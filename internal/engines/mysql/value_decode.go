@@ -1,0 +1,174 @@
+package mysql
+
+import (
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/orware/sluice/internal/ir"
+)
+
+// decodeValue converts a single value as returned by the go-sql-driver/mysql
+// driver into the canonical Go type the IR uses for the given column type.
+//
+// SQL NULL is represented as a nil interface value, both as input and as
+// output. Callers must therefore allow nil values for nullable columns.
+//
+// The function is pure (no I/O, no shared state) and exhaustively
+// table-tested in value_decode_test.go.
+func decodeValue(raw any, t ir.Type) (any, error) {
+	if raw == nil {
+		return nil, nil
+	}
+
+	switch t.(type) {
+	case ir.Boolean:
+		return decodeBoolean(raw)
+	case ir.Integer:
+		return decodeInteger(raw)
+	case ir.Decimal:
+		return decodeDecimal(raw)
+	case ir.Float:
+		return decodeFloat(raw)
+	case ir.Char, ir.Varchar, ir.Text:
+		return decodeString(raw)
+	case ir.Binary, ir.Varbinary, ir.Blob:
+		return decodeBytes(raw)
+	case ir.Date, ir.DateTime, ir.Timestamp:
+		return decodeTime(raw)
+	case ir.Time:
+		return decodeString(raw)
+	case ir.JSON:
+		return decodeBytes(raw)
+	case ir.Enum:
+		return decodeString(raw)
+	case ir.Set:
+		return decodeSet(raw)
+	case ir.Geometry:
+		return decodeBytes(raw)
+	case ir.UUID, ir.Inet, ir.Cidr, ir.Macaddr:
+		// MySQL doesn't have native types for these; they live in
+		// VARCHAR columns. The driver gives us bytes; canonical form
+		// is string.
+		return decodeString(raw)
+	}
+	return nil, fmt.Errorf("mysql: no decoder for IR type %T", t)
+}
+
+// decodeBoolean accepts either int64 (TINYINT(1)) or []byte/string
+// (BIT(1)) and returns a Go bool. Any non-zero numeric or non-empty
+// non-zero byte sequence is true; anything else is false.
+func decodeBoolean(raw any) (any, error) {
+	switch v := raw.(type) {
+	case int64:
+		return v != 0, nil
+	case uint64:
+		return v != 0, nil
+	case bool:
+		return v, nil
+	case []byte:
+		// BIT(1) returns a single byte. Non-zero is true.
+		for _, b := range v {
+			if b != 0 {
+				return true, nil
+			}
+		}
+		return false, nil
+	case string:
+		return v != "" && v != "0", nil
+	}
+	return nil, fmt.Errorf("mysql: cannot decode %T as Boolean", raw)
+}
+
+// decodeInteger preserves the driver's int64 / uint64 distinction so
+// downstream code can reason about signedness correctly.
+func decodeInteger(raw any) (any, error) {
+	switch v := raw.(type) {
+	case int64:
+		return v, nil
+	case uint64:
+		return v, nil
+	case []byte:
+		// Some MySQL builds return integers as bytes for very large
+		// values. We keep them as bytes — callers can parse on demand.
+		return v, nil
+	}
+	return nil, fmt.Errorf("mysql: cannot decode %T as Integer", raw)
+}
+
+// decodeDecimal preserves the textual precision of a DECIMAL column
+// by returning it as a string. Avoids the precision loss that float
+// conversion would introduce.
+func decodeDecimal(raw any) (any, error) {
+	switch v := raw.(type) {
+	case []byte:
+		return string(v), nil
+	case string:
+		return v, nil
+	}
+	return nil, fmt.Errorf("mysql: cannot decode %T as Decimal", raw)
+}
+
+// decodeFloat returns float64. Single-precision FLOAT columns are
+// widened to double-precision Go floats — there is no information loss
+// in this direction.
+func decodeFloat(raw any) (any, error) {
+	switch v := raw.(type) {
+	case float64:
+		return v, nil
+	case float32:
+		return float64(v), nil
+	}
+	return nil, fmt.Errorf("mysql: cannot decode %T as Float", raw)
+}
+
+// decodeString converts a string-like driver value into a Go string.
+func decodeString(raw any) (any, error) {
+	switch v := raw.(type) {
+	case []byte:
+		return string(v), nil
+	case string:
+		return v, nil
+	}
+	return nil, fmt.Errorf("mysql: cannot decode %T as string", raw)
+}
+
+// decodeBytes returns a fresh []byte. The driver may reuse its buffers
+// across rows, so we copy to make values safe to retain.
+func decodeBytes(raw any) (any, error) {
+	switch v := raw.(type) {
+	case []byte:
+		out := make([]byte, len(v))
+		copy(out, v)
+		return out, nil
+	case string:
+		return []byte(v), nil
+	}
+	return nil, fmt.Errorf("mysql: cannot decode %T as bytes", raw)
+}
+
+// decodeTime accepts a time.Time directly (when the driver was opened
+// with parseTime=true, which we always set). Strings and bytes are
+// rejected — that would mean the driver is misconfigured.
+func decodeTime(raw any) (any, error) {
+	if v, ok := raw.(time.Time); ok {
+		return v, nil
+	}
+	return nil, fmt.Errorf("mysql: cannot decode %T as time.Time (parseTime=true should be set)", raw)
+}
+
+// decodeSet converts a MySQL SET value's textual representation into
+// a []string. MySQL formats SET as a comma-separated list of selected
+// members ("a,b,c"). An empty SET returns a non-nil empty slice.
+func decodeSet(raw any) (any, error) {
+	s, err := decodeString(raw)
+	if err != nil {
+		return nil, errors.New("mysql: SET value: " + err.Error())
+	}
+	str := s.(string)
+	if str == "" {
+		return []string{}, nil
+	}
+	return strings.Split(str, ","), nil
+}
