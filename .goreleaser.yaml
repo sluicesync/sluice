@@ -1,0 +1,77 @@
+# GoReleaser configuration for sluice.
+# Docs: https://goreleaser.com
+
+version: 2
+
+project_name: sluice
+
+before:
+  hooks:
+    - go mod tidy
+    - go test ./...
+
+builds:
+  - id: sluice
+    main: ./cmd/sluice
+    binary: sluice
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+      - -X main.commit={{.Commit}}
+      - -X main.date={{.Date}}
+
+archives:
+  - id: sluice
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_
+      {{- title .Os }}_
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else }}{{ .Arch }}{{ end }}
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files:
+      - LICENSE
+      - README.md
+      - docs/*
+
+checksum:
+  name_template: checksums.txt
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-snapshot"
+
+changelog:
+  sort: asc
+  use: github
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "^ci:"
+      - "Merge pull request"
+
+release:
+  github:
+    owner: orware
+    name: sluice
+  draft: true
+  prerelease: auto
+  header: |
+    ## sluice {{ .Version }}
+
+    See the [changelog](https://github.com/orware/sluice/blob/main/CHANGELOG.md) for highlights.
+
+    During the v0.x series, no API or CLI stability guarantees are made. See the README for details.
