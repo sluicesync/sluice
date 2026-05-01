@@ -99,12 +99,17 @@ func (s EnumSupport) String() string {
 // JSONSupport describes which JSON variants an engine supports.
 type JSONSupport uint8
 
-// Recognised JSONSupport values.
+// JSONSupport variants:
+//
+//   - JSONNone:   no native JSON type
+//   - JSONText:   only a textual JSON type
+//   - JSONBinary: only a parsed/normalised JSON type
+//   - JSONBoth:   both textual and binary variants
 const (
 	JSONNone JSONSupport = iota
-	JSONText             // a textual JSON type only
-	JSONBinary           // a parsed/normalised JSON type only
-	JSONBoth             // both textual and binary variants
+	JSONText
+	JSONBinary
+	JSONBoth
 )
 
 func (s JSONSupport) String() string {

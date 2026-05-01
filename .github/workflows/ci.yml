@@ -32,6 +32,15 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Force every `run` step onto bash so argument parsing is identical on
+# Linux, macOS, and Windows. PowerShell (the Windows default) splits
+# arguments differently and broke `go test -coverprofile=coverage.out`
+# by treating `coverage.out` as `coverage` plus a `.out` positional
+# package argument. Bash is preinstalled on all GitHub-hosted runners.
+defaults:
+  run:
+    shell: bash
+
 jobs:
   # ----- Test -----
   # Runs `go test` with the race detector across all three operating

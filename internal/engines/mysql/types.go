@@ -217,8 +217,10 @@ func bitWidth(columnType string) int {
 }
 
 // parseEnumOrSet pulls the value list out of an ENUM/SET column_type.
-// MySQL formats these as e.g. enum('red','green','blue'). Values may
-// contain escaped single quotes (doubled: ''); the parser handles that.
+//
+// MySQL formats these as enum('red','green','blue') and similar; values
+// containing escaped single quotes (doubled inside the literal) are
+// handled by the inner loop.
 func parseEnumOrSet(columnType, kind string) ([]string, error) {
 	expected := kind + "("
 	idx := strings.Index(columnType, expected)
