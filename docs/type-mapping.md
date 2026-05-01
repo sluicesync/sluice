@@ -2,6 +2,8 @@
 
 This document defines the internal type model and the policies that govern translation between MySQL, PostgreSQL, and the IR.
 
+> **Related:** [docs/value-types.md](value-types.md) defines the *runtime* contract — the Go value types stored in `ir.Row` for each IR `Type`. This document covers the static type model and the DDL ↔ IR translation; that one covers the data values flowing through the pipeline.
+
 The fundamental decision is that translation is **not** a pairwise dialect→dialect operation. It is always source-dialect → IR → target-dialect. With four directions in scope, the pairwise approach would require twelve mapping tables; the IR approach requires four readers and four writers.
 
 ## Internal type model

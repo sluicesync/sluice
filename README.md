@@ -43,6 +43,7 @@ These are the tenets the project is built around. They take precedence over feat
 
 - [docs/architecture.md](docs/architecture.md) — IR, reader/writer pattern, the two engines, module layout
 - [docs/type-mapping.md](docs/type-mapping.md) — internal type model and dialect-specific translation policies
+- [docs/value-types.md](docs/value-types.md) — the runtime contract for `ir.Row` values that flow between readers, the translator, and writers
 - [docs/testing.md](docs/testing.md) — testing strategy and tooling
 
 ## Why sluice?
