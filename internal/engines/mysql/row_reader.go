@@ -62,7 +62,9 @@ func (r *RowReader) ReadRows(ctx context.Context, table *ir.Table) (<-chan ir.Ro
 	r.mu.Unlock()
 
 	query := buildSelect(table)
-	rows, err := r.db.QueryContext(ctx, query)
+	// rowserrcheck can't follow rows into the goroutine; rows.Err() is
+	// checked at the end of stream() once iteration is complete.
+	rows, err := r.db.QueryContext(ctx, query) //nolint:rowserrcheck
 	if err != nil {
 		return nil, fmt.Errorf("mysql: ReadRows: query failed: %w", err)
 	}
