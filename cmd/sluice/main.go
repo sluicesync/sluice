@@ -12,6 +12,10 @@ import (
 	"os"
 
 	"github.com/orware/sluice/internal/engines"
+	// Engine packages are imported for their init() side effects, which
+	// register them with the engines registry. Add a new engine by
+	// importing its package here.
+	_ "github.com/orware/sluice/internal/engines/mysql"
 )
 
 // version, commit, and date are populated at build time via -ldflags.
