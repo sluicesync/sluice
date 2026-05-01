@@ -250,12 +250,12 @@ func TestParseEnumOrSet(t *testing.T) {
 
 func TestParseEnumOrSetMalformed(t *testing.T) {
 	cases := []string{
-		"enum",                  // no parens
-		"enum(",                 // open paren only
-		"enum('a'",              // missing close paren
-		"enum('a)",              // unterminated value
-		"enum(a,b)",             // unquoted
-		"enum('a' 'b')",         // missing comma
+		"enum",          // no parens
+		"enum(",         // open paren only
+		"enum('a'",      // missing close paren
+		"enum('a)",      // unterminated value
+		"enum(a,b)",     // unquoted
+		"enum('a' 'b')", // missing comma
 	}
 	for _, c := range cases {
 		c := c

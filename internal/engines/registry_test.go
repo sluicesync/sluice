@@ -14,14 +14,32 @@ type fakeEngine struct {
 	caps ir.Capabilities
 }
 
-func (f *fakeEngine) Name() string                                                     { return f.name }
-func (f *fakeEngine) Capabilities() ir.Capabilities                                    { return f.caps }
-func (*fakeEngine) OpenSchemaReader(context.Context, string) (ir.SchemaReader, error)   { panic("not implemented") }
-func (*fakeEngine) OpenSchemaWriter(context.Context, string) (ir.SchemaWriter, error)   { panic("not implemented") }
-func (*fakeEngine) OpenRowReader(context.Context, string) (ir.RowReader, error)         { panic("not implemented") }
-func (*fakeEngine) OpenRowWriter(context.Context, string) (ir.RowWriter, error)         { panic("not implemented") }
-func (*fakeEngine) OpenCDCReader(context.Context, string) (ir.CDCReader, error)         { panic("not implemented") }
-func (*fakeEngine) OpenChangeApplier(context.Context, string) (ir.ChangeApplier, error) { panic("not implemented") }
+func (f *fakeEngine) Name() string                  { return f.name }
+func (f *fakeEngine) Capabilities() ir.Capabilities { return f.caps }
+
+func (*fakeEngine) OpenSchemaReader(context.Context, string) (ir.SchemaReader, error) {
+	panic("not implemented")
+}
+
+func (*fakeEngine) OpenSchemaWriter(context.Context, string) (ir.SchemaWriter, error) {
+	panic("not implemented")
+}
+
+func (*fakeEngine) OpenRowReader(context.Context, string) (ir.RowReader, error) {
+	panic("not implemented")
+}
+
+func (*fakeEngine) OpenRowWriter(context.Context, string) (ir.RowWriter, error) {
+	panic("not implemented")
+}
+
+func (*fakeEngine) OpenCDCReader(context.Context, string) (ir.CDCReader, error) {
+	panic("not implemented")
+}
+
+func (*fakeEngine) OpenChangeApplier(context.Context, string) (ir.ChangeApplier, error) {
+	panic("not implemented")
+}
 
 func TestRegisterAndGet(t *testing.T) {
 	t.Cleanup(reset)

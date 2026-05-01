@@ -3,6 +3,7 @@ package ir
 // BulkLoadMethod identifies how an engine supports bulk inserting data.
 type BulkLoadMethod uint8
 
+// Recognised BulkLoadMethod values.
 const (
 	BulkLoadNone           BulkLoadMethod = iota
 	BulkLoadCopy                          // PostgreSQL COPY
@@ -28,6 +29,7 @@ func (m BulkLoadMethod) String() string {
 // CDCMethod identifies how an engine exposes change-data-capture.
 type CDCMethod uint8
 
+// Recognised CDCMethod values.
 const (
 	CDCNone               CDCMethod = iota
 	CDCBinlog                       // MySQL row-based binary log
@@ -54,6 +56,7 @@ func (m CDCMethod) String() string {
 // schemas (PostgreSQL) or has a flat table namespace (MySQL).
 type SchemaScope uint8
 
+// Recognised SchemaScope values.
 const (
 	SchemaScopeFlat       SchemaScope = iota // MySQL-style: tables live in a single namespace
 	SchemaScopeNamespaced                    // Postgres-style: schemas contain tables
@@ -73,6 +76,7 @@ func (s SchemaScope) String() string {
 // EnumSupport describes how an engine represents enumerations.
 type EnumSupport uint8
 
+// Recognised EnumSupport values.
 const (
 	EnumNone        EnumSupport = iota // engine has no native enum representation
 	EnumColumnLevel                    // MySQL-style: ENUM declared on the column
@@ -95,6 +99,7 @@ func (s EnumSupport) String() string {
 // JSONSupport describes which JSON variants an engine supports.
 type JSONSupport uint8
 
+// Recognised JSONSupport values.
 const (
 	JSONNone JSONSupport = iota
 	JSONText             // a textual JSON type only

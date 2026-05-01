@@ -56,9 +56,13 @@ linters-settings:
     # Don't require checking errors from these functions. Adjust as
     # needed when patterns emerge.
     exclude-functions:
-      - (io.Closer).Close   # closing on cleanup; checking is rarely useful
-      - fmt.Fprintln(os.Stderr)
-      - fmt.Fprintf(os.Stderr)
+      - (io.Closer).Close              # generic Close — usually unused on read paths
+      - (*database/sql.Rows).Close     # deferred Rows.Close after Scan loop
+      - (*database/sql.Stmt).Close
+      - (*database/sql.DB).Close
+      - fmt.Fprint                     # CLI usage/help text writes — error not actionable
+      - fmt.Fprintln
+      - fmt.Fprintf
 
   revive:
     # Confidence threshold: 0.0 = report everything, 1.0 = only the most
@@ -68,6 +72,13 @@ linters-settings:
       - name: var-naming
       - name: package-comments
       - name: exported
+        arguments:
+          # Skip the comment-required check on methods. Sealed-interface
+          # impls (e.g. every IR type's Tier() method) are pure
+          # boilerplate; one-liner comments would just repeat the
+          # method name and add noise. Comments on exported types,
+          # functions, and constants are still required.
+          - disableChecksOnMethods
       - name: indent-error-flow
       - name: error-return
       - name: error-strings

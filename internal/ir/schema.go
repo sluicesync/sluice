@@ -75,6 +75,7 @@ func (DefaultExpression) isDefaultValue() {}
 // support a subset of these.
 type IndexKind uint8
 
+// Recognised IndexKind values.
 const (
 	IndexKindUnspecified IndexKind = iota
 	IndexKindBTree
@@ -133,6 +134,7 @@ type IndexColumn struct {
 // FKAction is the action to take on a referenced row's UPDATE or DELETE.
 type FKAction uint8
 
+// Recognised FKAction values.
 const (
 	FKActionNoAction FKAction = iota
 	FKActionRestrict

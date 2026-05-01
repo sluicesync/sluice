@@ -64,6 +64,7 @@ type Type interface {
 // double-precision (64-bit) floats.
 type FloatPrecision uint8
 
+// Recognised FloatPrecision values.
 const (
 	FloatSingle FloatPrecision = iota
 	FloatDouble
@@ -84,6 +85,7 @@ func (p FloatPrecision) String() string {
 // are dialect-specific; the IR preserves only the categorical bucket.
 type TextSize uint8
 
+// Recognised TextSize buckets, ordered from smallest to largest.
 const (
 	TextTiny TextSize = iota
 	TextRegular
@@ -109,6 +111,7 @@ func (s TextSize) String() string {
 // BlobSize buckets the size class of a [Blob] column.
 type BlobSize uint8
 
+// Recognised BlobSize buckets, ordered from smallest to largest.
 const (
 	BlobTiny BlobSize = iota
 	BlobRegular
@@ -152,6 +155,7 @@ type Integer struct {
 
 func (Integer) isType()    {}
 func (Integer) Tier() Tier { return TierCore }
+
 func (i Integer) String() string {
 	sign := "Int"
 	if i.Unsigned {
@@ -170,17 +174,21 @@ type Decimal struct {
 	Scale     int // digits to the right of the decimal point
 }
 
-func (Decimal) isType()        {}
-func (Decimal) Tier() Tier     { return TierCore }
-func (d Decimal) String() string { return fmt.Sprintf("Decimal(%d,%d)", d.Precision, d.Scale) }
+func (Decimal) isType()    {}
+func (Decimal) Tier() Tier { return TierCore }
+
+func (d Decimal) String() string {
+	return fmt.Sprintf("Decimal(%d,%d)", d.Precision, d.Scale)
+}
 
 // Float represents an IEEE-754 floating-point number.
 type Float struct {
 	Precision FloatPrecision
 }
 
-func (Float) isType()          {}
-func (Float) Tier() Tier       { return TierCore }
+func (Float) isType()    {}
+func (Float) Tier() Tier { return TierCore }
+
 func (f Float) String() string { return fmt.Sprintf("Float[%s]", f.Precision) }
 
 // Char is a fixed-length character string.
@@ -190,8 +198,9 @@ type Char struct {
 	Collation string
 }
 
-func (Char) isType()          {}
-func (Char) Tier() Tier       { return TierCore }
+func (Char) isType()    {}
+func (Char) Tier() Tier { return TierCore }
+
 func (c Char) String() string { return fmt.Sprintf("Char(%d)", c.Length) }
 
 // Varchar is a variable-length character string with an explicit max length.
@@ -201,8 +210,9 @@ type Varchar struct {
 	Collation string
 }
 
-func (Varchar) isType()          {}
-func (Varchar) Tier() Tier       { return TierCore }
+func (Varchar) isType()    {}
+func (Varchar) Tier() Tier { return TierCore }
+
 func (v Varchar) String() string { return fmt.Sprintf("Varchar(%d)", v.Length) }
 
 // Text is a variable-length character string sized by category. Postgres
@@ -213,8 +223,9 @@ type Text struct {
 	Collation string
 }
 
-func (Text) isType()          {}
-func (Text) Tier() Tier       { return TierCore }
+func (Text) isType()    {}
+func (Text) Tier() Tier { return TierCore }
+
 func (t Text) String() string { return fmt.Sprintf("Text[%s]", t.Size) }
 
 // Binary is a fixed-length byte string.
@@ -222,8 +233,9 @@ type Binary struct {
 	Length int
 }
 
-func (Binary) isType()          {}
-func (Binary) Tier() Tier       { return TierCore }
+func (Binary) isType()    {}
+func (Binary) Tier() Tier { return TierCore }
+
 func (b Binary) String() string { return fmt.Sprintf("Binary(%d)", b.Length) }
 
 // Varbinary is a variable-length byte string with an explicit max length.
@@ -231,8 +243,9 @@ type Varbinary struct {
 	Length int
 }
 
-func (Varbinary) isType()          {}
-func (Varbinary) Tier() Tier       { return TierCore }
+func (Varbinary) isType()    {}
+func (Varbinary) Tier() Tier { return TierCore }
+
 func (v Varbinary) String() string { return fmt.Sprintf("Varbinary(%d)", v.Length) }
 
 // Blob is a variable-length byte string sized by category.
@@ -240,8 +253,9 @@ type Blob struct {
 	Size BlobSize
 }
 
-func (Blob) isType()          {}
-func (Blob) Tier() Tier       { return TierCore }
+func (Blob) isType()    {}
+func (Blob) Tier() Tier { return TierCore }
+
 func (b Blob) String() string { return fmt.Sprintf("Blob[%s]", b.Size) }
 
 // Date is a calendar date with no time-of-day component.
@@ -256,8 +270,9 @@ type Time struct {
 	Precision int
 }
 
-func (Time) isType()          {}
-func (Time) Tier() Tier       { return TierCore }
+func (Time) isType()    {}
+func (Time) Tier() Tier { return TierCore }
+
 func (t Time) String() string { return fmt.Sprintf("Time(%d)", t.Precision) }
 
 // DateTime is a calendar date plus time-of-day, without a timezone.
@@ -265,8 +280,9 @@ type DateTime struct {
 	Precision int
 }
 
-func (DateTime) isType()          {}
-func (DateTime) Tier() Tier       { return TierCore }
+func (DateTime) isType()    {}
+func (DateTime) Tier() Tier { return TierCore }
+
 func (d DateTime) String() string { return fmt.Sprintf("DateTime(%d)", d.Precision) }
 
 // Timestamp is a calendar date plus time-of-day with optional timezone.
@@ -277,6 +293,7 @@ type Timestamp struct {
 
 func (Timestamp) isType()    {}
 func (Timestamp) Tier() Tier { return TierCore }
+
 func (t Timestamp) String() string {
 	if t.WithTimeZone {
 		return fmt.Sprintf("TimestampTZ(%d)", t.Precision)
@@ -293,6 +310,7 @@ type JSON struct {
 
 func (JSON) isType()    {}
 func (JSON) Tier() Tier { return TierCore }
+
 func (j JSON) String() string {
 	if j.Binary {
 		return "JSON[binary]"

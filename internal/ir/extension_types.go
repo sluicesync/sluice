@@ -14,6 +14,7 @@ import (
 // types they natively support.
 type ExtensionKind uint8
 
+// Recognised ExtensionKind values, one per extension Type defined below.
 const (
 	ExtEnum ExtensionKind = iota
 	ExtSet
@@ -51,6 +52,7 @@ func (k ExtensionKind) String() string {
 // GeometrySubtype identifies the spatial-data subtype of a [Geometry] column.
 type GeometrySubtype uint8
 
+// Recognised GeometrySubtype values.
 const (
 	GeometryUnspecified GeometrySubtype = iota
 	GeometryPoint
@@ -140,8 +142,9 @@ type Geometry struct {
 	Subtype GeometrySubtype
 }
 
-func (Geometry) isType()        {}
-func (Geometry) Tier() Tier     { return TierExtension }
+func (Geometry) isType()    {}
+func (Geometry) Tier() Tier { return TierExtension }
+
 func (g Geometry) String() string { return fmt.Sprintf("Geometry[%s]", g.Subtype) }
 
 // Inet represents an IPv4 or IPv6 host address (Postgres inet).

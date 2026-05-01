@@ -1,6 +1,7 @@
 package mysql
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
@@ -57,7 +58,6 @@ func translateType(c columnMeta) (ir.Type, error) {
 	autoIncrement := strings.Contains(strings.ToLower(c.Extra), "auto_increment")
 
 	switch c.DataType {
-
 	// ---- Integer family ----
 
 	case "tinyint":
@@ -194,11 +194,11 @@ func displayWidth(columnType string) int {
 	if open < 0 {
 		return 0
 	}
-	close := strings.IndexByte(columnType[open:], ')')
-	if close < 0 {
+	closeIdx := strings.IndexByte(columnType[open:], ')')
+	if closeIdx < 0 {
 		return 0
 	}
-	inner := columnType[open+1 : open+close]
+	inner := columnType[open+1 : open+closeIdx]
 	n, err := atoiPositive(inner)
 	if err != nil {
 		return 0
@@ -273,7 +273,7 @@ func parseEnumOrSet(columnType, kind string) ([]string, error) {
 // error for negative values, leading whitespace, or non-digit input.
 func atoiPositive(s string) (int, error) {
 	if s == "" {
-		return 0, fmt.Errorf("empty input")
+		return 0, errors.New("empty input")
 	}
 	n := 0
 	for _, r := range s {

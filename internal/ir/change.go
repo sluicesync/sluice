@@ -46,9 +46,9 @@ type Insert struct {
 	Row      Row
 }
 
-func (Insert) isChange()                {}
-func (e Insert) Pos() Position          { return e.Position }
-func (e Insert) QualifiedName() string  { return qualified(e.Schema, e.Table) }
+func (Insert) isChange()               {}
+func (e Insert) Pos() Position         { return e.Position }
+func (e Insert) QualifiedName() string { return qualified(e.Schema, e.Table) }
 
 // Update is a row-modification change event. Before captures the prior
 // state (when available from the source); After captures the new state.
@@ -62,9 +62,9 @@ type Update struct {
 	After    Row
 }
 
-func (Update) isChange()                {}
-func (e Update) Pos() Position          { return e.Position }
-func (e Update) QualifiedName() string  { return qualified(e.Schema, e.Table) }
+func (Update) isChange()               {}
+func (e Update) Pos() Position         { return e.Position }
+func (e Update) QualifiedName() string { return qualified(e.Schema, e.Table) }
 
 // Delete is a row-removal change event. Before holds the row that was
 // removed, when the source supplies it.
@@ -75,9 +75,9 @@ type Delete struct {
 	Before   Row // optional; nil when the source does not supply it
 }
 
-func (Delete) isChange()                {}
-func (e Delete) Pos() Position          { return e.Position }
-func (e Delete) QualifiedName() string  { return qualified(e.Schema, e.Table) }
+func (Delete) isChange()               {}
+func (e Delete) Pos() Position         { return e.Position }
+func (e Delete) QualifiedName() string { return qualified(e.Schema, e.Table) }
 
 // Truncate is a whole-table truncation event. Some sources emit this as
 // a DDL-flavoured event; the IR treats it as a data-stream change so
@@ -88,6 +88,6 @@ type Truncate struct {
 	Table    string
 }
 
-func (Truncate) isChange()                {}
-func (e Truncate) Pos() Position          { return e.Position }
-func (e Truncate) QualifiedName() string  { return qualified(e.Schema, e.Table) }
+func (Truncate) isChange()               {}
+func (e Truncate) Pos() Position         { return e.Position }
+func (e Truncate) QualifiedName() string { return qualified(e.Schema, e.Table) }
