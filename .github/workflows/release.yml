@@ -43,7 +43,7 @@ jobs:
       # .goreleaser.yaml. GITHUB_TOKEN is automatically provided by
       # GitHub Actions and has permission (per the `permissions` block
       # above) to create releases on this repo.
-      - uses: goreleaser/goreleaser-action@v6
+      - uses: goreleaser/goreleaser-action@v7
         with:
           version: latest
           args: release --clean
