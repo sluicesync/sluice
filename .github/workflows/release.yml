@@ -37,7 +37,9 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.22.x"
+          # Reads the version from go.mod so CI tracks the declared
+          # toolchain automatically.
+          go-version-file: "go.mod"
 
       # The GoReleaser action runs the release process defined in
       # .goreleaser.yaml. GITHUB_TOKEN is automatically provided by

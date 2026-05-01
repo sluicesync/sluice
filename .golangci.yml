@@ -17,7 +17,7 @@ run:
   timeout: 5m
   # Lint code targeting this Go version. Should match the go directive
   # in go.mod.
-  go: "1.22"
+  go: "1.25"
 
 linters:
   # Start from a clean slate so the enabled set is explicit.
