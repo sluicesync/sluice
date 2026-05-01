@@ -1,0 +1,49 @@
+# Dependabot configuration.
+#
+# Dependabot is GitHub's built-in dependency-update bot. It watches
+# specified package ecosystems and opens pull requests when updates are
+# available. Each PR runs through CI, so an update that breaks the build
+# is caught immediately.
+#
+# We watch two ecosystems:
+#   - gomod: Go module dependencies in go.mod
+#   - github-actions: action versions pinned in .github/workflows/*.yml
+#
+# Docs: https://docs.github.com/en/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
+
+version: 2
+
+updates:
+  # Go module updates.
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "10:00"
+      timezone: "America/Los_Angeles"
+    # Cap the number of open update PRs to keep the queue manageable.
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "go"
+    commit-message:
+      prefix: "deps"
+      include: "scope"
+
+  # GitHub Actions updates. Keeps the actions/checkout@v4-style references
+  # current so we benefit from upstream fixes and security patches.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "10:00"
+      timezone: "America/Los_Angeles"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "github-actions"
+    commit-message:
+      prefix: "ci"
+      include: "scope"

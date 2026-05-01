@@ -1,0 +1,51 @@
+# Release workflow.
+#
+# Triggered when a tag matching v* is pushed. Builds cross-platform
+# binaries via GoReleaser (configured in .goreleaser.yaml) and publishes
+# a draft GitHub release with the binaries attached.
+#
+# To cut a release locally:
+#   git tag v0.1.0
+#   git push origin v0.1.0
+# GitHub Actions takes it from there.
+#
+# The release is created as a draft so you can review the changelog and
+# binaries before clicking "Publish release" on GitHub.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# This workflow needs to write to the repository (creating releases and
+# uploading assets), so we opt in explicitly. Other tokens stay read-only.
+permissions:
+  contents: write
+
+jobs:
+  goreleaser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # GoReleaser uses git history for the changelog. fetch-depth: 0
+          # tells the checkout action to clone the full history, not just
+          # the latest commit.
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22.x"
+
+      # The GoReleaser action runs the release process defined in
+      # .goreleaser.yaml. GITHUB_TOKEN is automatically provided by
+      # GitHub Actions and has permission (per the `permissions` block
+      # above) to create releases on this repo.
+      - uses: goreleaser/goreleaser-action@v6
+        with:
+          version: latest
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

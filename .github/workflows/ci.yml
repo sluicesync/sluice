@@ -1,0 +1,125 @@
+# Continuous Integration workflow.
+#
+# Runs on every push to main and every pull request targeting main.
+# Three jobs run in parallel:
+#   - test:  cross-platform matrix (Linux, macOS, Windows) running unit tests
+#   - lint:  golangci-lint on a single runner (it's not OS-specific)
+#   - build: smoke-test that ./cmd/sluice still compiles on every platform
+#
+# A failed lint or test job blocks merges if branch protection is enabled
+# (see docs/dev/branch-protection.md for setup).
+
+name: CI
+
+# Triggers. Every push to main runs CI; every PR targeting main runs CI
+# with the merge-result tree (so the reviewer sees the result of merging
+# the PR, not just the branch).
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Default token permissions — least-privilege. Workflows that need to
+# write must opt in explicitly. CI here is read-only.
+permissions:
+  contents: read
+
+# Cancel in-progress runs for the same ref when a new commit lands. Saves
+# CI minutes and ensures the latest commit's result is the one that
+# matters. Without this, fast-pushing a fix would queue up duplicate runs.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Pinned at workflow level so all jobs see the same version. Bump in one
+# place when upgrading Go.
+env:
+  GO_VERSION: "1.22.x"
+
+jobs:
+  # ----- Test -----
+  # Runs `go test` with the race detector across all three operating
+  # systems. The matrix runs each combination as an independent job in
+  # parallel; fail-fast: false means all combinations finish even if one
+  # fails (so we see the full picture of which platforms broke).
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      # Checkout the code into the runner's working directory.
+      - uses: actions/checkout@v4
+
+      # Install Go and enable the module cache so subsequent runs reuse
+      # downloaded dependencies. setup-go@v5 enables caching by default.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      # Download modules first so any failure here is isolated from the
+      # build/test step (easier triage in the CI logs).
+      - run: go mod download
+
+      # `go vet` is the cheap-and-fast static checker baked into the Go
+      # toolchain. It catches a lot of real bugs (printf format mismatches,
+      # struct tag typos, copying mutexes) and runs in seconds.
+      - run: go vet ./...
+
+      # Tests with the race detector enabled. -count=1 disables the test
+      # cache so we always get a fresh run. -coverprofile collects
+      # coverage data we may upload as an artifact later.
+      - run: go test -race -count=1 -coverprofile=coverage.out ./...
+
+      # Upload coverage from the Linux run only (otherwise we'd get three
+      # near-identical artifacts). Useful for inspecting coverage trends.
+      - uses: actions/upload-artifact@v4
+        if: matrix.os == 'ubuntu-latest'
+        with:
+          name: coverage
+          path: coverage.out
+          if-no-files-found: error
+
+  # ----- Lint -----
+  # golangci-lint runs many static analyzers in a single pass. We use the
+  # official action which handles caching and version selection. Linting
+  # is OS-independent so we only need one runner.
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - uses: golangci/golangci-lint-action@v6
+        with:
+          # 'latest' tracks the most recent stable release of golangci-lint.
+          # If lint becomes flaky after an upstream release, pin a version
+          # here (e.g. v1.59.0) until the issue is resolved.
+          version: latest
+          # Fail the job on any issue. Combined with branch protection
+          # this means you can't merge until lint is clean.
+          args: --timeout=5m
+
+  # ----- Build -----
+  # A separate build smoke-test confirms `./cmd/sluice` compiles on every
+  # platform — useful because pure unit tests don't always exercise the
+  # main package. Cheap and gives a clear signal when a Windows-only or
+  # macOS-only build break sneaks in.
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - run: go build ./...

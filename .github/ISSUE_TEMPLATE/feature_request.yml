@@ -1,0 +1,44 @@
+name: Feature request
+description: Suggest a new feature or enhancement
+title: "[feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for suggesting an improvement! Concrete use cases and examples make a big difference.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+      description: |
+        Describe the situation that prompted this request. The "why" usually matters more
+        than the "what" — a clear problem often suggests a better solution than the one you
+        had in mind.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What's your proposed solution?
+      description: How would you like sluice to behave? Sketch a CLI invocation or config snippet if relevant.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you've considered
+      description: Any other approaches you've thought about, including not changing anything.
+    validations:
+      required: false
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Anything else that might help — examples from other tools, links to related issues, etc.
+    validations:
+      required: false

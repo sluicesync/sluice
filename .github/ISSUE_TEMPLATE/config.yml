@@ -1,0 +1,12 @@
+# Configures the GitHub issue chooser. Setting blank_issues_enabled to
+# false forces contributors to pick a template, which keeps issues more
+# consistent and easier to triage.
+
+blank_issues_enabled: false
+
+# Optional: point users to non-issue discussion venues. Uncomment and
+# set the URL when GitHub Discussions is enabled on the repo.
+# contact_links:
+#   - name: Question or discussion
+#     url: https://github.com/orware/sluice/discussions
+#     about: Use Discussions for open-ended questions and design conversations.

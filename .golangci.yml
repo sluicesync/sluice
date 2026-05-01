@@ -1,0 +1,108 @@
+# golangci-lint configuration.
+#
+# golangci-lint runs a curated set of Go static analyzers in a single
+# pass. Adding a linter here makes the lint job in CI enforce it.
+#
+# Philosophy: enable linters that reliably catch real bugs or enforce
+# conventions the project actually wants. Avoid noisy or stylistic
+# linters that produce more friction than value.
+#
+# To run locally:
+#   golangci-lint run ./...
+# Install: https://golangci-lint.run/welcome/install/
+
+run:
+  # Maximum time the run is allowed to take before being killed. Five
+  # minutes is generous; most runs finish in seconds.
+  timeout: 5m
+  # Lint code targeting this Go version. Should match the go directive
+  # in go.mod.
+  go: "1.22"
+
+linters:
+  # Start from a clean slate so the enabled set is explicit.
+  disable-all: true
+  enable:
+    # ---- Default-on linters (correctness) ----
+    - errcheck      # unchecked error returns
+    - govet         # the standard `go vet` suite
+    - ineffassign   # ineffective assignments (a := 1; a = 2; without using the first)
+    - staticcheck   # large suite of static analysis checks (SA*, ST*, S1*)
+    - unused        # unused declarations
+    - gosimple      # suggest simpler code (S1xxx)
+
+    # ---- Additional correctness / safety ----
+    - bodyclose     # ensure http.Response.Body is closed
+    - errorlint     # use errors.Is/As/%w instead of == comparisons
+    - nilerr        # returning nil when an error was just received
+    - noctx         # HTTP requests without context.Context
+    - sqlclosecheck # ensure sql.Rows/Stmt are closed (relevant for engines)
+    - rowserrcheck  # check rows.Err() after iteration
+
+    # ---- Style / hygiene ----
+    - gofumpt       # stricter gofmt; enforces a few extra stylistic choices
+    - goimports     # sorts and groups imports
+    - misspell      # common spelling mistakes in comments/strings
+    - unconvert     # unnecessary type conversions
+    - whitespace    # trailing whitespace on lines
+
+    # ---- Idiom enforcement ----
+    - revive        # golint successor — common style and naming rules
+    - gocritic      # opinionated but useful idiomatic suggestions
+    - prealloc      # suggest slice preallocation when length is known
+
+linters-settings:
+  errcheck:
+    # Don't require checking errors from these functions. Adjust as
+    # needed when patterns emerge.
+    exclude-functions:
+      - (io.Closer).Close   # closing on cleanup; checking is rarely useful
+      - fmt.Fprintln(os.Stderr)
+      - fmt.Fprintf(os.Stderr)
+
+  revive:
+    # Confidence threshold: 0.0 = report everything, 1.0 = only the most
+    # certain. 0.8 is a good middle ground.
+    confidence: 0.8
+    rules:
+      - name: var-naming
+      - name: package-comments
+      - name: exported
+      - name: indent-error-flow
+      - name: error-return
+      - name: error-strings
+      - name: error-naming
+      - name: if-return
+      - name: range
+      - name: receiver-naming
+      - name: time-naming
+      - name: unused-parameter
+      - name: unreachable-code
+
+  goimports:
+    local-prefixes: github.com/orware/sluice  # group sluice imports separately
+
+  gocritic:
+    # A subset of gocritic's many checks. The defaults include a few
+    # that are too opinionated for this project.
+    enabled-tags:
+      - diagnostic
+      - performance
+      - style
+    disabled-checks:
+      - whyNoLint        # we accept explicit nolint directives
+      - hugeParam        # encourages excessive pointer use
+      - rangeValCopy     # noisy on small structs
+
+issues:
+  # Don't lint generated or fixture code.
+  exclude-dirs:
+    - test/golden
+    - test/fixtures
+  # Caps to keep output manageable on a fresh codebase. Remove these
+  # caps later if you want exhaustive output.
+  max-issues-per-linter: 50
+  max-same-issues: 10
+  # Don't suppress new findings just because they appear in a file with
+  # existing issues — that's how lint debt accumulates.
+  exclude-use-default: false

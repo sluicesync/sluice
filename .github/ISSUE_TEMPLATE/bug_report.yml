@@ -1,0 +1,86 @@
+# Issue form for bug reports. GitHub renders this as a structured form
+# rather than a free-text Markdown template, making it easier for
+# reporters to include the details we actually need to triage.
+
+name: Bug report
+description: Something is broken or behaves unexpectedly
+title: "[bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug! A few quick details up front make a big difference for triage.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the bug. Include any error messages or unexpected output.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect to happen?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: How can we reproduce it?
+      description: |
+        Minimal steps, command lines, schemas, or sample data that reproduce the issue.
+        If a small SQL fixture is involved, please paste it here in a code fence.
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: sluice version
+      description: Output of `sluice --version`, or the commit SHA you built from.
+      placeholder: "e.g. v0.1.0 or abc1234"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: source-engine
+    attributes:
+      label: Source engine
+      options:
+        - "MySQL"
+        - "PostgreSQL"
+        - "Other / not applicable"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: target-engine
+    attributes:
+      label: Target engine
+      options:
+        - "MySQL"
+        - "PostgreSQL"
+        - "Other / not applicable"
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: "e.g. macOS 14.5, Ubuntu 22.04, Windows 11"
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / additional context
+      description: Anything else that helps diagnose the issue.
+      render: shell
+    validations:
+      required: false
