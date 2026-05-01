@@ -1,0 +1,48 @@
+# Compiled binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+/bin/
+/dist/
+/build/
+
+# Test artifacts
+*.test
+*.out
+coverage.txt
+coverage.html
+profile.out
+
+# Go workspace files
+go.work
+go.work.sum
+
+# Module dependency directories
+vendor/
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment and secrets
+.env
+.env.local
+*.pem
+*.key
+
+# Local developer config
+config.local.yaml
+config.local.yml
+
+# Generated test fixtures and large datasets
+test/perf/data/
+test/integration/dumps/
+
+# Logs
+*.log
