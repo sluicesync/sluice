@@ -16,7 +16,9 @@ package pipeline
 
 import (
 	"context"
+	"database/sql"
 	"io"
+	"strings"
 	"testing"
 	"time"
 
@@ -60,12 +62,18 @@ func TestMigrate_MySQLToPostgres(t *testing.T) {
 	_, pgTarget, pgCleanup := startPostgres(t)
 	defer pgCleanup()
 
+	// §7 type-translation coverage: score (UNSIGNED), role (ENUM),
+	// metadata (JSON). The exit checks below assert each lands as
+	// the expected IR shape on the PG target.
 	const seedDDL = `
 		CREATE TABLE users (
-			id         BIGINT       NOT NULL AUTO_INCREMENT,
-			email      VARCHAR(255) NOT NULL,
-			active     TINYINT(1)   NOT NULL DEFAULT 1,
-			created_at TIMESTAMP(0) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			id         BIGINT          NOT NULL AUTO_INCREMENT,
+			email      VARCHAR(255)    NOT NULL,
+			active     TINYINT(1)      NOT NULL DEFAULT 1,
+			created_at TIMESTAMP(0)    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			score      BIGINT UNSIGNED NOT NULL DEFAULT 0,
+			role       ENUM('admin','user','guest') NOT NULL DEFAULT 'user',
+			metadata   JSON            NULL,
 			PRIMARY KEY (id),
 			UNIQUE KEY users_email_unique (email)
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
@@ -80,9 +88,9 @@ func TestMigrate_MySQLToPostgres(t *testing.T) {
 				REFERENCES users (id) ON DELETE CASCADE
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
-		INSERT INTO users (email, active) VALUES
-			('alice@example.com', 1),
-			('bob@example.com',   0);
+		INSERT INTO users (email, active, score, role, metadata) VALUES
+			('alice@example.com', 1, 100, 'admin', '{"k":"v"}'),
+			('bob@example.com',   0, 42,  'user',  NULL);
 
 		INSERT INTO posts (user_id, body) VALUES
 			(1, 'first post'),
@@ -178,6 +186,43 @@ func TestMigrate_MySQLToPostgres(t *testing.T) {
 		t.Errorf("posts FK = %+v; want users on-delete cascade", fk)
 	}
 
+	// §7 type-translation checks: UNSIGNED → NUMERIC(20,0), ENUM →
+	// PG enum, JSON → JSONB.
+	scoreCol := findColumn(users, "score")
+	if scoreCol == nil {
+		t.Fatalf("users.score missing")
+	}
+	if dec, ok := scoreCol.Type.(ir.Decimal); !ok || dec.Precision != 20 || dec.Scale != 0 {
+		t.Errorf("users.score type = %#v; want ir.Decimal{Precision:20, Scale:0} (BIGINT UNSIGNED → NUMERIC(20,0))", scoreCol.Type)
+	}
+
+	roleCol := findColumn(users, "role")
+	if roleCol == nil {
+		t.Fatalf("users.role missing")
+	}
+	if e, ok := roleCol.Type.(ir.Enum); !ok {
+		t.Errorf("users.role type = %#v; want ir.Enum", roleCol.Type)
+	} else {
+		want := []string{"admin", "user", "guest"}
+		if len(e.Values) != len(want) {
+			t.Errorf("users.role values = %v; want %v", e.Values, want)
+		} else {
+			for i, w := range want {
+				if e.Values[i] != w {
+					t.Errorf("users.role values[%d] = %q; want %q", i, e.Values[i], w)
+				}
+			}
+		}
+	}
+
+	metaCol := findColumn(users, "metadata")
+	if metaCol == nil {
+		t.Fatalf("users.metadata missing")
+	}
+	if j, ok := metaCol.Type.(ir.JSON); !ok || !j.Binary {
+		t.Errorf("users.metadata type = %#v; want ir.JSON{Binary:true} (MySQL JSON → PG JSONB)", metaCol.Type)
+	}
+
 	// ---- Verify rows arrived intact and translated correctly ----
 	rr, err := pgEng.OpenRowReader(ctx, pgTarget)
 	if err != nil {
@@ -201,9 +246,50 @@ func TestMigrate_MySQLToPostgres(t *testing.T) {
 		t.Errorf("users[1].active = %#v; want false", usersRows[1]["active"])
 	}
 
+	// §7 row-value checks for the new columns.
+	if score, ok := usersRows[0]["score"].(string); !ok || score != "100" {
+		t.Errorf("users[0].score = %#v; want \"100\" (NUMERIC decoded as string)", usersRows[0]["score"])
+	}
+	if role, ok := usersRows[0]["role"].(string); !ok || role != "admin" {
+		t.Errorf("users[0].role = %#v; want \"admin\"", usersRows[0]["role"])
+	}
+	// JSON values arrive as []byte. PG's JSONB normalisation may
+	// reformat (key ordering, whitespace), so we re-parse and compare
+	// fields rather than asserting byte equality.
+	metaBytes, ok := usersRows[0]["metadata"].([]byte)
+	if !ok {
+		t.Errorf("users[0].metadata = %T; want []byte", usersRows[0]["metadata"])
+	} else if !strings.Contains(string(metaBytes), `"k"`) || !strings.Contains(string(metaBytes), `"v"`) {
+		t.Errorf("users[0].metadata = %s; want contents containing both \"k\" and \"v\"", metaBytes)
+	}
+	// bob has NULL metadata.
+	if usersRows[1]["metadata"] != nil {
+		t.Errorf("users[1].metadata = %#v; want nil", usersRows[1]["metadata"])
+	}
+
 	postsRows := readAll(t, ctx, rr, posts)
 	if len(postsRows) != 3 {
 		t.Errorf("target posts rows = %d; want 3", len(postsRows))
+	}
+
+	// §7 identity-sequence sync check: after bulk-copy, the PG
+	// sequence for users.id should be advanced past the highest
+	// bulk-copied id (2 — alice and bob). Calling nextval() should
+	// return 3, not 1. Without phase 3.5, the sequence would still
+	// be at its default and the next user-initiated INSERT would
+	// collide with alice's id=1.
+	pgDB, err := sql.Open("pgx", pgTarget)
+	if err != nil {
+		t.Fatalf("open pg target for nextval check: %v", err)
+	}
+	defer func() { _ = pgDB.Close() }()
+	var nextID int64
+	if err := pgDB.QueryRowContext(ctx,
+		`SELECT nextval(pg_get_serial_sequence('public.users', 'id'))`).Scan(&nextID); err != nil {
+		t.Fatalf("nextval: %v", err)
+	}
+	if nextID != 3 {
+		t.Errorf("nextval after sync = %d; want 3 (sequence not synced past bulk-copied max=2)", nextID)
 	}
 }
 

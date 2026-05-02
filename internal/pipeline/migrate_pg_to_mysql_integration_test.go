@@ -55,6 +55,7 @@ func TestMigrate_PostgresToMySQL(t *testing.T) {
 			email      VARCHAR(255) NOT NULL,
 			active     BOOLEAN      NOT NULL DEFAULT true,
 			created_at TIMESTAMP(0) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			metadata   JSONB        NULL,
 			CONSTRAINT users_email_unique UNIQUE (email)
 		);
 
@@ -67,9 +68,9 @@ func TestMigrate_PostgresToMySQL(t *testing.T) {
 		);
 		CREATE INDEX posts_user_id_idx ON posts (user_id);
 
-		INSERT INTO users (email, active) VALUES
-			('alice@example.com', true),
-			('bob@example.com',   false);
+		INSERT INTO users (email, active, metadata) VALUES
+			('alice@example.com', true,  '{"k":"v"}'::jsonb),
+			('bob@example.com',   false, NULL);
 
 		INSERT INTO posts (user_id, body) VALUES
 			(1, 'first post'),
@@ -149,6 +150,17 @@ func TestMigrate_PostgresToMySQL(t *testing.T) {
 	}
 	if textT, ok := bodyCol.Type.(ir.Text); !ok || textT.Size != ir.TextLong {
 		t.Errorf("posts.body type = %#v; want ir.Text{Size:TextLong}", bodyCol.Type)
+	}
+
+	// §7: PG JSONB → MySQL JSON. MySQL has only one JSON kind
+	// (binary internally), so the IR shape on the MySQL side is
+	// ir.JSON{Binary:true} regardless of which side originated it.
+	metaCol := findColumn(users, "metadata")
+	if metaCol == nil {
+		t.Fatalf("users.metadata missing")
+	}
+	if j, ok := metaCol.Type.(ir.JSON); !ok || !j.Binary {
+		t.Errorf("users.metadata type = %#v; want ir.JSON{Binary:true} (PG JSONB → MySQL JSON)", metaCol.Type)
 	}
 
 	// PK on id, unique on email.
