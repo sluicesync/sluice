@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/alecthomas/kong"
 
@@ -124,10 +126,20 @@ type SyncCmd struct {
 	Status SyncStatusCmd `cmd:"" help:"Show status of a running sync stream."`
 }
 
-// SyncStartCmd starts (or resumes) a continuous-sync stream.
+// SyncStartCmd starts (or resumes) a continuous-sync stream from a
+// source database to a target. The stream captures a consistent
+// snapshot, bulk-copies it, then streams ongoing changes via CDC
+// until the operator interrupts it (Ctrl-C). Restarts with the
+// same --stream-id resume from the persisted position rather than
+// re-running the snapshot+bulk-copy phase.
 type SyncStartCmd struct {
-	Source string `help:"Source database DSN." required:"" env:"SLUICE_SOURCE" placeholder:"DSN"`
-	Target string `help:"Target database DSN." required:"" env:"SLUICE_TARGET" placeholder:"DSN"`
+	SourceDriver string `help:"Source engine name (e.g. mysql, postgres). See 'sluice engines'." required:"" placeholder:"NAME" group:"source"`
+	Source       string `help:"Source database DSN." required:"" env:"SLUICE_SOURCE" placeholder:"DSN" group:"source"`
+
+	TargetDriver string `help:"Target engine name (e.g. mysql, postgres). See 'sluice engines'." required:"" placeholder:"NAME" group:"target"`
+	Target       string `help:"Target database DSN." required:"" env:"SLUICE_TARGET" placeholder:"DSN" group:"target"`
+
+	StreamID string `help:"Stream identifier; the key under which position is persisted on the target. Auto-generated from source/target host info when empty." placeholder:"ID"`
 }
 
 // Run implements `sluice sync start`.
@@ -135,24 +147,50 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 	if _, err := config.Load(g.Config); err != nil {
 		return err
 	}
-	return errors.New("sync: continuous-sync engine not yet implemented")
+
+	source, err := resolveEngine(s.SourceDriver)
+	if err != nil {
+		return fmt.Errorf("--source-driver: %w", err)
+	}
+	target, err := resolveEngine(s.TargetDriver)
+	if err != nil {
+		return fmt.Errorf("--target-driver: %w", err)
+	}
+
+	streamer := &pipeline.Streamer{
+		Source:    source,
+		Target:    target,
+		SourceDSN: s.Source,
+		TargetDSN: s.Target,
+		StreamID:  s.StreamID,
+		Stdout:    os.Stdout,
+	}
+	return streamer.Run(kongContext())
 }
 
-// SyncStatusCmd reports the state of a running sync stream. With no
-// CDC engine yet there is nothing to report; this stub wires the
-// command shape so the surface is in place when it lands.
+// SyncStatusCmd reports the state of a running sync stream. Stub
+// for now — operational visibility into running streams is a
+// follow-up chunk; today the streamer's progress lines are written
+// to its Stdout, which 'sync start' inherits from the terminal.
 type SyncStatusCmd struct{}
 
 // Run implements `sluice sync status`.
 func (*SyncStatusCmd) Run() error {
-	return errors.New("sync: continuous-sync engine not yet implemented")
+	return errors.New("sync: status reporting not yet implemented; observe 'sluice sync start' output directly for now")
 }
 
-// kongContext returns a context.Context for use inside Run methods.
-// Kept as a small helper so the CLI plumbing for cancellation can
-// evolve in one place — for example to listen for SIGINT and cancel
-// long-running migrations cleanly. For now it just returns the
-// background context.
+// kongContext returns a context.Context wired to OS signals so a
+// long-running migration or sync stream cancels cleanly when the
+// operator hits Ctrl-C. The context is cancelled on SIGINT or
+// SIGTERM; the underlying pipeline goroutines unwind and the
+// command exits with the cancellation propagated up.
 func kongContext() context.Context {
-	return context.Background()
+	ctx, _ := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	// We deliberately don't capture the cancel func: the signal
+	// notifier itself triggers cancellation, and we want the
+	// context to stay live for the entire process lifetime
+	// (kong dispatches one Run call per process). The spurious
+	// context-leak the linter flags here is intentional; see the
+	// nolint directive.
+	return ctx //nolint:contextcheck // ctx is scoped to the process lifetime
 }
