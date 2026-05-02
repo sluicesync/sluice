@@ -169,9 +169,29 @@ func (e Engine) OpenCDCReader(ctx context.Context, dsn string) (ir.CDCReader, er
 	}, nil
 }
 
-// OpenChangeApplier is not yet implemented.
-func (Engine) OpenChangeApplier(_ context.Context, _ string) (ir.ChangeApplier, error) {
-	return nil, ErrNotImplemented
+// OpenChangeApplier returns a [ChangeApplier] bound to the database
+// identified by dsn. The applier targets MySQL 8.0.20+ for its
+// row-alias UPSERT syntax (INSERT ... AS new ON DUPLICATE KEY UPDATE
+// col = new.col); older versions are not supported. The caller is
+// responsible for closing the returned applier (via its Close method)
+// to release the underlying connection pool.
+//
+// See the [ChangeApplier] doc comment for important details about
+// no-PK and unique-key-without-PK tables.
+func (Engine) OpenChangeApplier(ctx context.Context, dsn string) (ir.ChangeApplier, error) {
+	cfg, err := parseDSN(dsn)
+	if err != nil {
+		return nil, err
+	}
+	db, err := openDB(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	return &ChangeApplier{
+		db:      db,
+		schema:  cfg.DBName,
+		pkCache: make(map[string][]string),
+	}, nil
 }
 
 // init registers each supported flavor under its own name in the

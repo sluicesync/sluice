@@ -136,9 +136,27 @@ func (Engine) OpenCDCReader(ctx context.Context, dsn string) (ir.CDCReader, erro
 	}, nil
 }
 
-// OpenChangeApplier is not yet implemented.
-func (Engine) OpenChangeApplier(_ context.Context, _ string) (ir.ChangeApplier, error) {
-	return nil, ErrNotImplemented
+// OpenChangeApplier returns a [ChangeApplier] bound to the database
+// identified by dsn. The caller is responsible for closing the
+// returned applier (via its Close method) to release the underlying
+// connection pool.
+//
+// See the [ChangeApplier] doc comment for important details about
+// no-PK and unique-key-without-PK tables.
+func (Engine) OpenChangeApplier(ctx context.Context, dsn string) (ir.ChangeApplier, error) {
+	cfg, err := parseDSN(dsn)
+	if err != nil {
+		return nil, err
+	}
+	db, err := openDB(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	return &ChangeApplier{
+		db:      db,
+		schema:  cfg.schema,
+		pkCache: make(map[string][]string),
+	}, nil
 }
 
 // capabilities declares what this engine supports. Values reflect a
