@@ -229,6 +229,21 @@ func quoteSQLString(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
 }
 
+// pgToMySQLDefaultExpr maps PG-canonical default expressions to
+// their MySQL equivalents. The most common case is now() (PG's
+// "current timestamp" function name), which MySQL spells
+// CURRENT_TIMESTAMP. Anything not in this map passes through
+// verbatim — loud failure on the target beats silent corruption,
+// per the project's translation policy.
+//
+// Lookup keys are lowercased + trimmed; PG's pg_get_expr output
+// isn't case-stable across versions, and incidental whitespace
+// can survive cast-stripping, so normalising before lookup keeps
+// the table tiny.
+var pgToMySQLDefaultExpr = map[string]string{
+	"now()": "CURRENT_TIMESTAMP",
+}
+
 // emitDefault renders a DEFAULT clause body for the given default
 // value, given the column type the default belongs to. Returns
 // ("", false) if no DEFAULT clause should be emitted.
@@ -240,6 +255,10 @@ func quoteSQLString(s string) string {
 // TINYINT and rejects the string `'true'`/`'false'` under strict mode.
 // Translating to `1`/`0` here keeps the IR engine-neutral while
 // letting the writer emit something MySQL accepts.
+//
+// DefaultExpression values are checked against pgToMySQLDefaultExpr
+// for known PG-canonical forms (e.g. now() → CURRENT_TIMESTAMP),
+// then fall through to verbatim emission.
 func emitDefault(d ir.DefaultValue, t ir.Type) (string, bool) {
 	switch v := d.(type) {
 	case nil, ir.DefaultNone:
@@ -255,8 +274,10 @@ func emitDefault(d ir.DefaultValue, t ir.Type) (string, bool) {
 		}
 		return quoteSQLString(v.Value), true
 	case ir.DefaultExpression:
-		// Expression defaults pass through verbatim — the IR's role
-		// is to preserve them losslessly.
+		normalized := strings.ToLower(strings.TrimSpace(v.Expr))
+		if translated, ok := pgToMySQLDefaultExpr[normalized]; ok {
+			return translated, true
+		}
 		return v.Expr, true
 	}
 	return "", false

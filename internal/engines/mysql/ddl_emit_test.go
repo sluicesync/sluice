@@ -127,6 +127,19 @@ func TestEmitDefault(t *testing.T) {
 		{"bool short f", ir.DefaultLiteral{Value: "f"}, ir.Boolean{}, "0", true},
 		// "1"/"0" already arrive from MySQL itself — keep them as-is.
 		{"bool literal 1 passthrough", ir.DefaultLiteral{Value: "1"}, ir.Boolean{}, "'1'", true},
+
+		// PG → MySQL DefaultExpression translation. PG's canonical
+		// "current timestamp" function is now(); MySQL's is
+		// CURRENT_TIMESTAMP. Lookup is case-insensitive after trim.
+		{"pg now()", ir.DefaultExpression{Expr: "now()"}, ir.Timestamp{}, "CURRENT_TIMESTAMP", true},
+		{"pg NOW() uppercase", ir.DefaultExpression{Expr: "NOW()"}, ir.Timestamp{}, "CURRENT_TIMESTAMP", true},
+		{"pg now() with whitespace", ir.DefaultExpression{Expr: " now() "}, ir.Timestamp{}, "CURRENT_TIMESTAMP", true},
+		// Already-canonical CURRENT_TIMESTAMP (from MySQL or from
+		// stripTypeCast on PG) passes through unchanged.
+		{"current_timestamp passthrough", ir.DefaultExpression{Expr: "CURRENT_TIMESTAMP"}, ir.Timestamp{}, "CURRENT_TIMESTAMP", true},
+		// Unrelated expressions pass through verbatim — the project
+		// policy of "loud failure beats silent corruption".
+		{"unrelated expr passthrough", ir.DefaultExpression{Expr: "uuid_generate_v4()"}, ir.UUID{}, "uuid_generate_v4()", true},
 	}
 	for _, c := range cases {
 		c := c
