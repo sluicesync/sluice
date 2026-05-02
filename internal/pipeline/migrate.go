@@ -109,35 +109,51 @@ func (m *Migrator) Run(ctx context.Context) error {
 	}
 	defer closeIf(rw)
 
-	// ---- 3. Schema phase 1: tables without indexes or constraints ----
-	if err := sw.CreateTablesWithoutConstraints(ctx, schema); err != nil {
-		return fmt.Errorf("pipeline: create tables: %w", err)
-	}
-
-	// ---- 4. Bulk-copy data ----
+	// ---- 3-6. Schema apply (phase 1) → bulk copy → indexes → constraints.
 	rr, err := m.Source.OpenRowReader(ctx, m.SourceDSN)
 	if err != nil {
 		return fmt.Errorf("pipeline: open source row reader: %w", err)
 	}
 	defer closeIf(rr)
 
-	for _, table := range schema.Tables {
-		if err := m.copyTable(ctx, rr, rw, table); err != nil {
-			return fmt.Errorf("pipeline: copy table %q: %w", table.Name, err)
-		}
-	}
-
-	// ---- 5. Schema phase 2: indexes (now that data is loaded) ----
-	if err := sw.CreateIndexes(ctx, schema); err != nil {
-		return fmt.Errorf("pipeline: create indexes: %w", err)
-	}
-
-	// ---- 6. Schema phase 3: foreign keys ----
-	if err := sw.CreateConstraints(ctx, schema); err != nil {
-		return fmt.Errorf("pipeline: create constraints: %w", err)
+	if err := runBulkCopy(ctx, schema, rr, sw, rw); err != nil {
+		return err
 	}
 
 	m.printf("pipeline: migrated %d tables\n", len(schema.Tables))
+	return nil
+}
+
+// runBulkCopy applies the four shared phases that follow target-writer
+// open: schema phase 1 (tables without constraints) → bulk-copy of
+// every table → schema phase 2 (indexes) → schema phase 3 (foreign
+// keys). Used by both [Migrator] (one-shot mode) and [Streamer]
+// (long-running mode) — the only difference between them is where
+// `rows` comes from (engine-pool RowReader vs [ir.SnapshotStream].Rows).
+//
+// Errors from any phase are wrapped with the phase name so the caller
+// can pinpoint which step failed without parsing strings.
+func runBulkCopy(
+	ctx context.Context,
+	schema *ir.Schema,
+	rows ir.RowReader,
+	sw ir.SchemaWriter,
+	rw ir.RowWriter,
+) error {
+	if err := sw.CreateTablesWithoutConstraints(ctx, schema); err != nil {
+		return fmt.Errorf("pipeline: create tables: %w", err)
+	}
+	for _, table := range schema.Tables {
+		if err := copyTable(ctx, rows, rw, table); err != nil {
+			return fmt.Errorf("pipeline: copy table %q: %w", table.Name, err)
+		}
+	}
+	if err := sw.CreateIndexes(ctx, schema); err != nil {
+		return fmt.Errorf("pipeline: create indexes: %w", err)
+	}
+	if err := sw.CreateConstraints(ctx, schema); err != nil {
+		return fmt.Errorf("pipeline: create constraints: %w", err)
+	}
 	return nil
 }
 
@@ -160,7 +176,7 @@ func (m *Migrator) validate() error {
 // copyTable opens the source-side row stream, hands it off to the
 // target writer, and waits for completion. The reader's lifetime
 // covers exactly one table; the writer is reused across tables.
-func (m *Migrator) copyTable(ctx context.Context, rr ir.RowReader, rw ir.RowWriter, table *ir.Table) error {
+func copyTable(ctx context.Context, rr ir.RowReader, rw ir.RowWriter, table *ir.Table) error {
 	rows, err := rr.ReadRows(ctx, table)
 	if err != nil {
 		return fmt.Errorf("read rows: %w", err)

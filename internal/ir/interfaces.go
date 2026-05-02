@@ -67,4 +67,11 @@ type Engine interface {
 	OpenRowWriter(ctx context.Context, dsn string) (RowWriter, error)
 	OpenCDCReader(ctx context.Context, dsn string) (CDCReader, error)
 	OpenChangeApplier(ctx context.Context, dsn string) (ChangeApplier, error)
+
+	// OpenSnapshotStream captures a consistent snapshot of the source
+	// and returns a paired RowReader (snapshot-pinned) and CDCReader
+	// (positioned to start where the snapshot ended). Engines without
+	// CDC support return an error wrapping the engine's
+	// ErrNotImplemented.
+	OpenSnapshotStream(ctx context.Context, dsn string) (*SnapshotStream, error)
 }

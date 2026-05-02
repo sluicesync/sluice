@@ -180,6 +180,10 @@ func (stubEngine) OpenChangeApplier(context.Context, string) (ir.ChangeApplier, 
 	panic("stubEngine.OpenChangeApplier called")
 }
 
+func (stubEngine) OpenSnapshotStream(context.Context, string) (*ir.SnapshotStream, error) {
+	panic("stubEngine.OpenSnapshotStream called")
+}
+
 // recordingEngine is a fake ir.Engine that tracks which Open* methods
 // were called and emits configurable readers/writers that record the
 // orchestrator's interactions for assertion.
@@ -222,6 +226,10 @@ func (*recordingEngine) OpenCDCReader(context.Context, string) (ir.CDCReader, er
 }
 
 func (*recordingEngine) OpenChangeApplier(context.Context, string) (ir.ChangeApplier, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (*recordingEngine) OpenSnapshotStream(context.Context, string) (*ir.SnapshotStream, error) {
 	return nil, errors.New("not implemented")
 }
 

@@ -41,6 +41,10 @@ func (*fakeEngine) OpenChangeApplier(context.Context, string) (ir.ChangeApplier,
 	panic("not implemented")
 }
 
+func (*fakeEngine) OpenSnapshotStream(context.Context, string) (*ir.SnapshotStream, error) {
+	panic("not implemented")
+}
+
 func TestRegisterAndGet(t *testing.T) {
 	t.Cleanup(reset)
 	reset()
