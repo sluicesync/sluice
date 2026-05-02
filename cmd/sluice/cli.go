@@ -1,13 +1,17 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"os"
 
 	"github.com/alecthomas/kong"
 
 	"github.com/orware/sluice/internal/config"
 	"github.com/orware/sluice/internal/engines"
+	"github.com/orware/sluice/internal/ir"
+	"github.com/orware/sluice/internal/pipeline"
 )
 
 // Globals are flags shared across every subcommand. Embedding into the
@@ -62,21 +66,53 @@ func (*EnginesCmd) Run() error {
 // is bulk-copied. Suitable for smaller databases willing to accept a
 // downtime window.
 type MigrateCmd struct {
-	Source string `help:"Source database DSN." required:"" env:"SLUICE_SOURCE" placeholder:"DSN"`
-	Target string `help:"Target database DSN." required:"" env:"SLUICE_TARGET" placeholder:"DSN"`
-	DryRun bool   `help:"Validate the plan and print what would happen, without applying changes." short:"n"`
+	SourceDriver string `help:"Source engine name (e.g. mysql, postgres). See 'sluice engines'." required:"" placeholder:"NAME" group:"source"`
+	Source       string `help:"Source database DSN." required:"" env:"SLUICE_SOURCE" placeholder:"DSN" group:"source"`
+
+	TargetDriver string `help:"Target engine name (e.g. mysql, postgres). See 'sluice engines'." required:"" placeholder:"NAME" group:"target"`
+	Target       string `help:"Target database DSN." required:"" env:"SLUICE_TARGET" placeholder:"DSN" group:"target"`
+
+	DryRun bool `help:"Read the source schema and print the migration plan without applying changes." short:"n"`
 }
 
 // Run implements the migrate subcommand.
-//
-// Until the simple-mode orchestrator lands the command parses,
-// validates flags, and loads any config file — but exits with a clear
-// not-implemented error rather than running a partial migration.
 func (m *MigrateCmd) Run(g *Globals) error {
 	if _, err := config.Load(g.Config); err != nil {
 		return err
 	}
-	return errors.New("migrate: simple-mode orchestrator not yet implemented; tracking as the next code chunk")
+
+	source, err := resolveEngine(m.SourceDriver)
+	if err != nil {
+		return fmt.Errorf("--source-driver: %w", err)
+	}
+	target, err := resolveEngine(m.TargetDriver)
+	if err != nil {
+		return fmt.Errorf("--target-driver: %w", err)
+	}
+
+	mig := &pipeline.Migrator{
+		Source:    source,
+		Target:    target,
+		SourceDSN: m.Source,
+		TargetDSN: m.Target,
+		DryRun:    m.DryRun,
+		Stdout:    os.Stdout,
+	}
+	return mig.Run(kongContext())
+}
+
+// resolveEngine looks up an engine by registered name and returns a
+// useful error message that lists the available options when the
+// name doesn't match anything.
+func resolveEngine(name string) (ir.Engine, error) {
+	if name == "" {
+		return nil, errors.New("engine name is empty")
+	}
+	e, ok := engines.Get(name)
+	if !ok {
+		return nil, fmt.Errorf("unknown engine %q (registered: %v)", name, engines.Names())
+	}
+	return e, nil
 }
 
 // SyncCmd groups the continuous-sync subcommands. Continuous sync is
@@ -110,4 +146,13 @@ type SyncStatusCmd struct{}
 // Run implements `sluice sync status`.
 func (*SyncStatusCmd) Run() error {
 	return errors.New("sync: continuous-sync engine not yet implemented")
+}
+
+// kongContext returns a context.Context for use inside Run methods.
+// Kept as a small helper so the CLI plumbing for cancellation can
+// evolve in one place — for example to listen for SIGINT and cancel
+// long-running migrations cleanly. For now it just returns the
+// background context.
+func kongContext() context.Context {
+	return context.Background()
 }

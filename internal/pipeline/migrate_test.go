@@ -1,0 +1,287 @@
+package pipeline
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"io"
+	"strings"
+	"testing"
+
+	"github.com/orware/sluice/internal/ir"
+)
+
+func TestRunValidates(t *testing.T) {
+	cases := []struct {
+		name string
+		m    *Migrator
+		want string
+	}{
+		{
+			"nil source",
+			&Migrator{Target: stubEngine{}, SourceDSN: "x", TargetDSN: "y"},
+			"Source engine is nil",
+		},
+		{
+			"nil target",
+			&Migrator{Source: stubEngine{}, SourceDSN: "x", TargetDSN: "y"},
+			"Target engine is nil",
+		},
+		{
+			"empty source DSN",
+			&Migrator{Source: stubEngine{}, Target: stubEngine{}, TargetDSN: "y"},
+			"SourceDSN is empty",
+		},
+		{
+			"empty target DSN",
+			&Migrator{Source: stubEngine{}, Target: stubEngine{}, SourceDSN: "x"},
+			"TargetDSN is empty",
+		},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			err := c.m.Run(context.Background())
+			if err == nil {
+				t.Fatalf("expected error containing %q; got nil", c.want)
+			}
+			if !strings.Contains(err.Error(), c.want) {
+				t.Errorf("err = %v; want contains %q", err, c.want)
+			}
+		})
+	}
+}
+
+func TestRunEmptySchema(t *testing.T) {
+	src := newRecordingEngine("source")
+	src.schema = &ir.Schema{} // no tables
+	tgt := newRecordingEngine("target")
+
+	m := &Migrator{
+		Source: src, Target: tgt,
+		SourceDSN: "src", TargetDSN: "tgt",
+		Stdout: io.Discard,
+	}
+	if err := m.Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	// No writers should have been opened.
+	if tgt.openSchemaWriterCalls != 0 {
+		t.Errorf("OpenSchemaWriter called %d times; want 0 (empty schema)", tgt.openSchemaWriterCalls)
+	}
+	if tgt.openRowWriterCalls != 0 {
+		t.Errorf("OpenRowWriter called %d times; want 0", tgt.openRowWriterCalls)
+	}
+}
+
+func TestRunDryRunDoesNotOpenWriters(t *testing.T) {
+	src := newRecordingEngine("source")
+	src.schema = sampleSchema()
+	tgt := newRecordingEngine("target")
+
+	var buf bytes.Buffer
+	m := &Migrator{
+		Source: src, Target: tgt,
+		SourceDSN: "src", TargetDSN: "tgt",
+		DryRun: true,
+		Stdout: &buf,
+	}
+	if err := m.Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if tgt.openSchemaWriterCalls != 0 {
+		t.Errorf("OpenSchemaWriter called %d times in dry run; want 0", tgt.openSchemaWriterCalls)
+	}
+	if tgt.openRowWriterCalls != 0 {
+		t.Errorf("OpenRowWriter called %d times in dry run; want 0", tgt.openRowWriterCalls)
+	}
+	if !strings.Contains(buf.String(), "DRY RUN") {
+		t.Errorf("expected dry-run output to mention 'DRY RUN'; got %q", buf.String())
+	}
+}
+
+func TestRunCallsThreePhasesInOrder(t *testing.T) {
+	src := newRecordingEngine("source")
+	src.schema = sampleSchema()
+	tgt := newRecordingEngine("target")
+
+	m := &Migrator{
+		Source: src, Target: tgt,
+		SourceDSN: "src", TargetDSN: "tgt",
+		Stdout: io.Discard,
+	}
+	if err := m.Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	wantPhases := []string{
+		"CreateTablesWithoutConstraints",
+		"WriteRows:users",
+		"CreateIndexes",
+		"CreateConstraints",
+	}
+	if len(tgt.phaseLog) != len(wantPhases) {
+		t.Fatalf("got %d phases (%v); want %d", len(tgt.phaseLog), tgt.phaseLog, len(wantPhases))
+	}
+	for i, want := range wantPhases {
+		if tgt.phaseLog[i] != want {
+			t.Errorf("phase[%d] = %q; want %q", i, tgt.phaseLog[i], want)
+		}
+	}
+}
+
+func TestRunPropagatesReadSchemaError(t *testing.T) {
+	src := newRecordingEngine("source")
+	src.readSchemaErr = errors.New("connection refused")
+	tgt := newRecordingEngine("target")
+
+	m := &Migrator{
+		Source: src, Target: tgt,
+		SourceDSN: "src", TargetDSN: "tgt",
+	}
+	err := m.Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "connection refused") {
+		t.Errorf("err = %v; want wrapping the schema-read error", err)
+	}
+}
+
+// ---- mocks ----
+
+// stubEngine is a placeholder ir.Engine for validation tests where Run
+// shouldn't reach any of the Open* methods. Hitting them would be a
+// regression in the validate-first ordering.
+type stubEngine struct{}
+
+func (stubEngine) Name() string                  { return "stub" }
+func (stubEngine) Capabilities() ir.Capabilities { return ir.Capabilities{} }
+func (stubEngine) OpenSchemaReader(context.Context, string) (ir.SchemaReader, error) {
+	panic("stubEngine.OpenSchemaReader called — Run should have failed validation first")
+}
+
+func (stubEngine) OpenSchemaWriter(context.Context, string) (ir.SchemaWriter, error) {
+	panic("stubEngine.OpenSchemaWriter called")
+}
+
+func (stubEngine) OpenRowReader(context.Context, string) (ir.RowReader, error) {
+	panic("stubEngine.OpenRowReader called")
+}
+
+func (stubEngine) OpenRowWriter(context.Context, string) (ir.RowWriter, error) {
+	panic("stubEngine.OpenRowWriter called")
+}
+
+func (stubEngine) OpenCDCReader(context.Context, string) (ir.CDCReader, error) {
+	panic("stubEngine.OpenCDCReader called")
+}
+
+func (stubEngine) OpenChangeApplier(context.Context, string) (ir.ChangeApplier, error) {
+	panic("stubEngine.OpenChangeApplier called")
+}
+
+// recordingEngine is a fake ir.Engine that tracks which Open* methods
+// were called and emits configurable readers/writers that record the
+// orchestrator's interactions for assertion.
+type recordingEngine struct {
+	name                  string
+	schema                *ir.Schema
+	readSchemaErr         error
+	openSchemaWriterCalls int
+	openRowWriterCalls    int
+	phaseLog              []string
+}
+
+func newRecordingEngine(name string) *recordingEngine {
+	return &recordingEngine{name: name}
+}
+
+func (e *recordingEngine) Name() string                  { return e.name }
+func (e *recordingEngine) Capabilities() ir.Capabilities { return ir.Capabilities{} }
+
+func (e *recordingEngine) OpenSchemaReader(_ context.Context, _ string) (ir.SchemaReader, error) {
+	return &recordingSchemaReader{schema: e.schema, err: e.readSchemaErr}, nil
+}
+
+func (e *recordingEngine) OpenSchemaWriter(_ context.Context, _ string) (ir.SchemaWriter, error) {
+	e.openSchemaWriterCalls++
+	return &recordingSchemaWriter{phaseLog: &e.phaseLog}, nil
+}
+
+func (e *recordingEngine) OpenRowReader(_ context.Context, _ string) (ir.RowReader, error) {
+	return &recordingRowReader{}, nil
+}
+
+func (e *recordingEngine) OpenRowWriter(_ context.Context, _ string) (ir.RowWriter, error) {
+	e.openRowWriterCalls++
+	return &recordingRowWriter{phaseLog: &e.phaseLog}, nil
+}
+
+func (*recordingEngine) OpenCDCReader(context.Context, string) (ir.CDCReader, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (*recordingEngine) OpenChangeApplier(context.Context, string) (ir.ChangeApplier, error) {
+	return nil, errors.New("not implemented")
+}
+
+type recordingSchemaReader struct {
+	schema *ir.Schema
+	err    error
+}
+
+func (r *recordingSchemaReader) ReadSchema(context.Context) (*ir.Schema, error) {
+	if r.err != nil {
+		return nil, r.err
+	}
+	return r.schema, nil
+}
+
+type recordingSchemaWriter struct {
+	phaseLog *[]string
+}
+
+func (w *recordingSchemaWriter) CreateTablesWithoutConstraints(context.Context, *ir.Schema) error {
+	*w.phaseLog = append(*w.phaseLog, "CreateTablesWithoutConstraints")
+	return nil
+}
+
+func (w *recordingSchemaWriter) CreateIndexes(context.Context, *ir.Schema) error {
+	*w.phaseLog = append(*w.phaseLog, "CreateIndexes")
+	return nil
+}
+
+func (w *recordingSchemaWriter) CreateConstraints(context.Context, *ir.Schema) error {
+	*w.phaseLog = append(*w.phaseLog, "CreateConstraints")
+	return nil
+}
+
+type recordingRowReader struct{}
+
+func (*recordingRowReader) ReadRows(context.Context, *ir.Table) (<-chan ir.Row, error) {
+	ch := make(chan ir.Row)
+	close(ch) // no rows for these tests; orchestrator dispatch is the focus
+	return ch, nil
+}
+
+type recordingRowWriter struct {
+	phaseLog *[]string
+}
+
+func (w *recordingRowWriter) WriteRows(_ context.Context, table *ir.Table, _ <-chan ir.Row) error {
+	*w.phaseLog = append(*w.phaseLog, "WriteRows:"+table.Name)
+	return nil
+}
+
+func sampleSchema() *ir.Schema {
+	return &ir.Schema{
+		Tables: []*ir.Table{
+			{
+				Name: "users",
+				Columns: []*ir.Column{
+					{Name: "id", Type: ir.Integer{Width: 64}},
+				},
+			},
+		},
+	}
+}
