@@ -77,6 +77,7 @@ Other recurring lint signals:
 - `docs/testing.md` — testing strategy and tooling
 - `docs/dev/development.md` — local dev environment, hooks, make targets
 - `docs/dev/branch-protection.md` — required CI checks and `gh api` example
+- `docs/dev/roadmap.md` — detailed list of upcoming chunks. Each entry is structured (why / what / gotchas) so it can double as a self-contained prompt. Read the relevant section before starting a new chunk.
 
 ## External references that informed real decisions
 
@@ -87,9 +88,7 @@ Other recurring lint signals:
 
 Done: IR package, both engines (read + write), kong CLI + koanf config, simple-mode orchestrator (`internal/pipeline.Migrator`), unit tests, integration tests for MySQL→MySQL, PG→PG, and MySQL→PG (cross-engine). CI Integration job runs them on every PR.
 
-Open work, in rough priority order: Postgres→MySQL integration test (lower priority, narrower bug surface), MySQL CDC (binlog parsing — likely via `github.com/go-mysql-org/go-mysql`), Postgres CDC (logical replication via pgoutput), Postgres COPY-protocol writer for performance, snapshot-to-CDC handoff (the killer feature for low-downtime migrations), ADRs for the bigger design decisions.
-
-Cross-engine bug surface that hasn't been hit yet but probably will: `BIGINT UNSIGNED` (no Postgres equivalent), `ENUM` translation policy, `JSON`/`JSONB` policy, default-value translation across dialects, identity-sequence sync after manual ID inserts.
+For the upcoming work, see `docs/dev/roadmap.md` — it has detailed entries for the Postgres→MySQL test, MySQL/Postgres CDC, the snapshot→CDC handoff, the COPY-protocol writer, translation-policy edges, ADRs, and OSS hygiene.
 
 ## Working agreements with humans on this project
 
