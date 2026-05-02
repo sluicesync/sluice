@@ -4,33 +4,48 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"io"
 	"strings"
 	"sync"
 
 	"github.com/orware/sluice/internal/ir"
 )
 
+// querier is the slice of database/sql RowReader needs from its query
+// source. Both *sql.DB (the simple-mode path, owns its own pool) and
+// *sql.Conn (the snapshot-mode path, holds a single pinned connection
+// running a long REPEATABLE-READ transaction) satisfy it.
+type querier interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
 // RowReader streams rows from MySQL tables for the bulk-copy phase.
 // It implements [ir.RowReader].
 //
-// The reader holds an open *sql.DB; callers should call Close when done
-// to release the connection pool. Errors that occur during streaming
-// are stored on the reader and accessible via Err after the row
-// channel has closed (mirrors database/sql.Rows.Err).
+// Errors that occur during streaming are stored on the reader and
+// accessible via Err after the row channel has closed (mirrors
+// database/sql.Rows.Err).
 type RowReader struct {
-	db     *sql.DB
+	q      querier
 	schema string
+
+	// closer owns the underlying connection resources for this reader.
+	// In simple mode it's the *sql.DB; in snapshot mode it's nil and
+	// the SnapshotStream owns the lifecycle. Close is a no-op when nil.
+	closer io.Closer
 
 	mu  sync.Mutex
 	err error // sticky error from the most recent ReadRows call
 }
 
-// Close releases the underlying connection pool.
+// Close releases the underlying connection resources. Safe to call
+// multiple times. In snapshot mode (closer==nil) this is a no-op —
+// the SnapshotStream's Close is the operative cleanup.
 func (r *RowReader) Close() error {
-	if r.db == nil {
+	if r.closer == nil {
 		return nil
 	}
-	return r.db.Close()
+	return r.closer.Close()
 }
 
 // Err returns the error, if any, that terminated the most recently
@@ -65,7 +80,7 @@ func (r *RowReader) ReadRows(ctx context.Context, table *ir.Table) (<-chan ir.Ro
 	// rowserrcheck and sqlclosecheck can't follow rows into the
 	// goroutine; both rows.Err() and rows.Close() are handled inside
 	// stream() (Close via defer, Err checked once iteration ends).
-	rows, err := r.db.QueryContext(ctx, query) //nolint:rowserrcheck,sqlclosecheck
+	rows, err := r.q.QueryContext(ctx, query) //nolint:rowserrcheck,sqlclosecheck
 	if err != nil {
 		return nil, fmt.Errorf("mysql: ReadRows: query failed: %w", err)
 	}

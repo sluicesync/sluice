@@ -101,7 +101,7 @@ func (Engine) OpenRowReader(ctx context.Context, dsn string) (ir.RowReader, erro
 	if err != nil {
 		return nil, err
 	}
-	return &RowReader{db: db, schema: cfg.DBName}, nil
+	return &RowReader{q: db, schema: cfg.DBName, closer: db}, nil
 }
 
 // OpenRowWriter returns a [RowWriter] bound to the database identified
