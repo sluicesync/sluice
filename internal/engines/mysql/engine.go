@@ -1,17 +1,24 @@
-// Package mysql implements the sluice [ir.Engine] for MySQL (and
-// fully-compatible variants such as MariaDB and Percona Server). It
-// reads schema and rows via the standard database/sql driver
-// (github.com/go-sql-driver/mysql), and produces IR values that the
-// orchestrator can pass to a target engine.
+// Package mysql implements the sluice [ir.Engine] for MySQL and its
+// wire-compatible variants. It reads schema and rows via the standard
+// database/sql driver (github.com/go-sql-driver/mysql), and produces
+// IR values the orchestrator can pass to a target engine.
+//
+// The package supports multiple [Flavor] variants. Each registered
+// flavor has its own engine name and its own [ir.Capabilities]
+// declaration; the rest of the engine code (schema reader, row reader,
+// DDL emitter, value decoder) is flavor-independent. See flavor.go for
+// the list of recognised flavors and their capability declarations.
 //
 // The engine is registered automatically when this package is imported:
 //
 //	import _ "github.com/orware/sluice/internal/engines/mysql"
 //
-// At this stage of the project, only [SchemaReader] is implemented;
-// the other Open* methods return [ErrNotImplemented]. This is a
-// deliberate, build-by-build expansion of the engine surface — see the
-// roadmap in docs/architecture.md.
+// Users select a flavor via the engine name in their configuration
+// (`driver: mysql` or `driver: planetscale`).
+//
+// At this stage of the project the read side and the schema-write side
+// are implemented; OpenRowWriter, OpenCDCReader, and OpenChangeApplier
+// return [ErrNotImplemented] until those layers land.
 package mysql
 
 import (
@@ -30,17 +37,24 @@ var ErrNotImplemented = errors.New("mysql engine: not implemented yet")
 // Engine is the MySQL implementation of [ir.Engine]. It is stateless:
 // each Open* call creates an independent connection. Multiple Engines
 // may safely coexist.
-type Engine struct{}
+//
+// The Flavor field selects between MySQL-compatible service variants
+// (vanilla MySQL, PlanetScale, etc.). The zero value is FlavorVanilla
+// so Engine{} continues to behave as a vanilla MySQL engine.
+type Engine struct {
+	Flavor Flavor
+}
 
 // Name returns the engine's short identifier as used in configuration
-// files and on the command line.
-func (Engine) Name() string { return "mysql" }
+// files and on the command line. The name is determined by the engine's
+// Flavor — "mysql" for vanilla, "planetscale" for PlanetScale, etc.
+func (e Engine) Name() string { return e.Flavor.String() }
 
-// Capabilities returns the static capability declaration for MySQL
-// (8.0 baseline). When per-version variation matters, Open* methods
-// can detect the server version on connection and report it through
-// engine-specific surfaces.
-func (Engine) Capabilities() ir.Capabilities { return capabilities }
+// Capabilities returns the capability declaration for this engine's
+// flavor. The orchestrator consults this to pick strategies (bulk-load
+// method, CDC mechanism, etc.) without having to know which flavor it
+// is talking to.
+func (e Engine) Capabilities() ir.Capabilities { return e.Flavor.capabilities() }
 
 // OpenSchemaReader returns a [SchemaReader] bound to the database
 // identified by dsn. The caller is responsible for closing the
@@ -104,29 +118,10 @@ func (Engine) OpenChangeApplier(_ context.Context, _ string) (ir.ChangeApplier, 
 	return nil, ErrNotImplemented
 }
 
-// capabilities declares what this engine implementation supports.
-// Values reflect MySQL 8.0+ behaviour; older servers may diverge in
-// specific details (notably CHECK constraint enforcement, which became
-// real in 8.0.16 — earlier versions parsed but ignored CHECK).
-var capabilities = ir.Capabilities{
-	BulkLoad:    ir.BulkLoadLoadDataInfile,
-	CDC:         ir.CDCBinlog,
-	SchemaScope: ir.SchemaScopeFlat,
-	SupportedTypes: ir.NewTypeSet(
-		ir.ExtEnum,     // column-level ENUM
-		ir.ExtSet,      // column-level SET
-		ir.ExtGeometry, // built-in spatial types
-	),
-	SupportsCheckConstraint:  true, // 8.0.16+
-	SupportsGeneratedColumns: true,
-	SupportsPartitioning:     true,
-	EnumSupport:              ir.EnumColumnLevel,
-	JSONSupport:              ir.JSONBinary, // MySQL has only one JSON type, binary-stored
-	UnsignedIntegers:         true,
-}
-
-// init registers this engine with the engines registry. The blank
-// import in cmd/sluice triggers this on binary startup.
+// init registers each supported flavor under its own name in the
+// engines registry. Adding a new flavor is a one-line addition here
+// plus the corresponding entry in flavor.go.
 func init() {
-	engines.Register(Engine{})
+	engines.Register(Engine{Flavor: FlavorVanilla})
+	engines.Register(Engine{Flavor: FlavorPlanetScale})
 }
