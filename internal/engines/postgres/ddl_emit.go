@@ -301,7 +301,7 @@ func emitIndexColumnList(cols []ir.IndexColumn) string {
 // emitCreateIndex produces a CREATE INDEX statement (UNIQUE if
 // applicable). Postgres uses CREATE INDEX rather than ALTER TABLE
 // ADD INDEX (which doesn't exist here).
-func emitCreateIndex(schema string, tableName string, idx *ir.Index) (string, error) {
+func emitCreateIndex(schema, tableName string, idx *ir.Index) (string, error) {
 	if idx == nil {
 		return "", errors.New("postgres: emitCreateIndex: index is nil")
 	}
@@ -360,7 +360,7 @@ func postgresIndexMethod(k ir.IndexKind) string {
 
 // emitAddForeignKey produces an ALTER TABLE ... ADD CONSTRAINT
 // statement for a foreign key on the given child table.
-func emitAddForeignKey(schema string, childTable string, fk *ir.ForeignKey) (string, error) {
+func emitAddForeignKey(schema, childTable string, fk *ir.ForeignKey) (string, error) {
 	if fk == nil {
 		return "", errors.New("postgres: emitAddForeignKey: fk is nil")
 	}
