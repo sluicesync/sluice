@@ -28,8 +28,11 @@ func TestEmitColumnType(t *testing.T) {
 
 		// ---- Character ----
 		{"char no charset", ir.Char{Length: 10}, "CHAR(10)"},
-		{"varchar with charset", ir.Varchar{Length: 255, Charset: "utf8mb4", Collation: "utf8mb4_unicode_ci"},
-			"VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"},
+		{
+			"varchar with charset",
+			ir.Varchar{Length: 255, Charset: "utf8mb4", Collation: "utf8mb4_unicode_ci"},
+			"VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci",
+		},
 		{"text tiny", ir.Text{Size: ir.TextTiny}, "TINYTEXT"},
 		{"text regular", ir.Text{Size: ir.TextRegular}, "TEXT"},
 		{"text medium", ir.Text{Size: ir.TextMedium}, "MEDIUMTEXT"},
@@ -102,10 +105,10 @@ func TestEmitColumnTypeUnsupported(t *testing.T) {
 
 func TestEmitDefault(t *testing.T) {
 	cases := []struct {
-		name      string
-		in        ir.DefaultValue
-		want      string
-		wantEmit  bool
+		name     string
+		in       ir.DefaultValue
+		want     string
+		wantEmit bool
 	}{
 		{"none", ir.DefaultNone{}, "", false},
 		{"nil", nil, "", false},

@@ -19,7 +19,6 @@ import (
 // them; an error here means an upstream contract was violated.
 func emitColumnType(t ir.Type) (string, error) {
 	switch v := t.(type) {
-
 	// ---- Numeric / boolean ----
 	case ir.Boolean:
 		return "TINYINT(1)", nil
