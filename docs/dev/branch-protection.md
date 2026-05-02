@@ -21,6 +21,7 @@ Navigate to **Settings → Branches → Add rule** (or **Branch protection rules
   - `Test (ubuntu-latest)`
   - `Test (macos-latest)`
   - `Test (windows-latest)`
+  - `Integration`
   - `Lint`
   - `Build (ubuntu-latest)`
   - `Build (macos-latest)`
@@ -58,6 +59,7 @@ gh api -X PUT repos/orware/sluice/branches/main/protection \
       "Test (ubuntu-latest)",
       "Test (macos-latest)",
       "Test (windows-latest)",
+      "Integration",
       "Lint",
       "Build (ubuntu-latest)",
       "Build (macos-latest)",

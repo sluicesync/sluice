@@ -1,13 +1,14 @@
 # Continuous Integration workflow.
 #
 # Runs on every push to main and every pull request targeting main.
-# Three jobs run in parallel:
-#   - test:  cross-platform matrix (Linux, macOS, Windows) running unit tests
-#   - lint:  golangci-lint on a single runner (it's not OS-specific)
-#   - build: smoke-test that ./cmd/sluice still compiles on every platform
+# Four jobs run in parallel:
+#   - test:        cross-platform matrix (Linux, macOS, Windows) running unit tests
+#   - integration: testcontainers-backed end-to-end tests on Linux only
+#   - lint:        golangci-lint on a single runner (it's not OS-specific)
+#   - build:       smoke-test that ./cmd/sluice still compiles on every platform
 #
-# A failed lint or test job blocks merges if branch protection is enabled
-# (see docs/dev/branch-protection.md for setup).
+# A failed job blocks merges if branch protection is enabled (see
+# docs/dev/branch-protection.md for setup).
 
 name: CI
 
@@ -97,6 +98,46 @@ jobs:
           name: coverage
           path: coverage.out
           if-no-files-found: error
+
+  # ----- Integration -----
+  # Integration tests are gated behind the `integration` build tag because
+  # they require Docker (testcontainers-go boots real MySQL and Postgres
+  # instances). GitHub-hosted ubuntu runners ship with Docker preinstalled,
+  # so this job runs the same `go test -tags=integration` invocation that
+  # contributors run locally — proving the simple-mode and cross-engine
+  # migration paths on every PR without anyone having to remember.
+  #
+  # Linux-only: Docker isn't preinstalled on the macOS or Windows runners
+  # the project tests against, and our deployment targets are server
+  # platforms anyway. The cross-OS Test job above already covers OS-
+  # specific compile and test concerns for the unit suite.
+  integration:
+    name: Integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: "go.mod"
+      - run: go mod download
+
+      # Pre-pull the container images the tests need. testcontainers-go
+      # would pull them implicitly the first time it boots a container,
+      # but doing it up-front gives a cleaner failure mode if Docker Hub
+      # is rate-limiting or unreachable: we see "pull failed" before
+      # touching any test code, instead of mid-test as a timeout.
+      - run: |
+          docker pull mysql:8.0
+          docker pull postgres:16
+
+      # Run every package's integration tests. -count=1 disables the
+      # test cache so we always exercise real containers (cached results
+      # would defeat the point). -race catches data-race bugs in the
+      # reader/writer code paths under realistic concurrency. Containers
+      # take ~30s each to boot; the matrix-engine pipeline test boots
+      # two, so 20 minutes of headroom is generous but cheap.
+      - run: go test -tags=integration -race -count=1 ./internal/...
 
   # ----- Lint -----
   # golangci-lint runs many static analyzers in a single pass. We use the
