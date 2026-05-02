@@ -58,9 +58,20 @@ func (Engine) OpenSchemaReader(ctx context.Context, dsn string) (ir.SchemaReader
 	return &SchemaReader{db: db, schema: cfg.DBName}, nil
 }
 
-// OpenSchemaWriter is not yet implemented.
-func (Engine) OpenSchemaWriter(_ context.Context, _ string) (ir.SchemaWriter, error) {
-	return nil, ErrNotImplemented
+// OpenSchemaWriter returns a [SchemaWriter] bound to the database
+// identified by dsn. The caller is responsible for closing the
+// returned SchemaWriter (via its Close method) to release the
+// underlying connection pool.
+func (Engine) OpenSchemaWriter(ctx context.Context, dsn string) (ir.SchemaWriter, error) {
+	cfg, err := parseDSN(dsn)
+	if err != nil {
+		return nil, err
+	}
+	db, err := openDB(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	return &SchemaWriter{db: db, schema: cfg.DBName}, nil
 }
 
 // OpenRowReader returns a [RowReader] bound to the database identified
