@@ -104,7 +104,7 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 			datetime_precision,
 			IFNULL(character_set_name, ''),
 			IFNULL(collation_name, ''),
-			LOWER(column_type),
+			column_type,
 			IFNULL(extra, ''),
 			IFNULL(column_comment, '')
 		FROM   information_schema.columns
@@ -354,7 +354,7 @@ func loadTableSchema(ctx context.Context, db *sql.DB, schema, table string) (*ta
 			datetime_precision,
 			IFNULL(character_set_name, ''),
 			IFNULL(collation_name, ''),
-			LOWER(column_type),
+			column_type,
 			IFNULL(extra, ''),
 			IFNULL(column_comment, '')
 		FROM   information_schema.columns

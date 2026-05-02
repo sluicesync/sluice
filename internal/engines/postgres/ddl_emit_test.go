@@ -171,6 +171,19 @@ func TestEmitColumnDef(t *testing.T) {
 			},
 			want: `"role" "users_role_enum" NOT NULL`,
 		},
+		{
+			// Cross-engine MySQL → PG with `rating ENUM(...) DEFAULT 'G'`
+			// must emit the explicit type cast on the default; without
+			// the cast Postgres rejects the literal as "invalid input
+			// value for enum ...".
+			name: "enum with default literal needs explicit type cast",
+			in: &ir.Column{
+				Name:    "rating",
+				Type:    ir.Enum{Values: []string{"G", "PG", "PG-13", "R", "NC-17"}},
+				Default: ir.DefaultLiteral{Value: "G"},
+			},
+			want: `"rating" "users_rating_enum" NOT NULL DEFAULT 'G'::"users_rating_enum"`,
+		},
 	}
 
 	for _, c := range cases {
@@ -255,13 +268,31 @@ func TestEmitCreateIndex(t *testing.T) {
 			want: `CREATE INDEX "users_lookup" ON "public"."users" USING btree ("tenant_id", "created_at" DESC);`,
 		},
 		{
-			name: "gin index",
+			// Index name doesn't start with the table name, so the
+			// PG emitter prefixes it to disambiguate against the
+			// schema-scoped Postgres namespace (a sibling table
+			// might use the same source-side index name).
+			name: "gin index — name gets table prefix",
 			idx: &ir.Index{
 				Name:    "posts_search",
 				Kind:    ir.IndexKindGIN,
 				Columns: []ir.IndexColumn{{Column: "tsv"}},
 			},
-			want: `CREATE INDEX "posts_search" ON "public"."users" USING gin ("tsv");`,
+			want: `CREATE INDEX "users_posts_search" ON "public"."users" USING gin ("tsv");`,
+		},
+		{
+			// Source-side name like MySQL's idx_fk_film_id, which
+			// appears on multiple tables in real-world schemas
+			// (sakila has it on inventory, film_actor, etc.). The
+			// table-prefix disambiguation is what makes the
+			// cross-engine migration work.
+			name: "common collision-prone name gets table prefix",
+			idx: &ir.Index{
+				Name:    "idx_fk_film_id",
+				Kind:    ir.IndexKindBTree,
+				Columns: []ir.IndexColumn{{Column: "film_id"}},
+			},
+			want: `CREATE INDEX "users_idx_fk_film_id" ON "public"."users" USING btree ("film_id");`,
 		},
 	}
 	for _, c := range cases {

@@ -54,7 +54,12 @@ type columnMeta struct {
 // project's "contain complexity" tenet. A user encountering an
 // unsupported type should see an explicit message naming the type.
 func translateType(c columnMeta) (ir.Type, error) {
-	unsigned := strings.Contains(c.ColumnType, "unsigned")
+	// information_schema.columns.column_type is read raw (no LOWER()
+	// in the query) so embedded ENUM/SET values keep their source-
+	// side casing. The keyword tokens we match here (unsigned,
+	// enum, set, bit) are normalised lowercase via strings.ToLower
+	// at each call site.
+	unsigned := strings.Contains(strings.ToLower(c.ColumnType), "unsigned")
 	autoIncrement := strings.Contains(strings.ToLower(c.Extra), "auto_increment")
 
 	switch c.DataType {
@@ -220,10 +225,13 @@ func bitWidth(columnType string) int {
 //
 // MySQL formats these as enum('red','green','blue') and similar; values
 // containing escaped single quotes (doubled inside the literal) are
-// handled by the inner loop.
+// handled by the inner loop. The kind prefix (`enum`/`set`) is matched
+// case-insensitively against the column_type string — the *values*
+// inside the parens preserve their source-side casing.
 func parseEnumOrSet(columnType, kind string) ([]string, error) {
 	expected := kind + "("
-	idx := strings.Index(columnType, expected)
+	lower := strings.ToLower(columnType)
+	idx := strings.Index(lower, expected)
 	if idx != 0 {
 		return nil, fmt.Errorf("mysql: malformed %s column_type %q", strings.ToUpper(kind), columnType)
 	}

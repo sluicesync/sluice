@@ -214,6 +214,16 @@ func emitColumnDef(table *ir.Table, c *ir.Column) (string, error) {
 	if dflt, ok := emitDefault(c.Default); ok {
 		sb.WriteString(" DEFAULT ")
 		sb.WriteString(dflt)
+		// Postgres enum columns need an explicit type cast on the
+		// default literal — without it, CREATE TABLE rejects the
+		// default with "invalid input value for enum ...". The
+		// enum type name is the same one used in typeStr above.
+		if _, isEnum := c.Type.(ir.Enum); isEnum {
+			if _, isLiteral := c.Default.(ir.DefaultLiteral); isLiteral {
+				sb.WriteString("::")
+				sb.WriteString(quoteIdent(enumTypeName(table.Name, c.Name)))
+			}
+		}
 	}
 	return sb.String(), nil
 }
@@ -224,6 +234,25 @@ func emitColumnDef(table *ir.Table, c *ir.Column) (string, error) {
 // no risk of name collisions or unintended sharing.
 func enumTypeName(tableName, columnName string) string {
 	return tableName + "_" + columnName + "_enum"
+}
+
+// pgIndexName disambiguates a source-side index name against the
+// schema-scoped Postgres namespace. If the source name already
+// begins with the table name (the common case for sluice-emitted
+// names), it's returned verbatim; otherwise it gets a `<table>_`
+// prefix. The two-form rule preserves human-readable names like
+// `idx_users_email` while disambiguating MySQL-style sibling index
+// names like `idx_fk_film_id` (which appears on multiple tables in
+// real-world schemas).
+func pgIndexName(tableName, sourceName string) string {
+	if sourceName == "" {
+		return ""
+	}
+	prefix := tableName + "_"
+	if strings.HasPrefix(sourceName, prefix) {
+		return sourceName
+	}
+	return prefix + sourceName
 }
 
 // emitCreateEnumType produces a CREATE TYPE statement for a single
@@ -319,7 +348,14 @@ func emitCreateIndex(schema, tableName string, idx *ir.Index) (string, error) {
 	}
 	sb.WriteString("INDEX ")
 	if idx.Name != "" {
-		sb.WriteString(quoteIdent(idx.Name))
+		// Postgres index names are schema-scoped (a single namespace
+		// per schema). MySQL index names are table-scoped (the same
+		// name on two tables is fine). Cross-engine, that means a
+		// MySQL source with `idx_fk_film_id` on both `inventory` and
+		// `film_actor` would collide on the PG target. Prefixing
+		// with the table name disambiguates without losing the
+		// human-readable original.
+		sb.WriteString(quoteIdent(pgIndexName(tableName, idx.Name)))
 		sb.WriteByte(' ')
 	}
 	sb.WriteString("ON ")
