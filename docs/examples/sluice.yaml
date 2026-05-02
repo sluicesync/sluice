@@ -1,0 +1,48 @@
+# Example sluice configuration file.
+#
+# Pass this file via `sluice --config sluice.yaml migrate ...` (or
+# similar). Every key is optional; CLI flags and SLUICE_-prefixed
+# environment variables override anything set here.
+#
+# Environment variable mapping: SLUICE_FOO_BAR overrides foo.bar.
+# Example: SLUICE_EXTENSIONS_ALLOW="citext,pg_trgm".
+
+# ---------------------------------------------------------------------
+# mappings:
+#   Per-column type-mapping overrides. Each entry forces the translator
+#   to emit a specific target-engine type for the named (table, column)
+#   pair, ignoring whatever the default type-mapping policy would pick.
+#
+#   Useful when:
+#     - You want a Postgres ENUM source column to land as TEXT with a
+#       CHECK constraint on MySQL (more flexible, slower).
+#     - You want a MySQL JSON column to land as Postgres JSONB (faster,
+#       indexable) rather than text JSON.
+#     - You have a column whose default translation is lossy and you
+#       want explicit control.
+# ---------------------------------------------------------------------
+mappings:
+  - table: orders
+    column: status
+    target_type: text                # default would be ENUM
+  - table: events
+    column: payload
+    target_type: jsonb               # force binary JSON on Postgres targets
+    target_type_options:
+      binary: true
+
+# ---------------------------------------------------------------------
+# extensions:
+#   Allowlist of database extensions sluice may handle during a
+#   migration. Anything outside the list triggers an explicit error
+#   rather than silent best-effort handling — keeps "what the tool
+#   will and won't do" honest.
+#
+#   Currently meaningful for Postgres extensions; the same shape is
+#   reserved for any future engine that exposes an analogous concept.
+# ---------------------------------------------------------------------
+extensions:
+  allow:
+    - citext
+    - pg_trgm
+    - uuid-ossp

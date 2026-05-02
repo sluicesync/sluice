@@ -39,6 +39,43 @@ These are the tenets the project is built around. They take precedence over feat
 
 **Cross-platform single binary.** Implemented in Go. One `go install` should produce a working tool on Linux, macOS, and Windows.
 
+## CLI
+
+```
+$ sluice --help
+Open-source database migration and continuous-sync tool.
+
+Usage: sluice <command> [flags]
+
+Flags:
+  -c, --config=PATH        Path to a YAML config file.
+  -l, --log-level=info     Log verbosity. (debug,info,warn,error)
+  -V, --version            Print version and exit.
+
+Commands:
+  engines                  List registered database engines.
+  migrate                  Run a one-time schema + data migration (simple mode).
+  sync start               Start a continuous-sync stream from source to target.
+  sync status              Show status of a running sync stream.
+```
+
+Quick examples:
+
+```bash
+# List the engines this binary was built with.
+sluice engines
+
+# Run a one-time MySQL → Postgres migration.
+sluice migrate \
+    --source 'user:pass@tcp(localhost:3306)/myapp' \
+    --target 'postgres://user:pass@localhost/myapp?sslmode=disable'
+
+# Same, but with a config file overriding type mappings.
+sluice --config sluice.yaml migrate --source ... --target ...
+```
+
+See [docs/examples/sluice.yaml](docs/examples/sluice.yaml) for a commented sample config.
+
 ## Documents
 
 - [docs/architecture.md](docs/architecture.md) — IR, reader/writer pattern, the two engines, module layout
@@ -46,6 +83,7 @@ These are the tenets the project is built around. They take precedence over feat
 - [docs/value-types.md](docs/value-types.md) — the runtime contract for `ir.Row` values that flow between readers, the translator, and writers
 - [docs/testing.md](docs/testing.md) — testing strategy and tooling
 - [docs/dev/development.md](docs/dev/development.md) — local development workflow (gofumpt, Make targets, pre-commit hook)
+- [docs/examples/sluice.yaml](docs/examples/sluice.yaml) — example configuration file
 
 ## Why sluice?
 
