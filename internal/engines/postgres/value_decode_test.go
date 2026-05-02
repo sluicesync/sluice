@@ -98,6 +98,56 @@ func TestDecodeValue(t *testing.T) {
 			ir.Array{Element: ir.Integer{Width: 32}},
 			[]any{int64(7), int64(8)},
 		},
+
+		// ---- Array text form (pgx stdlib *any scan path) ----
+		{
+			"int array from text",
+			"{10,20,30}",
+			ir.Array{Element: ir.Integer{Width: 32}},
+			[]any{int64(10), int64(20), int64(30)},
+		},
+		{
+			"empty array from text",
+			"{}",
+			ir.Array{Element: ir.Integer{Width: 32}},
+			[]any{},
+		},
+		{
+			"int array with NULL",
+			"{1,NULL,3}",
+			ir.Array{Element: ir.Integer{Width: 32}},
+			[]any{int64(1), nil, int64(3)},
+		},
+		{
+			"text array from text",
+			`{"alpha","beta","gamma"}`,
+			ir.Array{Element: ir.Text{Size: ir.TextLong}},
+			[]any{"alpha", "beta", "gamma"},
+		},
+		{
+			"text array with embedded comma",
+			`{"a, b","c"}`,
+			ir.Array{Element: ir.Text{Size: ir.TextLong}},
+			[]any{"a, b", "c"},
+		},
+		{
+			"text array with escaped quote",
+			`{"he said \"hi\"","plain"}`,
+			ir.Array{Element: ir.Text{Size: ir.TextLong}},
+			[]any{`he said "hi"`, "plain"},
+		},
+		{
+			"bool array from text",
+			"{t,f,t}",
+			ir.Array{Element: ir.Boolean{}},
+			[]any{true, false, true},
+		},
+
+		// ---- Scalar string fallbacks ----
+		{"int from numeric string", "42", ir.Integer{Width: 32}, int64(42)},
+		{"float from numeric string", "3.14", ir.Float{Precision: ir.FloatDouble}, 3.14},
+		{"bool from t", "t", ir.Boolean{}, true},
+		{"bool from f", "f", ir.Boolean{}, false},
 	}
 
 	for _, c := range cases {
@@ -121,10 +171,11 @@ func TestDecodeValueErrors(t *testing.T) {
 		t    ir.Type
 	}{
 		{"bool from int", int64(1), ir.Boolean{}},
-		{"int from string", "1", ir.Integer{Width: 32}},
+		{"int from non-numeric string", "not a number", ir.Integer{Width: 32}},
+		{"bool from gibberish string", "maybe", ir.Boolean{}},
 		{"timestamp from string", "2026-05-01", ir.Timestamp{}},
 		{"uuid wrong length bytes", []byte{1, 2, 3}, ir.UUID{}},
-		{"array from non-slice", "not a slice", ir.Array{Element: ir.Integer{}}},
+		{"array from string without braces", "not an array literal", ir.Array{Element: ir.Integer{}}},
 		{"array nil element type", []int32{1}, ir.Array{}},
 	}
 	for _, c := range cases {

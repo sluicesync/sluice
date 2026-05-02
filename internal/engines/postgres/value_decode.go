@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/netip"
 	"reflect"
+	"strconv"
 	"time"
 
 	"github.com/orware/sluice/internal/ir"
@@ -61,14 +62,30 @@ func decodeValue(raw any, t ir.Type) (any, error) {
 }
 
 func decodeBoolean(raw any) (any, error) {
-	if v, ok := raw.(bool); ok {
+	switch v := raw.(type) {
+	case bool:
 		return v, nil
+	case string:
+		// Postgres text form: "t"/"f", or "true"/"false". Surfaces
+		// when arrays of booleans come back via the array text
+		// parser.
+		switch v {
+		case "t", "T", "true", "TRUE", "True":
+			return true, nil
+		case "f", "F", "false", "FALSE", "False":
+			return false, nil
+		}
+		return nil, fmt.Errorf("postgres: cannot decode %q as Boolean", v)
 	}
 	return nil, fmt.Errorf("postgres: cannot decode %T as Boolean", raw)
 }
 
 // decodeInteger widens any signed integer pgx returns into int64.
 // Postgres has no native unsigned integers, so we never see uint*.
+//
+// Strings are accepted as a fallback: the array text-form parser
+// hands per-element strings here, and pgx's stdlib mode can also
+// surface integers as strings under some configurations.
 func decodeInteger(raw any) (any, error) {
 	switch v := raw.(type) {
 	case int64:
@@ -81,6 +98,12 @@ func decodeInteger(raw any) (any, error) {
 		return int64(v), nil
 	case int:
 		return int64(v), nil
+	case string:
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("postgres: cannot decode %q as Integer: %w", v, err)
+		}
+		return n, nil
 	}
 	return nil, fmt.Errorf("postgres: cannot decode %T as Integer", raw)
 }
@@ -98,13 +121,20 @@ func decodeDecimal(raw any) (any, error) {
 }
 
 // decodeFloat returns float64. Single-precision floats are widened —
-// no information loss in this direction.
+// no information loss in this direction. Strings are accepted as a
+// fallback path for array text decoding.
 func decodeFloat(raw any) (any, error) {
 	switch v := raw.(type) {
 	case float64:
 		return v, nil
 	case float32:
 		return float64(v), nil
+	case string:
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			return nil, fmt.Errorf("postgres: cannot decode %q as Float: %w", v, err)
+		}
+		return f, nil
 	}
 	return nil, fmt.Errorf("postgres: cannot decode %T as Float", raw)
 }
@@ -233,20 +263,32 @@ func decodeMacaddr(raw any) (any, error) {
 	return nil, fmt.Errorf("postgres: cannot decode %T as Macaddr", raw)
 }
 
-// decodeArray walks a slice value and applies decodeValue to each
-// element with the array's IR element type. The result is always
-// []any so the IR Row can carry it without callers needing to know
-// the runtime slice type.
+// decodeArray converts a Postgres array value into a uniform []any
+// where each element has been run through [decodeValue] with the
+// array's element type.
 //
-// Reflection is used to handle the variety of slice types pgx may
-// return ([]int32 for int4[], []string for text[], etc.) without
-// having to enumerate every combination.
+// Three input shapes are handled, in order:
+//
+//  1. []any — some pgx configurations decode arrays directly into
+//     this shape.
+//  2. Any other slice/array reflect kind ([]int32, []string, …) —
+//     pgx with typed scan targets (e.g. *[]int32) lands here.
+//  3. string — pgx in database/sql stdlib mode returns the Postgres
+//     text-array form ("{1,2,3}", "{\"a\",\"b\"}") when the scan
+//     target is *any. We parse that into []string tokens and then
+//     decode element-by-element.
+//
+// (3) is the path that drove this function's existence: stdlib-mode
+// arrays come back as their text representation, and the IR Row
+// contract demands a typed slice. Falling back to a parser keeps the
+// reader independent of pgx-version-specific scan behaviour and
+// avoids forcing every column-type handler to know about arrays.
 func decodeArray(raw any, elementType ir.Type) (any, error) {
 	if elementType == nil {
 		return nil, errors.New("postgres: array decode: element type is nil")
 	}
 
-	// Some pgx setups return arrays as []any directly; fast-path it.
+	// (1) Some pgx setups return arrays as []any directly; fast-path it.
 	if asAny, ok := raw.([]any); ok {
 		out := make([]any, len(asAny))
 		for i, e := range asAny {
@@ -259,6 +301,30 @@ func decodeArray(raw any, elementType ir.Type) (any, error) {
 		return out, nil
 	}
 
+	// (3) Text form, e.g. "{10,20,30}" or "{\"a\",\"b\"}". Parsed
+	// before the reflect path because string is also a reflect.Kind
+	// that the slice check below would erroneously reject.
+	if s, ok := raw.(string); ok {
+		tokens, nullMask, err := parsePGArrayText(s)
+		if err != nil {
+			return nil, fmt.Errorf("postgres: array text parse: %w", err)
+		}
+		out := make([]any, len(tokens))
+		for i, tok := range tokens {
+			if nullMask[i] {
+				out[i] = nil
+				continue
+			}
+			d, err := decodeValue(tok, elementType)
+			if err != nil {
+				return nil, fmt.Errorf("postgres: array element %d: %w", i, err)
+			}
+			out[i] = d
+		}
+		return out, nil
+	}
+
+	// (2) Any other slice/array via reflection.
 	rv := reflect.ValueOf(raw)
 	if rv.Kind() != reflect.Slice && rv.Kind() != reflect.Array {
 		return nil, fmt.Errorf("postgres: cannot decode %T as Array (not a slice/array)", raw)
@@ -272,4 +338,128 @@ func decodeArray(raw any, elementType ir.Type) (any, error) {
 		out[i] = d
 	}
 	return out, nil
+}
+
+// parsePGArrayText parses Postgres's text representation of a
+// one-dimensional array into per-element string tokens. The second
+// return value is a parallel "is NULL?" mask so callers can
+// distinguish a string element "NULL" from an actual SQL null —
+// Postgres encodes the literal NULL keyword unquoted, while a string
+// "NULL" would be wrapped in double quotes.
+//
+// Format reference (PostgreSQL docs, "Array Input and Output Syntax"):
+//
+//   - Outer braces: "{" and "}"
+//   - Empty array: "{}"
+//   - Element separator: "," (no whitespace expected, but tolerated)
+//   - Bare element: any unquoted text up to the next "," or "}". The
+//     literal NULL (case-insensitive) is the SQL null marker.
+//   - Quoted element: enclosed in double quotes; "\" escapes the
+//     following byte (so \" and \\ are literal). Required for
+//     elements containing "{}",", or whitespace.
+//
+// Multi-dimensional arrays (nested braces) are not supported by this
+// parser; the caller will get a parse error. The IR doesn't model
+// dimensions today and adding that surface should come with a real
+// use case.
+func parsePGArrayText(s string) (tokens []string, isNull []bool, err error) {
+	if len(s) < 2 || s[0] != '{' || s[len(s)-1] != '}' {
+		return nil, nil, fmt.Errorf("malformed array literal %q (missing braces)", s)
+	}
+	body := s[1 : len(s)-1]
+	if body == "" {
+		return []string{}, []bool{}, nil
+	}
+
+	for i := 0; i < len(body); {
+		// Skip leading whitespace before the element.
+		for i < len(body) && (body[i] == ' ' || body[i] == '\t') {
+			i++
+		}
+		if i >= len(body) {
+			break
+		}
+
+		var (
+			tok   string
+			isNil bool
+		)
+
+		switch body[i] {
+		case '{', '}':
+			return nil, nil, fmt.Errorf("nested arrays not supported in %q", s)
+		case '"':
+			// Quoted element: scan until the matching unescaped quote.
+			i++ // consume opening quote
+			var sb []byte
+			for i < len(body) {
+				c := body[i]
+				if c == '\\' && i+1 < len(body) {
+					sb = append(sb, body[i+1])
+					i += 2
+					continue
+				}
+				if c == '"' {
+					i++ // consume closing quote
+					break
+				}
+				sb = append(sb, c)
+				i++
+			}
+			tok = string(sb)
+		default:
+			// Bare element: scan until the next "," or "}".
+			start := i
+			for i < len(body) && body[i] != ',' {
+				i++
+			}
+			tok = body[start:i]
+			// Trim trailing whitespace inside the bare token.
+			for len(tok) > 0 && (tok[len(tok)-1] == ' ' || tok[len(tok)-1] == '\t') {
+				tok = tok[:len(tok)-1]
+			}
+			// Unquoted NULL is the SQL null marker.
+			if eqFold(tok, "NULL") {
+				isNil = true
+				tok = ""
+			}
+		}
+
+		// Skip trailing whitespace before the comma.
+		for i < len(body) && (body[i] == ' ' || body[i] == '\t') {
+			i++
+		}
+		// Consume the comma if present.
+		if i < len(body) {
+			if body[i] != ',' {
+				return nil, nil, fmt.Errorf("expected ',' or '}' at offset %d in %q", i+1, s)
+			}
+			i++
+		}
+
+		tokens = append(tokens, tok)
+		isNull = append(isNull, isNil)
+	}
+	return tokens, isNull, nil
+}
+
+// eqFold is a tiny case-insensitive ASCII comparison; avoids pulling
+// in the unicode/strings.EqualFold cost for a single keyword check.
+func eqFold(s, t string) bool {
+	if len(s) != len(t) {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		a, b := s[i], t[i]
+		if a >= 'A' && a <= 'Z' {
+			a += 'a' - 'A'
+		}
+		if b >= 'A' && b <= 'Z' {
+			b += 'a' - 'A'
+		}
+		if a != b {
+			return false
+		}
+	}
+	return true
 }

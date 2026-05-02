@@ -300,12 +300,23 @@ func (r *SchemaReader) populateForeignKeys(ctx context.Context, tables map[strin
 		k := key{table: tableName, name: name}
 		fk, ok := collected[k]
 		if !ok {
+			// MySQL has a flat scope: its `TABLE_SCHEMA` column is a
+			// database name, not a namespace. The IR contract on
+			// ir.ForeignKey.ReferencedSchema says it must be empty for
+			// flat-scope engines, so we deliberately drop refSchema
+			// here. Propagating it leaks the source database name
+			// into target dialects that *do* have namespaced schemas
+			// — e.g. emitting `REFERENCES "source_db"."users"(...)`
+			// against a Postgres target where no such schema exists.
+			// Cross-database FKs in MySQL are rare and not supported
+			// by InnoDB enforcement; if real-world cases appear we
+			// can revisit with a typed translation policy.
+			_ = refSchema
 			fk = &ir.ForeignKey{
-				Name:             name,
-				ReferencedSchema: refSchema,
-				ReferencedTable:  refTable,
-				OnUpdate:         fkActionFrom(updateRule),
-				OnDelete:         fkActionFrom(deleteRule),
+				Name:            name,
+				ReferencedTable: refTable,
+				OnUpdate:        fkActionFrom(updateRule),
+				OnDelete:        fkActionFrom(deleteRule),
 			}
 			collected[k] = fk
 		}
