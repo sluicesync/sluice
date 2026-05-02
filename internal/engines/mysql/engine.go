@@ -24,6 +24,7 @@ package mysql
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"github.com/orware/sluice/internal/engines"
 	"github.com/orware/sluice/internal/ir"
@@ -125,9 +126,47 @@ func (e Engine) OpenRowWriter(ctx context.Context, dsn string) (ir.RowWriter, er
 	}, nil
 }
 
-// OpenCDCReader is not yet implemented.
-func (Engine) OpenCDCReader(_ context.Context, _ string) (ir.CDCReader, error) {
-	return nil, ErrNotImplemented
+// OpenCDCReader returns a [CDCReader] bound to the database identified
+// by dsn. The reader speaks MySQL's row-based binary log via a separate
+// connection from the schema-cache *sql.DB; the account in the DSN
+// must therefore have REPLICATION SLAVE (and REPLICATION CLIENT, for
+// the gtid_mode and master-status queries) in addition to the usual
+// SELECT on information_schema.
+//
+// PlanetScale and other flavors with [ir.CDCNone] receive
+// [ErrNotImplemented]; check the engine's [ir.Capabilities.CDC]
+// before requesting a CDC reader.
+//
+// The caller is responsible for calling Close on the returned reader
+// to release both the schema-DB pool and the binlog connection.
+func (e Engine) OpenCDCReader(ctx context.Context, dsn string) (ir.CDCReader, error) {
+	if e.Capabilities().CDC == ir.CDCNone {
+		return nil, fmt.Errorf("%s: CDC not supported by this flavor: %w", e.Name(), ErrNotImplemented)
+	}
+	cfg, err := parseDSN(dsn)
+	if err != nil {
+		return nil, err
+	}
+	db, err := openDB(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	host, port, err := hostPortFromAddr(cfg.Addr)
+	if err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("mysql: parse host/port: %w", err)
+	}
+	return &CDCReader{
+		db:          db,
+		schema:      cfg.DBName,
+		host:        host,
+		port:        port,
+		user:        cfg.User,
+		password:    cfg.Passwd,
+		serverID:    generateServerID(),
+		tableMap:    make(map[uint64]string),
+		schemaCache: make(map[string]*tableSchema),
+	}, nil
 }
 
 // OpenChangeApplier is not yet implemented.

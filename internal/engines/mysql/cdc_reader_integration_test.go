@@ -1,0 +1,265 @@
+//go:build integration
+
+// Integration test for the MySQL CDC reader. Boots a MySQL container
+// with binlog enabled (the default on 8.0 + an explicit log-bin name
+// for clarity), seeds a table, opens the reader at "from now", then
+// performs INSERT/UPDATE/DELETE and asserts the expected sequence of
+// ir.Change events arrives.
+
+package mysql
+
+import (
+	"context"
+	"database/sql"
+	"reflect"
+	"testing"
+	"time"
+
+	"github.com/orware/sluice/internal/ir"
+
+	"github.com/testcontainers/testcontainers-go"
+	mysqltc "github.com/testcontainers/testcontainers-go/modules/mysql"
+)
+
+// startMySQLForCDC boots a MySQL container with binlog enabled. We
+// can't reuse the existing startMySQL helper from the pipeline package
+// because that one uses default container args; the reproducible thing
+// to do is to spell out the binlog flags here even though MySQL 8.0
+// happens to default to ROW-formatted binlogs.
+func startMySQLForCDC(t *testing.T) (dsn string, cleanup func()) {
+	t.Helper()
+	testcontainers.SkipIfProviderIsNotHealthy(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	container, err := mysqltc.Run(ctx,
+		"mysql:8.0",
+		mysqltc.WithDatabase("source_db"),
+		mysqltc.WithUsername("root"),
+		mysqltc.WithPassword("rootpw"),
+		testcontainers.CustomizeRequest(testcontainers.GenericContainerRequest{
+			ContainerRequest: testcontainers.ContainerRequest{
+				Cmd: []string{
+					"mysqld",
+					"--server-id=1",
+					"--log-bin=mysql-bin",
+					"--binlog-format=ROW",
+					"--binlog-row-image=FULL",
+				},
+			},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("start container: %v", err)
+	}
+
+	terminate := func() {
+		shutdown, c := context.WithTimeout(context.Background(), 30*time.Second)
+		defer c()
+		_ = container.Terminate(shutdown)
+	}
+
+	conn, err := container.ConnectionString(ctx, "parseTime=true")
+	if err != nil {
+		terminate()
+		t.Fatalf("connection string: %v", err)
+	}
+	return conn, terminate
+}
+
+// applyMySQL runs a possibly-multi-statement DDL/DML script against a
+// MySQL DSN. Mirrors the helper in the pipeline package so this file
+// stays self-contained.
+func applyMySQL(t *testing.T, dsn, sqlText string) {
+	t.Helper()
+	db, err := sql.Open("mysql", dsn+"&multiStatements=true")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if _, err := db.ExecContext(ctx, sqlText); err != nil {
+		t.Fatalf("apply sql: %v", err)
+	}
+}
+
+// TestCDCReader_BasicChangeStream is the spine test for the binlog
+// reader: write some rows after StreamChanges starts and assert each
+// one comes back as the expected ir.Change variant with the right
+// table, position, and decoded values.
+func TestCDCReader_BasicChangeStream(t *testing.T) {
+	dsn, cleanup := startMySQLForCDC(t)
+	defer cleanup()
+
+	const seedDDL = `
+		CREATE TABLE users (
+			id     BIGINT       NOT NULL AUTO_INCREMENT,
+			email  VARCHAR(255) NOT NULL,
+			active TINYINT(1)   NOT NULL DEFAULT 1,
+			PRIMARY KEY (id)
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+	`
+	applyMySQL(t, dsn, seedDDL)
+
+	eng := Engine{Flavor: FlavorVanilla}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	rdr, err := eng.OpenCDCReader(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenCDCReader: %v", err)
+	}
+	defer func() {
+		if c, ok := rdr.(interface{ Close() error }); ok {
+			_ = c.Close()
+		}
+	}()
+
+	// Empty position = "from now". Anything done before this point
+	// (the seed DDL) is excluded from the stream.
+	changes, err := rdr.StreamChanges(ctx, ir.Position{})
+	if err != nil {
+		t.Fatalf("StreamChanges: %v", err)
+	}
+
+	// The binlog syncer registers asynchronously; give it a moment to
+	// catch up to "now" before we generate events. Otherwise the very
+	// first INSERT can be slightly ahead of the registration boundary
+	// and get dropped. 200ms is conservative — local docker is faster.
+	time.Sleep(200 * time.Millisecond)
+
+	const dml = `
+		INSERT INTO users (email, active) VALUES
+			('alice@example.com', 1),
+			('bob@example.com',   0);
+		UPDATE users SET active = 0 WHERE email = 'alice@example.com';
+		DELETE FROM users WHERE email = 'bob@example.com';
+	`
+	applyMySQL(t, dsn, dml)
+
+	// Drain four events: 2 inserts, 1 update, 1 delete.
+	got := drainChanges(t, ctx, changes, 4, 30*time.Second)
+
+	if len(got) != 4 {
+		// Surface the streaming-side error if pump captured one;
+		// otherwise the channel just hadn't filled yet.
+		if cdcRdr, ok := rdr.(*CDCReader); ok {
+			if streamErr := cdcRdr.Err(); streamErr != nil {
+				t.Fatalf("got %d changes; want 4 (stream error: %v)", len(got), streamErr)
+			}
+		}
+		t.Fatalf("got %d changes; want 4", len(got))
+	}
+
+	insAlice, ok := got[0].(ir.Insert)
+	if !ok {
+		t.Fatalf("change[0] = %T; want ir.Insert", got[0])
+	}
+	if insAlice.Table != "users" {
+		t.Errorf("change[0].Table = %q; want users", insAlice.Table)
+	}
+	if email, _ := insAlice.Row["email"].(string); email != "alice@example.com" {
+		t.Errorf("change[0].Row[email] = %#v; want alice@example.com", insAlice.Row["email"])
+	}
+	if active, _ := insAlice.Row["active"].(bool); !active {
+		t.Errorf("change[0].Row[active] = %#v; want true", insAlice.Row["active"])
+	}
+
+	insBob, ok := got[1].(ir.Insert)
+	if !ok {
+		t.Fatalf("change[1] = %T; want ir.Insert", got[1])
+	}
+	if active, _ := insBob.Row["active"].(bool); active {
+		t.Errorf("change[1].Row[active] = %#v; want false", insBob.Row["active"])
+	}
+
+	upd, ok := got[2].(ir.Update)
+	if !ok {
+		t.Fatalf("change[2] = %T; want ir.Update", got[2])
+	}
+	if upd.Before == nil || upd.After == nil {
+		t.Fatalf("update missing Before/After: %+v", upd)
+	}
+	if before, _ := upd.Before["active"].(bool); !before {
+		t.Errorf("update.Before[active] = %#v; want true", upd.Before["active"])
+	}
+	if after, _ := upd.After["active"].(bool); after {
+		t.Errorf("update.After[active] = %#v; want false", upd.After["active"])
+	}
+
+	del, ok := got[3].(ir.Delete)
+	if !ok {
+		t.Fatalf("change[3] = %T; want ir.Delete", got[3])
+	}
+	if email, _ := del.Before["email"].(string); email != "bob@example.com" {
+		t.Errorf("delete.Before[email] = %#v; want bob@example.com", del.Before["email"])
+	}
+
+	// Position bookkeeping: every emitted change must carry a non-empty
+	// position the engine can decode. Also: positions should be
+	// monotonically non-decreasing in their canonical comparison form.
+	for i, c := range got {
+		if c.Pos().Engine != "mysql" {
+			t.Errorf("change[%d].Pos.Engine = %q; want mysql", i, c.Pos().Engine)
+		}
+		if c.Pos().Token == "" {
+			t.Errorf("change[%d].Pos.Token is empty", i)
+		}
+		if _, ok, err := decodeBinlogPos(c.Pos()); !ok || err != nil {
+			t.Errorf("change[%d].Pos failed to decode: ok=%v err=%v", i, ok, err)
+		}
+	}
+}
+
+// TestCDCReader_PlanetScaleRefuses is a unit-style guard inside the
+// integration suite (no docker dependency in the assertion path) that
+// confirms the capability gate kicks in for flavors with CDC=None.
+// Lives in the integration file because the engine import path would
+// otherwise duplicate.
+func TestCDCReader_PlanetScaleRefuses(t *testing.T) {
+	eng := Engine{Flavor: FlavorPlanetScale}
+	_, err := eng.OpenCDCReader(context.Background(), "user:pw@tcp(127.0.0.1:3306)/db")
+	if err == nil {
+		t.Fatal("expected error for planetscale OpenCDCReader; got nil")
+	}
+}
+
+// drainChanges reads up to want events from changes, with an overall
+// timeout. The returned slice may be shorter than want if the stream
+// closed early or the timeout fired — caller asserts.
+func drainChanges(
+	t *testing.T,
+	ctx context.Context,
+	changes <-chan ir.Change,
+	want int,
+	timeout time.Duration,
+) []ir.Change {
+	t.Helper()
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+
+	got := make([]ir.Change, 0, want)
+	for len(got) < want {
+		select {
+		case c, ok := <-changes:
+			if !ok {
+				return got
+			}
+			got = append(got, c)
+		case <-deadline.C:
+			t.Logf("timed out after %v with %d/%d changes", timeout, len(got), want)
+			return got
+		case <-ctx.Done():
+			return got
+		}
+	}
+	return got
+}
+
+// _ ensures reflect is referenced when the assertions move; keeps the
+// import set honest if the test grows.
+var _ = reflect.DeepEqual

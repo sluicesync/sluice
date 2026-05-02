@@ -334,6 +334,88 @@ func (r *SchemaReader) populateForeignKeys(ctx context.Context, tables map[strin
 	return nil
 }
 
+// loadTableSchema reads just the column list for a single table from
+// information_schema. It is the per-table flavour of populateColumns,
+// added so the CDC reader can refresh its schema cache on a single
+// table after a DDL event without re-scanning the entire database.
+//
+// Indexes and foreign keys are not loaded — the CDC dispatcher only
+// needs column names and types to decode row events.
+func loadTableSchema(ctx context.Context, db *sql.DB, schema, table string) (*tableSchema, error) {
+	const q = `
+		SELECT
+			column_name,
+			column_default,
+			is_nullable,
+			LOWER(data_type),
+			character_maximum_length,
+			numeric_precision,
+			numeric_scale,
+			datetime_precision,
+			IFNULL(character_set_name, ''),
+			IFNULL(collation_name, ''),
+			LOWER(column_type),
+			IFNULL(extra, ''),
+			IFNULL(column_comment, '')
+		FROM   information_schema.columns
+		WHERE  table_schema = ?
+		  AND  table_name   = ?
+		ORDER  BY ordinal_position`
+
+	rows, err := db.QueryContext(ctx, q, schema, table)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := &tableSchema{Schema: schema, Name: table}
+	for rows.Next() {
+		var (
+			colName    string
+			defaultVal sql.NullString
+			isNullable string
+			meta       columnMeta
+			comment    string
+		)
+		if err := rows.Scan(
+			&colName,
+			&defaultVal,
+			&isNullable,
+			&meta.DataType,
+			nullableInt64(&meta.CharMaxLen),
+			nullableInt64(&meta.NumPrec),
+			nullableInt64(&meta.NumScale),
+			nullableInt64(&meta.DTPrec),
+			&meta.Charset,
+			&meta.Collation,
+			&meta.ColumnType,
+			&meta.Extra,
+			&comment,
+		); err != nil {
+			return nil, err
+		}
+
+		typ, err := translateType(meta)
+		if err != nil {
+			return nil, fmt.Errorf("table %q column %q: %w", table, colName, err)
+		}
+		out.Columns = append(out.Columns, &ir.Column{
+			Name:     colName,
+			Type:     typ,
+			Nullable: strings.EqualFold(isNullable, "YES"),
+			Default:  translateDefault(defaultVal, meta.Extra),
+			Comment:  comment,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(out.Columns) == 0 {
+		return nil, fmt.Errorf("mysql: table %s.%s has no columns (does it exist?)", schema, table)
+	}
+	return out, nil
+}
+
 // translateDefault converts the (column_default, extra) pair from
 // information_schema into an [ir.DefaultValue]. MySQL signals
 // expression defaults with the "DEFAULT_GENERATED" token in extra;
