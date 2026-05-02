@@ -101,7 +101,14 @@ var flavorCapabilities = map[Flavor]ir.Capabilities{
 	//   - Spatial types are excluded from SupportedTypes here for
 	//     conservatism; flip the flag if a user reports they work.
 	//
-	// Reference: https://planetscale.com/docs/vitess/troubleshooting/mysql-compatibility
+	// References:
+	//   - Compatibility:    https://planetscale.com/docs/vitess/troubleshooting/mysql-compatibility
+	//   - Reference dumper: https://github.com/planetscale/cli
+	//                       (internal/dumper/sql_writer.go is the
+	//                       battle-tested implementation of batched
+	//                       INSERTs against PlanetScale; ~1 MB per
+	//                       INSERT statement, plus `set workload=olap;`
+	//                       on the session for OLAP-mode timeouts.)
 	// ---------------------------------------------------------------
 	FlavorPlanetScale: {
 		BulkLoad:    ir.BulkLoadBatchedInsert,
