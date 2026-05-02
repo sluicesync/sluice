@@ -415,7 +415,7 @@ func parsePGArrayText(s string) (tokens []string, isNull []bool, err error) {
 			}
 			tok = body[start:i]
 			// Trim trailing whitespace inside the bare token.
-			for len(tok) > 0 && (tok[len(tok)-1] == ' ' || tok[len(tok)-1] == '\t') {
+			for tok != "" && (tok[len(tok)-1] == ' ' || tok[len(tok)-1] == '\t') {
 				tok = tok[:len(tok)-1]
 			}
 			// Unquoted NULL is the SQL null marker.
