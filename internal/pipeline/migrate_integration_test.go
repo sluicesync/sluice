@@ -74,7 +74,7 @@ func startMySQL(t *testing.T) (sourceDSN, targetDSN string, cleanup func()) {
 	}
 
 	// Build the two DSNs — same host/credentials, different db names.
-	tgtConn, err := buildDSN(srcConn, "target_db")
+	tgtConn, err := buildMySQLDSN(srcConn, "target_db")
 	if err != nil {
 		terminate()
 		t.Fatalf("build target DSN: %v", err)
@@ -83,11 +83,11 @@ func startMySQL(t *testing.T) (sourceDSN, targetDSN string, cleanup func()) {
 	return srcConn, tgtConn, terminate
 }
 
-// buildDSN replaces the database name in a MySQL DSN. The MySQL DSN
-// format (driver-specific, not a standard URL) places the DB name
+// buildMySQLDSN replaces the database name in a MySQL DSN. The MySQL
+// DSN format (driver-specific, not a standard URL) places the DB name
 // after the host portion: `user:pass@tcp(host:port)/dbname?params`.
 // We swap in the new dbname while preserving everything else.
-func buildDSN(orig, newDB string) (string, error) {
+func buildMySQLDSN(orig, newDB string) (string, error) {
 	// Find the slash that begins the DB name. The DSN looks like:
 	//   user:pass@tcp(host:port)/dbname?params
 	// We can locate it via the LAST `/` before any `?`.
@@ -123,8 +123,9 @@ func lastIndexByte(s string, b byte) int {
 	return -1
 }
 
-// applyDDL runs an arbitrary multi-statement script against dsn.
-func applyDDL(t *testing.T, dsn, ddl string) {
+// applyMySQLDDL runs an arbitrary multi-statement script against a
+// MySQL DSN.
+func applyMySQLDDL(t *testing.T, dsn, ddl string) {
 	t.Helper()
 	db, err := sql.Open("mysql", dsn+"&multiStatements=true")
 	if err != nil {
@@ -174,7 +175,7 @@ func TestMigrate_MySQLToMySQL(t *testing.T) {
 			(1, 'second post'),
 			(2, 'a post by bob');
 	`
-	applyDDL(t, sourceDSN, seedDDL)
+	applyMySQLDDL(t, sourceDSN, seedDDL)
 
 	mysqlEng, ok := engines.Get("mysql")
 	if !ok {

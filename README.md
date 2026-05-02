@@ -76,6 +76,75 @@ sluice --config sluice.yaml migrate --source ... --target ...
 
 See [docs/examples/sluice.yaml](docs/examples/sluice.yaml) for a commented sample config.
 
+## End-to-end walkthrough
+
+A copy-pasteable run against two throwaway containers — useful for verifying a fresh build, demoing the tool, or kicking the tires on a new engine pair. The example migrates a small MySQL database into a fresh Postgres database.
+
+Boot the two databases:
+
+```bash
+docker run -d --rm --name sluice-mysql \
+    -e MYSQL_ROOT_PASSWORD=rootpw \
+    -e MYSQL_DATABASE=app \
+    -p 3306:3306 mysql:8.0
+
+docker run -d --rm --name sluice-pg \
+    -e POSTGRES_PASSWORD=pgpw \
+    -e POSTGRES_DB=app \
+    -p 5432:5432 postgres:16
+```
+
+Seed the MySQL source with a tiny schema and a few rows:
+
+```bash
+docker exec -i sluice-mysql mysql -uroot -prootpw app <<'SQL'
+CREATE TABLE users (
+    id         BIGINT       NOT NULL AUTO_INCREMENT,
+    email      VARCHAR(255) NOT NULL,
+    active     TINYINT(1)   NOT NULL DEFAULT 1,
+    created_at TIMESTAMP(0) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (id),
+    UNIQUE KEY users_email_unique (email)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+INSERT INTO users (email, active) VALUES
+    ('alice@example.com', 1),
+    ('bob@example.com',   0);
+SQL
+```
+
+Run the migration. The `--dry-run` (`-n`) flag prints the plan without writing — useful for sanity-checking before letting it loose:
+
+```bash
+sluice migrate \
+    --source-driver mysql    --source 'root:rootpw@tcp(localhost:3306)/app' \
+    --target-driver postgres --target 'postgres://postgres:pgpw@localhost:5432/app?sslmode=disable' \
+    --dry-run
+
+sluice migrate \
+    --source-driver mysql    --source 'root:rootpw@tcp(localhost:3306)/app' \
+    --target-driver postgres --target 'postgres://postgres:pgpw@localhost:5432/app?sslmode=disable'
+```
+
+Verify the Postgres target:
+
+```bash
+docker exec -i sluice-pg psql -U postgres app <<'SQL'
+\d users
+SELECT id, email, active FROM users ORDER BY id;
+SQL
+```
+
+Expected: a `users` table with `id BIGINT … IDENTITY`, `email VARCHAR(255)`, `active BOOLEAN`, the unique index on `email`, and two rows where alice's `active` is `t` and bob's is `f` — i.e. MySQL's `TINYINT(1)` came across as Postgres `BOOLEAN`.
+
+Tear down:
+
+```bash
+docker stop sluice-mysql sluice-pg
+```
+
+DSNs can also be passed via the `SLUICE_SOURCE` and `SLUICE_TARGET` environment variables instead of `--source`/`--target`.
+
 ## Documents
 
 - [docs/architecture.md](docs/architecture.md) — IR, reader/writer pattern, the two engines, module layout
