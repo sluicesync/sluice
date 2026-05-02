@@ -107,20 +107,31 @@ func TestEmitDefault(t *testing.T) {
 	cases := []struct {
 		name     string
 		in       ir.DefaultValue
+		colType  ir.Type
 		want     string
 		wantEmit bool
 	}{
-		{"none", ir.DefaultNone{}, "", false},
-		{"nil", nil, "", false},
-		{"literal zero", ir.DefaultLiteral{Value: "0"}, "'0'", true},
-		{"literal text", ir.DefaultLiteral{Value: "hello"}, "'hello'", true},
-		{"literal with quote", ir.DefaultLiteral{Value: "it's"}, "'it''s'", true},
-		{"expression", ir.DefaultExpression{Expr: "CURRENT_TIMESTAMP"}, "CURRENT_TIMESTAMP", true},
+		{"none", ir.DefaultNone{}, ir.Integer{Width: 32}, "", false},
+		{"nil", nil, ir.Integer{Width: 32}, "", false},
+		{"literal zero", ir.DefaultLiteral{Value: "0"}, ir.Integer{Width: 32}, "'0'", true},
+		{"literal text", ir.DefaultLiteral{Value: "hello"}, ir.Varchar{Length: 32}, "'hello'", true},
+		{"literal with quote", ir.DefaultLiteral{Value: "it's"}, ir.Varchar{Length: 32}, "'it''s'", true},
+		{"expression", ir.DefaultExpression{Expr: "CURRENT_TIMESTAMP"}, ir.Timestamp{}, "CURRENT_TIMESTAMP", true},
+
+		// Boolean literal translation: PG hands us "true"/"false",
+		// MySQL needs "1"/"0".
+		{"bool literal true", ir.DefaultLiteral{Value: "true"}, ir.Boolean{}, "1", true},
+		{"bool literal false", ir.DefaultLiteral{Value: "false"}, ir.Boolean{}, "0", true},
+		{"bool literal TRUE uppercase", ir.DefaultLiteral{Value: "TRUE"}, ir.Boolean{}, "1", true},
+		{"bool short t", ir.DefaultLiteral{Value: "t"}, ir.Boolean{}, "1", true},
+		{"bool short f", ir.DefaultLiteral{Value: "f"}, ir.Boolean{}, "0", true},
+		// "1"/"0" already arrive from MySQL itself — keep them as-is.
+		{"bool literal 1 passthrough", ir.DefaultLiteral{Value: "1"}, ir.Boolean{}, "'1'", true},
 	}
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			got, ok := emitDefault(c.in)
+			got, ok := emitDefault(c.in, c.colType)
 			if ok != c.wantEmit {
 				t.Errorf("emit flag = %v; want %v", ok, c.wantEmit)
 			}
@@ -161,6 +172,19 @@ func TestEmitColumnDef(t *testing.T) {
 				Default: ir.DefaultLiteral{Value: "1"},
 			},
 			want: "`active` TINYINT(1) NOT NULL DEFAULT '1'",
+		},
+		{
+			// Regression: a Postgres source hands MySQL a boolean
+			// default of "true" (ir.DefaultLiteral). Without the
+			// translation step in emitDefault, MySQL sees DEFAULT
+			// 'true' and rejects it under strict mode.
+			name: "active boolean default true (pg-style)",
+			in: &ir.Column{
+				Name:    "active",
+				Type:    ir.Boolean{},
+				Default: ir.DefaultLiteral{Value: "true"},
+			},
+			want: "`active` TINYINT(1) NOT NULL DEFAULT 1",
 		},
 		{
 			name: "created_at default current_timestamp",

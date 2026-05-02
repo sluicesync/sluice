@@ -460,18 +460,23 @@ func translateDefault(d sql.NullString, autoIncrement bool) ir.DefaultValue {
 // stripTypeCast removes a trailing ::sometype that Postgres adds to
 // column_default values. Returns the input unchanged if no cast is
 // present.
+//
+// The suffix may be a parameterised, qualified, or quoted type name —
+// e.g. `timestamp(0) without time zone`, `pg_catalog."text"`, or
+// `numeric(20,2)`. The character set the matcher accepts is
+// deliberately narrow so something like `(x + y)::int` (where the
+// suffix is just `int`) still strips, while `array[1]::int[]` (with
+// brackets) does not.
 func stripTypeCast(s string) string {
 	idx := strings.LastIndex(s, "::")
 	if idx < 0 {
 		return s
 	}
-	// Only strip if the cast suffix looks like an identifier (or a
-	// space-separated qualified type name). Avoids over-eager
-	// stripping inside complex expressions.
 	suffix := s[idx+2:]
 	for _, r := range suffix {
 		if !(r >= 'a' && r <= 'z') && !(r >= 'A' && r <= 'Z') &&
-			!(r >= '0' && r <= '9') && r != '_' && r != ' ' && r != '"' && r != '.' {
+			!(r >= '0' && r <= '9') && r != '_' && r != ' ' && r != '"' &&
+			r != '.' && r != '(' && r != ')' && r != ',' {
 			return s
 		}
 	}

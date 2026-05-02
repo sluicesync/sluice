@@ -230,12 +230,29 @@ func quoteSQLString(s string) string {
 }
 
 // emitDefault renders a DEFAULT clause body for the given default
-// value. Returns ("", false) if no DEFAULT clause should be emitted.
-func emitDefault(d ir.DefaultValue) (string, bool) {
+// value, given the column type the default belongs to. Returns
+// ("", false) if no DEFAULT clause should be emitted.
+//
+// The column type is consulted only for the narrow case where the
+// IR carries a literal whose canonical form differs across dialects:
+// a Postgres BOOLEAN default of `true`/`false` arrives as a
+// DefaultLiteral with that string value, but MySQL stores boolean as
+// TINYINT and rejects the string `'true'`/`'false'` under strict mode.
+// Translating to `1`/`0` here keeps the IR engine-neutral while
+// letting the writer emit something MySQL accepts.
+func emitDefault(d ir.DefaultValue, t ir.Type) (string, bool) {
 	switch v := d.(type) {
 	case nil, ir.DefaultNone:
 		return "", false
 	case ir.DefaultLiteral:
+		if _, isBool := t.(ir.Boolean); isBool {
+			switch strings.ToLower(strings.TrimSpace(v.Value)) {
+			case "true", "t":
+				return "1", true
+			case "false", "f":
+				return "0", true
+			}
+		}
 		return quoteSQLString(v.Value), true
 	case ir.DefaultExpression:
 		// Expression defaults pass through verbatim — the IR's role
@@ -265,7 +282,7 @@ func emitColumnDef(c *ir.Column) (string, error) {
 	if !c.Nullable {
 		sb.WriteString(" NOT NULL")
 	}
-	if dflt, ok := emitDefault(c.Default); ok {
+	if dflt, ok := emitDefault(c.Default, c.Type); ok {
 		sb.WriteString(" DEFAULT ")
 		sb.WriteString(dflt)
 	}
