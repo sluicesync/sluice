@@ -63,9 +63,19 @@ func (Engine) OpenSchemaWriter(_ context.Context, _ string) (ir.SchemaWriter, er
 	return nil, ErrNotImplemented
 }
 
-// OpenRowReader is not yet implemented.
-func (Engine) OpenRowReader(_ context.Context, _ string) (ir.RowReader, error) {
-	return nil, ErrNotImplemented
+// OpenRowReader returns a [RowReader] bound to the database identified
+// by dsn. The caller is responsible for closing the returned RowReader
+// (via its Close method) to release the underlying connection pool.
+func (Engine) OpenRowReader(ctx context.Context, dsn string) (ir.RowReader, error) {
+	cfg, err := parseDSN(dsn)
+	if err != nil {
+		return nil, err
+	}
+	db, err := openDB(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	return &RowReader{db: db, schema: cfg.schema}, nil
 }
 
 // OpenRowWriter is not yet implemented.
