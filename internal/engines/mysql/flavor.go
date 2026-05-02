@@ -61,7 +61,6 @@ func (f Flavor) capabilities() ir.Capabilities {
 // Kept as a package-level map so adding a new flavor is a one-line
 // addition rather than a switch-statement edit.
 var flavorCapabilities = map[Flavor]ir.Capabilities{
-
 	// ---------------------------------------------------------------
 	// FlavorVanilla — MySQL 8.0+ (the reference implementation).
 	//
