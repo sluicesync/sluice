@@ -106,9 +106,34 @@ func (Engine) OpenRowWriter(ctx context.Context, dsn string) (ir.RowWriter, erro
 	return &RowWriter{db: db, schema: cfg.schema}, nil
 }
 
-// OpenCDCReader is not yet implemented.
-func (Engine) OpenCDCReader(_ context.Context, _ string) (ir.CDCReader, error) {
-	return nil, ErrNotImplemented
+// OpenCDCReader returns a [CDCReader] bound to the database identified
+// by dsn. The reader streams pgoutput logical-replication output via a
+// dedicated replication-mode connection it opens internally; the
+// returned reader also holds a regular *sql.DB pool for precondition
+// queries and one-time DDL (CREATE PUBLICATION on demand). Caller
+// closes the returned reader to release both connections.
+//
+// Requires Postgres 14+ (pgoutput protocol v2) and wal_level=logical
+// on the source. The connecting role needs the REPLICATION attribute
+// to create the replication slot. Both preconditions surface as
+// startup errors rather than mid-stream failures.
+func (Engine) OpenCDCReader(ctx context.Context, dsn string) (ir.CDCReader, error) {
+	cfg, err := parseDSN(dsn)
+	if err != nil {
+		return nil, err
+	}
+	db, err := openDB(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	return &CDCReader{
+		db:           db,
+		schema:       cfg.schema,
+		dsn:          cfg.dsn,
+		publication:  defaultPublication,
+		slotName:     defaultSlot,
+		protoVersion: 2,
+	}, nil
 }
 
 // OpenChangeApplier is not yet implemented.
