@@ -123,16 +123,11 @@ func TestDecodeValueErrors(t *testing.T) {
 		{"bool from int", int64(1), ir.Boolean{}},
 		{"int from string", "1", ir.Integer{Width: 32}},
 		{"timestamp from string", "2026-05-01", ir.Timestamp{}},
-		{"uuid from short bytes", [16]byte{1, 2, 3}, nil}, // unused; placeholder
 		{"uuid wrong length bytes", []byte{1, 2, 3}, ir.UUID{}},
 		{"array from non-slice", "not a slice", ir.Array{Element: ir.Integer{}}},
 		{"array nil element type", []int32{1}, ir.Array{}},
 	}
 	for _, c := range cases {
-		// Skip cases with nil ir.Type marker (placeholder for clarity).
-		if c.t == nil {
-			continue
-		}
 		c := c
 		t.Run(c.name, func(t *testing.T) {
 			if _, err := decodeValue(c.raw, c.t); err == nil {
