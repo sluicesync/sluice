@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted (forward-looking — no CDC reader is implemented yet at the time of this ADR; see roadmap §3).
+Accepted. Implemented in `internal/engines/postgres/cdc_reader.go` using `github.com/jackc/pglogrepl` for the binary protocol parser.
 
 ## Context
 

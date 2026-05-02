@@ -16,7 +16,7 @@ The IR has two layers:
 
 **Change IR.** Represents row-level events (`Insert`, `Update`, `Delete`, `Truncate`) and schema events (`AddColumn`, `DropColumn`, etc.) for the continuous-sync engine. Each event carries the IR-typed values of the affected columns plus durable position information.
 
-Source-specific knowledge lives in **readers**. Target-specific knowledge lives in **writers**. The IR layer itself is pure — no I/O, no logging, no global state — which means the most correctness-critical code is exercised by sub-millisecond table-driven unit tests.
+Source-specific knowledge lives in **readers**. Target-specific knowledge lives in **writers**. The IR layer itself is pure — no I/O, no logging, no global state — which means the most correctness-critical code is exercised by sub-millisecond table-driven unit tests. (See [ADR-0001](adr/adr-0001-ir-first-translation.md) for the IR-first decision and [ADR-0002](adr/adr-0002-sealed-interfaces.md) for the sealed `ir.Type` hierarchy.)
 
 ## Two engines
 
@@ -40,7 +40,7 @@ flowchart LR
     F --> J[Writer: indexes/constraints/FKs]
 ```
 
-Schema is created without indexes or constraints, data is bulk-loaded (`COPY` for Postgres, `LOAD DATA INFILE` for MySQL), and then indexes and constraints are added as a final step. This three-phase ordering — borrowed from `pgcopydb` — is typically 5–10× faster than loading into a fully-constrained schema.
+Schema is created without indexes or constraints, data is bulk-loaded (`COPY` for Postgres, `LOAD DATA INFILE` for MySQL), and then indexes and constraints are added as a final step. This three-phase ordering — borrowed from `pgcopydb` — is typically 5–10× faster than loading into a fully-constrained schema. (See [ADR-0004](adr/adr-0004-three-phase-apply.md) for the phase model.)
 
 Per-table parallelism is the default. Foreign-key dependency order matters only for the constraint-application phase, not for the data-load phase.
 
@@ -61,7 +61,7 @@ flowchart LR
 
 The CDC reader produces a stream of Change IR events. The translator maps them through the type model. The applier batches and applies them to the target, maintaining transactional boundaries where the source provides them. A durable position store records progress on both sides so a crash mid-stream resumes correctly.
 
-The same engine serves two operator intents: bootstrapping a one-time migration (initial snapshot + tail of the change stream until cutover) and ongoing replication (initial snapshot + indefinite tail).
+The same engine serves two operator intents: bootstrapping a one-time migration (initial snapshot + tail of the change stream until cutover) and ongoing replication (initial snapshot + indefinite tail). (See [ADR-0006](adr/adr-0006-pgoutput.md) and [ADR-0008](adr/adr-0008-go-mysql.md) for the per-engine CDC library choices, [ADR-0007](adr/adr-0007-position-persistence.md) for the position store, [ADR-0009](adr/adr-0009-streamer-vs-mode-flag.md) for the orchestrator shape, and [ADR-0010](adr/adr-0010-idempotent-applier.md) for resume safety.)
 
 ## Module layout
 
@@ -135,7 +135,7 @@ type ChangeApplier interface {
 }
 ```
 
-Note that the `Schema*` and `Row*` interfaces are deliberately separate. A simple-mode run needs both; a continuous-sync run needs `SchemaReader` and `SchemaWriter` for bootstrap, then transitions to `CDCReader` and `ChangeApplier`. Keeping them distinct lets the simple-mode engine remain lean and easy to test in isolation.
+Note that the `Schema*` and `Row*` interfaces are deliberately separate. A simple-mode run needs both; a continuous-sync run needs `SchemaReader` and `SchemaWriter` for bootstrap, then transitions to `CDCReader` and `ChangeApplier`. Keeping them distinct lets the simple-mode engine remain lean and easy to test in isolation. (The unexported sealing method on each variant interface is documented in [ADR-0002](adr/adr-0002-sealed-interfaces.md).)
 
 ## Engine capabilities
 
@@ -182,7 +182,7 @@ type Engine interface {
 
 The translator and the simple-mode pipeline consult capabilities to pick a strategy. The Postgres writer's emission of an `Enum` IR value is decided by `cap.EnumSupport`. The MySQL writer's emission of an `Array` IR value is decided by `cap.SupportedTypes.Has(ArrayType)`. The bulk-load phase asks `cap.BulkLoad` rather than guessing.
 
-This pattern means new engines slot in without touching the core. It also means *behaviour differences* between engines are documented as data — readable, diffable, easy to inspect — rather than scattered conditionals.
+This pattern means new engines slot in without touching the core. It also means *behaviour differences* between engines are documented as data — readable, diffable, easy to inspect — rather than scattered conditionals. (See [ADR-0005](adr/adr-0005-mysql-flavors.md) for the per-flavor capability variant model that proves out the pattern.)
 
 ## Adding a new engine
 
@@ -252,6 +252,8 @@ extensions:
     - citext
     - pg_trgm
 ```
+
+Configuration loading and CLI parsing details are discussed in [ADR-0003](adr/adr-0003-kong-koanf.md).
 
 ## Decisions deferred
 

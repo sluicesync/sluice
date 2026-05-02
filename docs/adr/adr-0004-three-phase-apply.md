@@ -18,10 +18,13 @@ A second concern is foreign-key ordering. Even without the performance argument,
 
 1. **CreateTablesWithoutConstraints** — emit `CREATE TABLE` statements with columns, primary keys, and `NOT NULL`, but no secondary indexes and no foreign keys.
 2. *(Bulk row copy phase happens between 1 and 3 — not part of `SchemaWriter` itself.)*
-3. **CreateIndexes** — emit `CREATE INDEX` for every secondary index.
-4. **CreateConstraints** — emit `ALTER TABLE ... ADD FOREIGN KEY` for every FK.
+3. **SyncIdentitySequences** — for engines whose identity columns don't auto-bump on direct INSERT (Postgres), advance each sequence past `MAX(<col>)` so the next user-initiated INSERT doesn't collide with bulk-copied IDs. MySQL's InnoDB auto-bumps, so its implementation is a no-op.
+4. **CreateIndexes** — emit `CREATE INDEX` for every secondary index.
+5. **CreateConstraints** — emit `ALTER TABLE ... ADD FOREIGN KEY` for every FK.
 
-These three methods form the `ir.SchemaWriter` interface. Engines implement them independently (MySQL, Postgres). Inline FK declarations in `CREATE TABLE` are deliberately *not* used even when they'd parse: keeping the contract uniform across engines and across simple-mode vs CDC-resume scenarios is worth more than minor SQL aesthetics.
+These four methods form the `ir.SchemaWriter` interface. Engines implement them independently (MySQL, Postgres). Inline FK declarations in `CREATE TABLE` are deliberately *not* used even when they'd parse: keeping the contract uniform across engines and across simple-mode vs CDC-resume scenarios is worth more than minor SQL aesthetics.
+
+The original three-phase design (this ADR's title) was extended with phase 3.5 (`SyncIdentitySequences`) during roadmap §7 once the cross-engine bug surface around identity columns surfaced in real migrations. The pattern is the same: each phase is an independent `SchemaWriter` method, the orchestrator calls them in order, and engines whose semantics make a phase unnecessary implement it as a no-op. The title stays "three-phase" because the addition is a sub-step of the original pattern rather than a fundamental restructure — and renaming would force every backlink to update without changing the underlying decision.
 
 ## Consequences
 

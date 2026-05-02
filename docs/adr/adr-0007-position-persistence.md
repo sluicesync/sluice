@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted (forward-looking — see roadmap §5; the control table is not implemented yet at the time of this ADR).
+Accepted. Implementation in `internal/engines/{mysql,postgres}/control_table.go` and the per-tx position write inlined into the `ChangeApplier` for each engine.
 
 ## Context
 
@@ -28,7 +28,7 @@ CREATE TABLE sluice_cdc_state (
 );
 ```
 
-`stream_id` is a user-facing identifier the operator picks (or sluice generates from `source-driver + source-host + target-driver + target-host`). `source_position` is engine-opaque; the engine that wrote it is the same engine that reads it, so no cross-engine compatibility is required. Position updates are committed in the same transaction as the data changes they reflect.
+`stream_id` is a user-facing identifier the operator picks (or sluice generates from `source-driver + source-host + target-driver + target-host`). `source_position` is engine-opaque; the engine that wrote it is the same engine that reads it, so no cross-engine compatibility is required. Position updates are committed in the same transaction as the data changes they reflect. The actual schema shipped uses `VARCHAR(255)` for `stream_id` rather than `TEXT` for MySQL primary-key compatibility — the only deviation from the block above.
 
 ## Consequences
 
