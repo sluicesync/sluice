@@ -103,9 +103,26 @@ func (Engine) OpenRowReader(ctx context.Context, dsn string) (ir.RowReader, erro
 	return &RowReader{db: db, schema: cfg.DBName}, nil
 }
 
-// OpenRowWriter is not yet implemented.
-func (Engine) OpenRowWriter(_ context.Context, _ string) (ir.RowWriter, error) {
-	return nil, ErrNotImplemented
+// OpenRowWriter returns a [RowWriter] bound to the database identified
+// by dsn. The writer chooses a bulk-load strategy based on the engine's
+// declared [ir.Capabilities.BulkLoad], so vanilla MySQL and PlanetScale
+// pick different paths from the same call. The caller is responsible
+// for closing the returned RowWriter (via its Close method) to release
+// the underlying connection pool.
+func (e Engine) OpenRowWriter(ctx context.Context, dsn string) (ir.RowWriter, error) {
+	cfg, err := parseDSN(dsn)
+	if err != nil {
+		return nil, err
+	}
+	db, err := openDB(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	return &RowWriter{
+		db:       db,
+		schema:   cfg.DBName,
+		bulkLoad: e.Capabilities().BulkLoad,
+	}, nil
 }
 
 // OpenCDCReader is not yet implemented.
