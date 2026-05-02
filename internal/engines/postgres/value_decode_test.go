@@ -58,6 +58,24 @@ func TestDecodeValue(t *testing.T) {
 			ir.Time{Precision: 0},
 			"08:30:00",
 		},
+		// pgoutput CDC tuple values arrive as []byte in Postgres
+		// canonical text form. The decoder is shared with the
+		// row-reader path that gives us time.Time, so both shapes
+		// must round-trip. (TIMESTAMPTZ parsing is exercised by the
+		// integration test — the location pointer comparison here
+		// is too brittle for a unit test.)
+		{
+			"timestamp from text bytes",
+			[]byte("2026-05-01 12:34:56"),
+			ir.DateTime{Precision: 0},
+			time.Date(2026, 5, 1, 12, 34, 56, 0, time.UTC),
+		},
+		{
+			"date from text bytes",
+			[]byte("2026-05-01"),
+			ir.Date{},
+			time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC),
+		},
 
 		// ---- JSON ----
 		{"json bytes", []byte(`{"k":"v"}`), ir.JSON{Binary: true}, []byte(`{"k":"v"}`)},
@@ -173,7 +191,7 @@ func TestDecodeValueErrors(t *testing.T) {
 		{"bool from int", int64(1), ir.Boolean{}},
 		{"int from non-numeric string", "not a number", ir.Integer{Width: 32}},
 		{"bool from gibberish string", "maybe", ir.Boolean{}},
-		{"timestamp from string", "2026-05-01", ir.Timestamp{}},
+		{"timestamp from gibberish string", "not a date", ir.Timestamp{}},
 		{"uuid wrong length bytes", []byte{1, 2, 3}, ir.UUID{}},
 		{"array from string without braces", "not an array literal", ir.Array{Element: ir.Integer{}}},
 		{"array nil element type", []int32{1}, ir.Array{}},

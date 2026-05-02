@@ -65,10 +65,13 @@ func decodeBoolean(raw any) (any, error) {
 	switch v := raw.(type) {
 	case bool:
 		return v, nil
+	case []byte:
+		return decodeBoolean(string(v))
 	case string:
 		// Postgres text form: "t"/"f", or "true"/"false". Surfaces
 		// when arrays of booleans come back via the array text
-		// parser.
+		// parser, and again on every CDC tuple value (pgoutput
+		// streams text-format payloads by default).
 		switch v {
 		case "t", "T", "true", "TRUE", "True":
 			return true, nil
@@ -83,9 +86,10 @@ func decodeBoolean(raw any) (any, error) {
 // decodeInteger widens any signed integer pgx returns into int64.
 // Postgres has no native unsigned integers, so we never see uint*.
 //
-// Strings are accepted as a fallback: the array text-form parser
-// hands per-element strings here, and pgx's stdlib mode can also
-// surface integers as strings under some configurations.
+// String/bytes are accepted as a fallback: the array text-form
+// parser hands per-element strings here, pgx's stdlib mode can
+// surface integers as strings under some configurations, and
+// pgoutput CDC tuples carry text-format []byte for every value.
 func decodeInteger(raw any) (any, error) {
 	switch v := raw.(type) {
 	case int64:
@@ -98,6 +102,8 @@ func decodeInteger(raw any) (any, error) {
 		return int64(v), nil
 	case int:
 		return int64(v), nil
+	case []byte:
+		return decodeInteger(string(v))
 	case string:
 		n, err := strconv.ParseInt(v, 10, 64)
 		if err != nil {
@@ -121,14 +127,17 @@ func decodeDecimal(raw any) (any, error) {
 }
 
 // decodeFloat returns float64. Single-precision floats are widened —
-// no information loss in this direction. Strings are accepted as a
-// fallback path for array text decoding.
+// no information loss in this direction. String/bytes are accepted
+// as a fallback path for array text decoding and pgoutput CDC
+// tuple values.
 func decodeFloat(raw any) (any, error) {
 	switch v := raw.(type) {
 	case float64:
 		return v, nil
 	case float32:
 		return float64(v), nil
+	case []byte:
+		return decodeFloat(string(v))
 	case string:
 		f, err := strconv.ParseFloat(v, 64)
 		if err != nil {
@@ -163,13 +172,44 @@ func decodeBytes(raw any) (any, error) {
 	return nil, fmt.Errorf("postgres: cannot decode %T as bytes", raw)
 }
 
-// decodeTime accepts a time.Time directly (pgx's default for
-// timestamp/timestamptz/date columns).
+// decodeTime accepts pgx's time.Time (the database/sql path) or a
+// text-format Postgres timestamp/date string ([]byte or string,
+// the pgoutput CDC path). Format detection is by-length rather than
+// trial-and-error parse: the canonical Postgres text representations
+// are unambiguous.
 func decodeTime(raw any) (any, error) {
-	if v, ok := raw.(time.Time); ok {
+	switch v := raw.(type) {
+	case time.Time:
 		return v, nil
+	case []byte:
+		return parsePGTimeText(string(v))
+	case string:
+		return parsePGTimeText(v)
 	}
 	return nil, fmt.Errorf("postgres: cannot decode %T as time.Time", raw)
+}
+
+// parsePGTimeText parses Postgres canonical text forms for DATE,
+// TIMESTAMP, and TIMESTAMPTZ. Each tries in order; first to succeed
+// wins. The format strings mirror pgx's internal pgTimestampFormat
+// to stay consistent across pgx-driven and pgoutput-driven paths.
+func parsePGTimeText(s string) (time.Time, error) {
+	layouts := []string{
+		// TIMESTAMPTZ — canonical Postgres output is "2006-01-02 15:04:05.999999-07".
+		"2006-01-02 15:04:05.999999999-07",
+		"2006-01-02 15:04:05-07",
+		// TIMESTAMP without timezone.
+		"2006-01-02 15:04:05.999999999",
+		"2006-01-02 15:04:05",
+		// DATE.
+		"2006-01-02",
+	}
+	for _, layout := range layouts {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t, nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("postgres: cannot parse %q as time.Time", s)
 }
 
 // decodeTimeAsString converts pgx's time-of-day representation (a
