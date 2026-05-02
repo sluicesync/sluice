@@ -1,0 +1,65 @@
+#!/bin/sh
+# Pre-commit hook: run formatting check, vet, and fast unit tests
+# before allowing a commit. Failures abort the commit with a clear
+# message; pass --no-verify to bypass (use sparingly).
+#
+# Calls gofumpt and go directly so it doesn't depend on `make` being
+# installed — works on Windows (Git Bash), macOS, and Linux.
+#
+# Enable in a fresh clone with:
+#   git config core.hooksPath .githooks
+#
+# See docs/dev/development.md for the full local-dev workflow.
+
+set -e
+
+red()   { printf "\033[31m%s\033[0m\n" "$*"; }
+green() { printf "\033[32m%s\033[0m\n" "$*"; }
+
+# Only run checks if Go files are staged. Lets non-code commits
+# (docs, CI config, etc.) skip the slow steps.
+if ! git diff --cached --name-only --diff-filter=ACM | grep -q '\.go$'; then
+	green "pre-commit: no Go files staged, skipping checks"
+	exit 0
+fi
+
+echo "pre-commit: running gofumpt check, go vet, and tests..."
+
+# ---- gofumpt ----
+if ! command -v gofumpt >/dev/null 2>&1; then
+	red "pre-commit: gofumpt not installed."
+	echo "Install: go install mvdan.cc/gofumpt@latest"
+	exit 1
+fi
+unformatted=$(gofumpt -l .)
+if [ -n "$unformatted" ]; then
+	red "pre-commit: gofumpt would reformat the following files:"
+	echo "$unformatted"
+	echo ""
+	echo "Run: gofumpt -w ."
+	echo "Then: git add ... && git commit"
+	exit 1
+fi
+
+# ---- go vet ----
+if ! go vet ./...; then
+	red "pre-commit: go vet failed."
+	exit 1
+fi
+
+# ---- go test (fast, no DB) ----
+# -race is preferred but requires cgo. On Windows / minimal-toolchain
+# setups CGO_ENABLED=0 by default, in which case we skip -race locally
+# and rely on CI (Linux runners, cgo on) to catch races. Same checks
+# either way, just a slightly slimmer guarantee on Windows.
+test_args="-count=1"
+if [ "$(go env CGO_ENABLED 2>/dev/null)" = "1" ]; then
+	test_args="$test_args -race"
+fi
+if ! go test $test_args ./... >/dev/null; then
+	red "pre-commit: tests failed."
+	echo "Run: go test ./...  (to see the failure)"
+	exit 1
+fi
+
+green "pre-commit: OK"

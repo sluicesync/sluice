@@ -1,4 +1,4 @@
-.PHONY: all build test test-it test-all bench lint vet fmt tidy clean help
+.PHONY: all build test test-it test-all bench lint vet fmt fmt-check pre-commit tidy clean help
 
 GO         ?= go
 PKG        := github.com/orware/sluice
@@ -42,8 +42,32 @@ lint: vet ## Run go vet plus golangci-lint
 vet: ## Run go vet
 	$(GO) vet ./...
 
-fmt: ## Apply gofmt to all .go files
-	$(GO) fmt ./...
+fmt: ## Apply gofumpt (preferred) or gofmt to all .go files
+	@if command -v gofumpt >/dev/null 2>&1; then \
+		echo "gofumpt -l -w ."; \
+		gofumpt -l -w .; \
+	else \
+		echo "gofumpt not installed; falling back to go fmt"; \
+		echo "Install: go install mvdan.cc/gofumpt@latest"; \
+		$(GO) fmt ./...; \
+	fi
+
+fmt-check: ## Verify formatting without writing changes (exits non-zero if any file would change)
+	@if ! command -v gofumpt >/dev/null 2>&1; then \
+		echo "gofumpt not installed. Install: go install mvdan.cc/gofumpt@latest"; \
+		exit 1; \
+	fi
+	@out=$$(gofumpt -l .); \
+	if [ -n "$$out" ]; then \
+		echo "gofumpt would reformat the following files:"; \
+		echo "$$out"; \
+		echo ""; \
+		echo "Run 'make fmt' to apply."; \
+		exit 1; \
+	fi
+
+pre-commit: fmt-check vet test ## Run the pre-commit suite locally (formatting, vet, fast tests)
+	@echo "OK — ready to commit."
 
 tidy: ## go mod tidy
 	$(GO) mod tidy

@@ -37,9 +37,14 @@ const defaultMaxRowsPerBatch = 500
 // The writer holds an open *sql.DB; callers should call Close when
 // finished to release the connection pool.
 type RowWriter struct {
-	db        *sql.DB
-	schema    string
-	bulkLoad  ir.BulkLoadMethod
+	db       *sql.DB
+	schema   string
+	bulkLoad ir.BulkLoadMethod
+
+	// maxRowsPerBatch caps the number of rows folded into a single
+	// INSERT statement. Tests can override it; callers typically
+	// leave it as the zero value, in which case defaultMaxRowsPerBatch
+	// is used.
 	maxRowsPerBatch int
 }
 

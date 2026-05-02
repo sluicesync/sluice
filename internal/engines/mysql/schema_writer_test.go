@@ -32,8 +32,10 @@ func TestSchemaWriter_RoundTrip(t *testing.T) {
 				{Name: "email", Type: ir.Varchar{Length: 255, Charset: "utf8mb4", Collation: "utf8mb4_0900_ai_ci"}},
 				{Name: "active", Type: ir.Boolean{}, Default: ir.DefaultLiteral{Value: "1"}},
 				{Name: "role", Type: ir.Enum{Values: []string{"admin", "user", "guest"}}},
-				{Name: "created_at", Type: ir.Timestamp{Precision: 6, WithTimeZone: true},
-					Default: ir.DefaultExpression{Expr: "CURRENT_TIMESTAMP(6)"}},
+				{
+					Name: "created_at", Type: ir.Timestamp{Precision: 6, WithTimeZone: true},
+					Default: ir.DefaultExpression{Expr: "CURRENT_TIMESTAMP(6)"},
+				},
 				{Name: "profile", Type: ir.JSON{Binary: true}, Nullable: true},
 			},
 			PrimaryKey: &ir.Index{
