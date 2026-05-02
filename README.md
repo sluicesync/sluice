@@ -2,13 +2,15 @@
 
 An open-source tool for migrating and continuously syncing data between relational databases. The initial release ships with MySQL and PostgreSQL support in all four directions; the architecture is deliberately engine-neutral so additional engines can be added later.
 
+## Quickstart
+
+The fastest way to see what sluice does is to run it. The walkthrough at [docs/examples/quickstart.md](docs/examples/quickstart.md) sets up a MySQL 8.0 + Postgres 16 pair via Docker Compose, loads the sakila sample database, and runs both a one-shot bulk migration and a continuous-sync stream — about 10 minutes start to finish.
+
 ## Status
 
-Pre-release. The IR package, engine registry, and CLI skeleton are in place; engine implementations (MySQL and PostgreSQL) are next. See [docs/architecture.md](docs/architecture.md) for the design and roadmap.
+Pre-1.0. Both engines (MySQL and Postgres) are implemented and tested against real database containers; the simple-mode orchestrator and continuous-sync streamer both work end-to-end. Architecture, design decisions, and roadmap are documented in [docs/architecture.md](docs/architecture.md), [docs/adr/](docs/adr/), and [docs/dev/roadmap.md](docs/dev/roadmap.md).
 
-## Stability
-
-`sluice` follows [Semantic Versioning](https://semver.org/) from day one. While the project is in `v0.x`, however, *no API or CLI stability guarantees are made* — minor releases may include breaking changes as the design settles. Once `v1.0.0` ships, breaking changes will only land in major versions.
+Versioning follows [SemVer](https://semver.org/). While the project is in `v0.x`, minor releases may include breaking changes — the API and CLI surface are still settling. Once `v1.0.0` ships, breaking changes will only land in major versions.
 
 ## What it does
 

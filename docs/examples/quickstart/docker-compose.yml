@@ -1,0 +1,68 @@
+# docker-compose for the sluice quickstart walkthrough.
+#
+# Brings up MySQL 8.0 + Postgres 16 with the GUC settings sluice
+# needs for continuous-sync mode. The MySQL init script downloads
+# the upstream sakila sample database (~30 MB) on first start.
+# Postgres starts with an empty `pagila` database — sluice itself
+# populates it during the migration step of the walkthrough.
+#
+# Usage (from this directory):
+#   docker compose up -d           # start both, ~30 sec for sakila download
+#   docker compose ps              # both should report 'healthy'
+#   docker compose down -v         # cleanup (volumes too — full reset)
+#
+# Connection strings, for sluice:
+#   MySQL:    root:rootpw@tcp(localhost:3306)/sakila
+#   Postgres: postgres://postgres:postgres@localhost:5432/pagila?sslmode=disable
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: sluice-quickstart-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpw
+      MYSQL_DATABASE: sakila
+    # Match the binlog config the sluice integration tests use; the
+    # walkthrough's continuous-sync section depends on this.
+    command:
+      - mysqld
+      - --server-id=1
+      - --log-bin=mysql-bin
+      - --binlog-format=ROW
+      - --binlog-row-image=FULL
+    ports:
+      - "3306:3306"
+    volumes:
+      - ./mysql-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-prootpw"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 60s
+
+  postgres:
+    image: postgres:16
+    container_name: sluice-quickstart-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: pagila
+    # wal_level=logical is required for sluice's CDC; the rest
+    # match the integration tests' Postgres settings so the
+    # walkthrough's behaviour matches what's covered by tests.
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_wal_senders=4
+      - -c
+      - max_replication_slots=4
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
