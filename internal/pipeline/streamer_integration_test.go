@@ -103,7 +103,19 @@ func newRecordingApplier() *recordingApplier {
 	return &recordingApplier{sig: make(chan struct{}, 64)}
 }
 
-func (a *recordingApplier) Apply(ctx context.Context, changes <-chan ir.Change) error {
+// EnsureControlTable is a no-op for the stub — the recording
+// applier doesn't talk to a database. The Streamer still calls
+// this method as part of its startup flow.
+func (a *recordingApplier) EnsureControlTable(_ context.Context) error { return nil }
+
+// ReadPosition always reports "no row" so the Streamer takes the
+// cold-start path. Tests covering warm resume use a real engine
+// applier rather than this stub.
+func (a *recordingApplier) ReadPosition(_ context.Context, _ string) (ir.Position, bool, error) {
+	return ir.Position{}, false, nil
+}
+
+func (a *recordingApplier) Apply(ctx context.Context, _ string, changes <-chan ir.Change) error {
 	for {
 		select {
 		case c, ok := <-changes:

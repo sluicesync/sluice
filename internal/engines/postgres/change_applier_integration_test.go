@@ -72,14 +72,21 @@ func applyPGApplier(t *testing.T, dsn, sqlText string) {
 	}
 }
 
+// testStreamID is the fixed stream_id the applier integration tests
+// use. Position writes from these tests all land on this single row.
+const testStreamID = "test-stream"
+
 func pumpChanges(t *testing.T, ctx context.Context, applier ir.ChangeApplier, events []ir.Change) {
 	t.Helper()
+	if err := applier.EnsureControlTable(ctx); err != nil {
+		t.Fatalf("EnsureControlTable: %v", err)
+	}
 	ch := make(chan ir.Change, len(events))
 	for _, e := range events {
 		ch <- e
 	}
 	close(ch)
-	if err := applier.Apply(ctx, ch); err != nil {
+	if err := applier.Apply(ctx, testStreamID, ch); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
 }

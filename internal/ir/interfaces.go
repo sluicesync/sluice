@@ -38,12 +38,33 @@ type CDCReader interface {
 	StreamChanges(ctx context.Context, from Position) (<-chan Change, error)
 }
 
-// ChangeApplier applies [Change] events to a target database.
-// Implementations should respect transactional boundaries supplied by
-// the source (when present) and update durable position tracking as
-// changes are committed.
+// ChangeApplier applies [Change] events to a target database and
+// persists progress alongside each applied change. Each Apply call
+// commits the data write and the position update in the same target
+// transaction (per ADR-0007), so progress and applied data can never
+// diverge.
+//
+// Lifecycle: callers (typically pipeline.Streamer) first invoke
+// EnsureControlTable once at startup to create the per-target state
+// table, then ReadPosition to detect a previous run, then Apply with
+// the resolved streamID.
 type ChangeApplier interface {
-	Apply(ctx context.Context, changes <-chan Change) error
+	// EnsureControlTable creates the per-target sluice_cdc_state
+	// table if it doesn't exist. Idempotent; safe to call on every
+	// start.
+	EnsureControlTable(ctx context.Context) error
+
+	// ReadPosition returns the last persisted source position for
+	// streamID, or ok=false when no row exists. ok=false signals
+	// "first run" (cold start); ok=true signals "resume from this
+	// position" (warm resume).
+	ReadPosition(ctx context.Context, streamID string) (Position, bool, error)
+
+	// Apply consumes Change events from the channel and applies each
+	// to the target. The position write happens inside the same
+	// transaction as the data write — atomicity guarantees that
+	// progress and data move together.
+	Apply(ctx context.Context, streamID string, changes <-chan Change) error
 }
 
 // Engine is the bundle of operations a database engine implementation

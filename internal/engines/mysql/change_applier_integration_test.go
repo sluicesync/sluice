@@ -74,14 +74,22 @@ func applyMySQLApplier(t *testing.T, dsn, sqlText string) {
 // pumpChanges pushes events into the applier on a goroutine and
 // returns a function that closes the channel and waits for Apply to
 // return. Mirrors how the production Streamer wires the channel.
+//
+// streamID is required by the applier interface (§5 control table);
+// tests use a fixed value so position writes go to a single row.
+const testStreamID = "test-stream"
+
 func pumpChanges(t *testing.T, ctx context.Context, applier ir.ChangeApplier, events []ir.Change) {
 	t.Helper()
+	if err := applier.EnsureControlTable(ctx); err != nil {
+		t.Fatalf("EnsureControlTable: %v", err)
+	}
 	ch := make(chan ir.Change, len(events))
 	for _, e := range events {
 		ch <- e
 	}
 	close(ch)
-	if err := applier.Apply(ctx, ch); err != nil {
+	if err := applier.Apply(ctx, testStreamID, ch); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
 }

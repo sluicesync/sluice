@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -61,19 +62,45 @@ func (a *ChangeApplier) Close() error {
 	return a.db.Close()
 }
 
+// EnsureControlTable creates the per-target sluice_cdc_state table
+// (in the applier's schema) if it doesn't exist. Idempotent.
+func (a *ChangeApplier) EnsureControlTable(ctx context.Context) error {
+	return ensureControlTable(ctx, a.db, a.schema)
+}
+
+// ReadPosition returns the last persisted source position for
+// streamID, or ok=false when no row exists. The returned Position
+// always has Engine = "postgres".
+func (a *ChangeApplier) ReadPosition(ctx context.Context, streamID string) (ir.Position, bool, error) {
+	token, ok, err := readPosition(ctx, a.db, a.schema, streamID)
+	if err != nil {
+		return ir.Position{}, false, err
+	}
+	if !ok {
+		return ir.Position{}, false, nil
+	}
+	return ir.Position{Engine: engineNamePostgres, Token: token}, true, nil
+}
+
 // Apply consumes changes from the channel and applies each to the
-// target in its own transaction. Returns when the channel closes
-// (clean shutdown), when ctx is cancelled, or when a target write
-// fails (in which case the error is wrapped with the change kind
-// and table name).
-func (a *ChangeApplier) Apply(ctx context.Context, changes <-chan ir.Change) error {
+// target in its own transaction. The position write happens inside
+// the same transaction as the data write (per ADR-0007); a crash
+// between them rolls back both, so progress and data can never
+// diverge.
+//
+// Returns when the channel closes (clean shutdown), when ctx is
+// cancelled, or when a target write fails.
+func (a *ChangeApplier) Apply(ctx context.Context, streamID string, changes <-chan ir.Change) error {
+	if streamID == "" {
+		return errors.New("postgres: applier: streamID is empty (Streamer is responsible for resolving it)")
+	}
 	for {
 		select {
 		case c, ok := <-changes:
 			if !ok {
 				return nil
 			}
-			if err := a.applyOne(ctx, c); err != nil {
+			if err := a.applyOne(ctx, streamID, c); err != nil {
 				return err
 			}
 		case <-ctx.Done():
@@ -82,16 +109,19 @@ func (a *ChangeApplier) Apply(ctx context.Context, changes <-chan ir.Change) err
 	}
 }
 
-// applyOne dispatches a single change to its SQL form and runs it
-// in a target transaction. The transaction shape is one statement
-// per change; this future-proofs the §5 control-table integration,
-// which adds a position UPDATE inside the same BEGIN/COMMIT.
-func (a *ChangeApplier) applyOne(ctx context.Context, c ir.Change) error {
+// applyOne dispatches a single change to its SQL form, runs the
+// data write, and writes the position update — all in the same
+// transaction.
+func (a *ChangeApplier) applyOne(ctx context.Context, streamID string, c ir.Change) error {
 	tx, err := a.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("postgres: applier: begin tx: %w", err)
 	}
 	if err := a.dispatch(ctx, tx, c); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if err := writePositionTx(ctx, tx, a.schema, streamID, c.Pos().Token); err != nil {
 		_ = tx.Rollback()
 		return err
 	}
