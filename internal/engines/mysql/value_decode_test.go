@@ -28,10 +28,21 @@ func TestDecodeValue(t *testing.T) {
 		{"bool from bit zero byte", []byte{0x00}, ir.Boolean{}, false},
 		{"bool from bit one byte", []byte{0x01}, ir.Boolean{}, true},
 		{"bool from bit set byte", []byte{0x80}, ir.Boolean{}, true},
+		// Binlog returns native-width ints rather than database/sql's
+		// widened int64. The decoder must accept both paths.
+		{"bool from int8=1", int8(1), ir.Boolean{}, true},
+		{"bool from int8=0", int8(0), ir.Boolean{}, false},
+		{"bool from uint8=1", uint8(1), ir.Boolean{}, true},
 
 		// ---- Integer ----
 		{"int64 passthrough", int64(42), ir.Integer{Width: 32}, int64(42)},
 		{"uint64 passthrough", uint64(0xffffffffffffffff), ir.Integer{Width: 64, Unsigned: true}, uint64(0xffffffffffffffff)},
+		// Binlog narrow-width passthroughs widen to int64/uint64 so
+		// downstream consumers see a uniform shape.
+		{"int8 widened", int8(7), ir.Integer{Width: 8}, int64(7)},
+		{"int16 widened", int16(-300), ir.Integer{Width: 16}, int64(-300)},
+		{"int32 widened", int32(70000), ir.Integer{Width: 32}, int64(70000)},
+		{"uint32 widened", uint32(70000), ir.Integer{Width: 32, Unsigned: true}, uint64(70000)},
 
 		// ---- Decimal ----
 		{"decimal as string", []byte("3.14159"), ir.Decimal{Precision: 6, Scale: 5}, "3.14159"},

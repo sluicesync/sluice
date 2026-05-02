@@ -56,14 +56,32 @@ func decodeValue(raw any, t ir.Type) (any, error) {
 	return nil, fmt.Errorf("mysql: no decoder for IR type %T", t)
 }
 
-// decodeBoolean accepts either int64 (TINYINT(1)) or []byte/string
-// (BIT(1)) and returns a Go bool. Any non-zero numeric or non-empty
-// non-zero byte sequence is true; anything else is false.
+// decodeBoolean accepts the various integer widths the row source can
+// produce — database/sql widens everything to int64/uint64, but the
+// binlog reader hands back native widths (int8 for TINYINT, etc.) —
+// plus bool, BIT(1) bytes, and string fallbacks. Non-zero numeric or
+// non-empty non-zero byte sequence is true; anything else is false.
 func decodeBoolean(raw any) (any, error) {
 	switch v := raw.(type) {
 	case int64:
 		return v != 0, nil
+	case int32:
+		return v != 0, nil
+	case int16:
+		return v != 0, nil
+	case int8:
+		return v != 0, nil
+	case int:
+		return v != 0, nil
 	case uint64:
+		return v != 0, nil
+	case uint32:
+		return v != 0, nil
+	case uint16:
+		return v != 0, nil
+	case uint8:
+		return v != 0, nil
+	case uint:
 		return v != 0, nil
 	case bool:
 		return v, nil
@@ -81,14 +99,32 @@ func decodeBoolean(raw any) (any, error) {
 	return nil, fmt.Errorf("mysql: cannot decode %T as Boolean", raw)
 }
 
-// decodeInteger preserves the driver's int64 / uint64 distinction so
-// downstream code can reason about signedness correctly.
+// decodeInteger normalises the various integer widths a MySQL row
+// source can produce into int64/uint64. database/sql already widens
+// to int64/uint64 for us, but the binlog reader returns native widths
+// (int8 for TINYINT, int32 for INT, etc.); both paths land here.
 func decodeInteger(raw any) (any, error) {
 	switch v := raw.(type) {
 	case int64:
 		return v, nil
+	case int32:
+		return int64(v), nil
+	case int16:
+		return int64(v), nil
+	case int8:
+		return int64(v), nil
+	case int:
+		return int64(v), nil
 	case uint64:
 		return v, nil
+	case uint32:
+		return uint64(v), nil
+	case uint16:
+		return uint64(v), nil
+	case uint8:
+		return uint64(v), nil
+	case uint:
+		return uint64(v), nil
 	case []byte:
 		// Some MySQL builds return integers as bytes for very large
 		// values. We keep them as bytes — callers can parse on demand.
