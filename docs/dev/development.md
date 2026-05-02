@@ -80,6 +80,20 @@ make test-it
 
 If Docker isn't available, the tests skip cleanly via `testcontainers.SkipIfProviderIsNotHealthy` — they don't fail. CI's Linux runners have Docker installed, so the integration tests execute there even when local devs can't run them.
 
+### Rancher Desktop on Windows
+
+Rancher Desktop works as a Docker Desktop replacement, with two snags worth knowing:
+
+- **PATH.** Rancher Desktop installs its `docker.exe` shim under `C:\Program Files\Rancher Desktop\resources\resources\win32\bin\`. Add that directory to `PATH` (or use Rancher Desktop's "Add to PATH" toggle on first launch); otherwise `docker` won't be on `PATH` for new shells even though the daemon is running.
+- **Disable the testcontainers ryuk reaper.** Testcontainers normally launches a `testcontainers/ryuk` sidecar to garbage-collect leaked containers. Under Rancher Desktop on Windows the ryuk container vanishes from the daemon's view almost immediately, and testcontainers retries it ~10× before failing the test with `No such container: ...`. Set `TESTCONTAINERS_RYUK_DISABLED=true` in your shell:
+
+  ```bash
+  export TESTCONTAINERS_RYUK_DISABLED=true   # bash / Git Bash
+  $env:TESTCONTAINERS_RYUK_DISABLED='true'   # PowerShell
+  ```
+
+  Our tests already terminate their containers via `defer cleanup()` so dropping ryuk doesn't leak anything in practice. CI runs Docker on Linux where ryuk works fine, so this is a local-only override.
+
 ## Branch protection
 
 See [docs/dev/branch-protection.md](branch-protection.md) for the recommended GitHub branch-protection rules. Once those are enabled, CI checks are load-bearing for merges, and the local pre-commit hook catches the same issues earlier.

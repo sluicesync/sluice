@@ -38,6 +38,8 @@ Required to be clean before commit: `gofumpt -l .`, `go vet ./...`, `golangci-li
 
 Integration tests need Docker and the `integration` build tag: `go test -tags=integration ./internal/...`. They take a few minutes (testcontainers boots real MySQL and Postgres). Run them after non-trivial changes to readers/writers/orchestrator.
 
+On Windows with Rancher Desktop, two things bite: `docker.exe` lives at `C:\Program Files\Rancher Desktop\resources\resources\win32\bin\` (often missing from `PATH`), and you need `TESTCONTAINERS_RYUK_DISABLED=true` because the ryuk reaper container vanishes immediately under Rancher's daemon. Without that env var the test loops through ~10 retries and fails with `No such container: ...`. See `docs/dev/development.md` for details. CI on Linux is unaffected.
+
 ## CI shape
 
 Four GitHub Actions jobs gate merges (see `.github/workflows/ci.yml` and `docs/dev/branch-protection.md`):
