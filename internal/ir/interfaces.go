@@ -8,13 +8,26 @@ type SchemaReader interface {
 }
 
 // SchemaWriter applies an IR [Schema] to a target database in three
-// phases. Splitting schema creation from index/constraint creation is
-// what enables fast bulk-loading: data is loaded into bare tables,
-// then indexes and constraints are added once the data is in place.
+// phases plus a small post-bulk-copy reconciliation step. Splitting
+// schema creation from index/constraint creation is what enables
+// fast bulk-loading: data is loaded into bare tables, then indexes
+// and constraints are added once the data is in place.
 type SchemaWriter interface {
 	CreateTablesWithoutConstraints(ctx context.Context, s *Schema) error
 	CreateIndexes(ctx context.Context, s *Schema) error
 	CreateConstraints(ctx context.Context, s *Schema) error
+
+	// SyncIdentitySequences advances each identity-column's sequence
+	// past the maximum value present in the target table. Called
+	// once after bulk-copy completes (between row-load and index
+	// creation in the orchestrator). Without this, a target that
+	// received explicit-id rows via bulk-copy would have its
+	// sequence left at its default; the next user-initiated INSERT
+	// would collide with bulk-copied IDs.
+	//
+	// Engines whose identity mechanism auto-bumps on direct INSERT
+	// of explicit values (MySQL InnoDB) implement this as a no-op.
+	SyncIdentitySequences(ctx context.Context, s *Schema) error
 }
 
 // RowReader streams rows from a single table for the bulk-copy phase.

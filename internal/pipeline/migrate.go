@@ -124,15 +124,23 @@ func (m *Migrator) Run(ctx context.Context) error {
 	return nil
 }
 
-// runBulkCopy applies the four shared phases that follow target-writer
+// runBulkCopy applies the shared phases that follow target-writer
 // open: schema phase 1 (tables without constraints) → bulk-copy of
-// every table → schema phase 2 (indexes) → schema phase 3 (foreign
-// keys). Used by both [Migrator] (one-shot mode) and [Streamer]
-// (long-running mode) — the only difference between them is where
-// `rows` comes from (engine-pool RowReader vs [ir.SnapshotStream].Rows).
+// every table → identity-sequence sync → schema phase 2 (indexes) →
+// schema phase 3 (foreign keys). Used by both [Migrator] (one-shot
+// mode) and [Streamer] (long-running mode); the only difference is
+// where `rows` comes from (engine-pool RowReader vs
+// [ir.SnapshotStream].Rows).
 //
-// Errors from any phase are wrapped with the phase name so the caller
-// can pinpoint which step failed without parsing strings.
+// Phase 3.5 (identity-sequence sync) runs between bulk-copy and
+// indexes so the next user-initiated INSERT against an identity
+// column doesn't collide with bulk-copied IDs. Engines whose
+// identity mechanism auto-bumps on direct INSERT (MySQL InnoDB)
+// implement this as a no-op; the call costs nothing on those
+// engines.
+//
+// Errors from any phase are wrapped with the phase name so the
+// caller can pinpoint which step failed without parsing strings.
 func runBulkCopy(
 	ctx context.Context,
 	schema *ir.Schema,
@@ -147,6 +155,9 @@ func runBulkCopy(
 		if err := copyTable(ctx, rows, rw, table); err != nil {
 			return fmt.Errorf("pipeline: copy table %q: %w", table.Name, err)
 		}
+	}
+	if err := sw.SyncIdentitySequences(ctx, schema); err != nil {
+		return fmt.Errorf("pipeline: sync identity sequences: %w", err)
 	}
 	if err := sw.CreateIndexes(ctx, schema); err != nil {
 		return fmt.Errorf("pipeline: create indexes: %w", err)

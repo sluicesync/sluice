@@ -119,6 +119,7 @@ func TestRunCallsThreePhasesInOrder(t *testing.T) {
 	wantPhases := []string{
 		"CreateTablesWithoutConstraints",
 		"WriteRows:users",
+		"SyncIdentitySequences",
 		"CreateIndexes",
 		"CreateConstraints",
 	}
@@ -261,6 +262,11 @@ func (w *recordingSchemaWriter) CreateIndexes(context.Context, *ir.Schema) error
 
 func (w *recordingSchemaWriter) CreateConstraints(context.Context, *ir.Schema) error {
 	*w.phaseLog = append(*w.phaseLog, "CreateConstraints")
+	return nil
+}
+
+func (w *recordingSchemaWriter) SyncIdentitySequences(context.Context, *ir.Schema) error {
+	*w.phaseLog = append(*w.phaseLog, "SyncIdentitySequences")
 	return nil
 }
 

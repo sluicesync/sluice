@@ -123,6 +123,67 @@ func (w *SchemaWriter) CreateConstraints(ctx context.Context, s *ir.Schema) erro
 	return nil
 }
 
+// SyncIdentitySequences advances every identity column's sequence
+// past the maximum value present in the target table. Runs after
+// bulk-copy completes so user-initiated INSERTs against IDs that
+// would have been auto-generated don't collide with bulk-copied IDs.
+//
+// Implementation is two queries per identity column: a MAX read,
+// followed by a conditional setval. The split (vs. a single SQL
+// statement) avoids the Postgres edge case where setval(seq, 0)
+// errors on a sequence with the default minvalue=1; an empty
+// target table simply skips the setval and leaves the sequence at
+// its default.
+func (w *SchemaWriter) SyncIdentitySequences(ctx context.Context, s *ir.Schema) error {
+	if s == nil {
+		return errors.New("postgres: SyncIdentitySequences: schema is nil")
+	}
+	for _, table := range orderedTables(s) {
+		for _, col := range table.Columns {
+			intT, isInt := col.Type.(ir.Integer)
+			if !isInt || !intT.AutoIncrement {
+				continue
+			}
+			if err := w.syncOneIdentity(ctx, table, col.Name); err != nil {
+				return fmt.Errorf("postgres: sync identity %s.%s.%s: %w",
+					w.schema, table.Name, col.Name, err)
+			}
+		}
+	}
+	return nil
+}
+
+// syncOneIdentity reads MAX(<col>) on the target table; if non-NULL,
+// runs setval on the column's underlying sequence so that next
+// nextval returns MAX+1.
+func (w *SchemaWriter) syncOneIdentity(ctx context.Context, table *ir.Table, column string) error {
+	qualified := quoteIdent(w.schema) + "." + quoteIdent(table.Name)
+
+	// Step 1: read MAX(<col>). NULL on empty table.
+	maxQuery := fmt.Sprintf("SELECT MAX(%s) FROM %s", quoteIdent(column), qualified)
+	var maxVal sql.NullInt64
+	if err := w.db.QueryRowContext(ctx, maxQuery).Scan(&maxVal); err != nil {
+		return fmt.Errorf("read max: %w", err)
+	}
+	if !maxVal.Valid {
+		// Empty table — sequence's default is already correct.
+		return nil
+	}
+
+	// Step 2: setval(seq, max). The third arg defaults to true →
+	// next nextval returns max+1. The WHERE clause guards against
+	// pg_get_serial_sequence returning NULL (defensive; should not
+	// fire for any standard IDENTITY column).
+	const setvalQuery = `
+		SELECT setval(pg_get_serial_sequence($1, $2), $3, true)
+		WHERE pg_get_serial_sequence($1, $2) IS NOT NULL`
+	tableArg := w.schema + "." + table.Name
+	if _, err := w.db.ExecContext(ctx, setvalQuery, tableArg, column, maxVal.Int64); err != nil {
+		return fmt.Errorf("setval: %w", err)
+	}
+	return nil
+}
+
 // orderedTables returns s.Tables sorted alphabetically by name. The
 // returned slice is independent of s.Tables.
 func orderedTables(s *ir.Schema) []*ir.Table {

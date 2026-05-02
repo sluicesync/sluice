@@ -117,6 +117,15 @@ func (w *SchemaWriter) CreateConstraints(ctx context.Context, s *ir.Schema) erro
 	return nil
 }
 
+// SyncIdentitySequences is a no-op on MySQL. InnoDB's AUTO_INCREMENT
+// counter is automatically advanced past explicit-value INSERTs at
+// transaction commit time, so a post-bulk-copy sync isn't needed —
+// the next user-initiated INSERT picks up where the bulk-copied IDs
+// left off without any extra work.
+func (w *SchemaWriter) SyncIdentitySequences(_ context.Context, _ *ir.Schema) error {
+	return nil
+}
+
 // orderedTables returns s.Tables sorted alphabetically by name. The
 // returned slice is independent of s.Tables; callers may sort or
 // modify it without affecting the schema.
