@@ -91,10 +91,14 @@ func (Engine) OpenRowReader(ctx context.Context, dsn string) (ir.RowReader, erro
 	return &RowReader{q: db, schema: cfg.schema, closer: db}, nil
 }
 
-// OpenRowWriter returns a [RowWriter] bound to the database identified
-// by dsn. The caller is responsible for closing the returned RowWriter
-// (via its Close method) to release the underlying connection pool.
-func (Engine) OpenRowWriter(ctx context.Context, dsn string) (ir.RowWriter, error) {
+// OpenRowWriter returns a [RowWriter] bound to the database
+// identified by dsn. The bulk-load strategy (COPY FROM STDIN vs.
+// batched multi-row INSERT) is chosen from the engine's BulkLoad
+// capability: vanilla PG declares BulkLoadCopy, so useCopy is true
+// by default. The caller is responsible for closing the returned
+// RowWriter (via its Close method) to release the underlying
+// connection pool.
+func (e Engine) OpenRowWriter(ctx context.Context, dsn string) (ir.RowWriter, error) {
 	cfg, err := parseDSN(dsn)
 	if err != nil {
 		return nil, err
@@ -103,7 +107,11 @@ func (Engine) OpenRowWriter(ctx context.Context, dsn string) (ir.RowWriter, erro
 	if err != nil {
 		return nil, err
 	}
-	return &RowWriter{db: db, schema: cfg.schema}, nil
+	return &RowWriter{
+		db:      db,
+		schema:  cfg.schema,
+		useCopy: e.Capabilities().BulkLoad == ir.BulkLoadCopy,
+	}, nil
 }
 
 // OpenCDCReader returns a [CDCReader] bound to the database identified

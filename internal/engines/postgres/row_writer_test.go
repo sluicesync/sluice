@@ -96,6 +96,15 @@ func TestRowWriter_RoundTrip(t *testing.T) {
 	}
 	defer closeIf(rw)
 
+	// Dispatch assertion: vanilla PG declares BulkLoadCopy in its
+	// capability table, so OpenRowWriter must select the COPY path.
+	// This test's body therefore exercises the COPY path end-to-end.
+	if rwImpl, ok := rw.(*RowWriter); !ok {
+		t.Fatalf("OpenRowWriter returned %T; want *RowWriter", rw)
+	} else if !rwImpl.useCopy {
+		t.Fatal("expected useCopy=true after OpenRowWriter (vanilla PG declares BulkLoadCopy)")
+	}
+
 	in := make(chan ir.Row, len(wantRows))
 	for _, r := range wantRows {
 		in <- r
@@ -149,4 +158,100 @@ func rowValueEqual(got, want any) bool {
 		return false
 	}
 	return reflect.DeepEqual(got, want)
+}
+
+// TestRowWriter_BatchedInsertPath exercises the writeViaBatch
+// fallback explicitly. After §6 wired COPY as the default for
+// vanilla PG, the only way to test the batched path is to construct
+// the RowWriter directly with useCopy=false.
+//
+// The smaller schema is deliberate: this test is about confirming
+// the fallback path still works after the dispatch refactor, not
+// about full type coverage. The COPY path inherits all the type
+// coverage from TestRowWriter_RoundTrip.
+func TestRowWriter_BatchedInsertPath(t *testing.T) {
+	dsn, cleanup := startPostgres(t)
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	schema := &ir.Schema{Tables: []*ir.Table{{
+		Name: "items",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}},
+			{Name: "label", Type: ir.Varchar{Length: 64}},
+		},
+		PrimaryKey: &ir.Index{
+			Name:    "items_pkey",
+			Unique:  true,
+			Columns: []ir.IndexColumn{{Column: "id"}},
+		},
+	}}}
+
+	sw, err := Engine{}.OpenSchemaWriter(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenSchemaWriter: %v", err)
+	}
+	defer closeIf(sw)
+	if err := sw.CreateTablesWithoutConstraints(ctx, schema); err != nil {
+		t.Fatalf("CreateTablesWithoutConstraints: %v", err)
+	}
+
+	// Construct the writer directly to force useCopy=false. The
+	// existing OpenRowWriter would have selected COPY; we want the
+	// fallback path here.
+	cfg, err := parseDSN(dsn)
+	if err != nil {
+		t.Fatalf("parseDSN: %v", err)
+	}
+	db, err := openDB(ctx, cfg)
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	rw := &RowWriter{
+		db:      db,
+		schema:  cfg.schema,
+		useCopy: false, // explicit: take the batched path
+	}
+	defer func() { _ = rw.Close() }()
+
+	wantRows := []ir.Row{
+		{"id": int64(1), "label": "first"},
+		{"id": int64(2), "label": "second"},
+		{"id": int64(3), "label": "third"},
+	}
+	in := make(chan ir.Row, len(wantRows))
+	for _, r := range wantRows {
+		in <- r
+	}
+	close(in)
+
+	table := schema.Tables[0]
+	if err := rw.WriteRows(ctx, table, in); err != nil {
+		t.Fatalf("WriteRows: %v", err)
+	}
+
+	// Read back via RowReader and assert.
+	rr, err := Engine{}.OpenRowReader(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenRowReader: %v", err)
+	}
+	defer closeIf(rr)
+	out, err := rr.ReadRows(ctx, table)
+	if err != nil {
+		t.Fatalf("ReadRows: %v", err)
+	}
+	var got []ir.Row
+	for row := range out {
+		got = append(got, row)
+	}
+	if len(got) != len(wantRows) {
+		t.Fatalf("got %d rows via batched path; want %d", len(got), len(wantRows))
+	}
+	for i, w := range wantRows {
+		if got[i]["id"] != w["id"] || got[i]["label"] != w["label"] {
+			t.Errorf("row[%d] = %#v; want %#v", i, got[i], w)
+		}
+	}
 }

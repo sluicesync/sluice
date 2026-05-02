@@ -7,28 +7,46 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/stdlib"
+
 	"github.com/orware/sluice/internal/ir"
 )
 
 // defaultMaxRowsPerBatch caps how many rows go into a single INSERT
-// statement. Conservative for now; can tune with real-world data.
+// statement on the batched-insert path. Conservative for now; can
+// tune with real-world data.
 const defaultMaxRowsPerBatch = 500
 
-// RowWriter performs bulk inserts into PostgreSQL tables. It implements
-// [ir.RowWriter].
+// RowWriter performs bulk inserts into PostgreSQL tables. It
+// implements [ir.RowWriter].
 //
-// First-cut strategy is BatchedInsert (multi-row INSERT with $N
-// placeholders) regardless of the engine's declared BulkLoad
-// capability. The Capability declaration is BulkLoadCopy, which would
-// use Postgres's native COPY protocol via pgx for higher throughput;
-// that path is a planned follow-up.
+// Two strategies are supported, selected by useCopy:
+//
+//   - **COPY FROM STDIN** (default for vanilla Postgres). Uses pgx's
+//     CopyFrom against the underlying *pgx.Conn — 3-5× the
+//     throughput of multi-row INSERT for bulk loads, and the
+//     canonical Postgres bulk-load protocol.
+//   - **Batched multi-row INSERT** (fallback). Builds parameterised
+//     INSERT ... VALUES (...) statements and Execs them through
+//     database/sql. Retained for engines whose BulkLoad capability
+//     declines COPY, and as the strategy unit/integration tests can
+//     force when they need to exercise this path.
+//
+// OpenRowWriter consults the engine's [ir.Capabilities.BulkLoad] to
+// decide; vanilla PG declares BulkLoadCopy → useCopy == true.
 type RowWriter struct {
 	db     *sql.DB
 	schema string
 
+	// useCopy selects the bulk-load strategy. true → writeViaCopy;
+	// false → writeViaBatch (the original batched-insert path).
+	useCopy bool
+
 	// maxRowsPerBatch caps the number of rows folded into a single
-	// INSERT. Tests can override; callers leave it at zero (which
-	// causes defaultMaxRowsPerBatch to be used).
+	// INSERT on the batched path. Tests can override; callers leave
+	// it at zero (which causes defaultMaxRowsPerBatch to be used).
+	// Ignored on the COPY path.
 	maxRowsPerBatch int
 }
 
@@ -40,9 +58,9 @@ func (w *RowWriter) Close() error {
 	return w.db.Close()
 }
 
-// WriteRows consumes rows from the channel and inserts them into table
-// via batched multi-row INSERT statements. See [ir.RowWriter.WriteRows]
-// for the contract.
+// WriteRows is the dispatcher. Validates inputs, then routes to the
+// strategy chosen by useCopy. See [ir.RowWriter.WriteRows] for the
+// contract.
 func (w *RowWriter) WriteRows(ctx context.Context, table *ir.Table, rows <-chan ir.Row) error {
 	if table == nil {
 		return errors.New("postgres: WriteRows: table is nil")
@@ -53,7 +71,60 @@ func (w *RowWriter) WriteRows(ctx context.Context, table *ir.Table, rows <-chan 
 	if rows == nil {
 		return errors.New("postgres: WriteRows: rows channel is nil")
 	}
+	if w.useCopy {
+		return w.writeViaCopy(ctx, table, rows)
+	}
+	return w.writeViaBatch(ctx, table, rows)
+}
 
+// writeViaCopy runs Postgres COPY FROM STDIN for one table. It pins
+// a single connection from the pool, escapes database/sql via
+// Conn.Raw to reach the underlying *pgx.Conn, and feeds rows
+// through pgx's CopyFrom + our chanCopySource adapter.
+//
+// COPY is atomic at the table level: a mid-stream error rolls back
+// the entire copy. The error message names how many rows landed
+// before the failure so operators can scope the impact.
+func (w *RowWriter) writeViaCopy(ctx context.Context, table *ir.Table, rows <-chan ir.Row) error {
+	sqlConn, err := w.db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("postgres: copy: acquire conn: %w", err)
+	}
+	defer func() { _ = sqlConn.Close() }() // returns conn to pool
+
+	columnNames := make([]string, len(table.Columns))
+	for i, c := range table.Columns {
+		columnNames[i] = c.Name
+	}
+	source := newChanCopySource(ctx, table, rows)
+
+	var copied int64
+	rawErr := sqlConn.Raw(func(driverConn any) error {
+		stdlibConn, ok := driverConn.(*stdlib.Conn)
+		if !ok {
+			return fmt.Errorf("postgres: copy: expected *stdlib.Conn, got %T", driverConn)
+		}
+		n, copyErr := stdlibConn.Conn().CopyFrom(
+			ctx,
+			pgx.Identifier{w.schema, table.Name},
+			columnNames,
+			source,
+		)
+		copied = n
+		return copyErr
+	})
+	if rawErr != nil {
+		return fmt.Errorf("postgres: copy into %q (%d rows copied before error): %w",
+			table.Name, copied, rawErr)
+	}
+	return nil
+}
+
+// writeViaBatch is the fallback batched-INSERT path. Builds
+// parameterised INSERT ... VALUES (...) statements and Execs them
+// through database/sql. Retained for engines whose BulkLoad
+// capability declines COPY (none today, but the hook is here).
+func (w *RowWriter) writeViaBatch(ctx context.Context, table *ir.Table, rows <-chan ir.Row) error {
 	limit := w.maxRowsPerBatch
 	if limit <= 0 {
 		limit = defaultMaxRowsPerBatch
