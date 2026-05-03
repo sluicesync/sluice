@@ -208,6 +208,11 @@ func TestVStream_VTTestServer_BasicChangeStream(t *testing.T) {
 	if email, _ := insAlice.Row["email"].(string); email != "alice@example.com" {
 		t.Errorf("got[0].Row[email] = %#v; want alice@example.com", insAlice.Row["email"])
 	}
+	// Cross-engine bool path: TINYINT(1)=1 must surface as Go bool
+	// true through the VStream decoder, not int64(1).
+	if active, ok := insAlice.Row["active"].(bool); !ok || !active {
+		t.Errorf("got[0].Row[active] = %#v (%T); want bool(true) (TINYINT(1)→bool)", insAlice.Row["active"], insAlice.Row["active"])
+	}
 
 	insBob, ok := got[1].(ir.Insert)
 	if !ok {
@@ -216,6 +221,10 @@ func TestVStream_VTTestServer_BasicChangeStream(t *testing.T) {
 	if email, _ := insBob.Row["email"].(string); email != "bob@example.com" {
 		t.Errorf("got[1].Row[email] = %#v; want bob@example.com", insBob.Row["email"])
 	}
+	// And TINYINT(1)=0 must surface as bool false.
+	if active, ok := insBob.Row["active"].(bool); !ok || active {
+		t.Errorf("got[1].Row[active] = %#v (%T); want bool(false)", insBob.Row["active"], insBob.Row["active"])
+	}
 
 	upd, ok := got[2].(ir.Update)
 	if !ok {
@@ -223,6 +232,13 @@ func TestVStream_VTTestServer_BasicChangeStream(t *testing.T) {
 	}
 	if email, _ := upd.After["email"].(string); email != "alice@example.com" {
 		t.Errorf("got[2].After[email] = %#v; want alice@example.com", upd.After["email"])
+	}
+	// Update flips active true → false; both halves are bool.
+	if before, ok := upd.Before["active"].(bool); !ok || !before {
+		t.Errorf("got[2].Before[active] = %#v (%T); want bool(true)", upd.Before["active"], upd.Before["active"])
+	}
+	if after, ok := upd.After["active"].(bool); !ok || after {
+		t.Errorf("got[2].After[active] = %#v (%T); want bool(false)", upd.After["active"], upd.After["active"])
 	}
 
 	del, ok := got[3].(ir.Delete)

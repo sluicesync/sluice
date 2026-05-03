@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	gomysql "github.com/go-sql-driver/mysql"
 	"google.golang.org/grpc"
@@ -662,19 +663,11 @@ func vgtidToShardGtidSlice(vg *binlogdata.VGtid) []shardGtid {
 
 // decodeVStreamRow turns a query.Row + cached []*query.Field into
 // an ir.Row. Returns ok=false when row is nil (the absent half of
-// an Insert's Before or a Delete's After). Decoding goes through
-// sqltypes.MakeTrusted for type-aware conversion (NULL detection,
-// numeric vs textual representation), then maps the canonical Go
-// values to sluice's IR contract:
-//
-//   - Signed integer-family types → int64
-//   - Floating-point → float64
-//   - NULL → nil
-//   - Everything else → []byte (the raw Vitess wire form)
-//
-// The decoder is deliberately conservative in v1; type fidelity
-// improvements (TINYINT(1)→bool for cross-engine MySQL→PG, JSON
-// shape preservation, etc.) layer in as separate small chunks.
+// an Insert's Before or a Delete's After). Decoding follows the
+// same IR-canonical Go-value contract documented in
+// docs/value-types.md, so cross-engine MySQL→PG paths behave
+// identically whether changes flow through the binlog reader or
+// the VStream reader.
 func decodeVStreamRow(row *query.Row, fields []*query.Field) (ir.Row, bool) {
 	if row == nil {
 		return nil, false
@@ -697,46 +690,164 @@ func decodeVStreamRow(row *query.Row, fields []*query.Field) (ir.Row, bool) {
 		}
 		raw := values[offset : offset+int(l)]
 		offset += int(l)
-		out[f.GetName()] = decodeVStreamCell(f.GetType(), raw)
+		out[f.GetName()] = decodeVStreamCell(f, raw)
 	}
 	return out, true
 }
 
 // decodeVStreamCell maps a single Vitess-wire cell to its IR-Row
-// canonical Go value. The switch covers the cases that matter for
-// the cross-engine path; falls through to []byte for everything
-// else so the consumer can at least see the bytes.
-func decodeVStreamCell(t query.Type, raw []byte) any {
+// canonical Go value. The mapping mirrors the binlog reader's
+// value contract (docs/value-types.md) so cross-engine work can
+// rely on identical Go shapes from either CDC path:
+//
+//   - INT8 with column_type "tinyint(1)" → bool (the cross-engine
+//     MySQL→PG bool path; TINYINT(1) is the canonical MySQL bool).
+//   - Other signed integer families → int64.
+//   - Unsigned integer families → uint64.
+//   - FLOAT32 / FLOAT64 → float64.
+//   - DECIMAL → string (NUMERIC stays textual to preserve precision
+//     past float64's range; matches the binlog reader's contract).
+//   - VARCHAR / TEXT / CHAR / ENUM → string.
+//   - SET → []string (split on comma; empty SET gives an empty
+//     slice, not nil, matching docs/value-types.md).
+//   - DATE / DATETIME / TIMESTAMP → time.Time, parsed from
+//     Vitess's textual wire format. parseTime=true on the
+//     standalone driver path produces time.Time directly; VStream
+//     hands us bytes, so we parse here.
+//   - TIME → string (HH:MM:SS textual; matches the binlog reader).
+//   - JSON → []byte (binary; the IR contract for JSON is "bytes
+//     of the JSON document", consumers parse as needed).
+//   - VARBINARY / BINARY / BLOB / BIT / GEOMETRY → []byte.
+//   - NULL_TYPE → nil.
+//   - Everything else → []byte fallback so the consumer at least
+//     sees the bytes when a future Vitess release adds a type the
+//     IR doesn't yet model.
+func decodeVStreamCell(field *query.Field, raw []byte) any {
+	t := field.GetType()
 	v := sqltypes.MakeTrusted(t, raw)
 	switch t {
-	case query.Type_INT8, query.Type_INT16, query.Type_INT24, query.Type_INT32, query.Type_INT64:
+	case query.Type_INT8:
 		n, err := v.ToInt64()
 		if err != nil {
-			return raw
+			return copyBytes(raw)
+		}
+		// TINYINT(1) is MySQL's canonical bool. Detect via the
+		// column_type string ("tinyint(1)" or "tinyint(1) unsigned");
+		// the proto Type alone collapses TINYINT and TINYINT(1) into
+		// INT8 / UINT8, so we'd lose the distinction without this.
+		if isMySQLBoolColumnType(field.GetColumnType()) {
+			return n != 0
 		}
 		return n
-	case query.Type_UINT8, query.Type_UINT16, query.Type_UINT24, query.Type_UINT32, query.Type_UINT64:
+	case query.Type_INT16, query.Type_INT24, query.Type_INT32, query.Type_INT64:
+		n, err := v.ToInt64()
+		if err != nil {
+			return copyBytes(raw)
+		}
+		return n
+	case query.Type_UINT8:
 		n, err := v.ToUint64()
 		if err != nil {
-			return raw
+			return copyBytes(raw)
+		}
+		// TINYINT(1) UNSIGNED is also a bool by MySQL convention.
+		if isMySQLBoolColumnType(field.GetColumnType()) {
+			return n != 0
+		}
+		return n
+	case query.Type_UINT16, query.Type_UINT24, query.Type_UINT32, query.Type_UINT64:
+		n, err := v.ToUint64()
+		if err != nil {
+			return copyBytes(raw)
 		}
 		return n
 	case query.Type_FLOAT32, query.Type_FLOAT64:
 		n, err := v.ToFloat64()
 		if err != nil {
-			return raw
+			return copyBytes(raw)
 		}
 		return n
-	case query.Type_VARCHAR, query.Type_TEXT, query.Type_CHAR:
+	case query.Type_DECIMAL:
+		// NUMERIC stays textual — float64 round-trips lose precision
+		// past 15 digits, and the IR contract says string.
 		return v.ToString()
+	case query.Type_VARCHAR, query.Type_TEXT, query.Type_CHAR, query.Type_ENUM:
+		return v.ToString()
+	case query.Type_SET:
+		s := v.ToString()
+		if s == "" {
+			return []string{}
+		}
+		return strings.Split(s, ",")
+	case query.Type_DATE, query.Type_DATETIME, query.Type_TIMESTAMP:
+		t, err := parseVStreamDateTime(t, raw)
+		if err != nil {
+			// Malformed date — surface bytes so the consumer
+			// notices rather than silently misinterpreting.
+			return copyBytes(raw)
+		}
+		return t
+	case query.Type_TIME:
+		// HH:MM:SS[.fffff] textual. The binlog reader returns the
+		// same string shape; matching here keeps cross-engine
+		// time-only columns consistent.
+		return v.ToString()
+	case query.Type_JSON, query.Type_BLOB, query.Type_VARBINARY,
+		query.Type_BINARY, query.Type_BIT, query.Type_GEOMETRY:
+		return copyBytes(raw)
 	case query.Type_NULL_TYPE:
 		return nil
 	}
-	// VARBINARY, BLOB, JSON, GEOMETRY, BIT, ENUM, SET, dates, etc.:
-	// hand back the raw bytes. Cross-engine paths rely on the
-	// existing MySQL value-decoder shape (VARCHAR-mapped extension
-	// types are already strings via the case above), and JSON is
-	// passed-through as bytes by docs/value-types.md anyway.
+	// Unknown type — pass bytes so the consumer at least sees
+	// something. Future Vitess releases may add types the IR
+	// doesn't yet model.
+	return copyBytes(raw)
+}
+
+// isMySQLBoolColumnType returns true when the field's MySQL
+// column_type string identifies TINYINT(1) (the canonical MySQL
+// bool). Both signed and unsigned variants are accepted.
+//
+// VStream's FieldEvent populates ColumnType with the source's DDL
+// string ("tinyint(1)", "tinyint(1) unsigned", "tinyint", etc.).
+// Vitess's proto Type alone collapses TINYINT and TINYINT(1) into
+// INT8/UINT8, so the column_type string is the only place the
+// display-width-1 distinction survives over the wire.
+func isMySQLBoolColumnType(columnType string) bool {
+	s := strings.ToLower(columnType)
+	return strings.HasPrefix(s, "tinyint(1)")
+}
+
+// parseVStreamDateTime parses a DATE / DATETIME / TIMESTAMP cell
+// from its Vitess wire form (textual) into a time.Time. Vitess's
+// canonical formats:
+//
+//	DATE      "YYYY-MM-DD"
+//	DATETIME  "YYYY-MM-DD HH:MM:SS[.fffffffff]"
+//	TIMESTAMP "YYYY-MM-DD HH:MM:SS[.fffffffff]"
+//
+// All three are parsed in UTC unless the source carries a zone (it
+// doesn't — MySQL DATETIME/TIMESTAMP wire values are zone-agnostic).
+func parseVStreamDateTime(t query.Type, raw []byte) (time.Time, error) {
+	s := string(raw)
+	if t == query.Type_DATE {
+		return time.Parse("2006-01-02", s)
+	}
+	// DATETIME / TIMESTAMP — try the precision-bearing format first,
+	// fall back to the no-fraction form. time.Parse is strict on
+	// the literal layout so probing both shapes is necessary.
+	if v, err := time.Parse("2006-01-02 15:04:05.999999999", s); err == nil {
+		return v, nil
+	}
+	return time.Parse("2006-01-02 15:04:05", s)
+}
+
+// copyBytes returns a fresh []byte with the same contents as raw.
+// VStream's underlying gRPC buffer may be reused across messages,
+// so cells that we hand to consumers as []byte must be copied —
+// otherwise the consumer's value silently mutates on the next
+// stream Recv.
+func copyBytes(raw []byte) []byte {
 	out := make([]byte, len(raw))
 	copy(out, raw)
 	return out

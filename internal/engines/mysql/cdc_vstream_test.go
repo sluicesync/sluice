@@ -2,6 +2,7 @@ package mysql
 
 import (
 	"context"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -493,6 +494,145 @@ func TestVStreamDialOptions(t *testing.T) {
 			}
 			if !c.wantAuth && authHeader != "" {
 				t.Errorf("authHeader = %q; want empty for non-basic auth", authHeader)
+			}
+		})
+	}
+}
+
+// TestDecodeVStreamCell covers the type-specific decode paths the
+// reader uses to produce IR-canonical Go values from Vitess wire
+// bytes. The matrix mirrors docs/value-types.md so cross-engine
+// MySQL→PG behaviour is identical whether changes flow via the
+// binlog reader or via VStream.
+func TestDecodeVStreamCell(t *testing.T) {
+	cases := []struct {
+		name       string
+		fieldType  query.Type
+		columnType string
+		raw        string
+		want       any
+	}{
+		// ---- Booleans (TINYINT(1)) ----
+		{"tinyint(1) → bool true", query.Type_INT8, "tinyint(1)", "1", true},
+		{"tinyint(1) → bool false", query.Type_INT8, "tinyint(1)", "0", false},
+		{"tinyint(1) unsigned → bool", query.Type_UINT8, "tinyint(1) unsigned", "1", true},
+		// Plain TINYINT (no display width) stays int64.
+		{"tinyint plain → int64", query.Type_INT8, "tinyint", "127", int64(127)},
+
+		// ---- Integers ----
+		{"int → int64", query.Type_INT32, "int", "12345", int64(12345)},
+		{"bigint → int64", query.Type_INT64, "bigint", "9223372036854775807", int64(9223372036854775807)},
+		{"uint64", query.Type_UINT64, "bigint unsigned", "18446744073709551615", uint64(18446744073709551615)},
+
+		// ---- Floats ----
+		{"double → float64", query.Type_FLOAT64, "double", "3.14159", 3.14159},
+
+		// ---- Decimal (string per IR contract) ----
+		{"decimal stays string", query.Type_DECIMAL, "decimal(10,2)", "1234.56", "1234.56"},
+
+		// ---- Strings / enums ----
+		{"varchar → string", query.Type_VARCHAR, "varchar(255)", "hello", "hello"},
+		{"text → string", query.Type_TEXT, "text", "long form", "long form"},
+		{"char → string", query.Type_CHAR, "char(10)", "fixed", "fixed"},
+		{"enum → string", query.Type_ENUM, "enum('a','b','c')", "b", "b"},
+
+		// ---- SET ----
+		{"set with members", query.Type_SET, "set('a','b','c')", "a,c", []string{"a", "c"}},
+		{"empty set", query.Type_SET, "set('a','b')", "", []string{}},
+
+		// ---- Time ----
+		{"time stays string", query.Type_TIME, "time", "12:34:56", "12:34:56"},
+
+		// ---- Bytes ----
+		{"varbinary → bytes", query.Type_VARBINARY, "varbinary(64)", "abc", []byte("abc")},
+		{"blob → bytes", query.Type_BLOB, "blob", "blobdata", []byte("blobdata")},
+		{"json → bytes", query.Type_JSON, "json", `{"k":"v"}`, []byte(`{"k":"v"}`)},
+
+		// ---- NULL_TYPE (rare; fields normally use lengths=-1 for NULL) ----
+		{"null type", query.Type_NULL_TYPE, "", "", nil},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			f := &query.Field{
+				Type:       c.fieldType,
+				ColumnType: c.columnType,
+			}
+			got := decodeVStreamCell(f, []byte(c.raw))
+			if !reflect.DeepEqual(got, c.want) {
+				t.Errorf("\n got: %#v (%T)\nwant: %#v (%T)", got, got, c.want, c.want)
+			}
+		})
+	}
+}
+
+// TestDecodeVStreamCellDateTime covers the time-typed decode path
+// separately because comparing time.Time values via DeepEqual is
+// fragile (location, monotonic clock). We assert on parsed fields
+// instead.
+func TestDecodeVStreamCellDateTime(t *testing.T) {
+	cases := []struct {
+		name     string
+		typ      query.Type
+		raw      string
+		wantYear int
+		wantHour int
+	}{
+		{"date", query.Type_DATE, "2026-05-03", 2026, 0},
+		{"datetime no fraction", query.Type_DATETIME, "2026-05-03 14:23:45", 2026, 14},
+		{"datetime with fraction", query.Type_DATETIME, "2026-05-03 14:23:45.123456", 2026, 14},
+		{"timestamp", query.Type_TIMESTAMP, "2026-05-03 14:23:45", 2026, 14},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			f := &query.Field{Type: c.typ}
+			got := decodeVStreamCell(f, []byte(c.raw))
+			tm, ok := got.(time.Time)
+			if !ok {
+				t.Fatalf("got %#v (%T); want time.Time", got, got)
+			}
+			if tm.Year() != c.wantYear {
+				t.Errorf("year = %d; want %d", tm.Year(), c.wantYear)
+			}
+			if tm.Hour() != c.wantHour {
+				t.Errorf("hour = %d; want %d", tm.Hour(), c.wantHour)
+			}
+		})
+	}
+
+	t.Run("malformed datetime falls back to bytes", func(t *testing.T) {
+		f := &query.Field{Type: query.Type_DATETIME}
+		got := decodeVStreamCell(f, []byte("not a date"))
+		if _, ok := got.([]byte); !ok {
+			t.Errorf("got %#v (%T); want []byte fallback for malformed input", got, got)
+		}
+	})
+}
+
+// TestIsMySQLBoolColumnType covers the small parser used to detect
+// TINYINT(1) from a Vitess FieldEvent's column_type string.
+func TestIsMySQLBoolColumnType(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{"tinyint(1)", true},
+		{"tinyint(1) unsigned", true},
+		{"TINYINT(1)", true},          // case-insensitive
+		{"TINYINT(1) UNSIGNED", true}, // ditto
+		{"tinyint", false},
+		{"tinyint(2)", false},
+		{"tinyint(4)", false},
+		{"int", false},
+		{"varchar(255)", false},
+		{"", false},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.in, func(t *testing.T) {
+			if got := isMySQLBoolColumnType(c.in); got != c.want {
+				t.Errorf("got %v; want %v", got, c.want)
 			}
 		})
 	}
