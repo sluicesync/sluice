@@ -35,6 +35,7 @@ const (
 	CDCBinlog                       // MySQL row-based binary log
 	CDCLogicalReplication           // PostgreSQL logical replication
 	CDCTriggers                     // Trigger-based CDC (e.g. SQLite future)
+	CDCVStream                      // Vitess VStream gRPC (PlanetScale MySQL)
 )
 
 func (m CDCMethod) String() string {
@@ -45,6 +46,8 @@ func (m CDCMethod) String() string {
 		return "logical-replication"
 	case CDCTriggers:
 		return "triggers"
+	case CDCVStream:
+		return "vstream"
 	case CDCNone:
 		return "none"
 	default:
