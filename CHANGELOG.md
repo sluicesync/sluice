@@ -6,10 +6,15 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-This section captures the work that has accumulated since the
-initial design pass and not yet been cut into a tagged release. The
-entries are grouped by capability rather than chronologically;
-`git log` is the source of truth for commit-level history.
+Empty — start here when adding the next chunk of work.
+
+## [0.1.0] - 2026-05-03
+
+The initial tagged release. Captures everything from the design
+pass through the multi-shard Vitess + `sluice sync status`
+chunks. Entries are grouped by capability rather than
+chronologically; `git log` is the source of truth for commit-
+level history.
 
 ### Added — orchestration
 
@@ -185,4 +190,5 @@ entries are grouped by capability rather than chronologically;
 
 (none currently — see the closed entries above.)
 
-[Unreleased]: https://github.com/orware/sluice/commits/main
+[Unreleased]: https://github.com/orware/sluice/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/orware/sluice/releases/tag/v0.1.0
