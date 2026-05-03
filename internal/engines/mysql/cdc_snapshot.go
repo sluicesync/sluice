@@ -9,22 +9,39 @@ import (
 	"github.com/orware/sluice/internal/ir"
 )
 
-// OpenSnapshotStream opens a consistent MySQL snapshot and returns a
-// paired RowReader (pinned to the snapshot transaction) and CDCReader
-// (configured to start from the captured binlog position). The bulk-
-// copy phase reads from the same connection that captured the
-// position, so the bulk-copy view is exactly as-of the position; CDC
-// resumes from immediately after, with no gap and no overlap.
+// OpenSnapshotStream opens a consistent source snapshot and returns
+// a paired RowReader and CDCReader whose start position is the
+// snapshot's logical capture point. The concrete mechanism depends
+// on the engine's flavor:
 //
-// PlanetScale and other CDCNone flavors return ErrNotImplemented.
+//   - FlavorVanilla → REPEATABLE READ + WITH CONSISTENT SNAPSHOT
+//     pinned to a captured binlog position. Bulk-copy and CDC use
+//     separate connections (binlog dump speaks a different protocol).
+//   - FlavorPlanetScale → VStream's built-in COPY mode. A single
+//     gRPC stream produces both the COPY-phase rows and the
+//     post-COPY change events; the seam is the global
+//     COPY_COMPLETED event, at which point the captured VGTID is
+//     the resume position.
 //
-// Caller closes the returned stream to release: the snapshot tx,
-// the pinned connection, the underlying schema-DB pool, and the CDC
-// reader's resources.
+// Flavors declaring [ir.CDCNone] return [ErrNotImplemented]; check
+// the engine's [ir.Capabilities.CDC] before requesting a snapshot
+// stream. Caller closes the returned stream to release all
+// connections / transactions.
 func (e Engine) OpenSnapshotStream(ctx context.Context, dsn string) (*ir.SnapshotStream, error) {
 	if e.Capabilities().CDC == ir.CDCNone {
 		return nil, fmt.Errorf("%s: snapshot+CDC not supported by this flavor: %w", e.Name(), ErrNotImplemented)
 	}
+	if e.Flavor == FlavorPlanetScale {
+		return e.openVStreamSnapshotStream(ctx, dsn)
+	}
+	// FlavorVanilla and any future binlog-based flavor land here.
+	return e.openBinlogSnapshotStream(ctx, dsn)
+}
+
+// openBinlogSnapshotStream is the FlavorVanilla path of
+// [Engine.OpenSnapshotStream]. Lifted out of OpenSnapshotStream so
+// the flavor dispatch stays readable.
+func (e Engine) openBinlogSnapshotStream(ctx context.Context, dsn string) (*ir.SnapshotStream, error) {
 	cfg, err := parseDSN(dsn)
 	if err != nil {
 		return nil, err

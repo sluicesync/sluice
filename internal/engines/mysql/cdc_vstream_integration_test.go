@@ -24,6 +24,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"sort"
 	"testing"
 	"time"
 
@@ -324,6 +325,140 @@ func TestVStream_VTTestServer_Truncate(t *testing.T) {
 	if tr.Pos().Engine != engineNameVStream || tr.Pos().Token == "" {
 		t.Errorf("truncate.Pos = %+v; want non-empty %s position", tr.Pos(), engineNameVStream)
 	}
+}
+
+// TestVStream_VTTestServer_SnapshotStream exercises the
+// FlavorPlanetScale snapshot+CDC handoff via VStream's built-in
+// COPY mode against vanilla Vitess. Mirrors the binlog reader's
+// TestSnapshotStream_NoGapNoOverlap shape (in
+// cdc_snapshot_integration_test.go) so the diff between the two
+// snapshot paths is purely the underlying mechanism.
+//
+// Sequence:
+//
+//  1. Seed R1..R5 (committed BEFORE OpenSnapshotStream).
+//  2. Open SnapshotStream — drains the COPY phase, captures VGTID.
+//  3. INSERT R6 on a SEPARATE connection (commits AFTER COPY).
+//  4. Drain stream.Rows.ReadRows for users → expect exactly R1..R5.
+//  5. Drain stream.Changes.StreamChanges → expect exactly the R6 insert.
+//
+// Properties under test:
+//
+//   - If R6 appears in step 4: the COPY phase didn't have a clean
+//     boundary (snapshot included a post-COPY change).
+//   - If R6 doesn't appear in step 5: there's a gap (CDC missed
+//     events between snapshot-capture and stream resume).
+func TestVStream_VTTestServer_SnapshotStream(t *testing.T) {
+	mysqlDSN, grpcEndpoint, _, cleanup := startVTTestServer(t)
+	defer cleanup()
+
+	const seedDDL = `
+		CREATE TABLE users (
+			id    BIGINT       NOT NULL AUTO_INCREMENT,
+			email VARCHAR(255) NOT NULL,
+			PRIMARY KEY (id)
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+	`
+	applyVTTestSQL(t, mysqlDSN, seedDDL)
+
+	const seedRows = `
+		INSERT INTO users (email) VALUES ('r1@example.com');
+		INSERT INTO users (email) VALUES ('r2@example.com');
+		INSERT INTO users (email) VALUES ('r3@example.com');
+		INSERT INTO users (email) VALUES ('r4@example.com');
+		INSERT INTO users (email) VALUES ('r5@example.com');
+	`
+	applyVTTestSQL(t, mysqlDSN+"&multiStatements=true", seedRows)
+
+	// vttestserver's schema tracker watches the binlog for DDL
+	// events and refreshes vttablet's schema engine accordingly —
+	// vstream's COPY phase needs the table visible there
+	// (`uvstreamer.buildTablePlan`) or it errors with "stream needs
+	// a position or a table to copy". The tracker is async so we
+	// give it a couple of seconds to catch up before opening the
+	// snapshot stream.
+	time.Sleep(3 * time.Second)
+
+	sluiceDSN := fmt.Sprintf(
+		"%s&vstream_endpoint=%s&vstream_transport=plaintext&vstream_auth=none&vstream_shards=0",
+		mysqlDSN, grpcEndpoint,
+	)
+
+	eng := Engine{Flavor: FlavorPlanetScale}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	stream, err := eng.OpenSnapshotStream(ctx, sluiceDSN)
+	if err != nil {
+		t.Fatalf("OpenSnapshotStream: %v", err)
+	}
+	defer func() { _ = stream.Close() }()
+
+	if stream.Position.Engine != engineNameVStream {
+		t.Errorf("Position.Engine = %q; want %q", stream.Position.Engine, engineNameVStream)
+	}
+	if stream.Position.Token == "" {
+		t.Error("Position.Token is empty after COPY_COMPLETED")
+	}
+
+	// Step 3 — concurrent insert AFTER snapshot capture.
+	applyVTTestSQL(t, mysqlDSN, "INSERT INTO users (email) VALUES ('r6@example.com')")
+
+	// Step 4 — drain bulk rows.
+	usersTable := &ir.Table{
+		Name: "users",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64, AutoIncrement: true}},
+			{Name: "email", Type: ir.Varchar{Length: 255}},
+		},
+	}
+	rowsCh, err := stream.Rows.ReadRows(ctx, usersTable)
+	if err != nil {
+		t.Fatalf("ReadRows: %v", err)
+	}
+	bulkEmails := make([]string, 0, 5)
+	for r := range rowsCh {
+		s, _ := r["email"].(string)
+		bulkEmails = append(bulkEmails, s)
+	}
+	sort.Strings(bulkEmails)
+	want := []string{"r1@example.com", "r2@example.com", "r3@example.com", "r4@example.com", "r5@example.com"}
+	if !equalSorted(bulkEmails, want) {
+		t.Fatalf("bulk rows = %v; want exactly %v (overlap or missing rows)", bulkEmails, want)
+	}
+
+	// Step 5 — start CDC from the captured position. The R6 insert
+	// committed after COPY_COMPLETED so it must surface here.
+	changes, err := stream.Changes.StreamChanges(ctx, stream.Position)
+	if err != nil {
+		t.Fatalf("StreamChanges: %v", err)
+	}
+
+	got := drainVTTestChanges(t, ctx, changes, 1, 90*time.Second)
+	if len(got) != 1 {
+		t.Fatalf("got %d changes; want 1 (R6 insert)", len(got))
+	}
+	insR6, ok := got[0].(ir.Insert)
+	if !ok {
+		t.Fatalf("change[0] = %T; want ir.Insert", got[0])
+	}
+	if email, _ := insR6.Row["email"].(string); email != "r6@example.com" {
+		t.Errorf("R6 insert email = %#v; want r6@example.com", insR6.Row["email"])
+	}
+}
+
+// equalSorted reports whether two pre-sorted slices have the same
+// contents in the same order.
+func equalSorted(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // applyVTTestSQL runs DDL/DML against vttestserver's embedded

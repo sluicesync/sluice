@@ -167,12 +167,5 @@ entries are grouped by capability rather than chronologically;
   VStream reader subscribes to a fixed shard layout supplied via
   the `vstream_shards` DSN parameter; reshard auto-discovery and
   multi-shard COPY handoff are planned follow-ups.
-- **VStream snapshot+CDC handoff** for PlanetScale MySQL: phase B
-  ships the streaming spine, but `OpenSnapshotStream` for the
-  PlanetScale flavor still uses the binlog-based path that
-  PlanetScale doesn't expose. The `Streamer` therefore can't
-  coldStart against PlanetScale today; CDC-only consumers and
-  out-of-band snapshots both work. Wiring VStream's built-in
-  COPY mode into `OpenSnapshotStream` is a planned chunk.
 
 [Unreleased]: https://github.com/orware/sluice/commits/main
