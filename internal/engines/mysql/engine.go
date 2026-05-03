@@ -126,23 +126,45 @@ func (e Engine) OpenRowWriter(ctx context.Context, dsn string) (ir.RowWriter, er
 	}, nil
 }
 
-// OpenCDCReader returns a [CDCReader] bound to the database identified
-// by dsn. The reader speaks MySQL's row-based binary log via a separate
-// connection from the schema-cache *sql.DB; the account in the DSN
-// must therefore have REPLICATION SLAVE (and REPLICATION CLIENT, for
-// the gtid_mode and master-status queries) in addition to the usual
-// SELECT on information_schema.
+// OpenCDCReader returns a [ir.CDCReader] bound to the database
+// identified by dsn. The concrete reader depends on the engine's
+// flavor:
 //
-// PlanetScale and other flavors with [ir.CDCNone] receive
-// [ErrNotImplemented]; check the engine's [ir.Capabilities.CDC]
-// before requesting a CDC reader.
+//   - FlavorVanilla → [CDCReader], speaking MySQL's row-based
+//     binary log via a separate connection from the schema-cache
+//     *sql.DB; the account in the DSN must have REPLICATION SLAVE
+//     (and REPLICATION CLIENT, for gtid_mode / master-status
+//     queries) in addition to SELECT on information_schema.
+//   - FlavorPlanetScale → [vstreamCDCReader], speaking Vitess's
+//     VStream gRPC protocol against the PlanetScale-supplied
+//     vtgate endpoint. Auth is HTTP Basic (service-token name +
+//     value) ridden as gRPC metadata; the endpoint defaults to
+//     `<sql-host>:443` and overrides via the `vstream_endpoint`
+//     DSN parameter.
 //
-// The caller is responsible for calling Close on the returned reader
-// to release both the schema-DB pool and the binlog connection.
+// Flavors declaring [ir.CDCNone] receive [ErrNotImplemented]; check
+// the engine's [ir.Capabilities.CDC] before requesting a CDC reader.
+//
+// The caller is responsible for calling Close on the returned
+// reader.
 func (e Engine) OpenCDCReader(ctx context.Context, dsn string) (ir.CDCReader, error) {
 	if e.Capabilities().CDC == ir.CDCNone {
 		return nil, fmt.Errorf("%s: CDC not supported by this flavor: %w", e.Name(), ErrNotImplemented)
 	}
+	switch e.Flavor {
+	case FlavorPlanetScale:
+		return openVStreamReader(ctx, dsn)
+	case FlavorVanilla:
+		fallthrough
+	default:
+		return openBinlogCDCReader(ctx, dsn)
+	}
+}
+
+// openBinlogCDCReader is the FlavorVanilla path of OpenCDCReader.
+// Lifted out of OpenCDCReader so the flavor dispatch above stays
+// readable.
+func openBinlogCDCReader(ctx context.Context, dsn string) (ir.CDCReader, error) {
 	cfg, err := parseDSN(dsn)
 	if err != nil {
 		return nil, err

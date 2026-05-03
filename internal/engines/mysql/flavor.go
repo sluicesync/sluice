@@ -111,7 +111,7 @@ var flavorCapabilities = map[Flavor]ir.Capabilities{
 	// ---------------------------------------------------------------
 	FlavorPlanetScale: {
 		BulkLoad:    ir.BulkLoadBatchedInsert,
-		CDC:         ir.CDCNone,
+		CDC:         ir.CDCVStream,
 		SchemaScope: ir.SchemaScopeFlat,
 		SupportedTypes: ir.NewTypeSet(
 			ir.ExtEnum,

@@ -80,8 +80,8 @@ func TestPlanetScaleCapabilities(t *testing.T) {
 	if caps.BulkLoad != ir.BulkLoadBatchedInsert {
 		t.Errorf("planetscale BulkLoad = %v; want BatchedInsert (LOAD DATA INFILE not supported)", caps.BulkLoad)
 	}
-	if caps.CDC != ir.CDCNone {
-		t.Errorf("planetscale CDC = %v; want None (binlog not exposed)", caps.CDC)
+	if caps.CDC != ir.CDCVStream {
+		t.Errorf("planetscale CDC = %v; want VStream (binlog not exposed; Vitess gRPC instead)", caps.CDC)
 	}
 	if caps.SupportsPartitioning {
 		t.Error("planetscale SupportsPartitioning = true; want false (Vitess handles sharding)")

@@ -215,16 +215,30 @@ func TestCDCReader_BasicChangeStream(t *testing.T) {
 	}
 }
 
-// TestCDCReader_PlanetScaleRefuses is a unit-style guard inside the
-// integration suite (no docker dependency in the assertion path) that
-// confirms the capability gate kicks in for flavors with CDC=None.
-// Lives in the integration file because the engine import path would
-// otherwise duplicate.
-func TestCDCReader_PlanetScaleRefuses(t *testing.T) {
+// TestCDCReader_PlanetScaleReturnsVStreamReader is a unit-style
+// guard inside the integration suite (no docker dependency in the
+// assertion path) that confirms FlavorPlanetScale's OpenCDCReader
+// returns the VStream-backed reader rather than the binlog one.
+// The flavor used to declare CDC=None and short-circuit; with the
+// VStream phase B work, it now declares CDCVStream and the engine
+// dispatches on flavor.
+//
+// We don't open the actual stream here — that needs real PS
+// credentials and is covered by the psverify suite. This test
+// verifies only that the dispatch produces the right reader type.
+func TestCDCReader_PlanetScaleReturnsVStreamReader(t *testing.T) {
 	eng := Engine{Flavor: FlavorPlanetScale}
-	_, err := eng.OpenCDCReader(context.Background(), "user:pw@tcp(127.0.0.1:3306)/db")
-	if err == nil {
-		t.Fatal("expected error for planetscale OpenCDCReader; got nil")
+	rdr, err := eng.OpenCDCReader(context.Background(), "user:pw@tcp(127.0.0.1:3306)/db")
+	if err != nil {
+		t.Fatalf("OpenCDCReader: %v", err)
+	}
+	defer func() {
+		if c, ok := rdr.(interface{ Close() error }); ok {
+			_ = c.Close()
+		}
+	}()
+	if _, ok := rdr.(*vstreamCDCReader); !ok {
+		t.Errorf("OpenCDCReader returned %T; want *vstreamCDCReader", rdr)
 	}
 }
 
