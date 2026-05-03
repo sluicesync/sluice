@@ -155,10 +155,13 @@ func TestBuildSetClause(t *testing.T) {
 }
 
 func TestApplierSchema(t *testing.T) {
-	if got := applierSchema("public", "myschema"); got != "myschema" {
-		t.Errorf("explicit wins: got %q; want myschema", got)
+	if got := applierSchema("public", "myschema"); got != "public" {
+		t.Errorf("default wins: got %q; want public", got)
 	}
 	if got := applierSchema("public", ""); got != "public" {
-		t.Errorf("empty falls back to default: got %q; want public", got)
+		t.Errorf("empty change schema: got %q; want public", got)
+	}
+	if got := applierSchema("", "myschema"); got != "myschema" {
+		t.Errorf("empty default falls back to change schema: got %q; want myschema", got)
 	}
 }

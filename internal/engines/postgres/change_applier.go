@@ -189,15 +189,21 @@ func (a *ChangeApplier) pkFor(ctx context.Context, tx *sql.Tx, schema, table str
 	return pk, nil
 }
 
-// applierSchema picks the schema name to use in SQL: the change's
-// schema if present, otherwise the applier's default. CDC events
-// from Postgres always carry the schema name; the default is only
-// used as a safety net.
+// applierSchema picks the schema name to use in SQL. The applier's
+// configured schema (a.schema, derived from the target DSN) is
+// authoritative — it is the destination database the operator
+// pointed sluice at. The change's source-side schema is metadata
+// only; using it would route writes to a same-named schema on the
+// target, which is wrong whenever source and target schema names
+// differ (e.g. cross-engine MySQL source_db → PG public). v.Schema
+// is honoured only as a fallback when the applier wasn't configured
+// with one — which shouldn't happen in practice but keeps the
+// function total.
 func applierSchema(defaultSchema, changeSchema string) string {
-	if changeSchema != "" {
-		return changeSchema
+	if defaultSchema != "" {
+		return defaultSchema
 	}
-	return defaultSchema
+	return changeSchema
 }
 
 // loadPrimaryKey reads the PK columns for the named table from

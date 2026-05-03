@@ -144,12 +144,17 @@ func TestBuildSetClause(t *testing.T) {
 	}
 }
 
-// TestApplierSchema covers the small fallback rule.
+// TestApplierSchema covers the small fallback rule. The applier's
+// configured schema wins; the change's source-side schema is only
+// used when the applier wasn't given a default.
 func TestApplierSchema(t *testing.T) {
-	if got := applierSchema("default_db", "explicit_db"); got != "explicit_db" {
-		t.Errorf("explicit wins: got %q; want explicit_db", got)
+	if got := applierSchema("default_db", "source_db"); got != "default_db" {
+		t.Errorf("default wins: got %q; want default_db", got)
 	}
 	if got := applierSchema("default_db", ""); got != "default_db" {
-		t.Errorf("empty falls back to default: got %q; want default_db", got)
+		t.Errorf("empty change schema: got %q; want default_db", got)
+	}
+	if got := applierSchema("", "source_db"); got != "source_db" {
+		t.Errorf("empty default falls back to change schema: got %q; want source_db", got)
 	}
 }
