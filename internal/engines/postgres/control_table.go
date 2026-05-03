@@ -5,6 +5,9 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"time"
+
+	"github.com/orware/sluice/internal/ir"
 )
 
 // controlTableName is the per-target table that holds CDC stream
@@ -48,6 +51,51 @@ func readPosition(ctx context.Context, db *sql.DB, schema, streamID string) (tok
 		return "", false, fmt.Errorf("postgres: read position: %w", err)
 	}
 	return token, true, nil
+}
+
+// listStreams returns every row in the per-target control table.
+// Tolerant of the table being absent (treated as "no streams") so
+// `sluice sync status` works against a target that hasn't been a
+// CDC destination yet.
+//
+// The Position values returned set Engine to the
+// engine-specific identifier the binlog or pgoutput readers use,
+// since the token alone is opaque without that context. The CLI
+// is the consumer; it doesn't strictly need Engine populated, but
+// keeping the shape consistent with ReadPosition's return matters
+// for any future caller that might.
+func listStreams(ctx context.Context, db *sql.DB, schema, engineName string) ([]ir.StreamStatus, error) {
+	tableRef := quoteIdent(schema) + "." + quoteIdent(controlTableName)
+	q := "SELECT stream_id, source_position, updated_at FROM " + tableRef
+	rows, err := db.QueryContext(ctx, q)
+	if err != nil {
+		// Best-effort tolerance: missing-relation = no streams.
+		// The schema reader uses the same string-match approach for
+		// PostGIS detection (see schema_reader.go).
+		if isUndefinedRelationErr(err) {
+			return []ir.StreamStatus{}, nil
+		}
+		return nil, fmt.Errorf("postgres: list streams: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	out := []ir.StreamStatus{}
+	for rows.Next() {
+		var (
+			streamID string
+			token    string
+			updated  time.Time
+		)
+		if err := rows.Scan(&streamID, &token, &updated); err != nil {
+			return nil, fmt.Errorf("postgres: scan streams: %w", err)
+		}
+		out = append(out, ir.StreamStatus{
+			StreamID:  streamID,
+			Position:  ir.Position{Engine: engineName, Token: token},
+			UpdatedAt: updated,
+		})
+	}
+	return out, rows.Err()
 }
 
 // writePositionTx upserts the (streamID, token) row inside an open

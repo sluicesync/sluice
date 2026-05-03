@@ -85,6 +85,14 @@ func (a *ChangeApplier) ReadPosition(ctx context.Context, streamID string) (ir.P
 	return ir.Position{Engine: engineNameMySQL, Token: token}, true, nil
 }
 
+// ListStreams returns all rows in the per-target control table.
+// Used by `sluice sync status` for operational visibility. Tolerant
+// of the table being absent — operators querying status against a
+// fresh target should see "no streams" rather than an error.
+func (a *ChangeApplier) ListStreams(ctx context.Context) ([]ir.StreamStatus, error) {
+	return listStreams(ctx, a.db, engineNameMySQL)
+}
+
 // Apply consumes changes from the channel and applies each to the
 // target in its own transaction. The position write happens inside
 // the same transaction as the data write (per ADR-0007), so a

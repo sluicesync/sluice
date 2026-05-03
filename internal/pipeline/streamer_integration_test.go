@@ -115,6 +115,13 @@ func (a *recordingApplier) ReadPosition(_ context.Context, _ string) (ir.Positio
 	return ir.Position{}, false, nil
 }
 
+// ListStreams returns an empty slice — the recording applier
+// doesn't talk to a real control table, and tests covering the
+// CLI's `sync status` command go through the engine appliers.
+func (a *recordingApplier) ListStreams(_ context.Context) ([]ir.StreamStatus, error) {
+	return []ir.StreamStatus{}, nil
+}
+
 func (a *recordingApplier) Apply(ctx context.Context, _ string, changes <-chan ir.Change) error {
 	for {
 		select {

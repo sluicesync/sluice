@@ -4,9 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
+	"sort"
 	"syscall"
+	"text/tabwriter"
+	"time"
 
 	"github.com/alecthomas/kong"
 
@@ -172,15 +176,110 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 	return streamer.Run(kongContext())
 }
 
-// SyncStatusCmd reports the state of a running sync stream. Stub
-// for now — operational visibility into running streams is a
-// follow-up chunk; today the streamer's progress lines are written
-// to its Stdout, which 'sync start' inherits from the terminal.
-type SyncStatusCmd struct{}
+// SyncStatusCmd reports the state of every continuous-sync stream
+// the target database has been the destination for. Reads the
+// per-target sluice_cdc_state control table directly — no need for
+// a running sync process.
+//
+// When `--stream-id` is supplied, output is filtered to that one
+// stream (matches by exact stream_id). Without it, every row in
+// the control table is printed.
+type SyncStatusCmd struct {
+	TargetDriver string `help:"Target engine name (e.g. mysql, postgres). See 'sluice engines'." required:"" placeholder:"NAME" group:"target"`
+	Target       string `help:"Target database DSN." required:"" env:"SLUICE_TARGET" placeholder:"DSN" group:"target"`
+	StreamID     string `help:"Filter to a specific stream id. When empty, every recorded stream is shown." placeholder:"ID"`
+}
 
 // Run implements `sluice sync status`.
-func (*SyncStatusCmd) Run() error {
-	return errors.New("sync: status reporting not yet implemented; observe 'sluice sync start' output directly for now")
+func (s *SyncStatusCmd) Run(_ *Globals) error {
+	target, err := resolveEngine(s.TargetDriver)
+	if err != nil {
+		return fmt.Errorf("--target-driver: %w", err)
+	}
+
+	ctx := kongContext()
+	applier, err := target.OpenChangeApplier(ctx, s.Target)
+	if err != nil {
+		return fmt.Errorf("open target applier: %w", err)
+	}
+	defer func() {
+		if c, ok := applier.(io.Closer); ok {
+			_ = c.Close()
+		}
+	}()
+
+	streams, err := applier.ListStreams(ctx)
+	if err != nil {
+		return fmt.Errorf("list streams: %w", err)
+	}
+
+	if s.StreamID != "" {
+		filtered := streams[:0]
+		for _, st := range streams {
+			if st.StreamID == s.StreamID {
+				filtered = append(filtered, st)
+			}
+		}
+		streams = filtered
+	}
+
+	if len(streams) == 0 {
+		if s.StreamID != "" {
+			fmt.Fprintf(os.Stdout, "no stream %q on target\n", s.StreamID)
+			return nil
+		}
+		fmt.Fprintln(os.Stdout, "no streams recorded on target")
+		return nil
+	}
+
+	// Sort for stable output across runs. Most-recently-updated
+	// first matches the operator's interest: "what's been moving?"
+	sort.Slice(streams, func(i, j int) bool {
+		return streams[i].UpdatedAt.After(streams[j].UpdatedAt)
+	})
+
+	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	defer func() { _ = tw.Flush() }()
+	fmt.Fprintln(tw, "STREAM\tUPDATED\tAGE\tPOSITION")
+	now := time.Now()
+	for _, st := range streams {
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n",
+			st.StreamID,
+			st.UpdatedAt.UTC().Format(time.RFC3339),
+			humanAgo(now.Sub(st.UpdatedAt)),
+			truncatePositionToken(st.Position.Token, 60),
+		)
+	}
+	return nil
+}
+
+// humanAgo returns a brief "5m ago" / "2h ago" / "3d ago" string
+// for d. Operators glance at the column to spot stuck streams; a
+// rough cadence is more useful than precise.
+func humanAgo(d time.Duration) string {
+	switch {
+	case d < 0:
+		return "in the future"
+	case d < time.Minute:
+		return fmt.Sprintf("%ds ago", int(d.Seconds()))
+	case d < time.Hour:
+		return fmt.Sprintf("%dm ago", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh ago", int(d.Hours()))
+	default:
+		return fmt.Sprintf("%dd ago", int(d.Hours()/24))
+	}
+}
+
+// truncatePositionToken returns token if it's no longer than max,
+// otherwise the head of the token followed by an ellipsis. Position
+// tokens are JSON blobs that can run hundreds of bytes; the status
+// table stays readable.
+func truncatePositionToken(token string, maxLen int) string {
+	if len(token) <= maxLen {
+		return token
+	}
+	return token[:maxLen-1] + "…"
 }
 
 // kongContext returns a context.Context wired to OS signals so a

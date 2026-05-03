@@ -32,6 +32,16 @@ entries are grouped by capability rather than chronologically;
   `text`, `text_array`, `jsonb`, `json`, `bytea`, `varchar`
   (with optional `length` option), and the eight `postgis_*`
   geometry shapes (with optional `srid`).
+- **`sluice sync status`** subcommand: prints every continuous-
+  sync stream the target database has been the destination for
+  (one row per `sluice_cdc_state` entry) with stream-id, last-
+  updated wall-clock, human "5m ago" age, and a truncated
+  position token. Filterable to a single stream via
+  `--stream-id`. Tolerant of the target's control table being
+  absent — operators querying status against a fresh target see
+  "no streams recorded" rather than an error. Backed by a new
+  `ChangeApplier.ListStreams` interface method, implemented on
+  both MySQL and Postgres.
 
 ### Added — engines
 
@@ -74,6 +84,16 @@ entries are grouped by capability rather than chronologically;
   `vstream_auth=none`, `vstream_shards=<custom>`,
   `vstream_endpoint=<host:port>`. Verified against
   `vitess/vttestserver` via testcontainers.
+- **Sharded Vitess keyspaces** are now supported: the VStream
+  reader streams from N shards concurrently (per-shard cursor
+  tracking is built into the `[]shardGtid` position), and the
+  new `vstream_auto_discover_shards=true` DSN flag asks the
+  reader to populate the layout via `SHOW VITESS_SHARDS LIKE
+  '<keyspace>/%'` at Open time. Reshards are detected via the
+  typed `ShardLayoutChangedError` (matchable with `errors.Is`
+  against `ErrShardLayoutChanged`); callers resume on the new
+  layout via `vstreamCDCReader.Reopen`. Validated against
+  `vttestserver` with `NUM_SHARDS=2` (`-80,80-`).
 
 ### Added — types and translation policies
 
@@ -163,9 +183,6 @@ entries are grouped by capability rather than chronologically;
 
 ### Known limitations
 
-- **Sharded Vitess keyspaces** are out of scope for v1. The
-  VStream reader subscribes to a fixed shard layout supplied via
-  the `vstream_shards` DSN parameter; reshard auto-discovery and
-  multi-shard COPY handoff are planned follow-ups.
+(none currently — see the closed entries above.)
 
 [Unreleased]: https://github.com/orware/sluice/commits/main

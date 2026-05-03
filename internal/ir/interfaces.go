@@ -1,6 +1,9 @@
 package ir
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // SchemaReader extracts an IR [Schema] from a live database.
 type SchemaReader interface {
@@ -73,11 +76,37 @@ type ChangeApplier interface {
 	// position" (warm resume).
 	ReadPosition(ctx context.Context, streamID string) (Position, bool, error)
 
+	// ListStreams returns one [StreamStatus] per row in the
+	// per-target control table. Used by `sluice sync status` for
+	// operational visibility — operators want to see every stream
+	// the target has ever been the destination for, not just one
+	// specific ID. Order is unspecified; the CLI sorts.
+	//
+	// Returns an empty slice (not nil) when no streams have been
+	// recorded yet. EnsureControlTable doesn't have to have been
+	// called — the implementation should be tolerant of the table
+	// being absent, treating that case as "no streams".
+	ListStreams(ctx context.Context) ([]StreamStatus, error)
+
 	// Apply consumes Change events from the channel and applies each
 	// to the target. The position write happens inside the same
 	// transaction as the data write — atomicity guarantees that
 	// progress and data move together.
 	Apply(ctx context.Context, streamID string, changes <-chan Change) error
+}
+
+// StreamStatus is the operational snapshot of one row in the
+// per-target sluice_cdc_state control table. Returned by
+// [ChangeApplier.ListStreams] for the `sluice sync status` command.
+//
+// UpdatedAt is the wall-clock instant the row last changed (i.e.,
+// the most recent Apply commit). Operators use it to detect stuck
+// streams: a stream that hasn't ticked in N minutes when the source
+// is generating change traffic is the operator's problem to chase.
+type StreamStatus struct {
+	StreamID  string
+	Position  Position
+	UpdatedAt time.Time
 }
 
 // Engine is the bundle of operations a database engine implementation
