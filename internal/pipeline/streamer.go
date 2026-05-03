@@ -8,7 +8,9 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/orware/sluice/internal/config"
 	"github.com/orware/sluice/internal/ir"
+	"github.com/orware/sluice/internal/translate"
 )
 
 // Streamer is the long-running orchestrator: it captures a consistent
@@ -59,6 +61,12 @@ type Streamer struct {
 	// the resumed Position (warm resume), and the resolved
 	// stream_id. Defaults to discarding when nil.
 	Stdout io.Writer
+
+	// Mappings is the per-column type-override list from sluice.yaml.
+	// Consumed only on the cold-start path, where the schema-apply
+	// phase needs the rewritten types. Warm resume reuses the target
+	// schema as-is, so the field is ignored on that branch.
+	Mappings []config.Mapping
 }
 
 // Run executes a snapshot+CDC stream. See [Streamer] for the full
@@ -169,6 +177,14 @@ func (s *Streamer) coldStart(ctx context.Context) (<-chan ir.Change, error) {
 	if len(schema.Tables) == 0 {
 		s.printf("pipeline: source schema has no tables; nothing to stream\n")
 		return nil, nil
+	}
+
+	// Apply per-column type overrides before the schema-write phase
+	// sees the schema. Warm resume skips this step — by then the
+	// target schema is already shaped from the cold-start run.
+	schema, err = translate.ApplyMappings(schema, s.Mappings)
+	if err != nil {
+		return nil, fmt.Errorf("pipeline: apply mappings: %w", err)
 	}
 
 	stream, err := s.Source.OpenSnapshotStream(ctx, s.SourceDSN)

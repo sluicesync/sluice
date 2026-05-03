@@ -25,7 +25,9 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/orware/sluice/internal/config"
 	"github.com/orware/sluice/internal/ir"
+	"github.com/orware/sluice/internal/translate"
 )
 
 // Migrator runs a single simple-mode migration from Source/SourceDSN to
@@ -60,6 +62,12 @@ type Migrator struct {
 	// Stdout is where dry-run plan output goes. Defaults to os.Stdout
 	// when nil; tests can supply a buffer.
 	Stdout io.Writer
+
+	// Mappings is the per-column type-override list from sluice.yaml.
+	// Applied after ReadSchema and before the schema-write phase, so
+	// the named columns reach the target with the requested IR type.
+	// nil/empty disables the override step entirely.
+	Mappings []config.Mapping
 }
 
 // Run executes the migration. Returns nil on success or a wrapped
@@ -90,6 +98,12 @@ func (m *Migrator) Run(ctx context.Context) error {
 	if len(schema.Tables) == 0 {
 		m.printf("pipeline: source schema has no tables; nothing to migrate\n")
 		return nil
+	}
+
+	// ---- 1.5. Apply per-column type-mapping overrides ----
+	schema, err = translate.ApplyMappings(schema, m.Mappings)
+	if err != nil {
+		return fmt.Errorf("pipeline: apply mappings: %w", err)
 	}
 
 	if m.DryRun {

@@ -79,7 +79,8 @@ type MigrateCmd struct {
 
 // Run implements the migrate subcommand.
 func (m *MigrateCmd) Run(g *Globals) error {
-	if _, err := config.Load(g.Config); err != nil {
+	cfg, err := config.Load(g.Config)
+	if err != nil {
 		return err
 	}
 
@@ -99,6 +100,7 @@ func (m *MigrateCmd) Run(g *Globals) error {
 		TargetDSN: m.Target,
 		DryRun:    m.DryRun,
 		Stdout:    os.Stdout,
+		Mappings:  cfg.Mappings,
 	}
 	return mig.Run(kongContext())
 }
@@ -144,7 +146,8 @@ type SyncStartCmd struct {
 
 // Run implements `sluice sync start`.
 func (s *SyncStartCmd) Run(g *Globals) error {
-	if _, err := config.Load(g.Config); err != nil {
+	cfg, err := config.Load(g.Config)
+	if err != nil {
 		return err
 	}
 
@@ -164,6 +167,7 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 		TargetDSN: s.Target,
 		StreamID:  s.StreamID,
 		Stdout:    os.Stdout,
+		Mappings:  cfg.Mappings,
 	}
 	return streamer.Run(kongContext())
 }

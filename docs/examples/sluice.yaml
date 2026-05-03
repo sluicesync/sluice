@@ -20,6 +20,15 @@
 #       indexable) rather than text JSON.
 #     - You have a column whose default translation is lossy and you
 #       want explicit control.
+#
+# Recognised target_type aliases (v1):
+#   text       — large variable-length text (PG TEXT / MySQL LONGTEXT)
+#   text_array — array of text values  (PG TEXT[]; MySQL writers reject)
+#   jsonb      — binary JSON           (PG JSONB / MySQL JSON)
+#   json       — textual JSON          (PG JSON  / MySQL JSON)
+#   bytea      — large variable-length bytes (PG BYTEA / MySQL LONGBLOB)
+#   varchar    — fixed-length string; default length 255, override via
+#                target_type_options: { length: <int> }
 # ---------------------------------------------------------------------
 mappings:
   - table: orders
@@ -28,8 +37,11 @@ mappings:
   - table: events
     column: payload
     target_type: jsonb               # force binary JSON on Postgres targets
+  - table: users
+    column: username
+    target_type: varchar
     target_type_options:
-      binary: true
+      length: 64                     # bound the column to 64 chars on the target
 
 # ---------------------------------------------------------------------
 # extensions:
