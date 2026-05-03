@@ -230,3 +230,68 @@ func TestGenerateServerIDIsNonZero(t *testing.T) {
 		}
 	}
 }
+
+// TestParseTruncateTable exercises the narrow string-prefix parser
+// the CDC reader uses to recognise TRUNCATE inside binlog
+// QUERY_EVENTs. The parser is deliberately not a SQL parser —
+// anything outside the recognised shapes returns ok=false and the
+// caller falls through to generic DDL handling (cache invalidation).
+func TestParseTruncateTable(t *testing.T) {
+	cases := []struct {
+		name       string
+		in         string
+		wantSchema string
+		wantTable  string
+		wantOK     bool
+	}{
+		// Recognised forms
+		{"basic TRUNCATE TABLE", "TRUNCATE TABLE foo", "", "foo", true},
+		{"lowercase", "truncate table foo", "", "foo", true},
+		{"mixed case", "Truncate Table foo", "", "foo", true},
+		{"optional TABLE", "TRUNCATE foo", "", "foo", true},
+		{"optional TABLE lowercase", "truncate foo", "", "foo", true},
+		{"surrounding whitespace", "  TRUNCATE TABLE foo  ", "", "foo", true},
+		{"backticks", "TRUNCATE TABLE `foo`", "", "foo", true},
+		{"schema.table", "TRUNCATE TABLE db.foo", "db", "foo", true},
+		{"backticked schema.table", "TRUNCATE TABLE `db`.`foo`", "db", "foo", true},
+		{"backticks one side", "TRUNCATE TABLE db.`foo`", "db", "foo", true},
+		{"tab whitespace", "TRUNCATE\tTABLE\tfoo", "", "foo", true},
+
+		// Not TRUNCATE — fall through to generic DDL handling
+		{"CREATE", "CREATE TABLE foo", "", "", false},
+		{"DROP", "DROP TABLE foo", "", "", false},
+		{"ALTER", "ALTER TABLE foo ADD COLUMN bar INT", "", "", false},
+		{"BEGIN", "BEGIN", "", "", false},
+		{"COMMIT", "COMMIT", "", "", false},
+		{"empty", "", "", "", false},
+		{"TRUNCATE prefix only", "TRUNCATE", "", "", false},
+		{"TRUNCATE TABLE no name", "TRUNCATE TABLE", "", "", false},
+		{"TRUNCATE TABLE trailing space", "TRUNCATE TABLE ", "", "", false},
+
+		// Out-of-shape — punt to generic DDL
+		{"multi-table", "TRUNCATE foo, bar", "", "", false},
+		{"trailing semicolon", "TRUNCATE foo;", "", "", false},
+		{"with parens", "TRUNCATE TABLE foo()", "", "", false},
+		// "TRUNCATE TABLEFOO" is the optional-TABLE form with TABLEFOO
+		// as the table name (a legal MySQL identifier). The parser
+		// must NOT mistakenly strip "TABLE" as a keyword without a
+		// whitespace separator.
+		{"TABLEFOO is a valid table name", "TRUNCATE TABLEFOO", "", "TABLEFOO", true},
+	}
+
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			gotSchema, gotTable, gotOK := parseTruncateTable(c.in)
+			if gotOK != c.wantOK {
+				t.Errorf("ok = %v; want %v", gotOK, c.wantOK)
+			}
+			if gotSchema != c.wantSchema {
+				t.Errorf("schema = %q; want %q", gotSchema, c.wantSchema)
+			}
+			if gotTable != c.wantTable {
+				t.Errorf("table = %q; want %q", gotTable, c.wantTable)
+			}
+		})
+	}
+}

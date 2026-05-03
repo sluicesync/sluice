@@ -228,6 +228,77 @@ func TestCDCReader_PlanetScaleRefuses(t *testing.T) {
 	}
 }
 
+// TestCDCReader_Truncate verifies that MySQL's TRUNCATE TABLE
+// surfaces as ir.Truncate on the change channel, not as a silent
+// schema-cache invalidation. PG's pgoutput emits typed truncate
+// messages natively; on MySQL we recognise TRUNCATE by parsing the
+// query text inside QUERY_EVENT.
+func TestCDCReader_Truncate(t *testing.T) {
+	dsn, cleanup := startMySQLForCDC(t)
+	defer cleanup()
+
+	const seedDDL = `
+		CREATE TABLE users (
+			id    BIGINT       NOT NULL AUTO_INCREMENT,
+			email VARCHAR(255) NOT NULL,
+			PRIMARY KEY (id)
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+	`
+	applyMySQL(t, dsn, seedDDL)
+
+	eng := Engine{Flavor: FlavorVanilla}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	rdr, err := eng.OpenCDCReader(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenCDCReader: %v", err)
+	}
+	defer func() {
+		if c, ok := rdr.(interface{ Close() error }); ok {
+			_ = c.Close()
+		}
+	}()
+
+	changes, err := rdr.StreamChanges(ctx, ir.Position{})
+	if err != nil {
+		t.Fatalf("StreamChanges: %v", err)
+	}
+
+	// Brief settle so the binlog syncer is positioned at "now"
+	// before the DML lands.
+	time.Sleep(200 * time.Millisecond)
+
+	// Issue an INSERT, then a TRUNCATE. We expect two events on
+	// the channel: ir.Insert for the row, then ir.Truncate for
+	// the table.
+	const dml = `
+		INSERT INTO users (email) VALUES ('alice@example.com');
+		TRUNCATE TABLE users;
+	`
+	applyMySQL(t, dsn, dml)
+
+	got := drainChanges(t, ctx, changes, 2, 30*time.Second)
+	if len(got) != 2 {
+		t.Fatalf("got %d changes; want 2 (1 Insert + 1 Truncate)", len(got))
+	}
+	if _, ok := got[0].(ir.Insert); !ok {
+		t.Errorf("change[0] = %T; want ir.Insert", got[0])
+	}
+	trunc, ok := got[1].(ir.Truncate)
+	if !ok {
+		t.Fatalf("change[1] = %T; want ir.Truncate", got[1])
+	}
+	if trunc.Table != "users" {
+		t.Errorf("truncate.Table = %q; want \"users\"", trunc.Table)
+	}
+	// The Position should be decodable — the same shape every
+	// other emitted change carries.
+	if trunc.Pos().Engine != "mysql" || trunc.Pos().Token == "" {
+		t.Errorf("truncate.Pos = %+v; want non-empty mysql position", trunc.Pos())
+	}
+}
+
 // drainChanges reads up to want events from changes, with an overall
 // timeout. The returned slice may be shorter than want if the stream
 // closed early or the timeout fired — caller asserts.

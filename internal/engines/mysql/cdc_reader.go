@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -311,11 +312,40 @@ func (r *CDCReader) dispatch(ctx context.Context, ev *replication.BinlogEvent, o
 		if q == "BEGIN" || q == "COMMIT" {
 			return nil
 		}
-		// Anything else is treated as DDL. Conservative blanket
-		// invalidation: we'd rather over-invalidate than risk the
-		// row decoder using a stale column list. The cost is one
-		// information_schema query per affected table on the next
-		// row event for that table.
+		// TRUNCATE TABLE arrives as a QUERY_EVENT carrying the SQL
+		// text. The IR has ir.Truncate; PG's pgoutput emits typed
+		// truncate messages directly, but on MySQL the only way to
+		// recognise truncates is parsing the query string. The
+		// parser is narrow (TRUNCATE [TABLE] [<schema>.]<table>);
+		// out-of-shape forms (multi-table truncate, etc.) fall
+		// through to generic DDL handling.
+		if truncSchema, truncTable, ok := parseTruncateTable(q); ok {
+			// The parsed schema is empty when the source DDL didn't
+			// qualify it; default to the QueryEvent's schema (the
+			// session's USE-context).
+			if truncSchema == "" {
+				truncSchema = string(e.Schema)
+			}
+			if truncSchema == r.schema {
+				pos, err := r.positionFor(ev.Header)
+				if err != nil {
+					return err
+				}
+				if err := send(ctx, out, ir.Truncate{
+					Position: pos,
+					Schema:   truncSchema,
+					Table:    truncTable,
+				}); err != nil {
+					return err
+				}
+			}
+			// Truncate also resets the auto-increment counter; fall
+			// through to the generic invalidation below so the
+			// schema cache stays honest.
+		}
+		// Generic DDL: conservative blanket cache invalidation.
+		// We'd rather over-invalidate than risk the row decoder
+		// using a stale column list.
 		stmtSchema := string(e.Schema)
 		if stmtSchema == r.schema || stmtSchema == "" {
 			clear(r.schemaCache)
@@ -686,6 +716,116 @@ func splitQualified(qn string) (schema, table string) {
 		}
 	}
 	return "", qn
+}
+
+// parseTruncateTable detects whether a binlog QUERY_EVENT body is a
+// TRUNCATE statement and, if so, returns the schema-qualified table
+// reference. Returns ok=false for any non-TRUNCATE input — the
+// caller treats that as "this is some other DDL, fall through to
+// schema-cache invalidation".
+//
+// Recognised forms:
+//
+//	TRUNCATE TABLE foo
+//	TRUNCATE foo                  (the optional-TABLE form)
+//	TRUNCATE TABLE `foo`
+//	TRUNCATE TABLE schema.foo
+//	TRUNCATE TABLE `schema`.`foo`
+//
+// Multi-table TRUNCATEs (TRUNCATE foo, bar) and anything outside
+// the recognised shapes return ok=false. The bound is deliberate:
+// this is not a SQL parser. Out-of-shape TRUNCATEs fall through to
+// generic DDL handling, which still invalidates the schema cache —
+// the only thing the operator loses is a typed ir.Truncate event,
+// not correctness.
+func parseTruncateTable(query string) (schema, table string, ok bool) {
+	q := strings.TrimSpace(query)
+	upper := strings.ToUpper(q)
+
+	const truncateKW = "TRUNCATE"
+	if !strings.HasPrefix(upper, truncateKW) {
+		return "", "", false
+	}
+	// Strip "TRUNCATE" plus exactly one whitespace separator.
+	rest := strings.TrimSpace(q[len(truncateKW):])
+	if rest == "" {
+		return "", "", false
+	}
+
+	// Optional "TABLE" keyword. Two cases to reject explicitly:
+	//
+	//   - rest is exactly "TABLE" (bare keyword, no name follows)
+	//     — the source DDL "TRUNCATE TABLE" would have errored at
+	//     the server anyway, but the parser should not pretend the
+	//     keyword is a table name.
+	//   - rest is "TABLEFOO" (no whitespace separator) — that's a
+	//     legal table name beginning with the letters T-A-B-L-E,
+	//     not a TABLE-keyword + name. Don't strip the prefix.
+	const tableKW = "TABLE"
+	if strings.EqualFold(rest, tableKW) {
+		return "", "", false
+	}
+	if len(rest) > len(tableKW) && strings.EqualFold(rest[:len(tableKW)], tableKW) {
+		next := rest[len(tableKW)]
+		if next == ' ' || next == '\t' {
+			rest = strings.TrimSpace(rest[len(tableKW):])
+		}
+	}
+
+	if rest == "" {
+		return "", "", false
+	}
+
+	// rest is now "foo" / "`foo`" / "schema.foo" / "`schema`.`foo`"
+	// (possibly with trailing punctuation we reject below). No commas
+	// allowed — multi-table TRUNCATE falls through to generic DDL.
+	if strings.ContainsAny(rest, ",;()") {
+		return "", "", false
+	}
+
+	// Split into at most two parts on the first non-quoted dot.
+	left, right, hasDot := splitTruncateRef(rest)
+	if hasDot {
+		schema = stripBackticks(left)
+		table = stripBackticks(right)
+	} else {
+		schema = ""
+		table = stripBackticks(left)
+	}
+
+	if table == "" {
+		return "", "", false
+	}
+	return schema, table, true
+}
+
+// splitTruncateRef splits a table reference on the first dot that
+// is *not* inside backticks. Returns (left, right, true) when a dot
+// was found, (whole, "", false) otherwise.
+func splitTruncateRef(s string) (left, right string, hasDot bool) {
+	inQuote := false
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '`':
+			inQuote = !inQuote
+		case '.':
+			if !inQuote {
+				return s[:i], s[i+1:], true
+			}
+		}
+	}
+	return s, "", false
+}
+
+// stripBackticks removes a single matching pair of backticks
+// surrounding s. Internal backticks (uncommon in real identifiers)
+// are left alone.
+func stripBackticks(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) >= 2 && s[0] == '`' && s[len(s)-1] == '`' {
+		return s[1 : len(s)-1]
+	}
+	return s
 }
 
 // decodeBinlogRow maps a positional row from a RowsEvent (one entry
