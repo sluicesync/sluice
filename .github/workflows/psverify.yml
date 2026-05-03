@@ -1,0 +1,92 @@
+# PlanetScale verification workflow.
+#
+# Exercises sluice's Postgres engine and orchestrator against a real
+# PlanetScale account using the credentials stored as repo secrets.
+# Gated behind the `psverify` build tag so the test files are excluded
+# from the default CI Test/Integration jobs and do nothing in a checkout
+# without credentials.
+#
+# Triggers:
+#   - workflow_dispatch:  manual run from the Actions tab. Use this when
+#                         you want to confirm sluice still works against
+#                         the live PS-PG account on demand (e.g., after
+#                         a non-trivial Postgres-engine change).
+#   - schedule (commented out below): once-a-week regression run.
+#                         Uncomment when you're confident the suite is
+#                         stable; leaving it disabled by default keeps
+#                         PlanetScale quota predictable while the suite
+#                         is still maturing.
+#
+# Required repo secrets (Settings → Secrets and variables → Actions):
+#   - SLUICE_MYSQL_SOURCE
+#   - SLUICE_MYSQL_DESTINATION
+#   - SLUICE_POSTGRES_SOURCE
+#   - SLUICE_POSTGRES_DESTINATION
+#
+# Each secret holds the same DSN string the local PLANETSCALE_CREDENTIALS.env
+# file holds. The credential loader in the test files reads env vars first
+# (the CI path) and falls back to the .env file (the dev-loop path), so
+# one set of test code serves both.
+
+name: PlanetScale Verify
+
+on:
+  workflow_dispatch:
+  # Uncomment to enable a weekly Monday-06:00-UTC regression run.
+  # Vendor changes (TLS cert renewals, pgwire-proxy rollouts) won't
+  # surface until someone runs the suite, so a periodic check catches
+  # drift even when nobody is touching engine code.
+  # schedule:
+  #   - cron: "0 6 * * 1"
+
+# This workflow only reads repo contents (and writes nothing back). The
+# secrets it consumes are scoped at the job's env block below.
+permissions:
+  contents: read
+
+# Cancel any in-progress run from the same trigger when a new one starts.
+# Two parallel runs against the same PlanetScale databases would race on
+# the test fixtures (they share schema names like `sluice_psverify_*`).
+concurrency:
+  group: psverify
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  psverify:
+    name: PS-PG verification
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: "go.mod"
+      - run: go mod download
+
+      # Cheap pre-flight: prove the test files compile under the
+      # `psverify` tag before we burn time hitting external services.
+      - run: go vet -tags=psverify ./internal/...
+
+      # The real run. Tests skip cleanly when env vars are missing,
+      # so a misconfigured secret produces "no tests to run" rather
+      # than a confusing connection error.
+      #
+      # -count=1 disables the test cache (cached results would defeat
+      # the point of verifying live infrastructure). -race catches
+      # races in the reader/writer paths exercised against a real
+      # backend, which the unit-test race coverage can't reach.
+      #
+      # The credential loader reads env vars first; the .env-file
+      # fallback path doesn't fire in CI, so secrets land directly
+      # via env: below.
+      - name: Run PS verification suite
+        env:
+          SLUICE_MYSQL_SOURCE: ${{ secrets.SLUICE_MYSQL_SOURCE }}
+          SLUICE_MYSQL_DESTINATION: ${{ secrets.SLUICE_MYSQL_DESTINATION }}
+          SLUICE_POSTGRES_SOURCE: ${{ secrets.SLUICE_POSTGRES_SOURCE }}
+          SLUICE_POSTGRES_DESTINATION: ${{ secrets.SLUICE_POSTGRES_DESTINATION }}
+        run: go test -tags=psverify -race -count=1 -timeout=15m -v ./internal/...

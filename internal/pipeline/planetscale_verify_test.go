@@ -217,6 +217,16 @@ func TestPSPipeline_StreamerPGToPG(t *testing.T) {
 		}
 	}()
 
+	// A previous failed run may have left a `sluice_slot` replication
+	// slot behind on the source. The OpenSnapshotStream path
+	// deliberately refuses to inherit existing slots (production
+	// safety: avoids accidentally resuming from a stale consistent
+	// point), but that defeats test idempotency. Drop any leftover
+	// slot before starting and again after the test finishes so reruns
+	// against the same database are reliable.
+	dropPSSlotIfExists(t, pgSrc, "sluice_slot")
+	defer dropPSSlotIfExists(t, pgSrc, "sluice_slot")
+
 	const seedDDL = `
 		CREATE TABLE sluice_psverify_stream.users (
 			id    BIGINT       PRIMARY KEY,
@@ -246,18 +256,52 @@ func TestPSPipeline_StreamerPGToPG(t *testing.T) {
 	runErr := make(chan error, 1)
 	go func() { runErr <- streamer.Run(streamCtx) }()
 
-	if !waitForPSRowCount(t, ctx, pgDest, schemaName, "users", 1, 60*time.Second) {
-		t.Fatalf("bulk-copy never delivered R1 to PG destination")
+	// waitOrSurfaceErr races the row-count poll against the
+	// streamer's run-error channel. Without this, an early failure
+	// in Streamer.Run (slot creation, snapshot import) surfaces only
+	// as a 60s "never delivered" timeout — useless for diagnosis.
+	waitOrSurfaceErr := func(want int, label string) {
+		t.Helper()
+		deadline := time.NewTimer(60 * time.Second)
+		defer deadline.Stop()
+		for {
+			select {
+			case err := <-runErr:
+				if err != nil {
+					t.Fatalf("%s: Streamer.Run returned early with error: %v", label, err)
+				}
+				t.Fatalf("%s: Streamer.Run returned nil before delivering rows", label)
+			case <-deadline.C:
+				t.Fatalf("%s: timeout waiting for %d rows on destination", label, want)
+			default:
+			}
+			db, err := sql.Open("pgx", pgDest)
+			if err != nil {
+				time.Sleep(500 * time.Millisecond)
+				continue
+			}
+			queryCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			var n int
+			qErr := db.QueryRowContext(queryCtx,
+				"SELECT COUNT(*) FROM "+schemaName+".users",
+			).Scan(&n)
+			cancel()
+			_ = db.Close()
+			if qErr == nil && n >= want {
+				return
+			}
+			time.Sleep(500 * time.Millisecond)
+		}
 	}
+
+	waitOrSurfaceErr(1, "phase D (bulk-copy R1)")
 
 	if err := execPS(t, ctx, pgSrc,
 		"INSERT INTO sluice_psverify_stream.users (id, email) VALUES (2, 'r2@example.com');",
 	); err != nil {
 		t.Fatalf("R2 insert: %v", err)
 	}
-	if !waitForPSRowCount(t, ctx, pgDest, schemaName, "users", 2, 60*time.Second) {
-		t.Fatalf("CDC never delivered R2 to PG destination")
-	}
+	waitOrSurfaceErr(2, "phase E (CDC R2)")
 
 	streamCancel()
 	select {
@@ -375,6 +419,41 @@ func dropPSSchema(t *testing.T, ctx context.Context, dsn, schema string) {
 	t.Helper()
 	if err := execPS(t, ctx, dsn, "DROP SCHEMA IF EXISTS "+schema+" CASCADE"); err != nil {
 		t.Logf("drop schema %s: %v", schema, err)
+	}
+}
+
+// dropPSSlotIfExists is a best-effort cleanup of a leftover
+// replication slot. pg_drop_replication_slot raises an error when
+// the slot doesn't exist, so we check first; either branch is fine
+// to ignore — the goal is to produce a clean slate for the next
+// CREATE_REPLICATION_SLOT call.
+func dropPSSlotIfExists(t *testing.T, dsn, slotName string) {
+	t.Helper()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Logf("slot pre-clean open: %v", err)
+		return
+	}
+	defer func() { _ = db.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	var exists bool
+	err = db.QueryRowContext(ctx,
+		"SELECT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)",
+		slotName,
+	).Scan(&exists)
+	if err != nil {
+		t.Logf("slot pre-clean lookup: %v", err)
+		return
+	}
+	if !exists {
+		return
+	}
+	if _, err := db.ExecContext(ctx,
+		"SELECT pg_drop_replication_slot($1)", slotName,
+	); err != nil {
+		t.Logf("drop slot %s: %v", slotName, err)
 	}
 }
 
