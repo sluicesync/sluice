@@ -115,23 +115,83 @@ header.
   because the situation is more likely on a managed service where
   network blips can interrupt the streamer.
 
-## PlanetScale MySQL
+## PlanetScale MySQL (and other Vitess deployments)
 
 **Status**: Supported via the `planetscale` engine (a flavor of the
-MySQL engine). Documented separately in
-[../internal/engines/mysql/flavor.go](../internal/engines/mysql/flavor.go);
-key constraints inherited from PlanetScale's Vitess platform are:
+MySQL engine that speaks Vitess's VStream gRPC protocol for CDC).
+The same flavor handles three deployment shapes:
+
+| Deployment | Transport | Auth | Shard convention |
+|------------|-----------|------|------------------|
+| PlanetScale (hosted) | TLS (default) | Basic (default; service-token name+value) | `-` (default) |
+| Self-hosted Vitess + TLS + auth | TLS | Basic | varies |
+| Self-hosted Vitess plaintext (vttestserver, dev) | `?vstream_transport=plaintext` | `?vstream_auth=none` | usually `?vstream_shards=0` |
+
+Key constraints inherited from the Vitess platform:
 
 - No `LOAD DATA INFILE` (sluice uses batched inserts instead).
-- No direct binlog access (sluice's CDC capability is reported as
-  `None` for this flavor; continuous sync via VStream is a planned
-  future chunk).
+- No direct binlog access — CDC goes through Vitess's VStream gRPC
+  protocol. The flavor declares `CDCVStream` so the streamer's
+  capability check accepts it.
 - No user-defined PARTITION BY (Vitess sharding handles partitioning).
+- Sharded keyspaces are explicitly out of scope for v1 — the
+  reader streams from a fixed shard layout supplied via
+  `vstream_shards` (defaults to `-` for the PlanetScale unsharded
+  case). Multi-shard support and reshard discovery are planned
+  follow-ups.
 - Spatial types not supported in v1 (conservative default; flip the
   capability flag if you've confirmed otherwise).
 
 Use `--source-driver=planetscale` (or the equivalent in
-`sluice.yaml`) when targeting a PS-MySQL database.
+`sluice.yaml`) when targeting any Vitess deployment.
+
+### VStream DSN flags
+
+All optional, all default to PlanetScale-friendly behaviour. Ride
+on the standard MySQL DSN as additional `?key=value` parameters:
+
+- `vstream_endpoint=<host:port>` — override the vtgate gRPC
+  endpoint. Default is `<sql-host>:443`, matching PlanetScale's
+  connect-host convention.
+- `vstream_transport={tls|plaintext}` — default `tls`. Plaintext
+  opts out of TLS entirely; only sensible for localhost vttestserver
+  and dev setups.
+- `vstream_insecure_tls=true` — keeps TLS but skips certificate
+  verification. Useful for self-signed certs in tests.
+- `vstream_auth={basic|none}` — default `basic`. None skips the
+  Authorization header entirely; matches vanilla Vitess
+  deployments that don't authenticate VStream calls.
+- `vstream_shards=<comma-separated>` — default `-`. PlanetScale
+  convention; vttestserver typically uses `0` for an unsharded
+  keyspace.
+
+Auth is HTTP Basic over gRPC metadata. Username/password come from
+the standard MySQL DSN's `User:Passwd` fields; for PlanetScale,
+those are the service-token name and value.
+
+### Verification
+
+`internal/engines/mysql/cdc_vstream_psverify_test.go` (psverify
+build tag) exercises the real PlanetScale endpoint:
+
+```bash
+go test -tags=psverify -v -count=1 -timeout=10m \
+  -run 'TestPSVStream' ./internal/engines/mysql/...
+```
+
+`internal/engines/mysql/cdc_vstream_integration_test.go`
+(`integration && vstream` build tag) exercises a vanilla Vitess
+deployment via testcontainers:
+
+```bash
+go test -tags='integration vstream' -v -count=1 -timeout=15m \
+  -run 'TestVStream_VTTestServer' ./internal/engines/mysql/...
+```
+
+The vttestserver image is heavier (~700 MB) than the plain
+`mysql:8.0` the default integration suite uses, so the standard
+`make test-it` doesn't pull it. The split build tag pattern
+mirrors the `postgis` tag for the PostGIS integration test.
 
 ## Other managed services
 

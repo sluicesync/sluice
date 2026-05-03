@@ -2,6 +2,7 @@ package mysql
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -316,6 +317,99 @@ func TestVStreamEndpointFromDSN(t *testing.T) {
 			}
 			if got != c.want {
 				t.Errorf("got %q; want %q", got, c.want)
+			}
+		})
+	}
+}
+
+// TestVStreamDialOptions covers the transport/auth flag matrix.
+// The four valid combinations all succeed; invalid values and the
+// "basic auth over plaintext" footgun produce clear errors.
+func TestVStreamDialOptions(t *testing.T) {
+	cases := []struct {
+		name      string
+		user      string
+		passwd    string
+		params    map[string]string
+		wantErr   bool
+		wantAuth  bool // expect non-empty authHeader
+		errSubstr string
+	}{
+		{
+			name: "default (tls + basic) with creds",
+			user: "u", passwd: "p",
+			wantAuth: true,
+		},
+		{
+			name: "tls + basic explicit",
+			user: "u", passwd: "p",
+			params:   map[string]string{"vstream_transport": "tls", "vstream_auth": "basic"},
+			wantAuth: true,
+		},
+		{
+			name:   "plaintext + none (vttestserver)",
+			params: map[string]string{"vstream_transport": "plaintext", "vstream_auth": "none"},
+		},
+		{
+			name:     "tls + none (vanilla Vitess with TLS but no auth)",
+			params:   map[string]string{"vstream_auth": "none"},
+			wantAuth: false,
+		},
+		{
+			name: "basic without user",
+			user: "", passwd: "",
+			wantErr:   true,
+			errSubstr: "no user",
+		},
+		{
+			name: "basic over plaintext refused",
+			user: "u", passwd: "p",
+			params:    map[string]string{"vstream_transport": "plaintext"},
+			wantErr:   true,
+			errSubstr: "refuses to ride plaintext",
+		},
+		{
+			name: "unknown transport",
+			user: "u", passwd: "p",
+			params:    map[string]string{"vstream_transport": "quic"},
+			wantErr:   true,
+			errSubstr: "unknown vstream_transport",
+		},
+		{
+			name: "unknown auth",
+			user: "u", passwd: "p",
+			params:    map[string]string{"vstream_auth": "oauth"},
+			wantErr:   true,
+			errSubstr: "unknown vstream_auth",
+		},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			cfg, _ := minimalConfig("host:3306", c.params)
+			cfg.User = c.user
+			cfg.Passwd = c.passwd
+			opts, authHeader, err := vstreamDialOptions(cfg)
+			if c.wantErr {
+				if err == nil {
+					t.Fatalf("expected error containing %q; got nil", c.errSubstr)
+				}
+				if !strings.Contains(err.Error(), c.errSubstr) {
+					t.Errorf("err = %q; want substring %q", err.Error(), c.errSubstr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("vstreamDialOptions: %v", err)
+			}
+			if len(opts) == 0 {
+				t.Errorf("got 0 dial options; want at least transport credentials")
+			}
+			if c.wantAuth && authHeader == "" {
+				t.Error("authHeader is empty; want non-empty for basic auth")
+			}
+			if !c.wantAuth && authHeader != "" {
+				t.Errorf("authHeader = %q; want empty for non-basic auth", authHeader)
 			}
 		})
 	}

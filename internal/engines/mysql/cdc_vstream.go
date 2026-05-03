@@ -12,7 +12,7 @@ import (
 	gomysql "github.com/go-sql-driver/mysql"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
-
+	"google.golang.org/grpc/credentials/insecure"
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/proto/binlogdata"
 	"vitess.io/vitess/go/vt/proto/query"
@@ -73,11 +73,6 @@ type vstreamCDCReader struct {
 	// querying the keyspace metadata in resolveStartPosition.
 	shards []string
 
-	// tlsConfig is the TLS configuration applied to the gRPC dial.
-	// nil means "default TLS" (PlanetScale's edge); tests can
-	// inject an insecure config for vttestserver-on-localhost.
-	tlsConfig *tls.Config
-
 	// conn is the underlying gRPC client connection. Held for the
 	// reader's lifetime so multiple StreamChanges calls (currently
 	// disallowed; reserved for a future API change) would share it.
@@ -118,30 +113,42 @@ type vstreamCDCReader struct {
 const vstreamChannelBuffer = 256
 
 // openVStreamReader is the FlavorPlanetScale path of the engine's
-// OpenCDCReader. It parses the standard MySQL DSN to extract the
-// service-token user/password, derives the gRPC endpoint, dials,
-// and returns a reader ready for StreamChanges.
+// OpenCDCReader. It parses the standard MySQL DSN, builds a gRPC
+// dial against the vtgate endpoint, and returns a reader ready for
+// StreamChanges.
 //
-// DSN sources:
-//   - User / Passwd → service-token name / value (HTTP Basic auth)
-//   - Addr (the host:port from the tcp(...) wrapper) → gRPC
-//     endpoint host. The default port is 443; override via the
-//     `vstream_endpoint` DSN parameter for self-hosted Vitess /
-//     vttestserver.
-//   - DBName → keyspace.
+// DSN inputs:
+//   - User / Passwd → basic-auth credentials (PlanetScale's service-
+//     token name / value). Skipped when vstream_auth=none.
+//   - Addr (host:port from the tcp(...) wrapper) → vtgate endpoint
+//     host. Port defaults to 443; the full endpoint is overridable
+//     via the `vstream_endpoint` DSN parameter.
+//   - DBName → Vitess keyspace.
+//
+// DSN flags (all optional, all default to PlanetScale-friendly
+// behaviour):
+//   - vstream_endpoint=<host:port> — vtgate gRPC endpoint
+//     override. Useful for self-hosted Vitess and vttestserver.
+//   - vstream_transport={tls|plaintext} — default tls. Plaintext
+//     opts out of TLS entirely; only useful for localhost
+//     vttestserver / development setups.
+//   - vstream_insecure_tls=true — keeps TLS but skips certificate
+//     verification. Useful for self-signed certs in tests.
+//   - vstream_auth={basic|none} — default basic. None skips the
+//     Authorization header entirely; matches vanilla Vitess
+//     deployments that don't authenticate VStream calls.
+//   - vstream_shards=<comma-separated> — default "-". The
+//     PlanetScale convention is "-" for an unsharded keyspace;
+//     vttestserver uses "0" for the same case. Multi-shard
+//     keyspaces list every shard ("-80,80-").
 //
 // Sharded keyspaces are out of scope for v1: this reader assumes
-// one shard ("-"). The check for that lands in resolveStartPosition
-// when StreamChanges runs (we want errors at usage time, not at
-// Open time, so the engine can be opened in dry-run flows that
-// don't actually stream).
+// one shard ("-"). Errors at usage time, not Open time, so the
+// engine can be opened in dry-run flows that don't actually stream.
 func openVStreamReader(_ context.Context, dsn string) (ir.CDCReader, error) {
 	cfg, err := parseDSN(dsn)
 	if err != nil {
 		return nil, err
-	}
-	if cfg.User == "" {
-		return nil, errors.New("mysql/vstream: DSN has no user (service-token name expected)")
 	}
 	if cfg.DBName == "" {
 		return nil, errors.New("mysql/vstream: DSN has no database name (vitess keyspace expected)")
@@ -152,14 +159,12 @@ func openVStreamReader(_ context.Context, dsn string) (ir.CDCReader, error) {
 		return nil, err
 	}
 
-	tlsCfg := vstreamTLSConfigFromDSN(cfg)
+	dialOpts, authHeader, err := vstreamDialOptions(cfg)
+	if err != nil {
+		return nil, err
+	}
 
-	authHeader := "Basic " + base64.StdEncoding.EncodeToString([]byte(cfg.User+":"+cfg.Passwd))
-
-	conn, err := grpc.NewClient(endpoint,
-		grpc.WithTransportCredentials(credentials.NewTLS(tlsCfg)),
-		grpc.WithPerRPCCredentials(&vstreamBasicAuth{header: authHeader}),
-	)
+	conn, err := grpc.NewClient(endpoint, dialOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("mysql/vstream: dial %s: %w", endpoint, err)
 	}
@@ -168,12 +173,75 @@ func openVStreamReader(_ context.Context, dsn string) (ir.CDCReader, error) {
 		endpoint:   endpoint,
 		authHeader: authHeader,
 		keyspace:   cfg.DBName,
-		shards:     []string{"-"}, // v1: unsharded only
-		tlsConfig:  tlsCfg,
+		shards:     vstreamShardsFromDSN(cfg),
 		conn:       conn,
 		client:     vtgateservice.NewVitessClient(conn),
 		fields:     make(map[string][]*query.Field),
 	}, nil
+}
+
+// vstreamShardsFromDSN returns the shard layout the reader should
+// stream. The DSN's `vstream_shards` parameter is a
+// comma-separated list of shard names; missing or empty defaults
+// to "-" (PlanetScale's convention for an unsharded keyspace).
+// vttestserver uses "0" instead and needs the override.
+func vstreamShardsFromDSN(cfg *gomysql.Config) []string {
+	v := cfg.Params["vstream_shards"]
+	if v == "" {
+		return []string{"-"}
+	}
+	parts := strings.Split(v, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	if len(out) == 0 {
+		return []string{"-"}
+	}
+	return out
+}
+
+// vstreamDialOptions builds the gRPC dial options from the DSN's
+// transport/auth flags. Returned authHeader is the encoded value
+// stashed on the reader for diagnostics; the gRPC layer attaches
+// it via PerRPCCredentials when vstream_auth=basic.
+func vstreamDialOptions(cfg *gomysql.Config) ([]grpc.DialOption, string, error) {
+	transport := cfg.Params["vstream_transport"]
+	authMode := cfg.Params["vstream_auth"]
+
+	dialOpts := make([]grpc.DialOption, 0, 2)
+
+	switch transport {
+	case "", "tls":
+		dialOpts = append(dialOpts,
+			grpc.WithTransportCredentials(credentials.NewTLS(vstreamTLSConfigFromDSN(cfg))))
+	case "plaintext":
+		dialOpts = append(dialOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	default:
+		return nil, "", fmt.Errorf("mysql/vstream: unknown vstream_transport %q (want tls or plaintext)", transport)
+	}
+
+	var authHeader string
+	switch authMode {
+	case "", "basic":
+		if cfg.User == "" {
+			return nil, "", errors.New("mysql/vstream: DSN has no user (service-token name expected); set vstream_auth=none for unauthenticated Vitess setups")
+		}
+		if transport == "plaintext" {
+			return nil, "", errors.New("mysql/vstream: vstream_auth=basic refuses to ride plaintext (gRPC RequireTransportSecurity); use vstream_auth=none if intentional")
+		}
+		authHeader = "Basic " + base64.StdEncoding.EncodeToString([]byte(cfg.User+":"+cfg.Passwd))
+		dialOpts = append(dialOpts, grpc.WithPerRPCCredentials(&vstreamBasicAuth{header: authHeader}))
+	case "none":
+		// Vanilla Vitess / vttestserver: no auth header.
+	default:
+		return nil, "", fmt.Errorf("mysql/vstream: unknown vstream_auth %q (want basic or none)", authMode)
+	}
+
+	return dialOpts, authHeader, nil
 }
 
 // vstreamEndpointFromDSN derives the vtgate gRPC endpoint from the
