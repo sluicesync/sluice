@@ -134,12 +134,21 @@ Key constraints inherited from the Vitess platform:
   protocol. The flavor declares `CDCVStream` so the streamer's
   capability check accepts it.
 - No user-defined PARTITION BY (Vitess sharding handles partitioning).
-- Sharded keyspaces are supported: list the shards explicitly via
-  `vstream_shards` or set `vstream_auto_discover_shards=true` to
-  have sluice query `SHOW VITESS_SHARDS LIKE '<keyspace>/%'` at
-  Open time. The reader streams from all shards concurrently and
-  detects reshards via a typed `ShardLayoutChangedError`; callers
-  resume on the new layout via `vstreamCDCReader.Reopen`.
+- Sharded keyspaces are supported on both the standalone CDC path
+  and the snapshot+CDC handoff path: list the shards explicitly
+  via `vstream_shards` or set `vstream_auto_discover_shards=true`
+  to have sluice query `SHOW VITESS_SHARDS LIKE '<keyspace>/%'` at
+  Open time. The reader streams from all shards concurrently
+  (vtgate fans out the COPY phase per shard, then the same gRPC
+  stream tails CDC across all shards). Per-scope `COPY_COMPLETED`
+  events are progress markers; only the *global* COPY_COMPLETED
+  (Keyspace and Shard both empty) marks the snapshot→CDC
+  handoff. Reshards mid-stream surface as a typed
+  `ShardLayoutChangedError`; on the standalone CDC path callers
+  resume via `vstreamCDCReader.Reopen`, on the snapshot path v1
+  asks the caller to drop and reopen the snapshot stream from
+  scratch (in-place reshard recovery during COPY is a future
+  chunk).
 - Spatial types not supported in v1 (conservative default; flip the
   capability flag if you've confirmed otherwise).
 

@@ -68,7 +68,11 @@ func (e Engine) openVStreamSnapshotStream(ctx context.Context, dsn string) (*ir.
 	}
 
 	keyspace := cfg.DBName
-	shards := vstreamShardsFromDSN(cfg)
+	shards, err := resolveVStreamShards(ctx, cfg)
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
 	client := vtgateservice.NewVitessClient(conn)
 
 	// The gRPC stream lives for the lifetime of the SnapshotStream:
@@ -106,12 +110,13 @@ func (e Engine) openVStreamSnapshotStream(ctx context.Context, dsn string) (*ir.
 	}
 
 	snap := &vstreamSnapshotStream{
-		keyspace:   keyspace,
-		fields:     make(map[string][]*query.Field),
-		rowBuffer:  make(map[string][]ir.Row),
-		conn:       conn,
-		grpcStream: grpcStream,
-		grpcCancel: streamCancel,
+		keyspace:            keyspace,
+		fields:              make(map[string][]*query.Field),
+		rowBuffer:           make(map[string][]ir.Row),
+		copyCompletedShards: make(map[string]bool),
+		conn:                conn,
+		grpcStream:          grpcStream,
+		grpcCancel:          streamCancel,
 	}
 
 	// Drain the COPY phase synchronously. The caller's ctx bounds how
@@ -178,7 +183,24 @@ type vstreamSnapshotStream struct {
 	// slice is cleared so a second ReadRows on the same table
 	// returns an empty slice (matches the contract in row_reader.go
 	// where ReadRows is single-shot per table).
+	//
+	// Multi-shard sharded keyspaces fan rows for the *same logical
+	// table* in from multiple shards. Keying by unqualified table
+	// name (rather than per-shard) merges them into one slice so
+	// the orchestrator's single-table ReadRows call surfaces every
+	// row regardless of shard origin.
 	rowBuffer map[string][]ir.Row
+
+	// copyCompletedShards tracks per-scope COPY_COMPLETED events
+	// (those carrying a non-empty Keyspace/Shard) seen during the
+	// COPY phase. drainCopyPhase terminates on vtgate's *global*
+	// COPY_COMPLETED event (Keyspace and Shard both empty), which
+	// fires once every per-scope copy has finished. The per-scope
+	// set is recorded for visibility — multi-shard snapshots emit
+	// one entry per (keyspace, shard, table) tuple before the
+	// global terminator, and surfacing the count via tests confirms
+	// the per-scope-vs-global routing is wired correctly.
+	copyCompletedShards map[string]bool
 
 	conn       *grpc.ClientConn
 	grpcStream vtgateservice.Vitess_VStreamClient
@@ -249,18 +271,43 @@ func (s *vstreamSnapshotStream) dispatchCopyEvent(ev *binlogdata.VEvent) (done b
 		return false, nil
 
 	case binlogdata.VEventType_COPY_COMPLETED:
-		// Per-shard/per-table COPY_COMPLETED events carry a non-empty
-		// Keyspace+Shard. The global "all done" event has both fields
-		// empty (see vtgate's vstream_manager.isCopyFullyCompleted).
-		// We use the global one as our drain boundary; per-table ones
-		// are noise from the snapshot consumer's perspective.
+		// COPY_COMPLETED has two flavours during a multi-shard
+		// snapshot:
+		//
+		//   1. Per-scope: Keyspace+Shard populated. Fires when one
+		//      (shard, table) pair finishes its copy — a progress
+		//      marker. We track these so an operator can observe
+		//      shard-level progress, but they DO NOT terminate the
+		//      drain.
+		//   2. Global: Keyspace+Shard both empty. Fires once after
+		//      every per-scope copy has finished (cf. vtgate's
+		//      vstream_manager.isCopyFullyCompleted). This is the
+		//      snapshot→CDC handoff boundary.
+		//
+		// Only the global event terminates. Single-shard streams
+		// see exactly one per-scope event followed by one global
+		// event; multi-shard streams see N×T per-scope events
+		// (N shards × T tables) followed by one global event.
 		if ev.GetKeyspace() == "" && ev.GetShard() == "" {
 			return true, nil
 		}
+		if s.copyCompletedShards == nil {
+			s.copyCompletedShards = make(map[string]bool)
+		}
+		key := shardScopeKey(ev.GetKeyspace(), ev.GetShard())
+		s.copyCompletedShards[key] = true
 		return false, nil
 
 	case binlogdata.VEventType_JOURNAL:
-		return false, errors.New("mysql/vstream: snapshot: shard layout changed (journal event) during COPY")
+		// Reshard during COPY. v1 of multi-shard snapshot doesn't
+		// recover in place — the row buffer is keyed by table not
+		// shard, and the new shards' COPY phases would re-emit rows
+		// the old shards already buffered. Surface the typed error
+		// so the caller (typically [pipeline.Streamer.coldStart])
+		// drops the snapshot stream and starts a fresh one against
+		// the new layout. Full multi-shard COPY-with-reshard
+		// recovery is a future chunk.
+		return false, journalToShardLayoutErr(ev.GetJournal())
 
 	default:
 		// LASTPK, BEGIN, COMMIT, HEARTBEAT, GTID, OTHER, etc. — all
@@ -382,7 +429,11 @@ func (s *vstreamSnapshotStream) dispatchCDCEvent(ctx context.Context, ev *binlog
 		return s.dispatchCDCDDL(ctx, ev, out)
 
 	case binlogdata.VEventType_JOURNAL:
-		return errors.New("mysql/vstream: snapshot: shard layout changed (journal event); caller must reopen")
+		// Same contract as [vstreamCDCReader.dispatch]: surface a
+		// typed [ShardLayoutChangedError] carrying the new layout
+		// so the caller can decide whether to reopen against the
+		// new shard set or fail loudly.
+		return journalToShardLayoutErr(ev.GetJournal())
 
 	default:
 		// BEGIN, COMMIT, HEARTBEAT, GTID, OTHER, VERSION, LASTPK,
@@ -611,6 +662,15 @@ func (c *vstreamSnapshotChanges) StreamChanges(ctx context.Context, from ir.Posi
 // — keeps the [Streamer]'s defer chain symmetric. Actual cleanup
 // happens via [SnapshotStream.Close]; this is a no-op.
 func (c *vstreamSnapshotChanges) Close() error { return nil }
+
+// shardScopeKey is the key shape used in
+// [vstreamSnapshotStream.copyCompletedShards]. Combines keyspace and
+// shard so two shards with the same name in different keyspaces
+// (theoretically possible in a multi-keyspace stream; sluice's v1
+// streams a single keyspace) don't collide.
+func shardScopeKey(keyspace, shard string) string {
+	return keyspace + "/" + shard
+}
 
 // sameVgtid is a strict equality check: same shards in the same
 // order with the same Gtids. Used only to catch the case where the

@@ -478,6 +478,150 @@ func TestVStream_VTTestServer_SnapshotStream(t *testing.T) {
 	}
 }
 
+// TestVStream_VTTestServer_MultiShardSnapshot exercises the
+// multi-shard snapshot+CDC handoff: the snapshot path's COPY phase
+// must fan out to BOTH shards (-80 and 80-), buffer rows from each
+// into a unified per-table slice, and only terminate on the *global*
+// COPY_COMPLETED event (not the per-scope events from each shard).
+// After the handoff, post-COPY inserts must surface via CDC from
+// the persisted multi-shard position.
+//
+// This is the multi-shard counterpart to
+// TestVStream_VTTestServer_SnapshotStream. The single-shard test
+// must continue to pass alongside this one.
+func TestVStream_VTTestServer_MultiShardSnapshot(t *testing.T) {
+	mysqlDSN, grpcEndpoint, _, cleanup := startVTTestServerWithShards(t, 2)
+	defer cleanup()
+
+	const seedDDL = `
+		CREATE TABLE users (
+			id    BIGINT       NOT NULL,
+			email VARCHAR(255) NOT NULL,
+			PRIMARY KEY (id)
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+	`
+	applyVTTestSQL(t, mysqlDSN, seedDDL)
+
+	// Sharded keyspace: declare the primary vindex so vtgate routes
+	// inserts to a specific shard. Same approach as the multi-shard
+	// CDC integration test.
+	const vindexDDL = `ALTER VSCHEMA ON test.users ADD VINDEX hash(id) USING hash`
+	applyVTTestSQL(t, mysqlDSN, vindexDDL)
+
+	// Schema tracker is async; wait for the vschema change to
+	// propagate before opening the snapshot stream (the COPY phase
+	// enumerates tables via the tablet's schema engine).
+	time.Sleep(3 * time.Second)
+
+	// Seed eight rows with mixed ids — Vitess's hash vindex
+	// distributes them across both shards. Eight is enough for both
+	// shards to host at least one row in practice; the test
+	// asserts on the count and content, not on a specific shard
+	// assignment.
+	const seedRows = `
+		INSERT INTO users (id, email) VALUES (1, 'r1@example.com');
+		INSERT INTO users (id, email) VALUES (2, 'r2@example.com');
+		INSERT INTO users (id, email) VALUES (3, 'r3@example.com');
+		INSERT INTO users (id, email) VALUES (4, 'r4@example.com');
+		INSERT INTO users (id, email) VALUES (5, 'r5@example.com');
+		INSERT INTO users (id, email) VALUES (6, 'r6@example.com');
+		INSERT INTO users (id, email) VALUES (7, 'r7@example.com');
+		INSERT INTO users (id, email) VALUES (8, 'r8@example.com');
+	`
+	applyVTTestSQL(t, mysqlDSN+"&multiStatements=true", seedRows)
+
+	// Same beat as the single-shard test: schema-tracker time before
+	// the COPY phase opens.
+	time.Sleep(3 * time.Second)
+
+	sluiceDSN := fmt.Sprintf(
+		"%s&vstream_endpoint=%s&vstream_transport=plaintext&vstream_auth=none&vstream_auto_discover_shards=true",
+		mysqlDSN, grpcEndpoint,
+	)
+
+	eng := Engine{Flavor: FlavorPlanetScale}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	stream, err := eng.OpenSnapshotStream(ctx, sluiceDSN)
+	if err != nil {
+		t.Fatalf("OpenSnapshotStream: %v", err)
+	}
+	defer func() { _ = stream.Close() }()
+
+	// The captured position must carry TWO shardGtid entries (one
+	// per shard) — the multi-shard snapshot path's defining
+	// difference from the single-shard path.
+	shards, ok, err := decodeVStreamPos(stream.Position)
+	if err != nil || !ok {
+		t.Fatalf("decodeVStreamPos(stream.Position) ok=%v err=%v", ok, err)
+	}
+	if len(shards) != 2 {
+		t.Fatalf("captured position has %d shardGtid entries (%v); want 2", len(shards), shards)
+	}
+	for i, s := range shards {
+		if s.Gtid == "" || s.Gtid == "current" {
+			t.Errorf("position shards[%d].Gtid = %q; want concrete GTID after COPY_COMPLETED", i, s.Gtid)
+		}
+	}
+
+	// Post-COPY insert on a separate connection — must surface via
+	// CDC, not via the snapshot rows.
+	applyVTTestSQL(t, mysqlDSN, "INSERT INTO users (id, email) VALUES (1001, 'after-copy-1@example.com')")
+	applyVTTestSQL(t, mysqlDSN, "INSERT INTO users (id, email) VALUES (1002, 'after-copy-2@example.com')")
+
+	// Drain bulk rows. Multi-shard COPY merges rows from both
+	// shards into the same unqualified-table slice; ReadRows
+	// surfaces all eight regardless of shard origin.
+	usersTable := &ir.Table{
+		Name: "users",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}},
+			{Name: "email", Type: ir.Varchar{Length: 255}},
+		},
+	}
+	rowsCh, err := stream.Rows.ReadRows(ctx, usersTable)
+	if err != nil {
+		t.Fatalf("ReadRows: %v", err)
+	}
+	bulkEmails := make([]string, 0, 8)
+	for r := range rowsCh {
+		s, _ := r["email"].(string)
+		bulkEmails = append(bulkEmails, s)
+	}
+	sort.Strings(bulkEmails)
+	want := []string{
+		"r1@example.com", "r2@example.com", "r3@example.com", "r4@example.com",
+		"r5@example.com", "r6@example.com", "r7@example.com", "r8@example.com",
+	}
+	if !equalSorted(bulkEmails, want) {
+		t.Fatalf("bulk rows = %v; want exactly %v (overlap or missing rows across shards)", bulkEmails, want)
+	}
+
+	// Start CDC from the captured position. The two after-copy
+	// inserts committed after COPY_COMPLETED so they must surface
+	// here.
+	changes, err := stream.Changes.StreamChanges(ctx, stream.Position)
+	if err != nil {
+		t.Fatalf("StreamChanges: %v", err)
+	}
+
+	got := drainVTTestChanges(t, ctx, changes, 2, 90*time.Second)
+	postCopy := 0
+	for _, c := range got {
+		ins, ok := c.(ir.Insert)
+		if !ok {
+			continue
+		}
+		if email, _ := ins.Row["email"].(string); strings.HasPrefix(email, "after-copy-") {
+			postCopy++
+		}
+	}
+	if postCopy < 2 {
+		t.Fatalf("post-COPY CDC: got %d after-copy inserts; want 2", postCopy)
+	}
+}
+
 // equalSorted reports whether two pre-sorted slices have the same
 // contents in the same order.
 func equalSorted(a, b []string) bool {
