@@ -67,6 +67,20 @@ type Streamer struct {
 	// phase needs the rewritten types. Warm resume reuses the target
 	// schema as-is, so the field is ignored on that branch.
 	Mappings []config.Mapping
+
+	// DryRun, when true, prints what Run would do (cold-start vs
+	// warm-resume, source schema summary or persisted-position
+	// token) and returns without opening the snapshot stream,
+	// applying any data, or modifying the target's control table.
+	// Symmetric with the Migrator's existing DryRun flag.
+	//
+	// The position lookup against the target's control table still
+	// happens — that's a read, not a write, and it's the only way
+	// to tell the operator "this is a cold start" vs "this would
+	// resume from <position>". The control table itself is NOT
+	// created on dry-run; the lookup uses the tolerant readPosition
+	// path that returns "no row" when the table doesn't exist yet.
+	DryRun bool
 }
 
 // Run executes a snapshot+CDC stream. See [Streamer] for the full
@@ -92,14 +106,24 @@ func (s *Streamer) Run(ctx context.Context) error {
 	}
 
 	// ---- 2. Ensure the control table exists ----
-	if err := applier.EnsureControlTable(ctx); err != nil {
-		return fmt.Errorf("pipeline: ensure control table: %w", err)
+	// Skip on dry-run — that's a write, and dry-run is read-only.
+	// ReadPosition below tolerates a missing control table by
+	// returning ok=false (same as "no row").
+	if !s.DryRun {
+		if err := applier.EnsureControlTable(ctx); err != nil {
+			return fmt.Errorf("pipeline: ensure control table: %w", err)
+		}
 	}
 
 	// ---- 3. Look up the persisted position ----
 	persisted, found, err := applier.ReadPosition(ctx, streamID)
 	if err != nil {
 		return fmt.Errorf("pipeline: read position: %w", err)
+	}
+
+	// ---- 3.5. Dry-run: print plan and exit before any state mutation. ----
+	if s.DryRun {
+		return s.printDryRunPlan(ctx, streamID, persisted, found)
 	}
 
 	// ---- 4. Branch: cold start vs warm resume ----
@@ -126,6 +150,63 @@ func (s *Streamer) Run(ctx context.Context) error {
 		return fmt.Errorf("pipeline: apply changes: %w", err)
 	}
 	return nil
+}
+
+// printDryRunPlan describes what Run would do without doing it.
+// Cold-start prints the source schema summary so operators can
+// catch missing-tables / unexpected-column-counts before the
+// migration starts; warm-resume prints the persisted position
+// token (truncated for readability) so operators can see whether
+// the stream is positioned where they expect.
+//
+// The source schema read for cold-start is the only source-side
+// touch the dry-run does — same level of access the regular
+// cold-start would do, just without then opening the snapshot
+// stream or starting CDC.
+func (s *Streamer) printDryRunPlan(ctx context.Context, streamID string, persisted ir.Position, found bool) error {
+	s.printf("DRY RUN — would stream %s://%s → %s://%s\n",
+		s.Source.Name(), redactedHost(s.SourceDSN),
+		s.Target.Name(), redactedHost(s.TargetDSN))
+	s.printf("  stream_id: %q\n", streamID)
+	if found {
+		s.printf("  warm resume from persisted position\n")
+		s.printf("  position token: %s\n", truncateDryRunToken(persisted.Token, 80))
+		return nil
+	}
+	s.printf("  cold start — would capture snapshot, bulk-copy, then start CDC\n")
+
+	sr, err := s.Source.OpenSchemaReader(ctx, s.SourceDSN)
+	if err != nil {
+		return fmt.Errorf("pipeline: dry-run: open source schema reader: %w", err)
+	}
+	defer closeIf(sr)
+	schema, err := sr.ReadSchema(ctx)
+	if err != nil {
+		return fmt.Errorf("pipeline: dry-run: read source schema: %w", err)
+	}
+	if len(schema.Tables) == 0 {
+		s.printf("  source schema has no tables — nothing to stream\n")
+		return nil
+	}
+	if _, err := translate.ApplyMappings(schema, s.Mappings); err != nil {
+		return fmt.Errorf("pipeline: dry-run: apply mappings: %w", err)
+	}
+	s.printf("  %d tables to bulk-copy and then tail via CDC:\n", len(schema.Tables))
+	for _, t := range schema.Tables {
+		s.printf("    - %s  (%d columns, %d indexes, %d foreign keys)\n",
+			t.Name, len(t.Columns), len(t.Indexes), len(t.ForeignKeys))
+	}
+	return nil
+}
+
+// truncateDryRunToken trims a position token to maxLen characters
+// with an ellipsis when longer. Position tokens are JSON blobs that
+// can run hundreds of bytes; the dry-run output stays scannable.
+func truncateDryRunToken(token string, maxLen int) string {
+	if len(token) <= maxLen {
+		return token
+	}
+	return token[:maxLen-1] + "…"
 }
 
 // openApplier returns the applier to use plus a flag indicating

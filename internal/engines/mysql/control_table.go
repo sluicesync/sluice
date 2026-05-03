@@ -47,11 +47,18 @@ func ensureControlTable(ctx context.Context, db *sql.DB) error {
 // position is set to "mysql" by the caller — only the Token survives
 // across runs (the engine reading is implicitly the engine that
 // wrote).
+//
+// Tolerant of the control table being absent: a missing-table error
+// is reported as ok=false (same as "no row") so dry-run flows that
+// skip EnsureControlTable still work. The same string-match helper
+// powers ListStreams's missing-table fallback.
 func readPosition(ctx context.Context, db *sql.DB, streamID string) (token string, ok bool, err error) {
 	const q = "SELECT source_position FROM `" + controlTableName + "` WHERE stream_id = ?"
 	row := db.QueryRowContext(ctx, q, streamID)
 	switch err := row.Scan(&token); {
 	case errors.Is(err, sql.ErrNoRows):
+		return "", false, nil
+	case isMySQLMissingTableErr(err):
 		return "", false, nil
 	case err != nil:
 		return "", false, fmt.Errorf("mysql: read position: %w", err)

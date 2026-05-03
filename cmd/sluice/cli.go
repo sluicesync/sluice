@@ -146,6 +146,7 @@ type SyncStartCmd struct {
 	Target       string `help:"Target database DSN." required:"" env:"SLUICE_TARGET" placeholder:"DSN" group:"target"`
 
 	StreamID string `help:"Stream identifier; the key under which position is persisted on the target. Auto-generated from source/target host info when empty." placeholder:"ID"`
+	DryRun   bool   `short:"n" help:"Print what would happen — cold-start vs warm-resume, source schema summary or persisted position — without modifying the target or starting the stream."`
 }
 
 // Run implements `sluice sync start`.
@@ -172,6 +173,7 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 		StreamID:  s.StreamID,
 		Stdout:    os.Stdout,
 		Mappings:  cfg.Mappings,
+		DryRun:    s.DryRun,
 	}
 	return streamer.Run(kongContext())
 }

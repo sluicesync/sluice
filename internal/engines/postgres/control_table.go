@@ -40,12 +40,20 @@ func ensureControlTable(ctx context.Context, db *sql.DB, schema string) error {
 // readPosition returns the persisted source_position for streamID,
 // or ok=false when no row exists. Engine on the returned Position
 // is set by the caller — only the Token survives across runs.
+//
+// Tolerant of the control table being absent: a missing-relation
+// error is reported as ok=false (same as "no row") so dry-run
+// flows that skip EnsureControlTable still work. Missing-relation
+// detection uses the same string-match helper as the schema reader's
+// PostGIS lookup.
 func readPosition(ctx context.Context, db *sql.DB, schema, streamID string) (token string, ok bool, err error) {
 	tableRef := quoteIdent(schema) + "." + quoteIdent(controlTableName)
 	q := "SELECT source_position FROM " + tableRef + " WHERE stream_id = $1"
 	row := db.QueryRowContext(ctx, q, streamID)
 	switch err := row.Scan(&token); {
 	case errors.Is(err, sql.ErrNoRows):
+		return "", false, nil
+	case isUndefinedRelationErr(err):
 		return "", false, nil
 	case err != nil:
 		return "", false, fmt.Errorf("postgres: read position: %w", err)

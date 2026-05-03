@@ -6,7 +6,43 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-Empty — start here when adding the next chunk of work.
+### Added — orchestration
+
+- **`sluice sync start --dry-run`** (`-n`): symmetric with the
+  existing `migrate --dry-run` flag. Reads the source schema,
+  looks up the persisted position on the target, and prints the
+  plan (cold-start vs warm-resume; source schema summary or
+  position token) without modifying the target or starting the
+  stream. Pre-flight check operators run before kicking off a
+  multi-day stream against production. The position lookup is
+  tolerant of the control table being absent — both engines'
+  `readPosition` helpers now fall through "missing relation"
+  errors as "no row" (same path `ListStreams` already uses), so
+  dry-run against a virgin target reports cold-start cleanly
+  rather than erroring on a table that doesn't exist yet.
+
+### Added — managed-service support
+
+- **Multi-shard Vitess snapshot+CDC handoff**: the snapshot path
+  (`Engine.OpenSnapshotStream` on the `planetscale` flavor) now
+  fans out to every shard in a sharded keyspace, buffers rows
+  from all shards into a unified per-table view, and uses the
+  global `COPY_COMPLETED` event (both `Keyspace` and `Shard`
+  empty) as the snapshot→CDC handoff boundary. Per-scope
+  `COPY_COMPLETED` events are tracked as progress markers but do
+  not terminate the drain. The captured `ir.Position` carries one
+  `shardGtid` entry per shard, matching the standalone CDC
+  reader's multi-shard layout. Pairs with
+  `vstream_auto_discover_shards=true` for shard-list discovery
+  via `SHOW VITESS_SHARDS`. Validated against
+  `vitess/vttestserver` with `NUM_SHARDS=2`.
+- **Reshard-during-COPY signalling**: a `JOURNAL` event during
+  the snapshot path's COPY phase now surfaces the typed
+  `ShardLayoutChangedError` (matchable via `errors.Is` against
+  `ErrShardLayoutChanged`), the same contract the standalone CDC
+  reader exposes. v1 of the multi-shard snapshot does not
+  recover in place — the caller drops the snapshot stream and
+  reopens against the new layout.
 
 ## [0.1.0] - 2026-05-03
 
