@@ -8,6 +8,14 @@ import (
 	"github.com/orware/sluice/internal/ir"
 )
 
+// emitOpts carries writer-derived flags that change how a few IR
+// types render — currently just whether the target database has the
+// postgis extension installed. Zero value (no PostGIS) preserves
+// the writer's pre-extension behaviour for all callers.
+type emitOpts struct {
+	HasPostGIS bool
+}
+
 // emitColumnType returns the Postgres DDL fragment for a column type
 // other than [ir.Enum]. Enum types are referenced by name in the
 // column definition; the schema writer creates the CREATE TYPE
@@ -15,8 +23,8 @@ import (
 // [emitColumnDef].
 //
 // Returns an error for IR types Postgres has no native form for, or
-// for unsupported edge cases (Set, Geometry without PostGIS, etc.).
-func emitColumnType(t ir.Type) (string, error) {
+// for unsupported edge cases (Geometry without PostGIS, etc.).
+func emitColumnType(t ir.Type, opts emitOpts) (string, error) {
 	switch v := t.(type) {
 	// ---- Boolean / numeric ----
 	case ir.Boolean:
@@ -77,22 +85,36 @@ func emitColumnType(t ir.Type) (string, error) {
 
 	// ---- Composite (extension) ----
 	case ir.Array:
-		elem, err := emitColumnType(v.Element)
+		elem, err := emitColumnType(v.Element, opts)
 		if err != nil {
 			return "", fmt.Errorf("postgres: array element: %w", err)
 		}
 		// Multi-dim arrays not modelled; we always emit single-dim.
 		return elem + "[]", nil
 
+	// MySQL SET has no native PG equivalent. Default policy is to
+	// land it as TEXT[]; the membership constraint enforcing the
+	// source's value list is emitted separately by emitTableDef as
+	// a table-level CHECK so the constraint name is operator-friendly
+	// (anonymous column-level CHECKs lose their identity in error
+	// messages).
+	case ir.Set:
+		return "TEXT[]", nil
+
 	// ---- Cases that need column context (handled by emitColumnDef) ----
 	case ir.Enum:
 		return "", errors.New("postgres: Enum DDL emission requires column context (table+column); use emitColumnDef")
 
-	// ---- Unsupported on Postgres without translation ----
-	case ir.Set:
-		return "", errors.New("postgres: SET has no native equivalent; translate to TEXT[] or similar before writing")
+	// PostGIS-aware GEOMETRY emission. With the extension detected
+	// at writer-open time, geometry(<subtype>, <srid>) carries the
+	// IR's subtype and SRID into a typed PostGIS column. Without it,
+	// the column is rejected — sluice doesn't try to install
+	// extensions implicitly.
 	case ir.Geometry:
-		return "", errors.New("postgres: GEOMETRY requires PostGIS; not supported in this writer version")
+		if !opts.HasPostGIS {
+			return "", errors.New("postgres: GEOMETRY requires PostGIS; install with `CREATE EXTENSION postgis;` before running sluice")
+		}
+		return fmt.Sprintf("geometry(%s, %d)", postgisSubtypeName(v.Subtype), v.SRID), nil
 	}
 	return "", fmt.Errorf("postgres: unknown IR type %T", t)
 }
@@ -178,6 +200,65 @@ func emitDefault(d ir.DefaultValue) (string, bool) {
 	return "", false
 }
 
+// setDefaultToArrayLiteral converts a MySQL-style comma-separated
+// SET default ("a,b" or "" for the empty default) to a Postgres
+// TEXT[] array literal expression. Used by emitColumnDef when the
+// column's IR type is ir.Set, so the operator's source-side
+// `DEFAULT 'a,b'` doesn't get dropped on the floor when the column
+// translates to TEXT[].
+//
+// MySQL SET members are non-empty strings; the empty-set default
+// is represented by an empty source-string, which maps to PG's
+// '{}'::TEXT[] empty-array literal.
+func setDefaultToArrayLiteral(commaSeparated string) string {
+	if commaSeparated == "" {
+		return "'{}'::TEXT[]"
+	}
+	parts := strings.Split(commaSeparated, ",")
+	quoted := make([]string, len(parts))
+	for i, p := range parts {
+		quoted[i] = quoteSQLString(p)
+	}
+	return "ARRAY[" + strings.Join(quoted, ",") + "]::TEXT[]"
+}
+
+// emitSetCheckConstraint produces a CHECK-constraint fragment that
+// enforces a SET column's value list at the table level:
+//
+//	CONSTRAINT "<table>_<column>_set" CHECK ("<column>" <@ ARRAY[...]::TEXT[])
+//
+// `<@` is PG's array-containment operator: the constraint passes
+// when every element of the column value is a member of the
+// declared SET. That matches MySQL SET semantics — any subset of
+// the declared values is valid, including the empty array.
+//
+// Empty-values lists produce a CHECK against an empty array, which
+// is degenerate (the column can only be the empty set) but
+// well-formed; the source DDL was already strange in that case.
+func emitSetCheckConstraint(tableName, columnName string, values []string) string {
+	literal := "'{}'::TEXT[]"
+	if len(values) > 0 {
+		quoted := make([]string, len(values))
+		for i, v := range values {
+			quoted[i] = quoteSQLString(v)
+		}
+		literal = "ARRAY[" + strings.Join(quoted, ",") + "]::TEXT[]"
+	}
+	return fmt.Sprintf(
+		"CONSTRAINT %s CHECK (%s <@ %s)",
+		quoteIdent(setCheckName(tableName, columnName)),
+		quoteIdent(columnName),
+		literal,
+	)
+}
+
+// setCheckName generates the CHECK-constraint name for a SET
+// column. Same shape as enumTypeName so the two policies stay
+// recognisable side-by-side.
+func setCheckName(tableName, columnName string) string {
+	return tableName + "_" + columnName + "_set"
+}
+
 // emitColumnDef returns the full DDL fragment for a single column,
 // suitable for inclusion in a CREATE TABLE column list:
 //
@@ -185,7 +266,7 @@ func emitDefault(d ir.DefaultValue) (string, bool) {
 //
 // For Enum columns, table is consulted for the per-column generated
 // type name. Other IR types ignore the table argument.
-func emitColumnDef(table *ir.Table, c *ir.Column) (string, error) {
+func emitColumnDef(table *ir.Table, c *ir.Column, opts emitOpts) (string, error) {
 	if c == nil {
 		return "", errors.New("postgres: emitColumnDef: column is nil")
 	}
@@ -198,7 +279,7 @@ func emitColumnDef(table *ir.Table, c *ir.Column) (string, error) {
 		typeStr = quoteIdent(enumTypeName(table.Name, c.Name))
 	} else {
 		var err error
-		typeStr, err = emitColumnType(c.Type)
+		typeStr, err = emitColumnType(c.Type, opts)
 		if err != nil {
 			return "", fmt.Errorf("postgres: column %q: %w", c.Name, err)
 		}
@@ -213,7 +294,19 @@ func emitColumnDef(table *ir.Table, c *ir.Column) (string, error) {
 	}
 	if dflt, ok := emitDefault(c.Default); ok {
 		sb.WriteString(" DEFAULT ")
-		sb.WriteString(dflt)
+		// SET columns translate the comma-separated MySQL literal
+		// to a TEXT[] array literal so the source DEFAULT survives
+		// the type rewrite. Other default shapes (DefaultExpression,
+		// DefaultNone) flow through emitDefault unchanged.
+		if _, isSet := c.Type.(ir.Set); isSet {
+			if lit, ok := c.Default.(ir.DefaultLiteral); ok {
+				sb.WriteString(setDefaultToArrayLiteral(lit.Value))
+			} else {
+				sb.WriteString(dflt)
+			}
+		} else {
+			sb.WriteString(dflt)
+		}
 		// Postgres enum columns need an explicit type cast on the
 		// default literal — without it, CREATE TABLE rejects the
 		// default with "invalid input value for enum ...". The
@@ -271,14 +364,44 @@ func emitCreateEnumType(schema, tableName, columnName string, values []string) s
 	)
 }
 
-// emitTableDef produces a CREATE TABLE statement with columns and
-// the primary key inline. The table is schema-qualified.
-func emitTableDef(schema string, table *ir.Table) (string, error) {
+// emitTableDef produces a CREATE TABLE statement with columns,
+// table-level CHECK constraints (for SET columns), and the primary
+// key inline. The table is schema-qualified.
+//
+// Body parts assembled into a single comma-separated block so the
+// trailing-comma logic stays in one place — MySQL SET columns add
+// CHECK lines that complicate the per-line rule.
+func emitTableDef(schema string, table *ir.Table, opts emitOpts) (string, error) {
 	if table == nil {
 		return "", errors.New("postgres: emitTableDef: table is nil")
 	}
 	if len(table.Columns) == 0 {
 		return "", fmt.Errorf("postgres: emitTableDef: table %q has no columns", table.Name)
+	}
+
+	parts := make([]string, 0, len(table.Columns)+2)
+
+	for _, col := range table.Columns {
+		def, err := emitColumnDef(table, col, opts)
+		if err != nil {
+			return "", err
+		}
+		parts = append(parts, def)
+	}
+
+	// SET columns get a table-level CHECK constraint enforcing the
+	// declared value list. Emitted in declaration order so the DDL
+	// is stable across runs.
+	for _, col := range table.Columns {
+		set, ok := col.Type.(ir.Set)
+		if !ok {
+			continue
+		}
+		parts = append(parts, emitSetCheckConstraint(table.Name, col.Name, set.Values))
+	}
+
+	if table.PrimaryKey != nil {
+		parts = append(parts, "PRIMARY KEY "+emitIndexColumnList(table.PrimaryKey.Columns))
 	}
 
 	var sb strings.Builder
@@ -287,26 +410,14 @@ func emitTableDef(schema string, table *ir.Table) (string, error) {
 	sb.WriteByte('.')
 	sb.WriteString(quoteIdent(table.Name))
 	sb.WriteString(" (\n")
-
-	for i, col := range table.Columns {
-		def, err := emitColumnDef(table, col)
-		if err != nil {
-			return "", err
-		}
+	for i, p := range parts {
 		sb.WriteString("  ")
-		sb.WriteString(def)
-		if i < len(table.Columns)-1 || table.PrimaryKey != nil {
+		sb.WriteString(p)
+		if i < len(parts)-1 {
 			sb.WriteByte(',')
 		}
 		sb.WriteByte('\n')
 	}
-
-	if table.PrimaryKey != nil {
-		sb.WriteString("  PRIMARY KEY ")
-		sb.WriteString(emitIndexColumnList(table.PrimaryKey.Columns))
-		sb.WriteByte('\n')
-	}
-
 	sb.WriteString(");")
 	return sb.String(), nil
 }

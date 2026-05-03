@@ -28,6 +28,11 @@ import (
 type SchemaWriter struct {
 	db     *sql.DB
 	schema string
+	// hasPostGIS is set at engine open time via detectPostGIS. When
+	// true, ir.Geometry columns emit as `geometry(<subtype>, <srid>)`;
+	// when false, they're rejected with a clear "install postgis"
+	// error rather than silently coerced.
+	hasPostGIS bool
 }
 
 // Close releases the underlying connection pool.
@@ -64,8 +69,9 @@ func (w *SchemaWriter) CreateTablesWithoutConstraints(ctx context.Context, s *ir
 	}
 
 	// Phase 1b: tables.
+	opts := emitOpts{HasPostGIS: w.hasPostGIS}
 	for _, table := range orderedTables(s) {
-		stmt, err := emitTableDef(w.schema, table)
+		stmt, err := emitTableDef(w.schema, table, opts)
 		if err != nil {
 			return err
 		}

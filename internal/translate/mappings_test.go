@@ -184,6 +184,69 @@ func TestApplyMappings_VarcharDefaultsTo255(t *testing.T) {
 	}
 }
 
+func TestApplyMappings_PostgisAliases(t *testing.T) {
+	cases := []struct {
+		alias    string
+		opts     map[string]any
+		wantSub  ir.GeometrySubtype
+		wantSRID int
+	}{
+		{"postgis_point", nil, ir.GeometryPoint, 0},
+		{"postgis_point", map[string]any{"srid": 4326}, ir.GeometryPoint, 4326},
+		{"postgis_polygon", map[string]any{"srid": int64(3857)}, ir.GeometryPolygon, 3857},
+		{"postgis_linestring", map[string]any{"srid": float64(1234)}, ir.GeometryLineString, 1234},
+		{"postgis_multipoint", nil, ir.GeometryMultiPoint, 0},
+		{"postgis_multilinestring", nil, ir.GeometryMultiLineString, 0},
+		{"postgis_multipolygon", nil, ir.GeometryMultiPolygon, 0},
+		{"postgis_geometrycollection", nil, ir.GeometryCollection, 0},
+		{"postgis_geometry", nil, ir.GeometryUnspecified, 0},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.alias, func(t *testing.T) {
+			s := schemaWith(struct {
+				table string
+				cols  []string
+			}{"t", []string{"col"}})
+			got, err := ApplyMappings(s, []config.Mapping{
+				{Table: "t", Column: "col", TargetType: c.alias, TargetTypeOptions: c.opts},
+			})
+			if err != nil {
+				t.Fatalf("err: %v", err)
+			}
+			geom, ok := got.Tables[0].Columns[0].Type.(ir.Geometry)
+			if !ok {
+				t.Fatalf("type = %T; want ir.Geometry", got.Tables[0].Columns[0].Type)
+			}
+			if geom.Subtype != c.wantSub {
+				t.Errorf("subtype = %v; want %v", geom.Subtype, c.wantSub)
+			}
+			if geom.SRID != c.wantSRID {
+				t.Errorf("srid = %d; want %d", geom.SRID, c.wantSRID)
+			}
+		})
+	}
+}
+
+func TestApplyMappings_PostgisInvalidSRID(t *testing.T) {
+	s := schemaWith(struct {
+		table string
+		cols  []string
+	}{"t", []string{"c"}})
+	_, err := ApplyMappings(s, []config.Mapping{
+		{
+			Table: "t", Column: "c", TargetType: "postgis_point",
+			TargetTypeOptions: map[string]any{"srid": "not-a-number"},
+		},
+	})
+	if err == nil {
+		t.Fatal("expected error for non-integer srid")
+	}
+	if !strings.Contains(err.Error(), "srid") {
+		t.Errorf("err = %q; want substring 'srid'", err.Error())
+	}
+}
+
 func TestApplyMappings_VarcharLengthFloat(t *testing.T) {
 	// koanf decodes plain numbers as float64 in some sources;
 	// resolveTargetType handles that.

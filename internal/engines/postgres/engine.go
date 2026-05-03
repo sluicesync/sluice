@@ -73,7 +73,12 @@ func (Engine) OpenSchemaWriter(ctx context.Context, dsn string) (ir.SchemaWriter
 	if err != nil {
 		return nil, err
 	}
-	return &SchemaWriter{db: db, schema: cfg.schema}, nil
+	hasGIS, err := detectPostGIS(ctx, db)
+	if err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return &SchemaWriter{db: db, schema: cfg.schema, hasPostGIS: hasGIS}, nil
 }
 
 // OpenRowReader returns a [RowReader] bound to the database identified
@@ -107,10 +112,16 @@ func (e Engine) OpenRowWriter(ctx context.Context, dsn string) (ir.RowWriter, er
 	if err != nil {
 		return nil, err
 	}
+	hasGIS, err := detectPostGIS(ctx, db)
+	if err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	return &RowWriter{
-		db:      db,
-		schema:  cfg.schema,
-		useCopy: e.Capabilities().BulkLoad == ir.BulkLoadCopy,
+		db:         db,
+		schema:     cfg.schema,
+		useCopy:    e.Capabilities().BulkLoad == ir.BulkLoadCopy,
+		hasPostGIS: hasGIS,
 	}, nil
 }
 

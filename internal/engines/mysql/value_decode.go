@@ -46,7 +46,13 @@ func decodeValue(raw any, t ir.Type) (any, error) {
 	case ir.Set:
 		return decodeSet(raw)
 	case ir.Geometry:
-		return decodeBytes(raw)
+		// MySQL stores geometry on the wire as `<srid uint32 LE><wkb>`.
+		// The IR contract for ir.Geometry values is "raw WKB" (per
+		// docs/value-types.md), so strip the 4-byte SRID prefix before
+		// returning. Per-row SRID is intentionally lost here — the
+		// per-column SRID lives on ir.Geometry.SRID and is set at
+		// schema-translation time, not per-row at decode time.
+		return decodeMySQLGeometry(raw)
 	case ir.UUID, ir.Inet, ir.Cidr, ir.Macaddr:
 		// MySQL doesn't have native types for these; they live in
 		// VARCHAR columns. The driver gives us bytes; canonical form
@@ -182,6 +188,27 @@ func decodeBytes(raw any) (any, error) {
 		return []byte(v), nil
 	}
 	return nil, fmt.Errorf("mysql: cannot decode %T as bytes", raw)
+}
+
+// decodeMySQLGeometry strips MySQL's 4-byte little-endian SRID prefix
+// from a geometry value, returning the trailing WKB body as a fresh
+// []byte. Matches the IR contract for [ir.Geometry] values (raw WKB,
+// per docs/value-types.md).
+//
+// Returns an error for anything shorter than 5 bytes — the SRID prefix
+// alone is 4, and a valid WKB body needs at least one more (the byte-
+// order flag).
+func decodeMySQLGeometry(raw any) (any, error) {
+	bytesAny, err := decodeBytes(raw)
+	if err != nil {
+		return nil, err
+	}
+	b := bytesAny.([]byte)
+	if len(b) < 5 {
+		return nil, fmt.Errorf("mysql: geometry too short (%d bytes; need >=5)", len(b))
+	}
+	// Drop the 4-byte SRID prefix. The remaining bytes are WKB.
+	return b[4:], nil
 }
 
 // decodeTime accepts a time.Time directly (when the driver was opened

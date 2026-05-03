@@ -138,14 +138,27 @@ func (a Array) String() string {
 
 // Geometry represents a spatial data value. PostGIS provides this on
 // Postgres; MySQL has built-in spatial types.
+//
+// SRID is the column's spatial reference system identifier. 0 means
+// "unknown CRS" — the same default both MySQL (no SRID argument)
+// and PostGIS (SRID=0) use when no coordinate system is declared.
+// Schema readers may populate it from the source's metadata; the
+// translate-layer mappings registry sets it from
+// `target_type_options.srid` for postgis_* aliases.
 type Geometry struct {
 	Subtype GeometrySubtype
+	SRID    int
 }
 
 func (Geometry) isType()    {}
 func (Geometry) Tier() Tier { return TierExtension }
 
-func (g Geometry) String() string { return fmt.Sprintf("Geometry[%s]", g.Subtype) }
+func (g Geometry) String() string {
+	if g.SRID == 0 {
+		return fmt.Sprintf("Geometry[%s]", g.Subtype)
+	}
+	return fmt.Sprintf("Geometry[%s,SRID=%d]", g.Subtype, g.SRID)
+}
 
 // Inet represents an IPv4 or IPv6 host address (Postgres inet).
 type Inet struct{}

@@ -191,9 +191,13 @@ func flattenArgs(batch []ir.Row, table *ir.Table) []any {
 //
 // Most IR-canonical Go values pass through to go-sql-driver/mysql
 // unchanged: int64, uint64, float64, string, []byte, bool, time.Time,
-// and nil all serialise correctly without intervention. The exception
-// is [ir.Set], whose canonical Go value is []string but which MySQL
-// expects as a comma-separated string literal.
+// and nil all serialise correctly without intervention. The exceptions:
+//
+//   - [ir.Set] values are []string in IR but MySQL expects a
+//     comma-separated string literal.
+//   - [ir.Geometry] values are raw WKB bytes (per docs/value-types.md);
+//     MySQL's wire format is `<srid uint32 LE><wkb>`. We prepend the
+//     SRID using the column's declared SRID (or 0 when unset).
 func prepareValue(v any, t ir.Type) any {
 	if v == nil {
 		return nil
@@ -201,6 +205,20 @@ func prepareValue(v any, t ir.Type) any {
 	if _, isSet := t.(ir.Set); isSet {
 		if ss, ok := v.([]string); ok {
 			return strings.Join(ss, ",")
+		}
+	}
+	if geom, isGeom := t.(ir.Geometry); isGeom {
+		if b, ok := v.([]byte); ok {
+			out := make([]byte, 4+len(b))
+			// Little-endian uint32 SRID prefix, matching MySQL's
+			// on-wire geometry layout.
+			srid := uint32(geom.SRID)
+			out[0] = byte(srid)
+			out[1] = byte(srid >> 8)
+			out[2] = byte(srid >> 16)
+			out[3] = byte(srid >> 24)
+			copy(out[4:], b)
+			return out
 		}
 	}
 	return v

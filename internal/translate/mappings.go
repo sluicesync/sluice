@@ -160,12 +160,12 @@ func rewriteTable(tbl *ir.Table, colMap map[string]resolvedMapping) *ir.Table {
 	return &out
 }
 
-// targetTypeRegistry is the v1 set of target_type aliases. Adding a
-// new alias is a one-line edit here plus a test case in
-// mappings_test.go. Aliases that need parameters (varchar length,
-// future PostGIS SRIDs, etc.) read those out of the
-// target_type_options map in resolveTargetType rather than living
-// in the registry literal.
+// targetTypeRegistry is the v1 set of target_type aliases that don't
+// take options. Adding a new alias is a one-line edit here plus a
+// test case in mappings_test.go. Aliases that take parameters
+// (varchar length, postgis SRIDs) live in resolveTargetType rather
+// than in this literal so the per-alias parameter handling stays
+// explicit.
 //
 // The aliases are deliberately engine-neutral names — the goal is
 // "what should the column be on the target" expressed in IR terms,
@@ -177,6 +177,23 @@ var targetTypeRegistry = map[string]ir.Type{
 	"jsonb":      ir.JSON{Binary: true},
 	"json":       ir.JSON{Binary: false},
 	"bytea":      ir.Blob{Size: ir.BlobLong},
+}
+
+// postgisAliasSubtypes maps the postgis_<subtype> aliases to their
+// matching ir.GeometrySubtype. The SRID is read at resolve time from
+// target_type_options.srid (default 0). Kept as a separate registry
+// from targetTypeRegistry because every entry needs the same SRID
+// option-handling — folding them into the literal would force a
+// `switch on geometry-ness` at every read site.
+var postgisAliasSubtypes = map[string]ir.GeometrySubtype{
+	"postgis_point":              ir.GeometryPoint,
+	"postgis_linestring":         ir.GeometryLineString,
+	"postgis_polygon":            ir.GeometryPolygon,
+	"postgis_multipoint":         ir.GeometryMultiPoint,
+	"postgis_multilinestring":    ir.GeometryMultiLineString,
+	"postgis_multipolygon":       ir.GeometryMultiPolygon,
+	"postgis_geometrycollection": ir.GeometryCollection,
+	"postgis_geometry":           ir.GeometryUnspecified,
 }
 
 // resolveTargetType maps a target_type alias plus any options to a
@@ -208,19 +225,51 @@ func resolveTargetType(name string, opts map[string]any) (ir.Type, error) {
 		}
 		return ir.Varchar{Length: length}, nil
 	}
+	if subtype, ok := postgisAliasSubtypes[name]; ok {
+		srid, err := readSRIDOption(opts)
+		if err != nil {
+			return nil, fmt.Errorf("target_type=%s: %w", name, err)
+		}
+		return ir.Geometry{Subtype: subtype, SRID: srid}, nil
+	}
 	if ty, ok := targetTypeRegistry[name]; ok {
 		return ty, nil
 	}
 	return nil, fmt.Errorf("unknown target_type %q (recognised: %s)", name, knownTargetTypes())
 }
 
+// readSRIDOption pulls the optional `srid` value out of a mapping's
+// target_type_options. Defaults to 0 (PostGIS "unknown CRS") when
+// absent. Same int/int64/float64 acceptance as varchar's `length`
+// because koanf hands numbers in different shapes depending on the
+// config source.
+func readSRIDOption(opts map[string]any) (int, error) {
+	raw, ok := opts["srid"]
+	if !ok {
+		return 0, nil
+	}
+	switch v := raw.(type) {
+	case int:
+		return v, nil
+	case int64:
+		return int(v), nil
+	case float64:
+		return int(v), nil
+	default:
+		return 0, fmt.Errorf("option `srid` must be an integer, got %T", raw)
+	}
+}
+
 // knownTargetTypes returns a comma-separated list of recognised
 // target_type aliases, including parameterised ones. Used in error
 // messages so operators get a hint when they typo an alias.
 func knownTargetTypes() string {
-	names := make([]string, 0, len(targetTypeRegistry)+1)
-	names = append(names, "varchar") // parameterised alias not in the registry literal
+	names := make([]string, 0, len(targetTypeRegistry)+len(postgisAliasSubtypes)+1)
+	names = append(names, "varchar") // parameterised alias not in any registry literal
 	for n := range targetTypeRegistry {
+		names = append(names, n)
+	}
+	for n := range postgisAliasSubtypes {
 		names = append(names, n)
 	}
 	sort.Strings(names)

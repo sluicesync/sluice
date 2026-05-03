@@ -43,6 +43,14 @@ type RowWriter struct {
 	// false → writeViaBatch (the original batched-insert path).
 	useCopy bool
 
+	// hasPostGIS records whether the target database has the postgis
+	// extension installed. Set at engine open time via detectPostGIS.
+	// Drives the value-side conversion for ir.Geometry columns: when
+	// true, prepareValue wraps WKB bytes in PostGIS EWKB framing
+	// using the column's SRID; when false, ir.Geometry columns are
+	// rejected at the schema phase before any rows reach the writer.
+	hasPostGIS bool
+
 	// maxRowsPerBatch caps the number of rows folded into a single
 	// INSERT on the batched path. Tests can override; callers leave
 	// it at zero (which causes defaultMaxRowsPerBatch to be used).
@@ -224,6 +232,10 @@ func flattenArgs(batch []ir.Row, table *ir.Table) ([]any, error) {
 //   - [ir.Array] values, whose canonical Go form is []any; pgx wants
 //     a typed slice for native array binding. We convert based on the
 //     element type.
+//   - [ir.Geometry] values, whose canonical Go form is raw WKB bytes
+//     (per docs/value-types.md); PostGIS columns expect EWKB framing
+//     with the SRID encoded in the type byte. wkbToEWKB handles the
+//     conversion and is a no-op when the value is already EWKB.
 //   - Nothing else (Postgres handles the rest natively via pgx).
 //
 // Returning an error here means the IR value didn't match the
@@ -239,6 +251,23 @@ func prepareValue(v any, t ir.Type) (any, error) {
 			return nil, fmt.Errorf("expected []any for Array column, got %T", v)
 		}
 		return convertArray(any, arr.Element)
+	}
+
+	if geom, isGeom := t.(ir.Geometry); isGeom {
+		b, ok := v.([]byte)
+		if !ok {
+			return nil, fmt.Errorf("expected []byte for Geometry column, got %T", v)
+		}
+		// nil-but-typed empty slice is meaningless for geometry;
+		// surface it rather than producing malformed EWKB.
+		if len(b) == 0 {
+			return nil, fmt.Errorf("Geometry column has empty bytes")
+		}
+		ewkb, err := wkbToEWKB(b, uint32(geom.SRID))
+		if err != nil {
+			return nil, fmt.Errorf("wrap WKB → EWKB: %w", err)
+		}
+		return ewkb, nil
 	}
 
 	return v, nil

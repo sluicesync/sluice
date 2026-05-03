@@ -66,10 +66,21 @@ func translateType(c columnMeta) (ir.Type, error) {
 	}
 
 	// USER-DEFINED covers enums, composites, and domain types. We
-	// support enums; composites/domains are not modelled in the IR.
+	// support enums and PostGIS's geometry; composites/domains are
+	// not modelled in the IR.
 	if c.DataType == "user-defined" || c.DataType == "USER-DEFINED" {
 		if c.EnumValues != nil {
 			return ir.Enum{Values: c.EnumValues}, nil
+		}
+		// PostGIS geometry. The base column type carries no subtype
+		// or SRID information by itself — both live in PostGIS's own
+		// geometry_columns view, which a follow-up enhancement could
+		// query during schema-read to reconstruct the typmod. v1
+		// returns ir.Geometry{Subtype: GeometryUnspecified}, which
+		// matches the source side closely enough to round-trip the
+		// type identity if not the subtype/SRID precision.
+		if c.UDTName == "geometry" {
+			return ir.Geometry{Subtype: ir.GeometryUnspecified}, nil
 		}
 		return nil, fmt.Errorf("postgres: user-defined type %q is not a recognised enum", c.UDTName)
 	}

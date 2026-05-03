@@ -78,7 +78,22 @@ func TestDecodeValue(t *testing.T) {
 		{"set empty", []byte(""), ir.Set{Values: []string{"a", "b"}}, []string{}},
 
 		// ---- Geometry ----
-		{"geometry passthrough", []byte{0x01, 0x02, 0x03}, ir.Geometry{Subtype: ir.GeometryPoint}, []byte{0x01, 0x02, 0x03}},
+		// MySQL on the wire delivers `<srid uint32 LE><wkb>`; the
+		// IR contract for ir.Geometry values is "raw WKB". The
+		// decoder strips the 4-byte SRID prefix. The test fixture
+		// here is a 4-byte SRID(0) followed by a 5-byte stub WKB
+		// payload so length checks pass.
+		{
+			"geometry strips srid prefix",
+			[]byte{
+				// SRID = 0 (4 bytes LE)
+				0x00, 0x00, 0x00, 0x00,
+				// WKB stub: byte_order(LE) + type(1=POINT, LE)
+				0x01, 0x01, 0x00, 0x00, 0x00,
+			},
+			ir.Geometry{Subtype: ir.GeometryPoint},
+			[]byte{0x01, 0x01, 0x00, 0x00, 0x00},
+		},
 
 		// ---- VARCHAR-mapped extension types ----
 		{"uuid as string", []byte("1234-5678"), ir.UUID{}, "1234-5678"},

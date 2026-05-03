@@ -73,6 +73,7 @@ func TestMigrate_MySQLToPostgres(t *testing.T) {
 			created_at TIMESTAMP(0)    NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			score      BIGINT UNSIGNED NOT NULL DEFAULT 0,
 			role       ENUM('admin','user','guest') NOT NULL DEFAULT 'user',
+			tags       SET('news','sports','tech')  NOT NULL DEFAULT 'news',
 			metadata   JSON            NULL,
 			PRIMARY KEY (id),
 			UNIQUE KEY users_email_unique (email)
@@ -88,9 +89,9 @@ func TestMigrate_MySQLToPostgres(t *testing.T) {
 				REFERENCES users (id) ON DELETE CASCADE
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
-		INSERT INTO users (email, active, score, role, metadata) VALUES
-			('alice@example.com', 1, 100, 'admin', '{"k":"v"}'),
-			('bob@example.com',   0, 42,  'user',  NULL);
+		INSERT INTO users (email, active, score, role, tags, metadata) VALUES
+			('alice@example.com', 1, 100, 'admin', 'news,tech', '{"k":"v"}'),
+			('bob@example.com',   0, 42,  'user',  '',          NULL);
 
 		INSERT INTO posts (user_id, body) VALUES
 			(1, 'first post'),
@@ -223,6 +224,19 @@ func TestMigrate_MySQLToPostgres(t *testing.T) {
 		t.Errorf("users.metadata type = %#v; want ir.JSON{Binary:true} (MySQL JSON → PG JSONB)", metaCol.Type)
 	}
 
+	// MySQL SET → PG TEXT[]. The PG schema reader sees TEXT[], so
+	// the IR shape on the target side is ir.Array{Element: ir.Text}.
+	tagsCol := findColumn(users, "tags")
+	if tagsCol == nil {
+		t.Fatalf("users.tags missing")
+	}
+	tagsArr, ok := tagsCol.Type.(ir.Array)
+	if !ok {
+		t.Errorf("users.tags type = %#v; want ir.Array (MySQL SET → PG TEXT[])", tagsCol.Type)
+	} else if _, ok := tagsArr.Element.(ir.Text); !ok {
+		t.Errorf("users.tags element type = %#v; want ir.Text", tagsArr.Element)
+	}
+
 	// ---- Verify rows arrived intact and translated correctly ----
 	rr, err := pgEng.OpenRowReader(ctx, pgTarget)
 	if err != nil {
@@ -265,6 +279,33 @@ func TestMigrate_MySQLToPostgres(t *testing.T) {
 	// bob has NULL metadata.
 	if usersRows[1]["metadata"] != nil {
 		t.Errorf("users[1].metadata = %#v; want nil", usersRows[1]["metadata"])
+	}
+
+	// SET → TEXT[] round-trip. Alice's source value 'news,tech'
+	// arrives on PG as a string array; bob's empty SET arrives as
+	// the empty array, not NULL (the source column is NOT NULL).
+	switch tags := usersRows[0]["tags"].(type) {
+	case []any:
+		want := map[string]bool{"news": true, "tech": true}
+		if len(tags) != len(want) {
+			t.Errorf("users[0].tags = %v; want 2 elements (news, tech)", tags)
+		}
+		for _, t0 := range tags {
+			s, _ := t0.(string)
+			if !want[s] {
+				t.Errorf("users[0].tags has unexpected element %q", s)
+			}
+		}
+	default:
+		t.Errorf("users[0].tags = %#v (%T); want []any of strings", tags, tags)
+	}
+	switch tags := usersRows[1]["tags"].(type) {
+	case []any:
+		if len(tags) != 0 {
+			t.Errorf("users[1].tags = %v; want empty array (empty SET)", tags)
+		}
+	default:
+		t.Errorf("users[1].tags = %#v (%T); want []any (empty)", tags, tags)
 	}
 
 	postsRows := readAll(t, ctx, rr, posts)

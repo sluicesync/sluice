@@ -60,12 +60,16 @@ func TestEmitColumnType(t *testing.T) {
 		{"int array", ir.Array{Element: ir.Integer{Width: 32}}, "INTEGER[]"},
 		{"text array", ir.Array{Element: ir.Text{Size: ir.TextLong}}, "TEXT[]"},
 		{"uuid array", ir.Array{Element: ir.UUID{}}, "UUID[]"},
+
+		// ---- Set → TEXT[] (membership CHECK emitted by emitTableDef) ----
+		{"set", ir.Set{Values: []string{"a", "b", "c"}}, "TEXT[]"},
+		{"empty set", ir.Set{Values: nil}, "TEXT[]"},
 	}
 
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			got, err := emitColumnType(c.in)
+			got, err := emitColumnType(c.in, emitOpts{})
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -78,17 +82,118 @@ func TestEmitColumnType(t *testing.T) {
 
 func TestEmitColumnTypeUnsupported(t *testing.T) {
 	cases := []ir.Type{
-		ir.Set{Values: []string{"a"}},
 		ir.Geometry{Subtype: ir.GeometryPoint},
 		ir.Enum{Values: []string{"x"}}, // requires column context
 	}
 	for _, c := range cases {
 		c := c
 		t.Run("unsupported", func(t *testing.T) {
-			if _, err := emitColumnType(c); err == nil {
+			if _, err := emitColumnType(c, emitOpts{}); err == nil {
 				t.Errorf("expected error for %T", c)
 			}
 		})
+	}
+}
+
+// TestEmitSetCheckConstraint covers the table-level CHECK fragment
+// the SET → TEXT[] policy emits. The constraint is what enforces the
+// "members must be in the source's value list" guarantee on the PG
+// target after the type translation.
+func TestEmitSetCheckConstraint(t *testing.T) {
+	cases := []struct {
+		name   string
+		table  string
+		column string
+		values []string
+		want   string
+	}{
+		{
+			"basic three-member SET",
+			"events", "flags",
+			[]string{"a", "b", "c"},
+			`CONSTRAINT "events_flags_set" CHECK ("flags" <@ ARRAY['a','b','c']::TEXT[])`,
+		},
+		{
+			"empty value list",
+			"events", "flags",
+			nil,
+			`CONSTRAINT "events_flags_set" CHECK ("flags" <@ '{}'::TEXT[])`,
+		},
+		{
+			"member containing apostrophe",
+			"t", "c",
+			[]string{"a'b"},
+			`CONSTRAINT "t_c_set" CHECK ("c" <@ ARRAY['a''b']::TEXT[])`,
+		},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			got := emitSetCheckConstraint(c.table, c.column, c.values)
+			if got != c.want {
+				t.Errorf("\n got:  %s\nwant:  %s", got, c.want)
+			}
+		})
+	}
+}
+
+// TestSetDefaultToArrayLiteral covers the comma-separated → PG
+// array-literal translation used when a SET column's source DEFAULT
+// crosses into a TEXT[] target.
+func TestSetDefaultToArrayLiteral(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"", "'{}'::TEXT[]"},
+		{"a", "ARRAY['a']::TEXT[]"},
+		{"a,b", "ARRAY['a','b']::TEXT[]"},
+		{"a,b,c", "ARRAY['a','b','c']::TEXT[]"},
+		{"a'b", "ARRAY['a''b']::TEXT[]"},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.in, func(t *testing.T) {
+			got := setDefaultToArrayLiteral(c.in)
+			if got != c.want {
+				t.Errorf("\n got:  %s\nwant:  %s", got, c.want)
+			}
+		})
+	}
+}
+
+// TestEmitTableDef_SETColumn covers the integration between
+// emitColumnType (TEXT[]), the SET CHECK constraint emission, and
+// the SET-default translation in emitColumnDef.
+func TestEmitTableDef_SETColumn(t *testing.T) {
+	tbl := &ir.Table{
+		Name: "events",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}, Nullable: false},
+			{
+				Name:     "flags",
+				Type:     ir.Set{Values: []string{"a", "b", "c"}},
+				Nullable: false,
+				Default:  ir.DefaultLiteral{Value: "a,b"},
+			},
+		},
+		PrimaryKey: &ir.Index{
+			Columns: []ir.IndexColumn{{Column: "id"}},
+		},
+	}
+	got, err := emitTableDef("public", tbl, emitOpts{})
+	if err != nil {
+		t.Fatalf("emitTableDef: %v", err)
+	}
+	wantContains := []string{
+		`"flags" TEXT[] NOT NULL DEFAULT ARRAY['a','b']::TEXT[]`,
+		`CONSTRAINT "events_flags_set" CHECK ("flags" <@ ARRAY['a','b','c']::TEXT[])`,
+		`PRIMARY KEY ("id")`,
+	}
+	for _, sub := range wantContains {
+		if !strings.Contains(got, sub) {
+			t.Errorf("CREATE TABLE missing %q\n--- got ---\n%s", sub, got)
+		}
 	}
 }
 
@@ -189,7 +294,7 @@ func TestEmitColumnDef(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			got, err := emitColumnDef(usersTable, c.in)
+			got, err := emitColumnDef(usersTable, c.in, emitOpts{})
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -221,7 +326,7 @@ func TestEmitTableDef(t *testing.T) {
 			Columns: []ir.IndexColumn{{Column: "id"}},
 		},
 	}
-	got, err := emitTableDef("public", table)
+	got, err := emitTableDef("public", table, emitOpts{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
