@@ -204,28 +204,32 @@ func TestPSPipeline_StreamerPGToPG(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
+	// A previous failed run may have left a `sluice_slot` replication
+	// slot behind on the source. Drop it BEFORE the schema cleanup
+	// because PG can refuse to drop a schema whose tables are
+	// referenced by an active publication tied to the slot, and the
+	// slot itself can hold the publication's catalog snapshot. Slot
+	// teardown is deferred too so reruns are reliable even if this
+	// test fails mid-flight.
+	step(t, "pre-clean: drop leftover slot", func() {
+		dropPSSlotIfExists(t, pgSrc, "sluice_slot")
+	})
+	defer dropPSSlotIfExists(t, pgSrc, "sluice_slot")
+
 	const schemaName = "sluice_psverify_stream"
-	for _, dsn := range []string{pgSrc, pgDest} {
-		dropPSSchema(t, ctx, dsn, schemaName)
-		if err := execPS(t, ctx, dsn, "CREATE SCHEMA "+schemaName); err != nil {
-			t.Fatalf("create schema: %v", err)
+	step(t, "pre-clean: drop and recreate test schemas", func() {
+		for _, dsn := range []string{pgSrc, pgDest} {
+			dropPSSchema(t, ctx, dsn, schemaName)
+			if err := execPS(t, ctx, dsn, "CREATE SCHEMA "+schemaName); err != nil {
+				t.Fatalf("create schema: %v", err)
+			}
 		}
-	}
+	})
 	defer func() {
 		for _, dsn := range []string{pgSrc, pgDest} {
 			dropPSSchema(t, context.Background(), dsn, schemaName)
 		}
 	}()
-
-	// A previous failed run may have left a `sluice_slot` replication
-	// slot behind on the source. The OpenSnapshotStream path
-	// deliberately refuses to inherit existing slots (production
-	// safety: avoids accidentally resuming from a stale consistent
-	// point), but that defeats test idempotency. Drop any leftover
-	// slot before starting and again after the test finishes so reruns
-	// against the same database are reliable.
-	dropPSSlotIfExists(t, pgSrc, "sluice_slot")
-	defer dropPSSlotIfExists(t, pgSrc, "sluice_slot")
 
 	const seedDDL = `
 		CREATE TABLE sluice_psverify_stream.users (
@@ -235,9 +239,11 @@ func TestPSPipeline_StreamerPGToPG(t *testing.T) {
 		ALTER TABLE sluice_psverify_stream.users REPLICA IDENTITY FULL;
 		INSERT INTO sluice_psverify_stream.users (id, email) VALUES (1, 'r1@example.com');
 	`
-	if err := execPS(t, ctx, pgSrc, seedDDL); err != nil {
-		t.Fatalf("seed: %v", err)
-	}
+	step(t, "seed source with R1", func() {
+		if err := execPS(t, ctx, pgSrc, seedDDL); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	})
 
 	pgEng, ok := engines.Get("postgres")
 	if !ok {
@@ -251,6 +257,7 @@ func TestPSPipeline_StreamerPGToPG(t *testing.T) {
 		StreamID:  "psverify-pg-stream",
 	}
 
+	t.Logf("phase B: starting Streamer.Run")
 	streamCtx, streamCancel := context.WithCancel(ctx)
 	defer streamCancel()
 	runErr := make(chan error, 1)
@@ -415,45 +422,77 @@ func execPSMySQL(t *testing.T, ctx context.Context, dsn, sqlText string) error {
 	return err
 }
 
-func dropPSSchema(t *testing.T, ctx context.Context, dsn, schema string) {
+// dropPSSchema is best-effort cleanup. Hard-capped at 30s in case a
+// stale lock (from a streamer goroutine that hasn't fully unwound
+// yet) blocks the DROP SCHEMA CASCADE — cleanup must never hang the
+// test, even when something upstream is holding resources.
+func dropPSSchema(t *testing.T, _ context.Context, dsn, schema string) {
 	t.Helper()
-	if err := execPS(t, ctx, dsn, "DROP SCHEMA IF EXISTS "+schema+" CASCADE"); err != nil {
-		t.Logf("drop schema %s: %v", schema, err)
+	const cap = 30 * time.Second
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ctx, cancel := context.WithTimeout(context.Background(), cap)
+		defer cancel()
+		if err := execPS(t, ctx, dsn, "DROP SCHEMA IF EXISTS "+schema+" CASCADE"); err != nil {
+			t.Logf("drop schema %s: %v", schema, err)
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(cap + 2*time.Second):
+		t.Logf("drop schema %s: timed out after %v; proceeding", schema, cap)
 	}
 }
 
 // dropPSSlotIfExists is a best-effort cleanup of a leftover
-// replication slot. pg_drop_replication_slot raises an error when
-// the slot doesn't exist, so we check first; either branch is fine
-// to ignore — the goal is to produce a clean slate for the next
-// CREATE_REPLICATION_SLOT call.
+// replication slot. pg_drop_replication_slot blocks if the slot is
+// still marked "active" (a previous failed run can leave it that
+// way for tens of seconds), and on managed services the Postgres-
+// level cancel packet doesn't always reach the backend in time.
+// We hard-cap the whole operation in a goroutine so cleanup never
+// hangs the test, even when context cancellation isn't honoured.
+//
+// Failure to drop the slot here isn't fatal — the next
+// CREATE_REPLICATION_SLOT will surface "slot already exists" with
+// a clear message that operators recognise.
 func dropPSSlotIfExists(t *testing.T, dsn, slotName string) {
 	t.Helper()
-	db, err := sql.Open("pgx", dsn)
-	if err != nil {
-		t.Logf("slot pre-clean open: %v", err)
-		return
-	}
-	defer func() { _ = db.Close() }()
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
+	const cap = 15 * time.Second
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		db, err := sql.Open("pgx", dsn)
+		if err != nil {
+			t.Logf("slot pre-clean open: %v", err)
+			return
+		}
+		defer func() { _ = db.Close() }()
+		ctx, cancel := context.WithTimeout(context.Background(), cap)
+		defer cancel()
 
-	var exists bool
-	err = db.QueryRowContext(ctx,
-		"SELECT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)",
-		slotName,
-	).Scan(&exists)
-	if err != nil {
-		t.Logf("slot pre-clean lookup: %v", err)
-		return
-	}
-	if !exists {
-		return
-	}
-	if _, err := db.ExecContext(ctx,
-		"SELECT pg_drop_replication_slot($1)", slotName,
-	); err != nil {
-		t.Logf("drop slot %s: %v", slotName, err)
+		var exists bool
+		err = db.QueryRowContext(ctx,
+			"SELECT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)",
+			slotName,
+		).Scan(&exists)
+		if err != nil {
+			t.Logf("slot pre-clean lookup: %v", err)
+			return
+		}
+		if !exists {
+			return
+		}
+		if _, err := db.ExecContext(ctx,
+			"SELECT pg_drop_replication_slot($1)", slotName,
+		); err != nil {
+			t.Logf("drop slot %s: %v", slotName, err)
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(cap + 2*time.Second):
+		t.Logf("drop slot %s: timed out after %v (PS-PG may not honour cancellation for replication-related calls); proceeding", slotName, cap)
 	}
 }
 
@@ -532,6 +571,19 @@ func withPSSchema(dsn, schema string) string {
 		return dsn + "&schema=" + schema
 	}
 	return dsn + "?schema=" + schema
+}
+
+// step wraps a setup-phase block with start/finish logging so the
+// test output shows exactly which step is running at any moment.
+// Useful when an external service is mid-failure: a test that hangs
+// at "phase A" tells the operator something different than one that
+// hangs at "phase D".
+func step(t *testing.T, name string, fn func()) {
+	t.Helper()
+	t.Logf("→ %s", name)
+	start := time.Now()
+	fn()
+	t.Logf("✓ %s (%v)", name, time.Since(start).Round(time.Millisecond))
 }
 
 func equalPSStringSlices(a, b []string) bool {
