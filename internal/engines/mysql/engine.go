@@ -151,14 +151,11 @@ func (e Engine) OpenCDCReader(ctx context.Context, dsn string) (ir.CDCReader, er
 	if e.Capabilities().CDC == ir.CDCNone {
 		return nil, fmt.Errorf("%s: CDC not supported by this flavor: %w", e.Name(), ErrNotImplemented)
 	}
-	switch e.Flavor {
-	case FlavorPlanetScale:
+	if e.Flavor == FlavorPlanetScale {
 		return openVStreamReader(ctx, dsn)
-	case FlavorVanilla:
-		fallthrough
-	default:
-		return openBinlogCDCReader(ctx, dsn)
 	}
+	// FlavorVanilla and any future binlog-based flavor land here.
+	return openBinlogCDCReader(ctx, dsn)
 }
 
 // openBinlogCDCReader is the FlavorVanilla path of OpenCDCReader.
