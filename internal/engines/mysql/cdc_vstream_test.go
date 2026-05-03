@@ -2,6 +2,7 @@ package mysql
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -201,10 +202,10 @@ func TestVStreamReader_VgtidUpdates(t *testing.T) {
 }
 
 // TestVStreamReader_JournalErrors confirms a JOURNAL event
-// terminates the dispatch with a clear error so the caller knows
-// to rediscover the shard layout. With StopOnReshard:true the
-// stream itself terminates after this; surfacing the error first
-// gives the operator something actionable to log.
+// terminates the dispatch with the typed [ShardLayoutChangedError]
+// so the caller can detect the reshard via [errors.Is] and
+// inspect the new layout to call Reopen. With StopOnReshard:true
+// the stream itself terminates after this.
 func TestVStreamReader_JournalErrors(t *testing.T) {
 	r := &vstreamCDCReader{
 		keyspace: "main",
@@ -214,9 +215,37 @@ func TestVStreamReader_JournalErrors(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()
 
-	ev := &binlogdata.VEvent{Type: binlogdata.VEventType_JOURNAL}
-	if err := r.dispatch(ctx, ev, out); err == nil {
+	ev := &binlogdata.VEvent{
+		Type: binlogdata.VEventType_JOURNAL,
+		Journal: &binlogdata.Journal{
+			Participants: []*binlogdata.KeyspaceShard{
+				{Keyspace: "main", Shard: "-"},
+			},
+			ShardGtids: []*binlogdata.ShardGtid{
+				{Keyspace: "main", Shard: "-80", Gtid: "MySQL56/abcd:1-100"},
+				{Keyspace: "main", Shard: "80-", Gtid: "MySQL56/abcd:1-100"},
+			},
+		},
+	}
+	err := r.dispatch(ctx, ev, out)
+	if err == nil {
 		t.Fatal("expected error for JOURNAL event")
+	}
+	if !errors.Is(err, ErrShardLayoutChanged) {
+		t.Errorf("err = %v; want errors.Is(err, ErrShardLayoutChanged)", err)
+	}
+	var resh *ShardLayoutChangedError
+	if !errors.As(err, &resh) {
+		t.Fatalf("err = %v; want errors.As(err, *ShardLayoutChangedError)", err)
+	}
+	if resh.Keyspace != "main" {
+		t.Errorf("resh.Keyspace = %q; want main", resh.Keyspace)
+	}
+	if len(resh.Participants) != 1 || resh.Participants[0].Shard != "-" {
+		t.Errorf("resh.Participants = %v; want one entry with shard=-", resh.Participants)
+	}
+	if len(resh.NewShards) != 2 {
+		t.Errorf("resh.NewShards has %d entries; want 2", len(resh.NewShards))
 	}
 }
 
@@ -660,6 +689,152 @@ func TestStripKeyspaceFromTable(t *testing.T) {
 				t.Errorf("got %q; want %q", got, c.want)
 			}
 		})
+	}
+}
+
+// TestResolveVStreamShards covers the open-time shard-resolution
+// policy: explicit list wins, auto-discover requires the explicit
+// list to be empty, and the contradictory-flags case errors loudly.
+//
+// Auto-discovery's network branch is exercised by the integration
+// suite; here we only assert the validation logic.
+func TestResolveVStreamShards(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+
+	cases := []struct {
+		name      string
+		params    map[string]string
+		want      []string
+		wantErr   bool
+		errSubstr string
+	}{
+		{
+			name: "default — single unsharded shard",
+			want: []string{"-"},
+		},
+		{
+			name:   "explicit single shard",
+			params: map[string]string{"vstream_shards": "0"},
+			want:   []string{"0"},
+		},
+		{
+			name:   "explicit multi-shard",
+			params: map[string]string{"vstream_shards": "-80,80-"},
+			want:   []string{"-80", "80-"},
+		},
+		{
+			name: "both shards and auto-discover → error",
+			params: map[string]string{
+				"vstream_shards":               "-80,80-",
+				"vstream_auto_discover_shards": "true",
+			},
+			wantErr:   true,
+			errSubstr: "mutually exclusive",
+		},
+		// Auto-discovery without explicit shards isn't tested here:
+		// it would require a live MySQL endpoint. The integration
+		// suite covers it; this layer just validates the policy.
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			cfg, _ := minimalConfig("host:3306", c.params)
+			got, err := resolveVStreamShards(ctx, cfg)
+			if c.wantErr {
+				if err == nil {
+					t.Fatalf("want error containing %q; got nil", c.errSubstr)
+				}
+				if !strings.Contains(err.Error(), c.errSubstr) {
+					t.Errorf("err = %q; want substring %q", err.Error(), c.errSubstr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("resolveVStreamShards: %v", err)
+			}
+			if !reflect.DeepEqual(got, c.want) {
+				t.Errorf("got %v; want %v", got, c.want)
+			}
+		})
+	}
+}
+
+// TestVStreamReader_ApplyReshardState asserts that the internal
+// state-mutation half of Reopen swaps the reader's shard set,
+// currentVgtid, and clears the field cache when handed a
+// [ShardLayoutChangedError]. The gRPC stream rebuild itself is
+// exercised by the multi-shard integration test.
+func TestVStreamReader_ApplyReshardState(t *testing.T) {
+	r := &vstreamCDCReader{
+		keyspace:     "main",
+		shards:       []string{"-"},
+		fields:       map[string][]*query.Field{"-/users": {{Name: "id"}}},
+		currentVgtid: []shardGtid{{Keyspace: "main", Shard: "-", Gtid: "MySQL56/abcd:1-100"}},
+	}
+	r.setErr(errors.New("prior shard layout changed"))
+
+	resh := &ShardLayoutChangedError{
+		Keyspace: "main",
+		Participants: []shardGtid{
+			{Keyspace: "main", Shard: "-"},
+		},
+		NewShards: []shardGtid{
+			{Keyspace: "main", Shard: "-80", Gtid: "MySQL56/abcd:1-200"},
+			{Keyspace: "main", Shard: "80-", Gtid: "MySQL56/abcd:1-200"},
+		},
+	}
+	if err := r.applyReshardState(resh); err != nil {
+		t.Fatalf("applyReshardState: %v", err)
+	}
+
+	wantShards := []string{"-80", "80-"}
+	if !reflect.DeepEqual(r.shards, wantShards) {
+		t.Errorf("r.shards = %v; want %v", r.shards, wantShards)
+	}
+	if len(r.currentVgtid) != 2 {
+		t.Errorf("r.currentVgtid has %d entries; want 2", len(r.currentVgtid))
+	}
+	if r.currentVgtid[0].Gtid != "MySQL56/abcd:1-200" {
+		t.Errorf("r.currentVgtid[0].Gtid = %q; want refreshed GTID", r.currentVgtid[0].Gtid)
+	}
+	if len(r.fields) != 0 {
+		t.Errorf("r.fields has %d entries; want 0 (cache cleared on reshard)", len(r.fields))
+	}
+	if r.Err() != nil {
+		t.Errorf("r.Err() = %v; want nil after applyReshardState", r.Err())
+	}
+}
+
+// TestVStreamReader_ApplyReshardStateGuards asserts the input
+// validation: nil error and empty NewShards both refuse loudly so
+// a downstream Reopen never attempts to build a stream against an
+// empty vgtid.
+func TestVStreamReader_ApplyReshardStateGuards(t *testing.T) {
+	r := &vstreamCDCReader{
+		keyspace: "main",
+		shards:   []string{"-"},
+		fields:   make(map[string][]*query.Field),
+	}
+	if err := r.applyReshardState(nil); err == nil {
+		t.Error("expected error for nil ShardLayoutChangedError")
+	}
+	if err := r.applyReshardState(&ShardLayoutChangedError{Keyspace: "main"}); err == nil {
+		t.Error("expected error for empty NewShards")
+	}
+}
+
+// TestShardLayoutChangedError_Is verifies the typed error matches
+// the sentinel under errors.Is, which is the documented contract
+// for callers.
+func TestShardLayoutChangedError_Is(t *testing.T) {
+	e := &ShardLayoutChangedError{Keyspace: "main"}
+	if !errors.Is(e, ErrShardLayoutChanged) {
+		t.Errorf("errors.Is(typed, sentinel) = false; want true")
+	}
+	// Unrelated errors must not match.
+	if errors.Is(errors.New("other"), ErrShardLayoutChanged) {
+		t.Errorf("errors.Is unrelated = true; want false")
 	}
 }
 

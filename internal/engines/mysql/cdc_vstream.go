@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -142,11 +143,20 @@ const vstreamChannelBuffer = 256
 //     PlanetScale convention is "-" for an unsharded keyspace;
 //     vttestserver uses "0" for the same case. Multi-shard
 //     keyspaces list every shard ("-80,80-").
+//   - vstream_auto_discover_shards=true — discover the keyspace's
+//     shard layout at Open time via `SHOW VITESS_SHARDS LIKE
+//     '<keyspace>/%'` against the standard MySQL endpoint.
+//     Mutually exclusive with `vstream_shards`. Default false to
+//     keep existing single-shard deployments working without
+//     changes.
 //
-// Sharded keyspaces are out of scope for v1: this reader assumes
-// one shard ("-"). Errors at usage time, not Open time, so the
-// engine can be opened in dry-run flows that don't actually stream.
-func openVStreamReader(_ context.Context, dsn string) (ir.CDCReader, error) {
+// Multi-shard sharded keyspaces are supported: enable
+// auto-discovery (or list shards explicitly) and the receive path
+// fans out per-shard cursor tracking through the `[]shardGtid`
+// position. Reshard handling is detected via the typed
+// [ErrShardLayoutChanged] error — see [vstreamCDCReader.dispatch]
+// for the contract.
+func openVStreamReader(ctx context.Context, dsn string) (ir.CDCReader, error) {
 	cfg, err := parseDSN(dsn)
 	if err != nil {
 		return nil, err
@@ -165,6 +175,11 @@ func openVStreamReader(_ context.Context, dsn string) (ir.CDCReader, error) {
 		return nil, err
 	}
 
+	shards, err := resolveVStreamShards(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+
 	conn, err := grpc.NewClient(endpoint, dialOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("mysql/vstream: dial %s: %w", endpoint, err)
@@ -174,7 +189,7 @@ func openVStreamReader(_ context.Context, dsn string) (ir.CDCReader, error) {
 		endpoint:   endpoint,
 		authHeader: authHeader,
 		keyspace:   cfg.DBName,
-		shards:     vstreamShardsFromDSN(cfg),
+		shards:     shards,
 		conn:       conn,
 		client:     vtgateservice.NewVitessClient(conn),
 		fields:     make(map[string][]*query.Field),
@@ -186,6 +201,10 @@ func openVStreamReader(_ context.Context, dsn string) (ir.CDCReader, error) {
 // comma-separated list of shard names; missing or empty defaults
 // to "-" (PlanetScale's convention for an unsharded keyspace).
 // vttestserver uses "0" instead and needs the override.
+//
+// This is the explicit-only path; for the full open-time resolution
+// (which includes the auto-discovery branch), see
+// [resolveVStreamShards].
 func vstreamShardsFromDSN(cfg *gomysql.Config) []string {
 	v := cfg.Params["vstream_shards"]
 	if v == "" {
@@ -203,6 +222,128 @@ func vstreamShardsFromDSN(cfg *gomysql.Config) []string {
 		return []string{"-"}
 	}
 	return out
+}
+
+// resolveVStreamShards picks the shard layout for the reader at
+// Open time. It applies the DSN policy:
+//
+//   - If `vstream_shards` is set: parse it (delegates to
+//     [vstreamShardsFromDSN]).
+//   - If `vstream_auto_discover_shards=true` AND `vstream_shards`
+//     is unset: query the vtgate via [discoverShards] and use that
+//     list.
+//   - If both flags are set: error. They're contradictory and the
+//     operator's intent is ambiguous.
+//   - Default (neither set): the explicit-default path —
+//     ["-"] (PlanetScale's unsharded convention). Backwards-
+//     compatible with every existing caller.
+func resolveVStreamShards(ctx context.Context, cfg *gomysql.Config) ([]string, error) {
+	explicit := strings.TrimSpace(cfg.Params["vstream_shards"])
+	autoDiscover := cfg.Params["vstream_auto_discover_shards"] == "true"
+
+	if explicit != "" && autoDiscover {
+		return nil, errors.New(
+			"mysql/vstream: vstream_shards and vstream_auto_discover_shards=true are mutually exclusive; pick one",
+		)
+	}
+	if !autoDiscover {
+		return vstreamShardsFromDSN(cfg), nil
+	}
+
+	shards, err := discoverShards(ctx, cfg, cfg.DBName)
+	if err != nil {
+		return nil, fmt.Errorf("mysql/vstream: shard auto-discovery: %w", err)
+	}
+	if len(shards) == 0 {
+		return nil, fmt.Errorf("mysql/vstream: shard auto-discovery for keyspace %q returned no shards", cfg.DBName)
+	}
+	return shards, nil
+}
+
+// discoverShards queries the vtgate's MySQL frontend with
+// `SHOW VITESS_SHARDS LIKE '<keyspace>/%'` and returns the shard
+// names belonging to keyspace. The command is a Vitess-specific
+// extension to standard MySQL: vtgate parses it, returns one row
+// per shard with a single column whose value is `keyspace/shard`.
+//
+// keyspace is matched as a literal prefix; the `/%` LIKE pattern
+// scopes the result to that keyspace alone (vtgate also serves
+// system keyspaces, e.g. `_vt`, that we don't want to stream
+// from).
+//
+// The returned slice is sorted by shard name to make the layout
+// deterministic across calls — the position-encoder already
+// canonicalises before persisting, but doing it here as well
+// keeps log output and test assertions stable.
+//
+// Connectivity uses a short-lived [database/sql] handle bound to
+// the same DSN-derived [gomysql.Config] the reader was opened
+// with. The handle is closed before return; the function does
+// not retain it.
+func discoverShards(ctx context.Context, cfg *gomysql.Config, keyspace string) ([]string, error) {
+	if keyspace == "" {
+		return nil, errors.New("mysql/vstream: discoverShards: empty keyspace")
+	}
+	// Clone the Config and drop sluice's vstream_* DSN flags before
+	// opening the connection: the go-sql-driver's session-init
+	// emits the DSN's Params map as `SET <key>=<value>, ...`, and
+	// vtgate's MySQL parser rejects unknown variable names with a
+	// syntax error. (The flags are sluice-internal — they belong
+	// in cfg.Params for the parser's eyes only, not in a SET
+	// statement on the wire.)
+	conn := cfg.Clone()
+	if conn.Params != nil {
+		for k := range conn.Params {
+			if strings.HasPrefix(k, "vstream_") {
+				delete(conn.Params, k)
+			}
+		}
+	}
+	db, err := openDB(ctx, conn)
+	if err != nil {
+		return nil, fmt.Errorf("open mysql for shard discovery: %w", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	pattern := keyspace + "/%"
+	rows, err := db.QueryContext(ctx, "SHOW VITESS_SHARDS LIKE ?", pattern)
+	if err != nil {
+		return nil, fmt.Errorf("SHOW VITESS_SHARDS LIKE %q: %w", pattern, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	out := make([]string, 0, 4)
+	for rows.Next() {
+		var ksShard string
+		if err := rows.Scan(&ksShard); err != nil {
+			return nil, fmt.Errorf("scan shard row: %w", err)
+		}
+		// SHOW VITESS_SHARDS rows have the shape "keyspace/shard"; we
+		// strip the keyspace prefix and validate the suffix is the
+		// shard name we expected.
+		idx := strings.IndexByte(ksShard, '/')
+		if idx < 0 {
+			return nil, fmt.Errorf("unexpected SHOW VITESS_SHARDS row %q (no '/' separator)", ksShard)
+		}
+		ks, shard := ksShard[:idx], ksShard[idx+1:]
+		if ks != keyspace {
+			// Defensive: the LIKE filter should have constrained
+			// keyspace, but a vtgate quirk could surface a foreign
+			// row; skip rather than fold it into our shard list.
+			continue
+		}
+		if shard != "" {
+			out = append(out, shard)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate shard rows: %w", err)
+	}
+
+	// Sort for deterministic output; vtgate doesn't guarantee any
+	// particular order from SHOW VITESS_SHARDS.
+	sort.Strings(out)
+	return out, nil
 }
 
 // vstreamDialOptions builds the gRPC dial options from the DSN's
@@ -462,10 +603,10 @@ func (r *vstreamCDCReader) dispatch(ctx context.Context, ev *binlogdata.VEvent, 
 
 	case binlogdata.VEventType_JOURNAL:
 		// With StopOnReshard the stream terminates after this; the
-		// outer Recv loop will see EOF and exit. Reshard handling
-		// is its own follow-up chunk; surface as an error so the
-		// caller knows to rediscover the shard layout and re-open.
-		return errors.New("mysql/vstream: shard layout changed (journal event); caller must reopen with new shards")
+		// outer Recv loop will see EOF and exit. Surface a typed
+		// error carrying the journal payload so the caller can
+		// inspect the new shard layout and call Reopen to resume.
+		return journalToShardLayoutErr(ev.GetJournal())
 
 	case binlogdata.VEventType_BEGIN,
 		binlogdata.VEventType_COMMIT,
@@ -851,4 +992,206 @@ func copyBytes(raw []byte) []byte {
 	out := make([]byte, len(raw))
 	copy(out, raw)
 	return out
+}
+
+// ShardLayoutChangedError is returned by [vstreamCDCReader] when
+// vtgate emits a JOURNAL VEvent — Vitess's signal that the source
+// keyspace's shard layout is being replaced (a reshard split,
+// merge, or move). With StopOnReshard:true (the flag the reader
+// sets), the gRPC stream terminates immediately after the journal
+// commits, so no further events arrive on the original shards.
+//
+// The error carries the journal's payload so the caller can:
+//
+//   - Log which shards were participating ([Participants]).
+//   - Resume from the new layout via [vstreamCDCReader.Reopen],
+//     which seeds a fresh stream from [NewShards] using the GTIDs
+//     vtgate stamped on each entry.
+//
+// The reader does NOT auto-reopen: that's a policy decision
+// (whether to retry, how long to wait, whether to alert). The
+// caller — typically [pipeline.Streamer]'s outer loop — owns the
+// retry semantics. Detect via [errors.Is] (or a type assertion
+// for the payload).
+//
+// The position-token format on persistence is unchanged; the
+// reader simply emits a new vgtid covering the new shard set
+// once Reopen succeeds, and subsequent ir.Change events carry
+// positions that decode to the new []shardGtid shape.
+type ShardLayoutChangedError struct {
+	// Keyspace is the keyspace the journal applies to. Sluice
+	// readers are bound to one keyspace via the DSN, so this is
+	// always the reader's own keyspace; surfacing it makes the
+	// error self-describing without forcing the caller to remember
+	// context.
+	Keyspace string
+
+	// Participants is the list of (keyspace, shard) tuples that
+	// were streaming when the journal committed — the shards being
+	// retired. Useful for logging and for sanity-checking that the
+	// reader was streaming the shards the journal expected to
+	// replace.
+	Participants []shardGtid
+
+	// NewShards is the list of (keyspace, shard, gtid) tuples for
+	// the post-reshard layout. The Gtid on each entry is the
+	// position vtgate stamped at the journal commit, so a stream
+	// opened against this slice resumes exactly at the seam — no
+	// gap, no overlap.
+	NewShards []shardGtid
+}
+
+// Error implements error. The message is intentionally terse;
+// detailed shard listings are available on the typed fields.
+func (e *ShardLayoutChangedError) Error() string {
+	return fmt.Sprintf(
+		"mysql/vstream: shard layout changed for keyspace %q (was %d shard(s), now %d); reopen required",
+		e.Keyspace, len(e.Participants), len(e.NewShards),
+	)
+}
+
+// ErrShardLayoutChanged is the sentinel paired with
+// [ShardLayoutChangedError] for [errors.Is] checks. The concrete
+// error type carries the new layout; the sentinel is the contract
+// boundary (so callers don't depend on the struct shape just to
+// detect the case).
+var ErrShardLayoutChanged = errors.New("mysql/vstream: shard layout changed")
+
+// Is implements the [errors.Is] hook so the typed error matches
+// the sentinel.
+func (e *ShardLayoutChangedError) Is(target error) bool {
+	return target == ErrShardLayoutChanged
+}
+
+// journalToShardLayoutErr converts a Vitess Journal proto into the
+// typed sluice error. Returns the sentinel on a nil journal so the
+// dispatcher's contract — "JOURNAL → error" — stays unconditional;
+// in practice vtgate always populates the field, but defending
+// against nil keeps the dispatch loop bullet-proof.
+func journalToShardLayoutErr(j *binlogdata.Journal) error {
+	if j == nil {
+		return ErrShardLayoutChanged
+	}
+	out := &ShardLayoutChangedError{}
+
+	for _, p := range j.GetParticipants() {
+		out.Keyspace = p.GetKeyspace()
+		out.Participants = append(out.Participants, shardGtid{
+			Keyspace: p.GetKeyspace(),
+			Shard:    p.GetShard(),
+		})
+	}
+	for _, sg := range j.GetShardGtids() {
+		out.NewShards = append(out.NewShards, shardGtid{
+			Keyspace: sg.GetKeyspace(),
+			Shard:    sg.GetShard(),
+			Gtid:     sg.GetGtid(),
+		})
+		// Backfill keyspace from the new-shards list when the
+		// journal carries no participants (rare; defensive).
+		if out.Keyspace == "" {
+			out.Keyspace = sg.GetKeyspace()
+		}
+	}
+	return out
+}
+
+// Reopen builds a fresh stream against the post-reshard shard
+// layout described by [ShardLayoutChangedError]. The underlying
+// gRPC connection is reused — only the stream is replaced — so
+// the typical use pattern is:
+//
+//	changes, err := rdr.StreamChanges(ctx, pos)
+//	for {
+//	    select {
+//	    case ev, ok := <-changes:
+//	        if !ok {
+//	            var resh *mysql.ShardLayoutChangedError
+//	            if errors.As(rdr.Err(), &resh) {
+//	                changes, err = rdr.Reopen(ctx, resh)
+//	                if err != nil { ... }
+//	                continue
+//	            }
+//	            return rdr.Err()
+//	        }
+//	        // handle ev
+//	    }
+//	}
+//
+// On success the reader's currentVgtid is replaced with the new
+// layout, the field cache is cleared (post-reshard tablets emit
+// fresh FIELD events), and a new ir.Change channel is returned.
+// The previous channel (already closed when the caller saw the
+// error) is no longer used.
+//
+// Reopen is intentionally a separate method from StreamChanges:
+// the latter is the public CDCReader entry point that decodes a
+// caller-supplied [ir.Position]; Reopen takes the typed error
+// directly so the GTIDs don't have to round-trip through the
+// position layer (which canonicalises and could lose information
+// in a future format revision).
+func (r *vstreamCDCReader) Reopen(ctx context.Context, resh *ShardLayoutChangedError) (<-chan ir.Change, error) {
+	if err := r.applyReshardState(resh); err != nil {
+		return nil, err
+	}
+
+	req := r.buildVStreamRequest(r.currentVgtid)
+	loopCtx, cancel := context.WithCancel(ctx)
+	r.streamerCancel = cancel
+
+	stream, err := r.client.VStream(loopCtx, req)
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("mysql/vstream: reopen: open stream: %w", err)
+	}
+
+	out := make(chan ir.Change, vstreamChannelBuffer)
+	go r.pump(loopCtx, stream, out)
+	return out, nil
+}
+
+// applyReshardState mutates the reader to match the post-reshard
+// layout: cancels any in-flight stream, clears the field cache,
+// and replaces the shard list and currentVgtid. Lifted out of
+// Reopen so the state transition is independently unit-testable
+// without needing a live gRPC client.
+func (r *vstreamCDCReader) applyReshardState(resh *ShardLayoutChangedError) error {
+	if resh == nil {
+		return errors.New("mysql/vstream: Reopen: nil ShardLayoutChangedError")
+	}
+	if len(resh.NewShards) == 0 {
+		return errors.New("mysql/vstream: Reopen: no new shards in journal")
+	}
+
+	// Cancel the previous streamer goroutine — Reopen is the
+	// transition point between the old layout and the new, and
+	// holding two streams open against the same keyspace would
+	// confuse the position bookkeeping.
+	if r.streamerCancel != nil {
+		r.streamerCancel()
+		r.streamerCancel = nil
+	}
+
+	// Reset error state so the caller sees a clean slate after a
+	// successful reopen. The reshard error itself was already
+	// observed via Err(); leaving it cached would mask any future
+	// genuine failure on the new stream.
+	r.mu.Lock()
+	r.err = nil
+	r.mu.Unlock()
+
+	// New layout becomes the reader's authoritative shard set.
+	r.shards = make([]string, 0, len(resh.NewShards))
+	for _, s := range resh.NewShards {
+		r.shards = append(r.shards, s.Shard)
+	}
+	r.currentVgtid = make([]shardGtid, len(resh.NewShards))
+	copy(r.currentVgtid, resh.NewShards)
+
+	// Field cache is keyed by (shard, table); the new tablets emit
+	// fresh FIELD events so the old cache entries would be stale
+	// at best, mis-aligned at worst.
+	clear(r.fields)
+
+	return nil
 }

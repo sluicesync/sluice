@@ -134,11 +134,12 @@ Key constraints inherited from the Vitess platform:
   protocol. The flavor declares `CDCVStream` so the streamer's
   capability check accepts it.
 - No user-defined PARTITION BY (Vitess sharding handles partitioning).
-- Sharded keyspaces are explicitly out of scope for v1 — the
-  reader streams from a fixed shard layout supplied via
-  `vstream_shards` (defaults to `-` for the PlanetScale unsharded
-  case). Multi-shard support and reshard discovery are planned
-  follow-ups.
+- Sharded keyspaces are supported: list the shards explicitly via
+  `vstream_shards` or set `vstream_auto_discover_shards=true` to
+  have sluice query `SHOW VITESS_SHARDS LIKE '<keyspace>/%'` at
+  Open time. The reader streams from all shards concurrently and
+  detects reshards via a typed `ShardLayoutChangedError`; callers
+  resume on the new layout via `vstreamCDCReader.Reopen`.
 - Spatial types not supported in v1 (conservative default; flip the
   capability flag if you've confirmed otherwise).
 
@@ -163,7 +164,21 @@ on the standard MySQL DSN as additional `?key=value` parameters:
   deployments that don't authenticate VStream calls.
 - `vstream_shards=<comma-separated>` — default `-`. PlanetScale
   convention; vttestserver typically uses `0` for an unsharded
-  keyspace.
+  keyspace. List every shard for a sharded keyspace
+  (`vstream_shards=-80,80-`).
+- `vstream_auto_discover_shards=true` — discover the keyspace's
+  shard layout at Open time via `SHOW VITESS_SHARDS LIKE
+  '<keyspace>/%'`. Default `false`. Mutually exclusive with
+  `vstream_shards`. Recommended for sharded sources where the
+  shard layout isn't known statically; for unsharded keyspaces
+  the explicit-default path (`-`) is cheaper.
+
+Reshards are surfaced as `ShardLayoutChangedError` (carries the
+new shard layout). Callers can match it with `errors.Is(err,
+ErrShardLayoutChanged)` and call `vstreamCDCReader.Reopen` to
+resume from the new layout. The continuous-sync streamer's outer
+loop owns this retry policy; the reader does not auto-reopen on
+its own.
 
 Auth is HTTP Basic over gRPC metadata. Username/password come from
 the standard MySQL DSN's `User:Passwd` fields; for PlanetScale,
