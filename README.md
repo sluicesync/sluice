@@ -25,7 +25,21 @@ Versioning follows [SemVer](https://semver.org/). While the project is in `v0.x`
 
 **Simple mode** — translate the source schema, apply it to the target, bulk-copy the data, done. Designed for smaller databases where a brief downtime window is acceptable. Single command, predictable outcome, easy to reason about.
 
-**Continuous sync mode** — establish an initial copy, then stream ongoing changes from source to target via change-data-capture (MySQL binlog, PostgreSQL logical replication). Useful for low/zero-downtime migrations *and* for ongoing replication scenarios such as reporting replicas, geographic data locality, or feeding downstream systems.
+**Continuous sync mode** — establish an initial copy, then stream ongoing changes from source to target via change-data-capture (MySQL binlog, PostgreSQL logical replication, or Vitess VStream for PlanetScale MySQL). Useful for low/zero-downtime migrations *and* for ongoing replication scenarios such as reporting replicas, geographic data locality, or feeding downstream systems.
+
+### Managed-service support
+
+The vanilla MySQL and Postgres engines work directly against most managed offerings (AWS RDS / Aurora, GCP CloudSQL, Azure Database). PlanetScale gets specific treatment:
+
+- **PlanetScale Postgres** — the vanilla `postgres` engine handles PS-PG without code changes. Verified end-to-end against a real PS account.
+- **PlanetScale MySQL** — uses the `planetscale` engine flavor (a variant of the MySQL engine), with CDC delivered via Vitess's VStream gRPC protocol instead of binlog (PlanetScale doesn't expose binlog directly).
+- **Self-hosted Vitess** — the same `planetscale` flavor covers any Vitess deployment. DSN flags opt out of PlanetScale-specific defaults (TLS, basic auth, shard naming) for vttestserver and other self-hosted setups.
+
+See [docs/managed-services.md](docs/managed-services.md) for the full compatibility matrix and operator preconditions.
+
+### Type-translation overrides
+
+The simple-mode and continuous-sync paths both honour a `mappings:` block in `sluice.yaml` that lets operators override per-column target types. Useful when the default policy is lossy or when targeting types the source can't natively express (PG `JSONB`, PG `TEXT[]` from a MySQL `SET`, PostGIS `geometry(POINT, 4326)` from a MySQL spatial column). See [docs/examples/sluice.yaml](docs/examples/sluice.yaml).
 
 ## Design principles
 
@@ -152,9 +166,12 @@ DSNs can also be passed via the `SLUICE_SOURCE` and `SLUICE_TARGET` environment 
 - [docs/architecture.md](docs/architecture.md) — IR, reader/writer pattern, the two engines, module layout
 - [docs/type-mapping.md](docs/type-mapping.md) — internal type model and dialect-specific translation policies
 - [docs/value-types.md](docs/value-types.md) — the runtime contract for `ir.Row` values that flow between readers, the translator, and writers
+- [docs/managed-services.md](docs/managed-services.md) — supported managed services (PlanetScale Postgres, PlanetScale MySQL via VStream, Vitess) plus operator preconditions
 - [docs/testing.md](docs/testing.md) — testing strategy and tooling
+- [docs/adr/](docs/adr/) — Architecture Decision Records pinning load-bearing design choices
 - [docs/dev/development.md](docs/dev/development.md) — local development workflow (gofumpt, Make targets, pre-commit hook)
 - [docs/examples/sluice.yaml](docs/examples/sluice.yaml) — example configuration file
+- [CHANGELOG.md](CHANGELOG.md) — capability-grouped log of what's landed since the initial design pass
 
 ## Why sluice?
 
