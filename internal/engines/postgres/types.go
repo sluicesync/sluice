@@ -45,6 +45,29 @@ type columnMeta struct {
 	// enum type. The schema reader resolves the values via pg_enum
 	// before invoking the translator.
 	EnumValues []string
+
+	// GeometryInfo is populated when the column's UDT is the PostGIS
+	// `geometry` type. The schema reader queries PostGIS's
+	// `geometry_columns` view to recover the subtype and SRID that
+	// information_schema flattens away. nil means "no geometry info
+	// available" — either the column isn't geometry, or the lookup
+	// returned nothing (PostGIS not installed, or the view doesn't
+	// know about this column for some reason). The translator
+	// degrades gracefully to GeometryUnspecified+SRID=0 in that case.
+	GeometryInfo *geometryColumnInfo
+}
+
+// geometryColumnInfo carries PostGIS's per-column metadata as
+// surfaced by the geometry_columns view.
+type geometryColumnInfo struct {
+	// Subtype is the PostGIS bareword from geometry_columns.type, e.g.
+	// "POINT", "POLYGON", "GEOMETRY". Empty when no row matched (the
+	// schema reader represents that as a nil GeometryInfo, but
+	// callers seeing the empty string treat it the same way).
+	Subtype string
+	// SRID is geometry_columns.srid. PostGIS uses 0 to mean "unknown
+	// CRS", which matches sluice's IR default.
+	SRID int
 }
 
 // translateType maps a Postgres column's metadata to an IR type. The
@@ -72,15 +95,22 @@ func translateType(c columnMeta) (ir.Type, error) {
 		if c.EnumValues != nil {
 			return ir.Enum{Values: c.EnumValues}, nil
 		}
-		// PostGIS geometry. The base column type carries no subtype
-		// or SRID information by itself — both live in PostGIS's own
-		// geometry_columns view, which a follow-up enhancement could
-		// query during schema-read to reconstruct the typmod. v1
-		// returns ir.Geometry{Subtype: GeometryUnspecified}, which
-		// matches the source side closely enough to round-trip the
-		// type identity if not the subtype/SRID precision.
+		// PostGIS geometry. information_schema reports the column as
+		// USER-DEFINED with udt_name="geometry"; subtype + SRID live
+		// in PostGIS's own geometry_columns view, which the schema
+		// reader queries separately and stashes on the columnMeta
+		// before invoking the translator. When that lookup returns
+		// nothing (PostGIS not installed, view doesn't know this
+		// column, or the schema reader is the older unaware version),
+		// we degrade gracefully to GeometryUnspecified+SRID=0.
 		if c.UDTName == "geometry" {
-			return ir.Geometry{Subtype: ir.GeometryUnspecified}, nil
+			if c.GeometryInfo == nil {
+				return ir.Geometry{Subtype: ir.GeometryUnspecified}, nil
+			}
+			return ir.Geometry{
+				Subtype: parseGeometrySubtype(c.GeometryInfo.Subtype),
+				SRID:    c.GeometryInfo.SRID,
+			}, nil
 		}
 		return nil, fmt.Errorf("postgres: user-defined type %q is not a recognised enum", c.UDTName)
 	}
@@ -163,4 +193,32 @@ func int64Ptr(p *int64) int64 {
 		return 0
 	}
 	return *p
+}
+
+// parseGeometrySubtype maps the PostGIS subtype string from
+// geometry_columns.type to the IR's [ir.GeometrySubtype] value.
+// Unknown strings return GeometryUnspecified (the wildcard) rather
+// than erroring — PostGIS evolves and a future spec might add
+// shapes the IR doesn't model yet; degrading to "generic geometry"
+// keeps schema reads working through that.
+func parseGeometrySubtype(s string) ir.GeometrySubtype {
+	switch s {
+	case "POINT":
+		return ir.GeometryPoint
+	case "LINESTRING":
+		return ir.GeometryLineString
+	case "POLYGON":
+		return ir.GeometryPolygon
+	case "MULTIPOINT":
+		return ir.GeometryMultiPoint
+	case "MULTILINESTRING":
+		return ir.GeometryMultiLineString
+	case "MULTIPOLYGON":
+		return ir.GeometryMultiPolygon
+	case "GEOMETRYCOLLECTION":
+		return ir.GeometryCollection
+	case "GEOMETRY", "":
+		return ir.GeometryUnspecified
+	}
+	return ir.GeometryUnspecified
 }

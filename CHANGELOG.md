@@ -89,7 +89,11 @@ entries are grouped by capability rather than chronologically;
   existing loud rejection persists (sluice doesn't auto-install
   extensions). MySQL SRID-prefixed WKB → PostGIS EWKB framing
   via `wkbToEWKB`. Per-column SRID flows through the translate
-  layer's `postgis_*` aliases.
+  layer's `postgis_*` aliases. The PG schema reader queries
+  PostGIS's `geometry_columns` view at read time so geometry
+  columns surface in the IR with their precise subtype + SRID
+  (cleanly degrades to `GeometryUnspecified+SRID=0` when PostGIS
+  isn't installed).
 - **TRUNCATE detection in CDC** for both binlog and VStream
   paths. The narrow `parseTruncateTable` parser recognises
   `TRUNCATE [TABLE] [<schema>.]<table>` shapes and emits
@@ -170,12 +174,5 @@ entries are grouped by capability rather than chronologically;
   coldStart against PlanetScale today; CDC-only consumers and
   out-of-band snapshots both work. Wiring VStream's built-in
   COPY mode into `OpenSnapshotStream` is a planned chunk.
-- **PostGIS schema-reader subtype/SRID introspection**: the
-  schema reader currently surfaces all geometry columns as
-  `ir.Geometry{Subtype: GeometryUnspecified, SRID: 0}`; the
-  precise subtype + SRID live in PG's `geometry_columns` view
-  but aren't yet reconstructed during schema read. v1 callers
-  that care about subtype precision pass it explicitly via
-  `mappings`.
 
 [Unreleased]: https://github.com/orware/sluice/commits/main

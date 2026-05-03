@@ -107,6 +107,93 @@ func TestTranslateType(t *testing.T) {
 	}
 }
 
+// TestTranslateTypeGeometry covers the PostGIS geometry path
+// through translateType. With GeometryInfo present, the
+// translator returns ir.Geometry with the precise Subtype and
+// SRID; without it (PostGIS not installed, view didn't know the
+// column), it falls back to GeometryUnspecified+SRID=0.
+func TestTranslateTypeGeometry(t *testing.T) {
+	cases := []struct {
+		name string
+		info *geometryColumnInfo
+		want ir.Geometry
+	}{
+		{
+			"point with srid", &geometryColumnInfo{Subtype: "POINT", SRID: 4326},
+			ir.Geometry{Subtype: ir.GeometryPoint, SRID: 4326},
+		},
+		{
+			"polygon zero srid", &geometryColumnInfo{Subtype: "POLYGON", SRID: 0},
+			ir.Geometry{Subtype: ir.GeometryPolygon, SRID: 0},
+		},
+		{
+			"linestring", &geometryColumnInfo{Subtype: "LINESTRING", SRID: 3857},
+			ir.Geometry{Subtype: ir.GeometryLineString, SRID: 3857},
+		},
+		{
+			"multipolygon", &geometryColumnInfo{Subtype: "MULTIPOLYGON", SRID: 4326},
+			ir.Geometry{Subtype: ir.GeometryMultiPolygon, SRID: 4326},
+		},
+		{
+			"generic geometry wildcard", &geometryColumnInfo{Subtype: "GEOMETRY", SRID: 0},
+			ir.Geometry{Subtype: ir.GeometryUnspecified, SRID: 0},
+		},
+		{
+			"unknown subtype falls back", &geometryColumnInfo{Subtype: "TIN", SRID: 4326},
+			ir.Geometry{Subtype: ir.GeometryUnspecified, SRID: 4326},
+		},
+		{
+			"no info (postgis not installed)", nil,
+			ir.Geometry{Subtype: ir.GeometryUnspecified},
+		},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			got, err := translateType(columnMeta{
+				DataType:     "USER-DEFINED",
+				UDTName:      "geometry",
+				GeometryInfo: c.info,
+			})
+			if err != nil {
+				t.Fatalf("translateType: %v", err)
+			}
+			if !reflect.DeepEqual(got, c.want) {
+				t.Errorf("\n got:  %#v\nwant: %#v", got, c.want)
+			}
+		})
+	}
+}
+
+// TestParseGeometrySubtype maps every PostGIS-canonical subtype
+// string to the IR enum. Unknown strings (and the empty string)
+// return GeometryUnspecified — the wildcard.
+func TestParseGeometrySubtype(t *testing.T) {
+	cases := []struct {
+		in   string
+		want ir.GeometrySubtype
+	}{
+		{"POINT", ir.GeometryPoint},
+		{"LINESTRING", ir.GeometryLineString},
+		{"POLYGON", ir.GeometryPolygon},
+		{"MULTIPOINT", ir.GeometryMultiPoint},
+		{"MULTILINESTRING", ir.GeometryMultiLineString},
+		{"MULTIPOLYGON", ir.GeometryMultiPolygon},
+		{"GEOMETRYCOLLECTION", ir.GeometryCollection},
+		{"GEOMETRY", ir.GeometryUnspecified},
+		{"", ir.GeometryUnspecified},
+		{"TIN", ir.GeometryUnspecified}, // unknown → wildcard
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.in, func(t *testing.T) {
+			if got := parseGeometrySubtype(c.in); got != c.want {
+				t.Errorf("got %v; want %v", got, c.want)
+			}
+		})
+	}
+}
+
 func TestTranslateTypeErrors(t *testing.T) {
 	cases := []struct {
 		name string

@@ -62,7 +62,18 @@ func (r *SchemaReader) ReadSchema(ctx context.Context) (*ir.Schema, error) {
 		return nil, fmt.Errorf("postgres: read enum values: %w", err)
 	}
 
-	if err := r.populateColumns(ctx, tables, enumValues); err != nil {
+	// PostGIS's geometry_columns view holds per-column subtype +
+	// SRID that information_schema flattens away. Lookup is
+	// best-effort — the view exists only when PostGIS is installed,
+	// and a schema with no geometry columns has no rows there.
+	// Either way, the translator degrades gracefully via
+	// GeometryUnspecified + SRID=0 when no info shows up.
+	geomInfo, err := r.readGeometryColumnInfo(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: read geometry columns: %w", err)
+	}
+
+	if err := r.populateColumns(ctx, tables, enumValues, geomInfo); err != nil {
 		return nil, fmt.Errorf("postgres: read columns: %w", err)
 	}
 	if err := r.populateIndexes(ctx, tables); err != nil {
@@ -134,8 +145,70 @@ func (r *SchemaReader) readEnumValues(ctx context.Context) (map[string][]string,
 	return out, rows.Err()
 }
 
+// readGeometryColumnInfo loads per-column PostGIS subtype + SRID
+// metadata from the geometry_columns view. The view is created by
+// the PostGIS extension; when PostGIS isn't installed, the SELECT
+// raises a "relation does not exist" error which we convert to an
+// empty map (no geometry info available — translator falls back to
+// the GeometryUnspecified+SRID=0 path).
+//
+// Map key shape: "<table>.<column>". One key per geometry-typed
+// column.
+func (r *SchemaReader) readGeometryColumnInfo(ctx context.Context) (map[string]geometryColumnInfo, error) {
+	const q = `
+		SELECT f_table_name, f_geometry_column, type, srid
+		FROM   geometry_columns
+		WHERE  f_table_schema = $1`
+
+	rows, err := r.db.QueryContext(ctx, q, r.schema)
+	if err != nil {
+		// PostGIS not installed → relation doesn't exist. Treat as
+		// "no geometry info" rather than escalating; the translator
+		// has a fallback path. We do this by string-matching the
+		// driver's error message because pgx's structured error
+		// types vary across versions.
+		if isUndefinedRelationErr(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	out := map[string]geometryColumnInfo{}
+	for rows.Next() {
+		var (
+			tableName, columnName string
+			subtype               string
+			srid                  int64
+		)
+		if err := rows.Scan(&tableName, &columnName, &subtype, &srid); err != nil {
+			return nil, err
+		}
+		out[tableName+"."+columnName] = geometryColumnInfo{
+			Subtype: subtype,
+			SRID:    int(srid),
+		}
+	}
+	return out, rows.Err()
+}
+
+// isUndefinedRelationErr returns true when err looks like Postgres's
+// "relation X does not exist" / SQLSTATE 42P01. The schema reader's
+// PostGIS lookup uses this to degrade gracefully when the extension
+// isn't installed.
+func isUndefinedRelationErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	// Postgres surfaces this through pgx as a string starting with
+	// "ERROR: relation \"...\" does not exist (SQLSTATE 42P01)".
+	return strings.Contains(msg, "does not exist") &&
+		(strings.Contains(msg, "geometry_columns") || strings.Contains(msg, "42P01"))
+}
+
 // populateColumns fills in Column lists for each table.
-func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*ir.Table, enumValues map[string][]string) error {
+func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*ir.Table, enumValues map[string][]string, geomInfo map[string]geometryColumnInfo) error {
 	const q = `
 		SELECT
 			table_name,
@@ -200,6 +273,16 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 		if dataType == "user-defined" || dataType == "USER-DEFINED" {
 			if values, ok := enumValues[udtName]; ok {
 				meta.EnumValues = values
+			}
+			// PostGIS geometry: look up subtype + SRID from the
+			// per-column info we read out of geometry_columns. A
+			// missing entry is fine — the translator handles
+			// GeometryInfo=nil by emitting GeometryUnspecified.
+			if udtName == "geometry" {
+				if info, ok := geomInfo[tableName+"."+colName]; ok {
+					info := info
+					meta.GeometryInfo = &info
+				}
 			}
 		}
 

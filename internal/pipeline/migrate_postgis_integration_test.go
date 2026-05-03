@@ -191,9 +191,9 @@ func TestMigrate_PostGIS_MySQLToPG(t *testing.T) {
 	}
 
 	// Belt-and-braces: the IR shape on the read-back side. The PG
-	// schema reader currently returns ir.Geometry without SRID
-	// (subtype info isn't reconstructed from pg_geometry_columns
-	// today either), but it should at least see the column.
+	// schema reader queries PostGIS's geometry_columns view to
+	// reconstruct the precise subtype + SRID; we should see them
+	// matching what the writer emitted.
 	sr, err := pgEng.OpenSchemaReader(ctx, pgTarget)
 	if err != nil {
 		t.Fatalf("OpenSchemaReader: %v", err)
@@ -211,8 +211,15 @@ func TestMigrate_PostGIS_MySQLToPG(t *testing.T) {
 	if loc == nil {
 		t.Fatalf("places.loc column missing")
 	}
-	if _, ok := loc.Type.(ir.Geometry); !ok {
-		t.Errorf("places.loc IR type = %T; want ir.Geometry", loc.Type)
+	geom, ok := loc.Type.(ir.Geometry)
+	if !ok {
+		t.Fatalf("places.loc IR type = %T; want ir.Geometry", loc.Type)
+	}
+	if geom.Subtype != ir.GeometryPoint {
+		t.Errorf("places.loc Subtype = %v; want GeometryPoint", geom.Subtype)
+	}
+	if geom.SRID != 4326 {
+		t.Errorf("places.loc SRID = %d; want 4326", geom.SRID)
 	}
 }
 
