@@ -219,12 +219,11 @@ func TestVStreamReader_JournalErrors(t *testing.T) {
 	}
 }
 
-// TestVStreamReader_DDLClearsFieldCache confirms a DDL event
-// invalidates the cached field metadata. A schema change on the
-// source means the next ROW event might have a different column
-// shape; clearing the cache forces a fresh FIELD event before any
-// ROW decode happens. (Phase C will refine this — surface
-// TRUNCATE as ir.Truncate, etc.)
+// TestVStreamReader_DDLClearsFieldCache confirms a non-TRUNCATE
+// DDL event invalidates the cached field metadata. A schema change
+// on the source means the next ROW event might have a different
+// column shape; clearing the cache forces a fresh FIELD event
+// before any ROW decode happens.
 func TestVStreamReader_DDLClearsFieldCache(t *testing.T) {
 	r := &vstreamCDCReader{
 		keyspace: "main",
@@ -242,6 +241,90 @@ func TestVStreamReader_DDLClearsFieldCache(t *testing.T) {
 	}
 	if err := r.dispatch(ctx, ev, out); err != nil {
 		t.Fatalf("dispatch DDL: %v", err)
+	}
+	if len(r.fields) != 0 {
+		t.Errorf("fields cache size = %d; want 0 after DDL", len(r.fields))
+	}
+	// No event should have been emitted for a non-TRUNCATE DDL.
+	close(out)
+	if got := drainChannel(out); len(got) != 0 {
+		t.Errorf("got %d events; want 0 for ALTER TABLE", len(got))
+	}
+}
+
+// TestVStreamReader_DDLTruncateEmitsTruncate confirms a TRUNCATE
+// TABLE statement surfaces as ir.Truncate AND clears the field
+// cache (TRUNCATE resets auto-increment, so the next FIELD event
+// might carry refreshed metadata).
+func TestVStreamReader_DDLTruncateEmitsTruncate(t *testing.T) {
+	r := &vstreamCDCReader{
+		keyspace: "main",
+		fields: map[string][]*query.Field{
+			"-/users": {{Name: "id", Type: query.Type_INT64}},
+		},
+	}
+	out := make(chan ir.Change, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+
+	ev := &binlogdata.VEvent{
+		Type:      binlogdata.VEventType_DDL,
+		Statement: "TRUNCATE TABLE users",
+		Keyspace:  "main",
+	}
+	if err := r.dispatch(ctx, ev, out); err != nil {
+		t.Fatalf("dispatch DDL: %v", err)
+	}
+	close(out)
+
+	got := drainChannel(out)
+	if len(got) != 1 {
+		t.Fatalf("got %d events; want 1 (ir.Truncate)", len(got))
+	}
+	tr, ok := got[0].(ir.Truncate)
+	if !ok {
+		t.Fatalf("got[0] = %T; want ir.Truncate", got[0])
+	}
+	if tr.Schema != "main" {
+		t.Errorf("truncate.Schema = %q; want main", tr.Schema)
+	}
+	if tr.Table != "users" {
+		t.Errorf("truncate.Table = %q; want users", tr.Table)
+	}
+	if len(r.fields) != 0 {
+		t.Errorf("fields cache size = %d; want 0 after TRUNCATE", len(r.fields))
+	}
+}
+
+// TestVStreamReader_DDLTruncateOtherKeyspace confirms a TRUNCATE
+// against a different keyspace is silently dropped (the reader is
+// bound to a single keyspace; a stray cross-keyspace event isn't
+// ours to apply). The field cache still gets invalidated though,
+// because the conservative-blanket-clear behaviour mirrors the
+// binlog path.
+func TestVStreamReader_DDLTruncateOtherKeyspace(t *testing.T) {
+	r := &vstreamCDCReader{
+		keyspace: "main",
+		fields: map[string][]*query.Field{
+			"-/users": {{Name: "id", Type: query.Type_INT64}},
+		},
+	}
+	out := make(chan ir.Change, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+
+	ev := &binlogdata.VEvent{
+		Type:      binlogdata.VEventType_DDL,
+		Statement: "TRUNCATE TABLE other_ks.something",
+		Keyspace:  "main",
+	}
+	if err := r.dispatch(ctx, ev, out); err != nil {
+		t.Fatalf("dispatch DDL: %v", err)
+	}
+	close(out)
+
+	if got := drainChannel(out); len(got) != 0 {
+		t.Errorf("got %d events; want 0 for cross-keyspace TRUNCATE", len(got))
 	}
 	if len(r.fields) != 0 {
 		t.Errorf("fields cache size = %d; want 0 after DDL", len(r.fields))

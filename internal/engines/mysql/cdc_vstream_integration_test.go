@@ -252,6 +252,80 @@ func TestVStream_VTTestServer_BasicChangeStream(t *testing.T) {
 	t.Logf("keyspace = %q", keyspace)
 }
 
+// TestVStream_VTTestServer_Truncate covers the Phase C TRUNCATE
+// path end-to-end: insert a row, TRUNCATE the table, assert both
+// events arrive in order with the expected shapes. Mirrors the
+// binlog reader's TestCDCReader_Truncate against the VStream path.
+func TestVStream_VTTestServer_Truncate(t *testing.T) {
+	mysqlDSN, grpcEndpoint, _, cleanup := startVTTestServer(t)
+	defer cleanup()
+
+	const seedDDL = `
+		CREATE TABLE users (
+			id    BIGINT       NOT NULL AUTO_INCREMENT,
+			email VARCHAR(255) NOT NULL,
+			PRIMARY KEY (id)
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+	`
+	applyVTTestSQL(t, mysqlDSN, seedDDL)
+
+	sluiceDSN := fmt.Sprintf(
+		"%s&vstream_endpoint=%s&vstream_transport=plaintext&vstream_auth=none&vstream_shards=0",
+		mysqlDSN, grpcEndpoint,
+	)
+
+	eng := Engine{Flavor: FlavorPlanetScale}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	rdr, err := eng.OpenCDCReader(ctx, sluiceDSN)
+	if err != nil {
+		t.Fatalf("OpenCDCReader: %v", err)
+	}
+	defer func() {
+		if c, ok := rdr.(interface{ Close() error }); ok {
+			_ = c.Close()
+		}
+	}()
+
+	changes, err := rdr.StreamChanges(ctx, ir.Position{})
+	if err != nil {
+		t.Fatalf("StreamChanges: %v", err)
+	}
+
+	time.Sleep(2 * time.Second)
+
+	const dml = `
+		INSERT INTO users (email) VALUES ('alice@example.com');
+		TRUNCATE TABLE users;
+	`
+	applyVTTestSQL(t, mysqlDSN+"&multiStatements=true", dml)
+
+	got := drainVTTestChanges(t, ctx, changes, 2, 60*time.Second)
+	if len(got) != 2 {
+		if cdcRdr, ok := rdr.(*vstreamCDCReader); ok {
+			if streamErr := cdcRdr.Err(); streamErr != nil {
+				t.Fatalf("got %d changes; want 2 (stream error: %v)", len(got), streamErr)
+			}
+		}
+		t.Fatalf("got %d changes; want 2 (1 Insert + 1 Truncate)", len(got))
+	}
+
+	if _, ok := got[0].(ir.Insert); !ok {
+		t.Errorf("got[0] = %T; want ir.Insert", got[0])
+	}
+	tr, ok := got[1].(ir.Truncate)
+	if !ok {
+		t.Fatalf("got[1] = %T; want ir.Truncate", got[1])
+	}
+	if tr.Table != "users" {
+		t.Errorf("truncate.Table = %q; want users", tr.Table)
+	}
+	if tr.Pos().Engine != engineNameVStream || tr.Pos().Token == "" {
+		t.Errorf("truncate.Pos = %+v; want non-empty %s position", tr.Pos(), engineNameVStream)
+	}
+}
+
 // applyVTTestSQL runs DDL/DML against vttestserver's embedded
 // MySQL. The connection is short-lived; multiStatements=true is
 // caller-controlled (DML batches typically need it; the seed DDL

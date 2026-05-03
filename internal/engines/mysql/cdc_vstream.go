@@ -457,11 +457,7 @@ func (r *vstreamCDCReader) dispatch(ctx context.Context, ev *binlogdata.VEvent, 
 		return nil
 
 	case binlogdata.VEventType_DDL:
-		// Phase C: TRUNCATE detection + per-table cache invalidation.
-		// Conservative blanket invalidation here so the cache stays
-		// honest while Phase C is in flight.
-		clear(r.fields)
-		return nil
+		return r.dispatchDDL(ctx, ev, out)
 
 	case binlogdata.VEventType_JOURNAL:
 		// With StopOnReshard the stream terminates after this; the
@@ -488,6 +484,68 @@ func (r *vstreamCDCReader) dispatch(ctx context.Context, ev *binlogdata.VEvent, 
 		// silently. Logging is the caller's responsibility.
 		return nil
 	}
+}
+
+// dispatchDDL handles a DDL event. Mirrors the binlog reader's
+// QueryEvent handling: try to parse the SQL as a TRUNCATE TABLE
+// and, if it matches, emit an ir.Truncate. Either way, clear the
+// field cache so the next ROW event triggers a fresh FIELD lookup
+// — DDL might have changed the column shape.
+//
+// The parser (parseTruncateTable, package-level, shared with the
+// binlog path) recognises the canonical
+// `TRUNCATE [TABLE] [<schema>.]<table>` shapes and returns
+// ok=false for anything else. Multi-table truncates, parenthesised
+// arguments, etc. fall through to generic DDL handling — the
+// operator loses the typed ir.Truncate event but keeps correctness
+// (the cache invalidation still fires).
+func (r *vstreamCDCReader) dispatchDDL(ctx context.Context, ev *binlogdata.VEvent, out chan<- ir.Change) error {
+	stmt := ev.GetStatement()
+	if stmt == "" {
+		clear(r.fields)
+		return nil
+	}
+
+	if truncSchema, truncTable, ok := parseTruncateTable(stmt); ok {
+		// VStream's DDL events carry the keyspace on the parent
+		// event; an unqualified TRUNCATE inherits that as its
+		// implicit schema (matches MySQL's USE-context semantics
+		// from the binlog path).
+		if truncSchema == "" {
+			truncSchema = ev.GetKeyspace()
+		}
+		// VStream events come with the source's keyspace prefix
+		// already (e.g., "test.users") in some configurations —
+		// strip it before emitting if it duplicates the keyspace
+		// we resolved above.
+		truncTable = stripKeyspaceFromTable(truncTable, truncSchema)
+
+		// The reader is bound to a single keyspace via the DSN's
+		// DBName. Emit only when the truncate falls inside it; a
+		// truncate of an unrelated keyspace is silently dropped
+		// (the change-applier on the target side wouldn't know
+		// what to do with it anyway).
+		if truncSchema == r.keyspace {
+			pos, err := r.positionFor()
+			if err != nil {
+				return err
+			}
+			if err := send(ctx, out, ir.Truncate{
+				Position: pos,
+				Schema:   truncSchema,
+				Table:    truncTable,
+			}); err != nil {
+				return err
+			}
+		}
+		// TRUNCATE resets the auto-increment counter; fall
+		// through to the generic invalidation below so the field
+		// cache stays honest with whatever the next FIELD event
+		// reports.
+	}
+
+	clear(r.fields)
+	return nil
 }
 
 // dispatchRow turns a ROW event's RowChanges into per-row
