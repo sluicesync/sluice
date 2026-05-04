@@ -6,25 +6,16 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-## [0.2.1] - 2026-05-03
+## [0.2.2] - 2026-05-04
 
-Patch release covering the v0.2.0 PG-source regression on PlanetScale
-Postgres plus a CDC-applier JSON-encoding bug that surfaced during
-v0.2.1 revalidation testing — the latter affecting both PG→MySQL
-(loud crash) and MySQL→MySQL (silent data divergence).
+Patch release closing a CDC-applier JSON-encoding bug that surfaced
+during v0.2.1 revalidation testing — affecting both PG→MySQL (loud
+crash) and MySQL→MySQL (silent data divergence). Plus a small
+dry-run output clarification and a debug-level zero-rows-affected
+log so the silent class of bug is one filter away from being
+spotted in the future.
 
 ### Fixed
-
-- **PG 17+ slot creation: use named `SNAPSHOT 'export'` option**.
-  v0.2.0 sent `CREATE_REPLICATION_SLOT ... (EXPORT_SNAPSHOT,
-  FAILOVER true)` on PG 17+, which is a syntax mismatch — the bare
-  `EXPORT_SNAPSHOT` keyword is the *pre-PG-17* form. Inside the new
-  parenthesised option-list grammar the snapshot option must be the
-  named form `SNAPSHOT 'export'`. PlanetScale Postgres rejected the
-  v0.2.0 form with `ERROR: unrecognized option: export_snapshot`,
-  blocking every `sluice sync start` against a PG source. Cold-start
-  CDC (without snapshot export) was unaffected; snapshot+CDC handoff
-  is the path that hit it.
 
 - **MySQL applier: shape JSON column values for the wire on CDC
   Insert/Update/Delete**. The MySQL `ChangeApplier` bound row values
@@ -75,6 +66,25 @@ v0.2.1 revalidation testing — the latter affecting both PG→MySQL
   psql / SHOW INDEX output. The new shape (`primary_key=true
   secondary_indexes=1 foreign_keys=2`) is explicit from the field
   names alone.
+
+## [0.2.1] - 2026-05-03
+
+Single-issue patch release fixing a regression introduced in v0.2.0:
+PG-source CDC is unblocked on PlanetScale Postgres (and any other
+PG 17+ deployment whose option-list parser is strict).
+
+### Fixed
+
+- **PG 17+ slot creation: use named `SNAPSHOT 'export'` option**.
+  v0.2.0 sent `CREATE_REPLICATION_SLOT ... (EXPORT_SNAPSHOT,
+  FAILOVER true)` on PG 17+, which is a syntax mismatch — the bare
+  `EXPORT_SNAPSHOT` keyword is the *pre-PG-17* form. Inside the new
+  parenthesised option-list grammar the snapshot option must be the
+  named form `SNAPSHOT 'export'`. PlanetScale Postgres rejected the
+  v0.2.0 form with `ERROR: unrecognized option: export_snapshot`,
+  blocking every `sluice sync start` against a PG source. Cold-start
+  CDC (without snapshot export) was unaffected; snapshot+CDC handoff
+  is the path that hit it.
 
 ## [0.2.0] - 2026-05-03
 
@@ -419,7 +429,8 @@ level history.
 
 (none currently — see the closed entries above.)
 
-[Unreleased]: https://github.com/orware/sluice/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/orware/sluice/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/orware/sluice/releases/tag/v0.2.2
 [0.2.1]: https://github.com/orware/sluice/releases/tag/v0.2.1
 [0.2.0]: https://github.com/orware/sluice/releases/tag/v0.2.0
 [0.1.0]: https://github.com/orware/sluice/releases/tag/v0.1.0
