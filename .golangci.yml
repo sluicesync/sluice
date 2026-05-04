@@ -10,6 +10,12 @@
 # To run locally:
 #   golangci-lint run ./...
 # Install: https://golangci-lint.run/welcome/install/
+#
+# This file is in golangci-lint v1 schema. CI's lint job pins
+# golangci-lint to a v1.x release for compatibility. The v2 schema
+# migration is queued as a roadmap follow-up; see the migration guide
+# at https://golangci-lint.run/docs/product/migration-guide/ when
+# we're ready to do it.
 
 run:
   # Maximum time the run is allowed to take before being killed. Five

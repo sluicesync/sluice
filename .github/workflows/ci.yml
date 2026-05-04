@@ -153,10 +153,12 @@ jobs:
           go-version-file: "go.mod"
       - uses: golangci/golangci-lint-action@v6
         with:
-          # 'latest' tracks the most recent stable release of golangci-lint.
-          # If lint becomes flaky after an upstream release, pin a version
-          # here (e.g. v1.59.0) until the issue is resolved.
-          version: latest
+          # Pinned to the v1 line because .golangci.yml is still in v1
+          # schema. golangci-lint v2 (released early 2026) reworked the
+          # config layout; migrating is a follow-up. Until then, "latest"
+          # would resolve to v2 and fail the lint step with
+          # `unsupported version of the configuration: ""`.
+          version: v1.64.8
           # install-mode: goinstall compiles golangci-lint from source
           # using the Go toolchain we just installed, so the linter's
           # embedded type-checker matches the Go version declared in
