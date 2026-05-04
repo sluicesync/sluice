@@ -87,6 +87,27 @@ type Migrator struct {
 	// indexes, constraints) so each phase consumes the pruned
 	// schema implicitly.
 	Filter TableFilter
+
+	// Resume, when true, picks up where a previously-failed
+	// migration with the same MigrationID left off. Reads the
+	// per-target sluice_migrate_state row, branches on phase, and
+	// skips work already recorded as complete. See
+	// internal/pipeline/resume.go for the full design rationale.
+	//
+	// Default false preserves the v0.2.x semantics: a fresh run
+	// against a target with no state row writes a new row and
+	// runs every phase. A run against a target with an existing
+	// non-complete state row errors out — operators must
+	// explicitly opt into resume rather than silently overwriting.
+	Resume bool
+
+	// MigrationID is the stable identifier under which state is
+	// persisted on the target. When empty, an ID is auto-derived
+	// from source/target engine names plus DSN host info — same
+	// shape Streamer.resolveStreamID uses for stream IDs. Operators
+	// who need stable identity across DSN changes (DNS shifts, host
+	// renames) should pass --migration-id explicitly.
+	MigrationID string
 }
 
 // Run executes the migration. Returns nil on success or a wrapped
@@ -137,41 +158,106 @@ func (m *Migrator) Run(ctx context.Context) error {
 		return m.logPlan(ctx, schema)
 	}
 
+	// ---- 1.75. Open the migration-state store (if the target engine
+	// supports it) and resolve the migration_id. ----
+	rc, state, exitClean, err := m.openResumeContext(ctx)
+	if err != nil {
+		return err
+	}
+	if exitClean {
+		// already-complete with --resume → log handled in
+		// loadOrInitState; nothing else to do.
+		return nil
+	}
+	if rc.enabled {
+		defer closeIf(rc.store)
+	}
+	resuming := m.Resume && rc.enabled
+
 	// ---- 2. Open target writers ----
 	sw, err := m.Target.OpenSchemaWriter(ctx, m.TargetDSN)
 	if err != nil {
-		return wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: open target schema writer: %w", err))
+		return wrapWithHint(PhaseConnect, markFailed(ctx, rc, state, ir.MigrationPhasePending,
+			fmt.Errorf("pipeline: open target schema writer: %w", err)))
 	}
 	defer closeIf(sw)
 
 	rw, err := m.Target.OpenRowWriter(ctx, m.TargetDSN)
 	if err != nil {
-		return wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: open target row writer: %w", err))
+		return wrapWithHint(PhaseConnect, markFailed(ctx, rc, state, ir.MigrationPhasePending,
+			fmt.Errorf("pipeline: open target row writer: %w", err)))
 	}
 	defer closeIf(rw)
 
 	// ---- 3-6. Schema apply (phase 1) → bulk copy → indexes → constraints.
 	rr, err := m.Source.OpenRowReader(ctx, m.SourceDSN)
 	if err != nil {
-		return wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: open source row reader: %w", err))
+		return wrapWithHint(PhaseConnect, markFailed(ctx, rc, state, ir.MigrationPhasePending,
+			fmt.Errorf("pipeline: open source row reader: %w", err)))
 	}
 	defer closeIf(rr)
 
-	if err := runBulkCopy(ctx, schema, rr, sw, rw); err != nil {
+	if resuming {
+		logResumeStart(ctx, state, schema)
+	}
+
+	if err := runBulkCopyPhases(ctx, rc, &state, schema, rr, sw, rw, resuming); err != nil {
 		return err
 	}
 
+	markComplete(ctx, rc, state)
 	slog.InfoContext(ctx, "migration complete", slog.Int("tables", len(schema.Tables)))
 	return nil
 }
 
+// openResumeContext resolves the migration_id, opens the per-target
+// state store (when the engine supports it), and decides whether to
+// short-circuit (already-complete + --resume) or proceed. The
+// returned (resumeContext, state, exitClean) tuple carries every
+// piece of state the rest of Run threads through phase boundaries.
+//
+// The only error path here is the "row found, refuse to overwrite"
+// branch and the "store open / table ensure" failures; both surface
+// before any target writers open so the operator gets a clean
+// refusal rather than a half-open connection set.
+func (m *Migrator) openResumeContext(ctx context.Context) (resumeContext, ir.MigrationState, bool, error) {
+	store, err := openMigrationStateStore(ctx, m.Target, m.TargetDSN)
+	if err != nil {
+		return resumeContext{}, ir.MigrationState{}, false, wrapWithHint(PhaseConnect, err)
+	}
+	rc := resumeContext{
+		store:       store,
+		migrationID: m.resolveMigrationID(),
+		enabled:     store != nil,
+	}
+	state, exitClean, err := loadOrInitState(ctx, rc, m.Resume)
+	if err != nil {
+		if rc.enabled {
+			closeIf(rc.store)
+		}
+		return resumeContext{}, ir.MigrationState{}, false, err
+	}
+	return rc, state, exitClean, nil
+}
+
+// resolveMigrationID returns the operator-supplied MigrationID when
+// non-empty, else an auto-derived value. Mirrors
+// Streamer.resolveStreamID's contract; see [deriveMigrationID] for
+// the hashing rationale.
+func (m *Migrator) resolveMigrationID() string {
+	if m.MigrationID != "" {
+		return m.MigrationID
+	}
+	return deriveMigrationID(m.Source.Name(), m.SourceDSN, m.Target.Name(), m.TargetDSN)
+}
+
 // runBulkCopy applies the shared phases that follow target-writer
-// open: schema phase 1 (tables without constraints) → bulk-copy of
-// every table → identity-sequence sync → schema phase 2 (indexes) →
-// schema phase 3 (foreign keys). Used by both [Migrator] (one-shot
-// mode) and [Streamer] (long-running mode); the only difference is
-// where `rows` comes from (engine-pool RowReader vs
-// [ir.SnapshotStream].Rows).
+// open with no resume awareness: schema phase 1 (tables without
+// constraints) → bulk-copy of every table → identity-sequence sync →
+// schema phase 2 (indexes) → schema phase 3 (foreign keys). Used by
+// the Streamer's cold-start path (which pre-dates the resume
+// feature). [Migrator] uses [runBulkCopyPhases] instead so the
+// per-phase boundaries can persist resume state.
 //
 // Phase 3.5 (identity-sequence sync) runs between bulk-copy and
 // indexes so the next user-initiated INSERT against an identity
@@ -206,6 +292,123 @@ func runBulkCopy(
 	if err := sw.CreateConstraints(ctx, schema); err != nil {
 		return wrapWithHint(PhaseConstraints, fmt.Errorf("pipeline: create constraints: %w", err))
 	}
+	return nil
+}
+
+// runBulkCopyPhases is the resume-aware variant of [runBulkCopy].
+// Each of the five phases is a state-update boundary: state.Phase
+// flips before the work runs, and on success the next iteration
+// inherits the updated phase. On failure, [markFailed] persists the
+// in-flight phase plus a truncated error message; the caller surfaces
+// the original error.
+//
+// Resume semantics per phase:
+//
+//   - tables:       re-run unconditionally (idempotent CREATE TABLE).
+//   - bulk_copy:    per-table classification (skip / truncate-redo /
+//     fresh) keyed off state.TableProgress.
+//   - identity_sync, indexes, constraints: re-run unconditionally.
+//     Idempotency is best-effort here; a CREATE INDEX with a clashing
+//     name will fail. Future iterations can pre-query catalog tables
+//     and skip pre-existing entries.
+func runBulkCopyPhases(
+	ctx context.Context,
+	rc resumeContext,
+	state *ir.MigrationState,
+	schema *ir.Schema,
+	rows ir.RowReader,
+	sw ir.SchemaWriter,
+	rw ir.RowWriter,
+	resuming bool,
+) error {
+	// Phase 1: tables.
+	if err := markPhase(ctx, rc, state, ir.MigrationPhaseTables); err != nil {
+		// Phase mark is non-fatal; continue with the data work.
+		_ = err
+	}
+	if err := sw.CreateTablesWithoutConstraints(ctx, schema); err != nil {
+		err = fmt.Errorf("pipeline: create tables: %w", err)
+		return wrapWithHint(PhaseSchemaApply, markFailed(ctx, rc, *state, ir.MigrationPhaseTables, err))
+	}
+	slog.InfoContext(ctx, "migration: phase complete", slog.String("phase", string(ir.MigrationPhaseTables)))
+
+	// Phase 2: bulk-copy. Per-table state-row updates here so a mid-
+	// phase failure preserves the partial progress map.
+	if err := markPhase(ctx, rc, state, ir.MigrationPhaseBulkCopy); err != nil {
+		_ = err
+	}
+	if state.TableProgress == nil {
+		state.TableProgress = map[string]ir.TableProgressState{}
+	}
+	for _, table := range schema.Tables {
+		action := classifyTableForResume(*state, table.Name, resuming)
+		switch action {
+		case resumeActionSkip:
+			slog.InfoContext(ctx, "migration: skipping completed table",
+				slog.String("table", table.Name))
+			continue
+		case resumeActionTruncate:
+			slog.InfoContext(ctx, "migration: truncating in-progress table for resume",
+				slog.String("table", table.Name))
+			if err := truncateForResume(ctx, rw, table); err != nil {
+				wrapped := fmt.Errorf("pipeline: truncate before resume: %w", err)
+				return wrapWithHint(PhaseBulkCopy, markFailed(ctx, rc, *state, ir.MigrationPhaseBulkCopy, wrapped))
+			}
+		}
+
+		// Mark this table in-progress before the copy starts so a
+		// subsequent failure leaves the right breadcrumb.
+		state.TableProgress[table.Name] = ir.TableProgressInProgress
+		if err := writeState(ctx, rc, *state); err != nil {
+			slog.WarnContext(ctx, "migration: per-table state write failed; continuing",
+				slog.String("table", table.Name),
+				slog.String("err", err.Error()))
+		}
+
+		if err := copyTable(ctx, rows, rw, table); err != nil {
+			wrapped := fmt.Errorf("pipeline: copy table %q: %w", table.Name, err)
+			return wrapWithHint(PhaseBulkCopy, markFailed(ctx, rc, *state, ir.MigrationPhaseBulkCopy, wrapped))
+		}
+
+		state.TableProgress[table.Name] = ir.TableProgressComplete
+		if err := writeState(ctx, rc, *state); err != nil {
+			slog.WarnContext(ctx, "migration: per-table state write failed; continuing",
+				slog.String("table", table.Name),
+				slog.String("err", err.Error()))
+		}
+	}
+	slog.InfoContext(ctx, "migration: phase complete", slog.String("phase", string(ir.MigrationPhaseBulkCopy)))
+
+	// Phase 3.5: identity sync.
+	if err := markPhase(ctx, rc, state, ir.MigrationPhaseIdentitySync); err != nil {
+		_ = err
+	}
+	if err := sw.SyncIdentitySequences(ctx, schema); err != nil {
+		err = fmt.Errorf("pipeline: sync identity sequences: %w", err)
+		return wrapWithHint(PhaseSchemaApply, markFailed(ctx, rc, *state, ir.MigrationPhaseIdentitySync, err))
+	}
+	slog.InfoContext(ctx, "migration: phase complete", slog.String("phase", string(ir.MigrationPhaseIdentitySync)))
+
+	// Phase 4: indexes.
+	if err := markPhase(ctx, rc, state, ir.MigrationPhaseIndexes); err != nil {
+		_ = err
+	}
+	if err := sw.CreateIndexes(ctx, schema); err != nil {
+		err = fmt.Errorf("pipeline: create indexes: %w", err)
+		return wrapWithHint(PhaseIndexes, markFailed(ctx, rc, *state, ir.MigrationPhaseIndexes, err))
+	}
+	slog.InfoContext(ctx, "migration: phase complete", slog.String("phase", string(ir.MigrationPhaseIndexes)))
+
+	// Phase 5: constraints.
+	if err := markPhase(ctx, rc, state, ir.MigrationPhaseConstraints); err != nil {
+		_ = err
+	}
+	if err := sw.CreateConstraints(ctx, schema); err != nil {
+		err = fmt.Errorf("pipeline: create constraints: %w", err)
+		return wrapWithHint(PhaseConstraints, markFailed(ctx, rc, *state, ir.MigrationPhaseConstraints, err))
+	}
+	slog.InfoContext(ctx, "migration: phase complete", slog.String("phase", string(ir.MigrationPhaseConstraints)))
+
 	return nil
 }
 

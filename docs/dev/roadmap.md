@@ -99,7 +99,7 @@ Not blocking v1 but worth tracking:
 - **Selective table inclusion / exclusion.** `--include-table users,posts` or `--exclude-table audit_log,sessions`. Glob patterns nice-to-have.
 - **Schema rename mapping.** Source schema `app` → target schema `webapp`. Useful for environments where naming differs. (The mappings YAML config covers some of this; surface it in flags too.)
 - **Type override config.** YAML hook for the user to say "treat MySQL `bigint(20) unsigned` in column X as Postgres `numeric(20)` regardless of default policy".
-- **Resume-from-partial-migration.** Right now if simple-mode fails halfway, the user has to drop the target and start over. A resume path that picks up where it left off (using a state table, much like CDC's) is a real operational improvement.
+- ~~**Resume-from-partial-migration.**~~ Landed in v0.3.x. `sluice migrate --resume --migration-id ID` reads the per-target `sluice_migrate_state` row and re-enters at the recorded phase; per-table progress is whole-table truncate-and-redo for v1 (per-batch checkpointing is a future enhancement). See ADR-0015 and `internal/pipeline/resume.go`.
 - **`sluice sync stop`.** A graceful stop that drains in-flight changes, persists the final position, and exits cleanly. Today operators Ctrl-C; a named command makes scripted operations tidier.
 
 ---

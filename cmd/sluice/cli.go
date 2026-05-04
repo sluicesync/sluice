@@ -84,6 +84,9 @@ type MigrateCmd struct {
 	ExcludeTable []string `help:"Migrate every table except these (comma-separated, repeatable). Glob patterns allowed. Mutually exclusive with --include-table." sep:"," placeholder:"TABLE"`
 
 	DryRun bool `help:"Read the source schema and print the migration plan without applying changes." short:"n"`
+
+	Resume      bool   `help:"Resume a previously-failed migration. State is read from sluice_migrate_state on the target." short:"r"`
+	MigrationID string `help:"Stable migration identifier; key in sluice_migrate_state. Auto-generated from source/target host info when empty." placeholder:"ID"`
 }
 
 // Run implements the migrate subcommand.
@@ -116,13 +119,15 @@ func (m *MigrateCmd) Run(g *Globals) error {
 	}
 
 	mig := &pipeline.Migrator{
-		Source:    source,
-		Target:    target,
-		SourceDSN: m.Source,
-		TargetDSN: m.Target,
-		DryRun:    m.DryRun,
-		Mappings:  cfg.Mappings,
-		Filter:    filter,
+		Source:      source,
+		Target:      target,
+		SourceDSN:   m.Source,
+		TargetDSN:   m.Target,
+		DryRun:      m.DryRun,
+		Mappings:    cfg.Mappings,
+		Filter:      filter,
+		Resume:      m.Resume,
+		MigrationID: m.MigrationID,
 	}
 	return mig.Run(kongContext())
 }
