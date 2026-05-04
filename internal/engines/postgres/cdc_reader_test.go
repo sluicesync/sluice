@@ -278,6 +278,128 @@ func TestDecodeTupleColumnCountMismatch(t *testing.T) {
 	}
 }
 
+// TestSynthesizeKeyOnlyBefore covers the REPLICA IDENTITY DEFAULT
+// path where pgoutput omits OldTuple on UPDATEs that don't modify
+// identity columns. Without this synthesis the applier would emit
+// "UPDATE t SET ... WHERE " (empty predicate) and Postgres rejects
+// with "syntax error at end of input" — see Bug 3 in the v0.1.0
+// findings.
+func TestSynthesizeKeyOnlyBefore(t *testing.T) {
+	rel := &relationCacheEntry{
+		Schema:          "public",
+		Name:            "users",
+		ReplicaIdentity: 'd',
+		Columns: []relationColumn{
+			{Name: "id", Type: ir.Integer{Width: 64}, KeyColumn: true},
+			{Name: "email", Type: ir.Varchar{Length: 255}, KeyColumn: false},
+			{Name: "active", Type: ir.Boolean{}, KeyColumn: false},
+		},
+	}
+	after := ir.Row{
+		"id":     int64(42),
+		"email":  "alice@example.com",
+		"active": true,
+	}
+	before, err := synthesizeKeyOnlyBefore(rel, after)
+	if err != nil {
+		t.Fatalf("synthesizeKeyOnlyBefore: %v", err)
+	}
+	want := ir.Row{"id": int64(42)}
+	if !reflect.DeepEqual(before, want) {
+		t.Errorf("\n got = %#v\nwant = %#v", before, want)
+	}
+}
+
+// TestSynthesizeKeyOnlyBeforeCompositeKey covers tables whose
+// identity is a multi-column key. All key columns must end up in
+// the synthesized Before, in the relation's column order (which
+// matches the table's PK ordering).
+func TestSynthesizeKeyOnlyBeforeCompositeKey(t *testing.T) {
+	rel := &relationCacheEntry{
+		Schema:          "public",
+		Name:            "memberships",
+		ReplicaIdentity: 'd',
+		Columns: []relationColumn{
+			{Name: "user_id", Type: ir.Integer{Width: 64}, KeyColumn: true},
+			{Name: "group_id", Type: ir.Integer{Width: 64}, KeyColumn: true},
+			{Name: "role", Type: ir.Text{Size: ir.TextLong}, KeyColumn: false},
+		},
+	}
+	after := ir.Row{
+		"user_id":  int64(7),
+		"group_id": int64(11),
+		"role":     "admin",
+	}
+	before, err := synthesizeKeyOnlyBefore(rel, after)
+	if err != nil {
+		t.Fatalf("synthesizeKeyOnlyBefore: %v", err)
+	}
+	want := ir.Row{"user_id": int64(7), "group_id": int64(11)}
+	if !reflect.DeepEqual(before, want) {
+		t.Errorf("\n got = %#v\nwant = %#v", before, want)
+	}
+}
+
+func TestSynthesizeKeyOnlyBeforeRejectsReplicaIdentityNothing(t *testing.T) {
+	rel := &relationCacheEntry{
+		Schema:          "public",
+		Name:            "logs",
+		ReplicaIdentity: 'n',
+		Columns: []relationColumn{
+			{Name: "id", Type: ir.Integer{Width: 64}, KeyColumn: true},
+		},
+	}
+	_, err := synthesizeKeyOnlyBefore(rel, ir.Row{"id": int64(1)})
+	if err == nil {
+		t.Fatal("expected error for REPLICA IDENTITY NOTHING")
+	}
+	if !strings.Contains(err.Error(), "REPLICA IDENTITY NOTHING") {
+		t.Errorf("error should name the misconfiguration; got %q", err.Error())
+	}
+}
+
+func TestSynthesizeKeyOnlyBeforeRejectsNoKeyColumns(t *testing.T) {
+	rel := &relationCacheEntry{
+		Schema:          "public",
+		Name:            "events",
+		ReplicaIdentity: 'd',
+		Columns: []relationColumn{
+			{Name: "id", Type: ir.Integer{Width: 64}, KeyColumn: false},
+			{Name: "kind", Type: ir.Text{Size: ir.TextLong}, KeyColumn: false},
+		},
+	}
+	_, err := synthesizeKeyOnlyBefore(rel, ir.Row{"id": int64(1), "kind": "x"})
+	if err == nil {
+		t.Fatal("expected error when relation has no identity columns")
+	}
+	if !strings.Contains(err.Error(), "no identity-key columns") {
+		t.Errorf("error should name the missing identity; got %q", err.Error())
+	}
+}
+
+func TestSynthesizeKeyOnlyBeforeRejectsMissingKeyValue(t *testing.T) {
+	// A key column declared on the relation but absent from the
+	// after-tuple should fail loudly — pgoutput shouldn't produce
+	// this shape, but if it ever does we'd rather surface the
+	// inconsistency than emit a WHERE that targets the wrong row.
+	rel := &relationCacheEntry{
+		Schema:          "public",
+		Name:            "users",
+		ReplicaIdentity: 'd',
+		Columns: []relationColumn{
+			{Name: "id", Type: ir.Integer{Width: 64}, KeyColumn: true},
+			{Name: "email", Type: ir.Varchar{Length: 255}, KeyColumn: false},
+		},
+	}
+	_, err := synthesizeKeyOnlyBefore(rel, ir.Row{"email": "alice@example.com"})
+	if err == nil {
+		t.Fatal("expected error when key column missing from after-tuple")
+	}
+	if !strings.Contains(err.Error(), "id") {
+		t.Errorf("error should name the missing column; got %q", err.Error())
+	}
+}
+
 func TestWithReplicationParam(t *testing.T) {
 	cases := []struct {
 		name string

@@ -443,17 +443,21 @@ func (r *CDCReader) emitUpdate(
 	if rel.Schema != r.schema {
 		return nil
 	}
+	after, err := decodeTuple(newTuple, rel.Columns)
+	if err != nil {
+		return fmt.Errorf("postgres: cdc: decode update.after for %s.%s: %w", rel.Schema, rel.Name, err)
+	}
 	var before ir.Row
 	if oldTuple != nil {
-		var err error
 		before, err = decodeTuple(oldTuple, rel.Columns)
 		if err != nil {
 			return fmt.Errorf("postgres: cdc: decode update.before for %s.%s: %w", rel.Schema, rel.Name, err)
 		}
-	}
-	after, err := decodeTuple(newTuple, rel.Columns)
-	if err != nil {
-		return fmt.Errorf("postgres: cdc: decode update.after for %s.%s: %w", rel.Schema, rel.Name, err)
+	} else {
+		before, err = synthesizeKeyOnlyBefore(rel, after)
+		if err != nil {
+			return fmt.Errorf("postgres: cdc: %w", err)
+		}
 	}
 	pos, err := r.positionAt(lsn)
 	if err != nil {
@@ -466,6 +470,53 @@ func (r *CDCReader) emitUpdate(
 		Before:   before,
 		After:    after,
 	})
+}
+
+// synthesizeKeyOnlyBefore builds a key-only Before image from the
+// after-tuple's identity-key columns. Used when pgoutput omits the
+// old tuple from an UPDATE message — under REPLICA IDENTITY DEFAULT
+// (and USING INDEX), the publisher omits OldTuple whenever the
+// UPDATE didn't change any of the identity-key columns. The Before
+// image is still required by the applier to construct a WHERE clause;
+// without this helper the applier would emit
+// "UPDATE t SET ... WHERE " with an empty predicate and Postgres
+// rejects with "syntax error at end of input".
+//
+// The post-image identity values are correct as a Before substitute
+// because, by construction, those columns are unchanged from the
+// row's pre-image (otherwise pgoutput would have included OldTuple).
+//
+// Errors loudly when the relation has REPLICA IDENTITY NOTHING (no
+// old tuple is ever emitted, regardless of column changes — UPDATEs
+// cannot be replicated) or when the relation has no identity-key
+// columns at all.
+func synthesizeKeyOnlyBefore(rel *relationCacheEntry, after ir.Row) (ir.Row, error) {
+	if rel.ReplicaIdentity == 'n' {
+		return nil, fmt.Errorf(
+			"update on %s.%s without identity: relation has REPLICA IDENTITY NOTHING; configure REPLICA IDENTITY DEFAULT, FULL, or USING INDEX before replicating UPDATEs",
+			rel.Schema, rel.Name)
+	}
+	before := make(ir.Row, len(rel.Columns))
+	keyCount := 0
+	for _, col := range rel.Columns {
+		if !col.KeyColumn {
+			continue
+		}
+		v, ok := after[col.Name]
+		if !ok {
+			return nil, fmt.Errorf(
+				"update on %s.%s: identity column %q missing from new tuple; cannot synthesize WHERE",
+				rel.Schema, rel.Name, col.Name)
+		}
+		before[col.Name] = v
+		keyCount++
+	}
+	if keyCount == 0 {
+		return nil, fmt.Errorf(
+			"update on %s.%s: relation has no identity-key columns (no PRIMARY KEY and no REPLICA IDENTITY index); cannot replicate UPDATE",
+			rel.Schema, rel.Name)
+	}
+	return before, nil
 }
 
 func (r *CDCReader) emitDelete(
