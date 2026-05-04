@@ -207,9 +207,10 @@ func (Engine) OpenChangeApplier(ctx context.Context, dsn string) (ir.ChangeAppli
 		return nil, err
 	}
 	return &ChangeApplier{
-		db:      db,
-		schema:  cfg.DBName,
-		pkCache: make(map[string][]string),
+		db:           db,
+		schema:       cfg.DBName,
+		pkCache:      make(map[string][]string),
+		colTypeCache: make(map[string]map[string]ir.Type),
 	}, nil
 }
 

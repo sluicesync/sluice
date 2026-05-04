@@ -15,6 +15,8 @@ package postgres
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
+	"reflect"
 	"sort"
 	"testing"
 	"time"
@@ -285,6 +287,111 @@ func TestChangeApplier_Truncate(t *testing.T) {
 	if got := countAllRows(t, dsn, "users"); got != 0 {
 		t.Errorf("after replay truncate: rows = %d; want 0", got)
 	}
+}
+
+// TestChangeApplier_JSONColumn is the PG-side mirror of the MySQL
+// applier's JSON regression test. PG / pgx doesn't surface the
+// `_binary` charset failure mode that drives Bug 6 on MySQL — pgx
+// inspects the per-column type metadata before binding — but the
+// structural fix is symmetric, and a regression here would still
+// indicate the applier's prepareValue routing has broken.
+//
+// The test feeds a JSONB-column Insert + Update + Delete with
+// hand-built ir.Change events whose values match what a PG CDC
+// reader emits ([]byte). Asserts that the destination row reflects
+// the events end-to-end.
+func TestChangeApplier_JSONColumn(t *testing.T) {
+	dsn, cleanup := startPostgresForApplier(t)
+	defer cleanup()
+
+	applyPGApplier(t, dsn, `
+		CREATE TABLE docs (
+			id   BIGINT PRIMARY KEY,
+			data JSONB  NOT NULL
+		);
+	`)
+
+	eng := Engine{}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	applier, err := eng.OpenChangeApplier(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenChangeApplier: %v", err)
+	}
+	defer func() {
+		if c, ok := applier.(interface{ Close() error }); ok {
+			_ = c.Close()
+		}
+	}()
+
+	insertedJSON := []byte(`{"k":"v","n":1}`)
+	pumpChanges(t, ctx, applier, []ir.Change{
+		ir.Insert{
+			Schema: "public", Table: "docs",
+			Row: ir.Row{"id": int64(1), "data": insertedJSON},
+		},
+	})
+	if got := selectJSONByID(t, dsn, 1); !jsonEqual(got, string(insertedJSON)) {
+		t.Fatalf("after insert: data = %q; want %q", got, string(insertedJSON))
+	}
+
+	updatedJSON := []byte(`{"k":"v2","n":2}`)
+	pumpChanges(t, ctx, applier, []ir.Change{
+		ir.Update{
+			Schema: "public", Table: "docs",
+			Before: ir.Row{"id": int64(1), "data": insertedJSON},
+			After:  ir.Row{"id": int64(1), "data": updatedJSON},
+		},
+	})
+	if got := selectJSONByID(t, dsn, 1); !jsonEqual(got, string(updatedJSON)) {
+		t.Fatalf("after update: data = %q; want %q", got, string(updatedJSON))
+	}
+
+	pumpChanges(t, ctx, applier, []ir.Change{
+		ir.Delete{
+			Schema: "public", Table: "docs",
+			Before: ir.Row{"id": int64(1), "data": updatedJSON},
+		},
+	})
+	if got := countAllRows(t, dsn, "docs"); got != 0 {
+		t.Errorf("after delete: rows = %d; want 0", got)
+	}
+}
+
+// selectJSONByID reads docs.data for the row with the given id.
+func selectJSONByID(t *testing.T, dsn string, id int64) string {
+	t.Helper()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	var out string
+	err = db.QueryRowContext(ctx, "SELECT data::text FROM docs WHERE id = $1", id).Scan(&out)
+	if err != nil {
+		t.Fatalf("select data: %v", err)
+	}
+	return out
+}
+
+// jsonEqual reports whether two JSON documents are semantically
+// equal. Postgres re-serialises stored JSON in canonical form (and
+// jsonb especially normalises key order), so byte-equal would
+// over-fail; comparing parsed maps avoids that.
+func jsonEqual(got, want string) bool {
+	var gotV, wantV any
+	if err := json.Unmarshal([]byte(got), &gotV); err != nil {
+		return false
+	}
+	if err := json.Unmarshal([]byte(want), &wantV); err != nil {
+		return false
+	}
+	return reflect.DeepEqual(gotV, wantV)
 }
 
 // ---- Test helpers ----

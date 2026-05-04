@@ -1,11 +1,36 @@
 package mysql
 
 import (
+	"bytes"
+	"context"
+	"log/slog"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/orware/sluice/internal/ir"
 )
+
+// fakeResult is a minimal [sql.Result] for unit-testing the
+// zero-rows-affected log helper without a database round-trip.
+type fakeResult struct {
+	rowsAffected int64
+}
+
+func (r fakeResult) LastInsertId() (int64, error) { return 0, nil }
+func (r fakeResult) RowsAffected() (int64, error) { return r.rowsAffected, nil }
+
+// captureSlog swaps slog.Default with a text handler writing into
+// buf for the duration of the test, restoring the previous default
+// on cleanup. Mirrors the helper in internal/pipeline/migrate_test.go.
+func captureSlog(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	prev := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	var buf bytes.Buffer
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	return &buf
+}
 
 // TestBuildInsertSQL covers both the upsert path (PK present) and
 // the plain-INSERT fallback (PK empty). Column order is sorted so
@@ -61,7 +86,7 @@ func TestBuildInsertSQL(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			gotSQL, gotArgs := buildInsertSQL(c.schema, c.table, c.row, c.pk)
+			gotSQL, gotArgs := buildInsertSQL(c.schema, c.table, c.row, c.pk, nil)
 			if gotSQL != c.wantSQL {
 				t.Errorf("\n got SQL: %q\nwant SQL: %q", gotSQL, c.wantSQL)
 			}
@@ -76,7 +101,7 @@ func TestBuildUpdateSQL(t *testing.T) {
 	before := ir.Row{"id": int64(7), "email": "old@example.com"}
 	after := ir.Row{"id": int64(7), "email": "new@example.com", "active": false}
 
-	gotSQL, gotArgs := buildUpdateSQL("src", "users", before, after)
+	gotSQL, gotArgs := buildUpdateSQL("src", "users", before, after, nil)
 	wantSQL := "UPDATE `src`.`users` SET `active` = ?, `email` = ?, `id` = ? WHERE `email` = ? AND `id` = ?"
 	if gotSQL != wantSQL {
 		t.Errorf("\n got: %q\nwant: %q", gotSQL, wantSQL)
@@ -90,7 +115,7 @@ func TestBuildUpdateSQL(t *testing.T) {
 
 func TestBuildDeleteSQL(t *testing.T) {
 	before := ir.Row{"id": int64(7), "email": "alice@example.com"}
-	gotSQL, gotArgs := buildDeleteSQL("src", "users", before)
+	gotSQL, gotArgs := buildDeleteSQL("src", "users", before, nil)
 	wantSQL := "DELETE FROM `src`.`users` WHERE `email` = ? AND `id` = ?"
 	if gotSQL != wantSQL {
 		t.Errorf("\n got: %q\nwant: %q", gotSQL, wantSQL)
@@ -119,7 +144,7 @@ func TestBuildWhereClause_NullHandling(t *testing.T) {
 		"email": nil, // NULL — must produce IS NULL, not = NULL
 		"name":  "alice",
 	}
-	gotSQL, gotArgs := buildWhereClause(row)
+	gotSQL, gotArgs := buildWhereClause(row, nil)
 	wantSQL := "`email` IS NULL AND `id` = ? AND `name` = ?"
 	if gotSQL != wantSQL {
 		t.Errorf("\n got: %q\nwant: %q", gotSQL, wantSQL)
@@ -133,7 +158,7 @@ func TestBuildWhereClause_NullHandling(t *testing.T) {
 
 func TestBuildSetClause(t *testing.T) {
 	row := ir.Row{"a": int64(1), "b": "x"}
-	gotSQL, gotArgs := buildSetClause(row)
+	gotSQL, gotArgs := buildSetClause(row, nil)
 	wantSQL := "`a` = ?, `b` = ?"
 	if gotSQL != wantSQL {
 		t.Errorf("\n got: %q\nwant: %q", gotSQL, wantSQL)
@@ -142,6 +167,146 @@ func TestBuildSetClause(t *testing.T) {
 	if !reflect.DeepEqual(gotArgs, wantArgs) {
 		t.Errorf("\n got args: %#v\nwant args: %#v", gotArgs, wantArgs)
 	}
+}
+
+// TestBuildInsertSQL_JSONColumnRoutesThroughPrepareValue is the
+// load-bearing check for Bug 6's loud-failure path: the applier
+// must convert []byte JSON values to string before binding so the
+// MySQL driver doesn't tag them with `_binary` charset on the wire.
+//
+// With colTypes nil (legacy callers), the raw []byte passes through
+// — preserving the old shape. With a populated map declaring the
+// column as ir.JSON, the value is the string form.
+func TestBuildInsertSQL_JSONColumnRoutesThroughPrepareValue(t *testing.T) {
+	row := ir.Row{
+		"id":   int64(1),
+		"data": []byte(`{"k":"v"}`),
+	}
+	colTypes := map[string]ir.Type{
+		"id":   ir.Integer{Width: 64},
+		"data": ir.JSON{Binary: true},
+	}
+
+	_, gotArgs := buildInsertSQL("src", "docs", row, []string{"id"}, colTypes)
+	// Sorted column order: data, id. data must be a string (not []byte).
+	if len(gotArgs) != 2 {
+		t.Fatalf("args length = %d; want 2", len(gotArgs))
+	}
+	got, ok := gotArgs[0].(string)
+	if !ok {
+		t.Fatalf("data arg is %T; want string (Bug 6 regression — JSON []byte was bound raw)", gotArgs[0])
+	}
+	if got != `{"k":"v"}` {
+		t.Errorf("data arg = %q; want %q", got, `{"k":"v"}`)
+	}
+}
+
+// TestBuildSetClause_JSONColumnRoutesThroughPrepareValue covers the
+// UPDATE SET path of Bug 6's loud failure.
+func TestBuildSetClause_JSONColumnRoutesThroughPrepareValue(t *testing.T) {
+	after := ir.Row{
+		"id":   int64(1),
+		"data": []byte(`{"k":"v"}`),
+	}
+	colTypes := map[string]ir.Type{
+		"id":   ir.Integer{Width: 64},
+		"data": ir.JSON{Binary: true},
+	}
+
+	_, gotArgs := buildSetClause(after, colTypes)
+	if len(gotArgs) != 2 {
+		t.Fatalf("args length = %d; want 2", len(gotArgs))
+	}
+	got, ok := gotArgs[0].(string)
+	if !ok {
+		t.Fatalf("data SET arg is %T; want string (Bug 6 regression)", gotArgs[0])
+	}
+	if got != `{"k":"v"}` {
+		t.Errorf("data SET arg = %q; want %q", got, `{"k":"v"}`)
+	}
+}
+
+// TestBuildWhereClause_JSONColumnRoutesThroughPrepareValue covers
+// Bug 6's silent failure: WHERE on a JSON-typed Before image must
+// (1) emit the value as string, not []byte, so the driver doesn't
+// tag it `_binary`; and (2) wrap the placeholder in CAST(? AS JSON)
+// so MySQL's equality operator does a JSON-vs-JSON comparison.
+// Either omission produces a predicate that silently matches zero
+// rows — the signature of the silent MySQL → MySQL divergence.
+func TestBuildWhereClause_JSONColumnRoutesThroughPrepareValue(t *testing.T) {
+	before := ir.Row{
+		"id":   int64(1),
+		"data": []byte(`{"k":"v"}`),
+	}
+	colTypes := map[string]ir.Type{
+		"id":   ir.Integer{Width: 64},
+		"data": ir.JSON{Binary: true},
+	}
+
+	gotSQL, gotArgs := buildWhereClause(before, colTypes)
+	wantSQL := "`data` = CAST(? AS JSON) AND `id` = ?"
+	if gotSQL != wantSQL {
+		t.Errorf("\n got SQL: %q\nwant SQL: %q (Bug 6: WHERE without CAST AS JSON silently matches zero rows)", gotSQL, wantSQL)
+	}
+	if len(gotArgs) != 2 {
+		t.Fatalf("args length = %d; want 2", len(gotArgs))
+	}
+	got, ok := gotArgs[0].(string)
+	if !ok {
+		t.Fatalf("data WHERE arg is %T; want string (Bug 6 regression — _binary charset would silently match zero rows)", gotArgs[0])
+	}
+	if got != `{"k":"v"}` {
+		t.Errorf("data WHERE arg = %q; want %q", got, `{"k":"v"}`)
+	}
+}
+
+// TestPrepareApplierValue_FallsBackOnMissingType: defensive — if
+// the cache is cold or the column is unknown, the raw value is
+// passed through unchanged. Same shape as the pre-Bug-6 behavior.
+func TestPrepareApplierValue_FallsBackOnMissingType(t *testing.T) {
+	raw := []byte(`{"k":"v"}`)
+	if got := prepareApplierValue(raw, nil, "data"); !reflect.DeepEqual(got, raw) {
+		t.Errorf("nil colTypes: got %#v; want raw value passthrough", got)
+	}
+	if got := prepareApplierValue(raw, map[string]ir.Type{}, "data"); !reflect.DeepEqual(got, raw) {
+		t.Errorf("missing colName: got %#v; want raw value passthrough", got)
+	}
+}
+
+// TestLogZeroRowsAffected verifies the debug-log signal that makes
+// Bug 6's silent-failure mode observable after the fact. Resume
+// idempotency depends on tolerating zero-rows-affected, so this
+// stays at debug level — but it must fire when the rows-affected
+// count is zero, so a future investigator has a footprint to grep.
+func TestLogZeroRowsAffected(t *testing.T) {
+	t.Run("zero rows fires debug log", func(t *testing.T) {
+		logs := captureSlog(t)
+		logZeroRowsAffected(context.Background(), "update", "src", "users", fakeResult{rowsAffected: 0})
+		out := logs.String()
+		if !strings.Contains(out, "zero rows affected") {
+			t.Errorf("log output missing zero-rows-affected marker:\n%s", out)
+		}
+		if !strings.Contains(out, "op=update") {
+			t.Errorf("log output missing op label: %s", out)
+		}
+		if !strings.Contains(out, "table=users") {
+			t.Errorf("log output missing table label: %s", out)
+		}
+	})
+	t.Run("non-zero rows is silent", func(t *testing.T) {
+		logs := captureSlog(t)
+		logZeroRowsAffected(context.Background(), "update", "src", "users", fakeResult{rowsAffected: 1})
+		if logs.Len() != 0 {
+			t.Errorf("log output should be empty when rows affected > 0; got: %s", logs.String())
+		}
+	})
+	t.Run("nil result is tolerated", func(t *testing.T) {
+		logs := captureSlog(t)
+		logZeroRowsAffected(context.Background(), "update", "src", "users", nil)
+		if logs.Len() != 0 {
+			t.Errorf("log output should be empty when result is nil; got: %s", logs.String())
+		}
+	})
 }
 
 // TestApplierSchema covers the small fallback rule. The applier's

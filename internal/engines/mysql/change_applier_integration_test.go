@@ -15,6 +15,8 @@ package mysql
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
+	"reflect"
 	"sort"
 	"testing"
 	"time"
@@ -302,6 +304,157 @@ func TestChangeApplier_Truncate(t *testing.T) {
 	if got := countAllRows(t, dsn, "target_db", "users"); got != 0 {
 		t.Errorf("after replay truncate: rows = %d; want 0", got)
 	}
+}
+
+// TestChangeApplier_JSONColumn is the regression test for Bug 6.
+//
+// Both manifestations of the bug share the same root cause: the
+// applier bound JSON values to the SQL statement without the
+// shaping the bulk-copy path uses.
+//
+//   - Loud (cross-engine PG → MySQL on Vitess/PlanetScale): the
+//     []byte image is labelled `_binary` charset on the wire, and
+//     Vitess rejects the INSERT with "Cannot create a JSON value
+//     from a string with CHARACTER SET 'binary'". Vanilla MySQL
+//     8.0 quietly accepts the same payload, which is why the loud
+//     path stays unobserved on a vanilla-only test environment.
+//   - Silent (MySQL → MySQL, including the test environment): the
+//     WHERE clause `data = ?` against a JSON column never matches —
+//     MySQL's equality operator does not implicitly cast the
+//     parameter to JSON, so the predicate returns zero rows
+//     regardless of whether the parameter is byte-identical to the
+//     stored document. The applier explicitly tolerates zero-rows-
+//     affected for resume idempotency and silently advances the
+//     position. The destination row stays stale forever —
+//     divergence with no error signal.
+//
+// The fix is two-part: (1) route the value through prepareValue so
+// JSON []byte arrives as string (eliminating the Vitess-specific
+// loud path), and (2) emit CAST(? AS JSON) in WHERE for JSON
+// columns so equality is JSON-vs-JSON rather than JSON-vs-string-
+// literal (eliminating the silent path on vanilla MySQL too). This
+// integration test exercises the silent path; the unit test for
+// buildWhereClause asserts the CAST shape, and the prepareValue
+// unit tests assert the []byte → string conversion.
+func TestChangeApplier_JSONColumn(t *testing.T) {
+	dsn, cleanup := startMySQLForApplier(t)
+	defer cleanup()
+
+	applyMySQLApplier(t, dsn, `
+		CREATE TABLE docs (
+			id   BIGINT NOT NULL AUTO_INCREMENT,
+			data JSON   NOT NULL,
+			PRIMARY KEY (id)
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+	`)
+
+	eng := Engine{Flavor: FlavorVanilla}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	applier, err := eng.OpenChangeApplier(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenChangeApplier: %v", err)
+	}
+	defer func() {
+		if c, ok := applier.(interface{ Close() error }); ok {
+			_ = c.Close()
+		}
+	}()
+
+	// Mode A (loud) — Insert with a JSON []byte payload. Pre-fix,
+	// MySQL rejects this with the _binary-charset error.
+	insertedJSON := []byte(`{"k":"v","n":1}`)
+	pumpChanges(t, ctx, applier, []ir.Change{
+		ir.Insert{
+			Schema: "target_db", Table: "docs",
+			Row: ir.Row{"id": int64(1), "data": insertedJSON},
+		},
+	})
+	if got := selectJSONByID(t, dsn, 1); !jsonEqual(got, string(insertedJSON)) {
+		t.Fatalf("after insert: data = %q; want %q", got, string(insertedJSON))
+	}
+
+	// Mode B (silent) — Update whose Before image carries the JSON
+	// column as []byte exactly the way a CDC reader emits it. Pre-
+	// fix, the predicate `WHERE data = ?` against a JSON column
+	// silently matches zero rows, because (a) the bound []byte is
+	// labelled `_binary` on the wire, and (b) MySQL's equality
+	// operator on a JSON-typed column never implicitly casts the
+	// right-hand side to JSON, so even a string-form parameter
+	// wouldn't match. The applier explicitly tolerates zero-rows-
+	// affected for resume idempotency and silently advances — the
+	// destination row stays stale forever. After the fix, the
+	// applier (a) routes the value through prepareValue → string,
+	// and (b) emits CAST(? AS JSON) on the right-hand side so the
+	// comparison is JSON-vs-JSON.
+	updatedJSON := []byte(`{"k":"v2","n":2}`)
+	pumpChanges(t, ctx, applier, []ir.Change{
+		ir.Update{
+			Schema: "target_db", Table: "docs",
+			Before: ir.Row{"id": int64(1), "data": insertedJSON},
+			After:  ir.Row{"id": int64(1), "data": updatedJSON},
+		},
+	})
+	if got := selectJSONByID(t, dsn, 1); !jsonEqual(got, string(updatedJSON)) {
+		t.Fatalf("after update: data = %q; want %q (Bug 6: WHERE on JSON column silently matched zero rows)", got, string(updatedJSON))
+	}
+
+	// Delete with the JSON column in the Before image — same WHERE-
+	// path as Update, same regression risk.
+	pumpChanges(t, ctx, applier, []ir.Change{
+		ir.Delete{
+			Schema: "target_db", Table: "docs",
+			Before: ir.Row{"id": int64(1), "data": updatedJSON},
+		},
+	})
+	if got := countAllRows(t, dsn, "target_db", "docs"); got != 0 {
+		t.Errorf("after delete: rows = %d; want 0 (Bug 6: WHERE on JSON column silently matched zero rows)", got)
+	}
+}
+
+// selectJSONByID reads docs.data for the row with the given id and
+// returns it as a string. Used by TestChangeApplier_JSONColumn to
+// assert that the destination JSON document matches expectations.
+func selectJSONByID(t *testing.T, dsn string, id int64) string {
+	t.Helper()
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	var out string
+	err = db.QueryRowContext(ctx, "SELECT data FROM docs WHERE id = ?", id).Scan(&out)
+	if err != nil {
+		t.Fatalf("select data: %v", err)
+	}
+	return out
+}
+
+// jsonEqual reports whether two JSON documents are semantically
+// equal. MySQL re-serialises stored JSON in canonical form, so a
+// byte-equal comparison would over-fail; comparing parsed maps
+// avoids that.
+func jsonEqual(got, want string) bool {
+	var gotV, wantV any
+	if err := jsonUnmarshalString(got, &gotV); err != nil {
+		return false
+	}
+	if err := jsonUnmarshalString(want, &wantV); err != nil {
+		return false
+	}
+	return reflect.DeepEqual(gotV, wantV)
+}
+
+// jsonUnmarshalString parses a JSON document held as a Go string
+// into v. Helper for jsonEqual; isolates the encoding/json
+// dependency so the helpers stay readable.
+func jsonUnmarshalString(s string, v any) error {
+	return json.Unmarshal([]byte(s), v)
 }
 
 // ---- Test helpers ----

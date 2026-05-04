@@ -5,10 +5,34 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 
 	"github.com/orware/sluice/internal/ir"
 )
+
+// # Bug-6 fix: route applier args through prepareValue
+//
+// The MySQL side of this fix has the load-bearing motivation (see
+// internal/engines/mysql/change_applier.go for the full write-up of
+// the JSON-column wire-format bug — both the loud PG → MySQL and the
+// silent MySQL → MySQL manifestations). The Postgres applier
+// historically didn't surface the same failure mode because pgx
+// inspects per-column type metadata before sending parameters, so
+// JSON values arrived correctly even without the shaping path.
+//
+// However, the structural omission was symmetric: the PG applier
+// also bypassed prepareValue, which means ir.Array values (canonical
+// []any) and ir.Geometry values (raw WKB needing EWKB framing) would
+// hit pgx in their IR shape rather than the driver-acceptable form
+// the bulk-copy path uses. Mirroring the MySQL fix here keeps the
+// two engines symmetric and inoculates the PG applier against the
+// same class of bug for any future IR type whose shaping is
+// non-trivial.
+//
+// As on the MySQL side, dispatch logs zero-rows-affected at debug
+// level for Update / Delete so the silent-divergence failure mode
+// has at least one observable footprint.
 
 // ChangeApplier applies [ir.Change] events to a Postgres target,
 // one source change per target transaction. It implements
@@ -52,6 +76,13 @@ type ChangeApplier struct {
 	// (length 0) means "table exists but has no PK" — in that case
 	// Insert falls back to plain INSERT (see the package comment).
 	pkCache map[string][]string
+
+	// colTypeCache maps "schema.table" → column-name → IR type. It
+	// is the input to prepareValue for every value the applier
+	// binds; see the file-header comment for the JSON-column bug
+	// the parallel MySQL fix exists to address. Populated lazily on
+	// the first sight of a table — same shape as pkCache.
+	colTypeCache map[string]map[string]ir.Type
 }
 
 // Close releases the underlying connection pool.
@@ -148,7 +179,14 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, c ir.Change) e
 		if err != nil {
 			return fmt.Errorf("postgres: applier: pk lookup for %s.%s: %w", schema, v.Table, err)
 		}
-		stmt, args := buildInsertSQL(schema, v.Table, v.Row, pk)
+		colTypes, err := a.colTypesFor(ctx, schema, v.Table)
+		if err != nil {
+			return fmt.Errorf("postgres: applier: column types for %s.%s: %w", schema, v.Table, err)
+		}
+		stmt, args, err := buildInsertSQL(schema, v.Table, v.Row, pk, colTypes)
+		if err != nil {
+			return fmt.Errorf("postgres: applier: build insert for %s.%s: %w", schema, v.Table, err)
+		}
 		if _, err := tx.ExecContext(ctx, stmt, args...); err != nil {
 			return fmt.Errorf("postgres: applier: insert into %s.%s: %w", schema, v.Table, err)
 		}
@@ -156,18 +194,40 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, c ir.Change) e
 
 	case ir.Update:
 		schema := applierSchema(a.schema, v.Schema)
-		stmt, args := buildUpdateSQL(schema, v.Table, v.Before, v.After)
-		if _, err := tx.ExecContext(ctx, stmt, args...); err != nil {
+		colTypes, err := a.colTypesFor(ctx, schema, v.Table)
+		if err != nil {
+			return fmt.Errorf("postgres: applier: column types for %s.%s: %w", schema, v.Table, err)
+		}
+		stmt, args, err := buildUpdateSQL(schema, v.Table, v.Before, v.After, colTypes)
+		if err != nil {
+			return fmt.Errorf("postgres: applier: build update for %s.%s: %w", schema, v.Table, err)
+		}
+		// Update misses are tolerated (zero rows affected) for resume
+		// idempotency; the same caveat as MySQL applies — see the
+		// MySQL applier's dispatch comment for the rationale and the
+		// debug-log defence-in-depth.
+		res, err := tx.ExecContext(ctx, stmt, args...)
+		if err != nil {
 			return fmt.Errorf("postgres: applier: update %s.%s: %w", schema, v.Table, err)
 		}
+		logZeroRowsAffected(ctx, "update", schema, v.Table, res)
 		return nil
 
 	case ir.Delete:
 		schema := applierSchema(a.schema, v.Schema)
-		stmt, args := buildDeleteSQL(schema, v.Table, v.Before)
-		if _, err := tx.ExecContext(ctx, stmt, args...); err != nil {
+		colTypes, err := a.colTypesFor(ctx, schema, v.Table)
+		if err != nil {
+			return fmt.Errorf("postgres: applier: column types for %s.%s: %w", schema, v.Table, err)
+		}
+		stmt, args, err := buildDeleteSQL(schema, v.Table, v.Before, colTypes)
+		if err != nil {
+			return fmt.Errorf("postgres: applier: build delete for %s.%s: %w", schema, v.Table, err)
+		}
+		res, err := tx.ExecContext(ctx, stmt, args...)
+		if err != nil {
 			return fmt.Errorf("postgres: applier: delete from %s.%s: %w", schema, v.Table, err)
 		}
+		logZeroRowsAffected(ctx, "delete", schema, v.Table, res)
 		return nil
 
 	case ir.Truncate:
@@ -179,6 +239,27 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, c ir.Change) e
 		return nil
 	}
 	return fmt.Errorf("postgres: applier: unknown change type %T", c)
+}
+
+// logZeroRowsAffected emits a debug-level log line when a target Exec
+// reports zero rows affected. Mirrors the MySQL applier's helper of
+// the same name; see that file for the full rationale (Bug-6 silent-
+// divergence visibility without violating resume idempotency).
+func logZeroRowsAffected(ctx context.Context, op, schema, table string, res sql.Result) {
+	if res == nil {
+		return
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return
+	}
+	if n == 0 {
+		slog.DebugContext(ctx, "postgres: applier: zero rows affected",
+			slog.String("op", op),
+			slog.String("schema", schema),
+			slog.String("table", table),
+		)
+	}
 }
 
 // pkFor returns the cached PK column list for the named table,
@@ -195,6 +276,164 @@ func (a *ChangeApplier) pkFor(ctx context.Context, tx *sql.Tx, schema, table str
 	}
 	a.pkCache[qn] = pk
 	return pk, nil
+}
+
+// colTypesFor returns the cached column-name → IR type map for the
+// named table, loading it on the first sight of the table. The map
+// is consulted for every value the applier binds so prepareValue can
+// shape Array / Geometry / future special-cased values for pgx.
+//
+// The lookup uses information_schema directly (the same source the
+// schema reader's populateColumns uses) and runs the existing
+// translateType to produce IR types — keeping the applier's view of
+// "what does this column hold" in lockstep with the rest of the
+// engine.
+func (a *ChangeApplier) colTypesFor(ctx context.Context, schema, table string) (map[string]ir.Type, error) {
+	qn := schema + "." + table
+	if cached, ok := a.colTypeCache[qn]; ok {
+		return cached, nil
+	}
+	out, err := loadColumnTypes(ctx, a.db, schema, table)
+	if err != nil {
+		return nil, err
+	}
+	a.colTypeCache[qn] = out
+	return out, nil
+}
+
+// loadColumnTypes queries information_schema for the column list of
+// schema.table and produces a column-name → IR type map. Mirrors
+// SchemaReader.populateColumns minus the index/FK/PK plumbing the
+// applier doesn't need.
+//
+// Enum-valued columns are resolved through readEnumValuesForSchema,
+// which loads the enum type values in the same call. Arrays of
+// supported scalar element types are also resolved. Geometry is left
+// without per-column subtype/SRID metadata — the applier doesn't
+// re-encode geometry on the write path's IR-Geometry → EWKB step
+// (that happens via prepareValue using the column's SRID, which here
+// defaults to 0; row_writer's PostGIS-aware path is the canonical
+// place to recover the SRID, and the applier does not currently do
+// so for replicated UPDATE/DELETE rows). When the cross-engine
+// PostGIS replication path lands we'll need to extend this to read
+// the geometry_columns view too.
+func loadColumnTypes(ctx context.Context, db *sql.DB, schema, table string) (map[string]ir.Type, error) {
+	enumValues, err := readEnumValuesForSchema(ctx, db, schema)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: applier: read enum values: %w", err)
+	}
+
+	const q = `
+		SELECT
+			column_name,
+			LOWER(data_type),
+			udt_name,
+			character_maximum_length,
+			numeric_precision,
+			numeric_scale,
+			datetime_precision,
+			is_identity,
+			column_default
+		FROM   information_schema.columns
+		WHERE  table_schema = $1
+		  AND  table_name   = $2
+		ORDER  BY ordinal_position`
+
+	rows, err := db.QueryContext(ctx, q, schema, table)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	out := map[string]ir.Type{}
+	for rows.Next() {
+		var (
+			colName, dataType, udtName string
+			charMaxLen, numPrec        sql.NullInt64
+			numScale, dtPrec           sql.NullInt64
+			isIdentity                 string
+			columnDefault              sql.NullString
+		)
+		if err := rows.Scan(
+			&colName, &dataType, &udtName,
+			&charMaxLen, &numPrec, &numScale, &dtPrec,
+			&isIdentity, &columnDefault,
+		); err != nil {
+			return nil, err
+		}
+
+		meta := columnMeta{
+			DataType:        dataType,
+			UDTName:         udtName,
+			CharMaxLen:      nullInt64ToPtr(charMaxLen),
+			NumPrec:         nullInt64ToPtr(numPrec),
+			NumScale:        nullInt64ToPtr(numScale),
+			DTPrec:          nullInt64ToPtr(dtPrec),
+			IsAutoIncrement: isAutoIncrement(isIdentity, columnDefault),
+		}
+		if dataType == "user-defined" || dataType == "USER-DEFINED" {
+			if values, ok := enumValues[udtName]; ok {
+				meta.EnumValues = values
+			}
+		}
+		if dataType == "array" || dataType == "ARRAY" {
+			elemDataType, ok := arrayElementDataType(udtName)
+			if !ok {
+				// Unknown array element types are surfaced (rather
+				// than silently passing through) for the same reason
+				// the schema reader surfaces them: an applier that
+				// can't shape the value will fail on the wire and the
+				// operator deserves a precise message.
+				return nil, fmt.Errorf("postgres: applier: array column %s.%s has unsupported element type %q", table, colName, udtName)
+			}
+			meta.ArrayElement = &columnMeta{
+				DataType: elemDataType,
+				UDTName:  strings.TrimPrefix(udtName, "_"),
+			}
+		}
+
+		typ, err := translateType(meta)
+		if err != nil {
+			return nil, fmt.Errorf("postgres: applier: translate %s.%s: %w", table, colName, err)
+		}
+		out[colName] = typ
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("postgres: applier: table %s.%s has no columns (does it exist?)", schema, table)
+	}
+	return out, nil
+}
+
+// readEnumValuesForSchema is the standalone variant of
+// SchemaReader.readEnumValues — same query, no receiver, callable
+// from the applier without instantiating a SchemaReader.
+func readEnumValuesForSchema(ctx context.Context, db *sql.DB, schema string) (map[string][]string, error) {
+	const q = `
+		SELECT t.typname, e.enumlabel
+		FROM   pg_enum e
+		JOIN   pg_type t      ON t.oid = e.enumtypid
+		JOIN   pg_namespace n ON n.oid = t.typnamespace
+		WHERE  n.nspname = $1
+		ORDER  BY t.typname, e.enumsortorder`
+
+	rows, err := db.QueryContext(ctx, q, schema)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	out := map[string][]string{}
+	for rows.Next() {
+		var typname, label string
+		if err := rows.Scan(&typname, &label); err != nil {
+			return nil, err
+		}
+		out[typname] = append(out[typname], label)
+	}
+	return out, rows.Err()
 }
 
 // applierSchema picks the schema name to use in SQL. The applier's
@@ -257,13 +496,23 @@ func loadPrimaryKey(ctx context.Context, tx *sql.Tx, schema, table string) ([]st
 // With an empty PK list (tables without a PRIMARY KEY), falls back
 // to a plain INSERT — see the ChangeApplier package doc for the
 // resume-idempotency caveat.
-func buildInsertSQL(schema, table string, row ir.Row, pk []string) (sqlStmt string, args []any) {
+//
+// colTypes maps column names to their IR types and is the input to
+// prepareValue. A missing entry (nil map, or column not present) is
+// tolerated and the raw value is bound — preserving the pre-Bug-6
+// shape so unit tests without a populated cache still produce valid
+// SQL.
+func buildInsertSQL(schema, table string, row ir.Row, pk []string, colTypes map[string]ir.Type) (sqlStmt string, args []any, err error) {
 	cols := sortedKeys(row)
 	args = make([]any, 0, len(cols))
 	colSQL := make([]string, len(cols))
 	for i, c := range cols {
 		colSQL[i] = quoteIdent(c)
-		args = append(args, row[c])
+		v, perr := prepareApplierValue(row[c], colTypes, c)
+		if perr != nil {
+			return "", nil, fmt.Errorf("column %q: %w", c, perr)
+		}
+		args = append(args, v)
 	}
 
 	tableRef := quoteIdent(schema) + "." + quoteIdent(table)
@@ -315,30 +564,39 @@ func buildInsertSQL(schema, table string, row ir.Row, pk []string) (sqlStmt stri
 			sb.WriteString(" DO NOTHING")
 		}
 	}
-	return sb.String(), args
+	return sb.String(), args, nil
 }
 
 // buildUpdateSQL builds an UPDATE statement. SET uses every column
 // in After (unchanged-column detection is a v1.5 optimization).
 // WHERE uses every column in Before with NULL-aware predicate
 // building.
-func buildUpdateSQL(schema, table string, before, after ir.Row) (sqlStmt string, args []any) {
+func buildUpdateSQL(schema, table string, before, after ir.Row, colTypes map[string]ir.Type) (sqlStmt string, args []any, err error) {
 	tableRef := quoteIdent(schema) + "." + quoteIdent(table)
-	setSQL, setArgs := buildSetClause(after, 1)
-	whereSQL, whereArgs := buildWhereClause(before, len(setArgs)+1)
+	setSQL, setArgs, err := buildSetClause(after, 1, colTypes)
+	if err != nil {
+		return "", nil, err
+	}
+	whereSQL, whereArgs, err := buildWhereClause(before, len(setArgs)+1, colTypes)
+	if err != nil {
+		return "", nil, err
+	}
 
 	args = make([]any, 0, len(setArgs)+len(whereArgs))
 	args = append(args, setArgs...)
 	args = append(args, whereArgs...)
-	return "UPDATE " + tableRef + " SET " + setSQL + " WHERE " + whereSQL, args
+	return "UPDATE " + tableRef + " SET " + setSQL + " WHERE " + whereSQL, args, nil
 }
 
 // buildDeleteSQL builds a DELETE statement using the Before image
 // as the WHERE predicate.
-func buildDeleteSQL(schema, table string, before ir.Row) (sqlStmt string, args []any) {
+func buildDeleteSQL(schema, table string, before ir.Row, colTypes map[string]ir.Type) (sqlStmt string, args []any, err error) {
 	tableRef := quoteIdent(schema) + "." + quoteIdent(table)
-	whereSQL, whereArgs := buildWhereClause(before, 1)
-	return "DELETE FROM " + tableRef + " WHERE " + whereSQL, whereArgs
+	whereSQL, whereArgs, err := buildWhereClause(before, 1, colTypes)
+	if err != nil {
+		return "", nil, err
+	}
+	return "DELETE FROM " + tableRef + " WHERE " + whereSQL, whereArgs, nil
 }
 
 // buildTruncateSQL builds a TRUNCATE TABLE statement.
@@ -350,22 +608,26 @@ func buildTruncateSQL(schema, table string) string {
 // startIdx is the next available placeholder number — Postgres uses
 // numbered placeholders (unlike MySQL's `?`), so a SET + WHERE
 // combination needs to share a sequence.
-func buildSetClause(row ir.Row, startIdx int) (clause string, args []any) {
+func buildSetClause(row ir.Row, startIdx int, colTypes map[string]ir.Type) (clause string, args []any, err error) {
 	cols := sortedKeys(row)
 	parts := make([]string, len(cols))
 	args = make([]any, 0, len(cols))
 	for i, c := range cols {
 		parts[i] = fmt.Sprintf("%s = $%d", quoteIdent(c), startIdx+i)
-		args = append(args, row[c])
+		v, perr := prepareApplierValue(row[c], colTypes, c)
+		if perr != nil {
+			return "", nil, fmt.Errorf("column %q: %w", c, perr)
+		}
+		args = append(args, v)
 	}
-	return strings.Join(parts, ", "), args
+	return strings.Join(parts, ", "), args, nil
 }
 
 // buildWhereClause renders an AND-joined predicate with NULL-aware
 // handling: nil row values produce "col IS NULL" (no parameter) so
 // SQL's NULL semantics don't make the predicate unsatisfiable.
 // startIdx is the next available placeholder number.
-func buildWhereClause(row ir.Row, startIdx int) (clause string, args []any) {
+func buildWhereClause(row ir.Row, startIdx int, colTypes map[string]ir.Type) (clause string, args []any, err error) {
 	cols := sortedKeys(row)
 	parts := make([]string, 0, len(cols))
 	args = make([]any, 0, len(cols))
@@ -377,10 +639,34 @@ func buildWhereClause(row ir.Row, startIdx int) (clause string, args []any) {
 			continue
 		}
 		parts = append(parts, fmt.Sprintf("%s = $%d", quoteIdent(c), idx))
-		args = append(args, v)
+		prepared, perr := prepareApplierValue(v, colTypes, c)
+		if perr != nil {
+			return "", nil, fmt.Errorf("column %q: %w", c, perr)
+		}
+		args = append(args, prepared)
 		idx++
 	}
-	return strings.Join(parts, " AND "), args
+	return strings.Join(parts, " AND "), args, nil
+}
+
+// prepareApplierValue is the applier's wrapper around prepareValue.
+// It looks up the column's IR type and routes the value through the
+// shared shaping helper from row_writer.go. When the column isn't in
+// the map (cache cold or column unknown — defensive), it falls back
+// to the raw value, preserving the pre-Bug-6 shape.
+//
+// Routing through the shared helper keeps any future shaping rules
+// added to prepareValue (for new IR types or new corner cases)
+// automatically picked up by the applier without touching this file.
+func prepareApplierValue(v any, colTypes map[string]ir.Type, colName string) (any, error) {
+	if colTypes == nil {
+		return v, nil
+	}
+	t, ok := colTypes[colName]
+	if !ok {
+		return v, nil
+	}
+	return prepareValue(v, t)
 }
 
 // (sortedKeys is shared with the schema reader — see schema_reader.go
