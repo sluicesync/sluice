@@ -15,7 +15,7 @@ require (
 	github.com/testcontainers/testcontainers-go v0.42.0
 	github.com/testcontainers/testcontainers-go/modules/mysql v0.42.0
 	github.com/testcontainers/testcontainers-go/modules/postgres v0.42.0
-	google.golang.org/grpc v1.80.0
+	google.golang.org/grpc v1.81.0
 	vitess.io/vitess v0.24.0
 )
 
