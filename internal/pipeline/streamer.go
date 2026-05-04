@@ -154,14 +154,47 @@ func (s *Streamer) Run(ctx context.Context) error {
 	// The dispatch-side filter wraps `changes` with a goroutine
 	// that drops events whose qualified name doesn't pass the
 	// filter. No-op pass-through when the filter is empty.
-	filtered := filterChanges(ctx, changes, s.Filter)
-	if err := applier.Apply(ctx, streamID, filtered); err != nil {
+	//
+	// applyCtx is the context the apply loop sees. It's a child of
+	// the caller's ctx, plus an extra cancel hook the stop-signal
+	// poll goroutine can pull. Cancelling applyCtx triggers the
+	// applier's existing context.Canceled return path (which the
+	// loop below treats as "clean exit" — same shape as a Ctrl-C).
+	applyCtx, cancelApply := context.WithCancel(ctx)
+	defer cancelApply()
+	s.startStopSignalPoll(applyCtx, applier, streamID, cancelApply)
+
+	filtered := filterChanges(applyCtx, changes, s.Filter)
+	if err := applier.Apply(applyCtx, streamID, filtered); err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return nil
 		}
 		return wrapWithHint(PhaseCDC, fmt.Errorf("pipeline: apply changes: %w", err))
 	}
 	return nil
+}
+
+// startStopSignalPoll wires the optional stop-signal poll goroutine
+// when the applier supports it. The goroutine reads the control
+// row's stop flag every few seconds; when set, it cancels applyCtx
+// so the apply loop drains the in-flight change and exits cleanly.
+//
+// Test stubs that don't implement stopFlagReader skip the poll
+// entirely — the existing Ctrl-C / ctx-cancel path remains the only
+// way to stop those streams, which matches their pre-stop-signal
+// behavior.
+func (s *Streamer) startStopSignalPoll(applyCtx context.Context, applier ir.ChangeApplier, streamID string, cancelApply context.CancelFunc) {
+	reader, ok := applier.(stopFlagReader)
+	if !ok {
+		slog.DebugContext(applyCtx, "stop-signal poll skipped: applier does not implement ReadStopRequested",
+			slog.String("stream_id", streamID),
+		)
+		return
+	}
+	slog.DebugContext(applyCtx, "stop-signal poll started",
+		slog.String("stream_id", streamID),
+	)
+	go pollStopSignal(applyCtx, reader, streamID, cancelApply)
 }
 
 // logDryRunPlan describes what Run would do without doing it via
