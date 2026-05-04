@@ -121,6 +121,31 @@ func (a *ChangeApplier) ListStreams(ctx context.Context) ([]ir.StreamStatus, err
 	return listStreams(ctx, a.db, a.schema, engineNamePostgres)
 }
 
+// RequestStop flips the stop flag on the named stream's row. The
+// running [pipeline.Streamer] polls this column every few seconds
+// and exits cleanly once it observes a non-NULL value. Idempotent —
+// repeated calls land the same flag.
+//
+// Returns an error wrapping [errStreamNotFound] when no row exists
+// for streamID; the CLI's `sync stop` branches on it to surface a
+// friendly "no stream X on target" message.
+func (a *ChangeApplier) RequestStop(ctx context.Context, streamID string) error {
+	if streamID == "" {
+		return errors.New("postgres: applier: RequestStop: streamID is empty")
+	}
+	return requestStop(ctx, a.db, a.schema, streamID)
+}
+
+// ReadStopRequested returns true when the named stream's row has a
+// non-NULL stop_requested_at column. The pipeline's Streamer poll
+// goroutine consults this method via a structural interface (the
+// internal pipeline.stopFlagReader). Exported because Go's method-
+// set rules require an exported method to satisfy an interface from
+// another package — even when that interface is itself unexported.
+func (a *ChangeApplier) ReadStopRequested(ctx context.Context, streamID string) (bool, error) {
+	return readStopRequested(ctx, a.db, a.schema, streamID)
+}
+
 // Apply consumes changes from the channel and applies each to the
 // target in its own transaction. The position write happens inside
 // the same transaction as the data write (per ADR-0007); a crash

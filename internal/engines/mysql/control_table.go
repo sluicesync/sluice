@@ -27,17 +27,51 @@ const controlTableName = "sluice_cdc_state"
 // MySQL does not allow CREATE TABLE inside an explicit transaction
 // (DDL implicit-commits), so callers run this from the *sql.DB pool
 // at applier startup, not inside the per-change tx.
+//
+// stop_requested_at is added via a detect-then-ALTER on existing
+// tables. ADD COLUMN IF NOT EXISTS landed in MySQL 8.0.29; sluice
+// supports 8.0+ broadly, so the conservative path queries
+// information_schema.COLUMNS first and only ALTERs when the column
+// is missing. Existing rows keep their data; the new column starts
+// NULL.
 func ensureControlTable(ctx context.Context, db *sql.DB) error {
 	const ddl = `
 		CREATE TABLE IF NOT EXISTS ` + "`" + controlTableName + "`" + ` (
-			stream_id       VARCHAR(255) NOT NULL,
-			source_position TEXT         NOT NULL,
-			updated_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP
+			stream_id         VARCHAR(255) NOT NULL,
+			source_position   TEXT         NOT NULL,
+			updated_at        TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP
 				ON UPDATE CURRENT_TIMESTAMP,
+			stop_requested_at TIMESTAMP    NULL,
 			PRIMARY KEY (stream_id)
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
 	if _, err := db.ExecContext(ctx, ddl); err != nil {
 		return fmt.Errorf("mysql: ensure control table: %w", err)
+	}
+	return ensureStopRequestedColumn(ctx, db)
+}
+
+// ensureStopRequestedColumn adds the stop_requested_at column to an
+// existing control table when missing. Detect-then-ALTER avoids the
+// MySQL 8.0.29 floor that ADD COLUMN IF NOT EXISTS would impose;
+// sluice broadly supports 8.0+. The lookup uses DATABASE() so the
+// query naturally scopes to the connection's default database.
+func ensureStopRequestedColumn(ctx context.Context, db *sql.DB) error {
+	const checkQ = `
+		SELECT COUNT(*)
+		FROM   information_schema.COLUMNS
+		WHERE  TABLE_SCHEMA = DATABASE()
+		  AND  TABLE_NAME   = ?
+		  AND  COLUMN_NAME  = 'stop_requested_at'`
+	var n int
+	if err := db.QueryRowContext(ctx, checkQ, controlTableName).Scan(&n); err != nil {
+		return fmt.Errorf("mysql: ensure control table: detect stop_requested_at: %w", err)
+	}
+	if n > 0 {
+		return nil
+	}
+	const alter = "ALTER TABLE `" + controlTableName + "` ADD COLUMN stop_requested_at TIMESTAMP NULL"
+	if _, err := db.ExecContext(ctx, alter); err != nil {
+		return fmt.Errorf("mysql: ensure control table: add stop_requested_at: %w", err)
 	}
 	return nil
 }
@@ -124,7 +158,9 @@ func isMySQLMissingTableErr(err error) bool {
 // together.
 //
 // Uses the row-alias UPSERT form (MySQL 8.0.20+) for consistency
-// with the data-write Insert path.
+// with the data-write Insert path. stop_requested_at is left
+// untouched: a position write is the streamer making forward
+// progress, which must not clear an in-flight stop request.
 func writePositionTx(ctx context.Context, tx *sql.Tx, streamID, token string) error {
 	const q = "INSERT INTO `" + controlTableName + "` (stream_id, source_position) VALUES (?, ?) " +
 		"AS new ON DUPLICATE KEY UPDATE source_position = new.source_position"
@@ -133,3 +169,72 @@ func writePositionTx(ctx context.Context, tx *sql.Tx, streamID, token string) er
 	}
 	return nil
 }
+
+// readStopRequested returns true when the named stream's row has a
+// non-NULL stop_requested_at column. Tolerant of the table being
+// absent (returns false, nil) so polling-loop startup races don't
+// surface as errors.
+//
+// Returns (false, nil) when the row doesn't exist — a stop signal
+// that hasn't been recorded is, by definition, not present. The
+// Streamer's poll loop calls this every few seconds via the
+// receiver method on ChangeApplier; the lint pass can't see that
+// cross-package usage, hence the nolint.
+//
+//nolint:unused // called by pipeline poll loop via ChangeApplier receiver
+func readStopRequested(ctx context.Context, db *sql.DB, streamID string) (bool, error) {
+	const q = "SELECT stop_requested_at IS NOT NULL FROM `" + controlTableName + "` WHERE stream_id = ?"
+	var stopRequested bool
+	err := db.QueryRowContext(ctx, q, streamID).Scan(&stopRequested)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return false, nil
+	case isMySQLMissingTableErr(err):
+		return false, nil
+	case err != nil:
+		return false, fmt.Errorf("mysql: read stop flag: %w", err)
+	}
+	return stopRequested, nil
+}
+
+// requestStop flips the stop flag on the named stream's row. Returns
+// errStreamNotFound when no row exists (the operator likely typoed
+// the stream ID; the CLI surfaces a friendly message).
+//
+// Idempotent: repeated calls land the same flag (the timestamp
+// updates, but the streamer treats any non-NULL value as "stop
+// requested" so the repeat is harmless). updated_at is left alone
+// so the "age" column in `sync status` continues to reflect real
+// apply activity rather than stop-request bookkeeping.
+//
+// Implementation note: MySQL's go-sql-driver reports RowsAffected
+// using `changed-rows` semantics by default — a UPDATE that touches
+// the same row with the same new value reports 0 rows affected
+// rather than 1. That makes "rows affected = 0 means missing row"
+// unreliable for our idempotency contract. We use a SELECT-then-
+// UPDATE pair instead. The two queries don't need to be in a
+// transaction: the UPDATE is itself atomic, and a stream row can
+// only be inserted by the streamer's writePositionTx, which races
+// don't matter for here (a transient missing row → operator retry
+// → success).
+func requestStop(ctx context.Context, db *sql.DB, streamID string) error {
+	const existsQ = "SELECT 1 FROM `" + controlTableName + "` WHERE stream_id = ?"
+	var dummy int
+	switch err := db.QueryRowContext(ctx, existsQ, streamID).Scan(&dummy); {
+	case errors.Is(err, sql.ErrNoRows):
+		return fmt.Errorf("%w: %q", errStreamNotFound, streamID)
+	case err != nil:
+		return fmt.Errorf("mysql: request stop: existence check: %w", err)
+	}
+	const updateQ = "UPDATE `" + controlTableName + "` SET stop_requested_at = CURRENT_TIMESTAMP WHERE stream_id = ?"
+	if _, err := db.ExecContext(ctx, updateQ, streamID); err != nil {
+		return fmt.Errorf("mysql: request stop: %w", err)
+	}
+	return nil
+}
+
+// errStreamNotFound is returned by [requestStop] (and thus
+// [ChangeApplier.RequestStop]) when no row matches the requested
+// stream_id. The CLI string-matches the wrapped engine error rather
+// than importing this sentinel, mirroring the slot-not-found shape.
+var errStreamNotFound = errors.New("mysql: stream not found")

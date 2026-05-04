@@ -93,6 +93,23 @@ type ChangeApplier interface {
 	// transaction as the data write — atomicity guarantees that
 	// progress and data move together.
 	Apply(ctx context.Context, streamID string, changes <-chan Change) error
+
+	// RequestStop sets the stop flag on the named stream's row in the
+	// per-target control table. A running [pipeline.Streamer] polls
+	// this flag and, when it transitions to "set", finishes the
+	// in-flight change, persists its final position, and exits
+	// cleanly with a nil error. See `sluice sync stop` for the
+	// operator-facing entry point.
+	//
+	// Idempotent: multiple calls land the same flag (the timestamp
+	// gets bumped, but the running streamer treats any non-NULL
+	// value as "stop requested" so a repeated request is harmless).
+	//
+	// When the stream row does not exist on the target, returns an
+	// engine-specific sentinel error the caller can branch on (see
+	// the `--if-exists`-style shape used by [SlotManager.Drop]).
+	// This is not a fatal condition; users typo stream IDs.
+	RequestStop(ctx context.Context, streamID string) error
 }
 
 // StreamStatus is the operational snapshot of one row in the

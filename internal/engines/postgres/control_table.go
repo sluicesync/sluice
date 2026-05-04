@@ -22,17 +22,31 @@ const controlTableName = "sluice_cdc_state"
 // passed in (taken from the DSN's `schema` query parameter, default
 // "public"). The Streamer reads the schema from the engine config
 // and threads it through.
+//
+// The stop_requested_at column is added with ADD COLUMN IF NOT
+// EXISTS so v0.2.x deployments that pre-date the column pick it up
+// transparently on the next call. Existing rows keep their data;
+// the new column starts NULL (i.e. "no stop requested").
 func ensureControlTable(ctx context.Context, db *sql.DB, schema string) error {
 	tableRef := quoteIdent(schema) + "." + quoteIdent(controlTableName)
 	ddl := `
 		CREATE TABLE IF NOT EXISTS ` + tableRef + ` (
-			stream_id       VARCHAR(255) NOT NULL,
-			source_position TEXT         NOT NULL,
-			updated_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			stream_id         VARCHAR(255) NOT NULL,
+			source_position   TEXT         NOT NULL,
+			updated_at        TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			stop_requested_at TIMESTAMP    NULL,
 			PRIMARY KEY (stream_id)
 		)`
 	if _, err := db.ExecContext(ctx, ddl); err != nil {
 		return fmt.Errorf("postgres: ensure control table: %w", err)
+	}
+	// Migration path for pre-`sync stop` deployments: the CREATE
+	// TABLE IF NOT EXISTS above is a no-op on existing tables, so
+	// the new column has to be added explicitly. ADD COLUMN IF NOT
+	// EXISTS is supported in every PG version sluice targets.
+	alter := "ALTER TABLE " + tableRef + " ADD COLUMN IF NOT EXISTS stop_requested_at TIMESTAMP NULL"
+	if _, err := db.ExecContext(ctx, alter); err != nil {
+		return fmt.Errorf("postgres: ensure control table: add stop_requested_at: %w", err)
 	}
 	return nil
 }
@@ -112,7 +126,9 @@ func listStreams(ctx context.Context, db *sql.DB, schema, engineName string) ([]
 //
 // The updated_at column is refreshed on every upsert via
 // CURRENT_TIMESTAMP — diagnostic info for operators inspecting the
-// control table by hand.
+// control table by hand. stop_requested_at is left untouched: a
+// position write is the streamer making forward progress, which
+// must not clear an in-flight stop request.
 func writePositionTx(ctx context.Context, tx *sql.Tx, schema, streamID, token string) error {
 	tableRef := quoteIdent(schema) + "." + quoteIdent(controlTableName)
 	q := "INSERT INTO " + tableRef + " (stream_id, source_position, updated_at) " +
@@ -125,3 +141,61 @@ func writePositionTx(ctx context.Context, tx *sql.Tx, schema, streamID, token st
 	}
 	return nil
 }
+
+// readStopRequested returns true when the named stream's row has a
+// non-NULL stop_requested_at column. Tolerant of the table being
+// absent (returns false, nil) so dry-run / unconfigured-target paths
+// don't error.
+//
+// Returns (false, nil) when the row doesn't exist — a stop signal
+// that hasn't been recorded is, by definition, not present. The
+// Streamer's poll loop calls this every few seconds via the
+// receiver method on ChangeApplier; the lint pass can't see that
+// cross-package usage, hence the nolint.
+//
+//nolint:unused // called by pipeline poll loop via ChangeApplier receiver
+func readStopRequested(ctx context.Context, db *sql.DB, schema, streamID string) (bool, error) {
+	tableRef := quoteIdent(schema) + "." + quoteIdent(controlTableName)
+	q := "SELECT stop_requested_at IS NOT NULL FROM " + tableRef + " WHERE stream_id = $1"
+	var stopRequested bool
+	err := db.QueryRowContext(ctx, q, streamID).Scan(&stopRequested)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return false, nil
+	case isUndefinedRelationErr(err):
+		return false, nil
+	case err != nil:
+		return false, fmt.Errorf("postgres: read stop flag: %w", err)
+	}
+	return stopRequested, nil
+}
+
+// requestStop flips the stop flag on the named stream's row. Returns
+// errStreamNotFound when no row exists (the operator likely typoed
+// the stream ID; the CLI surfaces a friendly message).
+//
+// Idempotent: repeated calls land the same flag. updated_at is left
+// alone so the "age" column in `sync status` continues to reflect
+// real apply activity rather than stop-request bookkeeping.
+func requestStop(ctx context.Context, db *sql.DB, schema, streamID string) error {
+	tableRef := quoteIdent(schema) + "." + quoteIdent(controlTableName)
+	q := "UPDATE " + tableRef + " SET stop_requested_at = CURRENT_TIMESTAMP WHERE stream_id = $1"
+	res, err := db.ExecContext(ctx, q, streamID)
+	if err != nil {
+		return fmt.Errorf("postgres: request stop: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("postgres: request stop: rows affected: %w", err)
+	}
+	if n == 0 {
+		return fmt.Errorf("%w: %q", errStreamNotFound, streamID)
+	}
+	return nil
+}
+
+// errStreamNotFound is returned by [requestStop] (and thus
+// [ChangeApplier.RequestStop]) when no row matches the requested
+// stream_id. The CLI string-matches the wrapped engine error rather
+// than importing this sentinel, mirroring the slot-not-found shape.
+var errStreamNotFound = errors.New("postgres: stream not found")
