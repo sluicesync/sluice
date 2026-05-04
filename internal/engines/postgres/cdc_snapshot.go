@@ -2,9 +2,9 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
-	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/orware/sluice/internal/ir"
@@ -76,17 +76,19 @@ func (e Engine) OpenSnapshotStream(ctx context.Context, dsn string) (*ir.Snapsho
 	}
 
 	// EXPORT_SNAPSHOT is the default for non-temporary slots, but
-	// stating it explicitly documents intent and survives any future
-	// pglogrepl default change.
-	result, err := pglogrepl.CreateReplicationSlot(ctx, replConn, defaultSlot, "pgoutput",
-		pglogrepl.CreateReplicationSlotOptions{
-			Mode:           pglogrepl.LogicalReplication,
-			SnapshotAction: "EXPORT_SNAPSHOT",
-		})
+	// stating it explicitly documents intent. The helper layers
+	// FAILOVER true on PG 17+ (see slot_create.go) so the slot
+	// survives Patroni / sync_replication_slots failover events.
+	consistentPoint, snapshotName, err := createLogicalReplicationSlot(ctx, db, replConn, defaultSlot, true)
 	if err != nil {
 		_ = replConn.Close(ctx)
 		_ = db.Close()
-		return nil, fmt.Errorf("postgres: snapshot: create replication slot: %w", err)
+		return nil, fmt.Errorf("postgres: snapshot: %w", err)
+	}
+	if snapshotName == "" {
+		_ = replConn.Close(ctx)
+		_ = db.Close()
+		return nil, errors.New("postgres: snapshot: server returned empty snapshot_name; expected EXPORT_SNAPSHOT to populate it")
 	}
 
 	// Pin a regular SQL connection and import the exported snapshot.
@@ -104,7 +106,7 @@ func (e Engine) OpenSnapshotStream(ctx context.Context, dsn string) (*ir.Snapsho
 		_ = db.Close()
 		return nil, fmt.Errorf("postgres: snapshot: BEGIN: %w", err)
 	}
-	if _, err := conn.ExecContext(ctx, fmt.Sprintf("SET TRANSACTION SNAPSHOT '%s'", quoteSnapshotName(result.SnapshotName))); err != nil {
+	if _, err := conn.ExecContext(ctx, fmt.Sprintf("SET TRANSACTION SNAPSHOT '%s'", quoteSnapshotName(snapshotName))); err != nil {
 		_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
 		_ = conn.Close()
 		_ = replConn.Close(ctx)
@@ -126,7 +128,7 @@ func (e Engine) OpenSnapshotStream(ctx context.Context, dsn string) (*ir.Snapsho
 		return nil, fmt.Errorf("postgres: snapshot: build cdc reader: %w", err)
 	}
 
-	position, err := encodePGPos(pgPos{Slot: defaultSlot, LSN: result.ConsistentPoint})
+	position, err := encodePGPos(pgPos{Slot: defaultSlot, LSN: consistentPoint})
 	if err != nil {
 		_ = cdcReader.(closer).Close()
 		_, _ = conn.ExecContext(context.Background(), "ROLLBACK")

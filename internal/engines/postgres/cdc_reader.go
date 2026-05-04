@@ -281,9 +281,10 @@ func (r *CDCReader) resolveStartPosition(
 	} else {
 		// CREATE_REPLICATION_SLOT runs on the replication connection
 		// (it's a replication-protocol command), not on the *sql.DB.
-		if _, err := pglogrepl.CreateReplicationSlot(ctx, conn, r.slotName, "pgoutput",
-			pglogrepl.CreateReplicationSlotOptions{Mode: pglogrepl.LogicalReplication}); err != nil {
-			return 0, fmt.Errorf("postgres: create replication slot %q: %w", r.slotName, err)
+		// The helper opts into FAILOVER on PG 17+ and warns on
+		// PG ≤ 16 (see slot_create.go for the rationale).
+		if _, _, err := createLogicalReplicationSlot(ctx, r.db, conn, r.slotName, false); err != nil {
+			return 0, err
 		}
 		*slotJustCreated = true
 	}

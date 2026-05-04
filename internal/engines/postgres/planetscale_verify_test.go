@@ -430,6 +430,125 @@ func TestPSPG_CDCReaderBasic(t *testing.T) {
 	}
 }
 
+// TestPSPG_CDCReader_FailoverFlag is the PlanetScale Postgres
+// counterpart to the integration TestCDCReader_FailoverFlag_PG17:
+// cold-start a CDC reader, query pg_replication_slots.failover,
+// assert it's true. This is the load-bearing verification for
+// roadmap item #7 — the operational story is that PS-PG slots
+// silently disappear on failover unless created with FAILOVER true
+// AND added to the cluster's permanent-slots config.
+//
+// Cleans up the slot afterwards so repeated runs don't leak.
+func TestPSPG_CDCReader_FailoverFlag(t *testing.T) {
+	sourceDSN, _ := dsnPair(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	db, err := sql.Open("pgx", sourceDSN)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	// Skip when wal_level isn't logical or REPLICATION attr is
+	// missing — same gates as TestPSPG_CDCReaderBasic.
+	var walLevel string
+	if err := db.QueryRowContext(ctx,
+		"SELECT setting FROM pg_settings WHERE name = 'wal_level'",
+	).Scan(&walLevel); err != nil {
+		t.Fatalf("read wal_level: %v", err)
+	}
+	if walLevel != "logical" {
+		t.Skipf("wal_level = %q; need 'logical'", walLevel)
+	}
+	var canReplicate bool
+	if err := db.QueryRowContext(ctx,
+		"SELECT rolreplication FROM pg_roles WHERE rolname = current_user",
+	).Scan(&canReplicate); err == nil && !canReplicate {
+		t.Skipf("current_user lacks REPLICATION attribute")
+	}
+
+	// Confirm the server is PG 17+; the FAILOVER flag exists only
+	// on those versions, and the test below would always assert
+	// false on older servers. Skip cleanly with the version logged.
+	var versionNum int
+	if err := db.QueryRowContext(ctx, "SHOW server_version_num").Scan(&versionNum); err != nil {
+		t.Fatalf("server_version_num: %v", err)
+	}
+	t.Logf("PS-PG server_version_num = %d", versionNum)
+	if versionNum < 170000 {
+		t.Skipf("PS-PG is PG <17 (%d); FAILOVER flag is unsupported", versionNum)
+	}
+
+	// Drop any leftover slot from a previous run so this test is
+	// idempotent. Errors here are informational only.
+	if _, err := db.ExecContext(ctx,
+		"SELECT pg_drop_replication_slot('sluice_slot') FROM pg_replication_slots WHERE slot_name = 'sluice_slot'",
+	); err != nil {
+		t.Logf("pre-clean drop slot: %v", err)
+	}
+
+	const schemaName = "sluice_psverify_failover"
+	if _, err := db.ExecContext(ctx, "DROP SCHEMA IF EXISTS "+schemaName+" CASCADE"); err != nil {
+		t.Fatalf("pre-clean schema: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "CREATE SCHEMA "+schemaName); err != nil {
+		t.Fatalf("create schema: %v", err)
+	}
+	defer func() {
+		dropCtx, dropCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer dropCancel()
+		// Always try to drop the slot; pg_drop_replication_slot is
+		// safe to call when the slot doesn't exist.
+		if _, err := db.ExecContext(dropCtx,
+			"SELECT pg_drop_replication_slot('sluice_slot') FROM pg_replication_slots WHERE slot_name = 'sluice_slot'",
+		); err != nil {
+			t.Logf("post-clean drop slot: %v", err)
+		}
+		if _, err := db.ExecContext(dropCtx, "DROP SCHEMA IF EXISTS "+schemaName+" CASCADE"); err != nil {
+			t.Logf("post-clean schema: %v", err)
+		}
+	}()
+
+	const seedDDL = `
+		CREATE TABLE sluice_psverify_failover.users (
+			id BIGINT PRIMARY KEY
+		);
+		ALTER TABLE sluice_psverify_failover.users REPLICA IDENTITY FULL;
+	`
+	if _, err := db.ExecContext(ctx, seedDDL); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	psDSN := withSchemaParam(sourceDSN, schemaName)
+
+	eng := Engine{}
+	rdr, err := eng.OpenCDCReader(ctx, psDSN)
+	if err != nil {
+		t.Fatalf("OpenCDCReader: %v", err)
+	}
+	defer closeIf(rdr)
+
+	if _, err := rdr.StreamChanges(ctx, ir.Position{}); err != nil {
+		t.Fatalf("StreamChanges: %v", err)
+	}
+
+	// The slot should now exist with failover=true. Use a separate
+	// connection (not the replication conn) to query the view.
+	var failover bool
+	err = db.QueryRowContext(ctx,
+		"SELECT failover FROM pg_replication_slots WHERE slot_name = $1",
+		"sluice_slot",
+	).Scan(&failover)
+	if err != nil {
+		t.Fatalf("query failover: %v", err)
+	}
+	if !failover {
+		t.Errorf("pg_replication_slots.failover = false on PS-PG; want true (slot will be lost on failover)")
+	}
+}
+
 // drainPSChanges drains up to want events from the channel with an
 // overall timeout. Local copy of the helper used in other CDC tests.
 func drainPSChanges(
