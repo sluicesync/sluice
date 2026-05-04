@@ -62,19 +62,26 @@ func TestWarnNoFailoverSupport_OncePerSlot(t *testing.T) {
 // sanity-check on the protocol-command string we send. We can't
 // actually run the command here without a server, but the format
 // string is small and load-bearing — a typo would silently fall
-// through to the server and surface as a confusing "syntax error
-// near FAILOVER" downstream.
+// through to the server and surface as a confusing parser error
+// downstream.
+//
+// Specifically, this test pins the snapshot-option spelling: PG 17+
+// requires the *named* form `SNAPSHOT 'export'` inside an
+// option-list, not the bare keyword `EXPORT_SNAPSHOT` (which is the
+// pre-PG-17 syntax). PlanetScale Postgres rejected the bare-keyword
+// form in v0.2.0 with "ERROR: unrecognized option: export_snapshot"
+// — this test guards against the regression coming back.
 //
 // Strategy: build the command exactly the way createSlotWithFailover
 // does, and assert the substring the server will see. The two
-// shapes (with/without EXPORT_SNAPSHOT) are both covered.
+// shapes (with/without snapshot export) are both covered.
 func TestCreateSlotWithFailover_CommandShape(t *testing.T) {
 	// Mirror the format used inside createSlotWithFailover. If the
 	// helper changes, this test guards against accidental drift.
 	build := func(slot string, exportSnapshot bool) string {
 		opts := []string{}
 		if exportSnapshot {
-			opts = append(opts, "EXPORT_SNAPSHOT")
+			opts = append(opts, "SNAPSHOT 'export'")
 		}
 		opts = append(opts, "FAILOVER true")
 		// Use the same quoteIdent path the helper uses.
@@ -95,10 +102,10 @@ func TestCreateSlotWithFailover_CommandShape(t *testing.T) {
 			want:           `CREATE_REPLICATION_SLOT "sluice_slot" LOGICAL pgoutput (FAILOVER true)`,
 		},
 		{
-			name:           "snapshot-and-CDC handoff",
+			name:           "snapshot-and-CDC handoff uses named SNAPSHOT 'export'",
 			slot:           "sluice_slot",
 			exportSnapshot: true,
-			want:           `CREATE_REPLICATION_SLOT "sluice_slot" LOGICAL pgoutput (EXPORT_SNAPSHOT, FAILOVER true)`,
+			want:           `CREATE_REPLICATION_SLOT "sluice_slot" LOGICAL pgoutput (SNAPSHOT 'export', FAILOVER true)`,
 		},
 		{
 			name:           "slot name with embedded quote escapes",

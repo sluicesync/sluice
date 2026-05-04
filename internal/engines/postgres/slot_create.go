@@ -61,17 +61,26 @@ import (
 // On PG 17+, the command looks like:
 //
 //	CREATE_REPLICATION_SLOT "slotname" LOGICAL pgoutput (FAILOVER true)
-//	CREATE_REPLICATION_SLOT "slotname" LOGICAL pgoutput (EXPORT_SNAPSHOT, FAILOVER true)
+//	CREATE_REPLICATION_SLOT "slotname" LOGICAL pgoutput (SNAPSHOT 'export', FAILOVER true)
 //
-// Options inside the parens-list are comma-separated. The boolean
-// argument to FAILOVER is required (the docs allow defaults but
-// always passing `true` is unambiguous). Slot identifiers go
-// through quoteIdent to protect against names that would otherwise
-// require escaping (the default "sluice_slot" doesn't, but a
-// custom name might).
+// Options inside the parens-list are comma-separated. The snapshot
+// option is the named form `SNAPSHOT 'export'` (or 'use' / 'nothing')
+// — the bare `EXPORT_SNAPSHOT` keyword is the *old* PG ≤ 16 syntax
+// and is rejected by PG 17+'s option-list parser with
+// `ERROR: unrecognized option: export_snapshot`. PlanetScale Postgres
+// surfaced this in v0.2.0 testing; the named form is the only one
+// that survives.
+//
+// The boolean argument to FAILOVER is required (the docs allow
+// defaults but always passing `true` is unambiguous). Slot
+// identifiers go through quoteIdent to protect against names that
+// would otherwise require escaping (the default "sluice_slot"
+// doesn't, but a custom name might).
 //
 // On PG ≤ 16, we delegate to pglogrepl.CreateReplicationSlot,
-// which sends the same command without the FAILOVER option.
+// which sends the legacy bare-keyword form (EXPORT_SNAPSHOT) outside
+// of any option-list — a separate parser path on the server, so
+// nothing here interferes.
 func createLogicalReplicationSlot(
 	ctx context.Context,
 	db *sql.DB,
@@ -102,12 +111,16 @@ func createSlotWithFailover(
 	exportSnapshot bool,
 ) (consistentPoint, snapshotName string, err error) {
 	// Build the parens-list option string. Order doesn't matter to
-	// the server, but we put EXPORT_SNAPSHOT first to match the
-	// shape pglogrepl emits (and the example in the PG protocol
-	// docs).
+	// the server, but we put SNAPSHOT first to match the order in
+	// the PG 17 protocol-replication docs.
 	opts := []string{}
 	if exportSnapshot {
-		opts = append(opts, "EXPORT_SNAPSHOT")
+		// PG 17+ uses the named-option form: SNAPSHOT 'export'. The
+		// bare EXPORT_SNAPSHOT keyword (pre-PG-17 syntax) is rejected
+		// inside an option-list with "ERROR: unrecognized option:
+		// export_snapshot" — observed against PlanetScale Postgres
+		// during v0.2.0 testing.
+		opts = append(opts, "SNAPSHOT 'export'")
 	}
 	opts = append(opts, "FAILOVER true")
 
