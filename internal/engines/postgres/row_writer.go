@@ -66,6 +66,26 @@ func (w *RowWriter) Close() error {
 	return w.db.Close()
 }
 
+// TruncateTable empties the target table. Used by the resume path in
+// [pipeline.Migrator] to clear an `in_progress` table before
+// re-running its bulk copy. Implements [ir.TableTruncator].
+//
+// TRUNCATE in Postgres is fast (it doesn't scan rows) and acquires
+// ACCESS EXCLUSIVE — fine here because the resume path runs single-
+// threaded. RESTART IDENTITY isn't applied: the orchestrator's
+// SyncIdentitySequences phase will reconcile sequences after the
+// re-copy finishes.
+func (w *RowWriter) TruncateTable(ctx context.Context, table *ir.Table) error {
+	if table == nil {
+		return errors.New("postgres: TruncateTable: table is nil")
+	}
+	stmt := "TRUNCATE TABLE " + quoteIdent(w.schema) + "." + quoteIdent(table.Name)
+	if _, err := w.db.ExecContext(ctx, stmt); err != nil {
+		return fmt.Errorf("postgres: truncate %q: %w", table.Name, err)
+	}
+	return nil
+}
+
 // WriteRows is the dispatcher. Validates inputs, then routes to the
 // strategy chosen by useCopy. See [ir.RowWriter.WriteRows] for the
 // contract.

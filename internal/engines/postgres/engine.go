@@ -175,6 +175,23 @@ func (Engine) OpenSlotManager(ctx context.Context, dsn string) (ir.SlotManager, 
 	return &SlotManager{db: db}, nil
 }
 
+// OpenMigrationStateStore returns a [MigrationStateStore] bound to
+// the database identified by dsn. Implements
+// [ir.MigrationStateStoreOpener]; the pipeline orchestrator type-
+// asserts on this method so engines without a SQL surface for
+// resumable migrations can omit it.
+func (Engine) OpenMigrationStateStore(ctx context.Context, dsn string) (ir.MigrationStateStore, error) {
+	cfg, err := parseDSN(dsn)
+	if err != nil {
+		return nil, err
+	}
+	db, err := openDB(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	return &MigrationStateStore{db: db, schema: cfg.schema}, nil
+}
+
 // OpenChangeApplier returns a [ChangeApplier] bound to the database
 // identified by dsn. The caller is responsible for closing the
 // returned applier (via its Close method) to release the underlying

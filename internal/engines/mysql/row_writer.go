@@ -3,6 +3,7 @@ package mysql
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -54,6 +55,28 @@ func (w *RowWriter) Close() error {
 		return nil
 	}
 	return w.db.Close()
+}
+
+// TruncateTable empties the target table. Used by the resume path in
+// [pipeline.Migrator] to clear an `in_progress` table before
+// re-running its bulk copy. Implements [ir.TableTruncator].
+//
+// MySQL TRUNCATE TABLE drops and recreates the table — fast on InnoDB
+// but it implicitly commits any open transaction. Fine here because
+// the resume path runs single-threaded and any in-flight writer is
+// torn down before this call.
+func (w *RowWriter) TruncateTable(ctx context.Context, table *ir.Table) error {
+	if table == nil {
+		return errors.New("mysql: TruncateTable: table is nil")
+	}
+	stmt := "TRUNCATE TABLE " + quoteIdent(table.Name)
+	if w.schema != "" {
+		stmt = "TRUNCATE TABLE " + quoteIdent(w.schema) + "." + quoteIdent(table.Name)
+	}
+	if _, err := w.db.ExecContext(ctx, stmt); err != nil {
+		return fmt.Errorf("mysql: truncate %q: %w", table.Name, err)
+	}
+	return nil
 }
 
 // WriteRows consumes rows from the channel and inserts them into table

@@ -405,7 +405,11 @@ func emitTableDef(schema string, table *ir.Table, opts emitOpts) (string, error)
 	}
 
 	var sb strings.Builder
-	sb.WriteString("CREATE TABLE ")
+	// IF NOT EXISTS keeps schema phase 1 idempotent: re-running
+	// CreateTablesWithoutConstraints during a resume is a no-op when
+	// the table is already there. Postgres has supported this since
+	// 9.1 (every version sluice targets).
+	sb.WriteString("CREATE TABLE IF NOT EXISTS ")
 	sb.WriteString(quoteIdent(schema))
 	sb.WriteByte('.')
 	sb.WriteString(quoteIdent(table.Name))

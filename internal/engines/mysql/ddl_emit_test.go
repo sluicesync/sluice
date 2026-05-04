@@ -278,7 +278,7 @@ func TestEmitTableDef(t *testing.T) {
 	// CREATE TABLE is verbose enough that a structural check reads
 	// more clearly than a giant string literal.
 	wants := []string{
-		"CREATE TABLE `users` (",
+		"CREATE TABLE IF NOT EXISTS `users` (",
 		"`id` BIGINT UNSIGNED AUTO_INCREMENT NOT NULL,",
 		"`email` VARCHAR(255) NOT NULL,",
 		"PRIMARY KEY (`id`)",

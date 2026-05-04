@@ -63,12 +63,20 @@ func (r *SchemaReader) ReadSchema(ctx context.Context) (*ir.Schema, error) {
 // readTables loads the table list and returns a map keyed by table
 // name. The map's values are skeleton [ir.Table] structs; populate*
 // methods fill them in.
+//
+// sluice's own bookkeeping tables (sluice_cdc_state from continuous
+// sync, sluice_migrate_state from resumable migrations) are excluded
+// — they're persisted on the target as a side effect of running
+// sluice itself, not user data, and including them would surface as
+// "your migration has an extra table" surprises in cross-engine
+// re-migrations.
 func (r *SchemaReader) readTables(ctx context.Context) (map[string]*ir.Table, error) {
 	const q = `
 		SELECT table_name, IFNULL(table_comment, '')
 		FROM   information_schema.tables
 		WHERE  table_schema = ?
 		  AND  table_type   = 'BASE TABLE'
+		  AND  table_name NOT IN ('sluice_cdc_state', 'sluice_migrate_state')
 		ORDER  BY table_name`
 
 	rows, err := r.db.QueryContext(ctx, q, r.schema)

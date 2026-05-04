@@ -370,7 +370,11 @@ func emitTableDef(table *ir.Table) (string, error) {
 	}
 
 	var sb strings.Builder
-	sb.WriteString("CREATE TABLE ")
+	// IF NOT EXISTS keeps schema phase 1 idempotent: re-running
+	// CreateTablesWithoutConstraints during a resume is a no-op when
+	// the table is already there. MySQL has supported this for as
+	// long as sluice cares about (5.x+).
+	sb.WriteString("CREATE TABLE IF NOT EXISTS ")
 	sb.WriteString(quoteIdent(table.Name))
 	sb.WriteString(" (\n")
 
