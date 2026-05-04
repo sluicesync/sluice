@@ -6,6 +6,152 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-05-04
+
+Feature release. Three substantial additions to the operator surface
+(`sluice migrate --resume`, `sluice sync stop`, `--include-table` /
+`--exclude-table`), one silent-data-loss fix on Postgres CDC, and
+five new ADRs documenting the v0.2.x and v0.3.0 design decisions.
+
+### Added — resumable simple-mode migrations
+
+- **`sluice migrate --resume --migration-id ID`** picks up a failed
+  migration where it left off rather than forcing a drop-and-redo.
+  Per-target `sluice_migrate_state` row tracks phase
+  (`tables`/`bulk_copy`/`identity_sync`/`indexes`/`constraints`/
+  `complete`) and per-table bulk-copy progress as a JSON map.
+  In-progress tables are TRUNCATEd before re-copy. Failure paths
+  persist the in-flight phase plus a 1KB-truncated error message;
+  a state-write failure during cleanup is joined with the primary
+  error via `errors.Join` so the operator never loses the root
+  cause.
+- **Behavior matrix** is conservative for non-resume runs: existing
+  state row + no `--resume` errors out (no silent overwrites), and
+  `--resume` against a `complete` row exits cleanly with an
+  "already complete" log. New `MigrationStateStore` and
+  `TableTruncator` are optional engine surfaces (type-assertion
+  pattern, mirroring `SlotManagerOpener`); engines without the
+  primitives error clearly when `--resume` is requested.
+- **`CREATE TABLE IF NOT EXISTS`** is now universal in the DDL
+  emitters on both engines, so the resume tables-phase is a clean
+  no-op on re-run. Schema readers exclude `sluice_*_state` so
+  re-migrations don't propagate sluice's bookkeeping as user data.
+
+### Added — selective table inclusion / exclusion
+
+- **`--include-table TABLE,...`** and **`--exclude-table TABLE,...`**
+  on `sluice migrate` and `sluice sync start`. Comma-separated,
+  repeatable, glob patterns supported via stdlib `path.Match`
+  (`audit_*`, `tmp_*`). Mutually exclusive at the CLI parse layer.
+  Same fields available in YAML config as `include_tables` /
+  `exclude_tables`; CLI takes precedence wholesale (no merge).
+- **Filtering happens at the orchestrator boundary**: schema
+  pruning after `ReadSchema` and a CDC dispatch wrapper that drops
+  events for excluded tables before the applier sees them. Engines
+  remain agnostic to the spec, so behaviour is identical across
+  MySQL/Postgres/future engines.
+- **Position-advancement caveat**: positions only commit when an
+  event applies, so a stream that consists entirely of dropped
+  events lags within the source-side WAL/binlog retention window.
+  Documented on the `Streamer.Filter` field.
+
+### Added — graceful stream stop
+
+- **`sluice sync stop --target-driver X --target DSN --stream-id ID`**
+  asks a running sync stream to drain in-flight changes, persist
+  the final position, and exit cleanly. Mechanism is a control-
+  table flag (`stop_requested_at` column on `sluice_cdc_state`)
+  polled by the running streamer every 5s. Survives operator
+  machine boundaries, container lifecycles, and process restarts —
+  the flag persists; a restarted streamer sees it on next poll.
+- **Additive to `Ctrl-C` / `SIGTERM`** which still work via the
+  existing signal path. The new mechanism fits Kubernetes lifecycle
+  hooks, systemd `ExecStop`, and remote orchestrators that can't
+  send signals to a different machine.
+- **Idempotent schema migration**: existing v0.2.x deployments pick
+  up the new column on next `EnsureControlTable` call without
+  losing data. PG uses `ADD COLUMN IF NOT EXISTS`; MySQL uses
+  detect-then-ALTER for portability across all 8.x versions.
+
+### Added — observability
+
+- **Structured logging via `log/slog`** (replacing
+  `fmt.Fprintf`-to-stdout). `--log-level` is now wired into the
+  default handler; `debug` / `info` / `warn` / `error` actually
+  change verbosity. Pipeline records emit as
+  `time=... level=INFO msg="..." key=value` to stderr; CLI table
+  outputs (`engines`, `sync status`, `slot list`) keep using stdout
+  unchanged — they're table renders, not log streams.
+- **Bulk-copy progress reporting**: a per-table `progressTicker`
+  emits `bulk copy progress table=foo rows=N rate=R` every 2s
+  while a copy is in flight, plus a final `bulk copy complete`
+  line on table completion. Long migrations are no longer 30
+  minutes of silence.
+- **Phase-aware error hints**: wrapped pipeline errors gain an
+  optional one-line `hint:` suffix for common operator-facing
+  failures (missing target table, bad DSN host, auth failures,
+  missing `REPLICATION` grant, missing `CREATE` on schema).
+  Registry is intentionally tiny (7 entries, scoped by phase);
+  hints are appended via `fmt.Errorf("%w\nhint: %s")` so
+  `errors.Is`/`As` traversal is unaffected.
+
+### Added — architecture documentation
+
+Five new ADRs in `docs/adr/`:
+
+- **ADR-0011**: `SlotManager` as an optional engine surface.
+- **ADR-0012**: Bypass `pglogrepl` to send raw
+  `CREATE_REPLICATION_SLOT FAILOVER true` for PG 17+.
+- **ADR-0013**: Applier value-shaping via column-type cache and
+  `CAST(? AS JSON)` (the Bug 6 fix shape).
+- **ADR-0014**: Phase-aware error-hint registry (substring + phase
+  matching, deliberately tiny).
+- **ADR-0015**: Migration resume design — per-target state table,
+  truncate-and-redo for in-progress tables, `errors.Join` on
+  state-write-during-failure paths.
+
+### Fixed
+
+- **Postgres CDC: composite-PK DELETE silently lost (Bug 8)**.
+  pgoutput's `DeleteMessage` with `REPLICA IDENTITY DEFAULT`
+  carries an `OldTuple` whose `ColumnNum` equals the relation's
+  full column count, with `'n'` (null) markers for non-key
+  columns. `decodeTuple` translated those into present-but-nil
+  entries on the row map; the applier's `WHERE` then emitted
+  `non_key IS NULL` predicates that matched zero rows on the
+  destination. The applier's resume-idempotency tolerance for
+  zero-rows-affected (ADR-0010) absorbed the silence; the
+  position advanced; `DELETE`s disappeared. Real-world soak
+  testing observed a 30-row drift on a composite-PK
+  `order_items` table.
+
+  Fix: `filterDeleteBefore` narrows the emitted Before to columns
+  flagged `KeyColumn=true` on the relation cache. Correct under
+  every `REPLICA IDENTITY` mode (DEFAULT drops `'n'` entries; FULL
+  drops non-identity columns; USING INDEX is a no-op on the
+  already-narrow OldTuple; PK-less FULL falls back to the full row
+  to honour the operator's deliberate setting). `REPLICA IDENTITY
+  NOTHING` is rejected loudly — DELETE is unreplicatable in that
+  mode.
+
+  MySQL is unaffected: `binlog_row_image=FULL` (the default)
+  carries every column with real values, so the WHERE matches
+  exactly. The user's PG→MySQL drift was the PG source-side bug
+  propagating through.
+
+### Test gap closed
+
+- **Composite-PK CDC coverage on MySQL paths**. Bug 8 reached
+  real-world soak because no existing CDC integration test
+  exercised composite-PK tables across any direction. Added
+  `TestCDCReader_CompositePK` (MySQL binlog, asserts both PK
+  columns survive INSERT/UPDATE/DELETE) and
+  `TestStreamer_MySQLToPostgres_CompositePKDelete` (cross-engine,
+  asserts row-count drop on the target). VStream coverage punted
+  to a follow-up — the test infrastructure (vtgate setup) is
+  heavier and the protocol surface differs enough to warrant its
+  own pass.
+
 ## [0.2.2] - 2026-05-04
 
 Patch release closing a CDC-applier JSON-encoding bug that surfaced
@@ -429,7 +575,8 @@ level history.
 
 (none currently — see the closed entries above.)
 
-[Unreleased]: https://github.com/orware/sluice/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/orware/sluice/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/orware/sluice/releases/tag/v0.3.0
 [0.2.2]: https://github.com/orware/sluice/releases/tag/v0.2.2
 [0.2.1]: https://github.com/orware/sluice/releases/tag/v0.2.1
 [0.2.0]: https://github.com/orware/sluice/releases/tag/v0.2.0
