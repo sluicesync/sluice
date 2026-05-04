@@ -278,6 +278,39 @@ func TestDecodeTupleColumnCountMismatch(t *testing.T) {
 	}
 }
 
+func TestCheckSlotUsable(t *testing.T) {
+	cases := []struct {
+		name      string
+		walStatus string
+		wantErr   bool
+		wantSub   string
+	}{
+		{"empty (PG <13)", "", false, ""},
+		{"reserved", "reserved", false, ""},
+		{"extended", "extended", false, ""},
+		{"unreserved warns + recovery hint", "unreserved", true, "wal_status=\"unreserved\""},
+		{"unreserved names sluice slot drop", "unreserved", true, "sluice slot drop"},
+		{"lost names recovery + max_slot_wal_keep_size", "lost", true, "max_slot_wal_keep_size"},
+		{"unrecognised future status", "exotic_future_state", true, "unrecognised wal_status"},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			got := checkSlotUsable(&slotState{SlotName: "sluice_slot", WALStatus: c.walStatus})
+			if c.wantErr {
+				if got == nil {
+					t.Fatalf("expected error for wal_status=%q", c.walStatus)
+				}
+				if !strings.Contains(got.Error(), c.wantSub) {
+					t.Errorf("error %q missing substring %q", got.Error(), c.wantSub)
+				}
+			} else if got != nil {
+				t.Errorf("unexpected error: %v", got)
+			}
+		})
+	}
+}
+
 // TestSynthesizeKeyOnlyBefore covers the REPLICA IDENTITY DEFAULT
 // path where pgoutput omits OldTuple on UPDATEs that don't modify
 // identity columns. Without this synthesis the applier would emit

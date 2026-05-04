@@ -52,12 +52,12 @@ func (e Engine) OpenSnapshotStream(ctx context.Context, dsn string) (*ir.Snapsho
 	// consistent_point and we'd silently inherit it instead of
 	// capturing a fresh snapshot. Refuse explicitly so the operator
 	// reckons with the leftover.
-	exists, err := slotExists(ctx, db, defaultSlot)
+	info, err := slotInfo(ctx, db, defaultSlot)
 	if err != nil {
 		_ = db.Close()
 		return nil, err
 	}
-	if exists {
+	if info != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf(
 			"postgres: snapshot: replication slot %q already exists; drop it before starting a snapshot stream (manual cleanup avoids accidentally inheriting a stale consistent_point)",

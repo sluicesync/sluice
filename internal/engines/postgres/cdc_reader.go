@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -129,6 +130,13 @@ func (r *CDCReader) Err() error {
 // — the reader creates the publication and slot if they don't exist
 // and resumes from the slot's confirmed_flush_lsn.
 //
+// On cold-start the reader creates the slot lazily; if any setup step
+// after slot creation (IDENTIFY_SYSTEM, START_REPLICATION) fails — or
+// ctx is cancelled before the channel is returned — the freshly-
+// created slot is auto-dropped before StreamChanges returns. Slots
+// that already existed when StreamChanges was called are never
+// auto-dropped: they may carry another caller's progress.
+//
 // The channel is closed when ctx is cancelled, when a fatal error
 // occurs (visible via [Err]), or when the upstream tears down the
 // replication connection. Drain the channel or cancel ctx to avoid
@@ -156,10 +164,41 @@ func (r *CDCReader) StreamChanges(ctx context.Context, from ir.Position) (<-chan
 	}
 	r.replConn = conn
 
-	startLSN, err := r.resolveStartPosition(ctx, conn, from)
-	if err != nil {
+	// slotJustCreated tracks whether resolveStartPosition created a
+	// fresh slot in this call. The deferred cleanup below drops it
+	// only when both flags hold: we created it AND we're not handing
+	// the caller a live channel. A pre-existing slot (someone else's
+	// progress) is never touched.
+	var slotJustCreated bool
+	streamStarted := false
+	defer func() {
+		if streamStarted || !slotJustCreated {
+			return
+		}
+		// Best-effort drop. The original error is the one the caller
+		// cares about; a drop failure is logged via the error path's
+		// returned error so it isn't silent, but never replaces the
+		// primary cause.
+		dropErr := dropReplicationSlot(ctx, conn, r.slotName)
 		_ = conn.Close(ctx)
 		r.replConn = nil
+		if dropErr != nil {
+			fmt.Fprintf(os.Stderr,
+				"postgres: cdc: warning: failed to auto-drop freshly-created slot %q after setup error: %v\n",
+				r.slotName, dropErr)
+			return
+		}
+		fmt.Fprintf(os.Stderr,
+			"postgres: cdc: auto-dropped freshly-created slot %q after setup error\n",
+			r.slotName)
+	}()
+
+	startLSN, err := r.resolveStartPosition(ctx, conn, from, &slotJustCreated)
+	if err != nil {
+		if !slotJustCreated {
+			_ = conn.Close(ctx)
+			r.replConn = nil
+		}
 		return nil, err
 	}
 
@@ -170,14 +209,17 @@ func (r *CDCReader) StreamChanges(ctx context.Context, from ir.Position) (<-chan
 	if err := pglogrepl.StartReplication(ctx, conn, r.slotName, startLSN, pglogrepl.StartReplicationOptions{
 		PluginArgs: pluginArgs,
 	}); err != nil {
-		_ = conn.Close(ctx)
-		r.replConn = nil
+		if !slotJustCreated {
+			_ = conn.Close(ctx)
+			r.replConn = nil
+		}
 		return nil, fmt.Errorf("postgres: START_REPLICATION: %w", err)
 	}
 
 	loopCtx, cancel := context.WithCancel(ctx)
 	r.streamerCancel = cancel
 	out := make(chan ir.Change, cdcChannelBuffer)
+	streamStarted = true // suppress the deferred slot-drop
 	go r.pump(loopCtx, conn, startLSN, out)
 	return out, nil
 }
@@ -188,7 +230,12 @@ func (r *CDCReader) StreamChanges(ctx context.Context, from ir.Position) (<-chan
 // it does. A non-empty position must reference an existing slot —
 // silently re-creating one would skip changes between the recorded
 // LSN and "now".
-func (r *CDCReader) resolveStartPosition(ctx context.Context, conn *pgconn.PgConn, from ir.Position) (pglogrepl.LSN, error) {
+func (r *CDCReader) resolveStartPosition(
+	ctx context.Context,
+	conn *pgconn.PgConn,
+	from ir.Position,
+	slotJustCreated *bool,
+) (pglogrepl.LSN, error) {
 	decoded, ok, err := decodePGPos(from)
 	if err != nil {
 		return 0, err
@@ -202,14 +249,17 @@ func (r *CDCReader) resolveStartPosition(ctx context.Context, conn *pgconn.PgCon
 				"postgres: position references slot %q but reader is configured with slot %q",
 				decoded.Slot, r.slotName)
 		}
-		exists, err := slotExists(ctx, r.db, r.slotName)
+		info, err := slotInfo(ctx, r.db, r.slotName)
 		if err != nil {
 			return 0, err
 		}
-		if !exists {
+		if info == nil {
 			return 0, fmt.Errorf(
 				"postgres: replication slot %q no longer exists; cannot resume from supplied LSN (start a fresh stream with empty position)",
 				r.slotName)
+		}
+		if err := checkSlotUsable(info); err != nil {
+			return 0, err
 		}
 		lsn, err := pglogrepl.ParseLSN(decoded.LSN)
 		if err != nil {
@@ -218,24 +268,74 @@ func (r *CDCReader) resolveStartPosition(ctx context.Context, conn *pgconn.PgCon
 		return lsn, nil
 	}
 
-	// "From now" path. Create the slot if it doesn't exist.
-	exists, err := slotExists(ctx, r.db, r.slotName)
+	// "From now" path. Create the slot if it doesn't exist; if it
+	// already exists, validate its WAL status before reusing it.
+	info, err := slotInfo(ctx, r.db, r.slotName)
 	if err != nil {
 		return 0, err
 	}
-	if !exists {
+	if info != nil {
+		if err := checkSlotUsable(info); err != nil {
+			return 0, err
+		}
+	} else {
 		// CREATE_REPLICATION_SLOT runs on the replication connection
 		// (it's a replication-protocol command), not on the *sql.DB.
 		if _, err := pglogrepl.CreateReplicationSlot(ctx, conn, r.slotName, "pgoutput",
 			pglogrepl.CreateReplicationSlotOptions{Mode: pglogrepl.LogicalReplication}); err != nil {
 			return 0, fmt.Errorf("postgres: create replication slot %q: %w", r.slotName, err)
 		}
+		*slotJustCreated = true
 	}
 	sysident, err := pglogrepl.IdentifySystem(ctx, conn)
 	if err != nil {
 		return 0, fmt.Errorf("postgres: IDENTIFY_SYSTEM: %w", err)
 	}
 	return sysident.XLogPos, nil
+}
+
+// checkSlotUsable surfaces wal_status invalidation as a clear,
+// actionable error. PostgreSQL drives slots through these states
+// in pg_replication_slots.wal_status as the source generates WAL
+// faster than the consumer advances:
+//
+//   - reserved   — slot has all required WAL on disk (healthy).
+//   - extended   — slot is keeping more WAL than max_wal_size on disk
+//     (healthy but should be watched; consumer is behind).
+//   - unreserved — required WAL has been removed from pg_wal but
+//     is still recoverable; slot is on the brink of
+//     invalidation. Once a checkpoint runs, the state
+//     transitions to "lost".
+//   - lost       — required WAL is gone permanently. The slot still
+//     exists but is unusable. The only recovery is to
+//     drop and recreate, which forces a fresh snapshot.
+//
+// We refuse to start replication on "unreserved" or "lost" slots
+// rather than letting START_REPLICATION fail mid-stream with the
+// confusing "requested WAL segment has already been removed".
+// The error names the slot, the wal_status, and the recovery path.
+func checkSlotUsable(info *slotState) error {
+	switch info.WALStatus {
+	case "", "reserved", "extended":
+		return nil
+	case "unreserved":
+		return fmt.Errorf(
+			"postgres: replication slot %q has wal_status=%q — required WAL is on the brink of being lost; "+
+				"resume immediately or recreate the slot. To recreate: `sluice slot drop %s --target ...` then restart with empty position (forces a fresh snapshot)",
+			info.SlotName, info.WALStatus, info.SlotName)
+	case "lost":
+		return fmt.Errorf(
+			"postgres: replication slot %q has wal_status=%q — required WAL has been permanently removed; "+
+				"the slot must be dropped and recreated. To recover: `sluice slot drop %s --target ...` then restart with empty position (forces a fresh snapshot). "+
+				"To prevent recurrence, raise max_slot_wal_keep_size on the source — PlanetScale recommends > 4GB",
+			info.SlotName, info.WALStatus, info.SlotName)
+	default:
+		// Future PG versions could add states. Surface verbatim
+		// rather than assume.
+		return fmt.Errorf(
+			"postgres: replication slot %q has unrecognised wal_status=%q; refusing to proceed",
+			info.SlotName, info.WALStatus)
+	}
 }
 
 // pump is the event loop. Owns the replication connection from this
@@ -716,14 +816,40 @@ func ensurePublication(ctx context.Context, db *sql.DB, name string) error {
 	return nil
 }
 
-// slotExists checks pg_replication_slots for the named slot.
-func slotExists(ctx context.Context, db *sql.DB, name string) (bool, error) {
-	var exists bool
-	const q = "SELECT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)"
-	if err := db.QueryRowContext(ctx, q, name).Scan(&exists); err != nil {
-		return false, fmt.Errorf("postgres: check slot: %w", err)
+// slotState carries the bits of pg_replication_slots the CDC reader
+// uses for cold-start validation. WALStatus drives the can-we-resume?
+// decision; see checkSlotUsable for the state-transition table.
+type slotState struct {
+	SlotName  string
+	WALStatus string
+}
+
+// slotInfo returns the slot's state, or nil when no row exists. The
+// "row missing" case is split out from the error path because the
+// cold-start code branches on existence — a missing slot is normal
+// (we'll create one), but an errored query is fatal.
+//
+// wal_status was added in PG 13. On older servers, the column would
+// be absent and this query would error; sluice's Engine.Capabilities
+// lists pgoutput-v2 (PG 14+) as the baseline, so this is safe.
+func slotInfo(ctx context.Context, db *sql.DB, name string) (*slotState, error) {
+	const q = `SELECT slot_name, COALESCE(wal_status, '') FROM pg_replication_slots WHERE slot_name = $1`
+	row := db.QueryRowContext(ctx, q, name)
+	var s slotState
+	if err := row.Scan(&s.SlotName, &s.WALStatus); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("postgres: check slot: %w", err)
 	}
-	return exists, nil
+	return &s, nil
+}
+
+// dropReplicationSlot drops the named slot via the replication
+// protocol. Used by the cold-start cleanup path to remove a slot we
+// just created when a later setup step fails.
+func dropReplicationSlot(ctx context.Context, conn *pgconn.PgConn, name string) error {
+	return pglogrepl.DropReplicationSlot(ctx, conn, name, pglogrepl.DropReplicationSlotOptions{})
 }
 
 // openReplicationConn opens a pgconn.PgConn in replication=database
