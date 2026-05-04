@@ -8,7 +8,7 @@ Before you start, please skim [CLAUDE.md](CLAUDE.md). It's the project's working
 
 ## Getting set up
 
-You'll need a recent Go toolchain (the version in `go.mod`'s `go` directive — currently 1.25.x), Docker for integration tests, and two small Go-based tools:
+You'll need a recent Go toolchain (the version in `go.mod`'s `go` directive — currently 1.26.x), Docker for integration tests, and two small Go-based tools:
 
 ```bash
 go install mvdan.cc/gofumpt@latest
@@ -42,10 +42,17 @@ If you have an idea that isn't on the roadmap, open an issue describing the use 
 
 ## Tests
 
-- **Unit tests** run on every push: `go test -race -count=1 ./internal/...`. They use mock engines (`stubEngine`, `recordingEngine` in the pipeline package) and don't need Docker.
-- **Integration tests** are gated behind `//go:build integration` and use [testcontainers-go](https://golang.testcontainers.org/): `go test -tags=integration -race -count=1 ./internal/...`. They need Docker. Same-engine tests live in each engine package; cross-engine tests live in `internal/pipeline`.
+The test suite is layered by infrastructure cost; each layer is opt-in via a build tag:
+
+- **Unit tests** (no tag) run on every push: `go test -race -count=1 ./internal/...`. Mock engines (`stubEngine`, `recordingEngine` in the pipeline package), no Docker.
+- **Integration tests** (`integration` tag): testcontainers-go boots `mysql:8.0` and `postgres:16` — `go test -tags=integration -race -count=1 ./internal/...`. Run on Linux in CI; same-engine tests live in each engine package, cross-engine tests in `internal/pipeline`.
+- **PostGIS tests** (`integration && postgis` tag): adds the `postgis/postgis:16-3.4` image (~600 MB). Single test (`TestMigrate_PostGIS_MySQLToPG`) gated behind a separate tag so the default integration suite doesn't pull the heavier image.
+- **VStream tests** (`integration && vstream` tag): adds the `vitess/vttestserver:mysql80` image (~700 MB). Five tests covering the FlavorPlanetScale CDC + snapshot paths against a vanilla Vitess cluster — same image cost concern as PostGIS, hence the separate tag.
+- **PlanetScale verification tests** (`psverify` tag): hits a real PlanetScale account via env vars / a repo-root `PLANETSCALE_CREDENTIALS.env` file. Manual-trigger only via `.github/workflows/psverify.yml`; never runs on push. Use these to validate against actual product quirks the in-container tests can't reach.
 
 Same-engine tests are sanity. Cross-engine tests are validation. Add a cross-engine test before claiming a feature works end-to-end.
+
+Local Windows note: the integration suites need `export TESTCONTAINERS_RYUK_DISABLED=true` because Rancher Desktop's daemon kills the ryuk reaper container; CI on Linux is unaffected. See [docs/dev/development.md](docs/dev/development.md) for the full local setup.
 
 ## CI shape
 

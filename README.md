@@ -1,10 +1,33 @@
 # sluice
 
-An open-source tool for migrating and continuously syncing data between relational databases. The initial release ships with MySQL and PostgreSQL support in all four directions; the architecture is deliberately engine-neutral so additional engines can be added later.
+An open-source tool for migrating and continuously syncing data between relational databases. The initial release ships with MySQL and PostgreSQL support in all four directions, plus PlanetScale-flavored MySQL via Vitess VStream; the architecture is deliberately engine-neutral so additional engines can be added later.
+
+## In a nutshell
+
+```bash
+go install github.com/orware/sluice/cmd/sluice@latest
+
+# One-shot migration: MySQL → Postgres, with --dry-run to preview the plan first.
+sluice migrate \
+    --source-driver mysql    --source 'root:rootpw@tcp(localhost:3306)/app' \
+    --target-driver postgres --target 'postgres://postgres:pgpw@localhost:5432/app?sslmode=disable' \
+    --dry-run
+
+# Continuous sync: same DSNs, runs until Ctrl-C; restart with the same --stream-id resumes
+# from the persisted position (no re-snapshot, no gap).
+sluice sync start \
+    --source-driver mysql    --source 'root:rootpw@tcp(localhost:3306)/app' \
+    --target-driver postgres --target 'postgres://postgres:pgpw@localhost:5432/app?sslmode=disable' \
+    --stream-id myapp-prod
+
+# Operational visibility — every stream the target has been a destination for, sorted by recency.
+sluice sync status \
+    --target-driver postgres --target 'postgres://postgres:pgpw@localhost:5432/app?sslmode=disable'
+```
 
 ## Quickstart
 
-The fastest way to see what sluice does is to run it. The walkthrough at [docs/examples/quickstart.md](docs/examples/quickstart.md) sets up a MySQL 8.0 + Postgres 16 pair via Docker Compose, loads the sakila sample database, and runs both a one-shot bulk migration and a continuous-sync stream — about 10 minutes start to finish.
+The fastest way to actually see sluice work end-to-end is the walkthrough at [docs/examples/quickstart.md](docs/examples/quickstart.md): MySQL 8.0 + Postgres 16 via Docker Compose, loads the sakila sample database, runs both a one-shot migration and a continuous-sync stream — about 10 minutes start to finish.
 
 ## Status
 
