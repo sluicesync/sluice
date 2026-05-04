@@ -21,7 +21,6 @@ import (
 	"bufio"
 	"context"
 	"database/sql"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -174,7 +173,6 @@ func TestPSPipeline_MigratePGToPG(t *testing.T) {
 		Target:    pgEng,
 		SourceDSN: withPSSchema(pgSrc, schemaName),
 		TargetDSN: withPSSchema(pgDest, schemaName),
-		Stdout:    io.Discard,
 	}
 	if err := mig.Run(ctx); err != nil {
 		t.Fatalf("Migrator.Run: %v", err)
@@ -383,7 +381,6 @@ func TestPSPipeline_MigrateMySQLToPG(t *testing.T) {
 		Target:    pgEng,
 		SourceDSN: mysqlSrc,
 		TargetDSN: withPSSchema(pgDest, targetSchema),
-		Stdout:    io.Discard,
 	}
 	if err := mig.Run(ctx); err != nil {
 		t.Fatalf("Migrator.Run: %v", err)

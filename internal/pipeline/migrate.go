@@ -17,6 +17,12 @@
 // The package does not depend on any specific engine package; engines
 // are passed in as [ir.Engine] values, typically resolved by the CLI
 // from the engines registry.
+//
+// Output goes through [log/slog]. The CLI configures the default
+// handler (level, destination) in cmd/sluice/main.go; this package
+// emits structured key/value lines via slog.Default(). Tests that
+// want to assert on log output swap the default handler with a
+// buffer-backed one for the duration of the test.
 package pipeline
 
 import (
@@ -24,11 +30,19 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
+	"time"
 
 	"github.com/orware/sluice/internal/config"
 	"github.com/orware/sluice/internal/ir"
 	"github.com/orware/sluice/internal/translate"
 )
+
+// progressInterval is how often the bulk-copy progress ticker emits a
+// line for a table that is actively receiving rows. Two seconds is the
+// shortest cadence that still feels alive to a human watching tail -f
+// without spamming aggregators on a many-table migration.
+const progressInterval = 2 * time.Second
 
 // Migrator runs a single simple-mode migration from Source/SourceDSN to
 // Target/TargetDSN. Construct the value, then call Run with a context.
@@ -58,10 +72,6 @@ type Migrator struct {
 	// target. Useful for verifying connectivity and previewing the
 	// migration plan.
 	DryRun bool
-
-	// Stdout is where dry-run plan output goes. Defaults to os.Stdout
-	// when nil; tests can supply a buffer.
-	Stdout io.Writer
 
 	// Mappings is the per-column type-override list from sluice.yaml.
 	// Applied after ReadSchema and before the schema-write phase, so
@@ -96,7 +106,7 @@ func (m *Migrator) Run(ctx context.Context) error {
 		return fmt.Errorf("pipeline: read source schema: %w", err)
 	}
 	if len(schema.Tables) == 0 {
-		m.printf("pipeline: source schema has no tables; nothing to migrate\n")
+		slog.InfoContext(ctx, "source schema has no tables; nothing to migrate")
 		return nil
 	}
 
@@ -107,7 +117,7 @@ func (m *Migrator) Run(ctx context.Context) error {
 	}
 
 	if m.DryRun {
-		return m.printPlan(schema)
+		return m.logPlan(ctx, schema)
 	}
 
 	// ---- 2. Open target writers ----
@@ -134,7 +144,7 @@ func (m *Migrator) Run(ctx context.Context) error {
 		return err
 	}
 
-	m.printf("pipeline: migrated %d tables\n", len(schema.Tables))
+	slog.InfoContext(ctx, "migration complete", slog.Int("tables", len(schema.Tables)))
 	return nil
 }
 
@@ -201,36 +211,48 @@ func (m *Migrator) validate() error {
 // copyTable opens the source-side row stream, hands it off to the
 // target writer, and waits for completion. The reader's lifetime
 // covers exactly one table; the writer is reused across tables.
+//
+// A [progressTicker] sits in the pipe between reader and writer: it
+// counts every row the orchestrator hands to the writer and emits a
+// slog line every [progressInterval]. Stop is called via defer so
+// progress reporting terminates even on writer error.
 func copyTable(ctx context.Context, rr ir.RowReader, rw ir.RowWriter, table *ir.Table) error {
 	rows, err := rr.ReadRows(ctx, table)
 	if err != nil {
 		return fmt.Errorf("read rows: %w", err)
 	}
-	if err := rw.WriteRows(ctx, table, rows); err != nil {
+	pt := newProgressTicker(ctx, progressInterval, table.Name)
+	defer pt.Stop(ctx)
+
+	teed := teeRows(ctx, rows, pt.inc)
+	if err := rw.WriteRows(ctx, table, teed); err != nil {
 		return fmt.Errorf("write rows: %w", err)
 	}
 	return nil
 }
 
-// printPlan writes a human-readable summary of what Run would do,
-// without performing any writes. Used when DryRun is true.
-func (m *Migrator) printPlan(schema *ir.Schema) error {
-	m.printf("DRY RUN — would migrate %s → %s\n", m.Source.Name(), m.Target.Name())
-	m.printf("  %d tables to create, populate, and constrain:\n", len(schema.Tables))
+// logPlan writes a human-readable summary of what Run would do via
+// slog, without performing any writes. Used when DryRun is true.
+//
+// The plan is logged at Info level so it surfaces under the default
+// handler. The header line is a single message; the per-table lines
+// follow with structured attributes so an aggregator can pick out
+// individual table summaries without parsing prose.
+func (m *Migrator) logPlan(ctx context.Context, schema *ir.Schema) error {
+	slog.InfoContext(ctx, "dry run: migration plan",
+		slog.String("source", m.Source.Name()),
+		slog.String("target", m.Target.Name()),
+		slog.Int("tables", len(schema.Tables)),
+	)
 	for _, t := range schema.Tables {
-		m.printf("    - %s  (%d columns, %d indexes, %d foreign keys)\n",
-			t.Name, len(t.Columns), len(t.Indexes), len(t.ForeignKeys))
+		slog.InfoContext(ctx, "dry run: table",
+			slog.String("name", t.Name),
+			slog.Int("columns", len(t.Columns)),
+			slog.Int("indexes", len(t.Indexes)),
+			slog.Int("foreign_keys", len(t.ForeignKeys)),
+		)
 	}
 	return nil
-}
-
-// printf writes formatted output to m.Stdout, defaulting to discarding
-// when no writer is configured.
-func (m *Migrator) printf(format string, args ...any) {
-	if m.Stdout == nil {
-		return
-	}
-	fmt.Fprintf(m.Stdout, format, args...)
 }
 
 // closeIf calls Close on v if it implements io.Closer. Used to clean

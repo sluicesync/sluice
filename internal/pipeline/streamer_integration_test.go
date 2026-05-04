@@ -205,7 +205,6 @@ func TestStreamer_PostgresToPostgres(t *testing.T) {
 		SourceDSN: sourceDSN,
 		TargetDSN: targetDSN,
 		Applier:   applier,
-		// Stdout left nil → progress messages discarded.
 	}
 
 	// Run the streamer in a goroutine; cancel via ctx when we're done.

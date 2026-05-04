@@ -15,7 +15,6 @@ package pipeline
 import (
 	"context"
 	"database/sql"
-	"io"
 	"testing"
 	"time"
 
@@ -53,7 +52,6 @@ func TestMigrate_Mappings_PGToPG(t *testing.T) {
 		Target:    pgEng,
 		SourceDSN: sourceDSN,
 		TargetDSN: targetDSN,
-		Stdout:    io.Discard,
 		Mappings: []config.Mapping{
 			{Table: "events", Column: "payload", TargetType: "jsonb"},
 		},
@@ -98,7 +96,6 @@ func TestMigrate_Mappings_UnknownTable_FailsLoud(t *testing.T) {
 		Target:    pgEng,
 		SourceDSN: sourceDSN,
 		TargetDSN: targetDSN,
-		Stdout:    io.Discard,
 		Mappings: []config.Mapping{
 			// Typo: "event" instead of "events".
 			{Table: "event", Column: "payload", TargetType: "jsonb"},

@@ -4,12 +4,24 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"io"
+	"log/slog"
 	"strings"
 	"testing"
 
 	"github.com/orware/sluice/internal/ir"
 )
+
+// captureSlog swaps slog.Default with a text handler writing into buf
+// for the duration of the test, restoring the previous default on
+// cleanup. Use it when an assertion needs to look at logged output.
+func captureSlog(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	prev := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	var buf bytes.Buffer
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	return &buf
+}
 
 func TestRunValidates(t *testing.T) {
 	cases := []struct {
@@ -60,7 +72,6 @@ func TestRunEmptySchema(t *testing.T) {
 	m := &Migrator{
 		Source: src, Target: tgt,
 		SourceDSN: "src", TargetDSN: "tgt",
-		Stdout: io.Discard,
 	}
 	if err := m.Run(context.Background()); err != nil {
 		t.Fatalf("Run: %v", err)
@@ -80,12 +91,11 @@ func TestRunDryRunDoesNotOpenWriters(t *testing.T) {
 	src.schema = sampleSchema()
 	tgt := newRecordingEngine("target")
 
-	var buf bytes.Buffer
+	logs := captureSlog(t)
 	m := &Migrator{
 		Source: src, Target: tgt,
 		SourceDSN: "src", TargetDSN: "tgt",
 		DryRun: true,
-		Stdout: &buf,
 	}
 	if err := m.Run(context.Background()); err != nil {
 		t.Fatalf("Run: %v", err)
@@ -97,8 +107,8 @@ func TestRunDryRunDoesNotOpenWriters(t *testing.T) {
 	if tgt.openRowWriterCalls != 0 {
 		t.Errorf("OpenRowWriter called %d times in dry run; want 0", tgt.openRowWriterCalls)
 	}
-	if !strings.Contains(buf.String(), "DRY RUN") {
-		t.Errorf("expected dry-run output to mention 'DRY RUN'; got %q", buf.String())
+	if !strings.Contains(logs.String(), "dry run: migration plan") {
+		t.Errorf("expected dry-run log to mention plan; got %q", logs.String())
 	}
 }
 
@@ -110,7 +120,6 @@ func TestRunCallsThreePhasesInOrder(t *testing.T) {
 	m := &Migrator{
 		Source: src, Target: tgt,
 		SourceDSN: "src", TargetDSN: "tgt",
-		Stdout: io.Discard,
 	}
 	if err := m.Run(context.Background()); err != nil {
 		t.Fatalf("Run: %v", err)

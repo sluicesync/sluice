@@ -104,7 +104,6 @@ func (m *MigrateCmd) Run(g *Globals) error {
 		SourceDSN: m.Source,
 		TargetDSN: m.Target,
 		DryRun:    m.DryRun,
-		Stdout:    os.Stdout,
 		Mappings:  cfg.Mappings,
 	}
 	return mig.Run(kongContext())
@@ -172,7 +171,6 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 		SourceDSN: s.Source,
 		TargetDSN: s.Target,
 		StreamID:  s.StreamID,
-		Stdout:    os.Stdout,
 		Mappings:  cfg.Mappings,
 		DryRun:    s.DryRun,
 	}

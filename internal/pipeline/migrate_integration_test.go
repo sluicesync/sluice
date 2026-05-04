@@ -11,7 +11,6 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"io"
 	"reflect"
 	"testing"
 	"time"
@@ -187,7 +186,6 @@ func TestMigrate_MySQLToMySQL(t *testing.T) {
 		Target:    mysqlEng,
 		SourceDSN: sourceDSN,
 		TargetDSN: targetDSN,
-		Stdout:    io.Discard,
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)

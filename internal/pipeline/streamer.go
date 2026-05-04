@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
+	"log/slog"
 	"net/url"
 	"strings"
 
@@ -56,12 +56,6 @@ type Streamer struct {
 	// does NOT call Close on it.
 	Applier ir.ChangeApplier
 
-	// Stdout receives human-readable progress messages — most
-	// importantly, the captured snapshot Position (cold start) or
-	// the resumed Position (warm resume), and the resolved
-	// stream_id. Defaults to discarding when nil.
-	Stdout io.Writer
-
 	// Mappings is the per-column type-override list from sluice.yaml.
 	// Consumed only on the cold-start path, where the schema-apply
 	// phase needs the rewritten types. Warm resume reuses the target
@@ -94,7 +88,7 @@ func (s *Streamer) Run(ctx context.Context) error {
 		return err
 	}
 	streamID := s.resolveStreamID()
-	s.printf("pipeline: stream_id = %q\n", streamID)
+	slog.InfoContext(ctx, "stream starting", slog.String("stream_id", streamID))
 
 	// ---- 1. Open / wire the applier first ----
 	applier, ownsApplier, err := s.openApplier(ctx)
@@ -123,7 +117,7 @@ func (s *Streamer) Run(ctx context.Context) error {
 
 	// ---- 3.5. Dry-run: print plan and exit before any state mutation. ----
 	if s.DryRun {
-		return s.printDryRunPlan(ctx, streamID, persisted, found)
+		return s.logDryRunPlan(ctx, streamID, persisted, found)
 	}
 
 	// ---- 4. Branch: cold start vs warm resume ----
@@ -152,28 +146,35 @@ func (s *Streamer) Run(ctx context.Context) error {
 	return nil
 }
 
-// printDryRunPlan describes what Run would do without doing it.
-// Cold-start prints the source schema summary so operators can
-// catch missing-tables / unexpected-column-counts before the
-// migration starts; warm-resume prints the persisted position
-// token (truncated for readability) so operators can see whether
-// the stream is positioned where they expect.
+// logDryRunPlan describes what Run would do without doing it via
+// structured slog records. Cold-start logs the source schema summary
+// so operators can catch missing-tables / unexpected-column-counts
+// before the migration starts; warm-resume logs the persisted
+// position token (truncated for readability) so operators can see
+// whether the stream is positioned where they expect.
 //
 // The source schema read for cold-start is the only source-side
 // touch the dry-run does — same level of access the regular
 // cold-start would do, just without then opening the snapshot
 // stream or starting CDC.
-func (s *Streamer) printDryRunPlan(ctx context.Context, streamID string, persisted ir.Position, found bool) error {
-	s.printf("DRY RUN — would stream %s://%s → %s://%s\n",
-		s.Source.Name(), redactedHost(s.SourceDSN),
-		s.Target.Name(), redactedHost(s.TargetDSN))
-	s.printf("  stream_id: %q\n", streamID)
+func (s *Streamer) logDryRunPlan(ctx context.Context, streamID string, persisted ir.Position, found bool) error {
+	slog.InfoContext(ctx, "dry run: stream plan",
+		slog.String("source", s.Source.Name()),
+		slog.String("source_host", redactedHost(s.SourceDSN)),
+		slog.String("target", s.Target.Name()),
+		slog.String("target_host", redactedHost(s.TargetDSN)),
+		slog.String("stream_id", streamID),
+	)
 	if found {
-		s.printf("  warm resume from persisted position\n")
-		s.printf("  position token: %s\n", truncateDryRunToken(persisted.Token, 80))
+		slog.InfoContext(ctx, "dry run: warm resume from persisted position",
+			slog.String("stream_id", streamID),
+			slog.String("position_token", truncateDryRunToken(persisted.Token, 80)),
+		)
 		return nil
 	}
-	s.printf("  cold start — would capture snapshot, bulk-copy, then start CDC\n")
+	slog.InfoContext(ctx, "dry run: cold start — would capture snapshot, bulk-copy, then start CDC",
+		slog.String("stream_id", streamID),
+	)
 
 	sr, err := s.Source.OpenSchemaReader(ctx, s.SourceDSN)
 	if err != nil {
@@ -185,16 +186,22 @@ func (s *Streamer) printDryRunPlan(ctx context.Context, streamID string, persist
 		return fmt.Errorf("pipeline: dry-run: read source schema: %w", err)
 	}
 	if len(schema.Tables) == 0 {
-		s.printf("  source schema has no tables — nothing to stream\n")
+		slog.InfoContext(ctx, "dry run: source schema has no tables — nothing to stream")
 		return nil
 	}
 	if _, err := translate.ApplyMappings(schema, s.Mappings); err != nil {
 		return fmt.Errorf("pipeline: dry-run: apply mappings: %w", err)
 	}
-	s.printf("  %d tables to bulk-copy and then tail via CDC:\n", len(schema.Tables))
+	slog.InfoContext(ctx, "dry run: tables to bulk-copy and tail via CDC",
+		slog.Int("tables", len(schema.Tables)),
+	)
 	for _, t := range schema.Tables {
-		s.printf("    - %s  (%d columns, %d indexes, %d foreign keys)\n",
-			t.Name, len(t.Columns), len(t.Indexes), len(t.ForeignKeys))
+		slog.InfoContext(ctx, "dry run: table",
+			slog.String("name", t.Name),
+			slog.Int("columns", len(t.Columns)),
+			slog.Int("indexes", len(t.Indexes)),
+			slog.Int("foreign_keys", len(t.ForeignKeys)),
+		)
 	}
 	return nil
 }
@@ -226,7 +233,9 @@ func (s *Streamer) openApplier(ctx context.Context) (ir.ChangeApplier, bool, err
 // warmResume opens a CDC reader on the source and starts streaming
 // from the persisted position. No snapshot, no bulk-copy.
 func (s *Streamer) warmResume(ctx context.Context, persisted ir.Position) (<-chan ir.Change, error) {
-	s.printf("pipeline: warm resume from persisted position {token=%s}\n", persisted.Token)
+	slog.InfoContext(ctx, "warm resume from persisted position",
+		slog.String("position_token", persisted.Token),
+	)
 	cdc, err := s.Source.OpenCDCReader(ctx, s.SourceDSN)
 	if err != nil {
 		return nil, fmt.Errorf("pipeline: open cdc reader: %w", err)
@@ -256,7 +265,7 @@ func (s *Streamer) coldStart(ctx context.Context) (<-chan ir.Change, error) {
 		return nil, fmt.Errorf("pipeline: read source schema: %w", err)
 	}
 	if len(schema.Tables) == 0 {
-		s.printf("pipeline: source schema has no tables; nothing to stream\n")
+		slog.InfoContext(ctx, "source schema has no tables; nothing to stream")
 		return nil, nil
 	}
 
@@ -275,7 +284,9 @@ func (s *Streamer) coldStart(ctx context.Context) (<-chan ir.Change, error) {
 	// stream.Close is deferred by the caller indirectly via
 	// Streamer.Run's defer chain — we keep the handle alive past
 	// this function so the snapshot+CDC pair stays valid.
-	s.printf("pipeline: cold start; snapshot captured at {token=%s}\n", stream.Position.Token)
+	slog.InfoContext(ctx, "cold start; snapshot captured",
+		slog.String("position_token", stream.Position.Token),
+	)
 
 	sw, err := s.Target.OpenSchemaWriter(ctx, s.TargetDSN)
 	if err != nil {
@@ -297,7 +308,7 @@ func (s *Streamer) coldStart(ctx context.Context) (<-chan ir.Change, error) {
 	}
 	closeIf(rw)
 	closeIf(sw)
-	s.printf("pipeline: bulk-copy complete; entering CDC mode\n")
+	slog.InfoContext(ctx, "bulk-copy complete; entering CDC mode")
 
 	changes, err := stream.Changes.StreamChanges(ctx, stream.Position)
 	if err != nil {
@@ -388,13 +399,4 @@ func redactedHost(dsn string) string {
 		return host + ":" + port
 	}
 	return host
-}
-
-// printf writes formatted output to s.Stdout, defaulting to
-// discarding when no writer is configured.
-func (s *Streamer) printf(format string, args ...any) {
-	if s.Stdout == nil {
-		return
-	}
-	fmt.Fprintf(s.Stdout, format, args...)
 }

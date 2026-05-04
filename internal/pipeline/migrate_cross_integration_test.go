@@ -17,7 +17,6 @@ package pipeline
 import (
 	"context"
 	"database/sql"
-	"io"
 	"strings"
 	"testing"
 	"time"
@@ -114,7 +113,6 @@ func TestMigrate_MySQLToPostgres(t *testing.T) {
 		Target:    pgEng,
 		SourceDSN: mysqlSource,
 		TargetDSN: pgTarget,
-		Stdout:    io.Discard,
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)

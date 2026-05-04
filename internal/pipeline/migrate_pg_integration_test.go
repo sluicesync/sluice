@@ -11,7 +11,6 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"io"
 	"net/url"
 	"strings"
 	"testing"
@@ -166,7 +165,6 @@ func TestMigrate_PostgresToPostgres(t *testing.T) {
 		Target:    pgEng,
 		SourceDSN: sourceDSN,
 		TargetDSN: targetDSN,
-		Stdout:    io.Discard,
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)

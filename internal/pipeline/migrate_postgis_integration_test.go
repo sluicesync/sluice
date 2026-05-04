@@ -14,7 +14,6 @@ package pipeline
 import (
 	"context"
 	"database/sql"
-	"io"
 	"testing"
 	"time"
 
@@ -137,7 +136,6 @@ func TestMigrate_PostGIS_MySQLToPG(t *testing.T) {
 		Target:    pgEng,
 		SourceDSN: mysqlSource,
 		TargetDSN: pgTarget,
-		Stdout:    io.Discard,
 		// MySQL POINT comes through as ir.Geometry{Subtype: GeometryPoint}
 		// without a SRID. The mapping override sets SRID=4326 so the PG
 		// column emerges as geometry(POINT, 4326) and the EWKB framing
