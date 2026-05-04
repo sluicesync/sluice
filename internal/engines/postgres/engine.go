@@ -155,6 +155,26 @@ func (Engine) OpenCDCReader(ctx context.Context, dsn string) (ir.CDCReader, erro
 	}, nil
 }
 
+// OpenSlotManager returns a [SlotManager] bound to the database
+// identified by dsn. Used by the `sluice slot list` and `sluice slot
+// drop` CLI commands to manage logical-replication slots from the
+// outside (separate from the CDC reader's implicit slot lifecycle).
+//
+// Implements [ir.SlotManagerOpener]; the CLI checks for this method
+// via type assertion so engines without slot management (e.g. MySQL)
+// can simply omit the method.
+func (Engine) OpenSlotManager(ctx context.Context, dsn string) (ir.SlotManager, error) {
+	cfg, err := parseDSN(dsn)
+	if err != nil {
+		return nil, err
+	}
+	db, err := openDB(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	return &SlotManager{db: db}, nil
+}
+
 // OpenChangeApplier returns a [ChangeApplier] bound to the database
 // identified by dsn. The caller is responsible for closing the
 // returned applier (via its Close method) to release the underlying

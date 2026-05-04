@@ -109,6 +109,69 @@ type StreamStatus struct {
 	UpdatedAt time.Time
 }
 
+// SlotInfo describes one row of an engine's logical-replication slot
+// inventory. The shape is engine-neutral but the underlying concept is
+// Postgres-specific today (logical replication slots). Future engines
+// with similar resume-state primitives — e.g. Vitess named tablet
+// vstream cursors — could surface the same struct.
+//
+// WALStatus is the verbatim wal_status string from
+// pg_replication_slots: "reserved", "extended", "unreserved", "lost",
+// or empty (older PG releases). Operators glance at this column to
+// spot slots about to be invalidated. ConfirmedFlushLSN is the slot's
+// last-acknowledged consume position, useful for spotting stalled or
+// abandoned slots whose consumer hasn't advanced.
+type SlotInfo struct {
+	Name              string
+	Plugin            string
+	Active            bool
+	WALStatus         string
+	RestartLSN        string
+	ConfirmedFlushLSN string
+}
+
+// SlotManager is the engine-neutral surface for managing logical-
+// replication slots from the operator-facing CLI (`sluice slot list`,
+// `sluice slot drop`). Engines without a notion of replication slots
+// don't implement it; the CLI checks for the optional
+// `OpenSlotManager` method on the engine via type assertion and
+// reports a clear error when the engine doesn't expose one.
+//
+// Slot management is destructive on the source side, so the CLI
+// confirms before invoking [SlotManager.Drop] unless `--yes` is
+// passed. Implementations should be idempotent on Drop: dropping a
+// non-existent slot is a no-op rather than an error, mirroring
+// Postgres' pg_drop_replication_slot semantics for the CLI's
+// `--if-exists` mode.
+type SlotManager interface {
+	// List returns every replication slot visible to the connecting
+	// role. The result is sorted by name for stable CLI output.
+	List(ctx context.Context) ([]SlotInfo, error)
+
+	// Drop removes the named slot. Returns an error wrapping
+	// [sql.ErrNoRows] (or an engine-specific marker) when the slot
+	// does not exist; callers can branch on that to honor a
+	// `--if-exists` mode.
+	//
+	// Drop refuses to remove an active slot — an in-flight CDC
+	// consumer is connected to it and yanking the slot would crash
+	// that stream. Pass force=true to override (the operator has
+	// confirmed they intend to disconnect the consumer).
+	Drop(ctx context.Context, name string, force bool) error
+
+	// Close releases the underlying connection pool.
+	Close() error
+}
+
+// SlotManagerOpener is the optional interface engines implement to
+// expose slot management to the CLI. The CLI checks for this method
+// via type assertion and reports a clear error when the engine
+// doesn't implement it (e.g. MySQL, where slot management isn't a
+// concept on the source side).
+type SlotManagerOpener interface {
+	OpenSlotManager(ctx context.Context, dsn string) (SlotManager, error)
+}
+
 // Engine is the bundle of operations a database engine implementation
 // provides. Engine packages register themselves with the engines
 // registry at init time; the orchestrator looks them up by name based
