@@ -565,8 +565,10 @@ func stripTypeCast(s string) string {
 	}
 	suffix := s[idx+2:]
 	for _, r := range suffix {
-		if !(r >= 'a' && r <= 'z') && !(r >= 'A' && r <= 'Z') &&
-			!(r >= '0' && r <= '9') && r != '_' && r != ' ' && r != '"' &&
+		// De-Morgan'd: each clause is "r is NOT in <range>"; the
+		// cumulative AND yields "r is none of the allowed chars".
+		if (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') &&
+			(r < '0' || r > '9') && r != '_' && r != ' ' && r != '"' &&
 			r != '.' && r != '(' && r != ')' && r != ',' {
 			return s
 		}

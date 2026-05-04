@@ -153,21 +153,17 @@ jobs:
           go-version-file: "go.mod"
       - uses: golangci/golangci-lint-action@v6
         with:
-          # Pinned to the v1 line because .golangci.yml is still in v1
-          # schema. golangci-lint v2 (released early 2026) reworked the
-          # config layout; migrating is a follow-up. Until then, "latest"
-          # would resolve to v2 and fail the lint step with
-          # `unsupported version of the configuration: ""`.
-          #
-          # We can't use install-mode: goinstall here because @v6 of the
-          # action hardcodes the v2 module path
-          # (github.com/golangci/golangci-lint/v2/cmd/...) for goinstall;
-          # v1 lives at the unversioned path. Falling back to the default
-          # binary install means the action downloads a pre-built v1.64.8
-          # release artifact, which is fine for our codebase — none of
-          # our packages require a newer Go for type-checking than what
-          # the v1.64.8 release was built with.
-          version: v1.64.8
+          # 'latest' tracks the most recent stable release of
+          # golangci-lint (v2.x as of 2026). Our .golangci.yml is in v2
+          # schema — see the file header for the migration notes.
+          version: latest
+          # install-mode: goinstall compiles golangci-lint from source
+          # using the Go toolchain we just installed, so the linter's
+          # embedded type-checker matches the Go version declared in
+          # go.mod. The pre-built v2 binary releases lag a Go version
+          # or two behind, which would fail to typecheck packages that
+          # require the newer Go (the issue we hit on the v0.3.0 build).
+          install-mode: goinstall
           # Fail the job on any issue. Combined with branch protection
           # this means you can't merge until lint is clean.
           args: --timeout=5m

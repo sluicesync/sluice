@@ -1,4 +1,4 @@
-# golangci-lint configuration.
+# golangci-lint configuration (v2 schema).
 #
 # golangci-lint runs a curated set of Go static analyzers in a single
 # pass. Adding a linter here makes the lint job in CI enforce it.
@@ -11,49 +11,44 @@
 #   golangci-lint run ./...
 # Install: https://golangci-lint.run/welcome/install/
 #
-# This file is in golangci-lint v1 schema. CI's lint job pins
-# golangci-lint to a v1.x release for compatibility. The v2 schema
-# migration is queued as a roadmap follow-up; see the migration guide
-# at https://golangci-lint.run/docs/product/migration-guide/ when
-# we're ready to do it.
+# v1→v2 migration notes (the v2 release reworked the config layout):
+#   - `version: "2"` is now required at the top.
+#   - `linters.disable-all: true` → `linters.default: none`.
+#   - `linters-settings:` → `linters.settings:`.
+#   - `issues.exclude-dirs:` → `linters.exclusions.paths:`.
+#   - Formatters (gofumpt, goimports, gofmt, gci) split out into a
+#     top-level `formatters:` section with their own enable list.
+#   - `gosimple` was merged into `staticcheck`; we drop it from the
+#     enable list since it's now redundant.
+# Migration guide: https://golangci-lint.run/docs/product/migration-guide/
+
+version: "2"
 
 run:
   # Maximum time the run is allowed to take before being killed. Five
   # minutes is generous; most runs finish in seconds.
   timeout: 5m
-  # Lint code targeting this Go version. Pinned to 1.24 because the
-  # CI-installed golangci-lint v1.64.8 binary was built with Go 1.24,
-  # and lint refuses to run when its build-time Go is older than the
-  # config's target Go ("the Go language version (go1.24) used to
-  # build golangci-lint is lower than the targeted Go version"). We
-  # don't use 1.25/1.26-specific syntax, so lint targeting 1.24 still
-  # catches everything we care about. Bump this back to match go.mod
-  # once we migrate to golangci-lint v2.
-  go: "1.24"
 
 linters:
   # Start from a clean slate so the enabled set is explicit.
-  disable-all: true
+  default: none
   enable:
     # ---- Default-on linters (correctness) ----
     - errcheck      # unchecked error returns
     - govet         # the standard `go vet` suite
-    - ineffassign   # ineffective assignments (a := 1; a = 2; without using the first)
-    - staticcheck   # large suite of static analysis checks (SA*, ST*, S1*)
+    - ineffassign   # ineffective assignments
+    - staticcheck   # large suite of static analysis checks (absorbs gosimple in v2)
     - unused        # unused declarations
-    - gosimple      # suggest simpler code (S1xxx)
 
     # ---- Additional correctness / safety ----
     - bodyclose     # ensure http.Response.Body is closed
     - errorlint     # use errors.Is/As/%w instead of == comparisons
     - nilerr        # returning nil when an error was just received
     - noctx         # HTTP requests without context.Context
-    - sqlclosecheck # ensure sql.Rows/Stmt are closed (relevant for engines)
+    - sqlclosecheck # ensure sql.Rows/Stmt are closed
     - rowserrcheck  # check rows.Err() after iteration
 
     # ---- Style / hygiene ----
-    - gofumpt       # stricter gofmt; enforces a few extra stylistic choices
-    - goimports     # sorts and groups imports
     - misspell      # common spelling mistakes in comments/strings
     - unconvert     # unnecessary type conversions
     - whitespace    # trailing whitespace on lines
@@ -63,69 +58,78 @@ linters:
     - gocritic      # opinionated but useful idiomatic suggestions
     - prealloc      # suggest slice preallocation when length is known
 
-linters-settings:
-  errcheck:
-    # Don't require checking errors from these functions. Adjust as
-    # needed when patterns emerge.
-    exclude-functions:
-      - (io.Closer).Close              # generic Close — usually unused on read paths
-      - (*database/sql.Rows).Close     # deferred Rows.Close after Scan loop
-      - (*database/sql.Stmt).Close
-      - (*database/sql.DB).Close
-      - fmt.Fprint                     # CLI usage/help text writes — error not actionable
-      - fmt.Fprintln
-      - fmt.Fprintf
+  settings:
+    errcheck:
+      # Don't require checking errors from these functions. Adjust as
+      # needed when patterns emerge.
+      exclude-functions:
+        - (io.Closer).Close              # generic Close — usually unused on read paths
+        - (*database/sql.Rows).Close     # deferred Rows.Close after Scan loop
+        - (*database/sql.Stmt).Close
+        - (*database/sql.DB).Close
+        - fmt.Fprint                     # CLI usage/help text writes — error not actionable
+        - fmt.Fprintln
+        - fmt.Fprintf
 
-  revive:
-    # Confidence threshold: 0.0 = report everything, 1.0 = only the most
-    # certain. 0.8 is a good middle ground.
-    confidence: 0.8
-    rules:
-      - name: var-naming
-      - name: package-comments
-      - name: exported
-        arguments:
-          # Skip the comment-required check on methods. Sealed-interface
-          # impls (e.g. every IR type's Tier() method) are pure
-          # boilerplate; one-liner comments would just repeat the
-          # method name and add noise. Comments on exported types,
-          # functions, and constants are still required.
-          - disableChecksOnMethods
-      - name: indent-error-flow
-      - name: error-return
-      - name: error-strings
-      - name: error-naming
-      - name: if-return
-      - name: range
-      - name: receiver-naming
-      - name: time-naming
-      - name: unused-parameter
-      - name: unreachable-code
+    revive:
+      # Confidence threshold: 0.0 = report everything, 1.0 = only the
+      # most certain. 0.8 is a good middle ground.
+      confidence: 0.8
+      rules:
+        - name: var-naming
+        - name: package-comments
+        - name: exported
+          arguments:
+            # Skip the comment-required check on methods. Sealed-
+            # interface impls (e.g. every IR type's Tier() method) are
+            # pure boilerplate; one-liner comments would just repeat
+            # the method name and add noise. Comments on exported
+            # types, functions, and constants are still required.
+            - disableChecksOnMethods
+        - name: indent-error-flow
+        - name: error-return
+        - name: error-strings
+        - name: error-naming
+        - name: if-return
+        - name: range
+        - name: receiver-naming
+        - name: time-naming
+        - name: unused-parameter
+        - name: unreachable-code
 
-  goimports:
-    local-prefixes: github.com/orware/sluice  # group sluice imports separately
+    gocritic:
+      # A subset of gocritic's many checks. The defaults include a few
+      # that are too opinionated for this project.
+      enabled-tags:
+        - diagnostic
+        - performance
+        - style
+      disabled-checks:
+        - whyNoLint        # we accept explicit nolint directives
+        - hugeParam        # encourages excessive pointer use
+        - rangeValCopy     # noisy on small structs
 
-  gocritic:
-    # A subset of gocritic's many checks. The defaults include a few
-    # that are too opinionated for this project.
-    enabled-tags:
-      - diagnostic
-      - performance
-      - style
-    disabled-checks:
-      - whyNoLint        # we accept explicit nolint directives
-      - hugeParam        # encourages excessive pointer use
-      - rangeValCopy     # noisy on small structs
+  exclusions:
+    # Don't lint generated or fixture code.
+    paths:
+      - test/golden
+      - test/fixtures
+
+formatters:
+  # gofumpt + goimports were linters in v1; v2 separates formatters
+  # from linters because the run model differs (formatters can be
+  # auto-applied; linters can't).
+  enable:
+    - gofumpt
+    - goimports
+  settings:
+    goimports:
+      # Group sluice imports separately from third-party deps.
+      local-prefixes:
+        - github.com/orware/sluice
 
 issues:
-  # Don't lint generated or fixture code.
-  exclude-dirs:
-    - test/golden
-    - test/fixtures
   # Caps to keep output manageable on a fresh codebase. Remove these
   # caps later if you want exhaustive output.
   max-issues-per-linter: 50
   max-same-issues: 10
-  # Don't suppress new findings just because they appear in a file with
-  # existing issues — that's how lint debt accumulates.
-  exclude-use-default: false

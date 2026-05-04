@@ -62,7 +62,7 @@ func main() {
 			"version": fmt.Sprintf("sluice %s (commit %s, built %s)", version, commit, date),
 		},
 	)
-	configureLogging(cli.Globals.LogLevel)
+	configureLogging(cli.LogLevel)
 	err := ctx.Run(&cli.Globals)
 	ctx.FatalIfErrorf(err)
 }

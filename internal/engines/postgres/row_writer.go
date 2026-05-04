@@ -266,11 +266,11 @@ func prepareValue(v any, t ir.Type) (any, error) {
 	}
 
 	if arr, isArr := t.(ir.Array); isArr {
-		any, ok := v.([]any)
+		elems, ok := v.([]any)
 		if !ok {
 			return nil, fmt.Errorf("expected []any for Array column, got %T", v)
 		}
-		return convertArray(any, arr.Element)
+		return convertArray(elems, arr.Element)
 	}
 
 	if geom, isGeom := t.(ir.Geometry); isGeom {
@@ -281,7 +281,7 @@ func prepareValue(v any, t ir.Type) (any, error) {
 		// nil-but-typed empty slice is meaningless for geometry;
 		// surface it rather than producing malformed EWKB.
 		if len(b) == 0 {
-			return nil, fmt.Errorf("Geometry column has empty bytes")
+			return nil, errors.New("geometry column has empty bytes")
 		}
 		ewkb, err := wkbToEWKB(b, uint32(geom.SRID))
 		if err != nil {

@@ -89,7 +89,6 @@ Not blocking v1 but worth tracking. The bigger items in this bucket landed in v0
 - **Schema rename mapping.** Source schema `app` → target schema `webapp`. Useful for environments where naming differs. (The mappings YAML config covers some of this; surface it in flags too.)
 - **Type override config (CLI form).** YAML hook for the user to say "treat MySQL `bigint(20) unsigned` in column X as Postgres `numeric(20)` regardless of default policy" — already works via the `mappings:` YAML; CLI surface for one-off overrides would be friendlier.
 - ~~**VStream composite-PK CDC coverage.**~~ Landed in v0.3.x. `cdc_vstream_composite_pk_integration_test.go` exercises Insert/Update.Before/Update.After/Delete.Before on a composite-PK table through vttestserver; test passes (VStream is unaffected by the Bug-8-class issue, same as MySQL binlog).
-- **Migrate `.golangci.yml` to v2 schema.** golangci-lint v2 (released early 2026) reworked the config layout. CI is currently pinned to `v1.64.8` to keep the existing config working; the v2 migration is a straightforward batch of key renames per the [migration guide](https://golangci-lint.run/docs/product/migration-guide/) plus dropping the pin in `.github/workflows/ci.yml`.
 - **Per-batch checkpointing for resume.** v0.3.0's resume truncates and re-copies any in-progress table on retry. For multi-hour copies of single huge tables, per-batch progress would let resume pick up mid-table. See ADR-0015 for the trade-off.
 
 ---
