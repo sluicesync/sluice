@@ -410,6 +410,185 @@ func TestSynthesizeKeyOnlyBeforeRejectsNoKeyColumns(t *testing.T) {
 	}
 }
 
+// TestDecodeTupleDeleteOldTupleHasNullMarkersForNonKey documents the
+// pgoutput protocol detail that motivates [filterDeleteBefore]: a
+// DELETE message under REPLICA IDENTITY DEFAULT carries an OldTuple
+// whose ColumnNum equals the relation's full column count, but with
+// 'n' (null) markers for non-key columns. decodeTuple — correctly,
+// for the protocol's own semantics — translates those into nil
+// entries on the row map. Without filtering, the applier's WHERE
+// then emits "col IS NULL" for non-key columns, the DELETE matches
+// zero rows, and ADR-0010's resume-idempotent zero-rows-ok behaviour
+// silently swallows the miss. This test pins the underlying shape
+// down so a future refactor of decodeTuple can't unknowingly redirect
+// the bug-fix surface.
+func TestDecodeTupleDeleteOldTupleHasNullMarkersForNonKey(t *testing.T) {
+	cols := []relationColumn{
+		{Name: "order_id", OID: pgtype.Int8OID, Type: ir.Integer{Width: 64}, KeyColumn: true},
+		{Name: "line_no", OID: pgtype.Int2OID, Type: ir.Integer{Width: 16}, KeyColumn: true},
+		{Name: "qty", OID: pgtype.Int4OID, Type: ir.Integer{Width: 32}, KeyColumn: false},
+		{Name: "unit_price", OID: pgtype.NumericOID, Type: ir.Decimal{Precision: 12, Scale: 4}, KeyColumn: false},
+	}
+	// What pgoutput sends for DELETE under REPLICA IDENTITY DEFAULT:
+	// the ColumnNum is the relation's full column count, key columns
+	// hold actual data ('t'), non-key columns are null markers ('n').
+	tuple := &pglogrepl.TupleData{
+		ColumnNum: 4,
+		Columns: []*pglogrepl.TupleDataColumn{
+			{DataType: 't', Length: 3, Data: []byte("100")},
+			{DataType: 't', Length: 1, Data: []byte("1")},
+			{DataType: 'n'},
+			{DataType: 'n'},
+		},
+	}
+	row, err := decodeTuple(tuple, cols)
+	if err != nil {
+		t.Fatalf("decodeTuple: %v", err)
+	}
+	if row["order_id"] != int64(100) {
+		t.Errorf("order_id = %#v; want int64(100)", row["order_id"])
+	}
+	// decodeInteger widens every signed-integer width to int64, so
+	// even a SMALLINT (Int2) value comes back as int64 here.
+	if row["line_no"] != int64(1) {
+		t.Errorf("line_no = %#v; want int64(1)", row["line_no"])
+	}
+	// The bug-prone shape: non-key columns are present-but-nil.
+	if v, present := row["qty"]; !present || v != nil {
+		t.Errorf("qty: present=%v value=%#v; want present=true value=nil", present, v)
+	}
+	if v, present := row["unit_price"]; !present || v != nil {
+		t.Errorf("unit_price: present=%v value=%#v; want present=true value=nil", present, v)
+	}
+}
+
+// TestFilterDeleteBefore exercises every REPLICA IDENTITY shape the
+// helper has to handle. The canonical Bug 8 surface is the composite-PK
+// + DEFAULT case (third row); the others are correctness invariants
+// the same code path needs to preserve.
+func TestFilterDeleteBefore(t *testing.T) {
+	cases := []struct {
+		name    string
+		rel     *relationCacheEntry
+		decoded ir.Row
+		want    ir.Row
+	}{
+		{
+			name: "single-PK + DEFAULT (non-key cols arrive as nil)",
+			rel: &relationCacheEntry{
+				Schema:          "public",
+				Name:            "users",
+				ReplicaIdentity: 'd',
+				Columns: []relationColumn{
+					{Name: "id", KeyColumn: true},
+					{Name: "email", KeyColumn: false},
+					{Name: "active", KeyColumn: false},
+				},
+			},
+			decoded: ir.Row{"id": int64(42), "email": nil, "active": nil},
+			want:    ir.Row{"id": int64(42)},
+		},
+		{
+			name: "composite-PK + DEFAULT (non-key cols arrive as nil)",
+			rel: &relationCacheEntry{
+				Schema:          "public",
+				Name:            "order_items",
+				ReplicaIdentity: 'd',
+				Columns: []relationColumn{
+					{Name: "order_id", KeyColumn: true},
+					{Name: "line_no", KeyColumn: true},
+					{Name: "qty", KeyColumn: false},
+					{Name: "unit_price", KeyColumn: false},
+				},
+			},
+			decoded: ir.Row{
+				"order_id":   int64(100),
+				"line_no":    int64(1),
+				"qty":        nil,
+				"unit_price": nil,
+			},
+			want: ir.Row{"order_id": int64(100), "line_no": int64(1)},
+		},
+		{
+			name: "FULL with PK (non-key cols carry real values; still filtered)",
+			rel: &relationCacheEntry{
+				Schema:          "public",
+				Name:            "users",
+				ReplicaIdentity: 'f',
+				Columns: []relationColumn{
+					{Name: "id", KeyColumn: true},
+					{Name: "email", KeyColumn: false},
+					{Name: "active", KeyColumn: false},
+				},
+			},
+			decoded: ir.Row{"id": int64(42), "email": "alice@example.com", "active": true},
+			want:    ir.Row{"id": int64(42)},
+		},
+		{
+			name: "USING INDEX (only the indexed columns are flagged KeyColumn)",
+			rel: &relationCacheEntry{
+				Schema:          "public",
+				Name:            "events",
+				ReplicaIdentity: 'i',
+				Columns: []relationColumn{
+					{Name: "id", KeyColumn: false},
+					{Name: "event_uuid", KeyColumn: true},
+					{Name: "payload", KeyColumn: false},
+				},
+			},
+			decoded: ir.Row{"id": nil, "event_uuid": "abc123", "payload": nil},
+			want:    ir.Row{"event_uuid": "abc123"},
+		},
+		{
+			name: "FULL on a PK-less relation falls back to the full row",
+			rel: &relationCacheEntry{
+				Schema:          "public",
+				Name:            "audit",
+				ReplicaIdentity: 'f',
+				Columns: []relationColumn{
+					{Name: "actor", KeyColumn: false},
+					{Name: "happened_at", KeyColumn: false},
+				},
+			},
+			decoded: ir.Row{"actor": "alice", "happened_at": "2024-01-01"},
+			want:    ir.Row{"actor": "alice", "happened_at": "2024-01-01"},
+		},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			got, err := filterDeleteBefore(c.rel, c.decoded)
+			if err != nil {
+				t.Fatalf("filterDeleteBefore: %v", err)
+			}
+			if !reflect.DeepEqual(got, c.want) {
+				t.Errorf("\n got = %#v\nwant = %#v", got, c.want)
+			}
+		})
+	}
+}
+
+func TestFilterDeleteBeforeRejectsMissingKeyValue(t *testing.T) {
+	// A key column declared on the relation but absent from the
+	// decoded tuple: should refuse to build a partial WHERE, on the
+	// same principle as synthesizeKeyOnlyBefore.
+	rel := &relationCacheEntry{
+		Schema: "public",
+		Name:   "users",
+		Columns: []relationColumn{
+			{Name: "id", KeyColumn: true},
+			{Name: "email", KeyColumn: false},
+		},
+	}
+	_, err := filterDeleteBefore(rel, ir.Row{"email": "alice@example.com"})
+	if err == nil {
+		t.Fatal("expected error when key column missing from decoded tuple")
+	}
+	if !strings.Contains(err.Error(), "id") {
+		t.Errorf("error should name the missing column; got %q", err.Error())
+	}
+}
+
 func TestSynthesizeKeyOnlyBeforeRejectsMissingKeyValue(t *testing.T) {
 	// A key column declared on the relation but absent from the
 	// after-tuple should fail loudly — pgoutput shouldn't produce

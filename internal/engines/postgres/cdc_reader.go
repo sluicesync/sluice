@@ -635,13 +635,23 @@ func (r *CDCReader) emitDelete(
 	if rel.Schema != r.schema {
 		return nil
 	}
-	var before ir.Row
-	if oldTuple != nil {
-		var err error
-		before, err = decodeTuple(oldTuple, rel.Columns)
-		if err != nil {
-			return fmt.Errorf("postgres: cdc: decode delete for %s.%s: %w", rel.Schema, rel.Name, err)
-		}
+	if oldTuple == nil {
+		// pgoutput emits no OldTuple at all only under REPLICA IDENTITY
+		// NOTHING, which is unreplicatable for DELETE: the applier has
+		// no way to identify the row. Surface this loudly so the
+		// operator fixes the source rather than silently losing rows
+		// (the original Bug 8 surface — see filterDeleteBefore).
+		return fmt.Errorf(
+			"postgres: cdc: delete on %s.%s without identity: relation has REPLICA IDENTITY NOTHING; configure REPLICA IDENTITY DEFAULT, FULL, or USING INDEX before replicating DELETEs",
+			rel.Schema, rel.Name)
+	}
+	decoded, err := decodeTuple(oldTuple, rel.Columns)
+	if err != nil {
+		return fmt.Errorf("postgres: cdc: decode delete for %s.%s: %w", rel.Schema, rel.Name, err)
+	}
+	before, err := filterDeleteBefore(rel, decoded)
+	if err != nil {
+		return fmt.Errorf("postgres: cdc: %w", err)
 	}
 	pos, err := r.positionAt(lsn)
 	if err != nil {
@@ -653,6 +663,70 @@ func (r *CDCReader) emitDelete(
 		Table:    rel.Name,
 		Before:   before,
 	})
+}
+
+// filterDeleteBefore narrows the decoded OldTuple of a DELETE event
+// down to its identity-key columns. The narrowing is load-bearing for
+// silent-data-loss prevention (Bug 8), so the protocol detail driving
+// it is worth spelling out:
+//
+// Under REPLICA IDENTITY DEFAULT (and USING INDEX), pgoutput's
+// DeleteMessage carries an 'K' OldTuple with ColumnNum equal to the
+// relation's full column count, but only the identity-key columns
+// hold actual data — non-key columns are sent as 'n' (null) markers.
+// [decodeTuple] faithfully translates 'n' into a present-but-nil
+// entry in the row map. The applier's [buildWhereClause] then emits
+// "non_key_col IS NULL" for those entries, predicates that fail to
+// match real rows whose non-key columns hold non-null values. The
+// DELETE matches zero rows, ADR-0010 absorbs the miss for resume
+// idempotency, and the position advances — silent data divergence.
+//
+// Filtering to key columns produces a WHERE that uses only the
+// identity-key predicates, which is exactly what an idempotent DELETE
+// against the replica identity needs. The same filter is correct
+// under FULL (every column is in the OldTuple, but only key columns
+// are flagged KeyColumn=true; the WHERE is still right, just shorter)
+// and under USING INDEX (only the named index columns are present
+// and they're flagged KeyColumn=true; nothing to drop).
+//
+// Edge cases:
+//
+//   - REPLICA IDENTITY NOTHING is rejected upstream in [emitDelete]
+//     (no OldTuple is ever sent), so this helper is never called for it.
+//   - A relation with no key columns at all (no PK and no REPLICA
+//     IDENTITY index) under REPLICA IDENTITY FULL is unusual but
+//     legitimate: the operator deliberately set FULL knowing there
+//     was no PK to flag. We honour that by falling back to the full
+//     decoded row — anything else would silently lose DELETEs on
+//     PK-less FULL tables, the very class of bug this helper exists
+//     to prevent.
+func filterDeleteBefore(rel *relationCacheEntry, decoded ir.Row) (ir.Row, error) {
+	keyCount := 0
+	for _, col := range rel.Columns {
+		if col.KeyColumn {
+			keyCount++
+		}
+	}
+	if keyCount == 0 {
+		// REPLICA IDENTITY FULL on a PK-less relation: the only
+		// usable identity is "every column", which is exactly what
+		// `decoded` already holds. Hand it back verbatim.
+		return decoded, nil
+	}
+	before := make(ir.Row, keyCount)
+	for _, col := range rel.Columns {
+		if !col.KeyColumn {
+			continue
+		}
+		v, ok := decoded[col.Name]
+		if !ok {
+			return nil, fmt.Errorf(
+				"delete on %s.%s: identity column %q missing from old tuple; refusing to emit a partial WHERE",
+				rel.Schema, rel.Name, col.Name)
+		}
+		before[col.Name] = v
+	}
+	return before, nil
 }
 
 func (r *CDCReader) emitTruncate(

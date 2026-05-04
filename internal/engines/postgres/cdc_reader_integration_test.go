@@ -312,6 +312,109 @@ func TestCDCReader_UpdateUnderReplicaIdentityDefault(t *testing.T) {
 	}
 }
 
+// TestCDCReader_DeleteCompositePKUnderReplicaIdentityDefault is the
+// regression for Bug 8: a composite-PK DELETE under REPLICA IDENTITY
+// DEFAULT used to emit a Before with non-key columns set to nil
+// (because pgoutput's 'K' OldTuple has 'n' markers for non-key
+// columns). The applier's WHERE then included "non_key IS NULL"
+// predicates that never matched the destination row, ADR-0010 ate
+// the zero-rows-affected, and the DELETE silently disappeared.
+//
+// The fix narrows the emitted Before to the relation's key columns.
+// This test asserts the shape directly off the CDC channel — no
+// applier in the loop, so the test pins the reader's contract
+// independently of the resume-idempotency layer.
+func TestCDCReader_DeleteCompositePKUnderReplicaIdentityDefault(t *testing.T) {
+	dsn, cleanup := startPostgresForCDC(t)
+	defer cleanup()
+
+	const seedDDL = `
+		CREATE TABLE order_items (
+			order_id    BIGINT       NOT NULL,
+			line_no     SMALLINT     NOT NULL,
+			qty         INTEGER      NOT NULL,
+			unit_price  NUMERIC(12,4) NOT NULL,
+			PRIMARY KEY (order_id, line_no)
+		);
+		-- Intentionally no ALTER TABLE ... REPLICA IDENTITY: the
+		-- server-default 'd' (DEFAULT) is what reproduces Bug 8.
+	`
+	applyPGSQL(t, dsn, seedDDL)
+
+	eng := Engine{}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	rdr, err := eng.OpenCDCReader(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenCDCReader: %v", err)
+	}
+	defer func() {
+		if c, ok := rdr.(interface{ Close() error }); ok {
+			_ = c.Close()
+		}
+	}()
+
+	changes, err := rdr.StreamChanges(ctx, ir.Position{})
+	if err != nil {
+		t.Fatalf("StreamChanges: %v", err)
+	}
+
+	time.Sleep(200 * time.Millisecond)
+
+	const dml = `
+		INSERT INTO order_items (order_id, line_no, qty, unit_price) VALUES
+			(100, 1, 5, 9.99),
+			(100, 2, 3, 1.50);
+		DELETE FROM order_items WHERE order_id = 100 AND line_no = 1;
+	`
+	applyPGSQL(t, dsn, dml)
+
+	got := drainChanges(t, ctx, changes, 3, 30*time.Second)
+	if len(got) != 3 {
+		if cdcRdr, ok := rdr.(*CDCReader); ok {
+			if streamErr := cdcRdr.Err(); streamErr != nil {
+				t.Fatalf("got %d changes; want 3 (stream error: %v)", len(got), streamErr)
+			}
+		}
+		t.Fatalf("got %d changes; want 3", len(got))
+	}
+
+	del, ok := got[2].(ir.Delete)
+	if !ok {
+		t.Fatalf("change[2] = %T; want ir.Delete", got[2])
+	}
+	if del.Schema != "public" || del.Table != "order_items" {
+		t.Errorf("delete = %s.%s; want public.order_items", del.Schema, del.Table)
+	}
+	// Both PK columns must be present in Before — the load-bearing
+	// invariant. Single-PK + DEFAULT had this by accident pre-fix
+	// (the lone PK column wasn't 'n'); the composite case is what
+	// the user's 30-row drift was made of.
+	if _, ok := del.Before["order_id"]; !ok {
+		t.Errorf("delete.Before missing order_id; got %#v", del.Before)
+	}
+	if _, ok := del.Before["line_no"]; !ok {
+		t.Errorf("delete.Before missing line_no; got %#v", del.Before)
+	}
+	// Non-key columns must NOT be present — having them as nil entries
+	// is exactly the bug shape (forces "qty IS NULL" in WHERE).
+	if _, present := del.Before["qty"]; present {
+		t.Errorf("delete.Before unexpectedly contains non-key column qty (value %#v); applier WHERE will filter to no rows", del.Before["qty"])
+	}
+	if _, present := del.Before["unit_price"]; present {
+		t.Errorf("delete.Before unexpectedly contains non-key column unit_price (value %#v); applier WHERE will filter to no rows", del.Before["unit_price"])
+	}
+	// PK values must be the actual deleted row's keys.
+	if del.Before["order_id"] != int64(100) {
+		t.Errorf("delete.Before[order_id] = %#v; want int64(100)", del.Before["order_id"])
+	}
+	if del.Before["line_no"] != int64(1) {
+		t.Errorf("delete.Before[line_no] = %#v; want int64(1)", del.Before["line_no"])
+	}
+}
+
 // TestCDCReader_RejectsWrongWALLevel verifies the precondition check.
 // Boots a fresh container with wal_level=replica (the default for
 // stock postgres images is also replica unless we override) and
