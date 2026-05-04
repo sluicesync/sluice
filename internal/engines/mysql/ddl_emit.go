@@ -82,10 +82,51 @@ func emitColumnType(t ir.Type) (string, error) {
 
 	// ---- Unsupported on MySQL ----
 	case ir.Array, ir.Inet, ir.Cidr, ir.Macaddr:
-		return "", fmt.Errorf("mysql: %s has no native MySQL type; translate before writing", typeName(t))
+		return "", unsupportedTypeError(t)
 	}
 
 	return "", fmt.Errorf("mysql: unknown IR type %T", t)
+}
+
+// unsupportedTypeError returns a user-actionable error for IR types
+// MySQL has no native representation for. It names the type, points
+// at the per-column mappings hook (the operator-supplied translation
+// override), and gives a concrete YAML snippet matched to the type
+// — `text` / `longtext` for variadic arrays, `varchar(45)` for the
+// network types — so the user can copy-paste rather than guess.
+//
+// The orchestrator wraps this error with the column name (see
+// emitColumnDef), so the final user-facing message lands as:
+//
+//	mysql: column "tags": mysql: int[] has no native MySQL type;
+//	add a per-column override in sluice.yaml's mappings: section
+//	  - table: <table>
+//	    column: tags
+//	    target_type: longtext
+//	or rewrite the source column before running sluice.
+func unsupportedTypeError(t ir.Type) error {
+	suggestion := ""
+	switch t.(type) {
+	case ir.Array:
+		// Variadic-length text content; LONGTEXT covers the worst case
+		// (PG TEXT is unbounded, so emitting MEDIUMTEXT or smaller
+		// would quietly truncate). Operators who want JSON shape
+		// instead can use target_type: json.
+		suggestion = "longtext"
+	case ir.Inet, ir.Cidr:
+		// Max IPv6 + CIDR mask in canonical form is 43 chars; round
+		// up to 45 for headroom.
+		suggestion = "varchar(45)"
+	case ir.Macaddr:
+		// EUI-64 in canonical form is 23 chars; round up to 30.
+		suggestion = "varchar(30)"
+	default:
+		suggestion = "text"
+	}
+	return fmt.Errorf(
+		"mysql: %s has no native MySQL type; add a per-column override in sluice.yaml's mappings: section\n  - table: <table>\n    column: <column>\n    target_type: %s\nor rewrite the source column before running sluice",
+		typeName(t), suggestion,
+	)
 }
 
 // emitIntegerType returns the MySQL integer type DDL, including the

@@ -82,25 +82,15 @@ Keep the original error verbatim; hints are additive. Source: a small registry o
 
 ---
 
-### 4. OSS hygiene
+### 4. Operational features (post-v1)
 
-Lower priority than feature work but required before declaring v1.
+Not blocking v1 but worth tracking. The bigger items in this bucket landed in v0.3.0 (`--include-table` / `--exclude-table` filtering, `sluice sync stop`, `sluice migrate --resume`); what's left are smaller knobs:
 
-- **SECURITY.md** — how to report vulnerabilities. Standard template.
-- **CODE_OF_CONDUCT.md** — Contributor Covenant standard text.
-- **Issue / PR templates** — exist in `.github/`; review for completeness once the project has external contributors.
-
----
-
-### 5. Operational features (post-v1)
-
-Not blocking v1 but worth tracking:
-
-- **Selective table inclusion / exclusion.** `--include-table users,posts` or `--exclude-table audit_log,sessions`. Glob patterns nice-to-have.
 - **Schema rename mapping.** Source schema `app` → target schema `webapp`. Useful for environments where naming differs. (The mappings YAML config covers some of this; surface it in flags too.)
-- **Type override config.** YAML hook for the user to say "treat MySQL `bigint(20) unsigned` in column X as Postgres `numeric(20)` regardless of default policy".
-- ~~**Resume-from-partial-migration.**~~ Landed in v0.3.x. `sluice migrate --resume --migration-id ID` reads the per-target `sluice_migrate_state` row and re-enters at the recorded phase; per-table progress is whole-table truncate-and-redo for v1 (per-batch checkpointing is a future enhancement). See ADR-0015 and `internal/pipeline/resume.go`.
-- **`sluice sync stop`.** A graceful stop that drains in-flight changes, persists the final position, and exits cleanly. Today operators Ctrl-C; a named command makes scripted operations tidier.
+- **Type override config (CLI form).** YAML hook for the user to say "treat MySQL `bigint(20) unsigned` in column X as Postgres `numeric(20)` regardless of default policy" — already works via the `mappings:` YAML; CLI surface for one-off overrides would be friendlier.
+- ~~**VStream composite-PK CDC coverage.**~~ Landed in v0.3.x. `cdc_vstream_composite_pk_integration_test.go` exercises Insert/Update.Before/Update.After/Delete.Before on a composite-PK table through vttestserver; test passes (VStream is unaffected by the Bug-8-class issue, same as MySQL binlog).
+- **Reconcile MySQL binlog vs VStream IR-Row integer widths.** The two MySQL CDC paths produce different Go types for narrow INT columns: binlog preserves the source width (INT → `int32`, BIGINT → `int64`), VStream collapses everything to `int64`. Both surface cleanly as PG `INTEGER` so the cross-engine path is fine, but same-engine MySQL→MySQL through the two readers produces different runtime row shapes. Picking a canonical convention (probably `int64` everywhere — closer to the IR's `Integer.Width=64` shape) and aligning the binlog reader is the smaller change. Flagged during the v0.3.x VStream composite-PK test work.
+- **Per-batch checkpointing for resume.** v0.3.0's resume truncates and re-copies any in-progress table on retry. For multi-hour copies of single huge tables, per-batch progress would let resume pick up mid-table. See ADR-0015 for the trade-off.
 
 ---
 

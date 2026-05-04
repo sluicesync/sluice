@@ -87,17 +87,31 @@ func TestEmitColumnType(t *testing.T) {
 }
 
 func TestEmitColumnTypeUnsupported(t *testing.T) {
-	cases := []ir.Type{
-		ir.Inet{},
-		ir.Cidr{},
-		ir.Macaddr{},
-		ir.Array{Element: ir.Integer{Width: 32}},
+	cases := []struct {
+		typ            ir.Type
+		wantSuggestion string // suggested target_type literal in the message
+	}{
+		{ir.Inet{}, "varchar(45)"},
+		{ir.Cidr{}, "varchar(45)"},
+		{ir.Macaddr{}, "varchar(30)"},
+		{ir.Array{Element: ir.Integer{Width: 32}}, "longtext"},
 	}
 	for _, c := range cases {
 		c := c
-		t.Run(typeName(c), func(t *testing.T) {
-			if _, err := emitColumnType(c); err == nil {
-				t.Errorf("expected error for %T; got nil", c)
+		t.Run(typeName(c.typ), func(t *testing.T) {
+			_, err := emitColumnType(c.typ)
+			if err == nil {
+				t.Fatalf("expected error for %T; got nil", c.typ)
+			}
+			msg := err.Error()
+			// The error must point operators at the mappings hook
+			// — the message is load-bearing for the v0.3.x roadmap
+			// note that the friendlier wording is what got us here.
+			if !strings.Contains(msg, "mappings:") {
+				t.Errorf("error should name the mappings YAML hook; got %q", msg)
+			}
+			if !strings.Contains(msg, "target_type: "+c.wantSuggestion) {
+				t.Errorf("error should suggest target_type %q; got %q", c.wantSuggestion, msg)
 			}
 		})
 	}
