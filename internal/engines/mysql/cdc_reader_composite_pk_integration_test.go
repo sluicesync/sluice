@@ -99,6 +99,14 @@ func TestCDCReader_CompositePK(t *testing.T) {
 	}
 
 	// change[0]: INSERT (100, 1, 5001, 3)
+	//
+	// Type-shape note: the binlog reader's value-decode path
+	// (decodeInteger in value_decode.go) widens every integer
+	// width — INT8, INT16, INT24, INT32, INT64 — to Go int64. The
+	// IR-Row contract is "all integer values arrive as int64 or
+	// uint64 regardless of source column width." So `line_no`
+	// (declared as INT) lands as int64 here, not int32. Same for
+	// `order_id` (BIGINT), `product_id` (BIGINT), and `qty` (INT).
 	ins1, ok := got[0].(ir.Insert)
 	if !ok {
 		t.Fatalf("change[0] = %T; want ir.Insert", got[0])
@@ -109,8 +117,8 @@ func TestCDCReader_CompositePK(t *testing.T) {
 	if ord, _ := ins1.Row["order_id"].(int64); ord != 100 {
 		t.Errorf("change[0].Row[order_id] = %#v; want int64(100)", ins1.Row["order_id"])
 	}
-	if ln, _ := ins1.Row["line_no"].(int32); ln != 1 {
-		t.Errorf("change[0].Row[line_no] = %#v; want int32(1)", ins1.Row["line_no"])
+	if ln, _ := ins1.Row["line_no"].(int64); ln != 1 {
+		t.Errorf("change[0].Row[line_no] = %#v; want int64(1)", ins1.Row["line_no"])
 	}
 
 	// change[2]: UPDATE composite-PK row — Before and After must
@@ -125,17 +133,17 @@ func TestCDCReader_CompositePK(t *testing.T) {
 	if ord, _ := upd.Before["order_id"].(int64); ord != 100 {
 		t.Errorf("update.Before[order_id] = %#v; want int64(100)", upd.Before["order_id"])
 	}
-	if ln, _ := upd.Before["line_no"].(int32); ln != 1 {
-		t.Errorf("update.Before[line_no] = %#v; want int32(1)", upd.Before["line_no"])
+	if ln, _ := upd.Before["line_no"].(int64); ln != 1 {
+		t.Errorf("update.Before[line_no] = %#v; want int64(1)", upd.Before["line_no"])
 	}
 	if ord, _ := upd.After["order_id"].(int64); ord != 100 {
 		t.Errorf("update.After[order_id] = %#v; want int64(100)", upd.After["order_id"])
 	}
-	if ln, _ := upd.After["line_no"].(int32); ln != 1 {
-		t.Errorf("update.After[line_no] = %#v; want int32(1)", upd.After["line_no"])
+	if ln, _ := upd.After["line_no"].(int64); ln != 1 {
+		t.Errorf("update.After[line_no] = %#v; want int64(1)", upd.After["line_no"])
 	}
-	if q, _ := upd.After["qty"].(int32); q != 7 {
-		t.Errorf("update.After[qty] = %#v; want int32(7)", upd.After["qty"])
+	if q, _ := upd.After["qty"].(int64); q != 7 {
+		t.Errorf("update.After[qty] = %#v; want int64(7)", upd.After["qty"])
 	}
 
 	// change[3]: DELETE — Before must carry both PK columns. This
@@ -153,7 +161,7 @@ func TestCDCReader_CompositePK(t *testing.T) {
 	if ord, _ := del.Before["order_id"].(int64); ord != 100 {
 		t.Errorf("delete.Before[order_id] = %#v; want int64(100)", del.Before["order_id"])
 	}
-	if ln, _ := del.Before["line_no"].(int32); ln != 2 {
-		t.Errorf("delete.Before[line_no] = %#v; want int32(2) — composite-PK second column dropped?", del.Before["line_no"])
+	if ln, _ := del.Before["line_no"].(int64); ln != 2 {
+		t.Errorf("delete.Before[line_no] = %#v; want int64(2) — composite-PK second column dropped?", del.Before["line_no"])
 	}
 }
