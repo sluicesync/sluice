@@ -105,14 +105,14 @@ func (s *Streamer) Run(ctx context.Context) error {
 	// returning ok=false (same as "no row").
 	if !s.DryRun {
 		if err := applier.EnsureControlTable(ctx); err != nil {
-			return fmt.Errorf("pipeline: ensure control table: %w", err)
+			return wrapWithHint(PhaseSchemaApply, fmt.Errorf("pipeline: ensure control table: %w", err))
 		}
 	}
 
 	// ---- 3. Look up the persisted position ----
 	persisted, found, err := applier.ReadPosition(ctx, streamID)
 	if err != nil {
-		return fmt.Errorf("pipeline: read position: %w", err)
+		return wrapWithHint(PhaseCDC, fmt.Errorf("pipeline: read position: %w", err))
 	}
 
 	// ---- 3.5. Dry-run: print plan and exit before any state mutation. ----
@@ -141,7 +141,7 @@ func (s *Streamer) Run(ctx context.Context) error {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return nil
 		}
-		return fmt.Errorf("pipeline: apply changes: %w", err)
+		return wrapWithHint(PhaseCDC, fmt.Errorf("pipeline: apply changes: %w", err))
 	}
 	return nil
 }
@@ -178,12 +178,12 @@ func (s *Streamer) logDryRunPlan(ctx context.Context, streamID string, persisted
 
 	sr, err := s.Source.OpenSchemaReader(ctx, s.SourceDSN)
 	if err != nil {
-		return fmt.Errorf("pipeline: dry-run: open source schema reader: %w", err)
+		return wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: dry-run: open source schema reader: %w", err))
 	}
 	defer closeIf(sr)
 	schema, err := sr.ReadSchema(ctx)
 	if err != nil {
-		return fmt.Errorf("pipeline: dry-run: read source schema: %w", err)
+		return wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: dry-run: read source schema: %w", err))
 	}
 	if len(schema.Tables) == 0 {
 		slog.InfoContext(ctx, "dry run: source schema has no tables — nothing to stream")
@@ -225,7 +225,7 @@ func (s *Streamer) openApplier(ctx context.Context) (ir.ChangeApplier, bool, err
 	}
 	a, err := s.Target.OpenChangeApplier(ctx, s.TargetDSN)
 	if err != nil {
-		return nil, false, fmt.Errorf("pipeline: open target change applier: %w", err)
+		return nil, false, wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: open target change applier: %w", err))
 	}
 	return a, true, nil
 }
@@ -238,7 +238,7 @@ func (s *Streamer) warmResume(ctx context.Context, persisted ir.Position) (<-cha
 	)
 	cdc, err := s.Source.OpenCDCReader(ctx, s.SourceDSN)
 	if err != nil {
-		return nil, fmt.Errorf("pipeline: open cdc reader: %w", err)
+		return nil, wrapWithHint(PhaseCDC, fmt.Errorf("pipeline: open cdc reader: %w", err))
 	}
 	// CDC reader's Close is async (cancellation-driven), but we
 	// don't have a clean handle to call it from here. Streamer.Run's
@@ -247,7 +247,7 @@ func (s *Streamer) warmResume(ctx context.Context, persisted ir.Position) (<-cha
 	changes, err := cdc.StreamChanges(ctx, persisted)
 	if err != nil {
 		closeIf(cdc)
-		return nil, fmt.Errorf("pipeline: start cdc: %w", err)
+		return nil, wrapWithHint(PhaseCDC, fmt.Errorf("pipeline: start cdc: %w", err))
 	}
 	return changes, nil
 }
@@ -257,12 +257,12 @@ func (s *Streamer) warmResume(ctx context.Context, persisted ir.Position) (<-cha
 func (s *Streamer) coldStart(ctx context.Context) (<-chan ir.Change, error) {
 	sr, err := s.Source.OpenSchemaReader(ctx, s.SourceDSN)
 	if err != nil {
-		return nil, fmt.Errorf("pipeline: open source schema reader: %w", err)
+		return nil, wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: open source schema reader: %w", err))
 	}
 	schema, err := sr.ReadSchema(ctx)
 	closeIf(sr)
 	if err != nil {
-		return nil, fmt.Errorf("pipeline: read source schema: %w", err)
+		return nil, wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: read source schema: %w", err))
 	}
 	if len(schema.Tables) == 0 {
 		slog.InfoContext(ctx, "source schema has no tables; nothing to stream")
@@ -279,7 +279,7 @@ func (s *Streamer) coldStart(ctx context.Context) (<-chan ir.Change, error) {
 
 	stream, err := s.Source.OpenSnapshotStream(ctx, s.SourceDSN)
 	if err != nil {
-		return nil, fmt.Errorf("pipeline: open snapshot stream: %w", err)
+		return nil, wrapWithHint(PhaseSnapshot, fmt.Errorf("pipeline: open snapshot stream: %w", err))
 	}
 	// stream.Close is deferred by the caller indirectly via
 	// Streamer.Run's defer chain — we keep the handle alive past
@@ -291,13 +291,13 @@ func (s *Streamer) coldStart(ctx context.Context) (<-chan ir.Change, error) {
 	sw, err := s.Target.OpenSchemaWriter(ctx, s.TargetDSN)
 	if err != nil {
 		_ = stream.Close()
-		return nil, fmt.Errorf("pipeline: open target schema writer: %w", err)
+		return nil, wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: open target schema writer: %w", err))
 	}
 	rw, err := s.Target.OpenRowWriter(ctx, s.TargetDSN)
 	if err != nil {
 		closeIf(sw)
 		_ = stream.Close()
-		return nil, fmt.Errorf("pipeline: open target row writer: %w", err)
+		return nil, wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: open target row writer: %w", err))
 	}
 
 	if err := runBulkCopy(ctx, schema, stream.Rows, sw, rw); err != nil {
@@ -313,7 +313,7 @@ func (s *Streamer) coldStart(ctx context.Context) (<-chan ir.Change, error) {
 	changes, err := stream.Changes.StreamChanges(ctx, stream.Position)
 	if err != nil {
 		_ = stream.Close()
-		return nil, fmt.Errorf("pipeline: start cdc: %w", err)
+		return nil, wrapWithHint(PhaseCDC, fmt.Errorf("pipeline: start cdc: %w", err))
 	}
 	// stream stays alive for the rest of Run; cleanup happens via
 	// the function's defer chain when ctx cancels and pump exits.

@@ -97,13 +97,13 @@ func (m *Migrator) Run(ctx context.Context) error {
 	// ---- 1. Open and read source schema ----
 	sr, err := m.Source.OpenSchemaReader(ctx, m.SourceDSN)
 	if err != nil {
-		return fmt.Errorf("pipeline: open source schema reader: %w", err)
+		return wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: open source schema reader: %w", err))
 	}
 	defer closeIf(sr)
 
 	schema, err := sr.ReadSchema(ctx)
 	if err != nil {
-		return fmt.Errorf("pipeline: read source schema: %w", err)
+		return wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: read source schema: %w", err))
 	}
 	if len(schema.Tables) == 0 {
 		slog.InfoContext(ctx, "source schema has no tables; nothing to migrate")
@@ -123,20 +123,20 @@ func (m *Migrator) Run(ctx context.Context) error {
 	// ---- 2. Open target writers ----
 	sw, err := m.Target.OpenSchemaWriter(ctx, m.TargetDSN)
 	if err != nil {
-		return fmt.Errorf("pipeline: open target schema writer: %w", err)
+		return wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: open target schema writer: %w", err))
 	}
 	defer closeIf(sw)
 
 	rw, err := m.Target.OpenRowWriter(ctx, m.TargetDSN)
 	if err != nil {
-		return fmt.Errorf("pipeline: open target row writer: %w", err)
+		return wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: open target row writer: %w", err))
 	}
 	defer closeIf(rw)
 
 	// ---- 3-6. Schema apply (phase 1) → bulk copy → indexes → constraints.
 	rr, err := m.Source.OpenRowReader(ctx, m.SourceDSN)
 	if err != nil {
-		return fmt.Errorf("pipeline: open source row reader: %w", err)
+		return wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: open source row reader: %w", err))
 	}
 	defer closeIf(rr)
 
@@ -173,21 +173,21 @@ func runBulkCopy(
 	rw ir.RowWriter,
 ) error {
 	if err := sw.CreateTablesWithoutConstraints(ctx, schema); err != nil {
-		return fmt.Errorf("pipeline: create tables: %w", err)
+		return wrapWithHint(PhaseSchemaApply, fmt.Errorf("pipeline: create tables: %w", err))
 	}
 	for _, table := range schema.Tables {
 		if err := copyTable(ctx, rows, rw, table); err != nil {
-			return fmt.Errorf("pipeline: copy table %q: %w", table.Name, err)
+			return wrapWithHint(PhaseBulkCopy, fmt.Errorf("pipeline: copy table %q: %w", table.Name, err))
 		}
 	}
 	if err := sw.SyncIdentitySequences(ctx, schema); err != nil {
-		return fmt.Errorf("pipeline: sync identity sequences: %w", err)
+		return wrapWithHint(PhaseSchemaApply, fmt.Errorf("pipeline: sync identity sequences: %w", err))
 	}
 	if err := sw.CreateIndexes(ctx, schema); err != nil {
-		return fmt.Errorf("pipeline: create indexes: %w", err)
+		return wrapWithHint(PhaseIndexes, fmt.Errorf("pipeline: create indexes: %w", err))
 	}
 	if err := sw.CreateConstraints(ctx, schema); err != nil {
-		return fmt.Errorf("pipeline: create constraints: %w", err)
+		return wrapWithHint(PhaseConstraints, fmt.Errorf("pipeline: create constraints: %w", err))
 	}
 	return nil
 }
