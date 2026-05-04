@@ -181,6 +181,12 @@ func (e Engine) OpenSnapshotStream(ctx context.Context, dsn string) (*ir.Snapsho
 // path. Avoids importing io for this single use.
 type closer interface{ Close() error }
 
+// Compile-time guard: pgconn is referenced indirectly via
+// openReplicationConn's return type but never named directly in this
+// file's body, so without this line goimports / the unused-import
+// check would drop the package. The guard pins it.
+var _ = pgconn.Connect
+
 // quoteSnapshotName escapes a Postgres snapshot identifier for use
 // in a SET TRANSACTION SNAPSHOT statement. Snapshot names returned
 // by CREATE_REPLICATION_SLOT have the form `<xid>-<numeric>-<numeric>`
@@ -197,9 +203,3 @@ func quoteSnapshotName(s string) string {
 	}
 	return string(out)
 }
-
-// Compile-time guards: pgconn types we depend on. Listed here so
-// touching the unrelated import block doesn't drop them on accident.
-var (
-	_ = pgconn.Connect
-)
