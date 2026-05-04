@@ -245,10 +245,16 @@ func (m *Migrator) logPlan(ctx context.Context, schema *ir.Schema) error {
 		slog.Int("tables", len(schema.Tables)),
 	)
 	for _, t := range schema.Tables {
+		// Field naming note: secondary_indexes excludes the primary
+		// key (which is reported separately via primary_key) — the IR
+		// stores PK on its own field, and operators comparing against
+		// psql / SHOW INDEX output have been confused by a bare
+		// "indexes" count that didn't include PK.
 		slog.InfoContext(ctx, "dry run: table",
 			slog.String("name", t.Name),
 			slog.Int("columns", len(t.Columns)),
-			slog.Int("indexes", len(t.Indexes)),
+			slog.Bool("primary_key", t.PrimaryKey != nil),
+			slog.Int("secondary_indexes", len(t.Indexes)),
 			slog.Int("foreign_keys", len(t.ForeignKeys)),
 		)
 	}

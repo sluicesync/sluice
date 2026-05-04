@@ -196,10 +196,13 @@ func (s *Streamer) logDryRunPlan(ctx context.Context, streamID string, persisted
 		slog.Int("tables", len(schema.Tables)),
 	)
 	for _, t := range schema.Tables {
+		// secondary_indexes excludes the primary key (reported via
+		// primary_key) — see migrate.go logPlan for the rationale.
 		slog.InfoContext(ctx, "dry run: table",
 			slog.String("name", t.Name),
 			slog.Int("columns", len(t.Columns)),
-			slog.Int("indexes", len(t.Indexes)),
+			slog.Bool("primary_key", t.PrimaryKey != nil),
+			slog.Int("secondary_indexes", len(t.Indexes)),
 			slog.Int("foreign_keys", len(t.ForeignKeys)),
 		)
 	}
