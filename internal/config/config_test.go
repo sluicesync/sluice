@@ -69,6 +69,36 @@ extensions:
 	}
 }
 
+// TestLoadIncludeExcludeTables checks the table-filter YAML fields
+// round-trip through the loader. Operators put these alongside
+// mappings in sluice.yaml; the orchestrator builds a TableFilter
+// from them when no CLI flag overrides.
+func TestLoadIncludeExcludeTables(t *testing.T) {
+	yamlContent := `
+include_tables:
+  - users
+  - orders
+exclude_tables:
+  - "audit_*"
+  - sessions
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sluice.yaml")
+	if err := os.WriteFile(path, []byte(yamlContent), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !reflect.DeepEqual(c.IncludeTables, []string{"users", "orders"}) {
+		t.Errorf("IncludeTables = %v; want [users orders]", c.IncludeTables)
+	}
+	if !reflect.DeepEqual(c.ExcludeTables, []string{"audit_*", "sessions"}) {
+		t.Errorf("ExcludeTables = %v; want [audit_* sessions]", c.ExcludeTables)
+	}
+}
+
 // TestEnvVarsLayer verifies env vars overlay onto a YAML file. Only
 // scalar fields are practical to override via env (slices need
 // comma-separated values which is doable but not elegant); we test

@@ -79,6 +79,9 @@ type MigrateCmd struct {
 	TargetDriver string `help:"Target engine name (e.g. mysql, postgres). See 'sluice engines'." required:"" placeholder:"NAME" group:"target"`
 	Target       string `help:"Target database DSN." required:"" env:"SLUICE_TARGET" placeholder:"DSN" group:"target"`
 
+	IncludeTable []string `help:"Only migrate these tables (comma-separated, repeatable). Glob patterns allowed (e.g. 'audit_*'). Mutually exclusive with --exclude-table." sep:"," placeholder:"TABLE"`
+	ExcludeTable []string `help:"Migrate every table except these (comma-separated, repeatable). Glob patterns allowed. Mutually exclusive with --include-table." sep:"," placeholder:"TABLE"`
+
 	DryRun bool `help:"Read the source schema and print the migration plan without applying changes." short:"n"`
 }
 
@@ -98,6 +101,19 @@ func (m *MigrateCmd) Run(g *Globals) error {
 		return fmt.Errorf("--target-driver: %w", err)
 	}
 
+	// CLI-side mutual exclusion: catching this here means the
+	// operator gets a clean "you can't do that" before any DSN
+	// dialing happens. NewTableFilter also enforces it for the
+	// programmatic-construction path.
+	if len(m.IncludeTable) > 0 && len(m.ExcludeTable) > 0 {
+		return errors.New("--include-table and --exclude-table are mutually exclusive")
+	}
+	include, exclude := resolveTableFilterArgs(m.IncludeTable, m.ExcludeTable, cfg)
+	filter, err := pipeline.NewTableFilter(include, exclude)
+	if err != nil {
+		return err
+	}
+
 	mig := &pipeline.Migrator{
 		Source:    source,
 		Target:    target,
@@ -105,8 +121,25 @@ func (m *MigrateCmd) Run(g *Globals) error {
 		TargetDSN: m.Target,
 		DryRun:    m.DryRun,
 		Mappings:  cfg.Mappings,
+		Filter:    filter,
 	}
 	return mig.Run(kongContext())
+}
+
+// resolveTableFilterArgs picks the include/exclude list to use,
+// preferring CLI flags over YAML config when both are supplied.
+// CLI takes precedence wholesale: if --include-table is set it
+// replaces the config's IncludeTables (and clears any config-side
+// ExcludeTables for that command run, since the operator's intent
+// is unambiguous). Same shape for --exclude-table.
+func resolveTableFilterArgs(cliInclude, cliExclude []string, cfg *config.Config) (include, exclude []string) {
+	if len(cliInclude) > 0 {
+		return cliInclude, nil
+	}
+	if len(cliExclude) > 0 {
+		return nil, cliExclude
+	}
+	return cfg.IncludeTables, cfg.ExcludeTables
 }
 
 // resolveEngine looks up an engine by registered name and returns a
@@ -145,6 +178,9 @@ type SyncStartCmd struct {
 	TargetDriver string `help:"Target engine name (e.g. mysql, postgres). See 'sluice engines'." required:"" placeholder:"NAME" group:"target"`
 	Target       string `help:"Target database DSN." required:"" env:"SLUICE_TARGET" placeholder:"DSN" group:"target"`
 
+	IncludeTable []string `help:"Only stream these tables (comma-separated, repeatable). Glob patterns allowed (e.g. 'audit_*'). Mutually exclusive with --exclude-table." sep:"," placeholder:"TABLE"`
+	ExcludeTable []string `help:"Stream every table except these (comma-separated, repeatable). Glob patterns allowed. Mutually exclusive with --include-table." sep:"," placeholder:"TABLE"`
+
 	StreamID string `help:"Stream identifier; the key under which position is persisted on the target. Auto-generated from source/target host info when empty." placeholder:"ID"`
 	DryRun   bool   `short:"n" help:"Print what would happen — cold-start vs warm-resume, source schema summary or persisted position — without modifying the target or starting the stream."`
 }
@@ -165,6 +201,15 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 		return fmt.Errorf("--target-driver: %w", err)
 	}
 
+	if len(s.IncludeTable) > 0 && len(s.ExcludeTable) > 0 {
+		return errors.New("--include-table and --exclude-table are mutually exclusive")
+	}
+	include, exclude := resolveTableFilterArgs(s.IncludeTable, s.ExcludeTable, cfg)
+	filter, err := pipeline.NewTableFilter(include, exclude)
+	if err != nil {
+		return err
+	}
+
 	streamer := &pipeline.Streamer{
 		Source:    source,
 		Target:    target,
@@ -173,6 +218,7 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 		StreamID:  s.StreamID,
 		Mappings:  cfg.Mappings,
 		DryRun:    s.DryRun,
+		Filter:    filter,
 	}
 	return streamer.Run(kongContext())
 }

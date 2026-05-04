@@ -40,6 +40,19 @@ type Config struct {
 	// Extensions controls how engine-specific extensions (notably
 	// Postgres extensions) are handled during a migration.
 	Extensions Extensions `koanf:"extensions"`
+
+	// IncludeTables is the table-filter allow-list. Entries are
+	// matched against unqualified source table names with stdlib
+	// path.Match glob semantics ("audit_*"). Mutually exclusive
+	// with ExcludeTables; the orchestrator surfaces a clear error
+	// when both are populated. CLI flags --include-table /
+	// --exclude-table override these YAML fields when supplied.
+	IncludeTables []string `koanf:"include_tables"`
+
+	// ExcludeTables is the table-filter deny-list. Same matching
+	// semantics as IncludeTables, opposite sense. Mutually
+	// exclusive with IncludeTables.
+	ExcludeTables []string `koanf:"exclude_tables"`
 }
 
 // Mapping is a single per-column override.
