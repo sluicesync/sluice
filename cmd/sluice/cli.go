@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"sort"
+	"strings"
 	"syscall"
 	"text/tabwriter"
 	"time"
@@ -163,6 +164,7 @@ func resolveEngine(name string) (ir.Engine, error) {
 type SyncCmd struct {
 	Start  SyncStartCmd  `cmd:"" help:"Start a continuous-sync stream from source to target."`
 	Status SyncStatusCmd `cmd:"" help:"Show status of a running sync stream."`
+	Stop   SyncStopCmd   `cmd:"" help:"Request a running sync stream to drain in-flight changes and exit cleanly."`
 }
 
 // SyncStartCmd starts (or resumes) a continuous-sync stream from a
@@ -298,6 +300,64 @@ func (s *SyncStatusCmd) Run(_ *Globals) error {
 		)
 	}
 	return nil
+}
+
+// SyncStopCmd asks a running `sluice sync start` to drain in-flight
+// changes, persist its final position, and exit cleanly. The signal
+// is delivered via the per-target sluice_cdc_state control table:
+// the column stop_requested_at is set to NOW(), and the running
+// streamer's polling loop observes the flag on its next tick (every
+// 5s by default).
+//
+// This is additive to the existing Ctrl-C / SIGTERM behavior; it
+// exists so operators can stop streams from a different host (k8s
+// lifecycle hooks, systemd, ad-hoc operator runbooks) without
+// needing PID files or cross-process signal delivery. See
+// internal/pipeline/stop_signal.go for the full design rationale.
+type SyncStopCmd struct {
+	TargetDriver string `help:"Target engine name (e.g. mysql, postgres). See 'sluice engines'." required:"" placeholder:"NAME" group:"target"`
+	Target       string `help:"Target database DSN." required:"" env:"SLUICE_TARGET" placeholder:"DSN" group:"target"`
+	StreamID     string `help:"Stream identifier to stop." required:"" placeholder:"ID"`
+}
+
+// Run implements `sluice sync stop`.
+func (s *SyncStopCmd) Run(_ *Globals) error {
+	target, err := resolveEngine(s.TargetDriver)
+	if err != nil {
+		return fmt.Errorf("--target-driver: %w", err)
+	}
+
+	ctx := kongContext()
+	applier, err := target.OpenChangeApplier(ctx, s.Target)
+	if err != nil {
+		return fmt.Errorf("open target applier: %w", err)
+	}
+	defer func() {
+		if c, ok := applier.(io.Closer); ok {
+			_ = c.Close()
+		}
+	}()
+
+	if err := applier.RequestStop(ctx, s.StreamID); err != nil {
+		// Mirrors `slot drop`'s shape: the CLI surfaces a friendly
+		// "no stream X on target" rather than an engine-specific
+		// stack trace when the operator typos a stream ID.
+		if isStreamNotFoundErr(err) {
+			fmt.Fprintf(os.Stdout, "no stream %q on target\n", s.StreamID)
+			return nil
+		}
+		return fmt.Errorf("request stop: %w", err)
+	}
+	fmt.Fprintf(os.Stdout, "stop requested for stream %q on target; running process will drain and exit\n", s.StreamID)
+	return nil
+}
+
+// isStreamNotFoundErr returns true when err wraps an engine's stream-
+// not-found sentinel. The CLI string-matches the wrapped engine
+// error rather than importing the sentinel from a specific engine
+// package — same shape `isSlotNotFoundErr` uses.
+func isStreamNotFoundErr(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "stream not found")
 }
 
 // humanAgo returns a brief "5m ago" / "2h ago" / "3d ago" string
