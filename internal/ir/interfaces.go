@@ -47,6 +47,21 @@ type RowWriter interface {
 	WriteRows(ctx context.Context, table *Table, rows <-chan Row) error
 }
 
+// TableTruncator is the optional surface a [RowWriter] (or
+// [SchemaWriter]) can implement to expose TRUNCATE TABLE for
+// resume's truncate-and-redo path. The pipeline.Migrator type-asserts
+// on this interface when re-entering an `in_progress` table during
+// resume; engines that don't expose it fall back to "DELETE FROM"
+// via the SchemaWriter or — last resort — refuse to resume the
+// in-progress table cleanly.
+//
+// MySQL InnoDB and Postgres both support TRUNCATE TABLE. The
+// per-engine wiring is on the [RowWriter] implementation so the
+// orchestrator can find it without re-opening connections.
+type TableTruncator interface {
+	TruncateTable(ctx context.Context, table *Table) error
+}
+
 // CDCReader streams [Change] events from a source database starting at
 // the given Position. Engines whose [Capabilities.CDC] is [CDCNone]
 // return a non-nil error for any call to this interface.
@@ -187,6 +202,166 @@ type SlotManager interface {
 // concept on the source side).
 type SlotManagerOpener interface {
 	OpenSlotManager(ctx context.Context, dsn string) (SlotManager, error)
+}
+
+// MigrationPhase enumerates the phases a simple-mode migration can be
+// in. Stored as a TEXT column so the wire shape is portable across
+// engines and human-readable in ad-hoc psql/mysql sessions.
+//
+// The lifecycle is roughly:
+//
+//	pending -> tables -> bulk_copy -> identity_sync -> indexes -> constraints -> complete
+//
+// Any phase can transition to `failed` on error; a subsequent
+// `--resume` reads the stored phase and re-enters at that point.
+type MigrationPhase string
+
+const (
+	// MigrationPhasePending is the initial state of a freshly-created
+	// state row: the row exists but no phase has yet started. This is
+	// transient — Migrator.Run flips to MigrationPhaseTables before
+	// returning to the caller in normal operation. A row left in
+	// `pending` indicates the orchestrator died between row-create and
+	// the first phase, which `--resume` recovers from by re-running
+	// every phase.
+	MigrationPhasePending MigrationPhase = "pending"
+
+	// MigrationPhaseTables covers schema phase 1 (CREATE TABLE without
+	// constraints/indexes). The schema writers are idempotent on
+	// re-run, so a partial-tables failure is recovered by simply
+	// re-running this phase.
+	MigrationPhaseTables MigrationPhase = "tables"
+
+	// MigrationPhaseBulkCopy covers per-table bulk copy. Per-table
+	// granularity lives in MigrationState.TableProgress; the phase
+	// itself only flips to the next state when every table in the
+	// schema is `complete`.
+	MigrationPhaseBulkCopy MigrationPhase = "bulk_copy"
+
+	// MigrationPhaseIdentitySync covers the post-bulk-copy
+	// SyncIdentitySequences step (PG-only; no-op on MySQL). Idempotent.
+	MigrationPhaseIdentitySync MigrationPhase = "identity_sync"
+
+	// MigrationPhaseIndexes covers schema phase 2 (CREATE INDEX). The
+	// engine schema writers' idempotence on re-run is best-effort here
+	// — an existing index with a clashing name would error. A future
+	// pass can pre-query INFORMATION_SCHEMA / pg_class and skip; v1
+	// accepts the rough edge.
+	MigrationPhaseIndexes MigrationPhase = "indexes"
+
+	// MigrationPhaseConstraints covers schema phase 3 (foreign keys).
+	// Same idempotence caveat as MigrationPhaseIndexes.
+	MigrationPhaseConstraints MigrationPhase = "constraints"
+
+	// MigrationPhaseComplete marks a clean finish. A row in this phase
+	// blocks a re-run without --resume (operators must drop the target
+	// or pick a fresh --migration-id) and surfaces "already complete"
+	// on `--resume`.
+	MigrationPhaseComplete MigrationPhase = "complete"
+
+	// MigrationPhaseFailed marks the most recent attempt as errored.
+	// MigrationState.LastError carries the wrapped error message,
+	// truncated to 1KB. The stored Phase field also retains which
+	// phase was running when the failure happened — that's what
+	// drives resume's re-entry.
+	MigrationPhaseFailed MigrationPhase = "failed"
+)
+
+// TableProgressState is the per-table tracking value within
+// [MigrationState.TableProgress]. Three states map directly onto the
+// resume semantics: skip (`complete`), truncate-and-redo
+// (`in_progress`), or start fresh (missing key).
+type TableProgressState string
+
+const (
+	// TableProgressInProgress means the bulk-copy started writing the
+	// table but did not complete. On --resume, the table is TRUNCATEd
+	// and copied from scratch (we can't tell how many rows landed; a
+	// partial-progress retry would need per-batch checkpointing,
+	// which is a future enhancement).
+	TableProgressInProgress TableProgressState = "in_progress"
+
+	// TableProgressComplete means the bulk-copy finished cleanly. On
+	// --resume, the table is skipped.
+	TableProgressComplete TableProgressState = "complete"
+)
+
+// MigrationState is one row in the per-target sluice_migrate_state
+// table. Returned by [MigrationStateStore.Read] and accepted by
+// [MigrationStateStore.Write].
+//
+// Wire shape on disk (engine-neutral):
+//
+//	migration_id    TEXT PRIMARY KEY
+//	phase           TEXT NOT NULL
+//	table_progress  TEXT          -- JSON map[string]TableProgressState
+//	started_at      TIMESTAMP NOT NULL
+//	updated_at      TIMESTAMP NOT NULL
+//	last_error      TEXT          -- truncated to 1KB on write
+//
+// In-memory we de/serialize the JSON map into a Go map for convenient
+// per-table updates. nil TableProgress is fine — first-run writes
+// before any table starts use an empty map.
+type MigrationState struct {
+	MigrationID   string
+	Phase         MigrationPhase
+	TableProgress map[string]TableProgressState
+	StartedAt     time.Time
+	UpdatedAt     time.Time
+	LastError     string
+}
+
+// MigrationStateStore is the per-target persistence surface for
+// resumable simple-mode migrations. Mirrors [ChangeApplier]'s
+// EnsureControlTable / ReadPosition shape but with a different
+// concept (one-shot migrations vs continuous-sync streams) and a
+// different table (`sluice_migrate_state` vs `sluice_cdc_state`).
+//
+// Lifecycle:
+//
+//   - Migrator.Run calls EnsureControlTable once at startup.
+//   - Read decides whether to start fresh, resume, or refuse.
+//   - Write is called at every phase transition (one-row UPDATE) and
+//     after each per-table bulk-copy boundary (table_progress JSON
+//     refresh).
+//
+// Engines that don't support resumable migrations (none today) can
+// simply not implement [MigrationStateStoreOpener]; the orchestrator
+// falls back to non-resumable behaviour.
+type MigrationStateStore interface {
+	// EnsureControlTable creates the per-target sluice_migrate_state
+	// table if it doesn't exist. Idempotent; safe to call on every
+	// start. Includes any column-add migration for v0.2.x targets that
+	// pre-date the table.
+	EnsureControlTable(ctx context.Context) error
+
+	// Read returns the row for migrationID, or ok=false when no row
+	// exists. ok=false means "fresh migration"; ok=true means "row
+	// found, decide resume vs refuse based on Phase".
+	Read(ctx context.Context, migrationID string) (MigrationState, bool, error)
+
+	// Write upserts the row. The store implementation is responsible
+	// for setting updated_at to the current wall-clock time and for
+	// preserving started_at across updates (only the first Write for
+	// a given migration_id sets it). LastError is stored verbatim;
+	// callers should truncate before passing.
+	Write(ctx context.Context, state MigrationState) error
+
+	// Close releases the underlying connection pool.
+	Close() error
+}
+
+// MigrationStateStoreOpener is the optional engine interface that
+// exposes resumable-migration state persistence. Engines without a
+// SQL surface for this (none today) can omit the method; the
+// orchestrator type-asserts and falls back to non-resumable behaviour
+// when the assertion fails.
+//
+// Same shape as [SlotManagerOpener]: optional, type-asserted at the
+// call site, so adding a new engine doesn't force every existing
+// engine to grow a stub.
+type MigrationStateStoreOpener interface {
+	OpenMigrationStateStore(ctx context.Context, dsn string) (MigrationStateStore, error)
 }
 
 // Engine is the bundle of operations a database engine implementation
