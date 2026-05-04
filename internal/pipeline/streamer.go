@@ -75,6 +75,20 @@ type Streamer struct {
 	// created on dry-run; the lookup uses the tolerant readPosition
 	// path that returns "no row" when the table doesn't exist yet.
 	DryRun bool
+
+	// Filter selects which source tables participate in the
+	// stream. Applied to the cold-start schema (so bulk-copy and
+	// schema-apply only see allowed tables) and to the dispatch
+	// loop (so CDC events for excluded tables are dropped before
+	// the applier sees them). The empty filter keeps every table.
+	//
+	// Caveat: position only advances when an event is applied. A
+	// stream that consists entirely of dropped events for a long
+	// time accumulates position lag bounded by the source-side
+	// WAL/binlog retention. In practice every workload mixes
+	// allowed and dropped events and the next applied event
+	// advances the position past the dropped ones.
+	Filter TableFilter
 }
 
 // Run executes a snapshot+CDC stream. See [Streamer] for the full
@@ -137,7 +151,11 @@ func (s *Streamer) Run(ctx context.Context) error {
 	}
 
 	// ---- 5. Apply ----
-	if err := applier.Apply(ctx, streamID, changes); err != nil {
+	// The dispatch-side filter wraps `changes` with a goroutine
+	// that drops events whose qualified name doesn't pass the
+	// filter. No-op pass-through when the filter is empty.
+	filtered := filterChanges(ctx, changes, s.Filter)
+	if err := applier.Apply(ctx, streamID, filtered); err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return nil
 		}
@@ -188,6 +206,9 @@ func (s *Streamer) logDryRunPlan(ctx context.Context, streamID string, persisted
 	if len(schema.Tables) == 0 {
 		slog.InfoContext(ctx, "dry run: source schema has no tables — nothing to stream")
 		return nil
+	}
+	if err := applyTableFilter(ctx, schema, s.Filter); err != nil {
+		return err
 	}
 	if _, err := translate.ApplyMappings(schema, s.Mappings); err != nil {
 		return fmt.Errorf("pipeline: dry-run: apply mappings: %w", err)
@@ -270,6 +291,12 @@ func (s *Streamer) coldStart(ctx context.Context) (<-chan ir.Change, error) {
 	if len(schema.Tables) == 0 {
 		slog.InfoContext(ctx, "source schema has no tables; nothing to stream")
 		return nil, nil
+	}
+
+	// Prune by table filter before mappings + bulk-copy so the
+	// excluded tables never reach the target schema-apply phase.
+	if err := applyTableFilter(ctx, schema, s.Filter); err != nil {
+		return nil, err
 	}
 
 	// Apply per-column type overrides before the schema-write phase

@@ -78,6 +78,15 @@ type Migrator struct {
 	// the named columns reach the target with the requested IR type.
 	// nil/empty disables the override step entirely.
 	Mappings []config.Mapping
+
+	// Filter selects which source tables participate in the
+	// migration. Empty filter (zero value) keeps the previous
+	// behaviour of migrating every table the source schema reader
+	// returns. The filter is applied immediately after ReadSchema
+	// and before any subsequent phase (schema apply, bulk copy,
+	// indexes, constraints) so each phase consumes the pruned
+	// schema implicitly.
+	Filter TableFilter
 }
 
 // Run executes the migration. Returns nil on success or a wrapped
@@ -108,6 +117,14 @@ func (m *Migrator) Run(ctx context.Context) error {
 	if len(schema.Tables) == 0 {
 		slog.InfoContext(ctx, "source schema has no tables; nothing to migrate")
 		return nil
+	}
+
+	// ---- 1.25. Prune schema by table filter ----
+	// Pruning here means every downstream phase (schema apply, bulk
+	// copy, indexes, constraints) operates on the filtered set
+	// implicitly — engines stay agnostic to the filter spec.
+	if err := applyTableFilter(ctx, schema, m.Filter); err != nil {
+		return err
 	}
 
 	// ---- 1.5. Apply per-column type-mapping overrides ----

@@ -142,6 +142,66 @@ func TestRunCallsThreePhasesInOrder(t *testing.T) {
 	}
 }
 
+// TestRunFilterPrunesTables exercises the orchestrator-side prune:
+// with three source tables and an exclude filter that drops one,
+// only the remaining two should be passed to the row writer.
+func TestRunFilterPrunesTables(t *testing.T) {
+	src := newRecordingEngine("source")
+	src.schema = &ir.Schema{
+		Tables: []*ir.Table{
+			{Name: "users", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}},
+			{Name: "orders", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}},
+			{Name: "audit_log", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}},
+		},
+	}
+	tgt := newRecordingEngine("target")
+
+	m := &Migrator{
+		Source: src, Target: tgt,
+		SourceDSN: "src", TargetDSN: "tgt",
+		Filter: TableFilter{Exclude: []string{"audit_*"}},
+	}
+	if err := m.Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	wantWrites := map[string]bool{
+		"WriteRows:users":     true,
+		"WriteRows:orders":    true,
+		"WriteRows:audit_log": false,
+	}
+	got := map[string]bool{}
+	for _, p := range tgt.phaseLog {
+		if strings.HasPrefix(p, "WriteRows:") {
+			got[p] = true
+		}
+	}
+	for k, want := range wantWrites {
+		if got[k] != want {
+			t.Errorf("phaseLog has %q = %v; want %v", k, got[k], want)
+		}
+	}
+}
+
+// TestRunFilterEmptyResultErrors confirms a filter that excludes
+// every source table surfaces a clear error rather than silently
+// running a no-op migration.
+func TestRunFilterEmptyResultErrors(t *testing.T) {
+	src := newRecordingEngine("source")
+	src.schema = sampleSchema()
+	tgt := newRecordingEngine("target")
+
+	m := &Migrator{
+		Source: src, Target: tgt,
+		SourceDSN: "src", TargetDSN: "tgt",
+		Filter: TableFilter{Include: []string{"nonexistent"}},
+	}
+	err := m.Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "every source table") {
+		t.Errorf("err = %v; want a 'excluded every source table' message", err)
+	}
+}
+
 func TestRunPropagatesReadSchemaError(t *testing.T) {
 	src := newRecordingEngine("source")
 	src.readSchemaErr = errors.New("connection refused")
