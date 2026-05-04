@@ -275,12 +275,52 @@ func emitDefault(d ir.DefaultValue, t ir.Type) (string, bool) {
 		return quoteSQLString(v.Value), true
 	case ir.DefaultExpression:
 		normalized := strings.ToLower(strings.TrimSpace(v.Expr))
+		expr := v.Expr
 		if translated, ok := pgToMySQLDefaultExpr[normalized]; ok {
-			return translated, true
+			expr = translated
 		}
-		return v.Expr, true
+		return matchTimestampDefaultPrecision(expr, t), true
 	}
 	return "", false
+}
+
+// matchTimestampDefaultPrecision rewrites a bare CURRENT_TIMESTAMP
+// default expression to include the column's declared fractional-
+// second precision, e.g. CURRENT_TIMESTAMP → CURRENT_TIMESTAMP(6) on
+// a TIMESTAMP(6) column. MySQL rejects "Invalid default value for X"
+// when the function call's precision doesn't match the column's
+// declared precision; the most common path that hits this is a PG
+// source migrating "TIMESTAMPTZ DEFAULT now()" to MySQL — PG reports
+// TIMESTAMPTZ as ir.Timestamp{Precision:6} (PG's default) and the
+// translator turns now() into CURRENT_TIMESTAMP, but without this
+// adjustment the precisions disagree on the target.
+//
+// Inputs that already carry a parenthesised precision (e.g.
+// CURRENT_TIMESTAMP(3)) pass through unchanged — the caller is
+// telling us the precision they want.
+func matchTimestampDefaultPrecision(expr string, t ir.Type) string {
+	if !strings.EqualFold(strings.TrimSpace(expr), "CURRENT_TIMESTAMP") {
+		return expr
+	}
+	prec := temporalPrecision(t)
+	if prec <= 0 {
+		return expr
+	}
+	return fmt.Sprintf("CURRENT_TIMESTAMP(%d)", prec)
+}
+
+// temporalPrecision returns the fractional-second precision declared
+// on a temporal IR type, or 0 for non-temporal types.
+func temporalPrecision(t ir.Type) int {
+	switch v := t.(type) {
+	case ir.Timestamp:
+		return v.Precision
+	case ir.DateTime:
+		return v.Precision
+	case ir.Time:
+		return v.Precision
+	}
+	return 0
 }
 
 // emitColumnDef returns the full DDL fragment for a single column,

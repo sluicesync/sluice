@@ -135,8 +135,30 @@ func TestEmitDefault(t *testing.T) {
 		{"pg NOW() uppercase", ir.DefaultExpression{Expr: "NOW()"}, ir.Timestamp{}, "CURRENT_TIMESTAMP", true},
 		{"pg now() with whitespace", ir.DefaultExpression{Expr: " now() "}, ir.Timestamp{}, "CURRENT_TIMESTAMP", true},
 		// Already-canonical CURRENT_TIMESTAMP (from MySQL or from
-		// stripTypeCast on PG) passes through unchanged.
+		// stripTypeCast on PG) passes through unchanged when the
+		// column has zero fractional precision.
 		{"current_timestamp passthrough", ir.DefaultExpression{Expr: "CURRENT_TIMESTAMP"}, ir.Timestamp{}, "CURRENT_TIMESTAMP", true},
+
+		// Precision-matching for CURRENT_TIMESTAMP defaults: MySQL
+		// rejects "TIMESTAMP(6) DEFAULT CURRENT_TIMESTAMP" because the
+		// function-call precision must equal the column's declared
+		// precision. The translator promotes the bare CURRENT_TIMESTAMP
+		// to CURRENT_TIMESTAMP(N) when the column carries a non-zero N.
+		// Common path: PG TIMESTAMPTZ DEFAULT now() — PG reports
+		// Precision=6 (its default), now() → CURRENT_TIMESTAMP, then
+		// promoted here to CURRENT_TIMESTAMP(6).
+		{"pg now() on TIMESTAMP(6) is precision-matched", ir.DefaultExpression{Expr: "now()"}, ir.Timestamp{Precision: 6, WithTimeZone: true}, "CURRENT_TIMESTAMP(6)", true},
+		{"pg now() on TIMESTAMP(3) is precision-matched", ir.DefaultExpression{Expr: "now()"}, ir.Timestamp{Precision: 3}, "CURRENT_TIMESTAMP(3)", true},
+		{"current_timestamp on DATETIME(6) is precision-matched", ir.DefaultExpression{Expr: "CURRENT_TIMESTAMP"}, ir.DateTime{Precision: 6}, "CURRENT_TIMESTAMP(6)", true},
+		// An expression that *already* declares a precision passes
+		// through unchanged — the caller is asserting that precision.
+		{"explicit precision passthrough", ir.DefaultExpression{Expr: "CURRENT_TIMESTAMP(6)"}, ir.Timestamp{Precision: 6}, "CURRENT_TIMESTAMP(6)", true},
+		// Mismatched explicit precision *is* preserved verbatim — the
+		// translator doesn't second-guess a hand-written expression.
+		// MySQL will reject it loudly if it's wrong, which matches
+		// the project policy.
+		{"explicit mismatched precision passthrough", ir.DefaultExpression{Expr: "CURRENT_TIMESTAMP(3)"}, ir.Timestamp{Precision: 6}, "CURRENT_TIMESTAMP(3)", true},
+
 		// Unrelated expressions pass through verbatim — the project
 		// policy of "loud failure beats silent corruption".
 		{"unrelated expr passthrough", ir.DefaultExpression{Expr: "uuid_generate_v4()"}, ir.UUID{}, "uuid_generate_v4()", true},
