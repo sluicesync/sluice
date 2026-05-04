@@ -198,6 +198,14 @@ func flattenArgs(batch []ir.Row, table *ir.Table) []any {
 //   - [ir.Geometry] values are raw WKB bytes (per docs/value-types.md);
 //     MySQL's wire format is `<srid uint32 LE><wkb>`. We prepend the
 //     SRID using the column's declared SRID (or 0 when unset).
+//   - [ir.JSON] values are []byte in IR (the raw JSON document
+//     per docs/value-types.md). go-sql-driver/mysql labels []byte
+//     parameters with `_binary` charset on the wire, which Vitess
+//     rejects with "Cannot create a JSON value from a string with
+//     CHARACTER SET 'binary'" when the destination column is JSON.
+//     Convert to a Go string so the driver sends VARCHAR (no
+//     charset prefix) and MySQL/Vitess parses it as JSON cleanly.
+//     Real-world bug found during PlanetScale-target testing.
 func prepareValue(v any, t ir.Type) any {
 	if v == nil {
 		return nil
@@ -205,6 +213,11 @@ func prepareValue(v any, t ir.Type) any {
 	if _, isSet := t.(ir.Set); isSet {
 		if ss, ok := v.([]string); ok {
 			return strings.Join(ss, ",")
+		}
+	}
+	if _, isJSON := t.(ir.JSON); isJSON {
+		if b, ok := v.([]byte); ok {
+			return string(b)
 		}
 	}
 	if geom, isGeom := t.(ir.Geometry); isGeom {

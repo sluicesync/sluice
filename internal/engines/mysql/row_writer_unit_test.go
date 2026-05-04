@@ -128,6 +128,16 @@ func TestPrepareValue(t *testing.T) {
 		{"set with members", []string{"a", "b", "c"}, ir.Set{Values: []string{"a", "b", "c", "d"}}, "a,b,c"},
 		{"set empty", []string{}, ir.Set{Values: []string{"a"}}, ""},
 
+		// JSON []byte → string. Without this conversion the driver
+		// labels the parameter with the _binary charset prefix on
+		// the wire and Vitess rejects with "Cannot create a JSON
+		// value from a string with CHARACTER SET 'binary'". Real-
+		// world failure surfaced during PlanetScale-target
+		// integration testing.
+		{"json bytes → string", []byte(`{"k":"v"}`), ir.JSON{Binary: true}, `{"k":"v"}`},
+		{"json textual → string", []byte(`["a",1]`), ir.JSON{Binary: false}, `["a",1]`},
+		{"json string passthrough", `{"k":"v"}`, ir.JSON{Binary: true}, `{"k":"v"}`},
+
 		// A non-Set column receiving []string passes through unchanged
 		// — the driver would error, which is what we want when the
 		// caller has a type confusion bug.
