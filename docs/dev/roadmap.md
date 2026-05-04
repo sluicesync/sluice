@@ -120,7 +120,24 @@ The orchestrator gets a new mode (`pipeline.Migrator{Mode: ModeSnapshotPlusCDC}`
 
 ---
 
-### 7. Translation policy edges
+### 7. Postgres slot creation with `failover=true`
+
+**Why.** PlanetScale Postgres (and any Patroni-fronted PG ≥ 17 deployment) requires logical replication slots to be created with the `failover=true` flag *and* listed in the cluster's permanent-slots config to survive switchover or failover. Today sluice creates slots via the replication-protocol command `CREATE_REPLICATION_SLOT`, which on PG 14–16 doesn't accept the failover flag at all — so slots created by sluice on those versions can never be HA-promoted, and on PG 17 we're not opting in. **Result:** a PlanetScale customer using sluice will silently lose their CDC stream on the next failover, with recovery requiring drop + recreate + re-snapshot. The `docs/postgres-source-prep.md` doc raises this with operators, but the tool should default to the safe behavior on PG 17+.
+
+**What.** Two paths:
+- **Protocol-level:** PG 17 added a `FAILOVER` option to the `CREATE_REPLICATION_SLOT` replication command. If `pglogrepl.CreateReplicationSlotOptions` exposes it (or once it does), set it on PG 17+ sources. Detect the server version via `pglogrepl.IdentifySystem` (or a `SHOW server_version_num` precondition query) before the call.
+- **SQL-function fallback:** `pg_create_logical_replication_slot('name', 'pgoutput', false, false, true)` — the 5-arg form, where the trailing `true` is `failover`. This needs a regular `*sql.DB` connection rather than the replication connection. The CDC reader currently runs `CREATE_REPLICATION_SLOT` on the replication conn; switching to the SQL function changes the order-of-operations a little but doesn't affect the snapshot-export path because the snapshot happens via `EXPORT_SNAPSHOT` on the replication conn separately.
+
+For PG ≤ 16, there's no path: the flag doesn't exist, and Patroni's permanent-slots config (or PG 17's `sync_replication_slots`) is the only mechanism. Surface a warning when sluice creates a slot on PG ≤ 16 against a Patroni-fronted cluster, pointing at `docs/postgres-source-prep.md`.
+
+**Gotchas / open questions.**
+- Detecting "is this Patroni" or "is this PlanetScale" cleanly is non-trivial. Patroni doesn't expose a sentinel GUC. Pragmatic call: always set `failover=true` when the server is PG 17+ (it's a no-op on non-Patroni clusters), and emit the warning unconditionally on PG ≤ 16. Operators can suppress with a flag or by adding the slot to the permanent-slots config.
+- The snapshot stream path (`internal/engines/postgres/cdc_snapshot.go`) creates the slot via `pglogrepl.CreateReplicationSlot` too — same fix needed there.
+- Verification: a `psverify`-tagged test on a real PlanetScale cluster that creates a slot, queries `pg_replication_slots.failover` (PG 17+), and asserts it's `true`.
+
+---
+
+### 8. Translation policy edges
 
 These will surface as bugs once cross-engine tests cover more types. Each is a small chunk on its own; they're listed together because they share a pattern (a type or feature exists in one engine and needs an explicit policy on the other).
 
@@ -132,7 +149,7 @@ These will surface as bugs once cross-engine tests cover more types. Each is a s
 
 ---
 
-### 8. ADRs (Architecture Decision Records)
+### 9. ADRs (Architecture Decision Records)
 
 **Why.** The project has accumulated several non-obvious design decisions (IR-first, sealed interfaces with unexported method, kong + koanf over cobra + viper, three-phase schema apply, MySQL flavors as capability variants). Without ADRs, the *reasons* live in conversation history and risk being forgotten or relitigated.
 
@@ -151,7 +168,7 @@ Initial set:
 
 ---
 
-### 9. OSS hygiene
+### 10. OSS hygiene
 
 Lower priority than feature work but required before declaring v1.
 
@@ -165,7 +182,7 @@ Lower priority than feature work but required before declaring v1.
 
 ---
 
-### 10. Operational features (post-v1)
+### 11. Operational features (post-v1)
 
 Not blocking v1 but worth tracking:
 
