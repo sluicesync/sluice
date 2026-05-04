@@ -8,9 +8,10 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [0.2.1] - 2026-05-03
 
-Single-issue patch release fixing a regression introduced in v0.2.0:
-PG-source CDC is unblocked on PlanetScale Postgres (and any other
-PG 17+ deployment whose option-list parser is strict).
+Patch release covering the v0.2.0 PG-source regression on PlanetScale
+Postgres plus a CDC-applier JSON-encoding bug that surfaced during
+v0.2.1 revalidation testing — the latter affecting both PG→MySQL
+(loud crash) and MySQL→MySQL (silent data divergence).
 
 ### Fixed
 
@@ -24,6 +25,56 @@ PG 17+ deployment whose option-list parser is strict).
   blocking every `sluice sync start` against a PG source. Cold-start
   CDC (without snapshot export) was unaffected; snapshot+CDC handoff
   is the path that hit it.
+
+- **MySQL applier: shape JSON column values for the wire on CDC
+  Insert/Update/Delete**. The MySQL `ChangeApplier` bound row values
+  straight from `ir.Row` to the parameterised SQL, bypassing the
+  `prepareValue` used by the bulk-copy path. Two production failures
+  shared the same root cause:
+
+  - **Loud (PG → MySQL CDC on Vitess/PlanetScale)**: `[]byte` JSON
+    values arrived `_binary`-tagged on the wire and Vitess rejected
+    them with "Cannot create a JSON value from a string with
+    CHARACTER SET 'binary'". Sluice exited.
+  - **Silent (MySQL → MySQL CDC, vanilla MySQL included)**: `WHERE`
+    on a JSON column with a bare `?` placeholder never matched —
+    MySQL's `=` operator does not implicitly cast a bound parameter
+    to JSON regardless of whether it's `[]byte` or `string`. The
+    applier (which tolerates zero-rows-affected for resume
+    idempotency) silently advanced past UPDATEs and DELETEs that
+    should have matched. The destination row stayed stale forever
+    with no error signal — data divergence with no observability.
+
+  The fix has two parts: (1) a per-table column-type cache lets every
+  bound value go through `prepareValue` (so JSON `[]byte` → `string`,
+  Set `[]string` → comma-joined, Geometry gets the SRID prefix); and
+  (2) `WHERE` placeholders on JSON-typed columns are wrapped in
+  `CAST(? AS JSON)` so the comparison is JSON-vs-JSON rather than
+  JSON-vs-text. The Postgres applier got the parallel cleanup for
+  symmetry and for Array/Geometry shaping (its WHERE didn't need a
+  CAST equivalent — pgx inspects per-column type metadata natively).
+
+  A new `TestChangeApplier_JSONColumn` integration test on each
+  engine exercises the silent path end-to-end; without the fix it
+  fails loudly in PG→MySQL and quietly in MySQL→MySQL.
+
+### Added
+
+- **Debug-level zero-rows-affected log on Update/Delete**. The
+  applier still tolerates zero-rows-affected (resume idempotency
+  depends on it), but a `slog.Debug` line now fires when it
+  happens — a single observability footprint that lets future
+  silent-divergence bugs be one log filter away from being spotted.
+
+### Changed
+
+- **Dry-run table output: split `indexes` into `primary_key` +
+  `secondary_indexes`**. The IR stores the primary key on a separate
+  field from secondary indexes, so the v0.2.0 `indexes=N` field
+  silently excluded PK and confused operators comparing against
+  psql / SHOW INDEX output. The new shape (`primary_key=true
+  secondary_indexes=1 foreign_keys=2`) is explicit from the field
+  names alone.
 
 ## [0.2.0] - 2026-05-03
 
