@@ -54,9 +54,26 @@ type binlogPos struct {
 	Pos  uint32 `json:"pos,omitempty"`
 }
 
-// engineNameMySQL is the [ir.Position.Engine] tag this engine writes
-// and accepts. Other engines' positions are rejected on decode.
+// engineNameMySQL is the [ir.Position.Engine] tag the binlog reader
+// writes for fresh positions. The VStream reader uses
+// [engineNameVStream] ("planetscale") instead. Both decoders accept
+// either name via [isMySQLFamilyEngine], because the per-target
+// [ChangeApplier].ReadPosition path stamps recovered positions
+// with the applier's own engine name (always "mysql" for the
+// MySQL applier) regardless of which reader produced the
+// original — so a VStream-shape token written by a planetscale-
+// flavor stream comes back tagged "mysql" on resume, and a binlog-
+// shape token similarly. Cross-package guard is still effective:
+// postgres positions get rejected because "postgres" isn't in this
+// family.
 const engineNameMySQL = "mysql"
+
+// isMySQLFamilyEngine returns true for the engine-name strings the
+// MySQL package's two CDC paths (binlog and VStream) accept on
+// decode. See [engineNameMySQL] for the rationale.
+func isMySQLFamilyEngine(name string) bool {
+	return name == engineNameMySQL || name == engineNameVStream
+}
 
 // encodeBinlogPos marshals p into an [ir.Position] suitable for
 // emission with an [ir.Change]. The Engine field is fixed to "mysql"
@@ -77,16 +94,27 @@ func encodeBinlogPos(p binlogPos) (ir.Position, error) {
 // zero value of [ir.Position] (empty Engine and Token) is the "from
 // now" sentinel and is reported via the second return value; callers
 // distinguish that case from a bad token by checking ok before err.
+//
+// Engine acceptance is broader than just "mysql": both binlog and
+// VStream positions originate inside this package, and the
+// [ChangeApplier] ReadPosition path stamps every recovered position
+// with the applier's engine name (currently "mysql") regardless of
+// which reader produced the original. So a planetscale-flavor
+// reader resuming on a binlog-mode position would see Engine="mysql"
+// — which is correct. We accept "planetscale" as an alias to keep
+// the same applier round-tripping VStream positions cleanly. The
+// real cross-engine guard is still in place: postgres positions
+// (Engine="postgres") are rejected.
 func decodeBinlogPos(p ir.Position) (decoded binlogPos, ok bool, err error) {
 	if p.Engine == "" && p.Token == "" {
 		// "From now" sentinel — caller should query the source for
 		// its current position instead of decoding.
 		return binlogPos{}, false, nil
 	}
-	if p.Engine != engineNameMySQL {
+	if !isMySQLFamilyEngine(p.Engine) {
 		return binlogPos{}, false, fmt.Errorf(
-			"mysql: decode binlog position: engine = %q; want %q",
-			p.Engine, engineNameMySQL)
+			"mysql: decode binlog position: engine = %q; want %q or %q",
+			p.Engine, engineNameMySQL, engineNameVStream)
 	}
 	if p.Token == "" {
 		return binlogPos{}, false, errors.New("mysql: decode binlog position: token is empty")

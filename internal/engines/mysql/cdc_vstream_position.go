@@ -90,16 +90,20 @@ func encodeVStreamPos(shards []shardGtid) (ir.Position, error) {
 // distinction at every call site (mirrors decodeBinlogPos's
 // shape).
 //
-// A non-empty Engine that doesn't match the planetscale engine
-// name returns an error so a binlog-mode position passed to a
-// VStream reader (or vice-versa) fails loudly rather than running
-// halfway and breaking mysteriously.
+// Engine acceptance covers both "mysql" and "planetscale" because
+// the [ChangeApplier].ReadPosition path stamps recovered positions
+// with the applier's engine name ("mysql") regardless of which
+// reader produced the original. A VStream-shape token tagged as
+// engine "mysql" therefore needs to round-trip through this
+// decoder cleanly. The cross-engine guard still applies — postgres
+// positions (Engine="postgres") fail loudly.
 func decodeVStreamPos(p ir.Position) (shards []shardGtid, ok bool, err error) {
 	if p.Engine == "" && p.Token == "" {
 		return nil, false, nil
 	}
-	if p.Engine != engineNameVStream {
-		return nil, false, fmt.Errorf("mysql: vstream position: wrong engine %q; want %q", p.Engine, engineNameVStream)
+	if !isMySQLFamilyEngine(p.Engine) {
+		return nil, false, fmt.Errorf("mysql: vstream position: wrong engine %q; want %q or %q",
+			p.Engine, engineNameMySQL, engineNameVStream)
 	}
 	if p.Token == "" {
 		return nil, false, errors.New("mysql: vstream position: empty token with non-empty engine")

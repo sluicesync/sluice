@@ -159,8 +159,13 @@ func TestDecodeVStreamPosErrors(t *testing.T) {
 		wantSub string
 	}{
 		{
-			"wrong engine",
-			ir.Position{Engine: "mysql", Token: `[{"keyspace":"main","shard":"-","gtid":"g"}]`},
+			// "mysql" is now accepted as a valid mysql-family engine
+			// alias — the applier round-trips planetscale positions
+			// tagged with the applier's own engine name. So this is
+			// no longer an error; positive coverage of the alias case
+			// lives in TestDecodeVStreamPos_AcceptsMySQLEngineAlias.
+			"wrong engine — postgres is rejected",
+			ir.Position{Engine: "postgres", Token: `[{"keyspace":"main","shard":"-","gtid":"g"}]`},
 			"wrong engine",
 		},
 		{
@@ -200,6 +205,35 @@ func TestDecodeVStreamPosErrors(t *testing.T) {
 				t.Errorf("err = %q; want substring %q", err.Error(), c.wantSub)
 			}
 		})
+	}
+}
+
+// TestDecodeVStreamPos_AcceptsMySQLEngineAlias covers Bug 2's fix:
+// the [ChangeApplier].ReadPosition path stamps every recovered
+// position with the applier's own engine name (always "mysql" on
+// the MySQL applier), regardless of which reader produced the
+// original. So a VStream-shape token written by a planetscale-
+// flavor stream comes back through ReadPosition tagged "mysql".
+// decodeVStreamPos must accept that alias to keep warm resume
+// working — without this, every restart of a planetscale sync
+// fails with "wrong engine 'mysql'; want 'planetscale'".
+func TestDecodeVStreamPos_AcceptsMySQLEngineAlias(t *testing.T) {
+	want := []shardGtid{
+		{Keyspace: "main", Shard: "-", Gtid: "MySQL56/abcd:1-100"},
+	}
+	pos := ir.Position{
+		Engine: "mysql", // applier's stamp, not the reader's canonical "planetscale"
+		Token:  `[{"keyspace":"main","shard":"-","gtid":"MySQL56/abcd:1-100"}]`,
+	}
+	got, ok, err := decodeVStreamPos(pos)
+	if err != nil {
+		t.Fatalf("expected mysql-aliased VStream position to decode cleanly; got err: %v", err)
+	}
+	if !ok {
+		t.Fatal("ok=false; want true (this is a real position, not the from-now sentinel)")
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("\n got:  %#v\nwant: %#v", got, want)
 	}
 }
 
