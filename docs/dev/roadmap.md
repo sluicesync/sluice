@@ -69,23 +69,16 @@ Keep the original error verbatim; hints are additive. Source: a small registry o
 
 ---
 
-### 3. ADRs (Architecture Decision Records)
+### 3. Follow-up ADRs for v0.2.x design decisions
 
-**Why.** The project has accumulated several non-obvious design decisions (IR-first, sealed interfaces with unexported method, kong + koanf over cobra + viper, three-phase schema apply, MySQL flavors as capability variants). Without ADRs, the *reasons* live in conversation history and risk being forgotten or relitigated.
+**Why.** ADRs 0001–0010 are landed (foundational decisions: IR-first, sealed interfaces, kong+koanf, three-phase apply, MySQL flavors, pgoutput, position persistence, go-mysql, Streamer-as-separate-orchestrator, idempotent applier semantics). Several non-obvious decisions in v0.2.x deserve their own entries:
 
-**What.** A `docs/adr/` directory with one file per decision, following the [Michael Nygard ADR format](https://github.com/joelparkerhenderson/architecture-decision-record/blob/main/locales/en/templates/decision-record-template-by-michael-nygard/index.md): Status, Context, Decision, Consequences. Numbered (`adr-0001-ir-first.md`, etc.). Reference them from the relevant `docs/architecture.md` sections.
+- **ADR-0011**: `SlotManager` as an optional engine surface (the optional-interface + type-assertion pattern for engine-specific operator surfaces).
+- **ADR-0012**: Bypassing `pglogrepl` to send raw `CREATE_REPLICATION_SLOT` for PG 17+ `FAILOVER true`. Records why we don't wait for upstream library support.
+- **ADR-0013**: Applier value-shaping via column-type cache + `CAST(? AS JSON)` (the Bug 6 fix shape — explains why we cache schema in the applier and why WHERE needs explicit JSON casting).
+- **ADR-0014**: Phase-aware error-hint registry (substring + phase matching, deliberately tiny, additive via `%w`-wrapping).
 
-Initial set:
-- ADR-0001: IR-first translation
-- ADR-0002: Sealed interfaces via unexported method
-- ADR-0003: kong + koanf over cobra + pflag + viper
-- ADR-0004: Three-phase schema apply (tables → indexes → constraints)
-- ADR-0005: MySQL flavors as capability variants
-- ADR-0006: pgoutput over wal2json
-- ADR-0007: Position persistence on the target (control table)
-- ADR-0008: SlotManager as optional engine surface
-
-**Scope.** Each ADR is short — typically under 200 words. The whole batch is half a day's work; they can also drip in over time.
+**Scope.** Each ADR is short — typically under 200 words. Half a day's work for the batch.
 
 ---
 
