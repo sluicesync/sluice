@@ -6,6 +6,79 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-05-03
+
+Bug-fix and operator-UX release driven by real-world v0.1.0
+testing against PlanetScale Postgres + MySQL. Four target-side
+data-correctness bugs fixed; the slot lifecycle on PG sources
+gets a first-class CLI plus auto-drop on failed setup; logical
+slots now opt into PG 17 `FAILOVER`; CLI output moves to
+structured logging with bulk-copy progress lines and phase-aware
+error hints.
+
+### Added — operator surface
+
+- **`sluice slot list` / `sluice slot drop`**: source-side
+  replication-slot management for Postgres CDC. List shows
+  every slot's plugin, active flag, `wal_status`, `restart_lsn`,
+  and `confirmed_flush_lsn`; drop is destructive and prompts
+  for confirmation by default (`--yes` skips, `--force` allows
+  dropping an active slot, `--if-exists` swallows the not-found
+  error). Engines without slot management (MySQL today) surface
+  a clear error rather than silently no-op. Backed by a new
+  `ir.SlotManager` interface that engines opt into via
+  `OpenSlotManager`.
+- **Auto-drop slot on failed cold-start**: when sluice creates a
+  fresh slot in `StreamChanges` and any later setup step fails
+  (IDENTIFY_SYSTEM, START_REPLICATION, ctx cancellation), the
+  slot is dropped before `StreamChanges` returns. Slots that
+  already existed when the call started are never touched. Once
+  the channel is in the caller's hands the auto-drop is
+  suppressed: emitted change positions reference the slot, and
+  that's user data we don't auto-clean.
+- **Refuse to start on invalidated slots**: `pg_replication_slots
+  .wal_status` of `unreserved` or `lost` (the latter caused by a
+  slow consumer falling behind `max_slot_wal_keep_size`) now
+  surfaces a clear, actionable error pointing at
+  `sluice slot drop` and `max_slot_wal_keep_size` for prevention,
+  instead of letting `START_REPLICATION` fail mid-stream with
+  "requested WAL segment has already been removed".
+- **Structured logging via `log/slog`**: `--log-level` is now
+  wired into the slog default handler (stderr text format), so
+  `debug`/`info`/`warn`/`error` actually changes verbosity. The
+  pipeline's `Migrator` and `Streamer` types drop their `Stdout`
+  fields and emit structured records (`migration complete
+  tables=N`, `bulk copy complete table=foo rows=N`, etc.).
+  Operator-facing CLI tables (`engines`, `sync status`,
+  `slot list`) keep using stdout — they're table renders, not
+  log streams.
+- **Bulk-copy progress reporting**: a new `progressTicker` sits
+  in the row pipe between `RowReader` and `RowWriter` for each
+  bulk-copied table. It atomically counts rows, emits
+  `bulk copy progress` every 2s while rows are advancing, and a
+  final `bulk copy complete` line on Stop. Counting at the
+  pipeline layer keeps engines unchanged.
+- **Phase-aware error hints**: wrapped pipeline errors get an
+  optional one-line `hint:` suffix for common operator-facing
+  failures — missing target table, bad DSN host, auth failures,
+  missing REPLICATION grant, missing CREATE on schema. Hints are
+  appended via `fmt.Errorf("%w\nhint: %s")` so `errors.Is`/`As`
+  traversal is unaffected. Registry is intentionally tiny (7
+  entries) and scoped by phase.
+
+### Added — Postgres slot HA
+
+- **`FAILOVER true` on PG 17+ slot creation**: both slot-creation
+  sites — the cold-start path in the CDC reader and the
+  snapshot+CDC handoff — now go through a version-aware helper.
+  PG 17+ sends a raw `CREATE_REPLICATION_SLOT ... (FAILOVER true)`
+  protocol command via `pgconn.Exec` (pglogrepl's options struct
+  doesn't yet expose the flag); PG ≤ 16 falls back to the
+  FAILOVER-less path and emits a one-time stderr warning naming
+  the slot and pointing at the manual workaround. Closes the
+  silent slot-loss-on-failover gotcha for PlanetScale and any
+  Patroni-fronted PG 17+ deployment.
+
 ### Added — orchestration
 
 - **`sluice sync start --dry-run`** (`-n`): symmetric with the
@@ -13,13 +86,9 @@ project follows [Semantic Versioning](https://semver.org/).
   looks up the persisted position on the target, and prints the
   plan (cold-start vs warm-resume; source schema summary or
   position token) without modifying the target or starting the
-  stream. Pre-flight check operators run before kicking off a
-  multi-day stream against production. The position lookup is
-  tolerant of the control table being absent — both engines'
-  `readPosition` helpers now fall through "missing relation"
-  errors as "no row" (same path `ListStreams` already uses), so
-  dry-run against a virgin target reports cold-start cleanly
-  rather than erroring on a table that doesn't exist yet.
+  stream. The position lookup is tolerant of the control table
+  being absent — both engines' `readPosition` helpers now fall
+  through "missing relation" errors as "no row".
 
 ### Added — managed-service support
 
@@ -28,21 +97,75 @@ project follows [Semantic Versioning](https://semver.org/).
   fans out to every shard in a sharded keyspace, buffers rows
   from all shards into a unified per-table view, and uses the
   global `COPY_COMPLETED` event (both `Keyspace` and `Shard`
-  empty) as the snapshot→CDC handoff boundary. Per-scope
-  `COPY_COMPLETED` events are tracked as progress markers but do
-  not terminate the drain. The captured `ir.Position` carries one
-  `shardGtid` entry per shard, matching the standalone CDC
-  reader's multi-shard layout. Pairs with
-  `vstream_auto_discover_shards=true` for shard-list discovery
+  empty) as the snapshot→CDC handoff boundary. The captured
+  `ir.Position` carries one `shardGtid` entry per shard. Pairs
+  with `vstream_auto_discover_shards=true` for shard discovery
   via `SHOW VITESS_SHARDS`. Validated against
   `vitess/vttestserver` with `NUM_SHARDS=2`.
 - **Reshard-during-COPY signalling**: a `JOURNAL` event during
   the snapshot path's COPY phase now surfaces the typed
-  `ShardLayoutChangedError` (matchable via `errors.Is` against
-  `ErrShardLayoutChanged`), the same contract the standalone CDC
-  reader exposes. v1 of the multi-shard snapshot does not
-  recover in place — the caller drops the snapshot stream and
-  reopens against the new layout.
+  `ShardLayoutChangedError`, matching the standalone CDC reader.
+  v1 of the multi-shard snapshot does not recover in place — the
+  caller drops the snapshot stream and reopens against the new
+  layout.
+
+### Fixed
+
+- **MySQL target rejects JSON values labelled `_binary`**: PG
+  source columns of type JSONB arriving through a MySQL writer
+  were being sent over the wire with the `_binary` charset
+  prefix, which Vitess (and MySQL strict mode) reject with
+  "Cannot create a JSON value from a string with CHARACTER SET
+  'binary'". `prepareValue` now converts `[]byte` to `string`
+  for `ir.JSON` columns. Surfaced during PlanetScale-target
+  testing.
+- **Warm-resume engine alias**: `ChangeApplier.ReadPosition`
+  stamps every recovered position with the applier's engine
+  name (always `mysql` for the MySQL applier) regardless of
+  which reader produced the original. Strict engine-name checks
+  in `decodeBinlogPos` / `decodeVStreamPos` rejected warm-resume
+  on PlanetScale streams with `wrong engine "mysql"; want
+  "planetscale"`. Both decoders now accept the mysql-family
+  aliases (`mysql` or `planetscale`); the cross-engine guard
+  still rejects `postgres` positions.
+- **Postgres UPDATE empty-WHERE under REPLICA IDENTITY DEFAULT**:
+  pgoutput omits `OldTuple` on UPDATEs that don't modify the
+  identity-key columns (the common case under the server-default
+  identity). The CDC reader previously left `Before` nil, and
+  the applier built `UPDATE t SET ... WHERE` with an empty
+  predicate that Postgres rejects with "syntax error at end of
+  input". The reader now synthesises a key-only `Before` from
+  the after-tuple's identity columns. REPLICA IDENTITY NOTHING
+  and tables without identity columns surface a clear error
+  instead of a malformed statement.
+- **MySQL `CURRENT_TIMESTAMP` default precision mismatch**: MySQL
+  rejects `TIMESTAMP(6) DEFAULT CURRENT_TIMESTAMP` because the
+  function-call precision must equal the column's. The most
+  common path that hit this was a PG `TIMESTAMPTZ DEFAULT now()`
+  migrating to MySQL — PG reports `Precision=6`, the translator
+  turned `now()` into bare `CURRENT_TIMESTAMP`, leaving
+  precisions mismatched. `emitDefault` now promotes a bare
+  `CURRENT_TIMESTAMP` to `CURRENT_TIMESTAMP(N)` on a
+  `TIMESTAMP`/`DATETIME`/`TIME` column with non-zero precision.
+  Expressions that already carry an explicit precision pass
+  through unchanged.
+
+### Added — docs
+
+- **`docs/postgres-source-prep.md`**: operator checklist for
+  running sluice CDC against a Postgres source — required GUCs,
+  connecting role attributes, slot lifecycle, `wal_status`
+  recovery workflow, and the failover-survival mechanisms
+  (Patroni `slots:`, PlanetScale "Logical slot name" UI,
+  PG 17 `sync_replication_slots`). The PlanetScale section is
+  load-bearing: slot loss on failover is silent without proper
+  permanent-slots config.
+- **README hero example** showing `migrate` / `sync start` /
+  `sync status` end-to-end against the same DSN pair.
+- **CONTRIBUTING test-tag layering**: documents the four build
+  tags (default, integration, integration+postgis,
+  integration+vstream, psverify) and which container images each
+  pulls.
 
 ## [0.1.0] - 2026-05-03
 
@@ -226,5 +349,6 @@ level history.
 
 (none currently — see the closed entries above.)
 
-[Unreleased]: https://github.com/orware/sluice/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/orware/sluice/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/orware/sluice/releases/tag/v0.2.0
 [0.1.0]: https://github.com/orware/sluice/releases/tag/v0.1.0
