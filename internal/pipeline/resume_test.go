@@ -215,6 +215,13 @@ func TestResumePhaseSkipping(t *testing.T) {
 			"orders": {State: ir.TableProgressInProgress, LastPK: []any{int64(100)}, RowsCopied: 100},
 			"legacy": {State: ir.TableProgressInProgress}, // v0.3.0-shape: no cursor
 			"events": {State: ir.TableProgressNoPKTruncateAndRedo},
+			"chunked": {
+				State: ir.TableProgressInProgress,
+				Chunks: []ir.TableChunkProgress{
+					{ChunkIndex: 0, UpperPK: []any{int64(50)}, State: ir.TableProgressComplete},
+					{ChunkIndex: 1, LowerPK: []any{int64(50)}, State: ir.TableProgressInProgress, LastPK: []any{int64(75)}, RowsCopied: 25},
+				},
+			},
 		},
 	}
 	cases := []struct {
@@ -230,6 +237,8 @@ func TestResumePhaseSkipping(t *testing.T) {
 		{"missing + resuming", "audit_log", true, resumeActionFresh},
 		{"complete but not resuming", "users", false, resumeActionFresh},
 		{"in_progress but not resuming", "orders", false, resumeActionFresh},
+		{"chunked + resuming", "chunked", true, resumeActionResumeChunked},
+		{"chunked but not resuming", "chunked", false, resumeActionFresh},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

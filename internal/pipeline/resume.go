@@ -289,17 +289,19 @@ func markComplete(ctx context.Context, rc resumeContext, state ir.MigrationState
 }
 
 // resumeBulkCopyAction is the per-table action the bulk-copy phase
-// takes during resume. Four values cover the resume cases:
+// takes during resume. Five values cover the resume cases:
 // skip a completed table, truncate-and-redo an in-progress no-PK
 // table (or a v0.3.0-shape row), resume mid-table from a recorded
-// cursor (v0.4.0), start fresh on a missing-from-progress table.
+// single-chunk cursor (v0.4.0), resume mid-table from per-chunk
+// cursors (v0.5.0), start fresh on a missing-from-progress table.
 type resumeBulkCopyAction int
 
 const (
 	resumeActionFresh            resumeBulkCopyAction = iota // not in progress map → start fresh
 	resumeActionSkip                                         // state=complete → skip
 	resumeActionTruncate                                     // state=in_progress without cursor, or state=no_pk_truncate_and_redo → truncate and redo
-	resumeActionResumeFromCursor                             // state=in_progress with non-empty LastPK → resume mid-table
+	resumeActionResumeFromCursor                             // state=in_progress with non-empty LastPK → resume mid-table (single-chunk)
+	resumeActionResumeChunked                                // state=in_progress with non-empty Chunks → resume mid-table (parallel)
 )
 
 // classifyTableForResume picks the action for a table during a
@@ -332,6 +334,13 @@ func classifyTableForResume(state ir.MigrationState, tableName string, resuming 
 	case ir.TableProgressNoPKTruncateAndRedo:
 		return resumeActionTruncate
 	case ir.TableProgressInProgress:
+		// v0.5.0 parallel-copy progress: per-chunk cursors live in
+		// Chunks. Even if Chunks has only chunk 0 with no cursor,
+		// each chunk is independently resumable so we hand off to
+		// the parallel path rather than truncate-and-redo.
+		if len(entry.Chunks) > 0 {
+			return resumeActionResumeChunked
+		}
 		if len(entry.LastPK) > 0 {
 			return resumeActionResumeFromCursor
 		}

@@ -93,6 +93,10 @@ type MigrateCmd struct {
 	ForceColdStart bool `help:"Skip the cold-start pre-flight check that refuses to bulk-copy into a populated target. Use with caution — INSERT into a non-empty table will collide on PRIMARY KEY. Ignored when --resume is set."`
 
 	BulkBatchSize int `help:"Bulk-copy batch size for resume-mid-table checkpointing. Each batch commits with an updated cursor in sluice_migrate_state.table_progress, so a crash mid-table resumes without re-copying the prefix. Tables without a PK fall back to truncate-and-redo regardless. Lower values shorten the replay window on crash; higher values amortise per-tx commit overhead. Only consulted on the resume path; cold-start migrations use the faster plain-INSERT / COPY path. Default 5000." default:"5000" placeholder:"N"`
+
+	BulkParallelism int `help:"Number of parallel reader/writer pairs per table during bulk copy. Tables above --bulk-parallel-min-rows are split into this many PK ranges and copied concurrently. Tables without a single integer PK fall back to single-reader. 0 means use min(8, NumCPU); 1 disables parallelism. See ADR-0019." default:"0" placeholder:"N"`
+
+	BulkParallelMinRows int64 `help:"Row-count threshold below which a table is copied with a single reader/writer pair regardless of --bulk-parallelism. Avoids per-chunk overhead on small tables. Default 100000." default:"100000" placeholder:"N"`
 }
 
 // Run implements the migrate subcommand.
@@ -130,17 +134,19 @@ func (m *MigrateCmd) Run(g *Globals) error {
 	}
 
 	mig := &pipeline.Migrator{
-		Source:         source,
-		Target:         target,
-		SourceDSN:      m.Source,
-		TargetDSN:      m.Target,
-		DryRun:         m.DryRun,
-		Mappings:       mappings,
-		Filter:         filter,
-		Resume:         m.Resume,
-		MigrationID:    m.MigrationID,
-		ForceColdStart: m.ForceColdStart,
-		BulkBatchSize:  m.BulkBatchSize,
+		Source:              source,
+		Target:              target,
+		SourceDSN:           m.Source,
+		TargetDSN:           m.Target,
+		DryRun:              m.DryRun,
+		Mappings:            mappings,
+		Filter:              filter,
+		Resume:              m.Resume,
+		MigrationID:         m.MigrationID,
+		ForceColdStart:      m.ForceColdStart,
+		BulkBatchSize:       m.BulkBatchSize,
+		BulkParallelism:     m.BulkParallelism,
+		BulkParallelMinRows: m.BulkParallelMinRows,
 	}
 	return mig.Run(kongContext())
 }

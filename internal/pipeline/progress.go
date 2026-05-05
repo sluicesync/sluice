@@ -14,6 +14,14 @@ package pipeline
 // emits a structured slog line every interval until [progressTicker.Stop]
 // is called.
 //
+// v0.5.0 extends the ticker with throughput metrics — bytes/sec and
+// ETA — that pair naturally with the parallel within-table copy. The
+// rate-and-ETA math is most meaningful when there's parallel work to
+// measure; on a single-reader copy the existing rows-per-second line
+// remains accurate. Bytes are observed best-effort by the engine via
+// the optional [byteCounter] hook (engines that don't track scan-buf
+// sizes pass 0 and the ETA falls back to row-rate alone).
+//
 // The counting happens at the pipeline layer rather than inside engine
 // implementations to keep engines simple and uniform — every engine
 // reports progress the same way without having to plumb a callback
@@ -48,9 +56,24 @@ import (
 // makes the failure visible in the operator's tail -f.
 type progressTicker struct {
 	rows     atomic.Int64
+	bytes    atomic.Int64
 	table    string
+	chunk    int  // 0..N-1 on parallel runs; -1 on the single-reader path
+	hasChunk bool // distinguishes "chunk 0 of a parallel run" from "single-reader"
 	interval time.Duration
 	logger   *slog.Logger
+
+	// total is the source-side row-count estimate for ETA calculation.
+	// Set via setTotalRows once the async COUNT(*) query (or
+	// pg_class.reltuples estimate) returns. Zero means "not yet
+	// available"; the ETA stays unknown in that case.
+	totalRows atomic.Int64
+
+	// startedAt is the wall-clock time the first tick fires after
+	// rows started flowing. Used as the denominator for the
+	// running-average rate that drives ETA — instantaneous rate is
+	// noisy at small sample sizes.
+	startedAt atomic.Pointer[time.Time]
 
 	stopOnce sync.Once
 	done     chan struct{}
@@ -64,6 +87,25 @@ type progressTicker struct {
 func newProgressTicker(ctx context.Context, interval time.Duration, table string) *progressTicker {
 	p := &progressTicker{
 		table:    table,
+		chunk:    -1,
+		interval: interval,
+		logger:   slog.Default(),
+		done:     make(chan struct{}),
+	}
+	p.wg.Add(1)
+	go p.loop(ctx)
+	return p
+}
+
+// newProgressTickerForChunk is the parallel-copy variant. The emitted
+// log lines include a `chunk` attribute so operators tailing the log
+// can correlate per-chunk progress; the structured shape stays
+// identical otherwise so log aggregators don't need a special case.
+func newProgressTickerForChunk(ctx context.Context, interval time.Duration, table string, chunk int) *progressTicker {
+	p := &progressTicker{
+		table:    table,
+		chunk:    chunk,
+		hasChunk: true,
 		interval: interval,
 		logger:   slog.Default(),
 		done:     make(chan struct{}),
@@ -80,6 +122,35 @@ func (p *progressTicker) inc() {
 	p.rows.Add(1)
 }
 
+// addBytes records bytes seen for this row. Optional — engines that
+// don't track scan-buffer sizes pass zero and the ticker reports
+// rate without bytes-per-second. Cheap (atomic add).
+//
+// v0.5.0 ships the hook but doesn't yet have an engine-side caller.
+// Wiring scan-buffer byte counts into the row stream is a small follow-
+// up; the ticker shape stays compatible. nolint:unused covers the
+// pre-wiring window.
+//
+//nolint:unused // wired from engines in a follow-up; the hook lands in v0.5.0 to avoid a ticker-API churn later.
+func (p *progressTicker) addBytes(n int64) {
+	if n <= 0 {
+		return
+	}
+	p.bytes.Add(n)
+}
+
+// setTotalRows feeds the row-count estimate into the ticker. Safe to
+// call from a separate goroutine (the COUNT(*) query typically runs
+// on its own connection and may take seconds on a huge table). Zero
+// is a no-op so callers that bail out of the count don't need a
+// special path.
+func (p *progressTicker) setTotalRows(total int64) {
+	if total <= 0 {
+		return
+	}
+	p.totalRows.Store(total)
+}
+
 // loop is the background goroutine. It wakes every interval, snapshots
 // the counter, and logs a line when the count has advanced since the
 // previous tick. When the count hasn't moved, no line is emitted —
@@ -90,6 +161,7 @@ func (p *progressTicker) loop(ctx context.Context) {
 	defer t.Stop()
 
 	var lastRows int64
+	var lastBytes int64
 	lastTime := time.Now()
 	for {
 		select {
@@ -102,17 +174,51 @@ func (p *progressTicker) loop(ctx context.Context) {
 			if rows == lastRows {
 				continue
 			}
+			// Mark the wall-clock start of streaming on the first
+			// non-zero tick so ETA uses a stable denominator that
+			// matches the operator's perception of "when did this
+			// table start moving?".
+			if p.startedAt.Load() == nil {
+				start := lastTime
+				p.startedAt.Store(&start)
+			}
+			bytes := p.bytes.Load()
 			elapsed := now.Sub(lastTime).Seconds()
 			rate := float64(0)
+			mbps := float64(0)
 			if elapsed > 0 {
 				rate = float64(rows-lastRows) / elapsed
+				mbps = float64(bytes-lastBytes) / (elapsed * 1024 * 1024)
 			}
-			p.logger.LogAttrs(ctx, slog.LevelInfo, "bulk copy progress",
+
+			total := p.totalRows.Load()
+			etaSecs := int64(-1)
+			if total > 0 && total > rows && p.startedAt.Load() != nil {
+				started := *p.startedAt.Load()
+				totalElapsed := now.Sub(started).Seconds()
+				if totalElapsed > 0 {
+					avgRate := float64(rows) / totalElapsed
+					if avgRate > 0 {
+						etaSecs = int64(float64(total-rows) / avgRate)
+					}
+				}
+			}
+
+			attrs := []slog.Attr{
 				slog.String("table", p.table),
 				slog.Int64("rows", rows),
-				slog.Float64("rate", rate),
-			)
+				slog.Int64("total_rows", total),
+				slog.Int64("bytes", bytes),
+				slog.Float64("rate_rows_per_sec", rate),
+				slog.Float64("rate_mb_per_sec", mbps),
+				slog.Int64("eta_seconds", etaSecs),
+			}
+			if p.hasChunk {
+				attrs = append(attrs, slog.Int("chunk", p.chunk))
+			}
+			p.logger.LogAttrs(ctx, slog.LevelInfo, "bulk copy progress", attrs...)
 			lastRows = rows
+			lastBytes = bytes
 			lastTime = now
 		}
 	}
@@ -143,11 +249,40 @@ func (p *progressTicker) Stop(ctx context.Context, err error) {
 			slog.String("table", p.table),
 			slog.Int64("rows", p.rows.Load()),
 		}
+		if p.hasChunk {
+			attrs = append(attrs, slog.Int("chunk", p.chunk))
+		}
 		if err != nil {
 			attrs = append(attrs, slog.String("err", err.Error()))
 		}
 		p.logger.LogAttrs(ctx, slog.LevelInfo, msg, attrs...)
 	})
+}
+
+// kickOffRowCount runs an asynchronous CountRows query on the given
+// reader and feeds the result into the ticker once it returns.
+// Returns immediately so the bulk-copy phase doesn't pay the
+// (potentially multi-second) COUNT(*) cost on the critical path.
+//
+// On count error or when the reader doesn't implement RowCounter,
+// the ticker keeps reporting zero total / unknown ETA — non-fatal.
+// The caller passes a context separate from the bulk-copy context
+// so a slow COUNT(*) doesn't block bulk-copy abort.
+func kickOffRowCount(ctx context.Context, rr ir.RowReader, table *ir.Table, pt *progressTicker) {
+	rc, ok := rr.(ir.RowCounter)
+	if !ok {
+		return
+	}
+	go func() {
+		count, err := rc.CountRows(ctx, table)
+		if err != nil {
+			slog.WarnContext(ctx, "migration: row-count probe failed; ETA will be unknown",
+				slog.String("table", table.Name),
+				slog.String("err", err.Error()))
+			return
+		}
+		pt.setTotalRows(count)
+	}()
 }
 
 // teeRows wraps an [ir.Row] channel and returns a new channel that

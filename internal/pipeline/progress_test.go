@@ -75,6 +75,72 @@ func TestProgressTicker_StopIsIdempotent(t *testing.T) {
 	pt.Stop(context.Background(), nil) // must not panic on close-of-closed-channel
 }
 
+// TestProgressTicker_PeriodicTickIncludesETA verifies the periodic
+// progress line carries `total_rows`, `eta_seconds`, and the
+// rate/bytes attributes added in v0.5.0. The ticker is constructed,
+// fed a row count and a total-rows estimate, then driven through
+// enough ticks to emit a line.
+func TestProgressTicker_PeriodicTickIncludesETA(t *testing.T) {
+	logs := captureSlog(t)
+
+	pt := newProgressTicker(context.Background(), 30*time.Millisecond, "events")
+	pt.setTotalRows(100)
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ticker := time.NewTicker(5 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				pt.inc()
+			}
+		}
+	}()
+	time.Sleep(100 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+	pt.Stop(context.Background(), nil)
+
+	out := logs.String()
+	if !strings.Contains(out, "bulk copy progress") {
+		t.Errorf("expected progress line; got: %q", out)
+	}
+	// total_rows attribute must be present even when the table count
+	// returned zero — the wire shape stays stable.
+	if !strings.Contains(out, "total_rows=100") {
+		t.Errorf("expected total_rows=100 attribute; got: %q", out)
+	}
+	if !strings.Contains(out, "eta_seconds=") {
+		t.Errorf("expected eta_seconds= attribute; got: %q", out)
+	}
+	if !strings.Contains(out, "rate_rows_per_sec=") {
+		t.Errorf("expected rate_rows_per_sec= attribute; got: %q", out)
+	}
+}
+
+// TestProgressTicker_ChunkAttribute verifies the parallel-copy variant
+// emits a `chunk` attribute on every line and propagates it through
+// Stop. Operators tailing the log correlate per-chunk progress via
+// this attribute.
+func TestProgressTicker_ChunkAttribute(t *testing.T) {
+	logs := captureSlog(t)
+
+	pt := newProgressTickerForChunk(context.Background(), 30*time.Millisecond, "shipments", 2)
+	pt.inc()
+	pt.inc()
+	pt.Stop(context.Background(), nil)
+
+	out := logs.String()
+	if !strings.Contains(out, "chunk=2") {
+		t.Errorf("expected chunk=2 attribute; got: %q", out)
+	}
+}
+
 // TestProgressTicker_PeriodicTickEmitsLine verifies the background
 // goroutine emits a "bulk copy progress" line when the row count
 // advances between ticks, and stays silent when it doesn't.

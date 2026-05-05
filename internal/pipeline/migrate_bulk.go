@@ -30,6 +30,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 	"sync/atomic"
 
 	"github.com/orware/sluice/internal/ir"
@@ -64,11 +65,13 @@ func bulkCopyOneTable(
 	ctx context.Context,
 	rc resumeContext,
 	state *ir.MigrationState,
+	stateMu *sync.Mutex,
 	rows ir.RowReader,
 	rw ir.RowWriter,
 	table *ir.Table,
 	resuming bool,
 	bulkBatchSize int,
+	parallel *parallelBulkCopyDeps,
 ) error {
 	action := classifyTableForResume(*state, table.Name, resuming)
 	switch action {
@@ -91,8 +94,29 @@ func bulkCopyOneTable(
 			slog.String("table", table.Name),
 			slog.Int64("rows_already_copied", entry.RowsCopied),
 			slog.Int("pk_columns", len(entry.LastPK)))
+	case resumeActionResumeChunked:
+		// Parallel-copy resume: per-chunk cursors live in entry.Chunks
+		// and the parallel path below picks them up. No truncate.
+		entry := state.TableProgress[table.Name]
+		slog.InfoContext(ctx, "migration: resuming chunked table from per-chunk cursors",
+			slog.String("table", table.Name),
+			slog.Int("chunks", len(entry.Chunks)))
 	case resumeActionFresh:
 		// Nothing to do up front; the per-batch path starts at PK > nil.
+	}
+
+	// Parallel-copy dispatch: applicable when the deps are configured,
+	// the table is large enough, and the eligibility checks pass. The
+	// parallel path is independent of resume — it can be used on a
+	// fresh cold-start migration as well as on a resume that recorded
+	// per-chunk cursors. When [tryParallelCopyTable] returns ran=true,
+	// the parallel path handled the table end-to-end; ran=false means
+	// "fall through to the single-reader path".
+	if ran, err := tryParallelCopyTable(ctx, rc, state, stateMu, rows, rw, table, parallel, resuming, bulkBatchSize); err != nil {
+		wrapped := fmt.Errorf("pipeline: copy table %q (parallel): %w", table.Name, err)
+		return wrapWithHint(PhaseBulkCopy, markFailed(ctx, rc, *state, ir.MigrationPhaseBulkCopy, wrapped))
+	} else if ran {
+		return nil
 	}
 
 	// Decide whether per-batch checkpointing is available for this
@@ -253,6 +277,8 @@ func copyTableWithCursor(
 	// attempt so the operator sees an accurate running total. The
 	// ticker treats it as the starting count.
 	pt.rows.Store(rowsCopied)
+	// Async row-count probe for ETA reporting; same shape as copyTable.
+	kickOffRowCount(ctx, rr, table, pt)
 	defer func() { pt.Stop(ctx, retErr) }()
 
 	for {

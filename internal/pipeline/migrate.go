@@ -31,6 +31,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"runtime"
+	"sync"
 	"time"
 
 	"github.com/orware/sluice/internal/config"
@@ -133,6 +135,28 @@ type Migrator struct {
 	// faster plain-INSERT / COPY-protocol path with no per-batch
 	// checkpointing overhead.
 	BulkBatchSize int
+
+	// BulkParallelism is the number of parallel reader/writer pairs
+	// per table during bulk copy (v0.5.0). Tables above
+	// BulkParallelMinRows are split into BulkParallelism PK ranges
+	// and copied concurrently. Tables below the threshold, tables
+	// without an integer single-column PK, and the resume-from-v0.4.0
+	// path all fall through to the v0.4.x single-reader behaviour.
+	//
+	// Zero means use the default — min(8, NumCPU). 1 disables
+	// parallelism entirely (every table on the single-reader path).
+	// See ADR-0019.
+	BulkParallelism int
+
+	// BulkParallelMinRows is the row-count threshold below which a
+	// table is copied with a single reader/writer pair regardless of
+	// BulkParallelism. The per-chunk overhead (extra connections,
+	// MIN/MAX query, per-chunk state writes) dominates on small
+	// tables; the threshold avoids the overhead for them.
+	//
+	// Zero means use the default (100,000). Set explicitly via
+	// --bulk-parallel-min-rows when tuning for unusual workloads.
+	BulkParallelMinRows int64
 }
 
 // Run executes the migration. Returns nil on success or a wrapped
@@ -234,7 +258,16 @@ func (m *Migrator) Run(ctx context.Context) error {
 		}
 	}
 
-	if err := runBulkCopyPhases(ctx, rc, &state, schema, rr, sw, rw, resuming, m.BulkBatchSize); err != nil {
+	parallelDeps := &parallelBulkCopyDeps{
+		source:      m.Source,
+		target:      m.Target,
+		sourceDSN:   m.SourceDSN,
+		targetDSN:   m.TargetDSN,
+		parallelism: resolveBulkParallelism(m.BulkParallelism, runtime.NumCPU()),
+		minRows:     resolveBulkParallelMinRows(m.BulkParallelMinRows),
+	}
+
+	if err := runBulkCopyPhases(ctx, rc, &state, schema, rr, sw, rw, resuming, m.BulkBatchSize, parallelDeps); err != nil {
 		return err
 	}
 
@@ -360,6 +393,7 @@ func runBulkCopyPhases(
 	rw ir.RowWriter,
 	resuming bool,
 	bulkBatchSize int,
+	parallel *parallelBulkCopyDeps,
 ) error {
 	// Phase 1: tables.
 	if err := markPhase(ctx, rc, state, ir.MigrationPhaseTables); err != nil {
@@ -380,8 +414,13 @@ func runBulkCopyPhases(
 	if state.TableProgress == nil {
 		state.TableProgress = map[string]ir.TableProgress{}
 	}
+	// stateMu serialises access to state.TableProgress across the
+	// per-chunk goroutines spawned by the parallel-copy path. The
+	// map itself is not safe for concurrent writes; each chunk takes
+	// the mutex when checkpointing its cursor.
+	var stateMu sync.Mutex
 	for _, table := range schema.Tables {
-		if err := bulkCopyOneTable(ctx, rc, state, rows, rw, table, resuming, bulkBatchSize); err != nil {
+		if err := bulkCopyOneTable(ctx, rc, state, &stateMu, rows, rw, table, resuming, bulkBatchSize, parallel); err != nil {
 			return err
 		}
 	}
@@ -468,6 +507,14 @@ func copyTable(ctx context.Context, rr ir.RowReader, rw ir.RowWriter, table *ir.
 		return fmt.Errorf("read rows: %w", err)
 	}
 	pt := newProgressTicker(copyCtx, progressInterval, table.Name)
+	// Async row-count for ETA reporting. Best-effort: failures are
+	// logged at warn level and the ETA stays unknown for the table's
+	// duration. The engine row readers' [ir.RowCounter] implementations
+	// short-circuit to (0, nil) on snapshot-pinned readers (single
+	// *sql.Conn) so the streamer's snapshot path doesn't deadlock
+	// against the in-flight row stream. See progress.go for the full
+	// semantics.
+	kickOffRowCount(copyCtx, rr, table, pt)
 	defer func() { pt.Stop(ctx, retErr) }()
 
 	teed := teeRows(copyCtx, rows, pt.inc)
