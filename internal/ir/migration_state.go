@@ -37,10 +37,51 @@ import (
 // tableProgressObject is the on-wire representation of the object form.
 // Field tags lock the wire keys so Go-side renames don't break
 // deployed state rows.
+//
+// The Chunks field is the v0.5.0 addition; older readers ignore it and
+// older writers omit it (omitempty). A v0.4.0 binary reading a v0.5.0
+// row sees the single-chunk fields it knows about and skips the
+// chunked layout — so resume falls back to a single-reader copy of
+// whatever the chunked-LastPK state was, which is wrong but not
+// catastrophic. The v0.5.0 release notes call out the same caveat as
+// v0.4.0 → v0.3.0: state-row forward-compat is one-way.
 type tableProgressObject struct {
-	State      TableProgressState `json:"state"`
+	State      TableProgressState   `json:"state"`
+	LastPK     []any                `json:"last_pk,omitempty"`
+	RowsCopied int64                `json:"rows_copied,omitempty"`
+	Chunks     []TableChunkProgress `json:"chunks,omitempty"`
+}
+
+// tableChunkProgressObject is the on-wire representation for one entry
+// within [TableProgress.Chunks]. Mirrors [TableChunkProgress] field-for-
+// field; held as its own type so the JSON tag locking is co-located
+// with the marshalling code.
+type tableChunkProgressObject struct {
+	ChunkIndex int                `json:"chunk_index"`
+	LowerPK    []any              `json:"lower_pk,omitempty"`
+	UpperPK    []any              `json:"upper_pk,omitempty"`
 	LastPK     []any              `json:"last_pk,omitempty"`
 	RowsCopied int64              `json:"rows_copied,omitempty"`
+	State      TableProgressState `json:"state"`
+}
+
+// MarshalJSON for [TableChunkProgress] emits the object form with
+// JSON-tagged keys. Chunks always serialise as objects — there is no
+// compact bare-string form for chunks because every chunk needs its
+// range bounds preserved across resume runs.
+func (c TableChunkProgress) MarshalJSON() ([]byte, error) {
+	return json.Marshal(tableChunkProgressObject(c))
+}
+
+// UnmarshalJSON for [TableChunkProgress] decodes the object form.
+func (c *TableChunkProgress) UnmarshalJSON(b []byte) error {
+	var obj tableChunkProgressObject
+	dec := json.NewDecoder(bytes.NewReader(b))
+	if err := dec.Decode(&obj); err != nil {
+		return fmt.Errorf("table chunk progress: decode: %w", err)
+	}
+	*c = TableChunkProgress(obj)
+	return nil
 }
 
 // MarshalJSON emits the compact bare-string form for terminal states

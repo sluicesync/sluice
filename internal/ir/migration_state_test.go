@@ -216,3 +216,89 @@ func TestTableProgressJSONBytesAfterMarshal(t *testing.T) {
 		t.Errorf("Marshal output not byte-exact: %q", string(b))
 	}
 }
+
+// TestTableProgressMarshalChunks confirms the v0.5.0 parallel-copy wire
+// shape: an in-progress TableProgress with a populated Chunks slice
+// emits both the legacy single-chunk fields (omitted when empty) and
+// the chunks array. Round-trips through Unmarshal preserve every chunk.
+func TestTableProgressMarshalChunks(t *testing.T) {
+	in := TableProgress{
+		State: TableProgressInProgress,
+		Chunks: []TableChunkProgress{
+			{
+				ChunkIndex: 0,
+				UpperPK:    []any{int64(100)},
+				LastPK:     []any{int64(42)},
+				RowsCopied: 42,
+				State:      TableProgressInProgress,
+			},
+			{
+				ChunkIndex: 1,
+				LowerPK:    []any{int64(100)},
+				UpperPK:    []any{int64(200)},
+				State:      TableProgressComplete,
+				RowsCopied: 100,
+			},
+		},
+	}
+	b, err := json.Marshal(in)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	// State on top, chunks array follows. Numeric values land as JSON
+	// numbers and decode back as float64 — see the LastPK assertion in
+	// TestTableProgressMarshalInProgressObject for the round-trip
+	// caveat.
+	got := string(b)
+	if !bytes.Contains(b, []byte(`"state":"in_progress"`)) {
+		t.Errorf("Marshal: missing state=in_progress; got %s", got)
+	}
+	if !bytes.Contains(b, []byte(`"chunk_index":0`)) {
+		t.Errorf("Marshal: missing chunk_index=0; got %s", got)
+	}
+	if !bytes.Contains(b, []byte(`"chunk_index":1`)) {
+		t.Errorf("Marshal: missing chunk_index=1; got %s", got)
+	}
+
+	var out TableProgress
+	if err := json.Unmarshal(b, &out); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if out.State != TableProgressInProgress {
+		t.Errorf("State: got %q; want in_progress", out.State)
+	}
+	if len(out.Chunks) != 2 {
+		t.Fatalf("Chunks: got %d; want 2", len(out.Chunks))
+	}
+	if out.Chunks[0].ChunkIndex != 0 || out.Chunks[1].ChunkIndex != 1 {
+		t.Errorf("Chunks indices: got %d/%d; want 0/1", out.Chunks[0].ChunkIndex, out.Chunks[1].ChunkIndex)
+	}
+	if out.Chunks[1].State != TableProgressComplete {
+		t.Errorf("Chunks[1].State: got %q; want complete", out.Chunks[1].State)
+	}
+	if out.Chunks[0].RowsCopied != 42 || out.Chunks[1].RowsCopied != 100 {
+		t.Errorf("Chunks rows_copied: got %d/%d; want 42/100", out.Chunks[0].RowsCopied, out.Chunks[1].RowsCopied)
+	}
+}
+
+// TestTableProgressUnmarshalV04Compat confirms that a v0.4.0-shape
+// object form (no Chunks field) decodes correctly into a v0.5.0
+// TableProgress with Chunks = nil. The orchestrator's classifier
+// reads Chunks==nil as the single-chunk path and falls back to the
+// v0.4.0 cursor-bearing resume.
+func TestTableProgressUnmarshalV04Compat(t *testing.T) {
+	v04 := `{"state":"in_progress","last_pk":[12345],"rows_copied":12345}`
+	var got TableProgress
+	if err := json.Unmarshal([]byte(v04), &got); err != nil {
+		t.Fatalf("Unmarshal v0.4.0 wire: %v", err)
+	}
+	if got.State != TableProgressInProgress {
+		t.Errorf("State: got %q; want in_progress", got.State)
+	}
+	if got.RowsCopied != 12345 {
+		t.Errorf("RowsCopied: got %d; want 12345", got.RowsCopied)
+	}
+	if got.Chunks != nil {
+		t.Errorf("Chunks: got %v; want nil for v0.4.0 row", got.Chunks)
+	}
+}

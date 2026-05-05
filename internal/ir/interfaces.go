@@ -85,6 +85,38 @@ type RowWriter interface {
 	WriteRows(ctx context.Context, table *Table, rows <-chan Row) error
 }
 
+// RangeBoundsQuerier is the optional surface a [RowReader] can
+// implement to expose MIN/MAX queries on a single PK column. Used by
+// the parallel-bulk-copy phase (v0.5.0) to compute chunk boundaries
+// before launching N parallel readers.
+//
+// minVal and maxVal are the raw driver-scanned values of MIN(col) and
+// MAX(col) for the table, with NULL surfacing as a nil interface
+// (empty table). The orchestrator coerces to int64 to compute equal
+// slices; non-integer PKs are routed to the single-reader fallback
+// before this method is called.
+//
+// Engines that don't implement this interface fall back to single-
+// reader copy regardless of --bulk-parallelism. The shipping engines
+// (MySQL, Postgres) both implement it.
+type RangeBoundsQuerier interface {
+	RangeBounds(ctx context.Context, table *Table, pkColumn string) (minVal, maxVal any, err error)
+}
+
+// RowCounter is the optional surface a [RowReader] can implement to
+// expose a row-count estimate for ETA reporting in the bulk-copy
+// progress lines (v0.5.0). The estimate may be exact (`SELECT
+// COUNT(*)`) or approximate (`pg_class.reltuples`); engines should
+// prefer fast estimates on huge tables since the count runs on a
+// separate connection and feeds the ETA, not the data path.
+//
+// Returning (0, nil) means "no estimate available" — the orchestrator
+// reports rate-only progress and omits ETA. Errors are non-fatal in
+// the orchestrator; ETA is best-effort throughout.
+type RowCounter interface {
+	CountRows(ctx context.Context, table *Table) (int64, error)
+}
+
 // IdempotentRowWriter is an optional extension of [RowWriter] for the
 // resume path. Indicates the writer's bulk INSERT path uses
 // upsert-on-PK semantics (ON CONFLICT / ON DUPLICATE KEY UPDATE)
@@ -143,6 +175,51 @@ type TableTruncator interface {
 // trusting the operator that "cold-start" means "fresh tables".
 type TableEmptyChecker interface {
 	IsTableEmpty(ctx context.Context, table *Table) (bool, error)
+}
+
+// SnapshotImporter is the optional engine surface for importing a
+// previously-exported snapshot onto N additional connections. Used by
+// the parallel bulk-copy phase when N reader goroutines all need to
+// see the same consistent source view.
+//
+// Postgres implements this via N `db.Conn(ctx)` acquires plus a
+// `BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET TRANSACTION
+// SNAPSHOT '<name>'` pair on each — the snapshot stays valid for as
+// long as the exporting transaction (held open by the SnapshotStream)
+// is alive. See ADR-0019 for the design.
+//
+// MySQL deliberately does not implement this interface: its REPEATABLE
+// READ snapshot is per-session with no shareable name, so N parallel
+// readers necessarily see N independent snapshots. The orchestrator
+// falls back to opening N independent readers in that case; the
+// transactional inconsistency window is bounded by the bulk-copy
+// duration and is closed by the binlog catch-up in the snapshot+CDC
+// handoff path. For non-CDC migrations (`sluice migrate`), the same
+// per-connection-snapshot inconsistency applies — operators running
+// against live MySQL sources should expect the small window or quiesce
+// the source. Documented as a known engine difference rather than a
+// regression.
+type SnapshotImporter interface {
+	// ImportSnapshot returns n RowReaders, each pinned to a separate
+	// connection that has imported the named snapshot. Used by the
+	// parallel bulk-copy phase; the caller closes each reader in turn
+	// (or all together via a parent ctx cancel).
+	//
+	// The implementation owns the connection lifecycle for each
+	// returned reader; callers should call Close on each to release
+	// the pinned connection and roll back the snapshot tx. The
+	// snapshotName must reference an exported snapshot whose owning
+	// transaction is still open — typically the snapshot captured by
+	// [Engine.OpenSnapshotStream].
+	ImportSnapshot(ctx context.Context, snapshotName string, n int) ([]RowReader, error)
+}
+
+// SnapshotImporterOpener is the optional engine interface that exposes
+// snapshot import. Engines without sharable snapshots (MySQL today) can
+// omit the method; the orchestrator type-asserts at the call site and
+// falls back to opening N independent readers.
+type SnapshotImporterOpener interface {
+	OpenSnapshotImporter(ctx context.Context, dsn string) (SnapshotImporter, error)
 }
 
 // CDCReader streams [Change] events from a source database starting at
@@ -438,39 +515,116 @@ const (
 //	"orders":     {"state":"in_progress","last_pk":[12345],"rows_copied":12345}
 //	"products":   {"state":"in_progress","last_pk":["a",7],"rows_copied":8000}
 //	"events_log": "no_pk_truncate_and_redo"
+//	"shipments":  {"state":"in_progress","chunks":[                // v0.5.0 parallel
+//	    {"chunk_index":0,"upper_pk":[100],"last_pk":[42],"rows_copied":42,"state":"in_progress"},
+//	    {"chunk_index":1,"lower_pk":[100],"upper_pk":[200],"state":"complete"}
+//	]}
 //
 // The bare-string form is preserved for `complete` (compact, matches
 // the v0.3.0 wire shape, easy to glance at in psql) and for the
 // no-PK sentinel. Cursor-bearing rows use the object form. Custom
 // JSON marshallers handle both shapes; see [TableProgress.UnmarshalJSON].
 //
-// Backward compatibility: a v0.3.0 row with the bare string
-// `"in_progress"` decodes into TableProgress{State:
-// TableProgressInProgress} with a nil LastPK and zero RowsCopied — the
-// orchestrator treats that "no cursor" case as truncate-and-redo on
-// resume. Operators upgrading mid-migration should expect that
-// in-flight tables will not gain mid-table resume on the v0.4.0
-// binary; only fresh migrations do.
+// Backward compatibility:
+//
+//   - v0.3.0 bare string `"in_progress"` decodes into
+//     TableProgress{State: TableProgressInProgress} with a nil LastPK
+//     and zero RowsCopied — the orchestrator treats that "no cursor"
+//     case as truncate-and-redo on resume.
+//   - v0.4.0 object form (LastPK + RowsCopied, no Chunks) decodes into
+//     a single-chunk TableProgress; the orchestrator's classifier reads
+//     it as the v0.4.0 single-cursor path. An old in-progress migration
+//     resumed under v0.5.0 will continue on the single-reader path
+//     (the parallel-copy decision is per-table, made at the start of
+//     each table's copy on the v0.5.0 binary).
+//   - v0.5.0 with Chunks populated is read as the parallel-copy form;
+//     each chunk resumes from its own cursor. Operators upgrading
+//     mid-migration should expect that in-flight tables retain their
+//     original chunking; only freshly-started tables on the v0.5.0
+//     binary use the new parallel layout.
 type TableProgress struct {
 	// State is the lifecycle phase of this table within the bulk-copy
 	// stage of the migration.
 	State TableProgressState
 
 	// LastPK is the primary-key column values of the last successfully
-	// committed row in the table. nil on fresh start, on v0.3.0 rows,
-	// and on no-PK tables. For composite PKs the slice is in PK column
-	// declaration order. JSON elements pass through encoding/json's
-	// default marshalling — integers as numbers, strings as strings,
-	// timestamps as RFC3339 strings — which is sufficient for every PK
-	// column type the orchestrator currently supports.
+	// committed row in the table on the single-chunk path. nil on
+	// fresh start, on v0.3.0 rows, on no-PK tables, and on the
+	// parallel-copy path (where per-chunk cursors live in [Chunks]).
+	// For composite PKs the slice is in PK column declaration order.
 	LastPK []any
 
-	// RowsCopied is the count of rows committed so far. Reported in
-	// progress logs on resume so an operator can see how far the
-	// previous attempt got. Best-effort: a crash between batch commit
-	// and checkpoint write may have landed more rows than the count
-	// reflects, but the upsert path on resume is tolerant of that drift.
+	// RowsCopied is the count of rows committed so far on the single-
+	// chunk path. The parallel-copy path reports its total via the sum
+	// of [TableChunkProgress.RowsCopied] across [Chunks]; this field is
+	// zero in that case.
 	RowsCopied int64
+
+	// Chunks holds the per-chunk progress entries when the table is
+	// being copied via the parallel path (v0.5.0 and later). nil for
+	// the single-chunk path (v0.4.0 and v0.5.0 below the parallelism
+	// threshold). When non-nil, [LastPK] / [RowsCopied] are unused —
+	// each chunk maintains its own cursor and row count, and the
+	// orchestrator classifies each chunk independently on resume.
+	Chunks []TableChunkProgress
+}
+
+// TableChunkProgress is the per-chunk entry within
+// [TableProgress.Chunks] on the parallel-copy path. Each chunk owns a
+// disjoint half-open PK range (`(LowerPK, UpperPK]` for chunks 1..N-1,
+// `[min, UpperPK]` for chunk 0, `(LowerPK, max]` for chunk N-1) and a
+// resume-cursor within that range.
+//
+// Range bounds are recorded once at parallel-copy launch and never
+// change for the lifetime of a chunk. This matters for resume: the
+// boundary computation (MIN/MAX/divide on the source PK column) runs
+// only on the first attempt; subsequent --resume runs reuse the
+// recorded bounds to keep chunks deterministic across restarts even
+// if the source PK distribution shifts mid-migration.
+//
+// Wire shape on disk (object form within the chunks array):
+//
+//	{"chunk_index":2,"lower_pk":[200],"upper_pk":[300],"last_pk":[247],"rows_copied":47,"state":"in_progress"}
+//
+// LowerPK is exclusive (rows with PK > LowerPK), UpperPK is inclusive
+// (rows with PK <= UpperPK). Chunk 0 has nil LowerPK to capture rows
+// at the absolute minimum; chunk N-1 has nil UpperPK to capture rows
+// at the absolute maximum. This matches the
+// `WHERE pk > lower AND (upper IS NULL OR pk <= upper)` predicate
+// shape the parallel reader emits.
+type TableChunkProgress struct {
+	// ChunkIndex is the 0..N-1 ordinal of this chunk within the
+	// table's parallel layout. Stable across resume runs; the
+	// orchestrator maps the same chunk to the same goroutine ordinal
+	// on every attempt.
+	ChunkIndex int
+
+	// LowerPK is the exclusive lower bound of this chunk's PK range.
+	// nil means "no lower bound" (chunk 0 captures rows at the
+	// absolute minimum).
+	LowerPK []any
+
+	// UpperPK is the inclusive upper bound of this chunk's PK range.
+	// nil means "no upper bound" (chunk N-1 captures rows at the
+	// absolute maximum).
+	UpperPK []any
+
+	// LastPK is the cursor within this chunk — the PK of the last
+	// successfully-committed row. nil before any rows commit. On
+	// resume, the chunk re-reads from `pk > LastPK AND pk <= UpperPK`.
+	LastPK []any
+
+	// RowsCopied is the count of rows committed by this chunk so far.
+	// Best-effort: a crash between batch commit and checkpoint write
+	// may have landed more rows than the count reflects, but the
+	// upsert path tolerates the drift.
+	RowsCopied int64
+
+	// State is the lifecycle phase of this chunk. The full
+	// TableProgressState enum is overkill for chunks (no_pk doesn't
+	// apply per-chunk), but reusing the type keeps the JSON wire shape
+	// uniform; only `in_progress` and `complete` are meaningful here.
+	State TableProgressState
 }
 
 // MigrationState is one row in the per-target sluice_migrate_state
