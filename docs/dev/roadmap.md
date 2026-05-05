@@ -41,9 +41,13 @@ For continuity when a chunk references "the previous work":
 - **CHECK constraint support** — same shape as generated columns: schema-read capture into `Table.CheckConstraints`, DDL emission, verbatim expression passthrough. Discovered (and now strips) two more layers of MySQL stored-form decoration: charset introducers (`_utf8mb4'literal'`) and delimiter-escape forms (`\'literal\'`). Generated columns benefit from the same normalizer.
 - **`--type-override TABLE.COLUMN=TYPE`** — CLI form of the YAML `mappings:` config; one-off overrides without writing a YAML file. Wholesale-precedence over YAML when both are supplied.
 
-### Foundational ADRs (0001–0015)
+### v0.4.x feature wave
 
-IR-first, sealed interfaces, kong+koanf, three-phase apply, MySQL flavors, pgoutput, position persistence, go-mysql, Streamer-as-separate-orchestrator, idempotent applier semantics, SlotManager optional surface, pglogrepl bypass for FAILOVER, applier value-shaping with `CAST(? AS JSON)`, phase-aware error-hint registry, migration resume design.
+- **Per-batch bulk-copy checkpointing** — resume mid-table from a PK cursor rather than truncate-and-redo; idempotent INSERTs tolerate the brief replay window between batch commit and cursor write; tables without a PK fall back to v0.3.0 behaviour. See ADR-0018. CLI: `--bulk-batch-size`.
+
+### Foundational ADRs (0001–0018)
+
+IR-first, sealed interfaces, kong+koanf, three-phase apply, MySQL flavors, pgoutput, position persistence, go-mysql, Streamer-as-separate-orchestrator, idempotent applier semantics, SlotManager optional surface, pglogrepl bypass for FAILOVER, applier value-shaping with `CAST(? AS JSON)`, phase-aware error-hint registry, migration resume design, layered expression translation, batched CDC apply, per-batch bulk-copy checkpointing.
 
 ---
 
@@ -65,18 +69,6 @@ IR-first, sealed interfaces, kong+koanf, three-phase apply, MySQL flavors, pgout
 - Non-PK tables (where ON CONFLICT/ON DUPLICATE KEY isn't usable) lose idempotency on replay; document that batched-commit mode amplifies the existing no-PK caveat from ADR-0010.
 
 ---
-
-### 2. Per-batch checkpointing for resume (bulk-copy phase)
-
-**Why.** v0.3.0's resume truncates and re-copies any in-progress table on retry. For multi-hour copies of single huge tables, per-batch progress would let resume pick up mid-table.
-
-**What.** Track per-table batch high-watermarks (PK-ordered LIMIT cursor or COPY byte offset) in `sluice_migrate_state.table_progress` rather than a binary in-progress / complete flag. The bulk-copy phase commits its position every N batches.
-
-**Open questions.**
-- Storage shape: extend the JSON `table_progress` to `{"users": {"phase": "in_progress", "last_pk": "...", "rows_copied": 12345}}` vs a sidecar table.
-- Idempotency on resume: does the COPY/INSERT need an upsert form to handle already-copied rows from the previous attempt? Today's bulk-copy assumes empty-target; per-batch checkpointing requires ON CONFLICT or ON DUPLICATE KEY semantics on the bulk path.
-
-See ADR-0015 for the trade-off the v1 truncate-and-redo decision settled.
 
 ---
 
