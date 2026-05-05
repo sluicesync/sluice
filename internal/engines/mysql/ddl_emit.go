@@ -441,6 +441,7 @@ func emitTableDef(table *ir.Table) (string, error) {
 	sb.WriteString(quoteIdent(table.Name))
 	sb.WriteString(" (\n")
 
+	hasPK := table.PrimaryKey != nil
 	for i, col := range table.Columns {
 		def, err := emitColumnDef(col)
 		if err != nil {
@@ -448,15 +449,31 @@ func emitTableDef(table *ir.Table) (string, error) {
 		}
 		sb.WriteString("  ")
 		sb.WriteString(def)
-		if i < len(table.Columns)-1 || table.PrimaryKey != nil {
+		if i < len(table.Columns)-1 || hasPK || len(table.CheckConstraints) > 0 {
 			sb.WriteByte(',')
 		}
 		sb.WriteByte('\n')
 	}
 
-	if table.PrimaryKey != nil {
+	if hasPK {
 		sb.WriteString("  PRIMARY KEY ")
 		sb.WriteString(emitIndexColumnList(table.PrimaryKey.Columns))
+		if len(table.CheckConstraints) > 0 {
+			sb.WriteByte(',')
+		}
+		sb.WriteByte('\n')
+	}
+
+	// CHECK constraints emit inline: they don't reference other tables
+	// (unlike foreign keys), so deferring them past the bulk-copy
+	// phase would gain nothing and lose diff-readability against the
+	// source's pg_dump shape.
+	for i, chk := range table.CheckConstraints {
+		sb.WriteString("  ")
+		sb.WriteString(emitCheckConstraint(chk))
+		if i < len(table.CheckConstraints)-1 {
+			sb.WriteByte(',')
+		}
 		sb.WriteByte('\n')
 	}
 
@@ -575,6 +592,34 @@ func emitAddForeignKey(childTable string, fk *ir.ForeignKey) (string, error) {
 	}
 	sb.WriteByte(';')
 	return sb.String(), nil
+}
+
+// emitCheckConstraint renders a CHECK clause inline within a CREATE
+// TABLE column list:
+//
+//	CONSTRAINT `name` CHECK (expr)
+//
+// or, when the constraint is unnamed in the IR:
+//
+//	CHECK (expr)
+//
+// The expression is passed through verbatim from the source dialect
+// (with engine-specific identifier quoting normalized at the read
+// boundary). Non-portable expressions — MySQL's IF(...) versus PG's
+// CASE, function names that differ between dialects — fail loudly at
+// CREATE TABLE time on the target rather than be guessed-at, which
+// matches the project's verbatim-passthrough translation policy.
+func emitCheckConstraint(c *ir.CheckConstraint) string {
+	var sb strings.Builder
+	if c.Name != "" {
+		sb.WriteString("CONSTRAINT ")
+		sb.WriteString(quoteIdent(c.Name))
+		sb.WriteByte(' ')
+	}
+	sb.WriteString("CHECK (")
+	sb.WriteString(c.Expr)
+	sb.WriteByte(')')
+	return sb.String()
 }
 
 // emitColumnList renders a parenthesised, comma-separated list of

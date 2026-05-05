@@ -327,6 +327,117 @@ func TestEmitColumnDef_Generated(t *testing.T) {
 	}
 }
 
+// TestEmitCheckConstraint covers the standalone CHECK fragment used
+// inline in CREATE TABLE bodies. Verbatim-passthrough policy: the
+// expression text is preserved as-is.
+func TestEmitCheckConstraint(t *testing.T) {
+	cases := []struct {
+		name string
+		in   *ir.CheckConstraint
+		want string
+	}{
+		{
+			name: "named with comparison",
+			in:   &ir.CheckConstraint{Name: "orders_qty_chk", Expr: "qty >= 0"},
+			want: "CONSTRAINT `orders_qty_chk` CHECK (qty >= 0)",
+		},
+		{
+			name: "named with IN list",
+			in: &ir.CheckConstraint{
+				Name: "orders_status_chk",
+				Expr: "status IN ('open','closed','cancelled')",
+			},
+			want: "CONSTRAINT `orders_status_chk` CHECK (status IN ('open','closed','cancelled'))",
+		},
+		{
+			name: "unnamed",
+			in:   &ir.CheckConstraint{Expr: "start_date <= end_date"},
+			want: "CHECK (start_date <= end_date)",
+		},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			if got := emitCheckConstraint(c.in); got != c.want {
+				t.Errorf("\n got  %q\n want %q", got, c.want)
+			}
+		})
+	}
+}
+
+// TestEmitTableDef_CheckConstraints exercises the inline-emission
+// path: CHECK clauses appear after the columns and the primary key,
+// each on its own line, with correct comma punctuation. Both cases
+// (with and without a primary key) need to land valid DDL.
+func TestEmitTableDef_CheckConstraints(t *testing.T) {
+	t.Run("with primary key", func(t *testing.T) {
+		tbl := &ir.Table{
+			Name: "orders",
+			Columns: []*ir.Column{
+				{Name: "id", Type: ir.Integer{Width: 64}},
+				{Name: "qty", Type: ir.Integer{Width: 32}},
+				{Name: "status", Type: ir.Varchar{Length: 20}},
+			},
+			PrimaryKey: &ir.Index{
+				Name:    "PRIMARY",
+				Unique:  true,
+				Columns: []ir.IndexColumn{{Column: "id"}},
+			},
+			CheckConstraints: []*ir.CheckConstraint{
+				{Name: "orders_qty_chk", Expr: "qty >= 0"},
+				{Name: "orders_status_chk", Expr: "status IN ('open','closed')"},
+			},
+		}
+		got, err := emitTableDef(tbl)
+		if err != nil {
+			t.Fatalf("emitTableDef: %v", err)
+		}
+		wants := []string{
+			"PRIMARY KEY (`id`),",
+			"CONSTRAINT `orders_qty_chk` CHECK (qty >= 0),",
+			"CONSTRAINT `orders_status_chk` CHECK (status IN ('open','closed'))",
+		}
+		for _, w := range wants {
+			if !strings.Contains(got, w) {
+				t.Errorf("output missing %q; got:\n%s", w, got)
+			}
+		}
+		// The last constraint line must NOT end with a trailing comma
+		// before the closing paren — that would be a MySQL parse error.
+		if strings.Contains(got, "))\n)") {
+			// A bare-eyeball check: make sure we don't have a stray
+			// comma before the closing `)`.
+			if strings.Contains(got, "),\n)") {
+				t.Errorf("trailing comma before closing paren; got:\n%s", got)
+			}
+		}
+	})
+
+	t.Run("without primary key", func(t *testing.T) {
+		tbl := &ir.Table{
+			Name: "audit_events",
+			Columns: []*ir.Column{
+				{Name: "kind", Type: ir.Varchar{Length: 32}},
+			},
+			CheckConstraints: []*ir.CheckConstraint{
+				{Name: "ae_kind_chk", Expr: "kind IN ('a','b')"},
+			},
+		}
+		got, err := emitTableDef(tbl)
+		if err != nil {
+			t.Fatalf("emitTableDef: %v", err)
+		}
+		// The column line must end with a trailing comma so the CHECK
+		// line that follows it is grammatical.
+		if !strings.Contains(got, "`kind` VARCHAR(32) NOT NULL,") {
+			t.Errorf("column line missing trailing comma before CHECK; got:\n%s", got)
+		}
+		if !strings.Contains(got, "CONSTRAINT `ae_kind_chk` CHECK (kind IN ('a','b'))") {
+			t.Errorf("CHECK clause missing; got:\n%s", got)
+		}
+	})
+}
+
 func TestEmitTableDef(t *testing.T) {
 	table := &ir.Table{
 		Name: "users",
