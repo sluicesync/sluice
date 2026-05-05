@@ -440,6 +440,13 @@ func emitTableDef(schema string, table *ir.Table, opts emitOpts) (string, error)
 		parts = append(parts, emitSetCheckConstraint(table.Name, col.Name, set.Values))
 	}
 
+	// User-declared CHECK constraints emit inline alongside the
+	// generated SET checks. Order is the IR's preserved source order
+	// so the target's pg_dump shape stays diffable against the source.
+	for _, chk := range table.CheckConstraints {
+		parts = append(parts, emitCheckConstraint(chk))
+	}
+
 	if table.PrimaryKey != nil {
 		parts = append(parts, "PRIMARY KEY "+emitIndexColumnList(table.PrimaryKey.Columns))
 	}
@@ -597,6 +604,34 @@ func emitAddForeignKey(schema, childTable string, fk *ir.ForeignKey) (string, er
 	}
 	sb.WriteByte(';')
 	return sb.String(), nil
+}
+
+// emitCheckConstraint renders a CHECK clause for inclusion in a
+// CREATE TABLE column list:
+//
+//	CONSTRAINT "name" CHECK (expr)
+//
+// or, when the constraint is unnamed in the IR:
+//
+//	CHECK (expr)
+//
+// The expression is passed through verbatim from the source dialect
+// (with engine-specific identifier quoting normalized at the read
+// boundary). Non-portable expressions — MySQL's IF(...) versus PG's
+// CASE, function names that differ between dialects — fail loudly at
+// CREATE TABLE time on the target rather than be guessed-at, which
+// matches the project's verbatim-passthrough translation policy.
+func emitCheckConstraint(c *ir.CheckConstraint) string {
+	var sb strings.Builder
+	if c.Name != "" {
+		sb.WriteString("CONSTRAINT ")
+		sb.WriteString(quoteIdent(c.Name))
+		sb.WriteByte(' ')
+	}
+	sb.WriteString("CHECK (")
+	sb.WriteString(c.Expr)
+	sb.WriteByte(')')
+	return sb.String()
 }
 
 // emitColumnList renders a parenthesised, comma-separated list of

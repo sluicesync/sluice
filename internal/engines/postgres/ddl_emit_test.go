@@ -353,6 +353,79 @@ func TestEmitColumnDef_Generated(t *testing.T) {
 	}
 }
 
+// TestEmitCheckConstraint covers the standalone CHECK fragment used
+// inline in CREATE TABLE bodies. Verbatim-passthrough policy: the
+// expression text is preserved as-is.
+func TestEmitCheckConstraint(t *testing.T) {
+	cases := []struct {
+		name string
+		in   *ir.CheckConstraint
+		want string
+	}{
+		{
+			name: "named with comparison",
+			in:   &ir.CheckConstraint{Name: "orders_qty_chk", Expr: "qty >= 0"},
+			want: `CONSTRAINT "orders_qty_chk" CHECK (qty >= 0)`,
+		},
+		{
+			name: "named with IN list",
+			in: &ir.CheckConstraint{
+				Name: "orders_status_chk",
+				Expr: "status IN ('open','closed','cancelled')",
+			},
+			want: `CONSTRAINT "orders_status_chk" CHECK (status IN ('open','closed','cancelled'))`,
+		},
+		{
+			name: "unnamed",
+			in:   &ir.CheckConstraint{Expr: "start_date <= end_date"},
+			want: `CHECK (start_date <= end_date)`,
+		},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			if got := emitCheckConstraint(c.in); got != c.want {
+				t.Errorf("\n got  %q\n want %q", got, c.want)
+			}
+		})
+	}
+}
+
+// TestEmitTableDef_CheckConstraints exercises the inline-emission
+// path: user-declared CHECK clauses appear in the CREATE TABLE body
+// alongside any synthetic SET-membership CHECKs, in source order.
+func TestEmitTableDef_CheckConstraints(t *testing.T) {
+	tbl := &ir.Table{
+		Name: "orders",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}},
+			{Name: "qty", Type: ir.Integer{Width: 32}},
+			{Name: "status", Type: ir.Varchar{Length: 20}},
+		},
+		PrimaryKey: &ir.Index{
+			Columns: []ir.IndexColumn{{Column: "id"}},
+		},
+		CheckConstraints: []*ir.CheckConstraint{
+			{Name: "orders_qty_chk", Expr: "qty >= 0"},
+			{Name: "orders_status_chk", Expr: "status IN ('open','closed')"},
+		},
+	}
+	got, err := emitTableDef("public", tbl, emitOpts{})
+	if err != nil {
+		t.Fatalf("emitTableDef: %v", err)
+	}
+	wants := []string{
+		`CONSTRAINT "orders_qty_chk" CHECK (qty >= 0)`,
+		`CONSTRAINT "orders_status_chk" CHECK (status IN ('open','closed'))`,
+		`PRIMARY KEY ("id")`,
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("output missing %q; got:\n%s", w, got)
+		}
+	}
+}
+
 func TestEmitCreateEnumType(t *testing.T) {
 	got := emitCreateEnumType("public", "users", "role", []string{"admin", "user", "guest"})
 	want := `CREATE TYPE "public"."users_role_enum" AS ENUM ('admin', 'user', 'guest');`

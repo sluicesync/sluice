@@ -81,6 +81,9 @@ func (r *SchemaReader) ReadSchema(ctx context.Context) (*ir.Schema, error) {
 	if err := r.populateForeignKeys(ctx, tables); err != nil {
 		return nil, fmt.Errorf("postgres: read foreign keys: %w", err)
 	}
+	if err := r.populateCheckConstraints(ctx, tables); err != nil {
+		return nil, fmt.Errorf("postgres: read check constraints: %w", err)
+	}
 
 	out := &ir.Schema{Tables: make([]*ir.Table, 0, len(tables))}
 	for _, name := range sortedKeys(tables) {
@@ -503,6 +506,59 @@ func (r *SchemaReader) populateForeignKeys(ctx context.Context, tables map[strin
 		tables[k.table].ForeignKeys = append(tables[k.table].ForeignKeys, fk)
 	}
 	return nil
+}
+
+// populateCheckConstraints fills in CheckConstraint lists for each
+// table.
+//
+// We query pg_constraint directly rather than information_schema.
+// check_constraints because:
+//   - pg_constraint exposes the structural contype filter (`'c'` for
+//     CHECK, `'n'` for the implicit NOT-NULL check Postgres synthesizes
+//     on NOT NULL columns). information_schema.check_constraints
+//     surfaces both kinds blended together, so callers there have to
+//     pattern-match the expression text — the wrong layer.
+//   - pg_get_expr(conbin, conrelid) returns the canonical, non-quoted
+//     expression form, sparing us a strip-`CHECK (...)`-wrapper step.
+//
+// Both column-scoped (`qty INT CHECK (qty >= 0)`) and table-scoped
+// (`CHECK (start_date <= end_date)`) declarations land here — PG
+// stores both as table-level pg_constraint rows, and the IR mirrors
+// that shape.
+func (r *SchemaReader) populateCheckConstraints(ctx context.Context, tables map[string]*ir.Table) error {
+	const q = `
+		SELECT
+			cl.relname AS table_name,
+			con.conname,
+			pg_get_expr(con.conbin, con.conrelid)
+		FROM   pg_constraint con
+		JOIN   pg_class      cl ON cl.oid = con.conrelid
+		JOIN   pg_namespace  n  ON n.oid  = cl.relnamespace
+		WHERE  n.nspname    = $1
+		  AND  con.contype  = 'c'
+		ORDER  BY cl.relname, con.conname`
+
+	rows, err := r.db.QueryContext(ctx, q, r.schema)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = rows.Close() }()
+
+	for rows.Next() {
+		var tableName, name, expr string
+		if err := rows.Scan(&tableName, &name, &expr); err != nil {
+			return err
+		}
+		t, ok := tables[tableName]
+		if !ok {
+			continue
+		}
+		t.CheckConstraints = append(t.CheckConstraints, &ir.CheckConstraint{
+			Name: name,
+			Expr: expr,
+		})
+	}
+	return rows.Err()
 }
 
 // isAutoIncrement detects SERIAL, BIGSERIAL, and IDENTITY columns.
