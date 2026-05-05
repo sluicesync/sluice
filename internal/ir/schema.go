@@ -43,6 +43,29 @@ type Column struct {
 	Default DefaultValue
 	// Comment is the column-level comment, if any.
 	Comment string
+
+	// GeneratedExpr is the SQL expression a generated column is
+	// computed from, in the source dialect's syntax. Empty when the
+	// column is not generated. The expression is passed through
+	// verbatim — translation policy is "loud failure beats silent
+	// corruption", so cross-dialect mismatches surface as a target
+	// rejection rather than a guess at translation.
+	GeneratedExpr string
+
+	// GeneratedStored, when true, signals STORED (PG default; MySQL
+	// explicit). False signals VIRTUAL (the implicit "computed at
+	// read time" form). Generated columns with GeneratedExpr non-
+	// empty must have this set; readers default to STORED when the
+	// source's metadata is ambiguous.
+	GeneratedStored bool
+}
+
+// IsGenerated reports whether the column is a generated/computed
+// column (its value is derived from an expression rather than written
+// directly). Equivalent to checking GeneratedExpr != "" but reads
+// better at call sites that gate INSERT/UPDATE column lists.
+func (c *Column) IsGenerated() bool {
+	return c.GeneratedExpr != ""
 }
 
 // DefaultValue is a sealed interface describing a column's DEFAULT
