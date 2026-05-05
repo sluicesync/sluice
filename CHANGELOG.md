@@ -6,6 +6,33 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Slot-missing fall-through to cold-start (Item F).** When a
+  Postgres CDC stream's persisted position references a replication
+  slot that no longer exists on the source — typically because the
+  operator dropped it after sluice surfaced `wal_status='lost'` —
+  the streamer now logs a loud WARN naming the slot + persisted LSN,
+  then falls through to the cold-start path automatically. No flag
+  required; no manual `DELETE FROM sluice_cdc_state` step. Bug 9's
+  pre-flight refusal still gates populated-dest operations, so
+  operators who want a fresh bulk-copy still pass `--force-cold-start`
+  or drop dest tables manually. The fall-through is engine-neutral:
+  CDC readers signal the condition via `ir.ErrPositionInvalid`
+  (wrapped on their specific diagnostic via `%w`); the pipeline
+  detects it via `errors.Is`. PG slot-missing is the only emitter
+  in this release; MySQL binlog-purged is queued as a follow-up.
+  See ADR-0022.
+
+  Recovery flow before this fix: drop slot → DELETE cdc_state row
+  → drop publication → drop dest tables (or `--force-cold-start`)
+  → re-run sluice. With this fix: drop slot → drop dest tables
+  (or `--force-cold-start`) → re-run sluice. The two manual SQL
+  steps disappear.
+
+  Integration test:
+  `TestStreamer_PostgresToPostgres_SlotMissingFallsThroughToColdStart`.
+
 ## [0.5.1] - 2026-05-05
 
 Single-issue patch release fixing a misleading flag name in the

@@ -283,9 +283,13 @@ func (r *CDCReader) resolveStartPosition(
 			return 0, err
 		}
 		if info == nil {
+			// Wrap with [ir.ErrPositionInvalid] so the pipeline
+			// orchestrator can detect via errors.Is and fall through
+			// to cold-start (ADR-0022). The wrap message stays
+			// engine-specific so operator-facing logs name the slot.
 			return 0, fmt.Errorf(
-				"postgres: replication slot %q no longer exists; cannot resume from supplied LSN (start a fresh stream with empty position)",
-				r.slotName)
+				"postgres: replication slot %q no longer exists; cannot resume from supplied LSN: %w",
+				r.slotName, ir.ErrPositionInvalid)
 		}
 		if err := checkSlotUsable(info); err != nil {
 			return 0, err

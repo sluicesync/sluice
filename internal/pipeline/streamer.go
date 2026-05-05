@@ -231,9 +231,30 @@ func (s *Streamer) Run(ctx context.Context) error {
 	}
 
 	// ---- 4. Branch: cold start vs warm resume ----
+	//
+	// Slot-missing fall-through (ADR-0022): if warm resume fails
+	// because the persisted position references state that no longer
+	// exists on the source (PG slot dropped, MySQL binlog purged),
+	// the CDC reader returns an error wrapping [ir.ErrPositionInvalid].
+	// The persisted position is by definition unrecoverable; the
+	// only path forward is cold-start (re-snapshot + fresh slot).
+	// We log a loud WARN naming the slot/position so monitoring
+	// catches the recovery event, then re-enter coldStart with the
+	// same lsnTracker. Bug 9's pre-flight refusal still gates
+	// destructive dest-table operations — auto-fall-through does
+	// not silently destroy data.
 	var changes <-chan ir.Change
 	if found {
 		changes, err = s.warmResume(ctx, persisted, lsnTracker)
+		if err != nil && errors.Is(err, ir.ErrPositionInvalid) {
+			slog.WarnContext(ctx, "warm resume: persisted position is no longer valid; falling through to cold start",
+				slog.String("stream_id", streamID),
+				slog.String("position_token", persisted.Token),
+				slog.String("source_engine", persisted.Engine),
+				slog.String("err", err.Error()),
+			)
+			changes, err = s.coldStart(ctx, lsnTracker)
+		}
 	} else {
 		changes, err = s.coldStart(ctx, lsnTracker)
 	}
