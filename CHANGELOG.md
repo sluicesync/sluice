@@ -6,6 +6,103 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-05-04
+
+Feature release with four substantive responses to measured production
+concerns from the v0.3.x robustness testing rounds, plus three new
+ADRs (0016, 0017, 0018) documenting the design decisions.
+
+### Added — performance
+
+- **`--apply-batch-size N`** on `sluice sync start` (and
+  `Streamer.ApplyBatchSize` for programmatic callers) batches up to N
+  CDC changes per target transaction with the position write of the
+  last change in the batch. Default 1 keeps v0.3.x conservative
+  one-change-per-tx behaviour; production tuning is 100–500. v0.3.0
+  testing measured the per-change applier at ~6.5 rows/sec on
+  PG→MySQL CDC with a 5000-row source transaction; batched mode
+  amortises commit overhead 50–100× on production hardware (3.5×
+  observed locally without fsync). Idempotency preserved via the
+  existing ON CONFLICT / ON DUPLICATE KEY UPDATE semantics on
+  Insert. Schema-change events (Truncate, DDL) flush the in-flight
+  batch before applying. See ADR-0017.
+- **`--bulk-batch-size N`** on `sluice migrate` (default 5000)
+  controls the per-batch checkpointing size for resume. Cold-start
+  migrations continue to use the faster plain-INSERT (and PG COPY)
+  path with no per-batch overhead.
+
+### Added — operability
+
+- **Per-batch checkpointing for `sluice migrate --resume`.**
+  Previously, resume on an in-progress table truncated and re-copied
+  from row 0. v0.4.0 tracks a per-table PK cursor in
+  `sluice_migrate_state.table_progress`, reads the source via
+  `WHERE pk > cursor ORDER BY pk LIMIT batch_size`, and applies
+  rows with `ON CONFLICT` / `ON DUPLICATE KEY UPDATE` so the brief
+  replay window between batch commit and cursor write is tolerated
+  cleanly. Multi-hour copies of 100M+ row tables can resume mid-
+  table. Composite PKs descend via row-comparison cursors
+  (`(a,b) > ($1,$2) ORDER BY a,b`). Tables without a PK fall back
+  to the v0.3.0 truncate-and-redo behaviour with a clear log line.
+  v0.3.0-shape state rows are read backward-compatibly. See
+  ADR-0018.
+- **Cross-engine expression translation for generated columns and
+  CHECK constraints.** v0.3.2's verbatim-passthrough policy held
+  the fail-loud claim (no silent corruption), but the set of
+  "non-portable" expressions included very common idioms.
+  Bidirectional translation pass at the writer boundary now covers:
+  - **MySQL → Postgres**: `CONCAT(a,b)` → `(a || b)`, `IFNULL` →
+    `COALESCE`, `IF(cond,a,b)` → `CASE WHEN cond THEN a ELSE b END`,
+    `JSON_UNQUOTE(JSON_EXTRACT(j,'$.k'))` → `(j->>'k')`,
+    `JSON_EXTRACT(j,'$.k')` → `(j->'k')`.
+  - **Postgres → MySQL**: `(expr)::type` → `CAST(expr AS …)`,
+    `a || b` → `CONCAT(a, b)`, `~~`/`~~*` → `LIKE`/case-insensitive
+    `LIKE`, `= ANY(ARRAY[…])` → `IN (…)`.
+
+  Unrecognized constructs still pass through verbatim and rely on
+  the loud-failure-on-target fallback. Translator uses a string-
+  literal-aware walker that respects single-quoted literals and
+  balanced parens — no full SQL parser. See ADR-0016.
+
+### Fixed
+
+- **Cold-start hangs when dest tables have pre-existing data
+  (Bug 9, open since v0.3.0).** Three-part fix:
+  1. **Pre-flight refusal**: cold-start now checks each source
+     table for non-empty dest data and refuses with a clear error
+     pointing at recovery commands. Skipped on `--resume` (resume
+     expects partial state).
+  2. **Goroutine-leak fix**: `copyTable` now derives a child
+     context and cancels it on every return path. Previously, when
+     `WriteRows` errored mid-stream, the row-reader goroutine
+     blocked forever on `out <- row` against an abandoned
+     consumer, holding the snapshot transaction open and surfacing
+     as PG's "idle in transaction" sessions.
+  3. **Clearer log shape**: progress ticker's Stop now takes the
+     writer error and logs `bulk copy aborted table=foo rows=N
+     err="…"` on failure instead of the misleading `bulk copy
+     complete rows=N`. New `--force-cold-start` flag bypasses the
+     pre-flight refusal for the rare legitimate "bulk-copy into a
+     populated target" case.
+- **`stop_requested_at` not cleared after consumption (Bug 11,
+  open since v0.3.2).** A `sluice sync stop` left the timestamp
+  set after the streamer drained and exited; the next
+  `sluice sync start` would see the stale signal and exit within
+  the first poll interval. The streamer now clears the flag at
+  startup (after `EnsureControlTable`, before reading the persisted
+  position). Idempotent and tolerant of a missing row. New
+  `ChangeApplier.ClearStopRequested` interface method on the
+  applier.
+
+### Changed
+
+- **`docs/type-mapping.md` corrected for PG→MySQL `Inet`/`Cidr`/
+  `Macaddr`/`Array` types.** The doc previously claimed auto-emit
+  as `VARCHAR(N) CHECK (format)`; v0.3.x and v0.4.x actually refuse
+  loudly with a copy-paste-ready `mappings:` YAML snippet pointing
+  at the `--type-override` CLI flag. Auto-emit is queued as a
+  future enhancement; manual override is the supported path today.
+
 ## [0.3.2] - 2026-05-04
 
 Patch release adding CHECK constraint support, a CLI form of the
@@ -692,7 +789,8 @@ level history.
 
 (none currently — see the closed entries above.)
 
-[Unreleased]: https://github.com/orware/sluice/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/orware/sluice/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/orware/sluice/releases/tag/v0.4.0
 [0.3.2]: https://github.com/orware/sluice/releases/tag/v0.3.2
 [0.3.1]: https://github.com/orware/sluice/releases/tag/v0.3.1
 [0.3.0]: https://github.com/orware/sluice/releases/tag/v0.3.0
