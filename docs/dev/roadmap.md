@@ -49,7 +49,24 @@ IR-first, sealed interfaces, kong+koanf, three-phase apply, MySQL flavors, pgout
 
 ## Next up
 
-### 1. Per-batch checkpointing for resume
+### 1. CDC apply throughput — batched commits with idempotency
+
+**Why.** v0.3.0's robustness testing measured the applier at ~6.5 rows/sec on PG→MySQL CDC (one source transaction with 5000 INSERTs lands on the destination at ~150ms per row). Each row is committed in its own target transaction per ADR-0010 ("idempotent applier semantics"), which is correct for resume safety but expensive at production scale where one source transaction touching thousands of rows is common.
+
+**What.** A configurable `--apply-batch-size N` flag on `sluice sync start` (or the `Streamer.ApplyBatchSize` field for programmatic callers). When set to >1, the applier accumulates N changes and commits them in a single target transaction along with the position write of the last change. Resume idempotency is preserved: replaying any prefix of the stream still produces the same final state thanks to ON CONFLICT / ON DUPLICATE KEY UPDATE semantics that the applier already uses on Insert.
+
+**Design questions.**
+- Default value: 1 (current behavior, conservative) vs 100 (~150x throughput improvement at the cost of larger replay-on-crash window). Recommend 1 as the default with the flag as the explicit opt-in for production tuning.
+- Cross-table batches: a single transaction can touch multiple source tables. Should the batch boundary follow source-transaction boundaries (preserve atomicity of the source's transactional unit), follow row count (simple but breaks transactional cohesion), or both with whichever fires first? The Begin/Commit pgoutput messages give us source-transaction boundaries on PG; MySQL binlog has equivalent BEGIN/XID/COMMIT events. Reach for source-transaction boundaries when available; fall back to row count otherwise.
+- Schema-event boundaries: a Truncate or DDL event mid-batch should force a flush before the schema change applies.
+
+**Gotchas.**
+- The position written at the end of a batch must be the position of the *last applied* change in the batch, not the first. On crash + resume, replaying the tail of the batch from that position reproduces the missed changes via the applier's idempotency.
+- Non-PK tables (where ON CONFLICT/ON DUPLICATE KEY isn't usable) lose idempotency on replay; document that batched-commit mode amplifies the existing no-PK caveat from ADR-0010.
+
+---
+
+### 2. Per-batch checkpointing for resume (bulk-copy phase)
 
 **Why.** v0.3.0's resume truncates and re-copies any in-progress table on retry. For multi-hour copies of single huge tables, per-batch progress would let resume pick up mid-table.
 
@@ -63,7 +80,7 @@ See ADR-0015 for the trade-off the v1 truncate-and-redo decision settled.
 
 ---
 
-### 2. Other latent cross-engine type edges
+### 3. Other latent cross-engine type edges
 
 Tracked here so they're not forgotten; each will surface once the relevant test exercises it.
 
