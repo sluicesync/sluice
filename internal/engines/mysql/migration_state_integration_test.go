@@ -42,9 +42,9 @@ func TestMigrationStateStoreMySQL_RoundTrip(t *testing.T) {
 	want := ir.MigrationState{
 		MigrationID: "round-trip",
 		Phase:       ir.MigrationPhaseBulkCopy,
-		TableProgress: map[string]ir.TableProgressState{
-			"users":  ir.TableProgressComplete,
-			"orders": ir.TableProgressInProgress,
+		TableProgress: map[string]ir.TableProgress{
+			"users":  {State: ir.TableProgressComplete},
+			"orders": {State: ir.TableProgressInProgress, LastPK: []any{int64(7)}, RowsCopied: 7},
 		},
 		LastError: "phase failed: connection reset",
 	}
@@ -62,11 +62,14 @@ func TestMigrationStateStoreMySQL_RoundTrip(t *testing.T) {
 	if got.Phase != want.Phase {
 		t.Errorf("phase = %q; want %q", got.Phase, want.Phase)
 	}
-	if got.TableProgress["users"] != ir.TableProgressComplete {
-		t.Errorf("TableProgress[users] = %q; want complete", got.TableProgress["users"])
+	if got.TableProgress["users"].State != ir.TableProgressComplete {
+		t.Errorf("TableProgress[users].State = %q; want complete", got.TableProgress["users"].State)
 	}
-	if got.TableProgress["orders"] != ir.TableProgressInProgress {
-		t.Errorf("TableProgress[orders] = %q; want in_progress", got.TableProgress["orders"])
+	if got.TableProgress["orders"].State != ir.TableProgressInProgress {
+		t.Errorf("TableProgress[orders].State = %q; want in_progress", got.TableProgress["orders"].State)
+	}
+	if got.TableProgress["orders"].RowsCopied != 7 {
+		t.Errorf("TableProgress[orders].RowsCopied = %d; want 7", got.TableProgress["orders"].RowsCopied)
 	}
 	if got.LastError != want.LastError {
 		t.Errorf("LastError = %q; want %q", got.LastError, want.LastError)

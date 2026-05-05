@@ -175,8 +175,10 @@ func nullableMigrateString(s string) sql.NullString {
 // encodeMigrateTableProgress serialises the per-table state map to
 // JSON. An empty or nil map returns "" — store as SQL NULL — so a
 // freshly-inserted state row before any table starts isn't littered
-// with `{}` literals.
-func encodeMigrateTableProgress(m map[string]ir.TableProgressState) (string, error) {
+// with `{}` literals. Per-entry encoding is delegated to
+// [ir.TableProgress.MarshalJSON]; see internal/ir/migration_state.go
+// for the bare-string-vs-object choice.
+func encodeMigrateTableProgress(m map[string]ir.TableProgress) (string, error) {
 	if len(m) == 0 {
 		return "", nil
 	}
@@ -189,12 +191,15 @@ func encodeMigrateTableProgress(m map[string]ir.TableProgressState) (string, err
 
 // decodeMigrateTableProgress is the inverse of
 // encodeMigrateTableProgress. An empty input returns nil so callers
-// can use the zero map shape without a special case.
-func decodeMigrateTableProgress(s string) (map[string]ir.TableProgressState, error) {
+// can use the zero map shape without a special case. Per-entry
+// decoding is delegated to [ir.TableProgress.UnmarshalJSON] which
+// accepts both the v0.3.0 bare-string form and the v0.4.0 cursor-
+// bearing object form.
+func decodeMigrateTableProgress(s string) (map[string]ir.TableProgress, error) {
 	if s == "" {
 		return nil, nil
 	}
-	out := map[string]ir.TableProgressState{}
+	out := map[string]ir.TableProgress{}
 	if err := json.Unmarshal([]byte(s), &out); err != nil {
 		return nil, err
 	}
