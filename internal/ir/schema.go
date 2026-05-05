@@ -36,11 +36,13 @@ type Table struct {
 
 // CheckConstraint represents a single CHECK clause on a table.
 //
-// Translation policy is verbatim passthrough — non-portable
-// expressions (e.g. MySQL's IF(...) versus PG's CASE) fail loudly on
-// the target rather than be guessed at. Identifier quoting is
-// normalized at the read boundary (MySQL's stored expression text
-// uses backticks that PG can't parse).
+// Translation is layered: identifier quoting is normalized at the
+// read boundary, a small set of high-frequency operator/function
+// translations runs at the writer boundary when ExprDialect != the
+// target engine (see ADR-0016), and anything not covered by either
+// pass falls through verbatim — non-portable expressions (e.g.
+// MySQL's IF(...) versus PG's CASE) still fail loudly on the target
+// rather than be guessed at.
 type CheckConstraint struct {
 	// Name is the constraint name (system-generated when not
 	// explicitly named at source). Preserved through DDL emit so a
@@ -49,6 +51,14 @@ type CheckConstraint struct {
 	// Expr is the constraint expression in the source dialect's
 	// syntax, with engine-specific identifier quoting stripped.
 	Expr string
+	// ExprDialect is the dialect the Expr text came from, in the
+	// readers' canonical form ("mysql" or "postgres"). Empty means
+	// the producer didn't tag the dialect (older IR-construction
+	// paths, hand-built test fixtures). Writers compare this against
+	// their own dialect: equal → emit verbatim; differ → run the
+	// cross-dialect translation pass first. See ADR-0016 for the
+	// layered translation policy.
+	ExprDialect string
 }
 
 // Column describes a single column.
@@ -69,10 +79,13 @@ type Column struct {
 
 	// GeneratedExpr is the SQL expression a generated column is
 	// computed from, in the source dialect's syntax. Empty when the
-	// column is not generated. The expression is passed through
-	// verbatim — translation policy is "loud failure beats silent
-	// corruption", so cross-dialect mismatches surface as a target
-	// rejection rather than a guess at translation.
+	// column is not generated. Translation is layered: identifier
+	// quoting is normalized at the read boundary, a small set of
+	// high-frequency operator/function translations runs at the
+	// writer boundary when GeneratedExprDialect differs from the
+	// target engine (see ADR-0016), and anything not covered by
+	// either pass falls through verbatim — non-portable constructs
+	// still surface as a target rejection rather than be guessed-at.
 	GeneratedExpr string
 
 	// GeneratedStored, when true, signals STORED (PG default; MySQL
@@ -81,6 +94,15 @@ type Column struct {
 	// empty must have this set; readers default to STORED when the
 	// source's metadata is ambiguous.
 	GeneratedStored bool
+
+	// GeneratedExprDialect is the dialect the GeneratedExpr text
+	// came from, in the readers' canonical form ("mysql" or
+	// "postgres"). Empty means the producer didn't tag the dialect
+	// (older IR-construction paths, hand-built test fixtures).
+	// Writers compare this against their own dialect: equal → emit
+	// verbatim; differ → run the cross-dialect translation pass
+	// first. See ADR-0016 for the layered translation policy.
+	GeneratedExprDialect string
 }
 
 // IsGenerated reports whether the column is a generated/computed

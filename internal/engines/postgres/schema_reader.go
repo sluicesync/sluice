@@ -334,6 +334,7 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 		if strings.EqualFold(isGenerated, "ALWAYS") && genExpr != "" {
 			col.GeneratedExpr = genExpr
 			col.GeneratedStored = true
+			col.GeneratedExprDialect = dialectName
 		}
 		t.Columns = append(t.Columns, col)
 	}
@@ -554,8 +555,9 @@ func (r *SchemaReader) populateCheckConstraints(ctx context.Context, tables map[
 			continue
 		}
 		t.CheckConstraints = append(t.CheckConstraints, &ir.CheckConstraint{
-			Name: name,
-			Expr: expr,
+			Name:        name,
+			Expr:        expr,
+			ExprDialect: dialectName,
 		})
 	}
 	return rows.Err()

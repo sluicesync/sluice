@@ -397,8 +397,9 @@ func (r *SchemaReader) populateCheckConstraints(ctx context.Context, tables map[
 			continue
 		}
 		t.CheckConstraints = append(t.CheckConstraints, &ir.CheckConstraint{
-			Name: name,
-			Expr: normalizeMySQLExpressionText(clause),
+			Name:        name,
+			Expr:        normalizeMySQLExpressionText(clause),
+			ExprDialect: dialectName,
 		})
 	}
 	return rows.Err()
@@ -519,6 +520,7 @@ func applyGenerated(col *ir.Column, genExpr, extra string) {
 		return
 	}
 	col.GeneratedExpr = normalizeMySQLExpressionText(genExpr)
+	col.GeneratedExprDialect = dialectName
 	upper := strings.ToUpper(extra)
 	switch {
 	case strings.Contains(upper, "VIRTUAL GENERATED"):
