@@ -256,11 +256,12 @@ func (p *progressTicker) loop(ctx context.Context) {
 			// Mark the wall-clock start of streaming on the first
 			// non-zero tick so ETA uses a stable denominator that
 			// matches the operator's perception of "when did this
-			// table start moving?".
-			if p.startedAt.Load() == nil {
-				start := lastTime
-				p.startedAt.Store(&start)
-			}
+			// table start moving?". CompareAndSwap (vs check-then-
+			// store) keeps the contract correct if loop ever runs
+			// from multiple goroutines — single-goroutine today,
+			// but the future-proofing is one line.
+			start := lastTime
+			p.startedAt.CompareAndSwap(nil, &start)
 			bytes := p.bytes.Load()
 			elapsed := now.Sub(lastTime).Seconds()
 			rate := float64(0)
@@ -347,6 +348,11 @@ func (p *progressTicker) Stop(ctx context.Context, err error) {
 // the ticker keeps reporting zero total / unknown ETA — non-fatal.
 // The caller passes a context separate from the bulk-copy context
 // so a slow COUNT(*) doesn't block bulk-copy abort.
+//
+// If ctx is cancelled (or the ticker is stopped) before CountRows
+// returns, the goroutine exits silently — the count would be
+// useless after the parent has already torn down, and a warn line
+// at that point is just noise interleaving with the cleanup logs.
 func kickOffRowCount(ctx context.Context, rr ir.RowReader, table *ir.Table, pt *progressTicker) {
 	rc, ok := rr.(ir.RowCounter)
 	if !ok {
@@ -355,10 +361,23 @@ func kickOffRowCount(ctx context.Context, rr ir.RowReader, table *ir.Table, pt *
 	go func() {
 		count, err := rc.CountRows(ctx, table)
 		if err != nil {
+			if ctx.Err() != nil {
+				// Parent gave up; the count isn't actionable. Don't
+				// log — it's interleaved teardown noise.
+				return
+			}
 			slog.WarnContext(ctx, "migration: row-count probe failed; ETA will be unknown",
 				slog.String("table", table.Name),
 				slog.String("err", err.Error()))
 			return
+		}
+		// Skip the store if the ticker is already stopped. The
+		// atomic.Store is harmless in itself, but skipping keeps
+		// the contract clean (a stopped ticker doesn't mutate).
+		select {
+		case <-pt.done:
+			return
+		default:
 		}
 		pt.setTotalRows(count)
 	}()
