@@ -96,9 +96,9 @@ When sluice sees a slot in `unreserved` or `lost` state, it refuses to start rep
 ```
 postgres: replication slot "sluice_slot" has wal_status="lost" — required WAL has been
 permanently removed; the slot must be dropped and recreated. To recover:
-`sluice slot drop sluice_slot --target ...` then restart with empty position
-(forces a fresh snapshot). To prevent recurrence, raise max_slot_wal_keep_size on the
-source — PlanetScale recommends > 4GB
+`sluice slot drop sluice_slot --source-driver=postgres --source ...` then restart with
+empty position (forces a fresh snapshot). To prevent recurrence, raise
+max_slot_wal_keep_size on the source — PlanetScale recommends > 4GB
 ```
 
 ## Operator commands

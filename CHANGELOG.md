@@ -6,6 +6,28 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-05-05
+
+Single-issue patch release fixing a misleading flag name in the
+Postgres `wal_status='unreserved'`/`'lost'` recovery hint. No
+behavioural change.
+
+### Fixed
+
+- **`wal_status` recovery hint named `--target` instead of
+  `--source` (Item F).** When sluice refused to start CDC against an
+  invalidated slot, the error message pointed operators at
+  `sluice slot drop <name> --target ...`. The slot lives on the
+  *source* database and `slot drop`'s actual flag is `--source` —
+  operators following the hint hit a flag-not-found error and had
+  to consult `slot drop --help` to recover. Both the `unreserved`
+  and `lost` branches of `checkSlotUsable` now emit
+  `--source-driver=postgres --source ...`. `docs/postgres-source-prep.md`
+  is corrected in lockstep. Real-world testing surfaced this as the
+  one polish item against an otherwise gold-standard error message.
+  Test coverage extended to assert the recovery hint references
+  `--source` so the regression doesn't return.
+
 ## [0.5.0] - 2026-05-05
 
 Reliability + performance release. Headline feature is parallel
@@ -913,7 +935,8 @@ level history.
 
 (none currently — see the closed entries above.)
 
-[Unreleased]: https://github.com/orware/sluice/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/orware/sluice/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/orware/sluice/releases/tag/v0.5.1
 [0.5.0]: https://github.com/orware/sluice/releases/tag/v0.5.0
 [0.4.0]: https://github.com/orware/sluice/releases/tag/v0.4.0
 [0.3.2]: https://github.com/orware/sluice/releases/tag/v0.3.2

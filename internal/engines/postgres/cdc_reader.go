@@ -351,12 +351,12 @@ func checkSlotUsable(info *slotState) error {
 	case "unreserved":
 		return fmt.Errorf(
 			"postgres: replication slot %q has wal_status=%q — required WAL is on the brink of being lost; "+
-				"resume immediately or recreate the slot. To recreate: `sluice slot drop %s --target ...` then restart with empty position (forces a fresh snapshot)",
+				"resume immediately or recreate the slot. To recreate: `sluice slot drop %s --source-driver=postgres --source ...` then restart with empty position (forces a fresh snapshot)",
 			info.SlotName, info.WALStatus, info.SlotName)
 	case "lost":
 		return fmt.Errorf(
 			"postgres: replication slot %q has wal_status=%q — required WAL has been permanently removed; "+
-				"the slot must be dropped and recreated. To recover: `sluice slot drop %s --target ...` then restart with empty position (forces a fresh snapshot). "+
+				"the slot must be dropped and recreated. To recover: `sluice slot drop %s --source-driver=postgres --source ...` then restart with empty position (forces a fresh snapshot). "+
 				"To prevent recurrence, raise max_slot_wal_keep_size on the source — PlanetScale recommends > 4GB",
 			info.SlotName, info.WALStatus, info.SlotName)
 	default:

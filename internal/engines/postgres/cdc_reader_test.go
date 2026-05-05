@@ -290,7 +290,9 @@ func TestCheckSlotUsable(t *testing.T) {
 		{"extended", "extended", false, ""},
 		{"unreserved warns + recovery hint", "unreserved", true, "wal_status=\"unreserved\""},
 		{"unreserved names sluice slot drop", "unreserved", true, "sluice slot drop"},
+		{"unreserved recovery hint targets --source", "unreserved", true, "--source"},
 		{"lost names recovery + max_slot_wal_keep_size", "lost", true, "max_slot_wal_keep_size"},
+		{"lost recovery hint targets --source", "lost", true, "--source"},
 		{"unrecognised future status", "exotic_future_state", true, "unrecognised wal_status"},
 	}
 	for _, c := range cases {
