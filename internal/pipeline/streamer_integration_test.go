@@ -125,7 +125,8 @@ func (a *recordingApplier) ListStreams(_ context.Context) ([]ir.StreamStatus, er
 // RequestStop is a no-op for the stub. Tests that exercise the
 // stop-signal flow use a real engine applier so the polling loop
 // has a real control table to read.
-func (a *recordingApplier) RequestStop(_ context.Context, _ string) error { return nil }
+func (a *recordingApplier) RequestStop(_ context.Context, _ string) error        { return nil }
+func (a *recordingApplier) ClearStopRequested(_ context.Context, _ string) error { return nil }
 
 func (a *recordingApplier) Apply(ctx context.Context, _ string, changes <-chan ir.Change) error {
 	for {

@@ -238,3 +238,23 @@ func requestStop(ctx context.Context, db *sql.DB, streamID string) error {
 // stream_id. The CLI string-matches the wrapped engine error rather
 // than importing this sentinel, mirroring the slot-not-found shape.
 var errStreamNotFound = errors.New("mysql: stream not found")
+
+// clearStopRequested resets the stop_requested_at flag to NULL for
+// the named stream. Called by [pipeline.Streamer] at startup so a
+// previous `sluice sync stop` doesn't leave a sticky stop signal
+// that immediately exits the next `sluice sync start`. Idempotent
+// and tolerant of a missing row or table (returns nil) — the next
+// position-write commit will populate the row.
+func clearStopRequested(ctx context.Context, db *sql.DB, streamID string) error {
+	const q = "UPDATE `" + controlTableName + "` SET stop_requested_at = NULL WHERE stream_id = ?"
+	if _, err := db.ExecContext(ctx, q, streamID); err != nil {
+		// Tolerant of the table being absent — same shape as
+		// readPosition. EnsureControlTable runs first, but a
+		// brand-new target may have an in-flight schema-apply.
+		if isMySQLMissingTableErr(err) {
+			return nil
+		}
+		return fmt.Errorf("mysql: clear stop signal: %w", err)
+	}
+	return nil
+}

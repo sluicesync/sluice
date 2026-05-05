@@ -199,3 +199,31 @@ func requestStop(ctx context.Context, db *sql.DB, schema, streamID string) error
 // stream_id. The CLI string-matches the wrapped engine error rather
 // than importing this sentinel, mirroring the slot-not-found shape.
 var errStreamNotFound = errors.New("postgres: stream not found")
+
+// clearStopRequested resets the stop_requested_at flag to NULL for
+// the named stream. Called by [pipeline.Streamer] at startup so a
+// previous `sluice sync stop` doesn't leave a sticky stop signal
+// that immediately exits the next `sluice sync start`. Idempotent
+// and tolerant of a missing row (returns nil) — the next position-
+// write commit will populate the row.
+//
+// Why not clear on consumption? The polling goroutine doesn't own
+// a transaction with the applier's data writes, so a clear-on-read
+// could lose the signal if the data write rolls back after seeing
+// the flag. Clearing at startup is structurally simpler: the
+// streamer's lifecycle owns the flag's lifecycle.
+func clearStopRequested(ctx context.Context, db *sql.DB, schema, streamID string) error {
+	tableRef := quoteIdent(schema) + "." + quoteIdent(controlTableName)
+	q := "UPDATE " + tableRef + " SET stop_requested_at = NULL WHERE stream_id = $1"
+	if _, err := db.ExecContext(ctx, q, streamID); err != nil {
+		// Tolerant of the table being absent — same shape as
+		// readPosition. EnsureControlTable runs first and creates
+		// the table, but a brand-new target may have an in-flight
+		// schema-apply at this point.
+		if isUndefinedRelationErr(err) {
+			return nil
+		}
+		return fmt.Errorf("postgres: clear stop signal: %w", err)
+	}
+	return nil
+}

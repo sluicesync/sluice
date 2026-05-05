@@ -152,6 +152,18 @@ func (s *Streamer) Run(ctx context.Context) error {
 		}
 	}
 
+	// ---- 2.5. Clear any leftover stop signal from a previous run ----
+	// Without this, `sluice sync stop` leaves stop_requested_at set
+	// after the streamer drains and exits; the next `sync start`
+	// would then see the stale flag and exit within the first poll
+	// interval (Bug 11 in v0.3.2 testing). Skip on dry-run for the
+	// same read-only reason as EnsureControlTable above.
+	if !s.DryRun {
+		if err := applier.ClearStopRequested(ctx, streamID); err != nil {
+			return wrapWithHint(PhaseSchemaApply, fmt.Errorf("pipeline: clear stop signal: %w", err))
+		}
+	}
+
 	// ---- 3. Look up the persisted position ----
 	persisted, found, err := applier.ReadPosition(ctx, streamID)
 	if err != nil {

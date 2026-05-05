@@ -146,6 +146,18 @@ func (a *ChangeApplier) ReadStopRequested(ctx context.Context, streamID string) 
 	return readStopRequested(ctx, a.db, a.schema, streamID)
 }
 
+// ClearStopRequested resets stop_requested_at to NULL for the named
+// stream. The Streamer calls this at startup so a previous
+// `sluice sync stop` doesn't leave a sticky signal that immediately
+// exits the next `sluice sync start` (Bug 11 in v0.3.2 testing).
+// Idempotent and tolerant of a missing row.
+func (a *ChangeApplier) ClearStopRequested(ctx context.Context, streamID string) error {
+	if streamID == "" {
+		return errors.New("postgres: applier: ClearStopRequested: streamID is empty")
+	}
+	return clearStopRequested(ctx, a.db, a.schema, streamID)
+}
+
 // Apply consumes changes from the channel and applies each to the
 // target in its own transaction. The position write happens inside
 // the same transaction as the data write (per ADR-0007); a crash

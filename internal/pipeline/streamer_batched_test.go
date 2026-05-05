@@ -39,7 +39,8 @@ func (a *applierWithBatch) ReadPosition(_ context.Context, _ string) (ir.Positio
 func (a *applierWithBatch) ListStreams(_ context.Context) ([]ir.StreamStatus, error) {
 	return []ir.StreamStatus{}, nil
 }
-func (a *applierWithBatch) RequestStop(_ context.Context, _ string) error { return nil }
+func (a *applierWithBatch) RequestStop(_ context.Context, _ string) error        { return nil }
+func (a *applierWithBatch) ClearStopRequested(_ context.Context, _ string) error { return nil }
 
 func (a *applierWithBatch) Apply(ctx context.Context, _ string, changes <-chan ir.Change) error {
 	a.applyCalls++
@@ -85,7 +86,8 @@ func (a *applierApplyOnly) ReadPosition(_ context.Context, _ string) (ir.Positio
 func (a *applierApplyOnly) ListStreams(_ context.Context) ([]ir.StreamStatus, error) {
 	return []ir.StreamStatus{}, nil
 }
-func (a *applierApplyOnly) RequestStop(_ context.Context, _ string) error { return nil }
+func (a *applierApplyOnly) RequestStop(_ context.Context, _ string) error        { return nil }
+func (a *applierApplyOnly) ClearStopRequested(_ context.Context, _ string) error { return nil }
 
 func (a *applierApplyOnly) Apply(ctx context.Context, _ string, changes <-chan ir.Change) error {
 	a.applyCalls++
@@ -212,7 +214,8 @@ func (a *errorApplier) ReadPosition(_ context.Context, _ string) (ir.Position, b
 func (a *errorApplier) ListStreams(_ context.Context) ([]ir.StreamStatus, error) {
 	return []ir.StreamStatus{}, nil
 }
-func (a *errorApplier) RequestStop(_ context.Context, _ string) error { return nil }
+func (a *errorApplier) RequestStop(_ context.Context, _ string) error        { return nil }
+func (a *errorApplier) ClearStopRequested(_ context.Context, _ string) error { return nil }
 
 func (a *errorApplier) Apply(_ context.Context, _ string, _ <-chan ir.Change) error {
 	return a.err

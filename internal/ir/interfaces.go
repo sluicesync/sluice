@@ -208,6 +208,19 @@ type ChangeApplier interface {
 	// the `--if-exists`-style shape used by [SlotManager.Drop]).
 	// This is not a fatal condition; users typo stream IDs.
 	RequestStop(ctx context.Context, streamID string) error
+
+	// ClearStopRequested resets the stop flag for the named stream.
+	// Called by [pipeline.Streamer] at startup so a previous
+	// `sluice sync stop` doesn't leave a sticky signal that
+	// immediately exits the next `sluice sync start`. Idempotent
+	// and tolerant of a missing row (returns nil).
+	//
+	// Why clear at startup rather than on consumption: the polling
+	// goroutine doesn't share a transaction with the applier's data
+	// writes, so a clear-on-read could lose the signal if the data
+	// write rolls back after seeing the flag. Clearing at startup
+	// keeps the streamer's lifecycle as the flag's lifecycle.
+	ClearStopRequested(ctx context.Context, streamID string) error
 }
 
 // BatchedChangeApplier is an optional extension of [ChangeApplier]
