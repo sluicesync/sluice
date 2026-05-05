@@ -43,7 +43,14 @@ func (e Engine) OpenSnapshotStream(ctx context.Context, dsn string) (*ir.Snapsho
 	// stream errors with "publication does not exist". Order
 	// matters here even though it didn't for the standalone CDC
 	// reader (which creates the slot fresh per StreamChanges call).
-	if err := ensurePublication(ctx, db, defaultPublication); err != nil {
+	// Pass nil tables: snapshot stream construction doesn't have
+	// the table list in hand. The streamer's coldStart calls
+	// EnsurePublication explicitly with the scoped table list
+	// before this point (Bug 13, ADR-0021), so when the publication
+	// already exists with the right scope this call is a no-op.
+	// Falls back to FOR ALL TABLES on a fresh setup with no prior
+	// EnsurePublication call (test paths, direct API consumers).
+	if err := ensurePublication(ctx, db, defaultPublication, cfg.schema, nil); err != nil {
 		_ = db.Close()
 		return nil, err
 	}

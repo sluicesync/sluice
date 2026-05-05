@@ -90,10 +90,30 @@ type CDCReader struct {
 	// available.
 	streamerCancel context.CancelFunc
 
+	// appliedLSN is the slot-ack-after-apply tracker (Bug 15,
+	// ADR-0020). Non-nil values come from the streamer wiring;
+	// when nil, the keepalive routine reports the streamed LSN
+	// (legacy v0.4.0 shape — preserved so non-streamer callers
+	// like the cdc-snapshot test paths don't need to construct
+	// a tracker).
+	appliedLSN *lsnTracker
+
 	// mu guards err. The pump writes; callers read via Err after
 	// the channel closes.
 	mu  sync.Mutex
 	err error
+}
+
+// AttachLSNTracker installs an applied-LSN feedback channel from
+// the [ChangeApplier]. The tracker's value is what the keepalive
+// routine reports as confirmed_flush_lsn; until the applier reports
+// its first commit, the reader falls back to startLSN so the slot
+// stays alive on idle streams. See ADR-0020.
+//
+// Must be called before [StreamChanges]; calling it on a running
+// reader is racy with the pump goroutine and will be ignored.
+func (r *CDCReader) AttachLSNTracker(t *lsnTracker) {
+	r.appliedLSN = t
 }
 
 // Close releases the schema-DB pool and stops the pump goroutine.
@@ -154,7 +174,16 @@ func (r *CDCReader) StreamChanges(ctx context.Context, from ir.Position) (<-chan
 		return nil, err
 	}
 
-	if err := ensurePublication(ctx, r.db, r.publication); err != nil {
+	// The streamer's coldStart calls Engine.EnsurePublication with
+	// the scoped table list before this point (Bug 13, ADR-0021),
+	// so this call is a no-op when the publication already exists
+	// with the right scope. Pass nil tables: at this layer we
+	// don't have the schema in hand, and the helper falls back to
+	// FOR ALL TABLES only when the publication is genuinely
+	// missing — i.e. a non-streamer caller never went through the
+	// scoped-publication code path. That's the v0.4.0 shape and
+	// remains correct for those callers.
+	if err := ensurePublication(ctx, r.db, r.publication, r.schema, nil); err != nil {
 		return nil, err
 	}
 
@@ -344,12 +373,29 @@ func checkSlotUsable(info *slotState) error {
 // methods on it. The ReceiveMessage deadline drives the keepalive
 // cadence — when it times out, we send a StandbyStatusUpdate and go
 // back to receiving.
+//
+// Two LSNs are tracked side-by-side (Bug 15, ADR-0020):
+//
+//   - streamedLSN: the highest commit-LSN the pump has parsed off
+//     the WAL stream. Advances as soon as a CommitMessage is seen.
+//     Used internally for keepalive bookkeeping and as the fallback
+//     ack value when no applier feedback is wired.
+//   - appliedLSN (via r.appliedLSN tracker, when non-nil): the
+//     highest LSN whose data has been committed to the target. The
+//     applier's commit path reports this back; the keepalive
+//     routine sends THIS value as WALWritePosition so the slot's
+//     confirmed_flush_lsn never advances past durably-applied work.
+//
+// On streams without a tracker (tests, legacy non-streamer
+// callers), the pump falls back to streamedLSN so the slot still
+// gets keepalive activity. Production paths always wire a tracker
+// via the [pipeline.Streamer].
 func (r *CDCReader) pump(ctx context.Context, conn *pgconn.PgConn, startLSN pglogrepl.LSN, out chan<- ir.Change) {
 	defer close(out)
 	defer func() { _ = conn.Close(ctx) }()
 
 	relations := map[uint32]*relationCacheEntry{}
-	confirmedLSN := startLSN
+	streamedLSN := startLSN
 	currentTxnLSN := startLSN
 	var inStream bool // pgoutput v2 streaming-in-progress flag
 
@@ -360,8 +406,11 @@ func (r *CDCReader) pump(ctx context.Context, conn *pgconn.PgConn, startLSN pglo
 		// asked for an immediate reply on a previous keepalive, which
 		// zeroes nextKeepalive).
 		if time.Now().After(nextKeepalive) {
+			ack := r.ackLSN(streamedLSN)
 			if err := pglogrepl.SendStandbyStatusUpdate(ctx, conn, pglogrepl.StandbyStatusUpdate{
-				WALWritePosition: confirmedLSN,
+				WALWritePosition: ack,
+				WALFlushPosition: ack,
+				WALApplyPosition: ack,
 			}); err != nil {
 				r.setErr(fmt.Errorf("postgres: cdc: standby status update: %w", err))
 				return
@@ -413,7 +462,7 @@ func (r *CDCReader) pump(ctx context.Context, conn *pgconn.PgConn, startLSN pglo
 				r.setErr(fmt.Errorf("postgres: cdc: parse xlogdata: %w", err))
 				return
 			}
-			if err := r.dispatchWAL(ctx, xld, relations, &currentTxnLSN, &confirmedLSN, &inStream, out); err != nil {
+			if err := r.dispatchWAL(ctx, xld, relations, &currentTxnLSN, &streamedLSN, &inStream, out); err != nil {
 				r.setErr(err)
 				return
 			}
@@ -423,14 +472,20 @@ func (r *CDCReader) pump(ctx context.Context, conn *pgconn.PgConn, startLSN pglo
 
 // dispatchWAL parses the WAL payload (a pgoutput message) and emits
 // the corresponding [ir.Change] when the message is row-level. Begin
-// and Commit messages bookend transactions and advance the resume
-// position; Relation messages refresh the cache.
+// and Commit messages bookend transactions and advance the streamed-
+// LSN bookkeeping; Relation messages refresh the cache.
+//
+// streamedLSN tracks the highest commit-LSN parsed off the wire and
+// is updated on each CommitMessage. It is NOT what the slot ack uses
+// when an applier feedback tracker is wired — the keepalive routine
+// reads from r.appliedLSN to honour the slot-ack-after-apply rule
+// (Bug 15, ADR-0020).
 func (r *CDCReader) dispatchWAL(
 	ctx context.Context,
 	xld pglogrepl.XLogData,
 	relations map[uint32]*relationCacheEntry,
 	currentTxnLSN *pglogrepl.LSN,
-	confirmedLSN *pglogrepl.LSN,
+	streamedLSN *pglogrepl.LSN,
 	inStream *bool,
 	out chan<- ir.Change,
 ) error {
@@ -461,7 +516,7 @@ func (r *CDCReader) dispatchWAL(
 		return nil
 
 	case *pglogrepl.CommitMessage:
-		*confirmedLSN = m.CommitLSN
+		*streamedLSN = m.CommitLSN
 		return nil
 
 	case *pglogrepl.InsertMessageV2:
@@ -766,6 +821,30 @@ func (r *CDCReader) positionAt(lsn pglogrepl.LSN) (ir.Position, error) {
 	return encodePGPos(pgPos{Slot: r.slotName, LSN: lsn.String()})
 }
 
+// ackLSN picks the LSN to advertise to the upstream slot. When an
+// applier feedback tracker is wired, its value wins; until the
+// applier reports its first commit, fall back to the streamed-LSN
+// so the slot still gets keepalive activity (the slot only needs to
+// know we're alive — confirmed_flush_lsn won't advance until the
+// applier reports a higher value than its current floor). Without a
+// tracker (legacy/test paths), report streamedLSN — equivalent to
+// the v0.4.0 behaviour, which is correct when no async-batched
+// apply layer is buffering ahead of the durable target write.
+func (r *CDCReader) ackLSN(streamedLSN pglogrepl.LSN) pglogrepl.LSN {
+	if r.appliedLSN == nil {
+		return streamedLSN
+	}
+	applied := r.appliedLSN.LoadApplied()
+	if applied == 0 {
+		// No applied feedback yet — keep the slot alive by sending
+		// startLSN-equivalent (the streamedLSN at this point is
+		// startLSN until the first Commit comes through). Once the
+		// applier reports its first batch we transition to applied.
+		return streamedLSN
+	}
+	return applied
+}
+
 // setErr stores the first streaming error; subsequent calls are
 // no-ops so the originating cause isn't masked.
 func (r *CDCReader) setErr(err error) {
@@ -873,22 +952,103 @@ func checkWALLevel(ctx context.Context, db *sql.DB) error {
 }
 
 // ensurePublication CREATEs the publication if it doesn't already
-// exist. CREATE PUBLICATION ... FOR ALL TABLES is idempotent only by
-// virtue of this check; running it twice is an error.
-func ensurePublication(ctx context.Context, db *sql.DB, name string) error {
-	var exists bool
-	const checkQuery = "SELECT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = $1)"
-	if err := db.QueryRowContext(ctx, checkQuery, name).Scan(&exists); err != nil {
+// exist, or ALTERs an existing publication's table set when one of
+// the call sites supplies an explicit list (Bug 13, ADR-0021).
+//
+// Three cases:
+//
+//   - tables == nil: legacy "FOR ALL TABLES" shape. The caller
+//     hasn't told us which tables to scope to — typically a non-
+//     streamer test path or a code path that doesn't yet have the
+//     schema in hand. CREATE FOR ALL TABLES if missing; leave any
+//     pre-existing publication alone.
+//   - tables non-nil and missing: CREATE PUBLICATION … FOR TABLE
+//     <list> with each name qualified by schema. The publication
+//     is scoped to just those tables so a CREATE TABLE on the
+//     source mid-stream stays out of the WAL stream and the
+//     applier never sees events for a non-existent target table.
+//   - tables non-nil and the publication already exists: ALTER
+//     PUBLICATION … SET TABLE <list>. This handles the migration
+//     path from a v0.4.0-or-earlier "FOR ALL TABLES" publication
+//     to a scoped one. ALTER ... SET TABLE replaces the entire
+//     table set atomically.
+//
+// The schema-qualification matters because a publication's table
+// references resolve in the session's search_path; quoting and
+// schema-qualifying both the relation and identifiers keeps the
+// behaviour robust against unusual search_path settings.
+func ensurePublication(ctx context.Context, db *sql.DB, name, schema string, tables []string) error {
+	var exists, allTables bool
+	const checkQuery = "SELECT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = $1), " +
+		"COALESCE((SELECT puballtables FROM pg_publication WHERE pubname = $1), false)"
+	if err := db.QueryRowContext(ctx, checkQuery, name).Scan(&exists, &allTables); err != nil {
 		return fmt.Errorf("postgres: check publication: %w", err)
 	}
-	if exists {
+
+	if !exists {
+		var createQuery string
+		if len(tables) == 0 {
+			createQuery = fmt.Sprintf(`CREATE PUBLICATION %s FOR ALL TABLES`, quoteIdent(name))
+		} else {
+			createQuery = fmt.Sprintf(`CREATE PUBLICATION %s FOR TABLE %s`,
+				quoteIdent(name), formatPublicationTableList(schema, tables))
+		}
+		if _, err := db.ExecContext(ctx, createQuery); err != nil {
+			return fmt.Errorf("postgres: create publication %q: %w", name, err)
+		}
 		return nil
 	}
-	createQuery := fmt.Sprintf(`CREATE PUBLICATION %s FOR ALL TABLES`, quoteIdent(name))
-	if _, err := db.ExecContext(ctx, createQuery); err != nil {
-		return fmt.Errorf("postgres: create publication %q: %w", name, err)
+
+	// Publication exists. If the caller supplied an explicit table
+	// list, sync the scope (ALTER … SET TABLE replaces the whole
+	// list atomically; safe to run repeatedly). If the existing
+	// publication is FOR ALL TABLES and the caller wants a scoped
+	// list, ALTER ... SET TABLE on a FOR-ALL-TABLES publication
+	// errors with "publication ... is defined as FOR ALL TABLES";
+	// in that case we drop and recreate. The drop is safe because
+	// the publication is metadata only — slots reference WAL by
+	// LSN, not by publication name binding.
+	if len(tables) == 0 {
+		// No-op: caller hasn't supplied a scope; respect whatever
+		// the publication currently is.
+		return nil
+	}
+	if allTables {
+		// Migrate: drop the FOR ALL TABLES publication and recreate
+		// scoped. ALTER cannot demote FOR ALL TABLES → FOR TABLE
+		// directly.
+		dropQuery := fmt.Sprintf(`DROP PUBLICATION %s`, quoteIdent(name))
+		if _, err := db.ExecContext(ctx, dropQuery); err != nil {
+			return fmt.Errorf("postgres: drop FOR-ALL-TABLES publication %q for migration: %w", name, err)
+		}
+		createQuery := fmt.Sprintf(`CREATE PUBLICATION %s FOR TABLE %s`,
+			quoteIdent(name), formatPublicationTableList(schema, tables))
+		if _, err := db.ExecContext(ctx, createQuery); err != nil {
+			return fmt.Errorf("postgres: re-create publication %q with scoped tables: %w", name, err)
+		}
+		return nil
+	}
+	alterQuery := fmt.Sprintf(`ALTER PUBLICATION %s SET TABLE %s`,
+		quoteIdent(name), formatPublicationTableList(schema, tables))
+	if _, err := db.ExecContext(ctx, alterQuery); err != nil {
+		return fmt.Errorf("postgres: alter publication %q tables: %w", name, err)
 	}
 	return nil
+}
+
+// formatPublicationTableList renders a comma-separated list of
+// schema-qualified, double-quoted table identifiers for use after
+// `FOR TABLE` / `SET TABLE`.
+func formatPublicationTableList(schema string, tables []string) string {
+	parts := make([]string, len(tables))
+	for i, t := range tables {
+		if schema == "" {
+			parts[i] = quoteIdent(t)
+			continue
+		}
+		parts[i] = quoteIdent(schema) + "." + quoteIdent(t)
+	}
+	return strings.Join(parts, ", ")
 }
 
 // slotState carries the bits of pg_replication_slots the CDC reader

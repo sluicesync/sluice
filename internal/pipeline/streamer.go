@@ -13,6 +13,46 @@ import (
 	"github.com/orware/sluice/internal/translate"
 )
 
+// publicationEnsurer is the optional engine-side surface for engines
+// that need a publication (or analogous CDC-source-side scope object)
+// established before snapshot capture / CDC start. Postgres
+// implements it (Bug 13, ADR-0021); MySQL does not.
+//
+// Tables is the post-filter source-table list — schema-qualifying is
+// the engine's job. Empty tables means "fall back to the engine's
+// default scope" (FOR ALL TABLES on PG); the streamer never passes
+// nil — when the schema is empty, [coldStart] returns before this
+// is called.
+type publicationEnsurer interface {
+	EnsurePublication(ctx context.Context, dsn string, tables []string) error
+}
+
+// lsnTrackerProvider is the optional applier-side surface for
+// engines that produce applied-LSN feedback (Bug 15, ADR-0020). The
+// applier owns the tracker; the streamer fetches it via this
+// interface and hands it to the matching CDC reader via
+// [lsnTrackerAttacher].
+//
+// Returns an opaque value (typed `any`) so the pipeline package
+// stays free of engine-specific types. The matching CDC reader
+// type-asserts internally — only same-engine pairs (PG applier ↔
+// PG reader) actually wire anything; cross-engine pairs harmlessly
+// hand an unrelated value to the attacher and the attacher's type-
+// assertion fails closed.
+type lsnTrackerProvider interface {
+	LSNTracker() any
+}
+
+// lsnTrackerAttacher is the optional CDC-reader-side surface for
+// engines that consume applied-LSN feedback (Bug 15, ADR-0020). On
+// a successful type-assertion of the opaque tracker to its native
+// shape, the reader keeps a pointer and uses it on its keepalive
+// path; on failure it ignores the value and falls back to streamed-
+// LSN keepalives.
+type lsnTrackerAttacher interface {
+	AttachLSNTracker(t any)
+}
+
 // Streamer is the long-running orchestrator: it captures a consistent
 // source snapshot (cold start) or resumes from a previously-persisted
 // position (warm resume), runs the bulk-copy phase if needed, then
@@ -175,12 +215,27 @@ func (s *Streamer) Run(ctx context.Context) error {
 		return s.logDryRunPlan(ctx, streamID, persisted, found)
 	}
 
+	// ---- 3.6. Fetch the applier's LSN-feedback tracker (if any) ----
+	// Slot-ack-after-apply (Bug 15, ADR-0020): the postgres applier
+	// exposes a tracker the matching CDC reader reads from on its
+	// keepalive path. The tracker is opaque (typed `any`) so the
+	// pipeline package stays engine-neutral; the matching reader's
+	// AttachLSNTracker type-asserts internally. Cross-engine pairs
+	// (PG applier → MySQL reader, etc.) harmlessly hand a value the
+	// reader doesn't recognise; nothing breaks because the reader's
+	// fallback path (streamed-LSN keepalive) is correct for engines
+	// without an async-batched apply layer.
+	var lsnTracker any
+	if provider, ok := applier.(lsnTrackerProvider); ok {
+		lsnTracker = provider.LSNTracker()
+	}
+
 	// ---- 4. Branch: cold start vs warm resume ----
 	var changes <-chan ir.Change
 	if found {
-		changes, err = s.warmResume(ctx, persisted)
+		changes, err = s.warmResume(ctx, persisted, lsnTracker)
 	} else {
-		changes, err = s.coldStart(ctx)
+		changes, err = s.coldStart(ctx, lsnTracker)
 	}
 	if err != nil {
 		return err
@@ -357,13 +412,32 @@ func (s *Streamer) openApplier(ctx context.Context) (ir.ChangeApplier, bool, err
 
 // warmResume opens a CDC reader on the source and starts streaming
 // from the persisted position. No snapshot, no bulk-copy.
-func (s *Streamer) warmResume(ctx context.Context, persisted ir.Position) (<-chan ir.Change, error) {
+//
+// lsnTracker is the opaque applied-LSN feedback channel (Bug 15,
+// ADR-0020). Attached to the reader before StreamChanges so the
+// keepalive path uses applied-LSN from the very first ack — no
+// window where the slot could advance past un-applied work just
+// because the reader was constructed before the tracker was
+// passed through. nil tracker means the engine doesn't support
+// LSN feedback (the pre-v0.5.0 shape) or the applier isn't a
+// matching engine; the reader falls back to streamed-LSN.
+//
+// Warm resume reuses the publication scope established at cold
+// start; we don't re-read the schema or re-call EnsurePublication
+// here. Defence-in-depth lives in the applier's dispatch path
+// (skip-with-warning on unknown tables).
+func (s *Streamer) warmResume(ctx context.Context, persisted ir.Position, lsnTracker any) (<-chan ir.Change, error) {
 	slog.InfoContext(ctx, "warm resume from persisted position",
 		slog.String("position_token", persisted.Token),
 	)
 	cdc, err := s.Source.OpenCDCReader(ctx, s.SourceDSN)
 	if err != nil {
 		return nil, wrapWithHint(PhaseCDC, fmt.Errorf("pipeline: open cdc reader: %w", err))
+	}
+	if lsnTracker != nil {
+		if attacher, ok := cdc.(lsnTrackerAttacher); ok {
+			attacher.AttachLSNTracker(lsnTracker)
+		}
 	}
 	// CDC reader's Close is async (cancellation-driven), but we
 	// don't have a clean handle to call it from here. Streamer.Run's
@@ -377,9 +451,15 @@ func (s *Streamer) warmResume(ctx context.Context, persisted ir.Position) (<-cha
 	return changes, nil
 }
 
-// coldStart performs the original §4 flow: read schema → snapshot
-// → bulk-copy → start CDC from snapshot's position.
-func (s *Streamer) coldStart(ctx context.Context) (<-chan ir.Change, error) {
+// coldStart performs the original §4 flow: read schema → ensure
+// publication scope → snapshot → bulk-copy → start CDC from
+// snapshot's position.
+//
+// lsnTracker is the opaque applied-LSN feedback channel (Bug 15,
+// ADR-0020) — attached to the snapshot stream's CDC reader before
+// StreamChanges so the keepalive path uses applied-LSN from the
+// first ack onwards.
+func (s *Streamer) coldStart(ctx context.Context, lsnTracker any) (<-chan ir.Change, error) {
 	sr, err := s.Source.OpenSchemaReader(ctx, s.SourceDSN)
 	if err != nil {
 		return nil, wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: open source schema reader: %w", err))
@@ -398,6 +478,20 @@ func (s *Streamer) coldStart(ctx context.Context) (<-chan ir.Change, error) {
 	// excluded tables never reach the target schema-apply phase.
 	if err := applyTableFilter(ctx, schema, s.Filter); err != nil {
 		return nil, err
+	}
+
+	// ---- Scope the source-side publication to the filtered table
+	// list (Bug 13, ADR-0021). On engines that don't have
+	// publications (MySQL), this is a no-op; on Postgres, this is
+	// what stops a CREATE TABLE on the source mid-sync from
+	// crashing the applier with "table public.X has no columns".
+	// Run BEFORE OpenSnapshotStream so the snapshot's slot pins a
+	// catalog snapshot that already has the scoped publication.
+	if pe, ok := s.Source.(publicationEnsurer); ok {
+		tables := tableNamesForPublication(schema)
+		if err := pe.EnsurePublication(ctx, s.SourceDSN, tables); err != nil {
+			return nil, wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: ensure publication scope: %w", err))
+		}
 	}
 
 	// Apply per-column type overrides before the schema-write phase
@@ -453,6 +547,12 @@ func (s *Streamer) coldStart(ctx context.Context) (<-chan ir.Change, error) {
 	closeIf(sw)
 	slog.InfoContext(ctx, "bulk-copy complete; entering CDC mode")
 
+	if lsnTracker != nil {
+		if attacher, ok := stream.Changes.(lsnTrackerAttacher); ok {
+			attacher.AttachLSNTracker(lsnTracker)
+		}
+	}
+
 	changes, err := stream.Changes.StreamChanges(ctx, stream.Position)
 	if err != nil {
 		_ = stream.Close()
@@ -464,6 +564,22 @@ func (s *Streamer) coldStart(ctx context.Context) (<-chan ir.Change, error) {
 	// channel; the OS reclaims connections at process exit, and ctx
 	// cancellation tears down the goroutines that hold them.
 	return changes, nil
+}
+
+// tableNamesForPublication returns the bare table names from a
+// post-filter schema, in declaration order. Used by the publication-
+// scope step (Bug 13, ADR-0021) — schema-qualifying happens in the
+// engine because schema is an engine-side concept (PG namespaces vs.
+// MySQL databases vs. future engines).
+func tableNamesForPublication(schema *ir.Schema) []string {
+	if schema == nil {
+		return nil
+	}
+	out := make([]string, 0, len(schema.Tables))
+	for _, t := range schema.Tables {
+		out = append(out, t.Name)
+	}
+	return out
 }
 
 // validate enforces the required-fields contract.

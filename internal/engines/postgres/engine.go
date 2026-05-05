@@ -155,6 +155,32 @@ func (Engine) OpenCDCReader(ctx context.Context, dsn string) (ir.CDCReader, erro
 	}, nil
 }
 
+// EnsurePublication creates or rescopes the sluice publication on
+// the source. Pass the list of source tables that should be in the
+// CDC stream; the publication is set to FOR TABLE <list> rather
+// than the legacy FOR ALL TABLES (Bug 13, ADR-0021).
+//
+// Idempotent and safe to call repeatedly: an existing publication
+// with the same scope is left alone; a publication with a different
+// scope (or the v0.4.0-style FOR ALL TABLES) is altered or replaced
+// to match.
+//
+// Discovered by the [pipeline.Streamer] via structural interface
+// (publicationEnsurer); engines that don't have logical-replication
+// publications simply omit the method.
+func (Engine) EnsurePublication(ctx context.Context, dsn string, tables []string) error {
+	cfg, err := parseDSN(dsn)
+	if err != nil {
+		return err
+	}
+	db, err := openDB(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = db.Close() }()
+	return ensurePublication(ctx, db, defaultPublication, cfg.schema, tables)
+}
+
 // OpenSlotManager returns a [SlotManager] bound to the database
 // identified by dsn. Used by the `sluice slot list` and `sluice slot
 // drop` CLI commands to manage logical-replication slots from the

@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"strings"
 
+	"github.com/jackc/pglogrepl"
+
 	"github.com/orware/sluice/internal/ir"
 )
 
@@ -83,7 +85,61 @@ type ChangeApplier struct {
 	// the parallel MySQL fix exists to address. Populated lazily on
 	// the first sight of a table — same shape as pkCache.
 	colTypeCache map[string]map[string]ir.Type
+
+	// lsnFeedback is the slot-ack-after-apply tracker (Bug 15,
+	// ADR-0020). The applier reports the LSN of each successfully-
+	// committed change here; the [CDCReader] reads from the same
+	// tracker on its keepalive path so the slot's
+	// confirmed_flush_lsn never advances past durably-applied
+	// work. nil tracker means "no feedback wired" — the applier
+	// runs as before, and the reader falls back to streamed-LSN
+	// keepalives.
+	lsnFeedback *lsnTracker
 }
+
+// LSNTracker returns the applier's applied-LSN feedback channel.
+// The [pipeline.Streamer] uses the structural interface
+// `lsnTrackerProvider` to fetch this and hand it to the
+// [CDCReader]'s `AttachLSNTracker`. Lazily allocated so callers
+// that never wire the streamer (tests, direct API users) don't pay
+// the cost.
+func (a *ChangeApplier) LSNTracker() any {
+	if a.lsnFeedback == nil {
+		a.lsnFeedback = newLSNTracker()
+	}
+	return a.lsnFeedback
+}
+
+// reportAppliedToken extracts the LSN from a position token and
+// reports it to the tracker. Token-parse errors are logged at debug
+// level rather than propagated — losing one tracker update doesn't
+// invalidate the batch we just successfully committed, and a malformed
+// token is itself worth surfacing via a debug line for diagnosis.
+//
+// No-op when no tracker is wired (the legacy v0.4.0 shape) or when
+// the token doesn't carry a valid LSN. Single-call cost is one JSON
+// unmarshal + one LSN parse + one atomic CAS.
+func (a *ChangeApplier) reportAppliedToken(ctx context.Context, token string) {
+	if a.lsnFeedback == nil {
+		return
+	}
+	lsn, err := lsnFromPositionToken(token)
+	if err != nil {
+		slog.DebugContext(ctx, "postgres: applier: applied-LSN report skipped (parse failure)",
+			slog.String("err", err.Error()))
+		return
+	}
+	if lsn == 0 {
+		return
+	}
+	a.lsnFeedback.ReportApplied(lsn)
+}
+
+// _ keeps pglogrepl in the import list when the file is built
+// without the lsn_tracker.go's symbols being referenced from this
+// translation unit (defensive for future refactors that move the
+// helper around).
+var _ pglogrepl.LSN
 
 // Close releases the underlying connection pool.
 func (a *ChangeApplier) Close() error {
@@ -187,7 +243,10 @@ func (a *ChangeApplier) Apply(ctx context.Context, streamID string, changes <-ch
 
 // applyOne dispatches a single change to its SQL form, runs the
 // data write, and writes the position update — all in the same
-// transaction.
+// transaction. After a successful commit, the change's LSN is
+// reported to the slot-ack feedback tracker (Bug 15, ADR-0020) so
+// the [CDCReader]'s keepalive routine can advance
+// confirmed_flush_lsn past this change.
 func (a *ChangeApplier) applyOne(ctx context.Context, streamID string, c ir.Change) error {
 	tx, err := a.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -197,17 +256,35 @@ func (a *ChangeApplier) applyOne(ctx context.Context, streamID string, c ir.Chan
 		_ = tx.Rollback()
 		return err
 	}
-	if err := writePositionTx(ctx, tx, a.schema, streamID, c.Pos().Token); err != nil {
+	token := c.Pos().Token
+	if err := writePositionTx(ctx, tx, a.schema, streamID, token); err != nil {
 		_ = tx.Rollback()
 		return err
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("postgres: applier: commit: %w", err)
 	}
+	a.reportAppliedToken(ctx, token)
 	return nil
 }
 
+// errUnknownTable is the sentinel the colTypesFor lookup returns
+// when a CDC event references a table that doesn't exist on the
+// target. The applier skips such events with a warning rather than
+// erroring out (Bug 13 defence-in-depth — the primary fix is
+// scoping the publication to the source-side table list, but a
+// drifted publication or a manually-altered scope shouldn't crash
+// the whole stream).
+var errUnknownTable = errors.New("postgres: applier: target table does not exist")
+
 // dispatch routes a single change to its SQL form on the open tx.
+//
+// Events targeting a table that doesn't exist on the destination
+// are skipped with a warning (defence-in-depth for Bug 13). The
+// publication scope-by-table fix in [ensurePublication] keeps these
+// out of the WAL stream in the normal case; this branch handles
+// drift (a manually-altered publication, a stale schema cache,
+// etc.) without taking the whole stream down.
 func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, c ir.Change) error {
 	switch v := c.(type) {
 	case ir.Insert:
@@ -217,6 +294,10 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, c ir.Change) e
 			return fmt.Errorf("postgres: applier: pk lookup for %s.%s: %w", schema, v.Table, err)
 		}
 		colTypes, err := a.colTypesFor(ctx, schema, v.Table)
+		if errors.Is(err, errUnknownTable) {
+			logUnknownTable(ctx, "insert", schema, v.Table)
+			return nil
+		}
 		if err != nil {
 			return fmt.Errorf("postgres: applier: column types for %s.%s: %w", schema, v.Table, err)
 		}
@@ -232,6 +313,10 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, c ir.Change) e
 	case ir.Update:
 		schema := applierSchema(a.schema, v.Schema)
 		colTypes, err := a.colTypesFor(ctx, schema, v.Table)
+		if errors.Is(err, errUnknownTable) {
+			logUnknownTable(ctx, "update", schema, v.Table)
+			return nil
+		}
 		if err != nil {
 			return fmt.Errorf("postgres: applier: column types for %s.%s: %w", schema, v.Table, err)
 		}
@@ -253,6 +338,10 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, c ir.Change) e
 	case ir.Delete:
 		schema := applierSchema(a.schema, v.Schema)
 		colTypes, err := a.colTypesFor(ctx, schema, v.Table)
+		if errors.Is(err, errUnknownTable) {
+			logUnknownTable(ctx, "delete", schema, v.Table)
+			return nil
+		}
 		if err != nil {
 			return fmt.Errorf("postgres: applier: column types for %s.%s: %w", schema, v.Table, err)
 		}
@@ -271,11 +360,46 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, c ir.Change) e
 		schema := applierSchema(a.schema, v.Schema)
 		stmt := buildTruncateSQL(schema, v.Table)
 		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			// Truncate of a missing table fails with "relation does
+			// not exist"; treat as a benign skip-with-warning so the
+			// stream survives a stale-publication TRUNCATE event.
+			if isMissingTableErr(err) {
+				logUnknownTable(ctx, "truncate", schema, v.Table)
+				return nil
+			}
 			return fmt.Errorf("postgres: applier: truncate %s.%s: %w", schema, v.Table, err)
 		}
 		return nil
 	}
 	return fmt.Errorf("postgres: applier: unknown change type %T", c)
+}
+
+// logUnknownTable surfaces the skip-with-warning footprint for
+// events targeting a non-existent destination table. Operators
+// should see exactly one of these per unknown table per applier
+// lifetime (the column-type cache is populated on first miss with
+// the sentinel and skipped thereafter).
+func logUnknownTable(ctx context.Context, op, schema, table string) {
+	slog.WarnContext(ctx, "postgres: applier: skipping CDC event for unknown target table",
+		slog.String("op", op),
+		slog.String("schema", schema),
+		slog.String("table", table),
+		slog.String("hint", "verify the publication is scoped to tables that exist on both source and target; re-run sluice migrate to add missing tables on the target"),
+	)
+}
+
+// isMissingTableErr returns true when err carries the Postgres
+// "relation does not exist" SQLSTATE 42P01. Used by the truncate
+// dispatch to recognise a stale-publication TRUNCATE without
+// taking a hard dependency on pgconn's error type.
+func isMissingTableErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	// SQLSTATE 42P01 = undefined_table. The text varies between
+	// pgx versions but the substring is stable.
+	msg := err.Error()
+	return strings.Contains(msg, "42P01") || strings.Contains(msg, "does not exist")
 }
 
 // logZeroRowsAffected emits a debug-level log line when a target Exec
@@ -439,7 +563,11 @@ func loadColumnTypes(ctx context.Context, db *sql.DB, schema, table string) (map
 		return nil, err
 	}
 	if len(out) == 0 {
-		return nil, fmt.Errorf("postgres: applier: table %s.%s has no columns (does it exist?)", schema, table)
+		// Empty information_schema result: the table doesn't exist
+		// on the destination. Wrap [errUnknownTable] so callers can
+		// branch on errors.Is and skip the event with a warning
+		// (Bug 13 defence-in-depth). See [ChangeApplier.dispatch].
+		return nil, fmt.Errorf("%w: %s.%s", errUnknownTable, schema, table)
 	}
 	return out, nil
 }

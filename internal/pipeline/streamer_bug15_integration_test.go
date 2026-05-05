@@ -1,0 +1,329 @@
+//go:build integration
+
+// Integration test for Bug 15 (slot-ack-after-apply, ADR-0020).
+//
+// The pre-fix shape: sluice's PG CDC reader advanced the slot's
+// confirmed_flush_lsn as soon as the pump parsed a Commit message
+// off the WAL stream — which is BEFORE the apply batch commits to
+// dst. When `sync stop` arrives mid-batch, sluice exits cleanly,
+// the buffered events are dropped from memory, and on warm-resume
+// the slot streams from a position past the un-applied batch. The
+// 43-row gap in the v0.4.0 night soak was exactly this surface.
+//
+// The fix: only ack to the slot the LSN whose data has been
+// committed to dst. The applier reports applied LSNs to a tracker
+// the keepalive routine reads from; until the applier reports its
+// first commit, the keepalive falls back to the streamed-LSN so
+// the slot stays alive on idle streams. See [lsnTracker] and
+// [CDCReader.ackLSN] for the implementation.
+//
+// This test mirrors workspace/bug15_repro.sh from the testing
+// repo: cold-start, sustained writer, mid-stream RequestStop,
+// restart, assert no row gap (the load-bearing post-restart
+// invariant — the in-flight buffer at stop time must replay).
+
+package pipeline
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"testing"
+	"time"
+
+	"github.com/orware/sluice/internal/engines"
+
+	_ "github.com/orware/sluice/internal/engines/postgres"
+)
+
+// TestStreamer_PostgresToPostgres_StopRestartNoLoss is the canonical
+// confirmation that Bug 15's slot-ack-after-apply fix works. The
+// shape:
+//
+//  1. Cold-start sluice on PG → PG with --apply-batch-size=50.
+//  2. Drive a sustained writer on the source (10 ops/sec, 60 sec).
+//  3. Mid-stream (~25 sec in), RequestStop on the target.
+//  4. Streamer drains and exits.
+//  5. Restart sluice; warm resume from persisted position.
+//  6. Wait for tail of writer events to land on dst.
+//  7. Assert MAX(id) == COUNT(*) — no row gaps.
+//
+// Pre-fix, this test would consistently fail with two distinct
+// gaps: an in-flight gap of 20-50 rows around the stop time, and
+// a tail gap of post-restart rows the wedged apply path never
+// committed. Post-fix, no gap.
+func TestStreamer_PostgresToPostgres_StopRestartNoLoss(t *testing.T) {
+	prevInterval := pollIntervalForTest
+	pollIntervalForTest = 200 * time.Millisecond
+	t.Cleanup(func() { pollIntervalForTest = prevInterval })
+
+	sourceDSN, targetDSN, cleanup := startPostgresLogical(t)
+	defer cleanup()
+
+	const seedDDL = `
+		CREATE TABLE bug15 (
+			id      BIGSERIAL PRIMARY KEY,
+			payload TEXT NOT NULL
+		);
+		ALTER TABLE bug15 REPLICA IDENTITY FULL;
+		INSERT INTO bug15 (payload)
+			SELECT 'seed-' || g FROM generate_series(1, 50) g;
+	`
+	applyDDL(t, sourceDSN, seedDDL)
+
+	pgEng, ok := engines.Get("postgres")
+	if !ok {
+		t.Fatal("postgres engine not registered")
+	}
+
+	const streamID = "bug15-stop-restart"
+
+	// ---- Phase 1: cold-start with batched apply ----
+	streamer := &Streamer{
+		Source:         pgEng,
+		Target:         pgEng,
+		SourceDSN:      sourceDSN,
+		TargetDSN:      targetDSN,
+		StreamID:       streamID,
+		ApplyBatchSize: 50,
+	}
+	streamCtx, streamCancel := context.WithCancel(context.Background())
+	defer streamCancel()
+	runErr := make(chan error, 1)
+	go func() { runErr <- streamer.Run(streamCtx) }()
+
+	// Wait for bulk-copy to deliver the seed rows.
+	if !waitForRowCount(t, targetDSN, "bug15", 50, 30*time.Second) {
+		streamCancel()
+		<-runErr
+		t.Fatalf("bulk copy did not deliver seed rows")
+	}
+
+	// ---- Phase 2: sustained writer ----
+	// Generate ~600 rows over ~60 seconds. Stop is issued at ~25s
+	// (250 ops in), so the in-flight buffer at stop time will be a
+	// realistic chunk of the 50-batch.
+	writerCtx, writerCancel := context.WithCancel(context.Background())
+	defer writerCancel()
+	writerDone := make(chan struct{})
+	go func() {
+		defer close(writerDone)
+		runWriter(t, writerCtx, sourceDSN)
+	}()
+
+	// Let the writer get a head start so events accumulate.
+	time.Sleep(2 * time.Second)
+
+	// Wait until ~50 rows have flowed through CDC, then ~more time
+	// to ensure batched apply has been buffering. Rough timing:
+	// writer adds 10/sec; we wait for ~150 rows past the seed.
+	if !waitForRowCount(t, targetDSN, "bug15", 50+50, 30*time.Second) {
+		writerCancel()
+		streamCancel()
+		<-runErr
+		<-writerDone
+		t.Fatalf("CDC did not advance after writer started")
+	}
+
+	// ---- Phase 3: RequestStop mid-stream ----
+	applierCtx, applierCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer applierCancel()
+	stopApplier, err := pgEng.OpenChangeApplier(applierCtx, targetDSN)
+	if err != nil {
+		writerCancel()
+		streamCancel()
+		<-runErr
+		<-writerDone
+		t.Fatalf("OpenChangeApplier (for stop): %v", err)
+	}
+	if err := stopApplier.RequestStop(applierCtx, streamID); err != nil {
+		_ = closeApplier(stopApplier)
+		writerCancel()
+		streamCancel()
+		<-runErr
+		<-writerDone
+		t.Fatalf("RequestStop: %v", err)
+	}
+	_ = closeApplier(stopApplier)
+
+	select {
+	case err := <-runErr:
+		if err != nil {
+			writerCancel()
+			<-writerDone
+			t.Fatalf("Streamer.Run returned err on stop: %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		writerCancel()
+		streamCancel()
+		<-writerDone
+		t.Fatal("Streamer.Run did not return after RequestStop")
+	}
+
+	// Tear down the first streamer's pump goroutine (and its
+	// replication connection) before opening a second one. RequestStop
+	// only cancels the apply loop; the CDC reader's pump is bound to
+	// streamCtx and would otherwise hold the slot active until the
+	// deferred streamCancel runs at test-end. Without this, the warm-
+	// resume's StartReplication races with the previous connection's
+	// release and the slot reports "active for PID N".
+	streamCancel()
+	// Give the pump goroutine a moment to release the replication
+	// connection so the warm resume's slot ownership check passes.
+	// 5 seconds is generous: under healthy host conditions the pump
+	// exits within milliseconds of streamCancel; the larger window
+	// covers the test running concurrently with other PG containers
+	// where the host's docker daemon is under resource pressure.
+	time.Sleep(5 * time.Second)
+
+	// Streamer is now stopped. The writer continues producing rows
+	// on the source — those events will accumulate in WAL until the
+	// next streamer comes online. Pre-fix, the in-flight batch
+	// buffered at stop time was dropped, AND the slot had been
+	// ack'd past it; post-fix, the slot retains the WAL because
+	// the applier never reported those LSNs as applied.
+
+	// ---- Phase 4: warm resume ----
+	resumeStreamer := &Streamer{
+		Source:         pgEng,
+		Target:         pgEng,
+		SourceDSN:      sourceDSN,
+		TargetDSN:      targetDSN,
+		StreamID:       streamID,
+		ApplyBatchSize: 50,
+	}
+	resumeCtx, resumeCancel := context.WithCancel(context.Background())
+	defer resumeCancel()
+	resumeErr := make(chan error, 1)
+	go func() { resumeErr <- resumeStreamer.Run(resumeCtx) }()
+
+	// Let the writer finish, then drain the stream.
+	<-writerDone
+
+	// Give the resumed streamer time to apply the tail events.
+	// Source row count is the target. Use a forgiving threshold —
+	// the load-bearing invariant is MAX(id) == COUNT(*) (no row
+	// gaps), not "perfectly caught up to source". With
+	// --apply-batch-size=50, a single trailing row past the
+	// last full batch can sit in the in-flight buffer until the
+	// next batch fills or the stream closes; that's a separate
+	// throughput knob, not a Bug 15 regression. We wait until
+	// dst is within 50 rows of src (one batch's worth).
+	srcCount := readSrcRowCount(t, sourceDSN, "bug15")
+	threshold := srcCount - 50
+	if threshold < 50 {
+		threshold = 50
+	}
+	if !waitForRowCount(t, targetDSN, "bug15", threshold, 60*time.Second) {
+		resumeCancel()
+		<-resumeErr
+		t.Fatalf("after resume, dst rows did not catch up to threshold (src=%d, dst=%d, threshold=%d)",
+			srcCount, pollRowCount(targetDSN, "bug15"), threshold)
+	}
+
+	// ---- Phase 5: assert no gaps ----
+	// MAX(id) == COUNT(*) for a contiguous BIGSERIAL is the
+	// canonical "no rows lost" invariant from the bug catalog.
+	// This is the load-bearing assertion: pre-fix, the gap of
+	// dropped in-flight events would show up as MAX > COUNT.
+	maxID, count := readMaxAndCount(t, targetDSN, "bug15")
+	if maxID != count {
+		t.Errorf("dst row gap: MAX(id)=%d, COUNT(*)=%d (delta=%d) — slot-ack-after-apply did not preserve in-flight buffer",
+			maxID, count, maxID-count)
+	}
+
+	// Tear down cleanly.
+	resumeCancel()
+	select {
+	case err := <-resumeErr:
+		if err != nil {
+			t.Errorf("resume Streamer.Run returned err: %v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Errorf("resume Streamer.Run did not return after ctx cancel")
+	}
+}
+
+// runWriter drives a sustained INSERT loop on the source: 10
+// ops/sec, until ctx is cancelled or 60s elapses (whichever
+// first).
+func runWriter(t *testing.T, ctx context.Context, dsn string) {
+	t.Helper()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Logf("writer: open: %v", err)
+		return
+	}
+	defer func() { _ = db.Close() }()
+
+	timeout := time.NewTimer(60 * time.Second)
+	defer timeout.Stop()
+	tick := time.NewTicker(100 * time.Millisecond)
+	defer tick.Stop()
+
+	for i := 1; i < 6000; i++ {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timeout.C:
+			return
+		case <-tick.C:
+			if _, err := db.ExecContext(ctx, "INSERT INTO bug15 (payload) VALUES ($1)",
+				fmt.Sprintf("continuous-%d", i)); err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				// Source-side errors (deadlines, connection drops)
+				// happen when the test tears down. Don't escalate.
+				return
+			}
+		}
+	}
+}
+
+// readMaxAndCount returns MAX(id) and COUNT(*) for the table. The
+// gap-detection invariant for a contiguous BIGSERIAL is MAX = COUNT.
+func readMaxAndCount(t *testing.T, dsn, table string) (max, count int64) {
+	t.Helper()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	q := fmt.Sprintf("SELECT COALESCE(MAX(id), 0), COUNT(*) FROM %s", table)
+	if err := db.QueryRowContext(ctx, q).Scan(&max, &count); err != nil {
+		t.Fatalf("max+count: %v", err)
+	}
+	return max, count
+}
+
+// readSrcRowCount returns the source-side COUNT(*) for the named
+// table. Used to compute the target the resumed streamer must
+// catch up to before the gap assertion runs.
+func readSrcRowCount(t *testing.T, dsn, table string) int {
+	t.Helper()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var n int
+	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+table).Scan(&n); err != nil {
+		t.Fatalf("count src: %v", err)
+	}
+	return n
+}
+
+// closeApplier is a small helper to close an applier obtained from
+// the engine factory in tests; the public IR doesn't expose Close
+// on the interface, but every shipping engine's applier embeds it.
+func closeApplier(a any) error {
+	if c, ok := a.(interface{ Close() error }); ok {
+		return c.Close()
+	}
+	return nil
+}

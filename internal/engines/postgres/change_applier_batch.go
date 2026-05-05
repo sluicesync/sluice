@@ -172,9 +172,18 @@ func (a *ChangeApplier) applyOneBatch(ctx context.Context, streamID string, chan
 	return n, lastPos, false, a.commitBatch(ctx, tx, streamID, lastPos.Token, n)
 }
 
-// commitBatch writes the position then commits the open tx.
-// Returns a wrapped error on either failure with a rollback already
-// attempted on the position-write path.
+// commitBatch writes the position then commits the open tx, then
+// reports the just-committed LSN to the slot-ack feedback tracker
+// (Bug 15, ADR-0020). Returns a wrapped error on either failure
+// with a rollback already attempted on the position-write path.
+//
+// The tracker report happens AFTER tx.Commit succeeds, so a crash
+// between the data commit and the report only loses one tracker
+// update — the next batch's commit will report a higher LSN that
+// supersedes it. The slot retains the WAL until that next report
+// in exchange. Crash before tx.Commit means the data isn't durable
+// either, and the reader's keepalive will keep ack'ing the
+// previous floor.
 func (a *ChangeApplier) commitBatch(ctx context.Context, tx *sql.Tx, streamID, token string, rows int) error {
 	if err := writePositionTx(ctx, tx, a.schema, streamID, token); err != nil {
 		_ = tx.Rollback()
@@ -193,6 +202,7 @@ func (a *ChangeApplier) commitBatch(ctx context.Context, tx *sql.Tx, streamID, t
 		)
 		return fmt.Errorf("postgres: applier: commit: %w", err)
 	}
+	a.reportAppliedToken(ctx, token)
 	return nil
 }
 
