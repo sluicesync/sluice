@@ -40,11 +40,75 @@ type RowReader interface {
 	ReadRows(ctx context.Context, table *Table) (<-chan Row, error)
 }
 
+// BatchedRowReader is an optional extension of [RowReader] for engines
+// that support PK-ordered cursor-paginated reads. The bulk-copy
+// orchestrator probes for this via type assertion when --resume is in
+// flight; engines that don't implement it (or tables without a PK)
+// fall back to the v0.3.0 truncate-and-redo behaviour for in-progress
+// tables.
+//
+// The contract is "give me up to limit rows whose PK is strictly
+// greater than after, in PK order". Pass nil after for the first
+// batch. The returned channel closes when no more rows match (and the
+// orchestrator interprets a zero-row close as "table fully read").
+//
+// For composite PKs, after is the slice of PK column values in PK
+// declaration order. Implementations emit a row-comparison predicate:
+//
+//	WHERE (pk1, pk2, ...) > ($1, $2, ...) ORDER BY pk1, pk2, ...
+//
+// Both PG and MySQL natively support row-comparison; per-column
+// boolean logic is incorrect for composite-PK descent and must not
+// be used.
+//
+// For tables without a PK, implementations return an error; the
+// orchestrator falls back to truncate-and-redo for that table. See
+// ADR-0018 for the full design.
+type BatchedRowReader interface {
+	RowReader
+
+	// ReadRowsBatch returns up to limit rows from table where the PK
+	// is strictly greater than after (in PK column order), streamed
+	// over the returned channel in PK ascending order. The channel
+	// closes when limit is reached or no more matching rows exist.
+	//
+	// Returns a non-nil error for tables without a primary key; the
+	// caller is expected to fall back to non-batched reads in that
+	// case.
+	ReadRowsBatch(ctx context.Context, table *Table, after []any, limit int) (<-chan Row, error)
+}
+
 // RowWriter performs bulk inserts using the target's native fast-load
 // path (COPY, LOAD DATA INFILE, batched INSERTs, etc.). Implementations
 // should consume rows until the channel is closed or ctx is cancelled.
 type RowWriter interface {
 	WriteRows(ctx context.Context, table *Table, rows <-chan Row) error
+}
+
+// IdempotentRowWriter is an optional extension of [RowWriter] for the
+// resume path. Indicates the writer's bulk INSERT path uses
+// upsert-on-PK semantics (ON CONFLICT / ON DUPLICATE KEY UPDATE)
+// instead of plain INSERT. Required for per-batch checkpointing — the
+// brief replay window between batch commit and checkpoint write can
+// re-deliver rows that already landed, and a plain INSERT would
+// duplicate-key-error on those.
+//
+// The orchestrator calls WriteRowsIdempotent in resume mode; in
+// non-resume (cold-start) mode it uses the faster plain WriteRows.
+// Engines that don't implement this surface can still be used as
+// targets — the orchestrator falls back to the v0.3.0 truncate-and-
+// redo behaviour for in-progress tables. See ADR-0018.
+type IdempotentRowWriter interface {
+	RowWriter
+
+	// WriteRowsIdempotent has the same shape as [RowWriter.WriteRows]
+	// but generates upsert-form INSERT statements that tolerate PK
+	// collisions (ON CONFLICT DO UPDATE / ON DUPLICATE KEY UPDATE).
+	// Tables without a PK fall back to plain INSERT semantics — the
+	// orchestrator never calls this method on no-PK tables (the
+	// classify step routes those to truncate-and-redo) but
+	// implementations should still degrade gracefully if it happens.
+	WriteRowsIdempotent(ctx context.Context, table *Table, rows <-chan Row) error
 }
 
 // TableTruncator is the optional surface a [RowWriter] (or
@@ -322,23 +386,79 @@ const (
 )
 
 // TableProgressState is the per-table tracking value within
-// [MigrationState.TableProgress]. Three states map directly onto the
-// resume semantics: skip (`complete`), truncate-and-redo
-// (`in_progress`), or start fresh (missing key).
+// [TableProgress.State]. The state field maps directly onto the
+// resume semantics: skip (`complete`), per-batch resume from cursor
+// (`in_progress` with cursor data), or truncate-and-redo
+// (`no_pk_truncate_and_redo`, or a v0.3.0-shape `in_progress` row).
 type TableProgressState string
 
 const (
 	// TableProgressInProgress means the bulk-copy started writing the
-	// table but did not complete. On --resume, the table is TRUNCATEd
-	// and copied from scratch (we can't tell how many rows landed; a
-	// partial-progress retry would need per-batch checkpointing,
-	// which is a future enhancement).
+	// table but did not complete. On --resume with v0.4.0 the cursor
+	// fields on [TableProgress] drive a per-batch resume; on a row
+	// written by v0.3.0 (no cursor) the orchestrator falls back to
+	// truncate-and-redo.
 	TableProgressInProgress TableProgressState = "in_progress"
 
 	// TableProgressComplete means the bulk-copy finished cleanly. On
 	// --resume, the table is skipped.
 	TableProgressComplete TableProgressState = "complete"
+
+	// TableProgressNoPKTruncateAndRedo marks a table without a primary
+	// key. Per-batch checkpointing requires a PK-ordered cursor;
+	// without one the table falls back to v0.3.0 truncate-and-redo on
+	// every retry. The state is sticky across attempts — once a table
+	// is classified as no-PK, every failure resumes via truncate-and-
+	// redo regardless of how many rows the previous attempt landed.
+	TableProgressNoPKTruncateAndRedo TableProgressState = "no_pk_truncate_and_redo"
 )
+
+// TableProgress is the per-table entry within
+// [MigrationState.TableProgress]. The struct shape replaces the v0.3.0
+// bare-string shape so per-batch resume can carry a cursor (last
+// successfully-applied PK) and a row count alongside the lifecycle
+// state.
+//
+// Wire shape on disk (within the table_progress JSON map):
+//
+//	"users":      "complete"                                       // v0.3.0 + v0.4.0
+//	"orders":     {"state":"in_progress","last_pk":[12345],"rows_copied":12345}
+//	"products":   {"state":"in_progress","last_pk":["a",7],"rows_copied":8000}
+//	"events_log": "no_pk_truncate_and_redo"
+//
+// The bare-string form is preserved for `complete` (compact, matches
+// the v0.3.0 wire shape, easy to glance at in psql) and for the
+// no-PK sentinel. Cursor-bearing rows use the object form. Custom
+// JSON marshallers handle both shapes; see [TableProgress.UnmarshalJSON].
+//
+// Backward compatibility: a v0.3.0 row with the bare string
+// `"in_progress"` decodes into TableProgress{State:
+// TableProgressInProgress} with a nil LastPK and zero RowsCopied — the
+// orchestrator treats that "no cursor" case as truncate-and-redo on
+// resume. Operators upgrading mid-migration should expect that
+// in-flight tables will not gain mid-table resume on the v0.4.0
+// binary; only fresh migrations do.
+type TableProgress struct {
+	// State is the lifecycle phase of this table within the bulk-copy
+	// stage of the migration.
+	State TableProgressState
+
+	// LastPK is the primary-key column values of the last successfully
+	// committed row in the table. nil on fresh start, on v0.3.0 rows,
+	// and on no-PK tables. For composite PKs the slice is in PK column
+	// declaration order. JSON elements pass through encoding/json's
+	// default marshalling — integers as numbers, strings as strings,
+	// timestamps as RFC3339 strings — which is sufficient for every PK
+	// column type the orchestrator currently supports.
+	LastPK []any
+
+	// RowsCopied is the count of rows committed so far. Reported in
+	// progress logs on resume so an operator can see how far the
+	// previous attempt got. Best-effort: a crash between batch commit
+	// and checkpoint write may have landed more rows than the count
+	// reflects, but the upsert path on resume is tolerant of that drift.
+	RowsCopied int64
+}
 
 // MigrationState is one row in the per-target sluice_migrate_state
 // table. Returned by [MigrationStateStore.Read] and accepted by
@@ -348,7 +468,7 @@ const (
 //
 //	migration_id    TEXT PRIMARY KEY
 //	phase           TEXT NOT NULL
-//	table_progress  TEXT          -- JSON map[string]TableProgressState
+//	table_progress  TEXT          -- JSON map[string]TableProgress
 //	started_at      TIMESTAMP NOT NULL
 //	updated_at      TIMESTAMP NOT NULL
 //	last_error      TEXT          -- truncated to 1KB on write
@@ -359,7 +479,7 @@ const (
 type MigrationState struct {
 	MigrationID   string
 	Phase         MigrationPhase
-	TableProgress map[string]TableProgressState
+	TableProgress map[string]TableProgress
 	StartedAt     time.Time
 	UpdatedAt     time.Time
 	LastError     string
