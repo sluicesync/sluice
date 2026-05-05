@@ -151,7 +151,7 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version-file: "go.mod"
-      - uses: golangci/golangci-lint-action@v8
+      - uses: golangci/golangci-lint-action@v9
         with:
           # @v8+ of the action natively requires golangci-lint v2 (the
           # major-version split happened in early 2026). Our
