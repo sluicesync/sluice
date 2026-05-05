@@ -308,7 +308,7 @@ func emitColumnDef(table *ir.Table, c *ir.Column, opts emitOpts) (string, error)
 			)
 		}
 		sb.WriteString(" GENERATED ALWAYS AS (")
-		sb.WriteString(c.GeneratedExpr)
+		sb.WriteString(translateGeneratedExpr(c))
 		sb.WriteString(") STORED")
 	}
 	if !c.Nullable {
@@ -629,9 +629,31 @@ func emitCheckConstraint(c *ir.CheckConstraint) string {
 		sb.WriteByte(' ')
 	}
 	sb.WriteString("CHECK (")
-	sb.WriteString(c.Expr)
+	sb.WriteString(translateCheckExpr(c))
 	sb.WriteByte(')')
 	return sb.String()
+}
+
+// translateGeneratedExpr returns the generated-column expression to
+// emit, applying the cross-dialect translation pass when the IR's
+// dialect tag indicates a different source dialect (see ADR-0016).
+// An empty / matching dialect tag emits verbatim — same behaviour as
+// before the translation layer landed.
+func translateGeneratedExpr(c *ir.Column) string {
+	if c.GeneratedExprDialect == "" || c.GeneratedExprDialect == dialectName {
+		return c.GeneratedExpr
+	}
+	return translateExprForPG(c.GeneratedExpr)
+}
+
+// translateCheckExpr returns the CHECK-constraint expression to emit,
+// applying the cross-dialect translation pass when the IR's dialect
+// tag indicates a different source dialect.
+func translateCheckExpr(c *ir.CheckConstraint) string {
+	if c.ExprDialect == "" || c.ExprDialect == dialectName {
+		return c.Expr
+	}
+	return translateExprForPG(c.Expr)
 }
 
 // emitColumnList renders a parenthesised, comma-separated list of
