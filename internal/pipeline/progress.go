@@ -36,7 +36,16 @@ import (
 // progressTicker counts rows passing through the bulk-copy pipe and
 // emits a periodic slog line summarising progress. One ticker per
 // table; call [progressTicker.Stop] when the table's copy completes
-// (or fails) to flush a final "completed" line and stop the goroutine.
+// (or fails) to flush a final summary line and stop the goroutine.
+//
+// The summary line's verbiage depends on the err passed to Stop:
+// nil means "bulk copy complete" (success); non-nil means "bulk
+// copy aborted" (the writer or context errored mid-stream). Bug 9
+// uncovered that the previous "always log complete" shape was
+// actively misleading — a duplicate-key error mid-stream would log
+// "complete table=comments rows=501" while the reader's goroutine
+// silently leaked, holding a snapshot tx open. The status-aware Stop
+// makes the failure visible in the operator's tail -f.
 type progressTicker struct {
 	rows     atomic.Int64
 	table    string
@@ -110,17 +119,34 @@ func (p *progressTicker) loop(ctx context.Context) {
 }
 
 // Stop tells the background goroutine to exit and emits a final
-// "bulk copy complete" line carrying the total row count for the
-// table. Idempotent — safe to call from a deferred cleanup as well as
-// from the success path.
-func (p *progressTicker) Stop(ctx context.Context) {
+// summary line carrying the total row count for the table. Pass nil
+// for err on the success path; pass the writer/context error on the
+// failure path so the line reads "bulk copy aborted" instead of
+// "complete". Idempotent — safe to call from a deferred cleanup as
+// well as from the success path.
+//
+// The row count is "rows handed to the writer", not "rows the writer
+// committed". On the failure path the writer may have flushed only a
+// subset of those rows before erroring; the count is therefore an
+// upper bound on what landed on the dest, not a confirmation that
+// every counted row is durable. See progress.go's file-level note
+// for the same caveat on the periodic progress line.
+func (p *progressTicker) Stop(ctx context.Context, err error) {
 	p.stopOnce.Do(func() {
 		close(p.done)
 		p.wg.Wait()
-		p.logger.LogAttrs(ctx, slog.LevelInfo, "bulk copy complete",
+		msg := "bulk copy complete"
+		if err != nil {
+			msg = "bulk copy aborted"
+		}
+		attrs := []slog.Attr{
 			slog.String("table", p.table),
 			slog.Int64("rows", p.rows.Load()),
-		)
+		}
+		if err != nil {
+			attrs = append(attrs, slog.String("err", err.Error()))
+		}
+		p.logger.LogAttrs(ctx, slog.LevelInfo, msg, attrs...)
 	})
 }
 

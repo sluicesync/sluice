@@ -108,6 +108,18 @@ type Migrator struct {
 	// who need stable identity across DSN changes (DNS shifts, host
 	// renames) should pass --migration-id explicitly.
 	MigrationID string
+
+	// ForceColdStart, when true, skips the cold-start pre-flight
+	// check that refuses a fresh migration into a target with
+	// pre-existing rows. The check protects against Bug 9 (cold-
+	// start hangs after a killed-mid-copy run leaves partial dest
+	// data behind); this flag is the explicit override for the
+	// rare case of bulk-copying into a populated table.
+	//
+	// Ignored when Resume is true — resume *expects* dest tables
+	// to have data, so the pre-flight doesn't run on that path
+	// regardless of this flag.
+	ForceColdStart bool
 }
 
 // Run executes the migration. Returns nil on success or a wrapped
@@ -199,6 +211,14 @@ func (m *Migrator) Run(ctx context.Context) error {
 
 	if resuming {
 		logResumeStart(ctx, state, schema)
+	} else {
+		// Cold-start pre-flight: refuse if any target table already
+		// contains data. See preflight.go for the rationale (Bug 9).
+		// Skipped on --resume (TableProgress drives that path) and
+		// on --force-cold-start (explicit operator override).
+		if err := preflightColdStart(ctx, schema, rw, m.ForceColdStart); err != nil {
+			return markFailed(ctx, rc, state, ir.MigrationPhasePending, err)
+		}
 	}
 
 	if err := runBulkCopyPhases(ctx, rc, &state, schema, rr, sw, rw, resuming); err != nil {
@@ -436,16 +456,34 @@ func (m *Migrator) validate() error {
 // counts every row the orchestrator hands to the writer and emits a
 // slog line every [progressInterval]. Stop is called via defer so
 // progress reporting terminates even on writer error.
-func copyTable(ctx context.Context, rr ir.RowReader, rw ir.RowWriter, table *ir.Table) error {
-	rows, err := rr.ReadRows(ctx, table)
+//
+// Goroutine lifecycle on the error path (Bug 9): the row reader
+// (e.g. postgres/row_reader.go::stream) and the tee both block on
+// "out <- row" with a select on ctx.Done(). When WriteRows returns
+// an error, neither goroutine has any reason to unwind on its own —
+// the writer abandoned its consumer end of the channel, but the
+// parent ctx is still alive (the caller may want to continue with
+// other phases). Without an explicit cancel, both goroutines wedge
+// forever; on a Postgres source that means the snapshot transaction
+// never commits and PG shows "idle in transaction" sessions.
+//
+// The fix: derive a child context that's cancelled regardless of
+// outcome (defer cancel). The reader and tee see ctx.Done() fire,
+// drop their pending sends, and exit cleanly. The parent ctx is
+// untouched, so the orchestrator can decide what to do next.
+func copyTable(ctx context.Context, rr ir.RowReader, rw ir.RowWriter, table *ir.Table) (retErr error) {
+	copyCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	rows, err := rr.ReadRows(copyCtx, table)
 	if err != nil {
 		return fmt.Errorf("read rows: %w", err)
 	}
-	pt := newProgressTicker(ctx, progressInterval, table.Name)
-	defer pt.Stop(ctx)
+	pt := newProgressTicker(copyCtx, progressInterval, table.Name)
+	defer func() { pt.Stop(ctx, retErr) }()
 
-	teed := teeRows(ctx, rows, pt.inc)
-	if err := rw.WriteRows(ctx, table, teed); err != nil {
+	teed := teeRows(copyCtx, rows, pt.inc)
+	if err := rw.WriteRows(copyCtx, table, teed); err != nil {
 		return fmt.Errorf("write rows: %w", err)
 	}
 	return nil

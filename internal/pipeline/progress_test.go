@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 	"testing"
@@ -21,7 +22,7 @@ func TestProgressTicker_StopEmitsCompleteLine(t *testing.T) {
 	pt.inc()
 	pt.inc()
 	pt.inc()
-	pt.Stop(context.Background())
+	pt.Stop(context.Background(), nil)
 
 	out := logs.String()
 	if !strings.Contains(out, "bulk copy complete") {
@@ -35,6 +36,34 @@ func TestProgressTicker_StopEmitsCompleteLine(t *testing.T) {
 	}
 }
 
+// TestProgressTicker_StopWithErrorEmitsAbortedLine verifies the
+// failure-path Stop logs "bulk copy aborted" instead of "complete"
+// and includes the error message. Bug 9 hinged on the original Stop
+// always logging "complete" regardless of writer outcome — this test
+// pins the corrected shape so a regression is caught immediately.
+func TestProgressTicker_StopWithErrorEmitsAbortedLine(t *testing.T) {
+	logs := captureSlog(t)
+
+	pt := newProgressTicker(context.Background(), time.Hour, "comments")
+	pt.inc()
+	pt.inc()
+	pt.Stop(context.Background(), errors.New("duplicate key on PRIMARY"))
+
+	out := logs.String()
+	if !strings.Contains(out, "bulk copy aborted") {
+		t.Errorf("expected aborted line; got: %q", out)
+	}
+	if strings.Contains(out, "bulk copy complete") {
+		t.Errorf("did NOT expect complete line on error path; got: %q", out)
+	}
+	if !strings.Contains(out, "rows=2") {
+		t.Errorf("expected rows=2; got: %q", out)
+	}
+	if !strings.Contains(out, "duplicate key on PRIMARY") {
+		t.Errorf("expected error message in attrs; got: %q", out)
+	}
+}
+
 // TestProgressTicker_StopIsIdempotent verifies the sync.Once in Stop
 // makes a second call a no-op — important because the orchestrator
 // uses a deferred Stop that may collide with an explicit Stop on the
@@ -42,8 +71,8 @@ func TestProgressTicker_StopEmitsCompleteLine(t *testing.T) {
 func TestProgressTicker_StopIsIdempotent(t *testing.T) {
 	captureSlog(t)
 	pt := newProgressTicker(context.Background(), time.Hour, "tbl")
-	pt.Stop(context.Background())
-	pt.Stop(context.Background()) // must not panic on close-of-closed-channel
+	pt.Stop(context.Background(), nil)
+	pt.Stop(context.Background(), nil) // must not panic on close-of-closed-channel
 }
 
 // TestProgressTicker_PeriodicTickEmitsLine verifies the background
@@ -76,7 +105,7 @@ func TestProgressTicker_PeriodicTickEmitsLine(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	close(stop)
 	wg.Wait()
-	pt.Stop(context.Background())
+	pt.Stop(context.Background(), nil)
 
 	out := logs.String()
 	if !strings.Contains(out, "bulk copy progress") {
