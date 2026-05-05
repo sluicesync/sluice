@@ -146,6 +146,41 @@ type ChangeApplier interface {
 	RequestStop(ctx context.Context, streamID string) error
 }
 
+// BatchedChangeApplier is an optional extension of [ChangeApplier]
+// for engines that can apply N changes in a single target
+// transaction. The Streamer probes for this via type assertion;
+// engines that don't implement it fall back to per-change
+// [ChangeApplier.Apply].
+//
+// Idempotency is preserved per ADR-0010: replay of any prefix of
+// the change stream still produces the same final state via the
+// existing ON CONFLICT / ON DUPLICATE KEY UPDATE semantics on
+// Insert and the zero-rows-affected tolerance on Update / Delete.
+// Position-and-data atomicity is preserved per ADR-0007: the
+// position of the last applied change in a batch is written in
+// the same target transaction as the batch's data writes, so a
+// crash mid-batch rolls back both.
+//
+// See ADR-0017 for the batched-commit design rationale.
+type BatchedChangeApplier interface {
+	ChangeApplier
+
+	// ApplyBatch consumes Change events from the channel and applies
+	// them in batches of up to maxBatchSize per target transaction.
+	// The position write of the last applied change in each batch
+	// happens inside the same transaction as the data writes.
+	//
+	// A batch flushes early when the channel closes (clean
+	// shutdown), when ctx is cancelled, when a target write fails,
+	// or when a [Truncate] event is encountered (schema-changing
+	// events apply alone so any column-type cache invalidation is
+	// scoped to that change).
+	//
+	// maxBatchSize <= 1 falls back to per-change semantics
+	// (equivalent to [ChangeApplier.Apply]).
+	ApplyBatch(ctx context.Context, streamID string, changes <-chan Change, maxBatchSize int) error
+}
+
 // StreamStatus is the operational snapshot of one row in the
 // per-target sluice_cdc_state control table. Returned by
 // [ChangeApplier.ListStreams] for the `sluice sync status` command.

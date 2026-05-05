@@ -98,6 +98,26 @@ type Streamer struct {
 	// rare case of bulk-copying into a populated table. Ignored on
 	// the warm-resume path — that branch doesn't bulk-copy.
 	ForceColdStart bool
+
+	// ApplyBatchSize is the upper bound on changes per target
+	// transaction. 0 or 1 means one-change-per-tx (the conservative
+	// v0.3.x default). Larger values amortise per-tx commit
+	// overhead at the cost of a larger replay-on-crash window. The
+	// applier's idempotent semantics (ADR-0010) make the replay
+	// safe; the position-and-data atomicity (ADR-0007) is preserved
+	// per batch — the position of the last applied change in a
+	// batch is written in the same tx as the batch's data writes.
+	//
+	// Schema-change events (Truncate today; AddColumn / DropColumn
+	// when the IR grows them) flush the in-progress batch and
+	// apply alone so the applier's column-type cache is scoped per
+	// schema epoch. The cap is an upper bound, not a target —
+	// small streams don't accumulate.
+	//
+	// Engines that don't implement [ir.BatchedChangeApplier] fall
+	// back to per-change Apply regardless of this field; in
+	// practice every shipping engine implements it (see ADR-0017).
+	ApplyBatchSize int
 }
 
 // Run executes a snapshot+CDC stream. See [Streamer] for the full
@@ -174,13 +194,40 @@ func (s *Streamer) Run(ctx context.Context) error {
 	s.startStopSignalPoll(applyCtx, applier, streamID, cancelApply)
 
 	filtered := filterChanges(applyCtx, changes, s.Filter)
-	if err := applier.Apply(applyCtx, streamID, filtered); err != nil {
+	if err := s.dispatchApply(applyCtx, applier, streamID, filtered); err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return nil
 		}
 		return wrapWithHint(PhaseCDC, fmt.Errorf("pipeline: apply changes: %w", err))
 	}
 	return nil
+}
+
+// dispatchApply routes the change channel to the applier's batched
+// or per-change Apply path. When ApplyBatchSize > 1 and the applier
+// implements [ir.BatchedChangeApplier], the batched path runs;
+// otherwise the per-change path runs (preserving v0.3.x semantics
+// bit-for-bit).
+//
+// The optional-interface probe means engines that don't yet
+// implement the batched form keep working — type assertion fails
+// silently and we fall through to Apply. ADR-0017 covers the
+// design choice.
+func (s *Streamer) dispatchApply(ctx context.Context, applier ir.ChangeApplier, streamID string, changes <-chan ir.Change) error {
+	if s.ApplyBatchSize > 1 {
+		if batched, ok := applier.(ir.BatchedChangeApplier); ok {
+			slog.DebugContext(ctx, "applier: batched apply enabled",
+				slog.String("stream_id", streamID),
+				slog.Int("apply_batch_size", s.ApplyBatchSize),
+			)
+			return batched.ApplyBatch(ctx, streamID, changes, s.ApplyBatchSize)
+		}
+		slog.WarnContext(ctx, "applier: --apply-batch-size requested but applier does not implement BatchedChangeApplier; falling back to per-change apply",
+			slog.String("stream_id", streamID),
+			slog.Int("apply_batch_size", s.ApplyBatchSize),
+		)
+	}
+	return applier.Apply(ctx, streamID, changes)
 }
 
 // startStopSignalPoll wires the optional stop-signal poll goroutine
