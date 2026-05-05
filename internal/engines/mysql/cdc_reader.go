@@ -250,6 +250,15 @@ func (r *CDCReader) resolveStartPosition(ctx context.Context, from ir.Position) 
 		return binlogPos{}, err
 	}
 	if ok {
+		// Pre-flight: confirm the source still has the WAL/binlog
+		// referenced by the persisted position (file/pos: file
+		// present in SHOW BINARY LOGS; GTID: gtid_purged ⊆ resume
+		// set). When the check fails, wrap with [ir.ErrPositionInvalid]
+		// so the pipeline orchestrator falls through to cold-start
+		// (ADR-0022). The wrap message stays engine-specific.
+		if err := r.verifyPositionResumable(ctx, decoded); err != nil {
+			return binlogPos{}, err
+		}
 		return decoded, nil
 	}
 
@@ -635,6 +644,103 @@ func send(ctx context.Context, out chan<- ir.Change, c ir.Change) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// verifyPositionResumable confirms that the source still has the
+// WAL/binlog data referenced by p. Returns an error wrapping
+// [ir.ErrPositionInvalid] when the persisted position can't be
+// resumed from — typically because the binlog file has been purged
+// (file/pos mode) or the source's gtid_purged advanced past GTIDs
+// the resume set hasn't consumed (GTID mode).
+//
+// The pipeline orchestrator detects the wrap via [errors.Is] and
+// falls through to cold-start (ADR-0022). Empty/auto-detect
+// positions don't reach this helper — the resolveStartPosition
+// caller short-circuits before calling it.
+func (r *CDCReader) verifyPositionResumable(ctx context.Context, p binlogPos) error {
+	switch p.Mode {
+	case positionModeFilePos:
+		return verifyBinlogFilePresent(ctx, r.db, p.File)
+	case positionModeGTID:
+		return verifyGTIDSetReachable(ctx, r.db, p.GTIDSet)
+	default:
+		return fmt.Errorf("mysql: cannot verify position with mode %q", p.Mode)
+	}
+}
+
+// verifyBinlogFilePresent checks that the named binlog file is in
+// the source's SHOW BINARY LOGS output. Returns ErrPositionInvalid-
+// wrapped when the file is missing — the typical "binlog purged"
+// surface. SHOW BINARY LOGS' column count varies across versions
+// (2 columns pre-8.0.14; 3 with Encrypted in 8.0.14+); we only read
+// the first column (Log_name).
+func verifyBinlogFilePresent(ctx context.Context, db *sql.DB, file string) error {
+	rows, err := db.QueryContext(ctx, "SHOW BINARY LOGS")
+	if err != nil {
+		return fmt.Errorf("mysql: SHOW BINARY LOGS: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	cols, err := rows.Columns()
+	if err != nil {
+		return fmt.Errorf("mysql: SHOW BINARY LOGS columns: %w", err)
+	}
+
+	holders := make([]any, len(cols))
+	dest := make([]any, len(cols))
+	for i := range dest {
+		holders[i] = &dest[i]
+	}
+
+	for rows.Next() {
+		if err := rows.Scan(holders...); err != nil {
+			return fmt.Errorf("mysql: SHOW BINARY LOGS scan: %w", err)
+		}
+		name, ok := scanString(dest[0])
+		if !ok {
+			continue
+		}
+		if name == file {
+			return rows.Err()
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("mysql: SHOW BINARY LOGS rows: %w", err)
+	}
+	return fmt.Errorf("mysql: binlog file %q is no longer available on the source (purged); cannot resume: %w",
+		file, ir.ErrPositionInvalid)
+}
+
+// verifyGTIDSetReachable checks that the source's @@gtid_purged is
+// a subset of the resume set. Equivalent to: every purged GTID has
+// already been consumed by us. If a purged GTID is NOT in the resume
+// set, it sits in (E - R) ∩ P — needed-but-purged — and the stream
+// would skip data on resume.
+//
+// `GTID_SUBSET(@@gtid_purged, ?)` returns 1 when every purged GTID
+// is within the supplied set, 0 otherwise. The empty-string resume
+// set short-circuits to "all of gtid_purged is unknown to us" —
+// callers that hit this helper always passed a non-empty decoded set.
+func verifyGTIDSetReachable(ctx context.Context, db *sql.DB, resumeSet string) error {
+	if strings.TrimSpace(resumeSet) == "" {
+		// Defensive: the caller's decoded position should always
+		// carry a set in GTID mode, but be explicit about not
+		// silently passing an empty check.
+		return fmt.Errorf("mysql: cannot verify empty GTID resume set: %w", ir.ErrPositionInvalid)
+	}
+	var subset int
+	err := db.QueryRowContext(ctx,
+		"SELECT GTID_SUBSET(@@global.gtid_purged, ?)",
+		resumeSet,
+	).Scan(&subset)
+	if err != nil {
+		return fmt.Errorf("mysql: GTID_SUBSET(@@gtid_purged, resume): %w", err)
+	}
+	if subset == 1 {
+		return nil
+	}
+	return fmt.Errorf("mysql: source has purged GTIDs not present in resume set; cannot resume: %w",
+		ir.ErrPositionInvalid)
 }
 
 // gtidModeOn queries the source's gtid_mode variable. ON, ON_PERMISSIVE,

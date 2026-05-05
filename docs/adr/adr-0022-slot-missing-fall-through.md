@@ -2,7 +2,12 @@
 
 ## Status
 
-Accepted. Implemented in `internal/ir/interfaces.go` (`ErrPositionInvalid` sentinel), `internal/engines/postgres/cdc_reader.go::resolveStartPosition` (wraps the slot-missing branch with `ErrPositionInvalid`), and `internal/pipeline/streamer.go::Run` (catches the sentinel from `warmResume`, logs a WARN, falls through to `coldStart`).
+Accepted. Implemented in:
+
+- `internal/ir/change.go` — `ErrPositionInvalid` sentinel (v0.5.2).
+- `internal/engines/postgres/cdc_reader.go::resolveStartPosition` — wraps the slot-missing branch with `ErrPositionInvalid` (v0.5.2).
+- `internal/engines/mysql/cdc_reader.go::resolveStartPosition` — pre-flights the persisted position via `verifyPositionResumable`, wraps with `ErrPositionInvalid` for missing binlog file (file/pos mode) or purged GTIDs (GTID mode) (v0.6.0).
+- `internal/pipeline/streamer.go::Run` — catches the sentinel from `warmResume`, logs a WARN, falls through to `coldStart` (v0.5.2; engine-neutral by design).
 
 ## Context
 
@@ -58,7 +63,7 @@ Only the **slot-missing** branch of `resolveStartPosition` returns `ir.ErrPositi
 
 - **Persisted-position cleanup is implicit, not explicit.** No DELETE step. Cold-start overwrites the stale row when it writes its own first position. If the operator wants to inspect the stale state for debugging before re-running, the row is still there.
 
-- **Other engines can opt into the same contract.** MySQL CDC readers can return `ir.ErrPositionInvalid` when the binlog file is purged; the streamer's fall-through path will work identically. v0.5.2 implements only the PG slot path; MySQL binlog-purged is a future chunk.
+- **Other engines can opt into the same contract.** v0.5.2 implements only the PG slot path. **v0.6.0 extends the contract to MySQL**: `verifyPositionResumable` runs as a pre-flight in the binlog reader's `resolveStartPosition`, returning `ir.ErrPositionInvalid`-wrapped errors when (a) file/pos mode and the named binlog file is missing from `SHOW BINARY LOGS`, or (b) GTID mode and `@@gtid_purged` contains GTIDs absent from the resume set (`GTID_SUBSET(@@gtid_purged, ?) = 0`). The streamer's fall-through path is unchanged — engine-neutrality means the per-engine wrap text differs but the recovery flow is identical.
 
 - **Bug 15's recovery procedure benefits.** Bug 15's manual recovery (described in BUG-CATALOG.md) follows the same shape: drop slot + clear state + drop tables + cold-start. Option B reduces it to drop slot + cold-start, with `--force-cold-start` for the dest-data step.
 

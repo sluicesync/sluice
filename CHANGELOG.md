@@ -6,6 +6,82 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Data race in parallel-copy state-write path.** v0.5.0's
+  `migrate_parallel.go::copyChunk` checkpoint sites took `stateMu`,
+  mutated their slot in `state.TableProgress`, then did a shallow
+  copy `stateCopy := *state` and released the lock before calling
+  `writeState`. The shallow copy left `stateCopy.TableProgress`
+  pointing at the same map backing storage as `state`, so the JSON
+  encoder iterating outside the lock raced peer chunk goroutines
+  taking the lock to mutate their own slots. Surfaced as a CI -race
+  failure in `TestMigrate_PG_ParallelCopy_Resume` for the v0.5.x
+  releases.
+
+  Fix: a `cloneStateForWrite` helper re-allocates the
+  `TableProgress` map and each entry's `Chunks` slice under the
+  lock; the encoder gets a fully independent snapshot. Per-chunk
+  reference fields (`LowerPK`/`UpperPK`/`LastPK`) are not deep-
+  cloned because they're either written once at resolution time or
+  replaced wholesale (not mutated in place) on each checkpoint.
+  Pre-existing behaviour preserved bit-for-bit; the fix is sync-
+  primitive-only.
+
+### Added
+
+- **Batched-apply idle flush on quiet streams.** Closes the trailing-
+  row latency footnote from ADR-0020. The batched applier now commits
+  a partial in-flight batch (n < `--apply-batch-size`) within
+  `defaultIdleFlushPeriod` (5s) when no further change arrives. On
+  Postgres this lets the slot's `confirmed_flush_lsn` advance past
+  in-flight work on idle streams, so warm-resume from a quiet stream
+  starts at the most recent commit rather than the previous full
+  batch boundary; on MySQL the same logic keeps `source_position`
+  current so the replay window on warm-resume stays bounded. Both
+  engines use the same 5s default for symmetry. Existing flush
+  triggers (channel close, Truncate, ctx cancel) are unchanged; idle
+  flush is purely additive. Integration test:
+  `TestChangeApplier_ApplyBatch_IdleFlushCommitsPartial` (PG;
+  partial-batch persistence on MySQL was already covered by
+  `TestChangeApplier_ApplyBatch_PartialFlushPersistsPosition`).
+
+- **MySQL binlog-purged fall-through to cold-start.** Extends the
+  v0.5.2 PG slot-missing recovery to the MySQL side. The MySQL CDC
+  reader's `resolveStartPosition` now pre-flights the persisted
+  position before handing off to go-mysql's binlog syncer:
+  - **File/pos mode**: queries `SHOW BINARY LOGS` and checks the
+    persisted file is still present. If missing (typical when
+    `expire_logs_seconds` rolled it off, or an operator ran
+    `PURGE BINARY LOGS`), returns
+    `mysql: binlog file %q is no longer available on the source
+    (purged); cannot resume: ir: persisted position is no longer
+    valid`.
+  - **GTID mode**: runs `SELECT GTID_SUBSET(@@gtid_purged, ?)` with
+    the resume set. Returns 0 when the source has purged GTIDs the
+    resume set hasn't consumed — meaning we'd be missing data on
+    resume — and surfaces `mysql: source has purged GTIDs not
+    present in resume set; cannot resume`.
+
+  Both branches wrap with `ir.ErrPositionInvalid`; the streamer's
+  existing v0.5.2 fall-through (added engine-neutrally) detects the
+  sentinel and re-enters `coldStart` with the same `lsnTracker`.
+  No new code in the pipeline package; the engine-neutrality of the
+  v0.5.2 design pays off here. ADR-0022 extended.
+
+  Pre-fix shape: a sluice stream restarted after the source's
+  binlog had rotated past the persisted file would surface
+  go-mysql's raw "Could not find first log file name in binary log
+  index file" error mid-stream. Post-fix: the WARN fires at startup,
+  cold-start runs, dest is reseeded.
+
+  Integration test:
+  `TestStreamer_MySQLToMySQL_BinlogPurgedFallsThroughToColdStart`
+  exercises the file/pos branch end-to-end. GTID branch is covered
+  by the same `verifyPositionResumable` dispatch and the SQL-side
+  semantics of `GTID_SUBSET` (no separate integration test;
+  GTID-mode setups are tested elsewhere in the resume coverage).
+
 ## [0.5.2] - 2026-05-05
 
 Single-feature patch release closing Item F from the v0.4.0

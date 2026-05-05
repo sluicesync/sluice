@@ -43,9 +43,24 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/orware/sluice/internal/ir"
 )
+
+// defaultIdleFlushPeriod bounds the wait between the last applied
+// change in an in-flight batch and that batch's commit. Without an
+// idle flush, a partial batch (n < maxBatchSize) would sit in memory
+// until either the channel closes or the next event arrives — which
+// on a quiet stream means the slot's confirmed_flush_lsn never
+// advances past the last *full* batch. ADR-0020's "trailing-row
+// latency" footnote.
+//
+// 5s matches the keepalive round-trip headroom: the next standby
+// status update sends the freshly-committed appliedLSN, the slot
+// advances, and warm-resume from a quiet stream now starts from the
+// most recent commit rather than the previous batch boundary.
+const defaultIdleFlushPeriod = 5 * time.Second
 
 // ApplyBatch implements [ir.BatchedChangeApplier]. See the file-
 // header comment for the design and invariants.
@@ -142,6 +157,13 @@ func (a *ChangeApplier) applyOneBatch(ctx context.Context, streamID string, chan
 		return n, lastPos, false, a.commitBatch(ctx, tx, streamID, lastPos.Token, n)
 	}
 
+	// Idle-flush timer: if no further change arrives within
+	// defaultIdleFlushPeriod, commit the partial batch so the slot's
+	// confirmed_flush_lsn can advance past the in-flight work
+	// (ADR-0020 trailing-row latency footnote).
+	idle := time.NewTimer(defaultIdleFlushPeriod)
+	defer idle.Stop()
+
 	for n < maxBatchSize {
 		select {
 		case c, ok := <-changes:
@@ -163,6 +185,23 @@ func (a *ChangeApplier) applyOneBatch(ctx context.Context, streamID string, chan
 			if _, isTruncate := c.(ir.Truncate); isTruncate {
 				return n, lastPos, false, a.commitBatch(ctx, tx, streamID, lastPos.Token, n)
 			}
+			// Reset the idle timer for each successful change so the
+			// timer measures gaps between events, not absolute time
+			// since first.
+			if !idle.Stop() {
+				select {
+				case <-idle.C:
+				default:
+				}
+			}
+			idle.Reset(defaultIdleFlushPeriod)
+		case <-idle.C:
+			slog.DebugContext(ctx, "postgres: applier: idle flush",
+				slog.String("stream_id", streamID),
+				slog.Int("rows", n),
+				slog.Duration("idle", defaultIdleFlushPeriod),
+			)
+			return n, lastPos, false, a.commitBatch(ctx, tx, streamID, lastPos.Token, n)
 		case <-ctx.Done():
 			_ = tx.Rollback()
 			return 0, ir.Position{}, false, ctx.Err()

@@ -344,6 +344,119 @@ func TestChangeApplier_ApplyBatch_CtxCancelRollsBack(t *testing.T) {
 	}
 }
 
+// TestChangeApplier_ApplyBatch_IdleFlushCommitsPartial confirms the
+// trailing-row-latency fix: a partial batch (n < maxBatchSize) on a
+// quiet stream commits within defaultIdleFlushPeriod even when the
+// channel hasn't closed and no Truncate has arrived.
+//
+// Pre-fix shape: the applier waited indefinitely for either
+// maxBatchSize, channel close, or a Truncate. A 3-of-100 batch sat
+// in memory; the slot's confirmed_flush_lsn never advanced past the
+// last full batch (PG, ADR-0020 trailing-row-latency footnote). On
+// warm-resume from a quiet stream, the slot would replay from a
+// stale boundary.
+//
+// Post-fix: an idle timer (5s default) commits the partial batch.
+// This test feeds 3 changes through an open channel (kept open!),
+// waits one idle window plus headroom, and asserts both the rows
+// landed AND the persisted position advanced — both load-bearing
+// signals that the partial batch committed.
+func TestChangeApplier_ApplyBatch_IdleFlushCommitsPartial(t *testing.T) {
+	dsn, cleanup := startPostgresForApplier(t)
+	defer cleanup()
+
+	applyPGApplier(t, dsn, `
+		CREATE TABLE users (
+			id    BIGINT       PRIMARY KEY,
+			email VARCHAR(255) NOT NULL
+		);
+	`)
+
+	parentCtx, cancelParent := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancelParent()
+
+	eng := Engine{}
+	applier, err := eng.OpenChangeApplier(parentCtx, dsn)
+	if err != nil {
+		t.Fatalf("OpenChangeApplier: %v", err)
+	}
+	defer func() {
+		if c, ok := applier.(interface{ Close() error }); ok {
+			_ = c.Close()
+		}
+	}()
+	if err := applier.EnsureControlTable(parentCtx); err != nil {
+		t.Fatalf("EnsureControlTable: %v", err)
+	}
+
+	batched, ok := applier.(ir.BatchedChangeApplier)
+	if !ok {
+		t.Fatalf("applier does not implement BatchedChangeApplier")
+	}
+
+	const lastToken = "idle-flush-last"
+	events := []ir.Change{
+		ir.Insert{Position: ir.Position{Token: "p1"}, Schema: "public", Table: "users", Row: ir.Row{"id": int64(1), "email": "a@x"}},
+		ir.Insert{Position: ir.Position{Token: "p2"}, Schema: "public", Table: "users", Row: ir.Row{"id": int64(2), "email": "b@x"}},
+		ir.Insert{Position: ir.Position{Token: lastToken}, Schema: "public", Table: "users", Row: ir.Row{"id": int64(3), "email": "c@x"}},
+	}
+
+	ch := make(chan ir.Change, len(events))
+	for _, e := range events {
+		ch <- e
+	}
+	// IMPORTANT: do NOT close the channel. The pre-fix path would
+	// commit on close; we want to assert idle-flush fires on its
+	// own.
+
+	applyCtx, cancelApply := context.WithCancel(parentCtx)
+	defer cancelApply()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- batched.ApplyBatch(applyCtx, testStreamID, ch, 100)
+	}()
+
+	// Wait for one idle-flush window plus headroom. The applier's
+	// `applyOneBatch` will dispatch all 3 changes (sub-millisecond),
+	// then sit on the select with the idle timer running. After 5s
+	// the timer fires and commitBatch runs.
+	time.Sleep(7 * time.Second)
+
+	// Rows landed (the in-flight tx committed).
+	if got := countAllRows(t, dsn, "users"); got != 3 {
+		cancelApply()
+		<-done
+		t.Errorf("after idle flush: rows = %d; want 3", got)
+	}
+
+	// Position advanced to the last applied change's token.
+	pos, found, err := applier.ReadPosition(parentCtx, testStreamID)
+	if err != nil {
+		cancelApply()
+		<-done
+		t.Fatalf("ReadPosition: %v", err)
+	}
+	if !found {
+		cancelApply()
+		<-done
+		t.Fatal("ReadPosition: no row found; idle-flush did not persist the partial batch")
+	}
+	if pos.Token != lastToken {
+		cancelApply()
+		<-done
+		t.Errorf("position token = %q; want %q (last applied change in partial batch)", pos.Token, lastToken)
+	}
+
+	// Cancel and drain so the goroutine exits cleanly.
+	cancelApply()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Error("ApplyBatch did not return after ctx cancel post-idle-flush")
+	}
+}
+
 // emailForInt returns a deterministic email address for the bulk-
 // insert tests above.
 func emailForInt(i int64) string {

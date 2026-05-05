@@ -44,9 +44,24 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/orware/sluice/internal/ir"
 )
+
+// defaultIdleFlushPeriod bounds the wait between the last applied
+// change in an in-flight batch and that batch's commit. Without an
+// idle flush, a partial batch (n < maxBatchSize) would sit in memory
+// until either the channel closes or the next event arrives — which
+// on a quiet stream means the persisted source_position never
+// advances past the last *full* batch, lengthening the replay
+// window on warm-resume.
+//
+// MySQL has no slot-ack equivalent of PG's confirmed_flush_lsn (the
+// binlog retention is server-wide, not per-consumer), but the
+// replay-window argument applies the same way. 5s matches PG for
+// consistency.
+const defaultIdleFlushPeriod = 5 * time.Second
 
 // ApplyBatch implements [ir.BatchedChangeApplier]. See the file-
 // header comment for the design and invariants.
@@ -158,6 +173,13 @@ func (a *ChangeApplier) applyOneBatch(ctx context.Context, streamID string, chan
 	n = 1
 	lastPos = first.Pos()
 
+	// Idle-flush timer: commit a partial batch if no further change
+	// arrives within defaultIdleFlushPeriod, so the persisted
+	// source_position keeps current on quiet streams (matches PG;
+	// see PG's change_applier_batch.go for the reasoning).
+	idle := time.NewTimer(defaultIdleFlushPeriod)
+	defer idle.Stop()
+
 	for n < maxBatchSize {
 		select {
 		case c, ok := <-changes:
@@ -199,6 +221,20 @@ func (a *ChangeApplier) applyOneBatch(ctx context.Context, streamID string, chan
 			}
 			n++
 			lastPos = c.Pos()
+			if !idle.Stop() {
+				select {
+				case <-idle.C:
+				default:
+				}
+			}
+			idle.Reset(defaultIdleFlushPeriod)
+		case <-idle.C:
+			slog.DebugContext(ctx, "mysql: applier: idle flush",
+				slog.String("stream_id", streamID),
+				slog.Int("rows", n),
+				slog.Duration("idle", defaultIdleFlushPeriod),
+			)
+			return n, lastPos, false, a.commitBatch(ctx, tx, streamID, lastPos.Token, n)
 		case <-ctx.Done():
 			_ = tx.Rollback()
 			return 0, ir.Position{}, false, ctx.Err()
