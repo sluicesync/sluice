@@ -25,6 +25,7 @@ package pipeline
 import (
 	"context"
 	"database/sql"
+	"strings"
 	"testing"
 	"time"
 
@@ -267,6 +268,155 @@ func TestMigrate_MySQLToPostgres_CheckConstraints(t *testing.T) {
 		`INSERT INTO orders (id, status, qty) VALUES (5, 'open', 3)`); err != nil {
 		t.Errorf("INSERT with valid values should have been accepted on pg target; got: %v", err)
 	}
+}
+
+// TestMigrate_PostgresToMySQL_CheckConstraintTranslation exercises
+// the cross-engine expression-translation pass: PG's `~~` LIKE
+// operator and `= ANY(ARRAY[...])` IN-list form are non-portable to
+// MySQL. The writer-boundary translator rewrites them to MySQL's
+// LIKE and IN(...) forms. See ADR-0016 for the layered translation
+// policy.
+func TestMigrate_PostgresToMySQL_CheckConstraintTranslation(t *testing.T) {
+	pgSource, _, pgCleanup := startPostgres(t)
+	defer pgCleanup()
+
+	_, mysqlTarget, mysqlCleanup := startMySQL(t)
+	defer mysqlCleanup()
+
+	// `email LIKE '%@%'` parses as `email ~~ '%@%'` in pg_get_expr.
+	// `status IN ('open','closed','cancelled')` parses as
+	// `status = ANY (ARRAY['open'::text, 'closed'::text, 'cancelled'::text])`
+	// in pg_get_expr. Both are PG-internal canonical forms that the
+	// MySQL parser would reject without translation.
+	const seedDDL = `
+		CREATE TABLE accounts (
+			id     BIGINT      NOT NULL PRIMARY KEY,
+			email  VARCHAR(255) NOT NULL CHECK (email LIKE '%@%'),
+			status VARCHAR(20) NOT NULL CHECK (status IN ('open', 'closed', 'cancelled'))
+		);
+
+		INSERT INTO accounts (id, email, status) VALUES
+			(1, 'alice@example.com', 'open'),
+			(2, 'bob@example.com',   'closed');
+	`
+	applyPGDDL(t, pgSource, seedDDL)
+
+	pgEng, ok := engines.Get("postgres")
+	if !ok {
+		t.Fatal("postgres engine not registered")
+	}
+	mysqlEng, ok := engines.Get("mysql")
+	if !ok {
+		t.Fatal("mysql engine not registered")
+	}
+
+	mig := &Migrator{
+		Source:    pgEng,
+		Target:    mysqlEng,
+		SourceDSN: pgSource,
+		TargetDSN: mysqlTarget,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	if err := mig.Run(ctx); err != nil {
+		t.Fatalf("Migrator.Run: %v", err)
+	}
+
+	tgt, err := sql.Open("mysql", mysqlTarget)
+	if err != nil {
+		t.Fatalf("open mysql target: %v", err)
+	}
+	defer func() { _ = tgt.Close() }()
+
+	// Both CHECKs landed on the MySQL target.
+	checkClauses := readMySQLCheckClauses(t, ctx, tgt, "accounts")
+	if len(checkClauses) < 2 {
+		t.Fatalf("mysql target check_constraints for accounts: got %d (%v); want >= 2",
+			len(checkClauses), checkClauses)
+	}
+	// At least one clause must contain LIKE (translated from ~~) and
+	// at least one must contain IN ( (translated from = ANY(ARRAY[...])).
+	var sawLike, sawIN bool
+	for _, c := range checkClauses {
+		lower := strings.ToLower(c)
+		if strings.Contains(lower, "like") {
+			sawLike = true
+		}
+		if strings.Contains(lower, " in (") || strings.Contains(lower, " in(") {
+			sawIN = true
+		}
+		if strings.Contains(lower, "~~") {
+			t.Errorf("mysql target CHECK still contains ~~ operator: %q", c)
+		}
+		if strings.Contains(lower, "= any") {
+			t.Errorf("mysql target CHECK still contains = ANY: %q", c)
+		}
+	}
+	if !sawLike {
+		t.Errorf("mysql target accounts: no CHECK contains LIKE; clauses=%v", checkClauses)
+	}
+	if !sawIN {
+		t.Errorf("mysql target accounts: no CHECK contains IN (...); clauses=%v", checkClauses)
+	}
+
+	// Pre-existing valid rows survived.
+	var n int
+	if err := tgt.QueryRowContext(ctx, "SELECT COUNT(*) FROM accounts").Scan(&n); err != nil {
+		t.Fatalf("count accounts: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("accounts row count = %d; want 2", n)
+	}
+
+	// Constraint enforcement: invalid email rejected.
+	if _, err := tgt.ExecContext(ctx,
+		`INSERT INTO accounts (id, email, status) VALUES (3, 'no-at-sign', 'open')`); err == nil {
+		t.Errorf("INSERT with email lacking @ should have been rejected")
+	}
+	// Constraint enforcement: invalid status rejected.
+	if _, err := tgt.ExecContext(ctx,
+		`INSERT INTO accounts (id, email, status) VALUES (4, 'x@y.com', 'bogus')`); err == nil {
+		t.Errorf("INSERT with bogus status should have been rejected")
+	}
+	// A valid row is accepted.
+	if _, err := tgt.ExecContext(ctx,
+		`INSERT INTO accounts (id, email, status) VALUES (5, 'c@d.com', 'open')`); err != nil {
+		t.Errorf("INSERT with valid values should have been accepted; got: %v", err)
+	}
+}
+
+// readMySQLCheckClauses returns the check-clause text of every CHECK
+// constraint on a table. Used by the translation tests to assert on
+// the expression body, not just the constraint count.
+func readMySQLCheckClauses(t *testing.T, ctx context.Context, db *sql.DB, table string) []string {
+	t.Helper()
+	const q = `
+		SELECT cc.check_clause
+		FROM   information_schema.check_constraints cc
+		JOIN   information_schema.table_constraints  tc
+		  ON   tc.constraint_schema = cc.constraint_schema
+		 AND   tc.constraint_name   = cc.constraint_name
+		WHERE  tc.table_schema    = DATABASE()
+		  AND  tc.table_name      = ?
+		  AND  tc.constraint_type = 'CHECK'
+		ORDER  BY cc.constraint_name`
+	rows, err := db.QueryContext(ctx, q, table)
+	if err != nil {
+		t.Fatalf("read mysql check clauses: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []string
+	for rows.Next() {
+		var clause string
+		if err := rows.Scan(&clause); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		out = append(out, clause)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows iteration: %v", err)
+	}
+	return out
 }
 
 // readMySQLCheckNames returns the names of CHECK constraints on a
