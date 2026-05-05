@@ -289,29 +289,55 @@ func markComplete(ctx context.Context, rc resumeContext, state ir.MigrationState
 }
 
 // resumeBulkCopyAction is the per-table action the bulk-copy phase
-// takes during resume. Three values map to the three resume cases:
-// skip a completed table, truncate-and-redo an in-progress table,
-// start fresh on a missing-from-progress table.
+// takes during resume. Four values cover the resume cases:
+// skip a completed table, truncate-and-redo an in-progress no-PK
+// table (or a v0.3.0-shape row), resume mid-table from a recorded
+// cursor (v0.4.0), start fresh on a missing-from-progress table.
 type resumeBulkCopyAction int
 
 const (
-	resumeActionFresh    resumeBulkCopyAction = iota // not in progress map → start fresh
-	resumeActionSkip                                 // table_progress[name] == complete → skip
-	resumeActionTruncate                             // table_progress[name] == in_progress → truncate and redo
+	resumeActionFresh            resumeBulkCopyAction = iota // not in progress map → start fresh
+	resumeActionSkip                                         // state=complete → skip
+	resumeActionTruncate                                     // state=in_progress without cursor, or state=no_pk_truncate_and_redo → truncate and redo
+	resumeActionResumeFromCursor                             // state=in_progress with non-empty LastPK → resume mid-table
 )
 
 // classifyTableForResume picks the action for a table during a
 // resume run. When resume is disabled (fresh run or store-less
 // engine), every table is "fresh" — the orchestrator's normal
 // behaviour.
+//
+// During a resume, the action depends on the persisted state plus the
+// presence of a cursor:
+//
+//   - State `complete`  → skip (no work to do).
+//   - State `in_progress` with a non-nil LastPK (v0.4.0 cursor-bearing
+//     row) → caller should resume mid-table from the cursor.
+//   - State `in_progress` with nil LastPK (v0.3.0 row, or v0.4.0 row
+//     written before any batch landed) → truncate-and-redo.
+//   - State `no_pk_truncate_and_redo` → truncate-and-redo (sticky
+//     fallback for tables without a primary key).
+//   - Missing key → fresh start.
 func classifyTableForResume(state ir.MigrationState, tableName string, resuming bool) resumeBulkCopyAction {
 	if !resuming {
 		return resumeActionFresh
 	}
-	switch state.TableProgress[tableName] {
+	entry, ok := state.TableProgress[tableName]
+	if !ok {
+		return resumeActionFresh
+	}
+	switch entry.State {
 	case ir.TableProgressComplete:
 		return resumeActionSkip
+	case ir.TableProgressNoPKTruncateAndRedo:
+		return resumeActionTruncate
 	case ir.TableProgressInProgress:
+		if len(entry.LastPK) > 0 {
+			return resumeActionResumeFromCursor
+		}
+		// v0.3.0-shape row, or a v0.4.0 row that failed before any
+		// batch committed: no cursor to resume from. Fall back to
+		// truncate-and-redo.
 		return resumeActionTruncate
 	}
 	return resumeActionFresh
@@ -335,10 +361,15 @@ func truncateForResume(ctx context.Context, rw ir.RowWriter, table *ir.Table) er
 // operator gets a one-glance view of what resume is about to do.
 func summariseTableProgress(schema *ir.Schema, state ir.MigrationState) (complete, inProgress, missing int) {
 	for _, t := range schema.Tables {
-		switch state.TableProgress[t.Name] {
+		entry, ok := state.TableProgress[t.Name]
+		if !ok {
+			missing++
+			continue
+		}
+		switch entry.State {
 		case ir.TableProgressComplete:
 			complete++
-		case ir.TableProgressInProgress:
+		case ir.TableProgressInProgress, ir.TableProgressNoPKTruncateAndRedo:
 			inProgress++
 		default:
 			missing++

@@ -120,6 +120,19 @@ type Migrator struct {
 	// to have data, so the pre-flight doesn't run on that path
 	// regardless of this flag.
 	ForceColdStart bool
+
+	// BulkBatchSize controls the per-batch row count for the
+	// resume-mid-table checkpointing path (see ADR-0018). Each batch
+	// commits with an updated cursor in
+	// sluice_migrate_state.table_progress, so a crash mid-table
+	// resumes without re-copying the prefix. Tables without a PK
+	// fall back to truncate-and-redo regardless.
+	//
+	// Zero means use the default (5000). The value is only consulted
+	// on the resume path — non-resume cold-start migrations use the
+	// faster plain-INSERT / COPY-protocol path with no per-batch
+	// checkpointing overhead.
+	BulkBatchSize int
 }
 
 // Run executes the migration. Returns nil on success or a wrapped
@@ -221,7 +234,7 @@ func (m *Migrator) Run(ctx context.Context) error {
 		}
 	}
 
-	if err := runBulkCopyPhases(ctx, rc, &state, schema, rr, sw, rw, resuming); err != nil {
+	if err := runBulkCopyPhases(ctx, rc, &state, schema, rr, sw, rw, resuming, m.BulkBatchSize); err != nil {
 		return err
 	}
 
@@ -326,11 +339,17 @@ func runBulkCopy(
 //
 //   - tables:       re-run unconditionally (idempotent CREATE TABLE).
 //   - bulk_copy:    per-table classification (skip / truncate-redo /
-//     fresh) keyed off state.TableProgress.
+//     resume-from-cursor / fresh) keyed off state.TableProgress.
+//     Per-batch checkpointing on the cursor path; see ADR-0018.
 //   - identity_sync, indexes, constraints: re-run unconditionally.
 //     Idempotency is best-effort here; a CREATE INDEX with a clashing
 //     name will fail. Future iterations can pre-query catalog tables
 //     and skip pre-existing entries.
+//
+// bulkBatchSize is the per-batch row count for the cursor-bearing
+// resume path. Zero falls back to defaultBulkBatchSize. Ignored on
+// the cold-start (non-resume) path which uses the faster plain-INSERT
+// or COPY-protocol shape.
 func runBulkCopyPhases(
 	ctx context.Context,
 	rc resumeContext,
@@ -340,6 +359,7 @@ func runBulkCopyPhases(
 	sw ir.SchemaWriter,
 	rw ir.RowWriter,
 	resuming bool,
+	bulkBatchSize int,
 ) error {
 	// Phase 1: tables.
 	if err := markPhase(ctx, rc, state, ir.MigrationPhaseTables); err != nil {
@@ -358,43 +378,11 @@ func runBulkCopyPhases(
 		_ = err
 	}
 	if state.TableProgress == nil {
-		state.TableProgress = map[string]ir.TableProgressState{}
+		state.TableProgress = map[string]ir.TableProgress{}
 	}
 	for _, table := range schema.Tables {
-		action := classifyTableForResume(*state, table.Name, resuming)
-		switch action {
-		case resumeActionSkip:
-			slog.InfoContext(ctx, "migration: skipping completed table",
-				slog.String("table", table.Name))
-			continue
-		case resumeActionTruncate:
-			slog.InfoContext(ctx, "migration: truncating in-progress table for resume",
-				slog.String("table", table.Name))
-			if err := truncateForResume(ctx, rw, table); err != nil {
-				wrapped := fmt.Errorf("pipeline: truncate before resume: %w", err)
-				return wrapWithHint(PhaseBulkCopy, markFailed(ctx, rc, *state, ir.MigrationPhaseBulkCopy, wrapped))
-			}
-		}
-
-		// Mark this table in-progress before the copy starts so a
-		// subsequent failure leaves the right breadcrumb.
-		state.TableProgress[table.Name] = ir.TableProgressInProgress
-		if err := writeState(ctx, rc, *state); err != nil {
-			slog.WarnContext(ctx, "migration: per-table state write failed; continuing",
-				slog.String("table", table.Name),
-				slog.String("err", err.Error()))
-		}
-
-		if err := copyTable(ctx, rows, rw, table); err != nil {
-			wrapped := fmt.Errorf("pipeline: copy table %q: %w", table.Name, err)
-			return wrapWithHint(PhaseBulkCopy, markFailed(ctx, rc, *state, ir.MigrationPhaseBulkCopy, wrapped))
-		}
-
-		state.TableProgress[table.Name] = ir.TableProgressComplete
-		if err := writeState(ctx, rc, *state); err != nil {
-			slog.WarnContext(ctx, "migration: per-table state write failed; continuing",
-				slog.String("table", table.Name),
-				slog.String("err", err.Error()))
+		if err := bulkCopyOneTable(ctx, rc, state, rows, rw, table, resuming, bulkBatchSize); err != nil {
+			return err
 		}
 	}
 	slog.InfoContext(ctx, "migration: phase complete", slog.String("phase", string(ir.MigrationPhaseBulkCopy)))

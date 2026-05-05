@@ -85,9 +85,9 @@ func TestMigrationStateRoundTrip(t *testing.T) {
 	state := ir.MigrationState{
 		MigrationID: "m1",
 		Phase:       ir.MigrationPhaseBulkCopy,
-		TableProgress: map[string]ir.TableProgressState{
-			"users":  ir.TableProgressComplete,
-			"orders": ir.TableProgressInProgress,
+		TableProgress: map[string]ir.TableProgress{
+			"users":  {State: ir.TableProgressComplete},
+			"orders": {State: ir.TableProgressInProgress, LastPK: []any{int64(42)}, RowsCopied: 42},
 		},
 	}
 	if err := writeState(context.Background(), rc, state); err != nil {
@@ -101,11 +101,14 @@ func TestMigrationStateRoundTrip(t *testing.T) {
 	if got.Phase != ir.MigrationPhaseBulkCopy {
 		t.Errorf("phase = %q; want %q", got.Phase, ir.MigrationPhaseBulkCopy)
 	}
-	if got.TableProgress["users"] != ir.TableProgressComplete {
-		t.Errorf("TableProgress[users] = %q; want complete", got.TableProgress["users"])
+	if got.TableProgress["users"].State != ir.TableProgressComplete {
+		t.Errorf("TableProgress[users].State = %q; want complete", got.TableProgress["users"].State)
 	}
-	if got.TableProgress["orders"] != ir.TableProgressInProgress {
-		t.Errorf("TableProgress[orders] = %q; want in_progress", got.TableProgress["orders"])
+	if got.TableProgress["orders"].State != ir.TableProgressInProgress {
+		t.Errorf("TableProgress[orders].State = %q; want in_progress", got.TableProgress["orders"].State)
+	}
+	if got.TableProgress["orders"].RowsCopied != 42 {
+		t.Errorf("TableProgress[orders].RowsCopied = %d; want 42", got.TableProgress["orders"].RowsCopied)
 	}
 }
 
@@ -207,9 +210,11 @@ func TestLoadOrInitState_ResumeAlreadyComplete(t *testing.T) {
 // classifier keeps the orchestrator's switch honest.
 func TestResumePhaseSkipping(t *testing.T) {
 	state := ir.MigrationState{
-		TableProgress: map[string]ir.TableProgressState{
-			"users":  ir.TableProgressComplete,
-			"orders": ir.TableProgressInProgress,
+		TableProgress: map[string]ir.TableProgress{
+			"users":  {State: ir.TableProgressComplete},
+			"orders": {State: ir.TableProgressInProgress, LastPK: []any{int64(100)}, RowsCopied: 100},
+			"legacy": {State: ir.TableProgressInProgress}, // v0.3.0-shape: no cursor
+			"events": {State: ir.TableProgressNoPKTruncateAndRedo},
 		},
 	}
 	cases := []struct {
@@ -219,7 +224,9 @@ func TestResumePhaseSkipping(t *testing.T) {
 		want     resumeBulkCopyAction
 	}{
 		{"complete + resuming", "users", true, resumeActionSkip},
-		{"in_progress + resuming", "orders", true, resumeActionTruncate},
+		{"in_progress with cursor + resuming", "orders", true, resumeActionResumeFromCursor},
+		{"v0.3.0 in_progress without cursor + resuming", "legacy", true, resumeActionTruncate},
+		{"no_pk_truncate_and_redo + resuming", "events", true, resumeActionTruncate},
 		{"missing + resuming", "audit_log", true, resumeActionFresh},
 		{"complete but not resuming", "users", false, resumeActionFresh},
 		{"in_progress but not resuming", "orders", false, resumeActionFresh},
@@ -251,9 +258,12 @@ func TestPartialBulkCopyTruncates(t *testing.T) {
 	tgt.store.rows["m1"] = ir.MigrationState{
 		MigrationID: "m1",
 		Phase:       ir.MigrationPhaseBulkCopy,
-		TableProgress: map[string]ir.TableProgressState{
-			"users":  ir.TableProgressComplete,
-			"orders": ir.TableProgressInProgress,
+		TableProgress: map[string]ir.TableProgress{
+			// "users" already complete; "orders" was an in-progress
+			// row from a v0.3.0 binary (no cursor) → resume falls back
+			// to truncate-and-redo.
+			"users":  {State: ir.TableProgressComplete},
+			"orders": {State: ir.TableProgressInProgress},
 		},
 	}
 

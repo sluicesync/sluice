@@ -1,0 +1,412 @@
+// Per-batch checkpointed bulk-copy for the resume-mid-table path.
+//
+// v0.3.0's resume truncates and re-copies any in-progress table on
+// retry. For multi-hour copies of a single huge table that's a full
+// workday lost on a single transient failure. v0.4.0 adds per-batch
+// cursor checkpointing for tables with a primary key: the orchestrator
+// reads up to BulkBatchSize rows ordered by PK > cursor, applies them
+// via the engine's idempotent INSERT path (ON CONFLICT / ON DUPLICATE
+// KEY UPDATE), then writes the new cursor + row count to
+// sluice_migrate_state.table_progress. A crash mid-table re-fetches
+// the un-checkpointed batch on the next attempt; the upsert tolerates
+// the small overlap window between batch commit and cursor write.
+//
+// Tables without a primary key fall back to v0.3.0 behaviour
+// (truncate-and-redo on resume entry, plain INSERT). The classification
+// is sticky in the state row: once a table is marked
+// no_pk_truncate_and_redo, every subsequent failure resumes via
+// truncate-and-redo regardless of how many rows the previous attempt
+// landed.
+//
+// PG cold-start uses the COPY-protocol writer (faster); the resume
+// path here uses batched INSERTs because COPY streams in a single
+// logical operation that can't be checkpointed mid-batch. The
+// throughput trade-off is documented in ADR-0018.
+
+package pipeline
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"sync/atomic"
+
+	"github.com/orware/sluice/internal/ir"
+)
+
+// defaultBulkBatchSize is the per-batch row count when [Migrator]'s
+// BulkBatchSize is left at zero. 5000 rows is a middle ground:
+//
+//   - Small enough to keep the replay window short on crash. With
+//     5000-row batches a worst-case crash redrives ~1MB of data on a
+//     typical OLTP row.
+//   - Large enough to amortise per-batch tx commit overhead. At
+//     ~100 rows/batch the per-tx fsync becomes a noticeable fraction
+//     of throughput.
+//
+// Operators can tune via --bulk-batch-size; the help text on the CLI
+// flag covers the trade-off.
+const defaultBulkBatchSize = 5000
+
+// bulkCopyOneTable does the per-table bulk-copy work for both the
+// cold-start and resume paths. It reads the persisted progress entry
+// (if any), classifies the table, and dispatches to either the
+// per-batch cursor loop (resume + has-PK + engine supports the
+// optional surfaces) or the whole-table copy via [copyTable] (v0.3.0
+// path: cold start, no-PK fallback, or engine without batched
+// surface).
+//
+// All state-row updates and error wrapping happen inside this
+// function so [runBulkCopyPhases]'s per-table loop stays a single
+// dispatch + error check.
+func bulkCopyOneTable(
+	ctx context.Context,
+	rc resumeContext,
+	state *ir.MigrationState,
+	rows ir.RowReader,
+	rw ir.RowWriter,
+	table *ir.Table,
+	resuming bool,
+	bulkBatchSize int,
+) error {
+	action := classifyTableForResume(*state, table.Name, resuming)
+	switch action {
+	case resumeActionSkip:
+		slog.InfoContext(ctx, "migration: skipping completed table",
+			slog.String("table", table.Name))
+		return nil
+	case resumeActionTruncate:
+		slog.InfoContext(ctx, "migration: truncating in-progress table for resume",
+			slog.String("table", table.Name))
+		if err := truncateForResume(ctx, rw, table); err != nil {
+			wrapped := fmt.Errorf("pipeline: truncate before resume: %w", err)
+			return wrapWithHint(PhaseBulkCopy, markFailed(ctx, rc, *state, ir.MigrationPhaseBulkCopy, wrapped))
+		}
+	case resumeActionResumeFromCursor:
+		// Cursor-bearing resume: the per-batch path picks up the
+		// previous attempt's progress entry below. No truncate.
+		entry := state.TableProgress[table.Name]
+		slog.InfoContext(ctx, "migration: resuming table from cursor",
+			slog.String("table", table.Name),
+			slog.Int64("rows_already_copied", entry.RowsCopied),
+			slog.Int("pk_columns", len(entry.LastPK)))
+	case resumeActionFresh:
+		// Nothing to do up front; the per-batch path starts at PK > nil.
+	}
+
+	// Decide whether per-batch checkpointing is available for this
+	// table and classify accordingly. The decision is sticky: once
+	// classified as no-PK truncate-and-redo, the entry stays that way
+	// across attempts.
+	canCursor, why := canResumePerBatch(rw, rows, table, resuming)
+	if !canCursor {
+		// Either no-PK, no engine-side support, or non-resume mode.
+		// Fall back to the v0.3.0 whole-table copy. We still record an
+		// in-progress breadcrumb so a mid-copy crash leaves a clean
+		// "truncate and redo" entry on the next attempt.
+		entry := ir.TableProgress{State: ir.TableProgressInProgress}
+		if resuming && why == cursorBlockedNoPK {
+			// Make the no-PK fallback explicit on disk so a future
+			// resume reads it as truncate-and-redo immediately rather
+			// than re-discovering the missing PK.
+			entry = ir.TableProgress{State: ir.TableProgressNoPKTruncateAndRedo}
+			slog.InfoContext(ctx, "migration: table has no primary key; falling back to truncate-and-redo on resume",
+				slog.String("table", table.Name))
+		}
+		state.TableProgress[table.Name] = entry
+		if err := writeState(ctx, rc, *state); err != nil {
+			slog.WarnContext(ctx, "migration: per-table state write failed; continuing",
+				slog.String("table", table.Name),
+				slog.String("err", err.Error()))
+		}
+		if err := copyTable(ctx, rows, rw, table); err != nil {
+			wrapped := fmt.Errorf("pipeline: copy table %q: %w", table.Name, err)
+			return wrapWithHint(PhaseBulkCopy, markFailed(ctx, rc, *state, ir.MigrationPhaseBulkCopy, wrapped))
+		}
+		state.TableProgress[table.Name] = ir.TableProgress{State: ir.TableProgressComplete}
+		if err := writeState(ctx, rc, *state); err != nil {
+			slog.WarnContext(ctx, "migration: per-table state write failed; continuing",
+				slog.String("table", table.Name),
+				slog.String("err", err.Error()))
+		}
+		return nil
+	}
+
+	// Per-batch checkpointed path.
+	limit := bulkBatchSize
+	if limit <= 0 {
+		limit = defaultBulkBatchSize
+	}
+	if err := copyTableWithCursor(ctx, rc, state, rw, rows, table, limit); err != nil {
+		wrapped := fmt.Errorf("pipeline: copy table %q: %w", table.Name, err)
+		return wrapWithHint(PhaseBulkCopy, markFailed(ctx, rc, *state, ir.MigrationPhaseBulkCopy, wrapped))
+	}
+	state.TableProgress[table.Name] = ir.TableProgress{State: ir.TableProgressComplete}
+	if err := writeState(ctx, rc, *state); err != nil {
+		slog.WarnContext(ctx, "migration: per-table state write failed; continuing",
+			slog.String("table", table.Name),
+			slog.String("err", err.Error()))
+	}
+	return nil
+}
+
+// cursorBlockReason explains why per-batch checkpointing isn't usable
+// for a given table. Used by callers that want to log the specific
+// reason rather than a binary "can / can't" signal.
+type cursorBlockReason int
+
+const (
+	cursorBlockedNotResuming   cursorBlockReason = iota // not in resume mode
+	cursorBlockedNoPK                                   // table has no primary key
+	cursorBlockedReaderNotImpl                          // reader doesn't implement BatchedRowReader
+	cursorBlockedWriterNotImpl                          // writer doesn't implement IdempotentRowWriter
+	cursorBlockedAvailable                              // sentinel: per-batch is available
+)
+
+// canResumePerBatch reports whether the per-batch cursor path can be
+// used for this table. The flag is true only when:
+//
+//   - The Migrator is in resume mode (cold-start uses the faster
+//     plain-INSERT / COPY path).
+//   - The table has a primary key (the cursor is a PK-ordered tuple).
+//   - The reader implements [ir.BatchedRowReader].
+//   - The writer implements [ir.IdempotentRowWriter].
+//
+// All four must be true. The second return value identifies the
+// blocking reason for callers that want to log it.
+func canResumePerBatch(rw ir.RowWriter, rr ir.RowReader, table *ir.Table, resuming bool) (bool, cursorBlockReason) {
+	if !resuming {
+		return false, cursorBlockedNotResuming
+	}
+	if table.PrimaryKey == nil || len(table.PrimaryKey.Columns) == 0 {
+		return false, cursorBlockedNoPK
+	}
+	if _, ok := rr.(ir.BatchedRowReader); !ok {
+		return false, cursorBlockedReaderNotImpl
+	}
+	if _, ok := rw.(ir.IdempotentRowWriter); !ok {
+		return false, cursorBlockedWriterNotImpl
+	}
+	return true, cursorBlockedAvailable
+}
+
+// copyTableWithCursor is the per-batch loop. Reads up to limit rows
+// at a time via [ir.BatchedRowReader.ReadRowsBatch], applies them
+// via [ir.IdempotentRowWriter.WriteRowsIdempotent], then commits a
+// cursor update to sluice_migrate_state.
+//
+// The brief replay window between batch commit and checkpoint write
+// is the load-bearing trade-off: a crash there re-applies the most
+// recent batch on the next attempt, which the upsert tolerates as
+// no-op UPDATEs. ADR-0018 documents this.
+//
+// PK extraction uses a teeing tracker that snapshots the last row's
+// PK column values as they pass from reader to writer. Channel close
+// signals batch end; on a clean batch the tracker holds the cursor
+// to write next.
+func copyTableWithCursor(
+	ctx context.Context,
+	rc resumeContext,
+	state *ir.MigrationState,
+	rw ir.RowWriter,
+	rr ir.RowReader,
+	table *ir.Table,
+	limit int,
+) (retErr error) {
+	br, ok := rr.(ir.BatchedRowReader)
+	if !ok {
+		return errors.New("pipeline: row reader does not implement BatchedRowReader (caller should have classified this case earlier)")
+	}
+	iw, ok := rw.(ir.IdempotentRowWriter)
+	if !ok {
+		return errors.New("pipeline: row writer does not implement IdempotentRowWriter (caller should have classified this case earlier)")
+	}
+
+	pkCols := primaryKeyColumnNames(table)
+
+	entry := state.TableProgress[table.Name]
+	if entry.State != ir.TableProgressInProgress {
+		// Either fresh start (entry is the zero value) or a sticky
+		// state we shouldn't be on (caller routes complete/no-PK
+		// elsewhere). Reset to in-progress with the existing cursor.
+		entry.State = ir.TableProgressInProgress
+	}
+
+	cursor := entry.LastPK
+	rowsCopied := entry.RowsCopied
+
+	// Persist the in-progress breadcrumb up front (mirrors the v0.3.0
+	// behaviour) so a crash before the first batch lands still leaves
+	// a meaningful state row for the next attempt.
+	state.TableProgress[table.Name] = entry
+	if err := writeState(ctx, rc, *state); err != nil {
+		slog.WarnContext(ctx, "migration: per-table state write failed; continuing",
+			slog.String("table", table.Name),
+			slog.String("err", err.Error()))
+	}
+
+	// Progress ticker for the long-running per-batch loop. The same
+	// shape as copyTable; one ticker per table.
+	pt := newProgressTicker(ctx, progressInterval, table.Name)
+	// Pre-load the ticker with rows already copied on a previous
+	// attempt so the operator sees an accurate running total. The
+	// ticker treats it as the starting count.
+	pt.rows.Store(rowsCopied)
+	defer func() { pt.Stop(ctx, retErr) }()
+
+	for {
+		// Each batch runs in its own context-derived scope so the
+		// reader/tee goroutines unwind cleanly when the writer returns.
+		// Same Bug-9 motivation as copyTable.
+		batchCtx, cancel := context.WithCancel(ctx)
+
+		rowsCh, err := br.ReadRowsBatch(batchCtx, table, cursor, limit)
+		if err != nil {
+			cancel()
+			return fmt.Errorf("read batch: %w", err)
+		}
+
+		var batchCount int64
+		tracker := newPKTracker(pkCols)
+		teed := teePKAndCount(batchCtx, rowsCh, tracker, &batchCount, pt.inc)
+		if err := iw.WriteRowsIdempotent(batchCtx, table, teed); err != nil {
+			cancel()
+			return fmt.Errorf("write batch: %w", err)
+		}
+		cancel() // batch goroutines unwind cleanly
+
+		if batchCount == 0 {
+			// Empty batch from the reader → end of table.
+			return nil
+		}
+
+		newCursor, ok := tracker.lastPK()
+		if !ok {
+			// Should be impossible — the writer accepted batchCount > 0
+			// rows but the tracker never saw a row's PK. Surface it
+			// rather than silently looping.
+			return errors.New("batch produced rows but PK tracker captured none; check primary key resolution")
+		}
+		cursor = newCursor
+		rowsCopied += batchCount
+
+		entry.LastPK = cursor
+		entry.RowsCopied = rowsCopied
+		state.TableProgress[table.Name] = entry
+		if err := writeState(ctx, rc, *state); err != nil {
+			// Best-effort; log and continue. The replay window
+			// tolerated by the idempotent INSERT will catch any rows
+			// that re-deliver on the next attempt.
+			slog.WarnContext(ctx, "migration: cursor checkpoint write failed; continuing",
+				slog.String("table", table.Name),
+				slog.Int64("rows_copied", rowsCopied),
+				slog.String("err", err.Error()))
+		}
+
+		// If the batch was short of limit, we hit the end of the table.
+		// Save one extra round-trip vs. asking for an empty batch.
+		if batchCount < int64(limit) {
+			return nil
+		}
+	}
+}
+
+// primaryKeyColumnNames returns the PK column names in declaration
+// order, or nil when the table has no PK. The orchestrator routes
+// no-PK tables away from the cursor path before this gets called;
+// the helper is defensive about a nil PK so future callers can use
+// it safely.
+func primaryKeyColumnNames(table *ir.Table) []string {
+	if table == nil || table.PrimaryKey == nil {
+		return nil
+	}
+	out := make([]string, len(table.PrimaryKey.Columns))
+	for i, c := range table.PrimaryKey.Columns {
+		out[i] = c.Column
+	}
+	return out
+}
+
+// pkTracker captures the PK column values of the last row passing
+// through a batch. Used by [teePKAndCount] to extract the cursor for
+// the next iteration without changing the writer interface.
+//
+// The tracker is intentionally simple: it overwrites lastValues on
+// every row, and lastValues is a fresh slice per call so the writer's
+// downstream consumer can't mutate the captured values out from under
+// the orchestrator. Concurrent reads of [pkTracker.lastPK] are not
+// supported — the only caller is the orchestrator, which reads after
+// the writer has returned.
+type pkTracker struct {
+	pkCols []string
+	last   atomic.Pointer[[]any]
+}
+
+// newPKTracker returns a tracker for the given PK column names.
+func newPKTracker(pkCols []string) *pkTracker {
+	return &pkTracker{pkCols: pkCols}
+}
+
+// observe records the PK column values of row. nil row is a no-op
+// (defensive — should not happen in practice). Missing PK columns
+// produce a slice with nil entries; the next batch's WHERE predicate
+// would be incorrect, but classifyTableForResume rejects no-PK tables
+// upstream so the situation shouldn't arise.
+func (t *pkTracker) observe(row ir.Row) {
+	if row == nil || len(t.pkCols) == 0 {
+		return
+	}
+	pk := make([]any, len(t.pkCols))
+	for i, c := range t.pkCols {
+		pk[i] = row[c]
+	}
+	t.last.Store(&pk)
+}
+
+// lastPK returns the PK values of the most recently observed row,
+// plus a flag indicating whether any rows were seen. Returns (nil,
+// false) when no rows passed through.
+func (t *pkTracker) lastPK() ([]any, bool) {
+	p := t.last.Load()
+	if p == nil {
+		return nil, false
+	}
+	return *p, true
+}
+
+// teePKAndCount wraps the row channel with a tee that observes each
+// row's PK columns into the tracker, increments count, and invokes
+// onRow for the [progressTicker]. The downstream channel is unbuffered
+// so back-pressure flows naturally through the writer; closing
+// happens on src close or ctx cancellation.
+//
+// Mirrors [teeRows]'s shape but pulls the per-row hooks together since
+// the per-batch loop wants all three.
+func teePKAndCount(ctx context.Context, src <-chan ir.Row, tracker *pkTracker, count *int64, onRow func()) <-chan ir.Row {
+	out := make(chan ir.Row)
+	go func() {
+		defer close(out)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case row, ok := <-src:
+				if !ok {
+					return
+				}
+				tracker.observe(row)
+				atomic.AddInt64(count, 1)
+				if onRow != nil {
+					onRow()
+				}
+				select {
+				case out <- row:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}
+	}()
+	return out
+}
