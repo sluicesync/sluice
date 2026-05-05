@@ -3,6 +3,7 @@ package mysql
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -269,6 +270,15 @@ func flattenArgs(batch []ir.Row, table *ir.Table) []any {
 //     Convert to a Go string so the driver sends VARCHAR (no
 //     charset prefix) and MySQL/Vitess parses it as JSON cleanly.
 //     Real-world bug found during PlanetScale-target testing.
+//   - [ir.JSON] target with a `[]any` value: PG arrays decode to
+//     `[]any` in the IR, and operators sometimes use
+//     `--type-override=col=jsonb` to land them as JSON on MySQL.
+//     Without conversion, the driver receives the slice and bombs
+//     with "Invalid JSON text"; we marshal to a JSON array literal
+//     instead. (Bug 14, v0.4.0 type-override regression.)
+//   - [ir.JSON] target with a PG-array-literal string ("{a,b,c}"):
+//     same scenario when the source presented the array as text
+//     rather than []any. We parse the literal and re-emit as JSON.
 func prepareValue(v any, t ir.Type) any {
 	if v == nil {
 		return nil
@@ -279,6 +289,9 @@ func prepareValue(v any, t ir.Type) any {
 		}
 	}
 	if _, isJSON := t.(ir.JSON); isJSON {
+		if converted, ok := convertArrayLikeToJSON(v); ok {
+			return converted
+		}
 		if b, ok := v.([]byte); ok {
 			return string(b)
 		}
@@ -298,4 +311,196 @@ func prepareValue(v any, t ir.Type) any {
 		}
 	}
 	return v
+}
+
+// convertArrayLikeToJSON detects values that look like PG arrays
+// landing on a MySQL JSON column (Bug 14) and re-encodes them as a
+// JSON array string the driver can hand to MySQL's JSON parser.
+//
+// Three input shapes are recognised:
+//
+//   - []any — the canonical IR shape for an [ir.Array] value
+//     decoded by the postgres reader against an ir.Array column.
+//     Marshalled element-by-element via [encoding/json].
+//   - string of the form "{...}" — the PG array text literal that
+//     surfaces when the override leaves the value as a string (e.g.
+//     CDC tuple values, or some database/sql scan paths). Parsed
+//     into tokens and emitted as a JSON string array; nested
+//     arrays are not supported (the IR doesn't model multi-
+//     dimensional arrays today and the parser refuses them).
+//   - []byte starting with `{` and ending with `}` — same shape
+//     as above when the source decodes the value as bytes (the
+//     [decodeValue] path for [ir.JSON] returns []byte and so when
+//     the column was *overridden* to JSON post-decode, the row
+//     reader's bytes path produces a `[]byte` containing the PG
+//     array literal verbatim). Routed through the same parser as
+//     the string case.
+//
+// Returns (jsonString, true) on a recognised shape; (nil, false)
+// when the value doesn't match either, signalling the caller to
+// fall back to the next branch in [prepareValue].
+//
+// Errors during marshalling are swallowed: returning the un-
+// converted value is safe because the next branch (the []byte →
+// string branch) handles bytes correctly, and the driver's own
+// error handling will report any genuinely-bad value the operator
+// supplied.
+func convertArrayLikeToJSON(v any) (any, bool) {
+	switch shaped := v.(type) {
+	case []any:
+		out, err := json.Marshal(shaped)
+		if err != nil {
+			return nil, false
+		}
+		return string(out), true
+	case string:
+		if !looksLikePGArrayLiteral(shaped) {
+			return nil, false
+		}
+		converted, err := pgArrayLiteralToJSON(shaped)
+		if err != nil {
+			return nil, false
+		}
+		return converted, true
+	case []byte:
+		// A `[]byte` for a JSON-target column is normally already
+		// valid JSON (the canonical IR shape for ir.JSON values).
+		// The PG-array-literal-as-bytes case only arises when the
+		// column was overridden to JSON post-decode and the value
+		// arrived from the source's text-form array reader.
+		//
+		// Disambiguation: try PG-array parsing first. The PG array
+		// grammar is strict — JSON objects with quoted keys and
+		// colons fail to parse — so a successful parse is high
+		// signal that the bytes are an array literal. The corner
+		// case is `{}`, which parses as both an empty PG array and
+		// an empty JSON object; we prefer the array interpretation
+		// because Bug 14's specific surface is the override case
+		// (empty PG arrays as bytes in JSON-target columns) and
+		// landing `{}` as the JSON object on MySQL would also be a
+		// caller error in any sensible setup. For non-`{}` JSON
+		// bytes, the PG-array parse fails and we fall through to
+		// the next branch (which emits the bytes as a string).
+		if len(shaped) < 2 || shaped[0] != '{' || shaped[len(shaped)-1] != '}' {
+			return nil, false
+		}
+		if converted, err := pgArrayLiteralToJSON(string(shaped)); err == nil {
+			return converted, true
+		}
+		return nil, false
+	}
+	return nil, false
+}
+
+// looksLikePGArrayLiteral is a cheap pre-filter: a Postgres array
+// text literal is wrapped in braces. Any string starting with `{`
+// and ending with `}` is a candidate; the actual parse rejects
+// non-array shapes (JSON objects, malformed input).
+func looksLikePGArrayLiteral(s string) bool {
+	return len(s) >= 2 && s[0] == '{' && s[len(s)-1] == '}'
+}
+
+// pgArrayLiteralToJSON parses a Postgres one-dimensional array text
+// literal ("{a,b,c}", "{\"x\",\"y\"}") and returns its JSON-array
+// equivalent. Element values are emitted as JSON strings — the
+// translation is a string-array view of the array, not a typed
+// re-decode. Operators who need typed-element translation (numeric
+// arrays as JSON numbers, etc.) should override to `text` instead
+// and parse downstream.
+func pgArrayLiteralToJSON(s string) (string, error) {
+	if !looksLikePGArrayLiteral(s) {
+		return "", fmt.Errorf("not a PG array literal: %q", s)
+	}
+	body := s[1 : len(s)-1]
+	if body == "" {
+		return "[]", nil
+	}
+	tokens, err := splitPGArrayTokens(body)
+	if err != nil {
+		return "", err
+	}
+	out, err := json.Marshal(tokens)
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
+}
+
+// splitPGArrayTokens parses the inside of a PG array literal into
+// per-element string tokens. Mirrors the postgres engine's
+// parsePGArrayText (which lives in a different package and isn't
+// imported by mysql); kept narrow because the only thing we do
+// with the tokens is JSON-serialise them.
+//
+// Format reference: PostgreSQL "Array Input and Output Syntax".
+// Quoted elements are unescaped; bare elements are taken verbatim;
+// the literal NULL (case-insensitive) maps to JSON null. Multi-
+// dimensional arrays (nested braces) are rejected.
+func splitPGArrayTokens(body string) ([]any, error) {
+	var out []any
+	for i := 0; i < len(body); {
+		// Skip leading whitespace.
+		for i < len(body) && (body[i] == ' ' || body[i] == '\t') {
+			i++
+		}
+		if i >= len(body) {
+			break
+		}
+		if body[i] == '{' || body[i] == '}' {
+			return nil, fmt.Errorf("nested arrays not supported in PG array literal")
+		}
+
+		var (
+			tok    string
+			isNull bool
+		)
+		if body[i] == '"' {
+			i++ // opening quote
+			var sb []byte
+			for i < len(body) {
+				c := body[i]
+				if c == '\\' && i+1 < len(body) {
+					sb = append(sb, body[i+1])
+					i += 2
+					continue
+				}
+				if c == '"' {
+					i++ // closing quote
+					break
+				}
+				sb = append(sb, c)
+				i++
+			}
+			tok = string(sb)
+		} else {
+			start := i
+			for i < len(body) && body[i] != ',' {
+				i++
+			}
+			tok = body[start:i]
+			for tok != "" && (tok[len(tok)-1] == ' ' || tok[len(tok)-1] == '\t') {
+				tok = tok[:len(tok)-1]
+			}
+			if strings.EqualFold(tok, "NULL") {
+				isNull = true
+			}
+		}
+		// Skip trailing whitespace, then the comma.
+		for i < len(body) && (body[i] == ' ' || body[i] == '\t') {
+			i++
+		}
+		if i < len(body) {
+			if body[i] != ',' {
+				return nil, fmt.Errorf("expected ',' or '}' at offset %d", i)
+			}
+			i++
+		}
+
+		if isNull {
+			out = append(out, nil)
+		} else {
+			out = append(out, tok)
+		}
+	}
+	return out, nil
 }

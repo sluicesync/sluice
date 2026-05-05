@@ -142,6 +142,56 @@ func TestPrepareValue(t *testing.T) {
 		// — the driver would error, which is what we want when the
 		// caller has a type confusion bug.
 		{"unexpected []string", []string{"x"}, ir.Varchar{Length: 32}, []string{"x"}},
+
+		// Bug 14: PG array values landing on a MySQL JSON column
+		// (operator-supplied --type-override=col=jsonb) get
+		// re-encoded as a JSON array string the MySQL JSON parser
+		// accepts. Without this branch the driver hands the
+		// driver-incompatible Go slice or the PG-array literal
+		// straight through, and MySQL rejects with "Invalid JSON
+		// text".
+		{
+			"json target with []any → JSON array",
+			[]any{int64(1), int64(2), int64(3)},
+			ir.JSON{Binary: true},
+			`[1,2,3]`,
+		},
+		{
+			"json target with []any of strings",
+			[]any{"a", "b", "c"},
+			ir.JSON{Binary: true},
+			`["a","b","c"]`,
+		},
+		{
+			"json target with PG-array-literal string",
+			"{a,b,c}",
+			ir.JSON{Binary: true},
+			`["a","b","c"]`,
+		},
+		{
+			"json target with quoted PG-array elements",
+			`{"alpha","beta","with,comma"}`,
+			ir.JSON{Binary: true},
+			`["alpha","beta","with,comma"]`,
+		},
+		{
+			"json target with PG-array NULL element",
+			"{a,NULL,c}",
+			ir.JSON{Binary: true},
+			`["a",null,"c"]`,
+		},
+		{
+			"json target with empty PG-array literal",
+			"{}",
+			ir.JSON{Binary: true},
+			`[]`,
+		},
+		{
+			"json target with []any containing nil",
+			[]any{int64(1), nil, int64(3)},
+			ir.JSON{Binary: true},
+			`[1,null,3]`,
+		},
 	}
 	for _, c := range cases {
 		c := c
@@ -151,5 +201,29 @@ func TestPrepareValue(t *testing.T) {
 				t.Errorf("prepareValue(%#v, %T) = %#v; want %#v", c.in, c.t, got, c.want)
 			}
 		})
+	}
+}
+
+// TestPrepareValue_PGArrayLiteralOnNonJSONPasses through unchanged —
+// the array→JSON transformation is gated on the target being JSON.
+// A `--type-override=col=text` (the documented Bug 14 workaround) on
+// a PG-array column should land the literal as a string, not be
+// re-shaped.
+func TestPrepareValue_PGArrayLiteralOnNonJSONPassesThrough(t *testing.T) {
+	got := prepareValue("{a,b,c}", ir.Text{Size: ir.TextLong})
+	if got != "{a,b,c}" {
+		t.Errorf("prepareValue text-target: got %#v; want \"{a,b,c}\"", got)
+	}
+}
+
+// TestPrepareValue_AnySliceOnNonJSONPassesThrough — the conversion
+// is intentionally narrow. A []any landing on a non-JSON column is
+// a caller bug, but it shouldn't silently morph; the driver's own
+// error surface should report the type mismatch.
+func TestPrepareValue_AnySliceOnNonJSONPassesThrough(t *testing.T) {
+	in := []any{int64(1), int64(2)}
+	got := prepareValue(in, ir.Varchar{Length: 32})
+	if !reflect.DeepEqual(got, in) {
+		t.Errorf("prepareValue varchar-target: got %#v; want %#v", got, in)
 	}
 }
