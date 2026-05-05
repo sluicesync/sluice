@@ -295,7 +295,7 @@ func copyTableWithCursor(
 
 		var batchCount int64
 		tracker := newPKTracker(pkCols)
-		teed := teePKAndCount(batchCtx, rowsCh, tracker, &batchCount, pt.inc)
+		teed := teePKAndCount(batchCtx, rowsCh, tracker, &batchCount, pt.observeRow)
 		if err := iw.WriteRowsIdempotent(batchCtx, table, teed); err != nil {
 			cancel()
 			return fmt.Errorf("write batch: %w", err)
@@ -408,8 +408,10 @@ func (t *pkTracker) lastPK() ([]any, bool) {
 // happens on src close or ctx cancellation.
 //
 // Mirrors [teeRows]'s shape but pulls the per-row hooks together since
-// the per-batch loop wants all three.
-func teePKAndCount(ctx context.Context, src <-chan ir.Row, tracker *pkTracker, count *int64, onRow func()) <-chan ir.Row {
+// the per-batch loop wants all three. onRow gets the row itself so
+// observers like [progressTicker.observeRow] can sum its byte cost
+// alongside the count.
+func teePKAndCount(ctx context.Context, src <-chan ir.Row, tracker *pkTracker, count *int64, onRow func(ir.Row)) <-chan ir.Row {
 	out := make(chan ir.Row)
 	go func() {
 		defer close(out)
@@ -424,7 +426,7 @@ func teePKAndCount(ctx context.Context, src <-chan ir.Row, tracker *pkTracker, c
 				tracker.observe(row)
 				atomic.AddInt64(count, 1)
 				if onRow != nil {
-					onRow()
+					onRow(row)
 				}
 				select {
 				case out <- row:

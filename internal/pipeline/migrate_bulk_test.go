@@ -81,7 +81,7 @@ func TestTeePKAndCount(t *testing.T) {
 	tr := newPKTracker([]string{"id"})
 	var count int64
 	tickCount := int64(0)
-	out := teePKAndCount(context.Background(), src, tr, &count, func() {
+	out := teePKAndCount(context.Background(), src, tr, &count, func(_ ir.Row) {
 		atomic.AddInt64(&tickCount, 1)
 	})
 

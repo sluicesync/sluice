@@ -444,7 +444,7 @@ func copyChunk(
 		var batchCount int64
 		tracker := newPKTracker(pkCols)
 		filtered := filterByUpperBound(batchCtx, rowsCh, pkCols, chunk.UpperPK)
-		teed := teePKAndCount(batchCtx, filtered, tracker, &batchCount, pt.inc)
+		teed := teePKAndCount(batchCtx, filtered, tracker, &batchCount, pt.observeRow)
 		if err := iw.WriteRowsIdempotent(batchCtx, table, teed); err != nil {
 			cancel()
 			return fmt.Errorf("write chunk %d batch: %w", chunkIndex, err)

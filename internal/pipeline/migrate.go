@@ -517,7 +517,7 @@ func copyTable(ctx context.Context, rr ir.RowReader, rw ir.RowWriter, table *ir.
 	kickOffRowCount(copyCtx, rr, table, pt)
 	defer func() { pt.Stop(ctx, retErr) }()
 
-	teed := teeRows(copyCtx, rows, pt.inc)
+	teed := teeRows(copyCtx, rows, pt.observeRow)
 	if err := rw.WriteRows(copyCtx, table, teed); err != nil {
 		return fmt.Errorf("write rows: %w", err)
 	}

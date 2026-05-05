@@ -126,17 +126,96 @@ func (p *progressTicker) inc() {
 // don't track scan-buffer sizes pass zero and the ticker reports
 // rate without bytes-per-second. Cheap (atomic add).
 //
-// v0.5.0 ships the hook but doesn't yet have an engine-side caller.
-// Wiring scan-buffer byte counts into the row stream is a small follow-
-// up; the ticker shape stays compatible. nolint:unused covers the
-// pre-wiring window.
-//
-//nolint:unused // wired from engines in a follow-up; the hook lands in v0.5.0 to avoid a ticker-API churn later.
+// v0.5.0 wires the hook from the pipeline tee point via
+// [observeRow], where the row content is available to every engine
+// without any per-engine plumbing. The hook stays a method on the
+// ticker so future engines that have a tighter byte count (e.g.
+// COPY-protocol writers that know exact wire-frame sizes) can call
+// it directly without going through observeRow's heuristic.
 func (p *progressTicker) addBytes(n int64) {
 	if n <= 0 {
 		return
 	}
 	p.bytes.Add(n)
+}
+
+// observeRow is the per-row hook the row pipe calls. Combines [inc]
+// with a best-effort byte-count of the row's values via
+// [approximateRowBytes]. Cheap: no allocation, walks the row map
+// once, sums into a local int64.
+func (p *progressTicker) observeRow(row ir.Row) {
+	p.inc()
+	p.addBytes(approximateRowBytes(row))
+}
+
+// approximateRowBytes estimates the wire-size of a row by walking
+// its values once. The estimate is intentionally rough: the goal is
+// to drive the rate_mb_per_sec gauge in progress logs, not to
+// reconcile against MySQL's max_allowed_packet or PG's COPY
+// statistics. Fixed-width types use their natural byte width;
+// strings and []byte use their length; time.Time uses a typical
+// wire-format width (24 bytes covers TIMESTAMPTZ with sub-second
+// precision and a timezone suffix); nil contributes nothing.
+//
+// Unknown types contribute zero rather than guessing. The
+// progressTicker's emitted rate is a lower bound on real wire
+// throughput in such cases — reasonable behaviour for a metric
+// whose only consumer is human eyeballs comparing tail -f output
+// to expected throughput.
+func approximateRowBytes(row ir.Row) int64 {
+	if row == nil {
+		return 0
+	}
+	var total int64
+	for _, v := range row {
+		total += approximateValueBytes(v)
+	}
+	return total
+}
+
+// approximateValueBytes returns the rough byte cost of a single
+// IR-canonical value. See [approximateRowBytes] for the policy
+// rationale.
+func approximateValueBytes(v any) int64 {
+	switch x := v.(type) {
+	case nil:
+		return 0
+	case string:
+		return int64(len(x))
+	case []byte:
+		return int64(len(x))
+	case bool:
+		return 1
+	case int8, uint8:
+		return 1
+	case int16, uint16:
+		return 2
+	case int32, uint32, float32:
+		return 4
+	case int, uint, int64, uint64, float64:
+		return 8
+	case time.Time:
+		// 24 bytes covers TIMESTAMPTZ-with-tz at microsecond
+		// precision in the canonical PG text form.
+		return 24
+	case []any:
+		var n int64
+		for _, e := range x {
+			n += approximateValueBytes(e)
+		}
+		return n
+	case []string:
+		var n int64
+		for _, s := range x {
+			n += int64(len(s))
+		}
+		return n
+	}
+	// Approximation falls back to zero rather than guessing a value
+	// that might be wildly wrong for engine-specific shapes (e.g.
+	// pgtype.Numeric, geometry WKB). The rate_mb_per_sec gauge is
+	// then a lower bound — accurate-enough for human inspection.
+	return 0
 }
 
 // setTotalRows feeds the row-count estimate into the ticker. Safe to
@@ -286,9 +365,12 @@ func kickOffRowCount(ctx context.Context, rr ir.RowReader, table *ir.Table, pt *
 }
 
 // teeRows wraps an [ir.Row] channel and returns a new channel that
-// forwards every row downstream while invoking onRow. The tee runs in
-// its own goroutine and propagates ctx cancellation; downstream is
-// closed when src closes (normal completion) or when ctx ends (early
+// forwards every row downstream while invoking onRow. onRow gets
+// the row itself so call-sites can run any per-row bookkeeping
+// (count, bytes, PK-tracking, etc.) without the tee plumbing
+// caring about the bookkeeping shape. The tee runs in its own
+// goroutine and propagates ctx cancellation; downstream is closed
+// when src closes (normal completion) or when ctx ends (early
 // abort).
 //
 // The function is unexported and returns an unbuffered channel; the
@@ -296,7 +378,7 @@ func kickOffRowCount(ctx context.Context, rr ir.RowReader, table *ir.Table, pt *
 // is the only reader. Buffering wouldn't help here — the writer's
 // throughput is the bottleneck, and an unbounded buffer would just
 // hide back-pressure.
-func teeRows(ctx context.Context, src <-chan ir.Row, onRow func()) <-chan ir.Row {
+func teeRows(ctx context.Context, src <-chan ir.Row, onRow func(ir.Row)) <-chan ir.Row {
 	out := make(chan ir.Row)
 	go func() {
 		defer close(out)
@@ -308,7 +390,7 @@ func teeRows(ctx context.Context, src <-chan ir.Row, onRow func()) <-chan ir.Row
 				if !ok {
 					return
 				}
-				onRow()
+				onRow(row)
 				select {
 				case out <- row:
 				case <-ctx.Done():
