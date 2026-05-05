@@ -22,7 +22,6 @@ import (
 //
 // Out of scope (for now):
 //   - Composite, range, and domain types.
-//   - Generated columns (read but not specially marked).
 //   - Comments on tables and columns.
 //   - Geometry / PostGIS types.
 //
@@ -230,7 +229,9 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 			numeric_precision,
 			numeric_scale,
 			datetime_precision,
-			is_identity
+			is_identity,
+			COALESCE(is_generated, 'NEVER'),
+			COALESCE(generation_expression, '')
 		FROM   information_schema.columns
 		WHERE  table_schema = $1
 		ORDER  BY table_name, ordinal_position`
@@ -251,6 +252,7 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 			charMaxLen, numPrec  sql.NullInt64
 			numScale, dtPrec     sql.NullInt64
 			isIdentity           string
+			isGenerated, genExpr string
 		)
 		if err := rows.Scan(
 			&tableName, &colName, &ordinal,
@@ -258,6 +260,7 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 			&dataType, &udtName,
 			&charMaxLen, &numPrec, &numScale, &dtPrec,
 			&isIdentity,
+			&isGenerated, &genExpr,
 		); err != nil {
 			return err
 		}
@@ -313,12 +316,23 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 			return fmt.Errorf("table %q column %q: %w", tableName, colName, err)
 		}
 
-		t.Columns = append(t.Columns, &ir.Column{
+		col := &ir.Column{
 			Name:     colName,
 			Type:     typ,
 			Nullable: strings.EqualFold(isNullable, "YES"),
 			Default:  translateDefault(columnDefault, meta.IsAutoIncrement),
-		})
+		}
+		// Postgres only supports STORED generated columns today;
+		// is_generated = 'ALWAYS' implies STORED. The expression
+		// passes through verbatim — translation policy is "loud
+		// failure beats silent corruption", so non-portable
+		// expressions surface as a target rejection at apply time
+		// rather than a guess at translation.
+		if strings.EqualFold(isGenerated, "ALWAYS") && genExpr != "" {
+			col.GeneratedExpr = genExpr
+			col.GeneratedStored = true
+		}
+		t.Columns = append(t.Columns, col)
 	}
 	return rows.Err()
 }

@@ -3,6 +3,7 @@ package postgres
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 
 	"github.com/orware/sluice/internal/ir"
@@ -289,9 +290,35 @@ func emitColumnDef(table *ir.Table, c *ir.Column, opts emitOpts) (string, error)
 	sb.WriteString(quoteIdent(c.Name))
 	sb.WriteByte(' ')
 	sb.WriteString(typeStr)
+	if c.IsGenerated() {
+		// Postgres only supports STORED generated columns. If a
+		// MySQL source provides a VIRTUAL column (GeneratedStored=
+		// false), the closest correct PG representation is STORED
+		// — the invariant survives but the storage tradeoff
+		// changes (STORED takes disk; VIRTUAL doesn't). Emit a
+		// warning so the operator sees the silent promotion.
+		// Source-engine VIRTUAL columns are rare on production
+		// schemas; refusing here would force operators into the
+		// per-column mappings hook for what's almost always a
+		// benign translation.
+		if !c.GeneratedStored {
+			slog.Warn("postgres: promoting source-engine VIRTUAL generated column to STORED (postgres has no VIRTUAL support)",
+				slog.String("table", tableNameForLog(table)),
+				slog.String("column", c.Name),
+			)
+		}
+		sb.WriteString(" GENERATED ALWAYS AS (")
+		sb.WriteString(c.GeneratedExpr)
+		sb.WriteString(") STORED")
+	}
 	if !c.Nullable {
 		sb.WriteString(" NOT NULL")
 	}
+	// DEFAULT is mutually exclusive with GENERATED in Postgres — the
+	// parser rejects the combination. Generated columns arrive with
+	// Default = DefaultNone from the schema reader, so emitDefault
+	// returns ok=false and the clause is skipped naturally; no
+	// special case needed here.
 	if dflt, ok := emitDefault(c.Default); ok {
 		sb.WriteString(" DEFAULT ")
 		// SET columns translate the comma-separated MySQL literal
@@ -319,6 +346,19 @@ func emitColumnDef(table *ir.Table, c *ir.Column, opts emitOpts) (string, error)
 		}
 	}
 	return sb.String(), nil
+}
+
+// tableNameForLog returns a non-empty table name for log lines, even
+// when the caller hasn't supplied a table context. Used by the
+// generated-column writer's STORED-promotion warning so the log line
+// stays useful for the only callsite that bypasses table context
+// (defensive — emitColumnDef's contract says table is required for
+// Enum, but generated columns can land on non-Enum types).
+func tableNameForLog(t *ir.Table) string {
+	if t == nil {
+		return "<unknown>"
+	}
+	return t.Name
 }
 
 // enumTypeName generates a deterministic Postgres enum type name for

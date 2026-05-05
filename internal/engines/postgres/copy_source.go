@@ -41,6 +41,9 @@ func newChanCopySource(ctx context.Context, table *ir.Table, rows <-chan ir.Row)
 // when [Values] has a fresh row to return; false otherwise (with
 // [Err] revealing the cause when relevant — channel close is a
 // nil-Err case).
+//
+// Generated columns are skipped so the value list stays in lockstep
+// with the column list passed to pgx.CopyFrom (also filtered).
 func (s *chanCopySource) Next() bool {
 	if s.err != nil {
 		return false
@@ -50,8 +53,9 @@ func (s *chanCopySource) Next() bool {
 		if !ok {
 			return false
 		}
-		values := make([]any, len(s.table.Columns))
-		for i, col := range s.table.Columns {
+		cols := nonGeneratedColumns(s.table.Columns)
+		values := make([]any, len(cols))
+		for i, col := range cols {
 			v, err := prepareValue(row[col.Name], col.Type)
 			if err != nil {
 				s.err = fmt.Errorf("column %q: %w", col.Name, err)

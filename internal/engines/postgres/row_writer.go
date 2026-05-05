@@ -120,8 +120,9 @@ func (w *RowWriter) writeViaCopy(ctx context.Context, table *ir.Table, rows <-ch
 	}
 	defer func() { _ = sqlConn.Close() }() // returns conn to pool
 
-	columnNames := make([]string, len(table.Columns))
-	for i, c := range table.Columns {
+	cols := nonGeneratedColumns(table.Columns)
+	columnNames := make([]string, len(cols))
+	for i, c := range cols {
 		columnNames[i] = c.Name
 	}
 	source := newChanCopySource(ctx, table, rows)
@@ -194,18 +195,21 @@ func (w *RowWriter) writeViaBatch(ctx context.Context, table *ir.Table, rows <-c
 }
 
 // buildBatchInsert returns the parameterised INSERT statement for the
-// given table and row count. Postgres uses $1, $2, ... placeholders
+// given table and row count. Generated columns are excluded — the
+// reader doesn't emit values for them, and INSERT into a generated
+// column is a database error. Postgres uses $1, $2, ... placeholders
 // (numbered, not positional like MySQL's ?).
 //
 // The numbering is global across rows: row 1 is $1..$N, row 2 is
 // $(N+1)..$(2N), etc.
 func buildBatchInsert(schema string, table *ir.Table, rowCount int) string {
-	colNames := make([]string, len(table.Columns))
-	for i, c := range table.Columns {
+	cols := nonGeneratedColumns(table.Columns)
+	colNames := make([]string, len(cols))
+	for i, c := range cols {
 		colNames[i] = quoteIdent(c.Name)
 	}
 
-	numCols := len(table.Columns)
+	numCols := len(cols)
 	rowParts := make([]string, rowCount)
 	paramIdx := 0
 	for i := range rowParts {
@@ -229,10 +233,13 @@ func buildBatchInsert(schema string, table *ir.Table, rowCount int) string {
 // flattenArgs walks the batch column-major-by-row and produces the
 // flat []any the driver expects, with each value passed through
 // prepareValue for any IR-canonical → driver-acceptable adjustments.
+// Generated columns are skipped so the column-list and value-list
+// stay in lockstep with buildBatchInsert.
 func flattenArgs(batch []ir.Row, table *ir.Table) ([]any, error) {
-	args := make([]any, 0, len(batch)*len(table.Columns))
+	cols := nonGeneratedColumns(table.Columns)
+	args := make([]any, 0, len(batch)*len(cols))
 	for _, row := range batch {
-		for _, col := range table.Columns {
+		for _, col := range cols {
 			v, err := prepareValue(row[col.Name], col.Type)
 			if err != nil {
 				return nil, fmt.Errorf("column %q: %w", col.Name, err)

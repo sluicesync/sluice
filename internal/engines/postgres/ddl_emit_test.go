@@ -305,6 +305,54 @@ func TestEmitColumnDef(t *testing.T) {
 	}
 }
 
+// TestEmitColumnDef_Generated covers GENERATED ALWAYS AS (...) STORED
+// emission. Postgres only supports STORED; a VIRTUAL source column is
+// silently promoted with a slog warning (verified separately by the
+// integration test that exercises a MySQL VIRTUAL → PG path).
+func TestEmitColumnDef_Generated(t *testing.T) {
+	tbl := &ir.Table{Name: "invoices"}
+
+	cases := []struct {
+		name string
+		in   *ir.Column
+		want string
+	}{
+		{
+			name: "stored generated bigint",
+			in: &ir.Column{
+				Name:            "total",
+				Type:            ir.Integer{Width: 64},
+				GeneratedExpr:   "qty * price",
+				GeneratedStored: true,
+			},
+			want: `"total" BIGINT GENERATED ALWAYS AS (qty * price) STORED NOT NULL`,
+		},
+		{
+			name: "virtual source column promoted to stored",
+			in: &ir.Column{
+				Name:            "tax",
+				Type:            ir.Decimal{Precision: 10, Scale: 2},
+				Nullable:        true,
+				GeneratedExpr:   "subtotal * 0.07",
+				GeneratedStored: false,
+			},
+			want: `"tax" NUMERIC(10,2) GENERATED ALWAYS AS (subtotal * 0.07) STORED`,
+		},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			got, err := emitColumnDef(tbl, c.in, emitOpts{})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != c.want {
+				t.Errorf("\n got  %q\n want %q", got, c.want)
+			}
+		})
+	}
+}
+
 func TestEmitCreateEnumType(t *testing.T) {
 	got := emitCreateEnumType("public", "users", "role", []string{"admin", "user", "guest"})
 	want := `CREATE TYPE "public"."users_role_enum" AS ENUM ('admin', 'user', 'guest');`
