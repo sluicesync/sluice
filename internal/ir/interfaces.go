@@ -62,6 +62,25 @@ type TableTruncator interface {
 	TruncateTable(ctx context.Context, table *Table) error
 }
 
+// TableEmptyChecker is the optional surface a [RowWriter] (or
+// [SchemaWriter]) can implement so the pipeline can detect a
+// pre-existing populated dest table before starting a cold-start
+// bulk-copy. Used by the cold-start pre-flight to refuse migrations
+// that would otherwise INSERT into a non-empty target — typically a
+// sign of a previously-killed cold-start run whose dest tables are
+// still in place. See [pipeline] for the recovery flow.
+//
+// Implementations should treat a missing table as empty (return
+// true, nil) so the pre-flight check doesn't double up with the
+// schema-apply phase's CREATE TABLE IF NOT EXISTS.
+//
+// Engines that don't expose this surface are silently skipped by the
+// pre-flight check — the pipeline keeps the v0.3.0 behaviour of
+// trusting the operator that "cold-start" means "fresh tables".
+type TableEmptyChecker interface {
+	IsTableEmpty(ctx context.Context, table *Table) (bool, error)
+}
+
 // CDCReader streams [Change] events from a source database starting at
 // the given Position. Engines whose [Capabilities.CDC] is [CDCNone]
 // return a non-nil error for any call to this interface.

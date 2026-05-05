@@ -86,6 +86,36 @@ func (w *RowWriter) TruncateTable(ctx context.Context, table *ir.Table) error {
 	return nil
 }
 
+// IsTableEmpty reports whether the target table has no rows. A
+// missing table is treated as empty so the cold-start pre-flight
+// doesn't double up with the subsequent CREATE TABLE IF NOT EXISTS
+// step. Implements [ir.TableEmptyChecker].
+//
+// We use SELECT 1 ... LIMIT 1 rather than COUNT(*) so the cost is
+// constant regardless of table size — the pre-flight only needs to
+// know "is anything there", not "how many rows".
+func (w *RowWriter) IsTableEmpty(ctx context.Context, table *ir.Table) (bool, error) {
+	if table == nil {
+		return false, errors.New("postgres: IsTableEmpty: table is nil")
+	}
+	q := "SELECT 1 FROM " + quoteIdent(w.schema) + "." + quoteIdent(table.Name) + " LIMIT 1"
+	var dummy int
+	err := w.db.QueryRowContext(ctx, q).Scan(&dummy)
+	if err == nil {
+		return false, nil
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		return true, nil
+	}
+	// Postgres SQLSTATE 42P01 = undefined_table. The driver surfaces
+	// it as a *pgconn.PgError; we check the message text rather than
+	// importing pgconn here just for one check.
+	if strings.Contains(err.Error(), "does not exist") {
+		return true, nil
+	}
+	return false, fmt.Errorf("postgres: probe %q for emptiness: %w", table.Name, err)
+}
+
 // WriteRows is the dispatcher. Validates inputs, then routes to the
 // strategy chosen by useCopy. See [ir.RowWriter.WriteRows] for the
 // contract.

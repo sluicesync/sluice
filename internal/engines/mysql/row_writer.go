@@ -79,6 +79,40 @@ func (w *RowWriter) TruncateTable(ctx context.Context, table *ir.Table) error {
 	return nil
 }
 
+// IsTableEmpty reports whether the target table has no rows. A
+// missing table is treated as empty so the cold-start pre-flight
+// doesn't double up with the subsequent CREATE TABLE IF NOT EXISTS
+// step. Implements [ir.TableEmptyChecker].
+//
+// We use SELECT 1 ... LIMIT 1 rather than COUNT(*) so the cost is
+// constant regardless of table size — the pre-flight only needs to
+// know "is anything there", not "how many rows".
+func (w *RowWriter) IsTableEmpty(ctx context.Context, table *ir.Table) (bool, error) {
+	if table == nil {
+		return false, errors.New("mysql: IsTableEmpty: table is nil")
+	}
+	stmt := "SELECT 1 FROM " + quoteIdent(table.Name) + " LIMIT 1"
+	if w.schema != "" {
+		stmt = "SELECT 1 FROM " + quoteIdent(w.schema) + "." + quoteIdent(table.Name) + " LIMIT 1"
+	}
+	var dummy int
+	err := w.db.QueryRowContext(ctx, stmt).Scan(&dummy)
+	if err == nil {
+		return false, nil
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		return true, nil
+	}
+	// MySQL error 1146 ("Table 'x.y' doesn't exist") plus the Vitess
+	// equivalent both contain "doesn't exist" in the message — that's
+	// the simplest cross-flavor check without importing the driver's
+	// error type into this package.
+	if strings.Contains(err.Error(), "doesn't exist") {
+		return true, nil
+	}
+	return false, fmt.Errorf("mysql: probe %q for emptiness: %w", table.Name, err)
+}
+
 // WriteRows consumes rows from the channel and inserts them into table
 // using the strategy chosen at construction time. The method returns
 // when the channel is closed (success) or when ctx is cancelled / a
