@@ -6,6 +6,24 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Windows CI: `TestPreviewer_Golden_Text` fails with CRLF/LF
+  mismatch.** The test compared `bytes.Equal(buf.Bytes(), want)` —
+  buffer with LF newlines (Go's native `\n`) vs. file content that
+  git's default `core.autocrlf=true` had converted to CRLF on
+  Windows checkouts. The diff showed visually identical content;
+  byte comparison failed.
+
+  Two-part fix:
+  1. New `.gitattributes` enforces `eol=lf` on text files so
+     Windows checkouts no longer get CRLF on golden fixtures.
+  2. The test normalises CRLF→LF on the read side before comparing
+     — belt-and-suspenders against any future checkout that
+     bypasses the attribute (e.g. zip-download, alternate clones).
+
+  No behavioural change to runtime code; CI-only fix.
+
 ## [0.6.0] - 2026-05-05
 
 Feature release. Headline additions are `sluice schema preview` (operator-facing target-DDL inspection with translation notes and advisory hints) and `--reset-target-data` (one-command destructive recovery on top of v0.5.2's slot-missing fall-through). Plus four reliability items uncovered during v0.5.x testing: a CI-only data race in the parallel-copy state-write path, batched-apply idle flush on quiet streams, MySQL binlog-purged fall-through (extends ADR-0022 to the MySQL side), and two parallel-copy hygiene follow-ups. Two new ADRs (0023 schema preview, 0024 reset-target-data); ADR-0022 extended for MySQL.

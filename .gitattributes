@@ -1,0 +1,17 @@
+# Force LF line endings on text files so Go tests that compare byte
+# slices against on-disk fixtures don't fail on Windows checkouts where
+# git's default core.autocrlf converts to CRLF. Specifically affects
+# the schema-preview golden files; broadened to all text testdata for
+# consistency.
+* text=auto eol=lf
+
+# Binary files: never touch.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.tar binary
+*.gz binary

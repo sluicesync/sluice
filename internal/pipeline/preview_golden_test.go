@@ -88,6 +88,11 @@ func TestPreviewer_Golden_Text(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read golden %q: %v\nrun with -update to create", goldenPath, err)
 	}
+	// Normalize CRLF to LF on the read-side so the test is resilient
+	// to a Windows checkout where git's autocrlf converted the golden
+	// file. The .gitattributes rule should keep the file LF-only on
+	// disk; the normalize is belt-and-suspenders.
+	want = bytes.ReplaceAll(want, []byte("\r\n"), []byte("\n"))
 	if !bytes.Equal(buf.Bytes(), want) {
 		t.Errorf("golden mismatch in %s\n--- got ---\n%s\n--- want ---\n%s",
 			goldenPath, buf.String(), string(want))
