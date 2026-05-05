@@ -151,18 +151,23 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: "go.mod"
-      - uses: golangci/golangci-lint-action@v6
+      - uses: golangci/golangci-lint-action@v8
         with:
-          # 'latest' tracks the most recent stable release of
-          # golangci-lint (v2.x as of 2026). Our .golangci.yml is in v2
-          # schema — see the file header for the migration notes.
+          # @v8+ of the action natively requires golangci-lint v2 (the
+          # major-version split happened in early 2026). Our
+          # .golangci.yml is in v2 schema — see the file header for
+          # the migration notes. Earlier versions of the action (@v6,
+          # @v7) defaulted goinstall to the v1 module path, which
+          # silently installed v1.64.8 even when "version: latest" was
+          # set; @v8+ uses the v2 module path correctly.
           version: latest
           # install-mode: goinstall compiles golangci-lint from source
           # using the Go toolchain we just installed, so the linter's
           # embedded type-checker matches the Go version declared in
-          # go.mod. The pre-built v2 binary releases lag a Go version
-          # or two behind, which would fail to typecheck packages that
-          # require the newer Go (the issue we hit on the v0.3.0 build).
+          # go.mod. Prebuilt v2 binaries lag the latest Go release;
+          # without this, packages that require Go 1.26 features (like
+          # the stdlib's chacha20poly1305 fips140only_go1.26.go file)
+          # fail to typecheck during lint.
           install-mode: goinstall
           # Fail the job on any issue. Combined with branch protection
           # this means you can't merge until lint is clean.
