@@ -258,3 +258,18 @@ func clearStopRequested(ctx context.Context, db *sql.DB, streamID string) error 
 	}
 	return nil
 }
+
+// clearStream deletes the named stream's row from the per-target
+// control table. Idempotent and tolerant of a missing row or table —
+// re-running `--reset-target-data` after a partial failure proceeds
+// cleanly. See [ChangeApplier.ClearStream] for the recovery flow.
+func clearStream(ctx context.Context, db *sql.DB, streamID string) error {
+	const q = "DELETE FROM `" + controlTableName + "` WHERE stream_id = ?"
+	if _, err := db.ExecContext(ctx, q, streamID); err != nil {
+		if isMySQLMissingTableErr(err) {
+			return nil
+		}
+		return fmt.Errorf("mysql: clear stream: %w", err)
+	}
+	return nil
+}

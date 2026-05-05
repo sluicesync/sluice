@@ -101,6 +101,15 @@ empty position (forces a fresh snapshot). To prevent recurrence, raise
 max_slot_wal_keep_size on the source — PlanetScale recommends > 4GB
 ```
 
+### One-command recovery via `--reset-target-data`
+
+After dropping the slot on the source, the next `sluice sync start` will trip the cold-start pre-flight refusal because the target still has the partially-streamed dest data. Two paths past the refusal:
+
+- **`sluice sync start --reset-target-data --yes ...`** (recommended for recovery): clears `sluice_cdc_state` and DROPs every source-schema table on the target, then runs cold-start. Confirmation prompt requires typing `reset` verbatim unless `--yes` is set. See [ADR-0023](adr/adr-0023-reset-target-data.md).
+- **`sluice sync start --force-cold-start ...`**: bypasses the refusal but does *not* clean up. INSERTs into the populated dest collide on PRIMARY KEY. Use only when you have manually wiped or otherwise prepared the target.
+
+`--reset-target-data` is destructive on the target — drops every table sluice manages on that DSN. Other tables on the target (sluice's bookkeeping tables aside) are untouched. The `slot drop` on the source is still a precondition; the flag handles dest-side cleanup only.
+
 ## Operator commands
 
 List slots on the source:

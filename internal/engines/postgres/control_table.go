@@ -227,3 +227,19 @@ func clearStopRequested(ctx context.Context, db *sql.DB, schema, streamID string
 	}
 	return nil
 }
+
+// clearStream deletes the named stream's row from the per-target
+// control table. Idempotent and tolerant of a missing row or table —
+// re-running `--reset-target-data` after a partial failure proceeds
+// cleanly. See [ChangeApplier.ClearStream] for the recovery flow.
+func clearStream(ctx context.Context, db *sql.DB, schema, streamID string) error {
+	tableRef := quoteIdent(schema) + "." + quoteIdent(controlTableName)
+	q := "DELETE FROM " + tableRef + " WHERE stream_id = $1"
+	if _, err := db.ExecContext(ctx, q, streamID); err != nil {
+		if isUndefinedRelationErr(err) {
+			return nil
+		}
+		return fmt.Errorf("postgres: clear stream: %w", err)
+	}
+	return nil
+}

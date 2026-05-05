@@ -159,6 +159,25 @@ func (s *MigrationStateStore) Write(ctx context.Context, state ir.MigrationState
 	return nil
 }
 
+// ClearMigration deletes the row for migrationID. Used by the
+// `--reset-target-data` recovery path (ADR-0023). Idempotent and
+// tolerant of a missing row or a missing table — the next run with
+// `--reset-target-data` proceeds cleanly either way.
+func (s *MigrationStateStore) ClearMigration(ctx context.Context, migrationID string) error {
+	if migrationID == "" {
+		return errors.New("postgres: migrate-state ClearMigration: migrationID is empty")
+	}
+	tableRef := quoteIdent(s.schema) + "." + quoteIdent(migrateStateTableName)
+	q := "DELETE FROM " + tableRef + " WHERE migration_id = $1"
+	if _, err := s.db.ExecContext(ctx, q, migrationID); err != nil {
+		if isUndefinedRelationErr(err) {
+			return nil
+		}
+		return fmt.Errorf("postgres: clear migrate-state: %w", err)
+	}
+	return nil
+}
+
 // nullableString returns a sql.NullString that's invalid when s is
 // empty. Centralises the "empty string maps to SQL NULL" convention
 // so encodeTableProgress's empty-map = nil JSON stays distinct from

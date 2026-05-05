@@ -92,6 +92,10 @@ type MigrateCmd struct {
 
 	ForceColdStart bool `help:"Skip the cold-start pre-flight check that refuses to bulk-copy into a populated target. Use with caution — INSERT into a non-empty table will collide on PRIMARY KEY. Ignored when --resume is set."`
 
+	ResetTargetData bool `help:"Destructive recovery: DELETE the migrate-state row, DROP every source-schema table on the target, then run a fresh cold-start. Use after a wedged-state recovery (e.g. slot-missing fall-through). Requires confirmation (type 'reset') unless --yes is set. Mutually exclusive with --resume. See ADR-0023."`
+
+	Yes bool `help:"Skip the destructive-action confirmation prompt for --reset-target-data." short:"y"`
+
 	BulkBatchSize int `help:"Bulk-copy batch size for resume-mid-table checkpointing. Each batch commits with an updated cursor in sluice_migrate_state.table_progress, so a crash mid-table resumes without re-copying the prefix. Tables without a PK fall back to truncate-and-redo regardless. Lower values shorten the replay window on crash; higher values amortise per-tx commit overhead. Only consulted on the resume path; cold-start migrations use the faster plain-INSERT / COPY path. Default 5000." default:"5000" placeholder:"N"`
 
 	BulkParallelism int `help:"Number of parallel reader/writer pairs per table during bulk copy. Tables above --bulk-parallel-min-rows are split into this many PK ranges and copied concurrently. Tables without a single integer PK fall back to single-reader. 0 means use min(8, NumCPU); 1 disables parallelism. See ADR-0019." default:"0" placeholder:"N"`
@@ -122,6 +126,9 @@ func (m *MigrateCmd) Run(g *Globals) error {
 	if len(m.IncludeTable) > 0 && len(m.ExcludeTable) > 0 {
 		return errors.New("--include-table and --exclude-table are mutually exclusive")
 	}
+	if m.Resume && m.ResetTargetData {
+		return errors.New("--resume and --reset-target-data are mutually exclusive")
+	}
 	include, exclude := resolveTableFilterArgs(m.IncludeTable, m.ExcludeTable, cfg)
 	filter, err := pipeline.NewTableFilter(include, exclude)
 	if err != nil {
@@ -131,6 +138,18 @@ func (m *MigrateCmd) Run(g *Globals) error {
 	mappings, err := resolveMappings(m.TypeOverride, cfg)
 	if err != nil {
 		return err
+	}
+
+	if m.ResetTargetData && !m.Yes {
+		ok, err := confirmTypedDestructive(os.Stdin, os.Stdout,
+			"This will DROP tables on the target. Type 'reset' to confirm: ", "reset")
+		if err != nil {
+			return err
+		}
+		if !ok {
+			fmt.Fprintln(os.Stdout, "aborted")
+			return nil
+		}
 	}
 
 	mig := &pipeline.Migrator{
@@ -144,6 +163,7 @@ func (m *MigrateCmd) Run(g *Globals) error {
 		Resume:              m.Resume,
 		MigrationID:         m.MigrationID,
 		ForceColdStart:      m.ForceColdStart,
+		ResetTargetData:     m.ResetTargetData,
 		BulkBatchSize:       m.BulkBatchSize,
 		BulkParallelism:     m.BulkParallelism,
 		BulkParallelMinRows: m.BulkParallelMinRows,
@@ -214,6 +234,10 @@ type SyncStartCmd struct {
 
 	ForceColdStart bool `help:"Skip the cold-start pre-flight check that refuses to bulk-copy into a populated target. Use with caution — INSERT into a non-empty table will collide on PRIMARY KEY. Ignored on the warm-resume path."`
 
+	ResetTargetData bool `help:"Destructive recovery: DELETE the cdc-state row, DROP every source-schema table on the target, then run a fresh cold-start stream. Use after slot-missing fall-through or a similar wedged-state recovery. Requires confirmation (type 'reset') unless --yes is set. See ADR-0023."`
+
+	Yes bool `help:"Skip the destructive-action confirmation prompt for --reset-target-data." short:"y"`
+
 	ApplyBatchSize int `help:"Batch up to N CDC changes per target transaction. Default 1 (one change per tx, conservative). Production tuning: 100-500 typically gives 50-100x throughput on bulk CDC traffic. Schema-change events (TRUNCATE) flush the in-progress batch; the cap is an upper bound on batch size, not a target. Idempotent applier semantics (ADR-0010) keep replay-on-crash safe; ADR-0017 covers the full design." default:"1" placeholder:"N"`
 }
 
@@ -247,17 +271,30 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 		return err
 	}
 
+	if s.ResetTargetData && !s.Yes {
+		ok, err := confirmTypedDestructive(os.Stdin, os.Stdout,
+			"This will DROP tables on the target. Type 'reset' to confirm: ", "reset")
+		if err != nil {
+			return err
+		}
+		if !ok {
+			fmt.Fprintln(os.Stdout, "aborted")
+			return nil
+		}
+	}
+
 	streamer := &pipeline.Streamer{
-		Source:         source,
-		Target:         target,
-		SourceDSN:      s.Source,
-		TargetDSN:      s.Target,
-		StreamID:       s.StreamID,
-		Mappings:       mappings,
-		DryRun:         s.DryRun,
-		Filter:         filter,
-		ForceColdStart: s.ForceColdStart,
-		ApplyBatchSize: s.ApplyBatchSize,
+		Source:          source,
+		Target:          target,
+		SourceDSN:       s.Source,
+		TargetDSN:       s.Target,
+		StreamID:        s.StreamID,
+		Mappings:        mappings,
+		DryRun:          s.DryRun,
+		Filter:          filter,
+		ForceColdStart:  s.ForceColdStart,
+		ResetTargetData: s.ResetTargetData,
+		ApplyBatchSize:  s.ApplyBatchSize,
 	}
 	return streamer.Run(kongContext())
 }

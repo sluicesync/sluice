@@ -139,6 +139,20 @@ type Streamer struct {
 	// the warm-resume path — that branch doesn't bulk-copy.
 	ForceColdStart bool
 
+	// ResetTargetData, when true, clears the cdc-state row and drops
+	// every source-schema table on the target before starting a fresh
+	// cold-start stream. The destructive recovery path for the
+	// v0.5.2 slot-missing fall-through and similar wedged-state
+	// scenarios. See ADR-0023.
+	//
+	// Forces the cold-start branch: warm-resume is bypassed in favour
+	// of cold-start after the reset wipes both the state row and the
+	// dest tables. The pre-flight refusal is skipped on the same run
+	// — the drop loop runs to completion first. Engines that don't
+	// expose the optional [ir.TableDropper] / [ir.StreamCleaner]
+	// surfaces cause the flag to error clearly before any work runs.
+	ResetTargetData bool
+
 	// ApplyBatchSize is the upper bound on changes per target
 	// transaction. 0 or 1 means one-change-per-tx (the conservative
 	// v0.3.x default). Larger values amortise per-tx commit
@@ -243,8 +257,18 @@ func (s *Streamer) Run(ctx context.Context) error {
 	// same lsnTracker. Bug 9's pre-flight refusal still gates
 	// destructive dest-table operations — auto-fall-through does
 	// not silently destroy data.
+	//
+	// --reset-target-data (ADR-0023): destructive recovery — clear
+	// the cdc-state row, drop dest tables, then run cold-start. The
+	// reset itself happens inside coldStart so it shares the schema
+	// read + row writer that already need to open. We force the
+	// cold-start branch here rather than risk warmResume seeing the
+	// stale row before reset clears it.
 	var changes <-chan ir.Change
-	if found {
+	switch {
+	case s.ResetTargetData:
+		changes, err = s.coldStart(ctx, lsnTracker, applier, streamID)
+	case found:
 		changes, err = s.warmResume(ctx, persisted, lsnTracker)
 		if err != nil && errors.Is(err, ir.ErrPositionInvalid) {
 			slog.WarnContext(ctx, "warm resume: persisted position is no longer valid; falling through to cold start",
@@ -253,10 +277,10 @@ func (s *Streamer) Run(ctx context.Context) error {
 				slog.String("source_engine", persisted.Engine),
 				slog.String("err", err.Error()),
 			)
-			changes, err = s.coldStart(ctx, lsnTracker)
+			changes, err = s.coldStart(ctx, lsnTracker, applier, streamID)
 		}
-	} else {
-		changes, err = s.coldStart(ctx, lsnTracker)
+	default:
+		changes, err = s.coldStart(ctx, lsnTracker, applier, streamID)
 	}
 	if err != nil {
 		return err
@@ -480,7 +504,14 @@ func (s *Streamer) warmResume(ctx context.Context, persisted ir.Position, lsnTra
 // ADR-0020) — attached to the snapshot stream's CDC reader before
 // StreamChanges so the keepalive path uses applied-LSN from the
 // first ack onwards.
-func (s *Streamer) coldStart(ctx context.Context, lsnTracker any) (<-chan ir.Change, error) {
+//
+// applier and streamID are the engine-side handles for the optional
+// `--reset-target-data` recovery path (ADR-0023): when [s.ResetTargetData]
+// is set, the cdc-state row is cleared via [ir.StreamCleaner] and dest
+// tables are dropped via [ir.TableDropper] before the bulk-copy phase
+// begins. Both surfaces are optional; an engine that doesn't expose
+// them surfaces a clear refusal rather than running a partial reset.
+func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.ChangeApplier, streamID string) (<-chan ir.Change, error) {
 	sr, err := s.Source.OpenSchemaReader(ctx, s.SourceDSN)
 	if err != nil {
 		return nil, wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: open source schema reader: %w", err))
@@ -546,16 +577,25 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any) (<-chan ir.Cha
 		return nil, wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: open target row writer: %w", err))
 	}
 
-	// Cold-start pre-flight: refuse if any target table already
-	// contains data. See preflight.go for the rationale (Bug 9).
-	// Streamer's cold-start branch is the analogue of Migrator's
-	// non-resume cold-start path; warm-resume doesn't run bulk-copy
-	// and is therefore not gated by this check.
-	if err := preflightColdStart(ctx, schema, rw, s.ForceColdStart); err != nil {
-		closeIf(rw)
-		closeIf(sw)
-		_ = stream.Close()
-		return nil, err
+	if s.ResetTargetData {
+		if err := resetTargetDataForStream(ctx, schema, rw, applier, streamID); err != nil {
+			closeIf(rw)
+			closeIf(sw)
+			_ = stream.Close()
+			return nil, err
+		}
+	} else {
+		// Cold-start pre-flight: refuse if any target table already
+		// contains data. See preflight.go for the rationale (Bug 9).
+		// Streamer's cold-start branch is the analogue of Migrator's
+		// non-resume cold-start path; warm-resume doesn't run bulk-copy
+		// and is therefore not gated by this check.
+		if err := preflightColdStart(ctx, schema, rw, s.ForceColdStart); err != nil {
+			closeIf(rw)
+			closeIf(sw)
+			_ = stream.Close()
+			return nil, err
+		}
 	}
 
 	if err := runBulkCopy(ctx, schema, stream.Rows, sw, rw); err != nil {

@@ -158,6 +158,24 @@ func (s *MigrationStateStore) Write(ctx context.Context, state ir.MigrationState
 	return nil
 }
 
+// ClearMigration deletes the row for migrationID. Used by the
+// `--reset-target-data` recovery path (ADR-0023). Idempotent and
+// tolerant of a missing row or a missing table — the next run with
+// `--reset-target-data` proceeds cleanly either way.
+func (s *MigrationStateStore) ClearMigration(ctx context.Context, migrationID string) error {
+	if migrationID == "" {
+		return errors.New("mysql: migrate-state ClearMigration: migrationID is empty")
+	}
+	const q = "DELETE FROM `" + migrateStateTableName + "` WHERE migration_id = ?"
+	if _, err := s.db.ExecContext(ctx, q, migrationID); err != nil {
+		if isMySQLMissingTableErr(err) {
+			return nil
+		}
+		return fmt.Errorf("mysql: clear migrate-state: %w", err)
+	}
+	return nil
+}
+
 // nullableMigrateString returns a sql.NullString that's invalid when
 // s is empty. Empty values land as SQL NULL on disk so a fresh row
 // with no per-table progress reads back as nil rather than `{}`.

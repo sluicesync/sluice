@@ -144,10 +144,16 @@ func truncateLastError(msg string) string {
 //   - row found, phase!=complete, --resume=false → error: drop or
 //     pass --resume
 //
+// When resetting=true, the "row already exists" refusal branches are
+// bypassed: the caller (Migrator with --reset-target-data) intends to
+// DELETE the row and start fresh, so the existence of an old row is
+// expected. A pending row is still written so subsequent phase
+// transitions have somewhere to land.
+//
 // The boolean second return signals "exit cleanly with no further
 // work" — i.e., the already-complete-resume case. Callers branch on
 // that to short-circuit Migrator.Run.
-func loadOrInitState(ctx context.Context, rc resumeContext, resume bool) (ir.MigrationState, bool, error) {
+func loadOrInitState(ctx context.Context, rc resumeContext, resume, resetting bool) (ir.MigrationState, bool, error) {
 	if !rc.enabled {
 		// No store available — fall back to non-resumable behaviour.
 		// --resume requested without a store is a clear caller error
@@ -165,6 +171,18 @@ func loadOrInitState(ctx context.Context, rc resumeContext, resume bool) (ir.Mig
 	state, found, err := rc.store.Read(ctx, rc.migrationID)
 	if err != nil {
 		return ir.MigrationState{}, false, fmt.Errorf("pipeline: read migrate-state: %w", err)
+	}
+
+	if resetting {
+		// --reset-target-data: ignore any existing row's phase; the
+		// reset path will DELETE it shortly. Return a pending state
+		// so the rest of Run treats this as a fresh migration.
+		fresh := ir.MigrationState{
+			MigrationID:   rc.migrationID,
+			Phase:         ir.MigrationPhasePending,
+			TableProgress: nil,
+		}
+		return fresh, false, nil
 	}
 
 	switch {

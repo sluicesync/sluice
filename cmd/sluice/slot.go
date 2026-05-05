@@ -152,6 +152,24 @@ func confirmDestructive(in io.Reader, out io.Writer, prompt string) (bool, error
 	return answer == "y" || answer == "yes", nil
 }
 
+// confirmTypedDestructive prompts the operator and accepts only an
+// exact match (after trim) against the supplied expected token. The
+// match is case-sensitive on the token: muscle-memory enter or "y"
+// will not pass. Used by `--reset-target-data` (ADR-0023), which sits
+// at a higher friction tier than `slot drop` because it destroys
+// target data.
+func confirmTypedDestructive(in io.Reader, out io.Writer, prompt, expected string) (bool, error) {
+	fmt.Fprint(out, prompt)
+	scanner := bufio.NewScanner(in)
+	if !scanner.Scan() {
+		if err := scanner.Err(); err != nil {
+			return false, fmt.Errorf("read confirmation: %w", err)
+		}
+		return false, nil
+	}
+	return strings.TrimSpace(scanner.Text()) == expected, nil
+}
+
 // isSlotNotFoundErr returns true if err wraps a slot-not-found
 // signal from any engine. Today only Postgres exposes the error;
 // the helper string-matches the wrapped engine error rather than

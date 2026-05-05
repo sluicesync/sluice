@@ -80,6 +80,65 @@ func (w *RowWriter) TruncateTable(ctx context.Context, table *ir.Table) error {
 	return nil
 }
 
+// DropTable drops the target table. Used by the
+// `--reset-target-data` recovery path (ADR-0023). Implements
+// [ir.TableDropper].
+//
+// MySQL's DROP TABLE does not accept the CASCADE keyword (which is
+// PG-specific); InnoDB's referential cascade rules handle FK
+// dependencies based on the constraint's declared ON DELETE action.
+// IF EXISTS keeps the call idempotent across partial-failure retries.
+// The schema readers exclude `sluice_*_state` tables, so the
+// bookkeeping row is cleared via [MigrationStateStore.ClearMigration]
+// / [ChangeApplier.ClearStream] rather than ever reaching this method.
+func (w *RowWriter) DropTable(ctx context.Context, table *ir.Table) error {
+	if table == nil {
+		return errors.New("mysql: DropTable: table is nil")
+	}
+	stmt := "DROP TABLE IF EXISTS " + quoteIdent(table.Name)
+	if w.schema != "" {
+		stmt = "DROP TABLE IF EXISTS " + quoteIdent(w.schema) + "." + quoteIdent(table.Name)
+	}
+	if _, err := w.db.ExecContext(ctx, stmt); err != nil {
+		return fmt.Errorf("mysql: drop %q: %w", table.Name, err)
+	}
+	return nil
+}
+
+// DropTables drops every named table with one DROP TABLE statement.
+// Implements [ir.BulkTableDropper] for the reset path on databases
+// with many tables — collapses N round-trips into one. MySQL's
+// multi-table DROP is atomic per the binlog-correctness model;
+// either every named table goes away or none do. IF EXISTS preserves
+// idempotency. CASCADE is not a MySQL keyword; InnoDB's referential
+// cascade rules handle FK dependencies.
+//
+// An empty input list is a no-op; nil entries are skipped silently.
+func (w *RowWriter) DropTables(ctx context.Context, tables []*ir.Table) error {
+	if len(tables) == 0 {
+		return nil
+	}
+	parts := make([]string, 0, len(tables))
+	for _, t := range tables {
+		if t == nil {
+			continue
+		}
+		if w.schema != "" {
+			parts = append(parts, quoteIdent(w.schema)+"."+quoteIdent(t.Name))
+		} else {
+			parts = append(parts, quoteIdent(t.Name))
+		}
+	}
+	if len(parts) == 0 {
+		return nil
+	}
+	stmt := "DROP TABLE IF EXISTS " + strings.Join(parts, ", ")
+	if _, err := w.db.ExecContext(ctx, stmt); err != nil {
+		return fmt.Errorf("mysql: drop %d tables: %w", len(parts), err)
+	}
+	return nil
+}
+
 // IsTableEmpty reports whether the target table has no rows. A
 // missing table is treated as empty so the cold-start pre-flight
 // doesn't double up with the subsequent CREATE TABLE IF NOT EXISTS

@@ -44,6 +44,41 @@ func TestConfirmDestructiveAccepts(t *testing.T) {
 	}
 }
 
+func TestConfirmTypedDestructiveAccepts(t *testing.T) {
+	cases := []struct {
+		name     string
+		input    string
+		expected string
+		want     bool
+	}{
+		{"empty refuses", "\n", "reset", false},
+		{"y refuses", "y\n", "reset", false},
+		{"yes refuses", "yes\n", "reset", false},
+		{"reset accepts", "reset\n", "reset", true},
+		{"trim whitespace", "  reset  \n", "reset", true},
+		{"case-sensitive: RESET refuses", "RESET\n", "reset", false},
+		{"close-but-typo refuses", "rest\n", "reset", false},
+		{"empty stream refuses", "", "reset", false},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			out := &bytes.Buffer{}
+			in := strings.NewReader(c.input)
+			got, err := confirmTypedDestructive(in, out, "Type 'reset' to confirm: ", c.expected)
+			if err != nil {
+				t.Fatalf("confirmTypedDestructive: %v", err)
+			}
+			if got != c.want {
+				t.Errorf("got %v; want %v", got, c.want)
+			}
+			if !strings.Contains(out.String(), "Type 'reset' to confirm") {
+				t.Errorf("prompt not written to out: %q", out.String())
+			}
+		})
+	}
+}
+
 func TestIsSlotNotFoundErr(t *testing.T) {
 	if isSlotNotFoundErr(nil) {
 		t.Error("nil error should not be slot-not-found")

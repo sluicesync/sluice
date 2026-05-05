@@ -123,6 +123,20 @@ type Migrator struct {
 	// regardless of this flag.
 	ForceColdStart bool
 
+	// ResetTargetData, when true, clears the migrate-state row and
+	// drops every source-schema table on the target before starting
+	// a fresh cold-start migration. The destructive recovery path for
+	// the v0.5.2 slot-missing fall-through and similar wedged-state
+	// recovery scenarios. See ADR-0023.
+	//
+	// Mutually exclusive with Resume; the CLI rejects the combination
+	// at parse time. The drop loop uses the optional [ir.TableDropper]
+	// surface; engines that don't expose it surface a clear refusal.
+	// The pre-flight refusal is skipped when this flag is set — the
+	// drop loop runs to completion before any pre-flight probe could
+	// fire.
+	ResetTargetData bool
+
 	// BulkBatchSize controls the per-batch row count for the
 	// resume-mid-table checkpointing path (see ADR-0018). Each batch
 	// commits with an updated cursor in
@@ -209,7 +223,7 @@ func (m *Migrator) Run(ctx context.Context) error {
 
 	// ---- 1.75. Open the migration-state store (if the target engine
 	// supports it) and resolve the migration_id. ----
-	rc, state, exitClean, err := m.openResumeContext(ctx)
+	rc, state, exitClean, err := m.openResumeContext(ctx, m.ResetTargetData)
 	if err != nil {
 		return err
 	}
@@ -249,12 +263,18 @@ func (m *Migrator) Run(ctx context.Context) error {
 	if resuming {
 		logResumeStart(ctx, state, schema)
 	} else {
-		// Cold-start pre-flight: refuse if any target table already
-		// contains data. See preflight.go for the rationale (Bug 9).
-		// Skipped on --resume (TableProgress drives that path) and
-		// on --force-cold-start (explicit operator override).
-		if err := preflightColdStart(ctx, schema, rw, m.ForceColdStart); err != nil {
-			return markFailed(ctx, rc, state, ir.MigrationPhasePending, err)
+		if m.ResetTargetData {
+			if err := resetTargetData(ctx, schema, rw, rc.store, rc.migrationID); err != nil {
+				return markFailed(ctx, rc, state, ir.MigrationPhasePending, err)
+			}
+		} else {
+			// Cold-start pre-flight: refuse if any target table already
+			// contains data. See preflight.go for the rationale (Bug 9).
+			// Skipped on --resume (TableProgress drives that path) and
+			// on --force-cold-start (explicit operator override).
+			if err := preflightColdStart(ctx, schema, rw, m.ForceColdStart); err != nil {
+				return markFailed(ctx, rc, state, ir.MigrationPhasePending, err)
+			}
 		}
 	}
 
@@ -286,7 +306,7 @@ func (m *Migrator) Run(ctx context.Context) error {
 // branch and the "store open / table ensure" failures; both surface
 // before any target writers open so the operator gets a clean
 // refusal rather than a half-open connection set.
-func (m *Migrator) openResumeContext(ctx context.Context) (resumeContext, ir.MigrationState, bool, error) {
+func (m *Migrator) openResumeContext(ctx context.Context, resetting bool) (resumeContext, ir.MigrationState, bool, error) {
 	store, err := openMigrationStateStore(ctx, m.Target, m.TargetDSN)
 	if err != nil {
 		return resumeContext{}, ir.MigrationState{}, false, wrapWithHint(PhaseConnect, err)
@@ -296,7 +316,7 @@ func (m *Migrator) openResumeContext(ctx context.Context) (resumeContext, ir.Mig
 		migrationID: m.resolveMigrationID(),
 		enabled:     store != nil,
 	}
-	state, exitClean, err := loadOrInitState(ctx, rc, m.Resume)
+	state, exitClean, err := loadOrInitState(ctx, rc, m.Resume, resetting)
 	if err != nil {
 		if rc.enabled {
 			closeIf(rc.store)
@@ -471,6 +491,8 @@ func (m *Migrator) validate() error {
 		return errors.New("pipeline: SourceDSN is empty")
 	case m.TargetDSN == "":
 		return errors.New("pipeline: TargetDSN is empty")
+	case m.Resume && m.ResetTargetData:
+		return errors.New("pipeline: --resume and --reset-target-data are mutually exclusive")
 	}
 	return nil
 }

@@ -214,6 +214,17 @@ func (a *ChangeApplier) ClearStopRequested(ctx context.Context, streamID string)
 	return clearStopRequested(ctx, a.db, a.schema, streamID)
 }
 
+// ClearStream deletes the named stream's row from the per-target
+// sluice_cdc_state table. Used by the `--reset-target-data` recovery
+// path (ADR-0023). Implements [ir.StreamCleaner]. Idempotent and
+// tolerant of a missing row or table.
+func (a *ChangeApplier) ClearStream(ctx context.Context, streamID string) error {
+	if streamID == "" {
+		return errors.New("postgres: applier: ClearStream: streamID is empty")
+	}
+	return clearStream(ctx, a.db, a.schema, streamID)
+}
+
 // Apply consumes changes from the channel and applies each to the
 // target in its own transaction. The position write happens inside
 // the same transaction as the data write (per ADR-0007); a crash

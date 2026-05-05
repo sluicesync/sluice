@@ -158,6 +158,39 @@ type TableTruncator interface {
 	TruncateTable(ctx context.Context, table *Table) error
 }
 
+// TableDropper is the optional surface a [RowWriter] (or
+// [SchemaWriter]) can implement to expose DROP TABLE for the
+// `--reset-target-data` recovery path (ADR-0023). The pipeline
+// type-asserts on this interface when the operator opts into the
+// destructive-recovery flag; engines that don't expose it cause the
+// flag to error clearly with "engine does not support
+// --reset-target-data".
+//
+// Implementations must use IF EXISTS semantics so a partial-failure
+// retry is idempotent. Postgres uses CASCADE to handle FK
+// dependencies automatically; MySQL relies on InnoDB's referential
+// cascade rules (the CASCADE keyword is invalid on MySQL DROP TABLE).
+type TableDropper interface {
+	DropTable(ctx context.Context, table *Table) error
+}
+
+// BulkTableDropper is the optional surface a [TableDropper] can layer
+// on top of single-table DropTable to issue one DROP statement for a
+// list of tables. The recovery flow on a database with hundreds of
+// sluice-managed tables would otherwise pay a network round-trip per
+// table; the bulk path collapses that to a single statement (PG and
+// MySQL both accept comma-separated DROP TABLE).
+//
+// The pipeline's reset path probes for this surface and falls back to
+// per-table [TableDropper.DropTable] when it's not implemented; an
+// audit log line is emitted for each table either way.
+//
+// Implementations must use IF EXISTS semantics on every named table
+// for the same idempotency reason as single-table DropTable.
+type BulkTableDropper interface {
+	DropTables(ctx context.Context, tables []*Table) error
+}
+
 // TableEmptyChecker is the optional surface a [RowWriter] (or
 // [SchemaWriter]) can implement so the pipeline can detect a
 // pre-existing populated dest table before starting a cold-start
@@ -333,6 +366,25 @@ type BatchedChangeApplier interface {
 	// maxBatchSize <= 1 falls back to per-change semantics
 	// (equivalent to [ChangeApplier.Apply]).
 	ApplyBatch(ctx context.Context, streamID string, changes <-chan Change, maxBatchSize int) error
+}
+
+// StreamCleaner is the optional surface a [ChangeApplier] can
+// implement to delete a stream's bookkeeping row from the per-target
+// `sluice_cdc_state` table. Used by the `--reset-target-data`
+// recovery path (ADR-0023): the pipeline clears the row before
+// dropping dest tables so the next cold-start sees a fresh control
+// table alongside an empty schema.
+//
+// Idempotent and tolerant of a missing row (returns nil) — re-running
+// the reset on a target whose row was already cleared is not an
+// error. Tolerant of the control table being absent for the same
+// reason ReadPosition is.
+//
+// Engines that don't expose this surface cause `--reset-target-data`
+// to error clearly with "engine does not support --reset-target-data
+// for streams".
+type StreamCleaner interface {
+	ClearStream(ctx context.Context, streamID string) error
 }
 
 // StreamStatus is the operational snapshot of one row in the
@@ -687,6 +739,14 @@ type MigrationStateStore interface {
 	// a given migration_id sets it). LastError is stored verbatim;
 	// callers should truncate before passing.
 	Write(ctx context.Context, state MigrationState) error
+
+	// ClearMigration deletes the row for migrationID. Used by the
+	// `--reset-target-data` recovery path (ADR-0023) before the dest
+	// tables are dropped so the next cold-start sees a clean state
+	// row alongside an empty schema. Idempotent and tolerant of a
+	// missing row (returns nil) — re-running the reset on a target
+	// whose row was already cleared is not an error.
+	ClearMigration(ctx context.Context, migrationID string) error
 
 	// Close releases the underlying connection pool.
 	Close() error

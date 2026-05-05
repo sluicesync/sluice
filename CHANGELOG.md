@@ -28,7 +28,40 @@ project follows [Semantic Versioning](https://semver.org/).
   Pre-existing behaviour preserved bit-for-bit; the fix is sync-
   primitive-only.
 
+- **Two parallel-copy hygiene follow-ups.** `progressTicker.startedAt`
+  swaps the `Load → Store` check-then-set for an `atomic.CompareAndSwap`
+  so the contract stays correct if `loop` ever runs from multiple
+  goroutines (single-goroutine today; one-line future-proofing).
+  `kickOffRowCount` now suppresses the `row-count probe failed`
+  WARN when the parent context was already cancelled, and skips
+  the `setTotalRows` store when the ticker is already stopped —
+  removes interleaved teardown-time noise during test cleanup.
+
 ### Added
+
+- **`--reset-target-data` for destructive recovery.** New flag on
+  `sluice migrate` and `sluice sync start` that DELETEs the
+  bookkeeping row (`sluice_migrate_state` / `sluice_cdc_state`),
+  DROPs every source-schema table on the target, then proceeds with
+  cold-start. Collapses the post-`slot drop` recovery flow to a
+  single command (no more enumerating tables for `DROP TABLE`).
+  Confirmation prompt requires the operator to type `reset`
+  verbatim — bypassed by `--yes` for non-interactive use. Mutually
+  exclusive with `--resume` at parse time. New optional engine
+  surfaces: `ir.TableDropper`, `ir.StreamCleaner`, and
+  `ir.MigrationStateStore.ClearMigration`. See ADR-0023.
+
+  An additional optional surface, `ir.BulkTableDropper`, lets
+  engines collapse the per-table DROP loop into one statement —
+  the recovery flow on a 500-table source pays one network round-
+  trip instead of 500. Both Postgres (`DROP TABLE … CASCADE`) and
+  MySQL (`DROP TABLE …`) implement the bulk path; engines without
+  it fall back to per-table `DropTable` automatically. Audit log
+  lines name every dropped table on either path.
+
+  `docs/postgres-source-prep.md` cross-references the flag from the
+  `wal_status='lost'` recovery section so the doc trail through the
+  destructive-recovery flow stays connected.
 
 - **Batched-apply idle flush on quiet streams.** Closes the trailing-
   row latency footnote from ADR-0020. The batched applier now commits

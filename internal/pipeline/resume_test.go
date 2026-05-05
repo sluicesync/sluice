@@ -59,6 +59,13 @@ func (f *fakeStateStore) Write(_ context.Context, s ir.MigrationState) error {
 	return nil
 }
 
+func (f *fakeStateStore) ClearMigration(_ context.Context, id string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.rows, id)
+	return nil
+}
+
 func (f *fakeStateStore) Close() error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -119,7 +126,7 @@ func TestLoadOrInitState_FreshMigration(t *testing.T) {
 	store := newFakeStateStore()
 	rc := resumeContext{store: store, migrationID: "fresh", enabled: true}
 
-	state, exitClean, err := loadOrInitState(context.Background(), rc, false /*resume*/)
+	state, exitClean, err := loadOrInitState(context.Background(), rc, false /*resume*/, false)
 	if err != nil {
 		t.Fatalf("loadOrInitState: %v", err)
 	}
@@ -142,7 +149,7 @@ func TestLoadOrInitState_RefusePartialWithoutResume(t *testing.T) {
 	store.rows["m1"] = ir.MigrationState{MigrationID: "m1", Phase: ir.MigrationPhaseBulkCopy}
 	rc := resumeContext{store: store, migrationID: "m1", enabled: true}
 
-	_, _, err := loadOrInitState(context.Background(), rc, false /*resume*/)
+	_, _, err := loadOrInitState(context.Background(), rc, false /*resume*/, false)
 	if err == nil {
 		t.Fatal("loadOrInitState succeeded; want refusal error")
 	}
@@ -159,7 +166,7 @@ func TestLoadOrInitState_RefuseCompleteWithoutResume(t *testing.T) {
 	store.rows["m1"] = ir.MigrationState{MigrationID: "m1", Phase: ir.MigrationPhaseComplete}
 	rc := resumeContext{store: store, migrationID: "m1", enabled: true}
 
-	_, _, err := loadOrInitState(context.Background(), rc, false /*resume*/)
+	_, _, err := loadOrInitState(context.Background(), rc, false /*resume*/, false)
 	if err == nil {
 		t.Fatal("loadOrInitState succeeded; want refusal error")
 	}
@@ -175,12 +182,45 @@ func TestLoadOrInitState_ResumeNoRow(t *testing.T) {
 	store := newFakeStateStore()
 	rc := resumeContext{store: store, migrationID: "missing", enabled: true}
 
-	_, _, err := loadOrInitState(context.Background(), rc, true /*resume*/)
+	_, _, err := loadOrInitState(context.Background(), rc, true /*resume*/, false)
 	if err == nil {
 		t.Fatal("loadOrInitState succeeded; want refusal error")
 	}
 	if !strings.Contains(err.Error(), "no migration found") {
 		t.Errorf("err = %v; want 'no migration found' wording", err)
+	}
+}
+
+// TestLoadOrInitState_ResettingBypassesRefusal covers
+// --reset-target-data: an existing complete or partial row does NOT
+// refuse the run, because the reset path will DELETE it shortly.
+// loadOrInitState returns a fresh pending state.
+func TestLoadOrInitState_ResettingBypassesRefusal(t *testing.T) {
+	cases := []struct {
+		name  string
+		phase ir.MigrationPhase
+	}{
+		{"complete row", ir.MigrationPhaseComplete},
+		{"partial row", ir.MigrationPhaseBulkCopy},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			store := newFakeStateStore()
+			store.rows["m1"] = ir.MigrationState{MigrationID: "m1", Phase: c.phase}
+			rc := resumeContext{store: store, migrationID: "m1", enabled: true}
+
+			state, exitClean, err := loadOrInitState(context.Background(), rc, false, true /*resetting*/)
+			if err != nil {
+				t.Fatalf("loadOrInitState: %v", err)
+			}
+			if exitClean {
+				t.Error("exitClean = true on reset; want false")
+			}
+			if state.Phase != ir.MigrationPhasePending {
+				t.Errorf("phase = %q; want pending", state.Phase)
+			}
+		})
 	}
 }
 
@@ -192,7 +232,7 @@ func TestLoadOrInitState_ResumeAlreadyComplete(t *testing.T) {
 	store.rows["m1"] = ir.MigrationState{MigrationID: "m1", Phase: ir.MigrationPhaseComplete}
 	rc := resumeContext{store: store, migrationID: "m1", enabled: true}
 
-	state, exitClean, err := loadOrInitState(context.Background(), rc, true)
+	state, exitClean, err := loadOrInitState(context.Background(), rc, true, false)
 	if err != nil {
 		t.Fatalf("loadOrInitState: %v", err)
 	}

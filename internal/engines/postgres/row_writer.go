@@ -86,6 +86,59 @@ func (w *RowWriter) TruncateTable(ctx context.Context, table *ir.Table) error {
 	return nil
 }
 
+// DropTable drops the target table with CASCADE so dependent foreign
+// keys, views, and constraints come down with it. Used by the
+// `--reset-target-data` recovery path (ADR-0023). Implements
+// [ir.TableDropper].
+//
+// IF EXISTS keeps the call idempotent: a partial-failure retry that
+// already dropped some tables is not an error on the second pass. The
+// schema readers exclude `sluice_*_state` tables, so the bookkeeping
+// row is cleared via [MigrationStateStore.ClearMigration] /
+// [ChangeApplier.ClearStream] rather than ever reaching this method.
+func (w *RowWriter) DropTable(ctx context.Context, table *ir.Table) error {
+	if table == nil {
+		return errors.New("postgres: DropTable: table is nil")
+	}
+	stmt := "DROP TABLE IF EXISTS " + quoteIdent(w.schema) + "." + quoteIdent(table.Name) + " CASCADE"
+	if _, err := w.db.ExecContext(ctx, stmt); err != nil {
+		return fmt.Errorf("postgres: drop %q: %w", table.Name, err)
+	}
+	return nil
+}
+
+// DropTables drops every named table with one DROP TABLE statement.
+// Implements [ir.BulkTableDropper] for the reset path on databases
+// with many tables — collapses N round-trips into one. CASCADE is
+// applied once at statement level (PG accepts only one CASCADE per
+// statement) so foreign keys, views, and dependent constraints come
+// down with the listed tables. IF EXISTS preserves idempotency.
+//
+// An empty input list is a no-op; nil entries are skipped silently
+// (the per-table DropTable rejects nil with an error, but a bulk caller
+// passing a nil-padded slice is more often a programming convenience
+// than an error case worth surfacing).
+func (w *RowWriter) DropTables(ctx context.Context, tables []*ir.Table) error {
+	if len(tables) == 0 {
+		return nil
+	}
+	parts := make([]string, 0, len(tables))
+	for _, t := range tables {
+		if t == nil {
+			continue
+		}
+		parts = append(parts, quoteIdent(w.schema)+"."+quoteIdent(t.Name))
+	}
+	if len(parts) == 0 {
+		return nil
+	}
+	stmt := "DROP TABLE IF EXISTS " + strings.Join(parts, ", ") + " CASCADE"
+	if _, err := w.db.ExecContext(ctx, stmt); err != nil {
+		return fmt.Errorf("postgres: drop %d tables: %w", len(parts), err)
+	}
+	return nil
+}
+
 // IsTableEmpty reports whether the target table has no rows. A
 // missing table is treated as empty so the cold-start pre-flight
 // doesn't double up with the subsequent CREATE TABLE IF NOT EXISTS

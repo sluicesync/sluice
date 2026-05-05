@@ -49,6 +49,15 @@ func TestRunValidates(t *testing.T) {
 			&Migrator{Source: stubEngine{}, Target: stubEngine{}, SourceDSN: "x"},
 			"TargetDSN is empty",
 		},
+		{
+			"resume + reset-target-data conflict",
+			&Migrator{
+				Source: stubEngine{}, Target: stubEngine{},
+				SourceDSN: "x", TargetDSN: "y",
+				Resume: true, ResetTargetData: true,
+			},
+			"--resume and --reset-target-data are mutually exclusive",
+		},
 	}
 	for _, c := range cases {
 		c := c
