@@ -39,6 +39,28 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **`sluice schema preview` subcommand.** Reads the source schema,
+  applies the translation pipeline (mappings + cross-engine type
+  policy), and emits the target DDL with inline cross-engine
+  translation notes and advisory hints — without touching either
+  database's data. Operators see exactly what the target schema will
+  look like before any migration runs, including the `--type-override`
+  invocation for known operator-preferable alternatives (e.g. PG
+  `uuid` → MySQL `BINARY(16)` instead of the default `CHAR(36)`).
+  Supports `--format text|json`, `--include-table`/`--exclude-table`,
+  `--type-override`, and `--output FILE` (atomic temp-file +
+  rename, so a Ctrl-C mid-write never corrupts the destination).
+  New `ir.DDLPreviewer` engine surface; both Postgres and MySQL
+  implement it on the same struct as their `SchemaWriter` (the
+  emitTableDef/emitCreateIndex/emitAddForeignKey helpers are now
+  shared between the execute and preview paths). Initial advisory-
+  hints registry seeds five high-traffic surprises from real-world
+  testing reports (UUID, large-TEXT, JSON-vs-JSONB note, DATETIME
+  timezone, unbounded numeric). Translate package gains
+  `binary_uuid`, `mediumtext`, `timestamptz`, and parameterised
+  `decimal` aliases to support the suggested overrides. See
+  ADR-0024.
+
 - **`--reset-target-data` for destructive recovery.** New flag on
   `sluice migrate` and `sluice sync start` that DELETEs the
   bookkeeping row (`sluice_migrate_state` / `sluice_cdc_state`),

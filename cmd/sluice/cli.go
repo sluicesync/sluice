@@ -43,6 +43,7 @@ type CLI struct {
 	Migrate MigrateCmd `cmd:"" help:"Run a one-time schema + data migration (simple mode)."`
 	Sync    SyncCmd    `cmd:"" help:"Manage continuous-sync streams."`
 	Slot    SlotCmd    `cmd:"" help:"Manage source-side replication slots (Postgres)."`
+	Schema  SchemaCmd  `cmd:"" help:"Inspect and describe schemas (preview translation, etc.)."`
 }
 
 // EnginesCmd lists the database engines registered in the binary,

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/orware/sluice/internal/ir"
 )
@@ -135,4 +136,79 @@ func orderedTables(s *ir.Schema) []*ir.Table {
 		return out[i].Name < out[j].Name
 	})
 	return out
+}
+
+// PreviewDDL returns every statement [SchemaWriter] would execute on
+// s, in execution order, without touching the target database. Used by
+// `sluice schema preview` (ADR-0024) to surface the target schema for
+// operator inspection before any migration runs. The CREATE TABLE
+// statements have their trailing semicolons stripped — the preview
+// formatter re-adds them for human readability.
+func (w *SchemaWriter) PreviewDDL(_ context.Context, s *ir.Schema) ([]ir.DDLStatement, error) {
+	if s == nil {
+		return nil, fmt.Errorf("mysql: PreviewDDL: schema is nil")
+	}
+
+	out := make([]ir.DDLStatement, 0, len(s.Tables)*2)
+
+	// Phase 1: tables.
+	for _, table := range orderedTables(s) {
+		stmt, err := emitTableDef(table)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, ir.DDLStatement{
+			Table: table.Name,
+			Kind:  "CREATE TABLE",
+			SQL:   trimTrailingSemicolon(stmt),
+		})
+	}
+
+	// Phase 2: secondary indexes.
+	for _, table := range orderedTables(s) {
+		indexes := append([]*ir.Index(nil), table.Indexes...)
+		sort.Slice(indexes, func(i, j int) bool {
+			return indexes[i].Name < indexes[j].Name
+		})
+		for _, idx := range indexes {
+			stmt, err := emitCreateIndex(table.Name, idx)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, ir.DDLStatement{
+				Table: table.Name,
+				Kind:  "ALTER TABLE",
+				SQL:   trimTrailingSemicolon(stmt),
+			})
+		}
+	}
+
+	// Phase 3: foreign keys.
+	for _, table := range orderedTables(s) {
+		fks := append([]*ir.ForeignKey(nil), table.ForeignKeys...)
+		sort.Slice(fks, func(i, j int) bool {
+			return fks[i].Name < fks[j].Name
+		})
+		for _, fk := range fks {
+			stmt, err := emitAddForeignKey(table.Name, fk)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, ir.DDLStatement{
+				Table: table.Name,
+				Kind:  "ALTER TABLE",
+				SQL:   trimTrailingSemicolon(stmt),
+			})
+		}
+	}
+
+	return out, nil
+}
+
+// trimTrailingSemicolon removes a single trailing ';' from s, if
+// present. MySQL DDL emitters terminate every statement with a
+// semicolon for executability; preview output adds them back at format
+// time so the wire shape is decoupled from the rendering shape.
+func trimTrailingSemicolon(s string) string {
+	return strings.TrimRight(s, ";")
 }

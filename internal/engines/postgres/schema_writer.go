@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/orware/sluice/internal/ir"
 )
@@ -198,4 +199,105 @@ func orderedTables(s *ir.Schema) []*ir.Table {
 		return out[i].Name < out[j].Name
 	})
 	return out
+}
+
+// PreviewDDL returns every statement [SchemaWriter] would execute on
+// s, in execution order, without touching the target database. Used by
+// `sluice schema preview` (ADR-0024) to surface the target schema for
+// operator inspection before any migration runs. The CREATE TABLE
+// statements have their trailing semicolons stripped — the preview
+// formatter re-adds them for human readability.
+//
+// Implementing this on the same struct as [SchemaWriter] keeps the
+// schema-emit logic in one place: PreviewDDL routes through the same
+// emitTableDef / emitCreateIndex / emitAddForeignKey helpers the
+// execute path uses. The trade-off is that PreviewDDL needs the
+// hasPostGIS flag — set by the engine's OpenSchemaWriter at construct
+// time — so geometry columns render with the right
+// `geometry(<subtype>, <srid>)` form. Operators previewing a target
+// without PostGIS still see the same loud rejection the actual
+// schema-write phase would raise.
+func (w *SchemaWriter) PreviewDDL(_ context.Context, s *ir.Schema) ([]ir.DDLStatement, error) {
+	if s == nil {
+		return nil, errors.New("postgres: PreviewDDL: schema is nil")
+	}
+
+	out := make([]ir.DDLStatement, 0, len(s.Tables)*2)
+	opts := emitOpts{HasPostGIS: w.hasPostGIS}
+
+	// Phase 1a: enum types, in deterministic table+column order.
+	for _, table := range orderedTables(s) {
+		for _, col := range table.Columns {
+			enum, ok := col.Type.(ir.Enum)
+			if !ok {
+				continue
+			}
+			out = append(out, ir.DDLStatement{
+				Table: table.Name,
+				Kind:  "CREATE TYPE",
+				SQL:   trimTrailingSemicolon(emitCreateEnumType(w.schema, table.Name, col.Name, enum.Values)),
+			})
+		}
+	}
+
+	// Phase 1b: tables.
+	for _, table := range orderedTables(s) {
+		stmt, err := emitTableDef(w.schema, table, opts)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, ir.DDLStatement{
+			Table: table.Name,
+			Kind:  "CREATE TABLE",
+			SQL:   trimTrailingSemicolon(stmt),
+		})
+	}
+
+	// Phase 2: indexes.
+	for _, table := range orderedTables(s) {
+		indexes := append([]*ir.Index(nil), table.Indexes...)
+		sort.Slice(indexes, func(i, j int) bool {
+			return indexes[i].Name < indexes[j].Name
+		})
+		for _, idx := range indexes {
+			stmt, err := emitCreateIndex(w.schema, table.Name, idx)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, ir.DDLStatement{
+				Table: table.Name,
+				Kind:  "CREATE INDEX",
+				SQL:   trimTrailingSemicolon(stmt),
+			})
+		}
+	}
+
+	// Phase 3: foreign-key constraints.
+	for _, table := range orderedTables(s) {
+		fks := append([]*ir.ForeignKey(nil), table.ForeignKeys...)
+		sort.Slice(fks, func(i, j int) bool {
+			return fks[i].Name < fks[j].Name
+		})
+		for _, fk := range fks {
+			stmt, err := emitAddForeignKey(w.schema, table.Name, fk)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, ir.DDLStatement{
+				Table: table.Name,
+				Kind:  "ALTER TABLE",
+				SQL:   trimTrailingSemicolon(stmt),
+			})
+		}
+	}
+
+	return out, nil
+}
+
+// trimTrailingSemicolon removes a single trailing ';' from s, if
+// present. Postgres DDL emitters terminate every statement with a
+// semicolon for executability; preview output adds them back at format
+// time so the wire shape is decoupled from the rendering shape.
+func trimTrailingSemicolon(s string) string {
+	return strings.TrimRight(s, ";")
 }

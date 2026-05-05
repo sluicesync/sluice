@@ -1,0 +1,20 @@
+-- sluice schema preview
+-- source: postgres (1 tables, 3 columns)
+-- target: mysql
+-- mappings applied: 0
+-- advisory hints: 2
+
+-- ──────────── users ────────────
+-- 3 columns; 2 cross-engine translations; 2 hints
+
+CREATE TABLE `users` (
+  `id` CHAR(36) NOT NULL, -- source: uuid -> target: char(36)
+  `email` VARCHAR(255) NOT NULL,
+  `bio` LONGTEXT NOT NULL  -- source: text -> target: longtext
+) ENGINE=InnoDB;
+
+-- hint: PG uuid expands 2.25x as CHAR(36); for binary storage, override to binary_uuid
+--       --type-override users.id=binary_uuid
+-- hint: PG text -> MySQL LONGTEXT (4GB cap, large overhead); if column is bounded, override to varchar:length=N or mediumtext
+--       --type-override users.bio=mediumtext
+

@@ -173,10 +173,23 @@ func rewriteTable(tbl *ir.Table, colMap map[string]resolvedMapping) *ir.Table {
 // for emitting the right native type.
 var targetTypeRegistry = map[string]ir.Type{
 	"text":       ir.Text{Size: ir.TextLong},
+	"mediumtext": ir.Text{Size: ir.TextMedium},
 	"text_array": ir.Array{Element: ir.Text{Size: ir.TextLong}},
 	"jsonb":      ir.JSON{Binary: true},
 	"json":       ir.JSON{Binary: false},
 	"bytea":      ir.Blob{Size: ir.BlobLong},
+	// `binary_uuid` is the override for "translate to MySQL BINARY(16)"
+	// — the storage-optimal MySQL form for UUIDs. Default cross-engine
+	// behaviour for PG `uuid` lands as MySQL CHAR(36) (human-readable
+	// at 36 bytes); this alias trades readability for 2.25× storage
+	// compression. See ADR-0024.
+	"binary_uuid": ir.Binary{Length: 16},
+	// `timestamptz` is the override for "use a zoned timestamp on the
+	// target". Default cross-engine behaviour for MySQL DATETIME lands
+	// as PG TIMESTAMP (no timezone); this alias preserves the UTC
+	// intent operators sometimes encode in DATETIME values. See
+	// ADR-0024.
+	"timestamptz": ir.Timestamp{Precision: 6, WithTimeZone: true},
 }
 
 // postgisAliasSubtypes maps the postgis_<subtype> aliases to their
@@ -225,6 +238,38 @@ func resolveTargetType(name string, opts map[string]any) (ir.Type, error) {
 		}
 		return ir.Varchar{Length: length}, nil
 	}
+	if name == "decimal" {
+		// `decimal` is the override for "force a specific precision/
+		// scale on a DECIMAL column". The default cross-engine path
+		// for PG unbounded `numeric` lands as MySQL DECIMAL(65,30)
+		// (the maximum); operators with bounded-precision values
+		// override via this alias to recover storage. See ADR-0024.
+		precision, scale := 10, 0
+		if raw, ok := opts["precision"]; ok {
+			n, err := readIntOption(raw)
+			if err != nil {
+				return nil, fmt.Errorf("target_type=decimal: option `precision`: %w", err)
+			}
+			precision = n
+		}
+		if raw, ok := opts["scale"]; ok {
+			n, err := readIntOption(raw)
+			if err != nil {
+				return nil, fmt.Errorf("target_type=decimal: option `scale`: %w", err)
+			}
+			scale = n
+		}
+		if precision <= 0 {
+			return nil, fmt.Errorf("target_type=decimal: option `precision` must be positive, got %d", precision)
+		}
+		if scale < 0 {
+			return nil, fmt.Errorf("target_type=decimal: option `scale` must be non-negative, got %d", scale)
+		}
+		if scale > precision {
+			return nil, fmt.Errorf("target_type=decimal: scale %d exceeds precision %d", scale, precision)
+		}
+		return ir.Decimal{Precision: precision, Scale: scale}, nil
+	}
 	if subtype, ok := postgisAliasSubtypes[name]; ok {
 		srid, err := readSRIDOption(opts)
 		if err != nil {
@@ -248,6 +293,19 @@ func readSRIDOption(opts map[string]any) (int, error) {
 	if !ok {
 		return 0, nil
 	}
+	v, err := readIntOption(raw)
+	if err != nil {
+		return 0, fmt.Errorf("option `srid` must be an integer: %w", err)
+	}
+	return v, nil
+}
+
+// readIntOption coerces a koanf-decoded option value to an int. koanf
+// hands plain numbers in three shapes depending on the source format
+// (int from YAML decimal literals, int64 from explicit YAML int tags,
+// float64 from JSON-shaped sources); accepting all three keeps the
+// mapping config robust to the operator's choice of format.
+func readIntOption(raw any) (int, error) {
 	switch v := raw.(type) {
 	case int:
 		return v, nil
@@ -256,7 +314,7 @@ func readSRIDOption(opts map[string]any) (int, error) {
 	case float64:
 		return int(v), nil
 	default:
-		return 0, fmt.Errorf("option `srid` must be an integer, got %T", raw)
+		return 0, fmt.Errorf("expected integer, got %T", raw)
 	}
 }
 
@@ -264,8 +322,10 @@ func readSRIDOption(opts map[string]any) (int, error) {
 // target_type aliases, including parameterised ones. Used in error
 // messages so operators get a hint when they typo an alias.
 func knownTargetTypes() string {
-	names := make([]string, 0, len(targetTypeRegistry)+len(postgisAliasSubtypes)+1)
-	names = append(names, "varchar") // parameterised alias not in any registry literal
+	names := make([]string, 0, len(targetTypeRegistry)+len(postgisAliasSubtypes)+2)
+	// Parameterised aliases not in any registry literal — listed by
+	// hand so the error message stays accurate.
+	names = append(names, "varchar", "decimal")
 	for n := range targetTypeRegistry {
 		names = append(names, n)
 	}

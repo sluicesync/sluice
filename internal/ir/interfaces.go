@@ -10,6 +10,49 @@ type SchemaReader interface {
 	ReadSchema(ctx context.Context) (*Schema, error)
 }
 
+// DDLStatement is a single emitted DDL statement, returned by
+// [DDLPreviewer.PreviewDDL]. The Kind / Table fields are present for
+// grouping in the operator-facing preview output (see ADR-0024); the
+// pipeline that consumes them does not interpret them otherwise.
+type DDLStatement struct {
+	// Table is the unqualified table name the statement applies to.
+	// For statements whose subject isn't a single table (e.g. PG
+	// CREATE TYPE, which lives in the schema namespace), use the
+	// table that owns the construct so output groups consistently.
+	Table string
+
+	// Kind is a short operator-friendly tag — "CREATE TABLE",
+	// "CREATE INDEX", "CREATE TYPE", "ALTER TABLE", etc. Used only
+	// for preview-output structure; engines may pick the spelling
+	// that matches their own DDL idiom.
+	Kind string
+
+	// SQL is the statement itself, without a trailing newline. The
+	// preview emitter joins statements with blank lines.
+	SQL string
+}
+
+// DDLPreviewer is the optional engine surface for "produce the DDL you
+// would emit, but don't execute it" — the read-side counterpart to the
+// schema-write phase. Used by `sluice schema preview` (ADR-0024) so
+// operators can inspect the target schema before any data moves.
+//
+// Engines implement this on the same type that satisfies
+// [SchemaWriter] (today: SchemaWriter for both Postgres and MySQL).
+// The pipeline preview orchestrator type-asserts on this surface;
+// engines without a preview path surface a clear error rather than
+// silently no-op.
+//
+// The returned slice is in the same logical order the writer would
+// execute statements in: enum/type prerequisites first, then CREATE
+// TABLE, then secondary indexes, then foreign-key constraints. The
+// preview formatter groups by Table for output, so the emit order
+// only matters insofar as cross-statement dependencies need to be
+// readable in the printed result.
+type DDLPreviewer interface {
+	PreviewDDL(ctx context.Context, s *Schema) ([]DDLStatement, error)
+}
+
 // SchemaWriter applies an IR [Schema] to a target database in three
 // phases plus a small post-bulk-copy reconciliation step. Splitting
 // schema creation from index/constraint creation is what enables
