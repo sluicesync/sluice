@@ -204,6 +204,8 @@ type SyncStartCmd struct {
 	DryRun   bool   `short:"n" help:"Print what would happen — cold-start vs warm-resume, source schema summary or persisted position — without modifying the target or starting the stream."`
 
 	ForceColdStart bool `help:"Skip the cold-start pre-flight check that refuses to bulk-copy into a populated target. Use with caution — INSERT into a non-empty table will collide on PRIMARY KEY. Ignored on the warm-resume path."`
+
+	ApplyBatchSize int `help:"Batch up to N CDC changes per target transaction. Default 1 (one change per tx, conservative). Production tuning: 100-500 typically gives 50-100x throughput on bulk CDC traffic. Schema-change events (TRUNCATE) flush the in-progress batch; the cap is an upper bound on batch size, not a target. Idempotent applier semantics (ADR-0010) keep replay-on-crash safe; ADR-0017 covers the full design." default:"1" placeholder:"N"`
 }
 
 // Run implements `sluice sync start`.
@@ -246,6 +248,7 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 		DryRun:         s.DryRun,
 		Filter:         filter,
 		ForceColdStart: s.ForceColdStart,
+		ApplyBatchSize: s.ApplyBatchSize,
 	}
 	return streamer.Run(kongContext())
 }
