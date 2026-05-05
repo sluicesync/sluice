@@ -6,6 +6,65 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-05-04
+
+Patch release adding CHECK constraint support, a CLI form of the
+type-override YAML config, and an opportunistic improvement to
+the generated-column expression normalizer that the CHECK work
+surfaced.
+
+### Added
+
+- **CHECK constraint support across both engines.** Source schemas
+  declared with `CHECK (qty >= 0)` or `CHECK (status IN ('open',
+  'closed'))` now round-trip cleanly: the schema readers capture
+  the expression on `Table.CheckConstraints`, the DDL writers
+  emit `CONSTRAINT name CHECK (expr)` inline in CREATE TABLE,
+  and the constraint is enforced on the target.
+
+  Translation policy is verbatim passthrough — non-portable
+  expressions fail loudly on the target rather than be guessed
+  at. Identifier and string-literal decoration is normalized at
+  the read boundary (see below).
+
+  Integration coverage: MySQL→MySQL, PG→PG, and MySQL→PG cross-
+  engine snapshot migrations each verify (1) the CHECK lands on
+  the target's `information_schema.check_constraints`, (2)
+  bulk-copied rows survived, (3) a violating INSERT is rejected
+  by the target, and (4) a satisfying INSERT is accepted.
+
+- **`--type-override TABLE.COLUMN=TYPE` CLI flag** on `sluice
+  migrate` and `sluice sync start`. Repeatable; format mirrors
+  the YAML `mappings:` shape but in a single string. Wholesale
+  CLI-over-YAML precedence (matches the existing `--include-table`
+  / `--exclude-table` precedence policy). For target-type options
+  (e.g. `jsonb` with `binary=true`) operators still need the YAML
+  form — the CLI deliberately doesn't try to encode key/value
+  options in a single string.
+
+### Fixed
+
+- **Generated-column cross-engine expressions with string
+  literals**. The v0.3.1 generated-column work normalized MySQL's
+  backtick identifier quotes but missed two more layers of
+  decoration MySQL applies to the stored expression text:
+
+  - **Charset introducers** — every string literal is wrapped as
+    `_<charset>'literal'` (e.g. `_utf8mb4'open'`). PG rejects this
+    as a syntax error.
+  - **Delimiter-escape form** — every string literal's apostrophes
+    are stored as `\'`. PG with `standard_conforming_strings=on`
+    (the default since 9.1) rejects `\'` outright.
+
+  v0.3.1 didn't catch these because the test fixtures used
+  `qty * price` — no string literals. The CHECK constraint work
+  in this release surfaced both immediately (via `status IN
+  ('open', ...)`) and the new `normalizeMySQLExpressionText`
+  helper now strips all three layers. **Generated columns benefit
+  from the same fix**: a column declared as `CONCAT(name, ' ')`
+  cross-engine that would have silently failed on v0.3.1 now
+  works.
+
 ## [0.3.1] - 2026-05-04
 
 Patch release — adds first-class generated-column support and
@@ -633,7 +692,8 @@ level history.
 
 (none currently — see the closed entries above.)
 
-[Unreleased]: https://github.com/orware/sluice/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/orware/sluice/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/orware/sluice/releases/tag/v0.3.2
 [0.3.1]: https://github.com/orware/sluice/releases/tag/v0.3.1
 [0.3.0]: https://github.com/orware/sluice/releases/tag/v0.3.0
 [0.2.2]: https://github.com/orware/sluice/releases/tag/v0.2.2
