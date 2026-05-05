@@ -93,11 +93,16 @@ func (r *RowReader) ReadRows(ctx context.Context, table *ir.Table) (<-chan ir.Ro
 // stream is the goroutine that scans rows from the database and pushes
 // them onto out as IR Rows. It owns rows and is responsible for closing
 // it; out is owned by stream and is closed before stream exits.
+//
+// Generated columns are filtered out of the SELECT (see buildSelect)
+// and therefore out of the iterated columns here too — the database
+// recomputes them on the target's INSERT, so the source value is
+// never carried.
 func (r *RowReader) stream(ctx context.Context, rows *sql.Rows, table *ir.Table, out chan<- ir.Row) {
 	defer close(out)
 	defer rows.Close()
 
-	cols := table.Columns
+	cols := nonGeneratedColumns(table.Columns)
 	scanBuf := make([]any, len(cols))
 	scanPtrs := make([]any, len(cols))
 	for i := range scanBuf {
@@ -139,13 +144,18 @@ func (r *RowReader) setErr(err error) {
 	r.err = err
 }
 
-// buildSelect produces a SELECT statement that fetches all columns of
-// table in the column order declared on the IR. MySQL identifiers are
-// quoted with backticks; any backticks within identifiers (rare) are
-// escaped by doubling.
+// buildSelect produces a SELECT statement that fetches every non-
+// generated column of table in declaration order. Generated columns
+// are excluded so the bulk-copy path doesn't carry source-side
+// computed values into the target — the target's own GENERATED
+// clause will recompute them on INSERT, preserving the invariant
+// rather than freezing it. MySQL identifiers are quoted with
+// backticks; any backticks within identifiers (rare) are escaped by
+// doubling.
 func buildSelect(table *ir.Table) string {
-	cols := make([]string, len(table.Columns))
-	for i, c := range table.Columns {
+	src := nonGeneratedColumns(table.Columns)
+	cols := make([]string, len(src))
+	for i, c := range src {
 		cols[i] = quoteIdent(c.Name)
 	}
 	return fmt.Sprintf(
@@ -153,6 +163,28 @@ func buildSelect(table *ir.Table) string {
 		strings.Join(cols, ", "),
 		quoteIdent(table.Name),
 	)
+}
+
+// nonGeneratedColumns returns the columns of in that are NOT
+// generated columns. The slice has the same declaration order as
+// the input (callers depend on it for positional row decoding).
+//
+// File-level note: this engine's translation policy on generated
+// columns is verbatim passthrough — the schema reader records the
+// expression text on the IR Column, the DDL writer emits a GENERATED
+// clause that recreates the same invariant on the target, and the
+// row read/write paths skip the column entirely so the database
+// recomputes the value rather than freezing the source-side result.
+// See docs/value-types.md once the policy is added there.
+func nonGeneratedColumns(cols []*ir.Column) []*ir.Column {
+	out := make([]*ir.Column, 0, len(cols))
+	for _, c := range cols {
+		if c.IsGenerated() {
+			continue
+		}
+		out = append(out, c)
+	}
+	return out
 }
 
 // quoteIdent backtick-quotes a MySQL identifier. Backticks within the

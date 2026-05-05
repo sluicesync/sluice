@@ -831,12 +831,23 @@ func stripBackticks(s string) string {
 // decodeBinlogRow maps a positional row from a RowsEvent (one entry
 // per column, in column-declaration order) onto an [ir.Row] keyed by
 // column name with values run through decodeValue.
+//
+// Generated columns are decoded into the local positional walk (the
+// binlog row image carries them) but dropped from the emitted row
+// map. The applier's INSERT/UPDATE column list is derived from the
+// row map's keys, so dropping the generated entry here naturally
+// excludes the column from the target SQL — the target's GENERATED
+// clause then recomputes the value rather than freezing the source-
+// side result.
 func decodeBinlogRow(raw []any, cols []*ir.Column) (ir.Row, error) {
 	if len(raw) != len(cols) {
 		return nil, fmt.Errorf("row has %d values; schema has %d columns", len(raw), len(cols))
 	}
 	row := make(ir.Row, len(cols))
 	for i, col := range cols {
+		if col.IsGenerated() {
+			continue
+		}
 		v, err := decodeValue(raw[i], col.Type)
 		if err != nil {
 			return nil, fmt.Errorf("column %q: %w", col.Name, err)

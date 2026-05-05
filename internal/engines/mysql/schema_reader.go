@@ -114,7 +114,8 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 			IFNULL(collation_name, ''),
 			column_type,
 			IFNULL(extra, ''),
-			IFNULL(column_comment, '')
+			IFNULL(column_comment, ''),
+			IFNULL(generation_expression, '')
 		FROM   information_schema.columns
 		WHERE  table_schema = ?
 		ORDER  BY table_name, ordinal_position`
@@ -134,6 +135,7 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 			isNullable string
 			meta       columnMeta
 			comment    string
+			genExpr    string
 		)
 		if err := rows.Scan(
 			&tableName,
@@ -151,6 +153,7 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 			&meta.ColumnType,
 			&meta.Extra,
 			&comment,
+			&genExpr,
 		); err != nil {
 			return err
 		}
@@ -167,13 +170,15 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 			return fmt.Errorf("table %q column %q: %w", tableName, colName, err)
 		}
 
-		t.Columns = append(t.Columns, &ir.Column{
+		col := &ir.Column{
 			Name:     colName,
 			Type:     typ,
 			Nullable: strings.EqualFold(isNullable, "YES"),
 			Default:  translateDefault(defaultVal, meta.Extra),
 			Comment:  comment,
-		})
+		}
+		applyGenerated(col, genExpr, meta.Extra)
+		t.Columns = append(t.Columns, col)
 	}
 	return rows.Err()
 }
@@ -364,7 +369,8 @@ func loadTableSchema(ctx context.Context, db *sql.DB, schema, table string) (*ta
 			IFNULL(collation_name, ''),
 			column_type,
 			IFNULL(extra, ''),
-			IFNULL(column_comment, '')
+			IFNULL(column_comment, ''),
+			IFNULL(generation_expression, '')
 		FROM   information_schema.columns
 		WHERE  table_schema = ?
 		  AND  table_name   = ?
@@ -384,6 +390,7 @@ func loadTableSchema(ctx context.Context, db *sql.DB, schema, table string) (*ta
 			isNullable string
 			meta       columnMeta
 			comment    string
+			genExpr    string
 		)
 		if err := rows.Scan(
 			&colName,
@@ -399,6 +406,7 @@ func loadTableSchema(ctx context.Context, db *sql.DB, schema, table string) (*ta
 			&meta.ColumnType,
 			&meta.Extra,
 			&comment,
+			&genExpr,
 		); err != nil {
 			return nil, err
 		}
@@ -407,13 +415,15 @@ func loadTableSchema(ctx context.Context, db *sql.DB, schema, table string) (*ta
 		if err != nil {
 			return nil, fmt.Errorf("table %q column %q: %w", table, colName, err)
 		}
-		out.Columns = append(out.Columns, &ir.Column{
+		col := &ir.Column{
 			Name:     colName,
 			Type:     typ,
 			Nullable: strings.EqualFold(isNullable, "YES"),
 			Default:  translateDefault(defaultVal, meta.Extra),
 			Comment:  comment,
-		})
+		}
+		applyGenerated(col, genExpr, meta.Extra)
+		out.Columns = append(out.Columns, col)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -422,6 +432,62 @@ func loadTableSchema(ctx context.Context, db *sql.DB, schema, table string) (*ta
 		return nil, fmt.Errorf("mysql: table %s.%s has no columns (does it exist?)", schema, table)
 	}
 	return out, nil
+}
+
+// applyGenerated populates the IR column's GeneratedExpr / GeneratedStored
+// fields from MySQL's information_schema.columns metadata.
+//
+// information_schema reports the expression in GENERATION_EXPRESSION
+// (empty / NULL on plain columns) and the storage class as a token in
+// EXTRA: "VIRTUAL GENERATED" or "STORED GENERATED". When the storage
+// class isn't explicit (some sluice-supported MySQL flavors are
+// inconsistent), default to STORED — that matches the project's
+// "verbatim passthrough plus loud failure on mismatch" translation
+// policy: a STORED column is always replicable; a VIRTUAL one might
+// be silently lossy if the target dialect doesn't support virtual
+// columns.
+//
+// The expression has its MySQL-specific backtick identifier quoting
+// stripped before being recorded. MySQL's parser stores the post-
+// parse form of the expression (e.g. `qty` * `price` for the source
+// text "qty * price"), and Postgres rejects backticks as a syntax
+// error at apply time. Stripping is a dialect-quoting normalization,
+// not function/operator translation — verbatim passthrough still
+// applies to the substantive expression body. In the rare case
+// where the source identifier would actually need quoting on the
+// target (a reserved word or unusual case), the operator must
+// rewrite the source column or drop the GENERATED clause via the
+// per-column mappings hook.
+func applyGenerated(col *ir.Column, genExpr, extra string) {
+	if genExpr == "" {
+		return
+	}
+	col.GeneratedExpr = stripMySQLIdentifierQuotes(genExpr)
+	upper := strings.ToUpper(extra)
+	switch {
+	case strings.Contains(upper, "VIRTUAL GENERATED"):
+		col.GeneratedStored = false
+	case strings.Contains(upper, "STORED GENERATED"):
+		col.GeneratedStored = true
+	default:
+		col.GeneratedStored = true
+	}
+}
+
+// stripMySQLIdentifierQuotes removes backtick characters from s.
+// Used to normalise the dialect-specific identifier quoting MySQL
+// embeds in stored generation expressions; see applyGenerated for
+// the rationale. An identifier that contains an embedded backtick
+// (escaped as a doubled backtick in the source — exceedingly rare
+// in real-world schemas) collapses to a single backtick after
+// stripping, which is at worst a target-side parse error, not
+// silent corruption — same loud-failure outcome as any other
+// non-portable expression.
+func stripMySQLIdentifierQuotes(s string) string {
+	if !strings.ContainsRune(s, '`') {
+		return s
+	}
+	return strings.ReplaceAll(s, "`", "")
 }
 
 // translateDefault converts the (column_default, extra) pair from

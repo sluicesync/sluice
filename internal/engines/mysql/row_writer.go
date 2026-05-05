@@ -161,15 +161,18 @@ func (w *RowWriter) writeBatched(ctx context.Context, table *ir.Table, rows <-ch
 }
 
 // buildBatchInsert returns the parameterised INSERT statement for the
-// given table and row count. Identifiers are backtick-quoted; values
-// are placeholders (`?`) for the driver to fill in.
+// given table and row count. Generated columns are excluded — the
+// reader doesn't emit values for them, and INSERT into a generated
+// column is a database error. Identifiers are backtick-quoted;
+// values are placeholders (`?`) for the driver to fill in.
 func buildBatchInsert(table *ir.Table, rowCount int) string {
-	colNames := make([]string, len(table.Columns))
-	for i, c := range table.Columns {
+	cols := nonGeneratedColumns(table.Columns)
+	colNames := make([]string, len(cols))
+	for i, c := range cols {
 		colNames[i] = quoteIdent(c.Name)
 	}
 
-	rowPart := buildRowPlaceholder(len(table.Columns))
+	rowPart := buildRowPlaceholder(len(cols))
 	rowParts := make([]string, rowCount)
 	for i := range rowParts {
 		rowParts[i] = rowPart
@@ -200,10 +203,13 @@ func buildRowPlaceholder(numCols int) string {
 // flattenArgs walks the batch column-major-by-row and produces the
 // flat []any the driver expects. Values are passed through prepareValue
 // to handle the IR-Set-to-string conversion and similar adjustments.
+// Generated columns are skipped so the column-list and value-list
+// stay in lockstep with buildBatchInsert.
 func flattenArgs(batch []ir.Row, table *ir.Table) []any {
-	args := make([]any, 0, len(batch)*len(table.Columns))
+	cols := nonGeneratedColumns(table.Columns)
+	args := make([]any, 0, len(batch)*len(cols))
 	for _, row := range batch {
-		for _, col := range table.Columns {
+		for _, col := range cols {
 			args = append(args, prepareValue(row[col.Name], col.Type))
 		}
 	}

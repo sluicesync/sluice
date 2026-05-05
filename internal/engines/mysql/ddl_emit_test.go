@@ -270,6 +270,63 @@ func TestEmitColumnDef(t *testing.T) {
 	}
 }
 
+// TestEmitColumnDef_Generated covers GENERATED ALWAYS AS (...)
+// emission for both STORED and VIRTUAL storage classes. Verbatim-
+// passthrough policy: the expression text is preserved as-is, so the
+// caller can spot dialect mismatches at apply time rather than
+// debug a guessed translation.
+func TestEmitColumnDef_Generated(t *testing.T) {
+	cases := []struct {
+		name string
+		in   *ir.Column
+		want string
+	}{
+		{
+			name: "stored generated bigint",
+			in: &ir.Column{
+				Name:            "total",
+				Type:            ir.Integer{Width: 64},
+				GeneratedExpr:   "qty * price",
+				GeneratedStored: true,
+			},
+			want: "`total` BIGINT GENERATED ALWAYS AS (qty * price) STORED NOT NULL",
+		},
+		{
+			name: "virtual generated varchar",
+			in: &ir.Column{
+				Name:            "label",
+				Type:            ir.Varchar{Length: 64},
+				GeneratedExpr:   "CONCAT(first_name, ' ', last_name)",
+				GeneratedStored: false,
+			},
+			want: "`label` VARCHAR(64) GENERATED ALWAYS AS (CONCAT(first_name, ' ', last_name)) VIRTUAL NOT NULL",
+		},
+		{
+			name: "stored generated nullable",
+			in: &ir.Column{
+				Name:            "tax",
+				Type:            ir.Decimal{Precision: 10, Scale: 2},
+				Nullable:        true,
+				GeneratedExpr:   "subtotal * 0.07",
+				GeneratedStored: true,
+			},
+			want: "`tax` DECIMAL(10,2) GENERATED ALWAYS AS (subtotal * 0.07) STORED",
+		},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			got, err := emitColumnDef(c.in)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != c.want {
+				t.Errorf("\n got  %q\n want %q", got, c.want)
+			}
+		})
+	}
+}
+
 func TestEmitTableDef(t *testing.T) {
 	table := &ir.Table{
 		Name: "users",

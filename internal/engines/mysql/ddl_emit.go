@@ -367,7 +367,14 @@ func temporalPrecision(t ir.Type) int {
 // emitColumnDef returns the full DDL fragment for a single column,
 // suitable for inclusion in a CREATE TABLE column list:
 //
-//	`name` TYPE [NOT NULL] [DEFAULT ...] [COMMENT '...']
+//	`name` TYPE [GENERATED ALWAYS AS (expr) STORED|VIRTUAL] [NOT NULL] [DEFAULT ...] [COMMENT '...']
+//
+// For generated columns the GENERATED clause sits between the type
+// and NOT NULL — that's where MySQL's grammar accepts it. The
+// expression is passed through verbatim from the source dialect;
+// non-portable expressions (e.g. PG-specific functions) will error
+// at CREATE TABLE time rather than be guessed-at, in line with the
+// project's verbatim-passthrough translation policy.
 func emitColumnDef(c *ir.Column) (string, error) {
 	if c == nil {
 		return "", fmt.Errorf("mysql: emitColumnDef: column is nil")
@@ -381,9 +388,24 @@ func emitColumnDef(c *ir.Column) (string, error) {
 	sb.WriteString(quoteIdent(c.Name))
 	sb.WriteByte(' ')
 	sb.WriteString(typeStr)
+	if c.IsGenerated() {
+		sb.WriteString(" GENERATED ALWAYS AS (")
+		sb.WriteString(c.GeneratedExpr)
+		sb.WriteByte(')')
+		if c.GeneratedStored {
+			sb.WriteString(" STORED")
+		} else {
+			sb.WriteString(" VIRTUAL")
+		}
+	}
 	if !c.Nullable {
 		sb.WriteString(" NOT NULL")
 	}
+	// DEFAULT and AUTO_INCREMENT are mutually exclusive with GENERATED
+	// in MySQL — the parser rejects the combination. Generated columns
+	// arrive with Default = DefaultNone from the schema reader, so
+	// emitDefault returns ok=false and the clause is skipped naturally;
+	// we don't need a special case here.
 	if dflt, ok := emitDefault(c.Default, c.Type); ok {
 		sb.WriteString(" DEFAULT ")
 		sb.WriteString(dflt)
