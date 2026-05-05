@@ -6,6 +6,14 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-05-05
+
+Single-feature patch release closing Item F from the v0.4.0
+real-world testing report: PG CDC streams whose replication slot
+was dropped (typically after `wal_status='lost'`) now recover via
+auto-fall-through to cold-start instead of erroring out with no
+flag to bypass.
+
 ### Added
 
 - **Slot-missing fall-through to cold-start (Item F).** When a
@@ -962,7 +970,8 @@ level history.
 
 (none currently — see the closed entries above.)
 
-[Unreleased]: https://github.com/orware/sluice/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/orware/sluice/compare/v0.5.2...HEAD
+[0.5.2]: https://github.com/orware/sluice/releases/tag/v0.5.2
 [0.5.1]: https://github.com/orware/sluice/releases/tag/v0.5.1
 [0.5.0]: https://github.com/orware/sluice/releases/tag/v0.5.0
 [0.4.0]: https://github.com/orware/sluice/releases/tag/v0.4.0
