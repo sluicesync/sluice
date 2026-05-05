@@ -91,6 +91,8 @@ type MigrateCmd struct {
 	MigrationID string `help:"Stable migration identifier; key in sluice_migrate_state. Auto-generated from source/target host info when empty." placeholder:"ID"`
 
 	ForceColdStart bool `help:"Skip the cold-start pre-flight check that refuses to bulk-copy into a populated target. Use with caution — INSERT into a non-empty table will collide on PRIMARY KEY. Ignored when --resume is set."`
+
+	BulkBatchSize int `help:"Bulk-copy batch size for resume-mid-table checkpointing. Each batch commits with an updated cursor in sluice_migrate_state.table_progress, so a crash mid-table resumes without re-copying the prefix. Tables without a PK fall back to truncate-and-redo regardless. Lower values shorten the replay window on crash; higher values amortise per-tx commit overhead. Only consulted on the resume path; cold-start migrations use the faster plain-INSERT / COPY path. Default 5000." default:"5000" placeholder:"N"`
 }
 
 // Run implements the migrate subcommand.
@@ -138,6 +140,7 @@ func (m *MigrateCmd) Run(g *Globals) error {
 		Resume:         m.Resume,
 		MigrationID:    m.MigrationID,
 		ForceColdStart: m.ForceColdStart,
+		BulkBatchSize:  m.BulkBatchSize,
 	}
 	return mig.Run(kongContext())
 }
