@@ -38,6 +38,8 @@ For continuity when a chunk references "the previous work":
 - **Structured logging via `log/slog`** — `--log-level` actually works; bulk-copy progress lines every 2s; phase-aware error hints.
 - **Composite-PK CDC regression coverage** — every direction (PG→PG, MySQL→MySQL via binlog and VStream, MySQL→PG cross-engine).
 - **Generated column support** — read-side capture (`Column.GeneratedExpr` + `GeneratedStored`), write-side emission, row-path filtering so the target's GENERATED clause does the recomputation. Verbatim expression passthrough; non-portable expressions fail loudly on the target.
+- **CHECK constraint support** — same shape as generated columns: schema-read capture into `Table.CheckConstraints`, DDL emission, verbatim expression passthrough. Discovered (and now strips) two more layers of MySQL stored-form decoration: charset introducers (`_utf8mb4'literal'`) and delimiter-escape forms (`\'literal\'`). Generated columns benefit from the same normalizer.
+- **`--type-override TABLE.COLUMN=TYPE`** — CLI form of the YAML `mappings:` config; one-off overrides without writing a YAML file. Wholesale-precedence over YAML when both are supplied.
 
 ### Foundational ADRs (0001–0015)
 
@@ -47,14 +49,7 @@ IR-first, sealed interfaces, kong+koanf, three-phase apply, MySQL flavors, pgout
 
 ## Next up
 
-### 1. Operational polish (small CLI surfaces)
-
-- **Schema rename mapping.** Source schema `app` → target schema `webapp`. Useful for environments where naming differs. (The mappings YAML config covers some of this; surface it in flags too.)
-- **Type override config (CLI form).** YAML hook for the user to say "treat MySQL `bigint(20) unsigned` in column X as Postgres `numeric(20)` regardless of default policy" — already works via the `mappings:` YAML; CLI surface for one-off overrides would be friendlier.
-
----
-
-### 2. Per-batch checkpointing for resume
+### 1. Per-batch checkpointing for resume
 
 **Why.** v0.3.0's resume truncates and re-copies any in-progress table on retry. For multi-hour copies of single huge tables, per-batch progress would let resume pick up mid-table.
 
@@ -68,19 +63,7 @@ See ADR-0015 for the trade-off the v1 truncate-and-redo decision settled.
 
 ---
 
-### 3. CHECK constraint support
-
-**Why.** Both engines support `CHECK (expression)` constraints (PG always; MySQL 8.0+). Today the schema readers ignore them, so the target gets a column without the validation. Same shape as the generated-column gap that landed in v0.3.x: silent invariant break, surfaces only when an invalid value gets written.
-
-**What.** Mirror the generated-columns shape — IR additions on `ir.Column` or a new `ir.Schema.CheckConstraints []*Check` slice, schema-reader queries (`information_schema.check_constraints`), DDL-emit support, verbatim expression passthrough policy.
-
-**Gotchas / open questions.**
-- Same identifier-quoting normalization as generated columns (MySQL stores reformatted text with backticks; PG won't parse them).
-- Table-level CHECKs vs column-level CHECKs — IR shape choice.
-
----
-
-### 4. Other latent cross-engine type edges
+### 2. Other latent cross-engine type edges
 
 Tracked here so they're not forgotten; each will surface once the relevant test exercises it.
 
