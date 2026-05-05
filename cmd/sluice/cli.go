@@ -83,6 +83,8 @@ type MigrateCmd struct {
 	IncludeTable []string `help:"Only migrate these tables (comma-separated, repeatable). Glob patterns allowed (e.g. 'audit_*'). Mutually exclusive with --exclude-table." sep:"," placeholder:"TABLE"`
 	ExcludeTable []string `help:"Migrate every table except these (comma-separated, repeatable). Glob patterns allowed. Mutually exclusive with --include-table." sep:"," placeholder:"TABLE"`
 
+	TypeOverride []string `help:"Force a specific target type for a column (repeatable). Format: 'TABLE.COLUMN=TYPE', e.g. 'products.attrs=text'. CLI form of the YAML 'mappings:' config; for target-type options (e.g. 'jsonb' with binary=true), use the YAML form." placeholder:"TABLE.COLUMN=TYPE"`
+
 	DryRun bool `help:"Read the source schema and print the migration plan without applying changes." short:"n"`
 
 	Resume      bool   `help:"Resume a previously-failed migration. State is read from sluice_migrate_state on the target." short:"r"`
@@ -118,13 +120,18 @@ func (m *MigrateCmd) Run(g *Globals) error {
 		return err
 	}
 
+	mappings, err := resolveMappings(m.TypeOverride, cfg)
+	if err != nil {
+		return err
+	}
+
 	mig := &pipeline.Migrator{
 		Source:      source,
 		Target:      target,
 		SourceDSN:   m.Source,
 		TargetDSN:   m.Target,
 		DryRun:      m.DryRun,
-		Mappings:    cfg.Mappings,
+		Mappings:    mappings,
 		Filter:      filter,
 		Resume:      m.Resume,
 		MigrationID: m.MigrationID,
@@ -188,6 +195,8 @@ type SyncStartCmd struct {
 	IncludeTable []string `help:"Only stream these tables (comma-separated, repeatable). Glob patterns allowed (e.g. 'audit_*'). Mutually exclusive with --exclude-table." sep:"," placeholder:"TABLE"`
 	ExcludeTable []string `help:"Stream every table except these (comma-separated, repeatable). Glob patterns allowed. Mutually exclusive with --include-table." sep:"," placeholder:"TABLE"`
 
+	TypeOverride []string `help:"Force a specific target type for a column (repeatable). Format: 'TABLE.COLUMN=TYPE', e.g. 'products.attrs=text'. CLI form of the YAML 'mappings:' config; for target-type options, use the YAML form." placeholder:"TABLE.COLUMN=TYPE"`
+
 	StreamID string `help:"Stream identifier; the key under which position is persisted on the target. Auto-generated from source/target host info when empty." placeholder:"ID"`
 	DryRun   bool   `short:"n" help:"Print what would happen — cold-start vs warm-resume, source schema summary or persisted position — without modifying the target or starting the stream."`
 }
@@ -217,13 +226,18 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 		return err
 	}
 
+	mappings, err := resolveMappings(s.TypeOverride, cfg)
+	if err != nil {
+		return err
+	}
+
 	streamer := &pipeline.Streamer{
 		Source:    source,
 		Target:    target,
 		SourceDSN: s.Source,
 		TargetDSN: s.Target,
 		StreamID:  s.StreamID,
-		Mappings:  cfg.Mappings,
+		Mappings:  mappings,
 		DryRun:    s.DryRun,
 		Filter:    filter,
 	}
