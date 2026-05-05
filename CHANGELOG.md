@@ -6,6 +6,64 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-05-04
+
+Patch release — adds first-class generated-column support and
+includes the CI-pipeline fixes that surfaced during the v0.3.0
+release rebuild.
+
+### Added
+
+- **Generated column support across both engines.** Source columns
+  declared as `GENERATED ALWAYS AS (expr) STORED` (or `VIRTUAL` on
+  MySQL) now round-trip cleanly: the schema readers capture the
+  expression on `ir.Column.GeneratedExpr`, the DDL writers emit
+  the corresponding `GENERATED ALWAYS AS (...)` clause, and the
+  bulk-copy / CDC paths skip the column from INSERT/UPDATE column
+  lists so the target re-computes via its own GENERATED clause.
+
+  Translation policy is verbatim passthrough — non-portable
+  expressions (e.g. MySQL `CONCAT(a, b)` vs PG `a || b`) fail
+  loudly on the target rather than be guessed at. Identifier
+  quoting *is* normalized at the read boundary (MySQL's stored
+  expression text uses backticks that PG can't parse), since
+  that's a mechanical dialect-quoting issue rather than a
+  function/operator translation. Cross-engine sources with
+  VIRTUAL columns are silently promoted to STORED on PG (which
+  doesn't support VIRTUAL) with a `slog.Warn` documenting the
+  shift.
+
+  Integration coverage on MySQL→MySQL, PG→PG, and MySQL→PG
+  (cross-engine) for both the migrate and streamer paths.
+
+### Fixed
+
+- **CI pipeline fixes uncovered during the v0.3.0 release rebuild**:
+  - Migrated `.golangci.yml` to v2 schema (top-level `version: "2"`,
+    `linters.default: none`, formatters split into the new
+    top-level `formatters:` section, drop deprecated `gosimple`
+    which is merged into `staticcheck`).
+  - Bumped `golangci/golangci-lint-action` to `@v8` so `version:
+    latest` resolves to the v2 module path.
+  - Re-enabled `install-mode: goinstall` so the linter compiles
+    with our Go 1.26 toolchain rather than the prebuilt-binary's
+    older Go (which couldn't typecheck stdlib `chacha20poly1305`'s
+    Go-1.26-only file).
+  - **MySQL binlog composite-PK test**: corrected `int32` type
+    assertions to `int64`. The binlog reader's `decodeInteger`
+    widens every integer to `int64`, so the v0.3.0 test asserted
+    a type that doesn't exist in the row map.
+  - Five new lint findings v1 missed (caught by v2): `any`
+    variable shadowing the builtin, an embedded-field selector
+    simplification, a capitalised error string, two De-Morgan'd
+    conditional reads.
+
+### Changed
+
+- **Schema readers exclude `sluice_*_state` tables**. Already done
+  in v0.3.0 for the migrate-state table; this release extends the
+  list to fully cover both bookkeeping tables on re-migrations.
+
 ## [0.3.0] - 2026-05-04
 
 Feature release. Three substantial additions to the operator surface
@@ -575,7 +633,8 @@ level history.
 
 (none currently — see the closed entries above.)
 
-[Unreleased]: https://github.com/orware/sluice/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/orware/sluice/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/orware/sluice/releases/tag/v0.3.1
 [0.3.0]: https://github.com/orware/sluice/releases/tag/v0.3.0
 [0.2.2]: https://github.com/orware/sluice/releases/tag/v0.2.2
 [0.2.1]: https://github.com/orware/sluice/releases/tag/v0.2.1
