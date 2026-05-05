@@ -89,6 +89,15 @@ type Streamer struct {
 	// allowed and dropped events and the next applied event
 	// advances the position past the dropped ones.
 	Filter TableFilter
+
+	// ForceColdStart, when true, skips the cold-start pre-flight
+	// check that refuses a fresh stream into a target with
+	// pre-existing rows. The check protects against Bug 9 (cold-
+	// start hangs after a killed-mid-copy run leaves partial dest
+	// data behind); this flag is the explicit override for the
+	// rare case of bulk-copying into a populated table. Ignored on
+	// the warm-resume path — that branch doesn't bulk-copy.
+	ForceColdStart bool
 }
 
 // Run executes a snapshot+CDC stream. See [Streamer] for the full
@@ -361,6 +370,18 @@ func (s *Streamer) coldStart(ctx context.Context) (<-chan ir.Change, error) {
 		closeIf(sw)
 		_ = stream.Close()
 		return nil, wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: open target row writer: %w", err))
+	}
+
+	// Cold-start pre-flight: refuse if any target table already
+	// contains data. See preflight.go for the rationale (Bug 9).
+	// Streamer's cold-start branch is the analogue of Migrator's
+	// non-resume cold-start path; warm-resume doesn't run bulk-copy
+	// and is therefore not gated by this check.
+	if err := preflightColdStart(ctx, schema, rw, s.ForceColdStart); err != nil {
+		closeIf(rw)
+		closeIf(sw)
+		_ = stream.Close()
+		return nil, err
 	}
 
 	if err := runBulkCopy(ctx, schema, stream.Rows, sw, rw); err != nil {

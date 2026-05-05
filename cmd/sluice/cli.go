@@ -89,6 +89,8 @@ type MigrateCmd struct {
 
 	Resume      bool   `help:"Resume a previously-failed migration. State is read from sluice_migrate_state on the target." short:"r"`
 	MigrationID string `help:"Stable migration identifier; key in sluice_migrate_state. Auto-generated from source/target host info when empty." placeholder:"ID"`
+
+	ForceColdStart bool `help:"Skip the cold-start pre-flight check that refuses to bulk-copy into a populated target. Use with caution — INSERT into a non-empty table will collide on PRIMARY KEY. Ignored when --resume is set."`
 }
 
 // Run implements the migrate subcommand.
@@ -126,15 +128,16 @@ func (m *MigrateCmd) Run(g *Globals) error {
 	}
 
 	mig := &pipeline.Migrator{
-		Source:      source,
-		Target:      target,
-		SourceDSN:   m.Source,
-		TargetDSN:   m.Target,
-		DryRun:      m.DryRun,
-		Mappings:    mappings,
-		Filter:      filter,
-		Resume:      m.Resume,
-		MigrationID: m.MigrationID,
+		Source:         source,
+		Target:         target,
+		SourceDSN:      m.Source,
+		TargetDSN:      m.Target,
+		DryRun:         m.DryRun,
+		Mappings:       mappings,
+		Filter:         filter,
+		Resume:         m.Resume,
+		MigrationID:    m.MigrationID,
+		ForceColdStart: m.ForceColdStart,
 	}
 	return mig.Run(kongContext())
 }
@@ -199,6 +202,8 @@ type SyncStartCmd struct {
 
 	StreamID string `help:"Stream identifier; the key under which position is persisted on the target. Auto-generated from source/target host info when empty." placeholder:"ID"`
 	DryRun   bool   `short:"n" help:"Print what would happen — cold-start vs warm-resume, source schema summary or persisted position — without modifying the target or starting the stream."`
+
+	ForceColdStart bool `help:"Skip the cold-start pre-flight check that refuses to bulk-copy into a populated target. Use with caution — INSERT into a non-empty table will collide on PRIMARY KEY. Ignored on the warm-resume path."`
 }
 
 // Run implements `sluice sync start`.
@@ -232,14 +237,15 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 	}
 
 	streamer := &pipeline.Streamer{
-		Source:    source,
-		Target:    target,
-		SourceDSN: s.Source,
-		TargetDSN: s.Target,
-		StreamID:  s.StreamID,
-		Mappings:  mappings,
-		DryRun:    s.DryRun,
-		Filter:    filter,
+		Source:         source,
+		Target:         target,
+		SourceDSN:      s.Source,
+		TargetDSN:      s.Target,
+		StreamID:       s.StreamID,
+		Mappings:       mappings,
+		DryRun:         s.DryRun,
+		Filter:         filter,
+		ForceColdStart: s.ForceColdStart,
 	}
 	return streamer.Run(kongContext())
 }
