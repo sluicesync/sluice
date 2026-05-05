@@ -24,8 +24,31 @@ type Table struct {
 	Indexes []*Index
 	// ForeignKeys declared on this table.
 	ForeignKeys []*ForeignKey
+	// CheckConstraints declared on this table. Both column-scoped
+	// (e.g. `qty INT CHECK (qty >= 0)`) and table-scoped (e.g.
+	// `CHECK (start_date <= end_date)`) CHECKs land here — both
+	// engines normalize them into information_schema as table-level
+	// entries, and the IR mirrors that.
+	CheckConstraints []*CheckConstraint
 	// Comment is the table-level comment, if any.
 	Comment string
+}
+
+// CheckConstraint represents a single CHECK clause on a table.
+//
+// Translation policy is verbatim passthrough — non-portable
+// expressions (e.g. MySQL's IF(...) versus PG's CASE) fail loudly on
+// the target rather than be guessed at. Identifier quoting is
+// normalized at the read boundary (MySQL's stored expression text
+// uses backticks that PG can't parse).
+type CheckConstraint struct {
+	// Name is the constraint name (system-generated when not
+	// explicitly named at source). Preserved through DDL emit so a
+	// target's pg_dump shape stays diffable against the source.
+	Name string
+	// Expr is the constraint expression in the source dialect's
+	// syntax, with engine-specific identifier quoting stripped.
+	Expr string
 }
 
 // Column describes a single column.
