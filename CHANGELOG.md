@@ -6,7 +6,131 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-## [0.4.0] - 2026-05-04
+## [0.5.0] - 2026-05-05
+
+Reliability + performance release. Headline feature is parallel
+within-table bulk copy (the pgcopydb-class signature win for multi-TB
+migrations), throughput metrics extended to MB/s + ETA, plus four
+fixes uncovered during real-world v0.4.0 soak testing — one of which
+(Bug 15) was a CRITICAL silent-data-loss path on Postgres CDC. Three
+new ADRs (0019, 0020, 0021).
+
+### Added — performance
+
+- **Parallel within-table bulk copy.** Tables above
+  `--bulk-parallel-min-rows` (default 100k) with a single integer PK
+  are now split into N PK ranges and copied concurrently, with per-
+  chunk cursor checkpoints in `sluice_migrate_state`. Tables below
+  the threshold, with composite PKs, or without a PK fall through to
+  the v0.4.x single-reader behaviour. Postgres readers share a single
+  exported snapshot via `SET TRANSACTION SNAPSHOT` (`SnapshotImporter`
+  optional engine surface) so all chunks see a consistent view; MySQL
+  uses per-chunk `REPEATABLE READ` transactions because per-session
+  REPEATABLE-READ snapshots have no shareable name. Boundaries are
+  computed once via `MIN`/`MAX` on the PK and persisted, so a resume
+  run aligns exactly with completed chunks rather than recomputing
+  ranges (which would shift if rows landed concurrently). New flags:
+  `--bulk-parallelism` (default `min(8, NumCPU)`) and
+  `--bulk-parallel-min-rows`. See ADR-0019.
+- **Throughput metrics: MB/s + ETA.** The bulk-copy progress ticker
+  now emits `total_rows`, `bytes`, `rate_mb_per_sec`, and
+  `eta_seconds` alongside the existing `rows`/`rate` attributes;
+  per-chunk progress lines carry a `chunk=` attribute so operators
+  can see which range is in flight. Row-byte estimation walks the
+  `ir.Row` value-side: string/`[]byte` by length, fixed-width
+  numerics by Go size, `time.Time` as 24, bool as 1, recursive on
+  `[]any`/`[]string`. Approximate but stable enough that MB/s tracks
+  observed network throughput within a few percent.
+- **`CountRows` / `RangeBounds` optional engine surfaces.** Postgres
+  estimates row counts via `pg_class.reltuples` (autovacuum-
+  maintained); MySQL via `information_schema.TABLE_ROWS`. Both short-
+  circuit when called against a snapshot-pinned reader where a
+  concurrent query would deadlock the single shared connection. The
+  ETA computation falls back gracefully when the surface isn't
+  available.
+
+### Fixed
+
+- **Postgres CDC: slot ack advanced before apply commit (Bug 15,
+  CRITICAL — silent data loss on crash).** The PG CDC reader was
+  sending the *streamed* LSN in `StandbyStatusUpdate`, so a crash
+  between `Send` and `tx.Commit` advanced `confirmed_flush_lsn` past
+  events that were never applied — and a warm resume started at the
+  acked position, dropping the in-flight batch on the floor. Real-
+  world soak observed silent row drift after a clean stop/restart
+  cycle when the streamer happened to interrupt a partial batch.
+
+  Fix: a single-producer/single-consumer `lsnTracker` plumbed
+  engine-neutrally via `lsnTrackerProvider`/`lsnTrackerAttacher`
+  structural interfaces. The applier reports `appliedLSN` after
+  `tx.Commit()`; the reader sends `min(streamed, applied)` in the
+  next status update. Trailing-row latency under `--apply-batch-size
+  > 1` is bounded by the batch interval since the LSN only advances
+  on commit boundaries — acceptable today; idle-flush is on the
+  roadmap. See ADR-0020.
+
+  Integration test: `TestStreamer_PostgresToPostgres_StopRestartNoLoss`
+  exercises a stop in the middle of a batched apply and asserts
+  every source change lands on the target after warm resume.
+
+- **Postgres CDC: publication scope was `FOR ALL TABLES` (Bug 13).**
+  The v0.4.0 publication was created `FOR ALL TABLES`, so a brand-
+  new unrelated table on the source — created after sluice started
+  streaming — would land in the pgoutput stream. The applier either
+  crashed on the unknown table OID or, worse, silently dropped the
+  events.
+
+  Fix: `Engine.EnsurePublication(ctx, dsn, tables)` now creates
+  `FOR TABLE <list>` from the resolved migration set after
+  `applyTableFilter`. Existing v0.4.0 `FOR ALL TABLES` publications
+  are migrated by drop-and-recreate during cold start (the slot is
+  unaffected; only the publication is replaced). The applier now
+  has defence-in-depth: an unknown table OID is logged at WARN and
+  the change is skipped rather than crashing the stream. See
+  ADR-0021.
+
+  Integration test: `TestStreamer_PostgresToPostgres_NewTableOnSourceIgnored`
+  creates a fresh table on the source mid-stream and asserts the
+  applier ignores it.
+
+- **PG array → MySQL JSON conversion (Bug 14).** A PG source column
+  of array type (e.g. `text[]`, `int[]`) migrating to a MySQL JSON
+  target arrived at the writer as `[]any`, a PG-array literal string
+  (`{a,b,c}`), or `[]byte` holding the same — none of which MySQL's
+  driver knows how to bind to a JSON column. `prepareValue` now
+  branches `convertArrayLikeToJSON` for all three shapes. Empty
+  arrays serialize as `[]` (disambiguated from `{}`, which would be a
+  JSON object). Integration test:
+  `TestMigrate_PostgresToMySQL_ArrayToJSONOverride`.
+
+- **MySQL CDC: silent stalls on quiet upstream (Bug 12).**
+  go-mysql's binlog syncer can hang silently if the upstream goes
+  quiet for long enough that the TCP keepalive doesn't fire — the
+  reader has no signal to distinguish "no events" from "connection
+  dead". v0.5.0 sets `defaultBinlogHeartbeatPeriod = 10s` on the
+  syncer so the upstream emits keep-alive heartbeats, and adds a
+  30s no-events watchdog that surfaces a stalled-stream error if no
+  row-relevant event arrives in that window (filtered by
+  `isRowRelevantEvent` so heartbeat and rotation events don't reset
+  the timer indefinitely, which would mask a real stall). Not
+  reproducible in CI without a multi-minute idle, so manually
+  validated against real PlanetScale/vanilla MySQL streams.
+
+### Added — architecture documentation
+
+Three new ADRs in `docs/adr/`:
+
+- **ADR-0019**: Parallel within-table bulk copy — chunk-boundary
+  computation, snapshot-import strategy per engine, boundary
+  stability invariant, fallback matrix.
+- **ADR-0020**: Slot-ack-after-apply — LSN tracker design, SPSC
+  contract, why `min(streamed, applied)` instead of just `applied`,
+  trailing-row latency tradeoff.
+- **ADR-0021**: Publication scope by table — `FOR TABLE <list>`
+  rationale, drop-and-recreate migration from v0.4.0 publications,
+  applier defence-in-depth on unknown OIDs.
+
+
 
 Feature release with four substantive responses to measured production
 concerns from the v0.3.x robustness testing rounds, plus three new
@@ -789,7 +913,8 @@ level history.
 
 (none currently — see the closed entries above.)
 
-[Unreleased]: https://github.com/orware/sluice/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/orware/sluice/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/orware/sluice/releases/tag/v0.5.0
 [0.4.0]: https://github.com/orware/sluice/releases/tag/v0.4.0
 [0.3.2]: https://github.com/orware/sluice/releases/tag/v0.3.2
 [0.3.1]: https://github.com/orware/sluice/releases/tag/v0.3.1
