@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"log/slog"
 	"net"
 	"os"
 	"strconv"
@@ -27,6 +28,30 @@ import (
 // hammering the consumer's loop body. Tunable later if real workloads
 // reveal a sweet spot.
 const cdcChannelBuffer = 256
+
+// defaultBinlogHeartbeatPeriod is the default cadence at which the
+// source MySQL server is asked to send heartbeat events on an idle
+// binlog connection. Without it (HeartbeatPeriod=0), the underlying
+// TCP connection can silently stall on Docker / NAT setups when no
+// row events flow for a few seconds — sluice cold-starts cleanly
+// but never advances past the initial rotate event. Bug 12 in v0.4.0
+// soak testing.
+//
+// 10 seconds matches go-mysql's documented "conventional" value and
+// is well below MySQL's default replica-net-timeout (60s), so a
+// stalled connection surfaces as a clean read error rather than a
+// silent hang.
+const defaultBinlogHeartbeatPeriod = 10 * time.Second
+
+// noEventsGracePeriod is the wall-clock window the streaming
+// goroutine waits for the first row event after CDC starts before
+// emitting a "no events received" warning. The warning is purely
+// diagnostic — long-idle source workloads are legitimate — but it
+// surfaces the Bug 12 silent-stall surface promptly so an operator
+// can investigate (binary logging disabled? REPLICATION SLAVE
+// missing? heartbeat misconfigured?). 30 seconds gives enough
+// breathing room that a normal startup never hits it.
+const noEventsGracePeriod = 30 * time.Second
 
 // CDCReader streams MySQL row changes from the binlog as [ir.Change]
 // events. It implements [ir.CDCReader] for the vanilla MySQL flavor;
@@ -103,6 +128,16 @@ type CDCReader struct {
 	// [Err] after the channel closes.
 	mu  sync.Mutex
 	err error
+
+	// noEventsSuppress / noEventsSuppressOnce coordinate the Bug 12
+	// startup watchdog. The watchdog goroutine listens on the
+	// channel; the pump closes it (via the Once) the first time a
+	// row-relevant event arrives. A timer expiry without the close
+	// is the "stalled connection" surface and emits a diagnostic
+	// WARN line. Allocated lazily in StreamChanges so the zero-
+	// valued reader has nothing to leak.
+	noEventsSuppress     chan struct{}
+	noEventsSuppressOnce sync.Once
 }
 
 // tableSchema is the slice of [ir.Table] the CDC dispatcher actually
@@ -173,6 +208,16 @@ func (r *CDCReader) StreamChanges(ctx context.Context, from ir.Position) (<-chan
 		Port:     r.port,
 		User:     r.user,
 		Password: r.password,
+		// Non-zero HeartbeatPeriod is load-bearing on Docker /
+		// NAT-y networks: with HeartbeatPeriod=0, the source never
+		// sends keepalive events on an idle binlog connection and
+		// the read can stall indefinitely. Bug 12 — observed on
+		// localhost mysql:8.0 containers under Rancher Desktop on
+		// Windows. The value matches go-mysql's documented
+		// convention and is well under MySQL's default
+		// replica-net-timeout, so a stalled connection now surfaces
+		// as a clean read error rather than a silent hang.
+		HeartbeatPeriod: defaultBinlogHeartbeatPeriod,
 		// The default ParseTime=false returns timestamps as a
 		// replication.Time string; we'd rather decode lazily ourselves
 		// inside decodeValue, so leave ParseTime alone.
@@ -185,6 +230,9 @@ func (r *CDCReader) StreamChanges(ctx context.Context, from ir.Position) (<-chan
 		r.syncer = nil
 		return nil, fmt.Errorf("mysql: start binlog stream: %w", err)
 	}
+
+	r.noEventsSuppress = make(chan struct{})
+	r.noEventsSuppressOnce = sync.Once{}
 
 	loopCtx, cancel := context.WithCancel(ctx)
 	r.streamerCancel = cancel
@@ -247,8 +295,21 @@ func (r *CDCReader) startStreamer(p binlogPos) (*replication.BinlogStreamer, err
 // pump is the event loop. It owns out and is responsible for closing
 // it before returning. Errors are stored on the reader via setErr;
 // callers see them via Err after the channel closes.
+//
+// A startup grace-period watchdog fires once if no row events arrive
+// within [noEventsGracePeriod] (Bug 12 diagnostic). The watchdog
+// does NOT cancel the stream — long-idle source workloads are
+// legitimate; it only surfaces a one-shot WARN line so the operator
+// has a footprint to investigate ("is binary logging on? does the
+// connecting role have REPLICATION SLAVE?"). Heartbeat events
+// (from the source's HeartbeatPeriod ack) and rotate events do NOT
+// count — only row-level events satisfy the watchdog.
 func (r *CDCReader) pump(ctx context.Context, streamer *replication.BinlogStreamer, out chan<- ir.Change) {
 	defer close(out)
+
+	pumpCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go r.startNoEventsWatchdog(pumpCtx)
 
 	for {
 		ev, err := streamer.GetEvent(ctx)
@@ -261,11 +322,60 @@ func (r *CDCReader) pump(ctx context.Context, streamer *replication.BinlogStream
 			r.setErr(fmt.Errorf("mysql: cdc: get event: %w", err))
 			return
 		}
+		// Suppress the watchdog as soon as anything row-relevant
+		// shows up. Heartbeat / format-description / rotate events
+		// are book-keeping and don't count — the watchdog wants to
+		// catch the "no rows ever delivered" Bug 12 surface
+		// specifically.
+		if isRowRelevantEvent(ev) {
+			r.suppressNoEventsWatchdog()
+		}
 		if err := r.dispatch(ctx, ev, out); err != nil {
 			r.setErr(err)
 			return
 		}
 	}
+}
+
+// startNoEventsWatchdog runs a one-shot timer; if it expires before
+// suppressNoEventsWatchdog is called, it emits a Bug-12-style WARN
+// line. Cancellation via ctx is the clean-shutdown path; the
+// suppress channel is the "row event seen, all good" path.
+func (r *CDCReader) startNoEventsWatchdog(ctx context.Context) {
+	t := time.NewTimer(noEventsGracePeriod)
+	defer t.Stop()
+	select {
+	case <-r.noEventsSuppress:
+		return
+	case <-ctx.Done():
+		return
+	case <-t.C:
+		slog.WarnContext(ctx, "mysql: cdc: no binlog row events received during startup grace period",
+			slog.String("hint", "verify binary logging is enabled (log_bin=ON), the connecting role has REPLICATION SLAVE, and the source is producing changes; if running against a localhost docker container, see Bug 12 in the project changelog"),
+		)
+	}
+}
+
+// suppressNoEventsWatchdog signals the watchdog goroutine to exit
+// without warning. Idempotent (closing a closed channel would panic;
+// we use a once-style guarded close).
+func (r *CDCReader) suppressNoEventsWatchdog() {
+	r.noEventsSuppressOnce.Do(func() { close(r.noEventsSuppress) })
+}
+
+// isRowRelevantEvent reports whether a binlog event represents
+// real DML or DDL traffic (the events the watchdog is watching for).
+// Heartbeat, format-description, and rotate events are bookkeeping
+// and don't count as "the source is producing changes".
+func isRowRelevantEvent(ev *replication.BinlogEvent) bool {
+	if ev == nil {
+		return false
+	}
+	switch ev.Event.(type) {
+	case *replication.RowsEvent, *replication.QueryEvent, *replication.GTIDEvent, *replication.XIDEvent:
+		return true
+	}
+	return false
 }
 
 // dispatch routes a single binlog event according to the table in
