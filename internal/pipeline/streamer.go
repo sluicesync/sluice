@@ -246,6 +246,23 @@ func (s *Streamer) Run(ctx context.Context) error {
 
 	// ---- 4. Branch: cold start vs warm resume ----
 	//
+	// Two cancellable contexts share the parent ctx:
+	//
+	//   - streamCtx scopes the CDC reader's pump (and, transitively,
+	//     the snapshot + bulk-copy phases of cold-start). When this
+	//     cancels, the reader's pump exits and `defer close(out)`
+	//     closes the change channel — the applier sees the close
+	//     via its existing channel-closed branch and commits its
+	//     in-flight partial batch CLEANLY before returning. This is
+	//     the graceful-drain shape the CLI `sync stop` path needs
+	//     (Bug 15 CLI fix, ADR-0025).
+	//
+	//   - applyCtx scopes the apply loop. Cancelling it tells the
+	//     applier to roll back any open transaction immediately —
+	//     the abort shape used for parent ctx cancellation (Ctrl-C)
+	//     and as the hard-timeout fallback when graceful drain
+	//     doesn't complete in stopDrainTimeout.
+	//
 	// Slot-missing fall-through (ADR-0022): if warm resume fails
 	// because the persisted position references state that no longer
 	// exists on the source (PG slot dropped, MySQL binlog purged),
@@ -264,12 +281,17 @@ func (s *Streamer) Run(ctx context.Context) error {
 	// read + row writer that already need to open. We force the
 	// cold-start branch here rather than risk warmResume seeing the
 	// stale row before reset clears it.
+	streamCtx, cancelStream := context.WithCancel(ctx)
+	defer cancelStream()
+	applyCtx, cancelApply := context.WithCancel(ctx)
+	defer cancelApply()
+
 	var changes <-chan ir.Change
 	switch {
 	case s.ResetTargetData:
-		changes, err = s.coldStart(ctx, lsnTracker, applier, streamID)
+		changes, err = s.coldStart(streamCtx, lsnTracker, applier, streamID)
 	case found:
-		changes, err = s.warmResume(ctx, persisted, lsnTracker)
+		changes, err = s.warmResume(streamCtx, persisted, lsnTracker)
 		if err != nil && errors.Is(err, ir.ErrPositionInvalid) {
 			slog.WarnContext(ctx, "warm resume: persisted position is no longer valid; falling through to cold start",
 				slog.String("stream_id", streamID),
@@ -277,10 +299,10 @@ func (s *Streamer) Run(ctx context.Context) error {
 				slog.String("source_engine", persisted.Engine),
 				slog.String("err", err.Error()),
 			)
-			changes, err = s.coldStart(ctx, lsnTracker, applier, streamID)
+			changes, err = s.coldStart(streamCtx, lsnTracker, applier, streamID)
 		}
 	default:
-		changes, err = s.coldStart(ctx, lsnTracker, applier, streamID)
+		changes, err = s.coldStart(streamCtx, lsnTracker, applier, streamID)
 	}
 	if err != nil {
 		return err
@@ -295,15 +317,7 @@ func (s *Streamer) Run(ctx context.Context) error {
 	// The dispatch-side filter wraps `changes` with a goroutine
 	// that drops events whose qualified name doesn't pass the
 	// filter. No-op pass-through when the filter is empty.
-	//
-	// applyCtx is the context the apply loop sees. It's a child of
-	// the caller's ctx, plus an extra cancel hook the stop-signal
-	// poll goroutine can pull. Cancelling applyCtx triggers the
-	// applier's existing context.Canceled return path (which the
-	// loop below treats as "clean exit" — same shape as a Ctrl-C).
-	applyCtx, cancelApply := context.WithCancel(ctx)
-	defer cancelApply()
-	s.startStopSignalPoll(applyCtx, applier, streamID, cancelApply)
+	s.startStopSignalPoll(applyCtx, applier, streamID, cancelStream, cancelApply)
 
 	filtered := filterChanges(applyCtx, changes, s.Filter)
 	if err := s.dispatchApply(applyCtx, applier, streamID, filtered); err != nil {
@@ -344,14 +358,18 @@ func (s *Streamer) dispatchApply(ctx context.Context, applier ir.ChangeApplier, 
 
 // startStopSignalPoll wires the optional stop-signal poll goroutine
 // when the applier supports it. The goroutine reads the control
-// row's stop flag every few seconds; when set, it cancels applyCtx
-// so the apply loop drains the in-flight change and exits cleanly.
+// row's stop flag every few seconds; when set, it cancels streamCtx
+// so the CDC reader's pump exits, the change channel closes, and
+// the apply loop commits its in-flight partial batch via the
+// channel-closed branch (Bug 15 CLI fix, ADR-0025). cancelApply is
+// passed through to pollStopSignal as a hard-timeout fallback if
+// the graceful drain doesn't complete in time.
 //
 // Test stubs that don't implement stopFlagReader skip the poll
 // entirely — the existing Ctrl-C / ctx-cancel path remains the only
 // way to stop those streams, which matches their pre-stop-signal
 // behavior.
-func (s *Streamer) startStopSignalPoll(applyCtx context.Context, applier ir.ChangeApplier, streamID string, cancelApply context.CancelFunc) {
+func (s *Streamer) startStopSignalPoll(applyCtx context.Context, applier ir.ChangeApplier, streamID string, cancelStream, cancelApply context.CancelFunc) {
 	reader, ok := applier.(stopFlagReader)
 	if !ok {
 		slog.DebugContext(applyCtx, "stop-signal poll skipped: applier does not implement ReadStopRequested",
@@ -362,7 +380,7 @@ func (s *Streamer) startStopSignalPoll(applyCtx context.Context, applier ir.Chan
 	slog.DebugContext(applyCtx, "stop-signal poll started",
 		slog.String("stream_id", streamID),
 	)
-	go pollStopSignal(applyCtx, reader, streamID, cancelApply)
+	go pollStopSignal(applyCtx, reader, streamID, cancelStream, cancelApply)
 }
 
 // logDryRunPlan describes what Run would do without doing it via

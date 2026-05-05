@@ -38,12 +38,7 @@ func (r *fakeStopFlagReader) callCount() int {
 }
 
 // withFastPollInterval replaces stopSignalPollInterval for the test
-// duration so the goroutine ticks frequently. The constant restore
-// runs as a Cleanup; tests can run in parallel as long as they all
-// adopt the fast cadence.
-//
-// We toggle a package-level variable rather than the constant — the
-// constant stays the production default, the override is for tests.
+// duration so the goroutine ticks frequently.
 func withFastPollInterval(t *testing.T) {
 	t.Helper()
 	prev := pollIntervalForTest
@@ -51,32 +46,45 @@ func withFastPollInterval(t *testing.T) {
 	t.Cleanup(func() { pollIntervalForTest = prev })
 }
 
-// TestPollStopSignal_CancelsApplyOnFlag verifies the load-bearing
+// withFastDrainTimeout shrinks the graceful-drain hard-timeout window
+// so the watchdog tests run in milliseconds rather than 30 seconds.
+func withFastDrainTimeout(t *testing.T, d time.Duration) {
+	t.Helper()
+	prev := drainTimeoutForTest
+	drainTimeoutForTest = d
+	t.Cleanup(func() { drainTimeoutForTest = prev })
+}
+
+// TestPollStopSignal_CancelsStreamOnFlag verifies the load-bearing
 // shape: when the reader reports stop_requested = true, the poll
-// loop calls cancelApply and returns.
-func TestPollStopSignal_CancelsApplyOnFlag(t *testing.T) {
+// loop calls cancelStream (graceful drain) and returns. cancelApply
+// only fires later as a hard-timeout fallback.
+func TestPollStopSignal_CancelsStreamOnFlag(t *testing.T) {
 	withFastPollInterval(t)
+	withFastDrainTimeout(t, 10*time.Second) // long enough we won't see it
 
 	reader := &fakeStopFlagReader{}
 	pollCtx, cancelPoll := context.WithCancel(context.Background())
 	defer cancelPoll()
 
+	var streamCancelled atomic.Bool
 	var applyCancelled atomic.Bool
+	cancelStream := func() { streamCancelled.Store(true) }
 	cancelApply := func() { applyCancelled.Store(true) }
 
 	done := make(chan struct{})
 	go func() {
-		pollStopSignal(pollCtx, reader, "stream-1", cancelApply)
+		pollStopSignal(pollCtx, reader, "stream-1", cancelStream, cancelApply)
 		close(done)
 	}()
 
 	// Let the loop tick a couple of times with the flag still off.
 	time.Sleep(50 * time.Millisecond)
-	if applyCancelled.Load() {
-		t.Fatal("applyCancelled fired with flag off")
+	if streamCancelled.Load() {
+		t.Fatal("streamCancelled fired with flag off")
 	}
 
-	// Flip the flag; the next tick should fire cancelApply.
+	// Flip the flag; the next tick should fire cancelStream.
 	reader.setStopRequested(true)
 
 	select {
@@ -84,11 +92,110 @@ func TestPollStopSignal_CancelsApplyOnFlag(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("poll loop did not return after stop flag was observed")
 	}
-	if !applyCancelled.Load() {
-		t.Fatal("cancelApply was not called when flag flipped to true")
+	if !streamCancelled.Load() {
+		t.Fatal("cancelStream was not called when flag flipped to true")
+	}
+	// cancelApply must NOT fire on graceful drain — that's the
+	// hard-timeout-only path.
+	if applyCancelled.Load() {
+		t.Error("cancelApply fired on graceful-drain path; should only fire after drain timeout")
 	}
 	if reader.callCount() < 2 {
 		t.Errorf("expected ≥2 polls before observing flag; got %d", reader.callCount())
+	}
+}
+
+// TestPollStopSignal_HardCancelsApplyOnDrainTimeout verifies the
+// graceful-drain watchdog: when pollCtx (= applyCtx) doesn't cancel
+// within drainTimeoutForTest, cancelApply fires as the fallback.
+func TestPollStopSignal_HardCancelsApplyOnDrainTimeout(t *testing.T) {
+	withFastPollInterval(t)
+	withFastDrainTimeout(t, 100*time.Millisecond)
+
+	reader := &fakeStopFlagReader{}
+	reader.setStopRequested(true)
+	pollCtx, cancelPoll := context.WithCancel(context.Background())
+	defer cancelPoll()
+
+	var streamCancelled atomic.Bool
+	var applyCancelled atomic.Bool
+	cancelStream := func() { streamCancelled.Store(true) }
+	cancelApply := func() { applyCancelled.Store(true) }
+
+	done := make(chan struct{})
+	go func() {
+		pollStopSignal(pollCtx, reader, "stream-1", cancelStream, cancelApply)
+		close(done)
+	}()
+
+	// Wait for the poll loop to return (cancelStream fires + watchdog
+	// goroutine launches).
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("poll loop did not return after stop flag was observed")
+	}
+	if !streamCancelled.Load() {
+		t.Fatal("cancelStream was not called")
+	}
+
+	// cancelApply hasn't fired yet — drain timeout hasn't elapsed.
+	if applyCancelled.Load() {
+		t.Fatal("cancelApply fired before drain timeout elapsed")
+	}
+
+	// Wait past the drain timeout. Since pollCtx is still alive,
+	// the watchdog hits the timeout branch and calls cancelApply.
+	deadline := time.Now().Add(2 * time.Second)
+	for !applyCancelled.Load() && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !applyCancelled.Load() {
+		t.Fatal("cancelApply did not fire after drain timeout elapsed")
+	}
+}
+
+// TestPollStopSignal_WatchdogExitsCleanlyOnApplyDone verifies the
+// graceful-drain watchdog goroutine exits cleanly when pollCtx
+// cancels first (= apply finished naturally), without firing
+// cancelApply.
+func TestPollStopSignal_WatchdogExitsCleanlyOnApplyDone(t *testing.T) {
+	withFastPollInterval(t)
+	withFastDrainTimeout(t, 5*time.Second) // long; we cancel pollCtx first
+
+	reader := &fakeStopFlagReader{}
+	reader.setStopRequested(true)
+	pollCtx, cancelPoll := context.WithCancel(context.Background())
+
+	var streamCancelled atomic.Bool
+	var applyCancelled atomic.Bool
+	cancelStream := func() { streamCancelled.Store(true) }
+	cancelApply := func() { applyCancelled.Store(true) }
+
+	done := make(chan struct{})
+	go func() {
+		pollStopSignal(pollCtx, reader, "stream-1", cancelStream, cancelApply)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("poll loop did not return after stop flag was observed")
+	}
+	if !streamCancelled.Load() {
+		t.Fatal("cancelStream was not called")
+	}
+
+	// Simulate apply finishing naturally — cancel pollCtx (analogous
+	// to defer cancelApply running in Streamer.Run after dispatchApply
+	// returns nil on channel close).
+	cancelPoll()
+
+	// Give the watchdog goroutine a moment to observe pollCtx.Done.
+	time.Sleep(100 * time.Millisecond)
+	if applyCancelled.Load() {
+		t.Error("cancelApply fired despite apply finishing naturally")
 	}
 }
 
@@ -101,25 +208,30 @@ func TestPollStopSignal_ExitsOnPollCtxCancel(t *testing.T) {
 	reader := &fakeStopFlagReader{} // flag stays off
 	pollCtx, cancelPoll := context.WithCancel(context.Background())
 
+	var streamCancelled atomic.Bool
 	var applyCancelled atomic.Bool
+	cancelStream := func() { streamCancelled.Store(true) }
 	cancelApply := func() { applyCancelled.Store(true) }
 
 	done := make(chan struct{})
 	go func() {
-		pollStopSignal(pollCtx, reader, "stream-1", cancelApply)
+		pollStopSignal(pollCtx, reader, "stream-1", cancelStream, cancelApply)
 		close(done)
 	}()
 
 	// Cancel the poll's own context; the goroutine should return
-	// without firing cancelApply (no stop flag was ever set).
+	// without firing either cancel func (no stop flag was ever set).
 	cancelPoll()
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("poll loop did not return after pollCtx was cancelled")
 	}
+	if streamCancelled.Load() {
+		t.Error("cancelStream was called on plain ctx-cancel; should only fire on flag-true")
+	}
 	if applyCancelled.Load() {
-		t.Error("cancelApply was called on plain ctx-cancel; should only fire on flag-true")
+		t.Error("cancelApply was called on plain ctx-cancel; should only fire after drain timeout")
 	}
 }
 
@@ -130,24 +242,27 @@ func TestPollStopSignal_ExitsOnPollCtxCancel(t *testing.T) {
 // the streamer's lifetime.
 func TestPollStopSignal_TolerantOfTransientErrors(t *testing.T) {
 	withFastPollInterval(t)
+	withFastDrainTimeout(t, 10*time.Second)
 
 	reader := &fakeStopFlagReader{returnErr: errors.New("transient blip")}
 	pollCtx, cancelPoll := context.WithCancel(context.Background())
 	defer cancelPoll()
 
+	var streamCancelled atomic.Bool
 	var applyCancelled atomic.Bool
+	cancelStream := func() { streamCancelled.Store(true) }
 	cancelApply := func() { applyCancelled.Store(true) }
 
 	done := make(chan struct{})
 	go func() {
-		pollStopSignal(pollCtx, reader, "stream-1", cancelApply)
+		pollStopSignal(pollCtx, reader, "stream-1", cancelStream, cancelApply)
 		close(done)
 	}()
 
 	// Let the loop tick several times despite errors.
 	time.Sleep(80 * time.Millisecond)
-	if applyCancelled.Load() {
-		t.Fatal("cancelApply fired during error-only ticks")
+	if streamCancelled.Load() {
+		t.Fatal("cancelStream fired during error-only ticks")
 	}
 
 	// Recover and observe the flag — poll should still see it.
@@ -161,7 +276,10 @@ func TestPollStopSignal_TolerantOfTransientErrors(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("poll loop did not recover from transient errors")
 	}
-	if !applyCancelled.Load() {
-		t.Fatal("cancelApply was not called after transient errors cleared")
+	if !streamCancelled.Load() {
+		t.Fatal("cancelStream was not called after transient errors cleared")
+	}
+	if applyCancelled.Load() {
+		t.Error("cancelApply fired on graceful-drain path")
 	}
 }

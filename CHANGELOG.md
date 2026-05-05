@@ -8,6 +8,50 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Bug 15 CLI sync-stop drain (data loss in warm-up window,
+  ADR-0025).** The v0.5.0 slot-ack-after-apply work (ADR-0020)
+  closed the post-restart wedge but left a residual data-loss path
+  in the warm-up window between stream start and the first applied
+  commit. Pre-fix, `ackLSN` returned `streamedLSN` (the highest
+  commit-LSN parsed off the WAL) when the applier-feedback tracker
+  was still at zero; the keepalive routine ack'd that to the slot,
+  advancing `confirmed_flush_lsn` past events that hadn't been
+  durably applied. A subsequent `sync stop` mid-batch then lost
+  the events between persisted_position and confirmed_flush_lsn —
+  warm-resume's slot stream started past them and the rows never
+  landed. Empirical repro on local docker: 25-42 row gap with
+  `--apply-batch-size=50` and a sustained 10/sec writer.
+
+  Fix has two layers:
+
+  1. **`ackLSN` anchors at startLSN until first apply commit.** The
+     load-bearing data-correctness fix. When the tracker is fresh
+     (`applied=0`), ack returns the LSN the pump started from
+     (cold-start: snapshot LSN; warm-resume: persisted_position's
+     LSN). The slot can't advance past that point until the applier
+     reports a higher value via the tracker. One-line, one-parameter
+     change.
+
+  2. **Graceful-drain shape for `sync stop`.** The pre-fix
+     `pollStopSignal` cancelled `applyCtx`, rolling back the open
+     batch — relying on warm-resume to redeliver. With the ackLSN
+     fix that worked correctly but produced unnecessary redelivery
+     storms. Stop-signal now cancels a separate `streamCtx` (which
+     scopes the CDC reader's pump); the channel closes cleanly,
+     the applier's existing `channelClosed` branch commits the
+     in-flight partial batch, position writes naturally. A
+     30-second watchdog escalates to hard-cancelling `applyCtx` if
+     the drain wedges.
+
+  Unit-level regression guard: `TestAckLSN_AnchorsAtStartLSNUntilFirstApply`
+  pins the contract. Empirical integration repro lives at
+  `C:\code\sluice-testing\workspace\bug15_repro_dev.sh` (sustained
+  writer, mid-stream `sync stop`): pre-fix dropped 25-42 rows;
+  post-fix drops 0. The existing programmatic-RequestStop integration
+  test (`TestStreamer_PostgresToPostgres_StopRestartNoLoss`) still
+  passes — it happened to time RequestStop past first-batch commit,
+  masking the warm-up window. See ADR-0025.
+
 - **Windows CI: `TestPreviewer_Golden_Text` fails with CRLF/LF
   mismatch.** The test compared `bytes.Equal(buf.Bytes(), want)` —
   buffer with LF newlines (Go's native `\n`) vs. file content that

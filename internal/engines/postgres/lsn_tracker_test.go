@@ -80,6 +80,65 @@ func TestLSNTracker_ConcurrentSingleProducer(t *testing.T) {
 	}
 }
 
+// TestAckLSN_AnchorsAtStartLSNUntilFirstApply is the regression
+// guard for Bug 15 (CLI path). The pre-fix branch on `applied == 0`
+// returned streamedLSN — which advances as the pump parses
+// CommitMessages off the WAL stream, well before the applier has
+// committed. On warm-resume, the tracker starts at 0 and the
+// keepalive would ack confirmed_flush_lsn past the persisted
+// position. A subsequent stop or crash mid-batch then permanently
+// lost events between persisted_position and confirmed_flush_lsn.
+//
+// The fix anchors the ack at startLSN until the applier reports
+// its first commit. Once applied > 0, the tracker takes over.
+func TestAckLSN_AnchorsAtStartLSNUntilFirstApply(t *testing.T) {
+	tr := newLSNTracker()
+	r := &CDCReader{appliedLSN: tr}
+
+	startLSN := pglogrepl.LSN(0x100)
+	// Pump has parsed several commits past startLSN but the applier
+	// hasn't committed any of them yet — applied is still 0.
+	streamed := pglogrepl.LSN(0x500)
+
+	got := r.ackLSN(streamed, startLSN)
+	if got != startLSN {
+		t.Errorf("with fresh tracker, ackLSN = %v; want startLSN=%v (got streamedLSN — Bug 15 regression)",
+			got, startLSN)
+	}
+
+	// First applied report — tracker advances past startLSN but
+	// stays behind streamed.
+	applied1 := pglogrepl.LSN(0x300)
+	tr.ReportApplied(applied1)
+	got = r.ackLSN(streamed, startLSN)
+	if got != applied1 {
+		t.Errorf("after first applied=%v, ackLSN = %v; want applied", applied1, got)
+	}
+
+	// Subsequent applied report advances the tracker further.
+	applied2 := pglogrepl.LSN(0x450)
+	tr.ReportApplied(applied2)
+	got = r.ackLSN(streamed, startLSN)
+	if got != applied2 {
+		t.Errorf("after applied=%v, ackLSN = %v; want applied", applied2, got)
+	}
+}
+
+// TestAckLSN_NoTrackerReturnsStreamedLSN preserves the legacy
+// behaviour for non-streamer callers (no tracker wired) — useful for
+// snapshot-stream test paths and pre-v0.5.0 compatibility shims.
+func TestAckLSN_NoTrackerReturnsStreamedLSN(t *testing.T) {
+	r := &CDCReader{appliedLSN: nil}
+
+	startLSN := pglogrepl.LSN(0x100)
+	streamed := pglogrepl.LSN(0x500)
+
+	got := r.ackLSN(streamed, startLSN)
+	if got != streamed {
+		t.Errorf("with nil tracker, ackLSN = %v; want streamedLSN=%v", got, streamed)
+	}
+}
+
 // TestLSNFromPositionToken_RoundTrip verifies the helper extracts
 // the LSN from a canonical pgPos token, returns 0 on the empty-
 // token case, and propagates parse errors on malformed tokens.

@@ -79,22 +79,44 @@ type stopFlagReader interface {
 // noise. Not exposed as a flag in v1; see the file-level rationale.
 const stopSignalPollInterval = 5 * time.Second
 
+// stopDrainTimeout bounds how long the streamer will wait for a
+// graceful drain (CDC reader stops → channel closes → applier commits
+// partial batch) before hard-cancelling the apply context. Generous
+// by design: a healthy apply commits a partial batch in under a
+// second; the timeout only fires when the apply is genuinely wedged
+// (lost connection, deadlock, etc.). 30s matches the same envelope
+// the integration tests use for "should be done by now" assertions.
+const stopDrainTimeout = 30 * time.Second
+
 // pollIntervalForTest is the live cadence pollStopSignal uses. It
 // defaults to stopSignalPollInterval; unit tests override it to a
 // few-millisecond value so the goroutine ticks fast enough to make
 // assertions snappy. Production code never reassigns it.
 var pollIntervalForTest = stopSignalPollInterval
 
+// drainTimeoutForTest is the live timeout the graceful-drain watchdog
+// uses. Defaults to stopDrainTimeout; unit/integration tests override
+// it for snappy assertions on the hard-cancel fallback. Production
+// code never reassigns it.
+var drainTimeoutForTest = stopDrainTimeout
+
 // pollStopSignal runs until pollCtx is cancelled or until reader
-// reports the stop flag is set. On stop-flag observation it calls
-// cancelApply to tear down the apply loop. The apply loop returns
-// nil on the resulting context.Canceled (existing behavior);
-// Streamer.Run translates that to a clean nil return.
+// reports the stop flag is set. On stop-flag observation it triggers
+// a graceful drain: cancelStream stops the CDC reader (which closes
+// the change channel), the applier sees the channel close and
+// commits its in-flight partial batch cleanly via the existing
+// channel-closed branch in applyOneBatch — no rolled-back events
+// (Bug 15 CLI path, ADR-0025).
+//
+// A watchdog goroutine then waits for the apply loop to finish (via
+// pollCtx.Done, which fires when Streamer.Run's deferred cancelApply
+// runs after dispatchApply returns). If the drain doesn't complete
+// within stopDrainTimeout, cancelApply fires as a hard fallback.
 //
 // reader is typed as stopFlagReader — the optional interface the
 // engine appliers satisfy. Callers that pass a non-conforming
 // applier should skip calling pollStopSignal entirely.
-func pollStopSignal(pollCtx context.Context, reader stopFlagReader, streamID string, cancelApply context.CancelFunc) {
+func pollStopSignal(pollCtx context.Context, reader stopFlagReader, streamID string, cancelStream, cancelApply context.CancelFunc) {
 	t := time.NewTicker(pollIntervalForTest)
 	defer t.Stop()
 
@@ -124,10 +146,25 @@ func pollStopSignal(pollCtx context.Context, reader stopFlagReader, streamID str
 			continue
 		}
 		if stopRequested {
-			slog.InfoContext(pollCtx, "stop requested via control table; draining and exiting",
+			slog.InfoContext(pollCtx, "stop requested via control table; draining stream and exiting",
 				slog.String("stream_id", streamID),
 			)
-			cancelApply()
+			cancelStream()
+			// Hard-timeout watchdog: if the graceful drain doesn't
+			// complete within drainTimeoutForTest, force-cancel the
+			// apply context. Exits cleanly when pollCtx (= applyCtx)
+			// fires first, signalling apply finished naturally.
+			go func() {
+				select {
+				case <-pollCtx.Done():
+				case <-time.After(drainTimeoutForTest):
+					slog.WarnContext(pollCtx, "graceful drain timed out; hard-cancelling apply",
+						slog.String("stream_id", streamID),
+						slog.Duration("timeout", drainTimeoutForTest),
+					)
+					cancelApply()
+				}
+			}()
 			return
 		}
 	}

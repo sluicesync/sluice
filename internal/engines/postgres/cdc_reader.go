@@ -410,7 +410,7 @@ func (r *CDCReader) pump(ctx context.Context, conn *pgconn.PgConn, startLSN pglo
 		// asked for an immediate reply on a previous keepalive, which
 		// zeroes nextKeepalive).
 		if time.Now().After(nextKeepalive) {
-			ack := r.ackLSN(streamedLSN)
+			ack := r.ackLSN(streamedLSN, startLSN)
 			if err := pglogrepl.SendStandbyStatusUpdate(ctx, conn, pglogrepl.StandbyStatusUpdate{
 				WALWritePosition: ack,
 				WALFlushPosition: ack,
@@ -827,24 +827,34 @@ func (r *CDCReader) positionAt(lsn pglogrepl.LSN) (ir.Position, error) {
 
 // ackLSN picks the LSN to advertise to the upstream slot. When an
 // applier feedback tracker is wired, its value wins; until the
-// applier reports its first commit, fall back to the streamed-LSN
-// so the slot still gets keepalive activity (the slot only needs to
-// know we're alive — confirmed_flush_lsn won't advance until the
-// applier reports a higher value than its current floor). Without a
+// applier reports its first commit, anchor at startLSN so the slot
+// can't advance past the position the stream resumed from. Without a
 // tracker (legacy/test paths), report streamedLSN — equivalent to
 // the v0.4.0 behaviour, which is correct when no async-batched
 // apply layer is buffering ahead of the durable target write.
-func (r *CDCReader) ackLSN(streamedLSN pglogrepl.LSN) pglogrepl.LSN {
+//
+// Bug 15 (post-v0.5.0): the pre-fix branch on `applied == 0` returned
+// streamedLSN, which advances as the pump parses CommitMessages off
+// the WAL stream — well before the applier has durably committed. On
+// warm-resume against a fresh tracker (applied=0 always at startup,
+// the tracker doesn't restore from persisted state), a keepalive
+// firing in the window between stream-start and first-apply would
+// ack confirmed_flush_lsn past the position. A subsequent crash or
+// `sync stop` mid-batch then permanently lost the events between
+// persisted_position and confirmed_flush_lsn.
+//
+// startLSN is the LSN the pump started streaming from (cold-start:
+// snapshot LSN; warm-resume: persisted_position's LSN). It's the
+// safe floor: the slot already had events past startLSN durably-
+// applied at startup, and the applier's first commit will report a
+// higher value via the tracker.
+func (r *CDCReader) ackLSN(streamedLSN, startLSN pglogrepl.LSN) pglogrepl.LSN {
 	if r.appliedLSN == nil {
 		return streamedLSN
 	}
 	applied := r.appliedLSN.LoadApplied()
 	if applied == 0 {
-		// No applied feedback yet — keep the slot alive by sending
-		// startLSN-equivalent (the streamedLSN at this point is
-		// startLSN until the first Commit comes through). Once the
-		// applier reports its first batch we transition to applied.
-		return streamedLSN
+		return startLSN
 	}
 	return applied
 }
