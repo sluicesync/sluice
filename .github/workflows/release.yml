@@ -35,7 +35,7 @@ jobs:
           # the latest commit.
           fetch-depth: 0
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           # Reads the version from go.mod so CI tracks the declared
           # toolchain automatically.
