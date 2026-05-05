@@ -130,7 +130,7 @@ Three new ADRs in `docs/adr/`:
   rationale, drop-and-recreate migration from v0.4.0 publications,
   applier defence-in-depth on unknown OIDs.
 
-
+## [0.4.0] - 2026-05-04
 
 Feature release with four substantive responses to measured production
 concerns from the v0.3.x robustness testing rounds, plus three new
