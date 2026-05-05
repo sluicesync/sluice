@@ -25,7 +25,11 @@
 // inside each chunk's goroutine via a small mutex guarding the
 // table_progress map. The orchestrator's per-table loop is
 // sequential, so no two parallel-copy phases write to the same
-// state row at the same time.
+// state row at the same time. Within a phase, peer chunk goroutines
+// take the mutex to mutate their own slot on Chunks, then deep-copy
+// the state via [cloneStateForWrite] before releasing the lock so
+// the JSON-encoding [writeState] call no longer shares the map and
+// slice backing storage with concurrent mutators.
 //
 // Snapshot consistency: the cold-start (`sluice migrate`) path does
 // not currently capture a source-side snapshot — each parallel reader
@@ -471,7 +475,14 @@ func copyChunk(
 			tp.Chunks[chunkIndex].RowsCopied = rowsCopied
 			state.TableProgress[table.Name] = tp
 		}
-		stateCopy := *state // shallow copy under lock
+		// Deep-clone the state under the lock: writeState's JSON
+		// encoding iterates TableProgress (a map shared with peer
+		// chunk goroutines) and walks each entry's Chunks slice. A
+		// shallow copy of *state would leave both pointing at the
+		// same map and slice backing arrays, so peer goroutines
+		// taking the lock to mutate their own chunk slot would race
+		// the JSON encoder reading outside the lock.
+		stateCopy := cloneStateForWrite(state)
 		stateMu.Unlock()
 		if err := writeState(ctx, rc, stateCopy); err != nil {
 			slog.WarnContext(ctx, "migration: chunk cursor checkpoint write failed; continuing",
@@ -494,7 +505,7 @@ func copyChunk(
 		tp.Chunks[chunkIndex].State = ir.TableProgressComplete
 		state.TableProgress[table.Name] = tp
 	}
-	stateCopy := *state
+	stateCopy := cloneStateForWrite(state)
 	stateMu.Unlock()
 	if err := writeState(ctx, rc, stateCopy); err != nil {
 		slog.WarnContext(ctx, "migration: chunk completion state write failed; continuing",
@@ -503,6 +514,37 @@ func copyChunk(
 			slog.String("err", err.Error()))
 	}
 	return nil
+}
+
+// cloneStateForWrite returns a deep enough copy of state to be safe
+// to read concurrently with peer chunk goroutines mutating the
+// original under stateMu. Specifically: the TableProgress map is
+// re-allocated, and each entry's Chunks slice is re-allocated so the
+// encoder no longer shares slice backing storage with the chunk
+// goroutines that write into [TableChunkProgress] slots under the
+// lock.
+//
+// Other reference-typed fields on the entry (LastPK on the table-
+// level entry, LowerPK/UpperPK/LastPK on each chunk) are not cloned:
+// boundaries are written once during resolveChunks and per-chunk
+// LastPK is replaced wholesale (not mutated in place) on every
+// checkpoint, so swapping the slice header under the lock is enough
+// to keep the encoder's view stable.
+func cloneStateForWrite(state *ir.MigrationState) ir.MigrationState {
+	cp := *state
+	if state.TableProgress != nil {
+		clone := make(map[string]ir.TableProgress, len(state.TableProgress))
+		for k, v := range state.TableProgress {
+			if len(v.Chunks) > 0 {
+				chunks := make([]ir.TableChunkProgress, len(v.Chunks))
+				copy(chunks, v.Chunks)
+				v.Chunks = chunks
+			}
+			clone[k] = v
+		}
+		cp.TableProgress = clone
+	}
+	return cp
 }
 
 // filterByUpperBound wraps a row channel with a goroutine that drops
