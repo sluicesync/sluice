@@ -172,8 +172,12 @@ When the IR is emitted as MySQL DDL, the inverse mapping applies, with the follo
 
 - `Integer{Width: 24}` is preserved as `MEDIUMINT`.
 - `Boolean{}` is emitted as `TINYINT(1)`.
-- `Array{}` from a Postgres source is emitted as `JSON` with a documented warning.
-- `Inet`/`Cidr`/`Macaddr` are emitted as `VARCHAR(45)` / `VARCHAR(43)` / `VARCHAR(17)` with a `CHECK` constraint validating format. Lossy but functional.
+- `Array{}`, `Inet{}`, `Cidr{}`, `Macaddr{}` from a Postgres source have no native MySQL representation. The schema emit step refuses with a clear error pointing operators at the `mappings:` YAML hook (or `--type-override` CLI flag). The error message includes a copy-paste-ready snippet with a sensible suggested target type per IR type:
+  - `Inet`/`Cidr` → `varchar(45)` (max IPv6 + CIDR mask in canonical form is 43 chars; round up for headroom)
+  - `Macaddr` → `varchar(30)` (EUI-64 in canonical form is 23 chars)
+  - `Array` → `longtext` (variable-length serialised content; operators wanting JSON shape can pick `json` instead)
+
+  Auto-emitting these as `VARCHAR(N) CHECK (format)` is a future enhancement — the auto-policy is documented in the roadmap but not active in the current release. Manual override is the v0.3.x and v0.4.x path.
 - `Timestamp{WithTimeZone: false}` is emitted as `DATETIME`.
 
 ## PostgreSQL ↔ IR
