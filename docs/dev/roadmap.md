@@ -70,124 +70,107 @@ For continuity when a chunk references "the previous work":
 - **Parallel-copy data race fix** — `cloneStateForWrite` deep-clones `TableProgress` map + `Chunks` slice under `stateMu` so the JSON encoder doesn't iterate shared backing storage. CI -race surface.
 - **Parallel-copy hygiene follow-ups** — `progressTicker.startedAt` → `CompareAndSwap`; `kickOffRowCount` suppresses post-cancellation noise.
 
-### Foundational ADRs (0001–0024)
+### v0.7.0 feature wave (performance round 2 + reliability)
 
-IR-first, sealed interfaces, kong+koanf, three-phase apply, MySQL flavors, pgoutput, position persistence, go-mysql, Streamer-as-separate-orchestrator, idempotent applier semantics, SlotManager optional surface, pglogrepl bypass for FAILOVER, applier value-shaping with `CAST(? AS JSON)`, phase-aware error-hint registry, migration resume design, layered expression translation, batched CDC apply, per-batch bulk-copy checkpointing, parallel within-table bulk copy, slot-ack-after-apply, publication scope by table, slot-missing fall-through (extended for MySQL in v0.6.0), `--reset-target-data`, `sluice schema preview`.
+- **MySQL `LOAD DATA LOCAL INFILE` writer (ADR-0026)** — TSV-over-RegisterReaderHandler bulk path, typically 5–10× faster than batched INSERT on wide-row tables. Per-call fallback to BatchedInsert when `local_infile=OFF` or a geometry column is present. PlanetScale stays on BatchedInsert.
+- **Source-transaction-boundary aware CDC batching (ADR-0027)** — `ir.TxBegin`/`ir.TxCommit` events let the applier flush on commit boundary instead of arbitrary row-count chunks; row cap remains as the upper bound. Closes the ADR-0017 deferred follow-up.
+- **Memory-bounded streaming (ADR-0028)** — `--max-buffer-bytes` (default 64 MiB) caps per-batch buffered memory by total bytes in addition to row count. Wide-row workloads (TEXT/BYTEA/JSON at MB scale) no longer need manual `--apply-batch-size` tuning. New `ir.MaxBufferBytesSetter` optional surface.
+- **Graceful-drain `sync stop` (ADR-0025, Bug 15 CLI)** — `ackLSN` anchors at `startLSN` until first apply commit; `pollStopSignal` cancels a separate `streamCtx` that scopes the CDC pump, letting the applier's existing `channelClosed` branch commit the in-flight partial batch. 30s watchdog escalates to hard-cancel if drain wedges.
+- **MySQL CDC temporal-string decoder (Bug 12 root cause)** — `decodeTime` parses MySQL's canonical temporal string formats (second/microsecond precision, date-only, byte-slice equivalents, `0000-00-00` zero-value); pre-fix the decoder rejected the binlog protocol's actual wire format and silently dropped 100% of CDC events on tables with TIMESTAMP/DATETIME/DATE columns.
+- **PG-native types auto-emit on MySQL targets** — `Inet`/`Cidr` → `VARCHAR(45)`, `Macaddr` → `VARCHAR(30)`, `Array` → `JSON`. `--type-override` continues to override.
+- **Throughput tuning guide** (`docs/throughput-tuning.md`) — operator reference for the knobs that matter at scale.
+- **`migrate --dry-run` cross-reference to schema preview** — small UX nudge.
+
+### v0.8.0 feature wave (schema diff + real-world bug bundle)
+
+- **`sluice schema diff` (ADR-0029)** — drift detection between sluice's expected target shape and the schema actually present. Text + JSON output, copy-paste ALTER suggestions, atomic `--output FILE`, CI exit codes (0/1/2 = clean/drift/op-error). Reads both sides through the existing `SchemaReader`. Compares defaults, generated expressions, and CHECK constraints (categories originally listed as out-of-scope; lifted in the same release because the IR already carried the fields). New optional interfaces: `ir.ColumnDDLPreviewer` (filled-in `ADD COLUMN` rendering), `ir.SchemaTypeDropper`, `ir.DefaultTableExcluder`.
+- **Cross-engine type-policy retarget on schema diff** — `internal/translate.RetargetForEngine` rewrites PG-native IR types (UUID, Inet, Cidr, Macaddr, Array) to MySQL-storage IR shapes before the diff runs, so cross-engine `sluice schema diff` no longer flags every translated column as drift.
+- **Bug 16 — MySQL functional/expression indexes** read correctly (NULL `column_name` + `EXPRESSION` column scanned via `sql.NullString`; new `ir.IndexColumn.Expression` field).
+- **Bug 17 — MySQL bool-idiom CHECK / generated expressions translate to PG.** ADR-0016 extended with column-context-aware `ExprContext`; rewrites `0 <> is_active`, `coalesce(is_active, 0)`, etc. to bool literals.
+- **Bug 18 — `--reset-target-data` drops orphan PG enum types** via the new `ir.SchemaTypeDropper` interface.
+- **Bug 19 — silent TIMESTAMP corruption in MySQL→PG CDC on non-UTC hosts** — fix at the connection layer: `BinlogSyncerConfig.TimestampStringLocation = time.UTC` + `time_zone='+00:00'` injected into every database/sql connection. Cold-start was latently affected on servers with non-UTC `default_time_zone`; same fix covers it.
+- **Bug 20 — cross-engine warm-resume dispatch** — streamer re-stamps persisted CDC positions with the source engine name so all four engine pairs (and the PlanetScale flavor) round-trip cleanly. v0.1.0's same-family fix generalised.
+- **Bug 21 — PG snapshot tx no longer holds AccessShareLock for the CDC lifetime.** New `ir.SnapshotStream.ReleaseRowsFn` lets the streamer commit the snapshot tx after bulk-copy without disturbing CDC. ALTER on the source unblocked.
+- **Bug 22 — Vitess `_vt_*` shadow tables auto-excluded** when `--source-driver=planetscale`. New `ir.DefaultTableExcluder` engine surface; operator-supplied `--include-table` short-circuits.
+
+### Foundational ADRs (0001–0029)
+
+IR-first, sealed interfaces, kong+koanf, three-phase apply, MySQL flavors, pgoutput, position persistence, go-mysql, Streamer-as-separate-orchestrator, idempotent applier semantics, SlotManager optional surface, pglogrepl bypass for FAILOVER, applier value-shaping with `CAST(? AS JSON)`, phase-aware error-hint registry, migration resume design, layered expression translation (extended in v0.8.0 with bool-idiom rewrites), batched CDC apply, per-batch bulk-copy checkpointing, parallel within-table bulk copy, slot-ack-after-apply, publication scope by table, slot-missing fall-through (extended for MySQL in v0.6.0), `--reset-target-data`, `sluice schema preview`, graceful-drain `sync stop`, LOAD DATA INFILE writer, source-tx-boundary CDC batching, memory-bounded streaming, `sluice schema diff`.
 
 ---
 
 ## Next up
 
-v0.6.0 testing surfaced two reliability follow-ups (Bug 12 still open + Bug 15 CLI path partial-fix) that take priority over the performance/ergonomics tracks. After those, multi-TB performance round 2 + ergonomics round 2: v0.5.0 closed the headline parallel-read gap; the remaining performance items are MySQL-side and CDC-batching tighter semantics. New items from recent ADRs add inspection/recovery tooling on top of the schema-preview foundation.
+v0.8.0 closed every actionable item that was on the v0.6.0 roadmap (LOAD DATA INFILE, source-tx-boundary CDC batching, memory-bounded streaming, PG-native auto-emit, schema diff, the Bug 12 / Bug 15 reliability tail). What remains is split between (a) low-priority items that have always been here and haven't surfaced as blockers, and (b) new work emerging from v0.7.0 / v0.8.0 testing.
 
-### 0a. Bug 15 CLI sync-stop drain ordering
+### 1. PlanetScale Vitess auto-detect for vanilla MySQL driver
 
-**Why.** v0.5.0's slot-ack-after-apply work (ADR-0020) eliminated the post-restart wedge for Bug 15 and the integration test (`TestStreamer_PostgresToPostgres_StopRestartNoLoss`) passes. v0.6.0 testing confirmed: the **programmatic `RequestStop` path is fixed**, but the CLI `sync stop` control-table path still drops 8-21 in-flight rows under sustained-writer load. Cause: when `pollStopSignal` detects `stop_requested_at`, it calls `cancelApply()` which cancels `applyCtx`. The applier's `applyOneBatch` selects on `<-ctx.Done()` and rolls back the open transaction, dropping the partial batch. The CDC reader's buffered events also go nowhere — channel between reader and applier is abandoned.
+**Why.** v0.8.0's Bug 22 fix auto-excludes `_vt_*` shadow tables when `--source-driver=planetscale`. A vanilla MySQL operator pointing at a Vitess-backed PlanetScale endpoint with `--source-driver=mysql` (a legitimate configuration — they get binlog CDC instead of VStream) still has to add `--exclude-table='_vt_*'` manually. Closing this gap finishes the auto-exclude story for the PlanetScale audience without growing a dependency on `@@version` / `INFORMATION_SCHEMA` probing.
 
-**What.** Graceful-drain shutdown path: when stop is detected, the streamer should signal the CDC reader to stop accepting NEW events and close its output channel. The applier then sees `channelClosed` (which it already handles correctly: commits the partial batch, returns nil). The current cancel-applier-immediately shape is too aggressive — it's correct for Ctrl-C / external ctx cancel (where you want to stop now), but wrong for the "graceful drain" semantics CLI `sync stop` advertises.
+**What.** Hostname-keyed DSN sniff at orchestrator startup. PlanetScale's hostnames follow stable patterns:
 
-Two implementation paths:
-- **(a) New CDC-reader interface** `RequestStop(ctx context.Context)` that closes the output channel after the next event boundary. Streamer's stop-signal poll calls `RequestStop` first, then waits a bounded time for the apply loop to drain, then falls back to `cancelApply` as a hard timeout.
-- **(b) Smaller change**: add a "stopping" flag on the streamer; the apply loop's batch-commit path checks it and returns nil instead of cancelling on ctx.Done. CDC reader stays as-is; the channel-close path triggers naturally from the outer ctx cancel (which now happens AFTER drain).
+| Hostname suffix | Service |
+| --- | --- |
+| `.connect.psdb.cloud` | PlanetScale MySQL (public endpoint) |
+| `.private-connect.psdb.cloud` | PlanetScale MySQL (AWS PrivateLink) |
+| `.pg.psdb.cloud` | PlanetScale Postgres (public endpoint) |
+| `.private-pg.psdb.cloud` | PlanetScale Postgres (PrivateLink) |
 
-(a) is cleaner architecturally; (b) is smaller scope. ADR worth writing before code.
+When `--source-driver=mysql` (vanilla flavor) is paired with a `*.connect.psdb.cloud` / `*.private-connect.psdb.cloud` host, merge `_vt_*` into the engine-default exclusions and emit a structured INFO log so operators see what fired. Driver promotion (vanilla → planetscale) is **not** the right call here — Capabilities differ between flavors (BulkLoad, CDC method) and the operator's driver choice is intentional. The narrow fix is just the exclusion list.
+
+The PG hostnames (`.pg.psdb.cloud`, `.private-pg.psdb.cloud`) are noted for future PG-side equivalents — PlanetScale Postgres isn't Vitess-backed and doesn't have `_vt_*` shadow tables today, so no action is required, but the same hostname-sniff machinery would catch any future PG-side defaults.
 
 **Gotchas.**
-- Drain timeout must be bounded — operator pressing Ctrl-C twice should escalate to hard cancel.
-- The integration test should exercise the CLI `sync stop` path specifically (writes to control table, polls 5s, asserts no row gap). The existing Bug 15 test uses `RequestStop` directly and won't catch this regression class.
+- Non-PlanetScale Vitess deployments (Slack-style, custom domains) keep needing manual `--exclude-table='_vt_*'`. Auto-detect via `@@version_comment` requires a connection round-trip and is more invasive; out of scope until a non-PS Vitess user reports it.
+- The hostname check is a startup-time DSN parse, not a runtime probe — fires before any DB call, no race with auth/network.
+- Could land as v0.8.1 (small, tightly scoped to Bug 22's audience) or batch into v0.9.0.
 
 ---
 
-### 0b. Bug 12 — MySQL CDC localhost silence
+### 2. Schema-change ergonomics around `ALTER` windows
 
-**Why.** The v0.5.0 binlog heartbeat (10s) + 30s no-events watchdog was diagnostic-only — it logs a WARN line but doesn't surface as a stream error or attempt recovery. v0.6.0 real-world testing on Rancher Desktop / Windows confirms the underlying symptom is unchanged: localhost MySQL streams produce no row events even when the source is actively committing. Likely a TCP keepalive interaction between go-mysql's binlog connection and Docker's port-forwarding on Windows hosts.
+**Why.** v0.8.0 stretch-testing (`SCHEMA-CHANGE-TESTS.md`) confirmed sluice's fail-loud behaviour on schema-change classes:
 
-**What.** Two-phase approach:
-1. Promote the watchdog from "diagnostic WARN" to "actionable error". After the 30s grace period, return a sentinel error from the pump so the streamer can either retry-with-backoff or fail loudly. Today the silence is forever.
-2. Add CDC-stream auto-reconnect with bounded retries. go-mysql's syncer has its own retry loop; the question is whether sluice should layer a reconnect-on-watchdog-fire on top.
+| Operation | Behaviour | Operator workflow |
+| --- | --- | --- |
+| ADD COLUMN + INSERT using new col | fail-loud (`column "X" does not exist`) | sync stop → ALTER both sides → sync start |
+| DROP COLUMN + INSERT not using col | graceful (missing col → NULL when target nullable) | optional cleanup |
+| MODIFY type widening + INSERT longer value | fail-loud (`value too long`) | sync stop → ALTER dst → sync start |
+
+The behaviour is correct (silent corruption would be worse), but the operator workflow is manual. Smoothing it would be ergonomic, not load-bearing.
+
+**What.** Two threads worth considering:
+
+- **`sync stop --until-applied`** — drain to a known-empty applier state and exit, instead of stopping at the next batch boundary. Gives operators a clean "I know nothing is in-flight" handle for ALTER coordination.
+- **Schema-change planning helper** — `sluice schema diff` already produces the diff between current source and current target. A wrapper flow could be: `diff` produces the ALTER list → operator reviews → `apply-alters` runs them on both sides in coordinated order. Doc-only first; tooling later if it earns its complexity.
+
+Sluice is not a schema-migration tool, so the second one is on the careful side of "preserve streaming continuity, don't replace Atlas / sqitch". The first is more cleanly in-scope.
 
 **Gotchas.**
-- Long-idle streams are legitimate (a dev DB with no traffic). The watchdog must distinguish "source is idle" (heartbeat events arriving but no rows) from "connection is dead" (no events at all, including heartbeats). Today the implementation already filters via `isRowRelevantEvent`, but the failure mode is "no events at all" — heartbeats don't reach us either, suggesting the connection itself is dead.
-- Without a reliable repro environment, this is investigative work. The next step is probably adding fine-grained logging at the binlog-syncer level to pinpoint where the silence originates (read deadline hit? connection silently dropped? events being filtered upstream?).
-
-**Open question for the next chunk**: is the Rancher Desktop / Windows testing environment available for repro work? If yes, this is implementable. If the environment isn't accessible to development, the chunk becomes "add fine-grained logging hooks so the next testing pass can pinpoint the failure point" rather than a fix.
+- `--until-applied` needs a definition of "applied" that's robust under idle-flush / no-traffic — probably "no events received in the last N seconds AND in-flight batch is empty AND position has been committed".
 
 ---
 
-### 1. MySQL `LOAD DATA INFILE` writer
+### 3. PG TIMESTAMP precision and CHARSET/COLLATION cross-engine edges
 
-**Why.** Vanilla MySQL bulk-load via `LOAD DATA LOCAL INFILE` is typically 5–10× faster than batched INSERT. The IR already declares `BulkLoadLoadDataInfile` as a capability but no engine implements it; vanilla MySQL falls through to `BulkLoadBatchedInsert`.
+**Why.** Latent items from earlier roadmap rounds, kept for tracking. Bug 19 (TIMESTAMP TZ corruption on non-UTC hosts) closed the silent-corruption tail for v0.8.0; the precision and charset edges are next on the cross-engine type contract:
 
-**What.** A new `RowWriter` strategy in `internal/engines/mysql/row_writer.go` selected by the engine's `Capabilities.BulkLoad` field. Streams rows as TSV/CSV over the local-infile protocol; bypasses per-row INSERT parsing. Fallback to BatchedInsert remains for PlanetScale (which doesn't allow `LOAD DATA LOCAL INFILE`).
+- TIMESTAMP precision differences beyond the `CURRENT_TIMESTAMP` default fix (e.g. `TIMESTAMP(6)` ↔ `TIMESTAMPTZ` round-trips, including the boundary between fractional-second-aware and -unaware columns).
+- CHARSET / COLLATION translation across dialects — `--ignore-charset-collation` is plumbed on `schema diff` but the underlying comparison is inert pending an IR enrichment to capture charset/collation on read for both engines.
 
-**Gotchas.**
-- The MySQL server has to be configured with `local_infile=ON` (default off in 8.0+). Document the prerequisite; surface a clear error when it's not enabled and fall back to batched INSERT with a warning.
-- TSV escaping for binary columns is fiddly. The existing `prepareValue` helper handles per-type shaping; the LOAD DATA path needs an analogous serialiser.
-
----
-
-### 2. Source-transaction-boundary aware CDC batching
-
-**Why.** v0.4.x's batched applier flushes on row count + Truncate. PG `Begin`/`Commit` and MySQL `XID`/`GTID` events would let the applier preserve transactional cohesion: a 5000-row source transaction commits as one 5000-row target transaction instead of 50 batches of 100. Cleaner semantics; matches what operators expect when running CDC against an OLTP source.
-
-**What.** Surface `Begin`/`Commit`-equivalent events in the IR (currently filtered before reaching the applier). The applier flushes its in-flight batch on `Commit` and starts a new one on `Begin`; the row-count cap remains as an upper bound for huge transactions.
-
-**Gotchas.**
-- Source transactions can span multiple seconds and many MB. The row-count cap is the safety valve.
-- The IR-layer plumbing for these events is its own focused chunk. ADR-0017 calls this out as the deliberate v0.4.x scope cut.
-
----
-
-### 3. Memory-bounded streaming
-
-**Why.** For huge rows (TEXT columns with megabyte-scale content, BYTEA blobs) the channel + tee + writer-batch chain can hold significant buffered memory. Need to verify there's actual backpressure at high data volumes; today the channels are unbuffered but the writer's per-batch accumulation isn't bounded by bytes.
-
-**What.** Audit the row-streaming path for memory accumulation. Add a `--max-buffer-bytes` knob (default ~64 MB) that bounds the writer's per-batch accumulation by total byte size in addition to row count. Bytes-aware chunking matches how pscale-cli batches by ~1 MB statement body rather than row count.
+**What.** Each is its own self-contained chunk; will surface once a real-world test exercises it. Bug 19's family (silent-corruption-adjacent TZ/precision behaviour) is the one to watch.
 
 ---
 
 ### 4. Network compression for cross-host copies
 
-**Why.** Lower priority. Multi-TB at gigabit is hours of pure bandwidth time. Both pgx and the MySQL driver support compression but it's not configured in our DSNs. Probably mostly a documentation update — the connection-string knob exists on both sides.
+**Why.** Lower priority. Multi-TB at gigabit is hours of pure bandwidth time. Both pgx and the MySQL driver support compression but it's not configured in our DSNs.
 
-**What.** Document the `compress=true` (MySQL DSN) and `sslmode=...` + `gssencmode=...` settings on PG DSNs as a tuning recommendation for cross-host copies. Only worth real implementation work if testing surfaces it as a specific bottleneck.
-
----
-
-### 5. Other latent cross-engine type edges
-
-Tracked here so they're not forgotten; each will surface once the relevant test exercises it.
-
-- TIMESTAMP precision differences beyond the `CURRENT_TIMESTAMP` default fix (e.g. `TIMESTAMP(6)` ↔ `TIMESTAMPTZ` round-trips).
-- CHARSET/COLLATION translation across dialects.
+**What.** Document the `compress=true` (MySQL DSN) and `sslmode=...` / `gssencmode=...` (PG DSN) settings as a tuning recommendation for cross-host copies. Real implementation work only if testing surfaces it as a specific bottleneck. Mentioned in `docs/throughput-tuning.md` already; could expand.
 
 ---
 
-### 6. PG-native types auto-emit on MySQL targets
-
-**Why.** v0.3.x onwards refuse `Inet`/`Cidr`/`Macaddr`/`Array` from PG sources with a clear error pointing at `--type-override`. v0.6.0's schema preview hints further surface the override path, but auto-emitting `VARCHAR(N) CHECK (regex)` matches the doc-promised behaviour and removes the toil for every PG→MySQL migration that touches these types.
-
-**What.** Wire up the policy in `internal/engines/mysql/ddl_emit.go` — when an unsupported type arrives and a sensible auto-mapping exists, emit `VARCHAR(N)` plus a CHECK constraint with a per-type regex. CHECK regex registry: `Inet` → `^[0-9.]+$|^[0-9a-fA-F:]+$` (loose IPv4/IPv6), `Cidr` → above + `/[0-9]+$`, `Macaddr` → `^[0-9a-fA-F:.-]+$`. `--type-override` continues to work as the explicit override path.
-
-**Gotchas.**
-- MySQL's REGEXP support varies. Confirm against MySQL 8.0+ (sluice's baseline).
-- Document the loosened validation (regex catches gross malformation but doesn't enforce all RFC details). Operators wanting strict format checking can use `--type-override` to a tighter shape.
-
----
-
-### 7. Schema-diff against an existing target
-
-**Why.** v0.6.0's `sluice schema preview` shows what sluice *would* produce on a fresh target. The complementary question — "does what's running on dst match what sluice would produce" — comes up during re-migration safety checks and post-deployment drift detection. ADR-0024's "out of scope" section flagged this as a separate ADR's worth of design.
-
-**What.** New subcommand `sluice schema diff --against-target ...` (or extended flag on `schema preview`). Reads the current dest's `information_schema`, builds an IR-equivalent of the existing schema, runs the same translation pipeline, and emits a diff: tables/columns/types/indexes that differ, with categorisation (missing-on-target, extra-on-target, type-mismatch).
-
-**Gotchas.**
-- The reverse-engineering of the existing target schema needs to handle sluice's auto-emitted artefacts (e.g. PG's `CREATE TYPE … AS ENUM` shadows of MySQL ENUMs) so they don't surface as spurious "extra" objects.
-- Output format mirrors `schema preview` (text + JSON + `--output FILE`).
-
----
-
-### 8. Auto-translate-and-create on mid-stream new tables
+### 5. Auto-translate-and-create on mid-stream new tables
 
 **Why.** ADR-0021 deliberately punted on mid-stream `CREATE TABLE`: a new table on a CDC source is currently silently dropped (defence-in-depth WARN, no schema propagation). The right path for "the developer ran a routine DDL" is to translate the new table's schema, create it on the target, and bring it into the publication scope — but doing this safely requires a mid-stream snapshot capture for the new table.
 
@@ -205,7 +188,7 @@ Tracked here so they're not forgotten; each will surface once the relevant test 
 
 ---
 
-### 9. Multi-source aggregation
+### 6. Multi-source aggregation
 
 **Why.** Some users have multiple source DBs replicating into one target (sharded → consolidated, microservices → analytics warehouse, etc.). Today each `sluice sync start` is a 1:1 stream. ADR-0024 flagged this as out-of-scope; deserves its own design pass.
 
@@ -218,11 +201,19 @@ Tracked here so they're not forgotten; each will surface once the relevant test 
 
 ---
 
-### 10. `migrate --dry-run` cross-reference to schema preview
+### 7. OSS-hygiene track
 
-**Why.** Small follow-up. Operators running `sluice migrate --dry-run` today see the orchestration plan but not the target DDL. ADR-0024 noted that `--dry-run` should print "for full target DDL inspection, run `sluice schema preview ...`" so operators land on the new tool when they're already in the dry-run mindset.
+**Why.** v0.8.0 marks the eighth tagged release. Public-release prep has been deferred during the feature ramp; worth a focused sweep before the next major.
 
-**What.** One-liner addition to the `--dry-run` output. ~10 LOC.
+**What.** Mostly project hygiene, no engineering risk:
+
+- License-header sweep across `internal/` (LICENSE file is in place; per-file headers are not).
+- `CONTRIBUTING.md` covering the pre-commit hook, the `integration` build tag mechanics, and the Windows-Rancher quirks.
+- Release-notes template formalised — the markdown block we paste into each GitHub release is consistent, but it lives in conversation memory rather than a checked-in template.
+- `goreleaser` or equivalent for cross-platform binary builds. Releases are routine enough that hand-rolled build artefacts are starting to be a chore.
+- Public README pass — current README is reasonable but reads as project-internal.
+
+**Gotchas.** None — these are independent items, each landable on its own.
 
 ---
 
@@ -231,7 +222,7 @@ Tracked here so they're not forgotten; each will surface once the relevant test 
 When starting a new chunk in Claude Code:
 
 1. Pick an item from "Next up". Earlier items have more context inheritance.
-2. Open the relevant section in the prompt: *"Read CLAUDE.md and docs/dev/roadmap.md section 1 (MySQL LOAD DATA INFILE writer). Propose a design before writing code."*
+2. Open the relevant section in the prompt: *"Read CLAUDE.md and docs/dev/roadmap.md section 1 (PlanetScale Vitess auto-detect). Propose a design before writing code."*
 3. Iterate on the plan.
 4. Implement.
 5. Update this file when the chunk lands — move the entry to "Recently landed" and trim it to one line.
