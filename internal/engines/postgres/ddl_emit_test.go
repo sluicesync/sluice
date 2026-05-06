@@ -385,7 +385,7 @@ func TestEmitColumnDef_Generated(t *testing.T) {
 				GeneratedExpr:   "CASE WHEN picked_at IS NULL THEN 'pending' ELSE 'picked' END",
 				GeneratedStored: true,
 			},
-			want: `"pickup_status" "invoices_pickup_status_enum" GENERATED ALWAYS AS (CASE WHEN picked_at IS NULL THEN 'pending' ELSE 'picked' END)::"invoices_pickup_status_enum" STORED`,
+			want: `"pickup_status" "invoices_pickup_status_enum" GENERATED ALWAYS AS ((CASE WHEN picked_at IS NULL THEN 'pending' ELSE 'picked' END)::"invoices_pickup_status_enum") STORED`,
 		},
 	}
 	for _, c := range cases {

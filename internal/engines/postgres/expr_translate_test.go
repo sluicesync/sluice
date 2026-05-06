@@ -372,6 +372,47 @@ func TestTranslateExprForPG_BoolToIntCoalesce(t *testing.T) {
 			in:   "IFNULL(is_active, 0)",
 			want: "COALESCE((is_active)::int, 0)",
 		},
+
+		// ---- v0.9.2: hasTopLevelCompareOp expanded to cover
+		// `<`, `>`, `<=`, `>=`, LIKE, BETWEEN, IN, IS [NOT] NULL.
+		// Each of these returns bool in MySQL/PG; previously the
+		// detector only handled `=`, `!=`, `<>` and missed real-
+		// world cases that surfaced in v0.9.1 testing.
+		{
+			name: "coalesce with > comparison",
+			in:   "COALESCE(qty > 0, 0)",
+			want: "COALESCE((qty > 0)::int, 0)",
+		},
+		{
+			name: "coalesce with <= comparison",
+			in:   "COALESCE(price <= max_price, 0)",
+			want: "COALESCE((price <= max_price)::int, 0)",
+		},
+		{
+			name: "coalesce with >= comparison",
+			in:   "COALESCE(score >= threshold, 0)",
+			want: "COALESCE((score >= threshold)::int, 0)",
+		},
+		{
+			name: "coalesce with bare <",
+			in:   "COALESCE(qty < 10, 0)",
+			want: "COALESCE((qty < 10)::int, 0)",
+		},
+		{
+			name: "coalesce with LIKE",
+			in:   "COALESCE(email LIKE '%@example.com', 0)",
+			want: "COALESCE((email LIKE '%@example.com')::int, 0)",
+		},
+		{
+			name: "coalesce with BETWEEN",
+			in:   "COALESCE(qty BETWEEN 1 AND 10, 0)",
+			want: "COALESCE((qty BETWEEN 1 AND 10)::int, 0)",
+		},
+		{
+			name: "coalesce with IN list",
+			in:   "COALESCE(status IN ('open','pending'), 0)",
+			want: "COALESCE((status IN ('open','pending'))::int, 0)",
+		},
 	}
 	for _, c := range cases {
 		c := c

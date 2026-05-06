@@ -308,23 +308,30 @@ func emitColumnDef(table *ir.Table, c *ir.Column, opts emitOpts) (string, error)
 			)
 		}
 		sb.WriteString(" GENERATED ALWAYS AS (")
-		sb.WriteString(translateGeneratedExpr(c, table))
-		sb.WriteString(")")
+		body := translateGeneratedExpr(c, table)
 		// Bug 23 (refined): an enum-typed generated column with a
 		// body that returns text — typically a CASE returning enum-
 		// valued literals, or a COALESCE over text columns — needs
 		// an explicit cast to the enum type, otherwise PG rejects
 		// with "column X is of type Y_enum but expression is of
-		// type text". Wrapping the whole expression with
-		// `::<enum_type>` works for any text-returning shape (CASE,
-		// COALESCE, simple literal); per-arm casting would require
-		// recognising the CASE structure and isn't strictly more
-		// correct. Mirrors the DEFAULT-cast pattern below.
+		// type text". The cast must live INSIDE the outer GENERATED
+		// parens — `GENERATED ALWAYS AS ((body)::"enum_type") STORED`
+		// — because PG's grammar binds `::` tighter than the AS
+		// clause and emitting `AS (body)::"type" STORED` is a syntax
+		// error (v0.9.1 placement bug). Wrapping the whole body
+		// works for any text-returning shape (CASE, COALESCE, simple
+		// literal); per-arm casting would require recognising the
+		// CASE structure and isn't strictly more correct. Mirrors
+		// the DEFAULT-cast pattern below.
 		if _, isEnum := c.Type.(ir.Enum); isEnum && table != nil {
-			sb.WriteString("::")
+			sb.WriteString("(")
+			sb.WriteString(body)
+			sb.WriteString(")::")
 			sb.WriteString(quoteIdent(enumTypeName(table.Name, c.Name)))
+		} else {
+			sb.WriteString(body)
 		}
-		sb.WriteString(" STORED")
+		sb.WriteString(") STORED")
 	}
 	if !c.Nullable {
 		sb.WriteString(" NOT NULL")

@@ -540,11 +540,21 @@ func isBoolReturning(s string, boolCols map[string]bool) bool {
 	return false
 }
 
-// hasTopLevelCompareOp reports whether s contains `=`, `!=`, or `<>`
-// at depth zero (not inside parens or string literals). The check is
-// conservative — operators like `<` and `>` are legal comparisons but
-// less commonly bool-returning in the COALESCE-with-int-literal idiom,
-// and skipping them avoids false positives on arithmetic expressions.
+// hasTopLevelCompareOp reports whether s contains a comparison
+// operator at depth zero (not inside parens or string literals).
+// Recognised operators: `=`, `!=`, `<>`, `<`, `>`, `<=`, `>=`. Also
+// recognises the keyword forms `LIKE`, `BETWEEN`, `IN`, and the
+// `IS [NOT] NULL` / `IS [NOT] DISTINCT FROM` variants — all of
+// which return bool. v0.9.2 expanded the operator set after Bug 17
+// real-world testing surfaced cases that the v0.9.1 detector
+// (which only handled `=` / `!=` / `<>`) missed.
+//
+// The check stays conservative on the false-positive side: operators
+// inside parens (sub-expressions) don't count, and the keyword forms
+// are only matched as standalone tokens, not as identifier
+// substrings. False negatives just mean the bool-to-int rewrite
+// doesn't fire for that particular shape, and the loud-failure tenet
+// kicks in.
 func hasTopLevelCompareOp(s string) bool {
 	depth := 0
 	for i := 0; i < len(s); i++ {
@@ -564,9 +574,56 @@ func hasTopLevelCompareOp(s string) bool {
 				return true
 			}
 		case '<':
-			if depth == 0 && i+1 < len(s) && s[i+1] == '>' {
+			if depth == 0 && i+1 < len(s) {
+				// `<>`, `<=`, or bare `<`.
+				if s[i+1] == '>' || s[i+1] == '=' {
+					return true
+				}
 				return true
 			}
+		case '>':
+			if depth == 0 {
+				return true
+			}
+		case ' ', '\t', '\n':
+			if depth != 0 {
+				continue
+			}
+			// Look for keyword-form bool operators starting at i+1.
+			// Required surrounding whitespace prevents matching
+			// identifier substrings like "BETWEENNESS".
+			if matchKeywordOp(s, i+1) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// matchKeywordOp reports whether s[i:] starts with one of the bool-
+// returning keyword operators (`LIKE`, `BETWEEN`, `IN`, `IS`),
+// followed by whitespace or `(`. Case-insensitive. Used by
+// [hasTopLevelCompareOp] to catch keyword forms that aren't
+// punctuation operators.
+func matchKeywordOp(s string, i int) bool {
+	keywords := []string{"LIKE", "BETWEEN", "IN", "IS"}
+	for _, kw := range keywords {
+		if i+len(kw) > len(s) {
+			continue
+		}
+		if !strings.EqualFold(s[i:i+len(kw)], kw) {
+			continue
+		}
+		// Must be followed by whitespace or `(` (for IN-list).
+		// Catches `IN (a, b)`, `LIKE 'pat%'`, `BETWEEN x AND y`,
+		// `IS NULL`, `IS NOT NULL`, `IS DISTINCT FROM`.
+		next := i + len(kw)
+		if next >= len(s) {
+			return false
+		}
+		switch s[next] {
+		case ' ', '\t', '\n', '(':
+			return true
 		}
 	}
 	return false

@@ -6,6 +6,35 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-05-06
+
+The expression-translator escape hatch. v0.8.x / v0.9.x's reactive cycle (operator hits a bug → we add a rule) reaches its planned next stage: instead of dropping a column when sluice's translator doesn't recognise an idiom, the operator can supply target-dialect expression text directly via `--expr-override` (CLI) or `expression_mappings:` (YAML). Sluice emits the override verbatim and the translator stays out of the way. The pattern-matching rule set keeps growing for the common cases; `--expr-override` covers everything else.
+
+### Added
+
+- **`--expr-override TABLE.COLUMN=EXPRESSION` flag** on `migrate`, `sync start`, `schema preview`, and `schema diff`. YAML form: `expression_mappings: [{table:, column:, expression:}]`. CLI flags wholesale-replace the YAML config when both are supplied (same precedence as `--type-override`). The expression part can contain arbitrary characters including additional `=` signs, single quotes, parens — only the first `=` after the column name is the separator.
+
+  Strict validation at config-load time: overrides referencing unknown tables, unknown columns, or columns that aren't generated columns surface as clear errors before any DSN is dialed. Silent passthrough would mask the operator-typo case ("why didn't my override fire?"); the strict check makes those typos visible immediately.
+
+  The override applies via a new `internal/translate.ApplyExpressionOverrides` pass that runs alongside `ApplyMappings`. Mechanism: replace `Column.GeneratedExpr` with the override text and clear `Column.GeneratedExprDialect`. The cleared dialect tag tells the writer-side translator that no rewrite is needed — the column flows through the same code path same-dialect expressions take. No special override-aware code paths anywhere downstream.
+
+  v0.10.0 scope: generated-column bodies only. CHECK constraints, index expressions, and DEFAULT expressions don't have an override surface yet; if real-world testing surfaces the need, each gets its own override type with the same shape. ADR-0016 extended with an "Added in v0.10.0" subsection covering the design.
+
+### Changed
+
+- `pipeline.Migrator`, `pipeline.Streamer`, `pipeline.Previewer`, `pipeline.Differ` all gain an `ExpressionMappings []config.ExpressionMapping` field. Existing callers that don't set it keep working — the field defaults to nil and the override pass is a no-op on nil/empty input.
+- `internal/config.Config` gains an `ExpressionMappings []ExpressionMapping` field. Existing YAML configs without an `expression_mappings:` key are unchanged.
+
+## [0.9.2] - 2026-05-06
+
+Two narrow patches surfaced by v0.9.1 real-world testing. Bug 23's enum-cast emit had a placement error — the cast landed outside the GENERATED parens where PG's grammar rejects it; Bug 17's bool-returning detector had been too narrow, missing the comparison operators (`<`, `>`, `<=`, `>=`) and keyword forms (`LIKE`, `BETWEEN`, `IN`) that real-world generated-column bodies use. Both fixes are localised and additive; the rest of v0.9.1 stands.
+
+### Fixed
+
+- **Bug 23 placement — enum cast moves inside the GENERATED parens.** v0.9.1 emitted `GENERATED ALWAYS AS (body)::"X_enum" STORED`, which PG rejects because `::` binds tighter than the AS clause's parens. The cast now lands as `GENERATED ALWAYS AS ((body)::"X_enum") STORED` — wrapping the body in inner parens before the cast and keeping the whole thing inside the outer GENERATED parens. Schema-writer change only; the translation logic is unchanged.
+
+- **Bug 17 detector breadth — `coalesce(<bool>, 0)` now recognises more bool-returning shapes.** v0.9.1's `hasTopLevelCompareOp` only handled `=`, `!=`, `<>` — equality and inequality. Real-world generated-column bodies also use `<`, `>`, `<=`, `>=`, `LIKE`, `BETWEEN`, and `IN`, all of which return bool. v0.9.2's detector recognises every operator in that set plus the `IS [NOT] NULL` form (already covered) and `IS DISTINCT FROM`. Each is matched with appropriate token-boundary discipline so identifier substrings (e.g. a column named `between_us`) don't trigger false positives.
+
 ## [0.9.1] - 2026-05-06
 
 Patch release closing the three remaining ADR-0016 translator gaps that v0.9.0 testing surfaced. All three are residuals of bugs the v0.8.0 / v0.9.0 batches partially closed; together they unblock end-to-end migration on the two real-world schemas (`schema_example_01` 555 tables, `schema_example_02` 138 tables) the sluice-testing companion repo uses for stretch validation.
