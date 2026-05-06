@@ -151,16 +151,22 @@ func pollStopSignal(pollCtx context.Context, reader stopFlagReader, streamID str
 			)
 			cancelStream()
 			// Hard-timeout watchdog: if the graceful drain doesn't
-			// complete within drainTimeoutForTest, force-cancel the
-			// apply context. Exits cleanly when pollCtx (= applyCtx)
-			// fires first, signalling apply finished naturally.
+			// complete within drainTimeout, force-cancel the apply
+			// context. Exits cleanly when pollCtx (= applyCtx) fires
+			// first, signalling apply finished naturally.
+			//
+			// Snapshot the drain timeout once before launching the
+			// goroutine so the goroutine doesn't race with tests'
+			// withFastDrainTimeout cleanup writing to the package-
+			// level drainTimeoutForTest var.
+			drainTimeout := drainTimeoutForTest
 			go func() {
 				select {
 				case <-pollCtx.Done():
-				case <-time.After(drainTimeoutForTest):
+				case <-time.After(drainTimeout):
 					slog.WarnContext(pollCtx, "graceful drain timed out; hard-cancelling apply",
 						slog.String("stream_id", streamID),
-						slog.Duration("timeout", drainTimeoutForTest),
+						slog.Duration("timeout", drainTimeout),
 					)
 					cancelApply()
 				}

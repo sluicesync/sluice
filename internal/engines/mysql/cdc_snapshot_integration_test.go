@@ -217,6 +217,13 @@ func drainSnapshotChanges(
 			if !ok {
 				return got
 			}
+			// Skip transaction-boundary events (ADR-0027) — this
+			// helper exists to capture row events for shape
+			// assertions, not transactional bookkeeping.
+			switch c.(type) {
+			case ir.TxBegin, ir.TxCommit:
+				continue
+			}
 			got = append(got, c)
 		case <-deadline.C:
 			return got
