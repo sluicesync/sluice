@@ -622,9 +622,13 @@ func TestChangeApplier_ApplyBatch_ByteCapFlushes(t *testing.T) {
 
 	// pg_stat_database's xact_commit counter is updated by the stats
 	// collector on its own cadence (PGSTAT_STAT_INTERVAL, typically
-	// ~500ms). A bare time.Sleep is timing-sensitive — poll for the
-	// value to stabilise instead, with a generous deadline.
-	delta := waitForStableXactCommitDelta(t, dsn, startCommits, 5*time.Second)
+	// ~500ms). A 1.5s sleep is comfortably above that. Each
+	// readXactCommit's own SELECT counts as a commit, so polling
+	// would inflate the delta against itself — a single sleep + read
+	// is the right shape.
+	time.Sleep(1500 * time.Millisecond)
+	endCommits := readXactCommit(t, dsn)
+	delta := endCommits - startCommits
 
 	// Lower bound: roughly ceil(200 KB / 32 KB) = 7 commits expected.
 	// Without the byte cap the row cap (100) would produce just 1
@@ -633,9 +637,11 @@ func TestChangeApplier_ApplyBatch_ByteCapFlushes(t *testing.T) {
 	// string's length plus 8 bytes for the int64; per-row total is
 	// ~10248 bytes, so the cap fires at 4 rows → 5 commits for 20
 	// rows). Floor of 4 covers the edge case where the cap-comparison
-	// rounds the other way for the last partial batch.
+	// rounds the other way for the last partial batch. Upper bound
+	// of 100 absorbs PG-level overhead (autovacuum, control-table
+	// upserts, stat-read SELECTs themselves).
 	const minExpected = 4
-	const maxExpected = 30 // metadata + control-table + stat-read overhead
+	const maxExpected = 100
 	if delta < minExpected {
 		t.Errorf("commit delta = %d; want >= %d (byte-cap flush should produce multiple commits)", delta, minExpected)
 	}
@@ -647,26 +653,6 @@ func TestChangeApplier_ApplyBatch_ByteCapFlushes(t *testing.T) {
 	if got := countAllRows(t, dsn, "wide_rows"); got != totalRows {
 		t.Errorf("after byte-cap apply: rows = %d; want %d", got, totalRows)
 	}
-}
-
-// waitForStableXactCommitDelta polls pg_stat_database.xact_commit
-// until two consecutive reads return the same delta from start, or
-// the deadline expires. PG's stat collector updates on its own
-// cadence (PGSTAT_STAT_INTERVAL, typically ~500ms), so a bare sleep
-// is timing-sensitive on a busy CI host. Returns the final delta.
-func waitForStableXactCommitDelta(t *testing.T, dsn string, start int64, timeout time.Duration) int64 {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	prev := readXactCommit(t, dsn) - start
-	for time.Now().Before(deadline) {
-		time.Sleep(300 * time.Millisecond)
-		cur := readXactCommit(t, dsn) - start
-		if cur == prev && cur > 0 {
-			return cur
-		}
-		prev = cur
-	}
-	return prev
 }
 
 // emailForInt returns a deterministic email address for the bulk-

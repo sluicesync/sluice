@@ -135,6 +135,14 @@ func (a *recordingApplier) Apply(ctx context.Context, _ string, changes <-chan i
 			if !ok {
 				return nil
 			}
+			// Skip transaction-boundary events (ADR-0027) — the
+			// recording applier exists to capture row events for
+			// shape assertions; tests that count or inspect changes
+			// expect the pre-ADR-0027 row-only stream.
+			switch c.(type) {
+			case ir.TxBegin, ir.TxCommit:
+				continue
+			}
 			a.mu.Lock()
 			a.changes = append(a.changes, c)
 			a.mu.Unlock()
