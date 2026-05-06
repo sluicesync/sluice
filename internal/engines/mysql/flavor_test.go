@@ -104,15 +104,79 @@ func TestVanillaPlanetScaleDifference(t *testing.T) {
 	}
 }
 
-// TestDefaultExcludePatterns_PlanetScale pins the Bug 22 fix: the
-// PlanetScale flavor opts into auto-excluding `_vt_*` Vitess shadow
-// tables; vanilla MySQL does not. Vanilla operators on Vitess-backed
-// servers can still pass --exclude-table='_vt_*' manually.
-func TestDefaultExcludePatterns_PlanetScale(t *testing.T) {
-	if pats := (Engine{Flavor: FlavorPlanetScale}).DefaultExcludePatterns(); len(pats) != 1 || pats[0] != "_vt_*" {
+// TestDefaultExcludePatterns_PlanetScaleFlavor pins the v0.8.0 Bug 22
+// fix: the PlanetScale flavor opts into auto-excluding `_vt_*` Vitess
+// shadow tables unconditionally; vanilla MySQL with a non-PlanetScale
+// DSN doesn't. The flavor flag is the operator's explicit choice.
+func TestDefaultExcludePatterns_PlanetScaleFlavor(t *testing.T) {
+	if pats := (Engine{Flavor: FlavorPlanetScale}).DefaultExcludePatterns(""); len(pats) != 1 || pats[0] != "_vt_*" {
 		t.Errorf("planetscale DefaultExcludePatterns = %v; want [_vt_*]", pats)
 	}
-	if pats := (Engine{Flavor: FlavorVanilla}).DefaultExcludePatterns(); len(pats) != 0 {
-		t.Errorf("vanilla DefaultExcludePatterns = %v; want empty", pats)
+	if pats := (Engine{Flavor: FlavorVanilla}).DefaultExcludePatterns("u:p@tcp(localhost:3306)/db"); len(pats) != 0 {
+		t.Errorf("vanilla on localhost DefaultExcludePatterns = %v; want empty", pats)
+	}
+}
+
+// TestDefaultExcludePatterns_VanillaPlanetScaleHostname pins the
+// v0.8.1 enhancement: a vanilla MySQL connection to a PlanetScale
+// endpoint should still apply the `_vt_*` exclusion. Drives the
+// hostname-suffix matcher across the documented patterns plus
+// negative cases (different domain, malformed DSN, empty DSN).
+func TestDefaultExcludePatterns_VanillaPlanetScaleHostname(t *testing.T) {
+	cases := []struct {
+		name   string
+		dsn    string
+		expect bool // true = `_vt_*` is returned
+	}{
+		{
+			name:   "public PlanetScale endpoint",
+			dsn:    "user:pass@tcp(prod.connect.psdb.cloud:3306)/dbname?tls=true",
+			expect: true,
+		},
+		{
+			name:   "PrivateLink PlanetScale endpoint",
+			dsn:    "user:pass@tcp(prod.private-connect.psdb.cloud:3306)/dbname?tls=true",
+			expect: true,
+		},
+		{
+			name:   "uppercase host still matches",
+			dsn:    "user:pass@tcp(PROD.Connect.PSDB.Cloud:3306)/dbname?tls=true",
+			expect: true,
+		},
+		{
+			name:   "PG-side PlanetScale hostname does not match (not Vitess-backed)",
+			dsn:    "user:pass@tcp(prod.pg.psdb.cloud:5432)/dbname",
+			expect: false,
+		},
+		{
+			name:   "non-PlanetScale host returns nothing",
+			dsn:    "user:pass@tcp(db.example.com:3306)/dbname",
+			expect: false,
+		},
+		{
+			name:   "localhost returns nothing",
+			dsn:    "user:pass@tcp(localhost:3306)/dbname",
+			expect: false,
+		},
+		{
+			name:   "empty DSN returns nothing",
+			dsn:    "",
+			expect: false,
+		},
+		{
+			name:   "malformed DSN returns nothing (no panic)",
+			dsn:    "this is not a valid DSN",
+			expect: false,
+		},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			pats := (Engine{Flavor: FlavorVanilla}).DefaultExcludePatterns(c.dsn)
+			got := len(pats) == 1 && pats[0] == "_vt_*"
+			if got != c.expect {
+				t.Errorf("vanilla DefaultExcludePatterns(%q) = %v; want match=%v", c.dsn, pats, c.expect)
+			}
+		})
 	}
 }

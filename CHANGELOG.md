@@ -6,6 +6,31 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-05-06
+
+Patch release. Closes a CI integration test regression introduced in v0.8.0 (test-only, no behaviour change for users), and finishes the Bug 22 auto-exclude story for vanilla-MySQL connections to PlanetScale endpoints.
+
+### Added
+
+- **PlanetScale Vitess hostname auto-detect for the vanilla MySQL driver.** v0.8.0's Bug 22 fix auto-excluded `_vt_*` Vitess shadow tables when `--source-driver=planetscale`. A vanilla MySQL operator pointing at a PlanetScale endpoint with `--source-driver=mysql` (a legitimate configuration — they get binlog CDC instead of VStream) still had to add `--exclude-table='_vt_*'` manually. v0.8.1 closes that gap with a DSN-keyed hostname sniff at orchestrator startup. The two PlanetScale MySQL hostname suffixes are recognised:
+
+  - `*.connect.psdb.cloud` (public PlanetScale MySQL)
+  - `*.private-connect.psdb.cloud` (AWS PrivateLink)
+
+  When matched, the engine merges `_vt_*` into the orchestrator's exclude list — same shape as the existing Bug 22 path. Operator-supplied `--include-table` short-circuits the merge; operators who explicitly want `_vt_*` tables override that way. A structured INFO log surfaces the merged exclusion list at startup so the new behaviour is visible.
+
+  No connection round-trip is involved — the sniff parses the DSN string and matches against the documented hostname suffixes, avoiding the auth/network failure modes that an `@@version_comment` probe would introduce. Non-PlanetScale Vitess deployments (Slack-style, custom domains) still need a manual `--exclude-table='_vt_*'`; if a non-PlanetScale Vitess user reports the gap, the connection-probe path can be added then.
+
+  PG-side PlanetScale hostname suffixes (`*.pg.psdb.cloud`, `*.private-pg.psdb.cloud`) are documented in code for future symmetry but no-op today — PlanetScale Postgres isn't Vitess-backed and has no `_vt_*` shadow tables. The same hostname-sniff machinery would slot into the PG engine's own `DefaultTableExcluder` if that need ever surfaces.
+
+### Changed
+
+- `ir.DefaultTableExcluder.DefaultExcludePatterns` signature gained a `dsn string` parameter so engines can return DSN-derived defaults in addition to flag-derived ones. Out-of-tree engines implementing the optional surface (none expected at this stage of the project) need to update the method signature.
+
+### Fixed
+
+- **CI: `TestMigrate_MySQLToPostgres_CheckBoolIdiom` referenced columns the test schema didn't have.** v0.8.0's bool-idiom integration test (Bug 17) ended with three stray INSERT validations on `email` / `status` columns left over from a sibling test. The bool-idiom test's schema only has `id` + `is_active`, so those INSERTs failed with `column "email" of relation "accounts" does not exist`. Removed the stray block; the test now ends after the bool-CHECK enforcement assertions where it was meant to. Test-only fix, no behaviour change.
+
 ## [0.8.0] - 2026-05-06
 
 Schema-diff release plus seven real-world bug fixes from v0.7.0 testing. Headline addition is `sluice schema diff` (ADR-0029): drift detection between sluice's expected target shape and the schema actually present, with text + JSON output, copy-paste-ready ALTER suggestions, and CI-friendly exit codes. The diff round picked up cross-engine type retargeting plus default / generated-expression / CHECK comparison along the way. Seven bug fixes — including Bug 19's silent TIMESTAMP corruption on non-UTC hosts, Bug 20's cross-engine resume dispatch, Bug 21's `idle in transaction` snapshot tx blocking source ALTERs, and Bug 22's auto-exclusion of Vitess `_vt_*` shadow tables — closed the remaining real-world gaps the v0.7.0 stretch testing surfaced.

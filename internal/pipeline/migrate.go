@@ -202,12 +202,14 @@ func (m *Migrator) Run(ctx context.Context) error {
 		return err
 	}
 
-	// Engine-default exclusions (Bug 22): merge in any patterns the
-	// source engine surfaces via [ir.DefaultTableExcluder] — today
-	// PlanetScale's `_vt_*` Vitess shadow tables. Operator-supplied
+	// Engine-default exclusions (Bug 22 / v0.8.1): merge in any
+	// patterns the source engine surfaces via [ir.DefaultTableExcluder]
+	// — today PlanetScale's `_vt_*` Vitess shadow tables, triggered
+	// either by the planetscale flavor flag or by a vanilla-mysql DSN
+	// pointing at a PlanetScale endpoint. Operator-supplied
 	// --include-table short-circuits the merge. Replace the field
 	// in-place because the orchestrator is single-shot per Run.
-	if eff, added := effectiveTableFilter(m.Filter, m.Source); len(added) > 0 {
+	if eff, added := effectiveTableFilter(m.Filter, m.Source, m.SourceDSN); len(added) > 0 {
 		slog.InfoContext(ctx, "applying engine-default table exclusions",
 			slog.String("engine", m.Source.Name()),
 			slog.Any("patterns", added),

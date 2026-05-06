@@ -309,7 +309,7 @@ type fakeExcluder struct {
 	patterns []string
 }
 
-func (f fakeExcluder) DefaultExcludePatterns() []string { return f.patterns }
+func (f fakeExcluder) DefaultExcludePatterns(string) []string { return f.patterns }
 
 // TestEffectiveTableFilter_MergesEngineDefaults covers the Bug 22
 // auto-exclude logic for PlanetScale's `_vt_*` Vitess shadow tables
@@ -355,7 +355,7 @@ func TestEffectiveTableFilter_MergesEngineDefaults(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			got, added := effectiveTableFilter(c.in, engine)
+			got, added := effectiveTableFilter(c.in, engine, "")
 			if !equalSlices(added, c.wantAdded) {
 				t.Errorf("added = %v; want %v", added, c.wantAdded)
 			}
@@ -377,7 +377,7 @@ func TestEffectiveTableFilter_MergesEngineDefaults(t *testing.T) {
 // this path.
 func TestEffectiveTableFilter_NonExcluderEngine(t *testing.T) {
 	in := TableFilter{Exclude: []string{"audit_*"}}
-	got, added := effectiveTableFilter(in, stubEngine{})
+	got, added := effectiveTableFilter(in, stubEngine{}, "")
 	if added != nil {
 		t.Errorf("added = %v; want nil (engine doesn't implement the interface)", added)
 	}
@@ -392,7 +392,7 @@ func TestEffectiveTableFilter_NonExcluderEngine(t *testing.T) {
 // Equivalent to no opt-in.
 func TestEffectiveTableFilter_EmptyDefaults(t *testing.T) {
 	in := TableFilter{Exclude: []string{"audit_*"}}
-	got, added := effectiveTableFilter(in, fakeExcluder{patterns: nil})
+	got, added := effectiveTableFilter(in, fakeExcluder{patterns: nil}, "")
 	if added != nil {
 		t.Errorf("added = %v; want nil (no defaults declared)", added)
 	}

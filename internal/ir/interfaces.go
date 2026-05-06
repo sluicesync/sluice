@@ -916,9 +916,18 @@ type Engine interface {
 // tables); operators almost never want sluice to copy or stream
 // those, and the symptom of accidentally including them is a quiet
 // flood of internal-state churn that bears no relation to user data.
+//
+// The DSN is supplied so the engine can return DSN-derived defaults
+// (e.g. v0.8.1's PlanetScale hostname auto-detect for the vanilla
+// MySQL flavor: `*.connect.psdb.cloud` endpoints carry Vitess shadow
+// tables even when the operator chose `--source-driver=mysql`). An
+// empty DSN is acceptable — engines fall back to flag-keyed
+// defaults.
 type DefaultTableExcluder interface {
 	// DefaultExcludePatterns returns a list of glob patterns to
 	// merge into the operator's exclude list. Empty / nil disables
 	// the default; equivalent to not implementing the interface.
-	DefaultExcludePatterns() []string
+	// The dsn parameter is the source DSN, supplied so the engine
+	// can return DSN-keyed defaults in addition to flag-keyed ones.
+	DefaultExcludePatterns(dsn string) []string
 }

@@ -81,6 +81,11 @@ For continuity when a chunk references "the previous work":
 - **Throughput tuning guide** (`docs/throughput-tuning.md`) — operator reference for the knobs that matter at scale.
 - **`migrate --dry-run` cross-reference to schema preview** — small UX nudge.
 
+### v0.8.1 patch wave
+
+- **PlanetScale Vitess hostname auto-detect.** Vanilla MySQL DSNs targeting `*.connect.psdb.cloud` or `*.private-connect.psdb.cloud` now inherit the v0.8.0 `_vt_*` auto-exclusion without needing `--source-driver=planetscale`. DSN-keyed sniff at orchestrator startup; no connection probe. PG-side hostname suffixes are documented for future symmetry but no-op today (PlanetScale Postgres isn't Vitess-backed).
+- **CI fix:** `TestMigrate_MySQLToPostgres_CheckBoolIdiom` referenced columns the test schema didn't have — leftover assertions from a sibling test. Removed.
+
 ### v0.8.0 feature wave (schema diff + real-world bug bundle)
 
 - **`sluice schema diff` (ADR-0029)** — drift detection between sluice's expected target shape and the schema actually present. Text + JSON output, copy-paste ALTER suggestions, atomic `--output FILE`, CI exit codes (0/1/2 = clean/drift/op-error). Reads both sides through the existing `SchemaReader`. Compares defaults, generated expressions, and CHECK constraints (categories originally listed as out-of-scope; lifted in the same release because the IR already carried the fields). New optional interfaces: `ir.ColumnDDLPreviewer` (filled-in `ADD COLUMN` rendering), `ir.SchemaTypeDropper`, `ir.DefaultTableExcluder`.
@@ -103,31 +108,7 @@ IR-first, sealed interfaces, kong+koanf, three-phase apply, MySQL flavors, pgout
 
 v0.8.0 closed every actionable item that was on the v0.6.0 roadmap (LOAD DATA INFILE, source-tx-boundary CDC batching, memory-bounded streaming, PG-native auto-emit, schema diff, the Bug 12 / Bug 15 reliability tail). What remains is split between (a) low-priority items that have always been here and haven't surfaced as blockers, and (b) new work emerging from v0.7.0 / v0.8.0 testing.
 
-### 1. PlanetScale Vitess auto-detect for vanilla MySQL driver
-
-**Why.** v0.8.0's Bug 22 fix auto-excludes `_vt_*` shadow tables when `--source-driver=planetscale`. A vanilla MySQL operator pointing at a Vitess-backed PlanetScale endpoint with `--source-driver=mysql` (a legitimate configuration — they get binlog CDC instead of VStream) still has to add `--exclude-table='_vt_*'` manually. Closing this gap finishes the auto-exclude story for the PlanetScale audience without growing a dependency on `@@version` / `INFORMATION_SCHEMA` probing.
-
-**What.** Hostname-keyed DSN sniff at orchestrator startup. PlanetScale's hostnames follow stable patterns:
-
-| Hostname suffix | Service |
-| --- | --- |
-| `.connect.psdb.cloud` | PlanetScale MySQL (public endpoint) |
-| `.private-connect.psdb.cloud` | PlanetScale MySQL (AWS PrivateLink) |
-| `.pg.psdb.cloud` | PlanetScale Postgres (public endpoint) |
-| `.private-pg.psdb.cloud` | PlanetScale Postgres (PrivateLink) |
-
-When `--source-driver=mysql` (vanilla flavor) is paired with a `*.connect.psdb.cloud` / `*.private-connect.psdb.cloud` host, merge `_vt_*` into the engine-default exclusions and emit a structured INFO log so operators see what fired. Driver promotion (vanilla → planetscale) is **not** the right call here — Capabilities differ between flavors (BulkLoad, CDC method) and the operator's driver choice is intentional. The narrow fix is just the exclusion list.
-
-The PG hostnames (`.pg.psdb.cloud`, `.private-pg.psdb.cloud`) are noted for future PG-side equivalents — PlanetScale Postgres isn't Vitess-backed and doesn't have `_vt_*` shadow tables today, so no action is required, but the same hostname-sniff machinery would catch any future PG-side defaults.
-
-**Gotchas.**
-- Non-PlanetScale Vitess deployments (Slack-style, custom domains) keep needing manual `--exclude-table='_vt_*'`. Auto-detect via `@@version_comment` requires a connection round-trip and is more invasive; out of scope until a non-PS Vitess user reports it.
-- The hostname check is a startup-time DSN parse, not a runtime probe — fires before any DB call, no race with auth/network.
-- Could land as v0.8.1 (small, tightly scoped to Bug 22's audience) or batch into v0.9.0.
-
----
-
-### 2. Schema-change ergonomics around `ALTER` windows
+### 1. Schema-change ergonomics around `ALTER` windows
 
 **Why.** v0.8.0 stretch-testing (`SCHEMA-CHANGE-TESTS.md`) confirmed sluice's fail-loud behaviour on schema-change classes:
 
@@ -151,7 +132,7 @@ Sluice is not a schema-migration tool, so the second one is on the careful side 
 
 ---
 
-### 3. PG TIMESTAMP precision and CHARSET/COLLATION cross-engine edges
+### 2. PG TIMESTAMP precision and CHARSET/COLLATION cross-engine edges
 
 **Why.** Latent items from earlier roadmap rounds, kept for tracking. Bug 19 (TIMESTAMP TZ corruption on non-UTC hosts) closed the silent-corruption tail for v0.8.0; the precision and charset edges are next on the cross-engine type contract:
 
@@ -162,15 +143,7 @@ Sluice is not a schema-migration tool, so the second one is on the careful side 
 
 ---
 
-### 4. Network compression for cross-host copies
-
-**Why.** Lower priority. Multi-TB at gigabit is hours of pure bandwidth time. Both pgx and the MySQL driver support compression but it's not configured in our DSNs.
-
-**What.** Document the `compress=true` (MySQL DSN) and `sslmode=...` / `gssencmode=...` (PG DSN) settings as a tuning recommendation for cross-host copies. Real implementation work only if testing surfaces it as a specific bottleneck. Mentioned in `docs/throughput-tuning.md` already; could expand.
-
----
-
-### 5. Auto-translate-and-create on mid-stream new tables
+### 3. Auto-translate-and-create on mid-stream new tables
 
 **Why.** ADR-0021 deliberately punted on mid-stream `CREATE TABLE`: a new table on a CDC source is currently silently dropped (defence-in-depth WARN, no schema propagation). The right path for "the developer ran a routine DDL" is to translate the new table's schema, create it on the target, and bring it into the publication scope — but doing this safely requires a mid-stream snapshot capture for the new table.
 
@@ -188,7 +161,7 @@ Sluice is not a schema-migration tool, so the second one is on the careful side 
 
 ---
 
-### 6. Multi-source aggregation
+### 4. Multi-source aggregation
 
 **Why.** Some users have multiple source DBs replicating into one target (sharded → consolidated, microservices → analytics warehouse, etc.). Today each `sluice sync start` is a 1:1 stream. ADR-0024 flagged this as out-of-scope; deserves its own design pass.
 
@@ -201,7 +174,7 @@ Sluice is not a schema-migration tool, so the second one is on the careful side 
 
 ---
 
-### 7. OSS-hygiene track
+### 5. OSS-hygiene track
 
 **Why.** v0.8.0 marks the eighth tagged release. Public-release prep has been deferred during the feature ramp; worth a focused sweep before the next major.
 

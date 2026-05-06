@@ -125,12 +125,12 @@ func (f TableFilter) Allows(tableName string) bool {
 // Returns the merged filter and the slice of patterns that came from
 // engine defaults (for the "applying engine default exclusions" log
 // line, distinct from the "operator filter applied" line).
-func effectiveTableFilter(filter TableFilter, source ir.Engine) (effective TableFilter, addedDefaults []string) {
+func effectiveTableFilter(filter TableFilter, source ir.Engine, sourceDSN string) (effective TableFilter, addedDefaults []string) {
 	excluder, ok := source.(ir.DefaultTableExcluder)
 	if !ok {
 		return filter, nil
 	}
-	defaults := excluder.DefaultExcludePatterns()
+	defaults := excluder.DefaultExcludePatterns(sourceDSN)
 	if len(defaults) == 0 {
 		return filter, nil
 	}

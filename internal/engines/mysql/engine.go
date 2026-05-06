@@ -25,6 +25,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/orware/sluice/internal/engines"
 	"github.com/orware/sluice/internal/ir"
@@ -231,34 +232,100 @@ func (Engine) OpenChangeApplier(ctx context.Context, dsn string) (ir.ChangeAppli
 	}, nil
 }
 
-// DefaultExcludePatterns returns flavor-specific table patterns the
-// orchestrator should merge into the operator's exclude list (only
-// when the operator hasn't supplied --include-table). Implements
-// [ir.DefaultTableExcluder].
+// DefaultExcludePatterns returns flavor-specific or DSN-derived
+// table patterns the orchestrator should merge into the operator's
+// exclude list (only when the operator hasn't supplied
+// --include-table). Implements [ir.DefaultTableExcluder].
 //
-// PlanetScale: Vitess maintains internal lifecycle "shadow tables" —
+// Vitess maintains internal lifecycle "shadow tables" —
 // `_vt_HOLD_<uuid>_<ts>` (legacy naming) and `_vt_hld_<uuid>_<ts>_`
 // / `_vt_prg_*` / `_vt_evc_*` / `_vt_drp_*` (post-PR-14613 naming
 // with a trailing underscore for FK-suffix headroom) — that aren't
 // user data. Including them in publication / bulk-copy generates
 // quiet write churn against the target with no operator-visible
-// signal. The `_vt_` prefix is the Vitess-reserved namespace; we
-// match it as a single glob to cover both legacy and new naming.
+// signal. The `_vt_` prefix is the Vitess-reserved namespace; a
+// single `_vt_*` glob covers both legacy and new naming.
 //
-// Operators that need to inspect or migrate `_vt_*` tables (rare —
-// usually a debugging exercise) can override by passing
+// Two paths trigger the auto-exclusion:
+//
+//  1. **Driver-flag-keyed (v0.8.0):** when the operator chose
+//     `--source-driver=planetscale`, the flavor declares the default
+//     unconditionally — the operator's choice is unambiguous.
+//
+//  2. **DSN-hostname-keyed (v0.8.1):** when the operator chose
+//     `--source-driver=mysql` (vanilla flavor) but the DSN points at
+//     a PlanetScale endpoint, sluice still applies the exclusion. A
+//     vanilla MySQL connection to a PlanetScale endpoint is a
+//     legitimate configuration — the operator gets binlog CDC
+//     instead of VStream — but the underlying server is still
+//     Vitess and the shadow tables are still there. PlanetScale's
+//     hostnames follow stable patterns that we can sniff at
+//     orchestrator startup before any DB call:
+//
+//     - `*.connect.psdb.cloud` (public PlanetScale MySQL)
+//     - `*.private-connect.psdb.cloud` (AWS PrivateLink)
+//
+//     PG-side PlanetScale endpoints (`*.pg.psdb.cloud`,
+//     `*.private-pg.psdb.cloud`) aren't Vitess-backed and don't
+//     have `_vt_*` shadow tables; they're noted here for symmetry
+//     and would slot into the PG engine's own `DefaultTableExcluder`
+//     implementation if that future need ever surfaces.
+//
+// Non-PlanetScale Vitess deployments (custom domains) still need a
+// manual `--exclude-table='_vt_*'`. Auto-detect via `@@version_comment`
+// would catch them but requires a connection round-trip and adds a
+// failure mode (auth/network race); the hostname sniff is cheap and
+// deterministic. If a non-PlanetScale Vitess user reports the gap,
+// the connection-probe path can be added then.
+//
+// Operators who need to inspect or migrate `_vt_*` tables (rare —
+// usually a debugging exercise) override by passing
 // `--include-table` explicitly, which short-circuits the default.
-//
-// Vanilla MySQL returns no defaults — `_vt_*` is Vitess-specific and
-// upstream MySQL has no equivalent reserved namespace. (Vanilla
-// MySQL operators connecting to a Vitess-backed server can still
-// pass `--exclude-table='_vt_*'` manually; auto-detect of the
-// underlying server flavor is out of scope for v0.8.0.)
-func (e Engine) DefaultExcludePatterns() []string {
+func (e Engine) DefaultExcludePatterns(dsn string) []string {
 	if e.Flavor == FlavorPlanetScale {
 		return []string{"_vt_*"}
 	}
+	if isPlanetScaleMySQLHost(dsn) {
+		return []string{"_vt_*"}
+	}
 	return nil
+}
+
+// planetScaleMySQLHostSuffixes is the closed set of DNS suffixes
+// PlanetScale's MySQL service uses today. Lowercase comparison; the
+// wider PSDB platform may add suffixes (region-specific shards,
+// etc.) — kept as a package-level slice so adding one is a one-line
+// edit.
+var planetScaleMySQLHostSuffixes = []string{
+	".connect.psdb.cloud",
+	".private-connect.psdb.cloud",
+}
+
+// isPlanetScaleMySQLHost reports whether dsn parses to a hostname
+// matching one of the documented PlanetScale MySQL endpoint
+// suffixes. Returns false on parse failure or non-host DSN forms
+// (Unix socket, etc.) — those configurations don't match PSDB by
+// construction. Lowercases the host before matching: PSDB hostnames
+// are case-insensitive and operators sometimes paste mixed-case.
+func isPlanetScaleMySQLHost(dsn string) bool {
+	if dsn == "" {
+		return false
+	}
+	cfg, err := parseDSN(dsn)
+	if err != nil {
+		return false
+	}
+	host, _, err := hostPortFromAddr(cfg.Addr)
+	if err != nil {
+		return false
+	}
+	host = strings.ToLower(host)
+	for _, suffix := range planetScaleMySQLHostSuffixes {
+		if strings.HasSuffix(host, suffix) {
+			return true
+		}
+	}
+	return false
 }
 
 // init registers each supported flavor under its own name in the
