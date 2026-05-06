@@ -81,11 +81,6 @@ For continuity when a chunk references "the previous work":
 - **Throughput tuning guide** (`docs/throughput-tuning.md`) — operator reference for the knobs that matter at scale.
 - **`migrate --dry-run` cross-reference to schema preview** — small UX nudge.
 
-### v0.8.1 patch wave
-
-- **PlanetScale Vitess hostname auto-detect.** Vanilla MySQL DSNs targeting `*.connect.psdb.cloud` or `*.private-connect.psdb.cloud` now inherit the v0.8.0 `_vt_*` auto-exclusion without needing `--source-driver=planetscale`. DSN-keyed sniff at orchestrator startup; no connection probe. PG-side hostname suffixes are documented for future symmetry but no-op today (PlanetScale Postgres isn't Vitess-backed).
-- **CI fix:** `TestMigrate_MySQLToPostgres_CheckBoolIdiom` referenced columns the test schema didn't have — leftover assertions from a sibling test. Removed.
-
 ### v0.8.0 feature wave (schema diff + real-world bug bundle)
 
 - **`sluice schema diff` (ADR-0029)** — drift detection between sluice's expected target shape and the schema actually present. Text + JSON output, copy-paste ALTER suggestions, atomic `--output FILE`, CI exit codes (0/1/2 = clean/drift/op-error). Reads both sides through the existing `SchemaReader`. Compares defaults, generated expressions, and CHECK constraints (categories originally listed as out-of-scope; lifted in the same release because the IR already carried the fields). New optional interfaces: `ir.ColumnDDLPreviewer` (filled-in `ADD COLUMN` rendering), `ir.SchemaTypeDropper`, `ir.DefaultTableExcluder`.
@@ -98,48 +93,58 @@ For continuity when a chunk references "the previous work":
 - **Bug 21 — PG snapshot tx no longer holds AccessShareLock for the CDC lifetime.** New `ir.SnapshotStream.ReleaseRowsFn` lets the streamer commit the snapshot tx after bulk-copy without disturbing CDC. ALTER on the source unblocked.
 - **Bug 22 — Vitess `_vt_*` shadow tables auto-excluded** when `--source-driver=planetscale`. New `ir.DefaultTableExcluder` engine surface; operator-supplied `--include-table` short-circuits.
 
+### v0.8.1 patch wave
+
+- **PlanetScale Vitess hostname auto-detect.** Vanilla MySQL DSNs targeting `*.connect.psdb.cloud` or `*.private-connect.psdb.cloud` now inherit the v0.8.0 `_vt_*` auto-exclusion without needing `--source-driver=planetscale`. DSN-keyed sniff at orchestrator startup; no connection probe. PG-side hostname suffixes are documented for future symmetry but no-op today (PlanetScale Postgres isn't Vitess-backed).
+- **CI fix:** `TestMigrate_MySQLToPostgres_CheckBoolIdiom` referenced columns the test schema didn't have — leftover assertions from a sibling test. Removed.
+
+### v0.9.0 patch wave
+
+- **`sluice sync stop --wait`** (extends ADR-0025). Blocks the CLI until the running streamer confirms graceful-drain completion; `--timeout` (default 5m) bounds the wait. Mechanism: streamer clears `stop_requested_at` only on stop-signal-driven exits (not Ctrl-C), so the cleared-flag signal accurately reflects "drain completed". CLI polls `ReadStopRequested` at 1s cadence.
+- **TIMESTAMP/DATETIME precision integration tests** across `(0/3/6)` precisions in both directions; outcome was "audited, no gaps found" — Bug 19's TZ fix had already closed the silent-corruption door, and the IR's `Precision` field rounds-trips end-to-end.
+- **CONTRIBUTING.md release-process section + `docs/dev/release-template.md`** — formalises the `chore: cut vX.Y.Z` commit + annotated-tag pattern and the GitHub release-notes structure (Highlights / Fixed / Compatibility / Who-needs-this).
+- **Bug 16 follow-up — index expressions translate cross-engine.** New `ir.IndexColumn.ExpressionDialect` field; PG's index-list emit routes MySQL-source expressions through the ADR-0016 translator. `((json_unquote(json_extract(...))))` → `(((... ->>...)))`.
+- **Bug 17 follow-up — COALESCE rewrite recognises bool-returning sub-expressions** (comparisons, `IS NULL`, `IS NOT NULL`, parenthesised wrappers), not just bare bool idents.
+- **Bug 22 follow-up — `schema preview` and `schema diff` now also auto-exclude PlanetScale `_vt_*` tables** (the v0.8.1 fix only covered Migrator/Streamer paths).
+- **Bug 23 — MySQL `DEFAULT ('value')` parens-form enum cast.** PG enum-cast emit was gated on `DefaultLiteral` only; now also fires on `DefaultExpression` whose body is shape-equivalent to a string literal. True-expression defaults stay uncast.
+
 ### Foundational ADRs (0001–0029)
 
-IR-first, sealed interfaces, kong+koanf, three-phase apply, MySQL flavors, pgoutput, position persistence, go-mysql, Streamer-as-separate-orchestrator, idempotent applier semantics, SlotManager optional surface, pglogrepl bypass for FAILOVER, applier value-shaping with `CAST(? AS JSON)`, phase-aware error-hint registry, migration resume design, layered expression translation (extended in v0.8.0 with bool-idiom rewrites), batched CDC apply, per-batch bulk-copy checkpointing, parallel within-table bulk copy, slot-ack-after-apply, publication scope by table, slot-missing fall-through (extended for MySQL in v0.6.0), `--reset-target-data`, `sluice schema preview`, graceful-drain `sync stop`, LOAD DATA INFILE writer, source-tx-boundary CDC batching, memory-bounded streaming, `sluice schema diff`.
+IR-first, sealed interfaces, kong+koanf, three-phase apply, MySQL flavors, pgoutput, position persistence, go-mysql, Streamer-as-separate-orchestrator, idempotent applier semantics, SlotManager optional surface, pglogrepl bypass for FAILOVER, applier value-shaping with `CAST(? AS JSON)`, phase-aware error-hint registry, migration resume design, layered expression translation (extended in v0.8.0 with bool-idiom rewrites and v0.9.0 with index-expression and bool-sub-expression coverage), batched CDC apply, per-batch bulk-copy checkpointing, parallel within-table bulk copy, slot-ack-after-apply, publication scope by table, slot-missing fall-through (extended for MySQL in v0.6.0), `--reset-target-data`, `sluice schema preview`, graceful-drain `sync stop` (extended in v0.9.0 with `--wait`), LOAD DATA INFILE writer, source-tx-boundary CDC batching, memory-bounded streaming, `sluice schema diff`.
 
 ---
 
 ## Next up
 
-v0.8.0 closed every actionable item that was on the v0.6.0 roadmap (LOAD DATA INFILE, source-tx-boundary CDC batching, memory-bounded streaming, PG-native auto-emit, schema diff, the Bug 12 / Bug 15 reliability tail). What remains is split between (a) low-priority items that have always been here and haven't surfaced as blockers, and (b) new work emerging from v0.7.0 / v0.8.0 testing.
+v0.9.0 closed `sync stop --wait` (the operator-coordination half of "schema-change ergonomics"), audited TIMESTAMP precision (no gaps found), and landed the OSS-hygiene starter (`CONTRIBUTING.md` + release-notes template). v0.8.1's testing surfaced four follow-ups that landed in v0.9.0 too: index-expression translation, bool-returning sub-expressions in COALESCE, the auto-exclude reach into preview/diff, and Bug 23's enum-cast on the parens-form default. What's left is split between (a) low-priority items that have always been here and haven't surfaced as blockers, and (b) the heavier design-first items (mid-stream add-table, multi-source).
 
-### 1. Schema-change ergonomics around `ALTER` windows
+### 1. Schema-change planning helper
 
-**Why.** v0.8.0 stretch-testing (`SCHEMA-CHANGE-TESTS.md`) confirmed sluice's fail-loud behaviour on schema-change classes:
+**Why.** v0.9.0 closed half of "schema-change ergonomics" with `sync stop --wait` — operators now have a clean drainage signal for ALTER coordination. The remaining thread: a **planning helper** that combines `schema diff` (current source vs current target) into an actionable workflow. Doc-only first; tooling later if it earns its complexity.
 
-| Operation | Behaviour | Operator workflow |
-| --- | --- | --- |
-| ADD COLUMN + INSERT using new col | fail-loud (`column "X" does not exist`) | sync stop → ALTER both sides → sync start |
-| DROP COLUMN + INSERT not using col | graceful (missing col → NULL when target nullable) | optional cleanup |
-| MODIFY type widening + INSERT longer value | fail-loud (`value too long`) | sync stop → ALTER dst → sync start |
+**What.** Today's flow is: operator runs `schema diff`, reads the JSON / text output, hand-translates the suggested ALTER statements, runs them on source and target in the right order. The doc gap: there's no recipe linking these steps, no example runbook for ALTER-on-source-then-ALTER-on-target sequencing, no guidance on how `sync stop --wait` slots into the flow.
 
-The behaviour is correct (silent corruption would be worse), but the operator workflow is manual. Smoothing it would be ergonomic, not load-bearing.
-
-**What.** Two threads worth considering:
-
-- **`sync stop --until-applied`** — drain to a known-empty applier state and exit, instead of stopping at the next batch boundary. Gives operators a clean "I know nothing is in-flight" handle for ALTER coordination.
-- **Schema-change planning helper** — `sluice schema diff` already produces the diff between current source and current target. A wrapper flow could be: `diff` produces the ALTER list → operator reviews → `apply-alters` runs them on both sides in coordinated order. Doc-only first; tooling later if it earns its complexity.
-
-Sluice is not a schema-migration tool, so the second one is on the careful side of "preserve streaming continuity, don't replace Atlas / sqitch". The first is more cleanly in-scope.
+A short doc — `docs/operator/schema-change-runbook.md` — would close the documentation gap without growing CLI surface. Tooling (a `sluice schema apply-alters` flow) only earns its weight if operators report they're hand-coding the same ALTER scripts repeatedly.
 
 **Gotchas.**
-- `--until-applied` needs a definition of "applied" that's robust under idle-flush / no-traffic — probably "no events received in the last N seconds AND in-flight batch is empty AND position has been committed".
+- Sluice is not a schema-migration tool. The doc should explicitly hand off to Atlas / sqitch / liquibase for cases where the operator wants version-controlled migrations; sluice's role is preserving streaming continuity, not replacing those tools.
 
 ---
 
-### 2. PG TIMESTAMP precision and CHARSET/COLLATION cross-engine edges
+### 2. CHARSET/COLLATION cross-engine translation
 
-**Why.** Latent items from earlier roadmap rounds, kept for tracking. Bug 19 (TIMESTAMP TZ corruption on non-UTC hosts) closed the silent-corruption tail for v0.8.0; the precision and charset edges are next on the cross-engine type contract:
+**Why.** v0.9.0 audited TIMESTAMP precision and found no gaps; CHARSET / COLLATION is the remaining cross-engine type-edge tracker. The `--ignore-charset-collation` flag on `schema diff` is plumbed but inert — the underlying comparison needs the IR to carry charset/collation on read for both engines.
 
-- TIMESTAMP precision differences beyond the `CURRENT_TIMESTAMP` default fix (e.g. `TIMESTAMP(6)` ↔ `TIMESTAMPTZ` round-trips, including the boundary between fractional-second-aware and -unaware columns).
-- CHARSET / COLLATION translation across dialects — `--ignore-charset-collation` is plumbed on `schema diff` but the underlying comparison is inert pending an IR enrichment to capture charset/collation on read for both engines.
+**What.** Two-step:
 
-**What.** Each is its own self-contained chunk; will surface once a real-world test exercises it. Bug 19's family (silent-corruption-adjacent TZ/precision behaviour) is the one to watch.
+1. **IR enrichment.** Add `Charset` and `Collation` fields to `ir.Column` (or a sub-struct shared with `ir.Table`). Both schema readers populate from `information_schema.columns` (MySQL) and `pg_collation` (Postgres). Empty when the engine doesn't expose the column-level value.
+2. **Diff comparison.** `schema diff` compares the fields when both sides have them; surfaces drift; `--ignore-charset-collation` becomes load-bearing.
+
+Cross-engine emit is out of scope for this chunk — operators with charset-sensitive workloads use `--type-override` today; bringing translation in-band requires an equivalence map similar to the default-value one (utf8mb4 ↔ UTF8, latin1 ↔ LATIN1, etc.) that would be its own ADR.
+
+**Gotchas.**
+- MySQL stores charset/collation per-column; Postgres tracks collation per-column but charset is database-wide. The IR field shape needs to cover both.
+- Default charset on MySQL column comes from the table default, which comes from the database default — surface only the explicitly-set values to avoid false positives.
 
 ---
 
@@ -174,19 +179,17 @@ Sluice is not a schema-migration tool, so the second one is on the careful side 
 
 ---
 
-### 5. OSS-hygiene track
+### 5. OSS-hygiene track (remaining items)
 
-**Why.** v0.8.0 marks the eighth tagged release. Public-release prep has been deferred during the feature ramp; worth a focused sweep before the next major.
+**Why.** v0.9.0 closed two of the OSS-hygiene starters (`CONTRIBUTING.md` release-process section + `docs/dev/release-template.md`). The remaining items round out the public-release-readiness story.
 
-**What.** Mostly project hygiene, no engineering risk:
+**What.** Three independent items, each landable on its own:
 
-- License-header sweep across `internal/` (LICENSE file is in place; per-file headers are not).
-- `CONTRIBUTING.md` covering the pre-commit hook, the `integration` build tag mechanics, and the Windows-Rancher quirks.
-- Release-notes template formalised — the markdown block we paste into each GitHub release is consistent, but it lives in conversation memory rather than a checked-in template.
-- `goreleaser` or equivalent for cross-platform binary builds. Releases are routine enough that hand-rolled build artefacts are starting to be a chore.
-- Public README pass — current README is reasonable but reads as project-internal.
+- **License-header sweep across `internal/`.** LICENSE file is in place at the repo root; per-file headers are not. Mechanical change with high diff churn (~50 files); best landed in a single doc-only commit so the diff is easy to skim and revert if convention changes.
+- **`goreleaser` (or equivalent) for cross-platform binary builds.** Eight tagged releases; hand-rolled build artefacts are starting to be a chore. Gotchas: Windows code-signing, GitHub Actions secrets, the integration-test images on the release runner. Worth its own focused chunk with a real ADR addendum.
+- **Public README pass.** Current README is reasonable but reads as project-internal. Audience the public README should target: an operator scanning for "does this fit my use case" in the first 30 seconds. Move the deeper architectural detail into `docs/architecture.md` (already exists); the README becomes a short pitch + quickstart + pointer to docs.
 
-**Gotchas.** None — these are independent items, each landable on its own.
+**Gotchas.** None for the license-header sweep or README pass; goreleaser carries the gotchas listed above and benefits from running through the whole release cycle once before being declared done.
 
 ---
 
@@ -195,7 +198,7 @@ Sluice is not a schema-migration tool, so the second one is on the careful side 
 When starting a new chunk in Claude Code:
 
 1. Pick an item from "Next up". Earlier items have more context inheritance.
-2. Open the relevant section in the prompt: *"Read CLAUDE.md and docs/dev/roadmap.md section 1 (PlanetScale Vitess auto-detect). Propose a design before writing code."*
+2. Open the relevant section in the prompt: *"Read CLAUDE.md and docs/dev/roadmap.md section 1 (Schema-change planning helper). Propose a design before writing code."*
 3. Iterate on the plan.
 4. Implement.
 5. Update this file when the chunk lands — move the entry to "Recently landed" and trim it to one line.
