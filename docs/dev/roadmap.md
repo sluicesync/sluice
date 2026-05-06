@@ -108,6 +108,16 @@ For continuity when a chunk references "the previous work":
 - **Bug 22 follow-up — `schema preview` and `schema diff` now also auto-exclude PlanetScale `_vt_*` tables** (the v0.8.1 fix only covered Migrator/Streamer paths).
 - **Bug 23 — MySQL `DEFAULT ('value')` parens-form enum cast.** PG enum-cast emit was gated on `DefaultLiteral` only; now also fires on `DefaultExpression` whose body is shape-equivalent to a string literal. True-expression defaults stay uncast.
 
+### v0.9.1 patch wave
+
+- **Bug 16 residual — `CAST(x AS CHAR(N) [CHARSET y] [COLLATE z])`** translates to `CAST(x AS VARCHAR(N))` on PG emit; charset/collate decorations dropped, CHAR(N) → VARCHAR(N) (matches MySQL no-padding semantics). Bare `CAST(x AS CHAR)` becomes `CAST(x AS TEXT)`.
+- **Bug 17 residual — outer-column-type-aware COALESCE direction.** New `ExprContext.OuterColumnIsInteger` flag flips the rewrite: integer-typed generated columns whose body returns bool now wrap the bool side with `::int` instead of converting the int literal to bool.
+- **Bug 23 (refined) — STORED GENERATED column body cast for enum targets.** Generated-column body wrapped with `::"<enum_type>"` when the column is enum-typed; works for any text-returning shape (CASE / COALESCE / literal). Mirrors the existing DEFAULT cast.
+
+### v0.9.x doc wave
+
+- **`docs/schema-change-runbook.md`** — operator runbook for the `ADD COLUMN` / `DROP COLUMN` / `MODIFY` workflow against a running sluice stream. Covers the standard `sync stop --wait` → ALTER → `sync start --resume` pattern, the per-class behaviour pinned by v0.8.0 stretch testing, planning with `sluice schema diff`, and when to reach for Atlas / sqitch / liquibase instead. Closes the documentation half of "Schema-change ergonomics" — tooling beyond what `sync stop --wait` already provides hasn't earned its weight yet.
+
 ### Foundational ADRs (0001–0029)
 
 IR-first, sealed interfaces, kong+koanf, three-phase apply, MySQL flavors, pgoutput, position persistence, go-mysql, Streamer-as-separate-orchestrator, idempotent applier semantics, SlotManager optional surface, pglogrepl bypass for FAILOVER, applier value-shaping with `CAST(? AS JSON)`, phase-aware error-hint registry, migration resume design, layered expression translation (extended in v0.8.0 with bool-idiom rewrites and v0.9.0 with index-expression and bool-sub-expression coverage), batched CDC apply, per-batch bulk-copy checkpointing, parallel within-table bulk copy, slot-ack-after-apply, publication scope by table, slot-missing fall-through (extended for MySQL in v0.6.0), `--reset-target-data`, `sluice schema preview`, graceful-drain `sync stop` (extended in v0.9.0 with `--wait`), LOAD DATA INFILE writer, source-tx-boundary CDC batching, memory-bounded streaming, `sluice schema diff`.
@@ -118,20 +128,7 @@ IR-first, sealed interfaces, kong+koanf, three-phase apply, MySQL flavors, pgout
 
 v0.9.0 closed `sync stop --wait` (the operator-coordination half of "schema-change ergonomics"), audited TIMESTAMP precision (no gaps found), and landed the OSS-hygiene starter (`CONTRIBUTING.md` + release-notes template). v0.8.1's testing surfaced four follow-ups that landed in v0.9.0 too: index-expression translation, bool-returning sub-expressions in COALESCE, the auto-exclude reach into preview/diff, and Bug 23's enum-cast on the parens-form default. What's left is split between (a) low-priority items that have always been here and haven't surfaced as blockers, and (b) the heavier design-first items (mid-stream add-table, multi-source).
 
-### 1. Schema-change planning helper
-
-**Why.** v0.9.0 closed half of "schema-change ergonomics" with `sync stop --wait` — operators now have a clean drainage signal for ALTER coordination. The remaining thread: a **planning helper** that combines `schema diff` (current source vs current target) into an actionable workflow. Doc-only first; tooling later if it earns its complexity.
-
-**What.** Today's flow is: operator runs `schema diff`, reads the JSON / text output, hand-translates the suggested ALTER statements, runs them on source and target in the right order. The doc gap: there's no recipe linking these steps, no example runbook for ALTER-on-source-then-ALTER-on-target sequencing, no guidance on how `sync stop --wait` slots into the flow.
-
-A short doc — `docs/operator/schema-change-runbook.md` — would close the documentation gap without growing CLI surface. Tooling (a `sluice schema apply-alters` flow) only earns its weight if operators report they're hand-coding the same ALTER scripts repeatedly.
-
-**Gotchas.**
-- Sluice is not a schema-migration tool. The doc should explicitly hand off to Atlas / sqitch / liquibase for cases where the operator wants version-controlled migrations; sluice's role is preserving streaming continuity, not replacing those tools.
-
----
-
-### 2. CHARSET/COLLATION cross-engine translation
+### 1. CHARSET/COLLATION cross-engine translation
 
 **Why.** v0.9.0 audited TIMESTAMP precision and found no gaps; CHARSET / COLLATION is the remaining cross-engine type-edge tracker. The `--ignore-charset-collation` flag on `schema diff` is plumbed but inert — the underlying comparison needs the IR to carry charset/collation on read for both engines.
 
@@ -148,7 +145,7 @@ Cross-engine emit is out of scope for this chunk — operators with charset-sens
 
 ---
 
-### 3. Auto-translate-and-create on mid-stream new tables
+### 2. Auto-translate-and-create on mid-stream new tables
 
 **Why.** ADR-0021 deliberately punted on mid-stream `CREATE TABLE`: a new table on a CDC source is currently silently dropped (defence-in-depth WARN, no schema propagation). The right path for "the developer ran a routine DDL" is to translate the new table's schema, create it on the target, and bring it into the publication scope — but doing this safely requires a mid-stream snapshot capture for the new table.
 
@@ -166,7 +163,7 @@ Cross-engine emit is out of scope for this chunk — operators with charset-sens
 
 ---
 
-### 4. Multi-source aggregation
+### 3. Multi-source aggregation
 
 **Why.** Some users have multiple source DBs replicating into one target (sharded → consolidated, microservices → analytics warehouse, etc.). Today each `sluice sync start` is a 1:1 stream. ADR-0024 flagged this as out-of-scope; deserves its own design pass.
 
@@ -179,7 +176,7 @@ Cross-engine emit is out of scope for this chunk — operators with charset-sens
 
 ---
 
-### 5. OSS-hygiene track (remaining items)
+### 4. OSS-hygiene track (remaining items)
 
 **Why.** v0.9.0 closed two of the OSS-hygiene starters (`CONTRIBUTING.md` release-process section + `docs/dev/release-template.md`). The remaining items round out the public-release-readiness story.
 
