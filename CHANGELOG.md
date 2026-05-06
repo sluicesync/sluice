@@ -6,6 +6,10 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-05-05
+
+Performance round 2 + ergonomics + reliability follow-ups. Four new ADRs (0025 graceful-drain stop, 0026 LOAD DATA INFILE writer, 0027 source-tx CDC batching, 0028 memory-bounded streaming). Closes Bug 12 (MySQL CDC silent-stall on temporal columns) and Bug 15 (CLI sync-stop drain in the warm-up window) — both classified during v0.6.0 testing as the remaining reliability gaps from the v0.4.0 night soak.
+
 ### Added
 
 - **MySQL `LOAD DATA LOCAL INFILE` row-writer (ADR-0026).** Vanilla
@@ -1275,7 +1279,8 @@ level history.
 
 (none currently — see the closed entries above.)
 
-[Unreleased]: https://github.com/orware/sluice/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/orware/sluice/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/orware/sluice/releases/tag/v0.7.0
 [0.6.0]: https://github.com/orware/sluice/releases/tag/v0.6.0
 [0.5.2]: https://github.com/orware/sluice/releases/tag/v0.5.2
 [0.5.1]: https://github.com/orware/sluice/releases/tag/v0.5.1
