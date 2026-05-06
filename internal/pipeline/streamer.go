@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/url"
 	"strings"
+	"sync/atomic"
 
 	"github.com/orware/sluice/internal/config"
 	"github.com/orware/sluice/internal/ir"
@@ -361,14 +362,32 @@ func (s *Streamer) Run(ctx context.Context) error {
 	// The dispatch-side filter wraps `changes` with a goroutine
 	// that drops events whose qualified name doesn't pass the
 	// filter. No-op pass-through when the filter is empty.
-	s.startStopSignalPoll(applyCtx, applier, streamID, cancelStream, cancelApply)
+	//
+	// stopObserved is set by pollStopSignal the moment it first sees
+	// the control-table stop flag. After dispatchApply returns we
+	// inspect it to decide whether to clear the flag (graceful drain
+	// initiated by `sync stop`) or leave it (Ctrl-C / outer ctx cancel
+	// — the operator's stop request, if any, didn't drive this exit).
+	// The cleared flag is the signal `sync stop --wait` polls for.
+	var stopObserved atomic.Bool
+	s.startStopSignalPoll(applyCtx, applier, streamID, cancelStream, cancelApply, &stopObserved)
 
 	filtered := filterChanges(applyCtx, changes, s.Filter)
-	if err := s.dispatchApply(applyCtx, applier, streamID, filtered); err != nil {
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			return nil
+	dispatchErr := s.dispatchApply(applyCtx, applier, streamID, filtered)
+	if dispatchErr != nil && !errors.Is(dispatchErr, context.Canceled) && !errors.Is(dispatchErr, context.DeadlineExceeded) {
+		return wrapWithHint(PhaseCDC, fmt.Errorf("pipeline: apply changes: %w", dispatchErr))
+	}
+	// On a stop-signal-driven graceful drain, clear stop_requested_at
+	// so a CLI `sync stop --wait` polling for completion sees the
+	// cleared flag and returns success. Use the outer ctx because
+	// applyCtx may already be cancelled here.
+	if stopObserved.Load() {
+		if err := applier.ClearStopRequested(ctx, streamID); err != nil {
+			slog.WarnContext(ctx, "failed to clear stop_requested_at after graceful drain; sync stop --wait may time out",
+				slog.String("stream_id", streamID),
+				slog.String("error", err.Error()),
+			)
 		}
-		return wrapWithHint(PhaseCDC, fmt.Errorf("pipeline: apply changes: %w", err))
 	}
 	return nil
 }
@@ -413,7 +432,7 @@ func (s *Streamer) dispatchApply(ctx context.Context, applier ir.ChangeApplier, 
 // entirely — the existing Ctrl-C / ctx-cancel path remains the only
 // way to stop those streams, which matches their pre-stop-signal
 // behavior.
-func (s *Streamer) startStopSignalPoll(applyCtx context.Context, applier ir.ChangeApplier, streamID string, cancelStream, cancelApply context.CancelFunc) {
+func (s *Streamer) startStopSignalPoll(applyCtx context.Context, applier ir.ChangeApplier, streamID string, cancelStream, cancelApply context.CancelFunc, observed *atomic.Bool) {
 	reader, ok := applier.(stopFlagReader)
 	if !ok {
 		slog.DebugContext(applyCtx, "stop-signal poll skipped: applier does not implement ReadStopRequested",
@@ -424,7 +443,7 @@ func (s *Streamer) startStopSignalPoll(applyCtx context.Context, applier ir.Chan
 	slog.DebugContext(applyCtx, "stop-signal poll started",
 		slog.String("stream_id", streamID),
 	)
-	go pollStopSignal(applyCtx, reader, streamID, cancelStream, cancelApply)
+	go pollStopSignal(applyCtx, reader, streamID, cancelStream, cancelApply, observed)
 }
 
 // logDryRunPlan describes what Run would do without doing it via

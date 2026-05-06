@@ -102,3 +102,31 @@ The `pollStopSignal` signature changed (added `cancelStream` parameter); this is
 - Unit test `TestPollStopSignal_HardCancelsApplyOnDrainTimeout` (`internal/pipeline/stop_signal_test.go`) verifies the watchdog escalates to `cancelApply` after `drainTimeoutForTest` elapses.
 - Unit test `TestPollStopSignal_WatchdogExitsCleanlyOnApplyDone` verifies the watchdog exits without firing `cancelApply` when apply finishes naturally.
 - Real-world repro at `C:\code\sluice-testing\workspace\bug15_repro_dev.sh` (sustained writer, `--apply-batch-size=50`, mid-stream `sync stop`): pre-fix dropped 25-42 rows; post-fix drops 0.
+
+## Added in v0.9.0: `sync stop --wait`
+
+Operator feedback from v0.8.0 stretch testing: when coordinating an ALTER window, operators have no clean handle that says "drain has completed; safe to ALTER now". Today's `sync stop` is fire-and-forget — it writes `stop_requested_at`, the streamer drains within ~30s, and the operator either polls `sync status` or `pgrep`s the streamer process to know when it's safe to issue the ALTER.
+
+v0.9.0 closes that gap with a `--wait` flag on `sluice sync stop` that blocks the CLI until the streamer confirms graceful-drain completion.
+
+### Mechanism
+
+The flag-clearing convention. The streamer already calls `applier.ClearStopRequested(streamID)` at startup (so a stale flag from a previous run doesn't immediately exit the next `sync start` — Bug 11 fix from v0.3.2). v0.9.0 adds a second clear point: after a stop-signal-driven graceful drain, the streamer clears the flag again as the very last step of `Streamer.Run`. The CLI's `--wait` polls `ReadStopRequested` until it returns `false` and exits success.
+
+Two pieces had to land together:
+
+1. **`pollStopSignal` exposes whether it observed the flag.** Added an optional `*atomic.Bool` parameter; the poll goroutine sets it to true the moment it first sees `stop_requested_at IS NOT NULL`. The streamer reads it after `dispatchApply` returns and clears the flag *only* when the observed bit is set — so a Ctrl-C / outer-ctx cancel mid-stream doesn't masquerade as a graceful drain.
+2. **CLI `waitForStopComplete` polls the cleared-flag signal.** 1s polling cadence (the streamer-side poll is the rate-limiting factor at 5s), bounded by `--timeout` (default 5 minutes), exits non-zero with a clear message on timeout. The stop request itself stays written, so the streamer continues draining in the background after CLI timeout — re-running `sync stop --wait` keeps watching the same flag.
+
+### Why not a new column
+
+A new `stopped_at` column on `sluice_cdc_state` would carry the same signal more explicitly, but it's a schema migration on every existing target and the cleared-flag pattern is already well-formed (idempotent: re-issuing `sync stop` re-sets the flag; tolerant of restart: the streamer always clears at startup). The cleared-flag approach reuses the lifecycle the existing code already manages.
+
+### Backwards compatibility
+
+A `sync stop --wait` against a streamer running an older sluice version (one that doesn't clear the flag on graceful exit) blocks until `--timeout` fires. Acceptable: `--wait` is opt-in, the timeout puts a bound, and the operator gets a clear "did not complete drain" message that points them at `sluice sync status`. Without `--wait` the behaviour is unchanged.
+
+### Verification
+
+- Unit test `TestPollStopSignal_SetsObservedOnFlag` (`internal/pipeline/stop_signal_test.go`) pins the observed-flag contract.
+- Unit tests `TestWaitForStopComplete_FlagClears` / `_Timeout` / `_ContextCancel` / `_NonPollingApplier` (`cmd/sluice/sync_stop_test.go`) cover the four CLI poll paths: success, timeout, outer-ctx cancel, and graceful degradation when the applier doesn't implement `ReadStopRequested`.

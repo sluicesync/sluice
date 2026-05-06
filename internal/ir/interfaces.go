@@ -426,16 +426,25 @@ type ChangeApplier interface {
 	RequestStop(ctx context.Context, streamID string) error
 
 	// ClearStopRequested resets the stop flag for the named stream.
-	// Called by [pipeline.Streamer] at startup so a previous
-	// `sluice sync stop` doesn't leave a sticky signal that
-	// immediately exits the next `sluice sync start`. Idempotent
-	// and tolerant of a missing row (returns nil).
+	// Called by [pipeline.Streamer] in two places:
+	//
+	//   1. At startup, so a previous `sluice sync stop` doesn't
+	//      leave a sticky signal that immediately exits the next
+	//      `sluice sync start`.
+	//   2. After a graceful drain triggered by an observed stop
+	//      flag, so a CLI `sluice sync stop --wait` polling for
+	//      completion sees the cleared flag and returns success.
+	//
+	// Idempotent and tolerant of a missing row (returns nil).
 	//
 	// Why clear at startup rather than on consumption: the polling
 	// goroutine doesn't share a transaction with the applier's data
 	// writes, so a clear-on-read could lose the signal if the data
 	// write rolls back after seeing the flag. Clearing at startup
-	// keeps the streamer's lifecycle as the flag's lifecycle.
+	// keeps the streamer's lifecycle as the flag's lifecycle. The
+	// post-drain clear is a separate concern — it signals "drain
+	// completed cleanly", not "flag consumed", and runs only after
+	// the apply loop has fully returned.
 	ClearStopRequested(ctx context.Context, streamID string) error
 }
 

@@ -55,6 +55,7 @@ package pipeline
 import (
 	"context"
 	"log/slog"
+	"sync/atomic"
 	"time"
 )
 
@@ -116,7 +117,14 @@ var drainTimeoutForTest = stopDrainTimeout
 // reader is typed as stopFlagReader — the optional interface the
 // engine appliers satisfy. Callers that pass a non-conforming
 // applier should skip calling pollStopSignal entirely.
-func pollStopSignal(pollCtx context.Context, reader stopFlagReader, streamID string, cancelStream, cancelApply context.CancelFunc) {
+//
+// observed is set to true the moment the poll first sees the stop
+// flag, before cancelStream fires. The Streamer reads it after
+// dispatchApply returns to decide whether the exit was triggered by
+// a stop-signal request (vs Ctrl-C / context cancel from outside);
+// when true, the streamer clears stop_requested_at so a CLI
+// `sync stop --wait` can detect graceful-drain completion.
+func pollStopSignal(pollCtx context.Context, reader stopFlagReader, streamID string, cancelStream, cancelApply context.CancelFunc, observed *atomic.Bool) {
 	t := time.NewTicker(pollIntervalForTest)
 	defer t.Stop()
 
@@ -146,6 +154,9 @@ func pollStopSignal(pollCtx context.Context, reader stopFlagReader, streamID str
 			continue
 		}
 		if stopRequested {
+			if observed != nil {
+				observed.Store(true)
+			}
 			slog.InfoContext(pollCtx, "stop requested via control table; draining stream and exiting",
 				slog.String("stream_id", streamID),
 			)

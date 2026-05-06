@@ -396,12 +396,30 @@ func (s *SyncStatusCmd) Run(_ *Globals) error {
 // needing PID files or cross-process signal delivery. See
 // internal/pipeline/stop_signal.go for the full design rationale.
 type SyncStopCmd struct {
-	TargetDriver string `help:"Target engine name (e.g. mysql, postgres). See 'sluice engines'." required:"" placeholder:"NAME" group:"target"`
-	Target       string `help:"Target database DSN." required:"" env:"SLUICE_TARGET" placeholder:"DSN" group:"target"`
-	StreamID     string `help:"Stream identifier to stop." required:"" placeholder:"ID"`
+	TargetDriver string        `help:"Target engine name (e.g. mysql, postgres). See 'sluice engines'." required:"" placeholder:"NAME" group:"target"`
+	Target       string        `help:"Target database DSN." required:"" env:"SLUICE_TARGET" placeholder:"DSN" group:"target"`
+	StreamID     string        `help:"Stream identifier to stop." required:"" placeholder:"ID"`
+	Wait         bool          `help:"Block until the running streamer drains and clears its stop signal. Use to coordinate ALTER windows or scripted teardowns." short:"w"`
+	Timeout      time.Duration `help:"Maximum wait when --wait is set. On timeout the CLI exits non-zero; the stop request remains in place and the streamer will eventually drain." default:"5m"`
 }
 
 // Run implements `sluice sync stop`.
+//
+// Without --wait this is a fire-and-forget shape: the CLI writes
+// stop_requested_at to the per-target control table and exits. The
+// running streamer's polling loop observes the flag (5s tick by
+// default) and drains gracefully on a timeline operators can read
+// from `sluice sync status`.
+//
+// With --wait the CLI additionally polls ReadStopRequested until the
+// flag clears (the streamer clears it at the end of a graceful drain
+// — see ir.ChangeApplier.ClearStopRequested). Useful for ALTER
+// coordination: `sync stop --wait && alter-source.sh && sync start`
+// runs the ALTER only after the streamer has confirmed it drained.
+// On --timeout the CLI exits non-zero and surfaces a clear message;
+// the stop request itself stays written so the streamer continues
+// draining in the background. Re-running `sync stop --wait` will
+// keep watching the same flag.
 func (s *SyncStopCmd) Run(_ *Globals) error {
 	target, err := resolveEngine(s.TargetDriver)
 	if err != nil {
@@ -429,8 +447,68 @@ func (s *SyncStopCmd) Run(_ *Globals) error {
 		}
 		return fmt.Errorf("request stop: %w", err)
 	}
-	fmt.Fprintf(os.Stdout, "stop requested for stream %q on target; running process will drain and exit\n", s.StreamID)
-	return nil
+	if !s.Wait {
+		fmt.Fprintf(os.Stdout, "stop requested for stream %q on target; running process will drain and exit\n", s.StreamID)
+		return nil
+	}
+	fmt.Fprintf(os.Stdout, "stop requested for stream %q on target; waiting for graceful drain (timeout %s)...\n", s.StreamID, s.Timeout)
+	return waitForStopComplete(ctx, applier, s.StreamID, s.Timeout)
+}
+
+// stopFlagReader is the interface waitForStopComplete needs from the
+// applier. Mirrors the unexported pipeline.stopFlagReader; declared
+// here independently so cmd/sluice doesn't import internal/pipeline
+// just for one method shape.
+type stopFlagReader interface {
+	ReadStopRequested(ctx context.Context, streamID string) (bool, error)
+}
+
+// stopWaitPollInterval is the cadence at which `sync stop --wait`
+// polls for flag clearance. 1s is responsive without hammering the
+// target; the streamer-side poll is the rate-limiting factor (5s
+// default for graceful-drain trigger), so faster polling on this
+// side gives no real win.
+const stopWaitPollInterval = 1 * time.Second
+
+// waitForStopComplete polls the control row until ReadStopRequested
+// returns false (the streamer cleared the flag on graceful exit) or
+// the timeout fires. Returns nil on success, an exitCode-2 error on
+// timeout, and the underlying error on read failure.
+func waitForStopComplete(ctx context.Context, applier ir.ChangeApplier, streamID string, timeout time.Duration) error {
+	reader, ok := applier.(stopFlagReader)
+	if !ok {
+		// The applier's RequestStop succeeded (it implements that
+		// part of the interface) but we can't poll. Fall back to
+		// the fire-and-forget shape with a clear message.
+		fmt.Fprintf(os.Stdout, "applier does not support polling for drain completion; stop signal sent — check `sluice sync status` to verify drain\n")
+		return nil
+	}
+
+	deadline := time.Now().Add(timeout)
+	t := time.NewTicker(stopWaitPollInterval)
+	defer t.Stop()
+
+	for {
+		stopRequested, err := reader.ReadStopRequested(ctx, streamID)
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return fmt.Errorf("poll stop signal: %w", err)
+		}
+		if !stopRequested {
+			fmt.Fprintf(os.Stdout, "stream %q drained and exited cleanly\n", streamID)
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("stream %q did not complete drain within %s; the stop request remains in place and the streamer will continue draining — check `sluice sync status` to investigate", streamID, timeout)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-t.C:
+		}
+	}
 }
 
 // isStreamNotFoundErr returns true when err wraps an engine's stream-

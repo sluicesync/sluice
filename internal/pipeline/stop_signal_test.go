@@ -74,7 +74,7 @@ func TestPollStopSignal_CancelsStreamOnFlag(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		pollStopSignal(pollCtx, reader, "stream-1", cancelStream, cancelApply)
+		pollStopSignal(pollCtx, reader, "stream-1", cancelStream, cancelApply, nil)
 		close(done)
 	}()
 
@@ -105,6 +105,49 @@ func TestPollStopSignal_CancelsStreamOnFlag(t *testing.T) {
 	}
 }
 
+// TestPollStopSignal_SetsObservedOnFlag verifies the v0.9.0 hook for
+// `sync stop --wait`: the optional observed *atomic.Bool is set the
+// moment pollStopSignal first sees the flag, before cancelStream
+// fires. Streamer.Run reads it after dispatchApply returns to decide
+// whether to clear stop_requested_at — only stop-signal-driven
+// graceful drains clear, not Ctrl-C / outer-ctx cancels.
+func TestPollStopSignal_SetsObservedOnFlag(t *testing.T) {
+	withFastPollInterval(t)
+	withFastDrainTimeout(t, 10*time.Second)
+
+	reader := &fakeStopFlagReader{}
+	pollCtx, cancelPoll := context.WithCancel(context.Background())
+	defer cancelPoll()
+
+	var observed atomic.Bool
+	var streamCancelled atomic.Bool
+	cancelStream := func() { streamCancelled.Store(true) }
+	cancelApply := func() {}
+
+	done := make(chan struct{})
+	go func() {
+		pollStopSignal(pollCtx, reader, "stream-1", cancelStream, cancelApply, &observed)
+		close(done)
+	}()
+
+	if observed.Load() {
+		t.Fatal("observed set before flag was raised")
+	}
+	reader.setStopRequested(true)
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("poll loop did not return after stop flag was observed")
+	}
+	if !observed.Load() {
+		t.Error("observed was not set when stop flag was observed")
+	}
+	if !streamCancelled.Load() {
+		t.Error("cancelStream did not fire after stop flag was observed")
+	}
+}
+
 // TestPollStopSignal_HardCancelsApplyOnDrainTimeout verifies the
 // graceful-drain watchdog: when pollCtx (= applyCtx) doesn't cancel
 // within drainTimeoutForTest, cancelApply fires as the fallback.
@@ -124,7 +167,7 @@ func TestPollStopSignal_HardCancelsApplyOnDrainTimeout(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		pollStopSignal(pollCtx, reader, "stream-1", cancelStream, cancelApply)
+		pollStopSignal(pollCtx, reader, "stream-1", cancelStream, cancelApply, nil)
 		close(done)
 	}()
 
@@ -174,7 +217,7 @@ func TestPollStopSignal_WatchdogExitsCleanlyOnApplyDone(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		pollStopSignal(pollCtx, reader, "stream-1", cancelStream, cancelApply)
+		pollStopSignal(pollCtx, reader, "stream-1", cancelStream, cancelApply, nil)
 		close(done)
 	}()
 
@@ -215,7 +258,7 @@ func TestPollStopSignal_ExitsOnPollCtxCancel(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		pollStopSignal(pollCtx, reader, "stream-1", cancelStream, cancelApply)
+		pollStopSignal(pollCtx, reader, "stream-1", cancelStream, cancelApply, nil)
 		close(done)
 	}()
 
@@ -255,7 +298,7 @@ func TestPollStopSignal_TolerantOfTransientErrors(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		pollStopSignal(pollCtx, reader, "stream-1", cancelStream, cancelApply)
+		pollStopSignal(pollCtx, reader, "stream-1", cancelStream, cancelApply, nil)
 		close(done)
 	}()
 
