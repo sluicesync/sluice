@@ -211,14 +211,50 @@ func decodeMySQLGeometry(raw any) (any, error) {
 	return b[4:], nil
 }
 
-// decodeTime accepts a time.Time directly (when the driver was opened
-// with parseTime=true, which we always set). Strings and bytes are
-// rejected — that would mean the driver is misconfigured.
+// decodeTime converts MySQL temporal values into time.Time.
+//
+// The schema-cache pool's DSN sets `parseTime=true` so SELECT results
+// arrive as time.Time directly — that's the cold-start bulk-copy
+// path. The binlog reader's RowsEvent decoder, however, hands back
+// the raw string form ("YYYY-MM-DD HH:MM:SS[.ffffff]" / "YYYY-MM-DD")
+// regardless of the SQL DSN setting, because the binlog protocol is
+// independent of the driver's row-scan flow. Bug 12 surfaced as a
+// silent CDC stall when this branch couldn't decode strings — pump
+// errored on the first INSERT carrying a TIMESTAMP/DATETIME column,
+// returned, defer close(out) closed the channel, and the applier
+// drained zero events.
+//
+// The 0000-00-00 zero-value (not the same as NULL — MySQL emits it
+// when strict mode is off and a date is omitted) maps to the Go
+// time.Time zero value so it round-trips cleanly to PG's NULL
+// (TIMESTAMPTZ rejects '0000-00-00'). Operators with strict mode on
+// won't see this case.
 func decodeTime(raw any) (any, error) {
 	if v, ok := raw.(time.Time); ok {
 		return v, nil
 	}
-	return nil, fmt.Errorf("mysql: cannot decode %T as time.Time (parseTime=true should be set)", raw)
+	var s string
+	switch v := raw.(type) {
+	case string:
+		s = v
+	case []byte:
+		s = string(v)
+	default:
+		return nil, fmt.Errorf("mysql: cannot decode %T as time.Time", raw)
+	}
+	if s == "0000-00-00 00:00:00" || s == "0000-00-00" || s == "" {
+		return time.Time{}, nil
+	}
+	for _, layout := range []string{
+		"2006-01-02 15:04:05.999999",
+		"2006-01-02 15:04:05",
+		"2006-01-02",
+	} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t, nil
+		}
+	}
+	return nil, fmt.Errorf("mysql: cannot parse %q as MySQL temporal value", s)
 }
 
 // decodeSet converts a MySQL SET value's textual representation into

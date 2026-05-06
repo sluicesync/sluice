@@ -218,9 +218,10 @@ func (r *CDCReader) StreamChanges(ctx context.Context, from ir.Position) (<-chan
 		// replica-net-timeout, so a stalled connection now surfaces
 		// as a clean read error rather than a silent hang.
 		HeartbeatPeriod: defaultBinlogHeartbeatPeriod,
-		// The default ParseTime=false returns timestamps as a
-		// replication.Time string; we'd rather decode lazily ourselves
-		// inside decodeValue, so leave ParseTime alone.
+		// The default ParseTime=false returns timestamps as their
+		// raw string form; decodeTime in value_decode.go parses
+		// MySQL temporal strings into time.Time at row-decode time
+		// (Bug 12, ADR follow-up).
 	}
 	r.syncer = replication.NewBinlogSyncer(syncerCfg)
 

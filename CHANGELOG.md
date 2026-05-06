@@ -8,6 +8,36 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Bug 12 — MySQL CDC silently dropped events with TIMESTAMP /
+  DATETIME / DATE columns.** The decoder for binlog row events
+  (`decodeTime` in `internal/engines/mysql/value_decode.go`) only
+  accepted `time.Time` directly — but the binlog protocol hands
+  temporal values back as their raw string form ("YYYY-MM-DD
+  HH:MM:SS[.ffffff]" / "YYYY-MM-DD") regardless of the schema-cache
+  DSN's `parseTime=true` setting. The first row event on any table
+  with a temporal column raised `cannot decode string as time.Time
+  (parseTime=true should be set)`; the binlog pump exited with that
+  error stored on the reader (only surfaced via `Err()`, not logged),
+  the change channel closed, and the applier saw zero events.
+  Symptom: cold-start bulk-copy completed cleanly, then CDC mode
+  produced no further inserts on the destination — looked exactly
+  like a network/heartbeat issue, which sent the original Bug 12
+  hypothesis chasing port-forwarding ghosts.
+
+  Fix: `decodeTime` now parses MySQL's canonical temporal string
+  formats — second-precision, microsecond-precision, date-only —
+  plus byte-slice equivalents and the `0000-00-00` zero-value (maps
+  to `time.Time{}` for clean cross-engine round-trip). Regression
+  guard: `TestDecodeTimeFromString` covers all five shapes; the
+  pre-existing `TestDecodeValueErrors/timestamp_from_string` case
+  was inverted to test the unparseable-string error path instead
+  (parseable strings now succeed).
+
+  Empirical confirmation against `bug12_repro_dev.sh` (local mysql:8.0
+  containers, table with `t TIMESTAMP DEFAULT CURRENT_TIMESTAMP`):
+  pre-fix dropped 100% of CDC events on tables with a temporal
+  column; post-fix all events flow.
+
 - **Bug 15 CLI sync-stop drain (data loss in warm-up window,
   ADR-0025).** The v0.5.0 slot-ack-after-apply work (ADR-0020)
   closed the post-restart wedge but left a residual data-loss path

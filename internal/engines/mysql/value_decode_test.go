@@ -125,13 +125,76 @@ func TestDecodeValueErrors(t *testing.T) {
 	}{
 		{"bool from float64", float64(1), ir.Boolean{}},
 		{"int from string", "42", ir.Integer{Width: 32}},
-		{"timestamp from string", "2026-05-01", ir.Timestamp{}},
+		// Note: TIMESTAMP/DATETIME from string is now SUPPORTED — the
+		// binlog reader hands back string-form temporals regardless of
+		// the schema-cache DSN's parseTime setting (Bug 12).
+		// TestDecodeTimeFromString covers the success path.
+		{"timestamp from unparseable string", "definitely-not-a-date", ir.Timestamp{}},
 	}
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
 			if _, err := decodeValue(c.raw, c.t); err == nil {
 				t.Errorf("decodeValue(%#v, %T) returned no error; expected one", c.raw, c.t)
+			}
+		})
+	}
+}
+
+// TestDecodeTimeFromString is the regression guard for Bug 12: the
+// binlog reader hands timestamp values back as strings, so decodeTime
+// must parse the canonical MySQL temporal forms rather than only
+// accepting time.Time directly.
+func TestDecodeTimeFromString(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  any
+		want time.Time
+	}{
+		{
+			"timestamp string with second precision",
+			"2026-05-05 17:20:13",
+			time.Date(2026, 5, 5, 17, 20, 13, 0, time.UTC),
+		},
+		{
+			"timestamp string with microsecond precision",
+			"2026-05-05 17:20:13.123456",
+			time.Date(2026, 5, 5, 17, 20, 13, 123456000, time.UTC),
+		},
+		{
+			"timestamp bytes (driver may return either)",
+			[]byte("2026-05-05 17:20:13"),
+			time.Date(2026, 5, 5, 17, 20, 13, 0, time.UTC),
+		},
+		{
+			"date string",
+			"2026-05-05",
+			time.Date(2026, 5, 5, 0, 0, 0, 0, time.UTC),
+		},
+		{
+			"all-zero datetime maps to zero time",
+			"0000-00-00 00:00:00",
+			time.Time{},
+		},
+		{
+			"empty string maps to zero time",
+			"",
+			time.Time{},
+		},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			got, err := decodeValue(c.raw, ir.Timestamp{})
+			if err != nil {
+				t.Fatalf("decodeValue: %v", err)
+			}
+			gotTime, ok := got.(time.Time)
+			if !ok {
+				t.Fatalf("decodeValue returned %T; want time.Time", got)
+			}
+			if !gotTime.Equal(c.want) {
+				t.Errorf("decodeValue = %v; want %v", gotTime, c.want)
 			}
 		})
 	}
