@@ -298,3 +298,119 @@ func TestChangeAllowedStripsSchemaPrefix(t *testing.T) {
 		})
 	}
 }
+
+// fakeExcluder is a minimal ir.Engine + ir.DefaultTableExcluder
+// implementation used by the engine-default-merge tests below. The
+// embedded stubEngine satisfies ir.Engine via no-op implementations
+// of every method; DefaultExcludePatterns is the only behaviour the
+// merge logic cares about.
+type fakeExcluder struct {
+	stubEngine
+	patterns []string
+}
+
+func (f fakeExcluder) DefaultExcludePatterns() []string { return f.patterns }
+
+// TestEffectiveTableFilter_MergesEngineDefaults covers the Bug 22
+// auto-exclude logic for PlanetScale's `_vt_*` Vitess shadow tables
+// (and any future engine that opts into [ir.DefaultTableExcluder]).
+//
+// The merge is gated three ways: (a) engine must implement the
+// interface; (b) operator must not have supplied --include-table;
+// (c) duplicate patterns are deduplicated by string equality.
+func TestEffectiveTableFilter_MergesEngineDefaults(t *testing.T) {
+	engine := fakeExcluder{patterns: []string{"_vt_*"}}
+
+	cases := []struct {
+		name        string
+		in          TableFilter
+		wantExclude []string
+		wantAdded   []string
+	}{
+		{
+			"empty filter gets engine defaults appended",
+			TableFilter{},
+			[]string{"_vt_*"},
+			[]string{"_vt_*"},
+		},
+		{
+			"operator exclude is preserved and engine defaults appended",
+			TableFilter{Exclude: []string{"audit_*"}},
+			[]string{"audit_*", "_vt_*"},
+			[]string{"_vt_*"},
+		},
+		{
+			"operator include short-circuits the merge",
+			TableFilter{Include: []string{"users"}},
+			nil, // unchanged: Include preserved, Exclude stays empty
+			nil,
+		},
+		{
+			"engine pattern already in operator exclude is deduplicated",
+			TableFilter{Exclude: []string{"_vt_*", "audit_*"}},
+			[]string{"_vt_*", "audit_*"},
+			nil, // nothing added — operator already had it
+		},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			got, added := effectiveTableFilter(c.in, engine)
+			if !equalSlices(added, c.wantAdded) {
+				t.Errorf("added = %v; want %v", added, c.wantAdded)
+			}
+			if c.in.Include != nil {
+				if !equalSlices(got.Include, c.in.Include) {
+					t.Errorf("Include = %v; want %v (preserved)", got.Include, c.in.Include)
+				}
+			}
+			if !equalSlices(got.Exclude, c.wantExclude) {
+				t.Errorf("Exclude = %v; want %v", got.Exclude, c.wantExclude)
+			}
+		})
+	}
+}
+
+// TestEffectiveTableFilter_NonExcluderEngine asserts that an engine
+// not implementing [ir.DefaultTableExcluder] short-circuits cleanly.
+// Vanilla MySQL (which has no `_vt_*` reserved prefix) goes through
+// this path.
+func TestEffectiveTableFilter_NonExcluderEngine(t *testing.T) {
+	in := TableFilter{Exclude: []string{"audit_*"}}
+	got, added := effectiveTableFilter(in, stubEngine{})
+	if added != nil {
+		t.Errorf("added = %v; want nil (engine doesn't implement the interface)", added)
+	}
+	if !equalSlices(got.Exclude, in.Exclude) {
+		t.Errorf("Exclude = %v; want %v (unchanged)", got.Exclude, in.Exclude)
+	}
+}
+
+// TestEffectiveTableFilter_EmptyDefaults covers an engine that
+// implements DefaultTableExcluder but returns no patterns (e.g.
+// vanilla MySQL once the shared mysql.Engine grows the method).
+// Equivalent to no opt-in.
+func TestEffectiveTableFilter_EmptyDefaults(t *testing.T) {
+	in := TableFilter{Exclude: []string{"audit_*"}}
+	got, added := effectiveTableFilter(in, fakeExcluder{patterns: nil})
+	if added != nil {
+		t.Errorf("added = %v; want nil (no defaults declared)", added)
+	}
+	if !equalSlices(got.Exclude, in.Exclude) {
+		t.Errorf("Exclude = %v; want %v (unchanged)", got.Exclude, in.Exclude)
+	}
+}
+
+// equalSlices is a string-slice equality helper used by the merge
+// tests; nil and []string{} are treated as equal.
+func equalSlices(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}

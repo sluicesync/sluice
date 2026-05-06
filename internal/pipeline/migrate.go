@@ -202,6 +202,19 @@ func (m *Migrator) Run(ctx context.Context) error {
 		return err
 	}
 
+	// Engine-default exclusions (Bug 22): merge in any patterns the
+	// source engine surfaces via [ir.DefaultTableExcluder] — today
+	// PlanetScale's `_vt_*` Vitess shadow tables. Operator-supplied
+	// --include-table short-circuits the merge. Replace the field
+	// in-place because the orchestrator is single-shot per Run.
+	if eff, added := effectiveTableFilter(m.Filter, m.Source); len(added) > 0 {
+		slog.InfoContext(ctx, "applying engine-default table exclusions",
+			slog.String("engine", m.Source.Name()),
+			slog.Any("patterns", added),
+		)
+		m.Filter = eff
+	}
+
 	// ---- 1. Open and read source schema ----
 	sr, err := m.Source.OpenSchemaReader(ctx, m.SourceDSN)
 	if err != nil {

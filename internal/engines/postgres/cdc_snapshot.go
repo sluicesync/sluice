@@ -156,17 +156,30 @@ func (e Engine) OpenSnapshotStream(ctx context.Context, dsn string) (*ir.Snapsho
 		Rows:     rowReader,
 		Changes:  cdcReader,
 	}
-	stream.CloseFn = func() error {
-		// Order matters: stop CDC first (releases its own repl conn),
-		// then commit the snapshot tx, then close the pinned SQL conn,
-		// then close the slot-creation replication conn, then close
-		// the schema DB pool.
-		var firstErr error
-		if c, ok := cdcReader.(closer); ok {
-			if err := c.Close(); err != nil && firstErr == nil {
-				firstErr = err
-			}
+
+	// rowsReleased is the idempotency guard for ReleaseRowsFn /
+	// CloseFn. Once the snapshot tx is committed and the import-side
+	// connections are closed, both must be skipped on the second
+	// caller (e.g. ReleaseRows then Close, or Close-only without
+	// ReleaseRows). Captured by closure; no surrounding mutex
+	// because the orchestrator never calls these concurrently —
+	// bulk-copy is single-goroutine for the snapshot tx, and the
+	// streamer's defer chain serialises Close with everything else.
+	rowsReleased := false
+	releaseRows := func() error {
+		if rowsReleased {
+			return nil
 		}
+		rowsReleased = true
+		// Commit (don't ROLLBACK) so the snapshot tx exits cleanly —
+		// nothing was written, but COMMIT is the project convention
+		// and matches what CloseFn used to do. Order: commit the
+		// snapshot tx → close the pinned SQL conn → close the
+		// slot-creation replication conn (the slot itself stays
+		// alive on the server; the replication-protocol conn used
+		// to create it is no longer needed once all importers have
+		// imported).
+		var firstErr error
 		if _, err := conn.ExecContext(context.Background(), "COMMIT"); err != nil && firstErr == nil {
 			firstErr = err
 		}
@@ -174,6 +187,22 @@ func (e Engine) OpenSnapshotStream(ctx context.Context, dsn string) (*ir.Snapsho
 			firstErr = err
 		}
 		if err := replConn.Close(context.Background()); err != nil && firstErr == nil {
+			firstErr = err
+		}
+		return firstErr
+	}
+	stream.ReleaseRowsFn = releaseRows
+	stream.CloseFn = func() error {
+		// Order matters: stop CDC first (releases its own repl conn),
+		// then release the import-side resources if not already
+		// released, then close the schema DB pool.
+		var firstErr error
+		if c, ok := cdcReader.(closer); ok {
+			if err := c.Close(); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
+		if err := releaseRows(); err != nil && firstErr == nil {
 			firstErr = err
 		}
 		if err := db.Close(); err != nil && firstErr == nil {

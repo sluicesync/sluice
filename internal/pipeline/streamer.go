@@ -198,6 +198,19 @@ func (s *Streamer) Run(ctx context.Context) error {
 	if err := s.validate(); err != nil {
 		return err
 	}
+
+	// Engine-default exclusions (Bug 22): merge in any patterns the
+	// source engine surfaces via [ir.DefaultTableExcluder] — today
+	// PlanetScale's `_vt_*` Vitess shadow tables. Replaced in-place;
+	// Streamer is single-shot per Run.
+	if eff, added := effectiveTableFilter(s.Filter, s.Source); len(added) > 0 {
+		slog.InfoContext(ctx, "applying engine-default table exclusions",
+			slog.String("engine", s.Source.Name()),
+			slog.Any("patterns", added),
+		)
+		s.Filter = eff
+	}
+
 	streamID := s.resolveStreamID()
 	slog.InfoContext(ctx, "stream starting", slog.String("stream_id", streamID))
 
@@ -661,6 +674,18 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 	}
 	closeIf(rw)
 	closeIf(sw)
+	// Release the snapshot transaction and import-side connections
+	// now that bulk-copy is done — without this, Postgres holds the
+	// snapshot tx as `idle in transaction` for the entire CDC
+	// lifetime (Bug 21), keeping AccessShareLock on every snapshotted
+	// table and blocking ALTER on the source. The slot's logical
+	// position is independent of the exporting tx; CDC continues on
+	// its own connection.
+	if err := stream.ReleaseRows(); err != nil {
+		slog.WarnContext(ctx, "release snapshot rows failed; CDC will continue but the snapshot tx may stay open",
+			slog.String("error", err.Error()),
+		)
+	}
 	slog.InfoContext(ctx, "bulk-copy complete; entering CDC mode")
 
 	if lsnTracker != nil {

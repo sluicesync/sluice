@@ -231,6 +231,36 @@ func (Engine) OpenChangeApplier(ctx context.Context, dsn string) (ir.ChangeAppli
 	}, nil
 }
 
+// DefaultExcludePatterns returns flavor-specific table patterns the
+// orchestrator should merge into the operator's exclude list (only
+// when the operator hasn't supplied --include-table). Implements
+// [ir.DefaultTableExcluder].
+//
+// PlanetScale: Vitess maintains internal lifecycle "shadow tables" —
+// `_vt_HOLD_<uuid>_<ts>` (legacy naming) and `_vt_hld_<uuid>_<ts>_`
+// / `_vt_prg_*` / `_vt_evc_*` / `_vt_drp_*` (post-PR-14613 naming
+// with a trailing underscore for FK-suffix headroom) — that aren't
+// user data. Including them in publication / bulk-copy generates
+// quiet write churn against the target with no operator-visible
+// signal. The `_vt_` prefix is the Vitess-reserved namespace; we
+// match it as a single glob to cover both legacy and new naming.
+//
+// Operators that need to inspect or migrate `_vt_*` tables (rare —
+// usually a debugging exercise) can override by passing
+// `--include-table` explicitly, which short-circuits the default.
+//
+// Vanilla MySQL returns no defaults — `_vt_*` is Vitess-specific and
+// upstream MySQL has no equivalent reserved namespace. (Vanilla
+// MySQL operators connecting to a Vitess-backed server can still
+// pass `--exclude-table='_vt_*'` manually; auto-detect of the
+// underlying server flavor is out of scope for v0.8.0.)
+func (e Engine) DefaultExcludePatterns() []string {
+	if e.Flavor == FlavorPlanetScale {
+		return []string{"_vt_*"}
+	}
+	return nil
+}
+
 // init registers each supported flavor under its own name in the
 // engines registry. Adding a new flavor is a one-line addition here
 // plus the corresponding entry in flavor.go.

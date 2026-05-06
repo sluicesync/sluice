@@ -8,7 +8,7 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [0.8.0] - 2026-05-06
 
-Schema-diff release plus five real-world bug fixes from v0.7.0 testing. Headline addition is `sluice schema diff` (ADR-0029): drift detection between sluice's expected target shape and the schema actually present, with text + JSON output, copy-paste-ready ALTER suggestions, and CI-friendly exit codes. The diff round picked up cross-engine type retargeting plus default / generated-expression / CHECK comparison along the way. The five bug fixes — including Bug 19's silent TIMESTAMP corruption on non-UTC hosts and Bug 20's cross-engine resume dispatch — closed the remaining real-world gaps the v0.7.0 stretch testing surfaced.
+Schema-diff release plus seven real-world bug fixes from v0.7.0 testing. Headline addition is `sluice schema diff` (ADR-0029): drift detection between sluice's expected target shape and the schema actually present, with text + JSON output, copy-paste-ready ALTER suggestions, and CI-friendly exit codes. The diff round picked up cross-engine type retargeting plus default / generated-expression / CHECK comparison along the way. Seven bug fixes — including Bug 19's silent TIMESTAMP corruption on non-UTC hosts, Bug 20's cross-engine resume dispatch, Bug 21's `idle in transaction` snapshot tx blocking source ALTERs, and Bug 22's auto-exclusion of Vitess `_vt_*` shadow tables — closed the remaining real-world gaps the v0.7.0 stretch testing surfaced.
 
 ### Added
 
@@ -195,6 +195,69 @@ Schema-diff release plus five real-world bug fixes from v0.7.0 testing. Headline
   inserts a TIMESTAMP, and asserts the value comes back as the
   same UTC instant from both the cold-start `RowReader` and the
   CDC stream's update event.
+
+- **Bug 21 — PG snapshot transaction held source-table locks for the
+  entire CDC lifetime, blocking ALTER on the source.** The PG cold-
+  start path opens a snapshot transaction (`SET TRANSACTION SNAPSHOT
+  '<name>'`) on a pinned SQL connection so bulk-copy reads see a
+  consistent view. Pre-fix, that transaction stayed open as `idle in
+  transaction` for as long as the SnapshotStream was alive — i.e.
+  for the entire CDC streaming phase, which on a long-running sync
+  is hours or days. Every snapshotted table held an
+  `AccessShareLock`, blocking any concurrent `ALTER TABLE` on the
+  source. Real-world report: a 310-second `idle in transaction` queue,
+  ALTER waiting behind it, both unblocked the moment sluice exited.
+
+  Fix splits the SnapshotStream cleanup into two phases via a new
+  `ir.SnapshotStream.ReleaseRowsFn` (and the corresponding
+  `ReleaseRows()` method): the streamer calls `ReleaseRows` after
+  bulk-copy completes, which COMMITs the snapshot transaction and
+  closes the import-side connections (the pinned SQL conn + the
+  slot-creation replication conn) without disturbing the CDC reader.
+  The CDC reader runs on its own connection, and the slot's logical
+  position is independent of the exporting transaction, so CDC
+  continues seamlessly. `Close()` remains the catch-all cleanup and
+  is idempotent with `ReleaseRows` — calling both is safe; calling
+  only `Close()` still works (it invokes the release path internally
+  if not already done). MySQL implementations don't need this surface
+  (per-session snapshot, no shared exporter), and the field is
+  optional. Regression guard:
+  `TestSnapshotStream_ReleaseRowsClosesSnapshotTx` (integration
+  tag) asserts `pg_stat_activity` shows zero `idle in transaction`
+  sessions after release, that an ALTER TABLE on the source
+  succeeds without blocking, and that CDC continues delivering
+  events post-release.
+
+- **Bug 22 — Vitess `_vt_*` shadow tables included by default.**
+  Vitess maintains internal lifecycle tables (`_vt_HOLD_*`,
+  `_vt_PURGE_*`, `_vt_EVAC_*`, `_vt_DROP_*` in legacy naming;
+  `_vt_hld_*` / `_vt_prg_*` / `_vt_evc_*` / `_vt_drp_*` plus a
+  trailing underscore in the post-PR-14613 scheme) that aren't user
+  data and shouldn't appear in publication or bulk-copy. v0.7.0
+  silently included them, generating quiet write churn against the
+  target with no operator-visible signal. Workaround was a manual
+  `--exclude-table='_vt_*'`.
+
+  Fix: new optional `ir.DefaultTableExcluder` engine surface lets
+  engines declare baseline exclusion patterns; the orchestrator
+  merges them into the operator's filter at the start of `Migrator`
+  / `Streamer` `Run`. The PlanetScale flavor opts in with the
+  `_vt_*` pattern (covers both legacy and post-PR-14613 naming).
+  Operator-supplied `--include-table` short-circuits the merge —
+  if the operator explicitly opts into a precise table list, engine
+  defaults don't override it. Vanilla MySQL returns no defaults
+  (`_vt_*` is a Vitess namespace, not an upstream MySQL one;
+  vanilla MySQL operators on Vitess-backed servers can still
+  pass `--exclude-table='_vt_*'` manually — auto-detect of the
+  underlying server flavor is out of scope for v0.8.0). The merged
+  exclusions are surfaced via a structured INFO log at
+  orchestrator startup so operators see what's being filtered.
+  Regression guards:
+  `TestEffectiveTableFilter_MergesEngineDefaults` (covers all four
+  merge paths: empty, exclude-mode, include-mode short-circuit,
+  duplicate-pattern dedup) and
+  `TestDefaultExcludePatterns_PlanetScale` (pins the flavor's
+  declared default).
 
 - **Bug 20 — cross-engine warm-resume dispatch on the wrong driver.**
   `sluice sync start --resume` failed on

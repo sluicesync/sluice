@@ -103,3 +103,16 @@ func TestVanillaPlanetScaleDifference(t *testing.T) {
 		t.Error("vanilla and planetscale BulkLoad are equal; one of them is wrong")
 	}
 }
+
+// TestDefaultExcludePatterns_PlanetScale pins the Bug 22 fix: the
+// PlanetScale flavor opts into auto-excluding `_vt_*` Vitess shadow
+// tables; vanilla MySQL does not. Vanilla operators on Vitess-backed
+// servers can still pass --exclude-table='_vt_*' manually.
+func TestDefaultExcludePatterns_PlanetScale(t *testing.T) {
+	if pats := (Engine{Flavor: FlavorPlanetScale}).DefaultExcludePatterns(); len(pats) != 1 || pats[0] != "_vt_*" {
+		t.Errorf("planetscale DefaultExcludePatterns = %v; want [_vt_*]", pats)
+	}
+	if pats := (Engine{Flavor: FlavorVanilla}).DefaultExcludePatterns(); len(pats) != 0 {
+		t.Errorf("vanilla DefaultExcludePatterns = %v; want empty", pats)
+	}
+}

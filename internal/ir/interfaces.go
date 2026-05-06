@@ -900,3 +900,25 @@ type Engine interface {
 	// ErrNotImplemented.
 	OpenSnapshotStream(ctx context.Context, dsn string) (*SnapshotStream, error)
 }
+
+// DefaultTableExcluder is the optional engine surface for "tables
+// the operator almost never wants to migrate against this engine".
+// Implementing engines return a list of [path.Match]-style patterns
+// that the orchestrator merges into the operator's
+// [pipeline.TableFilter.Exclude] when the operator is in
+// exclude-or-no-filter mode. Operator-supplied
+// [pipeline.TableFilter.Include] short-circuits the merge — if the
+// operator explicitly opts in to a table list, the engine doesn't
+// override it.
+//
+// Used today for PlanetScale's Vitess table-lifecycle shadow tables
+// (`_vt_*` — the tablet-internal HOLD/PURGE/EVAC/DROP staging
+// tables); operators almost never want sluice to copy or stream
+// those, and the symptom of accidentally including them is a quiet
+// flood of internal-state churn that bears no relation to user data.
+type DefaultTableExcluder interface {
+	// DefaultExcludePatterns returns a list of glob patterns to
+	// merge into the operator's exclude list. Empty / nil disables
+	// the default; equivalent to not implementing the interface.
+	DefaultExcludePatterns() []string
+}

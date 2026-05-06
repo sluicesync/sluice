@@ -102,6 +102,62 @@ func (f TableFilter) Allows(tableName string) bool {
 	return true
 }
 
+// effectiveTableFilter merges engine-supplied default exclusion
+// patterns into the operator's filter when the engine implements
+// [ir.DefaultTableExcluder]. Used today for PlanetScale's `_vt_*`
+// Vitess shadow-table prefix (Bug 22) — operators almost never want
+// those in a migration or stream, and forgetting to exclude them
+// generates quiet write churn against the target.
+//
+// Merge rules:
+//
+//   - Operator supplied --include-table: defaults are skipped
+//     (include-mode is an explicit allow-list; the operator opted
+//     into a precise table set and engine defaults shouldn't undermine
+//     that). If the operator wants `_vt_*` tables, --include-table is
+//     the override.
+//   - Operator supplied --exclude-table or no filter: defaults are
+//     appended to Exclude. Patterns the operator already specified
+//     are deduplicated by string equality.
+//   - Engine doesn't implement [ir.DefaultTableExcluder]: filter
+//     returned unchanged.
+//
+// Returns the merged filter and the slice of patterns that came from
+// engine defaults (for the "applying engine default exclusions" log
+// line, distinct from the "operator filter applied" line).
+func effectiveTableFilter(filter TableFilter, source ir.Engine) (effective TableFilter, addedDefaults []string) {
+	excluder, ok := source.(ir.DefaultTableExcluder)
+	if !ok {
+		return filter, nil
+	}
+	defaults := excluder.DefaultExcludePatterns()
+	if len(defaults) == 0 {
+		return filter, nil
+	}
+	if len(filter.Include) > 0 {
+		// Explicit allow-list — engine defaults don't apply.
+		return filter, nil
+	}
+	added := make([]string, 0, len(defaults))
+	excludeSet := make(map[string]struct{}, len(filter.Exclude))
+	for _, p := range filter.Exclude {
+		excludeSet[p] = struct{}{}
+	}
+	merged := make([]string, 0, len(filter.Exclude)+len(defaults))
+	merged = append(merged, filter.Exclude...)
+	for _, p := range defaults {
+		if _, dup := excludeSet[p]; dup {
+			continue
+		}
+		merged = append(merged, p)
+		added = append(added, p)
+	}
+	if len(added) == 0 {
+		return filter, nil
+	}
+	return TableFilter{Include: nil, Exclude: merged}, added
+}
+
 // applyTableFilter mutates schema.Tables in place, retaining only
 // the tables the filter allows. Logs the count at info level so
 // operators can verify the filter matched what they expected. An
