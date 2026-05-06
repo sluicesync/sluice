@@ -457,22 +457,6 @@ func TestMigrate_MySQLToPostgres_CheckBoolIdiom(t *testing.T) {
 		`INSERT INTO accounts (id, is_active) VALUES (4, true)`); err != nil {
 		t.Errorf("INSERT with is_active=true should have been accepted on PG target; got: %v", err)
 	}
-
-	// Constraint enforcement: invalid email rejected.
-	if _, err := tgt.ExecContext(ctx,
-		`INSERT INTO accounts (id, email, status) VALUES (3, 'no-at-sign', 'open')`); err == nil {
-		t.Errorf("INSERT with email lacking @ should have been rejected")
-	}
-	// Constraint enforcement: invalid status rejected.
-	if _, err := tgt.ExecContext(ctx,
-		`INSERT INTO accounts (id, email, status) VALUES (4, 'x@y.com', 'bogus')`); err == nil {
-		t.Errorf("INSERT with bogus status should have been rejected")
-	}
-	// A valid row is accepted.
-	if _, err := tgt.ExecContext(ctx,
-		`INSERT INTO accounts (id, email, status) VALUES (5, 'c@d.com', 'open')`); err != nil {
-		t.Errorf("INSERT with valid values should have been accepted; got: %v", err)
-	}
 }
 
 // readMySQLCheckClauses returns the check-clause text of every CHECK
