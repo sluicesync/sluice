@@ -1,0 +1,17 @@
+-- sluice schema diff
+-- source: postgres (1 tables expected after translation)
+-- target: postgres (2 tables found)
+-- result: 1 extra table, 1 missing column, 1 type mismatch
+--
+-- The ALTER/DROP statements below are starting points for manual
+-- reconciliation. sluice does not execute them. Review carefully
+-- before running them against the target.
+
+-- ──────────── deprecated_log (extra on target) ────────────
+DROP TABLE "deprecated_log";
+-- ^ not in source schema; sluice would not create it
+
+-- ──────────── users (mismatched) ────────────
+ALTER TABLE "users" ADD COLUMN "created_at"; -- TYPE; column missing on target
+ALTER TABLE "users" ALTER COLUMN "email" TYPE Varchar(255); -- on target: Varchar(100)
+

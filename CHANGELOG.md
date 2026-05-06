@@ -6,6 +6,33 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **`sluice schema diff` (ADR-0029).** Drift detection between what
+  sluice would produce on a target (source schema → translation
+  pipeline → expected target shape) and the schema that's actually
+  there. Reads both sides through the existing `SchemaReader`
+  surface — no new engine API; every engine that already implements
+  `SchemaReader` (today: PG, MySQL) gets diff support immediately.
+  Renders text (default; per-table sections with copy-paste
+  ALTER/DROP suggestions and a preamble noting they're starting
+  points, not verified migration scripts) or JSON (stable shape for
+  CI consumers) and supports `--output FILE` with the same atomic
+  temp+rename semantics as `schema preview`. Filter and mapping
+  flags mirror `schema preview` so the diff and preview pipelines
+  stay aligned. CI-friendly exit codes: 0 on no drift, 1 on drift
+  detected (suitable for failing a `schema-drift.yml` job), 2 on
+  operational error like a bad DSN — distinct so CI scripts don't
+  conflate "the gate failed" with "we couldn't run the gate."
+  `--ignore-extras` suppresses extra-on-target entries (useful when
+  the target hosts other applications' tables); `--ignore-charset-
+  collation` is plumbed for the v1.x extension when those fields
+  land in the IR. Out of scope per the ADR: column reordering,
+  index column ordering, FK constraint name normalisation, and
+  trigger/function/view comparison — surfacing those as drift
+  produces too much noise for too little operator value, and
+  reconciliation is a different tool's job (Atlas, sqitch).
+
 ## [0.7.0] - 2026-05-05
 
 Performance round 2 + ergonomics + reliability follow-ups. Four new ADRs (0025 graceful-drain stop, 0026 LOAD DATA INFILE writer, 0027 source-tx CDC batching, 0028 memory-bounded streaming). Closes Bug 12 (MySQL CDC silent-stall on temporal columns) and Bug 15 (CLI sync-stop drain in the warm-up window) — both classified during v0.6.0 testing as the remaining reliability gaps from the v0.4.0 night soak.

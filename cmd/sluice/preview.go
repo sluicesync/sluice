@@ -18,6 +18,7 @@ import (
 // migrate / sync / slot trees.
 type SchemaCmd struct {
 	Preview SchemaPreviewCmd `cmd:"" help:"Render the target DDL sluice would emit, with cross-engine translation notes and advisory hints."`
+	Diff    SchemaDiffCmd    `cmd:"" help:"Compare the expected target DDL (source -> translation) against the actual on-target schema; report drift with copy-paste DDL suggestions."`
 }
 
 // SchemaPreviewCmd implements `sluice schema preview` (ADR-0024).
