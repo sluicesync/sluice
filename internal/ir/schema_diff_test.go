@@ -158,6 +158,112 @@ func TestDiffSchemas_NullabilityMismatch(t *testing.T) {
 	}
 }
 
+// TestDiffSchemas_CharsetCollationMismatch covers the v0.11.0 (or
+// whatever version this lands in) charset/collation drift detection.
+// Both fields surface as separate ColumnDiff fields and combine
+// independently — a column can have both, just one, or neither.
+func TestDiffSchemas_CharsetCollationMismatch(t *testing.T) {
+	cases := []struct {
+		name                       string
+		exp                        Type
+		act                        Type
+		wantCharset, wantCollation bool
+	}{
+		{
+			"charset only",
+			Varchar{Length: 255, Charset: "utf8mb4"},
+			Varchar{Length: 255, Charset: "latin1"},
+			true, false,
+		},
+		{
+			"collation only",
+			Varchar{Length: 255, Collation: "utf8mb4_general_ci"},
+			Varchar{Length: 255, Collation: "utf8mb4_bin"},
+			false, true,
+		},
+		{
+			"both differ",
+			Varchar{Length: 255, Charset: "utf8mb4", Collation: "utf8mb4_general_ci"},
+			Varchar{Length: 255, Charset: "latin1", Collation: "latin1_swedish_ci"},
+			true, true,
+		},
+		{
+			"text type also tracks charset/collation",
+			Text{Size: TextLong, Collation: "utf8mb4_bin"},
+			Text{Size: TextLong, Collation: "utf8mb4_general_ci"},
+			false, true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			exp := &Schema{Tables: []*Table{{Name: "t", Columns: []*Column{{Name: "c", Type: tc.exp}}}}}
+			act := &Schema{Tables: []*Table{{Name: "t", Columns: []*Column{{Name: "c", Type: tc.act}}}}}
+			d := DiffSchemas(exp, act, DiffOptions{})
+			if len(d.TablesMismatched) != 1 || len(d.TablesMismatched[0].ColumnsMismatched) != 1 {
+				t.Fatalf("expected one column mismatch; got %+v", d)
+			}
+			cd := d.TablesMismatched[0].ColumnsMismatched[0]
+			if tc.wantCharset && (cd.ExpectedCharset == "" || cd.ActualCharset == "") {
+				t.Errorf("expected charset fields populated; got %+v", cd)
+			}
+			if !tc.wantCharset && (cd.ExpectedCharset != "" || cd.ActualCharset != "") {
+				t.Errorf("did not expect charset fields populated; got %+v", cd)
+			}
+			if tc.wantCollation && (cd.ExpectedCollation == "" || cd.ActualCollation == "") {
+				t.Errorf("expected collation fields populated; got %+v", cd)
+			}
+			if !tc.wantCollation && (cd.ExpectedCollation != "" || cd.ActualCollation != "") {
+				t.Errorf("did not expect collation fields populated; got %+v", cd)
+			}
+			// Type-string fields stay empty when only charset/collation
+			// differs — Type.String() doesn't include them.
+			if cd.ExpectedType != "" || cd.ActualType != "" {
+				t.Errorf("type strings should be empty when only charset/collation differs; got %+v", cd)
+			}
+		})
+	}
+}
+
+// TestDiffSchemas_IgnoreCharsetCollation pins the suppression
+// behaviour: when DiffOptions.IgnoreCharsetCollation is set,
+// columns whose only drift was charset/collation drop out of
+// ColumnsMismatched entirely; columns with additional drift keep
+// surfacing minus the charset/collation fields.
+func TestDiffSchemas_IgnoreCharsetCollation(t *testing.T) {
+	t.Run("only-charset drift suppressed", func(t *testing.T) {
+		exp := &Schema{Tables: []*Table{{Name: "t", Columns: []*Column{
+			{Name: "c", Type: Varchar{Length: 255, Charset: "utf8mb4", Collation: "utf8mb4_general_ci"}},
+		}}}}
+		act := &Schema{Tables: []*Table{{Name: "t", Columns: []*Column{
+			{Name: "c", Type: Varchar{Length: 255, Charset: "latin1", Collation: "latin1_swedish_ci"}},
+		}}}}
+		d := DiffSchemas(exp, act, DiffOptions{IgnoreCharsetCollation: true})
+		if len(d.TablesMismatched) != 0 {
+			t.Errorf("expected no mismatches under IgnoreCharsetCollation; got %+v", d.TablesMismatched)
+		}
+	})
+
+	t.Run("type drift survives charset suppression", func(t *testing.T) {
+		exp := &Schema{Tables: []*Table{{Name: "t", Columns: []*Column{
+			{Name: "c", Type: Varchar{Length: 255, Charset: "utf8mb4"}},
+		}}}}
+		act := &Schema{Tables: []*Table{{Name: "t", Columns: []*Column{
+			{Name: "c", Type: Varchar{Length: 100, Charset: "latin1"}},
+		}}}}
+		d := DiffSchemas(exp, act, DiffOptions{IgnoreCharsetCollation: true})
+		if len(d.TablesMismatched) != 1 || len(d.TablesMismatched[0].ColumnsMismatched) != 1 {
+			t.Fatalf("expected the type drift to survive; got %+v", d)
+		}
+		cd := d.TablesMismatched[0].ColumnsMismatched[0]
+		if cd.ExpectedType != "Varchar(255)" || cd.ActualType != "Varchar(100)" {
+			t.Errorf("type drift should survive; got %+v", cd)
+		}
+		if cd.ExpectedCharset != "" || cd.ActualCharset != "" {
+			t.Errorf("charset fields should be cleared; got %+v", cd)
+		}
+	})
+}
+
 func TestDiffSchemas_IndexAddedRemoved(t *testing.T) {
 	exp := &Schema{Tables: []*Table{
 		{

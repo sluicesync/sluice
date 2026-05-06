@@ -165,6 +165,29 @@ type ColumnDiff struct {
 	// table for these.
 	ExpectedGeneratedExpr string `json:"expected_generated_expr,omitempty"`
 	ActualGeneratedExpr   string `json:"actual_generated_expr,omitempty"`
+
+	// ExpectedCharset / ActualCharset carry the column's character-
+	// set name (MySQL information_schema.columns.character_set_name).
+	// Empty when both sides match or when the column isn't a
+	// character type. Postgres has no per-column charset (server
+	// encoding is database-wide) so these surface only on MySQL
+	// sources / targets. The schema-diff renderer suppresses these
+	// fields when --ignore-charset-collation is set.
+	ExpectedCharset string `json:"expected_charset,omitempty"`
+	ActualCharset   string `json:"actual_charset,omitempty"`
+
+	// ExpectedCollation / ActualCollation carry the column's
+	// collation name. Both engines populate it: MySQL from
+	// information_schema.columns.collation_name, Postgres from
+	// pg_attribute.attcollation → pg_collation.collname (only when
+	// explicitly set per-column; database-default collations leave
+	// it empty). Cross-engine comparison is high-noise — a MySQL
+	// `utf8mb4_general_ci` and a PG `en_US.utf8` rarely match by
+	// name even when the operator considers them equivalent — so
+	// `--ignore-charset-collation` is the typical default for
+	// cross-engine diffs.
+	ExpectedCollation string `json:"expected_collation,omitempty"`
+	ActualCollation   string `json:"actual_collation,omitempty"`
 }
 
 // CheckDiff captures a single CHECK constraint's expected-vs-actual
@@ -185,6 +208,17 @@ type DiffOptions struct {
 	// useful when the target hosts other applications' tables that
 	// sluice should ignore. ADR-0029.
 	IgnoreExtras bool
+
+	// IgnoreCharsetCollation suppresses charset/collation drift
+	// from the column-diff comparison. When set, mismatches that
+	// would otherwise populate ExpectedCharset/ActualCharset/
+	// ExpectedCollation/ActualCollation are dropped at compare
+	// time, and column entries whose only drift was charset /
+	// collation are not surfaced as mismatched. Useful for cross-
+	// engine diffs where MySQL `utf8mb4_general_ci` and PG
+	// `en_US.utf8` rarely match by name even when operators
+	// consider them equivalent.
+	IgnoreCharsetCollation bool
 }
 
 // DiffSchemas computes the structural delta between expected and
@@ -281,9 +315,17 @@ func diffTable(expected, actual *Table, opts DiffOptions) TableDiff {
 	}
 	sort.Strings(commonCols)
 	for _, name := range commonCols {
-		if cd, mismatched := diffColumn(expCols[name], actCols[name]); mismatched {
-			td.ColumnsMismatched = append(td.ColumnsMismatched, cd)
+		cd, mismatched := diffColumn(expCols[name], actCols[name])
+		if !mismatched {
+			continue
 		}
+		if opts.IgnoreCharsetCollation {
+			cd, mismatched = stripCharsetCollation(cd)
+			if !mismatched {
+				continue
+			}
+		}
+		td.ColumnsMismatched = append(td.ColumnsMismatched, cd)
 	}
 
 	expIdx := indexNames(expected)
@@ -411,7 +453,66 @@ func diffColumn(expected, actual *Column) (ColumnDiff, bool) {
 		mismatched = true
 	}
 
+	// Charset / collation comparison. Both fields ride on the IR's
+	// character-type structs (Char, Varchar, Text); the helper below
+	// extracts them and returns empty strings for non-character
+	// types. Comparison is exact-string — cross-engine differences
+	// (e.g. `utf8mb4` vs `UTF8`) are real drift signals operators
+	// can suppress with `--ignore-charset-collation` rather than
+	// being silently equated. v1.x scope.
+	expCharset, expCollation := charsetCollationOf(expected.Type)
+	actCharset, actCollation := charsetCollationOf(actual.Type)
+	if expCharset != actCharset {
+		cd.ExpectedCharset = expCharset
+		cd.ActualCharset = actCharset
+		mismatched = true
+	}
+	if expCollation != actCollation {
+		cd.ExpectedCollation = expCollation
+		cd.ActualCollation = actCollation
+		mismatched = true
+	}
+
 	return cd, mismatched
+}
+
+// stripCharsetCollation clears the four charset/collation fields on
+// a ColumnDiff and reports whether any other drift remains. Used
+// under DiffOptions.IgnoreCharsetCollation to suppress charset /
+// collation drift at compare time: column entries whose only
+// mismatch was on those fields drop out of ColumnsMismatched
+// entirely, while entries with additional drift (type, nullability,
+// default, generated expression) keep surfacing minus the
+// charset/collation noise.
+func stripCharsetCollation(cd ColumnDiff) (ColumnDiff, bool) {
+	cd.ExpectedCharset = ""
+	cd.ActualCharset = ""
+	cd.ExpectedCollation = ""
+	cd.ActualCollation = ""
+	hasOther := cd.ExpectedType != "" || cd.ActualType != "" ||
+		cd.ExpectedNullable != nil || cd.ActualNullable != nil ||
+		cd.ExpectedDefault != "" || cd.ActualDefault != "" ||
+		cd.ExpectedGeneratedExpr != "" || cd.ActualGeneratedExpr != ""
+	return cd, hasOther
+}
+
+// charsetCollationOf extracts the Charset and Collation fields off
+// any of the IR's character-type structs (ir.Char, ir.Varchar,
+// ir.Text). Returns ("", "") for non-character types and for
+// character types where neither field is set. The diff comparison
+// uses string equality on the returned values, so an unset field
+// (zero value) equals another unset field — only when both sides
+// have a value and they differ does drift surface.
+func charsetCollationOf(t Type) (charset, collation string) {
+	switch v := t.(type) {
+	case Char:
+		return v.Charset, v.Collation
+	case Varchar:
+		return v.Charset, v.Collation
+	case Text:
+		return v.Charset, v.Collation
+	}
+	return "", ""
 }
 
 // renderDefault produces a stable textual rendering of a

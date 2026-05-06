@@ -176,7 +176,10 @@ func (d *Differ) Run(ctx context.Context) (*ir.SchemaDiff, error) {
 	}
 
 	// ---- 3. Compute the diff. ----
-	diff := ir.DiffSchemas(expected, actual, ir.DiffOptions{IgnoreExtras: d.IgnoreExtras})
+	diff := ir.DiffSchemas(expected, actual, ir.DiffOptions{
+		IgnoreExtras:           d.IgnoreExtras,
+		IgnoreCharsetCollation: d.IgnoreCharsetCollation,
+	})
 
 	// ---- 4. Resolve missing-table DDL via the target engine's
 	// PreviewDDL surface so the text renderer can include real CREATE
@@ -586,6 +589,7 @@ func renderColumnMismatch(sb *strings.Builder, table string, cd ir.ColumnDiff, q
 		if cd.ExpectedGeneratedExpr != cd.ActualGeneratedExpr {
 			renderGeneratedExprMismatch(sb, table, cd, quote)
 		}
+		renderCharsetCollationMismatch(sb, table, cd, quote, "mysql")
 	default:
 		if cd.ExpectedType != "" {
 			fmt.Fprintf(sb, "ALTER TABLE %s ALTER COLUMN %s TYPE %s; -- on target: %s\n",
@@ -604,6 +608,43 @@ func renderColumnMismatch(sb *strings.Builder, table string, cd ir.ColumnDiff, q
 		}
 		if cd.ExpectedGeneratedExpr != cd.ActualGeneratedExpr {
 			renderGeneratedExprMismatch(sb, table, cd, quote)
+		}
+		renderCharsetCollationMismatch(sb, table, cd, quote, "postgres")
+	}
+}
+
+// renderCharsetCollationMismatch emits ALTER suggestions for charset
+// or collation drift. Empty fields are skipped, so a ColumnDiff that
+// passed `--ignore-charset-collation` (which clears these via
+// stripCharsetCollation at compare time) renders nothing here.
+//
+// MySQL syntax uses `MODIFY COLUMN ... CHARACTER SET ... COLLATE ...`;
+// PG uses `ALTER COLUMN ... TYPE ... COLLATE "..."`. Suggestions are
+// hint comments — the precise type still needs filling in by the
+// operator.
+func renderCharsetCollationMismatch(sb *strings.Builder, table string, cd ir.ColumnDiff, quote func(string) string, engine string) {
+	if cd.ExpectedCharset == "" && cd.ActualCharset == "" &&
+		cd.ExpectedCollation == "" && cd.ActualCollation == "" {
+		return
+	}
+	switch engine {
+	case "mysql", "planetscale":
+		switch {
+		case cd.ExpectedCharset != cd.ActualCharset && cd.ExpectedCollation != cd.ActualCollation:
+			fmt.Fprintf(sb, "ALTER TABLE %s MODIFY COLUMN %s ... CHARACTER SET %s COLLATE %s; -- on target: charset=%s collation=%s\n",
+				quote(table), quote(cd.Name), cd.ExpectedCharset, cd.ExpectedCollation, cd.ActualCharset, cd.ActualCollation)
+		case cd.ExpectedCharset != cd.ActualCharset:
+			fmt.Fprintf(sb, "ALTER TABLE %s MODIFY COLUMN %s ... CHARACTER SET %s; -- on target: %s\n",
+				quote(table), quote(cd.Name), cd.ExpectedCharset, cd.ActualCharset)
+		case cd.ExpectedCollation != cd.ActualCollation:
+			fmt.Fprintf(sb, "ALTER TABLE %s MODIFY COLUMN %s ... COLLATE %s; -- on target: %s\n",
+				quote(table), quote(cd.Name), cd.ExpectedCollation, cd.ActualCollation)
+		}
+	default:
+		// PG has no per-column charset; only collation surfaces here.
+		if cd.ExpectedCollation != cd.ActualCollation {
+			fmt.Fprintf(sb, "ALTER TABLE %s ALTER COLUMN %s SET DATA TYPE ... COLLATE %q; -- on target: %s\n",
+				quote(table), quote(cd.Name), cd.ExpectedCollation, cd.ActualCollation)
 		}
 	}
 }

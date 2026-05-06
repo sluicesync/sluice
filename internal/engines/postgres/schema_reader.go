@@ -218,26 +218,52 @@ func isUndefinedRelationErr(err error) bool {
 }
 
 // populateColumns fills in Column lists for each table.
+//
+// Per-column collation is read via a LEFT JOIN to pg_attribute /
+// pg_collation rather than information_schema.columns.collation_name
+// because the latter only surfaces explicit-on-domain collations and
+// misses the column-level setting Postgres stores on
+// pg_attribute.attcollation. The collation comparison feeds
+// `sluice schema diff` (gated by `--ignore-charset-collation`); on
+// the migrate / sync paths the value rides through to the writer's
+// emit so an explicit `COLLATE "<name>"` clause can round-trip if the
+// target supports the same collation name.
+//
+// Postgres has no per-column "charset" concept — the database's
+// server_encoding is global — so the Charset field on the IR types
+// stays empty for PG sources. MySQL writers accept that as "use the
+// table / database default."
 func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*ir.Table, enumValues map[string][]string, geomInfo map[string]geometryColumnInfo) error {
 	const q = `
 		SELECT
-			table_name,
-			column_name,
-			ordinal_position,
-			column_default,
-			is_nullable,
-			LOWER(data_type),
-			udt_name,
-			character_maximum_length,
-			numeric_precision,
-			numeric_scale,
-			datetime_precision,
-			is_identity,
-			COALESCE(is_generated, 'NEVER'),
-			COALESCE(generation_expression, '')
-		FROM   information_schema.columns
-		WHERE  table_schema = $1
-		ORDER  BY table_name, ordinal_position`
+			c.table_name,
+			c.column_name,
+			c.ordinal_position,
+			c.column_default,
+			c.is_nullable,
+			LOWER(c.data_type),
+			c.udt_name,
+			c.character_maximum_length,
+			c.numeric_precision,
+			c.numeric_scale,
+			c.datetime_precision,
+			c.is_identity,
+			COALESCE(c.is_generated, 'NEVER'),
+			COALESCE(c.generation_expression, ''),
+			COALESCE(coll.collname, '')
+		FROM   information_schema.columns c
+		LEFT JOIN pg_class      cl   ON cl.relname    = c.table_name
+		                            AND cl.relnamespace = (
+		                                  SELECT oid FROM pg_namespace WHERE nspname = c.table_schema)
+		LEFT JOIN pg_attribute  a    ON a.attrelid    = cl.oid
+		                            AND a.attname     = c.column_name
+		                            AND a.attnum      > 0
+		                            AND NOT a.attisdropped
+		LEFT JOIN pg_collation  coll ON coll.oid       = a.attcollation
+		                            AND coll.oid      <> 0
+		                            AND coll.collname <> 'default'
+		WHERE  c.table_schema = $1
+		ORDER  BY c.table_name, c.ordinal_position`
 
 	rows, err := r.db.QueryContext(ctx, q, r.schema)
 	if err != nil {
@@ -256,6 +282,7 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 			numScale, dtPrec     sql.NullInt64
 			isIdentity           string
 			isGenerated, genExpr string
+			collation            string
 		)
 		if err := rows.Scan(
 			&tableName, &colName, &ordinal,
@@ -264,6 +291,7 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 			&charMaxLen, &numPrec, &numScale, &dtPrec,
 			&isIdentity,
 			&isGenerated, &genExpr,
+			&collation,
 		); err != nil {
 			return err
 		}
@@ -281,6 +309,7 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 			NumScale:        nullInt64ToPtr(numScale),
 			DTPrec:          nullInt64ToPtr(dtPrec),
 			IsAutoIncrement: isAutoIncrement(isIdentity, columnDefault),
+			Collation:       collation,
 		}
 
 		// Resolve enum values for USER-DEFINED columns.

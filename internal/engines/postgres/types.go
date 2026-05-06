@@ -31,6 +31,14 @@ type columnMeta struct {
 	// DTPrec is datetime_precision, or nil when not applicable.
 	DTPrec *int64
 
+	// Collation is the per-column collation name resolved from
+	// pg_attribute.attcollation → pg_collation.collname. Empty when
+	// the column inherits the database default. PG has no per-column
+	// charset (server_encoding is database-wide) so there's no
+	// matching Charset field — the IR's character-type structs leave
+	// Charset empty for PG sources.
+	Collation string
+
 	// IsAutoIncrement is true for SERIAL/BIGSERIAL/IDENTITY columns.
 	// The schema reader sets this based on either is_identity or a
 	// nextval() default; the translator just respects it.
@@ -138,13 +146,13 @@ func translateType(c columnMeta) (ir.Type, error) {
 
 	// ---- Character ----
 	case "character":
-		return ir.Char{Length: int(int64Ptr(c.CharMaxLen))}, nil
+		return ir.Char{Length: int(int64Ptr(c.CharMaxLen)), Collation: c.Collation}, nil
 	case "character varying":
-		return ir.Varchar{Length: int(int64Ptr(c.CharMaxLen))}, nil
+		return ir.Varchar{Length: int(int64Ptr(c.CharMaxLen)), Collation: c.Collation}, nil
 	case "text":
 		// Postgres text is unbounded; the IR's TextLong is the
 		// closest match that round-trips correctly to MySQL's LONGTEXT.
-		return ir.Text{Size: ir.TextLong}, nil
+		return ir.Text{Size: ir.TextLong, Collation: c.Collation}, nil
 
 	// ---- Binary ----
 	case "bytea":
