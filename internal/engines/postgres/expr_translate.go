@@ -281,11 +281,22 @@ func rewriteBoolIdioms(expr string, ctx ExprContext) string {
 	return expr
 }
 
-// rewriteBoolCoalesce rewrites `COALESCE(<bool_ident>, <int_lit>)` and
-// `COALESCE(<int_lit>, <bool_ident>)` calls (any number of args, only
-// rewrites when exactly one arg is a bool ident and exactly one is an
-// int literal — the two-arg shape MySQL operators actually use).
-// Multi-arg COALESCE shapes that don't match fall through verbatim.
+// rewriteBoolCoalesce rewrites two-arg `COALESCE` calls where one
+// side is a bool-returning argument and the other is an int literal
+// (`0` or `1`). The bool side is recognised in two flavours:
+//
+//   - **Bare ident** matching the table's bool-mapped column set.
+//     Covers the common `COALESCE(is_active, 0)` shape from MySQL
+//     `tinyint(1)` columns mapped to PG BOOLEAN.
+//   - **Comparison / NULL-test sub-expression** (`a = b`, `a <> b`,
+//     `a != b`, `a IS NULL`, `a IS NOT NULL`). Covers Bug 17's
+//     follow-up case where the bool side is a generated-column body
+//     that returns bool but isn't a direct column reference. PG's
+//     strict typing rejects `COALESCE(<bool_expr>, 0)` even though
+//     MySQL accepts it via implicit coercion.
+//
+// Multi-arg COALESCE and shapes that don't match either pattern
+// fall through verbatim (loud-failure tenet).
 func rewriteBoolCoalesce(expr string, boolCols map[string]bool) string {
 	return rewriteFunctionCalls(expr, "COALESCE", func(args []string) string {
 		if len(args) != 2 {
@@ -293,14 +304,89 @@ func rewriteBoolCoalesce(expr string, boolCols map[string]bool) string {
 		}
 		left := strings.TrimSpace(args[0])
 		right := strings.TrimSpace(args[1])
+		leftBool := isBoolReturning(left, boolCols)
+		rightBool := isBoolReturning(right, boolCols)
 		switch {
-		case boolCols[left] && isBoolIntLiteral(right):
+		case leftBool && isBoolIntLiteral(right):
 			return "COALESCE(" + left + ", " + intLitToBool(right) + ")"
-		case boolCols[right] && isBoolIntLiteral(left):
+		case rightBool && isBoolIntLiteral(left):
 			return "COALESCE(" + intLitToBool(left) + ", " + right + ")"
 		}
 		return ""
 	})
+}
+
+// isBoolReturning reports whether s is a top-level expression that
+// returns boolean. Recognises bare bool-mapped column names and the
+// comparison / NULL-test shapes that operators put inside generated-
+// column bodies and CHECK constraints. The check is conservative: a
+// false negative just means the rewrite doesn't fire and the loud-
+// failure tenet kicks in; a false positive would silently rewrite a
+// non-bool expression's int literal, which we explicitly avoid.
+func isBoolReturning(s string, boolCols map[string]bool) bool {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return false
+	}
+	// Case 1: bare identifier matching a bool-mapped column.
+	if boolCols[s] {
+		return true
+	}
+	// Strip a single layer of outer parens — operators commonly write
+	// `coalesce((a = b), 0)` and the parens shouldn't defeat the
+	// check.
+	if strings.HasPrefix(s, "(") && strings.HasSuffix(s, ")") {
+		inner := strings.TrimSpace(s[1 : len(s)-1])
+		// Only strip if the parens are matched (not just wrapping
+		// part of a larger expression). scanParenGroup confirms.
+		if end, ok := scanParenGroup(s, 0); ok && end == len(s)-1 {
+			s = inner
+		}
+	}
+	// Case 2: contains a top-level comparison operator. Walks the
+	// string respecting nested parens and string literals.
+	if hasTopLevelCompareOp(s) {
+		return true
+	}
+	// Case 3: top-level IS NULL / IS NOT NULL. Match
+	// case-insensitively at the tail.
+	upper := strings.ToUpper(s)
+	if strings.HasSuffix(upper, " IS NULL") || strings.HasSuffix(upper, " IS NOT NULL") {
+		return true
+	}
+	return false
+}
+
+// hasTopLevelCompareOp reports whether s contains `=`, `!=`, or `<>`
+// at depth zero (not inside parens or string literals). The check is
+// conservative — operators like `<` and `>` are legal comparisons but
+// less commonly bool-returning in the COALESCE-with-int-literal idiom,
+// and skipping them avoids false positives on arithmetic expressions.
+func hasTopLevelCompareOp(s string) bool {
+	depth := 0
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '\'':
+			i = scanStringLiteral(s, i) - 1 // -1 because the for loop increments
+		case '(', '[':
+			depth++
+		case ')', ']':
+			depth--
+		case '=':
+			if depth == 0 {
+				return true
+			}
+		case '!':
+			if depth == 0 && i+1 < len(s) && s[i+1] == '=' {
+				return true
+			}
+		case '<':
+			if depth == 0 && i+1 < len(s) && s[i+1] == '>' {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // rewriteBoolComparison walks expr and rewrites `<int_lit> <op>

@@ -215,6 +215,42 @@ func TestTranslateExprForPG_BoolIdioms(t *testing.T) {
 			in:   "COALESCE(is_active, deleted, 0)",
 			want: "COALESCE(is_active, deleted, 0)",
 		},
+
+		// ---- Bug 17 follow-up (v0.9.0): coalesce with a bool-returning
+		// sub-expression instead of a bare bool ident. Covers the
+		// generated-column / CHECK shapes where the bool side is a
+		// comparison or IS NULL test rather than a direct column
+		// reference.
+		{
+			name: "coalesce with parenthesised comparison rewrites to false",
+			in:   "COALESCE((qty = 0), 0)",
+			want: "COALESCE((qty = 0), false)",
+		},
+		{
+			name: "coalesce with bare comparison (no parens) rewrites",
+			in:   "COALESCE(qty = 0, 0)",
+			want: "COALESCE(qty = 0, false)",
+		},
+		{
+			name: "coalesce with IS NULL rewrites to false",
+			in:   "COALESCE(notes IS NULL, 0)",
+			want: "COALESCE(notes IS NULL, false)",
+		},
+		{
+			name: "coalesce with IS NOT NULL rewrites to true",
+			in:   "COALESCE(notes IS NOT NULL, 1)",
+			want: "COALESCE(notes IS NOT NULL, true)",
+		},
+		{
+			name: "coalesce with inequality rewrites",
+			in:   "COALESCE((a <> b), 1)",
+			want: "COALESCE((a <> b), true)",
+		},
+		{
+			name: "coalesce with arithmetic expression is NOT rewritten",
+			in:   "COALESCE(qty + 1, 0)",
+			want: "COALESCE(qty + 1, 0)",
+		},
 		{
 			name: "lowercase coalesce",
 			in:   "coalesce(is_active, 0)",

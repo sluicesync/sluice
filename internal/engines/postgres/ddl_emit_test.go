@@ -289,6 +289,37 @@ func TestEmitColumnDef(t *testing.T) {
 			},
 			want: `"rating" "users_rating_enum" NOT NULL DEFAULT 'G'::"users_rating_enum"`,
 		},
+		{
+			// Bug 23: MySQL's `DEFAULT ('pending')` parenthesised form
+			// arrives as DefaultExpression{Expr: "'pending'"} via
+			// information_schema's EXTRA=DEFAULT_GENERATED. The
+			// expression body is a string literal so the cast must
+			// still fire — without it PG rejects with "column X is
+			// of type Y_enum but default expression is of type text".
+			name: "enum with paren-literal expression default also gets cast",
+			in: &ir.Column{
+				Name:     "rating",
+				Type:     ir.Enum{Values: []string{"G", "PG", "R"}},
+				Nullable: true,
+				Default:  ir.DefaultExpression{Expr: "'PG'"},
+			},
+			want: `"rating" "users_rating_enum" DEFAULT 'PG'::"users_rating_enum"`,
+		},
+		{
+			// Bug 23 negative: a true expression default (not a
+			// string-literal-shaped one) does NOT get the cast — the
+			// cast wouldn't be safe and the resulting CREATE TABLE
+			// would fail loudly on the target if the operator's
+			// expression isn't enum-compatible.
+			name: "enum with non-literal expression default is not cast",
+			in: &ir.Column{
+				Name:     "rating",
+				Type:     ir.Enum{Values: []string{"G", "PG", "R"}},
+				Nullable: true,
+				Default:  ir.DefaultExpression{Expr: "current_setting('app.default_rating')"},
+			},
+			want: `"rating" "users_rating_enum" DEFAULT current_setting('app.default_rating')`,
+		},
 	}
 
 	for _, c := range cases {
@@ -519,6 +550,50 @@ func TestEmitCreateIndex(t *testing.T) {
 				Columns: []ir.IndexColumn{{Column: "film_id"}},
 			},
 			want: `CREATE INDEX "users_idx_fk_film_id" ON "public"."users" USING btree ("film_id");`,
+		},
+		{
+			// Same-dialect (PG-source) expression — passes through
+			// verbatim with no translation.
+			name: "same-dialect expression passes through verbatim",
+			idx: &ir.Index{
+				Name: "users_lower_email",
+				Kind: ir.IndexKindBTree,
+				Columns: []ir.IndexColumn{
+					{Expression: "lower(email)", ExpressionDialect: "postgres"},
+				},
+			},
+			want: `CREATE INDEX "users_lower_email" ON "public"."users" USING btree ((lower(email)));`,
+		},
+		{
+			// MySQL-source expression with a JSON_UNQUOTE+JSON_EXTRACT
+			// chain — the ADR-0016 translator rewrites to PG's ->>
+			// idiom on emit (Bug 16 follow-up). Without this, the
+			// expression would emit verbatim and PG would reject the
+			// CREATE INDEX with "function json_unquote(json) does not
+			// exist".
+			name: "MySQL-source JSON expression rewrites to PG ->>",
+			idx: &ir.Index{
+				Name: "containers_pickup_status",
+				Kind: ir.IndexKindBTree,
+				Columns: []ir.IndexColumn{
+					{Expression: "json_unquote(json_extract(meta,'$.color'))", ExpressionDialect: "mysql"},
+				},
+			},
+			want: `CREATE INDEX "users_containers_pickup_status" ON "public"."users" USING btree (((meta->>'color')));`,
+		},
+		{
+			// Untagged expression (older IR / hand-built fixtures)
+			// emits verbatim — same as the pre-Bug-16-follow-up
+			// behaviour.
+			name: "untagged expression passes through verbatim",
+			idx: &ir.Index{
+				Name: "users_lower_legacy",
+				Kind: ir.IndexKindBTree,
+				Columns: []ir.IndexColumn{
+					{Expression: "lower(email)"},
+				},
+			},
+			want: `CREATE INDEX "users_lower_legacy" ON "public"."users" USING btree ((lower(email)));`,
 		},
 	}
 	for _, c := range cases {

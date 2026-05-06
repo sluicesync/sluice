@@ -335,14 +335,21 @@ func emitColumnDef(table *ir.Table, c *ir.Column, opts emitOpts) (string, error)
 			sb.WriteString(dflt)
 		}
 		// Postgres enum columns need an explicit type cast on the
-		// default literal — without it, CREATE TABLE rejects the
-		// default with "invalid input value for enum ...". The
-		// enum type name is the same one used in typeStr above.
-		if _, isEnum := c.Type.(ir.Enum); isEnum {
-			if _, isLiteral := c.Default.(ir.DefaultLiteral); isLiteral {
-				sb.WriteString("::")
-				sb.WriteString(quoteIdent(enumTypeName(table.Name, c.Name)))
-			}
+		// default — without it, CREATE TABLE rejects with "column X
+		// is of type Y_enum but default expression is of type text"
+		// (Bug 23). The cast applies whenever the default's emitted
+		// form is shape-equivalent to a string literal; that covers
+		// both DefaultLiteral (the common path) and DefaultExpression
+		// for the MySQL `DEFAULT ('pending')` parenthesised form,
+		// which information_schema reports with EXTRA=
+		// "DEFAULT_GENERATED" → DefaultExpression. Anything that
+		// isn't a simple quoted string (function calls, true
+		// expressions like CURRENT_TIMESTAMP) is left alone — the
+		// cast wouldn't be safe there and the loud-failure tenet
+		// surfaces the operator-driven gap.
+		if _, isEnum := c.Type.(ir.Enum); isEnum && enumDefaultShouldCast(c.Default, dflt) {
+			sb.WriteString("::")
+			sb.WriteString(quoteIdent(enumTypeName(table.Name, c.Name)))
 		}
 	}
 	return sb.String(), nil
@@ -359,6 +366,49 @@ func tableNameForLog(t *ir.Table) string {
 		return "<unknown>"
 	}
 	return t.Name
+}
+
+// enumDefaultShouldCast reports whether the cast suffix should be
+// appended to an enum column's emitted default (Bug 23). Returns
+// true for DefaultLiteral (always) and for DefaultExpression whose
+// emitted form is a single-quoted string literal (the MySQL
+// `DEFAULT ('pending')` parenthesised form, which the schema reader
+// translates to DefaultExpression because information_schema's EXTRA
+// column carries DEFAULT_GENERATED).
+//
+// `emitted` is the rendered form returned by [emitDefault] — for a
+// DefaultLiteral that's already `'pending'`; for a DefaultExpression
+// it's the raw expression text. We test the rendered form so the
+// caller doesn't have to thread both shapes through.
+func enumDefaultShouldCast(d ir.DefaultValue, emitted string) bool {
+	if _, ok := d.(ir.DefaultLiteral); ok {
+		return true
+	}
+	if _, ok := d.(ir.DefaultExpression); !ok {
+		return false
+	}
+	// String-literal shape: opens with `'`, closes with `'`, contains
+	// no unescaped intermediate quotes that would extend the literal.
+	// The quote-tolerant check covers `'O''Brien'` (an enum value
+	// with an apostrophe — rare but valid). Anything else (e.g.
+	// `CURRENT_TIMESTAMP`, `(NOW())`, function calls) returns false.
+	s := strings.TrimSpace(emitted)
+	if len(s) < 2 || s[0] != '\'' || s[len(s)-1] != '\'' {
+		return false
+	}
+	// Walk the body checking that any embedded `'` characters are
+	// doubled. The walker matches the SQL standard escaping rule.
+	body := s[1 : len(s)-1]
+	for i := 0; i < len(body); i++ {
+		if body[i] != '\'' {
+			continue
+		}
+		if i+1 >= len(body) || body[i+1] != '\'' {
+			return false
+		}
+		i++ // skip the doubled quote
+	}
+	return true
 }
 
 // enumTypeName generates a deterministic Postgres enum type name for
@@ -482,16 +532,17 @@ func emitTableDef(schema string, table *ir.Table, opts emitOpts) (string, error)
 // render as `(expression_text)` — Postgres expression-index syntax
 // requires the expression to be parenthesised, which combined with
 // the outer column-list parens produces the canonical double-parens
-// shape `((lower(email)))`. Verbatim-passthrough policy applies: the
-// expression text is preserved as-is, so non-portable constructs
-// (e.g. a MySQL-only function name) fail loudly at CREATE INDEX time
-// rather than be silently rewritten.
+// shape `((lower(email)))`. The expression body runs through the
+// ADR-0016 translator when the source dialect tag differs from PG,
+// so a MySQL-source `json_unquote(json_extract(j,'$.k'))` index
+// rewrites to `(j->>'k')` instead of failing at CREATE INDEX.
+// Same-dialect / untagged expressions pass through verbatim.
 func emitIndexColumnList(cols []ir.IndexColumn) string {
 	parts := make([]string, len(cols))
 	for i, c := range cols {
 		var entry string
 		if c.Expression != "" {
-			entry = "(" + c.Expression + ")"
+			entry = "(" + translateIndexExpr(c) + ")"
 		} else {
 			entry = quoteIdent(c.Column)
 		}
@@ -501,6 +552,27 @@ func emitIndexColumnList(cols []ir.IndexColumn) string {
 		parts[i] = entry
 	}
 	return "(" + strings.Join(parts, ", ") + ")"
+}
+
+// translateIndexExpr returns the index expression to emit, applying
+// the cross-dialect translation pass when the IR's dialect tag
+// indicates a different source dialect (see ADR-0016). An empty /
+// matching dialect tag emits verbatim — same behaviour as before
+// the translation layer applied to indexes.
+//
+// The bool-idiom rewrite (v0.8.0) is gated on a per-table column
+// context that index expressions don't carry; index expressions are
+// rendered in [emitCreateIndex] where the table is in scope, but the
+// list helper isn't. Since index expressions almost never reference
+// bool-mapped columns directly (they reference columns to derive
+// search keys), the simpler context-free pass covers the observed
+// cases. If a bool-context-aware index emit is needed later, the
+// caller can build [ExprContext] and route through this helper.
+func translateIndexExpr(c ir.IndexColumn) string {
+	if c.ExpressionDialect == "" || c.ExpressionDialect == dialectName {
+		return c.Expression
+	}
+	return translateExprForPG(c.Expression, ExprContext{})
 }
 
 // emitCreateIndex produces a CREATE INDEX statement (UNIQUE if

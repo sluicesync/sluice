@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"sort"
 	"strings"
 
@@ -122,6 +123,17 @@ func (p *Previewer) Run(ctx context.Context) error {
 	}
 
 	// ---- 2. Filter ----
+	// Engine-default exclusions (Bug 22): same shape as Migrator and
+	// Streamer — merge engine-supplied patterns (e.g. PlanetScale's
+	// `_vt_*`) when the operator is in exclude-or-no-filter mode.
+	// Replace the field in-place; Previewer is single-shot per Run.
+	if eff, added := effectiveTableFilter(p.Filter, p.Source, p.SourceDSN); len(added) > 0 {
+		slog.InfoContext(ctx, "applying engine-default table exclusions",
+			slog.String("engine", p.Source.Name()),
+			slog.Any("patterns", added),
+		)
+		p.Filter = eff
+	}
 	if err := applyTableFilter(ctx, srcSchema, p.Filter); err != nil {
 		return err
 	}

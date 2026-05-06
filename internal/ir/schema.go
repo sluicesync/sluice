@@ -204,11 +204,16 @@ type IndexColumn struct {
 	// CheckConstraint.Expr / Column.GeneratedExpr). Empty for the
 	// common case of a plain column entry. When non-empty, Column is
 	// empty.
-	//
-	// Cross-engine emit policy mirrors generated columns: writers
-	// passthrough verbatim, non-portable expressions fail loudly on
-	// the target rather than be silently rewritten.
 	Expression string
+	// ExpressionDialect is the source dialect the Expression text came
+	// from ("mysql" or "postgres"; both MySQL flavors share "mysql"
+	// since the wire dialect is identical). Empty for plain column
+	// entries. The DDL emitters compare this against their own
+	// dialect and run the layered ADR-0016 translator only when they
+	// differ — a MySQL `json_unquote(json_extract(...))` index
+	// expression rewrites to PG `->>'...'` on emit; a same-dialect
+	// expression passes through verbatim. See ADR-0016.
+	ExpressionDialect string
 	// Desc indicates the column is indexed in descending order.
 	Desc bool
 	// Length is a prefix length for prefix indexes (MySQL); zero means

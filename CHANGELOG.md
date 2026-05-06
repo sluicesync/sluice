@@ -8,7 +8,7 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [0.9.0] - 2026-05-06
 
-Operator quality-of-life + cross-engine type-edge audit + OSS-hygiene starter. Three tracks: `sync stop --wait` closes the operator-coordination gap surfaced by v0.8.0's stretch-testing of ALTER windows; new TIMESTAMP-precision integration tests audit the cross-engine boundary that Bug 19's TZ fix opened to scrutiny; `CONTRIBUTING.md` and `docs/dev/release-template.md` formalise the conventions that have been carried in conversation memory across the v0.x ramp.
+Operator quality-of-life + cross-engine type-edge audit + OSS-hygiene starter + four follow-ups from v0.8.1 real-world testing. `sync stop --wait` closes the operator-coordination gap surfaced by v0.8.0's stretch-testing of ALTER windows; new TIMESTAMP-precision integration tests audit the cross-engine boundary that Bug 19's TZ fix opened to scrutiny; `CONTRIBUTING.md` and `docs/dev/release-template.md` formalise the conventions that have been carried in conversation memory across the v0.x ramp. The follow-ups close Bug 16 (index-expression translation), Bug 17 (bool-returning sub-expressions in COALESCE), Bug 22 (`schema preview` and `schema diff` now also auto-exclude PlanetScale `_vt_*` tables), plus a new Bug 23 (MySQL `DEFAULT ('value')` parens form not getting the PG enum cast).
 
 ### Added
 
@@ -35,6 +35,16 @@ Operator quality-of-life + cross-engine type-edge audit + OSS-hygiene starter. T
   equivalent values.
 
 - **`CONTRIBUTING.md` release-process section + `docs/dev/release-template.md`** — formalise the GitHub release-notes structure (Highlights / Fixed / Compatibility / Who-needs-this) that's been carried in conversation memory across the v0.x ramp, plus the `chore: cut vX.Y.Z` commit + annotated-tag pattern. The release-template doc carries section-by-section guidance with examples drawn from the v0.7.0 / v0.8.0 release notes.
+
+### Fixed
+
+- **Bug 16 follow-up — MySQL functional/expression index bodies translate cross-engine.** v0.8.0 unwalled the schema reader for functional indexes; v0.9.0 closes the emit-side gap. The MySQL schema reader now tags each index expression with its source dialect (mirroring the existing tags on generated columns and CHECK constraints), and the PG DDL writer routes index expressions through the ADR-0016 translator on emit. A MySQL `CREATE INDEX ... ((json_unquote(json_extract(meta, '$.k'))))` now lands on PG as `CREATE INDEX ... (((meta->>'k')))` instead of failing at apply time with "function json_unquote(json) does not exist". Same-dialect and untagged expressions pass through verbatim.
+
+- **Bug 17 follow-up — COALESCE with a bool-returning sub-expression rewrites correctly.** v0.8.0 handled `COALESCE(<bool_ident>, 0)` where the bool side was a bare column reference. v0.9.0 extends the rewrite to recognise bool-returning sub-expressions: comparisons (`a = b`, `a <> b`, `a != b`), `IS NULL` / `IS NOT NULL` tests, and parenthesised wrappers around them. Real-world report: a generated column whose body included `coalesce((some_bool_returning_expr), 0)` failed to land on PG even though every direct bool-column case was handled. Arithmetic and other non-bool sub-expressions are still left alone (loud-failure tenet preserved).
+
+- **Bug 22 follow-up — engine-default exclusions now apply to `schema preview` and `schema diff` too.** v0.8.1's Bug 22 fix wired the `_vt_*` Vitess shadow-table auto-exclude into `Migrator.Run` and `Streamer.Run`, but the merge step was missing from `Previewer.Run` and `Differ.Run`. Both now run the same merge before invoking `applyTableFilter` — so `sluice schema preview` and `sluice schema diff` against a PlanetScale source no longer surface `_vt_HOLD_*` / `_vt_hld_*` tables in the output. Operator-supplied `--include-table` short-circuits the merge as in the migrate/sync path.
+
+- **Bug 23 — MySQL `DEFAULT ('value')` parens-form enum default now gets the PG enum cast.** MySQL 8.0+ stores `DEFAULT ('pending')` (with parens) as an expression default — `information_schema.columns.extra` carries the `DEFAULT_GENERATED` flag, which the schema reader translates to `ir.DefaultExpression` rather than `ir.DefaultLiteral`. The PG enum-cast emit was gated only on `DefaultLiteral`, so the parens form skipped the cast and PG rejected with "column X is of type Y_enum but default expression is of type text". The cast now also fires on `DefaultExpression` whose body is shape-equivalent to a single-quoted string literal (the parens form's only legal content for an enum default); true-expression defaults like `current_setting(...)` are still left uncast (the cast wouldn't be safe).
 
 ## [0.8.1] - 2026-05-06
 

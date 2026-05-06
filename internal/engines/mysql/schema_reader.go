@@ -265,8 +265,13 @@ func (r *SchemaReader) populateIndexes(ctx context.Context, tables map[string]*i
 			// identifier quotes, charset introducers, escaped
 			// apostrophes); normalize them at the read boundary so the
 			// IR holds portable expression text — same approach as
-			// generated columns and CHECK constraints.
+			// generated columns and CHECK constraints. The dialect tag
+			// lets the cross-engine writer (PG) apply the ADR-0016
+			// translator to MySQL idioms in the expression body
+			// (json_unquote/json_extract → ->>, IFNULL → COALESCE,
+			// etc.) instead of emitting them verbatim.
 			entry.Expression = normalizeMySQLExpressionText(expression)
+			entry.ExpressionDialect = dialectName
 		}
 		idx.Columns = append(idx.Columns, entry)
 	}

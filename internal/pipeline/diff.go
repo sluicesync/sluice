@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"sort"
 	"strings"
 
@@ -123,6 +124,16 @@ func (d *Differ) Run(ctx context.Context) (*ir.SchemaDiff, error) {
 		return nil, errors.New("diff: source schema has no tables")
 	}
 
+	// Engine-default exclusions (Bug 22): same shape as Migrator and
+	// Streamer — merge engine-supplied patterns (e.g. PlanetScale's
+	// `_vt_*`) when the operator is in exclude-or-no-filter mode.
+	if eff, added := effectiveTableFilter(d.Filter, d.Source, d.SourceDSN); len(added) > 0 {
+		slog.InfoContext(ctx, "applying engine-default table exclusions",
+			slog.String("engine", d.Source.Name()),
+			slog.Any("patterns", added),
+		)
+		d.Filter = eff
+	}
 	if err := applyTableFilter(ctx, srcSchema, d.Filter); err != nil {
 		return nil, err
 	}
