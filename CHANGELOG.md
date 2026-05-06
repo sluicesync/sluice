@@ -6,6 +6,36 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-05-06
+
+Operator quality-of-life + cross-engine type-edge audit + OSS-hygiene starter. Three tracks: `sync stop --wait` closes the operator-coordination gap surfaced by v0.8.0's stretch-testing of ALTER windows; new TIMESTAMP-precision integration tests audit the cross-engine boundary that Bug 19's TZ fix opened to scrutiny; `CONTRIBUTING.md` and `docs/dev/release-template.md` formalise the conventions that have been carried in conversation memory across the v0.x ramp.
+
+### Added
+
+- **`sluice sync stop --wait`** (extends ADR-0025). Blocks the CLI until the running streamer confirms it's drained gracefully; `--timeout` (default 5 minutes) bounds the wait. Useful for ALTER coordination — `sync stop --wait && alter-source.sh && sync start` now runs the ALTER only after the streamer has confirmed it drained, instead of operators polling `sync status` or `pgrep`-ing the streamer process.
+
+  Implementation rests on a flag-clearing convention: the streamer already calls `applier.ClearStopRequested(streamID)` at startup (Bug 11 fix from v0.3.2). v0.9.0 adds a second clear point — after a stop-signal-driven graceful drain, the streamer clears the flag again as the very last step of `Streamer.Run`. The CLI's `--wait` polls `ReadStopRequested` (1s cadence) until the flag clears and exits success; on timeout it exits non-zero with a clear message and the stop request remains in place so the streamer continues draining in the background.
+
+  The streamer only clears the flag on stop-signal-driven exits, not on Ctrl-C / outer-ctx cancels — `pollStopSignal` now exposes an optional `*atomic.Bool` that the streamer reads after `dispatchApply` returns to decide whether the exit was the operator's stop request or something else. Without `--wait` the behaviour is unchanged; against an older streamer that doesn't clear the flag, `--wait` blocks until `--timeout` and then surfaces a clear "did not complete drain" message.
+
+- **TIMESTAMP / DATETIME precision integration tests**
+  (`internal/pipeline/migrate_temporal_precision_integration_test.go`).
+  Bug 19 (v0.8.0) closed the silent-corruption hole on the TZ axis;
+  the precision axis was previously covered only by unit tests on the
+  IR's `Precision` field. The new integration tests exercise
+  end-to-end behaviour across `DATETIME(0/3/6)` /
+  `TIMESTAMP(0/3/6)` (MySQL→PG) and `TIMESTAMP(0/3/6)` /
+  `TIMESTAMPTZ(0/3/6)` (PG→MySQL), seeded with
+  `12:34:56.123456` so each precision tier surfaces a distinct
+  truncated value. Round-trips assert wall-clock equivalence within
+  the column's declared precision; the PG→MySQL case also pins the
+  expected target column types (`TIMESTAMP` → `DATETIME`,
+  `TIMESTAMPTZ` → `TIMESTAMP`) so a future schema-emit rewire would
+  surface as a schema-shape failure rather than silently passing on
+  equivalent values.
+
+- **`CONTRIBUTING.md` release-process section + `docs/dev/release-template.md`** — formalise the GitHub release-notes structure (Highlights / Fixed / Compatibility / Who-needs-this) that's been carried in conversation memory across the v0.x ramp, plus the `chore: cut vX.Y.Z` commit + annotated-tag pattern. The release-template doc carries section-by-section guidance with examples drawn from the v0.7.0 / v0.8.0 release notes.
+
 ## [0.8.1] - 2026-05-06
 
 Patch release. Closes a CI integration test regression introduced in v0.8.0 (test-only, no behaviour change for users), and finishes the Bug 22 auto-exclude story for vanilla-MySQL connections to PlanetScale endpoints.
