@@ -30,6 +30,9 @@ vendor/
 *~
 .DS_Store
 
+# Claude Code local state
+.claude/
+
 # Environment and secrets
 .env
 .env.local
