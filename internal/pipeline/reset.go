@@ -10,7 +10,9 @@
 // EXISTS. See ADR-0023 for the full design.
 //
 // Engine-neutrality: this file imports only [ir]; engine packages
-// expose [ir.TableDropper], [ir.StreamCleaner], and the existing
+// expose [ir.TableDropper], [ir.StreamCleaner], the optional
+// [ir.SchemaTypeDropper] for engines whose enum/UDTs survive table
+// drops (PG; MySQL doesn't need it), and the existing
 // [ir.MigrationStateStore.ClearMigration] surface. Engines that
 // don't opt in cause [resetTargetData] to surface a clear "engine
 // does not support --reset-target-data" error before any work runs.
@@ -57,6 +59,9 @@ func resetTargetData(ctx context.Context, schema *ir.Schema, rw ir.RowWriter, st
 	if err := dropTables(ctx, dropper, schema.Tables); err != nil {
 		return err
 	}
+	if err := dropSchemaTypes(ctx, rw, schema); err != nil {
+		return err
+	}
 	slog.InfoContext(ctx, "reset: target data wiped; proceeding with cold-start",
 		slog.Int("tables_dropped", len(schema.Tables)),
 	)
@@ -87,9 +92,35 @@ func resetTargetDataForStream(ctx context.Context, schema *ir.Schema, rw ir.RowW
 	if err := dropTables(ctx, dropper, schema.Tables); err != nil {
 		return err
 	}
+	if err := dropSchemaTypes(ctx, rw, schema); err != nil {
+		return err
+	}
 	slog.InfoContext(ctx, "reset: target data wiped; proceeding with cold-start",
 		slog.Int("tables_dropped", len(schema.Tables)),
 	)
+	return nil
+}
+
+// dropSchemaTypes drops user-defined database-level types the source
+// IR schema would create on a cold-start (e.g. PG enum types). Probes
+// the row writer for the optional [ir.SchemaTypeDropper] surface; a
+// no-op when the engine doesn't expose it (MySQL embeds enum values
+// inline on the column, so there are no orphan types to clean up).
+//
+// Must run AFTER the table drops — columns can reference the types,
+// so dropping the type first either errors or requires more aggressive
+// CASCADE on the type drop itself. Tables-first keeps the dependency
+// order natural. Fixes Bug 18 where partial cold-start failures left
+// enum types orphaned on the target.
+func dropSchemaTypes(ctx context.Context, rw ir.RowWriter, schema *ir.Schema) error {
+	typeDropper, ok := rw.(ir.SchemaTypeDropper)
+	if !ok {
+		return nil
+	}
+	if err := typeDropper.DropSchemaTypes(ctx, schema); err != nil {
+		return fmt.Errorf("pipeline: --reset-target-data: drop schema types: %w", err)
+	}
+	slog.InfoContext(ctx, "reset: dropped schema-defined types")
 	return nil
 }
 

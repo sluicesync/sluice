@@ -163,6 +163,45 @@ func (w *RowWriter) DropTables(ctx context.Context, tables []*ir.Table) error {
 	return nil
 }
 
+// DropSchemaTypes drops every Postgres enum type that the source IR
+// schema would create on a fresh cold-start. Used by the
+// `--reset-target-data` recovery path (ADR-0023) to fix Bug 18: when
+// a partial cold-start fails after CREATE TYPE but before the table
+// is committed, the next reset attempt drops the table cleanly but
+// leaves the enum behind, causing the re-run's CREATE TYPE to fail
+// with "type X already exists".
+//
+// The names walked here mirror [enumTypeName] — the same convention
+// the schema writer uses when creating the types — so the drop list
+// is exactly the set sluice would have created. Enum types belonging
+// to other applications on a shared target database are not touched.
+//
+// Implements [ir.SchemaTypeDropper]. Order matters: callers must drop
+// tables first (columns may reference these types). DROP TYPE IF
+// EXISTS ... CASCADE keeps the call idempotent across partial-failure
+// retries and handles the corner case where a stray dependent column
+// outlives the table drop.
+func (w *RowWriter) DropSchemaTypes(ctx context.Context, schema *ir.Schema) error {
+	if schema == nil {
+		return nil
+	}
+	for _, table := range schema.Tables {
+		if table == nil {
+			continue
+		}
+		for _, col := range table.Columns {
+			if _, isEnum := col.Type.(ir.Enum); !isEnum {
+				continue
+			}
+			stmt := "DROP TYPE IF EXISTS " + quoteIdent(w.schema) + "." + quoteIdent(enumTypeName(table.Name, col.Name)) + " CASCADE"
+			if _, err := w.db.ExecContext(ctx, stmt); err != nil {
+				return fmt.Errorf("postgres: drop enum type for %s.%s: %w", table.Name, col.Name, err)
+			}
+		}
+	}
+	return nil
+}
+
 // IsTableEmpty reports whether the target table has no rows. A
 // missing table is treated as empty so the cold-start pre-flight
 // doesn't double up with the subsequent CREATE TABLE IF NOT EXISTS

@@ -367,6 +367,96 @@ func TestMigrate_PostgresToMySQL_CheckConstraintTranslation(t *testing.T) {
 	if n != 2 {
 		t.Errorf("accounts row count = %d; want 2", n)
 	}
+}
+
+// TestMigrate_MySQLToPostgres_CheckBoolIdiom exercises the v0.8.0
+// bool-idiom translator (ADR-0016 addition): MySQL CHECKs and
+// generated columns referencing a tinyint(1)→BOOLEAN-mapped column
+// with int-literal idioms (`0 <> is_active`, `coalesce(deleted, 0)`)
+// must be rewritten to bool literals on the PG target. Without the
+// rewrite, PG's strict typing rejects the CREATE TABLE.
+//
+// The MySQL information_schema may report CHECK clauses with normalized
+// quoting or operator spelling; we assert on PG enforcement (insert
+// passes/fails as the constraint requires) rather than pinning the
+// exact rewritten text, which keeps the test independent of upstream
+// reformatting.
+func TestMigrate_MySQLToPostgres_CheckBoolIdiom(t *testing.T) {
+	mysqlSource, _, mysqlCleanup := startMySQL(t)
+	defer mysqlCleanup()
+
+	_, pgTarget, pgCleanup := startPostgres(t)
+	defer pgCleanup()
+
+	// `is_active TINYINT(1)` lands as PG BOOLEAN. The CHECK uses
+	// `0 <> is_active`; without the bool rewrite, PG rejects with
+	// "operator does not exist: integer <> boolean".
+	const seedDDL = `
+		CREATE TABLE accounts (
+			id        BIGINT      NOT NULL PRIMARY KEY,
+			is_active TINYINT(1)  NOT NULL,
+			CONSTRAINT accounts_must_be_active CHECK (0 <> is_active)
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+		INSERT INTO accounts (id, is_active) VALUES
+			(1, 1),
+			(2, 1);
+	`
+	applyMySQLDDL(t, mysqlSource, seedDDL)
+
+	mysqlEng, ok := engines.Get("mysql")
+	if !ok {
+		t.Fatal("mysql engine not registered")
+	}
+	pgEng, ok := engines.Get("postgres")
+	if !ok {
+		t.Fatal("postgres engine not registered")
+	}
+
+	mig := &Migrator{
+		Source:    mysqlEng,
+		Target:    pgEng,
+		SourceDSN: mysqlSource,
+		TargetDSN: pgTarget,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	if err := mig.Run(ctx); err != nil {
+		t.Fatalf("Migrator.Run: %v", err)
+	}
+
+	tgt, err := sql.Open("pgx", pgTarget)
+	if err != nil {
+		t.Fatalf("open pg target: %v", err)
+	}
+	defer func() { _ = tgt.Close() }()
+
+	// CHECK landed.
+	checkNames := readPGCheckNames(t, ctx, tgt, "accounts")
+	if len(checkNames) < 1 {
+		t.Fatalf("pg target accounts: no CHECK constraints landed; want >= 1")
+	}
+
+	// Pre-existing valid rows survived.
+	var n int
+	if err := tgt.QueryRowContext(ctx, "SELECT COUNT(*) FROM accounts").Scan(&n); err != nil {
+		t.Fatalf("count accounts: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("accounts row count = %d; want 2", n)
+	}
+
+	// Constraint enforcement: an inactive (false) row must be rejected.
+	if _, err := tgt.ExecContext(ctx,
+		`INSERT INTO accounts (id, is_active) VALUES (3, false)`); err == nil {
+		t.Errorf("INSERT with is_active=false should have been rejected by CHECK on PG target")
+	}
+	// And a true row must be accepted (sanity that the CHECK isn't
+	// permanently false from a botched rewrite).
+	if _, err := tgt.ExecContext(ctx,
+		`INSERT INTO accounts (id, is_active) VALUES (4, true)`); err != nil {
+		t.Errorf("INSERT with is_active=true should have been accepted on PG target; got: %v", err)
+	}
 
 	// Constraint enforcement: invalid email rejected.
 	if _, err := tgt.ExecContext(ctx,

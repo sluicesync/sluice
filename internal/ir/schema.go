@@ -188,10 +188,27 @@ type Index struct {
 	Kind IndexKind
 }
 
-// IndexColumn is a single column entry within an index.
+// IndexColumn is a single entry within an index. Most entries name a
+// column directly via Column; functional/expression indexes (MySQL
+// 8.0.13+ functional indexes, Postgres expression indexes) instead
+// carry their indexed expression in Expression with Column empty.
+// Exactly one of Column / Expression is non-empty for a well-formed
+// IndexColumn.
 type IndexColumn struct {
-	// Column is the indexed column's name.
+	// Column is the indexed column's name. Empty when this entry is an
+	// expression index entry (Expression non-empty).
 	Column string
+	// Expression is the SQL expression indexed by this entry, in the
+	// source dialect's syntax with engine-specific identifier quoting
+	// stripped at the read boundary (same normalization as
+	// CheckConstraint.Expr / Column.GeneratedExpr). Empty for the
+	// common case of a plain column entry. When non-empty, Column is
+	// empty.
+	//
+	// Cross-engine emit policy mirrors generated columns: writers
+	// passthrough verbatim, non-portable expressions fail loudly on
+	// the target rather than be silently rewritten.
+	Expression string
 	// Desc indicates the column is indexed in descending order.
 	Desc bool
 	// Length is a prefix length for prefix indexes (MySQL); zero means

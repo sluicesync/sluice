@@ -276,6 +276,27 @@ type BulkTableDropper interface {
 	DropTables(ctx context.Context, tables []*Table) error
 }
 
+// SchemaTypeDropper is the optional surface a [RowWriter] (or
+// [SchemaWriter]) can implement to drop user-defined database-level
+// types created from the IR schema (e.g. Postgres `CREATE TYPE ...
+// AS ENUM` types). Used by the `--reset-target-data` recovery path
+// (ADR-0023) after the table drops complete: a partial cold-start
+// can leave enum types behind that the next CREATE TYPE call would
+// refuse with "type X already exists" (Bug 18).
+//
+// Engines whose enum representation doesn't outlive the table (MySQL
+// embeds enum values inline on the column) don't need to implement
+// this surface; the reset path no-ops when it isn't present.
+//
+// Implementations must use IF EXISTS / CASCADE semantics so the call
+// stays idempotent across partial-failure retries. The schema passed
+// in is the source-side IR so dropped types are scoped to ones sluice
+// would have created — types belonging to other applications on a
+// shared target database are untouched.
+type SchemaTypeDropper interface {
+	DropSchemaTypes(ctx context.Context, schema *Schema) error
+}
+
 // TableEmptyChecker is the optional surface a [RowWriter] (or
 // [SchemaWriter]) can implement so the pipeline can detect a
 // pre-existing populated dest table before starting a cold-start

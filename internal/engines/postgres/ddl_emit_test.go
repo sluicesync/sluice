@@ -384,7 +384,7 @@ func TestEmitCheckConstraint(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			if got := emitCheckConstraint(c.in); got != c.want {
+			if got := emitCheckConstraint(c.in, nil); got != c.want {
 				t.Errorf("\n got  %q\n want %q", got, c.want)
 			}
 		})

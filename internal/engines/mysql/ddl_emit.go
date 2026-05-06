@@ -470,12 +470,25 @@ func emitTableDef(table *ir.Table) (string, error) {
 
 // emitIndexColumnList renders a parenthesised, comma-separated list
 // of index columns with optional prefix length and direction.
+//
+// Functional/expression entries (Expression non-empty, Column empty)
+// render as `(expression_text)` — MySQL 8.0.13+ syntax requires the
+// expression to be parenthesised, which combined with the outer
+// parens of the column list produces the canonical double-parens
+// shape `((LOWER(email)))`. Verbatim-passthrough policy applies: the
+// expression text is preserved as-is, so non-portable constructs fail
+// loudly on the target rather than be silently rewritten.
 func emitIndexColumnList(cols []ir.IndexColumn) string {
 	parts := make([]string, len(cols))
 	for i, c := range cols {
-		entry := quoteIdent(c.Column)
-		if c.Length > 0 {
-			entry += fmt.Sprintf("(%d)", c.Length)
+		var entry string
+		if c.Expression != "" {
+			entry = "(" + c.Expression + ")"
+		} else {
+			entry = quoteIdent(c.Column)
+			if c.Length > 0 {
+				entry += fmt.Sprintf("(%d)", c.Length)
+			}
 		}
 		if c.Desc {
 			entry += " DESC"

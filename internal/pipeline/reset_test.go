@@ -183,6 +183,112 @@ func (s *stubBulkDroppingWriter) DropTables(_ context.Context, tables []*ir.Tabl
 	return nil
 }
 
+// stubTypeDroppingWriter combines [ir.RowWriter] + [ir.TableDropper]
+// + [ir.SchemaTypeDropper]. Records each invocation so the reset path
+// tests can assert ordering: tables drop first, then types.
+type stubTypeDroppingWriter struct {
+	stubDroppingWriter
+	typeCalls   int
+	typeSchemas []*ir.Schema
+	typeErr     error
+	callOrder   []string // "drop-table:<name>" / "drop-types"
+	recordOrder bool
+}
+
+func (s *stubTypeDroppingWriter) DropTable(ctx context.Context, table *ir.Table) error {
+	if s.recordOrder {
+		s.callOrder = append(s.callOrder, "drop-table:"+table.Name)
+	}
+	return s.stubDroppingWriter.DropTable(ctx, table)
+}
+
+func (s *stubTypeDroppingWriter) DropSchemaTypes(_ context.Context, schema *ir.Schema) error {
+	s.typeCalls++
+	s.typeSchemas = append(s.typeSchemas, schema)
+	if s.recordOrder {
+		s.callOrder = append(s.callOrder, "drop-types")
+	}
+	return s.typeErr
+}
+
+// TestResetTargetData_DropsSchemaTypesAfterTables verifies that when
+// the row writer implements [ir.SchemaTypeDropper] (PG case), the
+// reset path drops schema-defined types AFTER the table drops have
+// completed. This is Bug 18: orphan enum types from a partial
+// cold-start were left behind by previous resets, causing the next
+// CREATE TYPE to fail with "type X already exists".
+func TestResetTargetData_DropsSchemaTypesAfterTables(t *testing.T) {
+	captureSlog(t)
+	schema := &ir.Schema{
+		Tables: []*ir.Table{
+			{Name: "users", Columns: []*ir.Column{
+				{Name: "role", Type: ir.Enum{Values: []string{"admin", "user"}}},
+			}},
+			{Name: "orders"},
+		},
+	}
+	rw := &stubTypeDroppingWriter{recordOrder: true}
+	store := newFakeStateStore()
+
+	if err := resetTargetData(context.Background(), schema, rw, store, "m1"); err != nil {
+		t.Fatalf("resetTargetData: %v", err)
+	}
+	if rw.typeCalls != 1 {
+		t.Errorf("DropSchemaTypes calls = %d; want 1", rw.typeCalls)
+	}
+	if len(rw.typeSchemas) != 1 || rw.typeSchemas[0] != schema {
+		t.Errorf("DropSchemaTypes schema = %v; want %v", rw.typeSchemas, schema)
+	}
+	// Order: every table drop must precede the type drop.
+	want := []string{"drop-table:users", "drop-table:orders", "drop-types"}
+	if len(rw.callOrder) != len(want) {
+		t.Fatalf("call order = %v; want %v", rw.callOrder, want)
+	}
+	for i, got := range rw.callOrder {
+		if got != want[i] {
+			t.Errorf("call[%d] = %q; want %q", i, got, want[i])
+		}
+	}
+}
+
+// TestResetTargetData_TypeDropErrorPropagates verifies that errors
+// from DropSchemaTypes surface with the reset-action prefix and are
+// wrapped so callers can errors.Is against the underlying cause.
+func TestResetTargetData_TypeDropErrorPropagates(t *testing.T) {
+	captureSlog(t)
+	schema := &ir.Schema{Tables: []*ir.Table{{Name: "users"}}}
+	rw := &stubTypeDroppingWriter{typeErr: errors.New("permission denied on pg_type")}
+	store := newFakeStateStore()
+
+	err := resetTargetData(context.Background(), schema, rw, store, "m1")
+	if err == nil {
+		t.Fatal("expected error; got nil")
+	}
+	if !strings.Contains(err.Error(), "drop schema types") {
+		t.Errorf("err = %v; want 'drop schema types' wording", err)
+	}
+	if !errors.Is(err, rw.typeErr) {
+		t.Errorf("type-drop error not wrapped: %v", err)
+	}
+}
+
+// TestResetTargetData_NoTypeDropperIsNoOp verifies the reset path is
+// happy when the row writer doesn't implement [ir.SchemaTypeDropper]
+// (MySQL case): no error, no panic, table drops still run.
+func TestResetTargetData_NoTypeDropperIsNoOp(t *testing.T) {
+	captureSlog(t)
+	schema := &ir.Schema{Tables: []*ir.Table{{Name: "users"}}}
+	rw := &stubDroppingWriter{} // no SchemaTypeDropper
+	store := newFakeStateStore()
+
+	if err := resetTargetData(context.Background(), schema, rw, store, "m1"); err != nil {
+		t.Fatalf("resetTargetData: %v", err)
+	}
+	if len(rw.dropped) != 1 || rw.dropped[0] != "users" {
+		t.Errorf("dropped = %v; want [users]", rw.dropped)
+	}
+}
+
 // TestResetTargetData_PrefersBulkDropper confirms that when the row
 // writer implements [ir.BulkTableDropper], the reset path uses the
 // single-statement bulk DROP rather than calling DropTable per table.

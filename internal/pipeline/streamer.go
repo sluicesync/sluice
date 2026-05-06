@@ -237,6 +237,21 @@ func (s *Streamer) Run(ctx context.Context) error {
 	if err != nil {
 		return wrapWithHint(PhaseCDC, fmt.Errorf("pipeline: read position: %w", err))
 	}
+	// The applier stamps every row it reads back with the applier's
+	// own engine name (target's engine), but the position itself is a
+	// source-side artifact (a MySQL GTID set, a Postgres LSN). On
+	// cross-engine resume — e.g. source=planetscale, target=postgres —
+	// the source CDC reader's decoder rejects the position because its
+	// Engine tag matches the target instead of the source. v0.1.0's
+	// Bug 2 fix patched the same-family case (PS↔MySQL) by widening
+	// the MySQL decoder's engine acceptance, but didn't generalise to
+	// truly cross-engine pairs (Bug 20). Re-stamping with the source
+	// engine's own name here makes every (source, target) pair
+	// round-trip cleanly through its source decoder, including
+	// PS-source → PG-target.
+	if found {
+		persisted = retagPositionForSource(persisted, s.Source.Name())
+	}
 
 	// ---- 3.5. Dry-run: print plan and exit before any state mutation. ----
 	if s.DryRun {
@@ -715,6 +730,37 @@ func (s *Streamer) resolveStreamID() string {
 		id = id[:255]
 	}
 	return id
+}
+
+// retagPositionForSource normalises a persisted ir.Position so its
+// Engine field matches the source engine's name. The applier always
+// stamps recovered positions with the applier's own (target's) engine
+// name on the way out of the control table; on cross-engine resume
+// the source CDC reader's decoder would reject the position with
+// "wrong engine" because the tag refers to the target. Re-stamping
+// here, before the position reaches the source CDC reader, makes
+// every (source, target) pair round-trip cleanly through whichever
+// decoder the source engine uses.
+//
+// The from-now sentinel (empty Engine and Token) is returned
+// untouched — every CDC reader's decoder treats that pair as
+// "start at the source's current position" and must not see a
+// non-empty Engine tag. An otherwise-empty token paired with a
+// non-empty engine is also passed through unchanged so the source
+// decoder can surface the malformed-token error itself.
+//
+// See [Streamer.Run] for the call site and Bug 20 in CHANGELOG for
+// the cross-engine pair this generalises (PlanetScale source →
+// Postgres target).
+func retagPositionForSource(persisted ir.Position, sourceEngine string) ir.Position {
+	if persisted.Engine == "" && persisted.Token == "" {
+		return persisted
+	}
+	if persisted.Token == "" {
+		return persisted
+	}
+	persisted.Engine = sourceEngine
+	return persisted
 }
 
 // redactedHost extracts a "host:port" (or "host") fragment from the

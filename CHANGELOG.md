@@ -6,6 +6,10 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-05-06
+
+Schema-diff release plus five real-world bug fixes from v0.7.0 testing. Headline addition is `sluice schema diff` (ADR-0029): drift detection between sluice's expected target shape and the schema actually present, with text + JSON output, copy-paste-ready ALTER suggestions, and CI-friendly exit codes. The diff round picked up cross-engine type retargeting plus default / generated-expression / CHECK comparison along the way. The five bug fixes — including Bug 19's silent TIMESTAMP corruption on non-UTC hosts and Bug 20's cross-engine resume dispatch — closed the remaining real-world gaps the v0.7.0 stretch testing surfaced.
+
 ### Added
 
 - **`sluice schema diff` (ADR-0029).** Drift detection between what
@@ -78,6 +82,140 @@ project follows [Semantic Versioning](https://semver.org/).
   injected drift surfaces (narrowed VARCHAR, missing column, extra
   table on target). Also covers JSON / text rendering and
   `IgnoreExtras` semantics on the cross-engine path.
+
+### Fixed
+
+- **Bug 16 — MySQL functional / expression indexes wall the schema
+  reader.** `information_schema.statistics` rows for
+  functional/expression indexes (MySQL 8.0.13+) carry
+  `COLUMN_NAME = NULL` and put the actual expression in the
+  `EXPRESSION` column. The reader scanned `column_name` into a plain
+  `string`, so the first such index produced
+  `converting NULL to string is unsupported` and aborted the
+  schema-read for the whole database — a hard wall blocking every
+  operation against production schemas that use the feature.
+
+  Fix: scan into `sql.NullString`, add `EXPRESSION` to the SELECT,
+  and route NULL-column rows into a new `ir.IndexColumn.Expression`
+  field (run through the same `normalizeMySQLExpressionText`
+  identifier-quote scrubbing the reader applies to generated columns
+  and CHECKs). MySQL and Postgres DDL writers render expression
+  entries as parenthesised expression text. Cross-engine MySQL→PG
+  emit is best-effort: portable expressions round-trip; non-portable
+  ones still fail loudly on `CREATE INDEX`. Regression guards:
+  `TestEmitCreateIndex/expression_entry`,
+  `TestEmitCreateIndex/mixed_plain_and_expression_entries` (unit) and
+  `TestSchemaReader_FunctionalIndex` (integration).
+
+- **Bug 17 — MySQL bool-idiom CHECK / generated expressions reject
+  on PG (ADR-0016 addition).** MySQL's tinyint(1)→PG BOOLEAN mapping
+  silently broke CHECK constraints and generated columns that compared
+  the column against an integer literal — `0 <> is_active`,
+  `is_active = 1`, `coalesce(is_active, 0)` — because PG's strict
+  typing rejects integer↔boolean comparisons that MySQL accepts via
+  implicit coercion. Real-world report: 3 of 138 tables on
+  `schema_example_02` blocked by this until columns were dropped
+  manually.
+
+  Fix extends the writer-side translator (`translateExprForPG`) with
+  an `ExprContext` carrying the table's bool-mapped column names.
+  When the rewrite recognises `<int_lit> <op> <bool_ident>` /
+  `<bool_ident> <op> <int_lit>` (op ∈ `=`, `!=`, `<>`; lit ∈ `0`, `1`)
+  or `COALESCE(<bool_ident>, <int_lit>)` and the symmetric form, the
+  int literal is replaced with `false` / `true`. `IFNULL` is renamed
+  to `COALESCE` by an earlier pass so it falls in too. Anything else
+  passes through verbatim — same loud-failure tenet as the rest of
+  ADR-0016. Same-engine emits unaffected (the translator only fires
+  when the IR's dialect tag differs from the writer's). New
+  integration test `TestMigrate_MySQLToPostgres_CheckBoolIdiom`
+  verifies a real `CHECK (0 <> is_active)` lands on PG and enforces
+  correctly. ADR-0016 updated with an "Added in v0.8.0" subsection.
+
+- **Bug 18 — `--reset-target-data` left orphaned PG enum types.**
+  The destructive-recovery path (ADR-0023) dropped tables and the
+  bookkeeping row; enum types created during a partially-failed
+  cold-start survived and caused the next reset's `CREATE TYPE` to
+  fail with "type X already exists" until operators manually
+  `DROP TYPE`d. Fix extends the reset path with a
+  `dropSchemaTypes` pass that runs after the table drops, walking
+  the source schema for `ir.Enum` columns and emitting
+  `DROP TYPE IF EXISTS "schema"."<table>_<col>_enum" CASCADE`. PG-
+  only via the new optional `ir.SchemaTypeDropper` interface; MySQL
+  embeds enum values inline and is unaffected. Idempotent across
+  partial failures. New integration test
+  `TestMigrate_ResetTargetData_DropsOrphanEnumTypes` simulates the
+  stuck state, runs reset, and asserts the next migrate succeeds
+  with rows landing.
+
+- **Bug 19 — silent TIMESTAMP corruption in MySQL→PG CDC on non-UTC
+  hosts.** TIMESTAMP values delivered through CDC drifted by the host
+  process's local UTC offset (e.g. seven hours early on a US/Pacific
+  host during DST). Cold-start bulk copy was correct, CDC was not, so
+  the destination silently held the wrong instant for every row
+  updated post-cold-start until an operator happened to compare
+  source and target epochs. Loud failures beat silent corruption;
+  this one snuck past v0.7.x.
+
+  Two distinct corruption surfaces landed under the same symptom:
+
+  - **CDC binlog path.** MySQL's binlog wire format encodes
+    TIMESTAMP as a UTC seconds-since-epoch integer, but go-mysql's
+    `decodeTimestamp2` builds the resulting `time.Time` via
+    `time.Unix(sec, ...)` whose `Location` defaults to `time.Local`.
+    With the parser's `ParseTime=false` setting (sluice's configured
+    path), `fracTime.String()` then formats that instant in
+    process-local TZ unless
+    `BinlogSyncerConfig.TimestampStringLocation` is pinned. The
+    formatted wall-clock string flowed into sluice's `decodeTime`,
+    which parses naked datetime strings as UTC — silently
+    re-interpreting a PT wall clock as a UTC instant.
+
+  - **Cold-start / database/sql path.** A second, latent surface:
+    if the MySQL session's `time_zone` inherits the server's
+    `default_time_zone` (often `SYSTEM`, which follows the host),
+    MySQL converts the column's UTC-stored TIMESTAMP into the
+    session TZ for the wire format. The driver — running with
+    `cfg.Loc=UTC` — re-interprets that wall-clock as UTC, producing
+    the same offset. This wasn't observed because test containers
+    default to UTC; production deployments against MySQL servers
+    with non-UTC `default_time_zone` would have hit it.
+
+  Fix lives at the connection-protocol layer in two places — no
+  Go-side runtime-TZ conversion that could drift with deployment
+  changes: the binlog client sets
+  `BinlogSyncerConfig.TimestampStringLocation = time.UTC`, and
+  every database/sql connection injects `time_zone='+00:00'` into
+  `cfg.Params` so the driver issues `SET time_zone='+00:00'`
+  immediately after handshake (covers schema reader, row reader,
+  row writer, CDC schema cache, change applier, migration-state
+  store). DATETIME is unaffected (its binlog encoding is the
+  broken-down date/time directly with no TZ conversion).
+  Regression guard: `TestCDCReader_TimestampNonUTCHost`
+  (integration tag) pins `time.Local` to America/Los_Angeles,
+  inserts a TIMESTAMP, and asserts the value comes back as the
+  same UTC instant from both the cold-start `RowReader` and the
+  CDC stream's update event.
+
+- **Bug 20 — cross-engine warm-resume dispatch on the wrong driver.**
+  `sluice sync start --resume` failed on
+  `--source-driver=planetscale --target-driver=postgres` because the
+  persisted CDC position came back from the target's
+  `sluice_cdc_state` tagged with the applier's (target's) engine
+  name, so the source CDC reader's decoder rejected it as belonging
+  to the wrong engine. v0.1.0's Bug 2 fix patched the symmetric
+  same-family PS↔MySQL pair by widening MySQL's decoder; it didn't
+  generalise to truly cross-engine pairs. Fix is a re-stamp at the
+  streamer level: every persisted position picked up via
+  `applier.ReadPosition` has its `Engine` field set to
+  `s.Source.Name()` before reaching the source CDC reader. All four
+  pairs (MySQL↔MySQL, MySQL↔PG, PG↔PG, PG↔MySQL, plus the
+  PlanetScale flavor) round-trip cleanly without per-pair special-
+  casing. The from-now sentinel (`Engine="" Token=""`) is preserved.
+  The `--reset-target-data --yes` workaround is no longer needed for
+  cross-engine zero-downtime resumes. New unit tests
+  `TestRetagPositionForSource_*` (helper-level pinning across the
+  four pairs) and `TestStreamer_WarmResume_CrossEngine_Retag`
+  (end-to-end-shape pin via recording reader/applier).
 
 ## [0.7.0] - 2026-05-05
 

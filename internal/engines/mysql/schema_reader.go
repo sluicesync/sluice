@@ -188,6 +188,13 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 
 // populateIndexes fills in Index lists for each table, separating the
 // primary key from secondary indexes.
+//
+// MySQL 8.0.13+ supports functional (expression) indexes — e.g.
+// `CREATE INDEX idx ON t ((LOWER(email)))` — and stores those entries
+// in information_schema.statistics with COLUMN_NAME = NULL and the
+// expression text in EXPRESSION. We scan COLUMN_NAME into a
+// sql.NullString so the NULL doesn't blow up the read, and route
+// NULL-column entries through the IR's expression-entry shape.
 func (r *SchemaReader) populateIndexes(ctx context.Context, tables map[string]*ir.Table) error {
 	const q = `
 		SELECT
@@ -196,6 +203,7 @@ func (r *SchemaReader) populateIndexes(ctx context.Context, tables map[string]*i
 			non_unique,
 			LOWER(IFNULL(index_type, '')),
 			column_name,
+			IFNULL(expression, ''),
 			seq_in_index,
 			IFNULL(sub_part, 0),
 			IFNULL(collation, '')
@@ -215,18 +223,19 @@ func (r *SchemaReader) populateIndexes(ctx context.Context, tables map[string]*i
 
 	for rows.Next() {
 		var (
-			tableName string
-			indexName string
-			nonUnique int
-			indexType string
-			colName   string
-			seq       int
-			subPart   int64
-			collation string
+			tableName  string
+			indexName  string
+			nonUnique  int
+			indexType  string
+			colName    sql.NullString
+			expression string
+			seq        int
+			subPart    int64
+			collation  string
 		)
 		if err := rows.Scan(
 			&tableName, &indexName, &nonUnique, &indexType,
-			&colName, &seq, &subPart, &collation,
+			&colName, &expression, &seq, &subPart, &collation,
 		); err != nil {
 			return err
 		}
@@ -244,11 +253,22 @@ func (r *SchemaReader) populateIndexes(ctx context.Context, tables map[string]*i
 			}
 			collected[k] = idx
 		}
-		idx.Columns = append(idx.Columns, ir.IndexColumn{
-			Column: colName,
+		entry := ir.IndexColumn{
 			Desc:   collation == "D",
 			Length: int(subPart),
-		})
+		}
+		if colName.Valid {
+			entry.Column = colName.String
+		} else {
+			// Functional/expression index entry. The raw EXPRESSION text
+			// carries MySQL's stored-form decorations (backtick
+			// identifier quotes, charset introducers, escaped
+			// apostrophes); normalize them at the read boundary so the
+			// IR holds portable expression text — same approach as
+			// generated columns and CHECK constraints.
+			entry.Expression = normalizeMySQLExpressionText(expression)
+		}
+		idx.Columns = append(idx.Columns, entry)
 	}
 	if err := rows.Err(); err != nil {
 		return err

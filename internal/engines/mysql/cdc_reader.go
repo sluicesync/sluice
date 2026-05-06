@@ -222,6 +222,21 @@ func (r *CDCReader) StreamChanges(ctx context.Context, from ir.Position) (<-chan
 		// raw string form; decodeTime in value_decode.go parses
 		// MySQL temporal strings into time.Time at row-decode time
 		// (Bug 12, ADR follow-up).
+		//
+		// TimestampStringLocation is load-bearing for Bug 19. The
+		// binlog wire format encodes TIMESTAMP as a UTC seconds-
+		// since-epoch integer. go-mysql's decodeTimestamp2 builds
+		// a fracTime via time.Unix(sec, ...) — the underlying
+		// time.Time instant is correct, but its Location defaults
+		// to time.Local. When fracTime.String() formats the value
+		// without a TimestampStringLocation, it formats in the
+		// process's local TZ. The string then flows into
+		// decodeTime, which parses naked datetime strings as UTC,
+		// silently shifting the value by the host's offset.
+		// Pinning to time.UTC formats the value in UTC, matching
+		// the decoder's contract. DATETIME isn't affected (its
+		// binlog encoding is the broken-down date/time directly).
+		TimestampStringLocation: time.UTC,
 	}
 	r.syncer = replication.NewBinlogSyncer(syncerCfg)
 

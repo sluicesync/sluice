@@ -17,6 +17,7 @@ import (
 	"context"
 	"database/sql"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -182,6 +183,91 @@ func TestSchemaReader_BasicShape(t *testing.T) {
 	}
 	if len(fk.ReferencedColumns) != 1 || fk.ReferencedColumns[0] != "id" {
 		t.Errorf("posts FK referenced columns = %v; want [id]", fk.ReferencedColumns)
+	}
+}
+
+// TestSchemaReader_FunctionalIndex covers Bug 16: MySQL 8.0.13+
+// functional indexes store COLUMN_NAME = NULL in
+// information_schema.statistics and put the expression text in the
+// EXPRESSION column. Pre-fix, the reader's bare-string scan blew up
+// with "converting NULL to string is unsupported", which was a hard
+// wall — sluice could not read any schema containing such an index.
+//
+// The IR shape is an expression-entry IndexColumn (Expression non-
+// empty, Column empty); the writer renders it in parens to produce
+// the canonical MySQL double-parens form `((LOWER(email)))`.
+func TestSchemaReader_FunctionalIndex(t *testing.T) {
+	dsn, cleanup := startMySQL(t)
+	defer cleanup()
+
+	const ddl = `
+		CREATE TABLE users (
+			id    BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+			email VARCHAR(255)    NOT NULL,
+			PRIMARY KEY (id)
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+		CREATE INDEX idx_lower_email ON users ((LOWER(email)));
+	`
+	applyDDL(t, dsn, ddl)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	r, err := Engine{}.OpenSchemaReader(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenSchemaReader: %v", err)
+	}
+	defer func() {
+		if c, ok := r.(interface{ Close() error }); ok {
+			_ = c.Close()
+		}
+	}()
+
+	schema, err := r.ReadSchema(ctx)
+	if err != nil {
+		t.Fatalf("ReadSchema: %v", err)
+	}
+
+	users := findTable(schema, "users")
+	if users == nil {
+		t.Fatalf("missing users table; have %v", tableNames(schema))
+	}
+
+	var fnIdx *ir.Index
+	for _, ix := range users.Indexes {
+		if ix.Name == "idx_lower_email" {
+			fnIdx = ix
+			break
+		}
+	}
+	if fnIdx == nil {
+		t.Fatalf("missing idx_lower_email index; have %d indexes", len(users.Indexes))
+	}
+	if len(fnIdx.Columns) != 1 {
+		t.Fatalf("idx_lower_email: got %d entries; want 1", len(fnIdx.Columns))
+	}
+	entry := fnIdx.Columns[0]
+	if entry.Column != "" {
+		t.Errorf("expression entry should have empty Column; got %q", entry.Column)
+	}
+	if entry.Expression == "" {
+		t.Fatalf("expression entry should carry expression text; got empty")
+	}
+	// MySQL stores the expression with backtick-quoted identifiers and
+	// possibly a charset introducer; the reader normalizes those out.
+	// The exact form is server-dependent (e.g. lower(email) vs
+	// `lower`(email) on some flavors), so assert the substantive
+	// shape rather than an exact string.
+	wantSubstrs := []string{"lower", "email"}
+	for _, w := range wantSubstrs {
+		if !strings.Contains(strings.ToLower(entry.Expression), w) {
+			t.Errorf("expression %q missing substring %q", entry.Expression, w)
+		}
+	}
+	// Backticks must be stripped at the read boundary.
+	if strings.Contains(entry.Expression, "`") {
+		t.Errorf("expression %q still contains backticks; should be normalized", entry.Expression)
 	}
 }
 

@@ -308,7 +308,7 @@ func emitColumnDef(table *ir.Table, c *ir.Column, opts emitOpts) (string, error)
 			)
 		}
 		sb.WriteString(" GENERATED ALWAYS AS (")
-		sb.WriteString(translateGeneratedExpr(c))
+		sb.WriteString(translateGeneratedExpr(c, table))
 		sb.WriteString(") STORED")
 	}
 	if !c.Nullable {
@@ -444,7 +444,7 @@ func emitTableDef(schema string, table *ir.Table, opts emitOpts) (string, error)
 	// generated SET checks. Order is the IR's preserved source order
 	// so the target's pg_dump shape stays diffable against the source.
 	for _, chk := range table.CheckConstraints {
-		parts = append(parts, emitCheckConstraint(chk))
+		parts = append(parts, emitCheckConstraint(chk, table))
 	}
 
 	if table.PrimaryKey != nil {
@@ -477,10 +477,24 @@ func emitTableDef(schema string, table *ir.Table, opts emitOpts) (string, error)
 // of index columns. Postgres doesn't support prefix-length on indexes
 // the way MySQL does, so c.Length is ignored (lossy if the source
 // used it; documented).
+//
+// Functional/expression entries (Expression non-empty, Column empty)
+// render as `(expression_text)` — Postgres expression-index syntax
+// requires the expression to be parenthesised, which combined with
+// the outer column-list parens produces the canonical double-parens
+// shape `((lower(email)))`. Verbatim-passthrough policy applies: the
+// expression text is preserved as-is, so non-portable constructs
+// (e.g. a MySQL-only function name) fail loudly at CREATE INDEX time
+// rather than be silently rewritten.
 func emitIndexColumnList(cols []ir.IndexColumn) string {
 	parts := make([]string, len(cols))
 	for i, c := range cols {
-		entry := quoteIdent(c.Column)
+		var entry string
+		if c.Expression != "" {
+			entry = "(" + c.Expression + ")"
+		} else {
+			entry = quoteIdent(c.Column)
+		}
 		if c.Desc {
 			entry += " DESC"
 		}
@@ -621,7 +635,7 @@ func emitAddForeignKey(schema, childTable string, fk *ir.ForeignKey) (string, er
 // CASE, function names that differ between dialects — fail loudly at
 // CREATE TABLE time on the target rather than be guessed-at, which
 // matches the project's verbatim-passthrough translation policy.
-func emitCheckConstraint(c *ir.CheckConstraint) string {
+func emitCheckConstraint(c *ir.CheckConstraint, tbl *ir.Table) string {
 	var sb strings.Builder
 	if c.Name != "" {
 		sb.WriteString("CONSTRAINT ")
@@ -629,7 +643,7 @@ func emitCheckConstraint(c *ir.CheckConstraint) string {
 		sb.WriteByte(' ')
 	}
 	sb.WriteString("CHECK (")
-	sb.WriteString(translateCheckExpr(c))
+	sb.WriteString(translateCheckExpr(c, tbl))
 	sb.WriteByte(')')
 	return sb.String()
 }
@@ -638,22 +652,48 @@ func emitCheckConstraint(c *ir.CheckConstraint) string {
 // emit, applying the cross-dialect translation pass when the IR's
 // dialect tag indicates a different source dialect (see ADR-0016).
 // An empty / matching dialect tag emits verbatim — same behaviour as
-// before the translation layer landed.
-func translateGeneratedExpr(c *ir.Column) string {
+// before the translation layer landed. tbl supplies the bool-column
+// context for the v0.8.0 bool-idiom rewrite; nil is permitted and
+// disables that rewrite.
+func translateGeneratedExpr(c *ir.Column, tbl *ir.Table) string {
 	if c.GeneratedExprDialect == "" || c.GeneratedExprDialect == dialectName {
 		return c.GeneratedExpr
 	}
-	return translateExprForPG(c.GeneratedExpr)
+	return translateExprForPG(c.GeneratedExpr, exprContextForTable(tbl))
 }
 
 // translateCheckExpr returns the CHECK-constraint expression to emit,
 // applying the cross-dialect translation pass when the IR's dialect
-// tag indicates a different source dialect.
-func translateCheckExpr(c *ir.CheckConstraint) string {
+// tag indicates a different source dialect. tbl supplies the bool-
+// column context for the v0.8.0 bool-idiom rewrite; nil is permitted
+// and disables that rewrite.
+func translateCheckExpr(c *ir.CheckConstraint, tbl *ir.Table) string {
 	if c.ExprDialect == "" || c.ExprDialect == dialectName {
 		return c.Expr
 	}
-	return translateExprForPG(c.Expr)
+	return translateExprForPG(c.Expr, exprContextForTable(tbl))
+}
+
+// exprContextForTable builds the [ExprContext] for tbl, populating
+// the BoolColumns set with the unquoted names of every column whose
+// IR type is ir.Boolean. Returns the zero value when tbl is nil so
+// callers without a table can still invoke translateExprForPG with a
+// safe fallback.
+func exprContextForTable(tbl *ir.Table) ExprContext {
+	if tbl == nil {
+		return ExprContext{}
+	}
+	var bools map[string]bool
+	for _, col := range tbl.Columns {
+		if _, ok := col.Type.(ir.Boolean); !ok {
+			continue
+		}
+		if bools == nil {
+			bools = make(map[string]bool, 4)
+		}
+		bools[col.Name] = true
+	}
+	return ExprContext{BoolColumns: bools}
 }
 
 // emitColumnList renders a parenthesised, comma-separated list of

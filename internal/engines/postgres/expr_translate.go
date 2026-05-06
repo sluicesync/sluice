@@ -35,13 +35,38 @@
 //   - IFNULL(a, b) → COALESCE(a, b)        (direct rename)
 //   - IF(cond, a, b) → CASE WHEN cond THEN a ELSE b END
 //
+// v0.8.0 added bool-idiom rewrites for CHECK / generated columns
+// referencing tinyint(1)→BOOLEAN-mapped columns. These run only when
+// the caller supplies an [ExprContext] naming the bool-mapped columns;
+// see ExprContext and rewriteBoolIdioms.
+//
 // See ADR-0016 for the design rationale.
 
 package postgres
 
 import (
 	"strings"
+	"unicode"
 )
+
+// ExprContext carries the table-level information rewrite passes need
+// in order to detect dialect idioms that depend on column-type
+// context — specifically the bool-idiom rewrite added in v0.8.0,
+// which can't tell `0 = is_active` from `0 = qty` without knowing
+// which identifiers refer to bool-mapped columns. Existing rewrites
+// (CONCAT, IFNULL, IF, JSON_*) are context-free and ignore it.
+//
+// Pass an empty value (zero-value ExprContext) when no context-aware
+// rewrites should fire — the IR's existing tests build expressions
+// without a table around them, and the rewrites that need context
+// are gated on a non-empty BoolColumns map.
+type ExprContext struct {
+	// BoolColumns is the set of unquoted column names in the table
+	// being emitted whose IR type is ir.Boolean. The bool-idiom
+	// rewrite uses this to decide whether `<int_lit> [op] <ident>`
+	// patterns should be rewritten.
+	BoolColumns map[string]bool
+}
 
 // dialectName is the canonical name this engine uses for the
 // ExprDialect / GeneratedExprDialect tags on IR expressions. Held as
@@ -58,7 +83,7 @@ const dialectName = "postgres"
 // normalized at the read boundary (backticks stripped, charset
 // introducers removed). What remains is the substantive expression
 // body in MySQL dialect.
-func translateExprForPG(expr string) string {
+func translateExprForPG(expr string, ctx ExprContext) string {
 	if expr == "" {
 		return expr
 	}
@@ -70,6 +95,10 @@ func translateExprForPG(expr string) string {
 	expr = rewriteIFNULL(expr)
 	expr = rewriteIF(expr)
 	expr = rewriteCONCAT(expr)
+	// Bool-idiom rewrites run last: they need the canonical names
+	// (IFNULL → COALESCE has already happened) and they're gated on
+	// the caller-supplied BoolColumns set — empty means no rewrites.
+	expr = rewriteBoolIdioms(expr, ctx)
 	return expr
 }
 
@@ -219,4 +248,202 @@ func unquotedSimpleJSONPath(s string) (string, bool) {
 		}
 	}
 	return path, true
+}
+
+// rewriteBoolIdioms rewrites two MySQL-side idioms that surface when
+// a tinyint(1) column gets mapped to PG BOOLEAN: integer-literal
+// comparisons and integer-literal coalesce defaults. PG's strict
+// typing rejects `0 = bool_col` and `coalesce(bool_col, 0)`; MySQL
+// accepts both via implicit coercion. The rewrite is gated on the
+// identifier appearing in ctx.BoolColumns — without that context we
+// don't know which integer literals are bool-coerced.
+//
+// Recognized patterns (op ∈ {=, !=, <>}, lit ∈ {0, 1}):
+//
+//   - <lit> <op> <bool_ident>
+//   - <bool_ident> <op> <lit>
+//   - COALESCE(<bool_ident>, <lit>)
+//   - COALESCE(<lit>, <bool_ident>)
+//
+// `0` becomes `false` and `1` becomes `true`. Anything outside this
+// set falls through verbatim — the loud-failure tenet still applies
+// to the constructs the rewrite doesn't recognize.
+//
+// IFNULL(...) is already renamed to COALESCE(...) by an earlier pass
+// in [translateExprForPG]; this rewrite only needs to look at
+// COALESCE.
+func rewriteBoolIdioms(expr string, ctx ExprContext) string {
+	if len(ctx.BoolColumns) == 0 {
+		return expr
+	}
+	expr = rewriteBoolCoalesce(expr, ctx.BoolColumns)
+	expr = rewriteBoolComparison(expr, ctx.BoolColumns)
+	return expr
+}
+
+// rewriteBoolCoalesce rewrites `COALESCE(<bool_ident>, <int_lit>)` and
+// `COALESCE(<int_lit>, <bool_ident>)` calls (any number of args, only
+// rewrites when exactly one arg is a bool ident and exactly one is an
+// int literal — the two-arg shape MySQL operators actually use).
+// Multi-arg COALESCE shapes that don't match fall through verbatim.
+func rewriteBoolCoalesce(expr string, boolCols map[string]bool) string {
+	return rewriteFunctionCalls(expr, "COALESCE", func(args []string) string {
+		if len(args) != 2 {
+			return ""
+		}
+		left := strings.TrimSpace(args[0])
+		right := strings.TrimSpace(args[1])
+		switch {
+		case boolCols[left] && isBoolIntLiteral(right):
+			return "COALESCE(" + left + ", " + intLitToBool(right) + ")"
+		case boolCols[right] && isBoolIntLiteral(left):
+			return "COALESCE(" + intLitToBool(left) + ", " + right + ")"
+		}
+		return ""
+	})
+}
+
+// rewriteBoolComparison walks expr and rewrites `<int_lit> <op>
+// <bool_ident>` and `<bool_ident> <op> <int_lit>` patterns where
+// op ∈ {=, !=, <>} and int_lit ∈ {0, 1}. Comparisons embedded in
+// string literals are skipped via the shared scanStringLiteral
+// helper.
+//
+// The walker matches tokens in order: identifier or int literal,
+// then a comparison operator, then the opposite token. If both
+// sides match the bool/lit pair, the int literal is replaced with
+// the corresponding bool literal. Anything else (different operator,
+// non-literal RHS, ident not in BoolColumns) is emitted verbatim.
+func rewriteBoolComparison(expr string, boolCols map[string]bool) string {
+	var sb strings.Builder
+	for i := 0; i < len(expr); {
+		// String literal: copy verbatim, no rewrites inside.
+		if expr[i] == '\'' {
+			end := scanStringLiteral(expr, i)
+			sb.WriteString(expr[i:end])
+			i = end
+			continue
+		}
+		// Try to match a token starting here.
+		tok, tokLen, ok := scanToken(expr, i)
+		if !ok {
+			sb.WriteByte(expr[i])
+			i++
+			continue
+		}
+		// Found a token. Check whether it's part of a bool comparison.
+		// We need to peek at the next non-space char(s) for a
+		// comparison operator, then peek at the token on the other side.
+		afterTok := i + tokLen
+		opStart := afterTok
+		for opStart < len(expr) && unicode.IsSpace(rune(expr[opStart])) {
+			opStart++
+		}
+		op, opLen, opOK := scanCompareOp(expr, opStart)
+		if !opOK {
+			// No comparison after this token; emit it verbatim and
+			// advance past it. (The token's bytes are non-string-
+			// literal so single-byte advancement would've also worked,
+			// but skipping the whole token is cheaper and avoids
+			// re-matching it.)
+			sb.WriteString(expr[i:afterTok])
+			i = afterTok
+			continue
+		}
+		rhsStart := opStart + opLen
+		for rhsStart < len(expr) && unicode.IsSpace(rune(expr[rhsStart])) {
+			rhsStart++
+		}
+		rhs, rhsLen, rhsOK := scanToken(expr, rhsStart)
+		if !rhsOK {
+			sb.WriteString(expr[i:afterTok])
+			i = afterTok
+			continue
+		}
+		// Decide whether (tok, op, rhs) forms a bool comparison.
+		var rewritten string
+		switch {
+		case boolCols[tok] && isBoolIntLiteral(rhs):
+			rewritten = tok + " " + op + " " + intLitToBool(rhs)
+		case boolCols[rhs] && isBoolIntLiteral(tok):
+			rewritten = intLitToBool(tok) + " " + op + " " + rhs
+		}
+		if rewritten == "" {
+			sb.WriteString(expr[i:afterTok])
+			i = afterTok
+			continue
+		}
+		sb.WriteString(rewritten)
+		i = rhsStart + rhsLen
+	}
+	return sb.String()
+}
+
+// scanToken returns the identifier or numeric-literal token at expr[i].
+// Returns the token text, its length in bytes, and ok=true on a
+// successful match. Identifiers must start with a letter or underscore
+// and continue with identifier bytes; numeric tokens are runs of
+// digits. Anything else (operators, parens, whitespace) returns
+// ok=false.
+func scanToken(expr string, i int) (tok string, n int, ok bool) {
+	if i >= len(expr) {
+		return "", 0, false
+	}
+	c := expr[i]
+	switch {
+	case (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_':
+		// Identifier.
+		j := i + 1
+		for j < len(expr) && isIdentifierByte(expr[j]) {
+			j++
+		}
+		return expr[i:j], j - i, true
+	case c >= '0' && c <= '9':
+		// Numeric literal (integer-only — bool comparisons that use
+		// floats fall outside the rewrite scope and pass through).
+		j := i + 1
+		for j < len(expr) && expr[j] >= '0' && expr[j] <= '9' {
+			j++
+		}
+		return expr[i:j], j - i, true
+	}
+	return "", 0, false
+}
+
+// scanCompareOp returns the comparison operator at expr[i] for the
+// three forms the bool-idiom rewrite cares about: `=`, `!=`, `<>`.
+// Other comparison operators (`<`, `>`, `<=`, `>=`) aren't part of
+// the v0.8.0 rewrite set — the bug report only lists equality and
+// inequality forms; expanding the set is a future-PR decision.
+func scanCompareOp(expr string, i int) (op string, n int, ok bool) {
+	if i >= len(expr) {
+		return "", 0, false
+	}
+	if i+1 < len(expr) {
+		two := expr[i : i+2]
+		switch two {
+		case "!=", "<>":
+			return two, 2, true
+		}
+	}
+	if expr[i] == '=' {
+		// Single '=', not '=>' or part of a different token. PG and
+		// MySQL both use bare '=' for equality (no SQL-spec '==' here).
+		return "=", 1, true
+	}
+	return "", 0, false
+}
+
+// isBoolIntLiteral reports whether s is the literal string "0" or "1".
+func isBoolIntLiteral(s string) bool {
+	return s == "0" || s == "1"
+}
+
+// intLitToBool maps "0" → "false" and "1" → "true". Caller must
+// ensure s is one of those via [isBoolIntLiteral].
+func intLitToBool(s string) string {
+	if s == "0" {
+		return "false"
+	}
+	return "true"
 }

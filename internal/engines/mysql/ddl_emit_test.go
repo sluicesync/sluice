@@ -519,6 +519,33 @@ func TestEmitCreateIndex(t *testing.T) {
 			},
 			want: "ALTER TABLE `users` ADD INDEX `users_name_prefix` (`name`(16)) USING BTREE;",
 		},
+		{
+			// Bug 16: a functional/expression index entry (MySQL
+			// 8.0.13+) renders the expression in parens. Combined with
+			// the outer column-list parens this produces MySQL's
+			// canonical double-parens form `((LOWER(email)))`.
+			name: "expression entry",
+			idx: &ir.Index{
+				Name:    "idx_lower_email",
+				Kind:    ir.IndexKindBTree,
+				Columns: []ir.IndexColumn{{Expression: "lower(email)"}},
+			},
+			want: "ALTER TABLE `users` ADD INDEX `idx_lower_email` ((lower(email))) USING BTREE;",
+		},
+		{
+			// Mixed entries: a plain column followed by an expression.
+			// Both forms coexist in a single index in MySQL 8.0.13+.
+			name: "mixed plain and expression entries",
+			idx: &ir.Index{
+				Name: "users_mixed",
+				Kind: ir.IndexKindBTree,
+				Columns: []ir.IndexColumn{
+					{Column: "tenant_id"},
+					{Expression: "lower(email)"},
+				},
+			},
+			want: "ALTER TABLE `users` ADD INDEX `users_mixed` (`tenant_id`, (lower(email))) USING BTREE;",
+		},
 	}
 	for _, c := range cases {
 		c := c
