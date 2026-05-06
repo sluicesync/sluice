@@ -12,6 +12,6 @@ DROP TABLE "deprecated_log";
 -- ^ not in source schema; sluice would not create it
 
 -- ──────────── users (mismatched) ────────────
-ALTER TABLE "users" ADD COLUMN "created_at"; -- TYPE; column missing on target
+ALTER TABLE "users" ADD COLUMN "created_at" Timestamp(6) NOT NULL DEFAULT now(); -- column missing on target
 ALTER TABLE "users" ALTER COLUMN "email" TYPE Varchar(255); -- on target: Varchar(100)
 

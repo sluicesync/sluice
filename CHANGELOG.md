@@ -33,6 +33,52 @@ project follows [Semantic Versioning](https://semver.org/).
   produces too much noise for too little operator value, and
   reconciliation is a different tool's job (Atlas, sqitch).
 
+- **Schema diff: defaults, generated expressions, CHECK constraints,
+  per-column ALTER rendering.** Three categories originally listed
+  as out-of-scope in ADR-0029 are now compared because the IR
+  already carries the underlying fields and the comparison shape is
+  additive on `ColumnDiff` / `TableDiff`: column defaults
+  (`ExpectedDefault` / `ActualDefault`, with a small cross-engine
+  equivalence map for the common pairs like `now()` ↔
+  `CURRENT_TIMESTAMP`; mismatches outside the map are flagged
+  low-confidence rather than silently equated), generated-column
+  expressions (verbatim string comparison after trim — engines don't
+  support in-place generated-expr ALTERs, so the renderer emits a
+  comment plus a DROP+ADD reconciliation hint), and table-level
+  CHECK constraints (matched by name; unnamed CHECKs are dropped
+  from the comparison to avoid cross-engine spelling false
+  positives). Renderer fills the actual column type, default, and
+  generated expression on `ALTER TABLE ... ADD COLUMN` suggestions
+  for missing-on-target columns via a new optional
+  `ir.ColumnDDLPreviewer` interface (implemented on both PG and
+  MySQL); the prior `-- TYPE` placeholder remains as a defensive
+  fallback for engines that don't implement it.
+
+- **Cross-engine type-policy retarget on schema diff.** New
+  `internal/translate.RetargetForEngine` rewrites the source-side
+  schema's PG-native IR types (`UUID`, `Inet`, `Cidr`, `Macaddr`,
+  `Array`) to the MySQL-storage IR shapes (`Char(36)`, `Varchar(45)`,
+  `Varchar(30)`, `JSON[binary]`) the target engine's DDL writer
+  would land them on. Wired into `pipeline.Differ.Run` between
+  `ApplyMappings` and the target schema read so cross-engine
+  `sluice schema diff` no longer flags every translated column as
+  drift when the target storage is exactly what sluice would
+  produce. Same-engine pairs and unknown engine pairs return the
+  schema unchanged. Operator-supplied `--type-override` mappings
+  take precedence (override replaces the IR type via
+  `ApplyMappings`; the retarget pass only fires on still-source-
+  native types). v0.8.0 scope is the PG→MySQL direction.
+
+### Tests
+
+- Cross-engine integration test for `sluice schema diff`
+  (`internal/pipeline/diff_cross_engine_integration_test.go`) booting
+  a PG source + MySQL target. Asserts the retarget pass collapses
+  the noisy cross-engine type drift so only the deliberately
+  injected drift surfaces (narrowed VARCHAR, missing column, extra
+  table on target). Also covers JSON / text rendering and
+  `IgnoreExtras` semantics on the cross-engine path.
+
 ## [0.7.0] - 2026-05-05
 
 Performance round 2 + ergonomics + reliability follow-ups. Four new ADRs (0025 graceful-drain stop, 0026 LOAD DATA INFILE writer, 0027 source-tx CDC batching, 0028 memory-bounded streaming). Closes Bug 12 (MySQL CDC silent-stall on temporal columns) and Bug 15 (CLI sync-stop drain in the warm-up window) — both classified during v0.6.0 testing as the remaining reliability gaps from the v0.4.0 night soak.

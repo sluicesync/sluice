@@ -301,3 +301,18 @@ func (w *SchemaWriter) PreviewDDL(_ context.Context, s *ir.Schema) ([]ir.DDLStat
 func trimTrailingSemicolon(s string) string {
 	return strings.TrimRight(s, ";")
 }
+
+// EmitColumnDef satisfies [ir.ColumnDDLPreviewer]. Returns the
+// Postgres column-def fragment (`"name" TYPE [NOT NULL] [DEFAULT ...]
+// [GENERATED ...]`) suitable for inlining into an `ALTER TABLE ...
+// ADD COLUMN` suggestion in the schema-diff renderer (ADR-0029).
+//
+// The table argument is required for [ir.Enum] columns (PG creates a
+// per-column enum type whose name is derived from the table+column
+// pair); other IR types accept a nil table. Errors from the
+// underlying emitter — e.g. GEOMETRY without PostGIS — surface
+// verbatim so the operator sees the same diagnostic the actual write
+// path would raise.
+func (w *SchemaWriter) EmitColumnDef(_ context.Context, table *ir.Table, col *ir.Column) (string, error) {
+	return emitColumnDef(table, col, emitOpts{HasPostGIS: w.hasPostGIS})
+}

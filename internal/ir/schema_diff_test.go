@@ -2,6 +2,7 @@ package ir
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -230,5 +231,273 @@ func TestDiffSchemas_SortedOutput(t *testing.T) {
 	want := []string{"a_table", "m_table", "z_table"}
 	if !reflect.DeepEqual(d.TablesMissing, want) {
 		t.Errorf("missing = %v; want sorted %v", d.TablesMissing, want)
+	}
+}
+
+func TestDiffSchemas_DefaultLiteralMismatch(t *testing.T) {
+	exp := &Schema{Tables: []*Table{{
+		Name: "t",
+		Columns: []*Column{{
+			Name: "c", Type: Integer{Width: 32},
+			Default: DefaultLiteral{Value: "1"},
+		}},
+	}}}
+	act := &Schema{Tables: []*Table{{
+		Name: "t",
+		Columns: []*Column{{
+			Name: "c", Type: Integer{Width: 32},
+			Default: DefaultLiteral{Value: "2"},
+		}},
+	}}}
+	d := DiffSchemas(exp, act, DiffOptions{})
+	if len(d.TablesMismatched) != 1 || len(d.TablesMismatched[0].ColumnsMismatched) != 1 {
+		t.Fatalf("expected literal-default mismatch; got %+v", d)
+	}
+	cd := d.TablesMismatched[0].ColumnsMismatched[0]
+	if cd.ExpectedDefault == "" || cd.ActualDefault == "" {
+		t.Errorf("expected/actual default fields should be set; got %+v", cd)
+	}
+	if cd.DefaultLowConfidence {
+		t.Errorf("literal-vs-literal mismatch should be high confidence; got %+v", cd)
+	}
+}
+
+func TestDiffSchemas_DefaultExpressionLowConfidence(t *testing.T) {
+	exp := &Schema{Tables: []*Table{{
+		Name: "t",
+		Columns: []*Column{{
+			Name: "c", Type: Timestamp{Precision: 6},
+			Default: DefaultExpression{Expr: "CURRENT_TIMESTAMP(0)"},
+		}},
+	}}}
+	act := &Schema{Tables: []*Table{{
+		Name: "t",
+		Columns: []*Column{{
+			Name: "c", Type: Timestamp{Precision: 6},
+			Default: DefaultExpression{Expr: "now() AT TIME ZONE 'UTC'"},
+		}},
+	}}}
+	d := DiffSchemas(exp, act, DiffOptions{})
+	if len(d.TablesMismatched) != 1 || len(d.TablesMismatched[0].ColumnsMismatched) != 1 {
+		t.Fatalf("expected expr-default mismatch; got %+v", d)
+	}
+	cd := d.TablesMismatched[0].ColumnsMismatched[0]
+	if !cd.DefaultLowConfidence {
+		t.Errorf("expr-vs-expr default mismatch should set DefaultLowConfidence; got %+v", cd)
+	}
+}
+
+func TestDiffSchemas_DefaultMissingHighConfidence(t *testing.T) {
+	exp := &Schema{Tables: []*Table{{
+		Name: "t",
+		Columns: []*Column{{
+			Name: "c", Type: Integer{Width: 32},
+			Default: DefaultLiteral{Value: "0"},
+		}},
+	}}}
+	act := &Schema{Tables: []*Table{{
+		Name:    "t",
+		Columns: []*Column{{Name: "c", Type: Integer{Width: 32}}},
+	}}}
+	d := DiffSchemas(exp, act, DiffOptions{})
+	cd := d.TablesMismatched[0].ColumnsMismatched[0]
+	if cd.DefaultLowConfidence {
+		t.Errorf("missing-on-one-side default drift should be high confidence; got %+v", cd)
+	}
+	if cd.ActualDefault != "<none>" {
+		t.Errorf("actual default should be <none>; got %q", cd.ActualDefault)
+	}
+}
+
+func TestDiffSchemas_DefaultEquivalencesSuppressDrift(t *testing.T) {
+	cases := []struct {
+		name string
+		exp  string
+		act  string
+	}{
+		{"now() vs CURRENT_TIMESTAMP", "now()", "CURRENT_TIMESTAMP"},
+		{"now() vs CURRENT_TIMESTAMP(6)", "now()", "CURRENT_TIMESTAMP(6)"},
+		{"CURRENT_TIMESTAMP vs now()", "CURRENT_TIMESTAMP", "now()"},
+		{"current_date vs CURRENT_DATE", "current_date", "CURRENT_DATE"},
+		{"whitespace tolerant", "current_timestamp ( 6 )", "CURRENT_TIMESTAMP(6)"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			exp := &Schema{Tables: []*Table{{
+				Name: "t",
+				Columns: []*Column{{
+					Name: "c", Type: Timestamp{Precision: 6},
+					Default: DefaultExpression{Expr: tc.exp},
+				}},
+			}}}
+			act := &Schema{Tables: []*Table{{
+				Name: "t",
+				Columns: []*Column{{
+					Name: "c", Type: Timestamp{Precision: 6},
+					Default: DefaultExpression{Expr: tc.act},
+				}},
+			}}}
+			d := DiffSchemas(exp, act, DiffOptions{})
+			if d.HasChanges() {
+				t.Errorf("expected no drift for %s vs %s; got %+v", tc.exp, tc.act, d)
+			}
+		})
+	}
+}
+
+func TestDiffSchemas_GeneratedExprMismatch(t *testing.T) {
+	exp := &Schema{Tables: []*Table{{
+		Name: "t",
+		Columns: []*Column{{
+			Name: "c", Type: Integer{Width: 32},
+			GeneratedExpr: "(price * 1.1)", GeneratedStored: true,
+		}},
+	}}}
+	act := &Schema{Tables: []*Table{{
+		Name: "t",
+		Columns: []*Column{{
+			Name: "c", Type: Integer{Width: 32},
+			GeneratedExpr: "(price * 1.2)", GeneratedStored: true,
+		}},
+	}}}
+	d := DiffSchemas(exp, act, DiffOptions{})
+	cd := d.TablesMismatched[0].ColumnsMismatched[0]
+	if cd.ExpectedGeneratedExpr != "(price * 1.1)" || cd.ActualGeneratedExpr != "(price * 1.2)" {
+		t.Errorf("expected generated-expr fields populated; got %+v", cd)
+	}
+}
+
+func TestDiffSchemas_GeneratedExprMissingOnOneSide(t *testing.T) {
+	exp := &Schema{Tables: []*Table{{
+		Name: "t",
+		Columns: []*Column{{
+			Name: "c", Type: Integer{Width: 32},
+			GeneratedExpr: "(price * 1.1)", GeneratedStored: true,
+		}},
+	}}}
+	act := &Schema{Tables: []*Table{{
+		Name:    "t",
+		Columns: []*Column{{Name: "c", Type: Integer{Width: 32}}},
+	}}}
+	d := DiffSchemas(exp, act, DiffOptions{})
+	cd := d.TablesMismatched[0].ColumnsMismatched[0]
+	if cd.ExpectedGeneratedExpr == "" || cd.ActualGeneratedExpr != "" {
+		t.Errorf("expected generated-expr asymmetry; got %+v", cd)
+	}
+}
+
+func TestDiffSchemas_CheckConstraintMissingExtra(t *testing.T) {
+	exp := &Schema{Tables: []*Table{{
+		Name:    "t",
+		Columns: []*Column{{Name: "qty", Type: Integer{Width: 32}}},
+		CheckConstraints: []*CheckConstraint{
+			{Name: "qty_nonneg", Expr: "qty >= 0"},
+		},
+	}}}
+	act := &Schema{Tables: []*Table{{
+		Name:    "t",
+		Columns: []*Column{{Name: "qty", Type: Integer{Width: 32}}},
+		CheckConstraints: []*CheckConstraint{
+			{Name: "legacy_check", Expr: "qty < 1000"},
+		},
+	}}}
+	d := DiffSchemas(exp, act, DiffOptions{})
+	td := d.TablesMismatched[0]
+	if !reflect.DeepEqual(td.ChecksMissing, []string{"qty_nonneg"}) {
+		t.Errorf("missing checks = %v; want [qty_nonneg]", td.ChecksMissing)
+	}
+	if !reflect.DeepEqual(td.ChecksExtra, []string{"legacy_check"}) {
+		t.Errorf("extra checks = %v; want [legacy_check]", td.ChecksExtra)
+	}
+}
+
+func TestDiffSchemas_CheckConstraintMismatch(t *testing.T) {
+	exp := &Schema{Tables: []*Table{{
+		Name:    "t",
+		Columns: []*Column{{Name: "qty", Type: Integer{Width: 32}}},
+		CheckConstraints: []*CheckConstraint{
+			{Name: "qty_range", Expr: "qty >= 0"},
+		},
+	}}}
+	act := &Schema{Tables: []*Table{{
+		Name:    "t",
+		Columns: []*Column{{Name: "qty", Type: Integer{Width: 32}}},
+		CheckConstraints: []*CheckConstraint{
+			{Name: "qty_range", Expr: "qty > 0"},
+		},
+	}}}
+	d := DiffSchemas(exp, act, DiffOptions{})
+	td := d.TablesMismatched[0]
+	if len(td.ChecksMismatched) != 1 {
+		t.Fatalf("expected one CHECK mismatch; got %+v", td)
+	}
+	cd := td.ChecksMismatched[0]
+	if cd.Name != "qty_range" || cd.ExpectedExpr != "qty >= 0" || cd.ActualExpr != "qty > 0" {
+		t.Errorf("CHECK diff = %+v; want qty_range expected=qty >= 0 actual=qty > 0", cd)
+	}
+}
+
+func TestDiffSchemas_CheckConstraintIgnoreExtras(t *testing.T) {
+	exp := &Schema{Tables: []*Table{{
+		Name:    "t",
+		Columns: []*Column{{Name: "qty", Type: Integer{Width: 32}}},
+	}}}
+	act := &Schema{Tables: []*Table{{
+		Name:    "t",
+		Columns: []*Column{{Name: "qty", Type: Integer{Width: 32}}},
+		CheckConstraints: []*CheckConstraint{
+			{Name: "legacy_check", Expr: "qty < 1000"},
+		},
+	}}}
+	d := DiffSchemas(exp, act, DiffOptions{IgnoreExtras: true})
+	if d.HasChanges() {
+		t.Errorf("expected no drift under IgnoreExtras; got %+v", d)
+	}
+}
+
+func TestDiffSchemas_CheckConstraintsUnnamedSkipped(t *testing.T) {
+	// Anonymous CHECKs aren't matched across sides — they'd produce
+	// false positives on cross-engine spelling differences. The diff
+	// silently drops them.
+	exp := &Schema{Tables: []*Table{{
+		Name:    "t",
+		Columns: []*Column{{Name: "qty", Type: Integer{Width: 32}}},
+		CheckConstraints: []*CheckConstraint{
+			{Name: "", Expr: "qty >= 0"},
+		},
+	}}}
+	act := &Schema{Tables: []*Table{{
+		Name:    "t",
+		Columns: []*Column{{Name: "qty", Type: Integer{Width: 32}}},
+	}}}
+	d := DiffSchemas(exp, act, DiffOptions{})
+	if d.HasChanges() {
+		t.Errorf("unnamed CHECK should not surface as drift; got %+v", d)
+	}
+}
+
+func TestDiffSchemas_Summary_IncludesNewCategories(t *testing.T) {
+	exp := &Schema{Tables: []*Table{{
+		Name:    "t",
+		Columns: []*Column{{Name: "qty", Type: Integer{Width: 32}}},
+		CheckConstraints: []*CheckConstraint{
+			{Name: "a", Expr: "qty > 0"},
+			{Name: "b", Expr: "qty < 100"},
+		},
+	}}}
+	act := &Schema{Tables: []*Table{{
+		Name:    "t",
+		Columns: []*Column{{Name: "qty", Type: Integer{Width: 32}}},
+		CheckConstraints: []*CheckConstraint{
+			{Name: "b", Expr: "qty < 50"},
+			{Name: "c", Expr: "qty != 7"},
+		},
+	}}}
+	d := DiffSchemas(exp, act, DiffOptions{})
+	got := d.Summary()
+	for _, want := range []string{"missing CHECK", "extra CHECK", "CHECK mismatch"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("summary %q missing %q", got, want)
+		}
 	}
 }

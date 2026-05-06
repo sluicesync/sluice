@@ -212,3 +212,14 @@ func (w *SchemaWriter) PreviewDDL(_ context.Context, s *ir.Schema) ([]ir.DDLStat
 func trimTrailingSemicolon(s string) string {
 	return strings.TrimRight(s, ";")
 }
+
+// EmitColumnDef satisfies [ir.ColumnDDLPreviewer]. Returns the MySQL
+// column-def fragment (“ `name` TYPE [GENERATED ...] [NOT NULL]
+// [DEFAULT ...] [COMMENT '...']“) suitable for inlining into an
+// `ALTER TABLE ... ADD COLUMN` suggestion in the schema-diff
+// renderer (ADR-0029). MySQL's emitter doesn't need table context
+// for any IR type; the table parameter is accepted for interface
+// symmetry with the Postgres implementation and silently ignored.
+func (w *SchemaWriter) EmitColumnDef(_ context.Context, _ *ir.Table, col *ir.Column) (string, error) {
+	return emitColumnDef(col)
+}

@@ -12,6 +12,16 @@ package ir
 // v1") — operators don't reconcile drift on those without manual
 // review anyway, and surfacing them as mismatches produces too much
 // noise for too little operator value.
+//
+// Default values, generated-column expressions, and CHECK constraints
+// are compared at v0.8.0+. Cross-engine textual comparison of default
+// expressions is fraught (`now()` vs `CURRENT_TIMESTAMP`,
+// `gen_random_uuid()` vs `UUID()`, etc.). The diff handles this two
+// ways: a tiny equivalence map (defaultEquivalents) suppresses
+// false-positive drift on the known cross-engine pairs; mismatches
+// outside that map surface as drift but are flagged
+// LowConfidence=true so the renderer can soften the language. Future
+// expansion of the equivalence map is additive.
 
 import (
 	"fmt"
@@ -45,7 +55,7 @@ func (d SchemaDiff) HasChanges() bool {
 // exit-code path to print a one-line summary on stderr alongside the
 // non-zero exit. Returns "in sync" when there is no drift.
 func (d SchemaDiff) Summary() string {
-	parts := make([]string, 0, 8)
+	parts := make([]string, 0, 12)
 	add := func(n int, singular, plural string) {
 		if n == 0 {
 			return
@@ -58,19 +68,29 @@ func (d SchemaDiff) Summary() string {
 	}
 	add(len(d.TablesMissing), "missing table", "missing tables")
 	add(len(d.TablesExtra), "extra table", "extra tables")
-	var colMissing, colExtra, colMismatched, idxMissing, idxExtra int
+	var (
+		colMissing, colExtra, colMismatched int
+		idxMissing, idxExtra                int
+		chkMissing, chkExtra, chkMismatched int
+	)
 	for _, td := range d.TablesMismatched {
 		colMissing += len(td.ColumnsMissing)
 		colExtra += len(td.ColumnsExtra)
 		colMismatched += len(td.ColumnsMismatched)
 		idxMissing += len(td.IndexesMissing)
 		idxExtra += len(td.IndexesExtra)
+		chkMissing += len(td.ChecksMissing)
+		chkExtra += len(td.ChecksExtra)
+		chkMismatched += len(td.ChecksMismatched)
 	}
 	add(colMissing, "missing column", "missing columns")
 	add(colExtra, "extra column", "extra columns")
 	add(colMismatched, "type mismatch", "type mismatches")
 	add(idxMissing, "missing index", "missing indexes")
 	add(idxExtra, "extra index", "extra indexes")
+	add(chkMissing, "missing CHECK", "missing CHECKs")
+	add(chkExtra, "extra CHECK", "extra CHECKs")
+	add(chkMismatched, "CHECK mismatch", "CHECK mismatches")
 	if len(parts) == 0 {
 		return "in sync"
 	}
@@ -87,6 +107,9 @@ type TableDiff struct {
 	ColumnsMismatched []ColumnDiff `json:"columns_mismatched,omitempty"`
 	IndexesMissing    []string     `json:"indexes_missing,omitempty"`
 	IndexesExtra      []string     `json:"indexes_extra,omitempty"`
+	ChecksMissing     []string     `json:"checks_missing,omitempty"`
+	ChecksExtra       []string     `json:"checks_extra,omitempty"`
+	ChecksMismatched  []CheckDiff  `json:"checks_mismatched,omitempty"`
 }
 
 // ColumnDiff captures a single column's expected-vs-actual mismatch.
@@ -97,12 +120,62 @@ type TableDiff struct {
 // with semantically-equivalent types (e.g. PG `varchar(45)` and
 // `character varying(45)`) compare equal because both schema readers
 // land them on the same `ir.Varchar{Length: 45}` value.
+//
+// Default and generated-expression comparisons are textual. Known
+// cross-engine equivalents (e.g. PG `now()` ↔ MySQL
+// `CURRENT_TIMESTAMP`) are normalized through defaultEquivalents
+// before comparison, suppressing false-positive drift on the most
+// common patterns. Mismatches outside the equivalence map surface as
+// drift with DefaultLowConfidence=true so the renderer can hedge —
+// the IR can't know whether "1" and "1::int4" are the same default
+// without engine-specific parsing.
 type ColumnDiff struct {
 	Name             string `json:"name"`
 	ExpectedType     string `json:"expected_type,omitempty"`
 	ActualType       string `json:"actual_type,omitempty"`
 	ExpectedNullable *bool  `json:"expected_nullable,omitempty"`
 	ActualNullable   *bool  `json:"actual_nullable,omitempty"`
+
+	// ExpectedDefault / ActualDefault carry the rendered DEFAULT
+	// clause from each side as a single string ("none", "1",
+	// "now()", etc.); empty when the defaults match. The "none"
+	// sentinel is used in rendering only — the JSON renderer
+	// distinguishes "no default" from "literal default of empty
+	// string" via the IR-level DefaultValue interface, but the
+	// diff's textual comparison flattens to a stable string.
+	ExpectedDefault string `json:"expected_default,omitempty"`
+	ActualDefault   string `json:"actual_default,omitempty"`
+
+	// DefaultLowConfidence is set when the only mismatch is on the
+	// DEFAULT clause and the textual comparison may be a cross-
+	// engine spelling difference rather than a real drift (e.g.
+	// `1` vs `'1'`, `nextval('seq')` with no MySQL counterpart).
+	// The renderer softens the language for these.
+	DefaultLowConfidence bool `json:"default_low_confidence,omitempty"`
+
+	// ExpectedGeneratedExpr / ActualGeneratedExpr carry the
+	// generated-column expression text. Empty on either side when
+	// the column is not generated on that side. Comparison is
+	// verbatim string equality on the trimmed expression — the IR
+	// already strips identifier quoting at the read boundary so
+	// `(price * 1.1)` and `(price*1.1)` would both arrive
+	// canonical, but cross-engine function-name differences (e.g.
+	// `CONCAT_WS` vs `concat_ws` casing, `IF` vs `CASE`) surface
+	// as a generated-expr mismatch by design — no equivalence
+	// table for these.
+	ExpectedGeneratedExpr string `json:"expected_generated_expr,omitempty"`
+	ActualGeneratedExpr   string `json:"actual_generated_expr,omitempty"`
+}
+
+// CheckDiff captures a single CHECK constraint's expected-vs-actual
+// expression mismatch. Only used when a constraint with the same
+// Name appears on both sides but the body differs. CHECK constraints
+// missing from one side surface in TableDiff.ChecksMissing /
+// ChecksExtra (set semantics, by name).
+type CheckDiff struct {
+	Name         string `json:"name"`
+	ExpectedExpr string `json:"expected_expr,omitempty"`
+	ActualExpr   string `json:"actual_expr,omitempty"`
 }
 
 // DiffOptions configures DiffSchemas. The zero value is the strict
@@ -172,7 +245,10 @@ func (td TableDiff) hasChanges() bool {
 		len(td.ColumnsExtra) > 0 ||
 		len(td.ColumnsMismatched) > 0 ||
 		len(td.IndexesMissing) > 0 ||
-		len(td.IndexesExtra) > 0
+		len(td.IndexesExtra) > 0 ||
+		len(td.ChecksMissing) > 0 ||
+		len(td.ChecksExtra) > 0 ||
+		len(td.ChecksMismatched) > 0
 }
 
 func diffTable(expected, actual *Table, opts DiffOptions) TableDiff {
@@ -227,7 +303,57 @@ func diffTable(expected, actual *Table, opts DiffOptions) TableDiff {
 		sort.Strings(td.IndexesExtra)
 	}
 
+	diffChecks(&td, expected, actual, opts)
+
 	return td
+}
+
+// diffChecks populates the CHECK-related slices on td. CHECK
+// constraints are matched by Name (set semantics, same as indexes).
+// Unnamed CHECKs are skipped: an anonymous constraint can't be
+// matched across sides without expression-text comparison, which
+// would produce false positives on cross-engine spelling differences.
+func diffChecks(td *TableDiff, expected, actual *Table, opts DiffOptions) {
+	expChecks := checksByName(expected)
+	actChecks := checksByName(actual)
+
+	for name := range expChecks {
+		if _, ok := actChecks[name]; !ok {
+			td.ChecksMissing = append(td.ChecksMissing, name)
+		}
+	}
+	sort.Strings(td.ChecksMissing)
+
+	if !opts.IgnoreExtras {
+		for name := range actChecks {
+			if _, ok := expChecks[name]; !ok {
+				td.ChecksExtra = append(td.ChecksExtra, name)
+			}
+		}
+		sort.Strings(td.ChecksExtra)
+	}
+
+	common := make([]string, 0, len(expChecks))
+	for name := range expChecks {
+		if _, ok := actChecks[name]; ok {
+			common = append(common, name)
+		}
+	}
+	sort.Strings(common)
+	for _, name := range common {
+		exp := expChecks[name]
+		act := actChecks[name]
+		expExpr := strings.TrimSpace(exp.Expr)
+		actExpr := strings.TrimSpace(act.Expr)
+		if expExpr == actExpr {
+			continue
+		}
+		td.ChecksMismatched = append(td.ChecksMismatched, CheckDiff{
+			Name:         name,
+			ExpectedExpr: expExpr,
+			ActualExpr:   actExpr,
+		})
+	}
 }
 
 // diffColumn returns a ColumnDiff and a flag indicating whether any
@@ -252,7 +378,186 @@ func diffColumn(expected, actual *Column) (ColumnDiff, bool) {
 		cd.ActualNullable = &act
 		mismatched = true
 	}
+
+	// Default-value comparison. Both sides are rendered to a stable
+	// string form, normalized through defaultEquivalents, then
+	// compared. A mismatch surfaces with both rendered forms so the
+	// renderer can show "expected X / actual Y"; LowConfidence is
+	// set unless one side is DefaultNone (a clear missing-default
+	// drift the operator should reconcile regardless of dialect).
+	expDefault := renderDefault(expected.Default)
+	actDefault := renderDefault(actual.Default)
+	if !defaultsEqual(expDefault, actDefault) {
+		cd.ExpectedDefault = expDefault
+		cd.ActualDefault = actDefault
+		// "no default on one side" is high-confidence drift; only
+		// expression-vs-expression mismatches are uncertain.
+		_, expIsExpr := expected.Default.(DefaultExpression)
+		_, actIsExpr := actual.Default.(DefaultExpression)
+		if expIsExpr && actIsExpr {
+			cd.DefaultLowConfidence = true
+		}
+		mismatched = true
+	}
+
+	// Generated-column expression comparison. Verbatim text after
+	// trim — no equivalence map (cross-engine generated-expr
+	// equivalents are too rare to enumerate).
+	expGen := strings.TrimSpace(expected.GeneratedExpr)
+	actGen := strings.TrimSpace(actual.GeneratedExpr)
+	if expGen != actGen {
+		cd.ExpectedGeneratedExpr = expGen
+		cd.ActualGeneratedExpr = actGen
+		mismatched = true
+	}
+
 	return cd, mismatched
+}
+
+// renderDefault produces a stable textual rendering of a
+// DefaultValue for use in diff comparison and output. The "<none>"
+// sentinel distinguishes "no DEFAULT clause" from "DEFAULT ”" (the
+// empty literal). Callers use defaultsEqual rather than direct
+// string comparison so the equivalence map kicks in.
+func renderDefault(d DefaultValue) string {
+	switch v := d.(type) {
+	case nil, DefaultNone:
+		return "<none>"
+	case DefaultLiteral:
+		return "'" + v.Value + "'"
+	case DefaultExpression:
+		return v.Expr
+	}
+	return "<unknown>"
+}
+
+// defaultsEqual reports whether two rendered defaults represent the
+// same value, accounting for the cross-engine equivalence map.
+// Comparison is case-insensitive and whitespace-tolerant on the
+// expression form; literal defaults compare verbatim (changing a
+// literal value is real drift, not a dialect difference).
+func defaultsEqual(a, b string) bool {
+	if a == b {
+		return true
+	}
+	if defaultExpressionsEquivalent(a, b) {
+		return true
+	}
+	return false
+}
+
+// defaultExpressionsEquivalent checks whether two default-expression
+// strings are known cross-engine equivalents. Returns false if either
+// side looks like a literal default (single-quoted) or the "<none>"
+// sentinel — those fall back to verbatim equality in defaultsEqual.
+//
+// The check is symmetric: lookup with a→b and b→a so the orchestrator
+// doesn't care which side is the source and which is the target.
+func defaultExpressionsEquivalent(a, b string) bool {
+	if isLiteralOrNone(a) || isLiteralOrNone(b) {
+		return false
+	}
+	na := normalizeDefaultExpr(a)
+	nb := normalizeDefaultExpr(b)
+	if na == nb {
+		return true
+	}
+	if equivs, ok := defaultEquivalents[na]; ok {
+		for _, e := range equivs {
+			if e == nb {
+				return true
+			}
+		}
+	}
+	if equivs, ok := defaultEquivalents[nb]; ok {
+		for _, e := range equivs {
+			if e == na {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// isLiteralOrNone reports whether s is a literal-default rendering
+// ('foo') or the no-default sentinel. Used to keep the equivalence
+// map from accidentally treating literal '1' as equivalent to expr 1.
+func isLiteralOrNone(s string) bool {
+	if s == "<none>" {
+		return true
+	}
+	return strings.HasPrefix(s, "'") && strings.HasSuffix(s, "'")
+}
+
+// normalizeDefaultExpr returns a comparison-friendly form of an
+// expression: lowercased, trimmed, internal whitespace collapsed,
+// and spaces stripped around parentheses and commas so
+// `current_timestamp ( 6 )` and `CURRENT_TIMESTAMP(6)` compare
+// equal. Keep this a pure string-shape pass; semantic normalization
+// (parsing argument lists, etc.) is deliberately out of scope.
+func normalizeDefaultExpr(s string) string {
+	s = strings.TrimSpace(strings.ToLower(s))
+	// Collapse internal whitespace runs to single spaces.
+	var sb strings.Builder
+	prevSpace := false
+	for _, r := range s {
+		if r == ' ' || r == '\t' || r == '\n' {
+			if !prevSpace {
+				sb.WriteByte(' ')
+			}
+			prevSpace = true
+			continue
+		}
+		prevSpace = false
+		sb.WriteRune(r)
+	}
+	// Strip spaces adjacent to parentheses and commas — purely
+	// syntactic noise that varies by hand-written DDL convention.
+	out := sb.String()
+	for _, pair := range [...][2]string{
+		{" (", "("},
+		{"( ", "("},
+		{" )", ")"},
+		{") ", ")"},
+		{" ,", ","},
+		{", ", ","},
+	} {
+		out = strings.ReplaceAll(out, pair[0], pair[1])
+	}
+	return out
+}
+
+// defaultEquivalents lists known cross-engine default-expression
+// equivalents. Keys and values are the result of normalizeDefaultExpr
+// (lowercased, whitespace-collapsed). Lookups go both directions so
+// callers don't need to know which side is the source.
+//
+// Conservative by design — adding wrong entries here suppresses real
+// drift, so each new pair should be backed by a documented engine-
+// reader behaviour. Future expansion is additive.
+//
+// Notable omissions:
+//
+//   - PG `nextval('seq')` has no MySQL counterpart (auto-increment
+//     is a column attribute, not a default expression).
+//   - PG `gen_random_uuid()` and MySQL `UUID()` produce
+//     incompatible binary representations even when both columns
+//     are CHAR(36); the equivalence is semantic but the wire-form
+//     drift is real, so we surface it as low-confidence drift
+//     rather than silently equate.
+var defaultEquivalents = map[string][]string{
+	"now()": {
+		"current_timestamp",
+		"current_timestamp()",
+		"current_timestamp(6)",
+	},
+	"current_timestamp": {
+		"now()",
+		"current_timestamp()",
+	},
+	"current_date": {
+		"current_date()",
+	},
 }
 
 // typeString returns the IR Type's stable rendering. Returns "<nil>"
@@ -276,6 +581,19 @@ func tablesByName(s *Schema) map[string]*Table {
 func columnsByName(t *Table) map[string]*Column {
 	out := make(map[string]*Column, len(t.Columns))
 	for _, c := range t.Columns {
+		out[c.Name] = c
+	}
+	return out
+}
+
+// checksByName indexes a table's CheckConstraints by name. Unnamed
+// constraints (Name == "") are skipped — see diffChecks for why.
+func checksByName(t *Table) map[string]*CheckConstraint {
+	out := make(map[string]*CheckConstraint, len(t.CheckConstraints))
+	for _, c := range t.CheckConstraints {
+		if c == nil || c.Name == "" {
+			continue
+		}
 		out[c.Name] = c
 	}
 	return out

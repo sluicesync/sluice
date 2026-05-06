@@ -93,6 +93,9 @@ type DiffJSONCounts struct {
 	ColumnsMismatched int `json:"columns_mismatched"`
 	IndexesMissing    int `json:"indexes_missing"`
 	IndexesExtra      int `json:"indexes_extra"`
+	ChecksMissing     int `json:"checks_missing"`
+	ChecksExtra       int `json:"checks_extra"`
+	ChecksMismatched  int `json:"checks_mismatched"`
 }
 
 // Run executes the diff. Returns the computed diff plus an error.
@@ -129,6 +132,15 @@ func (d *Differ) Run(ctx context.Context) (*ir.SchemaDiff, error) {
 		return nil, fmt.Errorf("diff: apply mappings: %w", err)
 	}
 
+	// Cross-engine retarget: rewrite source-native IR types to their
+	// target-engine emit equivalents (PG uuid → CHAR(36), inet →
+	// VARCHAR(45), etc.) so the IR comparison below sees the actual
+	// target storage shape, not the un-translated source type. Same-
+	// engine pairs are identity. Mappings already ran above, so any
+	// operator-supplied --type-override has already replaced the IR
+	// type and the retarget pattern match doesn't fire.
+	expected = translate.RetargetForEngine(expected, d.Source.Name(), d.Target.Name())
+
 	// ---- 2. Read target's actual schema via the same SchemaReader
 	// surface (ADR-0029). The reader doesn't care whether a DSN points
 	// at a "source" or a "target".
@@ -151,7 +163,7 @@ func (d *Differ) Run(ctx context.Context) (*ir.SchemaDiff, error) {
 	// TABLE suggestions (MySQL/PG syntax) rather than a generic
 	// placeholder. PreviewDDL is optional; engines without it fall
 	// through to a simple comment.
-	missingDDL, err := previewDDLForTables(ctx, d.Target, d.TargetDSN, expected, diff.TablesMissing)
+	missingDDL, missingColDDL, err := previewMissingDDL(ctx, d.Target, d.TargetDSN, expected, diff)
 	if err != nil {
 		return nil, err
 	}
@@ -160,13 +172,14 @@ func (d *Differ) Run(ctx context.Context) (*ir.SchemaDiff, error) {
 	switch strings.ToLower(strings.TrimSpace(d.Format)) {
 	case "", "text":
 		if err := renderDiffText(d.Out, diffBundle{
-			srcEngine:  d.Source.Name(),
-			tgtEngine:  d.Target.Name(),
-			diff:       diff,
-			missingDDL: missingDDL,
-			expected:   expected,
-			actual:     actual,
-			opts:       diffRenderOpts{IgnoreCharsetCollation: d.IgnoreCharsetCollation, IgnoreExtras: d.IgnoreExtras},
+			srcEngine:     d.Source.Name(),
+			tgtEngine:     d.Target.Name(),
+			diff:          diff,
+			missingDDL:    missingDDL,
+			missingColDDL: missingColDDL,
+			expected:      expected,
+			actual:        actual,
+			opts:          diffRenderOpts{IgnoreCharsetCollation: d.IgnoreCharsetCollation, IgnoreExtras: d.IgnoreExtras},
 		}); err != nil {
 			return nil, err
 		}
@@ -203,9 +216,19 @@ type diffBundle struct {
 	tgtEngine  string
 	diff       ir.SchemaDiff
 	missingDDL map[string][]ir.DDLStatement // table name -> CREATE TABLE / CREATE INDEX statements
-	expected   *ir.Schema
-	actual     *ir.Schema
-	opts       diffRenderOpts
+
+	// missingColDDL maps "<table>.<column>" -> the target engine's
+	// rendered column-def fragment (e.g. `"created_at" TIMESTAMP(6)
+	// NOT NULL`) for use in the ALTER TABLE ADD COLUMN suggestion.
+	// nil when no missing-on-target column was rendered (engine
+	// didn't expose ir.ColumnDDLPreviewer or the emit failed for a
+	// specific column — in that case the renderer falls back to the
+	// `-- TYPE` placeholder).
+	missingColDDL map[string]string
+
+	expected *ir.Schema
+	actual   *ir.Schema
+	opts     diffRenderOpts
 }
 
 type diffRenderOpts struct {
@@ -213,12 +236,67 @@ type diffRenderOpts struct {
 	IgnoreExtras           bool
 }
 
+// previewMissingDDL opens the target engine's schema writer once and
+// asks it for two flavours of "render the DDL you would emit"
+// material: full CREATE TABLE statements for tables missing from the
+// target, and per-column-def fragments for individual columns missing
+// from a present-on-both-sides table. Returning both from a single
+// helper keeps the connection lifecycle in one place — the writer
+// (and its connection pool) is opened once and closed before this
+// function returns regardless of which preview surface the engine
+// implements.
+//
+// The returned maps may be nil when there's nothing to preview or the
+// engine doesn't expose the relevant optional surface
+// ([ir.DDLPreviewer] / [ir.ColumnDDLPreviewer]); the renderer falls
+// back to placeholder output in those cases. Errors from the
+// underlying preview calls are returned verbatim.
+func previewMissingDDL(ctx context.Context, target ir.Engine, dsn string, expected *ir.Schema, diff ir.SchemaDiff) (tableDDL map[string][]ir.DDLStatement, columnDDL map[string]string, err error) {
+	missingTables := diff.TablesMissing
+	missingCols := collectMissingColumns(diff)
+	if len(missingTables) == 0 && len(missingCols) == 0 {
+		return nil, nil, nil
+	}
+
+	sw, openErr := target.OpenSchemaWriter(ctx, dsn)
+	if openErr != nil {
+		return nil, nil, wrapWithHint(PhaseConnect, fmt.Errorf("diff: open target schema writer: %w", openErr))
+	}
+	defer closeIf(sw)
+
+	tableDDL, err = previewDDLForTables(ctx, sw, expected, missingTables)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	columnDDL, err = previewDDLForColumns(ctx, sw, expected, missingCols)
+	if err != nil {
+		return nil, nil, err
+	}
+	return tableDDL, columnDDL, nil
+}
+
+// collectMissingColumns returns the per-table list of columns absent
+// from the target. Map key is table name, value is the slice of
+// missing column names (in the same alphabetic order DiffSchemas
+// returned them).
+func collectMissingColumns(diff ir.SchemaDiff) map[string][]string {
+	out := make(map[string][]string, len(diff.TablesMismatched))
+	for _, td := range diff.TablesMismatched {
+		if len(td.ColumnsMissing) == 0 {
+			continue
+		}
+		out[td.Name] = td.ColumnsMissing
+	}
+	return out
+}
+
 // previewDDLForTables asks the target engine for the DDL it would
 // emit for the listed tables. Used to render CREATE TABLE suggestions
 // for "missing on target" entries. Returns an empty map (nil) when
 // missing is empty or the target doesn't expose DDLPreviewer — the
 // renderer falls back to a plain "-- CREATE TABLE x (missing)" hint.
-func previewDDLForTables(ctx context.Context, target ir.Engine, dsn string, expected *ir.Schema, missing []string) (map[string][]ir.DDLStatement, error) {
+func previewDDLForTables(ctx context.Context, sw ir.SchemaWriter, expected *ir.Schema, missing []string) (map[string][]ir.DDLStatement, error) {
 	if len(missing) == 0 {
 		return nil, nil
 	}
@@ -235,12 +313,6 @@ func previewDDLForTables(ctx context.Context, target ir.Engine, dsn string, expe
 	if len(subset.Tables) == 0 {
 		return nil, nil
 	}
-
-	sw, err := target.OpenSchemaWriter(ctx, dsn)
-	if err != nil {
-		return nil, wrapWithHint(PhaseConnect, fmt.Errorf("diff: open target schema writer: %w", err))
-	}
-	defer closeIf(sw)
 	previewer, ok := sw.(ir.DDLPreviewer)
 	if !ok {
 		return nil, nil
@@ -257,6 +329,67 @@ func previewDDLForTables(ctx context.Context, target ir.Engine, dsn string, expe
 		out[s.Table] = append(out[s.Table], s)
 	}
 	return out, nil
+}
+
+// previewDDLForColumns asks the target engine for the column-def
+// fragment of every (table, column) pair missing on the target.
+// Returns nil when there's nothing to render or the engine doesn't
+// expose ir.ColumnDDLPreviewer — the diff renderer falls back to the
+// `-- TYPE` placeholder in either case.
+//
+// Per-column emit failures (e.g. PG GEOMETRY without PostGIS) are
+// silently skipped — the renderer falls through to the placeholder
+// for that column and the operator sees the same diagnostic loop the
+// migration would surface. Aborting the whole diff over one column
+// would be worse UX than partial rendering with a placeholder for the
+// problem cases.
+func previewDDLForColumns(ctx context.Context, sw ir.SchemaWriter, expected *ir.Schema, missing map[string][]string) (map[string]string, error) {
+	if len(missing) == 0 {
+		return nil, nil
+	}
+	previewer, ok := sw.(ir.ColumnDDLPreviewer)
+	if !ok {
+		return nil, nil
+	}
+	tablesByName := make(map[string]*ir.Table, len(expected.Tables))
+	for _, t := range expected.Tables {
+		tablesByName[t.Name] = t
+	}
+	out := make(map[string]string, totalColumns(missing))
+	for tableName, cols := range missing {
+		table, ok := tablesByName[tableName]
+		if !ok {
+			continue
+		}
+		colsByName := make(map[string]*ir.Column, len(table.Columns))
+		for _, c := range table.Columns {
+			colsByName[c.Name] = c
+		}
+		for _, colName := range cols {
+			col, ok := colsByName[colName]
+			if !ok {
+				continue
+			}
+			frag, err := previewer.EmitColumnDef(ctx, table, col)
+			if err != nil {
+				// Skip; renderer falls back to placeholder. Column
+				// emit errors are recoverable at the diff layer —
+				// the renderer's job is to surface drift, not to
+				// produce a fully-validated migration script.
+				continue
+			}
+			out[tableName+"."+colName] = frag
+		}
+	}
+	return out, nil
+}
+
+func totalColumns(m map[string][]string) int {
+	n := 0
+	for _, cols := range m {
+		n += len(cols)
+	}
+	return n
 }
 
 // renderDiffText writes the human-readable diff to w. Format follows
@@ -315,8 +448,7 @@ func renderDiffText(w io.Writer, b diffBundle) error {
 	for _, td := range b.diff.TablesMismatched {
 		fmt.Fprintf(&sb, "-- ──────────── %s (mismatched) ────────────\n", td.Name)
 		for _, col := range td.ColumnsMissing {
-			fmt.Fprintf(&sb, "ALTER TABLE %s ADD COLUMN %s; -- TYPE; column missing on target\n",
-				quote(td.Name), quote(col))
+			renderMissingColumn(&sb, td.Name, col, quote, b.missingColDDL)
 		}
 		for _, col := range td.ColumnsExtra {
 			fmt.Fprintf(&sb, "ALTER TABLE %s DROP COLUMN %s;\n", quote(td.Name), quote(col))
@@ -332,11 +464,79 @@ func renderDiffText(w io.Writer, b diffBundle) error {
 		for _, idx := range td.IndexesExtra {
 			fmt.Fprintf(&sb, "DROP INDEX %s; -- not in source schema\n", quote(idx))
 		}
+		for _, name := range td.ChecksMissing {
+			renderMissingCheck(&sb, td.Name, name, quote, b.expected)
+		}
+		for _, name := range td.ChecksExtra {
+			fmt.Fprintf(&sb, "ALTER TABLE %s DROP CONSTRAINT %s; -- CHECK not in source schema\n",
+				quote(td.Name), quote(name))
+		}
+		for _, ck := range td.ChecksMismatched {
+			fmt.Fprintf(&sb, "-- CHECK %s mismatched: target has %q; expected %q\n",
+				quote(ck.Name), ck.ActualExpr, ck.ExpectedExpr)
+			fmt.Fprintf(&sb, "ALTER TABLE %s DROP CONSTRAINT %s;\n", quote(td.Name), quote(ck.Name))
+			fmt.Fprintf(&sb, "ALTER TABLE %s ADD CONSTRAINT %s CHECK (%s);\n",
+				quote(td.Name), quote(ck.Name), ck.ExpectedExpr)
+		}
 		sb.WriteByte('\n')
 	}
 
 	_, err := io.WriteString(w, sb.String())
 	return err
+}
+
+// renderMissingColumn writes the ALTER TABLE ADD COLUMN suggestion
+// for a column missing on target. When the target engine emitted a
+// concrete column-def fragment via ir.ColumnDDLPreviewer the renderer
+// inlines it (operators get a copy-paste-ready ALTER); otherwise we
+// fall back to the v0.7.0 `-- TYPE` placeholder shape.
+func renderMissingColumn(sb *strings.Builder, table, col string, quote func(string) string, ddl map[string]string) {
+	if frag, ok := ddl[table+"."+col]; ok && frag != "" {
+		fmt.Fprintf(sb, "ALTER TABLE %s ADD COLUMN %s; -- column missing on target\n",
+			quote(table), frag)
+		return
+	}
+	fmt.Fprintf(sb, "ALTER TABLE %s ADD COLUMN %s; -- TYPE; column missing on target\n",
+		quote(table), quote(col))
+}
+
+// renderMissingCheck writes the ADD CONSTRAINT ... CHECK suggestion
+// for a CHECK constraint missing on target, looking up the expected
+// expression in the expected-side schema. Surfaces a placeholder
+// when the constraint name resolves but the schema is malformed (no
+// expression text) — the operator can still see the name and chase
+// it down by hand.
+func renderMissingCheck(sb *strings.Builder, table, name string, quote func(string) string, expected *ir.Schema) {
+	expr := lookupCheckExpr(expected, table, name)
+	if expr == "" {
+		fmt.Fprintf(sb, "-- CHECK %s missing on target; expression unavailable for ADD CONSTRAINT suggestion\n",
+			quote(name))
+		return
+	}
+	fmt.Fprintf(sb, "ALTER TABLE %s ADD CONSTRAINT %s CHECK (%s); -- CHECK missing on target\n",
+		quote(table), quote(name), expr)
+}
+
+// lookupCheckExpr returns the expression text for the named CHECK
+// constraint on the named table within s, or "" when the schema is
+// nil / table absent / constraint absent. Used by the missing-CHECK
+// renderer; schemas should be populated with the constraint's text
+// from the source-side reader.
+func lookupCheckExpr(s *ir.Schema, tableName, checkName string) string {
+	if s == nil {
+		return ""
+	}
+	for _, t := range s.Tables {
+		if t.Name != tableName {
+			continue
+		}
+		for _, c := range t.CheckConstraints {
+			if c != nil && c.Name == checkName {
+				return c.Expr
+			}
+		}
+	}
+	return ""
 }
 
 // renderColumnMismatch emits one ALTER suggestion per column-level
@@ -360,6 +560,12 @@ func renderColumnMismatch(sb *strings.Builder, table string, cd ir.ColumnDiff, q
 			fmt.Fprintf(sb, "ALTER TABLE %s MODIFY COLUMN %s ... %s; -- nullable on target: %v -> expected: %v\n",
 				quote(table), quote(cd.Name), null, *cd.ActualNullable, *cd.ExpectedNullable)
 		}
+		if cd.ExpectedDefault != "" || cd.ActualDefault != "" {
+			renderDefaultMismatchMySQL(sb, table, cd, quote)
+		}
+		if cd.ExpectedGeneratedExpr != cd.ActualGeneratedExpr {
+			renderGeneratedExprMismatch(sb, table, cd, quote)
+		}
 	default:
 		if cd.ExpectedType != "" {
 			fmt.Fprintf(sb, "ALTER TABLE %s ALTER COLUMN %s TYPE %s; -- on target: %s\n",
@@ -373,7 +579,84 @@ func renderColumnMismatch(sb *strings.Builder, table string, cd ir.ColumnDiff, q
 			fmt.Fprintf(sb, "ALTER TABLE %s ALTER COLUMN %s %s; -- nullable on target: %v -> expected: %v\n",
 				quote(table), quote(cd.Name), action, *cd.ActualNullable, *cd.ExpectedNullable)
 		}
+		if cd.ExpectedDefault != "" || cd.ActualDefault != "" {
+			renderDefaultMismatchPG(sb, table, cd, quote)
+		}
+		if cd.ExpectedGeneratedExpr != cd.ActualGeneratedExpr {
+			renderGeneratedExprMismatch(sb, table, cd, quote)
+		}
 	}
+}
+
+// renderDefaultMismatchPG renders an ALTER TABLE ... ALTER COLUMN ...
+// SET DEFAULT / DROP DEFAULT suggestion for a PG-style target. When
+// the diff carries DefaultLowConfidence=true the suggestion is
+// preceded by a `-- (default may differ across engines)` hint so the
+// operator knows to verify the rendering against the actual source-
+// side spelling before applying.
+func renderDefaultMismatchPG(sb *strings.Builder, table string, cd ir.ColumnDiff, quote func(string) string) {
+	if cd.DefaultLowConfidence {
+		fmt.Fprintf(sb, "-- (default on %s may differ across engines; verify before applying)\n",
+			quote(cd.Name))
+	}
+	switch {
+	case cd.ExpectedDefault == "<none>":
+		fmt.Fprintf(sb, "ALTER TABLE %s ALTER COLUMN %s DROP DEFAULT; -- on target: %s -> expected: <none>\n",
+			quote(table), quote(cd.Name), cd.ActualDefault)
+	case cd.ActualDefault == "<none>":
+		fmt.Fprintf(sb, "ALTER TABLE %s ALTER COLUMN %s SET DEFAULT %s; -- on target: <none>\n",
+			quote(table), quote(cd.Name), unwrapDefaultLiteral(cd.ExpectedDefault))
+	default:
+		fmt.Fprintf(sb, "ALTER TABLE %s ALTER COLUMN %s SET DEFAULT %s; -- on target: %s\n",
+			quote(table), quote(cd.Name), unwrapDefaultLiteral(cd.ExpectedDefault), cd.ActualDefault)
+	}
+}
+
+// renderDefaultMismatchMySQL renders the MySQL-style ALTER for a
+// default-clause drift. MySQL uses MODIFY COLUMN ... DEFAULT (or
+// ALTER COLUMN ... SET/DROP DEFAULT in 8.0+); we use the latter form
+// because it's narrower (doesn't require the operator to retype the
+// column type) and works on both 5.7+ and 8.0+.
+func renderDefaultMismatchMySQL(sb *strings.Builder, table string, cd ir.ColumnDiff, quote func(string) string) {
+	if cd.DefaultLowConfidence {
+		fmt.Fprintf(sb, "-- (default on %s may differ across engines; verify before applying)\n",
+			quote(cd.Name))
+	}
+	switch {
+	case cd.ExpectedDefault == "<none>":
+		fmt.Fprintf(sb, "ALTER TABLE %s ALTER COLUMN %s DROP DEFAULT; -- on target: %s -> expected: <none>\n",
+			quote(table), quote(cd.Name), cd.ActualDefault)
+	case cd.ActualDefault == "<none>":
+		fmt.Fprintf(sb, "ALTER TABLE %s ALTER COLUMN %s SET DEFAULT %s; -- on target: <none>\n",
+			quote(table), quote(cd.Name), unwrapDefaultLiteral(cd.ExpectedDefault))
+	default:
+		fmt.Fprintf(sb, "ALTER TABLE %s ALTER COLUMN %s SET DEFAULT %s; -- on target: %s\n",
+			quote(table), quote(cd.Name), unwrapDefaultLiteral(cd.ExpectedDefault), cd.ActualDefault)
+	}
+}
+
+// unwrapDefaultLiteral converts the diff's rendered-default string
+// back into a SQL fragment suitable for inlining after `SET DEFAULT
+// `. The diff renders literal defaults as `'value'` (with the
+// surrounding quotes) and expression defaults verbatim; the SQL
+// emitter wants both forms passed through unchanged. Today the two
+// shapes happen to be identical at the surface, so this function is
+// a no-op — it exists as a single point to evolve later if the IR's
+// default rendering grows new shapes (e.g. typed literals).
+func unwrapDefaultLiteral(rendered string) string {
+	return rendered
+}
+
+// renderGeneratedExprMismatch emits a comment describing the
+// generated-column expression drift. We don't try to ALTER the
+// expression: PG/MySQL both require dropping and re-adding the
+// column to change a STORED generated expression, which is
+// destructive enough that the operator should run the migration
+// hand-edited rather than copy-pasting from a diff suggestion.
+func renderGeneratedExprMismatch(sb *strings.Builder, table string, cd ir.ColumnDiff, quote func(string) string) {
+	fmt.Fprintf(sb, "-- generated expression drift on %s.%s: target=%q expected=%q\n",
+		quote(table), quote(cd.Name), cd.ActualGeneratedExpr, cd.ExpectedGeneratedExpr)
+	fmt.Fprintln(sb, "-- ^ engines require DROP + ADD COLUMN to change a generated expression; review carefully")
 }
 
 // identifierQuoter returns a function that quotes a SQL identifier in
@@ -410,6 +693,9 @@ func summarise(d ir.SchemaDiff) DiffJSONCounts {
 		c.ColumnsMismatched += len(td.ColumnsMismatched)
 		c.IndexesMissing += len(td.IndexesMissing)
 		c.IndexesExtra += len(td.IndexesExtra)
+		c.ChecksMissing += len(td.ChecksMissing)
+		c.ChecksExtra += len(td.ChecksExtra)
+		c.ChecksMismatched += len(td.ChecksMismatched)
 	}
 	return c
 }

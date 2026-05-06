@@ -23,6 +23,12 @@ type previewStubEngine struct {
 	stmts    []ir.DDLStatement
 	emitErr  error
 	noWriter bool // when true, OpenSchemaWriter returns a writer without DDLPreviewer
+
+	// emitColDef, when set, is invoked by the writer's
+	// EmitColumnDef method (satisfying ir.ColumnDDLPreviewer) so
+	// diff tests can drive the per-column DDL rendering path
+	// without standing up a real engine.
+	emitColDef func(table *ir.Table, col *ir.Column) (string, error)
 }
 
 func (e *previewStubEngine) Name() string                  { return e.name }
@@ -35,7 +41,7 @@ func (e *previewStubEngine) OpenSchemaWriter(_ context.Context, _ string) (ir.Sc
 	if e.noWriter {
 		return &previewStubBareWriter{}, nil
 	}
-	return &previewStubWriter{stmts: e.stmts, err: e.emitErr}, nil
+	return &previewStubWriter{stmts: e.stmts, err: e.emitErr, emitColDef: e.emitColDef}, nil
 }
 
 func (e *previewStubEngine) OpenRowReader(_ context.Context, _ string) (ir.RowReader, error) {
@@ -65,8 +71,9 @@ func (r *previewStubReader) ReadSchema(_ context.Context) (*ir.Schema, error) {
 }
 
 type previewStubWriter struct {
-	stmts []ir.DDLStatement
-	err   error
+	stmts      []ir.DDLStatement
+	err        error
+	emitColDef func(table *ir.Table, col *ir.Column) (string, error)
 }
 
 func (w *previewStubWriter) CreateTablesWithoutConstraints(_ context.Context, _ *ir.Schema) error {
@@ -90,6 +97,26 @@ func (w *previewStubWriter) PreviewDDL(_ context.Context, _ *ir.Schema) ([]ir.DD
 		return nil, w.err
 	}
 	return w.stmts, nil
+}
+
+// EmitColumnDef satisfies ir.ColumnDDLPreviewer for stubs that opted
+// in via previewStubEngine.emitColDef. Stubs that didn't set the
+// callback fall back to a "<col> <type>" rendering — that's enough
+// for the diff test to exercise the rendering path without binding
+// the test to a specific engine's DDL syntax. Tests that care about
+// engine-correct DDL plumb in their own callback.
+func (w *previewStubWriter) EmitColumnDef(_ context.Context, table *ir.Table, col *ir.Column) (string, error) {
+	if w.emitColDef != nil {
+		return w.emitColDef(table, col)
+	}
+	if col == nil {
+		return "", errors.New("stub: nil column")
+	}
+	typeStr := "<unknown>"
+	if col.Type != nil {
+		typeStr = col.Type.String()
+	}
+	return col.Name + " " + typeStr, nil
 }
 
 // previewStubBareWriter satisfies ir.SchemaWriter but not

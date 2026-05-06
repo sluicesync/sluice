@@ -53,6 +53,29 @@ type DDLPreviewer interface {
 	PreviewDDL(ctx context.Context, s *Schema) ([]DDLStatement, error)
 }
 
+// ColumnDDLPreviewer is the optional engine surface for emitting a
+// single column's DDL fragment without writing it. Used by `sluice
+// schema diff` (ADR-0029) to render `ADD COLUMN` suggestions for
+// missing columns with the actual type, default, and generated-
+// expression filled in — operators get a copy-paste-ready ALTER
+// TABLE rather than a `-- TYPE` placeholder they have to fill in by
+// hand.
+//
+// Engines implement this on the same type that satisfies
+// [SchemaWriter] / [DDLPreviewer]. The column argument carries the
+// type / default / generated metadata; table is needed only for IR
+// types that require table context (PG enum names, today). table
+// may be nil for callers that don't need that context — the
+// implementation's contract is to either succeed or return a clear
+// error explaining why table is required.
+//
+// The diff orchestrator type-asserts on this surface; engines that
+// don't expose it fall back to the bare `-- TYPE` placeholder shape
+// of the renderer rather than failing the whole diff.
+type ColumnDDLPreviewer interface {
+	EmitColumnDef(ctx context.Context, table *Table, col *Column) (string, error)
+}
+
 // SchemaWriter applies an IR [Schema] to a target database in three
 // phases plus a small post-bulk-copy reconciliation step. Splitting
 // schema creation from index/constraint creation is what enables

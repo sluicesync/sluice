@@ -163,7 +163,11 @@ sluice schema diff \
 
 - **No new engine surface.** Reusing `SchemaReader` means every engine that already implements it (today: PG, MySQL) gets diff support immediately. Future engines that ship `SchemaReader` get it for free.
 
-- **DDL-suggestion accuracy is best-effort.** The text format renders `ALTER TABLE` / `DROP TABLE` SQL as a copy-paste starting point for operator reconciliation scripts. It's not guaranteed to be a syntactically-perfect migration script — column-default mismatches, generated-column expressions, and index-method differences may need hand-editing. Operators wanting verified migration scripts use a dedicated migration tool (Atlas, sqitch); sluice's diff is for *visibility*, not authoring.
+- **DDL-suggestion accuracy is best-effort.** The text format renders `ALTER TABLE` / `DROP TABLE` SQL as a copy-paste starting point for operator reconciliation scripts. It's not guaranteed to be a syntactically-perfect migration script — index-method differences, identifier-namespace edge cases (PG schema-qualified vs MySQL flat scope), and target-engine constraints around column ordering may still need hand-editing. Operators wanting verified migration scripts use a dedicated migration tool (Atlas, sqitch); sluice's diff is for *visibility*, not authoring.
+
+- **Cross-engine default-expression equivalences are intentionally narrow.** `now()` ↔ `CURRENT_TIMESTAMP` (with optional precision) and `CURRENT_DATE` round-trip cleanly via the IR's `defaultEquivalents` map; everything else surfaces as drift. Expression-vs-expression mismatches outside the equivalence map are flagged `default_low_confidence` in the JSON output and prefaced with `-- (default may differ across engines; verify before applying)` in the text output, rather than silently equated. The map is conservative by design — wrong entries suppress real drift — and grows additively as new engine-reader pairs land. Notable omissions documented inline: PG `nextval('seq')` (no MySQL counterpart; auto-increment is a column attribute, not a default expression) and PG `gen_random_uuid()` ↔ MySQL `UUID()` (semantically equivalent but produce incompatible binary representations).
+
+- **Generated-column expression drift is reported but not auto-rewritten.** Both engines require DROP + ADD COLUMN to change a STORED generated expression, which is destructive enough that the renderer emits a comment describing the drift rather than a copy-paste-ready ALTER. Same trade-off as the missing-on-target case — operators get visibility, the migration is theirs to author.
 
 ## Why not auto-converge
 
@@ -192,6 +196,16 @@ Documented up front so the implementation chunk has a clear stopping point:
 - **FK constraint name normalisation**: PG and MySQL generate FK names differently when not explicitly named. Treat FKs as anonymous structurally — match by columns + referenced table/columns, not by name.
 - **Trigger / function / procedure / view comparison**: sluice doesn't translate these today; they're outside the schema-diff scope until they are.
 - **Snapshot-vs-running-state diff**: comparing what the target *was* (e.g., from a `pg_dump` snapshot) against what it is now is a generic database-tool problem, not specific to sluice's translation pipeline. Out of scope.
+- **Charset / collation comparison**: the `--ignore-charset-collation` flag is plumbed and the preamble flags it, but the underlying comparison is still inert pending an IR enrichment to capture charset/collation on read for both engines. Once the IR carries them, the diff is additive — same shape as the v0.8.0 default/generated/CHECK additions.
+
+### Added in v0.8.0
+
+The first three categories below were originally listed as out-of-scope; v0.8.0 lifts that because the IR already carries the underlying fields and the comparison shape is additive on `ColumnDiff` / `TableDiff`:
+
+- **Default values** (`ExpectedDefault` / `ActualDefault` / `DefaultLowConfidence` on `ColumnDiff`). Textual comparison with a tiny equivalence map for the common cross-engine pairs; mismatches outside the map flagged low-confidence rather than silently equated. Renderer emits `ALTER TABLE ... ALTER COLUMN ... SET DEFAULT` / `DROP DEFAULT` suggestions.
+- **Generated-column expressions** (`ExpectedGeneratedExpr` / `ActualGeneratedExpr` on `ColumnDiff`). Verbatim string comparison after trim; no equivalence map. Renderer emits a comment describing the drift plus a `DROP + ADD COLUMN` reconciliation hint (engines don't support in-place generated-expr ALTERs).
+- **Table-level CHECK constraints** (`ChecksMissing` / `ChecksExtra` / `ChecksMismatched` on `TableDiff`). Matched by name (set semantics, same as indexes); unnamed CHECKs are silently dropped from the comparison to avoid false positives on cross-engine spelling. Renderer emits `ALTER TABLE ... ADD/DROP CONSTRAINT ... CHECK (...)` suggestions.
+- **Per-column ALTER type rendering**. Engines now expose an `EmitColumnDef(table, col)` method via the optional `ir.ColumnDDLPreviewer` interface (implemented on the same struct as `SchemaWriter` / `DDLPreviewer` in both PG and MySQL). The diff renderer uses it to fill in the actual type, default, and generated expression on `ALTER TABLE ... ADD COLUMN` suggestions for missing-on-target columns; the previous `-- TYPE` placeholder remains as a defensive fallback for engines that don't implement the new interface.
 
 ## Verification
 

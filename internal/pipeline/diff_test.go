@@ -294,6 +294,211 @@ func TestDiffer_Run_TargetReadFailureSurfaces(t *testing.T) {
 	}
 }
 
+func TestDiffer_Run_DefaultMismatch_RendersSetDefault(t *testing.T) {
+	srcSchema := &ir.Schema{Tables: []*ir.Table{{
+		Name: "users",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}, Nullable: false},
+			{Name: "status", Type: ir.Varchar{Length: 16}, Default: ir.DefaultLiteral{Value: "active"}},
+		},
+	}}}
+	tgtSchema := &ir.Schema{Tables: []*ir.Table{{
+		Name: "users",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}, Nullable: false},
+			{Name: "status", Type: ir.Varchar{Length: 16}, Default: ir.DefaultLiteral{Value: "pending"}},
+		},
+	}}}
+	src := &previewStubEngine{name: "postgres", schema: srcSchema}
+	tgt := &previewStubEngine{name: "postgres", schema: tgtSchema}
+
+	var buf bytes.Buffer
+	d := &Differ{Source: src, Target: tgt, SourceDSN: "src", TargetDSN: "tgt", Format: "text", Out: &buf}
+	if _, err := d.Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, `ALTER COLUMN "status" SET DEFAULT 'active'`) {
+		t.Errorf("expected SET DEFAULT 'active' suggestion:\n%s", out)
+	}
+	if strings.Contains(out, "may differ across engines") {
+		t.Errorf("literal-vs-literal mismatch should be high confidence; got:\n%s", out)
+	}
+}
+
+func TestDiffer_Run_DefaultExpressionLowConfidenceComment(t *testing.T) {
+	srcSchema := &ir.Schema{Tables: []*ir.Table{{
+		Name: "events",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}, Nullable: false},
+			{Name: "ts", Type: ir.Timestamp{Precision: 6}, Default: ir.DefaultExpression{Expr: "now() AT TIME ZONE 'UTC'"}},
+		},
+	}}}
+	tgtSchema := &ir.Schema{Tables: []*ir.Table{{
+		Name: "events",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}, Nullable: false},
+			{Name: "ts", Type: ir.Timestamp{Precision: 6}, Default: ir.DefaultExpression{Expr: "statement_timestamp()"}},
+		},
+	}}}
+	src := &previewStubEngine{name: "postgres", schema: srcSchema}
+	tgt := &previewStubEngine{name: "postgres", schema: tgtSchema}
+
+	var buf bytes.Buffer
+	d := &Differ{Source: src, Target: tgt, SourceDSN: "src", TargetDSN: "tgt", Format: "text", Out: &buf}
+	if _, err := d.Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "may differ across engines") {
+		t.Errorf("expected low-confidence hint for expr-vs-expr default mismatch:\n%s", out)
+	}
+}
+
+func TestDiffer_Run_NowVsCurrentTimestampSuppressed(t *testing.T) {
+	srcSchema := &ir.Schema{Tables: []*ir.Table{{
+		Name: "events",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}, Nullable: false},
+			{Name: "ts", Type: ir.Timestamp{Precision: 6}, Default: ir.DefaultExpression{Expr: "now()"}},
+		},
+	}}}
+	tgtSchema := &ir.Schema{Tables: []*ir.Table{{
+		Name: "events",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}, Nullable: false},
+			{Name: "ts", Type: ir.Timestamp{Precision: 6}, Default: ir.DefaultExpression{Expr: "CURRENT_TIMESTAMP(6)"}},
+		},
+	}}}
+	src := &previewStubEngine{name: "postgres", schema: srcSchema}
+	tgt := &previewStubEngine{name: "mysql", schema: tgtSchema}
+
+	var buf bytes.Buffer
+	d := &Differ{Source: src, Target: tgt, SourceDSN: "src", TargetDSN: "tgt", Format: "text", Out: &buf}
+	diff, err := d.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if diff.HasChanges() {
+		t.Errorf("expected no drift for now() vs CURRENT_TIMESTAMP(6); got %+v", diff)
+	}
+}
+
+func TestDiffer_Run_GeneratedExprMismatchSurfaced(t *testing.T) {
+	srcSchema := &ir.Schema{Tables: []*ir.Table{{
+		Name: "products",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}, Nullable: false},
+			{Name: "price", Type: ir.Decimal{Precision: 10, Scale: 2}},
+			{
+				Name: "price_with_tax", Type: ir.Decimal{Precision: 10, Scale: 2},
+				GeneratedExpr: "(price * 1.1)", GeneratedStored: true,
+			},
+		},
+	}}}
+	tgtSchema := &ir.Schema{Tables: []*ir.Table{{
+		Name: "products",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}, Nullable: false},
+			{Name: "price", Type: ir.Decimal{Precision: 10, Scale: 2}},
+			{
+				Name: "price_with_tax", Type: ir.Decimal{Precision: 10, Scale: 2},
+				GeneratedExpr: "(price * 1.2)", GeneratedStored: true,
+			},
+		},
+	}}}
+	src := &previewStubEngine{name: "postgres", schema: srcSchema}
+	tgt := &previewStubEngine{name: "postgres", schema: tgtSchema}
+
+	var buf bytes.Buffer
+	d := &Differ{Source: src, Target: tgt, SourceDSN: "src", TargetDSN: "tgt", Format: "text", Out: &buf}
+	if _, err := d.Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "generated expression drift") {
+		t.Errorf("expected generated-expression drift comment:\n%s", out)
+	}
+	if !strings.Contains(out, "DROP + ADD COLUMN") {
+		t.Errorf("expected DROP + ADD reconciliation hint:\n%s", out)
+	}
+}
+
+func TestDiffer_Run_CheckConstraintMissingExtraMismatched(t *testing.T) {
+	srcSchema := &ir.Schema{Tables: []*ir.Table{{
+		Name:    "orders",
+		Columns: []*ir.Column{{Name: "qty", Type: ir.Integer{Width: 32}}},
+		CheckConstraints: []*ir.CheckConstraint{
+			{Name: "qty_nonneg", Expr: "qty >= 0"},
+			{Name: "qty_range", Expr: "qty < 1000"},
+		},
+	}}}
+	tgtSchema := &ir.Schema{Tables: []*ir.Table{{
+		Name:    "orders",
+		Columns: []*ir.Column{{Name: "qty", Type: ir.Integer{Width: 32}}},
+		CheckConstraints: []*ir.CheckConstraint{
+			{Name: "qty_range", Expr: "qty < 500"},
+			{Name: "legacy_check", Expr: "qty != 7"},
+		},
+	}}}
+	src := &previewStubEngine{name: "postgres", schema: srcSchema}
+	tgt := &previewStubEngine{name: "postgres", schema: tgtSchema}
+
+	var buf bytes.Buffer
+	d := &Differ{Source: src, Target: tgt, SourceDSN: "src", TargetDSN: "tgt", Format: "text", Out: &buf}
+	if _, err := d.Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	out := buf.String()
+	// Missing CHECK rendered with ADD CONSTRAINT.
+	if !strings.Contains(out, `ADD CONSTRAINT "qty_nonneg" CHECK (qty >= 0)`) {
+		t.Errorf("expected ADD CONSTRAINT for missing CHECK:\n%s", out)
+	}
+	// Extra CHECK rendered with DROP CONSTRAINT.
+	if !strings.Contains(out, `DROP CONSTRAINT "legacy_check"`) {
+		t.Errorf("expected DROP CONSTRAINT for extra CHECK:\n%s", out)
+	}
+	// Mismatched CHECK rendered as drop+re-add.
+	if !strings.Contains(out, `DROP CONSTRAINT "qty_range"`) {
+		t.Errorf("expected DROP for mismatched CHECK:\n%s", out)
+	}
+	if !strings.Contains(out, `ADD CONSTRAINT "qty_range" CHECK (qty < 1000)`) {
+		t.Errorf("expected ADD with expected expr for mismatched CHECK:\n%s", out)
+	}
+}
+
+func TestDiffer_Run_CheckConstraintsInJSON(t *testing.T) {
+	srcSchema := &ir.Schema{Tables: []*ir.Table{{
+		Name:    "orders",
+		Columns: []*ir.Column{{Name: "qty", Type: ir.Integer{Width: 32}}},
+		CheckConstraints: []*ir.CheckConstraint{
+			{Name: "qty_nonneg", Expr: "qty >= 0"},
+		},
+	}}}
+	tgtSchema := &ir.Schema{Tables: []*ir.Table{{
+		Name:    "orders",
+		Columns: []*ir.Column{{Name: "qty", Type: ir.Integer{Width: 32}}},
+	}}}
+	src := &previewStubEngine{name: "postgres", schema: srcSchema}
+	tgt := &previewStubEngine{name: "postgres", schema: tgtSchema}
+
+	var buf bytes.Buffer
+	d := &Differ{Source: src, Target: tgt, SourceDSN: "src", TargetDSN: "tgt", Format: "json", Out: &buf}
+	if _, err := d.Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	var got DiffJSON
+	if err := json.Unmarshal(buf.Bytes(), &got); err != nil {
+		t.Fatalf("decode JSON: %v", err)
+	}
+	if got.Summary.ChecksMissing != 1 {
+		t.Errorf("summary.checks_missing = %d; want 1", got.Summary.ChecksMissing)
+	}
+	if len(got.TablesMismatched) != 1 || len(got.TablesMismatched[0].ChecksMissing) != 1 {
+		t.Errorf("expected one missing CHECK in tables_mismatched; got %+v", got.TablesMismatched)
+	}
+}
+
 // previewStubFailingTargetEngine fails ReadSchema on the target side.
 // Used to verify the Differ surfaces target-side read errors with the
 // same wrapping shape as the source-side failure path.

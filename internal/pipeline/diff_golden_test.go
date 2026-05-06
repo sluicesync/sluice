@@ -23,7 +23,7 @@ func TestDiffer_Golden_Text(t *testing.T) {
 				Columns: []*ir.Column{
 					{Name: "id", Type: ir.Integer{Width: 64}, Nullable: false},
 					{Name: "email", Type: ir.Varchar{Length: 255}, Nullable: false},
-					{Name: "created_at", Type: ir.Timestamp{Precision: 6}, Nullable: false},
+					{Name: "created_at", Type: ir.Timestamp{Precision: 6}, Nullable: false, Default: ir.DefaultExpression{Expr: "now()"}},
 				},
 				Indexes: []*ir.Index{
 					{Name: "users_email_idx", Columns: []ir.IndexColumn{{Column: "email"}}, Unique: true},
@@ -50,6 +50,21 @@ func TestDiffer_Golden_Text(t *testing.T) {
 				Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}},
 			},
 		}},
+		// A PG-flavour column-def renderer for the missing-column
+		// suggestion path. Doesn't exercise every IR type — the
+		// engine packages have their own ddl_emit tests for that —
+		// but is enough to confirm the diff renderer threads the
+		// emitter's output into the ALTER suggestion.
+		emitColDef: func(_ *ir.Table, c *ir.Column) (string, error) {
+			frag := `"` + c.Name + `" ` + c.Type.String()
+			if !c.Nullable {
+				frag += " NOT NULL"
+			}
+			if e, ok := c.Default.(ir.DefaultExpression); ok {
+				frag += " DEFAULT " + e.Expr
+			}
+			return frag, nil
+		},
 	}
 
 	var buf bytes.Buffer
