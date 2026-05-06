@@ -6,6 +6,18 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-05-06
+
+Patch release closing the three remaining ADR-0016 translator gaps that v0.9.0 testing surfaced. All three are residuals of bugs the v0.8.0 / v0.9.0 batches partially closed; together they unblock end-to-end migration on the two real-world schemas (`schema_example_01` 555 tables, `schema_example_02` 138 tables) the sluice-testing companion repo uses for stretch validation.
+
+### Fixed
+
+- **Bug 16 residual — `CAST(x AS CHAR(N) [CHARSET y] [COLLATE z])` translates on cross-engine emit.** v0.9.0 routed index expressions through the ADR-0016 translator but the translator itself didn't yet recognise MySQL's CAST-to-CHAR form with charset/collate decorations. PG's grammar rejects both decorations and the CHAR(N) target's blank-padding semantics differ from MySQL's. The new `rewriteCASTCharCharset` rule rewrites `CAST(x AS CHAR(N) [...])` to `CAST(x AS VARCHAR(N))` (matching MySQL's no-padding semantics) and `CAST(x AS CHAR)` (no length) to `CAST(x AS TEXT)`. Other cast targets (DECIMAL, DATE, etc.) pass through verbatim.
+
+- **Bug 17 residual — `coalesce(<bool_returning>, <int_lit>)` for integer-typed columns.** v0.9.0 expanded the COALESCE rewrite to recognise bool-returning sub-expressions; that path converted the int literal to a bool, which is the right answer when the outer column is BOOLEAN. For an integer-typed generated column (e.g. a MySQL `tinyint(1)` source widened to `smallint` via `--type-override`), the int literal is the right answer and the bool side needs to cast to int instead. New `ExprContext.OuterColumnIsInteger` flag flips the rewrite direction; `translateGeneratedExpr` sets it based on the column's IR type (`ir.Integer` → flag set). Comparison rewrites (the other half of the bool-idiom pass) stay bool-context only since the int-context comparisons (`<int_lit> = <bool_ident>`) already work via PG's implicit-cast handling.
+
+- **Bug 23 — STORED GENERATED column body returning text into an enum-typed target gets the enum cast.** The original v0.8.1 framing was about column DEFAULT casting; real-world testing refined the diagnosis: the failing case is a STORED GENERATED column with a `CASE` expression returning enum-valued text literals. The PG enum-cast emit now also wraps generated-column bodies for enum-typed columns: `GENERATED ALWAYS AS (CASE … END)::"<enum_type>" STORED`. Works for any text-returning shape (`CASE`, `COALESCE`, simple literal), not just `CASE`. Mirrors the `DEFAULT 'value'::"<enum_type>"` cast already emitted for non-generated columns.
+
 ## [0.9.0] - 2026-05-06
 
 Operator quality-of-life + cross-engine type-edge audit + OSS-hygiene starter + four follow-ups from v0.8.1 real-world testing. `sync stop --wait` closes the operator-coordination gap surfaced by v0.8.0's stretch-testing of ALTER windows; new TIMESTAMP-precision integration tests audit the cross-engine boundary that Bug 19's TZ fix opened to scrutiny; `CONTRIBUTING.md` and `docs/dev/release-template.md` formalise the conventions that have been carried in conversation memory across the v0.x ramp. The follow-ups close Bug 16 (index-expression translation), Bug 17 (bool-returning sub-expressions in COALESCE), Bug 22 (`schema preview` and `schema diff` now also auto-exclude PlanetScale `_vt_*` tables), plus a new Bug 23 (MySQL `DEFAULT ('value')` parens form not getting the PG enum cast).

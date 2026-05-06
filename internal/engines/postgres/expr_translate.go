@@ -66,6 +66,16 @@ type ExprContext struct {
 	// rewrite uses this to decide whether `<int_lit> [op] <ident>`
 	// patterns should be rewritten.
 	BoolColumns map[string]bool
+	// OuterColumnIsInteger is true when the outer column being
+	// emitted has an integer IR type (e.g. a generated column whose
+	// `tinyint(1)` source got mapped to `smallint` via
+	// --type-override). Flips the COALESCE rewrite direction
+	// (Bug 17 residual): instead of converting an int literal to a
+	// bool literal, the bool-returning side is cast to integer with
+	// `::int` so PG's strict typing accepts the resulting
+	// `coalesce(int, int)` pair. False (the default) preserves the
+	// v0.8.0 / v0.9.0 bool-context behaviour.
+	OuterColumnIsInteger bool
 }
 
 // dialectName is the canonical name this engine uses for the
@@ -95,6 +105,11 @@ func translateExprForPG(expr string, ctx ExprContext) string {
 	expr = rewriteIFNULL(expr)
 	expr = rewriteIF(expr)
 	expr = rewriteCONCAT(expr)
+	// CAST(x AS CHAR(N) [CHARSET y] [COLLATE z]) → CAST(x AS VARCHAR(N))
+	// (Bug 16 residual). Drops MySQL's CHARSET / COLLATE clauses that
+	// PG rejects, and switches to VARCHAR which more closely matches
+	// MySQL's CAST CHAR semantics than PG's blank-padded CHAR.
+	expr = rewriteCASTCharCharset(expr)
 	// Bool-idiom rewrites run last: they need the canonical names
 	// (IFNULL → COALESCE has already happened) and they're gated on
 	// the caller-supplied BoolColumns set — empty means no rewrites.
@@ -148,6 +163,107 @@ func rewriteIF(expr string) string {
 			" ELSE " + strings.TrimSpace(args[2]) +
 			" END"
 	})
+}
+
+// rewriteCASTCharCharset rewrites MySQL's
+// `CAST(<expr> AS CHAR(N) [CHARSET y] [COLLATE z])` form to PG's
+// `CAST(<expr> AS VARCHAR(N))`. Three aspects of the MySQL form are
+// non-portable to PG:
+//
+//  1. **CHARSET / COLLATE clauses** are MySQL-specific decorations
+//     PG's CAST grammar doesn't accept.
+//  2. **CHAR(N) semantics differ.** MySQL's `CAST(x AS CHAR(N))`
+//     truncates/coerces to a string of up to N characters with no
+//     padding. PG's `CHAR(N)` is fixed-length and blank-padded; the
+//     resulting value would carry trailing spaces, which then leak
+//     into comparison and indexing behaviour. PG's `VARCHAR(N)`
+//     matches MySQL's CAST semantics far better.
+//  3. **Bare `CAST(x AS CHAR)`** (no length) is also handled — it
+//     becomes `CAST(x AS TEXT)` since neither side has a length.
+//
+// Anything outside this shape (e.g. `CAST(x AS DECIMAL(10,2))`,
+// `CAST(x AS DATE)`) passes through verbatim — the verbatim-passthrough
+// policy plus PG's strict typing surface any non-portable cast as a
+// loud error at apply time.
+//
+// v0.9.1 / Bug 16 residual.
+func rewriteCASTCharCharset(expr string) string {
+	return rewriteFunctionCalls(expr, "CAST", func(args []string) string {
+		if len(args) != 1 {
+			return ""
+		}
+		body := strings.TrimSpace(args[0])
+		// Find ` AS ` at the top level (not inside parens or strings).
+		asIdx := indexOfTopLevelAS(body)
+		if asIdx < 0 {
+			return ""
+		}
+		valExpr := strings.TrimSpace(body[:asIdx])
+		typeSpec := strings.TrimSpace(body[asIdx+len(" AS "):])
+		// Lowercase a leading word for matching; preserve the original
+		// for any bits we choose to pass through verbatim.
+		lower := strings.ToLower(typeSpec)
+		// Strip any CHARSET or COLLATE clause from the tail; either
+		// can appear, in either order, and consumes the rest of the
+		// type spec for matching purposes.
+		if cut := indexOfCharsetOrCollate(lower); cut >= 0 {
+			typeSpec = strings.TrimSpace(typeSpec[:cut])
+			lower = strings.ToLower(typeSpec)
+		}
+		switch {
+		case strings.HasPrefix(lower, "char(") && strings.HasSuffix(lower, ")"):
+			// CHAR(N) → VARCHAR(N); preserve the length token verbatim
+			// so quoted/decorated forms (e.g. `char(10)`) round-trip.
+			length := typeSpec[len("char(") : len(typeSpec)-1]
+			return "CAST(" + valExpr + " AS VARCHAR(" + length + "))"
+		case lower == "char":
+			return "CAST(" + valExpr + " AS TEXT)"
+		}
+		return ""
+	})
+}
+
+// indexOfTopLevelAS returns the byte offset of ` AS ` in s, ignoring
+// occurrences inside parens or single-quoted string literals. Returns
+// -1 when not found. The match is case-insensitive on the AS keyword
+// and requires whitespace on both sides so it doesn't match
+// identifiers like `MAS_TER` or `aSCAS`.
+func indexOfTopLevelAS(s string) int {
+	depth := 0
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '\'':
+			i = scanStringLiteral(s, i) - 1
+		case '(':
+			depth++
+		case ')':
+			depth--
+		case ' ', '\t', '\n':
+			if depth != 0 {
+				continue
+			}
+			// Look for `AS ` (case-insensitive) followed by whitespace.
+			if i+3 < len(s) && (s[i+1] == 'A' || s[i+1] == 'a') && (s[i+2] == 'S' || s[i+2] == 's') && (s[i+3] == ' ' || s[i+3] == '\t' || s[i+3] == '\n') {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+// indexOfCharsetOrCollate returns the byte offset of a top-level
+// ` charset ` or ` collate ` clause in lower (assumed already
+// lowercased), or -1 when neither is present. The clauses are
+// MySQL-specific and the rewrite drops them whole.
+func indexOfCharsetOrCollate(lower string) int {
+	cut := -1
+	if i := strings.Index(lower, " charset "); i >= 0 {
+		cut = i
+	}
+	if i := strings.Index(lower, " collate "); i >= 0 && (cut < 0 || i < cut) {
+		cut = i
+	}
+	return cut
 }
 
 // rewriteJSONUnquoteExtract collapses
@@ -273,12 +389,79 @@ func unquotedSimpleJSONPath(s string) (string, bool) {
 // in [translateExprForPG]; this rewrite only needs to look at
 // COALESCE.
 func rewriteBoolIdioms(expr string, ctx ExprContext) string {
+	// The two coalesce paths are mutually exclusive and depend on the
+	// outer column's expected type:
+	//   - OuterColumnIsInteger: cast the bool-returning side to int
+	//     so PG accepts coalesce(int, int). v0.9.1 / Bug 17 residual.
+	//   - Otherwise (or empty context): the existing v0.8.0 / v0.9.0
+	//     path converts the int literal to a bool, assuming the outer
+	//     context wants bool (CHECK constraint, BOOLEAN-typed column).
+	if ctx.OuterColumnIsInteger {
+		expr = rewriteBoolToIntCoalesce(expr, ctx.BoolColumns)
+		// The comparison rewrite is bool-context only — int-context
+		// `<int_lit> = <bool_ident>` is rare and the implicit-coercion
+		// path works correctly for it (PG casts the int to bool).
+		// Skip it here.
+		return expr
+	}
 	if len(ctx.BoolColumns) == 0 {
 		return expr
 	}
 	expr = rewriteBoolCoalesce(expr, ctx.BoolColumns)
 	expr = rewriteBoolComparison(expr, ctx.BoolColumns)
 	return expr
+}
+
+// rewriteBoolToIntCoalesce wraps the bool-returning side of a
+// `COALESCE(<bool>, <int_lit>)` (or symmetric) call with `::int` so
+// PG sees `coalesce(int, int)` instead of `coalesce(bool, int)`.
+// Used for generated columns whose IR type is integer (e.g. a
+// MySQL `tinyint(1)` source column the operator widened to
+// `smallint` via --type-override; the body still references bool-
+// returning sub-expressions but the column is integer-typed). MySQL
+// accepts the bool/int mix via implicit coercion; PG's strict typing
+// rejects with an operator-resolution error. v0.9.1 / Bug 17 residual.
+//
+// Bool-returning sub-expressions are recognised the same way
+// [isBoolReturning] handles them: bare bool-mapped column names,
+// comparisons (`=`, `!=`, `<>`), `IS [NOT] NULL`, and parenthesised
+// wrappers. Anything else falls through verbatim.
+func rewriteBoolToIntCoalesce(expr string, boolCols map[string]bool) string {
+	return rewriteFunctionCalls(expr, "COALESCE", func(args []string) string {
+		if len(args) != 2 {
+			return ""
+		}
+		left := strings.TrimSpace(args[0])
+		right := strings.TrimSpace(args[1])
+		leftBool := isBoolReturning(left, boolCols)
+		rightBool := isBoolReturning(right, boolCols)
+		switch {
+		case leftBool && isBoolIntLiteral(right):
+			return "COALESCE(" + boolToIntCast(left) + ", " + right + ")"
+		case rightBool && isBoolIntLiteral(left):
+			return "COALESCE(" + left + ", " + boolToIntCast(right) + ")"
+		}
+		return ""
+	})
+}
+
+// boolToIntCast returns the bool expression wrapped with `::int` in a
+// way that survives whatever quoting the source had. Bare idents and
+// parenthesised expressions both render as `<expr>::int`; the cast is
+// associative on the left of a coalesce arg.
+func boolToIntCast(expr string) string {
+	if expr == "" {
+		return expr
+	}
+	// Already parenthesised? Just append the cast — `(a = b)::int`
+	// is unambiguous.
+	if expr[0] == '(' && expr[len(expr)-1] == ')' {
+		return expr + "::int"
+	}
+	// Bare ident or unparenthesised expression: wrap in parens
+	// before the cast to keep the precedence right against the
+	// surrounding comma.
+	return "(" + expr + ")::int"
 }
 
 // rewriteBoolCoalesce rewrites two-arg `COALESCE` calls where one

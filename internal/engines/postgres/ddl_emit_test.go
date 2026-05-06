@@ -369,6 +369,24 @@ func TestEmitColumnDef_Generated(t *testing.T) {
 			},
 			want: `"tax" NUMERIC(10,2) GENERATED ALWAYS AS (subtotal * 0.07) STORED`,
 		},
+		{
+			// Bug 23 (refined): an enum-typed generated column whose
+			// body returns text (CASE returning enum-valued string
+			// literals, simple literal, etc.) needs an explicit cast
+			// to the enum type. PG rejects without it: "column X is
+			// of type Y_enum but expression is of type text". The
+			// cast wraps the whole body — works for any text-
+			// returning shape.
+			name: "enum-typed generated column gets enum cast on the body",
+			in: &ir.Column{
+				Name:            "pickup_status",
+				Type:            ir.Enum{Values: []string{"pending", "picked", "cancelled"}},
+				Nullable:        true,
+				GeneratedExpr:   "CASE WHEN picked_at IS NULL THEN 'pending' ELSE 'picked' END",
+				GeneratedStored: true,
+			},
+			want: `"pickup_status" "invoices_pickup_status_enum" GENERATED ALWAYS AS (CASE WHEN picked_at IS NULL THEN 'pending' ELSE 'picked' END)::"invoices_pickup_status_enum" STORED`,
+		},
 	}
 	for _, c := range cases {
 		c := c

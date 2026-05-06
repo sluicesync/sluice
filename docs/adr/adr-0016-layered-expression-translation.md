@@ -189,3 +189,51 @@ the symmetric PG → MySQL case (PG `BOOLEAN` writer comparing against
 int) is rare in real schemas and hasn't surfaced in cross-engine
 testing. The PG → MySQL translator (`internal/engines/mysql/expr_
 translate.go`) is unchanged.
+
+## Added in v0.9.1
+
+Three additional rules surfaced from real-world stretch testing of the v0.9.0 release on production-shaped schemas. Each was the residual of a bug an earlier release partially closed; together they finish the cross-engine rewrite story for the patterns operators actually have in their schemas.
+
+### CAST CHAR with CHARSET / COLLATE
+
+`CAST(x AS CHAR(N) CHARSET utf8mb4 [COLLATE utf8mb4_bin])` is a common MySQL idiom in generated-column bodies and CHECK constraints. PG's grammar rejects both the CHARSET and COLLATE decorations, and the CHAR(N) target itself has different semantics: PG's `CHAR(N)` is fixed-length blank-padded, while MySQL's `CAST(... AS CHAR(N))` truncates without padding.
+
+The new `rewriteCASTCharCharset` rule strips the charset/collate clauses and switches the type to `VARCHAR(N)` — which matches MySQL's no-padding semantics. The bare form `CAST(x AS CHAR)` (no length) becomes `CAST(x AS TEXT)`. Other CAST targets (DECIMAL, DATE, BINARY, etc.) pass through verbatim.
+
+### Outer-column-type-aware COALESCE direction
+
+v0.8.0 / v0.9.0's bool-idiom rewrites always converted the int literal to a bool literal in `coalesce(<bool>, <int_lit>)` patterns. That's the right answer when the outer column is BOOLEAN, but the wrong answer when the outer column is integer-typed — for example, a MySQL `tinyint(1)` source column widened to `smallint` via `--type-override`. In that case the int literal is the right answer and the bool side needs to cast to int instead.
+
+`ExprContext.OuterColumnIsInteger` flips the rewrite direction. `translateGeneratedExpr` sets the flag based on the emitted column's IR type. The comparison rewrite (the other half of the bool-idiom pass) stays bool-context-only — int-context comparisons (`<int_lit> = <bool_ident>`) work via PG's implicit-cast handling.
+
+### Enum-typed generated column body cast
+
+A STORED GENERATED column whose body returns text — typically a `CASE` expression with enum-valued string literals, or a `COALESCE` over text columns — needs an explicit cast to the enum type when the column itself is enum-typed. The error pattern is the same as Bug 23's DEFAULT case: PG rejects with "column X is of type Y_enum but expression is of type text".
+
+The fix lives in `emitColumnDef` rather than the translator: the generated-expression body is wrapped with `::"<enum_type>"` after the body emit. Works for any text-returning shape; no per-arm CASE recognition required. Mirrors the `DEFAULT 'value'::"<enum_type>"` pattern already emitted for non-generated columns. The cast wraps the whole expression body, so:
+
+```
+GENERATED ALWAYS AS (CASE WHEN x IS NULL THEN 'a' ELSE 'b' END)::"foo_status_enum" STORED
+```
+
+instead of per-arm casting.
+
+### Cumulative scope
+
+After v0.9.1 the writer-side translator covers:
+
+| Direction | Idiom | Rewrite |
+| --- | --- | --- |
+| MySQL → PG | `CONCAT(a, b)` | `(a \|\| b)` |
+| MySQL → PG | `JSON_UNQUOTE(JSON_EXTRACT(j, '$.k'))` | `(j->>'k')` |
+| MySQL → PG | `JSON_EXTRACT(j, '$.k')` | `(j->'k')` |
+| MySQL → PG | `IFNULL(a, b)` | `COALESCE(a, b)` |
+| MySQL → PG | `IF(c, a, b)` | `CASE WHEN c THEN a ELSE b END` |
+| MySQL → PG | `CAST(x AS CHAR(N) [CHARSET y])` | `CAST(x AS VARCHAR(N))` |
+| MySQL → PG | `CAST(x AS CHAR)` | `CAST(x AS TEXT)` |
+| MySQL → PG | bool-context: `<int_lit> [op] <bool>` / `<bool> [op] <int_lit>` | `<bool_lit> [op] <bool>` etc. |
+| MySQL → PG | bool-context: `COALESCE(<bool>, <int_lit>)` | `COALESCE(<bool>, <bool_lit>)` |
+| MySQL → PG | int-context: `COALESCE(<bool_returning>, <int_lit>)` | `COALESCE(<bool_returning>::int, <int_lit>)` |
+| PG → MySQL | unchanged | unchanged |
+
+The verbatim-passthrough policy still owns everything outside this set.

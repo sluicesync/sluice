@@ -266,6 +266,39 @@ func TestTranslateExprForPG_BoolIdioms(t *testing.T) {
 			in:   "0 = unknown_col",
 			want: "0 = unknown_col",
 		},
+
+		// ---- v0.9.1 / Bug 16 residual: CAST CHAR(N) [CHARSET ...]
+		// → CAST AS VARCHAR(N). Runs regardless of bool context.
+		{
+			name: "cast char with charset rewrites to varchar",
+			in:   "cast(value as char(10) charset utf8mb4)",
+			want: "CAST(value AS VARCHAR(10))",
+		},
+		{
+			name: "cast char with charset and collate rewrites",
+			in:   "cast(name as char(64) charset utf8mb4 collate utf8mb4_bin)",
+			want: "CAST(name AS VARCHAR(64))",
+		},
+		{
+			name: "cast char without charset rewrites",
+			in:   "cast(qty as char(20))",
+			want: "CAST(qty AS VARCHAR(20))",
+		},
+		{
+			name: "bare cast char (no length) becomes TEXT",
+			in:   "cast(x as char)",
+			want: "CAST(x AS TEXT)",
+		},
+		{
+			name: "cast to non-CHAR type passes through",
+			in:   "CAST(price AS DECIMAL(10,2))",
+			want: "CAST(price AS DECIMAL(10,2))",
+		},
+		{
+			name: "CAST inside CONCAT triggers both rewrites",
+			in:   "CONCAT('id-', cast(id as char(10) charset utf8mb4))",
+			want: "('id-' || CAST(id AS VARCHAR(10)))",
+		},
 	}
 	for _, c := range cases {
 		c := c
@@ -284,6 +317,84 @@ func TestTranslateExprForPG_BoolIdioms(t *testing.T) {
 		got := translateExprForPG("0 = is_active", ExprContext{})
 		if got != "0 = is_active" {
 			t.Errorf("empty-ctx translateExprForPG = %q; want passthrough", got)
+		}
+	})
+}
+
+// TestTranslateExprForPG_BoolToIntCoalesce covers v0.9.1 / Bug 17
+// residual: when the outer column is integer-typed (e.g. a generated
+// column whose tinyint(1) source got widened to smallint via
+// --type-override), `coalesce(<bool>, <int_lit>)` casts the bool side
+// to int instead of converting the int literal to bool. The flip is
+// gated on ExprContext.OuterColumnIsInteger.
+func TestTranslateExprForPG_BoolToIntCoalesce(t *testing.T) {
+	intCtx := ExprContext{
+		OuterColumnIsInteger: true,
+		BoolColumns:          map[string]bool{"is_active": true},
+	}
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "coalesce(bool ident, int) wraps bool with ::int",
+			in:   "COALESCE(is_active, 0)",
+			want: "COALESCE((is_active)::int, 0)",
+		},
+		{
+			name: "coalesce(int, bool ident) wraps bool with ::int",
+			in:   "COALESCE(0, is_active)",
+			want: "COALESCE(0, (is_active)::int)",
+		},
+		{
+			name: "coalesce with parenthesised bool sub-expression",
+			in:   "COALESCE((qty = 0), 0)",
+			want: "COALESCE((qty = 0)::int, 0)",
+		},
+		{
+			name: "coalesce with bare comparison",
+			in:   "COALESCE(qty = 0, 0)",
+			want: "COALESCE((qty = 0)::int, 0)",
+		},
+		{
+			name: "coalesce with IS NULL",
+			in:   "COALESCE(notes IS NULL, 0)",
+			want: "COALESCE((notes IS NULL)::int, 0)",
+		},
+		{
+			name: "coalesce of two non-bool args is untouched",
+			in:   "COALESCE(qty, 0)",
+			want: "COALESCE(qty, 0)",
+		},
+		{
+			name: "ifnull renames and the bool side gets cast",
+			in:   "IFNULL(is_active, 0)",
+			want: "COALESCE((is_active)::int, 0)",
+		},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			got := translateExprForPG(c.in, intCtx)
+			if got != c.want {
+				t.Errorf("translateExprForPG(%q) =\n  got  %q\n  want %q",
+					c.in, got, c.want)
+			}
+		})
+	}
+
+	// Cross-check: with OuterColumnIsInteger=false (default) and a
+	// bool context, the SAME input rewrites the int literal to bool
+	// instead — confirms the flag flips the rewrite direction
+	// without affecting the bool-context path.
+	t.Run("flag off restores bool-literal direction", func(t *testing.T) {
+		boolCtx := ExprContext{
+			BoolColumns: map[string]bool{"is_active": true},
+		}
+		got := translateExprForPG("COALESCE(is_active, 0)", boolCtx)
+		if got != "COALESCE(is_active, false)" {
+			t.Errorf("bool-context COALESCE rewrite = %q; want bool-literal direction", got)
 		}
 	})
 }

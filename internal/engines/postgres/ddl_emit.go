@@ -309,7 +309,22 @@ func emitColumnDef(table *ir.Table, c *ir.Column, opts emitOpts) (string, error)
 		}
 		sb.WriteString(" GENERATED ALWAYS AS (")
 		sb.WriteString(translateGeneratedExpr(c, table))
-		sb.WriteString(") STORED")
+		sb.WriteString(")")
+		// Bug 23 (refined): an enum-typed generated column with a
+		// body that returns text — typically a CASE returning enum-
+		// valued literals, or a COALESCE over text columns — needs
+		// an explicit cast to the enum type, otherwise PG rejects
+		// with "column X is of type Y_enum but expression is of
+		// type text". Wrapping the whole expression with
+		// `::<enum_type>` works for any text-returning shape (CASE,
+		// COALESCE, simple literal); per-arm casting would require
+		// recognising the CASE structure and isn't strictly more
+		// correct. Mirrors the DEFAULT-cast pattern below.
+		if _, isEnum := c.Type.(ir.Enum); isEnum && table != nil {
+			sb.WriteString("::")
+			sb.WriteString(quoteIdent(enumTypeName(table.Name, c.Name)))
+		}
+		sb.WriteString(" STORED")
 	}
 	if !c.Nullable {
 		sb.WriteString(" NOT NULL")
@@ -726,12 +741,19 @@ func emitCheckConstraint(c *ir.CheckConstraint, tbl *ir.Table) string {
 // An empty / matching dialect tag emits verbatim — same behaviour as
 // before the translation layer landed. tbl supplies the bool-column
 // context for the v0.8.0 bool-idiom rewrite; nil is permitted and
-// disables that rewrite.
+// disables that rewrite. The outer column's IR type also informs the
+// COALESCE rewrite direction (v0.9.1 / Bug 17 residual): integer-
+// typed generated columns whose body returns bool get the bool side
+// cast to int, instead of converting the int literal to bool.
 func translateGeneratedExpr(c *ir.Column, tbl *ir.Table) string {
 	if c.GeneratedExprDialect == "" || c.GeneratedExprDialect == dialectName {
 		return c.GeneratedExpr
 	}
-	return translateExprForPG(c.GeneratedExpr, exprContextForTable(tbl))
+	ctx := exprContextForTable(tbl)
+	if _, isInt := c.Type.(ir.Integer); isInt {
+		ctx.OuterColumnIsInteger = true
+	}
+	return translateExprForPG(c.GeneratedExpr, ctx)
 }
 
 // translateCheckExpr returns the CHECK-constraint expression to emit,
