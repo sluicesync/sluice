@@ -81,6 +81,15 @@ type Migrator struct {
 	// nil/empty disables the override step entirely.
 	Mappings []config.Mapping
 
+	// ExpressionMappings is the per-column generated-expression
+	// override list from sluice.yaml. Applied alongside Mappings:
+	// the schema reader's emitted GeneratedExpr is replaced with the
+	// operator's target-dialect text, and the dialect tag is cleared
+	// so the writer-side translator skips the column entirely. The
+	// escape hatch for cases the cross-dialect translator's hand-
+	// coded rewrite table doesn't recognise (ADR-0016).
+	ExpressionMappings []config.ExpressionMapping
+
 	// Filter selects which source tables participate in the
 	// migration. Empty filter (zero value) keeps the previous
 	// behaviour of migrating every table the source schema reader
@@ -245,6 +254,10 @@ func (m *Migrator) Run(ctx context.Context) error {
 	schema, err = translate.ApplyMappings(schema, m.Mappings)
 	if err != nil {
 		return fmt.Errorf("pipeline: apply mappings: %w", err)
+	}
+	schema, err = translate.ApplyExpressionOverrides(schema, m.ExpressionMappings)
+	if err != nil {
+		return fmt.Errorf("pipeline: apply expression overrides: %w", err)
 	}
 
 	if m.DryRun {

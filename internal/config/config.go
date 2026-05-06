@@ -37,6 +37,15 @@ type Config struct {
 	// the type-mapping policy would otherwise pick.
 	Mappings []Mapping `koanf:"mappings"`
 
+	// ExpressionMappings is a list of per-column expression overrides.
+	// Each entry replaces the source's `GENERATED ALWAYS AS (<expr>)`
+	// body with operator-supplied target-dialect expression text,
+	// bypassing the cross-dialect translator (ADR-0016) entirely for
+	// that column. Operator owns the syntax; sluice emits the override
+	// verbatim. The escape hatch for cases the translator's hand-coded
+	// rewrite table doesn't recognise — see ADR-0016 §"Added in v0.10.0".
+	ExpressionMappings []ExpressionMapping `koanf:"expression_mappings"`
+
 	// Extensions controls how engine-specific extensions (notably
 	// Postgres extensions) are handled during a migration.
 	Extensions Extensions `koanf:"extensions"`
@@ -69,6 +78,26 @@ type Mapping struct {
 	// Postgres). Free-form so writers can add options without
 	// schema migrations of the config file.
 	TargetTypeOptions map[string]any `koanf:"target_type_options"`
+}
+
+// ExpressionMapping is a single per-column generated-expression
+// override. The Expression field is target-dialect text that sluice
+// emits verbatim — the translator's pattern-based rewrites
+// (ADR-0016) do not run when an override is present, so the operator
+// is fully responsible for the syntax.
+//
+// v0.10.0 scope: generated-column bodies only. CHECK constraints,
+// index expressions, and DEFAULT expressions get their own override
+// types if/when real-world testing surfaces the need.
+type ExpressionMapping struct {
+	// Table is the unqualified table name the override applies to.
+	Table string `koanf:"table"`
+	// Column is the generated column whose body is being overridden.
+	Column string `koanf:"column"`
+	// Expression is the target-dialect text to emit verbatim inside
+	// the `GENERATED ALWAYS AS (...)` clause. Operator-owned syntax;
+	// sluice does not parse or validate it.
+	Expression string `koanf:"expression"`
 }
 
 // Extensions controls extension-related behaviour, currently scoped

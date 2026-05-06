@@ -103,6 +103,12 @@ type Streamer struct {
 	// schema as-is, so the field is ignored on that branch.
 	Mappings []config.Mapping
 
+	// ExpressionMappings is the per-column generated-expression
+	// override list. Same cold-start-only consumption as Mappings.
+	// See [Migrator.ExpressionMappings] for the rationale and
+	// ADR-0016 §"Added in v0.10.0".
+	ExpressionMappings []config.ExpressionMapping
+
 	// DryRun, when true, prints what Run would do (cold-start vs
 	// warm-resume, source schema summary or persisted-position
 	// token) and returns without opening the snapshot stream,
@@ -492,8 +498,12 @@ func (s *Streamer) logDryRunPlan(ctx context.Context, streamID string, persisted
 	if err := applyTableFilter(ctx, schema, s.Filter); err != nil {
 		return err
 	}
-	if _, err := translate.ApplyMappings(schema, s.Mappings); err != nil {
+	mapped, err := translate.ApplyMappings(schema, s.Mappings)
+	if err != nil {
 		return fmt.Errorf("pipeline: dry-run: apply mappings: %w", err)
+	}
+	if _, err := translate.ApplyExpressionOverrides(mapped, s.ExpressionMappings); err != nil {
+		return fmt.Errorf("pipeline: dry-run: apply expression overrides: %w", err)
 	}
 	slog.InfoContext(ctx, "dry run: tables to bulk-copy and tail via CDC",
 		slog.Int("tables", len(schema.Tables)),
@@ -640,6 +650,10 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 	schema, err = translate.ApplyMappings(schema, s.Mappings)
 	if err != nil {
 		return nil, fmt.Errorf("pipeline: apply mappings: %w", err)
+	}
+	schema, err = translate.ApplyExpressionOverrides(schema, s.ExpressionMappings)
+	if err != nil {
+		return nil, fmt.Errorf("pipeline: apply expression overrides: %w", err)
 	}
 
 	stream, err := s.Source.OpenSnapshotStream(ctx, s.SourceDSN)

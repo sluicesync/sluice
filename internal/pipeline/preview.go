@@ -52,6 +52,12 @@ type Previewer struct {
 	// step. Mirrors the migrate/streamer field of the same name.
 	Mappings []config.Mapping
 
+	// ExpressionMappings is the per-column generated-expression
+	// override list. Mirrors the migrate/streamer field of the same
+	// name. Applied alongside Mappings so previewed DDL reflects
+	// what migrate / sync start would produce.
+	ExpressionMappings []config.ExpressionMapping
+
 	// Filter selects which source tables participate in the preview.
 	// Empty (zero value) keeps every table the source schema reader
 	// returns.
@@ -142,6 +148,10 @@ func (p *Previewer) Run(ctx context.Context) error {
 	tgtSchema, err := translate.ApplyMappings(srcSchema, p.Mappings)
 	if err != nil {
 		return fmt.Errorf("preview: apply mappings: %w", err)
+	}
+	tgtSchema, err = translate.ApplyExpressionOverrides(tgtSchema, p.ExpressionMappings)
+	if err != nil {
+		return fmt.Errorf("preview: apply expression overrides: %w", err)
 	}
 
 	// ---- 4. Open the target schema writer; type-assert for preview. ----

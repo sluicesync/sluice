@@ -37,6 +37,8 @@ type SchemaPreviewCmd struct {
 
 	TypeOverride []string `help:"Force a specific target type for a column (repeatable). Format: 'TABLE.COLUMN=TYPE', e.g. 'users.id=binary_uuid'. CLI form of the YAML 'mappings:' config; for target-type options, use the YAML form." placeholder:"TABLE.COLUMN=TYPE"`
 
+	ExprOverride []string `help:"Replace a generated column's body with operator-supplied target-dialect text (repeatable). Format: 'TABLE.COLUMN=EXPRESSION'. Emitted verbatim; ADR-0016 translator skips overridden columns. CLI form of the YAML 'expression_mappings:' config." placeholder:"TABLE.COLUMN=EXPRESSION"`
+
 	Format string `help:"Output format: 'text' (human-readable, default) or 'json' (machine-readable for tooling)." default:"text" enum:"text,json" placeholder:"FORMAT"`
 
 	Output string `help:"Write to FILE instead of stdout. Atomic: written to a sibling temp file in the destination directory, then renamed into place." short:"o" placeholder:"FILE"`
@@ -71,6 +73,10 @@ func (s *SchemaPreviewCmd) Run(g *Globals) error {
 	if err != nil {
 		return err
 	}
+	exprMappings, err := resolveExpressionMappings(s.ExprOverride, cfg)
+	if err != nil {
+		return err
+	}
 
 	writer, finalize, err := openPreviewOutput(s.Output)
 	if err != nil {
@@ -82,14 +88,15 @@ func (s *SchemaPreviewCmd) Run(g *Globals) error {
 	defer func() { _ = finalize(err) }()
 
 	prev := &pipeline.Previewer{
-		Source:    source,
-		Target:    target,
-		SourceDSN: s.Source,
-		TargetDSN: s.Target,
-		Mappings:  mappings,
-		Filter:    filter,
-		Format:    s.Format,
-		Out:       writer,
+		Source:             source,
+		Target:             target,
+		SourceDSN:          s.Source,
+		TargetDSN:          s.Target,
+		Mappings:           mappings,
+		ExpressionMappings: exprMappings,
+		Filter:             filter,
+		Format:             s.Format,
+		Out:                writer,
 	}
 	err = prev.Run(kongContext())
 	return err

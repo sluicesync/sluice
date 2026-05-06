@@ -86,6 +86,8 @@ type MigrateCmd struct {
 
 	TypeOverride []string `help:"Force a specific target type for a column (repeatable). Format: 'TABLE.COLUMN=TYPE', e.g. 'products.attrs=text'. CLI form of the YAML 'mappings:' config; for target-type options (e.g. 'jsonb' with binary=true), use the YAML form." placeholder:"TABLE.COLUMN=TYPE"`
 
+	ExprOverride []string `help:"Replace a generated column's body with operator-supplied target-dialect text (repeatable). Format: 'TABLE.COLUMN=EXPRESSION'. The expression is emitted verbatim — sluice's cross-dialect translator (ADR-0016) does NOT run on overridden columns. Escape hatch for cases the translator's hand-coded rewrites don't recognise. CLI form of the YAML 'expression_mappings:' config." placeholder:"TABLE.COLUMN=EXPRESSION"`
+
 	DryRun bool `help:"Read the source schema and print the migration plan without applying changes." short:"n"`
 
 	Resume      bool   `help:"Resume a previously-failed migration. State is read from sluice_migrate_state on the target." short:"r"`
@@ -142,6 +144,10 @@ func (m *MigrateCmd) Run(g *Globals) error {
 	if err != nil {
 		return err
 	}
+	exprMappings, err := resolveExpressionMappings(m.ExprOverride, cfg)
+	if err != nil {
+		return err
+	}
 
 	if m.ResetTargetData && !m.Yes {
 		ok, err := confirmTypedDestructive(os.Stdin, os.Stdout,
@@ -162,6 +168,7 @@ func (m *MigrateCmd) Run(g *Globals) error {
 		TargetDSN:           m.Target,
 		DryRun:              m.DryRun,
 		Mappings:            mappings,
+		ExpressionMappings:  exprMappings,
 		Filter:              filter,
 		Resume:              m.Resume,
 		MigrationID:         m.MigrationID,
@@ -233,6 +240,8 @@ type SyncStartCmd struct {
 
 	TypeOverride []string `help:"Force a specific target type for a column (repeatable). Format: 'TABLE.COLUMN=TYPE', e.g. 'products.attrs=text'. CLI form of the YAML 'mappings:' config; for target-type options, use the YAML form." placeholder:"TABLE.COLUMN=TYPE"`
 
+	ExprOverride []string `help:"Replace a generated column's body with operator-supplied target-dialect text (repeatable). Format: 'TABLE.COLUMN=EXPRESSION'. Emitted verbatim; ADR-0016 translator skips overridden columns. CLI form of the YAML 'expression_mappings:' config." placeholder:"TABLE.COLUMN=EXPRESSION"`
+
 	StreamID string `help:"Stream identifier; the key under which position is persisted on the target. Auto-generated from source/target host info when empty." placeholder:"ID"`
 	DryRun   bool   `short:"n" help:"Print what would happen — cold-start vs warm-resume, source schema summary or persisted position — without modifying the target or starting the stream."`
 
@@ -276,6 +285,10 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 	if err != nil {
 		return err
 	}
+	exprMappings, err := resolveExpressionMappings(s.ExprOverride, cfg)
+	if err != nil {
+		return err
+	}
 
 	if s.ResetTargetData && !s.Yes {
 		ok, err := confirmTypedDestructive(os.Stdin, os.Stdout,
@@ -290,18 +303,19 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 	}
 
 	streamer := &pipeline.Streamer{
-		Source:          source,
-		Target:          target,
-		SourceDSN:       s.Source,
-		TargetDSN:       s.Target,
-		StreamID:        s.StreamID,
-		Mappings:        mappings,
-		DryRun:          s.DryRun,
-		Filter:          filter,
-		ForceColdStart:  s.ForceColdStart,
-		ResetTargetData: s.ResetTargetData,
-		ApplyBatchSize:  s.ApplyBatchSize,
-		MaxBufferBytes:  s.MaxBufferBytes,
+		Source:             source,
+		Target:             target,
+		SourceDSN:          s.Source,
+		TargetDSN:          s.Target,
+		StreamID:           s.StreamID,
+		Mappings:           mappings,
+		ExpressionMappings: exprMappings,
+		DryRun:             s.DryRun,
+		Filter:             filter,
+		ForceColdStart:     s.ForceColdStart,
+		ResetTargetData:    s.ResetTargetData,
+		ApplyBatchSize:     s.ApplyBatchSize,
+		MaxBufferBytes:     s.MaxBufferBytes,
 	}
 	return streamer.Run(kongContext())
 }

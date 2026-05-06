@@ -218,6 +218,35 @@ GENERATED ALWAYS AS (CASE WHEN x IS NULL THEN 'a' ELSE 'b' END)::"foo_status_enu
 
 instead of per-arm casting.
 
+## Added in v0.10.0: `--expr-override` (the operator escape hatch)
+
+The pattern-matching translator's coverage has been growing one rule at a time as real-world testing surfaces new idioms. Each rule lands with a test, an ADR-0016 entry, and an integration repro — but the v0.x release cycle has made it clear that operators sometimes hit dialect quirks the table doesn't have a rule for, and the only path forward today is "drop the column on the source, recreate manually." That's an unhelpful failure mode for what's almost always a single-line gap.
+
+`--expr-override` (CLI) and `expression_mappings:` (YAML) are the always-works escape hatch. The operator names a column and supplies the target-dialect expression text directly; sluice emits it verbatim, and the translator skips the column entirely. This separates two questions that were previously bundled:
+
+- **What does sluice know how to translate?** Answer: the rules in this ADR's "Cumulative scope" table. Coverage grows over time.
+- **What does the operator do when sluice doesn't know?** Answer: `--expr-override`. Always works; one config line.
+
+### Mechanism
+
+The override applies before the writer-side translator runs. `internal/translate/expr_override.go::ApplyExpressionOverrides` walks the schema, replaces `Column.GeneratedExpr` with the operator's text, and clears `Column.GeneratedExprDialect`. The cleared dialect tag is the signal to `translateGeneratedExpr` (PG side) to short-circuit verbatim — same code path that runs for same-dialect expressions where no translation is needed.
+
+This means the rest of the pipeline (DDL emit, schema preview, schema diff, migrate, sync start) sees the override transparently. No special override-aware path; the column just looks like a same-dialect column from the writer's perspective.
+
+### Strict validation
+
+The override rejects three operator-typo cases at config-load time, before any DSN is dialed:
+
+- Override references a table the source schema doesn't contain.
+- Override references a column the table doesn't have.
+- Override references a column that exists but isn't a generated column.
+
+The third check exists because "I overrode the wrong column name" is the most common operator mistake and silent passthrough would leave the operator wondering why their override didn't fire. Strict validation surfaces it as `expression_mappings target X.Y but the column is not a generated column`.
+
+### Scope
+
+v0.10.0 covers generated-column bodies only. CHECK constraints, index expressions, and DEFAULT expressions don't have an override surface yet — when (if) real-world testing surfaces the need, each gets its own override type with the same shape. Generated columns are the most-bitten case (Bugs 17 and 23 across the v0.8.x / v0.9.x cycles), so the v1 cut focuses there.
+
 ### Cumulative scope
 
 After v0.9.1 the writer-side translator covers:

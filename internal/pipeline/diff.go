@@ -50,6 +50,11 @@ type Differ struct {
 	// override step.
 	Mappings []config.Mapping
 
+	// ExpressionMappings is the per-column generated-expression
+	// override list. Applied alongside Mappings so the diff compares
+	// what migrate would actually emit (overridden bodies and all).
+	ExpressionMappings []config.ExpressionMapping
+
 	// Filter selects which source tables participate. Empty (zero
 	// value) keeps every source table the reader returns.
 	Filter TableFilter
@@ -141,6 +146,10 @@ func (d *Differ) Run(ctx context.Context) (*ir.SchemaDiff, error) {
 	expected, err := translate.ApplyMappings(srcSchema, d.Mappings)
 	if err != nil {
 		return nil, fmt.Errorf("diff: apply mappings: %w", err)
+	}
+	expected, err = translate.ApplyExpressionOverrides(expected, d.ExpressionMappings)
+	if err != nil {
+		return nil, fmt.Errorf("diff: apply expression overrides: %w", err)
 	}
 
 	// Cross-engine retarget: rewrite source-native IR types to their
