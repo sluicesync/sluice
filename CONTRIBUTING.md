@@ -58,6 +58,24 @@ Local Windows note: the integration suites need `export TESTCONTAINERS_RYUK_DISA
 
 Four jobs run on every PR (see [`.github/workflows/ci.yml`](.github/workflows/ci.yml) and [docs/dev/branch-protection.md](docs/dev/branch-protection.md)): Test (3 OSes, unit only), Integration (Linux only, Docker-backed), Lint (golangci-lint), Build (3 OSes, `go build` smoke test). All four must pass to merge.
 
+## Releases
+
+Sluice follows [Semantic Versioning](https://semver.org/). The release shape is:
+
+1. Land changes on `main` with a normal feature/fix commit. The CHANGELOG accumulates them under `## [Unreleased]`.
+2. When cutting a release, a `chore: cut vX.Y.Z — <one-line summary>` commit promotes `## [Unreleased]` to `## [vX.Y.Z] - YYYY-MM-DD` with a header paragraph and adds an empty `## [Unreleased]` above it.
+3. An annotated tag points at the cut commit:
+
+   ```bash
+   git tag -a vX.Y.Z -m "vX.Y.Z"
+   git push origin main
+   git push origin vX.Y.Z
+   ```
+
+4. The GitHub release notes follow the structure in [docs/dev/release-template.md](docs/dev/release-template.md) — Highlights / Fixed / Compatibility / Who-needs-this. The template carries enough context to fill in for any release.
+
+Patch releases (`vX.Y.Z` with non-zero Z) are reserved for bug fixes that don't change behaviour for unaffected users; minor releases (`vX.Y.0`) bundle features and any breaking interface changes the project has committed to honoring.
+
 ## Reporting bugs
 
 Open an issue with: the engine pair (e.g. MySQL 8.0 → Postgres 16), the version of sluice, the smallest reproducible config or schema, and the actual vs expected behavior. If you can include a `--dry-run` plan output, that's gold.
