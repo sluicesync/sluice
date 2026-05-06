@@ -188,7 +188,17 @@ func filterChanges(ctx context.Context, in <-chan ir.Change, filter TableFilter)
 // before the lookup. Operators write filter patterns against the
 // table name they see in CREATE TABLE / SHOW TABLES, not against
 // the schema-qualified form.
+//
+// Source-tx boundary events ([ir.TxBegin], [ir.TxCommit]) carry no
+// table reference (QualifiedName == "") and bypass the filter
+// entirely — they're applier-internal signals (ADR-0027), not
+// per-table data, and dropping them would defeat the
+// transaction-aware batch flush.
 func changeAllowed(c ir.Change, filter TableFilter) bool {
+	switch c.(type) {
+	case ir.TxBegin, ir.TxCommit:
+		return true
+	}
 	name := c.QualifiedName()
 	// Strip "schema." prefix if present — filter patterns target
 	// unqualified names. The IR's QualifiedName returns either

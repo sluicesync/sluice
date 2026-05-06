@@ -627,9 +627,13 @@ func TestServerVersionNum_PG17(t *testing.T) {
 	}
 }
 
-// drainChanges reads up to want events from changes, with an overall
-// timeout. Returns whatever it has if the timeout fires or the
-// channel closes.
+// drainChanges reads up to want row-level events from changes, with
+// an overall timeout. Returns whatever it has if the timeout fires
+// or the channel closes. Source-tx boundary events (TxBegin /
+// TxCommit, ADR-0027) are silently consumed without counting toward
+// want — the assertions in this test file target row-level events,
+// and the boundary events are coverage of the BatchedChangeApplier
+// flush path (exercised by the applier integration tests).
 func drainChanges(
 	t *testing.T,
 	ctx context.Context,
@@ -647,6 +651,10 @@ func drainChanges(
 		case c, ok := <-changes:
 			if !ok {
 				return got
+			}
+			switch c.(type) {
+			case ir.TxBegin, ir.TxCommit:
+				continue
 			}
 			got = append(got, c)
 		case <-deadline.C:

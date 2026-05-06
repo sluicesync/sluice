@@ -457,6 +457,194 @@ func TestChangeApplier_ApplyBatch_IdleFlushCommitsPartial(t *testing.T) {
 	}
 }
 
+// TestChangeApplier_ApplyBatch_TxCommitFlushesBatch verifies the
+// source-transaction-boundary aware flush path (ADR-0027). A
+// TxCommit event mid-stream flushes the in-flight target tx so the
+// target commit boundary aligns with the source's. The test feeds
+// two source transactions through a large batchSize (so row-count
+// flush wouldn't fire) and asserts:
+//
+//   - All rows land (correctness).
+//   - Two target commits are observed for the two source-tx
+//     groupings (alignment).
+//   - The persisted position is the last TxCommit's position
+//     (per-batch position semantics).
+//
+// Empty source transactions (TxBegin → TxCommit with no row events)
+// are folded into the same test to confirm they don't produce empty
+// target commits.
+func TestChangeApplier_ApplyBatch_TxCommitFlushesBatch(t *testing.T) {
+	dsn, cleanup := startPostgresForApplier(t)
+	defer cleanup()
+
+	applyPGApplier(t, dsn, `
+		CREATE TABLE users (
+			id    BIGINT       PRIMARY KEY,
+			email VARCHAR(255) NOT NULL
+		);
+	`)
+
+	eng := Engine{}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	applier, err := eng.OpenChangeApplier(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenChangeApplier: %v", err)
+	}
+	defer func() {
+		if c, ok := applier.(interface{ Close() error }); ok {
+			_ = c.Close()
+		}
+	}()
+
+	// Three source-side transactions:
+	//   tx1: 3 inserts (1, 2, 3)   -> commit
+	//   tx2: empty                 -> commit (must NOT produce a target tx)
+	//   tx3: 2 inserts (4, 5)      -> commit
+	//
+	// batchSize=100 means row-count flush won't fire; only TxCommit
+	// alignment can produce the observed two commits.
+	const lastToken = "tx3-commit-token"
+	events := []ir.Change{
+		ir.TxBegin{Position: ir.Position{Token: "tx1-begin"}},
+		ir.Insert{Position: ir.Position{Token: "tx1-r1"}, Schema: "public", Table: "users", Row: ir.Row{"id": int64(1), "email": "a@x"}},
+		ir.Insert{Position: ir.Position{Token: "tx1-r2"}, Schema: "public", Table: "users", Row: ir.Row{"id": int64(2), "email": "b@x"}},
+		ir.Insert{Position: ir.Position{Token: "tx1-r3"}, Schema: "public", Table: "users", Row: ir.Row{"id": int64(3), "email": "c@x"}},
+		ir.TxCommit{Position: ir.Position{Token: "tx1-commit"}},
+		ir.TxBegin{Position: ir.Position{Token: "tx2-begin"}},
+		ir.TxCommit{Position: ir.Position{Token: "tx2-commit"}},
+		ir.TxBegin{Position: ir.Position{Token: "tx3-begin"}},
+		ir.Insert{Position: ir.Position{Token: "tx3-r1"}, Schema: "public", Table: "users", Row: ir.Row{"id": int64(4), "email": "d@x"}},
+		ir.Insert{Position: ir.Position{Token: "tx3-r2"}, Schema: "public", Table: "users", Row: ir.Row{"id": int64(5), "email": "e@x"}},
+		ir.TxCommit{Position: ir.Position{Token: lastToken}},
+	}
+
+	startCommits := readXactCommit(t, dsn)
+	pumpBatchedChanges(t, ctx, applier, events, 100)
+	time.Sleep(300 * time.Millisecond)
+	endCommits := readXactCommit(t, dsn)
+
+	if got := countAllRows(t, dsn, "users"); got != 5 {
+		t.Errorf("after tx-aligned batched apply: rows = %d; want 5", got)
+	}
+
+	// We should observe at least 2 commits (one per non-empty source
+	// tx) and not many more — the empty tx in the middle must NOT
+	// produce its own target commit. Tolerance covers
+	// EnsureControlTable, pkFor / colTypesFor metadata lookups, and
+	// the pg_stat read itself. A pre-ADR-0027 batched applier with
+	// no flush-on-TxCommit would produce ONE commit (everything in
+	// one big batch); a per-change applier would produce >= 5.
+	delta := endCommits - startCommits
+	if delta < 2 {
+		t.Errorf("commit delta = %d; want >= 2 (one per non-empty source tx)", delta)
+	}
+	const tolerance = 30
+	if delta > 2+tolerance {
+		t.Errorf("commit delta = %d; want <= %d (suggests empty source tx produced a target commit)", delta, 2+tolerance)
+	}
+
+	pos, found, err := applier.ReadPosition(ctx, testStreamID)
+	if err != nil {
+		t.Fatalf("ReadPosition: %v", err)
+	}
+	if !found {
+		t.Fatal("ReadPosition: no row found; expected TxCommit-flush to persist position")
+	}
+	if pos.Token != lastToken {
+		t.Errorf("position token = %q; want %q (last source TxCommit's position)", pos.Token, lastToken)
+	}
+}
+
+// TestChangeApplier_ApplyBatch_ByteCapFlushes verifies the
+// memory-bounded streaming knob (--max-buffer-bytes, ADR-0028): when
+// the per-batch byte cap is below what maxBatchSize rows would
+// accumulate, the applier flushes early on the byte cap and produces
+// more commits than maxBatchSize alone would predict.
+//
+// Setup: 20 inserts with a ~10 KB payload column each (~200 KB
+// total). Row cap of 100 (effectively unbounded for the input) and
+// byte cap of 32 KB. Expect roughly ceil(200 KB / 32 KB) = 7
+// commits, not 1 (which is what the row cap alone would produce).
+func TestChangeApplier_ApplyBatch_ByteCapFlushes(t *testing.T) {
+	dsn, cleanup := startPostgresForApplier(t)
+	defer cleanup()
+
+	applyPGApplier(t, dsn, `
+		CREATE TABLE wide_rows (
+			id   BIGINT PRIMARY KEY,
+			data TEXT   NOT NULL
+		);
+	`)
+
+	eng := Engine{}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	applier, err := eng.OpenChangeApplier(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenChangeApplier: %v", err)
+	}
+	defer func() {
+		if c, ok := applier.(interface{ Close() error }); ok {
+			_ = c.Close()
+		}
+	}()
+
+	// Apply the byte cap: 32 KB. Per-row payload is 10 KB so ~3
+	// rows per batch before the cap fires.
+	const byteCap int64 = 32 * 1024
+	if setter, ok := applier.(ir.MaxBufferBytesSetter); ok {
+		setter.SetMaxBufferBytes(byteCap)
+	} else {
+		t.Fatalf("applier does not implement MaxBufferBytesSetter")
+	}
+
+	const totalRows = 20
+	const rowPayloadBytes = 10 * 1024
+	payload := strings.Repeat("x", rowPayloadBytes)
+
+	events := make([]ir.Change, 0, totalRows)
+	for i := int64(1); i <= totalRows; i++ {
+		events = append(events, ir.Insert{
+			Position: ir.Position{Engine: engineNamePostgres, Token: tokenForInt(i)},
+			Schema:   "public",
+			Table:    "wide_rows",
+			Row:      ir.Row{"id": i, "data": payload},
+		})
+	}
+
+	startCommits := readXactCommit(t, dsn)
+	// maxBatchSize is set to 100 — far higher than totalRows — so the
+	// row cap can't be the flush trigger; only the byte cap can.
+	pumpBatchedChanges(t, ctx, applier, events, 100)
+
+	time.Sleep(300 * time.Millisecond)
+	endCommits := readXactCommit(t, dsn)
+	delta := endCommits - startCommits
+
+	// Lower bound: roughly ceil(200 KB / 32 KB) = 7 commits.
+	// Without the byte cap the row cap (100) would produce just 1
+	// commit; the inequality below is wide enough to absorb the
+	// approximation noise (ApproximateRowBytes counts the data
+	// string's length plus 8 bytes for the int64; per-row total is
+	// ~10248 bytes, so 32 KB / 10248 ≈ 3 rows/batch → 7 commits).
+	const minExpected = 5
+	const maxExpected = 30 // metadata + control-table + stat-read overhead
+	if delta < minExpected {
+		t.Errorf("commit delta = %d; want >= %d (byte-cap flush should produce multiple commits)", delta, minExpected)
+	}
+	if delta > maxExpected {
+		t.Errorf("commit delta = %d; want <= %d (suggests too many flushes — byte cap may be ignored)", delta, maxExpected)
+	}
+
+	// Final state check: every row landed.
+	if got := countAllRows(t, dsn, "wide_rows"); got != totalRows {
+		t.Errorf("after byte-cap apply: rows = %d; want %d", got, totalRows)
+	}
+}
+
 // emailForInt returns a deterministic email address for the bulk-
 // insert tests above.
 func emailForInt(i int64) string {

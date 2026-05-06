@@ -102,6 +102,8 @@ type MigrateCmd struct {
 	BulkParallelism int `help:"Number of parallel reader/writer pairs per table during bulk copy. Tables above --bulk-parallel-min-rows are split into this many PK ranges and copied concurrently. Tables without a single integer PK fall back to single-reader. 0 means use min(8, NumCPU); 1 disables parallelism. See ADR-0019." default:"0" placeholder:"N"`
 
 	BulkParallelMinRows int64 `help:"Row-count threshold below which a table is copied with a single reader/writer pair regardless of --bulk-parallelism. Avoids per-chunk overhead on small tables. Default 100000." default:"100000" placeholder:"N"`
+
+	MaxBufferBytes int64 `help:"Soft cap on per-batch buffered memory in the bulk-copy writer. The writer flushes when accumulated row-value bytes reach the cap regardless of row count, so wide-row workloads (TEXT/BYTEA/JSON at MB scale) don't blow out heap. A single row larger than the cap still applies (soft target). Default 67108864 (64 MiB). See ADR-0028." default:"67108864" placeholder:"N"`
 }
 
 // Run implements the migrate subcommand.
@@ -168,6 +170,7 @@ func (m *MigrateCmd) Run(g *Globals) error {
 		BulkBatchSize:       m.BulkBatchSize,
 		BulkParallelism:     m.BulkParallelism,
 		BulkParallelMinRows: m.BulkParallelMinRows,
+		MaxBufferBytes:      m.MaxBufferBytes,
 	}
 	return mig.Run(kongContext())
 }
@@ -240,6 +243,8 @@ type SyncStartCmd struct {
 	Yes bool `help:"Skip the destructive-action confirmation prompt for --reset-target-data." short:"y"`
 
 	ApplyBatchSize int `help:"Batch up to N CDC changes per target transaction. Default 1 (one change per tx, conservative). Production tuning: 100-500 typically gives 50-100x throughput on bulk CDC traffic. Schema-change events (TRUNCATE) flush the in-progress batch; the cap is an upper bound on batch size, not a target. Idempotent applier semantics (ADR-0010) keep replay-on-crash safe; ADR-0017 covers the full design." default:"1" placeholder:"N"`
+
+	MaxBufferBytes int64 `help:"Soft cap on per-batch buffered memory in the CDC applier (and, on the cold-start branch, the bulk-copy writer). The applier commits the in-flight target tx when accumulated row-value bytes reach the cap regardless of row count, so wide-row streams (TEXT/BYTEA/JSON at MB scale) don't blow out heap. A single change larger than the cap still applies (soft target). Default 67108864 (64 MiB). See ADR-0028." default:"67108864" placeholder:"N"`
 }
 
 // Run implements `sluice sync start`.
@@ -296,6 +301,7 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 		ForceColdStart:  s.ForceColdStart,
 		ResetTargetData: s.ResetTargetData,
 		ApplyBatchSize:  s.ApplyBatchSize,
+		MaxBufferBytes:  s.MaxBufferBytes,
 	}
 	return streamer.Run(kongContext())
 }

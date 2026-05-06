@@ -17,11 +17,15 @@ import (
 // realistic row sizes; tables with very wide rows can override.
 //
 // PlanetScale's pscale-cli dumper batches by ~1 MB of statement
-// body rather than row count; using row count here is simpler and
-// works fine for the typical migration shape. We can switch to
-// byte-driven batching when the BulkLoadLoadDataInfile strategy
-// lands and we have a real performance baseline to tune against.
+// body rather than row count; v0.7.0's --max-buffer-bytes is the
+// byte-driven cap that fires alongside the row-count cap (ADR-0028).
 const defaultMaxRowsPerBatch = 500
+
+// defaultMaxBufferBytes is the soft per-batch byte cap when the
+// caller doesn't set one explicitly. Bounds heap usage at ~64 MiB
+// for wide-row workloads; tunable via --max-buffer-bytes. See
+// ADR-0028.
+const defaultMaxBufferBytes int64 = 64 << 20 // 64 MiB
 
 // RowWriter performs bulk inserts into MySQL tables. It implements
 // [ir.RowWriter].
@@ -29,12 +33,16 @@ const defaultMaxRowsPerBatch = 500
 // The writer chooses a backend strategy at construction time based on
 // the engine's declared [ir.BulkLoadMethod]:
 //
+//   - BulkLoadLoadDataInfile: streams rows to MySQL via LOAD DATA
+//     LOCAL INFILE using go-sql-driver/mysql's RegisterReaderHandler
+//     mechanism (no real file is written). Typically 5–10x faster than
+//     batched INSERT. Falls back to BatchedInsert on a per-call basis
+//     when the server has `local_infile=OFF` or the table contains an
+//     ir.Geometry column. See `load_data_writer.go`.
 //   - BulkLoadBatchedInsert: accumulates rows into multi-row INSERT
 //     statements via prepared parameter placeholders. Used by
-//     PlanetScale (which doesn't support LOAD DATA INFILE) and as the
-//     fallback for vanilla MySQL until the LOAD DATA INFILE path lands.
-//   - BulkLoadLoadDataInfile: TODO. Currently falls through to
-//     BatchedInsert with no functional difference.
+//     PlanetScale (which doesn't allow LOAD DATA LOCAL INFILE) and as
+//     the per-call fallback path for vanilla MySQL.
 //
 // The writer holds an open *sql.DB; callers should call Close when
 // finished to release the connection pool.
@@ -48,6 +56,24 @@ type RowWriter struct {
 	// leave it as the zero value, in which case defaultMaxRowsPerBatch
 	// is used.
 	maxRowsPerBatch int
+
+	// maxBufferBytes is the soft byte-size cap on per-batch buffered
+	// row values for the BatchedInsert path. Implements
+	// [ir.MaxBufferBytesSetter] via [SetMaxBufferBytes]. Zero or
+	// negative means "no byte cap"; the row-count cap remains the
+	// only flush trigger. The LOAD DATA path is already streaming
+	// (rows go through an io.Pipe to the driver) and is unaffected.
+	// See ADR-0028.
+	maxBufferBytes int64
+}
+
+// SetMaxBufferBytes implements [ir.MaxBufferBytesSetter]. The
+// orchestrator calls this after [Engine.OpenRowWriter] returns when
+// --max-buffer-bytes is set, before WriteRows runs. Zero or negative
+// means "no byte cap"; the row-count cap remains the only flush
+// trigger.
+func (w *RowWriter) SetMaxBufferBytes(bytes int64) {
+	w.maxBufferBytes = bytes
 }
 
 // Close releases the underlying connection pool.
@@ -197,15 +223,12 @@ func (w *RowWriter) WriteRows(ctx context.Context, table *ir.Table, rows <-chan 
 	}
 
 	switch w.bulkLoad {
-	case ir.BulkLoadBatchedInsert, ir.BulkLoadLoadDataInfile:
-		// LoadDataInfile falls through to BatchedInsert until the
-		// dedicated path lands. This keeps the surface honest:
-		// vanilla MySQL still works (slower than ideal), and the
-		// switch-on-capability shape stays in place for the day we
-		// add LoadDataInfile.
+	case ir.BulkLoadLoadDataInfile:
+		return w.writeLoadData(ctx, table, rows)
+	case ir.BulkLoadBatchedInsert:
 		return w.writeBatched(ctx, table, rows)
 	case ir.BulkLoadNone:
-		return fmt.Errorf("mysql: WriteRows: engine declares BulkLoad=None; cannot write rows")
+		return errors.New("mysql: WriteRows: engine declares BulkLoad=None; cannot write rows")
 	default:
 		return fmt.Errorf("mysql: WriteRows: unknown BulkLoadMethod %v", w.bulkLoad)
 	}
@@ -215,13 +238,26 @@ func (w *RowWriter) WriteRows(ctx context.Context, table *ir.Table, rows <-chan 
 // a single multi-row INSERT statement using parameter placeholders.
 // Letting the driver handle parameter encoding sidesteps the
 // per-type escaping problems that custom SQL generation would face.
+//
+// The flush trigger fires on whichever cap hits first: the row-count
+// cap (maxRowsPerBatch) or the byte-size cap (maxBufferBytes,
+// ADR-0028). The byte cap is a soft target — a single row larger
+// than the cap still applies (the row's already in `batch` when the
+// post-append check fires); the cap bounds *accumulation*, not
+// individual rows. This matches what pscale-cli's batcher does:
+// flush at ~1 MB of statement body rather than a fixed row count.
 func (w *RowWriter) writeBatched(ctx context.Context, table *ir.Table, rows <-chan ir.Row) error {
 	limit := w.maxRowsPerBatch
 	if limit <= 0 {
 		limit = defaultMaxRowsPerBatch
 	}
+	byteCap := w.maxBufferBytes
+	if byteCap <= 0 {
+		byteCap = defaultMaxBufferBytes
+	}
 
 	batch := make([]ir.Row, 0, limit)
+	var batchBytes int64
 
 	flush := func() error {
 		if len(batch) == 0 {
@@ -233,6 +269,7 @@ func (w *RowWriter) writeBatched(ctx context.Context, table *ir.Table, rows <-ch
 			return fmt.Errorf("mysql: insert into %q (%d rows): %w", table.Name, len(batch), err)
 		}
 		batch = batch[:0]
+		batchBytes = 0
 		return nil
 	}
 
@@ -243,7 +280,8 @@ func (w *RowWriter) writeBatched(ctx context.Context, table *ir.Table, rows <-ch
 				return flush()
 			}
 			batch = append(batch, row)
-			if len(batch) >= limit {
+			batchBytes += ir.ApproximateRowBytes(row)
+			if len(batch) >= limit || batchBytes >= byteCap {
 				if err := flush(); err != nil {
 					return err
 				}

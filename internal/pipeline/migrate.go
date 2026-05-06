@@ -171,6 +171,21 @@ type Migrator struct {
 	// Zero means use the default (100,000). Set explicitly via
 	// --bulk-parallel-min-rows when tuning for unusual workloads.
 	BulkParallelMinRows int64
+
+	// MaxBufferBytes is the soft upper bound on per-batch buffered
+	// memory in the bulk-copy writer (and, when this Migrator is
+	// later used as the cold-start half of a Streamer, the CDC
+	// applier). The writer flushes when accumulated row-value bytes
+	// reach the cap regardless of row count, so wide-row workloads
+	// (TEXT / BYTEA / JSON columns at MB scale) don't blow out heap
+	// when --bulk-batch-size's default of 5000 multiplies an unknown
+	// row size into hundreds of MB.
+	//
+	// Zero means use the default (64 MiB). The cap is a soft target:
+	// a single row larger than the cap still applies (the alternative
+	// is to refuse it, which would silently break otherwise-valid
+	// migrations). See ADR-0028.
+	MaxBufferBytes int64
 }
 
 // Run executes the migration. Returns nil on success or a wrapped
@@ -250,6 +265,7 @@ func (m *Migrator) Run(ctx context.Context) error {
 		return wrapWithHint(PhaseConnect, markFailed(ctx, rc, state, ir.MigrationPhasePending,
 			fmt.Errorf("pipeline: open target row writer: %w", err)))
 	}
+	applyMaxBufferBytes(rw, m.MaxBufferBytes)
 	defer closeIf(rw)
 
 	// ---- 3-6. Schema apply (phase 1) → bulk copy → indexes → constraints.
@@ -279,12 +295,13 @@ func (m *Migrator) Run(ctx context.Context) error {
 	}
 
 	parallelDeps := &parallelBulkCopyDeps{
-		source:      m.Source,
-		target:      m.Target,
-		sourceDSN:   m.SourceDSN,
-		targetDSN:   m.TargetDSN,
-		parallelism: resolveBulkParallelism(m.BulkParallelism, runtime.NumCPU()),
-		minRows:     resolveBulkParallelMinRows(m.BulkParallelMinRows),
+		source:         m.Source,
+		target:         m.Target,
+		sourceDSN:      m.SourceDSN,
+		targetDSN:      m.TargetDSN,
+		parallelism:    resolveBulkParallelism(m.BulkParallelism, runtime.NumCPU()),
+		minRows:        resolveBulkParallelMinRows(m.BulkParallelMinRows),
+		maxBufferBytes: m.MaxBufferBytes,
 	}
 
 	if err := runBulkCopyPhases(ctx, rc, &state, schema, rr, sw, rw, resuming, m.BulkBatchSize, parallelDeps); err != nil {
@@ -573,6 +590,7 @@ func (m *Migrator) logPlan(ctx context.Context, schema *ir.Schema) error {
 			slog.Int("foreign_keys", len(t.ForeignKeys)),
 		)
 	}
+	slog.InfoContext(ctx, "dry run: for full target DDL with translation notes and advisory hints, run `sluice schema preview` (ADR-0024)")
 	return nil
 }
 
@@ -581,5 +599,23 @@ func (m *Migrator) logPlan(ctx context.Context, schema *ir.Schema) error {
 func closeIf(v any) {
 	if c, ok := v.(io.Closer); ok {
 		_ = c.Close()
+	}
+}
+
+// applyMaxBufferBytes plumbs the orchestrator-side --max-buffer-bytes
+// value to an engine-side surface that opts into byte-bounded
+// batching via [ir.MaxBufferBytesSetter]. Engines that don't
+// implement the setter retain their pre-v0.7.0 row-count-only
+// behaviour. Zero or negative bytes is the no-cap value (engines
+// fall back to their built-in default if they have one).
+//
+// Called immediately after each engine writer/applier opens, before
+// any WriteRows / ApplyBatch dispatch. See ADR-0028.
+func applyMaxBufferBytes(target any, bytes int64) {
+	if bytes <= 0 {
+		return
+	}
+	if setter, ok := target.(ir.MaxBufferBytesSetter); ok {
+		setter.SetMaxBufferBytes(bytes)
 	}
 }

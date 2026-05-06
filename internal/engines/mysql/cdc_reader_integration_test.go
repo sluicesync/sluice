@@ -313,9 +313,13 @@ func TestCDCReader_Truncate(t *testing.T) {
 	}
 }
 
-// drainChanges reads up to want events from changes, with an overall
-// timeout. The returned slice may be shorter than want if the stream
-// closed early or the timeout fired — caller asserts.
+// drainChanges reads up to want row-level events from changes, with
+// an overall timeout. The returned slice may be shorter than want
+// if the stream closed early or the timeout fired — caller asserts.
+// Source-tx boundary events (TxBegin / TxCommit, ADR-0027) are
+// silently consumed without counting toward want — the assertions
+// in this test file target row-level events; boundary coverage
+// lives in the applier integration tests.
 func drainChanges(
 	t *testing.T,
 	ctx context.Context,
@@ -333,6 +337,10 @@ func drainChanges(
 		case c, ok := <-changes:
 			if !ok {
 				return got
+			}
+			switch c.(type) {
+			case ir.TxBegin, ir.TxCommit:
+				continue
 			}
 			got = append(got, c)
 		case <-deadline.C:

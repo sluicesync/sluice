@@ -517,11 +517,29 @@ func (r *CDCReader) dispatchWAL(
 
 	case *pglogrepl.BeginMessage:
 		*currentTxnLSN = m.FinalLSN
-		return nil
+		// Surface the source-tx boundary to the applier so the
+		// batched path can flush in-flight non-tx-aware batches and
+		// open a fresh target transaction aligned to this source
+		// transaction. Per-change appliers treat the event as a
+		// no-op. See ADR-0027.
+		pos, err := r.positionAt(m.FinalLSN)
+		if err != nil {
+			return err
+		}
+		return send(ctx, out, ir.TxBegin{Position: pos})
 
 	case *pglogrepl.CommitMessage:
 		*streamedLSN = m.CommitLSN
-		return nil
+		// Source-tx commit boundary: flush whatever the applier has
+		// in flight as one target transaction. The empty-source-tx
+		// case (BEGIN immediately followed by COMMIT with no row
+		// events) is harmless — the applier's flush path skips when
+		// no rows have accumulated. See ADR-0027.
+		pos, err := r.positionAt(m.CommitLSN)
+		if err != nil {
+			return err
+		}
+		return send(ctx, out, ir.TxCommit{Position: pos})
 
 	case *pglogrepl.InsertMessageV2:
 		return r.emitInsert(ctx, relations, m.RelationID, m.Tuple, *currentTxnLSN, out)
@@ -545,10 +563,27 @@ func (r *CDCReader) dispatchWAL(
 
 	case *pglogrepl.StreamStartMessageV2:
 		*inStream = true
-		return nil
+		// pgoutput v2 streaming-in-progress: large source
+		// transactions arrive in chunks separated by StreamStart /
+		// StreamStop pairs (ADR-0027). Treat each chunk as its own
+		// boundary for applier batching purposes — the alternative
+		// (buffer the whole transaction in memory) would defeat the
+		// streaming protocol's purpose. The trade-off is documented
+		// in the ADR: a huge source transaction produces multiple
+		// target transactions on the receiver, which is still
+		// correct under ADR-0010 idempotency.
+		pos, err := r.positionAt(*currentTxnLSN)
+		if err != nil {
+			return err
+		}
+		return send(ctx, out, ir.TxBegin{Position: pos})
 	case *pglogrepl.StreamStopMessageV2:
 		*inStream = false
-		return nil
+		pos, err := r.positionAt(*currentTxnLSN)
+		if err != nil {
+			return err
+		}
+		return send(ctx, out, ir.TxCommit{Position: pos})
 
 	default:
 		// TypeMessage, OriginMessage, LogicalDecodingMessage,

@@ -95,6 +95,22 @@ type ChangeApplier struct {
 	// runs as before, and the reader falls back to streamed-LSN
 	// keepalives.
 	lsnFeedback *lsnTracker
+
+	// maxBufferBytes is the soft byte-size cap on the in-flight
+	// batch's buffered change values during ApplyBatch. Implements
+	// [ir.MaxBufferBytesSetter] via [SetMaxBufferBytes]. Zero or
+	// negative means "no byte cap"; the row-count cap remains the
+	// only flush trigger. See ADR-0028.
+	maxBufferBytes int64
+}
+
+// SetMaxBufferBytes implements [ir.MaxBufferBytesSetter]. The
+// streamer calls this after [Engine.OpenChangeApplier] returns when
+// --max-buffer-bytes is set, before ApplyBatch runs. Zero or negative
+// means "no byte cap"; the row-count cap remains the only flush
+// trigger.
+func (a *ChangeApplier) SetMaxBufferBytes(bytes int64) {
+	a.maxBufferBytes = bytes
 }
 
 // LSNTracker returns the applier's applied-LSN feedback channel.
@@ -242,6 +258,17 @@ func (a *ChangeApplier) Apply(ctx context.Context, streamID string, changes <-ch
 		case c, ok := <-changes:
 			if !ok {
 				return nil
+			}
+			// Source-tx boundary events are no-ops on the per-change
+			// path (ADR-0027): each row event already commits its
+			// own target transaction, so a TxBegin / TxCommit
+			// signal carries no extra information here. The
+			// boundary semantics are only useful to the batched
+			// applier, which observes them to align target tx
+			// boundaries to source tx boundaries.
+			switch c.(type) {
+			case ir.TxBegin, ir.TxCommit:
+				continue
 			}
 			if err := a.applyOne(ctx, streamID, c); err != nil {
 				return err

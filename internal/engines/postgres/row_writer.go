@@ -18,6 +18,12 @@ import (
 // tune with real-world data.
 const defaultMaxRowsPerBatch = 500
 
+// defaultMaxBufferBytes is the soft per-batch byte cap when the
+// caller doesn't set one explicitly. Bounds heap usage at ~64 MiB
+// for wide-row workloads; tunable via --max-buffer-bytes. See
+// ADR-0028.
+const defaultMaxBufferBytes int64 = 64 << 20 // 64 MiB
+
 // RowWriter performs bulk inserts into PostgreSQL tables. It
 // implements [ir.RowWriter].
 //
@@ -56,6 +62,24 @@ type RowWriter struct {
 	// it at zero (which causes defaultMaxRowsPerBatch to be used).
 	// Ignored on the COPY path.
 	maxRowsPerBatch int
+
+	// maxBufferBytes is the soft byte-size cap on per-batch buffered
+	// row values. Implements [ir.MaxBufferBytesSetter] via
+	// [SetMaxBufferBytes]. Zero or negative means "no byte cap"; the
+	// row-count cap (maxRowsPerBatch) remains the only flush
+	// trigger. The COPY path also honours this — pgx CopyFrom drains
+	// rows from a generator we control, so the source can flush
+	// early on byte accumulation. See ADR-0028.
+	maxBufferBytes int64
+}
+
+// SetMaxBufferBytes implements [ir.MaxBufferBytesSetter]. The
+// orchestrator calls this immediately after [Engine.OpenRowWriter]
+// returns when --max-buffer-bytes is set, before WriteRows runs.
+// Zero or negative means "no byte cap"; the row-count cap remains
+// the only flush trigger.
+func (w *RowWriter) SetMaxBufferBytes(bytes int64) {
+	w.maxBufferBytes = bytes
 }
 
 // Close releases the underlying connection pool.
@@ -236,13 +260,26 @@ func (w *RowWriter) writeViaCopy(ctx context.Context, table *ir.Table, rows <-ch
 // parameterised INSERT ... VALUES (...) statements and Execs them
 // through database/sql. Retained for engines whose BulkLoad
 // capability declines COPY (none today, but the hook is here).
+//
+// The flush trigger fires on whichever cap hits first: the row-count
+// cap (maxRowsPerBatch) or the byte-size cap (maxBufferBytes,
+// ADR-0028). The byte cap is a soft target — a single row larger
+// than the cap still applies (the row's already in `batch` when the
+// post-append check fires), bounded only by the engine's own
+// per-statement limits. This matches what pscale-cli's batcher does:
+// flush at ~1 MB of statement body rather than a fixed row count.
 func (w *RowWriter) writeViaBatch(ctx context.Context, table *ir.Table, rows <-chan ir.Row) error {
 	limit := w.maxRowsPerBatch
 	if limit <= 0 {
 		limit = defaultMaxRowsPerBatch
 	}
+	byteCap := w.maxBufferBytes
+	if byteCap <= 0 {
+		byteCap = defaultMaxBufferBytes
+	}
 
 	batch := make([]ir.Row, 0, limit)
+	var batchBytes int64
 	flush := func() error {
 		if len(batch) == 0 {
 			return nil
@@ -256,6 +293,7 @@ func (w *RowWriter) writeViaBatch(ctx context.Context, table *ir.Table, rows <-c
 			return fmt.Errorf("postgres: insert into %q (%d rows): %w", table.Name, len(batch), err)
 		}
 		batch = batch[:0]
+		batchBytes = 0
 		return nil
 	}
 
@@ -266,7 +304,8 @@ func (w *RowWriter) writeViaBatch(ctx context.Context, table *ir.Table, rows <-c
 				return flush()
 			}
 			batch = append(batch, row)
-			if len(batch) >= limit {
+			batchBytes += ir.ApproximateRowBytes(row)
+			if len(batch) >= limit || batchBytes >= byteCap {
 				if err := flush(); err != nil {
 					return err
 				}

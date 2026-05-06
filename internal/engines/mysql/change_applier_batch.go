@@ -125,23 +125,45 @@ func (a *ChangeApplier) ApplyBatch(ctx context.Context, streamID string, changes
 // position-write lands before TRUNCATE's implicit commit destroys
 // the open tx.
 //
+// Memory-bounded batching (ADR-0028): the in-flight batch's
+// accumulated row-value bytes are tracked via
+// [ir.ApproximateChangeBytes]; when the running total reaches
+// [ChangeApplier.maxBufferBytes] the batch flushes early even if the
+// row cap hasn't fired. The byte cap is a soft target — a single
+// change larger than the cap still applies (the dispatch already
+// happened before the post-dispatch check fires); the cap bounds
+// *accumulation*, not individual changes.
+//
 // On error the open transaction is rolled back. On clean exit (row
-// cap, channel close, or Truncate flush) the transaction is
+// cap, byte cap, channel close, or Truncate flush) the transaction is
 // committed.
 func (a *ChangeApplier) applyOneBatch(ctx context.Context, streamID string, changes <-chan ir.Change, maxBatchSize int) (n int, lastPos ir.Position, channelClosed bool, err error) {
-	// Wait for the first change before opening the tx. Opening the
-	// tx then blocking with no work to do would hold a connection
-	// idle from the pool for arbitrarily long; we'd rather wait on
-	// the channel.
+	// Wait for the first row-bearing change before opening the tx.
+	// Opening the tx then blocking with no work to do would hold a
+	// connection idle from the pool for arbitrarily long; we'd
+	// rather wait on the channel. TxBegin / TxCommit boundary
+	// events received before any row event are consumed in this
+	// pre-tx loop (ADR-0027 — they're useful to the inner loop
+	// where they bracket actual row work).
 	var first ir.Change
-	select {
-	case c, ok := <-changes:
-		if !ok {
-			return 0, ir.Position{}, true, nil
+	for {
+		select {
+		case c, ok := <-changes:
+			if !ok {
+				return 0, ir.Position{}, true, nil
+			}
+			switch c.(type) {
+			case ir.TxBegin, ir.TxCommit:
+				// Empty source tx (BEGIN → XID with no row events)
+				// or a TxBegin / TxCommit that arrived after a
+				// previous batch flushed — both are no-ops.
+				continue
+			}
+			first = c
+		case <-ctx.Done():
+			return 0, ir.Position{}, false, ctx.Err()
 		}
-		first = c
-	case <-ctx.Done():
-		return 0, ir.Position{}, false, ctx.Err()
+		break
 	}
 
 	// Truncate as the first change of the batch: dispatch via the
@@ -154,6 +176,11 @@ func (a *ChangeApplier) applyOneBatch(ctx context.Context, streamID string, chan
 			return 0, ir.Position{}, false, err
 		}
 		return 1, first.Pos(), false, nil
+	}
+
+	byteCap := a.maxBufferBytes
+	if byteCap <= 0 {
+		byteCap = defaultMaxBufferBytes
 	}
 
 	tx, err := a.db.BeginTx(ctx, nil)
@@ -172,6 +199,7 @@ func (a *ChangeApplier) applyOneBatch(ctx context.Context, streamID string, chan
 	}
 	n = 1
 	lastPos = first.Pos()
+	batchBytes := ir.ApproximateChangeBytes(first)
 
 	// Idle-flush timer: commit a partial batch if no further change
 	// arrives within defaultIdleFlushPeriod, so the persisted
@@ -186,6 +214,25 @@ func (a *ChangeApplier) applyOneBatch(ctx context.Context, streamID string, chan
 			if !ok {
 				channelClosed = true
 				return n, lastPos, channelClosed, a.commitBatch(ctx, tx, streamID, lastPos.Token, n)
+			}
+			// Source-tx boundary handling (ADR-0027). TxCommit
+			// flushes the in-flight target tx so the apply aligns
+			// with the source's XIDEvent. TxBegin observed mid-
+			// batch is a no-op: flushing on TxCommit is sufficient
+			// to keep alignment.
+			if _, isTxCommit := c.(ir.TxCommit); isTxCommit {
+				lastPos = c.Pos()
+				return n, lastPos, false, a.commitBatch(ctx, tx, streamID, lastPos.Token, n)
+			}
+			if _, isTxBegin := c.(ir.TxBegin); isTxBegin {
+				if !idle.Stop() {
+					select {
+					case <-idle.C:
+					default:
+					}
+				}
+				idle.Reset(defaultIdleFlushPeriod)
+				continue
 			}
 			if _, isTruncate := c.(ir.Truncate); isTruncate {
 				// Flush the in-flight non-DDL changes first so the
@@ -221,6 +268,20 @@ func (a *ChangeApplier) applyOneBatch(ctx context.Context, streamID string, chan
 			}
 			n++
 			lastPos = c.Pos()
+			batchBytes += ir.ApproximateChangeBytes(c)
+			// Byte-cap flush (ADR-0028): bounds the in-flight tx's
+			// buffered parameter memory on wide-row streams. Checked
+			// after the dispatch so the just-dispatched change is
+			// included in the count we commit.
+			if batchBytes >= byteCap {
+				slog.DebugContext(ctx, "mysql: applier: byte-cap flush",
+					slog.String("stream_id", streamID),
+					slog.Int("rows", n),
+					slog.Int64("bytes", batchBytes),
+					slog.Int64("byte_cap", byteCap),
+				)
+				return n, lastPos, false, a.commitBatch(ctx, tx, streamID, lastPos.Token, n)
+			}
 			if !idle.Stop() {
 				select {
 				case <-idle.C:

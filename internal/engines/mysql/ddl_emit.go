@@ -80,53 +80,34 @@ func emitColumnType(t ir.Type) (string, error) {
 	case ir.Geometry:
 		return emitGeometryType(v.Subtype), nil
 
-	// ---- Unsupported on MySQL ----
-	case ir.Array, ir.Inet, ir.Cidr, ir.Macaddr:
-		return "", unsupportedTypeError(t)
+	// ---- PG-native types without native MySQL equivalents ----
+	// Pre-v0.7.0 these returned an error pointing operators at
+	// `--type-override`. v0.7.0 auto-emits a sensible default so
+	// PG→MySQL migrations of these column types don't require
+	// per-column intervention. Operators wanting strict syntactic
+	// validation (e.g. CHECK regex on Inet) still use --type-override
+	// to a custom shape; operators wanting tighter or looser sizing
+	// likewise. The schema-preview command (ADR-0024) surfaces the
+	// auto-emit choice so it isn't silent.
+	case ir.Array:
+		// Array values arrive at the writer as JSON-shaped strings
+		// (Bug 14 fix in v0.5.0); MySQL JSON is the closest semantic
+		// match — structured, queryable via JSON_EXTRACT, indexable
+		// on virtual generated columns.
+		return "JSON", nil
+	case ir.Inet, ir.Cidr:
+		// Max IPv6 + CIDR mask in canonical form is 43 chars; round
+		// up to 45 for headroom. No CHECK constraint emitted in
+		// v0.7.0 — operators wanting strict validation use
+		// --type-override TABLE.COL=varchar:length=N with their own
+		// CHECK shape.
+		return "VARCHAR(45)", nil
+	case ir.Macaddr:
+		// EUI-64 in canonical form is 23 chars; round up to 30.
+		return "VARCHAR(30)", nil
 	}
 
 	return "", fmt.Errorf("mysql: unknown IR type %T", t)
-}
-
-// unsupportedTypeError returns a user-actionable error for IR types
-// MySQL has no native representation for. It names the type, points
-// at the per-column mappings hook (the operator-supplied translation
-// override), and gives a concrete YAML snippet matched to the type
-// — `text` / `longtext` for variadic arrays, `varchar(45)` for the
-// network types — so the user can copy-paste rather than guess.
-//
-// The orchestrator wraps this error with the column name (see
-// emitColumnDef), so the final user-facing message lands as:
-//
-//	mysql: column "tags": mysql: int[] has no native MySQL type;
-//	add a per-column override in sluice.yaml's mappings: section
-//	  - table: <table>
-//	    column: tags
-//	    target_type: longtext
-//	or rewrite the source column before running sluice.
-func unsupportedTypeError(t ir.Type) error {
-	suggestion := ""
-	switch t.(type) {
-	case ir.Array:
-		// Variadic-length text content; LONGTEXT covers the worst case
-		// (PG TEXT is unbounded, so emitting MEDIUMTEXT or smaller
-		// would quietly truncate). Operators who want JSON shape
-		// instead can use target_type: json.
-		suggestion = "longtext"
-	case ir.Inet, ir.Cidr:
-		// Max IPv6 + CIDR mask in canonical form is 43 chars; round
-		// up to 45 for headroom.
-		suggestion = "varchar(45)"
-	case ir.Macaddr:
-		// EUI-64 in canonical form is 23 chars; round up to 30.
-		suggestion = "varchar(30)"
-	default:
-		suggestion = "text"
-	}
-	return fmt.Errorf(
-		"mysql: %s has no native MySQL type; add a per-column override in sluice.yaml's mappings: section\n  - table: <table>\n    column: <column>\n    target_type: %s\nor rewrite the source column before running sluice",
-		typeName(t), suggestion,
-	)
 }
 
 // emitIntegerType returns the MySQL integer type DDL, including the

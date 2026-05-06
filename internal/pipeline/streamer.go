@@ -172,6 +172,20 @@ type Streamer struct {
 	// back to per-change Apply regardless of this field; in
 	// practice every shipping engine implements it (see ADR-0017).
 	ApplyBatchSize int
+
+	// MaxBufferBytes is the soft upper bound on per-batch buffered
+	// memory in the CDC applier (and, on the cold-start branch, the
+	// bulk-copy writer). Each in-flight target transaction tracks
+	// the accumulated row-value bytes of its buffered changes and
+	// commits early when the cap is reached, even if the row-count
+	// cap (--apply-batch-size) hasn't fired. This bounds memory on
+	// streams whose source transactions contain a few wide rows
+	// (TEXT / BYTEA / JSON at MB scale).
+	//
+	// Zero means use the default (64 MiB). The cap is a soft target:
+	// a single change larger than the cap still applies — better to
+	// land it than to wedge the stream. See ADR-0028.
+	MaxBufferBytes int64
 }
 
 // Run executes a snapshot+CDC stream. See [Streamer] for the full
@@ -464,12 +478,19 @@ func truncateDryRunToken(token string, maxLen int) string {
 // Close it. Borrowed => caller is responsible.
 func (s *Streamer) openApplier(ctx context.Context) (ir.ChangeApplier, bool, error) {
 	if s.Applier != nil {
+		// Pre-supplied appliers are typically test stubs whose
+		// lifecycle the caller owns; we still hand them the byte cap
+		// so a stub that wants to honour it can. Real production
+		// callers leave Applier nil and hit the OpenChangeApplier
+		// branch below.
+		applyMaxBufferBytes(s.Applier, s.MaxBufferBytes)
 		return s.Applier, false, nil
 	}
 	a, err := s.Target.OpenChangeApplier(ctx, s.TargetDSN)
 	if err != nil {
 		return nil, false, wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: open target change applier: %w", err))
 	}
+	applyMaxBufferBytes(a, s.MaxBufferBytes)
 	return a, true, nil
 }
 
@@ -594,6 +615,7 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 		_ = stream.Close()
 		return nil, wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: open target row writer: %w", err))
 	}
+	applyMaxBufferBytes(rw, s.MaxBufferBytes)
 
 	if s.ResetTargetData {
 		if err := resetTargetDataForStream(ctx, schema, rw, applier, streamID); err != nil {

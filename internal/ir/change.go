@@ -37,8 +37,8 @@ var ErrPositionInvalid = errors.New("ir: persisted position is no longer valid; 
 type Row map[string]any
 
 // Change is the sealed interface for events in a continuous-sync change
-// stream. Implementations are [Insert], [Update], [Delete], and
-// [Truncate]. New variants must be added in this package.
+// stream. Implementations are [Insert], [Update], [Delete], [Truncate],
+// [TxBegin], and [TxCommit]. New variants must be added in this package.
 type Change interface {
 	// isChange seals the interface.
 	isChange()
@@ -46,7 +46,8 @@ type Change interface {
 	// resumed. The value is opaque to consumers of the IR.
 	Pos() Position
 	// QualifiedName returns "schema.table" for the affected table, or
-	// just "table" when Schema is empty.
+	// just "table" when Schema is empty. Transaction-boundary events
+	// ([TxBegin], [TxCommit]) carry no table reference and return "".
 	QualifiedName() string
 }
 
@@ -111,3 +112,54 @@ type Truncate struct {
 func (Truncate) isChange()               {}
 func (e Truncate) Pos() Position         { return e.Position }
 func (e Truncate) QualifiedName() string { return qualified(e.Schema, e.Table) }
+
+// TxBegin marks the start of a source-side transaction. Engines that
+// observe transaction boundaries in their replication protocol
+// (Postgres' BeginMessage, MySQL's BEGIN QueryEvent) emit one of
+// these immediately before the row events that belong to the
+// transaction; [TxCommit] marks the end.
+//
+// The IR carries these so a [BatchedChangeApplier] can preserve
+// transactional cohesion: a 5000-row source transaction commits as
+// one 5000-row target transaction instead of being split across
+// multiple batches by the row-count cap. Engines that don't surface
+// boundaries (legacy CDCReaders, future engines that lack the
+// concept) simply omit the events; the applier's row-count and idle
+// flush paths still work as before, so backwards compatibility is
+// automatic.
+//
+// Position carries the boundary's source position. For Postgres,
+// pgoutput's `BeginMessage.FinalLSN` (the commit LSN of the
+// transaction this Begin opens — known up front because pgoutput
+// emits Begin only after the source transaction has committed). For
+// MySQL, the position of the BEGIN QueryEvent in the binlog stream.
+//
+// Per-change [ChangeApplier.Apply] implementations treat TxBegin /
+// TxCommit as no-ops: each row event already commits its own target
+// transaction, so the boundary signal carries no extra information.
+// See ADR-0027.
+type TxBegin struct {
+	Position Position
+}
+
+func (TxBegin) isChange()               {}
+func (e TxBegin) Pos() Position         { return e.Position }
+func (e TxBegin) QualifiedName() string { return "" }
+
+// TxCommit marks the end of a source-side transaction. See [TxBegin]
+// for the design rationale. A [BatchedChangeApplier] that observes
+// TxCommit flushes the in-flight target transaction at this boundary
+// (subject to the empty-source-tx skip — a TxBegin → TxCommit pair
+// with no row events between them does not produce an empty target
+// commit).
+//
+// Position carries the source-side commit position. For Postgres,
+// pgoutput's `CommitMessage.CommitLSN`. For MySQL, the position of
+// the XIDEvent (InnoDB transaction commit marker).
+type TxCommit struct {
+	Position Position
+}
+
+func (TxCommit) isChange()               {}
+func (e TxCommit) Pos() Position         { return e.Position }
+func (e TxCommit) QualifiedName() string { return "" }

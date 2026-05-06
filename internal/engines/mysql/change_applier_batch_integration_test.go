@@ -147,6 +147,74 @@ func TestChangeApplier_ApplyBatch_TruncateFlushesBatch(t *testing.T) {
 	}
 }
 
+// TestChangeApplier_ApplyBatch_TxCommitFlushesBatch verifies the
+// source-transaction-boundary aware flush path (ADR-0027). A
+// TxCommit event mid-stream flushes the in-flight target tx so the
+// target commit boundary aligns with the source's XIDEvent. The
+// test feeds two non-empty source transactions plus one empty
+// (TxBegin → TxCommit with no rows) through a large batchSize and
+// asserts the rows land and the position written is the last
+// TxCommit's position. Commit-count assertions on MySQL are not as
+// clean as on PG (no `pg_stat_database` equivalent), so the load-
+// bearing assertions are correctness + position alignment.
+func TestChangeApplier_ApplyBatch_TxCommitFlushesBatch(t *testing.T) {
+	dsn, cleanup := startMySQLForApplier(t)
+	defer cleanup()
+
+	applyMySQLApplier(t, dsn, `
+		CREATE TABLE users (
+			id    BIGINT       NOT NULL,
+			email VARCHAR(255) NOT NULL,
+			PRIMARY KEY (id)
+		);
+	`)
+
+	eng := Engine{}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	applier, err := eng.OpenChangeApplier(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenChangeApplier: %v", err)
+	}
+	defer func() {
+		if c, ok := applier.(interface{ Close() error }); ok {
+			_ = c.Close()
+		}
+	}()
+
+	const lastToken = "tx3-commit-token"
+	events := []ir.Change{
+		ir.TxBegin{Position: ir.Position{Token: "tx1-begin"}},
+		ir.Insert{Position: ir.Position{Token: "tx1-r1"}, Schema: "target_db", Table: "users", Row: ir.Row{"id": int64(1), "email": "a@x"}},
+		ir.Insert{Position: ir.Position{Token: "tx1-r2"}, Schema: "target_db", Table: "users", Row: ir.Row{"id": int64(2), "email": "b@x"}},
+		ir.Insert{Position: ir.Position{Token: "tx1-r3"}, Schema: "target_db", Table: "users", Row: ir.Row{"id": int64(3), "email": "c@x"}},
+		ir.TxCommit{Position: ir.Position{Token: "tx1-commit"}},
+		ir.TxBegin{Position: ir.Position{Token: "tx2-begin"}},
+		ir.TxCommit{Position: ir.Position{Token: "tx2-commit"}},
+		ir.TxBegin{Position: ir.Position{Token: "tx3-begin"}},
+		ir.Insert{Position: ir.Position{Token: "tx3-r1"}, Schema: "target_db", Table: "users", Row: ir.Row{"id": int64(4), "email": "d@x"}},
+		ir.Insert{Position: ir.Position{Token: "tx3-r2"}, Schema: "target_db", Table: "users", Row: ir.Row{"id": int64(5), "email": "e@x"}},
+		ir.TxCommit{Position: ir.Position{Token: lastToken}},
+	}
+	pumpBatchedChanges(t, ctx, applier, events, 100)
+
+	if got := countAllRows(t, dsn, "target_db", "users"); got != 5 {
+		t.Errorf("after tx-aligned batched apply: rows = %d; want 5", got)
+	}
+
+	pos, ok, err := applier.ReadPosition(ctx, testStreamID)
+	if err != nil {
+		t.Fatalf("ReadPosition: %v", err)
+	}
+	if !ok {
+		t.Fatal("ReadPosition: no row found; expected TxCommit-flush to persist position")
+	}
+	if pos.Token != lastToken {
+		t.Errorf("position token = %q; want %q (last source TxCommit's position)", pos.Token, lastToken)
+	}
+}
+
 // TestChangeApplier_ApplyBatch_PartialFlushPersistsPosition checks
 // the channel-close-flush path: when the channel closes before the
 // batch fills, the partial batch commits and the position of the

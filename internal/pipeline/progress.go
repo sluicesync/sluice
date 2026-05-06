@@ -141,81 +141,20 @@ func (p *progressTicker) addBytes(n int64) {
 
 // observeRow is the per-row hook the row pipe calls. Combines [inc]
 // with a best-effort byte-count of the row's values via
-// [approximateRowBytes]. Cheap: no allocation, walks the row map
+// [ir.ApproximateRowBytes]. Cheap: no allocation, walks the row map
 // once, sums into a local int64.
 func (p *progressTicker) observeRow(row ir.Row) {
 	p.inc()
-	p.addBytes(approximateRowBytes(row))
+	p.addBytes(ir.ApproximateRowBytes(row))
 }
 
-// approximateRowBytes estimates the wire-size of a row by walking
-// its values once. The estimate is intentionally rough: the goal is
-// to drive the rate_mb_per_sec gauge in progress logs, not to
-// reconcile against MySQL's max_allowed_packet or PG's COPY
-// statistics. Fixed-width types use their natural byte width;
-// strings and []byte use their length; time.Time uses a typical
-// wire-format width (24 bytes covers TIMESTAMPTZ with sub-second
-// precision and a timezone suffix); nil contributes nothing.
-//
-// Unknown types contribute zero rather than guessing. The
-// progressTicker's emitted rate is a lower bound on real wire
-// throughput in such cases — reasonable behaviour for a metric
-// whose only consumer is human eyeballs comparing tail -f output
-// to expected throughput.
+// approximateRowBytes is retained as a thin pass-through for the
+// existing in-package tests; v0.7.0 moved the implementation to
+// [ir.ApproximateRowBytes] so the engine packages' batched-write
+// and CDC-apply paths can reuse it without importing pipeline
+// (which would invert the layering). See ADR-0028.
 func approximateRowBytes(row ir.Row) int64 {
-	if row == nil {
-		return 0
-	}
-	var total int64
-	for _, v := range row {
-		total += approximateValueBytes(v)
-	}
-	return total
-}
-
-// approximateValueBytes returns the rough byte cost of a single
-// IR-canonical value. See [approximateRowBytes] for the policy
-// rationale.
-func approximateValueBytes(v any) int64 {
-	switch x := v.(type) {
-	case nil:
-		return 0
-	case string:
-		return int64(len(x))
-	case []byte:
-		return int64(len(x))
-	case bool:
-		return 1
-	case int8, uint8:
-		return 1
-	case int16, uint16:
-		return 2
-	case int32, uint32, float32:
-		return 4
-	case int, uint, int64, uint64, float64:
-		return 8
-	case time.Time:
-		// 24 bytes covers TIMESTAMPTZ-with-tz at microsecond
-		// precision in the canonical PG text form.
-		return 24
-	case []any:
-		var n int64
-		for _, e := range x {
-			n += approximateValueBytes(e)
-		}
-		return n
-	case []string:
-		var n int64
-		for _, s := range x {
-			n += int64(len(s))
-		}
-		return n
-	}
-	// Approximation falls back to zero rather than guessing a value
-	// that might be wildly wrong for engine-specific shapes (e.g.
-	// pgtype.Numeric, geometry WKB). The rate_mb_per_sec gauge is
-	// then a lower bound — accurate-enough for human inspection.
-	return 0
+	return ir.ApproximateRowBytes(row)
 }
 
 // setTotalRows feeds the row-count estimate into the ticker. Safe to

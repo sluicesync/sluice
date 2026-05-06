@@ -429,8 +429,34 @@ func (r *CDCReader) dispatch(ctx context.Context, ev *replication.BinlogEvent, o
 
 	case *replication.QueryEvent:
 		q := string(e.Query)
-		if q == "BEGIN" || q == "COMMIT" {
-			return nil
+		if q == "BEGIN" {
+			// Source-tx start: surface the boundary so the batched
+			// applier can flush a previous in-flight batch and open
+			// a target tx aligned to this source transaction.
+			// Per-change appliers treat this as a no-op. See
+			// ADR-0027. (MySQL's binlog does not emit a separate
+			// COMMIT QueryEvent when GTIDs / XIDs are in use; the
+			// XIDEvent below is the canonical commit boundary for
+			// InnoDB transactions. The COMMIT QueryEvent only
+			// appears on non-transactional storage engines, which
+			// sluice doesn't target.)
+			pos, err := r.positionFor(ev.Header)
+			if err != nil {
+				return err
+			}
+			return send(ctx, out, ir.TxBegin{Position: pos})
+		}
+		if q == "COMMIT" {
+			// Defensive: emit TxCommit on the rare COMMIT-as-
+			// QueryEvent surface (non-InnoDB storage engines).
+			// Sluice doesn't formally support those, but if one
+			// shows up we'd rather flush than silently drop the
+			// boundary signal.
+			pos, err := r.positionFor(ev.Header)
+			if err != nil {
+				return err
+			}
+			return send(ctx, out, ir.TxCommit{Position: pos})
 		}
 		// TRUNCATE TABLE arrives as a QUERY_EVENT carrying the SQL
 		// text. The IR has ir.Truncate; PG's pgoutput emits typed
@@ -473,10 +499,17 @@ func (r *CDCReader) dispatch(ctx context.Context, ev *replication.BinlogEvent, o
 		return nil
 
 	case *replication.XIDEvent:
-		// Transaction commit boundary in InnoDB. We don't emit
-		// anything on commit today; future work (a "commit" hook for
-		// position persistence) will live here.
-		return nil
+		// InnoDB transaction commit boundary. Surface as TxCommit so
+		// the batched applier can flush the in-flight target tx in
+		// one shot. The empty-source-tx case (BEGIN → XID with no
+		// row events between, e.g. an aborted-but-still-recorded
+		// transaction) is handled by the applier's flush path, which
+		// skips when no rows have accumulated. See ADR-0027.
+		pos, err := r.positionFor(ev.Header)
+		if err != nil {
+			return err
+		}
+		return send(ctx, out, ir.TxCommit{Position: pos})
 
 	default:
 		// FORMAT_DESCRIPTION_EVENT, ROWS_QUERY_EVENT, and the various

@@ -47,16 +47,23 @@ func (w *RowWriter) WriteRowsIdempotent(ctx context.Context, table *ir.Table, ro
 }
 
 // writeBatchedIdempotent is the upsert-form of [writeBatched]. The
-// per-batch flush mechanics are identical; only the SQL changes.
+// per-batch flush mechanics are identical (flush on whichever of
+// row-count cap and byte-size cap fires first; ADR-0028); only the
+// SQL changes.
 func (w *RowWriter) writeBatchedIdempotent(ctx context.Context, table *ir.Table, rows <-chan ir.Row) error {
 	limit := w.maxRowsPerBatch
 	if limit <= 0 {
 		limit = defaultMaxRowsPerBatch
 	}
+	byteCap := w.maxBufferBytes
+	if byteCap <= 0 {
+		byteCap = defaultMaxBufferBytes
+	}
 
 	pkCols := primaryKeyColumns(table)
 
 	batch := make([]ir.Row, 0, limit)
+	var batchBytes int64
 	flush := func() error {
 		if len(batch) == 0 {
 			return nil
@@ -67,6 +74,7 @@ func (w *RowWriter) writeBatchedIdempotent(ctx context.Context, table *ir.Table,
 			return fmt.Errorf("mysql: idempotent insert into %q (%d rows): %w", table.Name, len(batch), err)
 		}
 		batch = batch[:0]
+		batchBytes = 0
 		return nil
 	}
 
@@ -77,7 +85,8 @@ func (w *RowWriter) writeBatchedIdempotent(ctx context.Context, table *ir.Table,
 				return flush()
 			}
 			batch = append(batch, row)
-			if len(batch) >= limit {
+			batchBytes += ir.ApproximateRowBytes(row)
+			if len(batch) >= limit || batchBytes >= byteCap {
 				if err := flush(); err != nil {
 					return err
 				}

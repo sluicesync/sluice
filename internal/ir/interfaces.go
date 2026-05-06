@@ -128,6 +128,25 @@ type RowWriter interface {
 	WriteRows(ctx context.Context, table *Table, rows <-chan Row) error
 }
 
+// MaxBufferBytesSetter is the optional surface a [RowWriter] or
+// [ChangeApplier] can implement to accept a soft byte-size cap on
+// per-batch buffered memory. The pipeline orchestrator threads
+// [pipeline.Migrator.MaxBufferBytes] / [pipeline.Streamer.MaxBufferBytes]
+// to every writer/applier that exposes this setter; engines that
+// don't implement it use whatever batching they had before (row-count
+// only).
+//
+// Zero or negative bytes means "no byte cap" (the engine's row-count
+// cap remains the only flush trigger). Positive values are interpreted
+// as a soft target — a single row larger than the cap still applies
+// rather than wedging the writer; the cap bounds *accumulation*, not
+// individual rows.
+//
+// See ADR-0028 for the design rationale.
+type MaxBufferBytesSetter interface {
+	SetMaxBufferBytes(bytes int64)
+}
+
 // RangeBoundsQuerier is the optional surface a [RowReader] can
 // implement to expose MIN/MAX queries on a single PK column. Used by
 // the parallel-bulk-copy phase (v0.5.0) to compute chunk boundaries

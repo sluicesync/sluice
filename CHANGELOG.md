@@ -6,6 +6,84 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **MySQL `LOAD DATA LOCAL INFILE` row-writer (ADR-0026).** Vanilla
+  MySQL bulk-copy now streams TSV over `LOAD DATA LOCAL INFILE` via
+  go-sql-driver's `RegisterReaderHandler` mechanism (no real file
+  written, no `?allowAllFiles=true` needed). Typically 5–10× faster
+  than the parameter-bound multi-row `INSERT` path on wide-row
+  tables. The `BulkLoadLoadDataInfile` capability constant has been
+  declared on vanilla MySQL since v0.1; this release brings the
+  implementation up to the declaration. PlanetScale stays on
+  BatchedInsert (the flavor doesn't allow `LOAD DATA LOCAL INFILE`).
+
+  Per-call fallback to BatchedInsert when (a) the server has
+  `local_infile=OFF` (default on MySQL 8.0+) — one structured WARN
+  surfaces the speedup-pending hint, and (b) the table contains a
+  geometry column (the SRID-prefixed WKB wire format isn't
+  expressible in a column-only LOAD DATA). The TSV serializer
+  escapes the four MySQL LOAD DATA defaults
+  (tab/newline/CR/backslash/NUL) and emits `\N` for NULL. Statement
+  uses `CHARACTER SET binary` plus per-column `SET col = CONVERT(@cN
+  USING utf8mb4)` for VARCHAR/TEXT/SET/JSON columns to round-trip
+  binary blobs and JSON cleanly in the same statement.
+
+- **Source-transaction-boundary aware CDC batching (ADR-0027).** New
+  `ir.TxBegin` / `ir.TxCommit` change variants surface source-side
+  transaction boundaries to the applier. Postgres emits from
+  `BeginMessage` / `CommitMessage` (with `StreamStart` / `StreamStop`
+  mapping to boundaries for the streaming-in-progress chunked path);
+  MySQL emits from `BEGIN` QueryEvent / `XIDEvent`. The batched
+  applier (`ApplyBatch`) flushes on `TxCommit` so a 5000-row source
+  transaction commits as one 5000-row target transaction instead of
+  being split by the row-count cap. The cap remains the upper bound;
+  idle flush, channel close, and Truncate flush behave as before.
+  Empty source transactions produce no target commits (lazy-tx-open
+  absorbs them). Per-change `Apply` treats boundary events as
+  no-ops; the table filter explicitly bypasses them so a filter
+  never drops a boundary signal. Position-and-data atomicity
+  (ADR-0007) and idempotency (ADR-0010) preserved. Closes the
+  follow-up explicitly deferred from ADR-0017.
+
+- **`--max-buffer-bytes N` (ADR-0028).** Default `67108864` = 64 MiB,
+  on `sluice migrate` and `sluice sync start`. Bounds per-batch
+  buffered memory by total byte size in addition to the existing
+  row-count caps. Wide-row workloads (TEXT / BYTEA / JSON at MB
+  scale) no longer have to manually retune `--bulk-batch-size` /
+  `--apply-batch-size` to control heap usage; the byte cap fires
+  whichever way is tighter. The cap is a soft target — a single row
+  larger than the cap still applies. Implemented in the bulk-INSERT
+  writer, idempotent-INSERT writer, and CDC `ApplyBatch` paths for
+  both engines via the new `ir.MaxBufferBytesSetter` optional
+  surface; the COPY-protocol and LOAD DATA paths are streaming and
+  unaffected. The byte-counting helper (`approximateRowBytes`) was
+  hoisted from the pipeline to `internal/ir/bytes.go` so engine
+  packages can reuse it.
+
+- **PG-native types auto-emit on MySQL targets.** `Inet` / `Cidr`
+  (PG → MySQL) auto-emit as `VARCHAR(45)`; `Macaddr` as
+  `VARCHAR(30)`; `Array` as `JSON` (matches the v0.5.0 Bug 14 fix
+  where array values are serialized as JSON for the writer).
+  Pre-v0.7.0 these returned an error pointing operators at
+  `--type-override`; the auto-emit removes the toil for every
+  PG→MySQL migration that touches these types. Operators wanting
+  strict syntactic validation still use `--type-override` to a
+  custom shape with their own CHECK constraint; the schema-preview
+  command (ADR-0024) surfaces the auto-emit choice so it isn't
+  silent. Closes roadmap §6.
+
+- **Throughput tuning guide** (`docs/throughput-tuning.md`).
+  Operator reference for the knobs that matter at scale —
+  `--apply-batch-size`, `--bulk-parallelism`, network compression
+  (MySQL `compress=true`, PG TLS+gss settings), and
+  `--max-buffer-bytes`. Cross-references the relevant ADRs.
+
+- **`migrate --dry-run` cross-reference to schema preview.** The
+  dry-run plan output now includes a one-line pointer to
+  `sluice schema preview` for full DDL inspection with translation
+  notes and advisory hints. Closes roadmap §10.
+
 ### Fixed
 
 - **Bug 12 — MySQL CDC silently dropped events with TIMESTAMP /

@@ -115,23 +115,59 @@ func (a *ChangeApplier) ApplyBatch(ctx context.Context, streamID string, changes
 // channel closed (signalling clean shutdown to the caller), and any
 // error.
 //
+// Source-transaction boundary handling (ADR-0027): TxBegin /
+// TxCommit events surface the source's transaction boundaries.
+// TxBegin is a no-op (the applier opens its target tx lazily on the
+// first row event). TxCommit flushes the in-flight batch so the
+// target tx commits as a single unit aligned to the source tx; an
+// empty source tx (TxBegin → TxCommit with no row events) is a no-
+// op since no target tx was opened.
+//
+// Memory-bounded batching (ADR-0028): the in-flight batch's
+// accumulated row-value bytes are tracked via
+// [ir.ApproximateChangeBytes]; when the running total reaches
+// [ChangeApplier.maxBufferBytes] the batch flushes early even if the
+// row cap hasn't fired. The byte cap is a soft target — a single
+// change larger than the cap still applies (the dispatch already
+// happened before the post-dispatch check fires); the cap bounds
+// *accumulation*, not individual changes.
+//
 // On error the open transaction is rolled back. On clean exit (row
-// cap, channel close, or Truncate flush) the transaction is
-// committed.
+// cap, byte cap, channel close, Truncate flush, or TxCommit flush)
+// the transaction is committed.
 func (a *ChangeApplier) applyOneBatch(ctx context.Context, streamID string, changes <-chan ir.Change, maxBatchSize int) (n int, lastPos ir.Position, channelClosed bool, err error) {
-	// Wait for the first change before opening the tx. Opening the
-	// tx then blocking with no work to do would hold a connection
-	// idle from the pool for arbitrarily long; we'd rather wait on
-	// the channel.
+	// Wait for the first row-bearing change before opening the tx.
+	// Opening the tx then blocking with no work to do would hold a
+	// connection idle from the pool for arbitrarily long; we'd
+	// rather wait on the channel. TxBegin / TxCommit boundary
+	// events received before any row event are consumed in this
+	// pre-tx loop.
 	var first ir.Change
-	select {
-	case c, ok := <-changes:
-		if !ok {
-			return 0, ir.Position{}, true, nil
+	for {
+		select {
+		case c, ok := <-changes:
+			if !ok {
+				return 0, ir.Position{}, true, nil
+			}
+			switch c.(type) {
+			case ir.TxBegin, ir.TxCommit:
+				// Boundary observed before any row event for this
+				// batch. TxBegin is a no-op; TxCommit closes an
+				// empty source tx (or the boundary that follows the
+				// previous batch's flush) — in both cases continue
+				// waiting for the next row event.
+				continue
+			}
+			first = c
+		case <-ctx.Done():
+			return 0, ir.Position{}, false, ctx.Err()
 		}
-		first = c
-	case <-ctx.Done():
-		return 0, ir.Position{}, false, ctx.Err()
+		break
+	}
+
+	byteCap := a.maxBufferBytes
+	if byteCap <= 0 {
+		byteCap = defaultMaxBufferBytes
 	}
 
 	tx, err := a.db.BeginTx(ctx, nil)
@@ -150,6 +186,7 @@ func (a *ChangeApplier) applyOneBatch(ctx context.Context, streamID string, chan
 	}
 	n = 1
 	lastPos = first.Pos()
+	batchBytes := ir.ApproximateChangeBytes(first)
 
 	// Truncate flushes the batch — schema-changing events apply
 	// alone so cache invalidation is contained.
@@ -171,6 +208,38 @@ func (a *ChangeApplier) applyOneBatch(ctx context.Context, streamID string, chan
 				channelClosed = true
 				return n, lastPos, channelClosed, a.commitBatch(ctx, tx, streamID, lastPos.Token, n)
 			}
+			// Source-tx boundary handling (ADR-0027). TxCommit
+			// flushes the batch so the target tx aligns with the
+			// source tx; the position written is the source
+			// commit's LSN, which is the right resume point under
+			// ADR-0007 (the position of the last durably-applied
+			// work) and ADR-0010 idempotency. TxBegin is a no-op:
+			// when it follows a TxCommit-driven flush we land here
+			// with the previous tx already committed and the loop
+			// has restarted; a TxBegin observed mid-batch (no
+			// preceding TxCommit) means the source produced
+			// adjacent transactions whose row events the applier
+			// hasn't separated — flushing on TxCommit is sufficient
+			// to keep alignment, so we ignore TxBegin here.
+			if _, isTxCommit := c.(ir.TxCommit); isTxCommit {
+				lastPos = c.Pos()
+				return n, lastPos, false, a.commitBatch(ctx, tx, streamID, lastPos.Token, n)
+			}
+			if _, isTxBegin := c.(ir.TxBegin); isTxBegin {
+				// Reset idle timer so a TxBegin observed mid-batch
+				// doesn't make the next idle window expire from the
+				// previous row event's timestamp; otherwise an
+				// otherwise-quiet stream would idle-flush
+				// inconsistently.
+				if !idle.Stop() {
+					select {
+					case <-idle.C:
+					default:
+					}
+				}
+				idle.Reset(defaultIdleFlushPeriod)
+				continue
+			}
 			if err := a.dispatch(ctx, tx, c); err != nil {
 				_ = tx.Rollback()
 				slog.WarnContext(ctx, "postgres: applier: batch rollback on error",
@@ -182,7 +251,21 @@ func (a *ChangeApplier) applyOneBatch(ctx context.Context, streamID string, chan
 			}
 			n++
 			lastPos = c.Pos()
+			batchBytes += ir.ApproximateChangeBytes(c)
 			if _, isTruncate := c.(ir.Truncate); isTruncate {
+				return n, lastPos, false, a.commitBatch(ctx, tx, streamID, lastPos.Token, n)
+			}
+			// Byte-cap flush (ADR-0028): bounds the in-flight tx's
+			// buffered parameter memory on wide-row streams. Checked
+			// after the dispatch so the just-dispatched change is
+			// included in the count we commit.
+			if batchBytes >= byteCap {
+				slog.DebugContext(ctx, "postgres: applier: byte-cap flush",
+					slog.String("stream_id", streamID),
+					slog.Int("rows", n),
+					slog.Int64("bytes", batchBytes),
+					slog.Int64("byte_cap", byteCap),
+				)
 				return n, lastPos, false, a.commitBatch(ctx, tx, streamID, lastPos.Token, n)
 			}
 			// Reset the idle timer for each successful change so the

@@ -86,32 +86,32 @@ func TestEmitColumnType(t *testing.T) {
 	}
 }
 
-func TestEmitColumnTypeUnsupported(t *testing.T) {
+// TestEmitColumnType_PGNativeAutoEmit verifies the v0.7.0 auto-emit
+// of PG-native types that lack a direct MySQL equivalent. Pre-v0.7.0
+// these returned an error pointing at --type-override; v0.7.0 emits
+// a sensible default so PG→MySQL migrations don't require per-column
+// intervention. Operators wanting strict syntactic validation (e.g.
+// CHECK regex on Inet) still use --type-override; the schema-preview
+// command surfaces the auto-emit choice so it isn't silent.
+func TestEmitColumnType_PGNativeAutoEmit(t *testing.T) {
 	cases := []struct {
-		typ            ir.Type
-		wantSuggestion string // suggested target_type literal in the message
+		typ  ir.Type
+		want string
 	}{
-		{ir.Inet{}, "varchar(45)"},
-		{ir.Cidr{}, "varchar(45)"},
-		{ir.Macaddr{}, "varchar(30)"},
-		{ir.Array{Element: ir.Integer{Width: 32}}, "longtext"},
+		{ir.Inet{}, "VARCHAR(45)"},
+		{ir.Cidr{}, "VARCHAR(45)"},
+		{ir.Macaddr{}, "VARCHAR(30)"},
+		{ir.Array{Element: ir.Integer{Width: 32}}, "JSON"},
 	}
 	for _, c := range cases {
 		c := c
 		t.Run(typeName(c.typ), func(t *testing.T) {
-			_, err := emitColumnType(c.typ)
-			if err == nil {
-				t.Fatalf("expected error for %T; got nil", c.typ)
+			got, err := emitColumnType(c.typ)
+			if err != nil {
+				t.Fatalf("emitColumnType(%T) returned error: %v", c.typ, err)
 			}
-			msg := err.Error()
-			// The error must point operators at the mappings hook
-			// — the message is load-bearing for the v0.3.x roadmap
-			// note that the friendlier wording is what got us here.
-			if !strings.Contains(msg, "mappings:") {
-				t.Errorf("error should name the mappings YAML hook; got %q", msg)
-			}
-			if !strings.Contains(msg, "target_type: "+c.wantSuggestion) {
-				t.Errorf("error should suggest target_type %q; got %q", c.wantSuggestion, msg)
+			if got != c.want {
+				t.Errorf("emitColumnType(%T) = %q; want %q", c.typ, got, c.want)
 			}
 		})
 	}

@@ -54,7 +54,8 @@ func (w *RowWriter) WriteRowsIdempotent(ctx context.Context, table *ir.Table, ro
 
 // writeViaBatchIdempotent is the upsert-form of [writeViaBatch]. It
 // uses the same per-batch flush mechanics — accumulate rows up to
-// maxRowsPerBatch, then Exec a multi-row INSERT — but the SQL adds
+// maxRowsPerBatch (or maxBufferBytes, ADR-0028, whichever fires
+// first), then Exec a multi-row INSERT — but the SQL adds
 // ON CONFLICT (pk) DO UPDATE.
 //
 // We deliberately do not pin a connection here: the orchestrator
@@ -67,10 +68,15 @@ func (w *RowWriter) writeViaBatchIdempotent(ctx context.Context, table *ir.Table
 	if limit <= 0 {
 		limit = defaultMaxRowsPerBatch
 	}
+	byteCap := w.maxBufferBytes
+	if byteCap <= 0 {
+		byteCap = defaultMaxBufferBytes
+	}
 
 	pkCols := primaryKeyColumns(table)
 
 	batch := make([]ir.Row, 0, limit)
+	var batchBytes int64
 	flush := func() error {
 		if len(batch) == 0 {
 			return nil
@@ -84,6 +90,7 @@ func (w *RowWriter) writeViaBatchIdempotent(ctx context.Context, table *ir.Table
 			return fmt.Errorf("postgres: idempotent insert into %q (%d rows): %w", table.Name, len(batch), err)
 		}
 		batch = batch[:0]
+		batchBytes = 0
 		return nil
 	}
 
@@ -94,7 +101,8 @@ func (w *RowWriter) writeViaBatchIdempotent(ctx context.Context, table *ir.Table
 				return flush()
 			}
 			batch = append(batch, row)
-			if len(batch) >= limit {
+			batchBytes += ir.ApproximateRowBytes(row)
+			if len(batch) >= limit || batchBytes >= byteCap {
 				if err := flush(); err != nil {
 					return err
 				}

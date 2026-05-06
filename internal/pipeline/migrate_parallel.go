@@ -89,6 +89,13 @@ type parallelBulkCopyDeps struct {
 	// resolveBulkParallelMinRows. Tables below this threshold use the
 	// single-reader path regardless of parallelism.
 	minRows int64
+
+	// maxBufferBytes is the per-chunk soft byte cap on writer batch
+	// accumulation (ADR-0028). Threaded through to each chunk's
+	// writer via [ir.MaxBufferBytesSetter] when the engine
+	// implements it. Zero means no cap (engines fall back to their
+	// built-in default).
+	maxBufferBytes int64
 }
 
 // shouldParallelChunk decides whether a given table should take the
@@ -367,6 +374,7 @@ func openChunkConnections(ctx context.Context, deps *parallelBulkCopyDeps, n int
 			cleanup()
 			return nil, nil, nil, fmt.Errorf("open target writer for chunk %d: %w", i+1, err)
 		}
+		applyMaxBufferBytes(wr, deps.maxBufferBytes)
 		closeFns = append(closeFns, func() { closeIf(wr) })
 		writers = append(writers, wr)
 	}
