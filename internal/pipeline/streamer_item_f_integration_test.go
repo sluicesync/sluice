@@ -52,9 +52,7 @@ import (
 // Pre-fix, step 5 errors out at "replication slot ... no longer
 // exists." Post-fix, the WARN fires and cold-start completes.
 func TestStreamer_PostgresToPostgres_SlotMissingFallsThroughToColdStart(t *testing.T) {
-	prevInterval := pollIntervalForTest
-	pollIntervalForTest = 200 * time.Millisecond
-	t.Cleanup(func() { pollIntervalForTest = prevInterval })
+	setPollIntervalForTest(t, 200*time.Millisecond)
 
 	sourceDSN, targetDSN, cleanup := startPostgresLogical(t)
 	defer cleanup()

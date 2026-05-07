@@ -96,13 +96,61 @@ const stopDrainTimeout = 30 * time.Second
 // defaults to stopSignalPollInterval; unit tests override it to a
 // few-millisecond value so the goroutine ticks fast enough to make
 // assertions snappy. Production code never reassigns it.
-var pollIntervalForTest = stopSignalPollInterval
+//
+// **Race-fix (v0.15.1):** stored as atomic.Int64 so a test setup
+// that reassigns this var via setPollIntervalForTest doesn't race
+// with a still-running pollStopSignal goroutine from a previous
+// test (which is the shape `go test -race` flagged when both
+// streamer_bug15_integration_test.go and stop_signal_test.go ran in
+// the same package). Tests use the helpers below; reads inside
+// pollStopSignal use loadPollIntervalForTest.
+var pollIntervalForTest atomic.Int64
 
 // drainTimeoutForTest is the live timeout the graceful-drain watchdog
 // uses. Defaults to stopDrainTimeout; unit/integration tests override
 // it for snappy assertions on the hard-cancel fallback. Production
-// code never reassigns it.
-var drainTimeoutForTest = stopDrainTimeout
+// code never reassigns it. Same race-fix shape as pollIntervalForTest.
+var drainTimeoutForTest atomic.Int64
+
+func init() {
+	pollIntervalForTest.Store(int64(stopSignalPollInterval))
+	drainTimeoutForTest.Store(int64(stopDrainTimeout))
+}
+
+// loadPollIntervalForTest reads the current poll-interval. Used by
+// pollStopSignal each time it constructs a ticker.
+func loadPollIntervalForTest() time.Duration {
+	return time.Duration(pollIntervalForTest.Load())
+}
+
+// loadDrainTimeoutForTest reads the current drain timeout. Used by
+// the watchdog goroutine pollStopSignal spawns.
+func loadDrainTimeoutForTest() time.Duration {
+	return time.Duration(drainTimeoutForTest.Load())
+}
+
+// setPollIntervalForTest is a test helper that writes a new poll
+// interval and returns a restorer the caller schedules with
+// t.Cleanup. Tests that need to override the cadence call this.
+func setPollIntervalForTest(t testCleaner, d time.Duration) {
+	prev := pollIntervalForTest.Load()
+	pollIntervalForTest.Store(int64(d))
+	t.Cleanup(func() { pollIntervalForTest.Store(prev) })
+}
+
+// setDrainTimeoutForTest is the matching helper for drain-timeout.
+func setDrainTimeoutForTest(t testCleaner, d time.Duration) {
+	prev := drainTimeoutForTest.Load()
+	drainTimeoutForTest.Store(int64(d))
+	t.Cleanup(func() { drainTimeoutForTest.Store(prev) })
+}
+
+// testCleaner is the testing.TB-narrow interface the test helpers
+// need. Defined here to keep `testing` out of the production import
+// graph while still exposing the helpers from this file.
+type testCleaner interface {
+	Cleanup(func())
+}
 
 // pollStopSignal runs until pollCtx is cancelled or until reader
 // reports the stop flag is set. On stop-flag observation it triggers
@@ -128,7 +176,7 @@ var drainTimeoutForTest = stopDrainTimeout
 // when true, the streamer clears stop_requested_at so a CLI
 // `sync stop --wait` can detect graceful-drain completion.
 func pollStopSignal(pollCtx context.Context, reader stopFlagReader, streamID string, cancelStream, cancelApply context.CancelFunc, observed *atomic.Bool) {
-	t := time.NewTicker(pollIntervalForTest)
+	t := time.NewTicker(loadPollIntervalForTest())
 	defer t.Stop()
 
 	// Backoff for transient query errors. We don't want to spam the
@@ -171,9 +219,9 @@ func pollStopSignal(pollCtx context.Context, reader stopFlagReader, streamID str
 			//
 			// Snapshot the drain timeout once before launching the
 			// goroutine so the goroutine doesn't race with tests'
-			// withFastDrainTimeout cleanup writing to the package-
-			// level drainTimeoutForTest var.
-			drainTimeout := drainTimeoutForTest
+			// withFastDrainTimeout cleanup writing to the atomic
+			// drainTimeoutForTest var.
+			drainTimeout := loadDrainTimeoutForTest()
 			go func() {
 				select {
 				case <-pollCtx.Done():

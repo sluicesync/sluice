@@ -56,9 +56,7 @@ import (
 // a tail gap of post-restart rows the wedged apply path never
 // committed. Post-fix, no gap.
 func TestStreamer_PostgresToPostgres_StopRestartNoLoss(t *testing.T) {
-	prevInterval := pollIntervalForTest
-	pollIntervalForTest = 200 * time.Millisecond
-	t.Cleanup(func() { pollIntervalForTest = prevInterval })
+	setPollIntervalForTest(t, 200*time.Millisecond)
 
 	sourceDSN, targetDSN, cleanup := startPostgresLogical(t)
 	defer cleanup()

@@ -41,21 +41,21 @@ func (r *fakeStopFlagReader) callCount() int {
 }
 
 // withFastPollInterval replaces stopSignalPollInterval for the test
-// duration so the goroutine ticks frequently.
+// duration so the goroutine ticks frequently. v0.15.1: routes
+// through atomic-based setPollIntervalForTest helper to avoid the
+// data race that surfaced when test setup raced with a still-
+// running pollStopSignal goroutine from a previous test in the
+// same package.
 func withFastPollInterval(t *testing.T) {
 	t.Helper()
-	prev := pollIntervalForTest
-	pollIntervalForTest = 10 * time.Millisecond
-	t.Cleanup(func() { pollIntervalForTest = prev })
+	setPollIntervalForTest(t, 10*time.Millisecond)
 }
 
 // withFastDrainTimeout shrinks the graceful-drain hard-timeout window
 // so the watchdog tests run in milliseconds rather than 30 seconds.
 func withFastDrainTimeout(t *testing.T, d time.Duration) {
 	t.Helper()
-	prev := drainTimeoutForTest
-	drainTimeoutForTest = d
-	t.Cleanup(func() { drainTimeoutForTest = prev })
+	setDrainTimeoutForTest(t, d)
 }
 
 // TestPollStopSignal_CancelsStreamOnFlag verifies the load-bearing
