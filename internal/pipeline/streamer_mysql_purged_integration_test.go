@@ -49,9 +49,7 @@ import (
 // Pre-fix, step 6 errors out with "Could not find first log file
 // name." Post-fix, the WARN fires and cold-start completes.
 func TestStreamer_MySQLToMySQL_BinlogPurgedFallsThroughToColdStart(t *testing.T) {
-	prevInterval := pollIntervalForTest
-	pollIntervalForTest = 200 * time.Millisecond
-	t.Cleanup(func() { pollIntervalForTest = prevInterval })
+	setPollIntervalForTest(t, 200*time.Millisecond)
 
 	sourceDSN, targetDSN, cleanup := startMySQLBinlog(t)
 	defer cleanup()

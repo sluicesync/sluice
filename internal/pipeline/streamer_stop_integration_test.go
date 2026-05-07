@@ -39,9 +39,7 @@ import (
 // budget stays well under the per-test minute. Production keeps
 // the 5s default (see internal/pipeline/stop_signal.go).
 func TestStreamer_RequestStop_DrainsAndExits(t *testing.T) {
-	prevInterval := pollIntervalForTest
-	pollIntervalForTest = 200 * time.Millisecond
-	t.Cleanup(func() { pollIntervalForTest = prevInterval })
+	setPollIntervalForTest(t, 200*time.Millisecond)
 
 	sourceDSN, targetDSN, cleanup := startPostgresLogical(t)
 	defer cleanup()

@@ -99,9 +99,7 @@ func readPersistedPositionTolerant(dsn, streamID string) string {
 // manually DROP TABLE every dest table after `slot drop`, then
 // re-run. Post-fix: the single command above suffices.
 func TestStreamer_ResetTargetData_RecoversFromSlotMissing(t *testing.T) {
-	prevInterval := pollIntervalForTest
-	pollIntervalForTest = 200 * time.Millisecond
-	t.Cleanup(func() { pollIntervalForTest = prevInterval })
+	setPollIntervalForTest(t, 200*time.Millisecond)
 
 	sourceDSN, targetDSN, cleanup := startPostgresLogical(t)
 	defer cleanup()
