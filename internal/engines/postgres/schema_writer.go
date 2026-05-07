@@ -209,12 +209,20 @@ func (w *SchemaWriter) CreateViews(ctx context.Context, s *ir.Schema) error {
 // qualification matches the writer's behaviour for tables — every
 // identifier is namespace-qualified so the writer can round-trip into
 // schemas other than the default `public`.
+//
+// **Bug 31 fix:** PG's `pg_views.definition` and `pg_matviews.definition`
+// columns return the SELECT body with a trailing semicolon. The
+// previous emit appended " WITH DATA;" or ";" directly, producing
+// "... ; WITH DATA;" (which PG rejects as SQLSTATE 42601) or
+// "... ;;" (which PG silently parses but is still ugly DDL). Trim
+// trailing whitespace + semicolon before appending the trailer.
 func emitCreateView(schema string, v *ir.View) string {
 	qualified := quoteIdent(schema) + "." + quoteIdent(v.Name)
+	body := trimTrailingSemicolon(v.Definition)
 	if v.Materialized {
-		return "CREATE MATERIALIZED VIEW " + qualified + " AS " + v.Definition + " WITH DATA;"
+		return "CREATE MATERIALIZED VIEW " + qualified + " AS " + body + " WITH DATA;"
 	}
-	return "CREATE OR REPLACE VIEW " + qualified + " AS " + v.Definition + ";"
+	return "CREATE OR REPLACE VIEW " + qualified + " AS " + body + ";"
 }
 
 // syncOneIdentity reads MAX(<col>) on the target table; if non-NULL,
@@ -372,12 +380,23 @@ func (w *SchemaWriter) PreviewDDL(_ context.Context, s *ir.Schema) ([]ir.DDLStat
 	return out, nil
 }
 
-// trimTrailingSemicolon removes a single trailing ';' from s, if
-// present. Postgres DDL emitters terminate every statement with a
-// semicolon for executability; preview output adds them back at format
-// time so the wire shape is decoupled from the rendering shape.
+// trimTrailingSemicolon strips trailing whitespace + a single trailing
+// semicolon (if present) from s.
+//
+// Two consumers:
+//   - DDL preview formatting: removes the executability-suffix ';' so
+//     preview output can re-add it at render time.
+//   - emitCreateView (Bug 31): normalizes PG's pg_views.definition /
+//     pg_matviews.definition outputs which carry a trailing ';' that
+//     breaks the matview `WITH DATA` trailer.
+//
+// Trims whitespace BOTH before and after the semicolon so trailing
+// blank-newlines from catalog-column reads don't leave the result
+// looking ragged.
 func trimTrailingSemicolon(s string) string {
-	return strings.TrimRight(s, ";")
+	s = strings.TrimRight(s, " \t\n\r")
+	s = strings.TrimSuffix(s, ";")
+	return strings.TrimRight(s, " \t\n\r")
 }
 
 // EmitColumnDef satisfies [ir.ColumnDDLPreviewer]. Returns the
