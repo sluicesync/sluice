@@ -142,6 +142,14 @@ For continuity when a chunk references "the previous work":
 - **CI Integration timeout bumped 10m→18m per package.** Slow CI runners + `-race` overhead were hitting Go's per-package default test timeout. Job timeout-minutes 20→30 to match. Pure infra change; no runtime behaviour.
 - **Autonomous release-test-fix loop authorized 2026-05-07.** After each release publishes (Option B 5-gate verification), main session auto-spawns next test cycle (sluice-testing's localhost-docker + PlanetScale harnesses both in scope), reacts to results (fix bugs OR pick next roadmap item), loops until stop condition. Stop conditions: user interrupt, saturation (3 clean cycles + roadmap exhausted), unfixable bug, infra blocker. See `feedback_automation_loop.md` in agent memory.
 
+### Logical backups Phase 1 (full snapshot to local filesystem, IR-format chunks)
+
+- **`sluice backup full` / `sluice backup verify` / `sluice restore`** — new CLI surface implementing the MVP slice from `docs/dev/design-logical-backups.md`. Manifest+chunks layout: a JSON `manifest.json` carrying the full IR schema, per-table row counts, and per-chunk SHA-256s, alongside one or more gzipped JSON Lines chunk files under `chunks/<table>/`. Restore round-trips through `translate.RetargetForEngine` so cross-engine restore (PG backup → MySQL target, etc.) works using the same machinery `sluice schema diff` uses.
+- **New types:** `ir.BackupStore` (storage interface designed for Phase 2 cloud backends from day one), `ir.Manifest`, `ir.TableManifest`, `ir.ChunkInfo`. Tagged-union JSON envelopes (`ir.MarshalType` / `ir.UnmarshalType` / `ir.MarshalDefault` / custom `Column.MarshalJSON`) so the IR's sealed `Type` / `DefaultValue` interfaces round-trip through `encoding/json`.
+- **New pipeline orchestrators:** `pipeline.Backup`, `pipeline.Restore`, `pipeline.LocalStore` (local-FS implementation of `BackupStore`), `pipeline.VerifyBackup` (chunk-level rehash without restoring).
+- **Restore-time integrity:** per-chunk SHA-256 checked at restore (loud-failure tenet — corruption surfaces as `ErrChunkHashMismatch`); per-table row count compared against manifest after streaming.
+- **Phase 2 (cloud backends — S3/GCS/Azure), Phase 3 (incremental backups), and Phase 6 (KMS-backed encryption) follow** — interface is ready; implementations and the manifest version bump are the only remaining work.
+
 ### View support Phase 1 (regular + materialized views, schema-only round-trip)
 
 - **`ir.View` type + `Schema.Views` field** wired end-to-end through readers, writers, pipeline, CLI, schema diff, and schema preview. Both shipping engines populate `Schema.Views` (MySQL via `information_schema.views`; Postgres via `pg_views` + `pg_matviews` with `Materialized=true` on matviews).
@@ -191,17 +199,17 @@ Metric set covers position-derived (`sluice_lag_events`, `sluice_lag_seconds`), 
 
 ---
 
-### 3. Logical backups (full + incremental, local + cloud)
+### 3. Logical backups Phase 2+ (cloud backends + incremental)
 
-**Why.** PlanetScale customers and self-hosted operators want backups they own and store wherever they want — outside the vendor's built-in physical-backup system. Sluice already has the building blocks (snapshot + CDC + position tracking + checkpointing). User explicitly raised this and confirmed local-storage is in scope alongside cloud. See [`design-logical-backups.md`](design-logical-backups.md).
+**Phase 1 (full snapshot to local filesystem) shipped — see "Recently landed".** Remaining phases:
 
-**What.** New `sluice backup full` / `sluice backup incremental` / `sluice restore` CLI surface. Backup format is hybrid manifest+chunks (JSON manifest pointing at zstd-compressed IR-format or Parquet chunks). New `BackupStore` storage abstraction with local-FS as a first-class peer to S3/GCS/Azure/B2. Per-chunk SHA-256 + per-table row-count verification on restore (reuses the `Verifier` infra from #1).
+**Phase 2 — cloud backends (S3-compatible, then GCS/Azure native).** `internal/pipeline/local_store.go` already implements `ir.BackupStore`; Phase 2 adds `S3Store` via `aws-sdk-go-v2` with multipart upload, then GCS / Azure native. CLI shape stays the same — only the URL scheme changes (`--target=s3://bucket/prefix/`). Auth follows AWS SDK defaults: env vars, IAM roles, profile files, AWS SSO. CI integration: roundtrip against MinIO via testcontainers. Estimated size ~1000-1500 LOC.
 
-**Phase 1 MVP**: `sluice backup full` to local-FS only, IR-format chunks, manifest with per-chunk checksums, restore tooling that produces byte-perfect target. ~2-3 weeks. Cloud backends (Phase 2), incremental (Phase 3), encryption (Phase 6) follow.
+**Phase 3 — incremental backups.** Same machinery as `sync start`'s CDC pump but with the applier writing serialised `ir.Change` events to rolling chunk files. New CLI: `sluice backup incremental --since <backup-id>`. Restore walks the chain (full + every incremental since) in order; idempotent application relies on ADR-0010. Layer-3 verification opt-in via `--verify=full`. Estimated size ~1500-2000 LOC.
 
-**Gotchas.** Public format ownership — manifest becomes a forward-compat contract sluice carries forever, so v1 needs to bake on a stable IR. Scope creep risk: backups pull in encryption / KMS / retention / lifecycle / PITR; MVP must aggressively say no.
+**Phase 6 — KMS-backed encryption.** Builds on a Phase 1 client-side AES-256-GCM passphrase MVP (also deferred from Phase 1). AWS KMS first, GCP KMS / Azure Key Vault to follow. BYOK story lands here. Estimated size ~800-1200 LOC plus a key-management ADR.
 
-**Convergence with #4 (Arrow)**: if Arrow Shape A ships, the chunk format can be Parquet for free, with broader interop. Combined Phase-1 (logical-backup local-FS + Arrow Parquet writer) is ~3-4 weeks vs. ~5 weeks if shipped serially.
+**Gotchas.** Public format ownership — `manifest.json` is now a forward-compat contract. `format_version: 1` lets future versions add fields; Phase 3 likely bumps it.
 
 ---
 
