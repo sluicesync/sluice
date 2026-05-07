@@ -196,6 +196,35 @@ func (Engine) EnsurePublication(ctx context.Context, dsn string, tables []string
 	return ensurePublication(ctx, db, defaultPublication, cfg.schema, tables)
 }
 
+// AddPublicationTables extends the sluice publication's table list
+// to include every name in tables, leaving the existing scope
+// untouched. Used by the mid-stream add-table flow where a `SET
+// TABLE` would silently drop tables that are already in scope.
+//
+// Refuses (with a clear error) when the publication is FOR ALL
+// TABLES — adding a specific table to such a publication is
+// meaningless. The publication must already exist; the add-table
+// orchestrator pre-flights the active stream's existence before
+// reaching this call.
+//
+// Idempotent: tables already in the publication are skipped, so a
+// re-run after a partial-add lands cleanly. Discovered by the
+// pipeline.AddTable orchestrator via structural interface
+// (publicationAdder); engines without publications simply omit the
+// method.
+func (Engine) AddPublicationTables(ctx context.Context, dsn string, tables []string) error {
+	cfg, err := parseDSN(dsn)
+	if err != nil {
+		return err
+	}
+	db, err := openDB(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = db.Close() }()
+	return addTablesToPublication(ctx, db, defaultPublication, cfg.schema, tables)
+}
+
 // OpenSlotManager returns a [SlotManager] bound to the database
 // identified by dsn. Used by the `sluice slot list` and `sluice slot
 // drop` CLI commands to manage logical-replication slots from the

@@ -1088,6 +1088,92 @@ func ensurePublication(ctx context.Context, db *sql.DB, name, schema string, tab
 	return nil
 }
 
+// addTablesToPublication issues `ALTER PUBLICATION ... ADD TABLE
+// <list>` so the named tables join the publication scope without
+// disturbing the existing scope. Used by the mid-stream add-table
+// flow where ensurePublication's `SET TABLE` semantics would replace
+// the entire list and silently drop tables that were already in
+// scope.
+//
+// Refuses (with a clear error) when the publication is FOR ALL
+// TABLES — adding a specific table to a FOR ALL TABLES publication
+// is meaningless and almost always indicates an operator
+// misconfiguration. The publication must already exist.
+//
+// Tables already in the publication are skipped so the call is
+// idempotent on a partial-add re-run. Schema-qualifies each table.
+func addTablesToPublication(ctx context.Context, db *sql.DB, name, schema string, tables []string) error {
+	if len(tables) == 0 {
+		return nil
+	}
+	var exists, allTables bool
+	const checkQuery = "SELECT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = $1), " +
+		"COALESCE((SELECT puballtables FROM pg_publication WHERE pubname = $1), false)"
+	if err := db.QueryRowContext(ctx, checkQuery, name).Scan(&exists, &allTables); err != nil {
+		return fmt.Errorf("postgres: check publication: %w", err)
+	}
+	if !exists {
+		return fmt.Errorf("postgres: add tables to publication %q: publication does not exist (mid-stream add-table requires an active stream's publication)", name)
+	}
+	if allTables {
+		return fmt.Errorf("postgres: add tables to publication %q: publication is FOR ALL TABLES; nothing to add (the new table is already implicitly in scope)", name)
+	}
+
+	// Look up the current member set so we can skip duplicates and
+	// emit a clean ALTER even if some of the supplied tables are
+	// already in the publication. pg_publication_rel + pg_class +
+	// pg_namespace gives us schema-qualified names that match
+	// formatPublicationTableList's quoting.
+	const memberQuery = `
+		SELECT n.nspname, c.relname
+		FROM   pg_publication p
+		JOIN   pg_publication_rel pr ON pr.prpubid = p.oid
+		JOIN   pg_class c            ON c.oid     = pr.prrelid
+		JOIN   pg_namespace n        ON n.oid     = c.relnamespace
+		WHERE  p.pubname = $1`
+	rows, err := db.QueryContext(ctx, memberQuery, name)
+	if err != nil {
+		return fmt.Errorf("postgres: list publication members: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	existing := make(map[string]struct{})
+	for rows.Next() {
+		var nsp, rel string
+		if err := rows.Scan(&nsp, &rel); err != nil {
+			return fmt.Errorf("postgres: scan publication member: %w", err)
+		}
+		existing[nsp+"."+rel] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("postgres: list publication members: %w", err)
+	}
+
+	toAdd := make([]string, 0, len(tables))
+	for _, t := range tables {
+		key := schema + "." + t
+		if schema == "" {
+			// Match the unqualified shape used by formatPublicationTableList
+			// for empty-schema callers.
+			key = "." + t
+		}
+		if _, ok := existing[key]; ok {
+			continue
+		}
+		toAdd = append(toAdd, t)
+	}
+	if len(toAdd) == 0 {
+		return nil
+	}
+
+	alterQuery := fmt.Sprintf(`ALTER PUBLICATION %s ADD TABLE %s`,
+		quoteIdent(name), formatPublicationTableList(schema, toAdd))
+	if _, err := db.ExecContext(ctx, alterQuery); err != nil {
+		return fmt.Errorf("postgres: alter publication %q add tables: %w", name, err)
+	}
+	return nil
+}
+
 // formatPublicationTableList renders a comma-separated list of
 // schema-qualified, double-quoted table identifiers for use after
 // `FOR TABLE` / `SET TABLE`.

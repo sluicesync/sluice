@@ -12,13 +12,20 @@ import (
 )
 
 // SchemaCmd groups subcommands that inspect or describe schemas
-// without modifying them. Today only `preview` lives here; future
-// surfaces (schema diff against an existing target, schema dump for
-// version-control) can slot in alongside without disturbing the
-// migrate / sync / slot trees.
+// without modifying them — plus the read-mostly `add-table`
+// command that brings a new source table into an active stream's
+// scope (Phase 1 MVP, see `docs/dev/design-mid-stream-add-table.md`).
+//
+// `add-table` lives here rather than under `sync` because it is a
+// schema-shape mutation that the operator drives explicitly,
+// alongside the source-side `CREATE TABLE` they just ran. The flow
+// is: drain the stream (`sluice sync stop --wait`), run
+// `sluice schema add-table SOURCE.NAME`, then resume
+// (`sluice sync start --resume`).
 type SchemaCmd struct {
-	Preview SchemaPreviewCmd `cmd:"" help:"Render the target DDL sluice would emit, with cross-engine translation notes and advisory hints."`
-	Diff    SchemaDiffCmd    `cmd:"" help:"Compare the expected target DDL (source -> translation) against the actual on-target schema; report drift with copy-paste DDL suggestions."`
+	Preview  SchemaPreviewCmd  `cmd:"" help:"Render the target DDL sluice would emit, with cross-engine translation notes and advisory hints."`
+	Diff     SchemaDiffCmd     `cmd:"" help:"Compare the expected target DDL (source -> translation) against the actual on-target schema; report drift with copy-paste DDL suggestions."`
+	AddTable SchemaAddTableCmd `cmd:"add-table" help:"Bring a new source table into an active stream's scope without a destructive --reset-target-data cycle. Drain the stream first via 'sluice sync stop --wait'."`
 }
 
 // SchemaPreviewCmd implements `sluice schema preview` (ADR-0024).
