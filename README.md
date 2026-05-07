@@ -50,6 +50,17 @@ Cross-engine type translation handles the common surfaces (PG `UUID`/`INET`/`MAC
 
 [`docs/examples/quickstart.md`](docs/examples/quickstart.md) walks through MySQL 8.0 + Postgres 16 via Docker Compose, loads the sakila sample database, runs a one-shot migration, then a continuous-sync stream. ~10 minutes start to finish.
 
+## What to do when something looks wrong
+
+| Symptom | First-look |
+|---|---|
+| `sluice migrate` failed mid-phase | Re-run with `--resume` (per-table-progress checkpointing, ADR-0018). State row in `sluice_migrate_state` survives the crash. |
+| `sluice sync start` won't resume — slot lost / WAL gone | Per `docs/postgres-source-prep.md`. Recovery: `sluice slot drop --source ...`, then `sync start --reset-target-data` to redo from scratch. |
+| `sluice verify` reports row-count mismatch | The target has drifted from source. Investigate via `--format json` for delta-per-table, then run `sluice schema diff` to confirm structural drift didn't also happen. Re-run `migrate` (with `--reset-target-data` if necessary) or fix source-side data. |
+| `sluice sync health --max-stale-seconds N` exits 1 | Stream stopped or fell behind. Check `sluice sync status` for the position; check the source-side CDC reader (PG `pg_stat_replication`, MySQL `SHOW REPLICA STATUS`); if PlanetScale-MySQL, see `docs/vitess-vstream-troubleshooting.md` for the throttler / replication-lag / deploy-request scenarios. |
+| `schema diff` reports drift after migrate | Either sluice didn't translate something cleanly (see ADR-0016 + `--expr-override`), or the target is being modified outside sluice's scope (operator action). Each diff entry has a copy-paste DDL suggestion; run them at your discretion. |
+| Cross-engine translation surfaces a bug | File against `BUG-CATALOG.md` in the [sluice-testing](https://github.com/orware/sluice-testing) companion repo (private) or on the sluice issue tracker. Workaround in the meantime: `--expr-override TABLE.COLUMN=EXPRESSION` (v0.10.0+) or `--type-override TABLE.COLUMN=TYPE`. |
+
 ## Why sluice (vs. alternatives)
 
 - **vs. mysqldump / pg_dump:** sluice handles cross-engine, schema translation, and continuous CDC; dump tools are same-engine and snapshot-only.
