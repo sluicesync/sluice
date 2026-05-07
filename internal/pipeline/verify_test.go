@@ -25,6 +25,9 @@ type verifyStubEngine struct {
 	countErr       map[string]error
 	noVerifier     bool // when true, the reader does NOT implement ir.Verifier
 	readSchemaFail error
+	// Sample-mode per-table data; nil for count-mode tests.
+	sampleHashes map[string][]ir.SampledRowHash
+	sampleErr    map[string]error
 }
 
 func (e *verifyStubEngine) Name() string                  { return e.name }
@@ -35,10 +38,12 @@ func (e *verifyStubEngine) OpenSchemaReader(_ context.Context, _ string) (ir.Sch
 		return &verifyStubReaderNoVerifier{schema: e.schema, fail: e.readSchemaFail}, nil
 	}
 	return &verifyStubReader{
-		schema:   e.schema,
-		counts:   e.counts,
-		countErr: e.countErr,
-		fail:     e.readSchemaFail,
+		schema:       e.schema,
+		counts:       e.counts,
+		countErr:     e.countErr,
+		fail:         e.readSchemaFail,
+		sampleHashes: e.sampleHashes,
+		sampleErr:    e.sampleErr,
 	}, nil
 }
 
@@ -71,6 +76,12 @@ type verifyStubReader struct {
 	counts   map[string]int64
 	countErr map[string]error
 	fail     error
+	// Per-table sampled-row hashes for sample-mode tests. Each entry
+	// is a slice of (pk, hash) pairs that the stub returns verbatim
+	// from SampleRowHashes. Tests populate this map directly.
+	sampleHashes map[string][]ir.SampledRowHash
+	// sampleErr forces SampleRowHashes to fail per-table.
+	sampleErr map[string]error
 }
 
 func (r *verifyStubReader) ReadSchema(_ context.Context) (*ir.Schema, error) {
@@ -85,6 +96,16 @@ func (r *verifyStubReader) ExactRowCount(_ context.Context, table *ir.Table) (in
 		return 0, err
 	}
 	return r.counts[table.Name], nil
+}
+
+// SampleRowHashes implements ir.SampleVerifier so the stub can drive
+// sample-mode tests. Returns the pre-populated slice; tests assemble
+// matched / mismatched pairs by setting source vs. target hashes.
+func (r *verifyStubReader) SampleRowHashes(_ context.Context, table *ir.Table, _ int, _ int64) ([]ir.SampledRowHash, error) {
+	if err, ok := r.sampleErr[table.Name]; ok {
+		return nil, err
+	}
+	return r.sampleHashes[table.Name], nil
 }
 
 // verifyStubReaderNoVerifier omits ExactRowCount so the test that
@@ -271,9 +292,151 @@ func TestVerifier_Run_UnsupportedDepthRejected(t *testing.T) {
 	tgt := &verifyStubEngine{name: "postgres", schema: verifySchema("users"), counts: map[string]int64{"users": 1}}
 
 	var buf bytes.Buffer
-	v := &Verifier{Source: src, Target: tgt, SourceDSN: "src", TargetDSN: "tgt", Depth: "sample", Out: &buf}
+	v := &Verifier{Source: src, Target: tgt, SourceDSN: "src", TargetDSN: "tgt", Depth: "full", Out: &buf}
 	_, err := v.Run(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "not supported in v0.12.0") {
+	if err == nil || !strings.Contains(err.Error(), "not supported") {
 		t.Errorf("expected unsupported-depth error; got %v", err)
+	}
+}
+
+// TestVerifier_Run_SampleMode_Clean pins the v0.14.0 sample-mode
+// happy path: identical sampled hashes on both sides → no mismatch,
+// per-table SampleSize populated, text output reports "clean".
+func TestVerifier_Run_SampleMode_Clean(t *testing.T) {
+	hashes := []ir.SampledRowHash{
+		{PrimaryKey: "1", Hash: "abc"},
+		{PrimaryKey: "2", Hash: "def"},
+		{PrimaryKey: "3", Hash: "ghi"},
+	}
+	src := &verifyStubEngine{
+		name: "postgres", schema: verifySchema("users"),
+		counts:       map[string]int64{"users": 3},
+		sampleHashes: map[string][]ir.SampledRowHash{"users": hashes},
+	}
+	tgt := &verifyStubEngine{
+		name: "postgres", schema: verifySchema("users"),
+		counts:       map[string]int64{"users": 3},
+		sampleHashes: map[string][]ir.SampledRowHash{"users": hashes},
+	}
+
+	var buf bytes.Buffer
+	v := &Verifier{Source: src, Target: tgt, SourceDSN: "src", TargetDSN: "tgt", Depth: VerifyDepthSample, Out: &buf}
+	r, err := v.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if r.HasMismatch() {
+		t.Errorf("identical hashes should be clean; got %+v", r.Summary)
+	}
+	if r.Tables[0].SampleSize != 3 {
+		t.Errorf("expected SampleSize=3; got %d", r.Tables[0].SampleSize)
+	}
+	if !strings.Contains(buf.String(), "sampled=3 clean") {
+		t.Errorf("text output should announce 'sampled=3 clean'; got:\n%s", buf.String())
+	}
+}
+
+// TestVerifier_Run_SampleMode_HashMismatch covers the case where
+// counts match but row content differs. Crucial for catching silent
+// data drift that count-mode would miss entirely.
+func TestVerifier_Run_SampleMode_HashMismatch(t *testing.T) {
+	srcHashes := []ir.SampledRowHash{
+		{PrimaryKey: "1", Hash: "abc"},
+		{PrimaryKey: "2", Hash: "def"},
+		{PrimaryKey: "3", Hash: "ghi"},
+	}
+	tgtHashes := []ir.SampledRowHash{
+		{PrimaryKey: "1", Hash: "abc"},
+		{PrimaryKey: "2", Hash: "WRONG"}, // drift on PK=2
+		{PrimaryKey: "3", Hash: "ghi"},
+	}
+	src := &verifyStubEngine{
+		name: "postgres", schema: verifySchema("users"),
+		counts:       map[string]int64{"users": 3},
+		sampleHashes: map[string][]ir.SampledRowHash{"users": srcHashes},
+	}
+	tgt := &verifyStubEngine{
+		name: "postgres", schema: verifySchema("users"),
+		counts:       map[string]int64{"users": 3},
+		sampleHashes: map[string][]ir.SampledRowHash{"users": tgtHashes},
+	}
+
+	var buf bytes.Buffer
+	v := &Verifier{Source: src, Target: tgt, SourceDSN: "src", TargetDSN: "tgt", Depth: VerifyDepthSample, Out: &buf}
+	r, err := v.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !r.HasMismatch() {
+		t.Errorf("hash drift should surface as mismatch; got %+v", r.Summary)
+	}
+	if r.Tables[0].SampleMismatch != 1 {
+		t.Errorf("expected SampleMismatch=1; got %d", r.Tables[0].SampleMismatch)
+	}
+	if len(r.Tables[0].SampleMismatchPKs) != 1 || r.Tables[0].SampleMismatchPKs[0] != "2" {
+		t.Errorf("expected mismatch PK=[2]; got %v", r.Tables[0].SampleMismatchPKs)
+	}
+	if !strings.Contains(buf.String(), "SAMPLE-MISMATCH") {
+		t.Errorf("text output should announce SAMPLE-MISMATCH; got:\n%s", buf.String())
+	}
+}
+
+// TestVerifier_Run_SampleMode_PKsDiffer covers the case where one
+// side has a row the other side doesn't (PK present on one only).
+// The merge-walk in compareSampleHashes catches this distinct from
+// pure hash drift.
+func TestVerifier_Run_SampleMode_PKsDiffer(t *testing.T) {
+	src := &verifyStubEngine{
+		name: "postgres", schema: verifySchema("users"),
+		counts: map[string]int64{"users": 3},
+		sampleHashes: map[string][]ir.SampledRowHash{"users": {
+			{PrimaryKey: "1", Hash: "h1"},
+			{PrimaryKey: "2", Hash: "h2"},
+			{PrimaryKey: "3", Hash: "h3"},
+		}},
+	}
+	tgt := &verifyStubEngine{
+		name: "postgres", schema: verifySchema("users"),
+		counts: map[string]int64{"users": 3},
+		sampleHashes: map[string][]ir.SampledRowHash{"users": {
+			{PrimaryKey: "1", Hash: "h1"},
+			// missing PK=2
+			{PrimaryKey: "3", Hash: "h3"},
+			{PrimaryKey: "4", Hash: "h4"}, // extra PK=4
+		}},
+	}
+
+	var buf bytes.Buffer
+	v := &Verifier{Source: src, Target: tgt, SourceDSN: "src", TargetDSN: "tgt", Depth: VerifyDepthSample, Out: &buf}
+	r, err := v.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !r.HasMismatch() {
+		t.Errorf("PK divergence should surface as mismatch")
+	}
+	// 2 mismatches: PK=2 (source-only) and PK=4 (target-only).
+	if r.Tables[0].SampleMismatch != 2 {
+		t.Errorf("expected SampleMismatch=2; got %d", r.Tables[0].SampleMismatch)
+	}
+	pks := r.Tables[0].SampleMismatchPKs
+	if len(pks) != 2 || pks[0] != "2" || pks[1] != "4" {
+		t.Errorf("expected mismatch PKs=[2, 4]; got %v", pks)
+	}
+}
+
+// TestVerifier_Run_SampleMode_CrossEngineRejected pins the same-
+// engine constraint: cross-engine sample-mode produces silent false-
+// positive mismatches due to text-rendering differences, so the
+// orchestrator refuses upfront with a clear error.
+func TestVerifier_Run_SampleMode_CrossEngineRejected(t *testing.T) {
+	src := &verifyStubEngine{name: "postgres", schema: verifySchema("users"), counts: map[string]int64{"users": 1}}
+	tgt := &verifyStubEngine{name: "mysql", schema: verifySchema("users"), counts: map[string]int64{"users": 1}}
+
+	var buf bytes.Buffer
+	v := &Verifier{Source: src, Target: tgt, SourceDSN: "src", TargetDSN: "tgt", Depth: VerifyDepthSample, Out: &buf}
+	_, err := v.Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "requires same source and target engine") {
+		t.Errorf("expected cross-engine rejection; got %v", err)
 	}
 }

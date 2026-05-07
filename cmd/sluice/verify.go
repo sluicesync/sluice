@@ -32,7 +32,10 @@ type VerifyCmd struct {
 	IncludeTable []string `help:"Only verify these tables (comma-separated, repeatable). Glob patterns allowed (e.g. 'audit_*'). Mutually exclusive with --exclude-table." sep:"," placeholder:"TABLE"`
 	ExcludeTable []string `help:"Verify every table except these (comma-separated, repeatable). Glob patterns allowed. Mutually exclusive with --include-table." sep:"," placeholder:"TABLE"`
 
-	Depth string `help:"Verification depth. v0.12.0 supports 'count' only; 'sample' and 'full' planned per proto-ADR." default:"count" enum:"count" placeholder:"DEPTH"`
+	Depth string `help:"Verification depth. 'count' (default; row-count comparison) or 'sample' (count + per-table sampled-row content hashes; ~99% confidence on 5%+ corruption). 'full' planned per proto-ADR." default:"count" enum:"count,sample" placeholder:"DEPTH"`
+
+	SampleRowsPerTable int   `help:"Per-table sample size when --depth=sample. Default 100 gives ~99% confidence of detecting a 5%+ corruption rate; raise for stronger guarantees on tables with rare anomalies." default:"100" placeholder:"N"`
+	SampleSeed         int64 `help:"Seed for deterministic sampling when --depth=sample. Same seed → same sample row set on source and target. Default 42; change to 'reshuffle' the sample." default:"42" placeholder:"N"`
 
 	Format string `help:"Output format: 'text' (default) or 'json' (machine-readable for CI gates / alertmanager pipes)." default:"text" enum:"text,json" placeholder:"FORMAT"`
 	Output string `help:"Write to FILE instead of stdout. Atomic." short:"o" placeholder:"FILE"`
@@ -71,14 +74,16 @@ func (v *VerifyCmd) Run(g *Globals) error {
 	defer func() { _ = finalize(runErr) }()
 
 	verifier := &pipeline.Verifier{
-		Source:    source,
-		Target:    target,
-		SourceDSN: v.Source,
-		TargetDSN: v.Target,
-		Depth:     pipeline.VerifyDepth(v.Depth),
-		Filter:    filter,
-		Format:    v.Format,
-		Out:       writer,
+		Source:             source,
+		Target:             target,
+		SourceDSN:          v.Source,
+		TargetDSN:          v.Target,
+		Depth:              pipeline.VerifyDepth(v.Depth),
+		SampleRowsPerTable: v.SampleRowsPerTable,
+		SampleSeed:         v.SampleSeed,
+		Filter:             filter,
+		Format:             v.Format,
+		Out:                writer,
 	}
 	result, err := verifier.Run(kongContext())
 	if err != nil {

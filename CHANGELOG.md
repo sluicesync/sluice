@@ -6,9 +6,19 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **`sluice verify --depth sample` (Phase 2 of the verify proto-ADR).** Per-table sampled-row content hashes alongside count comparison; closes the "did the row data come across, not just the count" gap that count-mode alone can't catch. Default 100 rows per table; `--sample-rows-per-table N` to raise; deterministic `--sample-seed` so source + target select the same row subset run-to-run. Server-side hashing via `MD5(CONCAT_WS('|', col::text, ...))`; merge-walk in the orchestrator detects three drift shapes: PK on source only (target-missing-row), PK on target only (target-extra-row), and PK on both with hash difference (content drift). New `ir.SampleVerifier` optional interface; both core engines implement.
+- **Same-engine constraint on sample mode** — sample-mode requires `source.Name() == target.Name()` since server-side text rendering of values differs cross-engine (MySQL TINYINT(1) → 0/1 vs PG BOOLEAN → t/f, etc.). Cross-engine sample is deferred to a future phase that adds client-side canonicalization. The orchestrator surfaces a clear error pointing operators at `--depth count` for cross-engine verification.
+- **MySQL chunked-count fallback for PlanetScale large tables.** Pre-fix, `sluice verify` against a PlanetScale-MySQL source with > ~100K rows could hit the per-query row-read budget and fail. Now: when the table has a single integer PK, MySQL `ExactRowCount` splits the count across PK ranges of 50K rows each (default), summing partial counts. Cost: `⌈rows / 50000⌉ + 1` queries, well under PS's per-query budget. Tables without a single-int PK fall back to single-shot `SELECT COUNT(*)`; documented limitation.
+
 ### Fixed
 
-- **`--output FILE` error messages** previously prefixed "preview:" regardless of which command (`schema preview`, `schema diff`, `verify`, `sync health`) invoked the shared atomic-write helper. Renamed prefix to "atomic output:" which describes the helper's actual responsibility and is correct regardless of caller. Cosmetic; surfaced by the v0.12.0 + v0.13.0 test cycles. (Will land in the next tagged release.)
+- **`--output FILE` error messages** previously prefixed "preview:" regardless of which command (`schema preview`, `schema diff`, `verify`, `sync health`) invoked the shared atomic-write helper. Renamed prefix to "atomic output:" which describes the helper's actual responsibility and is correct regardless of caller. Cosmetic; surfaced by the v0.12.0 + v0.13.0 test cycles.
+
+### Changed
+
+- **`ir.View` type added** for upcoming view-support Phase 1 (per `docs/dev/design-schema-completeness.md`). `Schema.Views []*View` field is empty on every engine until the readers/writers land in a follow-up commit. Type definition + dialect tag pre-staged so the next implementation pass can drop in cleanly.
 
 ## [0.13.0] - 2026-05-07
 

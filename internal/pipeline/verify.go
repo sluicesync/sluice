@@ -31,10 +31,22 @@ type VerifyDepth string
 
 // Recognised VerifyDepth values.
 const (
-	VerifyDepthCount VerifyDepth = "count"
-	// VerifyDepthSample VerifyDepth = "sample" // post-MVP
-	// VerifyDepthFull   VerifyDepth = "full"   // post-MVP
+	VerifyDepthCount  VerifyDepth = "count"
+	VerifyDepthSample VerifyDepth = "sample" // v0.14.0
+	// VerifyDepthFull   VerifyDepth = "full"   // post-sample
 )
+
+// DefaultSampleRowsPerTable is the per-table sample size when --depth
+// sample is requested without an explicit --sample-rows-per-table.
+// 100 gives ~99% confidence of detecting a 5%+ corruption rate per
+// the proto-ADR (`docs/dev/design-sluice-verify.md`).
+const DefaultSampleRowsPerTable = 100
+
+// DefaultSampleSeed is the seed used when sample mode runs without an
+// explicit --sample-seed flag. Deterministic across calls so a given
+// table's sample rows are stable run-to-run; the operator overrides
+// for "reshuffle the sample" workflows.
+const DefaultSampleSeed = 42
 
 // Verifier runs a single verify pass against the configured source/
 // target pair. Same shape as [Differ]: hold config, call Run.
@@ -50,6 +62,15 @@ type Verifier struct {
 
 	// Depth selects the verification mode. Empty defaults to count.
 	Depth VerifyDepth
+
+	// SampleRowsPerTable controls the per-table sample size when
+	// Depth == sample. Zero falls back to [DefaultSampleRowsPerTable].
+	SampleRowsPerTable int
+
+	// SampleSeed makes sampling deterministic across calls. Same seed
+	// → same row subset on source + target. Zero falls back to
+	// [DefaultSampleSeed].
+	SampleSeed int64
 
 	// Filter selects which source tables participate. Empty (zero
 	// value) keeps every source table.
@@ -83,6 +104,18 @@ type VerifyTableResult struct {
 	SourceRowCount int64  `json:"source_row_count"`
 	TargetRowCount int64  `json:"target_row_count"`
 	CountMismatch  bool   `json:"count_mismatch"`
+	// SampleSize is the number of rows actually sampled (may be
+	// less than the requested SampleRowsPerTable on small tables).
+	// Zero when Depth != sample.
+	SampleSize int `json:"sample_size,omitempty"`
+	// SampleMismatch is the number of sampled rows whose source
+	// hash differs from the target hash (or whose PK isn't present
+	// on both sides). Non-zero implies row-content drift.
+	SampleMismatch int `json:"sample_mismatch,omitempty"`
+	// SampleMismatchPKs lists the primary keys of mismatched rows
+	// for forensic drill-in. Capped at the first 25 entries to
+	// keep reports readable; the full count is in SampleMismatch.
+	SampleMismatchPKs []string `json:"sample_mismatch_pks,omitempty"`
 	// Reason is non-empty when this table couldn't be verified
 	// (e.g. table not on target side, engine doesn't support
 	// Verifier). The Source/Target counts are 0 when Reason is set.
@@ -124,8 +157,25 @@ func (v *Verifier) Run(ctx context.Context) (*VerifyResult, error) {
 	if depth == "" {
 		depth = VerifyDepthCount
 	}
-	if depth != VerifyDepthCount {
-		return nil, fmt.Errorf("verify: depth %q not supported in v0.12.0 MVP (count only)", depth)
+	if depth != VerifyDepthCount && depth != VerifyDepthSample {
+		return nil, fmt.Errorf("verify: depth %q not supported (recognised: count, sample); full mode pending future release", depth)
+	}
+	// Sample-mode currently requires same source + target engine —
+	// server-side hashing produces engine-specific text rendering of
+	// values, so cross-engine sample comparison would yield silent
+	// false-positive mismatches. Cross-engine sample is deferred to a
+	// future phase that adds client-side canonicalization.
+	if depth == VerifyDepthSample && v.Source.Name() != v.Target.Name() {
+		return nil, fmt.Errorf("verify: depth=sample requires same source and target engine (got source=%q target=%q); cross-engine sample is planned but not yet implemented — use --depth=count for cross-engine verification",
+			v.Source.Name(), v.Target.Name())
+	}
+	sampleRows := v.SampleRowsPerTable
+	if sampleRows == 0 {
+		sampleRows = DefaultSampleRowsPerTable
+	}
+	sampleSeed := v.SampleSeed
+	if sampleSeed == 0 {
+		sampleSeed = DefaultSampleSeed
 	}
 
 	sr, err := v.Source.OpenSchemaReader(ctx, v.SourceDSN)
@@ -215,10 +265,35 @@ func (v *Verifier) Run(ctx context.Context) (*VerifyResult, error) {
 		tr.SourceRowCount = srcCount
 		tr.TargetRowCount = tgtCount
 		tr.CountMismatch = srcCount != tgtCount
+
+		// Sample mode: also compare row content hashes for the
+		// requested sample size. Skip on count-mode runs and on tables
+		// where the engine's SampleVerifier surface isn't usable
+		// (no PK, etc.) — those land as SKIPPED with a clear reason.
+		if depth == VerifyDepthSample {
+			srcSV, srcOK := srcVerifier.(ir.SampleVerifier)
+			tgtSV, tgtOK := tgtVerifier.(ir.SampleVerifier)
+			switch {
+			case !srcOK || !tgtOK:
+				tr.Reason = "sample mode not supported on this engine (no ir.SampleVerifier implementation)"
+				result.Tables = append(result.Tables, tr)
+				result.Summary.TablesSkipped++
+				continue
+			default:
+				if err := compareSampleHashes(ctx, srcSV, tgtSV, srcTable, tgtTable, sampleRows, sampleSeed, &tr); err != nil {
+					tr.Reason = fmt.Sprintf("sample-hash error: %v", err)
+					result.Tables = append(result.Tables, tr)
+					result.Summary.TablesSkipped++
+					continue
+				}
+			}
+		}
+
 		result.Tables = append(result.Tables, tr)
-		if tr.CountMismatch {
+		switch {
+		case tr.CountMismatch || tr.SampleMismatch > 0:
 			result.Summary.TablesMismatch++
-		} else {
+		default:
 			result.Summary.TablesClean++
 		}
 	}
@@ -275,6 +350,18 @@ func (v *Verifier) renderText(r *VerifyResult) error {
 		case t.CountMismatch:
 			fmt.Fprintf(&sb, "%-40s MISMATCH source=%d target=%d (delta=%+d)\n",
 				t.Name, t.SourceRowCount, t.TargetRowCount, t.TargetRowCount-t.SourceRowCount)
+		case t.SampleMismatch > 0:
+			fmt.Fprintf(&sb, "%-40s SAMPLE-MISMATCH counts=%d/%d sampled=%d mismatch=%d\n",
+				t.Name, t.SourceRowCount, t.TargetRowCount, t.SampleSize, t.SampleMismatch)
+			for _, pk := range t.SampleMismatchPKs {
+				fmt.Fprintf(&sb, "   pk=%s\n", pk)
+			}
+			if t.SampleMismatch > len(t.SampleMismatchPKs) {
+				fmt.Fprintf(&sb, "   ... and %d more (capped for readability; see JSON output for full list)\n",
+					t.SampleMismatch-len(t.SampleMismatchPKs))
+			}
+		case t.SampleSize > 0:
+			fmt.Fprintf(&sb, "%-40s OK rows=%d sampled=%d clean\n", t.Name, t.SourceRowCount, t.SampleSize)
 		default:
 			fmt.Fprintf(&sb, "%-40s OK rows=%d\n", t.Name, t.SourceRowCount)
 		}
@@ -286,9 +373,71 @@ func (v *Verifier) renderText(r *VerifyResult) error {
 		}
 		sb.WriteString("-- run `sluice schema diff` if you need to reconcile structural drift.\n")
 	}
-	if r.Summary.TablesMismatch > 0 {
-		sb.WriteString("\n-- non-zero exit code follows; re-run with --depth=sample (post-MVP) to compare row content for drift root-cause.\n")
+	if r.Summary.TablesMismatch > 0 && r.Depth == VerifyDepthCount {
+		sb.WriteString("\n-- non-zero exit code follows; re-run with --depth=sample to compare row content for drift root-cause.\n")
 	}
 	_, err := io.WriteString(v.Out, sb.String())
 	return err
+}
+
+// compareSampleHashes runs SampleRowHashes on both sides with the
+// same n + seed (so both engines select the same row subset), then
+// walks the two sorted lists side-by-side to detect mismatches:
+//   - PK present on source only (target is missing the row).
+//   - PK present on target only (target has an extra row).
+//   - PK present on both but hashes differ (row content drift).
+//
+// Mismatches populate tr.SampleMismatch + tr.SampleMismatchPKs (cap
+// 25). The function returns nil on success (including the all-clean
+// case); operational errors propagate via the err return so the
+// orchestrator can mark the table SKIPPED with a clear reason.
+//
+// Const for the per-table mismatch-PK cap; full count remains in
+// SampleMismatch even when the slice is truncated.
+func compareSampleHashes(ctx context.Context, src, tgt ir.SampleVerifier, srcTable, tgtTable *ir.Table, n int, seed int64, tr *VerifyTableResult) error {
+	srcSamples, err := src.SampleRowHashes(ctx, srcTable, n, seed)
+	if err != nil {
+		return fmt.Errorf("source-side: %w", err)
+	}
+	tgtSamples, err := tgt.SampleRowHashes(ctx, tgtTable, n, seed)
+	if err != nil {
+		return fmt.Errorf("target-side: %w", err)
+	}
+	tr.SampleSize = len(srcSamples)
+	const maxPKsListed = 25
+
+	// Walk both sorted lists in parallel. Each side is sorted by PK
+	// (engines guarantee this); merge-walk catches all three kinds
+	// of mismatch in a single O(n+m) pass.
+	i, j := 0, 0
+	addMismatch := func(pk string) {
+		tr.SampleMismatch++
+		if len(tr.SampleMismatchPKs) < maxPKsListed {
+			tr.SampleMismatchPKs = append(tr.SampleMismatchPKs, pk)
+		}
+	}
+	for i < len(srcSamples) && j < len(tgtSamples) {
+		switch {
+		case srcSamples[i].PrimaryKey < tgtSamples[j].PrimaryKey:
+			addMismatch(srcSamples[i].PrimaryKey)
+			i++
+		case srcSamples[i].PrimaryKey > tgtSamples[j].PrimaryKey:
+			addMismatch(tgtSamples[j].PrimaryKey)
+			j++
+		default:
+			if srcSamples[i].Hash != tgtSamples[j].Hash {
+				addMismatch(srcSamples[i].PrimaryKey)
+			}
+			i++
+			j++
+		}
+	}
+	// Trailing tail on either side.
+	for ; i < len(srcSamples); i++ {
+		addMismatch(srcSamples[i].PrimaryKey)
+	}
+	for ; j < len(tgtSamples); j++ {
+		addMismatch(tgtSamples[j].PrimaryKey)
+	}
+	return nil
 }

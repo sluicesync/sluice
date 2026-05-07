@@ -9,6 +9,84 @@ type Schema struct {
 	// Tables in the schema. Order is not significant for correctness
 	// but is preserved from the source for stable diffs and logs.
 	Tables []*Table
+
+	// Views in the schema. Empty on engines that don't support views or
+	// when the source has none. Materialized views (Postgres) are
+	// included with View.Materialized = true. View support is a
+	// schema-only round-trip in v1: the writer creates the view from
+	// View.Definition; cross-engine view-definition translation is a
+	// future Phase 3 effort. See `docs/dev/design-schema-completeness.md`.
+	Views []*View
+}
+
+// View is a dialect-neutral description of a SQL view (regular or
+// materialized). The definition is the SQL body of the view's SELECT
+// statement, captured verbatim from the source dialect.
+//
+// View support is intentionally minimal in v1 ("Phase 1" of the proto-
+// ADR `docs/dev/design-schema-completeness.md`):
+//
+//   - Schema-only round-trip: source views are read from the catalog,
+//     emitted to the target via `CREATE VIEW`/`CREATE MATERIALIZED VIEW`.
+//   - Same-engine pairs work without translation.
+//   - Cross-engine pairs emit the source-dialect definition verbatim
+//     and rely on the loud-failure tenet — non-portable definitions
+//     surface as a target rejection at apply time, not silent corruption.
+//   - `--view-override` (future Phase 3) will be the operator escape
+//     for cases the eventual translator can't handle.
+//
+// Materialized views (Postgres-only today): the writer emits
+// `CREATE MATERIALIZED VIEW ... WITH DATA` so the target's view is
+// populated immediately from the just-loaded target tables. Continuous
+// refresh on CDC is a Phase 2 future enhancement.
+type View struct {
+	// Schema is the namespace the view belongs to. Empty for engines
+	// with a flat scope (such as MySQL); set for engines with
+	// namespaced schemas (such as PostgreSQL). Mirrors Table.Schema.
+	Schema string
+
+	// Name is the view's identifier within its schema.
+	Name string
+
+	// Definition is the SQL body of the view, e.g.
+	//   `SELECT id, email FROM users WHERE active = 1`.
+	// Captured from the source dialect's `pg_views.definition` /
+	// `information_schema.views.view_definition`. Identifier quoting
+	// is left as the source emitted it — the writer is responsible
+	// for any normalization needed to apply on the target dialect.
+	Definition string
+
+	// DefinitionDialect is the dialect the Definition text came from,
+	// in the readers' canonical form ("mysql" or "postgres"). Mirrors
+	// the same convention as [Column.GeneratedExprDialect] and
+	// [CheckConstraint.ExprDialect]. Cross-engine writers compare this
+	// against their own dialect: equal → emit verbatim; differ → in
+	// Phase 1 emit verbatim and rely on loud failure, in Phase 3 route
+	// through a SELECT-grammar translator. Empty means the producer
+	// didn't tag the dialect (older IR-construction paths, hand-built
+	// test fixtures).
+	DefinitionDialect string
+
+	// Columns are the projected columns of the view, in declaration
+	// order. May be empty when the source reader can't cleanly derive
+	// them (deriving requires parsing the SELECT body). Useful for
+	// `sluice schema diff` to compare expected-vs-actual column lists
+	// when the reader does populate them.
+	Columns []*Column
+
+	// Materialized indicates a Postgres-style materialized view (one
+	// whose query result is physically stored on disk and refreshed
+	// explicitly via `REFRESH MATERIALIZED VIEW`). False for regular
+	// views (the dynamic-SELECT form both engines support). MySQL
+	// has no materialized-view concept; this field is always false on
+	// MySQL sources.
+	//
+	// Phase 1 writer emits `WITH DATA` for materialized views (refresh
+	// from source on creation); Phase 2 will add CDC-driven refresh.
+	Materialized bool
+
+	// Comment is the view-level comment, if any. Mirrors Table.Comment.
+	Comment string
 }
 
 // Table describes a single relational table.
