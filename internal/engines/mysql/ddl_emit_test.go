@@ -613,6 +613,83 @@ func TestEmitAddForeignKey_NoActions(t *testing.T) {
 	}
 }
 
+// TestEmitAddForeignKey_SelfReferential — same shape as the PG sibling.
+// Pinned per design-schema-completeness.md so self-ref FK support
+// can't regress silently.
+func TestEmitAddForeignKey_SelfReferential(t *testing.T) {
+	fk := &ir.ForeignKey{
+		Name:              "employees_manager_fk",
+		Columns:           []string{"manager_id"},
+		ReferencedTable:   "employees",
+		ReferencedColumns: []string{"id"},
+		OnDelete:          ir.FKActionSetNull,
+	}
+	got, err := emitAddForeignKey("employees", fk)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := "ALTER TABLE `employees` ADD CONSTRAINT `employees_manager_fk` FOREIGN KEY (`manager_id`) REFERENCES `employees` (`id`) ON DELETE SET NULL;"
+	if got != want {
+		t.Errorf("\n got  %q\n want %q", got, want)
+	}
+}
+
+// TestEmitAddForeignKey_CompositePK — composite-key FK shape (real-
+// world tenant-scoped models with `(tenant_id, id)` PKs).
+func TestEmitAddForeignKey_CompositePK(t *testing.T) {
+	fk := &ir.ForeignKey{
+		Name:              "orders_customer_fk",
+		Columns:           []string{"tenant_id", "customer_id"},
+		ReferencedTable:   "customers",
+		ReferencedColumns: []string{"tenant_id", "id"},
+		OnDelete:          ir.FKActionCascade,
+		OnUpdate:          ir.FKActionCascade,
+	}
+	got, err := emitAddForeignKey("orders", fk)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := "ALTER TABLE `orders` ADD CONSTRAINT `orders_customer_fk` FOREIGN KEY (`tenant_id`, `customer_id`) REFERENCES `customers` (`tenant_id`, `id`) ON DELETE CASCADE ON UPDATE CASCADE;"
+	if got != want {
+		t.Errorf("\n got  %q\n want %q", got, want)
+	}
+}
+
+// TestEmitAddForeignKey_AllOnDeleteActions pins every supported
+// FKAction's MySQL keyword. Same shape as the PG sibling. A
+// regression that swapped two of them would silently change the
+// cascade behavior on the target.
+func TestEmitAddForeignKey_AllOnDeleteActions(t *testing.T) {
+	cases := []struct {
+		action ir.FKAction
+		want   string
+	}{
+		{ir.FKActionRestrict, "RESTRICT"},
+		{ir.FKActionCascade, "CASCADE"},
+		{ir.FKActionSetNull, "SET NULL"},
+		{ir.FKActionSetDefault, "SET DEFAULT"},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.action.String(), func(t *testing.T) {
+			fk := &ir.ForeignKey{
+				Name:              "fk_test",
+				Columns:           []string{"x"},
+				ReferencedTable:   "parent",
+				ReferencedColumns: []string{"id"},
+				OnDelete:          c.action,
+			}
+			got, err := emitAddForeignKey("child", fk)
+			if err != nil {
+				t.Fatalf("emitAddForeignKey: %v", err)
+			}
+			if !strings.Contains(got, "ON DELETE "+c.want) {
+				t.Errorf("expected ON DELETE %s; got %q", c.want, got)
+			}
+		})
+	}
+}
+
 func TestQuoteSQLString(t *testing.T) {
 	cases := []struct{ in, want string }{
 		{"hello", "'hello'"},

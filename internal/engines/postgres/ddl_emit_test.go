@@ -730,6 +730,97 @@ func TestEmitAddForeignKey(t *testing.T) {
 	}
 }
 
+// TestEmitAddForeignKey_SelfReferential pins the self-referential FK
+// shape (employees.manager_id → employees.id). Sluice's three-phase
+// apply (tables → bulk_copy → indexes → constraints) sidesteps the
+// create-order problem because FKs land in phase 5 after all tables
+// exist; this test pins the DDL emit so a regression couldn't drop
+// the self-ref support silently. Per design-schema-completeness.md.
+func TestEmitAddForeignKey_SelfReferential(t *testing.T) {
+	fk := &ir.ForeignKey{
+		Name:              "employees_manager_fk",
+		Columns:           []string{"manager_id"},
+		ReferencedTable:   "employees", // same table as the parent
+		ReferencedColumns: []string{"id"},
+		OnDelete:          ir.FKActionSetNull,
+	}
+	got, err := emitAddForeignKey("public", "employees", fk)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := `ALTER TABLE "public"."employees" ADD CONSTRAINT "employees_manager_fk" FOREIGN KEY ("manager_id") REFERENCES "public"."employees" ("id") ON DELETE SET NULL;`
+	if got != want {
+		t.Errorf("\n got  %q\n want %q", got, want)
+	}
+}
+
+// TestEmitAddForeignKey_CompositePK pins the composite-PK FK shape
+// (a child whose FK references a parent's two-column primary key).
+// Real-world tenant-scoped data models often use (tenant_id, id)
+// composite PKs; their FKs from child tables need both columns.
+func TestEmitAddForeignKey_CompositePK(t *testing.T) {
+	fk := &ir.ForeignKey{
+		Name:              "orders_customer_fk",
+		Columns:           []string{"tenant_id", "customer_id"},
+		ReferencedTable:   "customers",
+		ReferencedColumns: []string{"tenant_id", "id"},
+		OnDelete:          ir.FKActionCascade,
+		OnUpdate:          ir.FKActionCascade,
+	}
+	got, err := emitAddForeignKey("public", "orders", fk)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := `ALTER TABLE "public"."orders" ADD CONSTRAINT "orders_customer_fk" FOREIGN KEY ("tenant_id", "customer_id") REFERENCES "public"."customers" ("tenant_id", "id") ON DELETE CASCADE ON UPDATE CASCADE;`
+	if got != want {
+		t.Errorf("\n got  %q\n want %q", got, want)
+	}
+}
+
+// TestEmitAddForeignKey_AllOnDeleteActions pins the round-trip of
+// every supported ir.FKAction value through the PG emitter. Each
+// action has a different SQL keyword; a regression that swapped two
+// of them would silently change cascade behavior on the target.
+func TestEmitAddForeignKey_AllOnDeleteActions(t *testing.T) {
+	cases := []struct {
+		action ir.FKAction
+		want   string
+	}{
+		{ir.FKActionNoAction, ""}, // omitted from output
+		{ir.FKActionRestrict, "RESTRICT"},
+		{ir.FKActionCascade, "CASCADE"},
+		{ir.FKActionSetNull, "SET NULL"},
+		{ir.FKActionSetDefault, "SET DEFAULT"},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.action.String(), func(t *testing.T) {
+			fk := &ir.ForeignKey{
+				Name:              "fk_test",
+				Columns:           []string{"x"},
+				ReferencedTable:   "parent",
+				ReferencedColumns: []string{"id"},
+				OnDelete:          c.action,
+			}
+			got, err := emitAddForeignKey("public", "child", fk)
+			if err != nil {
+				t.Fatalf("emitAddForeignKey: %v", err)
+			}
+			if c.want == "" {
+				// NO ACTION shouldn't render an explicit clause —
+				// the column-default behavior matches.
+				if strings.Contains(got, "ON DELETE") {
+					t.Errorf("FKActionNoAction should not render ON DELETE clause; got:\n%s", got)
+				}
+				return
+			}
+			if !strings.Contains(got, "ON DELETE "+c.want) {
+				t.Errorf("expected ON DELETE %s in output; got:\n%s", c.want, got)
+			}
+		})
+	}
+}
+
 func TestQuoteSQLString(t *testing.T) {
 	cases := []struct{ in, want string }{
 		{"hello", "'hello'"},
