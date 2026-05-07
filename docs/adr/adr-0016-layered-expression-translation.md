@@ -262,7 +262,29 @@ After v0.9.1 the writer-side translator covers:
 | MySQL → PG | `CAST(x AS CHAR)` | `CAST(x AS TEXT)` |
 | MySQL → PG | bool-context: `<int_lit> [op] <bool>` / `<bool> [op] <int_lit>` | `<bool_lit> [op] <bool>` etc. |
 | MySQL → PG | bool-context: `COALESCE(<bool>, <int_lit>)` | `COALESCE(<bool>, <bool_lit>)` |
-| MySQL → PG | int-context: `COALESCE(<bool_returning>, <int_lit>)` | `COALESCE(<bool_returning>::int, <int_lit>)` |
+| MySQL → PG | int-context: `COALESCE(<expr>, <int_lit>)` | `COALESCE(<expr>::int, <int_lit>)` (v0.10.1: applied unconditionally on non-literal sides) |
 | PG → MySQL | unchanged | unchanged |
 
 The verbatim-passthrough policy still owns everything outside this set.
+
+## Updated in v0.10.1: aggressive int-context COALESCE cast
+
+v0.9.1 / v0.9.2's int-context COALESCE rewrite gated the `::int` cast on a hand-coded `isBoolReturning` detector that recognised bare bool idents, comparisons (`=`, `!=`, `<>`, `<`, `>`, `<=`, `>=`), `IS NULL`/`IS NOT NULL`, keyword forms (`LIKE`, `BETWEEN`, `IN`), and parenthesised wrappers. v0.10.0 real-world testing kept surfacing expression shapes the detector missed — function calls returning bool, AND/OR chains, NOT prefixes, EXISTS subqueries — each producing a fresh "still not handled" bug report.
+
+v0.10.1 drops the detector and casts the non-literal side unconditionally when the outer column is integer-typed. The reasoning chain:
+
+- The column is integer-typed (the operator's intent for that column's stored value).
+- A `COALESCE` whose second arg is a 0/1 literal must produce an int (so it's storable in the int column).
+- Therefore the FIRST arg must also be coercible to int.
+- A `::int` cast on the first arg either:
+  - Helps (bool → int succeeds: true→1, false→0).
+  - Is a syntactic no-op (already int).
+  - Fails at apply time on a non-numeric expression — but the column's type would have rejected the body anyway. **Loud-failure tenet preserved.**
+
+The cost is one extra `::int` token in the emitted DDL for COALESCE expressions on already-int columns. The benefit is that every bool-returning shape — recognised or not — now translates correctly without operator intervention.
+
+### When this still doesn't fire
+
+`OuterColumnIsInteger` is set only when the column being emitted has IR type `ir.Integer`. For BOOLEAN-typed columns (the v0.8.0 default for `tinyint(1)` columns without `--type-override`), the bool-context path takes over instead — the int literal becomes a bool literal. The two paths are mutually exclusive based on the outer column's IR type.
+
+For columns that aren't generated columns (CHECK constraint references, index expressions), the OuterColumnIsInteger flag isn't set today; CHECK/index expressions return their own types regardless of the column they reference. Operator escape hatch: `--expr-override` (v0.10.0) is the always-works fallback for any case the translator misses.

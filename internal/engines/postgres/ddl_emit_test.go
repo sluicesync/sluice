@@ -165,6 +165,53 @@ func TestSetDefaultToArrayLiteral(t *testing.T) {
 // TestEmitTableDef_SETColumn covers the integration between
 // emitColumnType (TEXT[]), the SET CHECK constraint emission, and
 // the SET-default translation in emitColumnDef.
+// TestEmitTableDef_GeneratedEnum_AsTextWithCheck pins Bug 25's
+// fix: an enum-typed STORED generated column emits as TEXT (no
+// enum type reference, since `(body)::enum_type` would trip PG's
+// IMMUTABLE check) and gets a table-level CHECK enforcing the
+// value-list. Mirrors the SET → TEXT[] + CHECK fallback shape.
+func TestEmitTableDef_GeneratedEnum_AsTextWithCheck(t *testing.T) {
+	tbl := &ir.Table{
+		Name: "shipments",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}, Nullable: false},
+			{Name: "picked_at", Type: ir.Timestamp{Precision: 6}, Nullable: true},
+			{
+				Name:            "pickup_status",
+				Type:            ir.Enum{Values: []string{"pending", "picked", "cancelled"}},
+				Nullable:        true,
+				GeneratedExpr:   "CASE WHEN picked_at IS NULL THEN 'pending' ELSE 'picked' END",
+				GeneratedStored: true,
+			},
+		},
+		PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "id"}}},
+	}
+	got, err := emitTableDef("public", tbl, emitOpts{})
+	if err != nil {
+		t.Fatalf("emitTableDef: %v", err)
+	}
+	wantContains := []string{
+		// Column emits as TEXT, not as the enum type, and the body
+		// is unwrapped (no ::enum_type cast).
+		`"pickup_status" TEXT GENERATED ALWAYS AS (CASE WHEN picked_at IS NULL THEN 'pending' ELSE 'picked' END) STORED`,
+		// Table-level CHECK enforces the value-list. Constraint name
+		// uses the `_enum_chk` suffix to disambiguate from `_set` and
+		// `_enum` (the type name).
+		`CONSTRAINT "shipments_pickup_status_enum_chk" CHECK ("pickup_status" IN ('pending','picked','cancelled'))`,
+	}
+	for _, sub := range wantContains {
+		if !strings.Contains(got, sub) {
+			t.Errorf("CREATE TABLE missing %q\n--- got ---\n%s", sub, got)
+		}
+	}
+	// Sanity: the column DOES NOT reference the enum type by name.
+	// If a future refactor reintroduces the `::enum_type` cast or
+	// the type-named column form, this catches it.
+	if strings.Contains(got, `"shipments_pickup_status_enum"`) {
+		t.Errorf("emitted DDL references the enum type name; should be TEXT-only for generated enums:\n%s", got)
+	}
+}
+
 func TestEmitTableDef_SETColumn(t *testing.T) {
 	tbl := &ir.Table{
 		Name: "events",
@@ -370,14 +417,16 @@ func TestEmitColumnDef_Generated(t *testing.T) {
 			want: `"tax" NUMERIC(10,2) GENERATED ALWAYS AS (subtotal * 0.07) STORED`,
 		},
 		{
-			// Bug 23 (refined): an enum-typed generated column whose
-			// body returns text (CASE returning enum-valued string
-			// literals, simple literal, etc.) needs an explicit cast
-			// to the enum type. PG rejects without it: "column X is
-			// of type Y_enum but expression is of type text". The
-			// cast wraps the whole body — works for any text-
-			// returning shape.
-			name: "enum-typed generated column gets enum cast on the body",
+			// Bug 25 (v0.10.1): enum-typed STORED generated columns
+			// can't reference the enum type — `(body)::enum_type`
+			// triggers PG's "generation expression is not immutable"
+			// error because `enum_in()` is STABLE not IMMUTABLE.
+			// Sluice sidesteps by emitting the column as TEXT (no
+			// enum type, no cast); a table-level CHECK constraint
+			// (added by emitTableDef) enforces the value-list. The
+			// previous v0.9.2/v0.10.0 (body)::enum_type wrapper is
+			// gone — see emitTableDef test for the CHECK side.
+			name: "enum-typed generated column emits as TEXT (Bug 25)",
 			in: &ir.Column{
 				Name:            "pickup_status",
 				Type:            ir.Enum{Values: []string{"pending", "picked", "cancelled"}},
@@ -385,7 +434,7 @@ func TestEmitColumnDef_Generated(t *testing.T) {
 				GeneratedExpr:   "CASE WHEN picked_at IS NULL THEN 'pending' ELSE 'picked' END",
 				GeneratedStored: true,
 			},
-			want: `"pickup_status" "invoices_pickup_status_enum" GENERATED ALWAYS AS ((CASE WHEN picked_at IS NULL THEN 'pending' ELSE 'picked' END)::"invoices_pickup_status_enum") STORED`,
+			want: `"pickup_status" TEXT GENERATED ALWAYS AS (CASE WHEN picked_at IS NULL THEN 'pending' ELSE 'picked' END) STORED`,
 		},
 	}
 	for _, c := range cases {

@@ -260,6 +260,47 @@ func setCheckName(tableName, columnName string) string {
 	return tableName + "_" + columnName + "_set"
 }
 
+// emitGeneratedEnumCheckConstraint produces a table-level CHECK
+// fragment enforcing the value-list of an enum-typed STORED
+// generated column. Bug 25's workaround: PG rejects
+// `(body)::enum_type` inside a STORED generated column because
+// `enum_in()` is STABLE not IMMUTABLE. Sluice sidesteps by
+// emitting the column as TEXT and adding this CHECK so the value-
+// set guarantee survives. The CHECK is `column_name IN ('a','b',...)`
+// — straightforward IN-list, no enum dependency.
+//
+// Empty values lists produce a CHECK against an empty IN-list,
+// which PG treats as always-false (the column can hold no value).
+// That matches the source's enum-with-no-values shape, which is
+// already degenerate.
+func emitGeneratedEnumCheckConstraint(tableName, columnName string, values []string) string {
+	if len(values) == 0 {
+		return fmt.Sprintf(
+			"CONSTRAINT %s CHECK (false)",
+			quoteIdent(generatedEnumCheckName(tableName, columnName)),
+		)
+	}
+	quoted := make([]string, len(values))
+	for i, v := range values {
+		quoted[i] = quoteSQLString(v)
+	}
+	return fmt.Sprintf(
+		"CONSTRAINT %s CHECK (%s IN (%s))",
+		quoteIdent(generatedEnumCheckName(tableName, columnName)),
+		quoteIdent(columnName),
+		strings.Join(quoted, ","),
+	)
+}
+
+// generatedEnumCheckName generates the CHECK-constraint name for a
+// generated enum column. The `_enum_chk` suffix distinguishes it
+// from setCheckName's `_set` suffix and from enumTypeName's `_enum`
+// suffix, keeping the three policies easy to tell apart in pg_dump
+// output.
+func generatedEnumCheckName(tableName, columnName string) string {
+	return tableName + "_" + columnName + "_enum_chk"
+}
+
 // emitColumnDef returns the full DDL fragment for a single column,
 // suitable for inclusion in a CREATE TABLE column list:
 //
@@ -277,7 +318,21 @@ func emitColumnDef(table *ir.Table, c *ir.Column, opts emitOpts) (string, error)
 		if table == nil {
 			return "", fmt.Errorf("postgres: emitColumnDef: Enum column %q requires a table context", c.Name)
 		}
-		typeStr = quoteIdent(enumTypeName(table.Name, c.Name))
+		// Bug 25: enum-typed STORED generated columns can't reference
+		// the enum type — the cast `(body)::enum_type` calls
+		// `enum_in()` which is STABLE, not IMMUTABLE, and PG's
+		// generated-column body must be IMMUTABLE. We sidestep by
+		// emitting the column as TEXT (no enum type, no cast) and
+		// letting emitTableDef append a table-level CHECK constraint
+		// that enforces the value list. Loses the named enum type but
+		// always works; matches sluice's "translate, don't wrap in
+		// target-side functions" philosophy. Same pattern as the SET
+		// → TEXT[] + CHECK fallback in emitSetCheckConstraint.
+		if c.IsGenerated() {
+			typeStr = "TEXT"
+		} else {
+			typeStr = quoteIdent(enumTypeName(table.Name, c.Name))
+		}
 	} else {
 		var err error
 		typeStr, err = emitColumnType(c.Type, opts)
@@ -309,28 +364,14 @@ func emitColumnDef(table *ir.Table, c *ir.Column, opts emitOpts) (string, error)
 		}
 		sb.WriteString(" GENERATED ALWAYS AS (")
 		body := translateGeneratedExpr(c, table)
-		// Bug 23 (refined): an enum-typed generated column with a
-		// body that returns text — typically a CASE returning enum-
-		// valued literals, or a COALESCE over text columns — needs
-		// an explicit cast to the enum type, otherwise PG rejects
-		// with "column X is of type Y_enum but expression is of
-		// type text". The cast must live INSIDE the outer GENERATED
-		// parens — `GENERATED ALWAYS AS ((body)::"enum_type") STORED`
-		// — because PG's grammar binds `::` tighter than the AS
-		// clause and emitting `AS (body)::"type" STORED` is a syntax
-		// error (v0.9.1 placement bug). Wrapping the whole body
-		// works for any text-returning shape (CASE, COALESCE, simple
-		// literal); per-arm casting would require recognising the
-		// CASE structure and isn't strictly more correct. Mirrors
-		// the DEFAULT-cast pattern below.
-		if _, isEnum := c.Type.(ir.Enum); isEnum && table != nil {
-			sb.WriteString("(")
-			sb.WriteString(body)
-			sb.WriteString(")::")
-			sb.WriteString(quoteIdent(enumTypeName(table.Name, c.Name)))
-		} else {
-			sb.WriteString(body)
-		}
+		// Bug 25 (v0.10.1): for enum-typed generated columns we
+		// emit as TEXT (above) and rely on a table-level CHECK
+		// constraint for the value-list enforcement — no cast here.
+		// For non-enum generated columns the body emits verbatim.
+		// (The v0.9.2 enum-cast wrapper that used to live here is
+		// gone because it triggered PG's "generation expression is
+		// not immutable" error: enum_in is STABLE not IMMUTABLE.)
+		sb.WriteString(body)
 		sb.WriteString(") STORED")
 	}
 	if !c.Nullable {
@@ -510,6 +551,19 @@ func emitTableDef(schema string, table *ir.Table, opts emitOpts) (string, error)
 			continue
 		}
 		parts = append(parts, emitSetCheckConstraint(table.Name, col.Name, set.Values))
+	}
+
+	// Bug 25: enum-typed STORED generated columns emit as TEXT (see
+	// emitColumnDef) and rely on a table-level CHECK to enforce the
+	// value list. Same shape as SET columns above. Non-generated
+	// enum columns keep using the native PG enum type and don't
+	// need this CHECK — the type itself constrains the values.
+	for _, col := range table.Columns {
+		enum, ok := col.Type.(ir.Enum)
+		if !ok || !col.IsGenerated() {
+			continue
+		}
+		parts = append(parts, emitGeneratedEnumCheckConstraint(table.Name, col.Name, enum.Values))
 	}
 
 	// User-declared CHECK constraints emit inline alongside the

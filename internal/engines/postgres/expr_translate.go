@@ -412,33 +412,45 @@ func rewriteBoolIdioms(expr string, ctx ExprContext) string {
 	return expr
 }
 
-// rewriteBoolToIntCoalesce wraps the bool-returning side of a
-// `COALESCE(<bool>, <int_lit>)` (or symmetric) call with `::int` so
-// PG sees `coalesce(int, int)` instead of `coalesce(bool, int)`.
-// Used for generated columns whose IR type is integer (e.g. a
-// MySQL `tinyint(1)` source column the operator widened to
-// `smallint` via --type-override; the body still references bool-
-// returning sub-expressions but the column is integer-typed). MySQL
-// accepts the bool/int mix via implicit coercion; PG's strict typing
-// rejects with an operator-resolution error. v0.9.1 / Bug 17 residual.
+// rewriteBoolToIntCoalesce wraps the non-literal side of a
+// `COALESCE(<expr>, <int_lit>)` (or symmetric) call with `::int` so
+// PG sees `coalesce(int, int)` instead of the type mismatch its
+// strict typing rejects. Used for generated columns whose IR type
+// is integer (e.g. a MySQL `tinyint(1)` source widened to `smallint`
+// via --type-override; the body still references bool-returning sub-
+// expressions but the column is integer-typed). MySQL accepts the
+// bool/int mix via implicit coercion; PG rejects with an operator-
+// resolution error.
 //
-// Bool-returning sub-expressions are recognised the same way
-// [isBoolReturning] handles them: bare bool-mapped column names,
-// comparisons (`=`, `!=`, `<>`), `IS [NOT] NULL`, and parenthesised
-// wrappers. Anything else falls through verbatim.
-func rewriteBoolToIntCoalesce(expr string, boolCols map[string]bool) string {
+// **Aggressive cast.** v0.9.1 / v0.9.2 gated the cast on a hand-
+// coded `isBoolReturning` detector that recognised bare bool idents,
+// comparisons, IS NULL/NOT NULL, keyword forms, and parenthesised
+// wrappers. Real-world v0.10.0 testing kept surfacing expression
+// shapes the detector missed (function calls returning bool, AND/OR
+// chains, NOT prefixes, etc.). v0.10.1 drops the detector and casts
+// the non-literal side unconditionally when the outer column is
+// integer-typed:
+//
+//   - bool-returning expression → cast helps (true→1, false→0).
+//   - already-integer expression → cast is a syntactic no-op.
+//   - non-numeric expression → cast fails at apply time, but the
+//     column was integer-typed so the body would have failed
+//     anyway. Loud-failure tenet preserved.
+//
+// The boolCols parameter is retained for symmetry with the rest of
+// the rewriteBoolIdioms surface but isn't consulted on this path —
+// the column-type signal is enough.
+func rewriteBoolToIntCoalesce(expr string, _ map[string]bool) string {
 	return rewriteFunctionCalls(expr, "COALESCE", func(args []string) string {
 		if len(args) != 2 {
 			return ""
 		}
 		left := strings.TrimSpace(args[0])
 		right := strings.TrimSpace(args[1])
-		leftBool := isBoolReturning(left, boolCols)
-		rightBool := isBoolReturning(right, boolCols)
 		switch {
-		case leftBool && isBoolIntLiteral(right):
+		case isBoolIntLiteral(right) && !isBoolIntLiteral(left):
 			return "COALESCE(" + boolToIntCast(left) + ", " + right + ")"
-		case rightBool && isBoolIntLiteral(left):
+		case isBoolIntLiteral(left) && !isBoolIntLiteral(right):
 			return "COALESCE(" + left + ", " + boolToIntCast(right) + ")"
 		}
 		return ""

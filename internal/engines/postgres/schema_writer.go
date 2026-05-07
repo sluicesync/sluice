@@ -55,11 +55,13 @@ func (w *SchemaWriter) CreateTablesWithoutConstraints(ctx context.Context, s *ir
 	// Phase 1a: enum types. We walk all columns and emit one
 	// CREATE TYPE per enum column. Two columns sharing values across
 	// tables get separate types — same naming convention as
-	// emitColumnDef expects.
+	// emitColumnDef expects. Generated enum columns are skipped:
+	// they emit as TEXT + table-level CHECK (Bug 25 fallback) so
+	// no enum type is needed.
 	for _, table := range orderedTables(s) {
 		for _, col := range table.Columns {
 			enum, ok := col.Type.(ir.Enum)
-			if !ok {
+			if !ok || col.IsGenerated() {
 				continue
 			}
 			stmt := emitCreateEnumType(w.schema, table.Name, col.Name, enum.Values)
@@ -226,10 +228,13 @@ func (w *SchemaWriter) PreviewDDL(_ context.Context, s *ir.Schema) ([]ir.DDLStat
 	opts := emitOpts{HasPostGIS: w.hasPostGIS}
 
 	// Phase 1a: enum types, in deterministic table+column order.
+	// Generated enum columns are skipped (Bug 25): they emit as TEXT
+	// + table-level CHECK in the CREATE TABLE body, so no enum type
+	// is needed.
 	for _, table := range orderedTables(s) {
 		for _, col := range table.Columns {
 			enum, ok := col.Type.(ir.Enum)
-			if !ok {
+			if !ok || col.IsGenerated() {
 				continue
 			}
 			out = append(out, ir.DDLStatement{

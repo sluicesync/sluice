@@ -363,14 +363,53 @@ func TestTranslateExprForPG_BoolToIntCoalesce(t *testing.T) {
 			want: "COALESCE((notes IS NULL)::int, 0)",
 		},
 		{
-			name: "coalesce of two non-bool args is untouched",
+			// v0.10.1: aggressive cast — even an already-int
+			// expression gets the (no-op) `::int` wrapper.
+			// Harmless syntactically; the cost is one extra `::int`
+			// token in the emitted DDL. (Pre-v0.10.1 behaviour was
+			// "leave alone if not bool"; the detector kept missing
+			// real-world bool shapes so we switched to "trust the
+			// column-type signal.")
+			name: "coalesce with already-int side gets a no-op cast",
 			in:   "COALESCE(qty, 0)",
-			want: "COALESCE(qty, 0)",
+			want: "COALESCE((qty)::int, 0)",
 		},
 		{
 			name: "ifnull renames and the bool side gets cast",
 			in:   "IFNULL(is_active, 0)",
 			want: "COALESCE((is_active)::int, 0)",
+		},
+
+		// ---- v0.10.1: aggressive cast — drop the bool-detector
+		// gate. When the outer column is integer-typed and a COALESCE
+		// has 0/1 on one side, cast the OTHER side regardless of
+		// detected shape. Catches the long tail of bool-returning
+		// expressions that v0.9.x detectors missed (function calls,
+		// AND/OR chains, NOT prefixes, etc.).
+		{
+			name: "function-call bool side gets cast",
+			in:   "COALESCE(json_valid(payload), 0)",
+			want: "COALESCE((json_valid(payload))::int, 0)",
+		},
+		{
+			name: "AND-chain bool side gets cast",
+			in:   "COALESCE(a > 0 AND b < 10, 0)",
+			want: "COALESCE((a > 0 AND b < 10)::int, 0)",
+		},
+		{
+			name: "NOT-prefix bool side gets cast",
+			in:   "COALESCE(NOT is_disabled, 1)",
+			want: "COALESCE((NOT is_disabled)::int, 1)",
+		},
+		{
+			name: "EXISTS subquery bool side gets cast",
+			in:   "COALESCE(EXISTS(SELECT 1 FROM peers WHERE peer_id = id), 0)",
+			want: "COALESCE((EXISTS(SELECT 1 FROM peers WHERE peer_id = id))::int, 0)",
+		},
+		{
+			name: "already-integer expression gets a no-op cast",
+			in:   "COALESCE(qty + 5, 0)",
+			want: "COALESCE((qty + 5)::int, 0)",
 		},
 
 		// ---- v0.9.2: hasTopLevelCompareOp expanded to cover
