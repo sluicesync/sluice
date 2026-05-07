@@ -6,6 +6,24 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.11.1] - 2026-05-07
+
+Continuation of the proactive-translator cycle started in v0.11.0. Eight more rewrites across the catalog's high- and medium-priority tiers, picked for "biggest leverage per LOC, fewest gotchas." All additive, no IR or interface changes, no operator-facing flags. Same loud-failure-on-unrecognized-shape policy as v0.11.0.
+
+### Added
+
+- **Translator catalog second batch (MySQL → PG).** Eight new rewrites across eight rule families:
+  - `RAND()` (argless) → `RANDOM()`. Direct rename. The seed form `RAND(seed)` has no single-call PG equivalent and falls through.
+  - `UUID()` (argless) → `gen_random_uuid()`. PG 13+ baseline assumed (matches sluice's existing baseline). The MySQL schema reader's UUID type-canonicalization path may already cover most real-world cases via the type mapping; this rule covers expression-level uses (CHECK constraints, text columns with UUID-shaped defaults, etc.).
+  - `ISNULL(x)` → `(x IS NULL)`. MySQL's function form returns int (1 or 0); PG's IS NULL operator returns boolean. For `COALESCE(ISNULL(x), 0)` patterns the existing v0.10.1 aggressive `::int` cast picks up the bool result automatically once this rewrite has fired. Standalone `ISNULL` in an integer-typed generated column body still needs `--expr-override`.
+  - `REGEXP_REPLACE(x, pat, repl)` (3-arg) → `REGEXP_REPLACE(x, pat, repl, 'g')`. PG defaults to first-match-only; MySQL defaults to all-match. Without the global flag, generated columns and CHECK constraints would silently produce different output. The 4-arg MySQL form (with position) has different semantics from PG's 4-arg form (with flags) and falls through verbatim. Regex-dialect divergence (ICU vs POSIX) is the operator's responsibility under the loud-failure tenet.
+  - `INSTR(s, sub)` → `STRPOS(s, sub)`. Same arg order, direct rename.
+  - `LOCATE(sub, s)` → `STRPOS(s, sub)`. **Argument order is FLIPPED** between the two functions (MySQL `LOCATE` takes needle-then-haystack; PG `STRPOS` takes haystack-then-needle). The arg-swap is load-bearing — getting it wrong silently searches the haystack inside the needle. The 3-arg form `LOCATE(sub, s, start)` has no clean single-call PG equivalent and falls through.
+  - `DATE_ADD(d, INTERVAL n unit)` / `DATE_SUB(d, INTERVAL n unit)` → `(d + INTERVAL 'n unit')` / `(d - INTERVAL 'n unit')`. Common in TTL / `expires_at` patterns. Singular MySQL units only — `MICROSECOND`, `SECOND`, `MINUTE`, `HOUR`, `DAY`, `WEEK`, `MONTH`, `YEAR`. Compound units (`HOUR_MINUTE`, `DAY_HOUR`, etc.), `QUARTER` (no PG equivalent), and non-literal counts fall through verbatim.
+  - `DATE_FORMAT(x, '<fmt>')` → `TO_CHAR(x, '<pg_fmt>')`. Format-string token mapping covers the common `%Y/%m/%d/%H/%i/%s` family and friends (24 token mappings total). Literal text in the format gets PG's `"..."` double-quote wrapping; punctuation passes through. **Strict mode**: any `%X` token outside the supported set causes the entire DATE_FORMAT call to fall through verbatim — silent partial translation would produce wrong output without raising an error. **Immutability caveat**: PG's `TO_CHAR` is `STABLE` not `IMMUTABLE`, blocking STORED generated columns; CHECK / DEFAULT / VIRTUAL bodies still benefit.
+
+  ADR-0016 cumulative-scope table extended with the new rows; v0.11.1 caveats section captures per-rule gotchas (PG version baseline for UUID, regex-dialect divergence, DATE_ADD compound-units, DATE_FORMAT immutability + strict-mode token policy, etc.).
+
 ## [0.11.0] - 2026-05-07
 
 Closes the v0.10.x reactive-bug cycle and opens the proactive-translator cycle. v0.10.x's bug bundle was driven by real-world testing surfacing translation gaps one at a time; v0.11.0 inverts the loop by mining sqlglot, pgloader, and dolt's function registry for the next batch of likely culprits and landing the highest-priority rewrites pre-emptively. CHARSET/COLLATION cross-engine diff finishes the schema-diff feature surface (the `--ignore-charset-collation` flag was plumbed but inert since v0.8.0). Two design docs capture the design space for the heavier roadmap items (mid-stream add-table, multi-source aggregation) so the implementation pass starts from a structured doc, not a blank page.

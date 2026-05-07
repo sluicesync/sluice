@@ -666,3 +666,415 @@ func TestTranslateExprForPG_V11Catalog(t *testing.T) {
 		})
 	}
 }
+
+// TestTranslateExprForPG_V11p1Catalog covers the v0.11.1 batch:
+// RAND, UUID, ISNULL, REGEXP_REPLACE, INSTR/LOCATE. All context-free.
+func TestTranslateExprForPG_V11p1Catalog(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		// ---- RAND() → RANDOM() ----
+		{
+			name: "RAND() argless to RANDOM()",
+			in:   "RAND()",
+			want: "RANDOM()",
+		},
+		{
+			name: "lowercase rand() also rewrites",
+			in:   "rand()",
+			want: "RANDOM()",
+		},
+		{
+			name: "RAND with seed arg falls through verbatim",
+			in:   "RAND(42)",
+			want: "RAND(42)",
+		},
+
+		// ---- UUID() → gen_random_uuid() ----
+		{
+			name: "UUID() to gen_random_uuid()",
+			in:   "UUID()",
+			want: "gen_random_uuid()",
+		},
+		{
+			name: "lowercase uuid() also rewrites",
+			in:   "uuid()",
+			want: "gen_random_uuid()",
+		},
+
+		// ---- ISNULL(x) → (x IS NULL) ----
+		{
+			name: "ISNULL of bare ident",
+			in:   "ISNULL(deleted_at)",
+			want: "(deleted_at IS NULL)",
+		},
+		{
+			name: "ISNULL of qualified column",
+			in:   "ISNULL(t.deleted_at)",
+			want: "(t.deleted_at IS NULL)",
+		},
+		{
+			name: "lowercase isnull",
+			in:   "isnull(name)",
+			want: "(name IS NULL)",
+		},
+		{
+			name: "ISNULL with extra args falls through",
+			in:   "ISNULL(a, b)",
+			want: "ISNULL(a, b)",
+		},
+
+		// ---- REGEXP_REPLACE 3-arg → 4-arg with 'g' flag ----
+		{
+			name: "REGEXP_REPLACE 3-arg adds 'g' flag",
+			in:   "REGEXP_REPLACE(name, '[0-9]+', '#')",
+			want: "REGEXP_REPLACE(name, '[0-9]+', '#', 'g')",
+		},
+		{
+			name: "REGEXP_REPLACE 4-arg falls through (different MySQL semantic)",
+			in:   "REGEXP_REPLACE(name, '[0-9]+', '#', 5)",
+			want: "REGEXP_REPLACE(name, '[0-9]+', '#', 5)",
+		},
+
+		// ---- INSTR(s, sub) → STRPOS(s, sub) (same arg order) ----
+		{
+			name: "INSTR renames to STRPOS",
+			in:   "INSTR(name, 'foo')",
+			want: "STRPOS(name, 'foo')",
+		},
+		{
+			name: "INSTR with 3 args falls through",
+			in:   "INSTR(s, 'sub', 5)",
+			want: "INSTR(s, 'sub', 5)",
+		},
+
+		// ---- LOCATE(sub, s) → STRPOS(s, sub) (arg-swap!) ----
+		{
+			name: "LOCATE swaps args to STRPOS form",
+			in:   "LOCATE('foo', name)",
+			want: "STRPOS(name, 'foo')",
+		},
+		{
+			name: "LOCATE 3-arg form (with start position) falls through",
+			in:   "LOCATE('foo', name, 5)",
+			want: "LOCATE('foo', name, 5)",
+		},
+		{
+			name: "LOCATE used in a CHECK comparison",
+			in:   "LOCATE('@', email) > 0",
+			want: "STRPOS(email, '@') > 0",
+		},
+
+		// ---- Composition cases ----
+		{
+			name: "ISNULL inside COALESCE composes via existing bool path (no ctx → no bool rewrite)",
+			in:   "COALESCE(ISNULL(x), 0)",
+			want: "COALESCE((x IS NULL), 0)",
+		},
+		{
+			name: "INSTR inside CHAR_LENGTH composes both rules",
+			in:   "CHAR_LENGTH(name) - INSTR(name, '_')",
+			want: "LENGTH(name) - STRPOS(name, '_')",
+		},
+
+		// ---- Passthrough / negative cases ----
+		{
+			name: "string literal containing rule names is untouched",
+			in:   "'RAND() and UUID() are random'",
+			want: "'RAND() and UUID() are random'",
+		},
+		{
+			name: "identifier prefixed by RAND is untouched",
+			in:   "RANDOMIZED(x)",
+			want: "RANDOMIZED(x)",
+		},
+		{
+			name: "identifier prefixed by UUID is untouched",
+			in:   "UUIDV5(ns, name)",
+			want: "UUIDV5(ns, name)",
+		},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			got := translateExprForPG(c.in, ExprContext{})
+			if got != c.want {
+				t.Errorf("translateExprForPG(%q) =\n  got  %q\n  want %q",
+					c.in, got, c.want)
+			}
+		})
+	}
+
+	// Cross-check: with int-context, COALESCE(ISNULL(x), 0) should
+	// pick up the v0.10.1 aggressive cast around the IS NULL bool.
+	t.Run("ISNULL inside COALESCE under int-context gets ::int cast", func(t *testing.T) {
+		intCtx := ExprContext{OuterColumnIsInteger: true}
+		got := translateExprForPG("COALESCE(ISNULL(x), 0)", intCtx)
+		want := "COALESCE((x IS NULL)::int, 0)"
+		if got != want {
+			t.Errorf("translateExprForPG(int-ctx) =\n  got  %q\n  want %q", got, want)
+		}
+	})
+}
+
+// TestTranslateExprForPG_DateAddSub covers the DATE_ADD / DATE_SUB
+// rewrites. The second arg is MySQL's `INTERVAL <n> <unit>` literal
+// grammar, not a normal expression — needs the parseMySQLInterval
+// helper.
+func TestTranslateExprForPG_DateAddSub(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		// ---- DATE_ADD basic shapes ----
+		{
+			name: "DATE_ADD with DAY",
+			in:   "DATE_ADD(created_at, INTERVAL 7 DAY)",
+			want: "(created_at + INTERVAL '7 day')",
+		},
+		{
+			name: "DATE_ADD with MONTH",
+			in:   "DATE_ADD(created_at, INTERVAL 1 MONTH)",
+			want: "(created_at + INTERVAL '1 month')",
+		},
+		{
+			name: "DATE_ADD with YEAR",
+			in:   "DATE_ADD(d, INTERVAL 5 YEAR)",
+			want: "(d + INTERVAL '5 year')",
+		},
+		{
+			name: "DATE_ADD with HOUR",
+			in:   "DATE_ADD(d, INTERVAL 12 HOUR)",
+			want: "(d + INTERVAL '12 hour')",
+		},
+		{
+			name: "DATE_ADD with WEEK",
+			in:   "DATE_ADD(d, INTERVAL 2 WEEK)",
+			want: "(d + INTERVAL '2 week')",
+		},
+		{
+			name: "lowercase date_add and unit",
+			in:   "date_add(d, interval 7 day)",
+			want: "(d + INTERVAL '7 day')",
+		},
+		{
+			name: "DATE_ADD with CURRENT_TIMESTAMP composes with NOW family rewrite",
+			in:   "DATE_ADD(NOW(), INTERVAL 1 DAY)",
+			want: "(CURRENT_TIMESTAMP + INTERVAL '1 day')",
+		},
+
+		// ---- DATE_SUB basic shapes ----
+		{
+			name: "DATE_SUB with DAY",
+			in:   "DATE_SUB(d, INTERVAL 1 DAY)",
+			want: "(d - INTERVAL '1 day')",
+		},
+		{
+			name: "DATE_SUB with MONTH",
+			in:   "DATE_SUB(created_at, INTERVAL 6 MONTH)",
+			want: "(created_at - INTERVAL '6 month')",
+		},
+
+		// ---- Fall-through cases ----
+		{
+			name: "DATE_ADD with QUARTER unit falls through (no PG INTERVAL 'n quarter')",
+			in:   "DATE_ADD(d, INTERVAL 1 QUARTER)",
+			want: "DATE_ADD(d, INTERVAL 1 QUARTER)",
+		},
+		{
+			name: "DATE_ADD with compound unit (HOUR_MINUTE) falls through",
+			in:   "DATE_ADD(d, INTERVAL '5 30' HOUR_MINUTE)",
+			want: "DATE_ADD(d, INTERVAL '5 30' HOUR_MINUTE)",
+		},
+		{
+			name: "DATE_ADD with non-literal count falls through",
+			in:   "DATE_ADD(d, INTERVAL n_days DAY)",
+			want: "DATE_ADD(d, INTERVAL n_days DAY)",
+		},
+		{
+			name: "DATE_ADD missing INTERVAL keyword falls through",
+			in:   "DATE_ADD(d, 7)",
+			want: "DATE_ADD(d, 7)",
+		},
+		{
+			name: "DATE_ADD with unrecognized unit falls through",
+			in:   "DATE_ADD(d, INTERVAL 1 FORTNIGHT)",
+			want: "DATE_ADD(d, INTERVAL 1 FORTNIGHT)",
+		},
+		{
+			name: "DATE_ADD with one arg falls through",
+			in:   "DATE_ADD(d)",
+			want: "DATE_ADD(d)",
+		},
+
+		// ---- Composition / nesting ----
+		{
+			name: "DATE_ADD nested inside CHAR_LENGTH-shaped expr",
+			in:   "DATE_ADD(d, INTERVAL 1 DAY) > NOW()",
+			want: "(d + INTERVAL '1 day') > CURRENT_TIMESTAMP",
+		},
+
+		// ---- Passthrough / negative ----
+		{
+			name: "DATE_ADD inside string literal is untouched",
+			in:   "'DATE_ADD(d, INTERVAL 1 DAY)'",
+			want: "'DATE_ADD(d, INTERVAL 1 DAY)'",
+		},
+		{
+			name: "identifier prefixed by DATE_ADD is untouched",
+			in:   "DATE_ADDED(x)",
+			want: "DATE_ADDED(x)",
+		},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			got := translateExprForPG(c.in, ExprContext{})
+			if got != c.want {
+				t.Errorf("translateExprForPG(%q) =\n  got  %q\n  want %q",
+					c.in, got, c.want)
+			}
+		})
+	}
+}
+
+// TestTranslateExprForPG_DateFormat covers DATE_FORMAT → TO_CHAR
+// rewrites with the format-string mapping table. The strict-mode
+// fall-through-on-unknown-token policy is the load-bearing safety
+// rule — silently emitting wrong output is much worse than the
+// operator getting a clear "function does not exist" error.
+func TestTranslateExprForPG_DateFormat(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		// ---- Common date/time format strings ----
+		{
+			name: "ISO date %Y-%m-%d",
+			in:   "DATE_FORMAT(created_at, '%Y-%m-%d')",
+			want: "TO_CHAR(created_at, 'YYYY-MM-DD')",
+		},
+		{
+			name: "ISO datetime %Y-%m-%d %H:%i:%s",
+			in:   "DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%s')",
+			want: "TO_CHAR(created_at, 'YYYY-MM-DD HH24:MI:SS')",
+		},
+		{
+			name: "Time only %H:%i:%s",
+			in:   "DATE_FORMAT(t, '%H:%i:%s')",
+			want: "TO_CHAR(t, 'HH24:MI:SS')",
+		},
+		{
+			name: "12-hour with AM/PM %h:%i %p",
+			in:   "DATE_FORMAT(t, '%h:%i %p')",
+			want: "TO_CHAR(t, 'HH12:MI AM')",
+		},
+		{
+			name: "Month name %M %d, %Y",
+			in:   "DATE_FORMAT(d, '%M %d, %Y')",
+			want: "TO_CHAR(d, 'Month DD, YYYY')",
+		},
+		{
+			name: "Day name %W, %M %d",
+			in:   "DATE_FORMAT(d, '%W, %M %d')",
+			want: "TO_CHAR(d, 'Day, Month DD')",
+		},
+		{
+			name: "Compound %T",
+			in:   "DATE_FORMAT(t, '%T')",
+			want: "TO_CHAR(t, 'HH24:MI:SS')",
+		},
+		{
+			name: "lowercase date_format",
+			in:   "date_format(d, '%Y-%m-%d')",
+			want: "TO_CHAR(d, 'YYYY-MM-DD')",
+		},
+
+		// ---- Literal-text wrapping ----
+		{
+			name: "year suffix _year wraps in double quotes",
+			in:   "DATE_FORMAT(d, '%Y_year')",
+			want: "TO_CHAR(d, 'YYYY_\"year\"')",
+		},
+		{
+			name: "literal Z timezone marker wraps",
+			in:   "DATE_FORMAT(d, '%Y-%m-%dT%H:%i:%sZ')",
+			want: "TO_CHAR(d, 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')",
+		},
+		{
+			name: "%% literal percent",
+			in:   "DATE_FORMAT(d, '%Y%%')",
+			want: "TO_CHAR(d, 'YYYY%')",
+		},
+
+		// ---- Fall-through cases ----
+		{
+			name: "unknown %D ordinal token falls through",
+			in:   "DATE_FORMAT(d, '%D %M %Y')",
+			want: "DATE_FORMAT(d, '%D %M %Y')",
+		},
+		{
+			name: "week-numbering %u token falls through",
+			in:   "DATE_FORMAT(d, '%Y week %u')",
+			want: "DATE_FORMAT(d, '%Y week %u')",
+		},
+		{
+			name: "dangling %% at end falls through",
+			in:   "DATE_FORMAT(d, '%Y-%m-%')",
+			want: "DATE_FORMAT(d, '%Y-%m-%')",
+		},
+		{
+			name: "non-literal format arg (column ref) falls through",
+			in:   "DATE_FORMAT(d, fmt_col)",
+			want: "DATE_FORMAT(d, fmt_col)",
+		},
+		{
+			name: "1-arg DATE_FORMAT falls through",
+			in:   "DATE_FORMAT(d)",
+			want: "DATE_FORMAT(d)",
+		},
+		{
+			name: "format with embedded single quote falls through",
+			in:   "DATE_FORMAT(d, 'It''s %Y')",
+			want: "DATE_FORMAT(d, 'It''s %Y')",
+		},
+
+		// ---- Composition ----
+		{
+			name: "DATE_FORMAT inside CONCAT composes",
+			in:   "CONCAT('day:', DATE_FORMAT(d, '%Y-%m-%d'))",
+			want: "('day:' || TO_CHAR(d, 'YYYY-MM-DD'))",
+		},
+		{
+			name: "DATE_FORMAT of NOW() composes with NOW family rewrite",
+			in:   "DATE_FORMAT(NOW(), '%Y-%m-%d')",
+			want: "TO_CHAR(CURRENT_TIMESTAMP, 'YYYY-MM-DD')",
+		},
+
+		// ---- Passthrough / negative ----
+		{
+			name: "DATE_FORMAT inside string literal is untouched",
+			in:   "'DATE_FORMAT(d, ...)'",
+			want: "'DATE_FORMAT(d, ...)'",
+		},
+		{
+			name: "identifier prefixed by DATE_FORMAT is untouched",
+			in:   "DATE_FORMATTED(x)",
+			want: "DATE_FORMATTED(x)",
+		},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			got := translateExprForPG(c.in, ExprContext{})
+			if got != c.want {
+				t.Errorf("translateExprForPG(%q) =\n  got  %q\n  want %q",
+					c.in, got, c.want)
+			}
+		})
+	}
+}

@@ -56,6 +56,22 @@
 //   - UCASE(x) → UPPER(x)
 //   - SUBSTR(x, …) / MID(x, …) → SUBSTRING(x, …)
 //
+// v0.11.1 added the second batch — smaller-but-frequent constructs
+// from the catalog's high-priority and medium-priority tiers:
+//
+//   - RAND() → RANDOM()                  (argless only; seed form passes through)
+//   - UUID() → gen_random_uuid()         (PG 13+ baseline assumed)
+//   - ISNULL(x) → (x IS NULL)            (function form; bool result)
+//   - REGEXP_REPLACE(x, p, r) → REGEXP_REPLACE(x, p, r, 'g')
+//                                        (PG defaults to first-match, MySQL to all-match)
+//   - INSTR(s, sub) → STRPOS(s, sub)
+//   - LOCATE(sub, s) → STRPOS(s, sub)    (arg-swap; 3-arg form passes through)
+//   - DATE_ADD(d, INTERVAL n unit) → (d + INTERVAL 'n unit')
+//   - DATE_SUB(d, INTERVAL n unit) → (d - INTERVAL 'n unit')
+//                                        (singular units only; compound units pass through)
+//   - DATE_FORMAT(x, '<fmt>') → TO_CHAR(x, '<pg_fmt>')
+//                                        (format-string token mapping; loud failure on unknown tokens)
+//
 // See ADR-0016 for the design rationale.
 
 package postgres
@@ -141,6 +157,20 @@ func translateExprForPG(expr string, ctx ExprContext) string {
 	expr = rewriteSUBSTR(expr)
 	expr = rewriteMID(expr)
 	expr = rewriteNOWFamily(expr)
+	// v0.11.1 catalog batch — small additive rules. ISNULL runs
+	// before the bool-idiom pass so `COALESCE(ISNULL(x), 0)` flows
+	// through as `COALESCE((x IS NULL), 0)` and the outer COALESCE
+	// rewrite picks up the bool-returning sub-expression. The other
+	// rules are commutative.
+	expr = rewriteINSTR(expr)
+	expr = rewriteLOCATE(expr)
+	expr = rewriteISNULL(expr)
+	expr = rewriteRAND(expr)
+	expr = rewriteREGEXPREPLACE(expr)
+	expr = rewriteUUID(expr)
+	expr = rewriteDATEADD(expr)
+	expr = rewriteDATESUB(expr)
+	expr = rewriteDATEFORMAT(expr)
 	// Bool-idiom rewrites run last: they need the canonical names
 	// (IFNULL → COALESCE has already happened) and they're gated on
 	// the caller-supplied BoolColumns set — empty means no rewrites.
@@ -972,4 +1002,403 @@ func rewriteMID(expr string) string {
 		}
 		return "SUBSTRING(" + strings.Join(trimmed, ", ") + ")"
 	})
+}
+
+// rewriteRAND renames MySQL's `RAND()` to PG's `RANDOM()`. Both are
+// VOLATILE so they can't appear in STORED generated columns on either
+// side, but they're common in DEFAULT expressions for token / random-
+// initial-value patterns. The 1-arg seed form (`RAND(seed)`) has no
+// single-call PG equivalent — PG's `setseed()` is a separate stateful
+// call — and falls through verbatim.
+func rewriteRAND(expr string) string {
+	return rewriteFunctionCalls(expr, "RAND", func(args []string) string {
+		if len(args) != 0 {
+			return ""
+		}
+		return "RANDOM()"
+	})
+}
+
+// rewriteUUID renames MySQL's `UUID()` to PG's built-in
+// `gen_random_uuid()`. Both are VOLATILE — DEFAULT-only, never
+// generated. PG 13+ has `gen_random_uuid()` in core; pre-13 needs
+// the `uuid-ossp` extension and a different name (`uuid_generate_v4()`).
+// sluice's PG baseline is modern enough that the rewrite assumes 13+;
+// if older PG support becomes a concern, gate on the same version
+// check sluice already runs for capability declaration.
+//
+// **Note on column-level vs. expression-level UUIDs.** sluice's MySQL
+// schema reader may already canonicalize a `CHAR(36)` column with
+// `DEFAULT (UUID())` into the IR's `UUID` type, in which case PG's
+// writer emits a `uuid` column with `DEFAULT gen_random_uuid()` via
+// the type-mapping path and this expression rewrite never sees the
+// `UUID()` call. The rule here covers cases where the type
+// canonicalization didn't fire (text columns with UUID-shaped
+// defaults, CHECK constraints referencing `UUID()`, etc.).
+func rewriteUUID(expr string) string {
+	return rewriteFunctionCalls(expr, "UUID", func(args []string) string {
+		if len(args) != 0 {
+			return ""
+		}
+		return "gen_random_uuid()"
+	})
+}
+
+// rewriteISNULL rewrites MySQL's `ISNULL(x)` function form to PG's
+// `(x IS NULL)` operator form. MySQL's function returns an integer
+// (1 or 0); PG's IS NULL operator returns boolean. For CHECK
+// constraints this is fine (PG promotes the bool implicitly); for
+// generated columns the outer-context determines whether the bool
+// result needs an integer cast — the existing v0.10.1 aggressive
+// `::int` cast on `COALESCE(<bool>, <int_lit>)` picks up
+// `COALESCE(ISNULL(x), 0)` automatically once this rewrite has fired.
+//
+// Standalone `ISNULL(x)` as the entire body of an integer-typed
+// generated column would need a `(x IS NULL)::int` cast that this
+// rule doesn't emit on its own; if that surfaces in real-world
+// testing, add a column-context-aware wrapper here. The
+// `--expr-override` (v0.10.0) escape hatch covers the case today.
+//
+// PG also has a non-standard `x ISNULL` operator form (alias for
+// `IS NULL`) but that's the operator, not a function call; this
+// rewrite only sees the function-call form.
+func rewriteISNULL(expr string) string {
+	return rewriteFunctionCalls(expr, "ISNULL", func(args []string) string {
+		if len(args) != 1 {
+			return ""
+		}
+		return "(" + strings.TrimSpace(args[0]) + " IS NULL)"
+	})
+}
+
+// rewriteREGEXPREPLACE adds the `'g'` global-replace flag to the
+// 3-arg form of `REGEXP_REPLACE` so PG's "replace first match by
+// default" matches MySQL's "replace all matches by default" semantics.
+// Without this flag, a generated column or CHECK using
+// `REGEXP_REPLACE(name, '[0-9]+', '#')` would replace only the first
+// digit-run on PG and silently produce different output from MySQL.
+//
+// The 4-arg MySQL form `REGEXP_REPLACE(x, pat, repl, pos)` takes a
+// position argument with different semantics from PG's 4-arg
+// `REGEXP_REPLACE(x, pat, repl, flags)` — falls through verbatim.
+//
+// **Regex-dialect caveat.** MySQL uses ICU regex; PG uses POSIX. A
+// meaningful subset of patterns work the same, but lookaheads /
+// lookbehinds / named captures don't translate. The rewrite handles
+// the global-flag arity difference; regex semantic divergence is the
+// operator's responsibility (loud-failure tenet at apply time, or
+// `--expr-override` for known-divergent patterns).
+func rewriteREGEXPREPLACE(expr string) string {
+	return rewriteFunctionCalls(expr, "REGEXP_REPLACE", func(args []string) string {
+		if len(args) != 3 {
+			return ""
+		}
+		trimmed := make([]string, len(args))
+		for i, a := range args {
+			trimmed[i] = strings.TrimSpace(a)
+		}
+		return "REGEXP_REPLACE(" + strings.Join(trimmed, ", ") + ", 'g')"
+	})
+}
+
+// rewriteINSTR renames MySQL's `INSTR(s, sub)` (haystack-then-needle)
+// to PG's `STRPOS(s, sub)`. Same argument order, direct rename. Both
+// return the 1-based byte position of the first occurrence, or 0 if
+// not found. 0/1-arg or 3+-arg forms fall through verbatim.
+func rewriteINSTR(expr string) string {
+	return rewriteFunctionCalls(expr, "INSTR", func(args []string) string {
+		if len(args) != 2 {
+			return ""
+		}
+		return "STRPOS(" + strings.TrimSpace(args[0]) + ", " + strings.TrimSpace(args[1]) + ")"
+	})
+}
+
+// rewriteLOCATE rewrites MySQL's `LOCATE(sub, s)` (needle-then-
+// haystack — argument order is FLIPPED from `INSTR`) to PG's
+// `STRPOS(s, sub)` (haystack-then-needle). The arg-swap is
+// load-bearing: getting the order wrong would silently search the
+// haystack inside the needle.
+//
+// The 3-arg form `LOCATE(sub, s, start)` (search starting at a given
+// 1-based position) has no clean single-call PG equivalent — would
+// need a `SUBSTRING(s FROM start) + STRPOS(...)` composition with a
+// position offset to map back to the original string. Falls through
+// verbatim under the loud-failure tenet; operator can use
+// `--expr-override` for the rare case.
+func rewriteLOCATE(expr string) string {
+	return rewriteFunctionCalls(expr, "LOCATE", func(args []string) string {
+		if len(args) != 2 {
+			return ""
+		}
+		return "STRPOS(" + strings.TrimSpace(args[1]) + ", " + strings.TrimSpace(args[0]) + ")"
+	})
+}
+
+// rewriteDATEADD rewrites MySQL's `DATE_ADD(d, INTERVAL n unit)` to
+// PG's operator form `(d + INTERVAL 'n unit')`. The second arg is
+// MySQL's interval literal grammar (`INTERVAL <expr> <unit>`), not a
+// normal expression — needs the [parseMySQLInterval] helper to
+// extract the count and unit, then re-emit as PG's quoted-interval
+// string form.
+//
+// Recognised units (singular MySQL keywords): MICROSECOND, SECOND,
+// MINUTE, HOUR, DAY, WEEK, MONTH, YEAR. PG accepts each of these as
+// the unit name in `INTERVAL 'n unit'`. **QUARTER falls through** —
+// PG doesn't accept `INTERVAL 'n quarter'`; an operator wanting that
+// can use `--expr-override` with `(d + INTERVAL '3 month' * n)` or
+// similar.
+//
+// **MySQL compound units** (`HOUR_MINUTE`, `DAY_HOUR`, etc.) take a
+// string-shaped count like `'5 1'`; the parse rejects them and the
+// call falls through verbatim. The operator's `--expr-override`
+// covers the rare cases.
+//
+// **Non-literal counts** (`DATE_ADD(d, INTERVAL n_days DAY)` where
+// n_days is a column) currently fall through too — PG's quoted-
+// interval form needs a literal-typed expression. Could be extended
+// to emit `(d + n_days * INTERVAL '1 day')` if real-world testing
+// surfaces the need.
+func rewriteDATEADD(expr string) string {
+	return rewriteFunctionCalls(expr, "DATE_ADD", func(args []string) string {
+		if len(args) != 2 {
+			return ""
+		}
+		count, unit, ok := parseMySQLInterval(args[1])
+		if !ok {
+			return ""
+		}
+		return "(" + strings.TrimSpace(args[0]) + " + INTERVAL '" + count + " " + unit + "')"
+	})
+}
+
+// rewriteDATESUB is the subtraction sibling of [rewriteDATEADD].
+// Same parsing rules; emits the `-` operator instead of `+`.
+func rewriteDATESUB(expr string) string {
+	return rewriteFunctionCalls(expr, "DATE_SUB", func(args []string) string {
+		if len(args) != 2 {
+			return ""
+		}
+		count, unit, ok := parseMySQLInterval(args[1])
+		if !ok {
+			return ""
+		}
+		return "(" + strings.TrimSpace(args[0]) + " - INTERVAL '" + count + " " + unit + "')"
+	})
+}
+
+// parseMySQLInterval parses MySQL's interval literal grammar
+// (`INTERVAL <int_lit> <unit_keyword>`) from the second argument of
+// DATE_ADD / DATE_SUB. Returns the count (digit string), unit
+// (lowercase singular PG-acceptable keyword), and ok=true on a
+// successful parse.
+//
+// Rejects (returns ok=false): missing INTERVAL keyword, non-integer
+// count, unrecognized unit, compound units, anything trailing.
+// Caller falls through verbatim.
+func parseMySQLInterval(arg string) (count, unit string, ok bool) {
+	s := strings.TrimSpace(arg)
+	const kw = "INTERVAL"
+	if len(s) < len(kw) || !strings.EqualFold(s[:len(kw)], kw) {
+		return "", "", false
+	}
+	// Must be followed by whitespace (not "INTERVALX").
+	if len(s) <= len(kw) || !isSpace(s[len(kw)]) {
+		return "", "", false
+	}
+	rest := strings.TrimSpace(s[len(kw):])
+	// Count: a run of digits.
+	i := 0
+	for i < len(rest) && rest[i] >= '0' && rest[i] <= '9' {
+		i++
+	}
+	if i == 0 {
+		return "", "", false
+	}
+	count = rest[:i]
+	// Whitespace separator.
+	if i >= len(rest) || !isSpace(rest[i]) {
+		return "", "", false
+	}
+	rest = strings.TrimSpace(rest[i:])
+	// Unit: a single keyword token, no underscores (compound units
+	// like HOUR_MINUTE rejected).
+	j := 0
+	for j < len(rest) {
+		c := rest[j]
+		if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') {
+			j++
+			continue
+		}
+		break
+	}
+	if j == 0 || j != len(rest) {
+		// Either no unit, or trailing junk after the unit (which
+		// includes underscore-separated compound units).
+		return "", "", false
+	}
+	unitLower := strings.ToLower(rest[:j])
+	switch unitLower {
+	case "microsecond", "second", "minute", "hour", "day", "week", "month", "year":
+		return count, unitLower, true
+	}
+	return "", "", false
+}
+
+// isSpace reports whether b is an ASCII whitespace byte. Limited to
+// the bytes that show up in IR-normalised expression text.
+func isSpace(b byte) bool {
+	return b == ' ' || b == '\t' || b == '\n' || b == '\r'
+}
+
+// rewriteDATEFORMAT rewrites MySQL's `DATE_FORMAT(x, '<fmt>')` to
+// PG's `TO_CHAR(x, '<pg_fmt>')`. The format-string translation is
+// the load-bearing tricky bit — MySQL uses C-style `%X` tokens
+// (`%Y`/`%m`/`%d`/`%H`/`%i`/`%s` etc.) while PG uses spelled-out
+// uppercase tokens (`YYYY`/`MM`/`DD`/`HH24`/`MI`/`SS`).
+//
+// **Strict mode.** Any `%X` token not in the supported set causes the
+// entire DATE_FORMAT call to fall through verbatim under the loud-
+// failure tenet. Silent partial translation would produce a format
+// string PG would render incorrectly without raising an error — much
+// worse than a clean apply-time rejection.
+//
+// **Literal text in the format string** is wrapped in double quotes
+// in the PG output (PG's TO_CHAR convention for literal characters
+// inside a format pattern). Punctuation and digits pass through
+// unquoted; runs of letters get a single `"..."` wrapper.
+//
+// **Single-quote in the format body** isn't supported — falls
+// through verbatim. Date format strings rarely contain quotes; the
+// rare case can use `--expr-override`.
+//
+// **PG immutability caveat.** PG's `TO_CHAR` is `STABLE`, not
+// `IMMUTABLE` (it depends on `lc_time` and other session GUCs), so
+// a STORED generated column using the rewritten output will fail
+// with "generation expression is not immutable". The rewrite makes
+// the cross-engine syntax valid; the immutability constraint is the
+// operator's call (use VIRTUAL on PG ≥18, an immutable wrapper
+// function, or `--expr-override` to drop the column).
+func rewriteDATEFORMAT(expr string) string {
+	return rewriteFunctionCalls(expr, "DATE_FORMAT", func(args []string) string {
+		if len(args) != 2 {
+			return ""
+		}
+		x := strings.TrimSpace(args[0])
+		fmtArg := strings.TrimSpace(args[1])
+		// Format must be a single-quoted string literal.
+		if len(fmtArg) < 2 || fmtArg[0] != '\'' || fmtArg[len(fmtArg)-1] != '\'' {
+			return ""
+		}
+		fmtBody := fmtArg[1 : len(fmtArg)-1]
+		// Reject embedded single quotes — would need escaping logic
+		// the rewriter doesn't carry.
+		if strings.Contains(fmtBody, "'") {
+			return ""
+		}
+		pgFmt, ok := translateMySQLDateFormat(fmtBody)
+		if !ok {
+			return ""
+		}
+		return "TO_CHAR(" + x + ", '" + pgFmt + "')"
+	})
+}
+
+// translateMySQLDateFormat maps a MySQL `DATE_FORMAT` format-string
+// body to its PG `TO_CHAR` equivalent. Returns ok=false if the
+// format contains a `%X` token outside [mysqlDateFormatTokens] or a
+// dangling `%` at the end.
+//
+// Letter runs in literal positions are wrapped in double quotes so
+// PG treats them as literal text rather than format patterns.
+// Digits and punctuation pass through unquoted.
+func translateMySQLDateFormat(format string) (pg string, ok bool) {
+	var sb strings.Builder
+	i := 0
+	for i < len(format) {
+		c := format[i]
+		if c == '%' {
+			if i+1 >= len(format) {
+				return "", false
+			}
+			tok, found := mysqlDateFormatTokens[format[i+1]]
+			if !found {
+				return "", false
+			}
+			sb.WriteString(tok)
+			i += 2
+			continue
+		}
+		if isAlpha(c) {
+			j := i + 1
+			for j < len(format) && isAlpha(format[j]) {
+				j++
+			}
+			sb.WriteByte('"')
+			sb.WriteString(format[i:j])
+			sb.WriteByte('"')
+			i = j
+			continue
+		}
+		sb.WriteByte(c)
+		i++
+	}
+	return sb.String(), true
+}
+
+// mysqlDateFormatTokens maps the MySQL `%X` format byte to its PG
+// `TO_CHAR` equivalent. Coverage targets the tokens that show up in
+// real-world DATE_FORMAT calls in DDL bodies (defaults, generated
+// columns, CHECK constraints):
+//
+//   - Year: `%Y` → YYYY (4-digit), `%y` → YY (2-digit).
+//   - Month: `%m` → MM (2-digit), `%c` → FMMM (no leading zero),
+//     `%M` → Month (full padded name), `%b` → Mon (3-char name).
+//   - Day-of-month: `%d` → DD (2-digit), `%e` → FMDD (no padding),
+//     `%j` → DDD (day-of-year).
+//   - Day name: `%W` → Day (full padded), `%a` → Dy (3-char).
+//   - Hour: `%H`/`%k` → HH24/FMHH24 (24-hour),
+//     `%h`/`%I`/`%l` → HH12/FMHH12 (12-hour).
+//   - Minute/second: `%i` → MI, `%s`/`%S` → SS.
+//   - AM/PM: `%p` → AM (PG handles both AM/PM via the same token).
+//   - Compound: `%T` → HH24:MI:SS, `%r` → HH12:MI:SS AM.
+//   - Literal `%`: `%%` → `%` (PG TO_CHAR has no special meaning for `%`).
+//
+// Tokens that don't fit cleanly (`%U`, `%u`, `%V`, `%v`, `%w`, `%X`,
+// `%x` for various week-numbering modes; `%D` for ordinal day suffix;
+// `%f` for microseconds with different formatting) are deliberately
+// omitted — the entire DATE_FORMAT call falls through verbatim if
+// any of them appears, preserving the loud-failure tenet rather than
+// producing silently-different output.
+var mysqlDateFormatTokens = map[byte]string{
+	'Y': "YYYY",
+	'y': "YY",
+	'm': "MM",
+	'c': "FMMM",
+	'M': "Month",
+	'b': "Mon",
+	'd': "DD",
+	'e': "FMDD",
+	'j': "DDD",
+	'W': "Day",
+	'a': "Dy",
+	'H': "HH24",
+	'k': "FMHH24",
+	'h': "HH12",
+	'I': "HH12",
+	'l': "FMHH12",
+	'i': "MI",
+	's': "SS",
+	'S': "SS",
+	'p': "AM",
+	'T': "HH24:MI:SS",
+	'r': "HH12:MI:SS AM",
+	'%': "%",
+}
+
+// isAlpha reports whether b is an ASCII letter. Used by
+// [translateMySQLDateFormat] to identify literal letter runs that
+// need double-quoting in PG TO_CHAR format strings.
+func isAlpha(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z')
 }

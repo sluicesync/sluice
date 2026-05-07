@@ -249,7 +249,7 @@ v0.10.0 covers generated-column bodies only. CHECK constraints, index expression
 
 ### Cumulative scope
 
-After v0.11.0 the writer-side translator covers:
+After v0.11.1 the writer-side translator covers:
 
 | Direction | Idiom | Rewrite |
 | --- | --- | --- |
@@ -272,6 +272,15 @@ After v0.11.0 the writer-side translator covers:
 | MySQL → PG | `LCASE(x)` | `LOWER(x)` |
 | MySQL → PG | `UCASE(x)` | `UPPER(x)` |
 | MySQL → PG | `SUBSTR(x, …)` / `MID(x, …)` (2-arg or 3-arg) | `SUBSTRING(x, …)` |
+| MySQL → PG | `RAND()` (argless) | `RANDOM()` |
+| MySQL → PG | `UUID()` (argless) | `gen_random_uuid()` |
+| MySQL → PG | `ISNULL(x)` (function form) | `(x IS NULL)` |
+| MySQL → PG | `REGEXP_REPLACE(x, p, r)` (3-arg) | `REGEXP_REPLACE(x, p, r, 'g')` |
+| MySQL → PG | `INSTR(s, sub)` | `STRPOS(s, sub)` |
+| MySQL → PG | `LOCATE(sub, s)` (2-arg) | `STRPOS(s, sub)` (arg-swap) |
+| MySQL → PG | `DATE_ADD(d, INTERVAL n unit)` | `(d + INTERVAL 'n unit')` (singular units only) |
+| MySQL → PG | `DATE_SUB(d, INTERVAL n unit)` | `(d - INTERVAL 'n unit')` (singular units only) |
+| MySQL → PG | `DATE_FORMAT(x, '<fmt>')` | `TO_CHAR(x, '<pg_fmt>')` (token-mapped; loud-fail on unknown token) |
 | PG → MySQL | unchanged | unchanged |
 
 The verbatim-passthrough policy still owns everything outside this set. See `docs/dev/translator-coverage.md` for the next batch of candidate rules sourced from sqlglot, pgloader, and dolt's function registry.
@@ -282,6 +291,16 @@ The verbatim-passthrough policy still owns everything outside this set. See `doc
 - **`NOW(precision)` form falls through verbatim.** PG's `CURRENT_TIMESTAMP` keyword does accept `(precision)` (e.g. `CURRENT_TIMESTAMP(6)`), but it has to be present at parse time — the bare keyword form doesn't. The argless form is the overwhelming majority of real-world use; the precision form falls through unchanged today and the loud-failure tenet kicks in if a target rejects it.
 - **`FROM_UNIXTIME(epoch, fmt)` two-arg form falls through.** The format-string side has no clean PG equivalent; documented in the catalog as out-of-scope.
 - **`CHAR_LENGTH` semantic match.** PG's `LENGTH(text)` returns characters (matching MySQL's `CHAR_LENGTH`); on `bytea` it returns bytes. The rewrite only fires when the source called `CHAR_LENGTH` / `CHARACTER_LENGTH`, so the column-context is implicit. The reverse direction (MySQL `LENGTH(x)` byte length → PG `OCTET_LENGTH(x)`) is not part of this batch — it requires column-type context to fire safely.
+
+### v0.11.1 batch caveats
+
+- **`UUID()` PG version baseline.** `gen_random_uuid()` is built into PG 13+. Pre-13 needs the `uuid-ossp` extension and a different name (`uuid_generate_v4()`). sluice's PG baseline is modern enough that the rewrite assumes 13+ unconditionally; if older PG support becomes a concern, gate on the same version check sluice already runs for capability declaration. Note: the MySQL schema reader may already canonicalize `CHAR(36)` columns with `DEFAULT (UUID())` into the IR's `UUID` type, in which case the type-mapping path emits `DEFAULT gen_random_uuid()` and this expression rewrite never sees the call.
+- **`ISNULL(x)` standalone in integer-typed generated columns.** The rewrite emits `(x IS NULL)` which returns boolean; PG's strict typing will reject it as a body for an integer-typed column without a cast. The aggressive `::int` cast (v0.10.1) only fires inside `COALESCE(..., <int_lit>)`, not on standalone bool-returning bodies. Real-world fix: `--expr-override` (v0.10.0). Could be extended to a column-context-aware standalone wrapper if it surfaces.
+- **`LOCATE` 3-arg form falls through.** PG's `STRPOS` doesn't accept a starting-position argument; the equivalent expression is a `SUBSTRING(s FROM start) + STRPOS(...)` composition with offset bookkeeping. Single-call rewrite would silently differ; falls through under the loud-failure tenet.
+- **`REGEXP_REPLACE` regex-dialect divergence.** MySQL uses ICU regex, PG uses POSIX. The rewrite handles the global-flag arity difference; pattern-syntax divergence (lookaheads, named captures, etc.) is the operator's responsibility — PG raises a clean error on unsupported syntax at apply time, or `--expr-override` for known-divergent patterns.
+- **`DATE_ADD` / `DATE_SUB` non-literal counts and compound units fall through.** The PG quoted-interval form needs a literal-typed expression; column-reference counts (`INTERVAL n_days DAY`) and MySQL's compound units (`HOUR_MINUTE`, `DAY_HOUR`, etc.) aren't covered. Could be extended to emit `(d + n_days * INTERVAL '1 day')` for the column-reference case if it surfaces. `QUARTER` also falls through (PG doesn't accept `INTERVAL '1 quarter'`).
+- **`DATE_FORMAT` immutability.** PG's `TO_CHAR` is `STABLE`, not `IMMUTABLE` (it depends on `lc_time` and other session GUCs), which blocks the rewrite output from STORED generated columns. The rewrite makes the cross-engine syntax valid; the immutability constraint is the operator's call (use VIRTUAL on PG ≥18, an immutable wrapper function, or `--expr-override`).
+- **`DATE_FORMAT` strict mode on unknown tokens.** Any `%X` token outside the supported set causes the entire DATE_FORMAT call to fall through verbatim — silent partial translation would produce a format string PG would render incorrectly without raising an error. The unsupported tokens (`%D` ordinal day suffix, `%U`/`%u`/`%V`/`%v`/`%w`/`%X`/`%x` for various week-numbering modes, `%f` microseconds with different formatting) get the loud-failure path.
 
 ## Updated in v0.10.1: aggressive int-context COALESCE cast
 
