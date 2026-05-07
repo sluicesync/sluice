@@ -6,6 +6,14 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.15.1] - 2026-05-08
+
+Single-bug patch from the v0.15.0 test cycle. v0.15.0's PG → PG sync-health source-side probe was non-functional — `lag_bytes` always reported "unavailable" and `--max-lag-bytes` thresholds never tripped on the very engine pair the feature was designed for.
+
+### Fixed
+
+- **Bug 32 — `sync health --max-lag-bytes` non-functional on PG → PG.** The lag-bytes calculation passed the persisted target Position's Token verbatim into `pg_wal_lsn_diff($1::pg_lsn, ...)`. PG positions are JSON envelopes (`{"slot":"...","lsn":"X/Y"}`), not bare LSN strings — PG rejected with `SQLSTATE 22P02`. The error landed in `source_probe_reason` (good loud-failure shape) but the headline alerting feature was unusable. The orchestrator was also reconstructing the target token from the truncated-for-display string rather than passing the full position through. Two-part fix: PG engine's `LagBytes` now extracts LSN transparently from either bare-LSN or JSON-envelope Token shapes via a new `extractPGLSN` helper; the orchestrator passes the full `StreamStatus.Position` through to `probeSource` instead of reconstructing it. 5 new regression tests cover bare LSN, JSON envelope, leading-whitespace tolerance, empty token, and malformed JSON. Surfaced by sluice-testing's v0.15.0 cycle.
+
 ## [0.15.0] - 2026-05-08
 
 Three roadmap items + a verify analysis pass land together. The user's morning brief asked me to pick "the next 3 items on the roadmap" and tackle them — these are the result.

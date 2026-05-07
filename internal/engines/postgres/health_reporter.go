@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/orware/sluice/internal/ir"
 )
@@ -41,17 +42,58 @@ func (r *SchemaReader) SourceCurrentPosition(ctx context.Context) (ir.Position, 
 //
 // Returns an error when either position's Token is malformed or
 // not parseable as a PG LSN.
+//
+// **Bug 32 fix (v0.15.1):** earlier versions passed `Position.Token`
+// verbatim into `pg_wal_lsn_diff`. That works when the Token is a
+// bare LSN string (the shape returned by `SourceCurrentPosition`),
+// but the persisted-state Token from `sluice_cdc_state` is a JSON
+// envelope `{"slot":"...","lsn":"X/Y"}` — passing the JSON verbatim
+// to `pg_wal_lsn_diff` errors with SQLSTATE 22P02. extractPGLSN now
+// transparently handles both shapes; the engine owns its position
+// format, the consumer doesn't have to.
 func (r *SchemaReader) LagBytes(ctx context.Context, earlier, later ir.Position) (int64, error) {
 	if r.db == nil {
 		return 0, errors.New("postgres: LagBytes: reader not opened")
 	}
-	if earlier.Token == "" || later.Token == "" {
-		return 0, errors.New("postgres: LagBytes: both positions must have non-empty Token")
+	earlierLSN, err := extractPGLSN(earlier)
+	if err != nil {
+		return 0, fmt.Errorf("postgres: LagBytes earlier-position: %w", err)
+	}
+	laterLSN, err := extractPGLSN(later)
+	if err != nil {
+		return 0, fmt.Errorf("postgres: LagBytes later-position: %w", err)
 	}
 	var diff int64
 	q := `SELECT pg_wal_lsn_diff($1::pg_lsn, $2::pg_lsn)::bigint`
-	if err := r.db.QueryRowContext(ctx, q, later.Token, earlier.Token).Scan(&diff); err != nil {
-		return 0, fmt.Errorf("postgres: LagBytes (later=%q earlier=%q): %w", later.Token, earlier.Token, err)
+	if err := r.db.QueryRowContext(ctx, q, laterLSN, earlierLSN).Scan(&diff); err != nil {
+		return 0, fmt.Errorf("postgres: LagBytes (later=%q earlier=%q): %w", laterLSN, earlierLSN, err)
 	}
 	return diff, nil
+}
+
+// extractPGLSN normalises an [ir.Position] into a bare LSN string
+// suitable for passing to `pg_wal_lsn_diff($1::pg_lsn, ...)`. Two
+// position-token shapes flow into here:
+//
+//  1. **Bare LSN** — what `SourceCurrentPosition` emits via
+//     `pg_current_wal_lsn()::text`. Pass through unchanged.
+//  2. **JSON envelope** — what the CDC reader emits via [encodePGPos]:
+//     `{"slot":"...","lsn":"X/Y"}`. The orchestrator's
+//     `sluice_cdc_state` row carries this shape. Parse the JSON and
+//     extract the `lsn` field.
+//
+// Either shape is a valid PG position; the caller doesn't have to
+// know which.
+func extractPGLSN(p ir.Position) (string, error) {
+	if p.Token == "" {
+		return "", errors.New("position has empty Token")
+	}
+	if strings.HasPrefix(strings.TrimSpace(p.Token), "{") {
+		decoded, _, err := decodePGPos(p)
+		if err != nil {
+			return "", fmt.Errorf("decode JSON-envelope position: %w", err)
+		}
+		return decoded.LSN, nil
+	}
+	return p.Token, nil
 }

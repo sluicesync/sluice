@@ -110,14 +110,26 @@ func (s *SyncHealthCmd) Run(_ *Globals) error {
 
 	result := evaluateHealth(streams, s.StreamID, s.MaxStaleSeconds, time.Now())
 
-	// Optional source-side probe (v0.15.0). Only fires when the
-	// operator supplied both --source-driver AND --source. Errors
-	// here populate SourceProbeReason but don't fail the run —
-	// operators running cron probes shouldn't have target-side
-	// monitoring break because the source-side connection is
+	// Optional source-side probe (v0.15.0, fixed in v0.15.1 / Bug 32).
+	// Only fires when the operator supplied both --source-driver AND
+	// --source. Errors here populate SourceProbeReason but don't fail
+	// the run — operators running cron probes shouldn't have target-
+	// side monitoring break because the source-side connection is
 	// transiently down.
 	if s.SourceDriver != "" && s.Source != "" {
-		probeSource(ctx, &result, s, target)
+		// Recover the FULL target Position from the streams slice
+		// (un-truncated) so engine-side LagBytes can parse the JSON
+		// envelope correctly. The displayed result.Position is
+		// truncated for readability and not safe to pass into the
+		// engine's lag-bytes computation.
+		var fullTargetPos ir.Position
+		for _, st := range streams {
+			if st.StreamID == s.StreamID {
+				fullTargetPos = st.Position
+				break
+			}
+		}
+		probeSource(ctx, &result, s, target, fullTargetPos)
 	}
 	result.LagThreshold = s.MaxLagBytes
 	if s.MaxLagBytes > 0 && result.LagBytesIsAvail && result.LagBytes > s.MaxLagBytes {
@@ -146,7 +158,15 @@ func (s *SyncHealthCmd) Run(_ *Globals) error {
 // the source-side fields on result. Errors are caught and surfaced
 // via SourceProbeReason rather than propagated; an unreachable
 // source shouldn't break a target-side health probe.
-func probeSource(ctx context.Context, result *HealthResult, cfg *SyncHealthCmd, target ir.Engine) {
+//
+// targetPos is the FULL un-truncated target Position from the
+// stream's ListStreams entry. v0.15.1 / Bug 32: passing
+// `result.Position` (the truncated-for-display string) into the
+// engine's LagBytes broke on PG because PG positions are JSON
+// envelopes, not bare LSNs. The engine now extracts LSN from
+// either shape — but only if it gets the full Token, not a
+// reconstructed-from-display string.
+func probeSource(ctx context.Context, result *HealthResult, cfg *SyncHealthCmd, target ir.Engine, targetPos ir.Position) {
 	source, err := resolveEngine(cfg.SourceDriver)
 	if err != nil {
 		result.SourceProbeReason = fmt.Sprintf("--source-driver: %v", err)
@@ -176,26 +196,13 @@ func probeSource(ctx context.Context, result *HealthResult, cfg *SyncHealthCmd, 
 	result.SourceProbeAvailable = true
 
 	// Byte-distance lag — only when source AND target both implement
-	// BytesLagReporter (today: PG only). The target-side check uses
-	// the result's existing position info from ListStreams; we need
-	// the FULL token (not truncated) for the diff query.
+	// BytesLagReporter (today: PG only).
 	srcLag, srcOK := sr.(ir.BytesLagReporter)
-	if !srcOK || !cfg.canComputeLagBytes(target) {
+	if !srcOK || !cfg.canComputeLagBytes(target) || targetPos.Token == "" {
 		result.LagBytes = -1
 		return
 	}
-	// Find the un-truncated target token from the streams response.
-	// We re-walk a bit; ListStreams already gave us the StreamStatus
-	// but evaluateHealth truncated it for display.
-	target1Pos := ir.Position{Engine: target.Name(), Token: cfg.unrenderedTargetPosition(result.Position)}
-	if target1Pos.Token == "" {
-		// Couldn't recover the full token — leave lag-bytes
-		// unavailable rather than computing against a truncated
-		// LSN string (which would error).
-		result.LagBytes = -1
-		return
-	}
-	lag, err := srcLag.LagBytes(ctx, target1Pos, pos)
+	lag, err := srcLag.LagBytes(ctx, targetPos, pos)
 	if err != nil {
 		result.SourceProbeReason = fmt.Sprintf("lag-bytes: %v", err)
 		result.LagBytes = -1
@@ -211,23 +218,6 @@ func probeSource(ctx context.Context, result *HealthResult, cfg *SyncHealthCmd, 
 // position-shape; future engine pairs may extend this.
 func (s *SyncHealthCmd) canComputeLagBytes(target ir.Engine) bool {
 	return target.Name() == "postgres" && s.SourceDriver == "postgres"
-}
-
-// unrenderedTargetPosition is a helper that returns the target's
-// stored position token. The result.Position field has been
-// truncated to 60 chars for display; for byte-distance lag we need
-// the full LSN. Returns "" if the displayed position string was
-// already at full length (no truncation marker), which is the
-// happy case — LSN strings are short enough not to truncate.
-func (s *SyncHealthCmd) unrenderedTargetPosition(displayedPosition string) string {
-	if strings.HasSuffix(displayedPosition, "…") {
-		// Truncation happened — we lost the suffix; can't recover
-		// without re-querying the applier. Return empty; caller
-		// surfaces "lag-bytes unavailable" via the standard fall-
-		// through.
-		return ""
-	}
-	return displayedPosition
 }
 
 // evaluateHealth filters the stream list to the requested ID and
