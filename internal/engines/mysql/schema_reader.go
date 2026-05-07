@@ -717,7 +717,12 @@ func translateDefault(def sql.NullString, extra string) ir.DefaultValue {
 		return ir.DefaultNone{}
 	}
 	if strings.Contains(strings.ToUpper(extra), "DEFAULT_GENERATED") {
-		return ir.DefaultExpression{Expr: def.String}
+		// Tag the dialect so a cross-engine writer (e.g. PG) routes the
+		// expression through its translator. Without the tag,
+		// MySQL-spelled defaults like `(UUID())`, `(RAND() * 100)`, or
+		// `(DATE_ADD(...))` would emit verbatim and fail loud on PG —
+		// see Bugs 28/29/30.
+		return ir.DefaultExpression{Expr: def.String, Dialect: "mysql"}
 	}
 	return ir.DefaultLiteral{Value: def.String}
 }

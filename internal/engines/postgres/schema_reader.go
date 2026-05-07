@@ -649,7 +649,7 @@ func translateDefault(d sql.NullString, autoIncrement bool) ir.DefaultValue {
 		return ir.DefaultLiteral{Value: s}
 	}
 
-	return ir.DefaultExpression{Expr: s}
+	return ir.DefaultExpression{Expr: s, Dialect: dialectName}
 }
 
 // stripTypeCast removes a trailing ::sometype that Postgres adds to

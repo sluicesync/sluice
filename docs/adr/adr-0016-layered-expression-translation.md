@@ -281,6 +281,8 @@ After v0.11.1 the writer-side translator covers:
 | MySQL → PG | `DATE_ADD(d, INTERVAL n unit)` | `(d + INTERVAL 'n unit')` (singular units only) |
 | MySQL → PG | `DATE_SUB(d, INTERVAL n unit)` | `(d - INTERVAL 'n unit')` (singular units only) |
 | MySQL → PG | `DATE_FORMAT(x, '<fmt>')` | `TO_CHAR(x, '<pg_fmt>')` (token-mapped; loud-fail on unknown token) |
+| MySQL → PG | operator-form `INTERVAL <int> <unit>` (unquoted) | `INTERVAL '<int> <unit>'` (PG-required quoted) |
+| MySQL → PG (DEFAULT-expression scope, v0.11.3+) | every rule above also fires on `DEFAULT (<expr>)` bodies, gated on `DefaultExpression.Dialect="mysql"` | same outputs as the generated/CHECK paths |
 | PG → MySQL | unchanged | unchanged |
 
 The verbatim-passthrough policy still owns everything outside this set. See `docs/dev/translator-coverage.md` for the next batch of candidate rules sourced from sqlglot, pgloader, and dolt's function registry.
@@ -301,6 +303,12 @@ The verbatim-passthrough policy still owns everything outside this set. See `doc
 - **`DATE_ADD` / `DATE_SUB` non-literal counts and compound units fall through.** The PG quoted-interval form needs a literal-typed expression; column-reference counts (`INTERVAL n_days DAY`) and MySQL's compound units (`HOUR_MINUTE`, `DAY_HOUR`, etc.) aren't covered. Could be extended to emit `(d + n_days * INTERVAL '1 day')` for the column-reference case if it surfaces. `QUARTER` also falls through (PG doesn't accept `INTERVAL '1 quarter'`).
 - **`DATE_FORMAT` immutability.** PG's `TO_CHAR` is `STABLE`, not `IMMUTABLE` (it depends on `lc_time` and other session GUCs), which blocks the rewrite output from STORED generated columns. The rewrite makes the cross-engine syntax valid; the immutability constraint is the operator's call (use VIRTUAL on PG ≥18, an immutable wrapper function, or `--expr-override`).
 - **`DATE_FORMAT` strict mode on unknown tokens.** Any `%X` token outside the supported set causes the entire DATE_FORMAT call to fall through verbatim — silent partial translation would produce a format string PG would render incorrectly without raising an error. The unsupported tokens (`%D` ordinal day suffix, `%U`/`%u`/`%V`/`%v`/`%w`/`%X`/`%x` for various week-numbering modes, `%f` microseconds with different formatting) get the loud-failure path.
+
+### v0.11.3 batch caveats (Bugs 28/29/30 from real-world testing)
+
+- **DEFAULT-expression translator gating (Bugs 28/29).** Pre-v0.11.3 the DEFAULT-expression emit path bypassed the translator — generated columns / CHECK constraints / index expressions all ran through it, but `DEFAULT (UUID())` / `DEFAULT (RAND() * 100)` / etc. emitted verbatim and failed loud on PG. Fix added a `Dialect` field to `ir.DefaultExpression` (mirrors `Column.GeneratedExprDialect` and `CheckConstraint.ExprDialect`) plus a `translateDefaultExpr` helper in the PG writer. MySQL schema reader now sets `Dialect="mysql"` on `DefaultExpression` values; PG schema reader sets `Dialect="postgres"`. The writer routes through `translateExprForPG` only when the dialect doesn't match, so same-engine migrations are no-ops and PG-source defaults emit verbatim.
+- **DEFAULT-expression context is empty.** The `ExprContext` passed to the translator on this path is the zero value — bool-idiom rewrites stay no-ops because DEFAULT expressions are evaluated per-row at INSERT time, not over other column values. If a real-world bug surfaces a DEFAULT that needs bool-context awareness, the fix is the same shape as the generated/CHECK path (build the context from the table; pass through).
+- **INTERVAL operator-form rewrite (Bug 30).** MySQL's `information_schema.generation_expression` canonicalizes `DATE_ADD(d, INTERVAL N UNIT)` to the operator form `(d + interval N unit)` when read back. The function-call rewrite (`rewriteDATEADD`/`rewriteDATESUB`) never fires on the canonicalized form because the function call is gone. New `rewriteIntervalLiteral` operates on the operator form directly: any top-level `INTERVAL <int> <unit>` token sequence becomes `INTERVAL '<int> <unit>'` (PG's required quoted-magnitude syntax). Same supported singular-unit set as `parseMySQLInterval` — MICROSECOND through YEAR; QUARTER, compound units (`HOUR_MINUTE` etc.), and non-literal magnitudes pass through.
 
 ## Updated in v0.10.1: aggressive int-context COALESCE cast
 

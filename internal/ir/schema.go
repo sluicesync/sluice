@@ -134,8 +134,16 @@ type DefaultLiteral struct {
 
 // DefaultExpression is a DEFAULT clause expressed as a SQL expression
 // such as CURRENT_TIMESTAMP or nextval('seq').
+//
+// Dialect tags the source engine the Expr text was read from so that
+// cross-engine writers can route the expression through their dialect
+// translator (see ADR-0016). Mirrors the same pattern as
+// [Column.GeneratedExprDialect] and [CheckConstraint.ExprDialect].
+// Empty when the expression text is dialect-neutral or matches the
+// writer's dialect (the verbatim-passthrough path).
 type DefaultExpression struct {
-	Expr string
+	Expr    string
+	Dialect string
 }
 
 func (DefaultNone) isDefaultValue()       {}

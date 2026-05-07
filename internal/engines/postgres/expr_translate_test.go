@@ -1081,3 +1081,108 @@ func TestTranslateExprForPG_DateFormat(t *testing.T) {
 		})
 	}
 }
+
+// TestTranslateExprForPG_IntervalOperatorForm covers the v0.11.3 fix
+// for Bug 30: MySQL's information_schema canonicalizes
+// `DATE_ADD(d, INTERVAL N DAY)` to `(d + interval N day)`. The
+// function-call rewrite never sees the function call because it's
+// gone; the operator-form rewrite handles the resulting INTERVAL
+// literal directly.
+func TestTranslateExprForPG_IntervalOperatorForm(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		// ---- The Bug 30 trigger shape ----
+		{
+			name: "MySQL canonicalized DATE_ADD operator form",
+			in:   "(event_at + interval 7 day)",
+			want: "(event_at + INTERVAL '7 day')",
+		},
+		{
+			name: "DATE_SUB operator form",
+			in:   "(event_at - interval 1 month)",
+			want: "(event_at - INTERVAL '1 month')",
+		},
+		{
+			name: "uppercase INTERVAL keyword",
+			in:   "(d + INTERVAL 5 YEAR)",
+			want: "(d + INTERVAL '5 year')",
+		},
+		{
+			name: "all supported singular units rewrite",
+			in:   "interval 1 microsecond, interval 1 second, interval 1 minute, interval 1 hour, interval 1 day, interval 1 week, interval 1 month, interval 1 year",
+			want: "INTERVAL '1 microsecond', INTERVAL '1 second', INTERVAL '1 minute', INTERVAL '1 hour', INTERVAL '1 day', INTERVAL '1 week', INTERVAL '1 month', INTERVAL '1 year'",
+		},
+		{
+			name: "multi-digit magnitude",
+			in:   "(d + interval 365 day)",
+			want: "(d + INTERVAL '365 day')",
+		},
+
+		// ---- Composes with existing rules ----
+		{
+			name: "DATE_ADD function form rewrites first; result has no operator-form to translate",
+			in:   "DATE_ADD(d, INTERVAL 7 DAY)",
+			want: "(d + INTERVAL '7 day')",
+		},
+		{
+			name: "operator form composes with NOW family",
+			in:   "(NOW() + interval 1 day)",
+			want: "(CURRENT_TIMESTAMP + INTERVAL '1 day')",
+		},
+
+		// ---- Fall-through cases ----
+		{
+			name: "compound HOUR_MINUTE unit falls through verbatim",
+			in:   "(d + interval '5 30' HOUR_MINUTE)",
+			want: "(d + interval '5 30' HOUR_MINUTE)",
+		},
+		{
+			name: "QUARTER unit falls through (no PG equivalent)",
+			in:   "(d + interval 1 quarter)",
+			want: "(d + interval 1 quarter)",
+		},
+		{
+			name: "non-literal magnitude falls through",
+			in:   "(d + interval n_days day)",
+			want: "(d + interval n_days day)",
+		},
+		{
+			name: "unrecognised unit falls through",
+			in:   "(d + interval 1 fortnight)",
+			want: "(d + interval 1 fortnight)",
+		},
+		{
+			name: "INTERVAL inside string literal is untouched",
+			in:   "'try interval 7 day in here'",
+			want: "'try interval 7 day in here'",
+		},
+		{
+			name: "identifier prefixed by INTERVAL is untouched",
+			in:   "INTERVALS(x)",
+			want: "INTERVALS(x)",
+		},
+		{
+			name: "identifier suffixed by INTERVAL is untouched",
+			in:   "MY_INTERVAL",
+			want: "MY_INTERVAL",
+		},
+		{
+			name: "INTERVAL not followed by magnitude+unit falls through",
+			in:   "INTERVAL DAY",
+			want: "INTERVAL DAY",
+		},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			got := translateExprForPG(c.in, ExprContext{})
+			if got != c.want {
+				t.Errorf("translateExprForPG(%q) =\n  got  %q\n  want %q",
+					c.in, got, c.want)
+			}
+		})
+	}
+}

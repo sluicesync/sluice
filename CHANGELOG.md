@@ -6,6 +6,30 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.11.3] - 2026-05-07
+
+Three-bug patch from the v0.11.2 real-world test cycle (see sluice-testing's `session-reports/v0.11.2.md`). All three bugs were in v0.11.x's translator emission paths — places where the catalog work was supposed to cover but a code path bypassed the translator or matched the wrong syntactic form.
+
+### Fixed
+
+- **Bug 28 — `DEFAULT (UUID())` now translates to `DEFAULT gen_random_uuid()` on cross-engine MySQL→PG migrate.** Pre-fix the DEFAULT-expression emit path bypassed the translator entirely (generated columns / CHECK constraints / index expressions all ran through it; only DEFAULTs didn't). Cross-engine migrates against schemas with `DEFAULT (UUID())`, `DEFAULT (RAND() * 100)`, or `DEFAULT (DATE_ADD(...))` failed loud on PG with `function uuid() does not exist` / `function rand() does not exist` / etc. Operator workaround was `--expr-override` (v0.10.0); the translator now handles it without intervention.
+
+- **Bug 29 — `DEFAULT (RAND() * 100)` now translates to `DEFAULT (RANDOM() * 100)`.** Same root cause as Bug 28; same fix. Both bugs surfaced in the same test cycle because they're the same code path.
+
+- **Bug 30 — `DATE_ADD(d, INTERVAL N DAY)` in a generated column now translates to PG's `(d + INTERVAL 'N day')` quoted-magnitude form.** MySQL's `information_schema.generation_expression` canonicalizes `DATE_ADD(...)` to the operator form `(d + interval N day)` when read back — the function-call rewrite added in v0.11.1 never fired on the canonicalized text because the function call was gone. Pre-fix the unquoted operator form emitted verbatim and failed loud with `syntax error at or near "7"`.
+
+### Implementation notes
+
+- New `Dialect` field on `ir.DefaultExpression` mirrors the existing `Column.GeneratedExprDialect` / `CheckConstraint.ExprDialect` fields. MySQL schema reader sets `Dialect="mysql"`; PG schema reader sets `Dialect="postgres"`. PG writer's `emitDefault` now routes `DefaultExpression` through `translateDefaultExpr` (same dialect-gating shape as `translateGeneratedExpr` / `translateCheckExpr`). The `ExprContext` passed on the DEFAULT path is the zero value — bool-idiom rewrites are no-ops here because DEFAULT expressions are evaluated per-row at INSERT time, not over other column values.
+- New `rewriteIntervalLiteral` operates on the operator-form `INTERVAL <int> <unit>` directly (vs. the function-form `DATE_ADD(...)` rewrite from v0.11.1). Same supported singular-unit set: MICROSECOND, SECOND, MINUTE, HOUR, DAY, WEEK, MONTH, YEAR. QUARTER, compound units (`HOUR_MINUTE` etc.), and non-literal magnitudes pass through under the loud-failure tenet.
+- ADR-0016's cumulative-scope table extended with the new operator-form INTERVAL row and a DEFAULT-expression-scope row noting the gate. v0.11.3 caveats section documents the per-rule reasoning.
+
+### Compatibility
+
+- **No CLI-breaking changes.** Same flags, same defaults.
+- **IR change**: `ir.DefaultExpression` gained a `Dialect string` field. Existing callers constructing `ir.DefaultExpression{Expr: ...}` with named fields continue to compile (zero value = "" = "verbatim" — same as pre-fix behaviour for that single field). Positional struct literals (rare; not present in the codebase) would need `, ""` appended.
+- **Behaviour change for cross-engine MySQL→PG migrate.** The three bug repros in sluice-testing now translate cleanly. Operators using `--expr-override` to work around these specific defaults can drop those overrides.
+
 ## [0.11.2] - 2026-05-07
 
 Single-bug patch from CI integration. v0.11.0's CHARSET/COLLATION cross-engine diff regressed `TestDiff_PostgresToMySQL` — three subtests started failing because the diff began surfacing bogus drift on every PG→MySQL retargeted column (UUID/Inet/Macaddr/Array). The Integration job has been red on every push since v0.11.0; the failure was visible in CI but not gated on (Integration is one of the required checks but the existing PR-merge flow had been bypassing it for tag-driven release commits).

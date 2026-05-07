@@ -259,7 +259,38 @@ func TestEmitDefault(t *testing.T) {
 		{"literal zero", ir.DefaultLiteral{Value: "0"}, "'0'", true},
 		{"literal text", ir.DefaultLiteral{Value: "hello"}, "'hello'", true},
 		{"literal with quote", ir.DefaultLiteral{Value: "it's"}, "'it''s'", true},
-		{"expression", ir.DefaultExpression{Expr: "now()"}, "now()", true},
+		{"expression no dialect", ir.DefaultExpression{Expr: "now()"}, "now()", true},
+		// v0.11.3 — DEFAULT-expression dialect-gated translation.
+		// Bugs 28/29/30: pre-fix the DEFAULT path bypassed the
+		// translator entirely. Post-fix, MySQL-tagged defaults route
+		// through the same MySQL→PG rewrites as generated columns and
+		// CHECK constraints. PG-tagged or untagged defaults still
+		// emit verbatim.
+		{
+			"expression mysql dialect: UUID() translates",
+			ir.DefaultExpression{Expr: "UUID()", Dialect: "mysql"},
+			"gen_random_uuid()", true,
+		},
+		{
+			"expression mysql dialect: RAND() translates",
+			ir.DefaultExpression{Expr: "RAND()", Dialect: "mysql"},
+			"RANDOM()", true,
+		},
+		{
+			"expression mysql dialect: NOW() translates to keyword",
+			ir.DefaultExpression{Expr: "NOW()", Dialect: "mysql"},
+			"CURRENT_TIMESTAMP", true,
+		},
+		{
+			"expression postgres dialect emits verbatim",
+			ir.DefaultExpression{Expr: "now()", Dialect: "postgres"},
+			"now()", true,
+		},
+		{
+			"expression mysql dialect with unrecognised function passes through verbatim",
+			ir.DefaultExpression{Expr: "WEIRD_FN()", Dialect: "mysql"},
+			"WEIRD_FN()", true,
+		},
 	}
 	for _, c := range cases {
 		c := c

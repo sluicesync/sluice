@@ -192,6 +192,15 @@ func quoteSQLString(s string) string {
 
 // emitDefault renders a DEFAULT clause body for the given default
 // value. Returns ("", false) if no DEFAULT clause should be emitted.
+//
+// For [ir.DefaultExpression] with a non-empty Dialect tag that doesn't
+// match this writer's dialect, the expression body is routed through
+// [translateExprForPG] so cross-engine MySQL-spelled defaults (e.g.
+// `(UUID())`, `(RAND() * 100)`, `DATE_ADD(...)`) translate to PG
+// equivalents instead of failing loud on the target. v0.11.3 fix for
+// Bugs 28/29/30; pre-fix the DEFAULT path was the only IR-expression
+// path that bypassed the translator (generated + CHECK + index already
+// routed through it).
 func emitDefault(d ir.DefaultValue) (string, bool) {
 	switch v := d.(type) {
 	case nil, ir.DefaultNone:
@@ -199,9 +208,26 @@ func emitDefault(d ir.DefaultValue) (string, bool) {
 	case ir.DefaultLiteral:
 		return quoteSQLString(v.Value), true
 	case ir.DefaultExpression:
-		return v.Expr, true
+		return translateDefaultExpr(v), true
 	}
 	return "", false
+}
+
+// translateDefaultExpr returns the DEFAULT-expression body to emit,
+// applying the cross-dialect translation pass when the IR's Dialect
+// tag indicates a different source dialect. Same gating shape as
+// [translateGeneratedExpr] and [translateCheckExpr]; an empty / matching
+// dialect tag emits verbatim — same behaviour as before v0.11.3.
+//
+// The DEFAULT-expression context doesn't carry table-level bool-column
+// information (defaults are evaluated per-row at INSERT time, not over
+// other column values), so the [ExprContext] passed to the translator
+// is the zero value — bool-idiom rewrites stay no-ops on this path.
+func translateDefaultExpr(d ir.DefaultExpression) string {
+	if d.Dialect == "" || d.Dialect == dialectName {
+		return d.Expr
+	}
+	return translateExprForPG(d.Expr, ExprContext{})
 }
 
 // setDefaultToArrayLiteral converts a MySQL-style comma-separated

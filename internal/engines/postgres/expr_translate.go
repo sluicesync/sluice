@@ -174,6 +174,16 @@ func translateExprForPG(expr string, ctx ExprContext) string {
 	expr = rewriteDATEADD(expr)
 	expr = rewriteDATESUB(expr)
 	expr = rewriteDATEFORMAT(expr)
+	// v0.11.3 — operator-form INTERVAL rewrite. MySQL canonicalizes
+	// `DATE_ADD(d, INTERVAL N UNIT)` to the operator form
+	// `(d + interval N unit)` when a generated-column body is read
+	// back via information_schema.generation_expression. The
+	// DATE_ADD rule above never fires on that text because the
+	// function call is gone. This rewrite operates on the operator
+	// form directly: any `INTERVAL <int> <unit>` token sequence at
+	// top level becomes `INTERVAL '<int> <unit>'` with the magnitude
+	// quoted (PG's required syntax). See Bug 30.
+	expr = rewriteIntervalLiteral(expr)
 	// Bool-idiom rewrites run last: they need the canonical names
 	// (IFNULL → COALESCE has already happened) and they're gated on
 	// the caller-supplied BoolColumns set — empty means no rewrites.
@@ -1404,4 +1414,113 @@ var mysqlDateFormatTokens = map[byte]string{
 // need double-quoting in PG TO_CHAR format strings.
 func isAlpha(b byte) bool {
 	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z')
+}
+
+// rewriteIntervalLiteral rewrites MySQL's operator-form interval
+// literal — `INTERVAL <int> <unit>` (unquoted magnitude/unit) — to
+// PG's required quoted-magnitude form `INTERVAL '<int> <unit>'`.
+//
+// **Why this rule exists.** MySQL's `information_schema` canonicalizes
+// `DATE_ADD(d, INTERVAL 7 DAY)` to the operator form `(d + interval
+// 7 day)` when a generated-column body is read back. The function-call
+// rewrite (rewriteDATEADD / rewriteDATESUB) never fires on that text
+// because the function call is gone. This rule operates on the
+// operator form directly so the generated-column body translates
+// correctly. Bug 30, surfaced by v0.11.2 real-world testing.
+//
+// Recognised units (singular, lowercased on output): microsecond,
+// second, minute, hour, day, week, month, year. Same set as
+// [parseMySQLInterval] for symmetry. Compound units (HOUR_MINUTE,
+// DAY_HOUR, etc.), QUARTER (no PG equivalent), and non-literal
+// magnitudes pass through verbatim under the loud-failure tenet.
+//
+// Non-greedy: the rewrite walks the expression once, skipping inside
+// string literals via [scanStringLiteral]. Multiple `INTERVAL ...`
+// occurrences in one expression all rewrite independently.
+func rewriteIntervalLiteral(expr string) string {
+	const kw = "INTERVAL"
+	var sb strings.Builder
+	i := 0
+	for i < len(expr) {
+		// Skip and copy through string literals verbatim.
+		if expr[i] == '\'' {
+			end := scanStringLiteral(expr, i)
+			sb.WriteString(expr[i:end])
+			i = end
+			continue
+		}
+		// Try to match INTERVAL at position i (case-insensitive,
+		// requires word boundary on the left).
+		if i+len(kw) > len(expr) || !strings.EqualFold(expr[i:i+len(kw)], kw) {
+			sb.WriteByte(expr[i])
+			i++
+			continue
+		}
+		if i > 0 && isIdentifierByte(expr[i-1]) {
+			sb.WriteByte(expr[i])
+			i++
+			continue
+		}
+		// Word boundary on the right (non-identifier byte must follow).
+		afterKw := i + len(kw)
+		if afterKw >= len(expr) || isIdentifierByte(expr[afterKw]) {
+			sb.WriteByte(expr[i])
+			i++
+			continue
+		}
+		// Skip whitespace between INTERVAL and the magnitude.
+		j := afterKw
+		for j < len(expr) && isSpace(expr[j]) {
+			j++
+		}
+		// Magnitude: a run of digits.
+		magStart := j
+		for j < len(expr) && expr[j] >= '0' && expr[j] <= '9' {
+			j++
+		}
+		if j == magStart {
+			// No magnitude — pass through verbatim.
+			sb.WriteByte(expr[i])
+			i++
+			continue
+		}
+		magnitude := expr[magStart:j]
+		// Whitespace separator before the unit.
+		if j >= len(expr) || !isSpace(expr[j]) {
+			sb.WriteByte(expr[i])
+			i++
+			continue
+		}
+		for j < len(expr) && isSpace(expr[j]) {
+			j++
+		}
+		// Unit: a run of letters.
+		unitStart := j
+		for j < len(expr) && isAlpha(expr[j]) {
+			j++
+		}
+		if j == unitStart {
+			sb.WriteByte(expr[i])
+			i++
+			continue
+		}
+		unit := strings.ToLower(expr[unitStart:j])
+		switch unit {
+		case "microsecond", "second", "minute", "hour", "day", "week", "month", "year":
+			// Recognised — emit the quoted form.
+			sb.WriteString("INTERVAL '")
+			sb.WriteString(magnitude)
+			sb.WriteByte(' ')
+			sb.WriteString(unit)
+			sb.WriteString("'")
+			i = j
+			continue
+		}
+		// Unrecognised unit (compound forms, QUARTER, etc.) — pass
+		// through verbatim, advancing past the INTERVAL keyword only
+		// so the rest of the expression keeps walking.
+		sb.WriteByte(expr[i])
+		i++
+	}
+	return sb.String()
 }

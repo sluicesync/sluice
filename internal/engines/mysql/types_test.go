@@ -322,13 +322,13 @@ func TestTranslateDefault(t *testing.T) {
 			"expression CURRENT_TIMESTAMP",
 			sql.NullString{String: "CURRENT_TIMESTAMP", Valid: true},
 			"DEFAULT_GENERATED",
-			ir.DefaultExpression{Expr: "CURRENT_TIMESTAMP"},
+			ir.DefaultExpression{Expr: "CURRENT_TIMESTAMP", Dialect: "mysql"},
 		},
 		{
 			"expression mixed-case extra token",
 			sql.NullString{String: "now()", Valid: true},
 			"default_generated on update current_timestamp",
-			ir.DefaultExpression{Expr: "now()"},
+			ir.DefaultExpression{Expr: "now()", Dialect: "mysql"},
 		},
 	}
 	for _, c := range cases {

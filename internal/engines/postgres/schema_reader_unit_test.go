@@ -104,13 +104,13 @@ func TestTranslateDefault(t *testing.T) {
 			"current_timestamp with parameterised cast",
 			sql.NullString{Valid: true, String: "CURRENT_TIMESTAMP::timestamp(0) without time zone"},
 			false,
-			ir.DefaultExpression{Expr: "CURRENT_TIMESTAMP"},
+			ir.DefaultExpression{Expr: "CURRENT_TIMESTAMP", Dialect: "postgres"},
 		},
 		{
 			"function expression",
 			sql.NullString{Valid: true, String: "now()"},
 			false,
-			ir.DefaultExpression{Expr: "now()"},
+			ir.DefaultExpression{Expr: "now()", Dialect: "postgres"},
 		},
 	}
 	for _, c := range cases {
