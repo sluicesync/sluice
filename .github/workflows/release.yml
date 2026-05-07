@@ -28,7 +28,7 @@ jobs:
   goreleaser:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           # GoReleaser uses git history for the changelog. fetch-depth: 0
           # tells the checkout action to clone the full history, not just
@@ -45,7 +45,7 @@ jobs:
       # .goreleaser.yaml. GITHUB_TOKEN is automatically provided by
       # GitHub Actions and has permission (per the `permissions` block
       # above) to create releases on this repo.
-      - uses: goreleaser/goreleaser-action@v6
+      - uses: goreleaser/goreleaser-action@v7
         with:
           version: latest
           args: release --clean
