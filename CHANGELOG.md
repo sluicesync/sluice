@@ -6,6 +6,15 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.10.4] - 2026-05-06
+
+CI workflow cost optimization. No sluice runtime change; no IR or interface change. Tagged separately so the workflow shift has a versioned anchor and the corresponding `branch-protection.md` doc update has a clear "applies as of" reference.
+
+### Changed
+
+- **CI matrix is conditional on trigger.** The `test` and `build` jobs ran on `[ubuntu-latest, macos-latest, windows-latest]` for every push and PR. macOS-latest costs ~10× Linux per-minute and Windows ~1.7× Linux; on a frequent-push cadence those two platforms drove the bulk of the daily Actions bill. New shape: push to main / pull_request runs Linux-only; push of a `v*` tag or a manual `workflow_dispatch` from the GitHub UI's "Run workflow" button runs the full 3-OS matrix. Implementation uses a single workflow file with `fromJSON()`-conditional matrix selected at workflow-parse time. Operators wanting cross-platform verification before merging a sensitive PR can dispatch the workflow manually.
+- **Branch-protection required-checks list trimmed.** `docs/dev/branch-protection.md` updated to drop `Test (macos-latest)` / `Test (windows-latest)` / `Build (macos-latest)` / `Build (windows-latest)` from the required set — they no longer run on PRs and would otherwise permanently block merges. Operators with existing branch protection per the older doc need to remove those four checks before further PR merges.
+
 ## [0.10.3] - 2026-05-06
 
 Single-bug patch from PostGIS testing. Bug 27 (VStream POINT mis-parse) defers to a later release because it needs VStream test infrastructure.
