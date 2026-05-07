@@ -19,15 +19,15 @@ Navigate to **Settings → Branches → Add rule** (or **Branch protection rules
 - **Require branches to be up to date before merging:** on
 - Required status checks (these are the GitHub Actions job names from `.github/workflows/ci.yml`):
   - `Test (ubuntu-latest)`
-  - `Test (macos-latest)`
-  - `Test (windows-latest)`
   - `Integration`
   - `Lint`
   - `Build (ubuntu-latest)`
-  - `Build (macos-latest)`
-  - `Build (windows-latest)`
 
 GitHub will only suggest these in the search box once they've successfully run at least once on a PR. If they don't appear, push a no-op PR first to trigger CI, then add them.
+
+> **Note (v0.10.4 cost optimization):** macOS and Windows test/build jobs no longer run on every push/PR — they run only on tag pushes (release verification) and manual `workflow_dispatch` from the GitHub UI. **Do NOT** add `Test (macos-latest)` / `Test (windows-latest)` / `Build (macos-latest)` / `Build (windows-latest)` to the required-checks list — they will never run on PRs and merging would be permanently blocked. If you previously configured branch protection per the older shape of this doc, remove those four checks from the required list before pushing further changes.
+
+If you want a "platform check" gate before merging a particular PR (e.g. a PR that touches OS-specific code paths), trigger the full matrix manually: GitHub Actions tab → CI workflow → "Run workflow" → pick the PR's branch → click. The full 3-OS matrix runs and surfaces under the workflow's runs list. The PR's own status checks won't include the dispatched run, but the operator can verify success before merging.
 
 ### Other
 
@@ -57,13 +57,9 @@ gh api -X PUT repos/orware/sluice/branches/main/protection \
     "strict": true,
     "contexts": [
       "Test (ubuntu-latest)",
-      "Test (macos-latest)",
-      "Test (windows-latest)",
       "Integration",
       "Lint",
-      "Build (ubuntu-latest)",
-      "Build (macos-latest)",
-      "Build (windows-latest)"
+      "Build (ubuntu-latest)"
     ]
   },
   "enforce_admins": true,

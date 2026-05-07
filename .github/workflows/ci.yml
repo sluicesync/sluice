@@ -2,24 +2,40 @@
 #
 # Runs on every push to main and every pull request targeting main.
 # Four jobs run in parallel:
-#   - test:        cross-platform matrix (Linux, macOS, Windows) running unit tests
+#   - test:        unit tests (Linux on push/PR; full 3-OS matrix on tag push or manual dispatch)
 #   - integration: testcontainers-backed end-to-end tests on Linux only
 #   - lint:        golangci-lint on a single runner (it's not OS-specific)
-#   - build:       smoke-test that ./cmd/sluice still compiles on every platform
+#   - build:       smoke-test that ./cmd/sluice still compiles (Linux on push/PR; full matrix on tag/dispatch)
+#
+# Cost-shape (v0.10.4): macOS runners cost ~10× Linux per minute and
+# Windows runners cost ~1.7× Linux. The 3-OS matrix used to run on every
+# push/PR — most of those don't need cross-platform coverage. Now the
+# matrix runs only on (a) tag pushes (release verification) and (b)
+# manual workflow_dispatch (operator explicitly wants the full check).
+# Routine push/PR cycles run Linux-only, which is the deployment target
+# audience anyway.
+#
+# To trigger the full matrix manually from the GitHub UI: Actions tab →
+# CI workflow → "Run workflow" button → pick branch → click. The
+# workflow runs with the full 3-OS matrix on the chosen branch.
 #
 # A failed job blocks merges if branch protection is enabled (see
 # docs/dev/branch-protection.md for setup).
 
 name: CI
 
-# Triggers. Every push to main runs CI; every PR targeting main runs CI
-# with the merge-result tree (so the reviewer sees the result of merging
-# the PR, not just the branch).
+# Triggers:
+#   - push to main: routine post-merge verification (Linux-only matrix)
+#   - pull_request to main: PR review check (Linux-only matrix)
+#   - push of tags v*: release verification (full 3-OS matrix)
+#   - workflow_dispatch: manual on-demand run from GitHub UI (full 3-OS matrix)
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
     branches: [main]
+  workflow_dispatch: {}
 
 # Default token permissions — least-privilege. Workflows that need to
 # write must opt in explicitly. CI here is read-only.
@@ -44,17 +60,23 @@ defaults:
 
 jobs:
   # ----- Test -----
-  # Runs `go test` with the race detector across all three operating
-  # systems. The matrix runs each combination as an independent job in
-  # parallel; fail-fast: false means all combinations finish even if one
-  # fails (so we see the full picture of which platforms broke).
+  # Runs `go test` with the race detector. The matrix shape depends on
+  # the trigger:
+  #   - tag push (v*) or workflow_dispatch: full 3-OS matrix for release
+  #     verification or operator-explicit cross-platform check.
+  #   - push to main / pull_request: Linux-only for routine verification.
+  # The conditional matrix is built via fromJSON because GitHub Actions
+  # matrix expressions can't directly reference event context — the
+  # JSON literal is selected at workflow-parse time then expanded.
+  # fail-fast: false means all combinations finish even if one fails
+  # (so we see the full picture of which platforms broke).
   test:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: ${{ fromJSON((github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')) && '["ubuntu-latest","macos-latest","windows-latest"]' || '["ubuntu-latest"]') }}
     steps:
       # Checkout the code into the runner's working directory.
       - uses: actions/checkout@v4
@@ -177,14 +199,15 @@ jobs:
   # A separate build smoke-test confirms `./cmd/sluice` compiles on every
   # platform — useful because pure unit tests don't always exercise the
   # main package. Cheap and gives a clear signal when a Windows-only or
-  # macOS-only build break sneaks in.
+  # macOS-only build break sneaks in. Same conditional matrix as the
+  # test job: full 3-OS on tag/dispatch, Linux-only on push/PR.
   build:
     name: Build (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: ${{ fromJSON((github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')) && '["ubuntu-latest","macos-latest","windows-latest"]' || '["ubuntu-latest"]') }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v6
