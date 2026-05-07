@@ -136,7 +136,7 @@ jobs:
   integration:
     name: Integration
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-go@v6
@@ -156,10 +156,20 @@ jobs:
       # Run every package's integration tests. -count=1 disables the
       # test cache so we always exercise real containers (cached results
       # would defeat the point). -race catches data-race bugs in the
-      # reader/writer code paths under realistic concurrency. Containers
-      # take ~30s each to boot; the matrix-engine pipeline test boots
-      # two, so 20 minutes of headroom is generous but cheap.
-      - run: go test -tags=integration -race -count=1 ./internal/...
+      # reader/writer code paths under realistic concurrency.
+      #
+      # -timeout=18m bumps the per-package timeout from Go's 10-minute
+      # default. v0.11.2 testing surfaced two false-failure timeouts
+      # where internal/engines/mysql and internal/pipeline both hit the
+      # 10-minute panic with one of their tests just 13–32s in — the
+      # WHOLE PACKAGE had accumulated the budget across ~30 testcontainer
+      # boots × ~30s each + per-test work × -race overhead. The actual
+      # tests work fine; they just need more headroom on the CI runner.
+      # 18m per package × ~3 substantive packages ≈ ~50 min worst case;
+      # the job's 30-minute timeout-minutes (bumped from 20) caps the
+      # outer envelope, but in practice the parallel-package execution
+      # under `go test ./...` keeps us well under both.
+      - run: go test -tags=integration -race -count=1 -timeout=18m ./internal/...
 
   # ----- Lint -----
   # golangci-lint runs many static analyzers in a single pass. We use the
