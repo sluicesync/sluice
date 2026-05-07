@@ -91,6 +91,13 @@ type BackupStore interface {
 	// non-existent path returns nil. Used by Phase 2+ retention
 	// pruning; Phase 1 backups don't auto-prune.
 	Delete(ctx context.Context, path string) error
+
+	// Exists reports whether a blob is present at path. Phase 2's
+	// resumable backup writer uses this to decide whether to skip
+	// re-uploading a chunk on restart. A "not present" result is
+	// (false, nil) — callers reserve the error return for transport
+	// or auth failures, not for a missing key.
+	Exists(ctx context.Context, path string) (bool, error)
 }
 
 // Manifest is the serialised public contract of a backup. Lives at

@@ -130,6 +130,44 @@ func TestLocalStore_RejectsPathTraversal(t *testing.T) {
 	}
 }
 
+func TestLocalStore_Exists(t *testing.T) {
+	dir := t.TempDir()
+	s, _ := NewLocalStore(dir)
+
+	// Absent path.
+	exists, err := s.Exists(context.Background(), "absent.txt")
+	if err != nil {
+		t.Fatalf("Exists(absent): %v", err)
+	}
+	if exists {
+		t.Errorf("Exists(absent) = true; want false")
+	}
+
+	// After Put.
+	if err := s.Put(context.Background(), "present.txt", bytes.NewReader([]byte("x"))); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	exists, err = s.Exists(context.Background(), "present.txt")
+	if err != nil {
+		t.Fatalf("Exists(present): %v", err)
+	}
+	if !exists {
+		t.Errorf("Exists(present) = false; want true")
+	}
+
+	// A directory is not a "blob" — Exists returns false.
+	if err := os.MkdirAll(filepath.Join(dir, "somedir"), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	exists, err = s.Exists(context.Background(), "somedir")
+	if err != nil {
+		t.Fatalf("Exists(dir): %v", err)
+	}
+	if exists {
+		t.Errorf("Exists(dir) = true; want false (directories are not blobs)")
+	}
+}
+
 func TestLocalStore_GetMissing(t *testing.T) {
 	dir := t.TempDir()
 	s, _ := NewLocalStore(dir)

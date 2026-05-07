@@ -170,6 +170,30 @@ func (s *LocalStore) List(ctx context.Context, prefix string) ([]string, error) 
 	return out, nil
 }
 
+// Exists implements [ir.BackupStore.Exists]. Reports whether a regular
+// file is present at path within the store root. Used by the resumable
+// backup writer to skip re-uploading already-completed chunks.
+func (s *LocalStore) Exists(ctx context.Context, path string) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	abs, err := s.absPath(path)
+	if err != nil {
+		return false, err
+	}
+	info, err := os.Stat(abs)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return false, nil
+		}
+		return false, fmt.Errorf("local store: stat %q: %w", path, err)
+	}
+	if info.IsDir() {
+		return false, nil
+	}
+	return true, nil
+}
+
 // Delete implements [ir.BackupStore.Delete]. Idempotent — a missing
 // path returns nil rather than an error.
 func (s *LocalStore) Delete(ctx context.Context, path string) error {
