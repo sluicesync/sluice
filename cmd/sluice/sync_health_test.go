@@ -119,6 +119,83 @@ func TestRenderHealth_JSON(t *testing.T) {
 	}
 }
 
+// TestRenderHealth_SourceProbeFields covers the v0.15.0 source-side
+// addition: when the source probe ran, the rendered text/json
+// includes source_position; when it didn't, source_probe shows the
+// reason.
+func TestRenderHealth_SourceProbeFields(t *testing.T) {
+	t.Run("source probe available with lag bytes", func(t *testing.T) {
+		r := HealthResult{
+			StreamID: "myapp", Found: true,
+			Position: "0/1A2B3C4D", UpdatedAt: "2026-05-08T12:00:00Z",
+			SecondsSinceLastApply: 5,
+			SourcePosition:        "0/1A2B3F12",
+			SourceProbeAvailable:  true,
+			LagBytes:              973, LagBytesIsAvail: true,
+		}
+		var buf bytes.Buffer
+		if err := renderHealth(&buf, r, "text"); err != nil {
+			t.Fatalf("renderHealth: %v", err)
+		}
+		out := buf.String()
+		for _, want := range []string{
+			"source_position: 0/1A2B3F12",
+			"lag_bytes: 973",
+		} {
+			if !strings.Contains(out, want) {
+				t.Errorf("expected %q; got:\n%s", want, out)
+			}
+		}
+	})
+	t.Run("source probe skipped with reason", func(t *testing.T) {
+		r := HealthResult{
+			StreamID: "myapp", Found: true,
+			Position:              "x",
+			SecondsSinceLastApply: 5,
+			SourceProbeReason:     "open source schema reader: connection refused",
+		}
+		var buf bytes.Buffer
+		if err := renderHealth(&buf, r, "text"); err != nil {
+			t.Fatalf("renderHealth: %v", err)
+		}
+		if !strings.Contains(buf.String(), "source_probe: skipped (open source schema reader: connection refused)") {
+			t.Errorf("expected skipped reason; got:\n%s", buf.String())
+		}
+	})
+	t.Run("source probe available but lag-bytes unavailable", func(t *testing.T) {
+		r := HealthResult{
+			StreamID: "myapp", Found: true,
+			Position: "abc", SecondsSinceLastApply: 1,
+			SourcePosition: "def", SourceProbeAvailable: true,
+			LagBytesIsAvail: false,
+		}
+		var buf bytes.Buffer
+		if err := renderHealth(&buf, r, "text"); err != nil {
+			t.Fatalf("renderHealth: %v", err)
+		}
+		if !strings.Contains(buf.String(), "lag_bytes: unavailable") {
+			t.Errorf("expected lag_bytes-unavailable line; got:\n%s", buf.String())
+		}
+	})
+}
+
+// TestRenderHealth_LagBytesStaleState pins the new STALE state when
+// lag-bytes exceeds the threshold (vs the existing time-based STALE).
+func TestRenderHealth_LagBytesStaleState(t *testing.T) {
+	r := HealthResult{
+		StreamID: "myapp", Found: true,
+		Position: "x", SecondsSinceLastApply: 0,
+		LagBytes: 5000000, LagBytesIsAvail: true, LagBytesStale: true, LagThreshold: 1000000,
+	}
+	var buf bytes.Buffer
+	if err := renderHealth(&buf, r, "text"); err != nil {
+		t.Fatalf("renderHealth: %v", err)
+	}
+	if !strings.Contains(buf.String(), "STALE (lag 5000000 bytes, threshold 1000000)") {
+		t.Errorf("expected lag-bytes STALE state; got:\n%s", buf.String())
+	}
+}
+
 func TestRenderHealth_NotFound(t *testing.T) {
 	r := HealthResult{StreamID: "myapp-prod"}
 	var buf bytes.Buffer

@@ -4,6 +4,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,29 +15,31 @@ import (
 )
 
 // SyncHealthCmd implements `sluice sync health` (proto-ADR
-// docs/dev/design-sync-health-monitoring.md, MVP slice).
+// docs/dev/design-sync-health-monitoring.md).
 //
-// Reads the target's sluice_cdc_state for the supplied --stream-id,
-// computes wall-clock seconds-since-last-apply, compares against
-// operator-supplied thresholds, returns structured exit code:
+// v0.13.0 (probe MVP): reads the target's sluice_cdc_state for the
+// supplied --stream-id, computes wall-clock seconds-since-last-apply.
 //
+// v0.15.0 (Phase 2 source-side position comparison): when optional
+// --source-driver + --source flags are supplied, also probes the
+// source's current position and surfaces the source/target tokens
+// + a byte-distance lag metric (PG only — MySQL GTID sets aren't
+// byte-distance comparable).
+//
+// Exit codes:
 //   - 0 healthy.
 //   - 1 stale (a threshold was breached).
 //   - 2 operational error (couldn't connect, stream not found, etc.).
-//
-// v0.13.0 MVP exposes only target-side state — what the existing
-// ListStreams surface already carries (UpdatedAt + Position). Source-
-// side position comparison + true lag-events / lag-seconds metrics
-// follow in a subsequent release with the new ir.HealthReporter
-// interface; today's MVP closes the cron-friendly "is the target
-// still ticking?" probe gap, which is the load-bearing operator
-// concern (Fivetran-stops-silently shape).
 type SyncHealthCmd struct {
 	TargetDriver string `help:"Target engine name (e.g. mysql, postgres). See 'sluice engines'." required:"" placeholder:"NAME" group:"target"`
 	Target       string `help:"Target database DSN." required:"" env:"SLUICE_TARGET" placeholder:"DSN" group:"target"`
 	StreamID     string `help:"Stream identifier to probe. Required — point at the stream you want to monitor." required:"" placeholder:"ID"`
 
-	MaxStaleSeconds int `help:"Threshold: exit 1 if target's last apply was more than N seconds ago. 0 disables the check (informational only)." default:"0" placeholder:"N"`
+	SourceDriver string `help:"Source engine name (optional). When set together with --source, the probe also reads the source's current position and reports source/target tokens plus byte-distance lag (PG only). Without these, the probe stays target-side only — same as v0.13.0 / v0.14.x behavior." placeholder:"NAME" group:"source"`
+	Source       string `help:"Source database DSN (optional). See --source-driver." env:"SLUICE_SOURCE" placeholder:"DSN" group:"source"`
+
+	MaxStaleSeconds int   `help:"Threshold: exit 1 if target's last apply was more than N seconds ago. 0 disables the check (informational only)." default:"0" placeholder:"N"`
+	MaxLagBytes     int64 `help:"Threshold (PG-only, requires --source): exit 1 if source LSN is more than N bytes ahead of target. 0 disables. MySQL leaves this informational; GTID sets aren't byte-distance comparable." default:"0" placeholder:"N"`
 
 	Format string `help:"Output format: 'text' (default) or 'json' (machine-readable for alertmanager / scripting pipes)." default:"text" enum:"text,json" placeholder:"FORMAT"`
 	Output string `help:"Write to FILE instead of stdout. Atomic." short:"o" placeholder:"FILE"`
@@ -53,6 +56,23 @@ type HealthResult struct {
 	SecondsSinceLastApply int64  `json:"seconds_since_last_apply,omitempty"`
 	Threshold             int    `json:"max_stale_seconds_threshold,omitempty"`
 	Stale                 bool   `json:"stale"`
+
+	// Source-side fields (populated only when --source-driver +
+	// --source were supplied). The orchestrator opens a SchemaReader
+	// against the source, type-asserts to ir.HealthReporter, calls
+	// SourceCurrentPosition(); engines without HealthReporter cause
+	// a "source-probe-not-supported" reason to land in SourceProbeReason.
+	SourcePosition       string `json:"source_position,omitempty"`
+	SourceProbeAvailable bool   `json:"source_probe_available"`
+	SourceProbeReason    string `json:"source_probe_reason,omitempty"`
+
+	// LagBytes is populated only when both source and target sides
+	// implement ir.BytesLagReporter (PG only as of v0.15.0). MySQL
+	// leaves this -1 (sentinel for "not available on this engine").
+	LagBytes        int64 `json:"lag_bytes,omitempty"`
+	LagBytesIsAvail bool  `json:"lag_bytes_available"`
+	LagThreshold    int64 `json:"max_lag_bytes_threshold,omitempty"`
+	LagBytesStale   bool  `json:"lag_bytes_stale,omitempty"`
 }
 
 // Run implements `sluice sync health`. Same boilerplate shape as
@@ -89,6 +109,21 @@ func (s *SyncHealthCmd) Run(_ *Globals) error {
 	}
 
 	result := evaluateHealth(streams, s.StreamID, s.MaxStaleSeconds, time.Now())
+
+	// Optional source-side probe (v0.15.0). Only fires when the
+	// operator supplied both --source-driver AND --source. Errors
+	// here populate SourceProbeReason but don't fail the run —
+	// operators running cron probes shouldn't have target-side
+	// monitoring break because the source-side connection is
+	// transiently down.
+	if s.SourceDriver != "" && s.Source != "" {
+		probeSource(ctx, &result, s, target)
+	}
+	result.LagThreshold = s.MaxLagBytes
+	if s.MaxLagBytes > 0 && result.LagBytesIsAvail && result.LagBytes > s.MaxLagBytes {
+		result.LagBytesStale = true
+	}
+
 	if err := renderHealth(writer, result, s.Format); err != nil {
 		runErr = err
 		return operationalError{err: err}
@@ -97,10 +132,102 @@ func (s *SyncHealthCmd) Run(_ *Globals) error {
 	if !result.Found {
 		return operationalError{err: fmt.Errorf("stream %q not found on target", s.StreamID)}
 	}
-	if result.Stale {
+	switch {
+	case result.Stale:
 		return staleStreamError{streamID: s.StreamID, secondsAgo: result.SecondsSinceLastApply, threshold: s.MaxStaleSeconds}
+	case result.LagBytesStale:
+		return staleStreamError{streamID: s.StreamID, lagBytes: result.LagBytes, lagThreshold: s.MaxLagBytes}
 	}
 	return nil
+}
+
+// probeSource opens a SchemaReader on the source DSN, type-asserts
+// to ir.HealthReporter (and ir.BytesLagReporter for PG), populates
+// the source-side fields on result. Errors are caught and surfaced
+// via SourceProbeReason rather than propagated; an unreachable
+// source shouldn't break a target-side health probe.
+func probeSource(ctx context.Context, result *HealthResult, cfg *SyncHealthCmd, target ir.Engine) {
+	source, err := resolveEngine(cfg.SourceDriver)
+	if err != nil {
+		result.SourceProbeReason = fmt.Sprintf("--source-driver: %v", err)
+		return
+	}
+	sr, err := source.OpenSchemaReader(ctx, cfg.Source)
+	if err != nil {
+		result.SourceProbeReason = fmt.Sprintf("open source schema reader: %v", err)
+		return
+	}
+	defer func() {
+		if c, ok := sr.(io.Closer); ok {
+			_ = c.Close()
+		}
+	}()
+	hr, ok := sr.(ir.HealthReporter)
+	if !ok {
+		result.SourceProbeReason = fmt.Sprintf("source engine %q does not implement ir.HealthReporter", source.Name())
+		return
+	}
+	pos, err := hr.SourceCurrentPosition(ctx)
+	if err != nil {
+		result.SourceProbeReason = fmt.Sprintf("source-current-position: %v", err)
+		return
+	}
+	result.SourcePosition = truncatePositionToken(pos.Token, 60)
+	result.SourceProbeAvailable = true
+
+	// Byte-distance lag — only when source AND target both implement
+	// BytesLagReporter (today: PG only). The target-side check uses
+	// the result's existing position info from ListStreams; we need
+	// the FULL token (not truncated) for the diff query.
+	srcLag, srcOK := sr.(ir.BytesLagReporter)
+	if !srcOK || !cfg.canComputeLagBytes(target) {
+		result.LagBytes = -1
+		return
+	}
+	// Find the un-truncated target token from the streams response.
+	// We re-walk a bit; ListStreams already gave us the StreamStatus
+	// but evaluateHealth truncated it for display.
+	target1Pos := ir.Position{Engine: target.Name(), Token: cfg.unrenderedTargetPosition(result.Position)}
+	if target1Pos.Token == "" {
+		// Couldn't recover the full token — leave lag-bytes
+		// unavailable rather than computing against a truncated
+		// LSN string (which would error).
+		result.LagBytes = -1
+		return
+	}
+	lag, err := srcLag.LagBytes(ctx, target1Pos, pos)
+	if err != nil {
+		result.SourceProbeReason = fmt.Sprintf("lag-bytes: %v", err)
+		result.LagBytes = -1
+		return
+	}
+	result.LagBytes = lag
+	result.LagBytesIsAvail = true
+}
+
+// canComputeLagBytes reports whether the target engine ALSO supports
+// BytesLagReporter (the source side is checked at the call site).
+// Today's check is engine-name-based since both sides need the same
+// position-shape; future engine pairs may extend this.
+func (s *SyncHealthCmd) canComputeLagBytes(target ir.Engine) bool {
+	return target.Name() == "postgres" && s.SourceDriver == "postgres"
+}
+
+// unrenderedTargetPosition is a helper that returns the target's
+// stored position token. The result.Position field has been
+// truncated to 60 chars for display; for byte-distance lag we need
+// the full LSN. Returns "" if the displayed position string was
+// already at full length (no truncation marker), which is the
+// happy case — LSN strings are short enough not to truncate.
+func (s *SyncHealthCmd) unrenderedTargetPosition(displayedPosition string) string {
+	if strings.HasSuffix(displayedPosition, "…") {
+		// Truncation happened — we lost the suffix; can't recover
+		// without re-querying the applier. Return empty; caller
+		// surfaces "lag-bytes unavailable" via the standard fall-
+		// through.
+		return ""
+	}
+	return displayedPosition
 }
 
 // evaluateHealth filters the stream list to the requested ID and
@@ -142,27 +269,60 @@ func renderHealthText(w io.Writer, r HealthResult) error {
 		return err
 	}
 	state := "healthy"
-	if r.Stale {
+	switch {
+	case r.Stale:
 		state = fmt.Sprintf("STALE (last apply %ds ago, threshold %ds)", r.SecondsSinceLastApply, r.Threshold)
+	case r.LagBytesStale:
+		state = fmt.Sprintf("STALE (lag %d bytes, threshold %d)", r.LagBytes, r.LagThreshold)
 	}
-	_, err := fmt.Fprintf(w,
+	if _, err := fmt.Fprintf(w,
 		"stream: %s\nfound: true\nstate: %s\nposition: %s\nupdated_at: %s\nseconds_since_last_apply: %d\n",
-		r.StreamID, state, r.Position, r.UpdatedAt, r.SecondsSinceLastApply)
-	return err
+		r.StreamID, state, r.Position, r.UpdatedAt, r.SecondsSinceLastApply); err != nil {
+		return err
+	}
+	if r.SourceProbeAvailable {
+		if _, err := fmt.Fprintf(w, "source_position: %s\n", r.SourcePosition); err != nil {
+			return err
+		}
+		if r.LagBytesIsAvail {
+			if _, err := fmt.Fprintf(w, "lag_bytes: %d\n", r.LagBytes); err != nil {
+				return err
+			}
+		} else {
+			if _, err := fmt.Fprintln(w, "lag_bytes: unavailable (cross-engine or non-PG pair)"); err != nil {
+				return err
+			}
+		}
+	} else if r.SourceProbeReason != "" {
+		if _, err := fmt.Fprintf(w, "source_probe: skipped (%s)\n", r.SourceProbeReason); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // staleStreamError signals "threshold breached" with kong exit code 1.
 // Mirrors driftError's shape for the diff command — short message on
 // stderr; the structured detail is on stdout (or --output FILE).
+//
+// Carries either time-based staleness (secondsAgo + threshold) OR
+// bytes-based staleness (lagBytes + lagThreshold) depending on which
+// gauge tripped.
 type staleStreamError struct {
-	streamID   string
-	secondsAgo int64
-	threshold  int
+	streamID     string
+	secondsAgo   int64
+	threshold    int
+	lagBytes     int64
+	lagThreshold int64
 }
 
 func (staleStreamError) ExitCode() int { return 1 }
 
 func (e staleStreamError) Error() string {
+	if e.lagThreshold > 0 {
+		return fmt.Sprintf("stream %q stale: lag %d bytes, threshold %d",
+			e.streamID, e.lagBytes, e.lagThreshold)
+	}
 	return fmt.Sprintf("stream %q stale: last apply %ds ago, threshold %ds",
 		e.streamID, e.secondsAgo, e.threshold)
 }
