@@ -1,0 +1,131 @@
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/orware/sluice/internal/ir"
+)
+
+func TestEvaluateHealth_StreamFound_NotStale(t *testing.T) {
+	now := time.Date(2026, 5, 7, 12, 0, 0, 0, time.UTC)
+	streams := []ir.StreamStatus{
+		{StreamID: "myapp-prod", Position: ir.Position{Token: "lsn=0/1A2B3C4D"}, UpdatedAt: now.Add(-30 * time.Second)},
+	}
+	r := evaluateHealth(streams, "myapp-prod", 60, now)
+	if !r.Found {
+		t.Fatal("expected Found=true")
+	}
+	if r.Stale {
+		t.Errorf("expected not stale (30s ago, threshold 60s); got %+v", r)
+	}
+	if r.SecondsSinceLastApply != 30 {
+		t.Errorf("expected 30 seconds; got %d", r.SecondsSinceLastApply)
+	}
+}
+
+func TestEvaluateHealth_Stale(t *testing.T) {
+	now := time.Date(2026, 5, 7, 12, 0, 0, 0, time.UTC)
+	streams := []ir.StreamStatus{
+		{StreamID: "myapp-prod", Position: ir.Position{Token: "lsn=0/1A2B3C4D"}, UpdatedAt: now.Add(-120 * time.Second)},
+	}
+	r := evaluateHealth(streams, "myapp-prod", 60, now)
+	if !r.Stale {
+		t.Errorf("expected stale (120s ago, threshold 60s); got %+v", r)
+	}
+}
+
+func TestEvaluateHealth_ThresholdZeroDisablesCheck(t *testing.T) {
+	now := time.Date(2026, 5, 7, 12, 0, 0, 0, time.UTC)
+	streams := []ir.StreamStatus{
+		{StreamID: "myapp-prod", Position: ir.Position{Token: "x"}, UpdatedAt: now.Add(-10 * time.Hour)},
+	}
+	r := evaluateHealth(streams, "myapp-prod", 0, now)
+	if r.Stale {
+		t.Errorf("threshold 0 should disable check even on a 10-hour-old stream; got %+v", r)
+	}
+	if r.SecondsSinceLastApply == 0 {
+		t.Error("seconds_since_last_apply should still be populated even when threshold is 0")
+	}
+}
+
+func TestEvaluateHealth_StreamNotFound(t *testing.T) {
+	now := time.Date(2026, 5, 7, 12, 0, 0, 0, time.UTC)
+	streams := []ir.StreamStatus{
+		{StreamID: "other-stream", UpdatedAt: now},
+	}
+	r := evaluateHealth(streams, "myapp-prod", 60, now)
+	if r.Found {
+		t.Errorf("expected Found=false; got %+v", r)
+	}
+	if r.Stale {
+		t.Errorf("not-found shouldn't be marked stale (it's an op error, not a threshold breach)")
+	}
+}
+
+func TestRenderHealth_TextHealthy(t *testing.T) {
+	r := HealthResult{
+		StreamID: "myapp-prod", Found: true, Position: "lsn=0/1A",
+		UpdatedAt: "2026-05-07T12:00:00Z", SecondsSinceLastApply: 30, Threshold: 60,
+	}
+	var buf bytes.Buffer
+	if err := renderHealth(&buf, r, "text"); err != nil {
+		t.Fatalf("renderHealth: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "state: healthy") {
+		t.Errorf("text output should say healthy; got:\n%s", out)
+	}
+	if !strings.Contains(out, "seconds_since_last_apply: 30") {
+		t.Errorf("text output missing seconds line; got:\n%s", out)
+	}
+}
+
+func TestRenderHealth_TextStale(t *testing.T) {
+	r := HealthResult{
+		StreamID: "myapp-prod", Found: true, Position: "x",
+		SecondsSinceLastApply: 200, Threshold: 60, Stale: true,
+	}
+	var buf bytes.Buffer
+	if err := renderHealth(&buf, r, "text"); err != nil {
+		t.Fatalf("renderHealth: %v", err)
+	}
+	if !strings.Contains(buf.String(), "STALE") {
+		t.Errorf("text output should announce STALE; got:\n%s", buf.String())
+	}
+}
+
+func TestRenderHealth_JSON(t *testing.T) {
+	r := HealthResult{
+		StreamID: "myapp-prod", Found: true, Position: "lsn=0/1A",
+		UpdatedAt: "2026-05-07T12:00:00Z", SecondsSinceLastApply: 30, Threshold: 60,
+	}
+	var buf bytes.Buffer
+	if err := renderHealth(&buf, r, "json"); err != nil {
+		t.Fatalf("renderHealth: %v", err)
+	}
+	var got HealthResult
+	if err := json.Unmarshal(buf.Bytes(), &got); err != nil {
+		t.Fatalf("decode JSON: %v", err)
+	}
+	if got.SecondsSinceLastApply != 30 || got.StreamID != "myapp-prod" {
+		t.Errorf("JSON round-trip mismatch; got %+v", got)
+	}
+}
+
+func TestRenderHealth_NotFound(t *testing.T) {
+	r := HealthResult{StreamID: "myapp-prod"}
+	var buf bytes.Buffer
+	if err := renderHealth(&buf, r, "text"); err != nil {
+		t.Fatalf("renderHealth: %v", err)
+	}
+	if !strings.Contains(buf.String(), "found:  false") {
+		t.Errorf("not-found shape should report false; got:\n%s", buf.String())
+	}
+}

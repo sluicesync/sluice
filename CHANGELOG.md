@@ -6,6 +6,10 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (will land in next release)
+
+- **`sluice sync health` command (probe MVP).** Companion to `sluice verify` from the sync-health monitoring proto-ADR (`docs/dev/design-sync-health-monitoring.md`). Probes a target's `sluice_cdc_state` for the supplied `--stream-id` and computes wall-clock seconds-since-last-apply; compares against `--max-stale-seconds` threshold; structured exit code (0 healthy / 1 stale / 2 op error) integrates with cron / alertmanager / blackbox-exporter / GitHub-Actions-CI pipelines. `--format text|json`; `--output FILE` for atomic write. **MVP scope** — exposes only target-side state (what `ListStreams` already carries); source-side position comparison + true lag-events / lag-seconds metrics follow with the new `ir.HealthReporter` interface. Closes the cron-friendly "is the target still ticking?" probe gap, which is the load-bearing operator concern (Fivetran-stops-silently shape).
+
 ## [0.12.0] - 2026-05-07
 
 `sluice verify` lands as a first-class operator surface — the count-mode MVP from the proto-ADR (`docs/dev/design-sluice-verify.md`). Direct delivery on the user's overarching "100% confidence that all data has been copied + synced" goal: operators can now ask "is the target row-count-equal to the source?" without writing the SQL themselves, integrate with cron / alertmanager / CI gates via the structured exit code, and machine-consume the JSON output for monitoring pipelines.

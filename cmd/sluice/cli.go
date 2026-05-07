@@ -221,6 +221,7 @@ type SyncCmd struct {
 	Start  SyncStartCmd  `cmd:"" help:"Start a continuous-sync stream from source to target."`
 	Status SyncStatusCmd `cmd:"" help:"Show status of a running sync stream."`
 	Stop   SyncStopCmd   `cmd:"" help:"Request a running sync stream to drain in-flight changes and exit cleanly."`
+	Health SyncHealthCmd `cmd:"" help:"Probe a running stream's freshness against operator-supplied thresholds; cron-friendly exit codes."`
 }
 
 // SyncStartCmd starts (or resumes) a continuous-sync stream from a
