@@ -6,6 +6,31 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-05-07
+
+`sluice verify` lands as a first-class operator surface — the count-mode MVP from the proto-ADR (`docs/dev/design-sluice-verify.md`). Direct delivery on the user's overarching "100% confidence that all data has been copied + synced" goal: operators can now ask "is the target row-count-equal to the source?" without writing the SQL themselves, integrate with cron / alertmanager / CI gates via the structured exit code, and machine-consume the JSON output for monitoring pipelines.
+
+Sample-mode and full-mode (proto-ADR phases 2 + 3) follow per the sequencing in the design doc; count-mode is the cron-friendly probe operators run most frequently.
+
+### Added
+
+- **`sluice verify` command (count-mode MVP).** New CLI subcommand. Runs `SELECT COUNT(*)` per table on both sides, compares, surfaces mismatches with deltas. Exit-code shape mirrors `schema diff`: 0 clean, 1 mismatch, 2 operational error. Same flag surface as `migrate` / `sync start` (DSN + driver + filters); reusable against the operator's existing `sluice.yaml`. `--depth count` (only supported value in v0.12.0; `sample` and `full` planned). `--format text|json` for machine consumption. `--output FILE` for atomic write.
+
+- **`ir.Verifier` optional engine interface.** Engines opt-in by implementing `ExactRowCount(ctx, table) (int64, error)`. Distinguished from existing `RowCounter` (which returns approximate counts via `pg_class.reltuples` / `information_schema.tables.table_rows` for ETA hints) — verify needs authoritative counts, so we pay the full-table-scan cost. MySQL and Postgres engines both implement on their `SchemaReader` (which already holds the DB connection). Engines without `Verifier` cause `sluice verify` to fail loud with a clear "not supported" operational error.
+
+- **`pipeline.Verifier` orchestrator.** Mirrors `Differ` shape. Reads both schemas via `SchemaReader`, type-asserts to `Verifier`, runs `ExactRowCount` per table, builds `VerifyResult` with per-table outcomes + summary counters. Renders text or JSON. Tables present on source but absent on target surface as SKIPPED (reported in the result; not flagged as mismatches — they're a structural concern that `schema diff` covers).
+
+### Notes
+
+- **Why not include `sample`/`full` in v0.12.0?** Per the proto-ADR's sequencing — count-mode alone closes the most common Fivetran-style "did I lose rows?" probe at the cheapest cost. Sample mode adds N random rows × content hashing per table; full mode adds full-table content-hash + bisection on mismatch. Each has its own engineering surface (sampling determinism, cross-engine value canonicalization, bisection chunk size). Shipping count-mode as the MVP gets operators the cron-friendly probe immediately while sample/full follow on real-world demand signal.
+- **CDC-position-aware verification deferred.** When sluice is verifying a continuously-syncing target, the source can have new rows the target hasn't applied yet — count mismatch is expected, not an error. The proto-ADR's open question #1 covers the design (verify against the target's tracked source position). Out of scope for v0.12.0; the MVP is best run against migration-completed targets, not in the middle of CDC catch-up.
+
+### Compatibility
+
+- **No breaking IR changes.** `ir.Verifier` is purely additive (new optional interface). Existing engine surfaces unchanged.
+- **No CLI-breaking changes.** New subcommand only.
+- **Behaviour change: none.** Verify is a read-only inspection tool; it doesn't modify either side.
+
 ## [0.11.3] - 2026-05-07
 
 Three-bug patch from the v0.11.2 real-world test cycle (see sluice-testing's `session-reports/v0.11.2.md`). All three bugs were in v0.11.x's translator emission paths — places where the catalog work was supposed to cover but a code path bypassed the translator or matched the wrong syntactic form.

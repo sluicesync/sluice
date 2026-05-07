@@ -44,6 +44,7 @@ type CLI struct {
 	Sync    SyncCmd    `cmd:"" help:"Manage continuous-sync streams."`
 	Slot    SlotCmd    `cmd:"" help:"Manage source-side replication slots (Postgres)."`
 	Schema  SchemaCmd  `cmd:"" help:"Inspect and describe schemas (preview translation, etc.)."`
+	Verify  VerifyCmd  `cmd:"" help:"Verify data integrity between source and target (v0.12.0+ count mode)."`
 }
 
 // EnginesCmd lists the database engines registered in the binary,
