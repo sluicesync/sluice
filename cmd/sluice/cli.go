@@ -45,6 +45,8 @@ type CLI struct {
 	Slot    SlotCmd    `cmd:"" help:"Manage source-side replication slots (Postgres)."`
 	Schema  SchemaCmd  `cmd:"" help:"Inspect and describe schemas (preview translation, etc.)."`
 	Verify  VerifyCmd  `cmd:"" help:"Verify data integrity between source and target (v0.12.0+ count mode)."`
+	Backup  BackupCmd  `cmd:"" help:"Take and verify logical backups (Phase 1: full snapshot to local filesystem)."`
+	Restore RestoreCmd `cmd:"" help:"Restore a logical backup into a target database."`
 }
 
 // EnginesCmd lists the database engines registered in the binary,
