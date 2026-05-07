@@ -1,3 +1,6 @@
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // JSON marshalling for the per-table progress entries within
 // [MigrationState.TableProgress].
 //

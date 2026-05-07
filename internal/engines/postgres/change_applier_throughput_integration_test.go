@@ -1,5 +1,8 @@
 //go:build integration
 
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // Throughput-comparison integration test: same workload applied
 // with batchSize=1 (per-change, the v0.3.x default) vs batchSize=100
 // (typical production tuning). Measures wall-clock to surface the

@@ -1,5 +1,8 @@
 //go:build integration
 
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // Integration test for `sync stop`: a running pipeline.Streamer that
 // observes a non-NULL stop_requested_at on its control row should
 // finish the in-flight change, persist its final position, and exit

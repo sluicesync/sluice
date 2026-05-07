@@ -1,5 +1,8 @@
 //go:build integration
 
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // Cross-engine continuous-sync integration test for pipeline.Streamer:
 // MySQL source → Postgres target. This is the streaming counterpart of
 // migrate_cross_integration_test.go (which exercises the snapshot-only

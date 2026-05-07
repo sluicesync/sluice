@@ -1,5 +1,8 @@
 //go:build integration
 
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // Integration test for Bug 14 (PG array → MySQL JSON override).
 //
 // Pre-fix shape: an operator using --type-override=col=jsonb to land

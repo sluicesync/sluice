@@ -1,5 +1,8 @@
 //go:build integration
 
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // End-to-end integration test for the snapshot+CDC orchestrator
 // (pipeline.Streamer). Same-engine Postgres → Postgres: the source
 // is seeded, the streamer captures a snapshot, runs bulk-copy on the

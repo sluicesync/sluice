@@ -1,3 +1,6 @@
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // Idempotent INSERT path for the resume-mid-table bulk-copy.
 //
 // See the postgres engine's row_writer_batch.go for the design

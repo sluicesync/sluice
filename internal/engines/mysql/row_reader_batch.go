@@ -1,3 +1,6 @@
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // PK-cursor batched reads for the resume-mid-table path.
 //
 // See the postgres engine's row_reader_batch.go for the design

@@ -1,3 +1,6 @@
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // Package ir defines the dialect-neutral intermediate representation
 // at the heart of sluice. Every translation between supported database
 // engines passes through types defined here.

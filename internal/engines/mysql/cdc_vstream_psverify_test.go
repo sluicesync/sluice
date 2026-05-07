@@ -1,5 +1,8 @@
 //go:build psverify
 
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // PlanetScale-MySQL VStream verification tests. Gated behind the
 // psverify build tag — same shape as the PS-PG verification suite
 // in internal/engines/{postgres,pipeline}.

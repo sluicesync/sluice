@@ -1,5 +1,8 @@
 //go:build integration
 
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // Integration tests for the schema-preview orchestrator. Boots a real
 // Postgres container (the source side, where ADR-0024's UUID hint
 // fires) plus a MySQL container (the target side, used only for the

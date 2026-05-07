@@ -1,5 +1,8 @@
 //go:build integration
 
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // Integration test for the MySQL batched change applier
 // (ApplyBatch). Boots a MySQL container, drives a stream of
 // Insert events through ApplyBatch, and asserts:

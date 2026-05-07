@@ -1,5 +1,8 @@
 //go:build integration
 
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // Integration tests for the per-target sluice_migrate_state control
 // table. Same shape as control_table_integration_test.go but for the
 // migration-state surface — round-trip of state rows + JSON

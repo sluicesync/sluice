@@ -1,3 +1,6 @@
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // Per-target persistence for resumable simple-mode migrations.
 //
 // This file mirrors control_table.go's shape — same idempotent CREATE

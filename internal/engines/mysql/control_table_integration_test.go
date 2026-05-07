@@ -1,5 +1,8 @@
 //go:build integration
 
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // Integration tests for the per-target sluice_cdc_state control
 // table. Two flavors:
 //

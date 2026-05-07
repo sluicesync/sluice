@@ -1,5 +1,8 @@
 //go:build integration
 
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // Integration test for the SlotManager surface: list and drop, plus
 // the auto-drop path on failed cold-start in CDCReader.
 

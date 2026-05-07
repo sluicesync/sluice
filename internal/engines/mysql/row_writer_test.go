@@ -1,5 +1,8 @@
 //go:build integration
 
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // Integration tests for the MySQL RowWriter. Exercises the full
 // SchemaWriter → RowWriter → RowReader round-trip end-to-end against a
 // real MySQL container.

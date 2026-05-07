@@ -1,3 +1,6 @@
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // Resumable simple-mode migrations.
 //
 // Today, if `sluice migrate` fails partway, the operator has to drop

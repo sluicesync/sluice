@@ -1,5 +1,8 @@
 //go:build integration
 
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // End-to-end regression for Bug 8: a composite-PK DELETE on a
 // Postgres source under REPLICA IDENTITY DEFAULT must reach the
 // destination. Pre-fix, the CDC reader emitted a Before image that

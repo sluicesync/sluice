@@ -1,3 +1,6 @@
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // Cross-dialect expression translation for the MySQL writer.
 //
 // Translation in sluice is a layered policy:

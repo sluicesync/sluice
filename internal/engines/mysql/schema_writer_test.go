@@ -1,5 +1,8 @@
 //go:build integration
 
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // Integration tests for the MySQL SchemaWriter. Build a known IR
 // Schema in memory, apply it to a fresh MySQL container, then read it
 // back via the SchemaReader and assert the structural shape was

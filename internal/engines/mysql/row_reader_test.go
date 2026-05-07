@@ -1,5 +1,8 @@
 //go:build integration
 
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // Integration tests for the MySQL RowReader. Boots a real MySQL
 // container, applies a fixture schema and data, and verifies that
 // rows round-trip through the IR-typed value table.

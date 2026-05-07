@@ -1,3 +1,6 @@
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // Package config loads sluice's runtime configuration from a YAML
 // file overlaid with environment variables. The shape of the Config
 // struct will grow as the orchestrator and translator mature; for

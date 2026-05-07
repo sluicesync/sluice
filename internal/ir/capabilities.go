@@ -1,3 +1,6 @@
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 package ir
 
 // BulkLoadMethod identifies how an engine supports bulk inserting data.

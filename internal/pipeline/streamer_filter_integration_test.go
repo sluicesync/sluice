@@ -1,5 +1,8 @@
 //go:build integration
 
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // Integration test for the streamer-side table filter: confirms a
 // CDC event for an excluded table is dropped at the dispatch layer
 // before the applier sees it, while events for allowed tables

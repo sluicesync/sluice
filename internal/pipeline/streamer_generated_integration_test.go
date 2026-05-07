@@ -1,5 +1,8 @@
 //go:build integration
 
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // Continuous-sync (snapshot + CDC) integration tests for the
 // generated-column path. Same-engine MySQL→MySQL and Postgres→Postgres
 // only — cross-engine CDC over generated columns is covered by the

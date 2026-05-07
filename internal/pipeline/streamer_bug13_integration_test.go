@@ -1,5 +1,8 @@
 //go:build integration
 
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // Integration test for Bug 13 (publication-scope-by-table, ADR-0021).
 //
 // The pre-fix shape: sluice's CDC reader created `sluice_pub` with

@@ -1,3 +1,6 @@
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 package pipeline
 
 // Unit coverage for Bug 20 — cross-engine warm-resume dispatch. The

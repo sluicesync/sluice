@@ -1,5 +1,8 @@
 //go:build integration
 
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // Integration test for the Postgres CDC reader. Boots a Postgres
 // container with wal_level=logical (the only non-default GUC the
 // reader needs), seeds a table, opens the reader at "from now",

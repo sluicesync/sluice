@@ -1,3 +1,6 @@
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // Range-bounds and row-count queries for the parallel-bulk-copy
 // orchestrator (v0.5.0).
 //

@@ -1,3 +1,6 @@
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 package ir
 
 // Schema is a dialect-neutral description of a database's structure:

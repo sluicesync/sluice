@@ -1,3 +1,6 @@
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // LSN tracking for slot-ack-after-apply correctness (Bug 15, ADR-0020).
 //
 // Postgres logical replication relies on the consumer telling the

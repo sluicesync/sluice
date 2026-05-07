@@ -1,3 +1,6 @@
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // Package mysql implements the sluice [ir.Engine] for MySQL and its
 // wire-compatible variants. It reads schema and rows via the standard
 // database/sql driver (github.com/go-sql-driver/mysql), and produces

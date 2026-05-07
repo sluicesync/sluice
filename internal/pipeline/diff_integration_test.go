@@ -1,5 +1,8 @@
 //go:build integration
 
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // Integration test for the schema-diff orchestrator. Boots a Postgres
 // container, applies the same source DDL twice (once into source_db,
 // once into target_db with deliberate drift), and asserts the diff

@@ -1,3 +1,6 @@
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // Package pipeline implements the simple-mode orchestrator: a one-shot
 // schema-and-data migration from a source database to a target. It is
 // the layer that wires the IR's reader and writer interfaces into an

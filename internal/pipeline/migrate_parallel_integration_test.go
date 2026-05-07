@@ -1,5 +1,8 @@
 //go:build integration
 
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // Integration tests for the parallel within-table bulk-copy path
 // (v0.5.0). The tests boot a real Postgres container, seed a source
 // table well above the parallelism threshold, and verify that:

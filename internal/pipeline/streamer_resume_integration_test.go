@@ -1,5 +1,8 @@
 //go:build integration
 
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // Restart-resume integration test for pipeline.Streamer. Proves the
 // load-bearing §5 property: a Streamer that crashes mid-stream and
 // restarts with the same StreamID resumes from the persisted

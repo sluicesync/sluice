@@ -1,5 +1,8 @@
 //go:build integration
 
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // Integration tests for the MySQL SchemaReader. These tests boot a real
 // MySQL container via testcontainers-go and assert the IR shape the
 // reader produces.

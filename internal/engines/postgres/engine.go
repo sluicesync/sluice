@@ -1,3 +1,6 @@
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // Package postgres implements the sluice [ir.Engine] for PostgreSQL.
 // It reads schema and rows via the standard database/sql interface
 // backed by the pgx driver in stdlib mode (github.com/jackc/pgx/v5/stdlib),

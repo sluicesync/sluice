@@ -1,5 +1,8 @@
 //go:build integration
 
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // Cross-engine integration tests for the orchestrator-side table
 // filter (MySQL → Postgres). Three cases:
 //

@@ -1,3 +1,6 @@
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // Range-splitting for the parallel within-table bulk-copy path.
 //
 // pgcopydb's signature performance comes from splitting each large

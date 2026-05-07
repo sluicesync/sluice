@@ -1,5 +1,8 @@
 //go:build integration
 
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // Integration tests for the generated-column path: schema reader
 // captures the GENERATED expression, the DDL writer recreates it on
 // the target, and the row reader/writer drop the column from the

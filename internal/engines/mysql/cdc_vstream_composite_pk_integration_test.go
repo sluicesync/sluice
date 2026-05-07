@@ -1,5 +1,8 @@
 //go:build integration && vstream
 
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // Composite-PK regression test for the VStream (FlavorPlanetScale)
 // CDC reader.
 //

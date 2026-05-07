@@ -1,5 +1,8 @@
 //go:build integration
 
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // Integration tests for the Postgres SchemaReader. These boot a real
 // PostgreSQL container via testcontainers-go, apply a fixture, and
 // assert the IR shape the reader produces.

@@ -1,5 +1,8 @@
 //go:build integration
 
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // End-to-end integration test for the simple-mode orchestrator.
 // Boots one MySQL container, creates a source and a target database,
 // seeds the source, runs pipeline.Migrator, and verifies the target

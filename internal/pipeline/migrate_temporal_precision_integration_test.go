@@ -1,5 +1,8 @@
 //go:build integration
 
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // Cross-engine TIMESTAMP / DATETIME precision audit. Bug 19 (v0.8.0)
 // closed the silent-corruption hole on the TZ axis — non-UTC hosts no
 // longer drift TIMESTAMP values during MySQL→PG CDC. The precision

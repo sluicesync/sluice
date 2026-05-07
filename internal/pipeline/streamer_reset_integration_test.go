@@ -1,5 +1,8 @@
 //go:build integration
 
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // Integration test for --reset-target-data on `sluice sync start`
 // (ADR-0023). Combines with the ADR-0022 slot-missing fall-through
 // to validate the one-command recovery path: after the operator drops

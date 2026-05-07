@@ -1,5 +1,8 @@
 //go:build integration
 
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // Integration test for Bug 9: cold-start hangs when dest tables have
 // pre-existing data. The pre-flight check (preflight.go) refuses
 // migrations into a populated target with a clear error, replacing

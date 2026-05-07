@@ -1,5 +1,8 @@
 //go:build integration
 
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // Integration test for the MySQL CDC reader. Boots a MySQL container
 // with binlog enabled (the default on 8.0 + an explicit log-bin name
 // for clarity), seeds a table, opens the reader at "from now", then

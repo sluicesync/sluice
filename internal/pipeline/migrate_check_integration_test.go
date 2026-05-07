@@ -1,5 +1,8 @@
 //go:build integration
 
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // Integration tests for the CHECK-constraint path: the schema reader
 // captures the CHECK clause, the DDL writer recreates it on the
 // target, and the constraint actually rejects invalid values.

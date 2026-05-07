@@ -1,5 +1,8 @@
 //go:build integration
 
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // Cross-engine integration test for the schema-diff orchestrator
 // (ADR-0029). Pairs a Postgres source with a MySQL target so the
 // "expected" side starts with PG-native IR types (UUID, Inet, Array);

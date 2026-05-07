@@ -1,3 +1,6 @@
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // Package translate carries pure schema-rewrite passes that sit
 // between the source-side SchemaReader and the target-side
 // SchemaWriter in the orchestrator. Today it holds a single pass —

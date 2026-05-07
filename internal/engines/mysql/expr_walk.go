@@ -1,3 +1,6 @@
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // String-aware walker and rewrite rules for translateExprForMySQL.
 // Kept separate from the entry point in expr_translate.go so the v1
 // translation table stays the load-bearing artifact and this file

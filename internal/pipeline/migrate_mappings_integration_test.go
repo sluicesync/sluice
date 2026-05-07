@@ -1,5 +1,8 @@
 //go:build integration
 
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // End-to-end integration test for the mappings translation pass.
 // Boots a single Postgres container, seeds the source side with a
 // JSON column, runs Migrator with a config.Mapping that rewrites

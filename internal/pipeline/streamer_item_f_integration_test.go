@@ -1,5 +1,8 @@
 //go:build integration
 
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // Integration test for Item F (slot-missing fall-through to cold-start,
 // ADR-0022).
 //

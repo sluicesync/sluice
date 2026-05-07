@@ -1,5 +1,8 @@
 //go:build integration && vstream
 
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // VStream integration tests using vitess/vttestserver — Vitess's
 // all-in-one test harness that runs vtcombo (vtgate + vttablet +
 // etcd in a single binary) plus an embedded MySQL with binlogs

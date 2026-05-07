@@ -1,5 +1,8 @@
 //go:build integration
 
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // Integration test for Bug 15 (slot-ack-after-apply, ADR-0020).
 //
 // The pre-fix shape: sluice's PG CDC reader advanced the slot's

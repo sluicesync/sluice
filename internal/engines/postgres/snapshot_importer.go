@@ -1,3 +1,6 @@
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // Snapshot-import support for the parallel within-table bulk-copy
 // path (v0.5.0). The orchestrator's parallel-copy phase needs N
 // reader connections that all observe the same consistent source view;

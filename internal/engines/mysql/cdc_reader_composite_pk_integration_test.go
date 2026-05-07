@@ -1,5 +1,8 @@
 //go:build integration
 
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // Composite-PK regression test for the MySQL binlog CDC reader.
 //
 // Bug 8 (in BUG-CATALOG.md) was a silent data-loss bug on the Postgres

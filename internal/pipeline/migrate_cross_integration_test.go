@@ -1,5 +1,8 @@
 //go:build integration
 
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // Cross-engine end-to-end integration test for the simple-mode
 // orchestrator: MySQL source → Postgres target. This is the test that
 // actually exercises type translation, value-side conversion, and

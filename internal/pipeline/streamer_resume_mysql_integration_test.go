@@ -1,5 +1,8 @@
 //go:build integration
 
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // Restart-resume integration test for pipeline.Streamer on MySQL.
 // Mirror of streamer_resume_integration_test.go (PG-only) — proves
 // the same load-bearing §5 property works for MySQL sources too: a

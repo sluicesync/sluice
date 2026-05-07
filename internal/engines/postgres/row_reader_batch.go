@@ -1,3 +1,6 @@
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // PK-cursor batched reads for the resume-mid-table path.
 //
 // The bulk-copy orchestrator drives ReadRowsBatch with the previous

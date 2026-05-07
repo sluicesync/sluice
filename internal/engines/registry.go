@@ -1,3 +1,6 @@
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // Package engines provides the registry through which database engine
 // implementations make themselves available to the rest of sluice.
 //

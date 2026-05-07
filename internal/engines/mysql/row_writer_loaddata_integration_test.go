@@ -1,5 +1,8 @@
 //go:build integration
 
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // Integration tests for the LOAD DATA LOCAL INFILE row-writer path.
 // These tests boot a real MySQL container (via testcontainers-go) and
 // drive the writer through its LOAD DATA branch, the

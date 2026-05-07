@@ -1,3 +1,6 @@
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // Unit tests for slot_create.go and server_version.go. These cover
 // the bits that don't require a live Postgres — version-string
 // parsing and the warn-once behaviour for the PG ≤ 16 fallback.

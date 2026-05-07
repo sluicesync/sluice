@@ -1,3 +1,6 @@
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // Parallel within-table bulk-copy orchestrator (v0.5.0).
 //
 // pgcopydb's signature performance comes from splitting each large

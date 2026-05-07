@@ -1,5 +1,8 @@
 //go:build integration
 
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // Integration test for the MySQL snapshot+CDC handoff. Boots a MySQL
 // container with binlog enabled, seeds rows R1..R5, opens a snapshot
 // stream, inserts R6 on a separate connection (so it commits *after*

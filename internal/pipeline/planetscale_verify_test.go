@@ -1,5 +1,8 @@
 //go:build psverify
 
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // Pipeline-level verification tests for PlanetScale Postgres
 // (PS-PG). Companion to internal/engines/postgres/planetscale_verify_test.go;
 // the engine-package tests cover Phase 1 (connectivity), Phase 2

@@ -1,5 +1,8 @@
 //go:build integration
 
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // Bug 19 regression: silent TIMESTAMP corruption in MySQL CDC.
 //
 // MySQL's binlog wire format encodes TIMESTAMP as a UTC seconds-since-

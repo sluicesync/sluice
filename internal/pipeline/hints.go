@@ -1,3 +1,6 @@
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 package pipeline
 
 // Operator-facing hint layer for wrapped engine errors.

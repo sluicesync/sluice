@@ -1,3 +1,6 @@
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // Cold-start pre-flight: refuse a fresh migration when the dest
 // already contains data.
 //

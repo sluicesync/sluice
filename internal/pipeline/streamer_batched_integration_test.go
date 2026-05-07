@@ -1,5 +1,8 @@
 //go:build integration
 
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // End-to-end integration test for the batched-apply path of the
 // snapshot+CDC orchestrator. Same-engine Postgres → Postgres: a
 // source-side transaction with N INSERTs is bulk-applied to the

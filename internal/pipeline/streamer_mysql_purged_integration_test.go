@@ -1,5 +1,8 @@
 //go:build integration
 
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // Integration test for MySQL binlog-purged fall-through to cold-start
 // (ADR-0022 extended to MySQL).
 //

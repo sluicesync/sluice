@@ -1,5 +1,8 @@
 //go:build integration
 
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // Integration test for --reset-target-data on `sluice migrate`
 // (ADR-0023). The flag DELETEs the migrate-state row, DROPs every
 // source-schema table on the target, and runs a fresh cold-start.

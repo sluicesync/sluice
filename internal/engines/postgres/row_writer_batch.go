@@ -1,3 +1,6 @@
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // Idempotent INSERT path for the resume-mid-table bulk-copy.
 //
 // The cold-start bulk-copy uses COPY FROM STDIN (faster, atomic at

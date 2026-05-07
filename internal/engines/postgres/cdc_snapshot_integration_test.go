@@ -1,5 +1,8 @@
 //go:build integration
 
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // Integration test for the Postgres snapshot+CDC handoff. Boots a
 // Postgres container with wal_level=logical, seeds rows R1..R5,
 // opens a snapshot stream (which atomically creates a logical

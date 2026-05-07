@@ -1,5 +1,8 @@
 //go:build psverify
 
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // Verification tests for PlanetScale Postgres (PS-PG). Gated behind
 // the psverify build tag because they need real PS-PG credentials
 // supplied via env vars and consequently can't run in CI's hermetic

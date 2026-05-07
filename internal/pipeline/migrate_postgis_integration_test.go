@@ -1,5 +1,8 @@
 //go:build integration && postgis
 
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // End-to-end integration test for the PostGIS-aware GEOMETRY
 // translation. Boots the postgis/postgis:16-3.4 image (heavier than
 // the postgres:16 used by other integration tests, which is why this

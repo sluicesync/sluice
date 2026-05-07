@@ -1,5 +1,8 @@
 //go:build integration
 
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // Integration tests for the resumable simple-mode migration path.
 // All tests run against Postgres on both sides because PG is the
 // fastest engine pair to spin up via testcontainers; the resume

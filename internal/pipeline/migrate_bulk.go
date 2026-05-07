@@ -1,3 +1,6 @@
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // Per-batch checkpointed bulk-copy for the resume-mid-table path.
 //
 // v0.3.0's resume truncates and re-copies any in-progress table on

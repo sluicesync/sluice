@@ -1,3 +1,6 @@
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // Unit tests for the MySQL schema reader's expression-normalization
 // helpers. These don't need a live MySQL — they cover the read-
 // boundary translation that turns MySQL's stored expression form

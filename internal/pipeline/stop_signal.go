@@ -1,3 +1,6 @@
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // Stop-signal polling for the Streamer.
 //
 // Operators stop a running `sluice sync start` today by hitting

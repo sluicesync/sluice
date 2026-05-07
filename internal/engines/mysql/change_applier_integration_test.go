@@ -1,5 +1,8 @@
 //go:build integration
 
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // Integration test for the MySQL ChangeApplier. Boots a MySQL
 // container, opens the applier directly (bypassing CDC — we feed
 // hand-built ir.Change events through the channel), and asserts:

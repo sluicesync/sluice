@@ -1,3 +1,6 @@
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // Destructive recovery: --reset-target-data.
 //
 // When the operator opts into the flag, the pipeline clears the

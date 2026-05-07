@@ -1,5 +1,8 @@
 //go:build integration
 
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // Cross-engine composite-PK regression for the CDC streamer path:
 // MySQL source → Postgres target. Companion to
 // streamer_composite_pk_delete_integration_test.go (PG → PG, the Bug 8

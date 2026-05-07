@@ -1,5 +1,8 @@
 //go:build integration
 
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
 // Integration test for the Postgres batched change applier
 // (ApplyBatch). Boots a Postgres container, drives a stream of
 // Insert/Update/Delete events through ApplyBatch, and asserts:
