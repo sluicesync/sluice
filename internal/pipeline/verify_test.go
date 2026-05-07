@@ -233,6 +233,39 @@ func TestVerifier_Run_PerTableCountErrorTreatedAsSkipped(t *testing.T) {
 	}
 }
 
+// TestVerifier_Run_ExtraOnTarget pins the v0.12.x enhancement:
+// tables present on target but absent on source surface in the
+// ExtraOnTarget slice (informational), do NOT contribute to
+// TablesMismatch. Operators get visibility without false-positive
+// drift signal.
+func TestVerifier_Run_ExtraOnTarget(t *testing.T) {
+	src := &verifyStubEngine{name: "postgres", schema: verifySchema("users"), counts: map[string]int64{"users": 5}}
+	tgt := &verifyStubEngine{name: "postgres", schema: verifySchema("users", "audit_log", "ops_metrics"), counts: map[string]int64{"users": 5, "audit_log": 100, "ops_metrics": 50}}
+
+	var buf bytes.Buffer
+	v := &Verifier{Source: src, Target: tgt, SourceDSN: "src", TargetDSN: "tgt", Out: &buf}
+	r, err := v.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if r.HasMismatch() {
+		t.Errorf("extra-on-target should not flag mismatch; got %+v", r.Summary)
+	}
+	if r.Summary.TablesExtraOnTarget != 2 {
+		t.Errorf("expected 2 extra; got %d", r.Summary.TablesExtraOnTarget)
+	}
+	if len(r.ExtraOnTarget) != 2 || r.ExtraOnTarget[0] != "audit_log" || r.ExtraOnTarget[1] != "ops_metrics" {
+		t.Errorf("ExtraOnTarget should be sorted [audit_log, ops_metrics]; got %v", r.ExtraOnTarget)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "tables present on target but absent on source") {
+		t.Errorf("text output should announce extra-on-target section; got:\n%s", out)
+	}
+	if !strings.Contains(out, "audit_log") || !strings.Contains(out, "ops_metrics") {
+		t.Errorf("text output should list extra table names; got:\n%s", out)
+	}
+}
+
 func TestVerifier_Run_UnsupportedDepthRejected(t *testing.T) {
 	src := &verifyStubEngine{name: "postgres", schema: verifySchema("users"), counts: map[string]int64{"users": 1}}
 	tgt := &verifyStubEngine{name: "postgres", schema: verifySchema("users"), counts: map[string]int64{"users": 1}}

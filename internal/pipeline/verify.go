@@ -70,7 +70,11 @@ type VerifyResult struct {
 	TargetEngine string              `json:"target_engine"`
 	Depth        VerifyDepth         `json:"depth"`
 	Tables       []VerifyTableResult `json:"tables"`
-	Summary      VerifySummary       `json:"summary"`
+	// ExtraOnTarget lists table names present on the target but
+	// absent from the source. Sorted alphabetically. Empty when no
+	// extras exist or when the source-only set is unknown.
+	ExtraOnTarget []string      `json:"extra_on_target,omitempty"`
+	Summary       VerifySummary `json:"summary"`
 }
 
 // VerifyTableResult is the per-table outcome.
@@ -91,6 +95,14 @@ type VerifySummary struct {
 	TablesClean    int `json:"tables_clean"`
 	TablesMismatch int `json:"tables_mismatch"`
 	TablesSkipped  int `json:"tables_skipped"`
+	// TablesExtraOnTarget is the count of tables present on the
+	// target but absent from the source. Reported informationally
+	// (the names land in [VerifyResult.ExtraOnTarget]); not flagged
+	// as mismatches since extra tables don't imply data loss — they
+	// could be operator-managed tables outside sluice's scope. The
+	// existing `sluice schema diff` is the right tool when they are
+	// drift; verify keeps its lane focused on row-data concerns.
+	TablesExtraOnTarget int `json:"tables_extra_on_target,omitempty"`
 }
 
 // HasMismatch reports whether any table failed verification. Used by
@@ -156,12 +168,23 @@ func (v *Verifier) Run(ctx context.Context) (*VerifyResult, error) {
 	for _, t := range tgtSchema.Tables {
 		tgtTables[t.Name] = t
 	}
+	srcNames := make(map[string]struct{}, len(srcSchema.Tables))
+	for _, t := range srcSchema.Tables {
+		srcNames[t.Name] = struct{}{}
+	}
 
 	result := &VerifyResult{
 		SourceEngine: v.Source.Name(),
 		TargetEngine: v.Target.Name(),
 		Depth:        depth,
 	}
+	for name := range tgtTables {
+		if _, present := srcNames[name]; !present {
+			result.ExtraOnTarget = append(result.ExtraOnTarget, name)
+		}
+	}
+	sort.Strings(result.ExtraOnTarget)
+	result.Summary.TablesExtraOnTarget = len(result.ExtraOnTarget)
 	tables := make([]*ir.Table, 0, len(srcSchema.Tables))
 	tables = append(tables, srcSchema.Tables...)
 	sort.Slice(tables, func(i, j int) bool { return tables[i].Name < tables[j].Name })
@@ -255,6 +278,13 @@ func (v *Verifier) renderText(r *VerifyResult) error {
 		default:
 			fmt.Fprintf(&sb, "%-40s OK rows=%d\n", t.Name, t.SourceRowCount)
 		}
+	}
+	if len(r.ExtraOnTarget) > 0 {
+		sb.WriteString("\n-- tables present on target but absent on source (informational; not counted as mismatches):\n")
+		for _, n := range r.ExtraOnTarget {
+			fmt.Fprintf(&sb, "   %s\n", n)
+		}
+		sb.WriteString("-- run `sluice schema diff` if you need to reconcile structural drift.\n")
 	}
 	if r.Summary.TablesMismatch > 0 {
 		sb.WriteString("\n-- non-zero exit code follows; re-run with --depth=sample (post-MVP) to compare row content for drift root-cause.\n")
