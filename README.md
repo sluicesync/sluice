@@ -28,6 +28,8 @@ Pre-built Linux/macOS/Windows binaries: [latest release](https://github.com/orwa
 | Move data **once** with low downtime — snapshot first, catch up via CDC, then cut over | `sluice migrate` then `sluice sync start --resume` |
 | **Replicate continuously** for analytics, geo-locality, or hot-standby | `sluice sync start` |
 | **Diff** a target against what sluice would produce | `sluice schema diff` |
+| **Verify** that every row made it across (row counts, sampled / full content forthcoming) | `sluice verify` |
+| **Probe** a running sync's freshness against a staleness threshold | `sluice sync health` |
 | **Preview** the target DDL before running anything | `sluice schema preview` |
 | Do all of the above against **PlanetScale** | Same commands; PS-MySQL uses VStream automatically when DSN host matches `*.connect.psdb.cloud` |
 
@@ -79,8 +81,11 @@ Commands:
   sync start               Start a continuous-sync stream.
   sync status              Show status of a running sync stream.
   sync stop                Gracefully drain and stop a running stream.
+  sync health              Probe a stream's freshness; cron-friendly exit code.
   schema preview           Print the target DDL sluice would emit.
   schema diff              Diff a target against what sluice would produce.
+  verify                   Compare row counts (and forthcoming sampled / full
+                           content checks) between source and target.
   slot list / slot drop    Manage Postgres replication slots.
 ```
 
