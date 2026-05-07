@@ -49,9 +49,11 @@ type BlobStore struct {
 func OpenBlobStore(ctx context.Context, urlStr string) (*BlobStore, error) { ... }
 ```
 
-### Encryption default: client-side AES-256-GCM stays default-on for cloud
+### Encryption: NOT shipped in Phase 2; remains a Phase 6 (KMS) deliverable
 
-Unchanged from Phase 1. Uniform behavior across local-FS and cloud beats per-backend reasoning. `--no-encryption` is the opt-out for SSE-trusters.
+The original proto-ADR proposed client-side AES-256-GCM as the default for the MVP, with `--no-encryption` as an SSE-truster opt-out. **That recommendation was not implemented in Phase 1 and is not implemented in Phase 2.** Backups land unencrypted at rest on both local-FS and cloud paths. Operators relying on at-rest encryption should use bucket-level SSE on the cloud side or filesystem-level encryption (LUKS / BitLocker / FileVault) on the local-FS side. Sluice-managed AES-256-GCM (passphrase or KMS-derived key) is parked as Phase 6 alongside the BYOK / KMS UX.
+
+This doc previously claimed encryption "carried through from Phase 1 unchanged"; that claim was inaccurate (originated in the v0.16.0 release-notes draft and propagated here). v0.16.1 will not change this — the gap is documented honestly and the operator workarounds are real. Re-opening encryption is a Phase 6 conversation.
 
 ### NEW in Phase 2 scope: resumable backup writer
 
