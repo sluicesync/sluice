@@ -10,6 +10,13 @@ Each entry has the same shape: a one-line summary, a *why* (the user-visible pay
 
 For continuity when a chunk references "the previous work":
 
+### Mid-stream add-table (Phase 1 MVP)
+
+- **`sluice schema add-table TABLE --stream-id ID`** — brings a new source table into an active CDC stream's scope without a destructive `--reset-target-data` cycle. Drained-stream workflow only (Phase 1): operator runs `sync stop --wait`, then `schema add-table`, then `sync start --resume`. Live add-table without the drain is Phase 2 (Strategy B / C from the proto-ADR). Implements the design in `docs/dev/design-mid-stream-add-table.md`.
+- **New surfaces.** `pipeline.AddTable` orchestrator (mirrors `Migrator` shape); pipeline-side optional interfaces `publicationAdder` / `snapshotSlotOpener` / `slotDropper` so engines opt in structurally. `Postgres.Engine.AddPublicationTables` issues `ALTER PUBLICATION ... ADD TABLE` (additive; existing scope untouched; idempotent on partial-add re-run). MySQL participates with no engine surface change — binlog already covers every table.
+- **Operator safeguards.** Refuses if no row exists for the supplied `--stream-id` (catches typos / wrong-target). Refuses if `stop_requested_at` is set (catches "forgot to drain"). Refuses if the target table already has rows (`TableEmptyChecker` preflight, same shape as cold-start). Refuses if the named table doesn't exist on the source (catches "ran add-table before CREATE TABLE landed"). All refusals surface clear messages with recovery steps. Typed-confirmation prompt mirroring `--reset-target-data`'s friction tier; `--yes` bypasses.
+- **Persisted position is intentionally NOT updated.** The stream's existing `sluice_cdc_state` position is still the right resume point for the other tables; the applier's idempotent upsert handles the [persisted_LSN, snapshot_LSN] overlap on the new table on resume.
+
 ### v0.1.0 foundations
 
 - **Simple-mode orchestrator** — three-phase apply, wired into `sluice migrate`.
@@ -223,21 +230,16 @@ Metric set covers position-derived (`sluice_lag_events`, `sluice_lag_seconds`), 
 
 ---
 
-### 5. Auto-translate-and-create on mid-stream new tables
+### 5. Mid-stream add-table — Phase 2 (live add, no drain)
 
-**Why.** ADR-0021 deliberately punted on mid-stream `CREATE TABLE`: a new table on a CDC source is currently silently dropped (defence-in-depth WARN, no schema propagation). The right path for "the developer ran a routine DDL" is to translate the new table's schema, create it on the target, and bring it into the publication scope — but doing this safely requires a mid-stream snapshot capture for the new table. Proto-ADR exists at [`design-mid-stream-add-table.md`](design-mid-stream-add-table.md).
+**Why.** Phase 1 (drained-stream add-table) shipped — see "Recently landed". Phase 2 removes the `sluice sync stop --wait` precondition by coordinating a brief CDC pause so the snapshot LSN aligns with the in-flight stream's position. Useful for high-availability workloads that can't tolerate the ~seconds-of-latency drain that Phase 1 requires.
 
-**What.** New subcommand `sluice schema add-table SOURCE.NAME ...` (or a flag on `sync start` / `migrate`) that:
-1. Reads the new table's source schema.
-2. Runs translation + creates it on the target.
-3. Captures a snapshot for that one table.
-4. Bulk-copies the table's rows.
-5. Adds it to the publication scope so future CDC events flow.
+**What.** Either Strategy B (in-stream snapshot alongside the live slot, atomic publication scope swap) or Strategy C (coordinated LSN handoff via a "pause at LSN" CDC-reader API) from the proto-ADR. Both are non-trivial; pick based on real operator demand and which one is easier to test deterministically.
 
 **Gotchas.**
-- Mid-stream snapshot capture is the load-bearing tricky bit — needs to coordinate with the in-flight CDC stream so the new table's snapshot LSN is past whatever's already been processed.
-- Operator confirmation prompt (mirroring `--reset-target-data`'s typed confirmation) since this is a schema mutation.
-- Sluice is not a schema-migration tool; this feature is about preserving streaming continuity, not about replacing tools like Atlas / sqitch / liquibase.
+- The brief pause-window must be small enough that operators don't notice; multi-second pauses defeat the point.
+- Strategy B's atomic publication-add is PG-only; MySQL needs a different shape (binlog auto-includes everything; the streamer's table-filter is the gate).
+- Concurrent add-tables (two operators racing) need a lock or the existing serialisation guarantees of `ALTER PUBLICATION`. Worth a multi-operator test.
 
 ---
 
