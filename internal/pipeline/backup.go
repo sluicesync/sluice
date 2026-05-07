@@ -144,8 +144,14 @@ func (b *Backup) Run(ctx context.Context) error {
 	if prior != nil {
 		switch prior.PartialState {
 		case ir.BackupStateInProgress:
-			slog.InfoContext(ctx, "backup: resuming partial backup",
-				slog.Int("completed_tables", len(prior.Tables)),
+			// Bug 34a: emit a clear "resuming" log line so operators
+			// can see resume happened. The detailed per-table fan-out
+			// (which tables to skip vs resume) follows once the schema
+			// is read; this is the headline.
+			slog.InfoContext(ctx, "resuming from partial backup",
+				slog.String("backup_dir", backupStoreDescriptor(b.Store)),
+				slog.Int("tables_in_prior_manifest", len(prior.Tables)),
+				slog.Time("prior_created_at", prior.CreatedAt),
 			)
 		case ir.BackupStateComplete, "":
 			if !b.ForceOverwrite {
@@ -219,17 +225,52 @@ func (b *Backup) Run(ctx context.Context) error {
 		// not the resume point.
 		manifest.CreatedAt = prior.CreatedAt
 	}
-	priorTables := indexManifestTables(priorCompletedTables(prior))
+	priorTables := indexManifestTables(priorResumableTables(prior))
 
-	for _, table := range schema.Tables {
-		key := manifestTableKey(table.Schema, table.Name)
-		if existing, ok := priorTables[key]; ok {
-			ok, err := tableChunksAllPresent(ctx, b.Store, existing)
+	// Bug 34a: Once the schema is in hand, fan out the resume decision
+	// per-table so operators can see exactly what's being resumed and
+	// what's being re-run. Decisions are surface-level only here; the
+	// actual skip / per-chunk-resume happens inside the loop below.
+	//
+	// A prior entry with Partial=false (or omitted, for backward compat
+	// with pre-v0.16.1 manifests) AND all its chunks still on the store
+	// is a "fully complete" table (skip whole table). Partial=true with
+	// some chunks present falls into the per-chunk resume path.
+	if prior != nil && prior.PartialState == ir.BackupStateInProgress {
+		var alreadyComplete, toResume []string
+		for _, table := range schema.Tables {
+			key := manifestTableKey(table.Schema, table.Name)
+			existing, ok := priorTables[key]
+			if !ok {
+				toResume = append(toResume, table.Name)
+				continue
+			}
+			full, err := tableManifestFullyComplete(ctx, b.Store, existing)
 			if err != nil {
 				return fmt.Errorf("backup: re-validate prior table %q: %w", table.Name, err)
 			}
-			if ok {
-				slog.InfoContext(ctx, "backup: table already complete in prior run; skipping",
+			if full {
+				alreadyComplete = append(alreadyComplete, table.Name)
+			} else {
+				toResume = append(toResume, table.Name)
+			}
+		}
+		slog.InfoContext(ctx, "resume plan",
+			slog.Int("tables_already_complete", len(alreadyComplete)),
+			slog.Any("tables_to_resume", toResume),
+		)
+	}
+
+	for _, table := range schema.Tables {
+		key := manifestTableKey(table.Schema, table.Name)
+		var priorTable *ir.TableManifest
+		if existing, ok := priorTables[key]; ok {
+			full, err := tableManifestFullyComplete(ctx, b.Store, existing)
+			if err != nil {
+				return fmt.Errorf("backup: re-validate prior table %q: %w", table.Name, err)
+			}
+			if full {
+				slog.InfoContext(ctx, "skipping table — already complete in partial backup",
 					slog.String("table", table.Name),
 					slog.Int64("rows", existing.RowCount),
 					slog.Int("chunks", len(existing.Chunks)),
@@ -237,19 +278,32 @@ func (b *Backup) Run(ctx context.Context) error {
 				manifest.Tables = append(manifest.Tables, existing)
 				continue
 			}
-			slog.WarnContext(ctx, "backup: prior-run chunks missing on store; re-running table",
+			// Partial: pass the prior entry through so backupTable can
+			// per-chunk-skip already-uploaded chunks (Bug 34b).
+			priorTable = existing
+			slog.InfoContext(ctx, "resuming table mid-stream — partial chunks present in prior backup",
 				slog.String("table", table.Name),
+				slog.Int("prior_chunks", len(existing.Chunks)),
+				slog.Bool("prior_partial_flag", existing.Partial),
 			)
 		}
-		entry, err := b.backupTable(ctx, rr, table, chunkRows)
-		if err != nil {
+		// backupTable stages its returned entry into manifest.Tables
+		// up-front so per-chunk checkpoints record progress as it
+		// accrues (Bug 34b's per-chunk granularity). The orchestrator
+		// must NOT append again here.
+		if _, err := b.backupTable(ctx, rr, table, chunkRows, priorTable, manifest); err != nil {
 			return wrapWithHint(PhaseBulkCopy, fmt.Errorf("backup: table %q: %w", table.Name, err))
 		}
-		manifest.Tables = append(manifest.Tables, entry)
 
 		// Per-table checkpoint: commit the manifest with PartialState
 		// = "in_progress" after each table so a crash before the next
-		// table loses at most one table of work.
+		// table loses at most one table of work. (Per-chunk checkpoints
+		// inside backupTable already capture sub-table progress; this
+		// final per-table commit ensures the manifest is up to date
+		// once the table fully closes — the per-chunk checkpoint after
+		// the last chunk usually has the same effect, but empty-table
+		// runs and tables whose row count is an exact chunk multiple
+		// rely on this final write.)
 		if err := writeManifest(ctx, b.Store, manifest); err != nil {
 			return fmt.Errorf("backup: checkpoint manifest after %q: %w", table.Name, err)
 		}
@@ -297,11 +351,23 @@ func (b *Backup) validate() error {
 // of chunkRows ends with a fully-written chunk and no extra trailing
 // chunk. Empty tables produce zero chunks (the manifest entry has
 // RowCount=0 and Chunks=nil) — keeps the storage layout tidy.
+//
+// Bug 34b: when priorTable is non-nil, its chunk entries are checked
+// before each new chunk gets a writer. If chunk N's prior info exists,
+// the recorded chunk is still on the store, AND its on-store SHA-256
+// matches the manifest's recorded SHA-256, the chunk is skipped — the
+// orchestrator advances the row cursor by chunk N's recorded RowCount
+// (reading-and-discarding) without opening a writer or hitting Put.
+// fullManifest, when non-nil, is the in-flight manifest to checkpoint
+// after each newly-written chunk so a mid-table crash leaves a manifest
+// recording exactly which chunks completed.
 func (b *Backup) backupTable(
 	ctx context.Context,
 	rr ir.RowReader,
 	table *ir.Table,
 	chunkRows int,
+	priorTable *ir.TableManifest,
+	fullManifest *ir.Manifest,
 ) (*ir.TableManifest, error) {
 	rows, err := rr.ReadRows(ctx, table)
 	if err != nil {
@@ -315,8 +381,15 @@ func (b *Backup) backupTable(
 	}
 
 	entry := &ir.TableManifest{
-		Schema: table.Schema,
-		Name:   table.Name,
+		Schema:  table.Schema,
+		Name:    table.Name,
+		Partial: true, // flips to false on natural EOF; per-chunk checkpoints persist it as true
+	}
+	// Stage the entry into the in-flight manifest now so per-chunk
+	// checkpoints capture progress as it accrues. The same pointer is
+	// returned to the orchestrator at the end.
+	if fullManifest != nil {
+		fullManifest.Tables = append(fullManifest.Tables, entry)
 	}
 
 	var (
@@ -357,7 +430,102 @@ func (b *Backup) backupTable(
 		writer = nil
 		buf = nil
 		chunkIdx++
+		// Per-chunk checkpoint: commit the manifest now so a mid-table
+		// crash (or kill) before the next table starts leaves an
+		// up-to-date record of exactly which chunks completed. The cost
+		// is one extra Put per chunk; benefit is the per-chunk skip on
+		// resume sees the right state. Bug 34b.
+		if fullManifest != nil {
+			if err := writeManifest(ctx, b.Store, fullManifest); err != nil {
+				return fmt.Errorf("checkpoint manifest after chunk %d: %w", chunkIdx-1, err)
+			}
+		}
 		return nil
+	}
+
+	// trySkipChunk inspects priorTable for a recorded entry at chunk
+	// chunkIdx. If the recorded entry is still on the store and its
+	// on-store bytes hash to the recorded SHA-256, the chunk is reused
+	// verbatim — the orchestrator advances the row cursor over chunk's
+	// rows without opening a writer or issuing a Put.
+	//
+	// Returns (skipped, nil) on a successful skip; (false, nil) when
+	// either no prior entry exists or the prior bytes mismatch (caller
+	// then writes the chunk normally — overwrite-on-mismatch).
+	trySkipChunk := func() (bool, error) {
+		if priorTable == nil || chunkIdx >= len(priorTable.Chunks) {
+			return false, nil
+		}
+		priorChunk := priorTable.Chunks[chunkIdx]
+		if priorChunk == nil || priorChunk.SHA256 == "" {
+			return false, nil
+		}
+		matches, err := chunkAlreadyMatches(ctx, b.Store, priorChunk.File, priorChunk.SHA256)
+		if err != nil {
+			return false, fmt.Errorf("inspect prior chunk %q: %w", priorChunk.File, err)
+		}
+		if !matches {
+			// Either the chunk is missing on the store or its bytes
+			// don't match the recorded SHA-256 (corrupted partial
+			// upload). Surface the second case loudly per the loud-
+			// failure tenet; either way the chunk gets re-written.
+			exists, existsErr := b.Store.Exists(ctx, priorChunk.File)
+			if existsErr == nil && exists {
+				slog.WarnContext(ctx, "prior chunk SHA-256 mismatch — overwriting on resume",
+					slog.String("table", table.Name),
+					slog.Int("chunk", chunkIdx),
+					slog.String("path", priorChunk.File),
+				)
+			}
+			return false, nil
+		}
+		// Reuse the prior entry verbatim and advance the cursor.
+		entry.Chunks = append(entry.Chunks, priorChunk)
+		// Discard the rows the skipped chunk covered so the row stream
+		// stays aligned with the chunk index. The chunk-row-range is
+		// deterministic ([N*chunkRows, (N+1)*chunkRows) in PK order),
+		// so reading-and-discarding priorChunk.RowCount rows from the
+		// channel preserves alignment for the next chunk.
+		discardN := priorChunk.RowCount
+		for discardN > 0 {
+			select {
+			case <-ctx.Done():
+				return false, ctx.Err()
+			case _, ok := <-rows:
+				if !ok {
+					return false, fmt.Errorf("row stream ended early while skipping chunk %d (had %d rows of %d to discard)", chunkIdx, priorChunk.RowCount-discardN, priorChunk.RowCount)
+				}
+				discardN--
+			}
+		}
+		rowsTotal += priorChunk.RowCount
+		slog.InfoContext(ctx, "skipping chunk — already complete in partial backup",
+			slog.String("table", table.Name),
+			slog.Int("chunk", chunkIdx),
+			slog.Int64("rows", priorChunk.RowCount),
+			slog.String("sha256", priorChunk.SHA256),
+		)
+		chunkIdx++
+		return true, nil
+	}
+
+	// Drive the per-chunk skip up-front before the row loop opens a
+	// new writer for chunk chunkIdx. We loop because successive chunks
+	// may all be skippable.
+	skipUntilWrite := func() error {
+		for {
+			skipped, err := trySkipChunk()
+			if err != nil {
+				return err
+			}
+			if !skipped {
+				return nil
+			}
+		}
+	}
+
+	if err := skipUntilWrite(); err != nil {
+		return nil, err
 	}
 
 	for {
@@ -378,6 +546,7 @@ func (b *Backup) backupTable(
 					}
 				}
 				entry.RowCount = rowsTotal
+				entry.Partial = false // table EOF reached naturally; flip the partial flag off
 				slog.InfoContext(ctx, "backup: table complete",
 					slog.String("table", table.Name),
 					slog.Int64("rows", rowsTotal),
@@ -399,6 +568,11 @@ func (b *Backup) backupTable(
 			rowsTotal++
 			if writer.RowCount() >= int64(chunkRows) {
 				if err := flush(); err != nil {
+					return nil, err
+				}
+				// After flushing, the next chunk index might also have
+				// been pre-uploaded in a prior run — try to skip again.
+				if err := skipUntilWrite(); err != nil {
 					return nil, err
 				}
 			}
@@ -464,9 +638,9 @@ func readManifestIfPresent(ctx context.Context, store ir.BackupStore) (*ir.Manif
 	return readManifest(ctx, store)
 }
 
-// priorCompletedTables returns the prior manifest's table list when
-// the manifest is in a state where its entries can be trusted as
-// "this table is fully done." Returns nil for a nil manifest.
+// priorResumableTables returns the prior manifest's table list when
+// the manifest is in a state where its entries are eligible for
+// resume. Returns nil for a nil manifest.
 //
 // Only "in_progress" manifests carry per-table progress; "complete"
 // manifests are the same shape but get rejected up-stack unless
@@ -474,11 +648,32 @@ func readManifestIfPresent(ctx context.Context, store ir.BackupStore) (*ir.Manif
 // nilled out prior. Empty PartialState (Phase 1 manifests) is treated
 // the same as "complete" — those manifests are immutable backups, not
 // resume points.
-func priorCompletedTables(prior *ir.Manifest) []*ir.TableManifest {
+//
+// Renamed from priorCompletedTables in v0.16.1: per-chunk-resume needs
+// partial-table entries too, not just fully-completed-tables. Callers
+// must check chunk-level state themselves before reusing entries.
+func priorResumableTables(prior *ir.Manifest) []*ir.TableManifest {
 	if prior == nil || prior.PartialState != ir.BackupStateInProgress {
 		return nil
 	}
 	return prior.Tables
+}
+
+// backupStoreDescriptor returns a short human-readable identifier of
+// the destination store for log lines. LocalStore reports the absolute
+// root directory; BlobStore reports the (annotated) URL with credentials
+// stripped. Other implementations of [ir.BackupStore] fall back to
+// `<unknown-store>` so log shape is stable.
+func backupStoreDescriptor(s ir.BackupStore) string {
+	type rooted interface{ Root() string }
+	type urled interface{ URL() string }
+	if r, ok := s.(rooted); ok {
+		return r.Root()
+	}
+	if u, ok := s.(urled); ok {
+		return u.URL()
+	}
+	return "<unknown-store>"
 }
 
 // tableChunksAllPresent verifies every chunk listed in entry is still
@@ -498,6 +693,25 @@ func tableChunksAllPresent(ctx context.Context, store ir.BackupStore, entry *ir.
 		}
 	}
 	return true, nil
+}
+
+// tableManifestFullyComplete reports whether a prior table entry
+// represents a fully-completed table backup (so the resume can skip
+// the table whole) vs a mid-stream partial state (resume per-chunk
+// inside the table).
+//
+// Two conditions both required: (1) the entry's Partial flag is false
+// (the row stream reached natural EOF when the entry was written; the
+// flag is omitted in pre-v0.16.1 manifests, defaulting to false there
+// too — those manifests only ever persisted entries at table-completion
+// boundaries, so the default is correct); (2) every chunk listed is
+// still present on the store (an operator who manually deleted chunks
+// between runs forces a re-stream).
+func tableManifestFullyComplete(ctx context.Context, store ir.BackupStore, entry *ir.TableManifest) (bool, error) {
+	if entry.Partial {
+		return false, nil
+	}
+	return tableChunksAllPresent(ctx, store, entry)
 }
 
 // chunkAlreadyMatches reports whether key already exists in store and

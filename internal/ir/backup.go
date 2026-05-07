@@ -183,6 +183,16 @@ type TableManifest struct {
 	// the actual delivered count after restore completes.
 	RowCount int64 `json:"row_count"`
 
+	// Partial reports whether this entry is a mid-table per-chunk
+	// checkpoint (v0.16.1+) rather than a fully-completed table. True
+	// means the row stream was killed before reaching EOF — the chunks
+	// listed are the chunks completed so far. Default (false / omitted)
+	// means the entry represents a fully-completed table; Phase-1 and
+	// v0.16.0 manifests carry no partial information so the omitted
+	// default preserves backward-compat (those entries were only ever
+	// persisted at table boundaries).
+	Partial bool `json:"partial,omitempty"`
+
 	// Chunks are the chunk files for this table, in write order.
 	// Empty when the table is empty (no chunk file is created in
 	// that case to avoid clutter).

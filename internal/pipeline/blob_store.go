@@ -50,6 +50,18 @@ import (
 type BlobStore struct {
 	bucket *blob.Bucket
 	url    string
+
+	// prefix is the path component the URL carried after the bucket
+	// name (e.g. `backup-v0160` for `s3://bucket/backup-v0160`). It is
+	// prepended to every key passed to bucket and stripped from List
+	// results so callers see paths relative to the configured prefix.
+	//
+	// Bug 33 (v0.16.0): gocloud.dev/blob.OpenBucket consumes only the
+	// bucket name from the URL; the path is silently dropped, so
+	// previously every key landed at bucket root regardless of what
+	// the operator wrote. Tracking it here and prefixing on every
+	// operation restores the "many backups in one bucket" workflow.
+	prefix string
 }
 
 // BlobStoreOptions tunes the URL [OpenBlobStore] passes to gocloud.
@@ -91,7 +103,63 @@ func OpenBlobStore(ctx context.Context, urlStr string, opts BlobStoreOptions) (*
 	if err != nil {
 		return nil, fmt.Errorf("blob store: open bucket %q: %w", redactBlobURL(full), err)
 	}
-	return &BlobStore{bucket: bucket, url: full}, nil
+	prefix, err := extractBlobPrefix(full)
+	if err != nil {
+		_ = bucket.Close()
+		return nil, err
+	}
+	return &BlobStore{bucket: bucket, url: full, prefix: prefix}, nil
+}
+
+// extractBlobPrefix pulls the path-after-bucket component out of the
+// (annotated) URL. gocloud's [blob.OpenBucket] only consumes the
+// bucket / container name from the URL — for `s3://bucket/foo/bar` the
+// driver sees `bucket` and `foo/bar` is silently dropped. We keep the
+// dropped piece here so all object keys can be prefixed with it,
+// restoring "many backups in one bucket" workflows.
+//
+// Returns the path with leading and trailing slashes trimmed; empty
+// when the URL had no path component.
+func extractBlobPrefix(urlStr string) (string, error) {
+	u, err := url.Parse(urlStr)
+	if err != nil {
+		return "", fmt.Errorf("blob store: parse URL %q for prefix: %w", urlStr, err)
+	}
+	// fileblob is the lone exception: the URL's path *is* the bucket
+	// (a local directory). gocloud treats the whole thing as the
+	// bucket root, so we must not double-prefix.
+	if u.Scheme == "file" {
+		return "", nil
+	}
+	p := strings.TrimPrefix(u.Path, "/")
+	p = strings.TrimSuffix(p, "/")
+	return p, nil
+}
+
+// joinBlobKey prepends the BlobStore's prefix to key and returns the
+// underlying-bucket path. The empty-prefix case passes key through
+// unchanged so the no-prefix URL shape behaves identically to v0.16.0.
+func (s *BlobStore) joinBlobKey(key string) string {
+	if s.prefix == "" {
+		return key
+	}
+	return s.prefix + "/" + key
+}
+
+// stripBlobPrefix removes the BlobStore's prefix from key. Used on
+// List output so callers see paths relative to the configured prefix
+// (matching [LocalStore]'s contract). Keys that don't start with the
+// prefix are returned verbatim — defensive only, the bucket should
+// never surface such keys when listing under the prefix.
+func (s *BlobStore) stripBlobPrefix(key string) string {
+	if s.prefix == "" {
+		return key
+	}
+	pfx := s.prefix + "/"
+	if strings.HasPrefix(key, pfx) {
+		return strings.TrimPrefix(key, pfx)
+	}
+	return key
 }
 
 // URL returns the (annotated) URL the store was opened with. Useful
@@ -119,6 +187,7 @@ func (s *BlobStore) Put(ctx context.Context, path string, r io.Reader) error {
 	if err != nil {
 		return err
 	}
+	key = s.joinBlobKey(key)
 	w, err := s.bucket.NewWriter(ctx, key, nil)
 	if err != nil {
 		return fmt.Errorf("blob store: open writer for %q: %w", path, err)
@@ -143,6 +212,7 @@ func (s *BlobStore) Get(ctx context.Context, path string) (io.ReadCloser, error)
 	if err != nil {
 		return nil, err
 	}
+	key = s.joinBlobKey(key)
 	rc, err := s.bucket.NewReader(ctx, key, nil)
 	if err != nil {
 		return nil, wrapBlobErr("open reader", path, err)
@@ -151,7 +221,9 @@ func (s *BlobStore) Get(ctx context.Context, path string) (io.ReadCloser, error)
 }
 
 // List implements [ir.BackupStore.List]. Returns every key whose name
-// starts with prefix, in unspecified order.
+// starts with prefix, in unspecified order. Paths in the result are
+// relative to the BlobStore's configured prefix — matching
+// [LocalStore]'s contract.
 func (s *BlobStore) List(ctx context.Context, prefix string) ([]string, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -164,7 +236,8 @@ func (s *BlobStore) List(ctx context.Context, prefix string) ([]string, error) {
 			return nil, err
 		}
 	}
-	iter := s.bucket.List(&blob.ListOptions{Prefix: prefix})
+	listPrefix := s.joinBlobKey(prefix)
+	iter := s.bucket.List(&blob.ListOptions{Prefix: listPrefix})
 	var out []string
 	for {
 		obj, err := iter.Next(ctx)
@@ -177,7 +250,7 @@ func (s *BlobStore) List(ctx context.Context, prefix string) ([]string, error) {
 		if obj.IsDir {
 			continue
 		}
-		out = append(out, obj.Key)
+		out = append(out, s.stripBlobPrefix(obj.Key))
 	}
 	return out, nil
 }
@@ -192,6 +265,7 @@ func (s *BlobStore) Delete(ctx context.Context, path string) error {
 	if err != nil {
 		return err
 	}
+	key = s.joinBlobKey(key)
 	if err := s.bucket.Delete(ctx, key); err != nil {
 		if gcerrors.Code(err) == gcerrors.NotFound {
 			return nil
@@ -213,6 +287,7 @@ func (s *BlobStore) Exists(ctx context.Context, path string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	key = s.joinBlobKey(key)
 	exists, err := s.bucket.Exists(ctx, key)
 	if err != nil {
 		return false, wrapBlobErr("exists", path, err)

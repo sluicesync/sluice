@@ -13,6 +13,11 @@ import (
 	"sort"
 	"strings"
 	"testing"
+
+	"gocloud.dev/blob"
+
+	// Memory blob driver for prefix tests — no creds, no network.
+	_ "gocloud.dev/blob/memblob"
 )
 
 // fileBlobURL builds a file:// URL gocloud's fileblob driver can open.
@@ -257,6 +262,164 @@ func TestBlobStore_GCSAndAzureURLsAccepted(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestBlobStore_ExtractPrefix pins the URL → prefix mapping. The path
+// component after the bucket name is what gocloud's URL parser drops
+// silently (Bug 33); BlobStore now keeps it for prefixing keys.
+func TestBlobStore_ExtractPrefix(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"s3 with prefix", "s3://bucket/foo", "foo"},
+		{"s3 multi-segment prefix", "s3://bucket/foo/bar", "foo/bar"},
+		{"s3 with trailing slash", "s3://bucket/foo/bar/", "foo/bar"},
+		{"s3 no prefix", "s3://bucket", ""},
+		{"s3 no prefix with slash", "s3://bucket/", ""},
+		{"gs with prefix", "gs://bucket/foo/bar", "foo/bar"},
+		{"azblob with prefix", "azblob://container/foo", "foo"},
+		{"file no prefix (path is bucket)", "file:///tmp/dir", ""},
+		{"file with sub-path (still no prefix)", "file:///tmp/dir/sub", ""},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			got, err := extractBlobPrefix(c.in)
+			if err != nil {
+				t.Fatalf("extractBlobPrefix(%q): %v", c.in, err)
+			}
+			if got != c.want {
+				t.Errorf("extractBlobPrefix(%q) = %q; want %q", c.in, got, c.want)
+			}
+		})
+	}
+}
+
+// TestBlobStore_PrefixRoundTrip verifies Bug 33's fix end-to-end via
+// the memblob driver: opening a BlobStore at `mem://anything/prefix/inner`
+// causes Put/Get/List/Exists/Delete to operate on prefix-joined keys
+// against the underlying bucket. Keys returned by List are relative to
+// the configured prefix (matching LocalStore's contract).
+func TestBlobStore_PrefixRoundTrip(t *testing.T) {
+	store, err := OpenBlobStore(context.Background(), "mem://ignored/foo/bar", BlobStoreOptions{})
+	if err != nil {
+		t.Fatalf("OpenBlobStore: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	if store.prefix != "foo/bar" {
+		t.Fatalf("store.prefix = %q; want %q", store.prefix, "foo/bar")
+	}
+
+	want := []byte("body")
+	if err := store.Put(context.Background(), "manifest.json", bytes.NewReader(want)); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	// The underlying bucket should see the prefixed key.
+	exists, err := store.bucket.Exists(context.Background(), "foo/bar/manifest.json")
+	if err != nil {
+		t.Fatalf("underlying bucket Exists: %v", err)
+	}
+	if !exists {
+		t.Errorf("underlying bucket key foo/bar/manifest.json missing; prefix not applied on Put")
+	}
+	// And the un-prefixed path should NOT exist (Bug 33 regression).
+	exists, err = store.bucket.Exists(context.Background(), "manifest.json")
+	if err != nil {
+		t.Fatalf("underlying bucket Exists (root): %v", err)
+	}
+	if exists {
+		t.Errorf("underlying bucket key manifest.json present at root; prefix should have been applied")
+	}
+
+	// BlobStore.Get sees the prefix-relative path.
+	rc, err := store.Get(context.Background(), "manifest.json")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	got, err := io.ReadAll(rc)
+	_ = rc.Close()
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Errorf("got %q; want %q", got, want)
+	}
+
+	// BlobStore.Exists sees the prefix-relative path.
+	yes, err := store.Exists(context.Background(), "manifest.json")
+	if err != nil {
+		t.Fatalf("Exists: %v", err)
+	}
+	if !yes {
+		t.Errorf("Exists(manifest.json) = false; want true")
+	}
+
+	// Populate a few sub-paths, then List → results are relative.
+	for _, k := range []string{"chunks/a.bin", "chunks/b.bin", "manifest.json"} {
+		if err := store.Put(context.Background(), k, bytes.NewReader([]byte("x"))); err != nil {
+			t.Fatalf("Put %q: %v", k, err)
+		}
+	}
+	keys, err := store.List(context.Background(), "chunks/")
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	sort.Strings(keys)
+	wantKeys := []string{"chunks/a.bin", "chunks/b.bin"}
+	if !equalStrSlices(keys, wantKeys) {
+		t.Errorf("List = %v; want %v (prefix-stripped)", keys, wantKeys)
+	}
+
+	// Delete uses the prefix; the underlying object should disappear.
+	if err := store.Delete(context.Background(), "chunks/a.bin"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	exists, err = store.bucket.Exists(context.Background(), "foo/bar/chunks/a.bin")
+	if err != nil {
+		t.Fatalf("underlying bucket Exists post-Delete: %v", err)
+	}
+	if exists {
+		t.Errorf("Delete didn't remove prefixed key")
+	}
+}
+
+// TestBlobStore_PrefixEmpty pins that the no-prefix URL shape behaves
+// identically to v0.16.0 — keys land at bucket root.
+func TestBlobStore_PrefixEmpty(t *testing.T) {
+	store, err := OpenBlobStore(context.Background(), "mem://ignored", BlobStoreOptions{})
+	if err != nil {
+		t.Fatalf("OpenBlobStore: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+	if store.prefix != "" {
+		t.Fatalf("store.prefix = %q; want empty", store.prefix)
+	}
+	if err := store.Put(context.Background(), "key", bytes.NewReader([]byte("x"))); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	exists, err := store.bucket.Exists(context.Background(), "key")
+	if err != nil {
+		t.Fatalf("underlying Exists: %v", err)
+	}
+	if !exists {
+		t.Errorf("Put with empty prefix didn't land at root")
+	}
+}
+
+// TestBlobStore_MemSchemeAccepted is a smoke test: confirms the memblob
+// scheme is registered (so the prefix tests above can reach the bucket).
+func TestBlobStore_MemSchemeAccepted(t *testing.T) {
+	// Direct probe via gocloud — the side-effect import lives in this
+	// test file, so this will fail loudly if it ever gets removed.
+	b, err := blob.OpenBucket(context.Background(), "mem://")
+	if err != nil {
+		t.Fatalf("memblob driver missing: %v", err)
+	}
+	_ = b.Close()
 }
 
 func TestBlobStore_ContextCancellation(t *testing.T) {

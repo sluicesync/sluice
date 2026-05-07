@@ -159,22 +159,25 @@ func minioBlobStore(t *testing.T, endpoint, bucket, prefix string) (*BlobStore, 
 func TestBlobStore_MinIO_RoundTrip(t *testing.T) {
 	endpoint, bucket, cleanup := startMinIO(t)
 	defer cleanup()
+	// `phase2/` is the URL prefix; v0.16.1 onwards routes object keys
+	// under that prefix in the bucket. Caller-side paths are RELATIVE
+	// to the prefix (matches the LocalStore contract).
 	store, storeCleanup := minioBlobStore(t, endpoint, bucket, "phase2/")
 	defer storeCleanup()
 
 	// Put → Exists → Get → checksum-matches.
 	want := []byte("phase 2 cloud roundtrip data")
-	if err := store.Put(context.Background(), "phase2/manifest.json", bytes.NewReader(want)); err != nil {
+	if err := store.Put(context.Background(), "manifest.json", bytes.NewReader(want)); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
-	exists, err := store.Exists(context.Background(), "phase2/manifest.json")
+	exists, err := store.Exists(context.Background(), "manifest.json")
 	if err != nil {
 		t.Fatalf("Exists: %v", err)
 	}
 	if !exists {
 		t.Errorf("Exists after Put = false; want true")
 	}
-	rc, err := store.Get(context.Background(), "phase2/manifest.json")
+	rc, err := store.Get(context.Background(), "manifest.json")
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
@@ -187,27 +190,39 @@ func TestBlobStore_MinIO_RoundTrip(t *testing.T) {
 		t.Errorf("got %q; want %q", got, want)
 	}
 
-	// List against a prefix.
-	for _, key := range []string{"phase2/chunks/users/0.bin", "phase2/chunks/users/1.bin", "phase2/chunks/orders/0.bin"} {
+	// Verify the underlying object actually lives at <bucket>/phase2/manifest.json
+	// and not at the bucket root (Bug 33 regression check). Direct AWS
+	// SDK call so we're confirming the wire shape, not just that the
+	// BlobStore round-trips through itself.
+	if err := assertS3KeyExists(t, endpoint, bucket, "phase2/manifest.json"); err != nil {
+		t.Errorf("Bug 33 regression: %v", err)
+	}
+	if err := assertS3KeyAbsent(t, endpoint, bucket, "manifest.json"); err != nil {
+		t.Errorf("Bug 33 regression: bucket-root manifest.json should not exist: %v", err)
+	}
+
+	// List against a prefix; keys are returned relative to the URL
+	// prefix.
+	for _, key := range []string{"chunks/users/0.bin", "chunks/users/1.bin", "chunks/orders/0.bin"} {
 		if err := store.Put(context.Background(), key, bytes.NewReader([]byte("x"))); err != nil {
 			t.Fatalf("Put %s: %v", key, err)
 		}
 	}
-	keys, err := store.List(context.Background(), "phase2/chunks/users/")
+	keys, err := store.List(context.Background(), "chunks/users/")
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
 	sort.Strings(keys)
-	wantKeys := []string{"phase2/chunks/users/0.bin", "phase2/chunks/users/1.bin"}
+	wantKeys := []string{"chunks/users/0.bin", "chunks/users/1.bin"}
 	if !equalStrSlices(keys, wantKeys) {
 		t.Errorf("List = %v; want %v", keys, wantKeys)
 	}
 
 	// Delete then Exists returns false.
-	if err := store.Delete(context.Background(), "phase2/manifest.json"); err != nil {
+	if err := store.Delete(context.Background(), "manifest.json"); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
-	exists, err = store.Exists(context.Background(), "phase2/manifest.json")
+	exists, err = store.Exists(context.Background(), "manifest.json")
 	if err != nil {
 		t.Fatalf("Exists after Delete: %v", err)
 	}
@@ -216,9 +231,47 @@ func TestBlobStore_MinIO_RoundTrip(t *testing.T) {
 	}
 
 	// Idempotent Delete.
-	if err := store.Delete(context.Background(), "phase2/manifest.json"); err != nil {
+	if err := store.Delete(context.Background(), "manifest.json"); err != nil {
 		t.Errorf("idempotent Delete: %v", err)
 	}
+}
+
+// assertS3KeyExists builds a fresh AWS SDK client against the MinIO
+// endpoint and HEADs the key directly, bypassing the BlobStore. Used to
+// verify that an object the BlobStore wrote actually landed at the
+// expected bucket-prefix path (Bug 33 regression check).
+func assertS3KeyExists(t *testing.T, endpoint, bucket, key string) error {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cfg, err := awsconfig.LoadDefaultConfig(ctx,
+		awsconfig.WithRegion(minioRegion),
+		awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(minioAccessKey, minioSecretKey, "")),
+	)
+	if err != nil {
+		return fmt.Errorf("load aws config: %w", err)
+	}
+	client := s3.NewFromConfig(cfg, func(o *s3.Options) {
+		o.UsePathStyle = true
+		o.BaseEndpoint = aws.String(endpoint)
+	})
+	_, err = client.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		return fmt.Errorf("HeadObject %s/%s: %w", bucket, key, err)
+	}
+	return nil
+}
+
+// assertS3KeyAbsent is the inverse: returns an error iff a key exists.
+func assertS3KeyAbsent(t *testing.T, endpoint, bucket, key string) error {
+	t.Helper()
+	if err := assertS3KeyExists(t, endpoint, bucket, key); err == nil {
+		return fmt.Errorf("key %s/%s exists; expected absent", bucket, key)
+	}
+	return nil
 }
 
 // TestBlobStore_MinIO_BackupRestoreRoundTrip is the cross-engine

@@ -75,11 +75,13 @@ func TestBackup_ResumeSkipsAlreadyCompletedTables(t *testing.T) {
 	}
 	src := newBackupRecorderEngine("postgres", schema, rows)
 
-	// First run: fail on the 3rd Put. Order of Puts is:
+	// First run: fail on the 4th Put. Order of Puts (v0.16.1+ — Bug 34b
+	// added per-chunk checkpoint, see backup.go) is:
 	//   1: users chunk 0
-	//   2: manifest checkpoint after users
-	//   3: posts chunk 0  ← fails here
-	failing := newFailOnNthPutStore(inner, 3)
+	//   2: per-chunk checkpoint after users chunk 0 (users.Partial=true)
+	//   3: per-table checkpoint after users completes (users.Partial=false)
+	//   4: posts chunk 0  ← fails here
+	failing := newFailOnNthPutStore(inner, 4)
 	b1 := &Backup{
 		Source: src, SourceDSN: "src", Store: failing,
 		ChunkRows: 100, // one chunk per table
@@ -134,12 +136,17 @@ func TestBackup_ResumeSkipsAlreadyCompletedTables(t *testing.T) {
 	}
 
 	// The resume run should have done EXACTLY the work the second
-	// table required: 1 chunk Put + 2 manifest Puts (per-table
-	// checkpoint + final flip-to-complete) = 3 Puts. The users chunk
-	// is not in that count — it was already on disk and the chunk-
-	// matches helper short-circuited the upload.
-	if counting.puts != 3 {
-		t.Errorf("resume Put count = %d; want 3 (1 chunk + 2 manifest)", counting.puts)
+	// table required:
+	//   - 1 chunk Put for posts chunk 0
+	//   - 1 manifest Put for the per-chunk checkpoint after posts chunk 0
+	//     (Bug 34b: per-chunk granularity, v0.16.1+)
+	//   - 1 manifest Put for the per-table checkpoint after posts
+	//   - 1 manifest Put for the final flip-to-complete
+	// = 4 Puts. The users chunk is not in that count — it was already
+	// on disk from the first run and trySkipChunk short-circuited the
+	// upload (no row read, no Put).
+	if counting.puts != 4 {
+		t.Errorf("resume Put count = %d; want 4 (1 chunk + 3 manifest checkpoints)", counting.puts)
 	}
 
 	// Verify the backup overall.
@@ -256,6 +263,171 @@ func TestBackup_ChunkAlreadyMatchesHelper(t *testing.T) {
 	if matches {
 		t.Errorf("chunkAlreadyMatches = true on missing file; want false")
 	}
+}
+
+// TestBackup_ResumePerChunkSkipsAlreadyUploadedChunks pins Bug 34b's
+// fix: a partial-state manifest that records ChunkInfo entries for
+// chunks 0..N (and those chunks are still on disk with matching
+// SHA-256) causes the resume run to skip those chunks — neither
+// re-uploading them (no Put against those paths) nor aborting on a
+// row-stream mismatch.
+//
+// Setup: write the table once with --chunk-rows=2 to produce 3 chunks.
+// Stash that backup state, simulate a "killed mid-table" by truncating
+// the manifest to keep only chunks 0 and 1. Then re-run; verify chunks
+// 0 and 1 are NOT re-uploaded (Put count proves it) and chunk 2 is.
+func TestBackup_ResumePerChunkSkipsAlreadyUploadedChunks(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewLocalStore(dir)
+	if err != nil {
+		t.Fatalf("NewLocalStore: %v", err)
+	}
+
+	schema := &ir.Schema{
+		Tables: []*ir.Table{
+			{
+				Name: "events",
+				Columns: []*ir.Column{
+					{Name: "id", Type: ir.Integer{Width: 64}},
+				},
+			},
+		},
+	}
+	rows := map[string][]ir.Row{
+		"events": {
+			{"id": int64(1)},
+			{"id": int64(2)},
+			{"id": int64(3)},
+			{"id": int64(4)},
+			{"id": int64(5)},
+		},
+	}
+
+	// First run: full backup with chunk-rows=2 → 3 chunks (2,2,1).
+	src1 := newBackupRecorderEngine("postgres", schema, rows)
+	b1 := &Backup{
+		Source: src1, SourceDSN: "src", Store: store,
+		ChunkRows: 2,
+	}
+	if err := b1.Run(context.Background()); err != nil {
+		t.Fatalf("first Run: %v", err)
+	}
+	full, err := readManifest(context.Background(), store)
+	if err != nil {
+		t.Fatalf("readManifest: %v", err)
+	}
+	if len(full.Tables) != 1 || len(full.Tables[0].Chunks) != 3 {
+		t.Fatalf("expected 3 chunks; got %+v", full.Tables)
+	}
+
+	// Stash chunks 0 and 1's SHA-256 for assertion later.
+	wantChunk0SHA := full.Tables[0].Chunks[0].SHA256
+	wantChunk1SHA := full.Tables[0].Chunks[1].SHA256
+
+	// Mutate the manifest to look like a "killed mid-table" state:
+	// keep chunks 0 and 1 but drop chunk 2. The chunk file for chunk 2
+	// stays on disk; the resume run should re-write it (chunks 0 and 1
+	// match the prior; the loop continues to chunk 2). Partial=true
+	// signals to the orchestrator that this is a mid-stream entry, not
+	// a fully-completed table.
+	partial := &ir.Manifest{
+		FormatVersion: ir.BackupFormatVersion,
+		SourceEngine:  "postgres",
+		Schema:        schema,
+		PartialState:  ir.BackupStateInProgress,
+		Tables: []*ir.TableManifest{
+			{
+				Name:     "events",
+				RowCount: 4, // chunks 0+1 hold 4 of the 5 rows
+				Partial:  true,
+				Chunks: []*ir.ChunkInfo{
+					full.Tables[0].Chunks[0],
+					full.Tables[0].Chunks[1],
+				},
+			},
+		},
+	}
+	if err := writeManifest(context.Background(), store, partial); err != nil {
+		t.Fatalf("writeManifest partial: %v", err)
+	}
+	// Delete chunk 2's file so the resume actually has work to do for
+	// chunk 2 (and to assert chunks 0/1 aren't being re-uploaded).
+	chunk2Path := full.Tables[0].Chunks[2].File
+	if err := store.Delete(context.Background(), chunk2Path); err != nil {
+		t.Fatalf("delete chunk 2 file: %v", err)
+	}
+
+	// Resume run: count Puts to verify chunks 0/1 are NOT re-uploaded.
+	counting := &countingPutPerPathStore{LocalStore: store}
+	src2 := newBackupRecorderEngine("postgres", schema, rows)
+	b2 := &Backup{
+		Source: src2, SourceDSN: "src", Store: counting,
+		ChunkRows: 2,
+	}
+	if err := b2.Run(context.Background()); err != nil {
+		t.Fatalf("resume Run: %v", err)
+	}
+
+	// Final manifest has 3 chunks again.
+	final, err := readManifest(context.Background(), store)
+	if err != nil {
+		t.Fatalf("readManifest final: %v", err)
+	}
+	if final.PartialState != ir.BackupStateComplete {
+		t.Errorf("PartialState = %q; want complete", final.PartialState)
+	}
+	if len(final.Tables) != 1 || len(final.Tables[0].Chunks) != 3 {
+		t.Fatalf("expected 3 chunks post-resume; got %+v", final.Tables)
+	}
+
+	// Chunks 0 and 1 must carry the SAME SHA-256 the original full
+	// run recorded — proves they weren't re-streamed/re-hashed.
+	if final.Tables[0].Chunks[0].SHA256 != wantChunk0SHA {
+		t.Errorf("chunk 0 SHA changed across resume: %q → %q", wantChunk0SHA, final.Tables[0].Chunks[0].SHA256)
+	}
+	if final.Tables[0].Chunks[1].SHA256 != wantChunk1SHA {
+		t.Errorf("chunk 1 SHA changed across resume: %q → %q", wantChunk1SHA, final.Tables[0].Chunks[1].SHA256)
+	}
+
+	// Per-path Put counts: chunks 0 and 1 should have 0 Puts during
+	// the resume run; chunk 2 should have exactly 1.
+	chunk0Path := full.Tables[0].Chunks[0].File
+	chunk1Path := full.Tables[0].Chunks[1].File
+	if got := counting.putsTo[chunk0Path]; got != 0 {
+		t.Errorf("Put count for chunk 0 (%s) = %d; want 0 (already-uploaded skip should fire)", chunk0Path, got)
+	}
+	if got := counting.putsTo[chunk1Path]; got != 0 {
+		t.Errorf("Put count for chunk 1 (%s) = %d; want 0", chunk1Path, got)
+	}
+	if got := counting.putsTo[chunk2Path]; got != 1 {
+		t.Errorf("Put count for chunk 2 (%s) = %d; want 1", chunk2Path, got)
+	}
+
+	// Final overall verify still clean.
+	total, mismatches, err := VerifyBackup(context.Background(), store)
+	if err != nil {
+		t.Fatalf("VerifyBackup: %v", err)
+	}
+	if mismatches != 0 || total != 3 {
+		t.Errorf("VerifyBackup = %d mismatches over %d chunks; want 0 over 3", mismatches, total)
+	}
+}
+
+// countingPutPerPathStore records how many Puts hit each path. Used by
+// the per-chunk-skip test to verify already-uploaded chunks aren't
+// re-Put on resume.
+type countingPutPerPathStore struct {
+	*LocalStore
+
+	putsTo map[string]int
+}
+
+func (s *countingPutPerPathStore) Put(ctx context.Context, path string, r io.Reader) error {
+	if s.putsTo == nil {
+		s.putsTo = make(map[string]int)
+	}
+	s.putsTo[path]++
+	return s.LocalStore.Put(ctx, path, r)
 }
 
 // TestBackup_ResumeWithMissingPriorChunksReruns confirms that when a
