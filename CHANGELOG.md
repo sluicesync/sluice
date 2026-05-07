@@ -6,25 +6,43 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-### Added (will land in next release)
+### Fixed
+
+- **`--output FILE` error messages** previously prefixed "preview:" regardless of which command (`schema preview`, `schema diff`, `verify`, `sync health`) invoked the shared atomic-write helper. Renamed prefix to "atomic output:" which describes the helper's actual responsibility and is correct regardless of caller. Cosmetic; surfaced by the v0.12.0 + v0.13.0 test cycles. (Will land in the next tagged release.)
+
+## [0.13.0] - 2026-05-07
+
+Companion to v0.12.0's `sluice verify` count-mode MVP — adds the **liveness side** of the user's "100% confidence" goal. Where verify covers data-integrity, `sluice sync health` covers liveness (is the sync still ticking?). Together they close the no-Fivetran-silent-stop pain shape on both axes.
+
+Plus operator-facing polish: extra-on-target reporting on verify, integration tests for verify, the README troubleshooting matrix, the Vitess VStream troubleshooting runbook, and 6 new proto-ADRs capturing the design space for the next round of substantive feature work.
+
+### Added
 
 - **`sluice sync health` command (probe MVP).** Companion to `sluice verify` from the sync-health monitoring proto-ADR (`docs/dev/design-sync-health-monitoring.md`). Probes a target's `sluice_cdc_state` for the supplied `--stream-id` and computes wall-clock seconds-since-last-apply; compares against `--max-stale-seconds` threshold; structured exit code (0 healthy / 1 stale / 2 op error) integrates with cron / alertmanager / blackbox-exporter / GitHub-Actions-CI pipelines. `--format text|json`; `--output FILE` for atomic write. **MVP scope** — exposes only target-side state (what `ListStreams` already carries); source-side position comparison + true lag-events / lag-seconds metrics follow with the new `ir.HealthReporter` interface. Closes the cron-friendly "is the target still ticking?" probe gap, which is the load-bearing operator concern (Fivetran-stops-silently shape).
 - **`sluice verify` reports tables present on target but absent from source.** Surfaced informationally in the new `VerifyResult.ExtraOnTarget` slice + the `TablesExtraOnTarget` summary count + a section in the text output. Does NOT count as mismatch (operators with shared targets often have other-app tables alongside sluice-managed ones; flagging would produce false-positive alerts). Text output nudges to `sluice schema diff` for structural-drift reconciliation.
 - **Integration tests for verify** (`internal/pipeline/verify_integration_test.go`) — four real-DB tests cover happy path (PG→PG), intentional drift on target, extra-on-target reporting, and MySQL→MySQL clean. Run under `-tags=integration` in CI on every push.
+- **FK edge-case test coverage** — six new unit tests across both engines (`TestEmitAddForeignKey_SelfReferential`, `TestEmitAddForeignKey_CompositePK`, `TestEmitAddForeignKey_AllOnDeleteActions` for both PG and MySQL). Pin self-ref FK shape, composite-PK FK shape, and every supported `ir.FKAction` keyword. No code changes; tests just pin behaviors per `design-schema-completeness.md`.
 
 ### Documentation
 
 - **`docs/vitess-vstream-troubleshooting.md`** — operator runbook for sluice users running against PlanetScale MySQL when their sync is showing lag or has stopped advancing. Top three VStream delay causes characterized with code-path citations (replica-tablet replication lag; tablet throttler indirect impact; internal Vitess operations including failovers, reshards, PS deploy requests). Plus what's new in Vitess 24's binlog streaming surface and an honest "PS exposure timeline unclear" assessment.
 - **Public README rewritten** for an operator scanning to decide "does this fit my use case" in 30 seconds. Engine matrix, "vs alternatives" comparison, decision-tree table for command selection, links to operator-facing docs first.
+- **README troubleshooting matrix** — quick-look for the most common operator symptoms (migrate failed mid-phase, sync slot lost, verify reports mismatch, sync health stale, etc.) and the first-look response.
 
 ### Design / planning
 
 - **Six new proto-ADRs** capturing the design space for the user's "100% confidence" goal:
   - `design-sluice-verify.md` — count / sample / full data-integrity verification (count MVP shipped in v0.12.0; sample + full follow).
-  - `design-sync-health-monitoring.md` — probe MVP + Prometheus listener + per-table metrics phases (probe MVP committed for v0.13.0).
+  - `design-sync-health-monitoring.md` — probe MVP + Prometheus listener + per-table metrics phases (probe MVP shipped in v0.13.0).
   - `design-logical-backups.md` — full + incremental backups to local-FS + cloud storage, with restore tooling. MVP recommendation: local-FS Phase 1.
   - `design-apache-arrow-integration.md` — Parquet writer engine + format interop. Conditional yes, gated on logical-backup format choice.
-  - `design-schema-completeness.md` — FK edge-case test coverage + view support Phase 1 (read+emit). FK tests landed; view support is a future implementation chunk.
+  - `design-schema-completeness.md` — FK edge-case test coverage + view support Phase 1 (read+emit). FK tests landed in v0.13.0; view support is a future implementation chunk.
+
+### Compatibility
+
+- **No breaking IR changes.** `ir.Verifier`'s new `ExtraOnTarget` field on `VerifyResult` is additive; existing JSON consumers ignore unknown fields.
+- **No CLI-breaking changes.** New subcommand (`sluice sync health`) only.
+- **Behaviour change on `sluice verify`** — extra-on-target tables now surface in output as informational entries. Operators piping the JSON output will see a new top-level `extra_on_target` array (empty when no extras exist).
 
 ## [0.12.0] - 2026-05-07
 
