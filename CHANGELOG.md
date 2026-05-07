@@ -6,6 +6,18 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.14.1] - 2026-05-08
+
+Single-bug patch from the v0.14.0 test cycle (`session-reports/v0.14.0.md` in the sluice-testing companion repo). 5 of 6 focus areas passed clean — including the headline PlanetScale Oregon → Virginia online migration with verify-mode-as-accuracy-proof — but the v0.14.0 view-support Phase 1 had one emission bug that blocked PG materialized-view round-trip.
+
+### Fixed
+
+- **Bug 31 — PG materialized view emit produces `... ; WITH DATA;` syntax error.** PG's `pg_matviews.definition` catalog column returns the SELECT body with a trailing `;`. The v0.14.0 `emitCreateView` matview branch appended ` WITH DATA;` directly, producing `CREATE MATERIALIZED VIEW ... AS SELECT ...; WITH DATA;` which PG rejects with SQLSTATE 42601. Migrate exited with the orchestrator's "view dependency budget exhausted" error after 2 retries, leaving the matview uncreated. Regular views happened to "work" because PG silently tolerates the resulting `;;` (parses as no-op-then-empty-statement); same code path; same fix. The shared `trimTrailingSemicolon` helper now also strips trailing whitespace before/after the semicolon. Workaround pre-fix: `--exclude-view <matview-name>` or `--skip-views`. Four new regression tests pin the trim behavior.
+
+## [0.14.0] - 2026-05-08
+
+Three feature tracks land together: **sample-mode verify** (Phase 2 of the verify proto-ADR), **Prometheus `/metrics` listener** (Phase 2 of the sync-health monitoring proto-ADR), and **view support Phase 1** (schema-only round-trip from the schema-completeness proto-ADR). Plus a chunked-count fallback that makes `sluice verify` work cleanly against PlanetScale-MySQL tables larger than its per-query row-read budget. Validated end-to-end including PlanetScale Oregon → Virginia online migration with verify confirming 100% accuracy.
+
 ### Added
 
 - **View support Phase 1 — schema-only round-trip for regular and materialized views.** Both schema readers populate `Schema.Views`: MySQL via `information_schema.views`, Postgres via `pg_views` (regular) and `pg_matviews` (materialized; tagged `Materialized=true`). Both schema writers emit views as a new Phase 6 of the simple-mode orchestrator (after constraints): `CREATE OR REPLACE VIEW` for regular views, `CREATE MATERIALIZED VIEW ... WITH DATA` for matviews so the matview is populated from the just-loaded target tables on cold-start. View-to-view dependency ordering uses a single-pass-with-up-to-2-retries policy — no SQL parser, surface a clear error if a view still fails after the retry budget. New CLI flags on `migrate` / `sync start` / `schema preview` / `schema diff`: `--include-view PATTERN`, `--exclude-view PATTERN`, `--skip-views`. New `ir.SchemaWriter.CreateViews` interface method (additive, all shipping engines implement). New `ir.SchemaDiff.ViewsMissing` / `ViewsExtra` / `ViewsMismatched` for view-level drift detection. Cross-engine view-body translation is deferred to Phase 3 — Phase 1 emits the source-dialect definition verbatim and relies on the loud-failure tenet for non-portable definitions. Materialized view CDC refresh is a Phase 2 follow-up.
