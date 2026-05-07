@@ -6,6 +6,10 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-05-08
+
+Three roadmap items + a verify analysis pass land together. The user's morning brief asked me to pick "the next 3 items on the roadmap" and tackle them — these are the result.
+
 ### Added
 
 - **`sluice sync health` source-side position probe (Phase 2 of sync-health proto-ADR).** New optional `--source-driver` + `--source` flags on the health probe; when supplied, sluice opens a `SchemaReader` against the source, type-asserts to the new `ir.HealthReporter` interface, calls `SourceCurrentPosition()`, and surfaces source/target tokens + (for PG-only pairs) a byte-distance lag metric via `ir.BytesLagReporter` + `pg_wal_lsn_diff()`. New `--max-lag-bytes` threshold flag (PG-only, exit 1 on breach). Source-probe errors don't fail the target-side check — an unreachable source shouldn't break cron probes monitoring the target. MySQL `SourceCurrentPosition` returns `gtid_executed`; MySQL doesn't implement `BytesLagReporter` (GTID sets aren't byte-distance comparable).
