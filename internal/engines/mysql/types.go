@@ -40,6 +40,16 @@ type columnMeta struct {
 	// Collation is collation_name (empty when not applicable).
 	Collation string
 
+	// SrsID is information_schema.columns.srs_id — the spatial
+	// reference system ID for geometry columns (0 / unset for non-
+	// geometry columns and for geometry columns without an explicit
+	// SRID). Used to populate ir.Geometry.SRID so the cross-engine
+	// emit path lands `geometry(POINT, 4326)` on PG instead of
+	// `geometry(POINT, 0)` (Bug 26). MySQL stores this in
+	// information_schema as of 8.0; older versions ignore the
+	// column.
+	SrsID int
+
 	// Extra is information_schema.columns.extra — contains tokens like
 	// "auto_increment" and "DEFAULT_GENERATED". Lowercase.
 	Extra string
@@ -169,23 +179,30 @@ func translateType(c columnMeta) (ir.Type, error) {
 		return ir.JSON{Binary: true}, nil
 
 	// ---- Geometry (extension type) ----
+	//
+	// Each geometry case threads c.SrsID through to ir.Geometry.SRID
+	// so the cross-engine emit path lands `geometry(POINT, 4326)`
+	// on PG instead of dropping the SRID (Bug 26). Source columns
+	// without an explicit SRID get 0, which both engines treat as
+	// "no spatial reference system" — same semantics as the pre-fix
+	// state.
 
 	case "geometry":
-		return ir.Geometry{Subtype: ir.GeometryUnspecified}, nil
+		return ir.Geometry{Subtype: ir.GeometryUnspecified, SRID: c.SrsID}, nil
 	case "point":
-		return ir.Geometry{Subtype: ir.GeometryPoint}, nil
+		return ir.Geometry{Subtype: ir.GeometryPoint, SRID: c.SrsID}, nil
 	case "linestring":
-		return ir.Geometry{Subtype: ir.GeometryLineString}, nil
+		return ir.Geometry{Subtype: ir.GeometryLineString, SRID: c.SrsID}, nil
 	case "polygon":
-		return ir.Geometry{Subtype: ir.GeometryPolygon}, nil
+		return ir.Geometry{Subtype: ir.GeometryPolygon, SRID: c.SrsID}, nil
 	case "multipoint":
-		return ir.Geometry{Subtype: ir.GeometryMultiPoint}, nil
+		return ir.Geometry{Subtype: ir.GeometryMultiPoint, SRID: c.SrsID}, nil
 	case "multilinestring":
-		return ir.Geometry{Subtype: ir.GeometryMultiLineString}, nil
+		return ir.Geometry{Subtype: ir.GeometryMultiLineString, SRID: c.SrsID}, nil
 	case "multipolygon":
-		return ir.Geometry{Subtype: ir.GeometryMultiPolygon}, nil
+		return ir.Geometry{Subtype: ir.GeometryMultiPolygon, SRID: c.SrsID}, nil
 	case "geometrycollection", "geomcollection":
-		return ir.Geometry{Subtype: ir.GeometryCollection}, nil
+		return ir.Geometry{Subtype: ir.GeometryCollection, SRID: c.SrsID}, nil
 	}
 
 	return nil, fmt.Errorf("mysql: unsupported data_type %q (column_type %q)", c.DataType, c.ColumnType)

@@ -6,6 +6,48 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.10.3] - 2026-05-06
+
+Single-bug patch from PostGIS testing. Bug 27 (VStream POINT mis-parse) defers to a later release because it needs VStream test infrastructure.
+
+### Fixed
+
+- **Bug 26 — MySQL geometry SRID is now preserved on cross-engine emit.** The MySQL schema reader didn't extract `information_schema.columns.srs_id`, so a `POINT NOT NULL /*!80003 SRID 4326 */` source column landed on PG as `geometry(POINT, 0)` — the SRID silently dropped. Any spatial query on the target that depended on the coordinate system (distance, contains, etc.) returned wrong results.
+
+  Fix: read `srs_id` from `information_schema.columns` and thread it through `columnMeta.SrsID` into `ir.Geometry.SRID`. The PG schema writer already honoured `Geometry.SRID` (no change needed), so the cross-engine emit path now produces `geometry(POINT, 4326)` on PG matching the MySQL source.
+
+  **Schema diff coverage extends automatically:** `ir.Geometry.String()` already includes the SRID in its rendering (`Geometry[POINT,SRID=4326]`), so the diff's existing type-string comparison surfaces SRID mismatches as drift once both sides carry SRID consistently. No separate diff change needed.
+
+  MySQL 8.0+ baseline assumed. Pre-8.0 MySQL servers don't expose `srs_id` in `information_schema.columns`; sluice's supported MySQL baseline is already 8.0.
+
+### Deferred
+
+- **Bug 27 — VStream POINT bytes mis-parsed.** MySQL's internal storage prepends a 4-byte SRID prefix before OGC WKB; the vanilla MySQL protocol strips this, but VStream doesn't. Sluice's WKB decoder reads `0xE6` (low byte of SRID 4326) as the byte-order flag and fails. The fix needs VStream test infrastructure (the `integration vstream` build tag); deferred to a later patch where it can land with the test that demonstrates it.
+
+## [0.10.2] - 2026-05-06
+
+Two test-unblocking surface additions from `FUTURE-TESTS.md`. Both small and well-bounded; no behaviour change for operators not opting in.
+
+### Added
+
+- **`--slot-name NAME` flag on `sluice sync start`** (Item C). Operator-supplied replication-slot name for engines that have a slot concept (Postgres). Default unchanged (`sluice_slot`); operators set per-instance to run multiple concurrent sluice instances against the same source — without distinct slot names they'd collide on the hard-coded default. Engines without slots (MySQL: binlog stream is the slot) silently ignore the flag.
+
+  **Sluice-prefix convention:** sluice prepends `sluice_` if the supplied name doesn't already start with it. `--slot-name shard_a` creates `sluice_shard_a`; `--slot-name sluice_shard_a` is idempotent. The convention lets operators find every sluice slot with `pg_replication_slots WHERE slot_name LIKE 'sluice\_%'` for cleanup, audits, and disambiguation from other tools' slots (Debezium, native logical replication subscribers, etc.). The resolved name surfaces in the orchestrator's INFO log so operators can correlate against `pg_replication_slots`.
+
+  Implementation: two new optional engine surfaces — `ir.CDCReaderWithSlotOpener` and `ir.SnapshotStreamWithSlotOpener` — let engines accept a slot-name parameter without breaking the existing `OpenCDCReader` / `OpenSnapshotStream` signatures. The orchestrator type-asserts on these and falls back to the default methods when the engine doesn't implement them. Postgres implements both.
+
+- **`migrate --dry-run` now reports per-table row counts** (Item H). The dry-run output's per-table line gains a `row_count` attribute populated via the existing `ir.RowCounter` interface (MySQL: `information_schema.tables.table_rows` / `SHOW TABLE STATUS`; Postgres: `pg_class.reltuples`). Best-effort: engines that don't implement `RowCounter`, or per-table counts that fail (permissions, etc.), surface as `row_count=-1` with a Warn-level log line so operators can distinguish "unavailable" from "empty". The count uses the throwaway dry-run-only RowReader handle and doesn't touch the bulk-copy path.
+
+## [0.10.1] - 2026-05-06
+
+Two narrow patches from v0.10.0 real-world testing. Bug 23's enum-cast placement fix uncovered Bug 25 — the cast itself triggers PG's "generation expression is not immutable" error because `enum_in()` is STABLE not IMMUTABLE. Bug 17's hand-coded bool-returning detector kept missing real-world expression shapes; v0.10.1 drops the detector and trusts the column-type signal instead.
+
+### Fixed
+
+- **Bug 25 — enum-typed STORED generated columns now emit as `TEXT` + table-level `CHECK`** instead of `(body)::"enum_type"`. PG rejects the cast inside a generated-column body because `enum_in()` is STABLE not IMMUTABLE, and STORED generated bodies must be IMMUTABLE. VIRTUAL doesn't help (PG 18+ forbids user-defined types in VIRTUAL gen cols). Sluice sidesteps by emitting the column as TEXT (no enum type, no cast) and adding a table-level `CHECK ("col" IN ('a','b','c'))` constraint that enforces the value-list. Mirrors the existing SET → TEXT[] + CHECK fallback. CREATE TYPE is skipped for these columns; non-generated enum columns still use the native PG enum type. Loses the named enum type on the target side but always works — matches sluice's "translate, don't wrap in target-side functions" philosophy.
+
+- **Bug 17 — int-context COALESCE rewrite drops the bool-detector gate.** v0.9.1 / v0.9.2 gated the `::int` cast on a hand-coded `isBoolReturning` detector that recognised bare bool idents, comparisons, `IS NULL`/`IS NOT NULL`, keyword forms, and parenthesised wrappers. v0.10.0 real-world testing surfaced expression shapes the detector missed (function calls returning bool, `AND`/`OR` chains, `NOT` prefixes, `EXISTS` subqueries) and each produced a fresh bug report. v0.10.1 drops the detector entirely: when the outer column is integer-typed, the non-literal side of `COALESCE(<expr>, <int_lit>)` is cast to `::int` unconditionally. Safe because the column must produce int — the cast either helps (bool→int), is a no-op (already int), or fails loudly at apply on a non-numeric expression (loud-failure tenet preserved). Cost: one extra `::int` token in the emitted DDL on already-int columns. Benefit: every bool-returning shape now translates correctly without operator intervention. ADR-0016 updated.
+
 ## [0.10.0] - 2026-05-06
 
 The expression-translator escape hatch. v0.8.x / v0.9.x's reactive cycle (operator hits a bug → we add a rule) reaches its planned next stage: instead of dropping a column when sluice's translator doesn't recognise an idiom, the operator can supply target-dialect expression text directly via `--expr-override` (CLI) or `expression_mappings:` (YAML). Sluice emits the override verbatim and the translator stays out of the way. The pattern-matching rule set keeps growing for the common cases; `--expr-override` covers everything else.

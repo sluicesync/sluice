@@ -101,6 +101,12 @@ func (r *SchemaReader) readTables(ctx context.Context) (map[string]*ir.Table, er
 
 // populateColumns fills in Column lists for each table.
 func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*ir.Table) error {
+	// `srs_id` is geometry-only (NULL on non-geometry columns).
+	// IFNULL(..., 0) keeps the scan tidy — 0 is also the "no SRID
+	// declared" value for geometry columns, so the cast is
+	// semantically correct for both cases. MySQL added this column
+	// in 8.0; pre-8.0 servers would error here, but sluice's
+	// supported MySQL baseline is 8.0+.
 	const q = `
 		SELECT
 			table_name,
@@ -115,6 +121,7 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 			datetime_precision,
 			IFNULL(character_set_name, ''),
 			IFNULL(collation_name, ''),
+			IFNULL(srs_id, 0),
 			column_type,
 			IFNULL(extra, ''),
 			IFNULL(column_comment, ''),
@@ -153,6 +160,7 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 			nullableInt64(&meta.DTPrec),
 			&meta.Charset,
 			&meta.Collation,
+			&meta.SrsID,
 			&meta.ColumnType,
 			&meta.Extra,
 			&comment,

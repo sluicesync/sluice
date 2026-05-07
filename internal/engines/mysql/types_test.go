@@ -198,6 +198,27 @@ func TestTranslateType(t *testing.T) {
 			in:   columnMeta{DataType: "geomcollection", ColumnType: "geomcollection"},
 			want: ir.Geometry{Subtype: ir.GeometryCollection},
 		},
+		{
+			// Bug 26 (v0.10.3): SRID threads through from
+			// information_schema.columns.srs_id into ir.Geometry.SRID
+			// so the cross-engine emit lands `geometry(POINT, 4326)`
+			// on PG instead of dropping to `geometry(POINT, 0)`.
+			name: "point with explicit SRID 4326",
+			in:   columnMeta{DataType: "point", ColumnType: "point", SrsID: 4326},
+			want: ir.Geometry{Subtype: ir.GeometryPoint, SRID: 4326},
+		},
+		{
+			name: "polygon with SRID",
+			in:   columnMeta{DataType: "polygon", ColumnType: "polygon", SrsID: 3857},
+			want: ir.Geometry{Subtype: ir.GeometryPolygon, SRID: 3857},
+		},
+		{
+			// SrsID=0 (no spatial reference declared) is the
+			// default behaviour and matches the pre-Bug-26 state.
+			name: "geometry with no SRID stays at 0",
+			in:   columnMeta{DataType: "geometry", ColumnType: "geometry", SrsID: 0},
+			want: ir.Geometry{Subtype: ir.GeometryUnspecified},
+		},
 	}
 
 	for _, c := range cases {
