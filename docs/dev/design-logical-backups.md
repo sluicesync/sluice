@@ -212,6 +212,8 @@ Estimated size: ~2000-2800 LOC including tests + ADR. (Smaller than a cloud-MVP 
 
 Estimated size: ~1000-1500 LOC.
 
+> **Implementation supplement:** see [`design-logical-backups-phase-2.md`](design-logical-backups-phase-2.md) for the post-Phase-1 decisions (gocloud.dev/blob library pivot, Archil integration findings, resumable backup writer additions, backup-chain → CDC handoff design, and the backup-as-broker pattern for Phase 4.5+).
+
 ### Phase 3: Incremental backups
 
 - `internal/backup/cdc_writer.go` and `cdc_reader.go` — applier and reader shapes for serialised `ir.Change` chunks.
