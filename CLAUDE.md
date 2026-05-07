@@ -112,7 +112,7 @@ The flow has six phases for a typical patch release:
 
 If any of the five fails, fix the failure (typically: race conditions caught by `-race`, lint regressions, or missing notes) and either force-move the tag (still-draft case) or cut the next patch version. **Never publish a release with one or more gate checks failing or unverified.**
 
-For full procedure incl. the watcher script and edge cases, see `docs/dev/release-process.md` (when added). The session-local `.claude/settings.local.json` should pre-authorize `Bash(git push origin main:*)`, `Bash(git push origin v*:*)`, and `Bash(gh release edit:*)` so the autonomous flow doesn't trip the deny-by-default hook on every release.
+The session-local `.claude/settings.local.json` should pre-authorize `Bash(git push origin main:*)`, `Bash(git push origin v*:*)`, and `Bash(gh release edit:*)` so the autonomous flow doesn't trip the deny-by-default hook on every release.
 
 ## Working agreements with humans on this project
 
