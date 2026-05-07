@@ -125,7 +125,7 @@ func openPreviewOutput(path string) (io.Writer, func(err error) error, error) {
 	}
 	tmp, err := os.CreateTemp(dir, base+".tmp.*")
 	if err != nil {
-		return nil, nil, fmt.Errorf("preview: create temp file in %q: %w", dir, err)
+		return nil, nil, fmt.Errorf("atomic output: create temp file in %q: %w", dir, err)
 	}
 
 	finalize := func(runErr error) error {
@@ -141,11 +141,11 @@ func openPreviewOutput(path string) (io.Writer, func(err error) error, error) {
 		}
 		if closeErr != nil {
 			_ = os.Remove(tmp.Name())
-			return fmt.Errorf("preview: close temp file: %w", closeErr)
+			return fmt.Errorf("atomic output: close temp file: %w", closeErr)
 		}
 		if err := os.Rename(tmp.Name(), path); err != nil {
 			_ = os.Remove(tmp.Name())
-			return fmt.Errorf("preview: rename temp file into %q: %w", path, err)
+			return fmt.Errorf("atomic output: rename temp file into %q: %w", path, err)
 		}
 		return nil
 	}
