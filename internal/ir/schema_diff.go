@@ -456,18 +456,34 @@ func diffColumn(expected, actual *Column) (ColumnDiff, bool) {
 	// Charset / collation comparison. Both fields ride on the IR's
 	// character-type structs (Char, Varchar, Text); the helper below
 	// extracts them and returns empty strings for non-character
-	// types. Comparison is exact-string — cross-engine differences
-	// (e.g. `utf8mb4` vs `UTF8`) are real drift signals operators
-	// can suppress with `--ignore-charset-collation` rather than
-	// being silently equated. v1.x scope.
+	// types.
+	//
+	// **Empty-on-source means "no opinion".** When the source/expected
+	// side has an empty charset (or empty collation), the comparison
+	// is skipped for that field — any actual value is acceptable.
+	// This avoids false-positive drift on three legitimate cases:
+	//   1. Source is Postgres (PG doesn't expose per-column charset
+	//      via information_schema; collation can be empty for non-
+	//      explicit columns).
+	//   2. Source column is non-character (Integer, JSON, etc.) —
+	//      both sides are empty and the skip is a no-op.
+	//   3. Source column was retargeted from a PG-native type (UUID,
+	//      Inet, Macaddr, ...) by translate.RetargetForEngine: the
+	//      retarget picks a Char/Varchar shape but doesn't carry
+	//      charset/collation since the source type never had one.
+	// When the source DOES have a charset/collation, the comparison is
+	// strict-string — `utf8mb4` vs `latin1` surfaces as drift, and
+	// the operator suppresses with `--ignore-charset-collation` if
+	// the divergence is intentional. v0.11.2 fix; pre-fix every
+	// PG→MySQL diff on retargeted columns surfaced as bogus drift.
 	expCharset, expCollation := charsetCollationOf(expected.Type)
 	actCharset, actCollation := charsetCollationOf(actual.Type)
-	if expCharset != actCharset {
+	if expCharset != "" && expCharset != actCharset {
 		cd.ExpectedCharset = expCharset
 		cd.ActualCharset = actCharset
 		mismatched = true
 	}
-	if expCollation != actCollation {
+	if expCollation != "" && expCollation != actCollation {
 		cd.ExpectedCollation = expCollation
 		cd.ActualCollation = actCollation
 		mismatched = true

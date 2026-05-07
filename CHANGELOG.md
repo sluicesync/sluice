@@ -6,6 +6,18 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.11.2] - 2026-05-07
+
+Single-bug patch from CI integration. v0.11.0's CHARSET/COLLATION cross-engine diff regressed `TestDiff_PostgresToMySQL` — three subtests started failing because the diff began surfacing bogus drift on every PG→MySQL retargeted column (UUID/Inet/Macaddr/Array). The Integration job has been red on every push since v0.11.0; the failure was visible in CI but not gated on (Integration is one of the required checks but the existing PR-merge flow had been bypassing it for tag-driven release commits).
+
+### Fixed
+
+- **Cross-engine retargeted columns no longer surface as charset/collation drift in `sluice schema diff`.** The diff comparison now treats empty source-side charset/collation as "no opinion" rather than as a sentinel value to compare against. Three legitimate cases are covered: source is Postgres (PG doesn't expose per-column charset via `information_schema`), source column is non-character (Integer/JSON/etc.), and source column was retargeted from a PG-native type by `internal/translate.RetargetForEngine` (the retarget rewrites UUID→Char(36), Inet/Cidr→Varchar(45), Macaddr→Varchar(30) but doesn't carry charset/collation since the source type never had one).
+
+  When the source DOES declare a charset/collation, the comparison stays strict: a target missing the source's declared charset still surfaces as drift. The asymmetry is intentional — source/expected is authoritative, so empty-source means "any actual is fine," populated-source means "actual must match." Operators wanting strict bidirectional compare can suppress with `--ignore-charset-collation` (already plumbed) or rely on the matched-pair behaviour, which is unchanged.
+
+  Pre-fix: every PG→MySQL diff on retargeted columns flagged drift like `accounts.account_uuid: expected="" actual=""` (the ColumnDiff's type strings were empty because the types matched post-retarget; only the new charset/collation comparison was triggering the mismatch). Three integration subtests caught it: `TestDiff_PostgresToMySQL/json_captures_only_in-band_drift_after_retarget`, `text_reports_drift_sections`, `ignore-extras_suppresses_extra-table_diff`. New unit test `TestDiffSchemas_EmptySourceCharsetCollationNoDrift` pins the empty-as-no-opinion behaviour so the regression can't return.
+
 ## [0.11.1] - 2026-05-07
 
 Continuation of the proactive-translator cycle started in v0.11.0. Eight more rewrites across the catalog's high- and medium-priority tiers, picked for "biggest leverage per LOC, fewest gotchas." All additive, no IR or interface changes, no operator-facing flags. Same loud-failure-on-unrecognized-shape policy as v0.11.0.

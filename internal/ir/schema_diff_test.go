@@ -224,6 +224,59 @@ func TestDiffSchemas_CharsetCollationMismatch(t *testing.T) {
 	}
 }
 
+// TestDiffSchemas_EmptySourceCharsetCollationNoDrift pins the
+// v0.11.2 fix: when the source/expected side has an empty charset
+// or collation, comparison is skipped for that field rather than
+// surfacing the difference as drift. Covers the cross-engine
+// retarget case (PG→MySQL UUID→Char(36) where the retargeted Char
+// has no charset/collation) plus the non-character-type case.
+func TestDiffSchemas_EmptySourceCharsetCollationNoDrift(t *testing.T) {
+	t.Run("empty source charset + populated target → no drift", func(t *testing.T) {
+		exp := &Schema{Tables: []*Table{{Name: "t", Columns: []*Column{
+			{Name: "c", Type: Char{Length: 36}}, // retargeted from PG UUID; no charset
+		}}}}
+		act := &Schema{Tables: []*Table{{Name: "t", Columns: []*Column{
+			{Name: "c", Type: Char{Length: 36, Charset: "utf8mb4", Collation: "utf8mb4_0900_ai_ci"}},
+		}}}}
+		d := DiffSchemas(exp, act, DiffOptions{})
+		if len(d.TablesMismatched) != 0 {
+			t.Errorf("retargeted column should not surface as drift; got %+v", d.TablesMismatched)
+		}
+	})
+	t.Run("populated source + empty target → drift surfaces (asymmetric)", func(t *testing.T) {
+		// The asymmetry is intentional: the source/expected side is
+		// authoritative. Empty-source means "any actual is fine";
+		// populated-source means "actual must match." So a target
+		// missing the source's declared charset IS drift.
+		exp := &Schema{Tables: []*Table{{Name: "t", Columns: []*Column{
+			{Name: "c", Type: Varchar{Length: 255, Charset: "utf8mb4"}},
+		}}}}
+		act := &Schema{Tables: []*Table{{Name: "t", Columns: []*Column{
+			{Name: "c", Type: Varchar{Length: 255}},
+		}}}}
+		d := DiffSchemas(exp, act, DiffOptions{})
+		if len(d.TablesMismatched) != 1 {
+			t.Fatalf("expected drift when source declares charset and target doesn't; got %+v", d)
+		}
+	})
+	t.Run("both populated, different → drift (existing behaviour preserved)", func(t *testing.T) {
+		exp := &Schema{Tables: []*Table{{Name: "t", Columns: []*Column{
+			{Name: "c", Type: Varchar{Length: 255, Charset: "utf8mb4"}},
+		}}}}
+		act := &Schema{Tables: []*Table{{Name: "t", Columns: []*Column{
+			{Name: "c", Type: Varchar{Length: 255, Charset: "latin1"}},
+		}}}}
+		d := DiffSchemas(exp, act, DiffOptions{})
+		if len(d.TablesMismatched) != 1 {
+			t.Fatalf("expected drift for differing charsets; got %+v", d)
+		}
+		cd := d.TablesMismatched[0].ColumnsMismatched[0]
+		if cd.ExpectedCharset != "utf8mb4" || cd.ActualCharset != "latin1" {
+			t.Errorf("charset fields = %q/%q; want utf8mb4/latin1", cd.ExpectedCharset, cd.ActualCharset)
+		}
+	})
+}
+
 // TestDiffSchemas_IgnoreCharsetCollation pins the suppression
 // behaviour: when DiffOptions.IgnoreCharsetCollation is set,
 // columns whose only drift was charset/collation drop out of
