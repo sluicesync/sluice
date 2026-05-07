@@ -6,6 +6,25 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-05-07
+
+Logical backups Phase 2 lands: cloud backends (S3 + S3-compatible providers + GCS + Azure) atop the `BackupStore` interface that shipped in v0.15.0's Phase 1. Plus a resumable backup writer that picks up a partially-completed job at the next un-finished table. Implementation supplement: `docs/dev/design-logical-backups-phase-2.md`.
+
+### Added
+
+- **Cloud backends for `sluice backup` / `restore` / `backup verify` (Phase 2 of the logical-backups proto-ADR).** New `internal/pipeline.BlobStore` wraps `gocloud.dev/blob` and implements the same `ir.BackupStore` contract as Phase 1's `LocalStore`. CLI: pass `--target=s3://bucket/prefix/` to `backup full`, or `--from=s3://...` to `restore` / `backup verify`. URL schemes wired: `s3://` (AWS S3 + S3-compatible via `--backup-endpoint`), `gs://` (Google Cloud Storage, ADC creds), `azblob://` (Azure Blob, managed-identity / connection-string), and `file:///` (kept for parity with `--output-dir`/`--from-dir`). Multipart upload for large chunks is automatic in `gocloud.dev/blob`'s `s3blob` driver. Encryption (client-side AES-256-GCM, default-on from Phase 1) and per-chunk SHA-256 integrity carry through unchanged.
+- **`--backup-endpoint`, `--backup-region`, `--backup-path-style` flags** for S3-compatible providers — MinIO, Cloudflare R2, Backblaze B2, Wasabi, Tigris, DigitalOcean Spaces. Same flags also enable Archil's read-only S3 API for cross-environment restore-from-Archil flows. Each flag is rejected with a clear error if combined with a non-`s3://` URL scheme.
+- **Resumable backup writer (NEW in Phase 2 scope).** Two complementary mechanisms so a partially-completed backup picks up where it left off rather than re-doing everything: per-chunk skip via `BackupStore.Exists` + manifest's recorded SHA-256 (skip if present and checksum-matches; overwrite if checksum-mismatches), and per-table progress checkpoints (manifest is updated atomically after each table completes). On a re-run against the same `--output-dir` / `--target`, the orchestrator detects the partial-state manifest and resumes from the next un-completed table. New `--force-overwrite` flag mirrors `--reset-target-data`'s friction tier for the case where the operator wants to discard the partial backup and start fresh.
+- **`BackupStore.Exists(ctx, path) (bool, error)` interface method** added to `ir.BackupStore`, both engines (`LocalStore`, `BlobStore`) implement it. Internal — no operator-visible surface change beyond the resumable writer.
+
+### Changed
+
+- **`gocloud.dev/blob` added as a dependency.** Pre-implementation estimate was `~3-5 MB` binary growth even on local-FS-only builds; real measurement after wiring all four side-effect imports (`s3blob`, `gcsblob`, `azureblob`, `fileblob`) is `~46 MB` total binary growth (~38.5 MB → ~84.2 MB on linux/windows amd64). Larger than the optimistic estimate but in line with the pessimistic envelope. Acceptable for v1 — operators consuming sluice via container images won't notice the layer-cache cost; binary distribution sizes remain in the same order of magnitude as `kubectl` (~50 MB) and `terraform` (~110 MB). If footprint becomes a real concern (e.g. embedding sluice in a small operator binary), the path is build-tag gating per cloud or moving to native SDKs per backend; the `BackupStore` interface is unchanged either way.
+
+### Documentation
+
+- **`docs/dev/design-logical-backups-phase-2.md`** — implementation supplement to the original proto-ADR. Captures: the `gocloud.dev/blob` library pivot (revised from native `aws-sdk-go-v2`); Archil integration findings (their S3 API is read-only — `PutObject` / multipart return `MethodNotAllowed`; clean split between POSIX-mount writes via Phase 1's `LocalStore` and S3-API restore reads via Phase 2's `BlobStore`); resumable backup writer addition; backup-chain → CDC handoff design as Phase 3 acceptance criterion (MySQL `gtid_purged` is clean; PG needs maintained slot or generous `wal_keep_size`); and the backup-as-broker pattern as a Phase 4.5+ direction (decoupled source-target sync with backup storage as the message log — unlocks no-direct-connectivity, multi-region-no-VPN, fan-out, time-shifted-sync, and air-gapped scenarios).
+
 ## [0.15.1] - 2026-05-08
 
 Single-bug patch from the v0.15.0 test cycle. v0.15.0's PG → PG sync-health source-side probe was non-functional — `lag_bytes` always reported "unavailable" and `--max-lag-bytes` thresholds never tripped on the very engine pair the feature was designed for.
