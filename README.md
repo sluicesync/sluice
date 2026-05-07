@@ -102,6 +102,14 @@ Commands:
 
 Run `sluice <command> --help` for per-command flags. DSNs can also be passed via `SLUICE_SOURCE` / `SLUICE_TARGET` env vars.
 
+## Terminology
+
+A few terms recur in the codebase and docs:
+
+- **IR** — the **internal representation**, sluice's typed dialect-neutral schema + value model in `internal/ir`. Every cross-engine translation passes through it: source-engine readers populate the IR, target-engine writers consume it. The IR is the only shared contract between engines, which keeps source-specific knowledge out of writers and target-specific knowledge out of readers. See [`docs/architecture.md`](docs/architecture.md) for the longer story.
+- **Engine** — a registered database integration (`mysql`, `postgres`, `planetscale`). Each engine implements the same interface set (`SchemaReader`, `SchemaWriter`, `RowReader`, `RowWriter`, `CDCReader`, `ChangeApplier`, plus optional surfaces); the orchestrator never imports an engine package directly.
+- **Stream** — a continuous-sync flow with persisted position, identified by a `--stream-id`. Distinct from a one-shot `migrate` which doesn't persist resume state on the target.
+
 ## Documentation
 
 - [`docs/architecture.md`](docs/architecture.md) — IR, engine pattern, orchestrator, what sluice is and isn't
