@@ -36,6 +36,7 @@ type VerifyCmd struct {
 
 	SampleRowsPerTable int   `help:"Per-table sample size when --depth=sample. Default 100 gives ~99% confidence of detecting a 5%+ corruption rate; raise for stronger guarantees on tables with rare anomalies." default:"100" placeholder:"N"`
 	SampleSeed         int64 `help:"Seed for deterministic sampling when --depth=sample. Same seed → same sample row set on source and target. Default 42; change to 'reshuffle' the sample." default:"42" placeholder:"N"`
+	StrictHash         bool  `help:"Use SHA-256 instead of MD5 for sample-mode row hashing. MD5 is statistically sufficient for honest-data scenarios at any practical row count (see docs/verify-vs-vitess-vdiff.md for the collision math); --strict-hash gives operators an extra confidence margin and matches compliance postures that require SHA-256. Costs ~2× the server-side hashing time; difference is sub-second at typical sample sizes."`
 
 	Format string `help:"Output format: 'text' (default) or 'json' (machine-readable for CI gates / alertmanager pipes)." default:"text" enum:"text,json" placeholder:"FORMAT"`
 	Output string `help:"Write to FILE instead of stdout. Atomic." short:"o" placeholder:"FILE"`
@@ -81,6 +82,7 @@ func (v *VerifyCmd) Run(g *Globals) error {
 		Depth:              pipeline.VerifyDepth(v.Depth),
 		SampleRowsPerTable: v.SampleRowsPerTable,
 		SampleSeed:         v.SampleSeed,
+		StrictHash:         v.StrictHash,
 		Filter:             filter,
 		Format:             v.Format,
 		Out:                writer,

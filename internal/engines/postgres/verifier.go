@@ -47,13 +47,17 @@ func (r *SchemaReader) ExactRowCount(ctx context.Context, table *ir.Table) (int6
 
 // SampleRowHashes implements [ir.SampleVerifier]. Picks n rows
 // deterministically (same seed → same row set on source + target),
-// computes MD5 of each row's column-value concatenation server-side,
+// computes the row-content hash server-side via the requested algo,
 // returns sorted by PK.
 //
 // Sampling strategy: ORDER BY md5(<pk-as-text> || '<seed>') LIMIT n.
 // This pseudorandomly orders rows and slices the first n; the
 // MD5(pk||seed) function is deterministic so source and target
 // running the query with the same seed pick the same row subset.
+// Note: even with `algo=SHA256`, sampling-order uses MD5 — the
+// sample selection just needs determinism, not collision resistance.
+// The strict-hash path applies to the row-content hash, not the
+// sample-selection ordering.
 //
 // **Single-PK constraint** (v0.14.0 MVP): the sampling SQL needs the
 // PK to construct the seed-derived ordering. Tables without a PK or
@@ -61,10 +65,15 @@ func (r *SchemaReader) ExactRowCount(ctx context.Context, table *ir.Table) (int6
 // this-table"; the orchestrator surfaces a clear per-table SKIPPED
 // reason so the operator knows which tables verify only by count.
 //
-// Hash strategy: MD5(CONCAT_WS('|', col1::text, col2::text, ...)).
-// PG's CONCAT_WS skips NULLs, matching MySQL's behavior, so NULL
-// handling is consistent same-engine.
-func (r *SchemaReader) SampleRowHashes(ctx context.Context, table *ir.Table, n int, seed int64) ([]ir.SampledRowHash, error) {
+// Hash strategy: MD5 (default) or SHA-256 (operator opt-in via
+// --strict-hash, v0.14.2+) of CONCAT_WS('|', col1::text, ...). PG's
+// CONCAT_WS skips NULLs, matching MySQL's behavior, so NULL handling
+// is consistent same-engine.
+//
+// SHA-256 path: PG 11+ ships sha256() in core (no pgcrypto needed),
+// returning bytea. ENCODE(..., 'hex') gives a 64-char hex string
+// matching the MD5() shape.
+func (r *SchemaReader) SampleRowHashes(ctx context.Context, table *ir.Table, n int, seed int64, algo ir.HashAlgorithm) ([]ir.SampledRowHash, error) {
 	if table == nil {
 		return nil, errors.New("postgres: SampleRowHashes: table is nil")
 	}
@@ -86,7 +95,16 @@ func (r *SchemaReader) SampleRowHashes(ctx context.Context, table *ir.Table, n i
 	if len(pkCols) == 1 {
 		pkExpr = fmt.Sprintf(`%s::text`, quoteIdent(pkCols[0]))
 	}
-	hashExpr := "MD5(CONCAT_WS('|', " + strings.Join(cols, ", ") + "))"
+	concatExpr := "CONCAT_WS('|', " + strings.Join(cols, ", ") + ")"
+	var hashExpr string
+	switch algo {
+	case ir.HashSHA256:
+		// PG 11+: sha256() is built-in, returns bytea; encode to hex
+		// to match the MD5 shape.
+		hashExpr = "ENCODE(SHA256(" + concatExpr + "::bytea), 'hex')"
+	default:
+		hashExpr = "MD5(" + concatExpr + ")"
+	}
 	q := fmt.Sprintf(
 		`SELECT %s AS pk, %s AS hash FROM %s.%s ORDER BY MD5(%s || '%d') LIMIT %d`,
 		pkExpr, hashExpr,

@@ -72,6 +72,15 @@ type Verifier struct {
 	// [DefaultSampleSeed].
 	SampleSeed int64
 
+	// StrictHash, when true, switches sample-mode hashing from MD5
+	// (default) to SHA-256. v0.14.2 operator opt-in. See
+	// `docs/verify-vs-vitess-vdiff.md` for the collision-math
+	// rationale; MD5 is statistically sufficient for honest-data
+	// scenarios at any practical row count, but SHA-256 gives
+	// operators an extra confidence margin and matches compliance
+	// postures that require it.
+	StrictHash bool
+
 	// Filter selects which source tables participate. Empty (zero
 	// value) keeps every source table.
 	Filter TableFilter
@@ -280,7 +289,11 @@ func (v *Verifier) Run(ctx context.Context) (*VerifyResult, error) {
 				result.Summary.TablesSkipped++
 				continue
 			default:
-				if err := compareSampleHashes(ctx, srcSV, tgtSV, srcTable, tgtTable, sampleRows, sampleSeed, &tr); err != nil {
+				algo := ir.HashMD5
+				if v.StrictHash {
+					algo = ir.HashSHA256
+				}
+				if err := compareSampleHashes(ctx, srcSV, tgtSV, srcTable, tgtTable, sampleRows, sampleSeed, algo, &tr); err != nil {
 					tr.Reason = fmt.Sprintf("sample-hash error: %v", err)
 					result.Tables = append(result.Tables, tr)
 					result.Summary.TablesSkipped++
@@ -394,12 +407,12 @@ func (v *Verifier) renderText(r *VerifyResult) error {
 //
 // Const for the per-table mismatch-PK cap; full count remains in
 // SampleMismatch even when the slice is truncated.
-func compareSampleHashes(ctx context.Context, src, tgt ir.SampleVerifier, srcTable, tgtTable *ir.Table, n int, seed int64, tr *VerifyTableResult) error {
-	srcSamples, err := src.SampleRowHashes(ctx, srcTable, n, seed)
+func compareSampleHashes(ctx context.Context, src, tgt ir.SampleVerifier, srcTable, tgtTable *ir.Table, n int, seed int64, algo ir.HashAlgorithm, tr *VerifyTableResult) error {
+	srcSamples, err := src.SampleRowHashes(ctx, srcTable, n, seed, algo)
 	if err != nil {
 		return fmt.Errorf("source-side: %w", err)
 	}
-	tgtSamples, err := tgt.SampleRowHashes(ctx, tgtTable, n, seed)
+	tgtSamples, err := tgt.SampleRowHashes(ctx, tgtTable, n, seed, algo)
 	if err != nil {
 		return fmt.Errorf("target-side: %w", err)
 	}

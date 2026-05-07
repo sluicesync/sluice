@@ -71,7 +71,11 @@ func (r *SchemaReader) ExactRowCount(ctx context.Context, table *ir.Table) (int6
 // rendering via CAST(col AS CHAR) which renders integers as decimal,
 // floats as their default text repr, datetime/timestamp as canonical
 // MySQL form; CONCAT_WS skips NULLs same as PG.
-func (r *SchemaReader) SampleRowHashes(ctx context.Context, table *ir.Table, n int, seed int64) ([]ir.SampledRowHash, error) {
+//
+// Hash algorithm: MD5 (default) or SHA-256 via SHA2(..., 256) when
+// algo == HashSHA256. Both produce hex-string output of consistent
+// width (32 chars MD5; 64 chars SHA-256).
+func (r *SchemaReader) SampleRowHashes(ctx context.Context, table *ir.Table, n int, seed int64, algo ir.HashAlgorithm) ([]ir.SampledRowHash, error) {
 	if table == nil {
 		return nil, errors.New("mysql: SampleRowHashes: table is nil")
 	}
@@ -94,7 +98,14 @@ func (r *SchemaReader) SampleRowHashes(ctx context.Context, table *ir.Table, n i
 	if len(pkCols) == 1 {
 		pkSelect = fmt.Sprintf("CAST(%s AS CHAR)", quoteIdent(pkCols[0]))
 	}
-	hashExpr := "MD5(CONCAT_WS('|', " + strings.Join(cols, ", ") + "))"
+	concatExpr := "CONCAT_WS('|', " + strings.Join(cols, ", ") + ")"
+	var hashExpr string
+	switch algo {
+	case ir.HashSHA256:
+		hashExpr = "SHA2(" + concatExpr + ", 256)"
+	default:
+		hashExpr = "MD5(" + concatExpr + ")"
+	}
 	q := fmt.Sprintf(
 		"SELECT %s AS pk, %s AS hash FROM %s ORDER BY MD5(CONCAT(%s, '%d')) LIMIT %d",
 		pkSelect, hashExpr,

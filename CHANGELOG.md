@@ -6,6 +6,14 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **`sluice verify --strict-hash` opt-in for SHA-256 sample-mode hashing.** Default stays MD5 (statistically sufficient for honest-data scenarios at any practical row count — see `docs/verify-vs-vitess-vdiff.md` for the collision math). `--strict-hash` switches sample-mode to SHA-256 for operators wanting an extra confidence margin or matching a compliance posture that requires SHA-256. New `ir.HashAlgorithm` enum on the `ir.SampleVerifier` interface; PG implements via the built-in `sha256()` (PG 11+ core, no pgcrypto needed); MySQL via `SHA2(..., 256)`. ~2× server-side hashing time vs MD5; difference is sub-second at sample-mode's typical sizes.
+
+### Documentation
+
+- **`docs/verify-vs-vitess-vdiff.md`** — operator-facing comparison of sluice's verify approach to Vitess's vdiff workflow. Covers what each tool does, when to reach for which, and the MD5 collision math (P(collision) ≈ 10⁻²¹ at 1B rows; effectively zero for honest data). Sourced via WebFetch against vitess.io docs and the vdiff `table_differ.go` source — vdiff uses direct value comparison (not hashing), streams every row in PK order, full-fidelity, heavy on multi-TB tables. Sluice verify offers count + statistical-sample comparison cheaper but less exhaustive; full-fidelity mode is planned (proto-ADR phase 3).
+
 ## [0.14.1] - 2026-05-08
 
 Single-bug patch from the v0.14.0 test cycle (`session-reports/v0.14.0.md` in the sluice-testing companion repo). 5 of 6 focus areas passed clean — including the headline PlanetScale Oregon → Virginia online migration with verify-mode-as-accuracy-proof — but the v0.14.0 view-support Phase 1 had one emission bug that blocked PG materialized-view round-trip.

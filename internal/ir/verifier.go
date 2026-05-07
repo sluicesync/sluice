@@ -66,11 +66,15 @@ type Verifier interface {
 // future phase that adds client-side canonicalization.
 type SampleVerifier interface {
 	// SampleRowHashes returns up to n sampled rows from the table,
-	// each represented as its primary-key string + the MD5 of its
+	// each represented as its primary-key string + the hash of its
 	// concatenated column values. The seed parameter makes sampling
 	// deterministic across calls — passing the same seed to source
 	// and target picks the same row subset on both sides, so the
 	// returned hashes can be compared 1:1.
+	//
+	// algo selects the hash function used for the row-content
+	// digest. Both source and target sides MUST be called with the
+	// same algo or the comparison is meaningless.
 	//
 	// Result ordering: sorted by primary key (lexicographically on
 	// the PrimaryKey string). Both sides return the same order so
@@ -80,7 +84,50 @@ type SampleVerifier interface {
 	// Returns an error when the table has no usable PK (sample mode
 	// requires deterministic sampling), when n <= 0, or on any
 	// operational failure.
-	SampleRowHashes(ctx context.Context, table *Table, n int, seed int64) ([]SampledRowHash, error)
+	SampleRowHashes(ctx context.Context, table *Table, n int, seed int64, algo HashAlgorithm) ([]SampledRowHash, error)
+}
+
+// HashAlgorithm selects the hash function used by sample-mode verify
+// to digest a row's column-values for cross-side comparison. v0.14.2
+// introduced this enum so operators can opt into SHA-256 (`--strict-
+// hash`) for an extra confidence margin on top of MD5's already-
+// negligible-for-honest-data collision probability.
+//
+// See `docs/verify-vs-vitess-vdiff.md` for the collision-math
+// rationale and the operator-facing comparison.
+type HashAlgorithm uint8
+
+// Recognised HashAlgorithm values.
+const (
+	// HashMD5 produces a 128-bit hash. Default; sufficient for
+	// honest-data scenarios at any practical row count.
+	HashMD5 HashAlgorithm = iota
+	// HashSHA256 produces a 256-bit hash. Operator opt-in via the
+	// `--strict-hash` flag. ~2× slower server-side than MD5 but
+	// the difference is sub-second at sample-mode's typical sizes.
+	HashSHA256
+)
+
+// SQLFunction returns the SQL function name the engine writers use
+// to invoke this hash algorithm. Both supported engines (MySQL,
+// Postgres) accept these function names — MySQL via the built-in
+// MD5/SHA2 functions; Postgres via MD5 (built-in) and SHA-256 via
+// pgcrypto's digest+encode (which sluice converts to a literal
+// `MD5(...)` or `ENCODE(DIGEST(..., 'sha256'), 'hex')` shape per the
+// engine's verifier implementation).
+//
+// Callers shouldn't assume the function-name shape works as a drop-
+// in literal; the engine-side SampleRowHashes builds the right
+// SQL fragment based on this enum value.
+func (a HashAlgorithm) String() string {
+	switch a {
+	case HashMD5:
+		return "MD5"
+	case HashSHA256:
+		return "SHA-256"
+	default:
+		return "unknown"
+	}
 }
 
 // SampledRowHash is one row's contribution to a sample-mode verify
