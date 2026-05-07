@@ -96,6 +96,7 @@ Run `sluice <command> --help` for per-command flags. DSNs can also be passed via
 - [`docs/architecture.md`](docs/architecture.md) — IR, engine pattern, orchestrator, what sluice is and isn't
 - [`docs/managed-services.md`](docs/managed-services.md) — PlanetScale-specific notes, operator preconditions
 - [`docs/postgres-source-prep.md`](docs/postgres-source-prep.md) — required PG GUCs, slot lifecycle, failover-survival mechanisms
+- [`docs/vitess-vstream-troubleshooting.md`](docs/vitess-vstream-troubleshooting.md) — operator runbook for diagnosing PlanetScale-MySQL VStream lag (throttler, replication lag, deploy requests), plus the Vitess 24 binlog streaming roadmap
 - [`docs/throughput-tuning.md`](docs/throughput-tuning.md) — knobs that matter at scale
 - [`docs/schema-change-runbook.md`](docs/schema-change-runbook.md) — `ADD COLUMN` / `DROP COLUMN` / `MODIFY` against a running stream
 - [`docs/type-mapping.md`](docs/type-mapping.md), [`docs/value-types.md`](docs/value-types.md) — type translation policies and runtime row contract
