@@ -910,6 +910,30 @@ type Engine interface {
 	OpenSnapshotStream(ctx context.Context, dsn string) (*SnapshotStream, error)
 }
 
+// CDCReaderWithSlotOpener is the optional engine surface for engines
+// whose CDC implementation can be configured with a non-default
+// replication-slot name (today: Postgres). When the orchestrator has
+// an operator-supplied slot name (`--slot-name` on `sync start`), it
+// type-asserts on this interface and uses [OpenCDCReaderWithSlot]
+// instead of the default [Engine.OpenCDCReader] — engines that don't
+// implement this interface fall back to their built-in default name.
+//
+// Engines without a slot concept (MySQL: binlog stream is the slot)
+// do not implement this surface; the orchestrator silently ignores
+// the slot-name flag for those engines.
+type CDCReaderWithSlotOpener interface {
+	OpenCDCReaderWithSlot(ctx context.Context, dsn, slotName string) (CDCReader, error)
+}
+
+// SnapshotStreamWithSlotOpener is the corresponding optional surface
+// for [Engine.OpenSnapshotStream]. The slot is created at snapshot-
+// open time, so the slot name has to flow in at construction (not
+// post-open via a setter). Same engine-set as [CDCReaderWithSlotOpener]
+// — Postgres implements both.
+type SnapshotStreamWithSlotOpener interface {
+	OpenSnapshotStreamWithSlot(ctx context.Context, dsn, slotName string) (*SnapshotStream, error)
+}
+
 // DefaultTableExcluder is the optional engine surface for "tables
 // the operator almost never wants to migrate against this engine".
 // Implementing engines return a list of [path.Match]-style patterns

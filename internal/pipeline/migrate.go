@@ -598,12 +598,27 @@ func copyTable(ctx context.Context, rr ir.RowReader, rw ir.RowWriter, table *ir.
 // handler. The header line is a single message; the per-table lines
 // follow with structured attributes so an aggregator can pick out
 // individual table summaries without parsing prose.
+//
+// Per-table row counts (v0.10.2) are best-effort. Sluice opens a
+// throwaway [ir.RowReader] on the source and type-asserts for
+// [ir.RowCounter]; engines that don't implement counting (or where
+// the count fails — permissions, locked table, etc.) get a `-1`
+// in the log so the operator sees "count unavailable" rather than
+// thinking the table is empty. Counts on huge tables can be slow
+// or approximate depending on the engine — see [ir.RowCounter]'s
+// doc-comment.
 func (m *Migrator) logPlan(ctx context.Context, schema *ir.Schema) error {
 	slog.InfoContext(ctx, "dry run: migration plan",
 		slog.String("source", m.Source.Name()),
 		slog.String("target", m.Target.Name()),
 		slog.Int("tables", len(schema.Tables)),
 	)
+
+	// Open a throwaway RowReader for row counts. Best-effort: if it
+	// fails to open, we still emit the per-table summary lines —
+	// just with row_count=-1.
+	counts := dryRunRowCounts(ctx, m.Source, m.SourceDSN, schema)
+
 	for _, t := range schema.Tables {
 		// Field naming note: secondary_indexes excludes the primary
 		// key (which is reported separately via primary_key) — the IR
@@ -616,10 +631,58 @@ func (m *Migrator) logPlan(ctx context.Context, schema *ir.Schema) error {
 			slog.Bool("primary_key", t.PrimaryKey != nil),
 			slog.Int("secondary_indexes", len(t.Indexes)),
 			slog.Int("foreign_keys", len(t.ForeignKeys)),
+			slog.Int64("row_count", counts[t.Name]),
 		)
 	}
 	slog.InfoContext(ctx, "dry run: for full target DDL with translation notes and advisory hints, run `sluice schema preview` (ADR-0024)")
 	return nil
+}
+
+// dryRunRowCounts returns a best-effort map of table-name → row count
+// for the supplied schema. Engines that implement [ir.RowCounter]
+// (today: MySQL and Postgres) populate the map; failures (engine
+// doesn't implement counting, RowReader open failure, per-table
+// CountRows error) leave the entry as -1 so the caller can render
+// "count unavailable" rather than "empty table". v0.10.2 / Item H.
+//
+// The RowReader is opened and closed inside this function. Errors
+// are logged at Warn level (not returned) — dry-run output should
+// degrade gracefully rather than refuse to print.
+func dryRunRowCounts(ctx context.Context, source ir.Engine, dsn string, schema *ir.Schema) map[string]int64 {
+	counts := make(map[string]int64, len(schema.Tables))
+	for _, t := range schema.Tables {
+		counts[t.Name] = -1 // default: count unavailable
+	}
+
+	rr, err := source.OpenRowReader(ctx, dsn)
+	if err != nil {
+		slog.WarnContext(ctx, "dry run: row counts unavailable (failed to open source row reader)",
+			slog.String("error", err.Error()),
+		)
+		return counts
+	}
+	defer closeIf(rr)
+
+	counter, ok := rr.(ir.RowCounter)
+	if !ok {
+		slog.DebugContext(ctx, "dry run: source engine doesn't implement RowCounter; row counts omitted",
+			slog.String("engine", source.Name()),
+		)
+		return counts
+	}
+
+	for _, t := range schema.Tables {
+		n, err := counter.CountRows(ctx, t)
+		if err != nil {
+			slog.WarnContext(ctx, "dry run: row count failed for table",
+				slog.String("table", t.Name),
+				slog.String("error", err.Error()),
+			)
+			continue
+		}
+		counts[t.Name] = n
+	}
+	return counts
 }
 
 // closeIf calls Close on v if it implements io.Closer. Used to clean

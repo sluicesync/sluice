@@ -136,7 +136,19 @@ func (e Engine) OpenRowWriter(ctx context.Context, dsn string) (ir.RowWriter, er
 // on the source. The connecting role needs the REPLICATION attribute
 // to create the replication slot. Both preconditions surface as
 // startup errors rather than mid-stream failures.
-func (Engine) OpenCDCReader(ctx context.Context, dsn string) (ir.CDCReader, error) {
+func (e Engine) OpenCDCReader(ctx context.Context, dsn string) (ir.CDCReader, error) {
+	return e.OpenCDCReaderWithSlot(ctx, dsn, defaultSlot)
+}
+
+// OpenCDCReaderWithSlot satisfies [ir.CDCReaderWithSlotOpener]. The
+// orchestrator picks this path over [OpenCDCReader] when an operator
+// supplies `--slot-name` on `sync start`. Empty slotName is replaced
+// with the default `sluice_slot` so the same code path serves both
+// the default and the override case.
+func (Engine) OpenCDCReaderWithSlot(ctx context.Context, dsn, slotName string) (ir.CDCReader, error) {
+	if slotName == "" {
+		slotName = defaultSlot
+	}
 	cfg, err := parseDSN(dsn)
 	if err != nil {
 		return nil, err
@@ -150,7 +162,7 @@ func (Engine) OpenCDCReader(ctx context.Context, dsn string) (ir.CDCReader, erro
 		schema:       cfg.schema,
 		dsn:          cfg.dsn,
 		publication:  defaultPublication,
-		slotName:     defaultSlot,
+		slotName:     slotName,
 		protoVersion: 2,
 	}, nil
 }

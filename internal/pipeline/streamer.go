@@ -109,6 +109,15 @@ type Streamer struct {
 	// ADR-0016 §"Added in v0.10.0".
 	ExpressionMappings []config.ExpressionMapping
 
+	// SlotName, when non-empty, overrides the engine's default
+	// replication-slot name on engines that have a slot concept
+	// (Postgres). Engines without slots (MySQL: binlog stream is
+	// the slot) silently ignore this field. Used to run multiple
+	// concurrent sluice instances against the same source —
+	// without a per-instance slot name they'd collide on the
+	// hard-coded `sluice_slot` default. v0.10.2.
+	SlotName string
+
 	// DryRun, when true, prints what Run would do (cold-start vs
 	// warm-resume, source schema summary or persisted-position
 	// token) and returns without opening the snapshot stream,
@@ -204,6 +213,22 @@ type Streamer struct {
 func (s *Streamer) Run(ctx context.Context) error {
 	if err := s.validate(); err != nil {
 		return err
+	}
+
+	// Apply the sluice-prefix convention to the operator-supplied
+	// slot name (v0.10.2). Empty stays empty (engine default);
+	// `shard_a` becomes `sluice_shard_a`; already-prefixed names
+	// pass through. Mutated in place because Streamer is single-
+	// shot per Run; the resolved name flows through to both the
+	// CDC-reader and snapshot-stream open paths and surfaces in
+	// log lines so operators can correlate against
+	// pg_replication_slots.
+	if resolved := resolveSlotName(s.SlotName); resolved != s.SlotName {
+		slog.InfoContext(ctx, "applying sluice slot-name prefix convention",
+			slog.String("operator_supplied", s.SlotName),
+			slog.String("resolved", resolved),
+		)
+		s.SlotName = resolved
 	}
 
 	// Engine-default exclusions (Bug 22 / v0.8.1): merge in any
@@ -573,7 +598,7 @@ func (s *Streamer) warmResume(ctx context.Context, persisted ir.Position, lsnTra
 	slog.InfoContext(ctx, "warm resume from persisted position",
 		slog.String("position_token", persisted.Token),
 	)
-	cdc, err := s.Source.OpenCDCReader(ctx, s.SourceDSN)
+	cdc, err := openCDCReaderWithOptionalSlot(ctx, s.Source, s.SourceDSN, s.SlotName)
 	if err != nil {
 		return nil, wrapWithHint(PhaseCDC, fmt.Errorf("pipeline: open cdc reader: %w", err))
 	}
@@ -656,7 +681,7 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 		return nil, fmt.Errorf("pipeline: apply expression overrides: %w", err)
 	}
 
-	stream, err := s.Source.OpenSnapshotStream(ctx, s.SourceDSN)
+	stream, err := openSnapshotStreamWithOptionalSlot(ctx, s.Source, s.SourceDSN, s.SlotName)
 	if err != nil {
 		return nil, wrapWithHint(PhaseSnapshot, fmt.Errorf("pipeline: open snapshot stream: %w", err))
 	}
@@ -821,6 +846,82 @@ func retagPositionForSource(persisted ir.Position, sourceEngine string) ir.Posit
 	}
 	persisted.Engine = sourceEngine
 	return persisted
+}
+
+// sluiceSlotPrefix is prepended to operator-supplied slot names
+// that don't already start with it. Convention: every sluice-created
+// replication slot starts with `sluice_` so operators can find them
+// all with `pg_replication_slots WHERE slot_name LIKE 'sluice\_%'`
+// for cleanup, audits, and disambiguation from other tools' slots
+// (Debezium, native logical replication subscribers, etc.). The
+// default slot name is `sluice_slot` (already prefixed); custom
+// names like `--slot-name shard_a` become `sluice_shard_a`.
+const sluiceSlotPrefix = "sluice_"
+
+// resolveSlotName applies the sluice-prefix convention to an
+// operator-supplied slot name. Empty input passes through unchanged
+// — the empty signal means "use the engine's default" (which is
+// already `sluice_slot`). Names already starting with `sluice_`
+// pass through verbatim. Anything else gets the prefix prepended.
+//
+// Examples:
+//
+//	""                → ""              (engine default)
+//	"shard_a"         → "sluice_shard_a"
+//	"sluice_shard_a"  → "sluice_shard_a" (idempotent)
+//	"sluice_slot"     → "sluice_slot"
+//
+// Centralised here so the prefix policy applies uniformly to both
+// the CDC-reader and snapshot-stream open paths, and any future
+// CLI / YAML / env entry points.
+func resolveSlotName(operatorSupplied string) string {
+	if operatorSupplied == "" {
+		return ""
+	}
+	if strings.HasPrefix(operatorSupplied, sluiceSlotPrefix) {
+		return operatorSupplied
+	}
+	return sluiceSlotPrefix + operatorSupplied
+}
+
+// openCDCReaderWithOptionalSlot calls the engine's slot-aware
+// OpenCDCReaderWithSlot when slotName is non-empty AND the engine
+// implements [ir.CDCReaderWithSlotOpener]. Otherwise falls back to
+// the default OpenCDCReader. Engines without slot concepts (MySQL)
+// silently ignore an operator-supplied slot name.
+//
+// The split keeps the streamer's main paths readable — the
+// type-assertion dance lives in one place rather than at every
+// open-CDC call site.
+func openCDCReaderWithOptionalSlot(ctx context.Context, source ir.Engine, dsn, slotName string) (ir.CDCReader, error) {
+	if slotName == "" {
+		return source.OpenCDCReader(ctx, dsn)
+	}
+	if opener, ok := source.(ir.CDCReaderWithSlotOpener); ok {
+		return opener.OpenCDCReaderWithSlot(ctx, dsn, slotName)
+	}
+	// Engine doesn't implement the slot-aware surface. Use the
+	// default and emit a debug-level note so the operator can spot
+	// the silent ignore via --log-level=debug if curious.
+	slog.DebugContext(ctx, "engine does not implement CDCReaderWithSlotOpener; --slot-name silently ignored",
+		slog.String("engine", source.Name()),
+	)
+	return source.OpenCDCReader(ctx, dsn)
+}
+
+// openSnapshotStreamWithOptionalSlot is the snapshot-stream sibling
+// of openCDCReaderWithOptionalSlot. Same dispatch shape.
+func openSnapshotStreamWithOptionalSlot(ctx context.Context, source ir.Engine, dsn, slotName string) (*ir.SnapshotStream, error) {
+	if slotName == "" {
+		return source.OpenSnapshotStream(ctx, dsn)
+	}
+	if opener, ok := source.(ir.SnapshotStreamWithSlotOpener); ok {
+		return opener.OpenSnapshotStreamWithSlot(ctx, dsn, slotName)
+	}
+	slog.DebugContext(ctx, "engine does not implement SnapshotStreamWithSlotOpener; --slot-name silently ignored",
+		slog.String("engine", source.Name()),
+	)
+	return source.OpenSnapshotStream(ctx, dsn)
 }
 
 // redactedHost extracts a "host:port" (or "host") fragment from the

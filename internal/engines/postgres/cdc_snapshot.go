@@ -22,6 +22,17 @@ import (
 // own resources are closed too — including any replication
 // connection it opens during StreamChanges.
 func (e Engine) OpenSnapshotStream(ctx context.Context, dsn string) (*ir.SnapshotStream, error) {
+	return e.OpenSnapshotStreamWithSlot(ctx, dsn, defaultSlot)
+}
+
+// OpenSnapshotStreamWithSlot satisfies [ir.SnapshotStreamWithSlotOpener].
+// Empty slotName falls back to the default `sluice_slot`. Same code
+// path as the default constructor so the slot-creation, snapshot
+// import, and CDC-handoff logic stay in one place.
+func (e Engine) OpenSnapshotStreamWithSlot(ctx context.Context, dsn, slotName string) (*ir.SnapshotStream, error) {
+	if slotName == "" {
+		slotName = defaultSlot
+	}
 	cfg, err := parseDSN(dsn)
 	if err != nil {
 		return nil, err
@@ -59,7 +70,7 @@ func (e Engine) OpenSnapshotStream(ctx context.Context, dsn string) (*ir.Snapsho
 	// consistent_point and we'd silently inherit it instead of
 	// capturing a fresh snapshot. Refuse explicitly so the operator
 	// reckons with the leftover.
-	info, err := slotInfo(ctx, db, defaultSlot)
+	info, err := slotInfo(ctx, db, slotName)
 	if err != nil {
 		_ = db.Close()
 		return nil, err
@@ -68,7 +79,7 @@ func (e Engine) OpenSnapshotStream(ctx context.Context, dsn string) (*ir.Snapsho
 		_ = db.Close()
 		return nil, fmt.Errorf(
 			"postgres: snapshot: replication slot %q already exists; drop it before starting a snapshot stream (manual cleanup avoids accidentally inheriting a stale consistent_point)",
-			defaultSlot)
+			slotName)
 	}
 
 	// Open a replication connection dedicated to slot creation. We
@@ -86,7 +97,7 @@ func (e Engine) OpenSnapshotStream(ctx context.Context, dsn string) (*ir.Snapsho
 	// stating it explicitly documents intent. The helper layers
 	// FAILOVER true on PG 17+ (see slot_create.go) so the slot
 	// survives Patroni / sync_replication_slots failover events.
-	consistentPoint, snapshotName, err := createLogicalReplicationSlot(ctx, db, replConn, defaultSlot, true)
+	consistentPoint, snapshotName, err := createLogicalReplicationSlot(ctx, db, replConn, slotName, true)
 	if err != nil {
 		_ = replConn.Close(ctx)
 		_ = db.Close()
@@ -125,8 +136,10 @@ func (e Engine) OpenSnapshotStream(ctx context.Context, dsn string) (*ir.Snapsho
 	// open its own replication conn on StreamChanges and use the
 	// slot we just created. The slot existence check inside
 	// resolveStartPosition will see the slot we created here and
-	// resume from the supplied position.
-	cdcReader, err := e.OpenCDCReader(ctx, dsn)
+	// resume from the supplied position. Pass the same slot name so
+	// the CDC reader picks up the slot we just created (not the
+	// hard-coded default).
+	cdcReader, err := e.OpenCDCReaderWithSlot(ctx, dsn, slotName)
 	if err != nil {
 		_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
 		_ = conn.Close()
@@ -135,7 +148,7 @@ func (e Engine) OpenSnapshotStream(ctx context.Context, dsn string) (*ir.Snapsho
 		return nil, fmt.Errorf("postgres: snapshot: build cdc reader: %w", err)
 	}
 
-	position, err := encodePGPos(pgPos{Slot: defaultSlot, LSN: consistentPoint})
+	position, err := encodePGPos(pgPos{Slot: slotName, LSN: consistentPoint})
 	if err != nil {
 		_ = cdcReader.(closer).Close()
 		_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
