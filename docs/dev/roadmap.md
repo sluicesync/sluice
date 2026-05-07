@@ -142,6 +142,14 @@ For continuity when a chunk references "the previous work":
 - **CI Integration timeout bumped 10m→18m per package.** Slow CI runners + `-race` overhead were hitting Go's per-package default test timeout. Job timeout-minutes 20→30 to match. Pure infra change; no runtime behaviour.
 - **Autonomous release-test-fix loop authorized 2026-05-07.** After each release publishes (Option B 5-gate verification), main session auto-spawns next test cycle (sluice-testing's localhost-docker + PlanetScale harnesses both in scope), reacts to results (fix bugs OR pick next roadmap item), loops until stop condition. Stop conditions: user interrupt, saturation (3 clean cycles + roadmap exhausted), unfixable bug, infra blocker. See `feedback_automation_loop.md` in agent memory.
 
+### View support Phase 1 (regular + materialized views, schema-only round-trip)
+
+- **`ir.View` type + `Schema.Views` field** wired end-to-end through readers, writers, pipeline, CLI, schema diff, and schema preview. Both shipping engines populate `Schema.Views` (MySQL via `information_schema.views`; Postgres via `pg_views` + `pg_matviews` with `Materialized=true` on matviews).
+- **`ir.SchemaWriter.CreateViews`** new interface method; both engines implement. New Phase 6 in the simple-mode orchestrator (after constraints) emits `CREATE OR REPLACE VIEW` (regular) and `CREATE MATERIALIZED VIEW ... WITH DATA` (matviews; PG-only). View-to-view dependency ordering uses single-pass-with-up-to-2-retries policy — no SQL parser, surfaces clear error if budget exhausted.
+- **CLI flags** `--include-view PATTERN`, `--exclude-view PATTERN`, `--skip-views` on `migrate` / `sync start` / `schema preview` / `schema diff`. `ViewFilter` mirrors `TableFilter` shape; filtered independently from tables.
+- **Schema diff for views** — `ir.SchemaDiff.ViewsMissing` / `ViewsExtra` / `ViewsMismatched` populated by `DiffSchemas`; text + JSON renderers updated. Definition comparison is trim-and-equal; cross-engine drift is high-noise by design (PG canonicalises view bodies via `pg_get_viewdef`); the renderer hedges with a low-confidence comment.
+- **Phase 1 limitations documented** — cross-engine view-body translation (PG → MySQL or vice-versa) emits the source dialect verbatim and relies on the loud-failure tenet. View definitions with explicit column lists (`CREATE VIEW v(a,b,c) AS ...`), MySQL `CREATE ALGORITHM=UNDEFINED VIEW`, PG `WITH (security_invoker=true)`, and PG RULE-based pseudo-views are out of scope for Phase 1.
+
 ### Foundational ADRs (0001–0029)
 
 IR-first, sealed interfaces, kong+koanf, three-phase apply, MySQL flavors, pgoutput, position persistence, go-mysql, Streamer-as-separate-orchestrator, idempotent applier semantics, SlotManager optional surface, pglogrepl bypass for FAILOVER, applier value-shaping with `CAST(? AS JSON)`, phase-aware error-hint registry, migration resume design, layered expression translation (extended in v0.8.0 with bool-idiom rewrites and v0.9.0 with index-expression and bool-sub-expression coverage), batched CDC apply, per-batch bulk-copy checkpointing, parallel within-table bulk copy, slot-ack-after-apply, publication scope by table, slot-missing fall-through (extended for MySQL in v0.6.0), `--reset-target-data`, `sluice schema preview`, graceful-drain `sync stop` (extended in v0.9.0 with `--wait`), LOAD DATA INFILE writer, source-tx-boundary CDC batching, memory-bounded streaming, `sluice schema diff`.
@@ -248,16 +256,18 @@ Metric set covers position-derived (`sluice_lag_events`, `sluice_lag_seconds`), 
 
 ---
 
-### 8. Schema completeness — FK edge cases + view support
+### 8. View support Phase 2/3 — materialized-view refresh + cross-engine view-body translation
 
-**Why.** Two user-raised concerns 2026-05-07 about how complete sluice's schema-object handling is. FKs work today via the three-phase apply (tables → bulk_copy → indexes → constraints; FKs in phase 5 after all tables exist) but documented edge cases lack regression tests. Views are not handled at all today. See [`design-schema-completeness.md`](design-schema-completeness.md).
+**Why.** Phase 1 (schema-only round-trip + dependency-ordered apply + diff/preview integration + CLI filters) shipped. The two large open frontiers remain:
 
-**What.** Two independent tracks:
+- **Phase 2 — materialized-view CDC refresh.** Phase 1 emits `WITH DATA` so cold-start populates the matview from the just-loaded tables. But matviews don't auto-update on CDC traffic — operators with `REFRESH MATERIALIZED VIEW` requirements need either a sluice-managed periodic refresh (cron-cadence, configurable per-matview) or a hook to integrate with their existing scheduler. Open question: does sluice ship a refresh loop in `sync start`, surface a `sluice matview refresh` subcommand, or just document the pg_cron pattern? Operator demand will pick.
 
-- **FK edge-case test coverage (~3 days).** Pin self-ref, circular, DROP-order, CDC catch-up, DEFERRABLE, ON DELETE actions, cross-engine round-trip, composite-PK FK behaviors with regression tests. No code changes; the architecture is correct, just needs the tests to pin behavior.
-- **View support (~2 weeks Phase 1).** New `ir.View` type, both engine readers + writers, dependency ordering, `--view-override` escape hatch. Materialized-view refresh as Phase 2. Cross-engine view-definition translation (Phase 3) reactive to operator demand.
+- **Phase 3 — cross-engine view-body translation.** Phase 1 emits the source-dialect SELECT verbatim on cross-engine pairs; non-portable definitions surface as a target-side parse rejection at apply time (loud-failure tenet). The right Phase 3 path is to extend ADR-0016's expression translator to a SELECT grammar — a strict subset (column refs, function calls, JOIN/WHERE/GROUP BY) that covers the high-frequency patterns. `--view-override TABLE.VIEW=DEFINITION` is the always-works escape hatch for cases the translator can't handle.
 
-**Gotchas.** Cross-engine view definitions are an open-ended translation problem — sluice doesn't (and shouldn't) implement a full SQL parser; `--view-override` is the always-works fallback. PG `RULE` system, `SQL SECURITY` clauses, and PG-specific view metadata are out of scope for Phase 1.
+**Gotchas.**
+- Phase 2 MVP could be `sluice matview refresh --target ...` as a one-shot subcommand, deferring the running-loop integration to a later phase if operator demand picks "manual cron over my own scheduler" pattern over "sluice owns the loop."
+- Phase 3 SELECT translation is open-ended — a real SQL parser dependency would simplify but adds a heavy library; the existing hand-coded ADR-0016 approach stays preferable until rule count exceeds ~30 entries.
+- Phase 1 deliberately punted: view definitions with explicit column lists `CREATE VIEW name (a, b, c) AS ...`, MySQL `CREATE ALGORITHM=UNDEFINED VIEW`, PG `WITH (security_invoker=true)`, and PG RULE-based pseudo-views. Each has different demand signals — pick what to surface based on real-world operator reports.
 
 ---
 

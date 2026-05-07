@@ -663,3 +663,110 @@ func TestDiffSchemas_Summary_IncludesNewCategories(t *testing.T) {
 		}
 	}
 }
+
+// TestDiffSchemas_ViewsMissingAndExtra covers the view-level
+// missing/extra set-semantics added in the view-support Phase 1
+// commit. Mirrors TestDiffSchemas_TableMissingAndExtra.
+func TestDiffSchemas_ViewsMissingAndExtra(t *testing.T) {
+	exp := &Schema{Views: []*View{
+		{Name: "active_users", Definition: "SELECT id FROM users WHERE active"},
+		{Name: "recent_orders", Definition: "SELECT id FROM orders WHERE created_at > NOW() - INTERVAL '7 days'"},
+	}}
+	act := &Schema{Views: []*View{
+		{Name: "active_users", Definition: "SELECT id FROM users WHERE active"},
+		{Name: "deprecated_view", Definition: "SELECT 1"},
+	}}
+	d := DiffSchemas(exp, act, DiffOptions{})
+	if !reflect.DeepEqual(d.ViewsMissing, []string{"recent_orders"}) {
+		t.Errorf("ViewsMissing = %v; want [recent_orders]", d.ViewsMissing)
+	}
+	if !reflect.DeepEqual(d.ViewsExtra, []string{"deprecated_view"}) {
+		t.Errorf("ViewsExtra = %v; want [deprecated_view]", d.ViewsExtra)
+	}
+	if !d.HasChanges() {
+		t.Errorf("expected HasChanges()=true on view drift")
+	}
+}
+
+// TestDiffSchemas_ViewsIgnoreExtras verifies the IgnoreExtras opt
+// suppresses extra-on-target views (mirrors the table behaviour).
+func TestDiffSchemas_ViewsIgnoreExtras(t *testing.T) {
+	exp := &Schema{Views: []*View{
+		{Name: "v1", Definition: "SELECT 1"},
+	}}
+	act := &Schema{Views: []*View{
+		{Name: "v1", Definition: "SELECT 1"},
+		{Name: "other_app_view", Definition: "SELECT 2"},
+	}}
+	d := DiffSchemas(exp, act, DiffOptions{IgnoreExtras: true})
+	if len(d.ViewsExtra) != 0 {
+		t.Errorf("ViewsExtra = %v; want empty under IgnoreExtras", d.ViewsExtra)
+	}
+}
+
+// TestDiffSchemas_ViewsMismatched_DefinitionDrift covers the trim-
+// and-equal definition comparison. A view whose body changes
+// (whitespace-insensitive) surfaces in ViewsMismatched.
+func TestDiffSchemas_ViewsMismatched_DefinitionDrift(t *testing.T) {
+	exp := &Schema{Views: []*View{
+		{Name: "v1", Definition: "SELECT id, email FROM users"},
+	}}
+	act := &Schema{Views: []*View{
+		{Name: "v1", Definition: "SELECT id FROM users"},
+	}}
+	d := DiffSchemas(exp, act, DiffOptions{})
+	if len(d.ViewsMismatched) != 1 {
+		t.Fatalf("ViewsMismatched len = %d; want 1", len(d.ViewsMismatched))
+	}
+	got := d.ViewsMismatched[0]
+	if got.Name != "v1" {
+		t.Errorf("Name = %q; want v1", got.Name)
+	}
+	if got.ExpectedDefinition == "" || got.ActualDefinition == "" {
+		t.Errorf("expected both definitions populated on body drift, got %+v", got)
+	}
+}
+
+// TestDiffSchemas_ViewsMismatched_MaterializedFlag covers the
+// materialized-flag drift case: same body, different materialized
+// flag.
+func TestDiffSchemas_ViewsMismatched_MaterializedFlag(t *testing.T) {
+	exp := &Schema{Views: []*View{
+		{Name: "v1", Definition: "SELECT 1", Materialized: true},
+	}}
+	act := &Schema{Views: []*View{
+		{Name: "v1", Definition: "SELECT 1", Materialized: false},
+	}}
+	d := DiffSchemas(exp, act, DiffOptions{})
+	if len(d.ViewsMismatched) != 1 {
+		t.Fatalf("ViewsMismatched len = %d; want 1", len(d.ViewsMismatched))
+	}
+	got := d.ViewsMismatched[0]
+	if got.ExpectedMaterialized == nil || got.ActualMaterialized == nil {
+		t.Fatalf("expected both materialized pointers populated, got %+v", got)
+	}
+	if *got.ExpectedMaterialized != true || *got.ActualMaterialized != false {
+		t.Errorf("ExpectedMaterialized=%v ActualMaterialized=%v; want true/false",
+			*got.ExpectedMaterialized, *got.ActualMaterialized)
+	}
+}
+
+// TestDiffSchemas_ViewsSummary verifies the Summary() rollup picks
+// up view-level drift counts.
+func TestDiffSchemas_ViewsSummary(t *testing.T) {
+	exp := &Schema{Views: []*View{
+		{Name: "a", Definition: "SELECT 1"},
+		{Name: "b", Definition: "SELECT 2"},
+	}}
+	act := &Schema{Views: []*View{
+		{Name: "a", Definition: "SELECT 1 WHERE TRUE"}, // mismatched
+		{Name: "c", Definition: "SELECT 3"},            // extra
+	}}
+	d := DiffSchemas(exp, act, DiffOptions{})
+	got := d.Summary()
+	for _, want := range []string{"missing view", "extra view", "view mismatch"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("summary %q missing %q", got, want)
+		}
+	}
+}

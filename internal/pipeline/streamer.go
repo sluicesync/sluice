@@ -149,6 +149,19 @@ type Streamer struct {
 	// advances the position past the dropped ones.
 	Filter TableFilter
 
+	// ViewFilter selects which source views are created on the
+	// target during the cold-start phase. CDC events for views
+	// don't exist (views aren't replicated by either engine's CDC
+	// surface), so this filter only affects the schema-apply step.
+	// Same shape as [Filter] for views.
+	ViewFilter ViewFilter
+
+	// SkipViews, when true, drops every view from the schema before
+	// any phase runs. Useful when the operator manages views
+	// out-of-band (Atlas/sqitch/liquibase) and doesn't want sluice
+	// to round-trip the definitions on cold-start.
+	SkipViews bool
+
 	// ForceColdStart, when true, skips the cold-start pre-flight
 	// check that refuses a fresh stream into a target with
 	// pre-existing rows. The check protects against Bug 9 (cold-
@@ -191,6 +204,22 @@ type Streamer struct {
 	// back to per-change Apply regardless of this field; in
 	// practice every shipping engine implements it (see ADR-0017).
 	ApplyBatchSize int
+
+	// MetricsListen, when non-empty, starts a Prometheus-format
+	// `/metrics` HTTP endpoint at the given address (e.g. `:9090`)
+	// for the duration of the stream. Off by default — the metrics
+	// surface is opt-in so operators can keep the network footprint
+	// minimal when they don't need scrape-based monitoring. Phase 2
+	// of the sync-health monitoring proto-ADR; the existing
+	// `sluice sync health` probe is the cron-friendly equivalent.
+	//
+	// Metric set: see [emitMetrics] for the full list. Briefly:
+	// `sluice_seconds_since_last_apply`, `sluice_stream_known`,
+	// `sluice_metrics_scrape_unix_seconds` — all gauges, labelled
+	// by `stream_id`. Read at scrape time from the target's
+	// `sluice_cdc_state` via the existing `ListStreams` surface; no
+	// instrumentation of the apply hot path.
+	MetricsListen string
 
 	// MaxBufferBytes is the soft upper bound on per-batch buffered
 	// memory in the CDC applier (and, on the cold-start branch, the
@@ -258,6 +287,27 @@ func (s *Streamer) Run(ctx context.Context) error {
 	}
 	if ownsApplier {
 		defer closeIf(applier)
+	}
+
+	// ---- 1a. Optional Prometheus metrics endpoint ----
+	// When --metrics-listen is set, a small HTTP server runs alongside
+	// the stream exposing a Prometheus-format /metrics surface.
+	// Off by default; opt-in. Lifecycle is scoped to the streamer's
+	// Run — Started before the stream begins, Closed in the deferred
+	// teardown. A bind failure at startup is fatal (operator asked
+	// for the listener; misconfigured port shouldn't be silent).
+	// Skipped on DryRun: dry-run doesn't run a real stream, so
+	// metrics for it aren't useful.
+	if s.MetricsListen != "" && !s.DryRun {
+		metricsSrv, mErr := NewMetricsServer(s.MetricsListen, applier)
+		if mErr != nil {
+			return wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: prepare metrics server: %w", mErr))
+		}
+		if mErr := metricsSrv.Start(); mErr != nil {
+			return wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: start metrics server: %w", mErr))
+		}
+		slog.InfoContext(ctx, "metrics server listening", slog.String("addr", s.MetricsListen))
+		defer func() { _ = metricsSrv.Close() }()
 	}
 
 	// ---- 2. Ensure the control table exists ----
@@ -526,6 +576,7 @@ func (s *Streamer) logDryRunPlan(ctx context.Context, streamID string, persisted
 	if err := applyTableFilter(ctx, schema, s.Filter); err != nil {
 		return err
 	}
+	applyViewFilter(ctx, schema, s.ViewFilter, s.SkipViews)
 	mapped, err := translate.ApplyMappings(schema, s.Mappings)
 	if err != nil {
 		return fmt.Errorf("pipeline: dry-run: apply mappings: %w", err)
@@ -657,6 +708,7 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 	if err := applyTableFilter(ctx, schema, s.Filter); err != nil {
 		return nil, err
 	}
+	applyViewFilter(ctx, schema, s.ViewFilter, s.SkipViews)
 
 	// ---- Scope the source-side publication to the filtered table
 	// list (Bug 13, ADR-0021). On engines that don't have

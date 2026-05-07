@@ -62,6 +62,15 @@ type Differ struct {
 	// value) keeps every source table the reader returns.
 	Filter TableFilter
 
+	// ViewFilter selects which source views participate in the
+	// diff. Empty keeps every view; SkipViews=true drops them all.
+	ViewFilter ViewFilter
+
+	// SkipViews drops every source view before computing the diff.
+	// Useful when the operator manages views out-of-band and
+	// considers any target-side view drift as not-sluice's-concern.
+	SkipViews bool
+
 	// Format is "text" (default) or "json". Empty defaults to "text".
 	Format string
 
@@ -105,6 +114,9 @@ type DiffJSONCounts struct {
 	ChecksMissing     int `json:"checks_missing"`
 	ChecksExtra       int `json:"checks_extra"`
 	ChecksMismatched  int `json:"checks_mismatched"`
+	ViewsMissing      int `json:"views_missing"`
+	ViewsExtra        int `json:"views_extra"`
+	ViewsMismatched   int `json:"views_mismatched"`
 }
 
 // Run executes the diff. Returns the computed diff plus an error.
@@ -145,6 +157,7 @@ func (d *Differ) Run(ctx context.Context) (*ir.SchemaDiff, error) {
 	if err := applyTableFilter(ctx, srcSchema, d.Filter); err != nil {
 		return nil, err
 	}
+	applyViewFilter(ctx, srcSchema, d.ViewFilter, d.SkipViews)
 
 	expected, err := translate.ApplyMappings(srcSchema, d.Mappings)
 	if err != nil {
@@ -470,6 +483,70 @@ func renderDiffText(w io.Writer, b diffBundle) error {
 		fmt.Fprintf(&sb, "-- ^ not in source schema; sluice would not create it\n\n")
 	}
 
+	// Views missing on target.
+	for _, name := range b.diff.ViewsMissing {
+		fmt.Fprintf(&sb, "-- ──────────── view %s (missing on target) ────────────\n", name)
+		// Look up the expected definition so the operator gets a
+		// copy-paste-ready CREATE VIEW. Materialized views emit
+		// `CREATE MATERIALIZED VIEW ... WITH DATA`; regular views
+		// emit `CREATE VIEW`. Cross-engine view-body translation is
+		// Phase 3 — for now the body is verbatim.
+		expView := lookupView(b.expected, name)
+		if expView != nil {
+			kw := "CREATE VIEW"
+			suffix := ""
+			if expView.Materialized {
+				kw = "CREATE MATERIALIZED VIEW"
+				suffix = " WITH DATA"
+			}
+			fmt.Fprintf(&sb, "%s %s AS %s%s;\n", kw, quote(name), expView.Definition, suffix)
+		} else {
+			fmt.Fprintf(&sb, "-- expected view definition not available; manually create %s\n", quote(name))
+		}
+		sb.WriteByte('\n')
+	}
+
+	// Views extra on target.
+	for _, name := range b.diff.ViewsExtra {
+		fmt.Fprintf(&sb, "-- ──────────── view %s (extra on target) ────────────\n", name)
+		// Pick the right DROP keyword based on what the actual side
+		// reports. Falls back to DROP VIEW (most common case).
+		actView := lookupView(b.actual, name)
+		if actView != nil && actView.Materialized {
+			fmt.Fprintf(&sb, "DROP MATERIALIZED VIEW %s;\n", quote(name))
+		} else {
+			fmt.Fprintf(&sb, "DROP VIEW %s;\n", quote(name))
+		}
+		fmt.Fprintf(&sb, "-- ^ not in source schema; sluice would not create it\n\n")
+	}
+
+	// Views mismatched (definition drift).
+	for _, vd := range b.diff.ViewsMismatched {
+		fmt.Fprintf(&sb, "-- ──────────── view %s (mismatched) ────────────\n", vd.Name)
+		if vd.ExpectedMaterialized != nil && vd.ActualMaterialized != nil &&
+			*vd.ExpectedMaterialized != *vd.ActualMaterialized {
+			fmt.Fprintf(&sb, "-- materialized flag differs: target=%v expected=%v\n",
+				*vd.ActualMaterialized, *vd.ExpectedMaterialized)
+		}
+		if vd.ExpectedDefinition != "" || vd.ActualDefinition != "" {
+			fmt.Fprintf(&sb, "-- (cross-engine view-definition comparison is high-noise; verify before applying)\n")
+			fmt.Fprintf(&sb, "-- target  : %s\n", oneLine(vd.ActualDefinition))
+			fmt.Fprintf(&sb, "-- expected: %s\n", oneLine(vd.ExpectedDefinition))
+		}
+		expView := lookupView(b.expected, vd.Name)
+		if expView != nil {
+			if expView.Materialized {
+				// PG won't accept CREATE OR REPLACE on a matview;
+				// the operator has to drop and recreate.
+				fmt.Fprintf(&sb, "DROP MATERIALIZED VIEW %s;\n", quote(vd.Name))
+				fmt.Fprintf(&sb, "CREATE MATERIALIZED VIEW %s AS %s WITH DATA;\n", quote(vd.Name), expView.Definition)
+			} else {
+				fmt.Fprintf(&sb, "CREATE OR REPLACE VIEW %s AS %s;\n", quote(vd.Name), expView.Definition)
+			}
+		}
+		sb.WriteByte('\n')
+	}
+
 	// Per-table mismatched sections.
 	for _, td := range b.diff.TablesMismatched {
 		fmt.Fprintf(&sb, "-- ──────────── %s (mismatched) ────────────\n", td.Name)
@@ -711,6 +788,44 @@ func unwrapDefaultLiteral(rendered string) string {
 	return rendered
 }
 
+// lookupView returns the named view from s, or nil when s is nil or
+// the view is absent. Used by the diff renderer to fetch the
+// expected definition for missing-on-target / mismatched-view
+// suggestions.
+func lookupView(s *ir.Schema, name string) *ir.View {
+	if s == nil {
+		return nil
+	}
+	for _, v := range s.Views {
+		if v != nil && v.Name == name {
+			return v
+		}
+	}
+	return nil
+}
+
+// oneLine collapses internal whitespace runs in s to single spaces
+// and trims leading/trailing whitespace, so a multi-line view
+// definition fits on a single comment line in the diff output.
+func oneLine(s string) string {
+	s = strings.TrimSpace(s)
+	var sb strings.Builder
+	sb.Grow(len(s))
+	prevSpace := false
+	for _, r := range s {
+		if r == ' ' || r == '\t' || r == '\n' || r == '\r' {
+			if !prevSpace {
+				sb.WriteByte(' ')
+			}
+			prevSpace = true
+			continue
+		}
+		prevSpace = false
+		sb.WriteRune(r)
+	}
+	return sb.String()
+}
+
 // renderGeneratedExprMismatch emits a comment describing the
 // generated-column expression drift. We don't try to ALTER the
 // expression: PG/MySQL both require dropping and re-adding the
@@ -750,6 +865,9 @@ func summarise(d ir.SchemaDiff) DiffJSONCounts {
 		TablesMissing:    len(d.TablesMissing),
 		TablesExtra:      len(d.TablesExtra),
 		TablesMismatched: len(d.TablesMismatched),
+		ViewsMissing:     len(d.ViewsMissing),
+		ViewsExtra:       len(d.ViewsExtra),
+		ViewsMismatched:  len(d.ViewsMismatched),
 	}
 	for _, td := range d.TablesMismatched {
 		c.ColumnsMissing += len(td.ColumnsMissing)

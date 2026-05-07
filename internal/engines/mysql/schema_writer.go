@@ -130,6 +130,55 @@ func (w *SchemaWriter) SyncIdentitySequences(_ context.Context, _ *ir.Schema) er
 	return nil
 }
 
+// CreateViews emits `CREATE OR REPLACE VIEW` for every view in s in
+// declaration order. View definitions are emitted verbatim — Phase 1
+// punts on cross-engine view-body translation (see [ir.View]), so a
+// PG-source-dialect definition applied to a MySQL target will fail
+// loudly at apply time rather than silently corrupt the view body.
+//
+// The orchestrator is responsible for retrying on view-to-view
+// dependency failures (one view referencing another that hasn't been
+// created yet); CreateViews itself emits in declared order with no
+// dependency analysis. See [pipeline.runViewsPhase].
+//
+// MySQL's view-body parser stores the SELECT in a re-canonicalised
+// form (backtick-quoted identifiers, charset introducers, etc.) — when
+// a sluice-managed view is round-tripped, the text the source reader
+// returns differs slightly from the operator's original DDL but
+// parses to the same logical view. `schema diff` accepts the round-
+// tripped form as equal.
+func (w *SchemaWriter) CreateViews(ctx context.Context, s *ir.Schema) error {
+	if s == nil {
+		return fmt.Errorf("mysql: CreateViews: schema is nil")
+	}
+	for _, view := range s.Views {
+		if view == nil || view.Name == "" {
+			continue
+		}
+		if view.Materialized {
+			// MySQL has no materialized-view concept. The schema
+			// reader on PG sources tags matviews; the writer surface
+			// here surfaces a clear error rather than silently
+			// emitting a regular view with the matview's SELECT (the
+			// loud-failure tenet).
+			return fmt.Errorf("mysql: CreateViews: view %q is materialized; MySQL has no materialized view support", view.Name)
+		}
+		stmt := emitCreateView(view)
+		if _, err := w.db.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("mysql: create view %q: %w", view.Name, err)
+		}
+	}
+	return nil
+}
+
+// emitCreateView returns the `CREATE OR REPLACE VIEW <name> AS
+// <definition>` statement for a regular view. Identifier quoting
+// follows the engine's existing conventions; the definition body is
+// emitted verbatim per Phase 1's no-translation policy.
+func emitCreateView(v *ir.View) string {
+	return "CREATE OR REPLACE VIEW " + quoteIdent(v.Name) + " AS " + v.Definition + ";"
+}
+
 // orderedTables returns s.Tables sorted alphabetically by name. The
 // returned slice is independent of s.Tables; callers may sort or
 // modify it without affecting the schema.
@@ -203,6 +252,19 @@ func (w *SchemaWriter) PreviewDDL(_ context.Context, s *ir.Schema) ([]ir.DDLStat
 				SQL:   trimTrailingSemicolon(stmt),
 			})
 		}
+	}
+
+	// Phase 4: views. Emitted last so all referenced base tables
+	// exist by the time the view is created.
+	for _, view := range s.Views {
+		if view == nil || view.Name == "" || view.Materialized {
+			continue
+		}
+		out = append(out, ir.DDLStatement{
+			Table: view.Name,
+			Kind:  "CREATE VIEW",
+			SQL:   trimTrailingSemicolon(emitCreateView(view)),
+		})
 	}
 
 	return out, nil

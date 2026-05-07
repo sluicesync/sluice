@@ -55,6 +55,7 @@ const (
 	PhaseBulkCopy    = "bulk-copy"
 	PhaseIndexes     = "indexes"
 	PhaseConstraints = "constraints"
+	PhaseViews       = "views"
 	PhaseCDC         = "cdc"
 	PhaseSnapshot    = "snapshot"
 )

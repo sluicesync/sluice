@@ -28,6 +28,10 @@ type SchemaDiffCmd struct {
 	IncludeTable []string `help:"Only diff these tables (comma-separated, repeatable). Glob patterns allowed (e.g. 'audit_*'). Mutually exclusive with --exclude-table." sep:"," placeholder:"TABLE"`
 	ExcludeTable []string `help:"Diff every table except these (comma-separated, repeatable). Glob patterns allowed. Mutually exclusive with --include-table." sep:"," placeholder:"TABLE"`
 
+	IncludeView []string `help:"Only diff these views (comma-separated, repeatable). Glob patterns allowed. Mutually exclusive with --exclude-view." sep:"," placeholder:"VIEW"`
+	ExcludeView []string `help:"Diff every view except these (comma-separated, repeatable). Glob patterns allowed. Mutually exclusive with --include-view." sep:"," placeholder:"VIEW"`
+	SkipViews   bool     `help:"Skip view comparison entirely. Useful when views are managed out-of-band and target-side view drift isn't sluice's concern."`
+
 	TypeOverride []string `help:"Force a specific target type for a column (repeatable). Format: 'TABLE.COLUMN=TYPE', e.g. 'users.id=binary_uuid'. CLI form of the YAML 'mappings:' config; for target-type options, use the YAML form." placeholder:"TABLE.COLUMN=TYPE"`
 
 	ExprOverride []string `help:"Replace a generated column's body with operator-supplied target-dialect text (repeatable). Format: 'TABLE.COLUMN=EXPRESSION'. Emitted verbatim; ADR-0016 translator skips overridden columns. CLI form of the YAML 'expression_mappings:' config." placeholder:"TABLE.COLUMN=EXPRESSION"`
@@ -62,8 +66,15 @@ func (s *SchemaDiffCmd) Run(g *Globals) error {
 	if len(s.IncludeTable) > 0 && len(s.ExcludeTable) > 0 {
 		return operationalError{err: errors.New("--include-table and --exclude-table are mutually exclusive")}
 	}
+	if len(s.IncludeView) > 0 && len(s.ExcludeView) > 0 {
+		return operationalError{err: errors.New("--include-view and --exclude-view are mutually exclusive")}
+	}
 	include, exclude := resolveTableFilterArgs(s.IncludeTable, s.ExcludeTable, cfg)
 	filter, err := pipeline.NewTableFilter(include, exclude)
+	if err != nil {
+		return operationalError{err: err}
+	}
+	viewFilter, err := pipeline.NewViewFilter(s.IncludeView, s.ExcludeView)
 	if err != nil {
 		return operationalError{err: err}
 	}
@@ -94,6 +105,8 @@ func (s *SchemaDiffCmd) Run(g *Globals) error {
 		Mappings:               mappings,
 		ExpressionMappings:     exprMappings,
 		Filter:                 filter,
+		ViewFilter:             viewFilter,
+		SkipViews:              s.SkipViews,
 		Format:                 s.Format,
 		IgnoreCharsetCollation: s.IgnoreCharsetCollation,
 		IgnoreExtras:           s.IgnoreExtras,

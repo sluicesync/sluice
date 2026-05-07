@@ -95,6 +95,10 @@ func (w *previewStubWriter) SyncIdentitySequences(_ context.Context, _ *ir.Schem
 	return nil
 }
 
+func (w *previewStubWriter) CreateViews(_ context.Context, _ *ir.Schema) error {
+	panic("preview should not call CreateViews")
+}
+
 func (w *previewStubWriter) PreviewDDL(_ context.Context, _ *ir.Schema) ([]ir.DDLStatement, error) {
 	if w.err != nil {
 		return nil, w.err
@@ -138,6 +142,10 @@ func (w *previewStubBareWriter) CreateConstraints(_ context.Context, _ *ir.Schem
 }
 
 func (w *previewStubBareWriter) SyncIdentitySequences(_ context.Context, _ *ir.Schema) error {
+	return nil
+}
+
+func (w *previewStubBareWriter) CreateViews(_ context.Context, _ *ir.Schema) error {
 	return nil
 }
 

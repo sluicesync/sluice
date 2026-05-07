@@ -191,6 +191,93 @@ func applyTableFilter(ctx context.Context, schema *ir.Schema, filter TableFilter
 	return nil
 }
 
+// ViewFilter selects which views participate in the migration / sync /
+// preview / diff. Same shape and semantics as [TableFilter]; views are
+// filtered independently of tables so an operator can opt out of view
+// processing entirely (`--skip-views`) or include / exclude a subset
+// without touching the table filter.
+type ViewFilter struct {
+	Include []string
+	Exclude []string
+}
+
+// NewViewFilter mirrors [NewTableFilter]: validates mutual exclusion of
+// Include / Exclude and pattern shape.
+func NewViewFilter(include, exclude []string) (ViewFilter, error) {
+	if len(include) > 0 && len(exclude) > 0 {
+		return ViewFilter{}, fmt.Errorf(
+			"pipeline: --include-view and --exclude-view are mutually exclusive (got include=%v exclude=%v)",
+			include, exclude)
+	}
+	for _, p := range include {
+		if _, err := path.Match(p, ""); err != nil {
+			return ViewFilter{}, fmt.Errorf("pipeline: invalid view include pattern %q: %w", p, err)
+		}
+	}
+	for _, p := range exclude {
+		if _, err := path.Match(p, ""); err != nil {
+			return ViewFilter{}, fmt.Errorf("pipeline: invalid view exclude pattern %q: %w", p, err)
+		}
+	}
+	return ViewFilter{Include: include, Exclude: exclude}, nil
+}
+
+// IsEmpty reports whether the view filter has no rules.
+func (f ViewFilter) IsEmpty() bool {
+	return len(f.Include) == 0 && len(f.Exclude) == 0
+}
+
+// Allows reports whether viewName is included by the filter. Same
+// semantics as [TableFilter.Allows].
+func (f ViewFilter) Allows(viewName string) bool {
+	if len(f.Include) > 0 {
+		return matchesAny(f.Include, viewName)
+	}
+	if len(f.Exclude) > 0 {
+		return !matchesAny(f.Exclude, viewName)
+	}
+	return true
+}
+
+// applyViewFilter mutates schema.Views in place, retaining only the
+// views the filter allows. When skipAll is true, every view is dropped
+// regardless of the filter — used to wire `--skip-views` from the CLI.
+//
+// Unlike [applyTableFilter], an empty result is NOT an error: many
+// schemas have no views, and a filter that drops them all is a
+// legitimate operator choice. Schema-with-no-views was already a
+// supported state before view-support landed.
+func applyViewFilter(ctx context.Context, schema *ir.Schema, filter ViewFilter, skipAll bool) {
+	if skipAll {
+		original := len(schema.Views)
+		schema.Views = nil
+		if original > 0 {
+			slog.InfoContext(ctx, "view processing skipped (--skip-views)",
+				slog.Int("excluded", original),
+			)
+		}
+		return
+	}
+	if filter.IsEmpty() {
+		return
+	}
+	original := len(schema.Views)
+	kept := schema.Views[:0]
+	for _, v := range schema.Views {
+		if v == nil {
+			continue
+		}
+		if filter.Allows(v.Name) {
+			kept = append(kept, v)
+		}
+	}
+	schema.Views = kept
+	slog.InfoContext(ctx, "view filter applied",
+		slog.Int("matched", len(kept)),
+		slog.Int("excluded", original-len(kept)),
+	)
+}
+
 // filterChanges wraps in with a goroutine that drops [ir.Change]
 // events whose table is excluded by filter. Used by the streamer's
 // dispatch loop so the [ir.ChangeApplier] never sees events for

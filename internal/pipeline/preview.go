@@ -66,6 +66,14 @@ type Previewer struct {
 	// returns.
 	Filter TableFilter
 
+	// ViewFilter selects which source views participate in the
+	// preview. Empty zero-value keeps every view; SkipViews=true
+	// drops them all regardless of filter.
+	ViewFilter ViewFilter
+
+	// SkipViews drops every view before preview rendering.
+	SkipViews bool
+
 	// Format is "text" (default human-readable form) or "json"
 	// (machine-readable for tooling). Empty defaults to "text".
 	Format string
@@ -146,6 +154,7 @@ func (p *Previewer) Run(ctx context.Context) error {
 	if err := applyTableFilter(ctx, srcSchema, p.Filter); err != nil {
 		return err
 	}
+	applyViewFilter(ctx, srcSchema, p.ViewFilter, p.SkipViews)
 
 	// ---- 3. Apply mappings ----
 	tgtSchema, err := translate.ApplyMappings(srcSchema, p.Mappings)

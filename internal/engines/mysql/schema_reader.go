@@ -34,36 +34,90 @@ func (r *SchemaReader) Close() error {
 // IR [ir.Schema] for the database the reader is bound to.
 //
 // The implementation runs a small number of broad queries (one per
-// concept: tables, columns, indexes, foreign keys) rather than per-table
-// round-trips. This keeps reads fast on large schemas and keeps the
-// query surface auditable.
+// concept: tables, columns, indexes, foreign keys, views) rather than
+// per-table round-trips. This keeps reads fast on large schemas and
+// keeps the query surface auditable.
 func (r *SchemaReader) ReadSchema(ctx context.Context) (*ir.Schema, error) {
 	tables, err := r.readTables(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("mysql: read tables: %w", err)
 	}
-	if len(tables) == 0 {
+	views, err := r.readViews(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("mysql: read views: %w", err)
+	}
+	if len(tables) == 0 && len(views) == 0 {
 		return &ir.Schema{}, nil
 	}
 
-	if err := r.populateColumns(ctx, tables); err != nil {
-		return nil, fmt.Errorf("mysql: read columns: %w", err)
-	}
-	if err := r.populateIndexes(ctx, tables); err != nil {
-		return nil, fmt.Errorf("mysql: read indexes: %w", err)
-	}
-	if err := r.populateForeignKeys(ctx, tables); err != nil {
-		return nil, fmt.Errorf("mysql: read foreign keys: %w", err)
-	}
-	if err := r.populateCheckConstraints(ctx, tables); err != nil {
-		return nil, fmt.Errorf("mysql: read check constraints: %w", err)
+	if len(tables) > 0 {
+		if err := r.populateColumns(ctx, tables); err != nil {
+			return nil, fmt.Errorf("mysql: read columns: %w", err)
+		}
+		if err := r.populateIndexes(ctx, tables); err != nil {
+			return nil, fmt.Errorf("mysql: read indexes: %w", err)
+		}
+		if err := r.populateForeignKeys(ctx, tables); err != nil {
+			return nil, fmt.Errorf("mysql: read foreign keys: %w", err)
+		}
+		if err := r.populateCheckConstraints(ctx, tables); err != nil {
+			return nil, fmt.Errorf("mysql: read check constraints: %w", err)
+		}
 	}
 
-	out := &ir.Schema{Tables: make([]*ir.Table, 0, len(tables))}
+	out := &ir.Schema{
+		Tables: make([]*ir.Table, 0, len(tables)),
+		Views:  views,
+	}
 	for _, name := range sortedKeys(tables) {
 		out.Tables = append(out.Tables, tables[name])
 	}
 	return out, nil
+}
+
+// readViews loads the view list for the bound database. MySQL stores
+// views in information_schema.views; the VIEW_DEFINITION column carries
+// the SELECT body MySQL parsed at CREATE time (with backtick-quoted
+// identifiers and the storage-form decorations that
+// [normalizeMySQLExpressionText] strips elsewhere). Phase 1 emits the
+// definition verbatim on same-engine pairs and relies on the loud-
+// failure tenet on cross-engine — view body translation is a future
+// Phase 3 effort.
+//
+// Materialized views don't exist in MySQL; View.Materialized is always
+// false on MySQL sources.
+//
+// `CHECK_OPTION`, `IS_UPDATABLE`, `DEFINER`, and `SECURITY_TYPE` are
+// metadata Phase 1 ignores — the goal is "round-trip the SELECT body",
+// not preserve the operator's full DDL surface. A future enhancement
+// could persist these on the IR if real-world demand surfaces.
+func (r *SchemaReader) readViews(ctx context.Context) ([]*ir.View, error) {
+	const q = `
+		SELECT table_name, view_definition
+		FROM   information_schema.views
+		WHERE  table_schema = ?
+		ORDER  BY table_name`
+
+	rows, err := r.db.QueryContext(ctx, q, r.schema)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []*ir.View
+	for rows.Next() {
+		var name, definition string
+		if err := rows.Scan(&name, &definition); err != nil {
+			return nil, err
+		}
+		out = append(out, &ir.View{
+			Name:              name,
+			Definition:        definition,
+			DefinitionDialect: dialectName,
+			Materialized:      false,
+		})
+	}
+	return out, rows.Err()
 }
 
 // readTables loads the table list and returns a map keyed by table

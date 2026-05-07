@@ -85,6 +85,10 @@ type MigrateCmd struct {
 	IncludeTable []string `help:"Only migrate these tables (comma-separated, repeatable). Glob patterns allowed (e.g. 'audit_*'). Mutually exclusive with --exclude-table." sep:"," placeholder:"TABLE"`
 	ExcludeTable []string `help:"Migrate every table except these (comma-separated, repeatable). Glob patterns allowed. Mutually exclusive with --include-table." sep:"," placeholder:"TABLE"`
 
+	IncludeView []string `help:"Only migrate these views (comma-separated, repeatable). Glob patterns allowed. Mutually exclusive with --exclude-view." sep:"," placeholder:"VIEW"`
+	ExcludeView []string `help:"Migrate every view except these (comma-separated, repeatable). Glob patterns allowed. Mutually exclusive with --include-view." sep:"," placeholder:"VIEW"`
+	SkipViews   bool     `help:"Skip view processing entirely; views in the source schema are not created on the target. Useful when views are managed out-of-band (Atlas / sqitch / liquibase)."`
+
 	TypeOverride []string `help:"Force a specific target type for a column (repeatable). Format: 'TABLE.COLUMN=TYPE', e.g. 'products.attrs=text'. CLI form of the YAML 'mappings:' config; for target-type options (e.g. 'jsonb' with binary=true), use the YAML form." placeholder:"TABLE.COLUMN=TYPE"`
 
 	ExprOverride []string `help:"Replace a generated column's body with operator-supplied target-dialect text (repeatable). Format: 'TABLE.COLUMN=EXPRESSION'. The expression is emitted verbatim — sluice's cross-dialect translator (ADR-0016) does NOT run on overridden columns. Escape hatch for cases the translator's hand-coded rewrites don't recognise. CLI form of the YAML 'expression_mappings:' config." placeholder:"TABLE.COLUMN=EXPRESSION"`
@@ -132,11 +136,18 @@ func (m *MigrateCmd) Run(g *Globals) error {
 	if len(m.IncludeTable) > 0 && len(m.ExcludeTable) > 0 {
 		return errors.New("--include-table and --exclude-table are mutually exclusive")
 	}
+	if len(m.IncludeView) > 0 && len(m.ExcludeView) > 0 {
+		return errors.New("--include-view and --exclude-view are mutually exclusive")
+	}
 	if m.Resume && m.ResetTargetData {
 		return errors.New("--resume and --reset-target-data are mutually exclusive")
 	}
 	include, exclude := resolveTableFilterArgs(m.IncludeTable, m.ExcludeTable, cfg)
 	filter, err := pipeline.NewTableFilter(include, exclude)
+	if err != nil {
+		return err
+	}
+	viewFilter, err := pipeline.NewViewFilter(m.IncludeView, m.ExcludeView)
 	if err != nil {
 		return err
 	}
@@ -171,6 +182,8 @@ func (m *MigrateCmd) Run(g *Globals) error {
 		Mappings:            mappings,
 		ExpressionMappings:  exprMappings,
 		Filter:              filter,
+		ViewFilter:          viewFilter,
+		SkipViews:           m.SkipViews,
 		Resume:              m.Resume,
 		MigrationID:         m.MigrationID,
 		ForceColdStart:      m.ForceColdStart,
@@ -240,6 +253,10 @@ type SyncStartCmd struct {
 	IncludeTable []string `help:"Only stream these tables (comma-separated, repeatable). Glob patterns allowed (e.g. 'audit_*'). Mutually exclusive with --exclude-table." sep:"," placeholder:"TABLE"`
 	ExcludeTable []string `help:"Stream every table except these (comma-separated, repeatable). Glob patterns allowed. Mutually exclusive with --include-table." sep:"," placeholder:"TABLE"`
 
+	IncludeView []string `help:"Only create these views on the target during cold-start (comma-separated, repeatable). Glob patterns allowed. Mutually exclusive with --exclude-view. Views are not replicated by CDC; this filter only affects the cold-start schema-apply phase." sep:"," placeholder:"VIEW"`
+	ExcludeView []string `help:"Skip these views during cold-start schema-apply (comma-separated, repeatable). Glob patterns allowed. Mutually exclusive with --include-view." sep:"," placeholder:"VIEW"`
+	SkipViews   bool     `help:"Skip view creation entirely on cold-start. Views are not replicated by CDC, so this only affects the initial schema-apply step."`
+
 	TypeOverride []string `help:"Force a specific target type for a column (repeatable). Format: 'TABLE.COLUMN=TYPE', e.g. 'products.attrs=text'. CLI form of the YAML 'mappings:' config; for target-type options, use the YAML form." placeholder:"TABLE.COLUMN=TYPE"`
 
 	ExprOverride []string `help:"Replace a generated column's body with operator-supplied target-dialect text (repeatable). Format: 'TABLE.COLUMN=EXPRESSION'. Emitted verbatim; ADR-0016 translator skips overridden columns. CLI form of the YAML 'expression_mappings:' config." placeholder:"TABLE.COLUMN=EXPRESSION"`
@@ -257,6 +274,8 @@ type SyncStartCmd struct {
 	ApplyBatchSize int `help:"Batch up to N CDC changes per target transaction. Default 1 (one change per tx, conservative). Production tuning: 100-500 typically gives 50-100x throughput on bulk CDC traffic. Schema-change events (TRUNCATE) flush the in-progress batch; the cap is an upper bound on batch size, not a target. Idempotent applier semantics (ADR-0010) keep replay-on-crash safe; ADR-0017 covers the full design." default:"1" placeholder:"N"`
 
 	MaxBufferBytes int64 `help:"Soft cap on per-batch buffered memory in the CDC applier (and, on the cold-start branch, the bulk-copy writer). The applier commits the in-flight target tx when accumulated row-value bytes reach the cap regardless of row count, so wide-row streams (TEXT/BYTEA/JSON at MB scale) don't blow out heap. A single change larger than the cap still applies (soft target). Default 67108864 (64 MiB). See ADR-0028." default:"67108864" placeholder:"N"`
+
+	MetricsListen string `help:"Bind a Prometheus-format /metrics endpoint at this address (e.g. ':9090' for all interfaces port 9090, '127.0.0.1:9090' for localhost only) for the duration of the stream. Off by default — opt-in. Companion to 'sluice sync health' (which is the cron-friendly one-shot probe shape). Useful for operators running Prometheus / Grafana / alertmanager." placeholder:"ADDR"`
 }
 
 // Run implements `sluice sync start`.
@@ -278,8 +297,15 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 	if len(s.IncludeTable) > 0 && len(s.ExcludeTable) > 0 {
 		return errors.New("--include-table and --exclude-table are mutually exclusive")
 	}
+	if len(s.IncludeView) > 0 && len(s.ExcludeView) > 0 {
+		return errors.New("--include-view and --exclude-view are mutually exclusive")
+	}
 	include, exclude := resolveTableFilterArgs(s.IncludeTable, s.ExcludeTable, cfg)
 	filter, err := pipeline.NewTableFilter(include, exclude)
+	if err != nil {
+		return err
+	}
+	viewFilter, err := pipeline.NewViewFilter(s.IncludeView, s.ExcludeView)
 	if err != nil {
 		return err
 	}
@@ -316,10 +342,13 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 		ExpressionMappings: exprMappings,
 		DryRun:             s.DryRun,
 		Filter:             filter,
+		ViewFilter:         viewFilter,
+		SkipViews:          s.SkipViews,
 		ForceColdStart:     s.ForceColdStart,
 		ResetTargetData:    s.ResetTargetData,
 		ApplyBatchSize:     s.ApplyBatchSize,
 		MaxBufferBytes:     s.MaxBufferBytes,
+		MetricsListen:      s.MetricsListen,
 	}
 	return streamer.Run(kongContext())
 }

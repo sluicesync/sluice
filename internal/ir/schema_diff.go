@@ -45,12 +45,42 @@ type SchemaDiff struct {
 	TablesMissing    []string    `json:"tables_missing,omitempty"`
 	TablesExtra      []string    `json:"tables_extra,omitempty"`
 	TablesMismatched []TableDiff `json:"tables_mismatched,omitempty"`
+
+	// ViewsMissing / ViewsExtra / ViewsMismatched mirror the table
+	// drift slices for views. View support Phase 1 compares by name
+	// (set semantics) for missing/extra, and by definition text for
+	// mismatched. Cross-engine definition comparison is high-noise
+	// (PG `pg_views.definition` reformats / canonicalises; MySQL
+	// returns the source as the parser stored it), so a "mismatched
+	// view" in cross-engine diffs surfaces low-confidence by design;
+	// future Phase 3 translator work will tighten this.
+	ViewsMissing    []string   `json:"views_missing,omitempty"`
+	ViewsExtra      []string   `json:"views_extra,omitempty"`
+	ViewsMismatched []ViewDiff `json:"views_mismatched,omitempty"`
+}
+
+// ViewDiff captures a single view's expected-vs-actual definition
+// drift. Only used when a view with the same Name appears on both
+// sides but the definition text differs.
+type ViewDiff struct {
+	Name               string `json:"name"`
+	ExpectedDefinition string `json:"expected_definition,omitempty"`
+	ActualDefinition   string `json:"actual_definition,omitempty"`
+
+	// ExpectedMaterialized / ActualMaterialized are populated only
+	// when the materialized-flag differs between sides (one side has
+	// a regular view, the other a materialized view of the same name).
+	// Both nil when both sides agree on the materialized-flag and
+	// only the definition body diverges.
+	ExpectedMaterialized *bool `json:"expected_materialized,omitempty"`
+	ActualMaterialized   *bool `json:"actual_materialized,omitempty"`
 }
 
 // HasChanges reports whether any drift was detected. The CLI uses
 // this to pick exit code 0 vs 1; same-shape unit-test predicate.
 func (d SchemaDiff) HasChanges() bool {
-	return len(d.TablesMissing) > 0 || len(d.TablesExtra) > 0 || len(d.TablesMismatched) > 0
+	return len(d.TablesMissing) > 0 || len(d.TablesExtra) > 0 || len(d.TablesMismatched) > 0 ||
+		len(d.ViewsMissing) > 0 || len(d.ViewsExtra) > 0 || len(d.ViewsMismatched) > 0
 }
 
 // Summary returns a short human-readable rollup of the diff (e.g.
@@ -94,6 +124,9 @@ func (d SchemaDiff) Summary() string {
 	add(chkMissing, "missing CHECK", "missing CHECKs")
 	add(chkExtra, "extra CHECK", "extra CHECKs")
 	add(chkMismatched, "CHECK mismatch", "CHECK mismatches")
+	add(len(d.ViewsMissing), "missing view", "missing views")
+	add(len(d.ViewsExtra), "extra view", "extra views")
+	add(len(d.ViewsMismatched), "view mismatch", "view mismatches")
 	if len(parts) == 0 {
 		return "in sync"
 	}
@@ -272,7 +305,80 @@ func DiffSchemas(expected, actual *Schema, opts DiffOptions) SchemaDiff {
 			d.TablesMismatched = append(d.TablesMismatched, td)
 		}
 	}
+
+	diffViews(&d, expected, actual, opts)
 	return d
+}
+
+// diffViews populates the view-related slices on d. Views are matched
+// by name (set semantics, mirroring tables). Definition comparison is
+// trim-and-equal — no SQL parser, no canonicalization. Cross-engine
+// drift is therefore high-noise; the renderer hedges accordingly.
+func diffViews(d *SchemaDiff, expected, actual *Schema, opts DiffOptions) {
+	expByName := viewsByName(expected)
+	actByName := viewsByName(actual)
+
+	for name := range expByName {
+		if _, ok := actByName[name]; !ok {
+			d.ViewsMissing = append(d.ViewsMissing, name)
+		}
+	}
+	sort.Strings(d.ViewsMissing)
+
+	if !opts.IgnoreExtras {
+		for name := range actByName {
+			if _, ok := expByName[name]; !ok {
+				d.ViewsExtra = append(d.ViewsExtra, name)
+			}
+		}
+		sort.Strings(d.ViewsExtra)
+	}
+
+	common := make([]string, 0, len(expByName))
+	for name := range expByName {
+		if _, ok := actByName[name]; ok {
+			common = append(common, name)
+		}
+	}
+	sort.Strings(common)
+	for _, name := range common {
+		exp := expByName[name]
+		act := actByName[name]
+		expDef := strings.TrimSpace(exp.Definition)
+		actDef := strings.TrimSpace(act.Definition)
+		matFlagDiffers := exp.Materialized != act.Materialized
+		if expDef == actDef && !matFlagDiffers {
+			continue
+		}
+		vd := ViewDiff{Name: name}
+		if expDef != actDef {
+			vd.ExpectedDefinition = expDef
+			vd.ActualDefinition = actDef
+		}
+		if matFlagDiffers {
+			expM := exp.Materialized
+			actM := act.Materialized
+			vd.ExpectedMaterialized = &expM
+			vd.ActualMaterialized = &actM
+		}
+		d.ViewsMismatched = append(d.ViewsMismatched, vd)
+	}
+}
+
+// viewsByName indexes a schema's Views by name. Returns an empty map
+// for a nil schema or a schema with no views.
+func viewsByName(s *Schema) map[string]*View {
+	if s == nil {
+		return nil
+	}
+	out := make(map[string]*View, len(s.Views))
+	for _, v := range s.Views {
+		if v == nil || v.Name == "" {
+			continue
+		}
+		out[v.Name] = v
+	}
+	return out
 }
 
 // hasChanges reports whether td carries any non-empty delta. Used by

@@ -165,6 +165,58 @@ func (w *SchemaWriter) SyncIdentitySequences(ctx context.Context, s *ir.Schema) 
 	return nil
 }
 
+// CreateViews emits `CREATE OR REPLACE VIEW` for regular views and
+// `CREATE MATERIALIZED VIEW ... WITH DATA` for materialized views,
+// in s.Views declaration order. View definitions are emitted verbatim;
+// cross-engine view-body translation is a Phase 3 effort (see
+// [ir.View]).
+//
+// The `WITH DATA` clause on materialized views populates the matview
+// from the just-loaded target tables on creation, so the cold-start
+// migration ends with a query-ready matview. Phase 2 will extend this
+// with CDC-driven `REFRESH MATERIALIZED VIEW` on a configured cadence.
+//
+// `CREATE OR REPLACE` covers regular-view re-runs idempotently; PG
+// rejects `CREATE OR REPLACE MATERIALIZED VIEW`, so a re-run of
+// CreateViews against a target whose matview already exists raises
+// "relation X already exists". The orchestrator's retry policy treats
+// this as success (the view is in place; the second pass would have
+// produced the same body anyway).
+//
+// View-to-view dependency ordering is the orchestrator's responsibility:
+// CreateViews emits in declared order, so a view that references
+// another view declared later in s.Views fails on the first pass and
+// retries on a later pass. See [pipeline.runViewsPhase].
+func (w *SchemaWriter) CreateViews(ctx context.Context, s *ir.Schema) error {
+	if s == nil {
+		return errors.New("postgres: CreateViews: schema is nil")
+	}
+	for _, view := range s.Views {
+		if view == nil || view.Name == "" {
+			continue
+		}
+		stmt := emitCreateView(w.schema, view)
+		if _, err := w.db.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("postgres: create view %q: %w", view.Name, err)
+		}
+	}
+	return nil
+}
+
+// emitCreateView returns the appropriate `CREATE [OR REPLACE | MATERIALIZED]
+// VIEW <schema>.<name> AS <definition>` statement for v. The definition
+// body is emitted verbatim per Phase 1's no-translation policy. Schema
+// qualification matches the writer's behaviour for tables — every
+// identifier is namespace-qualified so the writer can round-trip into
+// schemas other than the default `public`.
+func emitCreateView(schema string, v *ir.View) string {
+	qualified := quoteIdent(schema) + "." + quoteIdent(v.Name)
+	if v.Materialized {
+		return "CREATE MATERIALIZED VIEW " + qualified + " AS " + v.Definition + " WITH DATA;"
+	}
+	return "CREATE OR REPLACE VIEW " + qualified + " AS " + v.Definition + ";"
+}
+
 // syncOneIdentity reads MAX(<col>) on the target table; if non-NULL,
 // runs setval on the column's underlying sequence so that next
 // nextval returns MAX+1.
@@ -297,6 +349,24 @@ func (w *SchemaWriter) PreviewDDL(_ context.Context, s *ir.Schema) ([]ir.DDLStat
 				SQL:   trimTrailingSemicolon(stmt),
 			})
 		}
+	}
+
+	// Phase 4: views. Emitted last so all referenced base tables
+	// exist by the time the view is created. Materialized views use
+	// the `CREATE MATERIALIZED VIEW ... WITH DATA` shape.
+	for _, view := range s.Views {
+		if view == nil || view.Name == "" {
+			continue
+		}
+		kind := "CREATE VIEW"
+		if view.Materialized {
+			kind = "CREATE MATERIALIZED VIEW"
+		}
+		out = append(out, ir.DDLStatement{
+			Table: view.Name,
+			Kind:  kind,
+			SQL:   trimTrailingSemicolon(emitCreateView(w.schema, view)),
+		})
 	}
 
 	return out, nil

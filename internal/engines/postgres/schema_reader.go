@@ -55,44 +55,101 @@ func (r *SchemaReader) ReadSchema(ctx context.Context) (*ir.Schema, error) {
 	if err != nil {
 		return nil, fmt.Errorf("postgres: read tables: %w", err)
 	}
-	if len(tables) == 0 {
+	views, err := r.readViews(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: read views: %w", err)
+	}
+	if len(tables) == 0 && len(views) == 0 {
 		return &ir.Schema{}, nil
 	}
 
-	enumValues, err := r.readEnumValues(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("postgres: read enum values: %w", err)
+	if len(tables) > 0 {
+		enumValues, err := r.readEnumValues(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("postgres: read enum values: %w", err)
+		}
+
+		// PostGIS's geometry_columns view holds per-column subtype +
+		// SRID that information_schema flattens away. Lookup is
+		// best-effort — the view exists only when PostGIS is installed,
+		// and a schema with no geometry columns has no rows there.
+		// Either way, the translator degrades gracefully via
+		// GeometryUnspecified + SRID=0 when no info shows up.
+		geomInfo, err := r.readGeometryColumnInfo(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("postgres: read geometry columns: %w", err)
+		}
+
+		if err := r.populateColumns(ctx, tables, enumValues, geomInfo); err != nil {
+			return nil, fmt.Errorf("postgres: read columns: %w", err)
+		}
+		if err := r.populateIndexes(ctx, tables); err != nil {
+			return nil, fmt.Errorf("postgres: read indexes: %w", err)
+		}
+		if err := r.populateForeignKeys(ctx, tables); err != nil {
+			return nil, fmt.Errorf("postgres: read foreign keys: %w", err)
+		}
+		if err := r.populateCheckConstraints(ctx, tables); err != nil {
+			return nil, fmt.Errorf("postgres: read check constraints: %w", err)
+		}
 	}
 
-	// PostGIS's geometry_columns view holds per-column subtype +
-	// SRID that information_schema flattens away. Lookup is
-	// best-effort — the view exists only when PostGIS is installed,
-	// and a schema with no geometry columns has no rows there.
-	// Either way, the translator degrades gracefully via
-	// GeometryUnspecified + SRID=0 when no info shows up.
-	geomInfo, err := r.readGeometryColumnInfo(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("postgres: read geometry columns: %w", err)
+	out := &ir.Schema{
+		Tables: make([]*ir.Table, 0, len(tables)),
+		Views:  views,
 	}
-
-	if err := r.populateColumns(ctx, tables, enumValues, geomInfo); err != nil {
-		return nil, fmt.Errorf("postgres: read columns: %w", err)
-	}
-	if err := r.populateIndexes(ctx, tables); err != nil {
-		return nil, fmt.Errorf("postgres: read indexes: %w", err)
-	}
-	if err := r.populateForeignKeys(ctx, tables); err != nil {
-		return nil, fmt.Errorf("postgres: read foreign keys: %w", err)
-	}
-	if err := r.populateCheckConstraints(ctx, tables); err != nil {
-		return nil, fmt.Errorf("postgres: read check constraints: %w", err)
-	}
-
-	out := &ir.Schema{Tables: make([]*ir.Table, 0, len(tables))}
 	for _, name := range sortedKeys(tables) {
 		out.Tables = append(out.Tables, tables[name])
 	}
 	return out, nil
+}
+
+// readViews loads regular views (pg_views) and materialized views
+// (pg_matviews) for the bound schema. PG canonicalises the view body
+// via pg_get_viewdef when serving these catalog views, so the text we
+// get back is reformatted relative to the operator's source — that's
+// fine for Phase 1's round-trip-on-same-engine goal but means
+// cross-engine `schema diff` against this side will see canonicalised
+// text on every line. Documented in [ir.View].
+//
+// Materialized-view CDC refresh is a Phase 2 future enhancement; the
+// Phase 1 writer emits `WITH DATA` so the target's matview is
+// populated immediately from the just-loaded target tables.
+func (r *SchemaReader) readViews(ctx context.Context) ([]*ir.View, error) {
+	const q = `
+		SELECT viewname AS name, definition, false AS materialized
+		FROM   pg_views
+		WHERE  schemaname = $1
+		UNION ALL
+		SELECT matviewname AS name, definition, true AS materialized
+		FROM   pg_matviews
+		WHERE  schemaname = $1
+		ORDER  BY name`
+
+	rows, err := r.db.QueryContext(ctx, q, r.schema)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []*ir.View
+	for rows.Next() {
+		var (
+			name, definition string
+			materialized     bool
+		)
+		if err := rows.Scan(&name, &definition, &materialized); err != nil {
+			return nil, err
+		}
+		out = append(out, &ir.View{
+			Schema:            r.schema,
+			Name:              name,
+			Definition:        definition,
+			DefinitionDialect: dialectName,
+			Materialized:      materialized,
+		})
+	}
+	return out, rows.Err()
 }
 
 // readTables loads the table list for the bound schema.

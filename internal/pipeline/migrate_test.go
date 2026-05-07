@@ -351,6 +351,11 @@ func (w *recordingSchemaWriter) SyncIdentitySequences(context.Context, *ir.Schem
 	return nil
 }
 
+func (w *recordingSchemaWriter) CreateViews(context.Context, *ir.Schema) error {
+	*w.phaseLog = append(*w.phaseLog, "CreateViews")
+	return nil
+}
+
 type recordingRowReader struct{}
 
 func (*recordingRowReader) ReadRows(context.Context, *ir.Table) (<-chan ir.Row, error) {

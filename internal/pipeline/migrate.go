@@ -102,6 +102,18 @@ type Migrator struct {
 	// schema implicitly.
 	Filter TableFilter
 
+	// ViewFilter selects which source views participate in the
+	// migration's view-creation phase. Independent of [Filter] so
+	// an operator can keep all tables but skip a subset of views.
+	// Zero value keeps every view the schema reader returns.
+	ViewFilter ViewFilter
+
+	// SkipViews, when true, drops every view from the schema before
+	// any phase runs — equivalent to setting ViewFilter to exclude
+	// `*`, but with a clearer log line. Useful for cold-start
+	// migrations that don't want to round-trip view definitions.
+	SkipViews bool
+
 	// Resume, when true, picks up where a previously-failed
 	// migration with the same MigrationID left off. Reads the
 	// per-target sluice_migrate_state row, branches on phase, and
@@ -252,6 +264,7 @@ func (m *Migrator) Run(ctx context.Context) error {
 	if err := applyTableFilter(ctx, schema, m.Filter); err != nil {
 		return err
 	}
+	applyViewFilter(ctx, schema, m.ViewFilter, m.SkipViews)
 
 	// ---- 1.5. Apply per-column type-mapping overrides ----
 	schema, err = translate.ApplyMappings(schema, m.Mappings)
@@ -388,10 +401,10 @@ func (m *Migrator) resolveMigrationID() string {
 // runBulkCopy applies the shared phases that follow target-writer
 // open with no resume awareness: schema phase 1 (tables without
 // constraints) → bulk-copy of every table → identity-sequence sync →
-// schema phase 2 (indexes) → schema phase 3 (foreign keys). Used by
-// the Streamer's cold-start path (which pre-dates the resume
-// feature). [Migrator] uses [runBulkCopyPhases] instead so the
-// per-phase boundaries can persist resume state.
+// schema phase 2 (indexes) → schema phase 3 (foreign keys) → schema
+// phase 4 (views). Used by the Streamer's cold-start path (which
+// pre-dates the resume feature). [Migrator] uses [runBulkCopyPhases]
+// instead so the per-phase boundaries can persist resume state.
 //
 // Phase 3.5 (identity-sequence sync) runs between bulk-copy and
 // indexes so the next user-initiated INSERT against an identity
@@ -425,6 +438,9 @@ func runBulkCopy(
 	}
 	if err := sw.CreateConstraints(ctx, schema); err != nil {
 		return wrapWithHint(PhaseConstraints, fmt.Errorf("pipeline: create constraints: %w", err))
+	}
+	if err := runViewsPhase(ctx, schema, sw); err != nil {
+		return wrapWithHint(PhaseViews, err)
 	}
 	return nil
 }
@@ -524,6 +540,100 @@ func runBulkCopyPhases(
 	}
 	slog.InfoContext(ctx, "migration: phase complete", slog.String("phase", string(ir.MigrationPhaseConstraints)))
 
+	// Phase 6: views. Final phase so all referenced base tables
+	// exist by the time the view is created. View-to-view dependency
+	// ordering uses a single-pass-with-retries policy (see
+	// [runViewsPhase]) — no SQL parser, no topological sort.
+	if err := markPhase(ctx, rc, state, ir.MigrationPhaseViews); err != nil {
+		_ = err
+	}
+	if err := runViewsPhase(ctx, schema, sw); err != nil {
+		return wrapWithHint(PhaseViews, markFailed(ctx, rc, *state, ir.MigrationPhaseViews, err))
+	}
+	slog.InfoContext(ctx, "migration: phase complete", slog.String("phase", string(ir.MigrationPhaseViews)))
+
+	return nil
+}
+
+// runViewsPhase emits CREATE VIEW for every view in schema.Views with
+// a retry policy that handles view-to-view dependency ordering without
+// implementing a full SQL parser. The policy: emit views in declared
+// order; on failure, accumulate the failed view in a retry list; after
+// the first pass, retry the failed views up to 2 more times. If the
+// retry list is non-empty after the third pass, surface the
+// accumulated errors.
+//
+// Why retry rather than topological sort: parsing the view's SELECT
+// body to extract referenced views requires a real SQL parser, which
+// is out of scope for Phase 1 (and arguably ever — different engines
+// have different SELECT grammars). Real-world view dependency depths
+// are shallow (typically 1-2 levels of view-on-view); two retry
+// passes covers the common cases. Operators with deeper dependency
+// graphs (>2 levels of view-on-view chains) get a clear error
+// pointing at the still-failing views and can manually reorder
+// `--include-view` invocations to bootstrap the dependency chain.
+//
+// No-op on schemas without views; cheap when none fail.
+func runViewsPhase(ctx context.Context, schema *ir.Schema, sw ir.SchemaWriter) error {
+	if schema == nil || len(schema.Views) == 0 {
+		return nil
+	}
+
+	// First pass: try every view. retry collects views that failed.
+	pending := append([]*ir.View(nil), schema.Views...)
+	var lastErrs []error
+
+	const maxPasses = 3 // 1 initial + 2 retries
+	for pass := 0; pass < maxPasses && len(pending) > 0; pass++ {
+		var nextPending []*ir.View
+		lastErrs = nil
+		for _, v := range pending {
+			single := &ir.Schema{Views: []*ir.View{v}}
+			if err := sw.CreateViews(ctx, single); err != nil {
+				if pass == maxPasses-1 {
+					// Last pass — accumulate the error for the caller.
+					lastErrs = append(lastErrs, fmt.Errorf("view %q: %w", v.Name, err))
+				} else {
+					slog.DebugContext(ctx, "view create failed, will retry",
+						slog.String("view", v.Name),
+						slog.Int("pass", pass+1),
+						slog.String("error", err.Error()),
+					)
+				}
+				nextPending = append(nextPending, v)
+			}
+		}
+		if len(nextPending) == len(pending) && pass < maxPasses-1 {
+			// No progress this pass — abort early. Trying again wouldn't
+			// help (no view-create succeeded to unblock the rest). Force
+			// the next iteration to be the last so the caller gets the
+			// accumulated errors.
+			slog.DebugContext(ctx, "no progress in views phase; bailing to error report",
+				slog.Int("pending", len(nextPending)),
+				slog.Int("pass", pass+1),
+			)
+			pass = maxPasses - 2 // next iteration is the last (records errors)
+		}
+		pending = nextPending
+	}
+
+	if len(pending) > 0 {
+		// Build a single combined error so the operator sees every
+		// still-failing view at once rather than just the first.
+		names := make([]string, 0, len(pending))
+		for _, v := range pending {
+			names = append(names, v.Name)
+		}
+		base := fmt.Errorf("pipeline: create views failed after %d retries (%d still failing: %v); "+
+			"view-to-view dependency depth may exceed retry budget — review and reorder declared view list",
+			maxPasses-1, len(pending), names)
+		if len(lastErrs) > 0 {
+			return errors.Join(append([]error{base}, lastErrs...)...)
+		}
+		return base
+	}
+
+	slog.InfoContext(ctx, "views created", slog.Int("count", len(schema.Views)))
 	return nil
 }
 
@@ -615,6 +725,7 @@ func (m *Migrator) logPlan(ctx context.Context, schema *ir.Schema) error {
 		slog.String("source", m.Source.Name()),
 		slog.String("target", m.Target.Name()),
 		slog.Int("tables", len(schema.Tables)),
+		slog.Int("views", len(schema.Views)),
 	)
 
 	// Open a throwaway RowReader for row counts. Best-effort: if it

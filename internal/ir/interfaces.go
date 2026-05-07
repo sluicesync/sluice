@@ -100,6 +100,26 @@ type SchemaWriter interface {
 	// Engines whose identity mechanism auto-bumps on direct INSERT
 	// of explicit values (MySQL InnoDB) implement this as a no-op.
 	SyncIdentitySequences(ctx context.Context, s *Schema) error
+
+	// CreateViews emits CREATE VIEW / CREATE MATERIALIZED VIEW for
+	// every entry in s.Views. Called as the final schema-apply phase
+	// (after foreign keys) so all referenced tables exist on the
+	// target. Implementations MUST be tolerant of view-to-view
+	// dependencies: the orchestrator relies on a single-pass with
+	// retries (see [pipeline.Migrator]) to converge on declaration
+	// orders that don't sort topologically without a SQL parser.
+	//
+	// Idempotent: re-running on a target that already has matching
+	// views is safe — both engines emit `CREATE OR REPLACE VIEW`
+	// for regular views. Materialized views (Postgres only) are not
+	// idempotent in the strict sense: a second apply will raise
+	// "relation already exists"; the orchestrator's retry policy
+	// treats this as success on the second pass.
+	//
+	// Engines without view support (none today) should implement
+	// this as a no-op for an empty s.Views and return a clear error
+	// on a non-empty list.
+	CreateViews(ctx context.Context, s *Schema) error
 }
 
 // RowReader streams rows from a single table for the bulk-copy phase.
@@ -588,7 +608,7 @@ type SlotManagerOpener interface {
 //
 // The lifecycle is roughly:
 //
-//	pending -> tables -> bulk_copy -> identity_sync -> indexes -> constraints -> complete
+//	pending -> tables -> bulk_copy -> identity_sync -> indexes -> constraints -> views -> complete
 //
 // Any phase can transition to `failed` on error; a subsequent
 // `--resume` reads the stored phase and re-enters at that point.
@@ -630,6 +650,14 @@ const (
 	// MigrationPhaseConstraints covers schema phase 3 (foreign keys).
 	// Same idempotence caveat as MigrationPhaseIndexes.
 	MigrationPhaseConstraints MigrationPhase = "constraints"
+
+	// MigrationPhaseViews covers schema phase 4 (CREATE VIEW /
+	// CREATE MATERIALIZED VIEW). Re-runs are best-effort idempotent
+	// for regular views (`CREATE OR REPLACE`); materialized views
+	// emit a non-idempotent `CREATE MATERIALIZED VIEW`, which the
+	// retry-on-failure orchestrator (see [pipeline.runViewsPhase])
+	// treats as success on the second pass.
+	MigrationPhaseViews MigrationPhase = "views"
 
 	// MigrationPhaseComplete marks a clean finish. A row in this phase
 	// blocks a re-run without --resume (operators must drop the target
