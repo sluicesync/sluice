@@ -79,7 +79,7 @@ jobs:
         os: ${{ fromJSON((github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')) && '["ubuntu-latest","macos-latest","windows-latest"]' || '["ubuntu-latest"]') }}
     steps:
       # Checkout the code into the runner's working directory.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       # Install Go and enable the module cache so subsequent runs reuse
       # downloaded dependencies. setup-go@v5 enables caching by default.
@@ -138,7 +138,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: actions/setup-go@v6
         with:
           go-version-file: "go.mod"
@@ -169,7 +169,7 @@ jobs:
     name: Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: actions/setup-go@v6
         with:
           go-version-file: "go.mod"
@@ -209,7 +209,7 @@ jobs:
       matrix:
         os: ${{ fromJSON((github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')) && '["ubuntu-latest","macos-latest","windows-latest"]' || '["ubuntu-latest"]') }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: actions/setup-go@v6
         with:
           go-version-file: "go.mod"
