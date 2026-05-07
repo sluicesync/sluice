@@ -189,6 +189,51 @@ just a wider hash space (2²⁵⁶ instead of 2¹²⁸). Cost: SHA-256 is
 ~2× slower than MD5 server-side, but at sample-mode's typical 100
 rows × N tables, the difference is in milliseconds.
 
+## Why MD5/SHA-256 and not xxhash?
+
+Vitess uses [xxhash](https://github.com/cespare/xxhash) in its
+`xxhash_vindex` for row-to-shard routing — fast (~10 GB/s in pure
+CPU), well-distributed, non-cryptographic. A reasonable question is
+whether sluice verify should use xxhash too.
+
+**Short answer: not for the current server-side path; yes for a
+future client-side path.**
+
+**Why not server-side.** sluice verify's sample-mode runs the hash
+inside MySQL or Postgres (`MD5(...)` / `SHA2(..., 256)` /
+`SHA256(...)`) and ships only the hex-string hash over the wire.
+Both engines have MD5 and SHA-256 in core. **xxhash is not in PG
+or MySQL core** — it requires a third-party extension (`pgxxhash`
+on PGXN; `xxhash_mysql_udf` for MySQL). PlanetScale doesn't allow
+installing these. Forcing operators to install an extension just
+to use a faster hash would defeat sluice's single-binary posture.
+
+**Speed isn't the bottleneck for sample-mode anyway.** At the
+default 100 rows per table × ~1 KB per row, MD5 takes well under
+a millisecond; the wire round-trip (~10–100 ms) dominates.
+Switching to xxhash would save microseconds of CPU but zero wall
+time.
+
+**Where xxhash would fit.** A future **client-side** hashing path
+would stream raw row values from the server, canonicalize them
+in Go (handling cross-engine value-rendering differences:
+`TINYINT(1)=1` vs `BOOLEAN=t`, decimal precision, timestamp
+formatting, etc.), then hash via `cespare/xxhash`. That's exactly
+what's needed to unlock **cross-engine sample-mode** (the
+verify proto-ADR's deferred open question). For that path:
+
+- Hash function runs in the operator's process — no DB-side
+  dependency, no extension footprint.
+- Cross-engine canonical values mean source and target hashes
+  align by construction.
+- Speed of xxhash matters more on the per-row hot loop in a
+  future full-mode (every-row) implementation.
+
+When we tackle cross-engine sample (or full-mode if it goes
+client-side), xxhash is the right choice for those code paths.
+For the current server-side sample-mode, MD5 (default) and
+SHA-256 (`--strict-hash`) remain correct.
+
 ## Complementary, not competing
 
 vdiff and sluice verify aren't replacements for each other — they
