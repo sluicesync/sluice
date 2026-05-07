@@ -88,9 +88,25 @@ func TestBackupCmdParse(t *testing.T) {
 			},
 		},
 		{
-			name:      "backup verify missing --from-dir",
-			args:      []string{"backup", "verify"},
-			expectErr: "from-dir",
+			// --from-dir is no longer required by kong because --from
+			// is the alternative; the runtime check inside Run()
+			// enforces that exactly one is supplied.
+			name: "backup verify --from-dir parses",
+			args: []string{"backup", "verify", "--from-dir=/tmp/backup"},
+			check: func(t *testing.T, cli *CLI) {
+				if cli.Backup.Verify.FromDir != "/tmp/backup" {
+					t.Errorf("FromDir = %q", cli.Backup.Verify.FromDir)
+				}
+			},
+		},
+		{
+			name: "backup verify --from URL parses",
+			args: []string{"backup", "verify", "--from=s3://bucket/prefix"},
+			check: func(t *testing.T, cli *CLI) {
+				if cli.Backup.Verify.From != "s3://bucket/prefix" {
+					t.Errorf("From = %q", cli.Backup.Verify.From)
+				}
+			},
 		},
 		{
 			name: "restore happy path",
@@ -118,9 +134,48 @@ func TestBackupCmdParse(t *testing.T) {
 			expectErr: "target-driver",
 		},
 		{
-			name:      "backup full missing --output-dir",
-			args:      []string{"backup", "full", "--source-driver=mysql", "--source=x"},
-			expectErr: "output-dir",
+			// Phase 2: --output-dir is no longer required by kong because
+			// --target (URL) is the alternative for cloud backups. The
+			// runtime check inside Run() catches the both-empty case.
+			name: "backup full --target URL parses",
+			args: []string{
+				"backup", "full",
+				"--source-driver=mysql",
+				"--source=user:pwd@/db",
+				"--target=s3://bucket/prefix",
+				"--backup-endpoint=http://minio.local:9000",
+				"--backup-region=us-east-1",
+				"--backup-path-style",
+			},
+			check: func(t *testing.T, cli *CLI) {
+				if cli.Backup.Full.Target != "s3://bucket/prefix" {
+					t.Errorf("Target = %q", cli.Backup.Full.Target)
+				}
+				if cli.Backup.Full.BackupEndpoint != "http://minio.local:9000" {
+					t.Errorf("BackupEndpoint = %q", cli.Backup.Full.BackupEndpoint)
+				}
+				if cli.Backup.Full.BackupRegion != "us-east-1" {
+					t.Errorf("BackupRegion = %q", cli.Backup.Full.BackupRegion)
+				}
+				if !cli.Backup.Full.BackupPathStyle {
+					t.Errorf("BackupPathStyle = false; want true")
+				}
+			},
+		},
+		{
+			name: "backup full --force-overwrite parses",
+			args: []string{
+				"backup", "full",
+				"--source-driver=mysql",
+				"--source=user:pwd@/db",
+				"--output-dir=/tmp/b",
+				"--force-overwrite",
+			},
+			check: func(t *testing.T, cli *CLI) {
+				if !cli.Backup.Full.ForceOverwrite {
+					t.Errorf("ForceOverwrite = false; want true")
+				}
+			},
 		},
 	}
 
