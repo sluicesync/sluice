@@ -92,9 +92,32 @@ Done: IR package, both engines (read + write), kong CLI + koanf config, simple-m
 
 For the upcoming work, see `docs/dev/roadmap.md` — it has detailed entries for the Postgres→MySQL test, MySQL/Postgres CDC, the snapshot→CDC handoff, the COPY-protocol writer, translation-policy edges, ADRs, and OSS hygiene.
 
+## Release process (autonomous)
+
+The owner has authorized AI-assisted releases end-to-end via the `gh` CLI. This convention has historically lived in auto-memory, but compaction thinned it once and a release got stuck mid-flow — so the canonical version lives here. **Do not wait to be asked at each phase; once a tag is cut, drive it through to publish.**
+
+The flow has six phases for a typical patch release:
+
+1. **Stage + commit** the fix(es) on `main` (run the pre-commit hook locally first; never bypass with `--no-verify`).
+2. **Tag** with `git tag -a vX.Y.Z -m "..."` from the commit you intend to ship. Force-moving a tag is acceptable **only while the corresponding GitHub release is still in draft state** (CI failed, fix landing, etc.) — never after publish.
+3. **Push** the commit and the tag (`git push origin main && git push origin vX.Y.Z`). The release workflow (`.github/workflows/release.yml`) builds binaries + creates a draft release with auto-generated commit-list notes.
+4. **Watch CI** on both the tag and `main` until completion. Both `release.yml` (on tag) and `ci.yml` (on tag, plus the descendant `main` push if the tag points to HEAD~) must finish green. The descendant-commit fallback exists because GitHub doesn't always run `ci.yml` on tag pushes when the tag points to a commit `ci.yml` already ran on; in that case the descendant `main` run is the authoritative signal.
+5. **Replace the auto-generated draft notes** with curated release notes (headline + Features / Fixed / Compatibility / Who-needs-this sections, mirroring the style in prior releases). Always include this — feedback memory `feedback_release_notes.md` documents that the owner expects both a CHANGELOG entry **and** a separately formatted GitHub-release block on every release.
+6. **Publish via Option B gate.** All five checks must pass before `gh release edit vX.Y.Z --draft=false`:
+   1. `release.yml` workflow on the tag → success
+   2. `ci.yml` workflow on the tag (or descendant `main` commit, if the on-tag run didn't trigger) → success
+   3. Release assets present (`gh release view vX.Y.Z --json assets` returns a non-empty list)
+   4. Release notes body present and curated (not the auto-generated commit-list)
+   5. Tag uniqueness — `git ls-remote --tags origin vX.Y.Z` returns exactly one ref
+
+If any of the five fails, fix the failure (typically: race conditions caught by `-race`, lint regressions, or missing notes) and either force-move the tag (still-draft case) or cut the next patch version. **Never publish a release with one or more gate checks failing or unverified.**
+
+For full procedure incl. the watcher script and edge cases, see `docs/dev/release-process.md` (when added). The session-local `.claude/settings.local.json` should pre-authorize `Bash(git push origin main:*)`, `Bash(git push origin v*:*)`, and `Bash(gh release edit:*)` so the autonomous flow doesn't trip the deny-by-default hook on every release.
+
 ## Working agreements with humans on this project
 
 - The repo's owner prefers terse responses over verbose recaps. Don't summarize what was just done; the diff is readable.
 - When making a non-trivial design choice, lay out the options and tradeoffs briefly *before* writing code. The "validate end-to-end" tenet exists because of a past instance where this wasn't done.
 - Run the pre-commit hook before suggesting a commit. Don't surface lint failures from CI that the local hook would have caught.
 - Memory of prior decisions and references lives in this file. If a new convention or hard-won lesson emerges, propose adding it here rather than relying on conversation context.
+- After a release tag is cut, **don't pause for re-approval at each phase** — drive through Phase 4–6 of the Release process autonomously. The owner has explicitly authorized end-to-end automation; pausing mid-flow has stranded releases in draft state in past sessions.
