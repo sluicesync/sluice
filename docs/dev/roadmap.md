@@ -133,6 +133,15 @@ For continuity when a chunk references "the previous work":
 - **`docs/dev/design-mid-stream-add-table.md`** + **`docs/dev/design-multi-source-aggregation.md`** — proto-ADRs lay out the design space for the two heavier roadmap items so the implementation pass starts from a structured doc, not a blank page.
 - **goreleaser cross-platform release (live since `.goreleaser.yaml` + `release.yml` landed earlier).** Tagging `v*` triggers a draft GitHub release with Linux/macOS/Windows × amd64/arm64 binaries. CHANGELOG-driven release notes; operator publishes the draft after review.
 
+### v0.11.x feature wave (proactive translator + reactive bug bundle)
+
+- **v0.11.0 + v0.11.1 — translator catalog two-batch (16 rules).** First batch of MySQL→PG rewrites mined from `docs/dev/translator-coverage.md`'s research catalog: NOW family / UNIX_TIMESTAMP / FROM_UNIXTIME / CHAR_LENGTH / LCASE / UCASE / SUBSTR / MID (v0.11.0); RAND / UUID / ISNULL / REGEXP_REPLACE / INSTR / LOCATE arg-swap / DATE_ADD/DATE_SUB / DATE_FORMAT (v0.11.1). Plus operator-form INTERVAL rewrite and DEFAULT-expression dialect-gating in v0.11.3 closing Bugs 28/29/30 from the v0.11.2 test cycle. ADR-0016 cumulative-scope table now lists 30 MySQL→PG translator entries.
+- **v0.11.2 — `schema diff` cross-engine retarget fix.** Empty-source charset/collation now treated as "no opinion" rather than as a sentinel for comparison; pre-fix every PG→MySQL retargeted column (UUID/Inet/Macaddr/Array → MySQL CHAR/VARCHAR/JSON) surfaced as bogus drift. CI Integration job had been red since v0.11.0 push; fix surfaced via the autonomous test-cycle loop.
+- **v0.11.3 — DEFAULT-expression translator gating + INTERVAL operator-form rewrite.** New `Dialect` field on `ir.DefaultExpression` (mirrors `Column.GeneratedExprDialect` / `CheckConstraint.ExprDialect`); PG writer's `emitDefault` routes `DefaultExpression` through translator when source dialect differs. New `rewriteIntervalLiteral` operates on the operator-form `INTERVAL <int> <unit>` since MySQL canonicalizes `DATE_ADD(...)` to the operator form before sluice ever sees it. All three v0.11.2 bugs closed.
+- **OSS-hygiene track complete.** SPDX license headers swept across all 211 `.go` files in `internal/` via reproducible Go script (commit 575b134). Public README rewrite for operator-scanning audience (commit d749700). License at repo root + per-file headers + goreleaser-published binaries + CONTRIBUTING.md = the OSS-readiness checklist done.
+- **CI Integration timeout bumped 10m→18m per package.** Slow CI runners + `-race` overhead were hitting Go's per-package default test timeout. Job timeout-minutes 20→30 to match. Pure infra change; no runtime behaviour.
+- **Autonomous release-test-fix loop authorized 2026-05-07.** After each release publishes (Option B 5-gate verification), main session auto-spawns next test cycle (sluice-testing's localhost-docker + PlanetScale harnesses both in scope), reacts to results (fix bugs OR pick next roadmap item), loops until stop condition. Stop conditions: user interrupt, saturation (3 clean cycles + roadmap exhausted), unfixable bug, infra blocker. See `feedback_automation_loop.md` in agent memory.
+
 ### Foundational ADRs (0001–0029)
 
 IR-first, sealed interfaces, kong+koanf, three-phase apply, MySQL flavors, pgoutput, position persistence, go-mysql, Streamer-as-separate-orchestrator, idempotent applier semantics, SlotManager optional surface, pglogrepl bypass for FAILOVER, applier value-shaping with `CAST(? AS JSON)`, phase-aware error-hint registry, migration resume design, layered expression translation (extended in v0.8.0 with bool-idiom rewrites and v0.9.0 with index-expression and bool-sub-expression coverage), batched CDC apply, per-batch bulk-copy checkpointing, parallel within-table bulk copy, slot-ack-after-apply, publication scope by table, slot-missing fall-through (extended for MySQL in v0.6.0), `--reset-target-data`, `sluice schema preview`, graceful-drain `sync stop` (extended in v0.9.0 with `--wait`), LOAD DATA INFILE writer, source-tx-boundary CDC batching, memory-bounded streaming, `sluice schema diff`.
@@ -141,25 +150,66 @@ IR-first, sealed interfaces, kong+koanf, three-phase apply, MySQL flavors, pgout
 
 ## Next up
 
-The v0.10.x cycle closed the reactive-bug loop on the v0.9.x translator gaps (Bug 17 detector aggressive cast, Bug 25 enum-as-text, Bug 26 geometry SRID), shipped the `--expr-override` escape hatch (v0.10.0) so operators can bypass the translator on any unrecognised idiom, and landed the operator-UX additions from `FUTURE-TESTS.md` (`--slot-name`, `--dry-run` row counts). The v0.11.0 commit closed CHARSET/COLLATION cross-engine diff, surfaced the translator-coverage research catalog, and captured the design space for the two heavier remaining items.
+The v0.10.x cycle closed reactive-bug loops on the v0.9.x translator gaps and shipped the `--expr-override` escape hatch. The v0.11.x cycle landed two batches of proactive translator catalog work (16 rules) plus three real-world bug fixes from the autonomous test-cycle loop. OSS-hygiene track is closed. Four new proto-ADRs were written 2026-05-07 to capture the design space for the user's "100% confidence that all data has been copied + synced" goal — `sluice verify`, sync-health monitoring, logical backups, and Apache Arrow integration. The roadmap reorders to put those at the top.
 
-What's left is split between (a) the translator-catalog top-N working through the highest-priority MySQL→PG idiom rewrites (now that the catalog itself exists), (b) the heavier design-first items (mid-stream add-table, multi-source aggregation — both have proto-ADRs to start from), and (c) the OSS-hygiene round-out (license-header sweep + public README pass).
+The remaining work splits into three buckets: (a) the "100% confidence" features — verify, sync-health, logical backups, Arrow — that directly serve the user's overarching goal; (b) the heavier design-first items still on deck — mid-stream add-table, multi-source aggregation; (c) translator-catalog continuation as lower-priority polish.
 
-### 1. Translator catalog: continue working through the candidate set
+### 1. `sluice verify` — data-integrity verification command
 
-**Why.** `docs/dev/translator-coverage.md` is the research catalog (30 candidate rules, sourced from sqlglot / pgloader / dolt). The v0.11.0 release works through the first batch of high-priority rules (NOW(), UNIX_TIMESTAMP/FROM_UNIXTIME, CHAR_LENGTH, LCASE/UCASE, SUBSTR/MID); the rest of the high-priority tier and the medium-priority tier remain. Each rule pre-empts a future "operator hit a translation gap" report and is mechanically small.
+**Why.** Operators today have `sluice schema diff` (structural) but no positive-confirmation surface for *data*. This is the most direct delivery on the "100% confidence" goal — operators can spend more or less verification time depending on their risk tolerance. Closes the no-Fivetran-silent-stop pain shape on the data-integrity side. See [`design-sluice-verify.md`](design-sluice-verify.md).
 
-**What.** Pick the next batch from the catalog — likely the remaining high-priority entries (`CONCAT_WS` immutability wrap, `DATE_FORMAT` format-string mapping, `RAND()` → `RANDOM()`, `MD5` passthrough doc, then medium-tier `INSTR`/`LOCATE`, `REGEXP_LIKE`, `REGEXP_REPLACE` global flag, `DATE_ADD`/`DATE_SUB`, `ISNULL`, etc.). Each follows the existing `rewriteFunctionCalls(name, replacer)` shape, gets tests in `expr_translate_test.go`, and updates ADR-0016's cumulative-scope table.
+**What.** New CLI command with three depth modes:
+- `--depth count` — row counts per table; cheapest probe.
+- `--depth sample` — counts + N random PK-range row content hashes (default; ~99% confidence of detecting 5%+ corruption).
+- `--depth full` — every row's content hash + bisection on mismatch.
 
-**Gotchas.**
-- `DATE_FORMAT` is the messiest of the high-priority remainder — the format-string token mapping (`%Y/%m/%d/%H/%i/%s` → `YYYY/MM/DD/HH24/MI/SS`) needs its own table and the result is `STABLE` not `IMMUTABLE` on the PG side, which blocks generated columns. Operators may still need `--expr-override` even after the rewrite lands.
-- Each rule's catalog entry already carries the "is the PG equivalent IMMUTABLE?" / "is there an extension dependency?" / "is there a NULL-handling difference?" callouts — re-read the catalog entry before implementing.
+New `ir.Verifier` optional interface (3 methods: `ExactRowCount`, `SampleRows`, `FullScanHash`); new `pipeline.Verifier` orchestrator mirrors `Differ`/`Migrator` shape. Sequencing: count-mode MVP (~1 week), then sample, then full. Total ~5 weeks for full feature.
+
+**Gotchas.** Cross-engine value comparison must use the same `RetargetForEngine` canonicalization `schema diff` already does. Generated columns + CHECK constraints excluded from row-hash. CDC-position-aware verification ("verify against the LSN target has caught up to") is open question #1.
 
 ---
 
-### 2. Auto-translate-and-create on mid-stream new tables
+### 2. Sync-health monitoring + alerting hooks
 
-**Why.** ADR-0021 deliberately punted on mid-stream `CREATE TABLE`: a new table on a CDC source is currently silently dropped (defence-in-depth WARN, no schema propagation). The right path for "the developer ran a routine DDL" is to translate the new table's schema, create it on the target, and bring it into the publication scope — but doing this safely requires a mid-stream snapshot capture for the new table.
+**Why.** Companion to `sluice verify`. Verify covers data-integrity; sync-health covers liveness/lag — the orthogonal half of the "100% confidence" goal. Operators today have `sync status` (snapshot when they look) but no continuous staleness measurement, stalled-stream detection, or push-based alerting integration. See [`design-sync-health-monitoring.md`](design-sync-health-monitoring.md).
+
+**What.** Two surfaces:
+- `sluice sync health` — one-shot probe with `--max-lag-seconds` / `--max-events` / `--max-stale-seconds` threshold flags + structured exit code. Cron-friendly.
+- `sluice sync start --metrics-listen ADDR` — Prometheus `/metrics` endpoint exposing the same metric set. Off by default; opt-in.
+
+Metric set covers position-derived (`sluice_lag_events`, `sluice_lag_seconds`), liveness (`sluice_seconds_since_last_event`, `sluice_streamer_state`), and throughput (events/bytes/batch-size). New `ir.HealthReporter` optional interface (2 methods); both engines implement straightforwardly. Sequencing: probe MVP (~2 weeks), Prometheus listener (~1 week), per-table + PG slot health (~1 week).
+
+**Gotchas.** Distinguishing "quiet source" (low write rate) from "broken connection" is the load-bearing design question — see open question #3 in the proto-ADR. Per-table metric cardinality blows up Prometheus storage on many-table schemas; gated behind `--metrics-per-table` flag.
+
+---
+
+### 3. Logical backups (full + incremental, local + cloud)
+
+**Why.** PlanetScale customers and self-hosted operators want backups they own and store wherever they want — outside the vendor's built-in physical-backup system. Sluice already has the building blocks (snapshot + CDC + position tracking + checkpointing). User explicitly raised this and confirmed local-storage is in scope alongside cloud. See [`design-logical-backups.md`](design-logical-backups.md).
+
+**What.** New `sluice backup full` / `sluice backup incremental` / `sluice restore` CLI surface. Backup format is hybrid manifest+chunks (JSON manifest pointing at zstd-compressed IR-format or Parquet chunks). New `BackupStore` storage abstraction with local-FS as a first-class peer to S3/GCS/Azure/B2. Per-chunk SHA-256 + per-table row-count verification on restore (reuses the `Verifier` infra from #1).
+
+**Phase 1 MVP**: `sluice backup full` to local-FS only, IR-format chunks, manifest with per-chunk checksums, restore tooling that produces byte-perfect target. ~2-3 weeks. Cloud backends (Phase 2), incremental (Phase 3), encryption (Phase 6) follow.
+
+**Gotchas.** Public format ownership — manifest becomes a forward-compat contract sluice carries forever, so v1 needs to bake on a stable IR. Scope creep risk: backups pull in encryption / KMS / retention / lifecycle / PITR; MVP must aggressively say no.
+
+**Convergence with #4 (Arrow)**: if Arrow Shape A ships, the chunk format can be Parquet for free, with broader interop. Combined Phase-1 (logical-backup local-FS + Arrow Parquet writer) is ~3-4 weeks vs. ~5 weeks if shipped serially.
+
+---
+
+### 4. Apache Arrow integration (conditional)
+
+**Why.** User raised as exploratory research. Arrow opens up data-lake offload (Parquet files on cloud storage), zero-copy interop with DuckDB/Polars/Spark, and downstream-system-friendly formats. See [`design-apache-arrow-integration.md`](design-apache-arrow-integration.md).
+
+**What.** Recommendation is **conditional yes — gated on logical-backup choice**. If logical-backup picks Parquet as its chunk format, ship Arrow Shape A (new `internal/engines/arrow/` writer behind an `arrow` build tag, Parquet-only, local-FS-only) together since they share most implementation. ~2 weeks for Shape A alone; ~3-4 weeks combined with logical-backup Phase 1.
+
+**Gotchas.** Silent type drift at Decimal-256 / Time-out-of-range / UUID-string-parse / Arrow-null-vs-empty-string boundaries — each needs explicit loud-failure branches per the loud-failure tenet. ~2× binary growth under the build tag (mitigated by keeping default untagged build slim). Shape C (Arrow as in-flight row-pipeline format) explicitly rejected as IR-tenet-violating.
+
+---
+
+### 5. Auto-translate-and-create on mid-stream new tables
+
+**Why.** ADR-0021 deliberately punted on mid-stream `CREATE TABLE`: a new table on a CDC source is currently silently dropped (defence-in-depth WARN, no schema propagation). The right path for "the developer ran a routine DDL" is to translate the new table's schema, create it on the target, and bring it into the publication scope — but doing this safely requires a mid-stream snapshot capture for the new table. Proto-ADR exists at [`design-mid-stream-add-table.md`](design-mid-stream-add-table.md).
 
 **What.** New subcommand `sluice schema add-table SOURCE.NAME ...` (or a flag on `sync start` / `migrate`) that:
 1. Reads the new table's source schema.
@@ -175,9 +225,9 @@ What's left is split between (a) the translator-catalog top-N working through th
 
 ---
 
-### 3. Multi-source aggregation
+### 6. Multi-source aggregation
 
-**Why.** Some users have multiple source DBs replicating into one target (sharded → consolidated, microservices → analytics warehouse, etc.). Today each `sluice sync start` is a 1:1 stream. ADR-0024 flagged this as out-of-scope; deserves its own design pass.
+**Why.** Some users have multiple source DBs replicating into one target (sharded → consolidated, microservices → analytics warehouse, etc.). Today each `sluice sync start` is a 1:1 stream. ADR-0024 flagged this as out-of-scope; proto-ADR exists at [`design-multi-source-aggregation.md`](design-multi-source-aggregation.md).
 
 **What.** Multi-source streams: a single target hosting N `sluice_cdc_state` rows (one per source), with the schema preview / migrate / sync paths able to plan against the union of source schemas. Stream IDs disambiguate; collision detection on table-name overlap is load-bearing.
 
@@ -188,16 +238,23 @@ What's left is split between (a) the translator-catalog top-N working through th
 
 ---
 
-### 4. OSS-hygiene track (remaining items)
+### 7. Translator catalog continuation (lowest priority)
 
-**Why.** v0.9.0 closed two of the OSS-hygiene starters (`CONTRIBUTING.md` release-process section + `docs/dev/release-template.md`). goreleaser is also live (`.goreleaser.yaml` + `release.yml` produce draft GitHub releases on tag push). The remaining items round out the public-release-readiness story.
+**Why.** `docs/dev/translator-coverage.md` is the research catalog (30 candidate rules). v0.11.0/v0.11.1/v0.11.3 closed the highest-leverage 16 rules. The remaining medium-priority entries are mostly passthroughs (NULLIF, GREATEST/LEAST), version-gated (JSON_OBJECT for PG 16+), or have semantic gotchas (REGEXP_LIKE dialect divergence). Diminishing returns now that the highest-frequency-in-DDL rules are in.
 
-**What.** Two independent items, each landable on its own:
+**What.** Pick the next batch from the catalog when a real-world test cycle surfaces a specific gap, OR opportunistically when a related code path is being touched. Reactive-driven rather than proactive-batch from this point on.
 
-- **License-header sweep across `internal/`.** LICENSE file is in place at the repo root; per-file headers are not. Mechanical change with high diff churn (~50 files); best landed in a single doc-only commit so the diff is easy to skim and revert if convention changes.
-- **Public README pass.** Current README is reasonable but reads as project-internal. Audience the public README should target: an operator scanning for "does this fit my use case" in the first 30 seconds. Move the deeper architectural detail into `docs/architecture.md` (already exists); the README becomes a short pitch + quickstart + pointer to docs.
+**Gotchas.** See ADR-0016's "v0.11.x batch caveats" sections for the per-rule notes already accumulated.
 
-**Gotchas.** None for either item.
+---
+
+### Bug 27 (deferred, parked here)
+
+**Why.** Deferred from v0.10.3 pending VStream test infrastructure (`integration vstream` build tag). VStream POINT bytes are mis-parsed because VStream doesn't strip MySQL's internal 4-byte SRID prefix before the OGC WKB; sluice's WKB decoder reads the SRID's low byte as the byte-order flag and fails. Only affects the VStream protocol; vanilla MySQL protocol path strips the prefix correctly.
+
+**What.** Add a 4-byte SRID prefix detection + strip in the VStream-specific WKB decoder path. Gated by either a fixture-based test (cheap) or a real PlanetScale-Vitess integration test (`psverify` build tag).
+
+**Gotchas.** Need to confirm the prefix is always present in VStream POINT bytes (vs. only when SRID != 0). Pre-VStream-fix verification: real PlanetScale source with PostGIS geometry column, sync to PG target.
 
 ---
 
