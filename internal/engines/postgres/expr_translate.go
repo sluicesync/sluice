@@ -40,6 +40,22 @@
 // the caller supplies an [ExprContext] naming the bool-mapped columns;
 // see ExprContext and rewriteBoolIdioms.
 //
+// v0.11.0 added the first batch from the translator coverage catalog
+// (docs/dev/translator-coverage.md): the highest-priority MySQL→PG
+// rewrites for constructs that show up in real DDL bodies but were
+// previously falling through to verbatim-passthrough and surfacing as
+// CREATE TABLE rejections on the target.
+//
+//   - NOW() / CURRENT_TIMESTAMP() / LOCALTIMESTAMP() / LOCALTIME()
+//     → CURRENT_TIMESTAMP / LOCALTIMESTAMP (bare keyword, no parens)
+//   - UNIX_TIMESTAMP(x) → EXTRACT(EPOCH FROM x)::bigint
+//   - UNIX_TIMESTAMP() → EXTRACT(EPOCH FROM CURRENT_TIMESTAMP)::bigint
+//   - FROM_UNIXTIME(x) → TO_TIMESTAMP(x)        (single-arg form only)
+//   - CHAR_LENGTH(x) / CHARACTER_LENGTH(x) → LENGTH(x)
+//   - LCASE(x) → LOWER(x)
+//   - UCASE(x) → UPPER(x)
+//   - SUBSTR(x, …) / MID(x, …) → SUBSTRING(x, …)
+//
 // See ADR-0016 for the design rationale.
 
 package postgres
@@ -110,6 +126,21 @@ func translateExprForPG(expr string, ctx ExprContext) string {
 	// PG rejects, and switches to VARCHAR which more closely matches
 	// MySQL's CAST CHAR semantics than PG's blank-padded CHAR.
 	expr = rewriteCASTCharCharset(expr)
+	// v0.11.0 catalog batch — see file-level doc and
+	// docs/dev/translator-coverage.md for the rule sources.
+	// Order: UNIX_TIMESTAMP runs before the NOW() rewrite so the
+	// argless `UNIX_TIMESTAMP()` form (which contains no inner call to
+	// rewrite as a NOW-equivalent) is handled by its own rule. The
+	// other rules are commutative — none of them produces output that
+	// looks like another rule's input.
+	expr = rewriteUNIXTIMESTAMP(expr)
+	expr = rewriteFROMUNIXTIME(expr)
+	expr = rewriteCHARLENGTH(expr)
+	expr = rewriteLCASE(expr)
+	expr = rewriteUCASE(expr)
+	expr = rewriteSUBSTR(expr)
+	expr = rewriteMID(expr)
+	expr = rewriteNOWFamily(expr)
 	// Bool-idiom rewrites run last: they need the canonical names
 	// (IFNULL → COALESCE has already happened) and they're gated on
 	// the caller-supplied BoolColumns set — empty means no rewrites.
@@ -784,4 +815,161 @@ func intLitToBool(s string) string {
 		return "false"
 	}
 	return "true"
+}
+
+// rewriteNOWFamily rewrites MySQL's parenthesised current-time
+// functions (`NOW()`, `CURRENT_TIMESTAMP()`, `LOCALTIMESTAMP()`,
+// `LOCALTIME()`) to PG's bare-keyword form. PG accepts
+// `CURRENT_TIMESTAMP` / `LOCALTIMESTAMP` as keywords (no parens) and
+// rejects `NOW()` outright; the bare-keyword form also matches what
+// PG emits when reading back its own DEFAULTs, so the rewrite
+// normalises round-trips. All four forms must be argless — the
+// 1-arg precision form (`NOW(6)`) is rare in DDL and PG's keyword
+// form doesn't accept precision; falls through verbatim and the
+// loud-failure tenet kicks in if it surfaces.
+func rewriteNOWFamily(expr string) string {
+	expr = rewriteFunctionCalls(expr, "NOW", func(args []string) string {
+		if len(args) != 0 {
+			return ""
+		}
+		return "CURRENT_TIMESTAMP"
+	})
+	expr = rewriteFunctionCalls(expr, "CURRENT_TIMESTAMP", func(args []string) string {
+		if len(args) != 0 {
+			return ""
+		}
+		return "CURRENT_TIMESTAMP"
+	})
+	expr = rewriteFunctionCalls(expr, "LOCALTIMESTAMP", func(args []string) string {
+		if len(args) != 0 {
+			return ""
+		}
+		return "LOCALTIMESTAMP"
+	})
+	expr = rewriteFunctionCalls(expr, "LOCALTIME", func(args []string) string {
+		if len(args) != 0 {
+			return ""
+		}
+		return "LOCALTIMESTAMP"
+	})
+	return expr
+}
+
+// rewriteUNIXTIMESTAMP rewrites MySQL's `UNIX_TIMESTAMP(x)` to PG's
+// `EXTRACT(EPOCH FROM x)::bigint`, and the bare argless
+// `UNIX_TIMESTAMP()` to `EXTRACT(EPOCH FROM CURRENT_TIMESTAMP)::bigint`.
+// MySQL returns an integer (or fractional decimal); PG's
+// `EXTRACT(EPOCH FROM …)` returns `double precision`, so the explicit
+// `::bigint` cast preserves MySQL's storable-as-integer semantics for
+// generated columns. Two-arg / fractional-precision forms are out of
+// scope and pass through verbatim.
+//
+// **Immutability caveat (catalog #2).** PG treats
+// `extract(epoch from timestamp)` as `STABLE` not `IMMUTABLE`, which
+// blocks STORED generated columns. The rewrite still helps for CHECK
+// constraints, DEFAULTs, and VIRTUAL bodies; STORED generated bodies
+// fall back to the loud-failure tenet — operator escape via
+// `--expr-override`.
+func rewriteUNIXTIMESTAMP(expr string) string {
+	return rewriteFunctionCalls(expr, "UNIX_TIMESTAMP", func(args []string) string {
+		switch len(args) {
+		case 0:
+			return "EXTRACT(EPOCH FROM CURRENT_TIMESTAMP)::bigint"
+		case 1:
+			return "EXTRACT(EPOCH FROM " + strings.TrimSpace(args[0]) + ")::bigint"
+		}
+		return ""
+	})
+}
+
+// rewriteFROMUNIXTIME renames the single-arg `FROM_UNIXTIME(x)` to
+// PG's `TO_TIMESTAMP(x)`. The two-arg form `FROM_UNIXTIME(epoch, fmt)`
+// returns a formatted string in MySQL and has no clean PG equivalent;
+// it falls through verbatim under the loud-failure tenet.
+func rewriteFROMUNIXTIME(expr string) string {
+	return rewriteFunctionCalls(expr, "FROM_UNIXTIME", func(args []string) string {
+		if len(args) != 1 {
+			return ""
+		}
+		return "TO_TIMESTAMP(" + strings.TrimSpace(args[0]) + ")"
+	})
+}
+
+// rewriteCHARLENGTH renames MySQL's `CHAR_LENGTH(x)` and the
+// equivalent `CHARACTER_LENGTH(x)` to PG's `LENGTH(x)`. Both engines
+// have a `LENGTH` function but the semantics differ on MySQL —
+// MySQL's `LENGTH` returns BYTE length while `CHAR_LENGTH` returns
+// CHARACTER length. PG's `LENGTH(text)` returns characters, matching
+// MySQL's `CHAR_LENGTH`. The reverse direction (`MySQL LENGTH` →
+// `PG OCTET_LENGTH`) is a separate rule with different semantics and
+// is not part of this batch — it requires column-type context to
+// fire safely.
+func rewriteCHARLENGTH(expr string) string {
+	rename := func(args []string) string {
+		if len(args) != 1 {
+			return ""
+		}
+		return "LENGTH(" + strings.TrimSpace(args[0]) + ")"
+	}
+	expr = rewriteFunctionCalls(expr, "CHAR_LENGTH", rename)
+	expr = rewriteFunctionCalls(expr, "CHARACTER_LENGTH", rename)
+	return expr
+}
+
+// rewriteLCASE renames MySQL's `LCASE(x)` synonym to PG's `LOWER(x)`.
+// Both engines accept `LOWER`; only MySQL accepts `LCASE`.
+func rewriteLCASE(expr string) string {
+	return rewriteFunctionCalls(expr, "LCASE", func(args []string) string {
+		if len(args) != 1 {
+			return ""
+		}
+		return "LOWER(" + strings.TrimSpace(args[0]) + ")"
+	})
+}
+
+// rewriteUCASE renames MySQL's `UCASE(x)` synonym to PG's `UPPER(x)`.
+// Both engines accept `UPPER`; only MySQL accepts `UCASE`.
+func rewriteUCASE(expr string) string {
+	return rewriteFunctionCalls(expr, "UCASE", func(args []string) string {
+		if len(args) != 1 {
+			return ""
+		}
+		return "UPPER(" + strings.TrimSpace(args[0]) + ")"
+	})
+}
+
+// rewriteSUBSTR renames MySQL's `SUBSTR(x, …)` to PG's
+// `SUBSTRING(x, …)`. PG accepts the comma-form `SUBSTRING(x, start,
+// length)` so a direct rename is sufficient; the SQL-standard
+// `SUBSTRING(x FROM start FOR length)` form is also valid in PG but
+// the comma form round-trips MySQL's grammar without re-tokenising.
+// Both 2-arg `SUBSTR(x, start)` and 3-arg `SUBSTR(x, start, length)`
+// are accepted by PG's `SUBSTRING`.
+func rewriteSUBSTR(expr string) string {
+	return rewriteFunctionCalls(expr, "SUBSTR", func(args []string) string {
+		if len(args) < 2 || len(args) > 3 {
+			return ""
+		}
+		trimmed := make([]string, len(args))
+		for i, a := range args {
+			trimmed[i] = strings.TrimSpace(a)
+		}
+		return "SUBSTRING(" + strings.Join(trimmed, ", ") + ")"
+	})
+}
+
+// rewriteMID renames MySQL's `MID(x, …)` synonym (an alias for
+// `SUBSTR`) to PG's `SUBSTRING(x, …)`. Same arity rules as
+// [rewriteSUBSTR].
+func rewriteMID(expr string) string {
+	return rewriteFunctionCalls(expr, "MID", func(args []string) string {
+		if len(args) < 2 || len(args) > 3 {
+			return ""
+		}
+		trimmed := make([]string, len(args))
+		for i, a := range args {
+			trimmed[i] = strings.TrimSpace(a)
+		}
+		return "SUBSTRING(" + strings.Join(trimmed, ", ") + ")"
+	})
 }

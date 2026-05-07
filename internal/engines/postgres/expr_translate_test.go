@@ -478,3 +478,191 @@ func TestTranslateExprForPG_BoolToIntCoalesce(t *testing.T) {
 		}
 	})
 }
+
+// TestTranslateExprForPG_V11Catalog covers the v0.11.0 batch from the
+// translator coverage catalog (docs/dev/translator-coverage.md).
+// Five rule families: NOW(), UNIX_TIMESTAMP/FROM_UNIXTIME,
+// CHAR_LENGTH/CHARACTER_LENGTH, LCASE/UCASE, SUBSTR/MID. All are
+// context-free (no ExprContext needed) and follow the established
+// rewriteFunctionCalls pattern.
+func TestTranslateExprForPG_V11Catalog(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		// ---- NOW() family → bare keyword ----
+		{
+			name: "NOW() to CURRENT_TIMESTAMP keyword",
+			in:   "NOW()",
+			want: "CURRENT_TIMESTAMP",
+		},
+		{
+			name: "lowercase now() also rewrites",
+			in:   "now()",
+			want: "CURRENT_TIMESTAMP",
+		},
+		{
+			name: "CURRENT_TIMESTAMP() drops the parens",
+			in:   "CURRENT_TIMESTAMP()",
+			want: "CURRENT_TIMESTAMP",
+		},
+		{
+			name: "LOCALTIMESTAMP() to LOCALTIMESTAMP keyword",
+			in:   "LOCALTIMESTAMP()",
+			want: "LOCALTIMESTAMP",
+		},
+		{
+			name: "LOCALTIME() to LOCALTIMESTAMP keyword",
+			in:   "LOCALTIME()",
+			want: "LOCALTIMESTAMP",
+		},
+		{
+			name: "NOW with precision arg falls through verbatim",
+			in:   "NOW(6)",
+			want: "NOW(6)",
+		},
+		{
+			name: "NOW() inside a larger expression",
+			in:   "(created_at < NOW())",
+			want: "(created_at < CURRENT_TIMESTAMP)",
+		},
+
+		// ---- UNIX_TIMESTAMP ----
+		{
+			name: "UNIX_TIMESTAMP with column arg",
+			in:   "UNIX_TIMESTAMP(created_at)",
+			want: "EXTRACT(EPOCH FROM created_at)::bigint",
+		},
+		{
+			name: "bare UNIX_TIMESTAMP() expands to CURRENT_TIMESTAMP form",
+			in:   "UNIX_TIMESTAMP()",
+			want: "EXTRACT(EPOCH FROM CURRENT_TIMESTAMP)::bigint",
+		},
+		{
+			name: "lowercase unix_timestamp",
+			in:   "unix_timestamp(ts)",
+			want: "EXTRACT(EPOCH FROM ts)::bigint",
+		},
+		{
+			name: "two-arg UNIX_TIMESTAMP falls through verbatim",
+			in:   "UNIX_TIMESTAMP(ts, 0)",
+			want: "UNIX_TIMESTAMP(ts, 0)",
+		},
+
+		// ---- FROM_UNIXTIME ----
+		{
+			name: "FROM_UNIXTIME single-arg renames to TO_TIMESTAMP",
+			in:   "FROM_UNIXTIME(epoch_col)",
+			want: "TO_TIMESTAMP(epoch_col)",
+		},
+		{
+			name: "FROM_UNIXTIME with format arg falls through verbatim",
+			in:   "FROM_UNIXTIME(epoch, '%Y-%m-%d')",
+			want: "FROM_UNIXTIME(epoch, '%Y-%m-%d')",
+		},
+		{
+			name: "FROM_UNIXTIME composes with UNIX_TIMESTAMP",
+			in:   "FROM_UNIXTIME(UNIX_TIMESTAMP(now()))",
+			want: "TO_TIMESTAMP(EXTRACT(EPOCH FROM CURRENT_TIMESTAMP)::bigint)",
+		},
+
+		// ---- CHAR_LENGTH / CHARACTER_LENGTH ----
+		{
+			name: "CHAR_LENGTH renames to LENGTH",
+			in:   "CHAR_LENGTH(name)",
+			want: "LENGTH(name)",
+		},
+		{
+			name: "CHARACTER_LENGTH renames to LENGTH",
+			in:   "CHARACTER_LENGTH(name)",
+			want: "LENGTH(name)",
+		},
+		{
+			name: "CHAR_LENGTH inside a CHECK comparison",
+			in:   "CHAR_LENGTH(slug) >= 3",
+			want: "LENGTH(slug) >= 3",
+		},
+		{
+			name: "MySQL LENGTH (byte length) is left alone — different semantics",
+			in:   "LENGTH(payload)",
+			want: "LENGTH(payload)",
+		},
+
+		// ---- LCASE / UCASE ----
+		{
+			name: "LCASE renames to LOWER",
+			in:   "LCASE(email)",
+			want: "LOWER(email)",
+		},
+		{
+			name: "UCASE renames to UPPER",
+			in:   "UCASE(code)",
+			want: "UPPER(code)",
+		},
+		{
+			name: "lowercase lcase",
+			in:   "lcase(email)",
+			want: "LOWER(email)",
+		},
+		{
+			name: "case-folding in a CHECK constraint shape",
+			in:   "LCASE(name) = name",
+			want: "LOWER(name) = name",
+		},
+
+		// ---- SUBSTR / MID ----
+		{
+			name: "SUBSTR three-arg renames to SUBSTRING",
+			in:   "SUBSTR(name, 1, 5)",
+			want: "SUBSTRING(name, 1, 5)",
+		},
+		{
+			name: "SUBSTR two-arg also rewrites",
+			in:   "SUBSTR(name, 2)",
+			want: "SUBSTRING(name, 2)",
+		},
+		{
+			name: "MID three-arg renames to SUBSTRING",
+			in:   "MID(name, 1, 5)",
+			want: "SUBSTRING(name, 1, 5)",
+		},
+		{
+			name: "SUBSTR inside CONCAT composes with the CONCAT rewrite",
+			in:   "CONCAT(SUBSTR(first_name, 1, 1), '. ', last_name)",
+			want: "(SUBSTRING(first_name, 1, 1) || '. ' || last_name)",
+		},
+		{
+			name: "SUBSTR with single arg falls through (PG SUBSTRING needs 2+)",
+			in:   "SUBSTR(name)",
+			want: "SUBSTR(name)",
+		},
+
+		// ---- Passthrough / negative cases ----
+		{
+			name: "string literal containing a rule name is untouched",
+			in:   "'CHAR_LENGTH(x) returns chars'",
+			want: "'CHAR_LENGTH(x) returns chars'",
+		},
+		{
+			name: "identifier prefixed by a rule name is untouched",
+			in:   "LCASEFOLD(x)",
+			want: "LCASEFOLD(x)",
+		},
+		{
+			name: "unrelated function falls through",
+			in:   "WEIRD_FN(a, b)",
+			want: "WEIRD_FN(a, b)",
+		},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			got := translateExprForPG(c.in, ExprContext{})
+			if got != c.want {
+				t.Errorf("translateExprForPG(%q) =\n  got  %q\n  want %q",
+					c.in, got, c.want)
+			}
+		})
+	}
+}

@@ -249,7 +249,7 @@ v0.10.0 covers generated-column bodies only. CHECK constraints, index expression
 
 ### Cumulative scope
 
-After v0.9.1 the writer-side translator covers:
+After v0.11.0 the writer-side translator covers:
 
 | Direction | Idiom | Rewrite |
 | --- | --- | --- |
@@ -263,9 +263,25 @@ After v0.9.1 the writer-side translator covers:
 | MySQL → PG | bool-context: `<int_lit> [op] <bool>` / `<bool> [op] <int_lit>` | `<bool_lit> [op] <bool>` etc. |
 | MySQL → PG | bool-context: `COALESCE(<bool>, <int_lit>)` | `COALESCE(<bool>, <bool_lit>)` |
 | MySQL → PG | int-context: `COALESCE(<expr>, <int_lit>)` | `COALESCE(<expr>::int, <int_lit>)` (v0.10.1: applied unconditionally on non-literal sides) |
+| MySQL → PG | `NOW()` / `CURRENT_TIMESTAMP()` (argless) | `CURRENT_TIMESTAMP` (bare keyword) |
+| MySQL → PG | `LOCALTIMESTAMP()` / `LOCALTIME()` (argless) | `LOCALTIMESTAMP` (bare keyword) |
+| MySQL → PG | `UNIX_TIMESTAMP(x)` | `EXTRACT(EPOCH FROM x)::bigint` |
+| MySQL → PG | `UNIX_TIMESTAMP()` (argless) | `EXTRACT(EPOCH FROM CURRENT_TIMESTAMP)::bigint` |
+| MySQL → PG | `FROM_UNIXTIME(x)` (single-arg) | `TO_TIMESTAMP(x)` |
+| MySQL → PG | `CHAR_LENGTH(x)` / `CHARACTER_LENGTH(x)` | `LENGTH(x)` |
+| MySQL → PG | `LCASE(x)` | `LOWER(x)` |
+| MySQL → PG | `UCASE(x)` | `UPPER(x)` |
+| MySQL → PG | `SUBSTR(x, …)` / `MID(x, …)` (2-arg or 3-arg) | `SUBSTRING(x, …)` |
 | PG → MySQL | unchanged | unchanged |
 
-The verbatim-passthrough policy still owns everything outside this set.
+The verbatim-passthrough policy still owns everything outside this set. See `docs/dev/translator-coverage.md` for the next batch of candidate rules sourced from sqlglot, pgloader, and dolt's function registry.
+
+### v0.11.0 batch caveats
+
+- **`UNIX_TIMESTAMP` and STORED generated columns.** PG treats `extract(epoch from timestamp)` as `STABLE`, not `IMMUTABLE`, which blocks STORED generated columns. The rewrite still helps for CHECK constraints, DEFAULTs, and VIRTUAL bodies; STORED bodies fall back to the loud-failure tenet — operator escape via `--expr-override` (v0.10.0).
+- **`NOW(precision)` form falls through verbatim.** PG's `CURRENT_TIMESTAMP` keyword does accept `(precision)` (e.g. `CURRENT_TIMESTAMP(6)`), but it has to be present at parse time — the bare keyword form doesn't. The argless form is the overwhelming majority of real-world use; the precision form falls through unchanged today and the loud-failure tenet kicks in if a target rejects it.
+- **`FROM_UNIXTIME(epoch, fmt)` two-arg form falls through.** The format-string side has no clean PG equivalent; documented in the catalog as out-of-scope.
+- **`CHAR_LENGTH` semantic match.** PG's `LENGTH(text)` returns characters (matching MySQL's `CHAR_LENGTH`); on `bytea` it returns bytes. The rewrite only fires when the source called `CHAR_LENGTH` / `CHARACTER_LENGTH`, so the column-context is implicit. The reverse direction (MySQL `LENGTH(x)` byte length → PG `OCTET_LENGTH(x)`) is not part of this batch — it requires column-type context to fire safely.
 
 ## Updated in v0.10.1: aggressive int-context COALESCE cast
 

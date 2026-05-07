@@ -6,6 +6,34 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-05-07
+
+Closes the v0.10.x reactive-bug cycle and opens the proactive-translator cycle. v0.10.x's bug bundle was driven by real-world testing surfacing translation gaps one at a time; v0.11.0 inverts the loop by mining sqlglot, pgloader, and dolt's function registry for the next batch of likely culprits and landing the highest-priority rewrites pre-emptively. CHARSET/COLLATION cross-engine diff finishes the schema-diff feature surface (the `--ignore-charset-collation` flag was plumbed but inert since v0.8.0). Two design docs capture the design space for the heavier roadmap items (mid-stream add-table, multi-source aggregation) so the implementation pass starts from a structured doc, not a blank page.
+
+### Added
+
+- **Translator catalog top-5 rewrites (MySQL → PG).** Eight rules across five families, all sourced from `docs/dev/translator-coverage.md`'s high-priority tier:
+  - `NOW()` / `CURRENT_TIMESTAMP()` / `LOCALTIMESTAMP()` / `LOCALTIME()` (argless) → bare `CURRENT_TIMESTAMP` / `LOCALTIMESTAMP` keyword. PG accepts the keyword form (no parens) and rejects `NOW()` outright; bare-keyword is also what PG emits when reading back its own DEFAULTs, so the rewrite normalises round-trips. The `NOW(6)` precision form falls through verbatim — the bare-keyword form doesn't accept precision at parse time and the operator escape (`--expr-override` from v0.10.0) covers the rare case.
+  - `UNIX_TIMESTAMP(x)` → `EXTRACT(EPOCH FROM x)::bigint`. The explicit `::bigint` cast preserves MySQL's storable-as-integer semantics; PG's `EXTRACT(EPOCH FROM …)` returns `double precision` natively. Argless `UNIX_TIMESTAMP()` expands to `EXTRACT(EPOCH FROM CURRENT_TIMESTAMP)::bigint`. Two-arg / fractional-precision forms fall through verbatim. **Caveat:** PG treats `extract(epoch from timestamp)` as `STABLE`, not `IMMUTABLE`, which blocks STORED generated columns; the rewrite still helps for CHECK / DEFAULT / VIRTUAL bodies, and STORED bodies fall back to `--expr-override`.
+  - `FROM_UNIXTIME(x)` (single-arg) → `TO_TIMESTAMP(x)`. The two-arg form `FROM_UNIXTIME(epoch, fmt)` returns a formatted string in MySQL and has no clean PG equivalent — falls through verbatim under the loud-failure tenet.
+  - `CHAR_LENGTH(x)` / `CHARACTER_LENGTH(x)` → `LENGTH(x)`. PG's `LENGTH(text)` counts characters, matching MySQL's `CHAR_LENGTH`. The reverse direction (MySQL `LENGTH(x)` byte length → PG `OCTET_LENGTH(x)`) is a separate rule with different semantics and not part of this batch — it requires column-type context to fire safely.
+  - `LCASE(x)` → `LOWER(x)` and `UCASE(x)` → `UPPER(x)`. Direct synonyms.
+  - `SUBSTR(x, …)` / `MID(x, …)` → `SUBSTRING(x, …)`. PG accepts the comma form `SUBSTRING(x, start, length)`; both 2-arg and 3-arg shapes round-trip. The single-arg `SUBSTR(x)` form (which PG's `SUBSTRING` doesn't accept) falls through verbatim.
+
+  ADR-0016's cumulative-scope table extended with the new rows; v0.11.0 caveats section captures the immutability + format-string + precision-form gotchas in one place.
+
+- **CHARSET/COLLATION cross-engine diff.** PG schema reader now reads per-column collation via `pg_attribute.attcollation` (joined to `pg_collation` for the name); `ir.DiffOptions.IgnoreCharsetCollation` becomes load-bearing instead of inert; `diffColumn` compares charset/collation as separate `ColumnDiff` fields (`ExpectedCharset`/`ActualCharset`, `ExpectedCollation`/`ActualCollation`); `stripCharsetCollation` suppresses the drift at compare time when the flag is set, dropping columns whose only drift was charset/collation. Renderer emits MySQL `MODIFY COLUMN` and PG `ALTER COLUMN` suggestions.
+
+- **`docs/dev/translator-coverage.md`** — research catalog with 30 candidate MySQL→PG rewrite rules from sqlglot's parser/generator, pgloader, and dolt's function registry. Each entry carries the MySQL form, the PG equivalent, semantic notes, citation, and an importance rating measured by how often the construct appears in real-world DDL bodies (not general usefulness). The "How to land a rule" section at the bottom documents the existing implementation pattern. Closes the "what about idioms we haven't seen?" thread.
+
+- **`docs/dev/design-mid-stream-add-table.md`** (proto-ADR). Lays out the design space for handling `CREATE TABLE` on a CDC source mid-stream: trigger options (manual subcommand vs. auto-detect from DDL events), snapshot-LSN coordination strategies, per-engine differences, four-phase implementation plan. Reference for when real-world testing surfaces the need.
+
+- **`docs/dev/design-multi-source-aggregation.md`** (proto-ADR). N-sources → one-target. Identifies three shapes (sharded, microservices, multi-master), scopes out multi-master, recommends N-processes with `--target-schema` for collision handling. Reference for the same reason.
+
+### Changed
+
+- **`docs/dev/roadmap.md` swept.** "Next up" #1 (CHARSET/COLLATION) moved to "Recently landed" since v0.11.0 closes it. OSS-hygiene goreleaser entry dropped — `.goreleaser.yaml` + `release.yml` have been live since earlier in the cycle. v0.10.x feature-wave summary added to "Recently landed" with the eight tagged + untagged commits between v0.9.x and v0.11.0. New "Next up" #1 reframed around continuing through the catalog's remaining high-priority rules.
+
 ## [0.10.4] - 2026-05-06
 
 CI workflow cost optimization. No sluice runtime change; no IR or interface change. Tagged separately so the workflow shift has a versioned anchor and the corresponding `branch-protection.md` doc update has a clear "applies as of" reference.

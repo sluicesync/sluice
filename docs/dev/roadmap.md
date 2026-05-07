@@ -118,6 +118,21 @@ For continuity when a chunk references "the previous work":
 
 - **`docs/schema-change-runbook.md`** — operator runbook for the `ADD COLUMN` / `DROP COLUMN` / `MODIFY` workflow against a running sluice stream. Covers the standard `sync stop --wait` → ALTER → `sync start --resume` pattern, the per-class behaviour pinned by v0.8.0 stretch testing, planning with `sluice schema diff`, and when to reach for Atlas / sqitch / liquibase instead. Closes the documentation half of "Schema-change ergonomics" — tooling beyond what `sync stop --wait` already provides hasn't earned its weight yet.
 
+### v0.10.x feature wave (translator escape hatch + reactive bug bundle)
+
+- **`--expr-override TABLE.COLUMN=EXPRESSION` (v0.10.0)** — operator-supplied target-dialect expression text bypasses the writer-side translator. Available on `migrate`, `sync start`, `schema preview`, `schema diff`; YAML form `expression_mappings:`. Generated columns only in v1; CHECK / index / DEFAULT slated to follow the same shape if real-world testing surfaces the need. Strict load-time validation of table/column existence + generated-column gate. ADR-0016 extended.
+- **Bug 25 — enum-typed STORED generated columns now emit as TEXT + table-level CHECK (v0.10.1).** PG rejects the `(body)::"enum"` cast inside generated bodies because `enum_in()` is STABLE not IMMUTABLE; sluice sidesteps by emitting the column as TEXT and adding a CHECK that enforces the value-list. Mirrors the existing SET → TEXT[] + CHECK fallback.
+- **Bug 17 — int-context COALESCE rewrite drops the bool-detector gate (v0.10.1).** v0.9.x's hand-coded `isBoolReturning` detector kept missing real-world expression shapes (function calls returning bool, AND/OR chains, NOT prefixes, EXISTS subqueries). v0.10.1 casts the non-literal side `::int` unconditionally when the outer column is integer-typed; safe under the column-type signal alone.
+- **`--slot-name NAME` (v0.10.2)** — operator-supplied replication-slot name with the `sluice_` prefix convention. New `ir.CDCReaderWithSlotOpener` / `ir.SnapshotStreamWithSlotOpener` optional surfaces. Lets multiple sluice instances target one Postgres source without colliding on the hard-coded default.
+- **`migrate --dry-run` row counts (v0.10.2)** — per-table `row_count` attribute populated via the existing `ir.RowCounter` interface; best-effort with `-1` + Warn-level log when unavailable.
+- **Bug 26 — MySQL geometry SRID preserved on cross-engine emit (v0.10.3).** Reader now scans `information_schema.columns.srs_id`; writer already honoured `Geometry.SRID`. PG side now lands `geometry(POINT, 4326)` instead of `geometry(POINT, 0)`. MySQL 8.0+ baseline.
+- **Bug 27 (deferred) — VStream POINT bytes mis-parsed.** VStream doesn't strip MySQL's internal 4-byte SRID prefix before the OGC WKB; sluice's WKB decoder reads the SRID's low byte as the byte-order flag and fails. Fix needs the `integration vstream` build tag and slated for a later patch.
+- **CI matrix is conditional on trigger (v0.10.4).** Routine push/PR runs Linux-only; tag pushes (`v*`) and `workflow_dispatch` runs the full 3-OS matrix. macOS runners cost ~10× Linux per-minute and were running on every push under the old shape. Branch-protection required-checks list trimmed to match.
+- **CHARSET/COLLATION cross-engine diff (committed as v0.11.0; tagged with the next release).** PG schema reader now reads per-column collation via `pg_attribute.attcollation`; `ir.DiffOptions.IgnoreCharsetCollation` becomes load-bearing instead of inert; `diffColumn` compares charset/collation as separate `ColumnDiff` fields; renderer emits MySQL `MODIFY COLUMN` / PG `ALTER COLUMN` suggestions; columns whose only drift was charset/collation are dropped under the suppression flag.
+- **`docs/dev/translator-coverage.md`** — research catalog of 30 candidate MySQL→PG rewrite rules sourced from sqlglot, pgloader, dolt's function registry. Top 5 highest-priority for real DDL bodies named explicitly so the next round of translator work has a concrete shopping list.
+- **`docs/dev/design-mid-stream-add-table.md`** + **`docs/dev/design-multi-source-aggregation.md`** — proto-ADRs lay out the design space for the two heavier roadmap items so the implementation pass starts from a structured doc, not a blank page.
+- **goreleaser cross-platform release (live since `.goreleaser.yaml` + `release.yml` landed earlier).** Tagging `v*` triggers a draft GitHub release with Linux/macOS/Windows × amd64/arm64 binaries. CHANGELOG-driven release notes; operator publishes the draft after review.
+
 ### Foundational ADRs (0001–0029)
 
 IR-first, sealed interfaces, kong+koanf, three-phase apply, MySQL flavors, pgoutput, position persistence, go-mysql, Streamer-as-separate-orchestrator, idempotent applier semantics, SlotManager optional surface, pglogrepl bypass for FAILOVER, applier value-shaping with `CAST(? AS JSON)`, phase-aware error-hint registry, migration resume design, layered expression translation (extended in v0.8.0 with bool-idiom rewrites and v0.9.0 with index-expression and bool-sub-expression coverage), batched CDC apply, per-batch bulk-copy checkpointing, parallel within-table bulk copy, slot-ack-after-apply, publication scope by table, slot-missing fall-through (extended for MySQL in v0.6.0), `--reset-target-data`, `sluice schema preview`, graceful-drain `sync stop` (extended in v0.9.0 with `--wait`), LOAD DATA INFILE writer, source-tx-boundary CDC batching, memory-bounded streaming, `sluice schema diff`.
@@ -126,22 +141,19 @@ IR-first, sealed interfaces, kong+koanf, three-phase apply, MySQL flavors, pgout
 
 ## Next up
 
-v0.9.0 closed `sync stop --wait` (the operator-coordination half of "schema-change ergonomics"), audited TIMESTAMP precision (no gaps found), and landed the OSS-hygiene starter (`CONTRIBUTING.md` + release-notes template). v0.8.1's testing surfaced four follow-ups that landed in v0.9.0 too: index-expression translation, bool-returning sub-expressions in COALESCE, the auto-exclude reach into preview/diff, and Bug 23's enum-cast on the parens-form default. What's left is split between (a) low-priority items that have always been here and haven't surfaced as blockers, and (b) the heavier design-first items (mid-stream add-table, multi-source).
+The v0.10.x cycle closed the reactive-bug loop on the v0.9.x translator gaps (Bug 17 detector aggressive cast, Bug 25 enum-as-text, Bug 26 geometry SRID), shipped the `--expr-override` escape hatch (v0.10.0) so operators can bypass the translator on any unrecognised idiom, and landed the operator-UX additions from `FUTURE-TESTS.md` (`--slot-name`, `--dry-run` row counts). The v0.11.0 commit closed CHARSET/COLLATION cross-engine diff, surfaced the translator-coverage research catalog, and captured the design space for the two heavier remaining items.
 
-### 1. CHARSET/COLLATION cross-engine translation
+What's left is split between (a) the translator-catalog top-N working through the highest-priority MySQL→PG idiom rewrites (now that the catalog itself exists), (b) the heavier design-first items (mid-stream add-table, multi-source aggregation — both have proto-ADRs to start from), and (c) the OSS-hygiene round-out (license-header sweep + public README pass).
 
-**Why.** v0.9.0 audited TIMESTAMP precision and found no gaps; CHARSET / COLLATION is the remaining cross-engine type-edge tracker. The `--ignore-charset-collation` flag on `schema diff` is plumbed but inert — the underlying comparison needs the IR to carry charset/collation on read for both engines.
+### 1. Translator catalog: continue working through the candidate set
 
-**What.** Two-step:
+**Why.** `docs/dev/translator-coverage.md` is the research catalog (30 candidate rules, sourced from sqlglot / pgloader / dolt). The v0.11.0 release works through the first batch of high-priority rules (NOW(), UNIX_TIMESTAMP/FROM_UNIXTIME, CHAR_LENGTH, LCASE/UCASE, SUBSTR/MID); the rest of the high-priority tier and the medium-priority tier remain. Each rule pre-empts a future "operator hit a translation gap" report and is mechanically small.
 
-1. **IR enrichment.** Add `Charset` and `Collation` fields to `ir.Column` (or a sub-struct shared with `ir.Table`). Both schema readers populate from `information_schema.columns` (MySQL) and `pg_collation` (Postgres). Empty when the engine doesn't expose the column-level value.
-2. **Diff comparison.** `schema diff` compares the fields when both sides have them; surfaces drift; `--ignore-charset-collation` becomes load-bearing.
-
-Cross-engine emit is out of scope for this chunk — operators with charset-sensitive workloads use `--type-override` today; bringing translation in-band requires an equivalence map similar to the default-value one (utf8mb4 ↔ UTF8, latin1 ↔ LATIN1, etc.) that would be its own ADR.
+**What.** Pick the next batch from the catalog — likely the remaining high-priority entries (`CONCAT_WS` immutability wrap, `DATE_FORMAT` format-string mapping, `RAND()` → `RANDOM()`, `MD5` passthrough doc, then medium-tier `INSTR`/`LOCATE`, `REGEXP_LIKE`, `REGEXP_REPLACE` global flag, `DATE_ADD`/`DATE_SUB`, `ISNULL`, etc.). Each follows the existing `rewriteFunctionCalls(name, replacer)` shape, gets tests in `expr_translate_test.go`, and updates ADR-0016's cumulative-scope table.
 
 **Gotchas.**
-- MySQL stores charset/collation per-column; Postgres tracks collation per-column but charset is database-wide. The IR field shape needs to cover both.
-- Default charset on MySQL column comes from the table default, which comes from the database default — surface only the explicitly-set values to avoid false positives.
+- `DATE_FORMAT` is the messiest of the high-priority remainder — the format-string token mapping (`%Y/%m/%d/%H/%i/%s` → `YYYY/MM/DD/HH24/MI/SS`) needs its own table and the result is `STABLE` not `IMMUTABLE` on the PG side, which blocks generated columns. Operators may still need `--expr-override` even after the rewrite lands.
+- Each rule's catalog entry already carries the "is the PG equivalent IMMUTABLE?" / "is there an extension dependency?" / "is there a NULL-handling difference?" callouts — re-read the catalog entry before implementing.
 
 ---
 
@@ -178,15 +190,14 @@ Cross-engine emit is out of scope for this chunk — operators with charset-sens
 
 ### 4. OSS-hygiene track (remaining items)
 
-**Why.** v0.9.0 closed two of the OSS-hygiene starters (`CONTRIBUTING.md` release-process section + `docs/dev/release-template.md`). The remaining items round out the public-release-readiness story.
+**Why.** v0.9.0 closed two of the OSS-hygiene starters (`CONTRIBUTING.md` release-process section + `docs/dev/release-template.md`). goreleaser is also live (`.goreleaser.yaml` + `release.yml` produce draft GitHub releases on tag push). The remaining items round out the public-release-readiness story.
 
-**What.** Three independent items, each landable on its own:
+**What.** Two independent items, each landable on its own:
 
 - **License-header sweep across `internal/`.** LICENSE file is in place at the repo root; per-file headers are not. Mechanical change with high diff churn (~50 files); best landed in a single doc-only commit so the diff is easy to skim and revert if convention changes.
-- **`goreleaser` (or equivalent) for cross-platform binary builds.** Eight tagged releases; hand-rolled build artefacts are starting to be a chore. Gotchas: Windows code-signing, GitHub Actions secrets, the integration-test images on the release runner. Worth its own focused chunk with a real ADR addendum.
 - **Public README pass.** Current README is reasonable but reads as project-internal. Audience the public README should target: an operator scanning for "does this fit my use case" in the first 30 seconds. Move the deeper architectural detail into `docs/architecture.md` (already exists); the README becomes a short pitch + quickstart + pointer to docs.
 
-**Gotchas.** None for the license-header sweep or README pass; goreleaser carries the gotchas listed above and benefits from running through the whole release cycle once before being declared done.
+**Gotchas.** None for either item.
 
 ---
 
