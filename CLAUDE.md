@@ -38,6 +38,8 @@ Required to be clean before commit: `gofumpt -l .`, `go vet ./...`, `golangci-li
 
 Integration tests need Docker and the `integration` build tag: `go test -tags=integration ./internal/...`. They take a few minutes (testcontainers boots real MySQL and Postgres). Run them after non-trivial changes to readers/writers/orchestrator.
 
+**Build-tagged files don't compile under bare `go build ./...`.** When changing a package-level symbol's type or signature, also run `go build -tags=integration ./...` (and any other relevant tags like `psverify`) before pushing — otherwise the integration build only fails in CI. This has bitten releases when an `internal/pipeline` symbol got migrated and the integration-tagged tests in the same package missed the rename.
+
 On Windows with Rancher Desktop, two things bite: `docker.exe` lives at `C:\Program Files\Rancher Desktop\resources\resources\win32\bin\` (often missing from `PATH`), and you need `TESTCONTAINERS_RYUK_DISABLED=true` because the ryuk reaper container vanishes immediately under Rancher's daemon. Without that env var the test loops through ~10 retries and fails with `No such container: ...`. See `docs/dev/development.md` for details. CI on Linux is unaffected.
 
 ## CI shape
