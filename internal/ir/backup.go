@@ -140,7 +140,31 @@ type Manifest struct {
 	// and the chunk files that contain its data. Order matches the
 	// schema's table order.
 	Tables []*TableManifest `json:"tables"`
+
+	// PartialState records whether the backup represented by this
+	// manifest finished successfully. Set to "in_progress" after each
+	// table completes (so a crash leaves a per-table-level resumable
+	// checkpoint on disk) and to "complete" only when the full backup
+	// finishes. The empty string is treated the same as "complete" for
+	// forward-compat with Phase-1 manifests written before this field
+	// existed.
+	//
+	// Phase 2 resume semantics (see internal/pipeline/backup.go):
+	//
+	//   - "complete" / "" → re-running into the same destination
+	//     refuses unless --force-overwrite is set.
+	//   - "in_progress" → re-running resumes from the next un-completed
+	//     table; chunks already present on the store with matching
+	//     SHA-256 are skipped, mismatched ones are overwritten.
+	PartialState string `json:"partial_state,omitempty"`
 }
+
+// Manifest partial-state constants. String literals are part of the
+// on-disk format; renaming requires a BackupFormatVersion bump.
+const (
+	BackupStateInProgress = "in_progress"
+	BackupStateComplete   = "complete"
+)
 
 // TableManifest is one entry within [Manifest.Tables]. Carries the
 // row count (load-bearing for restore-time row-count verification —

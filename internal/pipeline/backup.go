@@ -18,6 +18,29 @@ package pipeline
 // The orchestrator is sequential per table (Phase 2 will add
 // parallel reads — same shape as the parallel bulk-copy path —
 // once cloud backends with multipart upload land).
+//
+// # Resumable backups (Phase 2)
+//
+// A re-run of `sluice backup full` against the same destination is
+// resumable: the orchestrator reads any pre-existing manifest at the
+// destination and decides whether to start fresh, resume, or refuse.
+//
+//   - If no manifest exists, the run starts fresh.
+//   - If the prior manifest is `partial_state == "complete"` (a
+//     successful prior run), the new run refuses unless
+//     [Backup.ForceOverwrite] is set. Operators trigger this from the
+//     CLI with `--force-overwrite`, mirroring the friction tier of
+//     `migrate --reset-target-data` (ADR-0023).
+//   - If the prior manifest is `partial_state == "in_progress"`, the
+//     new run resumes: tables already fully written in the prior run
+//     are kept verbatim (their chunks are HEAD-checked for presence),
+//     and the run picks up at the next un-completed table. Within a
+//     table, chunk writes that find an existing object with a
+//     matching SHA-256 are skipped; mismatches overwrite (treating
+//     the prior bytes as a corrupted partial upload).
+//
+// The manifest is committed to the store after every table completes,
+// so a crashed run leaves at most one table's worth of work to redo.
 
 import (
 	"bytes"
@@ -76,6 +99,14 @@ type Backup struct {
 	// blank in the manifest.
 	SluiceVersion string
 
+	// ForceOverwrite, when true, lets a re-run replace a previously-
+	// completed backup at the same destination. Without it, finding a
+	// `partial_state == "complete"` manifest at the destination is an
+	// operator-actionable error. This is the analog of
+	// `migrate --reset-target-data` for the backup verb. In-progress
+	// manifests always resume regardless of this flag.
+	ForceOverwrite bool
+
 	// Now, when set, overrides the wall-clock-time source for
 	// [Manifest.CreatedAt]. Used by tests to pin timestamps; in
 	// production callers leave it nil and the default uses time.Now.
@@ -85,8 +116,9 @@ type Backup struct {
 // Run executes the backup. Returns nil on success; a wrapped error on
 // any phase failure.
 //
-// On success: the Store contains exactly one `manifest.json` and one
-// chunk file per (table, chunk-index) in the source schema.
+// On success: the Store contains exactly one `manifest.json` (with
+// `partial_state == "complete"`) and one chunk file per (table,
+// chunk-index) in the source schema.
 func (b *Backup) Run(ctx context.Context) error {
 	if err := b.validate(); err != nil {
 		return err
@@ -101,6 +133,30 @@ func (b *Backup) Run(ctx context.Context) error {
 			slog.Any("patterns", added),
 		)
 		b.Filter = eff
+	}
+
+	// 0. Resume detection: if a manifest already exists in the store,
+	// decide whether to fresh-start, resume, or refuse.
+	prior, priorErr := readManifestIfPresent(ctx, b.Store)
+	if priorErr != nil {
+		return fmt.Errorf("backup: inspect existing manifest: %w", priorErr)
+	}
+	if prior != nil {
+		switch prior.PartialState {
+		case ir.BackupStateInProgress:
+			slog.InfoContext(ctx, "backup: resuming partial backup",
+				slog.Int("completed_tables", len(prior.Tables)),
+			)
+		case ir.BackupStateComplete, "":
+			if !b.ForceOverwrite {
+				return fmt.Errorf("backup: a completed backup already exists at this destination (created %s); pass --force-overwrite to replace it",
+					prior.CreatedAt.UTC().Format(time.RFC3339))
+			}
+			slog.InfoContext(ctx, "backup: --force-overwrite set; replacing existing complete backup",
+				slog.Time("prior_created_at", prior.CreatedAt),
+			)
+			prior = nil // discard so we start from scratch
+		}
 	}
 
 	// 1. Read source schema.
@@ -140,40 +196,79 @@ func (b *Backup) Run(ctx context.Context) error {
 		chunkRows = DefaultBackupChunkRows
 	}
 
-	tableEntries := make([]*ir.TableManifest, 0, len(schema.Tables))
-	for _, table := range schema.Tables {
-		entry, err := b.backupTable(ctx, rr, table, chunkRows)
-		if err != nil {
-			return wrapWithHint(PhaseBulkCopy, fmt.Errorf("backup: table %q: %w", table.Name, err))
-		}
-		tableEntries = append(tableEntries, entry)
-	}
-
-	// 5. Write manifest.
 	now := time.Now
 	if b.Now != nil {
 		now = b.Now
 	}
+
+	// Pre-build the in-progress manifest with the schema. Tables get
+	// appended (or copied from the prior run) as they finish; the
+	// manifest is committed after each table completes.
 	manifest := &ir.Manifest{
 		FormatVersion: ir.BackupFormatVersion,
 		SluiceVersion: b.SluiceVersion,
 		CreatedAt:     now().UTC(),
 		SourceEngine:  b.Source.Name(),
 		Schema:        schema,
-		Tables:        tableEntries,
+		Tables:        make([]*ir.TableManifest, 0, len(schema.Tables)),
+		PartialState:  ir.BackupStateInProgress,
 	}
+	if prior != nil {
+		// Preserve the original CreatedAt across resume so the
+		// "when was this backup taken?" answer is the snapshot point,
+		// not the resume point.
+		manifest.CreatedAt = prior.CreatedAt
+	}
+	priorTables := indexManifestTables(priorCompletedTables(prior))
+
+	for _, table := range schema.Tables {
+		key := manifestTableKey(table.Schema, table.Name)
+		if existing, ok := priorTables[key]; ok {
+			ok, err := tableChunksAllPresent(ctx, b.Store, existing)
+			if err != nil {
+				return fmt.Errorf("backup: re-validate prior table %q: %w", table.Name, err)
+			}
+			if ok {
+				slog.InfoContext(ctx, "backup: table already complete in prior run; skipping",
+					slog.String("table", table.Name),
+					slog.Int64("rows", existing.RowCount),
+					slog.Int("chunks", len(existing.Chunks)),
+				)
+				manifest.Tables = append(manifest.Tables, existing)
+				continue
+			}
+			slog.WarnContext(ctx, "backup: prior-run chunks missing on store; re-running table",
+				slog.String("table", table.Name),
+			)
+		}
+		entry, err := b.backupTable(ctx, rr, table, chunkRows)
+		if err != nil {
+			return wrapWithHint(PhaseBulkCopy, fmt.Errorf("backup: table %q: %w", table.Name, err))
+		}
+		manifest.Tables = append(manifest.Tables, entry)
+
+		// Per-table checkpoint: commit the manifest with PartialState
+		// = "in_progress" after each table so a crash before the next
+		// table loses at most one table of work.
+		if err := writeManifest(ctx, b.Store, manifest); err != nil {
+			return fmt.Errorf("backup: checkpoint manifest after %q: %w", table.Name, err)
+		}
+	}
+
+	// 5. Final manifest write — flip to complete.
+	manifest.PartialState = ir.BackupStateComplete
 	if err := writeManifest(ctx, b.Store, manifest); err != nil {
-		return fmt.Errorf("backup: write manifest: %w", err)
+		return fmt.Errorf("backup: write final manifest: %w", err)
 	}
 
 	totalRows := int64(0)
 	totalChunks := 0
-	for _, t := range tableEntries {
+	for _, t := range manifest.Tables {
 		totalRows += t.RowCount
 		totalChunks += len(t.Chunks)
 	}
 	slog.InfoContext(ctx, "backup complete",
-		slog.Int("tables", len(tableEntries)),
+		slog.Int("tables", len(manifest.Tables)),
 		slog.Int64("rows", totalRows),
 		slog.Int("chunks", totalChunks),
 	)
@@ -239,13 +334,25 @@ func (b *Backup) backupTable(
 			return fmt.Errorf("close chunk: %w", err)
 		}
 		chunkPath := chunkFilePath(table, chunkIdx)
-		if err := b.Store.Put(ctx, chunkPath, buf); err != nil {
-			return fmt.Errorf("store put %q: %w", chunkPath, err)
+		hash := writer.Hash()
+		// Resumable-write defence: if a chunk file is already at this
+		// path (from a prior interrupted run) AND its bytes hash to
+		// the same value as the chunk we just produced, skip the
+		// upload. Mismatches overwrite — a corrupted partial-upload
+		// shouldn't survive a re-run.
+		skip, err := chunkAlreadyMatches(ctx, b.Store, chunkPath, hash)
+		if err != nil {
+			return fmt.Errorf("inspect existing chunk %q: %w", chunkPath, err)
+		}
+		if !skip {
+			if err := b.Store.Put(ctx, chunkPath, buf); err != nil {
+				return fmt.Errorf("store put %q: %w", chunkPath, err)
+			}
 		}
 		entry.Chunks = append(entry.Chunks, &ir.ChunkInfo{
 			File:     chunkPath,
 			RowCount: writer.RowCount(),
-			SHA256:   writer.Hash(),
+			SHA256:   hash,
 		})
 		writer = nil
 		buf = nil
@@ -339,6 +446,87 @@ func writeManifest(ctx context.Context, store ir.BackupStore, manifest *ir.Manif
 		return fmt.Errorf("marshal manifest: %w", err)
 	}
 	return store.Put(ctx, ManifestFileName, bytes.NewReader(b))
+}
+
+// readManifestIfPresent returns the prior manifest if one exists in
+// store, or (nil, nil) when no manifest is on disk. Distinct from
+// [readManifest] which surfaces a NotFound as an error: resume code
+// needs to distinguish "no prior backup" (fresh start) from "prior
+// manifest is unreadable" (operator-actionable failure).
+func readManifestIfPresent(ctx context.Context, store ir.BackupStore) (*ir.Manifest, error) {
+	exists, err := store.Exists(ctx, ManifestFileName)
+	if err != nil {
+		return nil, err
+	}
+	if !exists {
+		return nil, nil
+	}
+	return readManifest(ctx, store)
+}
+
+// priorCompletedTables returns the prior manifest's table list when
+// the manifest is in a state where its entries can be trusted as
+// "this table is fully done." Returns nil for a nil manifest.
+//
+// Only "in_progress" manifests carry per-table progress; "complete"
+// manifests are the same shape but get rejected up-stack unless
+// --force-overwrite is set, in which case the caller has already
+// nilled out prior. Empty PartialState (Phase 1 manifests) is treated
+// the same as "complete" — those manifests are immutable backups, not
+// resume points.
+func priorCompletedTables(prior *ir.Manifest) []*ir.TableManifest {
+	if prior == nil || prior.PartialState != ir.BackupStateInProgress {
+		return nil
+	}
+	return prior.Tables
+}
+
+// tableChunksAllPresent verifies every chunk listed in entry is still
+// present in store. Used when resuming to confirm a "fully completed
+// table from a prior run" is still backed by its bytes — operators
+// who manually deleted chunks between runs trip this and the table
+// gets re-streamed instead of silently appearing in the manifest with
+// no actual data behind it.
+func tableChunksAllPresent(ctx context.Context, store ir.BackupStore, entry *ir.TableManifest) (bool, error) {
+	for _, c := range entry.Chunks {
+		exists, err := store.Exists(ctx, c.File)
+		if err != nil {
+			return false, fmt.Errorf("exists %q: %w", c.File, err)
+		}
+		if !exists {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// chunkAlreadyMatches reports whether key already exists in store and
+// hashes to expectedSHA256. Returns (false, nil) when the key is
+// absent (the common cold-start case). Returns (false, nil) when the
+// key is present but mismatches — the caller treats that as a stale
+// partial-upload and overwrites.
+//
+// The fetch-and-hash cost is bounded to chunk size (default 100k rows,
+// typically a few MB compressed); cheap relative to a full re-upload
+// of the same chunk over a slow link.
+func chunkAlreadyMatches(ctx context.Context, store ir.BackupStore, key, expectedSHA256 string) (bool, error) {
+	exists, err := store.Exists(ctx, key)
+	if err != nil {
+		return false, err
+	}
+	if !exists {
+		return false, nil
+	}
+	rc, err := store.Get(ctx, key)
+	if err != nil {
+		return false, fmt.Errorf("get %q: %w", key, err)
+	}
+	defer func() { _ = rc.Close() }()
+	got, err := hashChunkBytes(ctx, rc)
+	if err != nil {
+		return false, fmt.Errorf("hash %q: %w", key, err)
+	}
+	return got == expectedSHA256, nil
 }
 
 // readManifest loads and decodes the manifest from store. Used by
