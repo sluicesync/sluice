@@ -116,6 +116,8 @@ If any of the five fails, fix the failure (typically: race conditions caught by 
 
 **Force-moving a tag creates a duplicate draft release.** GoReleaser doesn't update the existing draft when the tag's SHA changes — it creates a new one. After publishing, list `gh api repos/owner/repo/releases --jq '.[] | select(.tag_name=="vX.Y.Z")'` and delete any leftover `draft: true` entries via `gh api -X DELETE repos/owner/repo/releases/<id>`. Pre-tagging cleanup (deleting the existing draft before the force-push) prevents the dup; cleanup after is fine too.
 
+7. **Auto-spawn the next test cycle after publish.** Per the autonomous-loop convention (see auto-memory `feedback_automation_loop.md`), every release publish triggers the next regression cycle in `C:\code\sluice-testing` *without waiting to be asked*. Update `sluice-testing/NEXT-CYCLE.md` to point at the just-shipped version's focus areas, spawn a `general-purpose` subagent in the background to download the new release, exercise the focus scenarios + the standard `RUNBOOK.md` baseline, and write a `session-reports/vX.Y.Z.md` report. Stop conditions: subagent reports clean (cycle done), or files a new bug entry in `BUG-CATALOG.md` (loop into next fix), or the operator says stop. The subagent runs in the testing repo's working directory; its own `CLAUDE.md` (if present there) governs the testing workflow.
+
 The session-local `.claude/settings.local.json` should pre-authorize `Bash(git push origin main:*)`, `Bash(git push origin v*:*)`, and `Bash(gh release edit:*)` so the autonomous flow doesn't trip the deny-by-default hook on every release.
 
 ## Working agreements with humans on this project
