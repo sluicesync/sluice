@@ -248,6 +248,19 @@ Metric set covers position-derived (`sluice_lag_events`, `sluice_lag_seconds`), 
 
 ---
 
+### 8. Schema completeness — FK edge cases + view support
+
+**Why.** Two user-raised concerns 2026-05-07 about how complete sluice's schema-object handling is. FKs work today via the three-phase apply (tables → bulk_copy → indexes → constraints; FKs in phase 5 after all tables exist) but documented edge cases lack regression tests. Views are not handled at all today. See [`design-schema-completeness.md`](design-schema-completeness.md).
+
+**What.** Two independent tracks:
+
+- **FK edge-case test coverage (~3 days).** Pin self-ref, circular, DROP-order, CDC catch-up, DEFERRABLE, ON DELETE actions, cross-engine round-trip, composite-PK FK behaviors with regression tests. No code changes; the architecture is correct, just needs the tests to pin behavior.
+- **View support (~2 weeks Phase 1).** New `ir.View` type, both engine readers + writers, dependency ordering, `--view-override` escape hatch. Materialized-view refresh as Phase 2. Cross-engine view-definition translation (Phase 3) reactive to operator demand.
+
+**Gotchas.** Cross-engine view definitions are an open-ended translation problem — sluice doesn't (and shouldn't) implement a full SQL parser; `--view-override` is the always-works fallback. PG `RULE` system, `SQL SECURITY` clauses, and PG-specific view metadata are out of scope for Phase 1.
+
+---
+
 ### Bug 27 (deferred, parked here)
 
 **Why.** Deferred from v0.10.3 pending VStream test infrastructure (`integration vstream` build tag). VStream POINT bytes are mis-parsed because VStream doesn't strip MySQL's internal 4-byte SRID prefix before the OGC WKB; sluice's WKB decoder reads the SRID's low byte as the byte-order flag and fails. Only affects the VStream protocol; vanilla MySQL protocol path strips the prefix correctly.
