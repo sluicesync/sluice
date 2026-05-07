@@ -4,6 +4,18 @@ Supplement to [`design-logical-backups.md`](design-logical-backups.md) (the orig
 
 ## Decisions revised since the original proto-ADR
 
+### Binary-size cost of `gocloud.dev/blob` (post-implementation measurement)
+
+The pre-implementation estimate was "`~3-5 MB` even on local-FS-only builds." Real-world measurement after wiring all four side-effect imports (`s3blob`, `gcsblob`, `azureblob`, `fileblob`):
+
+| Build | Size (Linux/Windows amd64) |
+|---|---|
+| Phase 1 (no cloud SDKs linked) | ~38.5 MB |
+| Phase 2 (gocloud + S3 + GCS + Azure + fileblob linked) | ~84.2 MB |
+| **Delta** | **~46 MB** |
+
+Larger than the optimistic estimate, in line with the pessimistic envelope. Acceptable for v1 — operators consuming sluice via container images won't notice the layer-cache cost, and binary distribution sizes are still in the same order of magnitude as `kubectl` (~50 MB) and `terraform` (~110 MB). If the footprint becomes a real concern (e.g. embedding sluice in a small operator binary), the path is build tags per cloud or moving to native SDKs per backend; the `BackupStore` interface is unchanged either way.
+
 ### Library: `gocloud.dev/blob` (revised from native `aws-sdk-go-v2`)
 
 The original recommended pure native SDKs per cloud backend. Revised to **`gocloud.dev/blob`** for Phase 2 onwards.
