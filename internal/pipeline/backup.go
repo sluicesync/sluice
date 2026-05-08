@@ -99,6 +99,18 @@ type Backup struct {
 	// blank in the manifest.
 	SluiceVersion string
 
+	// SlotName is the source-side replication-slot name to record on
+	// the manifest's [ir.Manifest.EndPosition] for engines with a slot
+	// concept (Postgres). Phase 3.3: the captured EndPosition pairs the
+	// slot name with the source's current LSN at end-of-backup so a
+	// subsequent incremental can resume CDC from that LSN against a
+	// slot of the same name. Empty falls back to the engine's default
+	// (`sluice_slot` on PG); engines without slots (MySQL) ignore the
+	// field. The slot need not exist at backup time — Phase 3.3's
+	// `sluice sync start --position-from-manifest` pre-flights slot
+	// state before resuming CDC.
+	SlotName string
+
 	// ForceOverwrite, when true, lets a re-run replace a previously-
 	// completed backup at the same destination. Without it, finding a
 	// `partial_state == "complete"` manifest at the destination is an
@@ -218,6 +230,7 @@ func (b *Backup) Run(ctx context.Context) error {
 		Schema:        schema,
 		Tables:        make([]*ir.TableManifest, 0, len(schema.Tables)),
 		PartialState:  ir.BackupStateInProgress,
+		Kind:          ir.BackupKindFull,
 	}
 	if prior != nil {
 		// Preserve the original CreatedAt across resume so the
@@ -309,6 +322,23 @@ func (b *Backup) Run(ctx context.Context) error {
 		}
 	}
 
+	// 4.5. Capture end-of-backup CDC position into manifest.EndPosition
+	// so a Phase 3 incremental chained off this full has a resume
+	// cursor (Phase 3.3). Engines without CDC support — or without an
+	// implementation of [ir.BackupPositionCapturer] — leave the field
+	// empty; the incremental orchestrator already handles that case
+	// with a clear "parent has no EndPosition" warning.
+	if err := b.captureEndPosition(ctx, manifest); err != nil {
+		return wrapWithHint(PhaseConnect, fmt.Errorf("backup: capture end position: %w", err))
+	}
+
+	// Compute BackupID once EndPosition is known. The id is used by
+	// Phase 3 incrementals to link via ParentBackupID; pre-Phase-3
+	// fulls leave it empty, which the chain-restore walker tolerates by
+	// computing on demand. Filling it in here means the full's manifest
+	// carries the same id the incremental would compute when chaining.
+	manifest.BackupID = ir.ComputeBackupID(manifest)
+
 	// 5. Final manifest write — flip to complete.
 	manifest.PartialState = ir.BackupStateComplete
 	if err := writeManifest(ctx, b.Store, manifest); err != nil {
@@ -325,6 +355,54 @@ func (b *Backup) Run(ctx context.Context) error {
 		slog.Int("tables", len(manifest.Tables)),
 		slog.Int64("rows", totalRows),
 		slog.Int("chunks", totalChunks),
+	)
+	return nil
+}
+
+// captureEndPosition queries the source for its current CDC position
+// and stores it on manifest.EndPosition. Engines that don't support
+// CDC (Capabilities.CDC == ir.CDCNone) skip the capture; engines that
+// do but don't implement [ir.BackupPositionCapturer] also skip with a
+// debug log line so the gap is visible to operators running with
+// --log-level=debug.
+//
+// The capture happens AFTER the per-table row sweep so the recorded
+// position reflects "the source has produced everything up to here at
+// the moment the backup completes." Source writes during the backup
+// window are read by the row sweep itself; the EndPosition captures
+// the resume point for the chain's next link.
+func (b *Backup) captureEndPosition(ctx context.Context, manifest *ir.Manifest) error {
+	if b.Source.Capabilities().CDC == ir.CDCNone {
+		slog.DebugContext(ctx, "backup: source does not support CDC; skipping EndPosition capture",
+			slog.String("engine", b.Source.Name()),
+		)
+		return nil
+	}
+	// We need a SchemaReader-shaped surface for the optional capturer
+	// (it lives there to share the engine's *sql.DB pool). Open one
+	// just for the capture; the engine handles connection lifetime
+	// via Close.
+	sr, err := b.Source.OpenSchemaReader(ctx, b.SourceDSN)
+	if err != nil {
+		return fmt.Errorf("open schema reader for position capture: %w", err)
+	}
+	defer closeIf(sr)
+
+	capturer, ok := sr.(ir.BackupPositionCapturer)
+	if !ok {
+		slog.DebugContext(ctx, "backup: source SchemaReader does not implement BackupPositionCapturer; manifest EndPosition will be empty",
+			slog.String("engine", b.Source.Name()),
+		)
+		return nil
+	}
+	pos, err := capturer.CaptureBackupPosition(ctx, b.SlotName)
+	if err != nil {
+		return fmt.Errorf("capture position: %w", err)
+	}
+	manifest.EndPosition = pos
+	slog.InfoContext(ctx, "backup: recorded end position",
+		slog.String("engine", manifest.SourceEngine),
+		slog.String("position_token", pos.Token),
 	)
 	return nil
 }

@@ -65,6 +65,8 @@ type BackupFullCmd struct {
 
 	ChunkSize int `help:"Maximum rows per chunk file. The writer rolls over to a new file whenever the current chunk hits this row count. Smaller chunks restore faster (per-chunk SHA-256 verification can fail-fast on the smallest possible unit) but inflate the manifest. Default 100000." default:"100000" placeholder:"N"`
 
+	SlotName string `help:"Replication-slot name suffix on engines with a slot concept (Postgres). Used to label the EndPosition recorded on the manifest so a Phase 3 incremental chained off this full opens CDC against a slot of the same name. Default 'sluice_slot'. Engines without slots (MySQL: binlog stream is the slot) ignore this flag." placeholder:"NAME"`
+
 	ForceOverwrite bool `help:"Replace an existing completed backup at the destination. By default 'sluice backup full' refuses to overwrite a successful prior backup; pass this to discard the prior contents and start fresh. Partial (in-progress) backups always resume regardless of this flag."`
 }
 
@@ -121,6 +123,7 @@ func (b *BackupFullCmd) Run(g *Globals) error {
 		Filter:         filter,
 		ChunkRows:      b.ChunkSize,
 		SluiceVersion:  version,
+		SlotName:       pipeline.ResolveSlotName(b.SlotName),
 		ForceOverwrite: b.ForceOverwrite,
 	}
 	return backup.Run(ctx)

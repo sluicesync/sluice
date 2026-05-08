@@ -421,6 +421,48 @@ type CDCReader interface {
 	StreamChanges(ctx context.Context, from Position) (<-chan Change, error)
 }
 
+// BackupPositionCapturer is the optional engine surface for capturing
+// the source's current CDC position from a one-shot query. Used by
+// the full-backup orchestrator to populate [Manifest.EndPosition] —
+// the resume point for a Phase 3 incremental chained off this full.
+//
+// The captured position is the source-side cursor at the moment of
+// capture. The full backup calls this once at the end of the per-table
+// row sweep so the recorded EndPosition reflects "the source has
+// produced everything up to here; an incremental from this point
+// captures changes after the backup completes." Source writes during
+// the backup window are read by the per-table row sweep itself; the
+// EndPosition captures the boundary between "in this backup" and
+// "needs to come via the chain's next link."
+//
+// Engines wire this on their [SchemaReader] (parallel to
+// [HealthReporter]) so the full-backup orchestrator can type-assert
+// on a value it already opens. The captured position's encoding is
+// engine-specific:
+//
+//   - Postgres: a JSON-envelope `{slot,lsn}` shape using the slot
+//     name supplied via slotName (or the engine's default when empty)
+//     plus `pg_current_wal_lsn()`. The slot need not exist at capture
+//     time — Phase 3.3's `--position-from-manifest` pre-flights the
+//     slot state before resuming CDC from the recorded LSN.
+//   - MySQL: a binlog-mode position recording `@@global.gtid_executed`
+//     when GTID mode is on, or a `(file, pos)` pair otherwise.
+//
+// Engines without CDC support don't implement this surface; the
+// orchestrator type-asserts and falls back to "no EndPosition recorded"
+// (matches the v0.16.x shape; first incremental against such a manifest
+// surfaces a clear "parent has no EndPosition; chain will start from
+// CDC's current position" warning).
+type BackupPositionCapturer interface {
+	// CaptureBackupPosition returns the source's current CDC position.
+	// The slotName argument is honoured by engines with a slot concept
+	// (Postgres) and ignored by others (MySQL); empty falls back to the
+	// engine's default. The returned position is suitable for storage
+	// in [Manifest.EndPosition] and as a [Position] argument to the
+	// engine's CDC reader.
+	CaptureBackupPosition(ctx context.Context, slotName string) (Position, error)
+}
+
 // ChangeApplier applies [Change] events to a target database and
 // persists progress alongside each applied change. Each Apply call
 // commits the data write and the position update in the same target

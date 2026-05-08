@@ -913,6 +913,14 @@ func retagPositionForSource(persisted ir.Position, sourceEngine string) ir.Posit
 // names like `--slot-name shard_a` become `sluice_shard_a`.
 const sluiceSlotPrefix = "sluice_"
 
+// ResolveSlotName is the exported counterpart of [resolveSlotName].
+// CLI commands outside the pipeline package (today: `sluice backup
+// full --slot-name`) call through to apply the sluice-prefix
+// convention without re-implementing it.
+func ResolveSlotName(operatorSupplied string) string {
+	return resolveSlotName(operatorSupplied)
+}
+
 // resolveSlotName applies the sluice-prefix convention to an
 // operator-supplied slot name. Empty input passes through unchanged
 // — the empty signal means "use the engine's default" (which is
