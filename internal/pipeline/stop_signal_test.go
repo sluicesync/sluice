@@ -103,9 +103,13 @@ func TestPollStopSignal_CancelsStreamOnFlag(t *testing.T) {
 	if applyCancelled.Load() {
 		t.Error("cancelApply fired on graceful-drain path; should only fire after drain timeout")
 	}
-	if reader.callCount() < 2 {
-		t.Errorf("expected ≥2 polls before observing flag; got %d", reader.callCount())
-	}
+	// Note: previously asserted callCount() >= 2 to verify the loop
+	// polled multiple times. Removed because Windows-latest under -race
+	// occasionally schedules the first poll exactly at the flag-flip
+	// moment, observing true on tick 1 and producing a false-positive
+	// failure. The streamCancelled check above is the load-bearing
+	// assertion (proves the polling loop actually did work); call-count
+	// shape is incidental.
 }
 
 // TestPollStopSignal_SetsObservedOnFlag verifies the v0.9.0 hook for
