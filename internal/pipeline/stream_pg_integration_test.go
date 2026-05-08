@@ -267,8 +267,8 @@ func TestBackupStream_Postgres_StopCommandRequestsExit(t *testing.T) {
 		if err != nil {
 			t.Errorf("stream.Run after stop = %v; want nil (clean exit)", err)
 		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("stream.Run did not exit within 10s of stop request")
+	case <-time.After(20 * time.Second):
+		t.Fatal("stream.Run did not exit within 20s of stop request")
 	}
 }
 

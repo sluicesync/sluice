@@ -661,16 +661,19 @@ type captureOutcome struct {
 //
 // Window-end straddle behaviour: an open transaction (TxBegin observed
 // without TxCommit) extends the window by up to one transaction so the
-// chain doesn't end mid-tx — same as Phase 3.1. Stop-request observed
-// while inTransaction is honoured at the next tx boundary too.
+// chain doesn't end mid-tx — same as Phase 3.1.
 //
 // Stop-request poll cadence: [streamStopPollInterval] (1 s by default,
 // regardless of the rollover-window). The poll reads `stream_state.json`'s
 // `stop_requested_at` field directly; on first observation, the
-// in-flight rollover flushes (commits chunks staged so far) and
-// returns with [captureOutcome.StopRequested]=true so the outer loop
-// can finalise the manifest and exit cleanly without another
-// state-file overwrite.
+// in-flight rollover flushes (commits chunks staged so far — may be a
+// partial mid-transaction chunk) and returns IMMEDIATELY with
+// [captureOutcome.StopRequested]=true so the outer loop can finalise
+// the manifest and exit cleanly. Eager exit (rather than wait-for-
+// next-tx-boundary) is load-bearing: on a quiet source the next tx
+// boundary may never arrive within the operator's drain budget. The
+// chain may end mid-tx in the stop case; this is the correct trade —
+// operator issued stop, exit promptly.
 //
 // Returns the captured outcome and any fatal error.
 func (b *BackupStream) captureWindow(
@@ -774,9 +777,15 @@ func (b *BackupStream) captureWindow(
 				return out, nil
 			}
 		case <-stopPoll.C:
-			// Cross-machine stop poll. Honoured at next tx boundary so
-			// the chain doesn't end mid-tx (same shape as the deadline
-			// case above).
+			// Cross-machine stop poll. Operator-issued
+			// `sluice backup stream stop` expects prompt exit, not
+			// "wait for the source to send another tx" — on a quiet
+			// source a tx-boundary may never arrive within the
+			// operator's drain budget. Eager-exit on first observation:
+			// flush whatever's buffered (could be a partial
+			// mid-transaction chunk) and return so the outer loop can
+			// commit the in-flight manifest and exit. Surfaces as
+			// [captureOutcome.StopRequested]=true.
 			if out.StopRequested {
 				continue
 			}
@@ -791,12 +800,10 @@ func (b *BackupStream) captureWindow(
 				continue
 			}
 			out.StopRequested = true
-			if !inTransaction {
-				if err := flush(); err != nil {
-					return out, err
-				}
-				return out, nil
+			if err := flush(); err != nil {
+				return out, err
 			}
+			return out, nil
 		case change, ok := <-changesCh:
 			if !ok {
 				out.SourceClosed = true
