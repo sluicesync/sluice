@@ -6,6 +6,24 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Logical backups Phase 3.1 + 3.2: chained backups (`sluice backup incremental --since=<backup-id>`) + chain-aware restore.** The chunk that closes the resync-avoidance story for irrecoverable position loss. New CLI subcommand `sluice backup incremental` opens the source's CDC pump at the parent manifest's terminal position, streams events for a bounded window (`--window` time-bound + `--max-changes` count-bound, first-fired wins; window extends to the next TxCommit so the chain doesn't end mid-tx), and writes a chain-linked manifest under `manifests/incr-…json` plus serialised change chunks under `chunks/_changes/`. Manifest gains `Kind`, `BackupID`, `ParentBackupID`, `StartPosition`, `EndPosition`, `SchemaHash`, and `SchemaDelta` fields; pre-Phase-3 manifests treated as orphan fulls under the canonicaliser. Implementation supplement: `docs/dev/design-logical-backups-phase-3.md`.
+- **`sluice restore --from=<chain-url>` chain detection.** The existing single-manifest restore path now lists `manifests/incr-…json` at the supplied URL; when any incremental manifests are found, dispatches to a new chain-aware orchestrator that walks `[full, incr_1, …, incr_N]` in order. Builds the chain via `ParentBackupID` linkage, validates: single full root, no branching, no cycles, no orphans, every incremental's `StartPosition` matches its parent's `EndPosition`. Cross-engine chain restore is refused loudly per the design doc's Phase 5+ deferral; same-engine chain restore applies schema deltas (AddTable creates the table, AlterTable replays ADD COLUMN via the new `ir.SchemaDeltaApplier` surface implemented on both PG and MySQL) then streams change chunks through the engine's idempotent `ChangeApplier.ApplyBatch` per ADR-0010.
+- **`sluice backup verify` walks chains.** Re-checksums every chunk in the store across all manifests (the full's row chunks and every incremental's change chunks), so cron-style integrity probes cover the whole chain in one call.
+- **`ir.SchemaDeltaApplier` interface** with `AlterAddColumn(ctx, table, cols)` — implemented on PG (`ALTER TABLE … ADD COLUMN IF NOT EXISTS …`) and MySQL (information-schema probe + `ALTER TABLE … ADD COLUMN`); same-engine column-add deltas apply cleanly during chain restore.
+- **Schema-evolution capture within an incremental's window.** Source's recorded schema (parent manifest) vs end-of-window source schema is diff'd into typed `ir.SchemaDeltaEntry` slice on the incremental manifest; AddTable / DropTable / AlterTable kinds covered. Rename-shaped deltas (single drop + single add per table) are flagged as ambiguous and surface a "force fresh full + new chain" recovery message.
+
+### Changed
+
+- **`ir.Manifest.FormatVersion` stays at 1.** All Phase 3 fields are forward-compatible additions (older sluice ignores `Kind` / `ParentBackupID` / etc.; those manifests appear as orphan fulls when read by an older binary, which is the right degraded behaviour for incrementals nobody can chain anyway). The version bumps when a future change would break older readers.
+
+### Phase 3 known limitations (Phase 3.3 follow-up)
+
+- The full-backup writer doesn't yet record an `EndPosition` (= snapshot LSN/GTID) on its manifest; integration tests patch this in manually, and the first incremental against a v0.16.x full surfaces a clear "parent has no EndPosition; chain will start from CDC's current position" warning. Phase 3.3 will close this gap so chains rooted in v0.17.0+ fulls get position-from-snapshot for free.
+- `sluice sync start --position-from-manifest=<chain-url>` (the CDC handoff flag that lets a sync stream resume from the chain's terminal position without re-bulking) is not in 3.1+3.2 — it's the next subagent's job, gated on a test cycle for the writer + restore work.
+- PG `wal_keep_size` soft-warning pre-flight checks are not in 3.1+3.2 — Phase 3.3 territory.
+
 ## [0.16.1] - 2026-05-07
 
 Two-bug patch from the v0.16.0 test cycle. v0.16.0 shipped logical-backups Phase 2 (cloud backends + resumable writer); both findings are operational papercuts on top of an otherwise-clean cloud-roundtrip surface — not data-correctness bugs, but they break the workflow shape v0.16.0 promised.

@@ -346,6 +346,41 @@ func TestChainRestore_FullPlusOneIncremental_RoundTrip(t *testing.T) {
 	}
 }
 
+// TestChainRestore_CrossEngineWithIncrementalsRefuses verifies that
+// a chain whose source engine differs from the target engine errors
+// out with operator-actionable guidance — Phase 3.2 acceptance
+// criterion 3 (cross-engine schema-delta translation deferred to
+// Phase 5+).
+func TestChainRestore_CrossEngineWithIncrementalsRefuses(t *testing.T) {
+	dir := t.TempDir()
+	store, _ := NewLocalStore(dir)
+
+	// Full manifest: source_engine=postgres.
+	full := makeManifest(t, ir.BackupKindFull, nil, "0/100")
+	full.SourceEngine = "postgres"
+	full.BackupID = ir.ComputeBackupID(full)
+	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
+		t.Fatalf("write full: %v", err)
+	}
+	incr := makeManifest(t, ir.BackupKindIncremental, full, "0/200")
+	incr.SourceEngine = "postgres"
+	incr.BackupID = ir.ComputeBackupID(incr)
+	if err := writeManifestAt(context.Background(), store, "manifests/incr-0001.json", incr); err != nil {
+		t.Fatalf("write incr: %v", err)
+	}
+
+	// Target engine = mysql, distinct from the chain's source.
+	tgt := newRestoreRecorderEngine("mysql")
+	chain := &ChainRestore{Target: tgt, TargetDSN: "tgt", Store: store}
+	err := chain.Run(context.Background())
+	if err == nil {
+		t.Fatal("err = nil; want cross-engine refusal")
+	}
+	if !strings.Contains(err.Error(), "cross-engine") {
+		t.Errorf("err = %v; want cross-engine refusal", err)
+	}
+}
+
 // TestChainRestore_DispatchFromRestore_Run verifies the existing
 // Restore.Run delegates to ChainRestore when incrementals are
 // present.
