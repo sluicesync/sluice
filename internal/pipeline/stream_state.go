@@ -95,14 +95,66 @@ func readStreamState(ctx context.Context, store ir.BackupStore, path string) (*s
 
 // writeStreamState serialises s as JSON (indented for human
 // readability) and writes it to store at path. Overwrites any existing
-// content — the file is single-writer by design (concurrent-writer
-// protection enforces this at the orchestrator level).
+// content.
+//
+// **Multiple writers, by design.** The file is shared between the
+// running stream (writes liveness fields: PID, Host, StartedAt,
+// LastRolloverAt) and `sluice backup stream stop` (writes
+// StopRequestedAt). Treating the file as last-writer-wins led to the
+// Bug 37 clobber: the stream's heartbeat write at a rollover boundary
+// landed AFTER an operator's RequestStreamStop, overwriting the
+// operator's stop_requested_at with the stream's in-memory state (no
+// stop). For heartbeat writes use [writeStreamStateMergeHeartbeat]
+// instead; it does a read-modify-write that preserves any concurrent
+// StopRequestedAt the operator wrote in the race window.
+//
+// The plain writeStreamState is reserved for paths that legitimately
+// own the entire file content (initial Run setup, takeover with
+// --force).
 func writeStreamState(ctx context.Context, store ir.BackupStore, path string, s *streamState) error {
 	body, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {
 		return fmt.Errorf("stream state: marshal: %w", err)
 	}
 	return store.Put(ctx, path, bytes.NewReader(body))
+}
+
+// writeStreamStateMergeHeartbeat is the heartbeat-write helper that
+// fixes Bug 37's clobber race. The stream's per-rollover heartbeat
+// write needs to advance LastRolloverAt without obliterating any
+// StopRequestedAt the operator's `sluice backup stream stop` wrote in
+// the read-window-followed-by-write-window race.
+//
+// Read-modify-write semantics: read the current file (if any), copy
+// StopRequestedAt forward into the supplied state (so the heartbeat
+// write doesn't clear it), then write. Returns true when a concurrent
+// stop was observed during the merge — callers can use this to
+// short-circuit further heartbeat / state work and trigger a clean
+// exit without the next outer-loop poll having to discover the stop.
+//
+// Limitation: this is a TOCTOU pattern over a non-atomic store. If
+// `RequestStreamStop` writes between this function's read and write,
+// the stop is still lost. The window is much smaller than the original
+// (full-rollover-cadence) clobber window — milliseconds vs seconds —
+// and the in-process channel notification path (registered via
+// [registerStreamStopChan] in stream.go) closes the same-process case
+// entirely. For cross-process operators on shared filesystems the
+// remaining tiny TOCTOU window is bounded by the read/write latency
+// of a single state-file flush; the next rollover-boundary heartbeat
+// gets another chance.
+func writeStreamStateMergeHeartbeat(ctx context.Context, store ir.BackupStore, path string, s *streamState) (stopObserved bool, err error) {
+	prior, err := readStreamState(ctx, store, path)
+	if err != nil {
+		return false, err
+	}
+	if prior != nil && prior.StopRequestedAt != nil && s.StopRequestedAt == nil {
+		s.StopRequestedAt = prior.StopRequestedAt
+		stopObserved = true
+	}
+	if err := writeStreamState(ctx, store, path, s); err != nil {
+		return stopObserved, err
+	}
+	return stopObserved, nil
 }
 
 // readStreamStopRequested returns the StopRequestedAt timestamp from
@@ -240,8 +292,20 @@ func requestStreamStopAt(ctx context.Context, store ir.BackupStore, path string,
 	if err := writeStreamState(ctx, store, path, prior); err != nil {
 		return nil, fmt.Errorf("stream stop: write state file: %w", err)
 	}
+	// In-process notification: when the running stream is in the same
+	// process as RequestStreamStop (CLI single-binary, integration test,
+	// `sync from-backup` consumer holding a stream inline), close the
+	// process-local stop channel so the running captureWindow exits
+	// immediately without waiting for a file-poll tick. No-op when
+	// cross-process (channel is registered per-process, so a stop
+	// command issued on machine B against a stream on machine A finds
+	// no registered channel and the file remains the cross-machine
+	// rendezvous). See [notifyStreamStop] / [registerStreamStopChan]
+	// in stream_stop_registry.go.
+	notified := notifyStreamStop(store)
 	slog.InfoContext(ctx, "bug37: RequestStreamStop wrote state",
 		slog.Int64("tick_unix_ms", time.Now().UnixMilli()),
+		slog.Bool("in_process_signalled", notified),
 	)
 	return prior, nil
 }

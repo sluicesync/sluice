@@ -307,6 +307,13 @@ func (b *BackupStream) Run(ctx context.Context) error {
 		return fmt.Errorf("stream: write initial state: %w", err)
 	}
 
+	// Register the in-process stop channel so a same-process
+	// RequestStreamStop can signal us instantaneously without going
+	// through the file-poll path (Bug 37 fix). Cross-process operators
+	// still go through the file (notifyStreamStop is a no-op for them).
+	stopCh, deregisterStopCh := registerStreamStopChan(b.Store)
+	defer deregisterStopCh()
+
 	slog.InfoContext(ctx, "stream: started",
 		slog.String("source_engine", b.Source.Name()),
 		slog.String("parent_backup_id", parent.BackupID),
@@ -338,7 +345,7 @@ func (b *BackupStream) Run(ctx context.Context) error {
 
 		// Run one rollover.
 		started := clockNow()
-		roll, rErr := b.runRollover(ctx, cdc, changesCh, currentParent, startPos, rolloverWindow, maxChanges, maxBytes, chunkSize, statePath, now, clockNow)
+		roll, rErr := b.runRollover(ctx, cdc, changesCh, currentParent, startPos, rolloverWindow, maxChanges, maxBytes, chunkSize, statePath, now, clockNow, stopCh)
 		elapsed := clockNow().Sub(started)
 		if rErr != nil {
 			// ctx-cancel during a rollover surfaces here. Per the
@@ -398,20 +405,31 @@ func (b *BackupStream) Run(ctx context.Context) error {
 			// Update state file's last_rollover_at as a heartbeat even
 			// when no manifest was committed — operators monitoring the
 			// state file's freshness should see the stream is alive.
+			//
+			// Bug 37 fix: use writeStreamStateMergeHeartbeat (read-
+			// modify-write) so a concurrent stop_requested_at the
+			// operator wrote in the race window between our captureWindow
+			// stop-poll and this heartbeat survives intact. If the merge
+			// observed a stop, exit immediately rather than starting the
+			// next rollover.
 			state.LastRolloverAt = now().UTC()
 			// PHASE-A-DEBUG (Bug 37): heartbeat write on the empty-rollover
-			// path. The in-memory `state` carries no StopRequestedAt; if the
-			// operator's RequestStreamStop wrote stop_requested_at in the race
-			// window between our last poll and this write, this clobbers it.
-			// Removed/demoted in Phase C cleanup.
+			// path. Demoted/removed in Phase C cleanup.
 			slog.InfoContext(ctx, "bug37: heartbeat write (empty rollover)",
 				slog.Int64("tick_unix_ms", time.Now().UnixMilli()),
 				slog.Time("last_rollover_at", state.LastRolloverAt),
 			)
-			if err := writeStreamState(ctx, b.Store, statePath, state); err != nil {
+			stopObserved, err := writeStreamStateMergeHeartbeat(ctx, b.Store, statePath, state)
+			if err != nil {
 				slog.WarnContext(ctx, "stream: failed to update state file after empty rollover",
 					slog.String("err", err.Error()),
 				)
+			}
+			if stopObserved {
+				slog.InfoContext(ctx, "stream: heartbeat merge observed concurrent stop_requested_at; exiting",
+					slog.Int("rollovers", rolloverSeq),
+				)
+				return nil
 			}
 			rolloverSeq++
 			// Source-channel-closed and skip-empty: the source has gone
@@ -455,18 +473,29 @@ func (b *BackupStream) Run(ctx context.Context) error {
 		}
 
 		// Advance state file's last_rollover_at to mark liveness.
+		//
+		// Bug 37 fix: use writeStreamStateMergeHeartbeat (read-modify-
+		// write) so a concurrent stop_requested_at survives. If the
+		// merge observed a stop, exit immediately rather than starting
+		// the next rollover.
 		state.LastRolloverAt = now().UTC()
 		// PHASE-A-DEBUG (Bug 37): heartbeat write on the committed-manifest
-		// path. Same clobber-race shape as the empty-rollover heartbeat
-		// above. Removed/demoted in Phase C cleanup.
+		// path. Demoted/removed in Phase C cleanup.
 		slog.InfoContext(ctx, "bug37: heartbeat write (committed rollover)",
 			slog.Int64("tick_unix_ms", time.Now().UnixMilli()),
 			slog.Time("last_rollover_at", state.LastRolloverAt),
 		)
-		if err := writeStreamState(ctx, b.Store, statePath, state); err != nil {
+		stopObserved, hbErr := writeStreamStateMergeHeartbeat(ctx, b.Store, statePath, state)
+		if hbErr != nil {
 			slog.WarnContext(ctx, "stream: failed to update state file after rollover commit",
-				slog.String("err", err.Error()),
+				slog.String("err", hbErr.Error()),
 			)
+		}
+		if stopObserved {
+			slog.InfoContext(ctx, "stream: heartbeat merge observed concurrent stop_requested_at; exiting after committed rollover",
+				slog.Int("rollovers", rolloverSeq),
+			)
+			return nil
 		}
 
 		slog.InfoContext(ctx, "stream rollover committed",
@@ -589,6 +618,7 @@ func (b *BackupStream) runRollover(
 	statePath string,
 	now func() time.Time,
 	clockNow func() time.Time,
+	stopCh <-chan struct{},
 ) (rolloverOutcome, error) {
 	beforeSchema := parent.Schema
 	beforeHash, hashErr := ir.ComputeSchemaHash(beforeSchema)
@@ -613,7 +643,7 @@ func (b *BackupStream) runRollover(
 	}
 
 	deadline := clockNow().Add(window)
-	captured, captureErr := b.captureWindow(ctx, cdc, changesCh, manifest, chunkSize, deadline, maxChanges, maxBytes, statePath, clockNow)
+	captured, captureErr := b.captureWindow(ctx, cdc, changesCh, manifest, chunkSize, deadline, maxChanges, maxBytes, statePath, clockNow, stopCh)
 	out := rolloverOutcome{
 		TotalChanges:  captured.TotalChanges,
 		TotalBytes:    captured.TotalBytes,
@@ -669,8 +699,8 @@ type captureOutcome struct {
 
 // captureWindow drains changes from changesCh into chunks staged on
 // manifest, closing on the first of: deadline reached, totalChanges ≥
-// maxChanges, totalBytes ≥ maxBytes, or a cross-machine stop request
-// observed via `stream_state.json`. Mirrors
+// maxChanges, totalBytes ≥ maxBytes, an in-process stop signal, or a
+// cross-machine stop request observed via `stream_state.json`. Mirrors
 // [IncrementalBackup.captureWindow] but adds a byte-bound, an in-loop
 // stop poll (decoupled from rollover cadence), and tracks totalBytes
 // across chunks for the rollover-hook env contract.
@@ -679,17 +709,33 @@ type captureOutcome struct {
 // without TxCommit) extends the window by up to one transaction so the
 // chain doesn't end mid-tx — same as Phase 3.1.
 //
-// Stop-request poll cadence: [streamStopPollInterval] (1 s by default,
-// regardless of the rollover-window). The poll reads `stream_state.json`'s
-// `stop_requested_at` field directly; on first observation, the
-// in-flight rollover flushes (commits chunks staged so far — may be a
-// partial mid-transaction chunk) and returns IMMEDIATELY with
-// [captureOutcome.StopRequested]=true so the outer loop can finalise
-// the manifest and exit cleanly. Eager exit (rather than wait-for-
-// next-tx-boundary) is load-bearing: on a quiet source the next tx
-// boundary may never arrive within the operator's drain budget. The
-// chain may end mid-tx in the stop case; this is the correct trade —
-// operator issued stop, exit promptly.
+// Two stop-signal paths (Bug 37 fix; v0.19.1):
+//
+//  1. **In-process channel** (`stopCh`). Closed by [notifyStreamStop]
+//     when [RequestStreamStop] runs in the same Go process. Detected
+//     via the new select case immediately; bypasses file I/O entirely
+//     so it can't be starved or clobbered. The integration tests
+//     (`pipeline.RequestStreamStop` in the same process as the running
+//     stream) take this path; CLI single-binary subcommand setups also
+//     register against the same registry.
+//
+//  2. **File poll** ([streamStopPollInterval], 1 s by default). Reads
+//     `stream_state.json`'s `stop_requested_at` field. The cross-
+//     machine rendezvous: an operator on machine B running
+//     `sluice backup stream stop --target=<url>` against a stream on
+//     machine A only has the file path. The poll cadence is decoupled
+//     from rollover-window so observation is bounded by ~1 s
+//     regardless of the (typically minutes-long) rollover-window
+//     setting.
+//
+// On first observation via either path, the in-flight rollover flushes
+// (commits chunks staged so far — may be a partial mid-transaction
+// chunk) and returns IMMEDIATELY with [captureOutcome.StopRequested]=
+// true so the outer loop can finalise the manifest and exit cleanly.
+// Eager exit (rather than wait-for-next-tx-boundary) is load-bearing:
+// on a quiet source the next tx boundary may never arrive within the
+// operator's drain budget. The chain may end mid-tx in the stop case;
+// this is the correct trade — operator issued stop, exit promptly.
 //
 // Returns the captured outcome and any fatal error.
 func (b *BackupStream) captureWindow(
@@ -703,6 +749,7 @@ func (b *BackupStream) captureWindow(
 	maxBytes int64,
 	statePath string,
 	clockNow func() time.Time,
+	stopCh <-chan struct{},
 ) (captureOutcome, error) {
 	var (
 		writer        *changeChunkWriter
@@ -784,6 +831,23 @@ func (b *BackupStream) captureWindow(
 				flushCancel()
 			}
 			return out, ctx.Err()
+		case <-stopCh:
+			// In-process stop signal (Bug 37 fix; v0.19.1). Closed by
+			// [notifyStreamStop] when [RequestStreamStop] runs in the
+			// same Go process. No file I/O, no select-loop starvation,
+			// no clobber-race window — same-process operators get
+			// instantaneous observation. Cross-process operators take
+			// the file-poll path below; this case is just a no-op for
+			// them (their stopCh is never closed by a remote process).
+			slog.InfoContext(ctx, "bug37: captureWindow select fired",
+				slog.String("case", "in_process_stop"),
+				slog.Int64("tick_unix_ms", time.Now().UnixMilli()),
+			)
+			out.StopRequested = true
+			if err := flush(); err != nil {
+				return out, err
+			}
+			return out, nil
 		case <-timer.C:
 			// PHASE-A-DEBUG (Bug 37): instrument which select case fires
 			// on CI under -race. Removed/demoted in Phase C cleanup.

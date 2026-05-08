@@ -161,6 +161,97 @@ func TestPreflightStreamState_SameProcessRestart_Bypasses(t *testing.T) {
 	}
 }
 
+// TestWriteStreamStateMergeHeartbeat_PreservesStop pins the Bug 37 fix:
+// the heartbeat write must NOT clobber a concurrent stop_requested_at
+// written by RequestStreamStop in the race window. Pre-fix the in-memory
+// `state` (no StopRequestedAt) overwrote whatever was on disk; post-fix
+// the merge helper does a read-modify-write that copies StopRequestedAt
+// forward.
+func TestWriteStreamStateMergeHeartbeat_PreservesStop(t *testing.T) {
+	dir := t.TempDir()
+	store, _ := NewLocalStore(dir)
+	t0 := time.Date(2026, 5, 8, 10, 0, 0, 0, time.UTC)
+	stop := t0.Add(-time.Second) // operator wrote stop just before our heartbeat
+
+	// Simulate the operator's RequestStreamStop having landed already:
+	// state file carries stop_requested_at + the previous heartbeat.
+	priorOnDisk := &streamState{
+		PID: 1234, Host: "h",
+		StartedAt:       t0.Add(-time.Minute),
+		LastRolloverAt:  t0.Add(-30 * time.Second),
+		StopRequestedAt: &stop,
+	}
+	if err := writeStreamState(context.Background(), store, DefaultStreamStateFilename, priorOnDisk); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	// Stream's heartbeat-write payload: in-memory state, no
+	// StopRequestedAt (the stream's main goroutine doesn't track that
+	// field). Pre-fix this would have clobbered the operator's stop.
+	heartbeat := &streamState{
+		PID: 1234, Host: "h",
+		StartedAt:      t0.Add(-time.Minute),
+		LastRolloverAt: t0,
+	}
+	stopObserved, err := writeStreamStateMergeHeartbeat(context.Background(), store, DefaultStreamStateFilename, heartbeat)
+	if err != nil {
+		t.Fatalf("writeStreamStateMergeHeartbeat: %v", err)
+	}
+	if !stopObserved {
+		t.Errorf("stopObserved = false; want true (concurrent stop_requested_at present on disk)")
+	}
+
+	got, err := readStreamState(context.Background(), store, DefaultStreamStateFilename)
+	if err != nil {
+		t.Fatalf("readStreamState: %v", err)
+	}
+	if got.StopRequestedAt == nil {
+		t.Fatal("stop_requested_at = nil after heartbeat merge; want preserved (Bug 37 clobber bug)")
+	}
+	if !got.StopRequestedAt.Equal(stop) {
+		t.Errorf("stop_requested_at = %v; want %v (operator's value)", *got.StopRequestedAt, stop)
+	}
+	if !got.LastRolloverAt.Equal(t0) {
+		t.Errorf("last_rollover_at = %v; want %v (heartbeat advanced it)", got.LastRolloverAt, t0)
+	}
+}
+
+// TestWriteStreamStateMergeHeartbeat_NoStopReturnsFalse pins the
+// happy-path heartbeat: when no concurrent stop is on disk, the merge
+// returns stopObserved=false and the file simply gets the new
+// LastRolloverAt.
+func TestWriteStreamStateMergeHeartbeat_NoStopReturnsFalse(t *testing.T) {
+	dir := t.TempDir()
+	store, _ := NewLocalStore(dir)
+	t0 := time.Date(2026, 5, 8, 10, 0, 0, 0, time.UTC)
+
+	prior := &streamState{
+		PID: 1234, Host: "h",
+		StartedAt:      t0.Add(-time.Minute),
+		LastRolloverAt: t0.Add(-time.Second),
+	}
+	if err := writeStreamState(context.Background(), store, DefaultStreamStateFilename, prior); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	heartbeat := &streamState{
+		PID: 1234, Host: "h",
+		StartedAt:      t0.Add(-time.Minute),
+		LastRolloverAt: t0,
+	}
+	stopObserved, err := writeStreamStateMergeHeartbeat(context.Background(), store, DefaultStreamStateFilename, heartbeat)
+	if err != nil {
+		t.Fatalf("writeStreamStateMergeHeartbeat: %v", err)
+	}
+	if stopObserved {
+		t.Errorf("stopObserved = true; want false (no concurrent stop on disk)")
+	}
+	got, _ := readStreamState(context.Background(), store, DefaultStreamStateFilename)
+	if got.StopRequestedAt != nil {
+		t.Errorf("stop_requested_at = %v; want nil (none was set)", *got.StopRequestedAt)
+	}
+}
+
 // TestRequestStreamStop_Roundtrip verifies the cross-machine stop path:
 // write stop_requested_at, observe via readStreamStopRequested.
 func TestRequestStreamStop_Roundtrip(t *testing.T) {
