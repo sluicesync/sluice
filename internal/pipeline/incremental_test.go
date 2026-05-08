@@ -5,7 +5,10 @@ package pipeline
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"io"
 	"strings"
 	"testing"
 	"time"
@@ -509,5 +512,165 @@ func TestIncrementalBackup_UnknownParentRef(t *testing.T) {
 	err := b.Run(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "doesnotexist") {
 		t.Errorf("err = %v; want clear unknown-parent error", err)
+	}
+}
+
+// TestIncrementalBackup_TwoIncrementals_NoChunkCollision is the
+// regression for Bug 35 from the v0.17.0 cycle. Pre-fix, both
+// incrementals' change chunks landed at the same path
+// (`chunks/_changes/changes-0.jsonl.gz`) — the second overwrote the
+// first on disk while the manifests still referenced the original
+// SHA-256, so chain restore + `backup verify` both failed with
+// `chunk SHA-256 mismatch`.
+//
+// The fix namespaces chunk paths under a per-incremental segment so
+// the two incrementals' chunks coexist on disk. This test pins:
+//
+//   - the two incrementals' recorded chunk paths are distinct;
+//   - both files exist on the store after both runs;
+//   - each manifest's recorded SHA-256 matches the bytes on disk
+//     (the chain-restore failure mode pre-fix was exactly the SHA-256
+//     mismatch that this assertion guards against).
+func TestIncrementalBackup_TwoIncrementals_NoChunkCollision(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewLocalStore(dir)
+	if err != nil {
+		t.Fatalf("NewLocalStore: %v", err)
+	}
+
+	schema := &ir.Schema{Tables: []*ir.Table{{
+		Name:    "users",
+		Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}},
+	}}}
+
+	parent := &ir.Manifest{
+		FormatVersion: ir.BackupFormatVersion,
+		CreatedAt:     time.Date(2026, 5, 8, 10, 0, 0, 0, time.UTC),
+		SourceEngine:  "postgres",
+		Schema:        schema,
+		Kind:          ir.BackupKindFull,
+		EndPosition:   ir.Position{Engine: "postgres", Token: `{"slot":"sluice_slot","lsn":"0/100"}`},
+		PartialState:  ir.BackupStateComplete,
+	}
+	parent.BackupID = ir.ComputeBackupID(parent)
+	writeParentFullManifest(t, store, parent)
+
+	// Helper: drive one incremental against `store`, parented on
+	// `parentID`, with a single insert at the given LSN and a pinned
+	// CreatedAt so the run namespace is deterministic per-call.
+	runIncr := func(t *testing.T, parentID, lsn string, createdAt time.Time) *ir.Manifest {
+		t.Helper()
+		src := &fakeCDCEngine{
+			name:           "postgres",
+			schemaSequence: []*ir.Schema{schema},
+			cdcChanges: []ir.Change{
+				ir.Insert{
+					Position: ir.Position{Engine: "postgres", Token: lsn},
+					Table:    "users",
+					Row:      ir.Row{"id": int64(1)},
+				},
+			},
+		}
+		b := &IncrementalBackup{
+			Source:        src,
+			SourceDSN:     "src",
+			Store:         store,
+			ParentRef:     parentID,
+			Window:        5 * time.Minute,
+			ChunkChanges:  10,
+			SluiceVersion: "test",
+			Now:           func() time.Time { return createdAt },
+			clockNow:      func() time.Time { return createdAt },
+		}
+		if err := b.Run(context.Background()); err != nil {
+			t.Fatalf("incremental Run: %v", err)
+		}
+		records, err := listAllManifests(context.Background(), store)
+		if err != nil {
+			t.Fatalf("listAllManifests: %v", err)
+		}
+		// Pick the most recent incremental.
+		var newest *ir.Manifest
+		for _, r := range records {
+			if r.manifest.Kind != ir.BackupKindIncremental {
+				continue
+			}
+			if newest == nil || r.manifest.CreatedAt.After(newest.CreatedAt) {
+				newest = r.manifest
+			}
+		}
+		if newest == nil {
+			t.Fatal("no incremental manifest written")
+		}
+		return newest
+	}
+
+	// First incremental: chained off the full.
+	incr1 := runIncr(t, parent.BackupID, `{"slot":"sluice_slot","lsn":"0/110"}`,
+		time.Date(2026, 5, 8, 11, 0, 0, 0, time.UTC))
+	if len(incr1.ChangeChunks) != 1 {
+		t.Fatalf("incr1 ChangeChunks = %d; want 1", len(incr1.ChangeChunks))
+	}
+	// Second incremental: chained off the first (so both manifests are
+	// linked into a single chain, mirroring the bug repro).
+	incr2 := runIncr(t, incr1.BackupID, `{"slot":"sluice_slot","lsn":"0/120"}`,
+		time.Date(2026, 5, 8, 11, 0, 1, 0, time.UTC)) // 1 second later → distinct UnixMilli
+	if len(incr2.ChangeChunks) != 1 {
+		t.Fatalf("incr2 ChangeChunks = %d; want 1", len(incr2.ChangeChunks))
+	}
+
+	path1 := incr1.ChangeChunks[0].File
+	path2 := incr2.ChangeChunks[0].File
+	if path1 == path2 {
+		t.Fatalf("change-chunk path collision: incr1 and incr2 both reference %q (Bug 35 regression)", path1)
+	}
+	if !strings.HasPrefix(path1, changeChunksPrefix) || !strings.HasPrefix(path2, changeChunksPrefix) {
+		t.Errorf("paths not under change-chunks prefix: %q, %q", path1, path2)
+	}
+
+	// Both files exist on the store and their recorded SHA-256 matches
+	// the bytes on disk. Pre-fix, path1 == path2 and the file's content
+	// was incr2's, so incr1's recorded SHA-256 mismatched what was on disk.
+	for label, info := range map[string]*ir.ChunkInfo{"incr1": incr1.ChangeChunks[0], "incr2": incr2.ChangeChunks[0]} {
+		exists, err := store.Exists(context.Background(), info.File)
+		if err != nil {
+			t.Fatalf("%s: store.Exists(%q): %v", label, info.File, err)
+		}
+		if !exists {
+			t.Fatalf("%s: chunk file %q missing on disk", label, info.File)
+		}
+		rc, err := store.Get(context.Background(), info.File)
+		if err != nil {
+			t.Fatalf("%s: store.Get(%q): %v", label, info.File, err)
+		}
+		h := sha256.New()
+		if _, err := io.Copy(h, rc); err != nil {
+			_ = rc.Close()
+			t.Fatalf("%s: read %q: %v", label, info.File, err)
+		}
+		_ = rc.Close()
+		got := hex.EncodeToString(h.Sum(nil))
+		if got != info.SHA256 {
+			t.Errorf("%s: chunk %q SHA-256 mismatch: manifest=%s, on-disk=%s",
+				label, info.File, info.SHA256, got)
+		}
+	}
+}
+
+// TestChangeChunkPath_RunNamespaceShape pins the per-run namespace
+// shape so a future refactor that drops it accidentally re-opens
+// Bug 35.
+func TestChangeChunkPath_RunNamespaceShape(t *testing.T) {
+	m := &ir.Manifest{CreatedAt: time.Date(2026, 5, 8, 11, 0, 0, 0, time.UTC)}
+	ns := changeChunkRunNamespace(m)
+	got := changeChunkPath(ns, 0)
+	want := "chunks/_changes/" + ns + "/changes-0.jsonl.gz"
+	if got != want {
+		t.Errorf("changeChunkPath = %q; want %q", got, want)
+	}
+	// Two manifests with distinct CreatedAt produce distinct namespaces.
+	m2 := &ir.Manifest{CreatedAt: m.CreatedAt.Add(1 * time.Millisecond)}
+	if changeChunkRunNamespace(m2) == ns {
+		t.Errorf("manifests one millisecond apart collide on namespace %q", ns)
 	}
 }

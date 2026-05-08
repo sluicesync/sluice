@@ -414,6 +414,18 @@ func (b *IncrementalBackup) captureWindow(
 		inTransaction bool
 	)
 
+	// runNamespace is the per-incremental directory segment chunks land
+	// under. Without it, a second incremental into the same store would
+	// reuse `chunks/_changes/changes-0.jsonl.gz` and overwrite the
+	// first's chunk on disk while the manifests still recorded the
+	// original SHA-256 — a chain-restore + verify hard failure (Bug 35
+	// from the v0.17.0 cycle). The namespace is derived from
+	// manifest.CreatedAt because BackupID isn't computable yet (it
+	// depends on EndPosition, which is only known once the window
+	// closes); CreatedAt is fixed when the manifest is constructed and
+	// uniquely identifies a Run() invocation in practice.
+	runNamespace := changeChunkRunNamespace(manifest)
+
 	flush := func() error {
 		if writer == nil {
 			return nil
@@ -421,7 +433,7 @@ func (b *IncrementalBackup) captureWindow(
 		if err := writer.Close(); err != nil {
 			return fmt.Errorf("close chunk: %w", err)
 		}
-		path := changeChunkPath(chunkIdx)
+		path := changeChunkPath(runNamespace, chunkIdx)
 		hash := writer.Hash()
 		if err := b.Store.Put(ctx, path, buf); err != nil {
 			return fmt.Errorf("store put %q: %w", path, err)
@@ -535,10 +547,36 @@ func (b *IncrementalBackup) captureWindow(
 }
 
 // changeChunkPath returns the conventional path of change chunk
-// index. Lives under [changeChunksPrefix] so the row-chunk path's
-// `chunks/<table>/...` shape doesn't collide.
-func changeChunkPath(idx int) string {
-	return fmt.Sprintf("%schanges-%d.jsonl.gz", changeChunksPrefix, idx)
+// index for a given run-namespace segment. Lives under
+// [changeChunksPrefix]/<runNamespace>/ so two incrementals into the
+// same store don't collide on the file basename. See Bug 35 in
+// `sluice-testing/BUG-CATALOG.md`.
+//
+// The legacy un-namespaced shape (`chunks/_changes/changes-N.jsonl.gz`)
+// is no longer written. v0.17.0-vintage backup directories with the
+// flat layout still restore correctly because the chain-restore path
+// reads `chunk.File` verbatim from the manifest — the manifest's
+// recorded path is the source of truth for reads regardless of which
+// shape produced it.
+func changeChunkPath(runNamespace string, idx int) string {
+	return fmt.Sprintf("%s%s/changes-%d.jsonl.gz", changeChunksPrefix, runNamespace, idx)
+}
+
+// changeChunkRunNamespace returns the per-Run() namespace segment for
+// change-chunk paths. Derived from the manifest's CreatedAt rendered
+// as a 13-digit zero-padded UnixMilli — same encoding
+// [buildIncrementalManifestPath] uses for the manifest filename, so
+// operators inspecting the directory see the same lexically-sortable
+// prefix on the manifest and its chunks.
+//
+// CreatedAt is preferred over BackupID because BackupID isn't
+// computable until EndPosition is known (i.e. after the window
+// closes), but chunks need a stable namespace before the first write.
+// Two Run() invocations colliding on UnixMilli is implausible: a Run
+// constructs a manifest, then opens a CDC stream, then writes chunks —
+// not two such pipelines fit in one millisecond on real hardware.
+func changeChunkRunNamespace(m *ir.Manifest) string {
+	return fmt.Sprintf("%013d", m.CreatedAt.UTC().UnixMilli())
 }
 
 // buildIncrementalManifestPath returns the conventional relative
