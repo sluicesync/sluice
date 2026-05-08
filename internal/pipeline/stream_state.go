@@ -28,6 +28,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"time"
 
 	"github.com/orware/sluice/internal/ir"
@@ -227,8 +228,20 @@ func requestStreamStopAt(ctx context.Context, store ir.BackupStore, path string,
 		t := now.UTC()
 		prior.StopRequestedAt = &t
 	}
+	// PHASE-A-DEBUG (Bug 37): stop-write entry/exit so we can correlate
+	// against the stream's heartbeat writes in the test logs and confirm
+	// hypothesis (c) — heartbeat clobbering stop_requested_at. Removed/
+	// demoted in Phase C cleanup.
+	slog.InfoContext(ctx, "bug37: RequestStreamStop writing state",
+		slog.Int64("tick_unix_ms", time.Now().UnixMilli()),
+		slog.Time("stop_requested_at", *prior.StopRequestedAt),
+		slog.Time("prior_last_rollover_at", prior.LastRolloverAt),
+	)
 	if err := writeStreamState(ctx, store, path, prior); err != nil {
 		return nil, fmt.Errorf("stream stop: write state file: %w", err)
 	}
+	slog.InfoContext(ctx, "bug37: RequestStreamStop wrote state",
+		slog.Int64("tick_unix_ms", time.Now().UnixMilli()),
+	)
 	return prior, nil
 }

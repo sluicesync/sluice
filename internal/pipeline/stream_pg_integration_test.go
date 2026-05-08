@@ -24,7 +24,6 @@ package pipeline
 import (
 	"context"
 	"fmt"
-	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -200,15 +199,12 @@ func TestBackupStream_Postgres_RolloverByMaxChanges(t *testing.T) {
 //
 // Acceptance criterion 7.
 //
-// SKIPPED ON CI pending Bug 37 investigation. Local runs pass in ~6s;
-// CI under -race consistently exceeds even a 60s budget, suggesting a
-// structural stop-signal observation issue (eager-exit path doesn't
-// fire OR stream_state.json read is starved under -race goroutine
-// contention). Tracked as Bug 37; v0.19.1 will close it.
+// PHASE-A-DEBUG (Bug 37, v0.19.1): re-enabled on CI for the
+// investigation phase; the bug37: log lines emitted from
+// captureWindow + RequestStreamStop are needed to confirm the
+// heartbeat-clobber hypothesis (option c). Phase B's fix re-tightens
+// the test on CI; Phase C demotes the debug logs.
 func TestBackupStream_Postgres_StopCommandRequestsExit(t *testing.T) {
-	if os.Getenv("CI") != "" {
-		t.Skip("skipped on CI pending Bug 37 investigation; runs locally")
-	}
 	sourceDSN, _, cleanup := startPostgresLogical(t)
 	defer cleanup()
 
@@ -281,15 +277,6 @@ func TestBackupStream_Postgres_StopCommandRequestsExit(t *testing.T) {
 		t.Fatal("stream.Run did not exit within 60s of stop request")
 	}
 }
-
-// init: skip TestBackupStream_Postgres_StopCommandRequestsExit on CI
-// pending Bug 37 investigation. Local runs pass in ~6s; CI under -race
-// consistently exceeds even a 60s budget, suggesting a structural
-// stop-signal observation issue (the eager-exit path in cb9a5f8 doesn't
-// fire on CI, OR the stop_state.json read is starved by other goroutines
-// under -race contention). Tracked as Bug 37 in sluice-testing's
-// BUG-CATALOG; v0.19.1 will close it. Local development still exercises
-// the test on every push.
 
 // TestBackupStream_Postgres_ConcurrentWriterRefused exercises the
 // concurrent-writer protection: start one stream, attempt a second

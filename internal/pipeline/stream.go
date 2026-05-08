@@ -399,6 +399,15 @@ func (b *BackupStream) Run(ctx context.Context) error {
 			// when no manifest was committed — operators monitoring the
 			// state file's freshness should see the stream is alive.
 			state.LastRolloverAt = now().UTC()
+			// PHASE-A-DEBUG (Bug 37): heartbeat write on the empty-rollover
+			// path. The in-memory `state` carries no StopRequestedAt; if the
+			// operator's RequestStreamStop wrote stop_requested_at in the race
+			// window between our last poll and this write, this clobbers it.
+			// Removed/demoted in Phase C cleanup.
+			slog.InfoContext(ctx, "bug37: heartbeat write (empty rollover)",
+				slog.Int64("tick_unix_ms", time.Now().UnixMilli()),
+				slog.Time("last_rollover_at", state.LastRolloverAt),
+			)
 			if err := writeStreamState(ctx, b.Store, statePath, state); err != nil {
 				slog.WarnContext(ctx, "stream: failed to update state file after empty rollover",
 					slog.String("err", err.Error()),
@@ -447,6 +456,13 @@ func (b *BackupStream) Run(ctx context.Context) error {
 
 		// Advance state file's last_rollover_at to mark liveness.
 		state.LastRolloverAt = now().UTC()
+		// PHASE-A-DEBUG (Bug 37): heartbeat write on the committed-manifest
+		// path. Same clobber-race shape as the empty-rollover heartbeat
+		// above. Removed/demoted in Phase C cleanup.
+		slog.InfoContext(ctx, "bug37: heartbeat write (committed rollover)",
+			slog.Int64("tick_unix_ms", time.Now().UnixMilli()),
+			slog.Time("last_rollover_at", state.LastRolloverAt),
+		)
 		if err := writeStreamState(ctx, b.Store, statePath, state); err != nil {
 			slog.WarnContext(ctx, "stream: failed to update state file after rollover commit",
 				slog.String("err", err.Error()),
@@ -769,6 +785,14 @@ func (b *BackupStream) captureWindow(
 			}
 			return out, ctx.Err()
 		case <-timer.C:
+			// PHASE-A-DEBUG (Bug 37): instrument which select case fires
+			// on CI under -race. Removed/demoted in Phase C cleanup.
+			slog.InfoContext(ctx, "bug37: captureWindow select fired",
+				slog.String("case", "timer"),
+				slog.Int64("tick_unix_ms", time.Now().UnixMilli()),
+				slog.Int64("changes_so_far", out.TotalChanges),
+				slog.Bool("in_transaction", inTransaction),
+			)
 			deadlinePassed = true
 			if !inTransaction {
 				if err := flush(); err != nil {
@@ -789,7 +813,21 @@ func (b *BackupStream) captureWindow(
 			if out.StopRequested {
 				continue
 			}
+			pollStart := time.Now()
 			req, sErr := readStreamStopRequested(ctx, b.Store, statePath)
+			pollElapsed := time.Since(pollStart)
+			// PHASE-A-DEBUG (Bug 37): observe stop-poll timing + outcome.
+			// Read elapsed time + presence of stop_requested_at; needed to
+			// distinguish hypothesis (a) starvation, (b) Get blocking, and
+			// (c) Get returning OLD state. Removed/demoted in Phase C.
+			stopSeen := req != nil
+			slog.InfoContext(ctx, "bug37: captureWindow select fired",
+				slog.String("case", "stop_poll"),
+				slog.Int64("tick_unix_ms", time.Now().UnixMilli()),
+				slog.Duration("get_elapsed", pollElapsed),
+				slog.Bool("stop_seen", stopSeen),
+				slog.Bool("read_err", sErr != nil),
+			)
 			if sErr != nil {
 				slog.WarnContext(ctx, "stream: stop-poll read failed; will retry on next tick",
 					slog.String("err", sErr.Error()),
@@ -805,6 +843,18 @@ func (b *BackupStream) captureWindow(
 			}
 			return out, nil
 		case change, ok := <-changesCh:
+			// PHASE-A-DEBUG (Bug 37): observe changesCh activity. If the
+			// channel is constantly ready we'd expect the select to bias
+			// toward this case under starvation (hypothesis a). Removed
+			// in Phase C cleanup.
+			if !ok || out.TotalChanges < 5 {
+				slog.InfoContext(ctx, "bug37: captureWindow select fired",
+					slog.String("case", "changes_ch"),
+					slog.Int64("tick_unix_ms", time.Now().UnixMilli()),
+					slog.Bool("channel_open", ok),
+					slog.Int64("changes_so_far", out.TotalChanges),
+				)
+			}
 			if !ok {
 				out.SourceClosed = true
 				if errReader, ok := cdc.(interface{ Err() error }); ok {
