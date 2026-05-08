@@ -94,31 +94,19 @@ func (a *ChangeApplier) ApplyBatch(ctx context.Context, streamID string, changes
 		return a.Apply(ctx, streamID, changes)
 	}
 
-	var totalApplied int
 	for {
 		batchN, lastPos, channelClosed, err := a.applyOneBatch(ctx, streamID, changes, maxBatchSize)
 		if err != nil {
-			slog.InfoContext(ctx, "MYSQL-APPLIER-DBG: ApplyBatch ERROR",
-				slog.String("stream_id", streamID),
-				slog.Int("total_applied_so_far", totalApplied),
-				slog.String("err", err.Error()),
-			)
 			return err
 		}
-		totalApplied += batchN
 		if batchN > 0 {
-			slog.InfoContext(ctx, "MYSQL-APPLIER-DBG: batch committed",
+			slog.DebugContext(ctx, "mysql: applier: batch committed",
 				slog.String("stream_id", streamID),
 				slog.Int("rows", batchN),
-				slog.Int("total_applied", totalApplied),
 				slog.String("position_token", truncateBatchToken(lastPos.Token, 80)),
 			)
 		}
 		if channelClosed {
-			slog.InfoContext(ctx, "MYSQL-APPLIER-DBG: ApplyBatch channel closed",
-				slog.String("stream_id", streamID),
-				slog.Int("total_applied", totalApplied),
-			)
 			return nil
 		}
 	}

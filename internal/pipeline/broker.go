@@ -473,23 +473,13 @@ func (b *SyncFromBackup) coldStart(ctx context.Context, applier ir.ChangeApplier
 // + every incremental currently in the store, then records the
 // chain's tail BackupID as the broker's resume floor.
 func (b *SyncFromBackup) coldStartReset(ctx context.Context, applier ir.ChangeApplier) (string, error) {
-	slog.InfoContext(ctx, "BROKER-DBG: coldStartReset ENTRY",
-		slog.String("stream_id", b.StreamID),
-	)
 	chain, err := buildChain(ctx, b.Store)
 	if err != nil {
-		slog.InfoContext(ctx, "BROKER-DBG: coldStartReset buildChain ERROR",
-			slog.String("err", err.Error()),
-		)
 		return "", wrapWithHint(PhaseConnect, fmt.Errorf("broker: build chain: %w", err))
 	}
 	if len(chain) == 0 {
-		slog.InfoContext(ctx, "BROKER-DBG: coldStartReset empty chain")
 		return "", errors.New("broker: chain is empty; cannot --reset-target-data with no full backup in store")
 	}
-	slog.InfoContext(ctx, "BROKER-DBG: coldStartReset chain built",
-		slog.Int("chain_len", len(chain)),
-	)
 	rest := &ChainRestore{
 		Target:         b.Target,
 		TargetDSN:      b.TargetDSN,
@@ -497,24 +487,13 @@ func (b *SyncFromBackup) coldStartReset(ctx context.Context, applier ir.ChangeAp
 		MaxBufferBytes: b.MaxBufferBytes,
 		ApplyBatchSize: b.ApplyBatchSize,
 	}
-	slog.InfoContext(ctx, "BROKER-DBG: coldStartReset calling ChainRestore.Run")
 	if err := rest.Run(ctx); err != nil {
-		slog.InfoContext(ctx, "BROKER-DBG: coldStartReset ChainRestore.Run FAILED",
-			slog.String("err", err.Error()),
-		)
 		return "", fmt.Errorf("broker: chain restore failed: %w", err)
 	}
-	slog.InfoContext(ctx, "BROKER-DBG: coldStartReset ChainRestore.Run OK")
 	tailID := manifestBackupID(chain[len(chain)-1].manifest)
 	if err := b.writePositionDirect(ctx, applier, tailID); err != nil {
-		slog.InfoContext(ctx, "BROKER-DBG: coldStartReset writePositionDirect FAILED",
-			slog.String("err", err.Error()),
-		)
 		return "", fmt.Errorf("broker: record post-restore position: %w", err)
 	}
-	slog.InfoContext(ctx, "BROKER-DBG: coldStartReset writePositionDirect OK",
-		slog.String("tail_backup_id", tailID),
-	)
 	slog.InfoContext(ctx, "broker: cold start complete; transitioning to live polling",
 		slog.String("stream_id", b.StreamID),
 		slog.String("tail_backup_id", tailID),
@@ -608,22 +587,11 @@ func (b *SyncFromBackup) replayNewIncrementals(
 	if err != nil {
 		return "", 0, fmt.Errorf("build chain: %w", err)
 	}
-	// PHASE-A INSTRUMENTATION (v0.20.0 fix-up): trace chain shape per tick.
-	{
-		ids := make([]string, 0, len(chain))
-		kinds := make([]string, 0, len(chain))
-		for _, link := range chain {
-			ids = append(ids, manifestBackupID(link.manifest))
-			kinds = append(kinds, string(link.manifest.Kind))
-		}
-		slog.InfoContext(ctx, "BROKER-DBG: replayNewIncrementals chain snapshot",
-			slog.String("stream_id", b.StreamID),
-			slog.String("last_applied", lastAppliedID),
-			slog.Int("chain_len", len(chain)),
-			slog.String("chain_ids", strings.Join(ids, ",")),
-			slog.String("chain_kinds", strings.Join(kinds, ",")),
-		)
-	}
+	slog.DebugContext(ctx, "broker: replay tick chain snapshot",
+		slog.String("stream_id", b.StreamID),
+		slog.String("last_applied", lastAppliedID),
+		slog.Int("chain_len", len(chain)),
+	)
 	if len(chain) == 0 {
 		return "", 0, nil
 	}
@@ -673,24 +641,8 @@ func (b *SyncFromBackup) replayNewIncrementals(
 		if link.manifest.Kind == ir.BackupKindFull || link.manifest.Kind == "" {
 			continue
 		}
-		var manifestRowCount int64
-		for _, c := range link.manifest.ChangeChunks {
-			manifestRowCount += c.RowCount
-		}
-		slog.InfoContext(ctx, "BROKER-DBG: applyIncremental BEGIN",
-			slog.String("stream_id", b.StreamID),
-			slog.String("backup_id", manifestBackupID(link.manifest)),
-			slog.Int("chunks", len(link.manifest.ChangeChunks)),
-			slog.Int64("manifest_row_count", manifestRowCount),
-			slog.Int("schema_deltas", len(link.manifest.SchemaDelta)),
-		)
 		bytesApplied, applyErr := b.applyIncremental(ctx, applier, link, batchSize)
 		if applyErr != nil {
-			slog.InfoContext(ctx, "BROKER-DBG: applyIncremental ERROR",
-				slog.String("stream_id", b.StreamID),
-				slog.String("backup_id", manifestBackupID(link.manifest)),
-				slog.String("err", applyErr.Error()),
-			)
 			return newApplied, totalBytes, fmt.Errorf("incremental %s: %w",
 				manifestBackupID(link.manifest), applyErr)
 		}
