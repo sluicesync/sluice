@@ -6,6 +6,32 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-05-07
+
+Closes the v0.17.2-documented "during-backup write window" gap. v0.17.x full backups recorded `EndPosition` at end-of-backup with no shared snapshot across tables — writes that landed on already-read tables before the position capture were missing from BOTH the row chunks AND the first incremental's `--since=<full>.EndPosition` window. v0.18.0 wires the full-backup row sweep into a snapshot-anchored consistent view and captures `EndPosition` at snapshot START, so the chain's next link's CDC stream from `EndPosition` forward picks up every write after the snapshot. Backup-only DR (no continuous `sluice sync start` paired) is now byte-perfect under heavy write load.
+
+### Added
+
+- **`ir.BackupSnapshotOpener` optional engine surface.** Returns an `ir.BackupSnapshot` bundle: snapshot-anchor `Position` + a snapshot-pinned `RowReader` + a cleanup closure. Engines that implement it get cross-table snapshot consistency plus a snapshot-anchored `EndPosition` for free; engines that don't fall back to the v0.17.x `BackupPositionCapturer` path with a soft `WARN` log line surfacing the during-backup window gap.
+- **Postgres `OpenBackupSnapshot` implementation.** Creates a temporary `EXPORT_SNAPSHOT`-shape replication slot (named `sluice_backup_anchor_<unix-nanos>`) to anchor the snapshot LSN, opens a `*sql.Conn` that imports the snapshot via `SET TRANSACTION SNAPSHOT '<name>'`, and returns a `RowReader` bound to the conn. The temporary anchor slot is dropped on close (the `consistent_point` LSN is preserved on the manifest's `EndPosition` for chain handoff against the operator's chain-handoff slot, which is recorded on the position alongside the LSN). Reuses `createLogicalReplicationSlot`'s PG-version-adaptive helper (FAILOVER on PG 17+).
+- **MySQL `OpenBackupSnapshot` implementation.** Pins a single `*sql.Conn`, runs `SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ` + `START TRANSACTION WITH CONSISTENT SNAPSHOT`, captures `@@global.gtid_executed` (or `(file, pos)` in non-GTID mode) inside the same transaction so the recorded position refers to the snapshot's logical clock. All table reads run on this one connection sequentially. **Trade-off vs PG**: MySQL's REPEATABLE READ snapshot is per-session and not shareable across connections (ADR-0019), so multi-conn parallel reads aren't available on this path; PG's snapshot can fan out to N readers via the existing `SnapshotImporter` machinery in a future revision. MySQL operators running backups under high read parallelism configurations should expect single-conn throughput on the row sweep.
+
+### Changed
+
+- **`pipeline.Backup` orchestrator now prefers the snapshot path.** `Backup.Run` type-asserts on `ir.BackupSnapshotOpener` at start of run; when implemented, the captured snapshot position becomes `Manifest.EndPosition` immediately and the post-sweep `BackupPositionCapturer` fallback is skipped. When the engine doesn't implement the new surface, falls through to the v0.17.x shape with a `WARN` line citing the during-backup window gap and pointing at the v0.17.2 release notes / `docs/dev/design-logical-backups-phase-3.md` for context.
+- **`Manifest.EndPosition` semantic.** For full manifests written by v0.18.0+ this is the snapshot-anchor LSN/GTID (captured AT snapshot start); for fulls written by v0.17.0–v0.17.3 it remains the post-sweep position (captured at end-of-backup). The chain-walker treats both identically — the field is a CDC resume cursor — so existing chains restore unchanged. The wire shape of `EndPosition` is unchanged; only its capture timing semantics shift, so old chains and new chains can coexist in a chain history without operator action.
+- **`docs/dev/design-logical-backups-phase-3.md`.** The "Implementation note: deviation from snapshot-anchored EndPosition" section is rewritten — flips from "deviation in v0.17.2" to "deviation closed in v0.18.0" with the post-fix shape documented.
+
+### Closed
+
+- **v0.17.2's documented "during-backup write window" caveat.** The release notes for v0.17.2 surfaced this as a known limitation with the workaround "pair backups with continuous `sluice sync start`." v0.18.0 closes it — backup-only DR works correctly even under heavy write load on the source. The mitigation pattern is still recommended for the "fresher than the most recent incremental window" use case, but is no longer load-bearing for chain correctness.
+
+### Migration / Compatibility
+
+- Pre-v0.18.0 chains restore unchanged; the chain-walker handles both old (post-sweep) and new (snapshot-anchored) `EndPosition` semantics identically.
+- Operators running PG with `wal_keep_size` tuned for the chain's incremental cadence don't need to revisit settings — the snapshot anchor is short-lived (dropped at end of full) and doesn't change the chain's WAL footprint at the chain-handoff slot.
+- MySQL operators running backups against high-throughput sources should expect the row sweep to be single-conn (per-session snapshot constraint); throughput-sensitive backups that previously ran with multiple workers via OpenRowReader will lose that parallelism. Document the trade-off; mitigation is to run backups during slightly slower windows or accept the consistent-view trade.
+
 ## [0.17.3] - 2026-05-07
 
 Single-bug patch from the v0.17.2 test cycle. v0.17.2 shipped Phase 3.3's PG soft-warning preflights (including Patroni / HA-managed source detection); the cycle surfaced that the three v0.17.2 detection signals all systematically miss on tenant-isolated managed PG services like PlanetScale Postgres. The operators who most need the idle-slot trap warning (managed-PG users who can't tune their own slot retention) got nothing.

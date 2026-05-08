@@ -30,20 +30,17 @@ The headline operator outcome: when CDC position is gone (PG slot dropped past `
 
 - Client-side AES-256-GCM remains unimplemented through Phase 3 (and v0.16.0's docs were corrected on this point in v0.16.1)
 
-## Implementation note: deviation from "snapshot-anchored EndPosition" (v0.17.2)
+## Implementation note: snapshot-anchored EndPosition (v0.17.2 deviation closed in v0.18.0)
 
 v0.17.2 implemented Phase 3.3.A with a lighter shape than the design originally proposed. The original design said: "use the existing snapshot infrastructure to capture `consistent_point` at slot creation" — i.e. open an `EXPORT_SNAPSHOT`-style transaction during the full backup, take the snapshot LSN as `EndPosition`, and have the row sweep read from inside that transaction.
 
-The actual v0.17.2 implementation:
+**v0.18.0 closes the deviation.** The original snapshot-anchored design is now the implementation. The history below records what v0.17.2 shipped and why, plus the v0.18.0 fix.
+
+### v0.17.2 shape (the deviation)
+
 - Adds `ir.BackupPositionCapturer` as a `SchemaReader`-attached optional interface.
 - Captures `pg_current_wal_lsn()` (PG) or `@@global.gtid_executed` (MySQL) at end-of-backup, after all row chunks have been written.
 - The row sweep continues to use plain `OpenRowReader` (no shared snapshot transaction across tables).
-
-**What this trades:**
-
-- **Lighter implementation** — no coupling between full-backup orchestrator and CDC slot lifecycle. Operators don't need backup-time slot creation; they manage slots independently via `sluice sync start`.
-- **Aligns with "Contain Postgres complexity"** — slot lifecycle stays explicit at the operator's hand, not implicit in backup runs.
-- **Loud-failure path preserved** — the 3.3.C preflight catches missing/lost slots before CDC opens for chain handoff.
 
 **The cost — the "during-backup write window" gap:**
 
@@ -51,17 +48,30 @@ The actual v0.17.2 implementation:
 - Cross-table consistency at full-backup time is also not guaranteed (also a pre-existing characteristic of `OpenRowReader`-based backups, not new in v0.17.2).
 - The chain → handoff path is therefore not byte-perfect for sources under heavy write load during the backup window itself.
 
-**The intended operational mitigation:**
+**The intended operational mitigation (v0.17.x):** pair backups with a continuously-running `sluice sync start` CDC stream. The live stream captures every write as it happens; the backup chain provides cold-bootstrap; the CDC stream's idempotent apply fills any chain gap on restore. For backup-alone DR (no live CDC), take backups during quiet windows.
 
-- Pair backups with a continuously-running `sluice sync start` CDC stream. The live stream captures every write as it happens; the backup chain provides cold-bootstrap; the CDC stream's idempotent apply fills any chain gap on restore.
-- For backup-alone DR (no live CDC), take backups during quiet windows.
-- A future release (likely paired with Phase 4) will wire the full-backup row sweep into the existing snapshot infrastructure (`EXPORT_SNAPSHOT` + `SET TRANSACTION SNAPSHOT` for PG; `WITH CONSISTENT SNAPSHOT` for MySQL), closing the gap with snapshot-anchored `EndPosition`.
+### v0.18.0 shape (the fix)
 
-**Why ship v0.17.2 with this gap:**
+- Adds `ir.BackupSnapshotOpener` as an optional engine surface that returns an `ir.BackupSnapshot` bundle: snapshot-anchor `Position` + a snapshot-pinned `RowReader` + a cleanup closure. Engines that implement it get cross-table snapshot consistency plus a snapshot-anchored `EndPosition` for free.
+- The full-backup orchestrator type-asserts on `BackupSnapshotOpener` at the start of `Run`. When implemented:
+  - The captured `Position` becomes `Manifest.EndPosition` immediately (no post-sweep capture).
+  - The `RowReader` reads from the snapshot's consistent view; cross-table consistency holds.
+  - The chain's next link's CDC pump from `EndPosition` forward covers every write after the snapshot anchor.
+- Engines that don't implement `BackupSnapshotOpener` (out-of-tree engines) fall through to the v0.17.x `BackupPositionCapturer` path with a soft `WARN` log line so operators know the chain rooted in this full carries the during-backup window gap.
+- Postgres implementation: a temporary `EXPORT_SNAPSHOT`-shape replication slot anchors the snapshot LSN; the slot is dropped on close. Distinct from the chain-handoff slot recorded on `EndPosition`.
+- MySQL implementation: `START TRANSACTION WITH CONSISTENT SNAPSHOT` on a single pinned `*sql.Conn`. All table reads run on this one connection sequentially — MySQL's snapshot is per-session and not shareable, so multi-conn parallel reads are not available on this path. Trade-off vs PG's parallel-readable snapshot is documented in the v0.18.0 release notes.
 
-- The gap is pre-existing in v0.17.0/v0.17.1 — those releases had a *larger* gap (incremental started at "current LSN at incremental-start time" — well after backup completion). v0.17.2 narrows the gap to just the during-backup window.
-- The continuous-CDC pattern is the recommended DR shape anyway; operators using sluice for ongoing replication get the gap closed for free.
-- The snapshot-anchored fix is non-trivial integration work; deferring it to a focused chunk avoids piling complexity onto Phase 3.3's already-substantial scope.
+**Post-fix shape — what the chain now guarantees:**
+
+- A full backup taken under heavy write load produces a chain whose terminal target reflects every committed row — both pre-snapshot writes (via the row sweep) and post-snapshot writes (via the incremental's CDC stream from `EndPosition` forward).
+- Restore + CDC handoff via `sluice sync start --position-from-manifest` is now byte-perfect for backup-only DR; the v0.17.2 mitigation (pair with continuous CDC) is no longer load-bearing for correctness, only for "the chain's tail position is fresher than the most recent incremental window."
+- Pre-existing v0.17.x backups continue to restore as-is; only fulls written by v0.18.0+ carry the snapshot-anchored `EndPosition`. The chain-walker treats the field's semantic identically (a CDC resume cursor); only the "what does this LSN represent" moves from "end-of-backup" to "snapshot-start."
+
+**Integration tests pinning the gap-fix:**
+
+- `TestBackup_SnapshotAnchoredEndPosition_PostgresGapClosed` and the MySQL sibling drive the load-bearing path: seed source → backup with concurrent during-window INSERTs → incremental → restore chain → verify every row arrives. Pre-fix the during-window writes would be missing from the target; post-fix all rows land.
+- `TestBackup_OpenBackupSnapshot_PostgresPositionShape` / `MySQLPositionShape` pin the wire shape of the recorded `Position` so a future regression in the encoding gets caught loudly.
+- Unit tests in `backup_endpos_test.go` pin the orchestrator's dispatch: snapshot-opener → snapshot path; no opener → fallback path.
 
 ## Sub-phasing
 
