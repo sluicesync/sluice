@@ -254,8 +254,16 @@ func TestSyncFromBackup_Postgres_HappyPath(t *testing.T) {
 }
 
 // TestSyncFromBackup_SchemaEvolution exercises Acceptance Criterion 3:
-// ALTER TABLE ADD COLUMN on source, broker applies the delta + the
-// rows referencing the new column.
+// ALTER TABLE ADD COLUMN on source while the BackupStream is running,
+// then the broker applies the delta + the rows referencing the new
+// column.
+//
+// Bug 38 fix (v0.20.1): pre-fix, the stream baked the parent's schema
+// snapshot into every rollover's manifest without ever refreshing —
+// so an ALTER on the source mid-stream produced manifests with stale
+// schema, and the broker's apply hit "column does not exist". Fix:
+// stream re-reads source schema at each rollover boundary and emits
+// SchemaDelta entries for any diff.
 func TestSyncFromBackup_SchemaEvolution(t *testing.T) {
 	const seedDDL = `
 		CREATE TABLE users (
@@ -275,28 +283,25 @@ func TestSyncFromBackup_SchemaEvolution(t *testing.T) {
 		t.Fatalf("seed restore: %v", err)
 	}
 
-	// Drive an ALTER TABLE on the source. The Phase 4 stream's
-	// rollover doesn't capture schema deltas (skipped to avoid
-	// per-rollover schema reads), so we use IncrementalBackup
-	// directly to capture the schema delta.
+	// Bug 38 repro shape: drive the source via the long-running
+	// BackupStream (the path the bug lived on), NOT a one-shot
+	// IncrementalBackup. The stream must capture the post-ALTER
+	// schema in its next rollover for the broker to apply the row.
+	streamCancel, streamDone := runStreamInGoroutine(t, sourceDSN, fullBackupID, store)
+	defer streamCancel()
+
+	// First write so the stream produces an initial pre-ALTER rollover.
+	applyDDL(t, sourceDSN, `INSERT INTO users (email) VALUES ('pre@example.com')`)
+	waitForIncrementals(t, store, 1, 30*time.Second)
+
+	// Now: ALTER on source while stream is running, then a row referencing
+	// the new column.
 	applyDDL(t, sourceDSN, `ALTER TABLE users ADD COLUMN nickname VARCHAR(100)`)
 	applyDDL(t, sourceDSN, `INSERT INTO users (email, nickname) VALUES ('bob@example.com', 'bobby')`)
 
-	// Take an incremental that captures the schema delta + the new row.
-	incrCtx, incrCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer incrCancel()
-	if err := (&IncrementalBackup{
-		Source:        pgEng,
-		SourceDSN:     sourceDSN,
-		Store:         store,
-		ParentRef:     fullBackupID,
-		Window:        10 * time.Second,
-		MaxChanges:    10,
-		ChunkChanges:  10,
-		SluiceVersion: "test",
-	}).Run(incrCtx); err != nil {
-		t.Fatalf("IncrementalBackup.Run: %v", err)
-	}
+	// Wait for at least one more rollover that should now carry the
+	// schema delta. Stream's RolloverWindow is 2s in the test helper.
+	waitForIncrementals(t, store, 2, 30*time.Second)
 
 	// Run the broker.
 	brokerCancel, brokerDone := runBrokerInGoroutine(t, brokerTargetDSN, "schema-evolve", store, brokerOpts{
@@ -305,21 +310,22 @@ func TestSyncFromBackup_SchemaEvolution(t *testing.T) {
 	})
 	defer brokerCancel()
 
-	// Wait for the broker to catch up: target should have 2 rows AND
-	// a `nickname` column.
+	// Wait for the broker to catch up: target should have 3 rows
+	// (alice + pre + bob) AND a `nickname` column.
 	deadline := time.Now().Add(60 * time.Second)
 	caught := false
 	for time.Now().Before(deadline) {
 		emails := pgQueryEmails(t, brokerTargetDSN)
-		if len(emails) >= 2 && pgColumnExists(t, brokerTargetDSN, "users", "nickname") {
+		if len(emails) >= 3 && pgColumnExists(t, brokerTargetDSN, "users", "nickname") {
 			caught = true
 			break
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
 	if !caught {
-		t.Fatalf("broker did not apply schema delta + new row within deadline; emails=%v",
-			pgQueryEmails(t, brokerTargetDSN))
+		t.Fatalf("broker did not apply schema delta + new row within deadline; emails=%v has_nickname=%v",
+			pgQueryEmails(t, brokerTargetDSN),
+			pgColumnExists(t, brokerTargetDSN, "users", "nickname"))
 	}
 
 	brokerCancel()
@@ -330,6 +336,12 @@ func TestSyncFromBackup_SchemaEvolution(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("broker did not exit within 10s")
+	}
+	streamCancel()
+	select {
+	case <-streamDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("stream did not exit within 10s")
 	}
 }
 
@@ -588,6 +600,100 @@ func TestSyncFromBackup_ColdStartWithReset(t *testing.T) {
 	case <-brokerDone:
 	case <-time.After(10 * time.Second):
 		t.Fatal("broker did not exit")
+	}
+}
+
+// TestSyncFromBackup_ColdStartWithReset_StaleSchema exercises Bug 40a:
+// pre-seed the target with a `users` table whose shape differs from
+// the chain's schema, then run --reset-target-data and confirm the
+// broker drops the stale table before the inline ChainRestore.
+//
+// Pre-fix shape: ChainRestore's CREATE TABLE IF NOT EXISTS no-op'd
+// against the stale-schema table, then the bulk-copy COPY referenced
+// columns the table didn't have, and the producer goroutine deadlocked
+// waiting on rowCh — broker hung indefinitely with idle PG connections
+// in ClientRead state. v0.20.1 fix: drop the table first; surface
+// COPY errors loudly instead of swallowing.
+func TestSyncFromBackup_ColdStartWithReset_StaleSchema(t *testing.T) {
+	const seedDDL = `
+		CREATE TABLE users (
+			id    BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+			email VARCHAR(255) NOT NULL,
+			created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+		);
+		ALTER TABLE users REPLICA IDENTITY FULL;
+		INSERT INTO users (email) VALUES ('alice@example.com'), ('bob@example.com');
+	`
+	sourceDSN, brokerTargetDSN, store, fullBackupID, teardown := brokerTestStreamSetup(t, seedDDL)
+	defer teardown()
+
+	// Take a single incremental so the chain isn't full-only.
+	applyDDL(t, sourceDSN, `INSERT INTO users (email) VALUES ('carol@example.com')`)
+	pgEng, _ := engines.Get("postgres")
+	incrCtx, incrCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer incrCancel()
+	if err := (&IncrementalBackup{
+		Source: pgEng, SourceDSN: sourceDSN, Store: store,
+		ParentRef: fullBackupID, Window: 10 * time.Second, MaxChanges: 5,
+		ChunkChanges: 5, SluiceVersion: "test",
+	}).Run(incrCtx); err != nil {
+		t.Fatalf("IncrementalBackup.Run: %v", err)
+	}
+
+	// Pre-seed the broker target with a STALE-SCHEMA `users` table
+	// (only id + email — no created_at) and a row in it. The pre-fix
+	// behaviour was to leave this table intact and hang on COPY.
+	applyDDL(t, brokerTargetDSN, `
+		CREATE TABLE users (
+			id    BIGINT PRIMARY KEY,
+			email VARCHAR(255) NOT NULL
+		);
+		INSERT INTO users (id, email) VALUES (999, 'stale@example.com');
+	`)
+
+	// Run the broker with --reset-target-data + a generous timeout so
+	// the pre-fix deadlock (if regressed) surfaces as a test timeout
+	// rather than hanging the suite.
+	runCtx, runCancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer runCancel()
+	broker := &SyncFromBackup{
+		Target:          pgEng,
+		TargetDSN:       brokerTargetDSN,
+		Store:           store,
+		ChainURL:        "test://reset-stale",
+		StreamID:        "reset-stale-test",
+		PollInterval:    2 * time.Second,
+		ResetTargetData: true,
+		SluiceVersion:   "test",
+	}
+	errCh := make(chan error, 1)
+	go func() { errCh <- broker.Run(runCtx) }()
+
+	// Wait for the broker to land the 3 chain rows. The 999/stale row
+	// should be GONE — that's the proof the table was dropped.
+	deadline := time.Now().Add(60 * time.Second)
+	for time.Now().Before(deadline) {
+		got := pgQueryEmailsTolerant(t, brokerTargetDSN)
+		if len(got) >= 3 {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	got := pgQueryEmailsTolerant(t, brokerTargetDSN)
+	if len(got) < 3 {
+		t.Fatalf("after --reset-target-data with stale schema, target emails = %v; want 3 chain rows", got)
+	}
+	for _, e := range got {
+		if e == "stale@example.com" {
+			t.Errorf("stale row survived --reset-target-data; got %v", got)
+		}
+	}
+
+	runCancel()
+	select {
+	case <-errCh:
+	case <-time.After(10 * time.Second):
+		t.Fatal("broker did not exit within 10s of cancel")
 	}
 }
 

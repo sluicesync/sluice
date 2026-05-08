@@ -24,9 +24,18 @@ func TestEncodeDecodeBrokerPosition(t *testing.T) {
 	if pos.Token == "" {
 		t.Fatal("token is empty")
 	}
+	// Bug 39 fix: the token JSON carries an `_engine` field so the
+	// broker sentinel survives the engine appliers' round-trip
+	// discard of [ir.Position.Engine].
+	if !strings.Contains(pos.Token, `"_engine":"backup-broker"`) {
+		t.Errorf("token does not embed _engine sentinel: %s", pos.Token)
+	}
 	tok, err := decodeBrokerPosition(pos)
 	if err != nil {
 		t.Fatalf("decodeBrokerPosition: %v", err)
+	}
+	if tok.Engine != BackupBrokerPositionEngine {
+		t.Errorf("decoded Engine = %q; want %q", tok.Engine, BackupBrokerPositionEngine)
 	}
 	if tok.ChainURL != "file:///tmp/chain" {
 		t.Errorf("ChainURL = %q; want %q", tok.ChainURL, "file:///tmp/chain")
@@ -36,15 +45,55 @@ func TestEncodeDecodeBrokerPosition(t *testing.T) {
 	}
 }
 
-// TestDecodeBrokerPosition_RejectsNonBrokerEngine rejects positions
-// tagged as a non-broker engine (e.g. a live CDC stream's row that
-// shares the same stream-id) so the broker doesn't silently overwrite
-// a sync-start stream's resume cursor.
-func TestDecodeBrokerPosition_RejectsNonBrokerEngine(t *testing.T) {
+// TestDecodeBrokerPosition_RejectsNonBrokerToken rejects positions
+// whose token doesn't carry the broker's _engine sentinel — e.g. a
+// live CDC stream's row written by a non-broker writer. Bug 39 fix:
+// the discriminator moved from [ir.Position.Engine] to the JSON
+// envelope's `_engine` field because the engine appliers' ReadPosition
+// discards Position.Engine on read.
+func TestDecodeBrokerPosition_RejectsNonBrokerToken(t *testing.T) {
+	// Live CDC stream row shape (no _engine field).
 	pos := ir.Position{Engine: "postgres", Token: `{"slot":"sluice_slot"}`}
 	_, err := decodeBrokerPosition(pos)
 	if err == nil {
-		t.Fatal("err = nil; want refusal of non-broker engine")
+		t.Fatal("err = nil; want refusal of non-broker token")
+	}
+}
+
+// TestIsBrokerToken_RoundTrip pins the discriminator behaviour at the
+// engine-applier round-trip boundary: a broker-written token always
+// reads back as a broker token, regardless of what
+// [ir.Position.Engine] looks like (the appliers stomp on it). Bug 39
+// fix: this is the warm-resume gating predicate.
+func TestIsBrokerToken_RoundTrip(t *testing.T) {
+	// Simulate the broker writing a position …
+	written := encodeBrokerPosition("file:///tmp/chain", "abc123")
+	// … and the PG applier reading it back: token preserved, but
+	// Engine clobbered to "postgres".
+	readBack := ir.Position{Engine: "postgres", Token: written.Token}
+	if !isBrokerToken(readBack) {
+		t.Errorf("isBrokerToken = false on round-tripped broker token; want true")
+	}
+}
+
+// TestIsBrokerToken_LegacyRow pins backward-compat: a v0.19.x-shaped
+// row that doesn't carry the _engine field is treated as non-broker.
+// Bug 39 fix doesn't break existing live-CDC writers.
+func TestIsBrokerToken_LegacyRow(t *testing.T) {
+	cases := []struct {
+		name string
+		pos  ir.Position
+	}{
+		{"empty", ir.Position{}},
+		{"opaque", ir.Position{Engine: "mysql", Token: "MySQL56/abc:1-100"}},
+		{"pg-json-no-engine", ir.Position{Engine: "postgres", Token: `{"slot":"x","lsn":"0/16B0000"}`}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if isBrokerToken(c.pos) {
+				t.Errorf("isBrokerToken = true; want false on legacy non-broker shape")
+			}
+		})
 	}
 }
 

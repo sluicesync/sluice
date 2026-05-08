@@ -247,22 +247,19 @@ func (r *Restore) restoreTable(
 		return nil
 	}
 
-	// Phase A (Bug 40): log entry into bulk-copy with the table column
-	// list we'll feed to the writer. The writer's COPY/INSERT path
-	// references these column names by identity; if the target table
-	// has a different shape (stale schema not dropped), the engine
-	// errors out — and we want to confirm that error surfaces here
-	// rather than getting swallowed in the goroutine pattern below.
-	colNames := make([]string, 0, len(table.Columns))
-	for _, c := range table.Columns {
-		colNames = append(colNames, c.Name)
-	}
-	slog.DebugContext(ctx, "restore: restoreTable — entering WriteRows",
-		slog.String("table", table.Name),
-		slog.Any("columns", colNames),
-		slog.Int("chunks", len(entry.Chunks)),
-		slog.Int64("expected_rows", entry.RowCount),
-	)
+	// Bug 40b fix (v0.20.1): wrap the producer goroutine in a derived
+	// context so a writer-side failure can cancel the producer.
+	// Pre-fix: the producer pushed rows into an unbuffered channel
+	// that the writer stopped draining the moment WriteRows returned
+	// an error; the producer then blocked forever on `out <- row`,
+	// and `<-errCh` deadlocked. Net effect: a target-side
+	// "column does not exist" turned into a silent hang with idle
+	// PG connections in ClientRead state and operators having to
+	// Stop-Process to recover. The streamCtx + streamCancel pattern
+	// below mirrors the one [ChainRestore.applyIncremental] uses for
+	// change-chunk streaming.
+	streamCtx, streamCancel := context.WithCancel(ctx)
+	defer streamCancel()
 
 	rowCh := make(chan ir.Row)
 	errCh := make(chan error, 1)
@@ -271,7 +268,7 @@ func (r *Restore) restoreTable(
 		defer close(rowCh)
 		var rowsApplied int64
 		for chunkIdx, chunk := range entry.Chunks {
-			chunkRows, err := r.streamChunkRows(ctx, chunk, rowCh)
+			chunkRows, err := r.streamChunkRows(streamCtx, chunk, rowCh)
 			if err != nil {
 				errCh <- fmt.Errorf("chunk %d (%s): %w", chunkIdx, chunk.File, err)
 				return
@@ -292,19 +289,17 @@ func (r *Restore) restoreTable(
 	}()
 
 	if err := rw.WriteRows(ctx, table, rowCh); err != nil {
-		// Phase A (Bug 40): the producer goroutine may still be
-		// blocked sending to rowCh when WriteRows fails — without a
-		// streamCancel here, `<-errCh` deadlocks (Bug 40 silent
-		// hang). Phase B will add cancellation; this log line catches
-		// the hang shape on existing CI logs.
-		slog.DebugContext(ctx, "restore: restoreTable — WriteRows failed; awaiting producer drain (may hang)",
+		// Bug 40b: cancel the producer's context so a goroutine
+		// blocked on `rowCh <- row` unblocks via the streamChunkRows
+		// `<-ctx.Done()` arm. Without this, `<-errCh` below would
+		// deadlock — the silent-hang shape from Bug 40.
+		slog.ErrorContext(ctx, "restore: write rows failed; cancelling chunk producer",
 			slog.String("table", table.Name),
 			slog.String("err", err.Error()),
 		)
-		// Drain the error channel so the goroutine exits even on
-		// writer-side failure.
+		streamCancel()
 		<-errCh
-		return fmt.Errorf("write rows: %w", err)
+		return fmt.Errorf("write rows for table %q: %w", table.Name, err)
 	}
 	if err := <-errCh; err != nil {
 		return err

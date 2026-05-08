@@ -183,7 +183,20 @@ type SyncFromBackup struct {
 // The shape is small + stable + JSON so an operator inspecting the
 // control table by hand can read it; future fields (chain_format,
 // schema_hash) are forward-compatible additions.
+//
+// Bug 39 fix (v0.20.1): the embedded `_engine` field is the broker's
+// self-identifier — it round-trips through `sluice_cdc_state.source_position`
+// even though the engine appliers' [ir.ChangeApplier.ReadPosition]
+// implementations hard-code their own engine name into the returned
+// [ir.Position.Engine]. Without this field, a broker restart against
+// its own previously-written row was rejected as "non-broker writer"
+// because Position.Engine came back as "postgres" / "mysql" instead
+// of [BackupBrokerPositionEngine]. The envelope choice (over a DDL
+// migration on `sluice_cdc_state`) is backward-compatible: legacy
+// rows lacking `_engine` parse with the field empty and are correctly
+// treated as non-broker.
 type brokerPositionToken struct {
+	Engine              string `json:"_engine,omitempty"`
 	ChainURL            string `json:"chain_url,omitempty"`
 	LastAppliedBackupID string `json:"last_applied_backup_id"`
 }
@@ -192,9 +205,12 @@ type brokerPositionToken struct {
 // alongside data writes during incremental replay. The Engine field
 // is [BackupBrokerPositionEngine] so a future broker run can detect
 // "this row was written by a broker, not a live CDC stream" without
-// parsing the token.
+// parsing the token. The same sentinel is also embedded in the JSON
+// token (`_engine` field) so it survives the engine appliers'
+// hard-coded engine-name discard on read (Bug 39 round-trip fix).
 func encodeBrokerPosition(chainURL, backupID string) ir.Position {
 	tok := brokerPositionToken{
+		Engine:              BackupBrokerPositionEngine,
 		ChainURL:            chainURL,
 		LastAppliedBackupID: backupID,
 	}
@@ -207,13 +223,18 @@ func encodeBrokerPosition(chainURL, backupID string) ir.Position {
 
 // decodeBrokerPosition parses a position token written by
 // [encodeBrokerPosition]. Returns (nil, error) when the token isn't
-// JSON-shaped — a non-broker position written into the same row by
-// some other code path. Callers handle that as "no broker state for
-// this stream-id" and fall through to the cold-start branch.
+// JSON-shaped or doesn't carry the broker sentinel — a non-broker
+// position written into the same row by some other code path.
+// Callers handle that as "no broker state for this stream-id" and
+// fall through to the cold-start branch.
+//
+// Bug 39 fix (v0.20.1): the discriminator is the embedded `_engine`
+// field, NOT [ir.Position.Engine]. The latter is set by the engine
+// applier's ReadPosition (always "postgres" / "mysql") and discards
+// the broker's sentinel; the former survives the round-trip. Callers
+// that want to ask "is this a broker row?" should call
+// [isBrokerToken] rather than reading Position.Engine.
 func decodeBrokerPosition(pos ir.Position) (*brokerPositionToken, error) {
-	if pos.Engine != BackupBrokerPositionEngine {
-		return nil, fmt.Errorf("broker: position engine %q is not %q", pos.Engine, BackupBrokerPositionEngine)
-	}
 	if pos.Token == "" {
 		return nil, errors.New("broker: position token is empty")
 	}
@@ -221,7 +242,31 @@ func decodeBrokerPosition(pos ir.Position) (*brokerPositionToken, error) {
 	if err := json.Unmarshal([]byte(pos.Token), &tok); err != nil {
 		return nil, fmt.Errorf("broker: decode position token: %w", err)
 	}
+	if tok.Engine != BackupBrokerPositionEngine {
+		return nil, fmt.Errorf(
+			"broker: token's _engine field is %q, not %q",
+			tok.Engine, BackupBrokerPositionEngine)
+	}
 	return &tok, nil
+}
+
+// isBrokerToken reports whether a persisted position token (read from
+// `sluice_cdc_state.source_position` via [ir.ChangeApplier.ReadPosition])
+// was written by a broker. It probes the token's embedded `_engine`
+// field rather than [ir.Position.Engine], which the engine appliers
+// stomp on with their own engine name. Returns false on JSON-decode
+// failure (non-broker writers — live CDC — write opaque tokens that
+// are typically NOT JSON envelopes; PG slots use a JSON envelope but
+// without the `_engine` field).
+func isBrokerToken(pos ir.Position) bool {
+	if pos.Token == "" {
+		return false
+	}
+	var tok brokerPositionToken
+	if err := json.Unmarshal([]byte(pos.Token), &tok); err != nil {
+		return false
+	}
+	return tok.Engine == BackupBrokerPositionEngine
 }
 
 // Run executes the long-running broker. Blocks until ctx is cancelled
@@ -278,22 +323,14 @@ func (b *SyncFromBackup) Run(ctx context.Context) error {
 		return wrapWithHint(PhaseCDC, fmt.Errorf("broker: read position: %w", err))
 	}
 
-	// Phase A (Bug 39): log the engine sentinel + token returned by
-	// ReadPosition. The applier's hard-coded engineName<Engine>
-	// discards the broker's BackupBrokerPositionEngine sentinel, so
-	// `persisted.Engine` here is always "postgres" / "mysql" — never
-	// "backup-broker" — even after the broker writes its own row.
-	slog.DebugContext(ctx, "broker: ReadPosition result",
-		slog.String("stream_id", b.StreamID),
-		slog.Bool("found", found),
-		slog.String("persisted_engine", persisted.Engine),
-		slog.String("expected_engine", BackupBrokerPositionEngine),
-		slog.String("token", persisted.Token),
-	)
-
+	// Bug 39 fix (v0.20.1): identify broker-owned rows via the
+	// embedded `_engine` JSON field, NOT [ir.Position.Engine]. The
+	// engine appliers' ReadPosition discards the broker's sentinel
+	// and returns its own engine name; the JSON envelope round-trips
+	// the sentinel intact. See [isBrokerToken] for the discriminator.
 	var lastAppliedID string
 	switch {
-	case found && persisted.Engine == BackupBrokerPositionEngine:
+	case found && isBrokerToken(persisted):
 		tok, dErr := decodeBrokerPosition(persisted)
 		if dErr != nil {
 			return fmt.Errorf("broker: corrupt persisted position for stream %q: %w; clear the row manually or pass --reset-target-data",
@@ -305,11 +342,6 @@ func (b *SyncFromBackup) Run(ctx context.Context) error {
 			slog.String("last_applied_backup_id", lastAppliedID),
 		)
 	case found:
-		slog.DebugContext(ctx, "broker: position-engine sentinel mismatch — refusing as non-broker writer",
-			slog.String("stream_id", b.StreamID),
-			slog.String("persisted_engine", persisted.Engine),
-			slog.String("token", persisted.Token),
-		)
 		return fmt.Errorf(
 			"broker: stream %q is owned by a non-broker writer (position engine %q); "+
 				"choose a different --stream-id or clear the conflicting row first",
@@ -490,13 +522,16 @@ func (b *SyncFromBackup) coldStart(ctx context.Context, applier ir.ChangeApplier
 // coldStartReset runs an inline ChainRestore to land the chain's full
 // + every incremental currently in the store, then records the
 // chain's tail BackupID as the broker's resume floor.
+//
+// Bug 40 fix (v0.20.1): before invoking ChainRestore, drop every
+// table named in the chain's terminal manifest schema. ChainRestore's
+// schema-application path uses CREATE TABLE IF NOT EXISTS, which
+// no-ops against pre-existing tables — so a target carrying a stale
+// schema (e.g. previous cycle's `(id, email)` shape vs. the chain's
+// `(id, email, created_at)` shape) would silently keep the old
+// columns and the subsequent COPY would fail with "column does not
+// exist". Mirror `migrate --reset-target-data`'s drop-loop pattern.
 func (b *SyncFromBackup) coldStartReset(ctx context.Context, applier ir.ChangeApplier) (string, error) {
-	// Phase A (Bug 40): log entry + the chain's terminal schema
-	// (table count + names) so we can confirm the restore call sees
-	// the right schema vs. what's actually on the target.
-	slog.DebugContext(ctx, "broker: coldStartReset — entry",
-		slog.String("stream_id", b.StreamID),
-	)
 	chain, err := buildChain(ctx, b.Store)
 	if err != nil {
 		return "", wrapWithHint(PhaseConnect, fmt.Errorf("broker: build chain: %w", err))
@@ -505,18 +540,17 @@ func (b *SyncFromBackup) coldStartReset(ctx context.Context, applier ir.ChangeAp
 		return "", errors.New("broker: chain is empty; cannot --reset-target-data with no full backup in store")
 	}
 	tailManifest := chain[len(chain)-1].manifest
-	if tailManifest.Schema != nil {
-		tableNames := make([]string, 0, len(tailManifest.Schema.Tables))
-		for _, t := range tailManifest.Schema.Tables {
-			tableNames = append(tableNames, t.Name)
+
+	// Bug 40a fix: drop pre-existing target tables that match the
+	// chain's terminal schema. ChainRestore's CREATE TABLE IF NOT
+	// EXISTS would otherwise no-op against stale-schema tables and
+	// trigger a "column does not exist" error in the subsequent COPY.
+	if tailManifest.Schema != nil && len(tailManifest.Schema.Tables) > 0 {
+		if err := b.dropExistingTargetTables(ctx, tailManifest.Schema); err != nil {
+			return "", err
 		}
-		slog.DebugContext(ctx, "broker: coldStartReset — terminal manifest schema",
-			slog.String("stream_id", b.StreamID),
-			slog.Int("chain_length", len(chain)),
-			slog.Int("table_count", len(tailManifest.Schema.Tables)),
-			slog.Any("table_names", tableNames),
-		)
 	}
+
 	rest := &ChainRestore{
 		Target:         b.Target,
 		TargetDSN:      b.TargetDSN,
@@ -524,15 +558,9 @@ func (b *SyncFromBackup) coldStartReset(ctx context.Context, applier ir.ChangeAp
 		MaxBufferBytes: b.MaxBufferBytes,
 		ApplyBatchSize: b.ApplyBatchSize,
 	}
-	slog.DebugContext(ctx, "broker: coldStartReset — invoking ChainRestore",
-		slog.String("stream_id", b.StreamID),
-	)
 	if err := rest.Run(ctx); err != nil {
 		return "", fmt.Errorf("broker: chain restore failed: %w", err)
 	}
-	slog.DebugContext(ctx, "broker: coldStartReset — ChainRestore returned ok",
-		slog.String("stream_id", b.StreamID),
-	)
 	tailID := manifestBackupID(tailManifest)
 	if err := b.writePositionDirect(ctx, applier, tailID); err != nil {
 		return "", fmt.Errorf("broker: record post-restore position: %w", err)
@@ -543,6 +571,39 @@ func (b *SyncFromBackup) coldStartReset(ctx context.Context, applier ir.ChangeAp
 		slog.Int("chain_length", len(chain)),
 	)
 	return tailID, nil
+}
+
+// dropExistingTargetTables drops every table named in schema on the
+// target via the engine's [ir.TableDropper] / [ir.BulkTableDropper]
+// surfaces. Reuses the same drop-loop pattern as
+// `migrate --reset-target-data` (see [dropTables] in reset.go) so a
+// target with a stale-schema table is wiped clean before
+// ChainRestore's CREATE-IF-NOT-EXISTS path runs. Bug 40 fix.
+func (b *SyncFromBackup) dropExistingTargetTables(ctx context.Context, schema *ir.Schema) error {
+	rw, err := b.Target.OpenRowWriter(ctx, b.TargetDSN)
+	if err != nil {
+		return wrapWithHint(PhaseConnect,
+			fmt.Errorf("broker: --reset-target-data: open row writer: %w", err))
+	}
+	defer closeIf(rw)
+	dropper, ok := rw.(ir.TableDropper)
+	if !ok {
+		return fmt.Errorf(
+			"broker: --reset-target-data: target engine %q does not expose ir.TableDropper; "+
+				"drop dest tables manually before re-running",
+			b.Target.Name())
+	}
+	if err := dropTables(ctx, dropper, schema.Tables); err != nil {
+		return err
+	}
+	if err := dropSchemaTypes(ctx, rw, schema); err != nil {
+		return err
+	}
+	slog.InfoContext(ctx, "broker: --reset-target-data: target tables dropped before chain restore",
+		slog.String("stream_id", b.StreamID),
+		slog.Int("tables_dropped", len(schema.Tables)),
+	)
+	return nil
 }
 
 // coldStartAtChainID handles the operator-asserted resumption path.

@@ -614,17 +614,6 @@ func (b *BackupStream) runRollover(
 		return rolloverOutcome{}, fmt.Errorf("hash source schema: %w", hashErr)
 	}
 
-	// Phase A (Bug 38): log the schema being baked into every
-	// rollover's manifest. Pre-fix expectation: this is the ORIGINAL
-	// parent.Schema captured at stream startup, never refreshed,
-	// even after source DDL. The stream loop assigns
-	// `currentParent = roll.Manifest`, so this snapshot replicates
-	// forward through every subsequent rollover.
-	beforeTableCols := summarizeSchemaForLogs(beforeSchema)
-	slog.DebugContext(ctx, "stream: runRollover — schema baseline (parent's)",
-		slog.Any("table_columns", beforeTableCols),
-	)
-
 	manifest := &ir.Manifest{
 		FormatVersion:  ir.BackupFormatVersion,
 		SluiceVersion:  b.SluiceVersion,
@@ -666,21 +655,68 @@ func (b *BackupStream) runRollover(
 		manifest.EndPosition = startPos
 	}
 
-	// Phase 4 v1: schema-delta capture is intentionally skipped on
-	// stream rollovers. Each rollover is short (default 5 m); reading
-	// the source schema twice per window adds latency proportional to
-	// table count for negligible benefit (DDL events on a continuous
-	// source are rare). Operators who need DDL capture can take a
-	// one-shot incremental at the boundary, or future Phase 4.x can
-	// promote schema diffing to streams. The schema recorded on each
-	// rollover's manifest is the parent's schema — a chain restore
-	// walks the parents in order so the schema state at the chain's
-	// terminal manifest is correct.
+	// Bug 38 fix (v0.20.1): refresh source schema at the rollover
+	// boundary and diff against the parent's schema. Previously the
+	// stream baked `parent.Schema` into every rollover's manifest
+	// without ever re-reading — meaning a `ALTER TABLE ADD COLUMN`
+	// on the source was never reflected in subsequent manifests, and
+	// a downstream broker hit "column does not exist" the moment it
+	// tried to apply a row referencing the new column. Mirrors
+	// [IncrementalBackup.Run]'s post-window schema-diff path; same
+	// SchemaDelta IR field the broker's ApplyChain consumes (Phase
+	// 3.2). Refresh cost is one cheap query per engine
+	// (information_schema.columns / pg_class+pg_attribute), bounded
+	// by table count.
+	if err := b.refreshSchemaAndAttachDelta(ctx, manifest, beforeSchema); err != nil {
+		return out, err
+	}
 
 	manifest.BackupID = ir.ComputeBackupID(manifest)
 	manifest.PartialState = ir.BackupStateComplete
 	out.Manifest = manifest
 	return out, captureErr
+}
+
+// refreshSchemaAndAttachDelta re-reads the source schema, diffs it
+// against the parent's schema, and attaches any [ir.SchemaDeltaEntry]
+// entries to manifest. When the diff is empty the manifest's recorded
+// Schema stays as the parent's; when entries are produced, the
+// manifest's Schema is replaced with the post-window source shape +
+// SchemaHash recomputed (mirrors [IncrementalBackup.Run]'s post-
+// window diff path).
+//
+// Errors here surface as fatal — a stream that can't refresh schema
+// loses the ability to keep the broker in sync with source DDL, so
+// loud-failure beats silent stale-manifest. Bug 38 fix (v0.20.1).
+func (b *BackupStream) refreshSchemaAndAttachDelta(
+	ctx context.Context,
+	manifest *ir.Manifest,
+	beforeSchema *ir.Schema,
+) error {
+	sr, err := b.Source.OpenSchemaReader(ctx, b.SourceDSN)
+	if err != nil {
+		return fmt.Errorf("rollover: open schema reader: %w", err)
+	}
+	defer closeIf(sr)
+	afterSchema, err := sr.ReadSchema(ctx)
+	if err != nil {
+		return fmt.Errorf("rollover: read source schema: %w", err)
+	}
+	delta := diffSchemas(beforeSchema, afterSchema)
+	if len(delta) == 0 {
+		return nil
+	}
+	manifest.SchemaDelta = delta
+	manifest.Schema = afterSchema
+	afterHash, err := ir.ComputeSchemaHash(afterSchema)
+	if err != nil {
+		return fmt.Errorf("rollover: hash post-window schema: %w", err)
+	}
+	manifest.SchemaHash = afterHash
+	slog.InfoContext(ctx, "stream: schema delta detected at rollover",
+		slog.Int("delta_count", len(delta)),
+	)
+	return nil
 }
 
 // captureOutcome bundles the multi-value result of one
@@ -1009,25 +1045,6 @@ func runRolloverHook(ctx context.Context, hookCmd string, manifest *ir.Manifest,
 		slog.String("hook", hookCmd),
 		slog.String("output", strings.TrimSpace(string(out))),
 	)
-}
-
-// summarizeSchemaForLogs returns a "table.col1,col2,..." per-table
-// summary of the schema, used by Phase A debug logs to confirm whether
-// the stream's schema-baseline shifts after a source ALTER. Tolerates
-// a nil schema.
-func summarizeSchemaForLogs(s *ir.Schema) []string {
-	if s == nil {
-		return nil
-	}
-	out := make([]string, 0, len(s.Tables))
-	for _, t := range s.Tables {
-		cols := make([]string, 0, len(t.Columns))
-		for _, c := range t.Columns {
-			cols = append(cols, c.Name)
-		}
-		out = append(out, fmt.Sprintf("%s(%s)", t.Name, strings.Join(cols, ",")))
-	}
-	return out
 }
 
 // newShellCommand wraps [exec.CommandContext] with the OS-appropriate
