@@ -6,6 +6,47 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.20.0]
+
+Logical backups Phase 4.5 lands: `sluice sync from-backup` is the consumer-side companion to v0.19.0's `sluice backup stream`. The headline operator outcome: **decouple source and target via the backup chain as the message log.** Source-side `backup stream` writes incrementals to S3/GCS/Azure/local-FS; target-side `sync from-backup` polls the same destination and replays incrementals into its own database — log-based ETL without direct source-target connectivity. Implementation supplement: `docs/dev/design-logical-backups-phase-4-5.md`.
+
+### Added
+
+- **`sluice sync from-backup run --backup-target=<url> --target-driver --target --stream-id=ID`** — new long-running broker subcommand. Drives a `for { tick(); replay(); commit(); }` loop at the configured `--poll-interval=DURATION` cadence (default `30s`). Each tick lists manifests at the chain root, filters to incrementals NOT yet applied (via the persisted `last_applied_backup_id` in `sluice_cdc_state`), and replays each in chain order — schema deltas first (via `ir.SchemaDeltaApplier.AlterAddColumn` from Phase 3.2), then change chunks through the engine's batched `ChangeApplier.ApplyBatch` (reusing the existing applier verbatim per ADR-0010 idempotent-apply).
+
+- **`sluice sync from-backup stop --backup-target=<url>`** — companion stop command. Writes `stop_requested_at` to the chain destination's `manifests/broker_state.json`; the running broker observes the request on its next tick poll and exits cleanly. Cross-machine: an operator on machine B can stop a broker running on machine A without process access — both sides agree on the chain destination. Mirrors the `backup stream stop` pattern.
+
+- **`pipeline.SyncFromBackup` orchestrator** — opens the target's `ChangeApplier` ONCE for the broker's lifetime; each tick reuses the connection. Per-tick INFO log line records new applied + total bytes + elapsed for monitoring. Integration tests use `--poll-interval=2s` for ~30-60s test scenarios.
+
+- **`pipeline.RequestSyncFromBackupStop(ctx, store, now)`** — exported helper for downstream tooling that wants to stop a running broker without going through the CLI. Idempotent: re-issuing stop preserves the original `stop_requested_at` timestamp so drain-completion watchers don't see the clock reset. In-process channel registry (`broker_stop_registry.go`) closes same-process stops with zero file I/O, mirroring the v0.19.1 stream-stop fix.
+
+- **`manifests/broker_state.json`** — new informational liveness file. Mirrors Phase 4's `stream_state.json` shape at the consumer side: `{pid, host, stream_id, started_at, last_apply_at, stop_requested_at}`. Coexists with `stream_state.json` when a stream + broker run against the same destination — one is producer-side, the other consumer-side; neither gates the other's concurrent-writer check.
+
+- **Cold-start safeguards.** First-start refusal when `sluice_cdc_state` has no row for the supplied `--stream-id` (mirrors `migrate --force-cold-start` friction tier from Bug 9). Two override flags:
+  - `--reset-target-data` — the broker first runs `pipeline.ChainRestore` internally to land the full + every incremental up to current, THEN transitions to live polling.
+  - `--at-chain-id=<BACKUP-ID>` — operator's assertion that the target is currently at chain ID `<BACKUP-ID>` (typical workflow: manual `sluice restore --from=<chain-url>` followed by `sync from-backup`); broker writes a fresh `sluice_cdc_state` row and transitions to live polling.
+
+- **`ir.PositionWriter` optional surface** — engine appliers that implement it allow the broker to record cold-start positions and schema-delta-only-incremental positions without an accompanying data write. Postgres + MySQL appliers implement it via the same `writePositionTx` helper the apply path uses, so the row shape and idempotency contract are identical.
+
+- **Replay state via existing `sluice_cdc_state`** — no schema change. New position-shape sentinel: `position_engine = "backup-broker"`, `position_token = '{"chain_url":"...","last_applied_backup_id":"<id>"}'`. Distinct from `sync start`'s positions (CDC LSN/GTID); the broker's positions reference chain state. ADR-0007 transactional position-and-data atomicity makes broker crashes mid-replay safe to re-apply (ADR-0010 idempotent applier).
+
+### Changed
+
+- **`cmd/sluice/cli.go` grows the `sync from-backup` subtree.** New `SyncCmd.FromBackup` field of type `SyncFromBackupCmdGrp` (kong-grouped `Run` + `Stop` subcommands). Existing `sync start` / `sync stop` / `sync status` / `sync health` flag surfaces are unchanged.
+
+### Migration / Compatibility
+
+- **No format changes.** Manifest schema, control-table schema, change-chunk format are unchanged. Pre-v0.20.0 chains restore + verify identically.
+- **No CLI breaking changes.** All existing `sluice` subcommands keep their flag surfaces.
+- **Brokers are read-only consumers of the chain.** They never modify manifests; the chain itself stays the source of truth for restore + verify regardless of broker activity.
+- **Same-engine only in v1.** Cross-engine `sync from-backup` (PG-source-chain → MySQL target) is deferred to Phase 5 alongside cross-engine chain restore. The broker today refuses cross-engine chains the same way `chain restore` does.
+
+### Deferred
+
+- **Phase 5 (cross-engine chain restore)** — the partner feature. Cross-engine `sync from-backup` waits for the SELECT-grammar translator + `RetargetForEngine` extensions in Phase 5.
+- **Phase 6 (KMS encryption)** — encrypted-chain consumption (the broker reads the same chunks that decrypt-on-restore would handle).
+- **Phase 7+ — operationally-mature features**: multi-source aggregation (one target consuming N source chains), selective-table replay (`--include-table` on the broker), time-shifted replay (`--lag-window=DURATION`).
+
 ## [0.19.1] - 2026-05-08
 
 Single-bug patch from the v0.19.0 test cycle. v0.19.0 shipped logical-backups Phase 4 (`sluice backup stream`) with the `TestBackupStream_Postgres_StopCommandRequestsExit` cooperative-stop integration test skipped on CI; cycle testing surfaced that the `sluice backup stream stop` companion command does not fire reliably under `-race` + heavy goroutine contention. The CDC pump, chain correctness, rollover policy, and SIGTERM-based shutdown were unaffected — only the cross-machine convenience surface was unreliable. Fix is option (b) from the BUG-CATALOG analysis: in-process channel notification for the same-process case + a heartbeat read-modify-write that closes the file-poll clobber race.
