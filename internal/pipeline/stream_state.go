@@ -280,32 +280,24 @@ func requestStreamStopAt(ctx context.Context, store ir.BackupStore, path string,
 		t := now.UTC()
 		prior.StopRequestedAt = &t
 	}
-	// PHASE-A-DEBUG (Bug 37): stop-write entry/exit so we can correlate
-	// against the stream's heartbeat writes in the test logs and confirm
-	// hypothesis (c) — heartbeat clobbering stop_requested_at. Removed/
-	// demoted in Phase C cleanup.
-	slog.InfoContext(ctx, "bug37: RequestStreamStop writing state",
-		slog.Int64("tick_unix_ms", time.Now().UnixMilli()),
-		slog.Time("stop_requested_at", *prior.StopRequestedAt),
-		slog.Time("prior_last_rollover_at", prior.LastRolloverAt),
-	)
 	if err := writeStreamState(ctx, store, path, prior); err != nil {
 		return nil, fmt.Errorf("stream stop: write state file: %w", err)
 	}
-	// In-process notification: when the running stream is in the same
-	// process as RequestStreamStop (CLI single-binary, integration test,
-	// `sync from-backup` consumer holding a stream inline), close the
-	// process-local stop channel so the running captureWindow exits
-	// immediately without waiting for a file-poll tick. No-op when
-	// cross-process (channel is registered per-process, so a stop
-	// command issued on machine B against a stream on machine A finds
-	// no registered channel and the file remains the cross-machine
-	// rendezvous). See [notifyStreamStop] / [registerStreamStopChan]
-	// in stream_stop_registry.go.
-	notified := notifyStreamStop(store)
-	slog.InfoContext(ctx, "bug37: RequestStreamStop wrote state",
-		slog.Int64("tick_unix_ms", time.Now().UnixMilli()),
-		slog.Bool("in_process_signalled", notified),
-	)
+	// In-process notification (Bug 37 fix; v0.19.1): when the running
+	// stream is in the same process as RequestStreamStop (CLI
+	// single-binary, integration test, `sync from-backup` consumer
+	// holding a stream inline), close the process-local stop channel
+	// so the running captureWindow exits immediately without waiting
+	// for a file-poll tick. No-op when cross-process (channel is
+	// registered per-process, so a stop command issued on machine B
+	// against a stream on machine A finds no registered channel and
+	// the file remains the cross-machine rendezvous). See
+	// [notifyStreamStop] / [registerStreamStopChan] in
+	// stream_stop_registry.go.
+	if notifyStreamStop(store) {
+		slog.DebugContext(ctx, "stream stop: in-process channel signalled",
+			slog.String("path", path),
+		)
+	}
 	return prior, nil
 }

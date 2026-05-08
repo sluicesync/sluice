@@ -199,11 +199,9 @@ func TestBackupStream_Postgres_RolloverByMaxChanges(t *testing.T) {
 //
 // Acceptance criterion 7.
 //
-// PHASE-A-DEBUG (Bug 37, v0.19.1): re-enabled on CI for the
-// investigation phase; the bug37: log lines emitted from
-// captureWindow + RequestStreamStop are needed to confirm the
-// heartbeat-clobber hypothesis (option c). Phase B's fix re-tightens
-// the test on CI; Phase C demotes the debug logs.
+// Bug 37 (v0.19.1) closed: in-process stop channel + heartbeat
+// merge-helper makes this test pass reliably on CI under -race; the
+// v0.19.0 skip-on-CI guard is gone. Local: ~6s; CI: comparable.
 func TestBackupStream_Postgres_StopCommandRequestsExit(t *testing.T) {
 	sourceDSN, _, cleanup := startPostgresLogical(t)
 	defer cleanup()

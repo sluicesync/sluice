@@ -6,7 +6,23 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-## [0.19.0] - 2026-05-07
+## [0.19.1] - 2026-05-08
+
+Single-bug patch from the v0.19.0 test cycle. v0.19.0 shipped logical-backups Phase 4 (`sluice backup stream`) with the `TestBackupStream_Postgres_StopCommandRequestsExit` cooperative-stop integration test skipped on CI; cycle testing surfaced that the `sluice backup stream stop` companion command does not fire reliably under `-race` + heavy goroutine contention. The CDC pump, chain correctness, rollover policy, and SIGTERM-based shutdown were unaffected — only the cross-machine convenience surface was unreliable. Fix is option (b) from the BUG-CATALOG analysis: in-process channel notification for the same-process case + a heartbeat read-modify-write that closes the file-poll clobber race.
+
+### Fixed
+
+- **Bug 37 — `backup stream` stop-signal observation does not fire reliably under `-race` + heavy goroutine contention; `sluice backup stream stop` may not trigger graceful drain on contended systems.** Phase A instrumentation pinned the actual root cause to **hypothesis (c)** from the catalog analysis: the `captureWindow` stop-poll fires on time and `LocalStore.Get` returns sub-millisecond, but the state file returned by `Get` is missing `stop_requested_at` because the running stream's per-rollover heartbeat write at the rollover boundary CLOBBERED it. The stream's in-memory `state` struct never carried `StopRequestedAt`, so its last-writer-wins overwrite of `manifests/stream_state.json` at every rollover boundary silently erased the operator's stop request whenever the heartbeat write landed after `RequestStreamStop`'s write within the same rollover-cycle. Once clobbered, neither the inner stop-poll nor the outer-loop `readStreamStopRequested` could recover — the field was gone from disk. The race fired more reliably on CI under `-race` because rollover-window deadline + heartbeat-write timing is sensitive to scheduler overhead; local development happened to land in the safe ordering on most runs.
+
+  **Pre-fix shape (v0.19.0):** `TestBackupStream_Postgres_StopCommandRequestsExit` consistently exceeds even a 60-second post-stop budget on CI (25.71s → 65.69s when budget bumped 20s → 60s — proportional scaling indicating the stream NEVER observes the stop, not just slow). `t.Skip` guard added so the test runs locally but not on CI; v0.19.0 ships with a workaround documented for operators (use SIGTERM directly instead of `backup stream stop`).
+
+  **v0.19.1 fix (two layered closes):**
+  1. **Heartbeat read-modify-write** (the actual correctness bug). New `writeStreamStateMergeHeartbeat` helper in `stream_state.go`: at every per-rollover heartbeat boundary, read the current state file first, copy any concurrent `StopRequestedAt` forward into the new payload, then write. When the merge observes a concurrent stop, the outer loop's heartbeat call returns `stopObserved=true` and the stream exits cleanly without starting a fresh rollover. Closes the clobber-race window across all backends (`LocalStore` and the `s3://` / `gs://` / `azblob://` `BlobStore` variants).
+  2. **In-process channel notification** (option (b) from BUG-CATALOG; structural reliability win). New `stream_stop_registry.go` maintains a process-local map of `[ir.BackupStore]→chan struct{}`; `BackupStream.Run` registers its store at startup and deregisters on return. `RequestStreamStop` closes the registered channel alongside the file write. `captureWindow`'s select grows a `case <-stopCh` that fires instantaneously when same-process — no file I/O, no select-loop starvation, no clobber-race window. Cross-process operators (`sluice backup stream stop --target=<url>` on a different machine) still go through the file; the channel is process-local and `notifyStreamStop` is a no-op for them. Both paths land at the same eager-exit code path, so the chain-correctness contract is unchanged.
+
+  **Verification (v0.19.1 cycle):** `TestBackupStream_Postgres_StopCommandRequestsExit` re-enabled on CI (no skip); local runs pass in ~6s with logs showing `in_process_stop` fires within ~5ms of `RequestStreamStop`'s write. All 6 BackupStream Postgres + MySQL integration tests pass. Phase 3 chain-restore + Phase 3.3 `--position-from-manifest` tests pass clean. Full `./internal/pipeline` integration suite green (834s, 0 failures). New unit tests `TestWriteStreamStateMergeHeartbeat_PreservesStop`, `TestWriteStreamStateMergeHeartbeat_NoStopReturnsFalse`, and `TestStreamStopRegistry_*` pin the contracts.
+
+
 
 Logical backups Phase 4 lands: `sluice backup stream` is a single long-running process that produces rolling incrementals at a configured cadence, no per-incremental cron orchestration. Fits k8s "always-on protection" deployments naturally; pairs with continuous CDC + chain-restore for full DR coverage. Implementation supplement: `docs/dev/design-logical-backups-phase-4.md`.
 
