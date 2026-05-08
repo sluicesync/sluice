@@ -6,6 +6,41 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-05-07
+
+Logical backups Phase 4 lands: `sluice backup stream` is a single long-running process that produces rolling incrementals at a configured cadence, no per-incremental cron orchestration. Fits k8s "always-on protection" deployments naturally; pairs with continuous CDC + chain-restore for full DR coverage. Implementation supplement: `docs/dev/design-logical-backups-phase-4.md`.
+
+### Added
+
+- **`sluice backup stream run`** — new long-running stream subcommand. Drives a `for { rollover() }` loop where each rollover is a bounded window producing one new manifest at `manifests/incr-<unix-millis>-<seq>.json`. Three rollover ceilings active in parallel, first-fired wins:
+  - `--rollover-window=DURATION` (default `5m`): wall-clock cadence.
+  - `--rollover-max-changes=N` (default `100000`): change-count ceiling.
+  - `--rollover-max-bytes=BYTES` (default `64Mi`, mirrors `--max-buffer-bytes` from Phase 2 backup writer): buffered-bytes ceiling.
+
+  Window extends to the next `TxCommit` so the chain doesn't end mid-tx (mirrors Phase 3.1's incremental orchestrator). Empty rollovers skipped by default; `--rollover-include-empty` opts in for heartbeat-shape monitoring.
+
+- **`sluice backup stream stop`** — companion stop command. Writes `stop_requested_at` to the destination's `stream_state.json`; the running stream observes the request on its next rollover-tick poll and exits cleanly. Cross-machine: an operator on machine B can stop a stream running on machine A without process access — both sides agree on the destination. Mirrors the `sync stop` pattern (ADR-0025).
+- **`pipeline.BackupStream` orchestrator** — opens the engine's CDC pump ONCE for the lifetime of the stream and reuses it across rollovers (load-bearing efficiency win over a tight `for { incremental.Run() }` loop, which would re-open the slot every iteration). `manifests/stream_state.json` carries `{pid, host, started_at, last_rollover_at, stop_requested_at}` for liveness + cross-machine signalling. Concurrent-writer protection: refuses to start a second stream when the file shows a recent (`< 2 × rollover-window`) `last_rollover_at` from a different (pid, host); `--force` bypasses with a WARN.
+- **`pipeline.RequestStreamStop(ctx, store, now)`** — exported helper for downstream tooling that wants to stop a running stream without going through the CLI. Idempotent: re-issuing stop preserves the original `stop_requested_at` timestamp so drain-completion watchers don't see the clock reset.
+- **Rollover hooks** — `--rollover-hook=<cmd>` runs a shell command after each rollover commits successfully. Receives env vars `SLUICE_ROLLOVER_MANIFEST_PATH`, `SLUICE_ROLLOVER_PARENT_BACKUP_ID`, `SLUICE_ROLLOVER_BACKUP_ID`, `SLUICE_ROLLOVER_CHANGES`, `SLUICE_ROLLOVER_BYTES`, `SLUICE_ROLLOVER_ELAPSED_MS`. 30 s timeout. Hook errors WARN-log but do NOT fail the stream — the rollover already committed. Examples in docs: push to Prometheus pushgateway / send Slack notification / write to monitoring datastore.
+- **Signal handling** — SIGINT / SIGTERM via the existing `kongContext` notifier propagates as ctx.Done through the rollover loop; mid-rollover cancel surfaces as a clean nil exit. The rollover's chunks may be partially-written but the manifest never finalises; on restart the stream picks up at the previous rollover's EndPosition. Operator-visible warning + `sluice backup verify` recommendation for orphan-chunk cleanup mid-rollover-crash.
+
+### Changed
+
+- **`cmd/sluice/backup.go` grows the `BackupStream` subtree.** New `BackupCmd.Stream` field of type `BackupStreamCmdGroup` (kong-grouped `Run` + `Stop` subcommands). Existing `backup full` / `backup incremental` / `backup verify` flags unchanged.
+
+### Migration / Compatibility
+
+- **No format changes.** Manifest schema is unchanged; stream rollovers write Phase-3 shape manifests at the same `manifests/incr-…json` path. Pre-v0.19.0 chains (single-shot incrementals + fulls) remain compatible — `restore` and `verify` walk stream-written chains identically.
+- **`stream_state.json` is new and informational-only.** The chain itself remains the source of truth for restore + verify. Losing the state file (operator deletes it, object-store eventual-consistency lag) doesn't break the chain — only the concurrent-writer / cross-machine-stop signalling falls back to ctx-cancel and process signals.
+- **No CLI breaking changes.** `sluice backup full` / `sluice backup incremental` / `sluice backup verify` / `sluice restore` flag surfaces are unchanged.
+
+### Deferred
+
+- **Phase 4.5 (backup-as-broker / `sync from-backup`)** — the watcher-side feature that polls a chain and replays incrementals into a target. Stream is the producer; `sync from-backup` is the future consumer. Out of scope here; tracked separately on the roadmap.
+- **Cross-engine chain restore** — Phase 5+ topic. Phase 4 streams produce same-engine chains; cross-engine replay needs the existing translate machinery extended for replay-of-changes-with-translation.
+- **KMS encryption** — Phase 6.
+
 ## [0.18.0] - 2026-05-07
 
 Closes the v0.17.2-documented "during-backup write window" gap. v0.17.x full backups recorded `EndPosition` at end-of-backup with no shared snapshot across tables — writes that landed on already-read tables before the position capture were missing from BOTH the row chunks AND the first incremental's `--since=<full>.EndPosition` window. v0.18.0 wires the full-backup row sweep into a snapshot-anchored consistent view and captures `EndPosition` at snapshot START, so the chain's next link's CDC stream from `EndPosition` forward picks up every write after the snapshot. Backup-only DR (no continuous `sluice sync start` paired) is now byte-perfect under heavy write load.
