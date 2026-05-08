@@ -30,6 +30,39 @@ The headline operator outcome: when CDC position is gone (PG slot dropped past `
 
 - Client-side AES-256-GCM remains unimplemented through Phase 3 (and v0.16.0's docs were corrected on this point in v0.16.1)
 
+## Implementation note: deviation from "snapshot-anchored EndPosition" (v0.17.2)
+
+v0.17.2 implemented Phase 3.3.A with a lighter shape than the design originally proposed. The original design said: "use the existing snapshot infrastructure to capture `consistent_point` at slot creation" — i.e. open an `EXPORT_SNAPSHOT`-style transaction during the full backup, take the snapshot LSN as `EndPosition`, and have the row sweep read from inside that transaction.
+
+The actual v0.17.2 implementation:
+- Adds `ir.BackupPositionCapturer` as a `SchemaReader`-attached optional interface.
+- Captures `pg_current_wal_lsn()` (PG) or `@@global.gtid_executed` (MySQL) at end-of-backup, after all row chunks have been written.
+- The row sweep continues to use plain `OpenRowReader` (no shared snapshot transaction across tables).
+
+**What this trades:**
+
+- **Lighter implementation** — no coupling between full-backup orchestrator and CDC slot lifecycle. Operators don't need backup-time slot creation; they manage slots independently via `sluice sync start`.
+- **Aligns with "Contain Postgres complexity"** — slot lifecycle stays explicit at the operator's hand, not implicit in backup runs.
+- **Loud-failure path preserved** — the 3.3.C preflight catches missing/lost slots before CDC opens for chain handoff.
+
+**The cost — the "during-backup write window" gap:**
+
+- Writes that land on tables already read by the row sweep, before `EndPosition` capture, are NOT in the row chunks AND are not covered by the first incremental's `--since=<full>.EndPosition` window (they're before that point).
+- Cross-table consistency at full-backup time is also not guaranteed (also a pre-existing characteristic of `OpenRowReader`-based backups, not new in v0.17.2).
+- The chain → handoff path is therefore not byte-perfect for sources under heavy write load during the backup window itself.
+
+**The intended operational mitigation:**
+
+- Pair backups with a continuously-running `sluice sync start` CDC stream. The live stream captures every write as it happens; the backup chain provides cold-bootstrap; the CDC stream's idempotent apply fills any chain gap on restore.
+- For backup-alone DR (no live CDC), take backups during quiet windows.
+- A future release (likely paired with Phase 4) will wire the full-backup row sweep into the existing snapshot infrastructure (`EXPORT_SNAPSHOT` + `SET TRANSACTION SNAPSHOT` for PG; `WITH CONSISTENT SNAPSHOT` for MySQL), closing the gap with snapshot-anchored `EndPosition`.
+
+**Why ship v0.17.2 with this gap:**
+
+- The gap is pre-existing in v0.17.0/v0.17.1 — those releases had a *larger* gap (incremental started at "current LSN at incremental-start time" — well after backup completion). v0.17.2 narrows the gap to just the during-backup window.
+- The continuous-CDC pattern is the recommended DR shape anyway; operators using sluice for ongoing replication get the gap closed for free.
+- The snapshot-anchored fix is non-trivial integration work; deferring it to a focused chunk avoids piling complexity onto Phase 3.3's already-substantial scope.
+
 ## Sub-phasing
 
 Per the user's preference for "ship 3.1 + 3.2 → test → 3.3 → test" sequencing — keeps blast radius small and lets restore-correctness issues surface before they pile up under handoff complexity.
