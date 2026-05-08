@@ -6,6 +6,10 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-05-07
+
+Logical backups Phase 3.1 + 3.2 lands: incremental backups + chain-aware restore. Phase 3.3 (CDC handoff via `--position-from-manifest`) is the v0.17.1 follow-up; that release closes the "auto-resume CDC from a chain's terminal position" UX gap. v0.17.0 is the storage + restore plumbing, usable today via `sluice backup full → backup incremental → restore --from=<chain-url>` with a manual `sluice sync start --resume` to continue replication. Implementation supplement: `docs/dev/design-logical-backups-phase-3.md`.
+
 ### Added
 
 - **Logical backups Phase 3.1 + 3.2: chained backups (`sluice backup incremental --since=<backup-id>`) + chain-aware restore.** The chunk that closes the resync-avoidance story for irrecoverable position loss. New CLI subcommand `sluice backup incremental` opens the source's CDC pump at the parent manifest's terminal position, streams events for a bounded window (`--window` time-bound + `--max-changes` count-bound, first-fired wins; window extends to the next TxCommit so the chain doesn't end mid-tx), and writes a chain-linked manifest under `manifests/incr-…json` plus serialised change chunks under `chunks/_changes/`. Manifest gains `Kind`, `BackupID`, `ParentBackupID`, `StartPosition`, `EndPosition`, `SchemaHash`, and `SchemaDelta` fields; pre-Phase-3 manifests treated as orphan fulls under the canonicaliser. Implementation supplement: `docs/dev/design-logical-backups-phase-3.md`.
