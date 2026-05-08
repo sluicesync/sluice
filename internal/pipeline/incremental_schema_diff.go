@@ -185,12 +185,39 @@ func columnsEqual(a, b *ir.Column) bool {
 	if a.IsGenerated() != b.IsGenerated() {
 		return false
 	}
-	// Default values compared via reflect.DeepEqual since DefaultValue
-	// is a sealed interface with simple concrete types.
-	if !reflect.DeepEqual(a.Default, b.Default) {
+	// Default values compared via canonicalized form: nil and
+	// DefaultNone{} are operationally equivalent (both mean "no
+	// default"), but reflect.DeepEqual distinguishes them. The IR's
+	// Column.UnmarshalJSON normalises absent defaults to
+	// DefaultNone{}, so a parent manifest round-tripped through JSON
+	// arrives with DefaultNone{} where the in-memory source struct
+	// might have nil. Treat them as equal here.
+	if !defaultsEqual(a.Default, b.Default) {
 		return false
 	}
 	return true
+}
+
+// defaultsEqual compares two DefaultValue interfaces, treating nil
+// and DefaultNone{} as equivalent.
+func defaultsEqual(a, b ir.DefaultValue) bool {
+	an := isNoneDefault(a)
+	bn := isNoneDefault(b)
+	if an && bn {
+		return true
+	}
+	if an != bn {
+		return false
+	}
+	return reflect.DeepEqual(a, b)
+}
+
+func isNoneDefault(d ir.DefaultValue) bool {
+	if d == nil {
+		return true
+	}
+	_, ok := d.(ir.DefaultNone)
+	return ok
 }
 
 // indicesEqual compares two indexes by name + column-name list.

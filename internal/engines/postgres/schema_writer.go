@@ -413,3 +413,36 @@ func trimTrailingSemicolon(s string) string {
 func (w *SchemaWriter) EmitColumnDef(_ context.Context, table *ir.Table, col *ir.Column) (string, error) {
 	return emitColumnDef(table, col, emitOpts{HasPostGIS: w.hasPostGIS})
 }
+
+// AlterAddColumn implements [ir.SchemaDeltaApplier] for Postgres. Used
+// by Phase 3 chain restore to apply column-add deltas captured on
+// incremental manifests against the target. PG supports
+// `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` since version 9.6, so
+// the call is idempotent across re-runs.
+//
+// The column-def fragment is rendered via the existing emitColumnDef
+// (the same helper [EmitColumnDef] uses), so generated columns,
+// defaults, NOT NULL, and PostGIS-aware GEOMETRY all flow through
+// the established path.
+func (w *SchemaWriter) AlterAddColumn(ctx context.Context, table *ir.Table, cols []*ir.Column) error {
+	if len(cols) == 0 {
+		return nil
+	}
+	for _, col := range cols {
+		def, err := emitColumnDef(table, col, emitOpts{HasPostGIS: w.hasPostGIS})
+		if err != nil {
+			return fmt.Errorf("alter add column: emit %q: %w", col.Name, err)
+		}
+		schemaName := w.schema
+		if table.Schema != "" {
+			schemaName = table.Schema
+		}
+		qualified := quoteIdent(schemaName) + "." + quoteIdent(table.Name)
+		stmt := fmt.Sprintf("ALTER TABLE %s ADD COLUMN IF NOT EXISTS %s", qualified, def)
+		if _, err := w.db.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("alter add column %q on %s.%s: %w",
+				col.Name, table.Schema, table.Name, err)
+		}
+	}
+	return nil
+}

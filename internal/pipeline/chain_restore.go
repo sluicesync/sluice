@@ -207,27 +207,36 @@ func (r *ChainRestore) applyIncremental(
 		}
 	}
 
-	// 2. Stream the change chunks through the applier.
+	// 2. Stream the change chunks through the applier. Use a derived
+	//    context the producer side honours: if the applier errors out
+	//    mid-chunk, cancelling the producer's context unblocks its
+	//    `out <- change` send so the goroutine exits. Without this, a
+	//    failed apply would leave the producer hung forever (the
+	//    applier no longer drains the channel).
 	if len(link.manifest.ChangeChunks) == 0 {
 		slog.InfoContext(ctx, "chain restore: incremental has no change chunks; schema deltas only",
 			slog.String("backup_id", manifestBackupID(link.manifest)),
 		)
 		return nil
 	}
+	streamCtx, streamCancel := context.WithCancel(ctx)
+	defer streamCancel()
 	changesCh := make(chan ir.Change)
 	errCh := make(chan error, 1)
 	go func() {
 		defer close(changesCh)
-		errCh <- r.streamIncrementalChanges(ctx, link, changesCh)
+		errCh <- r.streamIncrementalChanges(streamCtx, link, changesCh)
 	}()
 
 	if batched, ok := applier.(ir.BatchedChangeApplier); ok {
 		if err := batched.ApplyBatch(ctx, ChainRestoreStreamID, changesCh, batchSize); err != nil {
+			streamCancel()
 			<-errCh
 			return fmt.Errorf("apply changes (batched): %w", err)
 		}
 	} else {
 		if err := applier.Apply(ctx, ChainRestoreStreamID, changesCh); err != nil {
+			streamCancel()
 			<-errCh
 			return fmt.Errorf("apply changes: %w", err)
 		}
@@ -310,42 +319,44 @@ func (r *ChainRestore) applySchemaDeltas(ctx context.Context, link *manifestReco
 		)
 	}
 
-	// AlterTable: surface as a log line. Phase 3.2 v1 doesn't have a
-	// "merge alter" surface on the schema writer; the column-add /
-	// retype semantics ride on the change events themselves
-	// (Insert into a row with the new column lands the value; the
-	// applier's adapter logic already handles unknown columns
-	// gracefully on most engines). For a column rename or non-
-	// idempotent shape, the design doc's "force fresh full" guidance
-	// applies. We apply the After-shape via re-running
-	// CreateTablesWithoutConstraints which is idempotent on existing
-	// tables in both shipping engines (PG / MySQL CREATE IF NOT
-	// EXISTS) — any column drift between target and the after-shape
-	// surfaces at INSERT time as the applier's existing column-list
-	// reconciliation does its work.
+	// AlterTable: emit ADD COLUMN for newly-added columns via the
+	// engine's optional [ir.SchemaDeltaApplier] surface. Both PG and
+	// MySQL implement it as of v0.17.0. Engines without the surface
+	// fall through to the legacy "rely on change-stream
+	// reconciliation" path, which works for additive INSERT shapes
+	// on some engines but not all — the loud-failure tenet means
+	// that's the operator's signal to take a fresh full.
 	if alters > 0 {
-		alterTables := make([]*ir.Table, 0, alters)
+		applier, _ := sw.(ir.SchemaDeltaApplier)
 		for _, d := range link.manifest.SchemaDelta {
-			if d.Kind == ir.SchemaDeltaAlterTable && d.After != nil {
-				alterTables = append(alterTables, d.After)
+			if d.Kind != ir.SchemaDeltaAlterTable || d.Before == nil || d.After == nil {
+				continue
 			}
-		}
-		// CreateTablesWithoutConstraints with IF NOT EXISTS semantics
-		// won't apply ALTERs to an existing table. Surface that as a
-		// known limitation: the data-side change events still land
-		// (unknown columns get default values; engine-specific
-		// reconciliation kicks in). Log the limitation so operators
-		// see it loudly.
-		slog.WarnContext(ctx, "chain restore: schema delta — altered tables; v1 relies on change-stream replay for column-add semantics, ALTER DDL is NOT issued. If your chain includes column renames or non-additive shape changes, take a fresh full + new chain.",
-			slog.Int("count", alters),
-		)
-		// Best-effort: re-running CREATE IF NOT EXISTS for these tables
-		// is idempotent on existing tables, and creates them if some
-		// are missing (defensive — covers the "alter on an add we
-		// haven't applied yet" weird path).
-		s := translate.RetargetForEngine(&ir.Schema{Tables: alterTables}, link.manifest.SourceEngine, r.Target.Name())
-		if err := sw.CreateTablesWithoutConstraints(ctx, s); err != nil {
-			return fmt.Errorf("re-apply altered table shape (idempotent): %w", err)
+			added := addedColumns(d.Before, d.After)
+			if len(added) == 0 {
+				continue
+			}
+			if applier == nil {
+				slog.WarnContext(ctx, "chain restore: schema delta — altered table with added columns; engine has no SchemaDeltaApplier; replay will rely on the applier's column-list reconciliation. If inserts fail, force a fresh full + new chain.",
+					slog.String("table", d.Table),
+					slog.Int("added_columns", len(added)),
+				)
+				continue
+			}
+			// Retarget the After-shape so cross-engine column types
+			// (UUID → CHAR(36) etc.) get rewritten before emit.
+			retargetSchema := translate.RetargetForEngine(
+				&ir.Schema{Tables: []*ir.Table{d.After}},
+				link.manifest.SourceEngine, r.Target.Name())
+			retargetTable := retargetSchema.Tables[0]
+			retargetAdded := addedColumns(d.Before, retargetTable)
+			if err := applier.AlterAddColumn(ctx, retargetTable, retargetAdded); err != nil {
+				return fmt.Errorf("alter add column on %s: %w", d.Table, err)
+			}
+			slog.InfoContext(ctx, "chain restore: schema delta — applied ADD COLUMN",
+				slog.String("table", d.Table),
+				slog.Int("added_columns", len(added)),
+			)
 		}
 	}
 
@@ -600,6 +611,27 @@ func detectAmbiguousDeltas(deltas []*ir.SchemaDeltaEntry) error {
 		}
 	}
 	return nil
+}
+
+// addedColumns returns the columns in after but not in before,
+// preserving after's declaration order.
+func addedColumns(before, after *ir.Table) []*ir.Column {
+	if after == nil {
+		return nil
+	}
+	beforeNames := map[string]bool{}
+	if before != nil {
+		for _, c := range before.Columns {
+			beforeNames[c.Name] = true
+		}
+	}
+	out := make([]*ir.Column, 0, len(after.Columns))
+	for _, c := range after.Columns {
+		if !beforeNames[c.Name] {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 // manifestBackupID returns m's stored or computed BackupID. Pre-

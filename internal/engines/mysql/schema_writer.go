@@ -288,3 +288,49 @@ func trimTrailingSemicolon(s string) string {
 func (w *SchemaWriter) EmitColumnDef(_ context.Context, _ *ir.Table, col *ir.Column) (string, error) {
 	return emitColumnDef(col)
 }
+
+// AlterAddColumn implements [ir.SchemaDeltaApplier] for MySQL. Used
+// by Phase 3 chain restore to apply column-add deltas captured on
+// incremental manifests against the target. MySQL gained
+// `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` in 8.0.29; we probe
+// information_schema.columns first instead, so the call is
+// idempotent across re-runs and works on older 8.0.x and 5.7
+// servers too.
+func (w *SchemaWriter) AlterAddColumn(ctx context.Context, table *ir.Table, cols []*ir.Column) error {
+	if len(cols) == 0 {
+		return nil
+	}
+	for _, col := range cols {
+		exists, err := columnExists(ctx, w.db, w.schema, table.Name, col.Name)
+		if err != nil {
+			return fmt.Errorf("alter add column: probe %q: %w", col.Name, err)
+		}
+		if exists {
+			continue
+		}
+		def, err := emitColumnDef(col)
+		if err != nil {
+			return fmt.Errorf("alter add column: emit %q: %w", col.Name, err)
+		}
+		stmt := fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s",
+			quoteIdent(table.Name), def)
+		if _, err := w.db.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("alter add column %q on %s: %w",
+				col.Name, table.Name, err)
+		}
+	}
+	return nil
+}
+
+// columnExists reports whether table.column is already present in
+// the target's information_schema.columns. Used by [AlterAddColumn]
+// for idempotency on servers without `ADD COLUMN IF NOT EXISTS`.
+func columnExists(ctx context.Context, db *sql.DB, schema, table, col string) (bool, error) {
+	const q = `SELECT EXISTS(SELECT 1 FROM information_schema.columns
+		WHERE table_schema = ? AND table_name = ? AND column_name = ?)`
+	var exists bool
+	if err := db.QueryRowContext(ctx, q, schema, table, col).Scan(&exists); err != nil {
+		return false, err
+	}
+	return exists, nil
+}

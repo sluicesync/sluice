@@ -299,6 +299,36 @@ type BulkTableDropper interface {
 	DropTables(ctx context.Context, tables []*Table) error
 }
 
+// SchemaDeltaApplier is the optional surface a [SchemaWriter] can
+// implement to apply a single ALTER TABLE delta against the target.
+// Used by the Phase 3.2 chain-restore orchestrator to replay
+// schema-evolution deltas captured on incremental manifests.
+//
+// Same-engine only: the source and target engine names must match.
+// Cross-engine schema-delta translation is a Phase 5+ topic; the
+// orchestrator refuses cross-engine chain restore upstream of this
+// call.
+//
+// AddedColumns is the slice of columns that exist on the after-shape
+// but not the before-shape. Implementations emit `ALTER TABLE
+// <table> ADD COLUMN <col-def>` per entry (engines pick the dialect-
+// specific column-def fragment via [ColumnDDLPreviewer]).
+//
+// Engines without an AlterAddColumn surface (none today; both PG and
+// MySQL implement this) cause chain-restore to fall through with a
+// clear log line and rely on the applier's column-list reconciliation
+// — which works for some shapes but not all (PG strict-mode errors
+// on unknown columns; MySQL's INSERT lists tolerate them via column
+// list).
+type SchemaDeltaApplier interface {
+	// AlterAddColumn issues `ALTER TABLE <table> ADD COLUMN <col>`
+	// for each column in cols, against the target. Idempotent on
+	// columns that already exist (engine writers use IF NOT EXISTS
+	// where the syntax allows; otherwise fall back to a probing
+	// information_schema check before emit).
+	AlterAddColumn(ctx context.Context, table *Table, cols []*Column) error
+}
+
 // SchemaTypeDropper is the optional surface a [RowWriter] (or
 // [SchemaWriter]) can implement to drop user-defined database-level
 // types created from the IR schema (e.g. Postgres `CREATE TYPE ...

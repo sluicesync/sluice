@@ -171,12 +171,15 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 		)
 	}
 
-	// 2. Read source schema at window start. SchemaHash is computed
-	//    from this; SchemaDelta uses this as the "before" baseline.
-	beforeSchema, err := b.readSourceSchema(ctx)
-	if err != nil {
-		return wrapWithHint(PhaseConnect, fmt.Errorf("incremental: read source schema (start): %w", err))
-	}
+	// 2. The "before" baseline for SchemaDelta is the parent
+	//    manifest's recorded schema — that's the source's shape at
+	//    the parent's terminal CDC position, which is exactly the
+	//    shape against which the incremental's window's events apply.
+	//    Reading the source again here would catch the post-ALTER
+	//    shape (DDL on the source between the parent and now landed
+	//    before this read), making the diff useless. SchemaHash is
+	//    computed from the same baseline.
+	beforeSchema := parent.Schema
 	beforeHash, err := ir.ComputeSchemaHash(beforeSchema)
 	if err != nil {
 		return fmt.Errorf("incremental: hash source schema (start): %w", err)
@@ -243,7 +246,7 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 	}
 
 	deadline := clockNow().Add(windowDur)
-	endPos, totalChanges, captureErr := b.captureWindow(ctx, changesCh, manifest, chunkSize, deadline, b.MaxChanges, clockNow)
+	endPos, totalChanges, captureErr := b.captureWindow(ctx, cdc, changesCh, manifest, chunkSize, deadline, b.MaxChanges, clockNow)
 	if captureErr != nil {
 		return wrapWithHint(PhaseCDC, fmt.Errorf("incremental: capture window: %w", captureErr))
 	}
@@ -387,8 +390,14 @@ func (b *IncrementalBackup) openCDCReader(ctx context.Context) (ir.CDCReader, er
 // is permissive about straddle: a TxBegin already received but the
 // matching TxCommit not yet observed extends the window by up to one
 // transaction so the chain doesn't end mid-tx.
+//
+// cdc is passed in so an early channel-close (the CDC reader's pump
+// terminating with an error) surfaces the underlying error via
+// `cdc.Err()` rather than silently exiting the window with zero
+// captured changes.
 func (b *IncrementalBackup) captureWindow(
 	ctx context.Context,
+	cdc ir.CDCReader,
 	changesCh <-chan ir.Change,
 	manifest *ir.Manifest,
 	chunkSize int,
@@ -463,8 +472,15 @@ func (b *IncrementalBackup) captureWindow(
 			}
 		case change, ok := <-changesCh:
 			if !ok {
-				// Channel closed unexpectedly. Treat as orderly window
-				// end so the manifest still records what we got.
+				// Channel closed. If the CDC reader recorded an error,
+				// surface it (loud-failure tenet); otherwise treat as
+				// orderly window end so the manifest still records what
+				// we got.
+				if errReader, ok := cdc.(interface{ Err() error }); ok {
+					if e := errReader.Err(); e != nil {
+						return lastPos, totalChanges, fmt.Errorf("cdc reader: %w", e)
+					}
+				}
 				if err := flush(); err != nil {
 					return lastPos, totalChanges, err
 				}

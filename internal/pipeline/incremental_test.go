@@ -208,7 +208,7 @@ func TestIncrementalBackup_RoundTrip(t *testing.T) {
 	parentEndPos := parent.EndPosition
 	src := &fakeCDCEngine{
 		name:           "postgres",
-		schemaSequence: []*ir.Schema{schema, schema}, // before & after; identical → no delta
+		schemaSequence: []*ir.Schema{schema}, // after-shape; before comes from parent manifest
 		cdcChanges: []ir.Change{
 			ir.TxBegin{Position: ir.Position{Engine: "postgres", Token: `{"slot":"sluice_slot","lsn":"0/110"}`}},
 			ir.Insert{
@@ -293,7 +293,10 @@ func TestIncrementalBackup_RoundTrip(t *testing.T) {
 	}
 	// SchemaDelta empty (before == after).
 	if len(incr.SchemaDelta) != 0 {
-		t.Errorf("SchemaDelta = %+v; want empty", incr.SchemaDelta)
+		for _, d := range incr.SchemaDelta {
+			t.Logf("unexpected delta: kind=%q table=%q before=%+v after=%+v", d.Kind, d.Table, d.Before, d.After)
+		}
+		t.Errorf("SchemaDelta len = %d; want empty", len(incr.SchemaDelta))
 	}
 	// One chunk written, with 3 changes.
 	if len(incr.ChangeChunks) != 1 {
@@ -383,9 +386,14 @@ func TestIncrementalBackup_SchemaDelta_AddColumn(t *testing.T) {
 	parent.BackupID = ir.ComputeBackupID(parent)
 	writeParentFullManifest(t, store, parent)
 
+	// The source schema reader is called once at window-end (the
+	// "after" snapshot); the "before" baseline comes from the parent
+	// manifest's Schema (= beforeSchema, written via
+	// writeParentFullManifest above). So schemaSequence here only
+	// needs to return the after-shape.
 	src := &fakeCDCEngine{
 		name:           "postgres",
-		schemaSequence: []*ir.Schema{beforeSchema, afterSchema},
+		schemaSequence: []*ir.Schema{afterSchema},
 		cdcChanges: []ir.Change{
 			ir.TxCommit{Position: ir.Position{Engine: "postgres", Token: `{"slot":"sluice_slot","lsn":"0/130"}`}},
 		},
