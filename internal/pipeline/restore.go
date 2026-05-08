@@ -194,12 +194,22 @@ func (r *Restore) Run(ctx context.Context) error {
 // storeHasIncrementals reports whether r.Store contains any
 // incremental manifest files. Used to dispatch between the legacy
 // single-manifest restore and the Phase 3 chain restore.
+//
+// Filters by manifest shape (`manifests/incr-*.json`) so non-manifest
+// state files that share the directory (e.g. Phase 4's
+// `manifests/stream_state.json`) don't trigger the chain-restore
+// dispatch on a single-full backup.
 func (r *Restore) storeHasIncrementals(ctx context.Context) (bool, error) {
 	paths, err := r.Store.List(ctx, incrementalManifestPrefix)
 	if err != nil {
 		return false, err
 	}
-	return len(paths) > 0, nil
+	for _, p := range paths {
+		if isIncrementalManifestPath(p) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // validate sanity-checks required fields.

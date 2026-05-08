@@ -100,6 +100,15 @@ const DefaultRolloverHookTimeout = 30 * time.Second
 // stream crashed and didn't clean up. Tuneable only via tests.
 const streamStateFreshness = 2
 
+// streamStopPollInterval is the cadence the in-rollover stop-signal
+// poll runs at. Decoupled from RolloverWindow so an operator's
+// `sluice backup stream stop` is observed within ~1 s, regardless of
+// the (typically minutes-long) rollover-window setting. Mirrors the
+// streamer's [stopSignalPollInterval] in spirit, but uses a tighter
+// 1 s cadence because a backup stream's "exit-on-stop" budget is
+// usually integration-test-tight (10 s end-to-end).
+const streamStopPollInterval = 1 * time.Second
+
 // BackupStream runs a continuous-incremental long-running stream
 // against Source / SourceDSN. Construct the value, then call Run. Run
 // blocks until ctx is cancelled or a stop request is observed via
@@ -329,28 +338,63 @@ func (b *BackupStream) Run(ctx context.Context) error {
 
 		// Run one rollover.
 		started := clockNow()
-		manifest, totalChanges, totalBytes, sourceClosed, rErr := b.runRollover(ctx, cdc, changesCh, currentParent, startPos, rolloverWindow, maxChanges, maxBytes, chunkSize, now, clockNow)
+		roll, rErr := b.runRollover(ctx, cdc, changesCh, currentParent, startPos, rolloverWindow, maxChanges, maxBytes, chunkSize, statePath, now, clockNow)
 		elapsed := clockNow().Sub(started)
 		if rErr != nil {
-			// ctx-cancel during a rollover surfaces here. Treat it as a
-			// clean exit: the rollover's in-flight chunks may have been
-			// written, but the manifest never finalised; on restart the
-			// stream picks up at the previous rollover's EndPosition.
+			// ctx-cancel during a rollover surfaces here. Per the
+			// design doc's SIGTERM contract, a graceful drain commits
+			// the in-flight rollover (chunks already flushed inside
+			// captureWindow); finalise the manifest here so every
+			// change observed before cancel makes it into the chain.
+			// Uses a fresh stopDrainTimeout-bounded ctx for the
+			// manifest write so a store call against the just-
+			// cancelled parent doesn't short-circuit the commit.
 			if errors.Is(rErr, context.Canceled) || errors.Is(rErr, context.DeadlineExceeded) {
-				slog.InfoContext(ctx, "stream: context cancelled during rollover; in-flight rollover not committed",
-					slog.Duration("elapsed", elapsed),
-				)
+				if roll.Manifest != nil && len(roll.Manifest.ChangeChunks) > 0 {
+					commitCtx, commitCancel := context.WithTimeout(context.WithoutCancel(ctx), stopDrainTimeout)
+					manifestPath := buildIncrementalManifestPath(roll.Manifest)
+					if err := writeManifestAt(commitCtx, b.Store, manifestPath, roll.Manifest); err != nil {
+						slog.WarnContext(ctx, "stream: drain-commit of in-flight manifest failed",
+							slog.String("err", err.Error()),
+						)
+					} else {
+						slog.InfoContext(ctx, "stream rollover committed (drain on ctx-cancel)",
+							slog.String("manifest_path", manifestPath),
+							slog.String("backup_id", roll.Manifest.BackupID),
+							slog.Int64("changes", roll.TotalChanges),
+							slog.Int64("bytes", roll.TotalBytes),
+							slog.Duration("elapsed", elapsed),
+						)
+					}
+					commitCancel()
+				} else {
+					slog.InfoContext(ctx, "stream: context cancelled during rollover; in-flight rollover not committed",
+						slog.Duration("elapsed", elapsed),
+					)
+				}
 				return nil
 			}
 			return wrapWithHint(PhaseCDC, fmt.Errorf("stream: rollover %d: %w", rolloverSeq, rErr))
 		}
 
-		if manifest == nil {
+		if roll.Manifest == nil {
 			// Empty rollover that we skipped per IncludeEmptyRollovers.
 			slog.InfoContext(ctx, "stream: rollover empty; skipping manifest write",
 				slog.Int("seq", rolloverSeq),
 				slog.Duration("elapsed", elapsed),
 			)
+			if roll.StopRequested {
+				// Stop signal observed during the empty window: exit
+				// cleanly without overwriting the state file (which now
+				// carries stop_requested_at written by the operator's
+				// `sluice backup stream stop`; clobbering it would
+				// confuse any drain-completion tooling watching the
+				// field).
+				slog.InfoContext(ctx, "stream: stop requested via stream_state.json during rollover; exiting",
+					slog.Int("rollovers", rolloverSeq),
+				)
+				return nil
+			}
 			// Update state file's last_rollover_at as a heartbeat even
 			// when no manifest was committed — operators monitoring the
 			// state file's freshness should see the stream is alive.
@@ -367,7 +411,7 @@ func (b *BackupStream) Run(ctx context.Context) error {
 			// would spin forever producing skip-empty rollovers. In
 			// production the same path triggers when the slot becomes
 			// invalid mid-stream — we want a loud exit, not a busy spin.
-			if sourceClosed {
+			if roll.SourceClosed {
 				slog.InfoContext(ctx, "stream: cdc channel closed; exiting after final empty rollover",
 					slog.Int("rollovers", rolloverSeq),
 				)
@@ -376,9 +420,29 @@ func (b *BackupStream) Run(ctx context.Context) error {
 			continue
 		}
 
-		manifestPath := buildIncrementalManifestPath(manifest)
-		if err := writeManifestAt(ctx, b.Store, manifestPath, manifest); err != nil {
+		manifestPath := buildIncrementalManifestPath(roll.Manifest)
+		if err := writeManifestAt(ctx, b.Store, manifestPath, roll.Manifest); err != nil {
 			return fmt.Errorf("stream: write rollover manifest: %w", err)
+		}
+
+		if roll.StopRequested {
+			// Stop observed during the window: commit the in-flight
+			// manifest (already done above) but skip the
+			// state-file last_rollover_at heartbeat write — the
+			// state file now carries the operator's
+			// stop_requested_at, and writing our heartbeat here would
+			// clobber it. Exit cleanly.
+			slog.InfoContext(ctx, "stream rollover committed; stop requested via stream_state.json — exiting",
+				slog.String("manifest_path", manifestPath),
+				slog.String("backup_id", roll.Manifest.BackupID),
+				slog.Int64("changes", roll.TotalChanges),
+				slog.Int64("bytes", roll.TotalBytes),
+				slog.Duration("elapsed", elapsed),
+			)
+			if b.RolloverHook != "" {
+				runRolloverHook(ctx, b.RolloverHook, roll.Manifest, manifestPath, roll.TotalChanges, roll.TotalBytes, elapsed)
+			}
+			return nil
 		}
 
 		// Advance state file's last_rollover_at to mark liveness.
@@ -391,29 +455,29 @@ func (b *BackupStream) Run(ctx context.Context) error {
 
 		slog.InfoContext(ctx, "stream rollover committed",
 			slog.String("manifest_path", manifestPath),
-			slog.String("backup_id", manifest.BackupID),
-			slog.String("parent_backup_id", manifest.ParentBackupID),
-			slog.Int64("changes", totalChanges),
-			slog.Int64("bytes", totalBytes),
+			slog.String("backup_id", roll.Manifest.BackupID),
+			slog.String("parent_backup_id", roll.Manifest.ParentBackupID),
+			slog.Int64("changes", roll.TotalChanges),
+			slog.Int64("bytes", roll.TotalBytes),
 			slog.Duration("elapsed", elapsed),
 		)
 
 		// Run the rollover hook (best-effort; failures don't fail the stream).
 		if b.RolloverHook != "" {
-			runRolloverHook(ctx, b.RolloverHook, manifest, manifestPath, totalChanges, totalBytes, elapsed)
+			runRolloverHook(ctx, b.RolloverHook, roll.Manifest, manifestPath, roll.TotalChanges, roll.TotalBytes, elapsed)
 		}
 
 		// Advance the chain: next rollover's parent is this rollover's
 		// manifest; next rollover's StartPosition is this rollover's
 		// EndPosition.
-		currentParent = manifest
-		startPos = manifest.EndPosition
+		currentParent = roll.Manifest
+		startPos = roll.Manifest.EndPosition
 		rolloverSeq++
 
 		// Source-channel-closed: pump terminated (test fakes that
 		// emit-then-close, or a real engine whose stream ended). Exit
 		// cleanly rather than spinning on an empty channel.
-		if sourceClosed {
+		if roll.SourceClosed {
 			slog.InfoContext(ctx, "stream: cdc channel closed after rollover commit; exiting",
 				slog.Int("rollovers", rolloverSeq),
 			)
@@ -476,13 +540,26 @@ func (b *BackupStream) resolveParent(ctx context.Context) (*ir.Manifest, string,
 	return mostRecent.manifest, mostRecent.path, nil
 }
 
+// rolloverOutcome bundles the multi-value result of a single rollover
+// run so [runRollover]'s signature stays under gocritic's 5-result
+// ceiling. The Manifest field is nil when an empty rollover was
+// captured AND IncludeEmptyRollovers is false ("skip the manifest
+// write").
+type rolloverOutcome struct {
+	Manifest      *ir.Manifest
+	TotalChanges  int64
+	TotalBytes    int64
+	SourceClosed  bool
+	StopRequested bool
+}
+
 // runRollover executes one bounded rollover window. Returns the
-// committed manifest (with chunks staged on the store), the change
-// count, the bytes written across all chunks in the window, and any
+// outcome (manifest, counts, sourceClosed, stopRequested) plus any
 // fatal error.
 //
 // When IncludeEmptyRollovers is false and the window captured zero
-// changes, returns (nil, 0, 0, nil) to signal "skip the manifest write."
+// changes, the returned outcome's Manifest is nil to signal "skip the
+// manifest write."
 func (b *BackupStream) runRollover(
 	ctx context.Context,
 	cdc ir.CDCReader,
@@ -493,13 +570,14 @@ func (b *BackupStream) runRollover(
 	maxChanges int,
 	maxBytes int64,
 	chunkSize int,
+	statePath string,
 	now func() time.Time,
 	clockNow func() time.Time,
-) (rolloverManifest *ir.Manifest, totalChanges, totalBytes int64, sourceClosed bool, err error) {
+) (rolloverOutcome, error) {
 	beforeSchema := parent.Schema
 	beforeHash, hashErr := ir.ComputeSchemaHash(beforeSchema)
 	if hashErr != nil {
-		return nil, 0, 0, false, fmt.Errorf("hash source schema: %w", hashErr)
+		return rolloverOutcome{}, fmt.Errorf("hash source schema: %w", hashErr)
 	}
 
 	manifest := &ir.Manifest{
@@ -519,23 +597,24 @@ func (b *BackupStream) runRollover(
 	}
 
 	deadline := clockNow().Add(window)
-	endPos, capturedChanges, capturedBytes, srcClosed, captureErr := b.captureWindow(ctx, cdc, changesCh, manifest, chunkSize, deadline, maxChanges, maxBytes, clockNow)
-	totalChanges = capturedChanges
-	totalBytes = capturedBytes
-	sourceClosed = srcClosed
-	if captureErr != nil {
-		return nil, totalChanges, totalBytes, sourceClosed, captureErr
+	captured, captureErr := b.captureWindow(ctx, cdc, changesCh, manifest, chunkSize, deadline, maxChanges, maxBytes, statePath, clockNow)
+	out := rolloverOutcome{
+		TotalChanges:  captured.TotalChanges,
+		TotalBytes:    captured.TotalBytes,
+		SourceClosed:  captured.SourceClosed,
+		StopRequested: captured.StopRequested,
 	}
 
 	// Empty rollover handling: when no changes captured AND the
-	// operator hasn't asked to include them, return (nil, ...) so the
-	// caller skips the manifest write.
-	if totalChanges == 0 && !b.IncludeEmptyRollovers {
-		return nil, 0, 0, sourceClosed, nil
+	// operator hasn't asked to include them, return outcome with
+	// Manifest=nil so the caller skips the manifest write. Applies
+	// even on ctx-cancel: nothing observed → nothing to commit.
+	if captured.TotalChanges == 0 && !b.IncludeEmptyRollovers {
+		return out, captureErr
 	}
 
-	manifest.EndPosition = endPos
-	if (manifest.EndPosition.Engine == "" && manifest.EndPosition.Token == "") && totalChanges == 0 {
+	manifest.EndPosition = captured.EndPos
+	if (manifest.EndPosition.Engine == "" && manifest.EndPosition.Token == "") && captured.TotalChanges == 0 {
 		// Empty rollover written-anyway path: the chain advances no
 		// position. Use the StartPosition as the EndPosition so the
 		// next rollover still has a valid resume cursor.
@@ -555,22 +634,45 @@ func (b *BackupStream) runRollover(
 
 	manifest.BackupID = ir.ComputeBackupID(manifest)
 	manifest.PartialState = ir.BackupStateComplete
-	return manifest, totalChanges, totalBytes, sourceClosed, nil
+	out.Manifest = manifest
+	return out, captureErr
+}
+
+// captureOutcome bundles the multi-value result of one
+// [BackupStream.captureWindow] call. Lives alongside [rolloverOutcome]
+// so each layer of the rollover machinery returns one struct + one
+// error rather than a long positional argument list (gocritic's 5-result
+// ceiling).
+type captureOutcome struct {
+	EndPos        ir.Position
+	TotalChanges  int64
+	TotalBytes    int64
+	SourceClosed  bool
+	StopRequested bool
 }
 
 // captureWindow drains changes from changesCh into chunks staged on
 // manifest, closing on the first of: deadline reached, totalChanges ≥
-// maxChanges, totalBytes ≥ maxBytes. Mirrors
-// [IncrementalBackup.captureWindow] but adds a byte-bound and tracks
-// totalBytes across chunks for the rollover-hook env contract.
+// maxChanges, totalBytes ≥ maxBytes, or a cross-machine stop request
+// observed via `stream_state.json`. Mirrors
+// [IncrementalBackup.captureWindow] but adds a byte-bound, an in-loop
+// stop poll (decoupled from rollover cadence), and tracks totalBytes
+// across chunks for the rollover-hook env contract.
 //
 // Window-end straddle behaviour: an open transaction (TxBegin observed
 // without TxCommit) extends the window by up to one transaction so the
-// chain doesn't end mid-tx — same as Phase 3.1.
+// chain doesn't end mid-tx — same as Phase 3.1. Stop-request observed
+// while inTransaction is honoured at the next tx boundary too.
 //
-// Returns the position of the last applied change (= EndPosition),
-// total change count, total bytes-written across chunks, and any fatal
-// error.
+// Stop-request poll cadence: [streamStopPollInterval] (1 s by default,
+// regardless of the rollover-window). The poll reads `stream_state.json`'s
+// `stop_requested_at` field directly; on first observation, the
+// in-flight rollover flushes (commits chunks staged so far) and
+// returns with [captureOutcome.StopRequested]=true so the outer loop
+// can finalise the manifest and exit cleanly without another
+// state-file overwrite.
+//
+// Returns the captured outcome and any fatal error.
 func (b *BackupStream) captureWindow(
 	ctx context.Context,
 	cdc ir.CDCReader,
@@ -580,18 +682,20 @@ func (b *BackupStream) captureWindow(
 	deadline time.Time,
 	maxChanges int,
 	maxBytes int64,
+	statePath string,
 	clockNow func() time.Time,
-) (endPos ir.Position, totalChanges, totalBytes int64, sourceClosed bool, err error) {
+) (captureOutcome, error) {
 	var (
 		writer        *changeChunkWriter
 		buf           *bytes.Buffer
 		chunkIdx      int
 		inTransaction bool
+		out           captureOutcome
 	)
 
 	runNamespace := changeChunkRunNamespace(manifest)
 
-	flush := func() error {
+	flushTo := func(putCtx context.Context) error {
 		if writer == nil {
 			return nil
 		}
@@ -601,7 +705,7 @@ func (b *BackupStream) captureWindow(
 		path := changeChunkPath(runNamespace, chunkIdx)
 		hash := writer.Hash()
 		nb := int64(buf.Len())
-		if err := b.Store.Put(ctx, path, buf); err != nil {
+		if err := b.Store.Put(putCtx, path, buf); err != nil {
 			return fmt.Errorf("store put %q: %w", path, err)
 		}
 		manifest.ChangeChunks = append(manifest.ChangeChunks, &ir.ChunkInfo{
@@ -609,12 +713,13 @@ func (b *BackupStream) captureWindow(
 			RowCount: writer.ChangeCount(),
 			SHA256:   hash,
 		})
-		totalBytes += nb
+		out.TotalBytes += nb
 		writer = nil
 		buf = nil
 		chunkIdx++
 		return nil
 	}
+	flush := func() error { return flushTo(ctx) }
 
 	openWriter := func() error {
 		buf = &bytes.Buffer{}
@@ -629,31 +734,81 @@ func (b *BackupStream) captureWindow(
 	timer := time.NewTimer(deadline.Sub(clockNow()))
 	defer timer.Stop()
 
+	// Stop-poll ticker: decoupled from rollover-window cadence so an
+	// operator's `sluice backup stream stop` is observed promptly
+	// regardless of how long the current window has left to run.
+	// Reads `stream_state.json` directly; on first observation, sets
+	// out.StopRequested so the outer loop knows to exit cleanly after
+	// this rollover commits.
+	stopPoll := time.NewTicker(streamStopPollInterval)
+	defer stopPoll.Stop()
+
 	deadlinePassed := false
 	for {
 		select {
 		case <-ctx.Done():
-			return endPos, totalChanges, totalBytes, sourceClosed, ctx.Err()
+			// Graceful drain: commit whatever's been captured to the
+			// in-flight chunk so the rollover's manifest (written by
+			// the caller) covers every change observed before cancel.
+			// Mirrors the design doc's SIGTERM "commit current
+			// in-flight rollover" contract. Uses a fresh
+			// stopDrainTimeout-bounded ctx for the chunk write so a
+			// store call against the just-cancelled parent ctx doesn't
+			// short-circuit the flush.
+			if !inTransaction && writer != nil {
+				flushCtx, flushCancel := context.WithTimeout(context.WithoutCancel(ctx), stopDrainTimeout)
+				if fErr := flushTo(flushCtx); fErr != nil {
+					slog.WarnContext(ctx, "stream: drain-flush failed; in-flight chunk dropped",
+						slog.String("err", fErr.Error()),
+					)
+				}
+				flushCancel()
+			}
+			return out, ctx.Err()
 		case <-timer.C:
 			deadlinePassed = true
 			if !inTransaction {
 				if err := flush(); err != nil {
-					return endPos, totalChanges, totalBytes, sourceClosed, err
+					return out, err
 				}
-				return endPos, totalChanges, totalBytes, sourceClosed, nil
+				return out, nil
+			}
+		case <-stopPoll.C:
+			// Cross-machine stop poll. Honoured at next tx boundary so
+			// the chain doesn't end mid-tx (same shape as the deadline
+			// case above).
+			if out.StopRequested {
+				continue
+			}
+			req, sErr := readStreamStopRequested(ctx, b.Store, statePath)
+			if sErr != nil {
+				slog.WarnContext(ctx, "stream: stop-poll read failed; will retry on next tick",
+					slog.String("err", sErr.Error()),
+				)
+				continue
+			}
+			if req == nil {
+				continue
+			}
+			out.StopRequested = true
+			if !inTransaction {
+				if err := flush(); err != nil {
+					return out, err
+				}
+				return out, nil
 			}
 		case change, ok := <-changesCh:
 			if !ok {
-				sourceClosed = true
+				out.SourceClosed = true
 				if errReader, ok := cdc.(interface{ Err() error }); ok {
 					if e := errReader.Err(); e != nil {
-						return endPos, totalChanges, totalBytes, sourceClosed, fmt.Errorf("cdc reader: %w", e)
+						return out, fmt.Errorf("cdc reader: %w", e)
 					}
 				}
 				if err := flush(); err != nil {
-					return endPos, totalChanges, totalBytes, sourceClosed, err
+					return out, err
 				}
-				return endPos, totalChanges, totalBytes, sourceClosed, nil
+				return out, nil
 			}
 			switch change.(type) {
 			case ir.TxBegin:
@@ -663,29 +818,29 @@ func (b *BackupStream) captureWindow(
 			}
 			if writer == nil {
 				if err := openWriter(); err != nil {
-					return endPos, totalChanges, totalBytes, sourceClosed, err
+					return out, err
 				}
 			}
 			if err := writer.WriteChange(change); err != nil {
-				return endPos, totalChanges, totalBytes, sourceClosed, err
+				return out, err
 			}
-			totalChanges++
+			out.TotalChanges++
 			pos := change.Pos()
 			if pos.Engine != "" || pos.Token != "" {
-				endPos = pos
+				out.EndPos = pos
 			}
 			// Roll the chunk on per-chunk-row cap.
 			if writer.ChangeCount() >= int64(chunkSize) {
 				if err := flush(); err != nil {
-					return endPos, totalChanges, totalBytes, sourceClosed, err
+					return out, err
 				}
 			}
 			// Approximate max-changes cap: close at next tx boundary.
-			if maxChanges > 0 && totalChanges >= int64(maxChanges) && !inTransaction {
+			if maxChanges > 0 && out.TotalChanges >= int64(maxChanges) && !inTransaction {
 				if err := flush(); err != nil {
-					return endPos, totalChanges, totalBytes, sourceClosed, err
+					return out, err
 				}
-				return endPos, totalChanges, totalBytes, sourceClosed, nil
+				return out, nil
 			}
 			// Approximate max-bytes cap: close at next tx boundary
 			// once the running total + the in-flight chunk's buffered
@@ -697,18 +852,18 @@ func (b *BackupStream) captureWindow(
 				if buf != nil {
 					inflightBytes = int64(buf.Len())
 				}
-				if totalBytes+inflightBytes >= maxBytes {
+				if out.TotalBytes+inflightBytes >= maxBytes {
 					if err := flush(); err != nil {
-						return endPos, totalChanges, totalBytes, sourceClosed, err
+						return out, err
 					}
-					return endPos, totalChanges, totalBytes, sourceClosed, nil
+					return out, nil
 				}
 			}
-			if deadlinePassed && !inTransaction {
+			if (deadlinePassed || out.StopRequested) && !inTransaction {
 				if err := flush(); err != nil {
-					return endPos, totalChanges, totalBytes, sourceClosed, err
+					return out, err
 				}
-				return endPos, totalChanges, totalBytes, sourceClosed, nil
+				return out, nil
 			}
 		}
 	}

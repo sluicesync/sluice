@@ -42,6 +42,7 @@ import (
 	"io"
 	"log/slog"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/orware/sluice/internal/ir"
@@ -71,6 +72,36 @@ const changeChunksPrefix = "chunks/_changes/"
 // `manifests/incr-…json` so the chain-restore walker can list them
 // without a per-name pattern match.
 const incrementalManifestPrefix = "manifests/"
+
+// incrementalManifestFilenamePrefix is the per-file prefix every
+// incremental manifest's basename starts with (see
+// [buildIncrementalManifestPath]). The chain-walker filters
+// `List(manifests/)` results on this prefix so non-manifest state
+// files that share the directory (e.g. Phase 4's
+// `manifests/stream_state.json`) are not mistaken for chain entries.
+const incrementalManifestFilenamePrefix = "incr-"
+
+// isIncrementalManifestPath reports whether path is shaped like a
+// chain-restore-eligible incremental manifest entry — i.e. it sits
+// directly under [incrementalManifestPrefix], its basename begins with
+// [incrementalManifestFilenamePrefix], and it ends in `.json`. Used
+// by chain-walker manifest discovery so additions to the
+// `manifests/` directory (such as `stream_state.json`) don't get
+// treated as chain entries.
+func isIncrementalManifestPath(path string) bool {
+	if !strings.HasPrefix(path, incrementalManifestPrefix) {
+		return false
+	}
+	rest := path[len(incrementalManifestPrefix):]
+	if strings.ContainsRune(rest, '/') {
+		// Something nested under manifests/ — not a chain entry shape.
+		return false
+	}
+	if !strings.HasPrefix(rest, incrementalManifestFilenamePrefix) {
+		return false
+	}
+	return strings.HasSuffix(rest, ".json")
+}
 
 // IncrementalBackup runs a single Phase 3.1 incremental backup
 // against Source / SourceDSN, taking the parent backup's terminal
@@ -643,13 +674,19 @@ func listAllManifests(ctx context.Context, store ir.BackupStore) ([]manifestReco
 		out = append(out, manifestRecord{path: ManifestFileName, manifest: m})
 	}
 
-	// Incremental manifests under `manifests/`.
+	// Incremental manifests under `manifests/`. Filter the listing on
+	// shape so non-manifest state files in the same directory (e.g.
+	// Phase 4's `manifests/stream_state.json`) aren't mistaken for
+	// chain entries.
 	paths, err := store.List(ctx, incrementalManifestPrefix)
 	if err != nil {
 		return nil, fmt.Errorf("list %q: %w", incrementalManifestPrefix, err)
 	}
 	sort.Strings(paths) // lexically sortable by construction
 	for _, p := range paths {
+		if !isIncrementalManifestPath(p) {
+			continue
+		}
 		m, err := readManifestAt(ctx, store, p)
 		if err != nil {
 			return nil, fmt.Errorf("read %q: %w", p, err)
