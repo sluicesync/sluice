@@ -17,12 +17,15 @@ import (
 
 // BackupCmd groups the backup verbs. Phase 1 shipped `full` and
 // `verify`; Phase 3 (v0.17.0) adds `incremental` for chained backups
-// taken on top of a previous full or incremental. See
-// `docs/dev/design-logical-backups.md` and
-// `docs/dev/design-logical-backups-phase-3.md` for the staged plan.
+// taken on top of a previous full or incremental; Phase 4 (v0.19.0)
+// adds `stream` for continuous-incremental long-running streams. See
+// `docs/dev/design-logical-backups.md`,
+// `docs/dev/design-logical-backups-phase-3.md`, and
+// `docs/dev/design-logical-backups-phase-4.md` for the staged plan.
 type BackupCmd struct {
 	Full        BackupFullCmd        `cmd:"" help:"Take a full logical backup of a source database to a local directory."`
 	Incremental BackupIncrementalCmd `cmd:"" help:"Take an incremental backup chained off a previous full or incremental (Phase 3)."`
+	Stream      BackupStreamCmdGroup `cmd:"" help:"Long-running stream that produces rolling incrementals (Phase 4)."`
 	Verify      BackupVerifyCmd      `cmd:"" help:"Re-checksum every chunk in an existing backup chain and report any mismatches."`
 }
 
@@ -248,6 +251,155 @@ func (b *BackupIncrementalCmd) Run(_ *Globals) error {
 		SluiceVersion: version,
 	}
 	return incr.Run(ctx)
+}
+
+// BackupStreamCmdGroup groups `sluice backup stream` (run) and
+// `sluice backup stream stop` (companion stop). The "run" verb is
+// `sluice backup stream run` for kong to dispatch cleanly with a
+// sibling `stop` subcommand.
+type BackupStreamCmdGroup struct {
+	Run  BackupStreamCmd     `cmd:"" help:"Run the long-running stream (rolling incrementals at configured cadence)."`
+	Stop BackupStreamStopCmd `cmd:"" help:"Request a running stream to commit the in-flight rollover and exit cleanly."`
+}
+
+// BackupStreamCmd runs `sluice backup stream run`. Drives a continuous-
+// incremental long-running stream against the source: each rollover
+// captures CDC events for a bounded window (time / change-count /
+// byte ceilings, first-fired wins) and commits a new manifest under
+// `manifests/incr-<unix-millis>-<seq>.json`. Window extends to next
+// TxCommit so the chain doesn't end mid-tx.
+//
+// Operator stop paths:
+//
+//   - SIGTERM / SIGINT (Ctrl-C): drain in-flight rollover, exit cleanly.
+//   - `sluice backup stream stop --target=<url>`: cross-machine stop
+//     via `stream_state.json`. Polled between rollovers; the stream
+//     exits within ≤ rollover-window of the request.
+type BackupStreamCmd struct {
+	SourceDriver string `help:"Source engine name (e.g. mysql, postgres). Must declare CDC support. See 'sluice engines'." required:"" placeholder:"NAME" group:"source"`
+	Source       string `help:"Source database DSN." required:"" env:"SLUICE_SOURCE" placeholder:"DSN" group:"source"`
+
+	OutputDir string `help:"Directory the parent backup lives in (and stream rollovers will be written into). Mutually exclusive with --target." placeholder:"DIR"`
+	Target    string `help:"URL of the existing backup directory the stream chains off (s3://, gs://, azblob://, file:///). Mutually exclusive with --output-dir." placeholder:"URL"`
+
+	BackupEndpoint  string `help:"Override the S3 endpoint for S3-compatible providers. Only meaningful when --target is an s3:// URL." placeholder:"URL"`
+	BackupRegion    string `help:"Override the S3 region. Only meaningful when --target is an s3:// URL." placeholder:"REGION"`
+	BackupPathStyle bool   `help:"Force path-style addressing. Only meaningful when --target is an s3:// URL."`
+
+	Since string `help:"BackupID of the parent manifest the stream chains off. Empty selects the most recent manifest in the destination." placeholder:"BACKUP-ID"`
+
+	SlotName string `help:"Replication-slot name suffix on engines with a slot concept (Postgres). Reuses the slot the original full was taken under so WAL retention covers the chain." placeholder:"NAME"`
+
+	RolloverWindow     time.Duration `help:"Wall-clock cadence each rollover commits at. Window extends to next TxCommit so the chain doesn't end mid-tx." default:"5m" placeholder:"DUR"`
+	RolloverMaxChanges int           `help:"Commit a rollover after this many CDC events queue up (approximate; closes at next TxCommit)." default:"100000" placeholder:"N"`
+	RolloverMaxBytes   int64         `help:"Commit a rollover when buffered chunk bytes cross this ceiling. Default 67108864 (64 MiB)." default:"67108864" placeholder:"BYTES"`
+
+	ChunkSize int `help:"Maximum changes per chunk file. Smaller chunks restore faster (per-chunk SHA-256 fail-fast) but inflate the manifest." default:"100000" placeholder:"N"`
+
+	IncludeEmpty bool `help:"Commit a manifest for rollovers that captured zero changes. Default off (skip empty rollovers; stream_state.json covers liveness without polluting the chain)."`
+
+	Force bool `help:"Bypass the concurrent-writer check at startup (refuses to start when an existing stream_state.json shows a recent last_rollover_at from a different pid/host). Operator-confirmed: 'I'm taking over this destination from a previous stream that may still be running.'"`
+
+	RolloverHook string `help:"Shell command to invoke after each rollover commits successfully. Receives env vars SLUICE_ROLLOVER_MANIFEST_PATH, SLUICE_ROLLOVER_PARENT_BACKUP_ID, SLUICE_ROLLOVER_BACKUP_ID, SLUICE_ROLLOVER_CHANGES, SLUICE_ROLLOVER_BYTES, SLUICE_ROLLOVER_ELAPSED_MS. Hook errors are WARN-logged but don't fail the stream. 30s timeout." placeholder:"CMD"`
+}
+
+// Run implements `sluice backup stream run`.
+func (b *BackupStreamCmd) Run(_ *Globals) error {
+	source, err := resolveEngine(b.SourceDriver)
+	if err != nil {
+		return fmt.Errorf("--source-driver: %w", err)
+	}
+	if b.OutputDir == "" && b.Target == "" {
+		return errors.New("one of --output-dir or --target is required")
+	}
+	if b.OutputDir != "" && b.Target != "" {
+		return errors.New("--output-dir and --target are mutually exclusive")
+	}
+	ctx := kongContext()
+	store, storeDesc, closer, err := openBackupStore(ctx, b.OutputDir, b.Target, pipeline.BlobStoreOptions{
+		Endpoint:  b.BackupEndpoint,
+		Region:    b.BackupRegion,
+		PathStyle: b.BackupPathStyle,
+	})
+	if err != nil {
+		return err
+	}
+	if closer != nil {
+		defer func() { _ = closer() }()
+	}
+
+	slog.InfoContext(ctx, "backup: starting stream",
+		slog.String("source_engine", source.Name()),
+		slog.String("destination", storeDesc),
+		slog.String("since", b.Since),
+		slog.Duration("rollover_window", b.RolloverWindow),
+	)
+
+	stream := &pipeline.BackupStream{
+		Source:                source,
+		SourceDSN:             b.Source,
+		Store:                 store,
+		ParentRef:             b.Since,
+		SlotName:              b.SlotName,
+		RolloverWindow:        b.RolloverWindow,
+		RolloverMaxChanges:    b.RolloverMaxChanges,
+		RolloverMaxBytes:      b.RolloverMaxBytes,
+		ChunkChanges:          b.ChunkSize,
+		IncludeEmptyRollovers: b.IncludeEmpty,
+		Force:                 b.Force,
+		RolloverHook:          b.RolloverHook,
+		SluiceVersion:         version,
+	}
+	return stream.Run(ctx)
+}
+
+// BackupStreamStopCmd runs `sluice backup stream stop`. Writes
+// `stop_requested_at` to the destination's `stream_state.json` so the
+// running stream observes the request on its next rollover-tick poll
+// and exits cleanly. Cross-machine: the operator can stop a stream
+// from a different host without process access — both sides agree on
+// the destination, not on the host.
+type BackupStreamStopCmd struct {
+	OutputDir string `help:"Directory the running stream is writing to (local filesystem). Mutually exclusive with --target." placeholder:"DIR"`
+	Target    string `help:"URL of the destination the running stream is writing to (s3://, gs://, azblob://, file:///). Mutually exclusive with --output-dir." placeholder:"URL"`
+
+	BackupEndpoint  string `help:"Override the S3 endpoint for S3-compatible providers. Only meaningful when --target is an s3:// URL." placeholder:"URL"`
+	BackupRegion    string `help:"Override the S3 region. Only meaningful when --target is an s3:// URL." placeholder:"REGION"`
+	BackupPathStyle bool   `help:"Force path-style addressing. Only meaningful when --target is an s3:// URL."`
+}
+
+// Run implements `sluice backup stream stop`.
+func (b *BackupStreamStopCmd) Run(_ *Globals) error {
+	if b.OutputDir == "" && b.Target == "" {
+		return errors.New("one of --output-dir or --target is required")
+	}
+	if b.OutputDir != "" && b.Target != "" {
+		return errors.New("--output-dir and --target are mutually exclusive")
+	}
+	ctx := kongContext()
+	store, storeDesc, closer, err := openBackupStore(ctx, b.OutputDir, b.Target, pipeline.BlobStoreOptions{
+		Endpoint:  b.BackupEndpoint,
+		Region:    b.BackupRegion,
+		PathStyle: b.BackupPathStyle,
+	})
+	if err != nil {
+		return err
+	}
+	if closer != nil {
+		defer func() { _ = closer() }()
+	}
+
+	prior, err := pipeline.RequestStreamStop(ctx, store, time.Now())
+	if err != nil {
+		return err
+	}
+	slog.InfoContext(ctx, "backup stream stop: signal written; running stream will exit on next rollover-tick",
+		slog.String("destination", storeDesc),
+		slog.Int("running_pid", prior.PID),
+		slog.String("running_host", prior.Host),
+		slog.Time("running_last_rollover_at", prior.LastRolloverAt),
+	)
+	return nil
 }
 
 // BackupVerifyCmd runs `sluice backup verify`. Walks an existing
