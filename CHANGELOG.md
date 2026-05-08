@@ -6,6 +6,26 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.17.3] - 2026-05-07
+
+Single-bug patch from the v0.17.2 test cycle. v0.17.2 shipped Phase 3.3's PG soft-warning preflights (including Patroni / HA-managed source detection); the cycle surfaced that the three v0.17.2 detection signals all systematically miss on tenant-isolated managed PG services like PlanetScale Postgres. The operators who most need the idle-slot trap warning (managed-PG users who can't tune their own slot retention) got nothing.
+
+### Fixed
+
+- **Bug 36 — Patroni / managed-PG idle-slot trap warning does not fire on PlanetScale Postgres (or other tenant-isolated managed PG services).** The v0.17.2 `detectPatroniSource` heuristic checked three signals: (1) `pg_settings WHERE name ILIKE '%patroni%'`, (2) `pg_stat_replication.application_name ILIKE 'patroni%'`, (3) `pg_roles WHERE rolname IN ('patroni', 'replicator')`. All three miss on PS-PG: Patroni sets standard PG GUCs via `ALTER SYSTEM` (not Patroni-prefixed ones, so `name ILIKE '%patroni%'` returns 0 rows); `pg_stat_replication` is permission-restricted on per-tenant roles (returns 0 rows even when Patroni is using it); PS creates tenant-prefixed roles like `hzi_xgsa060j2bbb_role` (so `rolname IN ('patroni', 'replicator')` doesn't match). Net effect: managed-PG operators got no warning when pointing `--position-from-manifest` at their cluster. Fix lands as option (c) from the BUG-CATALOG analysis: broader heuristics + an explicit override flag.
+
+  **Broader engine-side heuristics (v0.17.3 adds Signals 4–5):**
+  1. **Non-temporary physical replication slots present.** `SELECT count(*) FROM pg_replication_slots WHERE slot_type = 'physical' AND temporary = false`. Standby physical slots are a strong HA-cluster signal — most non-HA PG deployments don't carry them. Permission-denied on `pg_replication_slots` (some managed services restrict it) gracefully degrades to skipping the signal.
+  2. **`cluster_name` GUC populated.** Patroni convention sets this; many managed services follow suit. Empty string = no signal; permission-denied / sql.ErrNoRows on `pg_settings WHERE name = 'cluster_name'` gracefully degrades.
+
+  **DSN hostname-pattern signal (streamer layer, layered on top of the engine's six SQL signals):** known managed-PG suffixes — `*.psdb.cloud` (PlanetScale Postgres), `*.aws.prod.archil.com` / `*.gcp.prod.archil.com` (Archil), `*.cluster*.rds.amazonaws.com` (Aurora cluster endpoints; vanilla RDS instances are excluded because they're not always HA), `*.postgres.database.azure.com` (Azure Database for PostgreSQL), `*.cloudsql.google.internal` (Cloud SQL via private IP). Patterns are intentionally narrow — false positives on non-HA setups would erode the warning's signal value. The signal lives at the streamer layer because the IR `PositionFromManifestPreflight` interface deliberately doesn't carry the DSN (engines without network awareness can implement it cleanly).
+
+- **Closes Bug 36.** Verified via integration tests on testcontainer-shaped HA signals: `TestPreflight_PG_DetectsPhysicalSlot` (a non-temporary physical replication slot trips Signal 4, citing the slot signal in the warning); `TestPreflight_PG_DetectsClusterNameGUC` (cluster_name set at server start trips Signal 5, citing the GUC value); `TestSyncStart_PatroniMode_Off_SuppressesWarning` (with a physical slot present, `--patroni-mode=off` strips the warning while keeping wal_keep_size warnings intact); `TestSyncStart_PatroniMode_On_FiresOnVanilla` (on vanilla PG with no Patroni signals, `--patroni-mode=on` still emits the operator-forced warning). DSN hostname-pattern detection is unit-tested via direct DSN-string parsing across all six patterns (PlanetScale, Archil aws/gcp, Aurora, Azure, Cloud SQL) plus negative cases (vanilla RDS instance, self-hosted host, localhost, empty DSN).
+
+### Added
+
+- **`sluice sync start --patroni-mode=auto|on|off`.** New flag pairing with the broader heuristics. `auto` (default) runs the engine heuristics + DSN hostname-pattern check and warns if any of the six signals fires; `on` skips the heuristics and forces the warning (operator opts in regardless of detection — the canonical override for tenant-isolated managed PG where the heuristics still miss); `off` skips the heuristics and suppresses the Patroni warning entirely (operator confirmed self-hosted single-node PG without HA, doesn't want the noise). Combine `--patroni-mode=on` with `--strict-preflight=true` to make the warning a hard refusal. The slot-existence / `wal_status='lost'` refusal is unaffected by `--patroni-mode` (those are always refusals — the slot can't deliver what's needed). Validation: unknown values are rejected at flag parse time with a clear error naming the accepted set.
+
 ## [0.17.2] - 2026-05-07
 
 Logical backups Phase 3.3 lands: full-backup `EndPosition` recording, the `--position-from-manifest` CDC handoff flag, and PG soft-warning pre-flights. Closes the v0.17.0 known-limitation list — chains rooted in v0.17.2+ fulls work end-to-end without manually patching the manifest's terminal position, and a freshly-restored target resumes CDC from the chain's tail without re-bulking from source. Implementation supplement: `docs/dev/design-logical-backups-phase-3.md` (Phase 3.3 row in the sub-phasing table).
