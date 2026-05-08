@@ -277,7 +277,18 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 	}
 
 	deadline := clockNow().Add(windowDur)
+	slog.InfoContext(ctx, "INCREMENTAL-DBG: captureWindow BEGIN",
+		slog.String("source_engine", b.Source.Name()),
+		slog.Time("deadline", deadline),
+		slog.Int("max_changes", b.MaxChanges),
+		slog.Int("chunk_size", chunkSize),
+	)
 	endPos, totalChanges, captureErr := b.captureWindow(ctx, cdc, changesCh, manifest, chunkSize, deadline, b.MaxChanges, clockNow)
+	slog.InfoContext(ctx, "INCREMENTAL-DBG: captureWindow END",
+		slog.Int64("total_changes", totalChanges),
+		slog.Bool("err", captureErr != nil),
+		slog.Int("chunks", len(manifest.ChangeChunks)),
+	)
 	if captureErr != nil {
 		return wrapWithHint(PhaseCDC, fmt.Errorf("incremental: capture window: %w", captureErr))
 	}
@@ -501,9 +512,14 @@ func (b *IncrementalBackup) captureWindow(
 	for {
 		select {
 		case <-ctx.Done():
+			slog.InfoContext(ctx, "INCREMENTAL-DBG: captureWindow ctx.Done",
+				slog.Int64("total_changes", totalChanges))
 			return lastPos, totalChanges, ctx.Err()
 		case <-timer.C:
 			deadlinePassed = true
+			slog.InfoContext(ctx, "INCREMENTAL-DBG: captureWindow timer.C",
+				slog.Int64("total_changes", totalChanges),
+				slog.Bool("in_tx", inTransaction))
 			// Check immediately whether we can close cleanly. If we're
 			// not in a transaction, close now; otherwise wait for the
 			// next TxCommit.
@@ -515,6 +531,8 @@ func (b *IncrementalBackup) captureWindow(
 			}
 		case change, ok := <-changesCh:
 			if !ok {
+				slog.InfoContext(ctx, "INCREMENTAL-DBG: captureWindow channel closed",
+					slog.Int64("total_changes", totalChanges))
 				// Channel closed. If the CDC reader recorded an error,
 				// surface it (loud-failure tenet); otherwise treat as
 				// orderly window end so the manifest still records what
@@ -529,6 +547,11 @@ func (b *IncrementalBackup) captureWindow(
 				}
 				return lastPos, totalChanges, nil
 			}
+			// PHASE-A: per-change trace.
+			slog.InfoContext(ctx, "INCREMENTAL-DBG: captureWindow event",
+				slog.Int64("n", totalChanges+1),
+				slog.String("type", fmt.Sprintf("%T", change)),
+				slog.Bool("in_tx_before", inTransaction))
 			// Track transaction boundary so we can extend the window
 			// to the next TxCommit when the deadline straddles a tx.
 			switch change.(type) {
@@ -560,6 +583,9 @@ func (b *IncrementalBackup) captureWindow(
 			// MaxChanges (approximate): close on a tx boundary at-or-after
 			// the cap.
 			if maxChanges > 0 && totalChanges >= int64(maxChanges) && !inTransaction {
+				slog.InfoContext(ctx, "INCREMENTAL-DBG: captureWindow MaxChanges fire",
+					slog.Int64("total_changes", totalChanges),
+					slog.Int("max_changes", maxChanges))
 				if err := flush(); err != nil {
 					return lastPos, totalChanges, err
 				}
@@ -568,6 +594,8 @@ func (b *IncrementalBackup) captureWindow(
 			// Deadline-already-passed and we just observed a TxCommit:
 			// close now.
 			if deadlinePassed && !inTransaction {
+				slog.InfoContext(ctx, "INCREMENTAL-DBG: captureWindow deadline+!inTx fire",
+					slog.Int64("total_changes", totalChanges))
 				if err := flush(); err != nil {
 					return lastPos, totalChanges, err
 				}

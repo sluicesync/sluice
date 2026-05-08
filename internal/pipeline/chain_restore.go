@@ -78,18 +78,27 @@ const DefaultChainRestoreBatchSize = 100
 
 // Run executes the chain restore. Returns nil on success.
 func (r *ChainRestore) Run(ctx context.Context) error {
+	slog.InfoContext(ctx, "CHAINRESTORE-DBG: Run ENTRY",
+		slog.String("target_engine", r.Target.Name()),
+	)
 	if err := r.validate(); err != nil {
+		slog.InfoContext(ctx, "CHAINRESTORE-DBG: validate failed", slog.String("err", err.Error()))
 		return err
 	}
 
 	// 1. Build the chain.
 	chain, err := buildChain(ctx, r.Store)
 	if err != nil {
+		slog.InfoContext(ctx, "CHAINRESTORE-DBG: buildChain failed", slog.String("err", err.Error()))
 		return wrapWithHint(PhaseConnect, fmt.Errorf("chain restore: build chain: %w", err))
 	}
 	if len(chain) == 0 {
+		slog.InfoContext(ctx, "CHAINRESTORE-DBG: chain empty")
 		return errors.New("chain restore: store contains no manifests")
 	}
+	slog.InfoContext(ctx, "CHAINRESTORE-DBG: chain built",
+		slog.Int("chain_len", len(chain)),
+	)
 
 	// 2. Refuse cross-engine incremental restore (Phase 5+ topic).
 	full := chain[0]
@@ -107,9 +116,16 @@ func (r *ChainRestore) Run(ctx context.Context) error {
 		slog.String("backup_id", manifestBackupID(full.manifest)),
 		slog.Int("incrementals", len(chain)-1),
 	)
+	slog.InfoContext(ctx, "CHAINRESTORE-DBG: applyFull BEGIN",
+		slog.String("manifest_path", full.path),
+	)
 	if err := r.applyFull(ctx, full); err != nil {
+		slog.InfoContext(ctx, "CHAINRESTORE-DBG: applyFull FAILED",
+			slog.String("err", err.Error()),
+		)
 		return wrapWithHint(PhaseBulkCopy, fmt.Errorf("chain restore: apply full: %w", err))
 	}
+	slog.InfoContext(ctx, "CHAINRESTORE-DBG: applyFull OK")
 
 	// 4. Apply each incremental in chain order.
 	if len(chain) == 1 {
