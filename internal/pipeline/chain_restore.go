@@ -175,6 +175,19 @@ func (r *ChainRestore) applyFull(ctx context.Context, full *manifestRecord) erro
 		return fmt.Errorf("chain restore: full manifest is at %q; expected %q (Phase 3.1 only supports the standard layout)",
 			full.path, ManifestFileName)
 	}
+	// Phase A (Bug 40): log entry into the full-restore path so we
+	// can confirm Restore.Run is invoked + the schema it sees.
+	if full.manifest != nil && full.manifest.Schema != nil {
+		tableNames := make([]string, 0, len(full.manifest.Schema.Tables))
+		for _, t := range full.manifest.Schema.Tables {
+			tableNames = append(tableNames, t.Name)
+		}
+		slog.DebugContext(ctx, "chain restore: applyFull — entering Restore.Run",
+			slog.String("manifest_path", full.path),
+			slog.Int("table_count", len(full.manifest.Schema.Tables)),
+			slog.Any("table_names", tableNames),
+		)
+	}
 	rest := &Restore{
 		Target:            r.Target,
 		TargetDSN:         r.TargetDSN,
@@ -183,7 +196,15 @@ func (r *ChainRestore) applyFull(ctx context.Context, full *manifestRecord) erro
 		MaxBufferBytes:    r.MaxBufferBytes,
 		SkipChainDispatch: true,
 	}
-	return rest.Run(ctx)
+	err := rest.Run(ctx)
+	if err != nil {
+		slog.DebugContext(ctx, "chain restore: applyFull — Restore.Run returned error",
+			slog.String("err", err.Error()),
+		)
+	} else {
+		slog.DebugContext(ctx, "chain restore: applyFull — Restore.Run returned ok")
+	}
+	return err
 }
 
 // applyIncremental applies one incremental's schema deltas and

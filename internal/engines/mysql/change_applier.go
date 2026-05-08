@@ -156,8 +156,19 @@ func (a *ChangeApplier) ReadPosition(ctx context.Context, streamID string) (ir.P
 		return ir.Position{}, false, err
 	}
 	if !ok {
+		slog.DebugContext(ctx, "mysql: applier: ReadPosition — no row",
+			slog.String("stream_id", streamID),
+		)
 		return ir.Position{}, false, nil
 	}
+	// Phase A (Bug 39): log the raw token + engine string we hard-code
+	// into the returned Position. Mirrors the PG side; the engine
+	// sentinel discard breaks broker warm-resume identically.
+	slog.DebugContext(ctx, "mysql: applier: ReadPosition — row found",
+		slog.String("stream_id", streamID),
+		slog.String("returned_engine", engineNameMySQL),
+		slog.String("token", token),
+	)
 	return ir.Position{Engine: engineNameMySQL, Token: token}, true, nil
 }
 

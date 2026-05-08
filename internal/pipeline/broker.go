@@ -278,6 +278,19 @@ func (b *SyncFromBackup) Run(ctx context.Context) error {
 		return wrapWithHint(PhaseCDC, fmt.Errorf("broker: read position: %w", err))
 	}
 
+	// Phase A (Bug 39): log the engine sentinel + token returned by
+	// ReadPosition. The applier's hard-coded engineName<Engine>
+	// discards the broker's BackupBrokerPositionEngine sentinel, so
+	// `persisted.Engine` here is always "postgres" / "mysql" — never
+	// "backup-broker" — even after the broker writes its own row.
+	slog.DebugContext(ctx, "broker: ReadPosition result",
+		slog.String("stream_id", b.StreamID),
+		slog.Bool("found", found),
+		slog.String("persisted_engine", persisted.Engine),
+		slog.String("expected_engine", BackupBrokerPositionEngine),
+		slog.String("token", persisted.Token),
+	)
+
 	var lastAppliedID string
 	switch {
 	case found && persisted.Engine == BackupBrokerPositionEngine:
@@ -292,6 +305,11 @@ func (b *SyncFromBackup) Run(ctx context.Context) error {
 			slog.String("last_applied_backup_id", lastAppliedID),
 		)
 	case found:
+		slog.DebugContext(ctx, "broker: position-engine sentinel mismatch — refusing as non-broker writer",
+			slog.String("stream_id", b.StreamID),
+			slog.String("persisted_engine", persisted.Engine),
+			slog.String("token", persisted.Token),
+		)
 		return fmt.Errorf(
 			"broker: stream %q is owned by a non-broker writer (position engine %q); "+
 				"choose a different --stream-id or clear the conflicting row first",
@@ -473,12 +491,31 @@ func (b *SyncFromBackup) coldStart(ctx context.Context, applier ir.ChangeApplier
 // + every incremental currently in the store, then records the
 // chain's tail BackupID as the broker's resume floor.
 func (b *SyncFromBackup) coldStartReset(ctx context.Context, applier ir.ChangeApplier) (string, error) {
+	// Phase A (Bug 40): log entry + the chain's terminal schema
+	// (table count + names) so we can confirm the restore call sees
+	// the right schema vs. what's actually on the target.
+	slog.DebugContext(ctx, "broker: coldStartReset — entry",
+		slog.String("stream_id", b.StreamID),
+	)
 	chain, err := buildChain(ctx, b.Store)
 	if err != nil {
 		return "", wrapWithHint(PhaseConnect, fmt.Errorf("broker: build chain: %w", err))
 	}
 	if len(chain) == 0 {
 		return "", errors.New("broker: chain is empty; cannot --reset-target-data with no full backup in store")
+	}
+	tailManifest := chain[len(chain)-1].manifest
+	if tailManifest.Schema != nil {
+		tableNames := make([]string, 0, len(tailManifest.Schema.Tables))
+		for _, t := range tailManifest.Schema.Tables {
+			tableNames = append(tableNames, t.Name)
+		}
+		slog.DebugContext(ctx, "broker: coldStartReset — terminal manifest schema",
+			slog.String("stream_id", b.StreamID),
+			slog.Int("chain_length", len(chain)),
+			slog.Int("table_count", len(tailManifest.Schema.Tables)),
+			slog.Any("table_names", tableNames),
+		)
 	}
 	rest := &ChainRestore{
 		Target:         b.Target,
@@ -487,10 +524,16 @@ func (b *SyncFromBackup) coldStartReset(ctx context.Context, applier ir.ChangeAp
 		MaxBufferBytes: b.MaxBufferBytes,
 		ApplyBatchSize: b.ApplyBatchSize,
 	}
+	slog.DebugContext(ctx, "broker: coldStartReset — invoking ChainRestore",
+		slog.String("stream_id", b.StreamID),
+	)
 	if err := rest.Run(ctx); err != nil {
 		return "", fmt.Errorf("broker: chain restore failed: %w", err)
 	}
-	tailID := manifestBackupID(chain[len(chain)-1].manifest)
+	slog.DebugContext(ctx, "broker: coldStartReset — ChainRestore returned ok",
+		slog.String("stream_id", b.StreamID),
+	)
+	tailID := manifestBackupID(tailManifest)
 	if err := b.writePositionDirect(ctx, applier, tailID); err != nil {
 		return "", fmt.Errorf("broker: record post-restore position: %w", err)
 	}
@@ -671,6 +714,26 @@ func (b *SyncFromBackup) applyIncremental(
 	link *manifestRecord,
 	batchSize int,
 ) (int64, error) {
+	// Phase A (Bug 38): log the incremental's schema-delta count + a
+	// per-table column count summary so we can confirm whether
+	// stream-rolled-over manifests carry post-ALTER schema info or
+	// stay on the parent's pre-ALTER snapshot. Pre-fix expectation:
+	// stream rollovers emit zero deltas across the chain even after
+	// source DDL.
+	if link.manifest != nil {
+		summary := make([]string, 0, len(link.manifest.SchemaDelta))
+		for _, d := range link.manifest.SchemaDelta {
+			summary = append(summary, fmt.Sprintf("%s/%s", d.Kind, d.Table))
+		}
+		slog.DebugContext(ctx, "broker: applyIncremental — manifest snapshot",
+			slog.String("stream_id", b.StreamID),
+			slog.String("backup_id", manifestBackupID(link.manifest)),
+			slog.Int("schema_delta_count", len(link.manifest.SchemaDelta)),
+			slog.Any("schema_deltas", summary),
+			slog.Int("change_chunk_count", len(link.manifest.ChangeChunks)),
+			slog.Int("schema_table_count", schemaTableCount(link.manifest.Schema)),
+		)
+	}
 	// 1. Schema deltas first.
 	if len(link.manifest.SchemaDelta) > 0 {
 		if err := b.applySchemaDeltas(ctx, link); err != nil {
@@ -893,6 +956,16 @@ func rewritePosition(c ir.Change, pos ir.Position) ir.Change {
 	// with their own position untouched; the broker's position
 	// advance still happens via the post-replay direct write.
 	return c
+}
+
+// schemaTableCount returns the number of tables on the manifest's
+// schema, tolerating a nil schema. Phase A debug-logging helper for
+// Bug 38 ground-truth gathering.
+func schemaTableCount(s *ir.Schema) int {
+	if s == nil {
+		return 0
+	}
+	return len(s.Tables)
 }
 
 // checkStopSignals returns (true, nil) when either the in-process

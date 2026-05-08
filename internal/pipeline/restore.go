@@ -247,6 +247,23 @@ func (r *Restore) restoreTable(
 		return nil
 	}
 
+	// Phase A (Bug 40): log entry into bulk-copy with the table column
+	// list we'll feed to the writer. The writer's COPY/INSERT path
+	// references these column names by identity; if the target table
+	// has a different shape (stale schema not dropped), the engine
+	// errors out — and we want to confirm that error surfaces here
+	// rather than getting swallowed in the goroutine pattern below.
+	colNames := make([]string, 0, len(table.Columns))
+	for _, c := range table.Columns {
+		colNames = append(colNames, c.Name)
+	}
+	slog.DebugContext(ctx, "restore: restoreTable — entering WriteRows",
+		slog.String("table", table.Name),
+		slog.Any("columns", colNames),
+		slog.Int("chunks", len(entry.Chunks)),
+		slog.Int64("expected_rows", entry.RowCount),
+	)
+
 	rowCh := make(chan ir.Row)
 	errCh := make(chan error, 1)
 
@@ -275,6 +292,15 @@ func (r *Restore) restoreTable(
 	}()
 
 	if err := rw.WriteRows(ctx, table, rowCh); err != nil {
+		// Phase A (Bug 40): the producer goroutine may still be
+		// blocked sending to rowCh when WriteRows fails — without a
+		// streamCancel here, `<-errCh` deadlocks (Bug 40 silent
+		// hang). Phase B will add cancellation; this log line catches
+		// the hang shape on existing CI logs.
+		slog.DebugContext(ctx, "restore: restoreTable — WriteRows failed; awaiting producer drain (may hang)",
+			slog.String("table", table.Name),
+			slog.String("err", err.Error()),
+		)
 		// Drain the error channel so the goroutine exits even on
 		// writer-side failure.
 		<-errCh

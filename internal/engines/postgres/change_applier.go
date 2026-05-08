@@ -183,8 +183,20 @@ func (a *ChangeApplier) ReadPosition(ctx context.Context, streamID string) (ir.P
 		return ir.Position{}, false, err
 	}
 	if !ok {
+		slog.DebugContext(ctx, "postgres: applier: ReadPosition — no row",
+			slog.String("stream_id", streamID),
+		)
 		return ir.Position{}, false, nil
 	}
+	// Phase A (Bug 39): log the raw token + engine string we hard-code
+	// into the returned Position. The broker writes a synthetic
+	// Engine="backup-broker" sentinel; this hard-coded postgres engine
+	// discards the sentinel on round-trip, defeating warm resume.
+	slog.DebugContext(ctx, "postgres: applier: ReadPosition — row found",
+		slog.String("stream_id", streamID),
+		slog.String("returned_engine", engineNamePostgres),
+		slog.String("token", token),
+	)
 	return ir.Position{Engine: engineNamePostgres, Token: token}, true, nil
 }
 

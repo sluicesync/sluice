@@ -614,6 +614,17 @@ func (b *BackupStream) runRollover(
 		return rolloverOutcome{}, fmt.Errorf("hash source schema: %w", hashErr)
 	}
 
+	// Phase A (Bug 38): log the schema being baked into every
+	// rollover's manifest. Pre-fix expectation: this is the ORIGINAL
+	// parent.Schema captured at stream startup, never refreshed,
+	// even after source DDL. The stream loop assigns
+	// `currentParent = roll.Manifest`, so this snapshot replicates
+	// forward through every subsequent rollover.
+	beforeTableCols := summarizeSchemaForLogs(beforeSchema)
+	slog.DebugContext(ctx, "stream: runRollover — schema baseline (parent's)",
+		slog.Any("table_columns", beforeTableCols),
+	)
+
 	manifest := &ir.Manifest{
 		FormatVersion:  ir.BackupFormatVersion,
 		SluiceVersion:  b.SluiceVersion,
@@ -998,6 +1009,25 @@ func runRolloverHook(ctx context.Context, hookCmd string, manifest *ir.Manifest,
 		slog.String("hook", hookCmd),
 		slog.String("output", strings.TrimSpace(string(out))),
 	)
+}
+
+// summarizeSchemaForLogs returns a "table.col1,col2,..." per-table
+// summary of the schema, used by Phase A debug logs to confirm whether
+// the stream's schema-baseline shifts after a source ALTER. Tolerates
+// a nil schema.
+func summarizeSchemaForLogs(s *ir.Schema) []string {
+	if s == nil {
+		return nil
+	}
+	out := make([]string, 0, len(s.Tables))
+	for _, t := range s.Tables {
+		cols := make([]string, 0, len(t.Columns))
+		for _, c := range t.Columns {
+			cols = append(cols, c.Name)
+		}
+		out = append(out, fmt.Sprintf("%s(%s)", t.Name, strings.Join(cols, ",")))
+	}
+	return out
 }
 
 // newShellCommand wraps [exec.CommandContext] with the OS-appropriate
