@@ -27,9 +27,49 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 
 	"github.com/orware/sluice/internal/ir"
 )
+
+// PatroniMode constants for [Streamer.PatroniMode]. The flag is a
+// string at the surface so kong can parse it; these constants pin the
+// in-codebase values to keep callers from drifting on spelling.
+const (
+	// PatroniModeAuto is the default: run the engine heuristics, warn
+	// if any signal fires.
+	PatroniModeAuto = "auto"
+
+	// PatroniModeOn skips the heuristics and forces the warning to
+	// fire — operator opts in regardless of detection.
+	PatroniModeOn = "on"
+
+	// PatroniModeOff skips the heuristics and suppresses any Patroni
+	// warning the engine would emit — operator opts out regardless of
+	// detection.
+	PatroniModeOff = "off"
+)
+
+// ValidatePatroniMode normalises and validates a --patroni-mode
+// value. Empty is treated as auto (the default). Returns the
+// canonical value or an error naming the accepted set.
+func ValidatePatroniMode(s string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "", PatroniModeAuto:
+		return PatroniModeAuto, nil
+	case PatroniModeOn:
+		return PatroniModeOn, nil
+	case PatroniModeOff:
+		return PatroniModeOff, nil
+	default:
+		return "", fmt.Errorf("invalid --patroni-mode %q: want one of auto, on, off", s)
+	}
+}
+
+// patroniWarningPrefix is the substring every Patroni-detection
+// warning starts with, used to filter the engine's reports when
+// --patroni-mode=off.
+const patroniWarningPrefix = "this PG cluster is HA-managed"
 
 // PositionFromManifestPreflight and PreflightReport now live in the
 // `ir` package so engine packages can implement the interface without
@@ -64,6 +104,11 @@ type (
 // resume-position validation (verifyPositionResumable) still run
 // and surface fatal conditions even when preflight is unavailable.
 func (s *Streamer) runPositionFromManifestPreflight(ctx context.Context, chainTerminal ir.Position) error {
+	patroniMode, err := ValidatePatroniMode(s.PatroniMode)
+	if err != nil {
+		return err
+	}
+
 	sr, err := s.Source.OpenSchemaReader(ctx, s.SourceDSN)
 	if err != nil {
 		slog.DebugContext(ctx, "position-from-manifest: could not open source schema reader for preflight; skipping",
@@ -86,6 +131,18 @@ func (s *Streamer) runPositionFromManifestPreflight(ctx context.Context, chainTe
 	if err != nil {
 		return fmt.Errorf("preflight query failed: %w", err)
 	}
+
+	// Mode-driven Patroni-warning shaping (Bug 36, v0.17.3):
+	//
+	//   auto: keep engine warnings as-is; layer in a hostname-pattern
+	//         signal (covers managed-PG services where the engine's
+	//         SQL-side signals miss because of permission isolation).
+	//   on:   strip the engine's Patroni warning if any, append a
+	//         single "operator forced via --patroni-mode=on" warning.
+	//   off:  strip every Patroni warning the engine emitted; emit
+	//         nothing.
+	report = s.applyPatroniMode(report, patroniMode)
+
 	for _, w := range report.Warnings {
 		slog.WarnContext(ctx, "position-from-manifest preflight: "+w,
 			slog.String("engine", s.Source.Name()),
@@ -99,4 +156,103 @@ func (s *Streamer) runPositionFromManifestPreflight(ctx context.Context, chainTe
 			len(report.Warnings), report.Warnings[0])
 	}
 	return nil
+}
+
+// applyPatroniMode shapes the engine's PreflightReport according to
+// the operator's --patroni-mode choice. See
+// [Streamer.runPositionFromManifestPreflight] for the per-mode
+// semantics summary.
+//
+// The Refusal field is never modified — a slot-missing /
+// wal_status='lost' refusal must trip regardless of patroni-mode.
+func (s *Streamer) applyPatroniMode(report PreflightReport, mode string) PreflightReport {
+	switch mode {
+	case PatroniModeOff:
+		// Suppress every Patroni warning the engine emitted; leave
+		// other warnings (e.g. wal_keep_size) intact.
+		filtered := report.Warnings[:0:0]
+		for _, w := range report.Warnings {
+			if !strings.HasPrefix(w, patroniWarningPrefix) {
+				filtered = append(filtered, w)
+			}
+		}
+		report.Warnings = filtered
+		return report
+	case PatroniModeOn:
+		// Strip engine-emitted Patroni warnings (avoid double-warn)
+		// and append the operator-forced one.
+		filtered := report.Warnings[:0:0]
+		for _, w := range report.Warnings {
+			if !strings.HasPrefix(w, patroniWarningPrefix) {
+				filtered = append(filtered, w)
+			}
+		}
+		filtered = append(filtered,
+			"this PG cluster is HA-managed (--patroni-mode=on; operator forced). "+
+				"The slot you're starting CDC from is subject to the idle-slot failover trap — slots not actively consumed don't replicate to standbys and are silently lost on failover. "+
+				"Ensure the slot is being actively consumed; for low-traffic sources, consider a heartbeat-write strategy. See docs/postgres-source-prep.md.",
+		)
+		report.Warnings = filtered
+		return report
+	default:
+		// auto: append the DSN-hostname signal if it fires AND the
+		// engine didn't already emit a Patroni warning (avoid
+		// double-warn on the same condition).
+		if pattern := matchManagedPGHostname(s.SourceDSN); pattern != "" {
+			already := false
+			for _, w := range report.Warnings {
+				if strings.HasPrefix(w, patroniWarningPrefix) {
+					already = true
+					break
+				}
+			}
+			if !already {
+				report.Warnings = append(report.Warnings,
+					fmt.Sprintf("this PG cluster is HA-managed (DSN hostname matches managed-PG pattern: %s). "+
+						"The slot you're starting CDC from is subject to the idle-slot failover trap — slots not actively consumed don't replicate to standbys and are silently lost on failover. "+
+						"Ensure the slot is being actively consumed; for low-traffic sources, consider a heartbeat-write strategy. See docs/postgres-source-prep.md.",
+						pattern))
+			}
+		}
+		return report
+	}
+}
+
+// matchManagedPGHostname extracts the host (no port) from the DSN
+// and tests it against the v0.17.3 managed-PG hostname-pattern set.
+// Patterns are intentionally narrow — false positives erode the
+// warning's signal value.
+//
+// Patterns:
+//
+//   - *.psdb.cloud (PlanetScale Postgres)
+//   - *.aws.prod.archil.com / *.gcp.prod.archil.com (Archil)
+//   - *.cluster*.rds.amazonaws.com (Aurora cluster endpoints)
+//   - *.postgres.database.azure.com (Azure Database for PostgreSQL)
+//   - *.cloudsql.google.internal (Cloud SQL via private IP)
+func matchManagedPGHostname(dsn string) string {
+	host := redactedHost(dsn)
+	if i := strings.LastIndex(host, ":"); i >= 0 {
+		host = host[:i]
+	}
+	host = strings.ToLower(strings.TrimSpace(host))
+	if host == "" {
+		return ""
+	}
+	switch {
+	case strings.HasSuffix(host, ".psdb.cloud"):
+		return "*.psdb.cloud"
+	case strings.HasSuffix(host, ".aws.prod.archil.com"):
+		return "*.aws.prod.archil.com"
+	case strings.HasSuffix(host, ".gcp.prod.archil.com"):
+		return "*.gcp.prod.archil.com"
+	case strings.HasSuffix(host, ".rds.amazonaws.com") &&
+		(strings.Contains(host, ".cluster.") || strings.Contains(host, ".cluster-")):
+		return "*.cluster*.rds.amazonaws.com (Aurora)"
+	case strings.HasSuffix(host, ".postgres.database.azure.com"):
+		return "*.postgres.database.azure.com"
+	case strings.HasSuffix(host, ".cloudsql.google.internal"):
+		return "*.cloudsql.google.internal"
+	}
+	return ""
 }

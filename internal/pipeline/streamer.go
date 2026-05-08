@@ -258,6 +258,20 @@ type Streamer struct {
 	// always a refusal; this flag only affects the warning-grade
 	// checks.
 	StrictPreflight bool
+
+	// PatroniMode controls how the Phase 3.3.C Patroni / HA-managed
+	// source detection runs. Valid values: "auto" (default — run the
+	// engine heuristics, warn if detected), "on" (skip heuristics,
+	// always warn — operator forcing the warning), "off" (skip
+	// heuristics, never warn — operator overriding the warning, e.g.
+	// confirmed self-hosted single-node PG without HA). Empty string
+	// is treated as "auto".
+	//
+	// Added in v0.17.3 (Bug 36): the v0.17.2 heuristics systematically
+	// missed managed-PG services with tenant-isolated permissions
+	// (PlanetScale Postgres, Aurora when superuser-restricted, etc.),
+	// so operators of those services need an explicit override.
+	PatroniMode string
 }
 
 // Run executes a snapshot+CDC stream. See [Streamer] for the full

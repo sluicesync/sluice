@@ -283,6 +283,8 @@ type SyncStartCmd struct {
 
 	StrictPreflight bool `help:"Promote position-from-manifest soft warnings (wal_keep_size sufficiency, Patroni-managed source detection) to hard refusals. Default off: the warnings log but the run proceeds. Slot existence / wal_status='lost' is always a refusal regardless of this flag — the slot can't deliver what we need."`
 
+	PatroniMode string `help:"Control the Patroni / HA-managed source detection. 'auto' (default) runs the engine heuristics + DSN hostname pattern check and warns if any signal fires; 'on' skips the heuristics and forces the warning (operator opts in regardless of detection — useful on tenant-isolated managed PG where the heuristics miss); 'off' skips the heuristics and suppresses the Patroni warning entirely (operator confirmed self-hosted single-node PG without HA). Combine with --strict-preflight=true and --patroni-mode=on to make the warning a hard refusal." default:"auto" enum:"auto,on,off" placeholder:"MODE"`
+
 	BackupEndpoint  string `help:"Override the S3 endpoint for --position-from-manifest's S3-compatible providers. Only meaningful when --position-from-manifest is an s3:// URL." placeholder:"URL"`
 	BackupRegion    string `help:"Override the S3 region for --position-from-manifest. Only meaningful when --position-from-manifest is an s3:// URL." placeholder:"REGION"`
 	BackupPathStyle bool   `help:"Force path-style S3 addressing for --position-from-manifest. Only meaningful when --position-from-manifest is an s3:// URL."`
@@ -388,6 +390,7 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 		MetricsListen:             s.MetricsListen,
 		PositionFromManifestStore: manifestStore,
 		StrictPreflight:           s.StrictPreflight,
+		PatroniMode:               s.PatroniMode,
 	}
 	return streamer.Run(kongContext())
 }

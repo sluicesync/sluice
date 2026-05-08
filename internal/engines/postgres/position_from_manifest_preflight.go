@@ -176,22 +176,33 @@ func walKeepSizeMB(ctx context.Context, db *sql.DB) (mb int64, ok bool, err erro
 }
 
 // detectPatroniSource probes the PG source for signals that an HA
-// manager is in front of it. Three signals are checked in turn; any
+// manager is in front of it. Six signals are checked in turn; any
 // positive signal triggers the warning. The returned why string names
 // the specific signal so the warning message gives operators a
 // starting point for verification.
 //
-// Signals (per the design doc):
+// Signals (most-specific first; first-match wins):
 //
 //   - pg_settings rows with name LIKE '%patroni%' (Patroni-set GUCs)
 //   - pg_stat_replication.application_name LIKE 'patroni%'
 //   - role names 'patroni' or 'replicator' present in pg_roles
+//   - non-temporary physical replication slots present (HA-cluster
+//     signal — most non-HA PG deployments don't carry standby physical
+//     slots) — Bug 36 v0.17.3
+//   - cluster_name GUC populated (Patroni convention; many managed
+//     services also set it) — Bug 36 v0.17.3
 //
-// The Patroni-set-GUC signal is the most specific (Patroni explicitly
-// names a few; the cluster admin can't avoid them); the
-// application_name signal catches Patroni's standby connections; the
-// role-name signal is the loosest (an operator could reuse those
-// names without Patroni).
+// The hostname-pattern signal lives at the streamer layer (it needs
+// the DSN, which isn't in scope here). See pipeline/sync_preflight.go.
+//
+// Signals 1-3 (the original v0.17.2 set) miss systematically on
+// tenant-isolated managed PG (e.g. PlanetScale Postgres): Patroni
+// sets standard GUCs not Patroni-prefixed ones, pg_stat_replication
+// is permission-restricted to the superuser, and roles are
+// tenant-prefixed. Signals 4 + 5 are added in v0.17.3 (Bug 36) to
+// catch those cases. Permission-denied errors on any individual
+// signal degrade gracefully via [isPermissionDenied] — managed
+// services may restrict pg_replication_slots too.
 func detectPatroniSource(ctx context.Context, db *sql.DB) (detected bool, why string, err error) {
 	// Signal 1: Patroni-set GUCs. The cleanest tell because Patroni
 	// itself sets these.
@@ -237,8 +248,56 @@ func detectPatroniSource(ctx context.Context, db *sql.DB) (detected bool, why st
 		return true, "Patroni-convention role names ('patroni' / 'replicator') present in pg_roles", nil
 	}
 
+	// Signal 4 (v0.17.3 Bug 36): non-temporary physical replication
+	// slots present. Standby physical slots are a strong HA-cluster
+	// signal — most non-HA PG deployments don't carry them. Catches
+	// managed-PG services where signals 1-3 miss because Patroni sets
+	// standard GUCs and pg_stat_replication is permission-restricted.
+	var physSlotCount int
+	if err := db.QueryRowContext(ctx,
+		`SELECT count(*) FROM pg_replication_slots WHERE slot_type = 'physical' AND temporary = false`,
+	).Scan(&physSlotCount); err != nil {
+		// pg_replication_slots can be restricted on some managed
+		// services (requires pg_read_all_stats or similar). Skip the
+		// signal on permission denied; surface other failures.
+		if !isPermissionDenied(err) {
+			return false, "", fmt.Errorf("query pg_replication_slots: %w", err)
+		}
+	}
+	if physSlotCount > 0 {
+		return true, "non-temporary physical replication slots present (HA-cluster signal)", nil
+	}
+
+	// Signal 5 (v0.17.3 Bug 36): cluster_name GUC populated. Patroni
+	// convention sets this, and many managed services follow suit.
+	// Empty string = no signal.
+	var clusterName string
+	if err := db.QueryRowContext(ctx,
+		`SELECT setting FROM pg_settings WHERE name = 'cluster_name'`,
+	).Scan(&clusterName); err != nil {
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			// cluster_name GUC absent on very old PG; skip the signal.
+			clusterName = ""
+		case isPermissionDenied(err):
+			// Skip the signal.
+			clusterName = ""
+		default:
+			return false, "", fmt.Errorf("query cluster_name GUC: %w", err)
+		}
+	}
+	if clusterName != "" {
+		return true, fmt.Sprintf("cluster_name GUC is populated (%q) — HA-managed convention", clusterName), nil
+	}
+
 	return false, "", nil
 }
+
+// Hostname-pattern detection lives in pipeline/sync_preflight.go's
+// matchManagedPGHostname — it needs the DSN in scope, which the
+// engine's preflight surface deliberately doesn't carry (the IR
+// interface accepts only chainTerminal + slotName so engines without
+// network awareness can implement it).
 
 // isPermissionDenied reports whether err is a Postgres "permission
 // denied" error. Used by [detectPatroniSource] to degrade gracefully
