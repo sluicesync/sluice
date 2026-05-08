@@ -233,10 +233,156 @@ func resolveEngine(name string) (ir.Engine, error) {
 // target on an ongoing basis — useful both as a low-downtime
 // migration path and as a reporting/locality replication tool.
 type SyncCmd struct {
-	Start  SyncStartCmd  `cmd:"" help:"Start a continuous-sync stream from source to target."`
-	Status SyncStatusCmd `cmd:"" help:"Show status of a running sync stream."`
-	Stop   SyncStopCmd   `cmd:"" help:"Request a running sync stream to drain in-flight changes and exit cleanly."`
-	Health SyncHealthCmd `cmd:"" help:"Probe a running stream's freshness against operator-supplied thresholds; cron-friendly exit codes."`
+	Start      SyncStartCmd         `cmd:"" help:"Start a continuous-sync stream from source to target."`
+	Status     SyncStatusCmd        `cmd:"" help:"Show status of a running sync stream."`
+	Stop       SyncStopCmd          `cmd:"" help:"Request a running sync stream to drain in-flight changes and exit cleanly."`
+	Health     SyncHealthCmd        `cmd:"" help:"Probe a running stream's freshness against operator-supplied thresholds; cron-friendly exit codes."`
+	FromBackup SyncFromBackupCmdGrp `cmd:"" name:"from-backup" help:"Replay a backup chain into a target as a long-running broker (Phase 4.5)."`
+}
+
+// SyncFromBackupCmdGrp groups `sluice sync from-backup` (run) and
+// `sluice sync from-backup stop` (companion stop). Mirrors the
+// BackupStreamCmdGroup shape from Phase 4: the verb without an
+// explicit subcommand is `sync from-backup run` so kong dispatches
+// cleanly with the sibling `stop` subcommand.
+type SyncFromBackupCmdGrp struct {
+	Run  SyncFromBackupCmd     `cmd:"" help:"Run the long-running broker (poll a chain and replay incrementals into a target)."`
+	Stop SyncFromBackupStopCmd `cmd:"" help:"Request a running broker to commit any in-flight apply and exit cleanly."`
+}
+
+// SyncFromBackupCmd runs the Phase 4.5 broker. Polls a chain root for
+// new incrementals at the configured cadence and replays each one
+// into a target via the existing ChangeApplier.ApplyBatch path. The
+// chain itself is the rendezvous: an upstream `sluice backup stream`
+// writes incrementals to S3 / GCS / Azure / local-FS; this command
+// reads from the same destination. No direct source-target
+// connectivity required — the broker is a read-only consumer of the
+// chain.
+type SyncFromBackupCmd struct {
+	BackupDir    string `help:"Directory the chain lives in (local filesystem). Mutually exclusive with --backup-target." placeholder:"DIR"`
+	BackupTarget string `name:"backup-target" help:"URL of the chain (s3://, gs://, azblob://, file:///). Mutually exclusive with --backup-dir." placeholder:"URL"`
+
+	BackupEndpoint  string `help:"Override the S3 endpoint for S3-compatible providers. Only meaningful when --backup-target is an s3:// URL." placeholder:"URL"`
+	BackupRegion    string `help:"Override the S3 region. Only meaningful when --backup-target is an s3:// URL." placeholder:"REGION"`
+	BackupPathStyle bool   `help:"Force path-style addressing. Only meaningful when --backup-target is an s3:// URL."`
+
+	TargetDriver string `help:"Target engine name (e.g. mysql, postgres). See 'sluice engines'." required:"" placeholder:"NAME" group:"target"`
+	Target       string `help:"Target database DSN." required:"" env:"SLUICE_TARGET" placeholder:"DSN" group:"target"`
+
+	StreamID string `help:"Stream identifier; the key under which the broker's chain-state position is persisted on the target. Required for clean restart resume." required:"" placeholder:"ID"`
+
+	PollInterval time.Duration `help:"Wall-clock cadence each broker tick runs at. The broker observes new incrementals + applies them within ~poll-interval of their commit on the source side." default:"30s" placeholder:"DUR"`
+
+	ApplyBatchSize int   `help:"Batch up to N CDC changes per target transaction during incremental replay. Idempotent applier semantics (ADR-0010) keep replay-on-crash safe." default:"100" placeholder:"N"`
+	MaxBufferBytes int64 `help:"Soft cap on per-batch buffered memory in the CDC applier. Default 67108864 (64 MiB). See ADR-0028." default:"67108864" placeholder:"N"`
+
+	ResetTargetData bool `help:"Cold-start recovery: drop target tables, run a chain restore (full + every incremental up to current), then transition to live polling. Mirrors 'migrate --reset-target-data'. Mutually exclusive with --at-chain-id."`
+
+	AtChainID string `help:"Operator-asserted resumption: the broker treats the target as currently being at chain ID <ID>; writes a fresh sluice_cdc_state row and transitions to live polling from there. Use after a manual 'sluice restore --from=<chain-url>'. Mutually exclusive with --reset-target-data." placeholder:"BACKUP-ID"`
+
+	Yes bool `help:"Skip the destructive-action confirmation prompt for --reset-target-data." short:"y"`
+}
+
+// Run implements `sluice sync from-backup run`.
+func (s *SyncFromBackupCmd) Run(_ *Globals) error {
+	target, err := resolveEngine(s.TargetDriver)
+	if err != nil {
+		return fmt.Errorf("--target-driver: %w", err)
+	}
+	if s.BackupDir == "" && s.BackupTarget == "" {
+		return errors.New("one of --backup-dir or --backup-target is required")
+	}
+	if s.BackupDir != "" && s.BackupTarget != "" {
+		return errors.New("--backup-dir and --backup-target are mutually exclusive")
+	}
+	if s.ResetTargetData && s.AtChainID != "" {
+		return errors.New("--reset-target-data and --at-chain-id are mutually exclusive")
+	}
+
+	ctx := kongContext()
+	store, storeDesc, closer, err := openBackupStore(ctx, s.BackupDir, s.BackupTarget, pipeline.BlobStoreOptions{
+		Endpoint:  s.BackupEndpoint,
+		Region:    s.BackupRegion,
+		PathStyle: s.BackupPathStyle,
+	})
+	if err != nil {
+		return err
+	}
+	if closer != nil {
+		defer func() { _ = closer() }()
+	}
+
+	if s.ResetTargetData && !s.Yes {
+		ok, err := confirmTypedDestructive(os.Stdin, os.Stdout,
+			"This will DROP tables on the target. Type 'reset' to confirm: ", "reset")
+		if err != nil {
+			return err
+		}
+		if !ok {
+			fmt.Fprintln(os.Stdout, "aborted")
+			return nil
+		}
+	}
+
+	broker := &pipeline.SyncFromBackup{
+		Target:          target,
+		TargetDSN:       s.Target,
+		Store:           store,
+		ChainURL:        storeDesc,
+		StreamID:        s.StreamID,
+		PollInterval:    s.PollInterval,
+		ApplyBatchSize:  s.ApplyBatchSize,
+		MaxBufferBytes:  s.MaxBufferBytes,
+		ResetTargetData: s.ResetTargetData,
+		AtChainID:       s.AtChainID,
+		SluiceVersion:   version,
+	}
+	return broker.Run(ctx)
+}
+
+// SyncFromBackupStopCmd runs `sluice sync from-backup stop`. Writes
+// `stop_requested_at` to the chain destination's `broker_state.json`
+// so the running broker observes the request on its next tick poll
+// and exits cleanly. Cross-machine: the operator can stop a broker
+// from a different host without process access — both sides agree on
+// the chain destination.
+type SyncFromBackupStopCmd struct {
+	BackupDir    string `help:"Directory the running broker is reading from (local filesystem). Mutually exclusive with --backup-target." placeholder:"DIR"`
+	BackupTarget string `name:"backup-target" help:"URL of the chain destination the running broker is reading from (s3://, gs://, azblob://, file:///). Mutually exclusive with --backup-dir." placeholder:"URL"`
+
+	BackupEndpoint  string `help:"Override the S3 endpoint for S3-compatible providers. Only meaningful when --backup-target is an s3:// URL." placeholder:"URL"`
+	BackupRegion    string `help:"Override the S3 region. Only meaningful when --backup-target is an s3:// URL." placeholder:"REGION"`
+	BackupPathStyle bool   `help:"Force path-style addressing. Only meaningful when --backup-target is an s3:// URL."`
+}
+
+// Run implements `sluice sync from-backup stop`.
+func (s *SyncFromBackupStopCmd) Run(_ *Globals) error {
+	if s.BackupDir == "" && s.BackupTarget == "" {
+		return errors.New("one of --backup-dir or --backup-target is required")
+	}
+	if s.BackupDir != "" && s.BackupTarget != "" {
+		return errors.New("--backup-dir and --backup-target are mutually exclusive")
+	}
+	ctx := kongContext()
+	store, storeDesc, closer, err := openBackupStore(ctx, s.BackupDir, s.BackupTarget, pipeline.BlobStoreOptions{
+		Endpoint:  s.BackupEndpoint,
+		Region:    s.BackupRegion,
+		PathStyle: s.BackupPathStyle,
+	})
+	if err != nil {
+		return err
+	}
+	if closer != nil {
+		defer func() { _ = closer() }()
+	}
+
+	prior, err := pipeline.RequestSyncFromBackupStop(ctx, store, time.Now())
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stdout, "stop requested for broker on chain %q (running pid=%d host=%q stream_id=%q); broker will exit on next tick\n",
+		storeDesc, prior.PID, prior.Host, prior.StreamID)
+	return nil
 }
 
 // SyncStartCmd starts (or resumes) a continuous-sync stream from a

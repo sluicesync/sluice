@@ -244,6 +244,37 @@ func (a *ChangeApplier) ClearStream(ctx context.Context, streamID string) error 
 	return clearStream(ctx, a.db, a.schema, streamID)
 }
 
+// WritePosition implements [ir.PositionWriter]: upserts the
+// position row for streamID in `sluice_cdc_state` without any
+// accompanying data write. Used by Phase 4.5's broker for
+// cold-start initial-position writes and schema-delta-only
+// incrementals (no change chunks → no Apply path to ride along
+// with).
+//
+// Wraps the same writePositionTx helper the Apply path uses, so
+// the row shape and idempotency contract are identical. EncodeBroker
+// callers pass [pipeline.BackupBrokerPositionEngine]-tagged positions
+// here; the engine column is stored as part of the JSON token (see
+// the v0.20.0 Phase 4.5 design), so the same writePositionTx call
+// works without a schema change.
+func (a *ChangeApplier) WritePosition(ctx context.Context, streamID string, pos ir.Position) error {
+	if streamID == "" {
+		return errors.New("postgres: applier: WritePosition: streamID is empty")
+	}
+	tx, err := a.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("postgres: applier: WritePosition: begin tx: %w", err)
+	}
+	if err := writePositionTx(ctx, tx, a.schema, streamID, pos.Token); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("postgres: applier: WritePosition: commit: %w", err)
+	}
+	return nil
+}
+
 // Apply consumes changes from the channel and applies each to the
 // target in its own transaction. The position write happens inside
 // the same transaction as the data write (per ADR-0007); a crash

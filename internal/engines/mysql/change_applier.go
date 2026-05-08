@@ -217,6 +217,32 @@ func (a *ChangeApplier) ClearStream(ctx context.Context, streamID string) error 
 	return clearStream(ctx, a.db, streamID)
 }
 
+// WritePosition implements [ir.PositionWriter]: upserts the position
+// row for streamID in `sluice_cdc_state` without any accompanying
+// data write. Used by Phase 4.5's broker for cold-start initial-
+// position writes and schema-delta-only incrementals (no change
+// chunks → no Apply path to ride along with).
+//
+// Wraps the same writePositionTx helper the Apply path uses, so the
+// row shape and idempotency contract are identical.
+func (a *ChangeApplier) WritePosition(ctx context.Context, streamID string, pos ir.Position) error {
+	if streamID == "" {
+		return errors.New("mysql: applier: WritePosition: streamID is empty")
+	}
+	tx, err := a.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("mysql: applier: WritePosition: begin tx: %w", err)
+	}
+	if err := writePositionTx(ctx, tx, streamID, pos.Token); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("mysql: applier: WritePosition: commit: %w", err)
+	}
+	return nil
+}
+
 // Apply consumes changes from the channel and applies each to the
 // target in its own transaction. The position write happens inside
 // the same transaction as the data write (per ADR-0007), so a

@@ -654,6 +654,28 @@ type StreamCleaner interface {
 	ClearStream(ctx context.Context, streamID string) error
 }
 
+// PositionWriter is the optional surface a [ChangeApplier] can
+// implement to write a position row WITHOUT a paired data write.
+// Phase 4.5 (`sluice sync from-backup`) needs it for two reasons:
+//
+//  1. Cold-start --at-chain-id and --reset-target-data record an
+//     initial broker position before any incremental has been
+//     replayed; there's no Change stream to ride along with.
+//  2. Schema-delta-only incrementals (no change chunks) still need
+//     the broker's position to advance so the next tick doesn't
+//     re-replay the schema delta on every poll.
+//
+// The implementation MUST upsert the same `(stream_id,
+// source_position, updated_at)` row the apply path writes, with the
+// same idempotency contract (re-calling for the same streamID lands
+// the same row). It MAY use a single-statement transaction; it
+// SHOULD NOT touch the data tables.
+//
+// EnsureControlTable must have been called first.
+type PositionWriter interface {
+	WritePosition(ctx context.Context, streamID string, pos Position) error
+}
+
 // StreamStatus is the operational snapshot of one row in the
 // per-target sluice_cdc_state control table. Returned by
 // [ChangeApplier.ListStreams] for the `sluice sync status` command.
