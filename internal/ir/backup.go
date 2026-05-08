@@ -54,7 +54,84 @@ import (
 // removed in a way that older readers couldn't safely ignore). Older
 // sluice refuses newer manifests with a clear error; newer sluice
 // always reads older.
+//
+// v0.16.x manifests carry FormatVersion=1 (full backups only). v0.17.0
+// keeps FormatVersion=1: every Phase 3 addition is forward-compatible
+// (older sluice ignores [Manifest.Kind]/[Manifest.ParentBackupID]/etc.
+// — those manifests appear as orphan fulls when read by an older
+// binary, which is the right degraded behaviour for incrementals
+// nobody can chain anyway). The version bumps when a future change
+// would break older readers.
 const BackupFormatVersion = 1
+
+// Manifest kind constants. String literals are part of the on-disk
+// format; renaming requires a [BackupFormatVersion] bump.
+const (
+	// BackupKindFull marks a manifest produced by `sluice backup full`
+	// — a self-contained snapshot of the source schema + every row.
+	// Empty Kind is treated as full for backward compatibility with
+	// v0.16.x manifests written before the field existed.
+	BackupKindFull = "full"
+
+	// BackupKindIncremental marks a manifest produced by `sluice
+	// backup incremental` — a window of [Change] events sourced from
+	// the engine's CDC pump, replayed at restore time on top of a
+	// parent (full or earlier incremental). Phase 3 of the logical-
+	// backup feature; see `docs/dev/design-logical-backups-phase-3.md`.
+	BackupKindIncremental = "incremental"
+)
+
+// SchemaDeltaKind enumerates the kinds of schema changes recorded in
+// [Manifest.SchemaDelta]. String literals are part of the on-disk
+// format.
+const (
+	// SchemaDeltaAddTable records a CREATE TABLE event observed
+	// during an incremental's window. Before is nil; After holds the
+	// post-CREATE table shape.
+	SchemaDeltaAddTable = "add_table"
+
+	// SchemaDeltaDropTable records a DROP TABLE event. Before holds
+	// the pre-DROP table shape; After is nil.
+	SchemaDeltaDropTable = "drop_table"
+
+	// SchemaDeltaAlterTable records a structural change to an existing
+	// table (column added, removed, retyped). Before and After both
+	// non-nil; restore replays whichever ALTER fragments the engine's
+	// schema-delta applier supports.
+	SchemaDeltaAlterTable = "alter_table"
+)
+
+// SchemaDeltaEntry is one structural change observed during an
+// incremental backup's window. Restore-side replay applies these
+// against the target schema before streaming the incremental's row
+// events; the order in [Manifest.SchemaDelta] is the order of
+// observation.
+//
+// Before and After are full table shapes (not column-level diffs) so
+// the restore-side applier can decide its own ALTER strategy without
+// re-deriving the source intent from a column-level patch. For
+// SchemaDeltaAddTable, Before is nil; for SchemaDeltaDropTable, After
+// is nil; for SchemaDeltaAlterTable, both are non-nil.
+type SchemaDeltaEntry struct {
+	// Kind is one of SchemaDeltaAddTable / SchemaDeltaDropTable /
+	// SchemaDeltaAlterTable.
+	Kind string `json:"kind"`
+
+	// Schema is the namespace the table belongs to (Postgres). Empty
+	// for flat-scope engines (MySQL).
+	Schema string `json:"schema,omitempty"`
+
+	// Table is the unqualified table name.
+	Table string `json:"table"`
+
+	// Before is the table's shape at the start of the incremental's
+	// window. Nil for SchemaDeltaAddTable.
+	Before *Table `json:"before,omitempty"`
+
+	// After is the table's shape at the end of the incremental's
+	// window. Nil for SchemaDeltaDropTable.
+	After *Table `json:"after,omitempty"`
+}
 
 // BackupStore is the storage abstraction for logical backups. Phase 1
 // ships a single implementation ([pipeline.LocalStore]) backed by the
@@ -157,6 +234,72 @@ type Manifest struct {
 	//     table; chunks already present on the store with matching
 	//     SHA-256 are skipped, mismatched ones are overwritten.
 	PartialState string `json:"partial_state,omitempty"`
+
+	// BackupID is a deterministic identifier for this manifest,
+	// derived from CreatedAt + SourceEngine + Kind + (for incrementals)
+	// EndPosition. Used to link incrementals to their parent via
+	// [ParentBackupID] without depending on the manifest's URL or
+	// filename. Empty in pre-v0.17.0 manifests; restore treats those
+	// as orphan fulls.
+	BackupID string `json:"backup_id,omitempty"`
+
+	// Kind is the manifest's flavour: [BackupKindFull] or
+	// [BackupKindIncremental]. Empty is treated as full for
+	// backward-compat with v0.16.x manifests.
+	Kind string `json:"kind,omitempty"`
+
+	// ParentBackupID is the [BackupID] of the manifest this
+	// incremental was taken on top of. Empty for fulls; required for
+	// incrementals (chain restore validates the link). Same chain may
+	// reference a full or another incremental; the restore-side walk
+	// follows the chain via this field.
+	ParentBackupID string `json:"parent_backup_id,omitempty"`
+
+	// StartPosition is the source-engine CDC position the incremental
+	// began streaming from. For an incremental whose parent is a full,
+	// this equals the full's [EndPosition] (= the snapshot point). For
+	// an incremental whose parent is another incremental, this equals
+	// the parent's [EndPosition]. The restore-side walk validates the
+	// equality before applying the chain.
+	//
+	// Empty on full manifests (Phase 3 didn't grow snapshot-position
+	// recording into the full path; that's a Phase 3.3 follow-up so
+	// `--position-from-manifest` can be a uniform read).
+	//
+	// The position's engine-tagged opaque token carries the
+	// engine-specific bookmark: Postgres LSN under [pgPos], MySQL
+	// binlog file/pos or GTID set under [binlogPos]. Operators
+	// inspecting the manifest see the JSON-encoded form; sluice
+	// decodes it through the same engine-side helpers the CDC
+	// reader uses.
+	StartPosition Position `json:"start_position,omitempty"`
+
+	// EndPosition is the source-engine CDC position the incremental
+	// stopped at. For incremental manifests, this is the resume point
+	// for the next incremental in the chain (and, eventually, for
+	// `sluice sync start --position-from-manifest`). For full
+	// manifests, Phase 3 leaves this empty (see [StartPosition]).
+	EndPosition Position `json:"end_position,omitempty"`
+
+	// SchemaHash is a deterministic fingerprint of [Schema] at the
+	// point the manifest was written. Computed via SHA-256 over the
+	// canonical JSON serialisation (encoding/json with the existing
+	// IR marshalling). Used by chain-restore as a sanity check that
+	// the chain's schema lineage hasn't been tampered with.
+	SchemaHash string `json:"schema_hash,omitempty"`
+
+	// SchemaDelta records structural changes observed during an
+	// incremental's window. Empty when no DDL ran on the source
+	// during the window. Restore-side applies entries in slice order
+	// before streaming the incremental's row events.
+	SchemaDelta []*SchemaDeltaEntry `json:"schema_delta,omitempty"`
+
+	// ChangeChunks lists the chunk files containing serialised
+	// [Change] events for an incremental backup. Empty for full
+	// manifests; populated for incrementals as the writer rolls
+	// chunks during the window. Path conventions mirror full
+	// backups' table chunks but live under `chunks/_changes/`.
+	ChangeChunks []*ChunkInfo `json:"change_chunks,omitempty"`
 }
 
 // Manifest partial-state constants. String literals are part of the
