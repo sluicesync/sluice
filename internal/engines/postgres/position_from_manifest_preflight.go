@@ -31,12 +31,11 @@ import (
 	"strings"
 
 	"github.com/orware/sluice/internal/ir"
-	"github.com/orware/sluice/internal/pipeline"
 )
 
 // PreflightPositionFromManifest implements
-// [pipeline.PositionFromManifestPreflight]. Returns a
-// [pipeline.PreflightReport] capturing soft warnings (wal_keep_size,
+// [ir.PositionFromManifestPreflight]. Returns an
+// [ir.PreflightReport] capturing soft warnings (wal_keep_size,
 // Patroni detection) and an optional refusal (slot missing /
 // invalidated). Engine-side query failures surface via the err return;
 // the streamer treats those as preflight infrastructure failures
@@ -51,9 +50,9 @@ func (r *SchemaReader) PreflightPositionFromManifest(
 	ctx context.Context,
 	chainTerminal ir.Position,
 	slotName string,
-) (pipeline.PreflightReport, error) {
+) (ir.PreflightReport, error) {
 	if r.db == nil {
-		return pipeline.PreflightReport{}, errors.New("postgres: PreflightPositionFromManifest: reader not opened")
+		return ir.PreflightReport{}, errors.New("postgres: PreflightPositionFromManifest: reader not opened")
 	}
 
 	// Resolve which slot to inspect. Operator-supplied slotName wins;
@@ -69,7 +68,7 @@ func (r *SchemaReader) PreflightPositionFromManifest(
 		resolvedSlot = defaultSlot
 	}
 
-	report := pipeline.PreflightReport{}
+	report := ir.PreflightReport{}
 
 	// Check 1: wal_keep_size. PG 13+. We surface the configured value
 	// (in MB) so the operator can sanity-check it against the chain
@@ -81,7 +80,7 @@ func (r *SchemaReader) PreflightPositionFromManifest(
 	// keeps blast radius small and matches the design doc's "soft
 	// warning" intent.
 	if walKeepMB, ok, err := walKeepSizeMB(ctx, r.db); err != nil {
-		return pipeline.PreflightReport{}, fmt.Errorf("read wal_keep_size: %w", err)
+		return ir.PreflightReport{}, fmt.Errorf("read wal_keep_size: %w", err)
 	} else if ok && walKeepMB < walKeepSizeWarnThresholdMB {
 		report.Warnings = append(report.Warnings, fmt.Sprintf(
 			"wal_keep_size = %d MB looks small (< %d MB) for a chain handoff; if the chain's typical incremental cadence exceeds the WAL volume per minute the slot covers, CDC may not have the WAL it needs to bridge to the chain's terminal position. Consider raising wal_keep_size on the source. See docs/postgres-source-prep.md.",
@@ -91,7 +90,7 @@ func (r *SchemaReader) PreflightPositionFromManifest(
 	// Check 2: Patroni / HA detection. Three signals checked in turn;
 	// any positive signal triggers the warning.
 	if isPatroni, why, err := detectPatroniSource(ctx, r.db); err != nil {
-		return pipeline.PreflightReport{}, fmt.Errorf("detect patroni: %w", err)
+		return ir.PreflightReport{}, fmt.Errorf("detect patroni: %w", err)
 	} else if isPatroni {
 		report.Warnings = append(report.Warnings, fmt.Sprintf(
 			"this PG cluster is HA-managed (%s). The slot you're starting CDC from is subject to the idle-slot failover trap — slots not actively consumed don't replicate to standbys and are silently lost on failover. Ensure the slot is being actively consumed; for low-traffic sources, consider a heartbeat-write strategy. See docs/postgres-source-prep.md.",
@@ -103,7 +102,7 @@ func (r *SchemaReader) PreflightPositionFromManifest(
 	// need and there's no recovery short of dropping/recreating.
 	state, err := slotInfo(ctx, r.db, resolvedSlot)
 	if err != nil {
-		return pipeline.PreflightReport{}, fmt.Errorf("query slot %q: %w", resolvedSlot, err)
+		return ir.PreflightReport{}, fmt.Errorf("query slot %q: %w", resolvedSlot, err)
 	}
 	switch {
 	case state == nil:

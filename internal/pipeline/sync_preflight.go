@@ -31,43 +31,24 @@ import (
 	"github.com/orware/sluice/internal/ir"
 )
 
-// PositionFromManifestPreflight is the optional engine-side surface
-// for the Phase 3.3.C pre-flight checks. PG implements it on the
-// engine's [ir.SchemaReader] (parallel to [ir.HealthReporter] /
-// [ir.BackupPositionCapturer]); engines without operator-attention
-// surfaces simply omit the method.
-//
-// The contract: implementations inspect the source's slot/WAL state
-// against the supplied chainTerminal position and the slotName the
-// CDC reader will use, and return a [PreflightReport] capturing soft
-// warnings + an optional refusal. The streamer surfaces refusals as
-// run-aborting errors; warnings turn into refusals when StrictPreflight
-// is true.
-type PositionFromManifestPreflight interface {
-	PreflightPositionFromManifest(
-		ctx context.Context,
-		chainTerminal ir.Position,
-		slotName string,
-	) (PreflightReport, error)
-}
+// PositionFromManifestPreflight and PreflightReport now live in the
+// `ir` package so engine packages can implement the interface without
+// forming an import cycle through pipeline's integration tests. The
+// type aliases below preserve the names at this package's surface so
+// existing callers (tests, the streamer's preflight runner) keep
+// compiling without prefix churn.
+type (
+	// PositionFromManifestPreflight is re-exported from ir for
+	// streamer-side access. Engines should reference
+	// [ir.PositionFromManifestPreflight] directly to keep their
+	// imports minimal.
+	PositionFromManifestPreflight = ir.PositionFromManifestPreflight
 
-// PreflightReport bundles the result of a Phase 3.3.C pre-flight
-// against the source. Warnings are operator-actionable advisories
-// that don't block the run by default; Refusal is a fatal condition
-// the operator must address before the run can proceed (slot lost,
-// slot missing, WAL gap exceeds keep-size).
-type PreflightReport struct {
-	// Warnings is the slice of soft-warning messages emitted by the
-	// preflight. Each is a single-sentence operator-facing string;
-	// the streamer logs them via slog.WarnContext and (when
-	// StrictPreflight is true) escalates to a refusal.
-	Warnings []string
-
-	// Refusal is non-empty when the preflight encountered a fatal
-	// condition. The streamer surfaces it as a wrapped run error.
-	// Empty means "no refusal" — warnings only.
-	Refusal string
-}
+	// PreflightReport is re-exported from ir for streamer-side
+	// access. Engines populate this struct value as the return of
+	// PreflightPositionFromManifest.
+	PreflightReport = ir.PreflightReport
+)
 
 // runPositionFromManifestPreflight runs the source-side pre-flight
 // checks against the chain terminal position and surfaces the result

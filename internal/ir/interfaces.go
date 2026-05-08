@@ -421,6 +421,49 @@ type CDCReader interface {
 	StreamChanges(ctx context.Context, from Position) (<-chan Change, error)
 }
 
+// PositionFromManifestPreflight is the optional engine-side surface
+// for the Phase 3.3.C pre-flight checks fired before
+// `sluice sync start --position-from-manifest` opens CDC. PG
+// implements it on the engine's [SchemaReader] (parallel to
+// [HealthReporter] / [BackupPositionCapturer]); engines without
+// operator-attention surfaces simply omit the method.
+//
+// The contract: implementations inspect the source's slot/WAL state
+// against the supplied chainTerminal position and the slotName the
+// CDC reader will use, and return a [PreflightReport] capturing soft
+// warnings + an optional refusal. The streamer surfaces refusals as
+// run-aborting errors; warnings turn into refusals when
+// `--strict-preflight` is set.
+//
+// Lives in the ir package (not pipeline) so engine packages can
+// reference it without forming an import cycle through pipeline's
+// integration tests.
+type PositionFromManifestPreflight interface {
+	PreflightPositionFromManifest(
+		ctx context.Context,
+		chainTerminal Position,
+		slotName string,
+	) (PreflightReport, error)
+}
+
+// PreflightReport bundles the result of a Phase 3.3.C pre-flight
+// against the source. Warnings are operator-actionable advisories
+// that don't block the run by default; Refusal is a fatal condition
+// the operator must address before the run can proceed (slot lost,
+// slot missing, WAL gap exceeds keep-size).
+type PreflightReport struct {
+	// Warnings is the slice of soft-warning messages emitted by the
+	// preflight. Each is a single-sentence operator-facing string;
+	// the streamer logs them via slog.WarnContext and (when
+	// StrictPreflight is true) escalates to a refusal.
+	Warnings []string
+
+	// Refusal is non-empty when the preflight encountered a fatal
+	// condition. The streamer surfaces it as a wrapped run error.
+	// Empty means "no refusal" — warnings only.
+	Refusal string
+}
+
 // BackupPositionCapturer is the optional engine surface for capturing
 // the source's current CDC position from a one-shot query. Used by
 // the full-backup orchestrator to populate [Manifest.EndPosition] —
