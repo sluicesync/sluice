@@ -67,6 +67,7 @@ import (
 	"time"
 
 	"github.com/orware/sluice/internal/ir"
+	"github.com/orware/sluice/internal/translate"
 )
 
 // BackupBrokerPositionEngine is the sentinel value the broker writes
@@ -847,6 +848,11 @@ func (b *SyncFromBackup) applyIncremental(
 // tables (no rows yet), AlterTable emits ADD COLUMN for added
 // columns, DropTable is a no-op for v1.
 //
+// Cross-engine (Phase 5): when the chain's source engine differs from
+// the broker's target engine, the After-shape of each delta is routed
+// through [translate.RetargetForEngine] before invoking the schema
+// writer / [ir.SchemaDeltaApplier]. Mirrors the chain-restore path.
+//
 // Implementation duplicates the chain-restore logic intentionally
 // rather than refactoring chain_restore.go (Tenet: don't refactor
 // Phase 4 surfaces beyond what 4.5 requires).
@@ -856,6 +862,15 @@ func (b *SyncFromBackup) applySchemaDeltas(ctx context.Context, link *manifestRe
 			"unsupportable schema delta in incremental %s: %w. "+
 				"Force a fresh full + new chain to recover",
 			manifestBackupID(link.manifest), err)
+	}
+
+	sourceEngine := link.manifest.SourceEngine
+	targetEngine := b.Target.Name()
+	if err := checkCrossEngineDeltaSupportable(
+		link.manifest.SchemaDelta, sourceEngine, targetEngine,
+		manifestBackupID(link.manifest),
+	); err != nil {
+		return err
 	}
 
 	sw, err := b.Target.OpenSchemaWriter(ctx, b.TargetDSN)
@@ -871,8 +886,10 @@ func (b *SyncFromBackup) applySchemaDeltas(ctx context.Context, link *manifestRe
 			if d.After == nil {
 				continue
 			}
-			s := &ir.Schema{Tables: []*ir.Table{d.After}}
-			if err := sw.CreateTablesWithoutConstraints(ctx, s); err != nil {
+			retargeted := translate.RetargetForEngine(
+				&ir.Schema{Tables: []*ir.Table{d.After}},
+				sourceEngine, targetEngine)
+			if err := sw.CreateTablesWithoutConstraints(ctx, retargeted); err != nil {
 				return fmt.Errorf("create added table %s: %w", d.Table, err)
 			}
 			slog.InfoContext(ctx, "broker: schema delta — added table",
@@ -895,7 +912,12 @@ func (b *SyncFromBackup) applySchemaDeltas(ctx context.Context, link *manifestRe
 				)
 				continue
 			}
-			if err := deltaApplier.AlterAddColumn(ctx, d.After, added); err != nil {
+			retargetedSchema := translate.RetargetForEngine(
+				&ir.Schema{Tables: []*ir.Table{d.After}},
+				sourceEngine, targetEngine)
+			retargetedTable := retargetedSchema.Tables[0]
+			retargetedAdded := addedColumns(d.Before, retargetedTable)
+			if err := deltaApplier.AlterAddColumn(ctx, retargetedTable, retargetedAdded); err != nil {
 				return fmt.Errorf("alter add column on %s: %w", d.Table, err)
 			}
 			slog.InfoContext(ctx, "broker: schema delta — applied ADD COLUMN",

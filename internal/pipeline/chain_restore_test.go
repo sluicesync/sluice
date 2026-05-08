@@ -346,12 +346,15 @@ func TestChainRestore_FullPlusOneIncremental_RoundTrip(t *testing.T) {
 	}
 }
 
-// TestChainRestore_CrossEngineWithIncrementalsRefuses verifies that
-// a chain whose source engine differs from the target engine errors
-// out with operator-actionable guidance — Phase 3.2 acceptance
-// criterion 3 (cross-engine schema-delta translation deferred to
-// Phase 5+).
-func TestChainRestore_CrossEngineWithIncrementalsRefuses(t *testing.T) {
+// TestChainRestore_CrossEngineWithIncrementalsSucceeds verifies that
+// Phase 5's cross-engine routing lifts the v0.17.0–v0.20.x refusal:
+// a chain whose source engine differs from the target engine now
+// runs through the restore + applier pipeline. Same shape, different
+// outcome: the test that used to assert refusal now asserts the
+// no-incremental-data path completes cleanly. Cross-engine acceptance
+// criteria 1–4 are validated end-to-end by the integration tests in
+// chain_restore_cross_integration_test.go.
+func TestChainRestore_CrossEngineWithIncrementalsSucceeds(t *testing.T) {
 	dir := t.TempDir()
 	store, _ := NewLocalStore(dir)
 
@@ -369,15 +372,69 @@ func TestChainRestore_CrossEngineWithIncrementalsRefuses(t *testing.T) {
 		t.Fatalf("write incr: %v", err)
 	}
 
-	// Target engine = mysql, distinct from the chain's source.
-	tgt := newRestoreRecorderEngine("mysql")
+	// Target engine = mysql, distinct from the chain's source. The
+	// recorder engine handles every phase as a no-op + record; the
+	// incremental has no change chunks so the applier is exercised
+	// only via OpenChangeApplier + EnsureControlTable.
+	tgt := &chainRestoreRecorderEngine{
+		restoreRecorderEngine: newRestoreRecorderEngine("mysql"),
+	}
+	chain := &ChainRestore{Target: tgt, TargetDSN: "tgt", Store: store}
+	if err := chain.Run(context.Background()); err != nil {
+		t.Fatalf("chain restore: %v", err)
+	}
+	phases, _ := tgt.snapshot()
+	if len(phases) == 0 || phases[0] != "CreateTablesWithoutConstraints" {
+		t.Errorf("phase[0] = %v; want CreateTablesWithoutConstraints first", phases)
+	}
+}
+
+// TestChainRestore_CrossEnginePostGISRefuses asserts the loud-refusal
+// path for unsupportable cross-engine types. Phase 5 acceptance
+// criterion 4: a PG chain whose schema includes a PostGIS geometry
+// column refuses with operator-actionable guidance when the target is
+// MySQL — the offending table is named so `--exclude-table=<name>`
+// gives the operator a clean recovery path.
+func TestChainRestore_CrossEnginePostGISRefuses(t *testing.T) {
+	dir := t.TempDir()
+	store, _ := NewLocalStore(dir)
+
+	// Full manifest with a PostGIS geometry column.
+	full := &ir.Manifest{
+		FormatVersion: ir.BackupFormatVersion,
+		CreatedAt:     time.Date(2026, 5, 8, 10, 0, 0, 0, time.UTC),
+		SourceEngine:  "postgres",
+		Kind:          ir.BackupKindFull,
+		Schema: &ir.Schema{Tables: []*ir.Table{{
+			Name: "places",
+			Columns: []*ir.Column{
+				{Name: "id", Type: ir.Integer{Width: 64}},
+				{Name: "loc", Type: ir.Geometry{Subtype: ir.GeometryPoint, SRID: 4326}},
+			},
+		}}},
+		EndPosition: ir.Position{Engine: "postgres", Token: `{"slot":"sluice_slot","lsn":"0/100"}`},
+	}
+	full.BackupID = ir.ComputeBackupID(full)
+	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
+		t.Fatalf("write full: %v", err)
+	}
+
+	tgt := &chainRestoreRecorderEngine{
+		restoreRecorderEngine: newRestoreRecorderEngine("mysql"),
+	}
 	chain := &ChainRestore{Target: tgt, TargetDSN: "tgt", Store: store}
 	err := chain.Run(context.Background())
 	if err == nil {
-		t.Fatal("err = nil; want cross-engine refusal")
+		t.Fatal("err = nil; want PostGIS refusal")
 	}
-	if !strings.Contains(err.Error(), "cross-engine") {
-		t.Errorf("err = %v; want cross-engine refusal", err)
+	if !strings.Contains(err.Error(), "PostGIS") {
+		t.Errorf("err = %v; want PostGIS refusal", err)
+	}
+	if !strings.Contains(err.Error(), "places") {
+		t.Errorf("err = %v; want refusal to name table 'places'", err)
+	}
+	if !strings.Contains(err.Error(), "--exclude-table") {
+		t.Errorf("err = %v; want recovery hint with --exclude-table", err)
 	}
 }
 

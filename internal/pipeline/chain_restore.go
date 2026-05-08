@@ -91,14 +91,44 @@ func (r *ChainRestore) Run(ctx context.Context) error {
 		return errors.New("chain restore: store contains no manifests")
 	}
 
-	// 2. Refuse cross-engine incremental restore (Phase 5+ topic).
+	// 2. Cross-engine routing (Phase 5). When the chain's source
+	//    engine differs from the target engine, schema deltas in
+	//    incrementals get translated via [translate.RetargetForEngine]
+	//    before they're applied; change-event row payloads are shaped
+	//    by the engine appliers' existing live-CDC value-translation
+	//    path (the applier looks up target column types and routes
+	//    each value through `prepareValue`). Pre-flight the chain's
+	//    full schema for unsupportable types (PostGIS, hstore — same
+	//    refusal the full cross-engine restore already surfaces) so
+	//    the operator gets a clear refusal before any work happens.
 	full := chain[0]
-	if len(chain) > 1 && full.manifest.SourceEngine != r.Target.Name() {
-		return fmt.Errorf(
-			"chain restore: chain has %d incremental(s) but source engine %q differs from target engine %q; "+
-				"cross-engine chain restore is a Phase 5+ topic. "+
-				"Restore the full alone (%q) or take a fresh full on the target side",
-			len(chain)-1, full.manifest.SourceEngine, r.Target.Name(), full.path)
+	crossEngine := full.manifest.SourceEngine != r.Target.Name() && full.manifest.SourceEngine != ""
+	if crossEngine {
+		if err := checkCrossEngineSupportable(
+			full.manifest.Schema,
+			full.manifest.SourceEngine, r.Target.Name(),
+			fmt.Sprintf("chain restore: full %s", manifestBackupID(full.manifest)),
+		); err != nil {
+			return err
+		}
+		// Pre-flight every incremental's After-shape too. Schema
+		// deltas may introduce a new table or column whose type is
+		// unsupportable; surfacing it here means the operator's
+		// recovery hint (--exclude-table) names the right table.
+		for _, link := range chain[1:] {
+			if err := checkCrossEngineDeltaSupportable(
+				link.manifest.SchemaDelta,
+				full.manifest.SourceEngine, r.Target.Name(),
+				manifestBackupID(link.manifest),
+			); err != nil {
+				return err
+			}
+		}
+		slog.InfoContext(ctx, "chain restore: cross-engine mode",
+			slog.String("source_engine", full.manifest.SourceEngine),
+			slog.String("target_engine", r.Target.Name()),
+			slog.Int("incrementals", len(chain)-1),
+		)
 	}
 
 	// 3. Apply the full via the existing Restore path.
