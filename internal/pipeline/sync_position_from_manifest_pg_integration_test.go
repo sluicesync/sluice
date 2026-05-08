@@ -33,6 +33,9 @@ import (
 	"github.com/orware/sluice/internal/ir"
 
 	_ "github.com/orware/sluice/internal/engines/postgres"
+
+	"github.com/testcontainers/testcontainers-go"
+	pgtc "github.com/testcontainers/testcontainers-go/modules/postgres"
 )
 
 // TestBackup_RecordsEndPosition_PostgresIntegration pins acceptance
@@ -366,6 +369,251 @@ func TestPreflight_PG_DetectsLowWalKeepSize(t *testing.T) {
 	}
 	if !sawWalKeep {
 		t.Errorf("expected wal_keep_size warning; got %v", report.Warnings)
+	}
+}
+
+// TestPreflight_PG_DetectsPhysicalSlot confirms Bug 36 (v0.17.3)
+// Signal 4: a non-temporary physical replication slot on the source
+// is detected as an HA-cluster signal. Most non-HA PG deployments
+// don't carry standby physical slots, so the presence of one is a
+// strong heuristic — and it covers managed-PG services where the
+// v0.17.2 SQL signals (Patroni-prefixed GUCs / pg_stat_replication /
+// patroni-named roles) all systematically miss.
+func TestPreflight_PG_DetectsPhysicalSlot(t *testing.T) {
+	sourceDSN, _, cleanup := startPostgresLogical(t)
+	defer cleanup()
+
+	db, err := sql.Open("pgx", sourceDSN)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	// Create a non-temporary physical replication slot to simulate
+	// the HA-cluster shape.
+	if _, err := db.ExecContext(context.Background(),
+		`SELECT pg_create_physical_replication_slot('sluice_test_phys_slot', false, false)`,
+	); err != nil {
+		t.Fatalf("create physical slot: %v", err)
+	}
+	defer func() {
+		_, _ = db.ExecContext(context.Background(),
+			`SELECT pg_drop_replication_slot('sluice_test_phys_slot')`)
+	}()
+
+	pgEng, _ := engines.Get("postgres")
+	sr, err := pgEng.OpenSchemaReader(context.Background(), sourceDSN)
+	if err != nil {
+		t.Fatalf("OpenSchemaReader: %v", err)
+	}
+	defer closeIf(sr)
+
+	preflighter, ok := sr.(PositionFromManifestPreflight)
+	if !ok {
+		t.Fatal("PG SchemaReader does not implement PositionFromManifestPreflight")
+	}
+	chainPos := ir.Position{Engine: "postgres", Token: `{"slot":"sluice_slot","lsn":"0/100"}`}
+	report, err := preflighter.PreflightPositionFromManifest(context.Background(), chainPos, "sluice_slot")
+	if err != nil {
+		t.Fatalf("PreflightPositionFromManifest: %v", err)
+	}
+	var sawPatroni bool
+	for _, w := range report.Warnings {
+		if strings.HasPrefix(w, "this PG cluster is HA-managed") {
+			sawPatroni = true
+			if !strings.Contains(w, "physical replication slots") {
+				t.Errorf("Patroni warning = %q; want 'physical replication slots' substring", w)
+			}
+		}
+	}
+	if !sawPatroni {
+		t.Errorf("expected Patroni warning citing physical slot; got %v", report.Warnings)
+	}
+}
+
+// TestPreflight_PG_DetectsClusterNameGUC confirms Bug 36 (v0.17.3)
+// Signal 5: a populated cluster_name GUC on the source is detected as
+// an HA-managed-convention signal. Patroni sets this; many managed
+// services do too. This signal catches managed-PG services where
+// pg_replication_slots is restricted (so Signal 4 misses) but
+// cluster_name is exposed via pg_settings.
+//
+// cluster_name is a postmaster-context GUC: it can only be set at
+// server startup, not via ALTER SYSTEM + reload. The test boots a
+// dedicated container with cluster_name passed as a server arg.
+func TestPreflight_PG_DetectsClusterNameGUC(t *testing.T) {
+	sourceDSN, cleanup := startPostgresLogicalWithClusterName(t, "sluice-test-cluster")
+	defer cleanup()
+
+	pgEng, _ := engines.Get("postgres")
+	sr, err := pgEng.OpenSchemaReader(context.Background(), sourceDSN)
+	if err != nil {
+		t.Fatalf("OpenSchemaReader: %v", err)
+	}
+	defer closeIf(sr)
+
+	preflighter, ok := sr.(PositionFromManifestPreflight)
+	if !ok {
+		t.Fatal("PG SchemaReader does not implement PositionFromManifestPreflight")
+	}
+	chainPos := ir.Position{Engine: "postgres", Token: `{"slot":"sluice_slot","lsn":"0/100"}`}
+	report, err := preflighter.PreflightPositionFromManifest(context.Background(), chainPos, "sluice_slot")
+	if err != nil {
+		t.Fatalf("PreflightPositionFromManifest: %v", err)
+	}
+	var sawPatroni bool
+	for _, w := range report.Warnings {
+		if strings.HasPrefix(w, "this PG cluster is HA-managed") {
+			sawPatroni = true
+			if !strings.Contains(w, "cluster_name") {
+				t.Errorf("Patroni warning = %q; want 'cluster_name' substring", w)
+			}
+			if !strings.Contains(w, "sluice-test-cluster") {
+				t.Errorf("Patroni warning = %q; want cluster_name value substring", w)
+			}
+		}
+	}
+	if !sawPatroni {
+		t.Errorf("expected Patroni warning citing cluster_name; got %v", report.Warnings)
+	}
+}
+
+// startPostgresLogicalWithClusterName boots a single PG container
+// (no separate target) with cluster_name set at startup via a -c
+// flag, returning the source DSN and a cleanup. Mirror of
+// startPostgresLogical but specialised for the postmaster-context
+// GUC test (cluster_name can only be set at server start).
+func startPostgresLogicalWithClusterName(t *testing.T, clusterName string) (sourceDSN string, cleanup func()) {
+	t.Helper()
+	testcontainers.SkipIfProviderIsNotHealthy(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	container, err := pgtc.Run(ctx,
+		"postgres:16",
+		pgtc.WithDatabase("source_db"),
+		pgtc.WithUsername("test"),
+		pgtc.WithPassword("test"),
+		pgtc.BasicWaitStrategies(),
+		testcontainers.CustomizeRequest(testcontainers.GenericContainerRequest{
+			ContainerRequest: testcontainers.ContainerRequest{
+				Cmd: []string{
+					"-c", "wal_level=logical",
+					"-c", "max_wal_senders=8",
+					"-c", "max_replication_slots=8",
+					"-c", "cluster_name=" + clusterName,
+				},
+			},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("start container: %v", err)
+	}
+	terminate := func() {
+		shutdown, c := context.WithTimeout(context.Background(), 30*time.Second)
+		defer c()
+		_ = container.Terminate(shutdown)
+	}
+	srcConn, err := container.ConnectionString(ctx, "sslmode=disable")
+	if err != nil {
+		terminate()
+		t.Fatalf("connection string: %v", err)
+	}
+	return srcConn, terminate
+}
+
+// TestSyncStart_PatroniMode_Off_SuppressesWarning confirms Bug 36
+// (v0.17.3) override: --patroni-mode=off skips the Patroni-detection
+// signals entirely and suppresses the warning, even when a heuristic
+// would fire. Other warnings (wal_keep_size) are unaffected.
+func TestSyncStart_PatroniMode_Off_SuppressesWarning(t *testing.T) {
+	sourceDSN, _, cleanup := startPostgresLogical(t)
+	defer cleanup()
+
+	db, err := sql.Open("pgx", sourceDSN)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	// Trip Signal 4: create a non-temporary physical replication slot.
+	if _, err := db.ExecContext(context.Background(),
+		`SELECT pg_create_physical_replication_slot('sluice_test_phys_off', false, false)`,
+	); err != nil {
+		t.Fatalf("create physical slot: %v", err)
+	}
+	defer func() {
+		_, _ = db.ExecContext(context.Background(),
+			`SELECT pg_drop_replication_slot('sluice_test_phys_off')`)
+	}()
+
+	pgEng, _ := engines.Get("postgres")
+	sr, err := pgEng.OpenSchemaReader(context.Background(), sourceDSN)
+	if err != nil {
+		t.Fatalf("OpenSchemaReader: %v", err)
+	}
+	defer closeIf(sr)
+	preflighter := sr.(PositionFromManifestPreflight)
+	chainPos := ir.Position{Engine: "postgres", Token: `{"slot":"sluice_slot","lsn":"0/100"}`}
+	engineReport, err := preflighter.PreflightPositionFromManifest(context.Background(), chainPos, "sluice_slot")
+	if err != nil {
+		t.Fatalf("PreflightPositionFromManifest: %v", err)
+	}
+
+	// Streamer-level: applyPatroniMode under "off" should strip every
+	// Patroni warning the engine emitted.
+	s := &Streamer{SourceDSN: sourceDSN, PatroniMode: PatroniModeOff}
+	final := s.applyPatroniMode(engineReport, PatroniModeOff)
+	for _, w := range final.Warnings {
+		if strings.HasPrefix(w, "this PG cluster is HA-managed") {
+			t.Errorf("--patroni-mode=off did not suppress warning: %q", w)
+		}
+	}
+}
+
+// TestSyncStart_PatroniMode_On_FiresOnVanilla confirms Bug 36
+// (v0.17.3) override: --patroni-mode=on emits the Patroni warning
+// even on a vanilla PG container with no Patroni signals (no GUCs,
+// no pg_stat_replication entries, no patroni-named roles, no
+// physical slots, no cluster_name set).
+func TestSyncStart_PatroniMode_On_FiresOnVanilla(t *testing.T) {
+	sourceDSN, _, cleanup := startPostgresLogical(t)
+	defer cleanup()
+
+	pgEng, _ := engines.Get("postgres")
+	sr, err := pgEng.OpenSchemaReader(context.Background(), sourceDSN)
+	if err != nil {
+		t.Fatalf("OpenSchemaReader: %v", err)
+	}
+	defer closeIf(sr)
+	preflighter := sr.(PositionFromManifestPreflight)
+	chainPos := ir.Position{Engine: "postgres", Token: `{"slot":"sluice_slot","lsn":"0/100"}`}
+	engineReport, err := preflighter.PreflightPositionFromManifest(context.Background(), chainPos, "sluice_slot")
+	if err != nil {
+		t.Fatalf("PreflightPositionFromManifest: %v", err)
+	}
+	// Confirm vanilla PG didn't trip any engine-side Patroni signals
+	// — the test's surface depends on it.
+	for _, w := range engineReport.Warnings {
+		if strings.HasPrefix(w, "this PG cluster is HA-managed") {
+			t.Fatalf("vanilla PG unexpectedly tripped a Patroni signal: %q", w)
+		}
+	}
+
+	s := &Streamer{SourceDSN: sourceDSN, PatroniMode: PatroniModeOn}
+	final := s.applyPatroniMode(engineReport, PatroniModeOn)
+	var sawForced bool
+	for _, w := range final.Warnings {
+		if strings.HasPrefix(w, "this PG cluster is HA-managed") {
+			sawForced = true
+			if !strings.Contains(w, "operator forced") {
+				t.Errorf("warning = %q; want 'operator forced' substring", w)
+			}
+		}
+	}
+	if !sawForced {
+		t.Errorf("--patroni-mode=on did not emit forced warning; got %v", final.Warnings)
 	}
 }
 
