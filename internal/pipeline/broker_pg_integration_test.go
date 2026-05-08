@@ -565,16 +565,20 @@ func TestSyncFromBackup_ColdStartWithReset(t *testing.T) {
 	})
 	defer brokerCancel()
 
-	// Wait for the broker to land all 3 rows.
+	// Wait for the broker to land all 3 rows. The target table doesn't
+	// exist yet when the broker hasn't finished its inline ChainRestore;
+	// pgQueryEmails fatals on any query error, so use the tolerant
+	// variant that returns an empty slice when "users" hasn't been
+	// recreated yet by the reset path.
 	deadline := time.Now().Add(60 * time.Second)
 	for time.Now().Before(deadline) {
-		got := pgQueryEmails(t, brokerTargetDSN)
+		got := pgQueryEmailsTolerant(t, brokerTargetDSN)
 		if len(got) >= 3 {
 			break
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
-	got := pgQueryEmails(t, brokerTargetDSN)
+	got := pgQueryEmailsTolerant(t, brokerTargetDSN)
 	if len(got) < 3 {
 		t.Fatalf("after --reset-target-data, target emails = %v; want 3 (alice, bob, carol)", got)
 	}

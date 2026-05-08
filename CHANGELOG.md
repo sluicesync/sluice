@@ -34,6 +34,11 @@ Logical backups Phase 4.5 lands: `sluice sync from-backup` is the consumer-side 
 
 - **`cmd/sluice/cli.go` grows the `sync from-backup` subtree.** New `SyncCmd.FromBackup` field of type `SyncFromBackupCmdGrp` (kong-grouped `Run` + `Stop` subcommands). Existing `sync start` / `sync stop` / `sync status` / `sync health` flag surfaces are unchanged.
 
+### Fixed (post-tag, integration-test stability)
+
+- **MySQL broker happy-path test (`TestSyncFromBackup_MySQL_HappyPath`)** — bumped the per-test `IncrementalBackup.MaxChanges` cap from 10 to 50. MySQL's binlog emits ~3 events per autocommit `INSERT` (`BEGIN` `QueryEvent` → `WRITE_ROWS_EVENTv2` → `XID/TxCommit`) and the session's first connection-time interaction commonly flushes a short empty `BEGIN/COMMIT` pair into the binlog ahead of any DML, so 5 INSERTs produced 17 captured events in CI. The original cap of 10 stopped the incremental window after only 3 INSERTs, leaving `user3`/`user4` missing from the chain. No code-path change — the broker, applier, and incremental-backup orchestrator all behaved correctly; the test bound was simply too tight for MySQL's event volume.
+- **PG broker cold-start-with-reset test (`TestSyncFromBackup_ColdStartWithReset`)** — the test's poll loop used `pgQueryEmails`, which fatal-fails on any query error including the expected `users does not exist` window between launching the broker goroutine and the broker's inline `ChainRestore` recreating the schema. Added `pgQueryEmailsTolerant` (returns `nil` on `SQLSTATE 42P01` instead of fatal) for poll-loop callers; production code paths are unchanged.
+
 ### Migration / Compatibility
 
 - **No format changes.** Manifest schema, control-table schema, change-chunk format are unchanged. Pre-v0.20.0 chains restore + verify identically.

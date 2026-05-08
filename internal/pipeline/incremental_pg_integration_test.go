@@ -19,6 +19,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -527,6 +528,48 @@ func pgQueryEmails(t *testing.T, dsn string) []string {
 	defer cancel()
 	rows, err := db.QueryContext(ctx, "SELECT email FROM users ORDER BY id")
 	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []string
+	for rows.Next() {
+		var s string
+		if err := rows.Scan(&s); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		out = append(out, s)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows: %v", err)
+	}
+	return out
+}
+
+// pgQueryEmailsTolerant is the sibling of [pgQueryEmails] for poll-loop
+// callers that may run before the target table exists — e.g. broker
+// `--reset-target-data` tests, where the broker drops + recreates the
+// schema asynchronously and the test polls catch-up. Returns an empty
+// slice when the table doesn't exist yet (SQLSTATE 42P01) instead of
+// fatal-failing the test; surfaces other errors as fatals.
+func pgQueryEmailsTolerant(t *testing.T, dsn string) []string {
+	t.Helper()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	rows, err := db.QueryContext(ctx, "SELECT email FROM users ORDER BY id")
+	if err != nil {
+		// Postgres SQLSTATE 42P01 = undefined_table. The text varies
+		// across drivers but reliably contains "does not exist" plus
+		// "users". Match on either signal so the test tolerates the
+		// pre-recreation window.
+		msg := err.Error()
+		if strings.Contains(msg, "42P01") || strings.Contains(msg, "does not exist") {
+			return nil
+		}
 		t.Fatalf("query: %v", err)
 	}
 	defer func() { _ = rows.Close() }()

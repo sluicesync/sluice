@@ -78,13 +78,22 @@ func TestSyncFromBackup_MySQL_HappyPath(t *testing.T) {
 			`INSERT INTO users (email) VALUES ('user%d@example.com');`, i))
 	}
 
-	// Take an incremental that captures them.
+	// Take an incremental that captures them. MaxChanges is generous
+	// because MySQL's binlog emits ~3 events per autocommit INSERT
+	// (BEGIN QueryEvent → WRITE_ROWS_EVENTv2 → XID/TxCommit) AND the
+	// session's first connection-time interaction commonly flushes a
+	// short empty BEGIN/COMMIT pair into the binlog (observed in the
+	// v0.20.0 CI failure for this test: 5 INSERTs produced 17 events,
+	// the first 2 of which were a spurious empty transaction). A cap
+	// of 10 stopped after only 3 INSERTs, leaving user3/user4 missing
+	// from the chain. 50 is a comfortable headroom that doesn't slow
+	// the test perceptibly. ChunkChanges follows the same logic.
 	incrCtx, incrCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer incrCancel()
 	if err := (&IncrementalBackup{
 		Source: mysqlEng, SourceDSN: sourceDSN, Store: store,
-		ParentRef: full.BackupID, Window: 10 * time.Second, MaxChanges: 10,
-		ChunkChanges: 10, SluiceVersion: "test",
+		ParentRef: full.BackupID, Window: 10 * time.Second, MaxChanges: 50,
+		ChunkChanges: 50, SluiceVersion: "test",
 	}).Run(incrCtx); err != nil {
 		t.Fatalf("IncrementalBackup.Run: %v", err)
 	}
