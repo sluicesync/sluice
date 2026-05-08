@@ -274,11 +274,30 @@ type Manifest struct {
 	// reader uses.
 	StartPosition Position `json:"start_position,omitempty"`
 
-	// EndPosition is the source-engine CDC position the incremental
-	// stopped at. For incremental manifests, this is the resume point
-	// for the next incremental in the chain (and, eventually, for
-	// `sluice sync start --position-from-manifest`). For full
-	// manifests, Phase 3 leaves this empty (see [StartPosition]).
+	// EndPosition is the source-engine CDC position the manifest
+	// resolves to as a chain-handoff resume point.
+	//
+	//   - For incremental manifests, this is the source position the
+	//     incremental's CDC pump stopped at. The next incremental in
+	//     the chain starts from here, and `sluice sync start
+	//     --position-from-manifest` resumes CDC from here against a
+	//     freshly-restored target.
+	//   - For full manifests written by v0.17.0–v0.17.3, this is the
+	//     source position captured AFTER the row sweep completed (an
+	//     end-of-backup reading). Writes that landed on already-read
+	//     tables during the backup window are NOT in the row chunks
+	//     AND are NOT in the first incremental's `--since` window
+	//     (their LSNs are before this captured EndPosition) — the
+	//     v0.17.2 release notes documented this caveat.
+	//   - For full manifests written by v0.18.0+, this is the source
+	//     position captured AT snapshot START — the cross-table
+	//     consistent read view's anchor LSN/GTID. The row sweep reads
+	//     the source as it appeared at this position; CDC from this
+	//     position forward covers every write after the snapshot.
+	//     The during-backup window gap is closed.
+	//
+	// Pre-v0.17.0 full manifests carry an empty value here; the
+	// chain-walk treats them as orphan fulls.
 	EndPosition Position `json:"end_position,omitempty"`
 
 	// SchemaHash is a deterministic fingerprint of [Schema] at the

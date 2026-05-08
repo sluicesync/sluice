@@ -466,17 +466,31 @@ type PreflightReport struct {
 
 // BackupPositionCapturer is the optional engine surface for capturing
 // the source's current CDC position from a one-shot query. Used by
-// the full-backup orchestrator to populate [Manifest.EndPosition] —
-// the resume point for a Phase 3 incremental chained off this full.
+// the full-backup orchestrator as a v0.18.0 fallback when the engine
+// does NOT implement [BackupSnapshotOpener] — the snapshot-anchored
+// path is the preferred shape because it closes the during-backup
+// write-window gap that this fallback path leaves open.
 //
 // The captured position is the source-side cursor at the moment of
-// capture. The full backup calls this once at the end of the per-table
-// row sweep so the recorded EndPosition reflects "the source has
-// produced everything up to here; an incremental from this point
-// captures changes after the backup completes." Source writes during
-// the backup window are read by the per-table row sweep itself; the
-// EndPosition captures the boundary between "in this backup" and
-// "needs to come via the chain's next link."
+// capture. With the v0.17.x fallback shape, the full backup calls
+// this at the end of the per-table row sweep so the recorded
+// EndPosition reflects "the source has produced everything up to
+// here at the moment the backup completes." Writes that landed on
+// already-read tables during the backup window are read by neither
+// the row sweep (no shared snapshot) nor the first incremental's
+// `--since=<full>.EndPosition` window (those LSNs are before the
+// captured EndPosition) — the v0.17.2 release notes called this out
+// as a known caveat with the workaround "pair backups with
+// continuous `sluice sync start`."
+//
+// In v0.18.0 the gap is closed via [BackupSnapshotOpener]: engines
+// that implement it capture EndPosition at snapshot START (the
+// source position at which a cross-table consistent read view is
+// pinned) and the orchestrator never calls CaptureBackupPosition.
+// Engines that DON'T implement BackupSnapshotOpener fall through to
+// this surface with a WARN log line so operators know the chain
+// rooted in this full will carry the v0.17.x during-backup write-
+// window gap.
 //
 // Engines wire this on their [SchemaReader] (parallel to
 // [HealthReporter]) so the full-backup orchestrator can type-assert

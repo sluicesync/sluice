@@ -201,12 +201,19 @@ func (b *Backup) Run(ctx context.Context) error {
 		return err
 	}
 
-	// 3. Open row reader.
-	rr, err := b.Source.OpenRowReader(ctx, b.SourceDSN)
+	// 3. Open the row reader. v0.18.0: prefer the snapshot-anchored
+	// path that captures EndPosition at snapshot START and pins all
+	// table reads to a cross-table consistent view, closing the
+	// during-backup write-window gap that v0.17.x's basic OpenRowReader
+	// path leaves open. Engines that don't implement
+	// [ir.BackupSnapshotOpener] fall through to the v0.17.x shape with
+	// a soft warning so operators know the chain rooted in this full
+	// will carry the gap.
+	rr, snapshotPos, snapshotCloser, err := b.openSnapshotOrFallback(ctx)
 	if err != nil {
-		return wrapWithHint(PhaseConnect, fmt.Errorf("backup: open source row reader: %w", err))
+		return err
 	}
-	defer closeIf(rr)
+	defer snapshotCloser()
 
 	// 4. Stream each table to chunk file(s).
 	chunkRows := b.ChunkRows
@@ -322,13 +329,26 @@ func (b *Backup) Run(ctx context.Context) error {
 		}
 	}
 
-	// 4.5. Capture end-of-backup CDC position into manifest.EndPosition
-	// so a Phase 3 incremental chained off this full has a resume
-	// cursor (Phase 3.3). Engines without CDC support — or without an
-	// implementation of [ir.BackupPositionCapturer] — leave the field
-	// empty; the incremental orchestrator already handles that case
-	// with a clear "parent has no EndPosition" warning.
-	if err := b.captureEndPosition(ctx, manifest); err != nil {
+	// 4.5. Record EndPosition. Two paths:
+	//
+	//   - v0.18.0 snapshot-anchored: snapshotPos was captured at
+	//     snapshot START before the row sweep. The row sweep's reads
+	//     all observe the source AS-OF this position, and CDC from
+	//     this position forward covers every write after the snapshot.
+	//     The during-backup window gap is closed.
+	//   - v0.17.x fallback: the engine doesn't implement
+	//     BackupSnapshotOpener so we capture the position now,
+	//     post-sweep, via the optional [ir.BackupPositionCapturer].
+	//     This is the v0.17.2 shape with the documented during-backup
+	//     write-window gap; the openSnapshotOrFallback step has
+	//     already logged a WARN line so operators know.
+	if snapshotPos != nil {
+		manifest.EndPosition = *snapshotPos
+		slog.InfoContext(ctx, "backup: recorded end position (snapshot-anchored)",
+			slog.String("engine", manifest.SourceEngine),
+			slog.String("position_token", snapshotPos.Token),
+		)
+	} else if err := b.captureEndPosition(ctx, manifest); err != nil {
 		return wrapWithHint(PhaseConnect, fmt.Errorf("backup: capture end position: %w", err))
 	}
 
@@ -359,18 +379,90 @@ func (b *Backup) Run(ctx context.Context) error {
 	return nil
 }
 
-// captureEndPosition queries the source for its current CDC position
-// and stores it on manifest.EndPosition. Engines that don't support
-// CDC (Capabilities.CDC == ir.CDCNone) skip the capture; engines that
-// do but don't implement [ir.BackupPositionCapturer] also skip with a
-// debug log line so the gap is visible to operators running with
-// --log-level=debug.
+// openSnapshotOrFallback returns a row reader the orchestrator drives
+// the table sweep against, plus an optional snapshot-anchored
+// EndPosition captured at snapshot start.
 //
-// The capture happens AFTER the per-table row sweep so the recorded
-// position reflects "the source has produced everything up to here at
-// the moment the backup completes." Source writes during the backup
-// window are read by the row sweep itself; the EndPosition captures
-// the resume point for the chain's next link.
+// v0.18.0: when the engine implements [ir.BackupSnapshotOpener], we
+// open a backup-scoped consistent snapshot. The returned RowReader is
+// pinned to the snapshot view (cross-table consistency holds) and the
+// returned position is the snapshot's anchor LSN/GTID — recorded on
+// manifest.EndPosition so the Phase 3 incremental's CDC pump from this
+// position forward covers every write after the snapshot, closing the
+// during-backup write-window gap that v0.17.x's basic OpenRowReader
+// path leaves open.
+//
+// Fallback: engines without BackupSnapshotOpener get the v0.17.x shape
+// — a basic OpenRowReader (no shared snapshot, no cross-table
+// consistency) plus a post-sweep [ir.BackupPositionCapturer] capture
+// (later, in [Backup.captureEndPosition]). A WARN line is emitted so
+// operators know the chain rooted in this full will carry the
+// during-backup write-window gap.
+//
+// Returns (reader, snapshotPos, cleanup, err). When snapshotPos is
+// nil the caller falls through to captureEndPosition; when non-nil it
+// has already been captured. cleanup is always non-nil and safe to
+// call.
+func (b *Backup) openSnapshotOrFallback(ctx context.Context) (ir.RowReader, *ir.Position, func(), error) {
+	if opener, ok := b.Source.(ir.BackupSnapshotOpener); ok {
+		snap, err := opener.OpenBackupSnapshot(ctx, b.SourceDSN, b.SlotName)
+		if err != nil {
+			return nil, nil, func() {}, wrapWithHint(PhaseConnect, fmt.Errorf("backup: open backup snapshot: %w", err))
+		}
+		slog.InfoContext(ctx, "backup: opened snapshot-anchored consistent view",
+			slog.String("engine", b.Source.Name()),
+			slog.String("position_token", snap.Position.Token),
+		)
+		pos := snap.Position
+		cleanup := func() {
+			if err := snap.Close(); err != nil {
+				slog.WarnContext(ctx, "backup: snapshot close failed; partial cleanup may have leaked resources",
+					slog.String("err", err.Error()),
+				)
+			}
+		}
+		return snap.Rows, &pos, cleanup, nil
+	}
+
+	// Fallback path. Surface the gap loudly — operators consuming the
+	// chain need to know writes during the backup window are not
+	// guaranteed to be captured. The recommended mitigation (pair
+	// backups with continuous `sluice sync start`) is the same one
+	// the v0.17.2 release notes called out.
+	slog.WarnContext(ctx, "backup: engine does not implement BackupSnapshotOpener; falling back to non-snapshot row reads",
+		slog.String("engine", b.Source.Name()),
+		slog.String("impact", "chains rooted in this full will have a during-backup write-window gap"),
+		slog.String("mitigation", "pair backups with continuous `sluice sync start` so the live stream captures every write"),
+		slog.String("see_also", "v0.17.2 release notes; docs/dev/design-logical-backups-phase-3.md"),
+	)
+
+	rr, err := b.Source.OpenRowReader(ctx, b.SourceDSN)
+	if err != nil {
+		return nil, nil, func() {}, wrapWithHint(PhaseConnect, fmt.Errorf("backup: open source row reader: %w", err))
+	}
+	cleanup := func() { closeIf(rr) }
+	return rr, nil, cleanup, nil
+}
+
+// captureEndPosition queries the source for its current CDC position
+// and stores it on manifest.EndPosition. v0.18.0: this path is the
+// FALLBACK shape used only when the engine doesn't implement
+// [ir.BackupSnapshotOpener] — engines that do (PG, MySQL in v0.18.0+)
+// route through [openSnapshotOrFallback] instead and capture the
+// position at snapshot START rather than post-sweep.
+//
+// Engines that don't support CDC (Capabilities.CDC == ir.CDCNone) skip
+// the capture; engines that do but don't implement
+// [ir.BackupPositionCapturer] also skip with a debug log line so the
+// gap is visible to operators running with --log-level=debug.
+//
+// In the fallback shape the capture happens AFTER the per-table row
+// sweep, so the recorded position reflects "the source has produced
+// everything up to here at the moment the backup completes." Writes
+// during the backup window are NOT covered by this path's row sweep
+// (no shared snapshot) and NOT covered by the chain's next link's
+// `--since=<full>.EndPosition` window (those LSNs are before this
+// captured EndPosition) — the documented v0.17.2 caveat.
 func (b *Backup) captureEndPosition(ctx context.Context, manifest *ir.Manifest) error {
 	if b.Source.Capabilities().CDC == ir.CDCNone {
 		slog.DebugContext(ctx, "backup: source does not support CDC; skipping EndPosition capture",

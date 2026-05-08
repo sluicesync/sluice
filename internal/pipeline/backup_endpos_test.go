@@ -161,6 +161,188 @@ func TestBackup_NoCDCSkipsEndPosition(t *testing.T) {
 	}
 }
 
+// snapshotOpeningEngine wraps capturingBackupEngine to also implement
+// [ir.BackupSnapshotOpener] — exercising the v0.18.0 snapshot-anchored
+// EndPosition path. The snapshot is fed a sentinel position; the test
+// verifies the orchestrator records that position on the manifest
+// rather than calling the post-sweep CaptureBackupPosition fallback.
+type snapshotOpeningEngine struct {
+	*capturingBackupEngine
+	snapshotPos      ir.Position
+	snapshotErr      error
+	snapshotCalls    int
+	snapshotCloses   int
+	gotSnapshotSlot  string
+	useSnapshotRows  bool
+	snapshotRowsHook func() ir.RowReader
+}
+
+// OpenBackupSnapshot implements [ir.BackupSnapshotOpener].
+func (e *snapshotOpeningEngine) OpenBackupSnapshot(_ context.Context, _, slotName string) (*ir.BackupSnapshot, error) {
+	e.snapshotCalls++
+	e.gotSnapshotSlot = slotName
+	if e.snapshotErr != nil {
+		return nil, e.snapshotErr
+	}
+	var rows ir.RowReader
+	if e.useSnapshotRows && e.snapshotRowsHook != nil {
+		rows = e.snapshotRowsHook()
+	} else {
+		rows = &fakeRowReader{rows: e.rows}
+	}
+	return &ir.BackupSnapshot{
+		Position: e.snapshotPos,
+		Rows:     rows,
+		CloseFn: func() error {
+			e.snapshotCloses++
+			return nil
+		},
+	}, nil
+}
+
+// TestBackup_RecordsSnapshotAnchoredEndPosition pins the v0.18.0
+// snapshot-anchored EndPosition path: when the source engine
+// implements [ir.BackupSnapshotOpener], the orchestrator opens a
+// backup snapshot, threads its Position onto manifest.EndPosition,
+// and never calls the post-sweep CaptureBackupPosition fallback.
+func TestBackup_RecordsSnapshotAnchoredEndPosition(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewLocalStore(dir)
+	if err != nil {
+		t.Fatalf("NewLocalStore: %v", err)
+	}
+
+	schema := &ir.Schema{
+		Tables: []*ir.Table{{
+			Name:    "users",
+			Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}},
+		}},
+	}
+	captured := ir.Position{
+		Engine: "postgres",
+		Token:  `{"slot":"sluice_chain_slot","lsn":"0/AABBCC"}`,
+	}
+	snapshotPos := ir.Position{
+		Engine: "postgres",
+		Token:  `{"slot":"sluice_chain_slot","lsn":"0/SNAP00"}`,
+	}
+	reader := &capturingSchemaReader{schema: schema, captured: captured}
+	src := &snapshotOpeningEngine{
+		capturingBackupEngine: &capturingBackupEngine{
+			backupRecorderEngine: newBackupRecorderEngine("postgres", schema, map[string][]ir.Row{
+				"users": {{"id": int64(1)}},
+			}),
+			cdc:    ir.CDCLogicalReplication,
+			reader: reader,
+		},
+		snapshotPos: snapshotPos,
+	}
+
+	now := time.Date(2026, 5, 7, 12, 0, 0, 0, time.UTC)
+	b := &Backup{
+		Source:        src,
+		SourceDSN:     "src",
+		Store:         store,
+		SluiceVersion: "v0.18.0-test",
+		SlotName:      "sluice_chain_slot",
+		Now:           func() time.Time { return now },
+	}
+	if err := b.Run(context.Background()); err != nil {
+		t.Fatalf("Backup.Run: %v", err)
+	}
+
+	got, err := readManifest(context.Background(), store)
+	if err != nil {
+		t.Fatalf("readManifest: %v", err)
+	}
+	if got.EndPosition != snapshotPos {
+		t.Errorf("EndPosition = %+v; want snapshot-anchored %+v", got.EndPosition, snapshotPos)
+	}
+	if src.snapshotCalls != 1 {
+		t.Errorf("OpenBackupSnapshot calls = %d; want 1", src.snapshotCalls)
+	}
+	if src.snapshotCloses != 1 {
+		t.Errorf("snapshot Close calls = %d; want 1", src.snapshotCloses)
+	}
+	if src.gotSnapshotSlot != "sluice_chain_slot" {
+		t.Errorf("OpenBackupSnapshot slotName = %q; want %q", src.gotSnapshotSlot, "sluice_chain_slot")
+	}
+	// The post-sweep capturer must NOT fire on the snapshot path —
+	// that's the whole point of v0.18.0's gap-fix.
+	if reader.captureCalls != 0 {
+		t.Errorf("CaptureBackupPosition calls = %d; want 0 (snapshot path bypasses it)", reader.captureCalls)
+	}
+}
+
+// TestBackup_SnapshotOpenerErrorSurfacesAsRunFailure pins the loud-
+// failure shape: an OpenBackupSnapshot error becomes a Backup.Run
+// error before any chunks are written. Operators don't end up with
+// a half-written backup whose manifest's EndPosition isn't anchored
+// at a real consistent point.
+func TestBackup_SnapshotOpenerErrorSurfacesAsRunFailure(t *testing.T) {
+	dir := t.TempDir()
+	store, _ := NewLocalStore(dir)
+	schema := &ir.Schema{
+		Tables: []*ir.Table{{Name: "users", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}}},
+	}
+	reader := &capturingSchemaReader{schema: schema}
+	src := &snapshotOpeningEngine{
+		capturingBackupEngine: &capturingBackupEngine{
+			backupRecorderEngine: newBackupRecorderEngine("postgres", schema, map[string][]ir.Row{
+				"users": {{"id": int64(1)}},
+			}),
+			cdc:    ir.CDCLogicalReplication,
+			reader: reader,
+		},
+		snapshotErr: errors.New("simulated snapshot open failure"),
+	}
+	b := &Backup{Source: src, SourceDSN: "src", Store: store}
+	err := b.Run(context.Background())
+	if err == nil {
+		t.Fatal("Backup.Run: nil; want error from snapshot open failure")
+	}
+	if !strings.Contains(err.Error(), "simulated snapshot open failure") {
+		t.Errorf("err = %v; want containing snapshot open failure", err)
+	}
+}
+
+// TestBackup_FallbackWhenNoSnapshotOpener pins the v0.17.x-shape
+// fallback path: when the engine doesn't implement
+// [ir.BackupSnapshotOpener], the orchestrator routes through the
+// post-sweep CaptureBackupPosition fallback. The during-backup
+// write-window gap is documented; this test pins the dispatch.
+func TestBackup_FallbackWhenNoSnapshotOpener(t *testing.T) {
+	dir := t.TempDir()
+	store, _ := NewLocalStore(dir)
+	schema := &ir.Schema{
+		Tables: []*ir.Table{{Name: "users", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}}},
+	}
+	captured := ir.Position{
+		Engine: "postgres",
+		Token:  `{"slot":"sluice_chain_slot","lsn":"0/POSTSWEEP"}`,
+	}
+	reader := &capturingSchemaReader{schema: schema, captured: captured}
+	// capturingBackupEngine does NOT implement BackupSnapshotOpener.
+	src := &capturingBackupEngine{
+		backupRecorderEngine: newBackupRecorderEngine("postgres", schema, map[string][]ir.Row{
+			"users": {{"id": int64(1)}},
+		}),
+		cdc:    ir.CDCLogicalReplication,
+		reader: reader,
+	}
+	b := &Backup{Source: src, SourceDSN: "src", Store: store, SlotName: "sluice_chain_slot"}
+	if err := b.Run(context.Background()); err != nil {
+		t.Fatalf("Backup.Run: %v", err)
+	}
+	got, _ := readManifest(context.Background(), store)
+	if got.EndPosition != captured {
+		t.Errorf("EndPosition = %+v; want fallback-captured %+v", got.EndPosition, captured)
+	}
+	if reader.captureCalls != 1 {
+		t.Errorf("CaptureBackupPosition calls = %d; want 1 (fallback path)", reader.captureCalls)
+	}
+}
+
 // TestBackup_CapturerErrorSurfacesAsRunFailure pins the loud-failure
 // shape: a CaptureBackupPosition error becomes a Backup.Run error so
 // operators don't end up with a manifest claiming "complete" without
