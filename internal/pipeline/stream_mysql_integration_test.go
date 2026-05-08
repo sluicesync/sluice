@@ -93,7 +93,19 @@ func TestBackupStream_MySQL_RolloverByMaxChanges(t *testing.T) {
 	streamErr := make(chan error, 1)
 	go func() { streamErr <- stream.Run(ctx) }()
 
+	// Wait for the stream to commit at least 2 rollovers AND for its
+	// rollover throughput to settle (no new manifest in ~3s, which is
+	// > rollover-window so an idle final rollover would have committed
+	// or timed out empty before we cancel) so the source's 25 INSERTs
+	// have all been observed by the CDC pump and fed into a committed
+	// rollover. Polling on count alone (the pre-v0.20.1 shape) cancels
+	// too eagerly when each rollover takes ~250ms (Bug 38 fix's per-
+	// rollover schema refresh) — by the time 2 incrementals appear on
+	// disk, the cancel races with the in-flight rollover that contains
+	// the trailing inserts and on MySQL the chunk-buffered events past
+	// the cancel point are lost when the CDC pump exits.
 	deadline := time.Now().Add(45 * time.Second)
+	var lastCount, stableTicks int
 	for time.Now().Before(deadline) {
 		records, _ := listAllManifests(context.Background(), store)
 		var incrCount int
@@ -102,7 +114,13 @@ func TestBackupStream_MySQL_RolloverByMaxChanges(t *testing.T) {
 				incrCount++
 			}
 		}
-		if incrCount >= 2 {
+		if incrCount == lastCount {
+			stableTicks++
+		} else {
+			stableTicks = 0
+			lastCount = incrCount
+		}
+		if incrCount >= 2 && stableTicks >= 6 {
 			break
 		}
 		time.Sleep(500 * time.Millisecond)

@@ -118,8 +118,17 @@ func TestBackupStream_Postgres_RolloverByMaxChanges(t *testing.T) {
 	streamErr := make(chan error, 1)
 	go func() { streamErr <- stream.Run(ctx) }()
 
-	// Watch for rollovers; cancel once we have at least 2.
+	// Watch for rollovers; cancel once we have at least 2 AND the
+	// rollover throughput has settled (no new manifest in ~3s, which
+	// is > rollover-window so an idle final rollover would have
+	// committed or timed out empty before we cancel). Polling on
+	// count alone (the pre-v0.20.1 shape) cancels too eagerly when
+	// each rollover takes ~30-250ms (Bug 38 fix's per-rollover schema
+	// refresh) — by the time 2 incrementals appear on disk, the
+	// cancel races with the in-flight rollover that contains the
+	// trailing inserts.
 	deadline := time.Now().Add(45 * time.Second)
+	var lastCount, stableTicks int
 	for time.Now().Before(deadline) {
 		records, _ := listAllManifests(context.Background(), store)
 		var incrCount int
@@ -128,7 +137,13 @@ func TestBackupStream_Postgres_RolloverByMaxChanges(t *testing.T) {
 				incrCount++
 			}
 		}
-		if incrCount >= 2 {
+		if incrCount == lastCount {
+			stableTicks++
+		} else {
+			stableTicks = 0
+			lastCount = incrCount
+		}
+		if incrCount >= 2 && stableTicks >= 6 {
 			break
 		}
 		time.Sleep(500 * time.Millisecond)
