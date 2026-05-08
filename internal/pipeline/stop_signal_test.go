@@ -16,7 +16,6 @@ import (
 // poll-loop unit tests.
 type fakeStopFlagReader struct {
 	mu        sync.Mutex
-	calls     int
 	returnVal bool // returned by readStopRequested when err is nil
 	returnErr error
 }
@@ -30,14 +29,7 @@ func (r *fakeStopFlagReader) setStopRequested(v bool) {
 func (r *fakeStopFlagReader) ReadStopRequested(_ context.Context, _ string) (bool, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.calls++
 	return r.returnVal, r.returnErr
-}
-
-func (r *fakeStopFlagReader) callCount() int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.calls
 }
 
 // withFastPollInterval replaces stopSignalPollInterval for the test
