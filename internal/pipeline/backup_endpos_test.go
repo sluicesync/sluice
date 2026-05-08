@@ -4,8 +4,10 @@
 package pipeline
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -274,18 +276,42 @@ func TestBackup_RecordsSnapshotAnchoredEndPosition(t *testing.T) {
 	}
 }
 
-// TestBackup_SnapshotOpenerErrorSurfacesAsRunFailure pins the loud-
-// failure shape: an OpenBackupSnapshot error becomes a Backup.Run
-// error before any chunks are written. Operators don't end up with
-// a half-written backup whose manifest's EndPosition isn't anchored
-// at a real consistent point.
-func TestBackup_SnapshotOpenerErrorSurfacesAsRunFailure(t *testing.T) {
+// TestBackup_SnapshotOpenerErrorFallsBackToCapturer pins the v0.18.0
+// graceful-fallback shape: when the engine implements
+// [ir.BackupSnapshotOpener] but the call returns an error (e.g. PG
+// without `wal_level=logical` can't create the temporary anchor slot),
+// the orchestrator MUST NOT fail the run. It falls through to the
+// v0.17.x path — basic OpenRowReader + post-sweep BackupPositionCapturer
+// — and emits a WARN line that names the error and the operational
+// implication so chain operators know to enable wal_level=logical.
+//
+// This unblocks one-shot full backups on PG environments where logical
+// replication isn't enabled (legitimate no-CDC scenarios). Chain
+// correctness still requires the snapshot path; the WARN is the
+// operator-actionable surface for that.
+func TestBackup_SnapshotOpenerErrorFallsBackToCapturer(t *testing.T) {
+	prev := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	var logBuf bytes.Buffer
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+
 	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
-	schema := &ir.Schema{
-		Tables: []*ir.Table{{Name: "users", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}}},
+	store, err := NewLocalStore(dir)
+	if err != nil {
+		t.Fatalf("NewLocalStore: %v", err)
 	}
-	reader := &capturingSchemaReader{schema: schema}
+
+	schema := &ir.Schema{
+		Tables: []*ir.Table{{
+			Name:    "users",
+			Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}},
+		}},
+	}
+	captured := ir.Position{
+		Engine: "postgres",
+		Token:  `{"slot":"sluice_chain_slot","lsn":"0/POSTSWEEP"}`,
+	}
+	reader := &capturingSchemaReader{schema: schema, captured: captured}
 	src := &snapshotOpeningEngine{
 		capturingBackupEngine: &capturingBackupEngine{
 			backupRecorderEngine: newBackupRecorderEngine("postgres", schema, map[string][]ir.Row{
@@ -294,15 +320,52 @@ func TestBackup_SnapshotOpenerErrorSurfacesAsRunFailure(t *testing.T) {
 			cdc:    ir.CDCLogicalReplication,
 			reader: reader,
 		},
-		snapshotErr: errors.New("simulated snapshot open failure"),
+		snapshotErr: errors.New(`postgres: cdc: wal_level is "replica"; must be 'logical' for logical replication`),
 	}
-	b := &Backup{Source: src, SourceDSN: "src", Store: store}
-	err := b.Run(context.Background())
-	if err == nil {
-		t.Fatal("Backup.Run: nil; want error from snapshot open failure")
+
+	b := &Backup{
+		Source:    src,
+		SourceDSN: "src",
+		Store:     store,
+		SlotName:  "sluice_chain_slot",
 	}
-	if !strings.Contains(err.Error(), "simulated snapshot open failure") {
-		t.Errorf("err = %v; want containing snapshot open failure", err)
+	if err := b.Run(context.Background()); err != nil {
+		t.Fatalf("Backup.Run: unexpected error; expected fallback success: %v", err)
+	}
+
+	// Snapshot was attempted exactly once and Close was NOT called
+	// (the snapshot open failed before a *BackupSnapshot was returned).
+	if src.snapshotCalls != 1 {
+		t.Errorf("OpenBackupSnapshot calls = %d; want 1", src.snapshotCalls)
+	}
+	if src.snapshotCloses != 0 {
+		t.Errorf("snapshot Close calls = %d; want 0 (no snapshot to close on error)", src.snapshotCloses)
+	}
+
+	// EndPosition should be the post-sweep capturer's position, NOT
+	// the (zero-valued) snapshot position.
+	got, err := readManifest(context.Background(), store)
+	if err != nil {
+		t.Fatalf("readManifest: %v", err)
+	}
+	if got.EndPosition != captured {
+		t.Errorf("EndPosition = %+v; want fallback-captured %+v", got.EndPosition, captured)
+	}
+	if reader.captureCalls != 1 {
+		t.Errorf("CaptureBackupPosition calls = %d; want 1 (fallback path)", reader.captureCalls)
+	}
+
+	// The fallback WARN must surface both the underlying error AND
+	// the operational implication so operators can act on it.
+	logged := logBuf.String()
+	if !strings.Contains(logged, "snapshot-anchored consistent view unavailable") {
+		t.Errorf("WARN line missing fallback header; log=%q", logged)
+	}
+	if !strings.Contains(logged, "wal_level") {
+		t.Errorf("WARN line missing underlying error context; log=%q", logged)
+	}
+	if !strings.Contains(logged, "implication") {
+		t.Errorf("WARN line missing operational implication field; log=%q", logged)
 	}
 }
 

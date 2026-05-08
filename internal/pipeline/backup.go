@@ -206,9 +206,13 @@ func (b *Backup) Run(ctx context.Context) error {
 	// table reads to a cross-table consistent view, closing the
 	// during-backup write-window gap that v0.17.x's basic OpenRowReader
 	// path leaves open. Engines that don't implement
-	// [ir.BackupSnapshotOpener] fall through to the v0.17.x shape with
-	// a soft warning so operators know the chain rooted in this full
-	// will carry the gap.
+	// [ir.BackupSnapshotOpener] — OR engines that implement it but
+	// whose OpenBackupSnapshot returns an error (e.g. PG without
+	// `wal_level=logical`) — fall through to the v0.17.x shape with a
+	// soft warning so operators know the chain rooted in this full will
+	// carry the during-backup write-window gap. One-shot full backups
+	// without CDC are still legitimate; chain correctness is the only
+	// thing that needs the snapshot path.
 	rr, snapshotPos, snapshotCloser, err := b.openSnapshotOrFallback(ctx)
 	if err != nil {
 		return err
@@ -392,49 +396,78 @@ func (b *Backup) Run(ctx context.Context) error {
 // during-backup write-window gap that v0.17.x's basic OpenRowReader
 // path leaves open.
 //
-// Fallback: engines without BackupSnapshotOpener get the v0.17.x shape
-// — a basic OpenRowReader (no shared snapshot, no cross-table
-// consistency) plus a post-sweep [ir.BackupPositionCapturer] capture
-// (later, in [Backup.captureEndPosition]). A WARN line is emitted so
-// operators know the chain rooted in this full will carry the
-// during-backup write-window gap.
+// Fallback (two flavours, both end up on the v0.17.x shape):
+//
+//   - Engine doesn't implement BackupSnapshotOpener at all (e.g. an
+//     engine that hasn't been migrated to v0.18.0 yet). We fall
+//     through with a WARN naming the gap.
+//   - Engine implements it but the call returned an error — e.g. PG
+//     without `wal_level=logical` can't create the temporary anchor
+//     slot, so OpenBackupSnapshot fails. v0.17.x's non-snapshot path
+//     is still a legitimate one-shot full-backup shape; we don't fail
+//     the run, we fall through with a WARN naming the underlying
+//     error AND the operational implication (chain correctness needs
+//     the snapshot path → operator action: enable wal_level=logical
+//     or pair backups with continuous `sluice sync start`).
+//
+// Either way, the fallback gets a basic OpenRowReader (no shared
+// snapshot, no cross-table consistency) plus a post-sweep
+// [ir.BackupPositionCapturer] capture (later, in
+// [Backup.captureEndPosition]).
 //
 // Returns (reader, snapshotPos, cleanup, err). When snapshotPos is
 // nil the caller falls through to captureEndPosition; when non-nil it
 // has already been captured. cleanup is always non-nil and safe to
-// call.
+// call. err is reserved for outright open failures of the fallback
+// row reader itself — a snapshot open error is NOT propagated as
+// err; it triggers the fallback instead.
 func (b *Backup) openSnapshotOrFallback(ctx context.Context) (ir.RowReader, *ir.Position, func(), error) {
 	if opener, ok := b.Source.(ir.BackupSnapshotOpener); ok {
 		snap, err := opener.OpenBackupSnapshot(ctx, b.SourceDSN, b.SlotName)
-		if err != nil {
-			return nil, nil, func() {}, wrapWithHint(PhaseConnect, fmt.Errorf("backup: open backup snapshot: %w", err))
-		}
-		slog.InfoContext(ctx, "backup: opened snapshot-anchored consistent view",
-			slog.String("engine", b.Source.Name()),
-			slog.String("position_token", snap.Position.Token),
-		)
-		pos := snap.Position
-		cleanup := func() {
-			if err := snap.Close(); err != nil {
-				slog.WarnContext(ctx, "backup: snapshot close failed; partial cleanup may have leaked resources",
-					slog.String("err", err.Error()),
-				)
+		if err == nil {
+			slog.InfoContext(ctx, "backup: opened snapshot-anchored consistent view",
+				slog.String("engine", b.Source.Name()),
+				slog.String("position_token", snap.Position.Token),
+			)
+			pos := snap.Position
+			cleanup := func() {
+				if err := snap.Close(); err != nil {
+					slog.WarnContext(ctx, "backup: snapshot close failed; partial cleanup may have leaked resources",
+						slog.String("err", err.Error()),
+					)
+				}
 			}
+			return snap.Rows, &pos, cleanup, nil
 		}
-		return snap.Rows, &pos, cleanup, nil
+		// Snapshot open failed (e.g. PG without `wal_level=logical`
+		// can't create the temporary anchor slot). v0.17.x's
+		// non-snapshot path is still a legitimate one-shot full-backup
+		// shape — the chain → handoff story is the only thing that
+		// breaks. Don't fail the run; fall through with a WARN line
+		// that names the operational implication so operators using
+		// this backup as a chain root know to enable wal_level=logical
+		// (or pair the backup with continuous `sluice sync start` so
+		// the live stream covers the during-backup window).
+		slog.WarnContext(ctx, "backup: snapshot-anchored consistent view unavailable; falling back to v0.17.x path",
+			slog.String("engine", b.Source.Name()),
+			slog.String("error", err.Error()),
+			slog.String("implication", "chains rooted in this full will have a during-backup write-window gap (see v0.17.2 release notes); enable wal_level=logical for snapshot-anchored consistency, or pair backups with continuous `sluice sync start`"),
+			slog.String("see_also", "v0.17.2 release notes; docs/dev/design-logical-backups-phase-3.md"),
+		)
+	} else {
+		// Engine doesn't implement BackupSnapshotOpener at all.
+		// Surface the gap loudly — operators consuming the chain
+		// need to know writes during the backup window are not
+		// guaranteed to be captured. The recommended mitigation
+		// (pair backups with continuous `sluice sync start`) is the
+		// same one the v0.17.2 release notes called out.
+		slog.WarnContext(ctx, "backup: engine does not implement BackupSnapshotOpener; falling back to non-snapshot row reads",
+			slog.String("engine", b.Source.Name()),
+			slog.String("impact", "chains rooted in this full will have a during-backup write-window gap"),
+			slog.String("mitigation", "pair backups with continuous `sluice sync start` so the live stream captures every write"),
+			slog.String("see_also", "v0.17.2 release notes; docs/dev/design-logical-backups-phase-3.md"),
+		)
 	}
-
-	// Fallback path. Surface the gap loudly — operators consuming the
-	// chain need to know writes during the backup window are not
-	// guaranteed to be captured. The recommended mitigation (pair
-	// backups with continuous `sluice sync start`) is the same one
-	// the v0.17.2 release notes called out.
-	slog.WarnContext(ctx, "backup: engine does not implement BackupSnapshotOpener; falling back to non-snapshot row reads",
-		slog.String("engine", b.Source.Name()),
-		slog.String("impact", "chains rooted in this full will have a during-backup write-window gap"),
-		slog.String("mitigation", "pair backups with continuous `sluice sync start` so the live stream captures every write"),
-		slog.String("see_also", "v0.17.2 release notes; docs/dev/design-logical-backups-phase-3.md"),
-	)
 
 	rr, err := b.Source.OpenRowReader(ctx, b.SourceDSN)
 	if err != nil {
