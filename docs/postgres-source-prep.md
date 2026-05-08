@@ -60,7 +60,22 @@ sync_replication_slots = on
 hot_standby_feedback   = on
 ```
 
-Both required for PG 17 native slot sync. `logical_slot_sync_timeout` (default 300s) bounds how long failover waits for slot sync to finish — relevant when your CDC client sleeps for long periods, which may otherwise let failover proceed before the slot is synchronized.
+Both required for PG 17 native slot sync.
+
+#### The idle-slot failover trap (load-bearing)
+
+**Even with all three mechanisms configured — Patroni `slots:` / "Logical slot name", `sync_replication_slots = on`, and `hot_standby_feedback = on` — a slot that hasn't advanced during the slot-sync window can still be lost on failover.** Operator-confirmed in production.
+
+The failure mode: Patroni's slot-sync (and PG 17's native equivalent, gated by `logical_slot_sync_timeout`, default 300s) is a primary→standby pull. The standby periodically copies slot state from the primary. If the primary's slot hasn't advanced for the duration of the sync window — e.g. the source database is quiet, the consumer is paused, or the consumer's host is down — the standby's replica copy stays at an old LSN. When failover then promotes the standby, the new primary's slot points at WAL that may already have been recycled. Result: slot is "present but invalid" and your CDC stream surfaces a `wal_status='lost'` error on resume.
+
+**Mitigations, ranked:**
+
+1. **Keep the slot consumer running.** Sluice's PG CDC reader sends `pg_send_standby_status_update` every 10 seconds whether or not events are flowing (see `internal/engines/postgres/cdc_reader.go`'s keepalive loop). As long as `sluice sync start` is the active consumer, the slot is "active" from the primary's perspective and the standby's sync will keep pace. **Don't run sluice as a one-shot during low-traffic windows; run it continuously.**
+2. **For low-traffic source databases**, inject lightweight WAL activity from the source side — e.g. a periodic `INSERT INTO heartbeat (ts) VALUES (now())` against a small dedicated table, or a `SELECT pg_logical_emit_message(false, 'sluice-heartbeat', '')`. The latter writes to WAL without modifying any user data; sluice's CDC reader sees and discards it. This guarantees slot advancement even if the active consumer is briefly disconnected.
+3. **Tune the sync window upward.** `logical_slot_sync_timeout` can be increased; on Patroni, the equivalent knobs are `loop_wait` (default 10s) and the `dcs.permanent_slots` consistency policy. Bigger windows = more tolerance for idle slots, but at the cost of slower failover detection.
+4. **Accept the risk** and rely on sluice's slot-missing fall-through (Item F, ADR-0022) — `sync start --resume` detects the lost slot, drops it, and falls through to cold-start. Operationally heavy but always works. Pair with `--reset-target-data` if the target also needs to be wiped.
+
+The trap is silent at the time of failover — there's no error in PG's logs naming the dropped slot. You only see it when the consumer reconnects and gets `wal_status='lost'` or `replication slot does not exist`. Audit your slot's `pg_replication_slots.confirmed_flush_lsn` advancement rate as part of pre-production checks; if it doesn't advance for hours at a time on a quiet workload, mitigation #2 (heartbeat writes) is the durable fix.
 
 ### On self-hosted Patroni
 
