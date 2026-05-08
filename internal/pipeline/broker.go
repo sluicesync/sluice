@@ -385,6 +385,26 @@ func (b *SyncFromBackup) Run(ctx context.Context) error {
 		slog.String("last_applied_backup_id", lastAppliedID),
 	)
 
+	// Phase 5.4: cross-engine broker detection. When the chain's
+	// source engine differs from the target's engine, the chain's
+	// terminal EndPosition is engine-specific (PG: {slot,lsn}; MySQL:
+	// GTID set) and cannot be translated to the target's CDC
+	// position-shape. The broker still writes its own
+	// `_engine="backup-broker"` envelope to `sluice_cdc_state` for
+	// warm resume, but the chain-source-engine-flavored EndPosition
+	// is intentionally omitted. Operators continuing CDC from a
+	// cross-engine restored target run a fresh `sluice sync start`
+	// against the source's native engine, or use --at-chain-id for
+	// resumption assertions.
+	chainSourceEngine := b.detectChainSourceEngine(ctx)
+	if chainSourceEngine != "" && chainSourceEngine != b.Target.Name() {
+		slog.InfoContext(ctx, "broker: cross-engine chain — chain's EndPosition not written to sluice_cdc_state; use --at-chain-id for cross-engine resumption assertions",
+			slog.String("stream_id", b.StreamID),
+			slog.String("chain_source_engine", chainSourceEngine),
+			slog.String("target_engine", b.Target.Name()),
+		)
+	}
+
 	// 5. Drive the tick loop. Each tick: list manifests, replay any
 	//    new ones in chain order, advance lastAppliedID, sleep
 	//    until next interval (or stop signal). The first iteration
@@ -466,6 +486,19 @@ func (b *SyncFromBackup) Run(ctx context.Context) error {
 			return nil
 		}
 	}
+}
+
+// detectChainSourceEngine returns the SourceEngine recorded in the
+// chain's full-backup manifest, or "" when the chain can't be read
+// (the broker's tick loop will surface its own error on the first
+// pass; this helper is best-effort metadata for the cross-engine
+// log line).
+func (b *SyncFromBackup) detectChainSourceEngine(ctx context.Context) string {
+	chain, err := buildChain(ctx, b.Store)
+	if err != nil || len(chain) == 0 {
+		return ""
+	}
+	return chain[0].manifest.SourceEngine
 }
 
 // validate sanity-checks required fields.
