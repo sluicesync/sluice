@@ -176,27 +176,21 @@ func (a *ChangeApplier) EnsureControlTable(ctx context.Context) error {
 
 // ReadPosition returns the last persisted source position for
 // streamID, or ok=false when no row exists. The returned Position
-// always has Engine = "postgres".
+// always has Engine = "postgres" — the persisted token does NOT carry
+// engine identity (the `sluice_cdc_state` table has no
+// `position_engine` column). For broker-driven rows the engine
+// sentinel lives inside the JSON envelope (`_engine` field, see
+// pipeline.isBrokerToken). Bug 39 (v0.20.1) is the load-bearing
+// rationale for that envelope; the broker discriminates on the
+// embedded sentinel, not on Position.Engine.
 func (a *ChangeApplier) ReadPosition(ctx context.Context, streamID string) (ir.Position, bool, error) {
 	token, ok, err := readPosition(ctx, a.db, a.schema, streamID)
 	if err != nil {
 		return ir.Position{}, false, err
 	}
 	if !ok {
-		slog.DebugContext(ctx, "postgres: applier: ReadPosition — no row",
-			slog.String("stream_id", streamID),
-		)
 		return ir.Position{}, false, nil
 	}
-	// Phase A (Bug 39): log the raw token + engine string we hard-code
-	// into the returned Position. The broker writes a synthetic
-	// Engine="backup-broker" sentinel; this hard-coded postgres engine
-	// discards the sentinel on round-trip, defeating warm resume.
-	slog.DebugContext(ctx, "postgres: applier: ReadPosition — row found",
-		slog.String("stream_id", streamID),
-		slog.String("returned_engine", engineNamePostgres),
-		slog.String("token", token),
-	)
 	return ir.Position{Engine: engineNamePostgres, Token: token}, true, nil
 }
 

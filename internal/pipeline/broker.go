@@ -775,26 +775,6 @@ func (b *SyncFromBackup) applyIncremental(
 	link *manifestRecord,
 	batchSize int,
 ) (int64, error) {
-	// Phase A (Bug 38): log the incremental's schema-delta count + a
-	// per-table column count summary so we can confirm whether
-	// stream-rolled-over manifests carry post-ALTER schema info or
-	// stay on the parent's pre-ALTER snapshot. Pre-fix expectation:
-	// stream rollovers emit zero deltas across the chain even after
-	// source DDL.
-	if link.manifest != nil {
-		summary := make([]string, 0, len(link.manifest.SchemaDelta))
-		for _, d := range link.manifest.SchemaDelta {
-			summary = append(summary, fmt.Sprintf("%s/%s", d.Kind, d.Table))
-		}
-		slog.DebugContext(ctx, "broker: applyIncremental — manifest snapshot",
-			slog.String("stream_id", b.StreamID),
-			slog.String("backup_id", manifestBackupID(link.manifest)),
-			slog.Int("schema_delta_count", len(link.manifest.SchemaDelta)),
-			slog.Any("schema_deltas", summary),
-			slog.Int("change_chunk_count", len(link.manifest.ChangeChunks)),
-			slog.Int("schema_table_count", schemaTableCount(link.manifest.Schema)),
-		)
-	}
 	// 1. Schema deltas first.
 	if len(link.manifest.SchemaDelta) > 0 {
 		if err := b.applySchemaDeltas(ctx, link); err != nil {
@@ -1017,16 +997,6 @@ func rewritePosition(c ir.Change, pos ir.Position) ir.Change {
 	// with their own position untouched; the broker's position
 	// advance still happens via the post-replay direct write.
 	return c
-}
-
-// schemaTableCount returns the number of tables on the manifest's
-// schema, tolerating a nil schema. Phase A debug-logging helper for
-// Bug 38 ground-truth gathering.
-func schemaTableCount(s *ir.Schema) int {
-	if s == nil {
-		return 0
-	}
-	return len(s.Tables)
 }
 
 // checkStopSignals returns (true, nil) when either the in-process
