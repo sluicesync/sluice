@@ -278,6 +278,14 @@ type SyncStartCmd struct {
 	MaxBufferBytes int64 `help:"Soft cap on per-batch buffered memory in the CDC applier (and, on the cold-start branch, the bulk-copy writer). The applier commits the in-flight target tx when accumulated row-value bytes reach the cap regardless of row count, so wide-row streams (TEXT/BYTEA/JSON at MB scale) don't blow out heap. A single change larger than the cap still applies (soft target). Default 67108864 (64 MiB). See ADR-0028." default:"67108864" placeholder:"N"`
 
 	MetricsListen string `help:"Bind a Prometheus-format /metrics endpoint at this address (e.g. ':9090' for all interfaces port 9090, '127.0.0.1:9090' for localhost only) for the duration of the stream. Off by default — opt-in. Companion to 'sluice sync health' (which is the cron-friendly one-shot probe shape). Useful for operators running Prometheus / Grafana / alertmanager." placeholder:"ADDR"`
+
+	PositionFromManifest string `help:"URL of a backup chain (s3://bucket/prefix, gs://, azblob://, file:///path) whose terminal manifest's EndPosition is used as this stream's resume position. Use after 'sluice restore --from=<chain-url>' to resume CDC from the chain's tail without re-bulking. Mutually exclusive with the implicit 'resume from sluice_cdc_state' path: when set, the persisted position is bypassed and the chain's terminal becomes the source of truth. PG soft warnings (wal_keep_size, Patroni) fire as pre-flight checks; --strict-preflight promotes them to refusals. See docs/dev/design-logical-backups-phase-3.md." placeholder:"URL"`
+
+	StrictPreflight bool `help:"Promote position-from-manifest soft warnings (wal_keep_size sufficiency, Patroni-managed source detection) to hard refusals. Default off: the warnings log but the run proceeds. Slot existence / wal_status='lost' is always a refusal regardless of this flag — the slot can't deliver what we need."`
+
+	BackupEndpoint  string `help:"Override the S3 endpoint for --position-from-manifest's S3-compatible providers. Only meaningful when --position-from-manifest is an s3:// URL." placeholder:"URL"`
+	BackupRegion    string `help:"Override the S3 region for --position-from-manifest. Only meaningful when --position-from-manifest is an s3:// URL." placeholder:"REGION"`
+	BackupPathStyle bool   `help:"Force path-style S3 addressing for --position-from-manifest. Only meaningful when --position-from-manifest is an s3:// URL."`
 }
 
 // Run implements `sluice sync start`.
@@ -333,24 +341,53 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 		}
 	}
 
+	// --position-from-manifest: load the chain terminal position from
+	// the supplied store. The streamer treats it as a warm-resume
+	// position source, replacing the default sluice_cdc_state lookup.
+	// Mutually exclusive with --reset-target-data (different recovery
+	// shapes; both override the persisted position).
+	var manifestStore ir.BackupStore
+	var manifestStoreCloser func() error
+	if s.PositionFromManifest != "" {
+		if s.ResetTargetData {
+			return errors.New("--position-from-manifest and --reset-target-data are mutually exclusive")
+		}
+		ctx := kongContext()
+		store, _, closer, err := openBackupStore(ctx, "", s.PositionFromManifest, pipeline.BlobStoreOptions{
+			Endpoint:  s.BackupEndpoint,
+			Region:    s.BackupRegion,
+			PathStyle: s.BackupPathStyle,
+		})
+		if err != nil {
+			return fmt.Errorf("--position-from-manifest: %w", err)
+		}
+		manifestStore = store
+		manifestStoreCloser = closer
+	}
+	if manifestStoreCloser != nil {
+		defer func() { _ = manifestStoreCloser() }()
+	}
+
 	streamer := &pipeline.Streamer{
-		Source:             source,
-		Target:             target,
-		SourceDSN:          s.Source,
-		TargetDSN:          s.Target,
-		StreamID:           s.StreamID,
-		SlotName:           s.SlotName,
-		Mappings:           mappings,
-		ExpressionMappings: exprMappings,
-		DryRun:             s.DryRun,
-		Filter:             filter,
-		ViewFilter:         viewFilter,
-		SkipViews:          s.SkipViews,
-		ForceColdStart:     s.ForceColdStart,
-		ResetTargetData:    s.ResetTargetData,
-		ApplyBatchSize:     s.ApplyBatchSize,
-		MaxBufferBytes:     s.MaxBufferBytes,
-		MetricsListen:      s.MetricsListen,
+		Source:                    source,
+		Target:                    target,
+		SourceDSN:                 s.Source,
+		TargetDSN:                 s.Target,
+		StreamID:                  s.StreamID,
+		SlotName:                  s.SlotName,
+		Mappings:                  mappings,
+		ExpressionMappings:        exprMappings,
+		DryRun:                    s.DryRun,
+		Filter:                    filter,
+		ViewFilter:                viewFilter,
+		SkipViews:                 s.SkipViews,
+		ForceColdStart:            s.ForceColdStart,
+		ResetTargetData:           s.ResetTargetData,
+		ApplyBatchSize:            s.ApplyBatchSize,
+		MaxBufferBytes:            s.MaxBufferBytes,
+		MetricsListen:             s.MetricsListen,
+		PositionFromManifestStore: manifestStore,
+		StrictPreflight:           s.StrictPreflight,
 	}
 	return streamer.Run(kongContext())
 }

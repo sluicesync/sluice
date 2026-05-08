@@ -234,6 +234,30 @@ type Streamer struct {
 	// a single change larger than the cap still applies — better to
 	// land it than to wedge the stream. See ADR-0028.
 	MaxBufferBytes int64
+
+	// PositionFromManifestStore is the [ir.BackupStore] the chain
+	// terminal position is read from when the operator passes
+	// `--position-from-manifest=<chain-url>`. The Streamer uses the
+	// store's terminal manifest's [ir.Manifest.EndPosition] as the
+	// resume position, bypassing the per-target [sluice_cdc_state]
+	// row read (which a fresh-restored target wouldn't have). Phase
+	// 3.3.B; mutually exclusive with the resume-from-control-table
+	// path because they describe different position sources.
+	//
+	// nil means the field is not in use (the legacy resume path runs
+	// unchanged).
+	PositionFromManifestStore ir.BackupStore
+
+	// StrictPreflight, when true, promotes the soft warnings emitted
+	// by the Phase 3.3.C pre-flight checks (PG `wal_keep_size`
+	// sufficiency, Patroni-managed source detection) to hard refusals
+	// before CDC starts. Default false: warnings log but the run
+	// proceeds. Operators flip this on when they want a strict
+	// "fail loudly on any preflight signal" posture (CI gate, scripted
+	// runbook, post-incident audit). The slot-existence check is
+	// always a refusal; this flag only affects the warning-grade
+	// checks.
+	StrictPreflight bool
 }
 
 // Run executes a snapshot+CDC stream. See [Streamer] for the full
@@ -333,24 +357,60 @@ func (s *Streamer) Run(ctx context.Context) error {
 	}
 
 	// ---- 3. Look up the persisted position ----
-	persisted, found, err := applier.ReadPosition(ctx, streamID)
-	if err != nil {
-		return wrapWithHint(PhaseCDC, fmt.Errorf("pipeline: read position: %w", err))
-	}
-	// The applier stamps every row it reads back with the applier's
-	// own engine name (target's engine), but the position itself is a
-	// source-side artifact (a MySQL GTID set, a Postgres LSN). On
-	// cross-engine resume — e.g. source=planetscale, target=postgres —
-	// the source CDC reader's decoder rejects the position because its
-	// Engine tag matches the target instead of the source. v0.1.0's
-	// Bug 2 fix patched the same-family case (PS↔MySQL) by widening
-	// the MySQL decoder's engine acceptance, but didn't generalise to
-	// truly cross-engine pairs (Bug 20). Re-stamping with the source
-	// engine's own name here makes every (source, target) pair
-	// round-trip cleanly through its source decoder, including
-	// PS-source → PG-target.
-	if found {
-		persisted = retagPositionForSource(persisted, s.Source.Name())
+	//
+	// Position source priority (highest to lowest):
+	//   1. PositionFromManifestStore (Phase 3.3.B). When non-nil, the
+	//      chain's terminal manifest's EndPosition replaces both the
+	//      ReadPosition lookup and the cold-start fall-through. The
+	//      operator passing `--position-from-manifest` has explicitly
+	//      asked for chain handoff; a slot-missing fall-through to
+	//      cold-start would silently re-bulk and defeat the point.
+	//   2. applier.ReadPosition (warm resume). Existing v0.3.x flow.
+	//   3. Cold start. The default when neither of the above is set.
+	var (
+		persisted ir.Position
+		found     bool
+	)
+	if s.PositionFromManifestStore != nil {
+		chainPos, err := LoadChainTerminalPosition(ctx, s.PositionFromManifestStore)
+		if err != nil {
+			return wrapWithHint(PhaseCDC, fmt.Errorf("pipeline: %w", err))
+		}
+		// Run Phase 3.3.C pre-flight checks before opening CDC. PG-only
+		// today; MySQL has no operator-attention surface here. Refuses
+		// when a check is fatal (slot lost / missing); warns otherwise
+		// (or refuses on warning when StrictPreflight is set).
+		if err := s.runPositionFromManifestPreflight(ctx, chainPos); err != nil {
+			return wrapWithHint(PhaseCDC, fmt.Errorf("pipeline: position-from-manifest preflight: %w", err))
+		}
+		persisted = retagPositionForSource(chainPos, s.Source.Name())
+		found = true
+		slog.InfoContext(ctx, "position-from-manifest: using chain terminal position",
+			slog.String("stream_id", streamID),
+			slog.String("position_engine", chainPos.Engine),
+			slog.String("position_token", truncateDryRunToken(chainPos.Token, 60)),
+		)
+	} else {
+		var err error
+		persisted, found, err = applier.ReadPosition(ctx, streamID)
+		if err != nil {
+			return wrapWithHint(PhaseCDC, fmt.Errorf("pipeline: read position: %w", err))
+		}
+		// The applier stamps every row it reads back with the applier's
+		// own engine name (target's engine), but the position itself is a
+		// source-side artifact (a MySQL GTID set, a Postgres LSN). On
+		// cross-engine resume — e.g. source=planetscale, target=postgres —
+		// the source CDC reader's decoder rejects the position because its
+		// Engine tag matches the target instead of the source. v0.1.0's
+		// Bug 2 fix patched the same-family case (PS↔MySQL) by widening
+		// the MySQL decoder's engine acceptance, but didn't generalise to
+		// truly cross-engine pairs (Bug 20). Re-stamping with the source
+		// engine's own name here makes every (source, target) pair
+		// round-trip cleanly through its source decoder, including
+		// PS-source → PG-target.
+		if found {
+			persisted = retagPositionForSource(persisted, s.Source.Name())
+		}
 	}
 
 	// ---- 3.5. Dry-run: print plan and exit before any state mutation. ----
@@ -421,7 +481,13 @@ func (s *Streamer) Run(ctx context.Context) error {
 		changes, err = s.coldStart(streamCtx, lsnTracker, applier, streamID)
 	case found:
 		changes, err = s.warmResume(streamCtx, persisted, lsnTracker)
-		if err != nil && errors.Is(err, ir.ErrPositionInvalid) {
+		// Slot-missing fall-through (ADR-0022) is suppressed when the
+		// position came from a manifest chain: the operator explicitly
+		// asked for "resume from this chain"; silently re-bulking would
+		// defeat the chain handoff. Surface the error verbatim so the
+		// operator gets the slot-recovery flow's message; cases 7/8
+		// from the design doc cover the recovery options.
+		if err != nil && errors.Is(err, ir.ErrPositionInvalid) && s.PositionFromManifestStore == nil {
 			slog.WarnContext(ctx, "warm resume: persisted position is no longer valid; falling through to cold start",
 				slog.String("stream_id", streamID),
 				slog.String("position_token", persisted.Token),
