@@ -8,18 +8,22 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/orware/sluice/internal/config"
 	"github.com/orware/sluice/internal/ir"
 	"github.com/orware/sluice/internal/pipeline"
 )
 
-// BackupCmd groups the backup verbs. Phase 1 ships the `full` and
-// `verify` subcommands; Phase 3 will add `incremental`. See
-// `docs/dev/design-logical-backups.md` for the staged plan.
+// BackupCmd groups the backup verbs. Phase 1 shipped `full` and
+// `verify`; Phase 3 (v0.17.0) adds `incremental` for chained backups
+// taken on top of a previous full or incremental. See
+// `docs/dev/design-logical-backups.md` and
+// `docs/dev/design-logical-backups-phase-3.md` for the staged plan.
 type BackupCmd struct {
-	Full   BackupFullCmd   `cmd:"" help:"Take a full logical backup of a source database to a local directory."`
-	Verify BackupVerifyCmd `cmd:"" help:"Re-checksum every chunk in an existing backup directory and report any mismatches."`
+	Full        BackupFullCmd        `cmd:"" help:"Take a full logical backup of a source database to a local directory."`
+	Incremental BackupIncrementalCmd `cmd:"" help:"Take an incremental backup chained off a previous full or incremental (Phase 3)."`
+	Verify      BackupVerifyCmd      `cmd:"" help:"Re-checksum every chunk in an existing backup chain and report any mismatches."`
 }
 
 // BackupFullCmd runs `sluice backup full`. Reads the source schema,
@@ -151,6 +155,98 @@ func openBackupStore(
 	return nil, "", nil, errors.New("no backup destination configured")
 }
 
+// BackupIncrementalCmd runs `sluice backup incremental`. Reads the
+// parent manifest from --output-dir / --target, opens the source's
+// CDC pump at the parent's terminal CDC position, streams events
+// for the configured window, and writes a new chain-linked manifest
+// + change chunks into the same store.
+//
+// Phase 3.1 caveats:
+//
+//   - The store must already contain at least one full backup (the
+//     parent). Pass --since=<backup-id> to chain off a specific
+//     manifest, or leave it empty to chain off the most recent one.
+//   - The window closes on either --window (wall-clock) or
+//     --max-changes (event count); first to fire wins. The window is
+//     extended to the next TxCommit so the chain doesn't end
+//     mid-transaction.
+//   - When the source's WAL / binlog has been pruned past the parent's
+//     terminal position, the run refuses loudly with "take a fresh
+//     full backup" guidance.
+//   - Schema deltas (DDL on the source between the parent's snapshot
+//     and the incremental's window end) are captured by re-reading
+//     the source schema at start and end of the window and diffing.
+//     Restore-side replay applies AddTable cleanly; AlterTable falls
+//     through to change-stream column reconciliation. Column renames
+//     within a single window are flagged as ambiguous and recommend
+//     a fresh full.
+type BackupIncrementalCmd struct {
+	SourceDriver string `help:"Source engine name (e.g. mysql, postgres). Must declare CDC support. See 'sluice engines'." required:"" placeholder:"NAME" group:"source"`
+	Source       string `help:"Source database DSN." required:"" env:"SLUICE_SOURCE" placeholder:"DSN" group:"source"`
+
+	OutputDir string `help:"Directory the parent backup lives in (and the incremental will be written into). Mutually exclusive with --target." placeholder:"DIR"`
+	Target    string `help:"URL of the existing backup directory the incremental chains off (s3://, gs://, azblob://, file:///). Mutually exclusive with --output-dir." placeholder:"URL"`
+
+	BackupEndpoint  string `help:"Override the S3 endpoint for S3-compatible providers. Only meaningful when --target is an s3:// URL." placeholder:"URL"`
+	BackupRegion    string `help:"Override the S3 region. Only meaningful when --target is an s3:// URL." placeholder:"REGION"`
+	BackupPathStyle bool   `help:"Force path-style addressing. Only meaningful when --target is an s3:// URL."`
+
+	Since string `help:"BackupID of the parent manifest the incremental chains off. Empty selects the most recent manifest in the destination." placeholder:"BACKUP-ID"`
+
+	SlotName string `help:"Replication-slot name suffix on engines with a slot concept (Postgres). Reuses the same slot the original full was taken under so WAL retention covers the chain." placeholder:"NAME"`
+
+	Window     time.Duration `help:"Wall-clock duration the incremental streams CDC events for before closing the window. The window is extended to the next TxCommit so the chain doesn't end mid-transaction." default:"5m" placeholder:"DUR"`
+	MaxChanges int           `help:"Stop streaming after this many CDC events (approximate; the window closes at the next TxCommit). Zero means time-bound only." default:"0" placeholder:"N"`
+
+	ChunkSize int `help:"Maximum changes per chunk file. Smaller chunks restore faster (per-chunk SHA-256 fail-fast) but inflate the manifest." default:"100000" placeholder:"N"`
+}
+
+// Run implements `sluice backup incremental`.
+func (b *BackupIncrementalCmd) Run(_ *Globals) error {
+	source, err := resolveEngine(b.SourceDriver)
+	if err != nil {
+		return fmt.Errorf("--source-driver: %w", err)
+	}
+	if b.OutputDir == "" && b.Target == "" {
+		return errors.New("one of --output-dir or --target is required")
+	}
+	if b.OutputDir != "" && b.Target != "" {
+		return errors.New("--output-dir and --target are mutually exclusive")
+	}
+	ctx := kongContext()
+	store, storeDesc, closer, err := openBackupStore(ctx, b.OutputDir, b.Target, pipeline.BlobStoreOptions{
+		Endpoint:  b.BackupEndpoint,
+		Region:    b.BackupRegion,
+		PathStyle: b.BackupPathStyle,
+	})
+	if err != nil {
+		return err
+	}
+	if closer != nil {
+		defer func() { _ = closer() }()
+	}
+
+	slog.InfoContext(ctx, "backup: starting incremental",
+		slog.String("source_engine", source.Name()),
+		slog.String("destination", storeDesc),
+		slog.String("since", b.Since),
+		slog.Duration("window", b.Window),
+	)
+
+	incr := &pipeline.IncrementalBackup{
+		Source:        source,
+		SourceDSN:     b.Source,
+		Store:         store,
+		ParentRef:     b.Since,
+		SlotName:      b.SlotName,
+		Window:        b.Window,
+		MaxChanges:    b.MaxChanges,
+		ChunkChanges:  b.ChunkSize,
+		SluiceVersion: version,
+	}
+	return incr.Run(ctx)
+}
+
 // BackupVerifyCmd runs `sluice backup verify`. Walks an existing
 // backup directory, recomputes every chunk's SHA-256, and reports
 // any that don't match the manifest. Useful for cron probes against
@@ -207,6 +303,12 @@ func (v *BackupVerifyCmd) Run(_ *Globals) error {
 // Cross-engine restore (PG backup → MySQL target, etc.) is supported
 // via `translate.RetargetForEngine` — the same machinery `sluice
 // schema diff` uses to bridge type differences.
+//
+// Phase 3 (v0.17.0+): when the supplied --from contains incremental
+// manifests in addition to the full, the restore walks the chain in
+// order. Same-engine chains apply schema deltas + replay change
+// chunks; cross-engine chains with incrementals are refused (Phase
+// 5+ topic).
 type RestoreCmd struct {
 	FromDir string `help:"Directory containing the backup to restore from (local filesystem). Mutually exclusive with --from." placeholder:"DIR"`
 	From    string `help:"URL of the backup to restore (s3://, gs://, azblob://, file:///). Mutually exclusive with --from-dir." placeholder:"URL"`
