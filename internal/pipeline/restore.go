@@ -57,13 +57,51 @@ type Restore struct {
 	// memory in the row writer. Same semantics as [Migrator.MaxBufferBytes].
 	// Zero means "no cap".
 	MaxBufferBytes int64
+
+	// SkipChainDispatch, when true, suppresses the chain-detection
+	// branch in [Restore.Run]. Used internally by [ChainRestore] so
+	// that re-entering Restore for the full-application step doesn't
+	// loop back into another chain restore. End-users leave this
+	// false; the public single-manifest restore path detects chain
+	// shape and dispatches.
+	SkipChainDispatch bool
 }
 
 // Run executes the restore. Returns nil on success; a wrapped error
 // pointing at the failed phase otherwise.
+//
+// Phase 3 (v0.17.0+): when the store contains incremental manifests
+// in addition to the full, Run delegates to [ChainRestore] which
+// walks the chain in order. The single-manifest path remains
+// unchanged for backups produced by `sluice backup full` alone.
 func (r *Restore) Run(ctx context.Context) error {
 	if err := r.validate(); err != nil {
 		return err
+	}
+
+	// 0. Detect chain shape — if any incremental manifests live
+	//    under the conventional manifests/ prefix, dispatch to the
+	//    chain restore orchestrator. Single-full backups (the v0.16.x
+	//    shape) skip the chain machinery.
+	//
+	// SkipChainDispatch is set internally by ChainRestore when it
+	// re-enters the single-manifest path to apply the full alone;
+	// without it the two would mutually recurse.
+	if !r.SkipChainDispatch {
+		hasIncrementals, err := r.storeHasIncrementals(ctx)
+		if err != nil {
+			return wrapWithHint(PhaseConnect, fmt.Errorf("restore: detect chain: %w", err))
+		}
+		if hasIncrementals {
+			chain := &ChainRestore{
+				Target:         r.Target,
+				TargetDSN:      r.TargetDSN,
+				Store:          r.Store,
+				Filter:         r.Filter,
+				MaxBufferBytes: r.MaxBufferBytes,
+			}
+			return chain.Run(ctx)
+		}
 	}
 
 	// 1. Read manifest.
@@ -151,6 +189,17 @@ func (r *Restore) Run(ctx context.Context) error {
 
 	slog.InfoContext(ctx, "restore complete", slog.Int("tables", len(schema.Tables)))
 	return nil
+}
+
+// storeHasIncrementals reports whether r.Store contains any
+// incremental manifest files. Used to dispatch between the legacy
+// single-manifest restore and the Phase 3 chain restore.
+func (r *Restore) storeHasIncrementals(ctx context.Context) (bool, error) {
+	paths, err := r.Store.List(ctx, incrementalManifestPrefix)
+	if err != nil {
+		return false, err
+	}
+	return len(paths) > 0, nil
 }
 
 // validate sanity-checks required fields.
@@ -332,25 +381,56 @@ func manifestTableKey(schema, name string) string {
 // reported via slog at error level AND counted in the failed return,
 // so the caller can report "N of M chunks failed verification"
 // without needing the full list.
+//
+// Phase 3 (v0.17.0+): when the store contains a backup chain (a full
+// plus one or more incremental manifests), VerifyBackup walks every
+// manifest's chunks — both the row chunks of the full and the
+// change chunks of each incremental.
 func VerifyBackup(ctx context.Context, store ir.BackupStore) (total, failed int, err error) {
-	manifest, err := readManifest(ctx, store)
+	records, err := listAllManifests(ctx, store)
 	if err != nil {
 		return 0, 0, fmt.Errorf("verify: %w", err)
 	}
-	for _, table := range manifest.Tables {
-		for _, chunk := range table.Chunks {
+	if len(records) == 0 {
+		return 0, 0, errors.New("verify: no manifests found in store")
+	}
+	for _, rec := range records {
+		manifest := rec.manifest
+		// Row chunks (full backups).
+		for _, table := range manifest.Tables {
+			for _, chunk := range table.Chunks {
+				total++
+				if err := verifyChunk(ctx, store, chunk); err != nil {
+					failed++
+					slog.ErrorContext(ctx, "verify: chunk failed",
+						slog.String("manifest", rec.path),
+						slog.String("table", table.Name),
+						slog.String("file", chunk.File),
+						slog.String("error", err.Error()),
+					)
+					continue
+				}
+				slog.DebugContext(ctx, "verify: chunk OK",
+					slog.String("manifest", rec.path),
+					slog.String("table", table.Name),
+					slog.String("file", chunk.File),
+				)
+			}
+		}
+		// Change chunks (incremental backups).
+		for _, chunk := range manifest.ChangeChunks {
 			total++
 			if err := verifyChunk(ctx, store, chunk); err != nil {
 				failed++
-				slog.ErrorContext(ctx, "verify: chunk failed",
-					slog.String("table", table.Name),
+				slog.ErrorContext(ctx, "verify: change chunk failed",
+					slog.String("manifest", rec.path),
 					slog.String("file", chunk.File),
 					slog.String("error", err.Error()),
 				)
 				continue
 			}
-			slog.DebugContext(ctx, "verify: chunk OK",
-				slog.String("table", table.Name),
+			slog.DebugContext(ctx, "verify: change chunk OK",
+				slog.String("manifest", rec.path),
 				slog.String("file", chunk.File),
 			)
 		}
