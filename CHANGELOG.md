@@ -6,6 +6,41 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.21.0]
+
+Logical backups Phase 5 lands: **cross-engine chain restore.** A PG-rooted backup chain can now restore (and stream-apply via `sync from-backup`) into a MySQL target, and vice versa. Closes the loud refusal at `chain_restore.go:99` (`"cross-engine chain restore is a Phase 5+ topic"`) that v0.17.0 through v0.20.x raised when the chain's source engine differed from the target. Implementation supplement: `docs/dev/design-logical-backups-phase-5.md`.
+
+### Added
+
+- **Cross-engine `sluice restore --from=<chain-url> --target-driver=<engine>`** — was supported for full-only chains since v0.16.x; v0.21.0 extends it to chains with incrementals. Schema deltas in incremental manifests now route through `internal/translate.RetargetForEngine` before invoking `ir.SchemaDeltaApplier.AlterAddColumn` on the target. PG-source `ADD COLUMN UUID` lands as MySQL `CHAR(36)`; PG-source `ADD COLUMN INET` lands as `VARCHAR(45)`; PG-source `ADD COLUMN <Array>` lands as MySQL `JSON`. Existing `RetargetForEngine` rules are reused verbatim — no new translation surface.
+
+- **Cross-engine `sluice sync from-backup run --target-driver=<engine>`** — the broker variant. Same delta-translation pass on each tick's incremental. Detects cross-engine at startup and logs `INFO broker: cross-engine chain — chain's EndPosition not written to sluice_cdc_state; use --at-chain-id for cross-engine resumption assertions`. The broker still writes its own `_engine="backup-broker"` envelope to `sluice_cdc_state` (warm resume works); the chain's source-engine-flavored terminal `EndPosition` is intentionally omitted because PG LSN ↔ MySQL GTID is not a meaningful translation.
+
+- **Change-event value translation reuses live-CDC machinery.** Cross-engine row payloads in change chunks land at the engine appliers' existing live-CDC value-translation path: each applier looks up its own *target* column types and routes every value through `prepareValue` for target-shape preparation. PG → MySQL: UUID strings bind to `CHAR(36)` natively; JSONB `[]byte` is shaped to a string for MySQL JSON columns (no `_binary` charset prefix). MySQL → PG: TINYINT(1) → `bool` (the cross-engine MySQL → PG bool path) is handled at the CDC reader's decode layer; `pgx` accepts `bool` natively for `BOOLEAN`.
+
+- **Loud refusal for unsupportable types.** PG-source PostGIS `Geometry` columns refuse cross-engine restore to MySQL with an operator-actionable message naming the offending table + column + recovery hint (`--exclude-table` to skip, or `--type-override` for a portable IR type). Pre-flighted at chain start so the operator gets a clear failure before any work happens. Same refusal pattern as full cross-engine restore, extended to cover incremental schema deltas (a delta that introduces a PostGIS column refuses with the incremental's BackupID named).
+
+- **`pipeline.checkCrossEngineSupportable` / `pipeline.checkCrossEngineDeltaSupportable`** — internal helpers driving the refusals. Both return nil for same-engine pairs and unknown engine pairs; PG → MySQL is the loaded direction in v0.21.0. Future engine pairs add their entries here.
+
+### Changed
+
+- **`pipeline.ChainRestore.Run`** — the cross-engine refusal at lines 94-103 is replaced with a routing branch: when `manifest.SourceEngine != Target.Name()`, the supportability pre-flight runs, then schema deltas + change events route through their respective translation paths during apply.
+
+- **`pipeline.SyncFromBackup.applySchemaDeltas`** — also routes deltas through `translate.RetargetForEngine` (mirrors the chain-restore path; the broker's apply intentionally duplicates the chain-restore logic per the Phase 4.5 tenet of "don't refactor across surfaces").
+
+### Migration / Compatibility
+
+- **No format changes.** Manifest schema, control-table schema, change-chunk format are unchanged. Pre-v0.21.0 chains restore identically across same-engine and cross-engine targets.
+- **No CLI breaking changes.** All existing `sluice` subcommands keep their flag surfaces.
+- **Same-engine paths regression-clean.** Existing same-engine chain-restore tests pass unchanged; same-engine broker happy paths unchanged.
+- **`backup verify` unchanged.** Verify is read-only and engine-agnostic; integrity checks pass on cross-engine-target-bound chains identically.
+
+### Deferred
+
+- **Cross-engine CDC handoff with engine-translated `EndPosition`** — translating PG LSN to MySQL GTID set isn't meaningful (different change-log shapes). Operators wanting cross-engine continuous CDC after restore set up a fresh `sluice sync start` against the source's native engine; the chain restore lands the data, sluice sync handles ongoing replication separately.
+- **PG-only types not yet in `RetargetForEngine`'s table** (PostGIS geometry, hstore, custom enums beyond the existing PG enum support) — refuse loudly with the offending column named; operator can use `--exclude-table` or `--type-override` per existing escape hatches. Adding new types to the rewrite table is a separate minor.
+- **Phase 6 (KMS encryption)** stays unimplemented through Phase 5.
+
 ## [0.20.1]
 
 Three-bug patch from the v0.20.0 Phase 4.5 broker cycle. v0.20.0 shipped the consumer-side `sluice sync from-backup` orchestrator; cycle testing surfaced three independent failures along the broker's restart, schema-evolution, and cold-start-recovery paths. None affects chain correctness, the source-side `backup stream`, or the read-only-consumer contract — broker-driven targets stayed safe at all times. Each fix is local to its surface and ships behind the same `--reset-target-data` / `--at-chain-id` operational guardrails as v0.20.0.
