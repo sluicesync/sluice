@@ -6,6 +6,38 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.17.2] - 2026-05-07
+
+Logical backups Phase 3.3 lands: full-backup `EndPosition` recording, the `--position-from-manifest` CDC handoff flag, and PG soft-warning pre-flights. Closes the v0.17.0 known-limitation list — chains rooted in v0.17.2+ fulls work end-to-end without manually patching the manifest's terminal position, and a freshly-restored target resumes CDC from the chain's tail without re-bulking from source. Implementation supplement: `docs/dev/design-logical-backups-phase-3.md` (Phase 3.3 row in the sub-phasing table).
+
+### Added
+
+- **Full-backup `EndPosition` recording (Phase 3.3.A).** `sluice backup full` now captures the source's CDC position at end-of-backup and writes it onto the manifest's `EndPosition` field. PG records `pg_current_wal_lsn()` paired with the configured slot name (default `sluice_slot`; override via the new `--slot-name` flag); MySQL records `@@global.gtid_executed` (or `(file, position)` when GTID mode is off) via the existing master-status helpers. Engines opt in by implementing the new `ir.BackupPositionCapturer` optional interface on their `SchemaReader`; engines without CDC support skip silently. Closes the v0.17.0 known limitation: incrementals chained off v0.17.2-rooted fulls no longer fire the "parent has no EndPosition; chain will start from CDC's current position" warning.
+- **`sluice sync start --position-from-manifest=<chain-url>`.** New CLI flag that loads the chain's terminal manifest's `EndPosition` and uses it as the resume position, bypassing the per-target `sluice_cdc_state` lookup. Use after `sluice restore --from=<chain-url>` to resume CDC from the chain's tail without re-bulking from source. Mutually exclusive with `--reset-target-data` (different recovery shapes; both override the persisted position). The slot-missing fall-through (ADR-0022) is suppressed when chain handoff is requested — silently re-bulking would defeat the chain's purpose. Accepts the same `s3://` / `gs://` / `azblob://` / `file:///` URL schemes as `sluice backup`, with companion `--backup-endpoint` / `--backup-region` / `--backup-path-style` flags for S3-compatible providers.
+- **PG soft-warning pre-flights (Phase 3.3.C) for `--position-from-manifest`.** New `ir.PositionFromManifestPreflight` optional engine surface; PG implements three checks against the source before CDC opens:
+   1. `wal_keep_size` sufficiency — soft warning when configured below PG's 64 MB default (so only setups that explicitly dialed it down trigger), with an operator-facing pointer to `docs/postgres-source-prep.md`.
+   2. Patroni / HA-managed source detection — soft warning about the idle-slot failover trap (the user's 2026-05-07 production finding). Three signals checked in order: Patroni-set GUCs in `pg_settings` (most specific), `pg_stat_replication.application_name` LIKE 'patroni%' (catches standby connections; gracefully degrades on permission denied), role names `patroni` / `replicator` (loosest).
+   3. Slot existence + health — fatal refusal for missing or `wal_status='lost'` / `'unreserved'`. Always a refusal regardless of `--strict-preflight` because the slot can't deliver what's needed.
+
+   MySQL intentionally has no preflight surface — its CDC reader's existing `verifyPositionResumable` already covers binlog purge.
+
+- **`sluice sync start --strict-preflight` (Phase 3.3.D).** New flag that promotes the soft warnings emitted by Phase 3.3.C to hard refusals before CDC starts. Default off: warnings log via slog and the run proceeds. Use in CI gates, scripted runbooks, or post-incident audits where the operator wants a strict "fail loudly on any preflight signal" posture.
+- **`sluice backup full --slot-name`.** Labels the recorded `EndPosition` on engines with a slot concept (Postgres) so a Phase 3 incremental opens CDC against a slot of the same name. Engines without slots (MySQL: binlog stream is the slot) ignore the flag. Default `sluice_slot`.
+- **`pipeline.LoadChainTerminalPosition(ctx, store)` exported helper.** Reads every manifest in a backup store, validates the chain shape via the existing `buildChain` helper, and returns the terminal manifest's `EndPosition`. Used by the streamer's `--position-from-manifest` path; exposed for downstream tooling that wants to inspect a chain's tail position without standing up a sync.
+
+### Changed
+
+- **`ir.PositionFromManifestPreflight` and `ir.PreflightReport` live in the `ir` package** (initially scoped to `pipeline`). The cycle-break is necessary because engine packages implement the interface and integration tests in pipeline import engines. The `pipeline` package keeps type aliases so existing call sites compile unchanged.
+- **`pipeline.ResolveSlotName` exported** so CLI commands outside the pipeline package (today: `sluice backup full --slot-name`) can apply the sluice-prefix convention without re-implementing it.
+
+### Phase 3 known limitations (closed)
+
+The v0.17.0 release notes flagged three Phase 3.3 follow-ups; all three are addressed in v0.17.2:
+
+- ✅ Full backups record `EndPosition` automatically (Phase 3.3.A).
+- ✅ `sluice sync start --position-from-manifest` is implemented (Phase 3.3.B).
+- ✅ PG `wal_keep_size` soft-warning + Patroni-detection pre-flights are implemented (Phase 3.3.C).
+
 ## [0.17.1] - 2026-05-07
 
 Single-bug patch from the v0.17.0 test cycle. v0.17.0 shipped logical-backups Phase 3.1 + 3.2 (incrementals + chain restore); the cycle surfaced a writer-side path collision that broke any chain with two or more incrementals into the same destination. Single-incremental chains and the schema-evolution path were unaffected.
