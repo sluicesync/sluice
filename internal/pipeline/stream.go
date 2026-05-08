@@ -667,8 +667,23 @@ func (b *BackupStream) runRollover(
 	// 3.2). Refresh cost is one cheap query per engine
 	// (information_schema.columns / pg_class+pg_attribute), bounded
 	// by table count.
-	if err := b.refreshSchemaAndAttachDelta(ctx, manifest, beforeSchema); err != nil {
-		return out, err
+	//
+	// Drain-commit carve-out (v0.20.1 regression fix): on ctx-cancel
+	// we still want to commit whatever chunks were flushed inside
+	// captureWindow's `case <-ctx.Done()` branch. Calling
+	// OpenSchemaReader on the cancelled ctx fails immediately, which
+	// pre-fix left out.Manifest=nil and the outer drain-commit path
+	// silently dropped the in-flight rollover (the LAST window's
+	// changes — e.g. user24 in TestBackupStream_*RolloverByMaxChanges).
+	// On ctx-cancel we skip the schema-refresh and commit with the
+	// parent's schema; the next stream run reads schema fresh on its
+	// first rollover and any source DDL that happened during the
+	// cancelled window is captured there as a SchemaDelta against the
+	// drain-commit's terminal manifest.
+	if !errors.Is(captureErr, context.Canceled) && !errors.Is(captureErr, context.DeadlineExceeded) {
+		if err := b.refreshSchemaAndAttachDelta(ctx, manifest, beforeSchema); err != nil {
+			return out, err
+		}
 	}
 
 	manifest.BackupID = ir.ComputeBackupID(manifest)
