@@ -6,6 +6,24 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.21.1]
+
+Two-item housekeeping release. No functional changes; documentation polish + a CI-flagged test-cleanup race fix.
+
+### Fixed
+
+- **`TestCDCReader_TimestampNonUTCHost` cleanup-race under `-race` on CI.** The test's `t.Cleanup` callback restored `time.Local` while the CDC pump goroutine — which calls go-mysql's binlog decoder, which builds `time.Time` via `time.Unix` (reads `time.Local`) — was still active. The original ordering relied on `defer rdr.Close()` running before the `t.Cleanup`, but `syncer.Close()` does not synchronously wait for the pump goroutine to exit, so the race detector caught reads from a still-running pump. Fix is test-side only: `defer rdr.Close()` becomes a `t.Cleanup` that closes AND drains the `changes` channel to completion. The pump's deferred `close(out)` runs as its last act, so observing the channel close gives a happens-before edge against any further pump-side reads of `time.Local`. Cleanup ordering (LIFO) is now: (1) close rdr + drain changes — registered second, runs first; (2) restore `time.Local` — registered first, runs last. Production CDC reader code is unchanged.
+
+### Documentation
+
+- **`docs/value-types.md` — MySQL binlog-event-volume sizing rule for `--rollover-max-changes`.** New section formalises an operator rule of thumb that surfaced during the v0.20.0 broker cycle: MySQL emits ~3 events per autocommit `INSERT` (`BEGIN` `QueryEvent` → `WRITE_ROWS_EVENTv2` → `XID/TxCommit`), plus a spurious empty `BEGIN/COMMIT` pair on the first DML of any new connection. Operators sizing `--rollover-max-changes` against naive INSERT counts under-size the bound by 3-4×. The new section documents the per-INSERT shape, the multi-row `INSERT` collapsed shape (`2 + N` events), the spurious pair, and the **4× expected-INSERT-count** rule of thumb. Includes a brief contrast against PostgreSQL's `pgoutput` (one event per row change, no in-band BEGIN/COMMIT inflation in the consumer's view) so PG operators don't apply the multiplier where it doesn't belong.
+
+### Migration / Compatibility
+
+- **No format changes.** Manifest schema, control-table schema, change-chunk format, CLI surface — all unchanged.
+- **No CLI breaking changes.** All existing `sluice` subcommands keep their flag surfaces verbatim.
+- **Drop-in upgrade from v0.21.0.** No DDL migration on `sluice_cdc_state`; no operator action required.
+
 ## [0.21.0]
 
 Logical backups Phase 5 lands: **cross-engine chain restore.** A PG-rooted backup chain can now restore (and stream-apply via `sync from-backup`) into a MySQL target, and vice versa. Closes the loud refusal at `chain_restore.go:99` (`"cross-engine chain restore is a Phase 5+ topic"`) that v0.17.0 through v0.20.x raised when the chain's source engine differed from the target. Implementation supplement: `docs/dev/design-logical-backups-phase-5.md`.
