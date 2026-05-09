@@ -6,6 +6,30 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.22.1]
+
+Single-bug patch from the v0.22.0 cycle. v0.22.0's load-bearing encryption pieces (encrypted full backup + restore, wrong-passphrase / missing-key refusals, per-chunk mode, plaintext backward-compat) all shipped clean — but the write-side envelope builder minted a fresh Argon2id salt every call, so any **chain extension** of an encrypted chain (`backup incremental --encrypt`, `backup stream run --encrypt`, or resume of a partial encrypted full) crashed at startup with `aes-gcm open: cipher: message authentication failed`. Restore-side already mirrored the chain's recorded salt; this patch brings the write-side in line. Fix is local to the encryption-builder + the orchestrator's chain-alignment paths; no schema or CLI changes.
+
+### Fixed
+
+- **Bug 43 — encrypted-chain extension fails at startup with `aes-gcm open: cipher: message authentication failed`.** `cmd/sluice/backup.go`'s write-side `buildBackupEncryption` called `crypto.DefaultArgon2idParams()`, which mints a fresh random salt every call. For `backup full` (no parent chain) this was correct — it sets the chain's salt for the first time. For `backup incremental --encrypt`, `backup stream run --encrypt` extending an existing encrypted chain, or resuming a partial encrypted full, the resulting envelope's KEK was derived against a different salt than the chain's recorded salt, so `Envelope.UnwrapCEK(parent.WrappedCEK)` failed with auth-tag mismatch. The read side (`buildReadEnvelope`) already loaded `rootManifest.ChainEncryption.Argon2id` and re-derived the KEK against the chain's recorded salt — that's why restore worked. Fix mirrors the read-side pattern on the write side: `pipeline.BackupEncryption` gains a `RebuildForChain func(*ir.Argon2idParams) (crypto.EnvelopeEncryption, error)` hook the CLI populates with a closure over the operator's passphrase. The orchestrator's chain-alignment paths (`Backup.setupChainEncryption`, `IncrementalBackup.alignEncryption`, `BackupStream.alignEncryption`) now read the chain root's recorded `Argon2id` and call `RebuildForChain` with those params before any CEK unwrap; the rebuilt envelope's KEK derives against the chain's salt and the unwrap succeeds. Cold-start full backups are unchanged — `RebuildForChain` is a no-op when the parent chain has no recorded params, so the freshly-minted Envelope's salt becomes the chain's salt as before.
+
+- **Latent: `Restore` discarded `Envelope` when chain shape was detected.** `Restore.Run` dispatches to `ChainRestore` for chains with incrementals, but the `ChainRestore{}` literal it built omitted the `Envelope` field — so encrypted chains restored via `sluice restore` (the public CLI surface) silently lost the operator's envelope and refused with the missing-key error. Surfaced as a follow-on while landing the Bug 43 integration test (encrypted full + encrypted incremental → chain restore). Fix is one-line; tests pin the propagation. Standalone full restores were unaffected because the chain-detection branch was skipped.
+
+### Added
+
+- **`pipeline.BackupEncryption.RebuildForChain` field.** Optional builder hook the orchestrator calls when extending an existing encrypted chain. Phase 6.1 (passphrase mode) populates it from the CLI; Phase 6.2/6.3 (KMS modes) leave it nil — KMS unwrap doesn't depend on a chain-recorded salt.
+
+- **Integration coverage for encrypted chain extension.** `TestBackup_EncryptedChainExtension_Incremental_PG` runs the full + encrypted-incremental + chain-restore round-trip with two distinct cold-start salts on the writer envelopes, mirroring the CLI shape that exposed Bug 43; the rebind pulls the chain's recorded salt into the second envelope before unwrap. Companion test `TestBackup_EncryptedChainExtension_NoRebuildHook_Fails` pins the pre-fix failure mode (no `RebuildForChain` → auth-tag mismatch) so a future regression of the wiring surfaces here rather than at the next cycle's S5 attempt.
+
+### Migration / Compatibility
+
+- **No format changes.** Manifest schema, control-table schema, change-chunk format, CLI surface — all unchanged.
+- **No CLI breaking changes.** All existing `sluice` subcommands keep their flag surfaces verbatim.
+- **Drop-in upgrade from v0.22.0.** A v0.22.0 chain that took its initial encrypted full cleanly is fully extensible under v0.22.1 (the chain's recorded `Argon2id` params let v0.22.1 derive the right KEK on every subsequent extension).
+- **Cold-start full backups unchanged.** `backup full --encrypt` against an empty destination mints a fresh salt as it always did; the chain root's recorded params are what subsequent extensions key off.
+- **No new dependencies.** Pure orchestration plumbing within the existing `internal/crypto` + `internal/pipeline` surfaces.
+
 ## [0.22.0]
 
 Logical backups Phase 6.1 lands: **client-side passphrase-mode encryption.** Chunks now land in cloud storage as AES-256-GCM ciphertext when `--encrypt` is set; only an operator with the right passphrase can recover the underlying rows. Closes the v0.16.0 / v0.17.2 release-notes-disclosed gap that sluice currently writes plaintext chunks; unlocks compliance-driven adoption (HIPAA, PCI-DSS, SOC 2 Type II, GDPR with customer-controlled keys) + air-gapped DR workflows where bucket-SSE doesn't follow the bytes. Implementation supplement: `docs/dev/design-logical-backups-phase-6.md`.
