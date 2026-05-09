@@ -114,6 +114,7 @@ func (r *Restore) Run(ctx context.Context) error {
 				Store:          r.Store,
 				Filter:         r.Filter,
 				MaxBufferBytes: r.MaxBufferBytes,
+				Envelope:       r.Envelope,
 			}
 			return chain.Run(ctx)
 		}
