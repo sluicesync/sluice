@@ -319,6 +319,18 @@ type Manifest struct {
 	// chunks during the window. Path conventions mirror full
 	// backups' table chunks but live under `chunks/_changes/`.
 	ChangeChunks []*ChunkInfo `json:"change_chunks,omitempty"`
+
+	// ChainEncryption, when non-nil, identifies this manifest's chain
+	// as encrypted under Phase 6 client-side envelope encryption. Empty
+	// (the zero default) means plaintext chunks — the v0.16.x..v0.21.x
+	// shape, preserved for backward compatibility.
+	//
+	// On encrypted chains the field is populated on the full manifest
+	// (the chain root); incremental manifests inherit the chain-level
+	// settings by reference. The chain walker reads the full's
+	// [ChainEncryption] to set up the [crypto.EnvelopeEncryption] used
+	// to decrypt every chunk in the chain.
+	ChainEncryption *ChainEncryption `json:"chain_encryption,omitempty"`
 }
 
 // Manifest partial-state constants. String literals are part of the
@@ -374,10 +386,118 @@ type ChunkInfo struct {
 	RowCount int64 `json:"row_count"`
 
 	// SHA256 is the hex-encoded SHA-256 of the chunk file's bytes
-	// AS WRITTEN TO STORAGE (i.e. after compression). Restore computes
-	// the hash on the bytes it reads back and compares; any mismatch
-	// is a hard failure.
+	// AS WRITTEN TO STORAGE (i.e. after compression AND encryption,
+	// when encryption is enabled — `backup verify` is sha256-only and
+	// must match what's on disk). Restore computes the hash on the
+	// bytes it reads back and compares; any mismatch is a hard failure.
 	SHA256 string `json:"sha256"`
+
+	// Encryption, when non-nil, marks this chunk as encrypted under
+	// Phase 6 client-side envelope encryption. Empty (the zero default)
+	// means plaintext — the v0.16.x..v0.21.x shape, preserved for
+	// backward compatibility.
+	//
+	// In per-chain mode, [ChunkEncryption.WrappedCEK] is empty and the
+	// chunk reader uses the chain-level CEK from
+	// [Manifest.ChainEncryption.WrappedCEK]. In per-chunk mode,
+	// WrappedCEK carries this chunk's own wrapped CEK.
+	Encryption *ChunkEncryption `json:"encryption,omitempty"`
+}
+
+// ChunkEncryption is the per-chunk Phase 6 encryption metadata. Empty
+// (nil pointer) means the chunk is plaintext; non-empty means the
+// chunk's bytes are AES-256-GCM ciphertext shaped as
+// `[nonce | ciphertext | authtag]`.
+//
+// Field-additions are forward-compatible (older sluice ignores unknown
+// fields); the chunk-format version on the manifest gates renames /
+// removals.
+type ChunkEncryption struct {
+	// Algorithm names the bulk cipher. Phase 6.1 ships only
+	// "AES-256-GCM"; future revisions may add ChaCha20-Poly1305.
+	Algorithm string `json:"algorithm,omitempty"`
+
+	// NonceLen is the byte length of the per-chunk random nonce that
+	// prefixes the ciphertext. 12 for AES-256-GCM (NIST recommended).
+	// Recorded explicitly so a future revision could vary it without
+	// breaking older readers.
+	NonceLen int `json:"nonce_len,omitempty"`
+
+	// AuthTagLen is the byte length of the AES-GCM auth tag that
+	// follows the ciphertext. 16 for AES-256-GCM. Same forward-compat
+	// rationale as NonceLen.
+	AuthTagLen int `json:"auth_tag_len,omitempty"`
+
+	// WrappedCEK is the per-chunk wrapped Content Encryption Key.
+	// Empty means "use the chain-level CEK" (per-chain mode);
+	// non-empty means this chunk has its own CEK (per-chunk mode).
+	WrappedCEK []byte `json:"wrapped_cek,omitempty"`
+}
+
+// ChainEncryption is the chain-level Phase 6 encryption metadata. Empty
+// (nil pointer) means the chain is plaintext; non-empty means every
+// chunk in the chain is encrypted under the recorded shape.
+//
+// The chain root (full manifest) carries this field; incremental
+// manifests inherit by reference. Mixed-mode chains (some chunks
+// encrypted, some not) are not supported — the chain-walker refuses
+// them at restore time.
+type ChainEncryption struct {
+	// Algorithm names the bulk cipher used by the chunk codec.
+	// Phase 6.1: "AES-256-GCM".
+	Algorithm string `json:"algorithm,omitempty"`
+
+	// Mode is "per-chain" or "per-chunk" — see the Phase 6 design.
+	// Per-chain (default) wraps a single CEK at the chain header and
+	// reuses it for every chunk; per-chunk wraps a fresh CEK per
+	// chunk for defense-in-depth.
+	Mode string `json:"mode,omitempty"`
+
+	// KEKMode identifies the Key Encryption Key derivation/access mode.
+	// Phase 6.1: "passphrase-argon2id". Phase 6.2/6.3 will add
+	// "aws-kms" / "gcp-kms" / "azure-keyvault".
+	KEKMode string `json:"kek_mode,omitempty"`
+
+	// KEKRef is the operator-visible reference to the KEK material.
+	// For passphrase mode: empty (the salt + Argon2id params in
+	// [ChainEncryption.Argon2id] is the reference). For KMS modes:
+	// the key ARN / resource name.
+	KEKRef string `json:"kek_ref,omitempty"`
+
+	// WrappedCEK is the chain-level wrapped Content Encryption Key,
+	// populated in per-chain mode. Empty in per-chunk mode (each
+	// [ChunkEncryption.WrappedCEK] carries the wrap there).
+	WrappedCEK []byte `json:"wrapped_cek,omitempty"`
+
+	// Argon2id, populated when [KEKMode] == "passphrase-argon2id",
+	// records the KEK-derivation params used so a restore-side
+	// PassphraseEnvelope can re-derive the same KEK from the
+	// operator's passphrase.
+	Argon2id *Argon2idParams `json:"argon2id,omitempty"`
+}
+
+// Argon2idParams matches the wire shape used by the Phase 6.1
+// passphrase-mode KEK derivation. See `internal/crypto/envelope.go`
+// for the runtime equivalent. Fields are mirrored here so the
+// manifest IR doesn't depend on the crypto package.
+type Argon2idParams struct {
+	// Salt is the per-chain Argon2id salt. 16 bytes; recorded so a
+	// restore-side passphrase can re-derive the same KEK.
+	Salt []byte `json:"salt,omitempty"`
+
+	// Memory is the Argon2id memory cost, in KiB. Default 65536
+	// (64 MiB).
+	Memory uint32 `json:"memory_kib,omitempty"`
+
+	// Iterations is the Argon2id time-cost parameter. Default 3.
+	Iterations uint32 `json:"iterations,omitempty"`
+
+	// Parallelism is the Argon2id parallelism parameter. Default 4.
+	Parallelism uint8 `json:"parallelism,omitempty"`
+
+	// KeyLen is the derived key length. Always 32 for AES-256-GCM in
+	// Phase 6.1; explicit so a future cipher swap can be recorded.
+	KeyLen uint32 `json:"key_len,omitempty"`
 }
 
 // MarshalJSON for [Schema] uses the tagged-union envelope so the
