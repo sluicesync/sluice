@@ -231,32 +231,46 @@ func TestAddTable_LiveMode_PG_UnderLoad(t *testing.T) {
 	seedCancel()
 
 	// Driver goroutine: keep inserting fresh rows during the add.
+	// The counter increments AFTER successful commit so it always
+	// matches actually-committed rows — the previous "increment
+	// before insert + decrement on error" shape lost a row whenever
+	// loadCancel fired mid-INSERT (the ctx-cancel branch returned
+	// without decrementing because errors.Is(err, context.Canceled)
+	// short-circuited the decrement path), producing an off-by-one
+	// failure under CI's specific scheduler.
+	//
+	// The pause uses a select-on-loadCtx-with-time.After rather than
+	// time.Sleep + ctx-aware Exec so the goroutine can't be killed
+	// mid-INSERT — that's the other class of "did this commit?"
+	// uncertainty (driver-side: pgx may have flushed the INSERT to
+	// the wire and the server committed before the ctx-cancel
+	// reached the client). With a clean pre-INSERT cancellation
+	// check + ctx.Background() Exec, the counter is provably exact.
 	loadCtx, loadCancel := context.WithCancel(context.Background())
 	var inserted atomic.Int64
 	var loadWG sync.WaitGroup
 	loadWG.Add(1)
 	go func() {
 		defer loadWG.Done()
+		var local int64
 		for {
 			select {
 			case <-loadCtx.Done():
+				inserted.Store(local)
 				return
 			default:
 			}
-			n := inserted.Add(1)
-			if _, err := srcDB.ExecContext(loadCtx, `INSERT INTO events (body) VALUES ($1)`, fmt.Sprintf("load-%d", n)); err != nil {
-				// Context cancellation is the expected exit path.
-				if loadCtx.Err() != nil {
-					return
-				}
-				// Surface unexpected errors via test-state side
-				// channel; using t.Errorf from a goroutine is unsafe
-				// per testing's contract. Decrement to keep the
-				// counter aligned with successful inserts.
-				inserted.Add(-1)
+			if _, err := srcDB.ExecContext(context.Background(), `INSERT INTO events (body) VALUES ($1)`, fmt.Sprintf("load-%d", local+1)); err != nil {
+				inserted.Store(local)
 				return
 			}
-			time.Sleep(10 * time.Millisecond)
+			local++
+			select {
+			case <-loadCtx.Done():
+				inserted.Store(local)
+				return
+			case <-time.After(10 * time.Millisecond):
+			}
 		}
 	}()
 
