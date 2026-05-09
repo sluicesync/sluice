@@ -195,9 +195,35 @@ func TestEmitDefault(t *testing.T) {
 		{"pg random()", ir.DefaultExpression{Expr: "random()"}, ir.Float{Precision: ir.FloatDouble}, "(RAND())", true},
 		{"pg RANDOM() uppercase", ir.DefaultExpression{Expr: "RANDOM()"}, ir.Float{Precision: ir.FloatDouble}, "(RAND())", true},
 
-		// Unrelated expressions pass through verbatim — the project
-		// policy of "loud failure beats silent corruption".
-		{"unrelated expr passthrough", ir.DefaultExpression{Expr: "uuid_generate_v4()"}, ir.UUID{}, "uuid_generate_v4()", true},
+		// Bug 44 — same-engine MySQL → MySQL function-call expression
+		// defaults need outer parens for MySQL 8.0+. Pre-fix the writer
+		// emitted `DEFAULT uuid()` (no parens) → MySQL Error 1064. The
+		// wrap helper recognises function-call shape and adds parens;
+		// already-wrapped translations like `(UUID())` from Bug 42's
+		// pgToMySQLDefaultExpr entry don't get double-wrapped.
+		{"bug44 mysql uuid() bare", ir.DefaultExpression{Expr: "uuid()"}, ir.Char{Length: 36}, "(uuid())", true},
+		{"bug44 mysql rand() bare", ir.DefaultExpression{Expr: "rand()"}, ir.Float{Precision: ir.FloatDouble}, "(rand())", true},
+		{"bug44 mysql UUID() uppercase bare", ir.DefaultExpression{Expr: "UUID()"}, ir.Char{Length: 36}, "(UUID())", true},
+		// Already-wrapped expressions (from translations or operator-
+		// supplied) pass through unchanged — no double-wrap.
+		{"bug44 already-wrapped (UUID()) passthrough", ir.DefaultExpression{Expr: "(UUID())"}, ir.Char{Length: 36}, "(UUID())", true},
+		{"bug44 already-wrapped (RAND()*100) passthrough", ir.DefaultExpression{Expr: "(RAND() * 100)"}, ir.Decimal{Precision: 10, Scale: 4}, "(RAND() * 100)", true},
+		// Bare temporal keywords stay bare — wrapping them is a syntax
+		// error in MySQL (the temporal-keyword grammar is separate
+		// from the function-call grammar).
+		{"bug44 current_timestamp lowercase passthrough", ir.DefaultExpression{Expr: "current_timestamp"}, ir.Timestamp{}, "current_timestamp", true},
+		{"bug44 current_timestamp() empty-parens passthrough", ir.DefaultExpression{Expr: "CURRENT_TIMESTAMP()"}, ir.Timestamp{}, "CURRENT_TIMESTAMP()", true},
+		{"bug44 LOCALTIMESTAMP passthrough", ir.DefaultExpression{Expr: "LOCALTIMESTAMP"}, ir.Timestamp{}, "LOCALTIMESTAMP", true},
+		{"bug44 LOCALTIME(3) passthrough", ir.DefaultExpression{Expr: "LOCALTIME(3)"}, ir.Time{Precision: 3}, "LOCALTIME(3)", true},
+		{"bug44 NOW() bare passthrough", ir.DefaultExpression{Expr: "NOW()"}, ir.Timestamp{}, "CURRENT_TIMESTAMP", true},
+		{"bug44 CURRENT_DATE passthrough", ir.DefaultExpression{Expr: "CURRENT_DATE"}, ir.Date{}, "CURRENT_DATE", true},
+
+		// Unrelated expressions still surface MySQL's loud failure on
+		// the target — but they get wrapped first per the function-call
+		// rule, so the rejection happens for the right reason (MySQL
+		// doesn't have the function), not the wrong reason (missing
+		// outer parens for the function-call form).
+		{"unrelated expr wrapped then loud-fail on target", ir.DefaultExpression{Expr: "uuid_generate_v4()"}, ir.UUID{}, "(uuid_generate_v4())", true},
 	}
 	for _, c := range cases {
 		c := c

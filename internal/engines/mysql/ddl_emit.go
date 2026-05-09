@@ -325,9 +325,90 @@ func emitDefault(d ir.DefaultValue, t ir.Type) (string, bool) {
 		if translated, ok := pgToMySQLDefaultExpr[normalized]; ok {
 			expr = translated
 		}
-		return matchTimestampDefaultPrecision(expr, t), true
+		expr = matchTimestampDefaultPrecision(expr, t)
+		expr = wrapMySQLExpressionDefault(expr)
+		return expr, true
 	}
 	return "", false
+}
+
+// wrapMySQLExpressionDefault wraps a DEFAULT expression body in outer
+// parens when MySQL 8.0+ requires it for function-call expression
+// defaults. Closes Bug 44 — pre-fix the writer emitted
+// `DEFAULT uuid()` (no outer parens) for an IR `DefaultExpression{Expr:
+// "uuid()"}`, which MySQL rejects with Error 1064. The MySQL 8.0.13+
+// expression-default syntax requires `DEFAULT (uuid())` for function
+// calls; only the special temporal keywords (CURRENT_TIMESTAMP family,
+// NOW(), LOCALTIME, etc.) are accepted bare.
+//
+// Three cases:
+//
+//  1. Already outer-wrapped — `(UUID())`, `(RAND())`, `(RAND() * 100)`:
+//     pass through. The Bug 42 translation entries (`gen_random_uuid()`
+//     → `(UUID())`) emit pre-wrapped expressions; same for
+//     operator-supplied defaults that come through pgToMySQLDefaultExpr
+//     pre-wrapped, and for cases where MySQL itself returns the
+//     parens-preserved shape from INFORMATION_SCHEMA.
+//
+//  2. Bare-keyword temporal forms — `CURRENT_TIMESTAMP`,
+//     `CURRENT_TIMESTAMP(6)`, `LOCALTIMESTAMP`, etc.: pass through bare.
+//     Wrapping these is a syntax error: MySQL rejects
+//     `DEFAULT (CURRENT_TIMESTAMP)` because the function-as-default
+//     wrap rule excludes the special temporal keywords.
+//
+//  3. Function-call shape — `uuid()`, `rand()`, `some_func()`: wrap in
+//     outer parens. Bug 44's exact failure shape.
+//
+// The "starts with `(`" check is naive — it doesn't verify the parens
+// actually balance — but real schemas don't surface pathological shapes
+// like `(a) + (b)`. If one does, the wrap path stays loud-failure on
+// the target rather than guessing.
+func wrapMySQLExpressionDefault(expr string) string {
+	trimmed := strings.TrimSpace(expr)
+	if trimmed == "" {
+		return expr
+	}
+	if strings.HasPrefix(trimmed, "(") && strings.HasSuffix(trimmed, ")") {
+		return expr
+	}
+	if isMySQLBareDefaultKeyword(trimmed) {
+		return expr
+	}
+	return "(" + trimmed + ")"
+}
+
+// isMySQLBareDefaultKeyword reports whether s is one of MySQL's
+// special temporal keywords accepted bare as a DEFAULT body. The
+// bare-vs-wrapped distinction matters: `DEFAULT CURRENT_TIMESTAMP`
+// and `DEFAULT NOW()` are valid, but `DEFAULT (CURRENT_TIMESTAMP)`
+// and `DEFAULT (NOW())` are not — MySQL's grammar treats the temporal
+// keywords as a separate production from the function-call form.
+//
+// Recognises (case-insensitive, with optional empty parens or
+// `(N)` precision suffix):
+//   - CURRENT_TIMESTAMP / NOW / LOCALTIME / LOCALTIMESTAMP
+//   - CURRENT_DATE / CURRENT_TIME (no precision; date and time
+//     accept the empty-parens form for symmetry)
+func isMySQLBareDefaultKeyword(s string) bool {
+	upper := strings.ToUpper(s)
+	if i := strings.IndexByte(upper, '('); i >= 0 {
+		if !strings.HasSuffix(upper, ")") {
+			return false
+		}
+		inner := strings.TrimSpace(upper[i+1 : len(upper)-1])
+		for _, c := range inner {
+			if c < '0' || c > '9' {
+				return false
+			}
+		}
+		upper = upper[:i]
+	}
+	switch upper {
+	case "CURRENT_TIMESTAMP", "CURRENT_DATE", "CURRENT_TIME",
+		"LOCALTIME", "LOCALTIMESTAMP", "NOW":
+		return true
+	}
+	return false
 }
 
 // matchTimestampDefaultPrecision rewrites a bare CURRENT_TIMESTAMP
