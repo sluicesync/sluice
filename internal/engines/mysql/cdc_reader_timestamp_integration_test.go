@@ -59,6 +59,16 @@ func TestCDCReader_TimestampNonUTCHost(t *testing.T) {
 	// override the test would only catch the bug on machines whose
 	// real local TZ happens to be non-UTC. Restore on cleanup so
 	// later tests in the same process see the original value.
+	//
+	// The cleanup is registered FIRST so it runs LAST (t.Cleanup is
+	// LIFO and runs after all defers). This guarantees the CDC pump
+	// goroutine — which calls go-mysql's binlog decoder, which reads
+	// time.Local in time.Unix — has fully exited (signalled by the
+	// `changes` channel closing in the pump's deferred close(out))
+	// BEFORE the test goroutine writes to time.Local. Without this
+	// ordering, -race flagged a write-vs-read race between the
+	// cleanup's `time.Local = originalLocal` and a still-decoding
+	// pump call to time.Unix.
 	loc, err := time.LoadLocation("America/Los_Angeles")
 	if err != nil {
 		t.Skipf("LoadLocation America/Los_Angeles: %v (tzdata unavailable)", err)
@@ -155,12 +165,23 @@ func TestCDCReader_TimestampNonUTCHost(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenCDCReader: %v", err)
 	}
-	defer func() { _ = rdr.(interface{ Close() error }).Close() }()
 
 	changes, err := rdr.StreamChanges(ctx, ir.Position{})
 	if err != nil {
 		t.Fatalf("StreamChanges: %v", err)
 	}
+
+	// Close the reader AND drain `changes` to completion before the
+	// time.Local restore (registered earlier) runs. The pump goroutine
+	// `defer close(out)`s the changes channel as its last act, so
+	// observing the channel close gives a happens-before edge against
+	// any further pump-side reads of time.Local. Registered after the
+	// time.Local cleanup so it runs first (LIFO).
+	t.Cleanup(func() {
+		_ = rdr.(interface{ Close() error }).Close()
+		for range changes {
+		}
+	})
 
 	// Settle: let the syncer register at "now" before triggering the
 	// row event. 200ms matches other CDC integration tests.
