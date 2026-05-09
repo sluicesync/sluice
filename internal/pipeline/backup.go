@@ -1009,6 +1009,16 @@ func chunkAlreadyMatches(ctx context.Context, store ir.BackupStore, key, expecte
 	return got == expectedSHA256, nil
 }
 
+// ReadRootManifest loads and decodes the chain-root manifest at
+// [ManifestFileName]. Returns (nil, nil) when no manifest is present
+// at the path (used by CLI helpers that want to inspect a chain's
+// encryption header before constructing a restore-side envelope).
+//
+// Distinct from [readManifest] which surfaces a NotFound as an error.
+func ReadRootManifest(ctx context.Context, store ir.BackupStore) (*ir.Manifest, error) {
+	return readManifestIfPresent(ctx, store)
+}
+
 // readManifest loads and decodes the manifest from store. Used by
 // both restore and `sluice backup verify`.
 func readManifest(ctx context.Context, store ir.BackupStore) (*ir.Manifest, error) {

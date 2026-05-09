@@ -8,12 +8,168 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/orware/sluice/internal/config"
+	"github.com/orware/sluice/internal/crypto"
 	"github.com/orware/sluice/internal/ir"
 	"github.com/orware/sluice/internal/pipeline"
 )
+
+// EncryptionFlags is the shared kong flag set for `--encrypt*` and
+// `--encryption-passphrase*` flags. Embedded into the backup / restore
+// / sync subcommand structs so every command surface that touches a
+// chain accepts the same shape. Phase 6.1 covers passphrase mode;
+// Phase 6.2/6.3 will add `--kms-key-arn` etc. via additional flags
+// here.
+type EncryptionFlags struct {
+	Encrypt bool `name:"encrypt" help:"Enable client-side envelope encryption. Backup paths require a passphrase source (--encryption-passphrase, --encryption-passphrase-env, or --encryption-passphrase-file). Restore / broker paths read the same flag and supply the operator's passphrase to unwrap the chain's CEK."`
+
+	EncryptionPassphrase     string `name:"encryption-passphrase" help:"Encryption passphrase (DEPRECATED for production — passphrase shows up in shell history; prefer --encryption-passphrase-env or --encryption-passphrase-file)." placeholder:"PASS"`
+	EncryptionPassphraseEnv  string `name:"encryption-passphrase-env" help:"Read encryption passphrase from this environment variable. Recommended over --encryption-passphrase for production." placeholder:"VAR"`
+	EncryptionPassphraseFile string `name:"encryption-passphrase-file" help:"Read encryption passphrase from this file path. Recommended for secrets-management integrations (1Password CLI, AWS Secrets Manager, etc.)." placeholder:"PATH"`
+
+	EncryptMode string `name:"encrypt-mode" enum:"per-chain,per-chunk" default:"per-chain" help:"Encryption mode: 'per-chain' (single CEK per chain; default; one Argon2id derive per restore) or 'per-chunk' (one CEK per chunk; defense-in-depth at the cost of per-chunk wrap)."`
+}
+
+// resolvePassphrase returns the operator's passphrase from whichever
+// source they chose, or an error if zero or more-than-one source was
+// supplied. Empty passphrases (env var / file is empty) are also
+// treated as an operator error.
+func (e *EncryptionFlags) resolvePassphrase() (string, error) {
+	count := 0
+	if e.EncryptionPassphrase != "" {
+		count++
+	}
+	if e.EncryptionPassphraseEnv != "" {
+		count++
+	}
+	if e.EncryptionPassphraseFile != "" {
+		count++
+	}
+	if count == 0 {
+		return "", errors.New("--encrypt requires one of --encryption-passphrase, --encryption-passphrase-env, or --encryption-passphrase-file")
+	}
+	if count > 1 {
+		return "", errors.New("--encryption-passphrase, --encryption-passphrase-env, and --encryption-passphrase-file are mutually exclusive")
+	}
+	switch {
+	case e.EncryptionPassphrase != "":
+		return e.EncryptionPassphrase, nil
+	case e.EncryptionPassphraseEnv != "":
+		v := os.Getenv(e.EncryptionPassphraseEnv)
+		if v == "" {
+			return "", fmt.Errorf("--encryption-passphrase-env=%s: environment variable is empty", e.EncryptionPassphraseEnv)
+		}
+		return v, nil
+	case e.EncryptionPassphraseFile != "":
+		raw, err := os.ReadFile(e.EncryptionPassphraseFile)
+		if err != nil {
+			return "", fmt.Errorf("--encryption-passphrase-file=%s: %w", e.EncryptionPassphraseFile, err)
+		}
+		// Trim trailing whitespace (operators commonly pipe `echo
+		// passphrase > file`, leaving a trailing newline).
+		v := strings.TrimRight(string(raw), "\r\n\t ")
+		if v == "" {
+			return "", fmt.Errorf("--encryption-passphrase-file=%s: file is empty", e.EncryptionPassphraseFile)
+		}
+		return v, nil
+	}
+	return "", errors.New("internal: passphrase source resolution fell through")
+}
+
+// buildBackupEncryption constructs a [pipeline.BackupEncryption] for
+// the write side (backup full / incremental / stream) using the
+// passphrase source supplied by the operator. Returns nil when
+// e.Encrypt is false (plaintext backup).
+func (e *EncryptionFlags) buildBackupEncryption() (*pipeline.BackupEncryption, error) {
+	if !e.Encrypt {
+		// Sanity: passphrase supplied without --encrypt is suspicious.
+		if e.EncryptionPassphrase != "" || e.EncryptionPassphraseEnv != "" || e.EncryptionPassphraseFile != "" {
+			return nil, errors.New("--encryption-passphrase* is set but --encrypt is not; pass --encrypt to enable encryption")
+		}
+		return nil, nil
+	}
+	passphrase, err := e.resolvePassphrase()
+	if err != nil {
+		return nil, err
+	}
+	params, err := crypto.DefaultArgon2idParams()
+	if err != nil {
+		return nil, fmt.Errorf("encryption: argon2id params: %w", err)
+	}
+	env, err := crypto.NewPassphraseEnvelope(passphrase, params)
+	if err != nil {
+		return nil, fmt.Errorf("encryption: build envelope: %w", err)
+	}
+	mode := e.EncryptMode
+	if mode == "" {
+		mode = crypto.EncryptModePerChain
+	}
+	return &pipeline.BackupEncryption{
+		Envelope: env,
+		Mode:     mode,
+	}, nil
+}
+
+// buildReadEnvelope constructs a [crypto.EnvelopeEncryption] for the
+// read side (restore / chain restore / broker). The chain root
+// manifest's recorded Argon2id params are needed to re-derive the KEK,
+// but those are loaded inside the pipeline orchestrator from the
+// manifest. CLI just needs the operator's passphrase; the orchestrator
+// re-derives the KEK against the chain's salt.
+//
+// Phase 6.1: returns a passphrase-only envelope when --encrypt is set.
+// The CLI hands it to the pipeline; the pipeline checks the chain's
+// recorded Argon2id params against the envelope's params at preflight
+// time.
+//
+// Returns nil when --encrypt is false (plaintext chain expected).
+func (e *EncryptionFlags) buildReadEnvelope(rootManifest *ir.Manifest) (crypto.EnvelopeEncryption, error) {
+	if !e.Encrypt {
+		// Sanity: chain is encrypted but operator didn't pass
+		// --encrypt? The pipeline's preflight returns a clearer error
+		// in that case (it knows the kek_mode); leave that path alone.
+		return nil, nil
+	}
+	passphrase, err := e.resolvePassphrase()
+	if err != nil {
+		return nil, err
+	}
+	// For passphrase mode, the read-side envelope needs the SAME
+	// Argon2id params the writer used (recorded in rootManifest's
+	// ChainEncryption.Argon2id). Load them; fall back to
+	// DefaultArgon2idParams when the manifest is unencrypted (the
+	// envelope still holds — the pipeline preflight is a no-op then).
+	var params crypto.Argon2idParams
+	if rootManifest != nil && rootManifest.ChainEncryption != nil && rootManifest.ChainEncryption.Argon2id != nil {
+		p := rootManifest.ChainEncryption.Argon2id
+		params = crypto.Argon2idParams{
+			Salt:        p.Salt,
+			Memory:      p.Memory,
+			Iterations:  p.Iterations,
+			Parallelism: p.Parallelism,
+			KeyLen:      p.KeyLen,
+		}
+	} else {
+		// Non-encrypted root or no Argon2id params recorded — generate
+		// fresh defaults; the pipeline will refuse the chain with a
+		// clearer error if the chain is actually encrypted under
+		// different params, since the unwrap will fail.
+		dp, derr := crypto.DefaultArgon2idParams()
+		if derr != nil {
+			return nil, fmt.Errorf("encryption: default argon2id params: %w", derr)
+		}
+		params = dp
+	}
+	env, err := crypto.NewPassphraseEnvelope(passphrase, params)
+	if err != nil {
+		return nil, fmt.Errorf("encryption: build read envelope: %w", err)
+	}
+	return env, nil
+}
 
 // BackupCmd groups the backup verbs. Phase 1 shipped `full` and
 // `verify`; Phase 3 (v0.17.0) adds `incremental` for chained backups
@@ -71,6 +227,8 @@ type BackupFullCmd struct {
 	SlotName string `help:"Replication-slot name suffix on engines with a slot concept (Postgres). Used to label the EndPosition recorded on the manifest so a Phase 3 incremental chained off this full opens CDC against a slot of the same name. Default 'sluice_slot'. Engines without slots (MySQL: binlog stream is the slot) ignore this flag." placeholder:"NAME"`
 
 	ForceOverwrite bool `help:"Replace an existing completed backup at the destination. By default 'sluice backup full' refuses to overwrite a successful prior backup; pass this to discard the prior contents and start fresh. Partial (in-progress) backups always resume regardless of this flag."`
+
+	EncryptionFlags
 }
 
 // Run implements `sluice backup full`.
@@ -119,6 +277,10 @@ func (b *BackupFullCmd) Run(g *Globals) error {
 		slog.Int("chunk_size", b.ChunkSize),
 	)
 
+	encConfig, err := b.buildBackupEncryption()
+	if err != nil {
+		return err
+	}
 	backup := &pipeline.Backup{
 		Source:         source,
 		SourceDSN:      b.Source,
@@ -128,6 +290,7 @@ func (b *BackupFullCmd) Run(g *Globals) error {
 		SluiceVersion:  version,
 		SlotName:       pipeline.ResolveSlotName(b.SlotName),
 		ForceOverwrite: b.ForceOverwrite,
+		Encryption:     encConfig,
 	}
 	return backup.Run(ctx)
 }
@@ -205,6 +368,8 @@ type BackupIncrementalCmd struct {
 	MaxChanges int           `help:"Stop streaming after this many CDC events (approximate; the window closes at the next TxCommit). Zero means time-bound only." default:"0" placeholder:"N"`
 
 	ChunkSize int `help:"Maximum changes per chunk file. Smaller chunks restore faster (per-chunk SHA-256 fail-fast) but inflate the manifest." default:"100000" placeholder:"N"`
+
+	EncryptionFlags
 }
 
 // Run implements `sluice backup incremental`.
@@ -239,6 +404,10 @@ func (b *BackupIncrementalCmd) Run(_ *Globals) error {
 		slog.Duration("window", b.Window),
 	)
 
+	encConfig, err := b.buildBackupEncryption()
+	if err != nil {
+		return err
+	}
 	incr := &pipeline.IncrementalBackup{
 		Source:        source,
 		SourceDSN:     b.Source,
@@ -249,6 +418,7 @@ func (b *BackupIncrementalCmd) Run(_ *Globals) error {
 		MaxChanges:    b.MaxChanges,
 		ChunkChanges:  b.ChunkSize,
 		SluiceVersion: version,
+		Encryption:    encConfig,
 	}
 	return incr.Run(ctx)
 }
@@ -301,6 +471,8 @@ type BackupStreamCmd struct {
 	Force bool `help:"Bypass the concurrent-writer check at startup (refuses to start when an existing stream_state.json shows a recent last_rollover_at from a different pid/host). Operator-confirmed: 'I'm taking over this destination from a previous stream that may still be running.'"`
 
 	RolloverHook string `help:"Shell command to invoke after each rollover commits successfully. Receives env vars SLUICE_ROLLOVER_MANIFEST_PATH, SLUICE_ROLLOVER_PARENT_BACKUP_ID, SLUICE_ROLLOVER_BACKUP_ID, SLUICE_ROLLOVER_CHANGES, SLUICE_ROLLOVER_BYTES, SLUICE_ROLLOVER_ELAPSED_MS. Hook errors are WARN-logged but don't fail the stream. 30s timeout." placeholder:"CMD"`
+
+	EncryptionFlags
 }
 
 // Run implements `sluice backup stream run`.
@@ -335,6 +507,10 @@ func (b *BackupStreamCmd) Run(_ *Globals) error {
 		slog.Duration("rollover_window", b.RolloverWindow),
 	)
 
+	encConfig, err := b.buildBackupEncryption()
+	if err != nil {
+		return err
+	}
 	stream := &pipeline.BackupStream{
 		Source:                source,
 		SourceDSN:             b.Source,
@@ -349,6 +525,7 @@ func (b *BackupStreamCmd) Run(_ *Globals) error {
 		Force:                 b.Force,
 		RolloverHook:          b.RolloverHook,
 		SluiceVersion:         version,
+		Encryption:            encConfig,
 	}
 	return stream.Run(ctx)
 }
@@ -479,6 +656,8 @@ type RestoreCmd struct {
 	ExcludeTable []string `help:"Restore every table except these (comma-separated, repeatable). Glob patterns allowed. Mutually exclusive with --include-table." sep:"," placeholder:"TABLE"`
 
 	MaxBufferBytes int64 `help:"Soft cap on per-batch buffered memory in the bulk-copy writer. Same semantics as 'sluice migrate --max-buffer-bytes'. Default 67108864 (64 MiB)." default:"67108864" placeholder:"N"`
+
+	EncryptionFlags
 }
 
 // Run implements `sluice restore`.
@@ -526,12 +705,25 @@ func (r *RestoreCmd) Run(g *Globals) error {
 		slog.String("source", storeDesc),
 	)
 
+	// Phase 6.1: read the chain-root manifest first to extract any
+	// recorded Argon2id params, so the restore-side envelope's KEK
+	// derivation matches the backup's.
+	rootManifest, err := pipeline.ReadRootManifest(ctx, store)
+	if err != nil {
+		return fmt.Errorf("restore: read root manifest: %w", err)
+	}
+	envelope, err := r.buildReadEnvelope(rootManifest)
+	if err != nil {
+		return err
+	}
+
 	restore := &pipeline.Restore{
 		Target:         target,
 		TargetDSN:      r.Target,
 		Store:          store,
 		Filter:         filter,
 		MaxBufferBytes: r.MaxBufferBytes,
+		Envelope:       envelope,
 	}
 	return restore.Run(ctx)
 }

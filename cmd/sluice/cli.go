@@ -281,6 +281,8 @@ type SyncFromBackupCmd struct {
 	AtChainID string `help:"Operator-asserted resumption: the broker treats the target as currently being at chain ID <ID>; writes a fresh sluice_cdc_state row and transitions to live polling from there. Use after a manual 'sluice restore --from=<chain-url>'. Mutually exclusive with --reset-target-data." placeholder:"BACKUP-ID"`
 
 	Yes bool `help:"Skip the destructive-action confirmation prompt for --reset-target-data." short:"y"`
+
+	EncryptionFlags
 }
 
 // Run implements `sluice sync from-backup run`.
@@ -324,6 +326,17 @@ func (s *SyncFromBackupCmd) Run(_ *Globals) error {
 		}
 	}
 
+	// Phase 6.1: load the chain root to extract Argon2id params for
+	// the read-side envelope.
+	rootManifest, err := pipeline.ReadRootManifest(ctx, store)
+	if err != nil {
+		return fmt.Errorf("from-backup: read root manifest: %w", err)
+	}
+	envelope, err := s.buildReadEnvelope(rootManifest)
+	if err != nil {
+		return err
+	}
+
 	broker := &pipeline.SyncFromBackup{
 		Target:          target,
 		TargetDSN:       s.Target,
@@ -336,6 +349,7 @@ func (s *SyncFromBackupCmd) Run(_ *Globals) error {
 		ResetTargetData: s.ResetTargetData,
 		AtChainID:       s.AtChainID,
 		SluiceVersion:   version,
+		Envelope:        envelope,
 	}
 	return broker.Run(ctx)
 }
