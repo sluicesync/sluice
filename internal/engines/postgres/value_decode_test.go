@@ -94,6 +94,27 @@ func TestDecodeValue(t *testing.T) {
 			"01234567-89ab-cdef-0123-456789abcdef",
 		},
 		{"uuid string passthrough", "11111111-2222-3333-4444-555555555555", ir.UUID{}, "11111111-2222-3333-4444-555555555555"},
+		// Bug 41 — pgoutput CDC tuple values arrive as []byte in
+		// canonical text form (36 bytes); the decoder must accept
+		// them and return the IR-canonical lowercased string.
+		{
+			"uuid 36-byte text []byte (pgoutput CDC)",
+			[]byte("11111111-2222-3333-4444-555555555555"),
+			ir.UUID{},
+			"11111111-2222-3333-4444-555555555555",
+		},
+		{
+			"uuid uppercase canonical text lowercased",
+			"AABBCCDD-EEFF-0011-2233-445566778899",
+			ir.UUID{},
+			"aabbccdd-eeff-0011-2233-445566778899",
+		},
+		{
+			"uuid mixed-case []byte lowercased",
+			[]byte("AaBbCcDd-EeFf-0011-2233-445566778899"),
+			ir.UUID{},
+			"aabbccdd-eeff-0011-2233-445566778899",
+		},
 
 		// ---- Network types ----
 		{"inet from netip.Prefix", prefix, ir.Inet{}, "192.168.1.0/24"},
@@ -196,6 +217,13 @@ func TestDecodeValueErrors(t *testing.T) {
 		{"bool from gibberish string", "maybe", ir.Boolean{}},
 		{"timestamp from gibberish string", "not a date", ir.Timestamp{}},
 		{"uuid wrong length bytes", []byte{1, 2, 3}, ir.UUID{}},
+		// Bug 41 negative cases — malformed text-format must error
+		// loudly rather than slipping past validation.
+		{"uuid 36-byte text with missing hyphen", []byte("11111111+2222-3333-4444-555555555555"), ir.UUID{}},
+		{"uuid 36-byte text with non-hex byte", []byte("zzzzzzzz-2222-3333-4444-555555555555"), ir.UUID{}},
+		{"uuid string wrong length", "1234", ir.UUID{}},
+		{"uuid string missing hyphen", "11111111+2222-3333-4444-555555555555", ir.UUID{}},
+		{"uuid byte slice unrecognised length", []byte("123456789012345"), ir.UUID{}},
 		{"array from string without braces", "not an array literal", ir.Array{Element: ir.Integer{}}},
 		{"array nil element type", []int32{1}, ir.Array{}},
 	}
@@ -222,6 +250,50 @@ func TestDecodeBytesIsCopy(t *testing.T) {
 	src[0] = 0x00
 	if out[0] != 0xaa {
 		t.Errorf("mutating source mutated decoded value: got %#v", out)
+	}
+}
+
+// TestCanonicalizeUUIDText covers the Bug 41 fix surface: pgoutput
+// CDC tuples deliver UUID values as 36-byte canonical text, and the
+// decoder must validate + lowercase before handing the string to the
+// IR. The shape-validation negative cases are already covered through
+// decodeValue in TestDecodeValueErrors; this test pins the helper's
+// own contract.
+func TestCanonicalizeUUIDText(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+		err  bool
+	}{
+		{"canonical lowercase", "11111111-2222-3333-4444-555555555555", "11111111-2222-3333-4444-555555555555", false},
+		{"canonical uppercase lowercased", "AABBCCDD-EEFF-0011-2233-445566778899", "aabbccdd-eeff-0011-2233-445566778899", false},
+		{"mixed case lowercased", "AaBbCcDd-1111-2222-3333-4a4B4c4D4E4f", "aabbccdd-1111-2222-3333-4a4b4c4d4e4f", false},
+		{"too short", "11111111-2222-3333-4444-55555555555", "", true},
+		{"too long", "11111111-2222-3333-4444-5555555555556", "", true},
+		{"missing hyphen at 8", "11111111+2222-3333-4444-555555555555", "", true},
+		{"missing hyphen at 13", "11111111-2222+3333-4444-555555555555", "", true},
+		{"missing hyphen at 18", "11111111-2222-3333+4444-555555555555", "", true},
+		{"missing hyphen at 23", "11111111-2222-3333-4444+555555555555", "", true},
+		{"non-hex byte", "zzzzzzzz-2222-3333-4444-555555555555", "", true},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			got, err := canonicalizeUUIDText(c.in)
+			if c.err {
+				if err == nil {
+					t.Errorf("canonicalizeUUIDText(%q): expected error, got %q", c.in, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("canonicalizeUUIDText(%q): unexpected error: %v", c.in, err)
+			}
+			if got != c.want {
+				t.Errorf("canonicalizeUUIDText(%q):\n got  %q\n want %q", c.in, got, c.want)
+			}
+		})
 	}
 }
 

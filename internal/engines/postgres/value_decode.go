@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"log/slog"
 	"net"
 	"net/netip"
 	"reflect"
@@ -238,45 +237,84 @@ func decodeTimeAsString(raw any) (any, error) {
 // decodeUUID converts pgx's [16]byte (or pgtype.UUID-shaped) raw form
 // into the canonical lowercase-hyphenated string the IR contract
 // requires.
+// decodeUUID accepts the three shapes pgx + pgoutput collectively
+// produce for a UUID column:
+//
+//   - [16]byte / 16-byte []byte — the binary form pgx returns under
+//     its native type-mapping mode (and what database/sql sometimes
+//     surfaces too). Hex-encoded into the canonical hyphenated string.
+//   - 36-byte []byte — the canonical text form pgoutput delivers in
+//     CDC tuple data. pgoutput tags every tuple value with format
+//     byte 't' (text); decodeTuple's 'b' (binary) branch is a hard
+//     refusal, so for the CDC path UUID values arrive here as the
+//     ASCII bytes of "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx". Validated
+//     and lowercased to the IR's canonical form. Bug 41 fix surface.
+//   - string — passthrough for pgx modes that decode UUID directly to
+//     string. Validated for canonical shape so a malformed source value
+//     can't sneak past the IR contract.
+//
+// Any other byte length surfaces a clear error naming both the length
+// and the format byte the caller delegated with, so a future format
+// surprise (e.g. a Postgres change to wire encoding) is easy to triage.
 func decodeUUID(raw any) (any, error) {
-	// Phase A instrumentation (Bug 41): log inbound shape so we can
-	// confirm what pgoutput is delivering for UUID columns.
-	switch v := raw.(type) {
-	case []byte:
-		preview := v
-		if len(preview) > 40 {
-			preview = preview[:40]
-		}
-		slog.Debug("postgres: decodeUUID: received []byte",
-			"len", len(v),
-			"preview", string(preview),
-		)
-	case string:
-		slog.Debug("postgres: decodeUUID: received string",
-			"len", len(v),
-			"value", v,
-		)
-	default:
-		slog.Debug("postgres: decodeUUID: received other",
-			"type", fmt.Sprintf("%T", raw),
-		)
-	}
-
 	switch v := raw.(type) {
 	case [16]byte:
 		return formatUUIDBytes(v[:])
 	case []byte:
-		if len(v) != 16 {
-			return nil, fmt.Errorf("postgres: UUID byte slice has length %d; want 16", len(v))
+		switch len(v) {
+		case 16:
+			return formatUUIDBytes(v)
+		case 36:
+			// Text-format CDC tuple value (pgoutput). Validate that
+			// the bytes really are a canonical hyphenated UUID before
+			// promoting to string — bare-bytes-of-arbitrary-length
+			// would otherwise pass straight through.
+			return canonicalizeUUIDText(string(v))
+		default:
+			return nil, fmt.Errorf(
+				"postgres: UUID byte slice has length %d; want 16 (binary) or 36 (canonical text)",
+				len(v))
 		}
-		return formatUUIDBytes(v)
 	case string:
-		// Already a string; accept it (pgx may return string in some
-		// modes). We don't validate format here — that's the source's
-		// responsibility.
-		return v, nil
+		// Already a string; pgx may return string in some modes, and
+		// some codepaths land here directly. Validate the shape so the
+		// IR contract holds.
+		return canonicalizeUUIDText(v)
 	}
 	return nil, fmt.Errorf("postgres: cannot decode %T as UUID", raw)
+}
+
+// canonicalizeUUIDText validates that s is the canonical hyphenated
+// UUID form (8-4-4-4-12 hex digits) and returns it lowercased so the
+// IR's UUID-as-string contract holds across engines. Pure ASCII work
+// — no allocations beyond the lowercased return.
+func canonicalizeUUIDText(s string) (string, error) {
+	if len(s) != 36 {
+		return "", fmt.Errorf("postgres: UUID text has length %d; want 36 (canonical xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)", len(s))
+	}
+	// Hyphens at positions 8, 13, 18, 23.
+	for _, i := range []int{8, 13, 18, 23} {
+		if s[i] != '-' {
+			return "", fmt.Errorf("postgres: UUID text %q missing hyphen at offset %d", s, i)
+		}
+	}
+	out := make([]byte, 36)
+	for i := 0; i < 36; i++ {
+		c := s[i]
+		switch {
+		case c == '-':
+			out[i] = c
+		case c >= '0' && c <= '9':
+			out[i] = c
+		case c >= 'a' && c <= 'f':
+			out[i] = c
+		case c >= 'A' && c <= 'F':
+			out[i] = c + ('a' - 'A')
+		default:
+			return "", fmt.Errorf("postgres: UUID text %q has non-hex byte %q at offset %d", s, c, i)
+		}
+	}
+	return string(out), nil
 }
 
 func formatUUIDBytes(b []byte) (string, error) {
