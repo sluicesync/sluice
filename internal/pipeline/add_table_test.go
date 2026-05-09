@@ -281,6 +281,140 @@ func TestAddTablePublicationAddCalled(t *testing.T) {
 	}
 }
 
+// TestAddTable_LiveMode_FieldRoundTrip pins the LiveMode field's
+// presence on the orchestrator struct. A typo or rename here would
+// silently disable Phase 2 because the CLI passes the bool through.
+func TestAddTable_LiveMode_FieldRoundTrip(t *testing.T) {
+	a := &AddTable{LiveMode: true}
+	if !a.LiveMode {
+		t.Errorf("LiveMode round-trip = %v; want true", a.LiveMode)
+	}
+}
+
+// TestAddTable_LiveMode_SkipsActiveStreamRefusal confirms the live-
+// mode path does NOT trip the Phase 1 stop_requested_at refusal.
+// The stream's row exists, the stop flag is set (would refuse in
+// Phase 1), and the live-mode engine's slot-position read succeeds —
+// the orchestrator proceeds to publication-add and snapshot.
+func TestAddTable_LiveMode_SkipsActiveStreamRefusal(t *testing.T) {
+	src := newAddTableSourceEngineLive("source")
+	src.schema = &ir.Schema{Tables: []*ir.Table{
+		{Name: "new_table", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}},
+	}}
+	src.slotLSN = "0/1000"
+	src.snapshotLSN = "0/2000"
+
+	tgt := newAddTableTargetEngine("target")
+	tgt.applier.streams = []ir.StreamStatus{{StreamID: "live"}}
+	// Phase 1 would refuse on this; live mode must skip the check.
+	tgt.applier.stopRequested = true
+
+	a := &AddTable{
+		Source: src, Target: tgt,
+		SourceDSN: "src", TargetDSN: "tgt",
+		StreamID: "live", TableName: "new_table",
+		LiveMode: true,
+	}
+	if err := a.Run(context.Background()); err != nil {
+		t.Fatalf("Run with LiveMode=true unexpectedly errored: %v", err)
+	}
+	if src.snapshotCalls != 1 {
+		t.Errorf("live-mode snapshot opens = %d; want 1", src.snapshotCalls)
+	}
+	if got := src.addedTables; len(got) != 1 || got[0] != "new_table" {
+		t.Errorf("live-mode publication-add tables = %v; want [new_table]", got)
+	}
+}
+
+// TestAddTable_LiveMode_RefusesEngineWithoutPublication confirms
+// live mode refuses (with a clear PG-only message) on an engine
+// that doesn't implement publicationAdder. MySQL is the canonical
+// case; the recordingEngine-without-pub stand-in here exercises the
+// same path.
+func TestAddTable_LiveMode_RefusesEngineWithoutPublication(t *testing.T) {
+	src := newAddTableSourceEngine("mysql-like") // no publicationAdder
+	src.schema = &ir.Schema{Tables: []*ir.Table{
+		{Name: "new_table", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}},
+	}}
+	tgt := newAddTableTargetEngine("target")
+	tgt.applier.streams = []ir.StreamStatus{{StreamID: "live"}}
+
+	a := &AddTable{
+		Source: src, Target: tgt,
+		SourceDSN: "src", TargetDSN: "tgt",
+		StreamID: "live", TableName: "new_table",
+		LiveMode: true,
+	}
+	err := a.Run(context.Background())
+	if err == nil {
+		t.Fatalf("expected error on live mode with non-publication engine; got nil")
+	}
+	if !strings.Contains(err.Error(), "publication-bearing source engine") {
+		t.Errorf("err = %v; want a publication-bearing-engine refusal", err)
+	}
+	if !strings.Contains(err.Error(), "drained add-table flow") {
+		t.Errorf("err = %v; want recovery hint pointing at the drained flow", err)
+	}
+}
+
+// TestAddTable_LiveMode_InvariantFires confirms the snapshot-LSN ≥
+// slot-LSN invariant trips loudly when a stub engine reports a
+// regressed snapshot LSN. The standard ordering can't actually
+// produce this in practice, but the check pins the invariant
+// against a future regression in the flow's ordering.
+func TestAddTable_LiveMode_InvariantFires(t *testing.T) {
+	src := newAddTableSourceEngineLive("source")
+	src.schema = &ir.Schema{Tables: []*ir.Table{
+		{Name: "new_table", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}},
+	}}
+	src.slotLSN = "0/2000"     // active stream at 0/2000
+	src.snapshotLSN = "0/1000" // snapshot somehow regressed to 0/1000
+
+	tgt := newAddTableTargetEngine("target")
+	tgt.applier.streams = []ir.StreamStatus{{StreamID: "live"}}
+
+	a := &AddTable{
+		Source: src, Target: tgt,
+		SourceDSN: "src", TargetDSN: "tgt",
+		StreamID: "live", TableName: "new_table",
+		LiveMode: true,
+	}
+	err := a.Run(context.Background())
+	if err == nil {
+		t.Fatalf("expected invariant-fired error; got nil")
+	}
+	if !strings.Contains(err.Error(), "snapshot LSN") || !strings.Contains(err.Error(), "behind") {
+		t.Errorf("err = %v; want snapshot-LSN-behind-slot-LSN refusal", err)
+	}
+}
+
+// TestAddTable_LiveMode_EmptySlotLSNSkipsInvariant confirms that
+// when the active slot's confirmed_flush_lsn is empty (fresh slot,
+// no consumer progress yet), the invariant check is skipped and
+// the orchestrator proceeds. This mirrors PG's behaviour right
+// after a slot is created but before any commits have flowed.
+func TestAddTable_LiveMode_EmptySlotLSNSkipsInvariant(t *testing.T) {
+	src := newAddTableSourceEngineLive("source")
+	src.schema = &ir.Schema{Tables: []*ir.Table{
+		{Name: "new_table", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}},
+	}}
+	src.slotLSN = ""           // empty floor → skip
+	src.snapshotLSN = "0/1000" // any value is fine
+
+	tgt := newAddTableTargetEngine("target")
+	tgt.applier.streams = []ir.StreamStatus{{StreamID: "live"}}
+
+	a := &AddTable{
+		Source: src, Target: tgt,
+		SourceDSN: "src", TargetDSN: "tgt",
+		StreamID: "live", TableName: "new_table",
+		LiveMode: true,
+	}
+	if err := a.Run(context.Background()); err != nil {
+		t.Fatalf("Run with empty slot LSN unexpectedly errored: %v", err)
+	}
+}
+
 // TestTempSlotName pins the temp-slot naming convention so changes
 // here become visible in code review.
 func TestTempSlotName(t *testing.T) {
@@ -348,6 +482,75 @@ func newAddTableSourceEngineWithPub(name string) *addTableSourceEngineWithPub {
 func (e *addTableSourceEngineWithPub) AddPublicationTables(_ context.Context, _ string, tables []string) error {
 	e.addedTables = append(e.addedTables, tables...)
 	return nil
+}
+
+// addTableSourceEngineLive is the live-mode (Phase 2) test stand-in.
+// Implements every optional surface the live-mode preflight + LSN
+// invariant check needs:
+//   - publicationAdder (gates the live-mode refusal)
+//   - slotPositionReader (returns the configured slotLSN)
+//   - snapshotLSNExtractor + lsnComparer (drive the invariant check;
+//     the comparer here is a string compare which works for the
+//     monotonically-increasing test fixtures)
+//
+// The snapshot it returns advertises snapshotLSN as its position
+// token via a JSON envelope ExtractSnapshotLSN can decode.
+type addTableSourceEngineLive struct {
+	*addTableSourceEngine
+	addedTables []string
+	slotLSN     string
+	snapshotLSN string
+}
+
+func newAddTableSourceEngineLive(name string) *addTableSourceEngineLive {
+	return &addTableSourceEngineLive{addTableSourceEngine: newAddTableSourceEngine(name)}
+}
+
+func (e *addTableSourceEngineLive) AddPublicationTables(_ context.Context, _ string, tables []string) error {
+	e.addedTables = append(e.addedTables, tables...)
+	return nil
+}
+
+func (e *addTableSourceEngineLive) ReadSlotPosition(_ context.Context, _, _ string) (string, error) {
+	return e.slotLSN, nil
+}
+
+// OpenSnapshotStream overrides the embedded base to advertise the
+// configured snapshotLSN in the position token. The token is the
+// LSN itself (no JSON envelope) — the test extractor / comparer
+// below handle this format directly.
+func (e *addTableSourceEngineLive) OpenSnapshotStream(_ context.Context, _ string) (*ir.SnapshotStream, error) {
+	e.snapshotCalls++
+	return &ir.SnapshotStream{
+		Position: ir.Position{Engine: e.name, Token: e.snapshotLSN},
+		Rows:     &recordingRowReader{},
+		Changes:  &noopCDCReader{},
+		CloseFn:  func() error { return nil },
+	}, nil
+}
+
+// ExtractSnapshotLSN treats the position token as the LSN string
+// directly (test-only shape; the real PG engine decodes a JSON
+// envelope).
+func (e *addTableSourceEngineLive) ExtractSnapshotLSN(pos ir.Position) (lsn string, ok bool, err error) {
+	if pos.Engine == "" && pos.Token == "" {
+		return "", false, nil
+	}
+	return pos.Token, true, nil
+}
+
+// CompareLSN does a lexicographic compare on the LSN strings —
+// adequate for the monotonically-increasing fixtures the live-
+// mode unit tests use ("0/1000", "0/2000", ...). Real engines do
+// numeric comparison after parsing.
+func (e *addTableSourceEngineLive) CompareLSN(a, b string) (int, error) {
+	switch {
+	case a < b:
+		return -1, nil
+	case a > b:
+		return 1, nil
+	}
+	return 0, nil
 }
 
 // addTableTargetEngine bundles a recordingEngine with a configurable

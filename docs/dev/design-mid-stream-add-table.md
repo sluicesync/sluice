@@ -124,8 +124,23 @@ Estimated size: ~600-900 LOC including tests + ADR.
 
 This is real engineering work — ~1000-1500 LOC minimum, plus tests, plus ADR. The current sluice usage pattern hasn't surfaced this as a blocker (operators are using `--reset-target-data` for now, or not adding tables mid-stream). When real-world testing reports it as a concrete need, this design should kick off.
 
+## Phase 2 status (live add, no drain)
+
+**Shipped.** Phase 2 lives behind `sluice schema add-table TABLE --no-drain` (PG-only first). See [`adr-0030-mid-stream-live-add-table.md`](adr/adr-0030-mid-stream-live-add-table.md) for the full correctness story.
+
+The implementation chose **Strategy C variant (c)** — single-slot, publication-add-then-snapshot ordering — over Strategy B (dual-slot). Re-reading Phase 1's orchestrator after it shipped revealed that the publication-add → snapshot ordering already implements the correctness shape; the only thing keeping Phase 1 from being live-safe was the conservative `stop_requested_at` refusal in `preflightStream`. Phase 2 lifts that refusal in favour of:
+
+- An explicit gate that the source engine implements `publicationAdder` (PG-only; MySQL refuses with a clear error).
+- A captured baseline of the active stream's slot `confirmed_flush_lsn` before publication-add.
+- An invariant check after the snapshot opens: snapshot-LSN ≥ the captured slot LSN; loud refusal otherwise.
+
+**MySQL Phase 2 is deferred.** The PG mechanism (publication-add) doesn't translate — MySQL's binlog auto-includes every table; the gap is in the streamer's table filter (`--include-table`/`--exclude-table`). Future work: a streamer-side filter-flip mechanism that extends `applyTableFilter`'s scope mid-run, or a no-filter default with the WARN-and-skip-then-pick-up pattern from ADR-0021.
+
+**Strategy B remains reserved** for Phase 3 if real operator demand surfaces for sub-second add-table latency on workloads where the temp slot's brief WAL pin is unacceptable.
+
 ## See also
 
 - `docs/adr/adr-0021-publication-scope-by-table.md` — the original punt and the rationale.
 - `docs/adr/adr-0023-reset-target-data.md` — the destructive-recovery pattern this design mirrors for failure handling.
+- `docs/adr/adr-0030-mid-stream-live-add-table.md` — Phase 2 (live add, no drain) decision record.
 - `docs/schema-change-runbook.md` — the operator-facing companion for ALTER coordination, which add-table will slot alongside.

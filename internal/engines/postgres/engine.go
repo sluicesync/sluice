@@ -18,7 +18,11 @@ package postgres
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"fmt"
+
+	"github.com/jackc/pglogrepl"
 
 	"github.com/orware/sluice/internal/engines"
 	"github.com/orware/sluice/internal/ir"
@@ -223,6 +227,99 @@ func (Engine) AddPublicationTables(ctx context.Context, dsn string, tables []str
 	}
 	defer func() { _ = db.Close() }()
 	return addTablesToPublication(ctx, db, defaultPublication, cfg.schema, tables)
+}
+
+// ExtractSnapshotLSN decodes a Postgres snapshot stream's
+// [ir.Position] and returns the LSN it carries. Used by the live
+// mid-stream add-table flow (ADR-0030) to enforce the
+// snapshot-LSN ≥ slot-LSN invariant without leaking the engine's
+// position envelope into the orchestrator.
+//
+// Returns ("", false, nil) when the position is the zero value
+// (the "from now" sentinel) — semantically "no LSN floor", which
+// the orchestrator treats as skip-the-check rather than refuse.
+// Returns a wrapped error on a non-zero position with a malformed
+// envelope; the orchestrator surfaces that as a refusal because a
+// malformed position from the snapshot path is itself a bug worth
+// investigating before touching production data.
+func (Engine) ExtractSnapshotLSN(pos ir.Position) (lsn string, ok bool, err error) {
+	decoded, ok, err := decodePGPos(pos)
+	if err != nil {
+		return "", false, err
+	}
+	if !ok {
+		return "", false, nil
+	}
+	return decoded.LSN, true, nil
+}
+
+// CompareLSN compares two PG LSN strings in the canonical
+// "X/XXXXXXXX" form. Returns -1 if a < b, 0 if equal, +1 if a > b.
+// Wraps pglogrepl.ParseLSN on each operand; a malformed LSN
+// surfaces as a wrapped error. Used by the live add-table
+// invariant check (ADR-0030).
+func (Engine) CompareLSN(a, b string) (int, error) {
+	la, err := pglogrepl.ParseLSN(a)
+	if err != nil {
+		return 0, fmt.Errorf("postgres: compare LSN: parse %q: %w", a, err)
+	}
+	lb, err := pglogrepl.ParseLSN(b)
+	if err != nil {
+		return 0, fmt.Errorf("postgres: compare LSN: parse %q: %w", b, err)
+	}
+	switch {
+	case la < lb:
+		return -1, nil
+	case la > lb:
+		return 1, nil
+	}
+	return 0, nil
+}
+
+// ReadSlotPosition returns the named replication slot's
+// confirmed_flush_lsn as a canonical "X/XXXXXXXX" string. Used by
+// the mid-stream live add-table flow (ADR-0030) to capture the
+// active stream's slot position before a publication change, so the
+// orchestrator can verify the subsequent snapshot LSN is at or
+// beyond the slot's current confirmed-flush position. If that
+// invariant ever fails, events on the new table in
+// [snapshot-LSN, confirmed_flush_lsn] would be silently dropped;
+// the live-mode preflight catches it loudly instead.
+//
+// Returns a clear error when the slot doesn't exist (typo on the
+// operator side, or a fresh stream that hasn't created its slot
+// yet). Returns the empty string when the slot exists but
+// confirmed_flush_lsn is NULL — fresh slot with no consumer
+// progress yet; the caller treats that as "no floor".
+//
+// Discovered structurally on the pipeline side via slotPositionReader;
+// engines without replication slots simply omit the method.
+func (Engine) ReadSlotPosition(ctx context.Context, dsn, slotName string) (string, error) {
+	if slotName == "" {
+		return "", errors.New("postgres: read slot position: slot name is empty")
+	}
+	cfg, err := parseDSN(dsn)
+	if err != nil {
+		return "", err
+	}
+	db, err := openDB(ctx, cfg)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = db.Close() }()
+
+	const q = `
+		SELECT COALESCE(confirmed_flush_lsn::text, '')
+		FROM   pg_replication_slots
+		WHERE  slot_name = $1`
+	var lsn string
+	switch err := db.QueryRowContext(ctx, q, slotName).Scan(&lsn); {
+	case errors.Is(err, sql.ErrNoRows):
+		return "", fmt.Errorf("postgres: read slot position: slot %q not found in pg_replication_slots — verify the active stream's slot name", slotName)
+	case err != nil:
+		return "", fmt.Errorf("postgres: read slot position: %w", err)
+	}
+	return lsn, nil
 }
 
 // OpenSlotManager returns a [SlotManager] bound to the database

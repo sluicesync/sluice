@@ -88,6 +88,49 @@ type slotDropper interface {
 	OpenSlotManager(ctx context.Context, dsn string) (ir.SlotManager, error)
 }
 
+// slotPositionReader is the optional engine-side surface for reading
+// the active stream's slot position before a live mid-stream add-
+// table. Used by [AddTable.LiveMode] to capture the slot's
+// confirmed_flush_lsn at the moment publication-add is about to
+// run, so the orchestrator can verify the subsequent snapshot LSN
+// has not regressed past it (which would silently drop events on
+// the new table). PG implements via SELECT confirmed_flush_lsn FROM
+// pg_replication_slots WHERE slot_name = ...; engines without slots
+// leave it unimplemented and live mode refuses on those engines via
+// the publicationAdder gate. See ADR-0030.
+type slotPositionReader interface {
+	ReadSlotPosition(ctx context.Context, dsn, slotName string) (string, error)
+}
+
+// snapshotLSNExtractor is the optional engine-side surface for
+// extracting the consistent-point LSN out of a snapshot stream's
+// opaque [ir.Position] token. Used by [AddTable.LiveMode] to verify
+// the snapshot-LSN ≥ slot-confirmed-flush-LSN invariant (ADR-0030).
+// PG implements via JSON-decoding its position envelope; engines
+// without LSN-shaped positions return ("", false, nil).
+//
+// The orchestrator stays engine-neutral by treating absence of this
+// interface as "no LSN floor available, skip the check". Live mode
+// refuses up-front on engines that don't implement publicationAdder,
+// so in practice the only engine that opts into live mode also
+// implements this surface.
+type snapshotLSNExtractor interface {
+	ExtractSnapshotLSN(pos ir.Position) (lsn string, ok bool, err error)
+}
+
+// lsnComparer is the optional engine-side surface for comparing two
+// position-token LSN strings. Used in conjunction with
+// [snapshotLSNExtractor] and [slotPositionReader] to enforce the
+// snapshot-LSN ≥ slot-confirmed-flush-LSN invariant on live add-
+// table without the orchestrator needing to parse engine-specific
+// LSN encodings.
+//
+// Returns -1 if a < b, 0 if equal, +1 if a > b. PG implements via
+// pglogrepl.ParseLSN comparison; engines without slots omit it.
+type lsnComparer interface {
+	CompareLSN(a, b string) (int, error)
+}
+
 // AddTable is the orchestrator for the mid-stream add-table flow.
 // Construct the value, then call Run with a context. AddTable does
 // not retain state between Run calls — call it once per add.
@@ -140,6 +183,22 @@ type AddTable struct {
 	// summary) without modifying the source publication, the
 	// target schema, or capturing a snapshot.
 	DryRun bool
+
+	// LiveMode, when true, lifts the Phase 1 conservative refusal
+	// of an active stream and runs add-table against a stream that
+	// is currently consuming WAL. Phase 2 of the mid-stream add-
+	// table feature; see ADR-0030 for the correctness story
+	// (publication-add-then-snapshot ordering on PG; the idempotent
+	// applier absorbs the [snapshot-LSN, slot-LSN] overlap on the
+	// new table).
+	//
+	// Trade-off: LiveMode skips the `stop_requested_at` refusal in
+	// favour of an explicit invariant check (snapshot-LSN ≥ slot
+	// confirmed_flush_lsn captured at publication-add time). PG-only
+	// in this phase — engines without publications refuse with a
+	// clear error directing the operator at the drained add-table
+	// flow. The CLI flag is `--no-drain` on `sluice schema add-table`.
+	LiveMode bool
 }
 
 // Run executes the add-table flow. Returns nil on success or a
@@ -165,13 +224,16 @@ func (a *AddTable) Run(ctx context.Context) error {
 	)
 
 	// ---- 1. Verify the stream exists and is not actively running.
+	// In live mode the active-stream refusal is skipped in favour of
+	// the snapshot-LSN ≥ slot-LSN invariant captured below.
 	applier, err := a.Target.OpenChangeApplier(ctx, a.TargetDSN)
 	if err != nil {
 		return wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: add-table: open target applier: %w", err))
 	}
 	defer closeIf(applier)
 
-	if err := a.preflightStream(ctx, applier); err != nil {
+	preflight, err := a.preflightStream(ctx, applier)
+	if err != nil {
 		return err
 	}
 
@@ -265,6 +327,18 @@ func (a *AddTable) Run(ctx context.Context) error {
 		slog.String("position_token", stream.Position.Token),
 	)
 
+	// ---- 5a. Live-mode invariant: snapshot-LSN ≥ slot
+	// confirmed_flush_lsn captured before publication-add. ADR-0030.
+	// The standard ordering (publication-add → snapshot) cannot trip
+	// this in practice, but the explicit check pins the invariant so
+	// a future regression in the flow's ordering fails loudly rather
+	// than producing silent drift on the new table.
+	if a.LiveMode {
+		if err := a.verifyLiveModeLSNInvariant(ctx, preflight.slotConfirmedFlushLSN, stream.Position); err != nil {
+			return err
+		}
+	}
+
 	// ---- 6. Bulk-copy the single table. runBulkCopy creates the
 	// table (IF NOT EXISTS), copies rows, syncs identity sequences,
 	// emits indexes and FKs scoped to scoped.Tables. FKs to existing
@@ -284,10 +358,17 @@ func (a *AddTable) Run(ctx context.Context) error {
 		)
 	}
 
-	slog.InfoContext(ctx, "add-table: complete; resume the stream with `sluice sync start --resume` to pick up CDC for the new table",
-		slog.String("table", a.TableName),
-		slog.String("stream_id", a.StreamID),
-	)
+	if a.LiveMode {
+		slog.InfoContext(ctx, "add-table: live add complete; the active stream's slot will pick up new-table events on its next consumption",
+			slog.String("table", a.TableName),
+			slog.String("stream_id", a.StreamID),
+		)
+	} else {
+		slog.InfoContext(ctx, "add-table: complete; resume the stream with `sluice sync start --resume` to pick up CDC for the new table",
+			slog.String("table", a.TableName),
+			slog.String("stream_id", a.StreamID),
+		)
+	}
 	return nil
 }
 
@@ -312,21 +393,39 @@ func (a *AddTable) validate() error {
 	return nil
 }
 
-// preflightStream verifies the active stream's row exists on the
-// target and that no `sync stop` is currently in flight. Refuses
-// loudly on either failure — the operator is expected to have run
-// `sluice sync stop --wait` before invoking add-table, which leaves
-// the row present and the stop flag cleared.
+// addTablePreflight is the orchestrator-side state captured during
+// the stream pre-flight: the active stream exists, and (in live
+// mode) the active stream's slot confirmed_flush_lsn at the moment
+// publication-add is about to run. The captured LSN feeds the
+// snapshot-LSN ≥ slot-LSN invariant check after the snapshot opens.
 //
-// We intentionally do NOT try to detect a running streamer beyond
-// the in-flight stop signal: the live-detection problem is racy and
-// belongs to the Phase 2 live add-table work. The CLI surface
-// nudges operators toward `sync stop --wait` first; this check
-// catches the obvious failure mode (operator forgot the drain).
-func (a *AddTable) preflightStream(ctx context.Context, applier ir.ChangeApplier) error {
+// Empty slotConfirmedFlushLSN means "no floor" — either the engine
+// doesn't expose the surface (drained mode), or the slot exists but
+// has not yet acked any consumer progress.
+type addTablePreflight struct {
+	slotConfirmedFlushLSN string
+}
+
+// preflightStream verifies the active stream's row exists on the
+// target. In drained (default) mode it also refuses if no `sync
+// stop` is in flight, surfacing the operator-friendly "drain first"
+// message. In live mode (`LiveMode=true`, ADR-0030) the active-
+// stream refusal is skipped in favour of three tighter checks:
+//
+//  1. the source engine must implement publicationAdder — engines
+//     without publications (MySQL) get a clear PG-only error here;
+//  2. the source engine must implement slotPositionReader — needed
+//     to capture the slot's confirmed_flush_lsn for the invariant
+//     check that fires after the snapshot opens;
+//  3. the slot's confirmed_flush_lsn is captured (best-effort: an
+//     empty string means "no floor", which the invariant check
+//     accepts).
+//
+// Returns the captured pre-flight state for use later in Run.
+func (a *AddTable) preflightStream(ctx context.Context, applier ir.ChangeApplier) (addTablePreflight, error) {
 	streams, err := applier.ListStreams(ctx)
 	if err != nil {
-		return wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: add-table: list streams: %w", err))
+		return addTablePreflight{}, wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: add-table: list streams: %w", err))
 	}
 	var found bool
 	for _, st := range streams {
@@ -336,9 +435,21 @@ func (a *AddTable) preflightStream(ctx context.Context, applier ir.ChangeApplier
 		}
 	}
 	if !found {
-		return fmt.Errorf("pipeline: add-table: no stream %q on target — verify --stream-id matches the active stream's id (run `sluice sync status` to list streams)", a.StreamID)
+		return addTablePreflight{}, fmt.Errorf("pipeline: add-table: no stream %q on target — verify --stream-id matches the active stream's id (run `sluice sync status` to list streams)", a.StreamID)
 	}
 
+	if a.LiveMode {
+		return a.preflightLive(ctx)
+	}
+	return addTablePreflight{}, a.preflightDrained(ctx, applier)
+}
+
+// preflightDrained applies the Phase 1 conservative refusal: the
+// stream must not have an in-flight `sync stop`. The operator is
+// expected to have run `sluice sync stop --wait` before invoking
+// add-table, which leaves the row present and the stop flag
+// cleared.
+func (a *AddTable) preflightDrained(ctx context.Context, applier ir.ChangeApplier) error {
 	reader, ok := applier.(stopFlagReader)
 	if !ok {
 		// Engine doesn't expose the stop-flag surface. We can't
@@ -354,8 +465,108 @@ func (a *AddTable) preflightStream(ctx context.Context, applier ir.ChangeApplier
 		return wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: add-table: read stop flag: %w", err))
 	}
 	if stopRequested {
-		return fmt.Errorf("pipeline: add-table: stream %q has an in-flight stop request (stop_requested_at IS NOT NULL) — wait for `sluice sync stop --wait` to drain before running add-table", a.StreamID)
+		return fmt.Errorf("pipeline: add-table: stream %q has an in-flight stop request (stop_requested_at IS NOT NULL) — wait for `sluice sync stop --wait` to drain before running add-table (or pass --no-drain to use Phase 2 live add)", a.StreamID)
 	}
+	return nil
+}
+
+// preflightLive applies the live-mode (ADR-0030) refusals and
+// captures the slot confirmed_flush_lsn that will floor the
+// snapshot-LSN invariant check. PG-only in this phase: engines
+// without publications refuse here with a clear error directing the
+// operator at the drained add-table flow.
+func (a *AddTable) preflightLive(ctx context.Context) (addTablePreflight, error) {
+	if _, ok := a.Source.(publicationAdder); !ok {
+		return addTablePreflight{}, fmt.Errorf(
+			"pipeline: add-table: --no-drain requires a publication-bearing source engine; %q has no publication concept. Phase 2 live add is PG-only in this release; use the drained add-table flow (`sluice sync stop --wait`, then `sluice schema add-table` without --no-drain) for MySQL sources",
+			a.Source.Name())
+	}
+
+	reader, ok := a.Source.(slotPositionReader)
+	if !ok {
+		return addTablePreflight{}, fmt.Errorf(
+			"pipeline: add-table: --no-drain requires the source engine to expose ReadSlotPosition; %q does not. This is a code-side guarantee on PG; the absence indicates a build with the engine surface stripped — file an issue",
+			a.Source.Name())
+	}
+
+	slotName := a.activeSlotName()
+	lsn, err := reader.ReadSlotPosition(ctx, a.SourceDSN, slotName)
+	if err != nil {
+		return addTablePreflight{}, wrapWithHint(PhaseConnect, fmt.Errorf(
+			"pipeline: add-table: --no-drain: read slot position for %q: %w",
+			slotName, err))
+	}
+	slog.InfoContext(ctx, "add-table: live mode: captured active-stream slot position",
+		slog.String("slot", slotName),
+		slog.String("confirmed_flush_lsn", lsn),
+	)
+	return addTablePreflight{slotConfirmedFlushLSN: lsn}, nil
+}
+
+// activeSlotName returns the name of the slot the active stream is
+// consuming from. Phase 2 assumes the default `sluice_slot` —
+// matches the streamer's default — until an operator surface for
+// per-stream slot naming surfaces. Operators using a custom slot on
+// `sync start` would also need a custom slot read here; tracked as
+// a follow-up if real demand surfaces.
+func (a *AddTable) activeSlotName() string {
+	return "sluice_slot"
+}
+
+// verifyLiveModeLSNInvariant enforces the live-mode invariant
+// snapshot-LSN ≥ slotConfirmedFlushLSN. ADR-0030's correctness
+// story explains why publication-add → snapshot ordering keeps the
+// invariant in practice; this check is the test-able shape of a
+// regression in that ordering.
+//
+// Skipped (with a debug log) when:
+//   - the active slot's confirmed_flush_lsn was empty at preflight
+//     time (no floor to enforce); or
+//   - the source engine doesn't expose snapshotLSNExtractor /
+//     lsnComparer (fall-through; the engine surface guarantees the
+//     check is meaningful on PG).
+func (a *AddTable) verifyLiveModeLSNInvariant(ctx context.Context, slotLSN string, snapshotPos ir.Position) error {
+	if slotLSN == "" {
+		slog.DebugContext(ctx, "add-table: live mode: slot confirmed_flush_lsn empty; skipping snapshot-LSN ≥ slot-LSN invariant check")
+		return nil
+	}
+
+	extractor, ok := a.Source.(snapshotLSNExtractor)
+	if !ok {
+		slog.DebugContext(ctx, "add-table: live mode: source engine does not expose ExtractSnapshotLSN; skipping invariant check",
+			slog.String("source", a.Source.Name()),
+		)
+		return nil
+	}
+	snapshotLSN, ok, err := extractor.ExtractSnapshotLSN(snapshotPos)
+	if err != nil {
+		return fmt.Errorf("pipeline: add-table: --no-drain: extract snapshot LSN: %w", err)
+	}
+	if !ok || snapshotLSN == "" {
+		slog.DebugContext(ctx, "add-table: live mode: snapshot position has no LSN; skipping invariant check")
+		return nil
+	}
+
+	comparer, ok := a.Source.(lsnComparer)
+	if !ok {
+		slog.DebugContext(ctx, "add-table: live mode: source engine does not expose CompareLSN; skipping invariant check",
+			slog.String("source", a.Source.Name()),
+		)
+		return nil
+	}
+	cmp, err := comparer.CompareLSN(snapshotLSN, slotLSN)
+	if err != nil {
+		return fmt.Errorf("pipeline: add-table: --no-drain: compare LSNs (snapshot=%q, slot=%q): %w", snapshotLSN, slotLSN, err)
+	}
+	if cmp < 0 {
+		return fmt.Errorf(
+			"pipeline: add-table: --no-drain: snapshot LSN %s is behind active stream's slot confirmed_flush_lsn %s; events on table %q in [snapshot, slot] would be silently dropped. This indicates a regression in the publication-add-then-snapshot ordering (ADR-0030); refusing to proceed",
+			snapshotLSN, slotLSN, a.TableName)
+	}
+	slog.InfoContext(ctx, "add-table: live mode: snapshot-LSN ≥ slot-LSN invariant satisfied",
+		slog.String("snapshot_lsn", snapshotLSN),
+		slog.String("slot_confirmed_flush_lsn", slotLSN),
+	)
 	return nil
 }
 
@@ -522,12 +733,17 @@ func (a *AddTable) logDryRun(ctx context.Context, scoped *ir.Schema) error {
 		slog.Bool("primary_key", t.PrimaryKey != nil),
 		slog.Int("secondary_indexes", len(t.Indexes)),
 		slog.Int("foreign_keys", len(t.ForeignKeys)),
+		slog.Bool("live_mode", a.LiveMode),
 	)
 	if _, ok := a.Source.(publicationAdder); ok {
 		slog.InfoContext(ctx, "dry run: add-table: would extend source publication via ALTER PUBLICATION ... ADD TABLE",
 			slog.String("table", t.Name),
 		)
 	}
-	slog.InfoContext(ctx, "dry run: add-table: would capture snapshot, bulk-copy rows, drop temp slot, then nudge operator to `sluice sync start --resume`")
+	if a.LiveMode {
+		slog.InfoContext(ctx, "dry run: add-table: live mode (--no-drain): would capture active stream's slot confirmed_flush_lsn, capture snapshot, verify snapshot-LSN ≥ slot-LSN invariant, bulk-copy rows, drop temp slot")
+	} else {
+		slog.InfoContext(ctx, "dry run: add-table: would capture snapshot, bulk-copy rows, drop temp slot, then nudge operator to `sluice sync start --resume`")
+	}
 	return nil
 }

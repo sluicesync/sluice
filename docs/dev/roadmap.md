@@ -10,9 +10,15 @@ Each entry has the same shape: a one-line summary, a *why* (the user-visible pay
 
 For continuity when a chunk references "the previous work":
 
+### Mid-stream add-table — Phase 2 (live add, no drain) — PG
+
+- **`sluice schema add-table TABLE --stream-id ID --no-drain`** — runs add-table against an actively-streaming sync without first running `sync stop --wait`. Strategy C variant (c) from the proto-ADR: single slot, publication-add-then-snapshot ordering. PG-only in this release; MySQL sources still require the drained workflow (separate chunk: streamer-side filter-flip mechanism). See [`adr-0030-mid-stream-live-add-table.md`](adr/adr-0030-mid-stream-live-add-table.md).
+- **New surfaces.** Pipeline-side optional interfaces `slotPositionReader` / `snapshotLSNExtractor` / `lsnComparer` so engines opt into the live-mode invariant check structurally. `Postgres.Engine.ReadSlotPosition` reads `confirmed_flush_lsn` from `pg_replication_slots`; `Postgres.Engine.ExtractSnapshotLSN` and `Postgres.Engine.CompareLSN` close the loop without leaking the engine's position envelope into the orchestrator.
+- **Operator safeguards.** Live mode refuses on engines without `publicationAdder` (clear PG-only error directing at the drained flow). Captures the active stream's slot `confirmed_flush_lsn` before publication-add; verifies snapshot-LSN ≥ slot-LSN after the snapshot opens — refuses loudly if the invariant fails (would silently drop events on the new table; ADR-0030 explains why standard ordering can't trip this in practice but the check pins the invariant against future regressions).
+
 ### Mid-stream add-table (Phase 1 MVP)
 
-- **`sluice schema add-table TABLE --stream-id ID`** — brings a new source table into an active CDC stream's scope without a destructive `--reset-target-data` cycle. Drained-stream workflow only (Phase 1): operator runs `sync stop --wait`, then `schema add-table`, then `sync start --resume`. Live add-table without the drain is Phase 2 (Strategy B / C from the proto-ADR). Implements the design in `docs/dev/design-mid-stream-add-table.md`.
+- **`sluice schema add-table TABLE --stream-id ID`** — brings a new source table into an active CDC stream's scope without a destructive `--reset-target-data` cycle. Drained-stream workflow only (Phase 1): operator runs `sync stop --wait`, then `schema add-table`, then `sync start --resume`. Live add-table without the drain shipped in Phase 2 (entry above). Implements the design in `docs/dev/design-mid-stream-add-table.md`.
 - **New surfaces.** `pipeline.AddTable` orchestrator (mirrors `Migrator` shape); pipeline-side optional interfaces `publicationAdder` / `snapshotSlotOpener` / `slotDropper` so engines opt in structurally. `Postgres.Engine.AddPublicationTables` issues `ALTER PUBLICATION ... ADD TABLE` (additive; existing scope untouched; idempotent on partial-add re-run). MySQL participates with no engine surface change — binlog already covers every table.
 - **Operator safeguards.** Refuses if no row exists for the supplied `--stream-id` (catches typos / wrong-target). Refuses if `stop_requested_at` is set (catches "forgot to drain"). Refuses if the target table already has rows (`TableEmptyChecker` preflight, same shape as cold-start). Refuses if the named table doesn't exist on the source (catches "ran add-table before CREATE TABLE landed"). All refusals surface clear messages with recovery steps. Typed-confirmation prompt mirroring `--reset-target-data`'s friction tier; `--yes` bypasses.
 - **Persisted position is intentionally NOT updated.** The stream's existing `sluice_cdc_state` position is still the right resume point for the other tables; the applier's idempotent upsert handles the [persisted_LSN, snapshot_LSN] overlap on the new table on resume.
@@ -253,16 +259,18 @@ Remaining size ~600-1000 LOC for 6.2 + 6.3 + a key-management ADR.
 
 ---
 
-### 3. Mid-stream add-table — Phase 2 (live add, no drain)
+### 3. Mid-stream add-table — MySQL Phase 2 (live add for binlog sources)
 
-**Why.** Phase 1 (drained-stream add-table) shipped — see "Recently landed". Phase 2 removes the `sluice sync stop --wait` precondition by coordinating a brief CDC pause so the snapshot LSN aligns with the in-flight stream's position. Useful for high-availability workloads that can't tolerate the ~seconds-of-latency drain that Phase 1 requires.
+**Why.** PG Phase 2 (`--no-drain`) shipped — see "Recently landed" + ADR-0030. The PG mechanism (publication-add-then-snapshot) doesn't translate to MySQL: binlog auto-includes every table, so the gate is in the streamer's table filter (`--include-table`/`--exclude-table`), not in a publication.
 
-**What.** Either Strategy B (in-stream snapshot alongside the live slot, atomic publication scope swap) or Strategy C (coordinated LSN handoff via a "pause at LSN" CDC-reader API) from the proto-ADR. Both are non-trivial; pick based on real operator demand and which one is easier to test deterministically.
+**What.** Either:
+- A streamer-side filter-flip: tell the running streamer "now also include table foo" via the control table or signal channel, extending `applyTableFilter`'s scope mid-run; the bulk-copy of the new table runs alongside via the same temp-snapshot pattern Phase 1 uses for MySQL.
+- Or accept the no-filter default (already permissive on MySQL): in which case the only mid-stream gap is the schema cache, and the WARN-and-skip-then-pick-up pattern from ADR-0021 might suffice.
 
 **Gotchas.**
-- The brief pause-window must be small enough that operators don't notice; multi-second pauses defeat the point.
-- Strategy B's atomic publication-add is PG-only; MySQL needs a different shape (binlog auto-includes everything; the streamer's table-filter is the gate).
-- Concurrent add-tables (two operators racing) need a lock or the existing serialisation guarantees of `ALTER PUBLICATION`. Worth a multi-operator test.
+- MySQL binlog is positionally addressed; there's no per-event publication membership check. Events on the new table arrive whether or not sluice is "ready" for them. Filter-flip + idempotent applier handles overlap the same way ADR-0010 does for PG.
+- Concurrent add-tables (two operators racing) for different tables: filter-flip should serialise on the control-table row.
+- VStream (PlanetScale) is a separate code path; treat as Phase 2.5 if real demand surfaces.
 
 ---
 

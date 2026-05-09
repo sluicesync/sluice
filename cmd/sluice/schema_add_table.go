@@ -37,10 +37,12 @@ import (
 // typed confirmation (the table name) unless --yes is supplied,
 // mirroring the friction tier of `--reset-target-data`.
 //
-// Phase 1 is intentionally narrow: one table per invocation, the
-// stream must be drained first (live add-table is Phase 2), and the
-// source/target must be the same engine pair the active stream uses.
-// See the proto-ADR for the design space.
+// Phase 1 (default) is intentionally narrow: one table per invocation,
+// the stream must be drained first, and the source/target must be the
+// same engine pair the active stream uses. Phase 2 (`--no-drain`,
+// PG-only, ADR-0030) lifts the drain precondition for high-availability
+// workloads. See `docs/dev/design-mid-stream-add-table.md` and ADR-0030
+// for the design space and correctness story.
 type SchemaAddTableCmd struct {
 	SourceDriver string `help:"Source engine name (e.g. mysql, postgres). See 'sluice engines'." required:"" placeholder:"NAME" group:"source"`
 	Source       string `help:"Source database DSN." required:"" env:"SLUICE_SOURCE" placeholder:"DSN" group:"source"`
@@ -55,6 +57,8 @@ type SchemaAddTableCmd struct {
 	ExprOverride []string `help:"Replace a generated column's body with operator-supplied target-dialect text (repeatable). Format: 'TABLE.COLUMN=EXPRESSION'. Emitted verbatim; ADR-0016 translator skips overridden columns." placeholder:"TABLE.COLUMN=EXPRESSION"`
 
 	SlotName string `help:"Override the temporary replication-slot name used for the snapshot capture on engines with a slot concept (Postgres). Defaults to 'sluice_addtable_<table>'. Engines without slots ignore this flag." placeholder:"NAME"`
+
+	NoDrain bool `help:"Phase 2 live add: run add-table against an actively-streaming sync without first running 'sync stop --wait'. PG-only in this release; MySQL sources still require the drained workflow. See ADR-0030 for the correctness story." name:"no-drain"`
 
 	DryRun bool `help:"Print the plan (which table, source publication update, target DDL summary) without modifying the source publication, target schema, or capturing a snapshot." short:"n"`
 	Yes    bool `help:"Skip the typed-confirmation prompt." short:"y"`
@@ -121,6 +125,7 @@ func (s *SchemaAddTableCmd) Run(g *Globals) error {
 		ExpressionMappings: exprMappings,
 		SlotName:           s.SlotName,
 		DryRun:             s.DryRun,
+		LiveMode:           s.NoDrain,
 	}
 	return add.Run(kongContext())
 }
