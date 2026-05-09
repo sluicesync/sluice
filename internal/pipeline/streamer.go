@@ -286,6 +286,26 @@ type Streamer struct {
 	// (PlanetScale Postgres, Aurora when superuser-restricted, etc.),
 	// so operators of those services need an explicit override.
 	PatroniMode string
+
+	// TargetSchema is the per-source target-schema namespace
+	// (`--target-schema NAME`, ADR-0031). When set, every emitted
+	// CREATE TABLE / ALTER TABLE / CREATE INDEX / CREATE TYPE
+	// prefixes its identifier with the schema name. Used to land
+	// multiple sluice streams on the same target without table-name
+	// collisions (Shape B microservices → analytics warehouse).
+	//
+	// PG-only: engines whose [ir.Capabilities.SchemaScope] is not
+	// [ir.SchemaScopeNamespaced] (today: MySQL) refuse the field at
+	// validate time with a clear "use a different --target DSN
+	// database to namespace per-source streams" message. Empty
+	// preserves today's behaviour (use the target DSN's default
+	// schema, typically `public`).
+	//
+	// The control tables (`sluice_cdc_state`) stay in the DSN's
+	// default schema regardless — they're per-target metadata, not
+	// per-stream user data, and multiple target-schemas on one DSN
+	// share a single state table. Stream-id keys disambiguate.
+	TargetSchema string
 }
 
 // Run executes a snapshot+CDC stream. See [Streamer] for the full
@@ -403,6 +423,34 @@ func (s *Streamer) Run(ctx context.Context) error {
 	if !s.DryRun {
 		if setter, ok := applier.(slotNameSetter); ok {
 			setter.SetSlotName(s.SlotName)
+		}
+	}
+
+	// ---- 2.7. Stream-id collision detection + source-DSN fingerprint
+	// recording (ADR-0031, Phase 2 of multi-source).
+	// Computes the truncated SHA-256 of the source DSN's host+port+
+	// database tuple, then:
+	//   1. Lists existing streams; refuses if the stream-id row's
+	//      recorded fingerprint differs from the new one (the typo /
+	//      wrong-source case).
+	//   2. Records the fingerprint on the applier so subsequent
+	//      writePositionTx calls populate the sluice_cdc_state row's
+	//      source_dsn_fingerprint column.
+	// Skipped on DryRun (read-only; no fingerprint write expected).
+	// Engines without fingerprint support no-op cleanly: an empty
+	// fingerprint passes the collision check and the recorder type-
+	// assertion fails closed.
+	if !s.DryRun {
+		fingerprint := fingerprintSourceDSN(s.SourceDSN)
+		if fingerprint != "" {
+			existing, err := applier.ListStreams(ctx)
+			if err != nil {
+				return wrapWithHint(PhaseSchemaApply, fmt.Errorf("pipeline: list streams for fingerprint check: %w", err))
+			}
+			if err := checkStreamIDCollision(streamID, fingerprint, existing); err != nil {
+				return wrapWithHint(PhaseSchemaApply, err)
+			}
+			applySourceFingerprint(applier, fingerprint)
 		}
 	}
 
@@ -730,14 +778,23 @@ func truncateDryRunToken(token string, maxLen int) string {
 // openApplier returns the applier to use plus a flag indicating
 // whether the Streamer owns its lifecycle. Owns => Streamer must
 // Close it. Borrowed => caller is responsible.
+//
+// The applier receives the operator-supplied `--target-schema`
+// override (ADR-0031): user-data INSERT/UPDATE/DELETE land in the
+// per-source schema, while `sluice_cdc_state` stays in the DSN's
+// default schema. The engine-side [SchemaSetter] is the contract
+// that splits the two — PG's applier preserves the original
+// (control-table) schema before applying the override to the
+// user-data schema.
 func (s *Streamer) openApplier(ctx context.Context) (ir.ChangeApplier, bool, error) {
 	if s.Applier != nil {
 		// Pre-supplied appliers are typically test stubs whose
 		// lifecycle the caller owns; we still hand them the byte cap
-		// so a stub that wants to honour it can. Real production
-		// callers leave Applier nil and hit the OpenChangeApplier
-		// branch below.
+		// + target-schema override so a stub that wants to honour
+		// them can. Real production callers leave Applier nil and
+		// hit the OpenChangeApplier branch below.
 		applyMaxBufferBytes(s.Applier, s.MaxBufferBytes)
+		applyTargetSchema(s.Applier, s.TargetSchema)
 		return s.Applier, false, nil
 	}
 	a, err := s.Target.OpenChangeApplier(ctx, s.TargetDSN)
@@ -745,6 +802,7 @@ func (s *Streamer) openApplier(ctx context.Context) (ir.ChangeApplier, bool, err
 		return nil, false, wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: open target change applier: %w", err))
 	}
 	applyMaxBufferBytes(a, s.MaxBufferBytes)
+	applyTargetSchema(a, s.TargetSchema)
 	return a, true, nil
 }
 
@@ -868,12 +926,14 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 		_ = stream.Close()
 		return nil, wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: open target schema writer: %w", err))
 	}
+	applyTargetSchema(sw, s.TargetSchema)
 	rw, err := s.Target.OpenRowWriter(ctx, s.TargetDSN)
 	if err != nil {
 		closeIf(sw)
 		_ = stream.Close()
 		return nil, wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: open target row writer: %w", err))
 	}
+	applyTargetSchema(rw, s.TargetSchema)
 	applyMaxBufferBytes(rw, s.MaxBufferBytes)
 
 	if s.ResetTargetData {
@@ -967,6 +1027,9 @@ func (s *Streamer) validate() error {
 		return errors.New("pipeline: Streamer.TargetDSN is empty")
 	case s.Source.Capabilities().CDC == ir.CDCNone:
 		return fmt.Errorf("pipeline: Streamer.Source engine %q declares CDC=None", s.Source.Name())
+	}
+	if err := validateTargetSchema(s.Target, s.TargetSchema); err != nil {
+		return err
 	}
 	return nil
 }

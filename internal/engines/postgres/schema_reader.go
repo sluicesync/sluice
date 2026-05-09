@@ -43,6 +43,24 @@ func (r *SchemaReader) Close() error {
 	return r.db.Close()
 }
 
+// SetSchema implements [ir.SchemaSetter]. Called by the pipeline
+// orchestrator when `--target-schema NAME` is set (ADR-0031) so the
+// reader queries pg_catalog / information_schema for the named
+// schema rather than the DSN's default. Empty input is a no-op
+// (preserves the DSN-derived default).
+//
+// On the source-read path (Migrator / Streamer / Previewer / Differ
+// reading the source DSN), the orchestrator deliberately does NOT
+// call SetSchema — only target-side reads (Differ's actual-target
+// schema read) get the override. The flag is target-namespacing
+// for multi-source aggregation, not a source-side schema selector.
+func (r *SchemaReader) SetSchema(name string) {
+	if name == "" {
+		return
+	}
+	r.schema = name
+}
+
 // ReadSchema queries pg_catalog and information_schema and returns a
 // fully populated IR Schema for the database/schema the reader is
 // bound to.

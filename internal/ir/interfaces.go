@@ -699,6 +699,57 @@ type StreamStatus struct {
 	// pre-date the column (best-effort fallback to the engine
 	// default `sluice_slot` is the caller's responsibility).
 	SlotName string
+
+	// SourceDSNFingerprint is the truncated SHA-256 hex of the
+	// stream's source DSN host+port+database tuple, recorded by the
+	// streamer on `sync start` (ADR-0031). Used for stream-id
+	// collision detection: if the same stream-id is reused with a
+	// different source DSN, the streamer refuses loudly. Empty for
+	// engines that don't implement the fingerprint surface and for
+	// legacy rows that pre-date the column (treated as "unknown —
+	// allow" by the collision check).
+	SourceDSNFingerprint string
+}
+
+// SchemaSetter is the optional surface a [SchemaReader], [SchemaWriter],
+// [RowReader], [RowWriter], or [ChangeApplier] can implement to accept
+// an operator-supplied schema-name override (`--target-schema NAME`,
+// ADR-0031). The pipeline orchestrator type-asserts on every Open*
+// return when a non-empty target-schema is set; engines that don't
+// implement the setter are expected to either expose [Capabilities].
+// SchemaScope = [SchemaScopeFlat] (so the orchestrator refuses the flag
+// upstream with a clear engine-not-supported error) or to no-op the
+// override.
+//
+// Engines whose schema concept is taken from the DSN (Postgres' `schema`
+// query parameter) implement this so the orchestrator can override
+// without DSN rewriting. The override applies to subsequent reads and
+// writes — implementations must not buffer schema-derived state before
+// the Open* return.
+//
+// PG implements; MySQL does not (no schema-vs-database distinction; the
+// orchestrator refuses `--target-schema` against MySQL targets).
+type SchemaSetter interface {
+	SetSchema(name string)
+}
+
+// SourceFingerprintRecorder is the optional surface a [ChangeApplier]
+// can implement to accept the source-DSN fingerprint the streamer
+// computes at startup. The fingerprint flows through to the per-target
+// `sluice_cdc_state` row's `source_dsn_fingerprint` column on every
+// position-write so a later `sync start` can detect a stream-id reused
+// with a different source (ADR-0031).
+//
+// Idempotent — the streamer may call this on every Run; the value
+// stays current across warm resumes. Empty input is allowed (no-op
+// set) and reflects the legacy / engine-not-supported case where no
+// fingerprint is recorded.
+//
+// PG implements; engines without fingerprint storage simply omit the
+// method (the orchestrator's collision check then no-ops for that
+// engine).
+type SourceFingerprintRecorder interface {
+	SetSourceDSNFingerprint(fingerprint string)
 }
 
 // SlotInfo describes one row of an engine's logical-replication slot

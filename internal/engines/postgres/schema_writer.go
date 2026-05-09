@@ -37,6 +37,32 @@ type SchemaWriter struct {
 	// when false, they're rejected with a clear "install postgis"
 	// error rather than silently coerced.
 	hasPostGIS bool
+	// schemaEnsured guards against repeat CREATE SCHEMA IF NOT EXISTS
+	// calls when the writer is reused across phases. Set on the first
+	// CreateTablesWithoutConstraints (or PreviewDDL — preview is
+	// idempotent and skips the ensure step).
+	schemaEnsured bool
+}
+
+// SetSchema implements [ir.SchemaSetter]. Called by the pipeline
+// orchestrator when `--target-schema NAME` is set (ADR-0031). Empty
+// input is treated as a no-op (preserves the writer's DSN-derived
+// default). Subsequent CreateTablesWithoutConstraints / CreateIndexes
+// / CreateConstraints emit DDL prefixed with the named schema.
+//
+// CreateTablesWithoutConstraints ensures the named schema exists via
+// `CREATE SCHEMA IF NOT EXISTS` before any table emit; calling
+// SetSchema after the schema has been ensured (re-set during a
+// resume, etc.) clears the ensured flag so the new schema is
+// validated on the next emit.
+func (w *SchemaWriter) SetSchema(name string) {
+	if name == "" {
+		return
+	}
+	if name != w.schema {
+		w.schemaEnsured = false
+	}
+	w.schema = name
 }
 
 // Close releases the underlying connection pool.
@@ -50,9 +76,17 @@ func (w *SchemaWriter) Close() error {
 // CreateTablesWithoutConstraints emits CREATE TYPE statements for any
 // enum columns, then CREATE TABLE for every table in s, in
 // deterministic (alphabetical) order.
+//
+// Ensures the writer's target schema exists before any DDL runs
+// (CREATE SCHEMA IF NOT EXISTS) — required when `--target-schema`
+// names a per-source namespace that may not exist on a fresh target.
+// Idempotent on schemas already in place.
 func (w *SchemaWriter) CreateTablesWithoutConstraints(ctx context.Context, s *ir.Schema) error {
 	if s == nil {
 		return errors.New("postgres: CreateTablesWithoutConstraints: schema is nil")
+	}
+	if err := w.ensureSchema(ctx); err != nil {
+		return err
 	}
 
 	// Phase 1a: enum types. We walk all columns and emit one
@@ -253,6 +287,29 @@ func (w *SchemaWriter) syncOneIdentity(ctx context.Context, table *ir.Table, col
 	if _, err := w.db.ExecContext(ctx, setvalQuery, tableArg, column, maxVal.Int64); err != nil {
 		return fmt.Errorf("setval: %w", err)
 	}
+	return nil
+}
+
+// ensureSchema emits `CREATE SCHEMA IF NOT EXISTS` for the writer's
+// configured schema. No-op for the default `public` schema (always
+// exists) and on subsequent calls within the same writer's lifetime
+// (schemaEnsured caches the success). Used by
+// CreateTablesWithoutConstraints to bootstrap a per-source namespace
+// when `--target-schema` (ADR-0031) names a schema that doesn't
+// exist yet on a fresh target.
+//
+// PG identifier-quoting via [quoteIdent] keeps schema names with
+// dashes / mixed case round-tripping cleanly through the catalog.
+func (w *SchemaWriter) ensureSchema(ctx context.Context) error {
+	if w.schemaEnsured || w.schema == "" || w.schema == "public" {
+		w.schemaEnsured = true
+		return nil
+	}
+	stmt := "CREATE SCHEMA IF NOT EXISTS " + quoteIdent(w.schema)
+	if _, err := w.db.ExecContext(ctx, stmt); err != nil {
+		return fmt.Errorf("postgres: ensure schema %q: %w", w.schema, err)
+	}
+	w.schemaEnsured = true
 	return nil
 }
 

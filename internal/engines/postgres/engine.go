@@ -376,10 +376,11 @@ func (Engine) OpenChangeApplier(ctx context.Context, dsn string) (ir.ChangeAppli
 		return nil, err
 	}
 	return &ChangeApplier{
-		db:           db,
-		schema:       cfg.schema,
-		pkCache:      make(map[string][]string),
-		colTypeCache: make(map[string]map[string]ir.Type),
+		db:            db,
+		schema:        cfg.schema,
+		controlSchema: cfg.schema,
+		pkCache:       make(map[string][]string),
+		colTypeCache:  make(map[string]map[string]ir.Type),
 	}, nil
 }
 

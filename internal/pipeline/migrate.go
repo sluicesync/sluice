@@ -210,6 +210,21 @@ type Migrator struct {
 	// is to refuse it, which would silently break otherwise-valid
 	// migrations). See ADR-0028.
 	MaxBufferBytes int64
+
+	// TargetSchema is the per-source target-schema namespace
+	// (`--target-schema NAME`, ADR-0031). When set, every emitted
+	// CREATE TABLE / ALTER TABLE / CREATE INDEX / CREATE TYPE
+	// prefixes its identifier with the schema name. Used to land
+	// multiple sluice streams on the same target without table-name
+	// collisions (Shape B microservices → analytics warehouse).
+	//
+	// PG-only: engines whose [ir.Capabilities.SchemaScope] is not
+	// [ir.SchemaScopeNamespaced] (today: MySQL) refuse the field at
+	// validate time with a clear "use a different --target DSN
+	// database to namespace per-source streams" message. Empty
+	// preserves today's behaviour (use the target DSN's default
+	// schema, typically `public`).
+	TargetSchema string
 }
 
 // Run executes the migration. Returns nil on success or a wrapped
@@ -242,6 +257,8 @@ func (m *Migrator) Run(ctx context.Context) error {
 	}
 
 	// ---- 1. Open and read source schema ----
+	// Source readers stay on the source DSN's schema — only the target
+	// side is namespaced under --target-schema (ADR-0031).
 	sr, err := m.Source.OpenSchemaReader(ctx, m.SourceDSN)
 	if err != nil {
 		return wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: open source schema reader: %w", err))
@@ -302,6 +319,7 @@ func (m *Migrator) Run(ctx context.Context) error {
 		return wrapWithHint(PhaseConnect, markFailed(ctx, rc, state, ir.MigrationPhasePending,
 			fmt.Errorf("pipeline: open target schema writer: %w", err)))
 	}
+	applyTargetSchema(sw, m.TargetSchema)
 	defer closeIf(sw)
 
 	rw, err := m.Target.OpenRowWriter(ctx, m.TargetDSN)
@@ -309,6 +327,7 @@ func (m *Migrator) Run(ctx context.Context) error {
 		return wrapWithHint(PhaseConnect, markFailed(ctx, rc, state, ir.MigrationPhasePending,
 			fmt.Errorf("pipeline: open target row writer: %w", err)))
 	}
+	applyTargetSchema(rw, m.TargetSchema)
 	applyMaxBufferBytes(rw, m.MaxBufferBytes)
 	defer closeIf(rw)
 
@@ -368,7 +387,7 @@ func (m *Migrator) Run(ctx context.Context) error {
 // before any target writers open so the operator gets a clean
 // refusal rather than a half-open connection set.
 func (m *Migrator) openResumeContext(ctx context.Context, resetting bool) (resumeContext, ir.MigrationState, bool, error) {
-	store, err := openMigrationStateStore(ctx, m.Target, m.TargetDSN)
+	store, err := openMigrationStateStore(ctx, m.Target, m.TargetDSN, m.TargetSchema)
 	if err != nil {
 		return resumeContext{}, ir.MigrationState{}, false, wrapWithHint(PhaseConnect, err)
 	}
@@ -651,6 +670,9 @@ func (m *Migrator) validate() error {
 		return errors.New("pipeline: TargetDSN is empty")
 	case m.Resume && m.ResetTargetData:
 		return errors.New("pipeline: --resume and --reset-target-data are mutually exclusive")
+	}
+	if err := validateTargetSchema(m.Target, m.TargetSchema); err != nil {
+		return err
 	}
 	return nil
 }

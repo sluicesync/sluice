@@ -88,6 +88,14 @@ type Differ struct {
 
 	// Out is the destination for the rendered diff. Required.
 	Out io.Writer
+
+	// TargetSchema is the per-source target-schema namespace
+	// (ADR-0031). When set, the diff's target-side schema reader is
+	// pinned to this schema, the missing-on-target DDL suggestions
+	// render schema-qualified, and the comparison runs against the
+	// target's per-source namespace rather than its DSN default.
+	// PG-only.
+	TargetSchema string
 }
 
 // DiffJSON is the JSON-format diff output. The shape is stable for
@@ -126,6 +134,9 @@ type DiffJSONCounts struct {
 // the ADR-0029 exit codes.
 func (d *Differ) Run(ctx context.Context) (*ir.SchemaDiff, error) {
 	if err := d.validate(); err != nil {
+		return nil, err
+	}
+	if err := validateTargetSchema(d.Target, d.TargetSchema); err != nil {
 		return nil, err
 	}
 
@@ -184,6 +195,7 @@ func (d *Differ) Run(ctx context.Context) (*ir.SchemaDiff, error) {
 	if err != nil {
 		return nil, wrapWithHint(PhaseConnect, fmt.Errorf("diff: open target schema reader: %w", err))
 	}
+	applyTargetSchema(tr, d.TargetSchema)
 	defer closeIf(tr)
 
 	actual, err := tr.ReadSchema(ctx)
@@ -202,7 +214,7 @@ func (d *Differ) Run(ctx context.Context) (*ir.SchemaDiff, error) {
 	// TABLE suggestions (MySQL/PG syntax) rather than a generic
 	// placeholder. PreviewDDL is optional; engines without it fall
 	// through to a simple comment.
-	missingDDL, missingColDDL, err := previewMissingDDL(ctx, d.Target, d.TargetDSN, expected, diff)
+	missingDDL, missingColDDL, err := previewMissingDDL(ctx, d.Target, d.TargetDSN, d.TargetSchema, expected, diff)
 	if err != nil {
 		return nil, err
 	}
@@ -290,7 +302,7 @@ type diffRenderOpts struct {
 // ([ir.DDLPreviewer] / [ir.ColumnDDLPreviewer]); the renderer falls
 // back to placeholder output in those cases. Errors from the
 // underlying preview calls are returned verbatim.
-func previewMissingDDL(ctx context.Context, target ir.Engine, dsn string, expected *ir.Schema, diff ir.SchemaDiff) (tableDDL map[string][]ir.DDLStatement, columnDDL map[string]string, err error) {
+func previewMissingDDL(ctx context.Context, target ir.Engine, dsn, targetSchema string, expected *ir.Schema, diff ir.SchemaDiff) (tableDDL map[string][]ir.DDLStatement, columnDDL map[string]string, err error) {
 	missingTables := diff.TablesMissing
 	missingCols := collectMissingColumns(diff)
 	if len(missingTables) == 0 && len(missingCols) == 0 {
@@ -301,6 +313,7 @@ func previewMissingDDL(ctx context.Context, target ir.Engine, dsn string, expect
 	if openErr != nil {
 		return nil, nil, wrapWithHint(PhaseConnect, fmt.Errorf("diff: open target schema writer: %w", openErr))
 	}
+	applyTargetSchema(sw, targetSchema)
 	defer closeIf(sw)
 
 	tableDDL, err = previewDDLForTables(ctx, sw, expected, missingTables)

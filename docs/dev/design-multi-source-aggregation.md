@@ -1,6 +1,18 @@
 # Design: multi-source aggregation
 
-**Status:** Proto-ADR / design exploration. Not yet a numbered ADR. Captures the design space, motivating use cases, and a phased implementation plan for sluice supporting multiple sources replicating into one target.
+**Status:** Phase 1 + Phase 2 shipped in v0.25.0 — see [ADR-0031](../adr/adr-0031-multi-source-aggregation-target-schema.md). This doc remains the proto-ADR / design-space reference for the remaining phases (per-table renaming, status-aggregation UX, schema-collision detection, Shape A sharded → consolidated).
+
+## Phase 1 + 2 status (v0.25.0)
+
+Shipped:
+- `--target-schema NAME` flag on `migrate`, `sync start`, `schema preview`, and `schema diff`. PG-only (engines whose `Capabilities().SchemaScope != SchemaScopeNamespaced` refuse the flag with a clear "use a different --target DSN database" message). Schema is auto-created via `CREATE SCHEMA IF NOT EXISTS`.
+- Type-name derivation (PG enums) namespaced through the schema — `customer_svc.accounts_status_enum`, `billing_svc.accounts_status_enum` coexist cleanly.
+- Stream-id collision detection: `sluice_cdc_state` grew a `source_dsn_fingerprint TEXT NULL` column (additive, idempotent migration). Streamer fingerprint check at startup refuses if the existing row's fingerprint differs from the incoming source's. Fingerprint is the truncated SHA-256 of host+port+database (user/password excluded so credential rotation doesn't trip false-positives).
+- New IR surfaces: `ir.SchemaSetter`, `ir.SourceFingerprintRecorder`, `ir.StreamStatus.SourceDSNFingerprint`. PG implements; MySQL deliberately doesn't.
+
+See ADR-0031 for the full design rationale, including the threat model and the controlSchema-vs-userDataSchema split on the PG applier (control table stays in the DSN's default schema; user-data INSERT/UPDATE/DELETE land in the per-source schema).
+
+## Context
 
 ## Context
 

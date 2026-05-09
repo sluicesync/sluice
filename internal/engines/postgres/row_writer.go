@@ -85,6 +85,18 @@ func (w *RowWriter) SetMaxBufferBytes(bytes int64) {
 	w.maxBufferBytes = bytes
 }
 
+// SetSchema implements [ir.SchemaSetter]. Called by the pipeline
+// orchestrator when `--target-schema NAME` is set (ADR-0031). The
+// row writer's bulk-load + DROP / TRUNCATE / DELETE statements
+// target the named schema rather than the DSN's default. Empty
+// input is a no-op.
+func (w *RowWriter) SetSchema(name string) {
+	if name == "" {
+		return
+	}
+	w.schema = name
+}
+
 // Close releases the underlying connection pool.
 func (w *RowWriter) Close() error {
 	if w.db == nil {

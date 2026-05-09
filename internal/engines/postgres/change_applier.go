@@ -72,8 +72,23 @@ import (
 // it consumes the change channel sequentially to preserve source
 // ordering. Concurrent calls on the same applier are not supported.
 type ChangeApplier struct {
-	db     *sql.DB
+	db *sql.DB
+	// schema is the namespace user-data INSERT/UPDATE/DELETE / TRUNCATE
+	// land in. Defaults to the DSN's `schema` query parameter (typically
+	// `public`); operator-overridable at startup via [SetSchema] when
+	// `--target-schema NAME` is supplied (ADR-0031). The override
+	// does NOT move the per-target sluice_cdc_state control table —
+	// see controlSchema.
 	schema string
+
+	// controlSchema is the namespace `sluice_cdc_state` lives in.
+	// Pinned to the DSN-derived schema at construction time; never
+	// moved by [SetSchema]. The split exists because multi-source
+	// aggregation (ADR-0031) wants per-source user-data schemas
+	// (`customer_svc.users`, `billing_svc.users`) but a single
+	// shared control table per target so cross-stream `sync status`
+	// keeps reading every recorded stream-id from one place.
+	controlSchema string
 
 	// slotName is the active stream's resolved replication-slot name,
 	// set by [SetSlotName] at Streamer startup. Threaded into every
@@ -86,6 +101,19 @@ type ChangeApplier struct {
 	// chain-handoff WritePosition before any sync start has run);
 	// the row's existing slot_name is preserved on the conflict path.
 	slotName string
+
+	// sourceFingerprint is the truncated SHA-256 hex of the streamer's
+	// source DSN host+port+database tuple, set by
+	// [SetSourceDSNFingerprint] at Streamer startup. Threaded into
+	// every [writePositionTx] call so the per-target sluice_cdc_state
+	// row's source_dsn_fingerprint column stays in sync with what
+	// the streamer is consuming. Used for stream-id collision
+	// detection (ADR-0031): a future `sync start` against the same
+	// target that supplies the same stream-id but a different source
+	// DSN will see a fingerprint mismatch on its ListStreams probe
+	// and refuse loudly. Empty preserves the row's existing value
+	// (legacy / engine-not-supported / pre-streamer chain handoff).
+	sourceFingerprint string
 
 	// pkCache maps "schema.table" → ordered list of PK column names.
 	// Populated lazily via a single information_schema query the
@@ -181,9 +209,16 @@ func (a *ChangeApplier) Close() error {
 }
 
 // EnsureControlTable creates the per-target sluice_cdc_state table
-// (in the applier's schema) if it doesn't exist. Idempotent.
+// (in the applier's controlSchema — the DSN-derived namespace, NOT
+// the operator-supplied --target-schema) if it doesn't exist.
+// Idempotent.
+//
+// The split between data schema and control schema (ADR-0031) means
+// `sluice_cdc_state` stays in `public` (or whatever the DSN selects)
+// even when user data lands in `customer_svc.users` etc. One control
+// table per target host serves multiple target-schema streams.
 func (a *ChangeApplier) EnsureControlTable(ctx context.Context) error {
-	return ensureControlTable(ctx, a.db, a.schema)
+	return ensureControlTable(ctx, a.db, a.controlSchema)
 }
 
 // ReadPosition returns the last persisted source position for
@@ -196,7 +231,7 @@ func (a *ChangeApplier) EnsureControlTable(ctx context.Context) error {
 // rationale for that envelope; the broker discriminates on the
 // embedded sentinel, not on Position.Engine.
 func (a *ChangeApplier) ReadPosition(ctx context.Context, streamID string) (ir.Position, bool, error) {
-	token, ok, err := readPosition(ctx, a.db, a.schema, streamID)
+	token, ok, err := readPosition(ctx, a.db, a.controlSchema, streamID)
 	if err != nil {
 		return ir.Position{}, false, err
 	}
@@ -211,7 +246,7 @@ func (a *ChangeApplier) ReadPosition(ctx context.Context, streamID string) (ir.P
 // of the table being absent — operators querying status against a
 // fresh target should see "no streams" rather than an error.
 func (a *ChangeApplier) ListStreams(ctx context.Context) ([]ir.StreamStatus, error) {
-	return listStreams(ctx, a.db, a.schema, engineNamePostgres)
+	return listStreams(ctx, a.db, a.controlSchema, engineNamePostgres)
 }
 
 // RequestStop flips the stop flag on the named stream's row. The
@@ -226,7 +261,7 @@ func (a *ChangeApplier) RequestStop(ctx context.Context, streamID string) error 
 	if streamID == "" {
 		return errors.New("postgres: applier: RequestStop: streamID is empty")
 	}
-	return requestStop(ctx, a.db, a.schema, streamID)
+	return requestStop(ctx, a.db, a.controlSchema, streamID)
 }
 
 // ReadStopRequested returns true when the named stream's row has a
@@ -236,7 +271,7 @@ func (a *ChangeApplier) RequestStop(ctx context.Context, streamID string) error 
 // set rules require an exported method to satisfy an interface from
 // another package — even when that interface is itself unexported.
 func (a *ChangeApplier) ReadStopRequested(ctx context.Context, streamID string) (bool, error) {
-	return readStopRequested(ctx, a.db, a.schema, streamID)
+	return readStopRequested(ctx, a.db, a.controlSchema, streamID)
 }
 
 // ClearStopRequested resets stop_requested_at to NULL for the named
@@ -248,7 +283,7 @@ func (a *ChangeApplier) ClearStopRequested(ctx context.Context, streamID string)
 	if streamID == "" {
 		return errors.New("postgres: applier: ClearStopRequested: streamID is empty")
 	}
-	return clearStopRequested(ctx, a.db, a.schema, streamID)
+	return clearStopRequested(ctx, a.db, a.controlSchema, streamID)
 }
 
 // ClearStream deletes the named stream's row from the per-target
@@ -259,7 +294,7 @@ func (a *ChangeApplier) ClearStream(ctx context.Context, streamID string) error 
 	if streamID == "" {
 		return errors.New("postgres: applier: ClearStream: streamID is empty")
 	}
-	return clearStream(ctx, a.db, a.schema, streamID)
+	return clearStream(ctx, a.db, a.controlSchema, streamID)
 }
 
 // WritePosition implements [ir.PositionWriter]: upserts the
@@ -283,7 +318,7 @@ func (a *ChangeApplier) WritePosition(ctx context.Context, streamID string, pos 
 	if err != nil {
 		return fmt.Errorf("postgres: applier: WritePosition: begin tx: %w", err)
 	}
-	if err := writePositionTx(ctx, tx, a.schema, streamID, pos.Token, a.slotName); err != nil {
+	if err := writePositionTx(ctx, tx, a.controlSchema, streamID, pos.Token, a.slotName, a.sourceFingerprint); err != nil {
 		_ = tx.Rollback()
 		return err
 	}
@@ -308,6 +343,34 @@ func (a *ChangeApplier) WritePosition(ctx context.Context, streamID string, pos 
 // fill it in before calling.
 func (a *ChangeApplier) SetSlotName(slotName string) {
 	a.slotName = slotName
+}
+
+// SetSchema implements [ir.SchemaSetter]. Records the per-source
+// target-schema namespace operator-supplied via `--target-schema NAME`
+// (ADR-0031). User-data INSERT/UPDATE/DELETE / TRUNCATE land in the
+// named schema; the per-target `sluice_cdc_state` table stays in the
+// applier's `controlSchema` (pinned at construction time). Empty
+// input is a no-op (preserves the DSN-derived default). Idempotent.
+func (a *ChangeApplier) SetSchema(name string) {
+	if name == "" {
+		return
+	}
+	a.schema = name
+}
+
+// SetSourceDSNFingerprint implements [ir.SourceFingerprintRecorder].
+// Records the source DSN fingerprint the streamer computed at startup
+// (ADR-0031) so subsequent position-writes populate the
+// sluice_cdc_state row's source_dsn_fingerprint column. Idempotent;
+// the streamer may call this on every Run.
+//
+// Empty input is allowed (no-op set) and reflects the
+// pre-fingerprinting case (legacy / engine-not-supported / direct
+// WritePosition from the broker without a streamer). The COALESCE
+// pattern in writePositionTx preserves any previously-recorded value
+// in that case.
+func (a *ChangeApplier) SetSourceDSNFingerprint(fingerprint string) {
+	a.sourceFingerprint = fingerprint
 }
 
 // Apply consumes changes from the channel and applies each to the
@@ -364,7 +427,7 @@ func (a *ChangeApplier) applyOne(ctx context.Context, streamID string, c ir.Chan
 		return err
 	}
 	token := c.Pos().Token
-	if err := writePositionTx(ctx, tx, a.schema, streamID, token, a.slotName); err != nil {
+	if err := writePositionTx(ctx, tx, a.controlSchema, streamID, token, a.slotName, a.sourceFingerprint); err != nil {
 		_ = tx.Rollback()
 		return err
 	}

@@ -10,6 +10,13 @@ Each entry has the same shape: a one-line summary, a *why* (the user-visible pay
 
 For continuity when a chunk references "the previous work":
 
+### Multi-source aggregation Phase 1 + 2 (`--target-schema` + stream-id collision detection)
+
+- **`--target-schema NAME` flag** on `migrate`, `sync start`, `schema preview`, `schema diff`. PG-only — flat-namespace engines (MySQL) refuse with a clear "use a different --target DSN database" message. When set, every emitted CREATE TABLE / ALTER TABLE / CREATE INDEX / CREATE TYPE prefixes the identifier with the schema name; the schema is auto-created via `CREATE SCHEMA IF NOT EXISTS`. Type-name derivation (PG enums) namespaces through the schema so two sources both having `accounts.status` enums coexist without collision. Implements Shape B (microservices → analytics warehouse) of the [proto-design](design-multi-source-aggregation.md). See [ADR-0031](adr/adr-0031-multi-source-aggregation-target-schema.md).
+- **Stream-id collision detection.** `sluice_cdc_state` grew a `source_dsn_fingerprint TEXT NULL` column (additive, idempotent migration via `ADD COLUMN IF NOT EXISTS`). Streamer fingerprint check at startup refuses if a different source DSN tries to reuse an existing stream-id. Catches operator-typo / wrong-source cases loudly before any data moves. Fingerprint is truncated SHA-256 of host+port+database — credential rotation doesn't trip false-positives.
+- **New IR surfaces.** `ir.SchemaSetter`, `ir.SourceFingerprintRecorder`, `ir.StreamStatus.SourceDSNFingerprint`. PG implements via SetSchema on SchemaReader / SchemaWriter / RowReader / RowWriter / ChangeApplier; the applier carries a separate `controlSchema` field so per-target `sluice_cdc_state` stays in the DSN's default schema while user-data INSERT/UPDATE/DELETE land in the per-source schema. MySQL deliberately doesn't implement (the validate-time refusal is the load-bearing gate).
+- **Operator UX.** `sluice sync status` renders cross-source streams from the same control table; the existing query already lists every row by stream-id. Each per-source stream stays a separate `sluice sync start` invocation — N-process aggregation rather than single-process multi-source (failure isolation, resource isolation, k8s/systemd lifecycle).
+
 ### Mid-stream add-table — Phase 2 (live add, no drain) — PG
 
 - **`sluice schema add-table TABLE --stream-id ID --no-drain`** — runs add-table against an actively-streaming sync without first running `sync stop --wait`. Strategy C variant (c) from the proto-ADR: single slot, publication-add-then-snapshot ordering. PG-only in this release; MySQL sources still require the drained workflow (separate chunk: streamer-side filter-flip mechanism). See [`adr-0030-mid-stream-live-add-table.md`](adr/adr-0030-mid-stream-live-add-table.md).
@@ -290,16 +297,19 @@ Remaining size ~600-1000 LOC for 6.2 + 6.3 + a key-management ADR.
 
 ---
 
-### 5. Multi-source aggregation
+### 5. Multi-source aggregation — Shape A (sharded → consolidated)
 
-**Why.** Some users have multiple source DBs replicating into one target (sharded → consolidated, microservices → analytics warehouse, etc.). Today each `sluice sync start` is a 1:1 stream. ADR-0024 flagged this as out-of-scope; proto-ADR exists at [`design-multi-source-aggregation.md`](design-multi-source-aggregation.md).
+**Why.** Multi-source Phase 1 + 2 (Shape B microservices → analytics warehouse) shipped in v0.25.0 — see "Recently landed". Shape A (N functionally-identical sources, sharded by key, consolidated into one target table) is the still-outstanding pattern. ADR-0031 explicitly defers it because it requires meaningfully more machinery; the proto-design at [`design-multi-source-aggregation.md`](design-multi-source-aggregation.md) covers the full surface area.
 
-**What.** Multi-source streams: a single target hosting N `sluice_cdc_state` rows (one per source), with the schema preview / migrate / sync paths able to plan against the union of source schemas. Stream IDs disambiguate; collision detection on table-name overlap is load-bearing.
+**What.** Three new pieces:
+- **Discriminator-column injection.** New CLI flag `--inject-shard-column NAME=VALUE` (mirrored on each shard's `sluice sync start`); sluice injects the column at translation time + populates it during writes so the consolidated PK stays unique across shards.
+- **Populated-target bulk-copy.** Today's cold-start preflight refuses bulk-copy into a non-empty target (Bug 9 protection). Shape A needs a "discriminator-aware" bypass that knows which rows belong to which shard so the second/third/Nth shard's bulk-copy can land cleanly alongside the first's data.
+- **Cross-shard schema-migration coordination.** When the operator alters the source schema, every shard's stream needs to coordinate the ALTER on the consolidated target. ADR-0030's `--no-drain` add-table is single-source; Shape A needs cross-stream consensus.
 
 **Gotchas.**
-- Schema collisions (two sources with `users` tables): the operator picks via filter, prefix, or per-source schema. Probably need a `--target-schema-prefix` or similar.
-- Position-token resolution: warm-resume per source, not per target. Existing `sluice_cdc_state` row shape already keys by `stream_id`; should extend cleanly.
-- Operator UX: `sluice sync status` should aggregate across all streams when run against a multi-source target.
+- The discriminator column shape needs a name in the IR (column origin = sluice-injected vs source-derived) so the applier can tell the two apart and the diff doesn't flag an "extra column on target."
+- The cold-start populated-target bypass is a sharp tool — getting it wrong means silent data corruption (one shard overwrites another's rows). Loud preflight: "you've set --inject-shard-column on a fresh stream into a populated target; rows from other shards already present must have shard-column NOT NULL and the new shard's value must be unique."
+- Shape A is heavier than Shape B; it waits for a real operator request with a concrete workload before committing to a design pass.
 
 ---
 

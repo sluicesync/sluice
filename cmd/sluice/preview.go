@@ -53,6 +53,8 @@ type SchemaPreviewCmd struct {
 	Format string `help:"Output format: 'text' (human-readable, default) or 'json' (machine-readable for tooling)." default:"text" enum:"text,json" placeholder:"FORMAT"`
 
 	Output string `help:"Write to FILE instead of stdout. Atomic: written to a sibling temp file in the destination directory, then renamed into place." short:"o" placeholder:"FILE"`
+
+	TargetSchema string `help:"Per-source target schema namespace (Postgres-only). Renders preview DDL prefixed with this schema so operators see exactly what 'sluice migrate' / 'sync start' would emit under --target-schema (ADR-0031). MySQL operators use a different --target DSN database instead." placeholder:"NAME"`
 }
 
 // Run implements `sluice schema preview`.
@@ -117,6 +119,7 @@ func (s *SchemaPreviewCmd) Run(g *Globals) error {
 		SkipViews:          s.SkipViews,
 		Format:             s.Format,
 		Out:                writer,
+		TargetSchema:       s.TargetSchema,
 	}
 	err = prev.Run(kongContext())
 	return err

@@ -82,6 +82,13 @@ type Previewer struct {
 	// `--output FILE` is a CLI concern; the orchestrator writes to
 	// the supplied io.Writer regardless.
 	Out io.Writer
+
+	// TargetSchema is the per-source target-schema namespace
+	// (ADR-0031). When set, preview output renders DDL prefixed with
+	// the schema name so operators see exactly what `migrate` /
+	// `sync start` would emit. Mirrors the Migrator/Streamer field
+	// of the same name; PG-only.
+	TargetSchema string
 }
 
 // PreviewJSON is the JSON-format preview output. The shape is stable
@@ -121,6 +128,9 @@ type PreviewJSONHint struct {
 // pointing at the phase that failed.
 func (p *Previewer) Run(ctx context.Context) error {
 	if err := p.validate(); err != nil {
+		return err
+	}
+	if err := validateTargetSchema(p.Target, p.TargetSchema); err != nil {
 		return err
 	}
 
@@ -171,6 +181,7 @@ func (p *Previewer) Run(ctx context.Context) error {
 	if err != nil {
 		return wrapWithHint(PhaseConnect, fmt.Errorf("preview: open target schema writer: %w", err))
 	}
+	applyTargetSchema(sw, p.TargetSchema)
 	defer closeIf(sw)
 
 	previewer, ok := sw.(ir.DDLPreviewer)

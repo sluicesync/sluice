@@ -88,7 +88,7 @@ type resumeContext struct {
 // non-resumable path: state is silently not persisted, --resume
 // errors clearly, and a fresh migration runs as it did before this
 // chunk landed.
-func openMigrationStateStore(ctx context.Context, target ir.Engine, dsn string) (ir.MigrationStateStore, error) {
+func openMigrationStateStore(ctx context.Context, target ir.Engine, dsn, targetSchema string) (ir.MigrationStateStore, error) {
 	opener, ok := target.(ir.MigrationStateStoreOpener)
 	if !ok {
 		return nil, nil
@@ -97,6 +97,20 @@ func openMigrationStateStore(ctx context.Context, target ir.Engine, dsn string) 
 	if err != nil {
 		return nil, fmt.Errorf("pipeline: open migration-state store: %w", err)
 	}
+	// The migration-state table itself is **not** moved into the
+	// per-source target schema — control tables stay in the DSN's
+	// default schema (typically `public`) so a single sluice instance
+	// can manage state for multiple target schemas without spamming
+	// `sluice_migrate_state` rows across every namespace. Migration IDs
+	// already disambiguate across overlapping target schemas.
+	//
+	// We deliberately do NOT call applyTargetSchema(store, targetSchema)
+	// here; the parameter is accepted for symmetry with the streamer's
+	// applier path (which also keeps `sluice_cdc_state` in the default
+	// schema). The unused parameter is documented rather than removed
+	// so a future shape that does want per-schema state can flow
+	// through cleanly.
+	_ = targetSchema
 	return store, nil
 }
 

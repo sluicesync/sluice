@@ -52,6 +52,17 @@ func (r *RowReader) Close() error {
 	return r.closer.Close()
 }
 
+// SetSchema implements [ir.SchemaSetter]. Called by the pipeline
+// orchestrator when `--target-schema NAME` is set (ADR-0031). The
+// row reader queries SELECT against the named schema rather than
+// the DSN's default. Empty input is a no-op.
+func (r *RowReader) SetSchema(name string) {
+	if name == "" {
+		return
+	}
+	r.schema = name
+}
+
 // Err returns the error, if any, that terminated the most recently
 // returned channel. It is only valid to call after the channel has
 // been fully drained.

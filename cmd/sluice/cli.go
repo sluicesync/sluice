@@ -113,6 +113,8 @@ type MigrateCmd struct {
 	BulkParallelMinRows int64 `help:"Row-count threshold below which a table is copied with a single reader/writer pair regardless of --bulk-parallelism. Avoids per-chunk overhead on small tables. Default 100000." default:"100000" placeholder:"N"`
 
 	MaxBufferBytes int64 `help:"Soft cap on per-batch buffered memory in the bulk-copy writer. The writer flushes when accumulated row-value bytes reach the cap regardless of row count, so wide-row workloads (TEXT/BYTEA/JSON at MB scale) don't blow out heap. A single row larger than the cap still applies (soft target). Default 67108864 (64 MiB). See ADR-0028." default:"67108864" placeholder:"N"`
+
+	TargetSchema string `help:"Per-source target schema namespace (Postgres-only). When set, every emitted CREATE TABLE / ALTER TABLE / CREATE INDEX / CREATE TYPE prefixes the table reference with this schema. Use to land multiple sluice streams on the same target without table-name collisions (Shape B microservices → analytics warehouse, ADR-0031). The schema is auto-created on the target if it doesn't exist. The control table sluice_cdc_state stays in the DSN's default schema regardless. MySQL operators use a different --target DSN database instead — schemas and databases collapse on MySQL." placeholder:"NAME"`
 }
 
 // Run implements the migrate subcommand.
@@ -194,6 +196,7 @@ func (m *MigrateCmd) Run(g *Globals) error {
 		BulkParallelism:     m.BulkParallelism,
 		BulkParallelMinRows: m.BulkParallelMinRows,
 		MaxBufferBytes:      m.MaxBufferBytes,
+		TargetSchema:        m.TargetSchema,
 	}
 	return mig.Run(kongContext())
 }
@@ -448,6 +451,8 @@ type SyncStartCmd struct {
 	BackupEndpoint  string `help:"Override the S3 endpoint for --position-from-manifest's S3-compatible providers. Only meaningful when --position-from-manifest is an s3:// URL." placeholder:"URL"`
 	BackupRegion    string `help:"Override the S3 region for --position-from-manifest. Only meaningful when --position-from-manifest is an s3:// URL." placeholder:"REGION"`
 	BackupPathStyle bool   `help:"Force path-style S3 addressing for --position-from-manifest. Only meaningful when --position-from-manifest is an s3:// URL."`
+
+	TargetSchema string `help:"Per-source target schema namespace (Postgres-only). When set, every emitted CREATE TABLE / ALTER TABLE / CREATE INDEX / CREATE TYPE prefixes the table reference with this schema, and CDC events apply against the named schema. Use to land multiple concurrent sluice streams on the same target without table-name collisions (Shape B microservices → analytics warehouse, ADR-0031). The schema is auto-created on the target if it doesn't exist. The control table sluice_cdc_state stays in the DSN's default schema regardless — multiple target-schema streams share a single state table per target. MySQL operators use a different --target DSN database instead — schemas and databases collapse on MySQL." placeholder:"NAME"`
 }
 
 // Run implements `sluice sync start`.
@@ -551,6 +556,7 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 		PositionFromManifestStore: manifestStore,
 		StrictPreflight:           s.StrictPreflight,
 		PatroniMode:               s.PatroniMode,
+		TargetSchema:              s.TargetSchema,
 	}
 	return streamer.Run(kongContext())
 }
