@@ -176,6 +176,25 @@ func TestEmitDefault(t *testing.T) {
 		// the project policy.
 		{"explicit mismatched precision passthrough", ir.DefaultExpression{Expr: "CURRENT_TIMESTAMP(3)"}, ir.Timestamp{Precision: 6}, "CURRENT_TIMESTAMP(3)", true},
 
+		// PG → MySQL UUID default translation (Bug 42). PG's
+		// gen_random_uuid() doesn't exist in MySQL; its canonical
+		// MySQL equivalent is UUID() wrapped in the outer parens that
+		// MySQL 8.0+ requires for function-call expression defaults.
+		// The retarget pass rewrites the column type from UUID to
+		// CHAR(36); this rule rewrites the matching default so the
+		// CREATE TABLE statement's pieces stay coherent.
+		{"pg gen_random_uuid()", ir.DefaultExpression{Expr: "gen_random_uuid()"}, ir.Char{Length: 36}, "(UUID())", true},
+		{"pg GEN_RANDOM_UUID() uppercase", ir.DefaultExpression{Expr: "GEN_RANDOM_UUID()"}, ir.Char{Length: 36}, "(UUID())", true},
+		{"pg gen_random_uuid() with whitespace", ir.DefaultExpression{Expr: " gen_random_uuid() "}, ir.Char{Length: 36}, "(UUID())", true},
+
+		// PG → MySQL random() default translation (symmetric reverse
+		// of v0.11.3's Bug 29 fix). PG's argless random() returns
+		// [0, 1); MySQL's RAND() returns the same range. The MySQL
+		// 8.0+ outer-parens requirement applies to expression
+		// defaults the same way it does for UUID.
+		{"pg random()", ir.DefaultExpression{Expr: "random()"}, ir.Float{Precision: ir.FloatDouble}, "(RAND())", true},
+		{"pg RANDOM() uppercase", ir.DefaultExpression{Expr: "RANDOM()"}, ir.Float{Precision: ir.FloatDouble}, "(RAND())", true},
+
 		// Unrelated expressions pass through verbatim — the project
 		// policy of "loud failure beats silent corruption".
 		{"unrelated expr passthrough", ir.DefaultExpression{Expr: "uuid_generate_v4()"}, ir.UUID{}, "uuid_generate_v4()", true},

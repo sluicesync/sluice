@@ -6,6 +6,22 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.23.1]
+
+Single-bug patch: closes Bug 42 — cross-engine PG → MySQL restore of a column with `DEFAULT gen_random_uuid()` failed at CREATE TABLE with MySQL Error 1064 (PG's UUID-generator function name lands verbatim in the MySQL DDL). Symmetric reverse of v0.11.3's Bugs 28/29 fix (which translated MySQL's `UUID()` / `RAND()` → PG's `gen_random_uuid()` / `random()`); the MySQL-side default-translator catalog now covers the opposite direction. Together with v0.21.2's Bug 41 (CDC value-decode for UUID columns), this completes "first-class UUID support in cross-engine restore" — Bug 41 fixed the CDC value-decode side; Bug 42 fixes the schema-side default-translation gap. Common pattern in modern PG schemas (Rails, Django, Hasura, Supabase all default-emit `gen_random_uuid()` for UUID PKs); pre-fix, those tables couldn't be migrated to MySQL without operator-side schema munging.
+
+### Fixed
+
+- **Bug 42 — cross-engine PG → MySQL restore of `DEFAULT gen_random_uuid()` columns fails with MySQL Error 1064.** `internal/translate.RetargetForEngine` correctly rewrote `Column.Type` (UUID → CHAR(36)) but didn't rewrite `Column.DefaultValue` of kind `DefaultExpression`. The PG-flavored expression `gen_random_uuid()` flowed through to the MySQL writer's `emitDefault`, where the `pgToMySQLDefaultExpr` translation table didn't have an entry for it, so it fell through to verbatim emission. The resulting CREATE TABLE statement (`uuid_col CHAR(36) DEFAULT gen_random_uuid()`) was rejected by MySQL — `gen_random_uuid` doesn't exist there. Fix: extend `pgToMySQLDefaultExpr` with `gen_random_uuid()` → `(UUID())` (MySQL's canonical UUID-generator function, wrapped in the outer parens MySQL 8.0+ requires for function-call expression defaults). Both PG's `gen_random_uuid()::text` and MySQL's `UUID()` return canonical hyphenated 36-char form, so the column's stored values are semantically equivalent. Also added the symmetric reverse of v0.11.3's Bug 29 fix: `random()` → `(RAND())` (same root cause; both functions return `[0, 1)` doubles). The MySQL writer's existing `emitDefault` precision-matching path is preserved; UUID and RAND defaults don't carry temporal precision so the matchTimestamp branch is a no-op for them.
+
+### Migration / Compatibility
+
+- **No format changes.** Manifest schema, control-table schema, change-chunk format, CLI surface — all unchanged.
+- **No CLI breaking changes.** All existing `sluice` subcommands keep their flag surfaces verbatim.
+- **Drop-in upgrade from v0.23.0.** No DDL migration on `sluice_cdc_state`; no operator action required.
+- **MySQL 8.0+ baseline preserved.** `DEFAULT (UUID())` and `DEFAULT (RAND())` require MySQL 8.0.13+ for the function-call-as-default expression-default syntax; the project already declares MySQL 8.0+ as the supported baseline.
+- **No behaviour change for same-engine paths.** PG → PG and MySQL → MySQL migrations of UUID-bearing tables are unaffected; the new translation only fires when the IR's expression default carries the canonical PG function name and the target engine is MySQL.
+
 ## [0.23.0]
 
 Logical backups Phase 6.2 lands: **AWS KMS-backed envelope encryption.** Operators who already manage encryption keys via AWS KMS (the common compliance posture for HIPAA / PCI / SOC 2 shops, and the common BYOK posture for multi-tenant SaaS) can now hand sluice a key ARN and skip the passphrase plumbing entirely. The manifest's per-chain CEK is wrapped via `kms.Encrypt`; restore unwraps via `kms.Decrypt` once at the start and caches the CEK in-memory for the rest of the chain. Phase 6.1 (passphrase mode) keeps working unchanged; the two modes are mutually exclusive per backup but pluggable behind the same `EnvelopeEncryption` interface. Implementation supplement: `docs/dev/design-logical-backups-phase-6.md`. Operator guide: `docs/operator/encryption.md` ("AWS KMS setup" section).

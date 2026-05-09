@@ -255,9 +255,7 @@ func quoteSQLString(s string) string {
 }
 
 // pgToMySQLDefaultExpr maps PG-canonical default expressions to
-// their MySQL equivalents. The most common case is now() (PG's
-// "current timestamp" function name), which MySQL spells
-// CURRENT_TIMESTAMP. Anything not in this map passes through
+// their MySQL equivalents. Anything not in this map passes through
 // verbatim — loud failure on the target beats silent corruption,
 // per the project's translation policy.
 //
@@ -265,8 +263,31 @@ func quoteSQLString(s string) string {
 // isn't case-stable across versions, and incidental whitespace
 // can survive cast-stripping, so normalising before lookup keeps
 // the table tiny.
+//
+// Entries:
+//   - now() → CURRENT_TIMESTAMP. PG's "current timestamp" function
+//     name; MySQL spells it CURRENT_TIMESTAMP (the bare keyword form,
+//     no parens). emitDefault then routes through
+//     matchTimestampDefaultPrecision to add a column-precision suffix
+//     when the target column declares one.
+//   - gen_random_uuid() → (UUID()). PG's built-in UUID generator;
+//     MySQL's canonical equivalent is UUID() wrapped in the outer
+//     parens MySQL 8.0+ requires for function-call expression
+//     defaults. Closes Bug 42 — symmetric reverse of v0.11.3's
+//     Bug 28 fix that translated MySQL's UUID() → gen_random_uuid()
+//     for PG targets. Both PG's gen_random_uuid()::text and MySQL's
+//     UUID() return canonical hyphenated 36-char form, so the
+//     PG UUID column retargets to MySQL CHAR(36) and the default
+//     produces semantically equivalent values.
+//   - random() → (RAND()). PG's argless random()-in-[0,1) function;
+//     MySQL spells it RAND() with the outer parens MySQL 8.0+
+//     requires for expression defaults. Symmetric reverse of
+//     v0.11.3's Bug 29 fix (MySQL RAND() → PG random()). Same
+//     [0, 1) semantics on both sides.
 var pgToMySQLDefaultExpr = map[string]string{
-	"now()": "CURRENT_TIMESTAMP",
+	"now()":             "CURRENT_TIMESTAMP",
+	"gen_random_uuid()": "(UUID())",
+	"random()":          "(RAND())",
 }
 
 // emitDefault renders a DEFAULT clause body for the given default
