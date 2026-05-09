@@ -126,6 +126,38 @@ If any of the five fails, fix the failure (typically: race conditions caught by 
 
 The session-local `.claude/settings.local.json` should pre-authorize `Bash(git push origin main:*)`, `Bash(git push origin v*:*)`, and `Bash(gh release edit:*)` so the autonomous flow doesn't trip the deny-by-default hook on every release.
 
+## Debugging non-obvious failures (the three-phase protocol)
+
+When a CI failure or test regression doesn't match an obvious hypothesis — or when the first speculative patch doesn't fix it — **stop speculating and run the three-phase protocol.** This pattern has closed Bug 37, the v0.20.0 broker false-failures, the v0.20.1 stream regression, and Bug 41 cleanly; speculative patching ahead of ground truth has burned multi-cycle retag loops in the same session. The discipline is non-negotiable when:
+
+- A test fails deterministically but the obvious fix candidates don't match the failure shape
+- Multiple plausible hypotheses exist (e.g. timing pressure vs structural bug vs serialization race)
+- Local repro isn't easy (e.g. Windows + CGO=0 can't run `-race`; Mac doesn't have testcontainers; the failure only fires under CI's specific scheduler)
+
+### Phase A — instrument and gather ground truth
+
+- Add **temporary DEBUG-level slog instrumentation** at every hypothesized failure path: log entry/exit, log the actual values at decision points, log timing if relevant.
+- Push the instrumentation commit to trigger CI; **read CI logs** for ground truth. Do NOT skip this step "because I think I know what the bug is" — that's exactly the speculate-and-patch trap. (Exception: if the bug is fully diagnosable by code-reading + the BUG-CATALOG repro is unambiguous, code-reading can substitute. Document why.)
+- The hypothesis you're confirming should be specific enough that the log output tells you "yes" or "no" — not vague.
+
+### Phase B — implement the fix based on Phase A findings
+
+- Only after Phase A's logs (or code-reading proof) confirm a specific hypothesis, write the fix.
+- Don't hedge: if Phase A says hypothesis (a), fix (a). Don't bundle in speculative patches for (b) and (c) "just in case" — they make the diff harder to review and obscure the actual fix.
+- Add unit tests + integration tests that pin the fix shape so the bug can't regress silently.
+
+### Phase C — cleanup and verify
+
+- Remove or gate Phase A's debug logs behind `--log-level=debug` (don't ship verbose INFO+ noise).
+- Re-run all related tests; verify no regressions in adjacent code.
+- **Watch for the unused-helper / dead-code lint trap** — when Phase B replaces or removes helpers, remove their supporting code too. golangci-lint's `unused` checker has bitten this multiple times in the v0.19.x → v0.21.x cycles.
+
+### Why this works (and why the alternative fails)
+
+Speculative patching looks faster ("just try fix X, push, see if CI's green") but compounds failure modes — each retag costs ~50-70 min of CI minutes + adds confusion to the release flow (force-tag-moves, duplicate drafts, stale checkpoint state). The three-phase protocol takes one extra CI roundtrip (Phase A) but cuts retry cycles to one. Bug 37 was speculatively patched four times before the heartbeat-clobber ground truth surfaced via instrumentation; v0.20.0 broker "failures" were actually two test-side issues that code-reading identified in 5 minutes once the agent looked at *what the test was actually doing* instead of patching imagined production bugs.
+
+Subagent prompts that invoke this protocol should explicitly forbid speculate-and-patch ("Phase A is non-negotiable; if hypotheses change, adjust before writing the fix"). They should also make Phase C's instrumentation cleanup explicit so the verbose debug logs don't ship to operators.
+
 ## Working agreements with humans on this project
 
 - The repo's owner prefers terse responses over verbose recaps. Don't summarize what was just done; the diff is readable.
