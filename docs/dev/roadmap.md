@@ -362,7 +362,55 @@ Output: `docs/research/sluice-as-analytics-source.md` (operator personas + surfa
 
 ---
 
-### 10. View support Phase 2/3 — materialized-view refresh + cross-engine view-body translation
+### 10. Multi-source aggregation — Shape A (sharded → consolidated)
+
+**Why.** v0.25.0 ships Shape B (microservices: N distinct schemas → per-source target schema, PG-only). Shape A is the other real-world multi-source pattern: N functionally-identical sources (Vitess shards, multi-region MySQL, partitioned-by-key Postgres) → one consolidated target table per type. The proto-ADR (`docs/dev/design-multi-source-aggregation.md`'s "What about Shape A" section) sketches the design space; deferred from v0.25.0 because the additional machinery is meaningfully heavier and no operator has surfaced the demand yet.
+
+**What.** Two load-bearing additions on top of the v0.25.0 foundation:
+
+- **Discriminator column injection.** When N sources have identical schemas, the operator typically wants a `source_shard_id` column added on the target. Sluice would inject the column at translation time + populate it with the stream-id (or operator-supplied value) during writes. New CLI flag: `--inject-shard-column NAME=VALUE`, mirrored on each shard's stream. Composite PK includes the discriminator so shards can't conflict.
+- **Stream-id-aware bulk copy.** Bulk-copy reads from N sources and writes to the same target table; today's pre-flight check refuses to bulk-copy into populated targets. With `--inject-shard-column` set, the populated check needs to allow co-existence with rows from other shards (predicate: `WHERE source_shard_id = $1`).
+
+**Gotchas.**
+- Cross-shard schema migrations need coordination — if shard A adds a column and shard B doesn't yet, the target's table schema diverges from one shard's view. Operator-facing: need a "wait for all shards" pattern or per-shard schema diff visualisation.
+- Discriminator-column rename: if the operator changes the discriminator name later, existing rows need backfill OR a new table. Out of scope — the column name is set-once.
+- VStream / PlanetScale shards are the canonical case; the Phase 2.5 VStream consideration from the "Mid-stream add-table — MySQL Phase 2" entry applies here too.
+
+**Operator demand check.** No real-world operator has surfaced this yet. The Vitess→PG analytics pattern is plausible but speculative; Shape B shipped in v0.25.0 (see "Recently landed") and the Shape A path waits for an operator to push for it. Estimated ~1500-2500 LOC + ADR if/when picked up.
+
+---
+
+### 11. Multi-source aggregation — MySQL native parity
+
+**Why.** v0.25.0's `--target-schema` is PG-only by design (PG schemas are first-class; MySQL collapses schema-and-database). MySQL operators with the same multi-source-microservices pattern get equivalent coverage today via `--target` DSN choice (different MySQL databases on the same server). For most operators this is enough — the analytics queries cross databases the same way they would cross PG schemas, and MySQL's namespace model genuinely is "database = schema."
+
+**What.** If a real operator surfaces "I want N sluice processes targeting one MySQL server but landing in one logical database with namespacing," the design would need to invent a per-table prefix mechanism (option (b) from the proto-ADR's schema-collision discussion: `table_renames: { source_table: target_table }` mapping). New CLI flag `--rename-table SOURCE=TARGET` mirrored on each source's stream.
+
+**Gotchas.** Per-table renaming is more verbose than schema-prefixing, but the proto-ADR notes it's the universal flexible option. Hardest UX problem: keeping the rename map in sync with source-side schema changes (operator must update the map when a source adds a table).
+
+**Operator demand check.** Currently zero. The DSN-choice workaround is good enough for the cases sluice has seen. Track here so the option doesn't get lost; revisit when an operator asks.
+
+---
+
+### 12. PlanetScale MySQL+Vitess test-matrix expansion
+
+**Why.** Sluice has a `psverify` build-tag harness for PlanetScale-backed Vitess source coverage (`docs/dev/notes/psverify-status.md`), gated by `PLANETSCALE_CREDENTIALS.env`. Coverage today is operator-driven (the harness exists; the user runs it before releases when they have credentials available) rather than continuously exercised in CI. Several VStream-specific edge cases live in this gap:
+
+- **Bug 27** (VStream POINT bytes mis-parsed) is the canonical example — explicitly deferred to the "GEOMETRY/SPATIAL support" entry's Phase B because the test infrastructure is operator-run.
+- **Mid-stream MySQL Phase 2.5** (gotcha called out in the "Mid-stream add-table — MySQL Phase 2" entry) — VStream is a separate code path from vanilla MySQL binlog; the Phase 2 mechanism may need a Vitess-specific variant.
+- **PlanetScale Postgres slot lifecycle** — Patroni-managed; slot loss on failover is silent without `Logical slot name` cluster config (operator memory `project_planetscale_postgres_slots.md`). The check is documented in `docs/postgres-source-prep.md` but not exercised in CI.
+- **VStream POINT/POLYGON/cross-shard-PK edge cases** — generally any PS-specific behavior beyond what vanilla MySQL exhibits.
+
+**What.** Two paths:
+
+- **Path A — Operator-run coverage matrix.** Document a "before each release" PlanetScale checklist: spin up a PS branch, run sluice against it for the canonical scenarios (vanilla migrate, CDC stream, slot recovery, geometry types, slot rename via `--slot-name=Logical slot name`). Output: `docs/dev/notes/ps-release-checklist.md`. ~1 day to write + populate; no code chunk.
+- **Path B — CI-integrated coverage.** Move `psverify` from operator-run to CI-conditional (PR labels, scheduled workflows). Requires a non-revocable PlanetScale credential surface in CI; operationally heavier. Defer until Path A's checklist surfaces enough recurring gaps to justify the CI cost.
+
+**Operator demand check.** Path A is the cheap-and-useful immediate win — ship the checklist. Path B is a "if PS coverage gaps keep biting" follow-on.
+
+---
+
+### 13. View support Phase 2/3 — materialized-view refresh + cross-engine view-body translation
 
 **Why.** Phase 1 (schema-only round-trip + dependency-ordered apply + diff/preview integration + CLI filters) shipped. The two large open frontiers remain:
 
@@ -383,11 +431,34 @@ Tracked in detail in `sluice-testing/BUG-CATALOG.md`; recap here for roadmap vis
 
 - **Bug 17** (deferred, low priority) — `impact_items` cross-engine COALESCE handling in expression translator.
 - **Bug 25** (deferred, low priority) — PG immutability of enum-typed STORED generated columns.
-- **Bug 26** — PostGIS SRID dropped on schema translation. *Picked up by item 6 (GEOMETRY/SPATIAL support) Phase A.*
-- **Bug 27** (deferred, see below) — VStream POINT bytes mis-parsed. *Picked up by item 6 Phase B.*
+- **Bug 26** — PostGIS SRID dropped on schema translation. *Picked up by the "GEOMETRY/SPATIAL support" entry's Phase A.*
+- **Bug 27** (deferred, see below) — VStream POINT bytes mis-parsed. *Picked up by the "GEOMETRY/SPATIAL support" entry's Phase B.*
 - **Bug 42** (open as of v0.21.2, parallel to Bug 41) — cross-engine restore of `DEFAULT gen_random_uuid()` columns fails MySQL Error 1064. Root cause: `RetargetForEngine` rewrites `Column.Type` (UUID → CHAR(36)) but doesn't rewrite `Column.DefaultValue` of kind `DefaultExpression`; PG's `gen_random_uuid()` lands verbatim in MySQL CREATE TABLE. Mirrors v0.11.3's Bugs 28/29 in the opposite direction. Suggested fix: extend ADR-0016's expression-translator catalog to cover PG → MySQL UUID defaults (`gen_random_uuid()` → `(UUID())`). Estimated ~50-150 LOC.
 
 Together, **Bug 41 (closed v0.21.2) + Bug 42** cover "first-class UUID support in cross-engine restore" — Bug 41 fixed the CDC value-decode side; Bug 42 fixes the schema-side default-translation gap. Worth bundling soon since UUID PKs are pervasive in modern PG schemas (Rails, Django, Hasura, Supabase patterns).
+
+### MySQL & PlanetScale parity tracker
+
+Sluice's recent feature work has cadenced PG-first; MySQL/PlanetScale parity is intentional but tracked. One-stop summary of what's PG-only today and where the MySQL/PS follow-up lives:
+
+| PG-shipped feature | MySQL parity status | Tracked at |
+|---|---|---|
+| Phase 6.1 passphrase encryption (v0.22.0) | Engine-neutral — applies to both already | n/a |
+| Phase 6.2 AWS KMS encryption (v0.23.0) | Engine-neutral — applies to both already | n/a |
+| Mid-stream live add-table (`--no-drain`, v0.24.0) | Deferred — different mechanism (table-filter flip vs publication-add) | "Mid-stream add-table — MySQL Phase 2" entry above |
+| Multi-source aggregation `--target-schema` (v0.25.0) | Deferred — DSN-choice workaround documented; per-table-rename flag if demand surfaces | "Multi-source aggregation — MySQL native parity" entry above |
+| Phase 2 strict zero-loss correctness (PG follow-up, future) | PG-specific (pgoutput decode-time publication semantics) — MySQL Phase 2 has its own correctness story | "Mid-stream live add-table — strict zero-loss correctness" entry above |
+| GEOMETRY / SPATIAL support (future) | Phase B explicitly closes Bug 27 (VStream POINT) — MySQL Phase A is part of the same chunk | "GEOMETRY / SPATIAL support" entry above |
+| `--type-override`, `--expr-override`, translator catalog | Both engines, both directions | n/a |
+
+PlanetScale-specific tracking:
+
+| PlanetScale concern | Status | Tracked at |
+|---|---|---|
+| Bug 27 VStream POINT bytes prefix | Deferred to GEOMETRY/SPATIAL entry's Phase B; gated by `psverify` build tag | "GEOMETRY/SPATIAL support" entry + "Bug 27 (deferred, parked here)" below |
+| Mid-stream Phase 2.5 (VStream-specific add-table mechanism) | Demand-driven; treat as a follow-on after MySQL Phase 2 lands | "Mid-stream add-table — MySQL Phase 2" entry's gotchas |
+| PlanetScale Postgres slot lifecycle (Patroni-managed; silent loss on failover without `Logical slot name` config) | Documented in `docs/postgres-source-prep.md`; not exercised in default CI | "PlanetScale MySQL+Vitess test-matrix expansion" entry above |
+| Broader VStream coverage (cross-shard PK, geometry edge cases, slot recovery) | Operator-run via `psverify` build tag with `PLANETSCALE_CREDENTIALS.env`; not in default CI | "PlanetScale MySQL+Vitess test-matrix expansion" entry above |
 
 ### Bug 27 (deferred, parked here)
 
