@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/orware/sluice/internal/crypto"
 	"github.com/orware/sluice/internal/ir"
 )
 
@@ -74,7 +75,7 @@ func TestChunkRoundTrip(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	w, err := newChunkWriter(&buf, colNames)
+	w, err := newChunkWriter(&buf, colNames, nil)
 	if err != nil {
 		t.Fatalf("newChunkWriter: %v", err)
 	}
@@ -90,7 +91,7 @@ func TestChunkRoundTrip(t *testing.T) {
 
 	// Read back.
 	src := io.NopCloser(bytes.NewReader(buf.Bytes()))
-	rdr, err := newChunkReader(src, hash)
+	rdr, err := newChunkReader(src, hash, nil)
 	if err != nil {
 		t.Fatalf("newChunkReader: %v", err)
 	}
@@ -129,12 +130,12 @@ func TestChunkRoundTrip(t *testing.T) {
 func TestChunkReader_HashMismatch(t *testing.T) {
 	cols := []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}
 	var buf bytes.Buffer
-	w, _ := newChunkWriter(&buf, []string{"id"})
+	w, _ := newChunkWriter(&buf, []string{"id"}, nil)
 	_ = w.WriteRow(ir.Row{"id": int64(1)}, cols)
 	_ = w.Close()
 
 	src := io.NopCloser(bytes.NewReader(buf.Bytes()))
-	rdr, err := newChunkReader(src, "0000deadbeef")
+	rdr, err := newChunkReader(src, "0000deadbeef", nil)
 	if err != nil {
 		t.Fatalf("newChunkReader: %v", err)
 	}
@@ -156,10 +157,91 @@ func TestChunkReader_HashMismatch(t *testing.T) {
 	}
 }
 
+// TestChunkEncryptedRoundTrip validates that the encrypted-mode
+// chunk codec round-trips rows through encryption end-to-end.
+func TestChunkEncryptedRoundTrip(t *testing.T) {
+	cols := []*ir.Column{
+		{Name: "id", Type: ir.Integer{Width: 64}},
+		{Name: "name", Type: ir.Varchar{Length: 255}},
+	}
+	colNames := []string{"id", "name"}
+	rows := []ir.Row{
+		{"id": int64(1), "name": "alpha"},
+		{"id": int64(2), "name": "beta"},
+	}
+	cek, err := crypto.GenerateCEK()
+	if err != nil {
+		t.Fatalf("GenerateCEK: %v", err)
+	}
+	var buf bytes.Buffer
+	w, err := newChunkWriter(&buf, colNames, cek)
+	if err != nil {
+		t.Fatalf("newChunkWriter: %v", err)
+	}
+	for _, r := range rows {
+		if err := w.WriteRow(r, cols); err != nil {
+			t.Fatalf("WriteRow: %v", err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	hash := w.Hash()
+	// The on-disk bytes should not contain the plaintext column name
+	// or row values — confirms encryption actually happened.
+	encBytes := buf.Bytes()
+	for _, banned := range []string{"alpha", "beta", "name", "id"} {
+		if bytes.Contains(encBytes, []byte(banned)) {
+			t.Errorf("encrypted chunk bytes contain plaintext substring %q (encryption did nothing?)", banned)
+		}
+	}
+	src := io.NopCloser(bytes.NewReader(buf.Bytes()))
+	rdr, err := newChunkReader(src, hash, cek)
+	if err != nil {
+		t.Fatalf("newChunkReader: %v", err)
+	}
+	var got []ir.Row
+	for {
+		row, err := rdr.ReadRow()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("ReadRow: %v", err)
+		}
+		got = append(got, row)
+	}
+	if err := rdr.Close(); err != nil {
+		t.Fatalf("rdr.Close: %v", err)
+	}
+	if len(got) != len(rows) {
+		t.Fatalf("got %d rows; want %d", len(got), len(rows))
+	}
+}
+
+// TestChunkEncrypted_WrongCEK confirms a wrong-key decrypt fails
+// with a clear error rather than silently returning garbage rows.
+func TestChunkEncrypted_WrongCEK(t *testing.T) {
+	cek1, _ := crypto.GenerateCEK()
+	cek2, _ := crypto.GenerateCEK()
+	var buf bytes.Buffer
+	w, err := newChunkWriter(&buf, []string{"id"}, cek1)
+	if err != nil {
+		t.Fatalf("newChunkWriter: %v", err)
+	}
+	_ = w.WriteRow(ir.Row{"id": int64(1)}, []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}})
+	_ = w.Close()
+	hash := w.Hash()
+	src := io.NopCloser(bytes.NewReader(buf.Bytes()))
+	if _, err := newChunkReader(src, hash, cek2); err == nil {
+		t.Fatalf("wrong-cek decrypt expected to fail; got nil")
+	}
+}
+
 func TestChunkReader_FormatVersionMismatch(t *testing.T) {
 	// Hand-craft a chunk file with a future format-version.
 	var buf bytes.Buffer
-	w, _ := newChunkWriter(&buf, []string{"id"})
+	w, _ := newChunkWriter(&buf, []string{"id"}, nil)
 	_ = w.Close()
 	// Patching the actual gzip stream is fragile; instead just verify
 	// behaviour via the decoder directly: write a bogus header line
@@ -167,7 +249,7 @@ func TestChunkReader_FormatVersionMismatch(t *testing.T) {
 	// (This check exercises the version-rejection branch without
 	// needing a hand-rolled gzip frame.)
 	bad := []byte("not gzip")
-	rdr, err := newChunkReader(io.NopCloser(bytes.NewReader(bad)), "")
+	rdr, err := newChunkReader(io.NopCloser(bytes.NewReader(bad)), "", nil)
 	if err == nil {
 		_ = rdr.Close()
 		t.Errorf("expected gzip-header error on non-gzip input; got nil")

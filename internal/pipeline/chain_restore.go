@@ -34,6 +34,7 @@ import (
 	"log/slog"
 	"sort"
 
+	"github.com/orware/sluice/internal/crypto"
 	"github.com/orware/sluice/internal/ir"
 	"github.com/orware/sluice/internal/translate"
 )
@@ -70,6 +71,16 @@ type ChainRestore struct {
 	// restore wants throughput; the per-change conservative default
 	// (1) would make even modest chains painfully slow.
 	ApplyBatchSize int
+
+	// Envelope, when non-nil, is the [crypto.EnvelopeEncryption] used
+	// to unwrap CEKs from encrypted manifests. Required for encrypted
+	// chains. See [Restore.Envelope].
+	Envelope crypto.EnvelopeEncryption
+
+	// chainCEK caches the chain-level CEK after the full's preflight.
+	// Reused for every change-chunk decrypt across the incremental
+	// walk so Argon2id (passphrase mode) runs once per chain restore.
+	chainCEK []byte
 }
 
 // DefaultChainRestoreBatchSize is the default value of
@@ -131,6 +142,14 @@ func (r *ChainRestore) Run(ctx context.Context) error {
 		)
 	}
 
+	// 2.5. Encryption pre-flight at the chain root. If the full
+	// manifest carries [ir.ChainEncryption], confirm we have an
+	// envelope, and (per-chain mode) cache the chain CEK so every
+	// change-chunk read in the incremental walk decrypts cheaply.
+	if err := r.preflightEncryption(full.manifest); err != nil {
+		return wrapWithHint(PhaseConnect, fmt.Errorf("chain restore: %w", err))
+	}
+
 	// 3. Apply the full via the existing Restore path.
 	slog.InfoContext(ctx, "chain restore: applying full",
 		slog.String("manifest_path", full.path),
@@ -139,6 +158,13 @@ func (r *ChainRestore) Run(ctx context.Context) error {
 	)
 	if err := r.applyFull(ctx, full); err != nil {
 		return wrapWithHint(PhaseBulkCopy, fmt.Errorf("chain restore: apply full: %w", err))
+	}
+
+	// 3.5. Mixed-mode chain refusal. A chain whose full is encrypted
+	// but an incremental isn't (or vice versa) is rejected up-front
+	// per acceptance criterion 7.
+	if err := r.checkMixedModeChain(chain); err != nil {
+		return wrapWithHint(PhaseConnect, fmt.Errorf("chain restore: %w", err))
 	}
 
 	// 4. Apply each incremental in chain order.
@@ -212,8 +238,74 @@ func (r *ChainRestore) applyFull(ctx context.Context, full *manifestRecord) erro
 		Filter:            r.Filter,
 		MaxBufferBytes:    r.MaxBufferBytes,
 		SkipChainDispatch: true,
+		Envelope:          r.Envelope,
 	}
 	return rest.Run(ctx)
+}
+
+// preflightEncryption validates the chain root's encryption metadata
+// and caches the chain-level CEK on r.chainCEK. Mirrors
+// [Restore.preflightEncryption] but the cached CEK is consumed by the
+// incremental change-chunk walk rather than the full's bulk-copy
+// path.
+func (r *ChainRestore) preflightEncryption(rootManifest *ir.Manifest) error {
+	if rootManifest == nil || rootManifest.ChainEncryption == nil {
+		return nil
+	}
+	enc := rootManifest.ChainEncryption
+	if r.Envelope == nil {
+		return fmt.Errorf("encrypted chain (algorithm=%q kek_mode=%q kek_ref=%q) requires --encrypt + a passphrase / KMS reference; no key was supplied",
+			enc.Algorithm, enc.KEKMode, enc.KEKRef)
+	}
+	if enc.KEKMode != "" && r.Envelope.Mode() != enc.KEKMode {
+		return fmt.Errorf("encryption envelope mode %q does not match chain's recorded kek_mode %q",
+			r.Envelope.Mode(), enc.KEKMode)
+	}
+	mode := enc.Mode
+	if mode == "" {
+		mode = crypto.EncryptModePerChain
+	}
+	if mode == crypto.EncryptModePerChain {
+		if len(enc.WrappedCEK) == 0 {
+			return errors.New("encrypted chain in per-chain mode but ChainEncryption.WrappedCEK is empty")
+		}
+		cek, err := r.Envelope.UnwrapCEK(enc.WrappedCEK)
+		if err != nil {
+			return fmt.Errorf("unwrap chain cek (wrong passphrase / KMS key?): %w", err)
+		}
+		r.chainCEK = cek
+	}
+	return nil
+}
+
+// checkMixedModeChain rejects chains where the full and an
+// incremental disagree on encryption shape (one encrypted, one not).
+// Per the design, encryption is per-chain, not per-chunk; chains are
+// atomic. Mixed-mode strongly suggests a tampered or mis-stitched
+// chain — refuse loudly.
+func (r *ChainRestore) checkMixedModeChain(chain []*manifestRecord) error {
+	if len(chain) < 2 {
+		return nil
+	}
+	rootEnc := chain[0].manifest.ChainEncryption != nil
+	for _, link := range chain[1:] {
+		incrHasChunkEnc := false
+		for _, c := range link.manifest.ChangeChunks {
+			if c != nil && c.Encryption != nil {
+				incrHasChunkEnc = true
+				break
+			}
+		}
+		if rootEnc && !incrHasChunkEnc && len(link.manifest.ChangeChunks) > 0 {
+			return fmt.Errorf("mixed-mode chain: full %s is encrypted but incremental %s has plaintext change chunks; encryption must be uniform across the chain",
+				manifestBackupID(chain[0].manifest), manifestBackupID(link.manifest))
+		}
+		if !rootEnc && incrHasChunkEnc {
+			return fmt.Errorf("mixed-mode chain: full %s is plaintext but incremental %s has encrypted change chunks; encryption must be uniform across the chain",
+				manifestBackupID(chain[0].manifest), manifestBackupID(link.manifest))
+		}
+	}
+	return nil
 }
 
 // applyIncremental applies one incremental's schema deltas and
@@ -433,7 +525,12 @@ func (r *ChainRestore) streamOneChangeChunk(
 	if err != nil {
 		return fmt.Errorf("open chunk: %w", err)
 	}
-	cr, err := newChangeChunkReader(src, chunk.SHA256)
+	cek, err := r.changeChunkCEK(chunk)
+	if err != nil {
+		_ = src.Close()
+		return fmt.Errorf("resolve change chunk cek: %w", err)
+	}
+	cr, err := newChangeChunkReader(src, chunk.SHA256, cek)
 	if err != nil {
 		return fmt.Errorf("open chunk reader: %w", err)
 	}
@@ -675,4 +772,27 @@ func manifestBackupID(m *ir.Manifest) string {
 		return m.BackupID
 	}
 	return ir.ComputeBackupID(m)
+}
+
+// changeChunkCEK resolves the CEK for a change chunk: per-chain mode
+// returns the cached r.chainCEK; per-chunk mode unwraps the chunk's
+// own wrapped CEK; plaintext returns nil.
+func (r *ChainRestore) changeChunkCEK(chunk *ir.ChunkInfo) ([]byte, error) {
+	if chunk.Encryption == nil {
+		return nil, nil
+	}
+	if len(chunk.Encryption.WrappedCEK) > 0 {
+		if r.Envelope == nil {
+			return nil, errors.New("per-chunk encrypted change chunk encountered without envelope")
+		}
+		cek, err := r.Envelope.UnwrapCEK(chunk.Encryption.WrappedCEK)
+		if err != nil {
+			return nil, fmt.Errorf("unwrap change chunk cek: %w", err)
+		}
+		return cek, nil
+	}
+	if r.chainCEK == nil {
+		return nil, errors.New("encrypted change chunk encountered but chain CEK is unset")
+	}
+	return r.chainCEK, nil
 }

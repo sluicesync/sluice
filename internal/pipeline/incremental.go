@@ -45,6 +45,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/orware/sluice/internal/crypto"
 	"github.com/orware/sluice/internal/ir"
 )
 
@@ -156,6 +157,14 @@ type IncrementalBackup struct {
 	// SluiceVersion is the build identifier of the running binary,
 	// recorded in the manifest. Optional.
 	SluiceVersion string
+
+	// Encryption, when non-nil, encrypts every change chunk written
+	// during this incremental's window. See [BackupEncryption]. The
+	// chain root (the parent full's manifest) governs the chain's
+	// encryption shape; the orchestrator validates that this run's
+	// encryption matches the parent at start so a mixed-mode chain
+	// can't be created.
+	Encryption *BackupEncryption
 
 	// Now, when set, overrides the wall-clock-time source for
 	// [ir.Manifest.CreatedAt]. Used by tests to pin timestamps; in
@@ -276,8 +285,17 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 		manifest.ParentBackupID = ir.ComputeBackupID(parent)
 	}
 
+	// Phase 6.1: align this incremental's encryption with the chain
+	// root. The parent full's [ir.ChainEncryption] dictates the chain's
+	// shape; mismatched runs (encrypt mid-chain or vice versa) are
+	// refused at chain-restore time anyway, so reject early here.
+	chainCEK, err := b.alignEncryption(parent)
+	if err != nil {
+		return fmt.Errorf("incremental: encryption: %w", err)
+	}
+
 	deadline := clockNow().Add(windowDur)
-	endPos, totalChanges, captureErr := b.captureWindow(ctx, cdc, changesCh, manifest, chunkSize, deadline, b.MaxChanges, clockNow)
+	endPos, totalChanges, captureErr := b.captureWindow(ctx, cdc, changesCh, manifest, chunkSize, deadline, b.MaxChanges, clockNow, chainCEK)
 	if captureErr != nil {
 		return wrapWithHint(PhaseCDC, fmt.Errorf("incremental: capture window: %w", captureErr))
 	}
@@ -435,6 +453,7 @@ func (b *IncrementalBackup) captureWindow(
 	deadline time.Time,
 	maxChanges int,
 	clockNow func() time.Time,
+	chainCEK []byte,
 ) (ir.Position, int64, error) {
 	var (
 		writer        *changeChunkWriter
@@ -443,6 +462,7 @@ func (b *IncrementalBackup) captureWindow(
 		totalChanges  int64
 		lastPos       ir.Position
 		inTransaction bool
+		curWrappedCEK []byte
 	)
 
 	// runNamespace is the per-incremental directory segment chunks land
@@ -469,20 +489,35 @@ func (b *IncrementalBackup) captureWindow(
 		if err := b.Store.Put(ctx, path, buf); err != nil {
 			return fmt.Errorf("store put %q: %w", path, err)
 		}
-		manifest.ChangeChunks = append(manifest.ChangeChunks, &ir.ChunkInfo{
+		ci := &ir.ChunkInfo{
 			File:     path,
 			RowCount: writer.ChangeCount(),
 			SHA256:   hash,
-		})
+		}
+		if b.Encryption != nil {
+			ci.Encryption = &ir.ChunkEncryption{
+				Algorithm:  crypto.AlgorithmAESGCM,
+				NonceLen:   crypto.NonceLen,
+				AuthTagLen: crypto.AuthTagLen,
+				WrappedCEK: curWrappedCEK,
+			}
+		}
+		manifest.ChangeChunks = append(manifest.ChangeChunks, ci)
 		writer = nil
 		buf = nil
+		curWrappedCEK = nil
 		chunkIdx++
 		return nil
 	}
 
 	openWriter := func() error {
 		buf = &bytes.Buffer{}
-		w, err := newChangeChunkWriter(buf)
+		cek, wrapped, err := b.resolveChunkCEK(chainCEK)
+		if err != nil {
+			return fmt.Errorf("resolve chunk cek: %w", err)
+		}
+		curWrappedCEK = wrapped
+		w, err := newChangeChunkWriter(buf, cek)
 		if err != nil {
 			return fmt.Errorf("open chunk: %w", err)
 		}
@@ -747,4 +782,79 @@ func joinComma(parts []string) string {
 		out += ", " + p
 	}
 	return out
+}
+
+// alignEncryption inspects the parent manifest's chain root for
+// encryption metadata and validates that the incremental's
+// configuration is consistent. Returns the chain-level CEK for
+// per-chain mode, or nil for per-chunk / unencrypted.
+//
+// Refusal cases:
+//
+//   - Parent's chain is encrypted but b.Encryption is nil → refuse.
+//   - Parent's chain is plaintext but b.Encryption is non-nil →
+//     refuse (would create a mixed-mode chain).
+//   - Parent's chain root carries [ir.ChainEncryption] but the
+//     supplied envelope's Mode() doesn't match → refuse.
+func (b *IncrementalBackup) alignEncryption(parent *ir.Manifest) ([]byte, error) {
+	parentEnc := parent.ChainEncryption
+	switch {
+	case parentEnc == nil && b.Encryption == nil:
+		return nil, nil
+	case parentEnc == nil && b.Encryption != nil:
+		return nil, errors.New("incremental: parent chain is plaintext but --encrypt was supplied; cannot extend a plaintext chain with encrypted incrementals")
+	case parentEnc != nil && b.Encryption == nil:
+		return nil, fmt.Errorf("incremental: parent chain is encrypted (algorithm=%q kek_mode=%q kek_ref=%q) but no --encrypt + key was supplied",
+			parentEnc.Algorithm, parentEnc.KEKMode, parentEnc.KEKRef)
+	}
+	// Both non-nil: verify mode + key compatibility.
+	if b.Encryption.Envelope == nil {
+		return nil, errors.New("incremental: encryption envelope is nil")
+	}
+	if parentEnc.KEKMode != "" && b.Encryption.Envelope.Mode() != parentEnc.KEKMode {
+		return nil, fmt.Errorf("incremental: envelope mode %q does not match chain's recorded kek_mode %q",
+			b.Encryption.Envelope.Mode(), parentEnc.KEKMode)
+	}
+	mode := parentEnc.Mode
+	if mode == "" {
+		mode = crypto.EncryptModePerChain
+	}
+	if mode == crypto.EncryptModePerChain {
+		if len(parentEnc.WrappedCEK) == 0 {
+			return nil, errors.New("incremental: parent's chain encryption is per-chain but WrappedCEK is empty")
+		}
+		cek, err := b.Encryption.Envelope.UnwrapCEK(parentEnc.WrappedCEK)
+		if err != nil {
+			return nil, fmt.Errorf("incremental: unwrap parent chain cek (wrong passphrase?): %w", err)
+		}
+		return cek, nil
+	}
+	// Per-chunk mode: no chain-level CEK.
+	return nil, nil
+}
+
+// resolveChunkCEK returns the (cek, wrappedCEK) pair to use for the
+// next change chunk. Mirrors [Backup.resolveChunkCEK]; per-chain mode
+// reuses chainCEK with empty wrapped value, per-chunk generates a
+// fresh CEK + wrap.
+func (b *IncrementalBackup) resolveChunkCEK(chainCEK []byte) (cek, wrapped []byte, err error) {
+	if b.Encryption == nil {
+		return nil, nil, nil
+	}
+	mode := b.Encryption.Mode
+	if mode == "" {
+		mode = crypto.EncryptModePerChain
+	}
+	if mode == crypto.EncryptModePerChain {
+		return chainCEK, nil, nil
+	}
+	cek, err = crypto.GenerateCEK()
+	if err != nil {
+		return nil, nil, fmt.Errorf("generate chunk cek: %w", err)
+	}
+	wrapped, err = b.Encryption.Envelope.WrapCEK(cek)
+	if err != nil {
+		return nil, nil, fmt.Errorf("wrap chunk cek: %w", err)
+	}
+	return cek, wrapped, nil
 }

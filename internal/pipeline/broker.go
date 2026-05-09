@@ -66,6 +66,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/orware/sluice/internal/crypto"
 	"github.com/orware/sluice/internal/ir"
 	"github.com/orware/sluice/internal/translate"
 )
@@ -162,6 +163,17 @@ type SyncFromBackup struct {
 	// SluiceVersion is the build identifier of the running binary.
 	// Recorded on log lines for diagnostics. Optional.
 	SluiceVersion string
+
+	// Envelope, when non-nil, is the [crypto.EnvelopeEncryption] used
+	// to unwrap CEKs from encrypted manifests. Required when the chain
+	// the broker is consuming carries [ir.ChainEncryption]. A nil
+	// Envelope against an encrypted chain produces a clear refusal at
+	// chain-walk time naming the missing key.
+	Envelope crypto.EnvelopeEncryption
+
+	// chainCEK caches the unwrapped per-chain CEK across ticks so
+	// Argon2id (passphrase mode) runs once per broker process.
+	chainCEK []byte
 
 	// Now, when set, overrides the wall-clock-time source used for
 	// `broker_state.json` timestamps. Tests pin timestamps; in
@@ -405,6 +417,15 @@ func (b *SyncFromBackup) Run(ctx context.Context) error {
 		)
 	}
 
+	// Phase 6.1: chain-encryption preflight. When the chain root
+	// carries [ir.ChainEncryption], the broker must have an envelope
+	// + the unwrapped chain CEK ready (per-chain mode) before the
+	// first tick attempts to decrypt a change chunk. preflightChainEncryption
+	// is a no-op for plaintext chains.
+	if err := b.preflightChainEncryption(ctx); err != nil {
+		return wrapWithHint(PhaseConnect, fmt.Errorf("broker: %w", err))
+	}
+
 	// 5. Drive the tick loop. Each tick: list manifests, replay any
 	//    new ones in chain order, advance lastAppliedID, sleep
 	//    until next interval (or stop signal). The first iteration
@@ -591,6 +612,7 @@ func (b *SyncFromBackup) coldStartReset(ctx context.Context, applier ir.ChangeAp
 		Store:          b.Store,
 		MaxBufferBytes: b.MaxBufferBytes,
 		ApplyBatchSize: b.ApplyBatchSize,
+		Envelope:       b.Envelope,
 	}
 	if err := rest.Run(ctx); err != nil {
 		return "", fmt.Errorf("broker: chain restore failed: %w", err)
@@ -1000,7 +1022,12 @@ func (b *SyncFromBackup) streamOneChunkWithPosition(
 	if err != nil {
 		return fmt.Errorf("open chunk: %w", err)
 	}
-	cr, err := newChangeChunkReader(src, chunk.SHA256)
+	cek, err := b.chunkCEK(chunk)
+	if err != nil {
+		_ = src.Close()
+		return fmt.Errorf("resolve chunk cek: %w", err)
+	}
+	cr, err := newChangeChunkReader(src, chunk.SHA256, cek)
 	if err != nil {
 		return fmt.Errorf("open chunk reader: %w", err)
 	}
@@ -1113,4 +1140,72 @@ func (b *SyncFromBackup) waitForNextTick(
 			}
 		}
 	}
+}
+
+// preflightChainEncryption inspects the chain root's encryption
+// metadata, validates that an envelope is supplied (when the chain is
+// encrypted), and caches the chain-level CEK. Mirrors the
+// [Restore.preflightEncryption] / [ChainRestore.preflightEncryption]
+// shape, applied to the broker.
+//
+// Reads the legacy `manifest.json` directly because that's where the
+// chain root lives in every backup chain shape. A cross-engine chain
+// where the root is plaintext but an incremental is encrypted (or
+// vice versa) is impossible per [IncrementalBackup.alignEncryption] /
+// [BackupStream.alignEncryption], so this preflight covers the broker
+// case fully.
+func (b *SyncFromBackup) preflightChainEncryption(ctx context.Context) error {
+	root, err := readManifestIfPresent(ctx, b.Store)
+	if err != nil {
+		return fmt.Errorf("read chain root manifest: %w", err)
+	}
+	if root == nil || root.ChainEncryption == nil {
+		return nil
+	}
+	enc := root.ChainEncryption
+	if b.Envelope == nil {
+		return fmt.Errorf("chain is encrypted (algorithm=%q kek_mode=%q kek_ref=%q) but no --encrypt + key was supplied",
+			enc.Algorithm, enc.KEKMode, enc.KEKRef)
+	}
+	if enc.KEKMode != "" && b.Envelope.Mode() != enc.KEKMode {
+		return fmt.Errorf("envelope mode %q does not match chain's recorded kek_mode %q",
+			b.Envelope.Mode(), enc.KEKMode)
+	}
+	mode := enc.Mode
+	if mode == "" {
+		mode = crypto.EncryptModePerChain
+	}
+	if mode == crypto.EncryptModePerChain {
+		if len(enc.WrappedCEK) == 0 {
+			return errors.New("encrypted chain in per-chain mode but ChainEncryption.WrappedCEK is empty")
+		}
+		cek, err := b.Envelope.UnwrapCEK(enc.WrappedCEK)
+		if err != nil {
+			return fmt.Errorf("unwrap chain cek (wrong passphrase?): %w", err)
+		}
+		b.chainCEK = cek
+	}
+	return nil
+}
+
+// chunkCEK resolves the per-change-chunk CEK using the broker's
+// envelope + cached chain CEK. Mirrors [ChainRestore.changeChunkCEK].
+func (b *SyncFromBackup) chunkCEK(chunk *ir.ChunkInfo) ([]byte, error) {
+	if chunk.Encryption == nil {
+		return nil, nil
+	}
+	if len(chunk.Encryption.WrappedCEK) > 0 {
+		if b.Envelope == nil {
+			return nil, errors.New("per-chunk encrypted change chunk encountered without envelope")
+		}
+		cek, err := b.Envelope.UnwrapCEK(chunk.Encryption.WrappedCEK)
+		if err != nil {
+			return nil, fmt.Errorf("unwrap change chunk cek: %w", err)
+		}
+		return cek, nil
+	}
+	if b.chainCEK == nil {
+		return nil, errors.New("encrypted change chunk encountered but chain CEK is unset")
+	}
+	return b.chainCEK, nil
 }

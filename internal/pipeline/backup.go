@@ -53,8 +53,38 @@ import (
 	"path"
 	"time"
 
+	"github.com/orware/sluice/internal/crypto"
 	"github.com/orware/sluice/internal/ir"
 )
+
+// BackupEncryption is the chunk-writer-side encryption configuration
+// shared by [Backup], [IncrementalBackup], and [BackupStream]. Nil
+// means plaintext (the v0.16.x..v0.21.x shape, preserved for backward
+// compatibility); non-nil means every chunk written by this run is
+// encrypted under the supplied envelope.
+//
+// The orchestrator generates the per-chain CEK on first use (per-chain
+// mode; the default), wraps it via the envelope, and records the
+// wrapped CEK + Argon2id params (passphrase mode) in the chain
+// manifest's [ir.ChainEncryption] field. Per-chunk mode generates a
+// fresh CEK + wrap per chunk; the wrapped CEK lands in
+// [ir.ChunkEncryption.WrappedCEK].
+type BackupEncryption struct {
+	// Envelope is the [crypto.EnvelopeEncryption] implementation used
+	// to wrap CEKs. Phase 6.1: a *crypto.PassphraseEnvelope. Required
+	// when the parent struct's encryption is enabled.
+	Envelope crypto.EnvelopeEncryption
+
+	// Mode is "per-chain" (default) or "per-chunk". See
+	// `docs/dev/design-logical-backups-phase-6.md` for the trade-off.
+	Mode string
+
+	// KEKRef is the operator-visible reference recorded in
+	// [ir.ChainEncryption.KEKRef]. Empty for passphrase mode (the
+	// salt + Argon2id params are the reference); KMS modes record the
+	// key ARN / resource name.
+	KEKRef string
+}
 
 // DefaultBackupChunkRows is the per-chunk row count when [Backup]'s
 // ChunkRows is left at zero. 100,000 rows is the proto-ADR default;
@@ -118,6 +148,11 @@ type Backup struct {
 	// `migrate --reset-target-data` for the backup verb. In-progress
 	// manifests always resume regardless of this flag.
 	ForceOverwrite bool
+
+	// Encryption, when non-nil, encrypts every chunk this run writes.
+	// See [BackupEncryption]. Empty (nil) preserves the plaintext
+	// shape — the v0.16.x..v0.21.x default.
+	Encryption *BackupEncryption
 
 	// Now, when set, overrides the wall-clock-time source for
 	// [Manifest.CreatedAt]. Used by tests to pin timestamps; in
@@ -249,6 +284,17 @@ func (b *Backup) Run(ctx context.Context) error {
 		// not the resume point.
 		manifest.CreatedAt = prior.CreatedAt
 	}
+
+	// Phase 6.1: when encryption is enabled, generate the chain-level
+	// CEK (per-chain mode) up-front, wrap it via the envelope, and
+	// stamp the manifest's [ir.ChainEncryption] header. Per-chunk
+	// mode leaves the chain-level WrappedCEK empty; each chunk
+	// generates its own CEK at write time.
+	chainCEK, err := b.setupChainEncryption(manifest, prior)
+	if err != nil {
+		return fmt.Errorf("backup: setup encryption: %w", err)
+	}
+
 	priorTables := indexManifestTables(priorResumableTables(prior))
 
 	// Bug 34a: Once the schema is in hand, fan out the resume decision
@@ -315,7 +361,7 @@ func (b *Backup) Run(ctx context.Context) error {
 		// up-front so per-chunk checkpoints record progress as it
 		// accrues (Bug 34b's per-chunk granularity). The orchestrator
 		// must NOT append again here.
-		if _, err := b.backupTable(ctx, rr, table, chunkRows, priorTable, manifest); err != nil {
+		if _, err := b.backupTable(ctx, rr, table, chunkRows, priorTable, manifest, chainCEK); err != nil {
 			return wrapWithHint(PhaseBulkCopy, fmt.Errorf("backup: table %q: %w", table.Name, err))
 		}
 
@@ -571,6 +617,7 @@ func (b *Backup) backupTable(
 	chunkRows int,
 	priorTable *ir.TableManifest,
 	fullManifest *ir.Manifest,
+	chainCEK []byte,
 ) (*ir.TableManifest, error) {
 	rows, err := rr.ReadRows(ctx, table)
 	if err != nil {
@@ -596,10 +643,11 @@ func (b *Backup) backupTable(
 	}
 
 	var (
-		writer    *chunkWriter
-		buf       *bytes.Buffer
-		chunkIdx  int
-		rowsTotal int64
+		writer        *chunkWriter
+		buf           *bytes.Buffer
+		chunkIdx      int
+		rowsTotal     int64
+		curWrappedCEK []byte // populated only in per-chunk mode
 	)
 
 	flush := func() error {
@@ -625,13 +673,23 @@ func (b *Backup) backupTable(
 				return fmt.Errorf("store put %q: %w", chunkPath, err)
 			}
 		}
-		entry.Chunks = append(entry.Chunks, &ir.ChunkInfo{
+		ci := &ir.ChunkInfo{
 			File:     chunkPath,
 			RowCount: writer.RowCount(),
 			SHA256:   hash,
-		})
+		}
+		if b.Encryption != nil {
+			ci.Encryption = &ir.ChunkEncryption{
+				Algorithm:  crypto.AlgorithmAESGCM,
+				NonceLen:   crypto.NonceLen,
+				AuthTagLen: crypto.AuthTagLen,
+				WrappedCEK: curWrappedCEK, // empty for per-chain mode
+			}
+		}
+		entry.Chunks = append(entry.Chunks, ci)
 		writer = nil
 		buf = nil
+		curWrappedCEK = nil
 		chunkIdx++
 		// Per-chunk checkpoint: commit the manifest now so a mid-table
 		// crash (or kill) before the next table starts leaves an
@@ -759,7 +817,12 @@ func (b *Backup) backupTable(
 			}
 			if writer == nil {
 				buf = &bytes.Buffer{}
-				w, err := newChunkWriter(buf, colNames)
+				cek, wrapped, err := b.resolveChunkCEK(chainCEK)
+				if err != nil {
+					return nil, fmt.Errorf("resolve chunk cek: %w", err)
+				}
+				curWrappedCEK = wrapped
+				w, err := newChunkWriter(buf, colNames, cek)
 				if err != nil {
 					return nil, fmt.Errorf("open chunk: %w", err)
 				}
@@ -967,4 +1030,120 @@ func readManifest(ctx context.Context, store ir.BackupStore) (*ir.Manifest, erro
 			m.FormatVersion, ir.BackupFormatVersion)
 	}
 	return &m, nil
+}
+
+// setupChainEncryption configures the manifest's [ir.ChainEncryption]
+// header and returns the chain-level CEK (per-chain mode) or nil
+// (per-chunk mode). When encryption is disabled (b.Encryption == nil),
+// returns nil with no manifest mutation.
+//
+// Resume safety: if prior is a Phase 6 in-progress encrypted manifest,
+// the chain-level CEK is unwrapped from prior.ChainEncryption.WrappedCEK
+// using the supplied envelope, so per-chain mode resumes write
+// additional chunks against the same CEK as the original run. This is
+// the load-bearing equivalent of "open the prior CEK to keep encrypting
+// consistently with the chain so far."
+func (b *Backup) setupChainEncryption(manifest, prior *ir.Manifest) ([]byte, error) {
+	if b.Encryption == nil {
+		return nil, nil
+	}
+	enc := b.Encryption
+	if enc.Envelope == nil {
+		return nil, errors.New("backup: encryption envelope is nil")
+	}
+	mode := enc.Mode
+	if mode == "" {
+		mode = crypto.EncryptModePerChain
+	}
+	chainEnc := &ir.ChainEncryption{
+		Algorithm: crypto.AlgorithmAESGCM,
+		Mode:      mode,
+		KEKMode:   enc.Envelope.Mode(),
+		KEKRef:    enc.KEKRef,
+	}
+	// Passphrase mode: record the Argon2id params so a restore-side
+	// envelope can re-derive the same KEK.
+	if pe, ok := enc.Envelope.(*crypto.PassphraseEnvelope); ok {
+		p := pe.Params()
+		chainEnc.Argon2id = &ir.Argon2idParams{
+			Salt:        p.Salt,
+			Memory:      p.Memory,
+			Iterations:  p.Iterations,
+			Parallelism: p.Parallelism,
+			KeyLen:      p.KeyLen,
+		}
+	}
+
+	// Per-chunk mode: chain-level WrappedCEK stays empty; each chunk
+	// generates its own CEK.
+	if mode == crypto.EncryptModePerChunk {
+		manifest.ChainEncryption = chainEnc
+		return nil, nil
+	}
+
+	// Per-chain mode (default): generate a fresh CEK and wrap it.
+	// On resume of an in-progress encrypted manifest we re-use the
+	// prior wrap so chunks already on disk decrypt cleanly.
+	var chainCEK []byte
+	if prior != nil && prior.ChainEncryption != nil &&
+		len(prior.ChainEncryption.WrappedCEK) > 0 &&
+		prior.ChainEncryption.Mode == crypto.EncryptModePerChain {
+		// Unwrap to recover the in-flight CEK.
+		cek, err := enc.Envelope.UnwrapCEK(prior.ChainEncryption.WrappedCEK)
+		if err != nil {
+			return nil, fmt.Errorf("unwrap prior chain cek: %w", err)
+		}
+		chainCEK = cek
+		chainEnc.WrappedCEK = prior.ChainEncryption.WrappedCEK
+		// Preserve the Argon2id params from the prior manifest so the
+		// salt remains stable across resume (the freshly-derived
+		// envelope was built from the operator's passphrase + the
+		// recorded salt; either source recovers the same KEK).
+		if prior.ChainEncryption.Argon2id != nil {
+			chainEnc.Argon2id = prior.ChainEncryption.Argon2id
+		}
+	} else {
+		cek, err := crypto.GenerateCEK()
+		if err != nil {
+			return nil, fmt.Errorf("generate chain cek: %w", err)
+		}
+		wrapped, err := enc.Envelope.WrapCEK(cek)
+		if err != nil {
+			return nil, fmt.Errorf("wrap chain cek: %w", err)
+		}
+		chainCEK = cek
+		chainEnc.WrappedCEK = wrapped
+	}
+	manifest.ChainEncryption = chainEnc
+	return chainCEK, nil
+}
+
+// resolveChunkCEK returns the (cek, wrappedCEK) pair to use for the
+// next chunk. Per-chain mode reuses the chain-level CEK and records an
+// empty wrapped value (the ChunkEncryption.WrappedCEK field). Per-chunk
+// mode generates a fresh CEK + wrap on every call.
+//
+// Returns (nil, nil, nil) when encryption is disabled — caller passes
+// nil cek to newChunkWriter for the plaintext path.
+func (b *Backup) resolveChunkCEK(chainCEK []byte) (cek, wrapped []byte, err error) {
+	if b.Encryption == nil {
+		return nil, nil, nil
+	}
+	mode := b.Encryption.Mode
+	if mode == "" {
+		mode = crypto.EncryptModePerChain
+	}
+	if mode == crypto.EncryptModePerChain {
+		return chainCEK, nil, nil
+	}
+	// Per-chunk: fresh CEK + fresh wrap.
+	cek, err = crypto.GenerateCEK()
+	if err != nil {
+		return nil, nil, fmt.Errorf("generate chunk cek: %w", err)
+	}
+	wrapped, err = b.Encryption.Envelope.WrapCEK(cek)
+	if err != nil {
+		return nil, nil, fmt.Errorf("wrap chunk cek: %w", err)
+	}
+	return cek, wrapped, nil
 }

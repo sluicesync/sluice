@@ -54,6 +54,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/orware/sluice/internal/crypto"
 	"github.com/orware/sluice/internal/ir"
 )
 
@@ -69,12 +70,26 @@ type chunkHeader struct {
 }
 
 // chunkWriter streams JSON-Lines rows to a gzip-compressed [io.Writer]
-// while computing a SHA-256 over the gzipped bytes (so restore-time
-// verification matches what's actually on disk / in object storage).
+// while computing a SHA-256 over the bytes that land on disk (so
+// restore-time verification matches what's actually on disk / in
+// object storage).
 //
-// Lifecycle: NewChunkWriter → WriteRow* → Close. Close MUST be called
-// (it flushes the gzip buffer). Hash() returns the final hex SHA-256
-// only after Close.
+// Two modes:
+//
+//   - Plaintext (cek == nil): rows → gzip → tee(out + sha256). The
+//     bytes flow through directly; Close flushes gzip and the hash
+//     covers exactly what's in `out`.
+//   - Encrypted (cek != nil): rows → gzip → internal buffer. On
+//     Close, the buffered gzipped bytes are encrypted via
+//     [crypto.EncryptChunk] (AES-256-GCM with a fresh random nonce),
+//     and the ciphertext is what's hashed AND written to `out`. The
+//     manifest's recorded SHA-256 covers ciphertext bytes — `backup
+//     verify` (sha256-only) doesn't need decryption.
+//
+// Lifecycle: newChunkWriter → WriteRow* → Close. Close MUST be called
+// (it flushes the gzip buffer and, in encrypted mode, performs the
+// encryption + write). Hash() returns the final hex SHA-256 only
+// after Close.
 type chunkWriter struct {
 	out      io.Writer
 	hasher   hash.Hash
@@ -82,15 +97,44 @@ type chunkWriter struct {
 	bufW     *bufio.Writer
 	rowCount int64
 	closed   bool
+
+	// cek, when non-nil, enables encrypted mode. It's the Content
+	// Encryption Key handed in by the orchestrator; chunkWriter is
+	// not responsible for generating or wrapping it.
+	cek []byte
+
+	// gzBuf is the in-memory buffer used in encrypted mode. The gzip
+	// writer writes here instead of `out` directly; on Close the
+	// bytes get encrypted and pushed to `out`.
+	gzBuf *bytes.Buffer
 }
 
 // newChunkWriter wraps out (the destination — typically a pipe to
 // [ir.BackupStore.Put]) with gzip + JSON-Lines machinery and writes
 // the format header. Caller must call Close to flush.
-func newChunkWriter(out io.Writer, columns []string) (*chunkWriter, error) {
+//
+// When cek is non-nil, encryption is applied at Close time (see
+// [chunkWriter] for the two modes). cek must be exactly
+// [crypto.CEKLen] bytes.
+func newChunkWriter(out io.Writer, columns []string, cek []byte) (*chunkWriter, error) {
+	if cek != nil && len(cek) != crypto.CEKLen {
+		return nil, fmt.Errorf("chunk writer: cek length %d != %d", len(cek), crypto.CEKLen)
+	}
 	hasher := sha256.New()
-	tee := io.MultiWriter(out, hasher)
-	gz := gzip.NewWriter(tee)
+	var (
+		gzDst io.Writer
+		gzBuf *bytes.Buffer
+	)
+	if cek == nil {
+		// Plaintext: gzip writes directly to out + hasher via a tee.
+		gzDst = io.MultiWriter(out, hasher)
+	} else {
+		// Encrypted: gzip writes into an in-memory buffer; Close()
+		// encrypts the buffered bytes and pushes them to out + hasher.
+		gzBuf = &bytes.Buffer{}
+		gzDst = gzBuf
+	}
+	gz := gzip.NewWriter(gzDst)
 	bw := bufio.NewWriter(gz)
 
 	// Header line.
@@ -110,6 +154,8 @@ func newChunkWriter(out io.Writer, columns []string) (*chunkWriter, error) {
 		hasher:   hasher,
 		gzWriter: gz,
 		bufW:     bw,
+		cek:      cek,
+		gzBuf:    gzBuf,
 	}, nil
 }
 
@@ -144,7 +190,8 @@ func (w *chunkWriter) WriteRow(row ir.Row, columns []*ir.Column) error {
 
 // Close flushes the buffered writer and gzip stream. Safe to call
 // twice; the second call is a no-op. Returns the SHA-256 hex digest
-// of the gzipped bytes after Close completes.
+// of the chunk's bytes (post-encryption when in encrypted mode) after
+// Close completes.
 func (w *chunkWriter) Close() error {
 	if w.closed {
 		return nil
@@ -155,6 +202,22 @@ func (w *chunkWriter) Close() error {
 	}
 	if err := w.gzWriter.Close(); err != nil {
 		return fmt.Errorf("chunk writer gzip close: %w", err)
+	}
+	if w.cek != nil {
+		// Encrypted mode: encrypt the buffered gzipped bytes and emit
+		// `[nonce | ciphertext | authtag]` to out + hasher. The
+		// manifest's recorded SHA-256 covers ciphertext, matching
+		// what `backup verify` re-hashes off disk.
+		ct, err := crypto.EncryptChunk(w.gzBuf.Bytes(), w.cek)
+		if err != nil {
+			return fmt.Errorf("chunk writer encrypt: %w", err)
+		}
+		if _, err := w.hasher.Write(ct); err != nil {
+			return fmt.Errorf("chunk writer hash: %w", err)
+		}
+		if _, err := w.out.Write(ct); err != nil {
+			return fmt.Errorf("chunk writer ciphertext write: %w", err)
+		}
 	}
 	return nil
 }
@@ -172,6 +235,11 @@ func (w *chunkWriter) RowCount() int64 { return w.rowCount }
 // gzip-compressed JSON Lines stream while computing a SHA-256 to
 // compare against the manifest entry. Returns ErrChunkHashMismatch
 // at EOF if the recomputed hash doesn't match the expected value.
+//
+// When the chunk is encrypted, the entire ciphertext is read + hashed
+// + decrypted up front in [newChunkReader]; the rest of the read path
+// then feeds plaintext bytes through the gzip reader as if the chunk
+// were never encrypted.
 type chunkReader struct {
 	src      io.ReadCloser
 	hasher   hash.Hash
@@ -179,6 +247,16 @@ type chunkReader struct {
 	scanner  *bufio.Scanner
 	expected string
 	header   chunkHeader
+
+	// encrypted reports whether [newChunkReader] consumed src
+	// up-front and is feeding the gzip reader from an in-memory
+	// plaintext buffer.
+	encrypted bool
+
+	// consumedSrc, when true, means the encrypted-path read+drained
+	// src already; the Close path skips the "drain underlying" step
+	// to avoid reading from an already-consumed reader.
+	consumedSrc bool
 }
 
 // ErrChunkHashMismatch surfaces when a chunk's recomputed SHA-256
@@ -191,10 +269,49 @@ var ErrChunkHashMismatch = errors.New("backup: chunk SHA-256 mismatch")
 // expectedSHA256 is the hex digest from the manifest; on Close the
 // reader compares the recomputed hash and returns
 // [ErrChunkHashMismatch] if they differ.
-func newChunkReader(src io.ReadCloser, expectedSHA256 string) (*chunkReader, error) {
+//
+// When cek is non-nil, the reader treats src as encrypted bytes: it
+// reads the entire ciphertext into memory, hashes ciphertext for
+// verification, decrypts via [crypto.DecryptChunk], and feeds the
+// resulting plaintext gzip stream to the rest of the machinery.
+// chunks are bounded (typically a few MB compressed); buffering whole
+// chunk in RAM is acceptable.
+func newChunkReader(src io.ReadCloser, expectedSHA256 string, cek []byte) (*chunkReader, error) {
+	if cek != nil && len(cek) != crypto.CEKLen {
+		_ = src.Close()
+		return nil, fmt.Errorf("chunk reader: cek length %d != %d", len(cek), crypto.CEKLen)
+	}
 	hasher := sha256.New()
-	tee := io.TeeReader(src, hasher)
-	gz, err := gzip.NewReader(tee)
+
+	var (
+		gzSrc       io.Reader
+		encrypted   bool
+		consumedSrc bool // true → we already drained src (encrypted path)
+	)
+	if cek == nil {
+		gzSrc = io.TeeReader(src, hasher)
+	} else {
+		// Encrypted: read all ciphertext, hash it, decrypt, feed
+		// plaintext (the gzip stream) to the gzip reader.
+		ct, err := io.ReadAll(src)
+		if err != nil {
+			_ = src.Close()
+			return nil, fmt.Errorf("chunk reader: read ciphertext: %w", err)
+		}
+		if _, err := hasher.Write(ct); err != nil {
+			_ = src.Close()
+			return nil, fmt.Errorf("chunk reader: hash ciphertext: %w", err)
+		}
+		pt, err := crypto.DecryptChunk(ct, cek)
+		if err != nil {
+			_ = src.Close()
+			return nil, fmt.Errorf("chunk reader: decrypt: %w", err)
+		}
+		gzSrc = bytes.NewReader(pt)
+		encrypted = true
+		consumedSrc = true
+	}
+	gz, err := gzip.NewReader(gzSrc)
 	if err != nil {
 		_ = src.Close()
 		return nil, fmt.Errorf("chunk reader: gzip header: %w", err)
@@ -218,12 +335,14 @@ func newChunkReader(src io.ReadCloser, expectedSHA256 string) (*chunkReader, err
 			hdr.Version, chunkHeaderVersion)
 	}
 	return &chunkReader{
-		src:      src,
-		hasher:   hasher,
-		gzReader: gz,
-		scanner:  sc,
-		expected: expectedSHA256,
-		header:   hdr,
+		src:         src,
+		hasher:      hasher,
+		gzReader:    gz,
+		scanner:     sc,
+		expected:    expectedSHA256,
+		header:      hdr,
+		encrypted:   encrypted,
+		consumedSrc: consumedSrc,
 	}, nil
 }
 
@@ -271,11 +390,15 @@ func (r *chunkReader) Close() error {
 		_ = r.src.Close()
 		return fmt.Errorf("chunk reader: gzip close: %w", err)
 	}
-	// Drain the underlying source through the tee so the hasher sees
-	// any trailing bytes the gzip stream didn't consume.
-	if _, err := io.Copy(io.Discard, r.src); err != nil {
-		_ = r.src.Close()
-		return fmt.Errorf("chunk reader: drain underlying: %w", err)
+	if !r.consumedSrc {
+		// Drain the underlying source through the tee so the hasher
+		// sees any trailing bytes the gzip stream didn't consume.
+		// Encrypted chunks have already had src fully consumed inside
+		// newChunkReader; skip to avoid reading nothing twice.
+		if _, err := io.Copy(io.Discard, r.src); err != nil {
+			_ = r.src.Close()
+			return fmt.Errorf("chunk reader: drain underlying: %w", err)
+		}
 	}
 	if err := r.src.Close(); err != nil {
 		return fmt.Errorf("chunk reader: src close: %w", err)

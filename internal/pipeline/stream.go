@@ -59,6 +59,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/orware/sluice/internal/crypto"
 	"github.com/orware/sluice/internal/ir"
 )
 
@@ -192,6 +193,12 @@ type BackupStream struct {
 	// recorded on every manifest. Optional.
 	SluiceVersion string
 
+	// Encryption, when non-nil, encrypts every change chunk written
+	// during the stream's lifetime. See [BackupEncryption]. Aligns
+	// against the parent's chain encryption at startup; mismatched
+	// shapes (encrypt mid-chain or vice versa) are refused there.
+	Encryption *BackupEncryption
+
 	// Now, when set, overrides the wall-clock-time source for
 	// [ir.Manifest.CreatedAt] and `stream_state.json` timestamps. Used
 	// by tests to pin timestamps; in production callers leave it nil
@@ -281,6 +288,14 @@ func (b *BackupStream) Run(ctx context.Context) error {
 		)
 	}
 
+	// 2.5. Phase 6.1: align with chain encryption. Refuses early if
+	// the parent's chain encryption shape doesn't match the operator's
+	// supplied envelope (or vice versa).
+	chainCEK, err := b.alignEncryption(parent)
+	if err != nil {
+		return fmt.Errorf("stream: encryption: %w", err)
+	}
+
 	// 3. Open CDC pump once for the lifetime of the stream.
 	cdc, err := openCDCReaderWithSlot(ctx, b.Source, b.SourceDSN, b.SlotName)
 	if err != nil {
@@ -345,7 +360,7 @@ func (b *BackupStream) Run(ctx context.Context) error {
 
 		// Run one rollover.
 		started := clockNow()
-		roll, rErr := b.runRollover(ctx, cdc, changesCh, currentParent, startPos, rolloverWindow, maxChanges, maxBytes, chunkSize, statePath, now, clockNow, stopCh)
+		roll, rErr := b.runRollover(ctx, cdc, changesCh, currentParent, startPos, rolloverWindow, maxChanges, maxBytes, chunkSize, statePath, now, clockNow, stopCh, chainCEK)
 		elapsed := clockNow().Sub(started)
 		if rErr != nil {
 			// ctx-cancel during a rollover surfaces here. Per the
@@ -607,6 +622,7 @@ func (b *BackupStream) runRollover(
 	now func() time.Time,
 	clockNow func() time.Time,
 	stopCh <-chan struct{},
+	chainCEK []byte,
 ) (rolloverOutcome, error) {
 	beforeSchema := parent.Schema
 	beforeHash, hashErr := ir.ComputeSchemaHash(beforeSchema)
@@ -631,7 +647,7 @@ func (b *BackupStream) runRollover(
 	}
 
 	deadline := clockNow().Add(window)
-	captured, captureErr := b.captureWindow(ctx, cdc, changesCh, manifest, chunkSize, deadline, maxChanges, maxBytes, statePath, clockNow, stopCh)
+	captured, captureErr := b.captureWindow(ctx, cdc, changesCh, manifest, chunkSize, deadline, maxChanges, maxBytes, statePath, clockNow, stopCh, chainCEK)
 	out := rolloverOutcome{
 		TotalChanges:  captured.TotalChanges,
 		TotalBytes:    captured.TotalBytes,
@@ -800,6 +816,7 @@ func (b *BackupStream) captureWindow(
 	statePath string,
 	clockNow func() time.Time,
 	stopCh <-chan struct{},
+	chainCEK []byte,
 ) (captureOutcome, error) {
 	var (
 		writer        *changeChunkWriter
@@ -807,6 +824,7 @@ func (b *BackupStream) captureWindow(
 		chunkIdx      int
 		inTransaction bool
 		out           captureOutcome
+		curWrappedCEK []byte
 	)
 
 	runNamespace := changeChunkRunNamespace(manifest)
@@ -824,14 +842,24 @@ func (b *BackupStream) captureWindow(
 		if err := b.Store.Put(putCtx, path, buf); err != nil {
 			return fmt.Errorf("store put %q: %w", path, err)
 		}
-		manifest.ChangeChunks = append(manifest.ChangeChunks, &ir.ChunkInfo{
+		ci := &ir.ChunkInfo{
 			File:     path,
 			RowCount: writer.ChangeCount(),
 			SHA256:   hash,
-		})
+		}
+		if b.Encryption != nil {
+			ci.Encryption = &ir.ChunkEncryption{
+				Algorithm:  crypto.AlgorithmAESGCM,
+				NonceLen:   crypto.NonceLen,
+				AuthTagLen: crypto.AuthTagLen,
+				WrappedCEK: curWrappedCEK,
+			}
+		}
+		manifest.ChangeChunks = append(manifest.ChangeChunks, ci)
 		out.TotalBytes += nb
 		writer = nil
 		buf = nil
+		curWrappedCEK = nil
 		chunkIdx++
 		return nil
 	}
@@ -839,7 +867,12 @@ func (b *BackupStream) captureWindow(
 
 	openWriter := func() error {
 		buf = &bytes.Buffer{}
-		w, err := newChangeChunkWriter(buf)
+		cek, wrapped, err := b.resolveChunkCEK(chainCEK)
+		if err != nil {
+			return fmt.Errorf("resolve chunk cek: %w", err)
+		}
+		curWrappedCEK = wrapped
+		w, err := newChangeChunkWriter(buf, cek)
 		if err != nil {
 			return fmt.Errorf("open chunk: %w", err)
 		}
@@ -1077,4 +1110,65 @@ func newShellCommand(ctx context.Context, cmdStr string) *exec.Cmd {
 	// SLUICE_ROLLOVER_* vars after.
 	cmd.Env = append(cmd.Env, processEnv()...)
 	return cmd
+}
+
+// alignEncryption mirrors [IncrementalBackup.alignEncryption]: validates
+// that this stream's encryption configuration is consistent with the
+// chain root's recorded shape, and returns the per-chain CEK (if any).
+func (b *BackupStream) alignEncryption(parent *ir.Manifest) ([]byte, error) {
+	parentEnc := parent.ChainEncryption
+	switch {
+	case parentEnc == nil && b.Encryption == nil:
+		return nil, nil
+	case parentEnc == nil && b.Encryption != nil:
+		return nil, errors.New("stream: parent chain is plaintext but --encrypt was supplied; cannot extend a plaintext chain with encrypted incrementals")
+	case parentEnc != nil && b.Encryption == nil:
+		return nil, fmt.Errorf("stream: parent chain is encrypted (algorithm=%q kek_mode=%q kek_ref=%q) but no --encrypt + key was supplied",
+			parentEnc.Algorithm, parentEnc.KEKMode, parentEnc.KEKRef)
+	}
+	if b.Encryption.Envelope == nil {
+		return nil, errors.New("stream: encryption envelope is nil")
+	}
+	if parentEnc.KEKMode != "" && b.Encryption.Envelope.Mode() != parentEnc.KEKMode {
+		return nil, fmt.Errorf("stream: envelope mode %q does not match chain's recorded kek_mode %q",
+			b.Encryption.Envelope.Mode(), parentEnc.KEKMode)
+	}
+	mode := parentEnc.Mode
+	if mode == "" {
+		mode = crypto.EncryptModePerChain
+	}
+	if mode == crypto.EncryptModePerChain {
+		if len(parentEnc.WrappedCEK) == 0 {
+			return nil, errors.New("stream: parent's chain encryption is per-chain but WrappedCEK is empty")
+		}
+		cek, err := b.Encryption.Envelope.UnwrapCEK(parentEnc.WrappedCEK)
+		if err != nil {
+			return nil, fmt.Errorf("stream: unwrap parent chain cek: %w", err)
+		}
+		return cek, nil
+	}
+	return nil, nil
+}
+
+// resolveChunkCEK mirrors [Backup.resolveChunkCEK].
+func (b *BackupStream) resolveChunkCEK(chainCEK []byte) (cek, wrapped []byte, err error) {
+	if b.Encryption == nil {
+		return nil, nil, nil
+	}
+	mode := b.Encryption.Mode
+	if mode == "" {
+		mode = crypto.EncryptModePerChain
+	}
+	if mode == crypto.EncryptModePerChain {
+		return chainCEK, nil, nil
+	}
+	cek, err = crypto.GenerateCEK()
+	if err != nil {
+		return nil, nil, fmt.Errorf("generate chunk cek: %w", err)
+	}
+	wrapped, err = b.Encryption.Envelope.WrapCEK(cek)
+	if err != nil {
+		return nil, nil, fmt.Errorf("wrap chunk cek: %w", err)
+	}
+	return cek, wrapped, nil
 }

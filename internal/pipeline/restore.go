@@ -29,6 +29,7 @@ import (
 	"io"
 	"log/slog"
 
+	"github.com/orware/sluice/internal/crypto"
 	"github.com/orware/sluice/internal/ir"
 	"github.com/orware/sluice/internal/translate"
 )
@@ -65,6 +66,20 @@ type Restore struct {
 	// false; the public single-manifest restore path detects chain
 	// shape and dispatches.
 	SkipChainDispatch bool
+
+	// Envelope, when non-nil, is the [crypto.EnvelopeEncryption] used
+	// to unwrap CEKs from encrypted manifests. Required when the
+	// chain's full manifest carries [ir.ChainEncryption]. A nil
+	// Envelope against an encrypted chain produces a clear refusal
+	// at chain-walk time naming the missing key — no partial data
+	// lands on the target.
+	Envelope crypto.EnvelopeEncryption
+
+	// chainCEK caches the chain-level CEK after first unwrap so
+	// per-chain mode pays the unwrap cost (Argon2id, KMS Decrypt)
+	// exactly once per Run. Internal — set by Run on the first
+	// encrypted-chunk read.
+	chainCEK []byte
 }
 
 // Run executes the restore. Returns nil on success; a wrapped error
@@ -119,6 +134,15 @@ func (r *Restore) Run(ctx context.Context) error {
 
 	if manifest.Schema == nil {
 		return errors.New("restore: manifest carries no schema")
+	}
+
+	// 1.5. Encryption pre-flight. If the chain root manifest carries
+	// [ir.ChainEncryption], the operator MUST have supplied an
+	// envelope that can unwrap the chain's CEK. A missing envelope
+	// against an encrypted chain refuses up-front so no partial data
+	// lands on the target.
+	if err := r.preflightEncryption(manifest); err != nil {
+		return wrapWithHint(PhaseConnect, fmt.Errorf("restore: %w", err))
 	}
 
 	// 2. Filter tables — both at the schema level (so unwanted
@@ -325,7 +349,12 @@ func (r *Restore) streamChunkRows(
 	if err != nil {
 		return 0, fmt.Errorf("open chunk: %w", err)
 	}
-	cr, err := newChunkReader(src, chunk.SHA256)
+	cek, err := r.chunkCEK(chunk)
+	if err != nil {
+		_ = src.Close()
+		return 0, fmt.Errorf("resolve chunk cek: %w", err)
+	}
+	cr, err := newChunkReader(src, chunk.SHA256, cek)
 	if err != nil {
 		return 0, fmt.Errorf("open chunk reader: %w", err)
 	}
@@ -398,6 +427,77 @@ func manifestTableKey(schema, name string) string {
 		return name
 	}
 	return schema + "." + name
+}
+
+// preflightEncryption inspects the manifest for [ir.ChainEncryption]
+// and, when present, validates that an envelope is supplied and that
+// it can unwrap the chain's CEK. Caches the chain-level CEK on
+// r.chainCEK for per-chain mode so subsequent chunk reads pay no
+// further unwrap cost.
+//
+// On a plaintext chain this is a no-op; on an encrypted chain with no
+// envelope, it returns an operator-actionable error naming the chain's
+// KEKMode and (where relevant) KEKRef so the operator knows what they
+// need to supply.
+func (r *Restore) preflightEncryption(manifest *ir.Manifest) error {
+	if manifest == nil || manifest.ChainEncryption == nil {
+		return nil
+	}
+	enc := manifest.ChainEncryption
+	if r.Envelope == nil {
+		return fmt.Errorf("encrypted chain (algorithm=%q kek_mode=%q kek_ref=%q) requires --encrypt + a passphrase / KMS reference; no key was supplied",
+			enc.Algorithm, enc.KEKMode, enc.KEKRef)
+	}
+	if enc.KEKMode != "" && r.Envelope.Mode() != enc.KEKMode {
+		return fmt.Errorf("encryption envelope mode %q does not match chain's recorded kek_mode %q",
+			r.Envelope.Mode(), enc.KEKMode)
+	}
+	mode := enc.Mode
+	if mode == "" {
+		mode = crypto.EncryptModePerChain
+	}
+	if mode == crypto.EncryptModePerChain {
+		if len(enc.WrappedCEK) == 0 {
+			return errors.New("encrypted chain in per-chain mode but ChainEncryption.WrappedCEK is empty (manifest corrupted?)")
+		}
+		cek, err := r.Envelope.UnwrapCEK(enc.WrappedCEK)
+		if err != nil {
+			return fmt.Errorf("unwrap chain cek (wrong passphrase / KMS key?): %w", err)
+		}
+		r.chainCEK = cek
+	}
+	return nil
+}
+
+// chunkCEK returns the per-chunk CEK for chunk based on the chunk's
+// recorded [ir.ChunkEncryption]. Per-chain mode returns r.chainCEK;
+// per-chunk mode unwraps the chunk's own [ir.ChunkEncryption.WrappedCEK]
+// via the envelope.
+//
+// Returns nil for plaintext chunks (Encryption == nil) — caller passes
+// nil cek to newChunkReader for the legacy plaintext read path.
+func (r *Restore) chunkCEK(chunk *ir.ChunkInfo) ([]byte, error) {
+	if chunk.Encryption == nil {
+		return nil, nil
+	}
+	// Per-chunk wrap takes precedence: if the chunk carries its own
+	// wrapped CEK, unwrap it.
+	if len(chunk.Encryption.WrappedCEK) > 0 {
+		if r.Envelope == nil {
+			return nil, errors.New("per-chunk encrypted chunk encountered without envelope")
+		}
+		cek, err := r.Envelope.UnwrapCEK(chunk.Encryption.WrappedCEK)
+		if err != nil {
+			return nil, fmt.Errorf("unwrap chunk cek: %w", err)
+		}
+		return cek, nil
+	}
+	// Per-chain mode: use the cached chain CEK (preflight already
+	// unwrapped it).
+	if r.chainCEK == nil {
+		return nil, errors.New("encrypted chunk encountered but chain CEK is unset (preflight skipped?)")
+	}
+	return r.chainCEK, nil
 }
 
 // VerifyBackup walks every chunk referenced by the manifest in store,

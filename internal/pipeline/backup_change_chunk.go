@@ -36,6 +36,7 @@ import (
 	"hash"
 	"io"
 
+	"github.com/orware/sluice/internal/crypto"
 	"github.com/orware/sluice/internal/ir"
 )
 
@@ -51,8 +52,9 @@ type changeChunkHeader struct {
 const changeChunkKind = "changes"
 
 // changeChunkWriter streams [ir.Change] events into a gzip-compressed
-// JSON Lines stream while tracking SHA-256 over the gzipped bytes.
-// Lifecycle mirrors [chunkWriter]: New → WriteChange* → Close.
+// JSON Lines stream while tracking SHA-256 over the bytes that land on
+// disk (post-encryption when in encrypted mode). Lifecycle mirrors
+// [chunkWriter]: New → WriteChange* → Close.
 type changeChunkWriter struct {
 	out         io.Writer
 	hasher      hash.Hash
@@ -60,15 +62,36 @@ type changeChunkWriter struct {
 	bufW        *bufio.Writer
 	changeCount int64
 	closed      bool
+
+	// cek, when non-nil, enables encrypted mode (mirrors chunkWriter).
+	cek   []byte
+	gzBuf *bytes.Buffer
 }
 
 // newChangeChunkWriter wraps out (typically a pipe-buffer destined
 // for [ir.BackupStore.Put]) with the gzip + JSONL machinery and
 // writes the chunk header. Caller must call Close to flush.
-func newChangeChunkWriter(out io.Writer) (*changeChunkWriter, error) {
+//
+// When cek is non-nil, the gzipped JSONL bytes are buffered in memory
+// and AES-256-GCM-encrypted at Close time before being written to out.
+// The hasher covers post-encryption bytes so `backup verify`'s
+// sha256-only check matches what's on disk.
+func newChangeChunkWriter(out io.Writer, cek []byte) (*changeChunkWriter, error) {
+	if cek != nil && len(cek) != crypto.CEKLen {
+		return nil, fmt.Errorf("change chunk writer: cek length %d != %d", len(cek), crypto.CEKLen)
+	}
 	hasher := sha256.New()
-	tee := io.MultiWriter(out, hasher)
-	gz := gzip.NewWriter(tee)
+	var (
+		gzDst io.Writer
+		gzBuf *bytes.Buffer
+	)
+	if cek == nil {
+		gzDst = io.MultiWriter(out, hasher)
+	} else {
+		gzBuf = &bytes.Buffer{}
+		gzDst = gzBuf
+	}
+	gz := gzip.NewWriter(gzDst)
 	bw := bufio.NewWriter(gz)
 
 	hdr := changeChunkHeader{Version: chunkHeaderVersion, ChunkKind: changeChunkKind}
@@ -87,6 +110,8 @@ func newChangeChunkWriter(out io.Writer) (*changeChunkWriter, error) {
 		hasher:   hasher,
 		gzWriter: gz,
 		bufW:     bw,
+		cek:      cek,
+		gzBuf:    gzBuf,
 	}, nil
 }
 
@@ -115,7 +140,9 @@ func (w *changeChunkWriter) WriteChange(c ir.Change) error {
 	return nil
 }
 
-// Close flushes the buffered writer and gzip stream. Idempotent.
+// Close flushes the buffered writer and gzip stream. Idempotent. In
+// encrypted mode, encrypts the gzipped buffer and writes the
+// ciphertext to out before returning.
 func (w *changeChunkWriter) Close() error {
 	if w.closed {
 		return nil
@@ -126,6 +153,18 @@ func (w *changeChunkWriter) Close() error {
 	}
 	if err := w.gzWriter.Close(); err != nil {
 		return fmt.Errorf("change chunk writer gzip close: %w", err)
+	}
+	if w.cek != nil {
+		ct, err := crypto.EncryptChunk(w.gzBuf.Bytes(), w.cek)
+		if err != nil {
+			return fmt.Errorf("change chunk writer encrypt: %w", err)
+		}
+		if _, err := w.hasher.Write(ct); err != nil {
+			return fmt.Errorf("change chunk writer hash: %w", err)
+		}
+		if _, err := w.out.Write(ct); err != nil {
+			return fmt.Errorf("change chunk writer ciphertext write: %w", err)
+		}
 	}
 	return nil
 }
@@ -139,7 +178,8 @@ func (w *changeChunkWriter) Hash() string {
 func (w *changeChunkWriter) ChangeCount() int64 { return w.changeCount }
 
 // changeChunkReader is the inverse: streams [ir.Change] events back
-// from a change chunk while validating SHA-256.
+// from a change chunk while validating SHA-256. When cek is non-nil,
+// the chunk's bytes are decrypted up-front (mirrors [chunkReader]).
 type changeChunkReader struct {
 	src      io.ReadCloser
 	hasher   hash.Hash
@@ -147,12 +187,44 @@ type changeChunkReader struct {
 	scanner  *bufio.Scanner
 	expected string
 	header   changeChunkHeader
+
+	encrypted   bool
+	consumedSrc bool
 }
 
-func newChangeChunkReader(src io.ReadCloser, expectedSHA256 string) (*changeChunkReader, error) {
+func newChangeChunkReader(src io.ReadCloser, expectedSHA256 string, cek []byte) (*changeChunkReader, error) {
+	if cek != nil && len(cek) != crypto.CEKLen {
+		_ = src.Close()
+		return nil, fmt.Errorf("change chunk reader: cek length %d != %d", len(cek), crypto.CEKLen)
+	}
 	hasher := sha256.New()
-	tee := io.TeeReader(src, hasher)
-	gz, err := gzip.NewReader(tee)
+	var (
+		gzSrc       io.Reader
+		encrypted   bool
+		consumedSrc bool
+	)
+	if cek == nil {
+		gzSrc = io.TeeReader(src, hasher)
+	} else {
+		ct, err := io.ReadAll(src)
+		if err != nil {
+			_ = src.Close()
+			return nil, fmt.Errorf("change chunk reader: read ciphertext: %w", err)
+		}
+		if _, err := hasher.Write(ct); err != nil {
+			_ = src.Close()
+			return nil, fmt.Errorf("change chunk reader: hash ciphertext: %w", err)
+		}
+		pt, err := crypto.DecryptChunk(ct, cek)
+		if err != nil {
+			_ = src.Close()
+			return nil, fmt.Errorf("change chunk reader: decrypt: %w", err)
+		}
+		gzSrc = bytes.NewReader(pt)
+		encrypted = true
+		consumedSrc = true
+	}
+	gz, err := gzip.NewReader(gzSrc)
 	if err != nil {
 		_ = src.Close()
 		return nil, fmt.Errorf("change chunk reader: gzip header: %w", err)
@@ -177,12 +249,14 @@ func newChangeChunkReader(src io.ReadCloser, expectedSHA256 string) (*changeChun
 		return nil, fmt.Errorf("change chunk reader: chunk_kind = %q; want %q", hdr.ChunkKind, changeChunkKind)
 	}
 	return &changeChunkReader{
-		src:      src,
-		hasher:   hasher,
-		gzReader: gz,
-		scanner:  sc,
-		expected: expectedSHA256,
-		header:   hdr,
+		src:         src,
+		hasher:      hasher,
+		gzReader:    gz,
+		scanner:     sc,
+		expected:    expectedSHA256,
+		header:      hdr,
+		encrypted:   encrypted,
+		consumedSrc: consumedSrc,
 	}, nil
 }
 
@@ -219,9 +293,11 @@ func (r *changeChunkReader) Close() error {
 		_ = r.src.Close()
 		return fmt.Errorf("change chunk reader: gzip close: %w", err)
 	}
-	if _, err := io.Copy(io.Discard, r.src); err != nil {
-		_ = r.src.Close()
-		return fmt.Errorf("change chunk reader: drain underlying: %w", err)
+	if !r.consumedSrc {
+		if _, err := io.Copy(io.Discard, r.src); err != nil {
+			_ = r.src.Close()
+			return fmt.Errorf("change chunk reader: drain underlying: %w", err)
+		}
 	}
 	if err := r.src.Close(); err != nil {
 		return fmt.Errorf("change chunk reader: src close: %w", err)
