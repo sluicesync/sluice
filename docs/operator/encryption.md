@@ -1,6 +1,6 @@
-# Backup encryption (Phase 6.1 — passphrase mode)
+# Backup encryption
 
-`sluice` v0.22.0 introduces client-side envelope encryption for logical backup chunks. Once enabled, chunks land on storage as AES-256-GCM ciphertext; only an operator with the right passphrase can recover the underlying rows. This guide covers the operator-facing shape: when to enable it, how to manage passphrases safely, and the recovery posture.
+`sluice` v0.22.0 introduced client-side envelope encryption for logical backup chunks (passphrase mode); v0.23.0 adds AWS KMS-backed encryption alongside it. Once enabled, chunks land on storage as AES-256-GCM ciphertext; only an operator with the right key material (passphrase or KMS-rooted IAM access) can recover the underlying rows. This guide covers the operator-facing shape: when to enable it, which mode fits which workload, and the recovery posture.
 
 ## What encryption protects against
 
@@ -131,7 +131,137 @@ Phase 6.1 passphrase rotation is a **fresh-chain workflow**:
 
 Re-encrypting existing chunks under a new passphrase is out of scope for Phase 6.1; operator can rotate forward by starting a new chain.
 
-(KMS-mode key rotation, coming in Phase 6.2/6.3, will rotate transparently via cloud-provider mechanisms — wrapped CEKs reference the key alias; KMS handles the version-chain.)
+(KMS-mode key rotation rotates transparently via cloud-provider mechanisms — see "Key rotation" below.)
+
+## AWS KMS setup (Phase 6.2)
+
+v0.23.0 adds AWS KMS-backed envelope encryption alongside passphrase mode. The trade-offs:
+
+| Dimension | Passphrase mode (Phase 6.1) | AWS KMS mode (Phase 6.2) |
+|---|---|---|
+| Key material | Operator-controlled passphrase | KMS-managed key (IAM-rooted access) |
+| Audit trail | None — whoever has the file has access | KMS CloudTrail logs every Encrypt/Decrypt call with the principal |
+| Rotation | Fresh-chain workflow | KMS rotates the root key transparently; old chains stay decryptable |
+| Lost key | Permanent data loss | Permanent data loss (operator must not delete the KMS key while chains exist) |
+| Best for | Air-gapped / SneakerNet / non-AWS deployments | AWS-resident workloads, multi-tenant BYOK, compliance audit trails |
+
+### Enabling KMS mode
+
+```bash
+sluice backup full \
+    --source-driver=postgres \
+    --source="$DATABASE_URL" \
+    --target=s3://my-bucket/backups/2026-05-09/ \
+    --encrypt \
+    --kms-key-arn=arn:aws:kms:us-east-1:123456789012:key/abcd1234-...
+```
+
+Restore mirrors the path:
+
+```bash
+sluice restore \
+    --target-driver=postgres \
+    --target="$TARGET_DSN" \
+    --from=s3://my-bucket/backups/2026-05-09/ \
+    --encrypt \
+    --kms-key-arn=arn:aws:kms:us-east-1:123456789012:key/abcd1234-...
+```
+
+The `--kms-key-arn` and `--encryption-passphrase{,-env,-file}` flag families are **mutually exclusive** — pick one mode per chain. Cross-region restore (e.g. backup in us-east-1, restore from a runner in eu-west-1) needs `--kms-region=us-east-1` to pin the region explicitly; the default AWS config chain picks the runner's region.
+
+### Acceptable key reference shapes
+
+`--kms-key-arn` accepts any of the standard AWS KMS key references:
+
+- **Full ARN** — `arn:aws:kms:us-east-1:123456789012:key/abcd1234-ef56-7890-...`
+- **Alias ARN** — `arn:aws:kms:us-east-1:123456789012:alias/sluice-backup-prod`
+- **Bare key ID** — `abcd1234-ef56-7890-...` (resolved via the SDK's configured region)
+- **Alias name** — `alias/sluice-backup-prod` (same)
+
+**Use an alias for production.** Rotating the underlying key is a single `aws kms update-alias` call without sluice restart; the chain's manifest records the alias literally and KMS resolves it on every restore.
+
+### Creating a KMS key
+
+```bash
+# 1. Create the key.
+aws kms create-key \
+    --description "sluice backup encryption key" \
+    --key-usage ENCRYPT_DECRYPT \
+    --key-spec SYMMETRIC_DEFAULT \
+    --query 'KeyMetadata.Arn' --output text
+# arn:aws:kms:us-east-1:123456789012:key/abcd1234-...
+
+# 2. Add a friendly alias.
+aws kms create-alias \
+    --alias-name alias/sluice-backup-prod \
+    --target-key-id abcd1234-...
+
+# 3. Enable automatic annual rotation (optional; recommended).
+aws kms enable-key-rotation --key-id abcd1234-...
+```
+
+Console equivalent: AWS Console → KMS → Customer managed keys → Create key → Symmetric → ENCRYPT_DECRYPT → assign administrator/usage roles → Save.
+
+### IAM policy template
+
+Grant the role sluice runs as the minimum required actions on the specific key. Do NOT grant `kms:*` on `*`.
+
+```json
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "SluiceKMSEnvelope",
+            "Effect": "Allow",
+            "Action": [
+                "kms:Encrypt",
+                "kms:Decrypt",
+                "kms:DescribeKey"
+            ],
+            "Resource": "arn:aws:kms:us-east-1:123456789012:key/abcd1234-..."
+        }
+    ]
+}
+```
+
+`kms:DescribeKey` is needed for sluice's construction-time preflight (catches auth issues before the backup starts streaming rows). `kms:Encrypt` covers the backup path; `kms:Decrypt` covers restore. No `kms:GenerateDataKey` because sluice generates the CEK locally via `crypto/rand` and calls `Encrypt` to wrap it (this matters for operators auditing IAM grants — sluice doesn't use the GenerateDataKey API).
+
+For BYOK / cross-account scenarios, the **key policy** on the key itself must also grant the principal access — IAM and key policies are AND-gated. See AWS's [Key policies](https://docs.aws.amazon.com/kms/latest/developerguide/key-policies.html) docs.
+
+### Key rotation
+
+KMS handles key rotation transparently. Two rotation modes:
+
+1. **Automatic annual rotation** (`aws kms enable-key-rotation`). KMS rotates the key material yearly; wrapped CEKs reference the key ID and KMS resolves to whichever version was active when the wrap happened. Old chains stay decryptable indefinitely; new chains use the current version. **Recommended for most operators.**
+
+2. **Manual rotation** (create a new key, update the alias, retire the old key). Useful for major rotations (compromise response, compliance milestone). **Do NOT delete the old key while chains wrapped under it still need to be restored.** KMS keys have a mandatory pending-deletion window (7-30 days); use it to verify no active chains reference the old key version before scheduling deletion.
+
+Sluice doesn't expose a key-version selector — it always asks KMS to use whichever version the key alias / ID currently resolves to. KMS picks the right version from the wrapped CEK's metadata on Decrypt.
+
+### KMS request charges
+
+Per-chain CEK caching keeps charges flat against chain length:
+
+- **Per backup**: 1 KMS Encrypt call (chain CEK wrap) + 1 DescribeKey call (preflight). ~$0.0000004 + ~$0.0000004 = ~$0.0000008.
+- **Per restore**: 1 KMS Decrypt call (chain CEK unwrap) + 1 DescribeKey call (preflight). ~$0.0000008.
+- **A 720-rollover monthly backup-stream**: 720 Encrypt + 720 DescribeKey calls = ~$0.000576/month in KMS charges.
+
+Negligible against any practical backup workload. Per-chunk mode (`--encrypt-mode=per-chunk`) makes one Encrypt call per chunk, which on a 1000-chunk chain is ~$0.0004 — still negligible, but disables the per-chain caching benefit on restore (1000 Decrypts instead of 1).
+
+### Wrong-key / missing-key recovery
+
+Restoring an encrypted chain without `--kms-key-arn` (or with the wrong key ARN) refuses with operator-actionable errors:
+
+- **Missing key**: "encrypted chain (kek_mode=\"aws-kms\" kek_ref=\"arn:aws:kms:...\") requires --encrypt + a KMS reference; no key was supplied". Operator-actionable: pass `--kms-key-arn` matching the chain's recorded ARN.
+- **Wrong key**: "kms decrypt rejected: ciphertext was wrapped under a different key (chain manifest's KEKRef does not match the supplied --kms-key-arn)". Operator-actionable: verify the ARN matches what the manifest's `chain_encryption.kek_ref` records.
+- **Access denied**: "kms decrypt denied: AWS IAM principal lacks kms:Decrypt on key ... (verify key policy + role policy grants the action)". Operator-actionable: extend the IAM grant.
+- **Key disabled / pending deletion**: "kms decrypt rejected: key ... is in an invalid state (verify the key is enabled and not pending deletion)". Operator-actionable: re-enable the key in the KMS console.
+
+### What NOT to do with KMS mode
+
+- **Don't delete a KMS key while chains wrapped under it still need to be restored.** KMS deletion is irreversible after the pending-deletion window expires; the data becomes unrecoverable.
+- **Don't grant `kms:*` on `*`.** Use the least-privilege IAM template above.
+- **Don't share KMS keys across unrelated chains.** Per-customer / per-environment keys are the right pattern; one compromised key shouldn't expose every other tenant's backups.
 
 ## See also
 

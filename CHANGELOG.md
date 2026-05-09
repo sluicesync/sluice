@@ -6,6 +6,39 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.23.0]
+
+Logical backups Phase 6.2 lands: **AWS KMS-backed envelope encryption.** Operators who already manage encryption keys via AWS KMS (the common compliance posture for HIPAA / PCI / SOC 2 shops, and the common BYOK posture for multi-tenant SaaS) can now hand sluice a key ARN and skip the passphrase plumbing entirely. The manifest's per-chain CEK is wrapped via `kms.Encrypt`; restore unwraps via `kms.Decrypt` once at the start and caches the CEK in-memory for the rest of the chain. Phase 6.1 (passphrase mode) keeps working unchanged; the two modes are mutually exclusive per backup but pluggable behind the same `EnvelopeEncryption` interface. Implementation supplement: `docs/dev/design-logical-backups-phase-6.md`. Operator guide: `docs/operator/encryption.md` ("AWS KMS setup" section).
+
+### Added
+
+- **`--kms-key-arn` + `--kms-region` on backup full / incremental / stream / restore / sync from-backup.** Operator passes a KMS key ARN (or alias ARN, or alias name); sluice loads the default AWS config (env vars, IAM role, profile, SSO), pre-flights the key with a `DescribeKey` call (auth/region/key-not-found errors surface at construction time, not mid-backup), then wraps every chain's CEK via `kms.Encrypt`. Restore mirrors the path: build the envelope, unwrap once, decrypt every chunk in the chain with the cached CEK. Per-chain CEK caching is the load-bearing performance choice — a 100-chunk restore makes ≤1 KMS Decrypt call regardless of chunk count, so KMS API charges stay flat against chain length.
+
+- **`internal/crypto.KMSEnvelope` implementing `EnvelopeEncryption`.** Drops in alongside Phase 6.1's `PassphraseEnvelope` behind the same interface; the chunk writer/reader paths don't change. Manifest schema is unchanged: `ChainEncryption.KEKMode = "aws-kms"`, `KEKRef = <arn>`, `Argon2id` omitted (KMS doesn't use it), `WrappedCEK` is the KMS CiphertextBlob.
+
+- **Operator-actionable KMS error translation.** `AccessDeniedException` surfaces as "AWS IAM principal lacks kms:Encrypt/Decrypt/DescribeKey on the key (verify key policy + role policy grants the action)"; `NotFoundException` as "key not found (verify the ARN/alias)"; `KMSInvalidStateException` / `DisabledException` as state-specific recovery hints; `IncorrectKeyException` as "ciphertext was wrapped under a different key" (the wrong-key-on-restore path). Generic SDK errors fall through with the key ARN preserved for support correlation.
+
+- **AWS KMS setup section in `docs/operator/encryption.md`.** Covers IAM policy template (least-privilege grant of kms:Encrypt + kms:Decrypt + kms:DescribeKey on a specific key ARN), key creation (CLI + console), key alias usage, and key-rotation handling (KMS rotates the root key transparently; wrapped CEKs reference the key ID — old chains stay decryptable).
+
+### Changed
+
+- **`EncryptionFlags.buildBackupEncryption` + `buildReadEnvelope` route through a single key-source validator.** `--encrypt` now requires exactly one of the passphrase-flag family OR `--kms-key-arn`; mixing them errors with "mutually exclusive" before any envelope work happens. Sets `pipeline.BackupEncryption.KEKRef` from the operator-supplied ARN so the manifest records what the operator passed verbatim.
+
+### Migration / Compatibility
+
+- **No format changes.** Manifest schema, control-table schema, change-chunk format, CLI surface — all unchanged. v0.22.x chains taken under passphrase mode restore unchanged under v0.23.0. KMS-mode chains are taken with v0.23.0+ binaries; pre-v0.23.0 binaries refuse them at preflight (the chain root's `KEKMode = "aws-kms"` doesn't match a `PassphraseEnvelope.Mode()`).
+
+- **No CLI breaking changes.** All existing `sluice` subcommands keep their flag surfaces verbatim. The new flags are additive.
+
+- **AWS SDK pulled in via `github.com/aws/aws-sdk-go-v2/service/kms`.** Already an indirect dependency for the S3 backup target; v0.23.0 promotes it to direct. Build size change is negligible (KMS service module is ~200KB compiled).
+
+### Test coverage
+
+- Unit tests for the KMS envelope: round-trip, wrong-key, missing-key, access-denied, disabled-key, invalid-state, generic SDK error fall-through, length-validation, per-chain caching pattern (100-chunk read = 1 Decrypt call).
+- Pipeline-level integration: end-to-end manifest stamping (KEKMode/KEKRef/no-Argon2id), restore preflight, mode-mismatch refusal, per-chain caching across the chunk-CEK resolver.
+- CLI flag-level tests: KMS-vs-passphrase mutual exclusion, KMS-without-encrypt sanity check, encrypt-without-any-key shape.
+- A `kmsverify` build-tag harness skeleton sits in `internal/pipeline/backup_kms_localstack_integration_test.go` for operator-run localstack verification; the main `integration` build tag stays focused on real-database scenarios so CI throughput doesn't regress on the localstack pull/boot cost.
+
 ## [0.22.1]
 
 Single-bug patch from the v0.22.0 cycle. v0.22.0's load-bearing encryption pieces (encrypted full backup + restore, wrong-passphrase / missing-key refusals, per-chunk mode, plaintext backward-compat) all shipped clean — but the write-side envelope builder minted a fresh Argon2id salt every call, so any **chain extension** of an encrypted chain (`backup incremental --encrypt`, `backup stream run --encrypt`, or resume of a partial encrypted full) crashed at startup with `aes-gcm open: cipher: message authentication failed`. Restore-side already mirrored the chain's recorded salt; this patch brings the write-side in line. Fix is local to the encryption-builder + the orchestrator's chain-alignment paths; no schema or CLI changes.
