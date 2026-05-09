@@ -243,13 +243,13 @@ Remaining size ~600-1000 LOC for 6.2 + 6.3 + a key-management ADR.
 
 ---
 
-### 2. Apache Arrow integration (conditional)
+### 2. Apache Arrow integration (deferred — research-doc updated)
 
-**Why.** User raised as exploratory research. Arrow opens up data-lake offload (Parquet files on cloud storage), zero-copy interop with DuckDB/Polars/Spark, and downstream-system-friendly formats. See [`design-apache-arrow-integration.md`](design-apache-arrow-integration.md).
+**Why.** Original conditional-yes recommendation in `design-apache-arrow-integration.md` was gated on logical-backup picking Parquet. **Phase 1 logical backups shipped JSON-Lines + gzip instead** (`internal/pipeline/backup_chunk.go:8-32`); the gate dissolved. Updated research lives in [`docs/research/apache-arrow-findings.md`](../research/apache-arrow-findings.md): Shape A (Arrow as IR row representation) is recommended **defer** — sizable refactor, zero current operator demand. The narrower analytics-export angle moved to its own research item — see item 9 below.
 
-**What.** Recommendation is **conditional yes — gated on logical-backup choice**. If logical-backup picks Parquet as its chunk format, ship Arrow Shape A (new `internal/engines/arrow/` writer behind an `arrow` build tag, Parquet-only, local-FS-only) together since they share most implementation. ~2 weeks for Shape A alone; ~3-4 weeks combined with logical-backup Phase 1.
+**What.** No code chunk. Revisit when an operator with a real Parquet/columnar requirement surfaces, or when item 9's research doc names a winning surface.
 
-**Gotchas.** Silent type drift at Decimal-256 / Time-out-of-range / UUID-string-parse / Arrow-null-vs-empty-string boundaries — each needs explicit loud-failure branches per the loud-failure tenet. ~2× binary growth under the build tag (mitigated by keeping default untagged build slim). Shape C (Arrow as in-flight row-pipeline format) explicitly rejected as IR-tenet-violating.
+**Gotchas (preserved for the eventual revisit).** Silent type drift at Decimal-256 / Time-out-of-range / UUID-string-parse / Arrow-null-vs-empty-string boundaries — each needs explicit loud-failure branches per the loud-failure tenet. ~2× binary growth under the build tag (mitigated by keeping default untagged build slim). Shape C (Arrow as in-flight row-pipeline format) explicitly rejected as IR-tenet-violating.
 
 ---
 
@@ -289,7 +289,56 @@ Remaining size ~600-1000 LOC for 6.2 + 6.3 + a key-management ADR.
 
 ---
 
-### 6. View support Phase 2/3 — materialized-view refresh + cross-engine view-body translation
+### 6. GEOMETRY / SPATIAL support — PostGIS-aware translation
+
+**Why.** Today sluice declines `GEOMETRY` emission in the PG writer with a loud error (`GEOMETRY requires PostGIS; not supported in this writer version`). Workloads with spatial columns — common in mapping / IoT / location-aware SaaS, often via Rails/Django/Hasura schemas — can't migrate at all. Two open bugs sit behind this entry: **Bug 26** (PostGIS SRID dropped on schema translation) and **Bug 27** (VStream POINT bytes mis-parsed). Prep doc with proposed shape: [`notes/prep-postgis-geometry.md`](notes/prep-postgis-geometry.md).
+
+**What.** Three sub-phases, each independently shippable:
+
+- **Phase A — PostGIS detection + PG writer emit.** PG engine declares PostGIS as an optional capability; init-time `SELECT 1 FROM pg_extension WHERE extname = 'postgis'` populates the flag. When PostGIS is present, writer accepts `ir.Geometry` columns and emits `geometry(<subtype>, <srid>)`. WKB on the source converts to EWKB on the target (preserves SRID). Closes **Bug 26**'s PG side.
+- **Phase B — VStream POINT bytes prefix handling.** VStream POINT bytes have a 4-byte little-endian SRID prefix that today trips the WKB byte-order-flag check. Strip the prefix, capture SRID, parse remainder as standard WKB. Closes **Bug 27**.
+- **Phase C — Cross-engine integration tests.** MySQL POINT/POLYGON → PG geometry round-trip; PG geometry → MySQL POINT round-trip. Add `integration postgis` build tag for tests that need a PG container with the PostGIS image (`postgis/postgis:16-3.5`).
+
+**Gotchas.** PostGIS-absent path stays loud-failure (don't silently downgrade to `bytea`). SRID auth-table differences (PG's `spatial_ref_sys` vs MySQL's hard-coded SRIDs) — start with the EPSG common subset, surface unrecognized SRIDs as a loud error. PostGIS image is large (~500MB layer); add it to the integration job's pre-pull list and consider whether to split into a separate CI job to keep the main `integration` job's runtime budget intact.
+
+Estimated ~600-1000 LOC including tests + image-pull CI changes.
+
+---
+
+### 7. Backup chunk compression investigation
+
+**Why.** Phase 1 logical backups ship gzip-compressed JSON Lines (`internal/pipeline/backup_chunk.go:8-32`). The Phase 1 design doc proposed zstd at level 3; gzip shipped because it's stdlib and Phase 1 prioritised correctness. There's no documented benchmark of compression ratio or throughput vs alternatives — operators reasoning about S3 storage cost or backup-window time-to-disk are guessing.
+
+**What.** A focused benchmark + decision doc:
+- **Library candidates**: stdlib `compress/gzip`, `github.com/klauspost/compress/zstd`, `github.com/klauspost/compress/gzip` (drop-in faster gzip), `github.com/klauspost/compress/snappy`. The [klauspost/compress](https://github.com/klauspost/compress) package is the standard Go recommendation for high-throughput compression and has a permissive license (BSD-3) compatible with Apache-2.0.
+- **Test corpora**: text-heavy (varchar columns), numeric-heavy (DECIMAL/INT), binary-heavy (bytea/blob, base64 in JSON envelope), JSON-mixed (representative of typical OLTP table). Sample size: ~1M rows per corpus, drawn from existing integration test data + a synthetic generator.
+- **Metrics**: compressed size, encode CPU time, decode CPU time, peak memory. Cross-tab with chunk size to pick the operating point.
+- **Format-version implications**: chunk format header carries a version int (`{"_h":1,...}`); a compression swap needs version=2 + a backward-compat reader path. Worth weighing whether the zstd ratio improvement justifies the format-version bump or whether to ship as `--compression=<algo>` flag with gzip default.
+
+Output is `docs/dev/notes/compression-benchmark.md` (data + recommendation) + a small benchmark harness under `internal/pipeline/internal/compressbench/` (build-tagged so it doesn't bloat default builds). Estimated ~200-400 LOC for the harness + benchmark.
+
+---
+
+### 8. Analytics-friendly source — research doc (Parquet export + DuckDB + Arrow Flight)
+
+**Why.** Operators running OLTP databases increasingly want the migration tool to also be the bridge to their analytics stack. Three orthogonal ideas surfaced in conversation that share an underlying theme: sluice as the data-out point for analytics-friendly consumption. Replaces the deferred Shape A path from item 2 with a narrower, more demand-driven framing.
+
+**What** (research-only — no code yet). A `docs/research/sluice-as-analytics-source.md` covering:
+
+- **Operator personas.** OLTP-only operator (no analytics need); OLTP + occasional ad-hoc analytics (DuckDB power user); OLTP + warehouse pipeline (Snowflake/BigQuery/Redshift target); analytics-first operator with sluice as the lakehouse-feed source. Each has different demand for which surface.
+- **Surface candidates** (not mutually exclusive):
+  1. **`sluice backup export-as-parquet` one-shot transcode.** Reads existing JSON-Lines chunks, emits Parquet alongside (or to a separate cloud bucket). Read-side semantics stay JSON-Lines (round-trip into MySQL/PG keeps the existing path); Parquet is exit-only, so the type-mapping problem becomes "best-effort columnar" instead of "lossless restore." Cheaper dep weight than Shape A from `design-apache-arrow-integration.md`. Library candidate: `parquet-go/parquet-go` (lighter than full `apache/arrow-go/v18` if Arrow's broader surface isn't needed).
+  2. **DuckDB integration on the consumer side.** DuckDB reads Parquet, JSON, and CSV directly; could ship a `sluice backup query --duckdb` subcommand that boots an embedded DuckDB engine pointed at the chunk store. Or simpler: document the recipe (`SELECT * FROM read_json_auto('s3://.../chunks/*.jsonl.gz')`) and let operators wire it themselves.
+  3. **Apache Arrow Flight as a high-throughput transport.** [Arrow Flight](https://arrow.apache.org/blog/2019/10/13/introducing-arrow-flight/) is a gRPC-based protocol for sending large Arrow-encoded datasets between systems with parallel-stream + columnar-batch semantics. Two roles sluice could play: (a) **Flight server** — operators run sluice, point a Flight client at it, sluice streams CDC + bulk-copy data via Arrow batches; (b) **Flight client** — sluice fetches from a Flight-speaking source (some warehouses already speak Flight). Worth mapping against the existing `RowReader` / `RowWriter` interfaces to see how much grafting fits, and whether Flight's parallel-stream semantics align with sluice's per-table chunk model.
+- **Worked example** for each: an end-to-end "operator wants X" scenario, with what sluice would emit and how the downstream consumer would consume it. Concrete demos beat speculative API design.
+
+**Gotchas.** Apache Arrow has the same dep-weight concern that pushed Shape A to defer (see `docs/research/apache-arrow-findings.md`). Flight specifically pulls in `apache/arrow-go` + a gRPC server runtime; non-trivial. The research doc should make explicit which surface (export-as-parquet vs DuckDB recipe vs Flight) has the cheapest dep cost vs operator value. Recommendation: rank the three surfaces by (dep weight × operator persona breadth) and only promote one to a code chunk.
+
+Output: `docs/research/sluice-as-analytics-source.md` (operator personas + surface analysis + worked examples + dep-cost matrix). Estimated 1-2 days research; no code chunk until the doc names a winner.
+
+---
+
+### 9. View support Phase 2/3 — materialized-view refresh + cross-engine view-body translation
 
 **Why.** Phase 1 (schema-only round-trip + dependency-ordered apply + diff/preview integration + CLI filters) shipped. The two large open frontiers remain:
 
@@ -310,8 +359,8 @@ Tracked in detail in `sluice-testing/BUG-CATALOG.md`; recap here for roadmap vis
 
 - **Bug 17** (deferred, low priority) — `impact_items` cross-engine COALESCE handling in expression translator.
 - **Bug 25** (deferred, low priority) — PG immutability of enum-typed STORED generated columns.
-- **Bug 26** (deferred) — PostGIS SRID dropped on schema translation.
-- **Bug 27** (deferred, see below) — VStream POINT bytes mis-parsed.
+- **Bug 26** — PostGIS SRID dropped on schema translation. *Picked up by item 6 (GEOMETRY/SPATIAL support) Phase A.*
+- **Bug 27** (deferred, see below) — VStream POINT bytes mis-parsed. *Picked up by item 6 Phase B.*
 - **Bug 42** (open as of v0.21.2, parallel to Bug 41) — cross-engine restore of `DEFAULT gen_random_uuid()` columns fails MySQL Error 1064. Root cause: `RetargetForEngine` rewrites `Column.Type` (UUID → CHAR(36)) but doesn't rewrite `Column.DefaultValue` of kind `DefaultExpression`; PG's `gen_random_uuid()` lands verbatim in MySQL CREATE TABLE. Mirrors v0.11.3's Bugs 28/29 in the opposite direction. Suggested fix: extend ADR-0016's expression-translator catalog to cover PG → MySQL UUID defaults (`gen_random_uuid()` → `(UUID())`). Estimated ~50-150 LOC.
 
 Together, **Bug 41 (closed v0.21.2) + Bug 42** cover "first-class UUID support in cross-engine restore" — Bug 41 fixed the CDC value-decode side; Bug 42 fixes the schema-side default-translation gap. Worth bundling soon since UUID PKs are pervasive in modern PG schemas (Rails, Django, Hasura, Supabase patterns).
