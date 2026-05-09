@@ -57,6 +57,20 @@ type lsnTrackerAttacher interface {
 	AttachLSNTracker(t any)
 }
 
+// slotNameSetter is the optional applier-side surface for engines
+// that record the active stream's replication-slot name on the
+// per-target control table (Phase 2 mid-stream live add-table,
+// ADR-0030). PG implements; MySQL does not (no slot concept). The
+// streamer calls SetSlotName once at startup; the applier threads
+// the value into every subsequent position-write so the
+// sluice_cdc_state row's slot_name column reflects what the streamer
+// is actually consuming. `sluice schema add-table --no-drain`
+// recovers the slot name via ListStreams to look up the right slot's
+// confirmed_flush_lsn.
+type slotNameSetter interface {
+	SetSlotName(slotName string)
+}
+
 // Streamer is the long-running orchestrator: it captures a consistent
 // source snapshot (cold start) or resumes from a previously-persisted
 // position (warm resume), runs the bulk-copy phase if needed, then
@@ -367,6 +381,28 @@ func (s *Streamer) Run(ctx context.Context) error {
 	if !s.DryRun {
 		if err := applier.ClearStopRequested(ctx, streamID); err != nil {
 			return wrapWithHint(PhaseSchemaApply, fmt.Errorf("pipeline: clear stop signal: %w", err))
+		}
+	}
+
+	// ---- 2.6. Record the active stream's resolved slot name on the
+	// applier (Phase 2 mid-stream live add-table, ADR-0030).
+	// SetSlotName is structural / optional — engines without slots
+	// (MySQL: binlog stream is the slot) don't implement it, and the
+	// nil check skips the call cleanly. The applier threads the slot
+	// name into every subsequent writePositionTx call so the per-
+	// target sluice_cdc_state row's slot_name column reflects what
+	// the streamer is actually consuming. `sluice schema add-table
+	// --no-drain` reads this back via ListStreams to look up the
+	// right slot's confirmed_flush_lsn for its LSN-floor check.
+	//
+	// The slot name passed here is post-resolveSlotName: a custom
+	// `--slot-name=shard_a` has already become `sluice_shard_a`.
+	// Empty input means the engine default (`sluice_slot`); the
+	// fallback lives in the add-table orchestrator's lookup, so we
+	// pass the empty string through verbatim.
+	if !s.DryRun {
+		if setter, ok := applier.(slotNameSetter); ok {
+			setter.SetSlotName(s.SlotName)
 		}
 	}
 

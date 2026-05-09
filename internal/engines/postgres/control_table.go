@@ -51,6 +51,15 @@ func ensureControlTable(ctx context.Context, db *sql.DB, schema string) error {
 	if _, err := db.ExecContext(ctx, alter); err != nil {
 		return fmt.Errorf("postgres: ensure control table: add stop_requested_at: %w", err)
 	}
+	// Migration path for pre-Phase-2 (v0.24.0) deployments: the
+	// slot_name column lets `sluice schema add-table --no-drain`
+	// recover the active stream's slot name without operator input.
+	// NULL on legacy rows; the position-write path UPSERTs the
+	// streamer's resolved slot name on every apply tx.
+	alter = "ALTER TABLE " + tableRef + " ADD COLUMN IF NOT EXISTS slot_name TEXT NULL"
+	if _, err := db.ExecContext(ctx, alter); err != nil {
+		return fmt.Errorf("postgres: ensure control table: add slot_name: %w", err)
+	}
 	return nil
 }
 
@@ -91,7 +100,11 @@ func readPosition(ctx context.Context, db *sql.DB, schema, streamID string) (tok
 // for any future caller that might.
 func listStreams(ctx context.Context, db *sql.DB, schema, engineName string) ([]ir.StreamStatus, error) {
 	tableRef := quoteIdent(schema) + "." + quoteIdent(controlTableName)
-	q := "SELECT stream_id, source_position, updated_at FROM " + tableRef
+	// COALESCE on slot_name so legacy rows that pre-date the column
+	// (NULL value) surface as empty string in the StreamStatus —
+	// callers fall back to the engine default sluice_slot for the
+	// empty case rather than handling sql.NullString.
+	q := "SELECT stream_id, source_position, updated_at, COALESCE(slot_name, '') FROM " + tableRef
 	rows, err := db.QueryContext(ctx, q)
 	if err != nil {
 		// Best-effort tolerance: missing-relation = no streams.
@@ -110,36 +123,52 @@ func listStreams(ctx context.Context, db *sql.DB, schema, engineName string) ([]
 			streamID string
 			token    string
 			updated  time.Time
+			slotName string
 		)
-		if err := rows.Scan(&streamID, &token, &updated); err != nil {
+		if err := rows.Scan(&streamID, &token, &updated, &slotName); err != nil {
 			return nil, fmt.Errorf("postgres: scan streams: %w", err)
 		}
 		out = append(out, ir.StreamStatus{
 			StreamID:  streamID,
 			Position:  ir.Position{Engine: engineName, Token: token},
 			UpdatedAt: updated,
+			SlotName:  slotName,
 		})
 	}
 	return out, rows.Err()
 }
 
-// writePositionTx upserts the (streamID, token) row inside an open
-// transaction. Called from the applier's per-change tx after the
-// data write; same atomicity guarantee as the MySQL counterpart.
+// writePositionTx upserts the (streamID, token, slotName) row inside
+// an open transaction. Called from the applier's per-change tx after
+// the data write; same atomicity guarantee as the MySQL counterpart.
 //
 // The updated_at column is refreshed on every upsert via
 // CURRENT_TIMESTAMP — diagnostic info for operators inspecting the
 // control table by hand. stop_requested_at is left untouched: a
 // position write is the streamer making forward progress, which
 // must not clear an in-flight stop request.
-func writePositionTx(ctx context.Context, tx *sql.Tx, schema, streamID, token string) error {
+//
+// slotName carries the active stream's resolved replication-slot
+// name (per ADR-0030's Phase 2 mid-stream live add-table). When
+// non-empty, every position-write refreshes the row's slot_name
+// column so a later live-add knows which slot's confirmed_flush_lsn
+// to read for the LSN-floor check. Empty slotName preserves any
+// previously-recorded value (chain handoff via WritePosition doesn't
+// know the streamer's slot; the row's existing slot_name stays put).
+func writePositionTx(ctx context.Context, tx *sql.Tx, schema, streamID, token, slotName string) error {
 	tableRef := quoteIdent(schema) + "." + quoteIdent(controlTableName)
-	q := "INSERT INTO " + tableRef + " (stream_id, source_position, updated_at) " +
-		"VALUES ($1, $2, CURRENT_TIMESTAMP) " +
+	// COALESCE on the conflict path lets a non-empty slotName
+	// overwrite, while an empty slotName falls back to whichever
+	// value the existing row already carries — so a chain-handoff
+	// position-write that lacks slot context doesn't clobber the
+	// streamer's previously-recorded slot.
+	q := "INSERT INTO " + tableRef + " (stream_id, source_position, updated_at, slot_name) " +
+		"VALUES ($1, $2, CURRENT_TIMESTAMP, NULLIF($3, '')) " +
 		"ON CONFLICT (stream_id) DO UPDATE SET " +
 		"source_position = EXCLUDED.source_position, " +
-		"updated_at = EXCLUDED.updated_at"
-	if _, err := tx.ExecContext(ctx, q, streamID, token); err != nil {
+		"updated_at = EXCLUDED.updated_at, " +
+		"slot_name = COALESCE(EXCLUDED.slot_name, " + tableRef + ".slot_name)"
+	if _, err := tx.ExecContext(ctx, q, streamID, token, slotName); err != nil {
 		return fmt.Errorf("postgres: write position: %w", err)
 	}
 	return nil

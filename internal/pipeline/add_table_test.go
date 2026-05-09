@@ -326,6 +326,78 @@ func TestAddTable_LiveMode_SkipsActiveStreamRefusal(t *testing.T) {
 	}
 }
 
+// TestAddTable_LiveMode_UsesRecordedSlotName pins the slot-name
+// plumbing through cdc-state (ADR-0030 follow-up): when the active
+// stream's StreamStatus carries a non-empty SlotName, preflightLive
+// queries that slot's position rather than the engine default. This
+// is the load-bearing surface for operators running multiple
+// concurrent streams against the same source via custom --slot-name.
+func TestAddTable_LiveMode_UsesRecordedSlotName(t *testing.T) {
+	src := newAddTableSourceEngineLive("source")
+	src.schema = &ir.Schema{Tables: []*ir.Table{
+		{Name: "new_table", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}},
+	}}
+	src.slotLSN = "0/1000"
+	src.snapshotLSN = "0/2000"
+
+	tgt := newAddTableTargetEngine("target")
+	// StreamStatus carries the operator's custom slot name (recorded
+	// by the streamer's SetSlotName plumbing on every position-write).
+	tgt.applier.streams = []ir.StreamStatus{
+		{StreamID: "live", SlotName: "sluice_shard_a"},
+	}
+
+	a := &AddTable{
+		Source: src, Target: tgt,
+		SourceDSN: "src", TargetDSN: "tgt",
+		StreamID: "live", TableName: "new_table",
+		LiveMode: true,
+	}
+	if err := a.Run(context.Background()); err != nil {
+		t.Fatalf("Run errored: %v", err)
+	}
+	if !src.slotReadCalled {
+		t.Fatal("ReadSlotPosition was never called")
+	}
+	if src.slotNameAsked != "sluice_shard_a" {
+		t.Errorf("ReadSlotPosition queried slot %q; want %q (from recorded StreamStatus.SlotName)",
+			src.slotNameAsked, "sluice_shard_a")
+	}
+}
+
+// TestAddTable_LiveMode_FallsBackToDefaultSlotName pins the legacy-
+// row / default-named-stream fallback: when StreamStatus.SlotName is
+// empty (NULL slot_name in cdc-state, e.g. a row that pre-dates the
+// column or a stream that ran with the default slot), preflightLive
+// queries `sluice_slot`. Without this fallback the live-add would
+// refuse when the recorded value happens to be empty.
+func TestAddTable_LiveMode_FallsBackToDefaultSlotName(t *testing.T) {
+	src := newAddTableSourceEngineLive("source")
+	src.schema = &ir.Schema{Tables: []*ir.Table{
+		{Name: "new_table", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}},
+	}}
+	src.slotLSN = "0/1000"
+	src.snapshotLSN = "0/2000"
+
+	tgt := newAddTableTargetEngine("target")
+	// SlotName left empty — covers both legacy rows + default streams.
+	tgt.applier.streams = []ir.StreamStatus{{StreamID: "live"}}
+
+	a := &AddTable{
+		Source: src, Target: tgt,
+		SourceDSN: "src", TargetDSN: "tgt",
+		StreamID: "live", TableName: "new_table",
+		LiveMode: true,
+	}
+	if err := a.Run(context.Background()); err != nil {
+		t.Fatalf("Run errored: %v", err)
+	}
+	if src.slotNameAsked != "sluice_slot" {
+		t.Errorf("ReadSlotPosition queried slot %q; want %q (default fallback)",
+			src.slotNameAsked, "sluice_slot")
+	}
+}
+
 // TestAddTable_LiveMode_RefusesEngineWithoutPublication confirms
 // live mode refuses (with a clear PG-only message) on an engine
 // that doesn't implement publicationAdder. MySQL is the canonical
@@ -415,6 +487,63 @@ func TestAddTable_LiveMode_EmptySlotLSNSkipsInvariant(t *testing.T) {
 	}
 }
 
+// TestActiveSlotName pins the slot-name lookup behavior for live
+// mode (ADR-0030). The cdc-state row's slot_name column is the
+// authoritative source; an empty value falls back to the engine
+// default `sluice_slot` to cover both legacy rows that pre-date
+// the column and streamers that ran with the default slot name.
+// Without the fallback, every live-add against a default-named
+// stream would refuse on a NULL slot_name lookup.
+func TestActiveSlotName(t *testing.T) {
+	cases := []struct {
+		name string
+		in   ir.StreamStatus
+		want string
+	}{
+		{
+			name: "recorded custom slot",
+			in:   ir.StreamStatus{StreamID: "s", SlotName: "sluice_shard_a"},
+			want: "sluice_shard_a",
+		},
+		{
+			name: "empty slot falls back to default",
+			in:   ir.StreamStatus{StreamID: "s", SlotName: ""},
+			want: "sluice_slot",
+		},
+		{
+			name: "legacy row (zero-value StreamStatus) falls back to default",
+			in:   ir.StreamStatus{StreamID: "s"},
+			want: "sluice_slot",
+		},
+		{
+			name: "default-named stream passes through",
+			in:   ir.StreamStatus{StreamID: "s", SlotName: "sluice_slot"},
+			want: "sluice_slot",
+		},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			if got := activeSlotName(c.in); got != c.want {
+				t.Errorf("activeSlotName(%+v) = %q; want %q", c.in, got, c.want)
+			}
+		})
+	}
+}
+
+// TestSlotNameSource pins the diagnostic tag so log inspection has
+// a stable contract. Operators tracing a live-add that picked the
+// wrong slot read this tag to confirm whether it came from the
+// recorded row or the default fallback.
+func TestSlotNameSource(t *testing.T) {
+	if got := slotNameSource(ir.StreamStatus{SlotName: "sluice_shard_a"}); got != "recorded" {
+		t.Errorf("slotNameSource(recorded) = %q; want %q", got, "recorded")
+	}
+	if got := slotNameSource(ir.StreamStatus{}); got != "default-fallback" {
+		t.Errorf("slotNameSource(empty) = %q; want %q", got, "default-fallback")
+	}
+}
+
 // TestTempSlotName pins the temp-slot naming convention so changes
 // here become visible in code review.
 func TestTempSlotName(t *testing.T) {
@@ -497,9 +626,11 @@ func (e *addTableSourceEngineWithPub) AddPublicationTables(_ context.Context, _ 
 // token via a JSON envelope ExtractSnapshotLSN can decode.
 type addTableSourceEngineLive struct {
 	*addTableSourceEngine
-	addedTables []string
-	slotLSN     string
-	snapshotLSN string
+	addedTables    []string
+	slotLSN        string
+	snapshotLSN    string
+	slotNameAsked  string // captured by ReadSlotPosition for assertion
+	slotReadCalled bool
 }
 
 func newAddTableSourceEngineLive(name string) *addTableSourceEngineLive {
@@ -511,7 +642,9 @@ func (e *addTableSourceEngineLive) AddPublicationTables(_ context.Context, _ str
 	return nil
 }
 
-func (e *addTableSourceEngineLive) ReadSlotPosition(_ context.Context, _, _ string) (string, error) {
+func (e *addTableSourceEngineLive) ReadSlotPosition(_ context.Context, _, slotName string) (string, error) {
+	e.slotReadCalled = true
+	e.slotNameAsked = slotName
 	return e.slotLSN, nil
 }
 

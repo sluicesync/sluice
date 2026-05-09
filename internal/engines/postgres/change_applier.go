@@ -75,6 +75,18 @@ type ChangeApplier struct {
 	db     *sql.DB
 	schema string
 
+	// slotName is the active stream's resolved replication-slot name,
+	// set by [SetSlotName] at Streamer startup. Threaded into every
+	// [writePositionTx] call so the per-target sluice_cdc_state row's
+	// slot_name column stays in sync with what the streamer is
+	// actually consuming. Recovered later by `sluice schema add-table
+	// --no-drain` (ADR-0030) to read the right slot's
+	// confirmed_flush_lsn for the live-add LSN-floor check. Empty
+	// when the streamer hasn't called [SetSlotName] yet (e.g. broker
+	// chain-handoff WritePosition before any sync start has run);
+	// the row's existing slot_name is preserved on the conflict path.
+	slotName string
+
 	// pkCache maps "schema.table" → ordered list of PK column names.
 	// Populated lazily via a single information_schema query the
 	// first time a change for the table arrives. An empty slice
@@ -271,7 +283,7 @@ func (a *ChangeApplier) WritePosition(ctx context.Context, streamID string, pos 
 	if err != nil {
 		return fmt.Errorf("postgres: applier: WritePosition: begin tx: %w", err)
 	}
-	if err := writePositionTx(ctx, tx, a.schema, streamID, pos.Token); err != nil {
+	if err := writePositionTx(ctx, tx, a.schema, streamID, pos.Token, a.slotName); err != nil {
 		_ = tx.Rollback()
 		return err
 	}
@@ -279,6 +291,23 @@ func (a *ChangeApplier) WritePosition(ctx context.Context, streamID string, pos 
 		return fmt.Errorf("postgres: applier: WritePosition: commit: %w", err)
 	}
 	return nil
+}
+
+// SetSlotName records the active stream's resolved replication-slot
+// name on the applier so subsequent position-writes (Apply +
+// WritePosition + the batched-apply path) populate the
+// sluice_cdc_state row's slot_name column. Phase 2 mid-stream live
+// add-table (ADR-0030) reads the recorded slot back via [ListStreams]
+// to look up the correct confirmed_flush_lsn before publication-add.
+//
+// Idempotent — the streamer may call this on every Run; the value
+// stays current across warm resumes (the slot can change if the
+// operator restarts with a different `--slot-name`). Empty input is
+// allowed (no-op set) and reflects the engine-default slot
+// (`sluice_slot`) — callers that need the resolved default should
+// fill it in before calling.
+func (a *ChangeApplier) SetSlotName(slotName string) {
+	a.slotName = slotName
 }
 
 // Apply consumes changes from the channel and applies each to the
@@ -335,7 +364,7 @@ func (a *ChangeApplier) applyOne(ctx context.Context, streamID string, c ir.Chan
 		return err
 	}
 	token := c.Pos().Token
-	if err := writePositionTx(ctx, tx, a.schema, streamID, token); err != nil {
+	if err := writePositionTx(ctx, tx, a.schema, streamID, token, a.slotName); err != nil {
 		_ = tx.Rollback()
 		return err
 	}

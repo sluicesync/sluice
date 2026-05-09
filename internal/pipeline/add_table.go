@@ -427,10 +427,14 @@ func (a *AddTable) preflightStream(ctx context.Context, applier ir.ChangeApplier
 	if err != nil {
 		return addTablePreflight{}, wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: add-table: list streams: %w", err))
 	}
-	var found bool
+	var (
+		found  bool
+		status ir.StreamStatus
+	)
 	for _, st := range streams {
 		if st.StreamID == a.StreamID {
 			found = true
+			status = st
 			break
 		}
 	}
@@ -439,7 +443,7 @@ func (a *AddTable) preflightStream(ctx context.Context, applier ir.ChangeApplier
 	}
 
 	if a.LiveMode {
-		return a.preflightLive(ctx)
+		return a.preflightLive(ctx, status)
 	}
 	return addTablePreflight{}, a.preflightDrained(ctx, applier)
 }
@@ -475,7 +479,16 @@ func (a *AddTable) preflightDrained(ctx context.Context, applier ir.ChangeApplie
 // snapshot-LSN invariant check. PG-only in this phase: engines
 // without publications refuse here with a clear error directing the
 // operator at the drained add-table flow.
-func (a *AddTable) preflightLive(ctx context.Context) (addTablePreflight, error) {
+//
+// The slot name is recovered from the StreamStatus row populated by
+// the active stream's last position-write (PG ChangeApplier records
+// it via SetSlotName on every Streamer startup; the sluice_cdc_state
+// row's slot_name column carries it). Empty / legacy values fall
+// back to the engine default `sluice_slot` — matches the Phase 1
+// hardcoded behavior so a pre-Phase-2 cdc-state row with NULL
+// slot_name still resolves to the right slot when the operator
+// hasn't customised it.
+func (a *AddTable) preflightLive(ctx context.Context, status ir.StreamStatus) (addTablePreflight, error) {
 	if _, ok := a.Source.(publicationAdder); !ok {
 		return addTablePreflight{}, fmt.Errorf(
 			"pipeline: add-table: --no-drain requires a publication-bearing source engine; %q has no publication concept. Phase 2 live add is PG-only in this release; use the drained add-table flow (`sluice sync stop --wait`, then `sluice schema add-table` without --no-drain) for MySQL sources",
@@ -489,7 +502,7 @@ func (a *AddTable) preflightLive(ctx context.Context) (addTablePreflight, error)
 			a.Source.Name())
 	}
 
-	slotName := a.activeSlotName()
+	slotName := activeSlotName(status)
 	lsn, err := reader.ReadSlotPosition(ctx, a.SourceDSN, slotName)
 	if err != nil {
 		return addTablePreflight{}, wrapWithHint(PhaseConnect, fmt.Errorf(
@@ -498,20 +511,44 @@ func (a *AddTable) preflightLive(ctx context.Context) (addTablePreflight, error)
 	}
 	slog.InfoContext(ctx, "add-table: live mode: captured active-stream slot position",
 		slog.String("slot", slotName),
+		slog.String("slot_source", slotNameSource(status)),
 		slog.String("confirmed_flush_lsn", lsn),
 	)
 	return addTablePreflight{slotConfirmedFlushLSN: lsn}, nil
 }
 
-// activeSlotName returns the name of the slot the active stream is
-// consuming from. Phase 2 assumes the default `sluice_slot` —
-// matches the streamer's default — until an operator surface for
-// per-stream slot naming surfaces. Operators using a custom slot on
-// `sync start` would also need a custom slot read here; tracked as
-// a follow-up if real demand surfaces.
-func (a *AddTable) activeSlotName() string {
-	return "sluice_slot"
+// activeSlotName returns the slot name to query for the active
+// stream's confirmed_flush_lsn. Recovered from the cdc-state row
+// populated by the streamer's per-position SetSlotName plumbing
+// (ADR-0030). Falls back to the engine default `sluice_slot` for
+// empty values — covers (a) legacy rows that pre-date the slot_name
+// column, and (b) streamers that ran with the default slot name.
+func activeSlotName(status ir.StreamStatus) string {
+	if status.SlotName != "" {
+		return status.SlotName
+	}
+	return defaultActiveSlotName
 }
+
+// slotNameSource is a diagnostic tag for the slot-name resolution
+// path — useful when an operator's live-add succeeds against the
+// fallback slot but the operator was expecting their custom slot to
+// be picked up. Logs surface "recorded" when the cdc-state row
+// carried a non-empty slot_name, "default-fallback" when it was
+// empty (legacy row or default-named stream).
+func slotNameSource(status ir.StreamStatus) string {
+	if status.SlotName != "" {
+		return "recorded"
+	}
+	return "default-fallback"
+}
+
+// defaultActiveSlotName mirrors the engine-side default in
+// internal/engines/postgres/cdc_reader.go's defaultSlot constant.
+// Held in the pipeline package because the orchestrator stays
+// engine-neutral; the constant is small enough to keep in sync by
+// hand.
+const defaultActiveSlotName = "sluice_slot"
 
 // verifyLiveModeLSNInvariant enforces the live-mode invariant
 // snapshot-LSN ≥ slotConfirmedFlushLSN. ADR-0030's correctness

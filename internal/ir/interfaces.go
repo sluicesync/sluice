@@ -688,6 +688,17 @@ type StreamStatus struct {
 	StreamID  string
 	Position  Position
 	UpdatedAt time.Time
+
+	// SlotName is the replication-slot name the active stream is
+	// consuming from on engines with a slot concept (Postgres).
+	// Populated by the applier on each position-write so a later
+	// `sluice schema add-table --no-drain` knows which slot's
+	// confirmed_flush_lsn to read for the live-add LSN-floor check.
+	// Empty for engines without slots (MySQL: binlog stream is the
+	// slot; no slot_name to record) and for legacy rows that
+	// pre-date the column (best-effort fallback to the engine
+	// default `sluice_slot` is the caller's responsibility).
+	SlotName string
 }
 
 // SlotInfo describes one row of an engine's logical-replication slot
