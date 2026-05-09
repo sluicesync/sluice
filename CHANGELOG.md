@@ -6,6 +6,21 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.21.2]
+
+Single-bug patch from the v0.21.0 cycle. CDC streams against any Postgres source carrying a `UUID`-typed column crashed on the first INSERT/UPDATE — pre-existing bug, not a v0.21 regression, surfaced when the v0.21 cross-engine cycle expanded UUID coverage. Fix is local to the PG CDC value-decoder; no protocol or schema changes.
+
+### Fixed
+
+- **Bug 41 — PG CDC decode of UUID columns crashes the stream with `UUID byte slice has length 36; want 16`.** Pgoutput's TupleData carries every column value with format byte `'t'` (text); the `'b'` (binary) branch in `decodeTuple` is already a hard refusal, so for the CDC path UUID values arrive at `decodeUUID` as the 36-byte ASCII canonical hyphenated string. The previous code path required `len([]byte) == 16` (binary form, the shape pgx returns for non-CDC reads) and bailed loudly on anything else — including the CDC text-format payload. Net effect: the stream exited with the catalog error message on the first INSERT against any UUID-bearing CDC-streamed table. Workarounds were `--exclude-table` or dropping UUID columns. Fix: `decodeUUID`'s `[]byte` branch now switches on length — 16 routes to the existing binary path (`formatUUIDBytes`), 36 routes through a new `canonicalizeUUIDText` helper that validates the 8-4-4-4-12 hyphenated shape and lowercases to the IR's UUID-as-string contract; any other length surfaces a clear error naming both the length and the supported alternatives. The string-passthrough case now also routes through the same canonicalisation so the IR contract holds whichever shape pgx returns. New helper is a small ASCII validator (no new dependency on `github.com/google/uuid`). Unit tests cover all three positive shapes (16-byte binary, 36-byte text, string passthrough), case folding, and five malformed-input negatives. Integration test `TestCDCReader_UUIDColumnRoundTrip` boots PG 16 with REPLICA IDENTITY FULL on a UUID-bearing table, drives INSERT + UPDATE with known UUIDs, and asserts both Before and After images carry the canonical lowercase string on the CDC channel — without the fix, the stream errored before draining a single event.
+
+### Migration / Compatibility
+
+- **No format changes.** Manifest schema, control-table schema, change-chunk format, CLI surface — all unchanged.
+- **No CLI breaking changes.** All existing `sluice` subcommands keep their flag surfaces verbatim.
+- **Drop-in upgrade from v0.21.x.** No DDL migration on `sluice_cdc_state`; no operator action required.
+- **No behaviour change for non-CDC paths.** Bulk-copy migrate (`sluice migrate`) of UUID-bearing tables continues to work identically — bulk-copy uses `TableReader`, a different code path that already handled `[16]byte` from pgx's binary mode. The new canonicalisation surface only sees the CDC-text shape it didn't before.
+
 ## [0.21.1]
 
 Two-item housekeeping release. No functional changes; documentation polish + a CI-flagged test-cleanup race fix.
