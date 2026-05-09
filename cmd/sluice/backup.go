@@ -25,13 +25,16 @@ import (
 // Phase 6.2/6.3 will add `--kms-key-arn` etc. via additional flags
 // here.
 type EncryptionFlags struct {
-	Encrypt bool `name:"encrypt" help:"Enable client-side envelope encryption. Backup paths require a passphrase source (--encryption-passphrase, --encryption-passphrase-env, or --encryption-passphrase-file). Restore / broker paths read the same flag and supply the operator's passphrase to unwrap the chain's CEK."`
+	Encrypt bool `name:"encrypt" help:"Enable client-side envelope encryption. Backup paths require a passphrase source (--encryption-passphrase, --encryption-passphrase-env, or --encryption-passphrase-file) OR a KMS key (--kms-key-arn). Restore / broker paths read the same flag and supply the operator's key material to unwrap the chain's CEK."`
 
 	EncryptionPassphrase     string `name:"encryption-passphrase" help:"Encryption passphrase (DEPRECATED for production — passphrase shows up in shell history; prefer --encryption-passphrase-env or --encryption-passphrase-file)." placeholder:"PASS"`
 	EncryptionPassphraseEnv  string `name:"encryption-passphrase-env" help:"Read encryption passphrase from this environment variable. Recommended over --encryption-passphrase for production." placeholder:"VAR"`
 	EncryptionPassphraseFile string `name:"encryption-passphrase-file" help:"Read encryption passphrase from this file path. Recommended for secrets-management integrations (1Password CLI, AWS Secrets Manager, etc.)." placeholder:"PATH"`
 
-	EncryptMode string `name:"encrypt-mode" enum:"per-chain,per-chunk" default:"per-chain" help:"Encryption mode: 'per-chain' (single CEK per chain; default; one Argon2id derive per restore) or 'per-chunk' (one CEK per chunk; defense-in-depth at the cost of per-chunk wrap)."`
+	KMSKeyARN string `name:"kms-key-arn" help:"AWS KMS key ARN, alias ARN, or alias/name for envelope encryption (Phase 6.2). Mutually exclusive with --encryption-passphrase{,-env,-file}. Sluice routes CEK wrap/unwrap through KMS Encrypt/Decrypt; the KMS root key never leaves AWS." placeholder:"ARN"`
+	KMSRegion string `name:"kms-region" help:"AWS region override for KMS calls. Defaults to AWS_REGION env var or the SDK's default region resolution." placeholder:"REGION"`
+
+	EncryptMode string `name:"encrypt-mode" enum:"per-chain,per-chunk" default:"per-chain" help:"Encryption mode: 'per-chain' (single CEK per chain; default; one KEK derive / KMS Decrypt per restore) or 'per-chunk' (one CEK per chunk; defense-in-depth at the cost of per-chunk wrap)."`
 }
 
 // resolvePassphrase returns the operator's passphrase from whichever
@@ -81,24 +84,45 @@ func (e *EncryptionFlags) resolvePassphrase() (string, error) {
 }
 
 // buildBackupEncryption constructs a [pipeline.BackupEncryption] for
-// the write side (backup full / incremental / stream) using the
-// passphrase source supplied by the operator. Returns nil when
-// e.Encrypt is false (plaintext backup).
+// the write side (backup full / incremental / stream) using whichever
+// key source the operator supplied (passphrase or AWS KMS). Returns
+// nil when e.Encrypt is false (plaintext backup).
 //
-// Bug 43 (v0.22.1): the returned struct's RebuildForChain field
-// captures the operator's passphrase in a closure so the orchestrator
-// can rebuild the envelope against the chain root's recorded Argon2id
-// salt when extending an existing encrypted chain (incremental /
-// stream / full-resume). Cold-start full backups don't trigger
-// RebuildForChain — the freshly-minted Envelope's salt becomes the
-// chain's recorded salt.
+// Bug 43 (v0.22.1): for passphrase mode, the returned struct's
+// RebuildForChain field captures the operator's passphrase in a
+// closure so the orchestrator can rebuild the envelope against the
+// chain root's recorded Argon2id salt when extending an existing
+// encrypted chain. KMS mode (Phase 6.2) leaves RebuildForChain nil —
+// KMS unwrap doesn't depend on a chain-recorded salt; the orchestrator's
+// `rebindForChain` is a no-op for it.
 func (e *EncryptionFlags) buildBackupEncryption() (*pipeline.BackupEncryption, error) {
 	if !e.Encrypt {
-		// Sanity: passphrase supplied without --encrypt is suspicious.
+		// Sanity: passphrase / KMS-key supplied without --encrypt is suspicious.
 		if e.EncryptionPassphrase != "" || e.EncryptionPassphraseEnv != "" || e.EncryptionPassphraseFile != "" {
 			return nil, errors.New("--encryption-passphrase* is set but --encrypt is not; pass --encrypt to enable encryption")
 		}
+		if e.KMSKeyARN != "" {
+			return nil, errors.New("--kms-key-arn is set but --encrypt is not; pass --encrypt to enable encryption")
+		}
 		return nil, nil
+	}
+	if err := e.validateKeySources(); err != nil {
+		return nil, err
+	}
+	mode := e.EncryptMode
+	if mode == "" {
+		mode = crypto.EncryptModePerChain
+	}
+	if e.KMSKeyARN != "" {
+		env, err := crypto.NewKMSEnvelope(kongContext(), e.KMSKeyARN, kmsOpts(e.KMSRegion)...)
+		if err != nil {
+			return nil, fmt.Errorf("encryption: build kms envelope: %w", err)
+		}
+		return &pipeline.BackupEncryption{
+			Envelope: env,
+			Mode:     mode,
+			KEKRef:   e.KMSKeyARN,
+		}, nil
 	}
 	passphrase, err := e.resolvePassphrase()
 	if err != nil {
@@ -112,15 +136,38 @@ func (e *EncryptionFlags) buildBackupEncryption() (*pipeline.BackupEncryption, e
 	if err != nil {
 		return nil, fmt.Errorf("encryption: build envelope: %w", err)
 	}
-	mode := e.EncryptMode
-	if mode == "" {
-		mode = crypto.EncryptModePerChain
-	}
 	return &pipeline.BackupEncryption{
 		Envelope:        env,
 		RebuildForChain: passphraseRebuildForChain(passphrase),
 		Mode:            mode,
 	}, nil
+}
+
+// validateKeySources enforces mutual exclusion between the
+// passphrase-mode flag family and the KMS-mode flag(s). Operators who
+// pass both get a clear error before any envelope-building work
+// happens.
+func (e *EncryptionFlags) validateKeySources() error {
+	hasPassphrase := e.EncryptionPassphrase != "" || e.EncryptionPassphraseEnv != "" || e.EncryptionPassphraseFile != ""
+	hasKMS := e.KMSKeyARN != ""
+	if hasPassphrase && hasKMS {
+		return errors.New("--encryption-passphrase{,-env,-file} and --kms-key-arn are mutually exclusive")
+	}
+	if !hasPassphrase && !hasKMS {
+		return errors.New("--encrypt requires one of --encryption-passphrase{,-env,-file} or --kms-key-arn")
+	}
+	return nil
+}
+
+// kmsOpts builds the [crypto.KMSOption] slice for the production
+// path. Only the region override is operator-facing; tests construct
+// envelopes via [crypto.WithKMSClient] directly without going through
+// the CLI builder.
+func kmsOpts(region string) []crypto.KMSOption {
+	if region == "" {
+		return nil
+	}
+	return []crypto.KMSOption{crypto.WithKMSRegion(region)}
 }
 
 // passphraseRebuildForChain returns a builder closure that the
@@ -154,16 +201,15 @@ func passphraseRebuildForChain(passphrase string) func(*ir.Argon2idParams) (cryp
 }
 
 // buildReadEnvelope constructs a [crypto.EnvelopeEncryption] for the
-// read side (restore / chain restore / broker). The chain root
-// manifest's recorded Argon2id params are needed to re-derive the KEK,
-// but those are loaded inside the pipeline orchestrator from the
-// manifest. CLI just needs the operator's passphrase; the orchestrator
-// re-derives the KEK against the chain's salt.
+// read side (restore / chain restore / broker). For passphrase mode,
+// the chain root manifest's recorded Argon2id params are needed to
+// re-derive the KEK; the CLI loads them from rootManifest before
+// constructing the envelope.
 //
-// Phase 6.1: returns a passphrase-only envelope when --encrypt is set.
-// The CLI hands it to the pipeline; the pipeline checks the chain's
-// recorded Argon2id params against the envelope's params at preflight
-// time.
+// For KMS mode (Phase 6.2), the chain root's KEKRef is the
+// operator-recorded ARN; the operator must supply a matching
+// --kms-key-arn (and KMS Decrypt does the rest — no params to load
+// from the manifest).
 //
 // Returns nil when --encrypt is false (plaintext chain expected).
 func (e *EncryptionFlags) buildReadEnvelope(rootManifest *ir.Manifest) (crypto.EnvelopeEncryption, error) {
@@ -172,6 +218,16 @@ func (e *EncryptionFlags) buildReadEnvelope(rootManifest *ir.Manifest) (crypto.E
 		// --encrypt? The pipeline's preflight returns a clearer error
 		// in that case (it knows the kek_mode); leave that path alone.
 		return nil, nil
+	}
+	if err := e.validateKeySources(); err != nil {
+		return nil, err
+	}
+	if e.KMSKeyARN != "" {
+		env, err := crypto.NewKMSEnvelope(kongContext(), e.KMSKeyARN, kmsOpts(e.KMSRegion)...)
+		if err != nil {
+			return nil, fmt.Errorf("encryption: build kms read envelope: %w", err)
+		}
+		return env, nil
 	}
 	passphrase, err := e.resolvePassphrase()
 	if err != nil {

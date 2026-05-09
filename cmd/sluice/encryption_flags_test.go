@@ -256,3 +256,68 @@ func TestEncryptionFlags_BuildBackupEncryption_RebuildForChain_NilParams(t *test
 		t.Fatal("RebuildForChain(nil) must error; got nil")
 	}
 }
+
+// TestEncryptionFlags_KMSAndPassphraseMutuallyExclusive pins the
+// Phase 6.2 contract: --kms-key-arn and --encryption-passphrase{,-env,
+// -file} can't be combined. The orchestrator only accepts one key
+// material; mixing them is operator confusion that should fail loudly
+// at flag-parse time, not silently pick a precedence rule.
+func TestEncryptionFlags_KMSAndPassphraseMutuallyExclusive(t *testing.T) {
+	cases := []struct {
+		name  string
+		flags EncryptionFlags
+	}{
+		{"with-passphrase-direct", EncryptionFlags{
+			Encrypt:              true,
+			KMSKeyARN:            "arn:aws:kms:us-east-1:1:key/x",
+			EncryptionPassphrase: "secret",
+		}},
+		{"with-passphrase-env", EncryptionFlags{
+			Encrypt:                 true,
+			KMSKeyARN:               "arn:aws:kms:us-east-1:1:key/x",
+			EncryptionPassphraseEnv: "VAR",
+		}},
+		{"with-passphrase-file", EncryptionFlags{
+			Encrypt:                  true,
+			KMSKeyARN:                "arn:aws:kms:us-east-1:1:key/x",
+			EncryptionPassphraseFile: "/tmp/p",
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := tc.flags.buildBackupEncryption(); err == nil {
+				t.Fatal("expected mutual-exclusion error; got nil")
+			} else if !strings.Contains(err.Error(), "mutually exclusive") {
+				t.Errorf("error should name mutual exclusion; got %v", err)
+			}
+		})
+	}
+}
+
+// TestEncryptionFlags_KMSWithoutEncrypt pins the symmetry with the
+// passphrase-without-encrypt sanity check: setting --kms-key-arn
+// without --encrypt is operator confusion, not a silent disable.
+func TestEncryptionFlags_KMSWithoutEncrypt(t *testing.T) {
+	flags := &EncryptionFlags{
+		KMSKeyARN: "arn:aws:kms:us-east-1:1:key/x",
+	}
+	if _, err := flags.buildBackupEncryption(); err == nil {
+		t.Fatal("expected error when --kms-key-arn is set without --encrypt")
+	} else if !strings.Contains(err.Error(), "--encrypt") {
+		t.Errorf("error should name --encrypt; got %v", err)
+	}
+}
+
+// TestEncryptionFlags_EncryptWithoutAnyKey pins the surface that
+// --encrypt alone (no passphrase, no KMS) errors with a clear
+// message naming the flag families that satisfy it.
+func TestEncryptionFlags_EncryptWithoutAnyKey(t *testing.T) {
+	flags := &EncryptionFlags{Encrypt: true}
+	_, err := flags.buildBackupEncryption()
+	if err == nil {
+		t.Fatal("expected --encrypt-without-key to error")
+	}
+	if !strings.Contains(err.Error(), "encryption-passphrase") || !strings.Contains(err.Error(), "kms-key-arn") {
+		t.Errorf("error should name both passphrase and kms options; got %v", err)
+	}
+}
