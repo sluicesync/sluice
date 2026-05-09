@@ -6,6 +6,51 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.22.0]
+
+Logical backups Phase 6.1 lands: **client-side passphrase-mode encryption.** Chunks now land in cloud storage as AES-256-GCM ciphertext when `--encrypt` is set; only an operator with the right passphrase can recover the underlying rows. Closes the v0.16.0 / v0.17.2 release-notes-disclosed gap that sluice currently writes plaintext chunks; unlocks compliance-driven adoption (HIPAA, PCI-DSS, SOC 2 Type II, GDPR with customer-controlled keys) + air-gapped DR workflows where bucket-SSE doesn't follow the bytes. Implementation supplement: `docs/dev/design-logical-backups-phase-6.md`.
+
+### Added
+
+- **`--encrypt` + `--encryption-passphrase{,-env,-file}` + `--encrypt-mode={per-chain,per-chunk}` on backup full / incremental / stream / restore / sync from-backup.** Operator passes a passphrase; sluice derives a Key Encryption Key via Argon2id (default 64 MiB / 3 iterations / 4 parallelism, NIST-recommended starting point), generates an AES-256 Content Encryption Key, encrypts every chunk with AES-256-GCM under the CEK, wraps the CEK with the KEK, and records the wrapped CEK + Argon2id params on the chain manifest. Restore re-derives the KEK from the operator's passphrase + the recorded salt, unwraps the CEK, decrypts every chunk on the fly. `--encryption-passphrase-env` and `--encryption-passphrase-file` are recommended over inline `--encryption-passphrase` for production (the inline form shows up in shell history).
+
+- **Per-chain CEK by default; per-chunk CEK opt-in.** Per-chain wraps a single CEK at chain root; every chunk reuses the same CEK with its own random 12-byte nonce. Argon2id (the expensive op) runs **once per restore**, not once per chunk. Per-chunk mode (`--encrypt-mode=per-chunk`) wraps a fresh CEK per chunk for defense-in-depth at the cost of per-chunk Argon2id derives during restore.
+
+- **`internal/crypto/envelope.go` package.** New `EnvelopeEncryption` interface abstracts CEK wrap/unwrap so Phase 6.2 (AWS KMS) and Phase 6.3 (GCP Cloud KMS / Azure Key Vault) modes plug in without changing the chunk writer/reader. Phase 6.1 ships `PassphraseEnvelope` (Argon2id-derived KEK).
+
+- **Manifest schema additions.** `Manifest.ChainEncryption` (`{algorithm, mode, kek_mode, kek_ref, wrapped_cek, argon2id}`), `ChunkInfo.Encryption` (`{algorithm, nonce_len, auth_tag_len, wrapped_cek}`). All fields use `omitempty` so pre-Phase-6 manifests round-trip bit-identically post-Phase-6 readers.
+
+- **`sluice backup verify` runs without keys.** SHA-256 verification covers ciphertext bytes (post-encryption), so cron-probe verification of archived encrypted backups doesn't need the passphrase distributed to the verification host.
+
+- **Mixed-mode chain refusal.** A chain whose full is encrypted but an incremental isn't (or vice versa) is rejected at chain-restore time with a clear error. Encryption is per-chain, not per-chunk; chains are atomic.
+
+- **Operator-actionable refusals on restore.** Encrypted chain restored without `--encrypt` → refusal naming `algorithm` / `kek_mode` / `kek_ref`. Wrong passphrase → AES-GCM auth-tag-mismatch error before any data lands on target. No partial data lands on the target on either failure mode.
+
+- **`docs/operator/encryption.md`** — operator-facing guide on passphrase storage best practices, examples integrating with 1Password CLI / AWS Secrets Manager / env-injection patterns, the "lose the passphrase = lose the data" warning, recovery posture, mixed-mode-chain semantics, passphrase rotation workflow.
+
+### Changed
+
+- **`pipeline.Backup` / `IncrementalBackup` / `BackupStream` gain an `Encryption *BackupEncryption` field.** Plaintext (the v0.16.x..v0.21.x default) preserved by leaving it nil. Construction ergonomics unchanged for existing callers.
+
+- **`pipeline.Restore` / `ChainRestore` / `SyncFromBackup` gain an `Envelope crypto.EnvelopeEncryption` field.** Encryption preflight at chain-walk time fails fast on key mismatch; chain-level CEK is unwrapped once per Run() in per-chain mode (Argon2id pays a single derivation cost per restore process).
+
+- **`pipeline.ReadRootManifest` exported helper.** Reads the chain root manifest at `manifest.json` for CLI-side encryption preflight (extracting recorded Argon2id params before constructing the read-side envelope).
+
+### Migration / Compatibility
+
+- **No CLI breaking changes.** `--encrypt` is opt-in; existing backup / restore / sync from-backup invocations without it continue to write / read plaintext chunks identically.
+- **Pre-v0.22.0 chains restore unchanged.** Plaintext chains stay plaintext on restore; the manifest's `ChainEncryption` field is absent (omitempty); the chunk reader takes the existing plaintext path.
+- **Manifest schema additive.** New encryption fields use `omitempty`; older sluice readers (v0.21.x and earlier) ignore them gracefully — a v0.21.x sluice reading a v0.22.0 plaintext manifest sees the same shape it always did. **An older sluice cannot restore a v0.22.0 encrypted chain** (no decryption code path), but the manifest is human-readable enough that operators can recognize the `chain_encryption` field's presence and upgrade.
+- **`backup verify` continues to work without keys.** Existing cron probes that hash chunks need no changes; encrypted chunks hash ciphertext, which matches what's recorded in the manifest.
+- **No new heavy dependencies.** AES-GCM uses stdlib `crypto/aes` + `crypto/cipher`; Argon2id uses `golang.org/x/crypto/argon2` (already an indirect dependency, now promoted to direct).
+
+### Deferred
+
+- **Phase 6.2 (AWS KMS) + Phase 6.3 (GCP Cloud KMS / Azure Key Vault).** The `EnvelopeEncryption` interface is the seam those modes plug into; CLI flags will follow the same `--encryption-*` shape with `--kms-key-arn` / `--kms-key-resource` / `--azure-key-vault-id` keys.
+- **`--decrypt-verify` for `backup verify`.** v0.22.0 is sha256-only (covers integrity but not "the ciphertext decrypts to something parseable"); a future enhancement will add a deeper verify mode that decrypts + re-hashes plaintext.
+- **Passphrase rotation tooling.** v0.22.0's rotation workflow is "fresh full + new chain"; re-encrypting existing chunks under a new passphrase is out of scope. KMS-mode key rotation in Phase 6.2/6.3 will be transparent via cloud-provider key-version chains.
+- **Encrypted manifests.** The manifest itself stays plaintext (carries chunk paths, sha256s, and the wrapped CEK — none of which leak rows). Operators wanting "encrypt everything including manifests" have a future-phase option.
+
 ## [0.21.2]
 
 Single-bug patch from the v0.21.0 cycle. CDC streams against any Postgres source carrying a `UUID`-typed column crashed on the first INSERT/UPDATE — pre-existing bug, not a v0.21 regression, surfaced when the v0.21 cross-engine cycle expanded UUID coverage. Fix is local to the PG CDC value-decoder; no protocol or schema changes.

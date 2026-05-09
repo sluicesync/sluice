@@ -231,11 +231,15 @@ What remains are the **harder-frontier items** that have always been here as des
 
 **Why.** v0.21.x ships chunked + manifested + chain-restorable backups, but **chunks land in cloud storage as plaintext** (correctly disclosed in v0.16.0 / v0.17.2's release notes — sluice doesn't currently encrypt at-rest; operators rely on bucket-level SSE / filesystem-level FDE). Phase 6 closes that with sluice-managed client-side AES-256-GCM, key material delivered via cloud KMS. Threat model: operators who can't trust the storage provider's encryption alone (compliance posture, regulated data, BYOK requirements) get end-to-end encryption that survives both the cloud provider and any intermediate storage handoff (SneakerNet, archival migrations, etc.).
 
-**What.** Build on a Phase 1-deferred passphrase-derived AES-256-GCM MVP (~300-400 LOC) for the no-cloud-dependency case, then extend to KMS-managed keys. AWS KMS first (most common cloud KMS), GCP KMS + Azure Key Vault to follow. Per-chunk envelope encryption: each chunk encrypted with a content-encryption key, the CEK encrypted with the KMS key reference, the wrapped CEK stored in the manifest. Restore decrypts via KMS API call per restore (or per chunk, configurable). BYOK ("bring your own key") story is the same shape — operator points at their KMS key ARN.
+**Sub-phasing.**
 
-**Gotchas.** KMS API call cost + latency on restore — multi-table chains with many chunks could rack up KMS request charges. Mitigate via per-chain CEK cache (single KMS unwrap at restore start; subsequent chunks reuse the unwrapped CEK in-memory for the duration of the restore process). Key rotation: operator rotates the KMS root key; existing manifests reference the old key version; KMS handles the version-chain transparently. Re-encryption-at-rest for already-written chunks is out of scope (operator can take a fresh full + retire old chains).
+- **6.1 — Passphrase mode (shipped in v0.22.0).** No cloud dependency. AES-256-GCM bulk cipher, Argon2id KEK derivation from operator-supplied passphrase + per-chain salt. Per-chain CEK by default (single Argon2id derive per restore); `--encrypt-mode=per-chunk` opt-in for defense-in-depth. CLI: `--encrypt`, `--encryption-passphrase`, `--encryption-passphrase-env`, `--encryption-passphrase-file` on backup full / incremental / stream / restore / sync from-backup. Mixed-mode chains refused; backup verify (sha256-only) doesn't need keys.
+- **6.2 — AWS KMS (next).** `--kms-key-arn` flag, AES-256-GCM bulk cipher unchanged, AWS KMS replaces Argon2id for KEK derivation. Per-chain CEK cache reduces KMS Decrypt calls to one per restore.
+- **6.3 — GCP Cloud KMS + Azure Key Vault.** Same shape as 6.2; per-cloud SDK wrappers behind the `EnvelopeEncryption` interface.
 
-Estimated size ~800-1200 LOC + a key-management ADR. Possible follow-ups: Phase 6.5 client-side passphrase mode (no KMS dependency) for air-gapped / dev workflows.
+**Gotchas.** KMS API call cost + latency on restore — multi-table chains with many chunks could rack up KMS request charges. Mitigated in 6.1's design via per-chain CEK cache (single KEK derive / KMS unwrap at restore start; subsequent chunks reuse the unwrapped CEK in-memory for the duration of the restore process). Key rotation: operator rotates the KMS root key; existing manifests reference the old key version; KMS handles the version-chain transparently. Passphrase rotation in 6.1 is a fresh-chain workflow (start a new chain with the new passphrase). Re-encryption-at-rest for already-written chunks is out of scope.
+
+Remaining size ~600-1000 LOC for 6.2 + 6.3 + a key-management ADR.
 
 ---
 
