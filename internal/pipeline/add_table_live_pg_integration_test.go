@@ -192,6 +192,18 @@ func TestAddTable_LiveMode_PG_UnderLoad(t *testing.T) {
 		t.Fatalf("bulk copy did not deliver customers seed row")
 	}
 
+	// Warm CDC + cdc-state row. The cdc-state row is created on the
+	// applier's first per-change tx, NOT on bulk-copy completion.
+	// Without this step, AddTable's preflight ListStreams query
+	// returns an empty list and refuses with "no stream X on target"
+	// before reaching the live-mode code path. ADR-0030's flow assumes
+	// an active stream — the test must wait for that state to
+	// materialize, not just for bulk-copy to land.
+	applyDDL(t, sourceDSN, "INSERT INTO customers (email) VALUES ('warmup@example.com');")
+	if !waitForRowCount(t, targetDSN, "customers", 2, 30*time.Second) {
+		t.Fatalf("CDC did not deliver post-snapshot warmup insert; cdc-state row may not be written yet")
+	}
+
 	// Create the new table with 50 seed rows.
 	const newTableDDL = `
 		CREATE TABLE events (
@@ -340,6 +352,17 @@ func TestAddTable_LiveMode_MySQL_Refused(t *testing.T) {
 
 	if !waitForRowCountMySQL(t, targetDSN, "users", 1, 30*time.Second) {
 		t.Fatalf("bulk copy did not deliver users seed row")
+	}
+
+	// Warm CDC + cdc-state row before the refusal probe — without
+	// this step the live-mode preflight refuses with "no stream X on
+	// target" (the cdc-state row is written on first apply, not on
+	// bulk-copy completion) and the assertion below would assert on
+	// the wrong refusal message. Same shape as the PG happy-path
+	// test's CDC-warmup step.
+	applyDDLMySQL(t, sourceDSN, "INSERT INTO users (email) VALUES ('warmup@example.com');")
+	if !waitForRowCountMySQL(t, targetDSN, "users", 2, 30*time.Second) {
+		t.Fatalf("CDC did not deliver post-snapshot warmup insert; cdc-state row may not be written yet")
 	}
 
 	applyDDLMySQL(t, sourceDSN, `
