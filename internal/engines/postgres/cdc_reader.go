@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/url"
 	"os"
 	"strings"
@@ -967,6 +968,23 @@ func decodeTuple(tuple *pglogrepl.TupleData, cols []relationColumn) (ir.Row, err
 			// Unchanged TOAST: omit from row map.
 			continue
 		case 't':
+			// Phase A instrumentation (Bug 41): log the format byte +
+			// raw payload shape we hand to decodeValue, so we can see
+			// what pgoutput actually delivers for UUID columns. The
+			// previous bug (UUID byte-length 36 vs want 16) suggests
+			// pgoutput is shipping text-format hyphenated strings; the
+			// log confirms ground truth before fixing decodeUUID.
+			preview := col.Data
+			if len(preview) > 40 {
+				preview = preview[:40]
+			}
+			slog.Debug("postgres: cdc: decodeTuple: column delegate",
+				"column", c.Name,
+				"oid", c.OID,
+				"format_byte", string([]byte{col.DataType}),
+				"data_len", len(col.Data),
+				"data_preview", string(preview),
+			)
 			v, err := decodeValue(col.Data, c.Type)
 			if err != nil {
 				return nil, fmt.Errorf("column %q: %w", c.Name, err)

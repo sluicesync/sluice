@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/netip"
 	"reflect"
@@ -238,6 +239,29 @@ func decodeTimeAsString(raw any) (any, error) {
 // into the canonical lowercase-hyphenated string the IR contract
 // requires.
 func decodeUUID(raw any) (any, error) {
+	// Phase A instrumentation (Bug 41): log inbound shape so we can
+	// confirm what pgoutput is delivering for UUID columns.
+	switch v := raw.(type) {
+	case []byte:
+		preview := v
+		if len(preview) > 40 {
+			preview = preview[:40]
+		}
+		slog.Debug("postgres: decodeUUID: received []byte",
+			"len", len(v),
+			"preview", string(preview),
+		)
+	case string:
+		slog.Debug("postgres: decodeUUID: received string",
+			"len", len(v),
+			"value", v,
+		)
+	default:
+		slog.Debug("postgres: decodeUUID: received other",
+			"type", fmt.Sprintf("%T", raw),
+		)
+	}
+
 	switch v := raw.(type) {
 	case [16]byte:
 		return formatUUIDBytes(v[:])
