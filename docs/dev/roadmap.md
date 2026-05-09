@@ -223,54 +223,23 @@ IR-first, sealed interfaces, kong+koanf, three-phase apply, MySQL flavors, pgout
 
 ## Next up
 
-The v0.10.x cycle closed reactive-bug loops on the v0.9.x translator gaps and shipped the `--expr-override` escape hatch. The v0.11.x cycle landed two batches of proactive translator catalog work (16 rules) plus three real-world bug fixes from the autonomous test-cycle loop. OSS-hygiene track is closed. Four new proto-ADRs were written 2026-05-07 to capture the design space for the user's "100% confidence that all data has been copied + synced" goal — `sluice verify`, sync-health monitoring, logical backups, and Apache Arrow integration. The roadmap reorders to put those at the top.
+The v0.10.x cycle closed reactive-bug loops on the v0.9.x translator gaps and shipped the `--expr-override` escape hatch. The v0.11.x cycle landed two batches of proactive translator catalog work (16 rules) plus three real-world bug fixes from the autonomous test-cycle loop. The v0.13.x–v0.21.x autonomous-release block (May 2026) shipped the entire "100% confidence" backbone: `sluice verify` (count + sample + full-mode), `sync-health` monitoring + Prometheus listener, **and the full logical-backups track Phase 1 → Phase 5** (local-FS → cloud backends → incremental + chain-aware restore → CDC handoff → continuous-incremental long-running stream → backup-as-broker → cross-engine chain restore). OSS-hygiene track is closed.
 
-The remaining work splits into three buckets: (a) the "100% confidence" features — verify, sync-health, logical backups, Arrow — that directly serve the user's overarching goal; (b) the heavier design-first items still on deck — mid-stream add-table, multi-source aggregation; (c) translator-catalog continuation as lower-priority polish.
+What remains are the **harder-frontier items** that have always been here as design-first work plus the now-front-of-queue Phase 6 (KMS encryption, the only piece of the logical-backups track still pending).
 
-### 1. `sluice verify` — data-integrity verification command
+### 1. Logical backups Phase 6 — KMS-backed at-rest encryption
 
-**Why.** Operators today have `sluice schema diff` (structural) but no positive-confirmation surface for *data*. This is the most direct delivery on the "100% confidence" goal — operators can spend more or less verification time depending on their risk tolerance. Closes the no-Fivetran-silent-stop pain shape on the data-integrity side. See [`design-sluice-verify.md`](design-sluice-verify.md).
+**Why.** v0.21.x ships chunked + manifested + chain-restorable backups, but **chunks land in cloud storage as plaintext** (correctly disclosed in v0.16.0 / v0.17.2's release notes — sluice doesn't currently encrypt at-rest; operators rely on bucket-level SSE / filesystem-level FDE). Phase 6 closes that with sluice-managed client-side AES-256-GCM, key material delivered via cloud KMS. Threat model: operators who can't trust the storage provider's encryption alone (compliance posture, regulated data, BYOK requirements) get end-to-end encryption that survives both the cloud provider and any intermediate storage handoff (SneakerNet, archival migrations, etc.).
 
-**What.** New CLI command with three depth modes:
-- `--depth count` — row counts per table; cheapest probe.
-- `--depth sample` — counts + N random PK-range row content hashes (default; ~99% confidence of detecting 5%+ corruption).
-- `--depth full` — every row's content hash + bisection on mismatch.
+**What.** Build on a Phase 1-deferred passphrase-derived AES-256-GCM MVP (~300-400 LOC) for the no-cloud-dependency case, then extend to KMS-managed keys. AWS KMS first (most common cloud KMS), GCP KMS + Azure Key Vault to follow. Per-chunk envelope encryption: each chunk encrypted with a content-encryption key, the CEK encrypted with the KMS key reference, the wrapped CEK stored in the manifest. Restore decrypts via KMS API call per restore (or per chunk, configurable). BYOK ("bring your own key") story is the same shape — operator points at their KMS key ARN.
 
-New `ir.Verifier` optional interface (3 methods: `ExactRowCount`, `SampleRows`, `FullScanHash`); new `pipeline.Verifier` orchestrator mirrors `Differ`/`Migrator` shape. Sequencing: count-mode MVP (~1 week), then sample, then full. Total ~5 weeks for full feature.
+**Gotchas.** KMS API call cost + latency on restore — multi-table chains with many chunks could rack up KMS request charges. Mitigate via per-chain CEK cache (single KMS unwrap at restore start; subsequent chunks reuse the unwrapped CEK in-memory for the duration of the restore process). Key rotation: operator rotates the KMS root key; existing manifests reference the old key version; KMS handles the version-chain transparently. Re-encryption-at-rest for already-written chunks is out of scope (operator can take a fresh full + retire old chains).
 
-**Gotchas.** Cross-engine value comparison must use the same `RetargetForEngine` canonicalization `schema diff` already does. Generated columns + CHECK constraints excluded from row-hash. CDC-position-aware verification ("verify against the LSN target has caught up to") is open question #1.
+Estimated size ~800-1200 LOC + a key-management ADR. Possible follow-ups: Phase 6.5 client-side passphrase mode (no KMS dependency) for air-gapped / dev workflows.
 
 ---
 
-### 2. Sync-health monitoring + alerting hooks
-
-**Why.** Companion to `sluice verify`. Verify covers data-integrity; sync-health covers liveness/lag — the orthogonal half of the "100% confidence" goal. Operators today have `sync status` (snapshot when they look) but no continuous staleness measurement, stalled-stream detection, or push-based alerting integration. See [`design-sync-health-monitoring.md`](design-sync-health-monitoring.md).
-
-**What.** Two surfaces:
-- `sluice sync health` — one-shot probe with `--max-lag-seconds` / `--max-events` / `--max-stale-seconds` threshold flags + structured exit code. Cron-friendly.
-- `sluice sync start --metrics-listen ADDR` — Prometheus `/metrics` endpoint exposing the same metric set. Off by default; opt-in.
-
-Metric set covers position-derived (`sluice_lag_events`, `sluice_lag_seconds`), liveness (`sluice_seconds_since_last_event`, `sluice_streamer_state`), and throughput (events/bytes/batch-size). New `ir.HealthReporter` optional interface (2 methods); both engines implement straightforwardly. Sequencing: probe MVP (~2 weeks), Prometheus listener (~1 week), per-table + PG slot health (~1 week).
-
-**Gotchas.** Distinguishing "quiet source" (low write rate) from "broken connection" is the load-bearing design question — see open question #3 in the proto-ADR. Per-table metric cardinality blows up Prometheus storage on many-table schemas; gated behind `--metrics-per-table` flag.
-
----
-
-### 3. Logical backups Phase 2+ (cloud backends + incremental)
-
-**Phase 1 (full snapshot to local filesystem) shipped — see "Recently landed".** Remaining phases:
-
-**Phase 2 — cloud backends (S3-compatible, then GCS/Azure native).** `internal/pipeline/local_store.go` already implements `ir.BackupStore`; Phase 2 adds `S3Store` via `aws-sdk-go-v2` with multipart upload, then GCS / Azure native. CLI shape stays the same — only the URL scheme changes (`--target=s3://bucket/prefix/`). Auth follows AWS SDK defaults: env vars, IAM roles, profile files, AWS SSO. CI integration: roundtrip against MinIO via testcontainers. Estimated size ~1000-1500 LOC.
-
-**Phase 3 — incremental backups.** Same machinery as `sync start`'s CDC pump but with the applier writing serialised `ir.Change` events to rolling chunk files. New CLI: `sluice backup incremental --since <backup-id>`. Restore walks the chain (full + every incremental since) in order; idempotent application relies on ADR-0010. Layer-3 verification opt-in via `--verify=full`. Estimated size ~1500-2000 LOC.
-
-**Phase 6 — KMS-backed encryption.** Builds on a Phase 1 client-side AES-256-GCM passphrase MVP (also deferred from Phase 1). AWS KMS first, GCP KMS / Azure Key Vault to follow. BYOK story lands here. Estimated size ~800-1200 LOC plus a key-management ADR.
-
-**Gotchas.** Public format ownership — `manifest.json` is now a forward-compat contract. `format_version: 1` lets future versions add fields; Phase 3 likely bumps it.
-
----
-
-### 4. Apache Arrow integration (conditional)
+### 2. Apache Arrow integration (conditional)
 
 **Why.** User raised as exploratory research. Arrow opens up data-lake offload (Parquet files on cloud storage), zero-copy interop with DuckDB/Polars/Spark, and downstream-system-friendly formats. See [`design-apache-arrow-integration.md`](design-apache-arrow-integration.md).
 
@@ -280,7 +249,7 @@ Metric set covers position-derived (`sluice_lag_events`, `sluice_lag_seconds`), 
 
 ---
 
-### 5. Mid-stream add-table — Phase 2 (live add, no drain)
+### 3. Mid-stream add-table — Phase 2 (live add, no drain)
 
 **Why.** Phase 1 (drained-stream add-table) shipped — see "Recently landed". Phase 2 removes the `sluice sync stop --wait` precondition by coordinating a brief CDC pause so the snapshot LSN aligns with the in-flight stream's position. Useful for high-availability workloads that can't tolerate the ~seconds-of-latency drain that Phase 1 requires.
 
@@ -293,7 +262,7 @@ Metric set covers position-derived (`sluice_lag_events`, `sluice_lag_seconds`), 
 
 ---
 
-### 6. Multi-source aggregation
+### 4. Multi-source aggregation
 
 **Why.** Some users have multiple source DBs replicating into one target (sharded → consolidated, microservices → analytics warehouse, etc.). Today each `sluice sync start` is a 1:1 stream. ADR-0024 flagged this as out-of-scope; proto-ADR exists at [`design-multi-source-aggregation.md`](design-multi-source-aggregation.md).
 
@@ -306,7 +275,7 @@ Metric set covers position-derived (`sluice_lag_events`, `sluice_lag_seconds`), 
 
 ---
 
-### 7. Translator catalog continuation (lowest priority)
+### 5. Translator catalog continuation (lowest priority)
 
 **Why.** `docs/dev/translator-coverage.md` is the research catalog (30 candidate rules). v0.11.0/v0.11.1/v0.11.3 closed the highest-leverage 16 rules. The remaining medium-priority entries are mostly passthroughs (NULLIF, GREATEST/LEAST), version-gated (JSON_OBJECT for PG 16+), or have semantic gotchas (REGEXP_LIKE dialect divergence). Diminishing returns now that the highest-frequency-in-DDL rules are in.
 
@@ -316,7 +285,7 @@ Metric set covers position-derived (`sluice_lag_events`, `sluice_lag_seconds`), 
 
 ---
 
-### 8. View support Phase 2/3 — materialized-view refresh + cross-engine view-body translation
+### 6. View support Phase 2/3 — materialized-view refresh + cross-engine view-body translation
 
 **Why.** Phase 1 (schema-only round-trip + dependency-ordered apply + diff/preview integration + CLI filters) shipped. The two large open frontiers remain:
 
@@ -330,6 +299,18 @@ Metric set covers position-derived (`sluice_lag_events`, `sluice_lag_seconds`), 
 - Phase 1 deliberately punted: view definitions with explicit column lists `CREATE VIEW name (a, b, c) AS ...`, MySQL `CREATE ALGORITHM=UNDEFINED VIEW`, PG `WITH (security_invoker=true)`, and PG RULE-based pseudo-views. Each has different demand signals — pick what to surface based on real-world operator reports.
 
 ---
+
+### Open bugs awaiting fix windows
+
+Tracked in detail in `sluice-testing/BUG-CATALOG.md`; recap here for roadmap visibility:
+
+- **Bug 17** (deferred, low priority) — `impact_items` cross-engine COALESCE handling in expression translator.
+- **Bug 25** (deferred, low priority) — PG immutability of enum-typed STORED generated columns.
+- **Bug 26** (deferred) — PostGIS SRID dropped on schema translation.
+- **Bug 27** (deferred, see below) — VStream POINT bytes mis-parsed.
+- **Bug 42** (open as of v0.21.2, parallel to Bug 41) — cross-engine restore of `DEFAULT gen_random_uuid()` columns fails MySQL Error 1064. Root cause: `RetargetForEngine` rewrites `Column.Type` (UUID → CHAR(36)) but doesn't rewrite `Column.DefaultValue` of kind `DefaultExpression`; PG's `gen_random_uuid()` lands verbatim in MySQL CREATE TABLE. Mirrors v0.11.3's Bugs 28/29 in the opposite direction. Suggested fix: extend ADR-0016's expression-translator catalog to cover PG → MySQL UUID defaults (`gen_random_uuid()` → `(UUID())`). Estimated ~50-150 LOC.
+
+Together, **Bug 41 (closed v0.21.2) + Bug 42** cover "first-class UUID support in cross-engine restore" — Bug 41 fixed the CDC value-decode side; Bug 42 fixes the schema-side default-translation gap. Worth bundling soon since UUID PKs are pervasive in modern PG schemas (Rails, Django, Hasura, Supabase patterns).
 
 ### Bug 27 (deferred, parked here)
 
