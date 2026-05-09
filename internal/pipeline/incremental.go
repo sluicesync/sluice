@@ -289,7 +289,7 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 	// root. The parent full's [ir.ChainEncryption] dictates the chain's
 	// shape; mismatched runs (encrypt mid-chain or vice versa) are
 	// refused at chain-restore time anyway, so reject early here.
-	chainCEK, err := b.alignEncryption(parent)
+	chainCEK, err := b.alignEncryption(ctx, parent)
 	if err != nil {
 		return fmt.Errorf("incremental: encryption: %w", err)
 	}
@@ -796,8 +796,17 @@ func joinComma(parts []string) string {
 //     refuse (would create a mixed-mode chain).
 //   - Parent's chain root carries [ir.ChainEncryption] but the
 //     supplied envelope's Mode() doesn't match → refuse.
-func (b *IncrementalBackup) alignEncryption(parent *ir.Manifest) ([]byte, error) {
-	parentEnc := parent.ChainEncryption
+//
+// Bug 43 (v0.22.1): when the parent's chain encryption records
+// Argon2id params, the orchestrator rebuilds the supplied envelope
+// against the chain's recorded salt before unwrapping the parent's
+// WrappedCEK. CLI envelopes are minted with a fresh salt at startup
+// (the salt is needed for cold-start), so without this rebind the
+// unwrap fails with `aes-gcm open: cipher: message authentication
+// failed`. Tests that pre-build envelopes with the chain's known salt
+// don't supply RebuildForChain and pass through the cold-start path.
+func (b *IncrementalBackup) alignEncryption(ctx context.Context, parent *ir.Manifest) ([]byte, error) {
+	parentEnc := chainRootEncryption(ctx, b.Store, parent)
 	switch {
 	case parentEnc == nil && b.Encryption == nil:
 		return nil, nil
@@ -807,7 +816,11 @@ func (b *IncrementalBackup) alignEncryption(parent *ir.Manifest) ([]byte, error)
 		return nil, fmt.Errorf("incremental: parent chain is encrypted (algorithm=%q kek_mode=%q kek_ref=%q) but no --encrypt + key was supplied",
 			parentEnc.Algorithm, parentEnc.KEKMode, parentEnc.KEKRef)
 	}
-	// Both non-nil: verify mode + key compatibility.
+	// Both non-nil: rebind the envelope to the chain's salt (Bug 43)
+	// before validating mode / unwrapping the chain CEK.
+	if err := b.Encryption.rebindForChain(parentEnc.Argon2id); err != nil {
+		return nil, fmt.Errorf("incremental: rebuild envelope for chain: %w", err)
+	}
 	if b.Encryption.Envelope == nil {
 		return nil, errors.New("incremental: encryption envelope is nil")
 	}

@@ -84,6 +84,14 @@ func (e *EncryptionFlags) resolvePassphrase() (string, error) {
 // the write side (backup full / incremental / stream) using the
 // passphrase source supplied by the operator. Returns nil when
 // e.Encrypt is false (plaintext backup).
+//
+// Bug 43 (v0.22.1): the returned struct's RebuildForChain field
+// captures the operator's passphrase in a closure so the orchestrator
+// can rebuild the envelope against the chain root's recorded Argon2id
+// salt when extending an existing encrypted chain (incremental /
+// stream / full-resume). Cold-start full backups don't trigger
+// RebuildForChain — the freshly-minted Envelope's salt becomes the
+// chain's recorded salt.
 func (e *EncryptionFlags) buildBackupEncryption() (*pipeline.BackupEncryption, error) {
 	if !e.Encrypt {
 		// Sanity: passphrase supplied without --encrypt is suspicious.
@@ -109,9 +117,40 @@ func (e *EncryptionFlags) buildBackupEncryption() (*pipeline.BackupEncryption, e
 		mode = crypto.EncryptModePerChain
 	}
 	return &pipeline.BackupEncryption{
-		Envelope: env,
-		Mode:     mode,
+		Envelope:        env,
+		RebuildForChain: passphraseRebuildForChain(passphrase),
+		Mode:            mode,
 	}, nil
+}
+
+// passphraseRebuildForChain returns a builder closure that the
+// pipeline orchestrator calls when extending an existing encrypted
+// chain. The closure derives a fresh KEK from the operator's
+// passphrase + the chain's recorded Argon2id params (salt + cost),
+// returning a [crypto.PassphraseEnvelope] whose UnwrapCEK call will
+// succeed against the chain's WrappedCEK.
+//
+// Mirrors the read-side pattern in [EncryptionFlags.buildReadEnvelope]:
+// load the recorded params from the chain root, hand the operator's
+// passphrase + those params to [crypto.NewPassphraseEnvelope].
+func passphraseRebuildForChain(passphrase string) func(*ir.Argon2idParams) (crypto.EnvelopeEncryption, error) {
+	return func(p *ir.Argon2idParams) (crypto.EnvelopeEncryption, error) {
+		if p == nil {
+			return nil, errors.New("rebuild envelope: chain has no recorded Argon2id params")
+		}
+		params := crypto.Argon2idParams{
+			Salt:        p.Salt,
+			Memory:      p.Memory,
+			Iterations:  p.Iterations,
+			Parallelism: p.Parallelism,
+			KeyLen:      p.KeyLen,
+		}
+		env, err := crypto.NewPassphraseEnvelope(passphrase, params)
+		if err != nil {
+			return nil, fmt.Errorf("rebuild envelope: %w", err)
+		}
+		return env, nil
+	}
 }
 
 // buildReadEnvelope constructs a [crypto.EnvelopeEncryption] for the

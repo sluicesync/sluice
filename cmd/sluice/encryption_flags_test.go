@@ -4,10 +4,14 @@
 package main
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/orware/sluice/internal/crypto"
+	"github.com/orware/sluice/internal/ir"
 )
 
 func TestEncryptionFlags_ResolvePassphrase_Direct(t *testing.T) {
@@ -155,5 +159,100 @@ func TestEncryptionFlags_BuildReadEnvelope_Encrypt(t *testing.T) {
 	}
 	if env.Mode() != "passphrase-argon2id" {
 		t.Errorf("Mode: got %q", env.Mode())
+	}
+}
+
+// TestEncryptionFlags_BuildBackupEncryption_RebuildForChain pins
+// Bug 43's CLI surface: the BackupEncryption returned for an
+// --encrypt run carries a non-nil RebuildForChain that, when called
+// with a chain's recorded Argon2id params, returns an envelope whose
+// KEK was derived against the chain's salt (not the cold-start
+// envelope's freshly-minted salt). This is what lets the orchestrator
+// successfully unwrap a parent chain's WrappedCEK when extending an
+// encrypted chain.
+func TestEncryptionFlags_BuildBackupEncryption_RebuildForChain(t *testing.T) {
+	const passphrase = "correct horse battery staple"
+
+	// Step 1: simulate a chain's full backup. Use distinct params
+	// from whatever buildBackupEncryption mints internally.
+	chainParams, err := crypto.DefaultArgon2idParams()
+	if err != nil {
+		t.Fatalf("chain params: %v", err)
+	}
+	chainEnv, err := crypto.NewPassphraseEnvelope(passphrase, chainParams)
+	if err != nil {
+		t.Fatalf("chain envelope: %v", err)
+	}
+	cek, err := crypto.GenerateCEK()
+	if err != nil {
+		t.Fatalf("generate cek: %v", err)
+	}
+	wrapped, err := chainEnv.WrapCEK(cek)
+	if err != nil {
+		t.Fatalf("wrap cek: %v", err)
+	}
+
+	// Step 2: build the CLI-side BackupEncryption (cold-start salt).
+	flags := &EncryptionFlags{
+		Encrypt:              true,
+		EncryptionPassphrase: passphrase,
+		EncryptMode:          "per-chain",
+	}
+	enc, err := flags.buildBackupEncryption()
+	if err != nil {
+		t.Fatalf("buildBackupEncryption: %v", err)
+	}
+	if enc == nil {
+		t.Fatal("buildBackupEncryption returned nil")
+	}
+	if enc.RebuildForChain == nil {
+		t.Fatal("Bug 43 contract: RebuildForChain must be populated for encrypted runs")
+	}
+
+	// Step 3: cold-start envelope MUST fail to unwrap the chain's
+	// CEK (the salt asymmetry the bug exposed).
+	if _, err := enc.Envelope.UnwrapCEK(wrapped); err == nil {
+		t.Fatal("Bug 43 contract: cold-start envelope must fail to unwrap chain-salt CEK")
+	}
+
+	// Step 4: invoke RebuildForChain with the chain's recorded
+	// params; the returned envelope must unwrap cleanly.
+	recordedParams := &ir.Argon2idParams{
+		Salt:        chainParams.Salt,
+		Memory:      chainParams.Memory,
+		Iterations:  chainParams.Iterations,
+		Parallelism: chainParams.Parallelism,
+		KeyLen:      chainParams.KeyLen,
+	}
+	rebuilt, err := enc.RebuildForChain(recordedParams)
+	if err != nil {
+		t.Fatalf("RebuildForChain: %v", err)
+	}
+	if rebuilt == nil {
+		t.Fatal("RebuildForChain returned nil envelope")
+	}
+	got, err := rebuilt.UnwrapCEK(wrapped)
+	if err != nil {
+		t.Fatalf("rebuilt envelope unwrap: %v", err)
+	}
+	if !bytes.Equal(got, cek) {
+		t.Fatal("rebuilt envelope CEK mismatch")
+	}
+}
+
+// TestEncryptionFlags_BuildBackupEncryption_RebuildForChain_NilParams
+// ensures the builder rejects nil params loudly rather than minting a
+// wrong-salt envelope silently.
+func TestEncryptionFlags_BuildBackupEncryption_RebuildForChain_NilParams(t *testing.T) {
+	flags := &EncryptionFlags{
+		Encrypt:              true,
+		EncryptionPassphrase: "secret",
+	}
+	enc, err := flags.buildBackupEncryption()
+	if err != nil {
+		t.Fatalf("buildBackupEncryption: %v", err)
+	}
+	if _, err := enc.RebuildForChain(nil); err == nil {
+		t.Fatal("RebuildForChain(nil) must error; got nil")
 	}
 }

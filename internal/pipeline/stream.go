@@ -291,7 +291,7 @@ func (b *BackupStream) Run(ctx context.Context) error {
 	// 2.5. Phase 6.1: align with chain encryption. Refuses early if
 	// the parent's chain encryption shape doesn't match the operator's
 	// supplied envelope (or vice versa).
-	chainCEK, err := b.alignEncryption(parent)
+	chainCEK, err := b.alignEncryption(ctx, parent)
 	if err != nil {
 		return fmt.Errorf("stream: encryption: %w", err)
 	}
@@ -1115,8 +1115,15 @@ func newShellCommand(ctx context.Context, cmdStr string) *exec.Cmd {
 // alignEncryption mirrors [IncrementalBackup.alignEncryption]: validates
 // that this stream's encryption configuration is consistent with the
 // chain root's recorded shape, and returns the per-chain CEK (if any).
-func (b *BackupStream) alignEncryption(parent *ir.Manifest) ([]byte, error) {
-	parentEnc := parent.ChainEncryption
+//
+// Bug 43 (v0.22.1): the chain root's recorded Argon2id params are
+// passed to [BackupEncryption.rebindForChain] so the envelope's KEK
+// derives against the chain's salt rather than the freshly-minted
+// salt the CLI started the run with. Without this rebind, the unwrap
+// of the parent's WrappedCEK fails with `aes-gcm open: cipher:
+// message authentication failed`.
+func (b *BackupStream) alignEncryption(ctx context.Context, parent *ir.Manifest) ([]byte, error) {
+	parentEnc := chainRootEncryption(ctx, b.Store, parent)
 	switch {
 	case parentEnc == nil && b.Encryption == nil:
 		return nil, nil
@@ -1125,6 +1132,9 @@ func (b *BackupStream) alignEncryption(parent *ir.Manifest) ([]byte, error) {
 	case parentEnc != nil && b.Encryption == nil:
 		return nil, fmt.Errorf("stream: parent chain is encrypted (algorithm=%q kek_mode=%q kek_ref=%q) but no --encrypt + key was supplied",
 			parentEnc.Algorithm, parentEnc.KEKMode, parentEnc.KEKRef)
+	}
+	if err := b.Encryption.rebindForChain(parentEnc.Argon2id); err != nil {
+		return nil, fmt.Errorf("stream: rebuild envelope for chain: %w", err)
 	}
 	if b.Encryption.Envelope == nil {
 		return nil, errors.New("stream: encryption envelope is nil")

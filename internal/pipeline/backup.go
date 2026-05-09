@@ -73,7 +73,39 @@ type BackupEncryption struct {
 	// Envelope is the [crypto.EnvelopeEncryption] implementation used
 	// to wrap CEKs. Phase 6.1: a *crypto.PassphraseEnvelope. Required
 	// when the parent struct's encryption is enabled.
+	//
+	// Cold-start path: the orchestrator uses Envelope as-is to wrap a
+	// fresh chain CEK and stamps the envelope's params on the chain
+	// root's [ir.ChainEncryption].
+	//
+	// Chain-extension path: when the orchestrator detects an existing
+	// chain root (or in-progress full's prior manifest) carrying
+	// recorded [ir.Argon2idParams], it rebuilds the envelope via
+	// [BackupEncryption.RebuildForChain] (when supplied) so the KEK
+	// derives against the chain's salt rather than a freshly-minted
+	// one. Without RebuildForChain, the orchestrator uses Envelope
+	// as-is — correct for tests that build envelopes with a known
+	// salt, broken for production CLI calls that mint fresh salts.
+	// Bug 43 (v0.22.1): closes the gap by routing CLI passphrase
+	// envelopes through RebuildForChain.
 	Envelope crypto.EnvelopeEncryption
+
+	// RebuildForChain, when non-nil, is called by the orchestrator
+	// when extending an existing encrypted chain (incremental / stream
+	// against a chain with recorded Argon2id params, or backup-full
+	// resume against an in-progress encrypted manifest). The supplied
+	// params are the chain root's recorded [ir.Argon2idParams] (the
+	// salt that was used to derive the chain's KEK). Implementations
+	// should rebuild a [crypto.EnvelopeEncryption] tied to that salt
+	// + the operator's passphrase / KMS key.
+	//
+	// Returning a non-nil error aborts the orchestrator's startup
+	// loudly (e.g. wrong passphrase shape).
+	//
+	// Phase 6.1: passphrase mode populates this with a closure over
+	// the operator's passphrase. KMS modes (Phase 6.2/6.3) leave it
+	// nil — KMS unwrap doesn't depend on a chain-recorded salt.
+	RebuildForChain func(parentParams *ir.Argon2idParams) (crypto.EnvelopeEncryption, error)
 
 	// Mode is "per-chain" (default) or "per-chunk". See
 	// `docs/dev/design-logical-backups-phase-6.md` for the trade-off.
@@ -84,6 +116,31 @@ type BackupEncryption struct {
 	// salt + Argon2id params are the reference); KMS modes record the
 	// key ARN / resource name.
 	KEKRef string
+}
+
+// rebindForChain rebuilds the encryption envelope against the parent
+// chain's recorded Argon2id params and swaps it onto the receiver. A
+// no-op when params are nil or RebuildForChain is unset; callers fall
+// through to the cold-start envelope in that case.
+//
+// Bug 43 fix: the write-side previously built the envelope with a
+// fresh-minted Argon2id salt, so unwrapping the parent chain's
+// WrappedCEK (which was sealed under the parent's salt) failed with
+// `aes-gcm open: cipher: message authentication failed`. This helper
+// is the load-bearing mirror of the read-side
+// [EncryptionFlags.buildReadEnvelope] pattern: detect chain extension
+// via recorded Argon2id params, rebuild the envelope tied to those
+// params before any CEK unwrap.
+func (e *BackupEncryption) rebindForChain(parentParams *ir.Argon2idParams) error {
+	if e == nil || parentParams == nil || e.RebuildForChain == nil {
+		return nil
+	}
+	env, err := e.RebuildForChain(parentParams)
+	if err != nil {
+		return err
+	}
+	e.Envelope = env
+	return nil
 }
 
 // DefaultBackupChunkRows is the per-chunk row count when [Backup]'s
@@ -1019,6 +1076,29 @@ func ReadRootManifest(ctx context.Context, store ir.BackupStore) (*ir.Manifest, 
 	return readManifestIfPresent(ctx, store)
 }
 
+// chainRootEncryption returns the chain-root's [ir.ChainEncryption]
+// when an extending writer (incremental / stream) needs to align its
+// envelope. parent's ChainEncryption is returned directly when set
+// (the common case: parent is a full carrying the chain header).
+// When parent is itself an incremental (no ChainEncryption), the
+// chain root manifest is read from store and its ChainEncryption is
+// returned.
+//
+// Read errors are swallowed (returns nil) — the alignment logic
+// already handles a nil ChainEncryption shape gracefully and a noisy
+// store read at this point would mask the simpler "parent is
+// plaintext" path.
+func chainRootEncryption(ctx context.Context, store ir.BackupStore, parent *ir.Manifest) *ir.ChainEncryption {
+	if parent != nil && parent.ChainEncryption != nil {
+		return parent.ChainEncryption
+	}
+	root, err := readManifestIfPresent(ctx, store)
+	if err != nil || root == nil {
+		return nil
+	}
+	return root.ChainEncryption
+}
+
 // readManifest loads and decodes the manifest from store. Used by
 // both restore and `sluice backup verify`.
 func readManifest(ctx context.Context, store ir.BackupStore) (*ir.Manifest, error) {
@@ -1098,6 +1178,13 @@ func (b *Backup) setupChainEncryption(manifest, prior *ir.Manifest) ([]byte, err
 	if prior != nil && prior.ChainEncryption != nil &&
 		len(prior.ChainEncryption.WrappedCEK) > 0 &&
 		prior.ChainEncryption.Mode == crypto.EncryptModePerChain {
+		// Bug 43: rebuild the envelope against the prior chain's
+		// recorded Argon2id salt before unwrapping. CLI envelopes
+		// are minted with a fresh salt; unwrap would fail with an
+		// auth-tag mismatch without this rebind.
+		if err := enc.rebindForChain(prior.ChainEncryption.Argon2id); err != nil {
+			return nil, fmt.Errorf("rebuild envelope for prior chain: %w", err)
+		}
 		// Unwrap to recover the in-flight CEK.
 		cek, err := enc.Envelope.UnwrapCEK(prior.ChainEncryption.WrappedCEK)
 		if err != nil {
