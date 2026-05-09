@@ -259,7 +259,23 @@ Remaining size ~600-1000 LOC for 6.2 + 6.3 + a key-management ADR.
 
 ---
 
-### 3. Mid-stream add-table — MySQL Phase 2 (live add for binlog sources)
+### 3. Mid-stream live add-table — strict zero-loss correctness (PG Phase 2 follow-up)
+
+**Why.** v0.24.0 shipped Phase 2 live add-table (`--no-drain`, PG-only) with a documented best-effort gap: events on the new table inserted during the brief publication-add window may not be delivered (~1–3 events lost per sub-second window in CI's under-load test). pgoutput evaluates publication membership per WAL record at decode time; events that the slot decoded-and-filtered BEFORE publication-add took effect are gone — the slot doesn't redeliver retroactively. Snapshot rows + post-publication-add events are delivered exactly-once-effectively (proven by integration tests `TestAddTable_LiveMode_PG` + the post-add sentinel pin in the under-load test); the gap is the in-flight events during the add window itself. ADR-0030's "What could go wrong" section documents the limitation.
+
+**What.** Two viable paths:
+
+- **Path A — Slot-pause.** Temporarily stop the streamer's apply ack so the main slot retains WAL across the publication-add boundary, then re-decode the retained WAL with the updated publication state. Lighter implementation than Path B but requires plumbing into the streamer's apply loop (a "pause ACK at LSN, do publication-add, resume ACK from before-add LSN" hook). Estimated ~400-700 LOC.
+
+- **Path B — Strategy B dual-slot.** As originally sketched in `docs/dev/design-mid-stream-add-table.md`'s "Strategy B" section: open a second slot at the publication-add LSN that delivers events on the new table from that point forward; main slot continues without publication-scope change. Heavier (LSN race between the two slots' progress is the price ADR-0030 wanted to avoid). Estimated ~1500-2000 LOC.
+
+**Gotchas.** Path A's slot-pause needs careful interaction with the existing slot-ack-after-apply mechanism (Bug 15, ADR-0020) and the LSN tracker. Path B's dual-slot needs deterministic test fixtures for the LSN race — historically the reason ADR-0030 picked Strategy C in the first place. Pick based on which path is easier to test deterministically; v0.24.0's under-load test will prove the fix in either case.
+
+**Operational impact.** Low-frequency for typical operators (most live-adds happen on tables that aren't being actively written to at the moment of the add). High-impact for the specific pattern of "rolling out a new table that's already taking writes from the application before the bulk-copy completes." The drained add-table flow remains the zero-loss default for operators who care.
+
+---
+
+### 4. Mid-stream add-table — MySQL Phase 2 (live add for binlog sources)
 
 **Why.** PG Phase 2 (`--no-drain`) shipped — see "Recently landed" + ADR-0030. The PG mechanism (publication-add-then-snapshot) doesn't translate to MySQL: binlog auto-includes every table, so the gate is in the streamer's table filter (`--include-table`/`--exclude-table`), not in a publication.
 
@@ -274,7 +290,7 @@ Remaining size ~600-1000 LOC for 6.2 + 6.3 + a key-management ADR.
 
 ---
 
-### 4. Multi-source aggregation
+### 5. Multi-source aggregation
 
 **Why.** Some users have multiple source DBs replicating into one target (sharded → consolidated, microservices → analytics warehouse, etc.). Today each `sluice sync start` is a 1:1 stream. ADR-0024 flagged this as out-of-scope; proto-ADR exists at [`design-multi-source-aggregation.md`](design-multi-source-aggregation.md).
 
@@ -287,7 +303,7 @@ Remaining size ~600-1000 LOC for 6.2 + 6.3 + a key-management ADR.
 
 ---
 
-### 5. Translator catalog continuation (lowest priority)
+### 6. Translator catalog continuation (lowest priority)
 
 **Why.** `docs/dev/translator-coverage.md` is the research catalog (30 candidate rules). v0.11.0/v0.11.1/v0.11.3 closed the highest-leverage 16 rules. The remaining medium-priority entries are mostly passthroughs (NULLIF, GREATEST/LEAST), version-gated (JSON_OBJECT for PG 16+), or have semantic gotchas (REGEXP_LIKE dialect divergence). Diminishing returns now that the highest-frequency-in-DDL rules are in.
 
@@ -297,7 +313,7 @@ Remaining size ~600-1000 LOC for 6.2 + 6.3 + a key-management ADR.
 
 ---
 
-### 6. GEOMETRY / SPATIAL support — PostGIS-aware translation
+### 7. GEOMETRY / SPATIAL support — PostGIS-aware translation
 
 **Why.** Today sluice declines `GEOMETRY` emission in the PG writer with a loud error (`GEOMETRY requires PostGIS; not supported in this writer version`). Workloads with spatial columns — common in mapping / IoT / location-aware SaaS, often via Rails/Django/Hasura schemas — can't migrate at all. Two open bugs sit behind this entry: **Bug 26** (PostGIS SRID dropped on schema translation) and **Bug 27** (VStream POINT bytes mis-parsed). Prep doc with proposed shape: [`notes/prep-postgis-geometry.md`](notes/prep-postgis-geometry.md).
 
@@ -313,7 +329,7 @@ Estimated ~600-1000 LOC including tests + image-pull CI changes.
 
 ---
 
-### 7. Backup chunk compression investigation
+### 8. Backup chunk compression investigation
 
 **Why.** Phase 1 logical backups ship gzip-compressed JSON Lines (`internal/pipeline/backup_chunk.go:8-32`). The Phase 1 design doc proposed zstd at level 3; gzip shipped because it's stdlib and Phase 1 prioritised correctness. There's no documented benchmark of compression ratio or throughput vs alternatives — operators reasoning about S3 storage cost or backup-window time-to-disk are guessing.
 
@@ -327,7 +343,7 @@ Output is `docs/dev/notes/compression-benchmark.md` (data + recommendation) + a 
 
 ---
 
-### 8. Analytics-friendly source — research doc (Parquet export + DuckDB + Arrow Flight)
+### 9. Analytics-friendly source — research doc (Parquet export + DuckDB + Arrow Flight)
 
 **Why.** Operators running OLTP databases increasingly want the migration tool to also be the bridge to their analytics stack. Three orthogonal ideas surfaced in conversation that share an underlying theme: sluice as the data-out point for analytics-friendly consumption. Replaces the deferred Shape A path from item 2 with a narrower, more demand-driven framing.
 
@@ -346,7 +362,7 @@ Output: `docs/research/sluice-as-analytics-source.md` (operator personas + surfa
 
 ---
 
-### 9. View support Phase 2/3 — materialized-view refresh + cross-engine view-body translation
+### 10. View support Phase 2/3 — materialized-view refresh + cross-engine view-body translation
 
 **Why.** Phase 1 (schema-only round-trip + dependency-ordered apply + diff/preview integration + CLI filters) shipped. The two large open frontiers remain:
 

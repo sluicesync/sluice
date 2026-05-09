@@ -36,9 +36,13 @@
 
 ## What `--no-drain` does NOT cover
 
+- **In-flight inserts during the publication-add window — best-effort, not strict zero-loss.** Discovered during v0.24.0's CI under-load testing. pgoutput evaluates publication membership per WAL record at decode time; events on the new table that the slot decoded-and-filtered BEFORE the publication-add commit took effect are gone — the slot's confirmed_flush_lsn advances past them as it processes other events, and pgoutput doesn't redeliver retroactively. In CI's worst-case scenario (sustained INSERTs on the new table during a sub-second add window), we observe ~1–3 events out of ~20 missed per add. Snapshot rows + post-publication-add events are delivered exactly-once-effectively (proven by the `TestAddTable_LiveMode_PG` happy-path test and the post-add sentinel pin in `TestAddTable_LiveMode_PG_UnderLoad`); the gap is the in-flight events during the add window itself. **Operators with high write rates on the new table at the moment of live-add should either** (a) use the drained add-table flow (`sluice sync stop --wait` then `sluice schema add-table` without `--no-drain`), which has zero-loss semantics by construction, or (b) quiesce writes to the new table for the seconds-long window of the live add. The strict-correctness fix is queued as roadmap item 3 (slot-pause or Strategy B dual-slot); see ADR-0030 for the full discussion.
+
 - **Pause-window budget for very large tables.** A 10M-row bulk-copy still takes time. Live mode runs the bulk-copy via the temp slot (independent from the main slot, so CDC consumption isn't affected), but the table itself isn't fully populated on the target until bulk-copy completes. Subsequent CDC events on the new table land before bulk-copy's INSERTs in some orderings — the idempotent applier (`INSERT ON CONFLICT DO NOTHING`) handles this correctly per ADR-0030's correctness story.
+
 - **Concurrent live-adds for the same table.** `ALTER PUBLICATION` is serialisable on PG; concurrent `add-table TABLE --no-drain` calls for the same TABLE serialize at the publication level. Different tables can be added concurrently. (Test deferred until a real operator surfaces this pattern.)
-- **MySQL sources.** As noted above — separate chunk.
+
+- **MySQL sources.** Phase 2 is PG-only; MySQL has a meaningfully different design space (binlog auto-includes everything; the gap is in the streamer's table-filter, not in publication scope). Tracked as roadmap item 4.
 
 ## Test coverage
 
@@ -57,9 +61,10 @@
 
 ## What's next
 
-- **MySQL Phase 2** — live add-table for binlog sources. Different mechanism (table-filter flip in the streamer; no publication concept). Separate chunk.
-- **Multi-source aggregation** — N→1 streams. Proto-ADR has open questions (schema-collision strategy, per-source vs aggregated `sync status`) worth operator input before kicking off.
-- **Roadmap items 6–8** — GEOMETRY/SPATIAL support (closes Bugs 26/27), backup chunk compression investigation, analytics-friendly source research doc. See `docs/dev/roadmap.md`.
+- **PG Phase 2 strict zero-loss correctness** (roadmap item 3) — close the in-flight-event gap via either a slot-pause mechanism or the Strategy B dual-slot design. Both proposed paths sketched in ADR-0030 + roadmap.
+- **MySQL Phase 2** (roadmap item 4) — live add-table for binlog sources. Different mechanism (table-filter flip in the streamer; no publication concept). Separate chunk.
+- **Multi-source aggregation** (roadmap item 5) — N→1 streams. Proto-ADR has open questions (schema-collision strategy, per-source vs aggregated `sync status`) worth operator input before kicking off.
+- **Roadmap items 7–9** — GEOMETRY/SPATIAL support (closes Bugs 26/27), backup chunk compression investigation, analytics-friendly source research doc. See `docs/dev/roadmap.md`.
 
 ## Who needs this
 
