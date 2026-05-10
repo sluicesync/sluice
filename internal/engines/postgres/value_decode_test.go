@@ -191,6 +191,77 @@ func TestDecodeValue(t *testing.T) {
 		{"bool from t", "t", ir.Boolean{}, true},
 		{"bool from f", "f", ir.Boolean{}, false},
 
+		// ---- Geometry (PostGIS) ----
+		// pgx stdlib's `default:` branch hands an unknown-OID column
+		// to us as a string in PostGIS text-format (EWKB-as-hex). The
+		// decoder must hex-decode and strip the EWKB framing back to
+		// raw WKB to match the IR contract.
+		//
+		// EWKB POINT(0 0) SRID=4326 little-endian:
+		//   byte_order  = 01
+		//   type|flag   = 01 00 00 20  (POINT | 0x20000000)
+		//   srid        = E6 10 00 00  (4326 LE)
+		//   x, y        = 16 bytes of zero (two LE float64 zeros)
+		// -> raw WKB POINT(0 0) LE:
+		//   byte_order  = 01
+		//   type        = 01 00 00 00
+		//   x, y        = 16 bytes of zero
+		{
+			"geometry hex string (pgx stdlib default)",
+			"0101000020E6100000" + "0000000000000000" + "0000000000000000",
+			ir.Geometry{Subtype: ir.GeometryPoint, SRID: 4326},
+			[]byte{
+				0x01,
+				0x01, 0x00, 0x00, 0x00,
+				0, 0, 0, 0, 0, 0, 0, 0,
+				0, 0, 0, 0, 0, 0, 0, 0,
+			},
+		},
+		{
+			"geometry hex string with bytea \\x prefix",
+			`\x0101000020E6100000` + "0000000000000000" + "0000000000000000",
+			ir.Geometry{Subtype: ir.GeometryPoint, SRID: 4326},
+			[]byte{
+				0x01,
+				0x01, 0x00, 0x00, 0x00,
+				0, 0, 0, 0, 0, 0, 0, 0,
+				0, 0, 0, 0, 0, 0, 0, 0,
+			},
+		},
+		{
+			"geometry EWKB bytes",
+			[]byte{
+				0x01,
+				0x01, 0x00, 0x00, 0x20,
+				0xE6, 0x10, 0x00, 0x00,
+				0, 0, 0, 0, 0, 0, 0, 0,
+				0, 0, 0, 0, 0, 0, 0, 0,
+			},
+			ir.Geometry{Subtype: ir.GeometryPoint, SRID: 4326},
+			[]byte{
+				0x01,
+				0x01, 0x00, 0x00, 0x00,
+				0, 0, 0, 0, 0, 0, 0, 0,
+				0, 0, 0, 0, 0, 0, 0, 0,
+			},
+		},
+		{
+			"geometry raw WKB bytes pass through (no SRID flag)",
+			[]byte{
+				0x01,
+				0x01, 0x00, 0x00, 0x00,
+				0, 0, 0, 0, 0, 0, 0, 0,
+				0, 0, 0, 0, 0, 0, 0, 0,
+			},
+			ir.Geometry{Subtype: ir.GeometryPoint, SRID: 0},
+			[]byte{
+				0x01,
+				0x01, 0x00, 0x00, 0x00,
+				0, 0, 0, 0, 0, 0, 0, 0,
+				0, 0, 0, 0, 0, 0, 0, 0,
+			},
+		},
+
 		// ---- ADR-0032 PG extension passthrough (pgvector) ----
 		// pgvector returns vectors as `[1,2,3]`-style strings under
 		// pgx stdlib mode; decoder passes them through verbatim.
@@ -242,6 +313,12 @@ func TestDecodeValueErrors(t *testing.T) {
 		{"uuid byte slice unrecognised length", []byte("123456789012345"), ir.UUID{}},
 		{"array from string without braces", "not an array literal", ir.Array{Element: ir.Integer{}}},
 		{"array nil element type", []int32{1}, ir.Array{}},
+		// Geometry — malformed inputs surface loudly rather than
+		// reaching the writer with garbage.
+		{"geometry non-hex string", "not-hex", ir.Geometry{}},
+		{"geometry empty bytes", []byte{}, ir.Geometry{}},
+		{"geometry EWKB declaring SRID but no body", []byte{0x01, 0x01, 0x00, 0x00, 0x20}, ir.Geometry{}},
+		{"geometry unknown byte-order", []byte{0x42, 0x00, 0x00, 0x00, 0x00}, ir.Geometry{}},
 	}
 	for _, c := range cases {
 		c := c

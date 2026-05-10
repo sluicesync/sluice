@@ -147,6 +147,88 @@ func TestWKBToEWKB(t *testing.T) {
 	})
 }
 
+// TestEWKBToWKB walks the inverse byte-level conversion, stripping
+// PostGIS EWKB framing back to raw WKB. Used by the PG row reader
+// to normalise pgx's text-format geometry output into the IR's
+// canonical "raw WKB" shape (per docs/value-types.md).
+func TestEWKBToWKB(t *testing.T) {
+	t.Run("strips SRID and clears the present-bit on type", func(t *testing.T) {
+		got, err := ewkbToWKB(ewkbPointLE())
+		if err != nil {
+			t.Fatalf("ewkbToWKB: %v", err)
+		}
+		want := wkbPointLE()
+		if !bytes.Equal(got, want) {
+			t.Errorf("\n got:  %x\nwant: %x", got, want)
+		}
+	})
+
+	t.Run("preserves big-endian byte order", func(t *testing.T) {
+		got, err := ewkbToWKB(ewkbPointBE())
+		if err != nil {
+			t.Fatalf("ewkbToWKB: %v", err)
+		}
+		want := wkbPointBE()
+		if !bytes.Equal(got, want) {
+			t.Errorf("\n got:  %x\nwant: %x", got, want)
+		}
+	})
+
+	t.Run("passes through values that are already raw WKB", func(t *testing.T) {
+		wkb := wkbPointLE()
+		got, err := ewkbToWKB(wkb)
+		if err != nil {
+			t.Fatalf("ewkbToWKB: %v", err)
+		}
+		if !bytes.Equal(got, wkb) {
+			t.Errorf("\n got:  %x\nwant: %x", got, wkb)
+		}
+		// And the result must be a fresh copy — not the input slice.
+		if len(got) > 0 && len(wkb) > 0 && &got[0] == &wkb[0] {
+			t.Error("ewkbToWKB returned the input slice; expected a copy")
+		}
+	})
+
+	t.Run("rejects too-short inputs", func(t *testing.T) {
+		if _, err := ewkbToWKB([]byte{0x01, 0x01, 0x00}); err == nil {
+			t.Error("expected error for 3-byte input")
+		}
+		if _, err := ewkbToWKB(nil); err == nil {
+			t.Error("expected error for nil input")
+		}
+	})
+
+	t.Run("rejects unknown byte-order flag", func(t *testing.T) {
+		bad := []byte{0x42, 0x00, 0x00, 0x00, 0x00}
+		if _, err := ewkbToWKB(bad); err == nil {
+			t.Error("expected error for byte-order=0x42")
+		}
+	})
+
+	t.Run("rejects EWKB declaring SRID-present without body", func(t *testing.T) {
+		// Type word with SRID-present flag set but no SRID word follows.
+		bad := []byte{0x01, 0x01, 0x00, 0x00, 0x20}
+		if _, err := ewkbToWKB(bad); err == nil {
+			t.Error("expected error for truncated EWKB")
+		}
+	})
+
+	t.Run("round-trips with wkbToEWKB", func(t *testing.T) {
+		original := wkbPointLE()
+		ewkb, err := wkbToEWKB(original, 4326)
+		if err != nil {
+			t.Fatalf("wkbToEWKB: %v", err)
+		}
+		got, err := ewkbToWKB(ewkb)
+		if err != nil {
+			t.Fatalf("ewkbToWKB: %v", err)
+		}
+		if !bytes.Equal(got, original) {
+			t.Errorf("round-trip\n got:  %x\nwant: %x", got, original)
+		}
+	})
+}
+
 // mysqlGeometry returns a MySQL on-wire geometry value: SRID prefix
 // (4 bytes LE) + WKB. With srid=4326 the prefix is E6 10 00 00.
 func mysqlGeometry(srid uint32, wkb []byte) []byte {

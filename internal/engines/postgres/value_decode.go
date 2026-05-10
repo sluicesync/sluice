@@ -11,6 +11,7 @@ import (
 	"net/netip"
 	"reflect"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/orware/sluice/internal/ir"
@@ -60,6 +61,18 @@ func decodeValue(raw any, t ir.Type) (any, error) {
 		return decodeMacaddr(raw)
 	case ir.Array:
 		return decodeArray(raw, v.Element)
+	case ir.Geometry:
+		// PostGIS geometry columns have a dynamic OID assigned at
+		// `CREATE EXTENSION postgis` time; pgx's stdlib mode therefore
+		// falls into its `default:` branch, which scans the value as
+		// the text-format string PG sends — the EWKB-as-hex
+		// representation `0101000020E610...`. We hex-decode to bytes,
+		// then strip the EWKB framing back to raw WKB to match the
+		// IR contract for ir.Geometry values (docs/value-types.md).
+		// Same-engine PG → PG paths use the bytes-shape directly, so
+		// we accept []byte too; pre-EWKB-framed (raw WKB) input also
+		// passes through untouched via ewkbToWKB.
+		return decodePGGeometry(raw)
 	case ir.ExtensionType:
 		// ADR-0032: extension passthrough decodes as opaque bytes
 		// (or canonical text for engines/codepaths that surface
@@ -71,6 +84,40 @@ func decodeValue(raw any, t ir.Type) (any, error) {
 		return decodeExtensionValue(raw, v)
 	}
 	return nil, fmt.Errorf("postgres: no decoder for IR type %T", t)
+}
+
+// decodePGGeometry normalises a PostGIS geometry column value into
+// the IR's canonical "raw WKB bytes" form. pgx's stdlib mode hands
+// us either:
+//
+//   - a string in EWKB-as-hex text form (the default for unknown
+//     OIDs — `default:` branch in pgx/stdlib's row-value decoder
+//     scans the wire bytes as a string); or
+//   - raw []byte in EWKB or WKB form (defensive — covers any future
+//     codec registration that delivers bytes directly).
+//
+// In both cases, we end up at [ewkbToWKB] which strips the SRID
+// framing if present and returns raw WKB. Per-row SRID is
+// intentionally dropped — the IR treats SRID as a per-column
+// property captured at schema-translation time (ADR-0035).
+func decodePGGeometry(raw any) (any, error) {
+	switch v := raw.(type) {
+	case string:
+		// PostGIS canonical text form for binary output: optional
+		// "\x" hex prefix (the bytea-style escape), followed by an
+		// even-length lowercase hex string. PostGIS's geometry_out
+		// emits EWKB-as-hex without the bytea prefix; tolerate both
+		// shapes so the codec is robust to future PG/PostGIS changes.
+		s := strings.TrimPrefix(v, `\x`)
+		ewkb, err := hex.DecodeString(s)
+		if err != nil {
+			return nil, fmt.Errorf("postgres: cannot decode geometry hex %q: %w", v, err)
+		}
+		return ewkbToWKB(ewkb)
+	case []byte:
+		return ewkbToWKB(v)
+	}
+	return nil, fmt.Errorf("postgres: cannot decode %T as Geometry", raw)
 }
 
 // decodeExtensionValue routes an extension-typed column value through

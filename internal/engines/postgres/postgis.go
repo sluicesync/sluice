@@ -113,6 +113,61 @@ func wkbToEWKB(wkb []byte, srid uint32) ([]byte, error) {
 	return out, nil
 }
 
+// ewkbToWKB is the inverse of [wkbToEWKB]: given a PostGIS EWKB
+// value (the wire form geometry columns return under pgx's stdlib
+// text-format default for unknown OIDs, after hex-decoding), it
+// strips the SRID-present flag from the geometry-type uint32 and
+// drops the 4-byte SRID word so the result matches the IR's "raw
+// WKB" contract for [ir.Geometry] values (per docs/value-types.md).
+//
+// Inputs that already look like raw WKB (no SRID-present bit set)
+// pass through untouched — the cross-engine PG → MySQL path is the
+// load-bearing case, but a same-engine source that already produced
+// raw WKB shouldn't error.
+//
+// Layout (little-endian source EWKB):
+//
+//	[01] [01 00 00 20] [E6 10 00 00] [<wkb body>]
+//	└────┘└─────────┘└─────────┘
+//	  byte_order  type|flag      srid (uint32 LE)
+//
+// Output strips bytes 5..8 and clears the 0x20000000 flag from the
+// geometry-type uint32 in-place at bytes 1..4.
+func ewkbToWKB(ewkb []byte) ([]byte, error) {
+	if len(ewkb) < 5 {
+		return nil, fmt.Errorf("ewkb too short (%d bytes; need >=5)", len(ewkb))
+	}
+	byteOrder := ewkb[0]
+	var endian binary.ByteOrder
+	switch byteOrder {
+	case 0:
+		endian = binary.BigEndian
+	case 1:
+		endian = binary.LittleEndian
+	default:
+		return nil, fmt.Errorf("ewkb has unknown byte-order flag 0x%02x (want 0 or 1)", byteOrder)
+	}
+
+	geomType := endian.Uint32(ewkb[1:5])
+	const sridFlag uint32 = 0x20000000
+	if geomType&sridFlag == 0 {
+		// Already raw WKB. Caller may have handed us a value that
+		// never carried SRID framing; return a fresh copy so callers
+		// don't accidentally retain pgx-internal buffers.
+		out := make([]byte, len(ewkb))
+		copy(out, ewkb)
+		return out, nil
+	}
+	if len(ewkb) < 9 {
+		return nil, fmt.Errorf("ewkb declares SRID-present but body has only %d bytes (need >=9)", len(ewkb))
+	}
+	out := make([]byte, len(ewkb)-4)
+	out[0] = byteOrder
+	endian.PutUint32(out[1:5], geomType&^sridFlag)
+	copy(out[5:], ewkb[9:])
+	return out, nil
+}
+
 // mysqlGeometryToWKB strips MySQL's 4-byte little-endian SRID
 // prefix from a geometry value's bytes, returning the trailing WKB
 // payload and the SRID itself.
