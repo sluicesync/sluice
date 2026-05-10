@@ -601,8 +601,23 @@ func (r *SchemaReader) populateIndexes(ctx context.Context, tables map[string]*i
 		// Extension AMs (pgvector's ivfflat / hnsw) genuinely need the
 		// opclass on every column entry — hnsw rejects the index at
 		// CREATE without it.
+		//
+		// pg_trgm extension (Tier 2 lite, no new column type, no new
+		// AM) introduces operator classes (`gin_trgm_ops` /
+		// `gist_trgm_ops`) that ride on core PG `gin` / `gist`. The
+		// `idx.Method != ""` gate above only fires for extension-
+		// introduced AMs, so we additionally consult
+		// extensionOperatorClassEnabled here to capture opclasses
+		// owned by an enabled extension even when the AM is core. The
+		// double-gate preserves Bug 47's "no spurious opclass on
+		// built-in indexes" property: a non-extension opclass (or one
+		// whose owning extension wasn't enabled) is dropped, just
+		// like before.
 		col := ir.IndexColumn{Column: colName}
-		if opclass != "" && idx.Method != "" {
+		switch {
+		case opclass != "" && idx.Method != "":
+			col.OperatorClass = opclass
+		case opclass != "" && extensionOperatorClassEnabled(opclass, r.enabledExtensions):
 			col.OperatorClass = opclass
 		}
 		idx.Columns = append(idx.Columns, col)

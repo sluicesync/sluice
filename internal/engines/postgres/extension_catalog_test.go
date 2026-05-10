@@ -161,21 +161,24 @@ func TestPGVectorBuild_DimFromTypmod(t *testing.T) {
 }
 
 // TestRecognisedPGExtensionNames returns the catalog's keys sorted.
-// v0.26.0 baseline is just "vector"; the test will need updating
-// when pg_trgm / hstore / citext / postgis follow.
+// As the v1 shortlist lands the recognised set grows; this test
+// pins both load-bearing entries (vector since v0.26.0; pg_trgm
+// since this PR) and the sort-order invariant.
 func TestRecognisedPGExtensionNames(t *testing.T) {
 	names := recognisedPGExtensionNames()
 	if len(names) == 0 {
 		t.Fatal("recognisedPGExtensionNames returned empty")
 	}
-	found := false
+	want := map[string]bool{"vector": false, "pg_trgm": false}
 	for _, n := range names {
-		if n == "vector" {
-			found = true
+		if _, ok := want[n]; ok {
+			want[n] = true
 		}
 	}
-	if !found {
-		t.Errorf("recognisedPGExtensionNames = %v; want to contain \"vector\"", names)
+	for n, found := range want {
+		if !found {
+			t.Errorf("recognisedPGExtensionNames = %v; want to contain %q", names, n)
+		}
 	}
 	// Ensure sort order: previous entry < current entry for every i>0.
 	for i := 1; i < len(names); i++ {
@@ -305,5 +308,180 @@ func TestLookupExtensionForType(t *testing.T) {
 				t.Errorf("ext = %q; want %q", ext, c.wantExt)
 			}
 		})
+	}
+}
+
+// TestPGExtensionCatalog_ContainsTrgm pins the pg_trgm catalog entry's
+// load-bearing shape: it owns no column types, declares no new index
+// access methods (it rides on core PG `gin` / `gist`), and registers
+// the two operator classes (`gin_trgm_ops`, `gist_trgm_ops`) the
+// schema reader uses to round-trip pg_trgm indexes via the
+// IndexColumn.OperatorClass field.
+func TestPGExtensionCatalog_ContainsTrgm(t *testing.T) {
+	def, ok := pgExtensionCatalog["pg_trgm"]
+	if !ok {
+		t.Fatal("pgExtensionCatalog missing 'pg_trgm' entry")
+	}
+	if len(def.typesByName) != 0 {
+		t.Errorf("pg_trgm typesByName = %v; want empty (no column types)", def.typesByName)
+	}
+	if len(def.indexAccessMethods) != 0 {
+		t.Errorf("pg_trgm indexAccessMethods = %v; want empty (rides on core gin / gist)",
+			def.indexAccessMethods)
+	}
+	if _, ok := def.indexOperatorClasses["gin_trgm_ops"]; !ok {
+		t.Errorf("pg_trgm indexOperatorClasses missing 'gin_trgm_ops'")
+	}
+	if _, ok := def.indexOperatorClasses["gist_trgm_ops"]; !ok {
+		t.Errorf("pg_trgm indexOperatorClasses missing 'gist_trgm_ops'")
+	}
+}
+
+// TestPGTrgmEmit_SentinelRefusal exercises the operator-class-only
+// extension's emitColumn sentinel: any caller hitting it has a
+// hand-constructed IR or a framework bug, since pg_trgm has no
+// column types. The refusal must be loud and operator-actionable.
+func TestPGTrgmEmit_SentinelRefusal(t *testing.T) {
+	def := pgExtensionCatalog["pg_trgm"]
+	_, err := def.emitColumn(ir.ExtensionType{
+		Extension: "pg_trgm",
+		Name:      "trgm",
+	})
+	if err == nil {
+		t.Fatal("expected sentinel refusal on pg_trgm emitColumn; got nil")
+	}
+	if !strings.Contains(err.Error(), "no column types") {
+		t.Errorf("err = %v; want contains \"no column types\"", err)
+	}
+}
+
+// TestPGTrgmBuild_SentinelRefusal mirrors the emit sentinel for the
+// build path: the schema reader's lookupExtensionForType is gated on
+// typesByName (which pg_trgm leaves empty), so build is unreachable
+// on the read path. The sentinel is defensive against framework
+// regressions.
+func TestPGTrgmBuild_SentinelRefusal(t *testing.T) {
+	def := pgExtensionCatalog["pg_trgm"]
+	_, err := def.build("anything", -1)
+	if err == nil {
+		t.Fatal("expected sentinel refusal on pg_trgm build; got nil")
+	}
+	if !strings.Contains(err.Error(), "no column types") {
+		t.Errorf("err = %v; want contains \"no column types\"", err)
+	}
+}
+
+// TestExtensionOperatorClassEnabled is the load-bearing gate the
+// schema reader uses to decide whether to carry an opclass forward
+// into IR. pg_trgm's `gin_trgm_ops` rides on core PG `gin`, so the
+// `idx.Method != ""` check (which only fires for extension-introduced
+// AMs like pgvector's hnsw) doesn't catch it; the per-opclass gate
+// here closes that gap.
+func TestExtensionOperatorClassEnabled(t *testing.T) {
+	cases := []struct {
+		name    string
+		opclass string
+		enabled map[string]bool
+		want    bool
+	}{
+		{
+			name:    "gin_trgm_ops with pg_trgm enabled",
+			opclass: "gin_trgm_ops",
+			enabled: map[string]bool{"pg_trgm": true},
+			want:    true,
+		},
+		{
+			name:    "gist_trgm_ops with pg_trgm enabled",
+			opclass: "gist_trgm_ops",
+			enabled: map[string]bool{"pg_trgm": true},
+			want:    true,
+		},
+		{
+			name:    "gin_trgm_ops with pg_trgm NOT enabled",
+			opclass: "gin_trgm_ops",
+			enabled: map[string]bool{},
+			want:    false,
+		},
+		{
+			name:    "vector_l2_ops with vector enabled (cross-extension lookup)",
+			opclass: "vector_l2_ops",
+			enabled: map[string]bool{"vector": true},
+			want:    true,
+		},
+		{
+			name:    "vector_l2_ops with only pg_trgm enabled (different extension)",
+			opclass: "vector_l2_ops",
+			enabled: map[string]bool{"pg_trgm": true},
+			want:    false,
+		},
+		{
+			name:    "empty opclass",
+			opclass: "",
+			enabled: map[string]bool{"pg_trgm": true},
+			want:    false,
+		},
+		{
+			name:    "unknown opclass",
+			opclass: "voodoo_ops",
+			enabled: map[string]bool{"pg_trgm": true},
+			want:    false,
+		},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			got := extensionOperatorClassEnabled(c.opclass, c.enabled)
+			if got != c.want {
+				t.Errorf("extensionOperatorClassEnabled(%q, %v) = %v; want %v",
+					c.opclass, c.enabled, got, c.want)
+			}
+		})
+	}
+}
+
+// TestExtensionOperatorClassRegistered is the catalog-wide variant
+// (no per-extension enabled gate) used by the cross-engine refusal
+// path. Any opclass populated by sluice into [ir.IndexColumn.OperatorClass]
+// is by construction extension-owned (Bug 47 design), so this helper
+// just verifies the catalog membership for symmetry with the
+// extensionAccessMethodEnabled / extensionOperatorClassEnabled pair.
+func TestExtensionOperatorClassRegistered(t *testing.T) {
+	cases := []struct {
+		opclass string
+		want    bool
+	}{
+		{"gin_trgm_ops", true},
+		{"gist_trgm_ops", true},
+		{"vector_l2_ops", true},
+		{"vector_cosine_ops", true},
+		{"text_ops", false}, // core-PG opclass, never registered
+		{"", false},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.opclass, func(t *testing.T) {
+			got := extensionOperatorClassRegistered(c.opclass)
+			if got != c.want {
+				t.Errorf("extensionOperatorClassRegistered(%q) = %v; want %v",
+					c.opclass, got, c.want)
+			}
+		})
+	}
+}
+
+// TestEmitExtensionColumn_TrgmRefusal pins the operator-actionable
+// shape when an [ir.ExtensionType] is hand-constructed naming
+// pg_trgm — the dispatcher returns the catalog's per-entry sentinel
+// rather than emitting invalid DDL.
+func TestEmitExtensionColumn_TrgmRefusal(t *testing.T) {
+	_, err := emitExtensionColumn(ir.ExtensionType{
+		Extension: "pg_trgm",
+		Name:      "trgm",
+	})
+	if err == nil {
+		t.Fatal("expected error on pg_trgm column emit; got nil")
+	}
+	if !strings.Contains(err.Error(), "no column types") {
+		t.Errorf("err = %v; want contains \"no column types\"", err)
 	}
 }

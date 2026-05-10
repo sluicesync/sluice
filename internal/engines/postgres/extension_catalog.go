@@ -86,16 +86,23 @@ type extensionDef struct {
 	// validates an index's method against this set when the IR's
 	// IndexKind is Unspecified and the recorded Method is non-empty.
 	// Empty for extensions that don't introduce new index methods
-	// (hstore, citext).
+	// (hstore, citext, pg_trgm — pg_trgm rides on core gin / gist).
 	indexAccessMethods map[string]struct{}
 
-	// indexOperatorClasses is metadata: the list of operator-class
-	// names this extension introduces. Captured in the catalog so a
-	// future schema-reader expansion can preserve operator-class
-	// modifiers on index columns; v1 doesn't read or emit them
-	// (the verbatim USING <method> emit covers the load-bearing
-	// pgvector path).
-	indexOperatorClasses []string
+	// indexOperatorClasses is the set of operator-class names this
+	// extension introduces. Used by the schema reader's index-population
+	// path (alongside indexAccessMethods) to recognise opclasses that
+	// are extension-owned even when the access method itself is core PG
+	// — pg_trgm's `gin_trgm_ops` and `gist_trgm_ops` ride on core gin /
+	// gist, so the reader must preserve them via [ir.IndexColumn.OperatorClass]
+	// to make the same-engine emit round-trip cleanly.
+	//
+	// For extensions where the AM is itself extension-owned (pgvector's
+	// ivfflat / hnsw) the opclass already round-trips through the
+	// idx.Method != "" branch; the per-opclass set still gets populated
+	// for symmetry and for the cross-engine refusal path that asks
+	// "is this opclass extension-owned?" without re-deriving from the AM.
+	indexOperatorClasses map[string]struct{}
 }
 
 // pgExtensionCatalog is the registry of recognised PG extensions
@@ -103,8 +110,9 @@ type extensionDef struct {
 // extension is an entry here — no interface changes, no per-call-site
 // switch updates. Keys are the canonical pg_extension.extname value.
 var pgExtensionCatalog = map[string]extensionDef{
-	"vector": pgVectorDef,
-	// pg_trgm / hstore / citext / postgis follow in subsequent point
+	"vector":  pgVectorDef,
+	"pg_trgm": pgTrgmDef,
+	// hstore / citext / postgis follow in subsequent point
 	// releases per the v1 shortlist (docs/research/pg-extensions-
 	// deployment-frequency.md).
 }
@@ -206,13 +214,13 @@ var pgVectorDef = extensionDef{
 		"ivfflat": {},
 		"hnsw":    {},
 	},
-	indexOperatorClasses: []string{
-		"vector_l2_ops",
-		"vector_ip_ops",
-		"vector_cosine_ops",
-		"vector_l1_ops",
-		"bit_hamming_ops",
-		"bit_jaccard_ops",
+	indexOperatorClasses: map[string]struct{}{
+		"vector_l2_ops":     {},
+		"vector_ip_ops":     {},
+		"vector_cosine_ops": {},
+		"vector_l1_ops":     {},
+		"bit_hamming_ops":   {},
+		"bit_jaccard_ops":   {},
 	},
 }
 
@@ -232,6 +240,56 @@ func pgVectorDimFromTypmod(typmod int32) (dim int, ok bool) {
 		return 0, false
 	}
 	return int(typmod), true
+}
+
+// pgTrgmDef is the catalog entry for the `pg_trgm` extension
+// (ADR-0032 Tier 2 lite). pg_trgm is "operator-class only" — it does
+// not introduce any new column types. Its surface to sluice is:
+//
+//   - Two operator classes — `gin_trgm_ops` and `gist_trgm_ops` —
+//     attached to indexes over existing `text` / `varchar` columns.
+//     The schema reader preserves these via [ir.IndexColumn.OperatorClass]
+//     so the same-engine writer can re-emit `<col> <opclass>` after
+//     the column reference (which the writer already does).
+//
+//   - No new index access methods. pg_trgm rides on core PG `gin` and
+//     `gist`, so [indexAccessMethods] is empty; the access-method
+//     passthrough path that pgvector's ivfflat / hnsw use does not
+//     fire here.
+//
+//   - No column types. [typesByName] is empty; [build] returns a
+//     sentinel error since it is never reached on the schema-read
+//     path (the catalog's lookup is gated on typesByName), and
+//     [emitColumn] returns a sentinel error since [ir.ExtensionType]
+//     columns never carry "extension = pg_trgm" in a well-formed IR.
+//     Both sentinels exist so a hand-constructed IR or a future
+//     framework extension surfaces the operator-actionable refusal
+//     loudly rather than producing invalid DDL.
+//
+// The cross-engine refusal (PG → MySQL with a pg_trgm-indexed column)
+// rides on the [ir.IndexColumn.OperatorClass] non-empty signal — see
+// `internal/pipeline/cross_engine_supportable.go`. Sluice never
+// populates OperatorClass for core-PG opclasses (Bug 47 design), so
+// the field's presence is an honest "extension-owned opclass" marker.
+var pgTrgmDef = extensionDef{
+	typesByName: map[string]struct{}{},
+	build: func(udtName string, _ int32) (ir.ExtensionType, error) {
+		return ir.ExtensionType{}, fmt.Errorf(
+			"postgres: pg_trgm catalog: build called with udt_name %q, "+
+				"but pg_trgm declares no column types (operator-class only)",
+			udtName)
+	},
+	emitColumn: func(t ir.ExtensionType) (string, error) {
+		return "", fmt.Errorf(
+			"postgres: pg_trgm catalog: emitColumn called for "+
+				"(extension=%q name=%q), but pg_trgm declares no column types",
+			t.Extension, t.Name)
+	},
+	indexAccessMethods: map[string]struct{}{},
+	indexOperatorClasses: map[string]struct{}{
+		"gin_trgm_ops":  {},
+		"gist_trgm_ops": {},
+	},
 }
 
 // emitExtensionColumn dispatches an [ir.ExtensionType] column to the
@@ -318,10 +376,10 @@ func validateAndPreflightExtensionsAt(ctx context.Context, db *sql.DB, extension
 		if _, ok := pgExtensionCatalog[name]; !ok {
 			return nil, fmt.Errorf(
 				"postgres: --enable-pg-extension %q is not a recognised "+
-					"extension (recognised: %s); v0.26.0 ships pgvector as "+
-					"the first concrete entry — see "+
+					"extension (recognised: %s); see "+
 					"docs/research/pg-extensions-deployment-frequency.md "+
-					"for the v1 shortlist",
+					"for the v1 shortlist (vector, pg_trgm shipped; "+
+					"hstore / citext / postgis follow as catalog entries)",
 				name, strings.Join(recognisedPGExtensionNames(), ", "))
 		}
 		enabled[name] = true
@@ -416,6 +474,61 @@ func extensionAccessMethodEnabled(method string, enabledExtensions map[string]bo
 			continue
 		}
 		if _, ok := def.indexAccessMethods[method]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// extensionOperatorClassEnabled reports whether `opclass` is the
+// operator-class name of an extension that's in the catalog AND
+// that the operator has opted into via `--enable-pg-extension`.
+// Used by the schema reader's index-population path to recognise
+// extension-owned opclasses on indexes whose access method itself is
+// core PG (the load-bearing pg_trgm case: `gin (col gin_trgm_ops)`
+// uses core `gin` as the AM but the extension's `gin_trgm_ops` as the
+// opclass).
+//
+// An opclass that's in some extension's catalog entry but the
+// operator didn't enable that extension returns false — same shape
+// as the extensionAccessMethodEnabled gate. This preserves the
+// loud-failure default: without the flag, the opclass is dropped
+// from the IR and the writer emits the index without it (PG falls
+// back to the AM's default opclass, which for `gin` over `text`
+// will fail at CREATE INDEX with no default operator class — a
+// loud failure surfaced at write-time rather than silently emitted).
+func extensionOperatorClassEnabled(opclass string, enabledExtensions map[string]bool) bool {
+	if opclass == "" {
+		return false
+	}
+	for ext, def := range pgExtensionCatalog {
+		if !enabledExtensions[ext] {
+			continue
+		}
+		if _, ok := def.indexOperatorClasses[opclass]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// extensionOperatorClassRegistered reports whether `opclass` is the
+// operator-class name of any extension in the catalog (regardless of
+// whether the operator enabled it). Used by the cross-engine
+// refusal path in `internal/pipeline/cross_engine_supportable.go`
+// indirectly via the [ir.IndexColumn.OperatorClass] non-empty
+// signal — sluice only populates that field for extension-owned
+// opclasses, so any non-empty value passing through the IR is by
+// construction extension-introduced. This helper exists for tests
+// and for symmetry with extensionOperatorClassEnabled.
+//
+//nolint:unused // exposed for tests; mirrors extensionAccessMethodEnabled
+func extensionOperatorClassRegistered(opclass string) bool {
+	if opclass == "" {
+		return false
+	}
+	for _, def := range pgExtensionCatalog {
+		if _, ok := def.indexOperatorClasses[opclass]; ok {
 			return true
 		}
 	}

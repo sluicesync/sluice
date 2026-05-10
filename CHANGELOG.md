@@ -6,6 +6,35 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+**PG → PG `pg_trgm` extension passthrough lands as the v1 shortlist's second concrete entry (ADR-0032).** pg_trgm is the "operator-class only" extension — no new column types, just `gin_trgm_ops` / `gist_trgm_ops` operator classes that ride on core PG `gin` / `gist` access methods. Sluice now recognises and round-trips trigram-indexed columns when the operator passes `--enable-pg-extension pg_trgm` on `migrate` / `sync start` / `schema preview` / `schema diff`. Validates the index-method-passthrough framework on a simpler shape than pgvector (Tier 2 lite) and clears the path for `hstore` / `citext` / `postgis` to follow as additional catalog entries.
+
+### Added
+
+- **`pg_trgm` PG extension catalog entry (`internal/engines/postgres/extension_catalog.go`).** Declares the two operator classes (`gin_trgm_ops`, `gist_trgm_ops`) the schema reader's index-population path now recognises. No `typesByName` entries (pg_trgm has no column types); `indexAccessMethods` empty (rides on core `gin` / `gist`); both `build` and `emitColumn` return loud sentinel refusals (defensive — never reached on the read or write path for a well-formed IR).
+
+- **`extensionDef.indexOperatorClasses` now `map[string]struct{}` (was `[]string`).** Promoted from "metadata" to a queryable set so the schema reader can ask "is this opclass extension-owned?" in O(1). Existing `pgVectorDef` rewritten to the new shape (additive — same opclass coverage, just lookup-friendly).
+
+- **`extensionOperatorClassEnabled(opclass, enabled)` helper.** Mirrors `extensionAccessMethodEnabled`; gates per-opclass passthrough on the operator's `--enable-pg-extension` allowlist. The schema reader's `populateIndexes` now consults both gates so a pg_trgm `gin (col gin_trgm_ops)` index on core PG `gin` AM survives the round-trip — the previous `idx.Method != ""` gate only fired for extension-introduced AMs (pgvector's ivfflat / hnsw) and dropped the pg_trgm opclass.
+
+- **Cross-engine refusal for extension-owned operator classes (`internal/pipeline/cross_engine_supportable.go`).** PG → MySQL with a pg_trgm-indexed table now refuses loudly at the existing `checkCrossEngineSupportable` pre-flight (was silently passed through, would have failed at MySQL CREATE INDEX with an opaque opclass-unknown error). The refusal rides on `ir.IndexColumn.OperatorClass` non-empty — sluice never populates that field for core-PG opclasses (Bug 47 design), so the field's presence is an honest "extension-owned opclass" marker without re-importing the postgres engine catalog into the pipeline package.
+
+- **Integration tests (`internal/pipeline/migrate_pgtrgm_integration_test.go`, `integration` build tag).** Four cases: GIN + GiST round-trip (ground-truth pg_index/pg_opclass query on the target verifies opclass survives), opt-in-skipped failure (operator forgot `--enable-pg-extension pg_trgm`; loud failure at index-create time), target-missing-extension preflight refusal (mirrors pgvector). Boots stock `postgres:16` (pg_trgm ships in standard contrib bundle — no special image needed; CI already pre-pulls).
+
+- **Cross-engine refusal unit tests (`internal/pipeline/cross_engine_supportable_test.go`).** PG → MySQL `gin_trgm_ops` and `gist_trgm_ops` index refusals; PG → PG passthrough not refused (regression guard).
+
+### Migration / Compatibility
+
+- **No format-breaking changes.** Manifest schema, change-chunk format, CLI surface — all unchanged for existing flows.
+- **Default behavior unchanged.** Operators not using `--enable-pg-extension pg_trgm` see no behaviour change — pg_trgm-indexed columns continue to surface as a loud failure at index-create time on the target (the existing pattern). The opt-in is the same shape as pgvector's v0.26.0 surface.
+- **Drop-in upgrade from v0.29.1.** No DDL migration on `sluice_cdc_state`; no operator action required.
+- **Cross-engine PG → MySQL operators:** if a previously silently-broken PG source with a pg_trgm index was being migrated to MySQL (and failing at MySQL CREATE INDEX with an opaque error), the new pre-flight refusal surfaces a clear operator-actionable message instead. The fix recommendation in the error message: drop the index on source before migrating, exclude the table, or supply a `--type-override` / `--index-override` mapping.
+
+### Known limitations
+
+- **No MySQL counterpart.** pg_trgm has no MySQL equivalent (MySQL's `FULLTEXT` indexes are different in shape — ranking, stemming, stop-words). Cross-engine PG → MySQL refuses; operators wanting fuzzy text search on the MySQL side need to design for MySQL's `FULLTEXT` ahead of time.
+- **No version pinning.** pg_trgm 1.5 source → 1.4 target may surface subtle behaviour gaps that sluice doesn't see (per ADR-0032's Tier-2 framework caveat). `pg_extension` presence check is the only pre-flight; version-pinning syntax is a future refinement if real operator demand surfaces.
+- **No new column types means no new IR variant.** Unlike pgvector (which introduced `ir.ExtensionType{Extension: "vector", ...}`), pg_trgm columns flow through as plain `ir.Text` / `ir.Varchar`. The catalog entry's surface is the operator-class round-trip and the cross-engine refusal — operators reading the IR will not see a `pg_trgm`-flavoured column type.
+
 ## [0.29.1]
 
 **Closes Bug 47 — MySQL writer corrupts empty JSON object `{}` to empty JSON array `[]` on bulk copy.** Pre-existing latent bug reproducing back to v0.20.0; surfaced in v0.29.0 cycle. A simple "preserve `{}` bytes" fix in `convertArrayLikeToJSON` was attempted, rolled back when it broke `TestMigrate_PostgresToMySQL_ArrayToJSONOverride` (Bug 14's load-bearing test) — the two paths converge irreducibly at `prepareValue([]byte("{}"), ir.JSON{...})` with no signal from the bytes + target type alone. The proper fix carries pre-override context: `ir.Column` gains an optional `SourceColumnType` field that `translate.ApplyMappings` populates when an override fires. The MySQL writer's `prepareValue` now consults this to disambiguate the two surfaces: `SourceColumnType = ir.Array{...}` → `[]` (Bug 14 override path); nil or non-array → `{}` (Bug 47 round-trip path).

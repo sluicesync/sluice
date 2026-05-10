@@ -113,7 +113,7 @@ Shipped in v0.26.0:
 
 Deferred to subsequent point releases:
 
-- **pg_trgm** (Tier 2 lite — operator classes only, no new column type)
+- **pg_trgm** (Tier 2 lite — operator classes only, no new column type) **— shipped post-v0.29.1.** Validated the per-opclass passthrough path: `extensionDef.indexOperatorClasses` promoted from `[]string` metadata to `map[string]struct{}` queryable set; new `extensionOperatorClassEnabled` helper; schema reader's `populateIndexes` now consults both the `idx.Method != ""` (extension-AM) and the `extensionOperatorClassEnabled` (extension-opclass-on-core-AM) gates so `gin (col gin_trgm_ops)` round-trips without dropping the opclass. Cross-engine PG → MySQL refusal extended to refuse indexes with `ir.IndexColumn.OperatorClass` non-empty (the IR field is only populated for extension-owned opclasses by Bug 47 design — a clean signal without re-importing the engine catalog).
 - **hstore** (Tier 1 — first opaque-text validation)
 - **citext** (Tier 1 — text + collation)
 - **postgis** (Tier 2 — last in v1; coordinates with the existing GEOMETRY/SPATIAL roadmap entry's PG-side path)

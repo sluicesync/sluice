@@ -162,3 +162,96 @@ func TestCheckCrossEngineSupportable_PGtoMySQL_ExtensionTypeRefuses(t *testing.T
 		t.Errorf("err = %v; want hint mentioning --type-override", err)
 	}
 }
+
+// TestCheckCrossEngineSupportable_PGtoMySQL_TrgmIndexRefuses exercises
+// the ADR-0032 Tier 2 lite cross-engine refusal: pg_trgm has no new
+// column type (the column is plain `text`), so the column-level
+// refusal can't fire — the index-level refusal closes the gap. PG →
+// MySQL with a `gin (col gin_trgm_ops)` index keeps the loud-failure
+// default; operators wanting MySQL fuzzy search must drop the index
+// or supply a workload-specific override.
+func TestCheckCrossEngineSupportable_PGtoMySQL_TrgmIndexRefuses(t *testing.T) {
+	s := &ir.Schema{Tables: []*ir.Table{{
+		Name: "documents",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}},
+			{Name: "body", Type: ir.Text{}},
+		},
+		Indexes: []*ir.Index{
+			{
+				Name: "documents_body_trgm",
+				Kind: ir.IndexKindGIN,
+				Columns: []ir.IndexColumn{
+					{Column: "body", OperatorClass: "gin_trgm_ops"},
+				},
+			},
+		},
+	}}}
+	err := checkCrossEngineSupportable(s, "postgres", "mysql", "documents-migration")
+	if err == nil {
+		t.Fatal("err = nil; want pg_trgm index refusal")
+	}
+	if !strings.Contains(err.Error(), "gin_trgm_ops") {
+		t.Errorf("err = %v; want mention of \"gin_trgm_ops\"", err)
+	}
+	if !strings.Contains(err.Error(), "documents_body_trgm") {
+		t.Errorf("err = %v; want mention of index 'documents_body_trgm'", err)
+	}
+	if !strings.Contains(err.Error(), "documents") {
+		t.Errorf("err = %v; want mention of table 'documents'", err)
+	}
+}
+
+// TestCheckCrossEngineSupportable_PGtoMySQL_TrgmGistIndexRefuses pins
+// the same refusal for the GiST flavour (`gist_trgm_ops`). pg_trgm
+// supports both GIN and GiST; sluice refuses both cross-engine.
+func TestCheckCrossEngineSupportable_PGtoMySQL_TrgmGistIndexRefuses(t *testing.T) {
+	s := &ir.Schema{Tables: []*ir.Table{{
+		Name: "documents",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}},
+			{Name: "body", Type: ir.Text{}},
+		},
+		Indexes: []*ir.Index{
+			{
+				Name: "documents_body_trgm_gist",
+				Kind: ir.IndexKindGIST,
+				Columns: []ir.IndexColumn{
+					{Column: "body", OperatorClass: "gist_trgm_ops"},
+				},
+			},
+		},
+	}}}
+	err := checkCrossEngineSupportable(s, "postgres", "mysql", "documents-migration")
+	if err == nil {
+		t.Fatal("err = nil; want pg_trgm gist index refusal")
+	}
+	if !strings.Contains(err.Error(), "gist_trgm_ops") {
+		t.Errorf("err = %v; want mention of \"gist_trgm_ops\"", err)
+	}
+}
+
+// TestCheckCrossEngineSupportable_SameEngineTrgmAllowed pins same-
+// engine round-trips: a pg_trgm index PG → PG must NOT be refused
+// (the refusal is cross-engine-only).
+func TestCheckCrossEngineSupportable_SameEngineTrgmAllowed(t *testing.T) {
+	s := &ir.Schema{Tables: []*ir.Table{{
+		Name: "documents",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}},
+			{Name: "body", Type: ir.Text{}},
+		},
+		Indexes: []*ir.Index{
+			{
+				Name: "documents_body_trgm",
+				Kind: ir.IndexKindGIN,
+				Columns: []ir.IndexColumn{
+					{Column: "body", OperatorClass: "gin_trgm_ops"},
+				},
+			},
+		},
+	}}}
+	if err := checkCrossEngineSupportable(s, "postgres", "postgres", "documents-pg-pg"); err != nil {
+		t.Errorf("same-engine err = %v; want nil (pg_trgm passthrough on PG → PG)", err)
+	}
+}

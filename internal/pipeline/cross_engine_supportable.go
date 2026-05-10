@@ -73,8 +73,64 @@ func checkCrossEngineSupportable(
 					contextID, tbl.Name, col.Name, reason, tbl.Name)
 			}
 		}
+		// ADR-0032 Tier 2 lite: indexes carrying an extension-owned
+		// operator class (today's load-bearing case is pg_trgm's
+		// `gin_trgm_ops` / `gist_trgm_ops` on a `text` column) have
+		// no clean MySQL translation either. Sluice never populates
+		// [ir.IndexColumn.OperatorClass] for core-PG opclasses (Bug
+		// 47 design), so any non-empty OperatorClass on a PG-source
+		// index is by construction extension-introduced; the cross-
+		// engine refusal mirrors the column-type refusal above.
+		if reason, idxName, colRef := unsupportablePGIndexToMySQL(tbl); reason != "" {
+			return fmt.Errorf(
+				"%s: index %q on table %q has %s (column %q) — "+
+					"no clean cross-engine translation. "+
+					"Recovery: re-run with --exclude-table=%s to skip the table, "+
+					"drop the index on the source before migrating, "+
+					"or supply a --type-override / --index-override mapping",
+				contextID, idxName, tbl.Name, reason, colRef, tbl.Name)
+		}
 	}
 	return nil
+}
+
+// unsupportablePGIndexToMySQL scans a table's indexes (including
+// PrimaryKey) for any [ir.IndexColumn.OperatorClass] that's
+// non-empty. Returns a (reason, indexName, columnRef) triple naming
+// the offending shape, or empty strings when every index is
+// MySQL-portable. Sluice's PG schema reader populates OperatorClass
+// only for extension-introduced opclasses (ADR-0032 / Bug 47); a
+// non-empty value passing through the IR therefore indicates an
+// extension-owned opclass with no MySQL counterpart.
+func unsupportablePGIndexToMySQL(tbl *ir.Table) (reason, indexName, columnRef string) {
+	if tbl == nil {
+		return "", "", ""
+	}
+	check := func(idx *ir.Index) (string, string, string) {
+		if idx == nil {
+			return "", "", ""
+		}
+		for _, c := range idx.Columns {
+			if c.OperatorClass != "" {
+				ref := c.Column
+				if ref == "" {
+					ref = c.Expression
+				}
+				return fmt.Sprintf("PG extension-owned operator class %q", c.OperatorClass),
+					idx.Name, ref
+			}
+		}
+		return "", "", ""
+	}
+	if r, n, ref := check(tbl.PrimaryKey); r != "" {
+		return r, n, ref
+	}
+	for _, idx := range tbl.Indexes {
+		if r, n, ref := check(idx); r != "" {
+			return r, n, ref
+		}
+	}
+	return "", "", ""
 }
 
 // unsupportablePGtoMySQL returns a non-empty human-readable reason
