@@ -10,6 +10,11 @@ Each entry has the same shape: a one-line summary, a *why* (the user-visible pay
 
 For continuity when a chunk references "the previous work":
 
+### PG → PG extension passthrough Phase 1: pgvector + framework
+
+- **Framework + pgvector landed in v0.26.0.** `--enable-pg-extension EXT` opt-in allowlist on `migrate`, `sync start`, `schema preview`, `schema diff`. PG → PG only — cross-engine targets (MySQL) keep the loud-failure default; the cross-engine refusal in `pipeline.checkCrossEngineSupportable` extends to refuse `ir.ExtensionType` regardless of the source-side flag. New IR variant `ir.ExtensionType{Extension, Name, Modifiers}`; new optional engine surface `ir.ExtensionAware`. PG schema reader recognises extension-owned column types when enabled; PG schema writer dispatches through `pgExtensionCatalog` to render the column-DDL; the index emitter passes `ivfflat` / `hnsw` access methods verbatim when the owning extension is enabled. Source + target presence preflight via `pg_extension`. See [ADR-0032](adr/adr-0032-pg-extension-passthrough.md).
+- **pg_trgm / hstore / citext / postgis are catalog-only follow-ons** — each subsequent extension is a separate point release that adds an `extensionDef` entry plus per-extension integration tests. The framework is shaped so the IR / engine surfaces don't change.
+
 ### Multi-source aggregation Phase 1 + 2 (`--target-schema` + stream-id collision detection)
 
 - **`--target-schema NAME` flag** on `migrate`, `sync start`, `schema preview`, `schema diff`. PG-only — flat-namespace engines (MySQL) refuse with a clear "use a different --target DSN database" message. When set, every emitted CREATE TABLE / ALTER TABLE / CREATE INDEX / CREATE TYPE prefixes the identifier with the schema name; the schema is auto-created via `CREATE SCHEMA IF NOT EXISTS`. Type-name derivation (PG enums) namespaces through the schema so two sources both having `accounts.status` enums coexist without collision. Implements Shape B (microservices → analytics warehouse) of the [proto-design](design-multi-source-aggregation.md). See [ADR-0031](adr/adr-0031-multi-source-aggregation-target-schema.md).
@@ -402,7 +407,22 @@ Output: `docs/research/sluice-as-analytics-source.md` (operator personas + surfa
 
 ---
 
-### 12. PG → PG extension passthrough (operator survey + allowlist)
+### 12. PG → PG extension passthrough — Phase 2+ (catalog-only follow-ons)
+
+**Status:** Phase 1 (framework + pgvector) shipped in v0.26.0 — see "Recently landed" + [ADR-0032](adr/adr-0032-pg-extension-passthrough.md). Each subsequent extension below is a catalog entry plus per-extension integration tests, not a new chunk; the framework's IR + engine surfaces don't change.
+
+**Implementation order** (per `docs/research/pg-extensions-deployment-frequency.md`):
+
+1. **pg_trgm** (Tier 2 lite — operator classes only, no new column type) — validates the index-method passthrough on a simpler shape than pgvector.
+2. **hstore** (Tier 1) — first opaque-text passthrough validation; ~80 LOC catalog entry.
+3. **citext** (Tier 1) — text + collation; ~50 LOC catalog entry. Pair with hstore in one PR if the catalog shapes land cleanly.
+4. **PostGIS** (Tier 2) — last in v1; coordinates with item 7 (GEOMETRY/SPATIAL support) — the cross-engine PostGIS path stays parented there; this entry covers the PG-to-PG passthrough as an ADR-0032 catalog entry.
+
+**Tier 3 deferred to v2+.** uuid-ossp + pgcrypto are universal across all four hosted-PG providers but their hard part is the function-default catalog (`uuid_generate_v4()`, `gen_random_uuid()`, etc.), not the type passthrough. ADR-0032 §"Consequences" notes this as the natural Tier 3 chunk.
+
+---
+
+### 12.original (historical context, retained for traceability)
 
 **Why.** Postgres' extensibility — PostGIS, pgvector, pg_trgm, hstore, citext, ltree, pgcrypto, uuid-ossp, etc. — is a major reason operators choose PG specifically. Today sluice's IR doesn't represent extension types, so PG-source columns of those types either get dropped (silent — not OK per the loud-failure tenet) or surface a loud refusal at schema-read time. **For PG → PG syncs where both sides have the same extensions installed, those columns should "just work"** — pass through with native fidelity rather than being treated as hostile. Cross-engine targets (PG → MySQL) keep the loud-failure default; explicit operator-supplied translations stay the escape hatch (parallel to ADR-0016's expression translator catalog).
 
@@ -441,7 +461,7 @@ Estimated ~800-1500 LOC for v1 + ADR + integration tests, depending on which Tie
 
 ### 13. PG extensions deployment-frequency research doc — **shipped** (research-only, see `docs/research/pg-extensions-deployment-frequency.md`)
 
-**Status:** Survey landed. v1 shortlist pinned to item 12 above. Remaining text retained for traceability.
+**Status:** Survey landed (research doc) → v1 shortlist pinned → item 12 Phase 1 (framework + pgvector) shipped in v0.26.0. The doc remains the canonical reference for the v1 shortlist's implementation order. Remaining text retained for traceability.
 
 **Why.** Item 12 ships an extension-passthrough allowlist; the v1 list has to be picked from somewhere. Operator-perceived priorities differ wildly (a pgvector shop disagrees with a PostGIS shop disagrees with an hstore shop), so a survey of which extensions are most-deployed in the wild is the cheapest input to that decision.
 

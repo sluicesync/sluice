@@ -98,6 +98,107 @@ func TestEmitColumnTypeUnsupported(t *testing.T) {
 	}
 }
 
+// TestEmitColumnType_PgvectorEnabled emits the canonical
+// `vector(384)` form when the operator opted into the pgvector
+// extension via emitOpts.EnabledExtensions. This is the
+// load-bearing same-engine PG → PG passthrough path (ADR-0032).
+func TestEmitColumnType_PgvectorEnabled(t *testing.T) {
+	got, err := emitColumnType(
+		ir.ExtensionType{Extension: "vector", Name: "vector", Modifiers: []int{384}},
+		emitOpts{EnabledExtensions: map[string]bool{"vector": true}},
+	)
+	if err != nil {
+		t.Fatalf("emitColumnType: %v", err)
+	}
+	if got != "vector(384)" {
+		t.Errorf("emitColumnType = %q; want %q", got, "vector(384)")
+	}
+}
+
+// TestEmitColumnType_PgvectorDisabled refuses pgvector columns
+// when the operator didn't opt in via --enable-pg-extension.
+// Defends against the "ExtensionType reached the writer through a
+// hand-constructed IR" path; the operator-actionable error names
+// the missing flag.
+func TestEmitColumnType_PgvectorDisabled(t *testing.T) {
+	_, err := emitColumnType(
+		ir.ExtensionType{Extension: "vector", Name: "vector", Modifiers: []int{384}},
+		emitOpts{},
+	)
+	if err == nil {
+		t.Fatal("expected error when extension is not enabled; got nil")
+	}
+	if !strings.Contains(err.Error(), "--enable-pg-extension") {
+		t.Errorf("err = %v; want contains \"--enable-pg-extension\"", err)
+	}
+}
+
+// TestResolveIndexMethod_PrefersVerbatimMethod ensures the writer
+// emits the IR's verbatim Method (pgvector's ivfflat / hnsw) ahead
+// of the canonical Kind dispatch — the load-bearing path for
+// extension-introduced index methods round-tripping through PG → PG.
+func TestResolveIndexMethod_PrefersVerbatimMethod(t *testing.T) {
+	cases := []struct {
+		name string
+		idx  *ir.Index
+		want string
+	}{
+		{
+			"ivfflat verbatim",
+			&ir.Index{Method: "ivfflat", Kind: ir.IndexKindUnspecified},
+			"ivfflat",
+		},
+		{
+			"hnsw verbatim",
+			&ir.Index{Method: "hnsw", Kind: ir.IndexKindUnspecified},
+			"hnsw",
+		},
+		{
+			"falls back to Kind when Method empty",
+			&ir.Index{Kind: ir.IndexKindGIN},
+			"gin",
+		},
+		{
+			"empty Kind + empty Method returns empty",
+			&ir.Index{},
+			"",
+		},
+		{
+			"nil index returns empty",
+			nil,
+			"",
+		},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			got := resolveIndexMethod(c.idx)
+			if got != c.want {
+				t.Errorf("resolveIndexMethod = %q; want %q", got, c.want)
+			}
+		})
+	}
+}
+
+// TestEmitCreateIndex_PgvectorIVFFlat exercises the full CREATE
+// INDEX rendering for a pgvector ivfflat index — the shape the PG →
+// PG passthrough must round-trip verbatim.
+func TestEmitCreateIndex_PgvectorIVFFlat(t *testing.T) {
+	idx := &ir.Index{
+		Name:    "idx_items_embedding_ivfflat",
+		Method:  "ivfflat",
+		Kind:    ir.IndexKindUnspecified,
+		Columns: []ir.IndexColumn{{Column: "embedding"}},
+	}
+	got, err := emitCreateIndex("public", "items", idx)
+	if err != nil {
+		t.Fatalf("emitCreateIndex: %v", err)
+	}
+	if !strings.Contains(got, "USING ivfflat") {
+		t.Errorf("emitCreateIndex output missing USING ivfflat: %q", got)
+	}
+}
+
 // TestEmitSetCheckConstraint covers the table-level CHECK fragment
 // the SET → TEXT[] policy emits. The constraint is what enforces the
 // "members must be in the source's value list" guarantee on the PG

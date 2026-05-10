@@ -96,6 +96,14 @@ type Differ struct {
 	// target's per-source namespace rather than its DSN default.
 	// PG-only.
 	TargetSchema string
+
+	// EnabledPGExtensions is the operator's `--enable-pg-extension`
+	// allowlist (ADR-0032). PG → PG only. Threaded through both the
+	// source and target SchemaReaders so the diff sees extension-
+	// owned types as IR ExtensionType on both sides; the comparison
+	// then matches target-side `vector(384)` against the expected
+	// shape correctly. Empty preserves the pre-v0.26.0 behaviour.
+	EnabledPGExtensions []string
 }
 
 // DiffJSON is the JSON-format diff output. The shape is stable for
@@ -139,6 +147,9 @@ func (d *Differ) Run(ctx context.Context) (*ir.SchemaDiff, error) {
 	if err := validateTargetSchema(d.Target, d.TargetSchema); err != nil {
 		return nil, err
 	}
+	if err := validateEnabledPGExtensions(d.Source, d.Target, d.EnabledPGExtensions); err != nil {
+		return nil, err
+	}
 
 	// ---- 1. Read source schema ----
 	sr, err := d.Source.OpenSchemaReader(ctx, d.SourceDSN)
@@ -146,6 +157,9 @@ func (d *Differ) Run(ctx context.Context) (*ir.SchemaDiff, error) {
 		return nil, wrapWithHint(PhaseConnect, fmt.Errorf("diff: open source schema reader: %w", err))
 	}
 	defer closeIf(sr)
+	if err := applyEnabledPGExtensions(ctx, sr, d.EnabledPGExtensions); err != nil {
+		return nil, wrapWithHint(PhaseConnect, fmt.Errorf("diff: enable PG extensions on source: %w", err))
+	}
 
 	srcSchema, err := sr.ReadSchema(ctx)
 	if err != nil {
@@ -196,6 +210,9 @@ func (d *Differ) Run(ctx context.Context) (*ir.SchemaDiff, error) {
 		return nil, wrapWithHint(PhaseConnect, fmt.Errorf("diff: open target schema reader: %w", err))
 	}
 	applyTargetSchema(tr, d.TargetSchema)
+	if err := applyEnabledPGExtensions(ctx, tr, d.EnabledPGExtensions); err != nil {
+		return nil, wrapWithHint(PhaseConnect, fmt.Errorf("diff: enable PG extensions on target: %w", err))
+	}
 	defer closeIf(tr)
 
 	actual, err := tr.ReadSchema(ctx)
@@ -214,7 +231,7 @@ func (d *Differ) Run(ctx context.Context) (*ir.SchemaDiff, error) {
 	// TABLE suggestions (MySQL/PG syntax) rather than a generic
 	// placeholder. PreviewDDL is optional; engines without it fall
 	// through to a simple comment.
-	missingDDL, missingColDDL, err := previewMissingDDL(ctx, d.Target, d.TargetDSN, d.TargetSchema, expected, diff)
+	missingDDL, missingColDDL, err := previewMissingDDL(ctx, d.Target, d.TargetDSN, d.TargetSchema, d.EnabledPGExtensions, expected, diff)
 	if err != nil {
 		return nil, err
 	}
@@ -302,7 +319,7 @@ type diffRenderOpts struct {
 // ([ir.DDLPreviewer] / [ir.ColumnDDLPreviewer]); the renderer falls
 // back to placeholder output in those cases. Errors from the
 // underlying preview calls are returned verbatim.
-func previewMissingDDL(ctx context.Context, target ir.Engine, dsn, targetSchema string, expected *ir.Schema, diff ir.SchemaDiff) (tableDDL map[string][]ir.DDLStatement, columnDDL map[string]string, err error) {
+func previewMissingDDL(ctx context.Context, target ir.Engine, dsn, targetSchema string, enabledExtensions []string, expected *ir.Schema, diff ir.SchemaDiff) (tableDDL map[string][]ir.DDLStatement, columnDDL map[string]string, err error) {
 	missingTables := diff.TablesMissing
 	missingCols := collectMissingColumns(diff)
 	if len(missingTables) == 0 && len(missingCols) == 0 {
@@ -314,6 +331,10 @@ func previewMissingDDL(ctx context.Context, target ir.Engine, dsn, targetSchema 
 		return nil, nil, wrapWithHint(PhaseConnect, fmt.Errorf("diff: open target schema writer: %w", openErr))
 	}
 	applyTargetSchema(sw, targetSchema)
+	if err := applyEnabledPGExtensions(ctx, sw, enabledExtensions); err != nil {
+		closeIf(sw)
+		return nil, nil, wrapWithHint(PhaseConnect, fmt.Errorf("diff: enable PG extensions on target: %w", err))
+	}
 	defer closeIf(sw)
 
 	tableDDL, err = previewDDLForTables(ctx, sw, expected, missingTables)

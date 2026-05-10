@@ -177,9 +177,16 @@ jobs:
       # but doing it up-front gives a cleaner failure mode if Docker Hub
       # is rate-limiting or unreachable: we see "pull failed" before
       # touching any test code, instead of mid-test as a timeout.
+      #
+      # pgvector/pgvector:0.7.4-pg16 (added v0.26.0) backs the
+      # internal/pipeline/migrate_pgvector_integration_test.go suite
+      # (ADR-0032 PG → PG extension passthrough). The image is a
+      # superset of postgres:16 with the pgvector extension files
+      # bundled; cold-start size is ~110 MB layer-compressed.
       - run: |
           docker pull mysql:8.0
           docker pull postgres:16
+          docker pull pgvector/pgvector:0.7.4-pg16
 
       # Run every package's integration tests. -count=1 disables the
       # test cache so we always exercise real containers (cached results

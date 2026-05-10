@@ -115,6 +115,8 @@ type MigrateCmd struct {
 	MaxBufferBytes int64 `help:"Soft cap on per-batch buffered memory in the bulk-copy writer. The writer flushes when accumulated row-value bytes reach the cap regardless of row count, so wide-row workloads (TEXT/BYTEA/JSON at MB scale) don't blow out heap. A single row larger than the cap still applies (soft target). Default 67108864 (64 MiB). See ADR-0028." default:"67108864" placeholder:"N"`
 
 	TargetSchema string `help:"Per-source target schema namespace (Postgres-only). When set, every emitted CREATE TABLE / ALTER TABLE / CREATE INDEX / CREATE TYPE prefixes the table reference with this schema. Use to land multiple sluice streams on the same target without table-name collisions (Shape B microservices → analytics warehouse, ADR-0031). The schema is auto-created on the target if it doesn't exist. The control table sluice_cdc_state stays in the DSN's default schema regardless. MySQL operators use a different --target DSN database instead — schemas and databases collapse on MySQL." placeholder:"NAME"`
+
+	EnablePGExtension []string `help:"Enable passthrough for a Postgres extension type (repeatable). Same-engine PG → PG only; cross-engine targets (MySQL) keep the loud-failure default. Each named extension must be installed on both source and target — sluice preflights via pg_extension before any data moves. Recognised in v0.26.0: vector (pgvector). v1 shortlist per docs/research/pg-extensions-deployment-frequency.md. See ADR-0032." placeholder:"EXT"`
 }
 
 // Run implements the migrate subcommand.
@@ -197,6 +199,7 @@ func (m *MigrateCmd) Run(g *Globals) error {
 		BulkParallelMinRows: m.BulkParallelMinRows,
 		MaxBufferBytes:      m.MaxBufferBytes,
 		TargetSchema:        m.TargetSchema,
+		EnabledPGExtensions: m.EnablePGExtension,
 	}
 	return mig.Run(kongContext())
 }
@@ -453,6 +456,8 @@ type SyncStartCmd struct {
 	BackupPathStyle bool   `help:"Force path-style S3 addressing for --position-from-manifest. Only meaningful when --position-from-manifest is an s3:// URL."`
 
 	TargetSchema string `help:"Per-source target schema namespace (Postgres-only). When set, every emitted CREATE TABLE / ALTER TABLE / CREATE INDEX / CREATE TYPE prefixes the table reference with this schema, and CDC events apply against the named schema. Use to land multiple concurrent sluice streams on the same target without table-name collisions (Shape B microservices → analytics warehouse, ADR-0031). The schema is auto-created on the target if it doesn't exist. The control table sluice_cdc_state stays in the DSN's default schema regardless — multiple target-schema streams share a single state table per target. MySQL operators use a different --target DSN database instead — schemas and databases collapse on MySQL." placeholder:"NAME"`
+
+	EnablePGExtension []string `help:"Enable passthrough for a Postgres extension type (repeatable). Same-engine PG → PG only; cross-engine targets keep the loud-failure default. Sluice preflights extension presence on both source and target. Recognised in v0.26.0: vector (pgvector). See ADR-0032." placeholder:"EXT"`
 }
 
 // Run implements `sluice sync start`.
@@ -557,6 +562,7 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 		StrictPreflight:           s.StrictPreflight,
 		PatroniMode:               s.PatroniMode,
 		TargetSchema:              s.TargetSchema,
+		EnabledPGExtensions:       s.EnablePGExtension,
 	}
 	return streamer.Run(kongContext())
 }

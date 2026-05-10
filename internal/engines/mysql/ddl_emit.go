@@ -108,6 +108,20 @@ func emitColumnType(t ir.Type) (string, error) {
 	case ir.Macaddr:
 		// EUI-64 in canonical form is 23 chars; round up to 30.
 		return "VARCHAR(30)", nil
+
+	// ---- PG extension passthrough types (ADR-0032) ----
+	// MySQL has no equivalent for arbitrary PG extension types
+	// (pgvector, hstore, etc.). The cross-engine refusal in
+	// pipeline.checkCrossEngineSupportable normally fires before
+	// MySQL's writer is invoked, but defend in depth here so a
+	// hand-constructed IR with ExtensionType + MySQL target gets a
+	// clear refusal naming the missing operator translation.
+	case ir.ExtensionType:
+		return "", fmt.Errorf(
+			"mysql: column type %s is from a PG extension; cross-engine "+
+				"translation is not supported in v0.26.0 — supply "+
+				"--type-override TABLE.COL=<MySQL_type> to opt in (ADR-0032)",
+			v.String())
 	}
 
 	return "", fmt.Errorf("mysql: unknown IR type %T", t)

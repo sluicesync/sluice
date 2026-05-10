@@ -33,6 +33,14 @@ import (
 type SchemaReader struct {
 	db     *sql.DB
 	schema string
+
+	// enabledExtensions is the set of extension names the operator
+	// opted into via `--enable-pg-extension` (ADR-0032). Populated by
+	// [EnableExtensions]; nil / empty means "no extension passthrough,
+	// existing loud-failure path preserved." Used by populateColumns
+	// to route extension-owned column types through pgExtensionCatalog
+	// instead of the existing user-defined / loud-failure dispatch.
+	enabledExtensions map[string]bool
 }
 
 // Close releases the underlying connection pool.
@@ -59,6 +67,32 @@ func (r *SchemaReader) SetSchema(name string) {
 		return
 	}
 	r.schema = name
+}
+
+// EnableExtensions implements [ir.ExtensionAware] for PG (ADR-0032).
+// Validates each requested extension name against pgExtensionCatalog
+// (refusing unknown names with the recognised set listed) and
+// preflights presence on the connected database via pg_extension.
+// Both checks fire at construction time — the orchestrator threads
+// this from the operator's `--enable-pg-extension` allowlist before
+// any schema read or write.
+//
+// Empty / nil extensions is a no-op (today's default: no extension
+// passthrough; unrecognised extension types continue to surface as
+// loud refusals at type-resolution time).
+//
+// The presence preflight is mandatory even when no columns of the
+// extension's type exist on this side — the check catches the
+// operator-typo case where the flag was misspelled or pointed at the
+// wrong DSN. Refusing an unused-but-enabled extension is the
+// loud-failure-friendly default.
+func (r *SchemaReader) EnableExtensions(ctx context.Context, extensions []string) error {
+	enabled, err := validateAndPreflightExtensions(ctx, r.db, extensions)
+	if err != nil {
+		return err
+	}
+	r.enabledExtensions = enabled
+	return nil
 }
 
 // ReadSchema queries pg_catalog and information_schema and returns a
@@ -312,6 +346,11 @@ func isUndefinedRelationErr(err error) bool {
 // stays empty for PG sources. MySQL writers accept that as "use the
 // table / database default."
 func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*ir.Table, enumValues map[string][]string, geomInfo map[string]geometryColumnInfo) error {
+	// COALESCE(a.atttypmod, -1) supplies the per-column typmod for
+	// extension-owned types whose modifiers ride on atttypmod
+	// (pgvector dimension; future PostGIS subtype/SRID). -1 is the
+	// "no typmod" sentinel pgattribute uses; per-extension catalog
+	// entries decode it into the IR's Modifiers vector.
 	const q = `
 		SELECT
 			c.table_name,
@@ -328,7 +367,8 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 			c.is_identity,
 			COALESCE(c.is_generated, 'NEVER'),
 			COALESCE(c.generation_expression, ''),
-			COALESCE(coll.collname, '')
+			COALESCE(coll.collname, ''),
+			COALESCE(a.atttypmod, -1)
 		FROM   information_schema.columns c
 		LEFT JOIN pg_class      cl   ON cl.relname    = c.table_name
 		                            AND cl.relnamespace = (
@@ -361,6 +401,7 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 			isIdentity           string
 			isGenerated, genExpr string
 			collation            string
+			attTypmod            int32
 		)
 		if err := rows.Scan(
 			&tableName, &colName, &ordinal,
@@ -370,6 +411,7 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 			&isIdentity,
 			&isGenerated, &genExpr,
 			&collation,
+			&attTypmod,
 		); err != nil {
 			return err
 		}
@@ -388,6 +430,7 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 			DTPrec:          nullInt64ToPtr(dtPrec),
 			IsAutoIncrement: isAutoIncrement(isIdentity, columnDefault),
 			Collation:       collation,
+			AttTypmod:       attTypmod,
 		}
 
 		// Resolve enum values for USER-DEFINED columns.
@@ -404,6 +447,18 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 					info := info
 					meta.GeometryInfo = &info
 				}
+			}
+
+			// ADR-0032: when the operator opted into one or more
+			// extensions via `--enable-pg-extension`, route the udt
+			// name through pgExtensionCatalog. Recognised → emit as
+			// ir.ExtensionType (carrying typmod-derived Modifiers);
+			// unrecognised → fall through to the existing dispatch
+			// (enum resolution / loud failure on user-defined types
+			// the IR doesn't model).
+			if ext, name, ok := lookupExtensionForType(udtName, r.enabledExtensions); ok {
+				meta.ExtensionName = ext
+				meta.ExtensionTypeName = name
 			}
 		}
 
@@ -508,10 +563,21 @@ func (r *SchemaReader) populateIndexes(ctx context.Context, tables map[string]*i
 		k := key{table: tableName, name: indexName}
 		idx, ok := collected[k]
 		if !ok {
+			kind := indexKindFrom(method)
 			idx = &ir.Index{
 				Name:   indexName,
 				Unique: isUnique,
-				Kind:   indexKindFrom(method),
+				Kind:   kind,
+			}
+			// ADR-0032: preserve extension-introduced access-method
+			// names (ivfflat, hnsw) verbatim so the same-engine writer
+			// can re-emit `USING <method>`. Only fires when the
+			// operator opted into the owning extension; otherwise the
+			// IR keeps its existing IndexKindUnspecified shape and the
+			// writer falls through to the default (btree).
+			if kind == ir.IndexKindUnspecified &&
+				extensionAccessMethodEnabled(method, r.enabledExtensions) {
+				idx.Method = method
 			}
 			collected[k] = idx
 			if isPrimary {

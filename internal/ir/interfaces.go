@@ -747,6 +747,31 @@ type SchemaSetter interface {
 	SetSchema(name string)
 }
 
+// ExtensionAware is the optional engine-side surface for engines that
+// can pass through column types defined by extensions (ADR-0032). PG
+// implements; MySQL does not (no extension concept in the same shape).
+// The pipeline orchestrator type-asserts on every freshly-opened
+// reader / writer and threads the operator-supplied
+// `--enable-pg-extension` allowlist through; engines that don't
+// implement default to "no extensions enabled" — the existing
+// behaviour where unrecognised extension types surface as loud
+// refusals.
+//
+// Implementations are responsible for:
+//
+//   - Validating each name against their own catalog of recognised
+//     extensions (refusing unknown names with an operator-friendly
+//     error listing the recognised set).
+//   - Preflighting extension presence against the connected database
+//     (`SELECT 1 FROM pg_extension WHERE extname = $1` on PG) so a
+//     misspelled flag or wrong DSN surfaces loudly before any data
+//     moves.
+//
+// Both checks fire at construction time, not mid-run.
+type ExtensionAware interface {
+	EnableExtensions(ctx context.Context, extensions []string) error
+}
+
 // SourceFingerprintRecorder is the optional surface a [ChangeApplier]
 // can implement to accept the source-DSN fingerprint the streamer
 // computes at startup. The fingerprint flows through to the per-target

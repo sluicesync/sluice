@@ -69,6 +69,121 @@ func TestValidateTargetSchema(t *testing.T) {
 	})
 }
 
+// stubPGEngine is a stubEngine that names itself "postgres" so the
+// ADR-0032 PG-only validate gate accepts it on either side.
+type stubPGEngine struct{ stubEngine }
+
+func (stubPGEngine) Name() string { return "postgres" }
+
+func (stubPGEngine) Capabilities() ir.Capabilities {
+	return ir.Capabilities{SchemaScope: ir.SchemaScopeNamespaced, CDC: ir.CDCLogicalReplication}
+}
+
+// stubMySQLEngine is a stubEngine that names itself "mysql" so the
+// ADR-0032 PG-only validate gate refuses it.
+type stubMySQLEngine struct{ stubEngine }
+
+func (stubMySQLEngine) Name() string { return "mysql" }
+
+func (stubMySQLEngine) Capabilities() ir.Capabilities {
+	return ir.Capabilities{SchemaScope: ir.SchemaScopeFlat, CDC: ir.CDCBinlog}
+}
+
+func TestValidateEnabledPGExtensions(t *testing.T) {
+	t.Run("empty extensions always pass", func(t *testing.T) {
+		if err := validateEnabledPGExtensions(stubMySQLEngine{}, stubMySQLEngine{}, nil); err != nil {
+			t.Errorf("err = %v; want nil for empty extensions even on MySQL", err)
+		}
+	})
+
+	t.Run("PG -> PG accepts", func(t *testing.T) {
+		err := validateEnabledPGExtensions(stubPGEngine{}, stubPGEngine{}, []string{"vector"})
+		if err != nil {
+			t.Errorf("err = %v; want nil for PG -> PG", err)
+		}
+	})
+
+	t.Run("MySQL source refused", func(t *testing.T) {
+		err := validateEnabledPGExtensions(stubMySQLEngine{}, stubPGEngine{}, []string{"vector"})
+		if err == nil {
+			t.Fatal("err = nil; want refusal")
+		}
+		if !strings.Contains(err.Error(), "PG sources") {
+			t.Errorf("err = %v; want \"PG sources\"", err)
+		}
+	})
+
+	t.Run("MySQL target refused", func(t *testing.T) {
+		err := validateEnabledPGExtensions(stubPGEngine{}, stubMySQLEngine{}, []string{"vector"})
+		if err == nil {
+			t.Fatal("err = nil; want refusal")
+		}
+		if !strings.Contains(err.Error(), "PG targets") {
+			t.Errorf("err = %v; want \"PG targets\"", err)
+		}
+		if !strings.Contains(err.Error(), "--type-override") {
+			t.Errorf("err = %v; want hint mentioning --type-override", err)
+		}
+	})
+}
+
+// TestApplyEnabledPGExtensions_NonExtensionAware confirms the
+// helper no-ops cleanly against a target that doesn't implement
+// the optional ir.ExtensionAware surface (e.g. MySQL).
+func TestApplyEnabledPGExtensions_NonExtensionAware(t *testing.T) {
+	// stubEngine doesn't implement ExtensionAware. Calling
+	// applyEnabledPGExtensions against an arbitrary value (e.g. a
+	// raw stub) must not panic.
+	type plain struct{}
+	if err := applyEnabledPGExtensions(context.Background(), plain{}, []string{"vector"}); err != nil {
+		t.Errorf("err = %v; want nil for non-aware target", err)
+	}
+}
+
+// TestApplyEnabledPGExtensions_Empty no-ops cleanly with an empty
+// extensions list — preserves today's behaviour where the
+// orchestrator field defaults to empty.
+func TestApplyEnabledPGExtensions_Empty(t *testing.T) {
+	if err := applyEnabledPGExtensions(context.Background(), nil, nil); err != nil {
+		t.Errorf("err = %v; want nil for empty extensions", err)
+	}
+}
+
+// fakeExtensionAware records the names passed to EnableExtensions
+// and optionally returns a configured error.
+type fakeExtensionAware struct {
+	got []string
+	err error
+}
+
+func (f *fakeExtensionAware) EnableExtensions(_ context.Context, names []string) error {
+	f.got = append(f.got, names...)
+	return f.err
+}
+
+// TestApplyEnabledPGExtensions_RoutesToAware confirms the helper
+// dispatches through the ir.ExtensionAware surface when the target
+// implements it.
+func TestApplyEnabledPGExtensions_RoutesToAware(t *testing.T) {
+	target := &fakeExtensionAware{}
+	if err := applyEnabledPGExtensions(context.Background(), target, []string{"vector"}); err != nil {
+		t.Errorf("err = %v; want nil", err)
+	}
+	if len(target.got) != 1 || target.got[0] != "vector" {
+		t.Errorf("EnableExtensions got %v; want [vector]", target.got)
+	}
+}
+
+// TestApplyEnabledPGExtensions_PropagatesError confirms refusal
+// errors from the engine surface back through the helper.
+func TestApplyEnabledPGExtensions_PropagatesError(t *testing.T) {
+	target := &fakeExtensionAware{err: errors.New("missing on target")}
+	err := applyEnabledPGExtensions(context.Background(), target, []string{"vector"})
+	if err == nil || !strings.Contains(err.Error(), "missing on target") {
+		t.Errorf("err = %v; want propagated \"missing on target\"", err)
+	}
+}
+
 func TestFingerprintSourceDSN(t *testing.T) {
 	cases := []struct {
 		name    string

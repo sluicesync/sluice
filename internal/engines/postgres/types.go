@@ -66,6 +66,25 @@ type columnMeta struct {
 	// know about this column for some reason). The translator
 	// degrades gracefully to GeometryUnspecified+SRID=0 in that case.
 	GeometryInfo *geometryColumnInfo
+
+	// AttTypmod is pg_attribute.atttypmod for this column. -1 means
+	// "no typmod" (the PG sentinel). Used by the ADR-0032 extension
+	// catalog to decode per-extension type modifiers (pgvector
+	// dimension is `atttypmod - 4`; future PostGIS subtype/SRID
+	// packs both into the same int32). Opaque from the rest of the
+	// translator's POV.
+	AttTypmod int32
+
+	// ExtensionName + ExtensionTypeName are populated by the schema
+	// reader (populateColumns) when (a) the column's data_type is
+	// USER-DEFINED, (b) the operator opted into the column's
+	// extension via `--enable-pg-extension`, and (c) the udt_name
+	// matches a typesByName entry in pgExtensionCatalog. The
+	// translator dispatches to the catalog's build function when
+	// both are non-empty, emitting an [ir.ExtensionType]; otherwise
+	// the existing user-defined → enum / loud-failure path runs.
+	ExtensionName     string
+	ExtensionTypeName string
 }
 
 // geometryColumnInfo carries PostGIS's per-column metadata as
@@ -103,6 +122,22 @@ func translateType(c columnMeta) (ir.Type, error) {
 	// support enums and PostGIS's geometry; composites/domains are
 	// not modelled in the IR.
 	if c.DataType == "user-defined" || c.DataType == "USER-DEFINED" {
+		// ADR-0032: extension passthrough. When the schema reader
+		// recognised this column's udt_name as belonging to an
+		// operator-enabled extension, dispatch to the catalog's
+		// build function so the IR carries [ir.ExtensionType] with
+		// the per-extension Modifiers.
+		if c.ExtensionName != "" {
+			def, ok := pgExtensionCatalog[c.ExtensionName]
+			if !ok {
+				return nil, fmt.Errorf(
+					"postgres: extension %q is not in the catalog "+
+						"(internal error — schema reader recognised it "+
+						"earlier in the pipeline)",
+					c.ExtensionName)
+			}
+			return def.build(c.ExtensionTypeName, c.AttTypmod)
+		}
 		if c.EnumValues != nil {
 			return ir.Enum{Values: c.EnumValues}, nil
 		}

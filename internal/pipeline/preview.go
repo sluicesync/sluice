@@ -89,6 +89,14 @@ type Previewer struct {
 	// `sync start` would emit. Mirrors the Migrator/Streamer field
 	// of the same name; PG-only.
 	TargetSchema string
+
+	// EnabledPGExtensions is the operator's `--enable-pg-extension`
+	// allowlist (ADR-0032). PG → PG only. Threaded through the
+	// freshly-opened source SchemaReader and target SchemaWriter
+	// so the preview's DDL renders the same shape `migrate` /
+	// `sync start` would emit. Empty preserves the pre-v0.26.0
+	// behaviour.
+	EnabledPGExtensions []string
 }
 
 // PreviewJSON is the JSON-format preview output. The shape is stable
@@ -133,6 +141,9 @@ func (p *Previewer) Run(ctx context.Context) error {
 	if err := validateTargetSchema(p.Target, p.TargetSchema); err != nil {
 		return err
 	}
+	if err := validateEnabledPGExtensions(p.Source, p.Target, p.EnabledPGExtensions); err != nil {
+		return err
+	}
 
 	// ---- 1. Read source schema ----
 	sr, err := p.Source.OpenSchemaReader(ctx, p.SourceDSN)
@@ -140,6 +151,9 @@ func (p *Previewer) Run(ctx context.Context) error {
 		return wrapWithHint(PhaseConnect, fmt.Errorf("preview: open source schema reader: %w", err))
 	}
 	defer closeIf(sr)
+	if err := applyEnabledPGExtensions(ctx, sr, p.EnabledPGExtensions); err != nil {
+		return wrapWithHint(PhaseConnect, fmt.Errorf("preview: enable PG extensions on source: %w", err))
+	}
 
 	srcSchema, err := sr.ReadSchema(ctx)
 	if err != nil {
@@ -182,6 +196,9 @@ func (p *Previewer) Run(ctx context.Context) error {
 		return wrapWithHint(PhaseConnect, fmt.Errorf("preview: open target schema writer: %w", err))
 	}
 	applyTargetSchema(sw, p.TargetSchema)
+	if err := applyEnabledPGExtensions(ctx, sw, p.EnabledPGExtensions); err != nil {
+		return wrapWithHint(PhaseConnect, fmt.Errorf("preview: enable PG extensions on target: %w", err))
+	}
 	defer closeIf(sw)
 
 	previewer, ok := sw.(ir.DDLPreviewer)

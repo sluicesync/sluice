@@ -326,6 +326,15 @@ type Streamer struct {
 	// per-stream user data, and multiple target-schemas on one DSN
 	// share a single state table. Stream-id keys disambiguate.
 	TargetSchema string
+
+	// EnabledPGExtensions is the operator's `--enable-pg-extension`
+	// allowlist (ADR-0032). PG → PG only — the validate gate refuses
+	// the field when either side isn't PG. Threaded through the
+	// freshly-opened source SchemaReader / RowReader / SnapshotStream
+	// and target SchemaWriter / RowWriter / ChangeApplier via
+	// [ir.ExtensionAware]. Empty preserves the pre-v0.26.0
+	// loud-failure behaviour for extension-owned types.
+	EnabledPGExtensions []string
 }
 
 // Run executes a snapshot+CDC stream. See [Streamer] for the full
@@ -760,6 +769,9 @@ func (s *Streamer) logDryRunPlan(ctx context.Context, streamID string, persisted
 		return wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: dry-run: open source schema reader: %w", err))
 	}
 	defer closeIf(sr)
+	if err := applyEnabledPGExtensions(ctx, sr, s.EnabledPGExtensions); err != nil {
+		return wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: dry-run: enable PG extensions on source: %w", err))
+	}
 	schema, err := sr.ReadSchema(ctx)
 	if err != nil {
 		return wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: dry-run: read source schema: %w", err))
@@ -898,6 +910,10 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 	if err != nil {
 		return nil, wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: open source schema reader: %w", err))
 	}
+	if err := applyEnabledPGExtensions(ctx, sr, s.EnabledPGExtensions); err != nil {
+		closeIf(sr)
+		return nil, wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: enable PG extensions on source: %w", err))
+	}
 	schema, err := sr.ReadSchema(ctx)
 	closeIf(sr)
 	if err != nil {
@@ -958,6 +974,11 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 		return nil, wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: open target schema writer: %w", err))
 	}
 	applyTargetSchema(sw, s.TargetSchema)
+	if err := applyEnabledPGExtensions(ctx, sw, s.EnabledPGExtensions); err != nil {
+		closeIf(sw)
+		_ = stream.Close()
+		return nil, wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: enable PG extensions on target: %w", err))
+	}
 	rw, err := s.Target.OpenRowWriter(ctx, s.TargetDSN)
 	if err != nil {
 		closeIf(sw)
@@ -1059,7 +1080,10 @@ func (s *Streamer) validate() error {
 	case s.Source.Capabilities().CDC == ir.CDCNone:
 		return fmt.Errorf("pipeline: Streamer.Source engine %q declares CDC=None", s.Source.Name())
 	}
-	return validateTargetSchema(s.Target, s.TargetSchema)
+	if err := validateTargetSchema(s.Target, s.TargetSchema); err != nil {
+		return err
+	}
+	return validateEnabledPGExtensions(s.Source, s.Target, s.EnabledPGExtensions)
 }
 
 // resolveStreamID returns the operator-supplied StreamID if non-

@@ -27,6 +27,12 @@ const (
 	ExtInet
 	ExtCidr
 	ExtMacaddr
+	// ExtExtensionType represents column types defined by a PG extension
+	// the operator has explicitly opted into via `--enable-pg-extension`
+	// (ADR-0032). The IR carries the extension+type names plus opaque
+	// modifiers; engine-specific binary representation lives in the
+	// catalog entry on the engine side.
+	ExtExtensionType
 )
 
 func (k ExtensionKind) String() string {
@@ -47,6 +53,8 @@ func (k ExtensionKind) String() string {
 		return "Cidr"
 	case ExtMacaddr:
 		return "Macaddr"
+	case ExtExtensionType:
+		return "ExtensionType"
 	default:
 		return "unknown"
 	}
@@ -184,6 +192,49 @@ func (Macaddr) isType()        {}
 func (Macaddr) Tier() Tier     { return TierExtension }
 func (Macaddr) String() string { return "Macaddr" }
 
+// ExtensionType represents a column type defined by a PG extension
+// (ADR-0032). The IR is engine-neutral by name (Extension + Name); the
+// binary representation is opaque to the IR — the schema reader
+// captures the type's modifiers and the matching engine writer emits
+// the column verbatim when the same extension is enabled on the
+// target.
+//
+// PG's extensibility introduces type variety MySQL fundamentally
+// lacks; this variant is the IR's representation of "I see a column
+// whose type is owned by an extension; preserve fidelity for
+// same-engine targets that have the same extension installed;
+// cross-engine targets get loud-failure unless an explicit operator
+// translation is supplied."
+//
+// Modifiers carries optional type-modifier values. For pgvector this
+// is the dimension count (vector(384) → Modifiers=[]int{384}). For
+// PostGIS (future) this is [subtypeCode, srid].
+//
+// Extension is the canonical extension name registered with PG (e.g.
+// "vector", "postgis", "hstore"). Name is the canonical type name
+// within the extension (e.g. "vector", "geometry"). The pair is what
+// the engine catalog uses to look up the column-DDL renderer.
+type ExtensionType struct {
+	Extension string
+	Name      string
+	Modifiers []int
+}
+
+func (ExtensionType) isType()    {}
+func (ExtensionType) Tier() Tier { return TierExtension }
+
+func (e ExtensionType) String() string {
+	if len(e.Modifiers) == 0 {
+		return fmt.Sprintf("ExtensionType[%s.%s]", e.Extension, e.Name)
+	}
+	mods := make([]string, len(e.Modifiers))
+	for i, m := range e.Modifiers {
+		mods[i] = fmt.Sprintf("%d", m)
+	}
+	return fmt.Sprintf("ExtensionType[%s.%s(%s)]",
+		e.Extension, e.Name, strings.Join(mods, ","))
+}
+
 // KindOf reports the [ExtensionKind] of an extension Type, or returns
 // false if t is a core type.
 func KindOf(t Type) (ExtensionKind, bool) {
@@ -204,6 +255,8 @@ func KindOf(t Type) (ExtensionKind, bool) {
 		return ExtCidr, true
 	case Macaddr:
 		return ExtMacaddr, true
+	case ExtensionType:
+		return ExtExtensionType, true
 	default:
 		return 0, false
 	}

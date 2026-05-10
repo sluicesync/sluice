@@ -190,6 +190,22 @@ func TestDecodeValue(t *testing.T) {
 		{"float from numeric string", "3.14", ir.Float{Precision: ir.FloatDouble}, 3.14},
 		{"bool from t", "t", ir.Boolean{}, true},
 		{"bool from f", "f", ir.Boolean{}, false},
+
+		// ---- ADR-0032 PG extension passthrough (pgvector) ----
+		// pgvector returns vectors as `[1,2,3]`-style strings under
+		// pgx stdlib mode; decoder passes them through verbatim.
+		{
+			"pgvector string passthrough",
+			"[0.1,0.2,0.3]",
+			ir.ExtensionType{Extension: "vector", Name: "vector", Modifiers: []int{3}},
+			"[0.1,0.2,0.3]",
+		},
+		{
+			"pgvector null",
+			nil,
+			ir.ExtensionType{Extension: "vector", Name: "vector"},
+			nil,
+		},
 	}
 
 	for _, c := range cases {

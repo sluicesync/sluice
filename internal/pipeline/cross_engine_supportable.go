@@ -85,9 +85,19 @@ func checkCrossEngineSupportable(
 // PostGIS Geometry: even though MySQL has spatial types, the SRID +
 // extension metadata don't round-trip — operators see silent
 // truncation of spatial-reference identifiers. Refuse loudly.
+//
+// PG extension passthrough types (ADR-0032) — pgvector and the v1
+// shortlist's other entries — have no portable MySQL equivalent;
+// the refusal here keeps the cross-engine loud-failure default in
+// place even when the source side was opened with
+// `--enable-pg-extension`. Operators wanting a translation supply
+// `--type-override TABLE.COL=<MySQL_type>`.
 func unsupportablePGtoMySQL(t ir.Type) string {
-	if _, ok := t.(ir.Geometry); ok {
+	switch v := t.(type) {
+	case ir.Geometry:
 		return "PostGIS geometry type"
+	case ir.ExtensionType:
+		return fmt.Sprintf("PG extension type %s.%s", v.Extension, v.Name)
 	}
 	return ""
 }

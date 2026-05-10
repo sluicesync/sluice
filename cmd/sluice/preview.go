@@ -55,6 +55,8 @@ type SchemaPreviewCmd struct {
 	Output string `help:"Write to FILE instead of stdout. Atomic: written to a sibling temp file in the destination directory, then renamed into place." short:"o" placeholder:"FILE"`
 
 	TargetSchema string `help:"Per-source target schema namespace (Postgres-only). Renders preview DDL prefixed with this schema so operators see exactly what 'sluice migrate' / 'sync start' would emit under --target-schema (ADR-0031). MySQL operators use a different --target DSN database instead." placeholder:"NAME"`
+
+	EnablePGExtension []string `help:"Enable passthrough for a Postgres extension type (repeatable). Same-engine PG → PG only. Recognised in v0.26.0: vector (pgvector). See ADR-0032." placeholder:"EXT"`
 }
 
 // Run implements `sluice schema preview`.
@@ -108,18 +110,19 @@ func (s *SchemaPreviewCmd) Run(g *Globals) error {
 	defer func() { _ = finalize(err) }()
 
 	prev := &pipeline.Previewer{
-		Source:             source,
-		Target:             target,
-		SourceDSN:          s.Source,
-		TargetDSN:          s.Target,
-		Mappings:           mappings,
-		ExpressionMappings: exprMappings,
-		Filter:             filter,
-		ViewFilter:         viewFilter,
-		SkipViews:          s.SkipViews,
-		Format:             s.Format,
-		Out:                writer,
-		TargetSchema:       s.TargetSchema,
+		Source:              source,
+		Target:              target,
+		SourceDSN:           s.Source,
+		TargetDSN:           s.Target,
+		Mappings:            mappings,
+		ExpressionMappings:  exprMappings,
+		Filter:              filter,
+		ViewFilter:          viewFilter,
+		SkipViews:           s.SkipViews,
+		Format:              s.Format,
+		Out:                 writer,
+		TargetSchema:        s.TargetSchema,
+		EnabledPGExtensions: s.EnablePGExtension,
 	}
 	err = prev.Run(kongContext())
 	return err

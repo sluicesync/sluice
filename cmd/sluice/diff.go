@@ -44,6 +44,8 @@ type SchemaDiffCmd struct {
 	IgnoreExtras           bool `help:"Suppress 'extra on target' diffs (tables/columns/indexes present on the target but absent from the source). Useful when the target hosts other applications' tables."`
 
 	TargetSchema string `help:"Per-source target schema namespace (Postgres-only). When set, the diff reads the target schema from this namespace rather than the DSN's default, and renders DDL suggestions prefixed with the schema name. ADR-0031. MySQL operators use a different --target DSN database instead." placeholder:"NAME"`
+
+	EnablePGExtension []string `help:"Enable passthrough for a Postgres extension type (repeatable). Same-engine PG → PG only. Recognised in v0.26.0: vector (pgvector). See ADR-0032." placeholder:"EXT"`
 }
 
 // Run implements `sluice schema diff`. Returns:
@@ -114,6 +116,7 @@ func (s *SchemaDiffCmd) Run(g *Globals) error {
 		IgnoreExtras:           s.IgnoreExtras,
 		Out:                    writer,
 		TargetSchema:           s.TargetSchema,
+		EnabledPGExtensions:    s.EnablePGExtension,
 	}
 	diff, err := differ.Run(kongContext())
 	if err != nil {

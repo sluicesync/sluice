@@ -136,3 +136,35 @@ func TestCheckCrossEngineDeltaSupportable_DropTableNoCheck(t *testing.T) {
 		t.Errorf("err = %v; want nil for drop-only delta", err)
 	}
 }
+
+// TestCheckCrossEngineSupportable_PGtoMySQL_ExtensionTypeRefuses
+// exercises the ADR-0032 cross-engine refusal: PG → MySQL with an
+// ExtensionType column (e.g. pgvector) keeps the loud-failure
+// default even when the operator opted into --enable-pg-extension
+// on the source side.
+func TestCheckCrossEngineSupportable_PGtoMySQL_ExtensionTypeRefuses(t *testing.T) {
+	s := &ir.Schema{Tables: []*ir.Table{{
+		Name: "items",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}},
+			{Name: "embedding", Type: ir.ExtensionType{
+				Extension: "vector",
+				Name:      "vector",
+				Modifiers: []int{384},
+			}},
+		},
+	}}}
+	err := checkCrossEngineSupportable(s, "postgres", "mysql", "items-migration")
+	if err == nil {
+		t.Fatal("err = nil; want ExtensionType refusal")
+	}
+	if !strings.Contains(err.Error(), "vector.vector") {
+		t.Errorf("err = %v; want mention of \"vector.vector\"", err)
+	}
+	if !strings.Contains(err.Error(), "embedding") {
+		t.Errorf("err = %v; want mention of column 'embedding'", err)
+	}
+	if !strings.Contains(err.Error(), "--type-override") {
+		t.Errorf("err = %v; want hint mentioning --type-override", err)
+	}
+}

@@ -60,8 +60,38 @@ func decodeValue(raw any, t ir.Type) (any, error) {
 		return decodeMacaddr(raw)
 	case ir.Array:
 		return decodeArray(raw, v.Element)
+	case ir.ExtensionType:
+		// ADR-0032: extension passthrough decodes as opaque bytes
+		// (or canonical text for engines/codepaths that surface
+		// extension types as strings — pgvector's `vector` type
+		// stringifies as `[1,2,3]` in pgx's stdlib mode). Same shape
+		// as JSON's decoder: the IR's Row contract is "whatever the
+		// engine round-trips natively"; downstream the writer's
+		// prepareValue passes the same bytes through verbatim.
+		return decodeExtensionValue(raw, v)
 	}
 	return nil, fmt.Errorf("postgres: no decoder for IR type %T", t)
+}
+
+// decodeExtensionValue routes an extension-typed column value through
+// the canonical opaque-bytes / opaque-text path. pgvector returns
+// vectors as strings in pgx stdlib mode (`[1,2,3]`); when other
+// extensions land we may need a per-extension decode hook, but the
+// pass-through shape covers v0.26.0's pgvector path. nil maps to nil
+// (NULL preserved).
+func decodeExtensionValue(raw any, _ ir.ExtensionType) (any, error) {
+	if raw == nil {
+		return nil, nil
+	}
+	switch v := raw.(type) {
+	case string:
+		return v, nil
+	case []byte:
+		out := make([]byte, len(v))
+		copy(out, v)
+		return out, nil
+	}
+	return nil, fmt.Errorf("postgres: cannot decode %T as ExtensionType", raw)
 }
 
 func decodeBoolean(raw any) (any, error) {

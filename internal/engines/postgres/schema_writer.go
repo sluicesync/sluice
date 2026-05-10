@@ -51,6 +51,13 @@ type SchemaWriter struct {
 	// pre-ADR-0031 shape for default-`public` operators (the type
 	// lands in `public`, which IS in `search_path`).
 	schemaExplicit bool
+
+	// enabledExtensions is the set of extension names the operator
+	// opted into via `--enable-pg-extension` (ADR-0032). Populated by
+	// [EnableExtensions], which preflights presence on the target.
+	// Threaded into emitOpts so emitColumnType can dispatch
+	// [ir.ExtensionType] columns through pgExtensionCatalog.
+	enabledExtensions map[string]bool
 }
 
 // SetSchema implements [ir.SchemaSetter]. Called by the pipeline
@@ -73,6 +80,25 @@ func (w *SchemaWriter) SetSchema(name string) {
 	}
 	w.schema = name
 	w.schemaExplicit = true
+}
+
+// EnableExtensions implements [ir.ExtensionAware] for PG (ADR-0032).
+// Validates each requested extension name against pgExtensionCatalog
+// and preflights presence on the target database. Refusals here fire
+// before any schema-write phase runs — operator gets a clean error
+// before sluice creates / alters anything on the target.
+//
+// The target-side preflight uses the writer's own *sql.DB pool, so a
+// firewall or auth issue surfaces here rather than mid-emit.
+//
+// Empty / nil extensions is a no-op (today's default).
+func (w *SchemaWriter) EnableExtensions(ctx context.Context, extensions []string) error {
+	enabled, err := validateAndPreflightExtensionsAt(ctx, w.db, extensions, "target")
+	if err != nil {
+		return err
+	}
+	w.enabledExtensions = enabled
+	return nil
 }
 
 // Close releases the underlying connection pool.
@@ -119,7 +145,7 @@ func (w *SchemaWriter) CreateTablesWithoutConstraints(ctx context.Context, s *ir
 	}
 
 	// Phase 1b: tables.
-	opts := emitOpts{HasPostGIS: w.hasPostGIS, TargetSchema: w.qualifyingSchema()}
+	opts := w.emitOpts()
 	for _, table := range orderedTables(s) {
 		stmt, err := emitTableDef(w.schema, table, opts)
 		if err != nil {
@@ -300,6 +326,18 @@ func (w *SchemaWriter) syncOneIdentity(ctx context.Context, table *ir.Table, col
 	return nil
 }
 
+// emitOpts builds the [emitOpts] value to thread into every
+// emitter helper for this writer's lifetime. Centralised so
+// adding a new field (HasPostGIS → +TargetSchema → +EnabledExtensions)
+// doesn't fan out across half a dozen call-sites.
+func (w *SchemaWriter) emitOpts() emitOpts {
+	return emitOpts{
+		HasPostGIS:        w.hasPostGIS,
+		TargetSchema:      w.qualifyingSchema(),
+		EnabledExtensions: w.enabledExtensions,
+	}
+}
+
 // qualifyingSchema returns the schema name to thread into emitOpts
 // for user-defined-type qualification (enums). Returns w.schema only
 // when [SetSchema] was called with an operator override
@@ -374,7 +412,7 @@ func (w *SchemaWriter) PreviewDDL(_ context.Context, s *ir.Schema) ([]ir.DDLStat
 	}
 
 	out := make([]ir.DDLStatement, 0, len(s.Tables)*2)
-	opts := emitOpts{HasPostGIS: w.hasPostGIS, TargetSchema: w.qualifyingSchema()}
+	opts := w.emitOpts()
 
 	// Phase 1a: enum types, in deterministic table+column order.
 	// Generated enum columns are skipped (Bug 25): they emit as TEXT
@@ -497,7 +535,7 @@ func trimTrailingSemicolon(s string) string {
 // verbatim so the operator sees the same diagnostic the actual write
 // path would raise.
 func (w *SchemaWriter) EmitColumnDef(_ context.Context, table *ir.Table, col *ir.Column) (string, error) {
-	return emitColumnDef(table, col, emitOpts{HasPostGIS: w.hasPostGIS, TargetSchema: w.qualifyingSchema()})
+	return emitColumnDef(table, col, w.emitOpts())
 }
 
 // AlterAddColumn implements [ir.SchemaDeltaApplier] for Postgres. Used
@@ -515,7 +553,7 @@ func (w *SchemaWriter) AlterAddColumn(ctx context.Context, table *ir.Table, cols
 		return nil
 	}
 	for _, col := range cols {
-		def, err := emitColumnDef(table, col, emitOpts{HasPostGIS: w.hasPostGIS, TargetSchema: w.qualifyingSchema()})
+		def, err := emitColumnDef(table, col, w.emitOpts())
 		if err != nil {
 			return fmt.Errorf("alter add column: emit %q: %w", col.Name, err)
 		}

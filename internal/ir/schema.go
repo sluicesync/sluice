@@ -275,6 +275,16 @@ type Index struct {
 	Unique bool
 	// Kind is the storage structure (btree, hash, gin, etc.).
 	Kind IndexKind
+	// Method is the verbatim engine-specific access-method name when
+	// it falls outside the [IndexKind] enum — typically extension-
+	// introduced methods (PG's ivfflat / hnsw via pgvector). The IR
+	// preserves the bareword so a same-engine writer can emit it
+	// verbatim under the engine's extension-passthrough policy
+	// (ADR-0032). Empty when Kind alone suffices (the common case).
+	//
+	// Engines without extension-aware index methods leave this empty;
+	// the writer's emit dispatch defaults to Kind.
+	Method string
 }
 
 // IndexColumn is a single entry within an index. Most entries name a

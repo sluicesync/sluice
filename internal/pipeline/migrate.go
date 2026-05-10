@@ -225,6 +225,16 @@ type Migrator struct {
 	// preserves today's behaviour (use the target DSN's default
 	// schema, typically `public`).
 	TargetSchema string
+
+	// EnabledPGExtensions is the operator's `--enable-pg-extension`
+	// allowlist (ADR-0032). PG → PG only — the validate gate refuses
+	// the field when either side isn't PG. Threaded through every
+	// freshly-opened source SchemaReader / RowReader and target
+	// SchemaWriter / RowWriter via [ir.ExtensionAware]; engines that
+	// don't expose the surface skip cleanly. Empty preserves the
+	// pre-v0.26.0 behaviour where extension-owned types surface as
+	// loud refusals.
+	EnabledPGExtensions []string
 }
 
 // Run executes the migration. Returns nil on success or a wrapped
@@ -264,6 +274,15 @@ func (m *Migrator) Run(ctx context.Context) error {
 		return wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: open source schema reader: %w", err))
 	}
 	defer closeIf(sr)
+
+	// ADR-0032: thread the operator's --enable-pg-extension allowlist
+	// through the source-side reader before the schema scan. Engines
+	// without ExtensionAware skip cleanly. Refusals (unknown name,
+	// missing on source) bubble up as a clean error before any data
+	// moves.
+	if err := applyEnabledPGExtensions(ctx, sr, m.EnabledPGExtensions); err != nil {
+		return wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: enable PG extensions on source: %w", err))
+	}
 
 	schema, err := sr.ReadSchema(ctx)
 	if err != nil {
@@ -320,6 +339,10 @@ func (m *Migrator) Run(ctx context.Context) error {
 			fmt.Errorf("pipeline: open target schema writer: %w", err)))
 	}
 	applyTargetSchema(sw, m.TargetSchema)
+	if err := applyEnabledPGExtensions(ctx, sw, m.EnabledPGExtensions); err != nil {
+		return wrapWithHint(PhaseConnect, markFailed(ctx, rc, state, ir.MigrationPhasePending,
+			fmt.Errorf("pipeline: enable PG extensions on target: %w", err)))
+	}
 	defer closeIf(sw)
 
 	rw, err := m.Target.OpenRowWriter(ctx, m.TargetDSN)
@@ -671,7 +694,10 @@ func (m *Migrator) validate() error {
 	case m.Resume && m.ResetTargetData:
 		return errors.New("pipeline: --resume and --reset-target-data are mutually exclusive")
 	}
-	return validateTargetSchema(m.Target, m.TargetSchema)
+	if err := validateTargetSchema(m.Target, m.TargetSchema); err != nil {
+		return err
+	}
+	return validateEnabledPGExtensions(m.Source, m.Target, m.EnabledPGExtensions)
 }
 
 // copyTable opens the source-side row stream, hands it off to the

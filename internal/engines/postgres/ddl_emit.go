@@ -31,6 +31,14 @@ import (
 type emitOpts struct {
 	HasPostGIS   bool
 	TargetSchema string
+
+	// EnabledExtensions is the set of operator-opted-into PG
+	// extensions (ADR-0032). Passed through every emit-helper so the
+	// column-type and index-method renderers can dispatch through
+	// pgExtensionCatalog without reaching back to the SchemaWriter.
+	// nil / empty means "no extension passthrough" — ir.ExtensionType
+	// columns surface a clear refusal naming the missing flag.
+	EnabledExtensions map[string]bool
 }
 
 // emitColumnType returns the Postgres DDL fragment for a column type
@@ -132,6 +140,23 @@ func emitColumnType(t ir.Type, opts emitOpts) (string, error) {
 			return "", errors.New("postgres: GEOMETRY requires PostGIS; install with `CREATE EXTENSION postgis;` before running sluice")
 		}
 		return fmt.Sprintf("geometry(%s, %d)", postgisSubtypeName(v.Subtype), v.SRID), nil
+
+	// ADR-0032: PG → PG extension passthrough. ExtensionType columns
+	// dispatch through pgExtensionCatalog so each extension's emit
+	// helper renders the column-type DDL (`vector(384)` for pgvector
+	// with dimension 384, etc.). The operator must have opted into
+	// the extension via `--enable-pg-extension`; without it, surface
+	// a clear refusal naming the flag rather than silently emitting
+	// DDL the target may not be able to parse.
+	case ir.ExtensionType:
+		if !opts.EnabledExtensions[v.Extension] {
+			return "", fmt.Errorf(
+				"postgres: column type %s is owned by extension %q which "+
+					"is not enabled; pass --enable-pg-extension %s "+
+					"on this command to opt in (ADR-0032)",
+				v.String(), v.Extension, v.Extension)
+		}
+		return emitExtensionColumn(v)
 	}
 	return "", fmt.Errorf("postgres: unknown IR type %T", t)
 }
@@ -753,7 +778,7 @@ func emitCreateIndex(schema, tableName string, idx *ir.Index) (string, error) {
 	sb.WriteByte('.')
 	sb.WriteString(quoteIdent(tableName))
 	sb.WriteByte(' ')
-	if method := postgresIndexMethod(idx.Kind); method != "" {
+	if method := resolveIndexMethod(idx); method != "" {
 		sb.WriteString("USING ")
 		sb.WriteString(method)
 		sb.WriteByte(' ')
@@ -761,6 +786,22 @@ func emitCreateIndex(schema, tableName string, idx *ir.Index) (string, error) {
 	sb.WriteString(emitIndexColumnList(idx.Columns))
 	sb.WriteByte(';')
 	return sb.String(), nil
+}
+
+// resolveIndexMethod picks the access-method name to emit for an
+// index. Prefers the IR's verbatim Method field when populated
+// (extension-introduced methods like pgvector's ivfflat/hnsw under
+// ADR-0032); falls back to the canonical postgresIndexMethod
+// dispatch on Kind otherwise. Returns "" when neither yields a
+// method, leaving PG to use its default (btree).
+func resolveIndexMethod(idx *ir.Index) string {
+	if idx == nil {
+		return ""
+	}
+	if idx.Method != "" {
+		return idx.Method
+	}
+	return postgresIndexMethod(idx.Kind)
 }
 
 // postgresIndexMethod maps an [ir.IndexKind] to a Postgres access

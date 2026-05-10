@@ -473,6 +473,20 @@ func prepareValue(v any, t ir.Type) (any, error) {
 		return ewkb, nil
 	}
 
+	// ADR-0032: ExtensionType columns pass through as their decoded
+	// shape — pgvector emits as `[1,2,3]`-style strings under pgx
+	// stdlib mode, which PG's `vector` parser accepts on the INSERT
+	// side. Bytes are also accepted (a future extension's
+	// binary-format codec would land here). Any other Go type is a
+	// translator bug upstream.
+	if _, isExt := t.(ir.ExtensionType); isExt {
+		switch x := v.(type) {
+		case string, []byte:
+			return x, nil
+		}
+		return nil, fmt.Errorf("expected string or []byte for ExtensionType column, got %T", v)
+	}
+
 	return v, nil
 }
 

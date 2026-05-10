@@ -89,6 +89,29 @@ func TestEmitColumnType(t *testing.T) {
 	}
 }
 
+// TestEmitColumnType_ExtensionTypeRefuses confirms the MySQL writer
+// refuses ir.ExtensionType columns loudly (ADR-0032). The
+// cross-engine refusal in pipeline.checkCrossEngineSupportable
+// normally fires before MySQL's writer is invoked, but this defends
+// in depth against hand-constructed IR.
+func TestEmitColumnType_ExtensionTypeRefuses(t *testing.T) {
+	col := ir.ExtensionType{
+		Extension: "vector",
+		Name:      "vector",
+		Modifiers: []int{384},
+	}
+	_, err := emitColumnType(col)
+	if err == nil {
+		t.Fatal("expected error on PG ExtensionType in MySQL writer; got nil")
+	}
+	if !strings.Contains(err.Error(), "PG extension") {
+		t.Errorf("err = %v; want mention of \"PG extension\"", err)
+	}
+	if !strings.Contains(err.Error(), "--type-override") {
+		t.Errorf("err = %v; want hint mentioning --type-override", err)
+	}
+}
+
 // TestEmitColumnType_PGNativeAutoEmit verifies the v0.7.0 auto-emit
 // of PG-native types that lack a direct MySQL equivalent. Pre-v0.7.0
 // these returned an error pointing at --type-override; v0.7.0 emits

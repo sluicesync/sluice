@@ -42,6 +42,8 @@ func TestTypesImplementType(t *testing.T) {
 		{"Inet", Inet{}, TierExtension},
 		{"Cidr", Cidr{}, TierExtension},
 		{"Macaddr", Macaddr{}, TierExtension},
+		// ADR-0032 PG extension passthrough variant.
+		{"ExtensionType", ExtensionType{Extension: "vector", Name: "vector", Modifiers: []int{384}}, TierExtension},
 	}
 
 	for _, c := range cases {
@@ -76,6 +78,7 @@ func TestKindOf(t *testing.T) {
 		{"Inet", Inet{}, ExtInet},
 		{"Cidr", Cidr{}, ExtCidr},
 		{"Macaddr", Macaddr{}, ExtMacaddr},
+		{"ExtensionType", ExtensionType{Extension: "vector", Name: "vector"}, ExtExtensionType},
 	}
 	for _, c := range cases {
 		c := c
@@ -130,6 +133,8 @@ func TestStringSamples(t *testing.T) {
 		{Timestamp{Precision: 0}, "Timestamp(0)"},
 		{Array{Element: Integer{Width: 32}}, "Array<Int32>"},
 		{Enum{Values: []string{"red", "green"}}, "red,green"},
+		{ExtensionType{Extension: "vector", Name: "vector", Modifiers: []int{384}}, "vector.vector(384)"},
+		{ExtensionType{Extension: "hstore", Name: "hstore"}, "hstore.hstore"},
 	}
 	for _, c := range cases {
 		c := c

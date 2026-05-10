@@ -10,6 +10,7 @@ package pipeline
 // readable.
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -64,6 +65,68 @@ func applyTargetSchema(target any, targetSchema string) {
 	if setter, ok := target.(ir.SchemaSetter); ok {
 		setter.SetSchema(targetSchema)
 	}
+}
+
+// applyEnabledPGExtensions threads the operator's
+// `--enable-pg-extension` allowlist (ADR-0032) through to a freshly-
+// opened engine reader / writer / applier via the optional
+// [ir.ExtensionAware] surface. Engines that don't implement the
+// interface (today: MySQL) skip cleanly — the validate gate
+// upstream already refused the flag for non-PG sides via the
+// engine-name check in [validateEnabledPGExtensions].
+//
+// Returns the error from [ir.ExtensionAware.EnableExtensions] when
+// the engine refuses (unknown extension name, missing on the
+// connected database). Empty / nil extensions is a no-op.
+func applyEnabledPGExtensions(ctx context.Context, target any, extensions []string) error {
+	if len(extensions) == 0 {
+		return nil
+	}
+	if aware, ok := target.(ir.ExtensionAware); ok {
+		return aware.EnableExtensions(ctx, extensions)
+	}
+	// Engine doesn't expose ExtensionAware. The validate gate normally
+	// catches this upstream; defending here keeps the helper safe to
+	// call against any opened reader/writer.
+	return nil
+}
+
+// validateEnabledPGExtensions enforces the engine-name gate for
+// `--enable-pg-extension` (ADR-0032). The flag is meaningful only
+// for same-engine PG → PG paths — the cross-engine refusal in
+// [checkCrossEngineSupportable] keeps loud-failure as the default
+// when the target isn't PG. Refusing at validate time means the
+// operator gets a clean error before any DSN dialing.
+//
+// Empty extensions is a no-op (the field defaults to empty).
+//
+// Refuses (with operator-actionable wording) when:
+//
+//   - The source engine isn't postgres — the flag has no meaning on
+//     a non-PG source.
+//   - The target engine isn't postgres — the cross-engine refusal
+//     would fire later anyway; surface it earlier with a clearer
+//     pointer to the right escape hatch (--type-override).
+func validateEnabledPGExtensions(source, target ir.Engine, extensions []string) error {
+	if len(extensions) == 0 {
+		return nil
+	}
+	if source != nil && source.Name() != "postgres" {
+		return fmt.Errorf(
+			"pipeline: --enable-pg-extension is only supported on PG sources "+
+				"(source engine is %q); the flag opts into PG → PG extension "+
+				"passthrough per ADR-0032",
+			source.Name())
+	}
+	if target != nil && target.Name() != "postgres" {
+		return fmt.Errorf(
+			"pipeline: --enable-pg-extension is only supported on PG targets "+
+				"(target engine is %q); cross-engine extension translation "+
+				"keeps the loud-failure default — supply --type-override per "+
+				"column to translate explicitly (ADR-0032)",
+			target.Name())
+	}
+	return nil
 }
 
 // applySourceFingerprint records the streamer's source-DSN fingerprint
