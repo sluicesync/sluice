@@ -240,6 +240,20 @@ func (r *CDCReader) StreamChanges(ctx context.Context, from ir.Position) (<-chan
 		// the decoder's contract. DATETIME isn't affected (its
 		// binlog encoding is the broken-down date/time directly).
 		TimestampStringLocation: time.UTC,
+		// MaxConnAttempts bounds the BinlogSyncer's internal retry
+		// loop (onStream → retrySync). Default 0 = infinite retries.
+		// In long-lived production streams that's the right default
+		// (transient source restarts shouldn't kill the streamer).
+		// But in CI's integration-job container-pressure environment,
+		// torn-down testcontainers leave the retry loop in a "dial
+		// tcp [::1]:32xxx: connection refused" loop forever; under
+		// pressure this leaks goroutines into subsequent tests
+		// (TestMigrate_MySQLToPostgres flake on v0.27.0+). 30 attempts
+		// at the default 1s interval = ~30s of retries before the
+		// goroutine gives up — long enough for legitimate transient
+		// outages, short enough that test-side ctx cancellation
+		// doesn't leave goroutines piling up.
+		MaxReconnectAttempts: 30,
 	}
 	r.syncer = replication.NewBinlogSyncer(syncerCfg)
 
@@ -334,22 +348,6 @@ func (r *CDCReader) startStreamer(p binlogPos) (*replication.BinlogStreamer, err
 // count — only row-level events satisfy the watchdog.
 func (r *CDCReader) pump(ctx context.Context, streamer *replication.BinlogStreamer, out chan<- ir.Change) {
 	defer close(out)
-	// Tear down the BinlogSyncer's internal goroutines (in particular
-	// the retrySync loop in onStream) on pump exit. Without this, a
-	// ctx cancellation only stops GetEvent — the BinlogSyncer's
-	// reconnect loop keeps trying to dial the source until the
-	// process exits. Under integration-job container pressure the
-	// leaked goroutines pollute subsequent tests (TestMigrate_*
-	// flakes during the v0.27.0 cycle were the symptom). Idempotent;
-	// safe to call alongside any explicit Close() in the engine's
-	// outer Close path. Unconditionally fires on pump exit (whether
-	// via ctx cancellation or read error) so the leak class is
-	// closed for both shutdown shapes.
-	defer func() {
-		if r.syncer != nil {
-			r.syncer.Close()
-		}
-	}()
 
 	pumpCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
