@@ -20,6 +20,10 @@ project follows [Semantic Versioning](https://semver.org/).
 
 - **`ir.Index.Method` field.** Carries verbatim extension-introduced index access-method names (`ivfflat`, `hnsw` for pgvector; `gin` / `gist` for pg_trgm / PostGIS in the future). Bareword fallback for `IndexKindUnspecified` preserves the existing engine-neutral `IndexKind` enum while letting catalog entries register their own access methods without expanding the enum.
 
+- **`ir.IndexColumn.OperatorClass` field + emission.** Captured by a `pg_index/pg_opclass` join in `populateIndexes`, emitted by `emitIndexColumnList` for indexes whose access method is extension-introduced and requires it (e.g. `hnsw` requires `vector_l2_ops` / `vector_ip_ops` / `vector_cosine_ops` / `vector_l1_ops`). Default-PG indexes (B-tree, hash, GiST, GIN with built-in opclasses) emit unchanged.
+
+- **pgvector binary COPY codec (`internal/engines/postgres/pgvector_codec.go`).** Bulk-copy uses pgvector's binary wire format (`int16 dim, int16 unused, dim × BE float32` per pgvector/src/vector.c). The naive text-passthrough approach fails because pgx's binary COPY protocol parses the first two bytes of the value as a dimension count — text representation `[0.1,0.2...` would be interpreted as a 23344-dimension vector and trip pgvector's 16000-dim ceiling. The codec is registered per-connection in `writeViaCopy` when the table has any vector column; the OID is resolved from `pg_type` at registration time.
+
 - **PG extension catalog (`internal/engines/postgres/extension_catalog.go`).** Registry mapping extension name → recognized type OIDs + emit functions + index access methods. Adding a new extension is "add a catalog entry," not "extend interfaces." pgvector ships as the first entry; catalog stub entries for pg_trgm / hstore / citext / PostGIS follow in subsequent point releases per the v1 shortlist (pinned by `docs/research/pg-extensions-deployment-frequency.md`).
 
 - **ADR-0032 — PG extension passthrough.** Decision rationale (allowlist over auto-detect), three-tier classification framework (Tier 1 type-only / Tier 2 type+index / Tier 3 type+functions), threat model (5 scenarios — target missing extension, version skew, cross-engine refusal, operator typo, no-columns no-op), why pgvector first.
@@ -34,7 +38,7 @@ project follows [Semantic Versioning](https://semver.org/).
 ### Known limitations
 
 - **Extension version skew not detected.** v1 checks extension presence on both source and target, NOT version compatibility (pgvector 0.7 source → 0.5 target may surface subtle behaviour gaps that sluice doesn't see). Documented in ADR-0032's threat model item 2; future refinement could add `--enable-pg-extension vector@>=0.7` syntax if real operator demand surfaces.
-- **Operator-class metadata captured but not yet emitted on indexes.** The catalog entry for pgvector records the operator classes (`vector_l2_ops`, `vector_ip_ops`, `vector_cosine_ops`, etc.) but v1 emits indexes via verbatim `USING <method>` only. The operator-class default that pgvector picks for the index covers the load-bearing ANN-search pattern; explicit operator-class emission can land as a follow-up if real demand surfaces.
+- **Operator-class emission scoped to extension AMs.** `hnsw` indexes correctly emit their required operator class (`vector_l2_ops` etc.); built-in PG access methods (B-tree, hash, GIN, GiST with built-in opclasses) emit unchanged. If a future extension requires custom operator classes that aren't in pgvector's recognized set, the catalog needs an entry update.
 - **Tier 3 extensions deferred.** uuid-ossp + pgcrypto are universal across all four surveyed providers (Supabase, Neon, PlanetScale Postgres, ps-extensions.io) but are Tier 3 (function-in-defaults expression-translator work). Strong v2 candidates after the v1 Tier 1+2 machinery is in place. Tracked in ADR-0032 §"Consequences."
 
 ## [0.25.1]

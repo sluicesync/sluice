@@ -11,9 +11,9 @@
   4. Schema writer renders these via the catalog's `emitCol` function on same-engine PG targets; refuses cleanly on cross-engine MySQL targets with operator-actionable error pointing at `--type-override`.
 
 - **pgvector — first concrete extension supported.** Both Tier 1 (type-only opaque-text/binary) and Tier 2 (index methods) covered:
-  - **`vector(N)` column type.** Dimension preserved; bulk-copy + CDC pass through pgvector's canonical text representation (`[0.1,0.2,0.3]`) verbatim.
+  - **`vector(N)` column type.** Dimension preserved end-to-end. Bulk-copy uses a registered pgvector binary codec (`int16 dim, int16 unused, dim × BE float32` per pgvector's wire format) — the naive text-passthrough approach fails because pgx's binary COPY protocol parses the first two bytes of the value as a dimension count, which would interpret `[0.1,0.2...` as a 23344-dimension vector and trip pgvector's 16000-dim ceiling. The codec is registered per-connection in `writeViaCopy` when the table has any vector column; the OID is resolved from `pg_type` at registration time.
   - **`ivfflat` and `hnsw` index methods** recognized and recreated on the target. The `ir.Index.Method` field carries verbatim extension-introduced access-method names.
-  - Operator-class metadata (`vector_l2_ops`, `vector_ip_ops`, `vector_cosine_ops`) captured in the catalog entry; v1 emits indexes via verbatim `USING <method>` (the operator-class default pgvector picks covers the load-bearing ANN-search pattern).
+  - **Operator classes emitted** for indexes whose access method is extension-introduced and requires them (`hnsw` needs `vector_l2_ops` / `vector_ip_ops` / `vector_cosine_ops` / `vector_l1_ops`). New `ir.IndexColumn.OperatorClass` field, populated by a `pg_index/pg_opclass` join. Default-PG indexes (B-tree, hash, etc.) emit unchanged.
 
 - **Three-tier classification framework** (per ADR-0032). Each pinned tier has predictable LOC cost per extension added:
   - **Tier 1 — type-only opaque bytes/text.** ~50-100 LOC per extension. Examples: hstore, citext, ltree.
@@ -42,7 +42,7 @@
 ## Known limitations
 
 - **Extension version skew not detected.** v1 checks extension presence on both source and target, NOT version compatibility. pgvector 0.7 source → 0.5 target may surface subtle behaviour gaps that sluice doesn't see. Documented in ADR-0032's threat model item 2; future refinement could add `--enable-pg-extension vector@>=0.7` syntax if real operator demand surfaces.
-- **Operator-class metadata captured but not yet emitted on indexes.** v1 emits `USING <method>` only; the operator-class default that pgvector picks covers the load-bearing ANN-search pattern. Explicit operator-class emission is a follow-up if real demand surfaces.
+- **Operator-class emission scoped to extension AMs.** `hnsw` indexes correctly emit their required operator class. Built-in PG access methods (B-tree, hash, GIN/GiST with built-in opclasses) emit unchanged. Future extensions requiring custom operator classes need a catalog entry update.
 - **Tier 3 extensions deferred.** uuid-ossp + pgcrypto are universal across all four surveyed providers (Supabase, Neon, PlanetScale Postgres, ps-extensions.io) but are Tier 3 (function-in-defaults work). Strong v2 candidates after the v1 Tier 1+2 machinery is in place. Tracked in ADR-0032 §"Consequences."
 - **Per-extension v1 shortlist not all shipped in v0.26.0.** This release lands pgvector + the framework. pg_trgm, hstore, citext, and PostGIS are planned as catalog-only follow-ons (each likely a single point release). Roadmap item 12 has the implementation order pinned by the research doc.
 
