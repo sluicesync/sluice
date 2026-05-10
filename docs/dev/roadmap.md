@@ -423,13 +423,25 @@ Output: `docs/research/sluice-as-analytics-source.md` (operator personas + surfa
 - Per-extension allowlist is more conservative than auto-detect ("we have the same extensions, pass them through automatically") but also higher operator burden. Worth considering an `--auto-pg-extensions` opt-in escape hatch in v2 once the allowlist is battle-tested.
 - The PostGIS PG-to-PG passthrough overlaps with the "GEOMETRY/SPATIAL support" entry (which today addresses cross-engine PG ↔ MySQL geometry). Decision: this entry covers the PG-to-PG path for PostGIS as part of the broader extension-passthrough mechanism; the GEOMETRY/SPATIAL entry retains its cross-engine + VStream focus. Bug 26/27 stay parented under GEOMETRY/SPATIAL.
 
-**Operator demand check.** Strong indirect signal — the PG ecosystem has well-documented extension-heavy adoption (see "PG extensions deployment-frequency research doc" entry below). pgvector specifically has had massive AI/ML adoption since 2023. PG-to-PG syncs where extensions are blocked are a real pain point. v1 ships the allowlist + 3-5 most-deployed Tier 1+2 extensions; further extensions follow demand.
+**Operator demand check.** Strong indirect signal — the PG ecosystem has well-documented extension-heavy adoption. pgvector specifically has had massive AI/ML adoption since 2023. PG-to-PG syncs where extensions are blocked are a real pain point. v1 ships the allowlist + 3-5 most-deployed Tier 1+2 extensions; further extensions follow demand.
+
+**v1 shortlist (pinned by item 13's research doc, [`docs/research/pg-extensions-deployment-frequency.md`](../research/pg-extensions-deployment-frequency.md))** — implementation order:
+
+1. **pgvector** (Tier 2) — leads; establishes the Tier-2 index-method-passthrough machinery PostGIS will reuse. Strongest demand trajectory (AI/ML).
+2. **pg_trgm** (Tier 2 lite — operator classes only, no new column type) — validates the index path on something simpler than full pgvector.
+3. **hstore** (Tier 1) — first Tier 1 ship; type-only opaque-text validation.
+4. **citext** (Tier 1) — second Tier 1, even simpler (text + collation); pair with hstore in one PR if the IR shape is clean.
+5. **PostGIS** (Tier 2) — last in v1; coordinates with the "GEOMETRY/SPATIAL support" entry above (the cross-engine PostGIS path stays parented there; this entry covers the PG-to-PG passthrough as the broader extension mechanism).
+
+**Surprises documented in item 13's doc**: uuid-ossp + pgcrypto are universal across all four sources but are Tier 3 (function-in-defaults expression-translator work) — strong v2 candidates after the v1 Tier 1+2 machinery is in place. ps-extensions.io's #1 (`pg_search`, 116 votes) is single-vendor (paradedb) and not on Neon — poor v1 fit despite vote count. hstore + citext have clean cross-engine paths to MySQL JSON / VARCHAR-collated respectively (worth ADR-0016 default-translator entries when ready).
 
 Estimated ~800-1500 LOC for v1 + ADR + integration tests, depending on which Tier 2 extensions land in scope.
 
 ---
 
-### 13. PG extensions deployment-frequency research doc (research-only, prerequisite to item 12)
+### 13. PG extensions deployment-frequency research doc — **shipped** (research-only, see `docs/research/pg-extensions-deployment-frequency.md`)
+
+**Status:** Survey landed. v1 shortlist pinned to item 12 above. Remaining text retained for traceability.
 
 **Why.** Item 12 ships an extension-passthrough allowlist; the v1 list has to be picked from somewhere. Operator-perceived priorities differ wildly (a pgvector shop disagrees with a PostGIS shop disagrees with an hstore shop), so a survey of which extensions are most-deployed in the wild is the cheapest input to that decision.
 
