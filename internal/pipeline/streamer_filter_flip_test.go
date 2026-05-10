@@ -6,6 +6,7 @@ package pipeline
 import (
 	"context"
 	"reflect"
+	"sync"
 	"testing"
 	"time"
 
@@ -267,17 +268,26 @@ func TestPollLiveAddedTables_DetectsChange(t *testing.T) {
 }
 
 // fakeLiveAddedReader is a thread-safe in-memory liveAddedTablesReader
-// for the poll-loop unit test.
+// for the poll-loop unit test. The mutex is load-bearing — the test
+// goroutine writes via Set while the poller goroutine reads via
+// ReadLiveAddedTables, and CI's -race detector flagged the unsynced
+// access (the docstring claimed thread-safety but the implementation
+// was actually unsafe; v0.27.0 first-tag CI surfaced the race).
 type fakeLiveAddedReader struct {
+	mu     sync.Mutex
 	tables []string
 }
 
 func (f *fakeLiveAddedReader) ReadLiveAddedTables(_ context.Context, _ string) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	out := make([]string, len(f.tables))
 	copy(out, f.tables)
 	return out, nil
 }
 
 func (f *fakeLiveAddedReader) Set(t []string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.tables = append(f.tables[:0], t...)
 }
