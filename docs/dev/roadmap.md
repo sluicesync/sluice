@@ -372,25 +372,7 @@ Output: `docs/research/sluice-as-analytics-source.md` (operator personas + surfa
 
 ---
 
-### 10. Multi-source aggregation — Shape A (sharded → consolidated)
-
-**Why.** v0.25.0 ships Shape B (microservices: N distinct schemas → per-source target schema, PG-only). Shape A is the other real-world multi-source pattern: N functionally-identical sources (Vitess shards, multi-region MySQL, partitioned-by-key Postgres) → one consolidated target table per type. The proto-ADR (`docs/dev/design-multi-source-aggregation.md`'s "What about Shape A" section) sketches the design space; deferred from v0.25.0 because the additional machinery is meaningfully heavier and no operator has surfaced the demand yet.
-
-**What.** Two load-bearing additions on top of the v0.25.0 foundation:
-
-- **Discriminator column injection.** When N sources have identical schemas, the operator typically wants a `source_shard_id` column added on the target. Sluice would inject the column at translation time + populate it with the stream-id (or operator-supplied value) during writes. New CLI flag: `--inject-shard-column NAME=VALUE`, mirrored on each shard's stream. Composite PK includes the discriminator so shards can't conflict.
-- **Stream-id-aware bulk copy.** Bulk-copy reads from N sources and writes to the same target table; today's pre-flight check refuses to bulk-copy into populated targets. With `--inject-shard-column` set, the populated check needs to allow co-existence with rows from other shards (predicate: `WHERE source_shard_id = $1`).
-
-**Gotchas.**
-- Cross-shard schema migrations need coordination — if shard A adds a column and shard B doesn't yet, the target's table schema diverges from one shard's view. Operator-facing: need a "wait for all shards" pattern or per-shard schema diff visualisation.
-- Discriminator-column rename: if the operator changes the discriminator name later, existing rows need backfill OR a new table. Out of scope — the column name is set-once.
-- VStream / PlanetScale shards are the canonical case; the Phase 2.5 VStream consideration from the "Mid-stream add-table — MySQL Phase 2" entry applies here too.
-
-**Operator demand check.** No real-world operator has surfaced this yet. The Vitess→PG analytics pattern is plausible but speculative; Shape B shipped in v0.25.0 (see "Recently landed") and the Shape A path waits for an operator to push for it. Estimated ~1500-2500 LOC + ADR if/when picked up.
-
----
-
-### 11. Multi-source aggregation — MySQL native parity
+### 10. Multi-source aggregation — MySQL native parity
 
 **Why.** v0.25.0's `--target-schema` is PG-only by design (PG schemas are first-class; MySQL collapses schema-and-database). MySQL operators with the same multi-source-microservices pattern get equivalent coverage today via `--target` DSN choice (different MySQL databases on the same server). For most operators this is enough — the analytics queries cross databases the same way they would cross PG schemas, and MySQL's namespace model genuinely is "database = schema."
 
@@ -402,7 +384,7 @@ Output: `docs/research/sluice-as-analytics-source.md` (operator personas + surfa
 
 ---
 
-### 12. PlanetScale MySQL+Vitess test-matrix expansion
+### 11. PlanetScale MySQL+Vitess test-matrix expansion
 
 **Why.** Sluice has a `psverify` build-tag harness for PlanetScale-backed Vitess source coverage (`docs/dev/notes/psverify-status.md`), gated by `PLANETSCALE_CREDENTIALS.env`. Coverage today is operator-driven (the harness exists; the user runs it before releases when they have credentials available) rather than continuously exercised in CI. Several VStream-specific edge cases live in this gap:
 
@@ -420,7 +402,53 @@ Output: `docs/research/sluice-as-analytics-source.md` (operator personas + surfa
 
 ---
 
-### 13. View support Phase 2/3 — materialized-view refresh + cross-engine view-body translation
+### 12. PG → PG extension passthrough (operator survey + allowlist)
+
+**Why.** Postgres' extensibility — PostGIS, pgvector, pg_trgm, hstore, citext, ltree, pgcrypto, uuid-ossp, etc. — is a major reason operators choose PG specifically. Today sluice's IR doesn't represent extension types, so PG-source columns of those types either get dropped (silent — not OK per the loud-failure tenet) or surface a loud refusal at schema-read time. **For PG → PG syncs where both sides have the same extensions installed, those columns should "just work"** — pass through with native fidelity rather than being treated as hostile. Cross-engine targets (PG → MySQL) keep the loud-failure default; explicit operator-supplied translations stay the escape hatch (parallel to ADR-0016's expression translator catalog).
+
+**What.** Allowlist-based opt-in passthrough mode. New CLI flag `--enable-pg-extension EXT` (repeatable). When set:
+- PG schema reader recognizes columns of those extension types and emits them into a new IR variant (`ir.ExtensionType{Extension, Name, ...}`).
+- PG schema writer detects same-engine target + matching extension installed + recognized extension type → emits the column verbatim.
+- CDC reader / row reader pass through the binary representation as-is (no value-shaping).
+- Pre-flight refuses cleanly if target doesn't have the extension installed (`SELECT 1 FROM pg_extension WHERE extname = $1`).
+- Cross-engine targets (MySQL): existing loud-error path preserved; operator can supply explicit `--type-override` to cast to a fallback type.
+
+**Three tiers based on what fidelity needs.** Tier classification informs which extensions are cheap to support vs. need real engineering:
+- **Tier 1: Type-only.** Extension defines new column types; values are opaque bytes/text from sluice's POV. Examples: hstore, citext, ltree, cube, intarray. ~50-100 LOC per extension.
+- **Tier 2: Type + indexes.** Type plus index access methods (GIN, GiST, BRIN-via-extension) operators rely on. Examples: PostGIS (gist), pgvector (ivfflat / hnsw), pg_trgm (gin). ~150-300 LOC per extension; need index-method awareness in schema reader so round-trip preserves indexes.
+- **Tier 3: Type + functions in defaults / generated columns.** Extension-defined functions appear in column defaults or generated expressions. Examples: uuid-ossp's `uuid_generate_v4()`, pgcrypto's `digest()`. Adds expression-translator catalog entries for PG-to-PG passthrough; loud failure on cross-engine unless explicitly translated. Per-extension policy.
+
+**Gotchas.**
+- Extension version skew (PostGIS 3.4 source → 3.0 target) could surface subtle behavior gaps. v1 only checks extension presence, not version; document the limitation; operator-supplied version-pinning could come later if real-world drift causes pain.
+- Per-extension allowlist is more conservative than auto-detect ("we have the same extensions, pass them through automatically") but also higher operator burden. Worth considering an `--auto-pg-extensions` opt-in escape hatch in v2 once the allowlist is battle-tested.
+- The PostGIS PG-to-PG passthrough overlaps with the "GEOMETRY/SPATIAL support" entry (which today addresses cross-engine PG ↔ MySQL geometry). Decision: this entry covers the PG-to-PG path for PostGIS as part of the broader extension-passthrough mechanism; the GEOMETRY/SPATIAL entry retains its cross-engine + VStream focus. Bug 26/27 stay parented under GEOMETRY/SPATIAL.
+
+**Operator demand check.** Strong indirect signal — the PG ecosystem has well-documented extension-heavy adoption (see "PG extensions deployment-frequency research doc" entry below). pgvector specifically has had massive AI/ML adoption since 2023. PG-to-PG syncs where extensions are blocked are a real pain point. v1 ships the allowlist + 3-5 most-deployed Tier 1+2 extensions; further extensions follow demand.
+
+Estimated ~800-1500 LOC for v1 + ADR + integration tests, depending on which Tier 2 extensions land in scope.
+
+---
+
+### 13. PG extensions deployment-frequency research doc (research-only, prerequisite to item 12)
+
+**Why.** Item 12 ships an extension-passthrough allowlist; the v1 list has to be picked from somewhere. Operator-perceived priorities differ wildly (a pgvector shop disagrees with a PostGIS shop disagrees with an hstore shop), so a survey of which extensions are most-deployed in the wild is the cheapest input to that decision.
+
+**What** (research-only — no code yet). A `docs/research/pg-extensions-deployment-frequency.md` covering:
+
+- **Sources surveyed**: managed-PG provider extension lists are the primary signal — they reflect what the providers' customers actually request.
+  - **Supabase** — extensions list at <https://supabase.com/docs/guides/database/extensions>
+  - **Neon** — extensions list at <https://neon.com/docs/extensions/pg-extensions>
+  - **PlanetScale Postgres** — extensions list at <https://planetscale.com/docs/postgres/extensions>
+  - **PlanetScale's requested-extensions tracker** at <https://ps-extensions.io/> (operator-voted demand signal — strongest direct read on what operators want that providers don't yet support)
+- **Per-extension classification** (matrix): name, primary use case, Tier (1/2/3 per item 12's framework), provider availability (Supabase / Neon / PlanetScale / PostgreSQL contrib), license, sluice-passthrough complexity estimate, "must-have for v1" yes/no with rationale.
+- **Recommended v1 allowlist** for item 12: 3-5 extensions with the strongest (deployment frequency × tractable Tier) signal. My initial guess for the shortlist: PostGIS, pgvector, pg_trgm, hstore, citext — but the survey may surface alternates.
+- **Cross-engine policy revisit**: which extensions, if any, have practical cross-engine translations (PostGIS → MySQL spatial, pgvector → MySQL JSON-of-floats) worth ADR-0016 expression-translator entries vs. operator-override-only? Mostly a "no" — the loud-failure default keeps stepping right.
+
+Output: `docs/research/pg-extensions-deployment-frequency.md` (matrix + recommended allowlist + cross-engine policy section). Estimated 1-2 days research; no code chunk until the doc names the v1 shortlist.
+
+---
+
+### 14. View support Phase 2/3 — materialized-view refresh + cross-engine view-body translation
 
 **Why.** Phase 1 (schema-only round-trip + dependency-ordered apply + diff/preview integration + CLI filters) shipped. The two large open frontiers remain:
 
