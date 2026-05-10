@@ -389,12 +389,13 @@ Output: `docs/research/sluice-as-analytics-source.md` (operator personas + surfa
 - **PlanetScale Postgres slot lifecycle** — Patroni-managed; slot loss on failover is silent without `Logical slot name` cluster config (operator memory `project_planetscale_postgres_slots.md`). The check is documented in `docs/postgres-source-prep.md` but not exercised in CI.
 - **VStream POINT/POLYGON/cross-shard-PK edge cases** — generally any PS-specific behavior beyond what vanilla MySQL exhibits.
 
-**What.** Two paths:
+**What.** Three paths (Path C added 2026-05-10 alongside the Vultr-box bootstrap):
 
 - **Path A — Operator-run coverage matrix.** Document a "before each release" PlanetScale checklist: spin up a PS branch, run sluice against it for the canonical scenarios (vanilla migrate, CDC stream, slot recovery, geometry types, slot rename via `--slot-name=Logical slot name`). Output: `docs/dev/notes/ps-release-checklist.md`. ~1 day to write + populate; no code chunk.
-- **Path B — CI-integrated coverage.** Move `psverify` from operator-run to CI-conditional (PR labels, scheduled workflows). Requires a non-revocable PlanetScale credential surface in CI; operationally heavier. Defer until Path A's checklist surfaces enough recurring gaps to justify the CI cost.
+- **Path B — CI-integrated coverage.** Move `psverify` (and/or `vstream`) from operator-run to CI-conditional (PR labels, scheduled workflows). Requires a non-revocable PlanetScale credential surface in CI; operationally heavier. Defer until Path C's signal surfaces enough recurring gaps to justify the CI cost.
+- **Path C — Vultr-box pre-release validation (LANDED).** The always-on Vultr instance runs `integration vstream` (vttestserver-based VStream coverage) on every release-validation pass without burning CI minutes. See `docs/dev/notes/release-validation-on-vultr.md` for the runbook. Reference timing: ~4 min per run. Captures the Vitess-side coverage gap that CI explicitly skips for cost reasons. The remaining gap vs `psverify` is real-PlanetScale-specific behavior (TLS, vendor pgwire-proxy quirks); Path A still covers that surface.
 
-**Operator demand check.** Path A is the cheap-and-useful immediate win — ship the checklist. Path B is a "if PS coverage gaps keep biting" follow-on.
+**Operator demand check.** Path C closed the loop on the most-frequent vstream-edge-case worry without a CI cost spike. Path A remains the right answer for real-PlanetScale-only quirks. Path B is a "if PS coverage gaps keep biting *and* Path C alone isn't enough" follow-on.
 
 ---
 
