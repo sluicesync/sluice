@@ -6,25 +6,6 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-## [0.29.1]
-
-**Bug 47 fix — MySQL writer no longer corrupts empty JSON object `{}` to empty JSON array `[]`.** Surfaced in v0.29.0 cycle as a previously-undocumented latent issue (reproduces back to v0.20.0). Silent data corruption: MySQL JSON column with value `{}` round-tripped through sluice landed on a MySQL target as `[]`. All other JSON shapes (non-empty objects, arrays, null, scalars) round-tripped correctly. Cross-engine PG → MySQL exhibited the same surface (writer-side bug); MySQL → PG and PG → PG were unaffected (target-side preservation correct).
-
-### Fixed
-
-- **Bug 47 — MySQL writer corrupts empty JSON object `{}` to `[]` on bulk copy.** `convertArrayLikeToJSON` in `internal/engines/mysql/row_writer.go` previously routed `[]byte("{}")` through `pgArrayLiteralToJSON`, which emptied the literal to `[]`. The corner case was acknowledged in a code comment as a deliberate (now wrong) preference for the PG-empty-array override interpretation; v0.29.1 flips the default — `{}` bytes stay as `{}` (the JSON-object interpretation), matching what every MySQL JSON source actually expects. The PG-array override case for genuinely-empty arrays is exotic; operators who want an empty array in a JSON column should use `[]` directly. Six new edge-case pins in `row_writer_unit_test.go::TestPrepareValue` (empty object as bytes, empty array as bytes, populated PG-array bytes, JSON null, JSON scalar, populated JSON object) prevent regression.
-
-### Migration / Compatibility
-
-- **Drop-in upgrade from v0.29.0.** No CLI changes, no on-disk format changes. The fix only narrows behavior for `[]byte("{}")` on the MySQL JSON-target path; nothing else changes.
-- **No DDL migration on `sluice_cdc_state`.** No operator action required.
-- **Operators affected by Bug 47** (MySQL → MySQL or PG → MySQL with `'{}'` as a JSON column value) should re-run their migration after upgrading, OR run a one-time `UPDATE table SET col = '{}' WHERE col = '[]' AND <pre-bug condition>` on the destination if they know which rows were corrupted. Detection: `SELECT JSON_TYPE(col) FROM table` on src vs dest after the original migrate; mismatched OBJECT-vs-ARRAY counts indicate the bug fired.
-
-### Who needs this release
-
-- **Operators with MySQL targets handling JSON columns:** **upgrade**. The bug is silent data corruption; even though it only affects the `{}` value specifically, downstream consumers using `JSON_TYPE`/`JSON_KEYS`/shape-aware queries see the wrong type.
-- **Operators on Postgres-only setups (PG source AND PG target):** drop-in upgrade; no behavior change for your path.
-
 ## [0.29.0]
 
 **CI structural improvements + Path D Phase A diagnostic infrastructure for mid-stream live add-table loss.** Two operator-visible threads land together: (a) the `Integration (PostGIS)` job is now a separate parallel CI gate (cuts wall-clock from ~45 min to ~25 min on tag pushes); (b) sluice now runs `integration vstream` (vttestserver-based VStream coverage) on an always-on Vultr instance during pre-release validation, closing the gap CI explicitly skipped for cost reasons. Internal: new ADR-0036 documents the empirical Phase A.1 characterization of the mid-stream live add-table residual loss surface — diagnostic-only branch, no behavior change to the v0.24.0 best-effort flow yet.
