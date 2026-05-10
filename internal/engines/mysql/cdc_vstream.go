@@ -937,7 +937,25 @@ func decodeVStreamCell(field *query.Field, raw []byte) any {
 		// time-only columns consistent.
 		return v.ToString()
 	case query.Type_JSON, query.Type_BLOB, query.Type_VARBINARY,
-		query.Type_BINARY, query.Type_BIT, query.Type_GEOMETRY:
+		query.Type_BINARY, query.Type_BIT:
+		return copyBytes(raw)
+	case query.Type_GEOMETRY:
+		// Bug 27: VStream delivers spatial values in MySQL's on-wire
+		// geometry format — `<srid uint32 LE><wkb>`. The IR contract
+		// for ir.Geometry values is "raw WKB" (per docs/value-types.md),
+		// matching the standard MySQL row-decoder path
+		// (decodeMySQLGeometry). Strip the 4-byte SRID prefix so
+		// downstream consumers (most importantly the PG row writer's
+		// EWKB framing) see the same WKB bytes regardless of which
+		// MySQL CDC source delivered them. SRID is intentionally
+		// dropped here — per-column SRID lives on the IR's
+		// ir.Geometry.SRID and is set at schema-translation time.
+		// Malformed-prefix payloads (under 5 bytes) fall through with
+		// raw bytes copied; the downstream WKB validator surfaces a
+		// clearer error than a silent re-shape would.
+		if len(raw) >= 5 {
+			return copyBytes(raw[4:])
+		}
 		return copyBytes(raw)
 	case query.Type_NULL_TYPE:
 		return nil

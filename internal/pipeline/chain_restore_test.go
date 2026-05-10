@@ -389,53 +389,17 @@ func TestChainRestore_CrossEngineWithIncrementalsSucceeds(t *testing.T) {
 	}
 }
 
-// TestChainRestore_CrossEnginePostGISRefuses asserts the loud-refusal
-// path for unsupportable cross-engine types. Phase 5 acceptance
-// criterion 4: a PG chain whose schema includes a PostGIS geometry
-// column refuses with operator-actionable guidance when the target is
-// MySQL — the offending table is named so `--exclude-table=<name>`
-// gives the operator a clean recovery path.
-func TestChainRestore_CrossEnginePostGISRefuses(t *testing.T) {
-	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
-
-	// Full manifest with a PostGIS geometry column.
-	full := &ir.Manifest{
-		FormatVersion: ir.BackupFormatVersion,
-		CreatedAt:     time.Date(2026, 5, 8, 10, 0, 0, 0, time.UTC),
-		SourceEngine:  "postgres",
-		Kind:          ir.BackupKindFull,
-		Schema: &ir.Schema{Tables: []*ir.Table{{
-			Name: "places",
-			Columns: []*ir.Column{
-				{Name: "id", Type: ir.Integer{Width: 64}},
-				{Name: "loc", Type: ir.Geometry{Subtype: ir.GeometryPoint, SRID: 4326}},
-			},
-		}}},
-		EndPosition: ir.Position{Engine: "postgres", Token: `{"slot":"sluice_slot","lsn":"0/100"}`},
-	}
-	full.BackupID = ir.ComputeBackupID(full)
-	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
-		t.Fatalf("write full: %v", err)
-	}
-
-	tgt := &chainRestoreRecorderEngine{
-		restoreRecorderEngine: newRestoreRecorderEngine("mysql"),
-	}
-	chain := &ChainRestore{Target: tgt, TargetDSN: "tgt", Store: store}
-	err := chain.Run(context.Background())
-	if err == nil {
-		t.Fatal("err = nil; want PostGIS refusal")
-	}
-	if !strings.Contains(err.Error(), "PostGIS") {
-		t.Errorf("err = %v; want PostGIS refusal", err)
-	}
-	if !strings.Contains(err.Error(), "places") {
-		t.Errorf("err = %v; want refusal to name table 'places'", err)
-	}
-	if !strings.Contains(err.Error(), "--exclude-table") {
-		t.Errorf("err = %v; want recovery hint with --exclude-table", err)
-	}
+// TestChainRestore_CrossEnginePostGISNowSupported documents the
+// post-ADR-0035 behaviour: PG → MySQL geometry round-trips with SRID
+// preserved (Bug 26 closed in v0.28.0). The unit-level refusal-shape
+// test for the remaining unsupportable cross-engine type
+// (ir.ExtensionType, ADR-0032 pgvector / hstore) lives in
+// cross_engine_supportable_test.go where it doesn't need to round-
+// trip a manifest (ExtensionType isn't representable in the backup-
+// manifest envelope today). This test stays as a placeholder so the
+// chunk's acceptance-criteria list maps 1:1 to a test name.
+func TestChainRestore_CrossEnginePostGISNowSupported(t *testing.T) {
+	t.Skip("PostGIS cross-engine geometry support landed in v0.28.0 (ADR-0035); see TestCheckCrossEngineSupportable_PGtoMySQL_ExtensionTypeRefuses for the remaining unsupportable-shape refusal.")
 }
 
 // TestChainRestore_DispatchFromRestore_Run verifies the existing

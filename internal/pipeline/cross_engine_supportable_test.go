@@ -22,7 +22,14 @@ func TestCheckCrossEngineSupportable_SameEngineNil(t *testing.T) {
 	}
 }
 
-func TestCheckCrossEngineSupportable_PGtoMySQL_PostGISRefuses(t *testing.T) {
+// TestCheckCrossEngineSupportable_PGtoMySQL_PostGISAllowed asserts the
+// post-ADR-0035 behaviour: PG → MySQL geometry no longer refuses. The
+// IR carries Subtype + SRID; the MySQL writer emits the matching
+// spatial type with `SRID <n>` so ST_SRID round-trips on the target.
+// Pre-v0.28.0 this case raised a "PostGIS geometry type" refusal — kept
+// as a regression guard against accidental re-introduction of the
+// blanket refusal.
+func TestCheckCrossEngineSupportable_PGtoMySQL_PostGISAllowed(t *testing.T) {
 	s := &ir.Schema{Tables: []*ir.Table{{
 		Name: "places",
 		Columns: []*ir.Column{
@@ -30,21 +37,8 @@ func TestCheckCrossEngineSupportable_PGtoMySQL_PostGISRefuses(t *testing.T) {
 			{Name: "loc", Type: ir.Geometry{Subtype: ir.GeometryPoint, SRID: 4326}},
 		},
 	}}}
-	err := checkCrossEngineSupportable(s, "postgres", "mysql", "incremental incr-0001")
-	if err == nil {
-		t.Fatal("err = nil; want PostGIS refusal")
-	}
-	if !strings.Contains(err.Error(), "PostGIS") {
-		t.Errorf("err = %v; want mention of PostGIS", err)
-	}
-	if !strings.Contains(err.Error(), "places") {
-		t.Errorf("err = %v; want mention of table 'places'", err)
-	}
-	if !strings.Contains(err.Error(), "loc") {
-		t.Errorf("err = %v; want mention of column 'loc'", err)
-	}
-	if !strings.Contains(err.Error(), "--exclude-table") {
-		t.Errorf("err = %v; want hint mentioning --exclude-table", err)
+	if err := checkCrossEngineSupportable(s, "postgres", "mysql", "incremental incr-0001"); err != nil {
+		t.Errorf("err = %v; want nil (geometry now allowed PG → MySQL)", err)
 	}
 }
 
@@ -78,7 +72,10 @@ func TestCheckCrossEngineSupportable_UnknownPairOK(t *testing.T) {
 	}
 }
 
-func TestCheckCrossEngineDeltaSupportable_AddTableWithPostGIS(t *testing.T) {
+// TestCheckCrossEngineDeltaSupportable_AddTableWithPostGISAllowed
+// asserts the post-ADR-0035 behaviour: an incremental that adds a
+// table with a geometry column no longer refuses PG → MySQL.
+func TestCheckCrossEngineDeltaSupportable_AddTableWithPostGISAllowed(t *testing.T) {
 	deltas := []*ir.SchemaDeltaEntry{
 		{
 			Kind:  ir.SchemaDeltaAddTable,
@@ -92,16 +89,14 @@ func TestCheckCrossEngineDeltaSupportable_AddTableWithPostGIS(t *testing.T) {
 			},
 		},
 	}
-	err := checkCrossEngineDeltaSupportable(deltas, "postgres", "mysql", "incr-0001")
-	if err == nil {
-		t.Fatal("err = nil; want PostGIS refusal")
-	}
-	if !strings.Contains(err.Error(), "incr-0001") {
-		t.Errorf("err = %v; want backup-id 'incr-0001'", err)
+	if err := checkCrossEngineDeltaSupportable(deltas, "postgres", "mysql", "incr-0001"); err != nil {
+		t.Errorf("err = %v; want nil (geometry now allowed PG → MySQL)", err)
 	}
 }
 
-func TestCheckCrossEngineDeltaSupportable_AlterTableAddPostGIS(t *testing.T) {
+// TestCheckCrossEngineDeltaSupportable_AlterTableAddPostGISAllowed
+// asserts the post-ADR-0035 behaviour for ALTER TABLE deltas.
+func TestCheckCrossEngineDeltaSupportable_AlterTableAddPostGISAllowed(t *testing.T) {
 	deltas := []*ir.SchemaDeltaEntry{
 		{
 			Kind:  ir.SchemaDeltaAlterTable,
@@ -121,9 +116,8 @@ func TestCheckCrossEngineDeltaSupportable_AlterTableAddPostGIS(t *testing.T) {
 			},
 		},
 	}
-	err := checkCrossEngineDeltaSupportable(deltas, "postgres", "mysql", "incr-0002")
-	if err == nil {
-		t.Fatal("err = nil; want PostGIS refusal")
+	if err := checkCrossEngineDeltaSupportable(deltas, "postgres", "mysql", "incr-0002"); err != nil {
+		t.Errorf("err = %v; want nil (geometry now allowed PG → MySQL)", err)
 	}
 }
 

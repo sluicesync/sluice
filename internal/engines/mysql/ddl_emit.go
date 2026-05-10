@@ -501,6 +501,16 @@ func emitColumnDef(c *ir.Column) (string, error) {
 	if !c.Nullable {
 		sb.WriteString(" NOT NULL")
 	}
+	// `SRID <n>` is a MySQL 8.0+ column attribute on spatial types
+	// (POINT/POLYGON/etc.). Emitted only when the IR carries a
+	// non-zero SRID — SRID 0 is MySQL's "no spatial reference
+	// declared" sentinel, identical to omitting the clause. Closes
+	// the writer half of Bug 26 (PG → MySQL): a PG `geometry(POINT,
+	// 4326)` column lands on MySQL as `POINT NOT NULL SRID 4326`
+	// and ST_SRID(loc) returns 4326 instead of 0.
+	if geom, ok := c.Type.(ir.Geometry); ok && geom.SRID != 0 {
+		fmt.Fprintf(&sb, " SRID %d", geom.SRID)
+	}
 	// DEFAULT and AUTO_INCREMENT are mutually exclusive with GENERATED
 	// in MySQL — the parser rejects the combination. Generated columns
 	// arrive with Default = DefaultNone from the schema reader, so

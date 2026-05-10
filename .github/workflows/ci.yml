@@ -183,10 +183,19 @@ jobs:
       # (ADR-0032 PG → PG extension passthrough). The image is a
       # superset of postgres:16 with the pgvector extension files
       # bundled; cold-start size is ~110 MB layer-compressed.
+      #
+      # postgis/postgis:16-3.4 (added v0.28.0) backs the
+      # internal/pipeline/migrate_postgis_integration_test.go suite
+      # (ADR-0035 PostGIS-aware GEOMETRY translation). The image is
+      # a postgres:16 superset with the postgis extension bundled;
+      # ~500 MB layer-compressed (heavier than pgvector's ~110 MB,
+      # which is why the tests are gated behind a separate `postgis`
+      # build tag rather than running on every Integration job).
       - run: |
           docker pull mysql:8.0
           docker pull postgres:16
           docker pull pgvector/pgvector:0.7.4-pg16
+          docker pull postgis/postgis:16-3.4
 
       # Run every package's integration tests. -count=1 disables the
       # test cache so we always exercise real containers (cached results
@@ -204,6 +213,16 @@ jobs:
       # heavy CI load). Bumped to 25m for headroom. The job's 35m
       # timeout-minutes caps the outer envelope.
       - run: go test -tags=integration -race -count=1 -timeout=25m ./internal/...
+
+      # PostGIS-tagged tests run as a separate go-test invocation so
+      # the heavier postgis/postgis:16-3.4 image only boots when the
+      # tag is active. ADR-0035 gates the cross-engine geometry
+      # round-trip tests behind `integration postgis` because the
+      # image cold-pulls ~500 MB of extra layers; the main Integration
+      # invocation above stays on postgres:16 for fast PG container
+      # boots. Adding -timeout=15m here because each postgis
+      # testcontainer takes ~45-60s to boot vs ~15s for postgres:16.
+      - run: go test -tags="integration postgis" -race -count=1 -timeout=15m ./internal/pipeline/...
 
   # ----- Lint -----
   # golangci-lint runs many static analyzers in a single pass. We use the

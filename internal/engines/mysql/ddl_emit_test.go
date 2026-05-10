@@ -325,6 +325,38 @@ func TestEmitColumnDef(t *testing.T) {
 			},
 			want: "`notes` TEXT COMMENT 'User notes'",
 		},
+		{
+			// Bug 26 PG → MySQL: a PG `geometry(POINT, 4326)` column
+			// lands as `POINT NOT NULL SRID 4326` so ST_SRID(loc) on
+			// the target returns 4326 instead of dropping to 0.
+			name: "geometry point with srid 4326",
+			in: &ir.Column{
+				Name: "loc",
+				Type: ir.Geometry{Subtype: ir.GeometryPoint, SRID: 4326},
+			},
+			want: "`loc` POINT NOT NULL SRID 4326",
+		},
+		{
+			// SRID 0 (no spatial reference declared) is identical to
+			// omitting the clause — SRID 0 is MySQL's "no SRS" sentinel.
+			// The DDL stays bare so cross-engine pre-Bug-26 schemas
+			// don't suddenly grow `SRID 0` text.
+			name: "geometry polygon with srid 0",
+			in: &ir.Column{
+				Name: "boundary",
+				Type: ir.Geometry{Subtype: ir.GeometryPolygon, SRID: 0},
+			},
+			want: "`boundary` POLYGON NOT NULL",
+		},
+		{
+			name: "geometry nullable with srid 3857",
+			in: &ir.Column{
+				Name:     "shape",
+				Type:     ir.Geometry{Subtype: ir.GeometryPolygon, SRID: 3857},
+				Nullable: true,
+			},
+			want: "`shape` POLYGON SRID 3857",
+		},
 	}
 
 	for _, c := range cases {

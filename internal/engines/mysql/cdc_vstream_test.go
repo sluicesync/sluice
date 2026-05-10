@@ -642,6 +642,65 @@ func TestDecodeVStreamCellDateTime(t *testing.T) {
 	})
 }
 
+// TestDecodeVStreamCellGeometry covers Bug 27: VStream POINT bytes
+// are delivered with a 4-byte little-endian SRID prefix that pre-fix
+// tripped the WKB byte-order-flag check (SRID 4326 = E6 10 00 00 →
+// byte 0 of 0xE6 isn't a valid byte-order flag). The decoder strips
+// the prefix so downstream consumers see standard WKB matching the
+// IR contract for ir.Geometry values.
+func TestDecodeVStreamCellGeometry(t *testing.T) {
+	// MySQL's on-wire geometry layout: <srid uint32 LE><wkb>.
+	// SRID 4326 little-endian is E6 10 00 00. The trailing 21 bytes
+	// are a canonical POINT(2.0, 3.0) WKB.
+	wkb := []byte{
+		0x01,                   // byte order = little endian
+		0x01, 0x00, 0x00, 0x00, // type = POINT (uint32 LE)
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, // x = 2.0 (f64 LE)
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x40, // y = 3.0 (f64 LE)
+	}
+	srid4326 := []byte{0xE6, 0x10, 0x00, 0x00}
+	mysqlBytes := append(append([]byte{}, srid4326...), wkb...)
+
+	t.Run("strips SRID 4326 prefix yielding raw WKB", func(t *testing.T) {
+		f := &query.Field{Type: query.Type_GEOMETRY, ColumnType: "point"}
+		got := decodeVStreamCell(f, mysqlBytes)
+		gotBytes, ok := got.([]byte)
+		if !ok {
+			t.Fatalf("got %T; want []byte", got)
+		}
+		if !reflect.DeepEqual(gotBytes, wkb) {
+			t.Errorf("got %x; want %x (raw WKB without SRID prefix)", gotBytes, wkb)
+		}
+	})
+
+	t.Run("malformed too-short value passes through", func(t *testing.T) {
+		// 3-byte input is shorter than the 4-byte SRID prefix; pass
+		// through so the downstream WKB validator surfaces the
+		// problem rather than silently re-shaping garbage.
+		f := &query.Field{Type: query.Type_GEOMETRY, ColumnType: "point"}
+		got := decodeVStreamCell(f, []byte{0x01, 0x02, 0x03})
+		if _, ok := got.([]byte); !ok {
+			t.Errorf("got %T; want []byte fallback", got)
+		}
+	})
+
+	t.Run("zero-srid prefix still strips cleanly", func(t *testing.T) {
+		// SRID 0 (no spatial reference declared) is the most common
+		// MySQL default; the prefix is 00 00 00 00 and stripping
+		// behaves identically.
+		zeroSRID := append([]byte{0, 0, 0, 0}, wkb...)
+		f := &query.Field{Type: query.Type_GEOMETRY, ColumnType: "point"}
+		got := decodeVStreamCell(f, zeroSRID)
+		gotBytes, ok := got.([]byte)
+		if !ok {
+			t.Fatalf("got %T; want []byte", got)
+		}
+		if !reflect.DeepEqual(gotBytes, wkb) {
+			t.Errorf("got %x; want %x", gotBytes, wkb)
+		}
+	})
+}
+
 // TestIsMySQLBoolColumnType covers the small parser used to detect
 // TINYINT(1) from a Vitess FieldEvent's column_type string.
 func TestIsMySQLBoolColumnType(t *testing.T) {

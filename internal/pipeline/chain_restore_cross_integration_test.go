@@ -370,21 +370,16 @@ func TestSyncFromBackup_CrossEngine_SchemaEvolution(t *testing.T) {
 	}
 }
 
-// TestChainRestore_CrossEngine_PostGISRefusal drives Phase 5
-// acceptance criterion 4: a PG chain whose schema includes a PostGIS
-// column refuses to restore into a MySQL target with an
-// operator-actionable error naming the offending entity.
-//
-// Skipped at runtime when the test PG image doesn't have PostGIS
-// available — the existing test scaffolding uses postgres:16 (no
-// extension); the postgis image is gated separately by build tag in
-// migrate_postgis_integration_test.go. For Phase 5's acceptance test
-// the unit test in chain_restore_test.go (TestChainRestore_CrossEnginePostGISRefuses)
-// covers the refusal shape end-to-end without requiring the heavier
-// image; this integration test stays as a placeholder + skip so the
-// design's acceptance-criteria list maps 1:1 to a test name.
-func TestChainRestore_CrossEngine_PostGISRefusal(t *testing.T) {
-	t.Skip("PostGIS refusal is exercised at the unit-test layer (see TestChainRestore_CrossEnginePostGISRefuses); the postgis container image is gated by a separate build tag in migrate_postgis_integration_test.go")
+// TestChainRestore_CrossEngine_PostGISNowSupported documents that
+// the Phase 5 PostGIS-refusal placeholder is closed in v0.28.0 by
+// ADR-0035 — PG → MySQL geometry round-trips with SRID preserved.
+// The remaining cross-engine refusal target is ir.ExtensionType
+// (ADR-0032 pgvector and friends), exercised at the unit-test layer
+// in TestChainRestore_CrossEngineExtensionTypeRefuses. The end-to-end
+// PG → MySQL geometry happy-path lives under the `postgis` build tag
+// (migrate_postgis_integration_test.go).
+func TestChainRestore_CrossEngine_PostGISNowSupported(t *testing.T) {
+	t.Skip("PostGIS cross-engine geometry support landed in v0.28.0 (ADR-0035); refusal exercised by TestChainRestore_CrossEngineExtensionTypeRefuses now uses ir.ExtensionType. End-to-end happy path: migrate_postgis_integration_test.go (build tag postgis).")
 }
 
 // mysqlQueryEmailsActive returns email → active for every row in the
