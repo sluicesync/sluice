@@ -164,7 +164,15 @@ jobs:
   integration:
     name: Integration
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    # 50m outer envelope (was 35m through v0.27.0). v0.28.0 added the
+    # postgis-tagged step (~10-15m on top of the default ~25-30m
+    # integration step + ~5m setup/pull); the v0.28.0 first-tag CI run
+    # hit the 35m ceiling and got cancelled at 35.2m. 50m gives the
+    # postgis suite breathing room without making routine flakes harder
+    # to spot. If the budget creeps further, the next move is to split
+    # the postgis tests into a separate job so they parallelize with
+    # the default integration step.
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-go@v6
