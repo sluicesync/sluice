@@ -164,15 +164,19 @@ jobs:
   integration:
     name: Integration
     runs-on: ubuntu-latest
-    # 50m outer envelope (was 35m through v0.27.0). v0.28.0 added the
-    # postgis-tagged step (~10-15m on top of the default ~25-30m
-    # integration step + ~5m setup/pull); the v0.28.0 first-tag CI run
-    # hit the 35m ceiling and got cancelled at 35.2m. 50m gives the
-    # postgis suite breathing room without making routine flakes harder
-    # to spot. If the budget creeps further, the next move is to split
-    # the postgis tests into a separate job so they parallelize with
-    # the default integration step.
-    timeout-minutes: 50
+    # 60m outer envelope (was 35m through v0.27.0; bumped to 50m on
+    # the v0.28.0 first force-tag-move; bumped again to 60m on the
+    # v0.28.0 fourth force-tag-move because the postgis step was hitting
+    # its 15m timeout despite the 50m outer budget — additive
+    # `-tags="integration postgis"` compiles BOTH integration AND
+    # postgis files, so the postgis step duplicates the integration
+    # suite on top of postgis-specific tests. Postgis step bumped to
+    # 25m to absorb the duplication; outer envelope bumped to 60m
+    # for headroom. If the budget creeps further, the next move is to
+    # split the postgis tests into a separate job so they parallelize
+    # with the default integration step (would also benefit from
+    # independent retry semantics).
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-go@v6
@@ -225,12 +229,21 @@ jobs:
       # PostGIS-tagged tests run as a separate go-test invocation so
       # the heavier postgis/postgis:16-3.4 image only boots when the
       # tag is active. ADR-0035 gates the cross-engine geometry
-      # round-trip tests behind `integration postgis` because the
-      # image cold-pulls ~500 MB of extra layers; the main Integration
+      # round-trip tests behind `integration postgis`. The image
+      # cold-pulls ~500 MB of extra layers; the main Integration
       # invocation above stays on postgres:16 for fast PG container
-      # boots. Adding -timeout=15m here because each postgis
-      # testcontainer takes ~45-60s to boot vs ~15s for postgres:16.
-      - run: go test -tags="integration postgis" -race -count=1 -timeout=15m ./internal/pipeline/...
+      # boots.
+      #
+      # The `-tags="integration postgis"` invocation is additive: it
+      # compiles in BOTH the integration-tagged files AND the
+      # postgis-tagged files, then runs the resulting full set. This
+      # means the postgis step duplicates the regular integration
+      # tests (in the pipeline package) on top of the postgis ones —
+      # not ideal but cheap to fix later (a `-run TestPostGIS` filter
+      # would scope it). For now, -timeout=25m matches the regular
+      # integration step's budget so the doubled runtime fits.
+      # Outer timeout-minutes=50 still caps the envelope.
+      - run: go test -tags="integration postgis" -race -count=1 -timeout=25m ./internal/pipeline/...
 
   # ----- Lint -----
   # golangci-lint runs many static analyzers in a single pass. We use the
