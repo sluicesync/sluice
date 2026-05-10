@@ -6,6 +6,37 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.26.0]
+
+**PG → PG extension passthrough framework + pgvector.** Sluice's IR has been engine-neutral by design — column types are categorized by core SQL kinds, and PG's extensible type system has been treated as hostile (loud-failure refusal at schema-read time). v0.26.0 lands the framework that flips this for same-engine PG → PG syncs where the operator opts in: `--enable-pg-extension EXT` (repeatable) tells sluice to recognize and round-trip column types defined by named extensions, with native fidelity. Cross-engine targets (PG → MySQL) keep the loud-failure default; explicit operator translations (`--type-override`) stay the escape hatch. v1 ships with **pgvector** as the first concrete extension, exercising both the type-only path (Tier 1 mechanics) and the index-method path (Tier 2 mechanics — `ivfflat` and `hnsw`). Subsequent extensions from the v1 shortlist (pg_trgm, hstore, citext, PostGIS) ship as catalog-only follow-ons; the framework stays put. Implementation supplement: `docs/adr/adr-0032-pg-extension-passthrough.md`. Decision input: `docs/research/pg-extensions-deployment-frequency.md` (the survey that pinned the v1 shortlist).
+
+### Added
+
+- **`--enable-pg-extension EXT` flag (repeatable) on `migrate` / `sync start` / `schema preview` / `schema diff`.** Default empty (today's behavior — extension types refuse loudly at schema-read). When set, sluice validates each name against the recognized-extensions catalog (refuses unknown names at flag-parse with the recognized set in the error), then preflights against the source DB (`SELECT extname FROM pg_extension WHERE extname = ANY(...)`) to ensure the extension is actually installed. Same preflight runs on the target. Same-engine PG → PG only — cross-engine targets refuse with operator-actionable error pointing at `--type-override`.
+
+- **`ir.ExtensionType` IR variant.** Engine-neutral by name (Extension + Name); modifiers carry per-type metadata (e.g. `vector(384)` → Modifiers=[]int{384}). Schema reader emits this variant when the column's PG type OID matches a catalog entry; schema writer renders it via the catalog's `emitCol` function on same-engine targets, refuses on cross-engine.
+
+- **`ir.ExtensionAware` optional engine surface.** `EnableExtensions(ctx, names)` activates allowlisted extensions on the engine. PG implements; MySQL does not (no extension concept in the same shape — MySQL's "feature flags" are server-level, not type-defining). The structural type-assertion skips cleanly on engines that don't implement.
+
+- **`ir.Index.Method` field.** Carries verbatim extension-introduced index access-method names (`ivfflat`, `hnsw` for pgvector; `gin` / `gist` for pg_trgm / PostGIS in the future). Bareword fallback for `IndexKindUnspecified` preserves the existing engine-neutral `IndexKind` enum while letting catalog entries register their own access methods without expanding the enum.
+
+- **PG extension catalog (`internal/engines/postgres/extension_catalog.go`).** Registry mapping extension name → recognized type OIDs + emit functions + index access methods. Adding a new extension is "add a catalog entry," not "extend interfaces." pgvector ships as the first entry; catalog stub entries for pg_trgm / hstore / citext / PostGIS follow in subsequent point releases per the v1 shortlist (pinned by `docs/research/pg-extensions-deployment-frequency.md`).
+
+- **ADR-0032 — PG extension passthrough.** Decision rationale (allowlist over auto-detect), three-tier classification framework (Tier 1 type-only / Tier 2 type+index / Tier 3 type+functions), threat model (5 scenarios — target missing extension, version skew, cross-engine refusal, operator typo, no-columns no-op), why pgvector first.
+
+### Migration / Compatibility
+
+- **No format-breaking changes.** Manifest schema, change-chunk format, CLI surface — all unchanged for existing flows.
+- **Default behavior unchanged.** Operators not using `--enable-pg-extension` see no behaviour change — extension column types continue to refuse loudly at schema-read (the existing pattern).
+- **Drop-in upgrade from v0.25.1.** No DDL migration on `sluice_cdc_state`; no operator action required.
+- **MySQL operators unaffected.** MySQL doesn't implement `ir.ExtensionAware`; the structural type-assertion skips cleanly. Cross-engine PG → MySQL with `--enable-pg-extension` enabled still refuses cleanly at the cross-engine retarget step (`--type-override` remains the operator escape hatch).
+
+### Known limitations
+
+- **Extension version skew not detected.** v1 checks extension presence on both source and target, NOT version compatibility (pgvector 0.7 source → 0.5 target may surface subtle behaviour gaps that sluice doesn't see). Documented in ADR-0032's threat model item 2; future refinement could add `--enable-pg-extension vector@>=0.7` syntax if real operator demand surfaces.
+- **Operator-class metadata captured but not yet emitted on indexes.** The catalog entry for pgvector records the operator classes (`vector_l2_ops`, `vector_ip_ops`, `vector_cosine_ops`, etc.) but v1 emits indexes via verbatim `USING <method>` only. The operator-class default that pgvector picks for the index covers the load-bearing ANN-search pattern; explicit operator-class emission can land as a follow-up if real demand surfaces.
+- **Tier 3 extensions deferred.** uuid-ossp + pgcrypto are universal across all four surveyed providers (Supabase, Neon, PlanetScale Postgres, ps-extensions.io) but are Tier 3 (function-in-defaults expression-translator work). Strong v2 candidates after the v1 Tier 1+2 machinery is in place. Tracked in ADR-0032 §"Consequences."
+
 ## [0.25.1]
 
 Two-bug patch from the v0.25.0 cycle. Both bugs were introduced by v0.25.0's `--target-schema` flag and surfaced in the load-bearing happy-path scenario + the v0.24.0 live-add-table interaction.
