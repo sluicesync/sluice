@@ -69,6 +69,17 @@ func ensureControlTable(ctx context.Context, db *sql.DB, schema string) error {
 	if _, err := db.ExecContext(ctx, alter); err != nil {
 		return fmt.Errorf("postgres: ensure control table: add source_dsn_fingerprint: %w", err)
 	}
+	// Migration path for pre-v0.25.1 deployments: the target_schema
+	// column records the operator-supplied `--target-schema NAME`
+	// (ADR-0031) on each position-write so a later
+	// `sluice schema add-table` knows which namespace the active
+	// stream's CDC applier is routing events to. NULL on legacy
+	// rows / streams that didn't pass --target-schema (treated as
+	// "use the DSN default schema"). Bug 46.
+	alter = "ALTER TABLE " + tableRef + " ADD COLUMN IF NOT EXISTS target_schema TEXT NULL"
+	if _, err := db.ExecContext(ctx, alter); err != nil {
+		return fmt.Errorf("postgres: ensure control table: add target_schema: %w", err)
+	}
 	return nil
 }
 
@@ -109,15 +120,19 @@ func readPosition(ctx context.Context, db *sql.DB, schema, streamID string) (tok
 // for any future caller that might.
 func listStreams(ctx context.Context, db *sql.DB, schema, engineName string) ([]ir.StreamStatus, error) {
 	tableRef := quoteIdent(schema) + "." + quoteIdent(controlTableName)
-	// COALESCE on slot_name + source_dsn_fingerprint so legacy rows
-	// that pre-date those columns (NULL values) surface as empty
-	// strings in the StreamStatus — callers branch on empty-string
-	// rather than handling sql.NullString. The fingerprint check
-	// (ADR-0031) treats empty as "unknown — allow," so legacy rows
-	// don't trip false-positive stream-id collisions.
+	// COALESCE on slot_name + source_dsn_fingerprint + target_schema
+	// so legacy rows that pre-date those columns (NULL values)
+	// surface as empty strings in the StreamStatus — callers branch
+	// on empty-string rather than handling sql.NullString. The
+	// fingerprint check (ADR-0031) treats empty as "unknown —
+	// allow," so legacy rows don't trip false-positive stream-id
+	// collisions; the target_schema check (Bug 46) treats empty as
+	// "operator did not pass --target-schema; use the DSN default
+	// schema."
 	q := "SELECT stream_id, source_position, updated_at, " +
 		"COALESCE(slot_name, ''), " +
-		"COALESCE(source_dsn_fingerprint, '') " +
+		"COALESCE(source_dsn_fingerprint, ''), " +
+		"COALESCE(target_schema, '') " +
 		"FROM " + tableRef
 	rows, err := db.QueryContext(ctx, q)
 	if err != nil {
@@ -134,13 +149,14 @@ func listStreams(ctx context.Context, db *sql.DB, schema, engineName string) ([]
 	out := []ir.StreamStatus{}
 	for rows.Next() {
 		var (
-			streamID    string
-			token       string
-			updated     time.Time
-			slotName    string
-			fingerprint string
+			streamID     string
+			token        string
+			updated      time.Time
+			slotName     string
+			fingerprint  string
+			targetSchema string
 		)
-		if err := rows.Scan(&streamID, &token, &updated, &slotName, &fingerprint); err != nil {
+		if err := rows.Scan(&streamID, &token, &updated, &slotName, &fingerprint, &targetSchema); err != nil {
 			return nil, fmt.Errorf("postgres: scan streams: %w", err)
 		}
 		out = append(out, ir.StreamStatus{
@@ -149,6 +165,7 @@ func listStreams(ctx context.Context, db *sql.DB, schema, engineName string) ([]
 			UpdatedAt:            updated,
 			SlotName:             slotName,
 			SourceDSNFingerprint: fingerprint,
+			TargetSchema:         targetSchema,
 		})
 	}
 	return out, rows.Err()
@@ -176,21 +193,31 @@ func listStreams(ctx context.Context, db *sql.DB, schema, engineName string) ([]
 // (ADR-0031) on the same COALESCE-tolerant pattern: non-empty
 // overwrites; empty preserves the row's existing value. Powers
 // stream-id collision detection on subsequent `sync start` runs.
-func writePositionTx(ctx context.Context, tx *sql.Tx, schema, streamID, token, slotName, sourceFingerprint string) error {
+//
+// targetSchema carries the streamer's operator-supplied
+// `--target-schema NAME` (ADR-0031, Bug 46) on the same
+// COALESCE-tolerant pattern. Recorded on every position-write so
+// `sluice schema add-table` can recover the active stream's
+// target-schema namespace and refuse a mismatch loudly. Empty input
+// preserves the row's existing value (legacy / streams started
+// without --target-schema / chain-handoff WritePosition without
+// streamer context).
+func writePositionTx(ctx context.Context, tx *sql.Tx, schema, streamID, token, slotName, sourceFingerprint, targetSchema string) error {
 	tableRef := quoteIdent(schema) + "." + quoteIdent(controlTableName)
 	// COALESCE on the conflict path lets a non-empty slotName /
-	// sourceFingerprint overwrite, while an empty value falls back to
-	// whichever value the existing row already carries — so a
-	// chain-handoff position-write that lacks streamer context
+	// sourceFingerprint / targetSchema overwrite, while an empty value
+	// falls back to whichever value the existing row already carries —
+	// so a chain-handoff position-write that lacks streamer context
 	// doesn't clobber the streamer's previously-recorded values.
-	q := "INSERT INTO " + tableRef + " (stream_id, source_position, updated_at, slot_name, source_dsn_fingerprint) " +
-		"VALUES ($1, $2, CURRENT_TIMESTAMP, NULLIF($3, ''), NULLIF($4, '')) " +
+	q := "INSERT INTO " + tableRef + " (stream_id, source_position, updated_at, slot_name, source_dsn_fingerprint, target_schema) " +
+		"VALUES ($1, $2, CURRENT_TIMESTAMP, NULLIF($3, ''), NULLIF($4, ''), NULLIF($5, '')) " +
 		"ON CONFLICT (stream_id) DO UPDATE SET " +
 		"source_position = EXCLUDED.source_position, " +
 		"updated_at = EXCLUDED.updated_at, " +
 		"slot_name = COALESCE(EXCLUDED.slot_name, " + tableRef + ".slot_name), " +
-		"source_dsn_fingerprint = COALESCE(EXCLUDED.source_dsn_fingerprint, " + tableRef + ".source_dsn_fingerprint)"
-	if _, err := tx.ExecContext(ctx, q, streamID, token, slotName, sourceFingerprint); err != nil {
+		"source_dsn_fingerprint = COALESCE(EXCLUDED.source_dsn_fingerprint, " + tableRef + ".source_dsn_fingerprint), " +
+		"target_schema = COALESCE(EXCLUDED.target_schema, " + tableRef + ".target_schema)"
+	if _, err := tx.ExecContext(ctx, q, streamID, token, slotName, sourceFingerprint, targetSchema); err != nil {
 		return fmt.Errorf("postgres: write position: %w", err)
 	}
 	return nil

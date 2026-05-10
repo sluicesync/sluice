@@ -199,6 +199,30 @@ type AddTable struct {
 	// clear error directing the operator at the drained add-table
 	// flow. The CLI flag is `--no-drain` on `sluice schema add-table`.
 	LiveMode bool
+
+	// TargetSchema is the operator-supplied per-source target schema
+	// namespace (`--target-schema NAME`, ADR-0031). Bug 46 fix:
+	// when the active stream was started with `--target-schema=NAME`,
+	// add-table must route the new table into the same namespace —
+	// otherwise the table lands in `public.<table>` but the
+	// stream's CDC applier routes events to `<NAME>.<table>` and
+	// they silently drop with a WARN log.
+	//
+	// Resolution rule:
+	//   - If empty AND the recorded stream's target_schema is
+	//     non-empty, inherit the recorded value.
+	//   - If non-empty AND matches the recorded value, proceed.
+	//   - If non-empty AND differs from the recorded non-empty
+	//     value, refuse loudly with a clear mismatch error.
+	//   - If empty AND the recorded value is empty (legacy / no
+	//     `--target-schema` at start time), fall through to the
+	//     DSN's default schema — pre-Bug-46 behaviour preserved.
+	//
+	// Engines that don't implement [ir.SchemaSetter] (MySQL) are
+	// rejected upstream by the validate gate. Threaded into the
+	// schema writer / row writer / change applier via the
+	// [ir.SchemaSetter] surface after resolution.
+	TargetSchema string
 }
 
 // Run executes the add-table flow. Returns nil on success or a
@@ -265,7 +289,7 @@ func (a *AddTable) Run(ctx context.Context) error {
 	}
 
 	if a.DryRun {
-		return a.logDryRun(ctx, scoped)
+		return a.logDryRun(ctx, scoped, preflight.resolvedTargetSchema)
 	}
 
 	// ---- 3. Open target writers; refuse if the new table already
@@ -284,6 +308,23 @@ func (a *AddTable) Run(ctx context.Context) error {
 		return wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: add-table: open target row writer: %w", err))
 	}
 	defer closeIf(rw)
+
+	// Bug 46: thread the resolved target-schema namespace into the
+	// schema writer + row writer + change applier so the new table
+	// lands in the same namespace the active stream is routing CDC
+	// events to. Resolution (operator-supplied vs recorded vs
+	// mismatch) ran in preflightStream above; an empty value here
+	// preserves the DSN-default schema (pre-Bug-46 behaviour for
+	// streams that didn't pass --target-schema).
+	if preflight.resolvedTargetSchema != "" {
+		applyTargetSchema(sw, preflight.resolvedTargetSchema)
+		applyTargetSchema(rw, preflight.resolvedTargetSchema)
+		applyTargetSchema(applier, preflight.resolvedTargetSchema)
+		slog.InfoContext(ctx, "add-table: resolved target schema",
+			slog.String("target_schema", preflight.resolvedTargetSchema),
+			slog.String("source", schemaSourceLabel(a.TargetSchema, preflight.resolvedTargetSchema)),
+		)
+	}
 
 	if err := preflightAddTable(ctx, scoped, rw); err != nil {
 		return err
@@ -390,20 +431,30 @@ func (a *AddTable) validate() error {
 	case a.Source.Capabilities().CDC == ir.CDCNone:
 		return fmt.Errorf("pipeline: add-table: Source engine %q declares CDC=None; mid-stream add-table only applies to CDC sources", a.Source.Name())
 	}
-	return nil
+	// --target-schema is PG-only (ADR-0031, validated by validateTargetSchema
+	// against the target's SchemaScope capability). MySQL operators get a
+	// clear refusal naming the DSN-choice workaround.
+	return validateTargetSchema(a.Target, a.TargetSchema)
 }
 
 // addTablePreflight is the orchestrator-side state captured during
-// the stream pre-flight: the active stream exists, and (in live
-// mode) the active stream's slot confirmed_flush_lsn at the moment
-// publication-add is about to run. The captured LSN feeds the
-// snapshot-LSN ≥ slot-LSN invariant check after the snapshot opens.
+// the stream pre-flight: the active stream exists, the recorded
+// target-schema namespace, and (in live mode) the active stream's
+// slot confirmed_flush_lsn at the moment publication-add is about
+// to run. The captured LSN feeds the snapshot-LSN ≥ slot-LSN
+// invariant check after the snapshot opens.
 //
 // Empty slotConfirmedFlushLSN means "no floor" — either the engine
 // doesn't expose the surface (drained mode), or the slot exists but
 // has not yet acked any consumer progress.
+//
+// resolvedTargetSchema is the post-resolution value to thread into
+// the schema writer / row writer / change applier — either inherited
+// from the recorded value, supplied by the operator, or (when both
+// sides agreed-empty) the empty string for "use the DSN default."
 type addTablePreflight struct {
 	slotConfirmedFlushLSN string
+	resolvedTargetSchema  string
 }
 
 // preflightStream verifies the active stream's row exists on the
@@ -420,6 +471,10 @@ type addTablePreflight struct {
 //  3. the slot's confirmed_flush_lsn is captured (best-effort: an
 //     empty string means "no floor", which the invariant check
 //     accepts).
+//
+// Always resolves the target-schema namespace (Bug 46): inherits
+// the recorded value when the operator omits the flag, refuses on
+// mismatch, accepts agreement.
 //
 // Returns the captured pre-flight state for use later in Run.
 func (a *AddTable) preflightStream(ctx context.Context, applier ir.ChangeApplier) (addTablePreflight, error) {
@@ -442,10 +497,63 @@ func (a *AddTable) preflightStream(ctx context.Context, applier ir.ChangeApplier
 		return addTablePreflight{}, fmt.Errorf("pipeline: add-table: no stream %q on target — verify --stream-id matches the active stream's id (run `sluice sync status` to list streams)", a.StreamID)
 	}
 
-	if a.LiveMode {
-		return a.preflightLive(ctx, status)
+	// Bug 46: reconcile the operator-supplied --target-schema flag
+	// with the active stream's recorded target_schema. Refuses on
+	// mismatch; inherits the recorded value when the flag is empty.
+	resolvedTS, err := resolveAddTableTargetSchema(a.StreamID, a.TargetSchema, status.TargetSchema)
+	if err != nil {
+		return addTablePreflight{}, err
 	}
-	return addTablePreflight{}, a.preflightDrained(ctx, applier)
+
+	if a.LiveMode {
+		live, err := a.preflightLive(ctx, status)
+		if err != nil {
+			return addTablePreflight{}, err
+		}
+		live.resolvedTargetSchema = resolvedTS
+		return live, nil
+	}
+	if err := a.preflightDrained(ctx, applier); err != nil {
+		return addTablePreflight{}, err
+	}
+	return addTablePreflight{resolvedTargetSchema: resolvedTS}, nil
+}
+
+// resolveAddTableTargetSchema reconciles the operator-supplied
+// `--target-schema` flag with the active stream's recorded
+// target_schema. Bug 46 fix: closes both the silent-event-drop
+// failure mode (operator forgets the flag → table lands in `public`
+// while CDC routes to <recorded>) and the ADR-0031 caveat about
+// mid-flight namespace changes (operator passes a different
+// namespace → loud refusal).
+//
+// Resolution table:
+//
+//	flag    recorded   result
+//	-----   --------   ----------------------------------------
+//	""      ""         "" (DSN default, pre-Bug-46 behavior)
+//	""      "X"        "X" (inherit recorded)
+//	"X"     ""         "X" (recorded is legacy/empty, accept)
+//	"X"     "X"        "X" (agreement, proceed)
+//	"X"     "Y"        refuse with mismatch error
+func resolveAddTableTargetSchema(streamID, operatorFlag, recorded string) (string, error) {
+	switch {
+	case operatorFlag == "":
+		// Inherit recorded value (or empty if no record).
+		return recorded, nil
+	case recorded == "":
+		// Operator override; recorded was legacy / empty. Accept the
+		// operator's value — the cdc-state row will be back-filled on
+		// the next position-write after add-table runs.
+		return operatorFlag, nil
+	case operatorFlag == recorded:
+		return operatorFlag, nil
+	default:
+		return "", fmt.Errorf(
+			"pipeline: add-table: --target-schema=%q does not match the active stream's recorded target_schema=%q for stream %q "+
+				"(set --target-schema to match the stream, or omit the flag to inherit the recorded namespace)",
+			operatorFlag, recorded, streamID)
+	}
 }
 
 // preflightDrained applies the Phase 1 conservative refusal: the
@@ -515,6 +623,23 @@ func (a *AddTable) preflightLive(ctx context.Context, status ir.StreamStatus) (a
 		slog.String("confirmed_flush_lsn", lsn),
 	)
 	return addTablePreflight{slotConfirmedFlushLSN: lsn}, nil
+}
+
+// schemaSourceLabel returns a diagnostic tag for the
+// resolveAddTableTargetSchema branch the operator hit — useful when
+// a successful add-table inherits the recorded namespace, so the
+// log line surfaces "did the operator pass the flag?". `operator`
+// when the operator-supplied flag was non-empty (and matched the
+// recorded value, or the recorded value was legacy/empty);
+// `inherited` when the recorded value supplied the resolved name.
+func schemaSourceLabel(operatorFlag, resolved string) string {
+	if operatorFlag != "" {
+		return "operator"
+	}
+	if resolved != "" {
+		return "inherited"
+	}
+	return "default"
 }
 
 // activeSlotName returns the slot name to query for the active
@@ -756,7 +881,7 @@ func (a *AddTable) dropTempSlot(ctx context.Context, slot string) {
 
 // logDryRun describes what Run would do without doing it. Mirrors
 // the shape of logDryRunPlan (streamer.go) and Migrator.logPlan.
-func (a *AddTable) logDryRun(ctx context.Context, scoped *ir.Schema) error {
+func (a *AddTable) logDryRun(ctx context.Context, scoped *ir.Schema, resolvedTargetSchema string) error {
 	if len(scoped.Tables) == 0 {
 		return errors.New("pipeline: add-table: dry-run: scoped schema has no tables; this is a bug")
 	}
@@ -771,6 +896,7 @@ func (a *AddTable) logDryRun(ctx context.Context, scoped *ir.Schema) error {
 		slog.Int("secondary_indexes", len(t.Indexes)),
 		slog.Int("foreign_keys", len(t.ForeignKeys)),
 		slog.Bool("live_mode", a.LiveMode),
+		slog.String("target_schema", resolvedTargetSchema),
 	)
 	if _, ok := a.Source.(publicationAdder); ok {
 		slog.InfoContext(ctx, "dry run: add-table: would extend source publication via ALTER PUBLICATION ... ADD TABLE",

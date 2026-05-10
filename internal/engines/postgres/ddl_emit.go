@@ -13,11 +13,24 @@ import (
 )
 
 // emitOpts carries writer-derived flags that change how a few IR
-// types render — currently just whether the target database has the
-// postgis extension installed. Zero value (no PostGIS) preserves
-// the writer's pre-extension behaviour for all callers.
+// types render — whether the target database has the postgis
+// extension installed, and the schema namespace user-defined types
+// (enums) live in. Zero value (no PostGIS, empty TargetSchema)
+// preserves the writer's pre-extension behaviour for all callers.
+//
+// TargetSchema is the operator-supplied `--target-schema` namespace
+// (ADR-0031). When non-empty, every reference to a user-defined type
+// (today: enums) is qualified with it — both the column-type ident
+// (`"<schema>"."<typname>"`) and the `::cast` suffix on enum DEFAULT
+// expressions. Without this, PG's parser searches the session's
+// `search_path` for the bare type name, which doesn't include the
+// per-source namespace, and CREATE TABLE fails with SQLSTATE 42704
+// "type does not exist" (Bug 45). Empty TargetSchema keeps the
+// pre-ADR-0031 unqualified shape — relies on the type living in
+// `search_path`'s default schema.
 type emitOpts struct {
-	HasPostGIS bool
+	HasPostGIS   bool
+	TargetSchema string
 }
 
 // emitColumnType returns the Postgres DDL fragment for a column type
@@ -360,7 +373,7 @@ func emitColumnDef(table *ir.Table, c *ir.Column, opts emitOpts) (string, error)
 		if c.IsGenerated() {
 			typeStr = "TEXT"
 		} else {
-			typeStr = quoteIdent(enumTypeName(table.Name, c.Name))
+			typeStr = qualifiedEnumTypeRef(opts.TargetSchema, table.Name, c.Name)
 		}
 	} else {
 		var err error
@@ -441,7 +454,7 @@ func emitColumnDef(table *ir.Table, c *ir.Column, opts emitOpts) (string, error)
 		// surfaces the operator-driven gap.
 		if _, isEnum := c.Type.(ir.Enum); isEnum && enumDefaultShouldCast(c.Default, dflt) {
 			sb.WriteString("::")
-			sb.WriteString(quoteIdent(enumTypeName(table.Name, c.Name)))
+			sb.WriteString(qualifiedEnumTypeRef(opts.TargetSchema, table.Name, c.Name))
 		}
 	}
 	return sb.String(), nil
@@ -509,6 +522,30 @@ func enumDefaultShouldCast(d ir.DefaultValue, emitted string) bool {
 // no risk of name collisions or unintended sharing.
 func enumTypeName(tableName, columnName string) string {
 	return tableName + "_" + columnName + "_enum"
+}
+
+// qualifiedEnumTypeRef returns the schema-qualified enum type
+// reference for use as a column type ident or `::cast` suffix.
+//
+// When targetSchema is non-empty, returns `"<schema>"."<typname>"`
+// — required under ADR-0031's `--target-schema=NAME` (Bug 45).
+// PG's parser searches the session's `search_path` for unqualified
+// type idents; per-source schemas (`customer_svc`, `billing_svc`)
+// aren't in `search_path`, so the bare ident fails with SQLSTATE
+// 42704 "type does not exist". The qualifier mirrors what
+// emitCreateEnumType already emits on the type-creation side, so
+// CREATE TABLE / DEFAULT cast resolve to the same type the
+// CREATE TYPE statement just declared.
+//
+// When targetSchema is empty, returns the unqualified ident — the
+// pre-ADR-0031 shape, relying on the type living in `search_path`'s
+// default schema (the DSN's default, typically `public`).
+func qualifiedEnumTypeRef(targetSchema, tableName, columnName string) string {
+	name := enumTypeName(tableName, columnName)
+	if targetSchema == "" {
+		return quoteIdent(name)
+	}
+	return quoteIdent(targetSchema) + "." + quoteIdent(name)
 }
 
 // pgIndexName disambiguates a source-side index name against the

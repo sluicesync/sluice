@@ -709,6 +709,20 @@ type StreamStatus struct {
 	// legacy rows that pre-date the column (treated as "unknown —
 	// allow" by the collision check).
 	SourceDSNFingerprint string
+
+	// TargetSchema is the operator-supplied `--target-schema NAME`
+	// recorded on the per-target sluice_cdc_state row at every
+	// position-write (ADR-0031, Bug 46). Powers the
+	// `sluice schema add-table` resolve-and-refuse path: if the
+	// operator passes `--target-schema` to add-table and it differs
+	// from the recorded value, sluice refuses loudly rather than
+	// landing the new table in a different namespace from where
+	// CDC events are routed (the v0.25.0 silent-event-drop failure
+	// mode). Empty for engines that don't implement the recorder
+	// surface, legacy rows that pre-date the column, and streams
+	// started without `--target-schema` (treated as "use the DSN
+	// default schema").
+	TargetSchema string
 }
 
 // SchemaSetter is the optional surface a [SchemaReader], [SchemaWriter],

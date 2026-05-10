@@ -42,6 +42,15 @@ type SchemaWriter struct {
 	// CreateTablesWithoutConstraints (or PreviewDDL — preview is
 	// idempotent and skips the ensure step).
 	schemaEnsured bool
+	// schemaExplicit records whether [SetSchema] was called with a
+	// non-empty operator-supplied override (`--target-schema NAME`,
+	// ADR-0031). When true, user-defined type idents (enums) emit
+	// fully-qualified `"<schema>"."<typname>"` — required when the
+	// per-source namespace isn't in PG's session `search_path`
+	// (Bug 45). When false, the bare ident emits — preserves the
+	// pre-ADR-0031 shape for default-`public` operators (the type
+	// lands in `public`, which IS in `search_path`).
+	schemaExplicit bool
 }
 
 // SetSchema implements [ir.SchemaSetter]. Called by the pipeline
@@ -63,6 +72,7 @@ func (w *SchemaWriter) SetSchema(name string) {
 		w.schemaEnsured = false
 	}
 	w.schema = name
+	w.schemaExplicit = true
 }
 
 // Close releases the underlying connection pool.
@@ -109,7 +119,7 @@ func (w *SchemaWriter) CreateTablesWithoutConstraints(ctx context.Context, s *ir
 	}
 
 	// Phase 1b: tables.
-	opts := emitOpts{HasPostGIS: w.hasPostGIS}
+	opts := emitOpts{HasPostGIS: w.hasPostGIS, TargetSchema: w.qualifyingSchema()}
 	for _, table := range orderedTables(s) {
 		stmt, err := emitTableDef(w.schema, table, opts)
 		if err != nil {
@@ -290,6 +300,25 @@ func (w *SchemaWriter) syncOneIdentity(ctx context.Context, table *ir.Table, col
 	return nil
 }
 
+// qualifyingSchema returns the schema name to thread into emitOpts
+// for user-defined-type qualification (enums). Returns w.schema only
+// when [SetSchema] was called with an operator override
+// (`--target-schema NAME`, ADR-0031); otherwise returns "" so the
+// emitter falls back to the bare-ident shape that pre-dates Bug 45.
+//
+// The split protects default-public operators from a behaviour
+// change (their CREATE TABLE / column-type idents would suddenly
+// emit `"public"."t_c_enum"` everywhere) while still fixing the
+// load-bearing case: per-source namespaces that aren't in PG's
+// session `search_path` need explicit qualification or CREATE TABLE
+// fails with SQLSTATE 42704.
+func (w *SchemaWriter) qualifyingSchema() string {
+	if !w.schemaExplicit {
+		return ""
+	}
+	return w.schema
+}
+
 // ensureSchema emits `CREATE SCHEMA IF NOT EXISTS` for the writer's
 // configured schema. No-op for the default `public` schema (always
 // exists) and on subsequent calls within the same writer's lifetime
@@ -345,7 +374,7 @@ func (w *SchemaWriter) PreviewDDL(_ context.Context, s *ir.Schema) ([]ir.DDLStat
 	}
 
 	out := make([]ir.DDLStatement, 0, len(s.Tables)*2)
-	opts := emitOpts{HasPostGIS: w.hasPostGIS}
+	opts := emitOpts{HasPostGIS: w.hasPostGIS, TargetSchema: w.qualifyingSchema()}
 
 	// Phase 1a: enum types, in deterministic table+column order.
 	// Generated enum columns are skipped (Bug 25): they emit as TEXT
@@ -468,7 +497,7 @@ func trimTrailingSemicolon(s string) string {
 // verbatim so the operator sees the same diagnostic the actual write
 // path would raise.
 func (w *SchemaWriter) EmitColumnDef(_ context.Context, table *ir.Table, col *ir.Column) (string, error) {
-	return emitColumnDef(table, col, emitOpts{HasPostGIS: w.hasPostGIS})
+	return emitColumnDef(table, col, emitOpts{HasPostGIS: w.hasPostGIS, TargetSchema: w.qualifyingSchema()})
 }
 
 // AlterAddColumn implements [ir.SchemaDeltaApplier] for Postgres. Used
@@ -486,7 +515,7 @@ func (w *SchemaWriter) AlterAddColumn(ctx context.Context, table *ir.Table, cols
 		return nil
 	}
 	for _, col := range cols {
-		def, err := emitColumnDef(table, col, emitOpts{HasPostGIS: w.hasPostGIS})
+		def, err := emitColumnDef(table, col, emitOpts{HasPostGIS: w.hasPostGIS, TargetSchema: w.qualifyingSchema()})
 		if err != nil {
 			return fmt.Errorf("alter add column: emit %q: %w", col.Name, err)
 		}

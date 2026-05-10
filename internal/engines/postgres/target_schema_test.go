@@ -166,3 +166,30 @@ func TestEmitCreateEnumType_QualifiesWithSchema(t *testing.T) {
 		t.Errorf("emitCreateEnumType = %q; want to contain %q", got, wantSubstr)
 	}
 }
+
+// TestChangeApplier_SetTargetSchema (Bug 46) pins the
+// SetTargetSchema mutator's effect on the persisted-on-write field.
+// Idempotent over re-set; empty input is allowed (preserves the
+// row's existing recorded value via writePositionTx's COALESCE).
+func TestChangeApplier_SetTargetSchema(t *testing.T) {
+	a := &ChangeApplier{}
+	a.SetTargetSchema("customer_svc")
+	if a.targetSchema != "customer_svc" {
+		t.Errorf("targetSchema = %q; want customer_svc", a.targetSchema)
+	}
+
+	// Re-set updates the value (warm resume on a new streamer
+	// instance with a different operator-supplied flag).
+	a.SetTargetSchema("billing_svc")
+	if a.targetSchema != "billing_svc" {
+		t.Errorf("targetSchema = %q; want billing_svc after re-set", a.targetSchema)
+	}
+
+	// Empty input is recorded verbatim — the COALESCE-on-conflict
+	// pattern in writePositionTx preserves the row's prior value
+	// when this empty value reaches the SQL layer.
+	a.SetTargetSchema("")
+	if a.targetSchema != "" {
+		t.Errorf("targetSchema = %q; want empty after empty-set", a.targetSchema)
+	}
+}

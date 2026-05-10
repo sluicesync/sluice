@@ -71,6 +71,26 @@ type slotNameSetter interface {
 	SetSlotName(slotName string)
 }
 
+// targetSchemaSetter is the optional applier-side surface for
+// engines that record the operator-supplied `--target-schema NAME`
+// on the per-target control table (Bug 46, ADR-0031). PG implements;
+// MySQL does not (no schema-vs-database distinction; --target-schema
+// is refused upstream for MySQL targets). The streamer calls
+// SetTargetSchema once at startup; the applier threads the value
+// into every subsequent position-write so the sluice_cdc_state row's
+// target_schema column reflects what the streamer is routing CDC
+// events to. `sluice schema add-table` reads the recorded value back
+// to refuse loudly when the operator supplies a mismatched flag, or
+// to inherit the stream's namespace when the flag is omitted.
+//
+// Distinct from [ir.SchemaSetter]: SetSchema mutates the user-data
+// namespace the writer / applier currently writes into;
+// SetTargetSchema records the operator's stated intent so a future
+// command can detect a mismatch.
+type targetSchemaSetter interface {
+	SetTargetSchema(name string)
+}
+
 // Streamer is the long-running orchestrator: it captures a consistent
 // source snapshot (cold start) or resumes from a previously-persisted
 // position (warm resume), runs the bulk-copy phase if needed, then
@@ -423,6 +443,17 @@ func (s *Streamer) Run(ctx context.Context) error {
 	if !s.DryRun {
 		if setter, ok := applier.(slotNameSetter); ok {
 			setter.SetSlotName(s.SlotName)
+		}
+		// Record the operator-supplied `--target-schema NAME` (Bug 46,
+		// ADR-0031) on the applier so subsequent position-writes
+		// populate the sluice_cdc_state row's target_schema column.
+		// `sluice schema add-table` reads the column back to detect a
+		// mismatch between operator-supplied flag and active stream's
+		// recorded namespace. Engines without schema-vs-database
+		// distinction (MySQL) don't implement; the validate gate
+		// already refused --target-schema upstream for those engines.
+		if setter, ok := applier.(targetSchemaSetter); ok {
+			setter.SetTargetSchema(s.TargetSchema)
 		}
 	}
 

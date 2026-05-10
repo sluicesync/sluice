@@ -597,6 +597,102 @@ func TestEmitTableDef(t *testing.T) {
 	}
 }
 
+// Bug 45 (v0.25.1): when `--target-schema=NAME` is set on a PG
+// target, the column-type ident and the `::cast` suffix on enum
+// DEFAULT expressions must both be schema-qualified — the bare
+// ident relies on `search_path` which doesn't include per-source
+// namespaces, and CREATE TABLE fails with SQLSTATE 42704 "type does
+// not exist". Verifies emitColumnDef + emitTableDef produce
+// `"customer_svc"."t_c_enum"` shape under non-empty TargetSchema.
+func TestEmitColumnDef_TargetSchemaQualifiesEnumIdentAndCast(t *testing.T) {
+	tbl := &ir.Table{Name: "orders"}
+	col := &ir.Column{
+		Name:    "status",
+		Type:    ir.Enum{Values: []string{"pending", "paid", "shipped"}},
+		Default: ir.DefaultLiteral{Value: "pending"},
+	}
+	got, err := emitColumnDef(tbl, col, emitOpts{TargetSchema: "customer_svc"})
+	if err != nil {
+		t.Fatalf("emitColumnDef: %v", err)
+	}
+	want := `"status" "customer_svc"."orders_status_enum" NOT NULL DEFAULT 'pending'::"customer_svc"."orders_status_enum"`
+	if got != want {
+		t.Errorf("\n got  %q\n want %q", got, want)
+	}
+}
+
+// TestEmitColumnDef_NoTargetSchemaPreservesUnqualifiedShape pins
+// the pre-Bug-45 shape: when TargetSchema is empty, enum idents and
+// casts emit unqualified — the type lives in the DSN's default
+// schema (typically `public`) which is in `search_path`, so the
+// bare ident resolves correctly.
+func TestEmitColumnDef_NoTargetSchemaPreservesUnqualifiedShape(t *testing.T) {
+	tbl := &ir.Table{Name: "orders"}
+	col := &ir.Column{
+		Name:    "status",
+		Type:    ir.Enum{Values: []string{"pending", "paid"}},
+		Default: ir.DefaultLiteral{Value: "pending"},
+	}
+	got, err := emitColumnDef(tbl, col, emitOpts{})
+	if err != nil {
+		t.Fatalf("emitColumnDef: %v", err)
+	}
+	want := `"status" "orders_status_enum" NOT NULL DEFAULT 'pending'::"orders_status_enum"`
+	if got != want {
+		t.Errorf("\n got  %q\n want %q", got, want)
+	}
+}
+
+// TestEmitTableDef_TargetSchemaQualifiesEnumColumnAndCast asserts
+// the full CREATE TABLE statement under --target-schema carries
+// schema-qualified type idents inside the column list — the
+// load-bearing shape from BUG-CATALOG Bug 45's repro section.
+func TestEmitTableDef_TargetSchemaQualifiesEnumColumnAndCast(t *testing.T) {
+	tbl := &ir.Table{
+		Name: "orders",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64, AutoIncrement: true}},
+			{
+				Name:    "status",
+				Type:    ir.Enum{Values: []string{"pending", "paid", "shipped"}},
+				Default: ir.DefaultLiteral{Value: "pending"},
+			},
+		},
+		PrimaryKey: &ir.Index{
+			Name:    "orders_pkey",
+			Unique:  true,
+			Columns: []ir.IndexColumn{{Column: "id"}},
+		},
+	}
+	got, err := emitTableDef("customer_svc", tbl, emitOpts{TargetSchema: "customer_svc"})
+	if err != nil {
+		t.Fatalf("emitTableDef: %v", err)
+	}
+	wants := []string{
+		`CREATE TABLE IF NOT EXISTS "customer_svc"."orders" (`,
+		`"status" "customer_svc"."orders_status_enum" NOT NULL DEFAULT 'pending'::"customer_svc"."orders_status_enum"`,
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("output missing %q; got:\n%s", w, got)
+		}
+	}
+}
+
+// TestSchemaWriter_QualifyingSchema_TogglesOnSetSchema verifies the
+// schema_writer's qualifyingSchema policy: bare ident before
+// SetSchema, schema-qualified after the operator-supplied override.
+func TestSchemaWriter_QualifyingSchema_TogglesOnSetSchema(t *testing.T) {
+	w := &SchemaWriter{schema: "public"}
+	if got := w.qualifyingSchema(); got != "" {
+		t.Errorf("qualifyingSchema() before SetSchema = %q; want empty (default-public preserves bare ident)", got)
+	}
+	w.SetSchema("customer_svc")
+	if got := w.qualifyingSchema(); got != "customer_svc" {
+		t.Errorf("qualifyingSchema() after SetSchema = %q; want customer_svc", got)
+	}
+}
+
 func TestEmitCreateIndex(t *testing.T) {
 	cases := []struct {
 		name string

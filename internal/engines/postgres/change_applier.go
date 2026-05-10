@@ -115,6 +115,26 @@ type ChangeApplier struct {
 	// (legacy / engine-not-supported / pre-streamer chain handoff).
 	sourceFingerprint string
 
+	// targetSchema is the operator-supplied `--target-schema NAME`
+	// recorded by [SetTargetSchema] at Streamer startup
+	// (ADR-0031, Bug 46). Threaded into every [writePositionTx] call
+	// so the per-target sluice_cdc_state row's target_schema column
+	// stays in sync with what the streamer is routing CDC events
+	// to. `sluice schema add-table` reads this column back to resolve
+	// the active stream's target-schema namespace and refuse a
+	// mismatch loudly (the v0.25.0 silent-event-drop failure mode).
+	// Empty preserves the row's existing value (streams started
+	// without --target-schema, legacy rows, chain-handoff
+	// WritePosition without streamer context).
+	//
+	// Distinct from a.schema: a.schema is the user-data namespace
+	// the applier currently writes into; targetSchema records the
+	// operator's intent so a mismatch can be detected. With the same
+	// engine running in both modes (initial start + later add-table)
+	// the values agree, but the recorded column is the canonical
+	// resume signal.
+	targetSchema string
+
 	// pkCache maps "schema.table" → ordered list of PK column names.
 	// Populated lazily via a single information_schema query the
 	// first time a change for the table arrives. An empty slice
@@ -318,7 +338,7 @@ func (a *ChangeApplier) WritePosition(ctx context.Context, streamID string, pos 
 	if err != nil {
 		return fmt.Errorf("postgres: applier: WritePosition: begin tx: %w", err)
 	}
-	if err := writePositionTx(ctx, tx, a.controlSchema, streamID, pos.Token, a.slotName, a.sourceFingerprint); err != nil {
+	if err := writePositionTx(ctx, tx, a.controlSchema, streamID, pos.Token, a.slotName, a.sourceFingerprint, a.targetSchema); err != nil {
 		_ = tx.Rollback()
 		return err
 	}
@@ -371,6 +391,28 @@ func (a *ChangeApplier) SetSchema(name string) {
 // in that case.
 func (a *ChangeApplier) SetSourceDSNFingerprint(fingerprint string) {
 	a.sourceFingerprint = fingerprint
+}
+
+// SetTargetSchema records the operator-supplied `--target-schema NAME`
+// (ADR-0031, Bug 46) so subsequent position-writes populate the
+// sluice_cdc_state row's target_schema column. Idempotent; the
+// streamer may call this on every Run.
+//
+// Empty input is allowed (no-op preservation of an existing recorded
+// value via the COALESCE in writePositionTx) and reflects the
+// pre-flag case (legacy / streams started without --target-schema /
+// direct WritePosition from the broker without a streamer). The
+// COALESCE pattern in writePositionTx preserves any
+// previously-recorded value in that case.
+//
+// Distinct from [SetSchema]: SetSchema mutates the user-data
+// namespace the applier writes into (a.schema); SetTargetSchema
+// records the operator's stated intent (a.targetSchema) so a
+// subsequent `sluice schema add-table` can detect a mismatch
+// between the operator-supplied flag and the active stream's
+// recorded namespace.
+func (a *ChangeApplier) SetTargetSchema(name string) {
+	a.targetSchema = name
 }
 
 // Apply consumes changes from the channel and applies each to the
@@ -427,7 +469,7 @@ func (a *ChangeApplier) applyOne(ctx context.Context, streamID string, c ir.Chan
 		return err
 	}
 	token := c.Pos().Token
-	if err := writePositionTx(ctx, tx, a.controlSchema, streamID, token, a.slotName, a.sourceFingerprint); err != nil {
+	if err := writePositionTx(ctx, tx, a.controlSchema, streamID, token, a.slotName, a.sourceFingerprint, a.targetSchema); err != nil {
 		_ = tx.Rollback()
 		return err
 	}

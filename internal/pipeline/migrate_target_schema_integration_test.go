@@ -364,6 +364,104 @@ func TestStreamer_PG_StreamIDCollisionRefused(t *testing.T) {
 	}
 }
 
+// TestMigrate_PG_TargetSchema_EnumColumn is the Bug 45 (v0.25.1)
+// regression test: --target-schema against a PG source containing an
+// enum-typed column with a literal DEFAULT must produce a schema-
+// qualified type ident in CREATE TABLE and a schema-qualified
+// `::cast` in the column DEFAULT. Pre-fix, the bare ident landed in
+// CREATE TABLE and PG rejected with SQLSTATE 42704 "type does not
+// exist" because the per-source namespace isn't in `search_path`.
+func TestMigrate_PG_TargetSchema_EnumColumn(t *testing.T) {
+	sourceDSN, targetDSN, cleanup := startPostgres(t)
+	defer cleanup()
+
+	const seedDDL = `
+		CREATE TYPE order_status AS ENUM ('pending','paid','shipped');
+		CREATE TABLE orders (
+			id     BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+			status order_status   NOT NULL DEFAULT 'pending',
+			total  NUMERIC(10,2)  NOT NULL
+		);
+		INSERT INTO orders (status, total) VALUES
+			('pending', 9.99),
+			('paid',    19.99),
+			('shipped', 29.99);
+	`
+	applyPGDDL(t, sourceDSN, seedDDL)
+
+	pgEng, ok := engines.Get("postgres")
+	if !ok {
+		t.Fatal("postgres engine not registered")
+	}
+
+	mig := &Migrator{
+		Source:       pgEng,
+		Target:       pgEng,
+		SourceDSN:    sourceDSN,
+		TargetDSN:    targetDSN,
+		TargetSchema: "customer_svc",
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	if err := mig.Run(ctx); err != nil {
+		t.Fatalf("Migrator.Run with --target-schema and enum column: %v", err)
+	}
+
+	db, err := sql.Open("pgx", targetDSN)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	// Bulk-copied rows landed.
+	var count int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM customer_svc.orders`).Scan(&count); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if count != 3 {
+		t.Errorf("customer_svc.orders count = %d; want 3", count)
+	}
+
+	// The enum type lives in the per-source namespace.
+	var typExists bool
+	if err := db.QueryRowContext(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM   pg_type t
+			JOIN   pg_namespace n ON n.oid = t.typnamespace
+			WHERE  n.nspname = 'customer_svc'
+			  AND  t.typname = 'orders_status_enum'
+		)`).Scan(&typExists); err != nil {
+		t.Fatalf("query enum type: %v", err)
+	}
+	if !typExists {
+		t.Error("customer_svc.orders_status_enum does not exist; CREATE TYPE didn't qualify")
+	}
+
+	// The column references the qualified type — INSERT against the
+	// enum column with the DEFAULT must round-trip cleanly. This is
+	// the load-bearing assertion: pre-fix, this INSERT crashes with
+	// SQLSTATE 42704 because the column-type ident wasn't qualified
+	// and the DEFAULT cast pointed at a bare type that search_path
+	// can't resolve.
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO customer_svc.orders (total) VALUES (49.99)`,
+	); err != nil {
+		t.Fatalf("INSERT into customer_svc.orders (with default 'pending'::enum cast): %v", err)
+	}
+
+	// The DEFAULT fired and produced the canonical 'pending' enum
+	// value via the qualified cast.
+	var status string
+	if err := db.QueryRowContext(ctx,
+		`SELECT status::TEXT FROM customer_svc.orders WHERE total = 49.99`).Scan(&status); err != nil {
+		t.Fatalf("read status: %v", err)
+	}
+	if status != "pending" {
+		t.Errorf("status = %q; want pending (DEFAULT cast)", status)
+	}
+}
+
 // mustCreateDatabase creates an additional database on the
 // container's PG instance, returning a DSN pointing at it. Used by
 // the multi-source tests to simulate two distinct source DBs sharing

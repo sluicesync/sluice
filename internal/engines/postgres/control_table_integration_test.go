@@ -21,6 +21,8 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"github.com/orware/sluice/internal/ir"
 )
 
 // TestEnsureControlTable_AddsStopRequestedColumn verifies the
@@ -144,7 +146,7 @@ func TestRequestStop_RoundTrips(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
-	if err := writePositionTx(ctx, tx, "public", "test-stream", "tok", "", ""); err != nil {
+	if err := writePositionTx(ctx, tx, "public", "test-stream", "tok", "", "", ""); err != nil {
 		t.Fatalf("writePositionTx: %v", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -209,5 +211,204 @@ func TestRequestStop_UnknownStreamReturnsSentinel(t *testing.T) {
 	}
 	if !errors.Is(err, errStreamNotFound) {
 		t.Errorf("RequestStop unknown: err = %v; want errors.Is errStreamNotFound", err)
+	}
+}
+
+// TestEnsureControlTable_AddsTargetSchemaColumn verifies the Bug 46
+// migration path: a v0.25.0-shape control table without target_schema
+// picks up the column on the next EnsureControlTable call without
+// losing existing rows. Mirrors the v0.24.0 slot_name and v0.25.0
+// source_dsn_fingerprint migrations.
+func TestEnsureControlTable_AddsTargetSchemaColumn(t *testing.T) {
+	dsn, cleanup := startPostgresForApplier(t)
+	defer cleanup()
+
+	// Pre-Bug-46 shape: no target_schema column. Includes all columns
+	// added prior to v0.25.1 so the migration arm-by-arm test pins the
+	// new column ADD without colliding with the older alters.
+	applyPGApplier(t, dsn, `
+		CREATE TABLE "public"."sluice_cdc_state" (
+			stream_id              VARCHAR(255) NOT NULL,
+			source_position        TEXT         NOT NULL,
+			updated_at             TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			stop_requested_at      TIMESTAMP    NULL,
+			slot_name              TEXT         NULL,
+			source_dsn_fingerprint TEXT         NULL,
+			PRIMARY KEY (stream_id)
+		);
+		INSERT INTO "public"."sluice_cdc_state"
+			(stream_id, source_position, slot_name, source_dsn_fingerprint)
+		VALUES ('legacy-stream', 'legacy-token', 'sluice_slot', 'abcd1234ef56');
+	`)
+
+	eng := Engine{}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	applier, err := eng.OpenChangeApplier(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenChangeApplier: %v", err)
+	}
+	defer func() {
+		if c, ok := applier.(interface{ Close() error }); ok {
+			_ = c.Close()
+		}
+	}()
+
+	if err := applier.EnsureControlTable(ctx); err != nil {
+		t.Fatalf("EnsureControlTable: %v", err)
+	}
+
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	var n int
+	if err := db.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM   information_schema.columns
+		WHERE  table_schema = 'public'
+		  AND  table_name   = 'sluice_cdc_state'
+		  AND  column_name  = 'target_schema'
+	`).Scan(&n); err != nil {
+		t.Fatalf("column lookup: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("target_schema column missing after EnsureControlTable; count = %d", n)
+	}
+
+	// Existing row still there with its prior values intact;
+	// target_schema starts NULL on the freshly-migrated row.
+	var (
+		token       string
+		slot        sql.NullString
+		fingerprint sql.NullString
+		ts          sql.NullString
+	)
+	if err := db.QueryRowContext(ctx,
+		`SELECT source_position, slot_name, source_dsn_fingerprint, target_schema
+		 FROM   "public"."sluice_cdc_state" WHERE stream_id = $1`,
+		"legacy-stream",
+	).Scan(&token, &slot, &fingerprint, &ts); err != nil {
+		t.Fatalf("legacy row select: %v", err)
+	}
+	if token != "legacy-token" {
+		t.Errorf("legacy token = %q; want %q", token, "legacy-token")
+	}
+	if !slot.Valid || slot.String != "sluice_slot" {
+		t.Errorf("slot = %v; want sluice_slot", slot)
+	}
+	if !fingerprint.Valid || fingerprint.String != "abcd1234ef56" {
+		t.Errorf("fingerprint = %v; want abcd1234ef56", fingerprint)
+	}
+	if ts.Valid {
+		t.Errorf("target_schema on freshly-migrated row should be NULL; got %q", ts.String)
+	}
+
+	// Calling EnsureControlTable again is still a no-op (idempotent).
+	if err := applier.EnsureControlTable(ctx); err != nil {
+		t.Fatalf("second EnsureControlTable: %v", err)
+	}
+}
+
+// TestWritePositionTx_TargetSchemaRoundTrip verifies the Bug 46
+// round-trip: writePositionTx upserts target_schema; listStreams
+// returns it via StreamStatus; SetTargetSchema controls the persisted
+// value. Empty inputs preserve the existing recorded value (the
+// chain-handoff / pre-Bug-46 case) via the COALESCE-on-conflict
+// pattern.
+func TestWritePositionTx_TargetSchemaRoundTrip(t *testing.T) {
+	dsn, cleanup := startPostgresForApplier(t)
+	defer cleanup()
+
+	eng := Engine{}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	applier, err := eng.OpenChangeApplier(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenChangeApplier: %v", err)
+	}
+	defer func() {
+		if c, ok := applier.(interface{ Close() error }); ok {
+			_ = c.Close()
+		}
+	}()
+	if err := applier.EnsureControlTable(ctx); err != nil {
+		t.Fatalf("EnsureControlTable: %v", err)
+	}
+
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	// First write: includes target_schema=customer_svc.
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if err := writePositionTx(ctx, tx, "public", "stream-a", "tok-1", "sluice_a", "fp-a", "customer_svc"); err != nil {
+		t.Fatalf("first writePositionTx: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit 1: %v", err)
+	}
+
+	streams, err := applier.ListStreams(ctx)
+	if err != nil {
+		t.Fatalf("ListStreams: %v", err)
+	}
+	if len(streams) != 1 {
+		t.Fatalf("ListStreams returned %d rows; want 1", len(streams))
+	}
+	if streams[0].TargetSchema != "customer_svc" {
+		t.Errorf("StreamStatus.TargetSchema = %q; want customer_svc", streams[0].TargetSchema)
+	}
+
+	// Second write with empty target_schema (chain-handoff /
+	// pre-streamer WritePosition): COALESCE preserves the prior
+	// recorded value rather than clobbering it to NULL.
+	tx, err = db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin 2: %v", err)
+	}
+	if err := writePositionTx(ctx, tx, "public", "stream-a", "tok-2", "", "", ""); err != nil {
+		t.Fatalf("second writePositionTx: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit 2: %v", err)
+	}
+	streams, err = applier.ListStreams(ctx)
+	if err != nil {
+		t.Fatalf("second ListStreams: %v", err)
+	}
+	if streams[0].TargetSchema != "customer_svc" {
+		t.Errorf("after empty-update, TargetSchema = %q; want preserved customer_svc", streams[0].TargetSchema)
+	}
+
+	// SetTargetSchema on the applier propagates through Apply-path
+	// position writes (here exercised via WritePosition, the same
+	// helper).
+	pgApplier := applier.(*ChangeApplier)
+	pgApplier.SetTargetSchema("billing_svc")
+	if err := pgApplier.WritePosition(ctx, "stream-b", ir.Position{Token: "tok-b"}); err != nil {
+		t.Fatalf("WritePosition: %v", err)
+	}
+	streams, err = applier.ListStreams(ctx)
+	if err != nil {
+		t.Fatalf("ListStreams after SetTargetSchema: %v", err)
+	}
+	var bSchema string
+	for _, s := range streams {
+		if s.StreamID == "stream-b" {
+			bSchema = s.TargetSchema
+		}
+	}
+	if bSchema != "billing_svc" {
+		t.Errorf("stream-b TargetSchema = %q; want billing_svc", bSchema)
 	}
 }

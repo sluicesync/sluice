@@ -60,6 +60,8 @@ type SchemaAddTableCmd struct {
 
 	NoDrain bool `help:"Phase 2 live add: run add-table against an actively-streaming sync without first running 'sync stop --wait'. PG-only in this release; MySQL sources still require the drained workflow. See ADR-0030 for the correctness story." name:"no-drain"`
 
+	TargetSchema string `help:"Per-source target schema namespace (Postgres-only). Must match the active stream's --target-schema, or be omitted to inherit the recorded value (Bug 46 / ADR-0031). When the active stream was started with --target-schema=NAME, the new table lands in NAME (rather than 'public') so CDC events the active stream's applier routes to NAME.<table> arrive at a real table. Mismatch (operator-supplied flag differs from recorded) refuses loudly. MySQL operators use a different --target DSN database instead." placeholder:"NAME"`
+
 	DryRun bool `help:"Print the plan (which table, source publication update, target DDL summary) without modifying the source publication, target schema, or capturing a snapshot." short:"n"`
 	Yes    bool `help:"Skip the typed-confirmation prompt." short:"y"`
 }
@@ -126,6 +128,7 @@ func (s *SchemaAddTableCmd) Run(g *Globals) error {
 		SlotName:           s.SlotName,
 		DryRun:             s.DryRun,
 		LiveMode:           s.NoDrain,
+		TargetSchema:       s.TargetSchema,
 	}
 	return add.Run(kongContext())
 }

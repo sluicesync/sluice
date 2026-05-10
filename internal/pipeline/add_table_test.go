@@ -720,6 +720,19 @@ func (e *addTableTargetEngine) OpenRowWriter(_ context.Context, _ string) (ir.Ro
 type fakeApplier struct {
 	streams       []ir.StreamStatus
 	stopRequested bool
+
+	// targetSchemaCalls captures the value the orchestrator passed to
+	// SetSchema (Bug 46) so tests assert the resolved namespace
+	// reached the applier post-resolution.
+	targetSchemaCalls string
+}
+
+// SetSchema implements [ir.SchemaSetter] so add-table's
+// applyTargetSchema(applier, ...) call lands a non-empty
+// targetSchemaCalls value when the orchestrator threads through a
+// resolved namespace (Bug 46).
+func (f *fakeApplier) SetSchema(name string) {
+	f.targetSchemaCalls = name
 }
 
 func (f *fakeApplier) EnsureControlTable(context.Context) error { return nil }
@@ -796,4 +809,204 @@ func (cdcNoneEngine) OpenChangeApplier(context.Context, string) (ir.ChangeApplie
 
 func (cdcNoneEngine) OpenSnapshotStream(context.Context, string) (*ir.SnapshotStream, error) {
 	panic("not used")
+}
+
+// addTableNamespacedTargetEngine wraps an addTableTargetEngine with
+// SchemaScope=Namespaced so validateTargetSchema accepts the
+// --target-schema flag in Bug 46's resolution tests. The default
+// recordingEngine declares Flat (zero-value Capabilities), which the
+// validate-time gate refuses upstream.
+type addTableNamespacedTargetEngine struct {
+	*addTableTargetEngine
+}
+
+func newAddTableNamespacedTargetEngine(name string) *addTableNamespacedTargetEngine {
+	return &addTableNamespacedTargetEngine{addTableTargetEngine: newAddTableTargetEngine(name)}
+}
+
+func (e *addTableNamespacedTargetEngine) Capabilities() ir.Capabilities {
+	return ir.Capabilities{SchemaScope: ir.SchemaScopeNamespaced}
+}
+
+// ---- Bug 46 (v0.25.1) target-schema resolution tests ----
+
+// TestAddTable_TargetSchema_FieldRoundTrip pins the field's presence
+// on the orchestrator struct. A typo or rename here would silently
+// disable Bug 46's resolve-and-refuse path because the CLI passes
+// the value through.
+func TestAddTable_TargetSchema_FieldRoundTrip(t *testing.T) {
+	a := &AddTable{TargetSchema: "customer_svc"}
+	if a.TargetSchema != "customer_svc" {
+		t.Errorf("TargetSchema round-trip = %q; want customer_svc", a.TargetSchema)
+	}
+}
+
+// TestResolveAddTableTargetSchema covers the resolution table from
+// resolveAddTableTargetSchema's doc comment: empty/empty, empty/X,
+// X/empty, X/X, X/Y. The Y mismatch is the load-bearing refusal —
+// it closes the v0.25.0 silent-event-drop failure mode.
+func TestResolveAddTableTargetSchema(t *testing.T) {
+	cases := []struct {
+		name        string
+		operator    string
+		recorded    string
+		want        string
+		wantErr     bool
+		errContains string
+	}{
+		{"both empty (DSN default)", "", "", "", false, ""},
+		{"inherit recorded", "", "customer_svc", "customer_svc", false, ""},
+		{"operator override on legacy/empty recorded", "customer_svc", "", "customer_svc", false, ""},
+		{"agreement on non-empty", "customer_svc", "customer_svc", "customer_svc", false, ""},
+		{"mismatch refuses", "customer_svc", "billing_svc", "", true, "does not match the active stream's recorded target_schema"},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			got, err := resolveAddTableTargetSchema("live", c.operator, c.recorded)
+			if c.wantErr {
+				if err == nil {
+					t.Fatalf("expected error containing %q; got nil", c.errContains)
+				}
+				if !strings.Contains(err.Error(), c.errContains) {
+					t.Errorf("err = %v; want contains %q", err, c.errContains)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != c.want {
+				t.Errorf("got = %q; want %q", got, c.want)
+			}
+		})
+	}
+}
+
+// TestAddTable_TargetSchemaInheritsRecorded confirms add-table with
+// no operator-supplied --target-schema flag inherits the recorded
+// value from cdc-state and threads it into the schema/row writer.
+// Closes Bug 46's primary failure mode: operator forgets the flag,
+// table lands in `public`, CDC events drop silently.
+func TestAddTable_TargetSchemaInheritsRecorded(t *testing.T) {
+	src := newAddTableSourceEngine("source")
+	src.schema = &ir.Schema{Tables: []*ir.Table{
+		{Name: "new_table", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}},
+	}}
+	tgt := newAddTableNamespacedTargetEngine("target")
+	// Active stream recorded target_schema=customer_svc.
+	tgt.applier.streams = []ir.StreamStatus{
+		{StreamID: "live", TargetSchema: "customer_svc"},
+	}
+	tgt.rowWriter.empty = true
+
+	a := &AddTable{
+		Source: src, Target: tgt,
+		SourceDSN: "src", TargetDSN: "tgt",
+		StreamID: "live", TableName: "new_table",
+		// TargetSchema flag deliberately empty → inherit.
+	}
+	if err := a.Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	// The schema-setter on each writer should have been called with
+	// the inherited "customer_svc". The recordingSchemaWriter and
+	// recordingRowWriterEmpty don't implement SchemaSetter (no need
+	// for them), so the type-assert in applyTargetSchema is a no-op
+	// here. The fakeApplier's TargetSchemaCalls counter is the
+	// asserting surface: it implements SchemaSetter so we can confirm
+	// the inherited value reached the applier.
+	if got := tgt.applier.targetSchemaCalls; got != "customer_svc" {
+		t.Errorf("applier.SetSchema called with %q; want customer_svc (inherited from cdc-state)", got)
+	}
+}
+
+// TestAddTable_TargetSchemaMismatchRefuses confirms add-table refuses
+// loudly when the operator passes --target-schema=X but the active
+// stream's recorded target_schema=Y. ADR-0031 mid-flight namespace
+// change detection (now CLOSED via Bug 46's fix).
+func TestAddTable_TargetSchemaMismatchRefuses(t *testing.T) {
+	src := newAddTableSourceEngine("source")
+	src.schema = &ir.Schema{Tables: []*ir.Table{
+		{Name: "new_table", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}},
+	}}
+	tgt := newAddTableNamespacedTargetEngine("target")
+	tgt.applier.streams = []ir.StreamStatus{
+		{StreamID: "live", TargetSchema: "customer_svc"},
+	}
+
+	a := &AddTable{
+		Source: src, Target: tgt,
+		SourceDSN: "src", TargetDSN: "tgt",
+		StreamID: "live", TableName: "new_table",
+		TargetSchema: "billing_svc", // differs from recorded
+	}
+	err := a.Run(context.Background())
+	if err == nil {
+		t.Fatal("expected mismatch refusal; got nil")
+	}
+	if !strings.Contains(err.Error(), `--target-schema="billing_svc" does not match`) {
+		t.Errorf("err = %v; want a target-schema-mismatch message", err)
+	}
+	// No I/O should have been attempted post-refusal.
+	if src.snapshotCalls != 0 {
+		t.Errorf("snapshot opens after refusal = %d; want 0", src.snapshotCalls)
+	}
+}
+
+// TestAddTable_TargetSchemaAgreementProceeds confirms that operator
+// flag + recorded value matching is not a refusal, just a regular
+// proceed-with-resolved-namespace.
+func TestAddTable_TargetSchemaAgreementProceeds(t *testing.T) {
+	src := newAddTableSourceEngine("source")
+	src.schema = &ir.Schema{Tables: []*ir.Table{
+		{Name: "new_table", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}},
+	}}
+	tgt := newAddTableNamespacedTargetEngine("target")
+	tgt.applier.streams = []ir.StreamStatus{
+		{StreamID: "live", TargetSchema: "customer_svc"},
+	}
+
+	a := &AddTable{
+		Source: src, Target: tgt,
+		SourceDSN: "src", TargetDSN: "tgt",
+		StreamID: "live", TableName: "new_table",
+		TargetSchema: "customer_svc", // matches recorded
+	}
+	if err := a.Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got := tgt.applier.targetSchemaCalls; got != "customer_svc" {
+		t.Errorf("applier.SetSchema called with %q; want customer_svc", got)
+	}
+}
+
+// TestAddTable_TargetSchemaLegacyRecordedAcceptsOperatorOverride
+// covers the migration scenario: a stream started under v0.25.0
+// (before Bug 46's fix) has NULL target_schema. An operator running
+// add-table on v0.25.1+ with --target-schema=NAME should be allowed
+// to back-fill the namespace rather than refused.
+func TestAddTable_TargetSchemaLegacyRecordedAcceptsOperatorOverride(t *testing.T) {
+	src := newAddTableSourceEngine("source")
+	src.schema = &ir.Schema{Tables: []*ir.Table{
+		{Name: "new_table", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}},
+	}}
+	tgt := newAddTableNamespacedTargetEngine("target")
+	// Legacy row: TargetSchema empty (pre-Bug-46 stream).
+	tgt.applier.streams = []ir.StreamStatus{
+		{StreamID: "live", TargetSchema: ""},
+	}
+
+	a := &AddTable{
+		Source: src, Target: tgt,
+		SourceDSN: "src", TargetDSN: "tgt",
+		StreamID: "live", TableName: "new_table",
+		TargetSchema: "customer_svc",
+	}
+	if err := a.Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got := tgt.applier.targetSchemaCalls; got != "customer_svc" {
+		t.Errorf("applier.SetSchema called with %q; want customer_svc (operator-supplied override)", got)
+	}
 }
