@@ -264,7 +264,7 @@ func TestApplyTargetSchema(t *testing.T) {
 		}
 	})
 
-	t.Run("non-setter target is silently passed through", func(t *testing.T) {
+	t.Run("non-setter target is silently passed through", func(_ *testing.T) {
 		// A bare struct without SetSchema. The helper must not panic
 		// (engines that don't implement the optional surface degrade
 		// gracefully — same shape as MaxBufferBytesSetter).

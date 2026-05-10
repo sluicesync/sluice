@@ -417,14 +417,27 @@ func TestMarkFailedJoinsStateError(t *testing.T) {
 // stable, length-bounded ID for the same source/target host pair
 // and a different ID for a different pair.
 func TestDeriveMigrationID(t *testing.T) {
-	a := deriveMigrationID("mysql", "user:pw@tcp(prod-1:3306)/db", "postgres", "postgres://u:p@warehouse:5432/db")
-	b := deriveMigrationID("mysql", "user:pw@tcp(prod-1:3306)/db", "postgres", "postgres://u:p@warehouse:5432/db")
-	c := deriveMigrationID("mysql", "user:pw@tcp(prod-2:3306)/db", "postgres", "postgres://u:p@warehouse:5432/db")
+	a := deriveMigrationID("mysql", "user:pw@tcp(prod-1:3306)/db", "postgres", "postgres://u:p@warehouse:5432/db", "")
+	b := deriveMigrationID("mysql", "user:pw@tcp(prod-1:3306)/db", "postgres", "postgres://u:p@warehouse:5432/db", "")
+	c := deriveMigrationID("mysql", "user:pw@tcp(prod-2:3306)/db", "postgres", "postgres://u:p@warehouse:5432/db", "")
+	// v0.25.0 added targetSchema as a discriminator: same hosts +
+	// different --target-schema must produce distinct IDs so the
+	// multi-source-aggregation pattern (one operator runs N
+	// migrations against the same target with different
+	// --target-schema values) doesn't collide on auto-derived IDs.
+	d := deriveMigrationID("mysql", "user:pw@tcp(prod-1:3306)/db", "postgres", "postgres://u:p@warehouse:5432/db", "customer_svc")
+	e := deriveMigrationID("mysql", "user:pw@tcp(prod-1:3306)/db", "postgres", "postgres://u:p@warehouse:5432/db", "billing_svc")
 	if a != b {
 		t.Errorf("same input produced different IDs: %q vs %q", a, b)
 	}
 	if a == c {
 		t.Errorf("different host pair produced identical IDs: %q", a)
+	}
+	if a == d {
+		t.Errorf("--target-schema discriminator failed: %q matched no-schema baseline", d)
+	}
+	if d == e {
+		t.Errorf("different --target-schema produced identical IDs: %q", d)
 	}
 	if !strings.HasPrefix(a, "auto-") {
 		t.Errorf("derived ID does not start with 'auto-': %q", a)

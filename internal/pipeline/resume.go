@@ -115,19 +115,46 @@ func openMigrationStateStore(ctx context.Context, target ir.Engine, dsn, targetS
 }
 
 // deriveMigrationID auto-generates a stable migration_id from
-// source/target engine names plus DSN host info. Mirrors
-// Streamer.resolveStreamID's approach: stable across restarts on the
-// same host pair, distinct for any host change, length-bounded for
-// the VARCHAR(255) PK.
+// source/target engine names plus DSN host info plus the operator-
+// supplied target schema. Mirrors Streamer.resolveStreamID's approach:
+// stable across restarts on the same (host pair, target schema),
+// distinct for any change in any of those, length-bounded for the
+// VARCHAR(255) PK.
+//
+// `targetSchema` is included in the hash so v0.25.0's multi-source
+// pattern (`sluice migrate --target-schema=customer_svc` then again
+// with `--target-schema=billing_svc` against the same target host)
+// produces distinct migration ids per stream — without this each
+// auto-derived id would collide on the second invocation, the
+// "migration already complete" guard would fire, and the operator
+// would have to manually supply --migration-id every time. Empty
+// targetSchema (the pre-v0.25.0 default behavior) hashes the same way
+// as before — operators not using --target-schema see no auto-derived
+// id change after upgrade.
+//
+// Note: source-DSN database name is NOT included today; two migrations
+// from different databases on the same host will still collide on
+// auto-derived id. Documented as a known limitation; operators hitting
+// this should supply --migration-id explicitly. Could be addressed in
+// a follow-up if real demand surfaces — would need an upgrade story
+// for operators who already have the colliding ids persisted.
 //
 // We hash the input rather than embedding the host directly so the
 // PK column stays compact and predictable. Operators who need a
 // stable identity across DSN changes (e.g., DNS round-robin
 // rotating the host) should pass --migration-id explicitly.
-func deriveMigrationID(sourceEngine, sourceDSN, targetEngine, targetDSN string) string {
+func deriveMigrationID(sourceEngine, sourceDSN, targetEngine, targetDSN, targetSchema string) string {
+	// Empty targetSchema (operators not using --target-schema) hashes
+	// the same way as pre-v0.25.0 so auto-derived ids on existing
+	// migrations don't shift after upgrade. Non-empty targetSchema
+	// appends a discriminator so v0.25.0's multi-source pattern
+	// produces distinct ids per stream.
 	in := fmt.Sprintf("%s://%s -> %s://%s",
 		sourceEngine, redactedHost(sourceDSN),
 		targetEngine, redactedHost(targetDSN))
+	if targetSchema != "" {
+		in += " schema=" + targetSchema
+	}
 	sum := sha256.Sum256([]byte(in))
 	// 16 hex chars (8 bytes) is enough collision-resistance for the
 	// realistic population of source/target host pairs an operator

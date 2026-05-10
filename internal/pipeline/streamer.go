@@ -1028,10 +1028,7 @@ func (s *Streamer) validate() error {
 	case s.Source.Capabilities().CDC == ir.CDCNone:
 		return fmt.Errorf("pipeline: Streamer.Source engine %q declares CDC=None", s.Source.Name())
 	}
-	if err := validateTargetSchema(s.Target, s.TargetSchema); err != nil {
-		return err
-	}
-	return nil
+	return validateTargetSchema(s.Target, s.TargetSchema)
 }
 
 // resolveStreamID returns the operator-supplied StreamID if non-

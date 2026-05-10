@@ -414,7 +414,7 @@ func (m *Migrator) resolveMigrationID() string {
 	if m.MigrationID != "" {
 		return m.MigrationID
 	}
-	return deriveMigrationID(m.Source.Name(), m.SourceDSN, m.Target.Name(), m.TargetDSN)
+	return deriveMigrationID(m.Source.Name(), m.SourceDSN, m.Target.Name(), m.TargetDSN, m.TargetSchema)
 }
 
 // runBulkCopy applies the shared phases that follow target-writer
@@ -671,10 +671,7 @@ func (m *Migrator) validate() error {
 	case m.Resume && m.ResetTargetData:
 		return errors.New("pipeline: --resume and --reset-target-data are mutually exclusive")
 	}
-	if err := validateTargetSchema(m.Target, m.TargetSchema); err != nil {
-		return err
-	}
-	return nil
+	return validateTargetSchema(m.Target, m.TargetSchema)
 }
 
 // copyTable opens the source-side row stream, hands it off to the
