@@ -6,6 +6,53 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.25.0]
+
+Multi-source aggregation Phase 1 + Phase 2: **`--target-schema` (PG-only) + stream-id collision detection.** Operators with N source databases landing in one target Postgres can now namespace each source's tables into its own schema (`customer_svc.users`, `billing_svc.users`) with a single CLI flag — N independent `sluice sync start` processes, one per source, each with its own `--target-schema NAME` + `--stream-id`. The `sluice_cdc_state` control table picks up a `source_dsn_fingerprint` column and refuses on stream-id collision (operator typo'd `--stream-id`; would silently overwrite another stream's position). ADR-0031 formalises the design (Shape B per `docs/dev/design-multi-source-aggregation.md`); Shape A (sharded → consolidated) is queued as a long-term roadmap entry, and MySQL native parity is the documented follow-up (today MySQL operators get equivalent coverage via `--target` DSN choice).
+
+### Added
+
+- **`--target-schema NAME` flag on `migrate`, `sync start`, `schema preview`, `schema diff`.** Default empty (use the target DSN's default schema, today's behavior). When set, every emitted CREATE TABLE / ALTER TABLE prefixes the table reference with the schema name; PG enums get schema-namespaced (`customer_svc.accounts_status_enum`) so two sources with same-named tables don't collide on type names. PG schema reader / writer / row reader / row writer / change applier all thread the schema through via the new optional `ir.SchemaSetter` surface. Schema is auto-created on first emit via `CREATE SCHEMA IF NOT EXISTS`.
+
+- **MySQL `--target-schema` refusal.** MySQL has no schema concept distinct from databases; the flag refuses cleanly at validate time with an operator-actionable message directing them at the `--target` DSN-choice pattern (different MySQL databases on the same server). Pinned via test that asserts MySQL doesn't implement `ir.SchemaSetter`.
+
+- **Stream-id collision detection.** `sluice_cdc_state` gains a `source_dsn_fingerprint TEXT NULL` column (idempotent migration). The streamer records a SHA-256-truncated fingerprint of the normalized source DSN (host + port + database; user/password excluded so password rotation doesn't break collision detection) on every position-write. On `sync start`, sluice queries the existing fingerprint for the stream-id; if it differs from the new source's fingerprint, refuses with `stream "X" exists on target with a different source DSN — pick a different --stream-id or --reset-target-data to wipe and start fresh`. Catches the operator-typo case where two streams accidentally share a stream-id and would silently overwrite each other's position.
+
+- **ADR-0031 — Multi-source aggregation: --target-schema + stream-id collision detection.** Decision rationale (Shape B + N-processes + PG-only first), threat model with 5 scenarios, type-name derivation (PG enums namespaced through the schema), and impl summary. References the proto-ADR at `docs/dev/design-multi-source-aggregation.md`.
+
+### Migration / Compatibility
+
+- **No format-breaking changes.** Manifest schema, change-chunk format, CLI surface — all unchanged for existing flows. The new `source_dsn_fingerprint` column on `sluice_cdc_state` is additive (idempotent `ADD COLUMN IF NOT EXISTS`); legacy rows surface as empty fingerprint via `COALESCE` and skip the collision check (preserves backward-compat).
+- **Drop-in upgrade from v0.24.0.** No DDL migration needed; the new column lands on first `EnsureControlTable` call.
+- **Default behavior unchanged.** Without `--target-schema`, every existing migrate / sync-start invocation lands tables in the target DSN's default schema exactly as before.
+- **MySQL operators unaffected** — `--target-schema` refuses cleanly with the DSN-choice-workaround error message. MySQL native parity (per-table-rename mechanism) is a future chunk if real demand surfaces.
+
+### Known limitations
+
+- **Mid-flight `--target-schema` change on warm-resume not detected.** If the operator changes the `--target-schema` value between `sync start` invocations, sluice doesn't refuse — both schemas would receive the stream's new writes. Documented in ADR-0031's threat model (item 5) as a known caveat; same-shape future refinement could add `target_schema TEXT` to `sluice_cdc_state` and refuse on mismatch.
+
+## [0.24.0]
+
+Mid-stream live add-table Phase 2: **`sluice schema add-table TABLE --no-drain`** for PG sources. Operators with high-availability workloads no longer need the `sluice sync stop --wait` drain that Phase 1 required to bring a new source table into an active CDC stream's scope. ADR-0030 formalises the design (Strategy C variant c per `docs/dev/design-mid-stream-add-table.md`); the heavy lifting was already in Phase 1 (publication-add-then-snapshot ordering, idempotent applier overlap handling) — Phase 2 lifts the conservative active-stream refusal, adds an explicit LSN-floor invariant check, and plumbs the active stream's slot name through the per-target `sluice_cdc_state` control table so live-add picks the right slot when the operator uses `--slot-name`. PG-only in this release; MySQL Phase 2 has a meaningfully different design space (table-filter flip vs publication scope) and is queued as a separate chunk.
+
+### Added
+
+- **`--no-drain` flag on `sluice schema add-table`.** Default off (preserves Phase 1's drained-stream refusal as the conservative default). When set, the orchestrator captures the active stream's slot `confirmed_flush_lsn`, runs `ALTER PUBLICATION ... ADD TABLE`, opens a temp-slot snapshot at LSN ≥ confirmed_flush_lsn, bulk-copies, and verifies the snapshot-LSN ≥ slot-LSN invariant. CDC keeps streaming throughout — no stream restart needed.
+- **Slot-name plumbing through `sluice_cdc_state`.** New `slot_name TEXT NULL` column (idempotent migration). The streamer records its resolved slot name on every position-write via the `SetSlotName` applier hook (Phase 1.5 follow-up shipped in the same release). Operators running multiple concurrent streams against the same source via `--slot-name=shard_a` get the right slot's confirmed_flush_lsn queried automatically by live add-table.
+- **New optional engine surfaces** (in `internal/pipeline/add_table.go`): `slotPositionReader`, `snapshotLSNExtractor`, `lsnComparer`, `slotNameSetter`. PG implements all four; MySQL implements none (no slot concept); the structural type-assertions skip cleanly. The orchestrator stays engine-neutral.
+- **ADR-0030 — Mid-stream live add-table.** Formalises the correctness story (pgoutput evaluates publication membership at decode time; snapshot-after-publication-add ordering + idempotent applier covers all rows on the new table exactly-once-effectively for the load-bearing cases), threat model (six hazards, all mitigated), why Strategy B (dual-slot) was deferred, and why MySQL's Phase 2 is a separate chunk.
+
+### Known limitations
+
+- **Best-effort for in-flight inserts during the publication-add window.** Discovered during v0.24.0's CI under-load testing: events on the new table inserted DURING the brief publication-add window may not be delivered (~1–3 events lost per sub-second window in the worst case). pgoutput evaluates publication membership per WAL record at decode time; events the slot decoded-and-filtered BEFORE publication-add commit took effect are gone. **Snapshot rows + post-publication-add events are delivered exactly-once-effectively** (proven by `TestAddTable_LiveMode_PG` happy-path test + the post-add sentinel pin in `TestAddTable_LiveMode_PG_UnderLoad`). Operators with high write rates on the new table at the moment of live-add should use the drained add-table flow (zero-loss by construction) or quiesce writes for the seconds-long window. Strict-correctness fix queued as a follow-up roadmap entry (Path A slot-pause / Path B Strategy B dual-slot). ADR-0030's "What could go wrong" section documents the gap in full.
+
+### Migration / Compatibility
+
+- **No format-breaking changes.** Manifest schema, change-chunk format, CLI surface — all unchanged for existing flows. The new `slot_name` column on `sluice_cdc_state` is additive (idempotent `ADD COLUMN IF NOT EXISTS`); legacy rows surface as empty `SlotName` via `COALESCE` and fall back to the engine default `sluice_slot` for live-add lookup.
+- **No CLI breaking changes.** `--no-drain` is opt-in; existing `sluice schema add-table` invocations without it continue to require a drained stream identically.
+- **Drop-in upgrade from v0.23.2.** No DDL migration needed; the new column lands on first `EnsureControlTable` call.
+- **MySQL operators unaffected** — `--no-drain` refuses cleanly with a PG-only error directing them at the drained-stream flow.
+
 ## [0.23.2]
 
 Single-bug patch: closes Bug 44 — same-engine MySQL → MySQL migrate of any column with `DEFAULT (UUID())` or `DEFAULT (RAND())` failed at CREATE TABLE with MySQL Error 1064. The MySQL writer's `emitDefault` was emitting `DEFAULT uuid()` (without outer parens) because MySQL's INFORMATION_SCHEMA returns the default expression with parens stripped (`column_default = 'uuid()'`). MySQL 8.0.13+ requires `DEFAULT (uuid())` for function-call expression defaults — only special temporal keywords (CURRENT_TIMESTAMP family, NOW(), LOCALTIME, etc.) are accepted bare. Symmetric writer-side counterpart to v0.11.3's Bug 28/29 fix (which were reader-side translation gaps for the cross-engine direction); together with v0.23.1's Bug 42 fix and v0.21.2's Bug 41 fix, all known UUID-default migration paths (PG → MySQL cross-engine, MySQL → MySQL same-engine, MySQL → PG cross-engine, PG → PG same-engine) now work end-to-end.
