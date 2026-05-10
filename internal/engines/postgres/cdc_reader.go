@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/url"
 	"os"
 	"strings"
@@ -404,6 +405,22 @@ func (r *CDCReader) pump(ctx context.Context, conn *pgconn.PgConn, startLSN pglo
 	relations := map[uint32]*relationCacheEntry{}
 	streamedLSN := startLSN
 	currentTxnLSN := startLSN
+	// currentTxnStartLSN is the WAL position of the BEGIN record for
+	// the in-progress transaction. ADR-0036 (Path D Phase A) M1
+	// instrumentation: a transaction whose BEGIN landed BEFORE
+	// publication-add but commits AFTER would have its events filtered
+	// by pgoutput's per-LSN catalog snapshot at decode time according
+	// to the catalog state at the row record's LSN; the txn-start LSN
+	// is one half of the diagnostic ordering. Distinct from
+	// currentTxnLSN (which is the BeginMessage.FinalLSN, == the commit
+	// LSN preview emitted by pgoutput).
+	currentTxnStartLSN := startLSN
+	// firstSeenRelLSN remembers the WAL LSN of the very first row event
+	// observed for each relation during this pump's lifetime. ADR-0036
+	// M3 instrumentation: lets the diagnostic test compare against the
+	// publication-add LSN to see how long pgoutput's per-relation
+	// catalog snapshot lagged the catalog change.
+	firstSeenRelLSN := map[uint32]pglogrepl.LSN{}
 	var inStream bool // pgoutput v2 streaming-in-progress flag
 
 	nextKeepalive := time.Now().Add(keepaliveInterval)
@@ -469,7 +486,7 @@ func (r *CDCReader) pump(ctx context.Context, conn *pgconn.PgConn, startLSN pglo
 				r.setErr(fmt.Errorf("postgres: cdc: parse xlogdata: %w", err))
 				return
 			}
-			if err := r.dispatchWAL(ctx, xld, relations, &currentTxnLSN, &streamedLSN, &inStream, out); err != nil {
+			if err := r.dispatchWAL(ctx, xld, relations, &currentTxnLSN, &currentTxnStartLSN, &streamedLSN, &inStream, firstSeenRelLSN, out); err != nil {
 				r.setErr(err)
 				return
 			}
@@ -492,8 +509,10 @@ func (r *CDCReader) dispatchWAL(
 	xld pglogrepl.XLogData,
 	relations map[uint32]*relationCacheEntry,
 	currentTxnLSN *pglogrepl.LSN,
+	currentTxnStartLSN *pglogrepl.LSN,
 	streamedLSN *pglogrepl.LSN,
 	inStream *bool,
+	firstSeenRelLSN map[uint32]pglogrepl.LSN,
 	out chan<- ir.Change,
 ) error {
 	logical, err := pglogrepl.ParseV2(xld.WALData, *inStream)
@@ -508,6 +527,16 @@ func (r *CDCReader) dispatchWAL(
 			return fmt.Errorf("postgres: cdc: relation %s.%s: %w", m.Namespace, m.RelationName, err)
 		}
 		relations[m.RelationID] = entry
+		// ADR-0036 M3: log RelationMessage arrivals so the diagnostic
+		// run can correlate them with the publication-add LSN.
+		slog.DebugContext(ctx, "cdc.diag: relation message",
+			slog.String("phase", "relation"),
+			slog.String("schema", entry.Schema),
+			slog.String("relation", entry.Name),
+			slog.Uint64("rel_oid", uint64(m.RelationID)),
+			slog.String("wal_start", xld.WALStart.String()),
+			slog.String("server_wal_end", xld.ServerWALEnd.String()),
+		)
 		return nil
 
 	case *pglogrepl.RelationMessage:
@@ -516,10 +545,29 @@ func (r *CDCReader) dispatchWAL(
 			return fmt.Errorf("postgres: cdc: relation %s.%s: %w", m.Namespace, m.RelationName, err)
 		}
 		relations[m.RelationID] = entry
+		slog.DebugContext(ctx, "cdc.diag: relation message",
+			slog.String("phase", "relation"),
+			slog.String("schema", entry.Schema),
+			slog.String("relation", entry.Name),
+			slog.Uint64("rel_oid", uint64(m.RelationID)),
+			slog.String("wal_start", xld.WALStart.String()),
+			slog.String("server_wal_end", xld.ServerWALEnd.String()),
+		)
 		return nil
 
 	case *pglogrepl.BeginMessage:
 		*currentTxnLSN = m.FinalLSN
+		*currentTxnStartLSN = xld.WALStart
+		// ADR-0036 M1: log txn-start (WAL position of the BEGIN record)
+		// alongside the txn's final commit LSN. Lets the diagnostic test
+		// detect transactions that straddle the publication-add LSN
+		// (txn_start < LSN_pubadd < commit).
+		slog.DebugContext(ctx, "cdc.diag: txn begin",
+			slog.String("phase", "begin"),
+			slog.String("txn_start_lsn", xld.WALStart.String()),
+			slog.String("txn_commit_lsn", m.FinalLSN.String()),
+			slog.Uint64("xid", uint64(m.Xid)),
+		)
 		// Surface the source-tx boundary to the applier so the
 		// batched path can flush in-flight non-tx-aware batches and
 		// open a fresh target transaction aligned to this source
@@ -533,6 +581,12 @@ func (r *CDCReader) dispatchWAL(
 
 	case *pglogrepl.CommitMessage:
 		*streamedLSN = m.CommitLSN
+		slog.DebugContext(ctx, "cdc.diag: txn commit",
+			slog.String("phase", "commit"),
+			slog.String("txn_start_lsn", currentTxnStartLSN.String()),
+			slog.String("txn_commit_lsn", m.CommitLSN.String()),
+			slog.String("wal_start", xld.WALStart.String()),
+		)
 		// Source-tx commit boundary: flush whatever the applier has
 		// in flight as one target transaction. The empty-source-tx
 		// case (BEGIN immediately followed by COMMIT with no row
@@ -545,18 +599,24 @@ func (r *CDCReader) dispatchWAL(
 		return send(ctx, out, ir.TxCommit{Position: pos})
 
 	case *pglogrepl.InsertMessageV2:
+		r.diagRowEvent(ctx, "insert", relations, m.RelationID, xld, *currentTxnStartLSN, *currentTxnLSN, firstSeenRelLSN)
 		return r.emitInsert(ctx, relations, m.RelationID, m.Tuple, *currentTxnLSN, out)
 	case *pglogrepl.InsertMessage:
+		r.diagRowEvent(ctx, "insert", relations, m.RelationID, xld, *currentTxnStartLSN, *currentTxnLSN, firstSeenRelLSN)
 		return r.emitInsert(ctx, relations, m.RelationID, m.Tuple, *currentTxnLSN, out)
 
 	case *pglogrepl.UpdateMessageV2:
+		r.diagRowEvent(ctx, "update", relations, m.RelationID, xld, *currentTxnStartLSN, *currentTxnLSN, firstSeenRelLSN)
 		return r.emitUpdate(ctx, relations, m.RelationID, m.OldTuple, m.NewTuple, *currentTxnLSN, out)
 	case *pglogrepl.UpdateMessage:
+		r.diagRowEvent(ctx, "update", relations, m.RelationID, xld, *currentTxnStartLSN, *currentTxnLSN, firstSeenRelLSN)
 		return r.emitUpdate(ctx, relations, m.RelationID, m.OldTuple, m.NewTuple, *currentTxnLSN, out)
 
 	case *pglogrepl.DeleteMessageV2:
+		r.diagRowEvent(ctx, "delete", relations, m.RelationID, xld, *currentTxnStartLSN, *currentTxnLSN, firstSeenRelLSN)
 		return r.emitDelete(ctx, relations, m.RelationID, m.OldTuple, *currentTxnLSN, out)
 	case *pglogrepl.DeleteMessage:
+		r.diagRowEvent(ctx, "delete", relations, m.RelationID, xld, *currentTxnStartLSN, *currentTxnLSN, firstSeenRelLSN)
 		return r.emitDelete(ctx, relations, m.RelationID, m.OldTuple, *currentTxnLSN, out)
 
 	case *pglogrepl.TruncateMessageV2:
@@ -593,6 +653,63 @@ func (r *CDCReader) dispatchWAL(
 		// StreamCommit/Abort: not in v1 scope. Silent skip.
 		return nil
 	}
+}
+
+// diagRowEvent emits ADR-0036 (Path D Phase A) DEBUG-level diagnostic
+// log lines for every row event that pgoutput delivers to the pump.
+// Captures four of the load-bearing facts the diagnostic test needs to
+// attribute v0.24.0 mid-stream live add-table loss:
+//
+//   - the relation OID + schema-qualified name (so the test can scope
+//     to events on the new table);
+//   - the WAL LSN of the row record itself (xld.WALStart);
+//   - the txn-start and txn-commit LSNs (M1: long-txn-across-pubadd);
+//   - whether this is the first event observed for this relation since
+//     the pump started (M3: pgoutput catalog-snapshot lag — the gap
+//     between LSN_pubadd and the first event delivered for the new
+//     relation tells us if pgoutput's per-LSN catalog snapshot lagged
+//     the catalog change in any visible way).
+//
+// All log lines carry the `cdc.diag` slug so the diagnostic test can
+// grep them out of the captured log stream cleanly.
+func (r *CDCReader) diagRowEvent(
+	ctx context.Context,
+	op string,
+	relations map[uint32]*relationCacheEntry,
+	relID uint32,
+	xld pglogrepl.XLogData,
+	txnStartLSN, txnCommitLSN pglogrepl.LSN,
+	firstSeenRelLSN map[uint32]pglogrepl.LSN,
+) {
+	rel, ok := relations[relID]
+	if !ok {
+		slog.DebugContext(ctx, "cdc.diag: row event (unknown relation)",
+			slog.String("phase", "row"),
+			slog.String("op", op),
+			slog.Uint64("rel_oid", uint64(relID)),
+			slog.String("wal_start", xld.WALStart.String()),
+			slog.String("txn_start_lsn", txnStartLSN.String()),
+			slog.String("txn_commit_lsn", txnCommitLSN.String()),
+		)
+		return
+	}
+	firstSeen := false
+	if _, seen := firstSeenRelLSN[relID]; !seen {
+		firstSeenRelLSN[relID] = xld.WALStart
+		firstSeen = true
+	}
+	slog.DebugContext(ctx, "cdc.diag: row event",
+		slog.String("phase", "row"),
+		slog.String("op", op),
+		slog.String("schema", rel.Schema),
+		slog.String("relation", rel.Name),
+		slog.Uint64("rel_oid", uint64(relID)),
+		slog.String("wal_start", xld.WALStart.String()),
+		slog.String("server_wal_end", xld.ServerWALEnd.String()),
+		slog.String("txn_start_lsn", txnStartLSN.String()),
+		slog.String("txn_commit_lsn", txnCommitLSN.String()),
+		slog.Bool("first_seen_for_rel", firstSeen),
+	)
 }
 
 func (r *CDCReader) emitInsert(

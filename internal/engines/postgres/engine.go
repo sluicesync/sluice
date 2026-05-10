@@ -322,6 +322,38 @@ func (Engine) ReadSlotPosition(ctx context.Context, dsn, slotName string) (strin
 	return lsn, nil
 }
 
+// ReadCurrentWALPosition returns pg_current_wal_lsn() against the
+// supplied DSN as a canonical "X/XXXXXXXX" string. ADR-0036 (Path D
+// Phase A) instrumentation surface: lets the live add-table
+// orchestrator log the WAL position before AND after the publication-
+// add step so the diagnostic test can attribute observed loss to a
+// specific LSN window. Independent from the SchemaReader's
+// SourceCurrentPosition surface because the live-add flow closes its
+// SchemaReader before publication-add runs.
+//
+// Discovered structurally on the pipeline side via the
+// currentWALPositionReader interface; engines without WAL semantics
+// simply omit the method. The diagnostic instrumentation is best-
+// effort: a query failure logs at WARN and returns empty, since this
+// is purely diagnostic and must not abort the live add.
+func (Engine) ReadCurrentWALPosition(ctx context.Context, dsn string) (string, error) {
+	cfg, err := parseDSN(dsn)
+	if err != nil {
+		return "", err
+	}
+	db, err := openDB(ctx, cfg)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = db.Close() }()
+
+	var lsn string
+	if err := db.QueryRowContext(ctx, `SELECT pg_current_wal_lsn()::text`).Scan(&lsn); err != nil {
+		return "", fmt.Errorf("postgres: read current WAL position: %w", err)
+	}
+	return lsn, nil
+}
+
 // OpenSlotManager returns a [SlotManager] bound to the database
 // identified by dsn. Used by the `sluice slot list` and `sluice slot
 // drop` CLI commands to manage logical-replication slots from the

@@ -102,6 +102,22 @@ type slotPositionReader interface {
 	ReadSlotPosition(ctx context.Context, dsn, slotName string) (string, error)
 }
 
+// currentWALPositionReader is an optional engine-side surface for
+// reading the source's current WAL position against a supplied DSN.
+// ADR-0036 (Path D Phase A) instrumentation: the diagnostic flow logs
+// pg_current_wal_lsn() before AND after publication-add so the
+// captured logs name a concrete LSN window for the catalog change.
+// Independent from the SchemaReader.SourceCurrentPosition surface
+// (which requires a held SchemaReader) because the live-add flow
+// closes the SchemaReader before publication-add runs.
+//
+// Implemented on PG; engines without WAL semantics omit it. Returns
+// the position's bare token (LSN string for PG); callers are responsible
+// for engine-specific parsing.
+type currentWALPositionReader interface {
+	ReadCurrentWALPosition(ctx context.Context, dsn string) (string, error)
+}
+
 // snapshotLSNExtractor is the optional engine-side surface for
 // extracting the consistent-point LSN out of a snapshot stream's
 // opaque [ir.Position] token. Used by [AddTable.LiveMode] to verify
@@ -335,6 +351,18 @@ func (a *AddTable) Run(ctx context.Context) error {
 	// snapshot already includes the new table in publication scope.
 	// Same ordering rationale as cold-start's EnsurePublication
 	// (Bug 13, ADR-0021). Engines without publications are no-ops.
+	//
+	// ADR-0036 (Path D Phase A) M2/M3 instrumentation: capture
+	// pg_current_wal_lsn() before AND after publication-add so the
+	// diagnostic test can name a concrete LSN window for the catalog
+	// change. The "before" value bounds where pgoutput's per-LSN
+	// catalog snapshot must still exclude the new table; the "after"
+	// value is an upper bound on LSN_pubadd (the actual commit-LSN
+	// of the ALTER PUBLICATION DDL). Together with the BEGIN/COMMIT
+	// LSN logging in cdc_reader's dispatchWAL, the captured trace
+	// answers M1 (long txns straddling the boundary) and M3
+	// (pgoutput catalog-snapshot lag).
+	lsnBeforePubAdd := a.diagReadCurrentWAL(ctx, "before-publication-add")
 	if pa, ok := a.Source.(publicationAdder); ok {
 		slog.InfoContext(ctx, "add-table: extending source publication scope",
 			slog.String("table", a.TableName),
@@ -347,6 +375,13 @@ func (a *AddTable) Run(ctx context.Context) error {
 			slog.String("source", a.Source.Name()),
 		)
 	}
+	lsnAfterPubAdd := a.diagReadCurrentWAL(ctx, "after-publication-add")
+	slog.DebugContext(ctx, "addtable.diag: publication-add LSN window",
+		slog.String("phase", "pub-add-window"),
+		slog.String("table", a.TableName),
+		slog.String("lsn_before_pub_add", lsnBeforePubAdd),
+		slog.String("lsn_after_pub_add", lsnAfterPubAdd),
+	)
 
 	// ---- 5. Open a snapshot stream restricted to the new table.
 	// PG: temp slot to avoid colliding with the main `sluice_slot`
@@ -367,6 +402,25 @@ func (a *AddTable) Run(ctx context.Context) error {
 		slog.String("table", a.TableName),
 		slog.String("position_token", stream.Position.Token),
 	)
+
+	// ADR-0036 (Path D Phase A) M2: surface the snapshot's
+	// consistent-point LSN alongside the publication-add LSN window
+	// so the diagnostic test can compare LSN_S against LSN_before_pubadd
+	// and LSN_after_pubadd. The "snapshot consistent-point race"
+	// hypothesis predicts loss when LSN_S < LSN_pubadd; the captured
+	// trace answers it directly.
+	if extractor, ok := a.Source.(snapshotLSNExtractor); ok {
+		if snapLSN, present, err := extractor.ExtractSnapshotLSN(stream.Position); err == nil && present {
+			slog.DebugContext(ctx, "addtable.diag: snapshot consistent-point",
+				slog.String("phase", "snapshot-open"),
+				slog.String("table", a.TableName),
+				slog.String("lsn_snapshot", snapLSN),
+				slog.String("lsn_before_pub_add", lsnBeforePubAdd),
+				slog.String("lsn_after_pub_add", lsnAfterPubAdd),
+				slog.String("temp_slot", tempSlot),
+			)
+		}
+	}
 
 	// ---- 5a. Live-mode invariant (PG path only): snapshot-LSN ≥ slot
 	// confirmed_flush_lsn captured before publication-add. ADR-0030.
@@ -843,6 +897,36 @@ func (a *AddTable) verifyLiveModeLSNInvariant(ctx context.Context, slotLSN strin
 		slog.String("slot_confirmed_flush_lsn", slotLSN),
 	)
 	return nil
+}
+
+// diagReadCurrentWAL is the ADR-0036 (Path D Phase A) instrumentation
+// helper that reads the source engine's current WAL position via the
+// optional currentWALPositionReader surface. Best-effort: a missing
+// surface or query failure produces an empty string rather than
+// aborting the live add. Logs at DEBUG with the supplied phase tag
+// so the diagnostic test can correlate before/after readings.
+func (a *AddTable) diagReadCurrentWAL(ctx context.Context, phase string) string {
+	reader, ok := a.Source.(currentWALPositionReader)
+	if !ok {
+		slog.DebugContext(ctx, "addtable.diag: source engine does not expose ReadCurrentWALPosition; skipping LSN sample",
+			slog.String("phase", phase),
+			slog.String("source", a.Source.Name()),
+		)
+		return ""
+	}
+	lsn, err := reader.ReadCurrentWALPosition(ctx, a.SourceDSN)
+	if err != nil {
+		slog.DebugContext(ctx, "addtable.diag: ReadCurrentWALPosition failed (best-effort, continuing)",
+			slog.String("phase", phase),
+			slog.String("err", err.Error()),
+		)
+		return ""
+	}
+	slog.DebugContext(ctx, "addtable.diag: WAL position sample",
+		slog.String("phase", phase),
+		slog.String("lsn", lsn),
+	)
+	return lsn
 }
 
 // isolateTable returns a new schema containing only the named table
