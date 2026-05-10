@@ -164,19 +164,13 @@ jobs:
   integration:
     name: Integration
     runs-on: ubuntu-latest
-    # 60m outer envelope (was 35m through v0.27.0; bumped to 50m on
-    # the v0.28.0 first force-tag-move; bumped again to 60m on the
-    # v0.28.0 fourth force-tag-move because the postgis step was hitting
-    # its 15m timeout despite the 50m outer budget — additive
-    # `-tags="integration postgis"` compiles BOTH integration AND
-    # postgis files, so the postgis step duplicates the integration
-    # suite on top of postgis-specific tests. Postgis step bumped to
-    # 25m to absorb the duplication; outer envelope bumped to 60m
-    # for headroom. If the budget creeps further, the next move is to
-    # split the postgis tests into a separate job so they parallelize
-    # with the default integration step (would also benefit from
-    # independent retry semantics).
-    timeout-minutes: 60
+    # 35m outer envelope. Was 60m through v0.28.0 because the same job
+    # ran both the integration suite + the postgis-tagged suite (which
+    # is additive — `-tags="integration postgis"` re-runs every
+    # integration test). v0.29.0 split postgis into its own parallel
+    # job (`integration-postgis`); this job no longer pulls the postgis
+    # image or runs the postgis step, so 35m is right-sized again.
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-go@v6
@@ -196,18 +190,12 @@ jobs:
       # superset of postgres:16 with the pgvector extension files
       # bundled; cold-start size is ~110 MB layer-compressed.
       #
-      # postgis/postgis:16-3.4 (added v0.28.0) backs the
-      # internal/pipeline/migrate_postgis_integration_test.go suite
-      # (ADR-0035 PostGIS-aware GEOMETRY translation). The image is
-      # a postgres:16 superset with the postgis extension bundled;
-      # ~500 MB layer-compressed (heavier than pgvector's ~110 MB,
-      # which is why the tests are gated behind a separate `postgis`
-      # build tag rather than running on every Integration job).
+      # postgis/postgis:16-3.4 is pulled in the dedicated
+      # `integration-postgis` job below — not here.
       - run: |
           docker pull mysql:8.0
           docker pull postgres:16
           docker pull pgvector/pgvector:0.7.4-pg16
-          docker pull postgis/postgis:16-3.4
 
       # Run every package's integration tests. -count=1 disables the
       # test cache so we always exercise real containers (cached results
@@ -226,24 +214,42 @@ jobs:
       # timeout-minutes caps the outer envelope.
       - run: go test -tags=integration -race -count=1 -timeout=25m ./internal/...
 
-      # PostGIS-tagged tests run as a separate go-test invocation so
-      # the heavier postgis/postgis:16-3.4 image only boots when the
-      # tag is active. ADR-0035 gates the cross-engine geometry
-      # round-trip tests behind `integration postgis`. The image
-      # cold-pulls ~500 MB of extra layers; the main Integration
-      # invocation above stays on postgres:16 for fast PG container
-      # boots.
-      #
-      # The `-tags="integration postgis"` invocation is additive: it
-      # compiles in BOTH the integration-tagged files AND the
-      # postgis-tagged files, then runs the resulting full set. This
-      # means the postgis step duplicates the regular integration
-      # tests (in the pipeline package) on top of the postgis ones —
-      # not ideal but cheap to fix later (a `-run TestPostGIS` filter
-      # would scope it). For now, -timeout=25m matches the regular
-      # integration step's budget so the doubled runtime fits.
-      # Outer timeout-minutes=50 still caps the envelope.
-      - run: go test -tags="integration postgis" -race -count=1 -timeout=25m ./internal/pipeline/...
+  # ----- Integration: PostGIS -----
+  # Split out as a separate parallel job in v0.29.0 (was in-line as a
+  # second step on the integration job through v0.28.0; that approach
+  # ran -tags="integration postgis" which is additive — Go's tag system
+  # compiled BOTH the integration-tagged files AND the postgis-tagged
+  # files, so the step re-ran the entire integration suite for the
+  # pipeline package on top of the postgis-specific tests. v0.28.0's
+  # 5 force-tag-moves and ballooning timeout budget surfaced the cost).
+  #
+  # The `-run TestMigrate_PostGIS_` filter scopes the run to ONLY the
+  # postgis-tagged tests (the additivity is unavoidable at the build-
+  # tag level, but `-run` selects which tests actually execute). All
+  # postgis-tagged tests live in
+  # internal/pipeline/migrate_postgis_integration_test.go and have
+  # the TestMigrate_PostGIS_ prefix; new postgis tests should follow
+  # this naming convention so the filter keeps them in scope.
+  #
+  # Image: postgis/postgis:16-3.4 (~500 MB layer-compressed).
+  # 20m timeout — the suite has 2 tests today (PG↔MySQL round-trips
+  # in both directions); each takes ~30-60s to boot the postgis
+  # container and do its work. Headroom for growth.
+  integration-postgis:
+    name: Integration (PostGIS)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: "go.mod"
+      - run: go mod download
+      - run: |
+          docker pull mysql:8.0
+          docker pull postgres:16
+          docker pull postgis/postgis:16-3.4
+      - run: go test -tags="integration postgis" -race -count=1 -timeout=15m -run TestMigrate_PostGIS_ ./internal/pipeline/...
 
   # ----- Lint -----
   # golangci-lint runs many static analyzers in a single pass. We use the

@@ -20,6 +20,7 @@ Navigate to **Settings → Branches → Add rule** (or **Branch protection rules
 - Required status checks (these are the GitHub Actions job names from `.github/workflows/ci.yml`):
   - `Test (ubuntu-latest)`
   - `Integration`
+  - `Integration (PostGIS)` — added v0.29.0; gates the cross-engine geometry round-trip suite
   - `Lint`
   - `Build (ubuntu-latest)`
 
@@ -60,6 +61,7 @@ gh api -X PUT repos/orware/sluice/branches/main/protection \
     "contexts": [
       "Test (ubuntu-latest)",
       "Integration",
+      "Integration (PostGIS)",
       "Lint",
       "Build (ubuntu-latest)"
     ]
