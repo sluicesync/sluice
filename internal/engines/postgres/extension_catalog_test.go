@@ -113,18 +113,27 @@ func TestPGVectorEmit_MismatchedExtension(t *testing.T) {
 }
 
 // TestPGVectorBuild_DimFromTypmod decodes the dimension out of
-// pg_attribute.atttypmod the way pgvector encodes it
-// (typmod = dimension + 4; -1 = no typmod).
+// pg_attribute.atttypmod the way pgvector encodes it. The reference
+// is `vector_typmod_in` in pgvector/src/vector.c: typmod IS the
+// dimension verbatim (no offset). -1 is PG's "no typmod" sentinel.
+//
+// Bug 47 fix: an earlier revision of this test (and the helper)
+// assumed a `dimension + 4` offset; pgvector itself does not use
+// such an offset, and the integration test surfaced the mismatch
+// when the source IR's Modifiers came back empty for a `vector(3)`
+// column whose atttypmod was 3.
 func TestPGVectorBuild_DimFromTypmod(t *testing.T) {
 	cases := []struct {
 		typmod int32
 		want   []int
 	}{
 		{-1, []int{}},         // no typmod
-		{4, []int{}},          // dimension <= 0 — degenerate
-		{8, []int{4}},         // dimension 4
-		{388, []int{384}},     // dimension 384
-		{16004, []int{16000}}, // pgvector's documented max
+		{0, []int{}},          // sentinel — defensive, shouldn't surface from PG
+		{1, []int{1}},         // dimension 1 (pgvector's minimum)
+		{3, []int{3}},         // dimension 3 — the integration test's seed
+		{4, []int{4}},         // dimension 4
+		{384, []int{384}},     // dimension 384
+		{16000, []int{16000}}, // pgvector's documented max
 	}
 	def := pgExtensionCatalog["vector"]
 	for _, c := range cases {

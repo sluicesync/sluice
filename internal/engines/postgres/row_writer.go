@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/orware/sluice/internal/ir"
@@ -271,6 +272,16 @@ func (w *RowWriter) WriteRows(ctx context.Context, table *ir.Table, rows <-chan 
 // Conn.Raw to reach the underlying *pgx.Conn, and feeds rows
 // through pgx's CopyFrom + our chanCopySource adapter.
 //
+// Before launching CopyFrom, any extension-owned column types whose
+// wire format pgx doesn't natively understand (today: pgvector's
+// `vector`) get a per-conn pgtype codec registered against the
+// runtime OID resolved from pg_type. Without this, pgx's binary COPY
+// path silently routes vector values through the `text` codec — the
+// canonical text form ships as raw bytes inside a binary-format
+// column, and the receiver's `vector_in()` parser interprets the
+// first two bytes as a big-endian dimension count and refuses with
+// "vector cannot have more than 16000 dimensions" (Bug 47, ADR-0032).
+//
 // COPY is atomic at the table level: a mid-stream error rolls back
 // the entire copy. The error message names how many rows landed
 // before the failure so operators can scope the impact.
@@ -288,13 +299,21 @@ func (w *RowWriter) writeViaCopy(ctx context.Context, table *ir.Table, rows <-ch
 	}
 	source := newChanCopySource(ctx, table, rows)
 
+	needsPGVectorCodec := tableHasPGVectorColumn(table)
+
 	var copied int64
 	rawErr := sqlConn.Raw(func(driverConn any) error {
 		stdlibConn, ok := driverConn.(*stdlib.Conn)
 		if !ok {
 			return fmt.Errorf("postgres: copy: expected *stdlib.Conn, got %T", driverConn)
 		}
-		n, copyErr := stdlibConn.Conn().CopyFrom(
+		conn := stdlibConn.Conn()
+		if needsPGVectorCodec {
+			if err := registerPGVectorCodec(ctx, conn, w.db); err != nil {
+				return err
+			}
+		}
+		n, copyErr := conn.CopyFrom(
 			ctx,
 			pgx.Identifier{w.schema, table.Name},
 			columnNames,
@@ -307,6 +326,46 @@ func (w *RowWriter) writeViaCopy(ctx context.Context, table *ir.Table, rows <-ch
 		return fmt.Errorf("postgres: copy into %q (%d rows copied before error): %w",
 			table.Name, copied, rawErr)
 	}
+	return nil
+}
+
+// tableHasPGVectorColumn reports whether table has any column whose
+// IR type is the pgvector ExtensionType. Used to decide whether the
+// COPY path needs to register the per-conn pgtype codec.
+func tableHasPGVectorColumn(table *ir.Table) bool {
+	for _, col := range table.Columns {
+		ext, ok := col.Type.(ir.ExtensionType)
+		if !ok {
+			continue
+		}
+		if ext.Extension == "vector" {
+			return true
+		}
+	}
+	return false
+}
+
+// registerPGVectorCodec resolves the runtime OID for the `vector` type
+// and registers [pgvectorBinaryCodec] against it on conn. The lookup
+// runs against the *sql.DB pool (not conn) because pgx's *Conn here
+// is mid-Raw and using it for an out-of-band query is awkward; the
+// pool query lands on a sibling conn but pg_type is database-global,
+// so the OID is the same. Idempotent: re-registering on a conn that
+// already has the type is harmless.
+func registerPGVectorCodec(ctx context.Context, conn *pgx.Conn, db *sql.DB) error {
+	tm := conn.TypeMap()
+	if _, alreadyRegistered := tm.TypeForName("vector"); alreadyRegistered {
+		return nil
+	}
+	oid, err := lookupVectorOID(ctx, db)
+	if err != nil {
+		return fmt.Errorf("postgres: copy: register pgvector codec: %w", err)
+	}
+	tm.RegisterType(&pgtype.Type{
+		Name:  "vector",
+		OID:   oid,
+		Codec: pgvectorBinaryCodec{},
+	})
 	return nil
 }
 

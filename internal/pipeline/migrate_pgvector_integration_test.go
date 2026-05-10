@@ -159,8 +159,9 @@ func TestMigrate_PG_Pgvector_Passthrough(t *testing.T) {
 	}
 	defer func() { _ = tgtDB.Close() }()
 
-	// pg_attribute.atttypmod stores `dimension + 4` for pgvector;
-	// 3 + 4 = 7 on a vector(3) column.
+	// pgvector stores the dimension verbatim in pg_attribute.atttypmod
+	// (verified against pgvector/src/vector.c's `vector_typmod_in`,
+	// Bug 47 root cause). A `vector(3)` column has atttypmod = 3.
 	const typmodQuery = `
 		SELECT atttypmod
 		FROM pg_attribute
@@ -171,8 +172,8 @@ func TestMigrate_PG_Pgvector_Passthrough(t *testing.T) {
 	if err := tgtDB.QueryRowContext(ctx, typmodQuery).Scan(&typmod); err != nil {
 		t.Fatalf("typmod query: %v", err)
 	}
-	if typmod != 7 {
-		t.Errorf("target items.embedding atttypmod = %d; want 7 (dimension=3 + 4 offset)", typmod)
+	if typmod != 3 {
+		t.Errorf("target items.embedding atttypmod = %d; want 3 (verbatim dimension, no offset)", typmod)
 	}
 
 	// Row count check — the bulk copy should have moved 3 rows.

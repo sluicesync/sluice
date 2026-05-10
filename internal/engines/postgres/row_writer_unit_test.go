@@ -129,3 +129,54 @@ func TestPrepareValueArrayWrongElementType(t *testing.T) {
 		t.Error("expected error for type mismatch in array element; got nil")
 	}
 }
+
+// TestTableHasPGVectorColumn pins the predicate that drives whether
+// writeViaCopy registers the per-conn pgvector codec. Bug 47: the
+// codec must register exactly when (and only when) the table carries
+// a vector column — otherwise the COPY path either misencodes the
+// vector or pays a stray pg_type lookup on every unrelated table.
+func TestTableHasPGVectorColumn(t *testing.T) {
+	cases := []struct {
+		name string
+		cols []*ir.Column
+		want bool
+	}{
+		{
+			name: "no extension columns",
+			cols: []*ir.Column{
+				{Name: "id", Type: ir.Integer{Width: 64}},
+				{Name: "name", Type: ir.Varchar{Length: 64}},
+			},
+			want: false,
+		},
+		{
+			name: "vector column present",
+			cols: []*ir.Column{
+				{Name: "id", Type: ir.Integer{Width: 64}},
+				{Name: "embedding", Type: ir.ExtensionType{Extension: "vector", Name: "vector", Modifiers: []int{3}}},
+			},
+			want: true,
+		},
+		{
+			name: "different extension only",
+			cols: []*ir.Column{
+				{Name: "fingerprint", Type: ir.ExtensionType{Extension: "pg_trgm", Name: "trgm"}},
+			},
+			want: false,
+		},
+		{
+			name: "empty columns",
+			cols: nil,
+			want: false,
+		},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			got := tableHasPGVectorColumn(&ir.Table{Name: "t", Columns: c.cols})
+			if got != c.want {
+				t.Errorf("tableHasPGVectorColumn = %v, want %v", got, c.want)
+			}
+		})
+	}
+}

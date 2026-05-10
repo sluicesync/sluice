@@ -507,7 +507,12 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 // table's PrimaryKey field; everything else goes into Indexes.
 //
 // The query unnests pg_index.indkey to produce one row per (index,
-// column, position), which the loop groups into IR Index values.
+// column, position), which the loop groups into IR Index values. A
+// parallel unnest over pg_index.indclass with `pg_opclass.opcname`
+// joined in carries the per-column operator class so extension
+// access methods that lack a default opclass (pgvector's hnsw —
+// which requires `vector_l2_ops` / `vector_cosine_ops` /
+// `vector_ip_ops`) round-trip cleanly under ADR-0032 / Bug 47.
 func (r *SchemaReader) populateIndexes(ctx context.Context, tables map[string]*ir.Table) error {
 	const q = `
 		SELECT
@@ -517,14 +522,17 @@ func (r *SchemaReader) populateIndexes(ctx context.Context, tables map[string]*i
 			ix.indisunique,
 			ix.indisprimary,
 			COALESCE(a.attname, ''),
-			u.ord
+			u.ord,
+			COALESCE(opc.opcname, '') AS opclass
 		FROM   pg_index ix
 		JOIN   pg_class      cl ON cl.oid = ix.indrelid
 		JOIN   pg_class      i  ON i.oid  = ix.indexrelid
 		JOIN   pg_am         am ON am.oid = i.relam
 		JOIN   pg_namespace  n  ON n.oid  = cl.relnamespace
-		JOIN   LATERAL unnest(ix.indkey) WITH ORDINALITY AS u(attnum, ord) ON TRUE
-		LEFT JOIN pg_attribute a ON a.attrelid = ix.indrelid AND a.attnum = u.attnum
+		JOIN   LATERAL unnest(ix.indkey)   WITH ORDINALITY AS u(attnum, ord) ON TRUE
+		LEFT JOIN LATERAL unnest(ix.indclass) WITH ORDINALITY AS uc(opcoid, ord) ON uc.ord = u.ord
+		LEFT JOIN pg_attribute a   ON a.attrelid = ix.indrelid AND a.attnum = u.attnum
+		LEFT JOIN pg_opclass   opc ON opc.oid    = uc.opcoid
 		WHERE  n.nspname = $1
 		  AND  cl.relkind = 'r'
 		ORDER  BY cl.relname, i.relname, u.ord`
@@ -544,11 +552,12 @@ func (r *SchemaReader) populateIndexes(ctx context.Context, tables map[string]*i
 			tableName, indexName, method, colName string
 			isUnique, isPrimary                   bool
 			ord                                   int
+			opclass                               string
 		)
 		if err := rows.Scan(
 			&tableName, &indexName, &method,
 			&isUnique, &isPrimary,
-			&colName, &ord,
+			&colName, &ord, &opclass,
 		); err != nil {
 			return err
 		}
@@ -584,7 +593,19 @@ func (r *SchemaReader) populateIndexes(ctx context.Context, tables map[string]*i
 				primary[tableName] = indexName
 			}
 		}
-		idx.Columns = append(idx.Columns, ir.IndexColumn{Column: colName})
+		// Bug 47: only carry opclass forward for extension-introduced
+		// access methods. btree/hash/gin/gist all have sensible default
+		// opclasses for built-in types; emitting the opcname there
+		// would (a) be redundant (b) clutter the DDL diffs (c) risk
+		// surfacing internal opcname differences across PG versions.
+		// Extension AMs (pgvector's ivfflat / hnsw) genuinely need the
+		// opclass on every column entry — hnsw rejects the index at
+		// CREATE without it.
+		col := ir.IndexColumn{Column: colName}
+		if opclass != "" && idx.Method != "" {
+			col.OperatorClass = opclass
+		}
+		idx.Columns = append(idx.Columns, col)
 	}
 	if err := rows.Err(); err != nil {
 		return err

@@ -713,6 +713,14 @@ func emitIndexColumnList(cols []ir.IndexColumn) string {
 		} else {
 			entry = quoteIdent(c.Column)
 		}
+		// Per-column operator class — populated by the schema reader
+		// only for extension-introduced access methods that need an
+		// explicit opclass (pgvector's hnsw rejects the index at
+		// CREATE without one). Default-opclass cases (btree/hash/gin
+		// over built-ins) leave this empty and emit nothing extra.
+		if c.OperatorClass != "" {
+			entry += " " + c.OperatorClass
+		}
 		if c.Desc {
 			entry += " DESC"
 		}

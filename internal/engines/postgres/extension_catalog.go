@@ -217,26 +217,21 @@ var pgVectorDef = extensionDef{
 }
 
 // pgVectorDimFromTypmod decodes the dimension count out of
-// pg_attribute.atttypmod for a pgvector column. pgvector uses
-// `typmod = dimension + 4` (the +4 is the convention the extension
-// picks; -1 means "no modifier"). Returns (0, false) when no
-// dimension was supplied at column declaration.
+// pg_attribute.atttypmod for a pgvector column. The reference is
+// `vector_typmod_in` in pgvector/src/vector.c: the typmod IS the
+// dimension verbatim — no offset. atttypmod = -1 is the PG
+// "no modifier" sentinel and means a bare `vector` column with no
+// dimension constraint.
 //
-// The extension's reference for the encoding is in pgvector source —
-// `vector_in()` rejects typmod < 1 + 4 = 5 (i.e. minimum dimension
-// is 1, encoded as 5). atttypmod = -1 is "no typmod"; atttypmod >= 5
-// carries the (dimension - 1 + 5) = dimension + 4 mapping. We accept
-// both decoded forms by deriving dimension as `typmod - 4` and
-// rejecting non-positive results.
+// (An earlier version of this helper assumed a `dimension + 4`
+// offset; that was a misread of the pgvector source — Bug 47 surfaced
+// it when the source IR's Modifiers came back empty for a `vector(3)`
+// column whose atttypmod the catalog query observed as 3.)
 func pgVectorDimFromTypmod(typmod int32) (dim int, ok bool) {
 	if typmod <= 0 {
 		return 0, false
 	}
-	d := int(typmod) - 4
-	if d <= 0 {
-		return 0, false
-	}
-	return d, true
+	return int(typmod), true
 }
 
 // emitExtensionColumn dispatches an [ir.ExtensionType] column to the

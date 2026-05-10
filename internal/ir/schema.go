@@ -318,6 +318,17 @@ type IndexColumn struct {
 	// Length is a prefix length for prefix indexes (MySQL); zero means
 	// the entire column value is indexed.
 	Length int
+	// OperatorClass is the PG operator-class name attached to this
+	// index column, when one is required for the access method (PG
+	// only — MySQL has no equivalent surface). The load-bearing case
+	// is pgvector's hnsw access method, which has no default operator
+	// class: every column entry must specify one of `vector_l2_ops`
+	// / `vector_ip_ops` / `vector_cosine_ops` / `vector_l1_ops`. The
+	// IR carries the bareword verbatim; the same-engine writer emits
+	// `<column> <opclass>` after the column reference. Empty when the
+	// AM has a default opclass for the column type (the common case
+	// for btree/gin/gist over built-in types).
+	OperatorClass string
 }
 
 // FKAction is the action to take on a referenced row's UPDATE or DELETE.
