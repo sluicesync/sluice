@@ -6,6 +6,46 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.28.0]
+
+**PostGIS-aware GEOMETRY/SPATIAL translation closes Bug 26 + Bug 27.** Sluice's IR has carried `ir.Geometry` since the beginning, but cross-engine PG ↔ MySQL geometry has been refused at the schema-write boundary (PG: "GEOMETRY requires PostGIS"; MySQL: SRID dropped). v0.28.0 lifts the refusal: PostGIS-detected PG targets accept `ir.Geometry` columns and emit `geometry(<subtype>, <srid>)`; MySQL targets emit `<type> SRID <n>` (MySQL 8.0+ syntax) preserving the SRID; cross-engine PG → MySQL round-trip closes Bug 26. The VStream-specific 4-byte SRID prefix on POINT bytes is now stripped + captured (closes Bug 27); vanilla MySQL protocol path unchanged. ADR-0035 documents the design.
+
+### Fixed
+
+- **Bug 26 — PostGIS SRID dropped on cross-engine schema translation.** `ir.Geometry.SRID` field carries the SRID from PG's `geometry_columns` view through translation. PG schema writer emits `geometry(<subtype>, <srid>)` when PostGIS is detected (init-time `SELECT 1 FROM pg_extension WHERE extname = 'postgis'`); without PostGIS, the existing loud refusal is preserved. MySQL `emitColumnDef` appends `SRID <n>` when `ir.Geometry.SRID != 0` (MySQL 8.0+ syntax); SRID 0 still emits the bare type. WKB → EWKB conversion at PG write-time injects the SRID's 4-byte prefix; EWKB → WKB on PG read-time captures the SRID for cross-engine flow.
+
+- **Bug 27 — VStream POINT bytes mis-parsed (4-byte SRID prefix).** `decodeVStreamCell` in `internal/engines/mysql/cdc_vstream.go` splits `query.Type_GEOMETRY` from the binary fall-through and strips the 4-byte little-endian SRID prefix; under-5-byte payloads pass through as-is. Vanilla MySQL protocol path unaffected (it strips the prefix correctly already). The `psverify`-build-tag end-to-end verification against a real PlanetScale source remains operator-run; the unit-test fixture (`TestDecodeVStreamCellGeometry` with 3 sub-cases — SRID 4326, malformed short, SRID 0) proves the byte-level fix.
+
+### Added
+
+- **ADR-0035 — PostGIS-aware GEOMETRY/SPATIAL support.** Decision rationale, EWKB ↔ MySQL-prefix conversion detail, 5-scenario threat model (PostGIS-absent target, SRID mismatch, VStream prefix on vanilla MySQL connections, EPSG SRID unrecognized, MySQL → PG cross-engine SRID drift), explanation of why this is parented under roadmap item 6 (cross-engine focus) rather than item 11 (PG → PG extension passthrough — the PostGIS PG-to-PG case follows naturally now that the writer emit path lands).
+
+- **`postgis/postgis:16-3.4` pre-pulled in CI's Integration job.** `.github/workflows/ci.yml` adds the image to the pre-pull list and runs `go test -tags="integration postgis" -timeout=15m ./internal/pipeline/...` as a separate Integration step. The image-pull cost (~500 MB layer) is one-time per cache; subsequent runs hit the warm cache.
+
+- **`integration postgis` build tag** for cross-engine geometry round-trip integration tests. New tests under `migrate_postgis_integration_test.go`: `TestMigrate_PostGIS_PGToMySQL` (Phase C reverse direction; closes Bug 26's load-bearing pin); existing `TestMigrate_PostGIS_MySQLToPG` (already shipped) still covers the forward direction.
+
+### Changed
+
+- **`unsupportablePGtoMySQL` in `internal/pipeline/cross_engine_supportable.go`** no longer refuses `ir.Geometry`; the refusal narrows to `ir.ExtensionType` (the v0.26.0 PG extension passthrough framework's IR variant). Cross-engine PG → MySQL geometry now works as long as both source and target have their respective spatial subsystems (PostGIS on PG, MySQL spatial types).
+
+- **Roadmap item 6 (GEOMETRY/SPATIAL)** moved from "Next up" to "Recently landed" with one-line summary. The MySQL/PostgreSQL parity tracker subsection now shows GEOMETRY/SPATIAL as "PG-to-PG + cross-engine v0.28.0; VStream Phase B v0.28.0 (operator-run via psverify)".
+
+### Migration / Compatibility
+
+- **No format-breaking changes.** Manifest schema, change-chunk format, CLI surface — all unchanged for existing flows.
+- **Default behavior changed for PG targets WITH PostGIS installed.** Previously the schema writer refused all `ir.Geometry` columns with `GEOMETRY requires PostGIS; not supported in this writer version`. Post-v0.28.0, the writer emits `geometry(<subtype>, <srid>)` for those columns. Operators with PostGIS-bearing PG targets who relied on the loud-failure to bail on geometry columns should review whether they want the new automatic emission (they probably do — that's the load-bearing fix) or set `--type-override` on those columns to `bytea` for the previous opaque-bytes shape.
+- **Default behavior unchanged for PG targets WITHOUT PostGIS.** The loud refusal is preserved.
+- **Default behavior unchanged for MySQL targets** — already accepted geometry columns; v0.28.0 just adds SRID preservation in the emit shape.
+- **Drop-in upgrade from v0.27.0.** No DDL migration on `sluice_cdc_state`; no operator action required.
+
+### Known limitations
+
+- **VStream Phase B end-to-end verification is operator-run via `psverify`.** The unit-test fixture proves the byte-level fix; the full PlanetScale source → sluice → target round-trip needs the operator's PlanetScale credentials (per `feedback_planetscale_creds.md`). Operators using PlanetScale Vitess sources with PostGIS-shaped POINT columns should verify the round-trip manually before relying on the v0.28.0 fix in production.
+
+- **EPSG SRID handling is "common subset" only.** PG's `spatial_ref_sys` table has thousands of SRIDs; MySQL has hard-coded mappings for a smaller subset. Sluice doesn't enforce SRID-existence checks at translation time; an unrecognized SRID will surface as a target-side error at INSERT time (the loud-failure tenet). v1 doesn't enumerate the supported SRID set — operators using non-EPSG-common SRIDs should test their workload before committing.
+
+- **PG-to-PG PostGIS passthrough lands by side-effect, not by explicit framework integration.** Roadmap item 11 (PG extension passthrough framework) shipped pgvector as the first concrete extension in v0.26.0; PostGIS would naturally fit as a catalog entry there. v0.28.0 ships PostGIS via the cross-engine path under item 6 instead — both PG-to-PG passthrough AND cross-engine PG ↔ MySQL work, but the explicit `--enable-pg-extension postgis` flag isn't yet wired (the v0.26.0 framework will fold PostGIS in as a future catalog entry, parallel to pg_trgm / hstore / citext).
+
 ## [0.27.0]
 
 **MySQL Phase 2 mid-stream live add-table** (parity for v0.24.0's PG-only `--no-drain`). Operators with high-availability MySQL workloads can now bring a new source table into an active CDC stream's scope without the `sluice sync stop --wait` drain that Phase 1 required. Different mechanism from PG (binlog auto-includes every table; the gate is in the streamer's table-filter, not in a publication): sluice persists the live-added table into a new `live_added_tables` column on `sluice_cdc_state`, and the running streamer polls the column on the same cadence as `stop_requested_at` and atomically extends `applyTableFilter`'s scope. ADR-0034 documents the design. Same operator UX as PG (`sluice schema add-table TABLE --no-drain`); same best-effort caveat (events on the new table during the bulk-copy + filter-flip window may not be delivered — operators with high write rates should use the drained flow or quiesce briefly).
