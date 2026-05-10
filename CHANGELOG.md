@@ -6,6 +6,31 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.25.1]
+
+Two-bug patch from the v0.25.0 cycle. Both bugs were introduced by v0.25.0's `--target-schema` flag and surfaced in the load-bearing happy-path scenario + the v0.24.0 live-add-table interaction.
+
+### Fixed
+
+- **Bug 45 — `--target-schema=NAME` against a PG source with enum-typed columns failed at CREATE TABLE with `ERROR: type "<table>_<column>_enum" does not exist (SQLSTATE 42704)`.** The PG schema writer schema-qualified the `CREATE TYPE` statement correctly (`CREATE TYPE "customer_svc"."orders_status_enum" AS ENUM (...)`), but the column-type ident inside `CREATE TABLE` and the `::cast` in column DEFAULT expressions were emitted unqualified — PG's parser with default `search_path` couldn't find the unqualified type and bailed. Fix: new `qualifiedEnumTypeRef` helper in PG ddl_emit; `emitColumnDef` qualifies enum column-type idents and the `::cast` suffix on DEFAULT expressions when TargetSchema is non-empty. Default-public operators (no `--target-schema`) see no behaviour change — the new `schemaExplicit` flag on the SchemaWriter only triggers qualifying emission when `SetSchema` was called from operator override.
+
+- **Bug 46 — `schema add-table --no-drain` against a stream started with `--target-schema=NAME` silently dropped CDC events on the new table.** The new table was created in `public.<table>` while the active stream's CDC applier (still running with `--target-schema=NAME`) routed new-table CDC events to `<NAME>.<table>` — which didn't exist. Events emitted a single WARN and silently dropped. Two-part fix: (a) added `--target-schema=NAME` flag to `schema add-table` (mirroring `migrate` / `sync start` / `schema preview`); (b) persist `target_schema` to `sluice_cdc_state` at sync start via the new `targetSchemaSetter` engine surface (PG implements; MySQL doesn't — same shape as v0.24.0's slot_name plumbing); (c) `AddTable.preflightStream` resolves the target schema from operator-supplied flag → recorded cdc-state value → (legacy) empty, with a 5-case resolution table covering inherit-from-recorded, operator-override, mismatch-refusal, agreement, and legacy-row-back-fill behaviors.
+
+### Added
+
+- **`--target-schema=NAME` flag on `sluice schema add-table`.** When non-empty, both bulk-copy DDL and any subsequent CDC events on the new table land in the named PG schema. Auto-inherits the active stream's recorded value when omitted; refuses with a clear error when the operator-supplied value disagrees with the recorded value (the latter close ADR-0031's previously-documented "mid-flight `--target-schema` change is NOT detected" caveat).
+- **`target_schema TEXT NULL` column on `sluice_cdc_state` (PG).** Idempotent migration via `ADD COLUMN IF NOT EXISTS` (mirrors v0.24.0's `slot_name` and v0.25.0's `source_dsn_fingerprint`). Streamer records the resolved target schema on every position-write via the new `targetSchemaSetter` interface; `ListStreams` returns it as `StreamStatus.TargetSchema`.
+
+### Changed
+
+- **ADR-0031 threat-model entry 5** (mid-flight `--target-schema` change on warm-resume not detected) moved from "deferred until a real operator surfaces the gap" to **"closed in v0.25.1"** via the recorded `target_schema` column + add-table mismatch refusal. A future warm-resume `sync start` with a different `--target-schema` against an existing stream-id refuses the same way as add-table's mismatch path; the operator either matches the recorded value or runs `--reset-target-data`.
+
+### Migration / Compatibility
+
+- **No format-breaking changes.** Manifest schema, change-chunk format, CLI surface — all unchanged for existing flows. The new `target_schema` column on `sluice_cdc_state` is additive (idempotent `ADD COLUMN IF NOT EXISTS`); legacy rows surface as empty TargetSchema via `COALESCE` and skip the resolution check (preserves backward-compat).
+- **Drop-in upgrade from v0.25.0.** No DDL migration needed; the new column lands on first `EnsureControlTable` call.
+- **Default behavior unchanged.** Operators not using `--target-schema` see no emission style changes — the `schemaExplicit` flag on the SchemaWriter only triggers qualifying emission when `SetSchema` was called from operator override.
+
 ## [0.25.0]
 
 Multi-source aggregation Phase 1 + Phase 2: **`--target-schema` (PG-only) + stream-id collision detection.** Operators with N source databases landing in one target Postgres can now namespace each source's tables into its own schema (`customer_svc.users`, `billing_svc.users`) with a single CLI flag — N independent `sluice sync start` processes, one per source, each with its own `--target-schema NAME` + `--stream-id`. The `sluice_cdc_state` control table picks up a `source_dsn_fingerprint` column and refuses on stream-id collision (operator typo'd `--stream-id`; would silently overwrite another stream's position). ADR-0031 formalises the design (Shape B per `docs/dev/design-multi-source-aggregation.md`); Shape A (sharded → consolidated) is queued as a long-term roadmap entry, and MySQL native parity is the documented follow-up (today MySQL operators get equivalent coverage via `--target` DSN choice).
