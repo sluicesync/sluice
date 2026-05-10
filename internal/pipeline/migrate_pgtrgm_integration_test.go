@@ -179,7 +179,7 @@ func TestMigrate_PG_PgTrgm_GinIndexPassthrough(t *testing.T) {
 		JOIN   LATERAL unnest(ix.indclass) WITH ORDINALITY AS uc(opcoid, ord) ON TRUE
 		JOIN   pg_opclass opc ON opc.oid = uc.opcoid
 		WHERE  cl.relname = 'documents'
-		  AND  i.relname  = 'documents_documents_body_trgm'`
+		  AND  i.relname  = 'documents_body_trgm'`
 	var (
 		amname  string
 		opcname string
@@ -308,7 +308,7 @@ func TestMigrate_PG_PgTrgm_GistIndexPassthrough(t *testing.T) {
 		JOIN   LATERAL unnest(ix.indclass) WITH ORDINALITY AS uc(opcoid, ord) ON TRUE
 		JOIN   pg_opclass opc ON opc.oid = uc.opcoid
 		WHERE  cl.relname = 'documents'
-		  AND  i.relname  = 'documents_documents_body_trgm_gist'`
+		  AND  i.relname  = 'documents_body_trgm_gist'`
 	var (
 		amname  string
 		opcname string
