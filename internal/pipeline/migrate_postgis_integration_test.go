@@ -305,6 +305,13 @@ func TestMigrate_PostGIS_PGToMySQL(t *testing.T) {
 		Target:    mysqlEng,
 		SourceDSN: pgSource,
 		TargetDSN: mysqlTarget,
+		// PostGIS auto-installs `geography_columns` + `geometry_columns`
+		// views into the public schema as part of `CREATE EXTENSION
+		// postgis`. They reference PG-specific functions that don't
+		// translate to MySQL; the test's focus is GEOMETRY column
+		// translation, not view-body translation. SkipViews keeps the
+		// test scoped to what Bug 26's fix actually addresses.
+		SkipViews: true,
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
