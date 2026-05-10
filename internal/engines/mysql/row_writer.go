@@ -345,7 +345,7 @@ func flattenArgs(batch []ir.Row, table *ir.Table) []any {
 	args := make([]any, 0, len(batch)*len(cols))
 	for _, row := range batch {
 		for _, col := range cols {
-			args = append(args, prepareValue(row[col.Name], col.Type))
+			args = append(args, prepareValue(row[col.Name], col))
 		}
 	}
 	return args
@@ -379,17 +379,29 @@ func flattenArgs(batch []ir.Row, table *ir.Table) []any {
 //   - [ir.JSON] target with a PG-array-literal string ("{a,b,c}"):
 //     same scenario when the source presented the array as text
 //     rather than []any. We parse the literal and re-emit as JSON.
-func prepareValue(v any, t ir.Type) any {
+//
+// The col parameter carries the column's IR descriptor. The post-
+// translate Type drives the branch dispatch; [ir.Column.SourceColumnType]
+// is consulted only to disambiguate the literal `{}` bytes case
+// (Bug 47 vs Bug 14 — see [convertArrayLikeToJSON]). A nil col is
+// tolerated: the value passes through unchanged, matching the
+// pre-Bug-6 fallback shape and keeping defensive applier callers
+// safe.
+func prepareValue(v any, col *ir.Column) any {
 	if v == nil {
 		return nil
 	}
+	if col == nil {
+		return v
+	}
+	t := col.Type
 	if _, isSet := t.(ir.Set); isSet {
 		if ss, ok := v.([]string); ok {
 			return strings.Join(ss, ",")
 		}
 	}
 	if _, isJSON := t.(ir.JSON); isJSON {
-		if converted, ok := convertArrayLikeToJSON(v); ok {
+		if converted, ok := convertArrayLikeToJSON(v, col); ok {
 			return converted
 		}
 		if b, ok := v.([]byte); ok {
@@ -445,7 +457,13 @@ func prepareValue(v any, t ir.Type) any {
 // string branch) handles bytes correctly, and the driver's own
 // error handling will report any genuinely-bad value the operator
 // supplied.
-func convertArrayLikeToJSON(v any) (any, bool) {
+//
+// The col parameter carries the column's pre-override source type
+// in [ir.Column.SourceColumnType]; the `[]byte` branch consults it
+// to disambiguate the literal `{}` shape — see the branch comment
+// for Bug 47 (round-trip empty JSON object) vs Bug 14 (override
+// empty PG array landing as JSON).
+func convertArrayLikeToJSON(v any, col *ir.Column) (any, bool) {
 	switch shaped := v.(type) {
 	case []any:
 		out, err := json.Marshal(shaped)
@@ -469,19 +487,41 @@ func convertArrayLikeToJSON(v any) (any, bool) {
 		// column was overridden to JSON post-decode and the value
 		// arrived from the source's text-form array reader.
 		//
-		// Disambiguation: try PG-array parsing first. The PG array
-		// grammar is strict — JSON objects with quoted keys and
-		// colons fail to parse — so a successful parse is high
-		// signal that the bytes are an array literal. The corner
-		// case is `{}`, which parses as both an empty PG array and
-		// an empty JSON object; we prefer the array interpretation
-		// because Bug 14's specific surface is the override case
-		// (empty PG arrays as bytes in JSON-target columns) and
-		// landing `{}` as the JSON object on MySQL would also be a
-		// caller error in any sensible setup. For non-`{}` JSON
-		// bytes, the PG-array parse fails and we fall through to
-		// the next branch (which emits the bytes as a string).
+		// Disambiguation: try PG-array parsing for non-empty
+		// `{...}` bytes. The PG array grammar is strict — JSON
+		// objects with quoted keys and colons fail to parse — so a
+		// successful parse is high signal that the bytes are an
+		// array literal. For non-`{...}` JSON bytes, the PG-array
+		// parse fails and we fall through to the next branch
+		// (which emits the bytes as a string).
+		//
+		// The corner case is `{}`, which is BOTH an empty JSON
+		// object and an empty PG array literal. Two converging
+		// real-world paths arrive at `[]byte("{}")` on a JSON-target
+		// column:
+		//   - Bug 47: MySQL JSON source column with value `{}`. The
+		//     correct round-trip is the JSON object `{}`. The
+		//     column has no `SourceColumnType` (no override fired).
+		//   - Bug 14: PG `text[]` source with `--type-override=jsonb`
+		//     and an empty array value. The correct landing is the
+		//     JSON array `[]`. The column's `SourceColumnType` is
+		//     an [ir.Array].
+		// We discriminate on `SourceColumnType`: only when the
+		// pre-override type is an array do we route `{}` through
+		// the array→JSON parser. Otherwise the bytes fall through
+		// to the next branch in [prepareValue] which emits `"{}"`
+		// (the JSON-object preservation Bug 47 demands).
 		if len(shaped) < 2 || shaped[0] != '{' || shaped[len(shaped)-1] != '}' {
+			return nil, false
+		}
+		if len(shaped) == 2 {
+			// Empty `{}`. Only treat as PG empty array when an
+			// override carries that intent in SourceColumnType.
+			if col != nil {
+				if _, fromArray := col.SourceColumnType.(ir.Array); fromArray {
+					return "[]", true
+				}
+			}
 			return nil, false
 		}
 		if converted, err := pgArrayLiteralToJSON(string(shaped)); err == nil {

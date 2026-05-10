@@ -147,6 +147,15 @@ func validateMappingsAgainstSchema(s *ir.Schema, byTable map[string]map[string]r
 // rewritten to the resolved IR type. Columns not in colMap share
 // pointers with the source — schemas are large and most tables
 // won't have any overrides at all.
+//
+// The rewritten column also records the pre-override type in
+// [ir.Column.SourceColumnType] so downstream writers can disambiguate
+// value shapes that are indistinguishable from the post-override
+// Type + bytes alone. See Bug 47 / `prepareValue` in
+// internal/engines/mysql/row_writer.go for the load-bearing case
+// (empty PG `text[]` value `[]byte("{}")` overridden to JSON must
+// land as `[]`, while a MySQL JSON source value `[]byte("{}")` must
+// round-trip as `{}`).
 func rewriteTable(tbl *ir.Table, colMap map[string]resolvedMapping) *ir.Table {
 	out := *tbl
 	out.Columns = make([]*ir.Column, len(tbl.Columns))
@@ -157,6 +166,7 @@ func rewriteTable(tbl *ir.Table, colMap map[string]resolvedMapping) *ir.Table {
 			continue
 		}
 		newCol := *c
+		newCol.SourceColumnType = c.Type
 		newCol.Type = mapping.irTy
 		out.Columns[i] = &newCol
 	}

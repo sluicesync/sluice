@@ -106,13 +106,17 @@ type ChangeApplier struct {
 	// Insert falls back to plain INSERT (see the package comment).
 	pkCache map[string][]string
 
-	// colTypeCache maps "schema.table" → column-name → IR type. It
+	// colTypeCache maps "schema.table" → column-name → *ir.Column. It
 	// is the input to prepareValue for every value the applier
 	// binds: see the file-header comment for the JSON-column bug
-	// this exists to fix. Populated lazily on the first sight of a
-	// table via a single information_schema query — same shape as
-	// pkCache. Cache miss is one round-trip; hit is a map lookup.
-	colTypeCache map[string]map[string]ir.Type
+	// this exists to fix. The map carries the full Column descriptor
+	// (not just the IR type) so prepareValue can consult fields like
+	// [ir.Column.SourceColumnType] when disambiguating value shapes
+	// — see Bug 47 / convertArrayLikeToJSON in row_writer.go.
+	// Populated lazily on the first sight of a table via a single
+	// information_schema query — same shape as pkCache. Cache miss
+	// is one round-trip; hit is a map lookup.
+	colTypeCache map[string]map[string]*ir.Column
 
 	// maxBufferBytes is the soft byte-size cap on the in-flight
 	// batch's buffered change values during ApplyBatch. Implements
@@ -465,7 +469,7 @@ func (a *ChangeApplier) pkFor(ctx context.Context, tx *sql.Tx, schema, table str
 // path the CDC reader takes to refresh its decoder cache after DDL,
 // so any new IR type the schema reader learns is automatically
 // available to the applier without further plumbing.
-func (a *ChangeApplier) colTypesFor(ctx context.Context, _ *sql.Tx, schema, table string) (map[string]ir.Type, error) {
+func (a *ChangeApplier) colTypesFor(ctx context.Context, _ *sql.Tx, schema, table string) (map[string]*ir.Column, error) {
 	qn := qualifiedName(schema, table)
 	if cached, ok := a.colTypeCache[qn]; ok {
 		return cached, nil
@@ -481,9 +485,9 @@ func (a *ChangeApplier) colTypesFor(ctx context.Context, _ *sql.Tx, schema, tabl
 	if err != nil {
 		return nil, err
 	}
-	out := make(map[string]ir.Type, len(tbl.Columns))
+	out := make(map[string]*ir.Column, len(tbl.Columns))
 	for _, col := range tbl.Columns {
-		out[col.Name] = col.Type
+		out[col.Name] = col
 	}
 	a.colTypeCache[qn] = out
 	return out, nil
@@ -545,12 +549,13 @@ func loadPrimaryKey(ctx context.Context, tx *sql.Tx, schema, table string) ([]st
 // to a plain INSERT — see the ChangeApplier package doc for the
 // resume-idempotency caveat.
 //
-// colTypes maps column names to their IR types and is the input to
-// prepareValue. A missing entry (empty map, or column not present)
-// is tolerated and the raw value is bound — the same pre-Bug-6
-// shape — so that callers without a populated cache (currently only
-// unit tests pre-dating this fix) still produce valid SQL.
-func buildInsertSQL(schema, table string, row ir.Row, pk []string, colTypes map[string]ir.Type) (sqlStmt string, args []any) {
+// colTypes maps column names to their full IR descriptors and is the
+// input to prepareValue. A missing entry (empty map, or column not
+// present) is tolerated and the raw value is bound — the same
+// pre-Bug-6 shape — so that callers without a populated cache
+// (currently only unit tests pre-dating this fix) still produce
+// valid SQL.
+func buildInsertSQL(schema, table string, row ir.Row, pk []string, colTypes map[string]*ir.Column) (sqlStmt string, args []any) {
 	cols := sortedKeys(row)
 	args = make([]any, 0, len(cols))
 	colSQL := make([]string, len(cols))
@@ -614,7 +619,7 @@ func buildInsertSQL(schema, table string, row ir.Row, pk []string, colTypes map[
 // in After (including ones whose value didn't change — unchanged-
 // column detection is a v1.5 optimization). WHERE uses every column
 // in Before with NULL-aware predicate building.
-func buildUpdateSQL(schema, table string, before, after ir.Row, colTypes map[string]ir.Type) (sqlStmt string, args []any) {
+func buildUpdateSQL(schema, table string, before, after ir.Row, colTypes map[string]*ir.Column) (sqlStmt string, args []any) {
 	tableRef := quoteIdent(schema) + "." + quoteIdent(table)
 	setSQL, setArgs := buildSetClause(after, colTypes)
 	whereSQL, whereArgs := buildWhereClause(before, colTypes)
@@ -627,7 +632,7 @@ func buildUpdateSQL(schema, table string, before, after ir.Row, colTypes map[str
 
 // buildDeleteSQL builds a DELETE statement using the Before image
 // as the WHERE predicate.
-func buildDeleteSQL(schema, table string, before ir.Row, colTypes map[string]ir.Type) (sqlStmt string, args []any) {
+func buildDeleteSQL(schema, table string, before ir.Row, colTypes map[string]*ir.Column) (sqlStmt string, args []any) {
 	tableRef := quoteIdent(schema) + "." + quoteIdent(table)
 	whereSQL, whereArgs := buildWhereClause(before, colTypes)
 	return "DELETE FROM " + tableRef + " WHERE " + whereSQL, whereArgs
@@ -641,7 +646,7 @@ func buildTruncateSQL(schema, table string) string {
 // buildSetClause renders "col1 = ?, col2 = ?" for an UPDATE SET.
 // NULL values bind through database/sql normally; no special form
 // is needed in SET (unlike WHERE).
-func buildSetClause(row ir.Row, colTypes map[string]ir.Type) (clause string, args []any) {
+func buildSetClause(row ir.Row, colTypes map[string]*ir.Column) (clause string, args []any) {
 	cols := sortedKeys(row)
 	parts := make([]string, len(cols))
 	args = make([]any, 0, len(cols))
@@ -666,7 +671,7 @@ func buildSetClause(row ir.Row, colTypes map[string]ir.Type) (clause string, arg
 // (whitespace, key order) the way operators expect. This is the
 // SQL-side half of the Bug 6 silent-failure fix; the value-shaping
 // half (prepareValue routing) is the other.
-func buildWhereClause(row ir.Row, colTypes map[string]ir.Type) (clause string, args []any) {
+func buildWhereClause(row ir.Row, colTypes map[string]*ir.Column) (clause string, args []any) {
 	cols := sortedKeys(row)
 	parts := make([]string, 0, len(cols))
 	args = make([]any, 0, len(cols))
@@ -687,11 +692,15 @@ func buildWhereClause(row ir.Row, colTypes map[string]ir.Type) (clause string, a
 // equality operator does a JSON-vs-JSON comparison rather than a
 // JSON-vs-string-literal comparison (which silently never matches).
 // Every other column type uses a bare ?.
-func placeholderFor(colTypes map[string]ir.Type, colName string) string {
+func placeholderFor(colTypes map[string]*ir.Column, colName string) string {
 	if colTypes == nil {
 		return "?"
 	}
-	if _, isJSON := colTypes[colName].(ir.JSON); isJSON {
+	col, ok := colTypes[colName]
+	if !ok || col == nil {
+		return "?"
+	}
+	if _, isJSON := col.Type.(ir.JSON); isJSON {
 		return "CAST(? AS JSON)"
 	}
 	return "?"
@@ -708,15 +717,15 @@ func placeholderFor(colTypes map[string]ir.Type, colName string) string {
 // JSON []byte → string conversion here means new shaping rules added
 // to prepareValue (for future IR types) are automatically picked up
 // by the applier without touching this file.
-func prepareApplierValue(v any, colTypes map[string]ir.Type, colName string) any {
+func prepareApplierValue(v any, colTypes map[string]*ir.Column, colName string) any {
 	if colTypes == nil {
 		return v
 	}
-	t, ok := colTypes[colName]
-	if !ok {
+	col, ok := colTypes[colName]
+	if !ok || col == nil {
 		return v
 	}
-	return prepareValue(v, t)
+	return prepareValue(v, col)
 }
 
 // (sortedKeys is shared with the schema reader — see schema_reader.go

@@ -6,6 +6,25 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.29.1]
+
+**Closes Bug 47 — MySQL writer corrupts empty JSON object `{}` to empty JSON array `[]` on bulk copy.** Pre-existing latent bug reproducing back to v0.20.0; surfaced in v0.29.0 cycle. A simple "preserve `{}` bytes" fix in `convertArrayLikeToJSON` was attempted, rolled back when it broke `TestMigrate_PostgresToMySQL_ArrayToJSONOverride` (Bug 14's load-bearing test) — the two paths converge irreducibly at `prepareValue([]byte("{}"), ir.JSON{...})` with no signal from the bytes + target type alone. The proper fix carries pre-override context: `ir.Column` gains an optional `SourceColumnType` field that `translate.ApplyMappings` populates when an override fires. The MySQL writer's `prepareValue` now consults this to disambiguate the two surfaces: `SourceColumnType = ir.Array{...}` → `[]` (Bug 14 override path); nil or non-array → `{}` (Bug 47 round-trip path).
+
+### Fixed
+
+- **Bug 47 — empty JSON object `{}` round-trip on MySQL targets.** MySQL JSON source columns carrying `{}` now land on MySQL targets as `{}` (`JSON_TYPE = OBJECT`), not `[]` (`JSON_TYPE = ARRAY`). PG → MySQL also fixed (same writer-side path). Bug 14's PG `text[]` override to `jsonb` continues to land empty arrays as `[]` (load-bearing integration test still green).
+
+### Migration / Compatibility
+
+- **No format-breaking changes.** No CLI changes, no on-disk format changes, no engine-interface changes.
+- **Drop-in upgrade from v0.29.0.** No operator action required.
+- **`ir.Column.SourceColumnType` is an internal IR field.** Engines and external consumers reading `ir.Column` see it as nil unless `translate.ApplyMappings` has run with an explicit per-column override. Field is informational — writers consult it; readers do not populate it.
+
+### Who needs this release
+
+- **Operators running MySQL → MySQL or PG → MySQL `migrate` / `sync` on workloads that use `'{}'` as a JSON value** (e.g. as a default for not-yet-populated `attrs` / `metadata` / `config` columns). Pre-fix: those values silently flipped to `'[]'` on the target. Detection: `SELECT JSON_TYPE(col) FROM table` on src vs dest after migrate; mismatched OBJECT-vs-ARRAY counts confirm the bug fired. Workaround in older versions was changing source defaults from `'{}'` to a placeholder like `'{"_": null}'` — no longer needed.
+- **Everyone else:** drop-in; no behavior change.
+
 ## [0.29.0]
 
 **CI structural improvements + Path D Phase A diagnostic infrastructure for mid-stream live add-table loss.** Two operator-visible threads land together: (a) the `Integration (PostGIS)` job is now a separate parallel CI gate (cuts wall-clock from ~45 min to ~25 min on tag pushes); (b) sluice now runs `integration vstream` (vttestserver-based VStream coverage) on an always-on Vultr instance during pre-release validation, closing the gap CI explicitly skipped for cost reasons. Internal: new ADR-0036 documents the empirical Phase A.1 characterization of the mid-stream live add-table residual loss surface — diagnostic-only branch, no behavior change to the v0.24.0 best-effort flow yet.

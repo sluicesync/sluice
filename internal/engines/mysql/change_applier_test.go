@@ -185,9 +185,9 @@ func TestBuildInsertSQL_JSONColumnRoutesThroughPrepareValue(t *testing.T) {
 		"id":   int64(1),
 		"data": []byte(`{"k":"v"}`),
 	}
-	colTypes := map[string]ir.Type{
-		"id":   ir.Integer{Width: 64},
-		"data": ir.JSON{Binary: true},
+	colTypes := map[string]*ir.Column{
+		"id":   {Name: "id", Type: ir.Integer{Width: 64}},
+		"data": {Name: "data", Type: ir.JSON{Binary: true}},
 	}
 
 	_, gotArgs := buildInsertSQL("src", "docs", row, []string{"id"}, colTypes)
@@ -211,9 +211,9 @@ func TestBuildSetClause_JSONColumnRoutesThroughPrepareValue(t *testing.T) {
 		"id":   int64(1),
 		"data": []byte(`{"k":"v"}`),
 	}
-	colTypes := map[string]ir.Type{
-		"id":   ir.Integer{Width: 64},
-		"data": ir.JSON{Binary: true},
+	colTypes := map[string]*ir.Column{
+		"id":   {Name: "id", Type: ir.Integer{Width: 64}},
+		"data": {Name: "data", Type: ir.JSON{Binary: true}},
 	}
 
 	_, gotArgs := buildSetClause(after, colTypes)
@@ -241,9 +241,9 @@ func TestBuildWhereClause_JSONColumnRoutesThroughPrepareValue(t *testing.T) {
 		"id":   int64(1),
 		"data": []byte(`{"k":"v"}`),
 	}
-	colTypes := map[string]ir.Type{
-		"id":   ir.Integer{Width: 64},
-		"data": ir.JSON{Binary: true},
+	colTypes := map[string]*ir.Column{
+		"id":   {Name: "id", Type: ir.Integer{Width: 64}},
+		"data": {Name: "data", Type: ir.JSON{Binary: true}},
 	}
 
 	gotSQL, gotArgs := buildWhereClause(before, colTypes)
@@ -271,7 +271,7 @@ func TestPrepareApplierValue_FallsBackOnMissingType(t *testing.T) {
 	if got := prepareApplierValue(raw, nil, "data"); !reflect.DeepEqual(got, raw) {
 		t.Errorf("nil colTypes: got %#v; want raw value passthrough", got)
 	}
-	if got := prepareApplierValue(raw, map[string]ir.Type{}, "data"); !reflect.DeepEqual(got, raw) {
+	if got := prepareApplierValue(raw, map[string]*ir.Column{}, "data"); !reflect.DeepEqual(got, raw) {
 		t.Errorf("missing colName: got %#v; want raw value passthrough", got)
 	}
 }

@@ -80,6 +80,11 @@ func TestApplyMappings_BasicOverride(t *testing.T) {
 	if _, ok := statusCol.Type.(ir.Text); !ok {
 		t.Errorf("status type = %T; want ir.Text", statusCol.Type)
 	}
+	// Pre-override source type is captured on the overridden column
+	// so writers can disambiguate ambiguous value shapes (Bug 47).
+	if _, ok := statusCol.SourceColumnType.(ir.Varchar); !ok {
+		t.Errorf("status SourceColumnType = %T; want ir.Varchar (the pre-override type)", statusCol.SourceColumnType)
+	}
 	// id should still be Varchar — only status was mapped.
 	if _, ok := got.Tables[0].Columns[0].Type.(ir.Varchar); !ok {
 		t.Errorf("id type = %T; want unchanged ir.Varchar", got.Tables[0].Columns[0].Type)
@@ -87,6 +92,11 @@ func TestApplyMappings_BasicOverride(t *testing.T) {
 	// id pointer should NOT have changed (untouched columns share).
 	if got.Tables[0].Columns[0] != s.Tables[0].Columns[0] {
 		t.Errorf("expected unchanged id column pointer for unmodified column")
+	}
+	// id has no override, so SourceColumnType stays nil — the field
+	// is override-context-only.
+	if got.Tables[0].Columns[0].SourceColumnType != nil {
+		t.Errorf("id SourceColumnType = %v; want nil (no override)", got.Tables[0].Columns[0].SourceColumnType)
 	}
 }
 

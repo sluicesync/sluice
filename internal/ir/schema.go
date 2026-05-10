@@ -184,6 +184,27 @@ type Column struct {
 	// verbatim; differ → run the cross-dialect translation pass
 	// first. See ADR-0016 for the layered translation policy.
 	GeneratedExprDialect string
+
+	// SourceColumnType is the column's pre-override IR type, captured
+	// when [translate.ApplyMappings] rewrites Type from a per-column
+	// `--type-override`. Nil when no override fired (the common case).
+	//
+	// Writers consult this to disambiguate value shapes that are
+	// indistinguishable from the post-override Type + bytes alone.
+	// The load-bearing case is Bug 47: MySQL JSON source value `{}`
+	// arrives as `[]byte("{}")` and must round-trip as JSON object
+	// `{}`, while a PG empty-array `text[]` value with
+	// `--type-override=col=jsonb` arrives as the same bytes but must
+	// land as JSON array `[]`. Both paths converge at
+	// `prepareValue([]byte("{}"), ir.JSON{...})`; the only way to
+	// tell them apart is to know that the second came from an
+	// `ir.Array` source — i.e. SourceColumnType is non-nil and an
+	// [Array].
+	//
+	// Producers other than translate.ApplyMappings leave this nil;
+	// readers should never populate it (the field carries
+	// override-context, not the raw source-engine type).
+	SourceColumnType Type
 }
 
 // IsGenerated reports whether the column is a generated/computed

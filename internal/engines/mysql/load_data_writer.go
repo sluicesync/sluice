@@ -223,7 +223,7 @@ func encodeRowsTSV(ctx context.Context, w io.Writer, cols []*ir.Column, rows <-c
 				if i > 0 {
 					buf = append(buf, '\t')
 				}
-				v := prepareValue(row[c.Name], c.Type)
+				v := prepareValue(row[c.Name], c)
 				var err error
 				buf, err = tsvEncode(buf, v)
 				if err != nil {
