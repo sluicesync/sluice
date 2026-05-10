@@ -22,11 +22,17 @@ For continuity when a chunk references "the previous work":
 - **New IR surfaces.** `ir.SchemaSetter`, `ir.SourceFingerprintRecorder`, `ir.StreamStatus.SourceDSNFingerprint`. PG implements via SetSchema on SchemaReader / SchemaWriter / RowReader / RowWriter / ChangeApplier; the applier carries a separate `controlSchema` field so per-target `sluice_cdc_state` stays in the DSN's default schema while user-data INSERT/UPDATE/DELETE land in the per-source schema. MySQL deliberately doesn't implement (the validate-time refusal is the load-bearing gate).
 - **Operator UX.** `sluice sync status` renders cross-source streams from the same control table; the existing query already lists every row by stream-id. Each per-source stream stays a separate `sluice sync start` invocation — N-process aggregation rather than single-process multi-source (failure isolation, resource isolation, k8s/systemd lifecycle).
 
+### Mid-stream add-table — MySQL Phase 2 (live add via filter-flip)
+
+- **`sluice schema add-table TABLE --stream-id ID --no-drain`** — now also works against a MySQL source. Same CLI surface as the PG path; the orchestrator dispatches by source-engine capability and routes binlog sources through the new filter-flip mechanism. Operator-facing UX is identical (one flag, no operator restart). See [`adr-0034-mysql-phase-2-live-add-table.md`](adr/adr-0034-mysql-phase-2-live-add-table.md).
+- **New surfaces.** Pipeline-side optional interfaces `liveAddedTablesWriter` / `liveAddedTablesReader` (target applier records / streamer reads the filter-flip column on `sluice_cdc_state`). MySQL `ChangeApplier.RecordLiveAddedTable` writes the new table into the comma-separated `live_added_tables` column; `ChangeApplier.ReadLiveAddedTables` is what the streamer's poll consults. Streamer side: `liveAddedFilter` (atomic-pointer-to-immutable-map) + a poll goroutine paired with the existing stop-signal poll. The dispatch filter merges base + live-added with OR semantics — additive grants without touching the operator's existing `--include-table` / `--exclude-table`.
+- **Best-effort caveat (parallel to PG Phase 2).** Events on the new table arriving at the streamer's dispatch BEFORE its poll observes the new column value are dropped (poll cadence 5s default). Operators with high write rates on the new table at the moment of live-add use the drained flow or quiesce briefly. Same shape as PG Phase 2's in-flight gap (ADR-0030 § "what could go wrong"); the strict-zero-loss roadmap entry now covers both engines.
+
 ### Mid-stream add-table — Phase 2 (live add, no drain) — PG
 
-- **`sluice schema add-table TABLE --stream-id ID --no-drain`** — runs add-table against an actively-streaming sync without first running `sync stop --wait`. Strategy C variant (c) from the proto-ADR: single slot, publication-add-then-snapshot ordering. PG-only in this release; MySQL sources still require the drained workflow (separate chunk: streamer-side filter-flip mechanism). See [`adr-0030-mid-stream-live-add-table.md`](adr/adr-0030-mid-stream-live-add-table.md).
+- **`sluice schema add-table TABLE --stream-id ID --no-drain`** — runs add-table against an actively-streaming sync without first running `sync stop --wait`. Strategy C variant (c) from the proto-ADR: single slot, publication-add-then-snapshot ordering. v0.27.0 extended the same CLI surface to MySQL via filter-flip (entry above + ADR-0034). See [`adr-0030-mid-stream-live-add-table.md`](adr/adr-0030-mid-stream-live-add-table.md).
 - **New surfaces.** Pipeline-side optional interfaces `slotPositionReader` / `snapshotLSNExtractor` / `lsnComparer` so engines opt into the live-mode invariant check structurally. `Postgres.Engine.ReadSlotPosition` reads `confirmed_flush_lsn` from `pg_replication_slots`; `Postgres.Engine.ExtractSnapshotLSN` and `Postgres.Engine.CompareLSN` close the loop without leaking the engine's position envelope into the orchestrator.
-- **Operator safeguards.** Live mode refuses on engines without `publicationAdder` (clear PG-only error directing at the drained flow). Captures the active stream's slot `confirmed_flush_lsn` before publication-add; verifies snapshot-LSN ≥ slot-LSN after the snapshot opens — refuses loudly if the invariant fails (would silently drop events on the new table; ADR-0030 explains why standard ordering can't trip this in practice but the check pins the invariant against future regressions).
+- **Operator safeguards.** Live mode refuses on engine pairs that expose neither `publicationAdder` (PG path) nor `liveAddedTablesWriter` (MySQL path) — clear error directing at the drained flow. Captures the active stream's slot `confirmed_flush_lsn` before publication-add; verifies snapshot-LSN ≥ slot-LSN after the snapshot opens — refuses loudly if the invariant fails (would silently drop events on the new table; ADR-0030 explains why standard ordering can't trip this in practice but the check pins the invariant against future regressions).
 
 ### Mid-stream add-table (Phase 1 MVP)
 
@@ -265,7 +271,7 @@ Remaining size ~600-1000 LOC for 6.2 + 6.3 + a key-management ADR.
 
 **Why.** Original conditional-yes recommendation in `design-apache-arrow-integration.md` was gated on logical-backup picking Parquet. **Phase 1 logical backups shipped JSON-Lines + gzip instead** (`internal/pipeline/backup_chunk.go:8-32`); the gate dissolved. Updated research lives in [`docs/research/apache-arrow-findings.md`](../research/apache-arrow-findings.md): Shape A (Arrow as IR row representation) is recommended **defer** — sizable refactor, zero current operator demand. The narrower analytics-export angle moved to its own research item — see item 9 below.
 
-**What.** No code chunk. Revisit when an operator with a real Parquet/columnar requirement surfaces, or when item 9's research doc names a winning surface.
+**What.** No code chunk. Revisit when an operator with a real Parquet/columnar requirement surfaces, or when item 8's research doc names a winning surface.
 
 **Gotchas (preserved for the eventual revisit).** Silent type drift at Decimal-256 / Time-out-of-range / UUID-string-parse / Arrow-null-vs-empty-string boundaries — each needs explicit loud-failure branches per the loud-failure tenet. ~2× binary growth under the build tag (mitigated by keeping default untagged build slim). Shape C (Arrow as in-flight row-pipeline format) explicitly rejected as IR-tenet-violating.
 
@@ -289,22 +295,7 @@ Remaining size ~600-1000 LOC for 6.2 + 6.3 + a key-management ADR.
 
 ---
 
-### 4. Mid-stream add-table — MySQL Phase 2 (live add for binlog sources)
-
-**Why.** PG Phase 2 (`--no-drain`) shipped — see "Recently landed" + ADR-0030. The PG mechanism (publication-add-then-snapshot) doesn't translate to MySQL: binlog auto-includes every table, so the gate is in the streamer's table filter (`--include-table`/`--exclude-table`), not in a publication.
-
-**What.** Either:
-- A streamer-side filter-flip: tell the running streamer "now also include table foo" via the control table or signal channel, extending `applyTableFilter`'s scope mid-run; the bulk-copy of the new table runs alongside via the same temp-snapshot pattern Phase 1 uses for MySQL.
-- Or accept the no-filter default (already permissive on MySQL): in which case the only mid-stream gap is the schema cache, and the WARN-and-skip-then-pick-up pattern from ADR-0021 might suffice.
-
-**Gotchas.**
-- MySQL binlog is positionally addressed; there's no per-event publication membership check. Events on the new table arrive whether or not sluice is "ready" for them. Filter-flip + idempotent applier handles overlap the same way ADR-0010 does for PG.
-- Concurrent add-tables (two operators racing) for different tables: filter-flip should serialise on the control-table row.
-- VStream (PlanetScale) is a separate code path; treat as Phase 2.5 if real demand surfaces.
-
----
-
-### 5. Multi-source aggregation — Shape A (sharded → consolidated)
+### 4. Multi-source aggregation — Shape A (sharded → consolidated)
 
 **Why.** Multi-source Phase 1 + 2 (Shape B microservices → analytics warehouse) shipped in v0.25.0 — see "Recently landed". Shape A (N functionally-identical sources, sharded by key, consolidated into one target table) is the still-outstanding pattern. ADR-0031 explicitly defers it because it requires meaningfully more machinery; the proto-design at [`design-multi-source-aggregation.md`](design-multi-source-aggregation.md) covers the full surface area.
 
@@ -320,7 +311,7 @@ Remaining size ~600-1000 LOC for 6.2 + 6.3 + a key-management ADR.
 
 ---
 
-### 6. Translator catalog continuation (lowest priority)
+### 5. Translator catalog continuation (lowest priority)
 
 **Why.** `docs/dev/translator-coverage.md` is the research catalog (30 candidate rules). v0.11.0/v0.11.1/v0.11.3 closed the highest-leverage 16 rules. The remaining medium-priority entries are mostly passthroughs (NULLIF, GREATEST/LEAST), version-gated (JSON_OBJECT for PG 16+), or have semantic gotchas (REGEXP_LIKE dialect divergence). Diminishing returns now that the highest-frequency-in-DDL rules are in.
 
@@ -330,7 +321,7 @@ Remaining size ~600-1000 LOC for 6.2 + 6.3 + a key-management ADR.
 
 ---
 
-### 7. GEOMETRY / SPATIAL support — PostGIS-aware translation
+### 6. GEOMETRY / SPATIAL support — PostGIS-aware translation
 
 **Why.** Today sluice declines `GEOMETRY` emission in the PG writer with a loud error (`GEOMETRY requires PostGIS; not supported in this writer version`). Workloads with spatial columns — common in mapping / IoT / location-aware SaaS, often via Rails/Django/Hasura schemas — can't migrate at all. Two open bugs sit behind this entry: **Bug 26** (PostGIS SRID dropped on schema translation) and **Bug 27** (VStream POINT bytes mis-parsed). Prep doc with proposed shape: [`notes/prep-postgis-geometry.md`](notes/prep-postgis-geometry.md).
 
@@ -346,7 +337,7 @@ Estimated ~600-1000 LOC including tests + image-pull CI changes.
 
 ---
 
-### 8. Backup chunk compression investigation
+### 7. Backup chunk compression investigation
 
 **Why.** Phase 1 logical backups ship gzip-compressed JSON Lines (`internal/pipeline/backup_chunk.go:8-32`). The Phase 1 design doc proposed zstd at level 3; gzip shipped because it's stdlib and Phase 1 prioritised correctness. There's no documented benchmark of compression ratio or throughput vs alternatives — operators reasoning about S3 storage cost or backup-window time-to-disk are guessing.
 
@@ -360,7 +351,7 @@ Output is `docs/dev/notes/compression-benchmark.md` (data + recommendation) + a 
 
 ---
 
-### 9. Analytics-friendly source — research doc (Parquet export + DuckDB + Arrow Flight)
+### 8. Analytics-friendly source — research doc (Parquet export + DuckDB + Arrow Flight)
 
 **Why.** Operators running OLTP databases increasingly want the migration tool to also be the bridge to their analytics stack. Three orthogonal ideas surfaced in conversation that share an underlying theme: sluice as the data-out point for analytics-friendly consumption. Replaces the deferred Shape A path from item 2 with a narrower, more demand-driven framing.
 
@@ -379,7 +370,7 @@ Output: `docs/research/sluice-as-analytics-source.md` (operator personas + surfa
 
 ---
 
-### 10. Multi-source aggregation — MySQL native parity
+### 9. Multi-source aggregation — MySQL native parity
 
 **Why.** v0.25.0's `--target-schema` is PG-only by design (PG schemas are first-class; MySQL collapses schema-and-database). MySQL operators with the same multi-source-microservices pattern get equivalent coverage today via `--target` DSN choice (different MySQL databases on the same server). For most operators this is enough — the analytics queries cross databases the same way they would cross PG schemas, and MySQL's namespace model genuinely is "database = schema."
 
@@ -391,12 +382,12 @@ Output: `docs/research/sluice-as-analytics-source.md` (operator personas + surfa
 
 ---
 
-### 11. PlanetScale MySQL+Vitess test-matrix expansion
+### 10. PlanetScale MySQL+Vitess test-matrix expansion
 
 **Why.** Sluice has a `psverify` build-tag harness for PlanetScale-backed Vitess source coverage (`docs/dev/notes/psverify-status.md`), gated by `PLANETSCALE_CREDENTIALS.env`. Coverage today is operator-driven (the harness exists; the user runs it before releases when they have credentials available) rather than continuously exercised in CI. Several VStream-specific edge cases live in this gap:
 
 - **Bug 27** (VStream POINT bytes mis-parsed) is the canonical example — explicitly deferred to the "GEOMETRY/SPATIAL support" entry's Phase B because the test infrastructure is operator-run.
-- **Mid-stream MySQL Phase 2.5** (gotcha called out in the "Mid-stream add-table — MySQL Phase 2" entry) — VStream is a separate code path from vanilla MySQL binlog; the Phase 2 mechanism may need a Vitess-specific variant.
+- **Mid-stream MySQL Phase 2.5** — VStream is a separate code path from vanilla MySQL binlog. v0.27.0's MySQL Phase 2 (ADR-0034 filter-flip mechanism) ships only the binlog-source path. VStream's own table-scope semantics (per-shard streams, COPY-mode handoff) need their own analysis before the same `--no-drain` UX can extend to PlanetScale operators. Demand-driven; track here when an operator surfaces a real PS workload that needs live add-table.
 - **PlanetScale Postgres slot lifecycle** — Patroni-managed; slot loss on failover is silent without `Logical slot name` cluster config (operator memory `project_planetscale_postgres_slots.md`). The check is documented in `docs/postgres-source-prep.md` but not exercised in CI.
 - **VStream POINT/POLYGON/cross-shard-PK edge cases** — generally any PS-specific behavior beyond what vanilla MySQL exhibits.
 
@@ -409,7 +400,7 @@ Output: `docs/research/sluice-as-analytics-source.md` (operator personas + surfa
 
 ---
 
-### 12. PG → PG extension passthrough — Phase 2+ (catalog-only follow-ons)
+### 11. PG → PG extension passthrough — Phase 2+ (catalog-only follow-ons)
 
 **Status:** Phase 1 (framework + pgvector) shipped in v0.26.0 — see "Recently landed" + [ADR-0032](adr/adr-0032-pg-extension-passthrough.md). Each subsequent extension below is a catalog entry plus per-extension integration tests, not a new chunk; the framework's IR + engine surfaces don't change.
 
@@ -418,13 +409,13 @@ Output: `docs/research/sluice-as-analytics-source.md` (operator personas + surfa
 1. **pg_trgm** (Tier 2 lite — operator classes only, no new column type) — validates the index-method passthrough on a simpler shape than pgvector.
 2. **hstore** (Tier 1) — first opaque-text passthrough validation; ~80 LOC catalog entry.
 3. **citext** (Tier 1) — text + collation; ~50 LOC catalog entry. Pair with hstore in one PR if the catalog shapes land cleanly.
-4. **PostGIS** (Tier 2) — last in v1; coordinates with item 7 (GEOMETRY/SPATIAL support) — the cross-engine PostGIS path stays parented there; this entry covers the PG-to-PG passthrough as an ADR-0032 catalog entry.
+4. **PostGIS** (Tier 2) — last in v1; coordinates with item 6 (GEOMETRY/SPATIAL support) — the cross-engine PostGIS path stays parented there; this entry covers the PG-to-PG passthrough as an ADR-0032 catalog entry.
 
 **Tier 3 deferred to v2+.** uuid-ossp + pgcrypto are universal across all four hosted-PG providers but their hard part is the function-default catalog (`uuid_generate_v4()`, `gen_random_uuid()`, etc.), not the type passthrough. ADR-0032 §"Consequences" notes this as the natural Tier 3 chunk.
 
 ---
 
-### 12.original (historical context, retained for traceability)
+### 11.original (historical context, retained for traceability)
 
 **Why.** Postgres' extensibility — PostGIS, pgvector, pg_trgm, hstore, citext, ltree, pgcrypto, uuid-ossp, etc. — is a major reason operators choose PG specifically. Today sluice's IR doesn't represent extension types, so PG-source columns of those types either get dropped (silent — not OK per the loud-failure tenet) or surface a loud refusal at schema-read time. **For PG → PG syncs where both sides have the same extensions installed, those columns should "just work"** — pass through with native fidelity rather than being treated as hostile. Cross-engine targets (PG → MySQL) keep the loud-failure default; explicit operator-supplied translations stay the escape hatch (parallel to ADR-0016's expression translator catalog).
 
@@ -447,7 +438,7 @@ Output: `docs/research/sluice-as-analytics-source.md` (operator personas + surfa
 
 **Operator demand check.** Strong indirect signal — the PG ecosystem has well-documented extension-heavy adoption. pgvector specifically has had massive AI/ML adoption since 2023. PG-to-PG syncs where extensions are blocked are a real pain point. v1 ships the allowlist + 3-5 most-deployed Tier 1+2 extensions; further extensions follow demand.
 
-**v1 shortlist (pinned by item 13's research doc, [`docs/research/pg-extensions-deployment-frequency.md`](../research/pg-extensions-deployment-frequency.md))** — implementation order:
+**v1 shortlist (pinned by item 12's research doc, [`docs/research/pg-extensions-deployment-frequency.md`](../research/pg-extensions-deployment-frequency.md))** — implementation order:
 
 1. **pgvector** (Tier 2) — leads; establishes the Tier-2 index-method-passthrough machinery PostGIS will reuse. Strongest demand trajectory (AI/ML).
 2. **pg_trgm** (Tier 2 lite — operator classes only, no new column type) — validates the index path on something simpler than full pgvector.
@@ -461,9 +452,9 @@ Estimated ~800-1500 LOC for v1 + ADR + integration tests, depending on which Tie
 
 ---
 
-### 13. PG extensions deployment-frequency research doc — **shipped** (research-only, see `docs/research/pg-extensions-deployment-frequency.md`)
+### 12. PG extensions deployment-frequency research doc — **shipped** (research-only, see `docs/research/pg-extensions-deployment-frequency.md`)
 
-**Status:** Survey landed (research doc) → v1 shortlist pinned → item 12 Phase 1 (framework + pgvector) shipped in v0.26.0. The doc remains the canonical reference for the v1 shortlist's implementation order. Remaining text retained for traceability.
+**Status:** Survey landed (research doc) → v1 shortlist pinned → item 11 Phase 1 (framework + pgvector) shipped in v0.26.0. The doc remains the canonical reference for the v1 shortlist's implementation order. Remaining text retained for traceability.
 
 **Why.** Item 12 ships an extension-passthrough allowlist; the v1 list has to be picked from somewhere. Operator-perceived priorities differ wildly (a pgvector shop disagrees with a PostGIS shop disagrees with an hstore shop), so a survey of which extensions are most-deployed in the wild is the cheapest input to that decision.
 
@@ -474,15 +465,15 @@ Estimated ~800-1500 LOC for v1 + ADR + integration tests, depending on which Tie
   - **Neon** — extensions list at <https://neon.com/docs/extensions/pg-extensions>
   - **PlanetScale Postgres** — extensions list at <https://planetscale.com/docs/postgres/extensions>
   - **PlanetScale's requested-extensions tracker** at <https://ps-extensions.io/> (operator-voted demand signal — strongest direct read on what operators want that providers don't yet support)
-- **Per-extension classification** (matrix): name, primary use case, Tier (1/2/3 per item 12's framework), provider availability (Supabase / Neon / PlanetScale / PostgreSQL contrib), license, sluice-passthrough complexity estimate, "must-have for v1" yes/no with rationale.
-- **Recommended v1 allowlist** for item 12: 3-5 extensions with the strongest (deployment frequency × tractable Tier) signal. My initial guess for the shortlist: PostGIS, pgvector, pg_trgm, hstore, citext — but the survey may surface alternates.
+- **Per-extension classification** (matrix): name, primary use case, Tier (1/2/3 per item 11's framework), provider availability (Supabase / Neon / PlanetScale / PostgreSQL contrib), license, sluice-passthrough complexity estimate, "must-have for v1" yes/no with rationale.
+- **Recommended v1 allowlist** for item 11: 3-5 extensions with the strongest (deployment frequency × tractable Tier) signal. My initial guess for the shortlist: PostGIS, pgvector, pg_trgm, hstore, citext — but the survey may surface alternates.
 - **Cross-engine policy revisit**: which extensions, if any, have practical cross-engine translations (PostGIS → MySQL spatial, pgvector → MySQL JSON-of-floats) worth ADR-0016 expression-translator entries vs. operator-override-only? Mostly a "no" — the loud-failure default keeps stepping right.
 
 Output: `docs/research/pg-extensions-deployment-frequency.md` (matrix + recommended allowlist + cross-engine policy section). Estimated 1-2 days research; no code chunk until the doc names the v1 shortlist.
 
 ---
 
-### 14. View support Phase 2/3 — materialized-view refresh + cross-engine view-body translation
+### 13. View support Phase 2/3 — materialized-view refresh + cross-engine view-body translation
 
 **Why.** Phase 1 (schema-only round-trip + dependency-ordered apply + diff/preview integration + CLI filters) shipped. The two large open frontiers remain:
 
@@ -517,7 +508,7 @@ Sluice's recent feature work has cadenced PG-first; MySQL/PlanetScale parity is 
 |---|---|---|
 | Phase 6.1 passphrase encryption (v0.22.0) | Engine-neutral — applies to both already | n/a |
 | Phase 6.2 AWS KMS encryption (v0.23.0) | Engine-neutral — applies to both already | n/a |
-| Mid-stream live add-table (`--no-drain`, v0.24.0) | Deferred — different mechanism (table-filter flip vs publication-add) | "Mid-stream add-table — MySQL Phase 2" entry above |
+| Mid-stream live add-table (`--no-drain`, v0.24.0) | Both engines, v0.27.0 — MySQL via streamer-side filter-flip (ADR-0034) | "Recently landed: Mid-stream add-table — MySQL Phase 2" |
 | Multi-source aggregation `--target-schema` (v0.25.0) | Deferred — DSN-choice workaround documented; per-table-rename flag if demand surfaces | "Multi-source aggregation — MySQL native parity" entry above |
 | Phase 2 strict zero-loss correctness (PG follow-up, future) | PG-specific (pgoutput decode-time publication semantics) — MySQL Phase 2 has its own correctness story | "Mid-stream live add-table — strict zero-loss correctness" entry above |
 | GEOMETRY / SPATIAL support (future) | Phase B explicitly closes Bug 27 (VStream POINT) — MySQL Phase A is part of the same chunk | "GEOMETRY / SPATIAL support" entry above |
@@ -528,7 +519,7 @@ PlanetScale-specific tracking:
 | PlanetScale concern | Status | Tracked at |
 |---|---|---|
 | Bug 27 VStream POINT bytes prefix | Deferred to GEOMETRY/SPATIAL entry's Phase B; gated by `psverify` build tag | "GEOMETRY/SPATIAL support" entry + "Bug 27 (deferred, parked here)" below |
-| Mid-stream Phase 2.5 (VStream-specific add-table mechanism) | Demand-driven; treat as a follow-on after MySQL Phase 2 lands | "Mid-stream add-table — MySQL Phase 2" entry's gotchas |
+| Mid-stream Phase 2.5 (VStream-specific add-table mechanism) | Demand-driven follow-on to v0.27.0's MySQL Phase 2; VStream is a separate code path from vanilla MySQL binlog | (no roadmap entry yet — track here when demand surfaces) |
 | PlanetScale Postgres slot lifecycle (Patroni-managed; silent loss on failover without `Logical slot name` config) | Documented in `docs/postgres-source-prep.md`; not exercised in default CI | "PlanetScale MySQL+Vitess test-matrix expansion" entry above |
 | Broader VStream coverage (cross-shard PK, geometry edge cases, slot recovery) | Operator-run via `psverify` build tag with `PLANETSCALE_CREDENTIALS.env`; not in default CI | "PlanetScale MySQL+Vitess test-matrix expansion" entry above |
 

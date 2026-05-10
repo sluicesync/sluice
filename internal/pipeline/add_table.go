@@ -368,13 +368,18 @@ func (a *AddTable) Run(ctx context.Context) error {
 		slog.String("position_token", stream.Position.Token),
 	)
 
-	// ---- 5a. Live-mode invariant: snapshot-LSN ≥ slot
+	// ---- 5a. Live-mode invariant (PG path only): snapshot-LSN ≥ slot
 	// confirmed_flush_lsn captured before publication-add. ADR-0030.
 	// The standard ordering (publication-add → snapshot) cannot trip
 	// this in practice, but the explicit check pins the invariant so
 	// a future regression in the flow's ordering fails loudly rather
 	// than producing silent drift on the new table.
-	if a.LiveMode {
+	//
+	// MySQL's filter-flip path (ADR-0034) has no equivalent invariant —
+	// the binlog auto-includes every table by construction, so the
+	// snapshot's binlog position is the only floor and no separate
+	// "before-the-mechanism" position needs comparing against it.
+	if a.LiveMode && preflight.mode == liveModePublicationAdd {
 		if err := a.verifyLiveModeLSNInvariant(ctx, preflight.slotConfirmedFlushLSN, stream.Position); err != nil {
 			return err
 		}
@@ -399,8 +404,39 @@ func (a *AddTable) Run(ctx context.Context) error {
 		)
 	}
 
+	// ---- 7. MySQL-side filter-flip: record the new table on the per-
+	// target sluice_cdc_state.live_added_tables column so the running
+	// streamer's poll goroutine merges it into the dispatch filter on
+	// its next tick. ADR-0034.
+	//
+	// Runs only in live mode and only on the binlog-source path
+	// (preflight.mode == liveModeBinlogFilterFlip). The PG path's
+	// equivalent step is the `ALTER PUBLICATION ... ADD TABLE` issued
+	// in step 4 BEFORE the snapshot — pgoutput's per-LSN catalog
+	// snapshot semantics make pre-snapshot publication-add the right
+	// ordering (see ADR-0030 for the correctness story). MySQL has no
+	// publication concept; the streamer's filter is the gate, so the
+	// flip lands AFTER bulk-copy succeeds.
+	if a.LiveMode && preflight.mode == liveModeBinlogFilterFlip {
+		writer, ok := applier.(liveAddedTablesWriter)
+		if !ok {
+			// Shouldn't happen — preflightLive's structural-interface
+			// check already guarded this — but be loud if a regression
+			// in the dispatch ladder slips through.
+			return errors.New("pipeline: add-table: --no-drain (binlog-source path): target applier no longer implements RecordLiveAddedTable; this is a regression in the dispatch ladder")
+		}
+		if err := writer.RecordLiveAddedTable(ctx, a.StreamID, a.TableName); err != nil {
+			return wrapWithHint(PhaseSchemaApply, fmt.Errorf(
+				"pipeline: add-table: --no-drain: record live-added table on cdc-state: %w", err))
+		}
+		slog.InfoContext(ctx, "add-table: live mode: recorded table on cdc-state.live_added_tables; running streamer's poll will merge into dispatch filter on next tick (ADR-0034)",
+			slog.String("table", a.TableName),
+			slog.String("stream_id", a.StreamID),
+		)
+	}
+
 	if a.LiveMode {
-		slog.InfoContext(ctx, "add-table: live add complete; the active stream's slot will pick up new-table events on its next consumption",
+		slog.InfoContext(ctx, "add-table: live add complete; the active stream's tail will pick up new-table events on its next consumption",
 			slog.String("table", a.TableName),
 			slog.String("stream_id", a.StreamID),
 		)
@@ -437,6 +473,26 @@ func (a *AddTable) validate() error {
 	return validateTargetSchema(a.Target, a.TargetSchema)
 }
 
+// liveAddMode encodes which Phase 2 mechanism the orchestrator picked
+// based on engine capabilities. Drives the post-bulk-copy step
+// (publication-add → no-op for MySQL filter-flip; record column → no-op
+// for PG). Zero value is the PG path (preserves pre-ADR-0034 behaviour).
+type liveAddMode int
+
+const (
+	// liveModePublicationAdd is the PG mechanism (ADR-0030):
+	// publication-add-then-snapshot, idempotent applier absorbs the
+	// [snapshot-LSN, slot-LSN] overlap. Zero value.
+	liveModePublicationAdd liveAddMode = iota
+
+	// liveModeBinlogFilterFlip is the MySQL mechanism (ADR-0034): the
+	// orchestrator records the new table on the per-target
+	// sluice_cdc_state.live_added_tables column after bulk-copy
+	// succeeds; the running streamer's poll goroutine merges into the
+	// dispatch filter on its next tick.
+	liveModeBinlogFilterFlip
+)
+
 // addTablePreflight is the orchestrator-side state captured during
 // the stream pre-flight: the active stream exists, the recorded
 // target-schema namespace, and (in live mode) the active stream's
@@ -452,9 +508,15 @@ func (a *AddTable) validate() error {
 // the schema writer / row writer / change applier — either inherited
 // from the recorded value, supplied by the operator, or (when both
 // sides agreed-empty) the empty string for "use the DSN default."
+//
+// mode encodes which Phase 2 mechanism the orchestrator chose based
+// on engine capabilities (PG publication-add vs MySQL filter-flip).
+// Drained-mode runs leave the field at the zero value; only live-mode
+// runs consult it for post-bulk-copy dispatch.
 type addTablePreflight struct {
 	slotConfirmedFlushLSN string
 	resolvedTargetSchema  string
+	mode                  liveAddMode
 }
 
 // preflightStream verifies the active stream's row exists on the
@@ -506,7 +568,7 @@ func (a *AddTable) preflightStream(ctx context.Context, applier ir.ChangeApplier
 	}
 
 	if a.LiveMode {
-		live, err := a.preflightLive(ctx, status)
+		live, err := a.preflightLive(ctx, applier, status)
 		if err != nil {
 			return addTablePreflight{}, err
 		}
@@ -582,27 +644,50 @@ func (a *AddTable) preflightDrained(ctx context.Context, applier ir.ChangeApplie
 	return nil
 }
 
-// preflightLive applies the live-mode (ADR-0030) refusals and
-// captures the slot confirmed_flush_lsn that will floor the
-// snapshot-LSN invariant check. PG-only in this phase: engines
-// without publications refuse here with a clear error directing the
-// operator at the drained add-table flow.
+// preflightLive applies the live-mode refusals and captures any
+// engine-specific floor (PG slot confirmed_flush_lsn, MySQL nothing
+// today) needed by later phases. Two paths, dispatched by source-
+// engine capability:
+//
+//   - PG (`publicationAdder`): ADR-0030. Captures the active stream's
+//     slot confirmed_flush_lsn so the snapshot-LSN ≥ slot-LSN
+//     invariant can be checked after the snapshot opens. Refuses if
+//     the source doesn't also implement `slotPositionReader` (a code-
+//     side guarantee on PG; the absence indicates a build with the
+//     engine surface stripped).
+//
+//   - MySQL (`liveAddedTablesWriter` on the target applier, since
+//     MySQL's filter-flip mechanism is target-side): ADR-0034. Verifies
+//     the target applier exposes the surface; no source-side floor to
+//     capture (the binlog auto-includes everything by construction —
+//     the snapshot's own binlog position is the only floor that
+//     matters, and it's captured at open time).
+//
+// Engines that match neither (the rare cross-engine pair where source
+// is something other than PG/MySQL) refuse with a clear error directing
+// the operator at the drained add-table flow.
+func (a *AddTable) preflightLive(ctx context.Context, applier ir.ChangeApplier, status ir.StreamStatus) (addTablePreflight, error) {
+	if _, ok := a.Source.(publicationAdder); ok {
+		return a.preflightLivePG(ctx, status)
+	}
+	if _, ok := applier.(liveAddedTablesWriter); ok {
+		return a.preflightLiveBinlog(ctx, applier, status)
+	}
+	return addTablePreflight{}, fmt.Errorf(
+		"pipeline: add-table: --no-drain requires either a publication-bearing source engine (PG) or a target applier exposing RecordLiveAddedTable (MySQL); source=%q target=%q expose neither. Use the drained add-table flow (`sluice sync stop --wait`, then `sluice schema add-table` without --no-drain) for unsupported engine pairs",
+		a.Source.Name(), a.Target.Name())
+}
+
+// preflightLivePG is the original ADR-0030 preflight: capture the
+// active stream's slot confirmed_flush_lsn so the snapshot-LSN ≥
+// slot-LSN invariant has a floor to verify against. PG-only.
 //
 // The slot name is recovered from the StreamStatus row populated by
 // the active stream's last position-write (PG ChangeApplier records
 // it via SetSlotName on every Streamer startup; the sluice_cdc_state
 // row's slot_name column carries it). Empty / legacy values fall
-// back to the engine default `sluice_slot` — matches the Phase 1
-// hardcoded behavior so a pre-Phase-2 cdc-state row with NULL
-// slot_name still resolves to the right slot when the operator
-// hasn't customised it.
-func (a *AddTable) preflightLive(ctx context.Context, status ir.StreamStatus) (addTablePreflight, error) {
-	if _, ok := a.Source.(publicationAdder); !ok {
-		return addTablePreflight{}, fmt.Errorf(
-			"pipeline: add-table: --no-drain requires a publication-bearing source engine; %q has no publication concept. Phase 2 live add is PG-only in this release; use the drained add-table flow (`sluice sync stop --wait`, then `sluice schema add-table` without --no-drain) for MySQL sources",
-			a.Source.Name())
-	}
-
+// back to the engine default `sluice_slot`.
+func (a *AddTable) preflightLivePG(ctx context.Context, status ir.StreamStatus) (addTablePreflight, error) {
 	reader, ok := a.Source.(slotPositionReader)
 	if !ok {
 		return addTablePreflight{}, fmt.Errorf(
@@ -622,7 +707,35 @@ func (a *AddTable) preflightLive(ctx context.Context, status ir.StreamStatus) (a
 		slog.String("slot_source", slotNameSource(status)),
 		slog.String("confirmed_flush_lsn", lsn),
 	)
-	return addTablePreflight{slotConfirmedFlushLSN: lsn}, nil
+	return addTablePreflight{slotConfirmedFlushLSN: lsn, mode: liveModePublicationAdd}, nil
+}
+
+// preflightLiveBinlog is the ADR-0034 preflight for binlog-source
+// engines (MySQL). The "filter-flip" mechanism is target-side: the
+// orchestrator records the new table on
+// `sluice_cdc_state.live_added_tables` after bulk-copy succeeds, and
+// the running streamer's poll goroutine merges it into the dispatch
+// filter on its next tick. There's no source-side floor to capture
+// today — the binlog auto-includes every table by construction, so
+// the only floor that matters is the snapshot's own binlog position,
+// captured at OpenSnapshotStream time.
+//
+// The preflight surfaces the chosen path in the log so an operator
+// inspecting the run can confirm which mechanism fired.
+func (a *AddTable) preflightLiveBinlog(ctx context.Context, applier ir.ChangeApplier, _ ir.StreamStatus) (addTablePreflight, error) {
+	// Defensive: the structural-interface dispatch in preflightLive
+	// already type-asserted, so this should always succeed.
+	if _, ok := applier.(liveAddedTablesWriter); !ok {
+		return addTablePreflight{}, fmt.Errorf(
+			"pipeline: add-table: --no-drain (binlog-source path): target applier does not implement RecordLiveAddedTable; %q",
+			a.Target.Name())
+	}
+	slog.InfoContext(ctx, "add-table: live mode: binlog-source filter-flip path (ADR-0034)",
+		slog.String("source", a.Source.Name()),
+		slog.String("target", a.Target.Name()),
+		slog.String("stream_id", a.StreamID),
+	)
+	return addTablePreflight{mode: liveModeBinlogFilterFlip}, nil
 }
 
 // schemaSourceLabel returns a diagnostic tag for the
@@ -904,9 +1017,23 @@ func (a *AddTable) logDryRun(ctx context.Context, scoped *ir.Schema, resolvedTar
 		)
 	}
 	if a.LiveMode {
-		slog.InfoContext(ctx, "dry run: add-table: live mode (--no-drain): would capture active stream's slot confirmed_flush_lsn, capture snapshot, verify snapshot-LSN ≥ slot-LSN invariant, bulk-copy rows, drop temp slot")
+		switch {
+		case isPublicationAdder(a.Source):
+			slog.InfoContext(ctx, "dry run: add-table: live mode (--no-drain) PG path (ADR-0030): would capture active stream's slot confirmed_flush_lsn, ALTER PUBLICATION ADD TABLE, capture snapshot, verify snapshot-LSN ≥ slot-LSN invariant, bulk-copy rows, drop temp slot")
+		default:
+			slog.InfoContext(ctx, "dry run: add-table: live mode (--no-drain) binlog-source path (ADR-0034): would capture snapshot, bulk-copy rows, then record table on cdc-state.live_added_tables for the running streamer's poll to merge into the dispatch filter")
+		}
 	} else {
 		slog.InfoContext(ctx, "dry run: add-table: would capture snapshot, bulk-copy rows, drop temp slot, then nudge operator to `sluice sync start --resume`")
 	}
 	return nil
+}
+
+// isPublicationAdder reports whether src implements [publicationAdder]
+// — the PG-path discriminator used by the dry-run log + dispatch
+// helpers. Pulled out of an inline assertion so the call sites read
+// declaratively.
+func isPublicationAdder(src ir.Engine) bool {
+	_, ok := src.(publicationAdder)
+	return ok
 }

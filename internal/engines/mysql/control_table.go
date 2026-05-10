@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -31,12 +32,16 @@ const controlTableName = "sluice_cdc_state"
 // (DDL implicit-commits), so callers run this from the *sql.DB pool
 // at applier startup, not inside the per-change tx.
 //
-// stop_requested_at is added via a detect-then-ALTER on existing
-// tables. ADD COLUMN IF NOT EXISTS landed in MySQL 8.0.29; sluice
-// supports 8.0+ broadly, so the conservative path queries
-// information_schema.COLUMNS first and only ALTERs when the column
-// is missing. Existing rows keep their data; the new column starts
-// NULL.
+// Per-column migrations use detect-then-ALTER (information_schema
+// lookup + ALTER) rather than `ADD COLUMN IF NOT EXISTS`; the IF NOT
+// EXISTS form for ADD COLUMN landed in MySQL 8.0.29 and sluice
+// supports 8.0+ broadly, so the conservative path is the portable
+// choice. Existing rows keep their data; new columns start NULL.
+//
+// Tracked migrations:
+//   - stop_requested_at (v0.3.0)
+//   - live_added_tables (v0.27.0, ADR-0034 MySQL Phase 2 mid-stream
+//     live add-table)
 func ensureControlTable(ctx context.Context, db *sql.DB) error {
 	const ddl = `
 		CREATE TABLE IF NOT EXISTS ` + "`" + controlTableName + "`" + ` (
@@ -50,7 +55,42 @@ func ensureControlTable(ctx context.Context, db *sql.DB) error {
 	if _, err := db.ExecContext(ctx, ddl); err != nil {
 		return fmt.Errorf("mysql: ensure control table: %w", err)
 	}
-	return ensureStopRequestedColumn(ctx, db)
+	if err := ensureStopRequestedColumn(ctx, db); err != nil {
+		return err
+	}
+	return ensureLiveAddedTablesColumn(ctx, db)
+}
+
+// ensureLiveAddedTablesColumn adds the live_added_tables column to
+// an existing control table when missing. ADR-0034 (MySQL Phase 2
+// mid-stream live add-table). Same detect-then-ALTER shape as
+// ensureStopRequestedColumn — keeps the migration portable to MySQL
+// 8.0.x versions older than 8.0.29.
+//
+// The column is TEXT NULL holding a comma-separated list of
+// unqualified source-table names that have been live-added to this
+// stream's scope. NULL on legacy rows; the orchestrator's
+// add-table --no-drain path UPSERTs the value via
+// recordLiveAddedTable.
+func ensureLiveAddedTablesColumn(ctx context.Context, db *sql.DB) error {
+	const checkQ = `
+		SELECT COUNT(*)
+		FROM   information_schema.COLUMNS
+		WHERE  TABLE_SCHEMA = DATABASE()
+		  AND  TABLE_NAME   = ?
+		  AND  COLUMN_NAME  = 'live_added_tables'`
+	var n int
+	if err := db.QueryRowContext(ctx, checkQ, controlTableName).Scan(&n); err != nil {
+		return fmt.Errorf("mysql: ensure control table: detect live_added_tables: %w", err)
+	}
+	if n > 0 {
+		return nil
+	}
+	const alter = "ALTER TABLE `" + controlTableName + "` ADD COLUMN live_added_tables TEXT NULL"
+	if _, err := db.ExecContext(ctx, alter); err != nil {
+		return fmt.Errorf("mysql: ensure control table: add live_added_tables: %w", err)
+	}
+	return nil
 }
 
 // ensureStopRequestedColumn adds the stop_requested_at column to an
@@ -275,4 +315,133 @@ func clearStream(ctx context.Context, db *sql.DB, streamID string) error {
 		return fmt.Errorf("mysql: clear stream: %w", err)
 	}
 	return nil
+}
+
+// readLiveAddedTables returns the comma-separated list parsed into a
+// deduplicated, sorted slice of unqualified table names. Empty slice
+// when the column is NULL, the row is missing, the column is missing
+// (legacy pre-v0.27.0 control table), or the table itself is missing.
+// ADR-0034.
+//
+// The streamer's poll goroutine calls this on every tick; tolerance
+// of legacy/missing surfaces means a streamer running against a
+// pre-v0.27.0 control table degrades to "no live-adds" rather than
+// erroring on every tick.
+func readLiveAddedTables(ctx context.Context, db *sql.DB, streamID string) ([]string, error) {
+	const q = "SELECT live_added_tables FROM `" + controlTableName + "` WHERE stream_id = ?"
+	var raw sql.NullString
+	err := db.QueryRowContext(ctx, q, streamID).Scan(&raw)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return nil, nil
+	case isMySQLMissingTableErr(err) || isMySQLUnknownColumnErr(err):
+		// Legacy control table without live_added_tables column, or
+		// the table itself doesn't exist yet — both surface as "no
+		// live-added tables" rather than errors.
+		return nil, nil
+	case err != nil:
+		return nil, fmt.Errorf("mysql: read live_added_tables: %w", err)
+	}
+	if !raw.Valid {
+		return nil, nil
+	}
+	return parseLiveAddedTables(raw.String), nil
+}
+
+// recordLiveAddedTable appends tableName to the per-target row's
+// live_added_tables column. Idempotent — duplicates are deduplicated
+// before write. The orchestrator's add-table --no-drain path calls
+// this once per successful run.
+//
+// The read-modify-write happens under a single transaction with
+// SELECT ... FOR UPDATE so concurrent runs serialise. The cdc-state
+// row must already exist (the streamer's first applied change creates
+// it); the orchestrator's preflight has already verified this via
+// ListStreams, but the function still surfaces a clear error if the
+// row vanishes between preflight and write (rare; operator
+// concurrently ran sync stop --wait + delete).
+func recordLiveAddedTable(ctx context.Context, db *sql.DB, streamID, tableName string) error {
+	tableName = strings.TrimSpace(tableName)
+	if tableName == "" {
+		return errors.New("mysql: record live-added table: tableName is empty")
+	}
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("mysql: record live-added table: begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	const selectQ = "SELECT live_added_tables FROM `" + controlTableName + "` WHERE stream_id = ? FOR UPDATE"
+	var raw sql.NullString
+	if err := tx.QueryRowContext(ctx, selectQ, streamID).Scan(&raw); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("mysql: record live-added table: stream %q has no cdc-state row (streamer must be running)", streamID)
+		}
+		return fmt.Errorf("mysql: record live-added table: select for update: %w", err)
+	}
+
+	existing := []string{}
+	if raw.Valid {
+		existing = parseLiveAddedTables(raw.String)
+	}
+	merged := mergeLiveAddedTables(existing, tableName)
+	joined := strings.Join(merged, ",")
+
+	const updateQ = "UPDATE `" + controlTableName + "` SET live_added_tables = ? WHERE stream_id = ?"
+	if _, err := tx.ExecContext(ctx, updateQ, joined, streamID); err != nil {
+		return fmt.Errorf("mysql: record live-added table: update: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("mysql: record live-added table: commit: %w", err)
+	}
+	return nil
+}
+
+// parseLiveAddedTables splits a comma-separated list, trims
+// whitespace, drops empties, deduplicates by exact match, and sorts
+// the result. The sort is for deterministic comparison ("did the
+// poll observe a new value?") and log readability.
+func parseLiveAddedTables(raw string) []string {
+	if raw == "" {
+		return nil
+	}
+	seen := map[string]struct{}{}
+	for _, p := range strings.Split(raw, ",") {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		seen[p] = struct{}{}
+	}
+	if len(seen) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(seen))
+	for k := range seen {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// mergeLiveAddedTables returns a sorted, deduplicated union of
+// existing + [tableName].
+func mergeLiveAddedTables(existing []string, tableName string) []string {
+	merged := make([]string, 0, len(existing)+1)
+	merged = append(merged, existing...)
+	merged = append(merged, tableName)
+	return parseLiveAddedTables(strings.Join(merged, ","))
+}
+
+// isMySQLUnknownColumnErr reports whether err looks like MySQL's
+// "Unknown column 'X' in 'field list'" / error 1054 — the surface a
+// pre-v0.27.0 control table without live_added_tables presents on
+// SELECT live_added_tables ... . readLiveAddedTables uses this to
+// degrade gracefully.
+func isMySQLUnknownColumnErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "Unknown column") || strings.Contains(msg, "Error 1054")
 }

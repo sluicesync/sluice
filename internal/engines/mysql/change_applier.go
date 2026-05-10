@@ -221,6 +221,46 @@ func (a *ChangeApplier) ClearStream(ctx context.Context, streamID string) error 
 	return clearStream(ctx, a.db, streamID)
 }
 
+// ReadLiveAddedTables returns the comma-parsed live_added_tables
+// column for streamID — the set of tables that have been live-added to
+// this stream's scope by `sluice schema add-table --no-drain`
+// (ADR-0034 MySQL Phase 2). The pipeline streamer's poll goroutine
+// calls this on its tick cadence to keep its in-memory dispatch
+// filter in sync.
+//
+// Empty slice covers all "no live-adds" surfaces: NULL column, missing
+// row, missing column (legacy pre-v0.27.0 control table), missing
+// table. The streamer treats every shape as "no live-adds; preserve
+// the operator's original filter."
+func (a *ChangeApplier) ReadLiveAddedTables(ctx context.Context, streamID string) ([]string, error) {
+	if streamID == "" {
+		return nil, errors.New("mysql: applier: ReadLiveAddedTables: streamID is empty")
+	}
+	return readLiveAddedTables(ctx, a.db, streamID)
+}
+
+// RecordLiveAddedTable appends tableName to the per-target row's
+// live_added_tables column for streamID. ADR-0034. Called by the
+// add-table --no-drain orchestrator on a successful live-add. The
+// streamer's poll goroutine picks the change up on its next tick;
+// from that point onwards, binlog events on the new table reach the
+// applier.
+//
+// Idempotent: re-running with the same tableName does not double-
+// record. Concurrent runs against different tables serialise via
+// SELECT ... FOR UPDATE.
+//
+// Errors when the cdc-state row doesn't exist for streamID — the
+// orchestrator's preflight has already verified this via ListStreams,
+// but a clean error here surfaces the rare race where the row was
+// deleted between preflight and write.
+func (a *ChangeApplier) RecordLiveAddedTable(ctx context.Context, streamID, tableName string) error {
+	if streamID == "" {
+		return errors.New("mysql: applier: RecordLiveAddedTable: streamID is empty")
+	}
+	return recordLiveAddedTable(ctx, a.db, streamID, tableName)
+}
+
 // WritePosition implements [ir.PositionWriter]: upserts the position
 // row for streamID in `sluice_cdc_state` without any accompanying
 // data write. Used by Phase 4.5's broker for cold-start initial-

@@ -3,8 +3,8 @@
 // Copyright 2026 Omar Ramos
 // SPDX-License-Identifier: Apache-2.0
 
-// Integration test for the mid-stream live add-table flow (Phase 2,
-// `--no-drain`, ADR-0030). The shape:
+// Integration test for the mid-stream live add-table flow on PG
+// (Phase 2, `--no-drain`, ADR-0030). The shape:
 //
 //  1. Cold-start a Streamer with a single table. Bulk-copy seeds.
 //  2. Confirm CDC is healthy by inserting a row that flows through.
@@ -18,8 +18,8 @@
 //  5. Confirm the original table's CDC continued to function during
 //     the add (no wedge).
 //
-// The PG-only refusal path is also covered: a MySQL source attempts
-// the live mode and gets the clear PG-only error.
+// MySQL Phase 2 lives in add_table_live_mysql_integration_test.go
+// (ADR-0034, filter-flip mechanism).
 
 package pipeline
 
@@ -27,7 +27,6 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -35,7 +34,6 @@ import (
 
 	"github.com/orware/sluice/internal/engines"
 
-	_ "github.com/orware/sluice/internal/engines/mysql"
 	_ "github.com/orware/sluice/internal/engines/postgres"
 )
 
@@ -368,93 +366,11 @@ func TestAddTable_LiveMode_PG_UnderLoad(t *testing.T) {
 	}
 }
 
-// TestAddTable_LiveMode_MySQL_Refused confirms the MySQL source path
-// gets a clear PG-only error rather than half-attempting the flow.
-// Phase 2 is PG-only by design (ADR-0030); MySQL operators are
-// pointed at the drained add-table flow.
-func TestAddTable_LiveMode_MySQL_Refused(t *testing.T) {
-	sourceDSN, targetDSN, cleanup := startMySQLBinlog(t)
-	defer cleanup()
-
-	const seedDDL = `
-		CREATE TABLE users (
-			id    BIGINT       NOT NULL AUTO_INCREMENT,
-			email VARCHAR(255) NOT NULL,
-			PRIMARY KEY (id)
-		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-		INSERT INTO users (email) VALUES ('alice@example.com');
-	`
-	applyDDLMySQL(t, sourceDSN, seedDDL)
-
-	mysqlEng, ok := engines.Get("mysql")
-	if !ok {
-		t.Fatal("mysql engine not registered")
-	}
-
-	const streamID = "test-live-add-mysql"
-	streamer := &Streamer{
-		Source:    mysqlEng,
-		Target:    mysqlEng,
-		SourceDSN: sourceDSN,
-		TargetDSN: targetDSN,
-		StreamID:  streamID,
-	}
-
-	streamCtx, streamCancel := context.WithCancel(context.Background())
-	defer streamCancel()
-	runErr := make(chan error, 1)
-	go func() { runErr <- streamer.Run(streamCtx) }()
-
-	if !waitForRowCountMySQL(t, targetDSN, "users", 1, 30*time.Second) {
-		t.Fatalf("bulk copy did not deliver users seed row")
-	}
-
-	// Warm CDC + cdc-state row before the refusal probe — without
-	// this step the live-mode preflight refuses with "no stream X on
-	// target" (the cdc-state row is written on first apply, not on
-	// bulk-copy completion) and the assertion below would assert on
-	// the wrong refusal message. Same shape as the PG happy-path
-	// test's CDC-warmup step.
-	applyDDLMySQL(t, sourceDSN, "INSERT INTO users (email) VALUES ('warmup@example.com');")
-	if !waitForRowCountMySQL(t, targetDSN, "users", 2, 30*time.Second) {
-		t.Fatalf("CDC did not deliver post-snapshot warmup insert; cdc-state row may not be written yet")
-	}
-
-	applyDDLMySQL(t, sourceDSN, `
-		CREATE TABLE orders (
-			id        BIGINT NOT NULL AUTO_INCREMENT,
-			customer  BIGINT NOT NULL,
-			PRIMARY KEY (id)
-		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-		INSERT INTO orders (customer) VALUES (1);
-	`)
-
-	addCtx, addCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer addCancel()
-	add := &AddTable{
-		Source:    mysqlEng,
-		Target:    mysqlEng,
-		SourceDSN: sourceDSN,
-		TargetDSN: targetDSN,
-		StreamID:  streamID,
-		TableName: "orders",
-		LiveMode:  true,
-	}
-	err := add.Run(addCtx)
-	if err == nil {
-		t.Fatalf("AddTable (MySQL live mode): expected refusal; got nil")
-	}
-	if !containsAll(err.Error(), "publication-bearing", "drained add-table flow") {
-		t.Errorf("MySQL refusal message missing expected hints; got: %v", err)
-	}
-
-	streamCancel()
-	select {
-	case <-runErr:
-	case <-time.After(20 * time.Second):
-		t.Fatal("Streamer.Run did not return after ctx cancel")
-	}
-}
+// MySQL live-mode used to be a refusal path (PG-only at v0.24.0,
+// ADR-0030). v0.27.0 lands ADR-0034: MySQL supports live add-table
+// via the streamer-side filter-flip mechanism. The MySQL happy-path
+// + under-load + filter-respected coverage moved to
+// add_table_live_mysql_integration_test.go.
 
 // sentinelDelivered polls the target for a row whose body column
 // contains the sentinel string. Returns true once seen, polling up
@@ -501,15 +417,4 @@ func distinctRowCount(t *testing.T, dsn, table, column string) int {
 		t.Fatalf("distinct-count: %v", err)
 	}
 	return n
-}
-
-// containsAll returns true when s contains every needle. Used in
-// the refusal-message assertions to keep them readable.
-func containsAll(s string, needles ...string) bool {
-	for _, n := range needles {
-		if !strings.Contains(s, n) {
-			return false
-		}
-	}
-	return true
 }

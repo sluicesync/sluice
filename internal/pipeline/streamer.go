@@ -660,7 +660,25 @@ func (s *Streamer) Run(ctx context.Context) error {
 	var stopObserved atomic.Bool
 	s.startStopSignalPoll(applyCtx, applier, streamID, cancelStream, cancelApply, &stopObserved)
 
-	filtered := filterChanges(applyCtx, changes, s.Filter)
+	// ---- 4a. Live-added-tables poll for ADR-0034 (MySQL Phase 2
+	// mid-stream live add-table). The orchestrator's
+	// `sluice schema add-table --no-drain TABLE` writes the new table
+	// into the per-target sluice_cdc_state row's live_added_tables
+	// column; the poll goroutine here picks that up on its 5s tick
+	// cadence and merges into the dispatch filter additively. The
+	// liveAddedFilter is also seeded once at startup so a streamer
+	// restart after a partial live-add picks up the previously-recorded
+	// additions before any events flow.
+	//
+	// Engines without the surface (PG, in-memory test stubs) skip both
+	// the seed and the poll cleanly — type assertion fails and the
+	// dispatch filter sees an empty live-added set forever, preserving
+	// pre-v0.27.0 behaviour.
+	liveFilter := &liveAddedFilter{}
+	s.seedLiveAddedFilter(applyCtx, applier, streamID, liveFilter)
+	s.startLiveAddedTablesPoll(applyCtx, applier, streamID, liveFilter)
+
+	filtered := filterChangesWithLiveAdd(applyCtx, changes, s.Filter, liveFilter)
 	dispatchErr := s.dispatchApply(applyCtx, applier, streamID, filtered)
 	if dispatchErr != nil && !errors.Is(dispatchErr, context.Canceled) && !errors.Is(dispatchErr, context.DeadlineExceeded) {
 		return wrapWithHint(PhaseCDC, fmt.Errorf("pipeline: apply changes: %w", dispatchErr))
@@ -705,6 +723,62 @@ func (s *Streamer) dispatchApply(ctx context.Context, applier ir.ChangeApplier, 
 		)
 	}
 	return applier.Apply(ctx, streamID, changes)
+}
+
+// seedLiveAddedFilter performs a one-shot read of the per-target
+// `sluice_cdc_state.live_added_tables` column at streamer startup so
+// the dispatch filter sees previously-recorded live-adds before any
+// events flow. Without this, a streamer restart after a partial
+// live-add would have a window where events on the live-added table
+// were dropped (poll is on a 5s tick) — the seed closes that window.
+//
+// Engines without [liveAddedTablesReader] (PG; pre-v0.27.0 control
+// table) silently skip; the streamer behaves as if there are no
+// live-adds, which is correct for those engines (PG uses
+// publication-add instead of filter-flip — ADR-0030).
+func (s *Streamer) seedLiveAddedFilter(ctx context.Context, applier ir.ChangeApplier, streamID string, target *liveAddedFilter) {
+	reader, ok := applier.(liveAddedTablesReader)
+	if !ok {
+		return
+	}
+	tables, err := reader.ReadLiveAddedTables(ctx, streamID)
+	if err != nil {
+		slog.DebugContext(ctx, "live-added-tables seed read failed; poll will retry on first tick",
+			slog.String("stream_id", streamID),
+			slog.String("err", err.Error()),
+		)
+		return
+	}
+	if len(tables) == 0 {
+		return
+	}
+	target.Set(tables)
+	slog.InfoContext(ctx, "live-added tables observed at startup; merging into dispatch filter (ADR-0034)",
+		slog.String("stream_id", streamID),
+		slog.Any("tables", tables),
+	)
+}
+
+// startLiveAddedTablesPoll wires the optional live-added-tables poll
+// goroutine for ADR-0034. Mirrors [startStopSignalPoll]'s shape:
+// engines that implement [liveAddedTablesReader] (MySQL) get a poll;
+// engines that don't (PG, test stubs) skip cleanly.
+//
+// The poll runs for the duration of applyCtx — same lifetime as
+// pollStopSignal — so it shuts down cleanly on graceful drain or
+// Ctrl-C.
+func (s *Streamer) startLiveAddedTablesPoll(applyCtx context.Context, applier ir.ChangeApplier, streamID string, target *liveAddedFilter) {
+	reader, ok := applier.(liveAddedTablesReader)
+	if !ok {
+		slog.DebugContext(applyCtx, "live-added-tables poll skipped: applier does not implement ReadLiveAddedTables",
+			slog.String("stream_id", streamID),
+		)
+		return
+	}
+	slog.DebugContext(applyCtx, "live-added-tables poll started",
+		slog.String("stream_id", streamID),
+	)
+	go pollLiveAddedTables(applyCtx, reader, streamID, target)
 }
 
 // startStopSignalPoll wires the optional stop-signal poll goroutine

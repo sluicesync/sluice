@@ -88,15 +88,11 @@ The ordering used here (Strategy C variant c — publication-add-then-snapshot, 
 
 If real operator demand surfaces for sub-second add-table latency on workloads where the temp-slot's brief WAL pin is unacceptable, Phase 3 reserves Strategy B as the next step.
 
-## MySQL deferred
+## MySQL deferred (resolved in ADR-0034)
 
-MySQL has no publication concept; the binlog auto-includes every table with no opt-in. The Phase 2 PG mechanism (publication-add-then-snapshot) doesn't translate. MySQL's add-table flow today already works without a publication step — the Phase 1 orchestrator skips publication-add when the source doesn't implement `publicationAdder`. The remaining gap for MySQL is in the streamer's table-filter (`--include-table` / `--exclude-table`): a new table on the source isn't in the filter set, so the streamer's CDC dispatch drops events for it.
+MySQL has no publication concept; the binlog auto-includes every table with no opt-in. The Phase 2 PG mechanism (publication-add-then-snapshot) doesn't translate. MySQL's add-table flow today already works without a publication step — the Phase 1 orchestrator skips publication-add when the source doesn't implement `publicationAdder`. The remaining gap for MySQL was in the streamer's table-filter (`--include-table` / `--exclude-table`): a new table on the source isn't in the filter set, so the streamer's CDC dispatch drops events for it.
 
-MySQL Phase 2 (live add-table for binlog sources) requires either:
-- A streamer-side filter-flip mechanism: tell the running streamer "now also include table foo", which extends `applyTableFilter`'s scope mid-run.
-- Or no filter (default `--include-table` empty, accept all): in which case the only gap is the schema cache, and the `recordingApplier`-style WARN-and-skip-then-pick-up pattern from ADR-0021 might suffice.
-
-This is a separate chunk; the design space is meaningfully different from the PG one and shouldn't be bundled here.
+MySQL Phase 2 shipped in v0.27.0 via the streamer-side filter-flip mechanism — see [ADR-0034](adr-0034-mysql-phase-2-live-add-table.md). The same `--no-drain` CLI flag works against both engines now; the orchestrator dispatches by source-engine capability (publication-add for PG, filter-flip for MySQL). MySQL Phase 2 ships with the same best-effort caveat documented in this ADR's § "What could go wrong" item 3 — events on the new table during the brief filter-flip window may not be delivered. The strict-zero-loss roadmap entry now covers both engines.
 
 ## Consequences
 
