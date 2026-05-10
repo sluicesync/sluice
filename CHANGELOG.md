@@ -6,6 +6,44 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.27.0]
+
+**MySQL Phase 2 mid-stream live add-table** (parity for v0.24.0's PG-only `--no-drain`). Operators with high-availability MySQL workloads can now bring a new source table into an active CDC stream's scope without the `sluice sync stop --wait` drain that Phase 1 required. Different mechanism from PG (binlog auto-includes every table; the gate is in the streamer's table-filter, not in a publication): sluice persists the live-added table into a new `live_added_tables` column on `sluice_cdc_state`, and the running streamer polls the column on the same cadence as `stop_requested_at` and atomically extends `applyTableFilter`'s scope. ADR-0034 documents the design. Same operator UX as PG (`sluice schema add-table TABLE --no-drain`); same best-effort caveat (events on the new table during the bulk-copy + filter-flip window may not be delivered — operators with high write rates should use the drained flow or quiesce briefly).
+
+### Added
+
+- **MySQL `--no-drain` support on `sluice schema add-table`.** Same flag, same UX as PG (v0.24.0). Orchestrator dispatches by source engine: PG → existing publication-add path; MySQL → new filter-flip path. Mixed-engine refusals stay clean with operator-actionable messages.
+
+- **`live_added_tables TEXT NULL` column on `sluice_cdc_state` (MySQL).** Idempotent migration (mirrors v0.24.0's `slot_name`, v0.25.0's `source_dsn_fingerprint`, v0.25.1's `target_schema`). Comma-separated list of newly-added table names; the streamer polls and merges on each tick.
+
+- **`tableFilterFlipper` optional engine surface.** PG doesn't implement (uses publication scope instead); MySQL implements via `RecordLiveAddedTable` / `ReadLiveAddedTables` on `ChangeApplier`. Discovered structurally so the orchestrator stays engine-neutral.
+
+- **Streamer `liveAddedFilter` (atomic.Pointer-backed).** New `streamer_filter_flip.go` plumbs the polled-from-cdc-state additions into `applyTableFilter`'s scope mid-run. The filter is additive: existing operator-supplied `--include-table` / `--exclude-table` rules continue to apply; the live-added table joins the include list at the next poll tick.
+
+- **ADR-0034 — MySQL Phase 2 mid-stream live add-table.** Design rationale (filter-flip vs accept-no-filter), threat model (4 scenarios), best-effort caveat documentation, parity with PG `--no-drain` operator UX.
+
+### Changed
+
+- **Roadmap item 4 (MySQL Phase 2)** moved from "Next up" to "Recently landed" with one-line summary. Items 5-14 renumbered down by 1. The `MySQL & PlanetScale parity tracker` subsection updated: mid-stream live add-table now shows "Both engines, v0.27.0".
+
+- **ADR-0030 (PG Phase 2)** cross-references ADR-0034 in its `MySQL deferred (resolved)` section. The "deferred" caveat from v0.24.0 is now closed.
+
+### Migration / Compatibility
+
+- **No format-breaking changes.** Manifest schema, change-chunk format, CLI surface — all unchanged for existing flows.
+- **Default behavior unchanged.** Operators not using `--no-drain` see no behaviour change — the v0.24.0 + earlier add-table flow continues to require a drained stream.
+- **Drop-in upgrade from v0.26.0.** No DDL migration on `sluice_cdc_state`; the new `live_added_tables` column lands on first `EnsureControlTable` call.
+- **PG operators unaffected.** PG `--no-drain` continues to use the publication-add mechanism from ADR-0030; the MySQL filter-flip path is engine-gated.
+- **Existing `--include-table` / `--exclude-table` semantics preserved.** Live-added tables are additive to the operator-supplied filter; explicit exclusions still apply.
+
+### Known limitations
+
+- **Best-effort during the filter-flip window** (parallel to PG Phase 2's documented gap, ADR-0030 item 3). Events on the new table that arrive between the bulk-copy snapshot's binlog position and the streamer's filter-flip observation (~5s poll interval) may not be delivered. Under-load test observed ~3 events lost out of 59 in CI's worst-case sustained-INSERT scenario. Operators with high write rates on the new table at the moment of live-add should use the drained add-table flow (zero-loss by construction) or quiesce writes for the seconds-long window. The strict-correctness mechanism (ADR-0033) is open for both engines pending further design work.
+
+- **Filter-flip poll cadence is 5 seconds** (matches the existing `stop_requested_at` poll). A future refinement could shorten the cadence or add a notification mechanism (LISTEN/NOTIFY on PG, but MySQL has no equivalent — would need a polling-rate trade-off).
+
+- **VStream / PlanetScale not in scope** for Phase 2. Different binlog source surface; Phase 2.5 follow-on if real demand surfaces.
+
 ## [0.26.0]
 
 **PG → PG extension passthrough framework + pgvector.** Sluice's IR has been engine-neutral by design — column types are categorized by core SQL kinds, and PG's extensible type system has been treated as hostile (loud-failure refusal at schema-read time). v0.26.0 lands the framework that flips this for same-engine PG → PG syncs where the operator opts in: `--enable-pg-extension EXT` (repeatable) tells sluice to recognize and round-trip column types defined by named extensions, with native fidelity. Cross-engine targets (PG → MySQL) keep the loud-failure default; explicit operator translations (`--type-override`) stay the escape hatch. v1 ships with **pgvector** as the first concrete extension, exercising both the type-only path (Tier 1 mechanics) and the index-method path (Tier 2 mechanics — `ivfflat` and `hnsw`). Subsequent extensions from the v1 shortlist (pg_trgm, hstore, citext, PostGIS) ship as catalog-only follow-ons; the framework stays put. Implementation supplement: `docs/adr/adr-0032-pg-extension-passthrough.md`. Decision input: `docs/research/pg-extensions-deployment-frequency.md` (the survey that pinned the v1 shortlist).
