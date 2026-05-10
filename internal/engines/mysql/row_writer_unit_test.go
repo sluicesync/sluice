@@ -189,6 +189,49 @@ func TestPrepareValue(t *testing.T) {
 			ir.JSON{Binary: true},
 			`[]`,
 		},
+
+		// Bug 47 (v0.29.0 cycle): MySQL source `attrs JSON` with value
+		// `{}` arrives at the writer as `[]byte{'{','}'}` and must
+		// round-trip as the JSON object `{}`, not as the empty PG-array
+		// literal `[]`. The string-input case above (line 187) keeps
+		// the override behavior; the bytes-input case below pins the
+		// MySQL-JSON-source case to the JSON-object interpretation.
+		{
+			"json target with empty JSON object as bytes (Bug 47)",
+			[]byte(`{}`),
+			ir.JSON{Binary: true},
+			`{}`,
+		},
+		{
+			"json target with empty JSON array as bytes",
+			[]byte(`[]`),
+			ir.JSON{Binary: true},
+			`[]`,
+		},
+		{
+			"json target with non-empty PG-array bytes (override case)",
+			[]byte(`{1,2,3}`),
+			ir.JSON{Binary: true},
+			`["1","2","3"]`,
+		},
+		{
+			"json target with JSON null as bytes",
+			[]byte(`null`),
+			ir.JSON{Binary: true},
+			`null`,
+		},
+		{
+			"json target with JSON scalar as bytes",
+			[]byte(`"hello"`),
+			ir.JSON{Binary: true},
+			`"hello"`,
+		},
+		{
+			"json target with populated JSON object as bytes",
+			[]byte(`{"k":"v"}`),
+			ir.JSON{Binary: true},
+			`{"k":"v"}`,
+		},
 		{
 			"json target with []any containing nil",
 			[]any{int64(1), nil, int64(3)},

@@ -469,20 +469,27 @@ func convertArrayLikeToJSON(v any) (any, bool) {
 		// column was overridden to JSON post-decode and the value
 		// arrived from the source's text-form array reader.
 		//
-		// Disambiguation: try PG-array parsing first. The PG array
-		// grammar is strict — JSON objects with quoted keys and
-		// colons fail to parse — so a successful parse is high
-		// signal that the bytes are an array literal. The corner
-		// case is `{}`, which parses as both an empty PG array and
-		// an empty JSON object; we prefer the array interpretation
-		// because Bug 14's specific surface is the override case
-		// (empty PG arrays as bytes in JSON-target columns) and
-		// landing `{}` as the JSON object on MySQL would also be a
-		// caller error in any sensible setup. For non-`{}` JSON
-		// bytes, the PG-array parse fails and we fall through to
-		// the next branch (which emits the bytes as a string).
+		// Disambiguation: try PG-array parsing for non-empty `{...}`
+		// bytes. The PG array grammar is strict — JSON objects with
+		// quoted keys and colons fail to parse — so a successful
+		// parse is high signal that the bytes are an array literal.
+		// For non-`{...}` JSON bytes, the PG-array parse fails and
+		// we fall through to the next branch (which emits the bytes
+		// as a string).
+		//
+		// The corner case is `{}`, which is BOTH an empty JSON
+		// object and an empty PG array literal. Bug 47 (v0.29.0
+		// cycle): the JSON-object interpretation is the right
+		// default — every MySQL JSON column holding `{}` as a value
+		// arrives here as `[]byte{'{','}'}` and must round-trip as
+		// the same `{}` to the target. The PG-array override case
+		// for an empty array is exotic; operators who want an empty
+		// array in a JSON column should use `[]` directly.
 		if len(shaped) < 2 || shaped[0] != '{' || shaped[len(shaped)-1] != '}' {
 			return nil, false
+		}
+		if len(shaped) == 2 {
+			return string(shaped), true
 		}
 		if converted, err := pgArrayLiteralToJSON(string(shaped)); err == nil {
 			return converted, true
