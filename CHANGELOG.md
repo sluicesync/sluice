@@ -6,6 +6,36 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.29.0]
+
+**CI structural improvements + Path D Phase A diagnostic infrastructure for mid-stream live add-table loss.** Two operator-visible threads land together: (a) the `Integration (PostGIS)` job is now a separate parallel CI gate (cuts wall-clock from ~45 min to ~25 min on tag pushes); (b) sluice now runs `integration vstream` (vttestserver-based VStream coverage) on an always-on Vultr instance during pre-release validation, closing the gap CI explicitly skipped for cost reasons. Internal: new ADR-0036 documents the empirical Phase A.1 characterization of the mid-stream live add-table residual loss surface — diagnostic-only branch, no behavior change to the v0.24.0 best-effort flow yet.
+
+### Added
+
+- **Parallel `Integration (PostGIS)` CI job** in `.github/workflows/ci.yml`. Splits the postgis-tagged tests off from the main Integration job into a sibling runner so the two run concurrently. CI wall-clock for a tag push drops from ~45 min sequential to ~25 min parallel. The new job is required-to-pass-before-merge on `main` (see `docs/dev/branch-protection.md` for the updated `gh api PUT` snippet).
+
+- **VStream coverage on the Vultr pre-release validation box.** `integration vstream` (vttestserver-backed Vitess coverage) now runs on the always-on Vultr instance as part of the pre-release runbook; reference timing 3m43s on a vhf-3c-8gb. Roadmap item 10 records this as "Path C — Vultr-box pre-release validation (LANDED)" alongside the original Path A (operator-run checklist) and Path B (CI-integrated coverage). Documented in `docs/dev/notes/release-validation-on-vultr.md`.
+
+- **ADR-0036 — Mid-stream live add-table residual loss surface (Phase A.1).** Empirical characterization of v0.24.0's documented best-effort gap. Six-run multi-iteration on Vultr with targeted DEBUG-level slog instrumentation: M1 (long-txn) contributes rarely (1/6 runs, 1 row); M2 (snapshot consistent-point race) ruled out conclusively; M3 (catalog-snapshot lag) reframed and INCONCLUSIVE pending Phase A.2 with per-row source-side LSN cross-reference; M4 (counter artifact) ruled out — loss is real (~5–9% in the diagnostic test). New diagnostic test `TestAddTable_LiveMode_PG_DiagnoseLossSurface` ships as a permanent regression artifact for the next iteration. No production fix lands in v0.29.0.
+
+- **`Engine.ReadCurrentWALPosition` optional engine surface** (PG-only). Returns the current WAL position via `pg_current_wal_lsn()`; mirrors the existing `ReadSlotPosition` pattern. Used by ADR-0036's diagnostic instrumentation; available to other observability use cases.
+
+### Changed
+
+- **CI Integration job timeout bumped** from 50 min to 60 min on the outer envelope; postgis step's individual timeout from 15 min to 25 min. Defensive headroom; the parallel split makes both unlikely to be hit in normal operation.
+
+### Migration / Compatibility
+
+- **No format-breaking changes.** No CLI changes, no on-disk format changes, no engine-interface changes that affect external implementations.
+- **CI required-checks list grew by one** — `Integration (PostGIS)`. Operators using their own fork's branch-protection rules should add this to their required-checks list (snippet in `docs/dev/branch-protection.md`).
+- **Drop-in upgrade from v0.28.0.** No DDL migration on `sluice_cdc_state`; no operator action required.
+
+### Who needs this release
+
+- **Operators tracking sluice's release cadence:** drop-in upgrade; no behavior change. Take it for the next release window.
+- **Operators on PostgreSQL with `--no-drain` mid-stream live add-table:** no functional change in v0.29.0. The instrumentation lands but is gated behind `--log-level=debug`. The actual mitigation (Path B dual-slot or Path C operator quiesce) is queued behind ADR-0036's Phase A.2 verdicts.
+- **Operators contributing to sluice:** the parallel CI job + faster wall-clock cuts the PR-feedback loop. The Vultr-box pre-release validation runbook is documented in `docs/dev/notes/release-validation-on-vultr.md`.
+
 ## [0.28.0]
 
 **PostGIS-aware GEOMETRY/SPATIAL translation closes Bug 26 + Bug 27.** Sluice's IR has carried `ir.Geometry` since the beginning, but cross-engine PG ↔ MySQL geometry has been refused at the schema-write boundary (PG: "GEOMETRY requires PostGIS"; MySQL: SRID dropped). v0.28.0 lifts the refusal: PostGIS-detected PG targets accept `ir.Geometry` columns and emit `geometry(<subtype>, <srid>)`; MySQL targets emit `<type> SRID <n>` (MySQL 8.0+ syntax) preserving the SRID; cross-engine PG → MySQL round-trip closes Bug 26. The VStream-specific 4-byte SRID prefix on POINT bytes is now stripped + captured (closes Bug 27); vanilla MySQL protocol path unchanged. ADR-0035 documents the design.
