@@ -6,6 +6,8 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.30.0]
+
 **PG → PG `pg_trgm` extension passthrough lands as the v1 shortlist's second concrete entry (ADR-0032).** pg_trgm is the "operator-class only" extension — no new column types, just `gin_trgm_ops` / `gist_trgm_ops` operator classes that ride on core PG `gin` / `gist` access methods. Sluice now recognises and round-trips trigram-indexed columns when the operator passes `--enable-pg-extension pg_trgm` on `migrate` / `sync start` / `schema preview` / `schema diff`. Validates the index-method-passthrough framework on a simpler shape than pgvector (Tier 2 lite) and clears the path for `hstore` / `citext` / `postgis` to follow as additional catalog entries.
 
 ### Added
