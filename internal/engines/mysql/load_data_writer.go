@@ -188,6 +188,22 @@ func columnSetExpr(col *ir.Column, varName string) string {
 	case ir.Varchar, ir.Text, ir.Set:
 		return "CONVERT(" + varName + " USING utf8mb4)"
 	}
+	// Bug 48 fix: PG extensions with cross-engine default translators
+	// (hstore → MySQL JSON; citext → MySQL VARCHAR-with-collation) keep
+	// their `ir.ExtensionType` shape in the IR until the writer emits;
+	// the value-side `prepareHstoreToJSON` translator runs at INSERT
+	// time but doesn't touch the LOAD DATA path. Without the CONVERT
+	// wrapper, MySQL parses the hstore→JSON bytes as charset=binary and
+	// rejects with "Cannot create a JSON value from a string with
+	// CHARACTER SET 'binary'" (Error 3144 / SQLSTATE 22032). Apply the
+	// same utf8mb4 reinterpretation that ir.JSON / ir.Varchar / ir.Text
+	// get — the bytes already are UTF-8; this is just a charset tag.
+	// vector / pg_trgm / postgis don't reach this path (they refuse at
+	// the cross-engine preflight); hstore and citext are the only
+	// ExtensionType arms with cross-engine default translators today.
+	if _, isExt := col.Type.(ir.ExtensionType); isExt {
+		return "CONVERT(" + varName + " USING utf8mb4)"
+	}
 	return varName
 }
 

@@ -237,6 +237,13 @@ func TestColumnSetExpr(t *testing.T) {
 		{"text → utf8mb4 convert", &ir.Column{Name: "t", Type: ir.Text{Size: ir.TextLong}}, "CONVERT(@c0 USING utf8mb4)"},
 		{"set → utf8mb4 convert", &ir.Column{Name: "x", Type: ir.Set{Values: []string{"a"}}}, "CONVERT(@c0 USING utf8mb4)"},
 		{"json → utf8mb4 convert", &ir.Column{Name: "j", Type: ir.JSON{Binary: true}}, "CONVERT(@c0 USING utf8mb4)"},
+		// Bug 48 pin: PG extension types with cross-engine default
+		// translators (hstore → JSON; citext → VARCHAR) need the same
+		// utf8mb4 reinterpretation so MySQL doesn't see the LOAD DATA
+		// stream as charset=binary and reject. Without this branch,
+		// hstore PG → MySQL via LOAD DATA fails with Error 3144.
+		{"hstore extension → utf8mb4 convert", &ir.Column{Name: "h", Type: ir.ExtensionType{Extension: "hstore", Name: "hstore"}}, "CONVERT(@c0 USING utf8mb4)"},
+		{"citext extension → utf8mb4 convert", &ir.Column{Name: "c", Type: ir.ExtensionType{Extension: "citext", Name: "citext"}}, "CONVERT(@c0 USING utf8mb4)"},
 	}
 	for _, c := range cases {
 		c := c

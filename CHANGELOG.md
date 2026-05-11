@@ -6,6 +6,24 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.31.1]
+
+**Bug 48 fix: hstore PG → MySQL cross-engine works under LOAD DATA path.** v0.31.0's headline feature succeeded on the batched-INSERT path (`local_infile=OFF`) but failed cryptically on the LOAD DATA path (`local_infile=ON`) with `Error 3144 (22032): Cannot create a JSON value from a string with CHARACTER SET 'binary'`. Surfaced by the v0.31.0 cycle on a MySQL target with the recommended `local_infile=ON` setting. Real-world operator UX bug; not a regression.
+
+### Fixed
+
+- **Bug 48 — `columnSetExpr` in `load_data_writer.go` now wraps `ir.ExtensionType` columns in `CONVERT(@var USING utf8mb4)`.** Pre-fix: only `ir.JSON` / `ir.Varchar` / `ir.Text` / `ir.Set` got the wrapper; hstore (which the cross-engine path translates to MySQL JSON via `prepareHstoreToJSON`) was sent as charset=binary and rejected by MySQL's JSON parser. Citext also benefits (it lands as VARCHAR with `_ci` collation; the same charset reinterpretation applies). Other ExtensionType arms (vector / pg_trgm / postgis) don't reach `columnSetExpr` — cross-engine preflight refuses them. New unit-test pins for both hstore and citext in `TestColumnSetExpr`.
+
+### Migration / Compatibility
+
+- **Bug fix only; no operator-visible behavior change beyond the failure path closing.** Drop-in upgrade from v0.31.0.
+- **Operators who hit Bug 48 on v0.31.0** (cross-engine PG → MySQL with hstore source columns and `local_infile=ON` on the MySQL target) should retry the migration after upgrading. The fix is targeted to the LOAD DATA path; batched-INSERT (the v0.31.0 success path) is unaffected.
+
+### Who needs this release
+
+- **Cross-engine PG → MySQL operators with hstore (or future translator-bearing extension) columns AND `local_infile=ON` on the MySQL target:** **upgrade** — v0.31.0's headline feature only worked under the slower batched-INSERT path.
+- **Operators on `local_infile=OFF`:** drop-in; no behavior change (v0.31.0 already worked for you).
+
 **PG → PG `hstore` (cross-engine only this release) and `citext` extension passthrough land as the v1 shortlist's Tier 1 entries (ADR-0032).** Both are type-only opaque-bytes extensions: hstore is the key/value-map type, citext is `text` with a case-insensitive collation. Cross-engine PG → MySQL gets built-in default translators for both (hstore → MySQL JSON with value-shape conversion; citext → MySQL VARCHAR with `utf8mb4_0900_ai_ci` collation). citext also ships PG → PG passthrough. **hstore PG → PG is deferred to v0.31.1** — the COPY-protocol binary codec for hstore (mirroring pgvector's pattern from v0.26.0) hasn't landed yet; preflight refuses with an actionable workaround hint (`--type-override hstore_col=text`). This is the first ADR-0032 entry to ship a cross-engine translator alongside same-engine passthrough — the framework formalises the surface (`ir.CrossEngineExtensionTranslator` optional engine interface; per-extension `crossEngineDefaultTranslatedExtensions` catalog declaration) so future Tier 1 entries with defensible cross-engine mappings can follow the same pattern.
 
 ### Deferred
