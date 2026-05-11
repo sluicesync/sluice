@@ -13,7 +13,7 @@
 
 **Loss is small but reproducible.** 1–2 rows out of 17–23 across runs (~5–9%). Missing rows are always among the loader rows that committed in the same time-window as the ALTER PUBLICATION transaction (load-15 / 16 / 18 / 19 / 20 in the 6 runs). The mechanism is the WAL-window between ALTER PUBLICATION's BEGIN and the catalog-effective LSN where pgoutput first sees the new table in scope — a sharper articulation than "M3 catalog-snapshot lag" as originally framed.
 
-**Phase A.2 instrumented; verdicts pending Vultr run.** The diagnostic test now captures per-loader-row source-side LSN at commit time (loader runs `SELECT pg_current_wal_lsn()` after each INSERT, populates `lsnByBody` map) and cross-references each missing row's LSN against the [pubadd_before, pubadd_after] window. `VERDICT_M3` now emits `missing_before` / `missing_inside` / `missing_after` / `missing_unknown` counts and renders one of `HOLDS_reframed` / `FAILS` / `INCONCLUSIVE`. The Vultr `-count=10` run will populate the actual verdict distribution and unlock the Path B vs Path C decision.
+**Phase A.2 run complete (2026-05-11, Vultr `-count=10`).** Per-row source LSN cross-reference falsifies the reframed M3 hypothesis: **10/10 runs show every missing row's commit LSN is STRICTLY AFTER `lsn_pubadd_after`** (`missing_inside=0` in every run). The loss is not in the ALTER PUBLICATION transaction's WAL window — it's in a later window that ends before the post-add-sentinel reliably arrives. A fifth mechanism (M5) is in play; three candidate descriptions are documented under Phase A.2's verdict section. **Phase A.3 needed** before any production fix to distinguish pgoutput-internal catalog lag (M5a), streamer-snapshot-handoff race (M5b), or applier-side drop (M5c). Path B vs Path C decision is contingent on Phase A.3 mechanism attribution.
 
 This ADR is the operator-facing record of "we instrumented, here's what the data said." Path A (slot-pause) remains falsified per ADR-0033 — this Phase A is Path D ("diagnose the actual v0.24.0 loss surface FIRST") from ADR-0033's "Forward options" list.
 
@@ -130,22 +130,37 @@ Phase A.1 left M3 INCONCLUSIVE with anomalously negative `delta_bytes` (the firs
 - LSN capture failures are non-fatal — they bump a `missing_unknown` counter rather than abort the loader or skew the counter.
 - At end-of-test, `renderVerdictM3` walks the set-diff's missing-row list, looks up each row's captured LSN, and classifies it into one of four buckets: `before` (lsn < pubAddBefore), `inside` (pubAddBefore ≤ lsn ≤ pubAddAfter), `after` (lsn > pubAddAfter), or `unknown` (LSN not captured or unparseable). The verdict is rendered from these totals per the interpretation table above.
 
-**Verdict captures** — TODO until the Vultr run completes. The lines below are placeholders.
+**Verdict captures** (Vultr vhf-3c-8gb, Postgres 16, `-count=10`, 2026-05-11):
 
 ```
-Run 1: VERDICT_M3: TODO_run_to_populate
-Run 2: VERDICT_M3: TODO_run_to_populate
-Run 3: VERDICT_M3: TODO_run_to_populate
-Run 4: VERDICT_M3: TODO_run_to_populate
-Run 5: VERDICT_M3: TODO_run_to_populate
-Run 6: VERDICT_M3: TODO_run_to_populate
-Run 7: VERDICT_M3: TODO_run_to_populate
-Run 8: VERDICT_M3: TODO_run_to_populate
-Run 9: VERDICT_M3: TODO_run_to_populate
-Run 10: VERDICT_M3: TODO_run_to_populate
+Run 1:  missing_total=2 inside=0 after=2 unknown=0   outside=[load-17@0/1D8CA78(after) load-18@0/1D8CC30(after)]   FAILS
+Run 2:  missing_total=1 inside=0 after=1 unknown=0   outside=[load-19@0/1D8CCE8(after)]                            FAILS
+Run 3:  missing_total=2 inside=0 after=2 unknown=0   outside=[load-19@0/1D8CCE8(after) load-20@0/1D8CEA0(after)]   FAILS
+Run 4:  missing_total=1 inside=0 after=1 unknown=0   outside=[load-17@0/1D8CA78(after)]                            FAILS
+Run 5:  missing_total=3 inside=0 after=3 unknown=0   outside=[load-17@0/1D8CB78(after) load-18@0/1D8CD30(after) load-19@0/1D8CEE8(after)]   FAILS
+Run 6:  missing_total=2 inside=0 after=2 unknown=0   outside=[load-18@0/1D8CB30(after) load-19@0/1D8CBE8(after)]   FAILS
+Run 7:  missing_total=1 inside=0 after=1 unknown=0   outside=[load-18@0/1D8CC30(after)]                            FAILS
+Run 8:  missing_total=1 inside=0 after=1 unknown=0   outside=[load-17@0/1D8C978(after)]                            FAILS
+Run 9:  missing_total=1 inside=0 after=1 unknown=0   outside=[load-17@0/1D8C978(after)]                            FAILS
+Run 10: missing_total=2 inside=0 after=2 unknown=0   outside=[load-19@0/1D8CBE8(after) load-20@0/1D8CD70(after)]   FAILS
 ```
 
-**Empirical reading — TODO.** Populate after the Vultr `-count=10` run lands. The shape of the distribution across runs determines whether reframed M3 is confirmed (`HOLDS_reframed` across most/all runs, with missing rows clustering inside the window), refuted (`FAILS` runs show missing rows scattered outside the window — a fifth mechanism is in play), or mixed (`INCONCLUSIVE` indicating reframed M3 is a contributing but not exclusive surface; further instrumentation needed to isolate the additional surface).
+**Empirical reading: reframed M3 conclusively FALSIFIED in 10/10 runs.** Across all runs, every missing row's commit LSN is STRICTLY AFTER `lsn_pubadd_after` by ~1.5KB–3KB. `missing_inside` is 0 in every run. The hypothesis that "rows committed inside the ALTER PUBLICATION transaction's WAL window are filtered" does not hold — the lost rows are NOT in that window. They're all from the tail of the loader's burst (load-17 through load-20), committed well after the publication-add transaction completed.
+
+The post-add-sentinel row (inserted at the very end of the test, well past pubadd_after AND past the missing rows' LSNs) IS reliably delivered in every run. So the gap is a specific window AFTER pubadd_after that ends before the post-add-sentinel — the lost rows sit in a finite slice of the timeline that's neither in the snapshot nor in the streamer's delivered output.
+
+**A fifth mechanism (M5) is in play.** Candidate descriptions:
+- **M5a: streamer's pgoutput-internal catalog catches up lazily after the visible catalog change.** Even though `pg_publication_rel` is updated at LSN_pubadd_commit (somewhere in `[lsn_pubadd_before, lsn_pubadd_after]`), the streamer's pgoutput may not refresh its catalog view immediately; events between LSN_pubadd_commit and "pgoutput-refresh-LSN" stream past but are filtered as if `events` weren't in scope. This would explain the after-window loss.
+- **M5b: streamer-side apply race with the snapshot handoff.** ADR-0030's flow opens a temp slot at LSN_S ≥ pubadd_after, bulk-copies rows visible at LSN_S, then hands off to the streamer. If the existing streamer's confirmed_flush_lsn is past LSN_S (because it was already running and ACKed past the snapshot's LSN), events between (some LSN < LSN_S) and (some LSN > LSN_S) may slip through the gap.
+- **M5c: applier-side drop of events that pgoutput delivered.** If pgoutput delivered the events but the applier's batched-apply path lost them (e.g. an early termination of the apply loop when `addtable.Run` returns), the loss would show up as data-on-target-missing despite pgoutput visibility.
+
+Distinguishing M5a / M5b / M5c requires **Phase A.3**:
+- Add per-event applier-side instrumentation that records `(relation, lsn, body)` for every Insert reaching the applier. At end-of-test, cross-reference missing rows' LSNs against this applier-side log.
+- If missing-row LSN appears in applier log → M5c (applier dropped). 
+- If absent → M5a or M5b (pgoutput filtered or streamer-snapshot-handoff race).
+- Server-side `log_min_messages=DEBUG2` would further distinguish M5a from M5b but is heavyweight.
+
+**Decision deferred until Phase A.3 narrows further.** Path B (dual-slot) was the M3-HOLDS fix; with reframed M3 falsified, Path B may or may not address the actual mechanism. Path C (operator quiesce + LOCK TABLE on events) closes all M5 variants by stopping writes during the snapshot+handoff window — operator-friendly even if "not strictly live". The Path B vs Path C choice is now contingent on Phase A.3's mechanism attribution.
 
 #### M4. Test-side counter artifact
 
