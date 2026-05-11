@@ -31,6 +31,11 @@
 //  - drives an explicit set-diff between source-side committed loader
 //    rows (queried back via SELECT body FROM events) and target-side
 //    delivered rows;
+//  - PHASE A.2: captures source-side pg_current_wal_lsn() immediately
+//    after each loader INSERT commits and stores the (body, lsn) pair
+//    in an in-memory map. At set-diff time, every missing row's
+//    captured LSN is classified against the
+//    [lsn_pubadd_before, lsn_pubadd_after] window and totals emitted.
 //  - emits four VERDICT_M[1-4] log lines naming the empirical result
 //    per mechanism, copying the discipline ADR-0033 used for H1/H2.
 //
@@ -39,6 +44,8 @@
 //   VERDICT_M1: long_txn_observed=N affected_rows=K [HOLDS|FAILS|INCONCLUSIVE]
 //   VERDICT_M2: lsn_snapshot=X lsn_pubadd_after=Y ordering=before|after|equal
 //   VERDICT_M3: rel_first_event_lsn=X lsn_pubadd_after=Y delta_bytes=N
+//                missing_before=B missing_inside=I missing_after=A missing_unknown=U
+//                [HOLDS_reframed|FAILS|INCONCLUSIVE]
 //   VERDICT_M4: source_committed=N target_delivered=K missing_ids=[...]
 //
 // **Phase A is non-negotiable: this test only OBSERVES. No production
@@ -168,10 +175,21 @@ func TestAddTable_LiveMode_PG_DiagnoseLossSurface(t *testing.T) {
 	// the diagnostic captures the same scheduler dynamics that produce
 	// the ~36% loss in the original. Counter increments AFTER successful
 	// commit (no off-by-one on cancellation).
+	//
+	// PHASE A.2: after each INSERT commits, also SELECT pg_current_wal_lsn()
+	// and record (body, lsn) into lsnByBody. The captured LSN is the WAL
+	// flush position *after* the implicit txn commit — a conservative upper
+	// bound on the commit LSN. For Phase A.2's classification (does the
+	// commit fall inside [pubadd_before, pubadd_after]?) an upper bound is
+	// fine: if lsn_after_insert <= pubadd_after, the commit definitely
+	// landed at-or-before pubadd_after. The map is keyed by row body so
+	// the set-diff cross-reference is trivial.
 	loadCtx, loadCancel := context.WithCancel(context.Background())
 	var inserted atomic.Int64
 	var loadWG sync.WaitGroup
 	loadWG.Add(1)
+	lsnByBody := make(map[string]string)
+	var lsnMu sync.Mutex
 	go func() {
 		defer loadWG.Done()
 		var local int64
@@ -182,9 +200,20 @@ func TestAddTable_LiveMode_PG_DiagnoseLossSurface(t *testing.T) {
 				return
 			default:
 			}
-			if _, err := srcDB.ExecContext(context.Background(), `INSERT INTO events (body) VALUES ($1)`, fmt.Sprintf("load-%d", local+1)); err != nil {
+			body := fmt.Sprintf("load-%d", local+1)
+			if _, err := srcDB.ExecContext(context.Background(), `INSERT INTO events (body) VALUES ($1)`, body); err != nil {
 				inserted.Store(local)
 				return
+			}
+			// Best-effort post-commit LSN capture. A failure here just
+			// leaves the body un-classified (M3 emits missing_unknown=N
+			// rather than a verdict). Do NOT skip incrementing the counter
+			// or aborting the loader on this — it's purely diagnostic.
+			var commitLSN string
+			if err := srcDB.QueryRowContext(context.Background(), `SELECT pg_current_wal_lsn()::text`).Scan(&commitLSN); err == nil {
+				lsnMu.Lock()
+				lsnByBody[body] = commitLSN
+				lsnMu.Unlock()
 			}
 			local++
 			select {
@@ -263,9 +292,19 @@ func TestAddTable_LiveMode_PG_DiagnoseLossSurface(t *testing.T) {
 	t.Logf("DIAG: finalInserted=%d source_committed=%d target_delivered=%d missing=%d",
 		finalInserted, len(sourceCommitted), len(targetDelivered), len(missing))
 
+	// Snapshot the LSN map so the verdict helper doesn't race the
+	// loader goroutine (it has already returned via loadWG.Wait, but
+	// taking a copy keeps the data flow obvious and the lint clean).
+	lsnMu.Lock()
+	lsnSnapshot := make(map[string]string, len(lsnByBody))
+	for k, v := range lsnByBody {
+		lsnSnapshot[k] = v
+	}
+	lsnMu.Unlock()
+
 	renderVerdictM1(t, logRecs)
 	renderVerdictM2(t, logRecs)
-	renderVerdictM3(t, logRecs)
+	renderVerdictM3(t, logRecs, missing, lsnSnapshot)
 	renderVerdictM4(t, finalInserted, sourceCommitted, targetDelivered, missing)
 
 	streamCancel()
@@ -472,8 +511,25 @@ func renderVerdictM2(t *testing.T, recs []diagRecord) {
 // substantially larger than the ALTER PUBLICATION WAL record itself
 // would indicate pgoutput's catalog-snapshot lagged the catalog
 // change visibly.
-func renderVerdictM3(t *testing.T, recs []diagRecord) {
+//
+// PHASE A.2 extension: cross-reference each missing row's source-side
+// commit LSN (captured by the loader after each INSERT) against the
+// [lsn_pubadd_before, lsn_pubadd_after] window and classify into
+// before / inside / after / unknown buckets. The classification drives
+// the reframed M3 verdict:
+//
+//   - HOLDS_reframed — every missing row's commit LSN falls INSIDE
+//     [pubadd_before, pubadd_after]. Confirms M3 (reframed): rows
+//     committed during the ALTER PUBLICATION txn's WAL window are
+//     filtered.
+//   - FAILS — missing rows scatter outside the window; a fifth
+//     mechanism is in play.
+//   - INCONCLUSIVE — mixed classification or insufficient data
+//     (no missing rows captured, LSN map empty, pub-add LSN
+//     unparseable, etc.).
+func renderVerdictM3(t *testing.T, recs []diagRecord, missing []string, lsnByBody map[string]string) {
 	t.Helper()
+	pubAddBefore := lookupSinglePubAddLSN(recs, "lsn_before_pub_add")
 	pubAddAfter := lookupSinglePubAddLSN(recs, "lsn_after_pub_add")
 	if pubAddAfter == 0 {
 		t.Logf("VERDICT_M3: INCONCLUSIVE — no addtable.diag pub-add-window record captured")
@@ -481,7 +537,9 @@ func renderVerdictM3(t *testing.T, recs []diagRecord) {
 	}
 
 	// Find the FIRST row event on relation "events" (the new table).
-	// first_seen_for_rel is the marker the pump emits.
+	// first_seen_for_rel is the marker the pump emits. Phase A.1
+	// instrumentation; still load-bearing for the rel_first_event LSN
+	// summary line below.
 	var firstEventsLSN pglogrepl.LSN
 	for _, r := range recs {
 		if r.phase != "row" {
@@ -502,14 +560,70 @@ func renderVerdictM3(t *testing.T, recs []diagRecord) {
 		}
 	}
 
-	if firstEventsLSN == 0 {
-		t.Logf("VERDICT_M3: INCONCLUSIVE — no first row event for relation 'events' observed in captured trace")
-		return
+	// Phase A.2 classification. For each missing row body, look up its
+	// captured commit LSN and bucket it against [pubAddBefore, pubAddAfter].
+	var (
+		mBefore, mInside, mAfter, mUnknown int
+		insidePreview                      []string
+		outsidePreview                     []string
+	)
+	const previewCap = 6
+	for _, body := range missing {
+		lsnStr, ok := lsnByBody[body]
+		if !ok || lsnStr == "" {
+			mUnknown++
+			continue
+		}
+		lsn, err := pglogrepl.ParseLSN(lsnStr)
+		if err != nil {
+			mUnknown++
+			continue
+		}
+		switch {
+		case pubAddBefore != 0 && lsn < pubAddBefore:
+			mBefore++
+			if len(outsidePreview) < previewCap {
+				outsidePreview = append(outsidePreview, fmt.Sprintf("%s@%s(before)", body, lsn.String()))
+			}
+		case lsn >= pubAddBefore && lsn <= pubAddAfter:
+			mInside++
+			if len(insidePreview) < previewCap {
+				insidePreview = append(insidePreview, fmt.Sprintf("%s@%s", body, lsn.String()))
+			}
+		default: // lsn > pubAddAfter
+			mAfter++
+			if len(outsidePreview) < previewCap {
+				outsidePreview = append(outsidePreview, fmt.Sprintf("%s@%s(after)", body, lsn.String()))
+			}
+		}
 	}
+
+	verdict := "INCONCLUSIVE"
+	totalClassified := mBefore + mInside + mAfter
+	switch {
+	case len(missing) == 0:
+		verdict = "INCONCLUSIVE (no missing rows captured in this run; cannot test reframed M3)"
+	case totalClassified == 0:
+		verdict = "INCONCLUSIVE (all missing rows have unknown LSN — loader LSN capture failed or skipped)"
+	case mInside == totalClassified && mInside > 0:
+		verdict = "HOLDS_reframed (every missing row's commit LSN falls INSIDE [pubadd_before, pubadd_after]; M3-reframed confirmed)"
+	case mInside == 0:
+		verdict = "FAILS (no missing rows fall in the window; reframed M3 doesn't hold — a fifth mechanism is in play)"
+	default:
+		verdict = "INCONCLUSIVE (mixed classification — some missing rows inside the window, some outside; M3-reframed contributes but isn't the only surface)"
+	}
+
+	// Phase A.1 line shape preserved at the front for continuity with
+	// the existing ADR rows; Phase A.2 fields appended.
 	delta := int64(firstEventsLSN) - int64(pubAddAfter)
-	verdict := "INCONCLUSIVE (raw delta only; no threshold encoded for 'visible lag')"
-	t.Logf("VERDICT_M3: rel_first_event_lsn=%s lsn_pubadd_after=%s delta_bytes=%d %s",
-		firstEventsLSN.String(), pubAddAfter.String(), delta, verdict)
+	relFirstStr := firstEventsLSN.String()
+	if firstEventsLSN == 0 {
+		relFirstStr = "<none>"
+	}
+	t.Logf("VERDICT_M3: rel_first_event_lsn=%s lsn_pubadd_before=%s lsn_pubadd_after=%s delta_bytes=%d missing_total=%d missing_before=%d missing_inside=%d missing_after=%d missing_unknown=%d inside_preview=%v outside_preview=%v %s",
+		relFirstStr, pubAddBefore.String(), pubAddAfter.String(), delta,
+		len(missing), mBefore, mInside, mAfter, mUnknown,
+		insidePreview, outsidePreview, verdict)
 }
 
 // renderVerdictM4 reports on whether finalInserted disagrees with the

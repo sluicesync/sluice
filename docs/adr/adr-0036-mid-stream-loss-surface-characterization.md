@@ -13,7 +13,7 @@
 
 **Loss is small but reproducible.** 1–2 rows out of 17–23 across runs (~5–9%). Missing rows are always among the loader rows that committed in the same time-window as the ALTER PUBLICATION transaction (load-15 / 16 / 18 / 19 / 20 in the 6 runs). The mechanism is the WAL-window between ALTER PUBLICATION's BEGIN and the catalog-effective LSN where pgoutput first sees the new table in scope — a sharper articulation than "M3 catalog-snapshot lag" as originally framed.
 
-**Phase A.2 needed before Decision can land.** The current instrumentation can't pin per-row commit LSNs against the catalog-effective boundary. Phase A.2 should add: per-loader-row source-side LSN capture at commit time + cross-reference against the [pubadd_before, pubadd_after] window. That data will resolve M3 from INCONCLUSIVE to a definitive HOLDS/FAILS and inform the Path B vs Path C decision.
+**Phase A.2 instrumented; verdicts pending Vultr run.** The diagnostic test now captures per-loader-row source-side LSN at commit time (loader runs `SELECT pg_current_wal_lsn()` after each INSERT, populates `lsnByBody` map) and cross-references each missing row's LSN against the [pubadd_before, pubadd_after] window. `VERDICT_M3` now emits `missing_before` / `missing_inside` / `missing_after` / `missing_unknown` counts and renders one of `HOLDS_reframed` / `FAILS` / `INCONCLUSIVE`. The Vultr `-count=10` run will populate the actual verdict distribution and unlock the Path B vs Path C decision.
 
 This ADR is the operator-facing record of "we instrumented, here's what the data said." Path A (slot-pause) remains falsified per ADR-0033 — this Phase A is Path D ("diagnose the actual v0.24.0 loss surface FIRST") from ADR-0033's "Forward options" list.
 
@@ -113,12 +113,39 @@ Run 6: VERDICT_M3: rel_first_event_lsn=0/1D8C3B0 lsn_pubadd_after=0/1D8C520 delt
 
 **Why INCONCLUSIVE remains:** the test's threshold logic in `internal/pipeline/add_table_live_pg_diagnose_integration_test.go` requires positive delta_bytes for HOLDS. The observed shape needs Phase A.2 instrumentation to confirm: cross-reference each missing row's source-side commit LSN against the [pubadd_before, pubadd_after] window. If missing rows land in that window, M3 (reframed) is confirmed.
 
-Diagnostic-line shape: `VERDICT_M3: rel_first_event_lsn=X lsn_pubadd_after=Y delta_bytes=N <HOLDS|FAILS|INCONCLUSIVE>`.
+Diagnostic-line shape (Phase A.1 + Phase A.2 fields merged): `VERDICT_M3: rel_first_event_lsn=X lsn_pubadd_before=B lsn_pubadd_after=Y delta_bytes=N missing_total=T missing_before=Bn missing_inside=In missing_after=An missing_unknown=Un inside_preview=[...] outside_preview=[...] <HOLDS_reframed|FAILS|INCONCLUSIVE>`.
 
-Verdict interpretation:
-- HOLDS — `delta_bytes` is significantly larger than a single ALTER PUBLICATION WAL record (~few hundred bytes); pgoutput's first delivered event for the new table arrived well after publication-add committed, suggesting catalog-snapshot lag.
-- FAILS — `delta_bytes` is near zero (the first event for the new table arrived almost immediately after LSN_pubadd); no observable lag.
-- INCONCLUSIVE — no first-event-for-relation captured for the new table (suggests the events table never had any events delivered in the trace; could indicate the mechanism produced 100% loss in the captured window, in which case the absence is itself the signal — re-run with longer drain).
+Verdict interpretation (reframed for Phase A.2):
+- HOLDS_reframed — every missing row's commit LSN (captured at INSERT time by the loader) falls INSIDE [lsn_pubadd_before, lsn_pubadd_after]. Confirms M3 (reframed): rows committed during the ALTER PUBLICATION transaction's WAL window are filtered by pgoutput's per-LSN catalog snapshot.
+- FAILS — no missing rows fall inside the window; reframed M3 doesn't hold and a fifth mechanism is in play. Phase A.3 needed.
+- INCONCLUSIVE — mixed classification (some missing rows inside, some outside) suggests M3-reframed contributes but isn't the only surface; OR no missing rows captured this run; OR loader LSN capture failed for the missing rows.
+
+### Phase A.2: per-row source LSN cross-reference
+
+Phase A.1 left M3 INCONCLUSIVE with anomalously negative `delta_bytes` (the first delivered event for the new table consistently lands INSIDE the ALTER PUBLICATION transaction's WAL window). The reframed hypothesis is that rows committed inside that same WAL window are filtered. Phase A.2 directly tests it by capturing the source-side commit LSN for every loader row at INSERT time and cross-referencing missing rows' LSNs against the [pubadd_before, pubadd_after] window.
+
+**Instrumentation** (added in `internal/pipeline/add_table_live_pg_diagnose_integration_test.go`):
+
+- The burst loader goroutine, after each `INSERT INTO events (body) VALUES ($1)` returns, additionally runs `SELECT pg_current_wal_lsn()` and stores `(body, lsn)` into an `lsnByBody` map (`map[string]string` guarded by a `sync.Mutex`). The captured LSN is the WAL flush position immediately after the implicit commit — a conservative upper bound on the row's actual commit LSN. For Phase A.2's classification question ("did this row commit inside the [pubadd_before, pubadd_after] window?"), an upper bound suffices: if `lsn_after_insert ≤ pubadd_after`, the commit definitely landed at-or-before pubadd_after.
+- LSN capture failures are non-fatal — they bump a `missing_unknown` counter rather than abort the loader or skew the counter.
+- At end-of-test, `renderVerdictM3` walks the set-diff's missing-row list, looks up each row's captured LSN, and classifies it into one of four buckets: `before` (lsn < pubAddBefore), `inside` (pubAddBefore ≤ lsn ≤ pubAddAfter), `after` (lsn > pubAddAfter), or `unknown` (LSN not captured or unparseable). The verdict is rendered from these totals per the interpretation table above.
+
+**Verdict captures** — TODO until the Vultr run completes. The lines below are placeholders.
+
+```
+Run 1: VERDICT_M3: TODO_run_to_populate
+Run 2: VERDICT_M3: TODO_run_to_populate
+Run 3: VERDICT_M3: TODO_run_to_populate
+Run 4: VERDICT_M3: TODO_run_to_populate
+Run 5: VERDICT_M3: TODO_run_to_populate
+Run 6: VERDICT_M3: TODO_run_to_populate
+Run 7: VERDICT_M3: TODO_run_to_populate
+Run 8: VERDICT_M3: TODO_run_to_populate
+Run 9: VERDICT_M3: TODO_run_to_populate
+Run 10: VERDICT_M3: TODO_run_to_populate
+```
+
+**Empirical reading — TODO.** Populate after the Vultr `-count=10` run lands. The shape of the distribution across runs determines whether reframed M3 is confirmed (`HOLDS_reframed` across most/all runs, with missing rows clustering inside the window), refuted (`FAILS` runs show missing rows scattered outside the window — a fifth mechanism is in play), or mixed (`INCONCLUSIVE` indicating reframed M3 is a contributing but not exclusive surface; further instrumentation needed to isolate the additional surface).
 
 #### M4. Test-side counter artifact
 
