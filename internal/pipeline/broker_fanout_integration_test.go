@@ -86,15 +86,24 @@ func TestSyncFromBackup_FanOut(t *testing.T) {
 	// on the respective TARGET databases anyway, so even same streamID
 	// would be OK; using distinct names matches the recommended
 	// operator pattern).
+	// Distinct broker-state paths per broker. The two brokers run in
+	// the same Go process against the same chain root; without this,
+	// they race on the shared `manifests/broker_state.json` write.
+	// See `brokerOpts.StatePath` for the full attribution; the Phase A
+	// diagnose narrowed the flake to writeBrokerState under concurrent
+	// same-path Put. Production is unaffected — one broker process per
+	// chain — so the fix lives in the test surface.
 	broker1Cancel, broker1Done := runBrokerInGoroutine(t, brokerTarget1DSN, "fanout-1", store, brokerOpts{
 		PollInterval: 2 * time.Second,
 		AtChainID:    fullBackupID,
+		StatePath:    "manifests/broker_state-fanout-1.json",
 	})
 	defer broker1Cancel()
 
 	broker2Cancel, broker2Done := runBrokerInGoroutine(t, brokerTarget2DSN, "fanout-2", store2, brokerOpts{
 		PollInterval: 2 * time.Second,
 		AtChainID:    fullBackupID,
+		StatePath:    "manifests/broker_state-fanout-2.json",
 	})
 	defer broker2Cancel()
 

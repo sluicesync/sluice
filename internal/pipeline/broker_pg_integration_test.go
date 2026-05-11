@@ -154,6 +154,7 @@ func runBrokerInGoroutine(t *testing.T, brokerTargetDSN, streamID string, store 
 		ResetTargetData: opts.ResetTargetData,
 		AtChainID:       opts.AtChainID,
 		SluiceVersion:   "test",
+		brokerStatePath: opts.StatePath,
 	}
 	ctx, c := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
@@ -168,6 +169,18 @@ type brokerOpts struct {
 	ApplyBatchSize  int
 	ResetTargetData bool
 	AtChainID       string
+
+	// StatePath, when non-empty, sets the broker's `brokerStatePath`
+	// override. Used by multi-broker fan-out tests that need distinct
+	// state files per broker — without this, two brokers running in
+	// the same process against the same chain root race on the
+	// shared `manifests/broker_state.json` write (writeBrokerState's
+	// `LocalStore.Put` is not goroutine-safe against same-path
+	// concurrent writes; one of the brokers occasionally hangs at
+	// startup). Production is unaffected — one broker process per
+	// chain — so the fix lives in the test surface, not the engine.
+	// Empty means "use the default" (`DefaultBrokerStateFilename`).
+	StatePath string
 }
 
 // TestSyncFromBackup_Postgres_HappyPath exercises Acceptance Criterion 1:
