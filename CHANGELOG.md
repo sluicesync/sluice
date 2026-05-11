@@ -6,7 +6,9 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-**v0.32.1 — hstore PG → PG COPY binary codec completes the v0.31.0 Tier 1 deferred work.** The v0.31.0 release shipped hstore as an ADR-0032 Tier 1 extension but deferred PG → PG passthrough because the IR carries text-form hstore bytes (`"k"=>"v"`) and PG's COPY binary protocol expects hstore's pair-array wire format. The preflight refusal in `validateEnabledPGExtensions` surfaced an actionable workaround hint until the codec landed. This release implements the codec and removes the refusal.
+## [0.32.1]
+
+**hstore PG → PG COPY binary codec completes the v0.31.0 Tier 1 deferred work.** The v0.31.0 release shipped hstore as an ADR-0032 Tier 1 extension but deferred PG → PG passthrough because the IR carries text-form hstore bytes (`"k"=>"v"`) and PG's COPY binary protocol expects hstore's pair-array wire format. The preflight refusal in `validateEnabledPGExtensions` surfaced an actionable workaround hint until the codec landed. This release implements the codec and removes the refusal.
 
 ### Fixed
 
