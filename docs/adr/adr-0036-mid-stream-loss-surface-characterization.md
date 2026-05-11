@@ -13,7 +13,9 @@
 
 **Loss is small but reproducible.** 1–2 rows out of 17–23 across runs (~5–9%). Missing rows are always among the loader rows that committed in the same time-window as the ALTER PUBLICATION transaction (load-15 / 16 / 18 / 19 / 20 in the 6 runs). The mechanism is the WAL-window between ALTER PUBLICATION's BEGIN and the catalog-effective LSN where pgoutput first sees the new table in scope — a sharper articulation than "M3 catalog-snapshot lag" as originally framed.
 
-**Phase A.2 run complete (2026-05-11, Vultr `-count=10`).** Per-row source LSN cross-reference falsifies the reframed M3 hypothesis: **10/10 runs show every missing row's commit LSN is STRICTLY AFTER `lsn_pubadd_after`** (`missing_inside=0` in every run). The loss is not in the ALTER PUBLICATION transaction's WAL window — it's in a later window that ends before the post-add-sentinel reliably arrives. A fifth mechanism (M5) is in play; three candidate descriptions are documented under Phase A.2's verdict section. **Phase A.3 needed** before any production fix to distinguish pgoutput-internal catalog lag (M5a), streamer-snapshot-handoff race (M5b), or applier-side drop (M5c). Path B vs Path C decision is contingent on Phase A.3 mechanism attribution.
+**Phase A.2 run complete (2026-05-11, Vultr `-count=10`).** Per-row source LSN cross-reference falsifies the reframed M3 hypothesis: **10/10 runs show every missing row's commit LSN is STRICTLY AFTER `lsn_pubadd_after`** (`missing_inside=0` in every run). The loss is not in the ALTER PUBLICATION transaction's WAL window — it's in a later window. A fifth mechanism (M5) is in play.
+
+**Phase A.3 run complete (2026-05-11, Vultr `-count=10`). M5c HOLDS in 10/10 runs.** Per-event applier-side capture shows every missing row reaches the PG applier's dispatch site (`pgoutput_filtered=0` in every run). **The applier is dropping events after receiving them.** Neither M5a (pgoutput catalog lazy refresh) nor M5b (streamer-snapshot-handoff race) is the dominant surface. **The fix lives in `internal/engines/postgres/change_applier.go`** — the per-change Apply loop or batched-apply idle-flush boundary is silently dropping events around the `AddTable.Run` return. Path B (dual-slot) was the wrong fix; Path C (operator quiesce) treats symptoms not cause. Phase B is a targeted ~200-500 LOC applier-side fix.
 
 **Phase A.3 instrumentation landed (2026-05-10).** Adds an applier-side capture probe at the PG `change_applier.go::dispatch` site (`addtable.diag: applier insert received`, DEBUG-level) that logs every Insert event reaching the applier alongside the row's `body` field and parsed LSN. The diagnose test now also emits a fifth verdict line — `VERDICT_M5_ATTRIBUTION` — that cross-references missing rows by body against the applier-received set. If every missing row is in the set → M5c (applier dropped); if none are → M5a or M5b (pgoutput filtered or streamer-handoff race). The M5a-vs-M5b distinction is deferred to Phase A.4 (server-side `log_min_messages=DEBUG2`). **Verdict captures pending Vultr run.**
 
@@ -180,31 +182,38 @@ Phase A.2 falsified reframed M3: missing rows commit STRICTLY AFTER `lsn_pubadd_
 - Cross-references the set-diff's missing rows by body: each missing row either is in the map (applier received) or isn't (pgoutput filtered or upstream race).
 - Renders a fifth verdict line: `VERDICT_M5_ATTRIBUTION: missing_total=T applier_received=A pgoutput_filtered=F preview_applier=[...] preview_filtered=[...] <verdict>`.
 
-**Verdict captures** (Vultr vhf-3c-8gb, Postgres 16, `-count=10`):
+**Verdict captures** (Vultr vhf-3c-8gb, Postgres 16, `-count=10`, 2026-05-11):
 
 ```
-Run 1:  TODO_run_to_populate
-Run 2:  TODO_run_to_populate
-Run 3:  TODO_run_to_populate
-Run 4:  TODO_run_to_populate
-Run 5:  TODO_run_to_populate
-Run 6:  TODO_run_to_populate
-Run 7:  TODO_run_to_populate
-Run 8:  TODO_run_to_populate
-Run 9:  TODO_run_to_populate
-Run 10: TODO_run_to_populate
+Run 1:  missing_total=1 applier_received=1 pgoutput_filtered=0  preview_applier=[load-16@0/1D8C828]                                        M5c_HOLDS
+Run 2:  missing_total=1 applier_received=1 pgoutput_filtered=0  preview_applier=[load-18@0/1D8CB00]                                        M5c_HOLDS
+Run 3:  missing_total=2 applier_received=2 pgoutput_filtered=0  preview_applier=[load-17@0/1D8CB48 load-18@0/1D8CD00]                      M5c_HOLDS
+Run 4:  missing_total=3 applier_received=3 pgoutput_filtered=0  preview_applier=[load-19@0/1D8CAB8 load-20@0/1D8CB70 load-21@0/1D8DC48]    M5c_HOLDS
+Run 5:  missing_total=2 applier_received=2 pgoutput_filtered=0  preview_applier=[load-18@0/1D8CC00 load-19@0/1D8CDB8]                      M5c_HOLDS
+Run 6:  missing_total=1 applier_received=1 pgoutput_filtered=0  preview_applier=[load-18@0/1D8CD00]                                        M5c_HOLDS
+Run 7:  missing_total=1 applier_received=1 pgoutput_filtered=0  preview_applier=[load-20@0/1D8CF70]                                        M5c_HOLDS
+Run 8:  missing_total=1 applier_received=1 pgoutput_filtered=0  preview_applier=[load-17@0/1D8CB48]                                        M5c_HOLDS
+Run 9:  missing_total=1 applier_received=1 pgoutput_filtered=0  preview_applier=[load-16@0/1D8C928]                                        M5c_HOLDS
+Run 10: missing_total=1 applier_received=1 pgoutput_filtered=0  preview_applier=[load-15@0/1D8C770]                                        M5c_HOLDS
 ```
 
-**Verdict interpretation:**
-- `M5c_HOLDS` — all missing rows have applier-received entries. The applier received the events but dropped them after receiving (e.g. early termination of the apply loop on `AddTable.Run` return, batched-apply rollback that drops in-flight changes, etc.). Fix lives in the applier.
-- `M5a_OR_M5b_HOLDS` — no missing rows reach the applier. The loss is upstream — either pgoutput's per-LSN catalog snapshot filtered them (M5a) or the streamer's snapshot-handoff race made the active stream skip past their LSNs (M5b). Fix is upstream. Phase A.4 (server-side `log_min_messages=DEBUG2` on the source PG) would distinguish M5a from M5b; Path B dual-slot may address M5a; Path C operator-quiesce closes both.
-- `MIXED` — partial; both mechanisms contribute. Each needs its own fix.
-- `INCONCLUSIVE` — no missing rows in this run, OR instrumentation didn't fire (applier-received map empty). Re-run with verified DEBUG handler installation.
+**Empirical reading: M5c conclusively HOLDS in 10/10 runs.** Every missing row's commit body shows up in the applier-side capture map — `pgoutput_filtered=0` in every run. pgoutput is delivering these events to the applier dispatch site; the applier is dropping them after receiving. **The fix lives in the applier.** Neither M5a (pgoutput catalog lazy refresh) nor M5b (streamer-snapshot-handoff race) is the load-bearing mechanism — they may exist as smaller surfaces but they are not the dominant loss surface.
 
-**Updated decision (pending Phase A.3 verdict):**
-- If `M5c_HOLDS` → applier-side fix. Investigate the per-change Apply loop's termination behaviour around `AddTable.Run` return, the batched applier's idle-flush boundary semantics, and any rollback path that drops in-flight changes silently.
-- If `M5a_OR_M5b_HOLDS` → upstream fix or Path C. Path B dual-slot may close M5a; Path C operator-quiesce always closes both. Phase A.4 needed to pin M5a vs M5b before committing to Path B vs operator-only mitigation.
-- If `MIXED` → both fixes needed; sequence the applier-side one first since it's the more contained scope.
+**Verdict interpretation table (kept for context, but resolved):**
+- `M5c_HOLDS` — chosen. All missing rows received by applier; applier dropped them.
+- `M5a_OR_M5b_HOLDS` — not chosen. (Would have meant pgoutput-filter or streamer-race; no signal for this in 10/10.)
+- `MIXED` — not chosen. (Would have meant partial.)
+
+**Updated decision (post-Phase A.3):**
+
+The actual fix lives in `internal/engines/postgres/change_applier.go`'s per-change Apply loop or the batched applier's idle-flush boundary semantics. **Path B dual-slot was the wrong fix** — it would have addressed a mechanism (pgoutput filter) that empirically isn't the dominant loss surface. **Path C operator-quiesce closes the symptom** but doesn't fix the root cause.
+
+**Phase B candidate scope (next chunk):**
+1. Read the PG change_applier's batched-apply loop, paying attention to (a) `addtable.Run`'s impact on the streamer's apply context, (b) the idle-flush trigger, (c) any rollback or batch-cancel that would drop in-flight changes silently.
+2. Identify which specific code path drops the events (LSN > pubadd_after, body matches the applier-side capture entries that aren't on the target).
+3. Add the targeted fix + a regression test that asserts under-load-test missing rows now land on the target.
+
+Estimated ~200-500 LOC depending on the drop location. Much smaller than Path B's ~1500-2000 LOC. **The diagnose work paid off.**
 
 #### M4. Test-side counter artifact
 
