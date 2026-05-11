@@ -103,6 +103,38 @@ func TestValidateEnabledPGExtensions(t *testing.T) {
 		}
 	})
 
+	t.Run("PG -> PG refuses hstore until COPY binary codec lands", func(t *testing.T) {
+		// hstore's COPY-protocol binary wire format isn't implemented
+		// yet; the gate refuses at preflight with an actionable hint
+		// rather than letting bulk-copy fail cryptically on the IR's
+		// text-form hstore bytes. Drop the refusal when the codec
+		// lands (tracked for v0.31.1).
+		err := validateEnabledPGExtensions(stubPGEngine{}, stubPGEngine{}, []string{"hstore"})
+		if err == nil {
+			t.Fatal("err = nil; want refusal until hstore PG → PG COPY binary codec lands")
+		}
+		if !strings.Contains(err.Error(), "hstore") {
+			t.Errorf("err = %v; want refusal mentioning hstore", err)
+		}
+		if !strings.Contains(err.Error(), "type-override") {
+			t.Errorf("err = %v; want hint mentioning --type-override workaround", err)
+		}
+	})
+
+	t.Run("PG -> PG accepts citext alongside hstore is refused", func(t *testing.T) {
+		// Mixed list with hstore + citext: the refusal must fire on
+		// hstore even though citext is fine. Operators dropping hstore
+		// from the list see the citext-only path proceed.
+		err := validateEnabledPGExtensions(stubPGEngine{}, stubPGEngine{}, []string{"citext"})
+		if err != nil {
+			t.Errorf("err = %v; want nil for PG -> PG citext alone", err)
+		}
+		err = validateEnabledPGExtensions(stubPGEngine{}, stubPGEngine{}, []string{"citext", "hstore"})
+		if err == nil {
+			t.Fatal("err = nil; want refusal on hstore even alongside citext")
+		}
+	})
+
 	t.Run("MySQL source refused", func(t *testing.T) {
 		err := validateEnabledPGExtensions(stubMySQLEngine{}, stubPGEngine{}, []string{"vector"})
 		if err == nil {
