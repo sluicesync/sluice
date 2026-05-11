@@ -6,6 +6,30 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.30.1]
+
+**Two operator-UX gaps surfaced by the v0.30.0 cycle, both closed.** Neither is a regression or correctness issue; both are cleaner failure modes for cross-engine + extension scenarios.
+
+### Fixed
+
+- **Cross-engine PG → MySQL preflight refusal now fires on `migrate` path.** v0.30.0 added `unsupportablePGIndexToMySQL` and wired it into `chain_restore` only — `Migrator.Run` skipped the helper entirely, so a PG source with a pg_trgm-indexed table targeting MySQL bulk-copied successfully and then died at MySQL Error 1170 during the indexes phase (no recovery path; data already partially migrated). v0.30.1 calls `checkCrossEngineSupportable` from `Migrator.Run` right after `translate.ApplyMappings`, mirroring the chain_restore wire-up. The refusal now fires before any data moves.
+
+- **`unsupportablePGIndexToMySQL` broadened to catch extension AMs without an opclass.** The v0.30.0 helper only checked `IndexColumn.OperatorClass`. That misses the no-flag scenario: when the operator runs cross-engine PG → MySQL without `--enable-pg-extension pg_trgm`, the schema reader strips `OperatorClass` from IR (loud-failure default) but `idx.Kind` stays `IndexKindGIN`. The opclass-only refusal returned empty and bulk-copy proceeded. The helper now also flags `IndexKindGIN` / `IndexKindGIST` indexes for non-PG targets. MySQL's FULLTEXT (`IndexKindFullText`) and SPATIAL (`IndexKindSpatial`) stay portable.
+
+- **WARN log when extension-owned opclass is stripped due to missing `--enable-pg-extension` flag.** The opt-in gate in the schema reader was silent: operators saw the downstream raw PG error 42704 (`data type text has no default operator class for access method "gin"`) on the target with no sluice-side attribution. v0.30.1 emits a WARN at strip-time naming the index, column, opclass, owning extension, and the exact `--enable-pg-extension <name>` flag the operator probably wanted. New helper: `extensionOwningOperatorClass(opclass) string` in the postgres engine's catalog.
+
+### Migration / Compatibility
+
+- **No format-breaking changes.** No CLI changes, no on-disk format changes, no engine-interface changes.
+- **Drop-in upgrade from v0.30.0.** No DDL migration; no operator action required.
+- **Cross-engine PG → MySQL operators previously running migrations through silent failure:** the new refusal surfaces an actionable error message at preflight instead of leaving a partially-migrated target. If you previously worked around the failure by dropping pg_trgm indexes on source pre-migrate, that workaround is now sluice's first suggestion in the refusal message.
+
+### Who needs this release
+
+- **Cross-engine PG → MySQL operators with pg_trgm (or any GIN/GiST) indexes on the source:** **upgrade**. The refusal now fires at preflight; previously bulk-copied succeeded then indexes phase failed cryptically.
+- **PG → PG operators using `--enable-pg-extension pg_trgm`:** drop-in; no behavior change.
+- **Operators forgetting `--enable-pg-extension pg_trgm` on a PG → PG with pg_trgm-indexed source:** the new WARN at schema-read time tells you which flag to pass; the resulting CREATE INDEX failure path is otherwise unchanged.
+
 ## [0.30.0]
 
 **PG → PG `pg_trgm` extension passthrough lands as the v1 shortlist's second concrete entry (ADR-0032).** pg_trgm is the "operator-class only" extension — no new column types, just `gin_trgm_ops` / `gist_trgm_ops` operator classes that ride on core PG `gin` / `gist` access methods. Sluice now recognises and round-trips trigram-indexed columns when the operator passes `--enable-pg-extension pg_trgm` on `migrate` / `sync start` / `schema preview` / `schema diff`. Validates the index-method-passthrough framework on a simpler shape than pgvector (Tier 2 lite) and clears the path for `hstore` / `citext` / `postgis` to follow as additional catalog entries.
