@@ -166,12 +166,24 @@ func TestMigrate_PG_PostGIS_GistIndexPassthrough(t *testing.T) {
 		t.Fatal("postgres engine not registered")
 	}
 
+	// Both source + target containers pre-install PostGIS, which
+	// populates the spatial_ref_sys system table (~8500 SRIDs) and
+	// creates the geometry_columns/geography_columns system views.
+	// Cold-start preflight refuses to bulk-copy into a non-empty
+	// target table; exclude spatial_ref_sys + skip views to scope the
+	// test to operator-owned tables only.
+	filter, fErr := NewTableFilter(nil, []string{"spatial_ref_sys"})
+	if fErr != nil {
+		t.Fatalf("NewTableFilter: %v", fErr)
+	}
 	mig := &Migrator{
 		Source:              pgEng,
 		Target:              pgEng,
 		SourceDSN:           sourceDSN,
 		TargetDSN:           targetDSN,
 		EnabledPGExtensions: []string{"postgis"},
+		Filter:              filter,
+		SkipViews:           true,
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
@@ -312,12 +324,24 @@ func TestMigrate_PG_PostGIS_GistNdIndexPassthrough(t *testing.T) {
 	applyPGDDL(t, sourceDSN, seedDDL)
 
 	pgEng, _ := engines.Get("postgres")
+	// Both source + target containers pre-install PostGIS, which
+	// populates the spatial_ref_sys system table (~8500 SRIDs) and
+	// creates the geometry_columns/geography_columns system views.
+	// Cold-start preflight refuses to bulk-copy into a non-empty
+	// target table; exclude spatial_ref_sys + skip views to scope the
+	// test to operator-owned tables only.
+	filter, fErr := NewTableFilter(nil, []string{"spatial_ref_sys"})
+	if fErr != nil {
+		t.Fatalf("NewTableFilter: %v", fErr)
+	}
 	mig := &Migrator{
 		Source:              pgEng,
 		Target:              pgEng,
 		SourceDSN:           sourceDSN,
 		TargetDSN:           targetDSN,
 		EnabledPGExtensions: []string{"postgis"},
+		Filter:              filter,
+		SkipViews:           true,
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
@@ -377,12 +401,24 @@ func TestMigrate_PG_PostGIS_TargetMissing_RefusedAtPreflight(t *testing.T) {
 	applyPGDDL(t, sourceDSN, seedDDL)
 
 	pgEng, _ := engines.Get("postgres")
+	// Both source + target containers pre-install PostGIS, which
+	// populates the spatial_ref_sys system table (~8500 SRIDs) and
+	// creates the geometry_columns/geography_columns system views.
+	// Cold-start preflight refuses to bulk-copy into a non-empty
+	// target table; exclude spatial_ref_sys + skip views to scope the
+	// test to operator-owned tables only.
+	filter, fErr := NewTableFilter(nil, []string{"spatial_ref_sys"})
+	if fErr != nil {
+		t.Fatalf("NewTableFilter: %v", fErr)
+	}
 	mig := &Migrator{
 		Source:              pgEng,
 		Target:              pgEng,
 		SourceDSN:           sourceDSN,
 		TargetDSN:           targetDSN,
 		EnabledPGExtensions: []string{"postgis"},
+		Filter:              filter,
+		SkipViews:           true,
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
