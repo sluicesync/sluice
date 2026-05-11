@@ -188,9 +188,17 @@ func TestChunkEncryptedRoundTrip(t *testing.T) {
 	}
 	hash := w.Hash()
 	// The on-disk bytes should not contain the plaintext column name
-	// or row values — confirms encryption actually happened.
+	// or row values — confirms encryption actually happened. Banned
+	// strings must be ≥ 4 bytes: shorter sequences (e.g. "id") appear
+	// in random ciphertext bytes ~certainly (P("id" in 1KB random)
+	// ≈ 1024/65536 = ~1.5% per byte position × ~1024 positions), so
+	// they generate a false-positive failure under normal-looking
+	// encrypted output. The remaining 4-5-byte banned strings have
+	// P("alpha" in 1KB random) ≈ 1 in 10^12 — effectively zero false
+	// positives. Hit in the v0.30.2 main CI re-run; pre-existing
+	// latent flake.
 	encBytes := buf.Bytes()
-	for _, banned := range []string{"alpha", "beta", "name", "id"} {
+	for _, banned := range []string{"alpha", "beta", "name"} {
 		if bytes.Contains(encBytes, []byte(banned)) {
 			t.Errorf("encrypted chunk bytes contain plaintext substring %q (encryption did nothing?)", banned)
 		}

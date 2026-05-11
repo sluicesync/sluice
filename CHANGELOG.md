@@ -6,6 +6,22 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.30.3]
+
+**One-line test fix: `TestChunkEncryptedRoundTrip` no longer flakes on the 2-byte `"id"` substring check.** Hit once on the v0.30.2 main CI run. Pre-existing latent flake; not a regression.
+
+### Fixed
+
+- **`TestChunkEncryptedRoundTrip` 2-byte substring false-positive.** `backup_chunk_test.go:194` checked that encrypted chunk bytes don't contain banned plaintext substrings — including `"id"` (2 bytes). `"id"` appears in random ciphertext ~certainly at typical chunk sizes (`P("id" in 1KB random) ≈ 1024/65536 = ~1.5% per byte position × ~1024 positions`). v0.30.3 drops `"id"` from the banned list; the remaining 4–5-byte strings (`"alpha"`, `"beta"`, `"name"`) have `P(banned in 1KB random) ≈ 1 in 10^12` — effectively zero false positives. Encryption-correctness coverage unchanged.
+
+### Migration / Compatibility
+
+- **Test-only fix; no operator-visible behavior change.** Drop-in upgrade from v0.30.2.
+
+### Who needs this release
+
+- **Project maintainers + contributors:** another release-flow flake permanently closed. No operator impact.
+
 ## [0.30.2]
 
 **Test-stability + CLI help-text patch.** Two operator-invisible nits surfaced via the v0.29.x / v0.30.x release flow. Neither affects production behavior.
