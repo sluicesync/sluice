@@ -312,7 +312,7 @@ func (a *ChangeApplier) applyOneBatch(ctx context.Context, streamID string, chan
 // Returns a wrapped error on either failure with a rollback already
 // attempted on the position-write path.
 func (a *ChangeApplier) commitBatch(ctx context.Context, tx *sql.Tx, streamID, token string, rows int) error {
-	if err := writePositionTx(ctx, tx, streamID, token); err != nil {
+	if err := writePositionTx(ctx, tx, streamID, token, a.slotName, a.sourceFingerprint, a.targetSchema); err != nil {
 		_ = tx.Rollback()
 		slog.WarnContext(ctx, "mysql: applier: batch rollback on position-write error",
 			slog.String("stream_id", streamID),

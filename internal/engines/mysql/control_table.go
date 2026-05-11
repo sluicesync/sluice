@@ -42,14 +42,29 @@ const controlTableName = "sluice_cdc_state"
 //   - stop_requested_at (v0.3.0)
 //   - live_added_tables (v0.27.0, ADR-0034 MySQL Phase 2 mid-stream
 //     live add-table)
+//   - slot_name, source_dsn_fingerprint, target_schema (v0.32.2,
+//     cross-engine parity with PG control table) — close OBS-1: a
+//     cross-engine PG → MySQL live add-table with `--slot-name <name>`
+//     pre-v0.32.2 surfaced MySQL Error 1054 ("Unknown column
+//     slot_name") at the per-target write because the column never
+//     existed on the MySQL side. PG added the column in v0.24.0 via
+//     a PG-target-only ALTER; the MySQL writer's CREATE TABLE never
+//     picked it up. Same gap for source_dsn_fingerprint (v0.25.0)
+//     and target_schema (v0.25.1, Bug 46). Bringing the schema to
+//     parity lets MySQL targets faithfully record what the streamer
+//     supplies — no behavior change for MySQL → MySQL flows where
+//     the streamer doesn't supply any of these values.
 func ensureControlTable(ctx context.Context, db *sql.DB) error {
 	const ddl = `
 		CREATE TABLE IF NOT EXISTS ` + "`" + controlTableName + "`" + ` (
-			stream_id         VARCHAR(255) NOT NULL,
-			source_position   TEXT         NOT NULL,
-			updated_at        TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP
+			stream_id              VARCHAR(255) NOT NULL,
+			source_position        TEXT         NOT NULL,
+			updated_at             TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP
 				ON UPDATE CURRENT_TIMESTAMP,
-			stop_requested_at TIMESTAMP    NULL,
+			stop_requested_at      TIMESTAMP    NULL,
+			slot_name              VARCHAR(255) NULL,
+			source_dsn_fingerprint VARCHAR(255) NULL,
+			target_schema          VARCHAR(255) NULL,
 			PRIMARY KEY (stream_id)
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
 	if _, err := db.ExecContext(ctx, ddl); err != nil {
@@ -58,7 +73,49 @@ func ensureControlTable(ctx context.Context, db *sql.DB) error {
 	if err := ensureStopRequestedColumn(ctx, db); err != nil {
 		return err
 	}
-	return ensureLiveAddedTablesColumn(ctx, db)
+	if err := ensureLiveAddedTablesColumn(ctx, db); err != nil {
+		return err
+	}
+	if err := ensureCrossEngineParityColumn(ctx, db, "slot_name", "VARCHAR(255) NULL"); err != nil {
+		return err
+	}
+	if err := ensureCrossEngineParityColumn(ctx, db, "source_dsn_fingerprint", "VARCHAR(255) NULL"); err != nil {
+		return err
+	}
+	return ensureCrossEngineParityColumn(ctx, db, "target_schema", "VARCHAR(255) NULL")
+}
+
+// ensureCrossEngineParityColumn adds a column to an existing control
+// table when missing, using the same detect-then-ALTER shape as
+// ensureStopRequestedColumn so the migration stays portable to MySQL
+// 8.0.x versions older than 8.0.29 that lack ADD COLUMN IF NOT EXISTS.
+// Closes OBS-1: pre-v0.32.2 deployments that ran sluice before any
+// of slot_name / source_dsn_fingerprint / target_schema existed on
+// the MySQL side pick the columns up on the next EnsureControlTable
+// call without losing existing rows.
+//
+// columnDef is the bare type + nullability spec (e.g. "VARCHAR(255)
+// NULL"). columnName is interpolated unsafely into the SQL — callers
+// supply only internally-defined constants, never operator input.
+func ensureCrossEngineParityColumn(ctx context.Context, db *sql.DB, columnName, columnDef string) error {
+	const checkQ = `
+		SELECT COUNT(*)
+		FROM   information_schema.COLUMNS
+		WHERE  TABLE_SCHEMA = DATABASE()
+		  AND  TABLE_NAME   = ?
+		  AND  COLUMN_NAME  = ?`
+	var n int
+	if err := db.QueryRowContext(ctx, checkQ, controlTableName, columnName).Scan(&n); err != nil {
+		return fmt.Errorf("mysql: ensure control table: detect %s: %w", columnName, err)
+	}
+	if n > 0 {
+		return nil
+	}
+	alter := "ALTER TABLE `" + controlTableName + "` ADD COLUMN `" + columnName + "` " + columnDef
+	if _, err := db.ExecContext(ctx, alter); err != nil {
+		return fmt.Errorf("mysql: ensure control table: add %s: %w", columnName, err)
+	}
+	return nil
 }
 
 // ensureLiveAddedTablesColumn adds the live_added_tables column to
@@ -150,8 +207,28 @@ func readPosition(ctx context.Context, db *sql.DB, streamID string) (token strin
 //
 // The Position values returned set Engine to the supplied
 // engineName for symmetry with ReadPosition's contract.
+//
+// COALESCE on slot_name / source_dsn_fingerprint / target_schema so
+// legacy rows that pre-date those columns (v0.32.2 introduced them on
+// the MySQL side; OBS-1) surface as empty strings in the StreamStatus
+// — callers branch on empty-string rather than handling
+// sql.NullString. The columns are also COALESCE'd in case the
+// control table itself was created pre-v0.32.2 and an ALTER landed
+// the columns: existing rows would be NULL until a subsequent
+// position-write upserts a non-empty value.
+//
+// The query falls back to the legacy column set (no slot_name etc.)
+// when MySQL reports "Unknown column" — the path is reachable only
+// during an in-progress upgrade where another connection has run
+// EnsureControlTable's ALTER concurrently but this connection's
+// query was already planned against the old schema. Defence in
+// depth; the fallback returns empty strings for the missing fields.
 func listStreams(ctx context.Context, db *sql.DB, engineName string) ([]ir.StreamStatus, error) {
-	const q = "SELECT stream_id, source_position, updated_at FROM `" + controlTableName + "`"
+	const q = "SELECT stream_id, source_position, updated_at, " +
+		"COALESCE(slot_name, ''), " +
+		"COALESCE(source_dsn_fingerprint, ''), " +
+		"COALESCE(target_schema, '') " +
+		"FROM `" + controlTableName + "`"
 	rows, err := db.QueryContext(ctx, q)
 	if err != nil {
 		// MySQL surfaces missing-table as error 1146; the friendly
@@ -160,7 +237,57 @@ func listStreams(ctx context.Context, db *sql.DB, engineName string) ([]ir.Strea
 		if isMySQLMissingTableErr(err) {
 			return []ir.StreamStatus{}, nil
 		}
+		// Unknown-column fallback: pre-v0.32.2 control tables that
+		// haven't had EnsureControlTable's ALTER applied yet. The
+		// streamer's startup runs EnsureControlTable so this is rare
+		// in practice; the fallback keeps `sluice sync status` working
+		// against a target mid-upgrade.
+		if isMySQLUnknownColumnErr(err) {
+			return listStreamsLegacy(ctx, db, engineName)
+		}
 		return nil, fmt.Errorf("mysql: list streams: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	out := []ir.StreamStatus{}
+	for rows.Next() {
+		var (
+			streamID     string
+			token        string
+			updated      time.Time
+			slotName     string
+			fingerprint  string
+			targetSchema string
+		)
+		if err := rows.Scan(&streamID, &token, &updated, &slotName, &fingerprint, &targetSchema); err != nil {
+			return nil, fmt.Errorf("mysql: scan streams: %w", err)
+		}
+		out = append(out, ir.StreamStatus{
+			StreamID:             streamID,
+			Position:             ir.Position{Engine: engineName, Token: token},
+			UpdatedAt:            updated,
+			SlotName:             slotName,
+			SourceDSNFingerprint: fingerprint,
+			TargetSchema:         targetSchema,
+		})
+	}
+	return out, rows.Err()
+}
+
+// listStreamsLegacy is the pre-v0.32.2 SELECT shape, used as a
+// fallback when the new query trips an Unknown-column error (e.g.
+// in-progress upgrade window before EnsureControlTable's ALTER ran).
+// The returned StreamStatus values have empty SlotName /
+// SourceDSNFingerprint / TargetSchema — the columns are simply not
+// present yet on this control table.
+func listStreamsLegacy(ctx context.Context, db *sql.DB, engineName string) ([]ir.StreamStatus, error) {
+	const q = "SELECT stream_id, source_position, updated_at FROM `" + controlTableName + "`"
+	rows, err := db.QueryContext(ctx, q)
+	if err != nil {
+		if isMySQLMissingTableErr(err) {
+			return []ir.StreamStatus{}, nil
+		}
+		return nil, fmt.Errorf("mysql: list streams (legacy): %w", err)
 	}
 	defer func() { _ = rows.Close() }()
 
@@ -172,7 +299,7 @@ func listStreams(ctx context.Context, db *sql.DB, engineName string) ([]ir.Strea
 			updated  time.Time
 		)
 		if err := rows.Scan(&streamID, &token, &updated); err != nil {
-			return nil, fmt.Errorf("mysql: scan streams: %w", err)
+			return nil, fmt.Errorf("mysql: scan streams (legacy): %w", err)
 		}
 		out = append(out, ir.StreamStatus{
 			StreamID:  streamID,
@@ -195,19 +322,43 @@ func isMySQLMissingTableErr(err error) bool {
 	return strings.Contains(msg, "doesn't exist") || strings.Contains(msg, "Error 1146")
 }
 
-// writePositionTx upserts the (streamID, token) row inside an open
-// transaction. Called from the applier's per-change tx after the
-// data write — atomicity guarantees that progress and data move
-// together.
+// writePositionTx upserts the (streamID, token, slotName,
+// sourceFingerprint, targetSchema) row inside an open transaction.
+// Called from the applier's per-change tx after the data write —
+// atomicity guarantees that progress and data move together.
 //
 // Uses the row-alias UPSERT form (MySQL 8.0.20+) for consistency
 // with the data-write Insert path. stop_requested_at is left
 // untouched: a position write is the streamer making forward
 // progress, which must not clear an in-flight stop request.
-func writePositionTx(ctx context.Context, tx *sql.Tx, streamID, token string) error {
-	const q = "INSERT INTO `" + controlTableName + "` (stream_id, source_position) VALUES (?, ?) " +
-		"AS new ON DUPLICATE KEY UPDATE source_position = new.source_position"
-	if _, err := tx.ExecContext(ctx, q, streamID, token); err != nil {
+//
+// slotName / sourceFingerprint / targetSchema follow the
+// COALESCE-tolerant shape the PG counterpart uses (v0.24.0, v0.25.0,
+// v0.25.1 — bridged to MySQL in v0.32.2 to close OBS-1): a non-empty
+// value overwrites the row's existing column; an empty value
+// preserves whatever was already there. The NULLIF wrapper around
+// each placeholder converts the driver-side empty string back to
+// SQL NULL on the INSERT path; the COALESCE on each ON DUPLICATE
+// KEY UPDATE entry preserves the row's existing value when the
+// incoming write supplies the empty (now NULL) string. Mirrors the
+// PG counterpart in
+// internal/engines/postgres/control_table.go::writePositionTx.
+//
+// Engines that don't supply these values (today: MySQL's own CDC
+// streamer doesn't have a slot concept; the streamer's SetSlotName
+// is structural-optional and the applier no-ops empty input)
+// produce NULL columns on the row — identical to the pre-v0.32.2
+// shape on the MySQL side.
+func writePositionTx(ctx context.Context, tx *sql.Tx, streamID, token, slotName, sourceFingerprint, targetSchema string) error {
+	const q = "INSERT INTO `" + controlTableName + "` " +
+		"(stream_id, source_position, slot_name, source_dsn_fingerprint, target_schema) " +
+		"VALUES (?, ?, NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, '')) " +
+		"AS new ON DUPLICATE KEY UPDATE " +
+		"source_position = new.source_position, " +
+		"slot_name = COALESCE(new.slot_name, `" + controlTableName + "`.slot_name), " +
+		"source_dsn_fingerprint = COALESCE(new.source_dsn_fingerprint, `" + controlTableName + "`.source_dsn_fingerprint), " +
+		"target_schema = COALESCE(new.target_schema, `" + controlTableName + "`.target_schema)"
+	if _, err := tx.ExecContext(ctx, q, streamID, token, slotName, sourceFingerprint, targetSchema); err != nil {
 		return fmt.Errorf("mysql: write position: %w", err)
 	}
 	return nil

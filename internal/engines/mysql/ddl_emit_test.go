@@ -296,6 +296,88 @@ func TestEmitDefault(t *testing.T) {
 	}
 }
 
+// TestEmitColumnDef_SuppressesDefaultOnForbidddenTypes pins the v0.32.2
+// fix: MySQL rejects DEFAULT clauses on JSON, TEXT, BLOB, and GEOMETRY
+// columns (Error 1101). The cross-engine PG → MySQL path is the
+// motivating case — a PG source with `jsonb NOT NULL DEFAULT '{}'::jsonb`
+// would die at CREATE TABLE on the target. The writer now drops the
+// DEFAULT clause; the emit shape stays identical when the column has
+// no Default. ir.Array also routes through the suppression because
+// emitColumnType maps it to MySQL JSON.
+func TestEmitColumnDef_SuppressesDefaultOnForbidddenTypes(t *testing.T) {
+	cases := []struct {
+		name      string
+		colType   ir.Type
+		typeIsStr string // expected substring of the emitted type
+	}{
+		{"json", ir.JSON{Binary: true}, "JSON"},
+		{"text regular", ir.Text{Size: ir.TextRegular}, "TEXT"},
+		{"text long", ir.Text{Size: ir.TextLong}, "LONGTEXT"},
+		{"blob regular", ir.Blob{Size: ir.BlobRegular}, "BLOB"},
+		{"blob medium", ir.Blob{Size: ir.BlobMedium}, "MEDIUMBLOB"},
+		{"geometry default", ir.Geometry{Subtype: ir.GeometryUnspecified}, "GEOMETRY"},
+		{"geometry point", ir.Geometry{Subtype: ir.GeometryPoint}, "POINT"},
+		{"array routes to JSON", ir.Array{Element: ir.Integer{Width: 32}}, "JSON"},
+		{"hstore extension routes to JSON", ir.ExtensionType{Extension: "hstore", Name: "hstore"}, "JSON"},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name+"/with default suppressed", func(t *testing.T) {
+			col := &ir.Column{
+				Name:    "data",
+				Type:    c.colType,
+				Default: ir.DefaultExpression{Expr: "'{}'::jsonb"},
+			}
+			got, err := emitColumnDef(col)
+			if err != nil {
+				t.Fatalf("emitColumnDef: %v", err)
+			}
+			if strings.Contains(got, "DEFAULT") {
+				t.Errorf("emitColumnDef = %q; want no DEFAULT clause on %s", got, c.typeIsStr)
+			}
+			if !strings.Contains(got, c.typeIsStr) {
+				t.Errorf("emitColumnDef = %q; want substring %q", got, c.typeIsStr)
+			}
+		})
+		t.Run(c.name+"/without default unchanged", func(t *testing.T) {
+			col := &ir.Column{Name: "data", Type: c.colType}
+			got, err := emitColumnDef(col)
+			if err != nil {
+				t.Fatalf("emitColumnDef: %v", err)
+			}
+			if strings.Contains(got, "DEFAULT") {
+				t.Errorf("emitColumnDef = %q; should never have DEFAULT (no Default set)", got)
+			}
+		})
+	}
+}
+
+// TestEmitColumnDef_PreservesDefaultOnAllowedTypes is the symmetric
+// regression-guard: columns whose types DO accept DEFAULT (boolean,
+// integer, varchar, timestamp, etc.) still emit the DEFAULT clause
+// after the v0.32.2 suppression. Without this pin a too-broad
+// helper change could quietly strip DEFAULTs across the board.
+func TestEmitColumnDef_PreservesDefaultOnAllowedTypes(t *testing.T) {
+	cases := []*ir.Column{
+		{Name: "active", Type: ir.Boolean{}, Default: ir.DefaultLiteral{Value: "true"}},
+		{Name: "count", Type: ir.Integer{Width: 32}, Default: ir.DefaultLiteral{Value: "0"}},
+		{Name: "name", Type: ir.Varchar{Length: 64}, Default: ir.DefaultLiteral{Value: "anon"}},
+		{Name: "created_at", Type: ir.Timestamp{Precision: 6, WithTimeZone: true}, Default: ir.DefaultExpression{Expr: "CURRENT_TIMESTAMP(6)"}},
+	}
+	for _, col := range cases {
+		col := col
+		t.Run(col.Name, func(t *testing.T) {
+			got, err := emitColumnDef(col)
+			if err != nil {
+				t.Fatalf("emitColumnDef: %v", err)
+			}
+			if !strings.Contains(got, "DEFAULT") {
+				t.Errorf("emitColumnDef = %q; expected DEFAULT clause to be preserved on %T", got, col.Type)
+			}
+		})
+	}
+}
+
 func TestEmitColumnDef(t *testing.T) {
 	cases := []struct {
 		name string

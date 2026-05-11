@@ -21,6 +21,8 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"github.com/orware/sluice/internal/ir"
 )
 
 // TestEnsureControlTable_AddsStopRequestedColumn verifies the
@@ -144,7 +146,7 @@ func TestRequestStop_RoundTrips(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
-	if err := writePositionTx(ctx, tx, "test-stream", "tok"); err != nil {
+	if err := writePositionTx(ctx, tx, "test-stream", "tok", "", "", ""); err != nil {
 		t.Fatalf("writePositionTx: %v", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -209,5 +211,185 @@ func TestRequestStop_UnknownStreamReturnsSentinel(t *testing.T) {
 	}
 	if !errors.Is(err, errStreamNotFound) {
 		t.Errorf("RequestStop unknown: err = %v; want errors.Is errStreamNotFound", err)
+	}
+}
+
+// TestEnsureControlTable_AddsCrossEngineParityColumns verifies the
+// v0.32.2 migration path that closes OBS-1. Pre-v0.32.2 deployments
+// had a control table with stream_id / source_position / updated_at /
+// stop_requested_at / live_added_tables only; the slot_name /
+// source_dsn_fingerprint / target_schema columns lived on the PG
+// side but never made it to the MySQL writer. EnsureControlTable
+// now backfills them via the detect-then-ALTER path (portable to
+// MySQL 8.0.x versions older than 8.0.29 that lack ADD COLUMN IF
+// NOT EXISTS), preserves existing rows, and starts the new columns
+// NULL.
+func TestEnsureControlTable_AddsCrossEngineParityColumns(t *testing.T) {
+	dsn, cleanup := startMySQLForApplier(t)
+	defer cleanup()
+
+	// Pre-v0.32.2 shape: stop_requested_at + live_added_tables, but
+	// none of the cross-engine parity columns. Includes a seeded row
+	// so the migration's row-preservation property has something to
+	// assert against.
+	applyMySQLApplier(t, dsn, "CREATE TABLE `sluice_cdc_state` ("+
+		"  stream_id         VARCHAR(255) NOT NULL,"+
+		"  source_position   TEXT         NOT NULL,"+
+		"  updated_at        TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,"+
+		"  stop_requested_at TIMESTAMP    NULL,"+
+		"  live_added_tables TEXT         NULL,"+
+		"  PRIMARY KEY (stream_id)"+
+		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;"+
+		"INSERT INTO `sluice_cdc_state` (stream_id, source_position) VALUES ('legacy-stream', 'legacy-token');")
+
+	eng := Engine{Flavor: FlavorVanilla}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	applier, err := eng.OpenChangeApplier(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenChangeApplier: %v", err)
+	}
+	defer func() {
+		if c, ok := applier.(interface{ Close() error }); ok {
+			_ = c.Close()
+		}
+	}()
+
+	if err := applier.EnsureControlTable(ctx); err != nil {
+		t.Fatalf("EnsureControlTable: %v", err)
+	}
+
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	for _, col := range []string{"slot_name", "source_dsn_fingerprint", "target_schema"} {
+		var n int
+		if err := db.QueryRowContext(ctx, `
+			SELECT COUNT(*)
+			FROM   information_schema.COLUMNS
+			WHERE  TABLE_SCHEMA = DATABASE()
+			  AND  TABLE_NAME   = 'sluice_cdc_state'
+			  AND  COLUMN_NAME  = ?
+		`, col).Scan(&n); err != nil {
+			t.Fatalf("column %s lookup: %v", col, err)
+		}
+		if n != 1 {
+			t.Errorf("%s column missing after EnsureControlTable; count = %d", col, n)
+		}
+	}
+
+	// Existing row should be preserved with its original token; the
+	// new columns start NULL on the freshly-migrated row.
+	var (
+		token       string
+		slot        sql.NullString
+		fingerprint sql.NullString
+		tsch        sql.NullString
+	)
+	if err := db.QueryRowContext(ctx,
+		"SELECT source_position, slot_name, source_dsn_fingerprint, target_schema FROM `sluice_cdc_state` WHERE stream_id = ?",
+		"legacy-stream",
+	).Scan(&token, &slot, &fingerprint, &tsch); err != nil {
+		t.Fatalf("legacy row select: %v", err)
+	}
+	if token != "legacy-token" {
+		t.Errorf("legacy token = %q; want %q", token, "legacy-token")
+	}
+	if slot.Valid {
+		t.Errorf("slot_name on freshly-migrated row should be NULL; got %q", slot.String)
+	}
+	if fingerprint.Valid {
+		t.Errorf("source_dsn_fingerprint on freshly-migrated row should be NULL; got %q", fingerprint.String)
+	}
+	if tsch.Valid {
+		t.Errorf("target_schema on freshly-migrated row should be NULL; got %q", tsch.String)
+	}
+
+	// Calling EnsureControlTable again is still a no-op (idempotent).
+	if err := applier.EnsureControlTable(ctx); err != nil {
+		t.Fatalf("second EnsureControlTable: %v", err)
+	}
+}
+
+// TestWritePositionTx_SlotNameRoundTrip pins the OBS-1 fix:
+// SetSlotName followed by a position-write upserts the slot_name
+// column; ListStreams returns the recorded value via StreamStatus.
+// Empty SetSlotName preserves the previously-recorded value (the
+// COALESCE branch in writePositionTx) — important so a chain-handoff
+// WritePosition that lacks streamer context doesn't clobber the
+// streamer's recorded slot.
+func TestWritePositionTx_SlotNameRoundTrip(t *testing.T) {
+	dsn, cleanup := startMySQLForApplier(t)
+	defer cleanup()
+
+	eng := Engine{Flavor: FlavorVanilla}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	applier, err := eng.OpenChangeApplier(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenChangeApplier: %v", err)
+	}
+	defer func() {
+		if c, ok := applier.(interface{ Close() error }); ok {
+			_ = c.Close()
+		}
+	}()
+	if err := applier.EnsureControlTable(ctx); err != nil {
+		t.Fatalf("EnsureControlTable: %v", err)
+	}
+
+	myApplier := applier.(*ChangeApplier)
+	myApplier.SetSlotName("sluice_shard_a")
+
+	// Seed a row via WritePosition (Apply's per-change path is the
+	// other writer; both share writePositionTx so either suffices).
+	pw, ok := applier.(interface {
+		WritePosition(ctx context.Context, streamID string, pos ir.Position) error
+	})
+	if !ok {
+		t.Fatal("ChangeApplier does not implement ir.PositionWriter")
+	}
+	if err := pw.WritePosition(ctx, "shard-stream", ir.Position{Engine: engineNameMySQL, Token: "tok1"}); err != nil {
+		t.Fatalf("WritePosition: %v", err)
+	}
+
+	statuses, err := applier.ListStreams(ctx)
+	if err != nil {
+		t.Fatalf("ListStreams: %v", err)
+	}
+	var got ir.StreamStatus
+	for _, s := range statuses {
+		if s.StreamID == "shard-stream" {
+			got = s
+			break
+		}
+	}
+	if got.StreamID == "" {
+		t.Fatalf("ListStreams did not return shard-stream; got %+v", statuses)
+	}
+	if got.SlotName != "sluice_shard_a" {
+		t.Errorf("StreamStatus.SlotName = %q; want %q", got.SlotName, "sluice_shard_a")
+	}
+
+	// Empty SetSlotName preserves the previously-recorded value: the
+	// position-write's COALESCE keeps slot_name pointing at the
+	// streamer's recorded slot.
+	myApplier.SetSlotName("")
+	if err := pw.WritePosition(ctx, "shard-stream", ir.Position{Engine: engineNameMySQL, Token: "tok2"}); err != nil {
+		t.Fatalf("WritePosition (preserve): %v", err)
+	}
+	statuses, err = applier.ListStreams(ctx)
+	if err != nil {
+		t.Fatalf("ListStreams (after preserve): %v", err)
+	}
+	for _, s := range statuses {
+		if s.StreamID == "shard-stream" && s.SlotName != "sluice_shard_a" {
+			t.Errorf("after empty SetSlotName, SlotName = %q; want preserved %q", s.SlotName, "sluice_shard_a")
+		}
 	}
 }

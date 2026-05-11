@@ -99,6 +99,41 @@ type ChangeApplier struct {
 	db     *sql.DB
 	schema string
 
+	// slotName is the active stream's resolved replication-slot name,
+	// set by [SetSlotName] at Streamer startup. Threaded into every
+	// [writePositionTx] call so the per-target sluice_cdc_state row's
+	// slot_name column stays in sync with what the streamer is
+	// actually consuming.
+	//
+	// MySQL has no native slot concept (the binlog stream is the
+	// slot), so on same-engine MySQL → MySQL the streamer does not
+	// supply a slot name and this stays empty. The field exists for
+	// cross-engine PG → MySQL parity (OBS-1, v0.32.2): the PG
+	// streamer's resolved slot name needs to round-trip through the
+	// MySQL target's sluice_cdc_state row so a future
+	// `sluice schema add-table --no-drain --slot-name=<name>`
+	// against the same MySQL target can recover it via ListStreams.
+	// Pre-v0.32.2, the same code path triggered MySQL Error 1054
+	// ("Unknown column slot_name") because the MySQL control table
+	// lacked the column entirely.
+	slotName string
+
+	// sourceFingerprint is the truncated SHA-256 hex of the streamer's
+	// source DSN host+port+database tuple, set by
+	// [SetSourceDSNFingerprint] at Streamer startup. Same
+	// cross-engine parity rationale as slotName — see ADR-0031 and
+	// OBS-1 (v0.32.2).
+	sourceFingerprint string
+
+	// targetSchema records the operator-supplied `--target-schema NAME`
+	// on the per-target sluice_cdc_state row. MySQL targets do not
+	// support `--target-schema` (the validate-time gate refuses it
+	// upstream — MySQL has no schema-vs-database distinction), so on
+	// the MySQL side this column always stays empty in practice. The
+	// field exists for IR-side parity and to avoid silently dropping
+	// the value if a future engine flavor relaxes the upstream gate.
+	targetSchema string
+
 	// pkCache maps "schema.table" → ordered list of PK column names.
 	// Populated lazily via a single information_schema query the
 	// first time a change for the table arrives. An empty slice
@@ -133,6 +168,49 @@ type ChangeApplier struct {
 // trigger.
 func (a *ChangeApplier) SetMaxBufferBytes(bytes int64) {
 	a.maxBufferBytes = bytes
+}
+
+// SetSlotName records the active stream's resolved replication-slot
+// name so subsequent position-writes populate the sluice_cdc_state
+// row's slot_name column. Symmetric with the PG ChangeApplier's
+// counterpart; v0.32.2 brought MySQL to schema parity (OBS-1) so a
+// cross-engine PG → MySQL stream with `--slot-name <name>` can
+// round-trip the slot identity through the target's control table.
+//
+// MySQL's own CDC streamer doesn't have a slot concept, so when the
+// pipeline streamer runs against a MySQL source the structural
+// SetSlotName call lands with an empty string (the streamer's
+// `s.SlotName` is itself empty for MySQL sources). Empty input is a
+// no-op via the COALESCE-tolerant shape in writePositionTx.
+// Idempotent; the streamer may call this on every Run.
+func (a *ChangeApplier) SetSlotName(slotName string) {
+	a.slotName = slotName
+}
+
+// SetSourceDSNFingerprint implements [ir.SourceFingerprintRecorder].
+// Records the source DSN fingerprint the streamer computed at startup
+// so subsequent position-writes populate the sluice_cdc_state row's
+// source_dsn_fingerprint column. Symmetric with PG (ADR-0031); MySQL
+// schema parity arrived in v0.32.2 (OBS-1). Empty input is a no-op
+// preservation via writePositionTx's COALESCE. Idempotent.
+func (a *ChangeApplier) SetSourceDSNFingerprint(fingerprint string) {
+	a.sourceFingerprint = fingerprint
+}
+
+// SetTargetSchema records the operator-supplied `--target-schema NAME`
+// (ADR-0031, Bug 46) so subsequent position-writes populate the
+// sluice_cdc_state row's target_schema column. MySQL's validate-time
+// gate refuses `--target-schema` upstream (no schema-vs-database
+// distinction), so on the MySQL side this method receives empty
+// input in practice — the column stays NULL on the row. The setter
+// exists for IR-side parity (OBS-1, v0.32.2): the streamer's
+// structural-interface dispatch otherwise can't tell that the empty
+// flag has been "applied" to the MySQL side, which would be
+// confusing if a future engine flavor opens up target_schema for
+// MySQL. Idempotent; empty input preserves the row's existing value
+// via writePositionTx's COALESCE.
+func (a *ChangeApplier) SetTargetSchema(name string) {
+	a.targetSchema = name
 }
 
 // Close releases the underlying connection pool.
@@ -281,7 +359,7 @@ func (a *ChangeApplier) WritePosition(ctx context.Context, streamID string, pos 
 	if err != nil {
 		return fmt.Errorf("mysql: applier: WritePosition: begin tx: %w", err)
 	}
-	if err := writePositionTx(ctx, tx, streamID, pos.Token); err != nil {
+	if err := writePositionTx(ctx, tx, streamID, pos.Token, a.slotName, a.sourceFingerprint, a.targetSchema); err != nil {
 		_ = tx.Rollback()
 		return err
 	}
@@ -341,7 +419,7 @@ func (a *ChangeApplier) applyOne(ctx context.Context, streamID string, c ir.Chan
 		_ = tx.Rollback()
 		return err
 	}
-	if err := writePositionTx(ctx, tx, streamID, c.Pos().Token); err != nil {
+	if err := writePositionTx(ctx, tx, streamID, c.Pos().Token, a.slotName, a.sourceFingerprint, a.targetSchema); err != nil {
 		_ = tx.Rollback()
 		return err
 	}

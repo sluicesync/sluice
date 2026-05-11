@@ -5,6 +5,7 @@ package mysql
 
 import (
 	"fmt"
+	"log/slog"
 	"strings"
 
 	"github.com/orware/sluice/internal/ir"
@@ -534,8 +535,26 @@ func emitColumnDef(c *ir.Column) (string, error) {
 	// emitDefault returns ok=false and the clause is skipped naturally;
 	// we don't need a special case here.
 	if dflt, ok := emitDefault(c.Default, c.Type); ok {
-		sb.WriteString(" DEFAULT ")
-		sb.WriteString(dflt)
+		// MySQL forbids DEFAULT on BLOB, TEXT, GEOMETRY, and JSON
+		// columns — the server rejects CREATE TABLE with Error 1101
+		// ("can't have a default value"). Cross-engine PG → MySQL
+		// hits this whenever a PG source carries `jsonb NOT NULL
+		// DEFAULT '{}'::jsonb` (and the symmetric shapes on text /
+		// bytea / geometry); pre-fix the migration died at CREATE
+		// TABLE on the target with no recovery path.
+		//
+		// Smallest correct fix: drop the DEFAULT clause for these
+		// types and warn loudly so the operator knows the column
+		// will not auto-populate on the target. The follow-up note
+		// fires when the column is also NOT NULL — that's the
+		// failure-prone shape (INSERTs without an explicit value
+		// will fail on the target).
+		if mysqlForbidsDefault(c.Type) {
+			logSuppressedDefault(c, dflt)
+		} else {
+			sb.WriteString(" DEFAULT ")
+			sb.WriteString(dflt)
+		}
 	}
 	if c.Comment != "" {
 		sb.WriteString(" COMMENT ")
@@ -793,6 +812,47 @@ func emitColumnList(cols []string) string {
 		parts[i] = quoteIdent(c)
 	}
 	return "(" + strings.Join(parts, ", ") + ")"
+}
+
+// mysqlForbidsDefault reports whether the given IR type maps to a
+// MySQL column type that rejects a DEFAULT clause at CREATE TABLE
+// (Error 1101: "BLOB, TEXT, GEOMETRY or JSON column ... can't have a
+// default value"). The four families are MySQL's hard-coded set —
+// the restriction is documented at
+// https://dev.mysql.com/doc/refman/8.0/en/data-type-defaults.html.
+// ir.Array also maps because emitColumnType routes it to JSON.
+func mysqlForbidsDefault(t ir.Type) bool {
+	switch t.(type) {
+	case ir.JSON, ir.Text, ir.Blob, ir.Geometry, ir.Array:
+		return true
+	}
+	// PG-extension types that translate to forbidding MySQL types:
+	// hstore → JSON falls under the JSON case via the writer's
+	// translator (emitColumnType emits "JSON"), but the IR shape
+	// here is still ir.ExtensionType. Match on that.
+	if ext, ok := t.(ir.ExtensionType); ok && ext.Extension == "hstore" {
+		return true
+	}
+	return false
+}
+
+// logSuppressedDefault emits a WARN that names the column whose
+// DEFAULT clause was suppressed because MySQL rejects DEFAULTs on
+// the column's type family. The follow-up note fires when the
+// column is also NOT NULL — without the default, INSERTs that don't
+// specify a value will fail on the target. Operator workflow: drop
+// the NOT NULL on the source, or supply the value at write time.
+func logSuppressedDefault(c *ir.Column, suppressed string) {
+	slog.Warn("cross-engine: dropping DEFAULT on MySQL forbidding-type column; MySQL forbids DEFAULTs on JSON/TEXT/BLOB/GEOMETRY (Error 1101)",
+		slog.String("column", c.Name),
+		slog.String("type", fmt.Sprintf("%T", c.Type)),
+		slog.String("suppressed_default", suppressed),
+	)
+	if !c.Nullable {
+		slog.Warn("cross-engine: column is NOT NULL; INSERTs without an explicit value will fail. Consider DROP NOT NULL on source or supply the value at write time",
+			slog.String("column", c.Name),
+		)
+	}
 }
 
 // typeName returns a human-readable name for an IR type, used in
