@@ -221,29 +221,69 @@ func TestTranslateTypeGeography(t *testing.T) {
 }
 
 // TestParseGeometrySubtype maps every PostGIS-canonical subtype
-// string to the IR enum. Unknown strings (and the empty string)
-// return GeometryUnspecified — the wildcard.
+// string to the IR enum + (HasZ, HasM) pair. Unknown strings (and
+// the empty string) return GeometryUnspecified — the wildcard.
+//
+// Three input shapes covered:
+//
+//   - ALL-CAPS (geometry_columns.type — the pre-Bug-51 path).
+//   - Mixed-case (geography_columns.type — Bug 51 fix exercises
+//     ToUpper before dispatch).
+//   - Z / M / ZM dimensional suffixes (Bug 52 — POINTZ, LINESTRINGM,
+//     MULTIPOLYGONZM, etc.). The suffix strips before subtype
+//     dispatch and surfaces as HasZ / HasM on the return tuple.
 func TestParseGeometrySubtype(t *testing.T) {
 	cases := []struct {
-		in   string
-		want ir.GeometrySubtype
+		in       string
+		want     ir.GeometrySubtype
+		wantHasZ bool
+		wantHasM bool
 	}{
-		{"POINT", ir.GeometryPoint},
-		{"LINESTRING", ir.GeometryLineString},
-		{"POLYGON", ir.GeometryPolygon},
-		{"MULTIPOINT", ir.GeometryMultiPoint},
-		{"MULTILINESTRING", ir.GeometryMultiLineString},
-		{"MULTIPOLYGON", ir.GeometryMultiPolygon},
-		{"GEOMETRYCOLLECTION", ir.GeometryCollection},
-		{"GEOMETRY", ir.GeometryUnspecified},
-		{"", ir.GeometryUnspecified},
-		{"TIN", ir.GeometryUnspecified}, // unknown → wildcard
+		{"POINT", ir.GeometryPoint, false, false},
+		{"LINESTRING", ir.GeometryLineString, false, false},
+		{"POLYGON", ir.GeometryPolygon, false, false},
+		{"MULTIPOINT", ir.GeometryMultiPoint, false, false},
+		{"MULTILINESTRING", ir.GeometryMultiLineString, false, false},
+		{"MULTIPOLYGON", ir.GeometryMultiPolygon, false, false},
+		{"GEOMETRYCOLLECTION", ir.GeometryCollection, false, false},
+		{"GEOMETRY", ir.GeometryUnspecified, false, false},
+		{"", ir.GeometryUnspecified, false, false},
+		{"TIN", ir.GeometryUnspecified, false, false}, // unknown → wildcard
+
+		// Bug 51 — geography_columns.type uses mixed case. Pre-fix the
+		// switch fell through to GeometryUnspecified silently.
+		{"Point", ir.GeometryPoint, false, false},
+		{"Polygon", ir.GeometryPolygon, false, false},
+		{"LineString", ir.GeometryLineString, false, false},
+		{"MultiPolygon", ir.GeometryMultiPolygon, false, false},
+		{"point", ir.GeometryPoint, false, false}, // defensive: all-lower also works
+
+		// Bug 52 — Z / M / ZM dimensional variants.
+		{"POINTZ", ir.GeometryPoint, true, false},
+		{"POINTM", ir.GeometryPoint, false, true},
+		{"POINTZM", ir.GeometryPoint, true, true},
+		{"LINESTRINGZ", ir.GeometryLineString, true, false},
+		{"POLYGONM", ir.GeometryPolygon, false, true},
+		{"MULTIPOINTZ", ir.GeometryMultiPoint, true, false},
+		{"MULTIPOLYGONZM", ir.GeometryMultiPolygon, true, true},
+		{"GEOMETRYCOLLECTIONZ", ir.GeometryCollection, true, false},
+
+		// Mixed-case + dimensional suffix (geography_columns shape).
+		{"PointZ", ir.GeometryPoint, true, false},
+		{"PolygonZM", ir.GeometryPolygon, true, true},
 	}
 	for _, c := range cases {
 		c := c
 		t.Run(c.in, func(t *testing.T) {
-			if got := parseGeometrySubtype(c.in); got != c.want {
-				t.Errorf("got %v; want %v", got, c.want)
+			gotSubtype, gotHasZ, gotHasM := parseGeometrySubtype(c.in)
+			if gotSubtype != c.want {
+				t.Errorf("subtype = %v; want %v", gotSubtype, c.want)
+			}
+			if gotHasZ != c.wantHasZ {
+				t.Errorf("hasZ = %v; want %v", gotHasZ, c.wantHasZ)
+			}
+			if gotHasM != c.wantHasM {
+				t.Errorf("hasM = %v; want %v", gotHasM, c.wantHasM)
 			}
 		})
 	}

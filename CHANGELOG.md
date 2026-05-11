@@ -6,6 +6,27 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.33.2]
+
+**Two adjacent PostGIS fidelity gaps surfaced by the v0.33.1 cycle, both closed.** Bug 51 + Bug 52 share a single fix locus (`parseGeometrySubtype`) and are both fidelity preservers — neither corrupts row data, but both silently widen the column type on the target.
+
+### Fixed
+
+- **Bug 51: PG `geography(Point, 4326)` columns now preserve the subtype on same-engine PG → PG.** Pre-fix: PostGIS's `geometry_columns.type` view returns ALL-CAPS strings ("POINT"), but its sibling `geography_columns.type` view returns Mixed-Case ("Point"). `parseGeometrySubtype` did a literal switch on the upper-case forms only, so `geography_columns` inputs fell through to `GeometryUnspecified` and the target column landed as `geography(Geometry, 4326)` instead of `geography(Point, 4326)`. Rows still round-tripped (the wildcard supertype accepts any concrete shape), but the typmod-constrained subtype was lost on the target — operators selecting on `geography_columns.type` would see drift. The fix upper-cases the input before dispatching; geography and geometry subtype reads now share a code path.
+- **Bug 52: PG `geometry(POINTZ, 4326)` and the Z / M / ZM dimensional variants now round-trip on same-engine PG → PG.** Pre-fix (and pre-existing — not a v0.33.1 regression): PostGIS extends each 2D subtype with Z (3D elevation), M (linear measure), and ZM (4D) variants — `POINTZ`, `LINESTRINGZM`, `MULTIPOLYGONZ`. The IR's `GeometrySubtype` enum only modeled the seven 2D base subtypes; the dimensional suffix dropped at translate-time and the writer emitted the generic `GEOMETRY` wildcard. Bulk copy then failed with SQLSTATE 22023 ("Geometry has Z dimension but column does not") because the row's WKB carried Z bytes but the target's typmod-constrained column rejected them. The fix adds two booleans (`HasZ`, `HasM`) to `ir.Geometry` orthogonal to `Subtype` (28 entries collapsed to 7 × 2 flags), `parseGeometrySubtype` strips the dimensional suffix before subtype dispatch, and the PG writer's `postgisSubtypeName` reconstructs the suffix on emit. Cross-engine PG → MySQL ignores the flags (MySQL carries Z / M in the WKB bytes rather than the column type modifier — the value round-trip works on MySQL targets without needing the type to match).
+
+### Migration / Compatibility
+
+- **No format-breaking changes.** No CLI or engine-interface changes. `ir.Geometry` gains two appended bool fields (`HasZ`, `HasM`); existing backups deserialise unchanged because the envelope fields use `omitempty`. Zero values produce the pre-v0.33.2 behaviour (2D, no measure).
+- **Drop-in upgrade from v0.33.1.** Operators with plain 2D `geometry` / `geography` columns are unaffected. Operators on the v0.33.1 geography passthrough path (Bug 49 closure) get the additional subtype-preservation fidelity automatically; no flag change needed.
+
+### Who needs this release
+
+- **Operators running PG → PG with `geography(<Subtype>, <SRID>)` typed columns:** **upgrade** — target column-type fidelity now matches the source byte-for-byte.
+- **Operators running PG → PG with Z / M / ZM (3D / measure / 4D) spatial columns:** **upgrade** — pre-v0.33.2 the bulk copy failed with SQLSTATE 22023 because the dimensional suffix was dropped from the target column type.
+- **Operators on the cross-engine PG → MySQL PostGIS path:** drop-in; no behaviour change (MySQL doesn't carry Z / M in column type — flags are ignored).
+- **Operators not using PostGIS:** drop-in; no behaviour change.
+
 ## [0.33.1]
 
 **Two PostGIS PG → PG passthrough gaps surfaced by the v0.33.0 cycle, both closed.** Bug 49 + Bug 50 are scoped to the PostGIS catalog path; both ship together as v0.33.1.

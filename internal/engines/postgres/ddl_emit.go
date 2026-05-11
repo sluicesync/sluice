@@ -143,7 +143,7 @@ func emitColumnType(t ir.Type, opts emitOpts) (string, error) {
 		if v.IsGeography {
 			typeName = "geography"
 		}
-		return fmt.Sprintf("%s(%s, %d)", typeName, postgisSubtypeName(v.Subtype), v.SRID), nil
+		return fmt.Sprintf("%s(%s, %d)", typeName, postgisSubtypeName(v), v.SRID), nil
 
 	// ADR-0032: PG → PG extension passthrough. ExtensionType columns
 	// dispatch through pgExtensionCatalog so each extension's emit

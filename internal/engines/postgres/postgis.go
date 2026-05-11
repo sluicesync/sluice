@@ -29,33 +29,46 @@ func detectPostGIS(ctx context.Context, db *sql.DB) (bool, error) {
 	return present, nil
 }
 
-// postgisSubtypeName maps an [ir.GeometrySubtype] to the PostGIS
-// type-modifier name. The result is the bareword that goes inside
-// `geometry(<NAME>, <SRID>)`. The names are the upper-case forms
-// PostGIS itself uses and accepts.
-func postgisSubtypeName(s ir.GeometrySubtype) string {
-	switch s {
+// postgisSubtypeName renders the PostGIS type-modifier name for the
+// column-type position, combining the base subtype with the Z / M
+// dimension flags on the [ir.Geometry]. The result is the bareword
+// that goes inside `geometry(<NAME>, <SRID>)` — for example
+// `POINTZ` for a 3D point, `POINTZM` for a 4D point with measure,
+// `POLYGON` for a plain 2D polygon. The names are the upper-case
+// forms PostGIS itself uses and accepts.
+func postgisSubtypeName(g ir.Geometry) string {
+	var base string
+	switch g.Subtype {
 	case ir.GeometryPoint:
-		return "POINT"
+		base = "POINT"
 	case ir.GeometryLineString:
-		return "LINESTRING"
+		base = "LINESTRING"
 	case ir.GeometryPolygon:
-		return "POLYGON"
+		base = "POLYGON"
 	case ir.GeometryMultiPoint:
-		return "MULTIPOINT"
+		base = "MULTIPOINT"
 	case ir.GeometryMultiLineString:
-		return "MULTILINESTRING"
+		base = "MULTILINESTRING"
 	case ir.GeometryMultiPolygon:
-		return "MULTIPOLYGON"
+		base = "MULTIPOLYGON"
 	case ir.GeometryCollection:
-		return "GEOMETRYCOLLECTION"
+		base = "GEOMETRYCOLLECTION"
 	default:
 		// ir.GeometryUnspecified plus any unknown subtype values fall
 		// through here. "GEOMETRY" is PostGIS's wildcard subtype that
 		// accepts any concrete shape; rejecting at write time would
 		// mask source data, so we permit through with the wildcard.
-		return "GEOMETRY"
+		base = "GEOMETRY"
 	}
+	switch {
+	case g.HasZ && g.HasM:
+		return base + "ZM"
+	case g.HasZ:
+		return base + "Z"
+	case g.HasM:
+		return base + "M"
+	}
+	return base
 }
 
 // wkbToEWKB takes a WKB geometry (per the IR contract for

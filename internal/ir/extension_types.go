@@ -169,6 +169,18 @@ type Geometry struct {
 	// geometry on those targets, losing the spherical-operator
 	// semantics but preserving values.
 	IsGeography bool
+	// HasZ / HasM carry the PostGIS dimensional modifiers orthogonal
+	// to [Subtype]. PostGIS extends the seven 2D base shapes with Z
+	// (3D), M (measure), and ZM (4D) variants — e.g.
+	// `geometry(POINTZ, 4326)` for elevation-aware coordinates. The
+	// IR carries the dimensional flags as two booleans rather than
+	// expanding [GeometrySubtype] into 28 entries; the writer
+	// reconstructs the suffix on emit (postgisSubtypeName). Engines
+	// that carry Z / M in the value bytes rather than the column type
+	// modifier (MySQL) ignore the flags — the WKB / EWKB framing
+	// preserves the dimensional coordinates regardless.
+	HasZ bool
+	HasM bool
 }
 
 func (Geometry) isType()    {}
@@ -179,10 +191,19 @@ func (g Geometry) String() string {
 	if g.IsGeography {
 		name = "Geography"
 	}
-	if g.SRID == 0 {
-		return fmt.Sprintf("%s[%s]", name, g.Subtype)
+	subtype := g.Subtype.String()
+	switch {
+	case g.HasZ && g.HasM:
+		subtype += "ZM"
+	case g.HasZ:
+		subtype += "Z"
+	case g.HasM:
+		subtype += "M"
 	}
-	return fmt.Sprintf("%s[%s,SRID=%d]", name, g.Subtype, g.SRID)
+	if g.SRID == 0 {
+		return fmt.Sprintf("%s[%s]", name, subtype)
+	}
+	return fmt.Sprintf("%s[%s,SRID=%d]", name, subtype, g.SRID)
 }
 
 // Inet represents an IPv4 or IPv6 host address (Postgres inet).

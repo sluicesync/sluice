@@ -13,22 +13,29 @@ import (
 
 func TestPostgisSubtypeName(t *testing.T) {
 	cases := []struct {
-		in   ir.GeometrySubtype
+		name string
+		in   ir.Geometry
 		want string
 	}{
-		{ir.GeometryPoint, "POINT"},
-		{ir.GeometryLineString, "LINESTRING"},
-		{ir.GeometryPolygon, "POLYGON"},
-		{ir.GeometryMultiPoint, "MULTIPOINT"},
-		{ir.GeometryMultiLineString, "MULTILINESTRING"},
-		{ir.GeometryMultiPolygon, "MULTIPOLYGON"},
-		{ir.GeometryCollection, "GEOMETRYCOLLECTION"},
-		{ir.GeometryUnspecified, "GEOMETRY"},
-		{ir.GeometrySubtype(255), "GEOMETRY"}, // unknown subtype → permissive default
+		{"POINT", ir.Geometry{Subtype: ir.GeometryPoint}, "POINT"},
+		{"LINESTRING", ir.Geometry{Subtype: ir.GeometryLineString}, "LINESTRING"},
+		{"POLYGON", ir.Geometry{Subtype: ir.GeometryPolygon}, "POLYGON"},
+		{"MULTIPOINT", ir.Geometry{Subtype: ir.GeometryMultiPoint}, "MULTIPOINT"},
+		{"MULTILINESTRING", ir.Geometry{Subtype: ir.GeometryMultiLineString}, "MULTILINESTRING"},
+		{"MULTIPOLYGON", ir.Geometry{Subtype: ir.GeometryMultiPolygon}, "MULTIPOLYGON"},
+		{"GEOMETRYCOLLECTION", ir.Geometry{Subtype: ir.GeometryCollection}, "GEOMETRYCOLLECTION"},
+		{"GEOMETRY (unspecified)", ir.Geometry{Subtype: ir.GeometryUnspecified}, "GEOMETRY"},
+		{"GEOMETRY (unknown)", ir.Geometry{Subtype: ir.GeometrySubtype(255)}, "GEOMETRY"},
+		// Bug 52: Z / M / ZM dimensional variants append to the base.
+		{"POINTZ", ir.Geometry{Subtype: ir.GeometryPoint, HasZ: true}, "POINTZ"},
+		{"POINTM", ir.Geometry{Subtype: ir.GeometryPoint, HasM: true}, "POINTM"},
+		{"POINTZM", ir.Geometry{Subtype: ir.GeometryPoint, HasZ: true, HasM: true}, "POINTZM"},
+		{"LINESTRINGZ", ir.Geometry{Subtype: ir.GeometryLineString, HasZ: true}, "LINESTRINGZ"},
+		{"MULTIPOLYGONZM", ir.Geometry{Subtype: ir.GeometryMultiPolygon, HasZ: true, HasM: true}, "MULTIPOLYGONZM"},
 	}
 	for _, c := range cases {
 		c := c
-		t.Run(c.want, func(t *testing.T) {
+		t.Run(c.name, func(t *testing.T) {
 			if got := postgisSubtypeName(c.in); got != c.want {
 				t.Errorf("got %q; want %q", got, c.want)
 			}
@@ -349,6 +356,29 @@ func TestEmitColumnTypeGeometry(t *testing.T) {
 			"geography unspecified",
 			ir.Geometry{Subtype: ir.GeometryUnspecified, IsGeography: true},
 			"geography(GEOMETRY, 0)", true, false,
+		},
+		// Bug 52: Z / M / ZM dimensional variants — the writer
+		// reconstructs the suffix on emit so PG → PG round-trips
+		// `geometry(POINTZ, 4326)` byte-for-byte.
+		{
+			"geometry POINTZ",
+			ir.Geometry{Subtype: ir.GeometryPoint, SRID: 4326, HasZ: true},
+			"geometry(POINTZ, 4326)", true, false,
+		},
+		{
+			"geometry POINTM",
+			ir.Geometry{Subtype: ir.GeometryPoint, SRID: 4326, HasM: true},
+			"geometry(POINTM, 4326)", true, false,
+		},
+		{
+			"geometry POINTZM",
+			ir.Geometry{Subtype: ir.GeometryPoint, SRID: 4326, HasZ: true, HasM: true},
+			"geometry(POINTZM, 4326)", true, false,
+		},
+		{
+			"geography POINTZ",
+			ir.Geometry{Subtype: ir.GeometryPoint, SRID: 4326, IsGeography: true, HasZ: true},
+			"geography(POINTZ, 4326)", true, false,
 		},
 	}
 	for _, c := range cases {

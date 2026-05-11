@@ -5,6 +5,7 @@ package postgres
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/orware/sluice/internal/ir"
 )
@@ -170,10 +171,13 @@ func translateType(c columnMeta) (ir.Type, error) {
 					IsGeography: c.UDTName == "geography",
 				}, nil
 			}
+			subtype, hasZ, hasM := parseGeometrySubtype(c.GeometryInfo.Subtype)
 			return ir.Geometry{
-				Subtype:     parseGeometrySubtype(c.GeometryInfo.Subtype),
+				Subtype:     subtype,
 				SRID:        c.GeometryInfo.SRID,
 				IsGeography: c.GeometryInfo.IsGeography,
+				HasZ:        hasZ,
+				HasM:        hasM,
 			}, nil
 		}
 		// ADR-0032 hint: if udt_name matches a known extension type
@@ -273,29 +277,66 @@ func int64Ptr(p *int64) int64 {
 }
 
 // parseGeometrySubtype maps the PostGIS subtype string from
-// geometry_columns.type to the IR's [ir.GeometrySubtype] value.
-// Unknown strings return GeometryUnspecified (the wildcard) rather
-// than erroring — PostGIS evolves and a future spec might add
-// shapes the IR doesn't model yet; degrading to "generic geometry"
-// keeps schema reads working through that.
-func parseGeometrySubtype(s string) ir.GeometrySubtype {
+// geometry_columns.type (or geography_columns.type) to the IR's
+// [ir.GeometrySubtype] value plus the orthogonal Z / M dimension
+// flags carried on [ir.Geometry].
+//
+// PostGIS reports the same logical subtype in two distinct casings
+// across views: geometry_columns uses ALL CAPS ("POINT"), but
+// geography_columns uses Mixed Case ("Point") — Bug 51. The function
+// upper-cases first so geography inputs dispatch correctly.
+//
+// PostGIS extends the seven 2D base subtypes with Z, M, and ZM
+// variants ("POINTZ" / "POINTM" / "POINTZM") for 3D + measure
+// dimensions — Bug 52. The function strips the dimensional suffix
+// before dispatching on the base name and returns the captured flags
+// so the IR's [ir.Geometry.HasZ] / [ir.Geometry.HasM] preserve the
+// source fidelity. The PG writer reconstructs the suffix on emit
+// (postgisSubtypeName); cross-engine MySQL ignores the flags (MySQL
+// carries Z / M in the WKB bytes rather than the column type
+// modifier).
+//
+// Unknown / unparsable strings return GeometryUnspecified with both
+// flags false — degrading gracefully rather than erroring is the
+// long-standing policy for forward-compat with PostGIS evolution.
+func parseGeometrySubtype(s string) (subtype ir.GeometrySubtype, hasZ, hasM bool) {
+	s = strings.ToUpper(s)
+	// Strip dimensional suffix. Order matters — ZM must be tried before
+	// Z and M as individual letters.
+	switch {
+	case strings.HasSuffix(s, "ZM"):
+		hasZ, hasM = true, true
+		s = strings.TrimSuffix(s, "ZM")
+	case strings.HasSuffix(s, "Z"):
+		hasZ = true
+		s = strings.TrimSuffix(s, "Z")
+	case strings.HasSuffix(s, "M"):
+		// `GEOMETRY` ends in "Y" not "M", but the seven base names that
+		// end in "M" are MULTIPOINT, MULTILINESTRING, MULTIPOLYGON
+		// (which already retain their trailing T / G), POINT
+		// (no M at all), LINESTRING (G), POLYGON (N), GEOMETRYCOLLECTION
+		// (N) — none of the base names end in a literal "M" character.
+		// So a trailing "M" unambiguously means the M-dimension flag.
+		hasM = true
+		s = strings.TrimSuffix(s, "M")
+	}
 	switch s {
 	case "POINT":
-		return ir.GeometryPoint
+		return ir.GeometryPoint, hasZ, hasM
 	case "LINESTRING":
-		return ir.GeometryLineString
+		return ir.GeometryLineString, hasZ, hasM
 	case "POLYGON":
-		return ir.GeometryPolygon
+		return ir.GeometryPolygon, hasZ, hasM
 	case "MULTIPOINT":
-		return ir.GeometryMultiPoint
+		return ir.GeometryMultiPoint, hasZ, hasM
 	case "MULTILINESTRING":
-		return ir.GeometryMultiLineString
+		return ir.GeometryMultiLineString, hasZ, hasM
 	case "MULTIPOLYGON":
-		return ir.GeometryMultiPolygon
+		return ir.GeometryMultiPolygon, hasZ, hasM
 	case "GEOMETRYCOLLECTION":
-		return ir.GeometryCollection
+		return ir.GeometryCollection, hasZ, hasM
 	case "GEOMETRY", "":
-		return ir.GeometryUnspecified
+		return ir.GeometryUnspecified, hasZ, hasM
 	}
-	return ir.GeometryUnspecified
+	return ir.GeometryUnspecified, false, false
 }
