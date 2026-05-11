@@ -772,6 +772,35 @@ type ExtensionAware interface {
 	EnableExtensions(ctx context.Context, extensions []string) error
 }
 
+// CrossEngineExtensionTranslator is the optional engine-side surface
+// for engines whose extensions have defensible default cross-engine
+// translators (ADR-0032 § "Cross-engine policy"). The pipeline's
+// engine-name gate in `validateEnabledPGExtensions` consults this
+// to decide whether `--enable-pg-extension EXT` may be passed
+// against a non-PG target: an extension with a default translator
+// is allowed (the translator rewrites the column type at write-time
+// or via [translate.RetargetForEngine]); one without falls back to
+// the loud-failure default.
+//
+// Today's PG implementation declares `hstore` and `citext` as
+// cross-engine-translatable (Tier 1 type-only with lossless MySQL
+// mappings). `vector` / `pg_trgm` / `postgis` are not declared:
+// their cross-engine semantics are ambiguous or absent and
+// operators must supply `--type-override` explicitly.
+//
+// Engines implement this when at least one of their declared
+// extensions has a built-in cross-engine translator. Engines without
+// extensions skip the interface entirely; the pipeline treats the
+// missing implementation as "no defaults — preserve the strict
+// target-must-be-same-engine gate."
+type CrossEngineExtensionTranslator interface {
+	// HasCrossEngineDefaultTranslator reports whether the named
+	// extension has a default cross-engine translator on this
+	// engine. The name is the canonical pg_extension.extname value
+	// (or whatever the engine's catalog keys on).
+	HasCrossEngineDefaultTranslator(name string) bool
+}
+
 // SourceFingerprintRecorder is the optional surface a [ChangeApplier]
 // can implement to accept the source-DSN fingerprint the streamer
 // computes at startup. The fingerprint flows through to the per-target

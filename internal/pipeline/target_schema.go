@@ -92,11 +92,15 @@ func applyEnabledPGExtensions(ctx context.Context, target any, extensions []stri
 }
 
 // validateEnabledPGExtensions enforces the engine-name gate for
-// `--enable-pg-extension` (ADR-0032). The flag is meaningful only
-// for same-engine PG → PG paths — the cross-engine refusal in
-// [checkCrossEngineSupportable] keeps loud-failure as the default
-// when the target isn't PG. Refusing at validate time means the
-// operator gets a clean error before any DSN dialing.
+// `--enable-pg-extension` (ADR-0032). For most extensions the flag
+// is meaningful only on same-engine PG → PG paths — cross-engine
+// translation keeps loud-failure as the default when the target
+// isn't PG. The exception: extensions with a default cross-engine
+// translator (today: hstore → MySQL JSON, citext → MySQL VARCHAR-
+// with-collation) are permitted against non-PG targets because the
+// translator handles them losslessly. The source engine queries
+// its [ir.CrossEngineExtensionTranslator] surface (when implemented)
+// to declare which extensions carry that capability.
 //
 // Empty extensions is a no-op (the field defaults to empty).
 //
@@ -104,9 +108,11 @@ func applyEnabledPGExtensions(ctx context.Context, target any, extensions []stri
 //
 //   - The source engine isn't postgres — the flag has no meaning on
 //     a non-PG source.
-//   - The target engine isn't postgres — the cross-engine refusal
-//     would fire later anyway; surface it earlier with a clearer
-//     pointer to the right escape hatch (--type-override).
+//   - The target engine isn't postgres AND none of the named
+//     extensions has a default cross-engine translator — the
+//     cross-engine refusal would fire later anyway; surface it
+//     earlier with a clearer pointer to the right escape hatch
+//     (--type-override).
 func validateEnabledPGExtensions(source, target ir.Engine, extensions []string) error {
 	if len(extensions) == 0 {
 		return nil
@@ -119,12 +125,29 @@ func validateEnabledPGExtensions(source, target ir.Engine, extensions []string) 
 			source.Name())
 	}
 	if target != nil && target.Name() != "postgres" {
-		return fmt.Errorf(
-			"pipeline: --enable-pg-extension is only supported on PG targets "+
-				"(target engine is %q); cross-engine extension translation "+
-				"keeps the loud-failure default — supply --type-override per "+
-				"column to translate explicitly (ADR-0032)",
-			target.Name())
+		// Per-extension cross-engine gate: an extension with a
+		// default translator declared by the source engine may pass
+		// against a non-PG target; the translator rewrites the
+		// column type at emit time (mysql/ddl_emit.go) and where
+		// needed translates values (mysql/row_writer.go::prepareValue).
+		// Without that declaration, fall back to the strict refusal.
+		translator, _ := source.(ir.CrossEngineExtensionTranslator)
+		for _, ext := range extensions {
+			ext = strings.TrimSpace(ext)
+			if ext == "" {
+				continue
+			}
+			if translator == nil || !translator.HasCrossEngineDefaultTranslator(ext) {
+				return fmt.Errorf(
+					"pipeline: --enable-pg-extension %q is not cross-engine "+
+						"translatable for target engine %q; ADR-0032 § "+
+						"\"Cross-engine policy\" reserves cross-engine "+
+						"translators for hstore and citext (lossless MySQL "+
+						"mappings). Supply --type-override per column for "+
+						"the named extension, or use a PG target",
+					ext, target.Name())
+			}
+		}
 	}
 	return nil
 }

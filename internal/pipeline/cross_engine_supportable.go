@@ -177,17 +177,44 @@ func unsupportablePGIndexToMySQL(tbl *ir.Table) (reason, indexName, columnRef st
 // instead of 0. Cross-engine geometry values pass through as
 // supportable now.
 //
-// PG extension passthrough types (ADR-0032) — pgvector and the v1
-// shortlist's other entries — have no portable MySQL equivalent;
-// the refusal here keeps the cross-engine loud-failure default in
-// place even when the source side was opened with
-// `--enable-pg-extension`. Operators wanting a translation supply
-// `--type-override TABLE.COL=<MySQL_type>`.
+// PG extension passthrough types (ADR-0032) — pgvector / pg_trgm /
+// postgis — have no portable MySQL equivalent; the refusal here
+// keeps the cross-engine loud-failure default in place even when
+// the source side was opened with `--enable-pg-extension`.
+// Operators wanting a translation supply `--type-override
+// TABLE.COL=<MySQL_type>`.
+//
+// Exception: hstore and citext have default cross-engine
+// translators (hstore → MySQL JSON; citext → MySQL VARCHAR with
+// case-insensitive collation), so the refusal carves them out.
+// The MySQL writer's `emitColumnType` handles the type rewrite
+// directly; the writer's `prepareValue` translates hstore wire
+// format to JSON at value-write time. See the catalog's
+// `crossEngineDefaultTranslatedExtensions` for the policy source
+// of truth.
 func unsupportablePGtoMySQL(t ir.Type) string {
 	if v, ok := t.(ir.ExtensionType); ok {
+		if isCrossEngineTranslatablePGExtension(v.Extension) {
+			return ""
+		}
 		return fmt.Sprintf("PG extension type %s.%s", v.Extension, v.Name)
 	}
 	return ""
+}
+
+// isCrossEngineTranslatablePGExtension reports whether an
+// ir.ExtensionType column from a PG source has a default
+// cross-engine translator on the MySQL side. Mirrors the catalog's
+// `crossEngineDefaultTranslatedExtensions` set; kept duplicated
+// in the pipeline package to avoid importing the postgres engine
+// package (engine-neutral orchestrator rule). The two lists must
+// stay in lock-step — see `internal/engines/postgres/extension_catalog.go`.
+func isCrossEngineTranslatablePGExtension(name string) bool {
+	switch name {
+	case "hstore", "citext":
+		return true
+	}
+	return false
 }
 
 // checkCrossEngineDeltaSupportable scans an incremental's schema-delta

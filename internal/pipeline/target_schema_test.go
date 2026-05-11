@@ -113,18 +113,66 @@ func TestValidateEnabledPGExtensions(t *testing.T) {
 		}
 	})
 
-	t.Run("MySQL target refused", func(t *testing.T) {
+	t.Run("MySQL target refused for non-translatable extension", func(t *testing.T) {
 		err := validateEnabledPGExtensions(stubPGEngine{}, stubMySQLEngine{}, []string{"vector"})
 		if err == nil {
 			t.Fatal("err = nil; want refusal")
 		}
-		if !strings.Contains(err.Error(), "PG targets") {
-			t.Errorf("err = %v; want \"PG targets\"", err)
+		if !strings.Contains(err.Error(), "cross-engine") {
+			t.Errorf("err = %v; want \"cross-engine\"", err)
 		}
 		if !strings.Contains(err.Error(), "--type-override") {
 			t.Errorf("err = %v; want hint mentioning --type-override", err)
 		}
 	})
+
+	t.Run("MySQL target refused when source has no translator capability", func(t *testing.T) {
+		// stubPGEngine doesn't implement ir.CrossEngineExtensionTranslator,
+		// so even hstore / citext fall back to the strict refusal — the
+		// gate is per-engine-declared, not hard-coded.
+		err := validateEnabledPGExtensions(stubPGEngine{}, stubMySQLEngine{}, []string{"hstore"})
+		if err == nil {
+			t.Fatal("err = nil; want refusal when source doesn't declare translator capability")
+		}
+	})
+
+	t.Run("MySQL target accepts when source declares cross-engine translator", func(t *testing.T) {
+		// stubPGEngineWithTranslator declares hstore and citext as
+		// cross-engine-translatable, mirroring the real postgres.Engine
+		// implementation.
+		err := validateEnabledPGExtensions(stubPGEngineWithTranslator{}, stubMySQLEngine{}, []string{"hstore"})
+		if err != nil {
+			t.Errorf("err = %v; want nil for hstore PG → MySQL via declared translator", err)
+		}
+	})
+
+	t.Run("MySQL target accepts citext via declared translator", func(t *testing.T) {
+		err := validateEnabledPGExtensions(stubPGEngineWithTranslator{}, stubMySQLEngine{}, []string{"citext"})
+		if err != nil {
+			t.Errorf("err = %v; want nil for citext PG → MySQL via declared translator", err)
+		}
+	})
+
+	t.Run("MySQL target refuses mixed list with non-translatable extension", func(t *testing.T) {
+		// hstore has a translator but vector does not — the gate must
+		// surface the refusal on vector rather than silently passing.
+		err := validateEnabledPGExtensions(stubPGEngineWithTranslator{}, stubMySQLEngine{}, []string{"hstore", "vector"})
+		if err == nil {
+			t.Fatal("err = nil; want refusal naming the non-translatable extension")
+		}
+		if !strings.Contains(err.Error(), "vector") {
+			t.Errorf("err = %v; want refusal naming vector", err)
+		}
+	})
+}
+
+// stubPGEngineWithTranslator implements ir.CrossEngineExtensionTranslator
+// declaring hstore and citext (the v1 cross-engine-translatable set).
+// Mirrors the real postgres.Engine surface without booting a real DB.
+type stubPGEngineWithTranslator struct{ stubPGEngine }
+
+func (stubPGEngineWithTranslator) HasCrossEngineDefaultTranslator(name string) bool {
+	return name == "hstore" || name == "citext"
 }
 
 // TestApplyEnabledPGExtensions_NonExtensionAware confirms the

@@ -112,9 +112,47 @@ type extensionDef struct {
 var pgExtensionCatalog = map[string]extensionDef{
 	"vector":  pgVectorDef,
 	"pg_trgm": pgTrgmDef,
-	// hstore / citext / postgis follow in subsequent point
-	// releases per the v1 shortlist (docs/research/pg-extensions-
-	// deployment-frequency.md).
+	"hstore":  pgHstoreDef,
+	"citext":  pgCiTextDef,
+	// postgis follows in a subsequent point release per the v1
+	// shortlist (docs/research/pg-extensions-deployment-frequency.md).
+}
+
+// crossEngineDefaultTranslatedExtensions names the PG extensions
+// whose cross-engine MySQL translation has a defensible, lossless
+// default (per research doc § 5). When the operator passes
+// `--enable-pg-extension EXT` against a non-PG target, the engine-
+// name gate in [validateEnabledPGExtensions] consults this set: the
+// flag is allowed when EXT has a default translator, refused
+// otherwise (preserving the loud-failure default for vector /
+// pg_trgm / postgis where the cross-engine mapping is ambiguous or
+// missing).
+//
+// Today's entries:
+//   - hstore → MySQL JSON (text "k"=>"v" → {"k":"v"} at value-write
+//     time; handled in mysql/row_writer.go::prepareValue + emit in
+//     mysql/ddl_emit.go::emitColumnType).
+//   - citext → MySQL VARCHAR with case-insensitive collation
+//     (utf8mb4_0900_ai_ci); identity value translation (citext is
+//     just text under a custom collation on the PG side).
+//
+// The map is exported for use by the pipeline's cross-engine
+// preflight (validateEnabledPGExtensions). New entries here must
+// also be wired into the MySQL emitter and (where applicable) the
+// MySQL writer's value translator.
+var crossEngineDefaultTranslatedExtensions = map[string]struct{}{
+	"hstore": {},
+	"citext": {},
+}
+
+// HasCrossEngineDefaultTranslator reports whether the named
+// extension has a default cross-engine translator. Used by the
+// pipeline package via the engine's optional [ir.ExtensionAware]
+// surface (kept exported on the package so it can be referenced
+// from outside without re-importing the catalog map).
+func HasCrossEngineDefaultTranslator(name string) bool {
+	_, ok := crossEngineDefaultTranslatedExtensions[name]
+	return ok
 }
 
 // recognisedPGExtensionNames returns the sorted list of extension
@@ -292,6 +330,123 @@ var pgTrgmDef = extensionDef{
 	},
 }
 
+// pgHstoreDef is the catalog entry for the `hstore` extension
+// (ADR-0032 Tier 1). hstore defines:
+//
+//   - One scalar type: `hstore` (a key/value-pair store within a
+//     single column). No type modifiers — hstore values are
+//     untyped key/value maps with no per-column length/cardinality
+//     constraint.
+//
+//   - GIN / GiST operator classes (`gin_hstore_ops`,
+//     `gist_hstore_ops`) for index-backed key lookup. These are
+//     out-of-v1-scope per the research doc; sluice does not declare
+//     them in [indexOperatorClasses] for the hstore catalog entry.
+//     A future PR can add the opclass round-trip if operator demand
+//     surfaces — the pattern is mechanical (mirror pg_trgm).
+//
+// Same-engine PG → PG passthrough is byte-for-byte: the schema
+// reader emits `ir.ExtensionType{Extension: "hstore", Name:
+// "hstore"}`, the writer emits the bareword `hstore` in the
+// CREATE TABLE column position, and the value decoder + driver
+// round-trip hstore's text form (e.g. `"a"=>"1", "b"=>"2"`)
+// verbatim.
+//
+// Cross-engine PG → MySQL maps hstore to MySQL JSON. The hstore
+// wire format is PG-specific (the `=>` arrow syntax) so the MySQL
+// writer's prepareValue parses the source text into a JSON object
+// at write-time. See `internal/engines/mysql/row_writer.go::
+// prepareValue` for the conversion path and
+// `crossEngineDefaultTranslatedExtensions` for the policy declaration.
+var pgHstoreDef = extensionDef{
+	typesByName: map[string]struct{}{
+		"hstore": {},
+	},
+	build: func(udtName string, _ int32) (ir.ExtensionType, error) {
+		if udtName != "hstore" {
+			return ir.ExtensionType{}, fmt.Errorf(
+				"postgres: hstore catalog: unexpected udt_name %q (want \"hstore\")", udtName)
+		}
+		return ir.ExtensionType{
+			Extension: "hstore",
+			Name:      "hstore",
+		}, nil
+	},
+	emitColumn: func(t ir.ExtensionType) (string, error) {
+		if t.Extension != "hstore" || t.Name != "hstore" {
+			return "", fmt.Errorf(
+				"postgres: hstore emit: unexpected (extension=%q name=%q); "+
+					"want (hstore, hstore)", t.Extension, t.Name)
+		}
+		if len(t.Modifiers) != 0 {
+			return "", fmt.Errorf(
+				"postgres: hstore emit: hstore has no type modifiers (got %d)",
+				len(t.Modifiers))
+		}
+		return "hstore", nil
+	},
+	indexAccessMethods:   map[string]struct{}{},
+	indexOperatorClasses: map[string]struct{}{},
+}
+
+// pgCiTextDef is the catalog entry for the `citext` extension
+// (ADR-0032 Tier 1). citext defines:
+//
+//   - One scalar type: `citext` (case-insensitive text). citext
+//     is `text` with a custom collation; queries against citext
+//     columns are case-insensitive by default (no explicit
+//     LOWER() / UPPER() wrapping required).
+//
+//   - No new index access methods. citext rides on core PG btree /
+//     gin / gist when indexed (same as plain text); no operator
+//     classes specific to citext that sluice needs to round-trip.
+//
+// Same-engine PG → PG passthrough is byte-for-byte: the schema
+// reader emits `ir.ExtensionType{Extension: "citext", Name:
+// "citext"}`, the writer emits the bareword `citext` in the
+// CREATE TABLE column position, and values round-trip as plain
+// strings (the case-insensitive comparison is a server-side
+// property of the type, not a wire-format concern).
+//
+// Cross-engine PG → MySQL maps citext to MySQL VARCHAR with the
+// case-insensitive collation `utf8mb4_0900_ai_ci`. Value
+// translation is identity (no encoding conversion). The default
+// length on the MySQL side is 255; operators wanting a different
+// length use `--type-override` per column. See
+// `internal/engines/mysql/ddl_emit.go::emitColumnType` for the
+// emit path and `crossEngineDefaultTranslatedExtensions` for the
+// policy declaration.
+var pgCiTextDef = extensionDef{
+	typesByName: map[string]struct{}{
+		"citext": {},
+	},
+	build: func(udtName string, _ int32) (ir.ExtensionType, error) {
+		if udtName != "citext" {
+			return ir.ExtensionType{}, fmt.Errorf(
+				"postgres: citext catalog: unexpected udt_name %q (want \"citext\")", udtName)
+		}
+		return ir.ExtensionType{
+			Extension: "citext",
+			Name:      "citext",
+		}, nil
+	},
+	emitColumn: func(t ir.ExtensionType) (string, error) {
+		if t.Extension != "citext" || t.Name != "citext" {
+			return "", fmt.Errorf(
+				"postgres: citext emit: unexpected (extension=%q name=%q); "+
+					"want (citext, citext)", t.Extension, t.Name)
+		}
+		if len(t.Modifiers) != 0 {
+			return "", fmt.Errorf(
+				"postgres: citext emit: citext has no type modifiers (got %d)",
+				len(t.Modifiers))
+		}
+		return "citext", nil
+	},
+	indexAccessMethods:   map[string]struct{}{},
+	indexOperatorClasses: map[string]struct{}{},
+}
+
 // emitExtensionColumn dispatches an [ir.ExtensionType] column to the
 // catalog entry's column-DDL renderer. Returns a clear error when
 // the extension isn't in the catalog (operator forgot the
@@ -378,8 +533,8 @@ func validateAndPreflightExtensionsAt(ctx context.Context, db *sql.DB, extension
 				"postgres: --enable-pg-extension %q is not a recognised "+
 					"extension (recognised: %s); see "+
 					"docs/research/pg-extensions-deployment-frequency.md "+
-					"for the v1 shortlist (vector, pg_trgm shipped; "+
-					"hstore / citext / postgis follow as catalog entries)",
+					"for the v1 shortlist (vector, pg_trgm, hstore, citext "+
+					"shipped; postgis follows as the final catalog entry)",
 				name, strings.Join(recognisedPGExtensionNames(), ", "))
 		}
 		enabled[name] = true
@@ -533,6 +688,23 @@ func extensionOperatorClassRegistered(opclass string) bool {
 		}
 	}
 	return false
+}
+
+// extensionOwningType returns the name of the extension that owns
+// the named PG type (information_schema.columns.udt_name), or "" if
+// no catalog entry claims it. Used by the schema reader's
+// user-defined-fallthrough path to surface a clean operator-
+// actionable hint when an unenabled extension type appears (ADR-0032).
+func extensionOwningType(udtName string) string {
+	if udtName == "" {
+		return ""
+	}
+	for ext, def := range pgExtensionCatalog {
+		if _, ok := def.typesByName[udtName]; ok {
+			return ext
+		}
+	}
+	return ""
 }
 
 // extensionOwningOperatorClass returns the extension name that owns

@@ -162,14 +162,20 @@ func TestPGVectorBuild_DimFromTypmod(t *testing.T) {
 
 // TestRecognisedPGExtensionNames returns the catalog's keys sorted.
 // As the v1 shortlist lands the recognised set grows; this test
-// pins both load-bearing entries (vector since v0.26.0; pg_trgm
-// since this PR) and the sort-order invariant.
+// pins each load-bearing entry (vector since v0.26.0; pg_trgm since
+// v0.30.0; hstore + citext since this PR) and the sort-order
+// invariant.
 func TestRecognisedPGExtensionNames(t *testing.T) {
 	names := recognisedPGExtensionNames()
 	if len(names) == 0 {
 		t.Fatal("recognisedPGExtensionNames returned empty")
 	}
-	want := map[string]bool{"vector": false, "pg_trgm": false}
+	want := map[string]bool{
+		"vector":  false,
+		"pg_trgm": false,
+		"hstore":  false,
+		"citext":  false,
+	}
 	for _, n := range names {
 		if _, ok := want[n]; ok {
 			want[n] = true
@@ -483,5 +489,238 @@ func TestEmitExtensionColumn_TrgmRefusal(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "no column types") {
 		t.Errorf("err = %v; want contains \"no column types\"", err)
+	}
+}
+
+// TestPGExtensionCatalog_ContainsHstore pins the hstore catalog
+// entry's load-bearing shape: it owns the `hstore` column type and
+// declares no new index access methods or operator classes (the GIN /
+// GiST opclasses are out-of-v1-scope per the research doc).
+func TestPGExtensionCatalog_ContainsHstore(t *testing.T) {
+	def, ok := pgExtensionCatalog["hstore"]
+	if !ok {
+		t.Fatal("pgExtensionCatalog missing 'hstore' entry")
+	}
+	if _, ok := def.typesByName["hstore"]; !ok {
+		t.Errorf("hstore typesByName missing 'hstore'")
+	}
+	if def.emitColumn == nil {
+		t.Errorf("hstore emitColumn is nil")
+	}
+	if len(def.indexAccessMethods) != 0 {
+		t.Errorf("hstore indexAccessMethods = %v; want empty (no extension-AMs)",
+			def.indexAccessMethods)
+	}
+	if len(def.indexOperatorClasses) != 0 {
+		t.Errorf("hstore indexOperatorClasses = %v; want empty (opclasses are v2)",
+			def.indexOperatorClasses)
+	}
+}
+
+// TestPGHstoreEmit pins the bareword `hstore` DDL form. No modifiers
+// allowed (hstore has no per-column length/cardinality).
+func TestPGHstoreEmit(t *testing.T) {
+	def := pgExtensionCatalog["hstore"]
+	got, err := def.emitColumn(ir.ExtensionType{
+		Extension: "hstore",
+		Name:      "hstore",
+	})
+	if err != nil {
+		t.Fatalf("emitColumn: %v", err)
+	}
+	if got != "hstore" {
+		t.Errorf("emitColumn = %q; want %q", got, "hstore")
+	}
+}
+
+// TestPGHstoreEmit_RejectsModifiers refuses an IR shape with
+// modifiers — hstore has none, so any modifier is a programmer error.
+func TestPGHstoreEmit_RejectsModifiers(t *testing.T) {
+	def := pgExtensionCatalog["hstore"]
+	_, err := def.emitColumn(ir.ExtensionType{
+		Extension: "hstore",
+		Name:      "hstore",
+		Modifiers: []int{1},
+	})
+	if err == nil {
+		t.Fatal("expected error on hstore with modifiers; got nil")
+	}
+}
+
+// TestPGHstoreBuild decodes the IR shape from the udt_name. No
+// modifiers regardless of typmod (hstore has no per-column type
+// modifier — atttypmod is always -1).
+func TestPGHstoreBuild(t *testing.T) {
+	def := pgExtensionCatalog["hstore"]
+	got, err := def.build("hstore", -1)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if got.Extension != "hstore" || got.Name != "hstore" {
+		t.Errorf("build Extension=%q Name=%q; want hstore/hstore",
+			got.Extension, got.Name)
+	}
+	if len(got.Modifiers) != 0 {
+		t.Errorf("build Modifiers = %v; want empty", got.Modifiers)
+	}
+}
+
+// TestPGHstoreBuild_RejectsWrongUDT defends the catalog dispatcher —
+// calling build with the wrong udt_name is a programmer error.
+func TestPGHstoreBuild_RejectsWrongUDT(t *testing.T) {
+	def := pgExtensionCatalog["hstore"]
+	_, err := def.build("not_hstore", -1)
+	if err == nil {
+		t.Fatal("expected error on wrong udt; got nil")
+	}
+}
+
+// TestPGExtensionCatalog_ContainsCiText pins the citext catalog
+// entry's shape: owns the `citext` type, no new AMs / opclasses
+// (citext rides on core PG btree / gin / gist).
+func TestPGExtensionCatalog_ContainsCiText(t *testing.T) {
+	def, ok := pgExtensionCatalog["citext"]
+	if !ok {
+		t.Fatal("pgExtensionCatalog missing 'citext' entry")
+	}
+	if _, ok := def.typesByName["citext"]; !ok {
+		t.Errorf("citext typesByName missing 'citext'")
+	}
+	if def.emitColumn == nil {
+		t.Errorf("citext emitColumn is nil")
+	}
+	if len(def.indexAccessMethods) != 0 {
+		t.Errorf("citext indexAccessMethods = %v; want empty", def.indexAccessMethods)
+	}
+	if len(def.indexOperatorClasses) != 0 {
+		t.Errorf("citext indexOperatorClasses = %v; want empty", def.indexOperatorClasses)
+	}
+}
+
+// TestPGCiTextEmit pins the bareword `citext` DDL form.
+func TestPGCiTextEmit(t *testing.T) {
+	def := pgExtensionCatalog["citext"]
+	got, err := def.emitColumn(ir.ExtensionType{
+		Extension: "citext",
+		Name:      "citext",
+	})
+	if err != nil {
+		t.Fatalf("emitColumn: %v", err)
+	}
+	if got != "citext" {
+		t.Errorf("emitColumn = %q; want %q", got, "citext")
+	}
+}
+
+// TestPGCiTextEmit_RejectsModifiers refuses an IR shape with
+// modifiers — citext has none (it's text with a custom collation,
+// no length parameter).
+func TestPGCiTextEmit_RejectsModifiers(t *testing.T) {
+	def := pgExtensionCatalog["citext"]
+	_, err := def.emitColumn(ir.ExtensionType{
+		Extension: "citext",
+		Name:      "citext",
+		Modifiers: []int{255},
+	})
+	if err == nil {
+		t.Fatal("expected error on citext with modifiers; got nil")
+	}
+}
+
+// TestPGCiTextBuild decodes the IR shape from the udt_name.
+func TestPGCiTextBuild(t *testing.T) {
+	def := pgExtensionCatalog["citext"]
+	got, err := def.build("citext", -1)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if got.Extension != "citext" || got.Name != "citext" {
+		t.Errorf("build Extension=%q Name=%q; want citext/citext",
+			got.Extension, got.Name)
+	}
+	if len(got.Modifiers) != 0 {
+		t.Errorf("build Modifiers = %v; want empty", got.Modifiers)
+	}
+}
+
+// TestHasCrossEngineDefaultTranslator pins the catalog-side
+// declaration the pipeline's cross-engine preflight consults. Today
+// hstore and citext qualify (Tier 1 type-only with defensible MySQL
+// mappings per the research doc § 5); vector / pg_trgm / postgis do
+// not — they preserve the loud-failure default cross-engine.
+func TestHasCrossEngineDefaultTranslator(t *testing.T) {
+	cases := []struct {
+		name string
+		want bool
+	}{
+		{"hstore", true},
+		{"citext", true},
+		{"vector", false},
+		{"pg_trgm", false},
+		{"postgis", false},
+		{"unknown", false},
+		{"", false},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			got := HasCrossEngineDefaultTranslator(c.name)
+			if got != c.want {
+				t.Errorf("HasCrossEngineDefaultTranslator(%q) = %v; want %v",
+					c.name, got, c.want)
+			}
+		})
+	}
+}
+
+// TestLookupExtensionForType_Hstore matches a `hstore` udt against
+// the enabled extension set, mirroring the pgvector test pattern.
+func TestLookupExtensionForType_Hstore(t *testing.T) {
+	cases := []struct {
+		name        string
+		udtName     string
+		enabled     map[string]bool
+		wantExt     string
+		wantMatched bool
+	}{
+		{
+			name:        "hstore type with hstore enabled",
+			udtName:     "hstore",
+			enabled:     map[string]bool{"hstore": true},
+			wantExt:     "hstore",
+			wantMatched: true,
+		},
+		{
+			name:        "citext type with citext enabled",
+			udtName:     "citext",
+			enabled:     map[string]bool{"citext": true},
+			wantExt:     "citext",
+			wantMatched: true,
+		},
+		{
+			name:        "hstore type without enabling",
+			udtName:     "hstore",
+			enabled:     map[string]bool{},
+			wantMatched: false,
+		},
+		{
+			name:        "citext type without enabling",
+			udtName:     "citext",
+			enabled:     map[string]bool{},
+			wantMatched: false,
+		},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			ext, _, ok := lookupExtensionForType(c.udtName, c.enabled)
+			if ok != c.wantMatched {
+				t.Errorf("lookupExtensionForType(%q, %v) matched=%v; want %v",
+					c.udtName, c.enabled, ok, c.wantMatched)
+			}
+			if ok && ext != c.wantExt {
+				t.Errorf("ext = %q; want %q", ext, c.wantExt)
+			}
+		})
 	}
 }

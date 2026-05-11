@@ -422,7 +422,170 @@ func prepareValue(v any, col *ir.Column) any {
 			return out
 		}
 	}
+	// ADR-0032: PG extension passthrough types. The MySQL writer's
+	// emitColumnType rewrites these to a native MySQL shape (hstore →
+	// JSON; citext → VARCHAR _ci). The values need matching adjustment:
+	//
+	//   - hstore values arrive from the PG reader as PG-canonical text
+	//     ("\"key\"=>\"value\", \"k2\"=>\"v2\""). MySQL JSON columns
+	//     reject that wire form — parse the hstore text and re-emit as
+	//     a JSON object string. NULL values in hstore (the unquoted
+	//     keyword NULL on the value side) map to JSON null.
+	//   - citext values are plain strings; no value translation needed
+	//     (the case-insensitive comparison is a server-side property
+	//     of the collation, not the wire format).
+	if ext, isExt := t.(ir.ExtensionType); isExt {
+		switch ext.Extension {
+		case "hstore":
+			return prepareHstoreToJSON(v)
+		case "citext":
+			// Identity — string passes through.
+			if b, ok := v.([]byte); ok {
+				return string(b)
+			}
+		}
+	}
 	return v
+}
+
+// prepareHstoreToJSON converts a PG hstore wire value into a JSON
+// object string suitable for a MySQL JSON column. The cross-engine
+// PG → MySQL translator (ADR-0032 § "Cross-engine policy") declares
+// hstore's default MySQL form as JSON; this is the value side of that
+// declaration.
+//
+// Input shapes:
+//   - string / []byte in PG hstore canonical text form:
+//     `"key1"=>"value1", "key2"=>"value2"`, with backslash-escaped
+//     interior quotes (`"a\"b"=>"v"`). Unquoted NULL on the value
+//     side is the SQL null marker, mapped to JSON null.
+//   - empty string → empty JSON object `{}`.
+//
+// On any parse failure the input bytes pass through unchanged; the
+// downstream driver will raise an unambiguous "Invalid JSON text"
+// error citing the offending value. The loud-failure path is
+// preferred over emitting "best-effort" malformed JSON.
+func prepareHstoreToJSON(v any) any {
+	var s string
+	switch b := v.(type) {
+	case string:
+		s = b
+	case []byte:
+		s = string(b)
+	default:
+		return v
+	}
+	pairs, err := parseHstoreText(s)
+	if err != nil {
+		// Parse failed — fall through with original bytes; the driver
+		// will surface its own error rather than this helper masking it.
+		return v
+	}
+	encoded, err := json.Marshal(pairs)
+	if err != nil {
+		return v
+	}
+	return string(encoded)
+}
+
+// parseHstoreText parses a PG hstore canonical text representation
+// into a key→value map suitable for JSON serialization. The grammar
+// is described in PG's docs ("hstore Input and Output"):
+//
+//   - Each key/value pair is `"key"=>"value"` with double-quoted
+//     strings on both sides.
+//   - Pairs are separated by `, ` (comma + space; tolerate either).
+//   - Interior quotes are backslash-escaped (`\"` is a literal quote
+//     in the key/value); literal backslashes are `\\`.
+//   - The unquoted keyword `NULL` (case-insensitive) on the value side
+//     is the SQL null marker. Keys cannot be NULL — PG hstore enforces
+//     that on insert.
+//   - The empty hstore is the empty string `""` (no braces).
+//
+// The returned map preserves PG's "last write wins" semantics for
+// duplicate keys — Go maps overwrite on assignment, which matches
+// PG's hstore behaviour.
+//
+// Returns an error for malformed input so the caller can fall back
+// to loud-failure rather than emit partial JSON. The parser is
+// strict on the brace-less canonical form; hstore values inside a
+// PG array (`{...}` envelope) are not supported — those would need
+// the array text-form parser ahead of this one.
+func parseHstoreText(s string) (map[string]any, error) {
+	out := map[string]any{}
+	i := 0
+	skipSpace := func() {
+		for i < len(s) && (s[i] == ' ' || s[i] == '\t') {
+			i++
+		}
+	}
+	// readQuoted consumes a `"..."` literal with backslash escapes,
+	// returning the unescaped string body and advancing i past the
+	// closing quote.
+	readQuoted := func() (string, error) {
+		if i >= len(s) || s[i] != '"' {
+			return "", fmt.Errorf("hstore: expected '\"' at offset %d in %q", i, s)
+		}
+		i++
+		var sb []byte
+		for i < len(s) {
+			c := s[i]
+			if c == '\\' && i+1 < len(s) {
+				sb = append(sb, s[i+1])
+				i += 2
+				continue
+			}
+			if c == '"' {
+				i++
+				return string(sb), nil
+			}
+			sb = append(sb, c)
+			i++
+		}
+		return "", fmt.Errorf("hstore: unterminated quoted string in %q", s)
+	}
+	for {
+		skipSpace()
+		if i >= len(s) {
+			break
+		}
+		key, err := readQuoted()
+		if err != nil {
+			return nil, err
+		}
+		skipSpace()
+		// Expect `=>`.
+		if i+1 >= len(s) || s[i] != '=' || s[i+1] != '>' {
+			return nil, fmt.Errorf("hstore: expected '=>' at offset %d in %q", i, s)
+		}
+		i += 2
+		skipSpace()
+		// Value: either an unquoted NULL (case-insensitive) or a
+		// quoted string.
+		switch {
+		case i < len(s) && s[i] == '"':
+			val, err := readQuoted()
+			if err != nil {
+				return nil, err
+			}
+			out[key] = val
+		case i+4 <= len(s) && strings.EqualFold(s[i:i+4], "NULL"):
+			out[key] = nil
+			i += 4
+		default:
+			return nil, fmt.Errorf("hstore: expected '\"' or NULL at offset %d in %q", i, s)
+		}
+		skipSpace()
+		// Either end of input or a comma separator.
+		if i >= len(s) {
+			break
+		}
+		if s[i] != ',' {
+			return nil, fmt.Errorf("hstore: expected ',' or end at offset %d in %q", i, s)
+		}
+		i++
+	}
+	return out, nil
 }
 
 // convertArrayLikeToJSON detects values that look like PG arrays

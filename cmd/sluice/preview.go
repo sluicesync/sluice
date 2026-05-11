@@ -56,7 +56,7 @@ type SchemaPreviewCmd struct {
 
 	TargetSchema string `help:"Per-source target schema namespace (Postgres-only). Renders preview DDL prefixed with this schema so operators see exactly what 'sluice migrate' / 'sync start' would emit under --target-schema (ADR-0031). MySQL operators use a different --target DSN database instead." placeholder:"NAME"`
 
-	EnablePGExtension []string `help:"Enable passthrough for a Postgres extension type (repeatable). Same-engine PG → PG only. Recognised: vector (pgvector), pg_trgm. See ADR-0032." placeholder:"EXT"`
+	EnablePGExtension []string `help:"Enable passthrough for a Postgres extension type (repeatable). Same-engine PG → PG passthrough; hstore and citext additionally have built-in cross-engine translators on MySQL targets. Recognised: vector (pgvector), pg_trgm, hstore, citext. See ADR-0032." placeholder:"EXT"`
 }
 
 // Run implements `sluice schema preview`.

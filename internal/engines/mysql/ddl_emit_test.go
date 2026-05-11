@@ -90,7 +90,8 @@ func TestEmitColumnType(t *testing.T) {
 }
 
 // TestEmitColumnType_ExtensionTypeRefuses confirms the MySQL writer
-// refuses ir.ExtensionType columns loudly (ADR-0032). The
+// refuses ir.ExtensionType columns without a default cross-engine
+// translator (pgvector, pg_trgm, postgis) loudly (ADR-0032). The
 // cross-engine refusal in pipeline.checkCrossEngineSupportable
 // normally fires before MySQL's writer is invoked, but this defends
 // in depth against hand-constructed IR.
@@ -109,6 +110,39 @@ func TestEmitColumnType_ExtensionTypeRefuses(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "--type-override") {
 		t.Errorf("err = %v; want hint mentioning --type-override", err)
+	}
+}
+
+// TestEmitColumnType_HstoreCrossEngine emits MySQL JSON for an
+// ir.ExtensionType{Extension: "hstore"} column. The cross-engine
+// translator (ADR-0032 § "Cross-engine policy") is wired into the
+// MySQL writer directly so the migrate path lands hstore columns as
+// MySQL JSON without operator intervention.
+func TestEmitColumnType_HstoreCrossEngine(t *testing.T) {
+	got, err := emitColumnType(ir.ExtensionType{Extension: "hstore", Name: "hstore"})
+	if err != nil {
+		t.Fatalf("emitColumnType hstore: %v", err)
+	}
+	if got != "JSON" {
+		t.Errorf("hstore emit = %q; want %q", got, "JSON")
+	}
+}
+
+// TestEmitColumnType_CiTextCrossEngine emits MySQL VARCHAR with the
+// case-insensitive collation utf8mb4_0900_ai_ci for an
+// ir.ExtensionType{Extension: "citext"} column. The collation
+// suffix is the load-bearing piece — without it the cross-engine
+// behaviour change (case-insensitive comparison) is lost.
+func TestEmitColumnType_CiTextCrossEngine(t *testing.T) {
+	got, err := emitColumnType(ir.ExtensionType{Extension: "citext", Name: "citext"})
+	if err != nil {
+		t.Fatalf("emitColumnType citext: %v", err)
+	}
+	if !strings.Contains(got, "VARCHAR") {
+		t.Errorf("citext emit = %q; want VARCHAR base", got)
+	}
+	if !strings.Contains(got, "utf8mb4_0900_ai_ci") {
+		t.Errorf("citext emit = %q; want utf8mb4_0900_ai_ci collation", got)
 	}
 }
 

@@ -70,8 +70,14 @@ func retargetRuleFor(sourceEngine, targetEngine string) retargetRule {
 // (e.g. binary_uuid for UUID) supply --type-override before this pass
 // runs — the override replaces the IR type via [ApplyMappings] and
 // the rewrite below sees a non-matching type and passes through.
+//
+// ADR-0032 cross-engine default translators: hstore → JSON and citext
+// → VARCHAR with case-insensitive collation. These mirror the
+// engine-side emit (mysql/ddl_emit.go::emitColumnType) so a `sluice
+// schema diff` against a MySQL target sees the same translated shape
+// the migrate path lands on.
 func retargetPGtoMySQL(t ir.Type) ir.Type {
-	switch t.(type) {
+	switch v := t.(type) {
 	case ir.UUID:
 		return ir.Char{Length: 36}
 	case ir.Inet, ir.Cidr:
@@ -80,6 +86,13 @@ func retargetPGtoMySQL(t ir.Type) ir.Type {
 		return ir.Varchar{Length: 30}
 	case ir.Array:
 		return ir.JSON{Binary: true}
+	case ir.ExtensionType:
+		switch v.Extension {
+		case "hstore":
+			return ir.JSON{Binary: true}
+		case "citext":
+			return ir.Varchar{Length: 255, Collation: "utf8mb4_0900_ai_ci"}
+		}
 	}
 	return nil
 }

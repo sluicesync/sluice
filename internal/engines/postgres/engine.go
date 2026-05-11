@@ -47,6 +47,17 @@ func (Engine) Name() string { return "postgres" }
 // package uses, when a real need surfaces.
 func (Engine) Capabilities() ir.Capabilities { return capabilities }
 
+// HasCrossEngineDefaultTranslator implements
+// [ir.CrossEngineExtensionTranslator]. The pipeline's engine-name
+// gate in `validateEnabledPGExtensions` calls this to decide whether
+// `--enable-pg-extension EXT` may be paired with a non-PG target.
+// PG declares its v1 cross-engine-translatable extensions via the
+// catalog's `crossEngineDefaultTranslatedExtensions` registry —
+// today: hstore and citext (ADR-0032 § "Cross-engine policy").
+func (Engine) HasCrossEngineDefaultTranslator(name string) bool {
+	return HasCrossEngineDefaultTranslator(name)
+}
+
 // OpenSchemaReader returns a [SchemaReader] bound to the database
 // identified by dsn. The schema name to read is taken from the DSN's
 // `schema` query parameter; if absent, defaults to "public".

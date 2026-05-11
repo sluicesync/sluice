@@ -277,6 +277,38 @@ func TestDecodeValue(t *testing.T) {
 			ir.ExtensionType{Extension: "vector", Name: "vector"},
 			nil,
 		},
+
+		// ---- ADR-0032 hstore + citext passthrough (Tier 1) ----
+		// hstore values arrive as PG-canonical text under pgx stdlib
+		// mode; the decoder passes them through verbatim for both
+		// same-engine PG→PG (where the value is reapplied as-is) and
+		// cross-engine PG→MySQL (where the writer's prepareValue
+		// reparses to JSON).
+		{
+			"hstore string passthrough",
+			`"a"=>"1", "b"=>"2"`,
+			ir.ExtensionType{Extension: "hstore", Name: "hstore"},
+			`"a"=>"1", "b"=>"2"`,
+		},
+		{
+			"hstore empty string",
+			"",
+			ir.ExtensionType{Extension: "hstore", Name: "hstore"},
+			"",
+		},
+		// citext values are plain strings.
+		{
+			"citext string passthrough",
+			"Hello",
+			ir.ExtensionType{Extension: "citext", Name: "citext"},
+			"Hello",
+		},
+		{
+			"citext bytes round-tripped to bytes",
+			[]byte("MixedCase"),
+			ir.ExtensionType{Extension: "citext", Name: "citext"},
+			[]byte("MixedCase"),
+		},
 	}
 
 	for _, c := range cases {

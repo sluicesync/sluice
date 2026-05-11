@@ -158,6 +158,19 @@ func translateType(c columnMeta) (ir.Type, error) {
 				SRID:    c.GeometryInfo.SRID,
 			}, nil
 		}
+		// ADR-0032 hint: if udt_name matches a known extension type
+		// the operator didn't opt into, surface the actionable flag
+		// rather than the vague "not a recognised enum" wording. The
+		// extension-owning lookup runs unconditionally — the catalog
+		// is small, the data point is already there from the
+		// `--enable-pg-extension` allowlist machinery.
+		if owningExt := extensionOwningType(c.UDTName); owningExt != "" {
+			return nil, fmt.Errorf(
+				"postgres: user-defined type %q is owned by extension %q; "+
+					"pass --enable-pg-extension %s to enable passthrough "+
+					"(ADR-0032)",
+				c.UDTName, owningExt, owningExt)
+		}
 		return nil, fmt.Errorf("postgres: user-defined type %q is not a recognised enum", c.UDTName)
 	}
 

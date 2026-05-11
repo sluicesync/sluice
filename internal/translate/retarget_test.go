@@ -55,6 +55,72 @@ func TestRetargetForEngine_PGtoMySQL(t *testing.T) {
 	}
 }
 
+// TestRetargetForEngine_PGtoMySQL_Hstore pins the ADR-0032 default
+// cross-engine translator: PG `hstore` rewrites to MySQL JSON.
+// Mirrors the mysql/ddl_emit.go::emitColumnType case so the diff
+// path sees the same shape the migrate path lands on.
+func TestRetargetForEngine_PGtoMySQL_Hstore(t *testing.T) {
+	src := &ir.Schema{Tables: []*ir.Table{
+		{
+			Name: "attrs",
+			Columns: []*ir.Column{
+				{Name: "id", Type: ir.Integer{Width: 64}},
+				{Name: "tags", Type: ir.ExtensionType{Extension: "hstore", Name: "hstore"}},
+			},
+		},
+	}}
+	got := RetargetForEngine(src, "postgres", "mysql")
+	tags := got.Tables[0].Columns[1]
+	want := ir.JSON{Binary: true}
+	if tags.Type != want {
+		t.Errorf("hstore retargeted type = %v; want %v", tags.Type, want)
+	}
+}
+
+// TestRetargetForEngine_PGtoMySQL_CiText pins the citext → MySQL
+// VARCHAR with `_ci` collation translator.
+func TestRetargetForEngine_PGtoMySQL_CiText(t *testing.T) {
+	src := &ir.Schema{Tables: []*ir.Table{
+		{
+			Name: "users",
+			Columns: []*ir.Column{
+				{Name: "id", Type: ir.Integer{Width: 64}},
+				{Name: "email", Type: ir.ExtensionType{Extension: "citext", Name: "citext"}},
+			},
+		},
+	}}
+	got := RetargetForEngine(src, "postgres", "mysql")
+	email := got.Tables[0].Columns[1]
+	want := ir.Varchar{Length: 255, Collation: "utf8mb4_0900_ai_ci"}
+	if email.Type != want {
+		t.Errorf("citext retargeted type = %v; want %v", email.Type, want)
+	}
+}
+
+// TestRetargetForEngine_PGtoMySQL_OtherExtensionPassthrough confirms
+// the rewrite is narrow: extension types without a default cross-
+// engine translator (vector, pg_trgm, postgis) pass through unchanged
+// so the cross-engine refusal in checkCrossEngineSupportable fires.
+func TestRetargetForEngine_PGtoMySQL_OtherExtensionPassthrough(t *testing.T) {
+	src := &ir.Schema{Tables: []*ir.Table{
+		{
+			Name: "items",
+			Columns: []*ir.Column{
+				{Name: "embedding", Type: ir.ExtensionType{Extension: "vector", Name: "vector", Modifiers: []int{384}}},
+			},
+		},
+	}}
+	got := RetargetForEngine(src, "postgres", "mysql")
+	emb := got.Tables[0].Columns[0]
+	ext, ok := emb.Type.(ir.ExtensionType)
+	if !ok {
+		t.Fatalf("vector retargeted to %T; want ir.ExtensionType (unchanged)", emb.Type)
+	}
+	if ext.Extension != "vector" {
+		t.Errorf("vector extension name = %q; want unchanged", ext.Extension)
+	}
+}
+
 // TestRetargetForEngine_PGtoPlanetScale uses the same retarget rules
 // as PG→MySQL since PlanetScale's MySQL flavor has the same native-
 // type set.

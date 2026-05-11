@@ -326,6 +326,69 @@ func TestCheckCrossEngineSupportable_PGtoMySQL_GistKindRefuses_NoOpclass(t *test
 	}
 }
 
+// TestCheckCrossEngineSupportable_PGtoMySQL_HstoreSupportable pins
+// the hstore carve-out from the ExtensionType refusal: hstore has a
+// default MySQL translator (→ JSON) declared in the catalog's
+// `crossEngineDefaultTranslatedExtensions`, so the column passes
+// through cleanly. Mirrors the postgis carve-out shape — same intent,
+// different translator surface.
+func TestCheckCrossEngineSupportable_PGtoMySQL_HstoreSupportable(t *testing.T) {
+	s := &ir.Schema{Tables: []*ir.Table{{
+		Name: "attrs",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}},
+			{Name: "tags", Type: ir.ExtensionType{Extension: "hstore", Name: "hstore"}},
+		},
+	}}}
+	if err := checkCrossEngineSupportable(s, "postgres", "mysql", "attrs-migration"); err != nil {
+		t.Errorf("hstore PG → MySQL err = %v; want nil (default translator → JSON)", err)
+	}
+}
+
+// TestCheckCrossEngineSupportable_PGtoMySQL_CiTextSupportable pins
+// the citext carve-out — translator maps to VARCHAR with case-
+// insensitive collation. The preflight must not refuse.
+func TestCheckCrossEngineSupportable_PGtoMySQL_CiTextSupportable(t *testing.T) {
+	s := &ir.Schema{Tables: []*ir.Table{{
+		Name: "users",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}},
+			{Name: "email", Type: ir.ExtensionType{Extension: "citext", Name: "citext"}},
+		},
+	}}}
+	if err := checkCrossEngineSupportable(s, "postgres", "mysql", "users-migration"); err != nil {
+		t.Errorf("citext PG → MySQL err = %v; want nil (default translator → VARCHAR _ci)", err)
+	}
+}
+
+// TestIsCrossEngineTranslatablePGExtension pins the small static set
+// the pipeline package mirrors against the postgres engine's catalog
+// declaration. Both lists must stay in lock-step.
+func TestIsCrossEngineTranslatablePGExtension(t *testing.T) {
+	cases := []struct {
+		name string
+		want bool
+	}{
+		{"hstore", true},
+		{"citext", true},
+		{"vector", false},
+		{"pg_trgm", false},
+		{"postgis", false},
+		{"unknown", false},
+		{"", false},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			got := isCrossEngineTranslatablePGExtension(c.name)
+			if got != c.want {
+				t.Errorf("isCrossEngineTranslatablePGExtension(%q) = %v; want %v",
+					c.name, got, c.want)
+			}
+		})
+	}
+}
+
 // TestCheckCrossEngineSupportable_PGtoMySQL_BtreePassesThrough confirms
 // the new Kind-based gate is narrow: btree indexes (the PG default for
 // every non-extension index) must NOT be refused.

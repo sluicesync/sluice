@@ -305,3 +305,191 @@ func TestPrepareValue_AnySliceOnNonJSONPassesThrough(t *testing.T) {
 		t.Errorf("prepareValue varchar-target: got %#v; want %#v", got, in)
 	}
 }
+
+// TestPrepareValue_HstoreToJSON pins the ADR-0032 cross-engine value
+// translator: a PG hstore source column with `col.Type =
+// ir.ExtensionType{Extension: "hstore"}` gets its PG-canonical text
+// form reparsed into a JSON object string the MySQL JSON column
+// accepts. The IR Type is the unchanged source-engine ExtensionType
+// — the writer rewrites at emit time (mysql/ddl_emit.go) and again
+// at value-write time (here).
+func TestPrepareValue_HstoreToJSON(t *testing.T) {
+	hstoreCol := &ir.Column{
+		Name: "tags",
+		Type: ir.ExtensionType{Extension: "hstore", Name: "hstore"},
+	}
+	cases := []struct {
+		name string
+		in   any
+		want any
+	}{
+		{
+			name: "simple two-pair hstore",
+			in:   `"a"=>"1", "b"=>"2"`,
+			want: `{"a":"1","b":"2"}`,
+		},
+		{
+			name: "single-pair hstore",
+			in:   `"key"=>"value"`,
+			want: `{"key":"value"}`,
+		},
+		{
+			name: "empty hstore",
+			in:   "",
+			want: "{}",
+		},
+		{
+			name: "hstore from bytes",
+			in:   []byte(`"x"=>"y"`),
+			want: `{"x":"y"}`,
+		},
+		{
+			name: "hstore with NULL value",
+			in:   `"a"=>"1", "b"=>NULL`,
+			want: `{"a":"1","b":null}`,
+		},
+		{
+			name: "hstore with escaped quote in value",
+			in:   `"k"=>"he said \"hi\""`,
+			want: `{"k":"he said \"hi\""}`,
+		},
+		{
+			name: "nil passes through as nil",
+			in:   nil,
+			want: nil,
+		},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			got := prepareValue(c.in, hstoreCol)
+			if !reflect.DeepEqual(got, c.want) {
+				t.Errorf("prepareValue(%#v, hstore) = %#v; want %#v", c.in, got, c.want)
+			}
+		})
+	}
+}
+
+// TestPrepareValue_CiTextIdentity pins the citext path — the value
+// passes through as a Go string (no encoding conversion). citext is
+// `text` with a custom collation; the case-insensitive comparison is
+// a server-side property of the column collation, not a wire-format
+// concern.
+func TestPrepareValue_CiTextIdentity(t *testing.T) {
+	citextCol := &ir.Column{
+		Name: "email",
+		Type: ir.ExtensionType{Extension: "citext", Name: "citext"},
+	}
+	cases := []struct {
+		name string
+		in   any
+		want any
+	}{
+		{"plain string", "Alice@Example.com", "Alice@Example.com"},
+		{"bytes to string", []byte("Bob@Example.com"), "Bob@Example.com"},
+		{"empty string", "", ""},
+		{"nil passes through", nil, nil},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			got := prepareValue(c.in, citextCol)
+			if !reflect.DeepEqual(got, c.want) {
+				t.Errorf("prepareValue(%#v, citext) = %#v; want %#v", c.in, got, c.want)
+			}
+		})
+	}
+}
+
+// TestParseHstoreText exercises the PG-hstore text-form parser
+// against the canonical shapes PG produces. Each input mirrors the
+// `\d hstore_output` cases from PG's regression tests, minus the
+// brace-wrapped envelope (the parser handles bare hstore form;
+// arrays of hstore are a separate concern).
+func TestParseHstoreText(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want map[string]any
+	}{
+		{
+			name: "empty",
+			in:   "",
+			want: map[string]any{},
+		},
+		{
+			name: "single pair",
+			in:   `"a"=>"1"`,
+			want: map[string]any{"a": "1"},
+		},
+		{
+			name: "two pairs comma-separated",
+			in:   `"a"=>"1", "b"=>"2"`,
+			want: map[string]any{"a": "1", "b": "2"},
+		},
+		{
+			name: "value with embedded spaces",
+			in:   `"name"=>"John Doe"`,
+			want: map[string]any{"name": "John Doe"},
+		},
+		{
+			name: "NULL value",
+			in:   `"a"=>NULL`,
+			want: map[string]any{"a": nil},
+		},
+		{
+			name: "lowercase null value",
+			in:   `"a"=>null`,
+			want: map[string]any{"a": nil},
+		},
+		{
+			name: "escaped quote in value",
+			in:   `"k"=>"a\"b"`,
+			want: map[string]any{"k": `a"b`},
+		},
+		{
+			name: "escaped backslash in value",
+			in:   `"k"=>"a\\b"`,
+			want: map[string]any{"k": `a\b`},
+		},
+		{
+			name: "mixed NULL and value",
+			in:   `"x"=>"1", "y"=>NULL, "z"=>"3"`,
+			want: map[string]any{"x": "1", "y": nil, "z": "3"},
+		},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			got, err := parseHstoreText(c.in)
+			if err != nil {
+				t.Fatalf("parseHstoreText(%q): %v", c.in, err)
+			}
+			if !reflect.DeepEqual(got, c.want) {
+				t.Errorf("parseHstoreText(%q) = %#v; want %#v", c.in, got, c.want)
+			}
+		})
+	}
+}
+
+// TestParseHstoreText_Errors pins the loud-failure shape for
+// malformed input. The MySQL writer's prepareValue catches parse
+// errors and passes the bytes through unchanged — the driver then
+// raises its own "Invalid JSON text" error citing the row's value.
+func TestParseHstoreText_Errors(t *testing.T) {
+	cases := []string{
+		`unquoted_key=>"v"`,    // bare-word key
+		`"key"->"v"`,           // wrong arrow
+		`"key"=>missing_quote`, // unquoted value not NULL
+		`"k"=>"unterminated`,   // unterminated quoted string
+		`"a"=>"1" "b"=>"2"`,    // missing comma separator
+	}
+	for _, in := range cases {
+		in := in
+		t.Run(in, func(t *testing.T) {
+			if _, err := parseHstoreText(in); err == nil {
+				t.Errorf("parseHstoreText(%q) = nil; want error", in)
+			}
+		})
+	}
+}

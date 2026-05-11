@@ -110,16 +110,33 @@ func emitColumnType(t ir.Type) (string, error) {
 		return "VARCHAR(30)", nil
 
 	// ---- PG extension passthrough types (ADR-0032) ----
-	// MySQL has no equivalent for arbitrary PG extension types
-	// (pgvector, hstore, etc.). The cross-engine refusal in
+	// Most PG extension types have no MySQL equivalent (pgvector,
+	// pg_trgm, postgis). The cross-engine refusal in
 	// pipeline.checkCrossEngineSupportable normally fires before
-	// MySQL's writer is invoked, but defend in depth here so a
-	// hand-constructed IR with ExtensionType + MySQL target gets a
-	// clear refusal naming the missing operator translation.
+	// MySQL's writer is invoked. The carve-outs:
+	//
+	//   - hstore: a key/value-pair type that maps cleanly to MySQL
+	//     JSON. The wire-format conversion (PG `"k"=>"v"` →
+	//     `{"k":"v"}`) lives in row_writer.go::prepareValue; the
+	//     emit side just declares JSON.
+	//   - citext: case-insensitive text. Maps to VARCHAR with the
+	//     case-insensitive collation `utf8mb4_0900_ai_ci`. The
+	//     default length is 255 (citext on PG is unbounded; operators
+	//     wanting a different length use --type-override).
+	//
+	// Other extension names get the loud-failure refusal pointing at
+	// --type-override. The IR remains ir.ExtensionType throughout —
+	// the rewrite is engine-local to the writer.
 	case ir.ExtensionType:
+		switch v.Extension {
+		case "hstore":
+			return "JSON", nil
+		case "citext":
+			return "VARCHAR(255) COLLATE utf8mb4_0900_ai_ci", nil
+		}
 		return "", fmt.Errorf(
 			"mysql: column type %s is from a PG extension; cross-engine "+
-				"translation is not supported in v0.26.0 — supply "+
+				"translation is not supported for this extension — supply "+
 				"--type-override TABLE.COL=<MySQL_type> to opt in (ADR-0032)",
 			v.String())
 	}

@@ -114,11 +114,22 @@ Shipped in v0.26.0:
 Deferred to subsequent point releases:
 
 - **pg_trgm** (Tier 2 lite — operator classes only, no new column type) **— shipped post-v0.29.1.** Validated the per-opclass passthrough path: `extensionDef.indexOperatorClasses` promoted from `[]string` metadata to `map[string]struct{}` queryable set; new `extensionOperatorClassEnabled` helper; schema reader's `populateIndexes` now consults both the `idx.Method != ""` (extension-AM) and the `extensionOperatorClassEnabled` (extension-opclass-on-core-AM) gates so `gin (col gin_trgm_ops)` round-trips without dropping the opclass. Cross-engine PG → MySQL refusal extended to refuse indexes with `ir.IndexColumn.OperatorClass` non-empty (the IR field is only populated for extension-owned opclasses by Bug 47 design — a clean signal without re-importing the engine catalog).
-- **hstore** (Tier 1 — first opaque-text validation)
-- **citext** (Tier 1 — text + collation)
+- **hstore** (Tier 1 — first opaque-text validation) **— shipped together with citext.** Tier 1 type-only entry: catalog `pgHstoreDef` declares the `hstore` udt; same-engine PG → PG emits the bareword `hstore` and round-trips values as PG-canonical text (`"k"=>"v"`). Cross-engine PG → MySQL gets a built-in default translator: `hstore` → MySQL `JSON`, with the writer's `prepareValue` reparsing the hstore wire form into a JSON object string at value-write time (`prepareHstoreToJSON` / `parseHstoreText` in `internal/engines/mysql/row_writer.go`). The flag-validate gate (`validateEnabledPGExtensions`) relaxes for hstore against non-PG targets via the new `ir.CrossEngineExtensionTranslator` optional engine surface — PG declares hstore + citext as cross-engine-translatable; other extensions preserve the strict refusal.
+- **citext** (Tier 1 — text + collation) **— shipped together with hstore.** Tier 1 type-only entry: catalog `pgCiTextDef` declares the `citext` udt; same-engine PG → PG emits bareword `citext` and round-trips values byte-for-byte (server-side case-insensitive collation is a property of the type, not the wire format). Cross-engine PG → MySQL maps to `VARCHAR(255) COLLATE utf8mb4_0900_ai_ci` — the `_ai_ci` suffix is the load-bearing piece (without it, the case-insensitive comparison the operator relied on is silently lost). Operators wanting a non-default length use `--type-override`.
 - **postgis** (Tier 2 — last in v1; coordinates with the existing GEOMETRY/SPATIAL roadmap entry's PG-side path)
 
-Each subsequent extension is a separate point release; the v1 chunk's landing pattern is "add a catalog entry + integration tests, ship as a patch release."
+Each subsequent extension is a separate point release; the v1 chunk's landing pattern is "add a catalog entry + integration tests, ship as a patch release." Tier 1 entries (hstore, citext) bundle two extensions per release where the implementation cost is dominated by the test-image + integration harness rather than per-extension code.
+
+## Cross-engine policy (revisited per § 5 of research doc)
+
+The original ADR-0032 status block declared "Same-engine target only" as the v1 scope. The hstore + citext PR refines this: a small carve-out admits two extensions whose cross-engine MySQL mappings are genuinely lossless and operator-helpful. The relaxation is **per-extension and engine-declared**, not blanket:
+
+- **`ir.CrossEngineExtensionTranslator`** is a new optional engine surface. An engine implements `HasCrossEngineDefaultTranslator(name string) bool` declaring which of its extensions sluice can translate without operator intervention.
+- **PG declares** `hstore` (→ MySQL JSON) and `citext` (→ MySQL VARCHAR with `_ai_ci` collation). `vector` / `pg_trgm` / `postgis` are not declared — their cross-engine semantics are ambiguous (vector storage on MySQL loses index support; pg_trgm has no MySQL counterpart; postgis is roadmap item 4's responsibility).
+- **The pipeline's `validateEnabledPGExtensions`** consults the source engine's translator surface (when implemented) on the target-not-PG branch. Extensions with a declared translator pass through; others get the existing loud-failure refusal pointing at `--type-override`.
+- **The MySQL writer's `emitColumnType`** carries the load-bearing rewrite directly — `ir.ExtensionType{Extension:"hstore"}` → `JSON`, `ir.ExtensionType{Extension:"citext"}` → `VARCHAR(255) COLLATE utf8mb4_0900_ai_ci`. The pipeline's `checkCrossEngineSupportable` exempts these from refusal via the helper `isCrossEngineTranslatablePGExtension` (kept inline in the pipeline package to avoid cross-package coupling; the small static list must stay in lock-step with the catalog's `crossEngineDefaultTranslatedExtensions`).
+
+The carve-out preserves the opt-in tenet — operators still pass `--enable-pg-extension hstore` (or citext) explicitly; the translator just kicks in on non-PG targets when the source engine declares it. Operators wanting non-default cross-engine shapes (e.g. citext → MySQL `TEXT` instead of VARCHAR) supply `--type-override` per column as before.
 
 ## References
 
