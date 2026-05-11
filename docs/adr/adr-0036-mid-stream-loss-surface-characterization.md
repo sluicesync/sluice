@@ -15,6 +15,8 @@
 
 **Phase A.2 run complete (2026-05-11, Vultr `-count=10`).** Per-row source LSN cross-reference falsifies the reframed M3 hypothesis: **10/10 runs show every missing row's commit LSN is STRICTLY AFTER `lsn_pubadd_after`** (`missing_inside=0` in every run). The loss is not in the ALTER PUBLICATION transaction's WAL window — it's in a later window that ends before the post-add-sentinel reliably arrives. A fifth mechanism (M5) is in play; three candidate descriptions are documented under Phase A.2's verdict section. **Phase A.3 needed** before any production fix to distinguish pgoutput-internal catalog lag (M5a), streamer-snapshot-handoff race (M5b), or applier-side drop (M5c). Path B vs Path C decision is contingent on Phase A.3 mechanism attribution.
 
+**Phase A.3 instrumentation landed (2026-05-10).** Adds an applier-side capture probe at the PG `change_applier.go::dispatch` site (`addtable.diag: applier insert received`, DEBUG-level) that logs every Insert event reaching the applier alongside the row's `body` field and parsed LSN. The diagnose test now also emits a fifth verdict line — `VERDICT_M5_ATTRIBUTION` — that cross-references missing rows by body against the applier-received set. If every missing row is in the set → M5c (applier dropped); if none are → M5a or M5b (pgoutput filtered or streamer-handoff race). The M5a-vs-M5b distinction is deferred to Phase A.4 (server-side `log_min_messages=DEBUG2`). **Verdict captures pending Vultr run.**
+
 This ADR is the operator-facing record of "we instrumented, here's what the data said." Path A (slot-pause) remains falsified per ADR-0033 — this Phase A is Path D ("diagnose the actual v0.24.0 loss surface FIRST") from ADR-0033's "Forward options" list.
 
 ## Context
@@ -162,6 +164,48 @@ Distinguishing M5a / M5b / M5c requires **Phase A.3**:
 
 **Decision deferred until Phase A.3 narrows further.** Path B (dual-slot) was the M3-HOLDS fix; with reframed M3 falsified, Path B may or may not address the actual mechanism. Path C (operator quiesce + LOCK TABLE on events) closes all M5 variants by stopping writes during the snapshot+handoff window — operator-friendly even if "not strictly live". The Path B vs Path C choice is now contingent on Phase A.3's mechanism attribution.
 
+### Phase A.3: applier-side event capture
+
+Phase A.2 falsified reframed M3: missing rows commit STRICTLY AFTER `lsn_pubadd_after`, so the loss surface is downstream of the ALTER PUBLICATION transaction's WAL window. Phase A.3 distinguishes M5c (applier-side drop) from M5a/M5b (pgoutput filter or streamer-snapshot-handoff race) without requiring server-side DEBUG2 logging.
+
+**Instrumentation** (added in `internal/engines/postgres/change_applier.go::dispatch`):
+
+- The PG applier emits `addtable.diag: applier insert received` at DEBUG level on EVERY Insert reaching the dispatch site, BEFORE any PK / col-types / SQL-build work runs. The probe is the earliest applier-side observation point — anything reaching it has cleared pgoutput's filter AND the streamer's send path.
+- Fields: `phase=applier_insert_received`, `schema`, `relation`, `lsn` (parsed from the Insert's Position token via `lsnFromPositionToken`; emits `<unparseable>` on parse failure rather than aborting), `body` (extracted from `v.Row["body"]` when it's a string — the events-table case; empty otherwise).
+- DEBUG-level keeps the probe silent in normal runs; the diagnose test's JSON debug handler captures it.
+
+**Diagnose test extension** (`renderVerdictM5Attribution` in `add_table_live_pg_diagnose_integration_test.go`):
+
+- Walks the captured slog records for `phase=applier_insert_received` events on `relation=events`, builds `applierByBody` map (`body → lsn`).
+- Cross-references the set-diff's missing rows by body: each missing row either is in the map (applier received) or isn't (pgoutput filtered or upstream race).
+- Renders a fifth verdict line: `VERDICT_M5_ATTRIBUTION: missing_total=T applier_received=A pgoutput_filtered=F preview_applier=[...] preview_filtered=[...] <verdict>`.
+
+**Verdict captures** (Vultr vhf-3c-8gb, Postgres 16, `-count=10`):
+
+```
+Run 1:  TODO_run_to_populate
+Run 2:  TODO_run_to_populate
+Run 3:  TODO_run_to_populate
+Run 4:  TODO_run_to_populate
+Run 5:  TODO_run_to_populate
+Run 6:  TODO_run_to_populate
+Run 7:  TODO_run_to_populate
+Run 8:  TODO_run_to_populate
+Run 9:  TODO_run_to_populate
+Run 10: TODO_run_to_populate
+```
+
+**Verdict interpretation:**
+- `M5c_HOLDS` — all missing rows have applier-received entries. The applier received the events but dropped them after receiving (e.g. early termination of the apply loop on `AddTable.Run` return, batched-apply rollback that drops in-flight changes, etc.). Fix lives in the applier.
+- `M5a_OR_M5b_HOLDS` — no missing rows reach the applier. The loss is upstream — either pgoutput's per-LSN catalog snapshot filtered them (M5a) or the streamer's snapshot-handoff race made the active stream skip past their LSNs (M5b). Fix is upstream. Phase A.4 (server-side `log_min_messages=DEBUG2` on the source PG) would distinguish M5a from M5b; Path B dual-slot may address M5a; Path C operator-quiesce closes both.
+- `MIXED` — partial; both mechanisms contribute. Each needs its own fix.
+- `INCONCLUSIVE` — no missing rows in this run, OR instrumentation didn't fire (applier-received map empty). Re-run with verified DEBUG handler installation.
+
+**Updated decision (pending Phase A.3 verdict):**
+- If `M5c_HOLDS` → applier-side fix. Investigate the per-change Apply loop's termination behaviour around `AddTable.Run` return, the batched applier's idle-flush boundary semantics, and any rollback path that drops in-flight changes silently.
+- If `M5a_OR_M5b_HOLDS` → upstream fix or Path C. Path B dual-slot may close M5a; Path C operator-quiesce always closes both. Phase A.4 needed to pin M5a vs M5b before committing to Path B vs operator-only mitigation.
+- If `MIXED` → both fixes needed; sequence the applier-side one first since it's the more contained scope.
+
 #### M4. Test-side counter artifact
 
 Hypothesis: the under-load test's `finalInserted` counter (incremented after successful Exec returns from the loader goroutine) is not perfectly synchronized with what's actually committed on the source. Phase A: query the source for actual committed `load-*` rows by `body` content and set-diff against the target's delivered `load-*` rows. If `finalInserted != source_committed`, the counter is wrong and some of the "loss" is fictitious. If they agree but `target_delivered < source_committed`, the loss is real.
@@ -197,6 +241,14 @@ Phase A.1 narrowed the hypothesis space but left M3 INCONCLUSIVE. Open questions
 ## Decision
 
 **Phase A.1 verdicts:** M1 contributes rarely (1/6 runs, 1 row); M2 ruled out; M3 INCONCLUSIVE but the data shape strongly suggests a reframed M3 (WAL-window between ALTER's BEGIN and catalog-effective LSN) is the dominant mechanism; M4 ruled out (loss is real). **Pre-conditions for committing to Path B (dual-slot) are NOT yet met** — Phase A.1 didn't conclusively pin M3 with positive lag delta. **Pre-conditions for Path C (operator quiesce) are met regardless** — it works for any mechanism.
+
+**Phase A.2 verdicts (2026-05-11):** reframed M3 FALSIFIED 10/10; loss is in a finite window AFTER `lsn_pubadd_after` that ends before the post-add-sentinel arrives. Mechanism is M5 (one of M5a / M5b / M5c). **Path B no longer indicated by data** — Path B was an M3 fix; Phase A.2 ruled M3 out.
+
+**Phase A.3 instrumentation landed (2026-05-10).** Applier-side capture probe in `internal/engines/postgres/change_applier.go::dispatch` plus `VERDICT_M5_ATTRIBUTION` in the diagnose test cross-references missing rows by body against the applier-received set. Verdict captures pending Vultr run. Decision branch:
+
+- If `M5c_HOLDS` → applier-side fix; Path B/C not needed.
+- If `M5a_OR_M5b_HOLDS` → Path C closes the gap immediately; Phase A.4 (server-side DEBUG2) needed before committing to Path B vs operator-only.
+- If `MIXED` → applier-side fix first (contained scope), then upstream.
 
 **Recommended next step: Phase A.2 before any production fix.** Refine the diagnostic instrumentation to cross-reference each missing row's source-side commit LSN against the [pubadd_before, pubadd_after] window. If missing rows fall inside that window, M3 (reframed) is confirmed and Path B becomes the right mitigation. If missing rows fall OUTSIDE the window, a fifth mechanism is in play and a deeper trace is needed.
 

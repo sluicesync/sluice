@@ -12,6 +12,34 @@
 // does the ~36% loss observed in TestAddTable_LiveMode_PG_UnderLoad
 // at high burst rates actually come from?
 //
+// Phase A.2 (committed on main as f8fc85c) falsified reframed M3
+// conclusively across 10/10 Vultr runs: every missing row's commit
+// LSN lands STRICTLY AFTER `lsn_pubadd_after`. A fifth mechanism
+// (M5) is in play. Phase A.3 distinguishes the three candidate M5
+// shapes:
+//
+//   M5a. pgoutput's per-slot catalog cache lazily refreshes after
+//        the catalog-effective LSN; events in the gap are filtered.
+//   M5b. Streamer-snapshot-handoff race: the temp-slot snapshot's
+//        consistent point and the active stream's confirmed_flush_lsn
+//        don't intersect cleanly, so events between them slip
+//        through.
+//   M5c. Applier-side drop: pgoutput delivered the event but the
+//        applier failed to commit it (e.g. early termination on
+//        AddTable.Run return).
+//
+// Phase A.3 distinguishes M5c from M5a/M5b by capturing every
+// Insert reaching the PG applier's dispatch site (the new
+// `addtable.diag: applier insert received` DEBUG-level probe in
+// internal/engines/postgres/change_applier.go::dispatch) and
+// cross-referencing missing-row bodies against the captured set.
+// If a missing row's body appears → M5c (applier received and
+// dropped); if absent → M5a or M5b (pgoutput filtered or
+// streamer-handoff race, applier never saw it).
+//
+// M5a vs M5b requires server-side log_min_messages=DEBUG2 and is
+// deferred to Phase A.4.
+//
 // ADR-0033 § "What we still don't know" enumerates four candidate
 // mechanisms:
 //
@@ -47,6 +75,9 @@
 //                missing_before=B missing_inside=I missing_after=A missing_unknown=U
 //                [HOLDS_reframed|FAILS|INCONCLUSIVE]
 //   VERDICT_M4: source_committed=N target_delivered=K missing_ids=[...]
+//   VERDICT_M5_ATTRIBUTION: missing_total=T applier_received=A pgoutput_filtered=F
+//                preview_applier=[...] preview_filtered=[...]
+//                [M5c_HOLDS|M5a_OR_M5b_HOLDS|MIXED|INCONCLUSIVE]
 //
 // **Phase A is non-negotiable: this test only OBSERVES. No production
 // fix code is gated on its outcome.** When the run completes, the
@@ -306,6 +337,7 @@ func TestAddTable_LiveMode_PG_DiagnoseLossSurface(t *testing.T) {
 	renderVerdictM2(t, logRecs)
 	renderVerdictM3(t, logRecs, missing, lsnSnapshot)
 	renderVerdictM4(t, finalInserted, sourceCommitted, targetDelivered, missing)
+	renderVerdictM5Attribution(t, logRecs, missing)
 
 	streamCancel()
 	select {
@@ -655,6 +687,107 @@ func renderVerdictM4(t *testing.T, finalInserted int64, sourceCommitted, targetD
 	}
 	t.Logf("VERDICT_M4: source_committed=%d target_delivered=%d counter=%d missing_count=%d missing_ids_preview=%v %s",
 		src, tgt, finalInserted, len(missing), missingPreview, verdict)
+}
+
+// renderVerdictM5Attribution implements the ADR-0036 Phase A.3
+// distinction between M5c (applier-side drop) and M5a/M5b
+// (pgoutput-filter or streamer-snapshot-handoff race). It builds a
+// `applierByBody` map from the `addtable.diag: applier insert
+// received` records emitted by the PG applier's dispatch site, then
+// cross-references each missing row's body against the map.
+//
+//   - applier_received counts the missing rows that the applier
+//     dispatch site DID see (M5c surface).
+//   - pgoutput_filtered counts the missing rows the applier never
+//     saw (M5a or M5b — pgoutput-side filter or upstream race).
+//
+// Verdict:
+//
+//   - M5c_HOLDS — every missing row was received by the applier;
+//     the loss is downstream of pgoutput (applier dropped them
+//     after receiving). Fix lives in the applier.
+//   - M5a_OR_M5b_HOLDS — no missing rows reach the applier;
+//     pgoutput-side filter or streamer-handoff race. Fix is
+//     upstream (Path B dual-slot may help; Path C quiesce always
+//     closes the gap). Phase A.4 (server-side DEBUG2 logging)
+//     would further distinguish M5a from M5b.
+//   - MIXED — partial; some missing rows reach the applier, some
+//     don't. Both mechanisms may be contributing.
+//   - INCONCLUSIVE — no missing rows, or no applier_insert_received
+//     records captured (instrumentation didn't fire).
+//
+// Phase A.3 is purely observational; no production fix is gated on
+// the verdict shape. The verdict drives the next iteration's path
+// (M5c → applier-side fix; M5a/M5b → upstream fix or Path C).
+func renderVerdictM5Attribution(t *testing.T, recs []diagRecord, missing []string) {
+	t.Helper()
+
+	// Build the applier-received body→lsn map. We log each
+	// occurrence; for the body-keyed lookup the latest entry wins
+	// (per-body inserts in this test are unique, so collisions
+	// don't occur for load-* rows). Rows with empty body are
+	// skipped — they're either non-events-table inserts (customers,
+	// post-add-sentinel for non-events) or the body extraction
+	// failed at the probe; either way they're irrelevant for the
+	// load-* set-diff cross-reference.
+	applierByBody := make(map[string]string)
+	for _, r := range recs {
+		if r.phase != "applier_insert_received" {
+			continue
+		}
+		rel, _ := r.attrs["relation"].(string)
+		if rel != "events" {
+			continue
+		}
+		body, _ := r.attrs["body"].(string)
+		if body == "" {
+			continue
+		}
+		lsn, _ := r.attrs["lsn"].(string)
+		applierByBody[body] = lsn
+	}
+
+	if len(missing) == 0 {
+		t.Logf("VERDICT_M5_ATTRIBUTION: missing_total=0 applier_received=0 pgoutput_filtered=0 INCONCLUSIVE (no missing rows in this run; cannot attribute)")
+		return
+	}
+	if len(applierByBody) == 0 {
+		t.Logf("VERDICT_M5_ATTRIBUTION: missing_total=%d applier_received=0 pgoutput_filtered=%d INCONCLUSIVE (no applier_insert_received records captured for events; instrumentation did not fire — check that the DEBUG slog handler is active and the applier probe is wired)",
+			len(missing), len(missing))
+		return
+	}
+
+	var applierPreview, filteredPreview []string
+	const previewCap = 6
+	applierReceived := 0
+	pgoutputFiltered := 0
+	for _, body := range missing {
+		lsn, ok := applierByBody[body]
+		if ok {
+			applierReceived++
+			if len(applierPreview) < previewCap {
+				applierPreview = append(applierPreview, fmt.Sprintf("%s@%s", body, lsn))
+			}
+		} else {
+			pgoutputFiltered++
+			if len(filteredPreview) < previewCap {
+				filteredPreview = append(filteredPreview, body)
+			}
+		}
+	}
+
+	verdict := "INCONCLUSIVE"
+	switch {
+	case applierReceived == len(missing) && applierReceived > 0:
+		verdict = "M5c_HOLDS (all missing rows reached the applier dispatch site; the applier dropped them after receiving — fix lives in the applier)"
+	case pgoutputFiltered == len(missing) && pgoutputFiltered > 0:
+		verdict = "M5a_OR_M5b_HOLDS (no missing rows reach the applier; pgoutput filtered them OR they slipped through the streamer-snapshot-handoff — Phase A.4 server-side DEBUG2 needed to distinguish M5a from M5b)"
+	case applierReceived > 0 && pgoutputFiltered > 0:
+		verdict = "MIXED (partial; both applier-side and upstream losses contribute — both mechanisms in play)"
+	}
+
+	t.Logf("VERDICT_M5_ATTRIBUTION: missing_total=%d applier_received=%d pgoutput_filtered=%d preview_applier=%v preview_filtered=%v %s",
+		len(missing), applierReceived, pgoutputFiltered, applierPreview, filteredPreview, verdict)
 }
 
 // lookupSinglePubAddLSN scans for the single addtable.diag pub-add-window

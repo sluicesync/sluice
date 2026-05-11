@@ -500,6 +500,16 @@ var errUnknownTable = errors.New("postgres: applier: target table does not exist
 func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, c ir.Change) error {
 	switch v := c.(type) {
 	case ir.Insert:
+		// ADR-0036 Phase A.3: applier-side capture probe. Logged at
+		// DEBUG so it surfaces under the diagnose test's JSON debug
+		// handler but stays silent in normal runs. Distinguishes M5c
+		// (applier-side drop) from M5a/M5b (pgoutput filter or
+		// streamer-snapshot-handoff race): if a missing row's body
+		// appears here, the applier received the event and dropped it
+		// (or failed downstream); if not, it never reached the
+		// applier and the loss is upstream. See the diagnose test's
+		// renderVerdictM5Attribution for the cross-reference.
+		diagApplierInsertReceived(ctx, a.schema, v)
 		schema := applierSchema(a.schema, v.Schema)
 		pk, err := a.pkFor(ctx, tx, schema, v.Table)
 		if err != nil {
@@ -584,6 +594,54 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, c ir.Change) e
 		return nil
 	}
 	return fmt.Errorf("postgres: applier: unknown change type %T", c)
+}
+
+// diagApplierInsertReceived emits an ADR-0036 Phase A.3 DEBUG-level
+// trace line every time an Insert event reaches the dispatch site.
+// The diagnose test (`add_table_live_pg_diagnose_integration_test.go`)
+// parses these to build an `applierByBody` map keyed off the events
+// table's `body` column, then cross-references each missing row to
+// classify the loss as M5c (applier received and dropped) vs
+// M5a/M5b (pgoutput filtered or streamer-snapshot-handoff race —
+// applier never saw it).
+//
+// Behaviour invariants:
+//
+//   - DEBUG-level — silent in normal runs; surfaces only when the
+//     caller installs a debug-level slog handler (the diagnose test
+//     does, via a JSON handler with `Level: slog.LevelDebug`).
+//   - Logs the position token's parsed LSN so the cross-reference
+//     can group entries by LSN if needed. Token-parse failures emit
+//     `lsn=<unparseable>` rather than aborting.
+//   - Extracts a string-typed `body` field when present so the
+//     test's body-keyed lookup is trivial. Absent or non-string
+//     bodies log `body=""` (the test treats "" as unknown for that
+//     row's classification).
+//
+// Function-scoped so the dispatch site stays readable; the cost is
+// one slog call per Insert when DEBUG is off (a fast no-op in
+// log/slog).
+func diagApplierInsertReceived(ctx context.Context, defaultSchema string, v ir.Insert) {
+	schema := applierSchema(defaultSchema, v.Schema)
+	body := ""
+	if v.Row != nil {
+		if raw, ok := v.Row["body"]; ok {
+			if s, isString := raw.(string); isString {
+				body = s
+			}
+		}
+	}
+	lsnStr := "<unparseable>"
+	if lsn, err := lsnFromPositionToken(v.Position.Token); err == nil && lsn != 0 {
+		lsnStr = lsn.String()
+	}
+	slog.DebugContext(ctx, "addtable.diag: applier insert received",
+		slog.String("phase", "applier_insert_received"),
+		slog.String("schema", schema),
+		slog.String("relation", v.Table),
+		slog.String("lsn", lsnStr),
+		slog.String("body", body),
+	)
 }
 
 // logUnknownTable surfaces the skip-with-warning footprint for
