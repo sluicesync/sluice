@@ -6,6 +6,8 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.32.2]
+
 **Two cross-engine MySQL UX gaps surfaced as pre-existing observations during the v0.32.0 cycle, both closed.** Neither is a regression or correctness issue; both are cleaner failure modes for cross-engine PG → MySQL scenarios. Same shape as v0.30.1's pair.
 
 ### Fixed
