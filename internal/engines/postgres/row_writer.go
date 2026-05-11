@@ -273,14 +273,26 @@ func (w *RowWriter) WriteRows(ctx context.Context, table *ir.Table, rows <-chan 
 // through pgx's CopyFrom + our chanCopySource adapter.
 //
 // Before launching CopyFrom, any extension-owned column types whose
-// wire format pgx doesn't natively understand (today: pgvector's
-// `vector`) get a per-conn pgtype codec registered against the
-// runtime OID resolved from pg_type. Without this, pgx's binary COPY
-// path silently routes vector values through the `text` codec — the
-// canonical text form ships as raw bytes inside a binary-format
-// column, and the receiver's `vector_in()` parser interprets the
-// first two bytes as a big-endian dimension count and refuses with
-// "vector cannot have more than 16000 dimensions" (Bug 47, ADR-0032).
+// wire format pgx doesn't natively understand get a per-conn pgtype
+// codec registered against the runtime OID resolved from pg_type.
+// Two codecs ship today (v0.32.1):
+//
+//   - pgvector's `vector` (v0.26.0, Bug 47, ADR-0032). Without the
+//     codec, pgx's binary COPY path silently routes vector values
+//     through the `text` codec — the canonical text form ships as
+//     raw bytes inside a binary-format column, and the receiver's
+//     `vector_in()` parser interprets the first two bytes as a
+//     big-endian dimension count and refuses with "vector cannot
+//     have more than 16000 dimensions".
+//   - hstore's `hstore` (v0.32.1, ADR-0032 Tier 1 follow-on). Same
+//     failure shape: the IR carries text-form hstore bytes
+//     (`"k"=>"v"`) and PG's binary COPY protocol expects hstore's
+//     pair-array wire format. The codec translates at encode time.
+//
+// The two-codec layout establishes the pattern future Tier 2+
+// extensions with their own wire formats (e.g. PostGIS EWKB) will
+// follow: add a codec file + a `tableHas<Ext>Column` helper + a
+// `registerPG<Ext>Codec` helper + register both in the gate below.
 //
 // COPY is atomic at the table level: a mid-stream error rolls back
 // the entire copy. The error message names how many rows landed
@@ -300,6 +312,7 @@ func (w *RowWriter) writeViaCopy(ctx context.Context, table *ir.Table, rows <-ch
 	source := newChanCopySource(ctx, table, rows)
 
 	needsPGVectorCodec := tableHasPGVectorColumn(table)
+	needsPGHstoreCodec := tableHasHstoreColumn(table)
 
 	var copied int64
 	rawErr := sqlConn.Raw(func(driverConn any) error {
@@ -310,6 +323,11 @@ func (w *RowWriter) writeViaCopy(ctx context.Context, table *ir.Table, rows <-ch
 		conn := stdlibConn.Conn()
 		if needsPGVectorCodec {
 			if err := registerPGVectorCodec(ctx, conn, w.db); err != nil {
+				return err
+			}
+		}
+		if needsPGHstoreCodec {
+			if err := registerPGHstoreCodec(ctx, conn, w.db); err != nil {
 				return err
 			}
 		}
@@ -365,6 +383,46 @@ func registerPGVectorCodec(ctx context.Context, conn *pgx.Conn, db *sql.DB) erro
 		Name:  "vector",
 		OID:   oid,
 		Codec: pgvectorBinaryCodec{},
+	})
+	return nil
+}
+
+// tableHasHstoreColumn reports whether table has any column whose
+// IR type is the hstore ExtensionType. Used to decide whether the
+// COPY path needs to register the per-conn hstore pgtype codec.
+// Mirrors [tableHasPGVectorColumn].
+func tableHasHstoreColumn(table *ir.Table) bool {
+	for _, col := range table.Columns {
+		ext, ok := col.Type.(ir.ExtensionType)
+		if !ok {
+			continue
+		}
+		if ext.Extension == "hstore" {
+			return true
+		}
+	}
+	return false
+}
+
+// registerPGHstoreCodec resolves the runtime OID for the `hstore` type
+// and registers [pgHstoreBinaryCodec] against it on conn. Mirrors
+// [registerPGVectorCodec] — the lookup runs against the *sql.DB pool
+// for the same reason (the conn here is mid-Raw; pg_type is database-
+// global so a sibling-conn query returns the right OID). Idempotent:
+// re-registering on a conn that already has the type is harmless.
+func registerPGHstoreCodec(ctx context.Context, conn *pgx.Conn, db *sql.DB) error {
+	tm := conn.TypeMap()
+	if _, alreadyRegistered := tm.TypeForName("hstore"); alreadyRegistered {
+		return nil
+	}
+	oid, err := lookupHstoreOID(ctx, db)
+	if err != nil {
+		return fmt.Errorf("postgres: copy: register hstore codec: %w", err)
+	}
+	tm.RegisterType(&pgtype.Type{
+		Name:  "hstore",
+		OID:   oid,
+		Codec: pgHstoreBinaryCodec{},
 	})
 	return nil
 }

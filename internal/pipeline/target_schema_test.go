@@ -103,35 +103,33 @@ func TestValidateEnabledPGExtensions(t *testing.T) {
 		}
 	})
 
-	t.Run("PG -> PG refuses hstore until COPY binary codec lands", func(t *testing.T) {
-		// hstore's COPY-protocol binary wire format isn't implemented
-		// yet; the gate refuses at preflight with an actionable hint
-		// rather than letting bulk-copy fail cryptically on the IR's
-		// text-form hstore bytes. Drop the refusal when the codec
-		// lands (tracked for v0.31.1).
+	t.Run("PG -> PG accepts hstore (v0.32.1 COPY binary codec)", func(t *testing.T) {
+		// hstore PG → PG was refused at preflight in v0.31.0 because
+		// the COPY-protocol binary codec had not landed; the
+		// validator turned the missing codec into an actionable
+		// preflight refusal rather than a cryptic mid-COPY failure.
+		// v0.32.1 ships the codec (internal/engines/postgres/
+		// hstore_codec.go) and the refusal branch is gone; the gate
+		// must accept hstore PG → PG the same way it accepts vector
+		// or citext.
 		err := validateEnabledPGExtensions(stubPGEngine{}, stubPGEngine{}, []string{"hstore"})
-		if err == nil {
-			t.Fatal("err = nil; want refusal until hstore PG → PG COPY binary codec lands")
-		}
-		if !strings.Contains(err.Error(), "hstore") {
-			t.Errorf("err = %v; want refusal mentioning hstore", err)
-		}
-		if !strings.Contains(err.Error(), "type-override") {
-			t.Errorf("err = %v; want hint mentioning --type-override workaround", err)
+		if err != nil {
+			t.Errorf("err = %v; want nil for PG -> PG hstore", err)
 		}
 	})
 
-	t.Run("PG -> PG accepts citext alongside hstore is refused", func(t *testing.T) {
-		// Mixed list with hstore + citext: the refusal must fire on
-		// hstore even though citext is fine. Operators dropping hstore
-		// from the list see the citext-only path proceed.
+	t.Run("PG -> PG accepts citext + hstore together", func(t *testing.T) {
+		// Mixed list with hstore + citext: both Tier 1 entries pass
+		// since the v0.32.1 hstore codec landed. Pin both arrangements
+		// (citext alone and the mixed list) so a future regression
+		// surfaces clearly.
 		err := validateEnabledPGExtensions(stubPGEngine{}, stubPGEngine{}, []string{"citext"})
 		if err != nil {
 			t.Errorf("err = %v; want nil for PG -> PG citext alone", err)
 		}
 		err = validateEnabledPGExtensions(stubPGEngine{}, stubPGEngine{}, []string{"citext", "hstore"})
-		if err == nil {
-			t.Fatal("err = nil; want refusal on hstore even alongside citext")
+		if err != nil {
+			t.Errorf("err = %v; want nil for PG -> PG mixed citext+hstore", err)
 		}
 	})
 

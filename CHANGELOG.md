@@ -6,6 +6,26 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+**v0.32.1 — hstore PG → PG COPY binary codec completes the v0.31.0 Tier 1 deferred work.** The v0.31.0 release shipped hstore as an ADR-0032 Tier 1 extension but deferred PG → PG passthrough because the IR carries text-form hstore bytes (`"k"=>"v"`) and PG's COPY binary protocol expects hstore's pair-array wire format. The preflight refusal in `validateEnabledPGExtensions` surfaced an actionable workaround hint until the codec landed. This release implements the codec and removes the refusal.
+
+### Fixed
+
+- **`--enable-pg-extension hstore` on PG → PG bulk-copy now succeeds.** Pre-fix: `pipeline.validateEnabledPGExtensions` refused at preflight with a `--type-override hstore_column=text` workaround hint; the bulk-copy path could not encode hstore values through pgx's binary COPY protocol because no per-conn `pgtype.Codec` translated the IR's text-form hstore bytes into hstore's pair-array wire format. The refusal branch is gone; PG → PG hstore now round-trips byte-for-byte the same way the existing pgvector / pg_trgm / citext same-engine paths do.
+- **New codec at `internal/engines/postgres/hstore_codec.go`** — `pgHstoreBinaryCodec` mirrors `pgvectorBinaryCodec`'s structural pattern (v0.26.0). Accepts `string` and `[]byte` text-form hstore inputs; emits PG's binary hstore wire format (`int32 BE pair-count + per-pair int32 BE keylen + key bytes + int32 BE vallen + value bytes`, with `vallen = -1` signalling SQL NULL on the value side). Decoder is symmetric for unit-test round-trip and future typed-scan paths.
+- **Two-codec framework now documented as the pattern for future Tier 2+ extensions with their own wire formats** (e.g. PostGIS EWKB). The COPY path's per-conn codec registration gate consults both `tableHasPGVectorColumn` and the new `tableHasHstoreColumn` helper; future extensions add a sibling helper + a `registerPG<Ext>Codec` function + an entry in the same gate.
+- **`TestMigrate_PG_Hstore_Passthrough` (un-skipped) now pins the end-to-end PG → PG hstore round-trip** with 3 rows including the canonical multi-pair shape (`"a"=>"1", "b"=>"2"`), a single-pair shape, and `pg_attribute` verification that the target column's type is `hstore` (not a text column with hstore-shaped content). Same-engine and cross-engine pgvector / pg_trgm / citext tests are regression-clean.
+
+### Migration / Compatibility
+
+- **Bug fix only; no operator surface change.** `sluice migrate --enable-pg-extension hstore` against PG sources/targets now works end-to-end without `--type-override`. Operators who deployed the v0.31.0 workaround (`--type-override hstore_column=text`) can drop the override; the hstore-as-text shape they got is byte-equivalent to what the codec now ships through binary COPY.
+- **Cross-engine PG → MySQL hstore path is unaffected.** That branch uses the value translator (`hstore` → JSON via `prepareHstoreToJSON` in `internal/engines/mysql/row_writer.go`); the v0.31.0 codepath had no preflight refusal there and the v0.32.1 codec is not consulted on a non-PG target.
+
+### Who needs this release
+
+- **Operators running PG → PG migrations or syncs with hstore columns:** **upgrade** — the v0.31.0 preflight refusal is closed and the migration now proceeds without the `--type-override` escape hatch.
+- **Operators on the cross-engine PG → MySQL hstore path:** drop-in; no behavior change (v0.31.0 + v0.31.1 already worked end-to-end via the JSON translator).
+- **Operators not using hstore:** drop-in; no behavior change.
+
 ## [0.32.0]
 
 **Mid-stream live add-table strict zero-loss closes the v0.24.0 best-effort gap (Item 3, ADR-0036 Phase B).** The four-round Phase A diagnose campaign on the v0.24.0 residual loss surface — Phase A.1 ruled out M1/M2/M4 and reframed M3; Phase A.2 falsified reframed M3 (10/10 runs); Phase A.3 confirmed M5c (applier-side drop, 10/10 runs); Phase B identified the precise drop site via code-reading — pinned the failure to a single load-bearing line in the PG applier's dispatch path. The fix is a one-line orchestration reorder plus a small idempotent-bulk-copy helper.

@@ -123,15 +123,12 @@ func startPostgresWithExtension(t *testing.T, extensionName string, enableOnTarg
 // must be `hstore` (verified via pg_type lookup) and the values must
 // match byte-for-byte.
 //
-// Currently skipped: the IR-to-COPY-binary path for hstore requires a
-// per-conn binary codec that hasn't landed yet (pgvector's pattern,
-// but for hstore's pair-array wire format). Until then,
-// validateEnabledPGExtensions refuses --enable-pg-extension hstore on
-// PG → PG with an actionable hint. Cross-engine PG → MySQL works via
-// the value translator. Re-enable this test when the binary codec
-// lands; tracked as a v0.31.1 follow-on.
+// The COPY-binary codec landed in v0.32.1 (internal/engines/postgres/
+// hstore_codec.go) — it translates the IR's text-form hstore bytes
+// (`"k"=>"v"`) into hstore's pair-array wire format at encode time.
+// The corresponding preflight refusal in
+// `pipeline.validateEnabledPGExtensions` is gone.
 func TestMigrate_PG_Hstore_Passthrough(t *testing.T) {
-	t.Skip("hstore PG → PG COPY binary codec not yet implemented; tracked for v0.31.1")
 	sourceDSN, targetDSN, cleanup := startPostgresWithExtension(t, "hstore", true)
 	defer cleanup()
 

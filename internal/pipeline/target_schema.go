@@ -149,27 +149,12 @@ func validateEnabledPGExtensions(source, target ir.Engine, extensions []string) 
 			}
 		}
 	}
-	// PG → PG hstore is not yet supported: COPY's binary protocol
-	// expects hstore's binary wire format, but the IR carries text-form
-	// bytes (the canonical extension-passthrough shape). The codec
-	// translator that would map between them is tracked for a future
-	// release; refuse loudly with an actionable hint until it lands.
-	// The cross-engine path (hstore → MySQL JSON via the value
-	// translator) is unaffected — that branch returned above.
-	if source != nil && target != nil && source.Name() == "postgres" && target.Name() == "postgres" {
-		for _, ext := range extensions {
-			if strings.TrimSpace(ext) == "hstore" {
-				return errors.New(
-					"pipeline: --enable-pg-extension hstore PG → PG is not yet supported " +
-						"(the COPY-protocol binary codec for hstore has not landed); " +
-						"workarounds: (1) use --type-override hstore_column=text per column " +
-						"to preserve the text form on a PG target, or (2) target a " +
-						"non-PG engine where the cross-engine translator (hstore → " +
-						"MySQL JSON) handles the value conversion; tracked for the " +
-						"next release — remove this flag and the migration proceeds")
-			}
-		}
-	}
+	// PG → PG hstore is fully supported as of v0.32.1 — the COPY-
+	// protocol binary codec (internal/engines/postgres/hstore_codec.go)
+	// translates the IR's text-form hstore bytes (`"k"=>"v"`) into
+	// hstore's pair-array wire format at encode time. No refusal
+	// branch needed here; the engine's catalog entry +
+	// validateAndPreflightExtensions handle the per-extension preflight.
 	return nil
 }
 
