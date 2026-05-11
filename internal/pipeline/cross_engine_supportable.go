@@ -110,6 +110,10 @@ func unsupportablePGIndexToMySQL(tbl *ir.Table) (reason, indexName, columnRef st
 		if idx == nil {
 			return "", "", ""
 		}
+		// Extension-introduced operator class on any column. The PG
+		// reader populates OperatorClass only for extension-owned
+		// opclasses (ADR-0032 / Bug 47), so non-empty here means MySQL
+		// has no counterpart.
 		for _, c := range idx.Columns {
 			if c.OperatorClass != "" {
 				ref := c.Column
@@ -119,6 +123,33 @@ func unsupportablePGIndexToMySQL(tbl *ir.Table) (reason, indexName, columnRef st
 				return fmt.Sprintf("PG extension-owned operator class %q", c.OperatorClass),
 					idx.Name, ref
 			}
+		}
+		// PG index kinds MySQL has no counterpart for. v0.30.0 caught
+		// the opclass-bearing case but missed the no-flag scenario:
+		// the operator-class gets stripped from IR yet idx.Kind stays
+		// `IndexKindGIN` / `IndexKindGIST`. MySQL has btree, hash,
+		// FULLTEXT, and SPATIAL — gin/gist don't translate. The PG
+		// schema reader sets `idx.Kind` from `pg_am.amname` regardless
+		// of whether the AM is extension-owned, so this check fires
+		// for core-PG gin/gist indexes even when `idx.Method` is
+		// empty (only extension-introduced AMs like pgvector's
+		// ivfflat / hnsw populate `idx.Method`). FULLTEXT and SPATIAL
+		// are MySQL-portable so they stay unflagged here; ir.Geometry
+		// auto-emits MySQL SPATIAL at write-time.
+		if kind := idx.Kind; kind == ir.IndexKindGIN || kind == ir.IndexKindGIST {
+			ref := ""
+			if len(idx.Columns) > 0 {
+				ref = idx.Columns[0].Column
+				if ref == "" {
+					ref = idx.Columns[0].Expression
+				}
+			}
+			label := "GIN"
+			if kind == ir.IndexKindGIST {
+				label = "GiST"
+			}
+			return fmt.Sprintf("PG %s index has no MySQL counterpart", label),
+				idx.Name, ref
 		}
 		return "", "", ""
 	}

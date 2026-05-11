@@ -255,3 +255,98 @@ func TestCheckCrossEngineSupportable_SameEngineTrgmAllowed(t *testing.T) {
 		t.Errorf("same-engine err = %v; want nil (pg_trgm passthrough on PG → PG)", err)
 	}
 }
+
+// TestCheckCrossEngineSupportable_PGtoMySQL_GinKindRefuses_NoOpclass
+// pins the v0.30.1 broadening: when the operator runs cross-engine
+// PG → MySQL without --enable-pg-extension pg_trgm, the schema reader
+// strips OperatorClass from IR (loud-failure default) but `idx.Kind`
+// stays `IndexKindGIN`. Pre-v0.30.1 the opclass-only refusal missed
+// this and the operator got MySQL Error 1170 after bulk-copy. The
+// refusal now catches the Kind directly. (idx.Method stays "" for
+// core-PG gin/gist; only extension-introduced AMs like ivfflat/hnsw
+// populate it.)
+func TestCheckCrossEngineSupportable_PGtoMySQL_GinKindRefuses_NoOpclass(t *testing.T) {
+	s := &ir.Schema{Tables: []*ir.Table{{
+		Name: "documents",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}},
+			{Name: "body", Type: ir.Text{}},
+		},
+		Indexes: []*ir.Index{
+			{
+				Name: "documents_body_trgm",
+				Kind: ir.IndexKindGIN,
+				// No OperatorClass — the schema-reader gate stripped it
+				// (operator omitted --enable-pg-extension pg_trgm).
+				// idx.Method is "" — core gin AM isn't extension-owned.
+				Columns: []ir.IndexColumn{
+					{Column: "body"},
+				},
+			},
+		},
+	}}}
+	err := checkCrossEngineSupportable(s, "postgres", "mysql", "documents-pg-mysql")
+	if err == nil {
+		t.Fatal("err = nil; want refusal for PG GIN index with no MySQL counterpart")
+	}
+	if !strings.Contains(err.Error(), "GIN") {
+		t.Errorf("err = %v; want mention of \"GIN\"", err)
+	}
+	if !strings.Contains(err.Error(), "MySQL") {
+		t.Errorf("err = %v; want mention of MySQL counterpart", err)
+	}
+}
+
+// TestCheckCrossEngineSupportable_PGtoMySQL_GistKindRefuses_NoOpclass
+// mirrors the GIN test for GiST (the second pg_trgm AM, also the
+// PostGIS spatial AM though spatial gets auto-emitted).
+func TestCheckCrossEngineSupportable_PGtoMySQL_GistKindRefuses_NoOpclass(t *testing.T) {
+	s := &ir.Schema{Tables: []*ir.Table{{
+		Name: "documents",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}},
+			{Name: "body", Type: ir.Text{}},
+		},
+		Indexes: []*ir.Index{
+			{
+				Name: "documents_body_trgm_gist",
+				Kind: ir.IndexKindGIST,
+				Columns: []ir.IndexColumn{
+					{Column: "body"},
+				},
+			},
+		},
+	}}}
+	err := checkCrossEngineSupportable(s, "postgres", "mysql", "documents-pg-mysql")
+	if err == nil {
+		t.Fatal("err = nil; want refusal for PG GiST index with no MySQL counterpart")
+	}
+	if !strings.Contains(err.Error(), "GiST") {
+		t.Errorf("err = %v; want mention of \"GiST\"", err)
+	}
+}
+
+// TestCheckCrossEngineSupportable_PGtoMySQL_BtreePassesThrough confirms
+// the new Kind-based gate is narrow: btree indexes (the PG default for
+// every non-extension index) must NOT be refused.
+func TestCheckCrossEngineSupportable_PGtoMySQL_BtreePassesThrough(t *testing.T) {
+	s := &ir.Schema{Tables: []*ir.Table{{
+		Name: "users",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}},
+			{Name: "email", Type: ir.Varchar{Length: 255}},
+		},
+		Indexes: []*ir.Index{
+			{
+				Name: "users_email_idx",
+				Kind: ir.IndexKindBTree,
+				Columns: []ir.IndexColumn{
+					{Column: "email"},
+				},
+			},
+		},
+	}}}
+	if err := checkCrossEngineSupportable(s, "postgres", "mysql", "users-pg-mysql"); err != nil {
+		t.Errorf("err = %v; want nil (btree is MySQL-portable)", err)
+	}
+}
