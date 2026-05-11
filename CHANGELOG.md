@@ -6,6 +6,8 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.32.0]
+
 **Mid-stream live add-table strict zero-loss closes the v0.24.0 best-effort gap (Item 3, ADR-0036 Phase B).** The four-round Phase A diagnose campaign on the v0.24.0 residual loss surface — Phase A.1 ruled out M1/M2/M4 and reframed M3; Phase A.2 falsified reframed M3 (10/10 runs); Phase A.3 confirmed M5c (applier-side drop, 10/10 runs); Phase B identified the precise drop site via code-reading — pinned the failure to a single load-bearing line in the PG applier's dispatch path. The fix is a one-line orchestration reorder plus a small idempotent-bulk-copy helper.
 
 ### Fixed
