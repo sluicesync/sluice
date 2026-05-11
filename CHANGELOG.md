@@ -6,6 +6,30 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+**Mid-stream live add-table strict zero-loss closes the v0.24.0 best-effort gap (Item 3, ADR-0036 Phase B).** The four-round Phase A diagnose campaign on the v0.24.0 residual loss surface — Phase A.1 ruled out M1/M2/M4 and reframed M3; Phase A.2 falsified reframed M3 (10/10 runs); Phase A.3 confirmed M5c (applier-side drop, 10/10 runs); Phase B identified the precise drop site via code-reading — pinned the failure to a single load-bearing line in the PG applier's dispatch path. The fix is a one-line orchestration reorder plus a small idempotent-bulk-copy helper.
+
+### Fixed
+
+- **PG mid-stream live add-table (`sluice schema add-table --no-drain`) now delivers every in-flight CDC event on the new table exactly-once-effectively.** Pre-fix: events on the new table at LSN > publication-add LSN that reached the active stream's applier in the window between `ALTER PUBLICATION ADD TABLE` and `runBulkCopy`'s `CREATE TABLE ... IF NOT EXISTS` were silently skipped by the applier's `errUnknownTable` defence-in-depth branch (Bug 13 path), then never re-delivered (pgoutput doesn't replay). v0.24.0 documented this as a "best-effort" property; CI's under-load test reported ~36% loss at sub-second burst rates with no shipped fix. Phase A.3 confirmed the drop site (applier receives, then drops); Phase B fixes it.
+- **Drop site (code-reading evidence):** `internal/engines/postgres/change_applier.go::dispatch`'s Insert case — when `colTypesFor` returns `errUnknownTable` because `information_schema.columns` is empty (target table doesn't exist), the dispatch logs a warning and `return nil`. Bug 13's defence-in-depth path stays in place for genuinely-drifted publications; the v0.24.0 race is closed at the orchestration layer instead.
+- **Fix shape (~150 LOC):**
+  - `internal/pipeline/add_table.go::AddTable.Run` step 3a (NEW): `sw.CreateTablesWithoutConstraints(ctx, scoped)` runs BEFORE publication-add. By the time pgoutput's per-LSN catalog snapshot includes the new table, the target table is already in `information_schema.columns` and the applier's dispatch path succeeds.
+  - `internal/pipeline/migrate.go::runBulkCopyForAddTable` (NEW): mid-stream-live-add variant of `runBulkCopy` that routes the row copy through `ir.IdempotentRowWriter.WriteRowsIdempotent` (INSERT … ON CONFLICT (pk) DO UPDATE) when the writer exposes it. With the target table pre-created, a small number of CDC events on the new table may have already been applied by the active stream's applier by the time bulk-copy reaches those rows (events in the [publication-add, snapshot-open] window); the idempotent path absorbs the overlap. Engines without the surface (none today — both PG and MySQL implement it) fall back to plain `WriteRows` with a debug log.
+- **Engine-symmetric.** Both PG and MySQL schema writers use `CREATE TABLE IF NOT EXISTS`; both engines implement `ir.IdempotentRowWriter`. MySQL's filter-flip mechanism (ADR-0034) didn't manifest the race in v0.24.0 (it gates dispatch on `live_added_tables` membership rather than table existence), but the early-create + idempotent-copy shape removes engine-specific timing assumptions from the orchestrator.
+- **Regression artifact.** `TestAddTable_LiveMode_PG_UnderLoad` tightened from best-effort logging (`if got < maxTotal { t.Logf(...) }`) to strict zero-loss assertion (`if got != maxTotal { t.Errorf(...) }`). `TestAddTable_LiveMode_PG_DiagnoseLossSurface` and the Phase A.3 applier-side capture probe in `change_applier.go::dispatch` stay as permanent diagnostic artifacts (mirrors how ADR-0033's slot-pause verify test stays as proof-of-falsification).
+
+### Migration / Compatibility
+
+- **Bug fix only; no operator surface change.** `sluice schema add-table --no-drain TABLE` runs the same way; the in-flight-loss caveat from ADR-0030 § "What could go wrong" item 3 is closed without operator intervention.
+- **Operators with high write-rate workloads who deferred live add-table** in favour of the drained flow (or operator-coordinated quiesce per Path C) can switch to `--no-drain` without the small residual loss caveat.
+- **Path B (dual-slot) and Path C (operator quiesce) are no longer needed** for the v0.24.0 loss surface. They remain available as forward options for unrelated edge cases (e.g. M1 long-txn straddling under workloads where Phase A.1's 1-in-6 rate becomes operator-relevant).
+
+### Who needs this release
+
+- **Operators running mid-stream live add-table (`sluice schema add-table --no-drain`) on PG → PG or PG → MySQL with sustained write rates on the new table at the moment of live-add:** **upgrade** — the residual loss surface that was best-effort in v0.24.0 through v0.31.1 is closed.
+- **Operators on the drained add-table flow:** drop-in; no behavior change (the drained flow already had zero-loss semantics by construction).
+- **MySQL → MySQL operators using `--no-drain`:** drop-in; the ADR-0034 filter-flip path didn't manifest the same race, but the orchestration reorder removes engine-specific timing assumptions from the flow.
+
 ## [0.31.1]
 
 **Bug 48 fix: hstore PG → MySQL cross-engine works under LOAD DATA path.** v0.31.0's headline feature succeeded on the batched-INSERT path (`local_infile=OFF`) but failed cryptically on the LOAD DATA path (`local_infile=ON`) with `Error 3144 (22032): Cannot create a JSON value from a string with CHARACTER SET 'binary'`. Surfaced by the v0.31.0 cycle on a MySQL target with the recommended `local_infile=ON` setting. Real-world operator UX bug; not a regression.

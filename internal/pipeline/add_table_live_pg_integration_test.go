@@ -332,18 +332,24 @@ func TestAddTable_LiveMode_PG_UnderLoad(t *testing.T) {
 
 	got := pollRowCount(targetDSN, "events")
 
-	// Best-effort pin on load-* rows: log the gap for diagnostic
-	// visibility but don't fail the test. Phase 2 with publication-
-	// add-then-snapshot ordering has a real edge case for in-flight
-	// inserts on the new table during the brief window between the
-	// slot's last decode-and-filter pass over a new-table event and
-	// the publication-add taking effect. ADR-0030's "what could go
-	// wrong" section documents this; the strict-correctness fix is
-	// reserved for a follow-up roadmap entry (slot-pause or a
-	// Strategy B dual-slot variant).
-	if got < maxTotal {
-		t.Logf("under-load events row count = %d; ideal (zero-loss) = %d; gap = %d. Phase 2 in-flight-loss edge case per ADR-0030 — load-* rows landing during publication-add boundary may not be delivered. Snapshot rows + post-add CDC pinned above; this is a best-effort log only.",
-			got, maxTotal, maxTotal-got)
+	// Strict zero-loss assertion. ADR-0036 Phase B closes the v0.24.0
+	// best-effort gap: the orchestrator now creates the target table
+	// BEFORE publication-add so the active stream's applier never
+	// sees an `errUnknownTable` silent drop for CDC events on the
+	// new table during the [publication-add, bulk-copy] window. Phase
+	// A.3 confirmed 10/10 runs that the missing rows reach the applier
+	// dispatch site (the M5c verdict); Phase B's fix is the targeted
+	// `errUnknownTable` exposure closure. The ideal (zero-loss) count
+	// is now the only acceptable shape. A regression here re-opens the
+	// best-effort gap and warrants ADR-0036's diagnose protocol.
+	if got != maxTotal {
+		// Re-poll the source so the error message captures the actual
+		// committed-vs-delivered state for triage. If the source row
+		// count disagrees with finalInserted the loader race is back —
+		// reach for the diagnose test to characterize.
+		gotSource := pollRowCount(sourceDSN, "events")
+		t.Errorf("under-load events row count = %d; want exactly %d (snapshot %d + load %d + post-add 1). Source committed = %d. ADR-0036 Phase B closes the in-flight-loss gap; a non-zero gap here is a regression — run TestAddTable_LiveMode_PG_DiagnoseLossSurface against the same Postgres to characterize.",
+			got, maxTotal, seedRowCount, finalInserted, gotSource)
 	}
 
 	// Pin: no duplicates. Whatever count actually landed, every row

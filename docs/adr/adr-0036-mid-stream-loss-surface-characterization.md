@@ -17,9 +17,11 @@
 
 **Phase A.3 run complete (2026-05-11, Vultr `-count=10`). M5c HOLDS in 10/10 runs.** Per-event applier-side capture shows every missing row reaches the PG applier's dispatch site (`pgoutput_filtered=0` in every run). **The applier is dropping events after receiving them.** Neither M5a (pgoutput catalog lazy refresh) nor M5b (streamer-snapshot-handoff race) is the dominant surface. **The fix lives in `internal/engines/postgres/change_applier.go`** — the per-change Apply loop or batched-apply idle-flush boundary is silently dropping events around the `AddTable.Run` return. Path B (dual-slot) was the wrong fix; Path C (operator quiesce) treats symptoms not cause. Phase B is a targeted ~200-500 LOC applier-side fix.
 
-**Phase A.3 instrumentation landed (2026-05-10).** Adds an applier-side capture probe at the PG `change_applier.go::dispatch` site (`addtable.diag: applier insert received`, DEBUG-level) that logs every Insert event reaching the applier alongside the row's `body` field and parsed LSN. The diagnose test now also emits a fifth verdict line — `VERDICT_M5_ATTRIBUTION` — that cross-references missing rows by body against the applier-received set. If every missing row is in the set → M5c (applier dropped); if none are → M5a or M5b (pgoutput filtered or streamer-handoff race). The M5a-vs-M5b distinction is deferred to Phase A.4 (server-side `log_min_messages=DEBUG2`). **Verdict captures pending Vultr run.**
+**Phase A.3 instrumentation landed (2026-05-10).** Adds an applier-side capture probe at the PG `change_applier.go::dispatch` site (`addtable.diag: applier insert received`, DEBUG-level) that logs every Insert event reaching the applier alongside the row's `body` field and parsed LSN. The diagnose test now also emits a fifth verdict line — `VERDICT_M5_ATTRIBUTION` — that cross-references missing rows by body against the applier-received set. If every missing row is in the set → M5c (applier dropped); if none are → M5a or M5b (pgoutput filtered or streamer-handoff race). The M5a-vs-M5b distinction is deferred to Phase A.4 (server-side `log_min_messages=DEBUG2`).
 
-This ADR is the operator-facing record of "we instrumented, here's what the data said." Path A (slot-pause) remains falsified per ADR-0033 — this Phase A is Path D ("diagnose the actual v0.24.0 loss surface FIRST") from ADR-0033's "Forward options" list.
+**Phase B fix landed (2026-05-10).** Code-reading on top of Phase A.3's M5c verdict identified the drop site precisely: `internal/engines/postgres/change_applier.go::dispatch`'s `errUnknownTable` branch (Bug 13 defence-in-depth path) silently skips Insert events for tables that don't exist on the target. In the v0.24.0 mid-stream live add-table flow, the table doesn't exist between `ALTER PUBLICATION ADD TABLE` (LSN_pubadd) and `CREATE TABLE` inside `runBulkCopy`. **The fix:** orchestrate `CREATE TABLE` on the target BEFORE publication-add (a one-line reorder in `AddTable.Run`), then route the bulk-copy through `ir.IdempotentRowWriter.WriteRowsIdempotent` (new `runBulkCopyForAddTable` helper) so any CDC events the active stream's applier processes in the [publication-add, snapshot-open] overlap window don't trip duplicate-key conflicts in the subsequent bulk-copy. The under-load test (`TestAddTable_LiveMode_PG_UnderLoad`) is tightened from best-effort logging to strict zero-loss assertion. Path B (dual-slot) and Path C (operator quiesce) are unnecessary — the loss surface is closed at the orchestration layer.
+
+This ADR is the operator-facing record of "we instrumented, here's what the data said." Path A (slot-pause) remains falsified per ADR-0033 — this Phase A is Path D ("diagnose the actual v0.24.0 loss surface FIRST") from ADR-0033's "Forward options" list. The Phase A → A.1 → A.2 → A.3 → B journey is the four-round diagnose discipline at work: each round narrowed the hypothesis space until the fix surface was named precisely, avoiding the speculate-and-patch trap that burned multiple cycles on ADR-0033's Path A.
 
 ## Context
 
@@ -214,6 +216,41 @@ The actual fix lives in `internal/engines/postgres/change_applier.go`'s per-chan
 3. Add the targeted fix + a regression test that asserts under-load-test missing rows now land on the target.
 
 Estimated ~200-500 LOC depending on the drop location. Much smaller than Path B's ~1500-2000 LOC. **The diagnose work paid off.**
+
+### Phase B: applier-side fix — `errUnknownTable` exposure window closure
+
+**Drop site (code-reading evidence).** With the applier-side capture probe (Phase A.3) proving every missing row reaches the dispatch site, a targeted read of `internal/engines/postgres/change_applier.go::dispatch` pins the silent-drop branch: the Insert case calls `pkFor` and `colTypesFor`; when the target table doesn't yet exist on the destination, `colTypesFor` returns `errUnknownTable` and the dispatch code goes:
+
+```go
+if errors.Is(err, errUnknownTable) {
+    logUnknownTable(ctx, "insert", schema, v.Table)
+    return nil   // <-- silent skip (Bug 13 defence-in-depth path)
+}
+```
+
+The `return nil` is the load-bearing line. The `errUnknownTable` path exists for legitimate defence-in-depth against a drifted publication scope (Bug 13) — but in the v0.24.0 mid-stream live add-table flow, the same path fires for a non-error reason: events on the new table reach the applier in the window between (a) `ALTER PUBLICATION ... ADD TABLE` committing on the source (pgoutput's per-LSN catalog snapshot now includes the new table) and (b) the orchestrator's `runBulkCopy` step running `CREATE TABLE ... IF NOT EXISTS` on the target. During that window the target table doesn't exist, `information_schema.columns` returns zero rows, `loadColumnTypes` returns `errUnknownTable`, the row is silently skipped. The 1-3 missing rows in every Phase A.3 verdict capture are exactly the events received in this race.
+
+**Why it matches the observed shape:**
+- Phase A.3 saw 10/10 runs with `applier_received` equal to `missing_total` → every missing row reaches the dispatch probe before being skipped (the probe fires before `colTypesFor`).
+- Phase A.2 saw missing rows always at LSN > `lsn_pubadd_after` → confirmed the events flow only after publication-add (pgoutput's catalog snapshot has the new table).
+- Phase A.1 saw missing rows clustering at the loader tail (load-15 through load-21) → consistent with the race ending once bulk-copy's CREATE TABLE lands.
+- The buggy timing also explains why duplicate-key conflicts don't surface today: under the buggy code, no events apply during the window (silent skip), so bulk-copy's COPY has the target table to itself.
+
+**The fix (orchestrator reorder + idempotent bulk-copy).**
+
+Two targeted changes in `internal/pipeline/`:
+
+1. **`add_table.go::AddTable.Run` step 3a (NEW):** call `sw.CreateTablesWithoutConstraints(ctx, scoped)` BEFORE publication-add (step 4). The target table now exists in `information_schema.columns` before pgoutput can possibly start delivering events on it; the applier's `errUnknownTable` branch can no longer fire for legitimately-arriving CDC events on the new table. The Bug 13 defence-in-depth path stays in place for genuinely-drifted publications (a manually-altered publication on the source that adds tables the operator didn't `sluice schema add-table` for) — unchanged behaviour for that case.
+
+2. **`migrate.go::runBulkCopyForAddTable` (NEW; replaces `runBulkCopy` for the live add-table flow):** routes the row copy through `ir.IdempotentRowWriter.WriteRowsIdempotent` (INSERT … ON CONFLICT (pk) DO UPDATE) when the writer exposes it. With the target table created before publication-add, a small number of CDC events on the new table may already have been applied by the active stream's applier by the time bulk-copy reaches those rows (events in the [publication-add, snapshot-open] window). A plain COPY would fail with a duplicate-key error and abort the entire COPY; the idempotent path absorbs the overlap. Identity sync, indexes, constraints, views run identically to the cold-start `runBulkCopy`.
+
+The change is engine-symmetric: PG and MySQL schema writers both use `CREATE TABLE IF NOT EXISTS`, both engines implement `ir.IdempotentRowWriter`. MySQL's filter-flip mechanism (ADR-0034) gates dispatch on `live_added_tables` membership and didn't manifest the race in v0.24.0, but the early-create + idempotent-copy shape removes engine-specific timing assumptions from the orchestrator and is correct for both engines.
+
+**Regression artifact:**
+- `internal/pipeline/add_table_live_pg_integration_test.go::TestAddTable_LiveMode_PG_UnderLoad` is tightened from a best-effort log (`if got < maxTotal { t.Logf(...) }`) to a strict zero-loss assertion (`if got != maxTotal { t.Errorf(...) }`). The Phase 2 best-effort caveat in ADR-0030 § "What could go wrong" item 3 is closed; the under-load test now pins the contract.
+- `internal/pipeline/add_table_live_pg_diagnose_integration_test.go::TestAddTable_LiveMode_PG_DiagnoseLossSurface` stays as a permanent regression artifact. Its VERDICT_M[1-5] lines remain the on-call diagnostic should a future regression re-introduce loss in any of the characterized mechanisms; the Phase A.3 applier-side capture probe stays as DEBUG-level instrumentation in `change_applier.go::dispatch` for the same reason (mirrors how ADR-0033's slot-pause verify test stays as proof-of-falsification).
+
+**LOC actual:** ~150 LOC across `add_table.go`, `migrate.go`, the under-load test, and ADR/CHANGELOG. Well under the Phase A.3 estimate; the diagnose work narrowed the fix scope precisely.
 
 #### M4. Test-side counter artifact
 

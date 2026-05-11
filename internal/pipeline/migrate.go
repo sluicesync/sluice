@@ -505,6 +505,101 @@ func runBulkCopy(
 	return nil
 }
 
+// runBulkCopyForAddTable is the mid-stream live add-table variant of
+// [runBulkCopy]. It exists to close the v0.24.0 residual loss surface
+// characterized in ADR-0036 (Phase A → Phase B):
+//
+//   - The orchestrator now CREATEs the target table BEFORE
+//     publication-add (see [AddTable.Run] step 3a) so events on the
+//     new table delivered to the active stream's applier between
+//     publication-add and bulk-copy don't hit the applier's
+//     errUnknownTable silent-drop branch. The CREATE in this helper
+//     is therefore idempotent (CREATE TABLE IF NOT EXISTS on both
+//     engines); the call is kept for symmetry + defense-in-depth on
+//     the rare resume path where the orchestrator's early-create
+//     didn't run.
+//
+//   - Bulk-copy uses [ir.IdempotentRowWriter] (INSERT ... ON CONFLICT
+//     (pk) DO UPDATE) when the writer exposes it. Under load, a
+//     small number of CDC events on the new table that committed in
+//     the [publication-add, snapshot-open] window may already have
+//     been applied by the active stream's applier by the time
+//     bulk-copy reaches those rows; the idempotent path absorbs the
+//     overlap. Engines without the surface fall back to plain
+//     [ir.RowWriter.WriteRows] with a debug log noting the fallback
+//     (no PG/MySQL engine currently lacks it).
+//
+// Other phases (identity sync, indexes, constraints, views) are
+// identical to [runBulkCopy] — only the table-create + per-table
+// row copy differ.
+func runBulkCopyForAddTable(
+	ctx context.Context,
+	schema *ir.Schema,
+	rows ir.RowReader,
+	sw ir.SchemaWriter,
+	rw ir.RowWriter,
+) error {
+	if err := sw.CreateTablesWithoutConstraints(ctx, schema); err != nil {
+		return wrapWithHint(PhaseSchemaApply, fmt.Errorf("pipeline: create tables: %w", err))
+	}
+	for _, table := range schema.Tables {
+		if err := copyTableIdempotent(ctx, rows, rw, table); err != nil {
+			return wrapWithHint(PhaseBulkCopy, fmt.Errorf("pipeline: copy table %q: %w", table.Name, err))
+		}
+	}
+	if err := sw.SyncIdentitySequences(ctx, schema); err != nil {
+		return wrapWithHint(PhaseSchemaApply, fmt.Errorf("pipeline: sync identity sequences: %w", err))
+	}
+	if err := sw.CreateIndexes(ctx, schema); err != nil {
+		return wrapWithHint(PhaseIndexes, fmt.Errorf("pipeline: create indexes: %w", err))
+	}
+	if err := sw.CreateConstraints(ctx, schema); err != nil {
+		return wrapWithHint(PhaseConstraints, fmt.Errorf("pipeline: create constraints: %w", err))
+	}
+	if err := runViewsPhase(ctx, schema, sw); err != nil {
+		return wrapWithHint(PhaseViews, err)
+	}
+	return nil
+}
+
+// copyTableIdempotent is the add-table variant of [copyTable]: it
+// routes the row stream through [ir.IdempotentRowWriter.WriteRowsIdempotent]
+// when the writer exposes it (INSERT ... ON CONFLICT (pk) DO UPDATE),
+// falling back to plain [ir.RowWriter.WriteRows] otherwise. See
+// [runBulkCopyForAddTable] for the v0.24.0 → Phase B fix rationale.
+//
+// Goroutine-lifecycle handling mirrors [copyTable] exactly — same
+// child-ctx + defer-cancel shape so the row reader unwinds cleanly
+// on error.
+func copyTableIdempotent(ctx context.Context, rr ir.RowReader, rw ir.RowWriter, table *ir.Table) (retErr error) {
+	copyCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	rows, err := rr.ReadRows(copyCtx, table)
+	if err != nil {
+		return fmt.Errorf("read rows: %w", err)
+	}
+	pt := newProgressTicker(copyCtx, progressInterval, table.Name)
+	kickOffRowCount(copyCtx, rr, table, pt)
+	defer func() { pt.Stop(ctx, retErr) }()
+
+	teed := teeRows(copyCtx, rows, pt.observeRow)
+	idem, ok := rw.(ir.IdempotentRowWriter)
+	if !ok {
+		slog.DebugContext(ctx, "add-table: row writer does not implement IdempotentRowWriter; falling back to plain WriteRows (the [publication-add, snapshot-open] overlap window may surface as a duplicate-key error under sustained load)",
+			slog.String("table", table.Name),
+		)
+		if err := rw.WriteRows(copyCtx, table, teed); err != nil {
+			return fmt.Errorf("write rows: %w", err)
+		}
+		return nil
+	}
+	if err := idem.WriteRowsIdempotent(copyCtx, table, teed); err != nil {
+		return fmt.Errorf("write rows (idempotent): %w", err)
+	}
+	return nil
+}
+
 // runBulkCopyPhases is the resume-aware variant of [runBulkCopy].
 // Each of the five phases is a state-update boundary: state.Phase
 // flips before the work runs, and on success the next iteration

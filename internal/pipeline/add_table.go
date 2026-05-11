@@ -346,6 +346,41 @@ func (a *AddTable) Run(ctx context.Context) error {
 		return err
 	}
 
+	// ---- 3a. Create the target table BEFORE publication-add
+	// (ADR-0036 Phase B fix). The Phase A diagnose work pinned the
+	// v0.24.0 residual loss surface to the PG applier's
+	// `errUnknownTable` silent-drop path: events on the new table
+	// reach the applier after publication-add, but if the target
+	// table has not yet been created (the original order ran
+	// publication-add → snapshot → runBulkCopy, with CREATE TABLE
+	// inside runBulkCopy), the applier silently skips them with a
+	// "skipping CDC event for unknown target table" warning. The
+	// missing rows in Phase A.3's verdict captures (1-3 per run,
+	// always from the loader tail of the burst) are exactly the
+	// events received in this race window.
+	//
+	// Reordering CREATE TABLE to before publication-add eliminates
+	// the race: by the time pgoutput begins decoding events on the
+	// new table, the target table is already in place and the
+	// applier's dispatch path succeeds. The CREATE TABLE statement
+	// itself is idempotent (CREATE TABLE IF NOT EXISTS — both
+	// engines); the later runBulkCopy phase no-ops on the
+	// already-existing table. See ADR-0036 § Phase B for the full
+	// drop-site analysis.
+	//
+	// MySQL: this step is engine-symmetric; the schema writer's
+	// CreateTablesWithoutConstraints uses CREATE TABLE IF NOT EXISTS
+	// on both engines (internal/engines/mysql/schema_writer.go,
+	// internal/engines/postgres/schema_writer.go). MySQL's
+	// filter-flip mechanism (ADR-0034) gates dispatch on
+	// `live_added_tables` membership, so the same race didn't
+	// manifest there in v0.24.0; the early-create is still the
+	// correct shape — it removes engine-specific timing assumptions
+	// from the orchestrator.
+	if err := sw.CreateTablesWithoutConstraints(ctx, scoped); err != nil {
+		return wrapWithHint(PhaseSchemaApply, fmt.Errorf("pipeline: add-table: create target table: %w", err))
+	}
+
 	// ---- 4. Extend the publication scope (Postgres) BEFORE the
 	// snapshot's slot is created so the slot's pinned catalog
 	// snapshot already includes the new table in publication scope.
@@ -439,12 +474,28 @@ func (a *AddTable) Run(ctx context.Context) error {
 		}
 	}
 
-	// ---- 6. Bulk-copy the single table. runBulkCopy creates the
-	// table (IF NOT EXISTS), copies rows, syncs identity sequences,
-	// emits indexes and FKs scoped to scoped.Tables. FKs to existing
-	// target tables are added; FKs to tables not present on the
-	// target surface a clear engine-side error.
-	if err := runBulkCopy(ctx, scoped, stream.Rows, sw, rw); err != nil {
+	// ---- 6. Bulk-copy the single table. runBulkCopyForAddTable
+	// re-runs CreateTablesWithoutConstraints (idempotent no-op given
+	// the early-create in step 3a above), copies rows via the
+	// idempotent INSERT path when the row writer exposes one,
+	// syncs identity sequences, emits indexes and FKs scoped to
+	// scoped.Tables. FKs to existing target tables are added; FKs to
+	// tables not present on the target surface a clear engine-side
+	// error.
+	//
+	// ADR-0036 Phase B: the idempotent INSERT path is what makes
+	// the early-create step (3a) safe under load. With the table
+	// in place before publication-add, the active stream's applier
+	// may already have applied a small number of CDC INSERTs by
+	// the time bulk-copy reaches those rows. A plain COPY would
+	// fail with a duplicate-key error on those rows and abort the
+	// entire COPY. WriteRowsIdempotent generates INSERT ... ON
+	// CONFLICT (pk) DO UPDATE so the bulk-copy absorbs the
+	// [publication-add, snapshot-open] overlap window cleanly.
+	// Engines without [ir.IdempotentRowWriter] (none today; PG and
+	// MySQL both implement it) fall back to plain WriteRows with a
+	// debug log noting the fallback.
+	if err := runBulkCopyForAddTable(ctx, scoped, stream.Rows, sw, rw); err != nil {
 		return err
 	}
 

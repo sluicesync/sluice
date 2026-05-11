@@ -205,8 +205,21 @@ func TestAddTableHappyPath(t *testing.T) {
 	if src.snapshotCalls != 1 {
 		t.Errorf("snapshot opens = %d; want 1", src.snapshotCalls)
 	}
-	// Bulk-copy phases ran on the target.
+	// Bulk-copy phases ran on the target. ADR-0036 Phase B: the
+	// orchestrator pre-creates the target table BEFORE publication-add
+	// (step 3a in AddTable.Run) so events on the new table delivered
+	// to the active stream's applier between publication-add and
+	// bulk-copy don't hit the applier's errUnknownTable silent-drop
+	// branch. The CreateTablesWithoutConstraints inside
+	// runBulkCopyForAddTable is therefore idempotent (CREATE TABLE IF
+	// NOT EXISTS on both engines); it appears in the phase log twice
+	// because the recording stub doesn't distinguish second-call
+	// no-op from a first-time create. The recordingRowWriterEmpty
+	// stub doesn't implement ir.IdempotentRowWriter, so the bulk-copy
+	// falls back to plain WriteRows — exactly what the phase log
+	// records.
 	wantPhases := []string{
+		"CreateTablesWithoutConstraints",
 		"CreateTablesWithoutConstraints",
 		"WriteRows:new_table",
 		"SyncIdentitySequences",
