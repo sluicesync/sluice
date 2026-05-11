@@ -289,6 +289,116 @@ func TestParseGeometrySubtype(t *testing.T) {
 	}
 }
 
+// TestDimensionFlagsFromCoordDim pins the PostGIS two-channel
+// dimension-encoding mapping (Bug 53). The function combines the
+// `type` column's optional Z / M / ZM suffix with the
+// `coord_dimension` column to recover the orthogonal Z / M flags
+// PostGIS stores in different places for different cases.
+func TestDimensionFlagsFromCoordDim(t *testing.T) {
+	cases := []struct {
+		name     string
+		typeName string
+		coordDim int
+		wantZ    bool
+		wantM    bool
+	}{
+		// 2D — coord_dimension=2 means no flags regardless of type.
+		{"POINT 2D", "POINT", 2, false, false},
+		{"POLYGON 2D", "POLYGON", 2, false, false},
+
+		// 3D — coord_dimension=3 disambiguates by type suffix.
+		// "POINT" + cd=3 → XYZ (Z only). "POINTM" + cd=3 → XYM (M only).
+		{"POINT cd=3 → POINTZ", "POINT", 3, true, false},
+		{"POLYGON cd=3 → POLYGONZ", "POLYGON", 3, true, false},
+		{"POINTM cd=3 → M-only", "POINTM", 3, false, true},
+		{"LINESTRINGM cd=3 → M-only", "LINESTRINGM", 3, false, true},
+
+		// 4D — coord_dimension=4 unambiguously XYZM.
+		{"POINT cd=4 → POINTZM", "POINT", 4, true, true},
+		{"POLYGONZM cd=4 → POINTZM", "POLYGONZM", 4, true, true},
+
+		// Mixed-case (geography_columns shape) — the helper
+		// upper-cases internally so dispatch survives PostGIS's
+		// inconsistent casing across views.
+		{"Point cd=3 → Z (mixed-case)", "Point", 3, true, false},
+		{"LineStringM cd=3 → M (mixed-case)", "LineStringM", 3, false, true},
+
+		// Unknown coord_dimension → no flags (degrade gracefully).
+		{"unknown cd=1", "POINT", 1, false, false},
+		{"unknown cd=5", "POINT", 5, false, false},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			gotZ, gotM := dimensionFlagsFromCoordDim(c.typeName, c.coordDim)
+			if gotZ != c.wantZ {
+				t.Errorf("hasZ = %v; want %v", gotZ, c.wantZ)
+			}
+			if gotM != c.wantM {
+				t.Errorf("hasM = %v; want %v", gotM, c.wantM)
+			}
+		})
+	}
+}
+
+// TestTranslateType_GeometryCoordDimensionMerge pins the OR-merge in
+// translateType: the schema reader's coord_dimension-derived flags
+// on `c.GeometryInfo.HasZ` / `.HasM` combine with the type-string
+// parsing inside parseGeometrySubtype. Either source alone may be
+// load-bearing; the merged result is what the IR carries.
+func TestTranslateType_GeometryCoordDimensionMerge(t *testing.T) {
+	cases := []struct {
+		name string
+		info *geometryColumnInfo
+		want ir.Geometry
+	}{
+		{
+			// Canonical POINTZ: type='POINT', reader sets HasZ from cd=3.
+			"POINTZ via coord_dimension",
+			&geometryColumnInfo{Subtype: "POINT", SRID: 4326, HasZ: true},
+			ir.Geometry{Subtype: ir.GeometryPoint, SRID: 4326, HasZ: true},
+		},
+		{
+			// LINESTRINGM: type='LINESTRINGM', reader sets HasM from cd=3.
+			// Both channels carry the M signal; OR-merge preserves it.
+			"LINESTRINGM via both channels",
+			&geometryColumnInfo{Subtype: "LINESTRINGM", SRID: 0, HasM: true},
+			ir.Geometry{Subtype: ir.GeometryLineString, SRID: 0, HasM: true},
+		},
+		{
+			// POLYGONZM via coord_dimension=4: type='POLYGON', reader
+			// sets both flags. parseGeometrySubtype contributes nothing.
+			"POLYGONZM via coord_dimension only",
+			&geometryColumnInfo{Subtype: "POLYGON", SRID: 4326, HasZ: true, HasM: true},
+			ir.Geometry{Subtype: ir.GeometryPolygon, SRID: 4326, HasZ: true, HasM: true},
+		},
+		{
+			// Defensive: pre-Bug-53 IR with type='POINTZ' and reader
+			// flags empty. parseGeometrySubtype still recovers the Z
+			// from the type-string suffix.
+			"POINTZ via type-string fallback (pre-Bug-53)",
+			&geometryColumnInfo{Subtype: "POINTZ", SRID: 4326},
+			ir.Geometry{Subtype: ir.GeometryPoint, SRID: 4326, HasZ: true},
+		},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			got, err := translateType(columnMeta{
+				DataType:     "USER-DEFINED",
+				UDTName:      "geometry",
+				GeometryInfo: c.info,
+			})
+			if err != nil {
+				t.Fatalf("translateType: %v", err)
+			}
+			if !reflect.DeepEqual(got, c.want) {
+				t.Errorf("\n got:  %#v\nwant: %#v", got, c.want)
+			}
+		})
+	}
+}
+
 func TestTranslateTypeErrors(t *testing.T) {
 	cases := []struct {
 		name string

@@ -108,6 +108,19 @@ type geometryColumnInfo struct {
 	// translator uses this to set [ir.Geometry.IsGeography] so the PG
 	// writer emits `geography(...)` instead of `geometry(...)`.
 	IsGeography bool
+	// HasZ / HasM are populated by the schema reader from the
+	// geometry_columns / geography_columns view's `coord_dimension`
+	// column. PostGIS encodes dimensional variants in a two-channel
+	// shape: the M-only case (POINTM, LINESTRINGM) puts an "M" suffix
+	// in the view's `type` column AND records coord_dimension=3, but
+	// the Z and ZM cases (POINTZ, POINTZM) leave the view's `type`
+	// column as the 2D base name and signal the dimension only via
+	// coord_dimension=3 / =4. The translator's parseGeometrySubtype
+	// extracts what's encoded in the type string; these flags carry
+	// the orthogonal signal from coord_dimension. Final
+	// [ir.Geometry.HasZ] / [ir.Geometry.HasM] are the OR-merge.
+	HasZ bool
+	HasM bool
 }
 
 // translateType maps a Postgres column's metadata to an IR type. The
@@ -171,13 +184,18 @@ func translateType(c columnMeta) (ir.Type, error) {
 					IsGeography: c.UDTName == "geography",
 				}, nil
 			}
-			subtype, hasZ, hasM := parseGeometrySubtype(c.GeometryInfo.Subtype)
+			subtype, parsedZ, parsedM := parseGeometrySubtype(c.GeometryInfo.Subtype)
 			return ir.Geometry{
 				Subtype:     subtype,
 				SRID:        c.GeometryInfo.SRID,
 				IsGeography: c.GeometryInfo.IsGeography,
-				HasZ:        hasZ,
-				HasM:        hasM,
+				// OR-merge: the type-string parsing covers the M-only
+				// case where PostGIS records the suffix in `type`; the
+				// schema reader's coord_dimension capture covers the Z
+				// and ZM cases where PostGIS records the dimension out
+				// of band in coord_dimension. Bug 53.
+				HasZ: parsedZ || c.GeometryInfo.HasZ,
+				HasM: parsedM || c.GeometryInfo.HasM,
 			}, nil
 		}
 		// ADR-0032 hint: if udt_name matches a known extension type

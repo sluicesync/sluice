@@ -284,7 +284,7 @@ func (r *SchemaReader) readEnumValues(ctx context.Context) (map[string][]string,
 // column.
 func (r *SchemaReader) readGeometryColumnInfo(ctx context.Context) (map[string]geometryColumnInfo, error) {
 	const q = `
-		SELECT f_table_name, f_geometry_column, type, srid
+		SELECT f_table_name, f_geometry_column, type, srid, coord_dimension
 		FROM   geometry_columns
 		WHERE  f_table_schema = $1`
 
@@ -308,16 +308,53 @@ func (r *SchemaReader) readGeometryColumnInfo(ctx context.Context) (map[string]g
 			tableName, columnName string
 			subtype               string
 			srid                  int64
+			coordDim              int
 		)
-		if err := rows.Scan(&tableName, &columnName, &subtype, &srid); err != nil {
+		if err := rows.Scan(&tableName, &columnName, &subtype, &srid, &coordDim); err != nil {
 			return nil, err
 		}
+		hasZ, hasM := dimensionFlagsFromCoordDim(subtype, coordDim)
 		out[tableName+"."+columnName] = geometryColumnInfo{
 			Subtype: subtype,
 			SRID:    int(srid),
+			HasZ:    hasZ,
+			HasM:    hasM,
 		}
 	}
 	return out, rows.Err()
+}
+
+// dimensionFlagsFromCoordDim maps PostGIS's two-channel dimension
+// encoding (the type column's optional Z / M / ZM suffix plus the
+// coord_dimension column) to the IR's orthogonal HasZ / HasM flags.
+// Bug 53: pre-fix the reader only consulted the type column, missing
+// the canonical Z and ZM cases where PostGIS records the dimension
+// in coord_dimension and leaves the type column as the 2D base name.
+//
+// PostGIS's encoding rules per the catalog reference:
+//
+//   - coord_dimension = 2: 2D (XY), no dimensional flags.
+//   - coord_dimension = 3: 3D — either XYZ (Z only) or XYM (M only).
+//     The two are distinguished by whether the type column ends in
+//     "M": "POINTM" → M; "POINT" with coord_dimension=3 → Z.
+//   - coord_dimension = 4: 4D (XYZM), both flags.
+//
+// The returned flags are layered on top of the type-string parsing
+// done by parseGeometrySubtype; the translator OR-merges the two
+// sources so neither alone is load-bearing for the M-suffix case.
+func dimensionFlagsFromCoordDim(typeName string, coordDim int) (hasZ, hasM bool) {
+	upper := strings.ToUpper(typeName)
+	typeHasM := strings.HasSuffix(upper, "M") && !strings.HasSuffix(upper, "ZM")
+	switch coordDim {
+	case 4:
+		return true, true
+	case 3:
+		if typeHasM {
+			return false, true
+		}
+		return true, false
+	}
+	return false, false
 }
 
 // readGeographyColumnInfo is the parallel of [readGeometryColumnInfo]
@@ -333,7 +370,7 @@ func (r *SchemaReader) readGeometryColumnInfo(ctx context.Context) (map[string]g
 // path handles missing entries).
 func (r *SchemaReader) readGeographyColumnInfo(ctx context.Context) (map[string]geometryColumnInfo, error) {
 	const q = `
-		SELECT f_table_name, f_geography_column, type, srid
+		SELECT f_table_name, f_geography_column, type, srid, coord_dimension
 		FROM   geography_columns
 		WHERE  f_table_schema = $1`
 
@@ -352,14 +389,18 @@ func (r *SchemaReader) readGeographyColumnInfo(ctx context.Context) (map[string]
 			tableName, columnName string
 			subtype               string
 			srid                  int64
+			coordDim              int
 		)
-		if err := rows.Scan(&tableName, &columnName, &subtype, &srid); err != nil {
+		if err := rows.Scan(&tableName, &columnName, &subtype, &srid, &coordDim); err != nil {
 			return nil, err
 		}
+		hasZ, hasM := dimensionFlagsFromCoordDim(subtype, coordDim)
 		out[tableName+"."+columnName] = geometryColumnInfo{
 			Subtype:     subtype,
 			SRID:        int(srid),
 			IsGeography: true,
+			HasZ:        hasZ,
+			HasM:        hasM,
 		}
 	}
 	return out, rows.Err()
