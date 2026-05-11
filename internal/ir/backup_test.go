@@ -43,6 +43,8 @@ func TestMarshalType_RoundTrip(t *testing.T) {
 		{"Cidr", Cidr{}},
 		{"Macaddr", Macaddr{}},
 		{"Geometry point SRID", Geometry{Subtype: GeometryPoint, SRID: 4326}},
+		{"Geography point SRID 4326", Geometry{Subtype: GeometryPoint, SRID: 4326, IsGeography: true}},
+		{"Geography polygon", Geometry{Subtype: GeometryPolygon, SRID: 4326, IsGeography: true}},
 		{"Array of Integer", Array{Element: Integer{Width: 32}}},
 		{"Array of UUID", Array{Element: UUID{}}},
 		{"Array of nil element", Array{Element: nil}},

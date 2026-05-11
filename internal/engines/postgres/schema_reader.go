@@ -122,18 +122,23 @@ func (r *SchemaReader) ReadSchema(ctx context.Context) (*ir.Schema, error) {
 			return nil, fmt.Errorf("postgres: read enum values: %w", err)
 		}
 
-		// PostGIS's geometry_columns view holds per-column subtype +
-		// SRID that information_schema flattens away. Lookup is
-		// best-effort — the view exists only when PostGIS is installed,
-		// and a schema with no geometry columns has no rows there.
-		// Either way, the translator degrades gracefully via
-		// GeometryUnspecified + SRID=0 when no info shows up.
+		// PostGIS's geometry_columns / geography_columns views hold the
+		// per-column subtype + SRID that information_schema flattens
+		// away. Lookup is best-effort — the views exist only when
+		// PostGIS is installed, and a schema with no spatial columns
+		// has no rows there. Either way, the translator degrades
+		// gracefully via GeometryUnspecified + SRID=0 when no info
+		// shows up.
 		geomInfo, err := r.readGeometryColumnInfo(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("postgres: read geometry columns: %w", err)
 		}
+		geogInfo, err := r.readGeographyColumnInfo(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("postgres: read geography columns: %w", err)
+		}
 
-		if err := r.populateColumns(ctx, tables, enumValues, geomInfo); err != nil {
+		if err := r.populateColumns(ctx, tables, enumValues, geomInfo, geogInfo); err != nil {
 			return nil, fmt.Errorf("postgres: read columns: %w", err)
 		}
 		if err := r.populateIndexes(ctx, tables); err != nil {
@@ -315,6 +320,51 @@ func (r *SchemaReader) readGeometryColumnInfo(ctx context.Context) (map[string]g
 	return out, rows.Err()
 }
 
+// readGeographyColumnInfo is the parallel of [readGeometryColumnInfo]
+// for PostGIS `geography` columns. PostGIS exposes them via the
+// geography_columns view (same columns: f_table_schema /
+// f_table_name / f_geography_column / type / srid). The result is
+// keyed the same way ("<table>.<column>"); the resulting entries
+// carry IsGeography=true so the translator selects the geography IR
+// shape.
+//
+// As with the geometry lookup: PostGIS-absent → "relation doesn't
+// exist" → empty map (the translator's existing graceful-degradation
+// path handles missing entries).
+func (r *SchemaReader) readGeographyColumnInfo(ctx context.Context) (map[string]geometryColumnInfo, error) {
+	const q = `
+		SELECT f_table_name, f_geography_column, type, srid
+		FROM   geography_columns
+		WHERE  f_table_schema = $1`
+
+	rows, err := r.db.QueryContext(ctx, q, r.schema)
+	if err != nil {
+		if isUndefinedRelationErr(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	out := map[string]geometryColumnInfo{}
+	for rows.Next() {
+		var (
+			tableName, columnName string
+			subtype               string
+			srid                  int64
+		)
+		if err := rows.Scan(&tableName, &columnName, &subtype, &srid); err != nil {
+			return nil, err
+		}
+		out[tableName+"."+columnName] = geometryColumnInfo{
+			Subtype:     subtype,
+			SRID:        int(srid),
+			IsGeography: true,
+		}
+	}
+	return out, rows.Err()
+}
+
 // isUndefinedRelationErr returns true when err looks like Postgres's
 // "relation X does not exist" / SQLSTATE 42P01. The schema reader's
 // PostGIS lookup uses this to degrade gracefully when the extension
@@ -327,7 +377,9 @@ func isUndefinedRelationErr(err error) bool {
 	// Postgres surfaces this through pgx as a string starting with
 	// "ERROR: relation \"...\" does not exist (SQLSTATE 42P01)".
 	return strings.Contains(msg, "does not exist") &&
-		(strings.Contains(msg, "geometry_columns") || strings.Contains(msg, "42P01"))
+		(strings.Contains(msg, "geometry_columns") ||
+			strings.Contains(msg, "geography_columns") ||
+			strings.Contains(msg, "42P01"))
 }
 
 // populateColumns fills in Column lists for each table.
@@ -346,7 +398,7 @@ func isUndefinedRelationErr(err error) bool {
 // server_encoding is global — so the Charset field on the IR types
 // stays empty for PG sources. MySQL writers accept that as "use the
 // table / database default."
-func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*ir.Table, enumValues map[string][]string, geomInfo map[string]geometryColumnInfo) error {
+func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*ir.Table, enumValues map[string][]string, geomInfo, geogInfo map[string]geometryColumnInfo) error {
 	// COALESCE(a.atttypmod, -1) supplies the per-column typmod for
 	// extension-owned types whose modifiers ride on atttypmod
 	// (pgvector dimension; future PostGIS subtype/SRID). -1 is the
@@ -439,14 +491,32 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 			if values, ok := enumValues[udtName]; ok {
 				meta.EnumValues = values
 			}
-			// PostGIS geometry: look up subtype + SRID from the
-			// per-column info we read out of geometry_columns. A
-			// missing entry is fine — the translator handles
-			// GeometryInfo=nil by emitting GeometryUnspecified.
-			if udtName == "geometry" {
+			// PostGIS geometry / geography: look up subtype + SRID from
+			// the per-column info we read out of geometry_columns /
+			// geography_columns. A missing entry is fine — the
+			// translator handles GeometryInfo=nil by emitting
+			// GeometryUnspecified. The geography_columns entry carries
+			// IsGeography=true, which propagates through to
+			// [ir.Geometry.IsGeography].
+			switch udtName {
+			case "geometry":
 				if info, ok := geomInfo[tableName+"."+colName]; ok {
 					info := info
 					meta.GeometryInfo = &info
+				}
+			case "geography":
+				if info, ok := geogInfo[tableName+"."+colName]; ok {
+					info := info
+					meta.GeometryInfo = &info
+				} else {
+					// Fallback: the operator may have a `geography`
+					// column declared without a typmod (no row in
+					// geography_columns? — rare, since PostGIS always
+					// populates the view). Synthesize a minimal entry
+					// so the translator dispatches to the geography
+					// branch with default subtype/SRID rather than
+					// falling through to the user-defined hint path.
+					meta.GeometryInfo = &geometryColumnInfo{IsGeography: true}
 				}
 			}
 
@@ -901,8 +971,8 @@ func looksLikeNumber(s string) bool {
 }
 
 // indexKindFrom maps a Postgres index access method name to an IR
-// IndexKind. Methods we don't currently model (spgist, brin) become
-// IndexKindUnspecified.
+// IndexKind. Unknown methods become IndexKindUnspecified, which the
+// writer dispatch translates back to PG's default (btree).
 func indexKindFrom(method string) ir.IndexKind {
 	switch method {
 	case "btree":
@@ -913,6 +983,10 @@ func indexKindFrom(method string) ir.IndexKind {
 		return ir.IndexKindGIN
 	case "gist":
 		return ir.IndexKindGIST
+	case "spgist":
+		return ir.IndexKindSPGist
+	case "brin":
+		return ir.IndexKindBRIN
 	default:
 		return ir.IndexKindUnspecified
 	}

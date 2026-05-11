@@ -168,6 +168,58 @@ func TestTranslateTypeGeometry(t *testing.T) {
 	}
 }
 
+// TestTranslateTypeGeography covers the PostGIS geography path
+// (parallel to TestTranslateTypeGeometry). The IsGeography flag on
+// the info struct propagates through to [ir.Geometry.IsGeography] so
+// the PG writer emits `geography(...)` rather than `geometry(...)`.
+// Without info (PostGIS schema-reader saw `geography` udt_name but
+// the lookup returned nothing), the translator falls back to
+// GeometryUnspecified+IsGeography=true based on the udt_name alone.
+func TestTranslateTypeGeography(t *testing.T) {
+	cases := []struct {
+		name string
+		info *geometryColumnInfo
+		want ir.Geometry
+	}{
+		{
+			"point with default srid 4326",
+			&geometryColumnInfo{Subtype: "POINT", SRID: 4326, IsGeography: true},
+			ir.Geometry{Subtype: ir.GeometryPoint, SRID: 4326, IsGeography: true},
+		},
+		{
+			"polygon",
+			&geometryColumnInfo{Subtype: "POLYGON", SRID: 4326, IsGeography: true},
+			ir.Geometry{Subtype: ir.GeometryPolygon, SRID: 4326, IsGeography: true},
+		},
+		{
+			"unspecified geography",
+			&geometryColumnInfo{Subtype: "GEOMETRY", SRID: 4326, IsGeography: true},
+			ir.Geometry{Subtype: ir.GeometryUnspecified, SRID: 4326, IsGeography: true},
+		},
+		{
+			"no info (udt_name geography but lookup empty) keeps IsGeography",
+			nil,
+			ir.Geometry{Subtype: ir.GeometryUnspecified, IsGeography: true},
+		},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			got, err := translateType(columnMeta{
+				DataType:     "USER-DEFINED",
+				UDTName:      "geography",
+				GeometryInfo: c.info,
+			})
+			if err != nil {
+				t.Fatalf("translateType: %v", err)
+			}
+			if !reflect.DeepEqual(got, c.want) {
+				t.Errorf("\n got:  %#v\nwant: %#v", got, c.want)
+			}
+		})
+	}
+}
+
 // TestParseGeometrySubtype maps every PostGIS-canonical subtype
 // string to the IR enum. Unknown strings (and the empty string)
 // return GeometryUnspecified — the wildcard.

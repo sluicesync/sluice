@@ -159,16 +159,30 @@ func (a Array) String() string {
 type Geometry struct {
 	Subtype GeometrySubtype
 	SRID    int
+	// IsGeography flags this column as PostGIS `geography` rather than
+	// `geometry`. PG's two spatial types share a WKB/EWKB wire shape
+	// and subtype enumeration, so they ride on the same IR variant;
+	// the boolean lets the PG writer emit `geography(<subtype>, <srid>)`
+	// vs `geometry(<subtype>, <srid>)` and lets the spatial-index
+	// opclass set route correctly. Engines without a distinct
+	// geography type (MySQL) ignore the flag — geography flattens to
+	// geometry on those targets, losing the spherical-operator
+	// semantics but preserving values.
+	IsGeography bool
 }
 
 func (Geometry) isType()    {}
 func (Geometry) Tier() Tier { return TierExtension }
 
 func (g Geometry) String() string {
-	if g.SRID == 0 {
-		return fmt.Sprintf("Geometry[%s]", g.Subtype)
+	name := "Geometry"
+	if g.IsGeography {
+		name = "Geography"
 	}
-	return fmt.Sprintf("Geometry[%s,SRID=%d]", g.Subtype, g.SRID)
+	if g.SRID == 0 {
+		return fmt.Sprintf("%s[%s]", name, g.Subtype)
+	}
+	return fmt.Sprintf("%s[%s,SRID=%d]", name, g.Subtype, g.SRID)
 }
 
 // Inet represents an IPv4 or IPv6 host address (Postgres inet).

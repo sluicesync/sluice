@@ -88,7 +88,8 @@ type columnMeta struct {
 }
 
 // geometryColumnInfo carries PostGIS's per-column metadata as
-// surfaced by the geometry_columns view.
+// surfaced by the geometry_columns view (and the parallel
+// geography_columns view for PostGIS `geography` columns).
 type geometryColumnInfo struct {
 	// Subtype is the PostGIS bareword from geometry_columns.type, e.g.
 	// "POINT", "POLYGON", "GEOMETRY". Empty when no row matched (the
@@ -96,8 +97,16 @@ type geometryColumnInfo struct {
 	// callers seeing the empty string treat it the same way).
 	Subtype string
 	// SRID is geometry_columns.srid. PostGIS uses 0 to mean "unknown
-	// CRS", which matches sluice's IR default.
+	// CRS", which matches sluice's IR default. PostGIS's
+	// geography_columns view defaults SRID to 4326 (WGS84) when the
+	// column was declared without an explicit modifier; the reader
+	// passes the view's value through unchanged.
 	SRID int
+	// IsGeography is true when this entry came from PostGIS's
+	// geography_columns view (rather than geometry_columns). The
+	// translator uses this to set [ir.Geometry.IsGeography] so the PG
+	// writer emits `geography(...)` instead of `geometry(...)`.
+	IsGeography bool
 }
 
 // translateType maps a Postgres column's metadata to an IR type. The
@@ -141,21 +150,30 @@ func translateType(c columnMeta) (ir.Type, error) {
 		if c.EnumValues != nil {
 			return ir.Enum{Values: c.EnumValues}, nil
 		}
-		// PostGIS geometry. information_schema reports the column as
-		// USER-DEFINED with udt_name="geometry"; subtype + SRID live
-		// in PostGIS's own geometry_columns view, which the schema
-		// reader queries separately and stashes on the columnMeta
-		// before invoking the translator. When that lookup returns
-		// nothing (PostGIS not installed, view doesn't know this
-		// column, or the schema reader is the older unaware version),
-		// we degrade gracefully to GeometryUnspecified+SRID=0.
-		if c.UDTName == "geometry" {
+		// PostGIS geometry / geography. information_schema reports
+		// both as USER-DEFINED with udt_name="geometry" / "geography";
+		// subtype + SRID live in PostGIS's own geometry_columns /
+		// geography_columns views, which the schema reader queries
+		// separately and stashes on the columnMeta before invoking the
+		// translator. When that lookup returns nothing (PostGIS not
+		// installed, view doesn't know this column, or the schema
+		// reader is the older unaware version), we degrade gracefully
+		// to GeometryUnspecified+SRID=0. The IsGeography flag rides
+		// on c.GeometryInfo so the IR's [ir.Geometry.IsGeography]
+		// preserves the source's geography-vs-geometry distinction
+		// for same-engine PG → PG; cross-engine targets ignore the
+		// flag and flatten to their generic spatial type.
+		if c.UDTName == "geometry" || c.UDTName == "geography" {
 			if c.GeometryInfo == nil {
-				return ir.Geometry{Subtype: ir.GeometryUnspecified}, nil
+				return ir.Geometry{
+					Subtype:     ir.GeometryUnspecified,
+					IsGeography: c.UDTName == "geography",
+				}, nil
 			}
 			return ir.Geometry{
-				Subtype: parseGeometrySubtype(c.GeometryInfo.Subtype),
-				SRID:    c.GeometryInfo.SRID,
+				Subtype:     parseGeometrySubtype(c.GeometryInfo.Subtype),
+				SRID:        c.GeometryInfo.SRID,
+				IsGeography: c.GeometryInfo.IsGeography,
 			}, nil
 		}
 		// ADR-0032 hint: if udt_name matches a known extension type

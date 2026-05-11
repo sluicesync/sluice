@@ -254,6 +254,10 @@ func (DefaultExpression) isDefaultValue() {}
 type IndexKind uint8
 
 // Recognised IndexKind values.
+//
+// Append-only: enum values are persisted as uint8 in the backup
+// envelope (manifest.IndexKind). Reordering or removing existing
+// values silently corrupts older manifests; new kinds get appended.
 const (
 	IndexKindUnspecified IndexKind = iota
 	IndexKindBTree
@@ -262,6 +266,8 @@ const (
 	IndexKindGIST
 	IndexKindFullText
 	IndexKindSpatial
+	IndexKindSPGist
+	IndexKindBRIN
 )
 
 func (k IndexKind) String() string {
@@ -278,6 +284,10 @@ func (k IndexKind) String() string {
 		return "fulltext"
 	case IndexKindSpatial:
 		return "spatial"
+	case IndexKindSPGist:
+		return "spgist"
+	case IndexKindBRIN:
+		return "brin"
 	case IndexKindUnspecified:
 		return "unspecified"
 	default:

@@ -331,6 +331,25 @@ func TestEmitColumnTypeGeometry(t *testing.T) {
 		{"polygon", ir.Geometry{Subtype: ir.GeometryPolygon, SRID: 3857}, "geometry(POLYGON, 3857)", true, false},
 		{"unspecified", ir.Geometry{Subtype: ir.GeometryUnspecified}, "geometry(GEOMETRY, 0)", true, false},
 		{"multipoint", ir.Geometry{Subtype: ir.GeometryMultiPoint}, "geometry(MULTIPOINT, 0)", true, false},
+		// IsGeography flips the type name to `geography(...)`. Bug 49:
+		// without this branch the PG writer emitted geography columns
+		// as `geometry(...)` (or, before this fix, the schema reader
+		// refused upstream).
+		{
+			"geography point srid 4326",
+			ir.Geometry{Subtype: ir.GeometryPoint, SRID: 4326, IsGeography: true},
+			"geography(POINT, 4326)", true, false,
+		},
+		{
+			"geography polygon srid 4326",
+			ir.Geometry{Subtype: ir.GeometryPolygon, SRID: 4326, IsGeography: true},
+			"geography(POLYGON, 4326)", true, false,
+		},
+		{
+			"geography unspecified",
+			ir.Geometry{Subtype: ir.GeometryUnspecified, IsGeography: true},
+			"geography(GEOMETRY, 0)", true, false,
+		},
 	}
 	for _, c := range cases {
 		c := c

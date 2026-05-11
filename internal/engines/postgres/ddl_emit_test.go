@@ -880,6 +880,29 @@ func TestEmitCreateIndex(t *testing.T) {
 			want: `CREATE INDEX "users_containers_pickup_status" ON "public"."users" USING btree (((meta->>'color')));`,
 		},
 		{
+			// SP-GiST round-trip (Bug 50): pre-fix the enum was
+			// IndexKindUnspecified for spgist and the writer dropped
+			// the AM, falling back to btree. With the enum populated
+			// the writer emits `USING spgist`.
+			name: "spgist index",
+			idx: &ir.Index{
+				Name:    "geom_spgist",
+				Kind:    ir.IndexKindSPGist,
+				Columns: []ir.IndexColumn{{Column: "geom", OperatorClass: "spgist_geometry_ops_2d"}},
+			},
+			want: `CREATE INDEX "users_geom_spgist" ON "public"."users" USING spgist ("geom" spgist_geometry_ops_2d);`,
+		},
+		{
+			// BRIN round-trip (Bug 50): same shape as SP-GiST above.
+			name: "brin index",
+			idx: &ir.Index{
+				Name:    "geom_brin",
+				Kind:    ir.IndexKindBRIN,
+				Columns: []ir.IndexColumn{{Column: "geom", OperatorClass: "brin_geometry_inclusion_ops_2d"}},
+			},
+			want: `CREATE INDEX "users_geom_brin" ON "public"."users" USING brin ("geom" brin_geometry_inclusion_ops_2d);`,
+		},
+		{
 			// Untagged expression (older IR / hand-built fixtures)
 			// emits verbatim — same as the pre-Bug-16-follow-up
 			// behaviour.

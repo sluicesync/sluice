@@ -139,7 +139,11 @@ func emitColumnType(t ir.Type, opts emitOpts) (string, error) {
 		if !opts.HasPostGIS {
 			return "", errors.New("postgres: GEOMETRY requires PostGIS; install with `CREATE EXTENSION postgis;` before running sluice")
 		}
-		return fmt.Sprintf("geometry(%s, %d)", postgisSubtypeName(v.Subtype), v.SRID), nil
+		typeName := "geometry"
+		if v.IsGeography {
+			typeName = "geography"
+		}
+		return fmt.Sprintf("%s(%s, %d)", typeName, postgisSubtypeName(v.Subtype), v.SRID), nil
 
 	// ADR-0032: PG → PG extension passthrough. ExtensionType columns
 	// dispatch through pgExtensionCatalog so each extension's emit
@@ -826,6 +830,10 @@ func postgresIndexMethod(k ir.IndexKind) string {
 		return "gin"
 	case ir.IndexKindGIST:
 		return "gist"
+	case ir.IndexKindSPGist:
+		return "spgist"
+	case ir.IndexKindBRIN:
+		return "brin"
 	}
 	// FullText/Spatial don't have direct Postgres builtin equivalents
 	// (FTS uses tsvector + GIN; Spatial needs PostGIS). Fall through

@@ -326,6 +326,62 @@ func TestCheckCrossEngineSupportable_PGtoMySQL_GistKindRefuses_NoOpclass(t *test
 	}
 }
 
+// TestCheckCrossEngineSupportable_PGtoMySQL_SPGistKindRefuses pins
+// the v0.33.1 broadening (Bug 50): the SP-GiST / BRIN index kinds
+// joined IndexKindGIN / IndexKindGIST as PG-only access methods with
+// no MySQL counterpart. The refusal now catches them too so the
+// operator gets a clear refusal instead of a downstream CREATE
+// INDEX failure on the MySQL target.
+func TestCheckCrossEngineSupportable_PGtoMySQL_SPGistKindRefuses(t *testing.T) {
+	s := &ir.Schema{Tables: []*ir.Table{{
+		Name: "spatial",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}},
+			{Name: "geom", Type: ir.Geometry{Subtype: ir.GeometryPoint, SRID: 4326}},
+		},
+		Indexes: []*ir.Index{
+			{
+				Name:    "spatial_geom_spgist",
+				Kind:    ir.IndexKindSPGist,
+				Columns: []ir.IndexColumn{{Column: "geom"}},
+			},
+		},
+	}}}
+	err := checkCrossEngineSupportable(s, "postgres", "mysql", "spatial-pg-mysql")
+	if err == nil {
+		t.Fatal("err = nil; want refusal for PG SP-GiST index with no MySQL counterpart")
+	}
+	if !strings.Contains(err.Error(), "SP-GiST") {
+		t.Errorf("err = %v; want mention of \"SP-GiST\"", err)
+	}
+}
+
+// TestCheckCrossEngineSupportable_PGtoMySQL_BRINKindRefuses — see
+// SP-GiST counterpart above.
+func TestCheckCrossEngineSupportable_PGtoMySQL_BRINKindRefuses(t *testing.T) {
+	s := &ir.Schema{Tables: []*ir.Table{{
+		Name: "spatial",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}},
+			{Name: "geom", Type: ir.Geometry{Subtype: ir.GeometryPoint, SRID: 4326}},
+		},
+		Indexes: []*ir.Index{
+			{
+				Name:    "spatial_geom_brin",
+				Kind:    ir.IndexKindBRIN,
+				Columns: []ir.IndexColumn{{Column: "geom"}},
+			},
+		},
+	}}}
+	err := checkCrossEngineSupportable(s, "postgres", "mysql", "spatial-pg-mysql")
+	if err == nil {
+		t.Fatal("err = nil; want refusal for PG BRIN index with no MySQL counterpart")
+	}
+	if !strings.Contains(err.Error(), "BRIN") {
+		t.Errorf("err = %v; want mention of \"BRIN\"", err)
+	}
+}
+
 // TestCheckCrossEngineSupportable_PGtoMySQL_HstoreSupportable pins
 // the hstore carve-out from the ExtensionType refusal: hstore has a
 // default MySQL translator (→ JSON) declared in the catalog's

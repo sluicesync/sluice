@@ -136,7 +136,8 @@ func unsupportablePGIndexToMySQL(tbl *ir.Table) (reason, indexName, columnRef st
 		// ivfflat / hnsw populate `idx.Method`). FULLTEXT and SPATIAL
 		// are MySQL-portable so they stay unflagged here; ir.Geometry
 		// auto-emits MySQL SPATIAL at write-time.
-		if kind := idx.Kind; kind == ir.IndexKindGIN || kind == ir.IndexKindGIST {
+		if kind := idx.Kind; kind == ir.IndexKindGIN || kind == ir.IndexKindGIST ||
+			kind == ir.IndexKindSPGist || kind == ir.IndexKindBRIN {
 			ref := ""
 			if len(idx.Columns) > 0 {
 				ref = idx.Columns[0].Column
@@ -145,8 +146,13 @@ func unsupportablePGIndexToMySQL(tbl *ir.Table) (reason, indexName, columnRef st
 				}
 			}
 			label := "GIN"
-			if kind == ir.IndexKindGIST {
+			switch kind {
+			case ir.IndexKindGIST:
 				label = "GiST"
+			case ir.IndexKindSPGist:
+				label = "SP-GiST"
+			case ir.IndexKindBRIN:
+				label = "BRIN"
 			}
 			return fmt.Sprintf("PG %s index has no MySQL counterpart", label),
 				idx.Name, ref

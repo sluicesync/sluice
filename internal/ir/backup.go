@@ -543,6 +543,7 @@ type schemaTypeEnvelope struct {
 	// Geometry.
 	GeometrySubtype uint8 `json:"geometry_subtype,omitempty"`
 	SRID            int   `json:"srid,omitempty"`
+	IsGeography     bool  `json:"is_geography,omitempty"`
 
 	// Array recursive.
 	Element json.RawMessage `json:"element,omitempty"`
@@ -631,6 +632,7 @@ func MarshalType(t Type) ([]byte, error) {
 		env.Kind = "Geometry"
 		env.GeometrySubtype = uint8(v.Subtype)
 		env.SRID = v.SRID
+		env.IsGeography = v.IsGeography
 	case Inet:
 		env.Kind = "Inet"
 	case Cidr:
@@ -703,7 +705,11 @@ func UnmarshalType(b []byte) (Type, error) {
 		}
 		return Array{Element: elem}, nil
 	case "Geometry":
-		return Geometry{Subtype: GeometrySubtype(env.GeometrySubtype), SRID: env.SRID}, nil
+		return Geometry{
+			Subtype:     GeometrySubtype(env.GeometrySubtype),
+			SRID:        env.SRID,
+			IsGeography: env.IsGeography,
+		}, nil
 	case "Inet":
 		return Inet{}, nil
 	case "Cidr":
