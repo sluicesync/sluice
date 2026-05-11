@@ -7,6 +7,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log/slog"
 	"strings"
 
 	"github.com/orware/sluice/internal/ir"
@@ -619,6 +620,24 @@ func (r *SchemaReader) populateIndexes(ctx context.Context, tables map[string]*i
 			col.OperatorClass = opclass
 		case opclass != "" && extensionOperatorClassEnabled(opclass, r.enabledExtensions):
 			col.OperatorClass = opclass
+		case opclass != "" && extensionOperatorClassRegistered(opclass):
+			// Operator-owned extension opclass on a core-PG access
+			// method (pg_trgm's `gin_trgm_ops` / `gist_trgm_ops`),
+			// but the owning extension is not in the operator's
+			// `--enable-pg-extension` allowlist. Drop the opclass
+			// from the IR per the loud-failure default, but emit
+			// a WARN so the operator can attribute the inevitable
+			// CREATE INDEX failure on the target to the missing
+			// flag rather than to a sluice-side bug.
+			ext := extensionOwningOperatorClass(opclass)
+			slog.WarnContext(ctx,
+				"postgres: schema reader: dropping extension-owned index opclass; pass --enable-pg-extension to preserve it",
+				slog.String("index", idx.Name),
+				slog.String("column", colName),
+				slog.String("opclass", opclass),
+				slog.String("extension", ext),
+				slog.String("hint", "--enable-pg-extension "+ext),
+			)
 		}
 		idx.Columns = append(idx.Columns, col)
 	}

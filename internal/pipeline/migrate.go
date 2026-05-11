@@ -312,6 +312,24 @@ func (m *Migrator) Run(ctx context.Context) error {
 		return fmt.Errorf("pipeline: apply expression overrides: %w", err)
 	}
 
+	// ---- 1.6. Cross-engine pre-flight refusal ----
+	// chain_restore has called this since v0.20.x; the simple-mode
+	// migrate path missed the wire-up. Without this, cross-engine
+	// PG → MySQL with an extension-owned index opclass (pg_trgm's
+	// gin_trgm_ops, pgvector's vector_l2_ops, etc.) gets through
+	// schema-translation and bulk-copy fine and then fails at the
+	// CREATE INDEX step on MySQL with Error 1170 — far past the
+	// point where the operator can cleanly recover. Surface the
+	// refusal here so the recovery hint names the unsupportable
+	// shape before any data moves.
+	if m.Source.Name() != m.Target.Name() {
+		if err := checkCrossEngineSupportable(
+			schema, m.Source.Name(), m.Target.Name(), "migrate",
+		); err != nil {
+			return err
+		}
+	}
+
 	if m.DryRun {
 		return m.logPlan(ctx, schema)
 	}

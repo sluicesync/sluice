@@ -534,3 +534,20 @@ func extensionOperatorClassRegistered(opclass string) bool {
 	}
 	return false
 }
+
+// extensionOwningOperatorClass returns the extension name that owns
+// `opclass` per the catalog, or "" if no extension claims it. Used by
+// the writer's error-hint path to suggest the right
+// `--enable-pg-extension <name>` flag when a CREATE INDEX fails on an
+// extension-owned opclass that the operator forgot to enable.
+func extensionOwningOperatorClass(opclass string) string {
+	if opclass == "" {
+		return ""
+	}
+	for ext, def := range pgExtensionCatalog {
+		if _, ok := def.indexOperatorClasses[opclass]; ok {
+			return ext
+		}
+	}
+	return ""
+}
