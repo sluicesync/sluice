@@ -161,12 +161,12 @@ func validateEnabledPGExtensions(source, target ir.Engine, extensions []string) 
 			if strings.TrimSpace(ext) == "hstore" {
 				return errors.New(
 					"pipeline: --enable-pg-extension hstore PG → PG is not yet supported " +
-						"(the COPY-protocol binary codec for hstore has not landed). " +
-						"Workarounds: (1) use --type-override hstore_column=text per column " +
-						"to preserve the text form on a PG target; or (2) target a " +
+						"(the COPY-protocol binary codec for hstore has not landed); " +
+						"workarounds: (1) use --type-override hstore_column=text per column " +
+						"to preserve the text form on a PG target, or (2) target a " +
 						"non-PG engine where the cross-engine translator (hstore → " +
-						"MySQL JSON) handles the value conversion. Tracked for the " +
-						"next release; remove this flag and the migration proceeds.")
+						"MySQL JSON) handles the value conversion; tracked for the " +
+						"next release — remove this flag and the migration proceeds")
 			}
 		}
 	}
