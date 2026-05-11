@@ -6,6 +6,29 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.33.0]
+
+**PostGIS completes the ADR-0032 v1 extension shortlist.** PostGIS is the final entry on the five-extension v1 shortlist per `docs/research/pg-extensions-deployment-frequency.md` — pgvector (v0.26.0), pg_trgm (post-v0.29.1), hstore + citext (v0.31.0, with v0.31.1 / v0.32.1 follow-ups), and now postgis. The cross-engine PG → MySQL PostGIS path already shipped in v0.28.0 / ADR-0035 (`ir.Geometry` + SRID round-trip + the MySQL writer's `SRID <n>` clause); this release adds the PG → PG passthrough catalog entry so spatial-index operator classes round-trip cleanly when the operator opts in via `--enable-pg-extension postgis`.
+
+### Added
+
+- **`--enable-pg-extension postgis` round-trips PostGIS spatial-index operator classes on PG → PG.** Pre-fix: a `CREATE INDEX ... USING GIST (col gist_geometry_ops_nd)` index on a PG source lost the opclass on a PG → PG migrate — the schema reader's `extensionOperatorClassRegistered` fallthrough didn't recognise PostGIS-owned opclasses (only pg_trgm's `gin_trgm_ops` / `gist_trgm_ops` and pgvector's `vector_*_ops` were declared), so the opclass dropped silently and the target index landed with PG's default opclass for the AM (which for the 2D case happens to also be `gist_geometry_ops_2d`, but diverges for nD / SP-GiST / BRIN variants). The new `pgPostGISDef` catalog entry in `internal/engines/postgres/extension_catalog.go` declares the nine canonical PostGIS opclasses (`gist_geometry_ops_2d`, `gist_geometry_ops_nd`, `gist_geography_ops`, `spgist_geometry_ops_2d` / `_3d` / `_nd`, `brin_geometry_inclusion_ops_2d` / `_4d` / `_nd`) so the existing per-opclass passthrough machinery preserves them via `ir.IndexColumn.OperatorClass` when the operator passes `--enable-pg-extension postgis`. Without the flag, the existing WARN/drop path fires (loud-failure default; mirrors pg_trgm).
+- **Actionable hint for unenabled PostGIS columns.** The schema reader's "USER-DEFINED type I don't recognise" fallthrough now surfaces `--enable-pg-extension postgis` for `geometry` / `geography` columns when the operator forgot the flag — same shape as the v0.31.0 hint for hstore / citext. The mechanism is a new `extensionDef.hintTypeNames` field that lets the catalog claim ownership of types for the hint path WITHOUT routing them through the catalog's build/emit machinery (PostGIS's `geometry` rides on `ir.Geometry` per ADR-0035, not `ir.ExtensionType` — `typesByName` stays empty).
+- **ADR-0032 v1 shortlist complete.** The five extensions named in the original research doc — vector, pg_trgm, hstore, citext, postgis — are all shipped. The ADR's status block records postgis under "shipped"; the deferred-tier follow-ups (Tier 3 uuid-ossp / pgcrypto for function-in-defaults) remain on the roadmap as v2 candidates.
+
+### Migration / Compatibility
+
+- **No format-breaking changes.** No CLI changes, no on-disk format changes, no engine-interface changes. `extensionDef` gains a new optional `hintTypeNames` field; per-extension entries that don't need it leave it nil/empty.
+- **Drop-in upgrade from v0.32.2.** The PostGIS catalog entry only fires when the operator passes `--enable-pg-extension postgis`; existing PG → PG migrations that didn't use spatial indexes are unaffected. Pre-existing PG → MySQL PostGIS operators (the v0.28.0 / ADR-0035 path) are unaffected — that flow doesn't use the extension flag.
+- **Cross-engine PG → MySQL `--enable-pg-extension postgis` stays refused** at `validateEnabledPGExtensions` (postgis is not in `crossEngineDefaultTranslatedExtensions`). The cross-engine geometry path requires no flag; column-type translation runs automatically when the source has `ir.Geometry` columns.
+- **No silent behavior shift for unenabled postgis users.** Without `--enable-pg-extension postgis`, a PG → PG migrate of a spatial-indexed table now emits a WARN naming the dropped opclass (same shape as pg_trgm) where pre-fix it was silent. The WARN points at the flag; the migrate still proceeds (PG's default opclass kicks in on the target).
+
+### Who needs this release
+
+- **Operators running PG → PG migrations or syncs against tables with PostGIS spatial indexes carrying explicit operator classes** (e.g. `gist_geometry_ops_nd` for 3D/4D geometry, `gist_geography_ops` for geography columns, SP-GiST or BRIN spatial indexes): **upgrade and pass `--enable-pg-extension postgis`** — the opclass now round-trips and the target index strategy matches the source.
+- **Operators on the cross-engine PG → MySQL PostGIS path** (the v0.28.0 / ADR-0035 path): drop-in; no behavior change. The column-type translation works without the new flag, same as before.
+- **Operators not using PostGIS:** drop-in; no behavior change.
+
 ## [0.32.2]
 
 **Two cross-engine MySQL UX gaps surfaced as pre-existing observations during the v0.32.0 cycle, both closed.** Neither is a regression or correctness issue; both are cleaner failure modes for cross-engine PG → MySQL scenarios. Same shape as v0.30.1's pair.

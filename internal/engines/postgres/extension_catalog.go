@@ -103,6 +103,25 @@ type extensionDef struct {
 	// for symmetry and for the cross-engine refusal path that asks
 	// "is this opclass extension-owned?" without re-deriving from the AM.
 	indexOperatorClasses map[string]struct{}
+
+	// hintTypeNames is the set of (schema, typname) pairs the extension
+	// owns for the operator-actionable-hint path ONLY — types that have
+	// a first-class IR representation outside [ir.ExtensionType] and
+	// therefore are NOT dispatched through the catalog's build/emit
+	// machinery. The schema reader uses this set via [extensionOwningType]
+	// to surface "pass --enable-pg-extension X" hints when the operator
+	// has a column of an extension-owned type but didn't enable the
+	// extension; the IR path for the type stays unchanged.
+	//
+	// Today's only entry is `postgis`'s `geometry` (and `geography`,
+	// reserved): PG's `ir.Geometry` is the IR type, not `ir.ExtensionType`,
+	// because PostGIS support pre-dates ADR-0032's extension catalog
+	// (the geometry/SRID path landed in v0.28.0 / ADR-0035). Same-engine
+	// PG → PG geometry round-trips via the existing PostGIS-aware emit
+	// path (postgis.go::postgisSubtypeName + the writer's HasPostGIS
+	// gate); the catalog entry adds the opclass + actionable-hint
+	// surface without rerouting the IR type.
+	hintTypeNames map[string]struct{}
 }
 
 // pgExtensionCatalog is the registry of recognised PG extensions
@@ -114,8 +133,7 @@ var pgExtensionCatalog = map[string]extensionDef{
 	"pg_trgm": pgTrgmDef,
 	"hstore":  pgHstoreDef,
 	"citext":  pgCiTextDef,
-	// postgis follows in a subsequent point release per the v1
-	// shortlist (docs/research/pg-extensions-deployment-frequency.md).
+	"postgis": pgPostGISDef,
 }
 
 // crossEngineDefaultTranslatedExtensions names the PG extensions
@@ -447,6 +465,105 @@ var pgCiTextDef = extensionDef{
 	indexOperatorClasses: map[string]struct{}{},
 }
 
+// pgPostGISDef is the catalog entry for the `postgis` extension
+// (ADR-0032 Tier 2, the final v1-shortlist entry). PostGIS is unique
+// in the catalog because its core types (`geometry`, `geography`)
+// pre-date ADR-0032 and already have first-class IR representations:
+//
+//   - `geometry` maps to [ir.Geometry] (with `Subtype` and `SRID`
+//     fields) per ADR-0035 / v0.28.0. Same-engine PG → PG round-trip
+//     uses the existing PostGIS-aware emit path
+//     (postgis.go::postgisSubtypeName + ddl_emit.go::Geometry case),
+//     gated on the writer's `HasPostGIS` flag.
+//   - `geography` has no IR representation today; surfaces via the
+//     hint path only (operators get a "--enable-pg-extension postgis"
+//     pointer if they hit it).
+//
+// As a result the catalog entry's [typesByName] is empty (the
+// catalog's build/emit machinery is bypassed for geometry / geography
+// — they ride on [ir.Geometry] and don't dispatch through
+// [ir.ExtensionType]). [hintTypeNames] holds both type names so
+// [extensionOwningType] surfaces the actionable refusal on the
+// schema reader's "USER-DEFINED type I don't recognise" fallthrough.
+//
+// The load-bearing v1 surface that this entry DOES contribute is the
+// operator-class declaration set. PostGIS introduces operator classes
+// over core PG access methods (gist, spgist, brin) for both geometry
+// and geography. With `--enable-pg-extension postgis`, the schema
+// reader's index-population path preserves these via
+// [ir.IndexColumn.OperatorClass] so the same-engine writer emits the
+// opclass and PG selects the matching index strategy on the target.
+// Without the flag, the opclass is dropped from the IR (and a WARN
+// fires per the loud-failure default, same shape as pg_trgm — the
+// CREATE INDEX on the target falls back to the AM's default
+// opclass, which for gist/geometry is `gist_geometry_ops_2d` so
+// the index still works for the 2D case but loses fidelity for nD /
+// brin / spgist variants).
+//
+// The operator-class set covers the catalog PostGIS ships in 3.x:
+//
+//   - GiST default 2D + nD opclasses: `gist_geometry_ops_2d`,
+//     `gist_geometry_ops_nd`, `gist_geography_ops`.
+//   - SP-GiST opclasses: `spgist_geometry_ops_2d`,
+//     `spgist_geometry_ops_3d`, `spgist_geometry_ops_nd`.
+//   - BRIN inclusion opclasses: `brin_geometry_inclusion_ops_2d`,
+//     `brin_geometry_inclusion_ops_4d`,
+//     `brin_geometry_inclusion_ops_nd`.
+//
+// PostGIS introduces no new index access methods — gist / spgist /
+// brin are core PG. [indexAccessMethods] stays empty; the
+// per-opclass passthrough rides on the `idx.Method == ""` path that
+// pg_trgm already exercises (extensionOperatorClassEnabled).
+//
+// Cross-engine PG → MySQL: NOT a default translator. PostGIS's
+// cross-engine path landed in v0.28.0 (ADR-0035) via the IR's
+// `ir.Geometry` direct mapping to MySQL's spatial column — the
+// `--enable-pg-extension postgis` flag isn't required for that path
+// (operators with PG `geometry` columns get the cross-engine
+// translation regardless). The flag's role is purely PG → PG
+// passthrough: opt into the per-opclass round-trip surface that the
+// catalog-driven IR machinery enables. Operators passing
+// `--enable-pg-extension postgis` against a non-PG target will be
+// refused at [validateEnabledPGExtensions] per the loud-failure
+// default for non-translator extensions.
+var pgPostGISDef = extensionDef{
+	typesByName: map[string]struct{}{},
+	build: func(udtName string, _ int32) (ir.ExtensionType, error) {
+		return ir.ExtensionType{}, fmt.Errorf(
+			"postgres: postgis catalog: build called with udt_name %q, "+
+				"but postgis types route through ir.Geometry (not ir.ExtensionType); "+
+				"this is a framework misuse",
+			udtName)
+	},
+	emitColumn: func(t ir.ExtensionType) (string, error) {
+		return "", fmt.Errorf(
+			"postgres: postgis catalog: emitColumn called for "+
+				"(extension=%q name=%q), but postgis types route through "+
+				"ir.Geometry's emit path (ddl_emit.go::Geometry case); "+
+				"this is a framework misuse",
+			t.Extension, t.Name)
+	},
+	indexAccessMethods: map[string]struct{}{},
+	indexOperatorClasses: map[string]struct{}{
+		// GiST — the canonical PostGIS index path.
+		"gist_geometry_ops_2d": {},
+		"gist_geometry_ops_nd": {},
+		"gist_geography_ops":   {},
+		// SP-GiST — alternative spatial index strategy.
+		"spgist_geometry_ops_2d": {},
+		"spgist_geometry_ops_3d": {},
+		"spgist_geometry_ops_nd": {},
+		// BRIN — block-range coarse spatial index.
+		"brin_geometry_inclusion_ops_2d": {},
+		"brin_geometry_inclusion_ops_4d": {},
+		"brin_geometry_inclusion_ops_nd": {},
+	},
+	hintTypeNames: map[string]struct{}{
+		"geometry":  {},
+		"geography": {},
+	},
+}
+
 // emitExtensionColumn dispatches an [ir.ExtensionType] column to the
 // catalog entry's column-DDL renderer. Returns a clear error when
 // the extension isn't in the catalog (operator forgot the
@@ -533,8 +650,8 @@ func validateAndPreflightExtensionsAt(ctx context.Context, db *sql.DB, extension
 				"postgres: --enable-pg-extension %q is not a recognised "+
 					"extension (recognised: %s); see "+
 					"docs/research/pg-extensions-deployment-frequency.md "+
-					"for the v1 shortlist (vector, pg_trgm, hstore, citext "+
-					"shipped; postgis follows as the final catalog entry)",
+					"for the v1 shortlist (vector, pg_trgm, hstore, citext, "+
+					"postgis — the full v1 set is shipped)",
 				name, strings.Join(recognisedPGExtensionNames(), ", "))
 		}
 		enabled[name] = true
@@ -695,12 +812,22 @@ func extensionOperatorClassRegistered(opclass string) bool {
 // no catalog entry claims it. Used by the schema reader's
 // user-defined-fallthrough path to surface a clean operator-
 // actionable hint when an unenabled extension type appears (ADR-0032).
+//
+// Consults both [extensionDef.typesByName] (types dispatched through
+// the catalog's build/emit as [ir.ExtensionType]) and
+// [extensionDef.hintTypeNames] (types with a first-class IR shape —
+// today's only entry is PostGIS `geometry`, whose IR type is
+// [ir.Geometry] not [ir.ExtensionType]). The hint surface is the same
+// either way: "pass --enable-pg-extension X to opt in".
 func extensionOwningType(udtName string) string {
 	if udtName == "" {
 		return ""
 	}
 	for ext, def := range pgExtensionCatalog {
 		if _, ok := def.typesByName[udtName]; ok {
+			return ext
+		}
+		if _, ok := def.hintTypeNames[udtName]; ok {
 			return ext
 		}
 	}

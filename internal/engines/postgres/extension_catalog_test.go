@@ -163,8 +163,8 @@ func TestPGVectorBuild_DimFromTypmod(t *testing.T) {
 // TestRecognisedPGExtensionNames returns the catalog's keys sorted.
 // As the v1 shortlist lands the recognised set grows; this test
 // pins each load-bearing entry (vector since v0.26.0; pg_trgm since
-// v0.30.0; hstore + citext since this PR) and the sort-order
-// invariant.
+// v0.30.0; hstore + citext since v0.31.0; postgis since v0.33.0 —
+// the full ADR-0032 v1 shortlist) and the sort-order invariant.
 func TestRecognisedPGExtensionNames(t *testing.T) {
 	names := recognisedPGExtensionNames()
 	if len(names) == 0 {
@@ -175,6 +175,7 @@ func TestRecognisedPGExtensionNames(t *testing.T) {
 		"pg_trgm": false,
 		"hstore":  false,
 		"citext":  false,
+		"postgis": false,
 	}
 	for _, n := range names {
 		if _, ok := want[n]; ok {
@@ -720,6 +721,249 @@ func TestLookupExtensionForType_Hstore(t *testing.T) {
 			}
 			if ok && ext != c.wantExt {
 				t.Errorf("ext = %q; want %q", ext, c.wantExt)
+			}
+		})
+	}
+}
+
+// TestPGExtensionCatalog_ContainsPostGIS pins the postgis catalog
+// entry's load-bearing shape: it owns NO column types via typesByName
+// (PostGIS's `geometry` rides on the first-class [ir.Geometry] IR
+// type per ADR-0035, not [ir.ExtensionType]), declares NO new index
+// access methods (gist / spgist / brin are core PG), and registers
+// the operator-class names PostGIS introduces for those AMs over
+// geometry / geography columns. `geometry` and `geography` are
+// recorded in hintTypeNames so the schema reader's
+// `extensionOwningType` hint path surfaces the
+// `--enable-pg-extension postgis` pointer for unenabled-extension
+// columns.
+func TestPGExtensionCatalog_ContainsPostGIS(t *testing.T) {
+	def, ok := pgExtensionCatalog["postgis"]
+	if !ok {
+		t.Fatal("pgExtensionCatalog missing 'postgis' entry")
+	}
+	if len(def.typesByName) != 0 {
+		t.Errorf("postgis typesByName = %v; want empty "+
+			"(geometry routes via ir.Geometry not ir.ExtensionType)",
+			def.typesByName)
+	}
+	if len(def.indexAccessMethods) != 0 {
+		t.Errorf("postgis indexAccessMethods = %v; want empty "+
+			"(gist/spgist/brin are core PG)",
+			def.indexAccessMethods)
+	}
+	// Load-bearing opclasses — GiST, SP-GiST, BRIN covered.
+	wantOpclasses := []string{
+		"gist_geometry_ops_2d",
+		"gist_geometry_ops_nd",
+		"gist_geography_ops",
+		"spgist_geometry_ops_2d",
+		"spgist_geometry_ops_3d",
+		"spgist_geometry_ops_nd",
+		"brin_geometry_inclusion_ops_2d",
+		"brin_geometry_inclusion_ops_4d",
+		"brin_geometry_inclusion_ops_nd",
+	}
+	for _, op := range wantOpclasses {
+		if _, ok := def.indexOperatorClasses[op]; !ok {
+			t.Errorf("postgis indexOperatorClasses missing %q", op)
+		}
+	}
+	// Hint-only types: geometry + geography. The IR uses ir.Geometry
+	// directly for geometry; geography has no IR shape today but
+	// surfaces in the hint path nonetheless.
+	for _, name := range []string{"geometry", "geography"} {
+		if _, ok := def.hintTypeNames[name]; !ok {
+			t.Errorf("postgis hintTypeNames missing %q", name)
+		}
+	}
+}
+
+// TestPGPostGISEmit_SentinelRefusal exercises the "framework misuse"
+// path: any caller invoking `emitColumn` on the postgis entry has a
+// hand-constructed IR or a framework bug, since PostGIS types route
+// through [ir.Geometry], not [ir.ExtensionType]. The refusal must be
+// loud and operator-actionable.
+func TestPGPostGISEmit_SentinelRefusal(t *testing.T) {
+	def := pgExtensionCatalog["postgis"]
+	_, err := def.emitColumn(ir.ExtensionType{
+		Extension: "postgis",
+		Name:      "geometry",
+	})
+	if err == nil {
+		t.Fatal("expected sentinel refusal on postgis emitColumn; got nil")
+	}
+	if !strings.Contains(err.Error(), "ir.Geometry") {
+		t.Errorf("err = %v; want mention of \"ir.Geometry\"", err)
+	}
+}
+
+// TestPGPostGISBuild_SentinelRefusal mirrors the emit refusal on the
+// build side: the schema reader's catalog lookup is gated on
+// typesByName (which postgis leaves empty), so build is unreachable
+// in practice — the sentinel exists as a defensive guard.
+func TestPGPostGISBuild_SentinelRefusal(t *testing.T) {
+	def := pgExtensionCatalog["postgis"]
+	_, err := def.build("geometry", -1)
+	if err == nil {
+		t.Fatal("expected sentinel refusal on postgis build; got nil")
+	}
+	if !strings.Contains(err.Error(), "ir.Geometry") {
+		t.Errorf("err = %v; want mention of \"ir.Geometry\"", err)
+	}
+}
+
+// TestExtensionOwningType_PostGIS pins the operator-actionable hint
+// surface: a `geometry` or `geography` column whose owning extension
+// isn't enabled surfaces the postgis pointer at translateType. The
+// hint rides on hintTypeNames (not typesByName) because PostGIS's
+// IR shape pre-dates ADR-0032 — see the catalog entry's comments.
+func TestExtensionOwningType_PostGIS(t *testing.T) {
+	cases := []struct {
+		udt  string
+		want string
+	}{
+		{"geometry", "postgis"},
+		{"geography", "postgis"},
+		{"vector", "vector"},
+		{"hstore", "hstore"},
+		{"citext", "citext"},
+		{"int4", ""},
+		{"", ""},
+		{"unknown_udt", ""},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.udt, func(t *testing.T) {
+			got := extensionOwningType(c.udt)
+			if got != c.want {
+				t.Errorf("extensionOwningType(%q) = %q; want %q",
+					c.udt, got, c.want)
+			}
+		})
+	}
+}
+
+// TestExtensionOperatorClassEnabled_PostGIS covers the per-opclass
+// passthrough gate for postgis. The schema reader's index-population
+// path consults this helper to decide whether to preserve the
+// opclass on [ir.IndexColumn.OperatorClass]; without
+// `--enable-pg-extension postgis`, the opclass is dropped.
+func TestExtensionOperatorClassEnabled_PostGIS(t *testing.T) {
+	cases := []struct {
+		name    string
+		opclass string
+		enabled map[string]bool
+		want    bool
+	}{
+		{
+			name:    "gist_geometry_ops_2d with postgis enabled",
+			opclass: "gist_geometry_ops_2d",
+			enabled: map[string]bool{"postgis": true},
+			want:    true,
+		},
+		{
+			name:    "gist_geometry_ops_nd with postgis enabled",
+			opclass: "gist_geometry_ops_nd",
+			enabled: map[string]bool{"postgis": true},
+			want:    true,
+		},
+		{
+			name:    "gist_geography_ops with postgis enabled",
+			opclass: "gist_geography_ops",
+			enabled: map[string]bool{"postgis": true},
+			want:    true,
+		},
+		{
+			name:    "spgist_geometry_ops_2d with postgis enabled",
+			opclass: "spgist_geometry_ops_2d",
+			enabled: map[string]bool{"postgis": true},
+			want:    true,
+		},
+		{
+			name:    "brin_geometry_inclusion_ops_2d with postgis enabled",
+			opclass: "brin_geometry_inclusion_ops_2d",
+			enabled: map[string]bool{"postgis": true},
+			want:    true,
+		},
+		{
+			name:    "gist_geometry_ops_2d without postgis",
+			opclass: "gist_geometry_ops_2d",
+			enabled: map[string]bool{},
+			want:    false,
+		},
+		{
+			name:    "gist_geometry_ops_2d with only pg_trgm enabled",
+			opclass: "gist_geometry_ops_2d",
+			enabled: map[string]bool{"pg_trgm": true},
+			want:    false,
+		},
+		{
+			name:    "gin_trgm_ops with postgis enabled (different extension)",
+			opclass: "gin_trgm_ops",
+			enabled: map[string]bool{"postgis": true},
+			want:    false,
+		},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			got := extensionOperatorClassEnabled(c.opclass, c.enabled)
+			if got != c.want {
+				t.Errorf("extensionOperatorClassEnabled(%q, %v) = %v; want %v",
+					c.opclass, c.enabled, got, c.want)
+			}
+		})
+	}
+}
+
+// TestExtensionOwningOperatorClass_PostGIS verifies the writer-side
+// hint dispatcher attributes postgis-owned opclasses correctly.
+// Mirrors the pg_trgm and pgvector hint coverage.
+func TestExtensionOwningOperatorClass_PostGIS(t *testing.T) {
+	cases := []struct {
+		opclass string
+		want    string
+	}{
+		{"gist_geometry_ops_2d", "postgis"},
+		{"gist_geometry_ops_nd", "postgis"},
+		{"gist_geography_ops", "postgis"},
+		{"spgist_geometry_ops_nd", "postgis"},
+		{"brin_geometry_inclusion_ops_2d", "postgis"},
+		{"gin_trgm_ops", "pg_trgm"},
+		{"vector_l2_ops", "vector"},
+		{"", ""},
+		{"not_an_opclass", ""},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.opclass, func(t *testing.T) {
+			got := extensionOwningOperatorClass(c.opclass)
+			if got != c.want {
+				t.Errorf("extensionOwningOperatorClass(%q) = %q; want %q",
+					c.opclass, got, c.want)
+			}
+		})
+	}
+}
+
+// TestLookupExtensionForType_PostGISNotRouted pins the design choice
+// that PostGIS's `geometry` / `geography` types do NOT route through
+// the catalog's build/emit machinery — they have first-class IR
+// shapes (ir.Geometry). lookupExtensionForType (which gates IR
+// dispatch on typesByName) must therefore return false for them
+// regardless of the operator's --enable-pg-extension allowlist; the
+// `c.UDTName == "geometry"` branch in types.go::translateType
+// continues to own the dispatch.
+func TestLookupExtensionForType_PostGISNotRouted(t *testing.T) {
+	for _, udt := range []string{"geometry", "geography"} {
+		udt := udt
+		t.Run(udt, func(t *testing.T) {
+			_, _, ok := lookupExtensionForType(udt, map[string]bool{"postgis": true})
+			if ok {
+				t.Errorf("lookupExtensionForType(%q, postgis=true) = matched; "+
+					"want unmatched (geometry/geography route via ir.Geometry, "+
+					"not the catalog's build/emit path)", udt)
 			}
 		})
 	}
