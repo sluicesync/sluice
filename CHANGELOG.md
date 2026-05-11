@@ -6,6 +6,26 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.30.2]
+
+**Test-stability + CLI help-text patch.** Two operator-invisible nits surfaced via the v0.29.x / v0.30.x release flow. Neither affects production behavior.
+
+### Fixed
+
+- **`TestSyncFromBackup_FanOut` flake closed.** The fan-out integration test runs two brokers in the same Go process against the same chain root; both defaulted to `manifests/broker_state.json` for their state file. Concurrent `LocalStore.Put` to the same path occasionally hung one broker at startup — symptom: target N stayed at the seed row for the test's 90s wait window. Hit 3 of the last 4 main-CI release cycles (v0.29.1, v0.30.1 twice). Phase A diagnose (3 instrumentation passes) narrowed the hang to `writeBrokerState` between `coldStartAtChainID`'s return and the "broker: started" log; the test-side fix is to give each broker a distinct state path. New `brokerOpts.StatePath` field; `TestSyncFromBackup_FanOut` sets distinct paths per broker. Production unaffected — one broker process per chain. 30/30 PASS on Vultr under race detector (vs 15-20% baseline failure rate). Closes the persistent re-run cost on every other release flow.
+- **`--enable-pg-extension` help text refreshed** to list pg_trgm alongside pgvector. v0.30.0's pg_trgm extension passthrough shipped without updating the four flag declarations (`migrate`, `sync start`, `schema preview`, `schema diff`) which still said "Recognised in v0.26.0: vector (pgvector)". Now: "Recognised: vector (pgvector), pg_trgm" (drops the version pin — CHANGELOG is the canonical version-pinning source). Surfaced by the v0.30.1 cycle.
+
+### Migration / Compatibility
+
+- **No format-breaking changes.** No CLI flag changes (only help-text refresh). No on-disk format changes. No engine-interface changes.
+- **Drop-in upgrade from v0.30.1.** No DDL migration; no operator action required.
+
+### Who needs this release
+
+- **Operators tracking sluice's release cadence:** drop-in upgrade; no behavior change. Take it for the next release window.
+- **Operators frustrated by `--enable-pg-extension` help text not mentioning pg_trgm:** the discoverability improvement is here.
+- **Project maintainers + contributors:** every other release CI flow now skips the broker-fanout flake retry cost.
+
 ## [0.30.1]
 
 **Two operator-UX gaps surfaced by the v0.30.0 cycle, both closed.** Neither is a regression or correctness issue; both are cleaner failure modes for cross-engine + extension scenarios.

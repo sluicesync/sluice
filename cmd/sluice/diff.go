@@ -45,7 +45,7 @@ type SchemaDiffCmd struct {
 
 	TargetSchema string `help:"Per-source target schema namespace (Postgres-only). When set, the diff reads the target schema from this namespace rather than the DSN's default, and renders DDL suggestions prefixed with the schema name. ADR-0031. MySQL operators use a different --target DSN database instead." placeholder:"NAME"`
 
-	EnablePGExtension []string `help:"Enable passthrough for a Postgres extension type (repeatable). Same-engine PG → PG only. Recognised in v0.26.0: vector (pgvector). See ADR-0032." placeholder:"EXT"`
+	EnablePGExtension []string `help:"Enable passthrough for a Postgres extension type (repeatable). Same-engine PG → PG only. Recognised: vector (pgvector), pg_trgm. See ADR-0032." placeholder:"EXT"`
 }
 
 // Run implements `sluice schema diff`. Returns:
