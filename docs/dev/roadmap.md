@@ -285,21 +285,28 @@ Remaining size ~600-1000 LOC for 6.2 + 6.3 + a key-management ADR.
 
 ---
 
-### 3. Mid-stream live add-table — strict zero-loss correctness (PG Phase 2 follow-up)
+### 3. Mid-stream live add-table — strict zero-loss correctness (PG Phase 2 follow-up) — **SHIPPED v0.32.0**
 
-**Why.** v0.24.0 shipped Phase 2 live add-table (`--no-drain`, PG-only) with a documented best-effort gap: events on the new table inserted during the brief publication-add window may not be delivered (~1–3 events lost per sub-second window in CI's under-load test, ~36% loss at 1000 rows / sub-second per Scenario 4 exploration). pgoutput evaluates publication membership per WAL record at decode time; events that the slot decoded-and-filtered BEFORE publication-add took effect are gone — the slot doesn't redeliver retroactively. Snapshot rows + post-publication-add events are delivered exactly-once-effectively (proven by integration tests `TestAddTable_LiveMode_PG` + the post-add sentinel pin in the under-load test); the gap is the in-flight events during the add window itself. ADR-0030's "What could go wrong" section documents the limitation.
+**Landed under ADR-0036** after a four-round Phase A diagnose campaign. v0.24.0's documented best-effort gap (~1–3 events lost per sub-second add window, ~36% loss at 1000 rows / sub-second) is closed at the orchestration layer.
 
-**Status (v0.27.0 cycle).** The first attempt picked **Path A (slot-pause)** and ran Phase A verification first. The verification empirically falsified Path A's load-bearing claim: pgoutput's per-LSN historical catalog snapshot pins publication membership at decode time, so a `START_REPLICATION` re-issued at `LSN_pre` after `ALTER PUBLICATION ADD TABLE` does NOT re-decode pre-publication-add events on the new table — even when the slot retains the WAL. See ADR-0033 for the experiment and verdict, and `internal/engines/postgres/slot_pause_verify_integration_test.go` for the permanent regression artifact. The slot-pause approach (in any of its variants — keepalive-pause-only, restart-from-LSN_pre, or `SQ` message) cannot achieve strict zero-loss given pgoutput's catalog-snapshot semantics. ADR-0033 also confirmed via complement test that the v0.24.0 temp-slot snapshot DOES capture pre-publication-add rows on the new table (H2 holds), so the actual loss surface in `TestAddTable_LiveMode_PG_UnderLoad` is NOT the bulk-copy path.
+**Phase A campaign (sequential, each falsifying the prior hypothesis):**
 
-**Forward options (no path picked yet).** Per ADR-0033's "Forward options":
+- **Phase A.1** ruled out M1 (long-txn straddling), M2 (snapshot LSN race), M4 (broker re-emit gap) and reframed M3.
+- **Phase A.2** (v0.29.0) added per-row source-LSN cross-reference instrumentation; falsified reframed M3 (10/10 runs).
+- **Phase A.3** (v0.31.x) added applier-side event-capture probe; confirmed M5c (applier-side drop) 10/10 runs.
+- **Phase B** code-reading identified the drop site: `internal/engines/postgres/change_applier.go::dispatch` — when `colTypesFor` returned `errUnknownTable` because the target table didn't exist yet, the dispatch logged a warning and `return nil`, silently dropping the event. Bug 13's defence-in-depth path was load-bearing for genuinely-drifted publications, not for the v0.24.0 add-window race.
 
-- **Path B — Strategy B dual-slot.** As originally sketched in `docs/dev/design-mid-stream-add-table.md`. Open a second slot at-or-after `LSN_pubadd` whose pgoutput sees the new table in scope from the start; deliver events on the new table from that slot. Main slot continues without scope change. The LSN race between the two slots' progress is the price ADR-0030 wanted to avoid. Estimated ~1500-2000 LOC.
-- **Path C — Source quiesce.** Take a brief `LOCK TABLE` or coordinate with the application to stop writes during the publication-add window. Operator-coordinated; not "live" in the strictest sense.
-- **Path D — Diagnose v0.24.0's actual loss surface FIRST.** ADR-0033's H2 verdict implies the loss does NOT come from the bulk-copy missing pre-publication-add rows. Candidate residual mechanisms: long-running transactions across the publication-add boundary (pgoutput may filter all events of a txn based on catalog at txn-start), bookkeeping race in the snapshot's consistent-point capture, or a test-side artifact. Instrument-then-design before mechanism choice. **This is the most CLAUDE.md-aligned next step** — start with Phase A on the actual failure surface, not on a hypothesised mechanism.
+**Fix (v0.32.0, ~150 LOC):**
 
-**Gotchas.** Whichever path is picked next, run Phase A verification BEFORE committing to an implementation strategy. ADR-0033's experiment shape is the template — it's a focused integration test that asks one falsifiable question and produces a VERDICT line in CI logs.
+- `internal/pipeline/add_table.go::AddTable.Run` — step 3a (NEW): `sw.CreateTablesWithoutConstraints(ctx, scoped)` runs BEFORE `ALTER PUBLICATION ADD TABLE`. By the time pgoutput's per-LSN catalog snapshot includes the new table, the target table is already in `information_schema.columns` and the applier's dispatch path succeeds.
+- `internal/pipeline/migrate.go::runBulkCopyForAddTable` (NEW): mid-stream-live-add variant of `runBulkCopy` that routes the row copy through `ir.IdempotentRowWriter.WriteRowsIdempotent` (INSERT … ON CONFLICT (pk) DO UPDATE) when the writer exposes it. Events that landed before bulk-copy reaches a row are absorbed by the idempotent path.
+- **Engine-symmetric.** Both PG and MySQL schema writers use `CREATE TABLE IF NOT EXISTS`; both engines implement `ir.IdempotentRowWriter`. MySQL's filter-flip mechanism (ADR-0034) didn't manifest the race but inherits the cleaner orchestration shape.
 
-**Operational impact.** Low-frequency for typical operators (most live-adds happen on tables that aren't being actively written to at the moment of the add). High-impact for the specific pattern of "rolling out a new table that's already taking writes from the application before the bulk-copy completes." The drained add-table flow remains the zero-loss default for operators who care.
+**Regression artifacts.** `TestAddTable_LiveMode_PG_UnderLoad` tightened from best-effort logging (`if got < maxTotal { t.Logf(...) }`) to strict zero-loss assertion (`if got != maxTotal { t.Errorf(...) }`). `TestAddTable_LiveMode_PG_DiagnoseLossSurface` and the Phase A.3 applier-side capture probe in `change_applier.go::dispatch` stay as permanent diagnostic artifacts (mirrors how ADR-0033's slot-pause verify test stays as proof-of-falsification).
+
+**Forward options shed.** Paths B (dual-slot) and C (operator quiesce) from ADR-0033 are no longer needed for the v0.24.0 loss surface; both remain available as forward options for unrelated edge cases (e.g. M1 long-txn straddling under workloads where Phase A.1's 1-in-6 rate becomes operator-relevant). The slot-pause approach (Path A) stayed falsified.
+
+See ADR-0036 for the full Phase A trace + Phase B identification; CHANGELOG [0.32.0] for the operator-facing summary.
 
 ---
 
@@ -494,9 +501,15 @@ Tracked in detail in `sluice-testing/BUG-CATALOG.md`; recap here for roadmap vis
 - **Bug 25** (deferred, low priority) — PG immutability of enum-typed STORED generated columns.
 - **Bug 26** — PostGIS SRID dropped on schema translation. *Closed in v0.28.0 (ADR-0035).*
 - **Bug 27** — VStream POINT bytes mis-parsed. *Closed in v0.28.0 (ADR-0035) at the unit-test layer; operator-run end-to-end verification via `psverify` follows the existing PS test pattern.*
-- **Bug 42** (open as of v0.21.2, parallel to Bug 41) — cross-engine restore of `DEFAULT gen_random_uuid()` columns fails MySQL Error 1064. Root cause: `RetargetForEngine` rewrites `Column.Type` (UUID → CHAR(36)) but doesn't rewrite `Column.DefaultValue` of kind `DefaultExpression`; PG's `gen_random_uuid()` lands verbatim in MySQL CREATE TABLE. Mirrors v0.11.3's Bugs 28/29 in the opposite direction. Suggested fix: extend ADR-0016's expression-translator catalog to cover PG → MySQL UUID defaults (`gen_random_uuid()` → `(UUID())`). Estimated ~50-150 LOC.
+- **Bug 41** — PG CDC decode crash on UUID columns. *Closed in v0.21.2.*
+- **Bug 42** — cross-engine PG → MySQL `DEFAULT gen_random_uuid()` translator gap. *Closed in v0.23.1.* `pgToMySQLDefaultExpr` in `internal/engines/mysql/ddl_emit.go` carries `gen_random_uuid()` → `(UUID())` and `random()` → `(RAND())`.
+- **Bug 44** — same-engine MySQL `DEFAULT (UUID())` / `(RAND())` lost outer parens. *Closed in v0.23.2.* `wrapMySQLExpressionDefault` helper in `internal/engines/mysql/ddl_emit.go` covers the function-call shape; bare `CURRENT_TIMESTAMP[(N)]` and already-wrapped forms pass through.
+- **Bug 47** — `{}` → `[]` on MySQL targets when default JSON cast surfaces via cross-engine. *Closed in v0.29.1 (initial fix) + v0.29.1 v2 (proper upstream disambiguation).*
+- **Bug 51** — PG `geography(POINT, srid)` widened to `geography(Geometry, srid)` due to mixed-case `geography_columns.type`. *Closed in v0.33.2.*
+- **Bug 52** — PG `geometry(POINTZ, srid)` Z/M/ZM dimensional variants lost on emit. *Closed in v0.33.3 (partial in v0.33.2, full closure via `coord_dimension` capture in v0.33.3).*
+- **Bug 53** — PostGIS `coord_dimension` not captured in schema reader. *Closed in v0.33.3 (same release as Bug 52 full closure).*
 
-Together, **Bug 41 (closed v0.21.2) + Bug 42** cover "first-class UUID support in cross-engine restore" — Bug 41 fixed the CDC value-decode side; Bug 42 fixes the schema-side default-translation gap. Worth bundling soon since UUID PKs are pervasive in modern PG schemas (Rails, Django, Hasura, Supabase patterns).
+UUID PK support across cross-engine restore is fully landed: Bug 41 (CDC value decode) + Bug 42 (schema-side default translation, PG → MySQL) + Bug 44 (same-engine MySQL function-call default wrapping) + v0.11.3's Bugs 28/29 (the MySQL → PG direction). All four corners covered for modern PG schemas (Rails, Django, Hasura, Supabase).
 
 ### MySQL & PlanetScale parity tracker
 
