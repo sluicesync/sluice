@@ -129,13 +129,6 @@ func WithAzureWrapAlgorithmString(alg string) AzureKMSOption {
 	}
 }
 
-// withSkipAzurePreflight skips the GetKey preflight; used by tests
-// that stub the client and don't want to assert a GetKey call. Not
-// exported — operators shouldn't bypass preflight in production.
-func withSkipAzurePreflight() AzureKMSOption {
-	return func(o *azureKMSOptions) { o.skipPreflight = true }
-}
-
 // AzureKMSEnvelope is the Azure Key Vault implementation of
 // [EnvelopeEncryption]. The KEK is the Key Vault key identified by
 // keyID; WrapCEK / UnwrapCEK route through the service's WrapKey /

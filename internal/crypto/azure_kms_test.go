@@ -22,12 +22,11 @@ import (
 // as a BadParameter error (Azure's actual shape when the ciphertext
 // doesn't match the key). Mirrors fakeKMS / fakeGCPKMS.
 type fakeAzureKMS struct {
-	keyName  string
-	wraps    int64
-	unwraps  int64
-	gets     int64
-	errOnOp  map[string]error
-	wrongKey bool // true → WrapKey emits a blob another instance can't unwrap
+	keyName string
+	wraps   int64
+	unwraps int64
+	gets    int64
+	errOnOp map[string]error
 }
 
 func newFakeAzureKMS(keyName string) *fakeAzureKMS {
@@ -113,8 +112,11 @@ func (f *fakeAzureKMS) Gets() int64    { return atomic.LoadInt64(&f.gets) }
 
 // fakeAzureAPIError produces an *azcore.ResponseError shaped like
 // what the real SDK surfaces, so translateAzureKMSError's ErrorCode
-// branches fire.
-func fakeAzureAPIError(code string, status int, msg string) error {
+// branches fire. The `_` msg parameter is kept at the call site for
+// inline documentation of what each fake error represents; the
+// azcore.ResponseError shape doesn't surface custom messages
+// (Error() reads from RawResponse) so we don't thread it further.
+func fakeAzureAPIError(code string, status int, _ string) error {
 	return &azcore.ResponseError{
 		ErrorCode:   code,
 		StatusCode:  status,

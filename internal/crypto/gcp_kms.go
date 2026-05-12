@@ -86,13 +86,6 @@ func WithGCPKMSClientOptions(opts ...option.ClientOption) GCPKMSOption {
 	return func(o *gcpKMSOptions) { o.clientOptions = append(o.clientOptions, opts...) }
 }
 
-// withSkipGCPPreflight skips the GetCryptoKey preflight; used by
-// tests that stub the client and don't want to assert a Get call.
-// Not exported — operators shouldn't bypass preflight in production.
-func withSkipGCPPreflight() GCPKMSOption {
-	return func(o *gcpKMSOptions) { o.skipPreflight = true }
-}
-
 // GCPKMSEnvelope is the GCP Cloud KMS implementation of
 // [EnvelopeEncryption]. The KEK is the Cloud KMS crypto-key
 // identified by keyResource; WrapCEK / UnwrapCEK route through the
