@@ -355,22 +355,17 @@ The harness lives at the package; future runs against new corpus shapes or new a
 
 ---
 
-### 8. Analytics-friendly source — research doc (Parquet export + DuckDB + Arrow Flight)
+### 8. Analytics-friendly source — research doc (Parquet export + DuckDB + Arrow Flight) — **research SHIPPED**
 
-**Why.** Operators running OLTP databases increasingly want the migration tool to also be the bridge to their analytics stack. Three orthogonal ideas surfaced in conversation that share an underlying theme: sluice as the data-out point for analytics-friendly consumption. Replaces the deferred Shape A path from item 2 with a narrower, more demand-driven framing.
+**Landed** as [`docs/research/sluice-as-analytics-source.md`](../research/sluice-as-analytics-source.md). The doc covers operator personas, three surface candidates, worked examples, and a dep-cost × persona-breadth matrix.
 
-**What** (research-only — no code yet). A `docs/research/sluice-as-analytics-source.md` covering:
+**Conclusion captured in the doc:**
 
-- **Operator personas.** OLTP-only operator (no analytics need); OLTP + occasional ad-hoc analytics (DuckDB power user); OLTP + warehouse pipeline (Snowflake/BigQuery/Redshift target); analytics-first operator with sluice as the lakehouse-feed source. Each has different demand for which surface.
-- **Surface candidates** (not mutually exclusive):
-  1. **`sluice backup export-as-parquet` one-shot transcode.** Reads existing JSON-Lines chunks, emits Parquet alongside (or to a separate cloud bucket). Read-side semantics stay JSON-Lines (round-trip into MySQL/PG keeps the existing path); Parquet is exit-only, so the type-mapping problem becomes "best-effort columnar" instead of "lossless restore." Cheaper dep weight than Shape A from `design-apache-arrow-integration.md`. Library candidate: `parquet-go/parquet-go` (lighter than full `apache/arrow-go/v18` if Arrow's broader surface isn't needed).
-  2. **DuckDB integration on the consumer side.** DuckDB reads Parquet, JSON, and CSV directly; could ship a `sluice backup query --duckdb` subcommand that boots an embedded DuckDB engine pointed at the chunk store. Or simpler: document the recipe (`SELECT * FROM read_json_auto('s3://.../chunks/*.jsonl.gz')`) and let operators wire it themselves.
-  3. **Apache Arrow Flight as a high-throughput transport.** [Arrow Flight](https://arrow.apache.org/blog/2019/10/13/introducing-arrow-flight/) is a gRPC-based protocol for sending large Arrow-encoded datasets between systems with parallel-stream + columnar-batch semantics. Two roles sluice could play: (a) **Flight server** — operators run sluice, point a Flight client at it, sluice streams CDC + bulk-copy data via Arrow batches; (b) **Flight client** — sluice fetches from a Flight-speaking source (some warehouses already speak Flight). Worth mapping against the existing `RowReader` / `RowWriter` interfaces to see how much grafting fits, and whether Flight's parallel-stream semantics align with sluice's per-table chunk model.
-- **Worked example** for each: an end-to-end "operator wants X" scenario, with what sluice would emit and how the downstream consumer would consume it. Concrete demos beat speculative API design.
+- **Promote to a code chunk on operator demand** — Surface 1 (`sluice backup export-as-parquet` one-shot transcode, built on `parquet-go/parquet-go`). Low dep weight (~5 new modules; pure Go; no CGO); broad persona reach (ad-hoc + warehouse-pipeline operators). ~600-1000 LOC. The doc serves as the chunk's prep document when promoted.
+- **Land alongside Surface 1** — Surface 2 (DuckDB recipe in `docs/cookbook/`). Zero code; ~1 day. Operators with DuckDB appetite already know how to drive it; sluice just makes its outputs greppable from there.
+- **Defer** — Surface 3 (Apache Arrow Flight). High dep weight (`apache/arrow-go/v18` + gRPC server runtime; ~2× binary size), narrow persona reach (analytics-first / lakehouse, rare today). Revisit when an operator with a concrete Flight-speaking consumer surfaces AND Surface 1 is shipped.
 
-**Gotchas.** Apache Arrow has the same dep-weight concern that pushed Shape A to defer (see `docs/research/apache-arrow-findings.md`). Flight specifically pulls in `apache/arrow-go` + a gRPC server runtime; non-trivial. The research doc should make explicit which surface (export-as-parquet vs DuckDB recipe vs Flight) has the cheapest dep cost vs operator value. Recommendation: rank the three surfaces by (dep weight × operator persona breadth) and only promote one to a code chunk.
-
-Output: `docs/research/sluice-as-analytics-source.md` (operator personas + surface analysis + worked examples + dep-cost matrix). Estimated 1-2 days research; no code chunk until the doc names a winner.
+The doc also flags five open questions the eventual chunk's prep doc should NOT re-derive (Parquet file granularity, encryption pass-through, incremental mode, GeoParquet adoption, decimal precision overflow). All five have a recommendation captured.
 
 ---
 
