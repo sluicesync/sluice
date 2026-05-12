@@ -56,4 +56,25 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 
+# ---- golangci-lint (mirrors CI's Lint job) ----
+# Pre-v0.39.1 this gate was missing — gofumpt + go vet caught
+# formatting + obvious-bug issues but unused-symbol / revive / etc.
+# only ran in CI, which meant lint-only failures slipped through the
+# local pre-commit gate for several releases (v0.34.0 → v0.39.0
+# inclusive). Adding it here matches the CI job exactly.
+#
+# Soft-skip when golangci-lint isn't installed (developer convenience)
+# rather than hard-block — the CI job is still the source of truth.
+$lint = Get-Command golangci-lint -ErrorAction SilentlyContinue
+if ($lint) {
+    & golangci-lint run
+    if ($LASTEXITCODE -ne 0) {
+        Red "golangci-lint failed."
+        Write-Host "Run: golangci-lint run  (to see the failures inline)"
+        exit 1
+    }
+} else {
+    Write-Host "golangci-lint not installed; skipping (install: https://golangci-lint.run/welcome/install/)" -ForegroundColor Yellow
+}
+
 Green "pre-commit: OK"

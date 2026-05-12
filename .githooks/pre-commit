@@ -62,4 +62,23 @@ if ! go test $test_args ./... >/dev/null; then
 	exit 1
 fi
 
+# ---- golangci-lint (mirrors CI's Lint job) ----
+# Pre-v0.39.1 this gate was missing — gofumpt + go vet caught
+# formatting + obvious-bug issues but unused-symbol / revive / etc.
+# only ran in CI, which meant lint-only failures slipped through the
+# local pre-commit gate for several releases. Adding it here matches
+# the CI job exactly.
+#
+# Soft-skip when golangci-lint isn't installed (developer convenience)
+# rather than hard-block — CI is the source of truth.
+if command -v golangci-lint >/dev/null 2>&1; then
+	if ! golangci-lint run; then
+		red "pre-commit: golangci-lint failed."
+		echo "Run: golangci-lint run  (to see the failures inline)"
+		exit 1
+	fi
+else
+	echo "pre-commit: golangci-lint not installed; skipping (install: https://golangci-lint.run/welcome/install/)"
+fi
+
 green "pre-commit: OK"
