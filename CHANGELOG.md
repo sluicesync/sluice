@@ -6,6 +6,34 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.35.0]
+
+**Translator catalog batch — six additional MySQL → Postgres rewrite rules.** Closes Roadmap Item 5's outstanding medium-leverage entries. Brings the total to 22 of 30 catalog rules shipped; the remaining 8 are deliberately deferred per the catalog's own per-rule guidance and have actionable `--expr-override` workarounds.
+
+### Added — translator catalog rules (`internal/engines/postgres/expr_translate.go`)
+
+- **`HEX(int)` → `to_hex(int)`** (catalog #19). MySQL's HEX function returns the hexadecimal string representation of an integer. PG's `to_hex` is the direct equivalent for the integer-typed case. Narrow form only: `HEX(string)` returning hex of bytes would need `encode(x::bytea, 'hex')` which is the wrong rewrite if the column is integer-typed; operators with bytea HEX-of-bytes use cases can use `--expr-override`.
+- **`FIELD(x, a, b, c, …)` → `array_position(ARRAY[a, b, c, …], x)`** (catalog #22). MySQL's FIELD returns the 1-based position of a value in a list; PG's `array_position` is the direct equivalent (PG 9.5+). Semantic note documented inline: PG returns NULL for not-present, MySQL returns 0. For ORDER BY proxies and custom enum-rank patterns the divergence is invisible; for strict 0-vs-NULL distinctions in CHECK constraints, use `--expr-override`.
+- **`DAYNAME(d)` / `MONTHNAME(d)` → `TO_CHAR(d, 'FMDay')` / `TO_CHAR(d, 'FMMonth')`** (catalog #25). The `FM` prefix suppresses PG's default right-padding to 9 characters. Same STABLE-not-IMMUTABLE caveat as DATE_FORMAT — PG marks TO_CHAR as STABLE which means it can't appear in IMMUTABLE generated columns; the failure is loud and operator-actionable at apply time.
+- **`WEEKOFYEAR(d)` → `EXTRACT(WEEK FROM d)::int`** (catalog #26 narrow ISO subset). `WEEK(d, mode)` with mode != 1 / 3 (ISO) uses Sunday/Monday-start semantics PG can't model uniformly — those forms intentionally fall through verbatim to preserve loud-failure on divergence.
+- **`QUARTER(d)` → `EXTRACT(QUARTER FROM d)::int`** (catalog #27 narrow). YEARWEEK is deferred (composes EXTRACT with arithmetic and inherits #26's week-numbering caveats).
+- **`DATEDIFF(a, b)` → `(a::date - b::date)`** (catalog #28). PG's date subtraction is an SQL operator, not a function call; the rewrite produces a parenthesised binary expression. Belt-and-braces `::date` casts handle timestamp-typed arguments by truncating to day precision, matching MySQL's behaviour (MySQL ignores the time portion).
+
+### Deliberately not shipped (per catalog's per-rule guidance)
+
+The remaining 8 catalog rules stay catalog-only with `--expr-override` as the escape hatch. Each was triaged in `docs/dev/translator-coverage.md` with a specific reason for deferral (extension dependency, divergent semantics, version-gated emit, or invalid-in-DDL-context expansion). The roadmap entry enumerates them for cross-reference.
+
+### Migration / Compatibility
+
+- **Drop-in upgrade from v0.34.x.** No format changes, no CLI changes, no engine-interface changes. The new translator rules only fire on cross-engine MySQL → PG migration when the source DDL body contains the recognised MySQL function shapes; pre-existing schemas that didn't trip the rules are unaffected.
+- **Operators with `--expr-override` workarounds for the six newly-shipped patterns** can drop the overrides; the catalog rewrite produces the same output. If the override emits a non-default shape (e.g. wrapping the result in additional casts the operator needs), keep it — the override takes precedence.
+
+### Who needs this release
+
+- **Operators with MySQL → Postgres migrations whose source schemas use `HEX(int)`, `FIELD(x, …)`, `DAYNAME(d)`, `MONTHNAME(d)`, `WEEKOFYEAR(d)`, `QUARTER(d)`, or `DATEDIFF(a, b)` in DEFAULT / GENERATED / CHECK bodies:** **upgrade** — the migration now rewrites these to the PG equivalents automatically instead of forwarding them verbatim (which would fail at the target's parse step).
+- **Same-engine operators** (MySQL → MySQL, PG → PG): drop-in; the translator only fires on cross-engine pairs.
+- **Operators using `--expr-override` for any of the six patterns:** drop-in; the override stays a higher-priority path.
+
 ## [0.34.0]
 
 **Logical backups Phase 6.3 closes the v1 KMS shortlist — GCP Cloud KMS + Azure Key Vault.** Operators outside AWS can now use envelope encryption without falling back to the passphrase-mode path. Same `EnvelopeEncryption` interface that Phase 6.1 (passphrase) and Phase 6.2 (AWS KMS) shipped against — chunk writer/reader paths are unchanged; the only per-provider bits are the KEKMode tag in the manifest and the per-cloud wrap/unwrap RPCs.

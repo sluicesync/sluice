@@ -174,6 +174,18 @@ func translateExprForPG(expr string, ctx ExprContext) string {
 	expr = rewriteDATEADD(expr)
 	expr = rewriteDATESUB(expr)
 	expr = rewriteDATEFORMAT(expr)
+	// v0.35.0 catalog batch — six additive rules from
+	// docs/dev/translator-coverage.md. Each is mechanical (no
+	// version-gated emit, no extension dependency, no cross-engine
+	// semantic surprise). Order-independent vs prior rules — none of
+	// these emits text that another rule would match.
+	expr = rewriteHEX(expr)
+	expr = rewriteFIELD(expr)
+	expr = rewriteDAYNAME(expr)
+	expr = rewriteMONTHNAME(expr)
+	expr = rewriteWEEKOFYEAR(expr)
+	expr = rewriteQUARTER(expr)
+	expr = rewriteDATEDIFF(expr)
 	// v0.11.3 — operator-form INTERVAL rewrite. MySQL canonicalizes
 	// `DATE_ADD(d, INTERVAL N UNIT)` to the operator form
 	// `(d + interval N unit)` when a generated-column body is read
@@ -1523,4 +1535,173 @@ func rewriteIntervalLiteral(expr string) string {
 		i++
 	}
 	return sb.String()
+}
+
+// ============================================================
+// v0.35.0 catalog batch — additive rules from the v1 catalog
+// (`docs/dev/translator-coverage.md`). Each rule below is mechanical
+// per its catalog entry; the per-rule comments cite the catalog
+// section number for cross-reference.
+//
+// Deliberately NOT shipped this batch (per the catalog's own
+// guidance):
+//   - #10 MD5/SHA1/SHA2 — requires pgcrypto's digest(); crosses
+//     extension boundary, violates contain-Postgres-complexity tenet.
+//   - #11 GREATEST/LEAST — same function name in both engines but
+//     NULL semantics differ; auto-rewrite would mask the divergence.
+//   - #13 REGEXP_LIKE — MySQL ICU vs PG POSIX regex flavours diverge
+//     beyond clean rewrite; operator's `--expr-override` is the right
+//     escape hatch.
+//   - #16 TIMESTAMPDIFF — unit-cross-product makes the rule table
+//     unwieldy; case-by-case `--expr-override`.
+//   - #20 JSON_OBJECT/JSON_ARRAY — version-gated (PG 16+ vs
+//     JSON_BUILD_*); deferred until version-aware emit lands.
+//   - #21 FIND_IN_SET — full position semantic needs a LATERAL
+//     subquery, invalid in CHECK/GENERATED contexts.
+//   - #23 CONVERT_TZ — AT TIME ZONE has subtle timestamp-vs-
+//     timestamptz semantics; auto-rewrite would surprise operators.
+//   - #24 LAST_DAY — verbose 5-token expansion; `--expr-override` is
+//     cleaner than baking it into the catalog.
+//   - #29 INET_ATON/INET_NTOA — no portable PG equivalent without
+//     a custom function.
+// ============================================================
+
+// rewriteHEX rewrites MySQL's `HEX(int_or_bigint)` to PG's
+// `to_hex(...)`. Both return the integer's hexadecimal representation
+// as a string. Catalog rule #19 (narrow form: integer-typed argument
+// only — `HEX(string)` returning hex of bytes would need
+// `encode(x::bytea, 'hex')` which is the wrong rewrite if the column
+// is integer-typed). Falls through verbatim on 0-arg / 2+-arg forms.
+//
+// Single rewrite arm; the column-type context isn't reachable here so
+// we conservatively assume integer-typed input. Operators whose HEX
+// argument is a varbinary / blob column should use `--expr-override`.
+func rewriteHEX(expr string) string {
+	return rewriteFunctionCalls(expr, "HEX", func(args []string) string {
+		if len(args) != 1 {
+			return ""
+		}
+		return "to_hex(" + strings.TrimSpace(args[0]) + ")"
+	})
+}
+
+// rewriteFIELD rewrites MySQL's `FIELD(x, a, b, c, ...)` (returns the
+// 1-based position of x in the list, or 0 if not present) to PG's
+// `array_position(ARRAY[a, b, c, ...], x)` (returns the 1-based
+// position, or NULL if not present). Catalog rule #22.
+//
+// Semantic gotcha: PG returns NULL when the value isn't in the
+// array; MySQL returns 0. For most DDL-body uses (ORDER BY proxies,
+// custom enum ranks) NULL ordering follows the same logical
+// direction as 0, but operators with a strict 0-vs-NULL distinction
+// in a CHECK constraint should use `--expr-override`. Documented as
+// a known sharp edge in the catalog.
+//
+// Requires at least one needle + one haystack value (≥ 2 args). Falls
+// through verbatim otherwise.
+func rewriteFIELD(expr string) string {
+	return rewriteFunctionCalls(expr, "FIELD", func(args []string) string {
+		if len(args) < 2 {
+			return ""
+		}
+		trimmed := make([]string, len(args))
+		for i, a := range args {
+			trimmed[i] = strings.TrimSpace(a)
+		}
+		needle := trimmed[0]
+		haystack := strings.Join(trimmed[1:], ", ")
+		return "array_position(ARRAY[" + haystack + "], " + needle + ")"
+	})
+}
+
+// rewriteDAYNAME rewrites MySQL's `DAYNAME(d)` (returns the weekday
+// name as a string — "Monday", "Tuesday", ...) to PG's
+// `TO_CHAR(d, 'FMDay')`. The `FM` prefix suppresses PG's default
+// right-padding to 9 chars; without it `TO_CHAR(d, 'Day')` produces
+// e.g. "Monday   " with trailing spaces that would silently diverge
+// from MySQL's output in a string-compare CHECK constraint.
+// Catalog rule #25.
+//
+// Same STABLE-not-IMMUTABLE caveat as DATE_FORMAT — PG marks TO_CHAR
+// as STABLE, which means it can't appear in IMMUTABLE generated
+// columns. PG raises a clear error at apply time; loud-failure tenet
+// preserved.
+func rewriteDAYNAME(expr string) string {
+	return rewriteFunctionCalls(expr, "DAYNAME", func(args []string) string {
+		if len(args) != 1 {
+			return ""
+		}
+		return "TO_CHAR(" + strings.TrimSpace(args[0]) + ", 'FMDay')"
+	})
+}
+
+// rewriteMONTHNAME rewrites MySQL's `MONTHNAME(d)` to PG's
+// `TO_CHAR(d, 'FMMonth')`. Same shape as [rewriteDAYNAME]; see that
+// function's comment for the FM-prefix and IMMUTABLE caveats.
+// Catalog rule #25.
+func rewriteMONTHNAME(expr string) string {
+	return rewriteFunctionCalls(expr, "MONTHNAME", func(args []string) string {
+		if len(args) != 1 {
+			return ""
+		}
+		return "TO_CHAR(" + strings.TrimSpace(args[0]) + ", 'FMMonth')"
+	})
+}
+
+// rewriteWEEKOFYEAR rewrites MySQL's `WEEKOFYEAR(d)` (equivalent to
+// `WEEK(d, 3)` — ISO 8601 week numbering) to PG's
+// `EXTRACT(WEEK FROM d)::int`. Both return the ISO-8601 week number.
+// PG's EXTRACT returns double precision; we cast to int to match
+// MySQL's integer return type for CHECK / GENERATED context fidelity.
+// Catalog rule #26 (the WEEKOFYEAR subset).
+//
+// `WEEK(d, mode)` with mode != 1 / 3 (ISO) uses different
+// Sunday/Monday-start semantics that PG doesn't model; sluice does
+// NOT auto-rewrite the moded WEEK form to avoid silent divergence.
+// The bare `WEEK(d)` form is mode-dependent on MySQL's
+// default_week_format session variable; also not auto-rewritten.
+// Operator's `--expr-override` covers the moded cases.
+func rewriteWEEKOFYEAR(expr string) string {
+	return rewriteFunctionCalls(expr, "WEEKOFYEAR", func(args []string) string {
+		if len(args) != 1 {
+			return ""
+		}
+		return "EXTRACT(WEEK FROM " + strings.TrimSpace(args[0]) + ")::int"
+	})
+}
+
+// rewriteQUARTER rewrites MySQL's `QUARTER(d)` (returns 1-4) to PG's
+// `EXTRACT(QUARTER FROM d)::int`. Both return the quarter number as
+// an integer in the 1..4 range. PG's EXTRACT returns double
+// precision; we cast to int for type fidelity in CHECK / GENERATED
+// contexts. Catalog rule #27 (the QUARTER subset; YEARWEEK is
+// deferred — it composes EXTRACT with arithmetic and inherits #26's
+// week-numbering caveats).
+func rewriteQUARTER(expr string) string {
+	return rewriteFunctionCalls(expr, "QUARTER", func(args []string) string {
+		if len(args) != 1 {
+			return ""
+		}
+		return "EXTRACT(QUARTER FROM " + strings.TrimSpace(args[0]) + ")::int"
+	})
+}
+
+// rewriteDATEDIFF rewrites MySQL's `DATEDIFF(a, b)` (returns days as
+// integer; a − b in calendar-day terms) to PG's `(a::date - b::date)`
+// operator form. Both return the signed integer difference in days.
+// Catalog rule #28.
+//
+// PG's date subtraction is an SQL operator, not a function call, so
+// the rewrite produces a parenthesised binary expression instead of a
+// fn-call shape. The `::date` casts are belt-and-braces: if the
+// arguments are already date-typed they're a no-op; if they're
+// timestamps the cast truncates to day precision, matching MySQL's
+// behaviour (MySQL ignores the time portion).
+func rewriteDATEDIFF(expr string) string {
+	return rewriteFunctionCalls(expr, "DATEDIFF", func(args []string) string {
+		if len(args) != 2 {
+			return ""
+		}
+		return "(" + strings.TrimSpace(args[0]) + "::date - " + strings.TrimSpace(args[1]) + "::date)"
+	})
 }

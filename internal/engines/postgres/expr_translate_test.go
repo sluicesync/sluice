@@ -1186,3 +1186,186 @@ func TestTranslateExprForPG_IntervalOperatorForm(t *testing.T) {
 		})
 	}
 }
+
+// TestTranslateExprForPG_V35Catalog covers the v0.35.0 catalog batch
+// of additive rules from docs/dev/translator-coverage.md: HEX (#19),
+// FIELD (#22), DAYNAME / MONTHNAME (#25), WEEKOFYEAR (#26 narrow),
+// QUARTER (#27 narrow), DATEDIFF (#28). Each rule is mechanical and
+// order-independent vs the prior catalog batches.
+func TestTranslateExprForPG_V35Catalog(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		// ---- HEX(int) → to_hex(int) ----
+		{
+			name: "HEX of bare ident",
+			in:   "HEX(id)",
+			want: "to_hex(id)",
+		},
+		{
+			name: "HEX of int literal",
+			in:   "HEX(255)",
+			want: "to_hex(255)",
+		},
+		{
+			name: "lowercase hex also rewrites",
+			in:   "hex(id)",
+			want: "to_hex(id)",
+		},
+		{
+			name: "HEX with no args falls through verbatim",
+			in:   "HEX()",
+			want: "HEX()",
+		},
+		{
+			name: "HEX with two args falls through verbatim",
+			in:   "HEX(a, b)",
+			want: "HEX(a, b)",
+		},
+
+		// ---- FIELD(x, a, b, c) → array_position(ARRAY[a, b, c], x) ----
+		{
+			name: "FIELD of string in literal list",
+			in:   "FIELD(name, 'alpha', 'beta', 'gamma')",
+			want: "array_position(ARRAY['alpha', 'beta', 'gamma'], name)",
+		},
+		{
+			name: "FIELD of int in literal list",
+			in:   "FIELD(status, 1, 2, 3)",
+			want: "array_position(ARRAY[1, 2, 3], status)",
+		},
+		{
+			name: "lowercase field also rewrites",
+			in:   "field(x, 'a', 'b')",
+			want: "array_position(ARRAY['a', 'b'], x)",
+		},
+		{
+			name: "FIELD with single arg (no haystack) falls through",
+			in:   "FIELD(x)",
+			want: "FIELD(x)",
+		},
+
+		// ---- DAYNAME / MONTHNAME ----
+		{
+			name: "DAYNAME to TO_CHAR FMDay",
+			in:   "DAYNAME(created_at)",
+			want: "TO_CHAR(created_at, 'FMDay')",
+		},
+		{
+			name: "MONTHNAME to TO_CHAR FMMonth",
+			in:   "MONTHNAME(created_at)",
+			want: "TO_CHAR(created_at, 'FMMonth')",
+		},
+		{
+			name: "lowercase dayname also rewrites",
+			in:   "dayname(d)",
+			want: "TO_CHAR(d, 'FMDay')",
+		},
+		{
+			name: "DAYNAME with no args falls through",
+			in:   "DAYNAME()",
+			want: "DAYNAME()",
+		},
+
+		// ---- WEEKOFYEAR → EXTRACT(WEEK FROM d)::int ----
+		{
+			name: "WEEKOFYEAR to EXTRACT WEEK",
+			in:   "WEEKOFYEAR(created_at)",
+			want: "EXTRACT(WEEK FROM created_at)::int",
+		},
+		{
+			name: "lowercase weekofyear also rewrites",
+			in:   "weekofyear(d)",
+			want: "EXTRACT(WEEK FROM d)::int",
+		},
+		{
+			name: "WEEKOFYEAR with extra arg falls through",
+			in:   "WEEKOFYEAR(d, 1)",
+			want: "WEEKOFYEAR(d, 1)",
+		},
+		{
+			// WEEK(d, mode) is intentionally NOT auto-rewritten —
+			// mode-dependent semantics that PG can't model uniformly.
+			name: "WEEK(d, mode) falls through (no auto-rewrite)",
+			in:   "WEEK(created_at, 1)",
+			want: "WEEK(created_at, 1)",
+		},
+
+		// ---- QUARTER → EXTRACT(QUARTER FROM d)::int ----
+		{
+			name: "QUARTER to EXTRACT QUARTER",
+			in:   "QUARTER(created_at)",
+			want: "EXTRACT(QUARTER FROM created_at)::int",
+		},
+		{
+			name: "lowercase quarter also rewrites",
+			in:   "quarter(d)",
+			want: "EXTRACT(QUARTER FROM d)::int",
+		},
+		{
+			name: "QUARTER with no args falls through",
+			in:   "QUARTER()",
+			want: "QUARTER()",
+		},
+
+		// ---- DATEDIFF(a, b) → (a::date - b::date) ----
+		{
+			name: "DATEDIFF of two columns",
+			in:   "DATEDIFF(end_date, start_date)",
+			want: "(end_date::date - start_date::date)",
+		},
+		{
+			name: "DATEDIFF of column and literal",
+			in:   "DATEDIFF(d, '2026-01-01')",
+			want: "(d::date - '2026-01-01'::date)",
+		},
+		{
+			name: "lowercase datediff also rewrites",
+			in:   "datediff(a, b)",
+			want: "(a::date - b::date)",
+		},
+		{
+			name: "DATEDIFF with one arg falls through",
+			in:   "DATEDIFF(a)",
+			want: "DATEDIFF(a)",
+		},
+		{
+			name: "DATEDIFF with three args falls through (no MySQL 3-arg form)",
+			in:   "DATEDIFF(a, b, c)",
+			want: "DATEDIFF(a, b, c)",
+		},
+
+		// ---- Compositions across rules ----
+		{
+			// FIELD nested inside COALESCE — verify the array-pos rewrite
+			// composes with the existing COALESCE pass.
+			name: "FIELD inside COALESCE composes",
+			in:   "COALESCE(FIELD(s, 'x', 'y'), 0)",
+			want: "COALESCE(array_position(ARRAY['x', 'y'], s), 0)",
+		},
+		{
+			// QUARTER + EXTRACT cast composes inside a CHECK shape.
+			name: "QUARTER inside CHECK >= comparison",
+			in:   "QUARTER(d) >= 2",
+			want: "EXTRACT(QUARTER FROM d)::int >= 2",
+		},
+		{
+			// DATEDIFF inside a CHECK upper-bound expression.
+			name: "DATEDIFF inside CHECK <= 30",
+			in:   "DATEDIFF(NOW(), created_at) <= 30",
+			want: "(CURRENT_TIMESTAMP::date - created_at::date) <= 30",
+		},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			got := translateExprForPG(c.in, ExprContext{})
+			if got != c.want {
+				t.Errorf("translateExprForPG(%q) =\n  got  %q\n  want %q",
+					c.in, got, c.want)
+			}
+		})
+	}
+}
