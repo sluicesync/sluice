@@ -95,9 +95,12 @@ var flavorCapabilities = map[Flavor]ir.Capabilities{
 	// limitations relative to upstream MySQL:
 	//
 	//   - LOAD DATA INFILE is not supported. Use BatchedInsert.
-	//   - Direct binlog access is not exposed. CDC is reported as
-	//     None for now; PlanetScale's own change-feed mechanisms
-	//     could be added as a separate option later.
+	//   - Direct binlog access is not exposed. CDC goes through Vitess's
+	//     VStream gRPC protocol against the vtgate endpoint; sluice's
+	//     [vstreamCDCReader] handles the GTID-keyed position tokens
+	//     and snapshot-anchored COPY-mode handoff. See
+	//     internal/engines/mysql/cdc_vstream.go and Bug 27 / ADR-0035
+	//     for the spatial-types CDC bytes-parsing detail.
 	//   - Table partitioning is handled by Vitess sharding rather
 	//     than user-defined PARTITION BY clauses.
 	//   - Spatial types are excluded from SupportedTypes here for

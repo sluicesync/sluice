@@ -25,8 +25,8 @@ sluice version v0.x.x
 
 $ sluice engines
 NAME          BULK LOAD           CDC
-mysql         loaddatainfile      binlog
-planetscale   batched-insert      none
+mysql         load-data-infile    binlog
+planetscale   batched-insert      vstream
 postgres      copy                logical-replication
 ```
 
