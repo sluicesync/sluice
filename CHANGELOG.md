@@ -6,6 +6,30 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.39.1]
+
+**Closes silent golangci-lint debt + adds the missing local pre-commit gate.** CI's `Lint` job has been failing silently on `main` since v0.34.0 across 6 consecutive releases (v0.34.0 → v0.39.0 inclusive). Root cause: the local pre-commit script ran `gofumpt + go vet + go test` but NOT `golangci-lint`, so lint-only failures (unused symbols, `revive`'s unused-parameter rule, etc.) passed the local gate and only surfaced in CI — where the watcher logic was only gating on the Release workflow's conclusion, not the parallel Lint job's. The four issues were all in v0.34.0 KMS code I added forward-looking-but-never-wired-up helpers for.
+
+### Fixed
+
+- **`internal/crypto/azure_kms_test.go`** — dropped unused `wrongKey` field on `fakeAzureKMS` stub; renamed unused `msg` parameter on `fakeAzureAPIError` to `_` (preserves call-site documentation while satisfying `revive`).
+- **`internal/crypto/azure_kms.go`** — dropped unused `withSkipAzurePreflight()` helper (was forward-looking; never wired to a test).
+- **`internal/crypto/gcp_kms.go`** — dropped unused `withSkipGCPPreflight()` helper (same).
+
+### Process — golangci-lint now in the local pre-commit gate
+
+Added a `golangci-lint run` step to both `.githooks/pre-commit` (bash) and `scripts/pre-commit.ps1` (PowerShell). Soft-skips when the tool isn't installed locally (developer convenience) with an install URL hint; hard-fails when it IS installed and produces issues. Mirrors CI's `Lint` job exactly, so lint-only failures can no longer slip through the local gate.
+
+### Migration / Compatibility
+
+- **Drop-in upgrade from v0.39.0.** No CLI changes, no engine-interface changes, no operator-visible behaviour changes. The dropped helpers were internal test-only forward-looking stubs that were never reachable from any caller.
+- **Existing CI workflows pass cleanly** on v0.39.1 for the first time since v0.34.0; the lint debt is closed retroactively.
+
+### Who needs this release
+
+- **Operators on v0.34.0–v0.39.0**: drop-in; no runtime change, just a CI hygiene fix.
+- **Contributors / developers running the local pre-commit hook**: the gate now matches CI exactly. If `golangci-lint` isn't installed, the script prints a soft-skip warning with an install URL; no hard fail. Install via the upstream's [installation guide](https://golangci-lint.run/welcome/install/).
+
 ## [0.39.0]
 
 **Translator-gap preflight scan integrated into `schema preview`.** Operators running cross-engine MySQL → Postgres migrations now see an upfront advisory listing every MySQL expression-body pattern sluice's translator catalog deliberately doesn't auto-rewrite. Before v0.39.0, the deferred rules surfaced as either loud failures at PG apply time (visible but late) or silent runtime divergences (invisible until row data ships through and a downstream consumer notices). The scan brings them forward into the preview, with operator-actionable workaround hints.
