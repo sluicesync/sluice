@@ -335,17 +335,16 @@ Closed under [ADR-0035](adr/adr-0035-postgis-geometry-spatial-support.md). See "
 
 ---
 
-### 7. Backup chunk compression investigation
+### 7. Backup chunk compression investigation — **SHIPPED**
 
-**Why.** Phase 1 logical backups ship gzip-compressed JSON Lines (`internal/pipeline/backup_chunk.go:8-32`). The Phase 1 design doc proposed zstd at level 3; gzip shipped because it's stdlib and Phase 1 prioritised correctness. There's no documented benchmark of compression ratio or throughput vs alternatives — operators reasoning about S3 storage cost or backup-window time-to-disk are guessing.
+**Landed** as build-tagged harness in `internal/pipeline/internal/compressbench/` plus decision doc at [`docs/dev/notes/compression-benchmark.md`](notes/compression-benchmark.md). Benchmarked stdlib `compress/gzip`, klauspost drop-in `gzip`, `zstd` (SpeedDefault + SpeedBetterCompression), and `snappy` across the four corpora at 50k rows each (operators can crank via `SLUICE_COMPRESSBENCH_ROWS`).
 
-**What.** A focused benchmark + decision doc:
-- **Library candidates**: stdlib `compress/gzip`, `github.com/klauspost/compress/zstd`, `github.com/klauspost/compress/gzip` (drop-in faster gzip), `github.com/klauspost/compress/snappy`. The [klauspost/compress](https://github.com/klauspost/compress) package is the standard Go recommendation for high-throughput compression and has a permissive license (BSD-3) compatible with Apache-2.0.
-- **Test corpora**: text-heavy (varchar columns), numeric-heavy (DECIMAL/INT), binary-heavy (bytea/blob, base64 in JSON envelope), JSON-mixed (representative of typical OLTP table). Sample size: ~1M rows per corpus, drawn from existing integration test data + a synthetic generator.
-- **Metrics**: compressed size, encode CPU time, decode CPU time, peak memory. Cross-tab with chunk size to pick the operating point.
-- **Format-version implications**: chunk format header carries a version int (`{"_h":1,...}`); a compression swap needs version=2 + a backward-compat reader path. Worth weighing whether the zstd ratio improvement justifies the format-version bump or whether to ship as `--compression=<algo>` flag with gzip default.
+**Recommendation captured in the decision doc:**
 
-Output is `docs/dev/notes/compression-benchmark.md` (data + recommendation) + a small benchmark harness under `internal/pipeline/internal/compressbench/` (build-tagged so it doesn't bloat default builds). Estimated ~200-400 LOC for the harness + benchmark.
+- **Short-term** — swap stdlib `compress/gzip` for `klauspost/compress/gzip` in `backup_chunk.go`. Drop-in (same `NewWriter` / `NewReader` surface, same gzip wire format → no chunk-format change, no version bump). Buys 2-6× encode speedup with <5% ratio loss across all four corpora. klauspost/compress is already in the module graph (indirect via pgx), so promoting it adds zero binary-size cost.
+- **Phase 2** — add `--compression=<algo>` flag with `gzip` default and `zstd` opt-in. Justification only after operator demand; the wins (storage cost on numeric/json corpora) trade against a chunk-format version bump and a backward-compat reader path. zstd at SpeedDefault is the right Phase-2 target; SpeedBetterCompression's marginal ratio gain doesn't pay back its 2× encode cost.
+
+The harness lives at the package; future runs against new corpus shapes or new algorithms (the catalog in `algos.go` is one-entry-per-algo additive) regenerate the markdown table. Reproduction commands at the bottom of the decision doc.
 
 ---
 
