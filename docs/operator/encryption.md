@@ -263,8 +263,259 @@ Restoring an encrypted chain without `--kms-key-arn` (or with the wrong key ARN)
 - **Don't grant `kms:*` on `*`.** Use the least-privilege IAM template above.
 - **Don't share KMS keys across unrelated chains.** Per-customer / per-environment keys are the right pattern; one compromised key shouldn't expose every other tenant's backups.
 
+## GCP Cloud KMS setup (Phase 6.3)
+
+v0.34.0 adds GCP Cloud KMS-backed envelope encryption with the same shape as AWS KMS. Same `EnvelopeEncryption` interface; only the per-cloud RPCs and IAM model differ.
+
+### Enabling GCP KMS mode
+
+```bash
+sluice backup full \
+    --source-driver=postgres \
+    --source="$DATABASE_URL" \
+    --target=gs://my-bucket/backups/2026-05-09/ \
+    --encrypt \
+    --gcp-kms-key-resource=projects/my-project/locations/us/keyRings/sluice/cryptoKeys/backup-prod
+```
+
+Restore mirrors the path with the same `--gcp-kms-key-resource` flag. The flag is mutually exclusive with `--encryption-passphrase{,-env,-file}`, `--kms-key-arn`, and `--azure-key-vault-id`.
+
+### Acceptable key reference shapes
+
+`--gcp-kms-key-resource` accepts either of Cloud KMS's canonical resource forms:
+
+- **Crypto-key resource** — `projects/PROJECT/locations/LOCATION/keyRings/RING/cryptoKeys/KEY` (recommended; KMS picks the primary version on wrap, recovers the version from ciphertext metadata on unwrap)
+- **Versioned crypto-key resource** — `projects/.../cryptoKeys/KEY/cryptoKeyVersions/3` (pins a specific version; useful when re-wrapping a chain to migrate off a deprecated version)
+
+### Creating a Cloud KMS key
+
+```bash
+# 1. Create the key ring (one per project / per environment).
+gcloud kms keyrings create sluice --location=us --project=my-project
+
+# 2. Create the crypto-key for envelope encryption.
+gcloud kms keys create backup-prod \
+    --location=us \
+    --keyring=sluice \
+    --purpose=encryption \
+    --project=my-project
+
+# 3. (Optional) Enable automatic rotation.
+gcloud kms keys update backup-prod \
+    --location=us \
+    --keyring=sluice \
+    --rotation-period=90d \
+    --next-rotation-time=$(date -d '+90 days' --iso-8601=seconds) \
+    --project=my-project
+```
+
+### IAM policy template
+
+Grant the service account sluice runs as the minimum-privilege roles on the specific crypto-key. Do NOT grant `roles/cloudkms.admin`.
+
+```bash
+# Encrypter — needed by sluice backup full / incremental / stream run.
+gcloud kms keys add-iam-policy-binding backup-prod \
+    --location=us --keyring=sluice --project=my-project \
+    --member=serviceAccount:sluice@my-project.iam.gserviceaccount.com \
+    --role=roles/cloudkms.cryptoKeyEncrypter
+
+# Decrypter — needed by sluice restore.
+gcloud kms keys add-iam-policy-binding backup-prod \
+    --location=us --keyring=sluice --project=my-project \
+    --member=serviceAccount:sluice@my-project.iam.gserviceaccount.com \
+    --role=roles/cloudkms.cryptoKeyDecrypter
+
+# Viewer — needed for sluice's preflight GetCryptoKey call.
+gcloud kms keys add-iam-policy-binding backup-prod \
+    --location=us --keyring=sluice --project=my-project \
+    --member=serviceAccount:sluice@my-project.iam.gserviceaccount.com \
+    --role=roles/cloudkms.viewer
+```
+
+For separation of duties, run backup and restore under different service accounts and grant only Encrypter to the backup principal, only Decrypter to the restore principal.
+
+### Authentication
+
+The Cloud KMS client uses Application Default Credentials. Three common shapes:
+
+1. **`gcloud auth application-default login`** — operator-laptop usage; credentials cached at `~/.config/gcloud/application_default_credentials.json`.
+2. **`GOOGLE_APPLICATION_CREDENTIALS=/path/to/key.json`** — service-account JSON key file; common for CI / Cloud Run / cron.
+3. **Workload Identity / metadata server** — on GKE / Cloud Run / Compute Engine, no explicit credential file needed; the platform provides credentials automatically.
+
+Sluice surfaces "no valid credentials available" with a `gcloud auth application-default login` hint if ADC is unconfigured.
+
+### Key rotation
+
+Cloud KMS handles rotation transparently. Two modes:
+
+1. **Automatic rotation** (set via `--rotation-period`). KMS rotates the key material on the configured cadence; wrapped CEKs reference the resource name and KMS resolves to whichever version was primary at wrap time. Old chains stay decryptable indefinitely; new chains use the current version.
+2. **Manual rotation** (`gcloud kms keys versions create`). Useful for compromise response. **Do NOT destroy old key versions while chains wrapped under them need to be restored.** Cloud KMS versions have a 24-hour minimum destroy delay; use it to verify no active chains reference the old version.
+
+### KMS request charges
+
+Cloud KMS pricing (~$0.03 per 10,000 calls) makes per-chain costs negligible:
+
+- **Per backup**: 1 Encrypt + 1 GetCryptoKey = ~$0.000006.
+- **Per restore**: 1 Decrypt + 1 GetCryptoKey = ~$0.000006.
+- **A 720-rollover monthly backup-stream**: ~720 Encrypt + 720 GetCryptoKey calls = ~$0.004/month.
+
+### Wrong-key / missing-key recovery
+
+Cloud KMS surfaces gRPC status codes that sluice translates to operator-actionable errors:
+
+- **NotFound**: "gcp kms decrypt failed: key X not found (verify the resource name is correct + the service account has access)". Recovery: check the resource name and IAM grants.
+- **PermissionDenied**: "gcp kms decrypt denied: service account lacks the required IAM role on key X (grant roles/cloudkms.cryptoKeyDecrypter)". Recovery: extend the IAM grant.
+- **FailedPrecondition**: "gcp kms decrypt rejected: key X is in an invalid state (verify the key is enabled and the primary version is not disabled)". Recovery: re-enable the key version.
+- **Unauthenticated**: "gcp kms decrypt denied: no valid credentials available (ensure GOOGLE_APPLICATION_CREDENTIALS is set or run `gcloud auth application-default login`)". Recovery: configure ADC.
+
+### What NOT to do with GCP KMS mode
+
+- **Don't destroy old crypto-key versions while chains wrapped under them still need restoring.** Cloud KMS destruction is irreversible after the destroy delay; data becomes unrecoverable.
+- **Don't grant `roles/cloudkms.admin` to the runtime service account.** Use the three minimum-privilege roles above (Encrypter / Decrypter / Viewer).
+- **Don't share crypto-keys across unrelated environments.** Per-environment crypto-keys (or even per-tenant) limit blast radius.
+
+## Azure Key Vault setup (Phase 6.3)
+
+v0.34.0 also adds Azure Key Vault-backed envelope encryption. Same operator surface; key identifier is a URL rather than an ARN / resource path.
+
+### Enabling Azure Key Vault mode
+
+```bash
+sluice backup full \
+    --source-driver=postgres \
+    --source="$DATABASE_URL" \
+    --target=azblob://my-container/backups/2026-05-09/ \
+    --encrypt \
+    --azure-key-vault-id=https://my-vault.vault.azure.net/keys/backup-prod
+```
+
+Restore mirrors the path. Like the other KMS flags, `--azure-key-vault-id` is mutually exclusive with the other three key-source families.
+
+### Acceptable key reference shapes
+
+`--azure-key-vault-id` accepts either of Key Vault's standard key identifier URL forms:
+
+- **Latest version** — `https://VAULT.vault.azure.net/keys/KEY` (Key Vault uses the current version on wrap; on unwrap the version is recovered from the wrapped blob's metadata)
+- **Versioned** — `https://VAULT.vault.azure.net/keys/KEY/abc123def456` (pins a specific version)
+- **Managed HSM** — `https://VAULT.managedhsm.azure.net/keys/KEY[/VERSION]` (FIPS 140-3 Level 3 HSM tier; same URL structure)
+
+### Creating a Key Vault key
+
+```bash
+# 1. Create the Key Vault (one per environment).
+az keyvault create \
+    --name sluice-prod \
+    --resource-group my-rg \
+    --location eastus \
+    --enable-rbac-authorization
+
+# 2. Create the key for envelope encryption.
+#    RSA 4096-bit, used for RSA-OAEP-256 wrap (sluice's default).
+az keyvault key create \
+    --vault-name sluice-prod \
+    --name backup-prod \
+    --kty RSA \
+    --size 4096 \
+    --ops wrapKey unwrapKey
+
+# 3. (Optional) Configure rotation policy.
+az keyvault key rotation-policy update \
+    --vault-name sluice-prod \
+    --name backup-prod \
+    --value '{"lifetimeActions": [{"action": {"type": "Rotate"}, "trigger": {"timeAfterCreate": "P90D"}}]}'
+```
+
+For HSM-backed AES keys (Managed HSM only):
+
+```bash
+az keyvault key create \
+    --hsm-name my-managed-hsm \
+    --name backup-prod \
+    --kty oct-HSM \
+    --size 256 \
+    --ops wrapKey unwrapKey
+```
+
+Pass `--azure-wrap-algorithm=A256KW` to sluice when using an AES-typed key (the default RSA-OAEP-256 won't apply).
+
+### Role assignment template
+
+Azure Key Vault has two access models: legacy access policies and modern RBAC. **Use RBAC** (`--enable-rbac-authorization` above). Minimum-privilege role assignment for a service principal:
+
+```bash
+# Crypto User — covers WrapKey / UnwrapKey / GetKey.
+az role assignment create \
+    --role "Key Vault Crypto User" \
+    --assignee <SERVICE_PRINCIPAL_OBJECT_ID> \
+    --scope /subscriptions/<SUB>/resourceGroups/my-rg/providers/Microsoft.KeyVault/vaults/sluice-prod
+```
+
+For separation of duties, assign "Key Vault Crypto User" to the backup principal and "Key Vault Crypto Service Encryption User" (read-only on the key) to a separate restore principal. (Azure doesn't have a built-in role with only-Decrypt; "Crypto User" is the closest minimum-privilege role that covers both wrap and unwrap.)
+
+### Authentication
+
+Sluice uses `DefaultAzureCredential` which probes a chain of credential sources:
+
+1. **Environment variables** — `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET` (service principal) or `AZURE_USERNAME` / `AZURE_PASSWORD` (user).
+2. **Workload Identity** — on AKS pods configured with workload-identity federation, no explicit credential needed.
+3. **Managed Identity** — on Azure VMs / App Service / Container Instances, the platform's IMDS endpoint provides credentials automatically.
+4. **Azure CLI cached login** — `az login` for laptop usage; works for the operator interactively.
+
+Sluice surfaces "no valid credentials" with an `az login` / managed-identity hint when authentication fails.
+
+### Key rotation
+
+Key Vault rotates transparently with `az keyvault key rotation-policy`. Same shape as the other clouds: wrapped CEKs reference the key name (not the version explicitly); on unwrap, Key Vault recovers the version from the wrapped blob's metadata. Old chains stay decryptable.
+
+Manual rotation: `az keyvault key rotate` creates a new version; Key Vault preserves old versions until explicitly purged (soft-delete protected for the configured retention period). **Don't purge old versions while chains need restoring.**
+
+### Wrap algorithm choice
+
+The `--azure-wrap-algorithm` flag controls which Key Vault algorithm is used:
+
+| Algorithm | Key type | When to use |
+|---|---|---|
+| `RSA-OAEP-256` (default) | RSA (vault or HSM) | The standard for software-protected RSA keys; works for HSM-backed RSA too. |
+| `RSA-OAEP` | RSA (vault or HSM) | Legacy; only use if a compliance baseline requires it. |
+| `A256KW` | AES-256 (Managed HSM only) | Required for HSM-backed AES keys; sluice's default doesn't apply. |
+
+If you pass the wrong algorithm for the key type, Key Vault rejects with `BadParameter`; sluice translates this to "verify the wrap algorithm matches the key type."
+
+### Wrong-key / missing-key recovery
+
+Key Vault surfaces error codes that sluice translates to operator-actionable errors:
+
+- **KeyNotFound** (404): "azure kms decrypt failed: key X not found (verify the key identifier URL + the role assignment grants 'Key Vault Crypto User' or equivalent)". Recovery: verify URL + role.
+- **Forbidden** (403): "azure kms decrypt denied: principal lacks the required role on key X (grant 'Key Vault Crypto User')". Recovery: extend the role assignment.
+- **BadParameter** (400): "azure kms decrypt rejected: bad parameter for key X (verify the wrap algorithm matches the key type — RSA keys default to RSA-OAEP-256; AES keys need --azure-wrap-algorithm=A256KW)". Recovery: align the algorithm.
+- **KeyDisabled**: "azure kms decrypt rejected: key X is disabled (re-enable via `az keyvault key set-attributes --enabled true`)". Recovery: re-enable the key.
+- **401 status fallback**: "azure kms decrypt denied: no valid credentials (run `az login` or set AZURE_CLIENT_ID/AZURE_TENANT_ID/AZURE_CLIENT_SECRET)". Recovery: configure credential chain.
+
+### What NOT to do with Azure Key Vault mode
+
+- **Don't purge old key versions while chains wrapped under them need restoring.** Soft-delete keeps purged keys recoverable for the retention period, but operators have been known to bypass it.
+- **Don't disable a key while operations against it might be in-flight.** Disabled keys break in-progress backup / restore with `KeyDisabled`.
+- **Don't use access policies (legacy) on a new vault.** RBAC is the supported model; access policies are being deprecated.
+- **Don't share vaults across unrelated environments.** Per-environment vaults isolate blast radius and align with Azure's billing / quota boundaries.
+
+## Choosing between providers
+
+| Dimension | Passphrase | AWS KMS | GCP Cloud KMS | Azure Key Vault |
+|---|---|---|---|---|
+| **Trust anchor** | Operator-managed | AWS IAM | GCP IAM | Azure RBAC |
+| **Cloud lock-in** | None | AWS-resident | GCP-resident | Azure-resident |
+| **Best for** | Air-gapped, SneakerNet, multi-cloud | AWS-resident workloads | GCP-resident workloads | Azure-resident workloads |
+| **Audit trail** | None (file access only) | CloudTrail | Cloud Logging | Key Vault Logs |
+| **Compliance certs** | None inherent | FIPS 140-2 L3 (with HSM tier) | FIPS 140-2 L3 (with HSM tier) | FIPS 140-2 L3 / 140-3 L3 (HSM) |
+| **HSM option** | n/a | CloudHSM-backed key spec | HSM key spec | Managed HSM (`managedhsm.azure.net`) |
+| **Cross-cloud restore** | Yes (operator carries passphrase) | No (key tied to AWS account) | No (tied to GCP project) | No (tied to Azure tenant) |
+
+Most operators pick one cloud and stay there; passphrase mode is the right answer when sluice is run from outside any of the three (CI runners with no cloud identity, air-gapped recovery hosts, SneakerNet workflows).
+
 ## See also
 
 - `docs/dev/design-logical-backups-phase-6.md` — full design + threat model
+- `docs/dev/adr-0037-key-management.md` — design rationale, threat-model recap, per-provider trade-offs
 - `docs/dev/design-logical-backups.md` — original logical-backup proto-ADR
 - `docs/postgres-source-prep.md` — TLS at the database-connection layer
