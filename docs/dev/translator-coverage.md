@@ -222,7 +222,7 @@ clean PG equivalent.
 | --- | --- |
 | MySQL | `HEX(x)`, `BIN(x)`, `OCT(x)` |
 | PG | `to_hex(x)` (integer → hex string), `to_char(x, 'FMS999…')` (no direct BIN equivalent), `to_char(x, '999…')` for OCT |
-| Notes | `HEX(int) → to_hex(int)` is mechanical. `HEX(string)` (returning hex of bytes) → `encode(x::bytea, 'hex')`. `BIN(int)` has no clean PG one-call equivalent. **Lands narrow:** only `HEX(int_or_bigint) → to_hex(…)`. |
+| Notes | `HEX(int) → to_hex(int)` is mechanical. `HEX(string)` (returning hex of bytes) → `encode(x::bytea, 'hex')`. `BIN(int)` has no clean PG one-call equivalent. **Lands narrow:** only `HEX(int_or_bigint) → to_hex(…)`. **Case-fold caveat (shipped v0.35.0):** PG's `to_hex` returns lowercase digits ("ff"); MySQL's `HEX` returns uppercase ("FF"). Bytes are case-equivalent on fold; case-sensitive equality on a HEX-derived column needs `LOWER(HEX(x))` on the MySQL side (or `UPPER(to_hex(x))` on the PG side) to align. |
 | Source | MySQL function list; PG `to_hex` |
 | Importance | Medium — appears in display-format generated columns |
 
