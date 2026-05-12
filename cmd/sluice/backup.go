@@ -31,8 +31,13 @@ type EncryptionFlags struct {
 	EncryptionPassphraseEnv  string `name:"encryption-passphrase-env" help:"Read encryption passphrase from this environment variable. Recommended over --encryption-passphrase for production." placeholder:"VAR"`
 	EncryptionPassphraseFile string `name:"encryption-passphrase-file" help:"Read encryption passphrase from this file path. Recommended for secrets-management integrations (1Password CLI, AWS Secrets Manager, etc.)." placeholder:"PATH"`
 
-	KMSKeyARN string `name:"kms-key-arn" help:"AWS KMS key ARN, alias ARN, or alias/name for envelope encryption (Phase 6.2). Mutually exclusive with --encryption-passphrase{,-env,-file}. Sluice routes CEK wrap/unwrap through KMS Encrypt/Decrypt; the KMS root key never leaves AWS." placeholder:"ARN"`
+	KMSKeyARN string `name:"kms-key-arn" help:"AWS KMS key ARN, alias ARN, or alias/name for envelope encryption (Phase 6.2). Mutually exclusive with the other --*-key flags. Sluice routes CEK wrap/unwrap through KMS Encrypt/Decrypt; the KMS root key never leaves AWS." placeholder:"ARN"`
 	KMSRegion string `name:"kms-region" help:"AWS region override for KMS calls. Defaults to AWS_REGION env var or the SDK's default region resolution." placeholder:"REGION"`
+
+	GCPKMSKeyResource string `name:"gcp-kms-key-resource" help:"GCP Cloud KMS crypto-key resource name for envelope encryption (Phase 6.3). Format: projects/PROJECT/locations/LOCATION/keyRings/RING/cryptoKeys/KEY (optionally with /cryptoKeyVersions/VERSION). Mutually exclusive with other --*-key flags. Auth via Application Default Credentials (gcloud auth application-default login or GOOGLE_APPLICATION_CREDENTIALS)." placeholder:"RESOURCE"`
+
+	AzureKeyVaultID    string `name:"azure-key-vault-id" help:"Azure Key Vault key identifier URL for envelope encryption (Phase 6.3). Format: https://VAULT.vault.azure.net/keys/KEY[/VERSION] (or managedhsm.azure.net for HSM-backed vaults). Mutually exclusive with other --*-key flags. Auth via DefaultAzureCredential (az login, managed identity, or AZURE_* env vars)." placeholder:"URL"`
+	AzureWrapAlgorithm string `name:"azure-wrap-algorithm" help:"Override the Azure Key Vault wrap algorithm. Defaults to RSA-OAEP-256 (works for software-protected RSA keys). HSM-backed AES keys need 'A256KW'." placeholder:"ALG"`
 
 	EncryptMode string `name:"encrypt-mode" enum:"per-chain,per-chunk" default:"per-chain" help:"Encryption mode: 'per-chain' (single CEK per chain; default; one KEK derive / KMS Decrypt per restore) or 'per-chunk' (one CEK per chunk; defense-in-depth at the cost of per-chunk wrap)."`
 }
@@ -104,6 +109,12 @@ func (e *EncryptionFlags) buildBackupEncryption() (*pipeline.BackupEncryption, e
 		if e.KMSKeyARN != "" {
 			return nil, errors.New("--kms-key-arn is set but --encrypt is not; pass --encrypt to enable encryption")
 		}
+		if e.GCPKMSKeyResource != "" {
+			return nil, errors.New("--gcp-kms-key-resource is set but --encrypt is not; pass --encrypt to enable encryption")
+		}
+		if e.AzureKeyVaultID != "" {
+			return nil, errors.New("--azure-key-vault-id is set but --encrypt is not; pass --encrypt to enable encryption")
+		}
 		return nil, nil
 	}
 	if err := e.validateKeySources(); err != nil {
@@ -113,15 +124,36 @@ func (e *EncryptionFlags) buildBackupEncryption() (*pipeline.BackupEncryption, e
 	if mode == "" {
 		mode = crypto.EncryptModePerChain
 	}
-	if e.KMSKeyARN != "" {
+	switch {
+	case e.KMSKeyARN != "":
 		env, err := crypto.NewKMSEnvelope(kongContext(), e.KMSKeyARN, kmsOpts(e.KMSRegion)...)
 		if err != nil {
-			return nil, fmt.Errorf("encryption: build kms envelope: %w", err)
+			return nil, fmt.Errorf("encryption: build aws kms envelope: %w", err)
 		}
 		return &pipeline.BackupEncryption{
 			Envelope: env,
 			Mode:     mode,
 			KEKRef:   e.KMSKeyARN,
+		}, nil
+	case e.GCPKMSKeyResource != "":
+		env, err := crypto.NewGCPKMSEnvelope(kongContext(), e.GCPKMSKeyResource)
+		if err != nil {
+			return nil, fmt.Errorf("encryption: build gcp kms envelope: %w", err)
+		}
+		return &pipeline.BackupEncryption{
+			Envelope: env,
+			Mode:     mode,
+			KEKRef:   e.GCPKMSKeyResource,
+		}, nil
+	case e.AzureKeyVaultID != "":
+		env, err := crypto.NewAzureKMSEnvelope(kongContext(), e.AzureKeyVaultID, azureKMSOpts(e.AzureWrapAlgorithm)...)
+		if err != nil {
+			return nil, fmt.Errorf("encryption: build azure kms envelope: %w", err)
+		}
+		return &pipeline.BackupEncryption{
+			Envelope: env,
+			Mode:     mode,
+			KEKRef:   e.AzureKeyVaultID,
 		}, nil
 	}
 	passphrase, err := e.resolvePassphrase()
@@ -149,25 +181,50 @@ func (e *EncryptionFlags) buildBackupEncryption() (*pipeline.BackupEncryption, e
 // happens.
 func (e *EncryptionFlags) validateKeySources() error {
 	hasPassphrase := e.EncryptionPassphrase != "" || e.EncryptionPassphraseEnv != "" || e.EncryptionPassphraseFile != ""
-	hasKMS := e.KMSKeyARN != ""
-	if hasPassphrase && hasKMS {
-		return errors.New("--encryption-passphrase{,-env,-file} and --kms-key-arn are mutually exclusive")
+	hasAWSKMS := e.KMSKeyARN != ""
+	hasGCPKMS := e.GCPKMSKeyResource != ""
+	hasAzureKMS := e.AzureKeyVaultID != ""
+	count := 0
+	for _, v := range []bool{hasPassphrase, hasAWSKMS, hasGCPKMS, hasAzureKMS} {
+		if v {
+			count++
+		}
 	}
-	if !hasPassphrase && !hasKMS {
-		return errors.New("--encrypt requires one of --encryption-passphrase{,-env,-file} or --kms-key-arn")
+	if count > 1 {
+		return errors.New("--encryption-passphrase{,-env,-file}, --kms-key-arn, --gcp-kms-key-resource, and --azure-key-vault-id are mutually exclusive")
+	}
+	if count == 0 {
+		return errors.New("--encrypt requires one of --encryption-passphrase{,-env,-file}, --kms-key-arn, --gcp-kms-key-resource, or --azure-key-vault-id")
 	}
 	return nil
 }
 
-// kmsOpts builds the [crypto.KMSOption] slice for the production
-// path. Only the region override is operator-facing; tests construct
-// envelopes via [crypto.WithKMSClient] directly without going through
-// the CLI builder.
+// kmsOpts builds the [crypto.KMSOption] slice for the AWS path. Only
+// the region override is operator-facing; tests construct envelopes
+// via [crypto.WithKMSClient] directly without going through the CLI
+// builder.
 func kmsOpts(region string) []crypto.KMSOption {
 	if region == "" {
 		return nil
 	}
 	return []crypto.KMSOption{crypto.WithKMSRegion(region)}
+}
+
+// azureKMSOpts builds the [crypto.AzureKMSOption] slice for the
+// Azure path. Today only the wrap-algorithm override is
+// operator-facing; tests construct envelopes via
+// [crypto.WithAzureKMSClient] directly.
+//
+// The wrap-algorithm string is a verbatim Key Vault algorithm name
+// (RSA-OAEP, RSA-OAEP-256, A256KW, etc.) — the Azure SDK accepts
+// the type as `azkeys.EncryptionAlgorithm`, which is a typed string
+// alias. We pass through whatever the operator typed; an invalid
+// algorithm name surfaces as a BadParameter from the service.
+func azureKMSOpts(wrapAlgorithm string) []crypto.AzureKMSOption {
+	if wrapAlgorithm == "" {
+		return nil
+	}
+	return []crypto.AzureKMSOption{crypto.WithAzureWrapAlgorithmString(wrapAlgorithm)}
 }
 
 // passphraseRebuildForChain returns a builder closure that the
@@ -222,10 +279,23 @@ func (e *EncryptionFlags) buildReadEnvelope(rootManifest *ir.Manifest) (crypto.E
 	if err := e.validateKeySources(); err != nil {
 		return nil, err
 	}
-	if e.KMSKeyARN != "" {
+	switch {
+	case e.KMSKeyARN != "":
 		env, err := crypto.NewKMSEnvelope(kongContext(), e.KMSKeyARN, kmsOpts(e.KMSRegion)...)
 		if err != nil {
-			return nil, fmt.Errorf("encryption: build kms read envelope: %w", err)
+			return nil, fmt.Errorf("encryption: build aws kms read envelope: %w", err)
+		}
+		return env, nil
+	case e.GCPKMSKeyResource != "":
+		env, err := crypto.NewGCPKMSEnvelope(kongContext(), e.GCPKMSKeyResource)
+		if err != nil {
+			return nil, fmt.Errorf("encryption: build gcp kms read envelope: %w", err)
+		}
+		return env, nil
+	case e.AzureKeyVaultID != "":
+		env, err := crypto.NewAzureKMSEnvelope(kongContext(), e.AzureKeyVaultID, azureKMSOpts(e.AzureWrapAlgorithm)...)
+		if err != nil {
+			return nil, fmt.Errorf("encryption: build azure kms read envelope: %w", err)
 		}
 		return env, nil
 	}

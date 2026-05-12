@@ -317,7 +317,81 @@ func TestEncryptionFlags_EncryptWithoutAnyKey(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected --encrypt-without-key to error")
 	}
-	if !strings.Contains(err.Error(), "encryption-passphrase") || !strings.Contains(err.Error(), "kms-key-arn") {
-		t.Errorf("error should name both passphrase and kms options; got %v", err)
+	for _, want := range []string{"encryption-passphrase", "kms-key-arn", "gcp-kms-key-resource", "azure-key-vault-id"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error should name %q; got %v", want, err)
+		}
+	}
+}
+
+// TestEncryptionFlags_AllProvidersMutuallyExclusive pins Phase 6.3's
+// broadened contract: AWS / GCP / Azure / passphrase are all
+// pairwise mutually exclusive.
+func TestEncryptionFlags_AllProvidersMutuallyExclusive(t *testing.T) {
+	const (
+		awsARN     = "arn:aws:kms:us-east-1:1:key/x"
+		gcpRes     = "projects/p/locations/us/keyRings/r/cryptoKeys/k"
+		azureURL   = "https://v.vault.azure.net/keys/k"
+		passphrase = "secret"
+	)
+	cases := []struct {
+		name  string
+		flags EncryptionFlags
+	}{
+		{"passphrase+aws", EncryptionFlags{Encrypt: true, EncryptionPassphrase: passphrase, KMSKeyARN: awsARN}},
+		{"passphrase+gcp", EncryptionFlags{Encrypt: true, EncryptionPassphrase: passphrase, GCPKMSKeyResource: gcpRes}},
+		{"passphrase+azure", EncryptionFlags{Encrypt: true, EncryptionPassphrase: passphrase, AzureKeyVaultID: azureURL}},
+		{"aws+gcp", EncryptionFlags{Encrypt: true, KMSKeyARN: awsARN, GCPKMSKeyResource: gcpRes}},
+		{"aws+azure", EncryptionFlags{Encrypt: true, KMSKeyARN: awsARN, AzureKeyVaultID: azureURL}},
+		{"gcp+azure", EncryptionFlags{Encrypt: true, GCPKMSKeyResource: gcpRes, AzureKeyVaultID: azureURL}},
+		{"all-four", EncryptionFlags{
+			Encrypt:              true,
+			EncryptionPassphrase: passphrase,
+			KMSKeyARN:            awsARN,
+			GCPKMSKeyResource:    gcpRes,
+			AzureKeyVaultID:      azureURL,
+		}},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := tc.flags.buildBackupEncryption(); err == nil {
+				t.Fatal("expected mutual-exclusion error; got nil")
+			} else if !strings.Contains(err.Error(), "mutually exclusive") {
+				t.Errorf("error should name mutual exclusion; got %v", err)
+			}
+		})
+	}
+}
+
+// TestEncryptionFlags_GCPAzureWithoutEncrypt mirrors the
+// passphrase-without-encrypt / kms-without-encrypt sanity checks for
+// the two new Phase 6.3 providers.
+func TestEncryptionFlags_GCPAzureWithoutEncrypt(t *testing.T) {
+	cases := []struct {
+		name  string
+		flags EncryptionFlags
+		want  string
+	}{
+		{
+			"gcp",
+			EncryptionFlags{GCPKMSKeyResource: "projects/p/locations/us/keyRings/r/cryptoKeys/k"},
+			"--gcp-kms-key-resource",
+		},
+		{
+			"azure",
+			EncryptionFlags{AzureKeyVaultID: "https://v.vault.azure.net/keys/k"},
+			"--azure-key-vault-id",
+		},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := tc.flags.buildBackupEncryption(); err == nil {
+				t.Fatal("expected error")
+			} else if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error should name %q; got %v", tc.want, err)
+			}
+		})
 	}
 }
