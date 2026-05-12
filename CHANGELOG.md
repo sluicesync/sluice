@@ -6,6 +6,44 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.39.0]
+
+**Translator-gap preflight scan integrated into `schema preview`.** Operators running cross-engine MySQL → Postgres migrations now see an upfront advisory listing every MySQL expression-body pattern sluice's translator catalog deliberately doesn't auto-rewrite. Before v0.39.0, the deferred rules surfaced as either loud failures at PG apply time (visible but late) or silent runtime divergences (invisible until row data ships through and a downstream consumer notices). The scan brings them forward into the preview, with operator-actionable workaround hints.
+
+### Added
+
+- **`internal/translate/gaps.go` — translator-gap scanner.** `ScanMySQLToPGGaps(schema, sourceEngine, targetEngine, enabledExt)` walks every `DefaultExpression` body, `Column.GeneratedExpr`, and `CheckConstraint.Expr` whose dialect tag is `mysql`, and returns a sorted list of `Gap` entries for any pattern matching the catalog's 7 deliberately-deferred rules:
+  - `GREATEST` / `LEAST` (rule #11, silent divergence: PG ignores NULL args, MySQL propagates)
+  - `REGEXP_LIKE` (rule #13, silent on PG 15+: POSIX vs ICU regex flavour)
+  - `FIND_IN_SET` (rule #21, loud failure: no portable PG equivalent in DDL context)
+  - `CONVERT_TZ` (rule #23, loud failure: no PG core equivalent)
+  - `INET_ATON` / `INET_NTOA` (rule #29, loud failure: no portable PG equivalent without custom function)
+  - `SHA1` / `SHA2` (rule #10, loud failure: requires pgcrypto — suppressed when `--enable-pg-extension pgcrypto` is set since the v0.38.0 rewrite ships)
+  
+  Detection is case-insensitive with word-boundary matching (rejects `IS_GREATEST_HIT(` etc.). Returns `nil` for non-MySQL-to-PG engine pairs.
+
+- **`sluice schema preview` renders the gaps section** in both text and JSON outputs:
+  - **Text format**: a `Translator gaps (MySQL → Postgres)` section before the per-table DDL listing the catalog rule number, severity (`loud` / `silent`), source location (`table.column` or `CHECK constraint name`), raw expression text, and the operator-actionable note (typically `--expr-override` snippet, `--type-override` recommendation, or `--enable-pg-extension` flag).
+  - **JSON format**: new `translator_gaps` top-level field with stable shape (`{table, column, constraint, field, pattern, rule, severity, expression, note}`). Omitted entirely when no gaps detected. CI gates can fail the migration plan on any `"severity": "loud"` entry.
+
+- **Header summary line in text output**: when ≥ 1 gap is detected, the preview's header gains a `-- translator gaps: N (see section below)` line alongside the existing `-- advisory hints: N` line. Operators eyeballing the preview see the count at a glance.
+
+### Migration / Compatibility
+
+- **Drop-in upgrade from v0.38.x.** No CLI flag changes; the scan is enabled by default. Same-engine and PG → MySQL operators see no behaviour change (the scanner returns nil for non-MySQL-to-PG pairs). Cross-engine MySQL → PG operators with no detected gaps see an unchanged preview (the new section is skipped entirely when the gap list is empty).
+- **JSON consumers**: the `translator_gaps` field is additive; existing parsers that don't know about it ignore it. Tooling can opt into reading it for CI-gate or migration-plan-review use cases.
+
+### Who needs this release
+
+- **Cross-engine MySQL → Postgres operators preparing a migration**: **upgrade and run `sluice schema preview`** before the actual migrate. The gaps section will surface any deferred-pattern usage in your source schema — much cheaper than discovering them at PG apply time (loud failures) or in production output (silent divergences).
+- **CI gates / migration-plan-review tools**: the JSON shape's `severity` field gives a clean fail-on-loud gate. Sample jq expression: `jq '.translator_gaps | map(select(.severity == "loud")) | length == 0' preview.json` returns true when no loud gaps detected.
+- **Operators not using MySQL → Postgres**: drop-in; the scanner is a no-op for other engine pairs.
+
+### Verification surface
+
+- 11 new unit tests in `internal/translate/gaps_test.go` covering each pattern's detection shape, the pgcrypto gate suppressing SHA1/SHA2 emissions, case-insensitive matching, word-boundary false-positive rejection, non-cross-engine no-op behaviour, DEFAULT/GENERATED/CHECK field coverage, dialect-tag filtering, nil-schema safety, severity stringification, and note-wording-contains-workaround sanity. All pass.
+- Existing preview + translator tests regression-clean.
+
 ## [0.38.0]
 
 **pgcrypto catalog entry + MD5/SHA1/SHA2 translator rules.** Re-examines the v0.37.0 deferral verdict for catalog rule #10 (hash family). Closer analysis split the rule into a core-PG path (MD5, no extension needed) and a pgcrypto-backed path (SHA1, SHA2). Total catalog coverage: 28 of 30 rules.

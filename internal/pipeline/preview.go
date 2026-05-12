@@ -107,6 +107,26 @@ type PreviewJSON struct {
 	SourceEngine string             `json:"source_engine"`
 	TargetEngine string             `json:"target_engine"`
 	Tables       []PreviewJSONTable `json:"tables"`
+	// TranslatorGaps is the v0.39.0 MySQL → PG translator-gap scan
+	// result. Omitted for non-cross-engine pairs and when the scan
+	// detected nothing.
+	TranslatorGaps []PreviewJSONTranslatorGap `json:"translator_gaps,omitempty"`
+}
+
+// PreviewJSONTranslatorGap is one detected MySQL → PG translator
+// gap. Stable shape for tooling consumers (CI gates, schema-diff
+// scripts) that want to fail the migration plan on any "loud"
+// severity entry. v0.39.0.
+type PreviewJSONTranslatorGap struct {
+	Table      string `json:"table"`
+	Column     string `json:"column,omitempty"`
+	Constraint string `json:"constraint,omitempty"`
+	Field      string `json:"field"` // "DEFAULT" / "GENERATED" / "CHECK"
+	Pattern    string `json:"pattern"`
+	RuleNum    int    `json:"rule"`
+	Severity   string `json:"severity"` // "loud" / "silent"
+	Expression string `json:"expression"`
+	Note       string `json:"note"`
 }
 
 // PreviewJSONTable is one table's worth of preview output.
@@ -224,6 +244,15 @@ func (p *Previewer) Run(ctx context.Context) error {
 		srcByTable:   srcByTable,
 		tgtByTable:   tgtByTable,
 		appliedAlias: appliedOverrideAliases(p.Mappings),
+		// Translator-gap scanner (v0.39.0): surface MySQL → PG
+		// patterns the catalog deliberately doesn't auto-translate so
+		// the operator gets an advisory before migrate rather than a
+		// surprise at apply-time or a silent runtime divergence.
+		// Returns nil for non-MySQL → PG pairs.
+		translatorGaps: translate.ScanMySQLToPGGaps(
+			srcSchema, p.Source.Name(), p.Target.Name(),
+			enabledExtensionSet(p.EnabledPGExtensions),
+		),
 	}
 
 	switch strings.ToLower(strings.TrimSpace(p.Format)) {
@@ -255,12 +284,27 @@ func (p *Previewer) validate() error {
 // previewBundle bundles the data renderPreviewText / renderPreviewJSON
 // consume so the formatters don't take a half-dozen parameters.
 type previewBundle struct {
-	srcEngine    string
-	tgtEngine    string
-	tables       []previewTable
-	srcByTable   map[string]*ir.Table
-	tgtByTable   map[string]*ir.Table
-	appliedAlias map[string]bool // table.column → true when operator already applied an override
+	srcEngine      string
+	tgtEngine      string
+	tables         []previewTable
+	srcByTable     map[string]*ir.Table
+	tgtByTable     map[string]*ir.Table
+	appliedAlias   map[string]bool // table.column → true when operator already applied an override
+	translatorGaps []translate.Gap // v0.39.0 MySQL → PG translator-gap scan results (nil for non-cross-engine pairs)
+}
+
+// enabledExtensionSet converts the operator's `--enable-pg-extension`
+// flag values (a string slice) into the set shape sluice's scanner
+// + translator helpers consume.
+func enabledExtensionSet(flags []string) map[string]bool {
+	if len(flags) == 0 {
+		return nil
+	}
+	out := make(map[string]bool, len(flags))
+	for _, f := range flags {
+		out[f] = true
+	}
+	return out
 }
 
 // previewTable groups DDL statements + computed notes/hints per
@@ -414,7 +458,14 @@ func renderPreviewText(w io.Writer, bundle previewBundle) error {
 	fmt.Fprintf(&sb, "-- target: %s\n", bundle.tgtEngine)
 	fmt.Fprintf(&sb, "-- mappings applied: %d\n", len(bundle.appliedAlias))
 	fmt.Fprintf(&sb, "-- advisory hints: %d\n", totalHints)
+	if n := len(bundle.translatorGaps); n > 0 {
+		fmt.Fprintf(&sb, "-- translator gaps: %d (see section below)\n", n)
+	}
 	sb.WriteByte('\n')
+
+	if len(bundle.translatorGaps) > 0 {
+		writeTranslatorGapsSection(&sb, bundle.translatorGaps)
+	}
 
 	for _, t := range bundle.tables {
 		notes := tableNotes[t.name]
@@ -424,6 +475,39 @@ func renderPreviewText(w io.Writer, bundle previewBundle) error {
 
 	_, err := io.WriteString(w, sb.String())
 	return err
+}
+
+// writeTranslatorGapsSection appends the MySQL → PG translator-gap
+// advisory block to sb. Each gap names the catalog rule number,
+// severity (loud → PG parse-fails at apply; silent → PG accepts but
+// diverges), source location (table.column or constraint), and
+// operator-actionable next step. v0.39.0.
+func writeTranslatorGapsSection(sb *strings.Builder, gaps []translate.Gap) {
+	sb.WriteString("-- ============================================================\n")
+	sb.WriteString("-- Translator gaps (MySQL → Postgres)\n")
+	sb.WriteString("-- ============================================================\n")
+	sb.WriteString("-- sluice's translator catalog does not auto-rewrite the patterns\n")
+	sb.WriteString("-- below. Each entry names the catalog rule, the severity, the\n")
+	sb.WriteString("-- source location, and an actionable workaround. See\n")
+	sb.WriteString("-- docs/dev/translator-coverage.md for the per-rule analysis.\n")
+	sb.WriteString("--\n")
+	sb.WriteString("-- Severity:\n")
+	sb.WriteString("--   loud   → PG parse-fails at apply time (visible immediately)\n")
+	sb.WriteString("--   silent → PG accepts but produces different output than MySQL\n")
+	sb.WriteString("--            (no error; divergence surfaces in row data later)\n")
+	sb.WriteString("--\n")
+	for _, g := range gaps {
+		fmt.Fprintf(sb, "-- [%s] rule #%d %s — ", g.Severity, g.RuleNum, g.Pattern)
+		if g.Constraint != "" {
+			fmt.Fprintf(sb, "%s CHECK constraint %q", g.Table, g.Constraint)
+		} else {
+			fmt.Fprintf(sb, "%s.%s %s", g.Table, g.Column, g.Field)
+		}
+		sb.WriteByte('\n')
+		fmt.Fprintf(sb, "--     expr: %s\n", g.Expression)
+		fmt.Fprintf(sb, "--     note: %s\n", g.Note)
+	}
+	sb.WriteByte('\n')
 }
 
 // writeTableSection appends one table's preview block to sb. The
@@ -596,6 +680,19 @@ func renderPreviewJSON(w io.Writer, bundle previewBundle) error {
 			})
 		}
 		out.Tables = append(out.Tables, jt)
+	}
+	for _, g := range bundle.translatorGaps {
+		out.TranslatorGaps = append(out.TranslatorGaps, PreviewJSONTranslatorGap{
+			Table:      g.Table,
+			Column:     g.Column,
+			Constraint: g.Constraint,
+			Field:      g.Field,
+			Pattern:    g.Pattern,
+			RuleNum:    g.RuleNum,
+			Severity:   g.Severity.String(),
+			Expression: g.Expression,
+			Note:       g.Note,
+		})
 	}
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
