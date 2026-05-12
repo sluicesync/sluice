@@ -6,6 +6,38 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.36.0]
+
+**View support Phase 2 — `sluice matview refresh` subcommand.** Closes Roadmap Item 13 Phase 2. PostgreSQL-only; operators drive the refresh cadence from their own scheduler (cron / k8s CronJob / Airflow). Sluice deliberately does NOT own a refresh loop because cadence is operator-policy and external scheduling brings alerting / backoff / observability operators already have.
+
+### Added
+
+- **`sluice matview refresh --target=DSN --target-driver=postgres [--matview NAME] [--concurrently] [--target-schema=NAME] [--format=text|json]`** (`cmd/sluice/matview.go`). New top-level subcommand that drives `REFRESH MATERIALIZED VIEW [CONCURRENTLY] schema.name` against every matview in the target schema (or only those named by repeated `--matview NAME` flags).
+- **Concurrent refresh path with unique-index preflight.** PG's `REFRESH MATERIALIZED VIEW CONCURRENTLY` requires a unique index on the matview; the path queries `pg_indexes` for one and falls back to a clear operator-actionable skip (matview name + reason naming the missing-unique-index requirement) instead of letting PG return its less-clear error mid-refresh.
+- **Loud-failure on missing matview filter.** `--matview NAME` where NAME doesn't exist in `pg_matviews` surfaces as a clear error naming every missing matview — better than silently no-op'ing a typo. The validation runs before any REFRESH call.
+- **Per-matview timing in output**. Text format renders human-readable rows (`refreshed: schema.name (123ms)` / `skipped: schema.name — reason`); JSON format emits `{"refreshed": [{"schema":...,"name":...,"duration_ms":...}], "skipped": [...]}` for metric-scraper integration.
+- **`internal/engines/postgres/matview_refresh.go`** carries the engine-internal `MatviewRefreshOptions` + `RefreshMatviews(ctx, db, opts)` API. The CLI is the operator surface; programmatic callers (future sync-loop integration, if it ever lands) consume the package surface directly.
+
+### Migration / Compatibility
+
+- **Drop-in upgrade from v0.35.x.** No format changes, no engine-interface changes (the implementation lives in the postgres package only — MySQL is unaffected). The new subcommand is additive; pre-existing CLI invocations work unchanged.
+- **PostgreSQL-only.** `sluice matview refresh --target-driver=mysql` refuses with a clear error naming MySQL's lack of matview concept; operators with MySQL targets should manage materialised-view-equivalent caching tables manually.
+
+### Phase 3 — deferred
+
+Phase 3 (cross-engine view-body translation via a SELECT-grammar translator) remains deferred. Phase 1's loud-failure-at-apply-time path handles non-portable view definitions today; `--view-override TABLE.VIEW=DEFINITION` (Phase 3 escape hatch) hasn't shipped because real operator demand for cross-engine views hasn't surfaced. Revisit when a concrete cross-engine view workflow surfaces.
+
+### Who needs this release
+
+- **PG operators with materialized views that should refresh on a cadence:** **upgrade** — `sluice matview refresh` is the operator-cadence-agnostic subcommand to wire into cron / k8s CronJob / Airflow. For matviews with a unique index, prefer `--concurrently` so reads keep working during the refresh.
+- **PG operators with matview cron pipelines they already manage** (pg_cron, manual `REFRESH MATERIALIZED VIEW` calls): drop-in; sluice doesn't displace your existing setup. The new subcommand is one more option, not a replacement.
+- **MySQL operators**: drop-in; the new command refuses with a clear error if invoked against a MySQL target. No impact on existing flows.
+
+### Verification surface
+
+- **3 unit tests** in `matview_refresh_test.go` covering SQL-statement shape across the four arg permutations, the filter-by-name behaviour, and the loud-failure-on-typo path.
+- **5 integration tests** in `matview_refresh_integration_test.go` (against `postgres:16` testcontainers) covering plain refresh round-trip (pre/post row counts), concurrent refresh with unique index, concurrent refresh skipped when no unique index exists, `--matview` filter narrowing, and missing-matview loud-failure. All pass locally; CI runs them under the `integration` build tag.
+
 ## [0.35.0]
 
 **Translator catalog batch — six additional MySQL → Postgres rewrite rules.** Closes Roadmap Item 5's outstanding medium-leverage entries. Brings the total to 22 of 30 catalog rules shipped; the remaining 8 are deliberately deferred per the catalog's own per-rule guidance and have actionable `--expr-override` workarounds.
