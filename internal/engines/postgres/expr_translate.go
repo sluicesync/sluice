@@ -80,6 +80,7 @@
 package postgres
 
 import (
+	"fmt"
 	"strings"
 	"unicode"
 )
@@ -186,6 +187,14 @@ func translateExprForPG(expr string, ctx ExprContext) string {
 	expr = rewriteWEEKOFYEAR(expr)
 	expr = rewriteQUARTER(expr)
 	expr = rewriteDATEDIFF(expr)
+	// v0.37.0 — three additional catalog rules from
+	// docs/dev/translator-coverage.md. Each was previously deferred;
+	// closer review made the case for shipping each one cleaner than
+	// the catalog's original "skip" verdict suggested.
+	expr = rewriteTIMESTAMPDIFF(expr)
+	expr = rewriteJSONOBJECT(expr)
+	expr = rewriteJSONARRAY(expr)
+	expr = rewriteLASTDAY(expr)
 	// v0.11.3 — operator-form INTERVAL rewrite. MySQL canonicalizes
 	// `DATE_ADD(d, INTERVAL N UNIT)` to the operator form
 	// `(d + interval N unit)` when a generated-column body is read
@@ -1703,5 +1712,165 @@ func rewriteDATEDIFF(expr string) string {
 			return ""
 		}
 		return "(" + strings.TrimSpace(args[0]) + "::date - " + strings.TrimSpace(args[1]) + "::date)"
+	})
+}
+
+// ============================================================
+// v0.37.0 catalog batch — three additional rules from
+// docs/dev/translator-coverage.md that were previously deferred. The
+// catalog's per-rule deferral reasoning for these three didn't fully
+// hold up under closer review:
+//
+//   - #16 TIMESTAMPDIFF — the "unit-cross-product makes the rule
+//     table unwieldy" objection turns out to be 8-9 mechanical arms
+//     in one switch. Manageable; ships.
+//   - #20 JSON_OBJECT / JSON_ARRAY — the "needs version-aware emit"
+//     objection vanishes by always emitting JSON_BUILD_OBJECT /
+//     JSON_BUILD_ARRAY (works on every PG version sluice supports;
+//     pre-16 needs them, ≥16 still accepts them). No detection
+//     needed.
+//   - #24 LAST_DAY — the "verbose 5-token expansion" objection is
+//     real but trivial; the rewrite is mechanical and operator-
+//     visible.
+//
+// The 6 rules still deferred (#10 MD5/SHA family, #11 GREATEST/LEAST,
+// #13 REGEXP_LIKE, #21 FIND_IN_SET, #23 CONVERT_TZ, #29 INET_*) each
+// have a load-bearing catalog reason that stands — extension
+// boundary, NULL-semantics divergence, ICU-vs-POSIX regex flavour,
+// invalid-in-CHECK/GENERATED LATERAL, TZ-semantics fuzziness, or
+// no-portable-equivalent. All six have actionable --expr-override
+// workarounds.
+// ============================================================
+
+// rewriteTIMESTAMPDIFF rewrites MySQL's `TIMESTAMPDIFF(unit, a, b)`
+// (returns the difference between a and b in the given unit, as a
+// truncated-toward-zero integer) to PG-equivalent expressions.
+// Catalog rule #16.
+//
+// Per-unit emit shapes:
+//
+//   - MICROSECOND → `(EXTRACT(EPOCH FROM (b - a)) * 1000000)::bigint`
+//   - SECOND      → `EXTRACT(EPOCH FROM (b - a))::bigint`
+//   - MINUTE      → `(EXTRACT(EPOCH FROM (b - a)) / 60)::bigint`
+//   - HOUR        → `(EXTRACT(EPOCH FROM (b - a)) / 3600)::bigint`
+//   - DAY         → `(b::date - a::date)` (date subtraction returns int)
+//   - WEEK        → `((b::date - a::date) / 7)`
+//   - MONTH       → `(EXTRACT(YEAR FROM AGE(b, a)) * 12 + EXTRACT(MONTH FROM AGE(b, a)))::int`
+//   - QUARTER     → same as MONTH with `/ 3`
+//   - YEAR        → `EXTRACT(YEAR FROM AGE(b, a))::int`
+//
+// MySQL's TIMESTAMPDIFF returns COMPLETE calendar units (truncated
+// toward zero), not duration-based units. The MONTH/QUARTER/YEAR
+// arms use `AGE(b, a)` which returns a calendar-aware interval
+// matching MySQL's semantic. DAY and below are duration-based, where
+// EPOCH or date-subtraction is the right primitive.
+//
+// Falls through verbatim on unrecognised unit names, non-3-arg
+// shapes, or empty args. Operators with unusual unit specifiers can
+// always use `--expr-override`.
+func rewriteTIMESTAMPDIFF(expr string) string {
+	return rewriteFunctionCalls(expr, "TIMESTAMPDIFF", func(args []string) string {
+		if len(args) != 3 {
+			return ""
+		}
+		unit := strings.ToUpper(strings.TrimSpace(args[0]))
+		a := strings.TrimSpace(args[1])
+		b := strings.TrimSpace(args[2])
+		if unit == "" || a == "" || b == "" {
+			return ""
+		}
+		switch unit {
+		case "MICROSECOND":
+			return fmt.Sprintf("(EXTRACT(EPOCH FROM (%s - %s)) * 1000000)::bigint", b, a)
+		case "SECOND":
+			return fmt.Sprintf("EXTRACT(EPOCH FROM (%s - %s))::bigint", b, a)
+		case "MINUTE":
+			return fmt.Sprintf("(EXTRACT(EPOCH FROM (%s - %s)) / 60)::bigint", b, a)
+		case "HOUR":
+			return fmt.Sprintf("(EXTRACT(EPOCH FROM (%s - %s)) / 3600)::bigint", b, a)
+		case "DAY":
+			return fmt.Sprintf("(%s::date - %s::date)", b, a)
+		case "WEEK":
+			return fmt.Sprintf("((%s::date - %s::date) / 7)", b, a)
+		case "MONTH":
+			return fmt.Sprintf("(EXTRACT(YEAR FROM AGE(%s, %s)) * 12 + EXTRACT(MONTH FROM AGE(%s, %s)))::int", b, a, b, a)
+		case "QUARTER":
+			return fmt.Sprintf("((EXTRACT(YEAR FROM AGE(%s, %s)) * 12 + EXTRACT(MONTH FROM AGE(%s, %s))) / 3)::int", b, a, b, a)
+		case "YEAR":
+			return fmt.Sprintf("EXTRACT(YEAR FROM AGE(%s, %s))::int", b, a)
+		}
+		return ""
+	})
+}
+
+// rewriteJSONOBJECT rewrites MySQL's `JSON_OBJECT(k1, v1, k2, v2, ...)`
+// (positional key/value pairs) to PG's `JSON_BUILD_OBJECT(k1, v1, k2,
+// v2, ...)`. Both are PG-portable across every version sluice
+// supports — pre-16 they're the only choice, ≥16 still accepts them.
+//
+// PG 16 added an SQL-standard `JSON_OBJECT(k1: v1, k2: v2)` syntax
+// with `:` separators; sluice deliberately doesn't emit that because
+// (a) we'd need server-version detection to know whether it's safe
+// and (b) JSON_BUILD_OBJECT produces equivalent JSON output, so
+// there's no operator-visible value in the choice.
+//
+// Catalog rule #20. Falls through on empty or zero-arg shapes.
+//
+// MySQL accepts JSON_OBJECT with an odd-count arg list (last key has
+// no value); PG's JSON_BUILD_OBJECT rejects that. The rewrite passes
+// the count through unchanged — if MySQL accepted odd args, PG will
+// catch the malformed call at apply time (loud-failure tenet).
+func rewriteJSONOBJECT(expr string) string {
+	return rewriteFunctionCalls(expr, "JSON_OBJECT", func(args []string) string {
+		if len(args) == 0 {
+			return ""
+		}
+		trimmed := make([]string, len(args))
+		for i, a := range args {
+			trimmed[i] = strings.TrimSpace(a)
+		}
+		return "JSON_BUILD_OBJECT(" + strings.Join(trimmed, ", ") + ")"
+	})
+}
+
+// rewriteJSONARRAY rewrites MySQL's `JSON_ARRAY(a, b, c)` to PG's
+// `JSON_BUILD_ARRAY(a, b, c)`. Same version-agnostic shipping
+// strategy as [rewriteJSONOBJECT] — JSON_BUILD_ARRAY works on every
+// PG version sluice supports, including PG 16+. Catalog rule #20.
+//
+// Empty `JSON_ARRAY()` is a valid MySQL form returning `[]`; PG's
+// `JSON_BUILD_ARRAY()` also returns `[]`. Pass through.
+func rewriteJSONARRAY(expr string) string {
+	return rewriteFunctionCalls(expr, "JSON_ARRAY", func(args []string) string {
+		trimmed := make([]string, len(args))
+		for i, a := range args {
+			trimmed[i] = strings.TrimSpace(a)
+		}
+		return "JSON_BUILD_ARRAY(" + strings.Join(trimmed, ", ") + ")"
+	})
+}
+
+// rewriteLASTDAY rewrites MySQL's `LAST_DAY(d)` (returns the last
+// day of the month containing d, as a date) to the PG-equivalent
+// date-truncation expression:
+//
+//	(DATE_TRUNC('month', d) + INTERVAL '1 month' - INTERVAL '1 day')::date
+//
+// Catalog rule #24. The rewrite is verbose (5 tokens vs MySQL's
+// single function call) but mechanical and produces identical output
+// on every date / timestamp input. Operators wanting a tighter
+// expression can use `--expr-override`.
+//
+// Falls through on non-1-arg shapes (MySQL only accepts 1 arg).
+func rewriteLASTDAY(expr string) string {
+	return rewriteFunctionCalls(expr, "LAST_DAY", func(args []string) string {
+		if len(args) != 1 {
+			return ""
+		}
+		d := strings.TrimSpace(args[0])
+		if d == "" {
+			return ""
+		}
+		return fmt.Sprintf("(DATE_TRUNC('month', %s) + INTERVAL '1 month' - INTERVAL '1 day')::date", d)
 	})
 }

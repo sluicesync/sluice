@@ -6,6 +6,33 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.37.0]
+
+**Translator catalog batch + two test-side fixes.** Re-examines the v0.35.0 deferral verdicts: three of the nine deferred rules ship under closer review. Brings total catalog coverage to 25 of 30 rules; the remaining 6 stay deferred with each having a load-bearing catalog reason that genuinely holds (extension boundary, NULL-semantics divergence, regex flavour, invalid-in-DDL LATERAL, TZ subtleties, no-portable-equivalent). All deferred rules have actionable `--expr-override` workarounds.
+
+### Added — translator catalog rules
+
+- **`TIMESTAMPDIFF(unit, a, b)` → unit-specific PG expression** (catalog #16). Nine units covered: MICROSECOND / SECOND / MINUTE / HOUR map to `EXTRACT(EPOCH FROM (b - a))` with unit scaling and `::bigint` cast; DAY / WEEK use date-subtraction (`(b::date - a::date)` / `/ 7`); MONTH / QUARTER / YEAR use `AGE(b, a)` for calendar-aware semantics matching MySQL's truncated-toward-zero behaviour. Unknown units fall through verbatim. The pre-v0.37.0 deferral rationale ("unit-cross-product makes the rule table unwieldy") turned out to be 9 mechanical arms in one switch — manageable, and it covers the high-frequency MySQL temporal-derived-column patterns.
+- **`JSON_OBJECT(k1, v1, k2, v2, …)` → `JSON_BUILD_OBJECT(k1, v1, k2, v2, …)`** and **`JSON_ARRAY(a, b, c)` → `JSON_BUILD_ARRAY(a, b, c)`** (catalog #20). The pre-v0.37.0 deferral rationale ("version-gated emit needed for PG 16+ vs older") vanishes by always emitting `JSON_BUILD_*` — they work on every PG version sluice supports, including PG 16+, with identical output semantics. No server-version detection needed.
+- **`LAST_DAY(d)` → `(DATE_TRUNC('month', d) + INTERVAL '1 month' - INTERVAL '1 day')::date`** (catalog #24). Verbose but mechanical; the v0.35.0 verdict ("probably one for `--expr-override`") was over-conservative — the rewrite is a single switch arm with a stable output shape.
+
+### Fixed — test-side bugs (no operator-visible behaviour change)
+
+- **Bug 55: `psverify` test `TestPSPG_CDCReaderBasic` stale on ADR-0027 markers.** Local `drainPSChanges` helper in `internal/engines/postgres/planetscale_verify_test.go` didn't filter `ir.TxBegin` / `ir.TxCommit` boundary markers; the integration-suite drain helper did. Post-ADR-0027 (which introduced transaction-boundary markers as first-class IR change types), the local helper accepted the markers into the `got` slice and missed trailing events. One-line fix: mirror the integration-suite filter pattern. Test-side only — production CDC reader works correctly; only the local test drain logic was stale.
+- **Bug 54: MySQL backup test flake `TestBackup_SnapshotAnchoredEndPosition_MySQLGapClosed`.** The during-window writer paced inserts at 50ms intervals starting after a 100ms head start; on fast machines, the 4th insert occasionally landed in the tight race window between snapshot `EndPosition` record and incremental CDC catch-up open. Widened pacing to 250ms intervals + 200ms head start, spreading writes across ~1.2s — well past both the snapshot's typical completion (<500ms) and the incremental's CDC reader's open lag. Verified by 3 consecutive PASS runs locally. Production invariant (v0.18.0 snapshot-anchored EndPosition gap closure) was correct throughout; only the test's writer pacing tripped the race.
+
+### Migration / Compatibility
+
+- **Drop-in upgrade from v0.36.x.** The three new translator rules only fire on cross-engine MySQL → PG migration when source DDL bodies contain the recognised function shapes; pre-existing schemas are unaffected. The test-side bug fixes have zero operator-visible effect.
+- **Operators with `--expr-override` workarounds for the three newly-shipped patterns** (`TIMESTAMPDIFF`, `JSON_OBJECT` / `JSON_ARRAY`, `LAST_DAY`): drop-in; the override stays a higher-priority path. Drop the override only if the catalog rewrite produces the right shape for your downstream consumers.
+
+### Who needs this release
+
+- **Cross-engine MySQL → Postgres operators whose source schemas use `TIMESTAMPDIFF`, `JSON_OBJECT`, `JSON_ARRAY`, or `LAST_DAY` in DEFAULT / GENERATED / CHECK bodies:** **upgrade** — the rewrites now ship in the catalog instead of needing `--expr-override`.
+- **Same-engine operators** (MySQL → MySQL, PG → PG): drop-in; the translator only fires on cross-engine pairs.
+- **psverify test users (cycle subagents running against real PlanetScale):** **upgrade** — Bug 55 fix removes a false-positive failure on the PG CDC test.
+- **MySQL integration-test users running `TestBackup_SnapshotAnchoredEndPosition_MySQLGapClosed`:** **upgrade** — Bug 54 fix eliminates the flake.
+
 ## [0.36.0]
 
 **View support Phase 2 — `sluice matview refresh` subcommand.** Closes Roadmap Item 13 Phase 2. PostgreSQL-only; operators drive the refresh cadence from their own scheduler (cron / k8s CronJob / Airflow). Sluice deliberately does NOT own a refresh loop because cadence is operator-policy and external scheduling brings alerting / backoff / observability operators already have.

@@ -70,9 +70,17 @@ func TestBackup_SnapshotAnchoredEndPosition_MySQLGapClosed(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		// Small head start so the snapshot tx has been opened (and
-		// gtid_executed captured) before we start writing.
-		time.Sleep(100 * time.Millisecond)
+		// Larger head start so the snapshot tx has been opened (and
+		// gtid_executed captured) before we start writing. Bug 54: the
+		// pre-fix 100ms head start + 50ms inter-write pacing put the
+		// 4th write at ~250ms which on a fast machine landed in the
+		// tight window between the snapshot's EndPosition record and
+		// the incremental's CDC catch-up open. Widening to 200ms head
+		// + 250ms inter-write spreads the writes across ~1.2s, which
+		// is well past both the snapshot's typical completion (<500ms)
+		// and the incremental's CDC reader's open lag (~tens of ms),
+		// so no write can land in the boundary window.
+		time.Sleep(200 * time.Millisecond)
 		db, err := sql.Open("mysql", sourceDSN)
 		if err != nil {
 			t.Errorf("during-window writer open: %v", err)
@@ -86,7 +94,7 @@ func TestBackup_SnapshotAnchoredEndPosition_MySQLGapClosed(t *testing.T) {
 				t.Errorf("during-window insert %d: %v", i, err)
 				return
 			}
-			time.Sleep(50 * time.Millisecond)
+			time.Sleep(250 * time.Millisecond)
 		}
 	}()
 

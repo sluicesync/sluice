@@ -1369,3 +1369,187 @@ func TestTranslateExprForPG_V35Catalog(t *testing.T) {
 		})
 	}
 }
+
+// TestTranslateExprForPG_V37Catalog covers the v0.37.0 catalog batch
+// of three additional rules: TIMESTAMPDIFF (#16), JSON_OBJECT /
+// JSON_ARRAY (#20), LAST_DAY (#24). Each was previously deferred
+// per the catalog's per-rule analysis; closer review made the case
+// for shipping each cleaner than the original "skip" verdict.
+func TestTranslateExprForPG_V37Catalog(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		// ---- TIMESTAMPDIFF — duration units ----
+		{
+			name: "TIMESTAMPDIFF SECOND",
+			in:   "TIMESTAMPDIFF(SECOND, created_at, updated_at)",
+			want: "EXTRACT(EPOCH FROM (updated_at - created_at))::bigint",
+		},
+		{
+			name: "TIMESTAMPDIFF MINUTE",
+			in:   "TIMESTAMPDIFF(MINUTE, a, b)",
+			want: "(EXTRACT(EPOCH FROM (b - a)) / 60)::bigint",
+		},
+		{
+			name: "TIMESTAMPDIFF HOUR",
+			in:   "TIMESTAMPDIFF(HOUR, a, b)",
+			want: "(EXTRACT(EPOCH FROM (b - a)) / 3600)::bigint",
+		},
+		{
+			name: "TIMESTAMPDIFF MICROSECOND",
+			in:   "TIMESTAMPDIFF(MICROSECOND, a, b)",
+			want: "(EXTRACT(EPOCH FROM (b - a)) * 1000000)::bigint",
+		},
+
+		// ---- TIMESTAMPDIFF — calendar units (date subtraction) ----
+		{
+			name: "TIMESTAMPDIFF DAY uses date subtraction",
+			in:   "TIMESTAMPDIFF(DAY, a, b)",
+			want: "(b::date - a::date)",
+		},
+		{
+			name: "TIMESTAMPDIFF WEEK is floor-divide of DAY",
+			in:   "TIMESTAMPDIFF(WEEK, a, b)",
+			want: "((b::date - a::date) / 7)",
+		},
+
+		// ---- TIMESTAMPDIFF — calendar units (AGE-based) ----
+		{
+			name: "TIMESTAMPDIFF YEAR uses AGE",
+			in:   "TIMESTAMPDIFF(YEAR, a, b)",
+			want: "EXTRACT(YEAR FROM AGE(b, a))::int",
+		},
+		{
+			name: "TIMESTAMPDIFF MONTH uses AGE year*12 + month",
+			in:   "TIMESTAMPDIFF(MONTH, a, b)",
+			want: "(EXTRACT(YEAR FROM AGE(b, a)) * 12 + EXTRACT(MONTH FROM AGE(b, a)))::int",
+		},
+		{
+			name: "TIMESTAMPDIFF QUARTER divides the MONTH formula by 3",
+			in:   "TIMESTAMPDIFF(QUARTER, a, b)",
+			want: "((EXTRACT(YEAR FROM AGE(b, a)) * 12 + EXTRACT(MONTH FROM AGE(b, a))) / 3)::int",
+		},
+
+		// ---- TIMESTAMPDIFF — case + fall-through paths ----
+		{
+			name: "lowercase timestampdiff also rewrites",
+			in:   "timestampdiff(day, a, b)",
+			want: "(b::date - a::date)",
+		},
+		{
+			name: "TIMESTAMPDIFF with unknown unit falls through",
+			in:   "TIMESTAMPDIFF(FORTNIGHT, a, b)",
+			want: "TIMESTAMPDIFF(FORTNIGHT, a, b)",
+		},
+		{
+			name: "TIMESTAMPDIFF with 2 args falls through",
+			in:   "TIMESTAMPDIFF(DAY, a)",
+			want: "TIMESTAMPDIFF(DAY, a)",
+		},
+
+		// ---- JSON_OBJECT → JSON_BUILD_OBJECT ----
+		{
+			name: "JSON_OBJECT single pair",
+			in:   "JSON_OBJECT('k', v)",
+			want: "JSON_BUILD_OBJECT('k', v)",
+		},
+		{
+			name: "JSON_OBJECT multiple pairs",
+			in:   "JSON_OBJECT('name', name, 'email', email)",
+			want: "JSON_BUILD_OBJECT('name', name, 'email', email)",
+		},
+		{
+			name: "lowercase json_object rewrites",
+			in:   "json_object('k', v)",
+			want: "JSON_BUILD_OBJECT('k', v)",
+		},
+		{
+			name: "JSON_OBJECT empty (no args) falls through",
+			in:   "JSON_OBJECT()",
+			want: "JSON_OBJECT()",
+		},
+
+		// ---- JSON_ARRAY → JSON_BUILD_ARRAY ----
+		{
+			name: "JSON_ARRAY scalar list",
+			in:   "JSON_ARRAY(1, 2, 3)",
+			want: "JSON_BUILD_ARRAY(1, 2, 3)",
+		},
+		{
+			name: "JSON_ARRAY with strings + idents",
+			in:   "JSON_ARRAY('a', col, 42)",
+			want: "JSON_BUILD_ARRAY('a', col, 42)",
+		},
+		{
+			name: "lowercase json_array rewrites",
+			in:   "json_array(1, 2)",
+			want: "JSON_BUILD_ARRAY(1, 2)",
+		},
+		{
+			name: "JSON_ARRAY empty (no args)",
+			in:   "JSON_ARRAY()",
+			want: "JSON_BUILD_ARRAY()",
+		},
+
+		// ---- LAST_DAY ----
+		{
+			name: "LAST_DAY of bare column",
+			in:   "LAST_DAY(d)",
+			want: "(DATE_TRUNC('month', d) + INTERVAL '1 month' - INTERVAL '1 day')::date",
+		},
+		{
+			name: "LAST_DAY of literal date",
+			in:   "LAST_DAY('2026-05-01')",
+			want: "(DATE_TRUNC('month', '2026-05-01') + INTERVAL '1 month' - INTERVAL '1 day')::date",
+		},
+		{
+			name: "lowercase last_day rewrites",
+			in:   "last_day(d)",
+			want: "(DATE_TRUNC('month', d) + INTERVAL '1 month' - INTERVAL '1 day')::date",
+		},
+		{
+			name: "LAST_DAY with no args falls through",
+			in:   "LAST_DAY()",
+			want: "LAST_DAY()",
+		},
+		{
+			name: "LAST_DAY with two args falls through",
+			in:   "LAST_DAY(a, b)",
+			want: "LAST_DAY(a, b)",
+		},
+
+		// ---- Cross-rule composition ----
+		{
+			// TIMESTAMPDIFF nested in a CHECK comparison — verify the
+			// AGE-based MONTH formula doesn't trip the bool-idiom pass.
+			name: "TIMESTAMPDIFF inside CHECK >= comparison",
+			in:   "TIMESTAMPDIFF(YEAR, birth_date, NOW()) >= 18",
+			want: "EXTRACT(YEAR FROM AGE(CURRENT_TIMESTAMP, birth_date))::int >= 18",
+		},
+		{
+			// JSON_OBJECT inside a generated-column body composes with
+			// COALESCE → COALESCE.
+			name: "JSON_OBJECT inside COALESCE",
+			in:   "COALESCE(JSON_OBJECT('k', v), '{}')",
+			want: "COALESCE(JSON_BUILD_OBJECT('k', v), '{}')",
+		},
+		{
+			// LAST_DAY inside a CHECK comparison.
+			name: "LAST_DAY inside CHECK = comparison",
+			in:   "due_date = LAST_DAY(created_at)",
+			want: "due_date = (DATE_TRUNC('month', created_at) + INTERVAL '1 month' - INTERVAL '1 day')::date",
+		},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			got := translateExprForPG(c.in, ExprContext{})
+			if got != c.want {
+				t.Errorf("translateExprForPG(%q) =\n  got  %q\n  want %q",
+					c.in, got, c.want)
+			}
+		})
+	}
+}

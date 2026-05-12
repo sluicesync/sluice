@@ -554,6 +554,14 @@ func TestPSPG_CDCReader_FailoverFlag(t *testing.T) {
 
 // drainPSChanges drains up to want events from the channel with an
 // overall timeout. Local copy of the helper used in other CDC tests.
+//
+// Source-tx boundary events ([ir.TxBegin] / [ir.TxCommit], ADR-0027)
+// are silently consumed without counting toward the `want` budget.
+// Bug 55: pre-fix the helper accepted every event including the
+// boundary markers; after ADR-0027 (which added TxBegin/TxCommit as
+// first-class IR change types) that meant the test would drain
+// `[TxBegin, Insert, Insert, Update]` and miss the trailing Delete.
+// Mirrors the integration-suite drainChanges helper's filter.
 func drainPSChanges(
 	t *testing.T,
 	ctx context.Context,
@@ -571,6 +579,10 @@ func drainPSChanges(
 		case c, ok := <-changes:
 			if !ok {
 				return got
+			}
+			switch c.(type) {
+			case ir.TxBegin, ir.TxCommit:
+				continue
 			}
 			got = append(got, c)
 		case <-deadline.C:
