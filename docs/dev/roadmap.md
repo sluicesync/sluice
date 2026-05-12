@@ -328,16 +328,15 @@ See ADR-0036 for the full Phase A trace + Phase B identification; CHANGELOG [0.3
 
 ### 5. Translator catalog continuation
 
-**Status (v0.37.0).** Twenty-five of 30 catalog rules shipped after re-assessment of the v0.35.0 deferrals. v0.35.0 landed 6 rules (HEX #19, FIELD #22, DAYNAME/MONTHNAME #25, WEEKOFYEAR #26, QUARTER #27, DATEDIFF #28); v0.37.0 added 3 more (TIMESTAMPDIFF #16, JSON_OBJECT/ARRAY #20, LAST_DAY #24) under closer review of their deferral rationale. The remaining 6 rules stay deferred per the catalog's load-bearing per-rule analysis:
+**Status (v0.38.0).** Twenty-eight of 30 catalog rules shipped after a second re-assessment pass. v0.35.0 landed 6 rules; v0.37.0 added 3 more (TIMESTAMPDIFF, JSON_OBJECT/ARRAY, LAST_DAY); v0.38.0 added 3 more from rule #10's hash family (MD5 unconditional via PG core; SHA1 + SHA2 gated on `--enable-pg-extension pgcrypto`). pgcrypto joins the extension catalog as a presence-gate (no types) — sluice's preflight confirms it's installed on the target before the SHA rewrites fire. The remaining 5 rules stay deferred per the catalog's load-bearing per-rule analysis:
 
-- **#10 MD5/SHA1/SHA2** — crosses pgcrypto extension boundary; violates contain-Postgres-complexity tenet.
 - **#11 GREATEST/LEAST** — same function name in both engines but NULL semantics differ; auto-rewrite would mask divergence.
 - **#13 REGEXP_LIKE** — MySQL ICU vs PG POSIX regex flavours diverge beyond clean rewrite.
 - **#21 FIND_IN_SET** — full position semantic needs a LATERAL subquery, invalid in CHECK/GENERATED contexts.
 - **#23 CONVERT_TZ** — AT TIME ZONE has subtle timestamp-vs-timestamptz semantics.
 - **#29 INET_ATON/INET_NTOA** — no portable PG equivalent without a custom function.
 
-All six have an actionable workaround via `--expr-override`. The remaining gaps would only land if a real operator workflow surfaces one of the deferred shapes as a regression — at which point the catalog's per-rule analysis already names the cost.
+All five have an actionable workaround via `--expr-override`. The remaining gaps would only land if a real operator workflow surfaces one of the deferred shapes as a regression — at which point the catalog's per-rule analysis already names the cost.
 
 ---
 

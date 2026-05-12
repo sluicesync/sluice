@@ -169,7 +169,7 @@ func (w *SchemaWriter) CreateIndexes(ctx context.Context, s *ir.Schema) error {
 			return indexes[i].Name < indexes[j].Name
 		})
 		for _, idx := range indexes {
-			stmt, err := emitCreateIndex(w.schema, table.Name, idx)
+			stmt, err := emitCreateIndex(w.schema, table.Name, idx, w.emitOpts())
 			if err != nil {
 				return err
 			}
@@ -452,7 +452,7 @@ func (w *SchemaWriter) PreviewDDL(_ context.Context, s *ir.Schema) ([]ir.DDLStat
 			return indexes[i].Name < indexes[j].Name
 		})
 		for _, idx := range indexes {
-			stmt, err := emitCreateIndex(w.schema, table.Name, idx)
+			stmt, err := emitCreateIndex(w.schema, table.Name, idx, w.emitOpts())
 			if err != nil {
 				return nil, err
 			}

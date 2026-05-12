@@ -112,6 +112,18 @@ type ExprContext struct {
 	// `coalesce(int, int)` pair. False (the default) preserves the
 	// v0.8.0 / v0.9.0 bool-context behaviour.
 	OuterColumnIsInteger bool
+	// EnabledPGExtensions is the set of operator-opted-into PG
+	// extensions (ADR-0032 framework). The set is sourced from
+	// [emitOpts.EnabledExtensions] at the schema writer boundary and
+	// gates extension-dependent translator rewrites — specifically
+	// v0.38.0's SHA1/SHA2 → digest() rule which depends on pgcrypto.
+	// Without the matching flag, those rules fall through verbatim
+	// so PG's parse-time error is the operator's signal that they
+	// need to enable the extension (loud-failure tenet).
+	//
+	// Rules that don't depend on an extension (the vast majority)
+	// ignore this field entirely; nil / empty is the default.
+	EnabledPGExtensions map[string]bool
 }
 
 // dialectName is the canonical name this engine uses for the
@@ -195,6 +207,15 @@ func translateExprForPG(expr string, ctx ExprContext) string {
 	expr = rewriteJSONOBJECT(expr)
 	expr = rewriteJSONARRAY(expr)
 	expr = rewriteLASTDAY(expr)
+	// v0.38.0 — hash family. MD5 is core PG (mechanical case-fold).
+	// SHA1 and SHA2 need pgcrypto's digest(), gated on the operator
+	// having opted in via --enable-pg-extension pgcrypto. Without the
+	// flag, SHA1/SHA2 fall through verbatim and PG's parse-time error
+	// surfaces the missing extension; with the flag, sluice's preflight
+	// has already confirmed pgcrypto is installed on the target.
+	expr = rewriteMD5(expr)
+	expr = rewriteSHA1(expr, ctx)
+	expr = rewriteSHA2(expr, ctx)
 	// v0.11.3 — operator-form INTERVAL rewrite. MySQL canonicalizes
 	// `DATE_ADD(d, INTERVAL N UNIT)` to the operator form
 	// `(d + interval N unit)` when a generated-column body is read
@@ -1872,5 +1893,94 @@ func rewriteLASTDAY(expr string) string {
 			return ""
 		}
 		return fmt.Sprintf("(DATE_TRUNC('month', %s) + INTERVAL '1 month' - INTERVAL '1 day')::date", d)
+	})
+}
+
+// ============================================================
+// v0.38.0 catalog batch — MD5 / SHA1 / SHA2 hash family
+// (catalog rule #10). Re-assessment of the v0.35.0 deferral:
+// MD5 doesn't actually need an extension (PG core has `md5(text)`);
+// SHA1 / SHA2 need pgcrypto's `digest()` but pgcrypto is a contrib
+// extension that ships with PG itself, available on every major
+// hosted PG service (PlanetScale, RDS, Cloud SQL, Azure DB, Supabase).
+// Gating the SHA rules on `--enable-pg-extension pgcrypto` mirrors
+// hstore's pattern — the operator opts in, sluice's preflight
+// confirms the extension is installed on the target before any
+// translation happens, and the rewrite emits the right
+// pgcrypto-backed expression.
+// ============================================================
+
+// rewriteMD5 rewrites MySQL's `MD5(x)` to PG's core `md5(x)`. Both
+// return the 32-character lowercase hex digest of the input. PG's
+// `md5(text)` is in core (not pgcrypto); no extension dependency.
+// Catalog rule #10 — the MD5-only subset.
+//
+// Mechanical case-fold rewrite; falls through verbatim on
+// non-1-arg shapes.
+func rewriteMD5(expr string) string {
+	return rewriteFunctionCalls(expr, "MD5", func(args []string) string {
+		if len(args) != 1 {
+			return ""
+		}
+		return "md5(" + strings.TrimSpace(args[0]) + ")"
+	})
+}
+
+// rewriteSHA1 rewrites MySQL's `SHA1(x)` to PG's
+// `encode(digest(x, 'sha1'), 'hex')`. Catalog rule #10 — the SHA1
+// subset. Gated on the operator having passed
+// `--enable-pg-extension pgcrypto`; without the flag the call falls
+// through verbatim so PG's parse-time "function sha1 does not exist"
+// error surfaces as the operator's signal to enable the extension.
+//
+// Both MySQL `SHA1` and the digest+encode combination return a
+// 40-character lowercase hex string for the same input. Identical
+// output bytes; safe for CHECK / GENERATED contexts.
+func rewriteSHA1(expr string, ctx ExprContext) string {
+	if !ctx.EnabledPGExtensions["pgcrypto"] {
+		return expr
+	}
+	return rewriteFunctionCalls(expr, "SHA1", func(args []string) string {
+		if len(args) != 1 {
+			return ""
+		}
+		return "encode(digest(" + strings.TrimSpace(args[0]) + ", 'sha1'), 'hex')"
+	})
+}
+
+// rewriteSHA2 rewrites MySQL's `SHA2(x, bits)` to PG's
+// `encode(digest(x, '<algo>'), 'hex')` where `<algo>` is selected
+// from `bits`: 0 / 256 → sha256, 224 → sha224, 384 → sha384,
+// 512 → sha512. Catalog rule #10 — the SHA2 subset. Gated on
+// pgcrypto (same as SHA1).
+//
+// MySQL's `SHA2(x, 0)` is documented as the SHA-256 default; the
+// rewrite preserves that semantic. Unrecognised bit widths fall
+// through verbatim (PG's parse-time error surfaces the unsupported
+// bit-width choice).
+func rewriteSHA2(expr string, ctx ExprContext) string {
+	if !ctx.EnabledPGExtensions["pgcrypto"] {
+		return expr
+	}
+	return rewriteFunctionCalls(expr, "SHA2", func(args []string) string {
+		if len(args) != 2 {
+			return ""
+		}
+		x := strings.TrimSpace(args[0])
+		bits := strings.TrimSpace(args[1])
+		var algo string
+		switch bits {
+		case "0", "256":
+			algo = "sha256"
+		case "224":
+			algo = "sha224"
+		case "384":
+			algo = "sha384"
+		case "512":
+			algo = "sha512"
+		default:
+			return ""
+		}
+		return "encode(digest(" + x + ", '" + algo + "'), 'hex')"
 	})
 }

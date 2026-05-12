@@ -133,6 +133,7 @@ clean PG equivalent.
 | Notes | `MD5(x) → MD5(x)` is a passthrough — PG has it built in and returns hex text matching MySQL. `SHA1` / `SHA256` need `pgcrypto`'s `DIGEST` plus `ENCODE(…, 'hex')`: `ENCODE(DIGEST(x, 'sha256'), 'hex')`. The pgcrypto requirement is a tenet violation (extension dependency) — sluice should NOT rewrite SHA* automatically, but should document that the verbatim passthrough will fail loudly with "function sha256 does not exist" and the operator-side fix is `--expr-override` or extension installation. Track only `MD5` as a candidate; reject `SHA*` as out-of-scope. |
 | Source | MySQL function list; PG `pgcrypto` docs |
 | Importance | Medium-High — MD5 is common in derived columns; SHA* less so |
+| Status | **Shipped v0.38.0.** Re-assessment found the deferral over-broad: PG core has `md5(text)` (no extension needed), so MD5 ships unconditionally. SHA1 / SHA2 / SHA-256 / SHA-512 use pgcrypto's `digest()`; the rewrites are gated on `--enable-pg-extension pgcrypto` (an opt-in flag now in the catalog as a presence-gate, no types). pgcrypto ships with PG contrib and is available on every major hosted PG service. Without the flag, SHA1/SHA2 calls fall through verbatim so PG's parse-time error signals the missing extension. |
 
 ### Medium priority — appears in DDL but less frequently
 

@@ -129,11 +129,12 @@ type extensionDef struct {
 // extension is an entry here — no interface changes, no per-call-site
 // switch updates. Keys are the canonical pg_extension.extname value.
 var pgExtensionCatalog = map[string]extensionDef{
-	"vector":  pgVectorDef,
-	"pg_trgm": pgTrgmDef,
-	"hstore":  pgHstoreDef,
-	"citext":  pgCiTextDef,
-	"postgis": pgPostGISDef,
+	"vector":   pgVectorDef,
+	"pg_trgm":  pgTrgmDef,
+	"hstore":   pgHstoreDef,
+	"citext":   pgCiTextDef,
+	"postgis":  pgPostGISDef,
+	"pgcrypto": pgCryptoDef,
 }
 
 // crossEngineDefaultTranslatedExtensions names the PG extensions
@@ -564,6 +565,48 @@ var pgPostGISDef = extensionDef{
 	},
 }
 
+// pgCryptoDef is the catalog entry for the `pgcrypto` extension —
+// PG's standard cryptographic-functions contrib extension. Like
+// PostGIS, pgcrypto has no types sluice needs to passthrough (the
+// catalog's typesByName / hintTypeNames are empty); the catalog
+// entry exists purely as a **presence gate** for the v0.38.0
+// SHA1/SHA2 expression-translator rewrites in expr_translate.go.
+//
+// When the operator passes `--enable-pg-extension pgcrypto`,
+// sluice's `validateAndPreflightExtensions` machinery (see below)
+// runs the standard pg_extension preflight check on the target
+// before any data moves; the SHA rewrites then fire confidently
+// because the extension is known to be installed. Without the flag,
+// SHA1/SHA2 calls fall through verbatim and PG's parse-time error
+// surfaces the missing extension to the operator.
+//
+// build/emitColumn refuse loudly — pgcrypto types should never
+// dispatch through here. indexAccessMethods and
+// indexOperatorClasses are empty (pgcrypto introduces neither).
+// hintTypeNames is empty (no operator-visible "you have a pgcrypto
+// type" hint surface needed).
+var pgCryptoDef = extensionDef{
+	typesByName: map[string]struct{}{},
+	build: func(udtName string, _ int32) (ir.ExtensionType, error) {
+		return ir.ExtensionType{}, fmt.Errorf(
+			"postgres: pgcrypto catalog: build called with udt_name %q, "+
+				"but pgcrypto has no sluice-passthrough types — the "+
+				"catalog entry is a presence-gate for the SHA1/SHA2 "+
+				"expression translator only; this is a framework misuse",
+			udtName)
+	},
+	emitColumn: func(t ir.ExtensionType) (string, error) {
+		return "", fmt.Errorf(
+			"postgres: pgcrypto catalog: emitColumn called for "+
+				"(extension=%q name=%q), but pgcrypto has no "+
+				"sluice-passthrough types; this is a framework misuse",
+			t.Extension, t.Name)
+	},
+	indexAccessMethods:   map[string]struct{}{},
+	indexOperatorClasses: map[string]struct{}{},
+	hintTypeNames:        map[string]struct{}{},
+}
+
 // emitExtensionColumn dispatches an [ir.ExtensionType] column to the
 // catalog entry's column-DDL renderer. Returns a clear error when
 // the extension isn't in the catalog (operator forgot the
@@ -651,7 +694,9 @@ func validateAndPreflightExtensionsAt(ctx context.Context, db *sql.DB, extension
 					"extension (recognised: %s); see "+
 					"docs/research/pg-extensions-deployment-frequency.md "+
 					"for the v1 shortlist (vector, pg_trgm, hstore, citext, "+
-					"postgis — the full v1 set is shipped)",
+					"postgis — the full v1 set is shipped). pgcrypto added "+
+					"in v0.38.0 as a presence-gate for the SHA1/SHA2 "+
+					"expression-translator rewrites",
 				name, strings.Join(recognisedPGExtensionNames(), ", "))
 		}
 		enabled[name] = true

@@ -1553,3 +1553,139 @@ func TestTranslateExprForPG_V37Catalog(t *testing.T) {
 		})
 	}
 }
+
+// TestTranslateExprForPG_V38Catalog covers the v0.38.0 catalog batch:
+// MD5 (always; core PG), SHA1 (gated on pgcrypto), SHA2 (gated on
+// pgcrypto). Re-assessment of v0.35.0's #10 deferral.
+func TestTranslateExprForPG_V38Catalog(t *testing.T) {
+	pgcryptoCtx := ExprContext{
+		EnabledPGExtensions: map[string]bool{"pgcrypto": true},
+	}
+
+	cases := []struct {
+		name string
+		in   string
+		ctx  ExprContext
+		want string
+	}{
+		// ---- MD5: always ships, no extension needed ----
+		{
+			name: "MD5 of bare column",
+			in:   "MD5(payload)",
+			ctx:  ExprContext{},
+			want: "md5(payload)",
+		},
+		{
+			name: "MD5 of literal string",
+			in:   "MD5('hello')",
+			ctx:  ExprContext{},
+			want: "md5('hello')",
+		},
+		{
+			name: "lowercase md5 also rewrites",
+			in:   "md5(payload)",
+			ctx:  ExprContext{},
+			want: "md5(payload)",
+		},
+		{
+			name: "MD5 with two args falls through",
+			in:   "MD5(a, b)",
+			ctx:  ExprContext{},
+			want: "MD5(a, b)",
+		},
+
+		// ---- SHA1: ships only when pgcrypto enabled ----
+		{
+			name: "SHA1 without pgcrypto falls through verbatim",
+			in:   "SHA1(payload)",
+			ctx:  ExprContext{},
+			want: "SHA1(payload)",
+		},
+		{
+			name: "SHA1 with pgcrypto rewrites to encode+digest",
+			in:   "SHA1(payload)",
+			ctx:  pgcryptoCtx,
+			want: "encode(digest(payload, 'sha1'), 'hex')",
+		},
+		{
+			name: "lowercase sha1 with pgcrypto rewrites",
+			in:   "sha1(payload)",
+			ctx:  pgcryptoCtx,
+			want: "encode(digest(payload, 'sha1'), 'hex')",
+		},
+
+		// ---- SHA2: bit-width dispatch (256 / 224 / 384 / 512), gated on pgcrypto ----
+		{
+			name: "SHA2 without pgcrypto falls through verbatim",
+			in:   "SHA2(payload, 256)",
+			ctx:  ExprContext{},
+			want: "SHA2(payload, 256)",
+		},
+		{
+			name: "SHA2 with bits=256 → sha256",
+			in:   "SHA2(payload, 256)",
+			ctx:  pgcryptoCtx,
+			want: "encode(digest(payload, 'sha256'), 'hex')",
+		},
+		{
+			name: "SHA2 with bits=0 → sha256 (MySQL default)",
+			in:   "SHA2(payload, 0)",
+			ctx:  pgcryptoCtx,
+			want: "encode(digest(payload, 'sha256'), 'hex')",
+		},
+		{
+			name: "SHA2 with bits=224 → sha224",
+			in:   "SHA2(payload, 224)",
+			ctx:  pgcryptoCtx,
+			want: "encode(digest(payload, 'sha224'), 'hex')",
+		},
+		{
+			name: "SHA2 with bits=384 → sha384",
+			in:   "SHA2(payload, 384)",
+			ctx:  pgcryptoCtx,
+			want: "encode(digest(payload, 'sha384'), 'hex')",
+		},
+		{
+			name: "SHA2 with bits=512 → sha512",
+			in:   "SHA2(payload, 512)",
+			ctx:  pgcryptoCtx,
+			want: "encode(digest(payload, 'sha512'), 'hex')",
+		},
+		{
+			name: "SHA2 with unrecognised bits falls through",
+			in:   "SHA2(payload, 999)",
+			ctx:  pgcryptoCtx,
+			want: "SHA2(payload, 999)",
+		},
+		{
+			name: "SHA2 with 1 arg falls through",
+			in:   "SHA2(payload)",
+			ctx:  pgcryptoCtx,
+			want: "SHA2(payload)",
+		},
+
+		// ---- Composition: MD5 inside other rewrites ----
+		{
+			name: "MD5 inside COALESCE composes with the COALESCE pass",
+			in:   "COALESCE(MD5(payload), '')",
+			ctx:  ExprContext{},
+			want: "COALESCE(md5(payload), '')",
+		},
+		{
+			name: "SHA1 inside CONCAT composes (with pgcrypto enabled)",
+			in:   "CONCAT('h:', SHA1(payload))",
+			ctx:  pgcryptoCtx,
+			want: "('h:' || encode(digest(payload, 'sha1'), 'hex'))",
+		},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			got := translateExprForPG(c.in, c.ctx)
+			if got != c.want {
+				t.Errorf("translateExprForPG(%q) =\n  got  %q\n  want %q",
+					c.in, got, c.want)
+			}
+		})
+	}
+}

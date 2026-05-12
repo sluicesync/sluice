@@ -190,7 +190,7 @@ func TestEmitCreateIndex_PgvectorIVFFlat(t *testing.T) {
 		Kind:    ir.IndexKindUnspecified,
 		Columns: []ir.IndexColumn{{Column: "embedding"}},
 	}
-	got, err := emitCreateIndex("public", "items", idx)
+	got, err := emitCreateIndex("public", "items", idx, emitOpts{})
 	if err != nil {
 		t.Fatalf("emitCreateIndex: %v", err)
 	}
@@ -396,7 +396,7 @@ func TestEmitDefault(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			got, ok := emitDefault(c.in)
+			got, ok := emitDefault(c.in, emitOpts{})
 			if ok != c.wantEmit {
 				t.Errorf("emit flag = %v; want %v", ok, c.wantEmit)
 			}
@@ -617,7 +617,7 @@ func TestEmitCheckConstraint(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			if got := emitCheckConstraint(c.in, nil); got != c.want {
+			if got := emitCheckConstraint(c.in, nil, emitOpts{}); got != c.want {
 				t.Errorf("\n got  %q\n want %q", got, c.want)
 			}
 		})
@@ -920,7 +920,7 @@ func TestEmitCreateIndex(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			got, err := emitCreateIndex("public", "users", c.idx)
+			got, err := emitCreateIndex("public", "users", c.idx, emitOpts{})
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}

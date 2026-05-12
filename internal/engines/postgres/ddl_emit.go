@@ -243,14 +243,14 @@ func quoteSQLString(s string) string {
 // Bugs 28/29/30; pre-fix the DEFAULT path was the only IR-expression
 // path that bypassed the translator (generated + CHECK + index already
 // routed through it).
-func emitDefault(d ir.DefaultValue) (string, bool) {
+func emitDefault(d ir.DefaultValue, opts emitOpts) (string, bool) {
 	switch v := d.(type) {
 	case nil, ir.DefaultNone:
 		return "", false
 	case ir.DefaultLiteral:
 		return quoteSQLString(v.Value), true
 	case ir.DefaultExpression:
-		return translateDefaultExpr(v), true
+		return translateDefaultExpr(v, opts), true
 	}
 	return "", false
 }
@@ -265,11 +265,11 @@ func emitDefault(d ir.DefaultValue) (string, bool) {
 // information (defaults are evaluated per-row at INSERT time, not over
 // other column values), so the [ExprContext] passed to the translator
 // is the zero value — bool-idiom rewrites stay no-ops on this path.
-func translateDefaultExpr(d ir.DefaultExpression) string {
+func translateDefaultExpr(d ir.DefaultExpression, opts emitOpts) string {
 	if d.Dialect == "" || d.Dialect == dialectName {
 		return d.Expr
 	}
-	return translateExprForPG(d.Expr, ExprContext{})
+	return translateExprForPG(d.Expr, ExprContext{EnabledPGExtensions: opts.EnabledExtensions})
 }
 
 // setDefaultToArrayLiteral converts a MySQL-style comma-separated
@@ -434,7 +434,7 @@ func emitColumnDef(table *ir.Table, c *ir.Column, opts emitOpts) (string, error)
 			)
 		}
 		sb.WriteString(" GENERATED ALWAYS AS (")
-		body := translateGeneratedExpr(c, table)
+		body := translateGeneratedExpr(c, table, opts)
 		// Bug 25 (v0.10.1): for enum-typed generated columns we
 		// emit as TEXT (above) and rely on a table-level CHECK
 		// constraint for the value-list enforcement — no cast here.
@@ -453,7 +453,7 @@ func emitColumnDef(table *ir.Table, c *ir.Column, opts emitOpts) (string, error)
 	// Default = DefaultNone from the schema reader, so emitDefault
 	// returns ok=false and the clause is skipped naturally; no
 	// special case needed here.
-	if dflt, ok := emitDefault(c.Default); ok {
+	if dflt, ok := emitDefault(c.Default, opts); ok {
 		sb.WriteString(" DEFAULT ")
 		// SET columns translate the comma-separated MySQL literal
 		// to a TEXT[] array literal so the source DEFAULT survives
@@ -665,11 +665,11 @@ func emitTableDef(schema string, table *ir.Table, opts emitOpts) (string, error)
 	// generated SET checks. Order is the IR's preserved source order
 	// so the target's pg_dump shape stays diffable against the source.
 	for _, chk := range table.CheckConstraints {
-		parts = append(parts, emitCheckConstraint(chk, table))
+		parts = append(parts, emitCheckConstraint(chk, table, opts))
 	}
 
 	if table.PrimaryKey != nil {
-		parts = append(parts, "PRIMARY KEY "+emitIndexColumnList(table.PrimaryKey.Columns))
+		parts = append(parts, "PRIMARY KEY "+emitIndexColumnList(table.PrimaryKey.Columns, opts))
 	}
 
 	var sb strings.Builder
@@ -708,12 +708,12 @@ func emitTableDef(schema string, table *ir.Table, opts emitOpts) (string, error)
 // so a MySQL-source `json_unquote(json_extract(j,'$.k'))` index
 // rewrites to `(j->>'k')` instead of failing at CREATE INDEX.
 // Same-dialect / untagged expressions pass through verbatim.
-func emitIndexColumnList(cols []ir.IndexColumn) string {
+func emitIndexColumnList(cols []ir.IndexColumn, opts emitOpts) string {
 	parts := make([]string, len(cols))
 	for i, c := range cols {
 		var entry string
 		if c.Expression != "" {
-			entry = "(" + translateIndexExpr(c) + ")"
+			entry = "(" + translateIndexExpr(c, opts) + ")"
 		} else {
 			entry = quoteIdent(c.Column)
 		}
@@ -747,17 +747,17 @@ func emitIndexColumnList(cols []ir.IndexColumn) string {
 // search keys), the simpler context-free pass covers the observed
 // cases. If a bool-context-aware index emit is needed later, the
 // caller can build [ExprContext] and route through this helper.
-func translateIndexExpr(c ir.IndexColumn) string {
+func translateIndexExpr(c ir.IndexColumn, opts emitOpts) string {
 	if c.ExpressionDialect == "" || c.ExpressionDialect == dialectName {
 		return c.Expression
 	}
-	return translateExprForPG(c.Expression, ExprContext{})
+	return translateExprForPG(c.Expression, ExprContext{EnabledPGExtensions: opts.EnabledExtensions})
 }
 
 // emitCreateIndex produces a CREATE INDEX statement (UNIQUE if
 // applicable). Postgres uses CREATE INDEX rather than ALTER TABLE
 // ADD INDEX (which doesn't exist here).
-func emitCreateIndex(schema, tableName string, idx *ir.Index) (string, error) {
+func emitCreateIndex(schema, tableName string, idx *ir.Index, opts emitOpts) (string, error) {
 	if idx == nil {
 		return "", errors.New("postgres: emitCreateIndex: index is nil")
 	}
@@ -795,7 +795,7 @@ func emitCreateIndex(schema, tableName string, idx *ir.Index) (string, error) {
 		sb.WriteString(method)
 		sb.WriteByte(' ')
 	}
-	sb.WriteString(emitIndexColumnList(idx.Columns))
+	sb.WriteString(emitIndexColumnList(idx.Columns, opts))
 	sb.WriteByte(';')
 	return sb.String(), nil
 }
@@ -906,7 +906,7 @@ func emitAddForeignKey(schema, childTable string, fk *ir.ForeignKey) (string, er
 // CASE, function names that differ between dialects — fail loudly at
 // CREATE TABLE time on the target rather than be guessed-at, which
 // matches the project's verbatim-passthrough translation policy.
-func emitCheckConstraint(c *ir.CheckConstraint, tbl *ir.Table) string {
+func emitCheckConstraint(c *ir.CheckConstraint, tbl *ir.Table, opts emitOpts) string {
 	var sb strings.Builder
 	if c.Name != "" {
 		sb.WriteString("CONSTRAINT ")
@@ -914,7 +914,7 @@ func emitCheckConstraint(c *ir.CheckConstraint, tbl *ir.Table) string {
 		sb.WriteByte(' ')
 	}
 	sb.WriteString("CHECK (")
-	sb.WriteString(translateCheckExpr(c, tbl))
+	sb.WriteString(translateCheckExpr(c, tbl, opts))
 	sb.WriteByte(')')
 	return sb.String()
 }
@@ -929,11 +929,12 @@ func emitCheckConstraint(c *ir.CheckConstraint, tbl *ir.Table) string {
 // COALESCE rewrite direction (v0.9.1 / Bug 17 residual): integer-
 // typed generated columns whose body returns bool get the bool side
 // cast to int, instead of converting the int literal to bool.
-func translateGeneratedExpr(c *ir.Column, tbl *ir.Table) string {
+func translateGeneratedExpr(c *ir.Column, tbl *ir.Table, opts emitOpts) string {
 	if c.GeneratedExprDialect == "" || c.GeneratedExprDialect == dialectName {
 		return c.GeneratedExpr
 	}
 	ctx := exprContextForTable(tbl)
+	ctx.EnabledPGExtensions = opts.EnabledExtensions
 	if _, isInt := c.Type.(ir.Integer); isInt {
 		ctx.OuterColumnIsInteger = true
 	}
@@ -945,11 +946,13 @@ func translateGeneratedExpr(c *ir.Column, tbl *ir.Table) string {
 // tag indicates a different source dialect. tbl supplies the bool-
 // column context for the v0.8.0 bool-idiom rewrite; nil is permitted
 // and disables that rewrite.
-func translateCheckExpr(c *ir.CheckConstraint, tbl *ir.Table) string {
+func translateCheckExpr(c *ir.CheckConstraint, tbl *ir.Table, opts emitOpts) string {
 	if c.ExprDialect == "" || c.ExprDialect == dialectName {
 		return c.Expr
 	}
-	return translateExprForPG(c.Expr, exprContextForTable(tbl))
+	ctx := exprContextForTable(tbl)
+	ctx.EnabledPGExtensions = opts.EnabledExtensions
+	return translateExprForPG(c.Expr, ctx)
 }
 
 // exprContextForTable builds the [ExprContext] for tbl, populating
