@@ -490,6 +490,33 @@ Output: `docs/research/pg-extensions-deployment-frequency.md` (matrix + recommen
 
 ---
 
+### 14. Backup chain retention, pruning, and compaction (GitHub #20)
+
+**Why.** `sluice backup stream run` grows the chain forever — no built-in rotation, expiry, or compaction. Object-storage operators get a partial pass via bucket lifecycle policies, but **local-filesystem chains** (`--output-dir`, the air-gapped / compliance / SneakerNet use case) hit operationally-painful growth surprisingly quickly: a 3-min-rollover stream at ~43 ops/sec wrote 494 files / 132 MB in 7h 48m on the validation rig — extrapolating to ~40k inodes / ~12 GB / ~12 hour restore in a month and ~430k inodes / ~145 GB / ~7-day restore in a year. The bottleneck isn't disk bytes (compression helps); it's **inode count** (`find` / `ls` / `du` slow past ~50k subdirs) and **linear-in-chain-length restore time** (~2.5s per incremental on the rig; multi-day restores aren't a credible DR posture). See [GitHub issue #20](https://github.com/orware/sluice/issues/20) for full numbers + repro.
+
+**What — four-chunk sequence:**
+
+- **14a. `chain.json` catalog at chain root** — the keystone. Single file listing `[backup_id, parent_backup_id, created_at, end_position, bytes, file_path]` per manifest in chain order. Restore / verify read it once instead of `ListObjects` / `readdir`-ing `manifests/`. Atomic write-temp + rename on every rollover. Backwards-compat: missing-file fall-back to today's directory scan, so existing chains keep working without migration. Unblocks every subsequent chunk because they all need O(1) chain-content lookup. **~v0.47.0.**
+
+- **14b. `--retain-rotate-at=DUR` on `backup stream run`** — at the configured chain age (or chain length), commit a final incremental, take a fresh `backup full` into a sibling directory, and tombstone the previous chain. Operator gets bounded chain length + bounded restore time without writing cron. The hard part is **snapshot/CDC overlap during rotation**: the new full's snapshot anchor MUST be ≥ the previous stream's last-committed incremental position, or events in the gap window are silently lost. Cleanest if the rotation runs inline (same gRPC handle on MySQL VStream; same logical-slot on PG); separate-process rotation is harder. **~v0.48.0.**
+
+- **14c. `sluice backup prune --from-dir CHAIN --keep-incrementals N`** — one-shot cleanup for existing chains. Refuses if dropping incrementals would break restorability (the full + the oldest kept incremental must still chain). Advances the chain's "earliest restorable position" metadata so `backup verify` can tell operators "this chain can no longer restore to GTID < X." Companion `--retain-incrementals=N` / `--retain-duration=DUR` flags on `backup stream run` for ongoing pruning at rollover time. **~v0.48.0** (paired with 14b).
+
+- **14d. `sluice backup compact --from-dir CHAIN --merge-window DUR`** — merge K consecutive incrementals into a single combined incremental with the same end-position but smaller file/inode footprint. **v1: naive concat** — read all change events in order, write to a single new `.jsonl.gz` chunk under a new `_changes/<merged-ts>/`, delete sources, tombstone merged manifests in `chain.json`. The new manifest gets the last source's end-position. Restore-side is no-change: merged manifests look like larger incrementals to the existing chain iterator. **~v0.49.0.**
+
+- **14e. Smart compaction (same-row event collapsing)** — within the merge window, collapse INSERT→UPDATE→DELETE on the same PK into just the final state (or just the DELETE). Materially smaller for high-update workloads. Requires PK awareness + DDL handling across the window + a new ADR. Defer until naive concat ships and operators report on it. **No release target.**
+
+**Gotchas.**
+
+- **Tombstone semantics on object storage.** S3 / GCS / Azure lifecycle policies can race `sluice prune` — physical deletion isn't atomic with chain-state update. Use a `<chain>.tombstone` marker file (or `state: tombstoned` in `chain.json`) that restore/verify check first; physical-cleanup is a separate, idempotent step.
+- **Crash-safety during compaction.** Mid-compact crash must leave the chain restorable. Write the new chunk + tombstoned chain.json atomically (write-temp + rename) BEFORE deleting source chunks; if crash hits between rename and delete, the source chunks become orphaned but the chain is still restorable from the new merged form.
+- **Restore-test coverage.** Today's restore tests assume linear chain. Compacted chains (with tombstones referencing merged-out manifests) need explicit test coverage — both same-engine and cross-engine restore paths.
+- **No effect on bucket-lifecycle operators.** This is a strict superset of today's behaviour; operators who already manage retention via S3 lifecycle policies see no behaviour change unless they opt in. The local-FS operator is the headline beneficiary.
+
+**Sizing.** 14a is ~200-300 LOC + tests (one tight release). 14b + 14c together ~500-800 LOC + an overlap-correctness ADR for the rotate-at snapshot/CDC handoff. 14d ~400-600 LOC + tests; 14e is a much larger chunk (probably its own ADR + 800-1200 LOC). Doesn't compete with item 1 (KMS Phase 6.4) or the AIMD controller (GitHub #18 Phase 3) — different surfaces, different operators benefit.
+
+---
+
 ### Open bugs awaiting fix windows
 
 Tracked in detail in `sluice-testing/BUG-CATALOG.md`; recap here for roadmap visibility:
