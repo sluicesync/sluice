@@ -6,6 +6,40 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.46.0]
+
+**Closes GitHub issue #19 — source-side retry on transient CDC reader errors.** Before v0.46.0, when the source CDC reader's pump hit a transient (`read tcp: ... read: connection reset by peer`, `EOF`, vttablet `code = Aborted/Unavailable/ResourceExhausted`, PG SQLSTATE 57P0x server-restart, etc.), the pump closed the changes channel after stashing the error via its internal `setErr`. The applier's batched loop saw the channel close as a normal EOF signal, committed any pending batch, and returned `nil`. The streamer then returned `nil` from `runOnce` — a clean exit code 0 — even though the operator's overnight `sluice sync start` had silently dropped its CDC connection mid-stream. The ADR-0038 retry loop (v0.42.0) catches *applier-side* transients via the `ir.RetriableError` interface, but never saw a source-side error to classify. v0.46.0 closes the gap by classifying source-pump errors with the same interface and surfacing them back to the retry loop after the changes channel closes.
+
+### Fixed
+
+- **`internal/engines/mysql/reader_errors.go` + `internal/engines/postgres/reader_errors.go` (new) — source-side classifier mirrors.** Each engine ships a thin `classifyReaderError(err)` that delegates to the engine's existing `classifyApplierError`. The transient shapes overlap perfectly between the two surfaces — same `*MySQLError` codes (1213, 1105 vttablet transients), same `*pgconn.PgError` SQLSTATEs (40001, 40P01, 57P0x, 08*), same `driver.ErrBadConn` / `io.EOF` / network-text patterns. The delegation is intentional: keeping reader and applier classifiers in lockstep means neither surface gets stricter or laxer over time. Future reader-specific shapes (e.g. binlog-rotate-during-restart shapes that only the source-pump sees) get added to `reader_errors.go` without touching applier code.
+
+- **`internal/engines/mysql/{cdc_reader,cdc_vstream,cdc_vstream_snapshot}.go` — pump `setErr` wraps with `classifyReaderError`.** Every place a CDC reader pump previously called `r.setErr(fmt.Errorf("mysql: cdc: get event: %w", err))` (and the two VStream pump variants) now wraps the error through `classifyReaderError` first. nil and non-transient shapes pass through unchanged.
+
+- **`internal/engines/postgres/cdc_reader.go::pump` — three setErr sites wrapped.** The standby-status-update / receive-message / ErrorResponse sites that surface network-level transients now route through `classifyReaderError`. Parse-error sites (`parse keepalive` / `parse xlogdata` / `dispatchWAL`) are *not* wrapped — those indicate protocol corruption or a sluice bug, not a retriable shape.
+
+- **`internal/pipeline/streamer.go` — source-error surfacing into the retry loop.** New private `sourceErrFn func() error` field on `Streamer` captures the source CDC reader's `Err()` method when the reader's concrete type exposes one (every shipping reader does — pre-v0.46.0 `Err` just wasn't visible to the streamer). Both `coldStart` and `warmResume` populate the field after `StreamChanges` returns; `runOnce` reads it after `dispatchApply` via the new `surfaceSourceError` helper that filters out the `context.Canceled` / `context.DeadlineExceeded` shapes (the pump's check is best-effort, and outer-ctx-driven shutdowns must not surface as retriable errors). When a non-nil non-cancellation source error is surfaced, `runOnce` returns it wrapped as `pipeline: source cdc reader: <err>`; the wrap satisfies `errors.As(&ir.RetriableError{})` when the underlying classifier marked the shape transient, so `runWithRetry` already-existing classification + exponential backoff loop handles the retry without further changes.
+
+### Migration / Compatibility
+
+- **Drop-in upgrade from v0.45.x.** No flag changes; no error-message changes for non-transient source errors (those return verbatim through `classifyReaderError`).
+- **Behaviour change on transient source-pump errors**: pre-v0.46.0 these surfaced as a clean exit code 0 (the silent #19 failure mode); v0.46.0 surfaces them through the ADR-0038 retry loop. Operators running with `--apply-retry-attempts > 1` (the v0.42.0+ default of 8) see automatic source-side retry. Operators on `--apply-retry-attempts 1` (single-attempt mode, pre-v0.42.0 behaviour) see the previously-silent error surface as a non-zero exit — strict improvement: an operator running with retry off explicitly opted into "exit on first transient" semantics.
+- **The exit-0 false-success case from #19 cannot recur** — the next time a transient source-pump error fires, the wrapped error reaches `runWithRetry` and either succeeds on retry or surfaces as a terminal retry-budget-exhausted error after the operator's configured `--apply-retry-attempts`.
+
+### Who needs this release
+
+- **Anyone running `sluice sync start` overnight or in long-running mode against any source**: **upgrade**. The #19 silent-exit failure mode is the highest-risk known issue between v0.42.0's applier-retry landing and today — overnight test cycles produced clean exit codes on what were actually mid-stream transient connection resets, with no operator-visible signal that the stream had dropped.
+- **Anyone with monitoring on sluice exit codes**: opt-in benefit. Source-side transients now surface as non-zero terminal errors (after retry exhaustion) instead of exit 0.
+- **Operators on `--apply-retry-attempts 1`**: drop-in benefit. Previously-silent source transients now surface immediately as terminal errors — strict improvement on the silent-failure mode.
+
+### Verification surface
+
+- **3 new unit-test files + 4 new test funcs**:
+  - `internal/engines/mysql/reader_errors_test.go::TestClassifyReaderError_DelegatesToApplierClassifier` (9 subtests) — confirms the delegation is shape-for-shape identical to `classifyApplierError`; any future drift between the two surfaces fails the test.
+  - `internal/engines/postgres/reader_errors_test.go::TestClassifyReaderError_DelegatesToApplierClassifier` (10 subtests) — same identity check on the PG surface; covers 40001 / 40P01 / 57P01 / 08006 retriable shapes and 23505 non-retriable.
+  - `internal/pipeline/streamer_source_error_test.go::TestSurfaceSourceError_*` (4 funcs) — covers nil-fn, nil-return, context-cancellation filtering (4 ctx-cancel shape subtests), and the GitHub #19 happy path where a non-cancellation transient is returned verbatim for the retry loop.
+- **End-to-end source-transient retry validation deferred to operator re-test** with `--apply-retry-attempts 8` running through a TCP reset on the source connection.
+
 ## [0.45.0]
 
 **Closes GitHub issue #17 (Option B — proper structural fix) + lands GitHub #18 Phase 1+2 (batch-latency telemetry + cross-region safety rail).** Operators bootstrapping `sluice sync start` against a PlanetScale-MySQL branch with Safe Migrations enabled (the recommended production configuration) previously hit `Error 1105 (HY000): direct DDL is disabled` after sluice had already captured the snapshot position and reached the schema-apply phase. No actionable hint, no recovery path that didn't involve toggling Safe Migrations off and on around the run. v0.45.0 adds a new `--schema-already-applied` flag (the recommended workflow), a focused error wrap that names the new flag in the operator-facing message, and several DSN-papercut fixes. The bundled #18 Phase 1+2 telemetry lands the foundation a future AIMD batch-size controller will build on.

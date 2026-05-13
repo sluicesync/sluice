@@ -436,7 +436,7 @@ func (r *CDCReader) pump(ctx context.Context, conn *pgconn.PgConn, startLSN pglo
 				WALFlushPosition: ack,
 				WALApplyPosition: ack,
 			}); err != nil {
-				r.setErr(fmt.Errorf("postgres: cdc: standby status update: %w", err))
+				r.setErr(classifyReaderError(fmt.Errorf("postgres: cdc: standby status update: %w", err)))
 				return
 			}
 			nextKeepalive = time.Now().Add(keepaliveInterval)
@@ -453,12 +453,12 @@ func (r *CDCReader) pump(ctx context.Context, conn *pgconn.PgConn, startLSN pglo
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return
 			}
-			r.setErr(fmt.Errorf("postgres: cdc: receive: %w", err))
+			r.setErr(classifyReaderError(fmt.Errorf("postgres: cdc: receive: %w", err)))
 			return
 		}
 
 		if errMsg, ok := raw.(*pgproto3.ErrorResponse); ok {
-			r.setErr(fmt.Errorf("postgres: cdc: server error: %s", errMsg.Message))
+			r.setErr(classifyReaderError(fmt.Errorf("postgres: cdc: server error: %s", errMsg.Message)))
 			return
 		}
 		copyData, ok := raw.(*pgproto3.CopyData)

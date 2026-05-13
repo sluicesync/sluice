@@ -391,6 +391,20 @@ type Streamer struct {
 	// backoff interval. ADR-0038. Zero means use the default (30s).
 	// Only consulted when [ApplyRetryAttempts] > 1.
 	ApplyRetryBackoffCap time.Duration
+
+	// sourceErrFn is the per-attempt closure that returns the source
+	// CDC reader's stored Err() — see GitHub issue #19. The pump's
+	// channel close is the normal EOF path; without surfacing the
+	// reader's error, a transient `read: connection reset` from the
+	// source mid-stream produced a clean nil exit instead of a
+	// retriable shape. Each [runOnce] iteration resets to nil before
+	// opening a fresh reader; coldStart / warmResume populate the
+	// field with the reader's Err method when the type exposes one
+	// (every shipping CDC reader does). runOnce reads after
+	// dispatchApply returns; the wrapped error is surfaced to
+	// runWithRetry which classifies it against [ir.RetriableError]
+	// in the standard way.
+	sourceErrFn func() error
 }
 
 // Run executes a snapshot+CDC stream with optional retry on
@@ -646,6 +660,11 @@ func (s *Streamer) runOnce(ctx context.Context) error {
 	if err := s.validate(); err != nil {
 		return err
 	}
+
+	// Reset the per-attempt source-error handle (GitHub #19). Each
+	// iteration opens a fresh CDC reader; carrying a stale handle
+	// from a previous attempt would surface an already-handled error.
+	s.sourceErrFn = nil
 
 	// Apply the sluice-prefix convention to the operator-supplied
 	// slot name (v0.10.2). Empty stays empty (engine default);
@@ -982,6 +1001,20 @@ func (s *Streamer) runOnce(ctx context.Context) error {
 	if dispatchErr != nil && !errors.Is(dispatchErr, context.Canceled) && !errors.Is(dispatchErr, context.DeadlineExceeded) {
 		return wrapWithHint(PhaseCDC, fmt.Errorf("pipeline: apply changes: %w", dispatchErr))
 	}
+	// GitHub issue #19: if the changes channel closed because the
+	// source CDC reader's pump hit a transient error (the channel-
+	// close path also fires on clean ctx-cancel and on the operator's
+	// graceful-stop signal, both of which are nil-Err cases), surface
+	// the wrapped error so [runWithRetry] classifies it as
+	// [ir.RetriableError] and retries. Pre-v0.46.0 this exited 0
+	// silently — a `read: connection reset` from the source mid-
+	// stream looked indistinguishable from a normal EOF to the
+	// applier.
+	if dispatchErr == nil {
+		if srcErr := surfaceSourceError(s.sourceErrFn); srcErr != nil {
+			return wrapWithHint(PhaseCDC, fmt.Errorf("pipeline: source cdc reader: %w", srcErr))
+		}
+	}
 	// On a stop-signal-driven graceful drain, clear stop_requested_at
 	// so a CLI `sync stop --wait` polling for completion sees the
 	// cleared flag and returns success. Use the outer ctx because
@@ -995,6 +1028,32 @@ func (s *Streamer) runOnce(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// surfaceSourceError returns the source CDC reader's stored Err()
+// when the pump terminated due to a non-cancellation failure
+// (GitHub issue #19). Filters two no-op cases:
+//
+//   - sourceErrFn nil — the engine's reader doesn't expose Err().
+//     Pre-v0.46 readers and same-shape future readers stay silent.
+//   - srcErr is context.Canceled / context.DeadlineExceeded — the
+//     pump's check is best-effort, and a ctx-driven shutdown must
+//     not surface as a retriable error that the retry loop would
+//     loop on after the parent cancellation.
+//
+// Returns nil for both no-op cases; the underlying error otherwise.
+// The caller wraps with phase + retry-loop context.
+func surfaceSourceError(sourceErrFn func() error) error {
+	if sourceErrFn == nil {
+		return nil
+	}
+	srcErr := sourceErrFn()
+	if srcErr == nil ||
+		errors.Is(srcErr, context.Canceled) ||
+		errors.Is(srcErr, context.DeadlineExceeded) {
+		return nil
+	}
+	return srcErr
 }
 
 // dispatchApply routes the change channel to the applier's batched
@@ -1260,6 +1319,14 @@ func (s *Streamer) warmResume(ctx context.Context, persisted ir.Position, lsnTra
 		closeIf(cdc)
 		return nil, wrapWithHint(PhaseCDC, fmt.Errorf("pipeline: start cdc: %w", err))
 	}
+	// GitHub issue #19: capture the reader's Err method so runOnce
+	// can surface a pump error (transient `read: connection reset`
+	// etc.) into the ADR-0038 retry loop after the changes channel
+	// closes. Optional-interface probe; pre-v0.46 readers without
+	// Err() pass through as nil and runOnce's check no-ops.
+	if errer, ok := cdc.(interface{ Err() error }); ok {
+		s.sourceErrFn = errer.Err
+	}
 	return changes, nil
 }
 
@@ -1468,6 +1535,13 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 	if err != nil {
 		_ = stream.Close()
 		return nil, wrapWithHint(PhaseCDC, fmt.Errorf("pipeline: start cdc: %w", err))
+	}
+	// GitHub issue #19: capture the reader's Err method so runOnce
+	// can surface a pump error into the ADR-0038 retry loop after the
+	// changes channel closes. See [warmResume] for the rationale —
+	// same optional-interface probe pattern.
+	if errer, ok := stream.Changes.(interface{ Err() error }); ok {
+		s.sourceErrFn = errer.Err
 	}
 	// stream stays alive for the rest of Run; cleanup happens via
 	// the function's defer chain when ctx cancels and pump exits.

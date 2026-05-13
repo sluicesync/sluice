@@ -426,7 +426,7 @@ func (s *vstreamSnapshotStream) pump(ctx context.Context, out chan<- ir.Change) 
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return
 			}
-			s.setErr(fmt.Errorf("mysql/vstream: snapshot: cdc recv: %w", err))
+			s.setErr(classifyReaderError(fmt.Errorf("mysql/vstream: snapshot: cdc recv: %w", err)))
 			return
 		}
 		for _, ev := range resp.GetEvents() {

@@ -361,7 +361,7 @@ func (r *CDCReader) pump(ctx context.Context, streamer *replication.BinlogStream
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return
 			}
-			r.setErr(fmt.Errorf("mysql: cdc: get event: %w", err))
+			r.setErr(classifyReaderError(fmt.Errorf("mysql: cdc: get event: %w", err)))
 			return
 		}
 		// Suppress the watchdog as soon as anything row-relevant

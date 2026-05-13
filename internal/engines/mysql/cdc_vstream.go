@@ -562,7 +562,7 @@ func (r *vstreamCDCReader) pump(ctx context.Context, stream vtgateservice.Vitess
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return
 			}
-			r.setErr(fmt.Errorf("mysql/vstream: recv: %w", err))
+			r.setErr(classifyReaderError(fmt.Errorf("mysql/vstream: recv: %w", err)))
 			return
 		}
 		for _, ev := range resp.GetEvents() {
