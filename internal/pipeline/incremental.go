@@ -334,6 +334,8 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 	if err := writeManifestAt(ctx, b.Store, manifestPath, manifest); err != nil {
 		return fmt.Errorf("incremental: write manifest: %w", err)
 	}
+	// GitHub #20 (v0.47.0): keep the chain.json catalog in sync.
+	updateChainCatalogBestEffort(ctx, b.Store, manifest, manifestPath, manifestFileCount(manifest))
 
 	slog.InfoContext(ctx, "incremental backup complete",
 		slog.String("backup_id", manifest.BackupID),
@@ -695,7 +697,35 @@ type manifestRecord struct {
 // listAllManifests returns every manifest in store (the full's
 // [ManifestFileName] and every `manifests/incr-…json`), with parent
 // resolution / chain ordering left to the caller.
+//
+// GitHub #20 (v0.47.0): when chain.json is present at the store root,
+// the catalog's ordered entries provide the chain shape in a single
+// Get — collapsing the per-manifest [store.List] + [readManifestAt]
+// walk. Catalog-absent (legacy chains, or stores that haven't been
+// written by v0.47.0+ yet) falls back to the directory walk via
+// [listAllManifestsViaWalk]. Catalog-present + per-entry manifest
+// reads surface chain-integrity problems (a catalog entry pointing
+// at a manifest that's no longer on disk) as a fatal error rather
+// than silently degrading — matches the loud-failure tenet.
 func listAllManifests(ctx context.Context, store ir.BackupStore) ([]manifestRecord, error) {
+	cat, ok, err := loadChainCatalog(ctx, store)
+	if err != nil {
+		// Catalog is present but corrupted / version-newer. Surface
+		// the error rather than silently degrading to a walk — the
+		// operator needs to know.
+		return nil, fmt.Errorf("chain catalog: %w", err)
+	}
+	if ok {
+		return readManifestsFromCatalog(ctx, store, cat)
+	}
+	return listAllManifestsViaWalk(ctx, store)
+}
+
+// listAllManifestsViaWalk is the legacy [store.List] + per-manifest
+// [readManifestAt] implementation. Preserved as the fall-through for
+// chains without chain.json (pre-v0.47.0 stores) and as the rebuild
+// path for [rebuildChainCatalog].
+func listAllManifestsViaWalk(ctx context.Context, store ir.BackupStore) ([]manifestRecord, error) {
 	var out []manifestRecord
 
 	// Full's manifest at the legacy path.

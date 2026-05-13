@@ -380,6 +380,10 @@ func (b *BackupStream) Run(ctx context.Context) error {
 							slog.String("err", err.Error()),
 						)
 					} else {
+						// GitHub #20 (v0.47.0): keep the chain.json
+						// catalog in sync on the drain-commit path
+						// too. Same best-effort posture.
+						updateChainCatalogBestEffort(commitCtx, b.Store, roll.Manifest, manifestPath, manifestFileCount(roll.Manifest))
 						slog.InfoContext(ctx, "stream rollover committed (drain on ctx-cancel)",
 							slog.String("manifest_path", manifestPath),
 							slog.String("backup_id", roll.Manifest.BackupID),
@@ -460,6 +464,8 @@ func (b *BackupStream) Run(ctx context.Context) error {
 		if err := writeManifestAt(ctx, b.Store, manifestPath, roll.Manifest); err != nil {
 			return fmt.Errorf("stream: write rollover manifest: %w", err)
 		}
+		// GitHub #20 (v0.47.0): keep the chain.json catalog in sync.
+		updateChainCatalogBestEffort(ctx, b.Store, roll.Manifest, manifestPath, manifestFileCount(roll.Manifest))
 
 		if roll.StopRequested {
 			// Stop observed during the window: commit the in-flight

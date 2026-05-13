@@ -6,6 +6,54 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.47.0]
+
+**Lands GitHub issue #20 chunk 14a — chain.json catalog at chain root.** Roadmap item 14's keystone. Today's chain readers (`Restore.storeHasIncrementals`, `ChainRestore`, `listAllManifests`, `position-from-manifest`, the resume-detect path on `backup full` / `incremental` / `stream`) all walk the `manifests/` directory via `store.List` and then `store.Get` every result — fine on local FS for small chains, operationally painful past ~10k incrementals or on object storage where `ListObjects` is the dominant cost. v0.47.0 lands a single `chain.json` at the chain root listing every manifest in order with end-position and file-count metadata pre-extracted; chain readers collapse the per-manifest walk to a single `Get`. Foundational for the v0.48.0+ rotate-at / prune (14b–c) and v0.49.0+ compact (14d) chunks under the same roadmap item — they all need O(1) chain-state lookup to build on.
+
+### Added
+
+- **`internal/pipeline/chain_catalog.go` (new).** `ChainCatalog` + `ChainCatalogEntry` types serialised as `chain.json` at chain root. Entry fields: `backup_id`, `kind`, `parent_backup_id`, `manifest_path`, `end_position`, `created_at`, `file_count`, plus `tombstoned` reserved for v0.48.0+ compact/prune. `loadChainCatalog`, `writeChainCatalog`, `rebuildChainCatalog`, `readManifestsFromCatalog`, `updateChainCatalogBestEffort` cover the read/write/repair/integration surface. `format_version=1`; forward-version refusal with operator-actionable "upgrade sluice" hint. See [`docs/dev/notes/prep-chain-catalog.md`](docs/dev/notes/prep-chain-catalog.md) for the design.
+
+- **`listAllManifests` fast-path.** When chain.json is present, `listAllManifests` dispatches to `readManifestsFromCatalog` (single catalog `Get` + per-entry manifest `Get`s in known chain order); catalog-absent (legacy chains, never-written stores) falls back to today's `listAllManifestsViaWalk`. Catalog-corrupted (parse failure, unsupported `format_version`) surfaces as a fatal error rather than silently degrading — operators need to know about the integrity issue.
+
+- **Catalog hooks at every production `writeManifest` site.** `backup.go::Backup.run` after the final flip-to-complete write; `incremental.go::Incremental.run` after the rollover-end manifest write; `stream.go::Stream.run` on both the normal-rollover commit AND the drain-on-ctx-cancel commit. Per-chunk / per-table checkpoint writes during the row sweep skip the catalog (BackupID isn't computed yet at that point), so a typical backup-full run produces exactly one catalog `Put` regardless of chunk count. Updates are best-effort: failures log at WARN but do NOT fail the manifest write — manifests remain the source of truth, the catalog is an O(1) accelerator.
+
+- **`sluice backup verify --rebuild-catalog`.** Operator-driven catalog regeneration. Walks every manifest on disk and writes a fresh chain.json from scratch. Useful after manual chain mutation (operator-driven prune outside the v0.48.0+ tooling) or to seed a catalog on a legacy chain produced by sluice older than v0.47.0.
+
+### Fixed
+
+- **Lazy rebuild on first v0.47.0 write to a legacy chain.** When `updateChainCatalog` runs against a chain without chain.json (a pre-v0.47.0 chain being extended in v0.47.0), the function performs a one-time rebuild over the existing `manifests/` directory + the full at the root before appending the new entry. Operator sees a new chain.json appear with all historical entries the first time v0.47.0 writes; subsequent updates pay only one `Get` + one `Put`. No operator-driven migration step required.
+
+- **Dedup-by-path AND dedup-by-BackupID.** A backup-full re-run that overwrites the conventional `manifest.json` produces a new BackupID (different CreatedAt) at the same path. Naive dedup-by-BackupID-only would leave a stale entry pointing at the same path, and chain consumers would read the manifest twice (verify-double-count, ChainRestore double-apply). v0.47.0's dedup filter drops any existing entry whose BackupID OR ManifestPath collides with the new entry before appending — both the per-chunk-checkpoint case (same BackupID, same path) and the re-run case (new BackupID, same path) collapse to a single correct entry.
+
+- **Tombstone forward-compat filter.** A v0.47.0 reader against a v0.48.0+ chain.json with `tombstoned: true` entries MUST skip those entries during chain iteration — otherwise a future compaction's tombstones would surface compacted-out manifests in a v0.47.0 restore. `filterActiveEntries` runs at every `readManifestsFromCatalog` call. v0.47.0 writers always emit `tombstoned: false`; the filter is cheap forward-compat insurance for the v0.48.0+ work.
+
+### Migration / Compatibility
+
+- **Drop-in upgrade from v0.46.x.** Existing chains without chain.json keep working through the directory-walk fallback. The first v0.47.0 write into a legacy chain triggers a one-time lazy rebuild (one `List` + one `Get` per existing manifest); subsequent writes pay only one `Get` + one `Put`. Operator sees a new `chain.json` file appear at the chain root.
+- **Pre-v0.47.0 sluice reading a v0.47.0-produced chain** ignores `chain.json` entirely (unknown file at chain root) and walks `manifests/` as before. Strict forward AND backward compat at the chain-root layer.
+- **`writeManifest` Put count is +1 on backup-full runs** (one chain.json write per backup completion). Operators with strict Put-count budgets / monitoring should adjust expectations; the additional Put is small (~1-10 KB depending on chain length).
+
+### Who needs this release
+
+- **Anyone running `sluice backup stream run` against long-running chains** (especially local-FS chains per the GitHub #20 evidence): drop-in benefit. Chain-state lookups are now O(1); the foundation for bounded retention is in place.
+- **Anyone restoring large chains on object storage**: drop-in benefit. Restore startup eliminates the `ListObjects` walk in favour of a single `Get chain.json` — meaningful on chains past a few hundred incrementals.
+- **Operators preparing for the v0.48.0+ rotate-at / prune work**: this is the keystone. The next chunks (`--retain-rotate-at`, `sluice backup prune`, `sluice backup compact`) all build on chain.json.
+
+### Verification surface
+
+- **8 new unit tests in `internal/pipeline/chain_catalog_test.go`**:
+  - `TestChainCatalog_LoadAbsent` — legacy-chain detection (no chain.json → no error)
+  - `TestChainCatalog_RoundTrip` — write/read symmetry across every field
+  - `TestChainCatalog_FormatVersionGate` — refuses `format_version` newer than this build
+  - `TestChainCatalog_AppendDeduplicatesByBackupID` — per-chunk-checkpoint dedup pins
+  - `TestChainCatalog_RebuildFromLegacyChain` — lazy-rebuild on first write to pre-v0.47.0 chain
+  - `TestChainCatalog_FilterTombstoned` — forward-compat insurance for v0.48.0+ tombstones
+  - `TestChainCatalog_JSONShape` — pins the on-disk JSON envelope against accidental tag renames
+  - `TestListAllManifests_PrefersCatalog` / `TestListAllManifests_FallsBackToWalk` — integration of fast-path vs legacy walk
+- **Existing backup-resume tests retained** with one assertion update (`TestBackup_ResumeSkipsAlreadyCompletedTables`: 4 → 5 Puts to account for the one chain.json write on the final flip-to-complete).
+- **End-to-end backup chain validation deferred to operator re-test** — same pattern as prior backup-track releases.
+
 ## [0.46.0]
 
 **Closes GitHub issue #19 — source-side retry on transient CDC reader errors.** Before v0.46.0, when the source CDC reader's pump hit a transient (`read tcp: ... read: connection reset by peer`, `EOF`, vttablet `code = Aborted/Unavailable/ResourceExhausted`, PG SQLSTATE 57P0x server-restart, etc.), the pump closed the changes channel after stashing the error via its internal `setErr`. The applier's batched loop saw the channel close as a normal EOF signal, committed any pending batch, and returned `nil`. The streamer then returned `nil` from `runOnce` — a clean exit code 0 — even though the operator's overnight `sluice sync start` had silently dropped its CDC connection mid-stream. The ADR-0038 retry loop (v0.42.0) catches *applier-side* transients via the `ir.RetriableError` interface, but never saw a source-side error to classify. v0.46.0 closes the gap by classifying source-pump errors with the same interface and surfacing them back to the retry loop after the changes channel closes.

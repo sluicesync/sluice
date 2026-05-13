@@ -756,6 +756,8 @@ type BackupVerifyCmd struct {
 	BackupEndpoint  string `help:"Override the S3 endpoint for S3-compatible providers. Only meaningful when --from is an s3:// URL." placeholder:"URL"`
 	BackupRegion    string `help:"Override the S3 region. Only meaningful when --from is an s3:// URL." placeholder:"REGION"`
 	BackupPathStyle bool   `help:"Force path-style addressing. Only meaningful when --from is an s3:// URL."`
+
+	RebuildCatalog bool `help:"Rebuild the chain.json catalog from scratch by walking every manifest, then exit. Use after manual chain mutation (operator-driven prune) or to seed a catalog on a legacy chain produced by sluice older than v0.47.0."`
 }
 
 // Run implements `sluice backup verify`.
@@ -777,6 +779,16 @@ func (v *BackupVerifyCmd) Run(_ *Globals) error {
 	}
 	if closer != nil {
 		defer func() { _ = closer() }()
+	}
+	if v.RebuildCatalog {
+		entries, err := pipeline.RebuildChainCatalogAt(ctx, store)
+		if err != nil {
+			return fmt.Errorf("rebuild chain catalog: %w", err)
+		}
+		slog.InfoContext(ctx, "chain catalog rebuilt",
+			slog.Int("entries", entries),
+		)
+		return nil
 	}
 	total, mismatches, err := pipeline.VerifyBackup(ctx, store)
 	if err != nil {

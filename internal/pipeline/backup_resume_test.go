@@ -142,11 +142,15 @@ func TestBackup_ResumeSkipsAlreadyCompletedTables(t *testing.T) {
 	//     (Bug 34b: per-chunk granularity, v0.16.1+)
 	//   - 1 manifest Put for the per-table checkpoint after posts
 	//   - 1 manifest Put for the final flip-to-complete
-	// = 4 Puts. The users chunk is not in that count — it was already
+	//   - 1 chain.json Put on the final manifest write (GitHub #20,
+	//     v0.47.0 — only the final write triggers the catalog because
+	//     per-chunk / per-table checkpoint manifests are written with
+	//     an empty BackupID, which updateChainCatalog skips)
+	// = 5 Puts. The users chunk is not in that count — it was already
 	// on disk from the first run and trySkipChunk short-circuited the
 	// upload (no row read, no Put).
-	if counting.puts != 4 {
-		t.Errorf("resume Put count = %d; want 4 (1 chunk + 3 manifest checkpoints)", counting.puts)
+	if counting.puts != 5 {
+		t.Errorf("resume Put count = %d; want 5 (1 chunk + 3 manifest checkpoints + 1 chain.json)", counting.puts)
 	}
 
 	// Verify the backup overall.
