@@ -220,6 +220,35 @@ type Streamer struct {
 	// surfaces cause the flag to error clearly before any work runs.
 	ResetTargetData bool
 
+	// SchemaAlreadyApplied, when true, declares that the target's
+	// schema (and the `sluice_cdc_state` control table) have been
+	// pre-created out-of-band. Sluice skips every DDL phase during
+	// cold-start: no CREATE TABLE / CREATE INDEX / ADD FOREIGN KEY /
+	// CREATE VIEW / SyncIdentitySequences / EnsureControlTable.
+	// Operators on environments that block direct DDL — PlanetScale
+	// branches with Safe Migrations enabled (GitHub issue #17),
+	// schema-managed-by-Atlas/Liquibase shops — use this flag after
+	// pushing schema changes via their managed pipeline.
+	//
+	// The pre-flight refusal that checks for non-empty target tables
+	// is also skipped (the operator's promise is "everything I
+	// need is already there"); bulk-copy runs into the operator-
+	// prepared empty tables.
+	//
+	// Operator responsibilities when this flag is set:
+	//   - Every source table must exist on the target with a
+	//     compatible schema. Sluice does NOT validate the schemas
+	//     match — translation policies still apply at the IR layer
+	//     for cross-engine pairs, but the target's catalog state is
+	//     trusted as-is.
+	//   - The `sluice_cdc_state` control table must exist on the
+	//     target before the run starts (the DDL is in
+	//     internal/engines/{mysql,postgres}/control_table.go).
+	//
+	// Skipping schema-apply does NOT skip the source-side snapshot
+	// or the CDC pump — only the target-side DDL phases.
+	SchemaAlreadyApplied bool
+
 	// ApplyBatchSize is the upper bound on changes per target
 	// transaction. 0 or 1 means one-change-per-tx (the conservative
 	// v0.3.x default). Larger values amortise per-tx commit
@@ -380,6 +409,13 @@ type Streamer struct {
 // Resources (snapshot stream, target writers, applier) are
 // released by each [runOnce] iteration regardless of outcome.
 func (s *Streamer) Run(ctx context.Context) error {
+	// GitHub #18 Phase 2: static safety-rail. Warn (don't refuse)
+	// when an operator combination is known to hit Vitess's 20s
+	// tx-killer under sustained load. The threshold matches the
+	// validation-rig observations (PS-MySQL cross-region failed at
+	// batch=100, worked at 25-50).
+	warnIfApplyBatchSizeRisky(ctx, s)
+
 	attempts := s.ApplyRetryAttempts
 	if attempts < 1 {
 		attempts = 1
@@ -426,9 +462,23 @@ func (s *Streamer) runWithRetry(ctx context.Context, attempts int) error {
 	// loop so progress is observable.
 	posReader, err := s.Target.OpenChangeApplier(ctx, s.TargetDSN)
 	if err != nil {
-		slog.WarnContext(ctx, "applier: retry policy disabled (cannot open position reader); falling through to single-attempt run",
-			slog.String("err", err.Error()),
-		)
+		// GitHub #17 papercut: when the open failure is a non-
+		// retriable startup error (parse error, bad DSN, unreachable
+		// target), the retry-policy WARN is noise — the inner
+		// runOnce is about to fail with the same error and exit.
+		// We skip the WARN for those shapes; for genuinely-
+		// transient open failures (network blip mid-startup), the
+		// WARN still fires and the single-attempt fall-through is
+		// the right behaviour.
+		if !isTransientOpenError(err) {
+			slog.DebugContext(ctx, "applier: retry policy disabled (cannot open position reader); falling through to single-attempt run",
+				slog.String("err", err.Error()),
+			)
+		} else {
+			slog.WarnContext(ctx, "applier: retry policy disabled (cannot open position reader); falling through to single-attempt run",
+				slog.String("err", err.Error()),
+			)
+		}
 		return s.runOnce(ctx)
 	}
 	defer closeIf(posReader)
@@ -484,6 +534,79 @@ func (s *Streamer) runWithRetry(ctx context.Context, attempts int) error {
 			return ctx.Err()
 		}
 	}
+}
+
+// warnIfApplyBatchSizeRisky emits a single WARN at startup when the
+// operator's apply-batch-size + target combination is known to hit
+// Vitess's 20s tx-killer under sustained load. GitHub #18 Phase 2:
+// the validation-rig observations showed PS-MySQL cross-region
+// failed at batch=100 (every batch hit tx-timeout, retry loop fired
+// exhaustively), worked at 25-50.
+//
+// Triggers when target engine name is "planetscale" AND
+// ApplyBatchSize > 50. The check is conservative — we don't try to
+// detect cross-region from DSN host inspection (PS hostname formats
+// vary; false negatives are better than the maintenance burden of a
+// host-pattern table that grows stale). Operators on same-region
+// PS-MySQL hit a benign WARN — better than missing the cross-region
+// foot-gun entirely.
+//
+// Phase 3 (v0.46.0+) will replace this static rail with an AIMD
+// controller that auto-discovers the right size per (source,
+// target) pair from observed per-batch latency.
+func warnIfApplyBatchSizeRisky(ctx context.Context, s *Streamer) {
+	if s.Target == nil {
+		return
+	}
+	maybeWarnApplyBatchSizeRisky(ctx, s.Target.Name(), s.ApplyBatchSize)
+}
+
+// maybeWarnApplyBatchSizeRisky is the testable core of
+// [warnIfApplyBatchSizeRisky] — takes the target engine name and
+// batch size directly so unit tests can exercise the policy without
+// constructing a full Engine stub.
+func maybeWarnApplyBatchSizeRisky(ctx context.Context, targetName string, batchSize int) {
+	if targetName != "planetscale" {
+		return
+	}
+	const riskyThreshold = 50
+	if batchSize <= riskyThreshold {
+		return
+	}
+	slog.WarnContext(ctx, "apply-batch-size > 50 against a planetscale target may exceed Vitess's 20s transaction-killer timeout under sustained CDC load",
+		slog.Int("apply_batch_size", batchSize),
+		slog.Int("safe_threshold", riskyThreshold),
+		slog.String("hint", "if you see frequent 'mysql: applier: batch rollback on error' with 'code = Aborted ... for tx killer rollback', reduce --apply-batch-size to 25-50. See GitHub #18 for the auto-tuning controller planned for a future release."),
+	)
+}
+
+// isTransientOpenError reports whether an applier-open error looks
+// like a transient (network blip, brief DNS failure) vs a permanent
+// startup failure (DSN parse error, bad credentials, unreachable
+// hostname). Permanent failures don't benefit from the retry-policy
+// WARN — the inner runOnce will surface the same error and exit;
+// the WARN just makes the operator's first stderr line confusing
+// (GitHub #17 papercut).
+//
+// Conservative classification: anything that looks like a parse or
+// configuration error is permanent. Network-shape strings are
+// transient. Unknown shapes default to transient so the existing
+// behaviour (WARN + fall-through) is preserved.
+func isTransientOpenError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "invalid DSN"),
+		strings.Contains(msg, "DSN must include"),
+		strings.Contains(msg, "parseDSN"),
+		strings.Contains(msg, "Access denied"),
+		strings.Contains(msg, "Unknown database"),
+		strings.Contains(msg, "Authentication failed"):
+		return false
+	}
+	return true
 }
 
 // computeRetryBackoff returns the per-attempt backoff per ADR-0038:
@@ -591,7 +714,7 @@ func (s *Streamer) runOnce(ctx context.Context) error {
 	// Skip on dry-run — that's a write, and dry-run is read-only.
 	// ReadPosition below tolerates a missing control table by
 	// returning ok=false (same as "no row").
-	if !s.DryRun {
+	if !s.DryRun && !s.SchemaAlreadyApplied {
 		if err := applier.EnsureControlTable(ctx); err != nil {
 			return wrapWithHint(PhaseSchemaApply, fmt.Errorf("pipeline: ensure control table: %w", err))
 		}
@@ -1238,14 +1361,27 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 	applyTargetSchema(rw, s.TargetSchema)
 	applyMaxBufferBytes(rw, s.MaxBufferBytes)
 
-	if s.ResetTargetData {
+	switch {
+	case s.ResetTargetData:
 		if err := resetTargetDataForStream(ctx, schema, rw, applier, streamID); err != nil {
 			closeIf(rw)
 			closeIf(sw)
 			_ = stream.Close()
 			return nil, err
 		}
-	} else {
+	case s.SchemaAlreadyApplied:
+		// GitHub issue #17: operator promises every source table
+		// exists on the target with a compatible schema, and that
+		// the sluice_cdc_state control table has been pre-created.
+		// Skip the preflight refusal — the operator's promise is
+		// "everything I need is already there with no data"; we
+		// can't validate that without round-trips that the operator
+		// has explicitly opted out of. Bulk-copy runs into the
+		// operator-prepared empty tables.
+		slog.InfoContext(ctx, "schema-already-applied: skipping cold-start preflight + DDL phases (GitHub #17)",
+			slog.String("stream_id", streamID),
+		)
+	default:
 		// Cold-start pre-flight: refuse if any target table already
 		// contains data. See preflight.go for the rationale (Bug 9).
 		// Streamer's cold-start branch is the analogue of Migrator's
@@ -1259,7 +1395,8 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 		}
 	}
 
-	if err := runBulkCopy(ctx, schema, stream.Rows, sw, rw); err != nil {
+	bulkOpts := bulkCopyOpts{SkipSchemaApply: s.SchemaAlreadyApplied}
+	if err := runBulkCopyWithOpts(ctx, schema, stream.Rows, sw, rw, bulkOpts); err != nil {
 		closeIf(rw)
 		closeIf(sw)
 		_ = stream.Close()

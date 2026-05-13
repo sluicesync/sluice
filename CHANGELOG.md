@@ -6,6 +6,57 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.45.0]
+
+**Closes GitHub issue #17 (Option B — proper structural fix) + lands GitHub #18 Phase 1+2 (batch-latency telemetry + cross-region safety rail).** Operators bootstrapping `sluice sync start` against a PlanetScale-MySQL branch with Safe Migrations enabled (the recommended production configuration) previously hit `Error 1105 (HY000): direct DDL is disabled` after sluice had already captured the snapshot position and reached the schema-apply phase. No actionable hint, no recovery path that didn't involve toggling Safe Migrations off and on around the run. v0.45.0 adds a new `--schema-already-applied` flag (the recommended workflow), a focused error wrap that names the new flag in the operator-facing message, and several DSN-papercut fixes. The bundled #18 Phase 1+2 telemetry lands the foundation a future AIMD batch-size controller will build on.
+
+### Added — #17 main fix
+
+- **`--schema-already-applied` flag on `sluice sync start`.** When set, sluice skips every DDL phase during cold-start: `CREATE TABLE` / `CREATE INDEX` / `ADD FOREIGN KEY` / `CREATE VIEW` / `SyncIdentitySequences` / `EnsureControlTable`. The cold-start preflight refusal (Bug 9) is also skipped — the operator's promise is "everything I need is already there with no data." Bulk-copy then runs into the operator-prepared empty tables. Operators on PlanetScale Safe Migrations branches push schema changes via deploy requests (including the `sluice_cdc_state` table — DDL in `internal/engines/mysql/control_table.go`), then run sluice with this flag.
+
+- **`bulkCopyOpts` (internal)** — `runBulkCopy` was refactored into `runBulkCopyWithOpts` with a `SkipSchemaApply` option that suppresses every DDL phase while preserving the per-table data sweep. Existing callers continue to use the zero-options shortcut; the Streamer's coldStart now passes `bulkCopyOpts{SkipSchemaApply: s.SchemaAlreadyApplied}`.
+
+### Fixed — #17 papercuts
+
+- **`internal/engines/mysql/schema_writer_errors.go` (new) — Safe Migrations DDL refusal detection.** New `wrapDDLError` helper recognises `Error 1105 (HY000): direct DDL is disabled` and wraps with `ErrSafeMigrationsBlocked` + a multi-line operator hint pointing at both recovery paths: (a) `--schema-already-applied` after pre-creating schema via a deploy request, or (b) temporarily disable Safe Migrations during bootstrap. The wrapper is wired at every DDL exec site in `schema_writer.go` (CreateTablesWithoutConstraints, CreateIndexes, CreateConstraints, CreateViews) and at the control-table-create in `control_table.go`. Errors that don't match the Safe Migrations shape return verbatim — no behaviour change for other failure modes.
+
+- **`internal/engines/mysql/connect.go::parseDSN` — doubled "invalid DSN:" prefix.** The driver's own error message starts with `"invalid DSN: ..."`, and sluice's `fmt.Errorf("mysql: invalid DSN: %w", err)` wrap produced a confusing `"mysql: invalid DSN: invalid DSN: ..."` double prefix. The wrapper now strips the redundant inner prefix.
+
+- **`internal/engines/mysql/connect.go::dsnShapeHint` — `/db/branch` DSN papercut.** PlanetScale credentials are branch-scoped (the branch is implicit in the user/password); operators sometimes try to encode the branch in the DSN path as `/db/branch`, which the driver rejects with a generic `"did you forget to escape a param value?"` hint sending them down the wrong rabbit hole. Sluice now detects path-with-extra-slash (skipping the parenthesised `protocol(address)` block so unix sockets like `/tmp/mysql.sock` don't false-positive) and prepends a clearer hint to the wrapped error.
+
+- **`internal/pipeline/streamer.go::runWithRetry` — retry-policy WARN suppression on non-retriable startup failures.** The ADR-0038 retry loop opens a side-channel applier at startup to read positions between attempts; on failure it logged `WARN msg="applier: retry policy disabled (cannot open position reader); falling through to single-attempt run"`. For genuinely-transient failures this is correct, but for parse errors / bad DSN / unknown database (the inner `runOnce` is about to fail with the same error and exit), the WARN was noise that confused the operator's first stderr line. New `isTransientOpenError` classifier downgrades the message to DEBUG for known non-transient shapes (invalid DSN, parseDSN failure, access denied, unknown database).
+
+### Added — #18 Phase 1 + Phase 2 (telemetry foundation)
+
+- **DEBUG-level batch-latency telemetry on every applier-committed batch.** Both `internal/engines/{mysql,postgres}/change_applier_batch.go::applyOneBatch` now emit `slog.DebugContext(ctx, "applier: batch latency", stream_id, rows, millis)` per non-empty batch, measuring wall-clock from "batch start" through "position write + tx commit returns." Operators running `--log-level=debug` (and a future AIMD auto-tuner) get per-target per-batch cost visibility. Empty / idle-flush batches are elided to avoid noise during quiet periods.
+
+- **Cross-region safety rail in `Streamer.Run` startup.** New `maybeWarnApplyBatchSizeRisky(ctx, targetName, batchSize)` emits a single WARN when target engine name is `planetscale` AND `--apply-batch-size > 50`. The warning names the Vitess 20s transaction-killer constraint and points at the GitHub #18 follow-on (the AIMD controller planned for v0.46.0+). Conservative classification — false positives on same-region PS-MySQL are acceptable to avoid missing the cross-region foot-gun your validation rig hit at batch=100.
+
+### Migration / Compatibility
+
+- **Drop-in upgrade from v0.44.x for vanilla MySQL / PG operators not using PlanetScale.** No behaviour change.
+- **PlanetScale operators**: drop-in. The new `--apply-batch-size > 50` warning is informational; existing flag values continue to work. The new `--schema-already-applied` flag is opt-in.
+- **Safe Migrations operators (new workflow)**: pre-create schema via PlanetScale deploy request → run `sluice sync start --schema-already-applied` → sluice skips all DDL. Document the `sluice_cdc_state` DDL operators must include (see `internal/engines/mysql/control_table.go`).
+- **The DSN-error wrap changes the exact text of `parseDSN` failures**: operators who pattern-match on the doubled prefix in scripts (unlikely) need to update.
+
+### Who needs this release
+
+- **Anyone running `sluice sync start` against a PlanetScale-MySQL branch with Safe Migrations enabled**: **upgrade**. The new `--schema-already-applied` flag is the supported workflow.
+- **Anyone running cross-region PS-MySQL with `--apply-batch-size > 50`**: drop-in benefit. The new safety-rail warning surfaces the tx-killer foot-gun at startup instead of the operator discovering it via retry-loop exhaustion in production.
+- **Anyone with telemetry pipelines that scrape DEBUG-level logs**: opt-in benefit. The new `applier: batch latency` line is the foundation for the v0.46.0+ AIMD auto-tuner.
+- **Operators on quiescent or non-PlanetScale sources**: drop-in; no behaviour change.
+
+### Verification surface
+
+- **6 new unit tests** across `internal/engines/mysql/{schema_writer_errors,connect_dsn}_test.go` + `internal/pipeline/streamer_warn_test.go`:
+  - `TestWrapDDLError_SafeMigrationsBlockedIsWrapped` — confirms the 1105 error wrap recognises the Safe Migrations message + includes both recovery paths in the hint
+  - `TestWrapDDLError_OtherErrorsUnchanged` — default-pass invariant (nil, plain errors, different MySQL codes, non-matching 1105 messages stay verbatim)
+  - `TestParseDSN_NoDoubleInvalidPrefix` — no more `"invalid DSN: invalid DSN:"` double-prefix
+  - `TestDSNShapeHint_BranchPathDetected` — `/db/branch` produces actionable hint
+  - `TestDSNShapeHint_PlainPathNoHint` — well-formed DSNs (including unix sockets) get no false-positive hint
+  - `TestMaybeWarnApplyBatchSizeRisky_*` (3 subtests) — Phase 2 warn-policy correctness
+  - `TestIsTransientOpenError_*` (2 subtests) — papercut WARN suppression classification
+
 ## [0.44.0]
 
 **Closes GitHub issue #16 — PlanetScale backup chain-resume now works end-to-end.** Before v0.44.0, `sluice backup full` against a PlanetScale/Vitess source captured the source position via the binlog-shape encoder (`{"mode":"gtid","gtid_set":"..."}`) but the continuous-sync VStream reader that `sluice backup stream run` and `sluice backup incremental` use only understands the VStream `[]shardGtid` shape (`[{"keyspace":"...","shard":"-","gtid":"..."}]`). Operators got "json: cannot unmarshal object into Go value of type []mysql.shardGtid" immediately on any chain-resume attempt; backup chains were unusable on PlanetScale sources. The architectural fix routes PlanetScale's `OpenBackupSnapshot` through the same VStream COPY-mode machinery the live-sync `coldStart` path already uses — same gRPC stream, same per-shard vgtid capture, same `vstreamSnapshotRows` table-by-table reader.

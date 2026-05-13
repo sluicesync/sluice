@@ -139,6 +139,20 @@ func (a *ChangeApplier) ApplyBatch(ctx context.Context, streamID string, changes
 // cap, byte cap, channel close, Truncate flush, or TxCommit flush)
 // the transaction is committed.
 func (a *ChangeApplier) applyOneBatch(ctx context.Context, streamID string, changes <-chan ir.Change, maxBatchSize int) (n int, lastPos ir.Position, channelClosed bool, err error) {
+	// GitHub #18 Phase 1: batch-latency telemetry (PG-side mirror of
+	// the MySQL applier). Measure wall-clock from batch start through
+	// position write + commit. DEBUG-only; elided on n==0.
+	batchStart := time.Now()
+	defer func() {
+		if n > 0 {
+			slog.DebugContext(ctx, "applier: batch latency",
+				slog.String("stream_id", streamID),
+				slog.Int("rows", n),
+				slog.Int64("millis", time.Since(batchStart).Milliseconds()),
+			)
+		}
+	}()
+
 	// Wait for the first row-bearing change before opening the tx.
 	// Opening the tx then blocking with no work to do would hold a
 	// connection idle from the pool for arbitrarily long; we'd

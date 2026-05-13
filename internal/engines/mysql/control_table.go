@@ -68,7 +68,7 @@ func ensureControlTable(ctx context.Context, db *sql.DB) error {
 			PRIMARY KEY (stream_id)
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
 	if _, err := db.ExecContext(ctx, ddl); err != nil {
-		return fmt.Errorf("mysql: ensure control table: %w", err)
+		return fmt.Errorf("mysql: ensure control table: %w", wrapDDLError(err))
 	}
 	if err := ensureStopRequestedColumn(ctx, db); err != nil {
 		return err

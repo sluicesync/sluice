@@ -8,10 +8,58 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/go-sql-driver/mysql"
 )
+
+// dsnShapeHint inspects a DSN that failed to parse and returns a
+// short, leading-newline-terminated hint when sluice can recognise
+// a known operator-side mistake. Returns the empty string for
+// unknown shapes so the driver's own error message stays first.
+//
+// Currently recognises:
+//
+//   - "/db/branch" path segment — PlanetScale credentials are
+//     branch-scoped (the branch is implicit in the user/password),
+//     so the DSN path should be just the database name. The
+//     driver's generic "did you forget to escape a param value?"
+//     hint is misleading here.
+//
+// More patterns can be added as operator reports surface them.
+func dsnShapeHint(dsn string) string {
+	// MySQL DSN shape: `user:pw@protocol(address)/dbname?params`.
+	// The path component is after `protocol(address)` — we have to
+	// skip the `(...)` block because addresses can contain `/`
+	// (unix sockets like `/tmp/mysql.sock`).
+	at := strings.LastIndex(dsn, "@")
+	if at < 0 {
+		return ""
+	}
+	rest := dsn[at+1:]
+	// Strip query string before counting path segments.
+	if q := strings.Index(rest, "?"); q >= 0 {
+		rest = rest[:q]
+	}
+	// Skip a `(...)` address block if present. This handles unix
+	// sockets like `unix(/tmp/mysql.sock)/foo` whose internal `/`
+	// would otherwise be mis-read as a path separator.
+	if openIdx := strings.Index(rest, "("); openIdx >= 0 {
+		if closeIdx := strings.Index(rest[openIdx:], ")"); closeIdx >= 0 {
+			rest = rest[openIdx+closeIdx+1:]
+		}
+	}
+	// Now `rest` is the path component (with leading `/` if present).
+	if !strings.HasPrefix(rest, "/") {
+		return ""
+	}
+	path := rest[1:]
+	if strings.Contains(path, "/") {
+		return "DSN path appears to contain `database/branch` (PlanetScale-style); credentials are branch-scoped so the path should be just the database name — try removing the `/branch` segment. Underlying error: "
+	}
+	return ""
+}
 
 // parseDSN parses and validates a MySQL DSN, applying the parameter
 // adjustments sluice requires for correct behaviour:
@@ -38,7 +86,20 @@ import (
 func parseDSN(dsn string) (*mysql.Config, error) {
 	cfg, err := mysql.ParseDSN(dsn)
 	if err != nil {
-		return nil, fmt.Errorf("mysql: invalid DSN: %w", err)
+		// GitHub issue #17 papercut: the driver's error message already
+		// starts with "invalid DSN: ..."; wrapping with our own
+		// "mysql: invalid DSN: %w" produces a confusing double prefix
+		// ("mysql: invalid DSN: invalid DSN: ..."). Strip the driver's
+		// own "invalid DSN:" prefix before wrapping; if the driver
+		// reports a different shape (a future driver version may
+		// change the prefix), the original wrap still applies.
+		msg := err.Error()
+		const dupPrefix = "invalid DSN: "
+		if strings.HasPrefix(msg, dupPrefix) {
+			//nolint:errorlint // intentional: rewriting prefix for operator readability; original chain preserved via errors.Is below if needed
+			return nil, fmt.Errorf("mysql: invalid DSN: %s%s", dsnShapeHint(dsn), msg[len(dupPrefix):])
+		}
+		return nil, fmt.Errorf("mysql: invalid DSN: %s%w", dsnShapeHint(dsn), err)
 	}
 	if cfg.DBName == "" {
 		return nil, errors.New("mysql: DSN must include a database name")

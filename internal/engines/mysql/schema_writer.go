@@ -59,7 +59,7 @@ func (w *SchemaWriter) CreateTablesWithoutConstraints(ctx context.Context, s *ir
 			return err
 		}
 		if _, err := w.db.ExecContext(ctx, stmt); err != nil {
-			return fmt.Errorf("mysql: create table %q: %w", table.Name, err)
+			return fmt.Errorf("mysql: create table %q: %w", table.Name, wrapDDLError(err))
 		}
 	}
 	return nil
@@ -87,7 +87,7 @@ func (w *SchemaWriter) CreateIndexes(ctx context.Context, s *ir.Schema) error {
 				return err
 			}
 			if _, err := w.db.ExecContext(ctx, stmt); err != nil {
-				return fmt.Errorf("mysql: create index %q on %q: %w", idx.Name, table.Name, err)
+				return fmt.Errorf("mysql: create index %q on %q: %w", idx.Name, table.Name, wrapDDLError(err))
 			}
 		}
 	}
@@ -114,7 +114,7 @@ func (w *SchemaWriter) CreateConstraints(ctx context.Context, s *ir.Schema) erro
 				return err
 			}
 			if _, err := w.db.ExecContext(ctx, stmt); err != nil {
-				return fmt.Errorf("mysql: add foreign key %q on %q: %w", fk.Name, table.Name, err)
+				return fmt.Errorf("mysql: add foreign key %q on %q: %w", fk.Name, table.Name, wrapDDLError(err))
 			}
 		}
 	}
@@ -165,7 +165,7 @@ func (w *SchemaWriter) CreateViews(ctx context.Context, s *ir.Schema) error {
 		}
 		stmt := emitCreateView(view)
 		if _, err := w.db.ExecContext(ctx, stmt); err != nil {
-			return fmt.Errorf("mysql: create view %q: %w", view.Name, err)
+			return fmt.Errorf("mysql: create view %q: %w", view.Name, wrapDDLError(err))
 		}
 	}
 	return nil

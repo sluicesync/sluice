@@ -475,26 +475,55 @@ func (m *Migrator) resolveMigrationID() string {
 //
 // Errors from any phase are wrapped with the phase name so the
 // caller can pinpoint which step failed without parsing strings.
-func runBulkCopy(
+// bulkCopyOpts groups the optional behaviours that vary across
+// runBulkCopy call sites without forcing a parameter explosion on
+// the common path. Zero value is the historical behaviour.
+type bulkCopyOpts struct {
+	// SkipSchemaApply, when true, suppresses every DDL phase
+	// (CreateTablesWithoutConstraints, SyncIdentitySequences,
+	// CreateIndexes, CreateConstraints, CreateViews). Only the
+	// per-table data sweep (copyTable) runs. Used by the
+	// `--schema-already-applied` operator flag (GitHub #17) on
+	// targets that block direct DDL (PlanetScale Safe Migrations,
+	// Atlas/Liquibase-managed schemas). Operators promise the
+	// target catalog already matches the source's; sluice does not
+	// validate.
+	SkipSchemaApply bool
+}
+
+// runBulkCopyWithOpts is the configurable variant of [runBulkCopy].
+// Existing callers stay on the zero-options shortcut; new callers
+// use this to opt into [bulkCopyOpts.SkipSchemaApply] etc.
+func runBulkCopyWithOpts(
 	ctx context.Context,
 	schema *ir.Schema,
 	rows ir.RowReader,
 	sw ir.SchemaWriter,
 	rw ir.RowWriter,
+	opts bulkCopyOpts,
 ) error {
-	if err := sw.CreateTablesWithoutConstraints(ctx, schema); err != nil {
-		return wrapWithHint(PhaseSchemaApply, fmt.Errorf("pipeline: create tables: %w", err))
+	if !opts.SkipSchemaApply {
+		if err := sw.CreateTablesWithoutConstraints(ctx, schema); err != nil {
+			return wrapWithHint(PhaseSchemaApply, fmt.Errorf("pipeline: create tables: %w", err))
+		}
 	}
 	for _, table := range schema.Tables {
 		if err := copyTable(ctx, rows, rw, table); err != nil {
 			return wrapWithHint(PhaseBulkCopy, fmt.Errorf("pipeline: copy table %q: %w", table.Name, err))
 		}
 	}
-	if err := sw.SyncIdentitySequences(ctx, schema); err != nil {
-		return wrapWithHint(PhaseSchemaApply, fmt.Errorf("pipeline: sync identity sequences: %w", err))
+	if !opts.SkipSchemaApply {
+		if err := sw.SyncIdentitySequences(ctx, schema); err != nil {
+			return wrapWithHint(PhaseSchemaApply, fmt.Errorf("pipeline: sync identity sequences: %w", err))
+		}
+		if err := sw.CreateIndexes(ctx, schema); err != nil {
+			return wrapWithHint(PhaseIndexes, fmt.Errorf("pipeline: create indexes: %w", err))
+		}
 	}
-	if err := sw.CreateIndexes(ctx, schema); err != nil {
-		return wrapWithHint(PhaseIndexes, fmt.Errorf("pipeline: create indexes: %w", err))
+	if opts.SkipSchemaApply {
+		// Skip the trailing constraints/views phases too — handled
+		// by the loop below short-circuiting them in the same block.
+		return nil
 	}
 	if err := sw.CreateConstraints(ctx, schema); err != nil {
 		return wrapWithHint(PhaseConstraints, fmt.Errorf("pipeline: create constraints: %w", err))
