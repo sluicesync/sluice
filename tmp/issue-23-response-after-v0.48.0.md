@@ -2,7 +2,7 @@
 
 Thanks for the third reproduction + the narrowed hypothesis — "one batch then silence after every in-process retry" is materially more actionable than the original report.
 
-**v0.48.0 (just published) lands the diagnostic surface for exactly this case** under [GitHub #20's CHANGELOG entry's "Added — GitHub #23 Phase A"](https://github.com/orware/sluice/releases/tag/v0.48.0). Two pieces:
+**v0.48.0 (releasing imminently — race-fix CI in progress, expect publish within ~30 min of this comment) lands the diagnostic surface for exactly this case.** Two pieces:
 
 1. **`stream: heartbeat` INFO log line** every `--heartbeat-interval` (default 60s) per stream. The stall now produces a visible signature in the default log: heartbeats stop, no `applier: batch` lines, no error. Distinguishable in <1 minute instead of waiting for `sluice sync health` to flag it.
 
