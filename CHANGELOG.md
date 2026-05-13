@@ -6,9 +6,11 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-## [0.40.1]
+## [0.41.0]
 
-**Closes GitHub issue #15 — `sluice sync start` cold-start now persists the CDC anchor before the first batch.** Before v0.40.1, `sluice_cdc_state` only gained a row when the first CDC batch committed successfully. Any failure in the window between "bulk-copy complete; entering CDC mode" and that first batch commit (most commonly: a transient Vitess error per GitHub issue #13) wedged the operator — warm-resume couldn't recover (no persisted position), cold-start refused (target tables held the freshly-bulk-copied data), and the only escape was `--reset-target-data --yes` (re-bulk-copying everything) or `--force-cold-start` (collides on PK).
+**Closes GitHub issue #15 — `sluice sync start` cold-start now persists the CDC anchor before the first batch.** Originally cut as v0.40.1 but re-tagged as v0.41.0 after the v0.40.1 CI run uncovered a brittle integration test assertion that the fix exposed (`TestStreamer_ResetTargetData_RecoversFromSlotMissing`). The v0.40.1 tag exists on the remote (`501303a`) as a historical artifact with no published release; v0.41.0 supersedes it cleanly with the test fix bundled.
+
+**Original v0.40.1 changelog text follows.** Before v0.40.1, `sluice_cdc_state` only gained a row when the first CDC batch committed successfully. Any failure in the window between "bulk-copy complete; entering CDC mode" and that first batch commit (most commonly: a transient Vitess error per GitHub issue #13) wedged the operator — warm-resume couldn't recover (no persisted position), cold-start refused (target tables held the freshly-bulk-copied data), and the only escape was `--reset-target-data --yes` (re-bulk-copying everything) or `--force-cold-start` (collides on PK).
 
 ### Fixed
 
@@ -33,6 +35,7 @@ project follows [Semantic Versioning](https://semver.org/).
 
 - New unit test `TestPreflightColdStart_SyncModeHint` in `internal/pipeline/preflight_test.go`: asserts the sync-mode hint names GitHub #15, recommends `--reset-target-data`, and does NOT point at `sluice migrate --resume` (which would mislead operators in sync flows).
 - Existing migrator preflight tests updated to pass `preflightModeMigrate`; their hint assertions still pass unchanged.
+- **`TestStreamer_ResetTargetData_RecoversFromSlotMissing`** updated to use the new `waitForPersistedPositionChanged(t, dsn, streamID, before, timeout)` helper instead of the brittle `waitForPersistedPositionGone`. The v0.40.1 fix shrinks the "row absent" window during a reset+cold-start from "bulk-copy + first-CDC-batch latency" to just "bulk-copy duration" (milliseconds for small fixtures), making the poll-based "row gone" assertion miss the transient. "Position changed from a known prior value" is the strictly stronger signal — proves both that the reset cleared the original row AND that the new run wrote a fresh row under a different snapshot/CDC position.
 
 ## [0.40.0]
 
