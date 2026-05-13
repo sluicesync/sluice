@@ -8,9 +8,36 @@ import (
 	"context"
 	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
+
+// syncBuffer is a goroutine-safe bytes.Buffer for capturing slog
+// output in concurrent tests. The bare bytes.Buffer is not
+// goroutine-safe; using it directly as the io.Writer behind a slog
+// handler that's invoked from a background goroutine while the test
+// main goroutine reads via String() trips the race detector (the
+// v0.48.0 CI surfaced this — the local CGO_ENABLED=0 Windows build
+// silently disables -race, so the failure only fires on CI's Linux
+// runner). Mutex-protect the Write + String paths to close the
+// window.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
 
 // TestStartHeartbeat_EmitsOnTick pins the GitHub #23 Phase A
 // invariant: when interval > 0, the heartbeat goroutine MUST emit
@@ -19,7 +46,7 @@ import (
 // on this; if the goroutine silently exits or skips ticks, the
 // diagnostic is useless.
 func TestStartHeartbeat_EmitsOnTick(t *testing.T) {
-	var buf bytes.Buffer
+	var buf syncBuffer
 	h := slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})
 	orig := slog.Default()
 	slog.SetDefault(slog.New(h))
@@ -53,7 +80,7 @@ func TestStartHeartbeat_EmitsOnTick(t *testing.T) {
 // interval=0 is the operator's "I don't want heartbeats" signal.
 // Goroutine must not start; no log lines emitted.
 func TestStartHeartbeat_ZeroIntervalDisables(t *testing.T) {
-	var buf bytes.Buffer
+	var buf syncBuffer
 	h := slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})
 	orig := slog.Default()
 	slog.SetDefault(slog.New(h))
@@ -80,7 +107,7 @@ func TestStartHeartbeat_ZeroIntervalDisables(t *testing.T) {
 // goroutine would keep accumulating ticks across the second window;
 // a healthy exit produces a flat line.
 func TestStartHeartbeat_ExitsOnCtxCancel(t *testing.T) {
-	var buf bytes.Buffer
+	var buf syncBuffer
 	h := slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})
 	orig := slog.Default()
 	slog.SetDefault(slog.New(h))
