@@ -23,21 +23,31 @@ import (
 	_ "github.com/orware/sluice/internal/engines/postgres"
 )
 
-// waitForPersistedPositionGone polls until source_position for the
-// named stream is missing (no row) on the target, or until timeout.
-// Used by the reset-target-data integration test to confirm the
-// cdc-state row was cleared before subsequent assertions about the
-// re-bulk-copy phase.
-func waitForPersistedPositionGone(t *testing.T, dsn, streamID string, timeout time.Duration) bool {
+// waitForPersistedPositionChanged polls until source_position for
+// the named stream is non-empty AND differs from `before`, or until
+// timeout. Returns the new position on success, "" on timeout.
+//
+// The "position changed from a known prior value" signal is the
+// load-bearing way to confirm that a reset (or any operation that
+// clears + re-populates the cdc-state row) actually fired. The
+// alternative "wait for row to go missing" is brittle as of v0.40.1
+// because cold-start persists the snapshot anchor as the cdc-state
+// row immediately after bulk-copy completes (closing GitHub issue
+// #15), shrinking the "row absent" window to roughly the bulk-copy
+// duration. "Position changed" is strictly stronger — it requires
+// both that the reset cleared the original row AND that the new run
+// wrote a fresh row under a different snapshot/CDC position.
+func waitForPersistedPositionChanged(t *testing.T, dsn, streamID, before string, timeout time.Duration) string {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if readPersistedPositionTolerant(dsn, streamID) == "" {
-			return true
+		got := readPersistedPositionTolerant(dsn, streamID)
+		if got != "" && got != before {
+			return got
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	return false
+	return ""
 }
 
 // waitForPersistedPosition polls until source_position for streamID
@@ -183,15 +193,19 @@ func TestStreamer_ResetTargetData_RecoversFromSlotMissing(t *testing.T) {
 	resumeErr := make(chan error, 1)
 	go func() { resumeErr <- resetStreamer.Run(resumeCtx) }()
 
-	// ---- Phase 5: wait for the cdc-state row to be cleared. The
-	// reset path deletes the row before dropping tables, so observing
-	// "no row" is the load-bearing signal that the reset fired
-	// (and not just a no-op). Once observed, the next bulk-copy will
-	// seed against the source snapshot. ----
-	if !waitForPersistedPositionGone(t, targetDSN, streamID, 30*time.Second) {
+	// ---- Phase 5: wait for the cdc-state row to advance past the
+	// pre-reset position. The reset path deletes the row, then
+	// cold-start re-creates it: as of v0.40.1 (GitHub issue #15)
+	// cold-start persists the snapshot anchor before the first CDC
+	// apply, so "row absent" is too brief to reliably observe with a
+	// poll loop. "Position changed from persistedBefore" is the
+	// stronger invariant — it proves both that the reset cleared
+	// the original row AND that the new cold-start wrote a fresh
+	// anchor under a different snapshot. ----
+	if got := waitForPersistedPositionChanged(t, targetDSN, streamID, persistedBefore, 30*time.Second); got == "" {
 		resumeCancel()
 		<-resumeErr
-		t.Fatalf("reset did not clear the cdc-state row within timeout")
+		t.Fatalf("reset did not advance the cdc-state row past the pre-reset position within timeout (still %q)", persistedBefore)
 	}
 
 	// Now wait for bulk-copy to deliver the 21 rows in source. The
