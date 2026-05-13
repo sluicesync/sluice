@@ -33,24 +33,28 @@ import (
 // snapshot transaction so the recorded position refers to the
 // snapshot's logical clock.
 //
-// PlanetScale flavor: the snapshot mode here is the binlog-with-
-// CONSISTENT-SNAPSHOT shape used by the vanilla flavor's
-// [openBinlogSnapshotStream]; the VStream snapshot stream
-// (`openVStreamSnapshotStream`) is for the migrate / sync-start
-// cold-start path's COPY-mode dispatch and is not appropriate for
-// backups (VStream's COPY phase produces row events through a gRPC
-// stream, not table-by-table SELECTs the backup orchestrator can
-// drive). Backup against a PlanetScale source therefore falls
-// through to the binlog-snapshot shape — operators using PS-MySQL
-// for backups should expect the same per-session-snapshot trade-off
-// as vanilla.
-//
 // Caller closes the returned snapshot to commit the snapshot tx,
 // release the pinned conn, and close the underlying DB pool.
-func (e Engine) OpenBackupSnapshot(ctx context.Context, dsn, _ string) (*ir.BackupSnapshot, error) {
+//
+// PlanetScale flavor (v0.44.0, GitHub issue #16): delegates to
+// [openBackupSnapshotVStream] which rides VStream COPY mode for
+// both data and position capture. The pinned-conn + binlog-position
+// path below stays for vanilla MySQL only — applying it to a Vitess
+// source produces a binlog-shape position the VStream-based
+// continuous-sync path can't decode, breaking incremental + stream-
+// run chain-resume entirely. The pre-v0.44.0 PS-MySQL backup-via-
+// pinned-conn path "worked" against single-shard keyspaces only in
+// the data-read sense — operators couldn't actually chain
+// incrementals onto those backups because the encoded position
+// shape was wrong.
+func (e Engine) OpenBackupSnapshot(ctx context.Context, dsn, slotName string) (*ir.BackupSnapshot, error) {
 	if e.Capabilities().CDC == ir.CDCNone {
 		return nil, fmt.Errorf("%s: backup snapshot not supported by this flavor: %w", e.Name(), ErrNotImplemented)
 	}
+	if e.Flavor == FlavorPlanetScale {
+		return e.openBackupSnapshotVStream(ctx, dsn)
+	}
+	_ = slotName // accepted for interface uniformity; ignored on the binlog-snapshot path
 	cfg, err := parseDSN(dsn)
 	if err != nil {
 		return nil, err

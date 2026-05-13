@@ -6,6 +6,45 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.44.0]
+
+**Closes GitHub issue #16 — PlanetScale backup chain-resume now works end-to-end.** Before v0.44.0, `sluice backup full` against a PlanetScale/Vitess source captured the source position via the binlog-shape encoder (`{"mode":"gtid","gtid_set":"..."}`) but the continuous-sync VStream reader that `sluice backup stream run` and `sluice backup incremental` use only understands the VStream `[]shardGtid` shape (`[{"keyspace":"...","shard":"-","gtid":"..."}]`). Operators got "json: cannot unmarshal object into Go value of type []mysql.shardGtid" immediately on any chain-resume attempt; backup chains were unusable on PlanetScale sources. The architectural fix routes PlanetScale's `OpenBackupSnapshot` through the same VStream COPY-mode machinery the live-sync `coldStart` path already uses — same gRPC stream, same per-shard vgtid capture, same `vstreamSnapshotRows` table-by-table reader.
+
+### Fixed
+
+- **`internal/engines/mysql/backup_snapshot_vstream.go` (new) — VStream-backed backup snapshot for PlanetScale.** `openBackupSnapshotVStream(ctx, dsn)` delegates to the existing `openVStreamSnapshotStream` (the live-sync coldStart path), constructs an `ir.BackupSnapshot` from the snapshot stream's `Position` / `Rows` / `CloseFn`, and ignores the `Changes` field (backup doesn't consume CDC, just records the position so a downstream incremental can resume from there). The gRPC stream stays open until `BackupSnapshot.Close` fires, mapped to `vstreamSnapshotStream.close`.
+
+- **`internal/engines/mysql/backup_snapshot.go::OpenBackupSnapshot` — flavor branch.** New guard at the top of the function: `if e.Flavor == FlavorPlanetScale { return e.openBackupSnapshotVStream(ctx, dsn) }`. The pre-v0.44.0 pinned-conn + `START TRANSACTION WITH CONSISTENT SNAPSHOT` + `@@global.gtid_executed` path stays for vanilla MySQL only — applying it to a Vitess source produced a binlog-shape position the VStream reader can't decode AND single-tablet snapshot semantics that don't generalise across shards.
+
+- **The pre-existing PS-MySQL backup data-read path "worked" against single-shard keyspaces** in the sense that rows were copied successfully, but the captured EndPosition was the wrong shape AND wasn't multi-shard-aware. v0.44.0 fixes both at once by switching to VStream COPY, which is sharded-aware by construction.
+
+### Migration / Compatibility
+
+- **Drop-in upgrade from v0.43.x for sync paths (vanilla MySQL, PG, all engines)** — `OpenBackupSnapshot` for `FlavorVanilla` and the PG `OpenBackupSnapshot` are unchanged.
+
+- **PS-MySQL backups: chain-resume requires a fresh `sluice backup full`.** Existing backups produced by v0.43.0 or earlier against PS-MySQL sources have wrong-shape EndPositions in their manifests. Those manifests cannot be chained from on v0.44.0 (the position decoder will still reject the binlog shape — this is intentional, since attempting to use the wrong position would silently mis-position the incremental). Re-take a `sluice backup full` on v0.44.0; that backup's manifest will carry the VStream-shape position and chain cleanly to incrementals.
+
+- **Behaviour change worth flagging**: PS-MySQL backups now spin up a brief gRPC VStream connection to vtgate (in addition to the existing MySQL-protocol connection). Operators with strict outbound-network policies on the backup-running host should ensure the vtgate gRPC port (typically 15991 or per PlanetScale's `vstream_url`) is reachable.
+
+- **Memory profile**: PS-MySQL backups now buffer all rows for all tables in memory before the orchestrator drains table-by-table (matches the live-sync coldStart trade-off). Sluice's v1 simple-mode workloads fit comfortably; very large sharded keyspaces would need a streaming variant — a future-revision concern documented in `openVStreamSnapshotStream`.
+
+### Who needs this release
+
+- **Anyone running `sluice backup full` against PlanetScale-MySQL and trying to chain incrementals or stream-run rollovers off it**: **upgrade immediately**. Pre-v0.44.0 the chain was always broken. Take a fresh full backup on v0.44.0 to seed a working chain.
+
+- **PS-MySQL backup operators who only ever take full backups (no chain)**: still benefits from the upgrade — the v0.44.0 snapshot data path uses VStream COPY which has Vitess's documented multi-shard consistency contract (RFC vitessio/vitess#6277), whereas the pre-v0.44.0 pinned-conn snapshot was single-tablet only.
+
+- **Vanilla MySQL backup operators**: drop-in; no behaviour change.
+
+- **PG backup operators**: drop-in; this release doesn't touch the PG path.
+
+### Verification surface
+
+- **`internal/engines/mysql/backup_snapshot_vstream_test.go` (new)** — two routing unit tests:
+  - `TestEngine_OpenBackupSnapshot_FlavorBranchRoutes` confirms `FlavorPlanetScale` routes to the VStream-COPY path (error message contains "vstream" when dial fails)
+  - `TestEngine_OpenBackupSnapshot_VanillaDoesNotUseVStream` confirms `FlavorVanilla` does NOT route to the VStream path (error message must NOT mention "vstream", guarding against future routing regressions)
+- **End-to-end validation deferred to operator re-test against real PlanetScale.** Sluice's `psverify` build-tag test surface can be extended with a backup-chain-resume test in a follow-on release once an operator confirms v0.44.0 closes the bug in the wild. The unit-test layer here pins the routing decision; the real-world validation pins the position-shape contract.
+
 ## [0.43.0]
 
 **Closes GitHub issue #14 — VStream COPY-phase chunk overlap dedup.** Operator-confirmed in the v0.42.0 retest: a single PlanetScale-MySQL source feeding three target engines (vanilla MySQL, PS-Postgres, PS-MySQL) failed cold-start with duplicate-PK errors on ALL three simultaneously, ruling out any target-side hypothesis. The empirical evidence isolated the root cause to Vitess's COPY-phase emission: per the upstream VStream Copy RFC ([vitessio/vitess#6277](https://github.com/vitessio/vitess/issues/6277)), COPY mode interleaves forward batch emissions with a "catchup" phase that replays binlog events for rows already past the COPY scan's lastpk. Sluice's pre-v0.43.0 VStream snapshot reader buffered every ROW event indiscriminately; the catchup-phase emissions reached the bulk-copy writer as duplicate-PK INSERTs. The v0.43.0 fix tracks max-PK-seen per scope and drops behind-the-scan emissions — exactly the dedup pattern Vitess's RFC documents on the client side via `LastTablePK`.

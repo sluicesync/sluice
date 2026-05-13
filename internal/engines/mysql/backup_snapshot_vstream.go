@@ -1,0 +1,110 @@
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
+package mysql
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/orware/sluice/internal/ir"
+)
+
+// # PlanetScale backup snapshot via VStream COPY mode (GitHub issue #16)
+//
+// Before v0.44.0, [Engine.OpenBackupSnapshot] used a single shared
+// path for all MySQL flavors: open a `*sql.Conn`, run
+// `START TRANSACTION WITH CONSISTENT SNAPSHOT`, capture the position
+// via `@@global.gtid_executed`, encode as [binlogPos] shape
+// (`{"mode":"gtid","gtid_set":"..."}`). For vanilla MySQL this is
+// correct; for PlanetScale / Vitess sources, two things go wrong:
+//
+//  1. **Wrong position encoding.** The live continuous-sync path uses
+//     the VStream CDC reader which only understands [shardGtid] slice
+//     positions (`[{"keyspace":"...","shard":"-","gtid":"..."}]`).
+//     The binlog-shape position the backup wrote can't be decoded by
+//     the VStream reader — `sluice backup stream run` and
+//     `sluice backup incremental` failed immediately with
+//     "json: cannot unmarshal object into Go value of type
+//     []mysql.shardGtid" when trying to resume from the manifest's
+//     end position. Chain-resume was completely broken on PS sources.
+//  2. **Snapshot semantics that don't generalise.** vtgate routes
+//     `START TRANSACTION WITH CONSISTENT SNAPSHOT` to a single tablet.
+//     For an unsharded keyspace this happens to give a per-tablet
+//     snapshot. For a sharded keyspace the snapshot covers only one
+//     shard's view — the other shards' rows are read from their own
+//     unsynchronised local clocks, breaking cross-shard consistency.
+//
+// v0.44.0's fix delegates the PlanetScale path to VStream COPY mode.
+// VStream COPY runs an internal table-copy phase across all shards
+// with the same gRPC stream sluice's live-sync path already uses,
+// captures the terminal vgtid (multi-shard-aware), and exposes
+// table-by-table reads from an in-memory row buffer via the same
+// [vstreamSnapshotRows] reader the cold-start path uses.
+//
+// Architecture:
+//
+//   - Engine.OpenBackupSnapshot branches on flavor at v0.44.0.
+//     PlanetScale flavor delegates here; vanilla MySQL keeps the
+//     pre-existing pinned-conn + START TRANSACTION path.
+//   - This function calls [Engine.openVStreamSnapshotStream] — the
+//     same code path the live-sync orchestrator uses. The returned
+//     SnapshotStream's Position, Rows, and CloseFn are everything
+//     [ir.BackupSnapshot] needs; the Changes channel is ignored
+//     (backup doesn't consume CDC, it just records the position so
+//     a downstream incremental can resume from there).
+//   - The gRPC stream stays open until BackupSnapshot.Close fires
+//     (mapped to vstreamSnapshotStream.close), at which point it's
+//     cancelled and the underlying conn closed. No leak.
+//
+// Memory: VStream COPY buffers all rows for all tables in memory
+// before returning. This matches the live-sync's existing trade-off
+// (see openVStreamSnapshotStream's docstring) — sluice's v1 simple-
+// mode workloads fit well in memory; sharded / very large tables
+// would need a streaming variant in a future revision.
+//
+// Multi-shard consistency: VStream COPY captures all shards under a
+// single logical stream; the terminal vgtid encodes per-shard
+// positions. Incrementals resume from this vgtid and pick up each
+// shard's CDC from its own captured position — exactly the contract
+// the live-sync path established (and the contract Vitess RFC
+// vitessio/vitess#6277 documents).
+
+// openBackupSnapshotVStream is the PlanetScale-flavor implementation
+// of [Engine.OpenBackupSnapshot]. Opens a VStream COPY-mode snapshot
+// stream (the same mechanism the live-sync coldStart path uses),
+// drains the COPY phase synchronously, and wraps the result in an
+// [ir.BackupSnapshot] for the backup orchestrator.
+//
+// slotName is accepted for [ir.BackupSnapshotOpener] interface
+// uniformity and ignored — VStream doesn't expose a slot concept
+// to clients (the underlying binlog position is in the captured
+// vgtid).
+//
+// The returned BackupSnapshot.Position is encoded as a VStream
+// [shardGtid] slice (`[{"keyspace":"...","shard":"-","gtid":"..."}]`),
+// which is the format incremental backups + `sluice backup stream run`
+// expect for chain-resume on PlanetScale sources.
+//
+// Errors from the COPY phase surface as the snapshot-open error.
+// Resource cleanup on error path: snapshot is closed before return,
+// so no goroutine or connection leaks. Caller closes the returned
+// snapshot to commit lifecycle (closes the gRPC stream + cancels
+// the stream context).
+func (e Engine) openBackupSnapshotVStream(ctx context.Context, dsn string) (*ir.BackupSnapshot, error) {
+	snap, err := e.openVStreamSnapshotStream(ctx, dsn)
+	if err != nil {
+		return nil, fmt.Errorf("mysql: backup snapshot (vstream): %w", err)
+	}
+
+	// SnapshotStream.Changes is the CDC-phase pump that the backup
+	// orchestrator doesn't consume — we drop the reference. The
+	// underlying gRPC stream stays open (the pump goroutine never
+	// starts since startPump is only called via Changes.StreamChanges),
+	// and CloseFn cleans it up when BackupSnapshot.Close fires.
+	return &ir.BackupSnapshot{
+		Position: snap.Position,
+		Rows:     snap.Rows,
+		CloseFn:  snap.CloseFn,
+	}, nil
+}
