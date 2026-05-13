@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/orware/sluice/internal/config"
 	"github.com/orware/sluice/internal/ir"
@@ -335,15 +336,190 @@ type Streamer struct {
 	// [ir.ExtensionAware]. Empty preserves the pre-v0.26.0
 	// loud-failure behaviour for extension-owned types.
 	EnabledPGExtensions []string
+
+	// ApplyRetryAttempts caps the number of consecutive retriable
+	// apply failures the streamer will absorb before giving up and
+	// returning the underlying error. ADR-0038. Zero or one means
+	// "no retry" (preserve pre-v0.42.0 fail-on-first behaviour);
+	// higher values enable bounded retry. Default when nil/zero on
+	// the [Streamer] receiver is supplied by the CLI's flag default
+	// (`--apply-retry-attempts`, default 8).
+	//
+	// Consecutive-failure counter resets when the persisted CDC
+	// position advances between attempts (a successful batch landed
+	// since the last failure) — so a streamer surviving for hours
+	// doesn't carry retry debt forward.
+	ApplyRetryAttempts int
+
+	// ApplyRetryBackoffBase is the base interval for the exponential
+	// backoff between retriable apply failures. ADR-0038. Doubles
+	// on each consecutive failure, capped at [ApplyRetryBackoffCap].
+	// Zero means use the default (100ms). Only consulted when
+	// [ApplyRetryAttempts] > 1.
+	ApplyRetryBackoffBase time.Duration
+
+	// ApplyRetryBackoffCap is the upper bound on each per-attempt
+	// backoff interval. ADR-0038. Zero means use the default (30s).
+	// Only consulted when [ApplyRetryAttempts] > 1.
+	ApplyRetryBackoffCap time.Duration
 }
 
-// Run executes a snapshot+CDC stream. See [Streamer] for the full
-// flow.
+// Run executes a snapshot+CDC stream with optional retry on
+// transient applier errors. See [Streamer] for the field surface
+// and ADR-0038 for the retry policy.
+//
+// When [Streamer.ApplyRetryAttempts] <= 1 (the v0.41.x default
+// when the field is zero on the receiver), Run is a thin wrapper
+// over [runOnce] preserving pre-v0.42.0 behaviour. When > 1, Run
+// catches errors that satisfy [ir.RetriableError] and retries the
+// inner pipeline with exponential backoff, returning a terminal
+// error after a budget of consecutive same-position failures.
+//
+// Returns nil on clean ctx cancellation or successful stream
+// completion; non-nil on terminal error or retry-budget exhaustion.
+// Resources (snapshot stream, target writers, applier) are
+// released by each [runOnce] iteration regardless of outcome.
+func (s *Streamer) Run(ctx context.Context) error {
+	attempts := s.ApplyRetryAttempts
+	if attempts < 1 {
+		attempts = 1
+	}
+	if attempts == 1 {
+		// Retry disabled: behaviour identical to v0.41.x.
+		return s.runOnce(ctx)
+	}
+	return s.runWithRetry(ctx, attempts)
+}
+
+// runWithRetry wraps [runOnce] with the ADR-0038 retry loop. Opens
+// a side-channel applier to read the persisted CDC position between
+// attempts so the consecutive-failure counter can reset whenever an
+// attempt made forward progress (a successful batch committed before
+// the failure that triggered the retry).
+//
+// First iteration: respects [Streamer.ResetTargetData] as the caller
+// supplied it. Subsequent iterations always warm-resume — the v0.41.0
+// pre-CDC anchor write guarantees a persisted position exists by the
+// time any retriable apply error fires, so warm-resume is always
+// possible. ResetTargetData is cleared after the first iteration so
+// a transient applier failure during the retry path does not
+// re-trigger the destructive reset.
+//
+// On clean shutdown, terminal error, ctx cancellation, or budget
+// exhaustion, returns the appropriate error (or nil on clean
+// shutdown). Budget exhaustion wraps the final transient with a
+// "retry budget exhausted" prefix so the operator sees both the
+// counter outcome and the underlying cause.
+func (s *Streamer) runWithRetry(ctx context.Context, attempts int) error {
+	base := s.ApplyRetryBackoffBase
+	if base <= 0 {
+		base = 100 * time.Millisecond
+	}
+	maxBackoff := s.ApplyRetryBackoffCap
+	if maxBackoff <= 0 {
+		maxBackoff = 30 * time.Second
+	}
+
+	// Side-channel applier for between-attempt position reads. The
+	// inner runOnce owns its own applier with a fresh open/close
+	// per iteration; this one stays alive across the whole retry
+	// loop so progress is observable.
+	posReader, err := s.Target.OpenChangeApplier(ctx, s.TargetDSN)
+	if err != nil {
+		slog.WarnContext(ctx, "applier: retry policy disabled (cannot open position reader); falling through to single-attempt run",
+			slog.String("err", err.Error()),
+		)
+		return s.runOnce(ctx)
+	}
+	defer closeIf(posReader)
+
+	streamID := s.resolveStreamID()
+	var consecutive int
+
+	for {
+		beforePos, beforeFound, _ := posReader.ReadPosition(ctx, streamID)
+
+		err := s.runOnce(ctx)
+		if err == nil {
+			return nil
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return err
+		}
+		var re ir.RetriableError
+		if !errors.As(err, &re) || !re.Retriable() {
+			return err
+		}
+
+		// Clear ResetTargetData after the first iteration so a
+		// transient applier failure during retry does not trigger
+		// another destructive reset of dest tables. The reset
+		// happens at most once per Run.
+		s.ResetTargetData = false
+
+		afterPos, afterFound, _ := posReader.ReadPosition(ctx, streamID)
+		progressed := beforeFound && afterFound && afterPos.Token != beforePos.Token
+		if progressed {
+			consecutive = 1
+		} else {
+			consecutive++
+		}
+
+		if consecutive >= attempts {
+			return fmt.Errorf("pipeline: apply retry budget exhausted after %d consecutive failures at position %q: %w",
+				consecutive, afterPos.Token, err)
+		}
+
+		backoff := computeRetryBackoff(consecutive, base, maxBackoff, re.RetryHint())
+		slog.InfoContext(ctx, "applier: transient error; retrying",
+			slog.String("stream_id", streamID),
+			slog.Int("attempt", consecutive),
+			slog.Int("max_attempts", attempts),
+			slog.Duration("backoff", backoff),
+			slog.String("err", err.Error()),
+		)
+		select {
+		case <-time.After(backoff):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+// computeRetryBackoff returns the per-attempt backoff per ADR-0038:
+// exponential doubling from base, capped at max. When the engine's
+// classifier provides a non-zero RetryHint, the hint overrides only
+// when larger than the computed value (so engines cannot make retries
+// fire sooner than the policy's exponential schedule). The hint
+// itself is still capped at max so a buggy engine returning an
+// unreasonable hint can't unbound the wait.
+func computeRetryBackoff(attempt int, base, maxBackoff, hint time.Duration) time.Duration {
+	b := base
+	for i := 1; i < attempt; i++ {
+		b *= 2
+		if b > maxBackoff {
+			b = maxBackoff
+			break
+		}
+	}
+	if hint > b {
+		b = hint
+	}
+	if b > maxBackoff {
+		b = maxBackoff
+	}
+	return b
+}
+
+// runOnce executes a single snapshot+CDC pipeline attempt. The
+// public [Run] method wraps this with the ADR-0038 retry policy
+// when [Streamer.ApplyRetryAttempts] > 1; otherwise Run delegates
+// here directly. Single-attempt semantics match v0.41.x.
 //
 // Returns nil on clean ctx cancellation; non-nil on any phase
 // failure. Resources (snapshot stream, target writers, applier)
 // are released before return regardless of outcome.
-func (s *Streamer) Run(ctx context.Context) error {
+func (s *Streamer) runOnce(ctx context.Context) error {
 	if err := s.validate(); err != nil {
 		return err
 	}

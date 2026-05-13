@@ -6,6 +6,45 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.42.0]
+
+**Closes GitHub issue #13 — bounded retry on transient applier errors.** Implements [ADR-0038](docs/adr/adr-0038-applier-retry-on-transient-errors.md). Before v0.42.0, the first transient applier error during CDC (Vitess `Error 1105` tx-killer, PG `SQLSTATE 40001` serialisation failure, etc.) exited the entire `sluice sync start` process. Operators had to wrap the binary in a supervisor and rely on warm-resume to retry. v0.42.0 brings the retry policy inside the streamer: each per-engine classifier categorises errors as retriable or terminal, and `Streamer.Run` wraps the apply pipeline with exponential backoff that resets on observed CDC-position progress.
+
+### Added
+
+- **`ir.RetriableError` interface (`internal/ir/applier_retry.go`)** — the optional surface an engine's applier error can implement to signal that the pipeline's retry policy should attempt to recover. Implementations preserve the original error via `Unwrap`, so `errors.Is` / `errors.As` against the driver-level error still works from any consumer.
+
+- **Per-engine error classifiers**:
+  - `internal/engines/mysql/applier_errors.go` — `classifyApplierError` recognises InnoDB deadlock (`Error 1213`), Vitess tx-killer / vttablet transients (`Error 1105` with `code = Aborted` / `Unavailable` / `ResourceExhausted`), and driver-level `bad connection` / `EOF` / connection-reset shapes. Explicitly NOT retriable: `Error 1062` (duplicate key) — masks data bugs and sluice idempotency gaps (e.g. GitHub issue #14).
+  - `internal/engines/postgres/applier_errors.go` — `classifyApplierError` recognises serialization failure (`40001`), deadlock detected (`40P01`), admin/crash/cannot-connect-now shutdown (`57P0x`), the entire connection_exception class (`08*`), and driver-level transients. Explicitly NOT retriable: `23505` (unique_violation) — same rationale as MySQL `1062`.
+
+- **Pipeline retry loop (`internal/pipeline/streamer.go`)** — `Streamer.Run` now dispatches to `runWithRetry` when `ApplyRetryAttempts > 1`. The loop opens a side-channel applier to read the persisted CDC position between attempts; the consecutive-failure counter resets when the position advances (a successful batch landed since the last failure), so a streamer surviving for hours doesn't carry retry debt forward. `ResetTargetData` is cleared after the first iteration so a transient applier failure during retry doesn't re-trigger the destructive reset path.
+
+- **CLI flags on `sluice sync start`**:
+  - `--apply-retry-attempts N` (default 8) — maximum consecutive retriable failures before exit. `1` = no retry (pre-v0.42.0 behaviour); `8` = default tuned for managed-Vitess / Vitess-flavoured MySQL.
+  - `--apply-retry-backoff-base DUR` (default `100ms`) — base interval for exponential doubling between retries.
+  - `--apply-retry-backoff-cap DUR` (default `30s`) — per-attempt upper bound on the backoff.
+
+  Default 8-attempt schedule: 100ms → 200ms → 400ms → 800ms → 1.6s → 3.2s → 6.4s → 12.8s (≈25.5s total). Bounded at ~4 minutes worst-case even with the cap hit.
+
+### Migration / Compatibility
+
+- **Drop-in upgrade from v0.41.x.** No IR changes that break callers; the applier's existing `Apply` / `ApplyBatch` signatures are unchanged. Engines that don't implement the new error classifier (third-party or hand-rolled) behave identically to v0.41.x — `errors.As(err, &ir.RetriableError{})` simply fails and the retry loop treats every error as terminal.
+- **Behaviour change**: operators running `sluice sync start` will no longer see the process exit on the first Vitess `Error 1105` or PG `40001`. The default policy retries 8 times with exponential backoff; transients that genuinely indicate "stuck" (8 consecutive failures at the same persisted position) surface as `retry budget exhausted` with the original error in the wrap chain.
+- **Operators wanting v0.41.x fail-fast behaviour** can pass `--apply-retry-attempts=1`.
+- **Stream-supervisor integrations** (systemd `Restart=on-failure`, k8s pod restart) keep working — they're the outer recovery layer for "retry budget exhausted" exits. v0.42.0's inner retry handles the routine transients without needing to bounce the process.
+
+### Who needs this release
+
+- **Anyone running `sluice sync start` against PlanetScale-MySQL / Vitess targets**: **upgrade immediately**. The Vitess `Error 1105 code = Aborted ... for tx killer rollback` shape was the load-bearing repro for GitHub #13; v0.42.0 makes it self-recoverable instead of process-exiting.
+- **Operators on PG → PG continuous-sync** under heavy concurrent write load: drop-in benefit. `SQLSTATE 40001` serialisation failures and deadlock victims (`40P01`) now retry transparently instead of exiting.
+- **Operators with custom supervisor wrappers**: still supported; the retry budget cap means supervisor restarts handle the "genuinely stuck" case while v0.42.0 absorbs the noise.
+
+### Verification surface
+
+- 22 new unit tests across `internal/engines/{mysql,postgres}/applier_errors_test.go` covering every retriable shape, the explicit non-retriable shapes (1062 / 23505), the default-deny invariant (unknown errors stay non-retriable), and edge cases (Vitess non-transient gRPC codes like `InvalidArgument` correctly stay terminal).
+- New `internal/pipeline/streamer_retry_test.go` pins the backoff schedule's exponential doubling, hint-floor semantics, cap behaviour, and the 8-attempt default budget (asserts total wait < 4 minutes per ADR-0038's stated promise).
+
 ## [0.41.0]
 
 **Closes GitHub issue #15 — `sluice sync start` cold-start now persists the CDC anchor before the first batch.** Originally cut as v0.40.1 but re-tagged as v0.41.0 after the v0.40.1 CI run uncovered a brittle integration test assertion that the fix exposed (`TestStreamer_ResetTargetData_RecoversFromSlotMissing`). The v0.40.1 tag exists on the remote (`501303a`) as a historical artifact with no published release; v0.41.0 supersedes it cleanly with the test fix bundled.

@@ -185,7 +185,7 @@ func (a *ChangeApplier) applyOneBatch(ctx context.Context, streamID string, chan
 			slog.Int("rows_attempted", 1),
 			slog.String("err", err.Error()),
 		)
-		return 0, ir.Position{}, false, err
+		return 0, ir.Position{}, false, classifyApplierError(err)
 	}
 	n = 1
 	lastPos = first.Pos()
@@ -250,7 +250,7 @@ func (a *ChangeApplier) applyOneBatch(ctx context.Context, streamID string, chan
 					slog.Int("rows_attempted", n+1),
 					slog.String("err", err.Error()),
 				)
-				return 0, ir.Position{}, false, err
+				return 0, ir.Position{}, false, classifyApplierError(err)
 			}
 			n++
 			lastPos = c.Pos()
@@ -325,7 +325,7 @@ func (a *ChangeApplier) commitBatch(ctx context.Context, tx *sql.Tx, streamID, t
 			slog.Int("rows_attempted", rows),
 			slog.String("err", err.Error()),
 		)
-		return fmt.Errorf("postgres: applier: commit: %w", err)
+		return classifyApplierError(fmt.Errorf("postgres: applier: commit: %w", err))
 	}
 	a.reportAppliedToken(ctx, token)
 	return nil

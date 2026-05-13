@@ -410,21 +410,25 @@ func (a *ChangeApplier) Apply(ctx context.Context, streamID string, changes <-ch
 // applyOne dispatches a single change to its SQL form, runs the
 // data write, and writes the position update — all in the same
 // transaction.
+//
+// Errors are routed through [classifyApplierError] so the pipeline's
+// retry policy (ADR-0038) can recognise transient Vitess / MySQL
+// errors and back off rather than exit the stream.
 func (a *ChangeApplier) applyOne(ctx context.Context, streamID string, c ir.Change) error {
 	tx, err := a.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("mysql: applier: begin tx: %w", err)
+		return classifyApplierError(fmt.Errorf("mysql: applier: begin tx: %w", err))
 	}
 	if err := a.dispatch(ctx, tx, c); err != nil {
 		_ = tx.Rollback()
-		return err
+		return classifyApplierError(err)
 	}
 	if err := writePositionTx(ctx, tx, streamID, c.Pos().Token, a.slotName, a.sourceFingerprint, a.targetSchema); err != nil {
 		_ = tx.Rollback()
-		return err
+		return classifyApplierError(err)
 	}
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("mysql: applier: commit: %w", err)
+		return classifyApplierError(fmt.Errorf("mysql: applier: commit: %w", err))
 	}
 	return nil
 }

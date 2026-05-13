@@ -474,19 +474,19 @@ func (a *ChangeApplier) Apply(ctx context.Context, streamID string, changes <-ch
 func (a *ChangeApplier) applyOne(ctx context.Context, streamID string, c ir.Change) error {
 	tx, err := a.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("postgres: applier: begin tx: %w", err)
+		return classifyApplierError(fmt.Errorf("postgres: applier: begin tx: %w", err))
 	}
 	if err := a.dispatch(ctx, tx, c); err != nil {
 		_ = tx.Rollback()
-		return err
+		return classifyApplierError(err)
 	}
 	token := c.Pos().Token
 	if err := writePositionTx(ctx, tx, a.controlSchema, streamID, token, a.slotName, a.sourceFingerprint, a.targetSchema); err != nil {
 		_ = tx.Rollback()
-		return err
+		return classifyApplierError(err)
 	}
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("postgres: applier: commit: %w", err)
+		return classifyApplierError(fmt.Errorf("postgres: applier: commit: %w", err))
 	}
 	a.reportAppliedToken(ctx, token)
 	return nil
