@@ -199,6 +199,37 @@ type BackupStream struct {
 	// shapes (encrypt mid-chain or vice versa) are refused there.
 	Encryption *BackupEncryption
 
+	// RetryAttempts caps the number of consecutive retriable rollover
+	// failures the stream will absorb before giving up and returning
+	// the underlying error. GitHub issue #22: pre-v0.48.0 the
+	// `backup stream run` loop treated any rollover error as terminal,
+	// so a source-side TCP reset that the sync-stream path retries
+	// through (ADR-0038, v0.46.0) took the backup-stream process down.
+	// v0.48.0 mirrors the sync-stream retry policy on the rollover
+	// loop: classify via [ir.RetriableError], reopen the CDC pump
+	// from the last committed parent's EndPosition, retry.
+	//
+	// Zero or one means "no retry" (preserve pre-v0.48.0 fail-on-first
+	// behaviour); higher values enable bounded retry. Default when
+	// nil/zero on the [BackupStream] receiver is supplied by the CLI's
+	// flag default (`--retry-attempts`, default 8).
+	//
+	// Consecutive-failure counter resets when a rollover commits
+	// successfully between failures — so a stream surviving for hours
+	// doesn't carry retry debt forward.
+	RetryAttempts int
+
+	// RetryBackoffBase is the base interval for the exponential
+	// backoff between retriable rollover failures. Doubles on each
+	// consecutive failure, capped at [RetryBackoffCap]. Zero means
+	// use the default (100ms). Only consulted when [RetryAttempts] > 1.
+	RetryBackoffBase time.Duration
+
+	// RetryBackoffCap is the upper bound on each per-attempt backoff
+	// interval. Zero means use the default (30s). Only consulted when
+	// [RetryAttempts] > 1.
+	RetryBackoffCap time.Duration
+
 	// Now, when set, overrides the wall-clock-time source for
 	// [ir.Manifest.CreatedAt] and `stream_state.json` timestamps. Used
 	// by tests to pin timestamps; in production callers leave it nil
@@ -296,12 +327,15 @@ func (b *BackupStream) Run(ctx context.Context) error {
 		return fmt.Errorf("stream: encryption: %w", err)
 	}
 
-	// 3. Open CDC pump once for the lifetime of the stream.
+	// 3. Open CDC pump for the lifetime of the stream. The handle is
+	// closed at function exit via a closure-captured defer so the
+	// transient-retry path (GitHub #22) can swap it for a fresh
+	// pump without leaking the previous one.
 	cdc, err := openCDCReaderWithSlot(ctx, b.Source, b.SourceDSN, b.SlotName)
 	if err != nil {
 		return wrapWithHint(PhaseConnect, fmt.Errorf("stream: open cdc reader: %w", err))
 	}
-	defer closeIf(cdc)
+	defer func() { closeIf(cdc) }()
 
 	changesCh, err := cdc.StreamChanges(ctx, startPos)
 	if err != nil {
@@ -310,6 +344,24 @@ func (b *BackupStream) Run(ctx context.Context) error {
 		}
 		return wrapWithHint(PhaseCDC, fmt.Errorf("stream: start cdc stream: %w", err))
 	}
+
+	// Retry policy for transient CDC-pump errors (GitHub #22). Mirrors
+	// the sync-stream's runWithRetry shape: classify, bounded
+	// consecutive-failure counter that resets on a successful
+	// rollover, exponential backoff between attempts.
+	retryAttempts := b.RetryAttempts
+	if retryAttempts < 1 {
+		retryAttempts = 1
+	}
+	retryBase := b.RetryBackoffBase
+	if retryBase <= 0 {
+		retryBase = 100 * time.Millisecond
+	}
+	retryCap := b.RetryBackoffCap
+	if retryCap <= 0 {
+		retryCap = 30 * time.Second
+	}
+	var retryConsecutive int
 
 	// 4. Initial state file write.
 	state := &streamState{
@@ -400,8 +452,57 @@ func (b *BackupStream) Run(ctx context.Context) error {
 				}
 				return nil
 			}
+			// GitHub #22: classify the rollover error; if it satisfies
+			// [ir.RetriableError] (a transient CDC-pump shape like
+			// `vstream: recv: rpc error: code = Unavailable …
+			// connection reset by peer`, classified by the engine's
+			// classifyReaderError in v0.46.0), reopen the pump from the
+			// last committed parent's EndPosition and retry. Bounded by
+			// [RetryAttempts] consecutive failures; resets on a
+			// successful rollover.
+			var re ir.RetriableError
+			if retryAttempts > 1 && errors.As(rErr, &re) && re.Retriable() {
+				retryConsecutive++
+				if retryConsecutive >= retryAttempts {
+					return wrapWithHint(PhaseCDC, fmt.Errorf("stream: rollover %d: retry budget exhausted after %d consecutive failures: %w",
+						rolloverSeq, retryConsecutive, rErr))
+				}
+				backoff := computeRetryBackoff(retryConsecutive, retryBase, retryCap, re.RetryHint())
+				slog.InfoContext(ctx, "stream: transient cdc error; reopening pump and retrying",
+					slog.Int("rollover_seq", rolloverSeq),
+					slog.Int("attempt", retryConsecutive),
+					slog.Int("max_attempts", retryAttempts),
+					slog.Duration("backoff", backoff),
+					slog.String("err", rErr.Error()),
+				)
+				select {
+				case <-time.After(backoff):
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+				closeIf(cdc)
+				cdc, err = openCDCReaderWithSlot(ctx, b.Source, b.SourceDSN, b.SlotName)
+				if err != nil {
+					return wrapWithHint(PhaseConnect, fmt.Errorf("stream: reopen cdc reader after transient: %w", err))
+				}
+				resumeFrom := currentParent.EndPosition
+				changesCh, err = cdc.StreamChanges(ctx, resumeFrom)
+				if err != nil {
+					if errors.Is(err, ir.ErrPositionInvalid) {
+						return fmt.Errorf("stream: after transient retry, source has pruned past parent's terminal position; take a fresh full backup or shorten the chain interval. Underlying: %w", err)
+					}
+					return wrapWithHint(PhaseCDC, fmt.Errorf("stream: restart cdc stream after transient: %w", err))
+				}
+				continue
+			}
 			return wrapWithHint(PhaseCDC, fmt.Errorf("stream: rollover %d: %w", rolloverSeq, rErr))
 		}
+		// Successful rollover (whether empty or with a manifest):
+		// reset the consecutive-failure counter so a long-lived stream
+		// doesn't carry retry debt forward across hours of clean
+		// rollovers (GitHub #22 mirrors sync-stream's progress-reset
+		// semantics).
+		retryConsecutive = 0
 
 		if roll.Manifest == nil {
 			// Empty rollover that we skipped per IncludeEmptyRollovers.

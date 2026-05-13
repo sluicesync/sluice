@@ -392,6 +392,14 @@ type Streamer struct {
 	// Only consulted when [ApplyRetryAttempts] > 1.
 	ApplyRetryBackoffCap time.Duration
 
+	// HeartbeatInterval, when > 0, enables a per-stream goroutine that
+	// logs an INFO line every interval reporting the stream is alive.
+	// GitHub #23 Phase A: distinguishes silent-stall (process alive
+	// but no apply, no log) from wedge (process alive, no heartbeat
+	// either). Zero disables; the CLI's default is 60s. Operators
+	// chasing a stall set --heartbeat-interval=10s for faster signal.
+	HeartbeatInterval time.Duration
+
 	// sourceErrFn is the per-attempt closure that returns the source
 	// CDC reader's stored Err() — see GitHub issue #19. The pump's
 	// channel close is the normal EOF path; without surfacing the
@@ -995,6 +1003,14 @@ func (s *Streamer) runOnce(ctx context.Context) error {
 	liveFilter := &liveAddedFilter{}
 	s.seedLiveAddedFilter(applyCtx, applier, streamID, liveFilter)
 	s.startLiveAddedTablesPoll(applyCtx, applier, streamID, liveFilter)
+
+	// GitHub #23 Phase A heartbeat: a periodic INFO log line so a
+	// silent stall (process alive, no apply, no log) is
+	// distinguishable from a wedge (process alive, no apply, no
+	// heartbeat either). Operators on default log level see the
+	// stream is alive; the absence of these lines combined with no
+	// `applier: batch` lines is the silent-stall signature.
+	startHeartbeat(applyCtx, streamID, s.HeartbeatInterval)
 
 	filtered := filterChangesWithLiveAdd(applyCtx, changes, s.Filter, liveFilter)
 	dispatchErr := s.dispatchApply(applyCtx, applier, streamID, filtered)

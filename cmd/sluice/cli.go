@@ -28,6 +28,14 @@ import (
 type Globals struct {
 	Config   string `help:"Path to a YAML config file." short:"c" type:"existingfile" placeholder:"PATH"`
 	LogLevel string `help:"Log verbosity." short:"l" default:"info" enum:"debug,info,warn,error" placeholder:"LEVEL"`
+
+	// PprofListen is the GitHub #23 Phase A operator-diagnostic hook.
+	// When non-empty, starts net/http/pprof's debug endpoints at the
+	// given address for the lifetime of the subcommand. Off by
+	// default; opt-in. Useful for diagnosing silent stalls — the
+	// operator hits /debug/pprof/goroutine?debug=2 to dump every
+	// goroutine's stack, which is what's needed to localise a wedge.
+	PprofListen string `help:"Bind net/http/pprof's debug endpoints at this address (e.g. ':6060', '127.0.0.1:6060') for the duration of the subcommand. Off by default. Useful for diagnosing silent stalls (GitHub #23 Phase A) — fetch /debug/pprof/goroutine?debug=2 to dump every goroutine's stack." placeholder:"ADDR"`
 }
 
 // CLI is the root of the sluice command tree. Kong populates this from
@@ -452,6 +460,8 @@ type SyncStartCmd struct {
 
 	MetricsListen string `help:"Bind a Prometheus-format /metrics endpoint at this address (e.g. ':9090' for all interfaces port 9090, '127.0.0.1:9090' for localhost only) for the duration of the stream. Off by default — opt-in. Companion to 'sluice sync health' (which is the cron-friendly one-shot probe shape). Useful for operators running Prometheus / Grafana / alertmanager." placeholder:"ADDR"`
 
+	HeartbeatInterval time.Duration `help:"Wall-clock cadence the per-stream heartbeat goroutine logs an INFO 'stream: heartbeat' line at. GitHub #23 Phase A: distinguishes silent-stall (process alive but no apply, no log) from wedge (process alive, no heartbeat either). 0 disables." default:"60s" placeholder:"DUR"`
+
 	PositionFromManifest string `help:"URL of a backup chain (s3://bucket/prefix, gs://, azblob://, file:///path) whose terminal manifest's EndPosition is used as this stream's resume position. Use after 'sluice restore --from=<chain-url>' to resume CDC from the chain's tail without re-bulking. Mutually exclusive with the implicit 'resume from sluice_cdc_state' path: when set, the persisted position is bypassed and the chain's terminal becomes the source of truth. PG soft warnings (wal_keep_size, Patroni) fire as pre-flight checks; --strict-preflight promotes them to refusals. See docs/dev/design-logical-backups-phase-3.md." placeholder:"URL"`
 
 	StrictPreflight bool `help:"Promote position-from-manifest soft warnings (wal_keep_size sufficiency, Patroni-managed source detection) to hard refusals. Default off: the warnings log but the run proceeds. Slot existence / wal_status='lost' is always a refusal regardless of this flag — the slot can't deliver what we need."`
@@ -569,6 +579,7 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 		ApplyRetryBackoffBase:     s.ApplyRetryBackoffBase,
 		ApplyRetryBackoffCap:      s.ApplyRetryBackoffCap,
 		MetricsListen:             s.MetricsListen,
+		HeartbeatInterval:         s.HeartbeatInterval,
 		PositionFromManifestStore: manifestStore,
 		StrictPreflight:           s.StrictPreflight,
 		PatroniMode:               s.PatroniMode,

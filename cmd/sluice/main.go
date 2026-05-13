@@ -16,10 +16,15 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/http"
+	_ "net/http/pprof" // GitHub #23 Phase A: pprof debug endpoints registered on the default mux
 	"os"
 	"strings"
+	"time"
 
 	"github.com/alecthomas/kong"
 
@@ -63,8 +68,52 @@ func main() {
 		},
 	)
 	configureLogging(cli.LogLevel)
+	startPprofIfRequested(cli.PprofListen)
 	err := ctx.Run(&cli.Globals)
 	ctx.FatalIfErrorf(err)
+}
+
+// startPprofIfRequested starts net/http/pprof on addr in a background
+// goroutine when addr is non-empty. GitHub #23 Phase A diagnostic
+// hook — when a sluice process silently stalls, the operator hits
+// /debug/pprof/goroutine?debug=2 to dump every goroutine's stack so
+// the wedge point can be localised.
+//
+// Bind failure is fatal: the operator explicitly asked for the
+// endpoint, and a silent fallthrough would defeat the purpose. Other
+// HTTP errors after the listener succeeds (handler panics, etc.) are
+// logged at WARN but don't terminate the subcommand — pprof is
+// auxiliary, not critical-path.
+//
+// The listener uses http.DefaultServeMux which `net/http/pprof`
+// auto-registers its handlers on via its init() — importing the
+// package for side effects above is intentional.
+func startPprofIfRequested(addr string) {
+	if addr == "" {
+		return
+	}
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           http.DefaultServeMux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	lc := &net.ListenConfig{}
+	ln, err := lc.Listen(context.Background(), "tcp", addr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "sluice: --pprof-listen %q: %v\n", addr, err)
+		os.Exit(1)
+	}
+	slog.InfoContext(context.Background(), "pprof endpoint listening",
+		slog.String("addr", addr),
+		slog.String("hint", "fetch /debug/pprof/goroutine?debug=2 to dump goroutine stacks"),
+	)
+	go func() {
+		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+			slog.WarnContext(context.Background(), "pprof endpoint stopped",
+				slog.String("err", err.Error()),
+			)
+		}
+	}()
 }
 
 // configureLogging installs a stderr-bound text slog handler at the

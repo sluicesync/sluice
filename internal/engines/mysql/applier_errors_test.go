@@ -81,6 +81,8 @@ func TestClassifyApplierError_RetriableShapes(t *testing.T) {
 		{"Vitess ResourceExhausted (Error 1105)", &gomysql.MySQLError{Number: 1105, Message: "vttablet: rpc error: code = ResourceExhausted desc = throttler engaged"}},
 		{"driver.ErrBadConn", driver.ErrBadConn},
 		{"io.EOF", io.EOF},
+		{"gomysql.ErrInvalidConn (GitHub #21)", gomysql.ErrInvalidConn},
+		{"wrapped gomysql.ErrInvalidConn (GitHub #21)", fmt.Errorf("mysql: applier: insert: %w", gomysql.ErrInvalidConn)},
 		{"wrapped driver.ErrBadConn", fmt.Errorf("query: %w", driver.ErrBadConn)},
 		{"connection reset by peer", errors.New("write tcp: connection reset by peer")},
 		{"connection refused", errors.New("dial tcp: connection refused")},

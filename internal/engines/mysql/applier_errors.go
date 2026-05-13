@@ -75,7 +75,19 @@ func classifyApplierError(err error) error {
 	// Driver-level "bad connection" / EOF — auto-reconnect on retry.
 	// These wrap as the bare sentinels; check via errors.Is for the
 	// standard cases the driver returns.
-	if errors.Is(err, driver.ErrBadConn) || errors.Is(err, io.EOF) {
+	//
+	// gomysql.ErrInvalidConn is the go-sql-driver/mysql sentinel for
+	// "connection marked bad" (errors.go:20 `errors.New("invalid
+	// connection")`). It is distinct from database/sql's
+	// driver.ErrBadConn — the driver pool surfaces ErrInvalidConn at
+	// the application layer when a pooled connection's underlying
+	// socket has been closed by the peer (typical shape: PlanetScale
+	// TCP reset). GitHub issue #21: pre-v0.48.0 the classifier missed
+	// this sentinel and the applier exited instead of retrying, even
+	// though the same connection-reset class on PG retries fine.
+	if errors.Is(err, driver.ErrBadConn) ||
+		errors.Is(err, io.EOF) ||
+		errors.Is(err, gomysql.ErrInvalidConn) {
 		return &retriableMySQLError{err: err}
 	}
 

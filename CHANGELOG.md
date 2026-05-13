@@ -6,6 +6,44 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.48.0]
+
+**Closes GitHub issues #21 + #22 and lands Phase A of #23.** Three changes sharing the *"remove the operational burden of supervising sluice externally"* theme, bundled into one release to reduce per-release CI cost burden. Operators running `sluice sync start` or `backup stream run` against PlanetScale-MySQL endpoints previously needed an external supervisor wrapper to recover from two classes of process exit (#21, #22). v0.48.0 closes both at the retry layer where v0.42.0 / v0.46.0 already framed the policy. Separately, the silent-stall failure mode (#23 — process alive, no apply, no log) now produces a positive liveness signal AND has a pprof endpoint for goroutine-dump diagnosis on the next stall.
+
+### Fixed
+
+- **MySQL applier classifier now catches `gomysql.ErrInvalidConn` (closes GitHub #21).** `go-sql-driver/mysql` exports its own `ErrInvalidConn = errors.New("invalid connection")` sentinel (`errors.go:20`), distinct from `database/sql`'s `driver.ErrBadConn`. The v0.42.0 `classifyApplierError` only checked `driver.ErrBadConn`, so `gomysql.ErrInvalidConn` slipped through and the applier exited even though the same connection-reset class on the PG side retried fine. Two-line fix at `internal/engines/mysql/applier_errors.go::classifyApplierError`. Confirmed against the operator's 3-hour repro (4 exits caused by `invalid connection` during applier INSERT, all required supervisor restarts; same window, 6 successful in-process retries of Vitess `exceeded timeout: 20s`).
+
+- **`sluice backup stream run` rollover loop now retries transient CDC-pump errors (closes GitHub #22).** Pre-v0.48.0 the backup-stream's rollover loop treated any rollover error as terminal, so a source-side TCP reset / gRPC `Unavailable` that the sync-stream path retries through (ADR-0038, v0.46.0) took the backup-stream process down. v0.48.0 mirrors the sync-stream retry policy on the rollover loop: classify via [`ir.RetriableError`](internal/ir/applier_retry.go), close the current CDC pump, reopen from the last committed parent's `EndPosition`, retry. Bounded by new `--retry-attempts` (default 8) / `--retry-backoff-base` (default 100ms) / `--retry-backoff-cap` (default 30s) flags on `backup stream run`, matching the sync-stream's `--apply-retry-*` knobs. Consecutive-failure counter resets on a successful rollover so a long-lived stream doesn't carry retry debt forward.
+
+### Added — GitHub #23 Phase A (silent-stall diagnostics)
+
+- **`stream: heartbeat` INFO log line every `--heartbeat-interval` (default 60s).** New per-stream goroutine in `Streamer.runOnce` emits a positive liveness signal at default log level. Distinguishes silent-stall (process alive, no apply, no log) from wedge (process alive, no heartbeat either). When the next stall fires, the log shows heartbeats stopping AND the operator can hit the new pprof endpoint to dump every goroutine's stack — exactly the data needed to localise the wedge point in Phase B. Phase A is deliberately diagnostic-only: it doesn't try to *fix* the stall, only make it visible. Set `--heartbeat-interval=0` to disable.
+
+- **Global `--pprof-listen ADDR` flag** binds `net/http/pprof`'s debug endpoints at the given address (e.g. `:6060`, `127.0.0.1:6060`) for the duration of any subcommand. Off by default; opt-in. When set, sluice logs `INFO pprof endpoint listening … hint="fetch /debug/pprof/goroutine?debug=2 to dump goroutine stacks"` at startup. The endpoints are the stdlib pprof handlers (CPU profile, heap, goroutine, mutex, block, etc.) — operators chasing the #23 silent-stall use `curl http://<addr>/debug/pprof/goroutine?debug=2 > stacks.txt` and attach to the issue.
+
+### Migration / Compatibility
+
+- **Drop-in upgrade from v0.47.x.** All three changes are additive at the operator surface; no flag renames, no behaviour change for non-failing runs.
+- **The supervisor pattern operators added for #21 / #22 is no longer required** for the documented retry-policy classes. Existing supervisors continue to work as defence-in-depth; they just shouldn't fire as often.
+- **Heartbeat log noise**: at the default 60s cadence, an overnight 24h run produces ~1440 extra INFO lines per stream. Operators with strict log-volume budgets can disable via `--heartbeat-interval=0` and rely on `sluice sync health` for stall detection instead.
+- **pprof endpoint is opt-in**: no exposure surface change unless `--pprof-listen` is set. Operators setting it should bind to localhost / a private interface — the endpoints are unauthenticated by design (stdlib pprof has no auth layer).
+
+### Who needs this release
+
+- **Anyone running `sluice sync start` against a PlanetScale-MySQL target**: **upgrade**. The #21 exit-on-`invalid connection` class is closed; supervisor restarts should drop materially.
+- **Anyone running `sluice backup stream run`**: **upgrade**. The #22 silent-exit-on-source-blip class is closed; the chain stops getting silent coverage gaps when a TCP reset cascade fires.
+- **Anyone who has hit the #23 silent stall** (process alive, no apply, no log): drop-in benefit. The heartbeat log line distinguishes stall from wedge immediately; the pprof endpoint enables a 10-second diagnosis on the next occurrence.
+- **Anyone with strict log-volume / pprof exposure policies**: opt-out via `--heartbeat-interval=0` / leave `--pprof-listen` unset.
+
+### Verification surface
+
+- **Test coverage**:
+  - `internal/engines/mysql/applier_errors_test.go::TestClassifyApplierError_RetriableShapes` extended with two cases — `gomysql.ErrInvalidConn` and a wrapped form (GitHub #21).
+  - `internal/pipeline/heartbeat_test.go` (new) — 3 tests covering emit-on-tick, zero-interval-disables, exits-on-ctx-cancel (catches goroutine leaks).
+  - Existing backup-stream tests cover the rollover loop's retry shape via the unchanged success path; the retry branch's `openCDCReaderWithSlot` reopen path is covered structurally (same engine API the original open uses).
+- **End-to-end retry validation deferred to operator re-test** — same pattern as v0.42.0 / v0.46.0. Concretely: with v0.48.0 binary, `--apply-retry-attempts 8` on the sync path AND `--retry-attempts 8` on the backup-stream path, run through a forced TCP reset and confirm no supervisor restart. For #23: set `--pprof-listen :6060` on all three streams; if a stall recurs, capture `curl localhost:6060/debug/pprof/goroutine?debug=2`.
+
 ## [0.47.0]
 
 **Lands GitHub issue #20 chunk 14a — chain.json catalog at chain root.** Roadmap item 14's keystone. Today's chain readers (`Restore.storeHasIncrementals`, `ChainRestore`, `listAllManifests`, `position-from-manifest`, the resume-detect path on `backup full` / `incremental` / `stream`) all walk the `manifests/` directory via `store.List` and then `store.Get` every result — fine on local FS for small chains, operationally painful past ~10k incrementals or on object storage where `ListObjects` is the dominant cost. v0.47.0 lands a single `chain.json` at the chain root listing every manifest in order with end-position and file-count metadata pre-extracted; chain readers collapse the per-manifest walk to a single `Get`. Foundational for the v0.48.0+ rotate-at / prune (14b–c) and v0.49.0+ compact (14d) chunks under the same roadmap item — they all need O(1) chain-state lookup to build on.

@@ -637,6 +637,10 @@ type BackupStreamCmd struct {
 
 	RolloverHook string `help:"Shell command to invoke after each rollover commits successfully. Receives env vars SLUICE_ROLLOVER_MANIFEST_PATH, SLUICE_ROLLOVER_PARENT_BACKUP_ID, SLUICE_ROLLOVER_BACKUP_ID, SLUICE_ROLLOVER_CHANGES, SLUICE_ROLLOVER_BYTES, SLUICE_ROLLOVER_ELAPSED_MS. Hook errors are WARN-logged but don't fail the stream. 30s timeout." placeholder:"CMD"`
 
+	RetryAttempts    int           `help:"Cap on consecutive retriable rollover failures the stream will absorb before giving up. Mirrors the sync-stream's --apply-retry-attempts. GitHub #22: transient source-side errors that v0.46.0 fixed for sync streams now also retry on backup-stream. 1 disables retry." default:"8" placeholder:"N"`
+	RetryBackoffBase time.Duration `help:"Base interval for exponential backoff between retriable rollover failures. Doubles each attempt, capped at --retry-backoff-cap." default:"100ms" placeholder:"DUR"`
+	RetryBackoffCap  time.Duration `help:"Upper bound on each retriable rollover backoff interval." default:"30s" placeholder:"DUR"`
+
 	EncryptionFlags
 }
 
@@ -691,6 +695,9 @@ func (b *BackupStreamCmd) Run(_ *Globals) error {
 		RolloverHook:          b.RolloverHook,
 		SluiceVersion:         version,
 		Encryption:            encConfig,
+		RetryAttempts:         b.RetryAttempts,
+		RetryBackoffBase:      b.RetryBackoffBase,
+		RetryBackoffCap:       b.RetryBackoffCap,
 	}
 	return stream.Run(ctx)
 }
