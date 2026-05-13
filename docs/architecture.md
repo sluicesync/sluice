@@ -151,7 +151,7 @@ type Capabilities struct {
     BulkLoad BulkLoadMethod    // Copy, LoadDataInfile, BatchedInsert
 
     // How change-data-capture is exposed (if at all).
-    CDC CDCMethod              // Binlog, LogicalReplication, Triggers, None
+    CDC CDCMethod              // Binlog, LogicalReplication, VStream, Triggers, None
 
     // The schema scope model.
     SchemaScope SchemaScope    // Flat (MySQL), Namespaced (Postgres), ...

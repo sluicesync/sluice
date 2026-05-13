@@ -1,5 +1,7 @@
 # Prep: Postgres CDC reader
 
+> **Status: SHIPPED in v0.1.0** (vanilla Postgres CDC reader via `pgoutput`).
+
 Roadmap reference: [docs/dev/roadmap.md §3](../roadmap.md). Related: [ADR-0006: pgoutput over wal2json](../../adr/adr-0006-pgoutput.md), [ADR-0007: position persistence](../../adr/adr-0007-position-persistence.md).
 
 ## Goal

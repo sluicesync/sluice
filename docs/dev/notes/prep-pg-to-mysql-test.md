@@ -1,5 +1,7 @@
 # Prep: Postgres → MySQL integration test
 
+> **Status: SHIPPED in v0.1.0.** Cross-engine PG → MySQL integration coverage is part of the standard four-directions test matrix.
+
 Roadmap reference: [docs/dev/roadmap.md §1](../roadmap.md).
 
 ## Goal

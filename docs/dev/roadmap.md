@@ -518,7 +518,7 @@ Sluice's recent feature work has cadenced PG-first; MySQL/PlanetScale parity is 
 | Phase 6.2 AWS KMS encryption (v0.23.0) | Engine-neutral — applies to both already | n/a |
 | Mid-stream live add-table (`--no-drain`, v0.24.0) | Both engines, v0.27.0 — MySQL via streamer-side filter-flip (ADR-0034) | "Recently landed: Mid-stream add-table — MySQL Phase 2" |
 | Multi-source aggregation `--target-schema` (v0.25.0) | Deferred — DSN-choice workaround documented; per-table-rename flag if demand surfaces | "Multi-source aggregation — MySQL native parity" entry above |
-| Phase 2 strict zero-loss correctness (PG follow-up, future) | PG-specific (pgoutput decode-time publication semantics) — MySQL Phase 2 has its own correctness story | "Mid-stream live add-table — strict zero-loss correctness" entry above |
+| Phase 2 strict zero-loss correctness (PG, closed v0.32.0 via ADR-0036) | PG-specific (pgoutput decode-time publication semantics) — MySQL Phase 2 has its own correctness story | "Recently landed: Mid-stream live add-table — strict zero-loss correctness (v0.32.0)" |
 | GEOMETRY / SPATIAL support (v0.28.0, ADR-0035) | Both engines — PG → MySQL geometry round-trip with SRID preserved; VStream POINT prefix stripped (Bug 27); cross-engine refusal lifted | "Recently landed: GEOMETRY / SPATIAL — PostGIS-aware translation" |
 | `--type-override`, `--expr-override`, translator catalog | Both engines, both directions | n/a |
 

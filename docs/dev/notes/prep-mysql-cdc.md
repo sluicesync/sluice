@@ -1,5 +1,7 @@
 # Prep: MySQL CDC reader
 
+> **Status: SHIPPED in v0.1.0** (vanilla MySQL binlog CDC reader). The `FlavorPlanetScale stays CDCNone` framing below is historically inaccurate — `FlavorPlanetScale` declares `CDCVStream` since v0.12.x via the VStream gRPC path (see ADR-0009 and `prep-planetscale-vstream.md`).
+
 Roadmap reference: [docs/dev/roadmap.md §2](../roadmap.md). Related: [ADR-0007: position persistence](../../adr/adr-0007-position-persistence.md).
 
 ## Goal

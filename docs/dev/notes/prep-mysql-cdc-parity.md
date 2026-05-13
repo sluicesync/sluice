@@ -1,5 +1,7 @@
 # Prep: MySQL CDC parity gaps
 
+> **Status: SHIPPED.** All three items (TRUNCATE detection, MySQL restart-resume integration test, MySQL → PG cross-engine continuous-sync test) landed and are referenced as canonical across the roadmap.
+
 Roadmap reference: not in the original roadmap. Surfaces from the post-§8 audit of MySQL CDC completeness — three known punts left from §2 (MySQL CDC reader) and §4 (snapshot+CDC handoff) where Postgres got coverage and MySQL didn't.
 
 ## Goal

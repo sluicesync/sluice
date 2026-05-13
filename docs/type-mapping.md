@@ -172,12 +172,12 @@ When the IR is emitted as MySQL DDL, the inverse mapping applies, with the follo
 
 - `Integer{Width: 24}` is preserved as `MEDIUMINT`.
 - `Boolean{}` is emitted as `TINYINT(1)`.
-- `Array{}`, `Inet{}`, `Cidr{}`, `Macaddr{}` from a Postgres source have no native MySQL representation. The schema emit step refuses with a clear error pointing operators at the `mappings:` YAML hook (or `--type-override` CLI flag). The error message includes a copy-paste-ready snippet with a sensible suggested target type per IR type:
-  - `Inet`/`Cidr` → `varchar(45)` (max IPv6 + CIDR mask in canonical form is 43 chars; round up for headroom)
-  - `Macaddr` → `varchar(30)` (EUI-64 in canonical form is 23 chars)
-  - `Array` → `longtext` (variable-length serialised content; operators wanting JSON shape can pick `json` instead)
+- `Array{}`, `Inet{}`, `Cidr{}`, `Macaddr{}` from a Postgres source have no native MySQL representation. Sluice auto-emits a sensible shape as of v0.7.0:
+  - `Inet`/`Cidr` → `VARCHAR(45)` (max IPv6 + CIDR mask in canonical form is 43 chars; round up for headroom)
+  - `Macaddr` → `VARCHAR(30)` (EUI-64 in canonical form is 23 chars)
+  - `Array` → `JSON` (operators wanting unstructured storage can pick `longtext` instead)
 
-  Auto-emitting these as `VARCHAR(N) CHECK (format)` is a future enhancement — the auto-policy is documented in the roadmap but not active in the current release. Manual override is the v0.3.x and v0.4.x path.
+  The `mappings:` YAML hook and `--type-override` CLI flag continue to override the auto-shape for operators who want different storage (e.g. binary representations, `LONGTEXT` for array serialisation).
 - `Timestamp{WithTimeZone: false}` is emitted as `DATETIME`.
 
 ## PostgreSQL ↔ IR
@@ -299,6 +299,14 @@ mappings:
     target_type_options:
       binary: true
 ```
+
+## Expression translation and extension gating
+
+Type translation is one half of the cross-engine story; expression-body translation is the other. The translator catalog (see [docs/dev/translator-coverage.md](dev/translator-coverage.md)) rewrites MySQL expressions in `DEFAULT` / `GENERATED` / `CHECK` bodies into their PG equivalents. Most rewrites ship unconditionally, but a few depend on operator-enabled Postgres extensions:
+
+- **`SHA1(x)` / `SHA2(x, n)` → `encode(digest(x, '<algo>'), 'hex')`** (v0.38.0) — requires `pgcrypto` on the target. Pass `--enable-pg-extension pgcrypto` and ensure `CREATE EXTENSION pgcrypto;` has been run; the rewrite then fires automatically. Without the flag, the calls fall through verbatim and PG's parse-time error signals the missing extension. `MD5(x)` ships unconditionally — PG core has `md5(text)`.
+
+For MySQL → PG migrations, run `sluice schema preview` first — its translator-gap preflight scan (v0.39.0, see [ADR-0024](adr/adr-0024-schema-preview.md)) lists every expression pattern sluice does NOT auto-rewrite, with operator-actionable workaround hints.
 
 ## What the IR is not
 

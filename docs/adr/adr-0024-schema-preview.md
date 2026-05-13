@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed. Implementation gated on operator review of this design.
+Accepted. Implemented in v0.6.0 (initial subcommand) with subsequent extensions across v0.8.x (output format polish), v0.11.2 (translation-notes coverage), v0.26.0 (advisory hints registry), v0.32.0 (multi-source / `--target-schema` awareness), and v0.39.0 (translator-gap preflight scan — see `internal/translate/gaps.go` and the dedicated section in this document).
 
 ## Context
 
@@ -124,6 +124,105 @@ The UUID hint is the headline example from the v0.6.0 testing discussion that mo
 - **Discovery of `--type-override`.** Today the flag is documented but not advertised in-flow. The hints registry surfaces it at the moment it's actionable.
 - **Tooling integration.** `--format json` lets CI scripts gate "no advisory hints in production schema preview" or diff previews across config branches.
 - **Same-engine paths get a free DDL dump too.** Operators running PG→PG can use the preview to check what their mappings actually produce, even though no cross-engine translation is happening.
+
+## v0.39.0 extension — translator-gap preflight scan
+
+The advisory-hints registry covers cross-engine **type** surprises. v0.39.0 adds a parallel surface for **expression** surprises: a preflight scan over every `DefaultExpression`, `Column.GeneratedExpr`, and `CheckConstraint.Expr` whose dialect tag is `mysql`, run during `sluice schema preview` against MySQL → PG pairs. Patterns that match sluice's deliberately-deferred translator catalog rules surface in the output before any data moves.
+
+### What the scan catches
+
+Seven catalog rules sluice does NOT auto-rewrite (`internal/translate/gaps.go`):
+
+| Pattern | Catalog rule | Severity | Why deferred |
+|---|---|---|---|
+| `GREATEST` / `LEAST` | #11 | silent | NULL semantics differ — PG ignores NULL args, MySQL propagates. Output divergence is silent (no parse error). |
+| `REGEXP_LIKE` | #13 | silent (PG 15+) | POSIX (PG) vs ICU (MySQL) regex flavours. Patterns with lookaheads / named groups / Unicode-property classes diverge silently. |
+| `FIND_IN_SET` | #21 | loud | No portable PG equivalent in CHECK / GENERATED contexts. |
+| `CONVERT_TZ` | #23 | loud | No `CONVERT_TZ` in PG core. |
+| `INET_ATON` / `INET_NTOA` | #29 | loud | No portable equivalent without a custom function. |
+| `SHA1` / `SHA2` | #10 | loud | Requires pgcrypto. **Suppressed when `--enable-pg-extension pgcrypto` is set** since the v0.38.0 rewrite ships under that flag. |
+
+- **`loud`** means PG rejects the DDL at parse time — the migration would fail visibly, but late. The preflight surfaces it cheaply.
+- **`silent`** means PG accepts the DDL but evaluates the expression differently than MySQL. The preflight surfaces it before the divergence ships into row data.
+
+Detection is case-insensitive, with word-boundary matching (`IS_GREATEST_HIT(...)` does not trigger a false positive). The scan returns `nil` for non-MySQL-to-PG engine pairs; same-engine paths see no behaviour change.
+
+### Operator-facing output (text format)
+
+When the scan finds ≥ 1 gap, the preview header gains a count line and a dedicated section before the per-table DDL:
+
+```
+-- sluice schema preview
+-- source: mysql (5 tables, 23 columns)
+-- target: postgres
+-- mappings applied: 0
+-- advisory hints: 2
+-- translator gaps: 3 (see section below)
+
+-- ──────────── Translator gaps (MySQL → Postgres) ────────────
+-- These MySQL expression patterns are NOT auto-translated to PostgreSQL.
+-- Address each one before migrating, or PG will either reject the DDL (loud)
+-- or evaluate the expression differently than MySQL (silent).
+
+[loud]   users.email_hash (GENERATED)
+         expression: SHA2(email, 256)
+         catalog rule #10 (SHA family)
+         note: enable pgcrypto on the target and pass --enable-pg-extension pgcrypto;
+               sluice will then rewrite to encode(digest(email, 'sha256'), 'hex').
+
+[loud]   orders.ip_int (DEFAULT)
+         expression: INET_ATON(client_ip)
+         catalog rule #29
+         note: no portable PG equivalent. Either redefine the column shape
+               (store the text address as inet) or use --expr-override
+               orders.ip_int='(your-PG-expression)' to supply the PG form.
+
+[silent] settings.max_retries (CHECK)
+         expression: max_retries >= GREATEST(1, default_retries)
+         catalog rule #11
+         note: PG's GREATEST ignores NULL args; MySQL's propagates NULL.
+               If either column is nullable, results diverge silently. Either
+               wrap with COALESCE or use --expr-override.
+
+-- ──────────── users ────────────
+...
+```
+
+### JSON shape
+
+```json
+{
+  "translator_gaps": [
+    {
+      "table": "users",
+      "column": "email_hash",
+      "constraint": "",
+      "field": "generated",
+      "pattern": "SHA2",
+      "rule": 10,
+      "severity": "loud",
+      "expression": "SHA2(email, 256)",
+      "note": "enable pgcrypto on the target..."
+    }
+  ]
+}
+```
+
+The `translator_gaps` field is **omitted entirely when no gaps are detected** (additive; existing parsers ignore unknown fields). CI gates can fail the migration plan on any `"severity": "loud"` entry:
+
+```bash
+jq '.translator_gaps | map(select(.severity == "loud")) | length == 0' preview.json
+```
+
+Returns `true` when no loud gaps are present.
+
+### Why a separate scan and not the advisory-hints registry
+
+The advisory-hints registry is keyed on `(sourceCol, targetCol)` type pairs — the source-of-truth is the column's declared type. Expression-body gaps are keyed on **what the expression *contains***, not the column type. Encoding "this expression body uses `INET_ATON`" in the hints registry's type-pair structure would mean a per-expression-body re-evaluation pass that the registry isn't shaped for. Splitting into a separate `internal/translate/gaps.go` scanner keeps each surface focused.
+
+### Why not auto-rewrite the deferred rules
+
+Each deferred rule has a load-bearing reason (NULL semantics, regex flavour, missing PG equivalent, or extension dependency); auto-rewriting any of them silently would change application semantics in subtle ways. The deferral is the conservative choice; the preflight is how operators discover the deferral before the migrate runs.
 
 ## Why a new subcommand and not `migrate --dry-run --show-target-ddl`
 

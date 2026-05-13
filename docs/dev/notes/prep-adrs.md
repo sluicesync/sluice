@@ -1,5 +1,7 @@
 # Prep: ADR audit + new ADRs (roadmap §8)
 
+> **Status: SHIPPED** (initial audit). ADR-0006 / ADR-0007 had their "forward-looking" caveats removed; ADRs 0008-0010 landed. Note: ADR-0024 has since regressed and been re-corrected (status: Accepted, with v0.6.0 / v0.39.0 implementation history).
+
 Roadmap reference: [docs/dev/roadmap.md §8](../roadmap.md). Existing ADRs: [docs/adr/](../../adr/).
 
 ## Goal

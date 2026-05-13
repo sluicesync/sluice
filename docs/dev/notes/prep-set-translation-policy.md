@@ -1,5 +1,7 @@
 # Prep: SET → TEXT[] (default) + mappings overrides
 
+> **Status: PARTIALLY SHIPPED.** v1 of the chunk implements the default `text_array` translation; the junction-table and boolean-per-member overrides remain deferred (see the v1 scope notes in the body below).
+
 Roadmap reference: not in the original roadmap. Surfaces from the post-walkthrough conversation about the GEOMETRY/SET friction items the sakila walkthrough exposed. Depends on [prep-mappings-config-wiring.md](prep-mappings-config-wiring.md) being merged.
 
 ## Goal

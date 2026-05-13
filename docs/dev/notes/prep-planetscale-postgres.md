@@ -1,5 +1,7 @@
 # Prep: PlanetScale Postgres support
 
+> **Status: SHIPPED.** Verification matrix lives in [docs/managed-services.md](../../managed-services.md). All sluice paths verified against PlanetScale Postgres (PS-PG, late 2025 launch).
+
 Roadmap reference: not in the original roadmap (PlanetScale Postgres launched after the roadmap was written). Surfaces from the §8 wrap-up conversation about real-world workload coverage.
 
 ## Goal

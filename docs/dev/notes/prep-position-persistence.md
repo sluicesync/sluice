@@ -1,5 +1,7 @@
 # Prep: position persistence (control table)
 
+> **Status: SHIPPED in v0.1.0.** Canonical reference: [ADR-0007](../../adr/adr-0007-position-persistence.md). The control table is the `sluice_cdc_state` referenced across all CDC features.
+
 Roadmap reference: [docs/dev/roadmap.md §5](../roadmap.md). Related: [ADR-0007: position persistence on the target](../../adr/adr-0007-position-persistence.md), [prep-change-applier.md](prep-change-applier.md) (which built the per-change transaction shape this chunk plugs into).
 
 ## Goal

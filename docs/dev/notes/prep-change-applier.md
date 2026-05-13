@@ -1,5 +1,7 @@
 # Prep: production ChangeApplier on each engine
 
+> **Status: SHIPPED in v0.1.0.** Both engines' `OpenChangeApplier` are core to every CDC release.
+
 Roadmap reference: implicit prerequisite for [docs/dev/roadmap.md §5](../roadmap.md) (position persistence). Related: [ADR-0007: position persistence](../../adr/adr-0007-position-persistence.md), [prep-snapshot-cdc-handoff.md](prep-snapshot-cdc-handoff.md) (which left this gap explicitly open).
 
 ## Goal

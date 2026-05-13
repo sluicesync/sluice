@@ -1,5 +1,7 @@
 # Prep: wire sluice.yaml mappings through translation
 
+> **Status: SHIPPED.** The `mappings:` YAML hook is wired through translation; `--type-override` is the CLI form. Both are referenced across the roadmap and ADR-0024.
+
 Roadmap reference: not in the original roadmap. Surfaces from the post-walkthrough conversation about handling SET / GEOMETRY / other policy-edge types via config rather than code changes — and prerequisite for the SET and GEOMETRY chunks that follow.
 
 ## Goal

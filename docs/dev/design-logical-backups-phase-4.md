@@ -23,17 +23,17 @@ The headline operator outcome: a single long-running process produces rolling in
 - Structured logging at INFO (rollover events, lifetime stats) + DEBUG (per-event detail)
 - Operator-facing rollover hooks: optional `--rollover-hook=<cmd>` runs after each rollover commits (e.g. shell out to alert-manager / metrics-pusher)
 
-**Deferred to Phase 4.5 (backup-as-broker, separate chunk):**
+**Shipped in Phase 4.5 (backup-as-broker):**
 
-- `sluice sync from-backup` watcher that polls the chain and replays incrementals into a target
+- `sluice sync from-backup` watcher that polls the chain and replays incrementals into a target — see [design-logical-backups-phase-4-5.md](design-logical-backups-phase-4-5.md).
 
-**Deferred to Phase 5+ (cross-engine chain restore):**
+**Shipped in Phase 5+ (cross-engine chain restore):**
 
-- Cross-engine chain restore (Phase 3.2 currently refuses cross-engine; this is a translation-pass scope, not a stream scope)
+- Cross-engine chain restore landed alongside the SELECT-grammar translator and `RetargetForEngine` extensions.
 
-**Deferred to Phase 6 (KMS encryption):**
+**Shipped in Phase 6 (passphrase + AWS KMS + GCP + Azure KMS):**
 
-- Client-side encryption at-rest
+- Client-side encryption at-rest via the `EnvelopeEncryption` interface — see [docs/operator/encryption.md](../operator/encryption.md).
 
 ## Open design questions — resolved decisions
 

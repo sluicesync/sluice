@@ -1,5 +1,7 @@
 # Prep: PostGIS-aware GEOMETRY translation
 
+> **Status: SHIPPED in v0.28.0** (initial PG → MySQL geometry round-trip with SRID); refined through v0.33.3 (Bug 51 / 52 / 53 closure on PG `geography(POINT, SRID)` and Z/M dimensional variants). Canonical reference: [ADR-0035](../../adr/adr-0035-postgis-geometry-spatial-support.md).
+
 Roadmap reference: not in the original roadmap. Surfaces from the post-walkthrough conversation about handling sakila's `address.location` (GEOMETRY) cleanly when the PG target has PostGIS enabled. Loosely depends on [prep-mappings-config-wiring.md](prep-mappings-config-wiring.md) being merged for SRID overrides.
 
 ## Goal

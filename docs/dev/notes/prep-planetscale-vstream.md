@@ -1,5 +1,7 @@
 # Prep: PlanetScale MySQL CDC via Vitess VStream
 
+> **Status: SHIPPED in v0.12.x.** `FlavorPlanetScale` now declares `CDCVStream`; the multi-shard reader with auto-discovery and reshard detection is the canonical PlanetScale CDC path. See [ADR-0034](../../adr/adr-0034-mysql-phase-2-live-add-table.md) for the follow-on filter-flip mechanism.
+
 Roadmap reference: not in the original roadmap. Surfaces from the §8 wrap-up: PlanetScale's `FlavorPlanetScale` declares `CDC: ir.CDCNone` today, and the `// PlanetScale's own change-feed mechanisms could be added as a separate option later` comment in `flavor.go` is the deferred work this chunk picks up.
 
 ## Goal

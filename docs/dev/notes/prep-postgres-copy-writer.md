@@ -1,5 +1,7 @@
 # Prep: Postgres COPY-protocol writer
 
+> **Status: SHIPPED in v0.1.0** — `chanCopySource` adapter wrapping pgx `CopyFrom` is the canonical PG bulk-load path.
+
 Roadmap reference: [docs/dev/roadmap.md §6](../roadmap.md). Related: [PlanetScale's pgcopydb fork](https://github.com/planetscale/pgcopydb), referenced in [CLAUDE.md](../../../CLAUDE.md) as the tactical inspiration.
 
 ## Goal

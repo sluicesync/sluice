@@ -1,5 +1,7 @@
 # Prep: translation policy edges
 
+> **Status: SHIPPED in v0.1.0** (all five audited items closed: BIGINT UNSIGNED, ENUM, JSON vs JSONB, default-value translation, identity sequence sync). Referenced across release notes and ADR-0014.
+
 Roadmap reference: [docs/dev/roadmap.md §7](../roadmap.md). Related: [docs/type-mapping.md](../../type-mapping.md), [docs/value-types.md](../../value-types.md).
 
 ## Goal

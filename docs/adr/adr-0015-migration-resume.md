@@ -53,8 +53,10 @@ and re-enters at the recorded point.
 Per-table granularity is **whole-table truncate-and-redo**: an
 in-progress table is `TRUNCATE`d before re-copy. The trade-off is
 deliberate — operators pay the cost of re-copying *one* in-progress
-table, not the entire migration. Per-batch checkpointing is parked as
-a future enhancement.
+table, not the entire migration. Per-batch checkpointing shipped in
+v0.4.x — see [ADR-0018](adr-0018-per-batch-bulk-copy-checkpointing.md) — and
+extends the whole-table fallback with a PK-cursor resume that avoids
+the truncate when the in-progress table's primary key is monotonic.
 
 `MigrationStateStore` is wired as an *optional* engine surface
 (`ir.MigrationStateStoreOpener`), mirroring the `SlotManagerOpener`

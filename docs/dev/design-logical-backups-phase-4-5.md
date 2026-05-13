@@ -24,13 +24,13 @@ The headline operator outcome: **decouple source and target via the backup chain
 - Catch-up mode: on first start against a non-empty target, refuses unless `--reset-target-data` is passed OR the operator has manually restored the chain's full + the target is at the chain's current state (operator asserts via `--at-chain-id=<ID>` flag)
 - Schema evolution: replay schema deltas from manifests in chain order (already exists in `chain_restore.go`; reuse)
 
-**Deferred to Phase 5 (cross-engine chain restore — the partner feature):**
+**Shipped in Phase 5 (cross-engine chain restore — the partner feature):**
 
-- Cross-engine `sync from-backup` (PG-source-chain → MySQL target). Phase 4.5 is same-engine only; cross-engine waits for the SELECT-grammar translator + RetargetForEngine extensions in Phase 5.
+- Cross-engine `sync from-backup` (PG-source-chain → MySQL target) shipped alongside the SELECT-grammar translator + `RetargetForEngine` extensions.
 
-**Deferred to Phase 6 (KMS encryption):**
+**Shipped in Phase 6 (passphrase + AWS + GCP + Azure KMS):**
 
-- Encrypted-chain consumption (the broker reads the same chunks that decrypt-on-restore would handle)
+- Encrypted-chain consumption — the broker reads the same chunks that decrypt-on-restore handles, via the `EnvelopeEncryption` interface across all four key-management modes.
 
 **Deferred to Phase 7+ (operationally-mature features):**
 

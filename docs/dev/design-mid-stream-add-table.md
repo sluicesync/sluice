@@ -134,7 +134,7 @@ The implementation chose **Strategy C variant (c)** — single-slot, publication
 - A captured baseline of the active stream's slot `confirmed_flush_lsn` before publication-add.
 - An invariant check after the snapshot opens: snapshot-LSN ≥ the captured slot LSN; loud refusal otherwise.
 
-**MySQL Phase 2 is deferred.** The PG mechanism (publication-add) doesn't translate — MySQL's binlog auto-includes every table; the gap is in the streamer's table filter (`--include-table`/`--exclude-table`). Future work: a streamer-side filter-flip mechanism that extends `applyTableFilter`'s scope mid-run, or a no-filter default with the WARN-and-skip-then-pick-up pattern from ADR-0021.
+**MySQL Phase 2 shipped v0.27.0** — see [ADR-0034](adr/adr-0034-mysql-phase-2-live-add-table.md). The streamer-side filter-flip mechanism this section anticipated was implemented as designed: `applyTableFilter`'s scope is extended mid-run when the publication-equivalent action fires, and the PG-only refusal in `preflightStream` is lifted for MySQL targets.
 
 **Strategy B remains reserved** for Phase 3 if real operator demand surfaces for sub-second add-table latency on workloads where the temp slot's brief WAL pin is unacceptable.
 

@@ -1,5 +1,7 @@
 # Prep: real-world walkthrough
 
+> **Status: SHIPPED** — see [docs/examples/quickstart.md](../../examples/quickstart.md). The walkthrough is the canonical entry point for new users.
+
 Roadmap reference: not in the original roadmap; surfaces from the §8 wrap-up conversation about validating the v1 spine against an actual workload before declaring v1 complete.
 
 ## Goal

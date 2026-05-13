@@ -1,5 +1,7 @@
 # Prep: Snapshot-to-CDC handoff
 
+> **Status: SHIPPED in v0.1.0** — gapless cutover via `START TRANSACTION WITH CONSISTENT SNAPSHOT` (MySQL) and `EXPORT_SNAPSHOT` + `SET TRANSACTION SNAPSHOT` (PG).
+
 Roadmap reference: [docs/dev/roadmap.md §4](../roadmap.md). Related: [ADR-0007: position persistence](../../adr/adr-0007-position-persistence.md), prior CDC work in [prep-mysql-cdc.md](prep-mysql-cdc.md) and [prep-postgres-cdc.md](prep-postgres-cdc.md).
 
 ## Goal

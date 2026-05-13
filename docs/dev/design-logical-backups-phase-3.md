@@ -15,20 +15,20 @@ The headline operator outcome: when CDC position is gone (PG slot dropped past `
 - Operator-facing soft warnings when PG `wal_keep_size` looks insufficient for the chain's cadence
 - Pointer to the idle-slot failover trap doc (`docs/postgres-source-prep.md`) when `--position-from-manifest` is used against PG
 
-**Deferred to Phase 4 (continuous-incremental, separate chunk after Phase 3 verifies clean):**
+**Shipped in Phase 4 (continuous-incremental):**
 
-- `sluice backup stream` long-running process producing rolling incrementals
+- `sluice backup stream` long-running process producing rolling incrementals — see [design-logical-backups-phase-4.md](design-logical-backups-phase-4.md).
 - Manifest update under concurrent writers
 - Operator UX for the long-running mode
 
-**Deferred to Phase 4.5 (backup-as-broker, after Phase 4 stabilizes):**
+**Shipped in Phase 4.5 (backup-as-broker):**
 
-- `sluice sync from-backup` watcher that polls the chain and replays incrementals into a target
+- `sluice sync from-backup` watcher that polls the chain and replays incrementals into a target — see [design-logical-backups-phase-4-5.md](design-logical-backups-phase-4-5.md).
 - Decoupled source / target sync via backup as the message log
 
-**Deferred to Phase 6 (KMS encryption):**
+**Shipped in Phase 6 (passphrase + AWS KMS + GCP + Azure KMS):**
 
-- Client-side AES-256-GCM remains unimplemented through Phase 3 (and v0.16.0's docs were corrected on this point in v0.16.1)
+- Client-side AES-256-GCM via the `EnvelopeEncryption` interface — passphrase mode (v0.22.0), AWS KMS (v0.23.0), GCP Cloud KMS + Azure Key Vault (v0.34.0). See [docs/operator/encryption.md](../operator/encryption.md).
 
 ## Implementation note: snapshot-anchored EndPosition (v0.17.2 deviation closed in v0.18.0)
 
