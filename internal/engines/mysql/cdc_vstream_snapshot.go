@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 
 	"google.golang.org/grpc"
@@ -117,6 +118,7 @@ func (e Engine) openVStreamSnapshotStream(ctx context.Context, dsn string) (*ir.
 		fields:              make(map[string][]*query.Field),
 		rowBuffer:           make(map[string][]ir.Row),
 		copyCompletedShards: make(map[string]bool),
+		dedup:               newCopyDedupTracker(),
 		conn:                conn,
 		grpcStream:          grpcStream,
 		grpcCancel:          streamCancel,
@@ -205,6 +207,17 @@ type vstreamSnapshotStream struct {
 	// the per-scope-vs-global routing is wired correctly.
 	copyCompletedShards map[string]bool
 
+	// dedup absorbs Vitess's COPY-phase re-emissions. Under
+	// concurrent source writes, VStream can emit the same (or
+	// behind-the-scan) PK twice on the same gRPC stream; the
+	// bulk-copy writer is not idempotent, so duplicates collide on
+	// the target's PRIMARY KEY. The tracker tracks max-PK-seen per
+	// (keyspace, shard, table) scope and drops behind-the-scan
+	// emissions. Post-COPY CDC phase re-emits any dropped events
+	// via the binlog tail, where the applier's idempotent semantics
+	// absorb them (ADR-0010). GitHub issue #14, v0.43.0.
+	dedup *copyDedupTracker
+
 	conn       *grpc.ClientConn
 	grpcStream vtgateservice.Vitess_VStreamClient
 	grpcCancel context.CancelFunc // cancels the gRPC stream context
@@ -260,6 +273,10 @@ func (s *vstreamSnapshotStream) dispatchCopyEvent(ev *binlogdata.VEvent) (done b
 		}
 		key := fieldCacheKey(fe.GetShard(), fe.GetTableName())
 		s.fields[key] = fe.GetFields()
+		// GitHub issue #14: derive PK column names from the FIELD
+		// event's per-field PRI_KEY_FLAG bit so the dedup tracker
+		// can identify behind-the-scan COPY-phase emissions.
+		s.dedup.recordFields(key, fe.GetFields())
 		return false, nil
 
 	case binlogdata.VEventType_ROW:
@@ -292,6 +309,16 @@ func (s *vstreamSnapshotStream) dispatchCopyEvent(ev *binlogdata.VEvent) (done b
 		// event; multi-shard streams see N×T per-scope events
 		// (N shards × T tables) followed by one global event.
 		if ev.GetKeyspace() == "" && ev.GetShard() == "" {
+			// GitHub issue #14: log the per-scope dedup-drop summary
+			// so operators on busy keyspaces can see how many
+			// behind-the-scan emissions Vitess sent that we filtered.
+			// Empty string when no drops fired — most streams.
+			if summary := s.dedup.summary(); summary != "" {
+				slog.DebugContext(context.Background(),
+					"mysql/vstream: snapshot: COPY-phase dedup summary (GitHub #14)",
+					slog.String("drops_by_scope", summary),
+				)
+			}
 			return true, nil
 		}
 		if s.copyCompletedShards == nil {
@@ -341,6 +368,17 @@ func (s *vstreamSnapshotStream) bufferCopyRow(ev *binlogdata.VEvent) error {
 			// COPY-phase rows always have After populated. A missing
 			// After is malformed; skip it so the rest of the table
 			// still buffers cleanly.
+			continue
+		}
+		// GitHub issue #14: drop behind-the-scan emissions. Vitess
+		// under concurrent source writes can emit the same (or an
+		// earlier) PK twice on the same gRPC stream during COPY.
+		// Without this filter, the bulk-copy writer would see
+		// duplicate PKs and the second INSERT would collide with
+		// the first. Dropped rows are replayed via the post-COPY
+		// CDC phase's binlog tail, where idempotent apply absorbs
+		// them (ADR-0010).
+		if !s.dedup.shouldKeep(key, row) {
 			continue
 		}
 		s.rowBuffer[tableName] = append(s.rowBuffer[tableName], row)

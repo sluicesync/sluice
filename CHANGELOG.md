@@ -6,6 +6,49 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.43.0]
+
+**Closes GitHub issue #14 — VStream COPY-phase chunk overlap dedup.** Operator-confirmed in the v0.42.0 retest: a single PlanetScale-MySQL source feeding three target engines (vanilla MySQL, PS-Postgres, PS-MySQL) failed cold-start with duplicate-PK errors on ALL three simultaneously, ruling out any target-side hypothesis. The empirical evidence isolated the root cause to Vitess's COPY-phase emission: per the upstream VStream Copy RFC ([vitessio/vitess#6277](https://github.com/vitessio/vitess/issues/6277)), COPY mode interleaves forward batch emissions with a "catchup" phase that replays binlog events for rows already past the COPY scan's lastpk. Sluice's pre-v0.43.0 VStream snapshot reader buffered every ROW event indiscriminately; the catchup-phase emissions reached the bulk-copy writer as duplicate-PK INSERTs. The v0.43.0 fix tracks max-PK-seen per scope and drops behind-the-scan emissions — exactly the dedup pattern Vitess's RFC documents on the client side via `LastTablePK`.
+
+### Fixed
+
+- **`internal/engines/mysql/vstream_copy_dedup.go` (new)** — `copyDedupTracker` with per-`(keyspace, shard, table)` max-PK-seen state. PK column identification from FIELD events via the `query.MySqlFlag_PRI_KEY_FLAG` bit. Composite PKs compared lexicographically; type-aware compare for int64 / uint64 / float64 / string / []byte / time.Time / bool. Tables without a declared PK fall through (the tracker keeps every row — dedup is opt-in by PK presence).
+
+- **`internal/engines/mysql/cdc_vstream_snapshot.go`** — `vstreamSnapshotStream` gained a `dedup *copyDedupTracker` field, initialised in `openVStreamSnapshotStream`. The `dispatchCopyEvent` FIELD branch calls `dedup.recordFields` to capture PK column names; `bufferCopyRow` consults `dedup.shouldKeep` before appending to `rowBuffer`. Dropped rows are recovered post-COPY: the CDC phase resumes from the snapshot's terminal GTID and Vitess's binlog tail replays any changes that happened during the scan; the applier's idempotent semantics (ADR-0010 / ON DUPLICATE KEY UPDATE / ON CONFLICT DO UPDATE) absorb them.
+
+- **DEBUG-level summary at COPY_COMPLETED** — when ≥ 1 emission was dropped, the global COPY_COMPLETED event logs a `mysql/vstream: snapshot: COPY-phase dedup summary (GitHub #14)` line with per-scope drop counts. Empty/no log for well-behaved streams (no drops). Operators on busy keyspaces can confirm the dedup is working.
+
+### Migration / Compatibility
+
+- **Drop-in upgrade from v0.42.x.** No CLI changes, no IR changes, no engine-interface changes. The dedup is enabled by default; engines that don't open a VStream snapshot stream are unaffected.
+- **PG / vanilla-MySQL targets**: drop-in benefit. The fix is in the SOURCE-side VStream reader, so any sluice stream consuming a PlanetScale-MySQL / Vitess source (regardless of target engine) gets the fix. The v0.42.0 retest's "all three targets fail simultaneously" shape is what this release is specifically designed to close.
+- **Same-engine MySQL → MySQL on vanilla MySQL source**: drop-in; this path uses the binlog reader (not VStream), so the dedup is a no-op.
+- **Tables without a primary key**: dedup is a no-op (tracker can't identify what to dedup). v0.42.x behaviour preserved.
+- **CDC apply-phase semantics**: unchanged. The dedup only filters COPY-phase emissions; CDC ROW events are passed through untouched (the applier's idempotency handles those per ADR-0010).
+
+### Who needs this release
+
+- **Anyone running `sluice sync start` against a PlanetScale-MySQL or self-hosted Vitess source under concurrent source writes**: **upgrade**. This is the load-bearing fix that closes the only remaining open bug from the v0.39.1 → v0.42.0 fix sequence.
+- **Operators on quiescent or write-paused source databases**: drop-in; no behaviour change (no re-emissions happen without concurrent writes).
+- **Operators not using VStream**: drop-in; this path is unreachable.
+
+### Verification surface
+
+- **13 new unit tests** in `internal/engines/mysql/vstream_copy_dedup_test.go` covering:
+  - nil-tracker fall-through (every row kept)
+  - no-PK table (every row kept — dedup is keyed on PK presence)
+  - single int PK monotonic forward (no drops)
+  - the GitHub #14 repro shape (behind-the-scan id=545 / id=1179 drops with the right summary)
+  - per-scope independence across multi-shard streams
+  - composite PK lexicographic compare (`(region, id)` with cross-region forward / behind / equal cases)
+  - every value-type's compare path in `comparePKCell` (int64 / uint64 / float64 / string / []byte / time.Time / bool / nil / type-mismatch fall-open)
+  - `recordFields` idempotency on FIELD-event re-emit
+  - summary string format pinning
+
+### Companion — Phase A branch retired
+
+The Phase A diagnostic instrumentation that lived on branch `phase-a-issue-14` (commit `b995afb`) is retained on that branch as a historical artifact. With v0.43.0 closing #14 via empirical confirmation of hypothesis (b) and no further diagnostic round needed, the branch can be deleted at your discretion — the dedup fix supersedes its purpose. The `phase_a_probe="github_issue_14"` DEBUG log lines were never merged into `main`; v0.43.0 ships its own per-COPY_COMPLETED summary log for ongoing operator visibility.
+
 ## [0.42.0]
 
 **Closes GitHub issue #13 — bounded retry on transient applier errors.** Implements [ADR-0038](docs/adr/adr-0038-applier-retry-on-transient-errors.md). Before v0.42.0, the first transient applier error during CDC (Vitess `Error 1105` tx-killer, PG `SQLSTATE 40001` serialisation failure, etc.) exited the entire `sluice sync start` process. Operators had to wrap the binary in a supervisor and rely on warm-resume to retry. v0.42.0 brings the retry policy inside the streamer: each per-engine classifier categorises errors as retriable or terminal, and `Streamer.Run` wraps the apply pipeline with exponential backoff that resets on observed CDC-position progress.
