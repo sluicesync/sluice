@@ -634,7 +634,7 @@ func loadPrimaryKey(ctx context.Context, tx *sql.Tx, schema, table string) ([]st
 // (currently only unit tests pre-dating this fix) still produce
 // valid SQL.
 func buildInsertSQL(schema, table string, row ir.Row, pk []string, colTypes map[string]*ir.Column) (sqlStmt string, args []any) {
-	cols := sortedKeys(row)
+	cols := nonGeneratedRowKeys(row, colTypes)
 	args = make([]any, 0, len(cols))
 	colSQL := make([]string, len(cols))
 	for i, c := range cols {
@@ -725,7 +725,7 @@ func buildTruncateSQL(schema, table string) string {
 // NULL values bind through database/sql normally; no special form
 // is needed in SET (unlike WHERE).
 func buildSetClause(row ir.Row, colTypes map[string]*ir.Column) (clause string, args []any) {
-	cols := sortedKeys(row)
+	cols := nonGeneratedRowKeys(row, colTypes)
 	parts := make([]string, len(cols))
 	args = make([]any, 0, len(cols))
 	for i, c := range cols {
@@ -750,7 +750,7 @@ func buildSetClause(row ir.Row, colTypes map[string]*ir.Column) (clause string, 
 // SQL-side half of the Bug 6 silent-failure fix; the value-shaping
 // half (prepareValue routing) is the other.
 func buildWhereClause(row ir.Row, colTypes map[string]*ir.Column) (clause string, args []any) {
-	cols := sortedKeys(row)
+	cols := nonGeneratedRowKeys(row, colTypes)
 	parts := make([]string, 0, len(cols))
 	args = make([]any, 0, len(cols))
 	for _, c := range cols {
@@ -763,6 +763,40 @@ func buildWhereClause(row ir.Row, colTypes map[string]*ir.Column) (clause string
 		args = append(args, prepareApplierValue(v, colTypes, c))
 	}
 	return strings.Join(parts, " AND "), args
+}
+
+// nonGeneratedRowKeys returns the row's keys in sorted order, filtering
+// out any column the colTypes map identifies as a generated column
+// (Column.GeneratedExpr non-empty). Generated columns cannot accept
+// non-DEFAULT values on either MySQL or PG — INSERT/UPDATE SET against
+// a generated column is a hard error on both engines, and including
+// one in a WHERE predicate risks silent zero-rows-affected when the
+// target's recomputation differs from the source's stored value
+// (precision / NULL-coalescing differences are realistic).
+//
+// Mirrors the bulk-load writer's [nonGeneratedColumns] (row_reader.go);
+// the GitHub issue #12 fix wires the CDC apply path to the same
+// filter the LOAD-DATA path already uses (ADR-0026:100).
+//
+// A nil or partial colTypes map (cache cold, column unknown) is
+// tolerant: columns not in the map are treated as non-generated and
+// included. This preserves the pre-fix shape for unit tests with
+// hand-built fixtures and for the small race window before the
+// applier's lazy cache populates.
+func nonGeneratedRowKeys(row ir.Row, colTypes map[string]*ir.Column) []string {
+	all := sortedKeys(row)
+	if len(colTypes) == 0 {
+		return all
+	}
+	out := make([]string, 0, len(all))
+	for _, c := range all {
+		col, ok := colTypes[c]
+		if ok && col != nil && col.IsGenerated() {
+			continue
+		}
+		out = append(out, c)
+	}
+	return out
 }
 
 // placeholderFor returns the right-hand-side placeholder fragment

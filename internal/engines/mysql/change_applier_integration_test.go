@@ -416,6 +416,107 @@ func TestChangeApplier_JSONColumn(t *testing.T) {
 	}
 }
 
+// TestChangeApplier_GeneratedColumn is the GitHub issue #12 regression
+// guard. A table with a STORED generated column previously caused the
+// CDC apply path to emit the generated column's value in the INSERT
+// statement, which MySQL rejected with Error 3105 ("The value
+// specified for generated column ... in table ... is not allowed").
+// The fix filters generated columns out of the apply path's column
+// lists / SET / WHERE — mirroring the LOAD-DATA writer's existing
+// filter (ADR-0026:100).
+func TestChangeApplier_GeneratedColumn(t *testing.T) {
+	dsn, cleanup := startMySQLForApplier(t)
+	defer cleanup()
+
+	applyMySQLApplier(t, dsn, `
+		CREATE TABLE products (
+			id     BIGINT UNSIGNED   NOT NULL AUTO_INCREMENT,
+			price  DECIMAL(12,2)     NOT NULL,
+			cost   DECIMAL(12,2)     NULL,
+			margin DECIMAL(12,2)     AS (price - COALESCE(cost, 0)) STORED,
+			PRIMARY KEY (id)
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+	`)
+
+	eng := Engine{Flavor: FlavorVanilla}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	applier, err := eng.OpenChangeApplier(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenChangeApplier: %v", err)
+	}
+	defer func() {
+		if c, ok := applier.(interface{ Close() error }); ok {
+			_ = c.Close()
+		}
+	}()
+
+	// Insert event whose Row carries the generated column's value —
+	// what the binlog row event emits for a STORED column. Without
+	// the fix this would fail with MySQL Error 3105. With the fix the
+	// column is filtered out and MySQL recomputes margin itself.
+	pumpChanges(t, ctx, applier, []ir.Change{
+		ir.Insert{
+			Schema: "target_db", Table: "products",
+			Row: ir.Row{"id": uint64(1), "price": "9.99", "cost": "4.50", "margin": "5.49"},
+		},
+	})
+
+	got := selectProductMargin(t, dsn, 1)
+	if got != "5.49" {
+		t.Errorf("after insert: margin = %q; want %q (MySQL-computed)", got, "5.49")
+	}
+
+	// Update changes price; MySQL should recompute margin.
+	pumpChanges(t, ctx, applier, []ir.Change{
+		ir.Update{
+			Schema: "target_db", Table: "products",
+			Before: ir.Row{"id": uint64(1), "price": "9.99", "cost": "4.50", "margin": "5.49"},
+			After:  ir.Row{"id": uint64(1), "price": "12.99", "cost": "4.50", "margin": "8.49"},
+		},
+	})
+	got = selectProductMargin(t, dsn, 1)
+	if got != "8.49" {
+		t.Errorf("after update: margin = %q; want %q (MySQL-recomputed from new price)", got, "8.49")
+	}
+
+	// Delete using a Before image that includes the generated
+	// column's value. WHERE must filter it out — including it risks
+	// silent zero-rows-affected when the target's recomputation
+	// differs from the source's stored value.
+	pumpChanges(t, ctx, applier, []ir.Change{
+		ir.Delete{
+			Schema: "target_db", Table: "products",
+			Before: ir.Row{"id": uint64(1), "price": "12.99", "cost": "4.50", "margin": "8.49"},
+		},
+	})
+	if got := countAllRows(t, dsn, "target_db", "products"); got != 0 {
+		t.Errorf("after delete: rows = %d; want 0", got)
+	}
+}
+
+// selectProductMargin reads the `margin` column for a single row.
+// Returns the textual DECIMAL representation so test assertions can
+// match exactly without floating-point rounding.
+func selectProductMargin(t *testing.T, dsn string, id int64) string {
+	t.Helper()
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	var margin string
+	if err := db.QueryRowContext(ctx, "SELECT margin FROM products WHERE id = ?", id).Scan(&margin); err != nil {
+		t.Fatalf("select margin: %v", err)
+	}
+	return margin
+}
+
 // selectJSONByID reads docs.data for the row with the given id and
 // returns it as a string. Used by TestChangeApplier_JSONColumn to
 // assert that the destination JSON document matches expectations.

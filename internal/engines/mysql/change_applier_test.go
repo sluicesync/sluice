@@ -326,3 +326,64 @@ func TestApplierSchema(t *testing.T) {
 		t.Errorf("empty default falls back to change schema: got %q; want source_db", got)
 	}
 }
+
+// TestBuildSQL_FiltersGeneratedColumns covers the GitHub issue #12 fix:
+// the CDC apply path must exclude STORED generated columns from
+// INSERT column lists, UPDATE SET clauses, and UPDATE/DELETE WHERE
+// predicates. MySQL refuses non-DEFAULT values on generated columns
+// with Error 3105 ("The value specified for generated column ... is
+// not allowed"); a CDC INSERT that includes the generated column's
+// value would fail the whole batch.
+//
+// Mirrors the existing nonGeneratedColumns filter used by the LOAD
+// DATA path (ADR-0026:100).
+func TestBuildSQL_FiltersGeneratedColumns(t *testing.T) {
+	colTypes := map[string]*ir.Column{
+		"id":     {Name: "id", Type: ir.Integer{Width: 64}},
+		"price":  {Name: "price", Type: ir.Decimal{Precision: 12, Scale: 2}},
+		"cost":   {Name: "cost", Type: ir.Decimal{Precision: 12, Scale: 2}},
+		"margin": {Name: "margin", Type: ir.Decimal{Precision: 12, Scale: 2}, GeneratedExpr: "price - COALESCE(cost, 0)", GeneratedStored: true},
+	}
+
+	t.Run("INSERT excludes generated column from column list and ON DUPLICATE KEY UPDATE SET", func(t *testing.T) {
+		row := ir.Row{"id": int64(1), "price": "9.99", "cost": "4.50", "margin": "5.49"}
+		gotSQL, gotArgs := buildInsertSQL("src", "products", row, []string{"id"}, colTypes)
+		wantSQL := "INSERT INTO `src`.`products` (`cost`, `id`, `price`) VALUES (?, ?, ?) AS new ON DUPLICATE KEY UPDATE `cost` = new.`cost`, `price` = new.`price`"
+		if gotSQL != wantSQL {
+			t.Errorf("\n got SQL: %q\nwant SQL: %q", gotSQL, wantSQL)
+		}
+		// Sorted non-generated columns: cost, id, price.
+		wantArgs := []any{"4.50", int64(1), "9.99"}
+		if !reflect.DeepEqual(gotArgs, wantArgs) {
+			t.Errorf("\n got args: %#v\nwant args: %#v", gotArgs, wantArgs)
+		}
+	})
+
+	t.Run("UPDATE SET excludes generated column", func(t *testing.T) {
+		before := ir.Row{"id": int64(1), "price": "9.99", "cost": "4.50", "margin": "5.49"}
+		after := ir.Row{"id": int64(1), "price": "12.99", "cost": "4.50", "margin": "8.49"}
+		gotSQL, _ := buildUpdateSQL("src", "products", before, after, colTypes)
+		// SET excludes margin; WHERE also excludes margin.
+		wantSQL := "UPDATE `src`.`products` SET `cost` = ?, `id` = ?, `price` = ? WHERE `cost` = ? AND `id` = ? AND `price` = ?"
+		if gotSQL != wantSQL {
+			t.Errorf("\n got SQL: %q\nwant SQL: %q", gotSQL, wantSQL)
+		}
+	})
+
+	t.Run("DELETE WHERE excludes generated column", func(t *testing.T) {
+		before := ir.Row{"id": int64(1), "price": "9.99", "cost": "4.50", "margin": "5.49"}
+		gotSQL, _ := buildDeleteSQL("src", "products", before, colTypes)
+		wantSQL := "DELETE FROM `src`.`products` WHERE `cost` = ? AND `id` = ? AND `price` = ?"
+		if gotSQL != wantSQL {
+			t.Errorf("\n got SQL: %q\nwant SQL: %q", gotSQL, wantSQL)
+		}
+	})
+
+	t.Run("nil colTypes: every column passes through (pre-fix shape)", func(t *testing.T) {
+		row := ir.Row{"id": int64(1), "margin": "5.49"}
+		gotSQL, _ := buildInsertSQL("src", "products", row, []string{"id"}, nil)
+		if !strings.Contains(gotSQL, "`margin`") {
+			t.Errorf("with nil colTypes the generated-column filter should not engage; got %q", gotSQL)
+		}
+	})
+}

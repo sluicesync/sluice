@@ -6,6 +6,37 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.40.0]
+
+**Closes GitHub issue #12 — CDC apply path now filters generated columns.** A source table with a `STORED` generated column previously caused the applier to include the generated column's value in every INSERT (and the SET-list of `ON DUPLICATE KEY UPDATE` / `ON CONFLICT DO UPDATE`, and the WHERE predicate of UPDATE/DELETE). MySQL rejected the INSERT with Error 3105 ("The value specified for generated column ... is not allowed"); PostgreSQL rejected with SQLSTATE 428C9 ("cannot insert a non-DEFAULT value into column"). The first CDC batch hitting an affected table exited the entire `sluice sync start` process. The fix mirrors the bulk-load writer's existing column-list filter (ADR-0026:100) on the apply side.
+
+### Fixed
+
+- **`internal/engines/mysql/change_applier.go`** — `buildInsertSQL`, `buildSetClause`, `buildWhereClause` now route their column lists through a new `nonGeneratedRowKeys` helper that consults the applier's cached column-type map and skips any column whose `Column.GeneratedExpr` is non-empty. The downstream `ON DUPLICATE KEY UPDATE` SET-list (derived from the same column list) is automatically filtered too.
+- **`internal/engines/postgres/change_applier.go`** — same fix on the PG side, with the additional plumbing required because PG's `colTypes` cache is `map[string]ir.Type` (no `GeneratedExpr` field on `ir.Type`). Introduced a parallel `generatedColCache map[string]map[string]bool`, populated alongside `colTypeCache` by an extended `loadColumnTypes` query that reads `information_schema.columns.is_generated`. The `buildInsertSQL` / `buildUpdateSQL` / `buildDeleteSQL` / `buildSetClause` / `buildWhereClause` builders gained a `generated map[string]bool` parameter and skip flagged columns from every SQL position.
+- **WHERE-clause filter rationale.** Including a `STORED` generated column in WHERE (UPDATE/DELETE) risks silent zero-rows-affected when the target's recomputation differs from the source's stored value (floating-point precision, NULL-coalescing semantics across engines, etc.). The PK + remaining-column equality is sufficient to identify the row; skipping generated columns from WHERE removes a class of silent divergence the applier's pre-fix shape exposed.
+
+### Migration / Compatibility
+
+- **Drop-in upgrade from v0.39.x.** No CLI changes, no IR changes, no engine-interface changes, no operator-visible behaviour change for source schemas without generated columns. Operators on the prior `sluice sync start` failure path (any continuous-sync stream against a source table with a `STORED` generated column) need to restart the stream — warm-resume continues from the persisted source position; no data is replayed.
+- **Caveat for source data drift.** Pre-fix, if a generated column's computed value diverged between source and target at any point (e.g. operator manually re-ran the source's `GENERATED` expression with a different precision), the WHERE-clause filter now means an UPDATE/DELETE will no longer fail silently — it'll apply against the row whose non-generated columns match. This is strictly safer; the silent-fail mode was the bug.
+- **Driver compatibility**: the new SELECT against `information_schema.columns.is_generated` works against PG 12+ unchanged. On older PG versions the column returns `'NEVER'` for every row — applier behaves exactly as pre-fix.
+
+### Who needs this release
+
+- **Anyone running `sluice sync start` against a source table with a `STORED` generated column** on any target engine (PostgreSQL, vanilla MySQL, PlanetScale-MySQL): **upgrade immediately**. The bug was 100%-reproducible: the first CDC INSERT after cold-start exited the stream.
+- **Operators not using generated columns**: drop-in; no behaviour change.
+- **Operators on cross-engine MySQL → PG migrations**: schema translation of generated columns already worked (the bulk-load path was correct); this release closes the CDC apply gap that previously made the columns continuous-sync-incompatible.
+
+### Verification surface
+
+- **New unit tests** in `internal/engines/mysql/change_applier_test.go` and `internal/engines/postgres/change_applier_test.go` (`TestBuildSQL_FiltersGeneratedColumns`): exercises INSERT / UPDATE SET / UPDATE WHERE / DELETE WHERE filter behaviour, plus the `nil colTypes` / `nil generated` fall-through that preserves the pre-fix shape for unit tests using hand-built fixtures.
+- **New integration tests** in `internal/engines/{mysql,postgres}/change_applier_integration_test.go` (`TestChangeApplier_GeneratedColumn`): boots a testcontainer, creates a table with `margin DECIMAL(12,2) AS (price - COALESCE(cost, 0)) STORED`, drives Insert + Update + Delete CDC events whose Row maps include the generated column's value, and asserts (a) the apply succeeds and (b) the target's computed margin matches the engine-computed value (not the source-emitted one).
+
+### Design — applier retry on transient errors (ADR-0038, awaiting review)
+
+This release also drafts [ADR-0038](docs/adr/adr-0038-applier-retry-on-transient-errors.md), a proposal for bounded retry-on-transient in the applier dispatch loop — the design response to GitHub issue #13 (PlanetScale-MySQL Vitess tx-killer errors exit the stream non-zero today). The ADR is `Proposed`; implementation lands in a follow-on release (v0.40.x or v0.41.0) after operator review.
+
 ## [0.39.1]
 
 **Closes silent golangci-lint debt + adds the missing local pre-commit gate.** CI's `Lint` job has been failing silently on `main` since v0.34.0 across 6 consecutive releases (v0.34.0 → v0.39.0 inclusive). Root cause: the local pre-commit script ran `gofumpt + go vet + go test` but NOT `golangci-lint`, so lint-only failures (unused symbols, `revive`'s unused-parameter rule, etc.) passed the local gate and only surfaced in CI — where the watcher logic was only gating on the Release workflow's conclusion, not the parallel Lint job's. The four issues were all in v0.34.0 KMS code I added forward-looking-but-never-wired-up helpers for.

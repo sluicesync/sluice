@@ -362,6 +362,115 @@ func TestChangeApplier_JSONColumn(t *testing.T) {
 	}
 }
 
+// TestChangeApplier_GeneratedColumn is the GitHub issue #12 regression
+// guard. A table with a STORED generated column previously caused the
+// CDC apply path to emit the generated column's value in the INSERT
+// statement, which PG rejected with SQLSTATE 428C9 ("cannot insert
+// a non-DEFAULT value into column 'margin'"). The fix filters
+// generated columns out of the apply path's column lists / SET /
+// WHERE — mirroring the bulk-load writer's existing filter
+// (ADR-0026:100).
+//
+// The test sends Insert + Update events whose Row maps include the
+// generated column's value (matching what the PG CDC reader's
+// pgoutput decoder emits for a STORED column). Without the fix, the
+// applier issues an INSERT with `margin` in the column list and PG
+// returns 428C9; with the fix, the INSERT omits `margin` and PG
+// recomputes it on its side. The assertion proves the destination's
+// `margin` matches what PG would compute, not what the source sent.
+func TestChangeApplier_GeneratedColumn(t *testing.T) {
+	dsn, cleanup := startPostgresForApplier(t)
+	defer cleanup()
+
+	applyPGApplier(t, dsn, `
+		CREATE TABLE products (
+			id     BIGINT         PRIMARY KEY,
+			price  NUMERIC(12,2)  NOT NULL,
+			cost   NUMERIC(12,2),
+			margin NUMERIC(12,2)  GENERATED ALWAYS AS (price - COALESCE(cost, 0)) STORED
+		);
+	`)
+
+	eng := Engine{}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	applier, err := eng.OpenChangeApplier(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenChangeApplier: %v", err)
+	}
+	defer func() {
+		if c, ok := applier.(interface{ Close() error }); ok {
+			_ = c.Close()
+		}
+	}()
+
+	// Insert event whose Row carries the generated column's value
+	// (what the pgoutput decoder produces). Without the fix this
+	// would fail with PG SQLSTATE 428C9 — the test would fail in
+	// Apply, not in the assertion. With the fix the column is
+	// filtered out and PG computes margin itself.
+	pumpChanges(t, ctx, applier, []ir.Change{
+		ir.Insert{
+			Schema: "public", Table: "products",
+			Row: ir.Row{"id": int64(1), "price": "9.99", "cost": "4.50", "margin": "5.49"},
+		},
+	})
+
+	got := selectProductMargin(t, dsn, 1)
+	if got != "5.49" {
+		t.Errorf("after insert: margin = %q; want %q (PG-computed)", got, "5.49")
+	}
+
+	// Update changes price; PG should recompute margin.
+	pumpChanges(t, ctx, applier, []ir.Change{
+		ir.Update{
+			Schema: "public", Table: "products",
+			Before: ir.Row{"id": int64(1), "price": "9.99", "cost": "4.50", "margin": "5.49"},
+			After:  ir.Row{"id": int64(1), "price": "12.99", "cost": "4.50", "margin": "8.49"},
+		},
+	})
+	got = selectProductMargin(t, dsn, 1)
+	if got != "8.49" {
+		t.Errorf("after update: margin = %q; want %q (PG-recomputed from new price)", got, "8.49")
+	}
+
+	// Delete using a Before image that includes the generated
+	// column's value. WHERE must filter it out — including it
+	// risks silent zero-rows-affected when the target's
+	// recomputation differs from the source's stored value.
+	pumpChanges(t, ctx, applier, []ir.Change{
+		ir.Delete{
+			Schema: "public", Table: "products",
+			Before: ir.Row{"id": int64(1), "price": "12.99", "cost": "4.50", "margin": "8.49"},
+		},
+	})
+	if got := countAllRows(t, dsn, "products"); got != 0 {
+		t.Errorf("after delete: rows = %d; want 0", got)
+	}
+}
+
+// selectProductMargin reads the `margin` column for a single row.
+// Returns the textual NUMERIC representation so test assertions can
+// match exactly without floating-point rounding.
+func selectProductMargin(t *testing.T, dsn string, id int64) string {
+	t.Helper()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	var margin string
+	if err := db.QueryRowContext(ctx, `SELECT margin::text FROM products WHERE id = $1`, id).Scan(&margin); err != nil {
+		t.Fatalf("select margin: %v", err)
+	}
+	return margin
+}
+
 // selectJSONByID reads docs.data for the row with the given id.
 func selectJSONByID(t *testing.T, dsn string, id int64) string {
 	t.Helper()

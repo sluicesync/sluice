@@ -88,7 +88,7 @@ func TestBuildInsertSQL(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			gotSQL, gotArgs, err := buildInsertSQL(c.schema, c.table, c.row, c.pk, nil)
+			gotSQL, gotArgs, err := buildInsertSQL(c.schema, c.table, c.row, c.pk, nil, nil)
 			if err != nil {
 				t.Fatalf("buildInsertSQL: %v", err)
 			}
@@ -106,7 +106,7 @@ func TestBuildUpdateSQL(t *testing.T) {
 	before := ir.Row{"id": int64(7), "email": "old@example.com"}
 	after := ir.Row{"id": int64(7), "email": "new@example.com", "active": false}
 
-	gotSQL, gotArgs, err := buildUpdateSQL("public", "users", before, after, nil)
+	gotSQL, gotArgs, err := buildUpdateSQL("public", "users", before, after, nil, nil)
 	if err != nil {
 		t.Fatalf("buildUpdateSQL: %v", err)
 	}
@@ -123,7 +123,7 @@ func TestBuildUpdateSQL(t *testing.T) {
 
 func TestBuildDeleteSQL(t *testing.T) {
 	before := ir.Row{"id": int64(7), "email": "alice@example.com"}
-	gotSQL, gotArgs, err := buildDeleteSQL("public", "users", before, nil)
+	gotSQL, gotArgs, err := buildDeleteSQL("public", "users", before, nil, nil)
 	if err != nil {
 		t.Fatalf("buildDeleteSQL: %v", err)
 	}
@@ -154,7 +154,7 @@ func TestBuildWhereClause_NullHandling(t *testing.T) {
 		"email": nil, // NULL — must produce IS NULL, not = $N
 		"name":  "alice",
 	}
-	gotSQL, gotArgs, err := buildWhereClause(row, 1, nil)
+	gotSQL, gotArgs, err := buildWhereClause(row, 1, nil, nil)
 	if err != nil {
 		t.Fatalf("buildWhereClause: %v", err)
 	}
@@ -174,7 +174,7 @@ func TestBuildWhereClause_NullHandling(t *testing.T) {
 // honoured — UPDATE SET + WHERE share a numbering sequence.
 func TestBuildWhereClause_StartIdx(t *testing.T) {
 	row := ir.Row{"id": int64(1)}
-	gotSQL, _, err := buildWhereClause(row, 5, nil)
+	gotSQL, _, err := buildWhereClause(row, 5, nil, nil)
 	if err != nil {
 		t.Fatalf("buildWhereClause: %v", err)
 	}
@@ -186,7 +186,7 @@ func TestBuildWhereClause_StartIdx(t *testing.T) {
 
 func TestBuildSetClause(t *testing.T) {
 	row := ir.Row{"a": int64(1), "b": "x"}
-	gotSQL, gotArgs, err := buildSetClause(row, 1, nil)
+	gotSQL, gotArgs, err := buildSetClause(row, 1, nil, nil)
 	if err != nil {
 		t.Fatalf("buildSetClause: %v", err)
 	}
@@ -217,7 +217,7 @@ func TestBuildInsertSQL_RoutesThroughPrepareValue(t *testing.T) {
 		"tags": ir.Array{Element: ir.Text{Size: ir.TextLong}},
 	}
 
-	_, gotArgs, err := buildInsertSQL("public", "docs", row, []string{"id"}, colTypes)
+	_, gotArgs, err := buildInsertSQL("public", "docs", row, []string{"id"}, colTypes, nil)
 	if err != nil {
 		t.Fatalf("buildInsertSQL: %v", err)
 	}
@@ -243,7 +243,7 @@ func TestBuildWhereClause_RoutesThroughPrepareValue(t *testing.T) {
 		"tags": ir.Array{Element: ir.Text{Size: ir.TextLong}},
 	}
 
-	_, gotArgs, err := buildWhereClause(before, 1, colTypes)
+	_, gotArgs, err := buildWhereClause(before, 1, colTypes, nil)
 	if err != nil {
 		t.Fatalf("buildWhereClause: %v", err)
 	}
@@ -316,4 +316,70 @@ func TestApplierSchema(t *testing.T) {
 	if got := applierSchema("", "myschema"); got != "myschema" {
 		t.Errorf("empty default falls back to change schema: got %q; want myschema", got)
 	}
+}
+
+// TestBuildSQL_FiltersGeneratedColumns covers the GitHub issue #12 fix
+// on the PG side: the CDC apply path must exclude GENERATED ALWAYS AS
+// (...) STORED columns from INSERT column lists, UPDATE SET clauses,
+// and UPDATE/DELETE WHERE predicates. PG rejects non-DEFAULT values
+// on generated columns with SQLSTATE 428C9 ("cannot insert a
+// non-DEFAULT value into column"); a CDC INSERT that includes the
+// generated column's value would fail the whole batch.
+func TestBuildSQL_FiltersGeneratedColumns(t *testing.T) {
+	colTypes := map[string]ir.Type{
+		"id":     ir.Integer{Width: 64},
+		"price":  ir.Decimal{Precision: 12, Scale: 2},
+		"cost":   ir.Decimal{Precision: 12, Scale: 2},
+		"margin": ir.Decimal{Precision: 12, Scale: 2},
+	}
+	generated := map[string]bool{"margin": true}
+
+	t.Run("INSERT excludes generated column from column list and ON CONFLICT DO UPDATE SET", func(t *testing.T) {
+		row := ir.Row{"id": int64(1), "price": "9.99", "cost": "4.50", "margin": "5.49"}
+		gotSQL, _, err := buildInsertSQL("public", "products", row, []string{"id"}, colTypes, generated)
+		if err != nil {
+			t.Fatalf("buildInsertSQL: %v", err)
+		}
+		// Sorted non-generated columns: cost, id, price.
+		wantSQL := `INSERT INTO "public"."products" ("cost", "id", "price") VALUES ($1, $2, $3) ON CONFLICT ("id") DO UPDATE SET "cost" = EXCLUDED."cost", "price" = EXCLUDED."price"`
+		if gotSQL != wantSQL {
+			t.Errorf("\n got SQL: %q\nwant SQL: %q", gotSQL, wantSQL)
+		}
+	})
+
+	t.Run("UPDATE SET and WHERE both exclude generated column", func(t *testing.T) {
+		before := ir.Row{"id": int64(1), "price": "9.99", "cost": "4.50", "margin": "5.49"}
+		after := ir.Row{"id": int64(1), "price": "12.99", "cost": "4.50", "margin": "8.49"}
+		gotSQL, _, err := buildUpdateSQL("public", "products", before, after, colTypes, generated)
+		if err != nil {
+			t.Fatalf("buildUpdateSQL: %v", err)
+		}
+		wantSQL := `UPDATE "public"."products" SET "cost" = $1, "id" = $2, "price" = $3 WHERE "cost" = $4 AND "id" = $5 AND "price" = $6`
+		if gotSQL != wantSQL {
+			t.Errorf("\n got SQL: %q\nwant SQL: %q", gotSQL, wantSQL)
+		}
+	})
+
+	t.Run("DELETE WHERE excludes generated column", func(t *testing.T) {
+		before := ir.Row{"id": int64(1), "price": "9.99", "cost": "4.50", "margin": "5.49"}
+		gotSQL, _, err := buildDeleteSQL("public", "products", before, colTypes, generated)
+		if err != nil {
+			t.Fatalf("buildDeleteSQL: %v", err)
+		}
+		wantSQL := `DELETE FROM "public"."products" WHERE "cost" = $1 AND "id" = $2 AND "price" = $3`
+		if gotSQL != wantSQL {
+			t.Errorf("\n got SQL: %q\nwant SQL: %q", gotSQL, wantSQL)
+		}
+	})
+
+	t.Run("nil generated map: every column passes through (pre-fix shape)", func(t *testing.T) {
+		row := ir.Row{"id": int64(1), "margin": "5.49"}
+		gotSQL, _, err := buildInsertSQL("public", "products", row, []string{"id"}, colTypes, nil)
+		if err != nil {
+			t.Fatalf("buildInsertSQL: %v", err)
+		}
+		if !strings.Contains(gotSQL, `"margin"`) {
+			t.Errorf("with nil generated map the filter should not engage; got %q", gotSQL)
+		}
+	})
 }
