@@ -392,7 +392,7 @@ func (m *Migrator) Run(ctx context.Context) error {
 			// contains data. See preflight.go for the rationale (Bug 9).
 			// Skipped on --resume (TableProgress drives that path) and
 			// on --force-cold-start (explicit operator override).
-			if err := preflightColdStart(ctx, schema, rw, m.ForceColdStart); err != nil {
+			if err := preflightColdStart(ctx, schema, rw, m.ForceColdStart, preflightModeMigrate); err != nil {
 				return markFailed(ctx, rc, state, ir.MigrationPhasePending, err)
 			}
 		}

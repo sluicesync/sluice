@@ -44,7 +44,7 @@ func TestPreflightColdStart_AllEmpty(t *testing.T) {
 		},
 	}
 	rw := &stubEmptyChecker{empty: map[string]bool{"users": true, "orders": true, "comments": true}}
-	if err := preflightColdStart(context.Background(), schema, rw, false); err != nil {
+	if err := preflightColdStart(context.Background(), schema, rw, false, preflightModeMigrate); err != nil {
 		t.Errorf("expected nil; got %v", err)
 	}
 	if len(rw.calls) != 3 {
@@ -63,7 +63,7 @@ func TestPreflightColdStart_PopulatedTableRefuses(t *testing.T) {
 		},
 	}
 	rw := &stubEmptyChecker{empty: map[string]bool{"users": true, "comments": false}}
-	err := preflightColdStart(context.Background(), schema, rw, false)
+	err := preflightColdStart(context.Background(), schema, rw, false, preflightModeMigrate)
 	if err == nil {
 		t.Fatal("expected error; got nil")
 	}
@@ -82,6 +82,31 @@ func TestPreflightColdStart_PopulatedTableRefuses(t *testing.T) {
 	}
 }
 
+// TestPreflightColdStart_SyncModeHint verifies the streamer-mode
+// recovery message names the GitHub #15 wedge shape and recommends
+// `--reset-target-data` over the migrate-mode `--resume` path. The
+// migrate-mode `--resume` hint would be misleading for a sync wedge
+// because `sluice migrate --resume` is a different code path and
+// doesn't apply to continuous-sync flows.
+func TestPreflightColdStart_SyncModeHint(t *testing.T) {
+	schema := &ir.Schema{Tables: []*ir.Table{{Name: "events"}}}
+	rw := &stubEmptyChecker{empty: map[string]bool{"events": false}}
+	err := preflightColdStart(context.Background(), schema, rw, false, preflightModeSync)
+	if err == nil {
+		t.Fatal("expected error; got nil")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "--reset-target-data") {
+		t.Errorf("sync-mode hint should recommend --reset-target-data; got %q", msg)
+	}
+	if !strings.Contains(msg, "#15") {
+		t.Errorf("sync-mode hint should reference GitHub #15 to give operators a search anchor; got %q", msg)
+	}
+	if strings.Contains(msg, "sluice migrate") {
+		t.Errorf("sync-mode hint should NOT point at `sluice migrate --resume`; that's the migrate-mode hint and confuses operators in sync flows; got %q", msg)
+	}
+}
+
 // TestPreflightColdStart_ForceSkips verifies --force-cold-start
 // bypasses the check entirely (no probes, no error).
 func TestPreflightColdStart_ForceSkips(t *testing.T) {
@@ -90,7 +115,7 @@ func TestPreflightColdStart_ForceSkips(t *testing.T) {
 		Tables: []*ir.Table{{Name: "anything"}},
 	}
 	rw := &stubEmptyChecker{empty: map[string]bool{"anything": false}}
-	if err := preflightColdStart(context.Background(), schema, rw, true); err != nil {
+	if err := preflightColdStart(context.Background(), schema, rw, true, preflightModeMigrate); err != nil {
 		t.Errorf("force=true should skip probe; got %v", err)
 	}
 	if len(rw.calls) != 0 {
@@ -106,7 +131,7 @@ func TestPreflightColdStart_ProbeErrorPropagates(t *testing.T) {
 	schema := &ir.Schema{Tables: []*ir.Table{{Name: "users"}}}
 	probe := errors.New("connection reset")
 	rw := &stubEmptyChecker{probeErr: probe}
-	err := preflightColdStart(context.Background(), schema, rw, false)
+	err := preflightColdStart(context.Background(), schema, rw, false, preflightModeMigrate)
 	if err == nil {
 		t.Fatal("expected error; got nil")
 	}
@@ -130,7 +155,7 @@ func (stubWriterNoChecker) WriteRows(_ context.Context, _ *ir.Table, _ <-chan ir
 // missing surface != error.
 func TestPreflightColdStart_NoCheckerSurfaceSkips(t *testing.T) {
 	schema := &ir.Schema{Tables: []*ir.Table{{Name: "users"}}}
-	if err := preflightColdStart(context.Background(), schema, stubWriterNoChecker{}, false); err != nil {
+	if err := preflightColdStart(context.Background(), schema, stubWriterNoChecker{}, false, preflightModeMigrate); err != nil {
 		t.Errorf("expected nil; got %v", err)
 	}
 }

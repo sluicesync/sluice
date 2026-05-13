@@ -1075,7 +1075,7 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 		// Streamer's cold-start branch is the analogue of Migrator's
 		// non-resume cold-start path; warm-resume doesn't run bulk-copy
 		// and is therefore not gated by this check.
-		if err := preflightColdStart(ctx, schema, rw, s.ForceColdStart); err != nil {
+		if err := preflightColdStart(ctx, schema, rw, s.ForceColdStart, preflightModeSync); err != nil {
 			closeIf(rw)
 			closeIf(sw)
 			_ = stream.Close()
@@ -1104,6 +1104,46 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 		)
 	}
 	slog.InfoContext(ctx, "bulk-copy complete; entering CDC mode")
+
+	// GitHub issue #15: persist the snapshot's anchor position on the
+	// target BEFORE the first CDC batch lands. Without this write, the
+	// cdc-state row stays absent through the entire window between
+	// "entering CDC mode" and the first successful batch commit. A
+	// crash, transient applier failure, or operator interrupt in that
+	// window wedges the operator: warm-resume can't recover (no row),
+	// and cold-start refuses (target tables already populated). The
+	// only escape is `--reset-target-data` which re-runs the whole
+	// bulk-copy.
+	//
+	// The position written here is the snapshot's anchor — the same
+	// position StreamChanges resumes from on the next call. CDC from
+	// this position is gapless and idempotent (ADR-0007, ADR-0010), so
+	// a restart that reads this row and warm-resumes is correct: it
+	// re-opens the slot at the same anchor and replays the same change
+	// stream the failed run would have processed.
+	//
+	// Idempotent: this row is later overwritten by the first
+	// applier.commitBatch — same row shape, monotonic position, same
+	// (streamID, source_fingerprint, target_schema) tuple, so the
+	// applier's writePositionTx absorbs the duplicate without conflict.
+	if pw, ok := applier.(ir.PositionWriter); ok {
+		if err := pw.WritePosition(ctx, streamID, stream.Position); err != nil {
+			_ = stream.Close()
+			return nil, wrapWithHint(PhaseCDC, fmt.Errorf("pipeline: persist cold-start CDC anchor position: %w", err))
+		}
+		slog.DebugContext(ctx, "cold-start CDC anchor persisted",
+			slog.String("stream_id", streamID),
+			slog.String("position_token", stream.Position.Token),
+		)
+	} else {
+		// Shipping engines all implement PositionWriter; an engine
+		// that doesn't would have shipped with the issue #15 wedge,
+		// but the fall-through preserves pre-fix behaviour rather than
+		// hard-erroring.
+		slog.WarnContext(ctx, "applier does not implement ir.PositionWriter; cold-start CDC anchor cannot be persisted — GitHub issue #15 wedge risk",
+			slog.String("stream_id", streamID),
+		)
+	}
 
 	if lsnTracker != nil {
 		if attacher, ok := stream.Changes.(lsnTrackerAttacher); ok {

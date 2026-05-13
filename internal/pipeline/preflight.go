@@ -53,6 +53,26 @@ import (
 // errors.Is to assert on it without coupling to the message text.
 var errColdStartRefused = errors.New("pipeline: cold-start refused")
 
+// preflightMode selects which recovery hint to emit on a cold-start
+// refusal. The migrator and the streamer hit different failure modes
+// upstream of the refusal:
+//
+//   - Migrator (one-shot) only fails mid-bulk-copy; recovery is via
+//     `--resume` on `sluice migrate` (per-table truncate-and-redo,
+//     ADR-0015 / ADR-0018) or by dropping the partial dest tables.
+//   - Streamer (sync) can fail either mid-bulk-copy OR
+//     post-bulk-copy-pre-first-CDC-apply (GitHub issue #15). v0.40.1
+//     closed the latter wedge on the happy path by persisting the
+//     cdc-state row at the cold-start → CDC-mode boundary, but stale
+//     wedge-state from an earlier-version run is still recoverable —
+//     the streamer's hint guides the operator at `--reset-target-data`.
+type preflightMode int
+
+const (
+	preflightModeMigrate preflightMode = iota
+	preflightModeSync
+)
+
 // preflightColdStart probes every table in the schema for pre-
 // existing rows on the target. Returns nil if every table is empty
 // (or the writer doesn't expose [ir.TableEmptyChecker], in which
@@ -71,7 +91,13 @@ var errColdStartRefused = errors.New("pipeline: cold-start refused")
 // Cost: one round-trip per source table. On a 200-table migration
 // that's ~200 cheap queries before bulk-copy starts; on the typical
 // failure mode the first non-empty table errors out in milliseconds.
-func preflightColdStart(ctx context.Context, schema *ir.Schema, rw ir.RowWriter, force bool) error {
+//
+// `mode` selects the recovery hint — migrate-mode reaches here only
+// via the bulk-copy phase failing mid-table; sync-mode can also reach
+// here from a v0.40.0-or-earlier wedge where bulk-copy completed but
+// the first CDC apply failed before a cdc-state row was written
+// (GitHub issue #15).
+func preflightColdStart(ctx context.Context, schema *ir.Schema, rw ir.RowWriter, force bool, mode preflightMode) error {
 	if force {
 		slog.InfoContext(ctx, "cold-start pre-flight skipped: --force-cold-start set")
 		return nil
@@ -90,9 +116,43 @@ func preflightColdStart(ctx context.Context, schema *ir.Schema, rw ir.RowWriter,
 		}
 		if !empty {
 			return wrapWithHint(PhaseSchemaApply, fmt.Errorf(
-				"%w: target table %q already contains data — this usually means a previous cold-start was killed mid-bulk-copy. To recover: (1) drop the partial dest tables (or use `--resume` on `sluice migrate`), (2) drop the source-side replication slot via `sluice slot drop`, (3) re-run the cold-start. Pass --force-cold-start to bulk-copy into the populated table anyway (use with caution — INSERT into a non-empty table will collide on PRIMARY KEY)",
-				errColdStartRefused, table.Name))
+				"%w: target table %q already contains data — %s",
+				errColdStartRefused, table.Name, recoveryHintFor(mode)))
 		}
 	}
 	return nil
+}
+
+// recoveryHintFor returns the operator-facing recovery text for a
+// cold-start refusal. The two modes deliberately differ: a migrate
+// failure means "bulk-copy died mid-table; redrive via --resume or
+// re-cold-start"; a sync failure adds the GitHub #15 wedge as a
+// possibility, where bulk-copy completed cleanly but the first CDC
+// apply failed before any cdc-state row was persisted.
+func recoveryHintFor(mode preflightMode) string {
+	switch mode {
+	case preflightModeSync:
+		// Sync-mode covers two upstream failure shapes:
+		//   (1) bulk-copy died mid-table (same as migrate)
+		//   (2) bulk-copy completed but first CDC apply failed
+		//       before a cdc-state row was written (issue #15
+		//       wedge, fixed in v0.40.1 for new runs; stale state
+		//       from older versions still surfaces this error)
+		// Both recover via --reset-target-data. The slot-drop step
+		// applies to PG sources only (Vitess / MySQL don't expose
+		// it as a separate concept).
+		return "no cdc-state row exists for this stream, so warm-resume isn't possible either. " +
+			"Likely state after a previous sync cold-start exited before persisting a CDC position — either " +
+			"mid-bulk-copy or post-bulk-copy-pre-first-CDC-apply (GitHub #15, fixed in v0.40.1 for new runs). " +
+			"To recover: (a) re-run with `--reset-target-data --yes` to wipe the target tables and any stale " +
+			"cdc-state row [preferred]; (b) manually `DROP TABLE` the affected target tables (and on PG sources, " +
+			"drop the source slot via `sluice slot drop`), then re-run; (c) pass `--force-cold-start` to bulk-copy " +
+			"into the populated table anyway (will collide on PRIMARY KEY in most cases — use with extreme caution)"
+	default: // preflightModeMigrate
+		return "this usually means a previous cold-start was killed mid-bulk-copy. " +
+			"To recover: (1) drop the partial dest tables (or use `--resume` on `sluice migrate`), " +
+			"(2) drop the source-side replication slot via `sluice slot drop` (PG sources only), " +
+			"(3) re-run the cold-start. Pass --force-cold-start to bulk-copy into the populated " +
+			"table anyway (use with caution — INSERT into a non-empty table will collide on PRIMARY KEY)"
+	}
 }

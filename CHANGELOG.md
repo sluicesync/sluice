@@ -6,6 +6,34 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.40.1]
+
+**Closes GitHub issue #15 — `sluice sync start` cold-start now persists the CDC anchor before the first batch.** Before v0.40.1, `sluice_cdc_state` only gained a row when the first CDC batch committed successfully. Any failure in the window between "bulk-copy complete; entering CDC mode" and that first batch commit (most commonly: a transient Vitess error per GitHub issue #13) wedged the operator — warm-resume couldn't recover (no persisted position), cold-start refused (target tables held the freshly-bulk-copied data), and the only escape was `--reset-target-data --yes` (re-bulk-copying everything) or `--force-cold-start` (collides on PK).
+
+### Fixed
+
+- **`internal/pipeline/streamer.go::coldStart`** — after the "bulk-copy complete; entering CDC mode" log line and before `StreamChanges`, the streamer now calls `applier.WritePosition(ctx, streamID, stream.Position)` with the snapshot's anchor. CDC from this position is gapless (the snapshot anchor and the CDC start position are the same — that's the ADR-0007 contract), so a restart that reads this row warm-resumes correctly and replays the same change stream the failed run would have processed. Idempotent: the first applier.commitBatch overwrites the same row with a monotonically-newer position, so no double-write contention.
+- **`internal/pipeline/preflight.go` — mode-aware recovery hint.** The cold-start refusal message previously assumed all hits came from migrate-mode (one-shot `sluice migrate`), recommending `--resume on sluice migrate` even when the operator reached the refusal through `sluice sync start`. The function now takes a `preflightMode` and emits a tailored hint:
+  - Migrate mode: unchanged ("previous cold-start killed mid-bulk-copy → drop tables or `--resume`")
+  - Sync mode: names GitHub #15 as a candidate cause, recommends `--reset-target-data --yes` as the primary recovery, notes that the slot-drop step applies to PG sources only (Vitess/MySQL don't expose it as a separate concept). Closes operator confusion in #15.
+
+### Migration / Compatibility
+
+- **Drop-in upgrade from v0.40.0.** No CLI changes, no IR changes, no engine-interface changes. Operators on v0.40.0 who experienced the #15 wedge state need to recover once via `--reset-target-data --yes`; subsequent runs are safe.
+- **First-write contract.** The pre-CDC `WritePosition` is gated on the applier implementing `ir.PositionWriter`. Both shipping engines (MySQL, Postgres) do; an engine that doesn't logs a WARN and falls through to pre-fix behaviour (no regression, just no protection).
+- **`PositionWriter` shape requirement.** The position written here is the snapshot's anchor token (same token the CDC reader will resume from). Applier implementations that bind position-writes to other side effects (e.g. tracker updates) must tolerate a write whose position equals the previously-written position — re-writes of the same anchor must not error.
+
+### Who needs this release
+
+- **Any operator running `sluice sync start` against a PlanetScale-MySQL / Vitess target** (or any target where transient applier failures are possible): **upgrade**. The #15 wedge required `--reset-target-data` recovery; v0.40.1 turns this into a clean warm-resume.
+- **Operators on PG-source streams**: drop-in. The cold-start anchor write makes restart-during-first-batch recoverable; pre-fix this was already rare (PG applier transients are less frequent than Vitess tx-killer events) but the fix is symmetric across engines.
+- **Operators currently in a v0.40.0 wedge state**: upgrade to v0.40.1, run once with `--reset-target-data --yes` to recover; future cold-starts will not re-wedge.
+
+### Verification surface
+
+- New unit test `TestPreflightColdStart_SyncModeHint` in `internal/pipeline/preflight_test.go`: asserts the sync-mode hint names GitHub #15, recommends `--reset-target-data`, and does NOT point at `sluice migrate --resume` (which would mislead operators in sync flows).
+- Existing migrator preflight tests updated to pass `preflightModeMigrate`; their hint assertions still pass unchanged.
+
 ## [0.40.0]
 
 **Closes GitHub issue #12 — CDC apply path now filters generated columns.** A source table with a `STORED` generated column previously caused the applier to include the generated column's value in every INSERT (and the SET-list of `ON DUPLICATE KEY UPDATE` / `ON CONFLICT DO UPDATE`, and the WHERE predicate of UPDATE/DELETE). MySQL rejected the INSERT with Error 3105 ("The value specified for generated column ... is not allowed"); PostgreSQL rejected with SQLSTATE 428C9 ("cannot insert a non-DEFAULT value into column"). The first CDC batch hitting an affected table exited the entire `sluice sync start` process. The fix mirrors the bulk-load writer's existing column-list filter (ADR-0026:100) on the apply side.
