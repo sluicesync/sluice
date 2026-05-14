@@ -577,14 +577,55 @@ func qualifiedEnumTypeRef(targetSchema, tableName, columnName string) string {
 	return quoteIdent(targetSchema) + "." + quoteIdent(name)
 }
 
+// maxPGIdentifierLen is PostgreSQL's NAMEDATALEN-1 = 63 bytes ceiling
+// on identifier length. Identifiers longer than this are silently
+// truncated at CREATE time — which is the failure mode behind
+// GitHub issue #26: two prepended index names that share their first
+// 63 chars truncate to the same PG identifier and the second CREATE
+// fires `SQLSTATE 42P07: relation "<truncated_name>" already exists`.
+const maxPGIdentifierLen = 63
+
+// indexNamingConventionPrefixes is the set of index-naming
+// convention prefixes that operator schemas use to mean "this index
+// is already scoped to a single table." When `pgIndexName` sees a
+// source name shaped like `ix_<table>_<rest>` / `idx_<table>_<rest>`
+// / `fk_<table>_<rest>` / `uq_<table>_<rest>` / etc., the table-name
+// portion is already encoded; sluice prepending another table prefix
+// would (a) double the table-name presence in the identifier and (b)
+// push past 63 chars on long table names.
+//
+// Coverage drawn from the conventions of SQLAlchemy/Alembic, Django,
+// Rails AR / ActiveRecord, Hibernate, Diesel, and operator-written
+// hand schemas. The list is intentionally generous on the read side
+// — false positives (treating an unconventional name as already-
+// scoped) are emit-verbatim, which is the same behavior the explicit
+// `<table>_` prefix check already handles.
+var indexNamingConventionPrefixes = []string{
+	"ix_", "idx_", "uix_", "uidx_", "uniq_", "uq_",
+	"pk_", "fk_", "chk_", "ck_",
+}
+
 // pgIndexName disambiguates a source-side index name against the
-// schema-scoped Postgres namespace. If the source name already
-// begins with the table name (the common case for sluice-emitted
-// names), it's returned verbatim; otherwise it gets a `<table>_`
-// prefix. The two-form rule preserves human-readable names like
-// `idx_users_email` while disambiguating MySQL-style sibling index
-// names like `idx_fk_film_id` (which appears on multiple tables in
-// real-world schemas).
+// schema-scoped Postgres namespace. The rule (after GitHub #26):
+//
+//  1. If sourceName already starts with `<tableName>_`, emit verbatim.
+//  2. If sourceName matches a known convention prefix
+//     (`ix_<table>_`, `idx_<table>_`, etc., per
+//     [indexNamingConventionPrefixes]) AND the convention-prefix +
+//     tableName segment matches, emit verbatim. This covers
+//     real-world SQLAlchemy / Alembic / Rails / Django shapes where
+//     the table name is already encoded in the index name.
+//  3. Otherwise, prepend `<tableName>_`. If the result would exceed
+//     PG's 63-char NAMEDATALEN limit, emit sourceName verbatim
+//     instead — the operator's source-declared name fits PG (it's <=
+//     64 chars on MySQL or natively under 63 on PG), and avoiding
+//     the truncation collision is the load-bearing concern. The
+//     historical reason for prefixing (sibling-table name disambig)
+//     is preserved for short names; long names sacrifice it.
+//
+// Pre-v0.49.0 emitted `<tableName>_<sourceName>` unconditionally
+// when (1) didn't match, causing the GitHub #26 truncation collision
+// on long names that share their first 63 chars after prepend.
 func pgIndexName(tableName, sourceName string) string {
 	if sourceName == "" {
 		return ""
@@ -593,7 +634,30 @@ func pgIndexName(tableName, sourceName string) string {
 	if strings.HasPrefix(sourceName, prefix) {
 		return sourceName
 	}
-	return prefix + sourceName
+	// Convention-prefix detection: if source name is shaped like
+	// `<convention_prefix><tableName>_<rest>`, treat as already
+	// table-scoped.
+	for _, conv := range indexNamingConventionPrefixes {
+		if strings.HasPrefix(sourceName, conv+tableName+"_") {
+			return sourceName
+		}
+		// Edge case: source name is exactly `<conv><tableName>`
+		// (table name suffix with no trailing column part) — still
+		// already-table-scoped.
+		if sourceName == conv+tableName {
+			return sourceName
+		}
+	}
+	full := prefix + sourceName
+	if len(full) > maxPGIdentifierLen {
+		// Prepending would overflow → emit verbatim. The
+		// historical disambiguation against sibling-table indexes
+		// (`idx_fk_film_id` on multiple tables) is sacrificed for
+		// the truncation-collision-free path, which is the more
+		// urgent failure mode.
+		return sourceName
+	}
+	return full
 }
 
 // emitCreateEnumType produces a CREATE TYPE statement for a single

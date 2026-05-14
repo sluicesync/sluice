@@ -692,6 +692,119 @@ func TestEmitTableDef(t *testing.T) {
 	}
 }
 
+// TestEmitTableDef_AutoIncrementNonPK_GitHub25 pins the GitHub #25
+// fix: a table with AUTO_INCREMENT on a non-PK column, supported by
+// a UNIQUE KEY, must emit that UNIQUE KEY inline at CREATE TABLE
+// time so MySQL/Vitess doesn't reject with Error 1075 (Incorrect
+// table definition; there can be only one auto column and it must
+// be defined as a key).
+//
+// Pre-v0.49.0 emitTableDef deferred ALL secondary indexes to phase 2,
+// which made the CREATE land without the auto column's supporting
+// key. v0.49.0's inlineAutoIncrementIndex detects this exact pattern
+// and threads the supporting index through emitTableDef's body.
+func TestEmitTableDef_AutoIncrementNonPK_GitHub25(t *testing.T) {
+	table := &ir.Table{
+		Name: "cell",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Varchar{Length: 50}},
+			{Name: "increment_id", Type: ir.Integer{Width: 32, AutoIncrement: true}},
+		},
+		PrimaryKey: &ir.Index{
+			Name:    "PRIMARY",
+			Unique:  true,
+			Columns: []ir.IndexColumn{{Column: "id"}},
+		},
+		Indexes: []*ir.Index{
+			{
+				Name:    "uq_cell_increment_id",
+				Unique:  true,
+				Kind:    ir.IndexKindBTree,
+				Columns: []ir.IndexColumn{{Column: "increment_id"}},
+			},
+		},
+	}
+	got, err := emitTableDef(table)
+	if err != nil {
+		t.Fatalf("emitTableDef: %v", err)
+	}
+	wants := []string{
+		"CREATE TABLE IF NOT EXISTS `cell` (",
+		"`increment_id` INT AUTO_INCREMENT NOT NULL,",
+		"PRIMARY KEY (`id`),",
+		"UNIQUE KEY `uq_cell_increment_id` (`increment_id`)",
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("output missing %q; got:\n%s", w, got)
+		}
+	}
+}
+
+// TestInlineAutoIncrementIndex_DetectionTable covers the detector
+// directly: PK auto column → no inline (existing common case),
+// non-PK auto column with supporting unique → inline that index,
+// non-PK auto column without supporting → nil (existing behavior;
+// MySQL will reject with same error pre/post-fix, distinct surface).
+func TestInlineAutoIncrementIndex_DetectionTable(t *testing.T) {
+	pkAuto := &ir.Table{
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64, AutoIncrement: true}},
+		},
+		PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "id"}}},
+		Indexes:    []*ir.Index{{Name: "noise", Columns: []ir.IndexColumn{{Column: "other"}}}},
+	}
+	if got := inlineAutoIncrementIndex(pkAuto); got != nil {
+		t.Errorf("PK auto column should return nil; got %+v", got)
+	}
+
+	nonPKAutoWithUnique := &ir.Table{
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Varchar{Length: 50}},
+			{Name: "seq_id", Type: ir.Integer{Width: 32, AutoIncrement: true}},
+		},
+		PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "id"}}},
+		Indexes: []*ir.Index{
+			{Name: "uq_seq_id", Unique: true, Columns: []ir.IndexColumn{{Column: "seq_id"}}},
+		},
+	}
+	got := inlineAutoIncrementIndex(nonPKAutoWithUnique)
+	if got == nil || got.Name != "uq_seq_id" {
+		t.Errorf("non-PK auto with supporting unique should return uq_seq_id; got %+v", got)
+	}
+
+	nonPKAutoNoSupport := &ir.Table{
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Varchar{Length: 50}},
+			{Name: "seq_id", Type: ir.Integer{Width: 32, AutoIncrement: true}},
+		},
+		PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "id"}}},
+		Indexes: []*ir.Index{
+			{Name: "uq_other", Unique: true, Columns: []ir.IndexColumn{{Column: "other"}}},
+		},
+	}
+	if got := inlineAutoIncrementIndex(nonPKAutoNoSupport); got != nil {
+		t.Errorf("non-PK auto without supporting index should return nil; got %+v", got)
+	}
+
+	// Prefer unique over non-unique when both have the auto col first.
+	nonPKAutoBoth := &ir.Table{
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Varchar{Length: 50}},
+			{Name: "seq_id", Type: ir.Integer{Width: 32, AutoIncrement: true}},
+		},
+		PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "id"}}},
+		Indexes: []*ir.Index{
+			{Name: "kx_seq_id", Unique: false, Columns: []ir.IndexColumn{{Column: "seq_id"}}},
+			{Name: "uq_seq_id", Unique: true, Columns: []ir.IndexColumn{{Column: "seq_id"}}},
+		},
+	}
+	got = inlineAutoIncrementIndex(nonPKAutoBoth)
+	if got == nil || got.Name != "uq_seq_id" {
+		t.Errorf("should prefer unique index when both match; got %+v", got)
+	}
+}
+
 func TestEmitCreateIndex(t *testing.T) {
 	cases := []struct {
 		name string

@@ -563,9 +563,81 @@ func emitColumnDef(c *ir.Column) (string, error) {
 	return sb.String(), nil
 }
 
+// inlineAutoIncrementIndex returns the secondary index that
+// [emitTableDef] emits inline at CREATE TABLE time to satisfy MySQL's
+// "every auto column must be a key" rule when the AUTO_INCREMENT
+// column is NOT in the primary key. Returns nil when:
+//
+//   - the table has no AUTO_INCREMENT column (the common case)
+//   - the AUTO_INCREMENT column IS in the primary key (also common —
+//     the standard "id BIGINT AUTO_INCREMENT PRIMARY KEY" pattern;
+//     PK itself satisfies the rule)
+//   - no secondary index in table.Indexes has the auto column as its
+//     leading column (sluice can't satisfy the rule from what's
+//     declared; MySQL will reject the CREATE TABLE downstream and
+//     the existing error path surfaces it — same as pre-v0.49.0)
+//
+// When non-nil, the returned index gets emitted inline by
+// [emitTableDef] AND skipped by [CreateIndexes] (phase 2) to avoid a
+// double-create on the same index name.
+//
+// GitHub issue #25: pre-v0.49.0 sluice's three-phase apply always
+// deferred secondary indexes to phase 2, which made CREATE TABLE land
+// without the auto column's supporting key and MySQL rejected with
+// Error 1075 (Incorrect table definition; there can be only one auto
+// column and it must be defined as a key).
+//
+// MySQL allows at most one AUTO_INCREMENT column per table, so at
+// most one supporting index is needed.
+func inlineAutoIncrementIndex(table *ir.Table) *ir.Index {
+	if table == nil || len(table.Indexes) == 0 {
+		return nil
+	}
+	pkCols := make(map[string]struct{})
+	if table.PrimaryKey != nil {
+		for _, c := range table.PrimaryKey.Columns {
+			pkCols[c.Column] = struct{}{}
+		}
+	}
+	var autoColName string
+	for _, col := range table.Columns {
+		intT, ok := col.Type.(ir.Integer)
+		if !ok || !intT.AutoIncrement {
+			continue
+		}
+		if _, inPK := pkCols[col.Name]; inPK {
+			return nil
+		}
+		autoColName = col.Name
+		break // MySQL: at most one AUTO_INCREMENT column per table.
+	}
+	if autoColName == "" {
+		return nil
+	}
+	// Pick the first index whose leading column is the auto column.
+	// Prefer unique indexes when both shapes are present — matches the
+	// real-world `UNIQUE KEY uq_<table>_<col> (<col>)` operator
+	// pattern (GitHub #25's example schema).
+	var fallback *ir.Index
+	for _, idx := range table.Indexes {
+		if len(idx.Columns) == 0 || idx.Columns[0].Column != autoColName {
+			continue
+		}
+		if idx.Unique {
+			return idx
+		}
+		if fallback == nil {
+			fallback = idx
+		}
+	}
+	return fallback
+}
+
 // emitTableDef returns a CREATE TABLE statement with columns and
-// the primary key inline. Secondary indexes and foreign keys are
-// emitted separately by Phase 2 and Phase 3.
+// the primary key inline (plus, when [inlineAutoIncrementIndex]
+// matches, the supporting unique index required to satisfy MySQL's
+// auto-column-is-key invariant). Secondary indexes and foreign keys
+// are otherwise emitted separately by Phase 2 and Phase 3.
 //
 // The statement is terminated with a semicolon for readability; the
 // driver doesn't require it but it keeps logged statements consistent
@@ -588,6 +660,8 @@ func emitTableDef(table *ir.Table) (string, error) {
 	sb.WriteString(" (\n")
 
 	hasPK := table.PrimaryKey != nil
+	inlineIdx := inlineAutoIncrementIndex(table)
+	hasInlineIdx := inlineIdx != nil
 	for i, col := range table.Columns {
 		def, err := emitColumnDef(col)
 		if err != nil {
@@ -595,7 +669,7 @@ func emitTableDef(table *ir.Table) (string, error) {
 		}
 		sb.WriteString("  ")
 		sb.WriteString(def)
-		if i < len(table.Columns)-1 || hasPK || len(table.CheckConstraints) > 0 {
+		if i < len(table.Columns)-1 || hasPK || hasInlineIdx || len(table.CheckConstraints) > 0 {
 			sb.WriteByte(',')
 		}
 		sb.WriteByte('\n')
@@ -604,6 +678,26 @@ func emitTableDef(table *ir.Table) (string, error) {
 	if hasPK {
 		sb.WriteString("  PRIMARY KEY ")
 		sb.WriteString(emitIndexColumnList(table.PrimaryKey.Columns))
+		if hasInlineIdx || len(table.CheckConstraints) > 0 {
+			sb.WriteByte(',')
+		}
+		sb.WriteByte('\n')
+	}
+
+	// GitHub #25: emit the supporting unique index for a non-PK
+	// AUTO_INCREMENT column inline so MySQL accepts the CREATE TABLE.
+	// Phase 2 (CreateIndexes) skips this same index via the same
+	// [inlineAutoIncrementIndex] detector.
+	if hasInlineIdx {
+		sb.WriteString("  ")
+		if inlineIdx.Unique {
+			sb.WriteString("UNIQUE KEY ")
+		} else {
+			sb.WriteString("KEY ")
+		}
+		sb.WriteString(quoteIdent(inlineIdx.Name))
+		sb.WriteByte(' ')
+		sb.WriteString(emitIndexColumnList(inlineIdx.Columns))
 		if len(table.CheckConstraints) > 0 {
 			sb.WriteByte(',')
 		}

@@ -77,11 +77,23 @@ func (w *SchemaWriter) CreateIndexes(ctx context.Context, s *ir.Schema) error {
 		return fmt.Errorf("mysql: CreateIndexes: schema is nil")
 	}
 	for _, table := range orderedTables(s) {
+		// GitHub #25: skip the index that emitTableDef already emitted
+		// inline (the supporting key for a non-PK AUTO_INCREMENT
+		// column). Re-creating it here would fail with "duplicate
+		// index" on the second pass. Tables without the inline pattern
+		// see the entire index list as before.
+		skipName := ""
+		if inline := inlineAutoIncrementIndex(table); inline != nil {
+			skipName = inline.Name
+		}
 		indexes := append([]*ir.Index(nil), table.Indexes...)
 		sort.Slice(indexes, func(i, j int) bool {
 			return indexes[i].Name < indexes[j].Name
 		})
 		for _, idx := range indexes {
+			if idx.Name == skipName {
+				continue
+			}
 			stmt, err := emitCreateIndex(table.Name, idx)
 			if err != nil {
 				return err
@@ -216,13 +228,22 @@ func (w *SchemaWriter) PreviewDDL(_ context.Context, s *ir.Schema) ([]ir.DDLStat
 		})
 	}
 
-	// Phase 2: secondary indexes.
+	// Phase 2: secondary indexes. Skip the inline-emitted
+	// AUTO_INCREMENT-supporting index (GitHub #25, same logic as
+	// CreateIndexes above).
 	for _, table := range orderedTables(s) {
+		skipName := ""
+		if inline := inlineAutoIncrementIndex(table); inline != nil {
+			skipName = inline.Name
+		}
 		indexes := append([]*ir.Index(nil), table.Indexes...)
 		sort.Slice(indexes, func(i, j int) bool {
 			return indexes[i].Name < indexes[j].Name
 		})
 		for _, idx := range indexes {
+			if idx.Name == skipName {
+				continue
+			}
 			stmt, err := emitCreateIndex(table.Name, idx)
 			if err != nil {
 				return nil, err

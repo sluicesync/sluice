@@ -10,6 +10,117 @@ import (
 	"github.com/orware/sluice/internal/ir"
 )
 
+// TestPgIndexName_GitHub26 covers the v0.49.0 pgIndexName fix:
+// the original "already-prefixed → verbatim" behavior is preserved,
+// plus three new shapes — convention-prefix detection (ix_/idx_/fk_/
+// etc. + table name), length-overflow fallback to verbatim, and the
+// edge case of source name exactly matching the convention+table
+// form. Pre-v0.49.0 names like
+// `ix_entity_field_operation_relation_workflow_block_id` got the
+// table prefix prepended unconditionally, producing 84-char names
+// that PG silently truncated to 63 and collided on the second
+// CREATE INDEX.
+func TestPgIndexName_GitHub26(t *testing.T) {
+	cases := []struct {
+		name      string
+		table     string
+		source    string
+		want      string
+		rationale string
+	}{
+		{
+			name:      "existing: already explicitly prefixed",
+			table:     "users",
+			source:    "users_idx_email",
+			want:      "users_idx_email",
+			rationale: "preserved — source already starts with `<table>_`",
+		},
+		{
+			name:      "existing: short name fits with prepend",
+			table:     "users",
+			source:    "idx_email",
+			want:      "users_idx_email",
+			rationale: "preserved — short prepend, no overflow risk",
+		},
+		{
+			name:      "new (#26 cause): long convention-prefixed name → verbatim",
+			table:     "entity_field_operation_relation",
+			source:    "ix_entity_field_operation_relation_workflow_block_id",
+			want:      "ix_entity_field_operation_relation_workflow_block_id",
+			rationale: "convention-prefix `ix_<table>_` detected → verbatim; avoids 84-char prepend collision",
+		},
+		{
+			name:      "new (#26 cause): long fk_ convention-prefixed → verbatim",
+			table:     "entity_field_operation_relation",
+			source:    "fk_entity_field_operation_relation_workflow_block_id",
+			want:      "fk_entity_field_operation_relation_workflow_block_id",
+			rationale: "convention-prefix `fk_<table>_` detected → verbatim",
+		},
+		{
+			name:      "new (#26 fallback): non-convention long name → length-check verbatim",
+			table:     "entity_field_operation_relation",
+			source:    "ix_workflow_block_id_for_op_rel_alpha",
+			want:      "ix_workflow_block_id_for_op_rel_alpha",
+			rationale: "prepend (32+37=69) would exceed 63 → emit verbatim; sacrifices sibling-table disambig for collision-freedom",
+		},
+		{
+			name:      "new (#26): convention prefix with no extra suffix (exact match)",
+			table:     "users",
+			source:    "ix_users",
+			want:      "ix_users",
+			rationale: "convention `ix_<table>` exact match → verbatim",
+		},
+		{
+			name:      "regression: idx_x on users still prepends (fits)",
+			table:     "users",
+			source:    "idx_x",
+			want:      "users_idx_x",
+			rationale: "convention prefix `idx_` is present but `idx_users_` is not the source's start, so general prepend applies and fits",
+		},
+		{
+			name:      "regression: uq_ convention detected",
+			table:     "users",
+			source:    "uq_users_email",
+			want:      "uq_users_email",
+			rationale: "convention prefix `uq_<table>_` detected → verbatim",
+		},
+		{
+			name:      "empty source → empty result",
+			table:     "users",
+			source:    "",
+			want:      "",
+			rationale: "preserved — empty-in, empty-out",
+		},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			got := pgIndexName(c.table, c.source)
+			if got != c.want {
+				t.Errorf("pgIndexName(%q, %q) = %q; want %q\nrationale: %s",
+					c.table, c.source, got, c.want, c.rationale)
+			}
+		})
+	}
+}
+
+// TestPgIndexName_NoCollisionAcrossLongSiblingNames is the
+// load-bearing pin for GitHub #26: two sibling indexes that
+// triggered the bug pre-v0.49.0 must now emit to distinct PG
+// identifiers (no truncation collision).
+func TestPgIndexName_NoCollisionAcrossLongSiblingNames(t *testing.T) {
+	table := "entity_field_operation_relation"
+	a := pgIndexName(table, "ix_workflow_block_id_for_op_rel_alpha")
+	b := pgIndexName(table, "ix_workflow_block_id_for_op_rel_beta")
+	if a == b {
+		t.Errorf("sibling long index names should not collide post-fix; both → %q", a)
+	}
+	if len(a) > maxPGIdentifierLen || len(b) > maxPGIdentifierLen {
+		t.Errorf("emitted names should fit PG's %d-char limit; got len(a)=%d len(b)=%d",
+			maxPGIdentifierLen, len(a), len(b))
+	}
+}
+
 func TestEmitColumnType(t *testing.T) {
 	cases := []struct {
 		name string

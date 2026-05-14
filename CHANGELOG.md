@@ -6,6 +6,38 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.49.0]
+
+**Closes GitHub issues #25 + #26.** Both bugs blocked cold-start on real-world MySQL source schemas — #25 on MySQL targets (Vitess refused the CREATE TABLE), #26 on PostgreSQL targets (silent identifier truncation collision). Both confirmed reproducing on v0.48.0 via the operator's validation rig before fix; both reproductions now closed via the targeted fixes below. Bundled per the operator's per-release CI-cost preference.
+
+### Fixed
+
+- **GitHub #25 — MySQL AUTO_INCREMENT-on-non-PK column now bootstraps cleanly.** A source table like `CREATE TABLE cell (id varchar(50) PRIMARY KEY, increment_id int AUTO_INCREMENT, UNIQUE KEY uq_cell_increment_id (increment_id), ...)` previously rejected at sluice cold-start on MySQL/Vitess targets with `Error 1075 (42000): Incorrect table definition; there can be only one auto column and it must be defined as a key`. Pre-v0.49.0's three-phase schema apply deferred ALL secondary indexes to phase 2, so the CREATE TABLE landed without the auto column's supporting key. v0.49.0 adds `inlineAutoIncrementIndex` in `internal/engines/mysql/ddl_emit.go` which detects "AUTO_INCREMENT column not in PK + has a supporting index" and emits the supporting index inline at CREATE TABLE; the same detector is used by `CreateIndexes` (phase 2) and the dry-run DDL preview path to skip the index that's already been emitted, avoiding double-create. MySQL allows at most one AUTO_INCREMENT column per table, so at most one inline supporting index is needed. Unique indexes are preferred when both unique and non-unique candidates exist (matches the operator's `UNIQUE KEY uq_<table>_<col>` pattern from real production schemas).
+
+- **GitHub #26 — PostgreSQL identifier truncation collision on long index names is closed.** A source table like `CREATE TABLE entity_field_operation_relation (..., KEY ix_workflow_block_id_for_op_rel_alpha (workflow_block_id), KEY ix_workflow_block_id_for_op_rel_beta (id, workflow_block_id))` previously failed at sluice's index-creation phase on PG targets with `SQLSTATE 42P07: relation "entity_field_operation_relation_ix_workflow_block_id_for_op_rel" already exists` — both 69- and 68-char prepended names silently truncated to the same 63-char PG identifier and the second CREATE INDEX hit a duplicate. v0.49.0 extends `pgIndexName` in `internal/engines/postgres/ddl_emit.go` with two complementary checks: (1) **convention-prefix detection** — recognises `ix_<table>_` / `idx_<table>_` / `fk_<table>_` / `uq_<table>_` / `chk_<table>_` / `pk_<table>_` / `uix_<table>_` / `uidx_<table>_` / `uniq_<table>_` / `ck_<table>_` patterns as "already table-scoped" and emits verbatim (covers SQLAlchemy / Alembic / Django / Rails / Hibernate / Diesel naming conventions); (2) **length-check fallback** — if the explicit `<tableName>_` prepend would exceed PG's 63-char `NAMEDATALEN-1` limit, emit verbatim instead. The historical disambiguation against sibling-table indexes (`idx_fk_film_id` appearing on multiple tables) is preserved for short names; long names sacrifice it for collision-freedom, which is the more urgent failure mode (a multi-table-collision is rare AND has an operator workaround via source-side index rename; the silent same-table self-collision today has no workaround).
+
+### Migration / Compatibility
+
+- **Drop-in upgrade from v0.48.x.** Both fixes are additive at the operator surface; no flag changes, no behaviour change for schemas that don't hit either pattern.
+- **The supervisor-workaround pattern operators were using** (filtering out the failing tables via `--include-table=users` per the validation rig's `start_sync_*.ps1` scripts) is no longer required for #25/#26 — the underlying CREATE-TABLE / CREATE-INDEX failures are closed. Operators can drop `--include-table` filters that were workarounds for these two bugs.
+- **Emitted index identifiers may differ on PG targets** for long source names: pre-v0.49.0 they'd silently truncate; post-v0.49.0 they emit verbatim. Operators with existing PG targets that already received the truncated names should either (a) re-bulk via `--reset-target-data` to land the corrected identifiers, or (b) accept the silent truncation as historical and continue (the catalog references are by OID, not name; user-data SQL queries don't reference index names directly).
+- **No engine API surface change**; no CLI surface change.
+
+### Who needs this release
+
+- **Anyone running `sluice sync start` or `sluice migrate` against a real-world MySQL source with**: (a) `AUTO_INCREMENT` on a non-PK column backed by a `UNIQUE KEY`, OR (b) long index names that include the table name (the SQLAlchemy / Alembic / Django default convention): **upgrade**. Both shapes blocked cold-start on v0.48.0 and earlier.
+- **Anyone bootstrapping a PG-target sync from a MySQL source with long-named tables** (the common case for legacy / mature schemas): drop-in benefit; the silent PG truncation collision is closed.
+- **Anyone whose schema doesn't hit either pattern**: drop-in, no behaviour change.
+
+### Verification surface
+
+- **5 new test functions / subtests**:
+  - `internal/engines/mysql/ddl_emit_test.go::TestEmitTableDef_AutoIncrementNonPK_GitHub25` — confirms the supporting UNIQUE KEY is emitted inline at CREATE TABLE
+  - `internal/engines/mysql/ddl_emit_test.go::TestInlineAutoIncrementIndex_DetectionTable` — 4 cases covering PK-auto / non-PK-auto-with-support / non-PK-auto-without-support / prefer-unique-over-non-unique
+  - `internal/engines/postgres/ddl_emit_test.go::TestPgIndexName_GitHub26` — 9 subtests covering both regression preservation AND new behavior shapes (convention-prefix detection, length-check fallback, exact-match edge case, empty-source)
+  - `internal/engines/postgres/ddl_emit_test.go::TestPgIndexName_NoCollisionAcrossLongSiblingNames` — load-bearing pin: the two sibling indexes that triggered #26 must now emit to distinct PG identifiers
+- **End-to-end re-verification via the validation rig at `C:\code\sluice-validation\`** — both `start_sync_mysql_dest.ps1 -AllTables` (re-triggers #25 pre-fix) and `start_sync_pg_dest.ps1 -AllTables` (re-triggers #26 pre-fix) are documented entry points. With the v0.49.0 binary, both should now succeed end-to-end.
+
 ## [0.48.0]
 
 **Closes GitHub issues #21 + #22 and lands Phase A of #23.** Three changes sharing the *"remove the operational burden of supervising sluice externally"* theme, bundled into one release to reduce per-release CI cost burden. Operators running `sluice sync start` or `backup stream run` against PlanetScale-MySQL endpoints previously needed an external supervisor wrapper to recover from two classes of process exit (#21, #22). v0.48.0 closes both at the retry layer where v0.42.0 / v0.46.0 already framed the policy. Separately, the silent-stall failure mode (#23 — process alive, no apply, no log) now produces a positive liveness signal AND has a pprof endpoint for goroutine-dump diagnosis on the next stall.
