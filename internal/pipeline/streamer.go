@@ -299,6 +299,23 @@ type Streamer struct {
 	// land it than to wedge the stream. See ADR-0028.
 	MaxBufferBytes int64
 
+	// ApplyExecTimeout is the per-statement deadline plumbed to the
+	// target [ir.ChangeApplier] via the optional
+	// [ir.ApplyExecTimeoutSetter] interface. Each tx.ExecContext call
+	// in the apply path is wrapped in a context.WithTimeout of this
+	// duration; on expiry the driver returns
+	// [context.DeadlineExceeded], which the engine-side classifier
+	// recognises as retriable so the runWithRetry loop activates.
+	//
+	// Zero or negative disables the per-exec timeout — the
+	// pre-v0.52.0 behaviour where a hung destination connection
+	// could block the apply goroutine indefinitely. The CLI's
+	// `sync start --apply-exec-timeout=DUR` flag is the canonical
+	// operator-facing knob; the default (60s) is intentionally long
+	// enough for a legitimately slow batch upsert but short enough
+	// to bound the silent-stall window (GitHub issue #23).
+	ApplyExecTimeout time.Duration
+
 	// PositionFromManifestStore is the [ir.BackupStore] the chain
 	// terminal position is read from when the operator passes
 	// `--position-from-manifest=<chain-url>`. The Streamer uses the
@@ -1286,6 +1303,7 @@ func (s *Streamer) openApplier(ctx context.Context) (ir.ChangeApplier, bool, err
 		// hit the OpenChangeApplier branch below.
 		applyMaxBufferBytes(s.Applier, s.MaxBufferBytes)
 		applyTargetSchema(s.Applier, s.TargetSchema)
+		applyExecTimeout(s.Applier, s.ApplyExecTimeout)
 		return s.Applier, false, nil
 	}
 	a, err := s.Target.OpenChangeApplier(ctx, s.TargetDSN)
@@ -1294,6 +1312,7 @@ func (s *Streamer) openApplier(ctx context.Context) (ir.ChangeApplier, bool, err
 	}
 	applyMaxBufferBytes(a, s.MaxBufferBytes)
 	applyTargetSchema(a, s.TargetSchema)
+	applyExecTimeout(a, s.ApplyExecTimeout)
 	return a, true, nil
 }
 

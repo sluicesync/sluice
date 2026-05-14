@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/orware/sluice/internal/ir"
 )
@@ -384,4 +385,61 @@ func sampleSchema() *ir.Schema {
 			},
 		},
 	}
+}
+
+// recordingExecTimeoutSetter is a test double that records
+// SetExecTimeout invocations. The orchestrator's [applyExecTimeout]
+// helper is the unit under test; this lets us assert plumbing without
+// instantiating a real engine.
+type recordingExecTimeoutSetter struct {
+	last  time.Duration
+	calls int
+}
+
+func (r *recordingExecTimeoutSetter) SetExecTimeout(d time.Duration) {
+	r.last = d
+	r.calls++
+}
+
+// TestApplyExecTimeout pins the contract of the orchestrator's
+// per-exec-timeout plumbing helper (GitHub #23 Phase B fix, v0.52.0):
+//
+//   - Zero / negative is a no-op (engines that don't want the setter
+//     called keep their built-in default; the legacy unbounded
+//     behaviour stays the default-default).
+//   - Positive values call SetExecTimeout exactly once with the value.
+//   - Non-setter targets pass through silently (engines that don't opt
+//     into the optional surface degrade gracefully — same shape as
+//     [applyMaxBufferBytes]).
+func TestApplyExecTimeout(t *testing.T) {
+	t.Run("zero is a no-op", func(t *testing.T) {
+		r := &recordingExecTimeoutSetter{}
+		applyExecTimeout(r, 0)
+		if r.calls != 0 {
+			t.Errorf("zero timeout: got %d calls; want 0", r.calls)
+		}
+	})
+
+	t.Run("negative is a no-op", func(t *testing.T) {
+		r := &recordingExecTimeoutSetter{}
+		applyExecTimeout(r, -5*time.Second)
+		if r.calls != 0 {
+			t.Errorf("negative timeout: got %d calls; want 0", r.calls)
+		}
+	})
+
+	t.Run("positive value sets exactly once", func(t *testing.T) {
+		r := &recordingExecTimeoutSetter{}
+		applyExecTimeout(r, 60*time.Second)
+		if r.calls != 1 {
+			t.Errorf("positive timeout: got %d calls; want 1", r.calls)
+		}
+		if r.last != 60*time.Second {
+			t.Errorf("recorded duration = %v; want 60s", r.last)
+		}
+	})
+
+	t.Run("non-setter target degrades silently", func(_ *testing.T) {
+		applyExecTimeout(struct{}{}, 60*time.Second)
+	})
 }

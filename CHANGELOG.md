@@ -6,6 +6,43 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.52.0]
+
+**Closes GitHub issue #23 — silent applier stall on half-closed destination connections.** Phase B of the three-phase debug protocol. Phase A (v0.48.0) added the diagnostic surface (`--heartbeat-interval`, `--pprof-listen`) that captured ground truth on the validation rig: with traffic flowing into a PlanetScale source, both MySQL→MySQL and MySQL→PG streams went 4+ minutes without applying any of the 1330+ source rows while heartbeats still fired and pprof remained responsive. Goroutine 1 in both sluice processes was blocked inside `crypto/tls.(*Conn).Read` waiting for an OK packet from the destination that never arrived. The apply goroutine had no per-statement deadline AND the drivers' DSNs set no `readTimeout`, so the read blocked indefinitely; the ADR-0038 retry loop couldn't activate because the apply call never returned to allow classification.
+
+### Added
+
+- **`--apply-exec-timeout=DUR` flag on `sluice sync start`** (default `60s`). Per-statement deadline applied to every `tx.ExecContext` call on the apply path. On expiry the driver returns `context.DeadlineExceeded`, which the applier's error classifier treats as retriable so the existing `runWithRetry` loop reopens the applier and retries the batch on a fresh connection. Default chosen long enough for a legitimately slow batch upsert on a slow target, short enough to bound the silent-stall detection window. Zero or negative disables (the pre-v0.52.0 unbounded behaviour).
+
+- **`ir.ApplyExecTimeoutSetter` optional interface** in `internal/ir/interfaces.go`. Mirror of the `MaxBufferBytesSetter` pattern: engines that opt into per-exec deadlines implement `SetExecTimeout(d time.Duration)`; engines that don't keep their pre-v0.52.0 behaviour. MySQL and Postgres appliers both implement.
+
+- **`pipeline.Streamer.ApplyExecTimeout` field**. Plumbed through `openApplier` via the new `applyExecTimeout` helper (mirror of `applyMaxBufferBytes`). Threaded from the CLI flag.
+
+### Fixed
+
+- **MySQL applier**: every `tx.ExecContext` in `dispatch()` (Insert / Update / Delete / Truncate) now wraps with `context.WithTimeout(ctx, execTimeout)` when the timeout is set. `classifyApplierError` recognises `context.DeadlineExceeded` as retriable so the runWithRetry loop activates on expiry.
+
+- **Postgres applier**: same shape. All four dispatch sites wrap with the per-exec context; `classifyApplierError` mirrors the MySQL change for `context.DeadlineExceeded`.
+
+### Migration / Compatibility
+
+- **Drop-in upgrade from v0.51.x.** The new `--apply-exec-timeout=60s` default is conservative; operators with legitimately slow batch upserts (large multi-row writes on slow targets, geographically distant destinations) who hit spurious timeouts should tune up via `--apply-exec-timeout=5m` or similar. Disable entirely with `--apply-exec-timeout=0` to restore exact pre-v0.52.0 behaviour.
+- **No schema changes.** No chain.json, sluice_cdc_state, or position-token format changes.
+- **The ADR-0038 retry surface gains one new retriable shape** (`context.DeadlineExceeded`). Operators tuning `--apply-retry-attempts` should be aware that exhausted-attempts now includes per-exec-timeout exhaustion.
+
+### Who needs this release
+
+- **Anyone running continuous-sync against a remote managed-database target** (PlanetScale, Cloud SQL, RDS, Neon, etc.): **upgrade**. The silent-stall failure mode was reproducible on the validation rig within a single 4-minute traffic window; production streams against destinations with idle-tablet cycles, vttablet failover, or proxy-layer eviction without clean FIN/RST will eventually hit the same shape.
+
+- **Anyone running same-host or self-managed sync**: low-risk drop-in. The default `60s` per-exec timeout is well above the legitimate-batch ceiling for almost all workloads; the retry loop activates on expiry rather than failing.
+
+### Verification
+
+- **End-to-end live capture on validation rig** documented in `C:\code\sluice-validation\PHASE-B-DIAGNOSIS-ISSUE-23.md` — goroutine 1 stack traces (`mysql-stall-goroutines.txt`, `pg-stall-goroutines.txt`) show the exact blocked frame the fix unblocks.
+- **6 new test cases** in `applier_errors_test.go` (3 MySQL, 3 PG) covering bare + wrapped `context.DeadlineExceeded` retriable classification.
+- **4 new test cases** in `internal/pipeline/migrate_test.go::TestApplyExecTimeout` pinning the plumbing helper's zero-no-op + negative-no-op + positive-sets-once + non-setter-degrades invariants.
+- **Existing classifier-table tests** (`TestClassifyApplierError_RetriableShapes`) extended to cover the new shape symmetrically on both engines.
+
 ## [0.51.0]
 
 **Lands GitHub issue #20 chunk 14b phase 1 — rotation-EXIT thresholds for `backup stream run`.** Third chunk of roadmap item 14 (the backup-chain retention/compaction track, following v0.47.0's chain.json catalog and v0.50.0's prune command). Operators can now bound chain length AND chain age via two new flags that exit the stream cleanly when either threshold trips; chain.json gets a rotation marker so subsequent tooling can detect the closed-state.

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"time"
 
 	"github.com/orware/sluice/internal/ir"
 )
@@ -134,6 +135,22 @@ type ChangeApplier struct {
 	// the value if a future engine flavor relaxes the upstream gate.
 	targetSchema string
 
+	// execTimeout is the per-exec deadline applied via context.WithTimeout
+	// around each tx.ExecContext / tx.QueryContext on the applier's
+	// transaction. GitHub #23 Phase B fix: pre-v0.52.0 the apply path
+	// had no per-exec timeout, so a destination connection that went
+	// half-closed silently (no TCP FIN/RST) caused the driver's TLS
+	// read to block indefinitely. The v0.42.0+ retry loop never fired
+	// because the apply call never returned. With execTimeout > 0,
+	// the deadline fires, the driver's watchCancel closes the
+	// connection, [classifyApplierError] wraps the resulting
+	// context.DeadlineExceeded as retriable, and the existing
+	// runWithRetry loop activates cleanly.
+	//
+	// Set via [SetExecTimeout]. 0 disables the timeout (preserves
+	// pre-v0.52.0 unbounded-block behavior).
+	execTimeout time.Duration
+
 	// pkCache maps "schema.table" → ordered list of PK column names.
 	// Populated lazily via a single information_schema query the
 	// first time a change for the table arrives. An empty slice
@@ -211,6 +228,32 @@ func (a *ChangeApplier) SetSourceDSNFingerprint(fingerprint string) {
 // via writePositionTx's COALESCE.
 func (a *ChangeApplier) SetTargetSchema(name string) {
 	a.targetSchema = name
+}
+
+// SetExecTimeout records the per-exec timeout the streamer should
+// apply to every tx.ExecContext / tx.QueryContext call on the apply
+// path. GitHub #23 Phase B fix (v0.52.0): bounds the time a hung
+// destination connection can keep the apply goroutine blocked.
+// Zero disables the timeout (preserves pre-v0.52.0 unbounded behavior).
+//
+// Implements the optional [applierExecTimeoutSetter] surface probed
+// by [Streamer.openApplier]. Idempotent.
+func (a *ChangeApplier) SetExecTimeout(d time.Duration) {
+	a.execTimeout = d
+}
+
+// txExec wraps tx.ExecContext with the applier's per-exec timeout
+// (when set). On timeout expiry the driver's watchCancel closes the
+// underlying connection; the resulting context.DeadlineExceeded is
+// classified retriable by [classifyApplierError] so the runWithRetry
+// loop activates.
+func (a *ChangeApplier) txExec(ctx context.Context, tx *sql.Tx, query string, args ...any) (sql.Result, error) {
+	if a.execTimeout <= 0 {
+		return tx.ExecContext(ctx, query, args...)
+	}
+	execCtx, cancel := context.WithTimeout(ctx, a.execTimeout)
+	defer cancel()
+	return tx.ExecContext(execCtx, query, args...)
 }
 
 // Close releases the underlying connection pool.
@@ -447,7 +490,7 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, c ir.Change) e
 			return fmt.Errorf("mysql: applier: column types for %s.%s: %w", v.Schema, v.Table, err)
 		}
 		stmt, args := buildInsertSQL(schema, v.Table, v.Row, pk, colTypes)
-		if _, err := tx.ExecContext(ctx, stmt, args...); err != nil {
+		if _, err := a.txExec(ctx, tx, stmt, args...); err != nil {
 			return fmt.Errorf("mysql: applier: insert into %s.%s: %w", v.Schema, v.Table, err)
 		}
 		return nil
@@ -464,7 +507,7 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, c ir.Change) e
 		// affected can also signal Bug-6-style WHERE-predicate
 		// breakage on JSON columns; we surface it at debug level so
 		// the divergence has at least one observable footprint.
-		res, err := tx.ExecContext(ctx, stmt, args...)
+		res, err := a.txExec(ctx, tx, stmt, args...)
 		if err != nil {
 			return fmt.Errorf("mysql: applier: update %s.%s: %w", v.Schema, v.Table, err)
 		}
@@ -478,7 +521,7 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, c ir.Change) e
 		}
 		stmt, args := buildDeleteSQL(applierSchema(a.schema, v.Schema), v.Table, v.Before, colTypes)
 		// Delete misses are tolerated for the same reason as Update.
-		res, err := tx.ExecContext(ctx, stmt, args...)
+		res, err := a.txExec(ctx, tx, stmt, args...)
 		if err != nil {
 			return fmt.Errorf("mysql: applier: delete from %s.%s: %w", v.Schema, v.Table, err)
 		}
@@ -487,7 +530,7 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, c ir.Change) e
 
 	case ir.Truncate:
 		stmt := buildTruncateSQL(applierSchema(a.schema, v.Schema), v.Table)
-		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+		if _, err := a.txExec(ctx, tx, stmt); err != nil {
 			return fmt.Errorf("mysql: applier: truncate %s.%s: %w", v.Schema, v.Table, err)
 		}
 		return nil

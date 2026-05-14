@@ -4,6 +4,7 @@
 package postgres
 
 import (
+	"context"
 	"database/sql/driver"
 	"errors"
 	"fmt"
@@ -79,6 +80,8 @@ func TestClassifyApplierError_RetriableShapes(t *testing.T) {
 		{"driver.ErrBadConn", driver.ErrBadConn},
 		{"io.EOF", io.EOF},
 		{"wrapped driver.ErrBadConn", fmt.Errorf("query: %w", driver.ErrBadConn)},
+		{"context.DeadlineExceeded (GitHub #23 per-exec timeout)", context.DeadlineExceeded},
+		{"wrapped context.DeadlineExceeded (GitHub #23)", fmt.Errorf("postgres: applier: insert: %w", context.DeadlineExceeded)},
 		{"connection reset by peer", errors.New("write tcp: connection reset by peer")},
 		{"connection refused", errors.New("dial tcp: connection refused")},
 		{"broken pipe", errors.New("write tcp: broken pipe")},

@@ -1011,3 +1011,25 @@ func applyMaxBufferBytes(target any, bytes int64) {
 		setter.SetMaxBufferBytes(bytes)
 	}
 }
+
+// applyExecTimeout plumbs the streamer-side --apply-exec-timeout
+// value to an engine-side [ir.ChangeApplier] that opts into the
+// per-exec deadline via [ir.ApplyExecTimeoutSetter]. Engines that
+// don't implement the setter inherit the pre-v0.52.0 behaviour
+// (no per-statement deadline; the apply call uses only the
+// streamer's parent context).
+//
+// Zero or negative duration is a no-op — the setter is not called,
+// so the applier's existing default applies (typically "no timeout").
+//
+// Called immediately after each engine applier opens, before any
+// ApplyBatch dispatch. Closes the GitHub #23 silent-stall failure
+// mode by guaranteeing every Exec returns within a bounded window.
+func applyExecTimeout(target any, d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	if setter, ok := target.(ir.ApplyExecTimeoutSetter); ok {
+		setter.SetExecTimeout(d)
+	}
+}

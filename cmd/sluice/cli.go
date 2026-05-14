@@ -454,6 +454,8 @@ type SyncStartCmd struct {
 
 	MaxBufferBytes int64 `help:"Soft cap on per-batch buffered memory in the CDC applier (and, on the cold-start branch, the bulk-copy writer). The applier commits the in-flight target tx when accumulated row-value bytes reach the cap regardless of row count, so wide-row streams (TEXT/BYTEA/JSON at MB scale) don't blow out heap. A single change larger than the cap still applies (soft target). Default 67108864 (64 MiB). See ADR-0028." default:"67108864" placeholder:"N"`
 
+	ApplyExecTimeout time.Duration `help:"Per-statement deadline applied to every tx.ExecContext on the apply path. GitHub #23 Phase B fix (v0.52.0): closes the silent-stall failure mode where a half-closed destination connection blocked the apply goroutine indefinitely inside the driver's TLS read path. On expiry the driver returns context.DeadlineExceeded, which is classified retriable so the runWithRetry loop reopens the applier and retries the batch on a fresh connection. 0 disables (the pre-v0.52.0 behaviour: unbounded). Tune up for legitimately slow batch upserts on slow targets; down for tighter stall detection." default:"60s" placeholder:"DUR"`
+
 	ApplyRetryAttempts    int           `help:"Maximum consecutive retriable apply failures the streamer absorbs before exiting. ADR-0038. 1 = no retry (exit on first transient — pre-v0.42.0 behaviour). 8 = default for managed-Vitess / Vitess-flavoured MySQL where tx-killer transients are routine. Counter resets when persisted CDC position advances between attempts; a streamer surviving for hours doesn't carry retry debt." default:"8" placeholder:"N"`
 	ApplyRetryBackoffBase time.Duration `help:"Base interval for the exponential backoff between retriable apply failures. ADR-0038. Doubles on each consecutive failure, capped at --apply-retry-backoff-cap. Only consulted when --apply-retry-attempts > 1." default:"100ms" placeholder:"DUR"`
 	ApplyRetryBackoffCap  time.Duration `help:"Upper bound on each per-attempt backoff interval. ADR-0038. Defaults to 30s. With 8 attempts and default base, the per-attempt sequence is: 100ms → 200ms → 400ms → 800ms → 1.6s → 3.2s → 6.4s → 12.8s, capped at the cap when it grows past." default:"30s" placeholder:"DUR"`
@@ -575,6 +577,7 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 		SchemaAlreadyApplied:      s.SchemaAlreadyApplied,
 		ApplyBatchSize:            s.ApplyBatchSize,
 		MaxBufferBytes:            s.MaxBufferBytes,
+		ApplyExecTimeout:          s.ApplyExecTimeout,
 		ApplyRetryAttempts:        s.ApplyRetryAttempts,
 		ApplyRetryBackoffBase:     s.ApplyRetryBackoffBase,
 		ApplyRetryBackoffCap:      s.ApplyRetryBackoffCap,

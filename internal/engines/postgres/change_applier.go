@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"time"
 
 	"github.com/jackc/pglogrepl"
 
@@ -177,6 +178,25 @@ type ChangeApplier struct {
 	// negative means "no byte cap"; the row-count cap remains the
 	// only flush trigger. See ADR-0028.
 	maxBufferBytes int64
+
+	// execTimeout is the per-statement deadline applied to every
+	// tx.ExecContext call on the apply path. Set by [SetExecTimeout]
+	// when the streamer observes the operator's --apply-exec-timeout
+	// flag (GitHub issue #23 Phase B fix, v0.52.0). Zero or negative
+	// means "no per-exec timeout" — the legacy v0.51.0 behaviour where
+	// the apply call inherits only the streamer's parent context.
+	//
+	// When non-zero, each Exec is wrapped in context.WithTimeout. On
+	// expiry the pgx driver's context-watcher closes the underlying
+	// connection and returns context.DeadlineExceeded, which the
+	// applier's [classifyApplierError] treats as retriable. The
+	// existing runWithRetry loop then re-opens the applier and retries
+	// the batch.
+	//
+	// Closes the silent-stall failure mode where a half-closed
+	// destination connection blocked the apply goroutine indefinitely
+	// inside crypto/tls.(*Conn).Read.
+	execTimeout time.Duration
 }
 
 // SetMaxBufferBytes implements [ir.MaxBufferBytesSetter]. The
@@ -186,6 +206,28 @@ type ChangeApplier struct {
 // trigger.
 func (a *ChangeApplier) SetMaxBufferBytes(bytes int64) {
 	a.maxBufferBytes = bytes
+}
+
+// SetExecTimeout sets the per-statement deadline applied to every
+// tx.ExecContext call on the apply path. Implements the pipeline's
+// applierExecTimeoutSetter optional interface (GitHub issue #23
+// Phase B fix, v0.52.0). Zero or negative disables the timeout.
+func (a *ChangeApplier) SetExecTimeout(d time.Duration) {
+	a.execTimeout = d
+}
+
+// txExec wraps tx.ExecContext with the applier's per-exec timeout
+// (when set). On timeout expiry the pgx driver's ctx-watcher closes
+// the underlying connection; the resulting context.DeadlineExceeded
+// is classified retriable by [classifyApplierError] so the
+// runWithRetry loop activates.
+func (a *ChangeApplier) txExec(ctx context.Context, tx *sql.Tx, query string, args ...any) (sql.Result, error) {
+	if a.execTimeout <= 0 {
+		return tx.ExecContext(ctx, query, args...)
+	}
+	execCtx, cancel := context.WithTimeout(ctx, a.execTimeout)
+	defer cancel()
+	return tx.ExecContext(execCtx, query, args...)
 }
 
 // LSNTracker returns the applier's applied-LSN feedback channel.
@@ -540,7 +582,7 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, c ir.Change) e
 		if err != nil {
 			return fmt.Errorf("postgres: applier: build insert for %s.%s: %w", schema, v.Table, err)
 		}
-		if _, err := tx.ExecContext(ctx, stmt, args...); err != nil {
+		if _, err := a.txExec(ctx, tx, stmt, args...); err != nil {
 			return fmt.Errorf("postgres: applier: insert into %s.%s: %w", schema, v.Table, err)
 		}
 		return nil
@@ -564,7 +606,7 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, c ir.Change) e
 		// idempotency; the same caveat as MySQL applies — see the
 		// MySQL applier's dispatch comment for the rationale and the
 		// debug-log defence-in-depth.
-		res, err := tx.ExecContext(ctx, stmt, args...)
+		res, err := a.txExec(ctx, tx, stmt, args...)
 		if err != nil {
 			return fmt.Errorf("postgres: applier: update %s.%s: %w", schema, v.Table, err)
 		}
@@ -586,7 +628,7 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, c ir.Change) e
 		if err != nil {
 			return fmt.Errorf("postgres: applier: build delete for %s.%s: %w", schema, v.Table, err)
 		}
-		res, err := tx.ExecContext(ctx, stmt, args...)
+		res, err := a.txExec(ctx, tx, stmt, args...)
 		if err != nil {
 			return fmt.Errorf("postgres: applier: delete from %s.%s: %w", schema, v.Table, err)
 		}
@@ -596,7 +638,7 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, c ir.Change) e
 	case ir.Truncate:
 		schema := applierSchema(a.schema, v.Schema)
 		stmt := buildTruncateSQL(schema, v.Table)
-		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+		if _, err := a.txExec(ctx, tx, stmt); err != nil {
 			// Truncate of a missing table fails with "relation does
 			// not exist"; treat as a benign skip-with-warning so the
 			// stream survives a stale-publication TRUNCATE event.

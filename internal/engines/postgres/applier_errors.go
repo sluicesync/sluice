@@ -4,6 +4,7 @@
 package postgres
 
 import (
+	"context"
 	"database/sql/driver"
 	"errors"
 	"io"
@@ -68,7 +69,17 @@ func classifyApplierError(err error) error {
 	}
 
 	// Driver-level "bad connection" / EOF — auto-reconnect on retry.
-	if errors.Is(err, driver.ErrBadConn) || errors.Is(err, io.EOF) {
+	//
+	// context.DeadlineExceeded surfaces when a per-exec timeout
+	// expires on the apply path's tx.ExecContext call (GitHub #23
+	// Phase B fix, v0.52.0). The destination connection is closed
+	// by pgx's ctx-watcher; the next attempt opens a fresh
+	// connection from the pool. Classifying this as retriable closes
+	// the silent-stall failure mode where a half-closed destination
+	// connection blocked the apply goroutine indefinitely.
+	if errors.Is(err, driver.ErrBadConn) ||
+		errors.Is(err, io.EOF) ||
+		errors.Is(err, context.DeadlineExceeded) {
 		return &retriablePGError{err: err}
 	}
 

@@ -4,6 +4,7 @@
 package mysql
 
 import (
+	"context"
 	"database/sql/driver"
 	"errors"
 	"fmt"
@@ -83,6 +84,8 @@ func TestClassifyApplierError_RetriableShapes(t *testing.T) {
 		{"io.EOF", io.EOF},
 		{"gomysql.ErrInvalidConn (GitHub #21)", gomysql.ErrInvalidConn},
 		{"wrapped gomysql.ErrInvalidConn (GitHub #21)", fmt.Errorf("mysql: applier: insert: %w", gomysql.ErrInvalidConn)},
+		{"context.DeadlineExceeded (GitHub #23 per-exec timeout)", context.DeadlineExceeded},
+		{"wrapped context.DeadlineExceeded (GitHub #23)", fmt.Errorf("mysql: applier: insert into x: %w", context.DeadlineExceeded)},
 		{"wrapped driver.ErrBadConn", fmt.Errorf("query: %w", driver.ErrBadConn)},
 		{"connection reset by peer", errors.New("write tcp: connection reset by peer")},
 		{"connection refused", errors.New("dial tcp: connection refused")},

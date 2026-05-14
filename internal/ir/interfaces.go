@@ -193,6 +193,27 @@ type MaxBufferBytesSetter interface {
 	SetMaxBufferBytes(bytes int64)
 }
 
+// ApplyExecTimeoutSetter is the optional surface a [ChangeApplier]
+// can implement to accept a per-statement deadline for every
+// tx.ExecContext on the apply path. The pipeline orchestrator
+// threads [pipeline.Streamer.ApplyExecTimeout] to every applier
+// that exposes this setter; engines that don't implement it inherit
+// only the streamer's parent context (the pre-v0.52.0 behaviour).
+//
+// Zero or negative duration disables the per-exec timeout. Positive
+// values are interpreted as a hard deadline per Exec; on expiry the
+// driver's ctx-watcher closes the underlying connection and returns
+// [context.DeadlineExceeded], which the applier's error classifier
+// should treat as retriable so the runWithRetry loop activates and
+// the next attempt acquires a fresh connection from the pool.
+//
+// Closes the GitHub issue #23 silent-stall failure mode (v0.52.0)
+// where a half-closed destination connection blocked the apply
+// goroutine indefinitely inside the driver's TLS read path.
+type ApplyExecTimeoutSetter interface {
+	SetExecTimeout(d time.Duration)
+}
+
 // RangeBoundsQuerier is the optional surface a [RowReader] can
 // implement to expose MIN/MAX queries on a single PK column. Used by
 // the parallel-bulk-copy phase (v0.5.0) to compute chunk boundaries

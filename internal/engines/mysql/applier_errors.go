@@ -4,6 +4,7 @@
 package mysql
 
 import (
+	"context"
 	"database/sql/driver"
 	"errors"
 	"io"
@@ -85,9 +86,18 @@ func classifyApplierError(err error) error {
 	// TCP reset). GitHub issue #21: pre-v0.48.0 the classifier missed
 	// this sentinel and the applier exited instead of retrying, even
 	// though the same connection-reset class on PG retries fine.
+	//
+	// context.DeadlineExceeded surfaces when a per-exec timeout
+	// expires on the apply path's tx.ExecContext call (GitHub #23
+	// Phase B fix, v0.52.0). The destination connection is closed
+	// by the driver's watchCancel; the next attempt opens a fresh
+	// connection from the pool. Classifying this as retriable closes
+	// the silent-stall failure mode where a half-closed destination
+	// connection blocked the apply goroutine indefinitely.
 	if errors.Is(err, driver.ErrBadConn) ||
 		errors.Is(err, io.EOF) ||
-		errors.Is(err, gomysql.ErrInvalidConn) {
+		errors.Is(err, gomysql.ErrInvalidConn) ||
+		errors.Is(err, context.DeadlineExceeded) {
 		return &retriableMySQLError{err: err}
 	}
 
