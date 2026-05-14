@@ -15,6 +15,7 @@ import (
 
 	"github.com/orware/sluice/internal/config"
 	"github.com/orware/sluice/internal/ir"
+	"github.com/orware/sluice/internal/redact"
 	"github.com/orware/sluice/internal/translate"
 )
 
@@ -315,6 +316,14 @@ type Streamer struct {
 	// enough for a legitimately slow batch upsert but short enough
 	// to bound the silent-stall window (GitHub issue #23).
 	ApplyExecTimeout time.Duration
+
+	// Redactor is the operator-configured PII redaction policy.
+	// PII Phase 1 (roadmap item 15a; GitHub issue #24). Same shape
+	// as [Migrator.Redactor] — see that field's doc for the design.
+	// CDC apply paths route every change row through
+	// [pipeline.redactRow] before dispatch when this field is
+	// non-nil and non-empty.
+	Redactor *redact.Registry
 
 	// PositionFromManifestStore is the [ir.BackupStore] the chain
 	// terminal position is read from when the operator passes

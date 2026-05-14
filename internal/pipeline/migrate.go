@@ -40,6 +40,7 @@ import (
 
 	"github.com/orware/sluice/internal/config"
 	"github.com/orware/sluice/internal/ir"
+	"github.com/orware/sluice/internal/redact"
 	"github.com/orware/sluice/internal/translate"
 )
 
@@ -210,6 +211,22 @@ type Migrator struct {
 	// is to refuse it, which would silently break otherwise-valid
 	// migrations). See ADR-0028.
 	MaxBufferBytes int64
+
+	// Redactor is the operator-configured PII redaction policy.
+	// PII Phase 1 (roadmap item 15a; GitHub issue #24). When non-nil
+	// and non-empty, every row's per-column values are passed through
+	// the registry's lookup → Strategy.Redact step before reaching
+	// the per-engine prepareValue. nil or empty Registry is the
+	// no-redactions hot path (zero-cost passthrough; see
+	// [pipeline.redactRow]).
+	//
+	// Phase 1's surface is internal-only: the CLI flag wiring is
+	// deferred to a follow-up commit so the prep-doc's open design
+	// questions (flag syntax, --require-redactions, key-source
+	// shape) can be aligned before they're baked in. Test code and
+	// direct Go API callers can populate this field today; CLI
+	// operators get the feature once the flag lands.
+	Redactor *redact.Registry
 
 	// TargetSchema is the per-source target-schema namespace
 	// (`--target-schema NAME`, ADR-0031). When set, every emitted
