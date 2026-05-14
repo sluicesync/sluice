@@ -126,6 +126,9 @@ type MigrateCmd struct {
 	TargetSchema string `help:"Per-source target schema namespace (Postgres-only). When set, every emitted CREATE TABLE / ALTER TABLE / CREATE INDEX / CREATE TYPE prefixes the table reference with this schema. Use to land multiple sluice streams on the same target without table-name collisions (Shape B microservices → analytics warehouse, ADR-0031). The schema is auto-created on the target if it doesn't exist. The control table sluice_cdc_state stays in the DSN's default schema regardless. MySQL operators use a different --target DSN database instead — schemas and databases collapse on MySQL." placeholder:"NAME"`
 
 	EnablePGExtension []string `help:"Enable passthrough for a Postgres extension type (repeatable). Same-engine PG → PG passthrough preserves the source-native shape on the target. Cross-engine targets (MySQL) keep the loud-failure default except for hstore (→ JSON) and citext (→ VARCHAR with case-insensitive collation), which have built-in default translators. Each named extension must be installed on both source and target — sluice preflights via pg_extension before any data moves. Recognised: vector (pgvector), pg_trgm, hstore, citext. v1 shortlist per docs/research/pg-extensions-deployment-frequency.md. See ADR-0032." placeholder:"EXT"`
+
+	Redact          []string `help:"Redact a PII column (repeatable). Format: '[schema.]table.column=STRATEGY[:options]'. Strategies: null (NULLABLE columns only), static:<value>, hash:sha256 (deterministic), hash:hmac-sha256 (requires --redact-key-source), truncate:<n> (first N runes; string columns only). Examples: --redact users.email=hash:sha256, --redact billing.accounts.credit_card=static:REDACTED, --redact users.phone=truncate:4. Phase 1 covers the bulk-copy path (migrate + sync start cold-start); CDC apply redaction is a Phase 1.5 follow-up. See docs/dev/notes/prep-pii-redaction-phase-1.md." placeholder:"RULE"`
+	RedactKeySource string   `help:"Source for the HMAC keyset when --redact rules use 'hash:hmac-sha256'. Forms: 'env:VARNAME' reads from environment variable; 'file:PATH' reads first line of PATH; 'derive:<salt>' derives from --stream-id + salt (Phase 1 simple key-derivation). Only required when at least one --redact rule uses hmac-sha256." placeholder:"SRC"`
 }
 
 // Run implements the migrate subcommand.
@@ -210,6 +213,12 @@ func (m *MigrateCmd) Run(g *Globals) error {
 		TargetSchema:        m.TargetSchema,
 		EnabledPGExtensions: m.EnablePGExtension,
 	}
+	redactor, err := parseRedactFlags(m.Redact, m.RedactKeySource, "")
+	if err != nil {
+		return err
+	}
+	mig.Redactor = redactor
+	logRedactionConfig(redactor, "migrate")
 	return mig.Run(kongContext())
 }
 
@@ -477,6 +486,9 @@ type SyncStartCmd struct {
 	TargetSchema string `help:"Per-source target schema namespace (Postgres-only). When set, every emitted CREATE TABLE / ALTER TABLE / CREATE INDEX / CREATE TYPE prefixes the table reference with this schema, and CDC events apply against the named schema. Use to land multiple concurrent sluice streams on the same target without table-name collisions (Shape B microservices → analytics warehouse, ADR-0031). The schema is auto-created on the target if it doesn't exist. The control table sluice_cdc_state stays in the DSN's default schema regardless — multiple target-schema streams share a single state table per target. MySQL operators use a different --target DSN database instead — schemas and databases collapse on MySQL." placeholder:"NAME"`
 
 	EnablePGExtension []string `help:"Enable passthrough for a Postgres extension type (repeatable). Same-engine PG → PG preserves the source-native shape. Cross-engine targets (MySQL) keep the loud-failure default except for hstore (→ JSON) and citext (→ VARCHAR with case-insensitive collation). Sluice preflights extension presence on both source and target. Recognised: vector (pgvector), pg_trgm, hstore, citext. See ADR-0032." placeholder:"EXT"`
+
+	Redact          []string `help:"Redact a PII column (repeatable). Format: '[schema.]table.column=STRATEGY[:options]'. Strategies: null (NULLABLE columns only), static:<value>, hash:sha256 (deterministic), hash:hmac-sha256 (requires --redact-key-source), truncate:<n> (first N runes; string columns only). Examples: --redact users.email=hash:sha256, --redact billing.accounts.credit_card=static:REDACTED, --redact users.phone=truncate:4. Phase 1 covers the cold-start bulk-copy phase; CDC apply redaction is a Phase 1.5 follow-up. See docs/dev/notes/prep-pii-redaction-phase-1.md." placeholder:"RULE"`
+	RedactKeySource string   `help:"Source for the HMAC keyset when --redact rules use 'hash:hmac-sha256'. Forms: 'env:VARNAME' reads from environment variable; 'file:PATH' reads first line of PATH; 'derive:<salt>' derives from --stream-id + salt (Phase 1 simple key-derivation). Only required when at least one --redact rule uses hmac-sha256." placeholder:"SRC"`
 }
 
 // Run implements `sluice sync start`.
@@ -589,6 +601,12 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 		TargetSchema:              s.TargetSchema,
 		EnabledPGExtensions:       s.EnablePGExtension,
 	}
+	redactor, err := parseRedactFlags(s.Redact, s.RedactKeySource, s.StreamID)
+	if err != nil {
+		return err
+	}
+	streamer.Redactor = redactor
+	logRedactionConfig(redactor, "sync start")
 	return streamer.Run(kongContext())
 }
 

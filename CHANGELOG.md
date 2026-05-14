@@ -6,6 +6,76 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.53.0]
+
+**Lands GitHub issue #24 chunk 15a — PII redaction Phase 1.** First half of the largest user-facing roadmap addition since multi-source aggregation: operators can now declare per-column redactions that fire during the bulk-copy path. "Snapshot prod → staging without PII" is now a first-class workflow instead of requiring an external Tonic / Privacy Dynamics / custom-ETL detour. Phase 2 (format-preserving + tokenize), Phase 3 (JSON-path), and Phase 4 (cross-stream keyset persistence) are tracked separately on the roadmap.
+
+Phase 1 ships the four highest-value strategies — `null` / `static` / `hash:sha256` / `hash:hmac-sha256` / `truncate` — covering ~70% of typical real-world PII redaction asks per the issue body's analysis. CDC apply-path redaction (continuous-sync mode) is a Phase 1.5 follow-up; this release covers the cold-start bulk-copy path that's the main use case for `sluice migrate`.
+
+### Added
+
+- **`--redact TABLE.COLUMN=STRATEGY[:options]`** on `sluice migrate` and `sluice sync start` (repeatable). Operator declares per-column redactions; rules apply during the bulk-copy phase (cold-start for both commands). Supported strategies:
+  - `null` — replace with NULL. Refuses at runtime on NOT NULL columns with operator-actionable hint suggesting `static:` alternative.
+  - `static:<value>` — replace with literal constant. Value isn't logged in the audit line (could leak which columns hold PII).
+  - `hash:sha256` — SHA-256 hex digest (stateless, deterministic across runs and machines). Same input → same 64-char hex.
+  - `hash:hmac-sha256` — keyed hash. Requires `--redact-key-source`; produces deterministic surrogates within a single keyset.
+  - `truncate:<n>` — keep first N runes (not bytes — UTF-8/emoji safe). Refuses non-string columns.
+
+- **`--redact-key-source SOURCE`** on the same commands. Provides the HMAC keyset for `hash:hmac-sha256` rules. Three forms: `env:VARNAME` (read from environment), `file:PATH` (first line of file), `derive:<salt>` (Phase 1's simple key-derivation: SHA-256 of `streamID:salt`). Phase 4 will land a proper keyset-persistence story; until then, operators wanting stable surrogates across multiple streams must use `env:` or `file:` with the same key everywhere.
+
+- **`internal/redact` package** — `Strategy` interface + `Registry` (Set/Get/Empty/Rules; case-folded keys) + the four Phase 1 strategies. Public for external Go-API callers; the CLI layer wraps it via `parseRedactFlags`.
+
+- **Pipeline wiring** at every bulk-copy variant:
+  - `copyTable` (simple cold-start)
+  - `copyTableIdempotent` (mid-stream add-table)
+  - `copyTableWithCursor` (resumable per-batch cursor path)
+  - `copyChunk` (parallel-copy per-chunk goroutine)
+  
+  Each callsite wraps the row channel with the new `redactRows` helper; nil/empty Registry is a zero-cost passthrough (no goroutine, no allocations).
+
+- **`Migrator.Redactor`, `Streamer.Redactor`, `AddTable.Redactor` fields** for direct Go-API callers + structural plumbing.
+
+- **Audit log line** at command start: `sluice: redaction configured scope=migrate columns=N strategies=[...]`. Logs distinct strategy names + total column count but NOT per-column rules (the rules themselves can leak which columns hold PII).
+
+### Migration / Compatibility
+
+- **Drop-in upgrade from v0.52.x.** Operators not setting `--redact` get unchanged pre-v0.53.0 behaviour. The redact wrap is a zero-cost passthrough when no rules are configured (no goroutine spawn, no row allocations).
+
+- **No schema or position-token changes.** Redactions apply at the IR layer between row read and target write; no on-disk format implications.
+
+- **CDC apply path is NOT yet redacted** (deferred to Phase 1.5). `sluice sync start` redacts the cold-start bulk-copy phase but apply-phase changes flow to the target unredacted. The CHANGELOG entry for Phase 1.5 will document the closing of this gap. Operators needing CDC redaction today should restrict to migrate-mode use (no continuous sync after bulk-copy completes).
+
+- **No engine surface changes** — the per-engine writer interfaces (`RowWriter.WriteRows`, etc.) are untouched. Redaction happens upstream of the writer.
+
+### Who needs this release
+
+- **Operators staging production data for dev/QA environments**: the canonical use case. `sluice migrate --redact users.email=hash:sha256 --redact users.phone=truncate:4` produces a staging clone where emails are 64-char hex surrogates (deterministic across runs — supports join-by-email tests) and phones show only the area code. Compliance teams get a written audit trail (the INFO log line at startup); engineers get realistic-shape data without exposure.
+
+- **Operators bound by GDPR / CCPA / HIPAA constraints on cross-region or cross-tenancy data movement**: redact at the source-jurisdiction boundary; the target inherits only the redacted shape.
+
+- **Operators handing data to third-party processors**: `--redact billing.credit_card=static:REDACTED` ensures the processor sees the schema + the row count + the table shape but no card numbers.
+
+- **Anyone NOT redacting PII**: drop-in, no behaviour change.
+
+### Verification
+
+- **`internal/redact` unit tests** (~438 LOC): every strategy's happy + refusal paths; Registry's Set/Get/Empty/Rules + case-folding + nil-strategy panic + last-write-wins.
+- **`internal/pipeline` unit tests** (~210 LOC): `redactRow` + `redactRows` channel-wrapper covering nil/empty passthrough, multi-row streaming, refusal wrapping + channel close, ctx-cancel-exits-cleanly.
+- **`cmd/sluice` unit tests** (~246 LOC): every flag form (each strategy + each key-source variant), every documented refusal, audit log smoke test.
+- **End-to-end validation deferred to the v0.53.0 cycle**: pin scenarios include cold-start migrate with `--redact users.email=hash:sha256` and confirmation that target rows contain SHA-256 hex digests instead of plaintext emails (round-trip via `psql` / `mysql` on the validation rig).
+
+### What's NOT in v0.53.0 (deferred)
+
+- **CDC apply-path redaction** (Phase 1.5) — sync-start's continuous CDC phase still ships changes verbatim.
+- **Backup-stream redaction** (Phase 1.5) — `backup full` / `backup stream run` paths don't yet honour `--redact`.
+- **Schema-preview annotation** — `sluice schema preview` / `schema diff` don't yet annotate redacted columns. Operators can verify via the audit log line.
+- **YAML config support** for the `redactions:` block — Phase 1 ships CLI-only; YAML follows once the operator-visible flag shape settles.
+- **Format-preserving / tokenize / randomize strategies** (Phase 2).
+- **JSON-path redaction** (Phase 3).
+- **Cross-stream keyset persistence** (Phase 4).
+
+See [docs/dev/notes/prep-pii-redaction-phase-1.md](docs/dev/notes/prep-pii-redaction-phase-1.md) for the full design + the roadmap entry for the four-phase sequence.
+
 ## [0.52.2]
 
 **Closes Bug 57 — the v0.52.0/v0.52.1 silent-stall retry path was inert.** Pre-existing bug from v0.52.0 masked by Bug 56. The v0.52.1 cycle subagent reproduced it deterministically on `--apply-exec-timeout=1ms`: sluice exited 0 in ~3 seconds with zero retry log lines. Root cause: the streamer's `runOnce` and `runWithRetry` both tested `errors.Is(err, context.DeadlineExceeded)` BEFORE the `errors.As(err, &ir.RetriableError)` check; since `classifyApplierError` wraps the timeout-driven DeadlineExceeded as a retriable wrapper that preserves the inner error via Unwrap, `errors.Is` matched via the Unwrap walk and the streamer mistook the wrapped timeout for a clean ctx-shutdown — exiting the retry loop without ever activating it.
