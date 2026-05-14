@@ -6,10 +6,12 @@ package postgres
 import (
 	"bytes"
 	"context"
+	"errors"
 	"log/slog"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/orware/sluice/internal/ir"
 )
@@ -380,6 +382,80 @@ func TestBuildSQL_FiltersGeneratedColumns(t *testing.T) {
 		}
 		if !strings.Contains(gotSQL, `"margin"`) {
 			t.Errorf("with nil generated map the filter should not engage; got %q", gotSQL)
+		}
+	})
+}
+
+// TestExecTimeoutCtx pins the wrapping contract for the helper that
+// bounds the writePositionTx call site (Bug 56, v0.52.1). Mirror of
+// the MySQL test; engines duplicate the helper so the per-engine
+// coverage stays local.
+func TestExecTimeoutCtx(t *testing.T) {
+	t.Run("zero timeout returns input ctx verbatim", func(t *testing.T) {
+		a := &ChangeApplier{execTimeout: 0}
+		ctx, cancel := a.execTimeoutCtx(context.Background())
+		defer cancel()
+		if _, ok := ctx.Deadline(); ok {
+			t.Errorf("zero timeout: child ctx has a deadline; want none")
+		}
+	})
+
+	t.Run("negative timeout returns input ctx verbatim", func(t *testing.T) {
+		a := &ChangeApplier{execTimeout: -5 * time.Second}
+		ctx, cancel := a.execTimeoutCtx(context.Background())
+		defer cancel()
+		if _, ok := ctx.Deadline(); ok {
+			t.Errorf("negative timeout: child ctx has a deadline; want none")
+		}
+	})
+
+	t.Run("positive timeout produces a child ctx with a deadline within the window", func(t *testing.T) {
+		a := &ChangeApplier{execTimeout: 50 * time.Millisecond}
+		start := time.Now()
+		ctx, cancel := a.execTimeoutCtx(context.Background())
+		defer cancel()
+		dl, ok := ctx.Deadline()
+		if !ok {
+			t.Fatal("positive timeout: child ctx has no deadline; want one")
+		}
+		if dl.Before(start) || dl.After(start.Add(60*time.Millisecond)) {
+			t.Errorf("deadline %v outside expected window [%v, %v]", dl, start, start.Add(60*time.Millisecond))
+		}
+	})
+}
+
+// TestRunWithDeadline mirrors the MySQL test. The PG engine has its
+// own copy of runWithDeadline so the watchdog stays local to the
+// package; the tests stay symmetric for the same reason.
+func TestRunWithDeadline(t *testing.T) {
+	t.Run("zero timeout: passthrough preserves return verbatim", func(t *testing.T) {
+		sentinel := errors.New("synthetic commit failure")
+		got := runWithDeadline(0, func() error { return sentinel })
+		if !errors.Is(got, sentinel) {
+			t.Errorf("zero-timeout passthrough lost the original error; got %v; want %v", got, sentinel)
+		}
+	})
+
+	t.Run("positive timeout: fast f returns its own value", func(t *testing.T) {
+		sentinel := errors.New("fast f")
+		got := runWithDeadline(500*time.Millisecond, func() error { return sentinel })
+		if !errors.Is(got, sentinel) {
+			t.Errorf("fast-f race lost the original error; got %v; want %v", got, sentinel)
+		}
+	})
+
+	t.Run("positive timeout: slow f trips watchdog with DeadlineExceeded", func(t *testing.T) {
+		start := time.Now()
+		got := runWithDeadline(20*time.Millisecond, func() error {
+			time.Sleep(500 * time.Millisecond)
+			return nil
+		})
+		if !errors.Is(got, context.DeadlineExceeded) {
+			t.Errorf("slow-f watchdog did not return DeadlineExceeded; got %v", got)
+		}
+		elapsed := time.Since(start)
+		if elapsed > 100*time.Millisecond {
+			t.Errorf("watchdog took %v; expected ~20ms (cap 100ms)", elapsed)
 		}
 	})
 }

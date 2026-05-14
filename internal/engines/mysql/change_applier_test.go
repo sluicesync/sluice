@@ -6,10 +6,12 @@ package mysql
 import (
 	"bytes"
 	"context"
+	"errors"
 	"log/slog"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/orware/sluice/internal/ir"
 )
@@ -384,6 +386,97 @@ func TestBuildSQL_FiltersGeneratedColumns(t *testing.T) {
 		gotSQL, _ := buildInsertSQL("src", "products", row, []string{"id"}, nil)
 		if !strings.Contains(gotSQL, "`margin`") {
 			t.Errorf("with nil colTypes the generated-column filter should not engage; got %q", gotSQL)
+		}
+	})
+}
+
+// TestExecTimeoutCtx pins the wrapping contract for the helper that
+// bounds the writePositionTx call site (Bug 56, v0.52.1).
+//
+//   - Zero / negative execTimeout: returns the input ctx verbatim and
+//     a no-op cancel. The caller's `defer cancel()` is harmless.
+//   - Positive execTimeout: returns a child ctx with a Deadline set
+//     within (now, now+timeout].
+func TestExecTimeoutCtx(t *testing.T) {
+	t.Run("zero timeout returns input ctx verbatim", func(t *testing.T) {
+		a := &ChangeApplier{execTimeout: 0}
+		ctx, cancel := a.execTimeoutCtx(context.Background())
+		defer cancel()
+		if _, ok := ctx.Deadline(); ok {
+			t.Errorf("zero timeout: child ctx has a deadline; want none")
+		}
+	})
+
+	t.Run("negative timeout returns input ctx verbatim", func(t *testing.T) {
+		a := &ChangeApplier{execTimeout: -5 * time.Second}
+		ctx, cancel := a.execTimeoutCtx(context.Background())
+		defer cancel()
+		if _, ok := ctx.Deadline(); ok {
+			t.Errorf("negative timeout: child ctx has a deadline; want none")
+		}
+	})
+
+	t.Run("positive timeout produces a child ctx with a deadline within the window", func(t *testing.T) {
+		a := &ChangeApplier{execTimeout: 50 * time.Millisecond}
+		start := time.Now()
+		ctx, cancel := a.execTimeoutCtx(context.Background())
+		defer cancel()
+		dl, ok := ctx.Deadline()
+		if !ok {
+			t.Fatal("positive timeout: child ctx has no deadline; want one")
+		}
+		if dl.Before(start) || dl.After(start.Add(60*time.Millisecond)) {
+			t.Errorf("deadline %v outside expected window [%v, %v]", dl, start, start.Add(60*time.Millisecond))
+		}
+	})
+}
+
+// TestRunWithDeadline exercises the package-level watchdog that
+// [commitWithTimeout] delegates to (Bug 56, v0.52.1). The watchdog
+// race semantics need direct coverage because the production failure
+// mode (tx.Commit blocked inside crypto/tls.(*Conn).Read on a
+// half-closed PlanetScale destination) can't be reproduced in a unit
+// test — but the race + cancel + passthrough logic is testable with
+// synthetic closures.
+func TestRunWithDeadline(t *testing.T) {
+	t.Run("zero timeout: passthrough preserves return verbatim", func(t *testing.T) {
+		sentinel := errors.New("synthetic commit failure")
+		got := runWithDeadline(0, func() error { return sentinel })
+		if !errors.Is(got, sentinel) {
+			t.Errorf("zero-timeout passthrough lost the original error; got %v; want %v", got, sentinel)
+		}
+	})
+
+	t.Run("negative timeout: same passthrough", func(t *testing.T) {
+		got := runWithDeadline(-1*time.Second, func() error { return nil })
+		if got != nil {
+			t.Errorf("negative-timeout passthrough produced unexpected error: %v", got)
+		}
+	})
+
+	t.Run("positive timeout: fast f returns its own value", func(t *testing.T) {
+		sentinel := errors.New("fast f")
+		got := runWithDeadline(500*time.Millisecond, func() error { return sentinel })
+		if !errors.Is(got, sentinel) {
+			t.Errorf("fast-f race lost the original error; got %v; want %v", got, sentinel)
+		}
+	})
+
+	t.Run("positive timeout: slow f trips watchdog with DeadlineExceeded", func(t *testing.T) {
+		// f sleeps longer than the timeout; the watchdog must fire.
+		start := time.Now()
+		got := runWithDeadline(20*time.Millisecond, func() error {
+			time.Sleep(500 * time.Millisecond)
+			return nil
+		})
+		if !errors.Is(got, context.DeadlineExceeded) {
+			t.Errorf("slow-f watchdog did not return DeadlineExceeded; got %v", got)
+		}
+		// The wall-clock cost should match the timeout, not f's sleep.
+		// Allow generous slack for scheduler jitter, especially on CI.
+		elapsed := time.Since(start)
+		if elapsed > 100*time.Millisecond {
+			t.Errorf("watchdog took %v; expected ~20ms (cap 100ms)", elapsed)
 		}
 	})
 }

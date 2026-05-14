@@ -324,7 +324,10 @@ func (a *ChangeApplier) applyOneBatch(ctx context.Context, streamID string, chan
 // either, and the reader's keepalive will keep ack'ing the
 // previous floor.
 func (a *ChangeApplier) commitBatch(ctx context.Context, tx *sql.Tx, streamID, token string, rows int) error {
-	if err := writePositionTx(ctx, tx, a.controlSchema, streamID, token, a.slotName, a.sourceFingerprint, a.targetSchema); err != nil {
+	posCtx, posCancel := a.execTimeoutCtx(ctx)
+	err := writePositionTx(posCtx, tx, a.controlSchema, streamID, token, a.slotName, a.sourceFingerprint, a.targetSchema)
+	posCancel()
+	if err != nil {
 		_ = tx.Rollback()
 		slog.WarnContext(ctx, "postgres: applier: batch rollback on position-write error",
 			slog.String("stream_id", streamID),
@@ -333,7 +336,7 @@ func (a *ChangeApplier) commitBatch(ctx context.Context, tx *sql.Tx, streamID, t
 		)
 		return err
 	}
-	if err := tx.Commit(); err != nil {
+	if err := a.commitWithTimeout(tx); err != nil {
 		slog.WarnContext(ctx, "postgres: applier: batch commit error",
 			slog.String("stream_id", streamID),
 			slog.Int("rows_attempted", rows),

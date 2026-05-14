@@ -230,6 +230,70 @@ func (a *ChangeApplier) txExec(ctx context.Context, tx *sql.Tx, query string, ar
 	return tx.ExecContext(execCtx, query, args...)
 }
 
+// execTimeoutCtx returns ctx wrapped with the applier's per-exec
+// timeout (when set) plus the matching cancel func. Used at the
+// writePositionTx call site, which is a package-level helper not
+// reachable via [txExec]. Callers must `defer cancel()` (or call
+// `cancel()` after the wrapped operation returns).
+//
+// Bug 56 (v0.52.1): the position-write path is the second TLS-read
+// surface on the apply hot path; pre-v0.52.1 it was not wrapped, so
+// a half-closed destination connection could still stall the apply
+// goroutine indefinitely inside [writePositionTx]'s bare
+// `tx.ExecContext`. Wrapping at the call site closes that gap.
+func (a *ChangeApplier) execTimeoutCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	if a.execTimeout <= 0 {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, a.execTimeout)
+}
+
+// commitWithTimeout runs tx.Commit() under the per-exec watchdog
+// (see [runWithDeadline] for the semantics and Bug 56 / v0.52.1
+// rationale). Thin wrapper that exists so callers don't have to
+// thread the closure manually.
+func (a *ChangeApplier) commitWithTimeout(tx *sql.Tx) error {
+	return runWithDeadline(a.execTimeout, tx.Commit)
+}
+
+// runWithDeadline runs f under a wall-clock deadline of `timeout`.
+// Zero or negative timeout is a passthrough (f runs to completion
+// inline). For positive timeouts, f runs in a goroutine and we race
+// its return against a time.After: whichever wins, wins.
+//
+// On timeout we return [context.DeadlineExceeded] (classified
+// retriable by [classifyApplierError]) so the runWithRetry loop
+// reopens the applier on a fresh connection. The orphaned f goroutine
+// cannot be cancelled — it will eventually return when the underlying
+// state (typically a TCP socket the caller closes via Close()) errors
+// out. One orphaned goroutine per timeout event is the bounded cost
+// of closing the silent-stall failure mode.
+//
+// Used by [commitWithTimeout] because [database/sql.Tx.Commit] takes
+// no context. Pulled out as a package-level function so it's testable
+// without constructing a real *sql.Tx; the watchdog race semantics
+// are non-trivial enough to deserve direct coverage.
+//
+// Bug 56 (v0.52.1): the apply path's third TLS-read surface (after
+// dispatch's tx.ExecContext + writePositionTx) is the implicit commit
+// flush. Pre-v0.52.1 it had no deadline; goroutine pprof on a v0.52.0
+// stall showed goroutine 1 blocked at tx.Commit() for >10 min.
+func runWithDeadline(timeout time.Duration, f func() error) error {
+	if timeout <= 0 {
+		return f()
+	}
+	done := make(chan error, 1)
+	go func() { done <- f() }()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		return err
+	case <-timer.C:
+		return context.DeadlineExceeded
+	}
+}
+
 // LSNTracker returns the applier's applied-LSN feedback channel.
 // The [pipeline.Streamer] uses the structural interface
 // `lsnTrackerProvider` to fetch this and hand it to the
@@ -392,11 +456,14 @@ func (a *ChangeApplier) WritePosition(ctx context.Context, streamID string, pos 
 	if err != nil {
 		return fmt.Errorf("postgres: applier: WritePosition: begin tx: %w", err)
 	}
-	if err := writePositionTx(ctx, tx, a.controlSchema, streamID, pos.Token, a.slotName, a.sourceFingerprint, a.targetSchema); err != nil {
+	posCtx, posCancel := a.execTimeoutCtx(ctx)
+	err = writePositionTx(posCtx, tx, a.controlSchema, streamID, pos.Token, a.slotName, a.sourceFingerprint, a.targetSchema)
+	posCancel()
+	if err != nil {
 		_ = tx.Rollback()
 		return err
 	}
-	if err := tx.Commit(); err != nil {
+	if err := a.commitWithTimeout(tx); err != nil {
 		return fmt.Errorf("postgres: applier: WritePosition: commit: %w", err)
 	}
 	return nil
@@ -523,11 +590,14 @@ func (a *ChangeApplier) applyOne(ctx context.Context, streamID string, c ir.Chan
 		return classifyApplierError(err)
 	}
 	token := c.Pos().Token
-	if err := writePositionTx(ctx, tx, a.controlSchema, streamID, token, a.slotName, a.sourceFingerprint, a.targetSchema); err != nil {
+	posCtx, posCancel := a.execTimeoutCtx(ctx)
+	err = writePositionTx(posCtx, tx, a.controlSchema, streamID, token, a.slotName, a.sourceFingerprint, a.targetSchema)
+	posCancel()
+	if err != nil {
 		_ = tx.Rollback()
 		return classifyApplierError(err)
 	}
-	if err := tx.Commit(); err != nil {
+	if err := a.commitWithTimeout(tx); err != nil {
 		return classifyApplierError(fmt.Errorf("postgres: applier: commit: %w", err))
 	}
 	a.reportAppliedToken(ctx, token)

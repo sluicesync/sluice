@@ -6,6 +6,36 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.52.1]
+
+**Completes the GitHub #23 silent-stall fix shipped in v0.52.0.** Bug 56: v0.52.0 wrapped the four `dispatch` sites (Insert / Update / Delete / Truncate) with `--apply-exec-timeout` but missed two adjacent destination-side blocking calls on the same apply hot path. The v0.52.0 cycle subagent captured three independent goroutine pprof snapshots over a 10-minute window on the validation rig showing goroutine 1 continuously blocked at the unwrapped sites (first `tx.Commit()`, then `writePositionTx`'s bare `tx.ExecContext`). Same silent-stall failure mode v0.52.0 was meant to close.
+
+### Fixed
+
+- **`writePositionTx` is now wrapped by the per-exec timeout** on both engines, at all three call sites (`applyOne`, `WritePosition`, `commitBatch`). New helper `(*ChangeApplier).execTimeoutCtx(ctx)` returns ctx + cancel; callers wrap the call and `cancel()` once it returns. Matches the existing `txExec` pattern but operates at the call site (writePositionTx is a package-level function, not a method, so it can't be routed through `txExec`).
+
+- **`tx.Commit()` is now wrapped by a per-exec watchdog** on both engines, at all three call sites. New helper `(*ChangeApplier).commitWithTimeout(tx)` delegates to a package-level `runWithDeadline(timeout, f)` that races f against `time.After(timeout)`; whichever wins, wins. On timeout we return `context.DeadlineExceeded` (classified retriable by `classifyApplierError`) so the runWithRetry loop reopens the applier on a fresh connection. `database/sql.Tx.Commit()` takes no context, so the goroutine-race approach is the only mechanism that bounds it; one orphaned goroutine per timeout event is the bounded cost.
+
+### Migration / Compatibility
+
+- **Drop-in upgrade from v0.52.0.** No flag changes; the new wrappers honour the existing `--apply-exec-timeout=DUR` setting. Operators who had set `--apply-exec-timeout=0` (disabled) keep the unbounded behaviour (no watchdog, no goroutine cost).
+- **No schema or position-token changes.**
+- **The retry surface gains no new shape** — `context.DeadlineExceeded` was already classified retriable in v0.52.0; v0.52.1 just adds two more sites that can produce it.
+
+### Who needs this release
+
+- **Anyone who upgraded to v0.52.0 expecting the silent-stall closure**: **upgrade**. v0.52.0's fix is structurally incomplete; the same failure mode recurred on the validation rig within the v0.52.0 cycle's observation window.
+
+- **Anyone still on v0.51.0 or earlier**: skip v0.52.0, upgrade straight to v0.52.1.
+
+### Verification
+
+- **Code-read confirmation** of Bug 56 at six call sites (3 per engine):
+  - MySQL: `change_applier.go::applyOne` (line ~469), `change_applier.go::WritePosition` (line ~405), `change_applier_batch.go::commitBatch` (line ~332)
+  - Postgres: `change_applier.go::applyOne` (line ~526), `change_applier.go::WritePosition` (line ~395), `change_applier_batch.go::commitBatch` (line ~327)
+- **Per-engine unit tests** for the new helpers: `TestExecTimeoutCtx` pins the ctx-wrapping contract; `TestRunWithDeadline` pins the watchdog race semantics (passthrough on zero/negative timeout, fast-f-wins on positive timeout, slow-f-trips-watchdog with `DeadlineExceeded` and bounded wall-clock cost). 8 new test cases (4 per engine).
+- **End-to-end validation deferred to the v0.52.1 cycle** on the validation rig at `C:\code\sluice-validation\` — same scenarios as the v0.52.0 cycle's #23 scenario 1, with the load-bearing pin being "no apply goroutine ever blocks at unwrapped sites for >60s in 3 sequential pprof snapshots".
+
 ## [0.52.0]
 
 **Closes GitHub issue #23 — silent applier stall on half-closed destination connections.** Phase B of the three-phase debug protocol. Phase A (v0.48.0) added the diagnostic surface (`--heartbeat-interval`, `--pprof-listen`) that captured ground truth on the validation rig: with traffic flowing into a PlanetScale source, both MySQL→MySQL and MySQL→PG streams went 4+ minutes without applying any of the 1330+ source rows while heartbeats still fired and pprof remained responsive. Goroutine 1 in both sluice processes was blocked inside `crypto/tls.(*Conn).Read` waiting for an OK packet from the destination that never arrived. The apply goroutine had no per-statement deadline AND the drivers' DSNs set no `readTimeout`, so the read blocked indefinitely; the ADR-0038 retry loop couldn't activate because the apply call never returned to allow classification.
