@@ -1555,7 +1555,10 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 		}
 	}
 
-	bulkOpts := bulkCopyOpts{SkipSchemaApply: s.SchemaAlreadyApplied}
+	bulkOpts := bulkCopyOpts{
+		SkipSchemaApply: s.SchemaAlreadyApplied,
+		Redactor:        s.Redactor,
+	}
 	if err := runBulkCopyWithOpts(ctx, schema, stream.Rows, sw, rw, bulkOpts); err != nil {
 		closeIf(rw)
 		closeIf(sw)

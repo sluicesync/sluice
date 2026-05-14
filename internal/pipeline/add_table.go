@@ -54,6 +54,7 @@ import (
 
 	"github.com/orware/sluice/internal/config"
 	"github.com/orware/sluice/internal/ir"
+	"github.com/orware/sluice/internal/redact"
 	"github.com/orware/sluice/internal/translate"
 )
 
@@ -239,6 +240,13 @@ type AddTable struct {
 	// schema writer / row writer / change applier via the
 	// [ir.SchemaSetter] surface after resolution.
 	TargetSchema string
+
+	// Redactor is the operator-configured PII redaction policy
+	// (Phase 1, roadmap item 15a). Same shape as
+	// [Migrator.Redactor] / [Streamer.Redactor] — see those for the
+	// design. Threaded into the bulk-copy phase of the add-table
+	// path so a newly-added table is PII-clean from the first row.
+	Redactor *redact.Registry
 }
 
 // Run executes the add-table flow. Returns nil on success or a
@@ -495,7 +503,7 @@ func (a *AddTable) Run(ctx context.Context) error {
 	// Engines without [ir.IdempotentRowWriter] (none today; PG and
 	// MySQL both implement it) fall back to plain WriteRows with a
 	// debug log noting the fallback.
-	if err := runBulkCopyForAddTable(ctx, scoped, stream.Rows, sw, rw); err != nil {
+	if err := runBulkCopyForAddTable(ctx, scoped, stream.Rows, sw, rw, a.Redactor); err != nil {
 		return err
 	}
 

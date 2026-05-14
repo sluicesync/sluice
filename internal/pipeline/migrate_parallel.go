@@ -57,6 +57,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/orware/sluice/internal/ir"
+	"github.com/orware/sluice/internal/redact"
 )
 
 // parallelBulkCopyDeps bundles the engine-level dependencies
@@ -170,6 +171,7 @@ func tryParallelCopyTable(
 	deps *parallelBulkCopyDeps,
 	resuming bool,
 	bulkBatchSize int,
+	redactor *redact.Registry,
 ) (bool, error) {
 	if deps == nil || deps.parallelism <= 1 {
 		return false, nil
@@ -207,7 +209,7 @@ func tryParallelCopyTable(
 		return false, nil
 	}
 
-	if err := runChunks(ctx, rc, state, stateMu, primaryRows, primaryRW, deps, table, chunks, bulkBatchSize); err != nil {
+	if err := runChunks(ctx, rc, state, stateMu, primaryRows, primaryRW, deps, table, chunks, bulkBatchSize, redactor); err != nil {
 		return false, err
 	}
 
@@ -306,6 +308,7 @@ func runChunks(
 	table *ir.Table,
 	chunks []ir.TableChunkProgress,
 	bulkBatchSize int,
+	redactor *redact.Registry,
 ) error {
 	additionalReaders, additionalWriters, closeFns, err := openChunkConnections(ctx, deps, len(chunks)-1)
 	if err != nil {
@@ -336,7 +339,7 @@ func runChunks(
 			chunkRW = additionalWriters[k-1]
 		}
 		g.Go(func() error {
-			return copyChunk(gctx, rc, state, stateMu, chunkRows, chunkRW, table, pkCols, k, limit)
+			return copyChunk(gctx, rc, state, stateMu, chunkRows, chunkRW, table, pkCols, k, limit, redactor)
 		})
 	}
 	return g.Wait()
@@ -403,6 +406,7 @@ func copyChunk(
 	pkCols []string,
 	chunkIndex int,
 	limit int,
+	redactor *redact.Registry,
 ) (retErr error) {
 	br, ok := rr.(ir.BatchedRowReader)
 	if !ok {
@@ -460,9 +464,15 @@ func copyChunk(
 		tracker := newPKTracker(pkCols)
 		filtered := filterByUpperBound(batchCtx, rowsCh, pkCols, chunk.UpperPK)
 		teed := teePKAndCount(batchCtx, filtered, tracker, &batchCount, pt.observeRow)
-		if err := iw.WriteRowsIdempotent(batchCtx, table, teed); err != nil {
+		// PII Phase 1: same redact-wrap as [copyTable].
+		redacted, redactErrFn := redactRows(batchCtx, teed, redactor, table.Schema, table.Name, table.Columns)
+		if err := iw.WriteRowsIdempotent(batchCtx, table, redacted); err != nil {
 			cancel()
 			return fmt.Errorf("write chunk %d batch: %w", chunkIndex, err)
+		}
+		if err := redactErrFn(); err != nil {
+			cancel()
+			return fmt.Errorf("redact chunk %d batch: %w", chunkIndex, err)
 		}
 		cancel()
 

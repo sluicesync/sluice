@@ -425,7 +425,7 @@ func (m *Migrator) Run(ctx context.Context) error {
 		maxBufferBytes: m.MaxBufferBytes,
 	}
 
-	if err := runBulkCopyPhases(ctx, rc, &state, schema, rr, sw, rw, resuming, m.BulkBatchSize, parallelDeps); err != nil {
+	if err := runBulkCopyPhases(ctx, rc, &state, schema, rr, sw, rw, resuming, m.BulkBatchSize, parallelDeps, m.Redactor); err != nil {
 		return err
 	}
 
@@ -506,6 +506,12 @@ type bulkCopyOpts struct {
 	// target catalog already matches the source's; sluice does not
 	// validate.
 	SkipSchemaApply bool
+
+	// Redactor is the operator-configured PII redaction policy
+	// (Phase 1, roadmap item 15a). nil/empty Registry is the
+	// no-redactions hot path; see [redactRow] and [redactRows] for
+	// the wrap semantics.
+	Redactor *redact.Registry
 }
 
 // runBulkCopyWithOpts is the configurable variant of [runBulkCopy].
@@ -525,7 +531,7 @@ func runBulkCopyWithOpts(
 		}
 	}
 	for _, table := range schema.Tables {
-		if err := copyTable(ctx, rows, rw, table); err != nil {
+		if err := copyTable(ctx, rows, rw, table, opts.Redactor); err != nil {
 			return wrapWithHint(PhaseBulkCopy, fmt.Errorf("pipeline: copy table %q: %w", table.Name, err))
 		}
 	}
@@ -584,12 +590,13 @@ func runBulkCopyForAddTable(
 	rows ir.RowReader,
 	sw ir.SchemaWriter,
 	rw ir.RowWriter,
+	redactor *redact.Registry,
 ) error {
 	if err := sw.CreateTablesWithoutConstraints(ctx, schema); err != nil {
 		return wrapWithHint(PhaseSchemaApply, fmt.Errorf("pipeline: create tables: %w", err))
 	}
 	for _, table := range schema.Tables {
-		if err := copyTableIdempotent(ctx, rows, rw, table); err != nil {
+		if err := copyTableIdempotent(ctx, rows, rw, table, redactor); err != nil {
 			return wrapWithHint(PhaseBulkCopy, fmt.Errorf("pipeline: copy table %q: %w", table.Name, err))
 		}
 	}
@@ -617,7 +624,7 @@ func runBulkCopyForAddTable(
 // Goroutine-lifecycle handling mirrors [copyTable] exactly — same
 // child-ctx + defer-cancel shape so the row reader unwinds cleanly
 // on error.
-func copyTableIdempotent(ctx context.Context, rr ir.RowReader, rw ir.RowWriter, table *ir.Table) (retErr error) {
+func copyTableIdempotent(ctx context.Context, rr ir.RowReader, rw ir.RowWriter, table *ir.Table, redactor *redact.Registry) (retErr error) {
 	copyCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -630,18 +637,27 @@ func copyTableIdempotent(ctx context.Context, rr ir.RowReader, rw ir.RowWriter, 
 	defer func() { pt.Stop(ctx, retErr) }()
 
 	teed := teeRows(copyCtx, rows, pt.observeRow)
+	// PII Phase 1: same wrap as [copyTable] — nil/empty Registry
+	// short-circuits to pass-through.
+	redacted, redactErrFn := redactRows(copyCtx, teed, redactor, table.Schema, table.Name, table.Columns)
 	idem, ok := rw.(ir.IdempotentRowWriter)
 	if !ok {
 		slog.DebugContext(ctx, "add-table: row writer does not implement IdempotentRowWriter; falling back to plain WriteRows (the [publication-add, snapshot-open] overlap window may surface as a duplicate-key error under sustained load)",
 			slog.String("table", table.Name),
 		)
-		if err := rw.WriteRows(copyCtx, table, teed); err != nil {
+		if err := rw.WriteRows(copyCtx, table, redacted); err != nil {
 			return fmt.Errorf("write rows: %w", err)
+		}
+		if err := redactErrFn(); err != nil {
+			return fmt.Errorf("redact rows: %w", err)
 		}
 		return nil
 	}
-	if err := idem.WriteRowsIdempotent(copyCtx, table, teed); err != nil {
+	if err := idem.WriteRowsIdempotent(copyCtx, table, redacted); err != nil {
 		return fmt.Errorf("write rows (idempotent): %w", err)
+	}
+	if err := redactErrFn(); err != nil {
+		return fmt.Errorf("redact rows: %w", err)
 	}
 	return nil
 }
@@ -679,6 +695,7 @@ func runBulkCopyPhases(
 	resuming bool,
 	bulkBatchSize int,
 	parallel *parallelBulkCopyDeps,
+	redactor *redact.Registry,
 ) error {
 	// Phase 1: tables.
 	if err := markPhase(ctx, rc, state, ir.MigrationPhaseTables); err != nil {
@@ -705,7 +722,7 @@ func runBulkCopyPhases(
 	// the mutex when checkpointing its cursor.
 	var stateMu sync.Mutex
 	for _, table := range schema.Tables {
-		if err := bulkCopyOneTable(ctx, rc, state, &stateMu, rows, rw, table, resuming, bulkBatchSize, parallel); err != nil {
+		if err := bulkCopyOneTable(ctx, rc, state, &stateMu, rows, rw, table, resuming, bulkBatchSize, parallel, redactor); err != nil {
 			return err
 		}
 	}
@@ -882,7 +899,7 @@ func (m *Migrator) validate() error {
 // outcome (defer cancel). The reader and tee see ctx.Done() fire,
 // drop their pending sends, and exit cleanly. The parent ctx is
 // untouched, so the orchestrator can decide what to do next.
-func copyTable(ctx context.Context, rr ir.RowReader, rw ir.RowWriter, table *ir.Table) (retErr error) {
+func copyTable(ctx context.Context, rr ir.RowReader, rw ir.RowWriter, table *ir.Table, redactor *redact.Registry) (retErr error) {
 	copyCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -902,8 +919,15 @@ func copyTable(ctx context.Context, rr ir.RowReader, rw ir.RowWriter, table *ir.
 	defer func() { pt.Stop(ctx, retErr) }()
 
 	teed := teeRows(copyCtx, rows, pt.observeRow)
-	if err := rw.WriteRows(copyCtx, table, teed); err != nil {
+	// PII Phase 1: wrap the row stream with redaction if the operator
+	// has configured rules. nil/empty Registry is a zero-cost
+	// passthrough — redactRows returns the teed channel verbatim.
+	redacted, redactErrFn := redactRows(copyCtx, teed, redactor, table.Schema, table.Name, table.Columns)
+	if err := rw.WriteRows(copyCtx, table, redacted); err != nil {
 		return fmt.Errorf("write rows: %w", err)
+	}
+	if err := redactErrFn(); err != nil {
+		return fmt.Errorf("redact rows: %w", err)
 	}
 	return nil
 }

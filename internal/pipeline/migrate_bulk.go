@@ -37,6 +37,7 @@ import (
 	"sync/atomic"
 
 	"github.com/orware/sluice/internal/ir"
+	"github.com/orware/sluice/internal/redact"
 )
 
 // defaultBulkBatchSize is the per-batch row count when [Migrator]'s
@@ -75,6 +76,7 @@ func bulkCopyOneTable(
 	resuming bool,
 	bulkBatchSize int,
 	parallel *parallelBulkCopyDeps,
+	redactor *redact.Registry,
 ) error {
 	action := classifyTableForResume(*state, table.Name, resuming)
 	switch action {
@@ -115,7 +117,7 @@ func bulkCopyOneTable(
 	// per-chunk cursors. When [tryParallelCopyTable] returns ran=true,
 	// the parallel path handled the table end-to-end; ran=false means
 	// "fall through to the single-reader path".
-	if ran, err := tryParallelCopyTable(ctx, rc, state, stateMu, rows, rw, table, parallel, resuming, bulkBatchSize); err != nil {
+	if ran, err := tryParallelCopyTable(ctx, rc, state, stateMu, rows, rw, table, parallel, resuming, bulkBatchSize, redactor); err != nil {
 		wrapped := fmt.Errorf("pipeline: copy table %q (parallel): %w", table.Name, err)
 		return wrapWithHint(PhaseBulkCopy, markFailed(ctx, rc, *state, ir.MigrationPhaseBulkCopy, wrapped))
 	} else if ran {
@@ -147,7 +149,7 @@ func bulkCopyOneTable(
 				slog.String("table", table.Name),
 				slog.String("err", err.Error()))
 		}
-		if err := copyTable(ctx, rows, rw, table); err != nil {
+		if err := copyTable(ctx, rows, rw, table, redactor); err != nil {
 			wrapped := fmt.Errorf("pipeline: copy table %q: %w", table.Name, err)
 			return wrapWithHint(PhaseBulkCopy, markFailed(ctx, rc, *state, ir.MigrationPhaseBulkCopy, wrapped))
 		}
@@ -165,7 +167,7 @@ func bulkCopyOneTable(
 	if limit <= 0 {
 		limit = defaultBulkBatchSize
 	}
-	if err := copyTableWithCursor(ctx, rc, state, rw, rows, table, limit); err != nil {
+	if err := copyTableWithCursor(ctx, rc, state, rw, rows, table, limit, redactor); err != nil {
 		wrapped := fmt.Errorf("pipeline: copy table %q: %w", table.Name, err)
 		return wrapWithHint(PhaseBulkCopy, markFailed(ctx, rc, *state, ir.MigrationPhaseBulkCopy, wrapped))
 	}
@@ -240,6 +242,7 @@ func copyTableWithCursor(
 	rr ir.RowReader,
 	table *ir.Table,
 	limit int,
+	redactor *redact.Registry,
 ) (retErr error) {
 	br, ok := rr.(ir.BatchedRowReader)
 	if !ok {
@@ -299,9 +302,16 @@ func copyTableWithCursor(
 		var batchCount int64
 		tracker := newPKTracker(pkCols)
 		teed := teePKAndCount(batchCtx, rowsCh, tracker, &batchCount, pt.observeRow)
-		if err := iw.WriteRowsIdempotent(batchCtx, table, teed); err != nil {
+		// PII Phase 1: same redact-wrap as [copyTable]. nil/empty
+		// Registry is the no-op fast path.
+		redacted, redactErrFn := redactRows(batchCtx, teed, redactor, table.Schema, table.Name, table.Columns)
+		if err := iw.WriteRowsIdempotent(batchCtx, table, redacted); err != nil {
 			cancel()
 			return fmt.Errorf("write batch: %w", err)
+		}
+		if err := redactErrFn(); err != nil {
+			cancel()
+			return fmt.Errorf("redact batch: %w", err)
 		}
 		cancel() // batch goroutines unwind cleanly
 

@@ -4,6 +4,7 @@
 package pipeline
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"strings"
@@ -236,4 +237,126 @@ func TestRedactRow_NilColumnInList(t *testing.T) {
 	if s, ok := row["email"].(string); !ok || len(s) != 64 {
 		t.Errorf("email should be hashed despite nil entries; got %v", row["email"])
 	}
+}
+
+// TestRedactRows_NilRegistryPassesThroughSrcVerbatim pins the
+// zero-allocation fast path: nil/empty Registry returns the source
+// channel verbatim (no goroutine, no wrapping).
+func TestRedactRows_NilRegistryPassesThroughSrcVerbatim(t *testing.T) {
+	src := make(chan ir.Row, 1)
+	var srcRO <-chan ir.Row = src
+	out, errFn := redactRows(context.Background(), src, nil, "public", "users", nil)
+	if out != srcRO {
+		t.Errorf("nil registry: returned channel is not the input src")
+	}
+	if err := errFn(); err != nil {
+		t.Errorf("nil registry: errFn() = %v; want nil", err)
+	}
+
+	r := redact.New()
+	out2, errFn2 := redactRows(context.Background(), src, r, "public", "users", nil)
+	if out2 != srcRO {
+		t.Errorf("empty registry: returned channel is not the input src")
+	}
+	if err := errFn2(); err != nil {
+		t.Errorf("empty registry: errFn() = %v; want nil", err)
+	}
+}
+
+// TestRedactRows_AppliesRedactionsToEveryRow covers the streaming
+// happy path: multiple rows flow through, each gets redacted.
+func TestRedactRows_AppliesRedactionsToEveryRow(t *testing.T) {
+	r := redact.New()
+	r.Set("public", "users", "email", redact.Hash{Algo: "sha256"})
+	cols := []*ir.Column{col("email", true), col("name", true)}
+
+	src := make(chan ir.Row, 3)
+	src <- ir.Row{"email": "a@x.com", "name": "Alice"}
+	src <- ir.Row{"email": "b@x.com", "name": "Bob"}
+	src <- ir.Row{"email": "c@x.com", "name": "Carol"}
+	close(src)
+
+	out, errFn := redactRows(context.Background(), src, r, "public", "users", cols)
+	var received []ir.Row
+	for row := range out {
+		received = append(received, row)
+	}
+	if err := errFn(); err != nil {
+		t.Fatalf("unexpected errFn() = %v", err)
+	}
+	if len(received) != 3 {
+		t.Fatalf("got %d rows; want 3", len(received))
+	}
+	for i, row := range received {
+		if s, ok := row["email"].(string); !ok || len(s) != 64 {
+			t.Errorf("row %d: email not hashed; got %v", i, row["email"])
+		}
+	}
+	// Sanity: different inputs → different hashes.
+	if received[0]["email"] == received[1]["email"] {
+		t.Errorf("different inputs produced identical hashes")
+	}
+}
+
+// TestRedactRows_StrategyErrorClosesChannelAndExposesErr covers
+// the refusal path: when a strategy returns an error, the output
+// channel closes cleanly and errFn returns the wrapped error.
+func TestRedactRows_StrategyErrorClosesChannelAndExposesErr(t *testing.T) {
+	r := redact.New()
+	r.Set("public", "users", "ssn", redact.Null{})
+	cols := []*ir.Column{col("ssn", false)} // NOT NULL → Null refuses
+
+	src := make(chan ir.Row, 1)
+	src <- ir.Row{"ssn": "111-22-3333"}
+	close(src)
+
+	out, errFn := redactRows(context.Background(), src, r, "public", "users", cols)
+	var received []ir.Row
+	for row := range out {
+		received = append(received, row)
+	}
+	// The refusal occurred before the row could be sent — out closes
+	// cleanly with zero rows received.
+	if len(received) != 0 {
+		t.Errorf("got %d rows; want 0 (refusal blocks forwarding)", len(received))
+	}
+	err := errFn()
+	if err == nil {
+		t.Fatal("errFn() = nil; want refusal error")
+	}
+	for _, want := range []string{"redact", "ssn", "NOT NULL"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("err %q should contain %q", err.Error(), want)
+		}
+	}
+}
+
+// TestRedactRows_CtxCancelExitsCleanly covers the cancellation
+// path: cancelling ctx before src closes makes the goroutine exit
+// and out close without errFn being set.
+func TestRedactRows_CtxCancelExitsCleanly(t *testing.T) {
+	r := redact.New()
+	r.Set("public", "users", "email", redact.Hash{Algo: "sha256"})
+	cols := []*ir.Column{col("email", true)}
+
+	src := make(chan ir.Row) // unbuffered; sender never sends
+	ctx, cancel := context.WithCancel(context.Background())
+	out, errFn := redactRows(ctx, src, r, "public", "users", cols)
+	cancel()
+	// out should close shortly after cancel.
+	for range out {
+		t.Errorf("ctx cancel: expected no rows; got one")
+	}
+	if err := errFn(); err != nil {
+		t.Errorf("ctx cancel: errFn() = %v; want nil (ctx cancel is not a redact error)", err)
+	}
+	_ = src
+}
+
+// TestRedactRows_HexUseAvoidsUnusedImport ensures hex is still
+// imported correctly by the test file. (Vacuous; serves as a
+// reminder if the test imports get pruned later.)
+func TestRedactRows_HexUseAvoidsUnusedImport(_ *testing.T) {
+	_ = hex.EncodeToString([]byte{0})
+	_ = sha256.Sum256
 }

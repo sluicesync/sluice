@@ -4,7 +4,9 @@
 package pipeline
 
 import (
+	"context"
 	"fmt"
+	"sync"
 
 	"github.com/orware/sluice/internal/ir"
 	"github.com/orware/sluice/internal/redact"
@@ -53,4 +55,82 @@ func redactRow(reg *redact.Registry, schema, table string, row ir.Row, cols []*i
 		row[col.Name] = newVal
 	}
 	return nil
+}
+
+// redactRows wraps a row channel with the operator-configured
+// redaction policy. Each row read from src is passed through
+// [redactRow] before being forwarded to the returned channel.
+//
+// When reg is nil or empty, the function returns src verbatim
+// (zero-cost passthrough) — no goroutine is spawned and the
+// returned errFn always reports nil. This is the load-bearing
+// fast path for the no-redactions case so default operators pay
+// nothing for the feature.
+//
+// When at least one rule is registered, a goroutine reads from
+// src, applies redactRow in-place, and forwards. On a redaction
+// error (strategy refusal), the goroutine:
+//
+//  1. Stores the error so errFn returns it.
+//  2. Closes the output channel.
+//  3. Returns. The downstream consumer (writer / applier) sees
+//     the channel close and exits cleanly; the caller checks
+//     errFn after that exit to surface the redaction error.
+//
+// The error-propagation contract is *intentionally* not via ctx
+// cancellation: a downstream WriteRows seeing a redacted channel
+// close cleanly is a legitimate "no more rows" signal; the caller
+// disambiguates by checking errFn() AFTER WriteRows returns nil.
+//
+//nolint:gocritic // named results would conflict with the bidi `out` channel built internally
+func redactRows(
+	ctx context.Context,
+	src <-chan ir.Row,
+	reg *redact.Registry,
+	schema, table string,
+	cols []*ir.Column,
+) (<-chan ir.Row, func() error) {
+	if reg.Empty() {
+		return src, func() error { return nil }
+	}
+	out := make(chan ir.Row)
+	var (
+		mu    sync.Mutex
+		fnErr error
+	)
+	storeFn := func(err error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if fnErr == nil {
+			fnErr = err
+		}
+	}
+	errFn := func() error {
+		mu.Lock()
+		defer mu.Unlock()
+		return fnErr
+	}
+	go func() {
+		defer close(out)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case row, ok := <-src:
+				if !ok {
+					return
+				}
+				if err := redactRow(reg, schema, table, row, cols); err != nil {
+					storeFn(err)
+					return
+				}
+				select {
+				case out <- row:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}
+	}()
+	return out, errFn
 }
