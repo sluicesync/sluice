@@ -544,6 +544,12 @@ func (a *ChangeApplier) SetTargetSchema(name string) {
 //
 // Returns when the channel closes (clean shutdown), when ctx is
 // cancelled, or when a target write fails.
+//
+// Per-apply DEBUG instrumentation (v0.53.0): mirror of the MySQL
+// applier — see that engine's `Apply` doc for the v0.52.0 cycle
+// finding that default-batch-size operators had no DEBUG signal on
+// the non-batched path. Per-change `applier: apply latency` line
+// closes the gap.
 func (a *ChangeApplier) Apply(ctx context.Context, streamID string, changes <-chan ir.Change) error {
 	if streamID == "" {
 		return errors.New("postgres: applier: streamID is empty (Streamer is responsible for resolving it)")
@@ -565,9 +571,15 @@ func (a *ChangeApplier) Apply(ctx context.Context, streamID string, changes <-ch
 			case ir.TxBegin, ir.TxCommit:
 				continue
 			}
+			applyStart := time.Now()
 			if err := a.applyOne(ctx, streamID, c); err != nil {
 				return err
 			}
+			slog.DebugContext(ctx, "applier: apply latency",
+				slog.String("stream_id", streamID),
+				slog.Int("rows", 1),
+				slog.Int64("millis", time.Since(applyStart).Milliseconds()),
+			)
 		case <-ctx.Done():
 			return ctx.Err()
 		}

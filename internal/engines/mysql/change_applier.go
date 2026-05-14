@@ -487,6 +487,16 @@ func (a *ChangeApplier) WritePosition(ctx context.Context, streamID string, pos 
 //
 // Returns when the channel closes (clean shutdown), when ctx is
 // cancelled, or when a target write fails.
+//
+// Per-apply DEBUG instrumentation (v0.53.0): the batched path emits
+// `applier: batch latency` per completed batch; the v0.52.0 cycle's
+// secondary finding was that default `--apply-batch-size=1` routes
+// through this non-batched Apply which had no equivalent line, so
+// operators running default settings had no DEBUG signal that apply
+// was making progress. We emit `applier: apply latency` per
+// successful change here for diagnostic symmetry. Same DEBUG level,
+// so INFO operators never see it; cycle-test runs at DEBUG get the
+// signal.
 func (a *ChangeApplier) Apply(ctx context.Context, streamID string, changes <-chan ir.Change) error {
 	if streamID == "" {
 		return errors.New("mysql: applier: streamID is empty (Streamer is responsible for resolving it)")
@@ -508,9 +518,15 @@ func (a *ChangeApplier) Apply(ctx context.Context, streamID string, changes <-ch
 			case ir.TxBegin, ir.TxCommit:
 				continue
 			}
+			applyStart := time.Now()
 			if err := a.applyOne(ctx, streamID, c); err != nil {
 				return err
 			}
+			slog.DebugContext(ctx, "applier: apply latency",
+				slog.String("stream_id", streamID),
+				slog.Int("rows", 1),
+				slog.Int64("millis", time.Since(applyStart).Milliseconds()),
+			)
 		case <-ctx.Done():
 			return ctx.Err()
 		}

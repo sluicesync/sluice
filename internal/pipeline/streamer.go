@@ -466,6 +466,29 @@ func (s *Streamer) Run(ctx context.Context) error {
 	return s.runWithRetry(ctx, attempts)
 }
 
+// errIsRetriable returns true when err carries an [ir.RetriableError]
+// wrapper with `Retriable() == true`. The caller passes a non-nil
+// *ir.RetriableError target so the matched wrapper is available for
+// subsequent `RetryHint()` lookups.
+//
+// Bug 57 fix (v0.52.2) load-bearing helper: this MUST be checked
+// BEFORE any `errors.Is(err, context.DeadlineExceeded)` /
+// `context.Canceled` short-circuit. The applier classifier wraps
+// `context.DeadlineExceeded` (from `--apply-exec-timeout`) as a
+// retriable error; that wrapping preserves the inner error via
+// `Unwrap`, so `errors.Is(wrappedErr, context.DeadlineExceeded)`
+// returns true and pre-v0.52.2 streamer logic mistook the wrapped
+// timeout for a clean shutdown signal — exiting the retry loop with
+// zero retry attempts. The fix is to test the wrapper class first
+// and only treat unwrapped ctx-termination as clean shutdown.
+func errIsRetriable(err error, re *ir.RetriableError) bool {
+	if re == nil {
+		var local ir.RetriableError
+		re = &local
+	}
+	return errors.As(err, re) && (*re).Retriable()
+}
+
 // runWithRetry wraps [runOnce] with the ADR-0038 retry loop. Opens
 // a side-channel applier to read the persisted CDC position between
 // attempts so the consecutive-failure counter can reset whenever an
@@ -532,11 +555,23 @@ func (s *Streamer) runWithRetry(ctx context.Context, attempts int) error {
 		if err == nil {
 			return nil
 		}
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			return err
-		}
+		// Bug 57 fix (v0.52.2): check the retriable wrapper BEFORE the
+		// ctx-Cancel/DeadlineExceeded short-circuit. A wrapped
+		// [ir.RetriableError] containing context.DeadlineExceeded (from
+		// the applier's `--apply-exec-timeout` watchdog) traverses to
+		// DeadlineExceeded via errors.Is's Unwrap walk. Pre-v0.52.2 the
+		// check fired on that match and exited the streamer with zero
+		// retry — the v0.52.0/v0.52.1 silent-stall fix was inert
+		// because the timeout-driven retry never reached the retry loop.
+		// The bare-ctx-termination case (operator Ctrl-C, sync stop
+		// applyCtx cancel) still needs the early return below; it just
+		// has to come AFTER the retriable check now.
 		var re ir.RetriableError
-		if !errors.As(err, &re) || !re.Retriable() {
+		if !errIsRetriable(err, &re) {
+			// Includes bare context.Canceled / context.DeadlineExceeded
+			// (genuine ctx termination) and any non-retriable failure.
+			// Returning err preserves the pre-v0.52.2 behaviour for
+			// these shapes (callers branch on errors.Is themselves).
 			return err
 		}
 
@@ -1031,8 +1066,23 @@ func (s *Streamer) runOnce(ctx context.Context) error {
 
 	filtered := filterChangesWithLiveAdd(applyCtx, changes, s.Filter, liveFilter)
 	dispatchErr := s.dispatchApply(applyCtx, applier, streamID, filtered)
-	if dispatchErr != nil && !errors.Is(dispatchErr, context.Canceled) && !errors.Is(dispatchErr, context.DeadlineExceeded) {
-		return wrapWithHint(PhaseCDC, fmt.Errorf("pipeline: apply changes: %w", dispatchErr))
+	if dispatchErr != nil {
+		// Bug 57 fix (v0.52.2): a wrapped [ir.RetriableError] containing
+		// context.DeadlineExceeded (from --apply-exec-timeout) MUST
+		// surface to runWithRetry so the existing retry loop activates.
+		// Pre-v0.52.2 the bare errors.Is checks on Canceled/Deadline
+		// matched via Unwrap and swallowed the timeout as clean
+		// shutdown, defeating the v0.52.0/v0.52.1 silent-stall fix.
+		// Order matters: check retriable first, fall through only when
+		// genuine ctx termination AND not retriable.
+		var re ir.RetriableError
+		isRetriable := errIsRetriable(dispatchErr, &re)
+		isCtxTermination := errors.Is(dispatchErr, context.Canceled) || errors.Is(dispatchErr, context.DeadlineExceeded)
+		if isRetriable || !isCtxTermination {
+			return wrapWithHint(PhaseCDC, fmt.Errorf("pipeline: apply changes: %w", dispatchErr))
+		}
+		// Bare ctx termination from outer shutdown — fall through to the
+		// stop-cleanup path below; runOnce returns nil.
 	}
 	// GitHub issue #19: if the changes channel closed because the
 	// source CDC reader's pump hit a transient error (the channel-

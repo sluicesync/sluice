@@ -4,9 +4,112 @@
 package pipeline
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"testing"
 	"time"
+
+	"github.com/orware/sluice/internal/ir"
 )
+
+// retriableWrapper is a test double satisfying [ir.RetriableError]
+// that mirrors the engine-side `retriableMySQLError` /
+// `retriablePGError` shape — wraps an underlying err via Unwrap and
+// reports Retriable()==true. Used to construct the exact error shape
+// the applier produces when --apply-exec-timeout fires, without
+// importing the engine packages (which would create a cycle).
+type retriableWrapper struct {
+	err error
+}
+
+func (e *retriableWrapper) Error() string            { return e.err.Error() }
+func (e *retriableWrapper) Unwrap() error            { return e.err }
+func (e *retriableWrapper) Retriable() bool          { return true }
+func (e *retriableWrapper) RetryHint() time.Duration { return 0 }
+
+// TestErrIsRetriable_Bug57 pins the load-bearing classification
+// contract for the v0.52.2 fix (Bug 57). Both runOnce and runWithRetry
+// MUST check the retriable wrapper BEFORE any
+// `errors.Is(err, context.DeadlineExceeded)` short-circuit — the
+// applier classifier wraps the timeout-driven DeadlineExceeded as a
+// retriable error, and `errors.Is`'s Unwrap walk reaches the inner
+// DeadlineExceeded, so pre-v0.52.2 the streamer mistook the wrapped
+// timeout for a clean ctx-shutdown and exited the retry loop.
+//
+// This test simultaneously asserts:
+//
+//  1. The bug-shape: errors.Is matches context.DeadlineExceeded
+//     against a wrapped retriable error (the pre-fix trap).
+//  2. The fix-shape: errIsRetriable returns true so the streamer's
+//     reordered checks route through the retry loop.
+func TestErrIsRetriable_Bug57(t *testing.T) {
+	// Construct the exact error shape the applier produces when its
+	// per-exec timeout fires: classifyApplierError wraps the inner
+	// DeadlineExceeded as a retriable wrapper preserving Unwrap chain.
+	inner := fmt.Errorf("mysql: applier: commit: %w", context.DeadlineExceeded)
+	wrapped := &retriableWrapper{err: inner}
+
+	t.Run("bug-shape: errors.Is sees DeadlineExceeded via Unwrap chain", func(t *testing.T) {
+		if !errors.Is(wrapped, context.DeadlineExceeded) {
+			t.Fatal("wrapped retriable should match DeadlineExceeded via errors.Is; the test premise is gone")
+		}
+	})
+
+	t.Run("fix-shape: errIsRetriable returns true", func(t *testing.T) {
+		var re ir.RetriableError
+		if !errIsRetriable(wrapped, &re) {
+			t.Fatal("wrapped retriable not classified as retriable; runWithRetry would exit instead of retrying")
+		}
+		if re == nil || !re.Retriable() {
+			t.Errorf("matched wrapper but Retriable()==false; got %+v", re)
+		}
+	})
+
+	t.Run("fix order: the streamer must check retriable BEFORE ctx-termination", func(t *testing.T) {
+		// Simulate the post-fix order. Pre-fix swapped the if-blocks.
+		var re ir.RetriableError
+		retriable := errIsRetriable(wrapped, &re)
+		ctxTerm := errors.Is(wrapped, context.Canceled) || errors.Is(wrapped, context.DeadlineExceeded)
+		if !retriable {
+			t.Fatal("test premise: errIsRetriable should fire on wrapped retriable")
+		}
+		if !ctxTerm {
+			t.Fatal("test premise: errors.Is should still see DeadlineExceeded in chain (bug-shape preserved)")
+		}
+		// The streamer's post-fix logic: when BOTH are true, the
+		// retriable branch wins (retry); only when retriable==false
+		// AND ctxTerm==true do we short-circuit as clean shutdown.
+		// This subtest is documentation-as-test for the reordering.
+	})
+}
+
+// TestErrIsRetriable_NonRetriable covers the inverse: a bare
+// DeadlineExceeded (genuine ctx termination, no retriable wrapper)
+// MUST NOT be classified as retriable, so the streamer's clean-
+// shutdown short-circuit still fires for the operator-Ctrl-C / sync-
+// stop case.
+func TestErrIsRetriable_NonRetriable(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+	}{
+		{"bare DeadlineExceeded", context.DeadlineExceeded},
+		{"bare Canceled", context.Canceled},
+		{"wrapped DeadlineExceeded (no retriable wrapper)", fmt.Errorf("ctx termination: %w", context.DeadlineExceeded)},
+		{"plain error", errors.New("some non-retriable failure")},
+		{"nil", nil},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			var re ir.RetriableError
+			if errIsRetriable(c.err, &re) {
+				t.Errorf("%v misclassified as retriable; would loop forever instead of cleanly returning", c.err)
+			}
+		})
+	}
+}
 
 // TestComputeRetryBackoff covers the ADR-0038 backoff schedule:
 // exponential doubling from base, capped at max, with a hint floor

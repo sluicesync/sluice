@@ -6,6 +6,40 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.52.2]
+
+**Closes Bug 57 — the v0.52.0/v0.52.1 silent-stall retry path was inert.** Pre-existing bug from v0.52.0 masked by Bug 56. The v0.52.1 cycle subagent reproduced it deterministically on `--apply-exec-timeout=1ms`: sluice exited 0 in ~3 seconds with zero retry log lines. Root cause: the streamer's `runOnce` and `runWithRetry` both tested `errors.Is(err, context.DeadlineExceeded)` BEFORE the `errors.As(err, &ir.RetriableError)` check; since `classifyApplierError` wraps the timeout-driven DeadlineExceeded as a retriable wrapper that preserves the inner error via Unwrap, `errors.Is` matched via the Unwrap walk and the streamer mistook the wrapped timeout for a clean ctx-shutdown — exiting the retry loop without ever activating it.
+
+### Fixed
+
+- **Streamer's runWithRetry now checks the retriable wrapper before the ctx-termination short-circuit** (`internal/pipeline/streamer.go`). New helper `errIsRetriable(err, *re)` encapsulates the `errors.As + Retriable()` predicate; both `runWithRetry` and `runOnce` route through it. Genuine bare ctx-termination (operator Ctrl-C, sync stop) still triggers clean shutdown — the check just has to come AFTER the retriable test now.
+
+- **`runOnce`'s dispatch-error branch** now applies the same reordering. A wrapped retriable error from the applier propagates to `runWithRetry` (where the retry loop activates) instead of being silently swallowed as if the apply call had returned because the outer ctx was cancelled.
+
+### Added
+
+- **`applier: apply latency` DEBUG log line on the per-change apply path** for both engines (v0.52.0 cycle's secondary observability finding). The batched path (`ApplyBatch` with `--apply-batch-size > 1`) has emitted `applier: batch latency` since v0.7.0; the non-batched path (default `--apply-batch-size=1`) had no equivalent line, so operators running default settings had no DEBUG signal that apply was making progress. Cycle subagents now see per-change latency lines symmetrically across both apply modes.
+
+### Migration / Compatibility
+
+- **Drop-in upgrade from v0.52.x.** No flag changes; the same `--apply-exec-timeout=DUR` setting now actually drives the retry loop (which was always the v0.52.0 design intent — Bug 57 just meant the wire was never connected end-to-end).
+- **No schema or position-token changes.**
+- **The retry surface gains no new behaviour shape** — existing `--apply-retry-attempts` / `--apply-retry-backoff-base` / `--apply-retry-backoff-cap` flags govern the timeout-driven retry just as they govern all other ADR-0038 retriable shapes.
+- **New DEBUG log line** `applier: apply latency` fires only at `--log-level=debug`; INFO-level operators see no change.
+
+### Who needs this release
+
+- **Anyone running v0.52.0 or v0.52.1 against a remote managed-database target**: **upgrade**. The Phase B fix's wire was disconnected at the streamer end; the timeout watchdog fired but the retry loop never activated, so sluice exited cleanly on the first half-closed connection instead of recovering. v0.52.2 reconnects the wire.
+
+- **Anyone still on v0.51.0 or earlier**: skip v0.52.0 / v0.52.1 entirely, upgrade straight to v0.52.2.
+
+### Verification
+
+- **End-to-end on the validation rig**: v0.52.1 cycle subagent's deterministic 3-second exit on `--apply-exec-timeout=1ms` is the reproduction case. v0.52.2 cycle re-runs the same scenario; pin is "retry log line fires + exit happens only after `--apply-retry-attempts` exhaustion" (not after a single timeout fire).
+- **New unit tests in `streamer_retry_test.go`**:
+  - `TestErrIsRetriable_Bug57` — asserts both the bug-shape (errors.Is sees DeadlineExceeded via the wrapper's Unwrap chain) AND the fix-shape (errIsRetriable returns true) hold simultaneously, with documentation-as-test for the required check order.
+  - `TestErrIsRetriable_NonRetriable` — bare DeadlineExceeded / Canceled / wrapped-but-non-retriable / nil all stay non-retriable so the clean-shutdown short-circuit still fires for operator-Ctrl-C / sync-stop.
+
 ## [0.52.1]
 
 **Completes the GitHub #23 silent-stall fix shipped in v0.52.0.** Bug 56: v0.52.0 wrapped the four `dispatch` sites (Insert / Update / Delete / Truncate) with `--apply-exec-timeout` but missed two adjacent destination-side blocking calls on the same apply hot path. The v0.52.0 cycle subagent captured three independent goroutine pprof snapshots over a 10-minute window on the validation rig showing goroutine 1 continuously blocked at the unwrapped sites (first `tx.Commit()`, then `writePositionTx`'s bare `tx.ExecContext`). Same silent-stall failure mode v0.52.0 was meant to close.
