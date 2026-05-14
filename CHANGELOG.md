@@ -6,6 +6,51 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.50.0]
+
+**Lands GitHub issue #20 chunk 14c — `sluice backup prune` retention command.** Second chunk of roadmap item 14 (the backup-chain retention / compaction track, following v0.47.0's chain.json catalog keystone). Operators of long-running `backup stream run` chains now have a first-class primitive to bound disk usage and restore time: drop the oldest incrementals (or older-than-duration), narrowing the chain's restorable range. The full at the chain root is always preserved. Prep doc for chunk 14b (`--retain-rotate-at` automated rotation) committed under `docs/dev/notes/prep-backup-chain-rotation.md` ahead of its v0.52.0+ implementation.
+
+### Added
+
+- **`sluice backup prune --from-dir DIR [--keep-incrementals N | --keep-duration DUR] [--dry-run]`** — operator-facing CLI. Mutually exclusive flags; one required. `--dry-run` reports what would be pruned without deleting or rewriting `chain.json`. Logs a structured summary at INFO level: `manifests_dropped`, `manifests_kept`, `chunks_deleted`, `earliest_restorable_backup_id`. Plus a `dropped` line per dropped manifest path so operators can audit the removal in the same log stream.
+
+- **`PruneChain` API in `internal/pipeline/chain_prune.go`** — programmatic entry point used by the CLI. `PruneOpts{KeepIncrementals, KeepDuration, DryRun, Now}` configures the operation; `PruneResult{Pruned, Kept, ChunksDeleted, EarliestRestorableBackupID}` summarises the outcome. Pre-flight validation refuses: both/neither flags set, missing `chain.json` (with actionable hint to run `backup verify --rebuild-catalog`), no full backup in chain, and structurally-broken catalogs (interior orphans whose parent isn't in the drop set OR is in the drop set despite not being the first-kept — the latter would require multi-stitch chain rewrites that v0.50.0 doesn't support).
+
+- **First-kept manifest re-stitch via `restitchManifest`**. When dropping the oldest-prefix incrementals leaves a kept incremental whose parent has been dropped, the first kept incremental's manifest gets rewritten in place: `ParentBackupID` re-anchors to the chain-root full, `StartPosition` re-anchors to the full's `EndPosition`. This keeps chain-restore's parent-link walk + `StartPosition` validation passing. The event windows in the DROPPED incrementals are LOST from the chain's restorable range (the operator opts into this; `PruneResult.EarliestRestorableBackupID` records the new earliest point). Chunk files referenced by the rewritten manifest stay intact — only the parent-link metadata changes.
+
+- **`docs/dev/notes/prep-backup-chain-rotation.md` (new)** — design prep for chunk 14b (`--retain-rotate-at`, v0.52.0+). Captures the snapshot/CDC overlap correctness concern (new full's snapshot anchor must be ≥ previous chain's last-committed incremental position), the inline-rotation FSM, the chain.json schema additions (`format_version: 2`, `rotated_at`, `succeeded_by`, `rotation_reason`), and the v0.50.0 catalog reader's forward-compat preparation. Captured pre-implementation per CLAUDE.md's design-first feedback for non-trivial chunks.
+
+### Migration / Compatibility
+
+- **Drop-in upgrade from v0.49.x.** Pure additive feature; no flag changes on existing commands, no behaviour change for operators who never invoke `sluice backup prune`.
+- **`chain.json` schema unchanged** at this release. v0.50.0 readers continue to load v1 catalogs; v0.50.0 writers continue to produce v1 catalogs. The `chainCatalogFormatVersion` constant stays at 1; the prep doc plans for the v2 bump under 14b's rotation work (and the forward-compat reader bump will land alongside 14b, not in 14c).
+- **Restorability narrows when prune runs**. The first kept incremental's `StartPosition` re-anchor to `full.EndPosition` is a recorded data-loss window — events that landed between the original `StartPosition` and the full's `EndPosition` are NOT replayed on restore. The operator's `--keep-incrementals` / `--keep-duration` choice IS this trade-off; the restorable-range narrowing isn't a separate consideration.
+- **Concurrent stream protection**: `sluice backup prune` does NOT lock the chain. If `backup stream run` is actively rolling against the chain when prune runs, the stream's parent-resolution may reference a now-pruned manifest on next restart. Recommended workflow: pause / stop the stream → prune → restart.
+
+### Who needs this release
+
+- **Anyone running `sluice backup stream run` against a local-FS chain that has accumulated meaningful disk usage** (per the GitHub #20 evidence — chains past ~10k incrementals start hitting `find` / `ls` slowdowns): drop-in benefit. `sluice backup prune --keep-duration=30d` (or similar) caps chain growth without manual `rm` orchestration.
+- **Anyone preparing for the v0.52.0+ rotate-at workflow**: prep doc captures the design; the chain catalog reader's forward-compat bump will land with 14b. No action needed in v0.50.0.
+- **Anyone whose chains aren't growing problematically**: drop-in, no behaviour change. The new command is opt-in.
+
+### Verification surface
+
+- **8 new unit tests in `internal/pipeline/chain_prune_test.go`**:
+  - `TestPruneChain_KeepIncrementalsDropsOldest` — basic keep-N-most-recent flow
+  - `TestPruneChain_KeepDurationDropsOlderThanThreshold` — time-based pruning with `Now` injection
+  - `TestPruneChain_KeepAllPreservesEverything` — no-op case (`KeepIncrementals >= incrCount`)
+  - `TestPruneChain_DryRunNoSideEffects` — dry-run mode (catalog + chunks unchanged)
+  - `TestPruneChain_RefusesBothFlags` — mutual-exclusion gate
+  - `TestPruneChain_RefusesNeitherFlag` — at-least-one gate
+  - `TestPruneChain_RefusesWhenCatalogAbsent` — operator-actionable hint
+  - `TestPruneChain_RefusesWhenChainWouldBreak` — interior-orphan refusal (manually-broken parent-link)
+- **End-to-end validation deferred to operator re-test** — the rig at `C:\code\sluice-validation\` has a 4-table chain that can be pruned + restored to verify the re-stitch + restore-side behavior; operator workflow once the next test cycle runs.
+
+### What's not in v0.50.0
+
+- **Chunk 14d (compact)**: deferred to v0.51.0. Initial scope estimate underestimated the complexity (chunk encoding, encryption envelope handling, SHA tracking across merged chunks, schema-delta merging). Better as its own focused release than bundled with 14c.
+- **Chunk 14b (rotate-at)**: deferred to v0.52.0+. The prep doc landed in this release; implementation needs the snapshot/CDC overlap design to be reviewable before code.
+
 ## [0.49.0]
 
 **Closes GitHub issues #25 + #26.** Both bugs blocked cold-start on real-world MySQL source schemas — #25 on MySQL targets (Vitess refused the CREATE TABLE), #26 on PostgreSQL targets (silent identifier truncation collision). Both confirmed reproducing on v0.48.0 via the operator's validation rig before fix; both reproductions now closed via the targeted fixes below. Bundled per the operator's per-release CI-cost preference.

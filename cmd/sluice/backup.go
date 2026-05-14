@@ -348,6 +348,7 @@ type BackupCmd struct {
 	Incremental BackupIncrementalCmd `cmd:"" help:"Take an incremental backup chained off a previous full or incremental (Phase 3)."`
 	Stream      BackupStreamCmdGroup `cmd:"" help:"Long-running stream that produces rolling incrementals (Phase 4)."`
 	Verify      BackupVerifyCmd      `cmd:"" help:"Re-checksum every chunk in an existing backup chain and report any mismatches."`
+	Prune       BackupPruneCmd       `cmd:"" help:"Drop the oldest incrementals from an existing chain to bound disk + restore time (GitHub #20 chunk 14c)."`
 }
 
 // BackupFullCmd runs `sluice backup full`. Reads the source schema,
@@ -807,6 +808,91 @@ func (v *BackupVerifyCmd) Run(_ *Globals) error {
 	slog.InfoContext(ctx, "backup verify: all chunks OK",
 		slog.Int("chunks", total),
 	)
+	return nil
+}
+
+// BackupPruneCmd runs `sluice backup prune`. Drops the oldest
+// incrementals from an existing chain to bound disk usage and
+// restore time. Closes GitHub #20 roadmap chunk 14c.
+//
+// Semantics (see internal/pipeline/chain_prune.go):
+//
+//   - Operator chooses retention via --keep-incrementals N (keep the
+//     N most-recent) OR --keep-duration DUR (keep anything younger
+//     than DUR). Mutually exclusive; exactly one required.
+//   - The full backup at the chain root is always preserved.
+//   - The first surviving incremental gets re-stitched to point at
+//     the full directly (advances the chain's "earliest restorable
+//     position" forward — the dropped incrementals' event windows
+//     are LOST from the chain's restore range; operator opts into
+//     this).
+//   - --dry-run reports what WOULD be pruned without deleting
+//     anything or rewriting the catalog.
+//
+// Prune requires chain.json to be present (the v0.47.0 catalog).
+// Run `sluice backup verify --rebuild-catalog` first on pre-v0.47.0
+// chains.
+type BackupPruneCmd struct {
+	FromDir string `help:"Directory containing the chain to prune (the same directory --output-dir wrote to). Mutually exclusive with --from." placeholder:"DIR"`
+	From    string `help:"URL of the chain to prune (s3://, gs://, azblob://, file:///). Mutually exclusive with --from-dir." placeholder:"URL"`
+
+	BackupEndpoint  string `help:"Override the S3 endpoint for S3-compatible providers. Only meaningful when --from is an s3:// URL." placeholder:"URL"`
+	BackupRegion    string `help:"Override the S3 region. Only meaningful when --from is an s3:// URL." placeholder:"REGION"`
+	BackupPathStyle bool   `help:"Force path-style addressing. Only meaningful when --from is an s3:// URL."`
+
+	KeepIncrementals int           `help:"Retain the N most-recent incrementals. Mutually exclusive with --keep-duration." placeholder:"N"`
+	KeepDuration     time.Duration `help:"Retain incrementals younger than this duration. Mutually exclusive with --keep-incrementals. Examples: 168h (7d), 720h (30d)." placeholder:"DUR"`
+
+	DryRun bool `help:"Report what would be pruned without deleting or rewriting the catalog."`
+}
+
+// Run implements `sluice backup prune`.
+func (p *BackupPruneCmd) Run(_ *Globals) error {
+	if p.FromDir == "" && p.From == "" {
+		return errors.New("one of --from-dir or --from is required")
+	}
+	if p.FromDir != "" && p.From != "" {
+		return errors.New("--from-dir and --from are mutually exclusive")
+	}
+	if (p.KeepIncrementals > 0) == (p.KeepDuration > 0) {
+		return errors.New("exactly one of --keep-incrementals or --keep-duration is required")
+	}
+	ctx := kongContext()
+	store, _, closer, err := openBackupStore(ctx, p.FromDir, p.From, pipeline.BlobStoreOptions{
+		Endpoint:  p.BackupEndpoint,
+		Region:    p.BackupRegion,
+		PathStyle: p.BackupPathStyle,
+	})
+	if err != nil {
+		return err
+	}
+	if closer != nil {
+		defer func() { _ = closer() }()
+	}
+
+	res, err := pipeline.PruneChain(ctx, store, pipeline.PruneOpts{
+		KeepIncrementals: p.KeepIncrementals,
+		KeepDuration:     p.KeepDuration,
+		DryRun:           p.DryRun,
+	})
+	if err != nil {
+		return err
+	}
+	mode := "pruned"
+	if p.DryRun {
+		mode = "would-prune (dry-run)"
+	}
+	slog.InfoContext(ctx, "backup prune: "+mode,
+		slog.Int("manifests_dropped", len(res.Pruned)),
+		slog.Int("manifests_kept", len(res.Kept)),
+		slog.Int("chunks_deleted", res.ChunksDeleted),
+		slog.String("earliest_restorable_backup_id", res.EarliestRestorableBackupID),
+	)
+	for _, p := range res.Pruned {
+		slog.InfoContext(ctx, "  dropped",
+			slog.String("manifest_path", p),
+		)
+	}
 	return nil
 }
 
