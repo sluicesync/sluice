@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/orware/sluice/internal/config"
 	"github.com/orware/sluice/internal/redact"
 )
 
@@ -64,6 +65,89 @@ func parseRedactFlags(values []string, keySource, streamID string) (*redact.Regi
 		reg.Set(schema, table, column, strategy)
 	}
 	return reg, nil
+}
+
+// mergeYAMLRedactions extends an existing Registry (from CLI flag
+// parsing) with the YAML `redactions:` block from the operator's
+// config. CLI rules are processed FIRST, so YAML entries on the
+// same column are silently overwritten — operators wanting YAML to
+// be authoritative should not pass conflicting CLI flags.
+//
+// keySource and streamID are the effective values (CLI flag
+// override of YAML). Returns the (potentially-augmented) Registry
+// or an error if any YAML entry is malformed.
+func mergeYAMLRedactions(reg *redact.Registry, entries []config.Redaction, keySource, streamID string) (*redact.Registry, error) {
+	if len(entries) == 0 {
+		return reg, nil
+	}
+	if reg == nil {
+		reg = redact.New()
+	}
+	for i, entry := range entries {
+		strategy, err := yamlStrategyToSluice(entry, keySource, streamID)
+		if err != nil {
+			return nil, fmt.Errorf("redactions[%d] (table=%q strategy=%q): %w", i, entry.Table, entry.Strategy, err)
+		}
+		schema, table, column, err := splitTriple(entry.Table)
+		if err != nil {
+			return nil, fmt.Errorf("redactions[%d]: %w", i, err)
+		}
+		reg.Set(schema, table, column, strategy)
+	}
+	return reg, nil
+}
+
+// yamlStrategyToSluice converts a config.Redaction to a redact.Strategy.
+func yamlStrategyToSluice(entry config.Redaction, keySource, streamID string) (redact.Strategy, error) {
+	switch entry.Strategy {
+	case "null":
+		return redact.Null{}, nil
+	case "static":
+		// Empty Value is allowed (operator-explicit empty replacement).
+		return redact.Static{Value: entry.Value}, nil
+	case "hash":
+		switch entry.Algo {
+		case "sha256":
+			return redact.Hash{Algo: "sha256"}, nil
+		case "hmac-sha256":
+			key, err := resolveHMACKey(keySource, streamID)
+			if err != nil {
+				return nil, fmt.Errorf("strategy 'hash:hmac-sha256': %w", err)
+			}
+			return redact.Hash{Algo: "hmac-sha256", Key: key}, nil
+		case "":
+			return nil, errors.New("strategy 'hash' requires 'algo' field: 'sha256' or 'hmac-sha256'")
+		default:
+			return nil, fmt.Errorf("strategy 'hash:%s' is not supported (use 'sha256' or 'hmac-sha256')", entry.Algo)
+		}
+	case "truncate":
+		if entry.Length < 0 {
+			return nil, fmt.Errorf("strategy 'truncate' requires non-negative 'length'; got %d", entry.Length)
+		}
+		return redact.Truncate{N: entry.Length}, nil
+	case "":
+		return nil, errors.New("'strategy' field is required (null, static, hash, truncate)")
+	default:
+		return nil, fmt.Errorf("unknown strategy %q (supported: null, static, hash, truncate)", entry.Strategy)
+	}
+}
+
+// splitTriple is YAML's variant of splitRedactValue's left half:
+// "[schema.]table.column" → (schema, table, column).
+func splitTriple(raw string) (schema, table, column string, err error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", "", "", errors.New("'table' field is empty")
+	}
+	parts := strings.Split(raw, ".")
+	switch len(parts) {
+	case 2:
+		return "", parts[0], parts[1], nil
+	case 3:
+		return parts[0], parts[1], parts[2], nil
+	default:
+		return "", "", "", fmt.Errorf("'table' field %q must be 'table.column' or 'schema.table.column'", raw)
+	}
 }
 
 // splitRedactValue parses a `[schema.]table.column=strategy[:opts]`

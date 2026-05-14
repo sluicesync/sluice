@@ -203,6 +203,12 @@ func (a *ChangeApplier) applyOneBatch(ctx context.Context, streamID string, chan
 		byteCap = defaultMaxBufferBytes
 	}
 
+	// PII Phase 1.5: redact the first change before dispatch.
+	// Subsequent batch members are redacted in the loop below.
+	if err := a.redactChange(first); err != nil {
+		return 0, ir.Position{}, false, classifyApplierError(fmt.Errorf("mysql: applier: redact: %w", err))
+	}
+
 	tx, err := a.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, ir.Position{}, false, fmt.Errorf("mysql: applier: begin tx: %w", err)
@@ -276,6 +282,12 @@ func (a *ChangeApplier) applyOneBatch(ctx context.Context, streamID string, chan
 				// Return rows=1 and the truncate's position so the
 				// outer loop logs the truncate as its own batch.
 				return 1, c.Pos(), false, nil
+			}
+			// PII Phase 1.5: redact each subsequent batch member
+			// before dispatch. nil/empty redactor is a no-op.
+			if err := a.redactChange(c); err != nil {
+				_ = tx.Rollback()
+				return 0, ir.Position{}, false, classifyApplierError(fmt.Errorf("mysql: applier: redact: %w", err))
 			}
 			if err := a.dispatch(ctx, tx, c); err != nil {
 				_ = tx.Rollback()

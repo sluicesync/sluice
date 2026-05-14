@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/orware/sluice/internal/ir"
+	"github.com/orware/sluice/internal/redact"
 )
 
 // # Bug-6 fix: shape applier values for JSON columns
@@ -176,6 +177,15 @@ type ChangeApplier struct {
 	// negative means "no byte cap"; the row-count cap remains the
 	// only flush trigger. See ADR-0028.
 	maxBufferBytes int64
+
+	// redactor is the operator-configured PII redaction registry
+	// (Phase 1.5, roadmap item 15a follow-on). When non-nil and
+	// non-empty, every change's row data passes through
+	// [redact.Registry.ApplyRow] before dispatch so PII columns get
+	// the operator's strategy applied on CDC events the same way
+	// Phase 1 already redacted bulk-copy rows. Set via
+	// [SetRedactor]; nil/empty is the no-redactions hot path.
+	redactor *redact.Registry
 }
 
 // SetMaxBufferBytes implements [ir.MaxBufferBytesSetter]. The
@@ -240,6 +250,49 @@ func (a *ChangeApplier) SetTargetSchema(name string) {
 // by [Streamer.openApplier]. Idempotent.
 func (a *ChangeApplier) SetExecTimeout(d time.Duration) {
 	a.execTimeout = d
+}
+
+// SetRedactor implements [ir.RedactorSetter] (PII Phase 1.5,
+// roadmap item 15a follow-on). Stores the operator-configured
+// redaction registry; the apply path invokes
+// [redact.Registry.ApplyRow] on each change's row data before
+// dispatch. The parameter type is `any` per the interface to
+// avoid an ir → redact dependency cycle; we type-assert to
+// *redact.Registry. nil registry or nil-asserting argument is the
+// no-redactions default.
+func (a *ChangeApplier) SetRedactor(registry any) {
+	if registry == nil {
+		a.redactor = nil
+		return
+	}
+	r, _ := registry.(*redact.Registry)
+	a.redactor = r
+}
+
+// redactChange invokes the applier's redactor (if any) on the
+// change's row data. Mutates the row in place. Returns a wrapped
+// error on strategy refusal; ADR-0038's classifier sees the error
+// as terminal-by-default.
+//
+// PII Phase 1.5: scope = Insert.Row, Update.Before, Update.After,
+// Delete.Before. Truncate / TxBegin / TxCommit carry no row data;
+// pass-through.
+func (a *ChangeApplier) redactChange(c ir.Change) error {
+	if a.redactor.Empty() {
+		return nil
+	}
+	switch v := c.(type) {
+	case ir.Insert:
+		return a.redactor.ApplyRow(v.Schema, v.Table, v.Row)
+	case ir.Update:
+		if err := a.redactor.ApplyRow(v.Schema, v.Table, v.Before); err != nil {
+			return err
+		}
+		return a.redactor.ApplyRow(v.Schema, v.Table, v.After)
+	case ir.Delete:
+		return a.redactor.ApplyRow(v.Schema, v.Table, v.Before)
+	}
+	return nil
 }
 
 // txExec wraps tx.ExecContext with the applier's per-exec timeout
@@ -541,6 +594,13 @@ func (a *ChangeApplier) Apply(ctx context.Context, streamID string, changes <-ch
 // retry policy (ADR-0038) can recognise transient Vitess / MySQL
 // errors and back off rather than exit the stream.
 func (a *ChangeApplier) applyOne(ctx context.Context, streamID string, c ir.Change) error {
+	// PII Phase 1.5: redact CDC row data before dispatch when the
+	// operator has configured rules. nil/empty redactor is a no-op
+	// fast path; the apply hot path stays free when no redaction is
+	// configured.
+	if err := a.redactChange(c); err != nil {
+		return classifyApplierError(fmt.Errorf("mysql: applier: redact: %w", err))
+	}
 	tx, err := a.db.BeginTx(ctx, nil)
 	if err != nil {
 		return classifyApplierError(fmt.Errorf("mysql: applier: begin tx: %w", err))

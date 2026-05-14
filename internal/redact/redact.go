@@ -181,6 +181,45 @@ type Rule struct {
 	Strategy Strategy
 }
 
+// ApplyRow walks the row's column-name → value pairs and replaces
+// values whose column triple has a matching strategy in the
+// Registry. Modifies the row map in place. Returns a wrapped error
+// on the first strategy refusal.
+//
+// Phase 1.5 entry point for CDC apply-path redaction: the engine
+// applier calls ApplyRow before dispatching each change, since the
+// applier doesn't always have the full target column metadata
+// available at apply time. The col metadata passed to
+// [Strategy.Redact] uses Nullable=true as a permissive default —
+// if a Null strategy would silently produce nil for a NOT NULL
+// target column, the engine catches it at INSERT time with a
+// loud duplicate-key / constraint-violation error and ADR-0038's
+// retry loop classifies it appropriately. The bulk-copy path's
+// [Strategy] callers (in pipeline.redactRow) pass full *ir.Column
+// metadata and get the earlier strategy-level refusal.
+//
+// Zero-cost on nil/empty Registry: returns nil immediately without
+// touching the row.
+func (r *Registry) ApplyRow(schema, table string, row ir.Row) error {
+	if r.Empty() {
+		return nil
+	}
+	for name, val := range row {
+		strategy := r.Get(schema, table, name)
+		if strategy == nil {
+			continue
+		}
+		col := &ir.Column{Name: name, Nullable: true}
+		newVal, err := strategy.Redact(col, val)
+		if err != nil {
+			return fmt.Errorf("redact %s.%s.%s via %s: %w",
+				schema, table, name, strategy.Name(), err)
+		}
+		row[name] = newVal
+	}
+	return nil
+}
+
 // registryKey produces the lowercased "schema.table.column" key
 // for Set / Get lookups. Empty schema is allowed (some engines
 // resolve schema implicitly); the resulting key starts with ".".

@@ -6,6 +6,50 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.54.0]
+
+**PII redaction Phase 1.5 — the two highest-impact deferrals from v0.53.0.** Closes the operator surprise where `sluice sync start --redact` redacted only the cold-start bulk-copy phase but let mid-stream CDC events flow to the target unredacted; adds YAML config support so production deployments can version-control redaction rules instead of stringing them through CLI flags.
+
+The two remaining Phase 1.5 items (schema-preview annotation + backup-stream redaction) are deferred to v0.55.0.
+
+### Added
+
+- **CDC apply-path redaction** on both engines. New `ir.RedactorSetter` optional interface (parameter type `any` to avoid an ir → redact dependency cycle); MySQL + Postgres appliers implement `SetRedactor(registry any)` and invoke `redact.Registry.ApplyRow` on every change's row data before dispatch. Wrap point covers all dispatch shapes:
+  - `Insert.Row`
+  - `Update.Before` AND `Update.After`
+  - `Delete.Before`
+  - `Truncate` / `TxBegin` / `TxCommit` pass through (no row data)
+- **`redact.Registry.ApplyRow(schema, table, row)` method** for CDC's row-keys-only case. Best-effort `Nullable=true` default for the col metadata; strategies that refuse on NOT NULL (`Null`) will silently produce nil at strategy level and the engine catches the constraint violation loudly at INSERT time (ADR-0038 retry loop classifies the error).
+- **Pipeline `applyRedactor` helper** mirrors `applyExecTimeout` / `applyMaxBufferBytes` — threads the Streamer.Redactor through to the applier via the optional interface at openApplier time.
+- **YAML config block** under `redactions:`. Each entry has `table`, `strategy`, plus strategy-specific `algo` / `value` / `length` fields. Operators wanting the bare `null` strategy must quote: `strategy: "null"` (YAML's null literal collides with the string form otherwise; documented in the config doc-comment).
+- **YAML + CLI merge semantics**: CLI flags are parsed first; YAML entries append. Duplicates on the same column have last-write-wins; operators wanting YAML to be authoritative should not pass conflicting CLI flags.
+- **`redact_key_source` YAML field** mirrors `--redact-key-source`. CLI flag overrides YAML when both are set.
+
+### Migration / Compatibility
+
+- **Drop-in upgrade from v0.53.x.** No flag changes — same `--redact` syntax. Operators previously running `sluice sync start --redact ...` will see CDC events now redacted too (they were not in v0.53.0). The audit log line at startup is the same.
+- **No schema or position-token changes.**
+- **The PII Phase 1.5 caveat from v0.53.0's CHANGELOG is closed** — `--redact` on `sync start` now covers both phases. Backup-stream redaction and schema-preview annotation remain deferred.
+
+### Who needs this release
+
+- **Anyone running `sluice sync start --redact ...`**: **upgrade**. v0.53.0's caveat ("CDC apply path is NOT yet redacted") is the load-bearing reason. PII columns in CDC events were flowing to the target unredacted; v0.54.0 closes that.
+- **Operators wanting reviewable / version-controllable redaction config**: use the new `redactions:` YAML block instead of long `--redact` CLI argument lists. Both forms are equivalent; YAML is the production-recommended form.
+- **Anyone not redacting PII**: drop-in, no behaviour change.
+
+### Verification
+
+- **`internal/redact` unit tests** extend the Registry's ApplyRow contract.
+- **`internal/config` tests** cover YAML round-trip for all four strategies + the `strategy: "null"` quoting requirement.
+- **`cmd/sluice` tests** cover `mergeYAMLRedactions` end-to-end + the YAML-extends-CLI semantics + every YAML refusal mode + HMAC keyset wired via YAML config.
+- **CDC apply-path verification deferred to the v0.54.0 cycle**: pin scenarios include `sluice sync start --redact users.email=hash:sha256` against a running source that's INSERTing into users mid-stream, then query the target after a few minutes and confirm emails are hex-digests (not plaintext) for both the cold-start rows AND the post-cold-start CDC-applied rows.
+
+### What's NOT in v0.54.0 (deferred to v0.55.0+)
+
+- **Schema-preview annotation** — `sluice schema preview` / `sluice schema diff` don't yet annotate redacted columns with `-- REDACTED via <strategy>` comments.
+- **Backup-stream redaction** — `backup full` / `backup stream run` paths don't yet honour `--redact`.
+- **Phase 2 strategy catalog** (format-preserving + randomized + dictionary) — see `docs/dev/notes/prep-pii-redaction-phase-2-strategy-catalog.md` for the planned mapping of MySQL Enterprise's data-masking functions to sluice-native strategies.
+
 ## [0.53.0]
 
 **Lands GitHub issue #24 chunk 15a — PII redaction Phase 1.** First half of the largest user-facing roadmap addition since multi-source aggregation: operators can now declare per-column redactions that fire during the bulk-copy path. "Snapshot prod → staging without PII" is now a first-class workflow instead of requiring an external Tonic / Privacy Dynamics / custom-ETL detour. Phase 2 (format-preserving + tokenize), Phase 3 (JSON-path), and Phase 4 (cross-stream keyset persistence) are tracked separately on the roadmap.

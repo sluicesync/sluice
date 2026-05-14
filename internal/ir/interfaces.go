@@ -214,6 +214,23 @@ type ApplyExecTimeoutSetter interface {
 	SetExecTimeout(d time.Duration)
 }
 
+// RedactorSetter is the optional surface a [ChangeApplier] can
+// implement to receive the operator-configured PII redaction
+// policy. PII Phase 1.5 (roadmap item 15a follow-on, GitHub issue
+// #24). The applier's Apply / ApplyBatch path consults the
+// redactor before dispatching each change so PII columns get
+// redacted on CDC events the same way Phase 1's bulk-copy path
+// already redacts cold-start rows.
+//
+// The parameter type is `any` to avoid pulling the redact package
+// into ir (would create a cycle: pipeline → redact → ir → redact).
+// Implementations type-assert to *redact.Registry; a nil or empty
+// registry is the no-op default (CDC events flow through
+// unredacted, matching pre-Phase-1.5 behaviour).
+type RedactorSetter interface {
+	SetRedactor(registry any)
+}
+
 // RangeBoundsQuerier is the optional surface a [RowReader] can
 // implement to expose MIN/MAX queries on a single PK column. Used by
 // the parallel-bulk-copy phase (v0.5.0) to compute chunk boundaries

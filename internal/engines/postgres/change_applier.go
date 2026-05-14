@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pglogrepl"
 
 	"github.com/orware/sluice/internal/ir"
+	"github.com/orware/sluice/internal/redact"
 )
 
 // # Bug-6 fix: route applier args through prepareValue
@@ -197,6 +198,11 @@ type ChangeApplier struct {
 	// destination connection blocked the apply goroutine indefinitely
 	// inside crypto/tls.(*Conn).Read.
 	execTimeout time.Duration
+
+	// redactor is the operator-configured PII redaction registry
+	// (Phase 1.5, roadmap item 15a follow-on). Symmetric with the
+	// MySQL applier; see that engine for the design.
+	redactor *redact.Registry
 }
 
 // SetMaxBufferBytes implements [ir.MaxBufferBytesSetter]. The
@@ -214,6 +220,39 @@ func (a *ChangeApplier) SetMaxBufferBytes(bytes int64) {
 // Phase B fix, v0.52.0). Zero or negative disables the timeout.
 func (a *ChangeApplier) SetExecTimeout(d time.Duration) {
 	a.execTimeout = d
+}
+
+// SetRedactor implements [ir.RedactorSetter]. PII Phase 1.5; same
+// shape as the MySQL applier's SetRedactor — see that engine for
+// the doc-comment + the type-assertion rationale.
+func (a *ChangeApplier) SetRedactor(registry any) {
+	if registry == nil {
+		a.redactor = nil
+		return
+	}
+	r, _ := registry.(*redact.Registry)
+	a.redactor = r
+}
+
+// redactChange mirrors the MySQL applier's redactChange. nil/empty
+// redactor is the no-op fast path. PII Phase 1.5 row-data scope:
+// Insert.Row, Update.Before/After, Delete.Before.
+func (a *ChangeApplier) redactChange(c ir.Change) error {
+	if a.redactor.Empty() {
+		return nil
+	}
+	switch v := c.(type) {
+	case ir.Insert:
+		return a.redactor.ApplyRow(v.Schema, v.Table, v.Row)
+	case ir.Update:
+		if err := a.redactor.ApplyRow(v.Schema, v.Table, v.Before); err != nil {
+			return err
+		}
+		return a.redactor.ApplyRow(v.Schema, v.Table, v.After)
+	case ir.Delete:
+		return a.redactor.ApplyRow(v.Schema, v.Table, v.Before)
+	}
+	return nil
 }
 
 // txExec wraps tx.ExecContext with the applier's per-exec timeout
@@ -593,6 +632,10 @@ func (a *ChangeApplier) Apply(ctx context.Context, streamID string, changes <-ch
 // the [CDCReader]'s keepalive routine can advance
 // confirmed_flush_lsn past this change.
 func (a *ChangeApplier) applyOne(ctx context.Context, streamID string, c ir.Change) error {
+	// PII Phase 1.5: redact CDC row data before dispatch.
+	if err := a.redactChange(c); err != nil {
+		return classifyApplierError(fmt.Errorf("postgres: applier: redact: %w", err))
+	}
 	tx, err := a.db.BeginTx(ctx, nil)
 	if err != nil {
 		return classifyApplierError(fmt.Errorf("postgres: applier: begin tx: %w", err))

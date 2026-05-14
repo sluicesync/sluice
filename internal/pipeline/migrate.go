@@ -1074,3 +1074,23 @@ func applyExecTimeout(target any, d time.Duration) {
 		setter.SetExecTimeout(d)
 	}
 }
+
+// applyRedactor plumbs the streamer-side --redact registry to a
+// target [ir.ChangeApplier] that opts into PII redaction via
+// [ir.RedactorSetter]. PII Phase 1.5: completes the operator
+// contract that Phase 1's CHANGELOG documented as "bulk-copy
+// only" — CDC apply paths now redact too. Engines that don't
+// implement the setter inherit the pre-Phase-1.5 behaviour (CDC
+// events flow through unredacted).
+//
+// nil registry skips the call (no setter invocation, no setter
+// stored on the applier). Empty registry is also a no-op via the
+// applier's own ApplyRow short-circuit.
+func applyRedactor(target any, registry *redact.Registry) {
+	if registry.Empty() {
+		return
+	}
+	if setter, ok := target.(ir.RedactorSetter); ok {
+		setter.SetRedactor(registry)
+	}
+}

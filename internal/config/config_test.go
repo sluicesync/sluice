@@ -72,6 +72,73 @@ extensions:
 	}
 }
 
+// TestLoadYAML_Redactions covers the PII Phase 1.5 YAML block.
+// Each strategy form should parse into the corresponding
+// Redaction struct.
+func TestLoadYAML_Redactions(t *testing.T) {
+	yamlContent := `
+redactions:
+  - table: users.email
+    strategy: hash
+    algo: sha256
+  - table: users.phone
+    strategy: truncate
+    length: 4
+  - table: billing.accounts.ssn
+    strategy: static
+    value: REDACTED
+  - table: users.middle_name
+    strategy: "null"
+redact_key_source: env:REDACT_KEY
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sluice.yaml")
+	if err := os.WriteFile(path, []byte(yamlContent), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	if len(c.Redactions) != 4 {
+		t.Fatalf("got %d redactions; want 4", len(c.Redactions))
+	}
+	if c.RedactKeySource != "env:REDACT_KEY" {
+		t.Errorf("RedactKeySource = %q; want %q", c.RedactKeySource, "env:REDACT_KEY")
+	}
+
+	cases := []struct {
+		idx                          int
+		table, strategy, algo, value string
+		length                       int
+	}{
+		{0, "users.email", "hash", "sha256", "", 0},
+		{1, "users.phone", "truncate", "", "", 4},
+		{2, "billing.accounts.ssn", "static", "", "REDACTED", 0},
+		{3, "users.middle_name", "null", "", "", 0},
+	}
+	for _, c2 := range cases {
+		r := c.Redactions[c2.idx]
+		if r.Table != c2.table {
+			t.Errorf("Redactions[%d].Table = %q; want %q", c2.idx, r.Table, c2.table)
+		}
+		if r.Strategy != c2.strategy {
+			t.Errorf("Redactions[%d].Strategy = %q; want %q", c2.idx, r.Strategy, c2.strategy)
+		}
+		if r.Algo != c2.algo {
+			t.Errorf("Redactions[%d].Algo = %q; want %q", c2.idx, r.Algo, c2.algo)
+		}
+		if r.Value != c2.value {
+			t.Errorf("Redactions[%d].Value = %q; want %q", c2.idx, r.Value, c2.value)
+		}
+		if r.Length != c2.length {
+			t.Errorf("Redactions[%d].Length = %d; want %d", c2.idx, r.Length, c2.length)
+		}
+	}
+}
+
 // TestLoadIncludeExcludeTables checks the table-filter YAML fields
 // round-trip through the loader. Operators put these alongside
 // mappings in sluice.yaml; the orchestrator builds a TableFilter

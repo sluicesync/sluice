@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/orware/sluice/internal/config"
 	"github.com/orware/sluice/internal/ir"
 	"github.com/orware/sluice/internal/redact"
 )
@@ -243,4 +244,113 @@ func TestLogRedactionConfig(_ *testing.T) {
 	r.Set("public", "users", "phone", redact.Truncate{N: 4})
 	r.Set("public", "users", "another_email", redact.Hash{Algo: "sha256"}) // dedup test
 	logRedactionConfig(r, "migrate")
+}
+
+// TestMergeYAMLRedactions_AllStrategies covers the PII Phase 1.5
+// YAML round-trip: config.Redaction entries → redact.Registry.
+func TestMergeYAMLRedactions_AllStrategies(t *testing.T) {
+	entries := []config.Redaction{
+		{Table: "public.users.email", Strategy: "hash", Algo: "sha256"},
+		{Table: "users.phone", Strategy: "truncate", Length: 4},
+		{Table: "public.users.ssn", Strategy: "static", Value: "REDACTED"},
+		{Table: "users.middle_name", Strategy: "null"},
+	}
+	reg, err := mergeYAMLRedactions(nil, entries, "", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	rules := reg.Rules()
+	if len(rules) != 4 {
+		t.Fatalf("got %d rules; want 4", len(rules))
+	}
+	// Spot-check each
+	if reg.Get("public", "users", "email").Name() != "hash:sha256" {
+		t.Errorf("email strategy mismatch")
+	}
+	if reg.Get("", "users", "phone").Name() != "truncate:4" {
+		t.Errorf("phone strategy mismatch")
+	}
+	if reg.Get("public", "users", "ssn").Name() != "static:<elided>" {
+		t.Errorf("ssn strategy mismatch")
+	}
+	if reg.Get("", "users", "middle_name").Name() != "null" {
+		t.Errorf("middle_name strategy mismatch")
+	}
+}
+
+// TestMergeYAMLRedactions_AppendsToCLIRegistry covers the
+// "YAML extends CLI" semantics: the merged Registry has both sets.
+func TestMergeYAMLRedactions_AppendsToCLIRegistry(t *testing.T) {
+	cli, err := parseRedactFlags([]string{"users.email=hash:sha256"}, "", "")
+	if err != nil {
+		t.Fatalf("CLI parse failed: %v", err)
+	}
+	yaml := []config.Redaction{
+		{Table: "users.phone", Strategy: "truncate", Length: 4},
+	}
+	reg, err := mergeYAMLRedactions(cli, yaml, "", "")
+	if err != nil {
+		t.Fatalf("merge failed: %v", err)
+	}
+	if reg.Get("", "users", "email") == nil {
+		t.Errorf("CLI rule lost after merge")
+	}
+	if reg.Get("", "users", "phone") == nil {
+		t.Errorf("YAML rule not registered")
+	}
+}
+
+// TestMergeYAMLRedactions_RefusalPaths covers malformed YAML
+// entries.
+func TestMergeYAMLRedactions_RefusalPaths(t *testing.T) {
+	cases := []struct {
+		name          string
+		entry         config.Redaction
+		wantSubstring string
+	}{
+		{"unknown strategy", config.Redaction{Table: "users.email", Strategy: "foo"}, "unknown strategy"},
+		{"empty strategy", config.Redaction{Table: "users.email"}, "'strategy' field is required"},
+		{"hash no algo", config.Redaction{Table: "users.email", Strategy: "hash"}, "requires 'algo' field"},
+		{"hash unknown algo", config.Redaction{Table: "users.email", Strategy: "hash", Algo: "md5"}, "not supported"},
+		{"truncate negative", config.Redaction{Table: "users.email", Strategy: "truncate", Length: -1}, "non-negative"},
+		{"empty table", config.Redaction{Strategy: "null"}, "'table' field is empty"},
+		{"single-segment table", config.Redaction{Table: "users", Strategy: "null"}, "must be"},
+		{"too many segments", config.Redaction{Table: "a.b.c.d", Strategy: "null"}, "must be"},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			_, err := mergeYAMLRedactions(nil, []config.Redaction{c.entry}, "", "")
+			if err == nil {
+				t.Fatal("expected error; got nil")
+			}
+			if !strings.Contains(err.Error(), c.wantSubstring) {
+				t.Errorf("error %q should contain %q", err.Error(), c.wantSubstring)
+			}
+		})
+	}
+}
+
+// TestMergeYAMLRedactions_HMACWithKeySource covers the YAML form
+// of hmac-sha256 + key-source resolution.
+func TestMergeYAMLRedactions_HMACWithKeySource(t *testing.T) {
+	t.Setenv("TEST_YAML_HMAC_KEY", "yaml-hmac-key")
+	entries := []config.Redaction{
+		{Table: "users.email", Strategy: "hash", Algo: "hmac-sha256"},
+	}
+	reg, err := mergeYAMLRedactions(nil, entries, "env:TEST_YAML_HMAC_KEY", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	s := reg.Get("", "users", "email")
+	got, err := s.Redact(&ir.Column{Name: "email"}, "alice@example.com")
+	if err != nil {
+		t.Fatalf("Redact failed: %v", err)
+	}
+	m := hmac.New(sha256.New, []byte("yaml-hmac-key"))
+	m.Write([]byte("alice@example.com"))
+	want := hex.EncodeToString(m.Sum(nil))
+	if got != want {
+		t.Errorf("YAML hmac mismatch")
+	}
 }

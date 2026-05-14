@@ -65,6 +65,71 @@ type Config struct {
 	// semantics as IncludeTables, opposite sense. Mutually
 	// exclusive with IncludeTables.
 	ExcludeTables []string `koanf:"exclude_tables"`
+
+	// Redactions is the YAML form of the `--redact` CLI flag (PII
+	// Phase 1.5). Each entry declares a per-column redaction rule
+	// that the orchestrator applies before the value reaches the
+	// target. CLI `--redact` flags append to this list; duplicates
+	// on the same column emit a WARN and last-write-wins.
+	Redactions []Redaction `koanf:"redactions"`
+
+	// RedactKeySource mirrors `--redact-key-source` (env:VAR |
+	// file:PATH | derive:<salt>). Only consulted when at least one
+	// Redactions entry uses `hash:hmac-sha256`.
+	RedactKeySource string `koanf:"redact_key_source"`
+}
+
+// Redaction is one entry from the YAML `redactions:` block. Mirrors
+// the `--redact TABLE.COLUMN=STRATEGY[:options]` flag shape, broken
+// into separate keys for YAML ergonomics.
+//
+//	redactions:
+//	  - table: users.email          # [schema.]table.column
+//	    strategy: hash              # null | static | hash | truncate
+//	    algo: sha256                # hash:<algo>; "sha256" or "hmac-sha256"
+//	  - table: users.phone
+//	    strategy: truncate
+//	    length: 4
+//	  - table: billing.accounts.ssn
+//	    strategy: static
+//	    value: REDACTED
+//	  - table: users.middle_name
+//	    strategy: "null"             # MUST be quoted; bare `null` is YAML's null literal
+//
+// The CLI layer's parseRedactFlags converts these entries (plus any
+// CLI flags) into a [redact.Registry]. The YAML form is the
+// preferred mode for production deployments — version-controllable,
+// reviewable, audit-friendly. The CLI form stays for ad-hoc use.
+//
+// Note on the `strategy: "null"` quoting: YAML treats the bare word
+// `null` (also `~`, `Null`, `NULL`) as the YAML null literal which
+// unmarshals to Go's empty string. Quoting forces it to stay a
+// string. sluice's CLI form (`--redact users.middle=null`) has no
+// such ambiguity. The quoting requirement is documented in
+// operator-facing docs.
+type Redaction struct {
+	// Table is the full `[schema.]table.column` triple naming the
+	// column to redact. Required.
+	Table string `koanf:"table"`
+
+	// Strategy is one of "null", "static", "hash", "truncate".
+	// Required.
+	Strategy string `koanf:"strategy"`
+
+	// Algo is the hash algorithm when Strategy == "hash". Valid
+	// values: "sha256", "hmac-sha256". Required for hash; ignored
+	// for other strategies.
+	Algo string `koanf:"algo"`
+
+	// Value is the literal replacement when Strategy == "static".
+	// Required for static; ignored for other strategies. Empty
+	// string is a valid replacement (operator-explicit empty-out).
+	Value string `koanf:"value"`
+
+	// Length is the rune-count when Strategy == "truncate". Required
+	// for truncate (must be non-negative); ignored for other
+	// strategies.
+	Length int `koanf:"length"`
 }
 
 // Mapping is a single per-column override.

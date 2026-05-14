@@ -1362,6 +1362,7 @@ func (s *Streamer) openApplier(ctx context.Context) (ir.ChangeApplier, bool, err
 		applyMaxBufferBytes(s.Applier, s.MaxBufferBytes)
 		applyTargetSchema(s.Applier, s.TargetSchema)
 		applyExecTimeout(s.Applier, s.ApplyExecTimeout)
+		applyRedactor(s.Applier, s.Redactor)
 		return s.Applier, false, nil
 	}
 	a, err := s.Target.OpenChangeApplier(ctx, s.TargetDSN)
@@ -1371,6 +1372,7 @@ func (s *Streamer) openApplier(ctx context.Context) (ir.ChangeApplier, bool, err
 	applyMaxBufferBytes(a, s.MaxBufferBytes)
 	applyTargetSchema(a, s.TargetSchema)
 	applyExecTimeout(a, s.ApplyExecTimeout)
+	applyRedactor(a, s.Redactor)
 	return a, true, nil
 }
 

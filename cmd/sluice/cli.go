@@ -213,9 +213,17 @@ func (m *MigrateCmd) Run(g *Globals) error {
 		TargetSchema:        m.TargetSchema,
 		EnabledPGExtensions: m.EnablePGExtension,
 	}
-	redactor, err := parseRedactFlags(m.Redact, m.RedactKeySource, "")
+	keySource := m.RedactKeySource
+	if keySource == "" {
+		keySource = cfg.RedactKeySource
+	}
+	redactor, err := parseRedactFlags(m.Redact, keySource, "")
 	if err != nil {
 		return err
+	}
+	redactor, err = mergeYAMLRedactions(redactor, cfg.Redactions, keySource, "")
+	if err != nil {
+		return fmt.Errorf("redactions (YAML): %w", err)
 	}
 	mig.Redactor = redactor
 	logRedactionConfig(redactor, "migrate")
@@ -601,9 +609,17 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 		TargetSchema:              s.TargetSchema,
 		EnabledPGExtensions:       s.EnablePGExtension,
 	}
-	redactor, err := parseRedactFlags(s.Redact, s.RedactKeySource, s.StreamID)
+	keySource := s.RedactKeySource
+	if keySource == "" {
+		keySource = cfg.RedactKeySource
+	}
+	redactor, err := parseRedactFlags(s.Redact, keySource, s.StreamID)
 	if err != nil {
 		return err
+	}
+	redactor, err = mergeYAMLRedactions(redactor, cfg.Redactions, keySource, s.StreamID)
+	if err != nil {
+		return fmt.Errorf("redactions (YAML): %w", err)
 	}
 	streamer.Redactor = redactor
 	logRedactionConfig(redactor, "sync start")
