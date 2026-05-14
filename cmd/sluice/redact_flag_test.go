@@ -12,10 +12,94 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/alecthomas/kong"
+
 	"github.com/orware/sluice/internal/config"
 	"github.com/orware/sluice/internal/ir"
 	"github.com/orware/sluice/internal/redact"
 )
+
+// TestRedactFlag_KongCommaPreservation pins Bug 59's regression
+// surface across all four `--redact` declaration sites. Before v0.56.1,
+// kong's default sep:"," split a value like `users.pan=mask:inner:4,4`
+// into two list entries ([`users.pan=mask:inner:3`, `4`]), so the
+// parser saw only "mask:inner:3" and rejected with a misleading
+// "got 1 args" error. The fix is `sep:"none"` on each Redact field.
+// Each subtest builds a kong parser, parses a comma-containing
+// `--redact` value, and confirms the Redact slice has exactly one
+// element with the comma intact.
+func TestRedactFlag_KongCommaPreservation(t *testing.T) {
+	want := "users.pan=mask:inner:4,4"
+	cases := []struct {
+		name string
+		args []string
+		get  func(*CLI) []string
+	}{
+		{
+			name: "migrate",
+			args: []string{
+				"migrate",
+				"--source-driver=mysql", "--source=u:p@/db",
+				"--target-driver=mysql", "--target=u:p@/db",
+				"--redact=" + want,
+			},
+			get: func(c *CLI) []string { return c.Migrate.Redact },
+		},
+		{
+			name: "sync-start",
+			args: []string{
+				"sync", "start",
+				"--source-driver=mysql", "--source=u:p@/db",
+				"--target-driver=mysql", "--target=u:p@/db",
+				"--redact=" + want,
+			},
+			get: func(c *CLI) []string { return c.Sync.Start.Redact },
+		},
+		{
+			name: "backup-full",
+			args: []string{
+				"backup", "full",
+				"--source-driver=mysql", "--source=u:p@/db",
+				"--output-dir=/tmp/b",
+				"--redact=" + want,
+			},
+			get: func(c *CLI) []string { return c.Backup.Full.Redact },
+		},
+		{
+			name: "schema-preview",
+			args: []string{
+				"schema", "preview",
+				"--source-driver=mysql", "--source=u:p@/db",
+				"--target-driver=mysql", "--target=u:p@/db",
+				"--redact=" + want,
+			},
+			get: func(c *CLI) []string { return c.Schema.Preview.Redact },
+		},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			cli := &CLI{}
+			parser, err := kong.New(cli,
+				kong.Vars{"version": "test"},
+				kong.Exit(func(int) {}),
+			)
+			if err != nil {
+				t.Fatalf("kong.New: %v", err)
+			}
+			if _, err := parser.Parse(c.args); err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+			got := c.get(cli)
+			if len(got) != 1 {
+				t.Fatalf("Redact len = %d; want 1 (kong split on comma — Bug 59 regression). values: %q", len(got), got)
+			}
+			if got[0] != want {
+				t.Errorf("Redact[0] = %q; want %q", got[0], want)
+			}
+		})
+	}
+}
 
 // TestParseRedactFlags_Empty pins the no-op default: empty slice
 // returns nil registry, no error.

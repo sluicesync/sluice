@@ -394,7 +394,7 @@ type BackupFullCmd struct {
 
 	ForceOverwrite bool `help:"Replace an existing completed backup at the destination. By default 'sluice backup full' refuses to overwrite a successful prior backup; pass this to discard the prior contents and start fresh. Partial (in-progress) backups always resume regardless of this flag."`
 
-	Redact          []string `help:"Redact a PII column in backup chunks (repeatable). Format: '[schema.]table.column=STRATEGY[:options]'. Same strategy list as 'sluice migrate --redact'. PII Phase 1.5 (v0.55.0+): redaction applies during chunk write, so the on-disk backup is PII-clean. Restore from a redacted chain produces the same redacted shape; restore does NOT re-apply redactions (they were applied at backup time). See docs/dev/notes/prep-pii-redaction-phase-1.md." placeholder:"RULE"`
+	Redact          []string `help:"Redact a PII column in backup chunks (repeatable). Format: '[schema.]table.column=STRATEGY[:options]'. Strategies: null, static:<v>, hash:sha256, hash:hmac-sha256, truncate:<n>, mask:inner:<m1>,<m2>[,<char>], mask:outer:<m1>,<m2>[,<char>] — same set as 'sluice migrate --redact'. PII Phase 1.5 (v0.55.0+): redaction applies during chunk write, so the on-disk backup is PII-clean. Restore from a redacted chain produces the same redacted shape; restore does NOT re-apply redactions (they were applied at backup time). See docs/dev/notes/prep-pii-redaction-phase-1.md." placeholder:"RULE" sep:"none"`
 	RedactKeySource string   `help:"Source for the HMAC keyset when --redact rules use 'hash:hmac-sha256'. Same forms as 'sluice migrate --redact-key-source'." placeholder:"SRC"`
 
 	EncryptionFlags

@@ -6,6 +6,32 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.56.1]
+
+**Closes Bug 59 — `--redact` was kong-split on the literal comma in `mask:inner:4,4`.** The v0.56.0 cycle subagent caught it: passing `--redact users.pan=mask:inner:4,4` made kong's default `sep:","` split the value into two list entries (`users.pan=mask:inner:3` + `4`), so the parser saw only `mask:inner:3` and refused with a misleading `got 1 args` error. Operators following the v0.56.0 CHANGELOG / release-notes examples literally would hit this on first try.
+
+### Fixed
+
+- **`sep:"none"` on every `--redact` declaration** — `sluice migrate`, `sluice sync start`, `sluice backup full`, `sluice schema preview`. Each `--redact` value now flows through kong as a single string regardless of embedded commas; the only splitting happens inside sluice's parser at the documented `:` / `,` positions inside `mask:<form>:<m1>,<m2>[,<char>]`.
+- **Regression test** (`TestRedactFlag_KongCommaPreservation`) parses `--redact users.pan=mask:inner:4,4` through real kong at each of the four sites and asserts the Redact slice has exactly one element with the comma intact. Catches any future re-introduction of the default separator.
+- **Help text** on `migrate`, `sync start`, `backup full`, `schema preview` now lists the `mask:inner` / `mask:outer` strategy shapes in the supported-strategies enumeration — previously they were valid but operator-discovery required reading the CHANGELOG or the prep doc.
+
+### Migration / Compatibility
+
+- **Drop-in upgrade from v0.56.0.** No flag, schema, or YAML changes; only the CLI parser shape changes (kong no longer splits the value, which was undocumented behaviour). Pre-v0.56.1 `mask:inner:3,4` rules that escaped the comma (`mask:inner:3\,4`) continue to work — the backslash isn't special to sluice's parser, it was a kong shell-side workaround that was never required and is no longer relevant.
+- **YAML form is unaffected** — koanf does not split list-of-string values on commas. Operators using `redactions:` blocks were never exposed to Bug 59.
+
+### Who needs this release
+
+- **Anyone using `mask:inner` / `mask:outer` via the CLI flag form.** Drop in.
+- **Anyone using only Phase 1 strategies** (`null`, `static:`, `hash:`, `truncate:`) — no behaviour change; the bug only triggered on comma-containing strategy options, and Phase 1 strategies don't take comma-separated arguments. Drop in.
+
+### Verification
+
+- Build + lint clean across all tags.
+- New unit test covers the four declaration sites end-to-end through kong.
+- Manual: `sluice migrate --redact users.pan=mask:inner:4,4 --source-driver=... --target-driver=...` now parses cleanly (previously rejected with `got 1 args`).
+
 ## [0.56.0]
 
 **PII Phase 2.a — generic format-preserving mask strategies + Luhn helper.** Operators redacting PAN, SSN, phone, or similar fixed-shape identifiers can now use `mask:inner` / `mask:outer` instead of stacking `truncate:` + `static:` to fake format preservation. The Luhn helper lands as shared infrastructure for the Phase 2.b checksum-aware strategies (`gen_rnd_pan`-style) coming in a later release.
