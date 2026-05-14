@@ -478,3 +478,140 @@ func TestRegistry(t *testing.T) {
 		}
 	})
 }
+
+// TestMask_Inner covers MaskInner: keep first M1 + last M2; mask middle.
+func TestMask_Inner(t *testing.T) {
+	t.Run("Name reports form + margins", func(t *testing.T) {
+		m := Mask{Form: MaskInner, M1: 4, M2: 4}
+		if got := m.Name(); got != "mask:inner:4,4" {
+			t.Errorf("Name = %q; want %q", got, "mask:inner:4,4")
+		}
+	})
+
+	t.Run("PAN-style: keep first 4 + last 4", func(t *testing.T) {
+		got, err := (Mask{Form: MaskInner, M1: 4, M2: 4}).Redact(
+			stringColumn("pan", true), "4111111111111111")
+		if err != nil {
+			t.Fatalf("unexpected error %v", err)
+		}
+		if got != "4111XXXXXXXX1111" {
+			t.Errorf("got %v; want %q", got, "4111XXXXXXXX1111")
+		}
+	})
+
+	t.Run("SSN-style: keep last 4 only (M1=0)", func(t *testing.T) {
+		got, _ := (Mask{Form: MaskInner, M1: 0, M2: 4}).Redact(
+			stringColumn("ssn", true), "123-45-6789")
+		if got != "XXXXXXX6789" {
+			t.Errorf("got %v; want %q", got, "XXXXXXX6789")
+		}
+	})
+
+	t.Run("custom mask char", func(t *testing.T) {
+		got, _ := (Mask{Form: MaskInner, M1: 4, M2: 4, Char: "*"}).Redact(
+			stringColumn("pan", true), "4111111111111111")
+		if got != "4111********1111" {
+			t.Errorf("got %v; want %q", got, "4111********1111")
+		}
+	})
+
+	t.Run("M1+M2 >= length: input passes through", func(t *testing.T) {
+		got, _ := (Mask{Form: MaskInner, M1: 4, M2: 4}).Redact(
+			stringColumn("short", true), "12345")
+		if got != "12345" {
+			t.Errorf("got %v; want %q (unchanged when margins cover full length)", got, "12345")
+		}
+	})
+
+	t.Run("UTF-8: rune-counted not byte-counted", func(t *testing.T) {
+		// "ñ@example.com" has 13 runes. M1=1, M2=4 keeps "ñ" and
+		// ".com", masks the 8 middle runes.
+		got, _ := (Mask{Form: MaskInner, M1: 1, M2: 4}).Redact(
+			stringColumn("email", true), "ñ@example.com")
+		if got != "ñXXXXXXXX.com" {
+			t.Errorf("got %v; want %q (UTF-8 rune count)", got, "ñXXXXXXXX.com")
+		}
+	})
+
+	t.Run("nil input passes through", func(t *testing.T) {
+		got, err := (Mask{Form: MaskInner, M1: 4, M2: 4}).Redact(
+			stringColumn("pan", true), nil)
+		if err != nil || got != nil {
+			t.Errorf("nil input: got %v err %v; want nil, nil", got, err)
+		}
+	})
+
+	t.Run("non-string input refuses with informative error", func(t *testing.T) {
+		_, err := (Mask{Form: MaskInner, M1: 4, M2: 4}).Redact(
+			intColumn("age", false), int64(42))
+		if err == nil {
+			t.Fatal("expected error for int input")
+		}
+		if !strings.Contains(err.Error(), "age") || !strings.Contains(err.Error(), "mask:inner") {
+			t.Errorf("error %q should name the column + strategy form", err.Error())
+		}
+	})
+
+	t.Run("negative margins treated as 0", func(t *testing.T) {
+		got, _ := (Mask{Form: MaskInner, M1: -1, M2: -1}).Redact(
+			stringColumn("pan", true), "ABCD")
+		if got != "XXXX" {
+			t.Errorf("got %v; want %q (negatives → 0, whole string masked)", got, "XXXX")
+		}
+	})
+}
+
+// TestMask_Outer covers MaskOuter: mask first M1 + last M2; keep middle.
+func TestMask_Outer(t *testing.T) {
+	t.Run("Name reports form + margins", func(t *testing.T) {
+		m := Mask{Form: MaskOuter, M1: 2, M2: 2}
+		if got := m.Name(); got != "mask:outer:2,2" {
+			t.Errorf("Name = %q; want %q", got, "mask:outer:2,2")
+		}
+	})
+
+	t.Run("Keep middle: mask first 2 + last 2", func(t *testing.T) {
+		got, _ := (Mask{Form: MaskOuter, M1: 2, M2: 2}).Redact(
+			stringColumn("code", true), "ABCDEFGH")
+		if got != "XXCDEFXX" {
+			t.Errorf("got %v; want %q", got, "XXCDEFXX")
+		}
+	})
+
+	t.Run("M1+M2 >= length: whole value masked", func(t *testing.T) {
+		got, _ := (Mask{Form: MaskOuter, M1: 4, M2: 4}).Redact(
+			stringColumn("short", true), "1234")
+		if got != "XXXX" {
+			t.Errorf("got %v; want %q (margins cover full length → all masked)", got, "XXXX")
+		}
+	})
+
+	t.Run("nil input passes through", func(t *testing.T) {
+		got, _ := (Mask{Form: MaskOuter, M1: 2, M2: 2}).Redact(
+			stringColumn("code", true), nil)
+		if got != nil {
+			t.Errorf("nil input: got %v; want nil", got)
+		}
+	})
+}
+
+// TestMaskForm_String pins the textual form names emitted in
+// Mask.Name and CLI error messages.
+func TestMaskForm_String(t *testing.T) {
+	cases := []struct {
+		form MaskForm
+		want string
+	}{
+		{MaskInner, "inner"},
+		{MaskOuter, "outer"},
+		{MaskForm(99), "unknown"}, // defensive
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.want, func(t *testing.T) {
+			if got := c.form.String(); got != c.want {
+				t.Errorf("MaskForm(%d).String() = %q; want %q", c.form, got, c.want)
+			}
+		})
+	}
+}

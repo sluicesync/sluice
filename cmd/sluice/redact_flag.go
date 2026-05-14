@@ -10,6 +10,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/orware/sluice/internal/config"
 	"github.com/orware/sluice/internal/redact"
@@ -125,11 +126,52 @@ func yamlStrategyToSluice(entry config.Redaction, keySource, streamID string) (r
 			return nil, fmt.Errorf("strategy 'truncate' requires non-negative 'length'; got %d", entry.Length)
 		}
 		return redact.Truncate{N: entry.Length}, nil
+	case "mask":
+		return yamlMaskToSluice(entry)
 	case "":
-		return nil, errors.New("'strategy' field is required (null, static, hash, truncate)")
+		return nil, errors.New("'strategy' field is required (null, static, hash, truncate, mask)")
 	default:
-		return nil, fmt.Errorf("unknown strategy %q (supported: null, static, hash, truncate)", entry.Strategy)
+		return nil, fmt.Errorf("unknown strategy %q (supported: null, static, hash, truncate, mask)", entry.Strategy)
 	}
+}
+
+// yamlMaskToSluice converts a `strategy: mask` YAML entry into a
+// [redact.Mask]. YAML shape:
+//
+//   - table: users.pan
+//     strategy: mask
+//     form: inner      # inner | outer
+//     m1: 4
+//     m2: 4
+//     char: X          # optional, single rune, defaults to "X"
+//
+// All margin validation mirrors the CLI's [parseMaskStrategy] —
+// negative margins, missing form, non-single-rune char all refuse
+// with a clear message.
+func yamlMaskToSluice(entry config.Redaction) (redact.Strategy, error) {
+	var form redact.MaskForm
+	switch entry.Form {
+	case "inner":
+		form = redact.MaskInner
+	case "outer":
+		form = redact.MaskOuter
+	case "":
+		return nil, errors.New("strategy 'mask' requires 'form' field: 'inner' or 'outer'")
+	default:
+		return nil, fmt.Errorf("strategy 'mask' has unknown form %q (supported: inner, outer)", entry.Form)
+	}
+	if entry.M1 < 0 {
+		return nil, fmt.Errorf("strategy 'mask' requires non-negative 'm1'; got %d", entry.M1)
+	}
+	if entry.M2 < 0 {
+		return nil, fmt.Errorf("strategy 'mask' requires non-negative 'm2'; got %d", entry.M2)
+	}
+	if entry.Char != "" {
+		if n := utf8.RuneCountInString(entry.Char); n != 1 {
+			return nil, fmt.Errorf("strategy 'mask' 'char' must be a single rune; got %d runes in %q", n, entry.Char)
+		}
+	}
+	return redact.Mask{Form: form, M1: entry.M1, M2: entry.M2, Char: entry.Char}, nil
 }
 
 // splitTriple is YAML's variant of splitRedactValue's left half:
@@ -229,9 +271,77 @@ func strategyFromSpec(spec, keySource, streamID string) (redact.Strategy, error)
 			return nil, fmt.Errorf("strategy 'truncate:%s': length must be non-negative", opts)
 		}
 		return redact.Truncate{N: n}, nil
+	case "mask":
+		return parseMaskStrategy(opts)
 	default:
-		return nil, fmt.Errorf("unknown strategy %q (supported: null, static:<v>, hash:sha256, hash:hmac-sha256, truncate:<n>)", name)
+		return nil, fmt.Errorf("unknown strategy %q (supported: null, static:<v>, hash:sha256, hash:hmac-sha256, truncate:<n>, mask:inner:<m1>,<m2>[,<char>], mask:outer:<m1>,<m2>[,<char>])", name)
 	}
+}
+
+// parseMaskStrategy parses the `inner:<m1>,<m2>[,<char>]` /
+// `outer:<m1>,<m2>[,<char>]` suffix of a `mask:` spec into a
+// [redact.Mask]. The CLI flag form is e.g.
+// `--redact users.pan=mask:inner:4,4` (defaults char to `X`)
+// or `--redact users.pan=mask:inner:4,4,*`.
+//
+// Refuses on:
+//
+//   - Unknown form (must be `inner` or `outer`)
+//   - Missing margins
+//   - Non-integer margins
+//   - Negative margins
+//   - Multi-rune char (operators wanting "Xx" patterns should
+//     use a single character; multi-char masks aren't a
+//     real-world need)
+func parseMaskStrategy(opts string) (redact.Strategy, error) {
+	if opts == "" {
+		return nil, errors.New("strategy 'mask' requires a form + margins: 'mask:inner:<m1>,<m2>[,<char>]' or 'mask:outer:<m1>,<m2>[,<char>]'")
+	}
+	formName, rest, ok := strings.Cut(opts, ":")
+	if !ok {
+		return nil, fmt.Errorf("strategy 'mask:%s': expected 'mask:<form>:<m1>,<m2>[,<char>]'", opts)
+	}
+	var form redact.MaskForm
+	switch formName {
+	case "inner":
+		form = redact.MaskInner
+	case "outer":
+		form = redact.MaskOuter
+	default:
+		return nil, fmt.Errorf("strategy 'mask:%s': unknown form %q (supported: inner, outer)", opts, formName)
+	}
+	parts := strings.Split(rest, ",")
+	if len(parts) < 2 || len(parts) > 3 {
+		return nil, fmt.Errorf("strategy 'mask:%s': expected '<m1>,<m2>[,<char>]'; got %d args", opts, len(parts))
+	}
+	m1, err := strconv.Atoi(strings.TrimSpace(parts[0]))
+	if err != nil {
+		return nil, fmt.Errorf("strategy 'mask:%s': m1 must be an integer", opts)
+	}
+	if m1 < 0 {
+		return nil, fmt.Errorf("strategy 'mask:%s': m1 must be non-negative", opts)
+	}
+	m2, err := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if err != nil {
+		return nil, fmt.Errorf("strategy 'mask:%s': m2 must be an integer", opts)
+	}
+	if m2 < 0 {
+		return nil, fmt.Errorf("strategy 'mask:%s': m2 must be non-negative", opts)
+	}
+	char := ""
+	if len(parts) == 3 {
+		char = parts[2]
+		if char == "" {
+			return nil, fmt.Errorf("strategy 'mask:%s': char argument is empty (omit the trailing comma to default to 'X')", opts)
+		}
+		// Refuse multi-rune char defensively. Operators wanting
+		// multi-character mask sequences should use a different
+		// strategy.
+		if n := utf8.RuneCountInString(char); n != 1 {
+			return nil, fmt.Errorf("strategy 'mask:%s': char must be a single rune; got %d runes in %q", opts, n, char)
+		}
+	}
+	return redact.Mask{Form: form, M1: m1, M2: m2, Char: char}, nil
 }
 
 // resolveHMACKey reads the HMAC keyset for `hash:hmac-sha256`

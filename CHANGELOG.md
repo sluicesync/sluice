@@ -6,6 +6,43 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.56.0]
+
+**PII Phase 2.a — generic format-preserving mask strategies + Luhn helper.** Operators redacting PAN, SSN, phone, or similar fixed-shape identifiers can now use `mask:inner` / `mask:outer` instead of stacking `truncate:` + `static:` to fake format preservation. The Luhn helper lands as shared infrastructure for the Phase 2.b checksum-aware strategies (`gen_rnd_pan`-style) coming in a later release.
+
+### Added
+
+- **`mask:inner:<m1>,<m2>[,<char>]` strategy** — keeps the first M1 + last M2 runes, masks the middle. `--redact users.pan=mask:inner:4,4` on `4111111111111111` yields `4111XXXXXXXX1111`; `--redact users.ssn=mask:inner:0,4,*` on `123456789` yields `*****6789`. Char defaults to `X` when omitted, single rune only (operators wanting `Xx` repeating patterns are explicitly out of scope).
+- **`mask:outer:<m1>,<m2>[,<char>]` strategy** — inverse of `mask:inner`: masks the first M1 + last M2 runes, keeps the middle. Less common in real-world PII workflows but matches MySQL Enterprise's `mask_outer` for parity.
+- **YAML form**: `strategy: mask` + `form: inner|outer` + `m1:` + `m2:` + optional `char:`. Same validation as the CLI parser (negative margins refused, multi-rune `char:` refused, missing `form:` refused).
+- **Rune-counted iteration**: both forms preserve input rune-length and are UTF-8 / emoji safe — a 16-char PAN stays 16 chars; `🎉ñe@x.com` masks rune-wise rather than slicing mid-byte.
+- **Luhn helper** (`internal/redact/luhn.go`): `luhnValid` + `luhnCheckDigit`. Validates and produces Luhn-conformant ISO/IEC 7812 numbers (PAN / SIN / IMEI). Skips non-digit characters in the input (so `4111-1111-1111-1111` and `4111 1111 1111 1111` both validate). Not exposed via CLI yet — shared infrastructure for the upcoming Phase 2.b `gen_rnd_pan` strategy.
+
+### Compatibility
+
+- **Drop-in upgrade from v0.55.x.** No flag changes; new strategies are opt-in.
+- **Boundary behaviour**: when M1+M2 ≥ rune-length, `mask:inner` is a no-op (nothing to mask) and `mask:outer` masks the whole value. Negative margins are clamped to 0 defensively though the CLI/YAML parsers refuse them at parse time.
+- **Strategy.Name() audit log** for mask omits the mask character: `mask:inner:4,4` / `mask:outer:1,1` regardless of `char:` setting. The character choice is uninteresting from an audit perspective; form + margins fully describe what was applied.
+
+### Who needs this release
+
+- **Operators redacting PAN / SSN / phone / passport / TIN columns** who want to preserve the on-target rune-length for downstream tooling (analytics tables expecting `CHAR(16)`, reports rendering "**** **** **** 1234"). `truncate:` + `static:` couldn't do this; `mask:inner` does.
+- **Anyone not redacting PII**: drop-in, no behaviour change.
+
+### Phase 2 roadmap
+
+- **Phase 2.a (this release)**: generic mask strategies + Luhn helper.
+- **Phase 2.b (next)**: checksum-aware strategies — `gen_rnd_pan`, `gen_rnd_us_phone`, `gen_rnd_canada_sin`. The Luhn helper lands here pre-emptively.
+- **Phase 2.c (later)**: structured-data strategies — `mask_iban`, `mask_uuid`, `mask_email` (separator-aware).
+
+See `docs/dev/notes/prep-pii-redaction-phase-2-strategy-catalog.md` for the full strategy catalog and MySQL Enterprise reference mapping.
+
+### Verification
+
+- **Build + lint clean** across all tags (default, integration, psverify).
+- **Unit tests**: `TestLuhnValid` / `TestLuhnCheckDigit` cover the algorithm; `TestMask_Inner` / `TestMask_Outer` cover boundaries (M1+M2 ≥ length, UTF-8, custom char, negative margins, nil); `TestParseRedactFlags_Mask` + `TestParseRedactFlags_MaskRefusalPaths` + `TestMergeYAMLRedactions_Mask` cover the CLI + YAML parse paths.
+- **End-to-end pin scenarios for the v0.56.0 cycle**: confirm `mask:inner:4,4` on a PAN column lands `4111XXXXXXXX1111` on the target; confirm YAML-shape `strategy: mask, form: inner` works equivalently.
+
 ## [0.55.1]
 
 **Adds `--target-schema=NAME` to `sluice restore`** — closes the UX-gap the v0.55.0 cycle subagent flagged when restoring redacted backups. Pre-v0.55.1 the restore command lacked the schema-override flag that every other operator-facing command (migrate / sync start / schema preview / schema diff / matview / schema add-table) already had, forcing operators to either use the DSN's default schema or work around it via docker. Now restore mirrors the existing pattern.

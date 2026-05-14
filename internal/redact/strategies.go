@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"strconv"
 
 	"github.com/orware/sluice/internal/ir"
 )
@@ -157,4 +158,161 @@ func colIdentity(col *ir.Column) string {
 		return "<unknown>"
 	}
 	return col.Name
+}
+
+// MaskForm enumerates Mask's two variants. The values mirror MySQL
+// Enterprise's `mask_inner` / `mask_outer` function names per the
+// PII Phase 2 strategy catalog.
+type MaskForm uint8
+
+// Mask form constants.
+const (
+	// MaskInner keeps the first M1 + last M2 characters and masks
+	// the middle. Used for "show last 4 of an SSN/PAN" style
+	// redaction.
+	MaskInner MaskForm = iota
+	// MaskOuter masks the first M1 + last M2 characters and keeps
+	// the middle. Inverse of MaskInner; less commonly used in
+	// real-world PII workflows but matches MySQL Enterprise.
+	MaskOuter
+)
+
+// String returns the textual form ("inner" / "outer") used in
+// [Mask.Name].
+func (f MaskForm) String() string {
+	switch f {
+	case MaskInner:
+		return "inner"
+	case MaskOuter:
+		return "outer"
+	default:
+		return "unknown"
+	}
+}
+
+// Mask applies format-preserving redaction by replacing characters
+// with a mask character while preserving the original length and
+// non-masked chars verbatim. Two forms (PII Phase 2.a, roadmap item
+// 15a Phase 2):
+//
+//   - [MaskInner] keeps the first M1 + last M2 characters and masks
+//     the middle with [Mask.Char] (default `X`). Real-world use:
+//     redact a credit card to `4111XXXXXXXXXXX1111`, an SSN to
+//     `XXX-XX-1234` (with M1=0, M2=4), or an email's mailbox while
+//     keeping its domain (M1=1, M2=len(@domain), char=`X`).
+//   - [MaskOuter] masks the first M1 + last M2 characters and keeps
+//     the middle. Less common; included for parity with MySQL
+//     Enterprise.
+//
+// Mask preserves the input's rune-length: a 16-char PAN stays
+// 16-char on output. Operators wanting variable-length output
+// should use [Truncate] or [Static] instead.
+//
+// Accepted input shapes:
+//
+//   - string: masked rune-wise (UTF-8 + emoji safe).
+//   - nil: passed through verbatim.
+//
+// All other input shapes (numeric types, []byte, etc.) return an
+// error naming the column + the value's Go type. Real-world PII
+// columns for masking are almost always string-typed (PAN, SSN,
+// phone, email); strict-type check catches operator
+// misconfiguration early.
+//
+// Boundary cases:
+//
+//   - M1 + M2 >= rune-length: the entire value is preserved
+//     (nothing to mask). No-op return.
+//   - M1 or M2 < 0: treated as 0 defensively.
+//   - Char is one rune; multi-rune Char defaults to the first rune.
+//     Empty Char defaults to `X`.
+type Mask struct {
+	// Form is MaskInner or MaskOuter; see the type doc.
+	Form MaskForm
+	// M1 is the "first N chars" margin. Operator-supplied via
+	// `mask:inner:4,4` or `mask:outer:4,4`.
+	M1 int
+	// M2 is the "last N chars" margin.
+	M2 int
+	// Char is the mask character. Defaults to `X` when empty. Only
+	// the first rune is consumed.
+	Char string
+}
+
+// Name returns "mask:<form>:<M1>,<M2>" — the audit-log identifier.
+// The mask character is NOT included in the name since it's
+// uninteresting from an audit perspective (the strategy still
+// fully describes what was applied: form + margins).
+func (m Mask) Name() string {
+	return "mask:" + m.Form.String() + ":" + strconv.Itoa(m.M1) + "," + strconv.Itoa(m.M2)
+}
+
+// Redact applies the mask. See the type doc for boundary semantics.
+func (m Mask) Redact(col *ir.Column, val any) (any, error) {
+	if val == nil {
+		return nil, nil
+	}
+	s, ok := val.(string)
+	if !ok {
+		return nil, fmt.Errorf("redact: column %s has unsupported type %T for mask:%s strategy (only string is supported)", colIdentity(col), val, m.Form)
+	}
+	runes := []rune(s)
+	m1 := m.M1
+	m2 := m.M2
+	if m1 < 0 {
+		m1 = 0
+	}
+	if m2 < 0 {
+		m2 = 0
+	}
+	mc := maskRune(m.Char)
+	switch m.Form {
+	case MaskInner:
+		// Keep first m1 + last m2; mask middle.
+		if m1+m2 >= len(runes) {
+			return s, nil // nothing to mask
+		}
+		out := make([]rune, len(runes))
+		copy(out, runes[:m1])
+		for i := m1; i < len(runes)-m2; i++ {
+			out[i] = mc
+		}
+		copy(out[len(runes)-m2:], runes[len(runes)-m2:])
+		return string(out), nil
+	case MaskOuter:
+		// Mask first m1 + last m2; keep middle.
+		if m1+m2 >= len(runes) {
+			// Whole value is masked.
+			out := make([]rune, len(runes))
+			for i := range out {
+				out[i] = mc
+			}
+			return string(out), nil
+		}
+		out := make([]rune, len(runes))
+		for i := 0; i < m1; i++ {
+			out[i] = mc
+		}
+		copy(out[m1:len(runes)-m2], runes[m1:len(runes)-m2])
+		for i := len(runes) - m2; i < len(runes); i++ {
+			out[i] = mc
+		}
+		return string(out), nil
+	default:
+		return nil, fmt.Errorf("redact: column %s has unknown mask form %v", colIdentity(col), m.Form)
+	}
+}
+
+// maskRune extracts the first rune from char (defaulting to 'X' on
+// empty). Multi-rune values silently consume only the first rune;
+// the CLI parser should refuse multi-rune values at parse time, so
+// this is defensive.
+func maskRune(char string) rune {
+	if char == "" {
+		return 'X'
+	}
+	for _, r := range char {
+		return r
+	}
+	return 'X'
 }

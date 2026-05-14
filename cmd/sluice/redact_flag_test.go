@@ -331,6 +331,149 @@ func TestMergeYAMLRedactions_RefusalPaths(t *testing.T) {
 	}
 }
 
+// TestParseRedactFlags_Mask covers the PII Phase 2.a CLI form of
+// mask:inner and mask:outer including the optional char argument.
+func TestParseRedactFlags_Mask(t *testing.T) {
+	values := []string{
+		"users.pan=mask:inner:4,4",    // default char
+		"users.ssn=mask:inner:0,4,*",  // custom char
+		"users.token=mask:outer:2,2",  // outer form
+		"users.code=mask:outer:1,1,#", // outer + custom char
+	}
+	reg, err := parseRedactFlags(values, "", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	cases := []struct {
+		schema, table, col, wantStrategy string
+	}{
+		{"", "users", "pan", "mask:inner:4,4"},
+		{"", "users", "ssn", "mask:inner:0,4"},
+		{"", "users", "token", "mask:outer:2,2"},
+		{"", "users", "code", "mask:outer:1,1"},
+	}
+	for _, c := range cases {
+		s := reg.Get(c.schema, c.table, c.col)
+		if s == nil {
+			t.Errorf("%s.%s.%s: no rule registered", c.schema, c.table, c.col)
+			continue
+		}
+		if s.Name() != c.wantStrategy {
+			t.Errorf("%s.%s.%s: got %q; want %q", c.schema, c.table, c.col, s.Name(), c.wantStrategy)
+		}
+	}
+
+	// Confirm the parsed Mask actually masks correctly end-to-end.
+	pan := reg.Get("", "users", "pan")
+	got, err := pan.Redact(&ir.Column{Name: "pan"}, "4111111111111111")
+	if err != nil {
+		t.Fatalf("Redact failed: %v", err)
+	}
+	if got != "4111XXXXXXXX1111" {
+		t.Errorf("PAN mask got %q; want %q", got, "4111XXXXXXXX1111")
+	}
+	ssn := reg.Get("", "users", "ssn")
+	got, err = ssn.Redact(&ir.Column{Name: "ssn"}, "123456789")
+	if err != nil {
+		t.Fatalf("Redact failed: %v", err)
+	}
+	if got != "*****6789" {
+		t.Errorf("SSN mask got %q; want %q", got, "*****6789")
+	}
+}
+
+// TestParseRedactFlags_MaskRefusalPaths covers every documented
+// refusal in parseMaskStrategy.
+func TestParseRedactFlags_MaskRefusalPaths(t *testing.T) {
+	cases := []struct {
+		name, raw, wantSubstring string
+	}{
+		{"empty opts", "users.pan=mask", "requires a form"},
+		{"no margins", "users.pan=mask:inner", "expected 'mask:<form>:<m1>,<m2>"},
+		{"unknown form", "users.pan=mask:middle:4,4", "unknown form"},
+		{"missing m2", "users.pan=mask:inner:4", "expected '<m1>,<m2>"},
+		{"too many args", "users.pan=mask:inner:1,2,3,4", "expected '<m1>,<m2>"},
+		{"non-int m1", "users.pan=mask:inner:abc,4", "m1 must be an integer"},
+		{"non-int m2", "users.pan=mask:inner:4,xyz", "m2 must be an integer"},
+		{"negative m1", "users.pan=mask:inner:-1,4", "m1 must be non-negative"},
+		{"negative m2", "users.pan=mask:inner:4,-1", "m2 must be non-negative"},
+		{"multi-rune char", "users.pan=mask:inner:4,4,XY", "single rune"},
+		{"empty char arg", "users.pan=mask:inner:4,4,", "char argument is empty"},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			_, err := parseRedactFlags([]string{c.raw}, "", "")
+			if err == nil {
+				t.Fatal("expected error; got nil")
+			}
+			if !strings.Contains(err.Error(), c.wantSubstring) {
+				t.Errorf("error %q should contain %q", err.Error(), c.wantSubstring)
+			}
+		})
+	}
+}
+
+// TestMergeYAMLRedactions_Mask covers the YAML form of mask.
+func TestMergeYAMLRedactions_Mask(t *testing.T) {
+	entries := []config.Redaction{
+		{Table: "users.pan", Strategy: "mask", Form: "inner", M1: 4, M2: 4},
+		{Table: "users.ssn", Strategy: "mask", Form: "inner", M1: 0, M2: 4, Char: "*"},
+		{Table: "users.token", Strategy: "mask", Form: "outer", M1: 2, M2: 2},
+	}
+	reg, err := mergeYAMLRedactions(nil, entries, "", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := reg.Get("", "users", "pan").Name(); got != "mask:inner:4,4" {
+		t.Errorf("pan strategy mismatch: %q", got)
+	}
+	if got := reg.Get("", "users", "ssn").Name(); got != "mask:inner:0,4" {
+		t.Errorf("ssn strategy mismatch: %q", got)
+	}
+	if got := reg.Get("", "users", "token").Name(); got != "mask:outer:2,2" {
+		t.Errorf("token strategy mismatch: %q", got)
+	}
+
+	// Confirm custom char round-trips through YAML.
+	ssn := reg.Get("", "users", "ssn")
+	got, err := ssn.Redact(&ir.Column{Name: "ssn"}, "123456789")
+	if err != nil {
+		t.Fatalf("Redact failed: %v", err)
+	}
+	if got != "*****6789" {
+		t.Errorf("SSN mask via YAML got %q; want %q", got, "*****6789")
+	}
+}
+
+// TestMergeYAMLRedactions_MaskRefusalPaths covers malformed YAML
+// mask entries.
+func TestMergeYAMLRedactions_MaskRefusalPaths(t *testing.T) {
+	cases := []struct {
+		name          string
+		entry         config.Redaction
+		wantSubstring string
+	}{
+		{"missing form", config.Redaction{Table: "users.pan", Strategy: "mask", M1: 4, M2: 4}, "requires 'form' field"},
+		{"unknown form", config.Redaction{Table: "users.pan", Strategy: "mask", Form: "middle", M1: 4, M2: 4}, "unknown form"},
+		{"negative m1", config.Redaction{Table: "users.pan", Strategy: "mask", Form: "inner", M1: -1, M2: 4}, "non-negative 'm1'"},
+		{"negative m2", config.Redaction{Table: "users.pan", Strategy: "mask", Form: "inner", M1: 4, M2: -1}, "non-negative 'm2'"},
+		{"multi-rune char", config.Redaction{Table: "users.pan", Strategy: "mask", Form: "inner", M1: 4, M2: 4, Char: "XY"}, "single rune"},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			_, err := mergeYAMLRedactions(nil, []config.Redaction{c.entry}, "", "")
+			if err == nil {
+				t.Fatal("expected error; got nil")
+			}
+			if !strings.Contains(err.Error(), c.wantSubstring) {
+				t.Errorf("error %q should contain %q", err.Error(), c.wantSubstring)
+			}
+		})
+	}
+}
+
 // TestMergeYAMLRedactions_HMACWithKeySource covers the YAML form
 // of hmac-sha256 + key-source resolution.
 func TestMergeYAMLRedactions_HMACWithKeySource(t *testing.T) {

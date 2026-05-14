@@ -130,6 +130,23 @@ type Redaction struct {
 	// for truncate (must be non-negative); ignored for other
 	// strategies.
 	Length int `koanf:"length"`
+
+	// Form is the mask form when Strategy == "mask". Valid values:
+	// "inner" / "outer". Required for mask; ignored otherwise.
+	// PII Phase 2.a (v0.56.0+).
+	Form string `koanf:"form"`
+
+	// M1 is the "first N chars" margin when Strategy == "mask".
+	// Required for mask; non-negative.
+	M1 int `koanf:"m1"`
+
+	// M2 is the "last N chars" margin when Strategy == "mask".
+	// Required for mask; non-negative.
+	M2 int `koanf:"m2"`
+
+	// Char is the mask character when Strategy == "mask". Defaults
+	// to "X" when empty. Single rune only.
+	Char string `koanf:"char"`
 }
 
 // Mapping is a single per-column override.
