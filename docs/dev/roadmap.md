@@ -517,6 +517,49 @@ Output: `docs/research/pg-extensions-deployment-frequency.md` (matrix + recommen
 
 ---
 
+### 15. PII redaction during logical replication and migration (GitHub #24)
+
+**Why.** Common operator ask in the replication space: *"I want a copy of this production database, but without the PII."* Typical destinations: staging/dev environments seeded from production schema + realistic-shape data without exposing real users; analytics warehouses that aggregate but never identify individuals; cross-region / cross-tenancy moves where compliance (GDPR / CCPA / HIPAA) requires PII to stay in the source jurisdiction; vendor handoffs where a third-party data processor needs the schema + the data shape but not the PII. Today operators reach for separate tools (Tonic, Privacy Dynamics, Debezium SMTs, custom ETL); sluice could absorb the use case as a first-class feature since the IR-first row pipeline already passes every value through a typed transform stage. See [GitHub issue #24](https://github.com/orware/sluice/issues/24) for the full motivation + comparable-products analysis.
+
+**What — four-phase sequence:**
+
+- **15a. Phase 1 — simple strategies + framework.** New CLI flag `--redact TABLE.COLUMN=STRATEGY[:options]` (repeatable) plus a YAML `redactions:` block. v1 strategies: `null` (replace with NULL), `static:<value>` (replace with constant), `hash:<algo>` (one-way SHA-256 / HMAC), `truncate:<n>` (keep first/last N chars). Lands the IR plumbing (`Redact(col ir.Column, val ir.Value) ir.Value`), the YAML schema, and `sluice schema preview` annotation showing operator which columns are redacted. Covers ~70% of real-world asks without taking on format-preserving complexity. **~v0.55.0 or beyond.**
+
+- **15b. Phase 2 — format-preserving + tokenize.** `mask:<pattern>` (format-preserving partial mask, e.g. `xxxx-xxxx-1234`), `tokenize:<format>` (deterministic surrogate keyed by HMAC of source value; same input → same output across rows + runs), `randomize:<shape>` (generate a new random value of the same shape; seedable). Shared format-detection utility. Well-bounded.
+
+- **15c. Phase 3 — JSON-path redaction.** `jsonpath` strategy with child redactions per JSON path: `paths: [$.payment_method: tokenize, $.last_visit: truncate_to_day]`. Requires an in-IR JSON walker that can rewrite nested values without re-encoding the whole document. Most invasive but smallest fraction of real-world asks (most PII is in dedicated columns, not nested JSON).
+
+- **15d. Phase 4 — deterministic-tokenize keyset persistence.** Persist the HMAC keyset across multiple sluice streams pulling from the same source so user `alice@example.com` becomes the same surrogate on streams to staging-1 AND staging-2. Enables referential-integrity-preserving multi-destination workflows. Probably its own ADR (key-management story + rotation policy).
+
+**Key invariants the design enforces (from the issue body):**
+
+1. **Determinism per stream-id.** Two different sluice sync streams over the same source produce *consistent* redactions for the same input — same hash key, same tokenize seed. Otherwise CDC apply would produce row-version drift.
+2. **Schema preview shows redactions.** `sluice schema preview` and `sluice schema diff` annotate redacted columns (`-- REDACTED via tokenize:email_format`) so operators see what they're agreeing to.
+3. **Verify modes downgrade gracefully.** `sluice verify --depth=count` is unaffected (row counts unchanged). `sluice verify --depth=sample` automatically excludes redacted columns from the row hash (otherwise it'd always fail by design).
+4. **Generated-column behavior unchanged.** Redactions apply at the reader's IR-emit step, BEFORE the target's `GENERATED ALWAYS AS` recomputes. So a generated column on the target derives from the redacted inputs naturally.
+5. **Refuse to start without acknowledgment when no redactions declared.** Optional `--require-redactions` flag for the safety-conscious operator who wants the pipeline to refuse if they forgot to configure them.
+6. **Audit logging.** Single INFO line at stream start summarizing how many columns are redacted (`columns_redacted=12 strategies=[...]`).
+
+**Where redaction sits in the pipeline.** Bulk-copy reader → IR rows → redact → bulk-copy writer. CDC reader → decoded events → IR row → redact → applier. Migrate uses the same path. The redaction layer is a single typed function composed with the existing translation step; adds no new I/O.
+
+**What it explicitly does NOT try to be (per the issue body).**
+
+- Not a PII discovery scanner (column-name regex / heuristics). Operators declare what to redact; sluice applies it. Discovery is a separate problem.
+- Not encryption at rest. Sluice runs in the operator's environment; the redacted output is plaintext on the destination. (Encryption during transport is TLS; encryption at rest is destination-side.)
+- Not reversible. Hash + tokenize are one-way by design. Operators needing reversibility should add their own reversible-encryption middleware outside sluice.
+
+**Gotchas.**
+
+- **Determinism across stream restarts**: the HMAC keyset (for tokenize / hash strategies) must persist somewhere durable so a stream restart produces the same surrogate for the same input. Phase 1 can punt this by deriving the keyset from `--stream-id` + a static salt (stable across restarts of the same stream); Phase 4 lands the proper keyset persistence.
+- **Backup chain integration** (cross-reference with item 14): redactions declared in YAML need to flow through `backup full` / `backup stream run` paths so the backup chain itself is PII-clean. Phase 1 lands sync-path redaction; backup-path follow-on is a small extension since both paths share the IR pipeline.
+- **Cross-engine + redaction**: same-column redactions must work whether the target is same-engine or cross-engine. The redaction layer operates on IR values, which are engine-neutral; should compose cleanly with existing cross-engine translation.
+
+**Sizing.** Phase 1 (the simple strategies + framework) is ~500-800 LOC + tests — IR-side `Redact()` function, YAML schema entries, four strategy implementations, CLI flag, `schema preview` annotation. Phase 2 adds ~400-600 LOC (format-preserving requires format-detection utility code). Phase 3 is ~600-900 LOC (in-IR JSON walker; non-trivial). Phase 4 is its own ADR + ~400-600 LOC (key-management + persistence).
+
+**Sequencing.** Behind the backup-chain track (chunk 14 phases 1-3 close before phase 4 starts). Doesn't compete with #18 (AIMD) or #23 (silent-stall fix) — different surfaces, different operators benefit. Probably the most operator-facing new feature in the v0.55.0+ roadmap window.
+
+---
+
 ### Open bugs awaiting fix windows
 
 Tracked in detail in `sluice-testing/BUG-CATALOG.md`; recap here for roadmap visibility:
