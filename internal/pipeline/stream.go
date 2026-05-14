@@ -230,6 +230,35 @@ type BackupStream struct {
 	// [RetryAttempts] > 1.
 	RetryBackoffCap time.Duration
 
+	// ExitAfterAge, when > 0, causes [BackupStream.Run] to commit the
+	// current rollover and then exit cleanly once the stream's age
+	// (now - chain catalog's CreatedAt, OR stream start time as the
+	// fallback when no catalog) exceeds this duration. The chain's
+	// chain.json gets marked with [ChainCatalog.RotatedAt] +
+	// [ChainCatalog.RotationReason] = "retain-rotate-at" on exit so
+	// subsequent runs can detect that the chain is closed and tooling
+	// can chain across rotations via the (eventual) [SucceededBy]
+	// pointer.
+	//
+	// GitHub issue #20 chunk 14b phase 1: operator wraps `sluice
+	// backup stream run` in a cron / systemd / supervisord loop that
+	// detects the clean exit and restarts the stream with a fresh
+	// --output-dir for the next chain. Phase 2 (v0.52.0+) will
+	// implement in-process rotation that doesn't require the operator
+	// wrapper.
+	//
+	// Zero disables the threshold (preserves pre-v0.51.0 unbounded
+	// behaviour).
+	ExitAfterAge time.Duration
+
+	// ExitAfterChainLength, when > 0, causes [BackupStream.Run] to
+	// exit cleanly after this many incrementals have been committed.
+	// Same chain.json marking as [ExitAfterAge]. Either threshold
+	// fires first wins.
+	//
+	// Zero disables the threshold.
+	ExitAfterChainLength int
+
 	// Now, when set, overrides the wall-clock-time source for
 	// [ir.Manifest.CreatedAt] and `stream_state.json` timestamps. Used
 	// by tests to pin timestamps; in production callers leave it nil
@@ -629,6 +658,24 @@ func (b *BackupStream) Run(ctx context.Context) error {
 		startPos = roll.Manifest.EndPosition
 		rolloverSeq++
 
+		// GitHub #20 chunk 14b phase 1 (v0.51.0): rotation-EXIT
+		// signal. After each successful rollover, check the
+		// configured thresholds. When either trips, mark the
+		// chain.json as rotated + exit cleanly so an operator wrapper
+		// (cron / systemd / supervisord) can restart the stream
+		// pointing at a fresh --output-dir for the next chain. Phase
+		// 2 (v0.52.0+) will implement in-process rotation that
+		// doesn't require the operator wrapper.
+		if reason := b.shouldExitForRotation(ctx, rolloverSeq, now()); reason != "" {
+			markChainRotatedBestEffort(ctx, b.Store, reason, now())
+			slog.InfoContext(ctx, "stream: rotation threshold reached; exiting cleanly",
+				slog.String("rotation_reason", reason),
+				slog.Int("rollovers", rolloverSeq),
+				slog.String("hint", "restart sluice backup stream run with a fresh --output-dir for the next chain; the previous chain.json is marked rotated"),
+			)
+			return nil
+		}
+
 		// Source-channel-closed: pump terminated (test fakes that
 		// emit-then-close, or a real engine whose stream ended). Exit
 		// cleanly rather than spinning on an empty channel.
@@ -639,6 +686,89 @@ func (b *BackupStream) Run(ctx context.Context) error {
 			return nil
 		}
 	}
+}
+
+// shouldExitForRotation returns a non-empty rotation reason when one
+// of the rotation thresholds has tripped. The caller marks the chain
+// and exits cleanly. Returns "" when no threshold is configured or
+// none has fired yet.
+//
+// Threshold semantics:
+//
+//   - ExitAfterChainLength: rolloverSeq has reached the configured
+//     number of incrementals. Cheaper to check (no I/O).
+//   - ExitAfterAge: now - chain catalog's CreatedAt has exceeded the
+//     configured duration. Reads chain.json once per call when
+//     active; the chain catalog is the authoritative anchor for
+//     "chain age" (stable across stream restarts mid-chain).
+//
+// Either threshold firing returns the corresponding reason; chain-
+// length checked first so length-based rotation doesn't pay the
+// chain.json read cost.
+func (b *BackupStream) shouldExitForRotation(ctx context.Context, rolloverSeq int, now time.Time) string {
+	if b.ExitAfterChainLength > 0 && rolloverSeq >= b.ExitAfterChainLength {
+		return rotationReasonChainLength
+	}
+	if b.ExitAfterAge > 0 {
+		cat, present, err := loadChainCatalog(ctx, b.Store)
+		if err != nil || !present || cat.CreatedAt.IsZero() {
+			// Catalog absent / unreadable — fall back silently. The
+			// chain.json should always be present after v0.47.0 +
+			// at least one rollover, so this path means either a
+			// pre-v0.47.0 chain or an I/O blip. Conservative: don't
+			// exit, let the operator surface the issue via the next
+			// rollover's catalog-update path.
+			return ""
+		}
+		if now.Sub(cat.CreatedAt) >= b.ExitAfterAge {
+			return rotationReasonAge
+		}
+	}
+	return ""
+}
+
+const (
+	// rotationReasonAge is the chain.json RotationReason when
+	// ExitAfterAge fires. Stable string for cross-version tooling.
+	rotationReasonAge = "retain-rotate-at"
+
+	// rotationReasonChainLength is the chain.json RotationReason when
+	// ExitAfterChainLength fires.
+	rotationReasonChainLength = "rotate-at-chain-length"
+)
+
+// markChainRotatedBestEffort updates the chain.json catalog at
+// store's root to record that the chain has been closed by a
+// rotation event. Best-effort: failures log at WARN but don't fail
+// the stream exit (the chain is intact on disk; missing the rotation
+// marker just means tooling can't tell automatically that this chain
+// is closed — operator-recoverable).
+func markChainRotatedBestEffort(ctx context.Context, store ir.BackupStore, reason string, when time.Time) {
+	cat, present, err := loadChainCatalog(ctx, store)
+	if err != nil || !present {
+		slog.WarnContext(ctx, "stream: chain.json absent or unreadable; rotation marker not written",
+			slog.String("err", errOrEmpty(err)),
+			slog.String("rotation_reason", reason),
+		)
+		return
+	}
+	cat.RotatedAt = when.UTC()
+	cat.RotationReason = reason
+	cat.UpdatedAt = when.UTC()
+	if err := writeChainCatalog(ctx, store, cat); err != nil {
+		slog.WarnContext(ctx, "stream: failed to write rotation marker into chain.json",
+			slog.String("err", err.Error()),
+			slog.String("rotation_reason", reason),
+		)
+		return
+	}
+}
+
+func errOrEmpty(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
 
 // validate sanity-checks required fields. Mirrors

@@ -66,6 +66,29 @@ type ChainCatalog struct {
 	CreatedAt         time.Time           `json:"created_at"`
 	UpdatedAt         time.Time           `json:"updated_at"`
 	Entries           []ChainCatalogEntry `json:"entries"`
+
+	// RotatedAt, when non-zero, marks this chain as having been
+	// closed by a `--retain-rotate-at` rotation event (GitHub #20
+	// chunk 14b). The chain remains restorable; new incrementals
+	// are not appended after rotation. Empty when the chain is
+	// active.
+	RotatedAt time.Time `json:"rotated_at,omitempty"`
+
+	// SucceededBy, when non-empty, points at the path (relative to
+	// the chain root's parent directory) of the next chain that
+	// took over after this one was rotated. Operators / tooling
+	// follow the pointer for cross-rotation restore walks. Empty
+	// when the chain is active or when it's the most recent
+	// rotation in the rotation history.
+	SucceededBy string `json:"succeeded_by,omitempty"`
+
+	// RotationReason records why this chain was rotated. Recognised
+	// values: "retain-rotate-at" (the --retain-rotate-at threshold
+	// fired), "retain-chain-length" (the --rotate-at-chain-length
+	// threshold fired), "operator-driven" (explicit operator
+	// command — reserved for a future `sluice backup rotate`
+	// subcommand). Empty when not rotated.
+	RotationReason string `json:"rotation_reason,omitempty"`
 }
 
 // ChainCatalogEntry is one manifest's index entry. The catalog

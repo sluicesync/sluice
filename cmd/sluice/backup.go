@@ -642,6 +642,9 @@ type BackupStreamCmd struct {
 	RetryBackoffBase time.Duration `help:"Base interval for exponential backoff between retriable rollover failures. Doubles each attempt, capped at --retry-backoff-cap." default:"100ms" placeholder:"DUR"`
 	RetryBackoffCap  time.Duration `help:"Upper bound on each retriable rollover backoff interval." default:"30s" placeholder:"DUR"`
 
+	ExitAfterAge         time.Duration `help:"After this duration of chain age, commit the current rollover and exit cleanly. GitHub #20 chunk 14b phase 1: pair with cron/systemd/supervisord to restart with a fresh --output-dir for the next chain (bounded chain length without writing application-side rotation). 0 disables." placeholder:"DUR"`
+	ExitAfterChainLength int           `help:"After this many incrementals committed, exit cleanly. Same wrapper pattern as --exit-after-age; either threshold firing wins. 0 disables." placeholder:"N"`
+
 	EncryptionFlags
 }
 
@@ -699,6 +702,8 @@ func (b *BackupStreamCmd) Run(_ *Globals) error {
 		RetryAttempts:         b.RetryAttempts,
 		RetryBackoffBase:      b.RetryBackoffBase,
 		RetryBackoffCap:       b.RetryBackoffCap,
+		ExitAfterAge:          b.ExitAfterAge,
+		ExitAfterChainLength:  b.ExitAfterChainLength,
 	}
 	return stream.Run(ctx)
 }

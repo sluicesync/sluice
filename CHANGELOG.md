@@ -6,6 +6,72 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.51.0]
+
+**Lands GitHub issue #20 chunk 14b phase 1 — rotation-EXIT thresholds for `backup stream run`.** Third chunk of roadmap item 14 (the backup-chain retention/compaction track, following v0.47.0's chain.json catalog and v0.50.0's prune command). Operators can now bound chain length AND chain age via two new flags that exit the stream cleanly when either threshold trips; chain.json gets a rotation marker so subsequent tooling can detect the closed-state.
+
+**Scope decision**: Phase 1 ships the rotation-EXIT signal pattern (operator wraps `sluice backup stream run` in cron / systemd / supervisord to restart with a fresh `--output-dir`). Phase 2 (v0.52.0+) will implement in-process rotation that doesn't require the operator wrapper. The correctness analysis (per `docs/dev/notes/prep-backup-chain-rotation.md`) shows the rotation-EXIT pattern has the same position-monotonic guarantee as inline rotation — between exit and new run start, source events get absorbed into the new full's snapshot data, so final-state restore is correct.
+
+### Added
+
+- **`--exit-after-age=DUR` flag on `sluice backup stream run`**. After this duration of chain age (computed as `now - chain.json's CreatedAt`), commit the current rollover and exit cleanly. The chain catalog's `RotatedAt` + `RotationReason` = `"retain-rotate-at"` fields get written so tooling can detect the closed-state. Zero disables (preserves pre-v0.51.0 unbounded behavior).
+
+- **`--exit-after-chain-length=N` flag on `sluice backup stream run`**. After N incrementals committed, exit cleanly. Same chain.json marking with `RotationReason` = `"rotate-at-chain-length"`. Either threshold firing wins; length checked first (cheaper, no I/O). Zero disables.
+
+- **`ChainCatalog.RotatedAt` + `ChainCatalog.SucceededBy` + `ChainCatalog.RotationReason` fields** in `internal/pipeline/chain_catalog.go`. Additive (optional JSON fields with `omitempty`); no format-version bump needed since older readers safely ignore unknown fields. `SucceededBy` is reserved for v0.52.0+ in-process rotation; v0.51.0 phase 1 leaves it empty (operator-driven rotation can manually link via tooling or wait for v0.52.0+ auto-stitching).
+
+- **`prefixedStore` wrapper** in `internal/pipeline/prefixed_store.go`. Wraps an `ir.BackupStore` with a transparent path prefix. Currently unused in production code; the wrapper exists ahead of its v0.52.0+ inline-rotation consumer so the chain-root sub-store mechanism is in place when 14b phase 2 lands. Three unit tests pin the round-trip + empty-prefix degeneration + nested-list path-stripping invariants.
+
+### Migration / Compatibility
+
+- **Drop-in upgrade from v0.50.x.** Both new flags are opt-in; operators not setting either get unchanged pre-v0.51.0 behavior.
+- **No chain.json schema bump.** The three new fields are additive and `omitempty`-encoded. v0.47.0+ readers ignore them and continue working. Older sluice readers (pre-v0.47.0) ignore the entire chain.json file (catalog absent → directory-walk fallback) so they're unaffected too.
+- **The `prefixedStore` wrapper is internal**; no operator-facing API. Wrapper exists for v0.52.0+ scaffolding.
+
+### Who needs this release
+
+- **Anyone running `sluice backup stream run` against a chain that grows unboundedly** (per GitHub #20's evidence): **upgrade**. Pair `--exit-after-age=24h` (or `--exit-after-chain-length=500`) with a cron / systemd timer that restarts the stream pointing at a fresh `--output-dir` for the next chain. Bounded chain length + bounded restore time without writing application-level rotation logic.
+
+- **Anyone preparing for v0.52.0+ in-process rotation**: the chain.json schema is forward-compatible; v0.51.0 chains marked with `RotatedAt` will be readable by v0.52.0+ readers that gain auto-stitching via `SucceededBy`.
+
+- **Anyone whose chains don't grow problematically**: drop-in, no behavior change.
+
+### Example operator workflow (phase 1)
+
+```bash
+# Rotation cadence: 24h or 500 incrementals, whichever first.
+#
+# systemd service spec (simplified):
+#   ExecStart=/usr/local/bin/run-sluice-stream.sh
+#   Restart=on-success
+#   RestartSec=5
+#
+# run-sluice-stream.sh chooses a fresh --output-dir per chain:
+TS=$(date -u +%Y%m%dT%H%M%S)
+DIR="/backups/chain-$TS"
+mkdir -p "$DIR"
+exec /usr/local/bin/sluice backup stream run \
+    --output-dir="$DIR" \
+    --since=<previous-chain-final-incremental-id> \
+    --exit-after-age=24h \
+    --exit-after-chain-length=500 \
+    ...
+```
+
+After phase 2 (v0.52.0+) lands, the same operator workflow collapses to a single long-running `sluice backup stream run --output-dir=/backups/ --retain-rotate-at=24h` command with no wrapper.
+
+### Verification surface
+
+- **9 new unit tests in `internal/pipeline/stream_rotation_test.go`** covering: length-threshold fires + not-yet, age-threshold fires + not-yet (catalog-CreatedAt-based math), length-preferred-over-age tie-breaker, none-configured no-op, catalog-absent conservative fall-back, marker-write success + absent-catalog no-op.
+- **3 new unit tests in `internal/pipeline/prefixed_store_test.go`** pinning the wrapper's transparency invariants.
+- **End-to-end validation deferred to operator re-test** via the validation rig at `C:\code\sluice-validation\` — pair the new flags with a brief `--exit-after-age=1m` (or `--exit-after-chain-length=2`) run to confirm the exit + chain.json marking behavior.
+
+### What's NOT in v0.51.0 (deferred to v0.52.0+ phase 2)
+
+- **In-process rotation**: when the threshold trips, the same goroutine opens a new snapshot stream, bulk-copies the source state into a new chain root sibling directory, and resumes streaming. Eliminates the need for the operator-wrapper pattern.
+- **`SucceededBy` auto-stitching**: rotation writes the pointer to the new chain's directory name, and restore tooling chains across rotations transparently.
+- **`--retain-rotate-at=DUR` flag**: reserved name for the phase 2 in-process rotation flag.
+
 ## [0.50.0]
 
 **Lands GitHub issue #20 chunk 14c — `sluice backup prune` retention command.** Second chunk of roadmap item 14 (the backup-chain retention / compaction track, following v0.47.0's chain.json catalog keystone). Operators of long-running `backup stream run` chains now have a first-class primitive to bound disk usage and restore time: drop the oldest incrementals (or older-than-duration), narrowing the chain's restorable range. The full at the chain root is always preserved. Prep doc for chunk 14b (`--retain-rotate-at` automated rotation) committed under `docs/dev/notes/prep-backup-chain-rotation.md` ahead of its v0.52.0+ implementation.
