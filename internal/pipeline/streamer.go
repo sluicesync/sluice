@@ -1492,6 +1492,15 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 		return nil, fmt.Errorf("pipeline: apply expression overrides: %w", err)
 	}
 
+	// Redaction-type pre-flight (Bug 60, v0.58.1): catch
+	// mask:uuid on UUID-typed columns before the target schema
+	// gets created. Runs after ApplyMappings so the operator's
+	// `--type-override=col=text` workaround short-circuits the
+	// refusal.
+	if err := preflightRedactTypes(s.Redactor, schema); err != nil {
+		return nil, wrapWithHint(PhaseConnect, err)
+	}
+
 	stream, err := openSnapshotStreamWithOptionalSlot(ctx, s.Source, s.SourceDSN, s.SlotName)
 	if err != nil {
 		return nil, wrapWithHint(PhaseSnapshot, fmt.Errorf("pipeline: open snapshot stream: %w", err))

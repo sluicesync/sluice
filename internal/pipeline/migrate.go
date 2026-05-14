@@ -329,6 +329,15 @@ func (m *Migrator) Run(ctx context.Context) error {
 		return fmt.Errorf("pipeline: apply expression overrides: %w", err)
 	}
 
+	// ---- 1.55. Redaction-type pre-flight refusal (Bug 60, v0.58.1) ----
+	// Catches mask:uuid on UUID-typed columns BEFORE schema apply so
+	// the operator sees an actionable error at run-start instead of
+	// a mid-bulk-copy pgx encode failure. Runs after ApplyMappings so
+	// `--type-override=col=text` short-circuits the refusal.
+	if err := preflightRedactTypes(m.Redactor, schema); err != nil {
+		return wrapWithHint(PhaseConnect, err)
+	}
+
 	// ---- 1.6. Cross-engine pre-flight refusal ----
 	// chain_restore has called this since v0.20.x; the simple-mode
 	// migrate path missed the wire-up. Without this, cross-engine

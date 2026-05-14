@@ -6,6 +6,32 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.58.1]
+
+**Closes Bug 60 — `mask:uuid` now refuses at startup when targeted at a UUID-typed column without a type override.** The v0.58.0 cycle's load-bearing scenario surfaced it: the mask preset's output (`550eXXXX-XXXX-XXXX-XXXX-XXXXXXXX0000`) contains `X` characters which aren't valid hex, so it fails mid-bulk-copy with an opaque pgx `cannot find encode plan` error when landing in a strict `uuid` column. By then the target schema was already created with the wrong column type and the operator had to manually unwind. v0.58.1 catches the misconfiguration before any data movement.
+
+### Fixed
+
+- **`preflightRedactTypes` runs after `translate.ApplyMappings`** in both the migrate path and the streamer's cold-start path. Walks every redaction rule; for any `mask:uuid` rule whose column's effective type is still `ir.UUID` (i.e., not re-typed by a `--type-override`), refuses with an operator-actionable error naming the column AND suggesting `--type-override=table.col=text` as the unblocker. Multiple offending rules are reported together so the operator sees the full picture in one run.
+- **`--type-override=table.col=text`** (or any non-UUID text type) on a `mask:uuid` column short-circuits the refusal. Operators who'd already worked around the issue see no behaviour change.
+
+### Compatibility
+
+- **Drop-in upgrade from v0.58.0.** No flag, schema, or YAML changes.
+- **Breaking only in the sense that `mask:uuid` on a UUID column now refuses at startup** instead of failing mid-bulk-copy. Operators hit by the v0.58.0 misconfiguration see a clear error pointing at the fix rather than an opaque pgx encode failure after partial data movement.
+- **Other mask presets unaffected** — `mask:ssn`, `mask:pan`, `mask:email`, etc. produce string output that lands in TEXT/VARCHAR columns without type-shape conflicts. The preflight is scoped narrowly to the one preset with the known issue.
+
+### Who needs this release
+
+- **Anyone using `mask:uuid` in production**: upgrade to get the startup-time refusal instead of the mid-bulk-copy opaque error.
+- **Anyone with a `mask:uuid` rule + an existing `--type-override=col=text`**: drop-in, no behaviour change (the preflight skips your case correctly).
+- **Anyone not using `mask:uuid`**: drop-in, no behaviour change.
+
+### Verification
+
+- **Build + lint clean** across all tags.
+- **New unit tests** (`TestPreflightRedactTypes`): 8 sub-tests cover nil-registry, nil-schema, refusal happy path, type-override short-circuit, missing column, non-mask:uuid pass-through, multi-rule combined report, mixed compatible rules.
+
 ## [0.58.0]
 
 **PII Phase 2.b second wave — Canadian SIN, UK NIN, IBAN, UUID mask presets.** Four more country/format-specific mask strategies that close the Phase 2.b catalog. Operators with international PII (Canadian / UK national IDs, European/international bank account numbers, system-generated UUIDs) now have one-line per-column presets matching the canonical shapes.
