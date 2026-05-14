@@ -6,6 +6,32 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.55.1]
+
+**Adds `--target-schema=NAME` to `sluice restore`** — closes the UX-gap the v0.55.0 cycle subagent flagged when restoring redacted backups. Pre-v0.55.1 the restore command lacked the schema-override flag that every other operator-facing command (migrate / sync start / schema preview / schema diff / matview / schema add-table) already had, forcing operators to either use the DSN's default schema or work around it via docker. Now restore mirrors the existing pattern.
+
+### Added
+
+- **`sluice restore --target-schema=NAME`** flag (Postgres-only). When set, restored tables land in the named schema rather than the DSN's default. Mirrors `sluice migrate --target-schema` and `sync start --target-schema` (ADR-0031). PG-only: flat-namespace engines (MySQL) refuse at validate time — operators use a different `--target` DSN database instead. The schema is auto-created on the target if it doesn't exist.
+
+- **`pipeline.Restore.TargetSchema` and `pipeline.ChainRestore.TargetSchema`** fields in the Go API. nil/empty preserves the pre-v0.55.1 behaviour (DSN-derived default schema).
+
+- **Threading through the chain-restore path**: `ChainRestore` propagates `TargetSchema` to the chain's full-application sub-Restore + the per-incremental change applier so chain restores honour the override end-to-end.
+
+### Migration / Compatibility
+
+- **Drop-in upgrade from v0.55.0.** No behaviour change unless the operator passes `--target-schema`.
+- **MySQL targets** refuse the flag at validate time with the same engine-not-namespaced refusal as the other commands.
+
+### Who needs this release
+
+- **Anyone restoring backups onto a shared Postgres target where the DSN's default schema is in use by another stream/tenant**: this is now a first-class operation. No more docker workaround.
+
+### Verification
+
+- **Build + lint clean** across all tags.
+- **End-to-end verification deferred to a future cycle**: pin scenario is `sluice restore --from-dir=<chain> --target-driver=postgres --target=<DSN> --target-schema=v0551_test` lands tables in the named schema rather than `public`.
+
 ## [0.55.0]
 
 **PII Phase 1.5 closure — the last two deferred items.** Schema-preview annotation and backup-stream redaction. Phase 1.5 is now structurally complete: every operator-facing surface that touches row data (migrate, sync start cold-start + CDC, backup full, schema preview) honours `--redact` either by applying redactions or by surfacing them as comments.

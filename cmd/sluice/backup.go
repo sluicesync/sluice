@@ -949,6 +949,8 @@ type RestoreCmd struct {
 
 	MaxBufferBytes int64 `help:"Soft cap on per-batch buffered memory in the bulk-copy writer. Same semantics as 'sluice migrate --max-buffer-bytes'. Default 67108864 (64 MiB)." default:"67108864" placeholder:"N"`
 
+	TargetSchema string `help:"Per-source target schema namespace (Postgres-only). When set, restored tables land in the named schema rather than the DSN's default. Mirrors 'sluice migrate --target-schema' / 'sync start --target-schema' (ADR-0031). PG-only: flat-namespace engines (MySQL) refuse at validate time — operators use a different --target DSN database instead. The schema is auto-created on the target if it doesn't exist. v0.56.0+ closure of the v0.55.0 cycle's UX-gap finding." placeholder:"NAME"`
+
 	EncryptionFlags
 }
 
@@ -1016,6 +1018,7 @@ func (r *RestoreCmd) Run(g *Globals) error {
 		Filter:         filter,
 		MaxBufferBytes: r.MaxBufferBytes,
 		Envelope:       envelope,
+		TargetSchema:   r.TargetSchema,
 	}
 	return restore.Run(ctx)
 }

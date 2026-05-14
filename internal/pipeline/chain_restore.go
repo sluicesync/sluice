@@ -77,6 +77,13 @@ type ChainRestore struct {
 	// chains. See [Restore.Envelope].
 	Envelope crypto.EnvelopeEncryption
 
+	// TargetSchema is the per-source target-schema namespace override
+	// (ADR-0031). See [Restore.TargetSchema] for the design. Threaded
+	// through to the chain's full-application step (via Restore) and
+	// to the per-incremental ChangeApplier so user-data DDL +
+	// INSERT/UPDATE/DELETE land in the named schema.
+	TargetSchema string
+
 	// chainCEK caches the chain-level CEK after the full's preflight.
 	// Reused for every change-chunk decrypt across the incremental
 	// walk so Argon2id (passphrase mode) runs once per chain restore.
@@ -179,6 +186,7 @@ func (r *ChainRestore) Run(ctx context.Context) error {
 	}
 	defer closeIf(applier)
 	applyMaxBufferBytes(applier, r.MaxBufferBytes)
+	applyTargetSchema(applier, r.TargetSchema)
 	if err := applier.EnsureControlTable(ctx); err != nil {
 		return wrapWithHint(PhaseSchemaApply, fmt.Errorf("chain restore: ensure control table: %w", err))
 	}
@@ -239,6 +247,7 @@ func (r *ChainRestore) applyFull(ctx context.Context, full *manifestRecord) erro
 		MaxBufferBytes:    r.MaxBufferBytes,
 		SkipChainDispatch: true,
 		Envelope:          r.Envelope,
+		TargetSchema:      r.TargetSchema,
 	}
 	return rest.Run(ctx)
 }

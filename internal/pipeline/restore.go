@@ -67,6 +67,19 @@ type Restore struct {
 	// shape and dispatches.
 	SkipChainDispatch bool
 
+	// TargetSchema is the per-source target-schema namespace override
+	// (ADR-0031), mirroring [Migrator.TargetSchema] /
+	// [Streamer.TargetSchema] / [Previewer.TargetSchema]. When set,
+	// the target schema writer / row writer / change applier route
+	// user-data DDL + INSERTs into the named schema. Engines that
+	// don't expose [ir.SchemaSetter] surface a flat-namespace refusal
+	// at validate time (today: MySQL, since schemas == databases on
+	// MySQL — operators use a different --target DSN database
+	// instead). Empty preserves the DSN-derived default schema (the
+	// pre-v0.56.0 shape). v0.56.0 / GitHub UX-gap closure flagged by
+	// the v0.55.0 cycle subagent.
+	TargetSchema string
+
 	// Envelope, when non-nil, is the [crypto.EnvelopeEncryption] used
 	// to unwrap CEKs from encrypted manifests. Required when the
 	// chain's full manifest carries [ir.ChainEncryption]. A nil
@@ -115,6 +128,7 @@ func (r *Restore) Run(ctx context.Context) error {
 				Filter:         r.Filter,
 				MaxBufferBytes: r.MaxBufferBytes,
 				Envelope:       r.Envelope,
+				TargetSchema:   r.TargetSchema,
 			}
 			return chain.Run(ctx)
 		}
@@ -158,10 +172,14 @@ func (r *Restore) Run(ctx context.Context) error {
 	schema := translate.RetargetForEngine(manifest.Schema, manifest.SourceEngine, r.Target.Name())
 
 	// 4. Open target writers.
+	if err := validateTargetSchema(r.Target, r.TargetSchema); err != nil {
+		return wrapWithHint(PhaseConnect, fmt.Errorf("restore: %w", err))
+	}
 	sw, err := r.Target.OpenSchemaWriter(ctx, r.TargetDSN)
 	if err != nil {
 		return wrapWithHint(PhaseConnect, fmt.Errorf("restore: open target schema writer: %w", err))
 	}
+	applyTargetSchema(sw, r.TargetSchema)
 	defer closeIf(sw)
 
 	rw, err := r.Target.OpenRowWriter(ctx, r.TargetDSN)
@@ -169,6 +187,7 @@ func (r *Restore) Run(ctx context.Context) error {
 		return wrapWithHint(PhaseConnect, fmt.Errorf("restore: open target row writer: %w", err))
 	}
 	applyMaxBufferBytes(rw, r.MaxBufferBytes)
+	applyTargetSchema(rw, r.TargetSchema)
 	defer closeIf(rw)
 
 	// 5. Phase 1: tables.
