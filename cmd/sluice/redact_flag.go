@@ -160,8 +160,8 @@ func yamlStrategyToSluice(entry config.Redaction, keySource, streamID string) (r
 func yamlMaskToSluice(entry config.Redaction) (redact.Strategy, error) {
 	switch entry.Form {
 	case "":
-		return nil, errors.New("strategy 'mask' requires 'form' field: 'inner', 'outer', or a preset (ssn, pan, pan-relaxed, email)")
-	case "ssn", "pan", "pan-relaxed", "email":
+		return nil, errors.New("strategy 'mask' requires 'form' field: 'inner', 'outer', or a preset (ssn, pan, pan-relaxed, email, ca-sin, uk-nin, iban, uuid)")
+	case "ssn", "pan", "pan-relaxed", "email", "ca-sin", "uk-nin", "iban", "uuid":
 		if entry.M1 != 0 || entry.M2 != 0 || entry.Char != "" {
 			return nil, fmt.Errorf("strategy 'mask' preset 'form: %s' takes no other fields; remove m1/m2/char", entry.Form)
 		}
@@ -174,7 +174,7 @@ func yamlMaskToSluice(entry config.Redaction) (redact.Strategy, error) {
 	case "outer":
 		form = redact.MaskOuter
 	default:
-		return nil, fmt.Errorf("strategy 'mask' has unknown form %q (supported: inner, outer, ssn, pan, pan-relaxed, email)", entry.Form)
+		return nil, fmt.Errorf("strategy 'mask' has unknown form %q (supported: inner, outer, ssn, pan, pan-relaxed, email, ca-sin, uk-nin, iban, uuid)", entry.Form)
 	}
 	if entry.M1 < 0 {
 		return nil, fmt.Errorf("strategy 'mask' requires non-negative 'm1'; got %d", entry.M1)
@@ -324,7 +324,7 @@ func parseMaskStrategy(opts string) (redact.Strategy, error) {
 	// Has a colon — must be inner/outer with margins, OR a preset
 	// that was given unexpected options.
 	switch formName {
-	case "ssn", "pan", "pan-relaxed", "email":
+	case "ssn", "pan", "pan-relaxed", "email", "ca-sin", "uk-nin", "iban", "uuid":
 		return nil, fmt.Errorf("strategy 'mask:%s': preset 'mask:%s' takes no options (drop ':%s')", opts, formName, rest)
 	}
 	var form redact.MaskForm
@@ -334,7 +334,7 @@ func parseMaskStrategy(opts string) (redact.Strategy, error) {
 	case "outer":
 		form = redact.MaskOuter
 	default:
-		return nil, fmt.Errorf("strategy 'mask:%s': unknown form %q (supported: inner, outer, ssn, pan, pan-relaxed, email)", opts, formName)
+		return nil, fmt.Errorf("strategy 'mask:%s': unknown form %q (supported: inner, outer, ssn, pan, pan-relaxed, email, ca-sin, uk-nin, iban, uuid)", opts, formName)
 	}
 	parts := strings.Split(rest, ",")
 	if len(parts) < 2 || len(parts) > 3 {
@@ -384,11 +384,19 @@ func parseMaskPreset(name string) (redact.Strategy, error) {
 		return redact.MaskPANRelaxed{}, nil
 	case "email":
 		return redact.MaskEmail{}, nil
+	case "ca-sin":
+		return redact.MaskCASIN{}, nil
+	case "uk-nin":
+		return redact.MaskUKNIN{}, nil
+	case "iban":
+		return redact.MaskIBAN{}, nil
+	case "uuid":
+		return redact.MaskUUID{}, nil
 	case "inner", "outer":
 		// Common mistake: dropped the colon + margins.
 		return nil, fmt.Errorf("strategy 'mask:%s': '%s' is a generic form requiring margins (use 'mask:%s:<m1>,<m2>[,<char>]')", name, name, name)
 	default:
-		return nil, fmt.Errorf("strategy 'mask:%s': unknown form/preset (supported: inner:<m1>,<m2>[,<char>], outer:<m1>,<m2>[,<char>], ssn, pan, pan-relaxed, email)", name)
+		return nil, fmt.Errorf("strategy 'mask:%s': unknown form/preset (supported: inner:<m1>,<m2>[,<char>], outer:<m1>,<m2>[,<char>], ssn, pan, pan-relaxed, email, ca-sin, uk-nin, iban, uuid)", name)
 	}
 }
 

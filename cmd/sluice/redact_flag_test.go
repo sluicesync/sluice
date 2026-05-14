@@ -605,6 +605,84 @@ func TestParseRedactFlags_MaskPresets(t *testing.T) {
 	}
 }
 
+// TestParseRedactFlags_MaskPresetsSecondWave covers the PII Phase
+// 2.b second-wave preset names (ca-sin, uk-nin, iban, uuid)
+// through the CLI parser dispatch.
+func TestParseRedactFlags_MaskPresetsSecondWave(t *testing.T) {
+	values := []string{
+		"users.sin=mask:ca-sin",
+		"users.nin=mask:uk-nin",
+		"users.iban=mask:iban",
+		"users.id=mask:uuid",
+	}
+	reg, err := parseRedactFlags(values, "", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	cases := []struct {
+		table, col, wantStrategy string
+	}{
+		{"users", "sin", "mask:ca-sin"},
+		{"users", "nin", "mask:uk-nin"},
+		{"users", "iban", "mask:iban"},
+		{"users", "id", "mask:uuid"},
+	}
+	for _, c := range cases {
+		s := reg.Get("", c.table, c.col)
+		if s == nil {
+			t.Errorf("%s.%s: no rule", c.table, c.col)
+			continue
+		}
+		if s.Name() != c.wantStrategy {
+			t.Errorf("%s.%s: got %q; want %q", c.table, c.col, s.Name(), c.wantStrategy)
+		}
+	}
+
+	// End-to-end through the registry for each preset.
+	got, err := reg.Get("", "users", "sin").Redact(&ir.Column{Name: "sin"}, "046-454-286")
+	if err != nil || got != "XXX-XXX-286" {
+		t.Errorf("ca-sin end-to-end: got %v err %v", got, err)
+	}
+	got, err = reg.Get("", "users", "nin").Redact(&ir.Column{Name: "nin"}, "AB123456C")
+	if err != nil || got != "ABXXXXXXC" {
+		t.Errorf("uk-nin end-to-end: got %v err %v", got, err)
+	}
+	got, err = reg.Get("", "users", "iban").Redact(&ir.Column{Name: "iban"}, "DE89370400440532013000")
+	if err != nil || got != "DE8937XXXXXXXXXXXX3000" {
+		t.Errorf("iban end-to-end: got %v err %v", got, err)
+	}
+	got, err = reg.Get("", "users", "id").Redact(&ir.Column{Name: "id"}, "550e8400-e29b-41d4-a716-446655440000")
+	if err != nil || got != "550eXXXX-XXXX-XXXX-XXXX-XXXXXXXX0000" {
+		t.Errorf("uuid end-to-end: got %v err %v", got, err)
+	}
+}
+
+// TestMergeYAMLRedactions_MaskPresetsSecondWave covers the YAML
+// form for the four new presets.
+func TestMergeYAMLRedactions_MaskPresetsSecondWave(t *testing.T) {
+	entries := []config.Redaction{
+		{Table: "users.sin", Strategy: "mask", Form: "ca-sin"},
+		{Table: "users.nin", Strategy: "mask", Form: "uk-nin"},
+		{Table: "users.iban", Strategy: "mask", Form: "iban"},
+		{Table: "users.id", Strategy: "mask", Form: "uuid"},
+	}
+	reg, err := mergeYAMLRedactions(nil, entries, "", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	wants := map[string]string{
+		"sin":  "mask:ca-sin",
+		"nin":  "mask:uk-nin",
+		"iban": "mask:iban",
+		"id":   "mask:uuid",
+	}
+	for col, want := range wants {
+		if got := reg.Get("", "users", col).Name(); got != want {
+			t.Errorf("%s: got %q; want %q", col, got, want)
+		}
+	}
+}
+
 // TestParseRedactFlags_MaskPresetRefusalPaths covers every preset-
 // specific CLI refusal.
 func TestParseRedactFlags_MaskPresetRefusalPaths(t *testing.T) {
@@ -613,6 +691,7 @@ func TestParseRedactFlags_MaskPresetRefusalPaths(t *testing.T) {
 	}{
 		{"unknown preset", "users.x=mask:zip", "unknown form/preset"},
 		{"preset with spurious options", "users.ssn=mask:ssn:foo", "preset 'mask:ssn' takes no options"},
+		{"second-wave preset with options", "users.x=mask:uuid:foo", "preset 'mask:uuid' takes no options"},
 		{"inner without margins", "users.x=mask:inner", "requiring margins"},
 		{"outer without margins", "users.x=mask:outer", "requiring margins"},
 	}

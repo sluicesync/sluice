@@ -243,3 +243,272 @@ func (MaskEmail) Redact(col *ir.Column, val any) (any, error) {
 	}
 	return string(out) + domain, nil
 }
+
+// MaskCASIN is the Canadian Social Insurance Number preset. Accepts
+// input in the canonical `XXX-XXX-XXX` (dashed) or `XXXXXXXXX`
+// (undashed) shape — both are common in real-world Canadian PII
+// columns. Validates the Luhn checksum (CA SINs MUST satisfy it
+// per the Government of Canada's SIN structure rules); preserves
+// the last 3 digits; masks the first 6 digits with `X`. Dashes,
+// when present, stay at their original positions.
+//
+// Examples:
+//
+//   - "046-454-286" → "XXX-XXX-286" (real Luhn-valid SIN format from Wikipedia)
+//   - "046454286"   → "XXXXXX286"
+//   - "046-454-287" → refused (bad Luhn checksum)
+//
+// Refuses non-conforming length, non-digit body, or Luhn-invalid
+// inputs. Operators with synthetic test data that doesn't satisfy
+// Luhn should use generic `mask:inner:0,3` instead.
+type MaskCASIN struct{}
+
+// Name returns "mask:ca-sin".
+func (MaskCASIN) Name() string { return "mask:ca-sin" }
+
+// Redact applies the CA SIN mask.
+func (MaskCASIN) Redact(col *ir.Column, val any) (any, error) {
+	if val == nil {
+		return nil, nil
+	}
+	s, ok := val.(string)
+	if !ok {
+		return nil, fmt.Errorf("redact: column %s has unsupported type %T for mask:ca-sin strategy (only string is supported)", colIdentity(col), val)
+	}
+	// Accept dashed (`XXX-XXX-XXX`, 11 chars) or undashed (9 digits).
+	hasDashes := len(s) == 11 && s[3] == '-' && s[7] == '-'
+	if !hasDashes && len(s) != 9 {
+		return nil, fmt.Errorf("redact: column %s value does not match SIN format 'XXX-XXX-XXX' (dashed) or 'XXXXXXXXX' (undashed); got %d chars", colIdentity(col), len(s))
+	}
+	// All non-dash positions must be digits.
+	for i, r := range s {
+		if hasDashes && (i == 3 || i == 7) {
+			continue
+		}
+		if r < '0' || r > '9' {
+			return nil, fmt.Errorf("redact: column %s value has non-digit at SIN position %d", colIdentity(col), i)
+		}
+	}
+	if !luhnValid(s) {
+		return nil, fmt.Errorf("redact: column %s value fails Luhn checksum; CA SINs must satisfy Luhn (use mask:inner:0,3 for synthetic non-Luhn data)", colIdentity(col))
+	}
+	if hasDashes {
+		return "XXX-XXX-" + s[8:], nil
+	}
+	return "XXXXXX" + s[6:], nil
+}
+
+// MaskUKNIN is the UK National Insurance Number preset. Accepts
+// the canonical `AA999999A` 9-char shape — 2 uppercase prefix
+// letters + 6 digits + 1 uppercase suffix letter. Preserves the
+// first 2 letters + the suffix letter; masks the 6 middle digits
+// with `X`.
+//
+// Examples:
+//
+//   - "AB123456C" → "ABXXXXXXC"
+//
+// Refuses non-conforming length, wrong-position letter/digit, or
+// suffix-letter outside the valid set A/B/C/D. (HMRC reserves
+// other suffix letters for administrative use — we treat them as
+// shape violations to surface operator misconfiguration.) Prefix
+// letter validation is NOT enforced here because the valid prefix
+// set is large and changes over time; HMRC's authoritative list is
+// out of scope.
+type MaskUKNIN struct{}
+
+// Name returns "mask:uk-nin".
+func (MaskUKNIN) Name() string { return "mask:uk-nin" }
+
+// Redact applies the UK NIN mask.
+func (MaskUKNIN) Redact(col *ir.Column, val any) (any, error) {
+	if val == nil {
+		return nil, nil
+	}
+	s, ok := val.(string)
+	if !ok {
+		return nil, fmt.Errorf("redact: column %s has unsupported type %T for mask:uk-nin strategy (only string is supported)", colIdentity(col), val)
+	}
+	if len(s) != 9 {
+		return nil, fmt.Errorf("redact: column %s value is %d chars; UK NIN requires exactly 9 chars (AA999999A)", colIdentity(col), len(s))
+	}
+	// Positions 0,1: uppercase letters (prefix).
+	// Positions 2-7: digits.
+	// Position 8: uppercase A/B/C/D (suffix).
+	for i := 0; i < 2; i++ {
+		if s[i] < 'A' || s[i] > 'Z' {
+			return nil, fmt.Errorf("redact: column %s value position %d is not an uppercase letter; UK NIN prefix must be 2 letters", colIdentity(col), i)
+		}
+	}
+	for i := 2; i < 8; i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return nil, fmt.Errorf("redact: column %s value position %d is not a digit; UK NIN must have 6 digits between prefix and suffix", colIdentity(col), i)
+		}
+	}
+	switch s[8] {
+	case 'A', 'B', 'C', 'D':
+		// ok
+	default:
+		return nil, fmt.Errorf("redact: column %s value suffix %q is not one of A/B/C/D; UK NIN suffix is restricted", colIdentity(col), s[8])
+	}
+	// Preserve positions 0,1,8; mask digits at 2-7.
+	return s[:2] + "XXXXXX" + s[8:], nil
+}
+
+// MaskIBAN is the International Bank Account Number preset.
+// IBANs are 15-34 chars: 2 uppercase country-code letters + 2
+// numeric check digits + a country-specific BBAN (Basic Bank
+// Account Number) of variable length. Preserves the country code
+// (positions 0-1) + the check digits (positions 2-3) + the first
+// 2 chars of the BBAN (positions 4-5) + the last 4 chars; masks
+// everything else with `X`.
+//
+// Example: German IBAN `DE89370400440532013000` (22 chars) →
+// `DE8937XXXXXXXXXXXX3000`. The pattern preserves enough
+// information to confirm bank routing (country + bank code prefix)
+// + the account-suffix slice useful for support-case lookups,
+// while hiding the bulk of the account identifier.
+//
+// Refuses non-conforming length (< 15 or > 34), missing country-
+// code letters at positions 0-1, or non-digit check digits at
+// positions 2-3.
+//
+// Per-country structural validation (e.g., German IBANs are
+// always 22 chars, UK 22 chars, etc.) is NOT enforced here —
+// the ISO 13616 spec allows lengths 15-34 and country-specific
+// length rules change over time. Operators wanting strict
+// per-country length checks should preflight at ingest time.
+type MaskIBAN struct{}
+
+// Name returns "mask:iban".
+func (MaskIBAN) Name() string { return "mask:iban" }
+
+// Redact applies the IBAN mask.
+func (MaskIBAN) Redact(col *ir.Column, val any) (any, error) {
+	if val == nil {
+		return nil, nil
+	}
+	s, ok := val.(string)
+	if !ok {
+		return nil, fmt.Errorf("redact: column %s has unsupported type %T for mask:iban strategy (only string is supported)", colIdentity(col), val)
+	}
+	// Strip any spaces (some IBAN representations group in 4s with
+	// spaces); validate against the compact form. Output preserves
+	// spaces if present.
+	compact := strings.ReplaceAll(s, " ", "")
+	if len(compact) < 15 || len(compact) > 34 {
+		return nil, fmt.Errorf("redact: column %s value has %d chars (compact); IBAN length must be 15-34 per ISO 13616", colIdentity(col), len(compact))
+	}
+	// Country code (positions 0-1): uppercase letters.
+	if compact[0] < 'A' || compact[0] > 'Z' || compact[1] < 'A' || compact[1] > 'Z' {
+		return nil, fmt.Errorf("redact: column %s value does not start with 2 uppercase country-code letters; not an IBAN shape", colIdentity(col))
+	}
+	// Check digits (positions 2-3): digits.
+	if compact[2] < '0' || compact[2] > '9' || compact[3] < '0' || compact[3] > '9' {
+		return nil, fmt.Errorf("redact: column %s value positions 2-3 are not numeric check digits; not an IBAN shape", colIdentity(col))
+	}
+	// Mask in compact form: preserve [0:6] + last 4; mask middle.
+	keepFromStart := 6 // country code + check digits + 2 BBAN
+	keepFromEnd := 4
+	masked := make([]byte, len(compact))
+	for i := 0; i < len(compact); i++ {
+		switch {
+		case i < keepFromStart:
+			masked[i] = compact[i]
+		case i >= len(compact)-keepFromEnd:
+			masked[i] = compact[i]
+		default:
+			masked[i] = 'X'
+		}
+	}
+	// If input had spaces, re-insert them at original positions so
+	// the output is the same shape as the input.
+	if strings.Contains(s, " ") {
+		return reinsertSpaces(s, string(masked)), nil
+	}
+	return string(masked), nil
+}
+
+// reinsertSpaces takes original (with spaces) + compact (with the
+// masking applied) and produces a string of the same length as
+// original, with spaces re-inserted at the original positions.
+// Used by [MaskIBAN] to preserve operator-supplied space grouping.
+func reinsertSpaces(original, compact string) string {
+	out := make([]byte, len(original))
+	ci := 0
+	for i := 0; i < len(original); i++ {
+		if original[i] == ' ' {
+			out[i] = ' '
+		} else {
+			out[i] = compact[ci]
+			ci++
+		}
+	}
+	return string(out)
+}
+
+// MaskUUID is the UUID preset. Accepts the canonical 36-char
+// 8-4-4-4-12 hyphenated form (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`).
+// Preserves the 4 hyphens + the first 4 chars + the last 4 chars;
+// masks all other hex digits with `X`.
+//
+// Example: `550e8400-e29b-41d4-a716-446655440000` →
+// `550eXXXX-XXXX-XXXX-XXXX-XXXXXXXX0000`.
+//
+// Refuses non-36-char input, hyphens at wrong positions, or
+// non-hex characters in the digit positions. The strict shape
+// check matches operator intent — a UUID column that doesn't hold
+// canonical UUIDs is usually a configuration mistake worth
+// catching loudly.
+type MaskUUID struct{}
+
+// Name returns "mask:uuid".
+func (MaskUUID) Name() string { return "mask:uuid" }
+
+// Redact applies the UUID mask.
+func (MaskUUID) Redact(col *ir.Column, val any) (any, error) {
+	if val == nil {
+		return nil, nil
+	}
+	s, ok := val.(string)
+	if !ok {
+		return nil, fmt.Errorf("redact: column %s has unsupported type %T for mask:uuid strategy (only string is supported)", colIdentity(col), val)
+	}
+	if len(s) != 36 {
+		return nil, fmt.Errorf("redact: column %s value is %d chars; UUID canonical form requires 36 chars (8-4-4-4-12 hyphenated)", colIdentity(col), len(s))
+	}
+	// Hyphens at positions 8, 13, 18, 23.
+	for _, pos := range []int{8, 13, 18, 23} {
+		if s[pos] != '-' {
+			return nil, fmt.Errorf("redact: column %s value missing hyphen at position %d; UUID canonical form is 8-4-4-4-12", colIdentity(col), pos)
+		}
+	}
+	// All other positions must be hex digits (0-9, a-f, A-F).
+	for i := 0; i < 36; i++ {
+		switch i {
+		case 8, 13, 18, 23:
+			continue
+		}
+		c := s[i]
+		isHex := (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+		if !isHex {
+			return nil, fmt.Errorf("redact: column %s value position %d (%q) is not a hex digit; UUID requires hex chars in all non-hyphen positions", colIdentity(col), i, c)
+		}
+	}
+	// Mask: preserve positions 0-3 (first 4 hex) + 32-35 (last 4 hex)
+	// + the 4 hyphens. Mask everything else with 'X'.
+	out := make([]byte, 36)
+	for i := 0; i < 36; i++ {
+		switch {
+		case i == 8 || i == 13 || i == 18 || i == 23:
+			out[i] = '-'
+		case i < 4:
+			out[i] = s[i]
+		case i >= 32:
+			out[i] = s[i]
+		default:
+			out[i] = 'X'
+		}
+	}
+	return string(out), nil
+}

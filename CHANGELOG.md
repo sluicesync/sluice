@@ -6,6 +6,46 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.58.0]
+
+**PII Phase 2.b second wave — Canadian SIN, UK NIN, IBAN, UUID mask presets.** Four more country/format-specific mask strategies that close the Phase 2.b catalog. Operators with international PII (Canadian / UK national IDs, European/international bank account numbers, system-generated UUIDs) now have one-line per-column presets matching the canonical shapes.
+
+### Added
+
+- **`mask:ca-sin` preset** — Canadian Social Insurance Number. Accepts `XXX-XXX-XXX` (dashed) or `XXXXXXXXX` (undashed); validates Luhn checksum (CA SINs are required to satisfy it per Government of Canada rules); preserves last 3 digits; masks first 6 with `X`. Dashes preserved at original positions. Refuses Luhn-invalid input with a hint pointing operators at `mask:inner:0,3` for synthetic test data.
+- **`mask:uk-nin` preset** — UK National Insurance Number. Accepts the canonical `AA999999A` shape (2 uppercase prefix letters + 6 digits + 1 uppercase suffix letter from {A,B,C,D}). Preserves prefix + suffix letters; masks the 6 middle digits. Suffix-letter set restricted to A/B/C/D per HMRC rules; prefix-letter set NOT validated here (the authoritative list is large and changes over time).
+- **`mask:iban` preset** — International Bank Account Number. Accepts 15-34 char shapes per ISO 13616; validates 2-letter country code + 2-digit check digits at positions 0-3. Preserves country code + check digits + first 2 of BBAN + last 4 chars; masks middle. Operator-supplied space grouping (e.g., `DE89 3704 ...`) is preserved on output. Per-country structural length checks are NOT enforced (the spec allows 15-34; country-specific rules change over time).
+- **`mask:uuid` preset** — canonical 8-4-4-4-12 hyphenated UUID. Preserves hyphens at positions 8/13/18/23 + first 4 hex chars + last 4 hex chars; masks all other hex digits with `X`. Mixed-case input is preserved at the preserved positions. Refuses non-36-char input or non-hex characters in digit positions.
+- **YAML form** — `strategy: mask` + `form: ca-sin|uk-nin|iban|uuid`. Same no-options validation as the first-wave presets (`m1`/`m2`/`char` rejected with a clear "preset takes no other fields" error).
+- **Help text** on `migrate`, `sync start`, `backup full`, `schema preview` enumerates all 8 country/format presets (4 first-wave + 4 second-wave).
+
+### Compatibility
+
+- **Drop-in upgrade from v0.57.x.** No flag changes; new presets are opt-in.
+- **Strict-by-default** for every preset — shape violations refuse at row-process time with operator-actionable error.
+- **Naming consistency** — every preset's `Strategy.Name()` matches the CLI spelling (`mask:ca-sin`, `mask:uk-nin`, etc.). The audit log + CHANGELOG cross-references stay coherent.
+
+### Phase 2 progress
+
+- ✅ **Phase 2.a** (v0.56.0): generic `mask:inner` / `mask:outer` + Luhn helper.
+- ✅ **Phase 2.b first wave** (v0.57.0): `mask:ssn`, `mask:pan`, `mask:pan-relaxed`, `mask:email`.
+- ✅ **Phase 2.b second wave** (this release): `mask:ca-sin`, `mask:uk-nin`, `mask:iban`, `mask:uuid`.
+- **Phase 2.c** (next major chunk): `randomize:*` generators (random PAN, random US-phone, random UUID, etc.) with per-stream-id deterministic seeding.
+
+Phase 2.b is now **fully shipped** — every catalog-listed country/format mask preset is available. Phase 2.c (randomized generation) is the next major chunk; operators needing format-preserving redaction for column shapes not covered by the preset set (e.g., German Personalausweis, Indian Aadhaar, Australian TFN) should continue using generic `mask:inner` until per-country presets land based on demand.
+
+### Who needs this release
+
+- **Operators with Canadian / UK PII** (SIN, NIN columns).
+- **Operators with IBAN-typed bank-account columns** — common in European financial services, fintech, payment processors.
+- **Operators with UUID columns** wanting log-friendly surrogates that preserve the prefix/suffix-byte (useful for correlating across systems without exposing the full identifier).
+- **Anyone not redacting PII**: drop-in, no behaviour change.
+
+### Verification
+
+- **Build + lint clean** across all tags.
+- **Unit tests**: 4 new test groups in `strategies_preset_test.go` cover the happy path + every documented refusal for each preset (Luhn rejection on CA-SIN, suffix-letter restriction on UK-NIN, ISO-13616 length bounds on IBAN, hyphen-position checks on UUID, etc.). 2 new CLI/YAML cross-cutting tests in `redact_flag_test.go` exercise the parser dispatch end-to-end.
+
 ## [0.57.0]
 
 **PII Phase 2.b first wave — country/format-specific mask presets.** Operators with PAN, SSN, or email columns can now write `--redact users.pan=mask:pan` (or `mask:ssn`, `mask:pan-relaxed`, `mask:email`) instead of stacking generic `mask:inner` with careful margin counting + Luhn validation. The presets validate input shape, refuse misconfiguration loudly, and produce the canonical masked output for each PII type.
