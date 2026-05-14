@@ -9,8 +9,6 @@ import (
 	"fmt"
 	"testing"
 	"time"
-
-	"github.com/orware/sluice/internal/ir"
 )
 
 // retriableWrapper is a test double satisfying [ir.RetriableError]
@@ -41,7 +39,7 @@ func (e *retriableWrapper) RetryHint() time.Duration { return 0 }
 //
 //  1. The bug-shape: errors.Is matches context.DeadlineExceeded
 //     against a wrapped retriable error (the pre-fix trap).
-//  2. The fix-shape: errIsRetriable returns true so the streamer's
+//  2. The fix-shape: classifyRetriable returns true so the streamer's
 //     reordered checks route through the retry loop.
 func TestErrIsRetriable_Bug57(t *testing.T) {
 	// Construct the exact error shape the applier produces when its
@@ -56,9 +54,9 @@ func TestErrIsRetriable_Bug57(t *testing.T) {
 		}
 	})
 
-	t.Run("fix-shape: errIsRetriable returns true", func(t *testing.T) {
-		var re ir.RetriableError
-		if !errIsRetriable(wrapped, &re) {
+	t.Run("fix-shape: classifyRetriable returns true", func(t *testing.T) {
+		re, retriable := classifyRetriable(wrapped)
+		if !retriable {
 			t.Fatal("wrapped retriable not classified as retriable; runWithRetry would exit instead of retrying")
 		}
 		if re == nil || !re.Retriable() {
@@ -68,11 +66,10 @@ func TestErrIsRetriable_Bug57(t *testing.T) {
 
 	t.Run("fix order: the streamer must check retriable BEFORE ctx-termination", func(t *testing.T) {
 		// Simulate the post-fix order. Pre-fix swapped the if-blocks.
-		var re ir.RetriableError
-		retriable := errIsRetriable(wrapped, &re)
+		_, retriable := classifyRetriable(wrapped)
 		ctxTerm := errors.Is(wrapped, context.Canceled) || errors.Is(wrapped, context.DeadlineExceeded)
 		if !retriable {
-			t.Fatal("test premise: errIsRetriable should fire on wrapped retriable")
+			t.Fatal("test premise: classifyRetriable should fire on wrapped retriable")
 		}
 		if !ctxTerm {
 			t.Fatal("test premise: errors.Is should still see DeadlineExceeded in chain (bug-shape preserved)")
@@ -103,8 +100,7 @@ func TestErrIsRetriable_NonRetriable(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			var re ir.RetriableError
-			if errIsRetriable(c.err, &re) {
+			if _, ok := classifyRetriable(c.err); ok {
 				t.Errorf("%v misclassified as retriable; would loop forever instead of cleanly returning", c.err)
 			}
 		})
