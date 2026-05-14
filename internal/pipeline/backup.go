@@ -55,6 +55,7 @@ import (
 
 	"github.com/orware/sluice/internal/crypto"
 	"github.com/orware/sluice/internal/ir"
+	"github.com/orware/sluice/internal/redact"
 )
 
 // BackupEncryption is the chunk-writer-side encryption configuration
@@ -210,6 +211,17 @@ type Backup struct {
 	// See [BackupEncryption]. Empty (nil) preserves the plaintext
 	// shape — the v0.16.x..v0.21.x default.
 	Encryption *BackupEncryption
+
+	// Redactor, when non-nil and non-empty, applies operator-
+	// configured PII redaction to every row before it's written to a
+	// chunk (PII Phase 1.5, roadmap item 15a follow-on, v0.55.0).
+	// Same redact.Registry shape used by [Migrator.Redactor] /
+	// [Streamer.Redactor]. nil/empty is the no-redactions hot path
+	// (zero-cost passthrough). Closes the Phase 1.5 backup-stream
+	// gap so backups stored on disk are PII-clean when the operator
+	// supplies --redact flags to `sluice backup full` / `backup
+	// stream run`.
+	Redactor *redact.Registry
 
 	// Now, when set, overrides the wall-clock-time source for
 	// [Manifest.CreatedAt]. Used by tests to pin timestamps; in
@@ -888,6 +900,12 @@ func (b *Backup) backupTable(
 					return nil, fmt.Errorf("open chunk: %w", err)
 				}
 				writer = w
+			}
+			// PII Phase 1.5: redact row before writing to the chunk so
+			// backups stored on disk are PII-clean. nil/empty Registry
+			// is a zero-cost passthrough.
+			if err := redactRow(b.Redactor, table.Schema, table.Name, row, cols); err != nil {
+				return nil, fmt.Errorf("redact row: %w", err)
 			}
 			if err := writer.WriteRow(row, cols); err != nil {
 				return nil, fmt.Errorf("write row: %w", err)

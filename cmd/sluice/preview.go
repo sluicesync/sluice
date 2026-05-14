@@ -57,6 +57,9 @@ type SchemaPreviewCmd struct {
 	TargetSchema string `help:"Per-source target schema namespace (Postgres-only). Renders preview DDL prefixed with this schema so operators see exactly what 'sluice migrate' / 'sync start' would emit under --target-schema (ADR-0031). MySQL operators use a different --target DSN database instead." placeholder:"NAME"`
 
 	EnablePGExtension []string `help:"Enable passthrough for a Postgres extension type (repeatable). Same-engine PG → PG passthrough; hstore and citext additionally have built-in cross-engine translators on MySQL targets. Recognised: vector (pgvector), pg_trgm, hstore, citext. See ADR-0032." placeholder:"EXT"`
+
+	Redact          []string `help:"Annotate redacted columns in the preview DDL (repeatable). Format and strategies identical to 'sluice migrate --redact'. PII Phase 1.5 (v0.55.0+): operator can SEE what 'sluice migrate' / 'sync start' would redact before committing. Each redacted column's CREATE TABLE line gets a trailing '-- REDACTED via <strategy>' comment. The DDL itself is unchanged — preview only annotates." placeholder:"RULE"`
+	RedactKeySource string   `help:"Source for the HMAC keyset when --redact rules use 'hash:hmac-sha256'. Same forms as 'sluice migrate --redact-key-source'." placeholder:"SRC"`
 }
 
 // Run implements `sluice schema preview`.
@@ -109,6 +112,18 @@ func (s *SchemaPreviewCmd) Run(g *Globals) error {
 	// no-op for the stdout path.
 	defer func() { _ = finalize(err) }()
 
+	keySource := s.RedactKeySource
+	if keySource == "" {
+		keySource = cfg.RedactKeySource
+	}
+	redactor, err := parseRedactFlags(s.Redact, keySource, "")
+	if err != nil {
+		return err
+	}
+	redactor, err = mergeYAMLRedactions(redactor, cfg.Redactions, keySource, "")
+	if err != nil {
+		return fmt.Errorf("redactions (YAML): %w", err)
+	}
 	prev := &pipeline.Previewer{
 		Source:              source,
 		Target:              target,
@@ -123,6 +138,7 @@ func (s *SchemaPreviewCmd) Run(g *Globals) error {
 		Out:                 writer,
 		TargetSchema:        s.TargetSchema,
 		EnabledPGExtensions: s.EnablePGExtension,
+		Redactor:            redactor,
 	}
 	err = prev.Run(kongContext())
 	return err

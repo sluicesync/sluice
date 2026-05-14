@@ -28,6 +28,7 @@ import (
 
 	"github.com/orware/sluice/internal/config"
 	"github.com/orware/sluice/internal/ir"
+	"github.com/orware/sluice/internal/redact"
 	"github.com/orware/sluice/internal/translate"
 )
 
@@ -97,6 +98,15 @@ type Previewer struct {
 	// `sync start` would emit. Empty preserves the pre-v0.26.0
 	// behaviour.
 	EnabledPGExtensions []string
+
+	// Redactor, when non-nil and non-empty, annotates each redacted
+	// column in the rendered CREATE TABLE DDL with a trailing
+	// `-- REDACTED via <strategy>` comment so operators can SEE
+	// what `sluice migrate` / `sync start` would redact before
+	// committing. PII Phase 1.5 (v0.55.0), roadmap item 15a
+	// follow-on. nil/empty: no annotations rendered (the
+	// pre-v0.55.0 shape).
+	Redactor *redact.Registry
 }
 
 // PreviewJSON is the JSON-format preview output. The shape is stable
@@ -253,6 +263,7 @@ func (p *Previewer) Run(ctx context.Context) error {
 			srcSchema, p.Source.Name(), p.Target.Name(),
 			enabledExtensionSet(p.EnabledPGExtensions),
 		),
+		redactor: p.Redactor,
 	}
 
 	switch strings.ToLower(strings.TrimSpace(p.Format)) {
@@ -289,8 +300,9 @@ type previewBundle struct {
 	tables         []previewTable
 	srcByTable     map[string]*ir.Table
 	tgtByTable     map[string]*ir.Table
-	appliedAlias   map[string]bool // table.column → true when operator already applied an override
-	translatorGaps []translate.Gap // v0.39.0 MySQL → PG translator-gap scan results (nil for non-cross-engine pairs)
+	appliedAlias   map[string]bool  // table.column → true when operator already applied an override
+	translatorGaps []translate.Gap  // v0.39.0 MySQL → PG translator-gap scan results (nil for non-cross-engine pairs)
+	redactor       *redact.Registry // PII Phase 1.5 (v0.55.0) — nil/empty disables annotation
 }
 
 // enabledExtensionSet converts the operator's `--enable-pg-extension`
@@ -532,11 +544,17 @@ func writeTableSection(sb *strings.Builder, t previewTable, notes []translate.No
 	fmt.Fprintf(sb, "-- %d columns; %d cross-engine translation%s; %d hint%s\n\n",
 		cols, noteCount, plural(noteCount), len(hints), plural(len(hints)))
 
+	// Build per-column redact strategy-name map (PII Phase 1.5).
+	// Empty registry produces a nil map; the annotator short-
+	// circuits.
+	redactByCol := redactNotesForTable(bundle.redactor, t.name, bundle)
+
 	// DDL: emit each statement, attaching inline notes on
-	// CREATE TABLE column lines that match a noted column.
+	// CREATE TABLE column lines that match a noted column or a
+	// redacted column.
 	for i, stmt := range t.stmts {
-		if stmt.Kind == "CREATE TABLE" && len(noteByCol) > 0 {
-			sb.WriteString(annotateCreateTable(stmt.SQL, noteByCol))
+		if stmt.Kind == "CREATE TABLE" && (len(noteByCol) > 0 || len(redactByCol) > 0) {
+			sb.WriteString(annotateCreateTable(stmt.SQL, noteByCol, redactByCol))
 		} else {
 			sb.WriteString(stmt.SQL)
 		}
@@ -562,20 +580,77 @@ func writeTableSection(sb *strings.Builder, t previewTable, notes []translate.No
 // shallow — the goal is best-effort annotation on the column lines a
 // human would expect to see annotated, not a full DDL parser. Lines
 // that don't match a noted column pass through unchanged.
-func annotateCreateTable(ddl string, notes map[string]translate.Note) string {
+func annotateCreateTable(ddl string, notes map[string]translate.Note, redactByCol map[string]string) string {
 	lines := strings.Split(ddl, "\n")
 	for i, line := range lines {
 		colName := firstIdentifier(line)
 		if colName == "" {
 			continue
 		}
-		note, ok := notes[colName]
-		if !ok {
-			continue
+		annotated := line
+		if note, ok := notes[colName]; ok {
+			annotated = appendNoteComment(annotated, note)
 		}
-		lines[i] = appendNoteComment(line, note)
+		if strategyName, ok := redactByCol[colName]; ok {
+			annotated = appendRedactComment(annotated, strategyName)
+		}
+		lines[i] = annotated
 	}
 	return strings.Join(lines, "\n")
+}
+
+// appendRedactComment appends a `-- REDACTED via <strategy>` comment
+// to line. PII Phase 1.5 (v0.55.0). Mirrors [appendNoteComment]'s
+// trailing-comma handling so the line stays parseable as DDL if
+// anyone copies it from the preview output.
+func appendRedactComment(line, strategyName string) string {
+	body := "REDACTED via " + strategyName
+	if strings.Contains(line, "--") {
+		return line + "; " + body
+	}
+	trimmed := strings.TrimRight(line, " \t")
+	if strings.HasSuffix(trimmed, ",") {
+		return strings.TrimSuffix(trimmed, ",") + ", -- " + body
+	}
+	return trimmed + "  -- " + body
+}
+
+// redactNotesForTable returns a column-name → strategy-name map for
+// the given table, drawn from the registry's rules. Returns nil
+// when the registry is empty.
+//
+// Lookup honours the same bare-schema fallback as
+// [Registry.Get]: rules registered for the empty schema apply
+// to every table's columns; rules registered for a specific
+// schema apply only to that schema's table. The bundle's
+// srcByTable supplies the source schema name; if the table isn't
+// found in srcByTable, we fall back to checking the bare-schema
+// form alone.
+func redactNotesForTable(r *redact.Registry, tableName string, bundle previewBundle) map[string]string {
+	if r.Empty() {
+		return nil
+	}
+	srcTable, ok := bundle.srcByTable[tableName]
+	schema := ""
+	if ok && srcTable != nil {
+		schema = srcTable.Schema
+	}
+	out := map[string]string{}
+	for _, rule := range r.Rules() {
+		// Schema mismatch: skip unless the rule's schema is bare
+		// (empty), in which case it applies to all schemas.
+		if rule.Schema != "" && rule.Schema != schema {
+			continue
+		}
+		if rule.Table != tableName {
+			continue
+		}
+		out[rule.Column] = rule.Strategy.Name()
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // firstIdentifier returns the first quoted identifier on a line —

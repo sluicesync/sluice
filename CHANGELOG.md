@@ -6,6 +6,52 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.55.0]
+
+**PII Phase 1.5 closure — the last two deferred items.** Schema-preview annotation and backup-stream redaction. Phase 1.5 is now structurally complete: every operator-facing surface that touches row data (migrate, sync start cold-start + CDC, backup full, schema preview) honours `--redact` either by applying redactions or by surfacing them as comments.
+
+### Added
+
+- **Backup-stream redaction**. `sluice backup full` (and chained-incremental variants) accept `--redact` + `--redact-key-source`. Rules apply at the chunk-write step in `Backup.backupTable` before each row hits the writer, so on-disk backup chunks are PII-clean. `--redact` and `--redact-key-source` operator-facing flags match the syntax already shipped on `migrate` and `sync start`; YAML config block is shared (`redactions:` + `redact_key_source:`).
+
+- **`Backup.Redactor *redact.Registry` field** in the Go API. nil/empty is the no-redactions hot path (zero-cost passthrough); existing callers stay on v0.54.x semantics by default.
+
+- **Schema-preview annotation**. `sluice schema preview` accepts `--redact` + `--redact-key-source` (same syntax). Each redacted column's CREATE TABLE line gets a trailing `-- REDACTED via <strategy>` comment so operators can SEE what `sluice migrate` / `sync start` would redact before committing.
+
+- **`Previewer.Redactor *redact.Registry` field** in the Go API. Same nil/empty no-op semantics; preview output remains byte-identical to pre-v0.55.0 when no redactions are configured.
+
+- **`appendRedactComment` annotator** in `internal/pipeline/preview.go`. Mirrors the existing `appendNoteComment` trailing-comma handling so the annotated DDL stays parseable if anyone copies it from the preview output.
+
+### Migration / Compatibility
+
+- **Drop-in upgrade from v0.54.x.** No flag changes; new flags are opt-in. The schema-preview output is byte-identical when `--redact` is absent.
+- **Restore-from-backup semantics**: redactions ARE NOT re-applied at restore time. Backups created with `--redact` already contain redacted rows on disk; the restore path just copies those rows through. Operators wanting different redactions need to re-create the backup with the new rule set.
+- **YAML config is shared** across `migrate` / `sync start` / `backup full` / `schema preview` — the `redactions:` block applies to all of them. Operators with one canonical rule set can declare it once in `sluice.yaml` and have it picked up everywhere.
+
+### Who needs this release
+
+- **Operators backing up production data for cross-region/cross-tenancy/vendor handoffs**: `sluice backup full --redact users.email=hash:sha256 --output-dir /backups/staging` produces a PII-clean backup chain. Compliance teams get a written audit trail (the audit INFO log line); engineers get realistic-shape backup data without exposure.
+- **Operators reviewing redaction config before committing**: `sluice schema preview --redact ... --target-driver=...` annotates the preview DDL so reviewers can confirm coverage at a glance.
+- **Anyone not redacting PII**: drop-in, no behaviour change.
+
+### Verification
+
+- **End-to-end deferred to v0.55.0 cycle**: pin scenarios include `sluice backup full --redact users.email=hash:sha256` to a local-fs backup, then inspect the chunk file's row contents (via `sluice restore` to a fresh target) to confirm hex digests not plaintext. `sluice schema preview --redact users.email=hash:sha256` should show `-- REDACTED via hash:sha256` annotation on the email column's CREATE TABLE line.
+- **Build + lint clean** across all tags (default, integration, psverify).
+
+### PII Phase 1.5 — fully shipped
+
+Three releases closed the four deferred items from Phase 1's CHANGELOG entry (v0.53.0):
+
+| Phase 1.5 item | Closed in |
+|---|---|
+| CDC apply-path redaction | v0.54.0 (with v0.54.1 fix for Bug 58 schema-namespace mismatch) |
+| YAML config support | v0.54.0 |
+| Schema-preview annotation | v0.55.0 (this release) |
+| Backup-stream redaction | v0.55.0 (this release) |
+
+Next: **PII Phase 2.a** (generic `mask:inner` + `mask:outer` + Luhn helper) per `docs/dev/notes/prep-pii-redaction-phase-2-strategy-catalog.md`.
+
 ## [0.54.1]
 
 **Closes Bug 58 — CDC apply-path PII redaction was non-functional due to schema-namespace key mismatch.** The v0.54.0 cycle's load-bearing test caught it: the wiring was structurally in place but lookups missed because engine CDC readers emit non-empty `Schema` while operator CLI flags register with `schema=""`. Cold-start bulk-copy was unaffected (uses `table.Schema=""` matching the CLI key); only mid-stream CDC events bypassed redaction.
