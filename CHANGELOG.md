@@ -6,6 +6,46 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.57.0]
+
+**PII Phase 2.b first wave — country/format-specific mask presets.** Operators with PAN, SSN, or email columns can now write `--redact users.pan=mask:pan` (or `mask:ssn`, `mask:pan-relaxed`, `mask:email`) instead of stacking generic `mask:inner` with careful margin counting + Luhn validation. The presets validate input shape, refuse misconfiguration loudly, and produce the canonical masked output for each PII type.
+
+### Added
+
+- **`mask:ssn` preset** — US Social Security Number. Accepts `XXX-XX-XXXX` shape (validates dash positions + digit-only body); outputs `XXX-XX-NNNN` (preserves last 4). Refuses non-conforming input with operator-actionable error naming the position of the violation. SSNs stored without dashes (`XXXXXXXXX`) should use generic `mask:inner:0,4` instead — the strict-shape check exists because real-world SSN columns are usually stored consistently dashed or undashed.
+- **`mask:pan` preset** — strict payment-card PAN. Validates Luhn checksum (using the v0.56.0 `luhnValid` helper); accepts 12-19 digits per ISO/IEC 7812; preserves first 6 (BIN) + last 4 (suffix); masks middle digits with `X`. Non-digit characters (spaces, hyphens) preserved at their original positions: `"4111 1111 1111 1111"` → `"4111 11XX XXXX 1111"`. Refuses Luhn-invalid input (use `mask:pan-relaxed` for synthetic test data).
+- **`mask:pan-relaxed` preset** — lenient PAN. Same masking shape as `mask:pan` but skips Luhn validation. Useful for synthetic test data or tokenized values that follow PAN shape without satisfying the checksum.
+- **`mask:email` preset** (sluice-native — MySQL Enterprise doesn't ship an equivalent) — preserves first character of local part, masks the rest of the mailbox with `X`, preserves the entire `@domain` verbatim. `alice@example.com` → `aXXXX@example.com`. Uses LAST `@` as separator (RFC 5322 quoted local-part safe). Refuses input without `@` or with empty local part.
+- **YAML form** — `strategy: mask` + `form: ssn|pan|pan-relaxed|email`. The presets take no extra fields (m1/m2/char rejected with a clear "preset takes no other fields" error so operators notice when they've mixed forms).
+- **Help text** on `migrate`, `sync start`, `backup full`, `schema preview` enumerates all four new presets in the supported-strategies list.
+
+### Compatibility
+
+- **Drop-in upgrade from v0.56.x.** No flag changes; new presets are opt-in.
+- **Strict-by-default** — each preset validates input shape AND refuses on violation rather than silently passing through. Operators who want lax behaviour on PANs should use `mask:pan-relaxed`; for non-canonical SSNs use generic `mask:inner:0,4`.
+- **Audit log `Name()`** — each preset's audit-log identifier matches the CLI spelling exactly (`mask:ssn` / `mask:pan` / `mask:pan-relaxed` / `mask:email`). Compliance reviewers can pivot between log lines and the CHANGELOG entry without translation.
+
+### Who needs this release
+
+- **Operators with dedicated PAN, SSN, or email columns** who want a one-line per-column rule instead of memorizing the margin counts for each PII shape.
+- **Compliance / audit teams** reading sluice's redaction logs — the preset name in the audit line is self-documenting (`mask:pan` is more legible than `mask:inner:6,4`).
+- **Anyone not redacting PII**: drop-in, no behaviour change.
+
+### Phase 2 progress
+
+- ✅ **Phase 2.a (v0.56.0)**: generic `mask:inner` / `mask:outer` + Luhn helper.
+- ✅ **Phase 2.b first wave (v0.57.0, this release)**: `mask:ssn`, `mask:pan`, `mask:pan-relaxed`, `mask:email`.
+- **Phase 2.b second wave** (next): `mask:ca-sin`, `mask:uk-nin`, `mask:iban`, `mask:uuid`.
+- **Phase 2.c** (later): `randomize:*` generators (random PAN, random US-phone, etc.) with the per-stream-id deterministic seeding contract per the prep doc.
+
+See `docs/dev/notes/prep-pii-redaction-phase-2-strategy-catalog.md` for the catalog and MySQL Enterprise reference mapping.
+
+### Verification
+
+- **Build + lint clean** across all tags.
+- **Unit tests**: 4 new test groups in `strategies_preset_test.go` cover the happy path + every refusal branch for each preset (PAN Luhn rejection, SSN dash-position checks, email no-`@` refusal, etc.). Cross-cutting CLI + YAML tests in `redact_flag_test.go` exercise the parser dispatch.
+- **End-to-end pin scenarios for the v0.57.0 cycle**: `--redact users.email=mask:email` on a real email column lands `aXXXX@example.com`-shape output; `--redact users.pan=mask:pan` refuses a Luhn-invalid synthetic PAN; YAML form `strategy: mask, form: ssn` works equivalently to CLI form.
+
 ## [0.56.1]
 
 **Closes Bug 59 — `--redact` was kong-split on the literal comma in `mask:inner:4,4`.** The v0.56.0 cycle subagent caught it: passing `--redact users.pan=mask:inner:4,4` made kong's default `sep:","` split the value into two list entries (`users.pan=mask:inner:3` + `4`), so the parser saw only `mask:inner:3` and refused with a misleading `got 1 args` error. Operators following the v0.56.0 CHANGELOG / release-notes examples literally would hit this on first try.

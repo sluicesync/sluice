@@ -473,7 +473,7 @@ func TestParseRedactFlags_MaskRefusalPaths(t *testing.T) {
 		name, raw, wantSubstring string
 	}{
 		{"empty opts", "users.pan=mask", "requires a form"},
-		{"no margins", "users.pan=mask:inner", "expected 'mask:<form>:<m1>,<m2>"},
+		{"no margins", "users.pan=mask:inner", "requiring margins"},
 		{"unknown form", "users.pan=mask:middle:4,4", "unknown form"},
 		{"missing m2", "users.pan=mask:inner:4", "expected '<m1>,<m2>"},
 		{"too many args", "users.pan=mask:inner:1,2,3,4", "expected '<m1>,<m2>"},
@@ -543,6 +543,131 @@ func TestMergeYAMLRedactions_MaskRefusalPaths(t *testing.T) {
 		{"negative m1", config.Redaction{Table: "users.pan", Strategy: "mask", Form: "inner", M1: -1, M2: 4}, "non-negative 'm1'"},
 		{"negative m2", config.Redaction{Table: "users.pan", Strategy: "mask", Form: "inner", M1: 4, M2: -1}, "non-negative 'm2'"},
 		{"multi-rune char", config.Redaction{Table: "users.pan", Strategy: "mask", Form: "inner", M1: 4, M2: 4, Char: "XY"}, "single rune"},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			_, err := mergeYAMLRedactions(nil, []config.Redaction{c.entry}, "", "")
+			if err == nil {
+				t.Fatal("expected error; got nil")
+			}
+			if !strings.Contains(err.Error(), c.wantSubstring) {
+				t.Errorf("error %q should contain %q", err.Error(), c.wantSubstring)
+			}
+		})
+	}
+}
+
+// TestParseRedactFlags_MaskPresets covers the PII Phase 2.b CLI
+// form of the country/format-specific mask presets.
+func TestParseRedactFlags_MaskPresets(t *testing.T) {
+	values := []string{
+		"users.ssn=mask:ssn",
+		"users.pan=mask:pan",
+		"users.test_pan=mask:pan-relaxed",
+		"users.email=mask:email",
+	}
+	reg, err := parseRedactFlags(values, "", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	cases := []struct {
+		schema, table, col, wantStrategy string
+	}{
+		{"", "users", "ssn", "mask:ssn"},
+		{"", "users", "pan", "mask:pan"},
+		{"", "users", "test_pan", "mask:pan-relaxed"},
+		{"", "users", "email", "mask:email"},
+	}
+	for _, c := range cases {
+		s := reg.Get(c.schema, c.table, c.col)
+		if s == nil {
+			t.Errorf("%s.%s.%s: no rule registered", c.schema, c.table, c.col)
+			continue
+		}
+		if s.Name() != c.wantStrategy {
+			t.Errorf("%s.%s.%s: got %q; want %q", c.schema, c.table, c.col, s.Name(), c.wantStrategy)
+		}
+	}
+
+	// End-to-end: each preset masks correctly through the resolved registry.
+	got, err := reg.Get("", "users", "ssn").Redact(&ir.Column{Name: "ssn"}, "123-45-6789")
+	if err != nil || got != "XXX-XX-6789" {
+		t.Errorf("ssn end-to-end: got %v err %v; want XXX-XX-6789", got, err)
+	}
+	got, err = reg.Get("", "users", "pan").Redact(&ir.Column{Name: "pan"}, "4111111111111111")
+	if err != nil || got != "411111XXXXXX1111" {
+		t.Errorf("pan end-to-end: got %v err %v; want 411111XXXXXX1111", got, err)
+	}
+	got, err = reg.Get("", "users", "email").Redact(&ir.Column{Name: "email"}, "alice@example.com")
+	if err != nil || got != "aXXXX@example.com" {
+		t.Errorf("email end-to-end: got %v err %v; want aXXXX@example.com", got, err)
+	}
+}
+
+// TestParseRedactFlags_MaskPresetRefusalPaths covers every preset-
+// specific CLI refusal.
+func TestParseRedactFlags_MaskPresetRefusalPaths(t *testing.T) {
+	cases := []struct {
+		name, raw, wantSubstring string
+	}{
+		{"unknown preset", "users.x=mask:zip", "unknown form/preset"},
+		{"preset with spurious options", "users.ssn=mask:ssn:foo", "preset 'mask:ssn' takes no options"},
+		{"inner without margins", "users.x=mask:inner", "requiring margins"},
+		{"outer without margins", "users.x=mask:outer", "requiring margins"},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			_, err := parseRedactFlags([]string{c.raw}, "", "")
+			if err == nil {
+				t.Fatal("expected error; got nil")
+			}
+			if !strings.Contains(err.Error(), c.wantSubstring) {
+				t.Errorf("error %q should contain %q", err.Error(), c.wantSubstring)
+			}
+		})
+	}
+}
+
+// TestMergeYAMLRedactions_MaskPresets covers the YAML form of the
+// PII Phase 2.b presets.
+func TestMergeYAMLRedactions_MaskPresets(t *testing.T) {
+	entries := []config.Redaction{
+		{Table: "users.ssn", Strategy: "mask", Form: "ssn"},
+		{Table: "users.pan", Strategy: "mask", Form: "pan"},
+		{Table: "users.test_pan", Strategy: "mask", Form: "pan-relaxed"},
+		{Table: "users.email", Strategy: "mask", Form: "email"},
+	}
+	reg, err := mergeYAMLRedactions(nil, entries, "", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := reg.Get("", "users", "ssn").Name(); got != "mask:ssn" {
+		t.Errorf("ssn: %q", got)
+	}
+	if got := reg.Get("", "users", "pan").Name(); got != "mask:pan" {
+		t.Errorf("pan: %q", got)
+	}
+	if got := reg.Get("", "users", "test_pan").Name(); got != "mask:pan-relaxed" {
+		t.Errorf("pan-relaxed: %q", got)
+	}
+	if got := reg.Get("", "users", "email").Name(); got != "mask:email" {
+		t.Errorf("email: %q", got)
+	}
+}
+
+// TestMergeYAMLRedactions_MaskPresetRefusalPaths covers the YAML
+// refusals (spurious M1/M2/Char on a preset, unknown preset).
+func TestMergeYAMLRedactions_MaskPresetRefusalPaths(t *testing.T) {
+	cases := []struct {
+		name          string
+		entry         config.Redaction
+		wantSubstring string
+	}{
+		{"spurious m1 on preset", config.Redaction{Table: "users.ssn", Strategy: "mask", Form: "ssn", M1: 4}, "takes no other fields"},
+		{"spurious char on preset", config.Redaction{Table: "users.pan", Strategy: "mask", Form: "pan", Char: "*"}, "takes no other fields"},
+		{"unknown preset/form", config.Redaction{Table: "users.x", Strategy: "mask", Form: "zip"}, "unknown form"},
 	}
 	for _, c := range cases {
 		c := c

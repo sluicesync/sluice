@@ -136,7 +136,10 @@ func yamlStrategyToSluice(entry config.Redaction, keySource, streamID string) (r
 }
 
 // yamlMaskToSluice converts a `strategy: mask` YAML entry into a
-// [redact.Mask]. YAML shape:
+// concrete [redact.Strategy]. Two shapes are supported (mirrors
+// the CLI's [parseMaskStrategy]):
+//
+// Generic format-preserving (PII Phase 2.a, v0.56.0+):
 //
 //   - table: users.pan
 //     strategy: mask
@@ -145,20 +148,33 @@ func yamlStrategyToSluice(entry config.Redaction, keySource, streamID string) (r
 //     m2: 4
 //     char: X          # optional, single rune, defaults to "X"
 //
-// All margin validation mirrors the CLI's [parseMaskStrategy] —
-// negative margins, missing form, non-single-rune char all refuse
-// with a clear message.
+// Country/format-specific preset (PII Phase 2.b, v0.57.0+):
+//
+//   - table: users.ssn
+//     strategy: mask
+//     form: ssn        # ssn | pan | pan-relaxed | email — no other fields needed
+//
+// Validation refuses negative margins, missing form, non-single-
+// rune char, and spurious M1/M2/Char fields on presets (so
+// operator misconfiguration is loud, not silent).
 func yamlMaskToSluice(entry config.Redaction) (redact.Strategy, error) {
+	switch entry.Form {
+	case "":
+		return nil, errors.New("strategy 'mask' requires 'form' field: 'inner', 'outer', or a preset (ssn, pan, pan-relaxed, email)")
+	case "ssn", "pan", "pan-relaxed", "email":
+		if entry.M1 != 0 || entry.M2 != 0 || entry.Char != "" {
+			return nil, fmt.Errorf("strategy 'mask' preset 'form: %s' takes no other fields; remove m1/m2/char", entry.Form)
+		}
+		return parseMaskPreset(entry.Form)
+	}
 	var form redact.MaskForm
 	switch entry.Form {
 	case "inner":
 		form = redact.MaskInner
 	case "outer":
 		form = redact.MaskOuter
-	case "":
-		return nil, errors.New("strategy 'mask' requires 'form' field: 'inner' or 'outer'")
 	default:
-		return nil, fmt.Errorf("strategy 'mask' has unknown form %q (supported: inner, outer)", entry.Form)
+		return nil, fmt.Errorf("strategy 'mask' has unknown form %q (supported: inner, outer, ssn, pan, pan-relaxed, email)", entry.Form)
 	}
 	if entry.M1 < 0 {
 		return nil, fmt.Errorf("strategy 'mask' requires non-negative 'm1'; got %d", entry.M1)
@@ -278,28 +294,38 @@ func strategyFromSpec(spec, keySource, streamID string) (redact.Strategy, error)
 	}
 }
 
-// parseMaskStrategy parses the `inner:<m1>,<m2>[,<char>]` /
-// `outer:<m1>,<m2>[,<char>]` suffix of a `mask:` spec into a
-// [redact.Mask]. The CLI flag form is e.g.
-// `--redact users.pan=mask:inner:4,4` (defaults char to `X`)
-// or `--redact users.pan=mask:inner:4,4,*`.
+// parseMaskStrategy parses the suffix of a `mask:` spec into a
+// concrete [redact.Strategy]. Two shapes are supported:
+//
+//   - Generic format-preserving masks (PII Phase 2.a, v0.56.0):
+//     `inner:<m1>,<m2>[,<char>]` and `outer:<m1>,<m2>[,<char>]`.
+//     Examples: `mask:inner:4,4`, `mask:outer:2,2,*`.
+//   - Country/format-specific presets (PII Phase 2.b, v0.57.0):
+//     no-options names — `ssn`, `pan`, `pan-relaxed`, `email`.
+//     Examples: `mask:ssn`, `mask:pan`, `mask:email`.
 //
 // Refuses on:
 //
-//   - Unknown form (must be `inner` or `outer`)
-//   - Missing margins
-//   - Non-integer margins
-//   - Negative margins
-//   - Multi-rune char (operators wanting "Xx" patterns should
-//     use a single character; multi-char masks aren't a
-//     real-world need)
+//   - Unknown form / preset
+//   - Missing margins (for inner/outer)
+//   - Non-integer or negative margins (for inner/outer)
+//   - Multi-rune char (for inner/outer)
+//   - Spurious options on a preset (operators tempted to write
+//     `mask:ssn:something` get a clear "preset takes no options")
 func parseMaskStrategy(opts string) (redact.Strategy, error) {
 	if opts == "" {
-		return nil, errors.New("strategy 'mask' requires a form + margins: 'mask:inner:<m1>,<m2>[,<char>]' or 'mask:outer:<m1>,<m2>[,<char>]'")
+		return nil, errors.New("strategy 'mask' requires a form: 'inner:<m1>,<m2>[,<char>]' / 'outer:<m1>,<m2>[,<char>]' or a preset (ssn, pan, pan-relaxed, email)")
 	}
 	formName, rest, ok := strings.Cut(opts, ":")
 	if !ok {
-		return nil, fmt.Errorf("strategy 'mask:%s': expected 'mask:<form>:<m1>,<m2>[,<char>]'", opts)
+		// No colon — must be a no-options preset.
+		return parseMaskPreset(opts)
+	}
+	// Has a colon — must be inner/outer with margins, OR a preset
+	// that was given unexpected options.
+	switch formName {
+	case "ssn", "pan", "pan-relaxed", "email":
+		return nil, fmt.Errorf("strategy 'mask:%s': preset 'mask:%s' takes no options (drop ':%s')", opts, formName, rest)
 	}
 	var form redact.MaskForm
 	switch formName {
@@ -308,7 +334,7 @@ func parseMaskStrategy(opts string) (redact.Strategy, error) {
 	case "outer":
 		form = redact.MaskOuter
 	default:
-		return nil, fmt.Errorf("strategy 'mask:%s': unknown form %q (supported: inner, outer)", opts, formName)
+		return nil, fmt.Errorf("strategy 'mask:%s': unknown form %q (supported: inner, outer, ssn, pan, pan-relaxed, email)", opts, formName)
 	}
 	parts := strings.Split(rest, ",")
 	if len(parts) < 2 || len(parts) > 3 {
@@ -342,6 +368,28 @@ func parseMaskStrategy(opts string) (redact.Strategy, error) {
 		}
 	}
 	return redact.Mask{Form: form, M1: m1, M2: m2, Char: char}, nil
+}
+
+// parseMaskPreset returns the concrete [redact.Strategy] for one of
+// the PII Phase 2.b country/format-specific preset names (no
+// options). Returns a clear error naming the unknown preset and
+// listing the supported set so operators see what's available.
+func parseMaskPreset(name string) (redact.Strategy, error) {
+	switch name {
+	case "ssn":
+		return redact.MaskSSN{}, nil
+	case "pan":
+		return redact.MaskPAN{}, nil
+	case "pan-relaxed":
+		return redact.MaskPANRelaxed{}, nil
+	case "email":
+		return redact.MaskEmail{}, nil
+	case "inner", "outer":
+		// Common mistake: dropped the colon + margins.
+		return nil, fmt.Errorf("strategy 'mask:%s': '%s' is a generic form requiring margins (use 'mask:%s:<m1>,<m2>[,<char>]')", name, name, name)
+	default:
+		return nil, fmt.Errorf("strategy 'mask:%s': unknown form/preset (supported: inner:<m1>,<m2>[,<char>], outer:<m1>,<m2>[,<char>], ssn, pan, pan-relaxed, email)", name)
+	}
 }
 
 // resolveHMACKey reads the HMAC keyset for `hash:hmac-sha256`
