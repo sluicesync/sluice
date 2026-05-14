@@ -72,7 +72,7 @@ func preflightRedactTypes(reg *redact.Registry, schema *ir.Schema) error {
 		if rule.Strategy.Name() != "mask:uuid" {
 			continue
 		}
-		col := findColumn(schema, rule.Table, rule.Column)
+		col := findSchemaColumn(schema, rule.Table, rule.Column)
 		if col == nil {
 			continue // column not in scope of this migration
 		}
@@ -97,9 +97,9 @@ func preflightRedactTypes(reg *redact.Registry, schema *ir.Schema) error {
 	return fmt.Errorf("%w (Bug 60 / v0.58.1 preflight):\n%s", errRedactTypeMismatch, strings.Join(problems, "\n"))
 }
 
-// findColumn looks up a column in the schema by table + column
+// findSchemaColumn looks up a column in the schema by table + column
 // name. Returns nil if not found.
-func findColumn(schema *ir.Schema, table, column string) *ir.Column {
+func findSchemaColumn(schema *ir.Schema, table, column string) *ir.Column {
 	for _, t := range schema.Tables {
 		if t.Name != table {
 			continue
