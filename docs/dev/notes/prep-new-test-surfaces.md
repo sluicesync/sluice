@@ -22,6 +22,42 @@ TABLE statements as a corpus. Each one is a real-world-ish CREATE
 TABLE shape (column types, defaults, constraints, indexes,
 multi-column PKs, etc.).
 
+### Revised understanding (post-fetch)
+
+The actual file (~13,725 lines, ~150-200 distinct CREATE TABLE
+statements) is heavily MySQL-flavored — full of MySQL-specific
+table options like `KEY_BLOCK_SIZE`, `INSERT_METHOD`,
+`ROW_FORMAT`, `TABLE_CHECKSUM`, `UNION`, `DELAY_KEY_WRITE`, plus
+liberal use of `COMMENT 'text...'` clauses. The "MySQL ∩ PG
+portable subset" filter I'd originally proposed would drop the
+majority of the corpus.
+
+The realistic harness shape is:
+
+1. Filter the corpus to MySQL-supported syntax (drop none, just
+   normalize quoting and split statements).
+2. Boot a testcontainers `mysql:8.0` and apply each `statement
+   ok` DDL.
+3. Read the resulting schema via sluice's MySQL schema reader.
+4. For each table, assert structural invariants:
+   - Table read without error
+   - Column count matches the DDL's column count
+   - Each column's IR type isn't `ir.Unknown`
+   - PRIMARY KEY (if declared) round-trips via the IR
+5. (Optional Phase 2) Emit MySQL DDL via sluice's MySQL writer
+   and apply it to a fresh DB; confirm a second read yields the
+   same IR shape.
+6. (Optional Phase 3) Cross-engine MySQL→IR→PG-emit; assert PG
+   accepts the translated DDL or refuses with a documented
+   translator-gap message.
+
+This is bigger than the original ~430 LOC estimate (more like
+~700-900 LOC including the testcontainer dance + fixture
+harness). Build tag: `integration ddlfixture` so the cost is
+opt-in and doesn't impact default CI.
+
+### Why this is valuable
+
 ### Why this is valuable
 
 - **Surfaces gaps in sluice's DDL parsing / IR translation that
