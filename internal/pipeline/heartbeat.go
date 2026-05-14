@@ -44,10 +44,20 @@ const DefaultHeartbeatInterval = 60 * time.Second
 // interval until ctx is cancelled. interval <= 0 disables the
 // goroutine (no-op return). Caller does NOT need to track the
 // goroutine — it exits on its own when ctx cancels.
+//
+// The slog logger is captured at call-site (not read lazily inside
+// the goroutine via slog.Default()). That matters in tests that
+// swap slog.Default() between subtests: an in-flight tick in an
+// orphan heartbeat goroutine from test1 must not land in test2's
+// captured-buffer assertion. Production callers don't swap
+// slog.Default() mid-stream, so the captured-at-call-site behaviour
+// is identical in practice; the change is purely about test
+// hermeticity. (Bug surfaced on v0.56.1 windows-latest CI.)
 func startHeartbeat(ctx context.Context, streamID string, interval time.Duration) {
 	if interval <= 0 {
 		return
 	}
+	logger := slog.Default()
 	go func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
@@ -56,7 +66,7 @@ func startHeartbeat(ctx context.Context, streamID string, interval time.Duration
 			case <-ctx.Done():
 				return
 			case t := <-ticker.C:
-				slog.InfoContext(ctx, "stream: heartbeat",
+				logger.InfoContext(ctx, "stream: heartbeat",
 					slog.String("stream_id", streamID),
 					slog.Time("at", t.UTC()),
 					slog.Duration("interval", interval),

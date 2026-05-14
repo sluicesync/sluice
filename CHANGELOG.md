@@ -32,6 +32,10 @@ project follows [Semantic Versioning](https://semver.org/).
 - New unit test covers the four declaration sites end-to-end through kong.
 - Manual: `sluice migrate --redact users.pan=mask:inner:4,4 --source-driver=... --target-driver=...` now parses cleanly (previously rejected with `got 1 args`).
 
+### Also fixed
+
+- **`startHeartbeat` test pollution under `slog.SetDefault()` swaps.** `TestStartHeartbeat_ZeroIntervalDisables` on `windows-latest` (Test job) flaked when a stray tick from the previous test's heartbeat goroutine landed in the next test's slog buffer. Root cause: the goroutine called `slog.InfoContext` which reads `slog.Default()` lazily at log-time; if test1's orphan goroutine was mid-tick when test2 swapped `slog.Default()` to its own handler, the stale tick wrote to test2's buffer. Fix: capture `slog.Default()` once at `startHeartbeat` call-site instead. Production behaviour is identical (operators don't swap `slog.Default()` mid-stream); the change is purely about test hermeticity. Folded into this release to keep the gate green.
+
 ## [0.56.0]
 
 **PII Phase 2.a — generic format-preserving mask strategies + Luhn helper.** Operators redacting PAN, SSN, phone, or similar fixed-shape identifiers can now use `mask:inner` / `mask:outer` instead of stacking `truncate:` + `static:` to fake format preservation. The Luhn helper lands as shared infrastructure for the Phase 2.b checksum-aware strategies (`gen_rnd_pan`-style) coming in a later release.
