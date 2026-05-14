@@ -435,4 +435,46 @@ func TestRegistry(t *testing.T) {
 			t.Error("Get with empty schema should match the same Set")
 		}
 	})
+
+	t.Run("Bug 58: bare CLI rule matches any source schema via fallback", func(t *testing.T) {
+		// Operator CLI form `--redact users.email=hash:sha256` registers
+		// the rule with schema="". CDC engines emit non-empty Schema:
+		// MySQL VStream uses the keyspace name; PG CDC uses "public".
+		// Without the empty-schema fallback in Get(), CDC redaction
+		// silently passes plaintext through to the target (Bug 58).
+		r := New()
+		r.Set("", "users", "email", Hash{Algo: "sha256"})
+
+		// MySQL VStream-shape lookup (Schema = keyspace name).
+		if got := r.Get("sluice-validation-mysql-source", "users", "email"); got == nil {
+			t.Error("Bug 58 regression: MySQL-keyspace-schema lookup must fall back to bare schema rule")
+		}
+		// PG CDC-shape lookup (Schema = "public").
+		if got := r.Get("public", "users", "email"); got == nil {
+			t.Error("Bug 58 regression: PG public-schema lookup must fall back to bare schema rule")
+		}
+		// Bare lookup still works.
+		if got := r.Get("", "users", "email"); got == nil {
+			t.Error("bare lookup still matches the bare rule")
+		}
+	})
+
+	t.Run("schema-qualified rule takes precedence over bare-fallback rule", func(t *testing.T) {
+		// Operator wants different strategies per schema (Shape B
+		// multi-source aggregation). The schema-qualified rule MUST
+		// take precedence; the bare-fallback only fires on miss.
+		r := New()
+		r.Set("", "users", "email", Hash{Algo: "sha256"})       // bare fallback
+		r.Set("customer_svc", "users", "email", Truncate{N: 4}) // per-schema override
+
+		bareGot := r.Get("customer_svc", "users", "email")
+		if bareGot == nil || bareGot.Name() != "truncate:4" {
+			t.Errorf("schema-qualified rule should win; got %v", bareGot)
+		}
+		// Other schemas fall back to the bare rule.
+		fallback := r.Get("audit_svc", "users", "email")
+		if fallback == nil || fallback.Name() != "hash:sha256" {
+			t.Errorf("audit_svc.users.email should fall back to bare hash:sha256; got %v", fallback)
+		}
+	})
 }

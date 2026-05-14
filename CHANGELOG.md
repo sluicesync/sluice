@@ -6,6 +6,37 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.54.1]
+
+**Closes Bug 58 — CDC apply-path PII redaction was non-functional due to schema-namespace key mismatch.** The v0.54.0 cycle's load-bearing test caught it: the wiring was structurally in place but lookups missed because engine CDC readers emit non-empty `Schema` while operator CLI flags register with `schema=""`. Cold-start bulk-copy was unaffected (uses `table.Schema=""` matching the CLI key); only mid-stream CDC events bypassed redaction.
+
+### Fixed
+
+- **`redact.Registry.Get` now falls back to the bare-schema rule** when the schema-qualified lookup misses. Lookup order: `(schema, table, column)` first, then `("", table, column)` if non-empty schema was queried. Preserves the documented CLI semantics ("bare `users.email=...` matches any source schema") AND lets engine-emitted schemas pass through cleanly.
+  - **MySQL VStream** populates `ir.Insert.Schema` with the keyspace name (e.g., `sluice-validation-mysql-source`).
+  - **Postgres CDC** populates `Schema` with the relation's schema (typically `public`).
+  - Both shapes now match operator-bare `--redact users.email=hash:sha256` via the fallback.
+
+- **Schema-qualified rule still wins on duplicates.** Operators with multi-source aggregation (`customer_svc.users.email` vs `audit_svc.users.email`) still get precise per-schema behaviour: the schema-qualified `Set` takes precedence over the bare fallback when both are registered.
+
+- **`--redact` help text updated** on both `migrate` and `sync start` to reflect the v0.54.0 closure (Phase 1.5: bulk-copy AND CDC apply paths both honour `--redact`).
+
+### Migration / Compatibility
+
+- **Drop-in upgrade from v0.54.0.** Operators running `sluice sync start --redact ...` against v0.54.0 should upgrade immediately — CDC events were silently flowing to the target unredacted in v0.54.0 (the v0.54.0 cycle's reproduction landed 3 plaintext rows on a PG target's `users.email` column despite the `--redact users.email=hash:sha256` flag).
+- **No schema, position-token, or YAML config changes.**
+
+### Who needs this release
+
+- **Anyone running `sluice sync start --redact ...` on v0.54.0**: **upgrade immediately**. CDC events are bypassing redaction in v0.54.0; v0.54.1 closes that gap.
+- **Anyone on v0.53.0 or earlier**: skip v0.54.0, upgrade straight to v0.54.1.
+
+### Verification
+
+- **New regression test in `internal/redact/redact_test.go`**: `Bug 58: bare CLI rule matches any source schema via fallback`. Exercises both MySQL-keyspace-shape and PG-public-shape lookups against a bare-schema rule.
+- **Companion test**: schema-qualified rule takes precedence over bare-fallback when both are registered (preserves multi-source aggregation semantics).
+- **End-to-end verification deferred to v0.54.1 cycle**: re-run the v0.54.0 cycle's CDC redaction scenario; pin is "CDC-applied rows show 64-char hex emails (not plaintext) on the target".
+
 ## [0.54.0]
 
 **PII redaction Phase 1.5 — the two highest-impact deferrals from v0.53.0.** Closes the operator surprise where `sluice sync start --redact` redacted only the cold-start bulk-copy phase but let mid-stream CDC events flow to the target unredacted; adds YAML config support so production deployments can version-control redaction rules instead of stringing them through CLI flags.

@@ -125,11 +125,40 @@ func (r *Registry) Set(schema, table, column string, strategy Strategy) {
 // Get returns the Strategy for the column triple, or nil if no rule
 // is registered. The pipeline's `redactRow` interprets nil as
 // "pass the value through verbatim".
+//
+// Lookup order: (schema, table, column) keyed first; on miss, fall
+// back to ("", table, column) — the operator-bare CLI form that
+// matches any source schema. This matters at CDC apply time where
+// engine-emitted change events carry a non-empty `Schema`:
+//
+//   - MySQL VStream populates `ir.Insert.Schema` with the keyspace
+//     name (e.g., `sluice-validation-mysql-source`).
+//   - Postgres CDC populates `Schema` with the relation's schema
+//     (typically `public`).
+//
+// The operator-bare CLI form `--redact users.email=hash:sha256`
+// registers the rule with `schema=""`; without the fallback, the
+// engine-emitted-schema lookup misses and CDC rows pass through
+// unredacted while bulk-copy rows (which use `table.Schema=""` on
+// MySQL sources) match. Bug 58 fix in v0.54.1.
+//
+// Operators wanting strict per-schema rules (`customer_svc.users.email`
+// vs `audit_svc.users.email`) still get the precise behaviour: the
+// schema-qualified Set takes precedence over the bare fallback when
+// both are registered.
 func (r *Registry) Get(schema, table, column string) Strategy {
 	if r == nil || len(r.rules) == 0 {
 		return nil
 	}
-	return r.rules[registryKey(schema, table, column)]
+	if s, ok := r.rules[registryKey(schema, table, column)]; ok {
+		return s
+	}
+	// Schema-qualified miss — fall back to the bare operator form so
+	// CDC engine-emitted schemas match operator-bare CLI rules.
+	if schema != "" {
+		return r.rules[registryKey("", table, column)]
+	}
+	return nil
 }
 
 // Empty reports whether the Registry has no rules. Used by the
