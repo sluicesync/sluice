@@ -6,6 +6,47 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.62.0]
+
+**Smarter `--bulk-parallel-min-rows` default — 100,000 → 80,000.** Empirical finding from the new local-local rig: sluice consults `information_schema.tables.table_rows` (InnoDB) when deciding whether a table is "big enough" for parallel-copy. That catalog row-count is an *estimate* that commonly undershoots actuals by 0.1–5%. A table holding exactly 100,000 rows often reports as `~95-99k` via the catalog, so the prior 100,000 threshold left 100k-actual tables on the single-reader path despite being meant to qualify.
+
+### Changed
+
+- **`--bulk-parallel-min-rows` default lowered to 80,000** (from 100,000). The new default sits below 100k to absorb the typical catalog undershoot. Tables with 100k actual rows now consistently engage parallel-copy by default.
+- **`defaultBulkParallelMinRows`** constant in `internal/pipeline/chunk.go` updated.
+- **Doc comments + CLI help text** name the new default and reference the v0.62.0 changeover for operators reading older docs.
+
+### Compatibility
+
+- **Behaviour change**: operators on workloads with many 80k-99k-row tables will see those tables now take the parallel-copy path by default. The change is intended — parallel-copy with default parallelism (`min(8, NumCPU)`) is strictly faster than single-reader on tables in this size band per the empirical baseline.
+- **Operators wanting the pre-v0.62.0 behaviour** pass `--bulk-parallel-min-rows=100000` explicitly. Nothing else changes — the threshold is the only knob affected.
+- **Drop-in upgrade from v0.61.0.** No flag-name changes, no IR changes, no engine API changes.
+
+### Empirical baseline (local-local MySQL rig, medium fixture)
+
+| Configuration | Throughput | Wall (2.5M rows) |
+|---|---|---|
+| v0.61.0, `--bulk-parallel-min-rows=100000` (default), `local_infile=OFF` | ~28k rows/sec | 88s |
+| v0.61.0, `--bulk-parallel-min-rows=100000` (default), `local_infile=ON` | ~33k rows/sec | 75s |
+| v0.61.0, `--bulk-parallel-min-rows=50000` explicit, `local_infile=ON` | ~54k rows/sec | 46s |
+| **v0.62.0 (this release), defaults, `local_infile=ON`** | **expected ~50-55k rows/sec** | **~45-50s** |
+
+### Who needs this release
+
+- **Anyone running migrate or sync-start against tables in the 80k-100k row range** (common for medium-sized SaaS schemas). The default now matches operator intent.
+- **Anyone with tables below 80k**: no change. Default behaviour stays single-reader.
+- **Anyone tuning `--bulk-parallel-min-rows` explicitly**: no change. The explicit value still wins.
+
+### Verification
+
+- Build + lint clean across all tags.
+- Existing tests cover the new default value via the constant; no test pinned the literal `100000`.
+
+### Future work surfaced by the same investigation
+
+- **Smart-check near the threshold**: when the catalog row-count is within ~10% of the threshold, sluice could run an exact `SELECT COUNT(*)` (~50ms on a 100k table) before deciding which path to take. Removes the threshold guesswork entirely. Deferred — the 80k default closes the most common gap.
+- **Cross-engine reader rate parity**: PG → PG on the same fixture shape runs ~4× faster than MySQL → MySQL on the same host. Reader-side delta worth a future throughput-tuning pass.
+
 ## [0.61.0]
 
 **PII Phase 3 — dictionary-based redaction strategies.** Two new strategies that map source values into operator-supplied dictionaries: `randomize:dict:<name>` picks an entry per row (PK-keyed, inherits v0.59.0's replay-stable contract) and `tokenize:dict:<name>` picks an entry by HMAC of the input value (input-value-keyed, stable across tables — every "Alice" maps to the same dict entry everywhere in the database). Dictionaries live in YAML's `dictionaries:` block with two declaration shapes: inline `entries:` list for small dicts (10s of entries), or `file:` pointer at a one-entry-per-line file (`#`-prefixed comments + blank lines tolerated) for large dicts. ADR-0040 documents the two differing determinism contracts.

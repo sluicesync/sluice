@@ -48,14 +48,23 @@ import (
 // default rather than a literal so the docstring on [Migrator] and
 // the CLI help text can reference one source of truth.
 //
-// 100,000 is a middle-ground pick. Production migrations of
-// multi-million-row tables benefit from parallel copy; tables under
-// 100k rows finish quickly enough that the per-chunk overhead (extra
-// connections, MIN/MAX query, per-chunk state writes) dwarfs the
-// parallelism gain. Operators with workloads of many small-but-
-// hot-tables can dial it down via --bulk-parallel-min-rows; nothing
-// in the design depends on the specific value.
-const defaultBulkParallelMinRows int64 = 100_000
+// 80,000 absorbs the typical information_schema row-count estimate
+// undershoot on InnoDB (0.1-5% below actual) while still favouring
+// the single-reader path for tables small enough that per-chunk
+// overhead (extra connections, MIN/MAX query, per-chunk state
+// writes) dwarfs the parallelism gain. Empirical: tables with 100k
+// actual rows commonly report as ~95-99k in information_schema; at
+// the prior 100,000 threshold they fell to single-reader despite
+// being "100k tables", costing ~64% throughput on a typical
+// medium-fixture (see sluice-testing local-rig/baselines.md
+// v0.62.0 commit). 80,000 sets the threshold low enough that a
+// genuine 100k table always crosses it.
+//
+// Operators with workloads of many small-but-hot-tables can dial
+// it down via --bulk-parallel-min-rows; operators wanting the
+// pre-v0.62.0 behaviour pass --bulk-parallel-min-rows=100000.
+// Nothing in the design depends on the specific value.
+const defaultBulkParallelMinRows int64 = 80_000
 
 // defaultBulkParallelism is the per-table reader/writer pair count
 // when --bulk-parallelism is left at zero. The orchestrator caps it at
@@ -100,8 +109,8 @@ func resolveBulkParallelism(configured, numCPU int) int {
 }
 
 // resolveBulkParallelMinRows applies the "0 = use default" rule. The
-// CLI default is 100k; in-process callers passing zero pick up the
-// same value.
+// CLI default is 80k (v0.62.0+); in-process callers passing zero
+// pick up the same value.
 func resolveBulkParallelMinRows(configured int64) int64 {
 	if configured <= 0 {
 		return defaultBulkParallelMinRows

@@ -193,8 +193,13 @@ type Migrator struct {
 	// MIN/MAX query, per-chunk state writes) dominates on small
 	// tables; the threshold avoids the overhead for them.
 	//
-	// Zero means use the default (100,000). Set explicitly via
-	// --bulk-parallel-min-rows when tuning for unusual workloads.
+	// Zero means use the default (80,000 as of v0.62.0; previously
+	// 100,000). The new default absorbs the typical
+	// information_schema row-count estimate undershoot on InnoDB —
+	// 100k-actual tables register as ~95-99k via the catalog and
+	// would have missed the prior 100k threshold by ~1%. Operators
+	// wanting the pre-v0.62.0 behaviour pass
+	// --bulk-parallel-min-rows=100000.
 	BulkParallelMinRows int64
 
 	// MaxBufferBytes is the soft upper bound on per-batch buffered
