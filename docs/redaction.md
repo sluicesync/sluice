@@ -76,7 +76,7 @@ work. Operators not using redaction pay nothing for the feature.
 | `null` | `null` | Replace with `NULL` | Refuses on `NOT NULL` columns (use `static:` instead) |
 | `static:<v>` | `static:<value>` | Replace with literal constant | None |
 | `hash:sha256` | `hash:sha256` | SHA-256 hex digest (64 chars, deterministic) | Refuses on non-string / non-bytea input |
-| `hash:hmac-sha256` | `hash:hmac-sha256` | HMAC-SHA256 hex digest; requires `--redact-key-source` | Refuses without keyset; refuses non-string input |
+| `hash:hmac-sha256` | `hash:hmac-sha256` | HMAC-SHA256 hex digest; requires `--keyset-source` | Refuses without keyset; refuses non-string input |
 | `truncate:<n>` | `truncate:4` | First N runes (rune-counted; UTF-8 + emoji safe) | Refuses non-string input |
 
 ### Phase 2.a: generic format-preserving masks (v0.56.0)
@@ -214,7 +214,7 @@ dictionaries:
   cities:
     file: /etc/sluice/cities.txt
 
-redact_key_source: env:HMAC_SECRET
+keyset_source: file:/etc/sluice/keyset.yaml
 ```
 
 Useful for: production deployments (version-controllable,
@@ -235,9 +235,9 @@ Three different determinism semantics across the strategy set:
 | Semantics | Strategies | Guarantee |
 |---|---|---|
 | **Stateless deterministic** | `hash:sha256`, `truncate:`, `mask:*` (all forms), `static:`, `null` | Same input → same output across any sluice run anywhere |
-| **Keyed deterministic** | `hash:hmac-sha256` | Same input + same key → same output (operator controls the key via `--redact-key-source`) |
-| **PK-keyed replay-stable** | `randomize:*` (including `randomize:dict`) | Same source row (table + column + PK) → same output across re-runs |
-| **Input-keyed cross-stream** | `tokenize:dict` | Same input value → same output across tables + columns (uses fixed HMAC key in v0.61.0; Phase 4 will lift to operator keyset) |
+| **Keyed deterministic** | `hash:hmac-sha256` | Same input + same keyset key → same output (operator controls the key via `--keyset-source`) |
+| **PK-keyed replay-stable** | `randomize:*` (including `randomize:dict`) | Same source row (table + column + PK) → same output across re-runs (not keyset-integrated) |
+| **Input-keyed cross-stream** | `tokenize:dict` | Same input value + same keyset key → same output across tables, columns, and streams |
 
 For CDC resume and backup → restore round-trips: every strategy
 above is idempotent on the SAME data. Operators relying on stable
@@ -250,33 +250,138 @@ value.
 
 ---
 
-## HMAC key sources
+## Operator keyset (`--keyset-source`)
 
-Required by `hash:hmac-sha256`. Three forms:
+PII Phase 4 (ADR-0041) unifies key sourcing under a single durable,
+versioned, operator-controlled **keyset**. Both keyed strategies —
+`hash:hmac-sha256` and `tokenize:dict` — resolve their HMAC secret
+from the keyset. There is no other key path: the Phase 1
+`--redact-key-source` flag and the built-in v0.61.0 `tokenize:dict`
+key were removed (clean break — sluice is pre-users). **Any rule
+using `hash:hmac-sha256` or `tokenize:dict` requires
+`--keyset-source`**; sluice refuses loudly at preflight otherwise.
 
-```bash
-# Environment variable (production: KMS-managed secret)
---redact-key-source=env:HMAC_SECRET
+### Keyset shape
 
-# File (operator-managed key on disk; one-line file)
---redact-key-source=file:/etc/sluice/hmac.key
-
-# Derived from stream-id + salt (phase 1 placeholder; phase 4 replaces this)
---redact-key-source=derive:my-app-salt
+```yaml
+keyset:
+  default: customer_pii          # which key an unnamed rule uses (optional)
+  keys:
+    - name: customer_pii
+      active: 3                  # generation used for NEW surrogates
+      generations:
+        - generation: 3
+          created_at: 2026-05-15T00:00:00Z
+          bytes: "<base64 32-byte secret>"
+        - generation: 2          # kept so older surrogates still resolve
+          created_at: 2026-03-01T00:00:00Z
+          bytes: "<base64 32-byte secret>"
+    - name: employee_pii
+      active: 1
+      generations:
+        - generation: 1
+          bytes: "<base64 secret>"
 ```
 
-**`tokenize:dict` uses its own fixed key** (`sluice-tokenize-dict-v1`) in v0.61.0.
-The security model is "stable hashing", not secrecy — operators relying
-on tokenize output as a non-reversible surrogate should NOT assume
-cryptographic strength against a targeted attacker. Phase 4 will
-introduce a proper operator-keyset story; the `v1` suffix on the
-current key reserves room for migration.
+### Sources
+
+```bash
+# Keyset YAML on disk
+--keyset-source=file:/etc/sluice/keyset.yaml
+
+# Keyset YAML in an environment variable (container/secret-manager friendly)
+--keyset-source=env:SLUICE_KEYSET
+
+# sluice-managed sluice_keysets table on a DSN — shared across streams
+# for cross-stream surrogate stability (postgres:// → PG, else MySQL)
+--keyset-source=db:postgres://user:pw@host:5432/keysetdb
+```
+
+### Selecting a key per rule
+
+A rule names which keyset key it uses via the YAML `key:` field
+(or the trailing `:<keyname>` segment of the CLI spec):
+
+```yaml
+redactions:
+  - table: users.email
+    strategy: hash
+    algo: hmac-sha256
+    key: customer_pii          # explicit key reference
+  - table: users.first_name
+    strategy: tokenize
+    dict: first_names
+    key: customer_pii          # same key → cross-table consistency
+```
+
+```bash
+--redact users.email=hash:hmac-sha256:customer_pii
+--redact users.first_name=tokenize:dict:first_names:customer_pii
+```
+
+Omitting `key:` uses the keyset's declared `default` (or its sole
+entry when exactly one key exists). With multiple keys and no
+`default`, omitting `key:` is refused loudly.
+
+### Determinism under rotation
+
+- **Named `key:`** pins to that key's *active* generation. Within a
+  run it is fixed; the active generation only changes on the next
+  process restart (startup-snapshot — sluice does NOT hot-reload a
+  rotated keyset mid-run). This is the choice for operators who
+  never want surrogate drift on a re-run.
+- **No `key:` / default key** also resolves to the default key's
+  active generation. After a rotation + restart, NEW rows produce
+  NEW surrogates under the new active generation while existing
+  target rows retain their old-generation surrogates → **mixed
+  surrogate population on the target**. Operators wanting a clean
+  rotation must explicitly migrate the target (drop + cold-start
+  re-run under the new key).
+
+The same consequence applies to backup → restore across a rotation:
+a backup taken at active=2 and restored alongside active=3 CDC
+applies leaves mixed-generation surrogates on the target. This is
+expected behaviour, not a bug — "active = used for NEW surrogates;
+existing rows retain their generation."
+
+### Cross-stream / cross-install sharing
+
+Two streams pointing at the same `--keyset-source=db:<dsn>` share
+the keyset automatically — this is the cross-stream-stability
+primitive (user `alice@example.com` becomes the same surrogate on
+staging-1 AND staging-2). For two independent sluice installs that
+must produce identical surrogates (cross-org data exchange), install
+the same `file:` keyset YAML at both ends.
+
+### Security model
+
+"Stable hashing", not secrecy: the goal is stable input → stable
+output, not cryptographic non-reversibility against a targeted
+attacker who also holds the key. The `bytes` column / file / env
+var is the operator's secret to protect; sluice does not encrypt it
+at rest (the operator's storage layer is responsible — same posture
+as the rest of sluice's state store).
+
+### Audit log
+
+Every command that loads a keyset emits exactly one INFO line at
+startup recording the source scheme, per-key generation list, active
+generation, and HMAC algorithm. Per-row surrogate audit is NOT
+logged (that would defeat redaction). DSN sources are
+credential-redacted in the line.
+
+### Out of scope (v1)
+
+`sluice keyset rotate` / `sluice keyset list` CLI subcommands
+(populate `sluice_keysets` via SQL / edit the YAML by hand for now);
+KMS/Vault adapters (layer them above sluice by populating
+`env:`/`file:`); encryption-at-rest of the `bytes` column.
 
 ---
 
 ## Preflight refusals
 
-sluice runs two preflight checks before any data movement:
+sluice runs three preflight checks before any data movement:
 
 1. **`mask:uuid` on a UUID-typed column** (Bug 60 / v0.58.1):
    refuses unless `--type-override=col=text` short-circuits the
@@ -284,9 +389,16 @@ sluice runs two preflight checks before any data movement:
 2. **`randomize:*` on a no-PK table** (v0.59.0): refuses; suggests
    either adding a PK to the source or picking a non-random
    strategy.
+3. **`hash:hmac-sha256` / `tokenize:dict` with no resolvable
+   keyset** (PII Phase 4 / ADR-0041): refuses with an actionable
+   message — supply `--keyset-source` and reference a key via the
+   rule's `key:` option (or rely on the keyset default / sole
+   entry). The CLI/YAML parsers refuse at config-parse time; this
+   preflight re-asserts it as defense-in-depth.
 
-When both fire in the same run, the preflight aggregates into a
-single combined error so you see the full picture in one pass.
+When more than one fires in the same run, the preflight aggregates
+into a single combined error so you see the full picture in one
+pass.
 
 ---
 
@@ -395,11 +507,12 @@ manually.
 
 ## Known limitations
 
-- **Tokenize HMAC key is fixed** in v0.61.0 (`sluice-tokenize-dict-v1`).
-  Operators wanting a per-tenant or per-environment-keyed
-  tokenization must wait for Phase 4. The fixed key is stable
-  enough for "we want consistent surrogates" but not strong enough
-  for "we need to defeat an attacker who knows the key derivation".
+- **No hot-reload of the keyset.** The keyset is resolved once at
+  process startup and is immutable for the run (ADR-0041 decision
+  D1). Rotating the active key (editing the YAML / updating
+  `sluice_keysets`) takes effect only on the next process restart;
+  sluice does not watch the file or poll the table mid-run.
+  Live-watch is deferred to a future Phase 4.5.
 - **Dictionary file form caches at parser-time.** If you edit the
   file mid-run, sluice doesn't reload. Restart for changes to
   take effect. Documented as a "changes to dictionaries between
@@ -440,6 +553,8 @@ manually.
 | 2.c | v0.59.0 → v0.60.0 | `randomize:int`, `randomize:email`, `randomize:us-phone`, `randomize:uuid`, `randomize:ssn`, `randomize:pan`, `randomize:ca-sin`, `randomize:uk-nin`, `randomize:iban`; replay-stable seeding contract; no-PK preflight |
 | 3 | v0.61.0 | `randomize:dict`, `tokenize:dict`; YAML `dictionaries:` block (inline + file forms) |
 
-**27 strategies, 5 phases, 9 minor releases.** Phase 4 (proper
-operator-keyset story replacing the fixed `tokenize:dict` HMAC key)
-is the next major PII chunk.
+| 4 | v0.62.0 line | operator keyset (`--keyset-source=file:\|env:\|db:`), `key:` rule option, `sluice_keysets` table on PG + MySQL; `--redact-key-source` and the built-in `tokenize:dict` key removed (ADR-0041) |
+
+**27 strategies, 5 phases.** Phase 4 landed the operator-keyset
+story; remaining keyset ergonomics (`sluice keyset rotate`/`list`
+CLI, KMS/Vault adapters, live-watch) are deferred to Phase 4.5+.

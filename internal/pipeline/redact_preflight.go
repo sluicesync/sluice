@@ -47,6 +47,15 @@ var errRedactTypeMismatch = errors.New("pipeline: redaction strategy incompatibl
 // hits the no-PK case mid-row.
 var errRedactRandomizeNoPK = errors.New("pipeline: randomize:* strategy requires a primary key on the source table")
 
+// errRedactKeysetMissing is the sentinel for the PII Phase 4
+// (ADR-0041 decision D2) loud refusal: a `hash:hmac-sha256` or
+// `tokenize:dict` rule is registered but has no resolvable keyset
+// key. The CLI/YAML parsers already refuse a keyless rule at
+// construction; this preflight re-asserts it as defense-in-depth so
+// a programmatically-built Registry can't slip a keyless rule into a
+// data path.
+var errRedactKeysetMissing = errors.New("pipeline: hash:hmac-sha256 / tokenize:dict rule requires --keyset-source")
+
 // preflightRedactTypes inspects every redaction rule in the
 // registry against the (post-mappings) schema, refusing
 // combinations whose strategy output won't satisfy the target
@@ -82,8 +91,22 @@ func preflightRedactTypes(reg *redact.Registry, schema *ir.Schema) error {
 	}
 	var typeProblems []string
 	var randomizeProblems []string
+	var keysetProblems []string
 	for _, rule := range reg.Rules() {
 		name := rule.Strategy.Name()
+		if redact.StrategyNeedsKeyButMissing(rule.Strategy) {
+			qualified := rule.Column
+			if rule.Table != "" {
+				qualified = rule.Table + "." + rule.Column
+			}
+			if rule.Schema != "" {
+				qualified = rule.Schema + "." + qualified
+			}
+			keysetProblems = append(keysetProblems, fmt.Sprintf(
+				"  - %s: strategy %s requires --keyset-source; the built-in v0.61.0 key was removed in PII Phase 4 (ADR-0041). Supply --keyset-source=file:<path>|env:<var>|db:<dsn> and reference a key via the rule's 'key:' option (or rely on the keyset default / sole entry).",
+				qualified, name,
+			))
+		}
 		switch {
 		case name == "mask:uuid":
 			col := findSchemaColumn(schema, rule.Table, rule.Column)
@@ -125,19 +148,27 @@ func preflightRedactTypes(reg *redact.Registry, schema *ir.Schema) error {
 			))
 		}
 	}
-	if len(typeProblems) == 0 && len(randomizeProblems) == 0 {
+	if len(typeProblems) == 0 && len(randomizeProblems) == 0 && len(keysetProblems) == 0 {
 		return nil
 	}
-	if len(typeProblems) > 0 && len(randomizeProblems) == 0 {
+	// Keyset-missing is the most fundamental misconfiguration (no key
+	// material at all); surface it first and on its own when it's the
+	// only failure so the operator gets the single actionable fix.
+	if len(keysetProblems) > 0 && len(typeProblems) == 0 && len(randomizeProblems) == 0 {
+		return fmt.Errorf("%w (PII Phase 4 / ADR-0041 preflight):\n%s", errRedactKeysetMissing, strings.Join(keysetProblems, "\n"))
+	}
+	if len(typeProblems) > 0 && len(randomizeProblems) == 0 && len(keysetProblems) == 0 {
 		return fmt.Errorf("%w (Bug 60 / v0.58.1 preflight):\n%s", errRedactTypeMismatch, strings.Join(typeProblems, "\n"))
 	}
-	if len(randomizeProblems) > 0 && len(typeProblems) == 0 {
+	if len(randomizeProblems) > 0 && len(typeProblems) == 0 && len(keysetProblems) == 0 {
 		return fmt.Errorf("%w (PII Phase 2.c / v0.59.0 preflight):\n%s", errRedactRandomizeNoPK, strings.Join(randomizeProblems, "\n"))
 	}
-	// Both sets non-empty: surface both with a combined header so the
-	// operator sees the full picture in one run.
-	combined := append(append([]string{}, typeProblems...), randomizeProblems...)
-	return fmt.Errorf("%w / %w (combined v0.58.1 + v0.59.0 preflight):\n%s", errRedactTypeMismatch, errRedactRandomizeNoPK, strings.Join(combined, "\n"))
+	// Multiple categories non-empty: surface all with a combined
+	// header so the operator sees the full picture in one run.
+	combined := append([]string{}, keysetProblems...)
+	combined = append(combined, typeProblems...)
+	combined = append(combined, randomizeProblems...)
+	return fmt.Errorf("%w / %w / %w (combined preflight):\n%s", errRedactKeysetMissing, errRedactTypeMismatch, errRedactRandomizeNoPK, strings.Join(combined, "\n"))
 }
 
 // findSchemaTable returns the *ir.Table for name, or nil if not

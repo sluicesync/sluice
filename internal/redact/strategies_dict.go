@@ -36,15 +36,12 @@ import (
 // for the determinism rationale and the contract differences between
 // these two strategies.
 
-// tokenizeDictHMACKey is the fixed key for the tokenize:dict HMAC.
-// The cryptographic security model is "stable hashing" — the goal
-// isn't secrecy, it's stable input → stable output mapping. A
-// constant key is fine here; security would come from a separate
-// keyset story (Phase 4) if/when operators need it.
-//
-// The key is intentionally unusual-looking to make it obvious in a
-// future grep / audit that it's not a placeholder secret.
-var tokenizeDictHMACKey = []byte("sluice-tokenize-dict-v1")
+// PII Phase 4 (ADR-0041): the hardcoded `tokenize:dict` HMAC
+// constant was DELETED. tokenize:dict now REQUIRES an operator
+// keyset (via --keyset-source); there is NO synthetic back-compat
+// keyset entry and NO zero-surrogate-drift commitment (clean break
+// — sluice is pre-users). The key is resolved from the loaded
+// keyset at strategy-construction time and carried on TokenizeDict.Key.
 
 // RandomizeDict picks a dictionary entry per row using the per-row
 // seed (PII Phase 3, v0.61.0). The first 8 bytes of the v0.59.0
@@ -152,6 +149,16 @@ type TokenizeDict struct {
 	// input. Empty when no stream-id is available (e.g. `migrate`
 	// path); the HMAC still computes deterministically.
 	StreamID string
+
+	// Key is the HMAC secret resolved from the operator keyset at
+	// strategy-construction time (PII Phase 4, ADR-0041). REQUIRED:
+	// the Phase 1/3 hardcoded constant was deleted (clean break,
+	// no shim). Two streams sharing the same keyset key produce
+	// identical surrogates — the cross-stream-stability primitive.
+	// An empty Key is refused at [TokenizeDict.Redact] time; the
+	// CLI/YAML parsers + preflight refuse it earlier with an
+	// actionable message.
+	Key []byte
 }
 
 // Name returns "tokenize:dict:<name>".
@@ -180,6 +187,9 @@ func (t TokenizeDict) Redact(col *ir.Column, val any, _ []byte) (any, error) {
 	if len(t.Entries) == 0 {
 		return nil, fmt.Errorf("redact: column %s strategy %s has 0 dictionary entries (loader should have refused this earlier)", colIdentity(col), t.Name())
 	}
+	if len(t.Key) == 0 {
+		return nil, fmt.Errorf("redact: column %s strategy %s has no keyset key; tokenize:dict requires --keyset-source (the built-in v0.61.0 key was removed in PII Phase 4, ADR-0041)", colIdentity(col), t.Name())
+	}
 	var canonical string
 	switch v := val.(type) {
 	case string:
@@ -189,7 +199,7 @@ func (t TokenizeDict) Redact(col *ir.Column, val any, _ []byte) (any, error) {
 	default:
 		canonical = fmt.Sprintf("%v", v)
 	}
-	m := hmac.New(sha256.New, tokenizeDictHMACKey)
+	m := hmac.New(sha256.New, t.Key)
 	_, _ = m.Write([]byte(t.StreamID))
 	_, _ = m.Write([]byte(":"))
 	_, _ = m.Write([]byte(t.DictName))

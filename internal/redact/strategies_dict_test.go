@@ -10,6 +10,11 @@ import (
 	"github.com/orware/sluice/internal/ir"
 )
 
+// tokTestKey is the shared HMAC secret for the tokenize:dict tests.
+// PII Phase 4 (ADR-0041): tokenize:dict requires a keyset-sourced
+// key — the hardcoded v0.61.0 constant was removed.
+var tokTestKey = []byte("tokenize-dict-test-secret")
+
 // TestRandomizeDict_Determinism pins the v0.61.0 PII Phase 3
 // contract: same seed → same dictionary entry.
 func TestRandomizeDict_Determinism(t *testing.T) {
@@ -108,7 +113,7 @@ func TestRandomizeDict_Name(t *testing.T) {
 // contract: same input → same output across calls, irrespective of
 // PK / seed.
 func TestTokenizeDict_DeterminismPerInput(t *testing.T) {
-	s := TokenizeDict{DictName: "first_names", Entries: []string{"Alice", "Bob", "Carol", "Dave", "Eve"}, StreamID: "s1"}
+	s := TokenizeDict{DictName: "first_names", Entries: []string{"Alice", "Bob", "Carol", "Dave", "Eve"}, StreamID: "s1", Key: tokTestKey}
 	// Same input value through two different seeds (PK changed) →
 	// same output. Seed is irrelevant for tokenize:dict.
 	first, err := s.Redact(&ir.Column{Name: "n"}, "Alice", []byte("seed-a"))
@@ -140,7 +145,7 @@ func TestTokenizeDict_DeterminismPerInput(t *testing.T) {
 // TestTokenizeDict_NilPassThrough pins that NULL input passes through
 // as NULL (no tokenization of NULL).
 func TestTokenizeDict_NilPassThrough(t *testing.T) {
-	s := TokenizeDict{DictName: "n", Entries: []string{"x", "y"}}
+	s := TokenizeDict{DictName: "n", Entries: []string{"x", "y"}, Key: tokTestKey}
 	got, err := s.Redact(&ir.Column{Name: "c"}, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -156,8 +161,8 @@ func TestTokenizeDict_NilPassThrough(t *testing.T) {
 // Test multiple inputs to make collision-only-by-chance unlikely.
 func TestTokenizeDict_StreamIDAffectsOutput(t *testing.T) {
 	entries := []string{"A", "B", "C", "D", "E", "F", "G", "H", "I", "J"}
-	sA := TokenizeDict{DictName: "n", Entries: entries, StreamID: "stream-A"}
-	sB := TokenizeDict{DictName: "n", Entries: entries, StreamID: "stream-B"}
+	sA := TokenizeDict{DictName: "n", Entries: entries, StreamID: "stream-A", Key: tokTestKey}
+	sB := TokenizeDict{DictName: "n", Entries: entries, StreamID: "stream-B", Key: tokTestKey}
 	// At least one input must map to a different output across the
 	// two streams; otherwise the streamID prefix isn't doing anything.
 	differs := false
@@ -178,7 +183,7 @@ func TestTokenizeDict_StreamIDAffectsOutput(t *testing.T) {
 // TestTokenizeDict_EmptyStreamIDStillStable pins the migrate-path
 // shape: when StreamID is "", the HMAC still computes deterministically.
 func TestTokenizeDict_EmptyStreamIDStillStable(t *testing.T) {
-	s := TokenizeDict{DictName: "n", Entries: []string{"x", "y", "z"}, StreamID: ""}
+	s := TokenizeDict{DictName: "n", Entries: []string{"x", "y", "z"}, StreamID: "", Key: tokTestKey}
 	first, err := s.Redact(&ir.Column{Name: "c"}, "Alice", nil)
 	if err != nil {
 		t.Fatalf("first: %v", err)
@@ -198,8 +203,8 @@ func TestTokenizeDict_EmptyStreamIDStillStable(t *testing.T) {
 // part of the HMAC message.
 func TestTokenizeDict_DictNameAffectsOutput(t *testing.T) {
 	entries := []string{"A", "B", "C", "D", "E", "F", "G", "H", "I", "J"}
-	sA := TokenizeDict{DictName: "dict-a", Entries: entries, StreamID: "s"}
-	sB := TokenizeDict{DictName: "dict-b", Entries: entries, StreamID: "s"}
+	sA := TokenizeDict{DictName: "dict-a", Entries: entries, StreamID: "s", Key: tokTestKey}
+	sB := TokenizeDict{DictName: "dict-b", Entries: entries, StreamID: "s", Key: tokTestKey}
 	differs := false
 	for _, in := range []string{"alice", "bob", "carol", "dave", "eve", "frank", "grace", "heidi"} {
 		a, _ := sA.Redact(&ir.Column{Name: "n"}, in, nil)
@@ -218,7 +223,7 @@ func TestTokenizeDict_DictNameAffectsOutput(t *testing.T) {
 // stringified via fmt.Sprintf("%v", ...). Operators with integer /
 // boolean / []byte columns shouldn't see a refusal.
 func TestTokenizeDict_NonStringInput(t *testing.T) {
-	s := TokenizeDict{DictName: "n", Entries: []string{"x", "y"}, StreamID: "s"}
+	s := TokenizeDict{DictName: "n", Entries: []string{"x", "y"}, StreamID: "s", Key: tokTestKey}
 	// integer input
 	intResult, err := s.Redact(&ir.Column{Name: "c"}, 42, nil)
 	if err != nil {

@@ -101,7 +101,7 @@ func (h Hash) Redact(col *ir.Column, val any, _ []byte) (any, error) {
 		return hex.EncodeToString(sum[:]), nil
 	case "hmac-sha256":
 		if len(h.Key) == 0 {
-			return nil, fmt.Errorf("redact: column %s declared with 'hash:hmac-sha256' but Key is empty; ensure --redact-key-source provides a non-empty key", colIdentity(col))
+			return nil, fmt.Errorf("redact: column %s declared with 'hash:hmac-sha256' but Key is empty; ensure --keyset-source resolves a non-empty key (PII Phase 4, ADR-0041)", colIdentity(col))
 		}
 		m := hmac.New(sha256.New, h.Key)
 		_, _ = m.Write(data)

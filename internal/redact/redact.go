@@ -32,12 +32,11 @@
 // `Null` and `Static` are obviously deterministic. `Hash` with
 // SHA-256 is stateless and produces the same hex output for the
 // same input across runs and machines. `Hash` with HMAC-SHA256
-// requires a Key; Phase 1's `--redact-key-source derive:<salt>`
-// default derives a key from `--stream-id + salt` so a restart of
-// the same stream produces the same surrogate. Phase 4 will add a
-// proper keyset-persistence story; until then, operators wanting
-// stable surrogates across multiple streams should declare the
-// same `--redact-key-source` everywhere.
+// and `tokenize:dict` require a Key resolved from the operator
+// keyset (`--keyset-source`, PII Phase 4 / ADR-0041); two streams
+// sharing the same keyset key produce identical surrogates. The
+// keyset is a startup snapshot — rotation takes effect on the next
+// process restart only (no hot-reload).
 //
 // # Case-folding
 //

@@ -7,8 +7,6 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -104,7 +102,7 @@ func TestRedactFlag_KongCommaPreservation(t *testing.T) {
 // TestParseRedactFlags_Empty pins the no-op default: empty slice
 // returns nil registry, no error.
 func TestParseRedactFlags_Empty(t *testing.T) {
-	reg, err := parseRedactFlags(nil, "", "", nil)
+	reg, err := parseRedactFlags(nil, nil, "", nil)
 	if err != nil {
 		t.Errorf("empty: unexpected error %v", err)
 	}
@@ -123,7 +121,7 @@ func TestParseRedactFlags_AllStrategies(t *testing.T) {
 		"public.users.ssn=null",
 		"billing.accounts.credit_card=static:REDACTED",
 	}
-	reg, err := parseRedactFlags(values, "", "", nil)
+	reg, err := parseRedactFlags(values, nil, "", nil)
 	if err != nil {
 		t.Fatalf("unexpected error %v", err)
 	}
@@ -152,12 +150,30 @@ func TestParseRedactFlags_AllStrategies(t *testing.T) {
 	}
 }
 
-// TestParseRedactFlags_HashHMAC covers the HMAC keyed path with
-// the derive: key source.
-func TestParseRedactFlags_HashHMAC_Derive(t *testing.T) {
+// testKeyset builds an in-memory single-key keyset for the
+// keyset-sourced strategy tests (PII Phase 4, ADR-0041).
+func testKeyset(t *testing.T, name string, secret []byte) *redact.Keyset {
+	t.Helper()
+	return &redact.Keyset{
+		Keys: map[string]redact.KeysetKey{
+			name: {
+				Name:        name,
+				Active:      1,
+				Generations: map[int]redact.KeysetGeneration{1: {Generation: 1, Bytes: secret}},
+			},
+		},
+		Source: "test",
+	}
+}
+
+// TestParseRedactFlags_HashHMAC_Keyset covers the keyset-sourced
+// HMAC path (PII Phase 4 — --redact-key-source was removed).
+func TestParseRedactFlags_HashHMAC_Keyset(t *testing.T) {
+	secret := []byte("operator-keyset-secret")
+	ks := testKeyset(t, "k1", secret)
 	reg, err := parseRedactFlags(
 		[]string{"users.email=hash:hmac-sha256"},
-		"derive:test-salt",
+		ks,
 		"test-stream",
 		nil,
 	)
@@ -171,13 +187,11 @@ func TestParseRedactFlags_HashHMAC_Derive(t *testing.T) {
 	if s.Name() != "hash:hmac-sha256" {
 		t.Errorf("got %q; want hash:hmac-sha256", s.Name())
 	}
-	// Verify the derived key matches what the helper produces.
 	got, err := s.Redact(&ir.Column{Name: "email"}, "alice@example.com", nil)
 	if err != nil {
 		t.Fatalf("Redact failed: %v", err)
 	}
-	wantKey := sha256.Sum256([]byte("test-stream:test-salt"))
-	m := hmac.New(sha256.New, wantKey[:])
+	m := hmac.New(sha256.New, secret)
 	m.Write([]byte("alice@example.com"))
 	want := hex.EncodeToString(m.Sum(nil))
 	if got != want {
@@ -185,58 +199,30 @@ func TestParseRedactFlags_HashHMAC_Derive(t *testing.T) {
 	}
 }
 
-// TestParseRedactFlags_HashHMAC_Env covers the env-var key source.
-func TestParseRedactFlags_HashHMAC_Env(t *testing.T) {
-	const envVar = "TEST_REDACT_HMAC_KEY"
-	t.Setenv(envVar, "test-key-from-env")
-	reg, err := parseRedactFlags(
-		[]string{"users.email=hash:hmac-sha256"},
-		"env:"+envVar,
-		"",
-		nil,
-	)
+// TestParseRedactFlags_HashHMAC_NamedKey covers the explicit
+// `hash:hmac-sha256:<keyname>` CLI form pinning a named key.
+func TestParseRedactFlags_HashHMAC_NamedKey(t *testing.T) {
+	secret := []byte("named-key-secret")
+	ks := &redact.Keyset{
+		Default: "other",
+		Keys: map[string]redact.KeysetKey{
+			"other": {Name: "other", Active: 1, Generations: map[int]redact.KeysetGeneration{1: {Generation: 1, Bytes: []byte("nope")}}},
+			"pii":   {Name: "pii", Active: 1, Generations: map[int]redact.KeysetGeneration{1: {Generation: 1, Bytes: secret}}},
+		},
+		Source: "test",
+	}
+	reg, err := parseRedactFlags([]string{"users.email=hash:hmac-sha256:pii"}, ks, "", nil)
 	if err != nil {
 		t.Fatalf("unexpected error %v", err)
 	}
-	s := reg.Get("", "users", "email")
-	got, err := s.Redact(&ir.Column{Name: "email"}, "alice@example.com", nil)
+	got, err := reg.Get("", "users", "email").Redact(&ir.Column{Name: "email"}, "alice@example.com", nil)
 	if err != nil {
 		t.Fatalf("Redact failed: %v", err)
 	}
-	m := hmac.New(sha256.New, []byte("test-key-from-env"))
+	m := hmac.New(sha256.New, secret)
 	m.Write([]byte("alice@example.com"))
-	want := hex.EncodeToString(m.Sum(nil))
-	if got != want {
-		t.Errorf("env-keyed HMAC digest mismatch")
-	}
-}
-
-// TestParseRedactFlags_HashHMAC_File covers the file-based key source.
-func TestParseRedactFlags_HashHMAC_File(t *testing.T) {
-	dir := t.TempDir()
-	keyPath := filepath.Join(dir, "hmac.key")
-	if err := os.WriteFile(keyPath, []byte("file-key-content\n"), 0o600); err != nil {
-		t.Fatalf("write key file: %v", err)
-	}
-	reg, err := parseRedactFlags(
-		[]string{"users.email=hash:hmac-sha256"},
-		"file:"+keyPath,
-		"",
-		nil,
-	)
-	if err != nil {
-		t.Fatalf("unexpected error %v", err)
-	}
-	s := reg.Get("", "users", "email")
-	got, err := s.Redact(&ir.Column{Name: "email"}, "alice@example.com", nil)
-	if err != nil {
-		t.Fatalf("Redact failed: %v", err)
-	}
-	m := hmac.New(sha256.New, []byte("file-key-content"))
-	m.Write([]byte("alice@example.com"))
-	want := hex.EncodeToString(m.Sum(nil))
-	if got != want {
-		t.Errorf("file-keyed HMAC digest mismatch")
+	if want := hex.EncodeToString(m.Sum(nil)); got != want {
+		t.Errorf("named-key HMAC mismatch: got %v; want %s", got, want)
 	}
 }
 
@@ -263,7 +249,7 @@ func TestParseRedactFlags_RefusalPaths(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			_, err := parseRedactFlags([]string{c.raw}, "", "", nil)
+			_, err := parseRedactFlags([]string{c.raw}, nil, "", nil)
 			if err == nil {
 				t.Fatal("expected error; got nil")
 			}
@@ -274,50 +260,61 @@ func TestParseRedactFlags_RefusalPaths(t *testing.T) {
 	}
 }
 
-// TestParseRedactFlags_HMACNoKeySource covers the specific refusal
-// when hmac-sha256 is declared without --redact-key-source.
-func TestParseRedactFlags_HMACNoKeySource(t *testing.T) {
+// TestParseRedactFlags_HMACNoKeyset covers the D2 loud refusal:
+// hash:hmac-sha256 with no keyset supplied.
+func TestParseRedactFlags_HMACNoKeyset(t *testing.T) {
 	_, err := parseRedactFlags(
 		[]string{"users.email=hash:hmac-sha256"},
-		"",
+		nil,
 		"",
 		nil,
 	)
 	if err == nil {
 		t.Fatal("expected refusal; got nil")
 	}
-	if !strings.Contains(err.Error(), "--redact-key-source") {
-		t.Errorf("error %q should reference --redact-key-source", err.Error())
+	if !strings.Contains(err.Error(), "--keyset-source") {
+		t.Errorf("error %q should reference --keyset-source", err.Error())
+	}
+	if !strings.Contains(err.Error(), "ADR-0041") {
+		t.Errorf("error %q should reference ADR-0041", err.Error())
 	}
 }
 
-// TestParseRedactFlags_KeySourceMalformed covers the key-source
-// parsing's error paths.
-func TestParseRedactFlags_KeySourceMalformed(t *testing.T) {
-	cases := []struct {
-		source, wantSubstring string
-	}{
-		{"no-colon", "expected 'env:VAR'"},
-		{"unknown:foo", "unknown scheme"},
-		{"env:NONEXISTENT_VAR_XYZ", "environment variable is empty"},
-		{"file:/no/such/path", ""}, // OS-dependent message; just ensure error
+// TestParseRedactFlags_HMACUnknownKeyName covers the refusal when a
+// rule names a key that is not in the keyset.
+func TestParseRedactFlags_HMACUnknownKeyName(t *testing.T) {
+	ks := testKeyset(t, "k1", []byte("secret"))
+	_, err := parseRedactFlags(
+		[]string{"users.email=hash:hmac-sha256:nope"},
+		ks,
+		"",
+		nil,
+	)
+	if err == nil {
+		t.Fatal("expected error; got nil")
 	}
-	for _, c := range cases {
-		c := c
-		t.Run(c.source, func(t *testing.T) {
-			_, err := parseRedactFlags(
-				[]string{"users.email=hash:hmac-sha256"},
-				c.source,
-				"",
-				nil,
-			)
-			if err == nil {
-				t.Fatal("expected error; got nil")
-			}
-			if c.wantSubstring != "" && !strings.Contains(err.Error(), c.wantSubstring) {
-				t.Errorf("error %q should contain %q", err.Error(), c.wantSubstring)
-			}
-		})
+	if !strings.Contains(err.Error(), "not in the keyset") {
+		t.Errorf("error %q should say the key is not in the keyset", err.Error())
+	}
+}
+
+// TestParseRedactFlags_HMACAmbiguousNoName covers ADR-0041
+// open-question #2: multiple keys, no default, no explicit key →
+// loud refusal.
+func TestParseRedactFlags_HMACAmbiguousNoName(t *testing.T) {
+	ks := &redact.Keyset{
+		Keys: map[string]redact.KeysetKey{
+			"a": {Name: "a", Active: 1, Generations: map[int]redact.KeysetGeneration{1: {Generation: 1, Bytes: []byte("a")}}},
+			"b": {Name: "b", Active: 1, Generations: map[int]redact.KeysetGeneration{1: {Generation: 1, Bytes: []byte("b")}}},
+		},
+		Source: "test",
+	}
+	_, err := parseRedactFlags([]string{"users.email=hash:hmac-sha256"}, ks, "", nil)
+	if err == nil {
+		t.Fatal("expected ambiguity refusal; got nil")
+	}
+	if !strings.Contains(err.Error(), "no 'default'") {
+		t.Errorf("error %q should mention the missing default", err.Error())
 	}
 }
 
@@ -344,7 +341,7 @@ func TestMergeYAMLRedactions_AllStrategies(t *testing.T) {
 		{Table: "public.users.ssn", Strategy: "static", Value: "REDACTED"},
 		{Table: "users.middle_name", Strategy: "null"},
 	}
-	reg, err := mergeYAMLRedactions(nil, entries, "", "", nil)
+	reg, err := mergeYAMLRedactions(nil, entries, nil, "", nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -370,14 +367,14 @@ func TestMergeYAMLRedactions_AllStrategies(t *testing.T) {
 // TestMergeYAMLRedactions_AppendsToCLIRegistry covers the
 // "YAML extends CLI" semantics: the merged Registry has both sets.
 func TestMergeYAMLRedactions_AppendsToCLIRegistry(t *testing.T) {
-	cli, err := parseRedactFlags([]string{"users.email=hash:sha256"}, "", "", nil)
+	cli, err := parseRedactFlags([]string{"users.email=hash:sha256"}, nil, "", nil)
 	if err != nil {
 		t.Fatalf("CLI parse failed: %v", err)
 	}
 	yaml := []config.Redaction{
 		{Table: "users.phone", Strategy: "truncate", Length: 4},
 	}
-	reg, err := mergeYAMLRedactions(cli, yaml, "", "", nil)
+	reg, err := mergeYAMLRedactions(cli, yaml, nil, "", nil)
 	if err != nil {
 		t.Fatalf("merge failed: %v", err)
 	}
@@ -409,7 +406,7 @@ func TestMergeYAMLRedactions_RefusalPaths(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			_, err := mergeYAMLRedactions(nil, []config.Redaction{c.entry}, "", "", nil)
+			_, err := mergeYAMLRedactions(nil, []config.Redaction{c.entry}, nil, "", nil)
 			if err == nil {
 				t.Fatal("expected error; got nil")
 			}
@@ -429,7 +426,7 @@ func TestParseRedactFlags_Mask(t *testing.T) {
 		"users.token=mask:outer:2,2",  // outer form
 		"users.code=mask:outer:1,1,#", // outer + custom char
 	}
-	reg, err := parseRedactFlags(values, "", "", nil)
+	reg, err := parseRedactFlags(values, nil, "", nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -492,7 +489,7 @@ func TestParseRedactFlags_MaskRefusalPaths(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			_, err := parseRedactFlags([]string{c.raw}, "", "", nil)
+			_, err := parseRedactFlags([]string{c.raw}, nil, "", nil)
 			if err == nil {
 				t.Fatal("expected error; got nil")
 			}
@@ -510,7 +507,7 @@ func TestMergeYAMLRedactions_Mask(t *testing.T) {
 		{Table: "users.ssn", Strategy: "mask", Form: "inner", M1: 0, M2: 4, Char: "*"},
 		{Table: "users.token", Strategy: "mask", Form: "outer", M1: 2, M2: 2},
 	}
-	reg, err := mergeYAMLRedactions(nil, entries, "", "", nil)
+	reg, err := mergeYAMLRedactions(nil, entries, nil, "", nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -552,7 +549,7 @@ func TestMergeYAMLRedactions_MaskRefusalPaths(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			_, err := mergeYAMLRedactions(nil, []config.Redaction{c.entry}, "", "", nil)
+			_, err := mergeYAMLRedactions(nil, []config.Redaction{c.entry}, nil, "", nil)
 			if err == nil {
 				t.Fatal("expected error; got nil")
 			}
@@ -572,7 +569,7 @@ func TestParseRedactFlags_MaskPresets(t *testing.T) {
 		"users.test_pan=mask:pan-relaxed",
 		"users.email=mask:email",
 	}
-	reg, err := parseRedactFlags(values, "", "", nil)
+	reg, err := parseRedactFlags(values, nil, "", nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -620,7 +617,7 @@ func TestParseRedactFlags_MaskPresetsSecondWave(t *testing.T) {
 		"users.iban=mask:iban",
 		"users.id=mask:uuid",
 	}
-	reg, err := parseRedactFlags(values, "", "", nil)
+	reg, err := parseRedactFlags(values, nil, "", nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -671,7 +668,7 @@ func TestMergeYAMLRedactions_MaskPresetsSecondWave(t *testing.T) {
 		{Table: "users.iban", Strategy: "mask", Form: "iban"},
 		{Table: "users.id", Strategy: "mask", Form: "uuid"},
 	}
-	reg, err := mergeYAMLRedactions(nil, entries, "", "", nil)
+	reg, err := mergeYAMLRedactions(nil, entries, nil, "", nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -703,7 +700,7 @@ func TestParseRedactFlags_MaskPresetRefusalPaths(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			_, err := parseRedactFlags([]string{c.raw}, "", "", nil)
+			_, err := parseRedactFlags([]string{c.raw}, nil, "", nil)
 			if err == nil {
 				t.Fatal("expected error; got nil")
 			}
@@ -723,7 +720,7 @@ func TestMergeYAMLRedactions_MaskPresets(t *testing.T) {
 		{Table: "users.test_pan", Strategy: "mask", Form: "pan-relaxed"},
 		{Table: "users.email", Strategy: "mask", Form: "email"},
 	}
-	reg, err := mergeYAMLRedactions(nil, entries, "", "", nil)
+	reg, err := mergeYAMLRedactions(nil, entries, nil, "", nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -756,7 +753,7 @@ func TestMergeYAMLRedactions_MaskPresetRefusalPaths(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			_, err := mergeYAMLRedactions(nil, []config.Redaction{c.entry}, "", "", nil)
+			_, err := mergeYAMLRedactions(nil, []config.Redaction{c.entry}, nil, "", nil)
 			if err == nil {
 				t.Fatal("expected error; got nil")
 			}
@@ -767,14 +764,16 @@ func TestMergeYAMLRedactions_MaskPresetRefusalPaths(t *testing.T) {
 	}
 }
 
-// TestMergeYAMLRedactions_HMACWithKeySource covers the YAML form
-// of hmac-sha256 + key-source resolution.
-func TestMergeYAMLRedactions_HMACWithKeySource(t *testing.T) {
-	t.Setenv("TEST_YAML_HMAC_KEY", "yaml-hmac-key")
+// TestMergeYAMLRedactions_HMACWithKeyset covers the YAML form of
+// hmac-sha256 resolving its key from the operator keyset, including
+// the YAML `key:` field naming a specific key (PII Phase 4).
+func TestMergeYAMLRedactions_HMACWithKeyset(t *testing.T) {
+	secret := []byte("yaml-keyset-secret")
+	ks := testKeyset(t, "customer_pii", secret)
 	entries := []config.Redaction{
-		{Table: "users.email", Strategy: "hash", Algo: "hmac-sha256"},
+		{Table: "users.email", Strategy: "hash", Algo: "hmac-sha256", Key: "customer_pii"},
 	}
-	reg, err := mergeYAMLRedactions(nil, entries, "env:TEST_YAML_HMAC_KEY", "", nil)
+	reg, err := mergeYAMLRedactions(nil, entries, ks, "", nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -783,7 +782,7 @@ func TestMergeYAMLRedactions_HMACWithKeySource(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Redact failed: %v", err)
 	}
-	m := hmac.New(sha256.New, []byte("yaml-hmac-key"))
+	m := hmac.New(sha256.New, secret)
 	m.Write([]byte("alice@example.com"))
 	want := hex.EncodeToString(m.Sum(nil))
 	if got != want {
@@ -807,7 +806,7 @@ func TestParseRedactFlags_Randomize(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			reg, err := parseRedactFlags([]string{c.raw}, "", "", nil)
+			reg, err := parseRedactFlags([]string{c.raw}, nil, "", nil)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -843,7 +842,7 @@ func TestParseRedactFlags_RandomizeRefusalPaths(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			_, err := parseRedactFlags([]string{c.raw}, "", "", nil)
+			_, err := parseRedactFlags([]string{c.raw}, nil, "", nil)
 			if err == nil {
 				t.Fatal("expected error; got nil")
 			}
@@ -886,7 +885,7 @@ func TestMergeYAMLRedactions_Randomize(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			reg, err := mergeYAMLRedactions(nil, []config.Redaction{c.entry}, "", "", nil)
+			reg, err := mergeYAMLRedactions(nil, []config.Redaction{c.entry}, nil, "", nil)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -924,7 +923,7 @@ func TestParseRedactFlags_RandomizeSecondWave(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			reg, err := parseRedactFlags([]string{c.raw}, "", "", nil)
+			reg, err := parseRedactFlags([]string{c.raw}, nil, "", nil)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -957,7 +956,7 @@ func TestParseRedactFlags_RandomizeSecondWaveRefusals(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			_, err := parseRedactFlags([]string{c.raw}, "", "", nil)
+			_, err := parseRedactFlags([]string{c.raw}, nil, "", nil)
 			if err == nil {
 				t.Fatal("expected error; got nil")
 			}
@@ -1015,7 +1014,7 @@ func TestMergeYAMLRedactions_RandomizeSecondWave(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			reg, err := mergeYAMLRedactions(nil, []config.Redaction{c.entry}, "", "", nil)
+			reg, err := mergeYAMLRedactions(nil, []config.Redaction{c.entry}, nil, "", nil)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -1103,7 +1102,7 @@ func TestMergeYAMLRedactions_RandomizeSecondWaveRefusals(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			_, err := mergeYAMLRedactions(nil, []config.Redaction{c.entry}, "", "", nil)
+			_, err := mergeYAMLRedactions(nil, []config.Redaction{c.entry}, nil, "", nil)
 			if err == nil {
 				t.Fatal("expected error; got nil")
 			}
@@ -1152,7 +1151,7 @@ func TestMergeYAMLRedactions_RandomizeRefusalPaths(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			_, err := mergeYAMLRedactions(nil, []config.Redaction{c.entry}, "", "", nil)
+			_, err := mergeYAMLRedactions(nil, []config.Redaction{c.entry}, nil, "", nil)
 			if err == nil {
 				t.Fatal("expected error; got nil")
 			}
@@ -1177,10 +1176,11 @@ func TestParseRedactFlags_TokenizeDict(t *testing.T) {
 		{"randomize:dict", "u.name=randomize:dict:first_names", "randomize:dict:first_names"},
 		{"tokenize:dict different dict", "u.city=tokenize:dict:cities", "tokenize:dict:cities"},
 	}
+	ks := testKeyset(t, "k1", []byte("tokenize-secret"))
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			reg, err := parseRedactFlags([]string{c.raw}, "", "stream-x", dicts)
+			reg, err := parseRedactFlags([]string{c.raw}, ks, "stream-x", dicts)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -1216,7 +1216,7 @@ func TestParseRedactFlags_TokenizeDictRefusals(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			_, err := parseRedactFlags([]string{c.raw}, "", "", c.dicts)
+			_, err := parseRedactFlags([]string{c.raw}, nil, "", c.dicts)
 			if err == nil {
 				t.Fatal("expected error; got nil")
 			}
@@ -1235,11 +1235,12 @@ func TestParseRedactFlags_TokenizeDictStreamIDThreaded(t *testing.T) {
 	dicts := map[string][]string{
 		"names": {"A", "B", "C", "D", "E", "F", "G", "H", "I", "J"},
 	}
-	regA, err := parseRedactFlags([]string{"u.n=tokenize:dict:names"}, "", "stream-A", dicts)
+	ks := testKeyset(t, "k1", []byte("shared-secret"))
+	regA, err := parseRedactFlags([]string{"u.n=tokenize:dict:names"}, ks, "stream-A", dicts)
 	if err != nil {
 		t.Fatalf("regA: %v", err)
 	}
-	regB, err := parseRedactFlags([]string{"u.n=tokenize:dict:names"}, "", "stream-B", dicts)
+	regB, err := parseRedactFlags([]string{"u.n=tokenize:dict:names"}, ks, "stream-B", dicts)
 	if err != nil {
 		t.Fatalf("regB: %v", err)
 	}
@@ -1285,10 +1286,11 @@ func TestMergeYAMLRedactions_TokenizeDict(t *testing.T) {
 			wantName: "randomize:dict:first_names",
 		},
 	}
+	ks := testKeyset(t, "k1", []byte("yaml-tokenize-secret"))
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			reg, err := mergeYAMLRedactions(nil, []config.Redaction{c.entry}, "", "stream-x", dicts)
+			reg, err := mergeYAMLRedactions(nil, []config.Redaction{c.entry}, ks, "stream-x", dicts)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -1376,7 +1378,7 @@ func TestMergeYAMLRedactions_TokenizeDictRefusals(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			_, err := mergeYAMLRedactions(nil, []config.Redaction{c.entry}, "", "", dicts)
+			_, err := mergeYAMLRedactions(nil, []config.Redaction{c.entry}, nil, "", dicts)
 			if err == nil {
 				t.Fatal("expected error; got nil")
 			}
@@ -1398,7 +1400,8 @@ func TestLoadDictionariesAndParse_EndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadDictionaries: %v", err)
 	}
-	reg, err := parseRedactFlags([]string{"u.name=tokenize:dict:first_names"}, "", "stream", loaded)
+	ks := testKeyset(t, "k1", []byte("e2e-secret"))
+	reg, err := parseRedactFlags([]string{"u.name=tokenize:dict:first_names"}, ks, "stream", loaded)
 	if err != nil {
 		t.Fatalf("parseRedactFlags: %v", err)
 	}

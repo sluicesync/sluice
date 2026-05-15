@@ -2,7 +2,23 @@
 
 ## Status
 
-**Draft**, not yet accepted. No code shipped. Captures the design problem and recommended path so a future implementation session has a clear starting point.
+**Accepted (2026-05-15).** Implemented in PII Phase 4 (v0.62.0 line). The keyset type + loader, `--keyset-source` flag (file/env/db schemes), strategy integration, `sluice_keysets` DDL on PG + MySQL, preflight refusal, and audit-log line have shipped. Two design decisions made at implementation time **override the original proposal text below where they conflict** — see "Decisions / deviations from original proposal".
+
+### Decisions / deviations from original proposal
+
+**D1 — Startup-snapshot only, NO hot-reload.** The keyset is resolved ONCE at process startup and is immutable for the run. Sluice does NOT watch the keyset file for atomic-rename updates and does NOT poll the `db:` table. Rotation takes effect on the **next process restart only**. Rationale: a mid-run active-key change would give some rows gen-N and others gen-N+1 surrogates within the same run, breaking within-run referential integrity for `hash`/`tokenize`. Startup-snapshot keeps each run internally consistent, removes the fsnotify dependency, and removes any poll goroutine. This supersedes the original proposal's `file:` "watches for atomic-rename updates", the `db:` "next keyset-watch poll (~30s)", and rotation-flow step 3. Live-watch is explicitly deferred to a future **Phase 4.5**.
+
+**D2 — Clean break, NO backward-compatibility shim.** Sluice is pre-users (zero-users → no-compat tenet), so Phase 4 is a clean break, not an additive layer. Concretely:
+
+- The Phase 1 `--redact-key-source` flag (and its `RedactKeySource` config field / `SLUICE_REDACT_KEY_SOURCE` env mapping / `resolveHMACKey` / `deriveHMACKey` derivation) was **deleted**. `--keyset-source` is the only key path. This supersedes the original proposal's "For backward compatibility, `--redact-key-source=env:VAR` and `--redact-key-source=file:PATH` continue to work as a single-key shim".
+- The hardcoded `tokenizeDictHMACKey = []byte("sluice-tokenize-dict-v1")` constant was **deleted**. There is **no synthetic `sluice-tokenize-dict-v1` keyset entry** and **no zero-surrogate-drift commitment**. This supersedes open-question #3's recommendation and the "Compatibility commitment" section: operators upgrading from v0.61.0 WILL see `tokenize:dict` surrogate drift unless they pin the same key material via an explicit keyset.
+- **Consequence (implemented as a loud preflight refusal):** any redaction rule using `hash:hmac-sha256` OR `tokenize:dict` REQUIRES `--keyset-source`. If a rule needs a key and none is resolvable, sluice refuses at preflight with an actionable message (e.g. `tokenize:dict on users.email requires --keyset-source; the built-in v0.61.0 key was removed in PII Phase 4 (ADR-0041)`). The CLI/YAML parsers refuse at strategy-construction time; the pipeline preflight (`internal/pipeline/redact_preflight.go`) re-asserts it as defense-in-depth.
+
+Other implementation notes: the keyset YAML shape uses a per-key `name` + `generations` list (each generation carries `bytes`/`created_at`) and an optional top-level `default`, rather than the original single-key sketch — this is what makes per-key independent rotation + the `key:` reference work. The `db:` scheme classifies the DSN to an engine (postgres:// → Postgres, else MySQL) and reads `sluice_keysets` via an engine-registered store opener so the `redact` package never imports an engine package (IR-first tenet). Out of v1 scope (unchanged from below): `sluice keyset rotate`/`list` CLI, KMS/Vault adapters, encryption-at-rest of `bytes`, keyset-integrating `randomize:*`.
+
+---
+
+*Original draft proposal follows (retained for context; D1 + D2 above take precedence on conflict).*
 
 ## Context
 

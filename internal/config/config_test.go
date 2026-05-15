@@ -89,7 +89,7 @@ redactions:
     value: REDACTED
   - table: users.middle_name
     strategy: "null"
-redact_key_source: env:REDACT_KEY
+keyset_source: file:/etc/sluice/keyset.yaml
 `
 	dir := t.TempDir()
 	path := filepath.Join(dir, "sluice.yaml")
@@ -105,8 +105,8 @@ redact_key_source: env:REDACT_KEY
 	if len(c.Redactions) != 4 {
 		t.Fatalf("got %d redactions; want 4", len(c.Redactions))
 	}
-	if c.RedactKeySource != "env:REDACT_KEY" {
-		t.Errorf("RedactKeySource = %q; want %q", c.RedactKeySource, "env:REDACT_KEY")
+	if c.KeysetSource != "file:/etc/sluice/keyset.yaml" {
+		t.Errorf("KeysetSource = %q; want %q", c.KeysetSource, "file:/etc/sluice/keyset.yaml")
 	}
 
 	cases := []struct {

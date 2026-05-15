@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"os"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -31,31 +30,33 @@ import (
 //   - `null`                 — replace with NULL (column must be NULLABLE)
 //   - `static:<value>`       — replace with literal constant
 //   - `hash:sha256`          — SHA-256 hex (stateless, deterministic)
-//   - `hash:hmac-sha256`     — HMAC-SHA256 hex (requires --redact-key-source)
+//   - `hash:hmac-sha256`     — HMAC-SHA256 hex (requires --keyset-source)
 //   - `truncate:<n>`         — keep first N runes (string columns only)
 //
-// keySource controls the HMAC keyset for `hash:hmac-sha256`. Supported
-// forms (Phase 1):
-//
-//   - `env:VAR`              — read key from environment variable VAR
-//   - `file:PATH`            — read key from file at PATH (one line, trimmed)
-//   - `derive:<salt>`        — derive key from streamID + salt (default)
+// keyset is the operator keyset resolved ONCE at startup from
+// `--keyset-source` (PII Phase 4, ADR-0041; startup-snapshot only,
+// decision D1). May be nil when no --keyset-source was supplied;
+// rules that need a key (`hash:hmac-sha256`, `tokenize:dict`) then
+// refuse loudly at preflight (decision D2 — clean break, no Phase 1
+// shim). For CLI rules the optional `key:` name is the trailing
+// `:<keyname>` segment of the spec (`hash:hmac-sha256:<keyname>`,
+// `tokenize:dict:<dict>:<keyname>`); omitting it uses the keyset's
+// default / sole entry.
 //
 // Returns an error on any malformed value (unknown strategy, bad
-// option, missing key-source for HMAC, etc.) so misconfiguration
-// fails loudly at startup before any data moves.
+// option, missing keyset for HMAC, etc.) so misconfiguration fails
+// loudly at startup before any data moves.
 //
-// streamID is required only when keySource starts with `derive:`;
-// pass an empty string in contexts (like `sluice migrate`) where a
-// stream-id isn't applicable, in which case the salt alone keys the
-// HMAC.
+// streamID is mixed into `tokenize:dict`'s HMAC message; pass an
+// empty string in contexts (like `sluice migrate`) where a
+// stream-id isn't applicable.
 //
 // dictionaries is the pre-resolved dictionary map (name → entries)
 // from [redact.LoadDictionaries]. Pass nil when no dictionaries are
 // declared. Any rule referencing `tokenize:dict:<name>` or
 // `randomize:dict:<name>` against a missing dictionary name is
 // refused loudly. PII Phase 3 (v0.61.0+).
-func parseRedactFlags(values []string, keySource, streamID string, dictionaries map[string][]string) (*redact.Registry, error) {
+func parseRedactFlags(values []string, keyset *redact.Keyset, streamID string, dictionaries map[string][]string) (*redact.Registry, error) {
 	if len(values) == 0 {
 		return nil, nil
 	}
@@ -65,7 +66,7 @@ func parseRedactFlags(values []string, keySource, streamID string, dictionaries 
 		if err != nil {
 			return nil, fmt.Errorf("--redact %q: %w", raw, err)
 		}
-		strategy, err := strategyFromSpec(strategySpec, keySource, streamID, dictionaries)
+		strategy, err := strategyFromSpec(strategySpec, keyset, streamID, dictionaries)
 		if err != nil {
 			return nil, fmt.Errorf("--redact %q: %w", raw, err)
 		}
@@ -80,14 +81,17 @@ func parseRedactFlags(values []string, keySource, streamID string, dictionaries 
 // same column are silently overwritten — operators wanting YAML to
 // be authoritative should not pass conflicting CLI flags.
 //
-// keySource and streamID are the effective values (CLI flag
-// override of YAML). Returns the (potentially-augmented) Registry
-// or an error if any YAML entry is malformed.
+// keyset is the startup-resolved operator keyset (ADR-0041); a
+// YAML entry's optional `key:` field names which keyset key the
+// hash/tokenize rule uses (omitting it uses the keyset default /
+// sole entry). streamID is mixed into tokenize:dict's HMAC. Returns
+// the (potentially-augmented) Registry or an error if any YAML
+// entry is malformed.
 //
 // dictionaries is the pre-resolved dictionary map (name → entries)
 // from [redact.LoadDictionaries]. Any YAML entry referencing a
 // missing dictionary name is refused loudly. PII Phase 3 (v0.61.0+).
-func mergeYAMLRedactions(reg *redact.Registry, entries []config.Redaction, keySource, streamID string, dictionaries map[string][]string) (*redact.Registry, error) {
+func mergeYAMLRedactions(reg *redact.Registry, entries []config.Redaction, keyset *redact.Keyset, streamID string, dictionaries map[string][]string) (*redact.Registry, error) {
 	if len(entries) == 0 {
 		return reg, nil
 	}
@@ -95,7 +99,7 @@ func mergeYAMLRedactions(reg *redact.Registry, entries []config.Redaction, keySo
 		reg = redact.New()
 	}
 	for i, entry := range entries {
-		strategy, err := yamlStrategyToSluice(entry, keySource, streamID, dictionaries)
+		strategy, err := yamlStrategyToSluice(entry, keyset, streamID, dictionaries)
 		if err != nil {
 			return nil, fmt.Errorf("redactions[%d] (table=%q strategy=%q): %w", i, entry.Table, entry.Strategy, err)
 		}
@@ -109,7 +113,7 @@ func mergeYAMLRedactions(reg *redact.Registry, entries []config.Redaction, keySo
 }
 
 // yamlStrategyToSluice converts a config.Redaction to a redact.Strategy.
-func yamlStrategyToSluice(entry config.Redaction, keySource, streamID string, dictionaries map[string][]string) (redact.Strategy, error) {
+func yamlStrategyToSluice(entry config.Redaction, keyset *redact.Keyset, streamID string, dictionaries map[string][]string) (redact.Strategy, error) {
 	// Field-cross-checks: `dict:` is only valid on `tokenize` and on
 	// `randomize` + `form: dict`. Refusing spurious dict on other
 	// strategies catches operator typos early. The randomize check
@@ -128,9 +132,9 @@ func yamlStrategyToSluice(entry config.Redaction, keySource, streamID string, di
 		case "sha256":
 			return redact.Hash{Algo: "sha256"}, nil
 		case "hmac-sha256":
-			key, err := resolveHMACKey(keySource, streamID)
+			key, err := resolveKeysetKey(keyset, entry.Key, "hash:hmac-sha256")
 			if err != nil {
-				return nil, fmt.Errorf("strategy 'hash:hmac-sha256': %w", err)
+				return nil, err
 			}
 			return redact.Hash{Algo: "hmac-sha256", Key: key}, nil
 		case "":
@@ -148,7 +152,7 @@ func yamlStrategyToSluice(entry config.Redaction, keySource, streamID string, di
 	case "randomize":
 		return yamlRandomizeToSluice(entry, streamID, dictionaries)
 	case "tokenize":
-		return yamlTokenizeToSluice(entry, streamID, dictionaries)
+		return yamlTokenizeToSluice(entry, keyset, streamID, dictionaries)
 	case "":
 		return nil, errors.New("'strategy' field is required (null, static, hash, truncate, mask, randomize, tokenize)")
 	default:
@@ -170,7 +174,7 @@ func yamlStrategyToSluice(entry config.Redaction, keySource, streamID string, di
 // Refuses spurious min/max/brand/country_code (these belong to
 // randomize, not tokenize), missing `dict:` field, or a `dict:`
 // referencing a name not declared under top-level `dictionaries:`.
-func yamlTokenizeToSluice(entry config.Redaction, streamID string, dictionaries map[string][]string) (redact.Strategy, error) {
+func yamlTokenizeToSluice(entry config.Redaction, keyset *redact.Keyset, streamID string, dictionaries map[string][]string) (redact.Strategy, error) {
 	if entry.Min != 0 || entry.Max != 0 {
 		return nil, errors.New("strategy 'tokenize' takes no min/max; remove the fields")
 	}
@@ -195,7 +199,11 @@ func yamlTokenizeToSluice(entry config.Redaction, streamID string, dictionaries 
 	if err != nil {
 		return nil, err
 	}
-	return redact.TokenizeDict{DictName: entry.Dict, Entries: entries, StreamID: streamID}, nil
+	key, err := resolveKeysetKey(keyset, entry.Key, "tokenize:dict")
+	if err != nil {
+		return nil, err
+	}
+	return redact.TokenizeDict{DictName: entry.Dict, Entries: entries, StreamID: streamID, Key: key}, nil
 }
 
 // yamlRandomizeToSluice converts a `strategy: randomize` YAML entry
@@ -464,7 +472,7 @@ func splitRedactValue(raw string) (schema, table, column, strategySpec string, e
 // strategyFromSpec parses the strategy-spec portion of a --redact
 // value into a [redact.Strategy]. The supported spec forms are
 // listed in the parseRedactFlags doc-comment.
-func strategyFromSpec(spec, keySource, streamID string, dictionaries map[string][]string) (redact.Strategy, error) {
+func strategyFromSpec(spec string, keyset *redact.Keyset, streamID string, dictionaries map[string][]string) (redact.Strategy, error) {
 	name, opts, _ := strings.Cut(spec, ":")
 	name = strings.TrimSpace(name)
 	opts = strings.TrimSpace(opts)
@@ -479,13 +487,20 @@ func strategyFromSpec(spec, keySource, streamID string, dictionaries map[string]
 		// replaces with literal "foo". Either is acceptable.
 		return redact.Static{Value: opts}, nil
 	case "hash":
-		switch opts {
+		// `hash:hmac-sha256[:<keyname>]` — the optional trailing
+		// segment names a key in the operator keyset (ADR-0041);
+		// omitting it uses the keyset default / sole entry.
+		algo, keyName, _ := strings.Cut(opts, ":")
+		switch algo {
 		case "sha256":
+			if keyName != "" {
+				return nil, fmt.Errorf("strategy 'hash:sha256' takes no key name; got ':%s' (key names apply only to hmac-sha256)", keyName)
+			}
 			return redact.Hash{Algo: "sha256"}, nil
 		case "hmac-sha256":
-			key, err := resolveHMACKey(keySource, streamID)
+			key, err := resolveKeysetKey(keyset, keyName, "hash:hmac-sha256")
 			if err != nil {
-				return nil, fmt.Errorf("strategy 'hash:hmac-sha256': %w", err)
+				return nil, err
 			}
 			return redact.Hash{Algo: "hmac-sha256", Key: key}, nil
 		case "":
@@ -510,7 +525,7 @@ func strategyFromSpec(spec, keySource, streamID string, dictionaries map[string]
 	case "randomize":
 		return parseRandomizeStrategy(opts, dictionaries)
 	case "tokenize":
-		return parseTokenizeStrategy(opts, streamID, dictionaries)
+		return parseTokenizeStrategy(opts, keyset, streamID, dictionaries)
 	default:
 		return nil, fmt.Errorf("unknown strategy %q (supported: null, static:<v>, hash:sha256, hash:hmac-sha256, truncate:<n>, mask:inner:<m1>,<m2>[,<char>], mask:outer:<m1>,<m2>[,<char>], mask:<preset>, randomize:int:<min>,<max>, randomize:email, randomize:us-phone, randomize:uuid, randomize:ssn, randomize:pan[:<brand>], randomize:ca-sin, randomize:uk-nin, randomize:iban[:<country-code>], randomize:dict:<name>, tokenize:dict:<name>)", name)
 	}
@@ -527,13 +542,20 @@ func strategyFromSpec(spec, keySource, streamID string, dictionaries map[string]
 // declaring dictionary content. Operators using only CLI flags see
 // a clear refusal naming the missing dictionary.
 //
+// The CLI form is `tokenize:dict:<dict>[:<keyname>]` — the optional
+// trailing segment names a key in the operator keyset (ADR-0041);
+// omitting it uses the keyset default / sole entry. tokenize:dict
+// REQUIRES a resolvable keyset (the built-in v0.61.0 key was
+// removed in Phase 4 — decision D2).
+//
 // Refuses on:
 //
 //   - Empty opts (no form supplied)
 //   - Unknown form (today only "dict" is valid)
 //   - Empty / missing dictionary name after `dict:`
 //   - Dictionary name not declared in YAML
-func parseTokenizeStrategy(opts, streamID string, dictionaries map[string][]string) (redact.Strategy, error) {
+//   - No resolvable keyset key
+func parseTokenizeStrategy(opts string, keyset *redact.Keyset, streamID string, dictionaries map[string][]string) (redact.Strategy, error) {
 	if opts == "" {
 		return nil, errors.New("strategy 'tokenize' requires a form: 'tokenize:dict:<name>' (the dictionary must be declared in YAML under 'dictionaries:')")
 	}
@@ -543,11 +565,19 @@ func parseTokenizeStrategy(opts, streamID string, dictionaries map[string][]stri
 		if rest == "" {
 			return nil, errors.New("strategy 'tokenize:dict:': dictionary name is empty (use 'tokenize:dict:<name>' where <name> is declared in YAML under 'dictionaries:')")
 		}
-		entries, err := redact.ResolveDictEntries(dictionaries, rest)
+		dictName, keyName, _ := strings.Cut(rest, ":")
+		if dictName == "" {
+			return nil, errors.New("strategy 'tokenize:dict:': dictionary name is empty (use 'tokenize:dict:<name>' where <name> is declared in YAML under 'dictionaries:')")
+		}
+		entries, err := redact.ResolveDictEntries(dictionaries, dictName)
 		if err != nil {
 			return nil, err
 		}
-		return redact.TokenizeDict{DictName: rest, Entries: entries, StreamID: streamID}, nil
+		key, err := resolveKeysetKey(keyset, keyName, "tokenize:dict")
+		if err != nil {
+			return nil, err
+		}
+		return redact.TokenizeDict{DictName: dictName, Entries: entries, StreamID: streamID, Key: key}, nil
 	default:
 		return nil, fmt.Errorf("strategy 'tokenize:%s': unknown form (supported: dict:<name>)", opts)
 	}
@@ -775,64 +805,25 @@ func parseMaskPreset(name string) (redact.Strategy, error) {
 	}
 }
 
-// resolveHMACKey reads the HMAC keyset for `hash:hmac-sha256`
-// according to the operator's `--redact-key-source` value:
+// resolveKeysetKey resolves the HMAC secret for a keyset-using
+// strategy (`hash:hmac-sha256` / `tokenize:dict`) from the
+// startup-resolved operator keyset (PII Phase 4, ADR-0041; clean
+// break from Phase 1's --redact-key-source — decision D2).
 //
-//   - env:VAR        — value of environment variable VAR (trimmed)
-//   - file:PATH      — first line of PATH (trimmed)
-//   - derive:<salt>  — SHA-256(streamID + ":" + salt) bytes (Phase 1)
-//
-// streamID may be empty for contexts that don't have one
-// (`sluice migrate`); the derive form still works — the key derives
-// from just the salt.
-func resolveHMACKey(source, streamID string) ([]byte, error) {
-	source = strings.TrimSpace(source)
-	if source == "" {
-		return nil, errors.New("--redact-key-source must be set when any rule uses 'hash:hmac-sha256'")
+// keyName is the rule's optional `key:` name (empty → keyset
+// default / sole entry). strategyLabel names the rule for the loud
+// preflight refusal when no keyset was supplied: any rule using
+// hash:hmac-sha256 or tokenize:dict REQUIRES --keyset-source and
+// the built-in v0.61.0 key was removed.
+func resolveKeysetKey(keyset *redact.Keyset, keyName, strategyLabel string) ([]byte, error) {
+	if keyset == nil {
+		return nil, fmt.Errorf("strategy %q requires --keyset-source; the built-in v0.61.0 key was removed in PII Phase 4 (ADR-0041)", strategyLabel)
 	}
-	prefix, value, ok := strings.Cut(source, ":")
-	if !ok {
-		return nil, fmt.Errorf("--redact-key-source %q: expected 'env:VAR', 'file:PATH', or 'derive:<salt>'", source)
+	secret, _, _, err := keyset.ResolveKey(keyName)
+	if err != nil {
+		return nil, fmt.Errorf("strategy %q: %w", strategyLabel, err)
 	}
-	switch prefix {
-	case "env":
-		v := strings.TrimSpace(os.Getenv(value))
-		if v == "" {
-			return nil, fmt.Errorf("--redact-key-source env:%s: environment variable is empty", value)
-		}
-		return []byte(v), nil
-	case "file":
-		data, err := os.ReadFile(value)
-		if err != nil {
-			return nil, fmt.Errorf("--redact-key-source file:%s: %w", value, err)
-		}
-		// First line, trimmed. Multi-line files are operator error
-		// (key files should be a single secret).
-		first, _, _ := strings.Cut(string(data), "\n")
-		key := strings.TrimSpace(first)
-		if key == "" {
-			return nil, fmt.Errorf("--redact-key-source file:%s: file is empty", value)
-		}
-		return []byte(key), nil
-	case "derive":
-		// Phase 1 derive: simple concat-and-hash. Phase 4 will replace
-		// this with a proper keyset (ADR pending).
-		return deriveHMACKey(streamID, value), nil
-	default:
-		return nil, fmt.Errorf("--redact-key-source %q: unknown scheme %q (expected env, file, or derive)", source, prefix)
-	}
-}
-
-// deriveHMACKey is Phase 1's straightforward streamID+salt key
-// derivation. SHA-256 of "streamID:salt" gives 32 bytes which is
-// the standard HMAC-SHA256 key length. Phase 4 lands a proper
-// keyset story; until then, operators wanting stable surrogates
-// across multiple streams must use --redact-key-source env:VAR or
-// file:PATH and supply the same key everywhere.
-func deriveHMACKey(streamID, salt string) []byte {
-	mat := streamID + ":" + salt
-	sum := sha256SumImpl([]byte(mat))
-	return sum[:]
+	return secret, nil
 }
 
 // logRedactionConfig emits a single INFO line at command start
@@ -860,5 +851,31 @@ func logRedactionConfig(reg *redact.Registry, scope string) {
 		slog.String("scope", scope),
 		slog.Int("columns", len(rules)),
 		slog.Any("strategies", strategies),
+	)
+}
+
+// logKeysetLoaded emits the single ADR-0041 §"Audit log entry"
+// INFO line at startup: source scheme + per-key generation list +
+// active generation + hmac algo. Secret bytes are NEVER logged
+// (that would defeat redaction); the DSN form is already
+// credential-redacted by the loader. No-op when no keyset is
+// configured (the no-keyset-needed common path stays silent).
+//
+// Per-row surrogate audit is intentionally NOT logged (ADR-0041) —
+// the startup line is enough for the "which key was approved by
+// ticket #1234" compliance case.
+func logKeysetLoaded(keyset *redact.Keyset) {
+	if keyset == nil {
+		return
+	}
+	summary := keyset.AuditSummary()
+	keys := make([]string, 0, len(summary))
+	for _, e := range summary {
+		keys = append(keys, fmt.Sprintf("%s{generations=%v active=%d}", e.Name, e.Generations, e.Active))
+	}
+	slog.Info("sluice: keyset loaded",
+		slog.String("source", keyset.Source),
+		slog.Any("keys", keys),
+		slog.String("hmac-algo", "sha256"),
 	)
 }

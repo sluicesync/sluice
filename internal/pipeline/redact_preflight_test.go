@@ -200,4 +200,38 @@ func TestPreflightRedactTypes(t *testing.T) {
 			}
 		}
 	})
+
+	t.Run("hash:hmac-sha256 with no keyset key refuses (D2)", func(t *testing.T) {
+		r := redact.New()
+		r.Set("", "users", "email", redact.Hash{Algo: "hmac-sha256"}) // no Key
+		err := preflightRedactTypes(r, schemaWith("users", emailCol))
+		if err == nil {
+			t.Fatal("expected D2 keyset refusal; got nil")
+		}
+		if !errors.Is(err, errRedactKeysetMissing) {
+			t.Errorf("error should wrap errRedactKeysetMissing; got %v", err)
+		}
+		for _, want := range []string{"users.email", "hash:hmac-sha256", "--keyset-source", "ADR-0041"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error %q should contain %q", err.Error(), want)
+			}
+		}
+	})
+
+	t.Run("tokenize:dict with no keyset key refuses (D2)", func(t *testing.T) {
+		r := redact.New()
+		r.Set("", "users", "email", redact.TokenizeDict{DictName: "names", Entries: []string{"x"}})
+		err := preflightRedactTypes(r, schemaWith("users", emailCol))
+		if err == nil || !errors.Is(err, errRedactKeysetMissing) {
+			t.Fatalf("expected D2 keyset refusal wrapping errRedactKeysetMissing; got %v", err)
+		}
+	})
+
+	t.Run("hash:hmac-sha256 with key passes", func(t *testing.T) {
+		r := redact.New()
+		r.Set("", "users", "email", redact.Hash{Algo: "hmac-sha256", Key: []byte("k")})
+		if err := preflightRedactTypes(r, schemaWith("users", emailCol)); err != nil {
+			t.Errorf("keyed hmac: got %v; want nil", err)
+		}
+	})
 }

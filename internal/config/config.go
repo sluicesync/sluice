@@ -73,10 +73,14 @@ type Config struct {
 	// on the same column emit a WARN and last-write-wins.
 	Redactions []Redaction `koanf:"redactions"`
 
-	// RedactKeySource mirrors `--redact-key-source` (env:VAR |
-	// file:PATH | derive:<salt>). Only consulted when at least one
-	// Redactions entry uses `hash:hmac-sha256`.
-	RedactKeySource string `koanf:"redact_key_source"`
+	// KeysetSource mirrors `--keyset-source` (file:PATH | env:VAR |
+	// db:DSN). Resolved ONCE at startup into an immutable keyset
+	// snapshot (PII Phase 4, ADR-0041; startup-snapshot only — no
+	// hot-reload). Consulted when at least one Redactions entry uses
+	// `hash:hmac-sha256` or `tokenize:dict`; those strategies REQUIRE
+	// a resolvable keyset (the Phase 1 --redact-key-source flag and
+	// the built-in v0.61.0 tokenize key were removed — clean break).
+	KeysetSource string `koanf:"keyset_source"`
 
 	// Dictionaries is the YAML `dictionaries:` block (PII Phase 3,
 	// v0.61.0+). Each entry declares a named dictionary that
@@ -225,6 +229,17 @@ type Redaction struct {
 	// typo'd names are refused at load time. Ignored for other
 	// strategy / form combinations.
 	Dict string `koanf:"dict"`
+
+	// Key names which key in the operator keyset (resolved from
+	// --keyset-source / config keyset_source) this rule uses. PII
+	// Phase 4 (ADR-0041). Valid for Strategy == "hash" + Algo ==
+	// "hmac-sha256" and Strategy == "tokenize". Empty uses the
+	// keyset's declared `default` (or its sole entry when exactly
+	// one key exists); with multiple keys and no default, omitting
+	// Key is refused loudly. A named key pins to that key's active
+	// generation regardless of rotation (see ADR-0041 determinism
+	// contract). Ignored for other strategies.
+	Key string `koanf:"key"`
 }
 
 // Mapping is a single per-column override.

@@ -59,8 +59,8 @@ type SchemaPreviewCmd struct {
 
 	EnablePGExtension []string `help:"Enable passthrough for a Postgres extension type (repeatable). Same-engine PG → PG passthrough; hstore and citext additionally have built-in cross-engine translators on MySQL targets. Recognised: vector (pgvector), pg_trgm, hstore, citext. See ADR-0032." placeholder:"EXT"`
 
-	Redact          []string `help:"Annotate redacted columns in the preview DDL (repeatable). Format: '[schema.]table.column=STRATEGY[:options]'. Strategies match 'sluice migrate --redact' (null, static:<v>, hash:sha256, hash:hmac-sha256, truncate:<n>, mask:inner:<m1>,<m2>[,<char>], mask:outer:<m1>,<m2>[,<char>], mask:ssn, mask:pan, mask:pan-relaxed, mask:email, mask:ca-sin, mask:uk-nin, mask:iban, mask:uuid, randomize:int:<min>,<max>, randomize:email, randomize:us-phone, randomize:uuid, randomize:ssn, randomize:pan[:<brand>], randomize:ca-sin, randomize:uk-nin, randomize:iban[:<country-code>], randomize:dict:<name>, tokenize:dict:<name>). PII Phase 1.5 (v0.55.0+): operator can SEE what 'sluice migrate' / 'sync start' would redact before committing. Each redacted column's CREATE TABLE line gets a trailing '-- REDACTED via <strategy>' comment. The DDL itself is unchanged — preview only annotates." placeholder:"RULE" sep:"none"`
-	RedactKeySource string   `help:"Source for the HMAC keyset when --redact rules use 'hash:hmac-sha256'. Same forms as 'sluice migrate --redact-key-source'." placeholder:"SRC"`
+	Redact       []string `help:"Annotate redacted columns in the preview DDL (repeatable). Format: '[schema.]table.column=STRATEGY[:options]'. Strategies match 'sluice migrate --redact' (null, static:<v>, hash:sha256, hash:hmac-sha256[:<keyname>], truncate:<n>, mask:inner:<m1>,<m2>[,<char>], mask:outer:<m1>,<m2>[,<char>], mask:ssn, mask:pan, mask:pan-relaxed, mask:email, mask:ca-sin, mask:uk-nin, mask:iban, mask:uuid, randomize:int:<min>,<max>, randomize:email, randomize:us-phone, randomize:uuid, randomize:ssn, randomize:pan[:<brand>], randomize:ca-sin, randomize:uk-nin, randomize:iban[:<country-code>], randomize:dict:<name>, tokenize:dict:<name>[:<keyname>]). PII Phase 1.5 (v0.55.0+): operator can SEE what 'sluice migrate' / 'sync start' would redact before committing. Each redacted column's CREATE TABLE line gets a trailing '-- REDACTED via <strategy>' comment. The DDL itself is unchanged — preview only annotates." placeholder:"RULE" sep:"none"`
+	KeysetSource string   `help:"Operator keyset source (file:PATH | env:VARNAME | db:DSN) for keyset-using strategies (hash:hmac-sha256, tokenize:dict). PII Phase 4 (ADR-0041). Same forms as 'sluice migrate --keyset-source'." placeholder:"SRC"`
 }
 
 // Run implements `sluice schema preview`.
@@ -113,22 +113,27 @@ func (s *SchemaPreviewCmd) Run(g *Globals) error {
 	// no-op for the stdout path.
 	defer func() { _ = finalize(err) }()
 
-	keySource := s.RedactKeySource
-	if keySource == "" {
-		keySource = cfg.RedactKeySource
+	keysetSource := s.KeysetSource
+	if keysetSource == "" {
+		keysetSource = cfg.KeysetSource
+	}
+	keyset, err := redact.LoadKeyset(kongContext(), keysetSource)
+	if err != nil {
+		return err
 	}
 	dictionaries, err := redact.LoadDictionaries(cfg.Dictionaries)
 	if err != nil {
 		return err
 	}
-	redactor, err := parseRedactFlags(s.Redact, keySource, "", dictionaries)
+	redactor, err := parseRedactFlags(s.Redact, keyset, "", dictionaries)
 	if err != nil {
 		return err
 	}
-	redactor, err = mergeYAMLRedactions(redactor, cfg.Redactions, keySource, "", dictionaries)
+	redactor, err = mergeYAMLRedactions(redactor, cfg.Redactions, keyset, "", dictionaries)
 	if err != nil {
 		return fmt.Errorf("redactions (YAML): %w", err)
 	}
+	logKeysetLoaded(keyset)
 	prev := &pipeline.Previewer{
 		Source:              source,
 		Target:              target,

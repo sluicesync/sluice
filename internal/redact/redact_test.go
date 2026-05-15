@@ -203,8 +203,8 @@ func TestHash(t *testing.T) {
 		if err == nil {
 			t.Fatal("expected error for empty Key; got nil")
 		}
-		if !strings.Contains(err.Error(), "Key") || !strings.Contains(err.Error(), "key-source") {
-			t.Errorf("error should mention Key + --redact-key-source: %q", err.Error())
+		if !strings.Contains(err.Error(), "Key") || !strings.Contains(err.Error(), "keyset-source") {
+			t.Errorf("error should mention Key + --keyset-source: %q", err.Error())
 		}
 	})
 
