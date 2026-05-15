@@ -2,13 +2,17 @@
 
 ## Status
 
-**Accepted as a discovery doc** (2026-05-15). No code shipped and
-no implementation committed — acceptance scopes the problem space
-+ investigation paths so a future throughput-priority session has
-a clear starting point. Per the Recommendation below, Phase A
-(instrumentation) is deliberately deferred behind PII Phase 4
-(ADR-0041) and any other near-term roadmap items; it becomes a
-focused v0.63.0+ effort when throughput is next the priority.
+**Accepted as a discovery doc** (2026-05-15). **Phase A executed
+2026-05-15** (after PII Phase 4 / ADR-0041 shipped as v0.63.0, per
+the sequencing below) — see "Phase A findings". Phase A added
+DEBUG-gated per-chunk/per-batch wall-time instrumentation (no
+behaviour change) and produced decisive ground truth: H1 + H2
+falsified, H3/H5 confirmed as the primary MySQL-side hypotheses,
+and two new findings (N1: PG parallel-copy silently disabled on a
+freshly-loaded source due to stale `reltuples`; N2: PG → PG is
+not bulk-copy-bound on this fixture). The original "PG uses
+8-chunk parallel COPY" baseline framing is corrected. Phase B
+(pprof + fixture variant) and the N1 decision remain open.
 
 Recommendation #3 (re-run the medium baseline against v0.62.0 and
 record in `local-rig/baselines.md`) is **satisfied**: the v0.62.0
@@ -52,8 +56,14 @@ before implementing any fix.
   path). Per-row encoding cost is real but well-understood; rows
   flow through a streaming `pgx.Conn.CopyFrom` call.
 - **PG reader uses chunked parallel COPY-out** for tables above
-  the `--bulk-parallel-min-rows` threshold. The medium fixture's
-  log shows 8 chunks per table running concurrently.
+  the `--bulk-parallel-min-rows` threshold. ⚠️ **Corrected by
+  Phase A (finding N1): this did NOT hold on the medium fixture.**
+  PG's parallel-eligibility row estimate reads `pg_class.reltuples`,
+  which is ≈0 until `ANALYZE` runs, so a freshly-loaded source
+  silently took the single-reader path on every table. The
+  "8 chunks per table" annotation in `local-rig/baselines.md` was
+  inferred, not observed; the v0.62.0 PG baseline was single-reader.
+  See "Phase A findings" below.
 - **MySQL writer prefers LOAD DATA INFILE** when the server has
   `local_infile=ON`, falling back to batched INSERT VALUES
   otherwise. LOAD DATA is faster than INSERT by ~5-10× in
@@ -164,6 +174,78 @@ Pick the most likely hypothesis from Phase A's data and target it:
 
 If Phase B identified a clear win, implement + ship. If multiple
 small wins exist, bundle into a single release.
+
+## Phase A findings (2026-05-15 — executed)
+
+Phase A was executed end-to-end on the local-local rig (Win11 +
+Rancher Desktop, medium fixture: 25 tables × 100k rows = 2.5M
+total, both engines, default config, `--log-level=debug`).
+Instrumentation: per-chunk + per-batch wall-time DEBUG logging
+at the engine-neutral pipeline chunk path
+(`internal/pipeline/migrate_parallel.go::copyChunk`, log key
+`adr0042:`). Retained as a permanent diagnostic artifact gated
+behind `--log-level=debug` (same disposition as the ADR-0033/0036
+verify probes), so Phase B can re-run the same measurement.
+
+**Measured aggregates:**
+
+| Run | Wall | Rows | Path actually taken |
+|---|---|---|---|
+| MySQL → MySQL | 29.4s | 2.49M | 8-way parallel on all 25 tables |
+| PG → PG (fresh source) | 13.0s | 2.50M | **single-reader on all 25 tables** |
+| PG → PG (post-`ANALYZE` source) | 13.3s | 2.50M | 8-way parallel on all 25 tables |
+
+Per-chunk rate under *identical* 8-way parallelism: **MySQL
+~15.4–17.5k rows/sec/chunk vs PG ~30–34.5k** (~2× per-stream).
+
+**Hypothesis verdicts:**
+
+- **H1 (MySQL writer serializes per-table) — FALSIFIED.** All 8
+  chunk goroutines share an identical `t_start` and their
+  `[t_start, t_end]` intervals fully overlap (~96 ms spread on a
+  ~0.8 s table). No shared-mutex / single-connection serialization.
+- **H2 (per-chunk fixed overhead dominates) — FALSIFIED.**
+  `non_batch_wall` (rowcount kickoff + checkpoint writes) is only
+  6–13% of `chunk_wall`; per-batch cost scales with row count, not
+  a fixed ~50–100 ms per-call penalty.
+- **H3 (driver per-value protocol encoding) / H5 (JSON/TINYINT
+  column codec) — LIVE; now the primary hypotheses.** Under
+  identical orchestration, same host, same fixture shape, the gap
+  is entirely in the per-row read+write data path. This is the
+  Phase B pprof + fixture-variant target.
+- **H4 (local-rig artifact) — unlikely dominant.** Same host,
+  same Docker, same rig; PG is 2× faster per stream → the cost is
+  MySQL-protocol-specific, not a uniform host tax. A native-Linux
+  cross-check remains a Phase B nicety, not a blocker.
+
+**New findings (not in the original hypothesis list):**
+
+- **N1 — PG parallel-copy is gated on stale planner stats.** The
+  PG parallel-eligibility row estimate reads `pg_class.reltuples`
+  (≈0 until `ANALYZE`/autovacuum populates it). On a freshly
+  loaded/restored source — *exactly the migrate cold-start case* —
+  every PG table reports `~0 rows; below --bulk-parallel-min-rows`
+  and silently takes the single-reader path. MySQL's analogous
+  `information_schema.tables.table_rows` is also an estimate but
+  InnoDB populates it on load, so MySQL does not exhibit this. This
+  is an asymmetric, silent correctness/perf bug independent of the
+  throughput question, and it invalidates this ADR's original
+  "PG uses 8-chunk parallel COPY" baseline framing.
+- **N2 — PG total wall is insensitive to parallel-copy on this
+  fixture.** PG single-reader (13.0s) ≈ PG 8-way parallel (13.3s).
+  PG → PG is bound by the non-bulk-copy phases (schema read, DDL,
+  index/constraint creation per table), not copy throughput.
+  MySQL → MySQL *is* bulk-copy-bound (parallel 29.4s vs the
+  historical v0.61.0 single-reader 75s). The two engines have
+  different bottleneck profiles; the headline "2.3× gap" conflates
+  them.
+
+**Phase B is now precisely scoped:** pprof a single-table MySQL
+bulk copy, compare the go-sql-driver write hot path against pgx's
+`CopyFrom`; run the no-JSON / no-TINYINT fixture variant to
+isolate H5 from H3. N1 is a separate decision (fix the PG estimate
+vs. document the `ANALYZE`-first operator step) tracked outside
+the Phase B perf work.
 
 ## What's out of scope
 

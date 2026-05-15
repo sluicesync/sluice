@@ -53,6 +53,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"time"
 
 	"golang.org/x/sync/errgroup"
 
@@ -443,6 +444,27 @@ func copyChunk(
 	}
 	rowsCopied := chunk.RowsCopied
 
+	// ADR-0042 Phase A — per-chunk wall-time instrumentation. DEBUG
+	// level only; this is a permanent diagnostic artifact (same
+	// disposition as the ADR-0033/0036 verify probes), gated behind
+	// --log-level=debug so it never adds INFO+ noise for operators.
+	// Comparing chunkStart across peer chunks (near-simultaneous?) and
+	// whether [chunkStart,chunkEnd] intervals overlap answers H1
+	// (writer serialisation); per-batch wall vs batchCount answers H2
+	// (fixed per-batch overhead). The read+write are interleaved
+	// through the streaming channel, so batch wall is read+redact+
+	// write combined — that coupling is itself a Phase A finding.
+	chunkStart := time.Now()
+	var (
+		totalBatchWall time.Duration
+		batchN         int
+	)
+	slog.DebugContext(ctx, "adr0042: chunk start",
+		slog.String("table", table.Name),
+		slog.Int("chunk", chunkIndex),
+		slog.Int("batch_limit", limit),
+		slog.Time("t_start", chunkStart))
+
 	pt := newProgressTickerForChunk(ctx, progressInterval, table.Name, chunkIndex)
 	pt.rows.Store(rowsCopied)
 	// Kick off an async row-count for this chunk's portion of the
@@ -453,6 +475,7 @@ func copyChunk(
 	defer func() { pt.Stop(ctx, retErr) }()
 
 	for {
+		batchStart := time.Now() // ADR-0042 Phase A
 		batchCtx, cancel := context.WithCancel(ctx)
 		rowsCh, err := br.ReadRowsBatch(batchCtx, table, cursor, limit)
 		if err != nil {
@@ -475,6 +498,21 @@ func copyChunk(
 			return fmt.Errorf("redact chunk %d batch: %w", chunkIndex, err)
 		}
 		cancel()
+
+		// ADR-0042 Phase A — per-batch wall (read+redact+write
+		// interleaved through the streaming channel). The terminal
+		// batchCount==0 probe is logged too: its wall is pure
+		// per-batch roundtrip overhead with zero payload, a direct
+		// read on H2.
+		batchWall := time.Since(batchStart)
+		totalBatchWall += batchWall
+		batchN++
+		slog.DebugContext(ctx, "adr0042: batch done",
+			slog.String("table", table.Name),
+			slog.Int("chunk", chunkIndex),
+			slog.Int("batch", batchN),
+			slog.Int64("rows", batchCount),
+			slog.Duration("wall", batchWall))
 
 		if batchCount == 0 {
 			// End of chunk (either hit upper bound or end of table).
@@ -534,6 +572,33 @@ func copyChunk(
 			slog.Int("chunk", chunkIndex),
 			slog.String("err", err.Error()))
 	}
+
+	// ADR-0042 Phase A — per-chunk summary. chunkEnd vs peer chunks'
+	// [t_start,t_end] decides H1: overlapping intervals => true
+	// parallelism; chunk N starting only after N-1's t_end =>
+	// writer serialisation. rows_per_sec + batch_wall_share isolate
+	// H2: a high non-batch remainder (chunk_wall - batch_wall_total)
+	// points at fixed per-chunk overhead (rowcount kickoff,
+	// checkpoint writes); a flat low rows_per_sec with full
+	// batch_wall_share points at the read+write protocol path.
+	chunkEnd := time.Now()
+	chunkWall := chunkEnd.Sub(chunkStart)
+	var rowsPerSec float64
+	if s := chunkWall.Seconds(); s > 0 {
+		rowsPerSec = float64(rowsCopied) / s
+	}
+	slog.DebugContext(ctx, "adr0042: chunk done",
+		slog.String("table", table.Name),
+		slog.Int("chunk", chunkIndex),
+		slog.Int64("rows", rowsCopied),
+		slog.Int("batches", batchN),
+		slog.Time("t_start", chunkStart),
+		slog.Time("t_end", chunkEnd),
+		slog.Duration("chunk_wall", chunkWall),
+		slog.Duration("batch_wall_total", totalBatchWall),
+		slog.Duration("non_batch_wall", chunkWall-totalBatchWall),
+		slog.Float64("rows_per_sec", rowsPerSec))
+
 	return nil
 }
 
