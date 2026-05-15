@@ -600,12 +600,13 @@ func runBulkCopyForAddTable(
 	sw ir.SchemaWriter,
 	rw ir.RowWriter,
 	redactor *redact.Registry,
+	streamID string,
 ) error {
 	if err := sw.CreateTablesWithoutConstraints(ctx, schema); err != nil {
 		return wrapWithHint(PhaseSchemaApply, fmt.Errorf("pipeline: create tables: %w", err))
 	}
 	for _, table := range schema.Tables {
-		if err := copyTableIdempotent(ctx, rows, rw, table, redactor); err != nil {
+		if err := copyTableIdempotent(ctx, rows, rw, table, redactor, streamID); err != nil {
 			return wrapWithHint(PhaseBulkCopy, fmt.Errorf("pipeline: copy table %q: %w", table.Name, err))
 		}
 	}
@@ -633,7 +634,7 @@ func runBulkCopyForAddTable(
 // Goroutine-lifecycle handling mirrors [copyTable] exactly — same
 // child-ctx + defer-cancel shape so the row reader unwinds cleanly
 // on error.
-func copyTableIdempotent(ctx context.Context, rr ir.RowReader, rw ir.RowWriter, table *ir.Table, redactor *redact.Registry) (retErr error) {
+func copyTableIdempotent(ctx context.Context, rr ir.RowReader, rw ir.RowWriter, table *ir.Table, redactor *redact.Registry, streamID string) (retErr error) {
 	copyCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -648,7 +649,7 @@ func copyTableIdempotent(ctx context.Context, rr ir.RowReader, rw ir.RowWriter, 
 	teed := teeRows(copyCtx, rows, pt.observeRow)
 	// PII Phase 1: same wrap as [copyTable] — nil/empty Registry
 	// short-circuits to pass-through.
-	redacted, redactErrFn := redactRows(copyCtx, teed, redactor, table.Schema, table.Name, table.Columns)
+	redacted, redactErrFn := redactRows(copyCtx, teed, redactor, table.Schema, table.Name, table.Columns, tablePKColumns(table), streamID)
 	idem, ok := rw.(ir.IdempotentRowWriter)
 	if !ok {
 		slog.DebugContext(ctx, "add-table: row writer does not implement IdempotentRowWriter; falling back to plain WriteRows (the [publication-add, snapshot-open] overlap window may surface as a duplicate-key error under sustained load)",
@@ -931,7 +932,14 @@ func copyTable(ctx context.Context, rr ir.RowReader, rw ir.RowWriter, table *ir.
 	// PII Phase 1: wrap the row stream with redaction if the operator
 	// has configured rules. nil/empty Registry is a zero-cost
 	// passthrough — redactRows returns the teed channel verbatim.
-	redacted, redactErrFn := redactRows(copyCtx, teed, redactor, table.Schema, table.Name, table.Columns)
+	//
+	// streamID is empty for migrate runs (Migrator has no stream
+	// identity); randomize:* strategies produce stable-per-row outputs
+	// within a single migrate run because the seed is fully determined
+	// by table + column + PK values. PK-less tables refuse on a
+	// randomize:* rule via the strategy's own seed-required check;
+	// preflight catches the same case earlier with a richer message.
+	redacted, redactErrFn := redactRows(copyCtx, teed, redactor, table.Schema, table.Name, table.Columns, tablePKColumns(table), "")
 	if err := rw.WriteRows(copyCtx, table, redacted); err != nil {
 		return fmt.Errorf("write rows: %w", err)
 	}
@@ -1101,5 +1109,24 @@ func applyRedactor(target any, registry *redact.Registry) {
 	}
 	if setter, ok := target.(ir.RedactorSetter); ok {
 		setter.SetRedactor(registry)
+	}
+}
+
+// applyStreamID plumbs the streamer-side stream identifier to a
+// target [ir.ChangeApplier] that opts into [ir.StreamIDSetter]
+// (PII Phase 2.c, v0.59.0). The applier needs the stream-id to
+// derive replay-stable seeds for randomize:* strategies on CDC
+// events. Engines that don't implement the setter inherit the
+// empty-streamID behaviour (randomize:* still replay-stable per
+// (table, column, PK) tuple within the empty-streamID space).
+//
+// Empty streamID is a no-op; the setter is only invoked when the
+// streamer has a non-empty identifier to pass through.
+func applyStreamID(target any, streamID string) {
+	if streamID == "" {
+		return
+	}
+	if setter, ok := target.(ir.StreamIDSetter); ok {
+		setter.SetStreamID(streamID)
 	}
 }

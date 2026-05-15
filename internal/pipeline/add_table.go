@@ -503,7 +503,7 @@ func (a *AddTable) Run(ctx context.Context) error {
 	// Engines without [ir.IdempotentRowWriter] (none today; PG and
 	// MySQL both implement it) fall back to plain WriteRows with a
 	// debug log noting the fallback.
-	if err := runBulkCopyForAddTable(ctx, scoped, stream.Rows, sw, rw, a.Redactor); err != nil {
+	if err := runBulkCopyForAddTable(ctx, scoped, stream.Rows, sw, rw, a.Redactor, a.StreamID); err != nil {
 		return err
 	}
 

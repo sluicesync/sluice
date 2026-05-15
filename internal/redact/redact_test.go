@@ -46,7 +46,7 @@ func TestNull(t *testing.T) {
 	t.Run("nullable column: returns nil, nil for any input", func(t *testing.T) {
 		col := stringColumn("email", true)
 		for _, in := range []any{"alice@example.com", nil, []byte("raw"), 42} {
-			got, err := (Null{}).Redact(col, in)
+			got, err := (Null{}).Redact(col, in, nil)
 			if err != nil {
 				t.Errorf("input %v: unexpected error %v", in, err)
 			}
@@ -58,7 +58,7 @@ func TestNull(t *testing.T) {
 
 	t.Run("NOT NULL column: refuses with informative error", func(t *testing.T) {
 		col := stringColumn("ssn", false)
-		_, err := (Null{}).Redact(col, "111-22-3333")
+		_, err := (Null{}).Redact(col, "111-22-3333", nil)
 		if err == nil {
 			t.Fatal("expected refusal; got nil error")
 		}
@@ -77,7 +77,7 @@ func TestNull(t *testing.T) {
 		// Defensive: redactRow always passes a non-nil col in
 		// production. Tests can pass nil to exercise strategies in
 		// isolation; the strategy must not panic.
-		got, err := (Null{}).Redact(nil, "x")
+		got, err := (Null{}).Redact(nil, "x", nil)
 		if err != nil {
 			t.Errorf("nil col: unexpected error %v", err)
 		}
@@ -100,7 +100,7 @@ func TestStatic(t *testing.T) {
 		col := stringColumn("email", true)
 		s := Static{Value: "REDACTED"}
 		for _, in := range []any{"alice@example.com", nil, 42, []byte("raw")} {
-			got, err := s.Redact(col, in)
+			got, err := s.Redact(col, in, nil)
 			if err != nil {
 				t.Errorf("input %v: unexpected error %v", in, err)
 			}
@@ -111,7 +111,7 @@ func TestStatic(t *testing.T) {
 	})
 
 	t.Run("empty Value is fine (operator-explicit empty replacement)", func(t *testing.T) {
-		got, err := (Static{Value: ""}).Redact(stringColumn("x", true), "anything")
+		got, err := (Static{Value: ""}).Redact(stringColumn("x", true), "anything", nil)
 		if err != nil {
 			t.Errorf("unexpected error %v", err)
 		}
@@ -135,7 +135,7 @@ func TestHash(t *testing.T) {
 
 	t.Run("sha256: string input → hex digest", func(t *testing.T) {
 		col := stringColumn("email", true)
-		got, err := (Hash{Algo: "sha256"}).Redact(col, "alice@example.com")
+		got, err := (Hash{Algo: "sha256"}).Redact(col, "alice@example.com", nil)
 		if err != nil {
 			t.Fatalf("unexpected error %v", err)
 		}
@@ -155,7 +155,7 @@ func TestHash(t *testing.T) {
 
 	t.Run("sha256: []byte input → hex digest", func(t *testing.T) {
 		col := stringColumn("pii", true)
-		got, err := (Hash{Algo: "sha256"}).Redact(col, []byte("raw-bytes"))
+		got, err := (Hash{Algo: "sha256"}).Redact(col, []byte("raw-bytes"), nil)
 		if err != nil {
 			t.Fatalf("unexpected error %v", err)
 		}
@@ -166,7 +166,7 @@ func TestHash(t *testing.T) {
 	})
 
 	t.Run("sha256: nil input passes through", func(t *testing.T) {
-		got, err := (Hash{Algo: "sha256"}).Redact(stringColumn("email", true), nil)
+		got, err := (Hash{Algo: "sha256"}).Redact(stringColumn("email", true), nil, nil)
 		if err != nil {
 			t.Errorf("unexpected error %v", err)
 		}
@@ -178,15 +178,15 @@ func TestHash(t *testing.T) {
 	t.Run("sha256: deterministic across calls", func(t *testing.T) {
 		h := Hash{Algo: "sha256"}
 		col := stringColumn("email", true)
-		a, _ := h.Redact(col, "alice@example.com")
-		b, _ := h.Redact(col, "alice@example.com")
+		a, _ := h.Redact(col, "alice@example.com", nil)
+		b, _ := h.Redact(col, "alice@example.com", nil)
 		if a != b {
 			t.Errorf("not deterministic: %v != %v", a, b)
 		}
 	})
 
 	t.Run("sha256: unsupported type refuses with informative error", func(t *testing.T) {
-		_, err := (Hash{Algo: "sha256"}).Redact(intColumn("id", false), int64(42))
+		_, err := (Hash{Algo: "sha256"}).Redact(intColumn("id", false), int64(42), nil)
 		if err == nil {
 			t.Fatal("expected error for int input; got nil")
 		}
@@ -199,7 +199,7 @@ func TestHash(t *testing.T) {
 	})
 
 	t.Run("hmac-sha256: requires Key", func(t *testing.T) {
-		_, err := (Hash{Algo: "hmac-sha256", Key: nil}).Redact(stringColumn("email", true), "alice@example.com")
+		_, err := (Hash{Algo: "hmac-sha256", Key: nil}).Redact(stringColumn("email", true), "alice@example.com", nil)
 		if err == nil {
 			t.Fatal("expected error for empty Key; got nil")
 		}
@@ -210,7 +210,7 @@ func TestHash(t *testing.T) {
 
 	t.Run("hmac-sha256: keyed digest", func(t *testing.T) {
 		key := []byte("my-secret-key-32-bytes-or-more!!")
-		got, err := (Hash{Algo: "hmac-sha256", Key: key}).Redact(stringColumn("email", true), "alice@example.com")
+		got, err := (Hash{Algo: "hmac-sha256", Key: key}).Redact(stringColumn("email", true), "alice@example.com", nil)
 		if err != nil {
 			t.Fatalf("unexpected error %v", err)
 		}
@@ -225,15 +225,15 @@ func TestHash(t *testing.T) {
 	t.Run("hmac-sha256: different key → different digest (keying matters)", func(t *testing.T) {
 		k1 := []byte("key-one")
 		k2 := []byte("key-two")
-		a, _ := (Hash{Algo: "hmac-sha256", Key: k1}).Redact(stringColumn("email", true), "alice@example.com")
-		b, _ := (Hash{Algo: "hmac-sha256", Key: k2}).Redact(stringColumn("email", true), "alice@example.com")
+		a, _ := (Hash{Algo: "hmac-sha256", Key: k1}).Redact(stringColumn("email", true), "alice@example.com", nil)
+		b, _ := (Hash{Algo: "hmac-sha256", Key: k2}).Redact(stringColumn("email", true), "alice@example.com", nil)
 		if a == b {
 			t.Errorf("different keys should produce different digests; got identical %v", a)
 		}
 	})
 
 	t.Run("unknown algorithm refuses with informative error", func(t *testing.T) {
-		_, err := (Hash{Algo: "md5"}).Redact(stringColumn("email", true), "x")
+		_, err := (Hash{Algo: "md5"}).Redact(stringColumn("email", true), "x", nil)
 		if err == nil {
 			t.Fatal("expected error for unknown algorithm; got nil")
 		}
@@ -256,7 +256,7 @@ func TestTruncate(t *testing.T) {
 	})
 
 	t.Run("ASCII string: first N chars", func(t *testing.T) {
-		got, err := (Truncate{N: 4}).Redact(stringColumn("phone", true), "555-1234")
+		got, err := (Truncate{N: 4}).Redact(stringColumn("phone", true), "555-1234", nil)
 		if err != nil {
 			t.Fatalf("unexpected error %v", err)
 		}
@@ -266,7 +266,7 @@ func TestTruncate(t *testing.T) {
 	})
 
 	t.Run("shorter than N: returns verbatim", func(t *testing.T) {
-		got, err := (Truncate{N: 100}).Redact(stringColumn("phone", true), "555-1234")
+		got, err := (Truncate{N: 100}).Redact(stringColumn("phone", true), "555-1234", nil)
 		if err != nil {
 			t.Fatalf("unexpected error %v", err)
 		}
@@ -279,7 +279,7 @@ func TestTruncate(t *testing.T) {
 		// 'ñ' is 2 bytes in UTF-8. Truncate to 4 RUNES of "ñ@ex.com"
 		// must produce "ñ@ex" (4 runes), NOT "ñ@e" (which is what
 		// byte-truncating the leading 2-byte ñ to 4 would do).
-		got, err := (Truncate{N: 4}).Redact(stringColumn("email", true), "ñ@example.com")
+		got, err := (Truncate{N: 4}).Redact(stringColumn("email", true), "ñ@example.com", nil)
 		if err != nil {
 			t.Fatalf("unexpected error %v", err)
 		}
@@ -289,7 +289,7 @@ func TestTruncate(t *testing.T) {
 	})
 
 	t.Run("emoji: 1 rune is preserved as 1 emoji", func(t *testing.T) {
-		got, err := (Truncate{N: 1}).Redact(stringColumn("note", true), "🔒secret")
+		got, err := (Truncate{N: 1}).Redact(stringColumn("note", true), "🔒secret", nil)
 		if err != nil {
 			t.Fatalf("unexpected error %v", err)
 		}
@@ -299,7 +299,7 @@ func TestTruncate(t *testing.T) {
 	})
 
 	t.Run("nil input passes through", func(t *testing.T) {
-		got, err := (Truncate{N: 4}).Redact(stringColumn("phone", true), nil)
+		got, err := (Truncate{N: 4}).Redact(stringColumn("phone", true), nil, nil)
 		if err != nil {
 			t.Errorf("unexpected error %v", err)
 		}
@@ -309,7 +309,7 @@ func TestTruncate(t *testing.T) {
 	})
 
 	t.Run("non-string input refuses with informative error", func(t *testing.T) {
-		_, err := (Truncate{N: 4}).Redact(intColumn("age", false), int64(42))
+		_, err := (Truncate{N: 4}).Redact(intColumn("age", false), int64(42), nil)
 		if err == nil {
 			t.Fatal("expected error for int input; got nil")
 		}
@@ -319,14 +319,14 @@ func TestTruncate(t *testing.T) {
 	})
 
 	t.Run("N <= 0 produces empty string defensively", func(t *testing.T) {
-		got, err := (Truncate{N: 0}).Redact(stringColumn("note", true), "anything")
+		got, err := (Truncate{N: 0}).Redact(stringColumn("note", true), "anything", nil)
 		if err != nil {
 			t.Errorf("unexpected error %v", err)
 		}
 		if got != "" {
 			t.Errorf("got %v; want empty string", got)
 		}
-		got, err = (Truncate{N: -5}).Redact(stringColumn("note", true), "anything")
+		got, err = (Truncate{N: -5}).Redact(stringColumn("note", true), "anything", nil)
 		if err != nil {
 			t.Errorf("unexpected error %v", err)
 		}
@@ -490,7 +490,7 @@ func TestMask_Inner(t *testing.T) {
 
 	t.Run("PAN-style: keep first 4 + last 4", func(t *testing.T) {
 		got, err := (Mask{Form: MaskInner, M1: 4, M2: 4}).Redact(
-			stringColumn("pan", true), "4111111111111111")
+			stringColumn("pan", true), "4111111111111111", nil)
 		if err != nil {
 			t.Fatalf("unexpected error %v", err)
 		}
@@ -501,7 +501,7 @@ func TestMask_Inner(t *testing.T) {
 
 	t.Run("SSN-style: keep last 4 only (M1=0)", func(t *testing.T) {
 		got, _ := (Mask{Form: MaskInner, M1: 0, M2: 4}).Redact(
-			stringColumn("ssn", true), "123-45-6789")
+			stringColumn("ssn", true), "123-45-6789", nil)
 		if got != "XXXXXXX6789" {
 			t.Errorf("got %v; want %q", got, "XXXXXXX6789")
 		}
@@ -509,7 +509,7 @@ func TestMask_Inner(t *testing.T) {
 
 	t.Run("custom mask char", func(t *testing.T) {
 		got, _ := (Mask{Form: MaskInner, M1: 4, M2: 4, Char: "*"}).Redact(
-			stringColumn("pan", true), "4111111111111111")
+			stringColumn("pan", true), "4111111111111111", nil)
 		if got != "4111********1111" {
 			t.Errorf("got %v; want %q", got, "4111********1111")
 		}
@@ -517,7 +517,7 @@ func TestMask_Inner(t *testing.T) {
 
 	t.Run("M1+M2 >= length: input passes through", func(t *testing.T) {
 		got, _ := (Mask{Form: MaskInner, M1: 4, M2: 4}).Redact(
-			stringColumn("short", true), "12345")
+			stringColumn("short", true), "12345", nil)
 		if got != "12345" {
 			t.Errorf("got %v; want %q (unchanged when margins cover full length)", got, "12345")
 		}
@@ -527,7 +527,7 @@ func TestMask_Inner(t *testing.T) {
 		// "ñ@example.com" has 13 runes. M1=1, M2=4 keeps "ñ" and
 		// ".com", masks the 8 middle runes.
 		got, _ := (Mask{Form: MaskInner, M1: 1, M2: 4}).Redact(
-			stringColumn("email", true), "ñ@example.com")
+			stringColumn("email", true), "ñ@example.com", nil)
 		if got != "ñXXXXXXXX.com" {
 			t.Errorf("got %v; want %q (UTF-8 rune count)", got, "ñXXXXXXXX.com")
 		}
@@ -535,7 +535,7 @@ func TestMask_Inner(t *testing.T) {
 
 	t.Run("nil input passes through", func(t *testing.T) {
 		got, err := (Mask{Form: MaskInner, M1: 4, M2: 4}).Redact(
-			stringColumn("pan", true), nil)
+			stringColumn("pan", true), nil, nil)
 		if err != nil || got != nil {
 			t.Errorf("nil input: got %v err %v; want nil, nil", got, err)
 		}
@@ -543,7 +543,7 @@ func TestMask_Inner(t *testing.T) {
 
 	t.Run("non-string input refuses with informative error", func(t *testing.T) {
 		_, err := (Mask{Form: MaskInner, M1: 4, M2: 4}).Redact(
-			intColumn("age", false), int64(42))
+			intColumn("age", false), int64(42), nil)
 		if err == nil {
 			t.Fatal("expected error for int input")
 		}
@@ -554,7 +554,7 @@ func TestMask_Inner(t *testing.T) {
 
 	t.Run("negative margins treated as 0", func(t *testing.T) {
 		got, _ := (Mask{Form: MaskInner, M1: -1, M2: -1}).Redact(
-			stringColumn("pan", true), "ABCD")
+			stringColumn("pan", true), "ABCD", nil)
 		if got != "XXXX" {
 			t.Errorf("got %v; want %q (negatives → 0, whole string masked)", got, "XXXX")
 		}
@@ -572,7 +572,7 @@ func TestMask_Outer(t *testing.T) {
 
 	t.Run("Keep middle: mask first 2 + last 2", func(t *testing.T) {
 		got, _ := (Mask{Form: MaskOuter, M1: 2, M2: 2}).Redact(
-			stringColumn("code", true), "ABCDEFGH")
+			stringColumn("code", true), "ABCDEFGH", nil)
 		if got != "XXCDEFXX" {
 			t.Errorf("got %v; want %q", got, "XXCDEFXX")
 		}
@@ -580,7 +580,7 @@ func TestMask_Outer(t *testing.T) {
 
 	t.Run("M1+M2 >= length: whole value masked", func(t *testing.T) {
 		got, _ := (Mask{Form: MaskOuter, M1: 4, M2: 4}).Redact(
-			stringColumn("short", true), "1234")
+			stringColumn("short", true), "1234", nil)
 		if got != "XXXX" {
 			t.Errorf("got %v; want %q (margins cover full length → all masked)", got, "XXXX")
 		}
@@ -588,7 +588,7 @@ func TestMask_Outer(t *testing.T) {
 
 	t.Run("nil input passes through", func(t *testing.T) {
 		got, _ := (Mask{Form: MaskOuter, M1: 2, M2: 2}).Redact(
-			stringColumn("code", true), nil)
+			stringColumn("code", true), nil, nil)
 		if got != nil {
 			t.Errorf("nil input: got %v; want nil", got)
 		}

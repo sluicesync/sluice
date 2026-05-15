@@ -31,7 +31,7 @@ func TestRedactRow_NilRegistry(t *testing.T) {
 	row := ir.Row{"id": int64(1), "email": "alice@example.com"}
 	cols := []*ir.Column{col("id", false), col("email", false)}
 
-	if err := redactRow(nil, "public", "users", row, cols); err != nil {
+	if err := redactRow(nil, "public", "users", row, cols, nil, ""); err != nil {
 		t.Fatalf("nil registry: unexpected error %v", err)
 	}
 	if row["email"] != "alice@example.com" {
@@ -46,7 +46,7 @@ func TestRedactRow_EmptyRegistry(t *testing.T) {
 	cols := []*ir.Column{col("id", false), col("email", false)}
 
 	r := redact.New()
-	if err := redactRow(r, "public", "users", row, cols); err != nil {
+	if err := redactRow(r, "public", "users", row, cols, nil, ""); err != nil {
 		t.Fatalf("empty registry: unexpected error %v", err)
 	}
 	if row["email"] != "alice@example.com" {
@@ -68,7 +68,7 @@ func TestRedactRow_HashStrategy(t *testing.T) {
 	}
 	cols := []*ir.Column{col("id", false), col("email", true), col("name", true)}
 
-	if err := redactRow(r, "public", "users", row, cols); err != nil {
+	if err := redactRow(r, "public", "users", row, cols, nil, ""); err != nil {
 		t.Fatalf("unexpected error %v", err)
 	}
 
@@ -114,7 +114,7 @@ func TestRedactRow_MultipleStrategies(t *testing.T) {
 		col("name", true),
 	}
 
-	if err := redactRow(r, "public", "users", row, cols); err != nil {
+	if err := redactRow(r, "public", "users", row, cols, nil, ""); err != nil {
 		t.Fatalf("unexpected error %v", err)
 	}
 
@@ -148,7 +148,7 @@ func TestRedactRow_CaseInsensitiveLookup(t *testing.T) {
 	row := ir.Row{"email": "alice@example.com"}
 	cols := []*ir.Column{col("email", true)}
 
-	if err := redactRow(r, "public", "users", row, cols); err != nil {
+	if err := redactRow(r, "public", "users", row, cols, nil, ""); err != nil {
 		t.Fatalf("unexpected error %v", err)
 	}
 	if s, ok := row["email"].(string); !ok || len(s) != 64 {
@@ -168,7 +168,7 @@ func TestRedactRow_RefusalWrapped(t *testing.T) {
 	// ssn declared NOT NULL — Null strategy must refuse.
 	cols := []*ir.Column{col("ssn", false)}
 
-	err := redactRow(r, "public", "users", row, cols)
+	err := redactRow(r, "public", "users", row, cols, nil, "")
 	if err == nil {
 		t.Fatal("expected refusal error; got nil")
 	}
@@ -192,7 +192,7 @@ func TestRedactRow_ColumnsNotInRow(t *testing.T) {
 	row := ir.Row{"id": int64(1)}
 	cols := []*ir.Column{col("id", false), col("email", true)}
 
-	if err := redactRow(r, "public", "users", row, cols); err != nil {
+	if err := redactRow(r, "public", "users", row, cols, nil, ""); err != nil {
 		t.Fatalf("unexpected error %v", err)
 	}
 	// row["email"] was nil; Hash on nil passes through; final
@@ -212,7 +212,7 @@ func TestRedactRow_NoMatchingColumns(t *testing.T) {
 	row := ir.Row{"id": int64(1), "email": "alice@example.com"}
 	cols := []*ir.Column{col("id", false), col("email", true)}
 
-	if err := redactRow(r, "public", "users", row, cols); err != nil {
+	if err := redactRow(r, "public", "users", row, cols, nil, ""); err != nil {
 		t.Fatalf("unexpected error %v", err)
 	}
 	if got := row["email"]; got != "alice@example.com" {
@@ -230,7 +230,7 @@ func TestRedactRow_NilColumnInList(t *testing.T) {
 	row := ir.Row{"email": "alice@example.com"}
 	cols := []*ir.Column{nil, col("email", true), nil}
 
-	if err := redactRow(r, "public", "users", row, cols); err != nil {
+	if err := redactRow(r, "public", "users", row, cols, nil, ""); err != nil {
 		t.Fatalf("nil columns in list: unexpected error %v", err)
 	}
 	// email should still be hashed.
@@ -245,7 +245,7 @@ func TestRedactRow_NilColumnInList(t *testing.T) {
 func TestRedactRows_NilRegistryPassesThroughSrcVerbatim(t *testing.T) {
 	src := make(chan ir.Row, 1)
 	var srcRO <-chan ir.Row = src
-	out, errFn := redactRows(context.Background(), src, nil, "public", "users", nil)
+	out, errFn := redactRows(context.Background(), src, nil, "public", "users", nil, nil, "")
 	if out != srcRO {
 		t.Errorf("nil registry: returned channel is not the input src")
 	}
@@ -254,7 +254,7 @@ func TestRedactRows_NilRegistryPassesThroughSrcVerbatim(t *testing.T) {
 	}
 
 	r := redact.New()
-	out2, errFn2 := redactRows(context.Background(), src, r, "public", "users", nil)
+	out2, errFn2 := redactRows(context.Background(), src, r, "public", "users", nil, nil, "")
 	if out2 != srcRO {
 		t.Errorf("empty registry: returned channel is not the input src")
 	}
@@ -276,7 +276,7 @@ func TestRedactRows_AppliesRedactionsToEveryRow(t *testing.T) {
 	src <- ir.Row{"email": "c@x.com", "name": "Carol"}
 	close(src)
 
-	out, errFn := redactRows(context.Background(), src, r, "public", "users", cols)
+	out, errFn := redactRows(context.Background(), src, r, "public", "users", cols, nil, "")
 	var received []ir.Row
 	for row := range out {
 		received = append(received, row)
@@ -310,7 +310,7 @@ func TestRedactRows_StrategyErrorClosesChannelAndExposesErr(t *testing.T) {
 	src <- ir.Row{"ssn": "111-22-3333"}
 	close(src)
 
-	out, errFn := redactRows(context.Background(), src, r, "public", "users", cols)
+	out, errFn := redactRows(context.Background(), src, r, "public", "users", cols, nil, "")
 	var received []ir.Row
 	for row := range out {
 		received = append(received, row)
@@ -341,7 +341,7 @@ func TestRedactRows_CtxCancelExitsCleanly(t *testing.T) {
 
 	src := make(chan ir.Row) // unbuffered; sender never sends
 	ctx, cancel := context.WithCancel(context.Background())
-	out, errFn := redactRows(ctx, src, r, "public", "users", cols)
+	out, errFn := redactRows(ctx, src, r, "public", "users", cols, nil, "")
 	cancel()
 	// out should close shortly after cancel.
 	for range out {
@@ -359,4 +359,57 @@ func TestRedactRows_CtxCancelExitsCleanly(t *testing.T) {
 func TestRedactRows_HexUseAvoidsUnusedImport(_ *testing.T) {
 	_ = hex.EncodeToString([]byte{0})
 	_ = sha256.Sum256
+}
+
+// TestRedactRow_RandomizeWithPK pins the v0.59.0 plumbing: when a
+// randomize:* rule fires, pipeline.redactRow derives a seed from
+// the PK values + streamID and feeds it to the strategy.
+// Replay-stable: same PK value across two calls produces the same
+// randomized output.
+func TestRedactRow_RandomizeWithPK(t *testing.T) {
+	r := redact.New()
+	r.Set("public", "users", "age", redact.RandomizeInt{Min: 18, Max: 90})
+
+	cols := []*ir.Column{col("id", false), col("age", true)}
+	pk := []string{"id"}
+
+	row1 := ir.Row{"id": int64(7), "age": int64(35)}
+	if err := redactRow(r, "public", "users", row1, cols, pk, "stream-1"); err != nil {
+		t.Fatalf("unexpected error %v", err)
+	}
+	a := row1["age"].(int64)
+	if a < 18 || a > 90 {
+		t.Errorf("age %d outside [18, 90]", a)
+	}
+
+	// Same PK + streamID → same value.
+	row2 := ir.Row{"id": int64(7), "age": int64(99)}
+	if err := redactRow(r, "public", "users", row2, cols, pk, "stream-1"); err != nil {
+		t.Fatalf("unexpected error %v", err)
+	}
+	if row2["age"] != a {
+		t.Errorf("replay stability broken: %v != %v", row2["age"], a)
+	}
+}
+
+// TestRedactRow_RandomizeNoPKRefuses pins the strategy-level
+// refusal contract via redactRow: a randomize:* rule on a no-PK
+// table surfaces a clear error mentioning the strategy + column.
+// Preflight should normally catch this earlier; this is the
+// defense-in-depth check.
+func TestRedactRow_RandomizeNoPKRefuses(t *testing.T) {
+	r := redact.New()
+	r.Set("public", "events", "rng", redact.RandomizeInt{Min: 0, Max: 100})
+	cols := []*ir.Column{col("rng", true)}
+
+	row := ir.Row{"rng": int64(0)}
+	err := redactRow(r, "public", "events", row, cols, nil, "stream-1")
+	if err == nil {
+		t.Fatal("expected refusal for randomize on no-PK table")
+	}
+	for _, want := range []string{"public", "events", "rng", "randomize:int", "primary key"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q should mention %q", err.Error(), want)
+		}
+	}
 }

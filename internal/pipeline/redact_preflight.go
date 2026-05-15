@@ -39,10 +39,19 @@ import (
 // target-type preflight refusal. Wrapped with per-column detail.
 var errRedactTypeMismatch = errors.New("pipeline: redaction strategy incompatible with target column type")
 
+// errRedactRandomizeNoPK is the sentinel for the second-tier preflight
+// refusal added in v0.59.0: a randomize:* rule is registered against
+// a table whose source schema has no primary key. Replay-stable
+// randomization requires PK values for seed derivation, so the
+// rule must refuse at startup rather than later when the strategy
+// hits the no-PK case mid-row.
+var errRedactRandomizeNoPK = errors.New("pipeline: randomize:* strategy requires a primary key on the source table")
+
 // preflightRedactTypes inspects every redaction rule in the
 // registry against the (post-mappings) schema, refusing
 // combinations whose strategy output won't satisfy the target
-// column type's strict constraints. nil/empty registry is a
+// column type's strict constraints OR whose strategy can't run
+// at all (randomize:* on a no-PK table). nil/empty registry is a
 // zero-cost no-op.
 //
 // Called AFTER [translate.ApplyMappings] so the column types
@@ -51,50 +60,96 @@ var errRedactTypeMismatch = errors.New("pipeline: redaction strategy incompatibl
 // around the issue sees their column already re-typed away from
 // UUID and the rule passes.
 //
-// Currently checks:
+// Checks:
 //
 //   - `mask:uuid` on a column whose (post-mappings) type is still
 //     [ir.UUID]. Refuses with a clear message naming the column
 //     and pointing at the `--type-override=table.col=text`
-//     workaround.
+//     workaround (Bug 60 / v0.58.1).
+//   - `randomize:*` on a table whose source schema has no primary
+//     key. Refuses with a clear message naming the table and
+//     suggesting the operator either add a PK to the source or
+//     pick a non-random strategy (hash:sha256 / mask:* / static:)
+//     for that column (PII Phase 2.c / v0.59.0).
 //
 // Returns nil when every rule is compatible. Returns an error
-// listing every offending rule (one rule per column) when one or
-// more fail; operators see the full set in a single run instead
-// of fix-rerun-fix-rerun cycles.
+// listing every offending rule when one or more fail; operators
+// see the full set in a single run instead of fix-rerun-fix-rerun
+// cycles.
 func preflightRedactTypes(reg *redact.Registry, schema *ir.Schema) error {
 	if reg == nil || reg.Empty() || schema == nil {
 		return nil
 	}
-	var problems []string
+	var typeProblems []string
+	var randomizeProblems []string
 	for _, rule := range reg.Rules() {
-		// Only mask:uuid currently has a known type-shape conflict.
-		if rule.Strategy.Name() != "mask:uuid" {
-			continue
+		name := rule.Strategy.Name()
+		switch {
+		case name == "mask:uuid":
+			col := findSchemaColumn(schema, rule.Table, rule.Column)
+			if col == nil {
+				continue
+			}
+			if _, isUUID := col.Type.(ir.UUID); !isUUID {
+				continue
+			}
+			qualified := rule.Column
+			if rule.Table != "" {
+				qualified = rule.Table + "." + rule.Column
+			}
+			if rule.Schema != "" {
+				qualified = rule.Schema + "." + qualified
+			}
+			typeProblems = append(typeProblems, fmt.Sprintf(
+				"  - %s: mask:uuid output contains 'X' characters which are not valid hex; the target's UUID column type will refuse them mid-bulk-copy. Either switch to a different strategy (hash:sha256 / truncate:N) or override the target column type via --type-override=%s.%s=text (the latter re-types the destination column so the masked string lands cleanly).",
+				qualified, rule.Table, rule.Column,
+			))
+		case strings.HasPrefix(name, "randomize:"):
+			table := findSchemaTable(schema, rule.Table)
+			if table == nil {
+				continue // table not in scope; nothing to check
+			}
+			if table.PrimaryKey != nil && len(table.PrimaryKey.Columns) > 0 {
+				continue
+			}
+			qualified := rule.Column
+			if rule.Table != "" {
+				qualified = rule.Table + "." + rule.Column
+			}
+			if rule.Schema != "" {
+				qualified = rule.Schema + "." + qualified
+			}
+			randomizeProblems = append(randomizeProblems, fmt.Sprintf(
+				"  - %s: strategy %s requires a primary key on the source table (replay-stable randomization derives its seed from PK values; without a PK each row would draw an unrelated random value on every run, breaking idempotency). Either add a PRIMARY KEY to %s on the source, or pick a non-random strategy (hash:sha256, mask:*, static:) for this column.",
+				qualified, name, rule.Table,
+			))
 		}
-		col := findSchemaColumn(schema, rule.Table, rule.Column)
-		if col == nil {
-			continue // column not in scope of this migration
-		}
-		if _, isUUID := col.Type.(ir.UUID); !isUUID {
-			continue // operator has re-typed the column via --type-override
-		}
-		qualified := rule.Column
-		if rule.Table != "" {
-			qualified = rule.Table + "." + rule.Column
-		}
-		if rule.Schema != "" {
-			qualified = rule.Schema + "." + qualified
-		}
-		problems = append(problems, fmt.Sprintf(
-			"  - %s: mask:uuid output contains 'X' characters which are not valid hex; the target's UUID column type will refuse them mid-bulk-copy. Either switch to a different strategy (hash:sha256 / truncate:N) or override the target column type via --type-override=%s.%s=text (the latter re-types the destination column so the masked string lands cleanly).",
-			qualified, rule.Table, rule.Column,
-		))
 	}
-	if len(problems) == 0 {
+	if len(typeProblems) == 0 && len(randomizeProblems) == 0 {
 		return nil
 	}
-	return fmt.Errorf("%w (Bug 60 / v0.58.1 preflight):\n%s", errRedactTypeMismatch, strings.Join(problems, "\n"))
+	if len(typeProblems) > 0 && len(randomizeProblems) == 0 {
+		return fmt.Errorf("%w (Bug 60 / v0.58.1 preflight):\n%s", errRedactTypeMismatch, strings.Join(typeProblems, "\n"))
+	}
+	if len(randomizeProblems) > 0 && len(typeProblems) == 0 {
+		return fmt.Errorf("%w (PII Phase 2.c / v0.59.0 preflight):\n%s", errRedactRandomizeNoPK, strings.Join(randomizeProblems, "\n"))
+	}
+	// Both sets non-empty: surface both with a combined header so the
+	// operator sees the full picture in one run.
+	combined := append(append([]string{}, typeProblems...), randomizeProblems...)
+	return fmt.Errorf("%w / %w (combined v0.58.1 + v0.59.0 preflight):\n%s", errRedactTypeMismatch, errRedactRandomizeNoPK, strings.Join(combined, "\n"))
+}
+
+// findSchemaTable returns the *ir.Table for name, or nil if not
+// found in schema. Used by the randomize-no-PK preflight to look up
+// the PK of the rule's table.
+func findSchemaTable(schema *ir.Schema, name string) *ir.Table {
+	for _, t := range schema.Tables {
+		if t.Name == name {
+			return t
+		}
+	}
+	return nil
 }
 
 // findSchemaColumn looks up a column in the schema by table + column

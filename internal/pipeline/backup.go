@@ -904,7 +904,14 @@ func (b *Backup) backupTable(
 			// PII Phase 1.5: redact row before writing to the chunk so
 			// backups stored on disk are PII-clean. nil/empty Registry
 			// is a zero-cost passthrough.
-			if err := redactRow(b.Redactor, table.Schema, table.Name, row, cols); err != nil {
+			//
+			// streamID is empty for full-backup runs (which are one-shot
+			// snapshots); the per-row randomize:* seed is determined
+			// purely by table + column + PK values, so re-running a
+			// full backup against the same source produces the same
+			// redacted values. pkColumns from the table descriptor gates
+			// randomize:* on no-PK tables (the strategy refuses cleanly).
+			if err := redactRow(b.Redactor, table.Schema, table.Name, row, cols, tablePKColumns(table), ""); err != nil {
 				return nil, fmt.Errorf("redact row: %w", err)
 			}
 			if err := writer.WriteRow(row, cols); err != nil {

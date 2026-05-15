@@ -465,7 +465,7 @@ func copyChunk(
 		filtered := filterByUpperBound(batchCtx, rowsCh, pkCols, chunk.UpperPK)
 		teed := teePKAndCount(batchCtx, filtered, tracker, &batchCount, pt.observeRow)
 		// PII Phase 1: same redact-wrap as [copyTable].
-		redacted, redactErrFn := redactRows(batchCtx, teed, redactor, table.Schema, table.Name, table.Columns)
+		redacted, redactErrFn := redactRows(batchCtx, teed, redactor, table.Schema, table.Name, table.Columns, pkCols, "")
 		if err := iw.WriteRowsIdempotent(batchCtx, table, redacted); err != nil {
 			cancel()
 			return fmt.Errorf("write chunk %d batch: %w", chunkIndex, err)

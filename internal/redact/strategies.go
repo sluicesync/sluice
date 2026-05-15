@@ -26,7 +26,7 @@ func (Null) Name() string { return "null" }
 
 // Redact returns (nil, nil) when col is nullable; otherwise returns
 // (nil, error) with the column identity in the message.
-func (Null) Redact(col *ir.Column, _ any) (any, error) {
+func (Null) Redact(col *ir.Column, _ any, _ []byte) (any, error) {
 	if col != nil && !col.Nullable {
 		return nil, fmt.Errorf("redact: column %s is NOT NULL; refusing to redact via 'null' (use 'static:<empty-equivalent>' instead)", colIdentity(col))
 	}
@@ -50,7 +50,7 @@ type Static struct {
 func (Static) Name() string { return "static:<elided>" }
 
 // Redact returns the configured Value.
-func (s Static) Redact(_ *ir.Column, _ any) (any, error) {
+func (s Static) Redact(_ *ir.Column, _ any, _ []byte) (any, error) {
 	return s.Value, nil
 }
 
@@ -82,7 +82,7 @@ func (h Hash) Name() string { return "hash:" + h.Algo }
 
 // Redact hashes the input and returns the hex-encoded digest as a
 // string. See the type's doc-comment for the accepted input shapes.
-func (h Hash) Redact(col *ir.Column, val any) (any, error) {
+func (h Hash) Redact(col *ir.Column, val any, _ []byte) (any, error) {
 	if val == nil {
 		return nil, nil
 	}
@@ -129,7 +129,7 @@ type Truncate struct {
 func (t Truncate) Name() string { return fmt.Sprintf("truncate:%d", t.N) }
 
 // Redact returns the first t.N runes of the input.
-func (t Truncate) Redact(col *ir.Column, val any) (any, error) {
+func (t Truncate) Redact(col *ir.Column, val any, _ []byte) (any, error) {
 	if val == nil {
 		return nil, nil
 	}
@@ -248,7 +248,7 @@ func (m Mask) Name() string {
 }
 
 // Redact applies the mask. See the type doc for boundary semantics.
-func (m Mask) Redact(col *ir.Column, val any) (any, error) {
+func (m Mask) Redact(col *ir.Column, val any, _ []byte) (any, error) {
 	if val == nil {
 		return nil, nil
 	}

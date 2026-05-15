@@ -186,6 +186,13 @@ type ChangeApplier struct {
 	// Phase 1 already redacted bulk-copy rows. Set via
 	// [SetRedactor]; nil/empty is the no-redactions hot path.
 	redactor *redact.Registry
+
+	// streamID is the active stream's identifier, recorded by
+	// [SetStreamID] at Streamer startup. Threaded through every
+	// redactor.ApplyRow call so randomize:* strategies (PII Phase 2.c,
+	// v0.59.0) derive a per-row replay-stable seed from streamID +
+	// table + column + PK values.
+	streamID string
 }
 
 // SetMaxBufferBytes implements [ir.MaxBufferBytesSetter]. The
@@ -269,6 +276,14 @@ func (a *ChangeApplier) SetRedactor(registry any) {
 	a.redactor = r
 }
 
+// SetStreamID implements [ir.StreamIDSetter] (PII Phase 2.c,
+// v0.59.0). Records the active stream's identifier so each CDC
+// event's redact.ApplyRow call can derive a replay-stable
+// per-row seed for randomize:* strategies. Idempotent.
+func (a *ChangeApplier) SetStreamID(streamID string) {
+	a.streamID = streamID
+}
+
 // redactChange invokes the applier's redactor (if any) on the
 // change's row data. Mutates the row in place. Returns a wrapped
 // error on strategy refusal; ADR-0038's classifier sees the error
@@ -277,22 +292,63 @@ func (a *ChangeApplier) SetRedactor(registry any) {
 // PII Phase 1.5: scope = Insert.Row, Update.Before, Update.After,
 // Delete.Before. Truncate / TxBegin / TxCommit carry no row data;
 // pass-through.
-func (a *ChangeApplier) redactChange(c ir.Change) error {
+//
+// PII Phase 2.c (v0.59.0): every ApplyRow call passes the table's
+// PK column list + active streamID so randomize:* strategies
+// derive a per-row replay-stable seed. The PK is fetched via the
+// existing per-table pkCache (one information_schema round-trip
+// per table on first sight).
+func (a *ChangeApplier) redactChange(ctx context.Context, c ir.Change) error {
 	if a.redactor.Empty() {
 		return nil
 	}
 	switch v := c.(type) {
 	case ir.Insert:
-		return a.redactor.ApplyRow(v.Schema, v.Table, v.Row)
-	case ir.Update:
-		if err := a.redactor.ApplyRow(v.Schema, v.Table, v.Before); err != nil {
+		pk, err := a.pkForRedact(ctx, v.Schema, v.Table)
+		if err != nil {
 			return err
 		}
-		return a.redactor.ApplyRow(v.Schema, v.Table, v.After)
+		return a.redactor.ApplyRow(v.Schema, v.Table, pk, v.Row, a.streamID)
+	case ir.Update:
+		pk, err := a.pkForRedact(ctx, v.Schema, v.Table)
+		if err != nil {
+			return err
+		}
+		if err := a.redactor.ApplyRow(v.Schema, v.Table, pk, v.Before, a.streamID); err != nil {
+			return err
+		}
+		return a.redactor.ApplyRow(v.Schema, v.Table, pk, v.After, a.streamID)
 	case ir.Delete:
-		return a.redactor.ApplyRow(v.Schema, v.Table, v.Before)
+		pk, err := a.pkForRedact(ctx, v.Schema, v.Table)
+		if err != nil {
+			return err
+		}
+		return a.redactor.ApplyRow(v.Schema, v.Table, pk, v.Before, a.streamID)
 	}
 	return nil
+}
+
+// pkForRedact returns the cached PK column list for the named
+// table using the applier's connection pool. Wrapper around
+// pkFor that opens a fresh tx — redactChange runs before the
+// dispatch's tx is established, but schema metadata is stable
+// across tx boundaries so this is safe.
+func (a *ChangeApplier) pkForRedact(ctx context.Context, schema, table string) ([]string, error) {
+	qn := qualifiedName(schema, table)
+	if cached, ok := a.pkCache[qn]; ok {
+		return cached, nil
+	}
+	tx, err := a.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("mysql: applier: pkForRedact: begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	pk, err := loadPrimaryKey(ctx, tx, applierSchema(a.schema, schema), table)
+	if err != nil {
+		return nil, fmt.Errorf("mysql: applier: pkForRedact: %w", err)
+	}
+	a.pkCache[qn] = pk
+	return pk, nil
 }
 
 // txExec wraps tx.ExecContext with the applier's per-exec timeout
@@ -598,7 +654,7 @@ func (a *ChangeApplier) applyOne(ctx context.Context, streamID string, c ir.Chan
 	// operator has configured rules. nil/empty redactor is a no-op
 	// fast path; the apply hot path stays free when no redaction is
 	// configured.
-	if err := a.redactChange(c); err != nil {
+	if err := a.redactChange(ctx, c); err != nil {
 		return classifyApplierError(fmt.Errorf("mysql: applier: redact: %w", err))
 	}
 	tx, err := a.db.BeginTx(ctx, nil)

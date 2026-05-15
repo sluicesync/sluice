@@ -171,7 +171,7 @@ func TestParseRedactFlags_HashHMAC_Derive(t *testing.T) {
 		t.Errorf("got %q; want hash:hmac-sha256", s.Name())
 	}
 	// Verify the derived key matches what the helper produces.
-	got, err := s.Redact(&ir.Column{Name: "email"}, "alice@example.com")
+	got, err := s.Redact(&ir.Column{Name: "email"}, "alice@example.com", nil)
 	if err != nil {
 		t.Fatalf("Redact failed: %v", err)
 	}
@@ -197,7 +197,7 @@ func TestParseRedactFlags_HashHMAC_Env(t *testing.T) {
 		t.Fatalf("unexpected error %v", err)
 	}
 	s := reg.Get("", "users", "email")
-	got, err := s.Redact(&ir.Column{Name: "email"}, "alice@example.com")
+	got, err := s.Redact(&ir.Column{Name: "email"}, "alice@example.com", nil)
 	if err != nil {
 		t.Fatalf("Redact failed: %v", err)
 	}
@@ -225,7 +225,7 @@ func TestParseRedactFlags_HashHMAC_File(t *testing.T) {
 		t.Fatalf("unexpected error %v", err)
 	}
 	s := reg.Get("", "users", "email")
-	got, err := s.Redact(&ir.Column{Name: "email"}, "alice@example.com")
+	got, err := s.Redact(&ir.Column{Name: "email"}, "alice@example.com", nil)
 	if err != nil {
 		t.Fatalf("Redact failed: %v", err)
 	}
@@ -449,7 +449,7 @@ func TestParseRedactFlags_Mask(t *testing.T) {
 
 	// Confirm the parsed Mask actually masks correctly end-to-end.
 	pan := reg.Get("", "users", "pan")
-	got, err := pan.Redact(&ir.Column{Name: "pan"}, "4111111111111111")
+	got, err := pan.Redact(&ir.Column{Name: "pan"}, "4111111111111111", nil)
 	if err != nil {
 		t.Fatalf("Redact failed: %v", err)
 	}
@@ -457,7 +457,7 @@ func TestParseRedactFlags_Mask(t *testing.T) {
 		t.Errorf("PAN mask got %q; want %q", got, "4111XXXXXXXX1111")
 	}
 	ssn := reg.Get("", "users", "ssn")
-	got, err = ssn.Redact(&ir.Column{Name: "ssn"}, "123456789")
+	got, err = ssn.Redact(&ir.Column{Name: "ssn"}, "123456789", nil)
 	if err != nil {
 		t.Fatalf("Redact failed: %v", err)
 	}
@@ -521,7 +521,7 @@ func TestMergeYAMLRedactions_Mask(t *testing.T) {
 
 	// Confirm custom char round-trips through YAML.
 	ssn := reg.Get("", "users", "ssn")
-	got, err := ssn.Redact(&ir.Column{Name: "ssn"}, "123456789")
+	got, err := ssn.Redact(&ir.Column{Name: "ssn"}, "123456789", nil)
 	if err != nil {
 		t.Fatalf("Redact failed: %v", err)
 	}
@@ -591,15 +591,15 @@ func TestParseRedactFlags_MaskPresets(t *testing.T) {
 	}
 
 	// End-to-end: each preset masks correctly through the resolved registry.
-	got, err := reg.Get("", "users", "ssn").Redact(&ir.Column{Name: "ssn"}, "123-45-6789")
+	got, err := reg.Get("", "users", "ssn").Redact(&ir.Column{Name: "ssn"}, "123-45-6789", nil)
 	if err != nil || got != "XXX-XX-6789" {
 		t.Errorf("ssn end-to-end: got %v err %v; want XXX-XX-6789", got, err)
 	}
-	got, err = reg.Get("", "users", "pan").Redact(&ir.Column{Name: "pan"}, "4111111111111111")
+	got, err = reg.Get("", "users", "pan").Redact(&ir.Column{Name: "pan"}, "4111111111111111", nil)
 	if err != nil || got != "411111XXXXXX1111" {
 		t.Errorf("pan end-to-end: got %v err %v; want 411111XXXXXX1111", got, err)
 	}
-	got, err = reg.Get("", "users", "email").Redact(&ir.Column{Name: "email"}, "alice@example.com")
+	got, err = reg.Get("", "users", "email").Redact(&ir.Column{Name: "email"}, "alice@example.com", nil)
 	if err != nil || got != "aXXXX@example.com" {
 		t.Errorf("email end-to-end: got %v err %v; want aXXXX@example.com", got, err)
 	}
@@ -639,19 +639,19 @@ func TestParseRedactFlags_MaskPresetsSecondWave(t *testing.T) {
 	}
 
 	// End-to-end through the registry for each preset.
-	got, err := reg.Get("", "users", "sin").Redact(&ir.Column{Name: "sin"}, "046-454-286")
+	got, err := reg.Get("", "users", "sin").Redact(&ir.Column{Name: "sin"}, "046-454-286", nil)
 	if err != nil || got != "XXX-XXX-286" {
 		t.Errorf("ca-sin end-to-end: got %v err %v", got, err)
 	}
-	got, err = reg.Get("", "users", "nin").Redact(&ir.Column{Name: "nin"}, "AB123456C")
+	got, err = reg.Get("", "users", "nin").Redact(&ir.Column{Name: "nin"}, "AB123456C", nil)
 	if err != nil || got != "ABXXXXXXC" {
 		t.Errorf("uk-nin end-to-end: got %v err %v", got, err)
 	}
-	got, err = reg.Get("", "users", "iban").Redact(&ir.Column{Name: "iban"}, "DE89370400440532013000")
+	got, err = reg.Get("", "users", "iban").Redact(&ir.Column{Name: "iban"}, "DE89370400440532013000", nil)
 	if err != nil || got != "DE8937XXXXXXXXXXXX3000" {
 		t.Errorf("iban end-to-end: got %v err %v", got, err)
 	}
-	got, err = reg.Get("", "users", "id").Redact(&ir.Column{Name: "id"}, "550e8400-e29b-41d4-a716-446655440000")
+	got, err = reg.Get("", "users", "id").Redact(&ir.Column{Name: "id"}, "550e8400-e29b-41d4-a716-446655440000", nil)
 	if err != nil || got != "550eXXXX-XXXX-XXXX-XXXX-XXXXXXXX0000" {
 		t.Errorf("uuid end-to-end: got %v err %v", got, err)
 	}
@@ -774,7 +774,7 @@ func TestMergeYAMLRedactions_HMACWithKeySource(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	s := reg.Get("", "users", "email")
-	got, err := s.Redact(&ir.Column{Name: "email"}, "alice@example.com")
+	got, err := s.Redact(&ir.Column{Name: "email"}, "alice@example.com", nil)
 	if err != nil {
 		t.Fatalf("Redact failed: %v", err)
 	}
@@ -783,5 +783,164 @@ func TestMergeYAMLRedactions_HMACWithKeySource(t *testing.T) {
 	want := hex.EncodeToString(m.Sum(nil))
 	if got != want {
 		t.Errorf("YAML hmac mismatch")
+	}
+}
+
+// TestParseRedactFlags_Randomize covers the v0.59.0 PII Phase 2.c
+// randomize:* parser shapes. Each happy path produces the right
+// Strategy concrete type with the expected Name().
+func TestParseRedactFlags_Randomize(t *testing.T) {
+	cases := []struct {
+		name, raw, wantName string
+	}{
+		{"int with bounds", "users.age=randomize:int:18,90", "randomize:int:18,90"},
+		{"int with negative min", "users.score=randomize:int:-100,100", "randomize:int:-100,100"},
+		{"email", "users.email=randomize:email", "randomize:email"},
+		{"us-phone", "users.phone=randomize:us-phone", "randomize:us-phone"},
+		{"uuid", "users.id=randomize:uuid", "randomize:uuid"},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			reg, err := parseRedactFlags([]string{c.raw}, "", "")
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			rules := reg.Rules()
+			if len(rules) != 1 {
+				t.Fatalf("got %d rules; want 1", len(rules))
+			}
+			if got := rules[0].Strategy.Name(); got != c.wantName {
+				t.Errorf("Strategy.Name() = %q; want %q", got, c.wantName)
+			}
+		})
+	}
+}
+
+// TestParseRedactFlags_RandomizeRefusalPaths covers every documented
+// malformed randomize:* input.
+func TestParseRedactFlags_RandomizeRefusalPaths(t *testing.T) {
+	cases := []struct {
+		name, raw, wantSubstring string
+	}{
+		{"missing form", "users.x=randomize", "requires a form"},
+		{"unknown form", "users.x=randomize:foo", "unknown form"},
+		{"int missing bounds", "users.x=randomize:int", "requires bounds"},
+		{"int single arg", "users.x=randomize:int:5", "expected '<min>,<max>'"},
+		{"int three args", "users.x=randomize:int:5,10,99", "expected '<min>,<max>'"},
+		{"int non-integer min", "users.x=randomize:int:abc,99", "min must be an integer"},
+		{"int non-integer max", "users.x=randomize:int:5,xyz", "max must be an integer"},
+		{"int min > max", "users.x=randomize:int:99,5", "must not exceed max"},
+		{"email with options", "users.x=randomize:email:foo", "takes no options"},
+		{"us-phone with options", "users.x=randomize:us-phone:foo", "takes no options"},
+		{"uuid with options", "users.x=randomize:uuid:foo", "takes no options"},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			_, err := parseRedactFlags([]string{c.raw}, "", "")
+			if err == nil {
+				t.Fatal("expected error; got nil")
+			}
+			if !strings.Contains(err.Error(), c.wantSubstring) {
+				t.Errorf("error %q should contain %q", err.Error(), c.wantSubstring)
+			}
+		})
+	}
+}
+
+// TestMergeYAMLRedactions_Randomize covers the YAML form of every
+// randomize:* shape.
+func TestMergeYAMLRedactions_Randomize(t *testing.T) {
+	cases := []struct {
+		name     string
+		entry    config.Redaction
+		wantName string
+	}{
+		{
+			name:     "int",
+			entry:    config.Redaction{Table: "users.age", Strategy: "randomize", Form: "int", Min: 18, Max: 90},
+			wantName: "randomize:int:18,90",
+		},
+		{
+			name:     "email",
+			entry:    config.Redaction{Table: "users.email", Strategy: "randomize", Form: "email"},
+			wantName: "randomize:email",
+		},
+		{
+			name:     "us-phone",
+			entry:    config.Redaction{Table: "users.phone", Strategy: "randomize", Form: "us-phone"},
+			wantName: "randomize:us-phone",
+		},
+		{
+			name:     "uuid",
+			entry:    config.Redaction{Table: "users.id", Strategy: "randomize", Form: "uuid"},
+			wantName: "randomize:uuid",
+		},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			reg, err := mergeYAMLRedactions(nil, []config.Redaction{c.entry}, "", "")
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			rules := reg.Rules()
+			if len(rules) != 1 {
+				t.Fatalf("got %d rules; want 1", len(rules))
+			}
+			if got := rules[0].Strategy.Name(); got != c.wantName {
+				t.Errorf("Strategy.Name() = %q; want %q", got, c.wantName)
+			}
+		})
+	}
+}
+
+// TestMergeYAMLRedactions_RandomizeRefusalPaths covers the YAML
+// refusal paths: missing form, unknown form, spurious min/max on
+// no-options forms, etc.
+func TestMergeYAMLRedactions_RandomizeRefusalPaths(t *testing.T) {
+	cases := []struct {
+		name          string
+		entry         config.Redaction
+		wantSubstring string
+	}{
+		{
+			name:          "missing form",
+			entry:         config.Redaction{Table: "users.x", Strategy: "randomize"},
+			wantSubstring: "requires 'form'",
+		},
+		{
+			name:          "unknown form",
+			entry:         config.Redaction{Table: "users.x", Strategy: "randomize", Form: "weird"},
+			wantSubstring: "unknown form",
+		},
+		{
+			name:          "int with min > max",
+			entry:         config.Redaction{Table: "users.x", Strategy: "randomize", Form: "int", Min: 100, Max: 5},
+			wantSubstring: "min <= max",
+		},
+		{
+			name:          "email with spurious min",
+			entry:         config.Redaction{Table: "users.x", Strategy: "randomize", Form: "email", Min: 5},
+			wantSubstring: "takes no min/max",
+		},
+		{
+			name:          "uuid with spurious max",
+			entry:         config.Redaction{Table: "users.x", Strategy: "randomize", Form: "uuid", Max: 5},
+			wantSubstring: "takes no min/max",
+		},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			_, err := mergeYAMLRedactions(nil, []config.Redaction{c.entry}, "", "")
+			if err == nil {
+				t.Fatal("expected error; got nil")
+			}
+			if !strings.Contains(err.Error(), c.wantSubstring) {
+				t.Errorf("error %q should contain %q", err.Error(), c.wantSubstring)
+			}
+		})
 	}
 }

@@ -6,6 +6,7 @@ package pipeline
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/orware/sluice/internal/ir"
@@ -29,12 +30,20 @@ import (
 // the row is owned by the caller's read goroutine and not aliased
 // after this call.
 //
+// pkColumns + streamID together produce the per-(row, column) seed
+// passed to randomize:* strategies (PII Phase 2.c, v0.59.0). When
+// pkColumns is empty (the table has no primary key) and any
+// registered rule for this table is a randomize:* strategy, the
+// strategy refuses with an operator-actionable error — replay-stable
+// randomization requires a PK. streamID may be empty (migrate path).
+// Phase 1 and Phase 2.a / 2.b strategies ignore the seed entirely.
+//
 // Wrapping errors: a strategy refusal (e.g. Null on NOT NULL,
 // Truncate on a non-string column) returns a wrapped error naming
 // the schema + table + column. Callers should treat redaction
 // errors as terminal (operator misconfiguration); the pipeline's
 // existing fail-fast posture is the right default.
-func redactRow(reg *redact.Registry, schema, table string, row ir.Row, cols []*ir.Column) error {
+func redactRow(reg *redact.Registry, schema, table string, row ir.Row, cols []*ir.Column, pkColumns []string, streamID string) error {
 	if reg.Empty() {
 		return nil
 	}
@@ -47,7 +56,8 @@ func redactRow(reg *redact.Registry, schema, table string, row ir.Row, cols []*i
 			continue
 		}
 		val := row[col.Name]
-		newVal, err := strategy.Redact(col, val)
+		seed := deriveSeedIfNeeded(strategy, table, col.Name, row, pkColumns, streamID)
+		newVal, err := strategy.Redact(col, val, seed)
 		if err != nil {
 			return fmt.Errorf("pipeline: redact %s.%s.%s via %s: %w",
 				schema, table, col.Name, strategy.Name(), err)
@@ -55,6 +65,33 @@ func redactRow(reg *redact.Registry, schema, table string, row ir.Row, cols []*i
 		row[col.Name] = newVal
 	}
 	return nil
+}
+
+// deriveSeedIfNeeded returns a per-row [redact.DeriveRowSeed] result
+// when strategy is a randomize:* family member, or nil otherwise.
+// Centralises the strategy-name probe + PK-value extraction so
+// redactRow + redactRows stay readable.
+//
+// When pkColumns is empty for a randomize:* strategy, this still
+// returns nil — the strategy's Redact then surfaces the
+// "PK required" refusal with full operator detail (column name +
+// strategy name). Preflight should have caught the no-PK case
+// before this runs.
+func deriveSeedIfNeeded(strategy redact.Strategy, table, column string, row ir.Row, pkColumns []string, streamID string) []byte {
+	if strategy == nil {
+		return nil
+	}
+	if !strings.HasPrefix(strategy.Name(), "randomize:") {
+		return nil
+	}
+	if len(pkColumns) == 0 {
+		return nil
+	}
+	pkValues := make([]any, len(pkColumns))
+	for i, c := range pkColumns {
+		pkValues[i] = row[c]
+	}
+	return redact.DeriveRowSeed(streamID, table, column, pkColumns, pkValues)
 }
 
 // redactRows wraps a row channel with the operator-configured
@@ -89,6 +126,8 @@ func redactRows(
 	reg *redact.Registry,
 	schema, table string,
 	cols []*ir.Column,
+	pkColumns []string,
+	streamID string,
 ) (<-chan ir.Row, func() error) {
 	if reg.Empty() {
 		return src, func() error { return nil }
@@ -120,7 +159,7 @@ func redactRows(
 				if !ok {
 					return
 				}
-				if err := redactRow(reg, schema, table, row, cols); err != nil {
+				if err := redactRow(reg, schema, table, row, cols, pkColumns, streamID); err != nil {
 					storeFn(err)
 					return
 				}
@@ -133,4 +172,20 @@ func redactRows(
 		}
 	}()
 	return out, errFn
+}
+
+// tablePKColumns returns the PK column names of table in declaration
+// order, or nil for tables without a primary key. Mirrors
+// [primaryKeyColumnNames] in migrate_bulk.go; lives here because
+// callers in non-bulk paths (copyTable, backup, etc.) also need
+// it for randomize:* seed plumbing. Defensive on nil table.
+func tablePKColumns(table *ir.Table) []string {
+	if table == nil || table.PrimaryKey == nil {
+		return nil
+	}
+	out := make([]string, len(table.PrimaryKey.Columns))
+	for i, c := range table.PrimaryKey.Columns {
+		out[i] = c.Column
+	}
+	return out
 }

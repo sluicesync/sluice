@@ -128,10 +128,54 @@ func yamlStrategyToSluice(entry config.Redaction, keySource, streamID string) (r
 		return redact.Truncate{N: entry.Length}, nil
 	case "mask":
 		return yamlMaskToSluice(entry)
+	case "randomize":
+		return yamlRandomizeToSluice(entry)
 	case "":
-		return nil, errors.New("'strategy' field is required (null, static, hash, truncate, mask)")
+		return nil, errors.New("'strategy' field is required (null, static, hash, truncate, mask, randomize)")
 	default:
-		return nil, fmt.Errorf("unknown strategy %q (supported: null, static, hash, truncate, mask)", entry.Strategy)
+		return nil, fmt.Errorf("unknown strategy %q (supported: null, static, hash, truncate, mask, randomize)", entry.Strategy)
+	}
+}
+
+// yamlRandomizeToSluice converts a `strategy: randomize` YAML entry
+// into a concrete [redact.Strategy]. The Form field selects between
+// the four randomize:* forms (PII Phase 2.c, v0.59.0):
+//
+//   - form: int   — additionally requires `min:` + `max:` integer
+//     fields (inclusive bounds; min must not exceed max).
+//   - form: email     — no other fields.
+//   - form: us-phone  — no other fields.
+//   - form: uuid      — no other fields.
+//
+// Validation refuses missing form, unknown form, missing/invalid
+// min/max on int form, and spurious min/max on non-int forms (so
+// operator misconfiguration is loud, not silent).
+func yamlRandomizeToSluice(entry config.Redaction) (redact.Strategy, error) {
+	switch entry.Form {
+	case "":
+		return nil, errors.New("strategy 'randomize' requires 'form' field: 'int', 'email', 'us-phone', or 'uuid'")
+	case "email":
+		if entry.Min != 0 || entry.Max != 0 {
+			return nil, errors.New("strategy 'randomize' form 'email' takes no min/max; remove the fields")
+		}
+		return redact.RandomizeEmail{}, nil
+	case "us-phone":
+		if entry.Min != 0 || entry.Max != 0 {
+			return nil, errors.New("strategy 'randomize' form 'us-phone' takes no min/max; remove the fields")
+		}
+		return redact.RandomizeUSPhone{}, nil
+	case "uuid":
+		if entry.Min != 0 || entry.Max != 0 {
+			return nil, errors.New("strategy 'randomize' form 'uuid' takes no min/max; remove the fields")
+		}
+		return redact.RandomizeUUID{}, nil
+	case "int":
+		if entry.Min > entry.Max {
+			return nil, fmt.Errorf("strategy 'randomize' form 'int' requires min <= max; got min=%d, max=%d", entry.Min, entry.Max)
+		}
+		return redact.RandomizeInt{Min: entry.Min, Max: entry.Max}, nil
+	default:
+		return nil, fmt.Errorf("strategy 'randomize' has unknown form %q (supported: int, email, us-phone, uuid)", entry.Form)
 	}
 }
 
@@ -289,8 +333,76 @@ func strategyFromSpec(spec, keySource, streamID string) (redact.Strategy, error)
 		return redact.Truncate{N: n}, nil
 	case "mask":
 		return parseMaskStrategy(opts)
+	case "randomize":
+		return parseRandomizeStrategy(opts)
 	default:
-		return nil, fmt.Errorf("unknown strategy %q (supported: null, static:<v>, hash:sha256, hash:hmac-sha256, truncate:<n>, mask:inner:<m1>,<m2>[,<char>], mask:outer:<m1>,<m2>[,<char>])", name)
+		return nil, fmt.Errorf("unknown strategy %q (supported: null, static:<v>, hash:sha256, hash:hmac-sha256, truncate:<n>, mask:inner:<m1>,<m2>[,<char>], mask:outer:<m1>,<m2>[,<char>], mask:<preset>, randomize:int:<min>,<max>, randomize:email, randomize:us-phone, randomize:uuid)", name)
+	}
+}
+
+// parseRandomizeStrategy parses the suffix of a `randomize:` spec
+// (PII Phase 2.c, v0.59.0). Supported forms:
+//
+//   - `int:<min>,<max>` — integer in [min, max] inclusive
+//   - `email`           — `<rand-local>@<rand-domain>.test`
+//   - `us-phone`        — `XXX-XXX-XXXX` (NANP-valid area/exchange)
+//   - `uuid`            — random UUIDv4 (canonical hyphenated form)
+//
+// All randomize:* strategies derive their output from a per-row
+// SHA-256 seed (streamID + table + column + primary-key values),
+// so the same source row always produces the same target value.
+// Tables without a primary key fail the preflight; randomize:*
+// requires a PK for replay stability.
+//
+// Refuses on:
+//
+//   - Unknown form
+//   - `int:` missing or malformed min/max (non-integer; min > max)
+//   - No-options form supplied with options (e.g., `randomize:uuid:foo`)
+func parseRandomizeStrategy(opts string) (redact.Strategy, error) {
+	if opts == "" {
+		return nil, errors.New("strategy 'randomize' requires a form: 'int:<min>,<max>', 'email', 'us-phone', or 'uuid'")
+	}
+	formName, rest, ok := strings.Cut(opts, ":")
+	if !ok {
+		// No colon — must be a no-options form.
+		switch formName {
+		case "email":
+			return redact.RandomizeEmail{}, nil
+		case "us-phone":
+			return redact.RandomizeUSPhone{}, nil
+		case "uuid":
+			return redact.RandomizeUUID{}, nil
+		case "int":
+			return nil, errors.New("strategy 'randomize:int' requires bounds: 'randomize:int:<min>,<max>'")
+		default:
+			return nil, fmt.Errorf("strategy 'randomize:%s': unknown form (supported: int:<min>,<max>, email, us-phone, uuid)", formName)
+		}
+	}
+	// Has a colon — must be `int` with min,max, OR a no-options form
+	// that was given unexpected options.
+	switch formName {
+	case "email", "us-phone", "uuid":
+		return nil, fmt.Errorf("strategy 'randomize:%s': form '%s' takes no options (drop ':%s')", opts, formName, rest)
+	case "int":
+		parts := strings.Split(rest, ",")
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("strategy 'randomize:int:%s': expected '<min>,<max>'; got %d args", rest, len(parts))
+		}
+		minVal, err := strconv.ParseInt(strings.TrimSpace(parts[0]), 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("strategy 'randomize:int:%s': min must be an integer", rest)
+		}
+		maxVal, err := strconv.ParseInt(strings.TrimSpace(parts[1]), 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("strategy 'randomize:int:%s': max must be an integer", rest)
+		}
+		if minVal > maxVal {
+			return nil, fmt.Errorf("strategy 'randomize:int:%s': min (%d) must not exceed max (%d)", rest, minVal, maxVal)
+		}
+		return redact.RandomizeInt{Min: minVal, Max: maxVal}, nil
+	default:
+		return nil, fmt.Errorf("strategy 'randomize:%s': unknown form %q (supported: int:<min>,<max>, email, us-phone, uuid)", opts, formName)
 	}
 }
 

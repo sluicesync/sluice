@@ -188,7 +188,7 @@ func (a *ChangeApplier) applyOneBatch(ctx context.Context, streamID string, chan
 	}
 
 	// PII Phase 1.5: redact the first change before dispatch.
-	if err := a.redactChange(first); err != nil {
+	if err := a.redactChange(ctx, first); err != nil {
 		return 0, ir.Position{}, false, classifyApplierError(fmt.Errorf("postgres: applier: redact: %w", err))
 	}
 
@@ -263,7 +263,7 @@ func (a *ChangeApplier) applyOneBatch(ctx context.Context, streamID string, chan
 				continue
 			}
 			// PII Phase 1.5: redact subsequent batch members.
-			if err := a.redactChange(c); err != nil {
+			if err := a.redactChange(ctx, c); err != nil {
 				_ = tx.Rollback()
 				return 0, ir.Position{}, false, classifyApplierError(fmt.Errorf("postgres: applier: redact: %w", err))
 			}

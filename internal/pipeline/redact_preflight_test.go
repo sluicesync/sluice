@@ -121,4 +121,83 @@ func TestPreflightRedactTypes(t *testing.T) {
 			}
 		}
 	})
+
+	// PII Phase 2.c (v0.59.0): randomize:* on a no-PK source table
+	// refuses at startup. The strategy needs PK values to derive a
+	// replay-stable seed; without a PK each row would draw an
+	// unrelated random value on every run.
+	t.Run("randomize:int on no-PK table refuses", func(t *testing.T) {
+		r := redact.New()
+		r.Set("", "users", "age", redact.RandomizeInt{Min: 18, Max: 90})
+		schema := &ir.Schema{
+			Tables: []*ir.Table{
+				{Name: "users", Columns: []*ir.Column{{Name: "age", Type: ir.Integer{Width: 32}}}, PrimaryKey: nil},
+			},
+		}
+		err := preflightRedactTypes(r, schema)
+		if err == nil {
+			t.Fatal("expected refusal for randomize:int on no-PK table")
+		}
+		if !errors.Is(err, errRedactRandomizeNoPK) {
+			t.Errorf("err should wrap errRedactRandomizeNoPK; got %v", err)
+		}
+		msg := err.Error()
+		for _, want := range []string{"users.age", "randomize:int:18,90", "primary key"} {
+			if !strings.Contains(msg, want) {
+				t.Errorf("error %q should contain %q", msg, want)
+			}
+		}
+	})
+
+	t.Run("randomize:email on table WITH PK passes", func(t *testing.T) {
+		r := redact.New()
+		r.Set("", "users", "email", redact.RandomizeEmail{})
+		schema := &ir.Schema{
+			Tables: []*ir.Table{
+				{
+					Name: "users",
+					Columns: []*ir.Column{
+						{Name: "id", Type: ir.Integer{Width: 64}},
+						{Name: "email", Type: ir.Text{}},
+					},
+					PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "id"}}},
+				},
+			},
+		}
+		if err := preflightRedactTypes(r, schema); err != nil {
+			t.Errorf("got %v; want nil (table has PK)", err)
+		}
+	})
+
+	t.Run("randomize:* on table not in scope is silent", func(t *testing.T) {
+		// Operator's filter pruned the table; nothing to check.
+		r := redact.New()
+		r.Set("", "missing", "id", redact.RandomizeUUID{})
+		schema := &ir.Schema{Tables: []*ir.Table{{Name: "users"}}}
+		if err := preflightRedactTypes(r, schema); err != nil {
+			t.Errorf("got %v; want nil (table out of scope)", err)
+		}
+	})
+
+	t.Run("mixed type-mismatch + randomize-no-PK refusals are reported together", func(t *testing.T) {
+		r := redact.New()
+		r.Set("", "users", "id", redact.MaskUUID{})                      // type mismatch
+		r.Set("", "events", "rng", redact.RandomizeInt{Min: 0, Max: 99}) // no PK
+		schema := &ir.Schema{
+			Tables: []*ir.Table{
+				{Name: "users", Columns: []*ir.Column{{Name: "id", Type: ir.UUID{}}}},
+				{Name: "events", Columns: []*ir.Column{{Name: "rng", Type: ir.Integer{Width: 32}}}, PrimaryKey: nil},
+			},
+		}
+		err := preflightRedactTypes(r, schema)
+		if err == nil {
+			t.Fatal("expected refusal")
+		}
+		msg := err.Error()
+		for _, want := range []string{"users.id", "events.rng"} {
+			if !strings.Contains(msg, want) {
+				t.Errorf("combined err %q should mention %q", msg, want)
+			}
+		}
+	})
 }

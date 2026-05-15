@@ -6,6 +6,58 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.59.0]
+
+**PII Phase 2.c first wave — replay-stable randomize strategies.** Four new generators (`randomize:int`, `randomize:email`, `randomize:us-phone`, `randomize:uuid`) that produce random-looking output stable per source row. Same row in always produces same redacted row out — across runs, across CDC resumes, across backup→restore. Operators wanting MySQL Enterprise–style `gen_rnd_*` placeholder generation get the shape they expected (NANP-valid phones, v4 UUIDs, `.test` emails) plus continuous-sync idempotency that pure-random would break. The deviation from Enterprise's pure-random semantics is documented in ADR-0039.
+
+### Added
+
+- **`randomize:int:<min>,<max>` strategy** — seeded random integer in [min, max] inclusive. Type-strict (refuses non-integer source values); returns int64 to match sluice's IR integer shape. Refuses CLI input with `min > max` and runtime calls with `Min > Max` (defensive).
+- **`randomize:email` strategy** — `<rand-local>@<rand-domain>.test` where the local part is 6-12 lowercase letters and the domain is 5-10 lowercase letters. Uses the RFC 6761 `.test` TLD so no output ever resolves to a real address.
+- **`randomize:us-phone` strategy** — NANP-valid `XXX-XXX-XXXX`. Area code 200-999 (never 555 — reserved for fictional use); exchange 200-999. Defaults to dashed format; operators wanting other separators should pipe through a separate transform.
+- **`randomize:uuid` strategy** — canonical 8-4-4-4-12 hyphenated UUIDv4 with version + variant bits set per RFC 4122 §4.1.1/§4.1.3, so output validates as a v4 UUID under any compliant parser.
+- **Per-row replay-stable seeding**. Every randomize:* strategy derives its RNG seed from `SHA256(streamID || table || column || pkColumns || pkValues)`. Same source row → same redacted value. CDC resume + cold-start re-apply produce identical target values; the applier's `ON CONFLICT (pk) DO UPDATE` / `ON DUPLICATE KEY UPDATE` idempotency contract is preserved end-to-end. ADR-0039 documents the rationale.
+- **Preflight refusal on no-PK tables**. Randomize:* requires a primary key for replay-stable seeding; `pipeline.preflightRedactTypes` refuses at startup with an operator-actionable error naming the rule and suggesting either a `PRIMARY KEY` on the source or a non-random strategy (`hash:sha256` / `mask:*` / `static:`). Tables out of scope (filtered out) pass silently.
+- **YAML form** — `strategy: randomize` + `form: int|email|us-phone|uuid`. For `int` form, additionally requires `min:` + `max:` integer fields. Spurious `min`/`max` on no-options forms (email/us-phone/uuid) is rejected with a clear error.
+- **`ir.StreamIDSetter` optional interface** — engines can implement `SetStreamID(string)` to receive the active stream's identifier at startup. Mirrors `RedactorSetter`'s shape; the streamer probes via type assertion and skips engines that don't expose it. Both shipping engines (MySQL, Postgres) implement it.
+- **Per-applier PK column cache for redact path** — the applier looks up PK columns once per table (`info_schema` query) and threads them through every CDC event's redactor.ApplyRow call so randomize:* can derive seeds without re-querying per row.
+- **Help text** on `migrate`, `sync start`, `backup full`, `schema preview` enumerates the 4 new strategies alongside the Phase 2.b presets.
+
+### Compatibility
+
+- **Drop-in upgrade from v0.58.x.** No flag changes; new strategies are opt-in.
+- **Internal API change**: `redact.Strategy.Redact` now takes a third `seed []byte` parameter. All Phase 1 / Phase 2.a / Phase 2.b strategies ignore the seed (they're already deterministic without one); only randomize:* uses it. Pre-existing strategy callers (engine appliers, pipeline.redactRow) plumb a nil seed for non-randomize rules. Direct API users who built custom strategy implementations need a one-line signature update — third parameter is `_ []byte` for the common ignore-seed case.
+- **`redact.Registry.ApplyRow` signature change**: now takes `pkColumns []string` + `streamID string` alongside the existing args. Engine appliers (MySQL, Postgres) are updated; direct API callers need to plumb the table's PK column list + stream identifier.
+- **`pipeline.redactRow` / `redactRows` signature change**: now accept `pkColumns []string` + `streamID string`. All in-package call sites updated (`migrate`, `migrate_bulk`, `migrate_parallel`, `add_table`, `backup`).
+- **`config.Redaction` gains `Min int64` + `Max int64` fields** for the `int` form of randomize. Pre-existing YAML configs unaffected (the new fields default to zero).
+
+### Phase 2 progress
+
+- Phase 2.a (v0.56.0): generic `mask:inner` / `mask:outer` + Luhn helper.
+- Phase 2.b (v0.57.0 + v0.58.0): `mask:ssn`, `mask:pan`, `mask:pan-relaxed`, `mask:email`, `mask:ca-sin`, `mask:uk-nin`, `mask:iban`, `mask:uuid`.
+- Phase 2.c first wave (this release): `randomize:int`, `randomize:email`, `randomize:us-phone`, `randomize:uuid`.
+- Phase 2.c second wave (next): `randomize:pan` (Luhn-valid generated PAN), `randomize:ca-sin` (Luhn-valid generated SIN), and `randomize:from-list:<file>` (operator-supplied sample pool). Same seed contract; checksum-aware generators reuse the v0.56.0 Luhn helper.
+
+### Who needs this release
+
+- **Operators redacting integer columns** (ages, scores, IDs that aren't PII themselves but where a stable randomized surrogate makes downstream analytics easier than `hash:sha256`'s hex blob).
+- **Operators redacting email/phone/UUID columns** wanting a placeholder shape that matches the column's apparent type (analytics tooling that expects a parseable email or a UUID-typed column).
+- **Operators running continuous-sync who tried Phase 2.a/2.b but wanted something less deterministic** — randomize:* gives them per-row uniqueness while still satisfying CDC resume idempotency.
+- **Anyone not using randomize:*** — drop-in, no behaviour change.
+
+### Verification
+
+- **Build + lint clean** across all tags (default, integration).
+- **Unit tests** (`strategies_randomize_test.go`): 4 generator test groups cover determinism (same seed → same output), shape correctness (regex matches on email/phone/uuid; in-range int), nil-seed refusal, type-strict refusal (int generator on string input).
+- **`DeriveRowSeed` test**: pins the seed-derivation contract (same inputs → same seed; per-component change → different seed; composite PK respected; empty streamID still stable).
+- **`Registry.ApplyRow` tests**: randomize-on-no-PK refusal; randomize-with-PK replay stability; streamID-changes-seed cross-stream separation.
+- **`pipeline.redactRow` tests**: PK + streamID plumbed through to randomize:*; refusal naming column + strategy + "primary key" hint.
+- **Preflight tests**: no-PK randomize refusal; with-PK pass-through; out-of-scope-table silence; mixed `mask:uuid` + randomize-no-PK combined report.
+- **CLI tests** (`redact_flag_test.go`): every randomize form happy path; every refusal branch (missing bounds, non-integer min/max, min>max, spurious options on no-options forms).
+- **YAML tests**: every form happy path; refusal on missing/unknown form + spurious min/max on no-options forms.
+
+See `docs/adr/adr-0039-randomize-strategy-determinism.md` for the per-row seed derivation contract and the rationale for deviating from MySQL Enterprise's pure-random semantics. See `docs/dev/notes/prep-pii-redaction-phase-2-strategy-catalog.md` for the full strategy catalog.
+
 ## [0.58.1]
 
 **Closes Bug 60 — `mask:uuid` now refuses at startup when targeted at a UUID-typed column without a type override.** The v0.58.0 cycle's load-bearing scenario surfaced it: the mask preset's output (`550eXXXX-XXXX-XXXX-XXXX-XXXXXXXX0000`) contains `X` characters which aren't valid hex, so it fails mid-bulk-copy with an opaque pgx `cannot find encode plan` error when landing in a strict `uuid` column. By then the target schema was already created with the wrong column type and the operator had to manually unwind. v0.58.1 catches the misconfiguration before any data movement.

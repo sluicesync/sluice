@@ -231,6 +231,23 @@ type RedactorSetter interface {
 	SetRedactor(registry any)
 }
 
+// StreamIDSetter is the optional surface a [ChangeApplier] can
+// implement to receive the active stream's identifier. PII Phase 2.c
+// (v0.59.0, GitHub issue #24): randomize:* strategies need
+// streamID + table + column + PK values to derive a per-row
+// replay-stable seed. The streamer calls SetStreamID after
+// resolving the stream-id, before Apply / ApplyBatch begins.
+//
+// Engines that don't implement this interface inherit the empty-
+// streamID behaviour: randomize:* still works (the seed remains
+// stable per (table, column, PK) within the empty-streamID
+// space), but operators wanting cross-stream determinism should
+// pick an engine flavour that exposes the setter. MySQL and PG
+// shipping engines both implement it.
+type StreamIDSetter interface {
+	SetStreamID(streamID string)
+}
+
 // RangeBoundsQuerier is the optional surface a [RowReader] can
 // implement to expose MIN/MAX queries on a single PK column. Used by
 // the parallel-bulk-copy phase (v0.5.0) to compute chunk boundaries

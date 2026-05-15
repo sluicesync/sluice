@@ -49,7 +49,7 @@ func (MaskSSN) Name() string { return "mask:ssn" }
 
 // Redact applies the SSN mask. Refuses non-string input or
 // shape-mismatched input.
-func (MaskSSN) Redact(col *ir.Column, val any) (any, error) {
+func (MaskSSN) Redact(col *ir.Column, val any, _ []byte) (any, error) {
 	if val == nil {
 		return nil, nil
 	}
@@ -102,7 +102,7 @@ func (MaskPAN) Name() string { return "mask:pan" }
 // Redact applies the strict PAN mask. Refuses non-string input,
 // Luhn-invalid input, or input with fewer than 12 / more than 19
 // digits.
-func (MaskPAN) Redact(col *ir.Column, val any) (any, error) {
+func (MaskPAN) Redact(col *ir.Column, val any, _ []byte) (any, error) {
 	return maskPAN(col, val, true)
 }
 
@@ -126,7 +126,7 @@ func (MaskPANRelaxed) Name() string { return "mask:pan-relaxed" }
 // Redact applies the lenient PAN mask. Refuses non-string input
 // and inputs with fewer than 12 / more than 19 digits but does NOT
 // check the Luhn checksum.
-func (MaskPANRelaxed) Redact(col *ir.Column, val any) (any, error) {
+func (MaskPANRelaxed) Redact(col *ir.Column, val any, _ []byte) (any, error) {
 	return maskPAN(col, val, false)
 }
 
@@ -206,7 +206,7 @@ func (MaskEmail) Name() string { return "mask:email" }
 
 // Redact applies the email mask. Refuses non-string input or input
 // without an `@` separator.
-func (MaskEmail) Redact(col *ir.Column, val any) (any, error) {
+func (MaskEmail) Redact(col *ir.Column, val any, _ []byte) (any, error) {
 	if val == nil {
 		return nil, nil
 	}
@@ -267,7 +267,7 @@ type MaskCASIN struct{}
 func (MaskCASIN) Name() string { return "mask:ca-sin" }
 
 // Redact applies the CA SIN mask.
-func (MaskCASIN) Redact(col *ir.Column, val any) (any, error) {
+func (MaskCASIN) Redact(col *ir.Column, val any, _ []byte) (any, error) {
 	if val == nil {
 		return nil, nil
 	}
@@ -321,7 +321,7 @@ type MaskUKNIN struct{}
 func (MaskUKNIN) Name() string { return "mask:uk-nin" }
 
 // Redact applies the UK NIN mask.
-func (MaskUKNIN) Redact(col *ir.Column, val any) (any, error) {
+func (MaskUKNIN) Redact(col *ir.Column, val any, _ []byte) (any, error) {
 	if val == nil {
 		return nil, nil
 	}
@@ -384,7 +384,7 @@ type MaskIBAN struct{}
 func (MaskIBAN) Name() string { return "mask:iban" }
 
 // Redact applies the IBAN mask.
-func (MaskIBAN) Redact(col *ir.Column, val any) (any, error) {
+func (MaskIBAN) Redact(col *ir.Column, val any, _ []byte) (any, error) {
 	if val == nil {
 		return nil, nil
 	}
@@ -466,7 +466,7 @@ type MaskUUID struct{}
 func (MaskUUID) Name() string { return "mask:uuid" }
 
 // Redact applies the UUID mask.
-func (MaskUUID) Redact(col *ir.Column, val any) (any, error) {
+func (MaskUUID) Redact(col *ir.Column, val any, _ []byte) (any, error) {
 	if val == nil {
 		return nil, nil
 	}

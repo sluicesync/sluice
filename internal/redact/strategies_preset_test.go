@@ -13,7 +13,7 @@ import (
 // TestMaskSSN covers the happy path + every refusal branch.
 func TestMaskSSN(t *testing.T) {
 	t.Run("happy path", func(t *testing.T) {
-		got, err := MaskSSN{}.Redact(&ir.Column{Name: "ssn"}, "123-45-6789")
+		got, err := MaskSSN{}.Redact(&ir.Column{Name: "ssn"}, "123-45-6789", nil)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -22,7 +22,7 @@ func TestMaskSSN(t *testing.T) {
 		}
 	})
 	t.Run("zeros preserved at tail", func(t *testing.T) {
-		got, err := MaskSSN{}.Redact(&ir.Column{Name: "ssn"}, "001-02-0003")
+		got, err := MaskSSN{}.Redact(&ir.Column{Name: "ssn"}, "001-02-0003", nil)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -31,7 +31,7 @@ func TestMaskSSN(t *testing.T) {
 		}
 	})
 	t.Run("nil passthrough", func(t *testing.T) {
-		got, err := MaskSSN{}.Redact(&ir.Column{Name: "ssn"}, nil)
+		got, err := MaskSSN{}.Redact(&ir.Column{Name: "ssn"}, nil, nil)
 		if err != nil || got != nil {
 			t.Errorf("nil: got %v err %v; want nil nil", got, err)
 		}
@@ -57,7 +57,7 @@ func TestMaskSSN(t *testing.T) {
 	for _, c := range refusals {
 		c := c
 		t.Run("refuse "+c.name, func(t *testing.T) {
-			_, err := MaskSSN{}.Redact(&ir.Column{Name: "ssn"}, c.input)
+			_, err := MaskSSN{}.Redact(&ir.Column{Name: "ssn"}, c.input, nil)
 			if err == nil {
 				t.Fatalf("expected error; got nil for input %v", c.input)
 			}
@@ -83,7 +83,7 @@ func TestMaskPAN(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			got, err := MaskPAN{}.Redact(&ir.Column{Name: "pan"}, c.input)
+			got, err := MaskPAN{}.Redact(&ir.Column{Name: "pan"}, c.input, nil)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -93,7 +93,7 @@ func TestMaskPAN(t *testing.T) {
 		})
 	}
 	t.Run("nil passthrough", func(t *testing.T) {
-		got, err := MaskPAN{}.Redact(&ir.Column{Name: "pan"}, nil)
+		got, err := MaskPAN{}.Redact(&ir.Column{Name: "pan"}, nil, nil)
 		if err != nil || got != nil {
 			t.Errorf("nil: got %v err %v; want nil nil", got, err)
 		}
@@ -117,7 +117,7 @@ func TestMaskPAN(t *testing.T) {
 	for _, c := range refusals {
 		c := c
 		t.Run("refuse "+c.name, func(t *testing.T) {
-			_, err := MaskPAN{}.Redact(&ir.Column{Name: "pan"}, c.input)
+			_, err := MaskPAN{}.Redact(&ir.Column{Name: "pan"}, c.input, nil)
 			if err == nil {
 				t.Fatalf("expected error; got nil")
 			}
@@ -128,7 +128,7 @@ func TestMaskPAN(t *testing.T) {
 	}
 
 	t.Run("non-string refused", func(t *testing.T) {
-		_, err := MaskPAN{}.Redact(&ir.Column{Name: "pan"}, int64(4111111111111111))
+		_, err := MaskPAN{}.Redact(&ir.Column{Name: "pan"}, int64(4111111111111111), nil)
 		if err == nil || !strings.Contains(err.Error(), "unsupported type") {
 			t.Errorf("expected unsupported-type error; got %v", err)
 		}
@@ -138,7 +138,7 @@ func TestMaskPAN(t *testing.T) {
 // TestMaskPANRelaxed covers lenient PAN masking (no Luhn check).
 func TestMaskPANRelaxed(t *testing.T) {
 	t.Run("Luhn-invalid accepted", func(t *testing.T) {
-		got, err := MaskPANRelaxed{}.Redact(&ir.Column{Name: "pan"}, "4111111111111112")
+		got, err := MaskPANRelaxed{}.Redact(&ir.Column{Name: "pan"}, "4111111111111112", nil)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -147,7 +147,7 @@ func TestMaskPANRelaxed(t *testing.T) {
 		}
 	})
 	t.Run("Luhn-valid still works", func(t *testing.T) {
-		got, err := MaskPANRelaxed{}.Redact(&ir.Column{Name: "pan"}, "4111111111111111")
+		got, err := MaskPANRelaxed{}.Redact(&ir.Column{Name: "pan"}, "4111111111111111", nil)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -161,7 +161,7 @@ func TestMaskPANRelaxed(t *testing.T) {
 		}
 	})
 	t.Run("digit-count check still applies", func(t *testing.T) {
-		_, err := MaskPANRelaxed{}.Redact(&ir.Column{Name: "pan"}, "41111111111") // 11 digits
+		_, err := MaskPANRelaxed{}.Redact(&ir.Column{Name: "pan"}, "41111111111", nil) // 11 digits
 		if err == nil || !strings.Contains(err.Error(), "12-19 digits") {
 			t.Errorf("expected digit-count refusal; got %v", err)
 		}
@@ -183,7 +183,7 @@ func TestMaskEmail(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			got, err := MaskEmail{}.Redact(&ir.Column{Name: "email"}, c.input)
+			got, err := MaskEmail{}.Redact(&ir.Column{Name: "email"}, c.input, nil)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -193,7 +193,7 @@ func TestMaskEmail(t *testing.T) {
 		})
 	}
 	t.Run("nil passthrough", func(t *testing.T) {
-		got, err := MaskEmail{}.Redact(&ir.Column{Name: "email"}, nil)
+		got, err := MaskEmail{}.Redact(&ir.Column{Name: "email"}, nil, nil)
 		if err != nil || got != nil {
 			t.Errorf("nil: got %v err %v; want nil nil", got, err)
 		}
@@ -214,7 +214,7 @@ func TestMaskEmail(t *testing.T) {
 	for _, c := range refusals {
 		c := c
 		t.Run("refuse "+c.name, func(t *testing.T) {
-			_, err := MaskEmail{}.Redact(&ir.Column{Name: "email"}, c.input)
+			_, err := MaskEmail{}.Redact(&ir.Column{Name: "email"}, c.input, nil)
 			if err == nil {
 				t.Fatalf("expected error; got nil")
 			}
@@ -225,7 +225,7 @@ func TestMaskEmail(t *testing.T) {
 	}
 
 	t.Run("non-string refused", func(t *testing.T) {
-		_, err := MaskEmail{}.Redact(&ir.Column{Name: "email"}, 42)
+		_, err := MaskEmail{}.Redact(&ir.Column{Name: "email"}, 42, nil)
 		if err == nil || !strings.Contains(err.Error(), "unsupported type") {
 			t.Errorf("expected unsupported-type error; got %v", err)
 		}
@@ -244,7 +244,7 @@ func TestMaskCASIN(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			got, err := MaskCASIN{}.Redact(&ir.Column{Name: "sin"}, c.input)
+			got, err := MaskCASIN{}.Redact(&ir.Column{Name: "sin"}, c.input, nil)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -254,7 +254,7 @@ func TestMaskCASIN(t *testing.T) {
 		})
 	}
 	t.Run("nil passthrough", func(t *testing.T) {
-		got, err := MaskCASIN{}.Redact(&ir.Column{Name: "sin"}, nil)
+		got, err := MaskCASIN{}.Redact(&ir.Column{Name: "sin"}, nil, nil)
 		if err != nil || got != nil {
 			t.Errorf("nil: got %v err %v", got, err)
 		}
@@ -279,7 +279,7 @@ func TestMaskCASIN(t *testing.T) {
 	for _, c := range refusals {
 		c := c
 		t.Run("refuse "+c.name, func(t *testing.T) {
-			_, err := MaskCASIN{}.Redact(&ir.Column{Name: "sin"}, c.input)
+			_, err := MaskCASIN{}.Redact(&ir.Column{Name: "sin"}, c.input, nil)
 			if err == nil {
 				t.Fatalf("expected error; got nil")
 			}
@@ -302,7 +302,7 @@ func TestMaskUKNIN(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			got, err := MaskUKNIN{}.Redact(&ir.Column{Name: "nin"}, c.input)
+			got, err := MaskUKNIN{}.Redact(&ir.Column{Name: "nin"}, c.input, nil)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -330,7 +330,7 @@ func TestMaskUKNIN(t *testing.T) {
 	for _, c := range refusals {
 		c := c
 		t.Run("refuse "+c.name, func(t *testing.T) {
-			_, err := MaskUKNIN{}.Redact(&ir.Column{Name: "nin"}, c.input)
+			_, err := MaskUKNIN{}.Redact(&ir.Column{Name: "nin"}, c.input, nil)
 			if err == nil {
 				t.Fatalf("expected error; got nil")
 			}
@@ -354,7 +354,7 @@ func TestMaskIBAN(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			got, err := MaskIBAN{}.Redact(&ir.Column{Name: "iban"}, c.input)
+			got, err := MaskIBAN{}.Redact(&ir.Column{Name: "iban"}, c.input, nil)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -380,7 +380,7 @@ func TestMaskIBAN(t *testing.T) {
 	for _, c := range refusals {
 		c := c
 		t.Run("refuse "+c.name, func(t *testing.T) {
-			_, err := MaskIBAN{}.Redact(&ir.Column{Name: "iban"}, c.input)
+			_, err := MaskIBAN{}.Redact(&ir.Column{Name: "iban"}, c.input, nil)
 			if err == nil {
 				t.Fatalf("expected error; got nil")
 			}
@@ -404,7 +404,7 @@ func TestMaskUUID(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			got, err := MaskUUID{}.Redact(&ir.Column{Name: "id"}, c.input)
+			got, err := MaskUUID{}.Redact(&ir.Column{Name: "id"}, c.input, nil)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -436,7 +436,7 @@ func TestMaskUUID(t *testing.T) {
 	for _, c := range refusals {
 		c := c
 		t.Run("refuse "+c.name, func(t *testing.T) {
-			_, err := MaskUUID{}.Redact(&ir.Column{Name: "id"}, c.input)
+			_, err := MaskUUID{}.Redact(&ir.Column{Name: "id"}, c.input, nil)
 			if err == nil {
 				t.Fatalf("expected error; got nil")
 			}

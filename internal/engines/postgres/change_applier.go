@@ -203,6 +203,17 @@ type ChangeApplier struct {
 	// (Phase 1.5, roadmap item 15a follow-on). Symmetric with the
 	// MySQL applier; see that engine for the design.
 	redactor *redact.Registry
+
+	// streamID is the active stream's identifier, recorded by
+	// [SetStreamID] at Streamer startup. Threaded through every
+	// redactor.ApplyRow call so randomize:* strategies (PII Phase 2.c,
+	// v0.59.0) derive a per-row replay-stable seed from streamID +
+	// table + column + PK values. Empty for direct API users that
+	// don't go through the streamer (chain-restore, broker, etc.);
+	// randomize:* still works (the seed remains stable per
+	// (table, column, PK) tuple) but operators wanting cross-stream
+	// determinism should set the stream-id explicitly.
+	streamID string
 }
 
 // SetMaxBufferBytes implements [ir.MaxBufferBytesSetter]. The
@@ -234,25 +245,83 @@ func (a *ChangeApplier) SetRedactor(registry any) {
 	a.redactor = r
 }
 
+// SetStreamID implements [ir.StreamIDSetter] (PII Phase 2.c,
+// v0.59.0). Records the active stream's identifier so each CDC
+// event's redact.ApplyRow call can derive a replay-stable
+// per-row seed for randomize:* strategies. Idempotent; the
+// streamer may call this on every Run.
+func (a *ChangeApplier) SetStreamID(streamID string) {
+	a.streamID = streamID
+}
+
 // redactChange mirrors the MySQL applier's redactChange. nil/empty
 // redactor is the no-op fast path. PII Phase 1.5 row-data scope:
 // Insert.Row, Update.Before/After, Delete.Before.
-func (a *ChangeApplier) redactChange(c ir.Change) error {
+//
+// PII Phase 2.c (v0.59.0): every ApplyRow call passes the table's
+// PK column list + active streamID so randomize:* strategies
+// derive a per-row replay-stable seed. The PK is fetched via the
+// existing per-table pkCache (one info_schema round-trip per
+// table on first sight). A nil tx falls back to the applier's
+// *sql.DB connection — schema metadata is stable across the tx
+// boundary so this is safe.
+func (a *ChangeApplier) redactChange(ctx context.Context, c ir.Change) error {
 	if a.redactor.Empty() {
 		return nil
 	}
 	switch v := c.(type) {
 	case ir.Insert:
-		return a.redactor.ApplyRow(v.Schema, v.Table, v.Row)
-	case ir.Update:
-		if err := a.redactor.ApplyRow(v.Schema, v.Table, v.Before); err != nil {
+		pk, err := a.pkForRedact(ctx, applierSchema(a.schema, v.Schema), v.Table)
+		if err != nil {
 			return err
 		}
-		return a.redactor.ApplyRow(v.Schema, v.Table, v.After)
+		return a.redactor.ApplyRow(v.Schema, v.Table, pk, v.Row, a.streamID)
+	case ir.Update:
+		pk, err := a.pkForRedact(ctx, applierSchema(a.schema, v.Schema), v.Table)
+		if err != nil {
+			return err
+		}
+		if err := a.redactor.ApplyRow(v.Schema, v.Table, pk, v.Before, a.streamID); err != nil {
+			return err
+		}
+		return a.redactor.ApplyRow(v.Schema, v.Table, pk, v.After, a.streamID)
 	case ir.Delete:
-		return a.redactor.ApplyRow(v.Schema, v.Table, v.Before)
+		pk, err := a.pkForRedact(ctx, applierSchema(a.schema, v.Schema), v.Table)
+		if err != nil {
+			return err
+		}
+		return a.redactor.ApplyRow(v.Schema, v.Table, pk, v.Before, a.streamID)
 	}
 	return nil
+}
+
+// pkForRedact returns the cached PK column list for the named
+// table using the applier's connection pool. Wrapper that lets
+// redactChange call pkFor without an open *sql.Tx — schema
+// metadata is stable across tx boundaries, so a DB-level query
+// is safe here and avoids the per-change tx-open cost when the
+// applier hasn't seen the table yet.
+//
+// Returns nil PK when the table has no primary key; randomize:*
+// strategies then refuse with a clear error (preflight should
+// catch the no-PK case before CDC events arrive, but defense-
+// in-depth applies here).
+func (a *ChangeApplier) pkForRedact(ctx context.Context, schema, table string) ([]string, error) {
+	qn := schema + "." + table
+	if cached, ok := a.pkCache[qn]; ok {
+		return cached, nil
+	}
+	tx, err := a.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: applier: pkForRedact: begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	pk, err := loadPrimaryKey(ctx, tx, schema, table)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: applier: pkForRedact: %w", err)
+	}
+	a.pkCache[qn] = pk
+	return pk, nil
 }
 
 // txExec wraps tx.ExecContext with the applier's per-exec timeout
@@ -633,7 +702,7 @@ func (a *ChangeApplier) Apply(ctx context.Context, streamID string, changes <-ch
 // confirmed_flush_lsn past this change.
 func (a *ChangeApplier) applyOne(ctx context.Context, streamID string, c ir.Change) error {
 	// PII Phase 1.5: redact CDC row data before dispatch.
-	if err := a.redactChange(c); err != nil {
+	if err := a.redactChange(ctx, c); err != nil {
 		return classifyApplierError(fmt.Errorf("postgres: applier: redact: %w", err))
 	}
 	tx, err := a.db.BeginTx(ctx, nil)

@@ -205,7 +205,7 @@ func (a *ChangeApplier) applyOneBatch(ctx context.Context, streamID string, chan
 
 	// PII Phase 1.5: redact the first change before dispatch.
 	// Subsequent batch members are redacted in the loop below.
-	if err := a.redactChange(first); err != nil {
+	if err := a.redactChange(ctx, first); err != nil {
 		return 0, ir.Position{}, false, classifyApplierError(fmt.Errorf("mysql: applier: redact: %w", err))
 	}
 
@@ -285,7 +285,7 @@ func (a *ChangeApplier) applyOneBatch(ctx context.Context, streamID string, chan
 			}
 			// PII Phase 1.5: redact each subsequent batch member
 			// before dispatch. nil/empty redactor is a no-op.
-			if err := a.redactChange(c); err != nil {
+			if err := a.redactChange(ctx, c); err != nil {
 				_ = tx.Rollback()
 				return 0, ir.Position{}, false, classifyApplierError(fmt.Errorf("mysql: applier: redact: %w", err))
 			}

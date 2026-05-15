@@ -147,6 +147,12 @@ type Redaction struct {
 	// Char is the mask character when Strategy == "mask". Defaults
 	// to "X" when empty. Single rune only.
 	Char string `koanf:"char"`
+
+	// Min / Max are the integer bounds when Strategy == "randomize"
+	// and Form == "int". PII Phase 2.c (v0.59.0). Inclusive; Min
+	// must not exceed Max. Ignored for other forms / strategies.
+	Min int64 `koanf:"min"`
+	Max int64 `koanf:"max"`
 }
 
 // Mapping is a single per-column override.

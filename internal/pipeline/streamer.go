@@ -776,6 +776,11 @@ func (s *Streamer) runOnce(ctx context.Context) error {
 	if ownsApplier {
 		defer closeIf(applier)
 	}
+	// PII Phase 2.c (v0.59.0): plumb the resolved stream-id into the
+	// applier so randomize:* CDC redactions derive replay-stable seeds.
+	// Empty streamID is a no-op via applyStreamID's guard; in
+	// practice resolveStreamID always returns a non-empty value.
+	applyStreamID(applier, streamID)
 
 	// ---- 1a. Optional Prometheus metrics endpoint ----
 	// When --metrics-listen is set, a small HTTP server runs alongside
