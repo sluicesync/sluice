@@ -2,9 +2,25 @@
 
 ## Status
 
-**Draft**, not yet accepted. No code shipped. Captures the
-problem space + investigation paths so a future implementation
-session has a clear starting point.
+**Accepted as a discovery doc** (2026-05-15). No code shipped and
+no implementation committed — acceptance scopes the problem space
++ investigation paths so a future throughput-priority session has
+a clear starting point. Per the Recommendation below, Phase A
+(instrumentation) is deliberately deferred behind PII Phase 4
+(ADR-0041) and any other near-term roadmap items; it becomes a
+focused v0.63.0+ effort when throughput is next the priority.
+
+Recommendation #3 (re-run the medium baseline against v0.62.0 and
+record in `local-rig/baselines.md`) is **satisfied**: the v0.62.0
+post-release validation cycle re-ran the medium fixture on the
+local-local rig at ~85.7k–89.4k rows/sec under default config
+(vs the v0.61.0 default-config ~33k baseline), recorded the result
+in `sluice-testing/local-rig/baselines.md`, and additionally
+captured the per-table `information_schema.tables.table_rows`
+estimate vs actual `COUNT(*)` delta (0.10–2.6% undershoot, and
+*noisy* — a ~2.7% swing across `ANALYZE` runs on identical data),
+which directly feeds the H-list in this ADR. See
+`sluice-testing/session-reports/v0.62.0.md`.
 
 ## Context
 
