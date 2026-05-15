@@ -1,0 +1,55 @@
+sluice — DDL fixture vendored from dolthub/sqllogictest
+=======================================================
+
+This directory contains the file `createtable1.test`, vendored
+verbatim (unmodified) from Dolt's mirror of the SQLite consortium's
+sqllogictest corpus.
+
+Upstream source
+---------------
+  Repository : https://github.com/dolthub/sqllogictest
+  Branch     : master
+  Path       : test/ddl/createtable/createtable1.test
+  Repo SHA   : a1f4aa3c1d691552a4a03d9603c45bcf93d0bb9d  (head of `master` at vendor time)
+  File SHA   : 2ec15849a2d07fe11c7918b1aeb4daceb66d00ef  (last commit that touched the file)
+  Vendored on: 2026-05-14
+  Size       : 13,725 lines / ~586 KB
+  Fetched via: https://raw.githubusercontent.com/dolthub/sqllogictest/master/test/ddl/createtable/createtable1.test
+
+The file is included unchanged; no normalization, filtering, or
+rewriting has been applied at vendor time. Any dialect-specific
+filtering happens at test-run time inside `ddl_fixture_test.go`.
+
+License & provenance
+--------------------
+The upstream `dolthub/sqllogictest` repository describes itself as an
+"unofficial mirror" of the SQLite consortium's sqllogictest corpus
+(see its README). The original SQLite consortium sqllogictest material
+is in the public domain
+(https://www.sqlite.org/sqllogictest/doc/trunk/about.wiki). The Dolt
+mirror's parser/runner Go code is MIT-licensed in the typical Dolt
+project convention; the test corpus files (this one included) are
+treated by the Dolt project as the public-domain SQLite-derived
+fixtures they originally were.
+
+sluice itself is licensed under Apache-2.0
+(see the top-level LICENSE file at the repo root). Apache-2.0 is
+compatible with both MIT and public-domain inclusions; vendoring this
+fixture for use in sluice's test suite poses no licensing conflict.
+
+Why vendored (not git submodule)
+--------------------------------
+A vendored copy gives reproducible test runs without a submodule init
+step in fresh clones. The trade-off is that updates to the upstream
+file require a manual refresh: re-fetch the file from the URL above,
+update the "Repo SHA" / "File SHA" / "Vendored on" / "Size" entries in
+this NOTICE, and verify the test still passes against the new corpus.
+
+Test consumer
+-------------
+  internal/translate/ddl_fixture_test.go  (build tag: integration ddlfixture)
+
+The test runs only when both `integration` and `ddlfixture` build
+tags are set, so default `go test ./...` and the default CI
+`Integration` job don't pay the testcontainer + fixture cost. See
+that file's package comment for the operator-facing run instructions.

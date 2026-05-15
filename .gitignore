@@ -15,6 +15,11 @@ coverage.txt
 coverage.html
 profile.out
 
+# Exception: vendored sqllogictest corpus files under testdata are
+# upstream fixtures we need to track, not Go test binaries. See
+# internal/translate/testdata/sqllogictest/NOTICE for provenance.
+!**/testdata/**/*.test
+
 # Go workspace files
 go.work
 go.work.sum
