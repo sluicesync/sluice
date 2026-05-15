@@ -437,6 +437,10 @@ func (m *Migrator) Run(ctx context.Context) error {
 		parallelism:    resolveBulkParallelism(m.BulkParallelism, runtime.NumCPU()),
 		minRows:        resolveBulkParallelMinRows(m.BulkParallelMinRows),
 		maxBufferBytes: m.MaxBufferBytes,
+		// ADR-0043 gate (3): --force-cold-start skipped the Bug 9
+		// preflight, so the target may hold rows; the fast non-upsert
+		// loader must not run on a chunk in that case.
+		forceColdStart: m.ForceColdStart,
 	}
 
 	if err := runBulkCopyPhases(ctx, rc, &state, schema, rr, sw, rw, resuming, m.BulkBatchSize, parallelDeps, m.Redactor); err != nil {

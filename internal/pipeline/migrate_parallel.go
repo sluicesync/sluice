@@ -53,6 +53,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sync/errgroup"
@@ -101,6 +102,62 @@ type parallelBulkCopyDeps struct {
 	// implements it. Zero means no cap (engines fall back to their
 	// built-in default).
 	maxBufferBytes int64
+
+	// forceColdStart is the operator's --force-cold-start flag,
+	// threaded verbatim from [Migrator.ForceColdStart]. It is gate
+	// (3) of the ADR-0043 fast-loader selection: when set, the Bug 9
+	// cold-start pre-flight was skipped, the target may already hold
+	// rows, and a non-upsert WriteRows would collide on the primary
+	// key — so the chunk must take the idempotent branch even on a
+	// fresh, zero-progress run. See [useFastLoader].
+	forceColdStart bool
+}
+
+// useFastLoader is the ADR-0043 gate: it decides whether a parallel
+// chunk may stream through the engine-native fast loader
+// ([ir.RowWriter.WriteRows] — PG COPY / MySQL LOAD DATA, with each
+// engine's automatic fallback) instead of the generic
+// [ir.IdempotentRowWriter.WriteRowsIdempotent] batched upsert.
+//
+// A chunk uses the fast loader IFF ALL of:
+//
+//   - (1) the migration is NOT a resume run, AND
+//   - (2) the chunk has zero recorded prior progress
+//     (LastPK == nil && RowsCopied == 0 && State != Complete), AND
+//   - (3) the cold-start pre-flight was NOT bypassed via
+//     --force-cold-start (the target is proven empty by Bug 9).
+//
+// Otherwise the chunk uses the idempotent upsert path exactly as
+// before. All three gates are correctness-forced, not tunable: the
+// fast path is non-upsert, so it is only ever taken where a primary-
+// key collision is provably impossible. (1)+(2) give resume safety —
+// a crash during a first-pass fast chunk is safe because the *next*
+// invocation is a resume run, fails gate (1), and replays the chunk
+// idempotently (the ADR-0043 load-bearing correctness claim). (3)
+// covers the deliberate "bulk-copy into a populated target" override.
+//
+// Gate (4) in ADR-0043 ("NOT the mid-stream live-add path") is
+// structurally vacuous for copyChunk and is deliberately NOT threaded
+// as a parameter: the parallel-copy path is unreachable from live-add.
+// runBulkCopyForAddTable copies via the single-table
+// copyTableIdempotent and never enters tryParallelCopyTable /
+// copyChunk (ADR-0036). Threading an always-false flag would be dead
+// surface; per the clean-code tenet the invariant is documented here
+// instead. If parallel copy is ever wired into the live-add path, the
+// gate must be reintroduced as a real parameter at that point.
+//
+// Pure and table-unit-testable: no I/O, no state mutation.
+func useFastLoader(resuming, forceColdStart bool, chunk ir.TableChunkProgress) bool {
+	if resuming { // gate (1)
+		return false
+	}
+	if forceColdStart { // gate (3)
+		return false
+	}
+	// gate (2): zero recorded prior progress.
+	return chunk.LastPK == nil &&
+		chunk.RowsCopied == 0 &&
+		chunk.State != ir.TableProgressComplete
 }
 
 // shouldParallelChunk decides whether a given table should take the
@@ -210,7 +267,7 @@ func tryParallelCopyTable(
 		return false, nil
 	}
 
-	if err := runChunks(ctx, rc, state, stateMu, primaryRows, primaryRW, deps, table, chunks, bulkBatchSize, redactor); err != nil {
+	if err := runChunks(ctx, rc, state, stateMu, primaryRows, primaryRW, deps, table, chunks, bulkBatchSize, redactor, resuming); err != nil {
 		return false, err
 	}
 
@@ -298,6 +355,10 @@ func resolveChunks(
 // reuses the orchestrator's primary connections) and spawns one
 // goroutine per chunk via errgroup. The first error cancels the
 // shared ctx so peers unwind cleanly.
+//
+// resuming (gate (1)) and deps.forceColdStart (gate (3)) are threaded
+// to every chunk so [copyChunk] can run the ADR-0043 [useFastLoader]
+// gate per chunk.
 func runChunks(
 	ctx context.Context,
 	rc resumeContext,
@@ -310,6 +371,7 @@ func runChunks(
 	chunks []ir.TableChunkProgress,
 	bulkBatchSize int,
 	redactor *redact.Registry,
+	resuming bool,
 ) error {
 	additionalReaders, additionalWriters, closeFns, err := openChunkConnections(ctx, deps, len(chunks)-1)
 	if err != nil {
@@ -340,7 +402,7 @@ func runChunks(
 			chunkRW = additionalWriters[k-1]
 		}
 		g.Go(func() error {
-			return copyChunk(gctx, rc, state, stateMu, chunkRows, chunkRW, table, pkCols, k, limit, redactor)
+			return copyChunk(gctx, rc, state, stateMu, chunkRows, chunkRW, table, pkCols, k, limit, redactor, resuming, deps.forceColdStart)
 		})
 	}
 	return g.Wait()
@@ -396,6 +458,18 @@ func openChunkConnections(ctx context.Context, deps *parallelBulkCopyDeps, n int
 // The implementation uses a `BoundedBatchedRowReader` (optional
 // surface) when available and falls back to a manual filter on the
 // returned rows otherwise. ADR-0019 records the rationale.
+//
+// ADR-0043: when [useFastLoader] returns true for this chunk (a fresh,
+// zero-progress, non-resume, non-force-cold-start run), the chunk's
+// whole PK-bounded range is drained through ONE
+// [ir.RowWriter.WriteRows] call (PG COPY / MySQL LOAD DATA) via a
+// memory-bounded streaming pump, and a single terminal per-chunk
+// checkpoint is written on success — no per-batch checkpoint. A crash
+// before that terminal checkpoint leaves the chunk with zero recorded
+// progress, so the resume run replays the whole chunk under the
+// idempotent branch (gate (1) fails). Otherwise the chunk uses the
+// existing per-batch [ir.IdempotentRowWriter.WriteRowsIdempotent]
+// cursor loop unchanged.
 func copyChunk(
 	ctx context.Context,
 	rc resumeContext,
@@ -408,14 +482,12 @@ func copyChunk(
 	chunkIndex int,
 	limit int,
 	redactor *redact.Registry,
+	resuming bool,
+	forceColdStart bool,
 ) (retErr error) {
 	br, ok := rr.(ir.BatchedRowReader)
 	if !ok {
 		return errors.New("pipeline: copyChunk: row reader does not implement BatchedRowReader")
-	}
-	iw, ok := rw.(ir.IdempotentRowWriter)
-	if !ok {
-		return errors.New("pipeline: copyChunk: row writer does not implement IdempotentRowWriter")
 	}
 
 	stateMu.Lock()
@@ -434,6 +506,24 @@ func copyChunk(
 			slog.Int("chunk", chunkIndex),
 			slog.Int64("rows_copied", chunk.RowsCopied))
 		return nil
+	}
+
+	// ADR-0043 fast-loader gate. Evaluated once at chunk entry from
+	// the three correctness-forced gates (resume / prior-progress /
+	// force-cold-start). When true the chunk takes the native bulk
+	// loader; otherwise it falls through to the idempotent branch,
+	// which additionally requires the IdempotentRowWriter surface.
+	if useFastLoader(resuming, forceColdStart, chunk) {
+		return copyChunkFast(ctx, rc, state, stateMu, br, rw, table, pkCols, chunkIndex, chunk, limit, redactor)
+	}
+
+	iw, ok := rw.(ir.IdempotentRowWriter)
+	if !ok {
+		// Should never happen: both shipped engines implement
+		// IdempotentRowWriter, and the fast path above is the only
+		// non-idempotent route. Loud precondition rather than a
+		// silent non-upsert write that could collide on resume.
+		return errors.New("pipeline: copyChunk: idempotent branch selected but row writer does not implement IdempotentRowWriter")
 	}
 
 	cursor := chunk.LastPK
@@ -597,6 +687,210 @@ func copyChunk(
 		slog.Duration("chunk_wall", chunkWall),
 		slog.Duration("batch_wall_total", totalBatchWall),
 		slog.Duration("non_batch_wall", chunkWall-totalBatchWall),
+		slog.Float64("rows_per_sec", rowsPerSec))
+
+	return nil
+}
+
+// copyChunkFast is the ADR-0043 fast-loader branch for a fresh,
+// zero-progress, non-resume, non-force-cold-start chunk (gated by
+// [useFastLoader] in [copyChunk]). It drains the chunk's whole
+// PK-bounded range (LowerPK exclusive .. UpperPK inclusive) through
+// ONE [ir.RowWriter.WriteRows] call — one PG COPY / MySQL LOAD DATA
+// for the entire chunk range — instead of the per-batch idempotent
+// upsert loop.
+//
+// Memory-bounding (ADR-0028) is preserved: the whole chunk is NOT
+// buffered. A streaming pump goroutine pages the reader with the same
+// cursor-driven [ir.BatchedRowReader.ReadRowsBatch] + limit the
+// idempotent loop uses, forwarding rows one-at-a-time into a single
+// unbuffered channel that WriteRows consumes. At most one batch's
+// worth of rows is ever in flight; the writer applies back-pressure
+// through the channel exactly as the single-reader [copyTable] path
+// does.
+//
+// Checkpoint coarsening (ADR-0043 design point b, locked): there is
+// NO per-batch checkpoint on this path. On success a single terminal
+// per-chunk checkpoint (RowsCopied = n, State = Complete) is written.
+// A crash before that terminal write leaves the chunk with zero
+// recorded progress, so the resume run fails useFastLoader gate (1)
+// and replays the whole chunk under the idempotent branch — the
+// load-bearing correctness property. The redact-wrap and PK/progress
+// observation (teePKAndCount / pt.observeRow) match the idempotent
+// loop so progress lines and PII redaction behave identically.
+func copyChunkFast(
+	ctx context.Context,
+	rc resumeContext,
+	state *ir.MigrationState,
+	stateMu *sync.Mutex,
+	br ir.BatchedRowReader,
+	rw ir.RowWriter,
+	table *ir.Table,
+	pkCols []string,
+	chunkIndex int,
+	chunk ir.TableChunkProgress,
+	limit int,
+	redactor *redact.Registry,
+) (retErr error) {
+	// ADR-0042 Phase A — per-chunk wall-time instrumentation (kept;
+	// permanent diagnostic). On the fast path there is one logical
+	// "batch" (the single WriteRows stream), so batch_wall_total ≈
+	// chunk_wall and the rows_per_sec line is directly comparable to
+	// the idempotent path's per-chunk rate — that comparison is the
+	// ADR-0043 "rate rises toward single-reader" acceptance signal.
+	chunkStart := time.Now()
+	slog.DebugContext(ctx, "adr0042: chunk start",
+		slog.String("table", table.Name),
+		slog.Int("chunk", chunkIndex),
+		slog.Int("batch_limit", limit),
+		slog.Bool("fast_loader", true),
+		slog.Time("t_start", chunkStart))
+
+	pt := newProgressTickerForChunk(ctx, progressInterval, table.Name, chunkIndex)
+	// Async row-count for ETA; runs on its own connection, never
+	// blocks the pump. Same disposition as the idempotent loop.
+	kickOffRowCount(ctx, br, table, pt)
+	defer func() { pt.Stop(ctx, retErr) }()
+
+	// streamCtx bounds both the pump and the writer; cancelling it on
+	// any error unwinds the reader goroutine cleanly (same shape as
+	// copyTable's child-ctx + defer-cancel).
+	streamCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	tracker := newPKTracker(pkCols)
+	var rowCount int64
+
+	// pump pages the reader cursor-by-cursor (memory-bounded: one
+	// ReadRowsBatch of <= limit rows in flight at a time), bounds each
+	// page by the chunk's UpperPK via the existing filterByUpperBound
+	// gate, and forwards every row into the single `out` channel that
+	// the one WriteRows call drains. The cursor starts at the chunk's
+	// LowerPK (nil => table start) and advances by the last PK seen;
+	// LastPK is guaranteed nil here (useFastLoader gate (2)) so there
+	// is no mid-chunk resume cursor to honour. The downstream channel
+	// is unbuffered, so the writer back-pressures the pump exactly as
+	// the single-reader copyTable path does.
+	out := make(chan ir.Row)
+	pumpErr := make(chan error, 1)
+	go func() {
+		defer close(out)
+		cursor := chunk.LowerPK
+		for {
+			rowsCh, err := br.ReadRowsBatch(streamCtx, table, cursor, limit)
+			if err != nil {
+				pumpErr <- fmt.Errorf("read chunk %d batch: %w", chunkIndex, err)
+				return
+			}
+			var batchCount int64
+			filtered := filterByUpperBound(streamCtx, rowsCh, pkCols, chunk.UpperPK)
+			for row := range filtered {
+				tracker.observe(row)
+				pt.observeRow(row)
+				batchCount++
+				atomic.AddInt64(&rowCount, 1)
+				select {
+				case out <- row:
+				case <-streamCtx.Done():
+					pumpErr <- streamCtx.Err()
+					return
+				}
+			}
+			if batchCount == 0 {
+				pumpErr <- nil // clean end of chunk range
+				return
+			}
+			newCursor, ok := tracker.lastPK()
+			if !ok {
+				pumpErr <- errors.New("pipeline: copyChunkFast: batch produced rows but PK tracker captured none")
+				return
+			}
+			cursor = newCursor
+			if batchCount < int64(limit) {
+				pumpErr <- nil // short page => end of data within chunk
+				return
+			}
+		}
+	}()
+
+	// PII Phase 1: same redact-wrap as the idempotent loop / copyTable.
+	redacted, redactErrFn := redactRows(streamCtx, out, redactor, table.Schema, table.Name, table.Columns, pkCols, "")
+
+	// One native bulk-load call for the whole chunk range. WriteRows
+	// drains `redacted` until the pump closes `out`; PG runs a single
+	// CopyFrom, MySQL a single LOAD DATA (each with its automatic
+	// fallback to batched INSERT — still non-upsert, still safe on a
+	// proven-empty cold chunk).
+	writeErr := rw.WriteRows(streamCtx, table, redacted)
+
+	// On a writer-side error WriteRows may have returned without
+	// draining `out`, leaving the pump blocked on `out <- row`.
+	// Cancel streamCtx first so the pump's select hits <-Done() and
+	// posts its terminal status to the buffered pumpErr — otherwise
+	// the <-pumpErr below would deadlock against the blocked pump.
+	if writeErr != nil {
+		cancel()
+	}
+
+	// Drain the pump's terminal status. On the success path WriteRows
+	// returned because the pump closed `out`, so pumpErr is already
+	// buffered; on the error path the cancel above guarantees the
+	// pump posts within a scheduler tick. The cap-1 buffer makes the
+	// receive race-free either way.
+	pErr := <-pumpErr
+	if writeErr != nil {
+		return fmt.Errorf("write chunk %d (fast loader): %w", chunkIndex, writeErr)
+	}
+	if pErr != nil {
+		cancel()
+		return pErr
+	}
+	if err := redactErrFn(); err != nil {
+		cancel()
+		return fmt.Errorf("redact chunk %d (fast loader): %w", chunkIndex, err)
+	}
+	// Both the pump (writer side closed) and WriteRows have returned;
+	// rowCount is now stable.
+	finalRows := atomic.LoadInt64(&rowCount)
+
+	// Single terminal per-chunk checkpoint (ADR-0043 design point b):
+	// RowsCopied + State=Complete in one writeState. No LastPK is
+	// recorded — the chunk is atomically "done" or (on crash) "never
+	// started", never mid-cursor.
+	stateMu.Lock()
+	tp := state.TableProgress[table.Name]
+	if chunkIndex < len(tp.Chunks) {
+		tp.Chunks[chunkIndex].RowsCopied = finalRows
+		tp.Chunks[chunkIndex].State = ir.TableProgressComplete
+		state.TableProgress[table.Name] = tp
+	}
+	stateCopy := cloneStateForWrite(state)
+	stateMu.Unlock()
+	if err := writeState(ctx, rc, stateCopy); err != nil {
+		slog.WarnContext(ctx, "migration: fast-loader chunk completion state write failed; continuing",
+			slog.String("table", table.Name),
+			slog.Int("chunk", chunkIndex),
+			slog.String("err", err.Error()))
+	}
+
+	// ADR-0042 Phase A — per-chunk summary (one synthetic "batch").
+	chunkEnd := time.Now()
+	chunkWall := chunkEnd.Sub(chunkStart)
+	var rowsPerSec float64
+	if s := chunkWall.Seconds(); s > 0 {
+		rowsPerSec = float64(finalRows) / s
+	}
+	slog.DebugContext(ctx, "adr0042: chunk done",
+		slog.String("table", table.Name),
+		slog.Int("chunk", chunkIndex),
+		slog.Int64("rows", finalRows),
+		slog.Int("batches", 1),
+		slog.Bool("fast_loader", true),
+		slog.Time("t_start", chunkStart),
+		slog.Time("t_end", chunkEnd),
+		slog.Duration("chunk_wall", chunkWall),
+		slog.Duration("batch_wall_total", chunkWall),
+		slog.Duration("non_batch_wall", 0),
 		slog.Float64("rows_per_sec", rowsPerSec))
 
 	return nil
