@@ -11,8 +11,16 @@ falsified, H3/H5 confirmed as the primary MySQL-side hypotheses,
 and two new findings (N1: PG parallel-copy silently disabled on a
 freshly-loaded source due to stale `reltuples`; N2: PG → PG is
 not bulk-copy-bound on this fixture). The original "PG uses
-8-chunk parallel COPY" baseline framing is corrected. Phase B
-(pprof + fixture variant) and the N1 decision remain open.
+8-chunk parallel COPY" baseline framing is corrected. **Phase B
+executed 2026-05-15** (fixture variant + dual-engine pprof) — see
+"Phase B findings": **H5 falsified** (no gain from removing
+JSON/TINYINT), and a structural finding that **both engines'
+parallel-copy path uses the same generic `database/sql`
+batched-upsert writer** — neither LOAD DATA nor pgx `CopyFrom` is
+on the bulk-copy hot path, which reframes H3 and the ADR's
+"PG uses COPY-binary" premise. Phase C (route the chunk writer
+onto the native bulk loader) is proposed but **not implemented**;
+it is a separate gated decision. The N1 decision remains open.
 
 Recommendation #3 (re-run the medium baseline against v0.62.0 and
 record in `local-rig/baselines.md`) is **satisfied**: the v0.62.0
@@ -246,6 +254,175 @@ bulk copy, compare the go-sql-driver write hot path against pgx's
 isolate H5 from H3. N1 is a separate decision (fix the PG estimate
 vs. document the `ANALYZE`-first operator step) tracked outside
 the Phase B perf work.
+
+## Phase B findings (2026-05-15 — executed)
+
+Phase B was executed on the local-local rig (Win11 + Rancher
+Desktop), with a **from-source build** of `sluice` (`go build
+./cmd/sluice` at the v0.63.1 tree — not a released binary) so the
+permanent `adr0042:` DEBUG instrumentation is present. Two
+experiments: (1) the H5-vs-H3 fixture variant, (2) a CPU profile of
+each engine's bulk-copy path via the existing `--pprof-listen`
+endpoint (`net/http/pprof`; no throwaway code, nothing to clean up).
+
+### Experiment 1 — fixture variant (H5 vs H3)
+
+A faithful `medium-25t-100k-noenc.sql` variant was authored: every
+`JSON` column → `VARCHAR(255)`, every `TINYINT(1)` → `INT`, all row
+counts/shapes identical, and the changed columns populated with
+JSON-shaped text of comparable byte width (`CONCAT('{"idx": ', n,
+', "kind": "', …, '"}')`) so payload bytes are held ~constant —
+otherwise H5 would be confounded with "less data". MySQL → MySQL,
+default config, `--log-level=debug`, two runs each.
+
+Per-chunk `adr0042: chunk done` rows/sec (200 chunks/run, 25 tables
+× 8 chunks):
+
+| Run | mean | median | p10 | p90 |
+|---|---|---|---|---|
+| standard #1 | 18,209 | 17,821 | 16,061 | 21,614 |
+| standard #2 | 16,283 | 15,937 | 13,822 | 19,365 |
+| noenc #1 | 17,048 | 17,077 | 15,042 | 19,283 |
+| noenc #2 | 16,973 | 16,770 | 14,939 | 19,439 |
+
+The two standard runs **straddle** the two noenc runs; the noenc
+mean is within the standard run-to-run noise band (±~12%). Drilling
+into the directly-changed tables specifically (`audit_log`,
+`events` = JSON→VARCHAR; `products`, `feature_flags`, `webhooks` =
+TINYINT(1)→INT): no consistent improvement — `audit_log` was
+*faster* under standard on one comparison and slower on the next;
+`products`/`feature_flags`/`webhooks` moved within ±15% with no
+directional signal. Total wall: standard 29s, noenc 30–31s.
+
+**Verdict: H5 (JSON/TINYINT column codec) FALSIFIED as a dominant
+factor.** Removing the JSON and `TINYINT(1)` types produced **zero
+throughput gain**. The cost is in the **general per-value /
+per-batch data path (H3 territory)**, not a column-type-specific
+codec.
+
+### Experiment 2 — CPU profile, both engines
+
+CPU profiles captured during a full medium-fixture migrate (all 25
+tables exercise the identical per-row read+write path; Experiment 1
+proved the JSON/TINYINT codec immaterial, so the whole-fixture run
+is representative and gives a clean steady-state sample window — a
+single 1M-row table copies in ~7 s, too short to sample cleanly).
+
+**Headline structural finding (reframes the ADR): on the
+parallel-copy hot path, *both engines use the same generic
+`database/sql` batched-upsert writer* — neither LOAD DATA nor pgx
+`CopyFrom` is on the bulk-copy path.** The parallel-copy
+orchestrator (`copyChunk`) writes through the `ir.IdempotentRowWriter`
+surface (`iw.WriteRowsIdempotent`). On MySQL that is
+`(*RowWriter).writeBatchedIdempotent`; on PG it is
+`(*RowWriter).writeViaBatchIdempotent`. Both build a multi-row
+`INSERT … ON CONFLICT/ON DUPLICATE KEY UPDATE` via `buildBatchUpsert`
++ `flattenArgs` and ship it through `database/sql.(*DB).ExecContext`.
+The ADR's "What's already true → PG writer uses COPY-binary
+protocol" assumption **does not hold for the medium-fixture
+bulk-copy path** — `CopyFrom` exists in the codebase but the
+resumable parallel-copy path never calls it. The two engines'
+write hot paths are structurally identical, which is exactly why
+H5 showed no signal and why the per-stream gap is *not* a
+go-sql-driver-vs-pgx codec story.
+
+MySQL profile (`cpu-mysql.pprof`, 18 s sample, top flat frames):
+
+| flat% | frame |
+|---|---|
+| 11.1% | `runtime.semasleep` |
+| 8.1% | `runtime.runqgrab.osyield.func1` |
+| 6.6% | `runtime.cgocall` |
+| 4.0% | `runtime.selectgo` |
+| 3.5% | `runtime.semawakeup` |
+
+PG profile (`cpu-pg.pprof`, 8 s sample, top flat frames):
+
+| flat% | frame |
+|---|---|
+| 8.8% | `runtime.semasleep` |
+| 5.3% | `runtime.cgocall` |
+| 4.8% | `runtime.runqgrab.osyield.func1` |
+| 3.4% | `runtime.unlock2` (cum), `runtime.selectgo` 2.4% |
+| 2.7% | `runtime.semawakeup` |
+
+Both profiles are dominated by the **same** costs: Go scheduler
+churn (`semasleep`/`semawakeup`/`runqgrab.osyield`/`stealWork`),
+`runtime.cgocall` (Windows + Docker syscall boundary — the net I/O
+to the containers), channel `selectgo`, and `runtime.lock2` /
+`database/sql.withLock` (the shared `*sql.DB` pool mutex). The
+per-chunk writer `-list` confirms the time inside the writer splits
+across the streaming-channel `select` (MySQL 1.02 s / PG 0.51 s
+cum), `ir.ApproximateRowBytes` (0.24 s / 0.20 s — the byte-cap
+accounting on every row), and the `flush()` → `ExecContext`
+round-trip (1.86 s / 2.81 s). **No JSON/type codec frame appears in
+either top-40.** `go-sql-driver/mysql.(*mysqlStmt).writeExecutePacket`
+is present but small (~0.48 s cum, ~3%); pgx's binary-format
+encoders do not appear at all because `CopyFrom` is not on this
+path.
+
+### H3-vs-H5 verdict
+
+- **H5 — FALSIFIED.** Fixture variant: no gain from removing
+  JSON/TINYINT. Profile: no column-codec frame in either engine's
+  hot set.
+- **H3 — partially confirmed but re-scoped.** The bottleneck *is*
+  the general per-value/per-batch data path, not a column codec —
+  but it is **not** "go-sql-driver encodes each value via
+  reflection while pgx uses a tighter binary path", because the PG
+  bulk-copy path here is *also* `database/sql` batched-upsert, not
+  `CopyFrom`. The dominant cost on both engines is the synchronous
+  read-channel → batch → `ExecContext` round-trip plus the
+  scheduler/cgo/pool-mutex tax around it. The per-stream MySQL-vs-PG
+  rate gap observed in Phase A is therefore *server-side / wire
+  round-trip shape* (MySQL's multi-row `INSERT … ON DUPLICATE KEY
+  UPDATE` parse+apply vs PG's `INSERT … ON CONFLICT`), **not**
+  driver encoding and **not** column types.
+
+This is a cleaner result than either original hypothesis: the
+single biggest lever is **getting off the generic idempotent-batch
+`ExecContext` path onto the engine-native bulk loader (LOAD DATA /
+`CopyFrom`) for the parallel-copy path**, which today is bypassed
+entirely.
+
+### Proposed Phase C options (NOT implemented — data-supported only)
+
+Ranked by signal-to-effort from the Phase B data:
+
+1. **Route the parallel-copy chunk writer through the native bulk
+   loader instead of `WriteRowsIdempotent`.** Highest signal. The
+   resumable parallel path uses the idempotent batched-upsert
+   writer for crash-resume idempotency, but pays the generic
+   `ExecContext` tax on every batch and never touches LOAD DATA /
+   `CopyFrom`. Option: use the native loader for the first pass of
+   each chunk and fall back to idempotent upsert only on
+   resume/retry. Medium effort (touches the writer-selection logic
+   in `copyChunk` + both engines' writers); largest expected win
+   because it changes the actual hot frame.
+2. **Reduce per-row overhead in the batch loop.**
+   `ir.ApproximateRowBytes` is ~1–2% flat on *every* row purely for
+   the ADR-0028 byte-cap; the streaming-channel `select` is another
+   3–6% cum. Low effort, modest win (amortise the byte estimate, or
+   widen the channel/batch to cut select frequency). Opportunistic.
+3. **Investigate the cgo/syscall tax.** `runtime.cgocall` is
+   5–7% flat on *both* engines — a uniform host tax (Windows +
+   Rancher Docker net path), consistent with Phase A's H4
+   "unlikely dominant but present". A native-Linux re-profile would
+   quantify how much of the absolute number is rig artifact vs
+   real. Low effort (one Linux run), diagnostic only — doesn't
+   change the relative MySQL-vs-PG story.
+4. **Re-baseline the ADR's premise.** The "PG writer uses
+   COPY-binary" claim in *What's already true* is wrong for the
+   bulk-copy path and should be corrected; the headline "2.3× gap"
+   conflates copy-bound MySQL with not-copy-bound PG (Phase A N2)
+   *and* assumed a fast PG path that isn't taken. Whether the gap
+   is worth closing should be re-evaluated against option 1's
+   expected ceiling. Doc-only, no code.
+
+Recommendation for the Phase C gate: option 1 is the only one that
+targets the measured dominant cost; options 2–4 are
+opportunistic/diagnostic. No fix is proposed here — Phase C is a
+separate, gated decision.
 
 ## What's out of scope
 
