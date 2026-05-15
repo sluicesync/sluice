@@ -2,7 +2,7 @@
 
 ## Status
 
-**Accepted (2026-05-15).** Implemented in PII Phase 4 (v0.62.0 line). The keyset type + loader, `--keyset-source` flag (file/env/db schemes), strategy integration, `sluice_keysets` DDL on PG + MySQL, preflight refusal, and audit-log line have shipped. Two design decisions made at implementation time **override the original proposal text below where they conflict** — see "Decisions / deviations from original proposal".
+**Accepted (2026-05-15).** Implemented in PII Phase 4 (v0.63.0). The keyset type + loader, `--keyset-source` flag (file/env/db schemes), strategy integration, `sluice_keysets` DDL on PG + MySQL, preflight refusal, and audit-log line have shipped. Two design decisions made at implementation time **override the original proposal text below where they conflict** — see "Decisions / deviations from original proposal".
 
 ### Decisions / deviations from original proposal
 

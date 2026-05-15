@@ -6,6 +6,38 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.63.0]
+
+**PII Phase 4 — operator-keyset persistence (ADR-0041).** Closes the PII track. Sluice now has a first-class **keyset**: a durable, versioned, operator-controlled set of named HMAC keys that `hash:hmac-sha256` and `tokenize:dict` both reference. A single keyset shared between two streams (`staging-1` + `staging-2`) produces *identical* surrogates for identical inputs — cross-stream referential integrity that was impossible in Phases 1–3, where each surface keyed independently. **This is a breaking change** (sluice is pre-1.0 and pre-users; per the project's zero-users → no-compat tenet we took the clean break over an additive shim).
+
+### Added
+
+- **`--keyset-source=<scheme>:<value>`** on `migrate`, `sync start`, `schema preview`, and `backup`. Three schemes: `file:PATH` (keyset YAML on disk), `env:VARNAME` (keyset YAML in an env var), `db:DSN` (a sluice-managed `sluice_keysets` table on the named DSN — shared across streams, the cross-stream-stability primitive).
+- **`key:` option** on `hash` and `tokenize` redaction rules (YAML field; CLI trailing-segment form `hash:hmac-sha256[:<keyname>]` / `tokenize:dict:<dict>[:<keyname>]`). Names which keyset entry to use, so different compliance scopes can rotate independently. Unnamed rules resolve the keyset's sole entry (or the `default` entry where the source supports one).
+- **`sluice_keysets` table DDL** auto-created on both PostgreSQL and MySQL targets (`CREATE TABLE IF NOT EXISTS`, engine-appropriate `BYTEA`/`BLOB` + timestamp types), mirroring the existing `sluice_cdc_state` control-table pattern. Engine-specific SQL lives in the engine packages; the redaction layer depends only on an interface (IR-first).
+- **Startup audit-log line** — one INFO line per run (`keyset loaded source=… generations=[…] active=… hmac-algo=sha256`), DSN credentials redacted. No per-row logging (that would defeat redaction).
+
+### Changed
+
+- `hash:hmac-sha256` and `tokenize:dict` now obtain their HMAC key from the loaded keyset (resolved **once at startup**, immutable for the run) instead of, respectively, a `--redact-key-source`-derived `[]byte` and a hardcoded built-in constant.
+
+### Removed (breaking)
+
+- **`--redact-key-source` is deleted** (all of `env:` / `file:` / `derive:`), along with the `redact_key_source` YAML key and the `SLUICE_REDACT_KEY_SOURCE` env var. Use `--keyset-source` instead.
+- **The built-in v0.61.0 `tokenize:dict` HMAC key (`sluice-tokenize-dict-v1`) is deleted.** `tokenize:dict` no longer has an implicit key — it now **requires** `--keyset-source`, exactly like `hash:hmac-sha256`. A redaction config that uses either strategy without a resolvable keyset is refused at preflight with an actionable message (loud-failure tenet) rather than silently using a default key.
+
+### Compatibility
+
+- **Breaking, no shim, no migration path.** There is intentionally no zero-surrogate-drift guarantee from v0.61.0/v0.62.0: any data previously redacted with the old built-in `tokenize:dict` key would tokenize differently under a new operator keyset. Pre-users, this is the correct trade — the alternative was permanent shim code for a tool with no installed base.
+- **Deferred to Phase 4.5 (not in this release):** hot-reload of the keyset (file-watch / db-poll). Rotation takes effect on the **next process restart only** — a mid-run active-key change would split surrogates within one run and break within-run referential integrity, so the run-snapshot contract is deliberate.
+- **Out of v1 scope:** `sluice keyset rotate` / `sluice keyset list` CLI helpers (use manual SQL / YAML editing), KMS / Vault adapters (layer them above `env:`/`file:`), and encryption-at-rest of the keyset `bytes` column (operator's storage-layer responsibility, consistent with how sluice treats other sensitive state).
+
+### Who needs this release
+
+- **Anyone running multiple sluice streams from one source into separate destinations** who needs a redacted column to join across those destinations (multi-staging, multi-tenant analytics, cross-org data exchange). Share one keyset → identical surrogates everywhere.
+- **Anyone using `hash:hmac-sha256` or `tokenize:dict` on v0.61.0/v0.62.0**: this is a required-action upgrade — replace `--redact-key-source` with `--keyset-source` and supply a keyset; `tokenize:dict` now needs one too.
+- **Anyone using only `null` / `static` / `truncate` / `mask` / `randomize:*`**: no action — those strategies don't touch the keyset (`randomize:*` stays `--stream-id`-seeded).
+
 ## [0.62.0]
 
 **Smarter `--bulk-parallel-min-rows` default — 100,000 → 80,000.** Empirical finding from the new local-local rig: sluice consults `information_schema.tables.table_rows` (InnoDB) when deciding whether a table is "big enough" for parallel-copy. That catalog row-count is an *estimate* that commonly undershoots actuals by 0.1–5%. A table holding exactly 100,000 rows often reports as `~95-99k` via the catalog, so the prior 100,000 threshold left 100k-actual tables on the single-reader path despite being meant to qualify.
