@@ -118,6 +118,7 @@ A few terms recur in the codebase and docs:
 - [`docs/vitess-vstream-troubleshooting.md`](docs/vitess-vstream-troubleshooting.md) — operator runbook for diagnosing PlanetScale-MySQL VStream lag (throttler, replication lag, deploy requests), plus the Vitess 24 binlog streaming roadmap
 - [`docs/throughput-tuning.md`](docs/throughput-tuning.md) — knobs that matter at scale
 - [`docs/redaction.md`](docs/redaction.md) — PII redaction operator guide: 27 strategies, determinism contracts, dictionary loader, examples
+- [`docs/snapshot-cdc-handoff.md`](docs/snapshot-cdc-handoff.md) — operator reference for the cold-start → CDC handoff; guarantees, log lines, diagnostic playbook
 - [`docs/schema-change-runbook.md`](docs/schema-change-runbook.md) — `ADD COLUMN` / `DROP COLUMN` / `MODIFY` against a running stream
 - [`docs/type-mapping.md`](docs/type-mapping.md), [`docs/value-types.md`](docs/value-types.md) — type translation policies and runtime row contract
 - [`docs/adr/`](docs/adr/) — Architecture Decision Records
