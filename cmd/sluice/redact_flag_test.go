@@ -104,7 +104,7 @@ func TestRedactFlag_KongCommaPreservation(t *testing.T) {
 // TestParseRedactFlags_Empty pins the no-op default: empty slice
 // returns nil registry, no error.
 func TestParseRedactFlags_Empty(t *testing.T) {
-	reg, err := parseRedactFlags(nil, "", "")
+	reg, err := parseRedactFlags(nil, "", "", nil)
 	if err != nil {
 		t.Errorf("empty: unexpected error %v", err)
 	}
@@ -123,7 +123,7 @@ func TestParseRedactFlags_AllStrategies(t *testing.T) {
 		"public.users.ssn=null",
 		"billing.accounts.credit_card=static:REDACTED",
 	}
-	reg, err := parseRedactFlags(values, "", "")
+	reg, err := parseRedactFlags(values, "", "", nil)
 	if err != nil {
 		t.Fatalf("unexpected error %v", err)
 	}
@@ -159,6 +159,7 @@ func TestParseRedactFlags_HashHMAC_Derive(t *testing.T) {
 		[]string{"users.email=hash:hmac-sha256"},
 		"derive:test-salt",
 		"test-stream",
+		nil,
 	)
 	if err != nil {
 		t.Fatalf("unexpected error %v", err)
@@ -192,6 +193,7 @@ func TestParseRedactFlags_HashHMAC_Env(t *testing.T) {
 		[]string{"users.email=hash:hmac-sha256"},
 		"env:"+envVar,
 		"",
+		nil,
 	)
 	if err != nil {
 		t.Fatalf("unexpected error %v", err)
@@ -220,6 +222,7 @@ func TestParseRedactFlags_HashHMAC_File(t *testing.T) {
 		[]string{"users.email=hash:hmac-sha256"},
 		"file:"+keyPath,
 		"",
+		nil,
 	)
 	if err != nil {
 		t.Fatalf("unexpected error %v", err)
@@ -260,7 +263,7 @@ func TestParseRedactFlags_RefusalPaths(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			_, err := parseRedactFlags([]string{c.raw}, "", "")
+			_, err := parseRedactFlags([]string{c.raw}, "", "", nil)
 			if err == nil {
 				t.Fatal("expected error; got nil")
 			}
@@ -278,6 +281,7 @@ func TestParseRedactFlags_HMACNoKeySource(t *testing.T) {
 		[]string{"users.email=hash:hmac-sha256"},
 		"",
 		"",
+		nil,
 	)
 	if err == nil {
 		t.Fatal("expected refusal; got nil")
@@ -305,6 +309,7 @@ func TestParseRedactFlags_KeySourceMalformed(t *testing.T) {
 				[]string{"users.email=hash:hmac-sha256"},
 				c.source,
 				"",
+				nil,
 			)
 			if err == nil {
 				t.Fatal("expected error; got nil")
@@ -339,7 +344,7 @@ func TestMergeYAMLRedactions_AllStrategies(t *testing.T) {
 		{Table: "public.users.ssn", Strategy: "static", Value: "REDACTED"},
 		{Table: "users.middle_name", Strategy: "null"},
 	}
-	reg, err := mergeYAMLRedactions(nil, entries, "", "")
+	reg, err := mergeYAMLRedactions(nil, entries, "", "", nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -365,14 +370,14 @@ func TestMergeYAMLRedactions_AllStrategies(t *testing.T) {
 // TestMergeYAMLRedactions_AppendsToCLIRegistry covers the
 // "YAML extends CLI" semantics: the merged Registry has both sets.
 func TestMergeYAMLRedactions_AppendsToCLIRegistry(t *testing.T) {
-	cli, err := parseRedactFlags([]string{"users.email=hash:sha256"}, "", "")
+	cli, err := parseRedactFlags([]string{"users.email=hash:sha256"}, "", "", nil)
 	if err != nil {
 		t.Fatalf("CLI parse failed: %v", err)
 	}
 	yaml := []config.Redaction{
 		{Table: "users.phone", Strategy: "truncate", Length: 4},
 	}
-	reg, err := mergeYAMLRedactions(cli, yaml, "", "")
+	reg, err := mergeYAMLRedactions(cli, yaml, "", "", nil)
 	if err != nil {
 		t.Fatalf("merge failed: %v", err)
 	}
@@ -404,7 +409,7 @@ func TestMergeYAMLRedactions_RefusalPaths(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			_, err := mergeYAMLRedactions(nil, []config.Redaction{c.entry}, "", "")
+			_, err := mergeYAMLRedactions(nil, []config.Redaction{c.entry}, "", "", nil)
 			if err == nil {
 				t.Fatal("expected error; got nil")
 			}
@@ -424,7 +429,7 @@ func TestParseRedactFlags_Mask(t *testing.T) {
 		"users.token=mask:outer:2,2",  // outer form
 		"users.code=mask:outer:1,1,#", // outer + custom char
 	}
-	reg, err := parseRedactFlags(values, "", "")
+	reg, err := parseRedactFlags(values, "", "", nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -487,7 +492,7 @@ func TestParseRedactFlags_MaskRefusalPaths(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			_, err := parseRedactFlags([]string{c.raw}, "", "")
+			_, err := parseRedactFlags([]string{c.raw}, "", "", nil)
 			if err == nil {
 				t.Fatal("expected error; got nil")
 			}
@@ -505,7 +510,7 @@ func TestMergeYAMLRedactions_Mask(t *testing.T) {
 		{Table: "users.ssn", Strategy: "mask", Form: "inner", M1: 0, M2: 4, Char: "*"},
 		{Table: "users.token", Strategy: "mask", Form: "outer", M1: 2, M2: 2},
 	}
-	reg, err := mergeYAMLRedactions(nil, entries, "", "")
+	reg, err := mergeYAMLRedactions(nil, entries, "", "", nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -547,7 +552,7 @@ func TestMergeYAMLRedactions_MaskRefusalPaths(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			_, err := mergeYAMLRedactions(nil, []config.Redaction{c.entry}, "", "")
+			_, err := mergeYAMLRedactions(nil, []config.Redaction{c.entry}, "", "", nil)
 			if err == nil {
 				t.Fatal("expected error; got nil")
 			}
@@ -567,7 +572,7 @@ func TestParseRedactFlags_MaskPresets(t *testing.T) {
 		"users.test_pan=mask:pan-relaxed",
 		"users.email=mask:email",
 	}
-	reg, err := parseRedactFlags(values, "", "")
+	reg, err := parseRedactFlags(values, "", "", nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -615,7 +620,7 @@ func TestParseRedactFlags_MaskPresetsSecondWave(t *testing.T) {
 		"users.iban=mask:iban",
 		"users.id=mask:uuid",
 	}
-	reg, err := parseRedactFlags(values, "", "")
+	reg, err := parseRedactFlags(values, "", "", nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -666,7 +671,7 @@ func TestMergeYAMLRedactions_MaskPresetsSecondWave(t *testing.T) {
 		{Table: "users.iban", Strategy: "mask", Form: "iban"},
 		{Table: "users.id", Strategy: "mask", Form: "uuid"},
 	}
-	reg, err := mergeYAMLRedactions(nil, entries, "", "")
+	reg, err := mergeYAMLRedactions(nil, entries, "", "", nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -698,7 +703,7 @@ func TestParseRedactFlags_MaskPresetRefusalPaths(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			_, err := parseRedactFlags([]string{c.raw}, "", "")
+			_, err := parseRedactFlags([]string{c.raw}, "", "", nil)
 			if err == nil {
 				t.Fatal("expected error; got nil")
 			}
@@ -718,7 +723,7 @@ func TestMergeYAMLRedactions_MaskPresets(t *testing.T) {
 		{Table: "users.test_pan", Strategy: "mask", Form: "pan-relaxed"},
 		{Table: "users.email", Strategy: "mask", Form: "email"},
 	}
-	reg, err := mergeYAMLRedactions(nil, entries, "", "")
+	reg, err := mergeYAMLRedactions(nil, entries, "", "", nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -751,7 +756,7 @@ func TestMergeYAMLRedactions_MaskPresetRefusalPaths(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			_, err := mergeYAMLRedactions(nil, []config.Redaction{c.entry}, "", "")
+			_, err := mergeYAMLRedactions(nil, []config.Redaction{c.entry}, "", "", nil)
 			if err == nil {
 				t.Fatal("expected error; got nil")
 			}
@@ -769,7 +774,7 @@ func TestMergeYAMLRedactions_HMACWithKeySource(t *testing.T) {
 	entries := []config.Redaction{
 		{Table: "users.email", Strategy: "hash", Algo: "hmac-sha256"},
 	}
-	reg, err := mergeYAMLRedactions(nil, entries, "env:TEST_YAML_HMAC_KEY", "")
+	reg, err := mergeYAMLRedactions(nil, entries, "env:TEST_YAML_HMAC_KEY", "", nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -802,7 +807,7 @@ func TestParseRedactFlags_Randomize(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			reg, err := parseRedactFlags([]string{c.raw}, "", "")
+			reg, err := parseRedactFlags([]string{c.raw}, "", "", nil)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -838,7 +843,7 @@ func TestParseRedactFlags_RandomizeRefusalPaths(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			_, err := parseRedactFlags([]string{c.raw}, "", "")
+			_, err := parseRedactFlags([]string{c.raw}, "", "", nil)
 			if err == nil {
 				t.Fatal("expected error; got nil")
 			}
@@ -881,7 +886,7 @@ func TestMergeYAMLRedactions_Randomize(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			reg, err := mergeYAMLRedactions(nil, []config.Redaction{c.entry}, "", "")
+			reg, err := mergeYAMLRedactions(nil, []config.Redaction{c.entry}, "", "", nil)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -919,7 +924,7 @@ func TestParseRedactFlags_RandomizeSecondWave(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			reg, err := parseRedactFlags([]string{c.raw}, "", "")
+			reg, err := parseRedactFlags([]string{c.raw}, "", "", nil)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -952,7 +957,7 @@ func TestParseRedactFlags_RandomizeSecondWaveRefusals(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			_, err := parseRedactFlags([]string{c.raw}, "", "")
+			_, err := parseRedactFlags([]string{c.raw}, "", "", nil)
 			if err == nil {
 				t.Fatal("expected error; got nil")
 			}
@@ -1010,7 +1015,7 @@ func TestMergeYAMLRedactions_RandomizeSecondWave(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			reg, err := mergeYAMLRedactions(nil, []config.Redaction{c.entry}, "", "")
+			reg, err := mergeYAMLRedactions(nil, []config.Redaction{c.entry}, "", "", nil)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -1098,7 +1103,7 @@ func TestMergeYAMLRedactions_RandomizeSecondWaveRefusals(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			_, err := mergeYAMLRedactions(nil, []config.Redaction{c.entry}, "", "")
+			_, err := mergeYAMLRedactions(nil, []config.Redaction{c.entry}, "", "", nil)
 			if err == nil {
 				t.Fatal("expected error; got nil")
 			}
@@ -1147,7 +1152,7 @@ func TestMergeYAMLRedactions_RandomizeRefusalPaths(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			_, err := mergeYAMLRedactions(nil, []config.Redaction{c.entry}, "", "")
+			_, err := mergeYAMLRedactions(nil, []config.Redaction{c.entry}, "", "", nil)
 			if err == nil {
 				t.Fatal("expected error; got nil")
 			}
@@ -1155,5 +1160,264 @@ func TestMergeYAMLRedactions_RandomizeRefusalPaths(t *testing.T) {
 				t.Errorf("error %q should contain %q", err.Error(), c.wantSubstring)
 			}
 		})
+	}
+}
+
+// TestParseRedactFlags_TokenizeDict covers the v0.61.0 PII Phase 3
+// CLI form for tokenize:dict and randomize:dict.
+func TestParseRedactFlags_TokenizeDict(t *testing.T) {
+	dicts := map[string][]string{
+		"first_names": {"Alice", "Bob", "Carol"},
+		"cities":      {"Boston", "Denver"},
+	}
+	cases := []struct {
+		name, raw, wantName string
+	}{
+		{"tokenize:dict", "u.name=tokenize:dict:first_names", "tokenize:dict:first_names"},
+		{"randomize:dict", "u.name=randomize:dict:first_names", "randomize:dict:first_names"},
+		{"tokenize:dict different dict", "u.city=tokenize:dict:cities", "tokenize:dict:cities"},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			reg, err := parseRedactFlags([]string{c.raw}, "", "stream-x", dicts)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			rules := reg.Rules()
+			if len(rules) != 1 {
+				t.Fatalf("got %d rules; want 1", len(rules))
+			}
+			if got := rules[0].Strategy.Name(); got != c.wantName {
+				t.Errorf("Strategy.Name() = %q; want %q", got, c.wantName)
+			}
+		})
+	}
+}
+
+// TestParseRedactFlags_TokenizeDictRefusals covers documented CLI
+// refusal paths for the dict strategies.
+func TestParseRedactFlags_TokenizeDictRefusals(t *testing.T) {
+	dicts := map[string][]string{"first_names": {"Alice", "Bob"}}
+	cases := []struct {
+		name, raw, wantSubstring string
+		dicts                    map[string][]string
+	}{
+		{"tokenize empty", "u.x=tokenize", "requires a form", dicts},
+		{"tokenize unknown form", "u.x=tokenize:other", "unknown form", dicts},
+		{"tokenize:dict no name", "u.x=tokenize:dict", "dictionary name is empty", dicts},
+		{"tokenize:dict empty name", "u.x=tokenize:dict:", "dictionary name is empty", dicts},
+		{"tokenize:dict unknown dict", "u.x=tokenize:dict:nope", "not declared", dicts},
+		{"tokenize:dict no dicts loaded", "u.x=tokenize:dict:any", "no dictionaries are loaded", nil},
+		{"randomize:dict no name", "u.x=randomize:dict", "requires a dictionary name", dicts},
+		{"randomize:dict empty name after colon", "u.x=randomize:dict:", "dictionary name is empty", dicts},
+		{"randomize:dict unknown dict", "u.x=randomize:dict:nope", "not declared", dicts},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			_, err := parseRedactFlags([]string{c.raw}, "", "", c.dicts)
+			if err == nil {
+				t.Fatal("expected error; got nil")
+			}
+			if !strings.Contains(err.Error(), c.wantSubstring) {
+				t.Errorf("error %q should contain %q", err.Error(), c.wantSubstring)
+			}
+		})
+	}
+}
+
+// TestParseRedactFlags_TokenizeDictStreamIDThreaded pins that the
+// CLI parser threads the streamID arg into the TokenizeDict
+// strategy. Two different streamIDs (likely) produce different
+// outputs for the same input through the same dict.
+func TestParseRedactFlags_TokenizeDictStreamIDThreaded(t *testing.T) {
+	dicts := map[string][]string{
+		"names": {"A", "B", "C", "D", "E", "F", "G", "H", "I", "J"},
+	}
+	regA, err := parseRedactFlags([]string{"u.n=tokenize:dict:names"}, "", "stream-A", dicts)
+	if err != nil {
+		t.Fatalf("regA: %v", err)
+	}
+	regB, err := parseRedactFlags([]string{"u.n=tokenize:dict:names"}, "", "stream-B", dicts)
+	if err != nil {
+		t.Fatalf("regB: %v", err)
+	}
+	differs := false
+	for _, in := range []string{"alice", "bob", "carol", "dave", "eve", "frank", "grace", "heidi"} {
+		a, _ := regA.Get("", "u", "n").Redact(&ir.Column{Name: "n"}, in, nil)
+		b, _ := regB.Get("", "u", "n").Redact(&ir.Column{Name: "n"}, in, nil)
+		if a != b {
+			differs = true
+			break
+		}
+	}
+	if !differs {
+		t.Errorf("streamID was not threaded through CLI parser to TokenizeDict")
+	}
+}
+
+// TestMergeYAMLRedactions_TokenizeDict covers the YAML round-trip
+// for dict declaration.
+func TestMergeYAMLRedactions_TokenizeDict(t *testing.T) {
+	dicts := map[string][]string{
+		"first_names": {"Alice", "Bob"},
+		"cities":      {"Boston"},
+	}
+	cases := []struct {
+		name     string
+		entry    config.Redaction
+		wantName string
+	}{
+		{
+			name:     "tokenize form omitted (defaults to dict)",
+			entry:    config.Redaction{Table: "u.n", Strategy: "tokenize", Dict: "first_names"},
+			wantName: "tokenize:dict:first_names",
+		},
+		{
+			name:     "tokenize form: dict explicit",
+			entry:    config.Redaction{Table: "u.n", Strategy: "tokenize", Form: "dict", Dict: "first_names"},
+			wantName: "tokenize:dict:first_names",
+		},
+		{
+			name:     "randomize form: dict",
+			entry:    config.Redaction{Table: "u.n", Strategy: "randomize", Form: "dict", Dict: "first_names"},
+			wantName: "randomize:dict:first_names",
+		},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			reg, err := mergeYAMLRedactions(nil, []config.Redaction{c.entry}, "", "stream-x", dicts)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			rules := reg.Rules()
+			if len(rules) != 1 {
+				t.Fatalf("got %d rules; want 1", len(rules))
+			}
+			if got := rules[0].Strategy.Name(); got != c.wantName {
+				t.Errorf("Strategy.Name() = %q; want %q", got, c.wantName)
+			}
+		})
+	}
+}
+
+// TestMergeYAMLRedactions_TokenizeDictRefusals covers documented
+// YAML refusal paths.
+func TestMergeYAMLRedactions_TokenizeDictRefusals(t *testing.T) {
+	dicts := map[string][]string{"first_names": {"Alice"}}
+	cases := []struct {
+		name          string
+		entry         config.Redaction
+		wantSubstring string
+	}{
+		{
+			name:          "tokenize without dict field",
+			entry:         config.Redaction{Table: "u.n", Strategy: "tokenize"},
+			wantSubstring: "requires 'dict' field",
+		},
+		{
+			name:          "tokenize unknown form",
+			entry:         config.Redaction{Table: "u.n", Strategy: "tokenize", Form: "weird", Dict: "first_names"},
+			wantSubstring: "unknown form",
+		},
+		{
+			name:          "tokenize unknown dict",
+			entry:         config.Redaction{Table: "u.n", Strategy: "tokenize", Dict: "nope"},
+			wantSubstring: "not declared",
+		},
+		{
+			name:          "tokenize with spurious min",
+			entry:         config.Redaction{Table: "u.n", Strategy: "tokenize", Dict: "first_names", Min: 5},
+			wantSubstring: "takes no min/max",
+		},
+		{
+			name:          "tokenize with spurious brand",
+			entry:         config.Redaction{Table: "u.n", Strategy: "tokenize", Dict: "first_names", Brand: "visa"},
+			wantSubstring: "takes no brand",
+		},
+		{
+			name:          "tokenize with spurious country_code",
+			entry:         config.Redaction{Table: "u.n", Strategy: "tokenize", Dict: "first_names", CountryCode: "DE"},
+			wantSubstring: "takes no country_code",
+		},
+		{
+			name:          "randomize:dict without dict field",
+			entry:         config.Redaction{Table: "u.n", Strategy: "randomize", Form: "dict"},
+			wantSubstring: "requires 'dict' field",
+		},
+		{
+			name:          "randomize:dict unknown dict",
+			entry:         config.Redaction{Table: "u.n", Strategy: "randomize", Form: "dict", Dict: "nope"},
+			wantSubstring: "not declared",
+		},
+		{
+			name:          "randomize:dict with spurious brand",
+			entry:         config.Redaction{Table: "u.n", Strategy: "randomize", Form: "dict", Dict: "first_names", Brand: "visa"},
+			wantSubstring: "takes no brand",
+		},
+		{
+			name:          "randomize:int with spurious dict",
+			entry:         config.Redaction{Table: "u.n", Strategy: "randomize", Form: "int", Min: 1, Max: 10, Dict: "first_names"},
+			wantSubstring: "takes no dict",
+		},
+		{
+			name:          "hash with spurious dict",
+			entry:         config.Redaction{Table: "u.n", Strategy: "hash", Algo: "sha256", Dict: "first_names"},
+			wantSubstring: "takes no 'dict' field",
+		},
+		{
+			name:          "static with spurious dict",
+			entry:         config.Redaction{Table: "u.n", Strategy: "static", Value: "X", Dict: "first_names"},
+			wantSubstring: "takes no 'dict' field",
+		},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			_, err := mergeYAMLRedactions(nil, []config.Redaction{c.entry}, "", "", dicts)
+			if err == nil {
+				t.Fatal("expected error; got nil")
+			}
+			if !strings.Contains(err.Error(), c.wantSubstring) {
+				t.Errorf("error %q should contain %q", err.Error(), c.wantSubstring)
+			}
+		})
+	}
+}
+
+// TestLoadDictionariesAndParse_EndToEnd pins the realistic flow:
+// declare a dict in config, load it, parse a CLI rule against it,
+// invoke the strategy.
+func TestLoadDictionariesAndParse_EndToEnd(t *testing.T) {
+	cfg := map[string]config.Dictionary{
+		"first_names": {Entries: []string{"Alice", "Bob", "Carol"}},
+	}
+	loaded, err := redact.LoadDictionaries(cfg)
+	if err != nil {
+		t.Fatalf("LoadDictionaries: %v", err)
+	}
+	reg, err := parseRedactFlags([]string{"u.name=tokenize:dict:first_names"}, "", "stream", loaded)
+	if err != nil {
+		t.Fatalf("parseRedactFlags: %v", err)
+	}
+	got, err := reg.Get("", "u", "name").Redact(&ir.Column{Name: "name"}, "Alice", nil)
+	if err != nil {
+		t.Fatalf("Redact: %v", err)
+	}
+	out, ok := got.(string)
+	if !ok {
+		t.Fatalf("Redact returned non-string: %T %v", got, got)
+	}
+	found := false
+	for _, e := range []string{"Alice", "Bob", "Carol"} {
+		if out == e {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("output %q not in dict; mapping broken", out)
 	}
 }

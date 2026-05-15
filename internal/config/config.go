@@ -77,6 +77,56 @@ type Config struct {
 	// file:PATH | derive:<salt>). Only consulted when at least one
 	// Redactions entry uses `hash:hmac-sha256`.
 	RedactKeySource string `koanf:"redact_key_source"`
+
+	// Dictionaries is the YAML `dictionaries:` block (PII Phase 3,
+	// v0.61.0+). Each entry declares a named dictionary that
+	// `randomize:dict:<name>` and `tokenize:dict:<name>` rules
+	// reference. Two forms per entry: inline `entries:` list, or
+	// `file:` pointing at a one-entry-per-line file (`#`-prefixed
+	// comment + blank-line tolerant). See
+	// `docs/dev/notes/prep-pii-redaction-phase-2-strategy-catalog.md`
+	// Phase 3 section.
+	Dictionaries map[string]Dictionary `koanf:"dictionaries"`
+}
+
+// Dictionary is one entry from the YAML `dictionaries:` block. PII
+// Phase 3 (v0.61.0+). Operators declare it as either an inline list:
+//
+//	dictionaries:
+//	  first_names:
+//	    entries:
+//	      - Alice
+//	      - Bob
+//	      - Carol
+//
+// or via a file pointer (one entry per line; #-prefixed and blank
+// lines are tolerated):
+//
+//	dictionaries:
+//	  city_names:
+//	    file: ./fixtures/cities.txt
+//
+// Declaring both `file:` and `entries:` on the same dictionary is
+// operator error and refused loudly at load time. Empty dictionaries
+// (0 effective entries after trimming) are also refused — they would
+// produce mod-by-zero in the strategies' RNG selection.
+//
+// Loaded by [redact.LoadDictionaries] (in the `internal/redact`
+// package) before the per-rule parsers run; the resolved entries are
+// embedded in each [redact.RandomizeDict] / [redact.TokenizeDict]
+// instance so the strategy itself is self-contained at row-process
+// time. See ADR-0040 for the determinism contract.
+type Dictionary struct {
+	// File is a path to a one-entry-per-line dictionary file.
+	// `#`-prefixed lines are treated as comments; blank lines are
+	// skipped. Trimming is applied to every line. Mutually exclusive
+	// with Entries.
+	File string `koanf:"file"`
+
+	// Entries is an inline list of dictionary entries. Mutually
+	// exclusive with File. Whitespace is trimmed from each entry;
+	// empties are dropped.
+	Entries []string `koanf:"entries"`
 }
 
 // Redaction is one entry from the YAML `redactions:` block. Mirrors
@@ -167,6 +217,14 @@ type Redaction struct {
 	// country at random" (deterministic per-row seed). Ignored
 	// for other forms / strategies.
 	CountryCode string `koanf:"country_code"`
+
+	// Dict names the dictionary the strategy resolves against when
+	// Strategy == "tokenize" or Strategy == "randomize" + Form ==
+	// "dict". PII Phase 3 (v0.61.0+). The named dictionary must
+	// exist under the top-level `dictionaries:` block; absent /
+	// typo'd names are refused at load time. Ignored for other
+	// strategy / form combinations.
+	Dict string `koanf:"dict"`
 }
 
 // Mapping is a single per-column override.

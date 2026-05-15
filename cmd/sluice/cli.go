@@ -19,6 +19,7 @@ import (
 	"github.com/orware/sluice/internal/engines"
 	"github.com/orware/sluice/internal/ir"
 	"github.com/orware/sluice/internal/pipeline"
+	"github.com/orware/sluice/internal/redact"
 )
 
 // Globals are flags shared across every subcommand. Embedding into the
@@ -127,7 +128,7 @@ type MigrateCmd struct {
 
 	EnablePGExtension []string `help:"Enable passthrough for a Postgres extension type (repeatable). Same-engine PG → PG passthrough preserves the source-native shape on the target. Cross-engine targets (MySQL) keep the loud-failure default except for hstore (→ JSON) and citext (→ VARCHAR with case-insensitive collation), which have built-in default translators. Each named extension must be installed on both source and target — sluice preflights via pg_extension before any data moves. Recognised: vector (pgvector), pg_trgm, hstore, citext. v1 shortlist per docs/research/pg-extensions-deployment-frequency.md. See ADR-0032." placeholder:"EXT"`
 
-	Redact          []string `help:"Redact a PII column (repeatable). Format: '[schema.]table.column=STRATEGY[:options]'. Strategies: null (NULLABLE columns only), static:<value>, hash:sha256, hash:hmac-sha256 (requires --redact-key-source), truncate:<n>, mask:inner:<m1>,<m2>[,<char>], mask:outer:<m1>,<m2>[,<char>], mask:ssn, mask:pan, mask:pan-relaxed, mask:email, mask:ca-sin, mask:uk-nin, mask:iban, mask:uuid (Phase 2.b country/format presets, v0.57.0+), randomize:int:<min>,<max>, randomize:email, randomize:us-phone, randomize:uuid (Phase 2.c first wave, v0.59.0+), randomize:ssn, randomize:pan[:<brand>], randomize:ca-sin, randomize:uk-nin, randomize:iban[:<country-code>] (Phase 2.c second wave, v0.60.0+; brand: visa|mastercard|amex; country: DE|GB|FR; all randomize:* require a PK on the source table). Examples: --redact users.email=hash:sha256, --redact users.pan=mask:pan, --redact users.id=mask:uuid, --redact users.age=randomize:int:18,90. Bulk-copy + CDC paths both honour --redact. YAML form available under config 'redactions:' block. See docs/dev/notes/prep-pii-redaction-phase-1.md." placeholder:"RULE" sep:"none"`
+	Redact          []string `help:"Redact a PII column (repeatable). Format: '[schema.]table.column=STRATEGY[:options]'. Strategies: null (NULLABLE columns only), static:<value>, hash:sha256, hash:hmac-sha256 (requires --redact-key-source), truncate:<n>, mask:inner:<m1>,<m2>[,<char>], mask:outer:<m1>,<m2>[,<char>], mask:ssn, mask:pan, mask:pan-relaxed, mask:email, mask:ca-sin, mask:uk-nin, mask:iban, mask:uuid (Phase 2.b country/format presets, v0.57.0+), randomize:int:<min>,<max>, randomize:email, randomize:us-phone, randomize:uuid (Phase 2.c first wave, v0.59.0+), randomize:ssn, randomize:pan[:<brand>], randomize:ca-sin, randomize:uk-nin, randomize:iban[:<country-code>] (Phase 2.c second wave, v0.60.0+; brand: visa|mastercard|amex; country: DE|GB|FR; all randomize:* require a PK on the source table), randomize:dict:<name>, tokenize:dict:<name> (Phase 3, v0.61.0+; dictionaries declared in YAML 'dictionaries:' block — CLI form REQUIRES YAML config to declare the dictionary content). Examples: --redact users.email=hash:sha256, --redact users.pan=mask:pan, --redact users.id=mask:uuid, --redact users.age=randomize:int:18,90, --redact users.first_name=tokenize:dict:first_names. Bulk-copy + CDC paths both honour --redact. YAML form available under config 'redactions:' block. See docs/dev/notes/prep-pii-redaction-phase-1.md." placeholder:"RULE" sep:"none"`
 	RedactKeySource string   `help:"Source for the HMAC keyset when --redact rules use 'hash:hmac-sha256'. Forms: 'env:VARNAME' reads from environment variable; 'file:PATH' reads first line of PATH; 'derive:<salt>' derives from --stream-id + salt (Phase 1 simple key-derivation). Only required when at least one --redact rule uses hmac-sha256." placeholder:"SRC"`
 }
 
@@ -217,11 +218,15 @@ func (m *MigrateCmd) Run(g *Globals) error {
 	if keySource == "" {
 		keySource = cfg.RedactKeySource
 	}
-	redactor, err := parseRedactFlags(m.Redact, keySource, "")
+	dictionaries, err := redact.LoadDictionaries(cfg.Dictionaries)
 	if err != nil {
 		return err
 	}
-	redactor, err = mergeYAMLRedactions(redactor, cfg.Redactions, keySource, "")
+	redactor, err := parseRedactFlags(m.Redact, keySource, "", dictionaries)
+	if err != nil {
+		return err
+	}
+	redactor, err = mergeYAMLRedactions(redactor, cfg.Redactions, keySource, "", dictionaries)
 	if err != nil {
 		return fmt.Errorf("redactions (YAML): %w", err)
 	}
@@ -495,7 +500,7 @@ type SyncStartCmd struct {
 
 	EnablePGExtension []string `help:"Enable passthrough for a Postgres extension type (repeatable). Same-engine PG → PG preserves the source-native shape. Cross-engine targets (MySQL) keep the loud-failure default except for hstore (→ JSON) and citext (→ VARCHAR with case-insensitive collation). Sluice preflights extension presence on both source and target. Recognised: vector (pgvector), pg_trgm, hstore, citext. See ADR-0032." placeholder:"EXT"`
 
-	Redact          []string `help:"Redact a PII column (repeatable). Format: '[schema.]table.column=STRATEGY[:options]'. Strategies: null (NULLABLE columns only), static:<value>, hash:sha256, hash:hmac-sha256 (requires --redact-key-source), truncate:<n>, mask:inner:<m1>,<m2>[,<char>], mask:outer:<m1>,<m2>[,<char>], mask:ssn, mask:pan, mask:pan-relaxed, mask:email, mask:ca-sin, mask:uk-nin, mask:iban, mask:uuid (Phase 2.b country/format presets, v0.57.0+), randomize:int:<min>,<max>, randomize:email, randomize:us-phone, randomize:uuid (Phase 2.c first wave, v0.59.0+), randomize:ssn, randomize:pan[:<brand>], randomize:ca-sin, randomize:uk-nin, randomize:iban[:<country-code>] (Phase 2.c second wave, v0.60.0+; brand: visa|mastercard|amex; country: DE|GB|FR; all randomize:* require a PK on the source table). Examples: --redact users.email=hash:sha256, --redact users.pan=mask:pan, --redact users.id=mask:uuid, --redact users.age=randomize:int:18,90. Phase 1.5 (v0.54.0+): redaction covers BOTH cold-start bulk-copy AND mid-stream CDC events. Bare 'users.email' matches any source schema; schema-qualified 'public.users.email' takes precedence when both registered. See docs/dev/notes/prep-pii-redaction-phase-1.md." placeholder:"RULE" sep:"none"`
+	Redact          []string `help:"Redact a PII column (repeatable). Format: '[schema.]table.column=STRATEGY[:options]'. Strategies: null (NULLABLE columns only), static:<value>, hash:sha256, hash:hmac-sha256 (requires --redact-key-source), truncate:<n>, mask:inner:<m1>,<m2>[,<char>], mask:outer:<m1>,<m2>[,<char>], mask:ssn, mask:pan, mask:pan-relaxed, mask:email, mask:ca-sin, mask:uk-nin, mask:iban, mask:uuid (Phase 2.b country/format presets, v0.57.0+), randomize:int:<min>,<max>, randomize:email, randomize:us-phone, randomize:uuid (Phase 2.c first wave, v0.59.0+), randomize:ssn, randomize:pan[:<brand>], randomize:ca-sin, randomize:uk-nin, randomize:iban[:<country-code>] (Phase 2.c second wave, v0.60.0+; brand: visa|mastercard|amex; country: DE|GB|FR; all randomize:* require a PK on the source table), randomize:dict:<name>, tokenize:dict:<name> (Phase 3, v0.61.0+; dictionaries declared in YAML 'dictionaries:' block — CLI form REQUIRES YAML config to declare the dictionary content). Examples: --redact users.email=hash:sha256, --redact users.pan=mask:pan, --redact users.id=mask:uuid, --redact users.age=randomize:int:18,90, --redact users.first_name=tokenize:dict:first_names. Phase 1.5 (v0.54.0+): redaction covers BOTH cold-start bulk-copy AND mid-stream CDC events. Bare 'users.email' matches any source schema; schema-qualified 'public.users.email' takes precedence when both registered. See docs/dev/notes/prep-pii-redaction-phase-1.md." placeholder:"RULE" sep:"none"`
 	RedactKeySource string   `help:"Source for the HMAC keyset when --redact rules use 'hash:hmac-sha256'. Forms: 'env:VARNAME' reads from environment variable; 'file:PATH' reads first line of PATH; 'derive:<salt>' derives from --stream-id + salt (Phase 1 simple key-derivation). Only required when at least one --redact rule uses hmac-sha256." placeholder:"SRC"`
 }
 
@@ -613,11 +618,15 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 	if keySource == "" {
 		keySource = cfg.RedactKeySource
 	}
-	redactor, err := parseRedactFlags(s.Redact, keySource, s.StreamID)
+	dictionaries, err := redact.LoadDictionaries(cfg.Dictionaries)
 	if err != nil {
 		return err
 	}
-	redactor, err = mergeYAMLRedactions(redactor, cfg.Redactions, keySource, s.StreamID)
+	redactor, err := parseRedactFlags(s.Redact, keySource, s.StreamID, dictionaries)
+	if err != nil {
+		return err
+	}
+	redactor, err = mergeYAMLRedactions(redactor, cfg.Redactions, keySource, s.StreamID, dictionaries)
 	if err != nil {
 		return fmt.Errorf("redactions (YAML): %w", err)
 	}

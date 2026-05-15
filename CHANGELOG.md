@@ -6,6 +6,63 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.61.0]
+
+**PII Phase 3 — dictionary-based redaction strategies.** Two new strategies that map source values into operator-supplied dictionaries: `randomize:dict:<name>` picks an entry per row (PK-keyed, inherits v0.59.0's replay-stable contract) and `tokenize:dict:<name>` picks an entry by HMAC of the input value (input-value-keyed, stable across tables — every "Alice" maps to the same dict entry everywhere in the database). Dictionaries live in YAML's `dictionaries:` block with two declaration shapes: inline `entries:` list for small dicts (10s of entries), or `file:` pointer at a one-entry-per-line file (`#`-prefixed comments + blank lines tolerated) for large dicts. ADR-0040 documents the two differing determinism contracts.
+
+### Added
+
+- **`randomize:dict:<name>` strategy** — picks a dictionary entry per row using the v0.59.0 PK-derived seed. Same source row → same dict entry across re-runs / CDC resumes / backup→restore. Inherits the no-PK preflight refusal automatically (Name() starts with `randomize:`).
+- **`tokenize:dict:<name>` strategy** — picks a dictionary entry via HMAC of `streamID || ":" || dictName || ":" || input`, modulo dictionary length. Determinism contract: same input value → same output regardless of PK, regardless of table/column. The FIRST sluice strategy whose output depends on the INPUT VALUE rather than the row's PK. NOT subject to the no-PK preflight (works on tables without a primary key — that's the whole point). NULL input passes through; non-string input is canonicalized via `fmt.Sprintf("%v", ...)`.
+- **`internal/redact/dictionary.go`** — `LoadDictionaries(map[string]config.Dictionary) (map[string][]string, error)` resolves YAML declarations to a flat name → entries map. File-form loader uses `os.ReadFile`, splits on `\n`, trims each line, skips blanks + `#`-prefixed comments. Refuses empty dictionaries (0 entries after trimming) at load time. Refuses dictionaries declaring both `file:` and inline `entries:`.
+- **`internal/redact/strategies_dict.go`** — `RandomizeDict` + `TokenizeDict` types implementing Strategy. Each holds `DictName string` + `Entries []string` materialised at parser-time (no `*DictionaryRegistry` plumbing through Strategy.Redact). `TokenizeDict` additionally captures `StreamID string` at construction time so the HMAC includes it.
+- **`config.Dictionary` type** with `File string` (mutually exclusive) and `Entries []string` fields. Operators declare under top-level YAML `dictionaries:` block.
+- **`config.Redaction.Dict string` field** (`koanf:"dict"`) — references a dictionary name for both `tokenize` and `randomize:dict` YAML forms.
+- **CLI form**: `--redact users.first_name=tokenize:dict:first_names` and `--redact users.first_name=randomize:dict:first_names`. **CLI form REQUIRES a YAML config** to declare the dictionary content (there's no good CLI-only shape for dictionaries); the parser refuses with a clear message when a CLI rule references a missing dictionary name.
+- **YAML form**: `strategy: tokenize` + `dict: <name>` (form: dict is the default and can be omitted), or `strategy: randomize` + `form: dict` + `dict: <name>`. Both reject spurious `min`/`max`/`brand`/`country_code` fields with operator-actionable errors.
+- **Help text** on `migrate`, `sync start`, `backup full`, `schema preview` enumerates the two new strategies.
+- **ADR-0040** documents the two differing determinism contracts and the rationale for keying tokenize by input value rather than by row PK.
+
+### Compatibility
+
+- **Drop-in upgrade from v0.60.x.** No flag changes; new strategies are opt-in. Existing pipelines without YAML `dictionaries:` block behave identically.
+- **Internal API change**: `cmd/sluice/redact_flag.go`'s `parseRedactFlags` and `mergeYAMLRedactions` gain a fourth `dictionaries map[string][]string` parameter. All in-process callers (Migrate, SyncStart, BackupFull, SchemaPreview) thread the pre-resolved dictionary map. Direct API users of these helpers need a one-line update; pass `nil` when no dictionaries are declared.
+- **`config.Redaction` gains a `Dict string` field**; pre-existing YAML configs unaffected (default empty).
+- **`config.Config` gains a `Dictionaries map[string]Dictionary` field**; pre-existing YAML configs unaffected (default nil map).
+- **`yamlRandomizeToSluice` signature changed** to accept `streamID` + `dictionaries` parameters. Only relevant to direct API users; no operator-facing change.
+- **Determinism contracts**:
+  - `randomize:dict` inherits ADR-0039's PK-keyed contract.
+  - `tokenize:dict` follows the NEW input-value-keyed contract documented in ADR-0040.
+
+### Phase progress
+
+- Phase 1 (v0.53.0): null, static, hash, truncate.
+- Phase 1.5 (v0.54.0+): CDC apply-path redaction, schema-preview annotation, YAML config, backup-stream redaction.
+- Phase 2.a (v0.56.0): generic `mask:inner` / `mask:outer` + Luhn helper.
+- Phase 2.b (v0.57.0 + v0.58.0): mask presets (ssn, pan, pan-relaxed, email, ca-sin, uk-nin, iban, uuid).
+- Phase 2.c first wave (v0.59.0): randomize:int, randomize:email, randomize:us-phone, randomize:uuid.
+- Phase 2.c second wave (v0.60.0): randomize:ssn, randomize:pan, randomize:ca-sin, randomize:uk-nin, randomize:iban.
+- Phase 3 (this release): randomize:dict, tokenize:dict, YAML dictionaries: block.
+
+Phase 4 (cross-stream keyset persistence) is the next major chunk — it formalises the operator-keyset story that the current `tokenize:dict` HMAC's fixed key (`sluice-tokenize-dict-v1`) leaves room for.
+
+### Who needs this release
+
+- **Operators redacting columns that appear in multiple tables** wanting one stable surrogate per value (e.g. customer names in `orders.customer_name`, `support_tickets.customer_name`, `audit_log.actor`) — `tokenize:dict` gives them per-value cross-table stability that no prior strategy provided.
+- **Operators wanting per-row synthetic-but-stable names / cities / placeholder strings** drawn from an operator-curated list (e.g. test data that uses fictional-but-realistic names) — `randomize:dict` extends v0.59.0's per-row replay-stability to operator-supplied vocabularies.
+- **Operators with PII columns on PK-less source tables** (audit logs, event streams, denormalised analytics tables) — `tokenize:dict` works on them; `randomize:dict` and other randomize:* strategies do not.
+- **Anyone not using dict strategies**: drop-in, no behaviour change.
+
+### Verification
+
+- **Build + lint clean** across all tags (default, integration, integration postgis).
+- **Unit tests** (`strategies_dict_test.go`): RandomizeDict determinism (same seed → same output) + per-seed separation; nil-seed refusal naming "primary key"; empty-entries refusal (defense-in-depth); Name() prefix invariants (RandomizeDict starts with `randomize:`, TokenizeDict does NOT). TokenizeDict determinism per input value (same input + different seed → same output); StreamID + DictName affecting output; NULL pass-through; non-string input canonicalization; seed-to-index reduction sanity.
+- **Loader tests** (`dictionary_test.go`): nil/empty pass-through; inline form with trimming + empty-drop; file form with `#`-comment + blank-line skipping; refusal paths (empty dict, all-whitespace inline, both file+entries declared, missing file, empty file, all-comments file, empty name); `ResolveDictEntries` defensive-copy behaviour.
+- **CLI tests** (`redact_flag_test.go`): `tokenize:dict:<name>` + `randomize:dict:<name>` happy paths; refusal paths (no form, unknown form, no dict name, empty name, unknown dict, no-dicts-loaded); streamID threading from CLI parser into TokenizeDict; end-to-end LoadDictionaries → parseRedactFlags → Redact.
+- **YAML tests** (`redact_flag_test.go`): tokenize form omitted (defaults to dict) + explicit `form: dict`; randomize form: dict; refusal paths (missing dict field, unknown form, unknown dict, spurious min/brand/country_code on tokenize, spurious brand/dict on randomize:int, spurious `dict:` on hash / static).
+
+See `docs/adr/adr-0040-dictionary-strategy-determinism.md` for the two determinism contracts. See `docs/dev/notes/prep-pii-redaction-phase-2-strategy-catalog.md` Phase 3 section for the catalog.
+
 ## [0.60.0]
 
 **PII Phase 2.c second wave — checksum-aware replay-stable randomize strategies.** Five new generators (`randomize:ssn`, `randomize:pan[:<brand>]`, `randomize:ca-sin`, `randomize:uk-nin`, `randomize:iban[:<country-code>]`) that produce realistic synthetic identifiers in the canonical shape for each country/format — Luhn-valid PANs / CA SINs, mod-97-valid IBANs, reserved-range-avoiding US SSNs, HMRC-shape UK NINs. Same per-row replay-stability contract as v0.59.0's first wave: same source row → same redacted value across re-runs, CDC resumes, and backup→restore. ADR-0039 still governs.

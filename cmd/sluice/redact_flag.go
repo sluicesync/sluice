@@ -49,7 +49,13 @@ import (
 // pass an empty string in contexts (like `sluice migrate`) where a
 // stream-id isn't applicable, in which case the salt alone keys the
 // HMAC.
-func parseRedactFlags(values []string, keySource, streamID string) (*redact.Registry, error) {
+//
+// dictionaries is the pre-resolved dictionary map (name → entries)
+// from [redact.LoadDictionaries]. Pass nil when no dictionaries are
+// declared. Any rule referencing `tokenize:dict:<name>` or
+// `randomize:dict:<name>` against a missing dictionary name is
+// refused loudly. PII Phase 3 (v0.61.0+).
+func parseRedactFlags(values []string, keySource, streamID string, dictionaries map[string][]string) (*redact.Registry, error) {
 	if len(values) == 0 {
 		return nil, nil
 	}
@@ -59,7 +65,7 @@ func parseRedactFlags(values []string, keySource, streamID string) (*redact.Regi
 		if err != nil {
 			return nil, fmt.Errorf("--redact %q: %w", raw, err)
 		}
-		strategy, err := strategyFromSpec(strategySpec, keySource, streamID)
+		strategy, err := strategyFromSpec(strategySpec, keySource, streamID, dictionaries)
 		if err != nil {
 			return nil, fmt.Errorf("--redact %q: %w", raw, err)
 		}
@@ -77,7 +83,11 @@ func parseRedactFlags(values []string, keySource, streamID string) (*redact.Regi
 // keySource and streamID are the effective values (CLI flag
 // override of YAML). Returns the (potentially-augmented) Registry
 // or an error if any YAML entry is malformed.
-func mergeYAMLRedactions(reg *redact.Registry, entries []config.Redaction, keySource, streamID string) (*redact.Registry, error) {
+//
+// dictionaries is the pre-resolved dictionary map (name → entries)
+// from [redact.LoadDictionaries]. Any YAML entry referencing a
+// missing dictionary name is refused loudly. PII Phase 3 (v0.61.0+).
+func mergeYAMLRedactions(reg *redact.Registry, entries []config.Redaction, keySource, streamID string, dictionaries map[string][]string) (*redact.Registry, error) {
 	if len(entries) == 0 {
 		return reg, nil
 	}
@@ -85,7 +95,7 @@ func mergeYAMLRedactions(reg *redact.Registry, entries []config.Redaction, keySo
 		reg = redact.New()
 	}
 	for i, entry := range entries {
-		strategy, err := yamlStrategyToSluice(entry, keySource, streamID)
+		strategy, err := yamlStrategyToSluice(entry, keySource, streamID, dictionaries)
 		if err != nil {
 			return nil, fmt.Errorf("redactions[%d] (table=%q strategy=%q): %w", i, entry.Table, entry.Strategy, err)
 		}
@@ -99,7 +109,14 @@ func mergeYAMLRedactions(reg *redact.Registry, entries []config.Redaction, keySo
 }
 
 // yamlStrategyToSluice converts a config.Redaction to a redact.Strategy.
-func yamlStrategyToSluice(entry config.Redaction, keySource, streamID string) (redact.Strategy, error) {
+func yamlStrategyToSluice(entry config.Redaction, keySource, streamID string, dictionaries map[string][]string) (redact.Strategy, error) {
+	// Field-cross-checks: `dict:` is only valid on `tokenize` and on
+	// `randomize` + `form: dict`. Refusing spurious dict on other
+	// strategies catches operator typos early. The randomize check
+	// happens inside yamlRandomizeToSluice (it knows the form).
+	if entry.Dict != "" && entry.Strategy != "tokenize" && entry.Strategy != "randomize" {
+		return nil, fmt.Errorf("strategy %q takes no 'dict' field; remove it (dict is only valid on 'tokenize' and 'randomize' + form:dict)", entry.Strategy)
+	}
 	switch entry.Strategy {
 	case "null":
 		return redact.Null{}, nil
@@ -129,12 +146,56 @@ func yamlStrategyToSluice(entry config.Redaction, keySource, streamID string) (r
 	case "mask":
 		return yamlMaskToSluice(entry)
 	case "randomize":
-		return yamlRandomizeToSluice(entry)
+		return yamlRandomizeToSluice(entry, streamID, dictionaries)
+	case "tokenize":
+		return yamlTokenizeToSluice(entry, streamID, dictionaries)
 	case "":
-		return nil, errors.New("'strategy' field is required (null, static, hash, truncate, mask, randomize)")
+		return nil, errors.New("'strategy' field is required (null, static, hash, truncate, mask, randomize, tokenize)")
 	default:
-		return nil, fmt.Errorf("unknown strategy %q (supported: null, static, hash, truncate, mask, randomize)", entry.Strategy)
+		return nil, fmt.Errorf("unknown strategy %q (supported: null, static, hash, truncate, mask, randomize, tokenize)", entry.Strategy)
 	}
+}
+
+// yamlTokenizeToSluice converts a `strategy: tokenize` YAML entry
+// into a concrete [redact.Strategy]. PII Phase 3 (v0.61.0+). Only
+// shape supported today is `form: dict` + `dict: <name>`:
+//
+//   - table: users.first_name
+//     strategy: tokenize
+//     dict: first_names
+//
+// The `form:` field is optional and defaults to "dict" (the only
+// supported shape) — operators can omit it.
+//
+// Refuses spurious min/max/brand/country_code (these belong to
+// randomize, not tokenize), missing `dict:` field, or a `dict:`
+// referencing a name not declared under top-level `dictionaries:`.
+func yamlTokenizeToSluice(entry config.Redaction, streamID string, dictionaries map[string][]string) (redact.Strategy, error) {
+	if entry.Min != 0 || entry.Max != 0 {
+		return nil, errors.New("strategy 'tokenize' takes no min/max; remove the fields")
+	}
+	if entry.Brand != "" {
+		return nil, errors.New("strategy 'tokenize' takes no brand; remove the field")
+	}
+	if entry.CountryCode != "" {
+		return nil, errors.New("strategy 'tokenize' takes no country_code; remove the field")
+	}
+	// Form is optional and defaults to "dict". Anything else is
+	// reserved for future shapes; refuse unknown forms loudly.
+	switch entry.Form {
+	case "", "dict":
+		// ok
+	default:
+		return nil, fmt.Errorf("strategy 'tokenize' has unknown form %q (supported: dict)", entry.Form)
+	}
+	if entry.Dict == "" {
+		return nil, errors.New("strategy 'tokenize' requires 'dict' field naming a dictionary declared under top-level 'dictionaries:'")
+	}
+	entries, err := redact.ResolveDictEntries(dictionaries, entry.Dict)
+	if err != nil {
+		return nil, err
+	}
+	return redact.TokenizeDict{DictName: entry.Dict, Entries: entries, StreamID: streamID}, nil
 }
 
 // yamlRandomizeToSluice converts a `strategy: randomize` YAML entry
@@ -156,7 +217,7 @@ func yamlStrategyToSluice(entry config.Redaction, keySource, streamID string) (r
 // min/max on int form, spurious min/max/brand/country_code on
 // forms that don't take them, and unsupported brand / country_code
 // values (so operator misconfiguration is loud, not silent).
-func yamlRandomizeToSluice(entry config.Redaction) (redact.Strategy, error) {
+func yamlRandomizeToSluice(entry config.Redaction, _ string, dictionaries map[string][]string) (redact.Strategy, error) {
 	// Guard helpers: each form rejects fields it doesn't use.
 	noBounds := func(form string) error {
 		if entry.Min != 0 || entry.Max != 0 {
@@ -176,6 +237,12 @@ func yamlRandomizeToSluice(entry config.Redaction) (redact.Strategy, error) {
 		}
 		return nil
 	}
+	noDict := func(form string) error {
+		if entry.Dict != "" {
+			return fmt.Errorf("strategy 'randomize' form %q takes no dict; remove the field (dict only applies to form: dict)", form)
+		}
+		return nil
+	}
 	rejectAllOptionals := func(form string) error {
 		if err := noBounds(form); err != nil {
 			return err
@@ -183,11 +250,14 @@ func yamlRandomizeToSluice(entry config.Redaction) (redact.Strategy, error) {
 		if err := noBrand(form); err != nil {
 			return err
 		}
-		return noCountry(form)
+		if err := noCountry(form); err != nil {
+			return err
+		}
+		return noDict(form)
 	}
 	switch entry.Form {
 	case "":
-		return nil, errors.New("strategy 'randomize' requires 'form' field: one of 'int', 'email', 'us-phone', 'uuid', 'ssn', 'pan', 'ca-sin', 'uk-nin', 'iban'")
+		return nil, errors.New("strategy 'randomize' requires 'form' field: one of 'int', 'email', 'us-phone', 'uuid', 'ssn', 'pan', 'ca-sin', 'uk-nin', 'iban', 'dict'")
 	case "email":
 		if err := rejectAllOptionals("email"); err != nil {
 			return nil, err
@@ -225,6 +295,9 @@ func yamlRandomizeToSluice(entry config.Redaction) (redact.Strategy, error) {
 		if err := noCountry("pan"); err != nil {
 			return nil, err
 		}
+		if err := noDict("pan"); err != nil {
+			return nil, err
+		}
 		if err := redact.ValidatePANBrand(entry.Brand); err != nil {
 			return nil, err
 		}
@@ -234,6 +307,9 @@ func yamlRandomizeToSluice(entry config.Redaction) (redact.Strategy, error) {
 			return nil, err
 		}
 		if err := noBrand("iban"); err != nil {
+			return nil, err
+		}
+		if err := noDict("iban"); err != nil {
 			return nil, err
 		}
 		if err := redact.ValidateIBANCountry(entry.CountryCode); err != nil {
@@ -247,12 +323,33 @@ func yamlRandomizeToSluice(entry config.Redaction) (redact.Strategy, error) {
 		if err := noCountry("int"); err != nil {
 			return nil, err
 		}
+		if err := noDict("int"); err != nil {
+			return nil, err
+		}
 		if entry.Min > entry.Max {
 			return nil, fmt.Errorf("strategy 'randomize' form 'int' requires min <= max; got min=%d, max=%d", entry.Min, entry.Max)
 		}
 		return redact.RandomizeInt{Min: entry.Min, Max: entry.Max}, nil
+	case "dict":
+		if err := noBounds("dict"); err != nil {
+			return nil, err
+		}
+		if err := noBrand("dict"); err != nil {
+			return nil, err
+		}
+		if err := noCountry("dict"); err != nil {
+			return nil, err
+		}
+		if entry.Dict == "" {
+			return nil, errors.New("strategy 'randomize' form 'dict' requires 'dict' field naming a dictionary declared under top-level 'dictionaries:'")
+		}
+		entries, err := redact.ResolveDictEntries(dictionaries, entry.Dict)
+		if err != nil {
+			return nil, err
+		}
+		return redact.RandomizeDict{DictName: entry.Dict, Entries: entries}, nil
 	default:
-		return nil, fmt.Errorf("strategy 'randomize' has unknown form %q (supported: int, email, us-phone, uuid, ssn, pan, ca-sin, uk-nin, iban)", entry.Form)
+		return nil, fmt.Errorf("strategy 'randomize' has unknown form %q (supported: int, email, us-phone, uuid, ssn, pan, ca-sin, uk-nin, iban, dict)", entry.Form)
 	}
 }
 
@@ -367,7 +464,7 @@ func splitRedactValue(raw string) (schema, table, column, strategySpec string, e
 // strategyFromSpec parses the strategy-spec portion of a --redact
 // value into a [redact.Strategy]. The supported spec forms are
 // listed in the parseRedactFlags doc-comment.
-func strategyFromSpec(spec, keySource, streamID string) (redact.Strategy, error) {
+func strategyFromSpec(spec, keySource, streamID string, dictionaries map[string][]string) (redact.Strategy, error) {
 	name, opts, _ := strings.Cut(spec, ":")
 	name = strings.TrimSpace(name)
 	opts = strings.TrimSpace(opts)
@@ -411,9 +508,48 @@ func strategyFromSpec(spec, keySource, streamID string) (redact.Strategy, error)
 	case "mask":
 		return parseMaskStrategy(opts)
 	case "randomize":
-		return parseRandomizeStrategy(opts)
+		return parseRandomizeStrategy(opts, dictionaries)
+	case "tokenize":
+		return parseTokenizeStrategy(opts, streamID, dictionaries)
 	default:
-		return nil, fmt.Errorf("unknown strategy %q (supported: null, static:<v>, hash:sha256, hash:hmac-sha256, truncate:<n>, mask:inner:<m1>,<m2>[,<char>], mask:outer:<m1>,<m2>[,<char>], mask:<preset>, randomize:int:<min>,<max>, randomize:email, randomize:us-phone, randomize:uuid, randomize:ssn, randomize:pan[:<brand>], randomize:ca-sin, randomize:uk-nin, randomize:iban[:<country-code>])", name)
+		return nil, fmt.Errorf("unknown strategy %q (supported: null, static:<v>, hash:sha256, hash:hmac-sha256, truncate:<n>, mask:inner:<m1>,<m2>[,<char>], mask:outer:<m1>,<m2>[,<char>], mask:<preset>, randomize:int:<min>,<max>, randomize:email, randomize:us-phone, randomize:uuid, randomize:ssn, randomize:pan[:<brand>], randomize:ca-sin, randomize:uk-nin, randomize:iban[:<country-code>], randomize:dict:<name>, tokenize:dict:<name>)", name)
+	}
+}
+
+// parseTokenizeStrategy parses the suffix of a `tokenize:` spec
+// (PII Phase 3, v0.61.0). Only `dict:<name>` is supported today.
+// streamID is captured into the strategy so the HMAC input depends
+// on the active stream identifier (empty when migrate / no-stream
+// contexts; see [redact.TokenizeDict] for the determinism contract).
+//
+// CLI form REQUIRES a YAML config because dictionaries live under
+// the top-level `dictionaries:` block — there's no CLI-only form for
+// declaring dictionary content. Operators using only CLI flags see
+// a clear refusal naming the missing dictionary.
+//
+// Refuses on:
+//
+//   - Empty opts (no form supplied)
+//   - Unknown form (today only "dict" is valid)
+//   - Empty / missing dictionary name after `dict:`
+//   - Dictionary name not declared in YAML
+func parseTokenizeStrategy(opts, streamID string, dictionaries map[string][]string) (redact.Strategy, error) {
+	if opts == "" {
+		return nil, errors.New("strategy 'tokenize' requires a form: 'tokenize:dict:<name>' (the dictionary must be declared in YAML under 'dictionaries:')")
+	}
+	formName, rest, _ := strings.Cut(opts, ":")
+	switch formName {
+	case "dict":
+		if rest == "" {
+			return nil, errors.New("strategy 'tokenize:dict:': dictionary name is empty (use 'tokenize:dict:<name>' where <name> is declared in YAML under 'dictionaries:')")
+		}
+		entries, err := redact.ResolveDictEntries(dictionaries, rest)
+		if err != nil {
+			return nil, err
+		}
+		return redact.TokenizeDict{DictName: rest, Entries: entries, StreamID: streamID}, nil
+	default:
+		return nil, fmt.Errorf("strategy 'tokenize:%s': unknown form (supported: dict:<name>)", opts)
 	}
 }
 
@@ -443,9 +579,9 @@ func strategyFromSpec(spec, keySource, streamID string) (redact.Strategy, error)
 //   - `int:` missing or malformed min/max (non-integer; min > max)
 //   - Brand / country-code outside the supported set
 //   - No-options form supplied with options (e.g., `randomize:uuid:foo`)
-func parseRandomizeStrategy(opts string) (redact.Strategy, error) {
+func parseRandomizeStrategy(opts string, dictionaries map[string][]string) (redact.Strategy, error) {
 	if opts == "" {
-		return nil, errors.New("strategy 'randomize' requires a form: 'int:<min>,<max>', 'email', 'us-phone', 'uuid', 'ssn', 'pan[:<brand>]', 'ca-sin', 'uk-nin', or 'iban[:<country-code>]'")
+		return nil, errors.New("strategy 'randomize' requires a form: 'int:<min>,<max>', 'email', 'us-phone', 'uuid', 'ssn', 'pan[:<brand>]', 'ca-sin', 'uk-nin', 'iban[:<country-code>]', or 'dict:<name>'")
 	}
 	formName, rest, ok := strings.Cut(opts, ":")
 	if !ok {
@@ -470,15 +606,27 @@ func parseRandomizeStrategy(opts string) (redact.Strategy, error) {
 			return redact.RandomizeIBAN{}, nil
 		case "int":
 			return nil, errors.New("strategy 'randomize:int' requires bounds: 'randomize:int:<min>,<max>'")
+		case "dict":
+			return nil, errors.New("strategy 'randomize:dict' requires a dictionary name: 'randomize:dict:<name>' (the dictionary must be declared in YAML under 'dictionaries:')")
 		default:
-			return nil, fmt.Errorf("strategy 'randomize:%s': unknown form (supported: int:<min>,<max>, email, us-phone, uuid, ssn, pan[:<brand>], ca-sin, uk-nin, iban[:<country-code>])", formName)
+			return nil, fmt.Errorf("strategy 'randomize:%s': unknown form (supported: int:<min>,<max>, email, us-phone, uuid, ssn, pan[:<brand>], ca-sin, uk-nin, iban[:<country-code>], dict:<name>)", formName)
 		}
 	}
 	// Has a colon — int with min,max; pan with brand; iban with
-	// country; or a no-options form that was given unexpected options.
+	// country; dict with dictionary name; or a no-options form that
+	// was given unexpected options.
 	switch formName {
 	case "email", "us-phone", "uuid", "ssn", "ca-sin", "uk-nin":
 		return nil, fmt.Errorf("strategy 'randomize:%s': form '%s' takes no options (drop ':%s')", opts, formName, rest)
+	case "dict":
+		if rest == "" {
+			return nil, errors.New("strategy 'randomize:dict:': dictionary name is empty (use 'randomize:dict:<name>' where <name> is declared in YAML under 'dictionaries:')")
+		}
+		entries, err := redact.ResolveDictEntries(dictionaries, rest)
+		if err != nil {
+			return nil, err
+		}
+		return redact.RandomizeDict{DictName: rest, Entries: entries}, nil
 	case "pan":
 		// `randomize:pan:` (trailing colon, empty brand) is operator
 		// error — the no-brand form is `randomize:pan`. Refuse rather
@@ -517,7 +665,7 @@ func parseRandomizeStrategy(opts string) (redact.Strategy, error) {
 		}
 		return redact.RandomizeInt{Min: minVal, Max: maxVal}, nil
 	default:
-		return nil, fmt.Errorf("strategy 'randomize:%s': unknown form %q (supported: int:<min>,<max>, email, us-phone, uuid, ssn, pan[:<brand>], ca-sin, uk-nin, iban[:<country-code>])", opts, formName)
+		return nil, fmt.Errorf("strategy 'randomize:%s': unknown form %q (supported: int:<min>,<max>, email, us-phone, uuid, ssn, pan[:<brand>], ca-sin, uk-nin, iban[:<country-code>], dict:<name>)", opts, formName)
 	}
 }
 

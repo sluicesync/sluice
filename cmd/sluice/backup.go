@@ -16,6 +16,7 @@ import (
 	"github.com/orware/sluice/internal/crypto"
 	"github.com/orware/sluice/internal/ir"
 	"github.com/orware/sluice/internal/pipeline"
+	"github.com/orware/sluice/internal/redact"
 )
 
 // EncryptionFlags is the shared kong flag set for `--encrypt*` and
@@ -394,7 +395,7 @@ type BackupFullCmd struct {
 
 	ForceOverwrite bool `help:"Replace an existing completed backup at the destination. By default 'sluice backup full' refuses to overwrite a successful prior backup; pass this to discard the prior contents and start fresh. Partial (in-progress) backups always resume regardless of this flag."`
 
-	Redact          []string `help:"Redact a PII column in backup chunks (repeatable). Format: '[schema.]table.column=STRATEGY[:options]'. Strategies: null, static:<v>, hash:sha256, hash:hmac-sha256, truncate:<n>, mask:inner:<m1>,<m2>[,<char>], mask:outer:<m1>,<m2>[,<char>], mask:ssn, mask:pan, mask:pan-relaxed, mask:email, mask:ca-sin, mask:uk-nin, mask:iban, mask:uuid, randomize:int:<min>,<max>, randomize:email, randomize:us-phone, randomize:uuid, randomize:ssn, randomize:pan[:<brand>], randomize:ca-sin, randomize:uk-nin, randomize:iban[:<country-code>] — same set as 'sluice migrate --redact'. PII Phase 1.5 (v0.55.0+): redaction applies during chunk write, so the on-disk backup is PII-clean. Restore from a redacted chain produces the same redacted shape; restore does NOT re-apply redactions (they were applied at backup time). See docs/dev/notes/prep-pii-redaction-phase-1.md." placeholder:"RULE" sep:"none"`
+	Redact          []string `help:"Redact a PII column in backup chunks (repeatable). Format: '[schema.]table.column=STRATEGY[:options]'. Strategies: null, static:<v>, hash:sha256, hash:hmac-sha256, truncate:<n>, mask:inner:<m1>,<m2>[,<char>], mask:outer:<m1>,<m2>[,<char>], mask:ssn, mask:pan, mask:pan-relaxed, mask:email, mask:ca-sin, mask:uk-nin, mask:iban, mask:uuid, randomize:int:<min>,<max>, randomize:email, randomize:us-phone, randomize:uuid, randomize:ssn, randomize:pan[:<brand>], randomize:ca-sin, randomize:uk-nin, randomize:iban[:<country-code>], randomize:dict:<name>, tokenize:dict:<name> (Phase 3, v0.61.0+; dictionaries declared in YAML) — same set as 'sluice migrate --redact'. PII Phase 1.5 (v0.55.0+): redaction applies during chunk write, so the on-disk backup is PII-clean. Restore from a redacted chain produces the same redacted shape; restore does NOT re-apply redactions (they were applied at backup time). See docs/dev/notes/prep-pii-redaction-phase-1.md." placeholder:"RULE" sep:"none"`
 	RedactKeySource string   `help:"Source for the HMAC keyset when --redact rules use 'hash:hmac-sha256'. Same forms as 'sluice migrate --redact-key-source'." placeholder:"SRC"`
 
 	EncryptionFlags
@@ -465,11 +466,15 @@ func (b *BackupFullCmd) Run(g *Globals) error {
 	if keySource == "" {
 		keySource = cfg.RedactKeySource
 	}
-	redactor, err := parseRedactFlags(b.Redact, keySource, "")
+	dictionaries, err := redact.LoadDictionaries(cfg.Dictionaries)
 	if err != nil {
 		return err
 	}
-	redactor, err = mergeYAMLRedactions(redactor, cfg.Redactions, keySource, "")
+	redactor, err := parseRedactFlags(b.Redact, keySource, "", dictionaries)
+	if err != nil {
+		return err
+	}
+	redactor, err = mergeYAMLRedactions(redactor, cfg.Redactions, keySource, "", dictionaries)
 	if err != nil {
 		return fmt.Errorf("redactions (YAML): %w", err)
 	}
