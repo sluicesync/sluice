@@ -6,6 +6,33 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.64.0]
+
+**Parallel bulk-copy now uses the engine-native fast loader on a cold start (ADR-0043; ADR-0042 Phase C).** The within-table parallel-copy path previously routed *every* chunk through a generic `database/sql` batched idempotent-upsert (`INSERT … ON CONFLICT/ON DUPLICATE KEY UPDATE`) — it never used PostgreSQL `COPY` or MySQL `LOAD DATA`, even though the single-reader path already does. That was a deliberate-but-over-broad trade for crash-resume safety. ADR-0042 Phase B profiling proved this generic writer path — not driver encoding or column types — was the dominant cost behind the MySQL↔PG throughput gap. v0.64.0 makes the parallel chunk writer **situation-driven and automatic** (no new flag): a fresh cold-start chunk into a proven-empty target streams through one native `COPY`/`LOAD DATA` call; resume, `--force-cold-start`, and live-add stay on the idempotent path exactly as before.
+
+### Changed
+
+- **Parallel-copy chunk writer selection is now automatic and situation-driven** (`internal/pipeline` ADR-0043 four-gate rule). A chunk uses the native fast loader iff: not a resume run, **and** the chunk has zero recorded prior progress, **and** `--force-cold-start` was not set (target proven empty by the Bug 9 pre-flight). Otherwise it uses the idempotent upsert path, byte-for-byte as before. No CLI surface, no IR/schema/state-format change — symmetric with how the single-reader path already auto-selects the loader from engine capability.
+- A fast-path cold chunk streams its entire PK-bounded range through **one** `WriteRows` call (one `COPY` / `LOAD DATA`, memory-bounded — no whole-chunk buffering) with a single terminal per-chunk checkpoint, instead of per-batch upserts + per-batch cursor checkpoints.
+
+### Performance
+
+- Local-rig medium fixture (25 tables × 100k rows), MySQL → MySQL, default config: **~31s → ~24s wall** (~80k → ~104k rows/sec); per-chunk rate **~16–18k → ~28k rows/sec**, ~1.7× per-stream, materially into the PostgreSQL band. PostgreSQL → PostgreSQL: no regression (it is schema/DDL-bound, not bulk-copy-bound — ADR-0042 finding N2). Largest real-world benefit: large cold-start migrations into an empty target (the common `migrate` case).
+
+### Correctness
+
+- The fast (non-upsert) path is taken **only** where a primary-key collision is provably impossible: a chunk with zero committed rows into an empty target. A crash mid-fast-chunk is safe because the *next* invocation is a resume run, which fails gate (1) and replays that chunk through the idempotent upsert — absorbing any committed prefix without collision. Pinned by a permanent both-engines proof-of-falsification integration test (`TestFastLoader_CrashMidFastChunk_ResumeIsIdempotent`) plus fresh-cold-start, force-cold-start-populated, and resume-partial coverage.
+
+### Diagnostics
+
+- Adds the ADR-0042 Phase B findings + the ADR-0043 design record (docs/ADRs only). The DEBUG-gated `adr0042:` per-chunk instrumentation (added in v0.63.1) now also annotates fast-loader chunks (`fast_loader=true`); `--log-level=debug` only, no behaviour change.
+
+### Who needs this release
+
+- **Anyone running large cold-start `sluice migrate` (or `sync start` cold-start) into an empty target** — especially MySQL targets and parallel-eligible tables (≥ `--bulk-parallel-min-rows`). Faster, automatically, no config change.
+- **Resume / `--force-cold-start` / mid-stream live-add users**: behaviour is byte-for-byte unchanged (idempotent path retained for exactly those situations).
+- **Everyone**: no API/CLI/IR/state-format change; drop-in upgrade from v0.63.1.
+
 ## [0.63.1]
 
 **Fixed: PostgreSQL source migrations silently skipped parallel-copy on a freshly loaded/restored database (ADR-0042 finding N1).** sluice decides parallel-copy eligibility from a row-count estimate. The PostgreSQL estimate read `pg_class.reltuples`, which is the sentinel `-1` (PG14+) / `0` until `ANALYZE` or autovacuum populates it. On the normal migrate cold-start — load or restore a source database, then migrate before autovacuum has run — *every* table reported `~0 rows`, fell below `--bulk-parallel-min-rows`, and silently took the single-reader path. (MySQL's analogous `information_schema.tables.table_rows` is populated by InnoDB on load, so MySQL sources were unaffected — the bug was Postgres-specific and asymmetric.)
