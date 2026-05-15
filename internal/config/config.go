@@ -153,6 +153,20 @@ type Redaction struct {
 	// must not exceed Max. Ignored for other forms / strategies.
 	Min int64 `koanf:"min"`
 	Max int64 `koanf:"max"`
+
+	// Brand selects the issuer prefix when Strategy == "randomize"
+	// and Form == "pan". PII Phase 2.c second wave (v0.60.0).
+	// Valid values: "visa", "mastercard", "amex". Empty means
+	// "pick a brand at random" (deterministic per-row seed).
+	// Ignored for other forms / strategies.
+	Brand string `koanf:"brand"`
+
+	// CountryCode selects the country when Strategy == "randomize"
+	// and Form == "iban". PII Phase 2.c second wave (v0.60.0).
+	// Valid values: "DE", "GB", "FR". Empty means "pick a
+	// country at random" (deterministic per-row seed). Ignored
+	// for other forms / strategies.
+	CountryCode string `koanf:"country_code"`
 }
 
 // Mapping is a single per-column override.

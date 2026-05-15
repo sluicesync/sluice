@@ -896,6 +896,219 @@ func TestMergeYAMLRedactions_Randomize(t *testing.T) {
 	}
 }
 
+// TestParseRedactFlags_RandomizeSecondWave covers the v0.60.0 PII
+// Phase 2.c second-wave checksum-aware generators. Each happy-path
+// case produces the right Strategy concrete type with the expected
+// Name() — including brand / country-code parsing.
+func TestParseRedactFlags_RandomizeSecondWave(t *testing.T) {
+	cases := []struct {
+		name, raw, wantName string
+	}{
+		{"ssn", "users.ssn=randomize:ssn", "randomize:ssn"},
+		{"pan no brand", "p.pan=randomize:pan", "randomize:pan"},
+		{"pan visa", "p.pan=randomize:pan:visa", "randomize:pan:visa"},
+		{"pan mastercard", "p.pan=randomize:pan:mastercard", "randomize:pan:mastercard"},
+		{"pan amex", "p.pan=randomize:pan:amex", "randomize:pan:amex"},
+		{"ca-sin", "c.sin=randomize:ca-sin", "randomize:ca-sin"},
+		{"uk-nin", "u.nin=randomize:uk-nin", "randomize:uk-nin"},
+		{"iban no country", "c.iban=randomize:iban", "randomize:iban"},
+		{"iban DE", "c.iban=randomize:iban:DE", "randomize:iban:DE"},
+		{"iban GB", "c.iban=randomize:iban:GB", "randomize:iban:GB"},
+		{"iban FR", "c.iban=randomize:iban:FR", "randomize:iban:FR"},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			reg, err := parseRedactFlags([]string{c.raw}, "", "")
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			rules := reg.Rules()
+			if len(rules) != 1 {
+				t.Fatalf("got %d rules; want 1", len(rules))
+			}
+			if got := rules[0].Strategy.Name(); got != c.wantName {
+				t.Errorf("Strategy.Name() = %q; want %q", got, c.wantName)
+			}
+		})
+	}
+}
+
+// TestParseRedactFlags_RandomizeSecondWaveRefusals covers every
+// documented refusal path on the new generators: unknown brand,
+// unknown country, spurious options on no-options forms.
+func TestParseRedactFlags_RandomizeSecondWaveRefusals(t *testing.T) {
+	cases := []struct {
+		name, raw, wantSubstring string
+	}{
+		{"ssn with options", "u.x=randomize:ssn:foo", "takes no options"},
+		{"ca-sin with options", "u.x=randomize:ca-sin:foo", "takes no options"},
+		{"uk-nin with options", "u.x=randomize:uk-nin:foo", "takes no options"},
+		{"pan unknown brand", "u.x=randomize:pan:discover", "unknown brand"},
+		{"pan empty brand after colon", "u.x=randomize:pan:", "brand is empty"},
+		{"iban unknown country", "u.x=randomize:iban:US", "unknown country"},
+		{"iban lowercase country (case-sensitive)", "u.x=randomize:iban:de", "unknown country"},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			_, err := parseRedactFlags([]string{c.raw}, "", "")
+			if err == nil {
+				t.Fatal("expected error; got nil")
+			}
+			if !strings.Contains(err.Error(), c.wantSubstring) {
+				t.Errorf("error %q should contain %q", err.Error(), c.wantSubstring)
+			}
+		})
+	}
+}
+
+// TestMergeYAMLRedactions_RandomizeSecondWave covers the YAML form
+// of the v0.60.0 generators including brand / country_code parsing.
+func TestMergeYAMLRedactions_RandomizeSecondWave(t *testing.T) {
+	cases := []struct {
+		name     string
+		entry    config.Redaction
+		wantName string
+	}{
+		{
+			name:     "ssn",
+			entry:    config.Redaction{Table: "users.ssn", Strategy: "randomize", Form: "ssn"},
+			wantName: "randomize:ssn",
+		},
+		{
+			name:     "pan no brand",
+			entry:    config.Redaction{Table: "p.pan", Strategy: "randomize", Form: "pan"},
+			wantName: "randomize:pan",
+		},
+		{
+			name:     "pan visa",
+			entry:    config.Redaction{Table: "p.pan", Strategy: "randomize", Form: "pan", Brand: "visa"},
+			wantName: "randomize:pan:visa",
+		},
+		{
+			name:     "ca-sin",
+			entry:    config.Redaction{Table: "c.sin", Strategy: "randomize", Form: "ca-sin"},
+			wantName: "randomize:ca-sin",
+		},
+		{
+			name:     "uk-nin",
+			entry:    config.Redaction{Table: "u.nin", Strategy: "randomize", Form: "uk-nin"},
+			wantName: "randomize:uk-nin",
+		},
+		{
+			name:     "iban no country",
+			entry:    config.Redaction{Table: "c.iban", Strategy: "randomize", Form: "iban"},
+			wantName: "randomize:iban",
+		},
+		{
+			name:     "iban DE",
+			entry:    config.Redaction{Table: "c.iban", Strategy: "randomize", Form: "iban", CountryCode: "DE"},
+			wantName: "randomize:iban:DE",
+		},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			reg, err := mergeYAMLRedactions(nil, []config.Redaction{c.entry}, "", "")
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			rules := reg.Rules()
+			if len(rules) != 1 {
+				t.Fatalf("got %d rules; want 1", len(rules))
+			}
+			if got := rules[0].Strategy.Name(); got != c.wantName {
+				t.Errorf("Strategy.Name() = %q; want %q", got, c.wantName)
+			}
+		})
+	}
+}
+
+// TestMergeYAMLRedactions_RandomizeSecondWaveRefusals covers YAML
+// refusal paths: bad brand / country, spurious bounds/brand/country
+// on forms that don't accept them.
+func TestMergeYAMLRedactions_RandomizeSecondWaveRefusals(t *testing.T) {
+	cases := []struct {
+		name          string
+		entry         config.Redaction
+		wantSubstring string
+	}{
+		{
+			name:          "pan with unknown brand",
+			entry:         config.Redaction{Table: "u.x", Strategy: "randomize", Form: "pan", Brand: "discover"},
+			wantSubstring: "unknown brand",
+		},
+		{
+			name:          "iban with unknown country",
+			entry:         config.Redaction{Table: "u.x", Strategy: "randomize", Form: "iban", CountryCode: "US"},
+			wantSubstring: "unknown country",
+		},
+		{
+			name:          "ssn with spurious brand",
+			entry:         config.Redaction{Table: "u.x", Strategy: "randomize", Form: "ssn", Brand: "visa"},
+			wantSubstring: "takes no brand",
+		},
+		{
+			name:          "ssn with spurious country",
+			entry:         config.Redaction{Table: "u.x", Strategy: "randomize", Form: "ssn", CountryCode: "DE"},
+			wantSubstring: "takes no country_code",
+		},
+		{
+			name:          "ssn with spurious min",
+			entry:         config.Redaction{Table: "u.x", Strategy: "randomize", Form: "ssn", Min: 5},
+			wantSubstring: "takes no min/max",
+		},
+		{
+			name:          "pan with spurious country",
+			entry:         config.Redaction{Table: "u.x", Strategy: "randomize", Form: "pan", CountryCode: "DE"},
+			wantSubstring: "takes no country_code",
+		},
+		{
+			name:          "pan with spurious min",
+			entry:         config.Redaction{Table: "u.x", Strategy: "randomize", Form: "pan", Min: 5},
+			wantSubstring: "takes no min/max",
+		},
+		{
+			name:          "iban with spurious brand",
+			entry:         config.Redaction{Table: "u.x", Strategy: "randomize", Form: "iban", Brand: "visa"},
+			wantSubstring: "takes no brand",
+		},
+		{
+			name:          "iban with spurious max",
+			entry:         config.Redaction{Table: "u.x", Strategy: "randomize", Form: "iban", Max: 5},
+			wantSubstring: "takes no min/max",
+		},
+		{
+			name:          "ca-sin with spurious brand",
+			entry:         config.Redaction{Table: "u.x", Strategy: "randomize", Form: "ca-sin", Brand: "visa"},
+			wantSubstring: "takes no brand",
+		},
+		{
+			name:          "uk-nin with spurious country",
+			entry:         config.Redaction{Table: "u.x", Strategy: "randomize", Form: "uk-nin", CountryCode: "DE"},
+			wantSubstring: "takes no country_code",
+		},
+		{
+			name:          "int with spurious brand",
+			entry:         config.Redaction{Table: "u.x", Strategy: "randomize", Form: "int", Brand: "visa", Min: 1, Max: 10},
+			wantSubstring: "takes no brand",
+		},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			_, err := mergeYAMLRedactions(nil, []config.Redaction{c.entry}, "", "")
+			if err == nil {
+				t.Fatal("expected error; got nil")
+			}
+			if !strings.Contains(err.Error(), c.wantSubstring) {
+				t.Errorf("error %q should contain %q", err.Error(), c.wantSubstring)
+			}
+		})
+	}
+}
+
 // TestMergeYAMLRedactions_RandomizeRefusalPaths covers the YAML
 // refusal paths: missing form, unknown form, spurious min/max on
 // no-options forms, etc.

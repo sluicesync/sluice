@@ -6,6 +6,56 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.60.0]
+
+**PII Phase 2.c second wave — checksum-aware replay-stable randomize strategies.** Five new generators (`randomize:ssn`, `randomize:pan[:<brand>]`, `randomize:ca-sin`, `randomize:uk-nin`, `randomize:iban[:<country-code>]`) that produce realistic synthetic identifiers in the canonical shape for each country/format — Luhn-valid PANs / CA SINs, mod-97-valid IBANs, reserved-range-avoiding US SSNs, HMRC-shape UK NINs. Same per-row replay-stability contract as v0.59.0's first wave: same source row → same redacted value across re-runs, CDC resumes, and backup→restore. ADR-0039 still governs.
+
+### Added
+
+- **`randomize:ssn` strategy** — US SSN `XXX-XX-XXXX`. Avoids reserved ranges: area never 000 / 666 / 900-999 (ITIN); group never 00; serial never 0000.
+- **`randomize:pan[:<brand>]` strategy** — Luhn-valid PAN. Optional `:<brand>` suffix selects issuer: `visa` (16-digit, starts with 4), `mastercard` (16-digit, starts with 5), `amex` (15-digit, starts with 34/37). No brand → random brand from the supported set (deterministic per-row).
+- **`randomize:ca-sin` strategy** — Luhn-valid Canadian SIN `XXX-XXX-XXX`. First digit drawn from the issued-province pool (1-7, 9); 0 and 8 (reserved) are excluded.
+- **`randomize:uk-nin` strategy** — UK National Insurance Number `AA999999A`. Prefix letters from a curated subset (HMRC-reserved D/F/I/Q/U/V excluded); suffix from {A,B,C,D} per HMRC convention.
+- **`randomize:iban[:<country-code>]` strategy** — mod-97-valid IBAN with country-specific check digits computed via ISO 13616-1's letter-to-digit-pair encoding. Optional `:<country-code>` suffix: `DE` (22 chars), `GB` (22 chars), `FR` (27 chars). No country → random country from the supported set. Other countries (ES, IT, NL, etc.) can be added on operator demand.
+- **`internal/redact/iban.go`** — `ibanCheckDigits` helper computes 2-digit mod-97 checks; `ibanValid` validator confirms self-consistency. Both tested against known-good IBANs from the SWIFT registry (DE89370400440532013000, GB82WEST12345698765432, FR1420041010050500013M02606).
+- **`config.Redaction` gains `Brand string` + `CountryCode string` fields** for the `pan` / `iban` forms of randomize. YAML form: `brand: visa` / `country_code: DE`.
+- **Help text** on `migrate`, `sync start`, `backup full`, `schema preview` enumerates all 9 randomize generators (4 first-wave + 5 second-wave).
+
+### Compatibility
+
+- **Drop-in upgrade from v0.59.x.** No flag changes; new strategies are opt-in. Inherits the v0.59.0 no-PK preflight refusal (still matches by `randomize:` prefix); no new preflight code.
+- **`config.Redaction` gains 2 optional string fields** (`Brand`, `CountryCode`). Pre-existing YAML configs unaffected (the new fields default to empty).
+- **Determinism contract unchanged** — every new generator is replay-stable per (table, column, PK).
+- **Country / brand scope is intentionally narrow.** PAN ships Visa/Mastercard/AmEx (the MySQL Enterprise `gen_rnd_pan()` set); Discover, JCB, UnionPay can be added on operator demand. IBAN ships DE/GB/FR (the MySQL Enterprise default demographic); ES/IT/NL/etc. can follow. Operators needing an unsupported brand/country today should override individual columns via `static:` or implement a custom Strategy.
+
+### Phase 2 progress
+
+- Phase 2.a (v0.56.0): generic `mask:inner` / `mask:outer` + Luhn helper.
+- Phase 2.b (v0.57.0 + v0.58.0): `mask:ssn`, `mask:pan`, `mask:pan-relaxed`, `mask:email`, `mask:ca-sin`, `mask:uk-nin`, `mask:iban`, `mask:uuid`.
+- Phase 2.c first wave (v0.59.0): `randomize:int`, `randomize:email`, `randomize:us-phone`, `randomize:uuid`.
+- Phase 2.c second wave (this release): `randomize:ssn`, `randomize:pan[:<brand>]`, `randomize:ca-sin`, `randomize:uk-nin`, `randomize:iban[:<country-code>]`.
+
+Phase 2 is now **fully shipped** for the MySQL Enterprise compatibility surface. Phase 3 (dictionary-based `tokenize:dict` / `randomize:dict`) is the next major chunk; Phase 4 (cross-stream keyset persistence) follows.
+
+### Who needs this release
+
+- **Operators redacting US SSN columns** wanting stable synthetic surrogates that don't collide with real-world reserved ranges.
+- **Operators redacting credit-card PAN columns** wanting Luhn-valid synthetic numbers (test-card-shape downstream analytics that validate checksums no longer reject the redacted column).
+- **Operators with Canadian / UK / European bank PII** (CA SIN, UK NIN, DE/GB/FR IBAN) wanting one-line per-column generators matching the canonical shapes.
+- **Operators running continuous-sync** who needed checksum-aware randomize (Luhn / mod-97) — the first wave's PII shapes (email / phone / UUID) didn't cover the catalog's most checksum-sensitive identifiers.
+- **Anyone not using randomize:\***: drop-in, no behaviour change.
+
+### Verification
+
+- **Build + lint clean** across all tags (default, integration, integration postgis).
+- **Unit tests** (`strategies_randomize_2nd_wave_test.go`): 5 generator test groups cover determinism, shape correctness, checksum validity (Luhn for PAN+CA SIN, mod-97 for IBAN), reserved-range exclusion (SSN), HMRC-shape compliance (UK NIN), brand/country parsing.
+- **`ibanCheckDigits` self-consistency tests** — known-good IBANs from the SWIFT registry confirm the helper computes the right check digit; constructed IBANs round-trip through `ibanValid`.
+- **`Registry.ApplyRow` tests** — every new strategy: no-PK refusal naming column + strategy + "primary key"; with-PK replay stability.
+- **CLI tests** (`redact_flag_test.go`): every second-wave form happy path + every refusal branch (unknown brand, unknown country, spurious options on no-options forms, empty trailing colon).
+- **YAML tests**: every form happy path + every refusal path (spurious brand on non-pan forms, spurious country_code on non-iban forms, spurious bounds on non-int forms, unknown brand / country values).
+
+See `docs/adr/adr-0039-randomize-strategy-determinism.md` for the per-row seed derivation contract. See `docs/dev/notes/prep-pii-redaction-phase-2-strategy-catalog.md` for the full strategy catalog and Phase 3 / Phase 4 sequencing.
+
 ## [0.59.0]
 
 **PII Phase 2.c first wave — replay-stable randomize strategies.** Four new generators (`randomize:int`, `randomize:email`, `randomize:us-phone`, `randomize:uuid`) that produce random-looking output stable per source row. Same row in always produces same redacted row out — across runs, across CDC resumes, across backup→restore. Operators wanting MySQL Enterprise–style `gen_rnd_*` placeholder generation get the shape they expected (NANP-valid phones, v4 UUIDs, `.test` emails) plus continuous-sync idempotency that pure-random would break. The deviation from Enterprise's pure-random semantics is documented in ADR-0039.

@@ -139,43 +139,120 @@ func yamlStrategyToSluice(entry config.Redaction, keySource, streamID string) (r
 
 // yamlRandomizeToSluice converts a `strategy: randomize` YAML entry
 // into a concrete [redact.Strategy]. The Form field selects between
-// the four randomize:* forms (PII Phase 2.c, v0.59.0):
+// the nine randomize:* forms (PII Phase 2.c, v0.59.0 first wave +
+// v0.60.0 second wave):
 //
-//   - form: int   — additionally requires `min:` + `max:` integer
-//     fields (inclusive bounds; min must not exceed max).
-//   - form: email     — no other fields.
-//   - form: us-phone  — no other fields.
-//   - form: uuid      — no other fields.
+//   - form: int       — requires `min:` + `max:` integer fields
+//   - form: email     — no other fields
+//   - form: us-phone  — no other fields
+//   - form: uuid      — no other fields
+//   - form: ssn       — no other fields
+//   - form: pan       — optional `brand:` (visa, mastercard, amex)
+//   - form: ca-sin    — no other fields
+//   - form: uk-nin    — no other fields
+//   - form: iban      — optional `country_code:` (DE, GB, FR)
 //
 // Validation refuses missing form, unknown form, missing/invalid
-// min/max on int form, and spurious min/max on non-int forms (so
-// operator misconfiguration is loud, not silent).
+// min/max on int form, spurious min/max/brand/country_code on
+// forms that don't take them, and unsupported brand / country_code
+// values (so operator misconfiguration is loud, not silent).
 func yamlRandomizeToSluice(entry config.Redaction) (redact.Strategy, error) {
+	// Guard helpers: each form rejects fields it doesn't use.
+	noBounds := func(form string) error {
+		if entry.Min != 0 || entry.Max != 0 {
+			return fmt.Errorf("strategy 'randomize' form %q takes no min/max; remove the fields", form)
+		}
+		return nil
+	}
+	noBrand := func(form string) error {
+		if entry.Brand != "" {
+			return fmt.Errorf("strategy 'randomize' form %q takes no brand; remove the field", form)
+		}
+		return nil
+	}
+	noCountry := func(form string) error {
+		if entry.CountryCode != "" {
+			return fmt.Errorf("strategy 'randomize' form %q takes no country_code; remove the field", form)
+		}
+		return nil
+	}
+	rejectAllOptionals := func(form string) error {
+		if err := noBounds(form); err != nil {
+			return err
+		}
+		if err := noBrand(form); err != nil {
+			return err
+		}
+		return noCountry(form)
+	}
 	switch entry.Form {
 	case "":
-		return nil, errors.New("strategy 'randomize' requires 'form' field: 'int', 'email', 'us-phone', or 'uuid'")
+		return nil, errors.New("strategy 'randomize' requires 'form' field: one of 'int', 'email', 'us-phone', 'uuid', 'ssn', 'pan', 'ca-sin', 'uk-nin', 'iban'")
 	case "email":
-		if entry.Min != 0 || entry.Max != 0 {
-			return nil, errors.New("strategy 'randomize' form 'email' takes no min/max; remove the fields")
+		if err := rejectAllOptionals("email"); err != nil {
+			return nil, err
 		}
 		return redact.RandomizeEmail{}, nil
 	case "us-phone":
-		if entry.Min != 0 || entry.Max != 0 {
-			return nil, errors.New("strategy 'randomize' form 'us-phone' takes no min/max; remove the fields")
+		if err := rejectAllOptionals("us-phone"); err != nil {
+			return nil, err
 		}
 		return redact.RandomizeUSPhone{}, nil
 	case "uuid":
-		if entry.Min != 0 || entry.Max != 0 {
-			return nil, errors.New("strategy 'randomize' form 'uuid' takes no min/max; remove the fields")
+		if err := rejectAllOptionals("uuid"); err != nil {
+			return nil, err
 		}
 		return redact.RandomizeUUID{}, nil
+	case "ssn":
+		if err := rejectAllOptionals("ssn"); err != nil {
+			return nil, err
+		}
+		return redact.RandomizeSSN{}, nil
+	case "ca-sin":
+		if err := rejectAllOptionals("ca-sin"); err != nil {
+			return nil, err
+		}
+		return redact.RandomizeCASIN{}, nil
+	case "uk-nin":
+		if err := rejectAllOptionals("uk-nin"); err != nil {
+			return nil, err
+		}
+		return redact.RandomizeUKNIN{}, nil
+	case "pan":
+		if err := noBounds("pan"); err != nil {
+			return nil, err
+		}
+		if err := noCountry("pan"); err != nil {
+			return nil, err
+		}
+		if err := redact.ValidatePANBrand(entry.Brand); err != nil {
+			return nil, err
+		}
+		return redact.RandomizePAN{Brand: entry.Brand}, nil
+	case "iban":
+		if err := noBounds("iban"); err != nil {
+			return nil, err
+		}
+		if err := noBrand("iban"); err != nil {
+			return nil, err
+		}
+		if err := redact.ValidateIBANCountry(entry.CountryCode); err != nil {
+			return nil, err
+		}
+		return redact.RandomizeIBAN{CountryCode: entry.CountryCode}, nil
 	case "int":
+		if err := noBrand("int"); err != nil {
+			return nil, err
+		}
+		if err := noCountry("int"); err != nil {
+			return nil, err
+		}
 		if entry.Min > entry.Max {
 			return nil, fmt.Errorf("strategy 'randomize' form 'int' requires min <= max; got min=%d, max=%d", entry.Min, entry.Max)
 		}
 		return redact.RandomizeInt{Min: entry.Min, Max: entry.Max}, nil
 	default:
-		return nil, fmt.Errorf("strategy 'randomize' has unknown form %q (supported: int, email, us-phone, uuid)", entry.Form)
+		return nil, fmt.Errorf("strategy 'randomize' has unknown form %q (supported: int, email, us-phone, uuid, ssn, pan, ca-sin, uk-nin, iban)", entry.Form)
 	}
 }
 
@@ -336,17 +413,23 @@ func strategyFromSpec(spec, keySource, streamID string) (redact.Strategy, error)
 	case "randomize":
 		return parseRandomizeStrategy(opts)
 	default:
-		return nil, fmt.Errorf("unknown strategy %q (supported: null, static:<v>, hash:sha256, hash:hmac-sha256, truncate:<n>, mask:inner:<m1>,<m2>[,<char>], mask:outer:<m1>,<m2>[,<char>], mask:<preset>, randomize:int:<min>,<max>, randomize:email, randomize:us-phone, randomize:uuid)", name)
+		return nil, fmt.Errorf("unknown strategy %q (supported: null, static:<v>, hash:sha256, hash:hmac-sha256, truncate:<n>, mask:inner:<m1>,<m2>[,<char>], mask:outer:<m1>,<m2>[,<char>], mask:<preset>, randomize:int:<min>,<max>, randomize:email, randomize:us-phone, randomize:uuid, randomize:ssn, randomize:pan[:<brand>], randomize:ca-sin, randomize:uk-nin, randomize:iban[:<country-code>])", name)
 	}
 }
 
 // parseRandomizeStrategy parses the suffix of a `randomize:` spec
-// (PII Phase 2.c, v0.59.0). Supported forms:
+// (PII Phase 2.c, v0.59.0 first wave + v0.60.0 second wave).
+// Supported forms:
 //
-//   - `int:<min>,<max>` — integer in [min, max] inclusive
-//   - `email`           — `<rand-local>@<rand-domain>.test`
-//   - `us-phone`        — `XXX-XXX-XXXX` (NANP-valid area/exchange)
-//   - `uuid`            — random UUIDv4 (canonical hyphenated form)
+//   - `int:<min>,<max>`       — integer in [min, max] inclusive
+//   - `email`                 — `<rand-local>@<rand-domain>.test`
+//   - `us-phone`              — `XXX-XXX-XXXX` (NANP-valid area/exchange)
+//   - `uuid`                  — random UUIDv4 (canonical hyphenated form)
+//   - `ssn`                   — US SSN `XXX-XX-XXXX`, reserved-range-avoiding
+//   - `pan[:<brand>]`         — Luhn-valid PAN; brand: visa | mastercard | amex
+//   - `ca-sin`                — Luhn-valid Canadian SIN `XXX-XXX-XXX`
+//   - `uk-nin`                — UK NIN `AA999999A`
+//   - `iban[:<country-code>]` — mod-97-valid IBAN; country: DE | GB | FR
 //
 // All randomize:* strategies derive their output from a per-row
 // SHA-256 seed (streamID + table + column + primary-key values),
@@ -358,14 +441,16 @@ func strategyFromSpec(spec, keySource, streamID string) (redact.Strategy, error)
 //
 //   - Unknown form
 //   - `int:` missing or malformed min/max (non-integer; min > max)
+//   - Brand / country-code outside the supported set
 //   - No-options form supplied with options (e.g., `randomize:uuid:foo`)
 func parseRandomizeStrategy(opts string) (redact.Strategy, error) {
 	if opts == "" {
-		return nil, errors.New("strategy 'randomize' requires a form: 'int:<min>,<max>', 'email', 'us-phone', or 'uuid'")
+		return nil, errors.New("strategy 'randomize' requires a form: 'int:<min>,<max>', 'email', 'us-phone', 'uuid', 'ssn', 'pan[:<brand>]', 'ca-sin', 'uk-nin', or 'iban[:<country-code>]'")
 	}
 	formName, rest, ok := strings.Cut(opts, ":")
 	if !ok {
-		// No colon — must be a no-options form.
+		// No colon — a no-options form, or pan/iban with their
+		// brand/country defaulted, or int (which requires bounds).
 		switch formName {
 		case "email":
 			return redact.RandomizeEmail{}, nil
@@ -373,17 +458,47 @@ func parseRandomizeStrategy(opts string) (redact.Strategy, error) {
 			return redact.RandomizeUSPhone{}, nil
 		case "uuid":
 			return redact.RandomizeUUID{}, nil
+		case "ssn":
+			return redact.RandomizeSSN{}, nil
+		case "ca-sin":
+			return redact.RandomizeCASIN{}, nil
+		case "uk-nin":
+			return redact.RandomizeUKNIN{}, nil
+		case "pan":
+			return redact.RandomizePAN{}, nil
+		case "iban":
+			return redact.RandomizeIBAN{}, nil
 		case "int":
 			return nil, errors.New("strategy 'randomize:int' requires bounds: 'randomize:int:<min>,<max>'")
 		default:
-			return nil, fmt.Errorf("strategy 'randomize:%s': unknown form (supported: int:<min>,<max>, email, us-phone, uuid)", formName)
+			return nil, fmt.Errorf("strategy 'randomize:%s': unknown form (supported: int:<min>,<max>, email, us-phone, uuid, ssn, pan[:<brand>], ca-sin, uk-nin, iban[:<country-code>])", formName)
 		}
 	}
-	// Has a colon — must be `int` with min,max, OR a no-options form
-	// that was given unexpected options.
+	// Has a colon — int with min,max; pan with brand; iban with
+	// country; or a no-options form that was given unexpected options.
 	switch formName {
-	case "email", "us-phone", "uuid":
+	case "email", "us-phone", "uuid", "ssn", "ca-sin", "uk-nin":
 		return nil, fmt.Errorf("strategy 'randomize:%s': form '%s' takes no options (drop ':%s')", opts, formName, rest)
+	case "pan":
+		// `randomize:pan:` (trailing colon, empty brand) is operator
+		// error — the no-brand form is `randomize:pan`. Refuse rather
+		// than silently treating it as "random brand".
+		if rest == "" {
+			return nil, errors.New("strategy 'randomize:pan:': brand is empty after the colon (use 'randomize:pan' for random brand, or 'randomize:pan:visa' / ':mastercard' / ':amex')")
+		}
+		if err := redact.ValidatePANBrand(rest); err != nil {
+			return nil, err
+		}
+		return redact.RandomizePAN{Brand: rest}, nil
+	case "iban":
+		// Same: refuse trailing-colon empty country.
+		if rest == "" {
+			return nil, errors.New("strategy 'randomize:iban:': country code is empty after the colon (use 'randomize:iban' for random country, or 'randomize:iban:DE' / ':GB' / ':FR')")
+		}
+		if err := redact.ValidateIBANCountry(rest); err != nil {
+			return nil, err
+		}
+		return redact.RandomizeIBAN{CountryCode: rest}, nil
 	case "int":
 		parts := strings.Split(rest, ",")
 		if len(parts) != 2 {
@@ -402,7 +517,7 @@ func parseRandomizeStrategy(opts string) (redact.Strategy, error) {
 		}
 		return redact.RandomizeInt{Min: minVal, Max: maxVal}, nil
 	default:
-		return nil, fmt.Errorf("strategy 'randomize:%s': unknown form %q (supported: int:<min>,<max>, email, us-phone, uuid)", opts, formName)
+		return nil, fmt.Errorf("strategy 'randomize:%s': unknown form %q (supported: int:<min>,<max>, email, us-phone, uuid, ssn, pan[:<brand>], ca-sin, uk-nin, iban[:<country-code>])", opts, formName)
 	}
 }
 
