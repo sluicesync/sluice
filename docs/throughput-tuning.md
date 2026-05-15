@@ -21,14 +21,44 @@ on source transaction shape and network latency. See
 ## Parallel within-table bulk copy: `--bulk-parallelism` + `--bulk-parallel-min-rows`
 
 Default: `min(8, NumCPU)` parallel readers per table; tables under
-`--bulk-parallel-min-rows` (default `100000`) stay on the single-
-reader path.
+`--bulk-parallel-min-rows` (default `80000` as of v0.62.0; previously
+`100000`) stay on the single-reader path.
 
 Tables above the threshold split into N PK ranges and copy
 concurrently. The pgcopydb-class signature feature for multi-TB
 migrations — 4–8× wall-clock improvement on a 16-vCPU host with a
 500 GB single table. See
 [ADR-0019](adr/adr-0019-parallel-within-table-bulk-copy.md).
+
+**Threshold-tuning note (v0.62.0+).** Sluice consults
+`information_schema.tables.table_rows` (InnoDB) when deciding which
+path a table takes. That catalog row-count is an *estimate* that
+commonly undershoots actuals by 0.1–5%. The default 80,000 sits
+below 100k specifically to absorb that undershoot — a 100k-actual
+table reporting as ~95-99k via the catalog still crosses the
+threshold and engages parallel copy. Operators wanting the
+pre-v0.62.0 behaviour pass `--bulk-parallel-min-rows=100000`
+explicitly.
+
+Empirical baseline (sluice-testing `local-rig`, 25-table-100k-row
+medium fixture, Win11 + Rancher Desktop):
+
+| Configuration | Rows/sec | Wall (2.5M rows) |
+|---|---|---|
+| v0.61.0 defaults, `local_infile=OFF` | ~28k | 88s |
+| v0.61.0 defaults, `local_infile=ON` | ~33k | 75s |
+| v0.61.0 `--bulk-parallel-min-rows=50000`, `local_infile=ON` | ~54k | 46s |
+| v0.62.0 defaults, `local_infile=ON` | (expected ~50-55k) | (~45-50s) |
+| v0.61.0 PG → PG defaults | ~125k | 20s |
+
+Cross-engine note: PG → PG runs ~4× faster than MySQL → MySQL on
+the same fixture / same host. The delta is reader-side
+(PG's COPY-binary protocol + parallel chunks vs MySQL's per-table
+LOAD DATA INFILE). Worth investigating in a future throughput pass.
+
+For local-machine measurement of your own workload, see the
+sluice-testing repo's `local-rig/` directory — `bootstrap.ps1` +
+`run-throughput.ps1` + `record-baseline.ps1` cover the workflow.
 
 ## Network compression for cross-host copies
 
