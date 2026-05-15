@@ -6,6 +6,24 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.63.1]
+
+**Fixed: PostgreSQL source migrations silently skipped parallel-copy on a freshly loaded/restored database (ADR-0042 finding N1).** sluice decides parallel-copy eligibility from a row-count estimate. The PostgreSQL estimate read `pg_class.reltuples`, which is the sentinel `-1` (PG14+) / `0` until `ANALYZE` or autovacuum populates it. On the normal migrate cold-start — load or restore a source database, then migrate before autovacuum has run — *every* table reported `~0 rows`, fell below `--bulk-parallel-min-rows`, and silently took the single-reader path. (MySQL's analogous `information_schema.tables.table_rows` is populated by InnoDB on load, so MySQL sources were unaffected — the bug was Postgres-specific and asymmetric.)
+
+### Fixed
+
+- **`internal/engines/postgres` `CountRows`** now falls back to an exact `SELECT COUNT(*)` when `reltuples` is non-positive (never-analyzed sentinel, or genuinely empty). One sequential scan, one time at preflight, triggered only when planner stats are absent — tables with good stats keep the fast single-catalog-lookup path. Correct whether the table turns out to be large or empty; snapshot-pinned readers are unaffected (they return before the count path, so no deadlock against the in-flight stream).
+
+### Changed
+
+- **`internal/pipeline` parallel-copy path** now carries DEBUG-gated per-chunk / per-batch wall-time instrumentation (log key `adr0042:`, `--log-level=debug` only — no INFO+ noise). Retained as a permanent diagnostic artifact for the ongoing ADR-0042 bulk-copy throughput investigation (same disposition as the ADR-0033/0036 verify probes). No behaviour change.
+
+### Who needs this release
+
+- **Anyone running `sluice migrate` or `sync start` with a PostgreSQL source that was recently loaded or restored** (dump/restore pipelines, fresh CI/staging seeds, cross-region rehydrations). Those migrations now correctly engage parallel-copy instead of silently single-threading. Impact is largest on **PostgreSQL → MySQL** (the slow MySQL-write side now parallelizes); PostgreSQL → PostgreSQL benefits less (it is not bulk-copy-bound — ADR-0042 finding N2).
+- **MySQL-source users**: no change (never affected).
+- **Operators who already `ANALYZE` their source before migrating**: no behaviour change (the fast `reltuples` path still short-circuits).
+
 ## [0.63.0]
 
 **PII Phase 4 — operator-keyset persistence (ADR-0041).** Closes the PII track. Sluice now has a first-class **keyset**: a durable, versioned, operator-controlled set of named HMAC keys that `hash:hmac-sha256` and `tokenize:dict` both reference. A single keyset shared between two streams (`staging-1` + `staging-2`) produces *identical* surrogates for identical inputs — cross-stream referential integrity that was impossible in Phases 1–3, where each surface keyed independently. **This is a breaking change** (sluice is pre-1.0 and pre-users; per the project's zero-users → no-compat tenet we took the clean break over an additive shim).
