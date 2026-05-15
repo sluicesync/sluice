@@ -84,13 +84,22 @@ func (r *RowReader) RangeBounds(ctx context.Context, table *ir.Table, pkColumn s
 	return minHolder.Int64, maxHolder.Int64, nil
 }
 
-// CountRows implements [ir.RowCounter]. Returns an approximate row
-// count via pg_class.reltuples — fast (one catalog lookup, no full
-// scan) but staleness-tolerant: on a table that hasn't been
-// autovacuumed in a while the estimate can lag actual cardinality by
-// orders of magnitude. The throughput-metric layer is the only
-// consumer; it treats the result as an ETA hint, not a correctness
-// invariant.
+// CountRows implements [ir.RowCounter]. Returns a row count via
+// pg_class.reltuples — fast (one catalog lookup, no full scan).
+//
+// reltuples is autovacuum-/ANALYZE-maintained: on a never-analyzed
+// table it is the sentinel -1 (PG14+) or 0 (older PG). That stale
+// ~0 is not merely an ETA miss — [shouldParallelChunk] consumes
+// CountRows for parallel-copy *eligibility*, so a never-analyzed
+// large table (the normal migrate cold-start: load/restore a
+// source, then migrate, before autovacuum runs) would silently
+// fall to the single-reader path. That was ADR-0042 finding N1.
+// So when reltuples is non-positive — never-analyzed, or genuinely
+// empty — we fall back to an exact COUNT(*): one seq scan, one
+// time at preflight, triggered only when stats are absent (good
+// stats short-circuit before the scan), and correct whether the
+// table turns out to be large or empty. The wart has a name (N1),
+// a test, and this comment per the codebase's clean-code tenet.
 //
 // Returns (0, nil) when the table doesn't appear in pg_class (e.g. a
 // non-default schema), or when the reader is snapshot-pinned
@@ -128,10 +137,41 @@ func (r *RowReader) CountRows(ctx context.Context, table *ir.Table) (int64, erro
 	if rerr := rows.Err(); rerr != nil {
 		return 0, fmt.Errorf("postgres: CountRows rows: %w", rerr)
 	}
-	// reltuples is -1 on tables that have never been analyzed; clamp
-	// to 0 so the orchestrator's "no estimate" path triggers cleanly.
-	if count < 0 {
-		count = 0
+	// reltuples non-positive => never-analyzed (sentinel -1 / 0) or
+	// genuinely empty. Resolve it exactly so parallel-copy
+	// eligibility is correct on a freshly-loaded source (ADR-0042
+	// N1). Snapshot-pinned readers already returned above, so the
+	// exact COUNT(*) cannot deadlock the in-flight stream.
+	if count <= 0 {
+		return r.exactCount(ctx, table)
+	}
+	return count, nil
+}
+
+// exactCount runs SELECT COUNT(*) for the table. Used only as the
+// CountRows fallback when pg_class.reltuples is non-positive
+// (stale/never-analyzed or empty). Identifiers are quoted, not
+// parameterized — Postgres does not bind identifiers.
+func (r *RowReader) exactCount(ctx context.Context, table *ir.Table) (int64, error) {
+	q := `SELECT COUNT(*) FROM ` + quoteIdent(r.schema) + `.` + quoteIdent(table.Name)
+	rows, err := r.q.QueryContext(ctx, q) //nolint:rowserrcheck,sqlclosecheck // handled below
+	if err != nil {
+		return 0, fmt.Errorf("postgres: CountRows exact COUNT(*): %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	if !rows.Next() {
+		if rerr := rows.Err(); rerr != nil {
+			return 0, fmt.Errorf("postgres: CountRows exact rows: %w", rerr)
+		}
+		return 0, nil
+	}
+	var count int64
+	if scanErr := rows.Scan(&count); scanErr != nil {
+		return 0, fmt.Errorf("postgres: CountRows exact scan: %w", scanErr)
+	}
+	if rerr := rows.Err(); rerr != nil {
+		return 0, fmt.Errorf("postgres: CountRows exact rows: %w", rerr)
 	}
 	return count, nil
 }
