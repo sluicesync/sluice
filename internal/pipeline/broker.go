@@ -515,7 +515,7 @@ func (b *SyncFromBackup) Run(ctx context.Context) error {
 // pass; this helper is best-effort metadata for the cross-engine
 // log line).
 func (b *SyncFromBackup) detectChainSourceEngine(ctx context.Context) string {
-	chain, err := buildChain(ctx, b.Store)
+	chain, err := buildBrokerChain(ctx, b.Store)
 	if err != nil || len(chain) == 0 {
 		return ""
 	}
@@ -587,7 +587,7 @@ func (b *SyncFromBackup) coldStart(ctx context.Context, applier ir.ChangeApplier
 // columns and the subsequent COPY would fail with "column does not
 // exist". Mirror `migrate --reset-target-data`'s drop-loop pattern.
 func (b *SyncFromBackup) coldStartReset(ctx context.Context, applier ir.ChangeApplier) (string, error) {
-	chain, err := buildChain(ctx, b.Store)
+	chain, err := buildBrokerChain(ctx, b.Store)
 	if err != nil {
 		return "", wrapWithHint(PhaseConnect, fmt.Errorf("broker: build chain: %w", err))
 	}
@@ -666,7 +666,7 @@ func (b *SyncFromBackup) dropExistingTargetTables(ctx context.Context, schema *i
 // Validates that the asserted ID exists in the chain (typo
 // protection) and writes the broker's position row.
 func (b *SyncFromBackup) coldStartAtChainID(ctx context.Context, applier ir.ChangeApplier) (string, error) {
-	chain, err := buildChain(ctx, b.Store)
+	chain, err := buildBrokerChain(ctx, b.Store)
 	if err != nil {
 		return "", wrapWithHint(PhaseConnect, fmt.Errorf("broker: build chain: %w", err))
 	}
@@ -743,7 +743,7 @@ func (b *SyncFromBackup) replayNewIncrementals(
 	applier ir.ChangeApplier,
 	lastAppliedID string,
 ) (newApplied string, totalBytes int64, err error) {
-	chain, err := buildChain(ctx, b.Store)
+	chain, err := buildBrokerChain(ctx, b.Store)
 	if err != nil {
 		return "", 0, fmt.Errorf("build chain: %w", err)
 	}
@@ -794,7 +794,7 @@ func (b *SyncFromBackup) replayNewIncrementals(
 		if err := ctx.Err(); err != nil {
 			return newApplied, totalBytes, err
 		}
-		link := chain[i]
+		link := &chain[i]
 		// Skip the full's manifest (i==0) when no last-applied is
 		// set; that case shouldn't happen on the warm-resume path
 		// but is harmless to guard.
@@ -828,7 +828,7 @@ func (b *SyncFromBackup) replayNewIncrementals(
 func (b *SyncFromBackup) applyIncremental(
 	ctx context.Context,
 	applier ir.ChangeApplier,
-	link *manifestRecord,
+	link *segmentRecord,
 	batchSize int,
 ) (int64, error) {
 	// 1. Schema deltas first.
@@ -911,7 +911,7 @@ func (b *SyncFromBackup) applyIncremental(
 // Implementation duplicates the chain-restore logic intentionally
 // rather than refactoring chain_restore.go (Tenet: don't refactor
 // Phase 4 surfaces beyond what 4.5 requires).
-func (b *SyncFromBackup) applySchemaDeltas(ctx context.Context, link *manifestRecord) error {
+func (b *SyncFromBackup) applySchemaDeltas(ctx context.Context, link *segmentRecord) error {
 	if err := detectAmbiguousDeltas(link.manifest.SchemaDelta); err != nil {
 		return fmt.Errorf(
 			"unsupportable schema delta in incremental %s: %w. "+
@@ -998,12 +998,14 @@ func (b *SyncFromBackup) applySchemaDeltas(ctx context.Context, link *manifestRe
 // source's CDC token.
 func (b *SyncFromBackup) streamIncrementalWithPosition(
 	ctx context.Context,
-	link *manifestRecord,
+	link *segmentRecord,
 	pos ir.Position,
 	out chan<- ir.Change,
 ) error {
+	segStore := link.segment.store(b.Store)
+	codec := link.segment.codecOrDefault()
 	for chunkIdx, chunk := range link.manifest.ChangeChunks {
-		if err := b.streamOneChunkWithPosition(ctx, chunk, pos, out); err != nil {
+		if err := b.streamOneChunkWithPosition(ctx, segStore, codec, chunk, pos, out); err != nil {
 			return fmt.Errorf("chunk %d (%s): %w", chunkIdx, chunk.File, err)
 		}
 	}
@@ -1012,13 +1014,16 @@ func (b *SyncFromBackup) streamIncrementalWithPosition(
 
 // streamOneChunkWithPosition reads one chunk's events and pushes them
 // onto out with each change's Position field rewritten to pos.
+// segStore/codec come from the chunk's segment (recorded, not sniffed).
 func (b *SyncFromBackup) streamOneChunkWithPosition(
 	ctx context.Context,
+	segStore ir.BackupStore,
+	codec Codec,
 	chunk *ir.ChunkInfo,
 	pos ir.Position,
 	out chan<- ir.Change,
 ) error {
-	src, err := b.Store.Get(ctx, chunk.File)
+	src, err := segStore.Get(ctx, chunk.File)
 	if err != nil {
 		return fmt.Errorf("open chunk: %w", err)
 	}
@@ -1027,7 +1032,7 @@ func (b *SyncFromBackup) streamOneChunkWithPosition(
 		_ = src.Close()
 		return fmt.Errorf("resolve chunk cek: %w", err)
 	}
-	cr, err := newChangeChunkReader(src, chunk.SHA256, cek)
+	cr, err := newChangeChunkReader(src, chunk.SHA256, cek, codec)
 	if err != nil {
 		return fmt.Errorf("open chunk reader: %w", err)
 	}

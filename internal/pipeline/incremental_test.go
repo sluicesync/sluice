@@ -252,9 +252,9 @@ func TestIncrementalBackup_RoundTrip(t *testing.T) {
 	}
 
 	// Find the new manifest in the store.
-	records, err := listAllManifests(context.Background(), store)
+	records, err := listAllManifestsViaWalk(context.Background(), store)
 	if err != nil {
-		t.Fatalf("listAllManifests: %v", err)
+		t.Fatalf("listAllManifestsViaWalk: %v", err)
 	}
 	if len(records) != 2 {
 		t.Fatalf("manifests in store = %d; want 2 (full + 1 incremental)", len(records))
@@ -411,7 +411,7 @@ func TestIncrementalBackup_SchemaDelta_AddColumn(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 
-	records, _ := listAllManifests(context.Background(), store)
+	records, _ := listAllManifestsViaWalk(context.Background(), store)
 	var incr *ir.Manifest
 	for _, r := range records {
 		if r.manifest.Kind == ir.BackupKindIncremental {
@@ -585,9 +585,9 @@ func TestIncrementalBackup_TwoIncrementals_NoChunkCollision(t *testing.T) {
 		if err := b.Run(context.Background()); err != nil {
 			t.Fatalf("incremental Run: %v", err)
 		}
-		records, err := listAllManifests(context.Background(), store)
+		records, err := listAllManifestsViaWalk(context.Background(), store)
 		if err != nil {
-			t.Fatalf("listAllManifests: %v", err)
+			t.Fatalf("listAllManifestsViaWalk: %v", err)
 		}
 		// Pick the most recent incremental.
 		var newest *ir.Manifest

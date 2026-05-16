@@ -125,9 +125,9 @@ func TestIncrementalBackup_PostgresChainRestore(t *testing.T) {
 	}
 
 	// 5. Verify the new manifest landed.
-	records, err := listAllManifests(context.Background(), store)
+	records, err := listAllManifestsViaWalk(context.Background(), store)
 	if err != nil {
-		t.Fatalf("listAllManifests: %v", err)
+		t.Fatalf("listAllManifestsViaWalk: %v", err)
 	}
 	if len(records) != 2 {
 		t.Fatalf("manifests = %d; want 2 (full + incremental)", len(records))
@@ -252,7 +252,7 @@ func TestIncrementalBackup_PostgresChainRestore_SchemaEvolution(t *testing.T) {
 	}
 
 	// Verify the manifest captured the schema delta.
-	records, _ := listAllManifests(context.Background(), store)
+	records, _ := listAllManifestsViaWalk(context.Background(), store)
 	var incr *ir.Manifest
 	for _, r := range records {
 		if r.manifest.Kind == ir.BackupKindIncremental {
@@ -397,9 +397,9 @@ func TestIncrementalBackup_PostgresChainRestore_TwoIncrementals(t *testing.T) {
 	}
 
 	// Inspect manifests.
-	records, err := listAllManifests(context.Background(), store)
+	records, err := listAllManifestsViaWalk(context.Background(), store)
 	if err != nil {
-		t.Fatalf("listAllManifests: %v", err)
+		t.Fatalf("listAllManifestsViaWalk: %v", err)
 	}
 	var incrs []*ir.Manifest
 	for _, r := range records {

@@ -3,6 +3,39 @@
 
 package pipeline
 
+// # lineage.json — native bounded-segment lineage catalog (ADR-0046)
+//
+// lineage.json lives at the lineage root and is the first-class
+// on-disk description of a backup's structure. It REPLACES the
+// pre-ADR-0046 chain.json (clean break — zero on-disk chains, no
+// migration shim; see ADR-0046 §1 for the full rationale).
+//
+// A **lineage** is an ordered list of **segments**. A segment is one
+// `backup full` anchor plus the incrementals chained off it, capped
+// by policy (age / chain-length). "Rotation" is not an exceptional
+// event grafted onto an unbounded chain — advancing the lineage is
+// `appendSegment`. The grafted model's RotatedAt / SucceededBy /
+// RotationReason / Tombstoned bimodality is GONE.
+//
+// **A never-rotated backup is a one-segment lineage** with the
+// segment's Dir == "" (chunks/manifests at the conventional root
+// paths) and Codec == "gzip". That shape is byte-identical in
+// behaviour and restore path to a pre-ADR single chain — a strict
+// generalization, not a heavier common path.
+//
+// lineage.json is an accelerator for segment-shape queries the same
+// way chain.json was for chain-shape queries, but it is ALSO the
+// authoritative record of each segment's compression codec (recorded,
+// never sniffed — ADR-0046 §5) and segment boundary positions. The
+// underlying manifest files remain authoritative for schema / chunk
+// lists; a missing / stale lineage.json triggers the directory-walk
+// fallback for the common one-segment shape (a multi-segment lineage
+// with sub-dir segments cannot be reconstructed by a bare walk, so a
+// corrupt lineage.json on a rotated backup is a loud refusal — DR
+// data, never a silent partial).
+//
+// See docs/adr/adr-0046-inline-backup-chain-rotation.md.
+
 import (
 	"bytes"
 	"context"
@@ -17,255 +50,404 @@ import (
 	"github.com/orware/sluice/internal/ir"
 )
 
-// # chain.json — backup chain catalog (GitHub #20, roadmap 14a)
-//
-// chain.json lives at the chain root alongside the full's manifest.json
-// and is the single-file O(1) index over the chain's manifests. Pre-
-// v0.47.0 every chain consumer (Restore.storeHasIncrementals,
-// ChainRestore, position-from-manifest, the resume-detect path on
-// backup full / incremental / stream) walked the manifests/ directory
-// via store.List and then store.Get every result — fine on local FS
-// for small chains, painful past ~10k incrementals or on object
-// storage where ListObjects is the dominant cost. chain.json collapses
-// the walk to a single Get.
-//
-// chain.json is an *accelerator*, not the source of truth. The
-// underlying manifest files remain authoritative; if chain.json is
-// absent / stale / unparseable, readers fall back to the directory
-// walk. Writers attempt to keep chain.json in sync but a failed update
-// is logged at WARN and does NOT fail the manifest write.
-//
-// Forward / backward compat:
-//   - Pre-v0.47.0 sluice ignores chain.json (unknown file at chain
-//     root) and walks manifests/ as before.
-//   - v0.47.0+ readers without chain.json fall back to the same walk.
-//   - v0.47.0+ writers extending a legacy chain trigger a one-time
-//     lazy rebuild before appending the new entry.
-//
-// See [docs/dev/notes/prep-chain-catalog.md] for the full design.
+// LineageCatalogFileName is the filename of the lineage catalog within
+// a backup store. Lives at the lineage root, sibling to the segment-0
+// full's [ManifestFileName].
+const LineageCatalogFileName = "lineage.json"
 
-// ChainCatalogFileName is the filename of the catalog within a backup
-// store. Lives at the chain root, sibling to [ManifestFileName].
-const ChainCatalogFileName = "chain.json"
+// lineageCatalogFormatVersion is the integer version of the
+// lineage.json schema. Bumped only on incompatible field renames;
+// additive fields don't require a bump.
+const lineageCatalogFormatVersion = 1
 
-// chainCatalogFormatVersion is the integer version of the chain.json
-// schema. Bumped only on incompatible field renames; additive fields
-// don't require a bump (older sluice ignores unknown fields when
-// deserialising).
-const chainCatalogFormatVersion = 1
+// LineageCatalog is the deserialised content of lineage.json. The
+// Segments slice is ordered: Segments[0] is the lineage root (the
+// first full + its incrementals), each subsequent segment opened by an
+// inline rotation. Segments[i].EndPosition <= Segments[i+1].StartPosition
+// by construction (the rotation FSM's S>=P_N hard-fail assertion); the
+// restore lineage-walk validates it with the SAME monotonicity check
+// it uses for intra-segment incremental boundaries.
+type LineageCatalog struct {
+	FormatVersion int       `json:"format_version"`
+	LineageID     string    `json:"lineage_id,omitempty"`
+	SluiceVersion string    `json:"sluice_version,omitempty"`
+	SourceEngine  string    `json:"source_engine,omitempty"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
 
-// ChainCatalog is the deserialised content of chain.json. Ordered
-// entries[] reflects chain order: entries[0] is the chain root (the
-// full), each subsequent entry's ParentBackupID matches the prior
-// entry's BackupID.
-type ChainCatalog struct {
-	FormatVersion     int                 `json:"format_version"`
-	SluiceVersion     string              `json:"sluice_version,omitempty"`
-	SourceEngine      string              `json:"source_engine,omitempty"`
-	ChainRootBackupID string              `json:"chain_root_backup_id,omitempty"`
-	CreatedAt         time.Time           `json:"created_at"`
-	UpdatedAt         time.Time           `json:"updated_at"`
-	Entries           []ChainCatalogEntry `json:"entries"`
+	// Segments is the ordered segment list. One entry for a
+	// never-rotated backup; N for a backup rotated N-1 times.
+	Segments []LineageSegment `json:"segments"`
 
-	// RotatedAt, when non-zero, marks this chain as having been
-	// closed by a `--retain-rotate-at` rotation event (GitHub #20
-	// chunk 14b). The chain remains restorable; new incrementals
-	// are not appended after rotation. Empty when the chain is
-	// active.
-	RotatedAt time.Time `json:"rotated_at,omitempty"`
-
-	// SucceededBy, when non-empty, points at the path (relative to
-	// the chain root's parent directory) of the next chain that
-	// took over after this one was rotated. Operators / tooling
-	// follow the pointer for cross-rotation restore walks. Empty
-	// when the chain is active or when it's the most recent
-	// rotation in the rotation history.
-	SucceededBy string `json:"succeeded_by,omitempty"`
-
-	// RotationReason records why this chain was rotated. Recognised
-	// values: "retain-rotate-at" (the --retain-rotate-at threshold
-	// fired), "retain-chain-length" (the --rotate-at-chain-length
-	// threshold fired), "operator-driven" (explicit operator
-	// command — reserved for a future `sluice backup rotate`
-	// subcommand). Empty when not rotated.
-	RotationReason string `json:"rotation_reason,omitempty"`
+	// RestorableFromSegment is the prune floor: the index of the
+	// oldest segment still fully restorable. Prune (ADR-0046 §4)
+	// advances it as it drops leading whole segments. Restore refuses
+	// to start before this segment. Zero on an unpruned lineage.
+	RestorableFromSegment int `json:"restorable_from_segment"`
 }
 
-// ChainCatalogEntry is one manifest's index entry. The catalog
-// duplicates a handful of manifest fields (BackupID, Kind, parent ref,
-// EndPosition, CreatedAt) so chain readers can answer chain-shape
-// questions without parsing every manifest. Restore still reads the
-// underlying manifest body when it needs the schema or per-table chunk
-// list.
-type ChainCatalogEntry struct {
-	BackupID       string      `json:"backup_id"`
-	Kind           string      `json:"kind"`
-	ParentBackupID string      `json:"parent_backup_id,omitempty"`
-	ManifestPath   string      `json:"manifest_path"`
-	EndPosition    ir.Position `json:"end_position,omitempty"`
-	CreatedAt      time.Time   `json:"created_at"`
-	FileCount      int         `json:"file_count,omitempty"`
+// LineageSegment is one segment within a lineage: a `backup full`
+// anchor plus the incrementals chained off it, capped by policy.
+//
+// Wire shape matches ADR-0046 §1. CappedAt / CapReason are absent
+// (zero / empty) on the open (last) segment and set on every prior
+// segment by the rotation FSM's atomic COMMIT write.
+type LineageSegment struct {
+	// SegmentID is a stable identifier for the segment (the full's
+	// BackupID). Used for log lines and operator inspection.
+	SegmentID string `json:"segment_id"`
 
-	// Tombstoned is the forward-compat placeholder for the v0.48.0+
-	// prune / compact work (roadmap 14b–d). v0.47.0 writers always
-	// emit false; v0.47.0 readers MUST filter tombstoned entries when
-	// iterating the chain so a future-rebuilt catalog with tombstones
-	// doesn't silently include compacted-out manifests in a v0.47.0
-	// restore. See [filterActiveEntries].
-	Tombstoned bool `json:"tombstoned,omitempty"`
+	// Dir is the segment's sub-directory relative to the lineage root,
+	// consumed via [newPrefixedStore]. EMPTY for segment 0 of a
+	// never-rotated (or the root segment of a rotated) lineage — that
+	// segment lives at the conventional root paths so a one-segment
+	// lineage is byte-identical to a pre-ADR single chain. Rotation-
+	// opened segments get `seg-<unix-millis>/`.
+	Dir string `json:"dir,omitempty"`
+
+	// FullManifestPath is the segment's full manifest path RELATIVE TO
+	// THE SEGMENT'S Dir (i.e. as the per-segment prefixed store sees
+	// it). Always [ManifestFileName] in v0.67.0 (the full lands at the
+	// segment root); kept explicit so a future layout change doesn't
+	// need a format bump.
+	FullManifestPath string `json:"full_manifest_path"`
+
+	// Incrementals is the ordered list of incremental manifest paths
+	// for this segment, RELATIVE TO Dir, in chain order.
+	Incrementals []string `json:"incrementals"`
+
+	// StartPosition is the segment's full's snapshot anchor (S). For
+	// segment 0 it's the root full's EndPosition; for a rotation-
+	// opened segment it's the snapshot anchor S captured on the same
+	// CDC handle, hard-asserted S >= prior segment's EndPosition.
+	StartPosition ir.Position `json:"start_position"`
+
+	// EndPosition is the segment's last committed incremental's
+	// EndPosition (P_N). Equals StartPosition for a segment with no
+	// incrementals yet (a freshly-opened segment).
+	EndPosition ir.Position `json:"end_position"`
+
+	// CappedAt is the instant the rotation FSM's COMMIT closed this
+	// segment. nil/zero on the open (last) segment.
+	CappedAt *time.Time `json:"capped_at,omitempty"`
+
+	// CapReason records why the segment was capped:
+	// [rotationReasonAge] or [rotationReasonChainLength]. Empty on the
+	// open segment.
+	CapReason string `json:"cap_reason,omitempty"`
+
+	// Codec is the compression codec every chunk in this segment was
+	// written with (ADR-0046 §5). Recorded here, NEVER inferred from
+	// the chunk bytes on restore. Empty resolves to gzip (the pre-ADR
+	// default) so a legacy-shaped one-segment lineage restores
+	// unchanged.
+	Codec Codec `json:"codec,omitempty"`
 }
 
-// loadChainCatalog reads chain.json from store. Returns (catalog,
+// codecOrDefault returns the segment's recorded codec, resolving an
+// empty value to the gzip default (pre-ADR-0046 behaviour).
+func (s *LineageSegment) codecOrDefault() Codec { return resolveCodec(s.Codec) }
+
+// open reports whether this is the open (last, uncapped) segment.
+func (s *LineageSegment) open() bool { return s.CappedAt == nil || s.CappedAt.IsZero() }
+
+// store returns the per-segment [ir.BackupStore] view: the lineage
+// store narrowed to the segment's Dir (a no-op wrap when Dir == "",
+// the common one-segment / root-segment shape).
+func (s *LineageSegment) store(root ir.BackupStore) ir.BackupStore {
+	return newPrefixedStore(root, s.Dir)
+}
+
+// loadLineageCatalog reads lineage.json from store. Returns (catalog,
 // true, nil) when present and parseable; (nil, false, nil) when
-// absent; (nil, false, err) for I/O / parse failures. The "absent"
-// case is the legacy-chain fall-through that callers handle by
-// walking the manifests/ directory.
-func loadChainCatalog(ctx context.Context, store ir.BackupStore) (*ChainCatalog, bool, error) {
-	exists, err := store.Exists(ctx, ChainCatalogFileName)
+// absent; (nil, false, err) for I/O / parse / version failures. The
+// "absent" case is the legacy one-segment fall-through callers handle
+// by synthesising a single root segment over the conventional layout.
+func loadLineageCatalog(ctx context.Context, store ir.BackupStore) (*LineageCatalog, bool, error) {
+	exists, err := store.Exists(ctx, LineageCatalogFileName)
 	if err != nil {
-		return nil, false, fmt.Errorf("inspect %q: %w", ChainCatalogFileName, err)
+		return nil, false, fmt.Errorf("inspect %q: %w", LineageCatalogFileName, err)
 	}
 	if !exists {
 		return nil, false, nil
 	}
-	rc, err := store.Get(ctx, ChainCatalogFileName)
+	rc, err := store.Get(ctx, LineageCatalogFileName)
 	if err != nil {
-		return nil, false, fmt.Errorf("get %q: %w", ChainCatalogFileName, err)
+		return nil, false, fmt.Errorf("get %q: %w", LineageCatalogFileName, err)
 	}
 	defer func() { _ = rc.Close() }()
 	body, err := io.ReadAll(rc)
 	if err != nil {
-		return nil, false, fmt.Errorf("read %q: %w", ChainCatalogFileName, err)
+		return nil, false, fmt.Errorf("read %q: %w", LineageCatalogFileName, err)
 	}
-	var cat ChainCatalog
+	var cat LineageCatalog
 	if err := json.Unmarshal(body, &cat); err != nil {
-		return nil, false, fmt.Errorf("decode %q: %w", ChainCatalogFileName, err)
+		return nil, false, fmt.Errorf("decode %q: %w", LineageCatalogFileName, err)
 	}
-	if cat.FormatVersion > chainCatalogFormatVersion {
+	if cat.FormatVersion > lineageCatalogFormatVersion {
 		return nil, false, fmt.Errorf("%s format version %d is newer than this build supports (%d); upgrade sluice",
-			ChainCatalogFileName, cat.FormatVersion, chainCatalogFormatVersion)
+			LineageCatalogFileName, cat.FormatVersion, lineageCatalogFormatVersion)
+	}
+	if len(cat.Segments) == 0 {
+		return nil, false, fmt.Errorf("%s contains zero segments; corrupt lineage (DR data — refusing to silently continue)",
+			LineageCatalogFileName)
 	}
 	return &cat, true, nil
 }
 
-// writeChainCatalog serialises cat as JSON (indented for human
-// readability, matching the manifest convention) and writes it to
-// store. Single-object Put — atomic at the storage layer from any
-// reader's perspective.
-func writeChainCatalog(ctx context.Context, store ir.BackupStore, cat *ChainCatalog) error {
+// writeLineageCatalog serialises cat as indented JSON and writes it to
+// store via a single-object Put. **This single Put is the rotation
+// FSM's atomic linearization point** (ADR-0046 §2 COMMIT): it is
+// always issued AFTER the next segment's full is durable, so there is
+// no window in which the lineage is non-authoritative. Atomic at the
+// storage layer from any reader's perspective (object stores: a Put is
+// all-or-nothing; local FS: write-tmp + rename inside LocalStore).
+func writeLineageCatalog(ctx context.Context, store ir.BackupStore, cat *LineageCatalog) error {
+	cat.FormatVersion = lineageCatalogFormatVersion
 	b, err := json.MarshalIndent(cat, "", "  ")
 	if err != nil {
-		return fmt.Errorf("marshal chain catalog: %w", err)
+		return fmt.Errorf("marshal lineage catalog: %w", err)
 	}
-	return store.Put(ctx, ChainCatalogFileName, bytes.NewReader(b))
+	return store.Put(ctx, LineageCatalogFileName, bytes.NewReader(b))
 }
 
-// updateChainCatalog appends or replaces the entry for manifest in
-// store's chain.json. If chain.json is absent (a legacy chain on
-// first v0.47.0 write), the function performs a one-time lazy rebuild
-// over the existing manifests/ directory + the full at the root
-// before appending the new entry — operator sees a new chain.json
-// appear with all historical entries the first time v0.47.0 writes
-// to the chain.
+// segmentRecord pairs a parsed manifest with the path it loaded from
+// AND the segment it belongs to. The chain-walk + restore code carries
+// the segment so it can resolve the per-segment store + codec without
+// re-deriving them. Embeds [manifestRecord] so existing helpers
+// (manifestBackupID etc.) work unchanged.
+type segmentRecord struct {
+	manifestRecord
+	segment *LineageSegment
+}
+
+// resolveLineage returns the lineage for store. When lineage.json is
+// present it's authoritative. When absent, a single synthetic root
+// segment (Dir == "", gzip codec) is constructed over the conventional
+// layout — the pre-ADR single-chain shape, a one-segment lineage by
+// strict generalization. A multi-segment backup with a missing /
+// unreadable lineage.json is unreconstructable from a bare walk; the
+// load error already surfaced loudly from [loadLineageCatalog].
+func resolveLineage(ctx context.Context, store ir.BackupStore) (*LineageCatalog, error) {
+	cat, ok, err := loadLineageCatalog(ctx, store)
+	if err != nil {
+		return nil, fmt.Errorf("lineage catalog: %w", err)
+	}
+	if ok {
+		return cat, nil
+	}
+	// Absent: synthesise the single-segment legacy lineage. The
+	// segment's manifest list is discovered by a directory walk (the
+	// pre-v0.47.0 fall-through, preserved for the one-segment shape).
+	root := &LineageSegment{
+		Dir:              "",
+		FullManifestPath: ManifestFileName,
+		Codec:            DefaultCodec,
+	}
+	exists, err := store.Exists(ctx, ManifestFileName)
+	if err != nil {
+		return nil, fmt.Errorf("inspect %q: %w", ManifestFileName, err)
+	}
+	if !exists {
+		return nil, errors.New("no manifests found in store (no lineage.json, no manifest.json) — take a `sluice backup full` first")
+	}
+	fullM, err := readManifestAt(ctx, store, ManifestFileName)
+	if err != nil {
+		return nil, fmt.Errorf("read %q: %w", ManifestFileName, err)
+	}
+	root.SegmentID = manifestBackupID(fullM)
+	root.StartPosition = fullM.EndPosition
+	root.EndPosition = fullM.EndPosition
+	incs, err := store.List(ctx, incrementalManifestPrefix)
+	if err != nil {
+		return nil, fmt.Errorf("list %q: %w", incrementalManifestPrefix, err)
+	}
+	sort.Strings(incs)
+	for _, p := range incs {
+		if isIncrementalManifestPath(p) {
+			root.Incrementals = append(root.Incrementals, p)
+		}
+	}
+	return &LineageCatalog{
+		FormatVersion: lineageCatalogFormatVersion,
+		SourceEngine:  fullM.SourceEngine,
+		SluiceVersion: fullM.SluiceVersion,
+		Segments:      []LineageSegment{*root},
+	}, nil
+}
+
+// listAllSegmentManifests returns every manifest across every segment
+// of the lineage in lineage order (segment 0 full, segment 0
+// incrementals, segment 1 full, ...), each tagged with its segment so
+// callers know which per-segment store + codec to use. Replaces the
+// pre-ADR [listAllManifests] catalog/walk dispatch — the lineage is
+// the single dispatch point now.
+func listAllSegmentManifests(ctx context.Context, store ir.BackupStore) ([]segmentRecord, error) {
+	cat, err := resolveLineage(ctx, store)
+	if err != nil {
+		return nil, err
+	}
+	var out []segmentRecord
+	for i := range cat.Segments {
+		seg := &cat.Segments[i]
+		if err := validateRecordedCodec(seg.Codec); err != nil {
+			return nil, err
+		}
+		ss := seg.store(store)
+		fm, err := readManifestAt(ctx, ss, seg.FullManifestPath)
+		if err != nil {
+			return nil, fmt.Errorf("segment %d (%s) full %q: %w", i, seg.SegmentID, seg.FullManifestPath, err)
+		}
+		out = append(out, segmentRecord{
+			manifestRecord: manifestRecord{path: seg.FullManifestPath, manifest: fm},
+			segment:        seg,
+		})
+		for _, ip := range seg.Incrementals {
+			im, err := readManifestAt(ctx, ss, ip)
+			if err != nil {
+				return nil, fmt.Errorf("segment %d (%s) incremental %q: %w", i, seg.SegmentID, ip, err)
+			}
+			out = append(out, segmentRecord{
+				manifestRecord: manifestRecord{path: ip, manifest: im},
+				segment:        seg,
+			})
+		}
+	}
+	return out, nil
+}
+
+// updateLineageForManifestBestEffort keeps lineage.json in sync after
+// a non-rotation manifest write (full backup completion, a normal
+// rollover's incremental). It appends/updates the manifest within the
+// OPEN segment and advances that segment's EndPosition. Rotation's
+// segment-append + cap is a SEPARATE atomic write (see the rotation
+// FSM); this helper never touches CappedAt / prior segments.
 //
-// updateChainCatalog is best-effort by design: callers should log
-// failures but NOT propagate them as fatal. The underlying manifest
-// files remain authoritative; a missing or stale chain.json triggers
-// the directory-walk fallback in [listAllManifests], so a temporary
-// catalog inconsistency doesn't break restore.
-func updateChainCatalog(
+// Best-effort by design (mirrors the pre-ADR chain.json posture for
+// the non-rotation path): the manifest file is the source of truth for
+// the one-segment shape, so a transient lineage.json hiccup is
+// WARN-logged and recovered on the next write. The codec is recorded
+// from the supplied value so the open segment's Codec is pinned on
+// first write and never changes mid-segment.
+func updateLineageForManifestBestEffort(
 	ctx context.Context,
 	store ir.BackupStore,
 	manifest *ir.Manifest,
 	manifestPath string,
-	fileCount int,
+	codec Codec,
+) {
+	if err := updateLineageForManifest(ctx, store, manifest, manifestPath, codec); err != nil {
+		slog.WarnContext(ctx, "lineage catalog update failed; lineage.json may be stale until next write",
+			slog.String("manifest_path", manifestPath),
+			slog.String("err", err.Error()),
+		)
+	}
+}
+
+func updateLineageForManifest(
+	ctx context.Context,
+	store ir.BackupStore,
+	manifest *ir.Manifest,
+	manifestPath string,
+	codec Codec,
 ) error {
 	if manifest == nil {
-		return errors.New("chain catalog: nil manifest")
+		return errors.New("lineage catalog: nil manifest")
 	}
-	if manifest.BackupID == "" {
-		// Pre-v0.17.0 manifests had no BackupID; v0.47.0+ writers
-		// always populate it. Skip the catalog update rather than
-		// indexing under an empty key.
-		return nil
-	}
-
-	cat, present, err := loadChainCatalog(ctx, store)
+	cat, ok, err := loadLineageCatalog(ctx, store)
 	if err != nil {
 		return err
 	}
-	if !present {
-		cat, err = rebuildChainCatalog(ctx, store)
-		if err != nil {
-			return fmt.Errorf("lazy rebuild: %w", err)
+	now := time.Now().UTC()
+	if !ok {
+		// First lineage.json write for this backup. Seed a single root
+		// segment over the conventional layout (Dir == "").
+		cat = &LineageCatalog{
+			FormatVersion: lineageCatalogFormatVersion,
+			SourceEngine:  manifest.SourceEngine,
+			SluiceVersion: manifest.SluiceVersion,
+			CreatedAt:     now,
+			Segments: []LineageSegment{{
+				SegmentID:        manifestBackupID(manifest),
+				Dir:              "",
+				FullManifestPath: ManifestFileName,
+				Codec:            resolveCodec(codec),
+			}},
 		}
 	}
-
-	entry := newCatalogEntry(manifest, manifestPath, fileCount)
-
-	// Dedup against any existing entry with the same BackupID OR the
-	// same ManifestPath, then append the new entry. Two cases:
-	//
-	//   - Same BackupID — happens on per-chunk-checkpoint writes
-	//     within a single backup-full run (orchestrator writes the
-	//     same manifest multiple times as chunks complete).
-	//   - Same ManifestPath, different BackupID — happens when a
-	//     backup full re-runs into the same store: the new run
-	//     computes a fresh BackupID (different CreatedAt) but
-	//     overwrites the conventional ManifestFileName. The prior
-	//     entry's manifest body is gone from disk; leaving the entry
-	//     in the catalog would surface two records pointing at the
-	//     same file to chain-walk consumers (load it twice → verify
-	//     it twice → over-count chunks; see [TestBackup_ResumePerChunkSkipsAlreadyUploadedChunks]
-	//     pre-v0.47.0 regression). The path is the structural slot;
-	//     the BackupID is the content identifier.
-	kept := make([]ChainCatalogEntry, 0, len(cat.Entries)+1)
-	for _, e := range cat.Entries {
-		if e.BackupID == entry.BackupID || e.ManifestPath == entry.ManifestPath {
-			continue
+	seg := &cat.Segments[len(cat.Segments)-1] // the open segment
+	switch canonicalKind(manifest.Kind) {
+	case ir.BackupKindFull:
+		seg.FullManifestPath = manifestPath
+		seg.SegmentID = manifestBackupID(manifest)
+		seg.StartPosition = manifest.EndPosition
+		seg.EndPosition = manifest.EndPosition
+		if seg.Codec == "" {
+			seg.Codec = resolveCodec(codec)
 		}
-		kept = append(kept, e)
-	}
-	kept = append(kept, entry)
-	cat.Entries = kept
-
-	// Seed catalog-wide fields on first write.
-	if cat.ChainRootBackupID == "" && len(cat.Entries) > 0 {
-		cat.ChainRootBackupID = cat.Entries[0].BackupID
+	case ir.BackupKindIncremental:
+		// Dedup on path (per-chunk checkpoint re-writes the same path).
+		found := false
+		for _, ip := range seg.Incrementals {
+			if ip == manifestPath {
+				found = true
+				break
+			}
+		}
+		if !found {
+			seg.Incrementals = append(seg.Incrementals, manifestPath)
+		}
+		seg.EndPosition = manifest.EndPosition
 	}
 	if cat.SourceEngine == "" {
 		cat.SourceEngine = manifest.SourceEngine
 	}
-	if cat.CreatedAt.IsZero() {
-		cat.CreatedAt = time.Now().UTC()
+	if cat.SluiceVersion == "" {
+		cat.SluiceVersion = manifest.SluiceVersion
 	}
-	cat.UpdatedAt = time.Now().UTC()
-	cat.FormatVersion = chainCatalogFormatVersion
-	cat.SluiceVersion = manifest.SluiceVersion
-
-	return writeChainCatalog(ctx, store, cat)
+	if cat.CreatedAt.IsZero() {
+		cat.CreatedAt = now
+	}
+	cat.UpdatedAt = now
+	return writeLineageCatalog(ctx, store, cat)
 }
 
-// newCatalogEntry projects a manifest into its catalog representation.
-// Field selection mirrors [ChainCatalogEntry]'s schema; consumers
-// reading the entry get enough metadata to answer chain-shape
-// questions without parsing the underlying manifest body.
-func newCatalogEntry(m *ir.Manifest, path string, fileCount int) ChainCatalogEntry {
-	return ChainCatalogEntry{
-		BackupID:       m.BackupID,
-		Kind:           canonicalKind(m.Kind),
-		ParentBackupID: m.ParentBackupID,
-		ManifestPath:   path,
-		EndPosition:    m.EndPosition,
-		CreatedAt:      m.CreatedAt.UTC(),
-		FileCount:      fileCount,
-		Tombstoned:     false,
+// openSegmentStore returns the open (last) segment's store view + the
+// codec recorded for it. For an absent lineage.json (the legacy
+// one-segment shape, or a freshly-written full not yet lineage-
+// catalogued) it returns the root store + the supplied write codec
+// default. Used by the incremental + stream orchestrators: every
+// non-rotation incremental lands in the OPEN segment, under its Dir,
+// with its codec — the rotation FSM is the only thing that appends a
+// new segment.
+//
+// writeCodec is the operator's --compression choice; it's used only
+// when the lineage doesn't yet pin a codec for the open segment (first
+// incremental into a never-catalogued backup). When the lineage exists
+// the recorded codec wins (codec is recorded, never re-chosen
+// mid-segment — a segment is single-codec by construction).
+func openSegmentStore(ctx context.Context, store ir.BackupStore, writeCodec Codec) (ir.BackupStore, Codec, error) {
+	cat, ok, err := loadLineageCatalog(ctx, store)
+	if err != nil {
+		return nil, "", err
 	}
+	if !ok {
+		return store, resolveCodec(writeCodec), nil
+	}
+	seg := &cat.Segments[len(cat.Segments)-1]
+	if err := validateRecordedCodec(seg.Codec); err != nil {
+		return nil, "", err
+	}
+	c := seg.Codec
+	if c == "" {
+		c = resolveCodec(writeCodec)
+	}
+	return seg.store(store), resolveCodec(c), nil
 }
 
 // canonicalKind normalises empty Kind to BackupKindFull. Mirror of
-// the ir.canonicalKind helper used by [ir.ComputeBackupID]; duplicated
-// here so the catalog code doesn't pull in unexported ir helpers.
+// the ir.canonicalKind helper; duplicated here so the catalog code
+// doesn't pull in unexported ir helpers.
 func canonicalKind(kind string) string {
 	if kind == "" {
 		return ir.BackupKindFull
@@ -273,155 +455,51 @@ func canonicalKind(kind string) string {
 	return kind
 }
 
-// rebuildChainCatalog walks the chain on disk (the full's manifest at
-// the legacy path plus every incremental manifest under manifests/)
-// and constructs a fresh [ChainCatalog] from scratch. Used by:
-//
-//  1. [updateChainCatalog]'s lazy-rebuild path on the first v0.47.0
-//     write into a legacy chain.
-//  2. The `sluice backup verify --rebuild-catalog` operator command
-//     for explicit catalog regeneration.
-//
-// Cost is one List + one Get per manifest — same as today's
-// [listAllManifests] walk — incurred once on the first write to a
-// legacy chain. Subsequent updates pay only one Get + one Put.
-func rebuildChainCatalog(ctx context.Context, store ir.BackupStore) (*ChainCatalog, error) {
-	records, err := listAllManifestsViaWalk(ctx, store)
+// RebuildLineageCatalogAt walks the conventional one-segment layout
+// (manifest.json + manifests/incr-*.json) and writes a fresh
+// single-segment lineage.json. Operator-facing entry point for
+// `sluice backup verify --rebuild-catalog`. Only the one-segment
+// (Dir == "") shape is rebuildable from a bare walk — a multi-segment
+// rotated lineage's sub-dir structure is not recoverable without the
+// catalog, by design (the catalog IS the structural record for a
+// rotated backup). Returns the segment + manifest count.
+func RebuildLineageCatalogAt(ctx context.Context, store ir.BackupStore) (segments, manifests int, err error) {
+	recs, err := listAllManifestsViaWalk(ctx, store)
 	if err != nil {
-		return nil, err
+		return 0, 0, err
+	}
+	if len(recs) == 0 {
+		return 0, 0, errors.New("rebuild: no manifests found at the conventional layout")
 	}
 	now := time.Now().UTC()
-	cat := &ChainCatalog{
-		FormatVersion: chainCatalogFormatVersion,
+	root := LineageSegment{
+		Dir:              "",
+		FullManifestPath: ManifestFileName,
+		Codec:            DefaultCodec,
+	}
+	for _, r := range recs {
+		switch canonicalKind(r.manifest.Kind) {
+		case ir.BackupKindFull:
+			root.SegmentID = manifestBackupID(r.manifest)
+			root.StartPosition = r.manifest.EndPosition
+			if root.EndPosition.Engine == "" && root.EndPosition.Token == "" {
+				root.EndPosition = r.manifest.EndPosition
+			}
+		case ir.BackupKindIncremental:
+			root.Incrementals = append(root.Incrementals, r.path)
+			root.EndPosition = r.manifest.EndPosition
+		}
+	}
+	cat := &LineageCatalog{
+		FormatVersion: lineageCatalogFormatVersion,
+		SourceEngine:  recs[0].manifest.SourceEngine,
+		SluiceVersion: recs[0].manifest.SluiceVersion,
 		CreatedAt:     now,
 		UpdatedAt:     now,
-		Entries:       make([]ChainCatalogEntry, 0, len(records)),
+		Segments:      []LineageSegment{root},
 	}
-	for _, rec := range records {
-		fc := manifestFileCount(rec.manifest)
-		// Pre-v0.17.0 manifests had no BackupID — synthesize via
-		// the same helper the chain walker uses so the entry has a
-		// stable key.
-		id := rec.manifest.BackupID
-		if id == "" {
-			id = ir.ComputeBackupID(rec.manifest)
-		}
-		entry := newCatalogEntry(rec.manifest, rec.path, fc)
-		entry.BackupID = id
-		cat.Entries = append(cat.Entries, entry)
-		if cat.SourceEngine == "" {
-			cat.SourceEngine = rec.manifest.SourceEngine
-		}
-		if cat.SluiceVersion == "" {
-			cat.SluiceVersion = rec.manifest.SluiceVersion
-		}
+	if err := writeLineageCatalog(ctx, store, cat); err != nil {
+		return 0, 0, err
 	}
-	// Chain order: stable sort by (kind, manifest path). Full first
-	// (kind sorts "full" < "incremental" lexically), then
-	// incrementals by the lex-sortable path (which encodes
-	// UnixMilli). Same ordering [listAllManifestsViaWalk] produces.
-	sort.SliceStable(cat.Entries, func(i, j int) bool {
-		ki, kj := cat.Entries[i].Kind, cat.Entries[j].Kind
-		if ki != kj {
-			return ki == ir.BackupKindFull
-		}
-		return cat.Entries[i].ManifestPath < cat.Entries[j].ManifestPath
-	})
-	if len(cat.Entries) > 0 {
-		cat.ChainRootBackupID = cat.Entries[0].BackupID
-	}
-	return cat, nil
-}
-
-// filterActiveEntries returns entries from cat with Tombstoned == false.
-// Used by [readManifestsFromCatalog] so a v0.48.0+ chain.json with
-// tombstones doesn't surface compacted-out manifests to a v0.47.0
-// reader.
-func filterActiveEntries(entries []ChainCatalogEntry) []ChainCatalogEntry {
-	out := entries[:0:len(entries)]
-	for _, e := range entries {
-		if !e.Tombstoned {
-			out = append(out, e)
-		}
-	}
-	return out
-}
-
-// readManifestsFromCatalog opens every active (non-tombstoned)
-// manifest referenced by cat and returns the [manifestRecord] slice
-// in chain order — the same shape today's [listAllManifestsViaWalk]
-// produces, so [listAllManifests] can dispatch between the two
-// transparently.
-//
-// Per-manifest Get errors propagate as a fatal: a catalog that
-// references a missing manifest is a chain-integrity problem the
-// operator needs to know about (manual deletion, partial restore,
-// corrupted prune).
-func readManifestsFromCatalog(
-	ctx context.Context,
-	store ir.BackupStore,
-	cat *ChainCatalog,
-) ([]manifestRecord, error) {
-	active := filterActiveEntries(cat.Entries)
-	out := make([]manifestRecord, 0, len(active))
-	for _, e := range active {
-		m, err := readManifestAt(ctx, store, e.ManifestPath)
-		if err != nil {
-			return nil, fmt.Errorf("chain catalog references %q: %w", e.ManifestPath, err)
-		}
-		out = append(out, manifestRecord{path: e.ManifestPath, manifest: m})
-	}
-	return out, nil
-}
-
-// manifestFileCount returns the total number of chunk files referenced
-// by a manifest — per-table chunks (fulls) plus change chunks
-// (incrementals). Exposed so call sites computing the value for
-// [updateChainCatalogBestEffort] don't have to duplicate the sum.
-func manifestFileCount(m *ir.Manifest) int {
-	if m == nil {
-		return 0
-	}
-	fc := 0
-	for _, t := range m.Tables {
-		fc += len(t.Chunks)
-	}
-	fc += len(m.ChangeChunks)
-	return fc
-}
-
-// RebuildChainCatalogAt walks the chain on store, builds a fresh
-// [ChainCatalog], and writes it as chain.json. Returns the number of
-// entries written. Operator-facing entry point for the `sluice backup
-// verify --rebuild-catalog` flag.
-func RebuildChainCatalogAt(ctx context.Context, store ir.BackupStore) (int, error) {
-	cat, err := rebuildChainCatalog(ctx, store)
-	if err != nil {
-		return 0, err
-	}
-	if err := writeChainCatalog(ctx, store, cat); err != nil {
-		return 0, err
-	}
-	return len(cat.Entries), nil
-}
-
-// updateChainCatalogBestEffort wraps [updateChainCatalog] and demotes
-// errors to a WARN log line. Callers at every writeManifest site use
-// this so a catalog hiccup doesn't fail the operator's backup run.
-// The next read either uses the still-valid earlier catalog state
-// (acceptable — the new manifest is on disk; readers can fall back
-// to the walk) or triggers a lazy rebuild on the next write.
-func updateChainCatalogBestEffort(
-	ctx context.Context,
-	store ir.BackupStore,
-	manifest *ir.Manifest,
-	manifestPath string,
-	fileCount int,
-) {
-	if err := updateChainCatalog(ctx, store, manifest, manifestPath, fileCount); err != nil {
-		slog.WarnContext(ctx, "chain catalog update failed; chain.json may be stale until next write",
-			slog.String("manifest_path", manifestPath),
-			slog.String("err", err.Error()),
-		)
-	}
+	return 1, len(recs), nil
 }

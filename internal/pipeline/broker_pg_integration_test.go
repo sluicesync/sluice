@@ -717,7 +717,7 @@ func waitForIncrementals(t *testing.T, store *LocalStore, minCount int, timeout 
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		records, _ := listAllManifests(context.Background(), store)
+		records, _ := listAllManifestsViaWalk(context.Background(), store)
 		var n int
 		for _, r := range records {
 			if r.manifest.Kind == ir.BackupKindIncremental {

@@ -166,6 +166,23 @@ type IncrementalBackup struct {
 	// can't be created.
 	Encryption *BackupEncryption
 
+	// Codec is the operator's --compression choice. Consulted only
+	// when the open segment's codec isn't already pinned in
+	// lineage.json (a segment is single-codec by construction; the
+	// recorded codec wins once set). Empty resolves to gzip (pre-ADR
+	// default).
+	Codec Codec
+
+	// segCodec is the codec resolved for the open segment at Run
+	// start; threaded into the change-chunk writer. Set by Run.
+	segCodec Codec
+
+	// segStore is the open-segment store view (b.Store narrowed to
+	// the open segment's Dir; a no-op wrap for the common one-segment
+	// shape). Manifest + chunk writes go here; the lineage update goes
+	// to the root b.Store. Set by Run.
+	segStore ir.BackupStore
+
 	// Now, when set, overrides the wall-clock-time source for
 	// [ir.Manifest.CreatedAt]. Used by tests to pin timestamps; in
 	// production callers leave it nil and the default uses time.Now.
@@ -188,6 +205,17 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 	if err := b.validate(); err != nil {
 		return err
 	}
+
+	// 0. Resolve the open segment: every incremental lands in the
+	//    lineage's open segment, under its Dir, with its recorded
+	//    codec (ADR-0046). For a never-rotated backup that's the root
+	//    (Dir == "") — byte-identical to the pre-ADR single chain.
+	segStore, segCodec, err := openSegmentStore(ctx, b.Store, b.Codec)
+	if err != nil {
+		return fmt.Errorf("incremental: resolve open segment: %w", err)
+	}
+	b.segStore = segStore
+	b.segCodec = segCodec
 
 	// 1. Resolve the parent manifest. The parent's EndPosition (or, on
 	//    a parent-is-full first incremental, the parent's recorded
@@ -331,11 +359,13 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 	manifest.PartialState = ir.BackupStateComplete
 
 	manifestPath := buildIncrementalManifestPath(manifest)
-	if err := writeManifestAt(ctx, b.Store, manifestPath, manifest); err != nil {
+	if err := writeManifestAt(ctx, b.segStore, manifestPath, manifest); err != nil {
 		return fmt.Errorf("incremental: write manifest: %w", err)
 	}
-	// GitHub #20 (v0.47.0): keep the chain.json catalog in sync.
-	updateChainCatalogBestEffort(ctx, b.Store, manifest, manifestPath, manifestFileCount(manifest))
+	// ADR-0046: append this incremental to the open segment in
+	// lineage.json (best-effort for the non-rotation path; the
+	// manifest file is authoritative for the one-segment shape).
+	updateLineageForManifestBestEffort(ctx, b.Store, manifest, manifestPath, b.segCodec)
 
 	slog.InfoContext(ctx, "incremental backup complete",
 		slog.String("backup_id", manifest.BackupID),
@@ -376,7 +406,10 @@ func (b *IncrementalBackup) validate() error {
 // Returns the parent manifest, the relative path it was loaded from,
 // and an error.
 func (b *IncrementalBackup) resolveParent(ctx context.Context) (*ir.Manifest, string, error) {
-	manifests, err := listAllManifests(ctx, b.Store)
+	// An incremental chains off a manifest in the OPEN segment. Walk
+	// the open segment's manifests (b.segStore is already narrowed to
+	// its Dir).
+	manifests, err := listAllManifestsViaWalk(ctx, b.segStore)
 	if err != nil {
 		return nil, "", err
 	}
@@ -488,7 +521,7 @@ func (b *IncrementalBackup) captureWindow(
 		}
 		path := changeChunkPath(runNamespace, chunkIdx)
 		hash := writer.Hash()
-		if err := b.Store.Put(ctx, path, buf); err != nil {
+		if err := b.segStore.Put(ctx, path, buf); err != nil {
 			return fmt.Errorf("store put %q: %w", path, err)
 		}
 		ci := &ir.ChunkInfo{
@@ -519,7 +552,7 @@ func (b *IncrementalBackup) captureWindow(
 			return fmt.Errorf("resolve chunk cek: %w", err)
 		}
 		curWrappedCEK = wrapped
-		w, err := newChangeChunkWriter(buf, cek)
+		w, err := newChangeChunkWriter(buf, cek, b.segCodec)
 		if err != nil {
 			return fmt.Errorf("open chunk: %w", err)
 		}
@@ -694,37 +727,14 @@ type manifestRecord struct {
 	manifest *ir.Manifest
 }
 
-// listAllManifests returns every manifest in store (the full's
-// [ManifestFileName] and every `manifests/incr-…json`), with parent
-// resolution / chain ordering left to the caller.
-//
-// GitHub #20 (v0.47.0): when chain.json is present at the store root,
-// the catalog's ordered entries provide the chain shape in a single
-// Get — collapsing the per-manifest [store.List] + [readManifestAt]
-// walk. Catalog-absent (legacy chains, or stores that haven't been
-// written by v0.47.0+ yet) falls back to the directory walk via
-// [listAllManifestsViaWalk]. Catalog-present + per-entry manifest
-// reads surface chain-integrity problems (a catalog entry pointing
-// at a manifest that's no longer on disk) as a fatal error rather
-// than silently degrading — matches the loud-failure tenet.
-func listAllManifests(ctx context.Context, store ir.BackupStore) ([]manifestRecord, error) {
-	cat, ok, err := loadChainCatalog(ctx, store)
-	if err != nil {
-		// Catalog is present but corrupted / version-newer. Surface
-		// the error rather than silently degrading to a walk — the
-		// operator needs to know.
-		return nil, fmt.Errorf("chain catalog: %w", err)
-	}
-	if ok {
-		return readManifestsFromCatalog(ctx, store, cat)
-	}
-	return listAllManifestsViaWalk(ctx, store)
-}
-
-// listAllManifestsViaWalk is the legacy [store.List] + per-manifest
-// [readManifestAt] implementation. Preserved as the fall-through for
-// chains without chain.json (pre-v0.47.0 stores) and as the rebuild
-// path for [rebuildChainCatalog].
+// listAllManifestsViaWalk is the [store.List] + per-manifest
+// [readManifestAt] implementation over the conventional one-segment
+// layout (manifest.json + manifests/incr-*.json). ADR-0046: the
+// lineage catalog ([listAllSegmentManifests]) is the cross-segment
+// dispatch point now; this walk is used for a SINGLE segment's store
+// (the open-segment parent resolve in incremental/stream, and the
+// one-segment legacy / rebuild paths). It does NOT cross segment
+// sub-dirs by design.
 func listAllManifestsViaWalk(ctx context.Context, store ir.BackupStore) ([]manifestRecord, error) {
 	var out []manifestRecord
 
@@ -836,7 +846,7 @@ func joinComma(parts []string) string {
 // failed`. Tests that pre-build envelopes with the chain's known salt
 // don't supply RebuildForChain and pass through the cold-start path.
 func (b *IncrementalBackup) alignEncryption(ctx context.Context, parent *ir.Manifest) ([]byte, error) {
-	parentEnc := chainRootEncryption(ctx, b.Store, parent)
+	parentEnc := chainRootEncryption(ctx, b.segStore, parent)
 	switch {
 	case parentEnc == nil && b.Encryption == nil:
 		return nil, nil

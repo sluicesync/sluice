@@ -59,7 +59,7 @@ func TestChangeChunk_RoundTrip(t *testing.T) {
 
 	// Encode.
 	buf := &bytes.Buffer{}
-	w, err := newChangeChunkWriter(buf, nil)
+	w, err := newChangeChunkWriter(buf, nil, CodecGzip)
 	if err != nil {
 		t.Fatalf("newChangeChunkWriter: %v", err)
 	}
@@ -80,7 +80,7 @@ func TestChangeChunk_RoundTrip(t *testing.T) {
 	}
 
 	// Decode and compare.
-	r, err := newChangeChunkReader(nopReadCloserFromBytes(buf.Bytes()), hash, nil)
+	r, err := newChangeChunkReader(nopReadCloserFromBytes(buf.Bytes()), hash, nil, CodecGzip)
 	if err != nil {
 		t.Fatalf("newChangeChunkReader: %v", err)
 	}
@@ -155,7 +155,7 @@ func TestChangeChunk_RoundTrip(t *testing.T) {
 // ErrChunkHashMismatch on Close.
 func TestChangeChunk_HashMismatch(t *testing.T) {
 	buf := &bytes.Buffer{}
-	w, _ := newChangeChunkWriter(buf, nil)
+	w, _ := newChangeChunkWriter(buf, nil, CodecGzip)
 	_ = w.WriteChange(ir.Insert{
 		Position: ir.Position{Engine: "postgres", Token: `{"slot":"x","lsn":"0/1"}`},
 		Schema:   "public",
@@ -165,7 +165,7 @@ func TestChangeChunk_HashMismatch(t *testing.T) {
 	_ = w.Close()
 
 	bogusHash := "00000000000000000000000000000000000000000000000000000000deadbeef"
-	r, err := newChangeChunkReader(nopReadCloserFromBytes(buf.Bytes()), bogusHash, nil)
+	r, err := newChangeChunkReader(nopReadCloserFromBytes(buf.Bytes()), bogusHash, nil, CodecGzip)
 	if err != nil {
 		t.Fatalf("newChangeChunkReader: %v", err)
 	}

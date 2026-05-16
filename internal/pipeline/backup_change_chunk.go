@@ -28,7 +28,6 @@ package pipeline
 import (
 	"bufio"
 	"bytes"
-	"compress/gzip"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -58,7 +57,7 @@ const changeChunkKind = "changes"
 type changeChunkWriter struct {
 	out         io.Writer
 	hasher      hash.Hash
-	gzWriter    *gzip.Writer
+	gzWriter    codecWriteCloser
 	bufW        *bufio.Writer
 	changeCount int64
 	closed      bool
@@ -76,7 +75,7 @@ type changeChunkWriter struct {
 // and AES-256-GCM-encrypted at Close time before being written to out.
 // The hasher covers post-encryption bytes so `backup verify`'s
 // sha256-only check matches what's on disk.
-func newChangeChunkWriter(out io.Writer, cek []byte) (*changeChunkWriter, error) {
+func newChangeChunkWriter(out io.Writer, cek []byte, codec Codec) (*changeChunkWriter, error) {
 	if cek != nil && len(cek) != crypto.CEKLen {
 		return nil, fmt.Errorf("change chunk writer: cek length %d != %d", len(cek), crypto.CEKLen)
 	}
@@ -91,7 +90,10 @@ func newChangeChunkWriter(out io.Writer, cek []byte) (*changeChunkWriter, error)
 		gzBuf = &bytes.Buffer{}
 		gzDst = gzBuf
 	}
-	gz := gzip.NewWriter(gzDst)
+	gz, err := newCodecWriter(gzDst, codec)
+	if err != nil {
+		return nil, fmt.Errorf("change chunk writer codec: %w", err)
+	}
 	bw := bufio.NewWriter(gz)
 
 	hdr := changeChunkHeader{Version: chunkHeaderVersion, ChunkKind: changeChunkKind}
@@ -183,7 +185,7 @@ func (w *changeChunkWriter) ChangeCount() int64 { return w.changeCount }
 type changeChunkReader struct {
 	src      io.ReadCloser
 	hasher   hash.Hash
-	gzReader *gzip.Reader
+	gzReader codecReadCloser
 	scanner  *bufio.Scanner
 	expected string
 	header   changeChunkHeader
@@ -192,7 +194,10 @@ type changeChunkReader struct {
 	consumedSrc bool
 }
 
-func newChangeChunkReader(src io.ReadCloser, expectedSHA256 string, cek []byte) (*changeChunkReader, error) {
+// codec is the codec RECORDED for this chunk's segment in
+// lineage.json — never inferred from the bytes (DR data; an inferred
+// codec is a latent corruption path).
+func newChangeChunkReader(src io.ReadCloser, expectedSHA256 string, cek []byte, codec Codec) (*changeChunkReader, error) {
 	if cek != nil && len(cek) != crypto.CEKLen {
 		_ = src.Close()
 		return nil, fmt.Errorf("change chunk reader: cek length %d != %d", len(cek), crypto.CEKLen)
@@ -224,10 +229,10 @@ func newChangeChunkReader(src io.ReadCloser, expectedSHA256 string, cek []byte) 
 		encrypted = true
 		consumedSrc = true
 	}
-	gz, err := gzip.NewReader(gzSrc)
+	gz, err := newCodecReader(gzSrc, codec)
 	if err != nil {
 		_ = src.Close()
-		return nil, fmt.Errorf("change chunk reader: gzip header: %w", err)
+		return nil, fmt.Errorf("change chunk reader: codec header: %w", err)
 	}
 	sc := bufio.NewScanner(gz)
 	sc.Buffer(make([]byte, 0, 64*1024), 64*1024*1024)

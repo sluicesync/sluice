@@ -67,6 +67,20 @@ type Restore struct {
 	// shape and dispatches.
 	SkipChainDispatch bool
 
+	// DataOnly, when true, restores ONLY the manifest's row data via an
+	// idempotent upsert bulk-copy and skips CreateTables / CreateIndexes
+	// / CreateConstraints / CreateViews. Set by [ChainRestore] for
+	// every segment full AFTER the first in a multi-segment lineage
+	// (ADR-0046 §3): segment 0 establishes the schema + indexes; a
+	// later rotation segment's full is a fresh snapshot of the SAME
+	// (possibly DDL-evolved) schema, so re-running the non-idempotent
+	// index/constraint phases would error ("relation already exists"),
+	// while the rows still need refreshing. Idempotent because the
+	// later segment's snapshot is at S >= the prior segment's end, so
+	// an upsert converges on the correct state. End-users leave this
+	// false (a single-manifest restore always builds the schema).
+	DataOnly bool
+
 	// TargetSchema is the per-source target-schema namespace override
 	// (ADR-0031), mirroring [Migrator.TargetSchema] /
 	// [Streamer.TargetSchema] / [Previewer.TargetSchema]. When set,
@@ -93,6 +107,44 @@ type Restore struct {
 	// exactly once per Run. Internal — set by Run on the first
 	// encrypted-chunk read.
 	chainCEK []byte
+
+	// segCodec is the codec recorded for the segment being restored on
+	// the single-manifest path (the root segment for a public restore;
+	// the specific segment ChainRestore is applying when it re-enters
+	// with SkipChainDispatch). Recorded, never sniffed (ADR-0046 §5).
+	// Set by Run / by ChainRestore.applyFull.
+	segCodec Codec
+}
+
+// lineageNeedsWalk reports whether the store's lineage requires the
+// lineage-walk restore path: more than one segment, or a single
+// segment carrying incrementals. A one-segment-no-incrementals lineage
+// (== a pre-ADR single full) returns false so the single-manifest path
+// handles it with byte-identical behaviour.
+func (r *Restore) lineageNeedsWalk(ctx context.Context) (bool, error) {
+	cat, err := resolveLineage(ctx, r.Store)
+	if err != nil {
+		return false, err
+	}
+	if len(cat.Segments) > 1 {
+		return true, nil
+	}
+	return len(cat.Segments[0].Incrementals) > 0, nil
+}
+
+// rootSegmentCodec returns the codec recorded for segment 0 (the root
+// segment). Absent lineage → gzip (pre-ADR default). The codec is
+// recorded, NEVER inferred from chunk bytes.
+func (r *Restore) rootSegmentCodec(ctx context.Context) (Codec, error) {
+	cat, err := resolveLineage(ctx, r.Store)
+	if err != nil {
+		return "", err
+	}
+	seg := &cat.Segments[0]
+	if err := validateRecordedCodec(seg.Codec); err != nil {
+		return "", err
+	}
+	return seg.codecOrDefault(), nil
 }
 
 // Run executes the restore. Returns nil on success; a wrapped error
@@ -107,20 +159,21 @@ func (r *Restore) Run(ctx context.Context) error {
 		return err
 	}
 
-	// 0. Detect chain shape — if any incremental manifests live
-	//    under the conventional manifests/ prefix, dispatch to the
-	//    chain restore orchestrator. Single-full backups (the v0.16.x
-	//    shape) skip the chain machinery.
+	// 0. Detect lineage shape (ADR-0046). A multi-segment lineage, OR
+	//    a one-segment lineage with incrementals, dispatches to the
+	//    lineage-walk restore. A one-segment-no-incrementals lineage
+	//    (== a pre-ADR single full) takes the single-manifest path
+	//    below — byte-identical behaviour to before.
 	//
 	// SkipChainDispatch is set internally by ChainRestore when it
-	// re-enters the single-manifest path to apply the full alone;
-	// without it the two would mutually recurse.
+	// re-enters the single-manifest path to apply ONE segment's full
+	// alone; without it the two would mutually recurse.
 	if !r.SkipChainDispatch {
-		hasIncrementals, err := r.storeHasIncrementals(ctx)
+		multi, err := r.lineageNeedsWalk(ctx)
 		if err != nil {
-			return wrapWithHint(PhaseConnect, fmt.Errorf("restore: detect chain: %w", err))
+			return wrapWithHint(PhaseConnect, fmt.Errorf("restore: detect lineage: %w", err))
 		}
-		if hasIncrementals {
+		if multi {
 			chain := &ChainRestore{
 				Target:         r.Target,
 				TargetDSN:      r.TargetDSN,
@@ -134,10 +187,19 @@ func (r *Restore) Run(ctx context.Context) error {
 		}
 	}
 
-	// 1. Read manifest.
+	// 1. Read manifest. Single-manifest path: this is the root
+	//    segment's full at the conventional ManifestFileName.
 	manifest, err := readManifest(ctx, r.Store)
 	if err != nil {
 		return wrapWithHint(PhaseConnect, fmt.Errorf("restore: %w", err))
+	}
+	// The root segment's recorded codec governs the full's chunks.
+	// Recorded, never sniffed (ADR-0046). Absent lineage → gzip.
+	if r.segCodec == "" {
+		r.segCodec, err = r.rootSegmentCodec(ctx)
+		if err != nil {
+			return wrapWithHint(PhaseConnect, fmt.Errorf("restore: %w", err))
+		}
 	}
 	slog.InfoContext(ctx, "restore: loaded manifest",
 		slog.Int("format_version", manifest.FormatVersion),
@@ -190,13 +252,20 @@ func (r *Restore) Run(ctx context.Context) error {
 	applyTargetSchema(rw, r.TargetSchema)
 	defer closeIf(rw)
 
-	// 5. Phase 1: tables.
-	if err := sw.CreateTablesWithoutConstraints(ctx, schema); err != nil {
-		return wrapWithHint(PhaseSchemaApply, fmt.Errorf("restore: create tables: %w", err))
+	// 5. Phase 1: tables. Skipped in DataOnly mode (a later
+	//    rotation-segment full — schema already established by
+	//    segment 0; CreateTables IF NOT EXISTS would be a no-op
+	//    anyway, but we skip the whole schema surface for clarity).
+	if !r.DataOnly {
+		if err := sw.CreateTablesWithoutConstraints(ctx, schema); err != nil {
+			return wrapWithHint(PhaseSchemaApply, fmt.Errorf("restore: create tables: %w", err))
+		}
+		slog.InfoContext(ctx, "restore: tables created", slog.Int("count", len(schema.Tables)))
 	}
-	slog.InfoContext(ctx, "restore: tables created", slog.Int("count", len(schema.Tables)))
 
-	// 6. Phase 2: bulk-copy from chunks.
+	// 6. Phase 2: bulk-copy from chunks. DataOnly uses an idempotent
+	//    upsert so re-applying a later segment's snapshot over the
+	//    prior segment's restored state converges (no PK-collision).
 	tablesByName := indexManifestTables(manifest.Tables)
 	for _, table := range schema.Tables {
 		key := manifestTableKey(table.Schema, table.Name)
@@ -209,6 +278,12 @@ func (r *Restore) Run(ctx context.Context) error {
 		if err := r.restoreTable(ctx, rw, table, entry); err != nil {
 			return wrapWithHint(PhaseBulkCopy, fmt.Errorf("restore: table %q: %w", table.Name, err))
 		}
+	}
+
+	if r.DataOnly {
+		slog.InfoContext(ctx, "restore: data-only segment refresh complete",
+			slog.Int("tables", len(schema.Tables)))
+		return nil
 	}
 
 	// 7. Phase 3: identity-sequence sync.
@@ -233,27 +308,6 @@ func (r *Restore) Run(ctx context.Context) error {
 
 	slog.InfoContext(ctx, "restore complete", slog.Int("tables", len(schema.Tables)))
 	return nil
-}
-
-// storeHasIncrementals reports whether r.Store contains any
-// incremental manifest files. Used to dispatch between the legacy
-// single-manifest restore and the Phase 3 chain restore.
-//
-// Filters by manifest shape (`manifests/incr-*.json`) so non-manifest
-// state files that share the directory (e.g. Phase 4's
-// `manifests/stream_state.json`) don't trigger the chain-restore
-// dispatch on a single-full backup.
-func (r *Restore) storeHasIncrementals(ctx context.Context) (bool, error) {
-	paths, err := r.Store.List(ctx, incrementalManifestPrefix)
-	if err != nil {
-		return false, err
-	}
-	for _, p := range paths {
-		if isIncrementalManifestPath(p) {
-			return true, nil
-		}
-	}
-	return false, nil
 }
 
 // validate sanity-checks required fields.
@@ -332,7 +386,22 @@ func (r *Restore) restoreTable(
 		errCh <- nil
 	}()
 
-	if err := rw.WriteRows(ctx, table, rowCh); err != nil {
+	// DataOnly (later rotation-segment full): use the idempotent
+	// upsert writer when the engine exposes it so re-applying the
+	// snapshot over the prior segment's restored rows converges
+	// (ON CONFLICT / ON DUPLICATE KEY UPDATE). Engines without the
+	// surface, or no-PK tables, fall back to plain WriteRows — the
+	// caller's lineage invariant (S_n >= prior end) means the rows are
+	// at-or-ahead, so a plain insert only collides on a PK the upsert
+	// would have updated to the same value; the idempotent path is the
+	// correct one and shipping engines (PG, MySQL) implement it.
+	writeFn := rw.WriteRows
+	if r.DataOnly {
+		if iw, ok := rw.(ir.IdempotentRowWriter); ok {
+			writeFn = iw.WriteRowsIdempotent
+		}
+	}
+	if err := writeFn(ctx, table, rowCh); err != nil {
 		// Bug 40b: cancel the producer's context so a goroutine
 		// blocked on `rowCh <- row` unblocks via the streamChunkRows
 		// `<-ctx.Done()` arm. Without this, `<-errCh` below would
@@ -374,7 +443,7 @@ func (r *Restore) streamChunkRows(
 		_ = src.Close()
 		return 0, fmt.Errorf("resolve chunk cek: %w", err)
 	}
-	cr, err := newChunkReader(src, chunk.SHA256, cek)
+	cr, err := newChunkReader(src, chunk.SHA256, cek, r.segCodec)
 	if err != nil {
 		return 0, fmt.Errorf("open chunk reader: %w", err)
 	}
@@ -538,7 +607,7 @@ func (r *Restore) chunkCEK(chunk *ir.ChunkInfo) ([]byte, error) {
 // manifest's chunks — both the row chunks of the full and the
 // change chunks of each incremental.
 func VerifyBackup(ctx context.Context, store ir.BackupStore) (total, failed int, err error) {
-	records, err := listAllManifests(ctx, store)
+	records, err := listAllSegmentManifests(ctx, store)
 	if err != nil {
 		return 0, 0, fmt.Errorf("verify: %w", err)
 	}
@@ -547,11 +616,15 @@ func VerifyBackup(ctx context.Context, store ir.BackupStore) (total, failed int,
 	}
 	for _, rec := range records {
 		manifest := rec.manifest
+		// Chunk files are addressed relative to the segment's store
+		// (Dir-prefixed). verify only rehashes bytes — codec is
+		// irrelevant for a byte-level SHA check.
+		segStore := rec.segment.store(store)
 		// Row chunks (full backups).
 		for _, table := range manifest.Tables {
 			for _, chunk := range table.Chunks {
 				total++
-				if err := verifyChunk(ctx, store, chunk); err != nil {
+				if err := verifyChunk(ctx, segStore, chunk); err != nil {
 					failed++
 					slog.ErrorContext(ctx, "verify: chunk failed",
 						slog.String("manifest", rec.path),
@@ -571,7 +644,7 @@ func VerifyBackup(ctx context.Context, store ir.BackupStore) (total, failed int,
 		// Change chunks (incremental backups).
 		for _, chunk := range manifest.ChangeChunks {
 			total++
-			if err := verifyChunk(ctx, store, chunk); err != nil {
+			if err := verifyChunk(ctx, segStore, chunk); err != nil {
 				failed++
 				slog.ErrorContext(ctx, "verify: change chunk failed",
 					slog.String("manifest", rec.path),

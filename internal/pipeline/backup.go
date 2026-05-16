@@ -223,6 +223,14 @@ type Backup struct {
 	// stream run`.
 	Redactor *redact.Registry
 
+	// Codec is the per-segment compression codec (ADR-0046 §5) every
+	// chunk this run writes is compressed with. Recorded on the
+	// lineage's segment 0; restore reads it from there, never sniffs
+	// it. Empty resolves to gzip (DefaultCodec) — unchanged pre-ADR
+	// behaviour, so a one-segment never-rotated lineage is
+	// byte-identical to a pre-ADR single chain.
+	Codec Codec
+
 	// Now, when set, overrides the wall-clock-time source for
 	// [Manifest.CreatedAt]. Used by tests to pin timestamps; in
 	// production callers leave it nil and the default uses time.Now.
@@ -483,10 +491,12 @@ func (b *Backup) Run(ctx context.Context) error {
 	if err := writeManifest(ctx, b.Store, manifest); err != nil {
 		return fmt.Errorf("backup: write final manifest: %w", err)
 	}
-	// GitHub #20 (v0.47.0): keep the chain.json catalog in sync.
-	// Best-effort — manifests are the source of truth, catalog is
-	// an O(1) accelerator (see internal/pipeline/chain_catalog.go).
-	updateChainCatalogBestEffort(ctx, b.Store, manifest, ManifestFileName, manifestFileCount(manifest))
+	// ADR-0046: seed / update lineage.json. A full backup is segment 0
+	// of a one-segment lineage at the conventional root (Dir == "").
+	// Best-effort — the manifest file is authoritative for the
+	// one-segment shape; lineage.json is the O(1) segment-shape +
+	// recorded-codec accelerator.
+	updateLineageForManifestBestEffort(ctx, b.Store, manifest, ManifestFileName, resolveCodec(b.Codec))
 
 	totalRows := int64(0)
 	totalChunks := 0
@@ -895,7 +905,7 @@ func (b *Backup) backupTable(
 					return nil, fmt.Errorf("resolve chunk cek: %w", err)
 				}
 				curWrappedCEK = wrapped
-				w, err := newChunkWriter(buf, colNames, cek)
+				w, err := newChunkWriter(buf, colNames, cek, b.Codec)
 				if err != nil {
 					return nil, fmt.Errorf("open chunk: %w", err)
 				}

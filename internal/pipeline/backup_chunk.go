@@ -42,7 +42,6 @@ package pipeline
 import (
 	"bufio"
 	"bytes"
-	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -93,7 +92,7 @@ type chunkHeader struct {
 type chunkWriter struct {
 	out      io.Writer
 	hasher   hash.Hash
-	gzWriter *gzip.Writer
+	gzWriter codecWriteCloser
 	bufW     *bufio.Writer
 	rowCount int64
 	closed   bool
@@ -116,7 +115,7 @@ type chunkWriter struct {
 // When cek is non-nil, encryption is applied at Close time (see
 // [chunkWriter] for the two modes). cek must be exactly
 // [crypto.CEKLen] bytes.
-func newChunkWriter(out io.Writer, columns []string, cek []byte) (*chunkWriter, error) {
+func newChunkWriter(out io.Writer, columns []string, cek []byte, codec Codec) (*chunkWriter, error) {
 	if cek != nil && len(cek) != crypto.CEKLen {
 		return nil, fmt.Errorf("chunk writer: cek length %d != %d", len(cek), crypto.CEKLen)
 	}
@@ -126,15 +125,18 @@ func newChunkWriter(out io.Writer, columns []string, cek []byte) (*chunkWriter, 
 		gzBuf *bytes.Buffer
 	)
 	if cek == nil {
-		// Plaintext: gzip writes directly to out + hasher via a tee.
+		// Plaintext: codec writes directly to out + hasher via a tee.
 		gzDst = io.MultiWriter(out, hasher)
 	} else {
-		// Encrypted: gzip writes into an in-memory buffer; Close()
+		// Encrypted: codec writes into an in-memory buffer; Close()
 		// encrypts the buffered bytes and pushes them to out + hasher.
 		gzBuf = &bytes.Buffer{}
 		gzDst = gzBuf
 	}
-	gz := gzip.NewWriter(gzDst)
+	gz, err := newCodecWriter(gzDst, codec)
+	if err != nil {
+		return nil, fmt.Errorf("chunk writer codec: %w", err)
+	}
 	bw := bufio.NewWriter(gz)
 
 	// Header line.
@@ -243,7 +245,7 @@ func (w *chunkWriter) RowCount() int64 { return w.rowCount }
 type chunkReader struct {
 	src      io.ReadCloser
 	hasher   hash.Hash
-	gzReader *gzip.Reader
+	gzReader codecReadCloser
 	scanner  *bufio.Scanner
 	expected string
 	header   chunkHeader
@@ -273,10 +275,15 @@ var ErrChunkHashMismatch = errors.New("backup: chunk SHA-256 mismatch")
 // When cek is non-nil, the reader treats src as encrypted bytes: it
 // reads the entire ciphertext into memory, hashes ciphertext for
 // verification, decrypts via [crypto.DecryptChunk], and feeds the
-// resulting plaintext gzip stream to the rest of the machinery.
+// resulting plaintext codec stream to the rest of the machinery.
 // chunks are bounded (typically a few MB compressed); buffering whole
 // chunk in RAM is acceptable.
-func newChunkReader(src io.ReadCloser, expectedSHA256 string, cek []byte) (*chunkReader, error) {
+//
+// codec is the codec RECORDED for this chunk's segment in
+// lineage.json — never inferred from the bytes. The caller threads it
+// through from segment metadata; an unknown recorded codec is rejected
+// loudly by [validateRecordedCodec] before this is reached.
+func newChunkReader(src io.ReadCloser, expectedSHA256 string, cek []byte, codec Codec) (*chunkReader, error) {
 	if cek != nil && len(cek) != crypto.CEKLen {
 		_ = src.Close()
 		return nil, fmt.Errorf("chunk reader: cek length %d != %d", len(cek), crypto.CEKLen)
@@ -311,10 +318,10 @@ func newChunkReader(src io.ReadCloser, expectedSHA256 string, cek []byte) (*chun
 		encrypted = true
 		consumedSrc = true
 	}
-	gz, err := gzip.NewReader(gzSrc)
+	gz, err := newCodecReader(gzSrc, codec)
 	if err != nil {
 		_ = src.Close()
-		return nil, fmt.Errorf("chunk reader: gzip header: %w", err)
+		return nil, fmt.Errorf("chunk reader: codec header: %w", err)
 	}
 	sc := bufio.NewScanner(gz)
 	// Allow large rows: 64 MiB max line buffer covers the wide-row

@@ -129,7 +129,7 @@ func TestApplySchemaDeltas_CrossEngine_AddColumnUUIDtoChar36(t *testing.T) {
 	cr := &ChainRestore{
 		Target: tgt, TargetDSN: "tgt", Store: &LocalStore{},
 	}
-	link := &manifestRecord{
+	link := &segmentRecord{segment: &LineageSegment{Codec: CodecGzip}, manifestRecord: manifestRecord{
 		path: "manifests/incr-0001.json",
 		manifest: &ir.Manifest{
 			BackupID:     "incr-0001",
@@ -153,7 +153,7 @@ func TestApplySchemaDeltas_CrossEngine_AddColumnUUIDtoChar36(t *testing.T) {
 				},
 			}},
 		},
-	}
+	}}
 	if err := cr.applySchemaDeltas(context.Background(), link); err != nil {
 		t.Fatalf("applySchemaDeltas: %v", err)
 	}
@@ -177,7 +177,7 @@ func TestApplySchemaDeltas_CrossEngine_AddColumnUUIDtoChar36(t *testing.T) {
 func TestApplySchemaDeltas_SameEngine_NoRetarget_TINYINTpassthrough(t *testing.T) {
 	tgt := newSchemaDeltaRecorderEngine("mysql")
 	cr := &ChainRestore{Target: tgt, TargetDSN: "tgt", Store: &LocalStore{}}
-	link := &manifestRecord{
+	link := &segmentRecord{segment: &LineageSegment{Codec: CodecGzip}, manifestRecord: manifestRecord{
 		path: "manifests/incr-0001.json",
 		manifest: &ir.Manifest{
 			BackupID:     "incr-0001",
@@ -201,7 +201,7 @@ func TestApplySchemaDeltas_SameEngine_NoRetarget_TINYINTpassthrough(t *testing.T
 				},
 			}},
 		},
-	}
+	}}
 	if err := cr.applySchemaDeltas(context.Background(), link); err != nil {
 		t.Fatalf("applySchemaDeltas: %v", err)
 	}
@@ -227,7 +227,7 @@ func TestApplySchemaDeltas_SameEngine_NoRetarget_TINYINTpassthrough(t *testing.T
 func TestApplySchemaDeltas_CrossEngine_AddTableUUID_RetargetsCol(t *testing.T) {
 	tgt := newSchemaDeltaRecorderEngine("mysql")
 	cr := &ChainRestore{Target: tgt, TargetDSN: "tgt", Store: &LocalStore{}}
-	link := &manifestRecord{
+	link := &segmentRecord{segment: &LineageSegment{Codec: CodecGzip}, manifestRecord: manifestRecord{
 		path: "manifests/incr-0001.json",
 		manifest: &ir.Manifest{
 			BackupID:     "incr-0001",
@@ -245,7 +245,7 @@ func TestApplySchemaDeltas_CrossEngine_AddTableUUID_RetargetsCol(t *testing.T) {
 				},
 			}},
 		},
-	}
+	}}
 	if err := cr.applySchemaDeltas(context.Background(), link); err != nil {
 		t.Fatalf("applySchemaDeltas: %v", err)
 	}
@@ -272,7 +272,7 @@ func TestApplySchemaDeltas_AlterAddColumnError_Propagates(t *testing.T) {
 		err:                       want,
 	}
 	cr := &ChainRestore{Target: tgt, TargetDSN: "tgt", Store: &LocalStore{}}
-	link := &manifestRecord{
+	link := &segmentRecord{segment: &LineageSegment{Codec: CodecGzip}, manifestRecord: manifestRecord{
 		path: "manifests/incr-0001.json",
 		manifest: &ir.Manifest{
 			BackupID:     "incr-0001",
@@ -288,7 +288,7 @@ func TestApplySchemaDeltas_AlterAddColumnError_Propagates(t *testing.T) {
 				}},
 			}},
 		},
-	}
+	}}
 	err := cr.applySchemaDeltas(context.Background(), link)
 	if err == nil {
 		t.Fatal("err = nil; want propagated AlterAddColumn err")

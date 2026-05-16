@@ -287,6 +287,34 @@ func (Engine) CompareLSN(a, b string) (int, error) {
 	return 0, nil
 }
 
+// PrecedesOrEqual implements [ir.PositionMonotonicChecker] for the
+// inline-rotation FSM's S>=P_N hard-fail assertion (ADR-0046 §2). It
+// decodes both positions' LSNs and reports a.lsn <= b.lsn in WAL
+// order. A malformed / cross-engine position is a non-nil error (the
+// FSM treats that as "cannot prove monotonic" and hard-aborts the
+// rotation — loud-failure, never a silent gap).
+func (e Engine) PrecedesOrEqual(a, b ir.Position) (bool, error) {
+	da, oka, err := decodePGPos(a)
+	if err != nil {
+		return false, fmt.Errorf("postgres: monotonic check: decode a: %w", err)
+	}
+	if !oka {
+		return false, fmt.Errorf("postgres: monotonic check: position a is the empty 'from now' sentinel; cannot compare")
+	}
+	db, okb, err := decodePGPos(b)
+	if err != nil {
+		return false, fmt.Errorf("postgres: monotonic check: decode b: %w", err)
+	}
+	if !okb {
+		return false, fmt.Errorf("postgres: monotonic check: position b is the empty 'from now' sentinel; cannot compare")
+	}
+	cmp, err := e.CompareLSN(da.LSN, db.LSN)
+	if err != nil {
+		return false, err
+	}
+	return cmp <= 0, nil
+}
+
 // ReadSlotPosition returns the named replication slot's
 // confirmed_flush_lsn as a canonical "X/XXXXXXXX" string. Used by
 // the mid-stream live add-table flow (ADR-0030) to capture the

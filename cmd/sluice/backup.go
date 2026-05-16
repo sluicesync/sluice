@@ -391,6 +391,8 @@ type BackupFullCmd struct {
 
 	ChunkSize int `help:"Maximum rows per chunk file. The writer rolls over to a new file whenever the current chunk hits this row count. Smaller chunks restore faster (per-chunk SHA-256 verification can fail-fast on the smallest possible unit) but inflate the manifest. Default 100000." default:"100000" placeholder:"N"`
 
+	Compression string `help:"Per-segment chunk compression codec: none | gzip | zstd. Default gzip (unchanged behaviour). 'none' leaves chunks as human-readable .jsonl on a local-FS target; 'zstd' uses klauspost/compress/zstd at SpeedDefault. Recorded in lineage.json and read back from there on restore (never inferred from bytes)." default:"gzip" enum:"none,gzip,zstd" placeholder:"CODEC"`
+
 	SlotName string `help:"Replication-slot name suffix on engines with a slot concept (Postgres). Used to label the EndPosition recorded on the manifest so a Phase 3 incremental chained off this full opens CDC against a slot of the same name. Default 'sluice_slot'. Engines without slots (MySQL: binlog stream is the slot) ignore this flag." placeholder:"NAME"`
 
 	ForceOverwrite bool `help:"Replace an existing completed backup at the destination. By default 'sluice backup full' refuses to overwrite a successful prior backup; pass this to discard the prior contents and start fresh. Partial (in-progress) backups always resume regardless of this flag."`
@@ -411,6 +413,10 @@ func (b *BackupFullCmd) Run(g *Globals) error {
 	source, err := resolveEngine(b.SourceDriver)
 	if err != nil {
 		return fmt.Errorf("--source-driver: %w", err)
+	}
+	codec, err := pipeline.ParseCompression(b.Compression)
+	if err != nil {
+		return fmt.Errorf("--compression: %w", err)
 	}
 
 	if len(b.IncludeTable) > 0 && len(b.ExcludeTable) > 0 {
@@ -461,6 +467,7 @@ func (b *BackupFullCmd) Run(g *Globals) error {
 		SlotName:       pipeline.ResolveSlotName(b.SlotName),
 		ForceOverwrite: b.ForceOverwrite,
 		Encryption:     encConfig,
+		Codec:          codec,
 	}
 	keysetSource := b.KeysetSource
 	if keysetSource == "" {
@@ -669,17 +676,33 @@ type BackupStreamCmd struct {
 	RetryBackoffBase time.Duration `help:"Base interval for exponential backoff between retriable rollover failures. Doubles each attempt, capped at --retry-backoff-cap." default:"100ms" placeholder:"DUR"`
 	RetryBackoffCap  time.Duration `help:"Upper bound on each retriable rollover backoff interval." default:"30s" placeholder:"DUR"`
 
-	ExitAfterAge         time.Duration `help:"After this duration of chain age, commit the current rollover and exit cleanly. GitHub #20 chunk 14b phase 1: pair with cron/systemd/supervisord to restart with a fresh --output-dir for the next chain (bounded chain length without writing application-side rotation). 0 disables." placeholder:"DUR"`
-	ExitAfterChainLength int           `help:"After this many incrementals committed, exit cleanly. Same wrapper pattern as --exit-after-age; either threshold firing wins. 0 disables." placeholder:"N"`
+	RetainRotateAt            time.Duration `help:"In-process backup-segment rotation (ADR-0046): once the open segment reaches this age, the stream caps it and opens a fresh segment over the SAME CDC handle (no operator wrapper, no stream exit). Pair with 'sluice backup prune' to bound total disk. 0 disables (unbounded single segment)." placeholder:"DUR"`
+	RetainRotateAtChainLength int           `help:"Rotate the open segment after this many incrementals are committed to it. Either rotation threshold firing wins. 0 disables." placeholder:"N"`
+
+	Compression string `help:"Per-segment chunk compression codec: none | gzip | zstd. Default gzip (unchanged behaviour). 'none' leaves chunks as human-readable .jsonl on a local-FS target; 'zstd' uses klauspost/compress/zstd at SpeedDefault. Recorded per segment in lineage.json and read back from there on restore (never inferred from bytes)." default:"gzip" enum:"none,gzip,zstd" placeholder:"CODEC"`
+
+	// Phase-1 rotation flags removed in v0.67.0 (ADR-0046 §6). Kept as
+	// hidden no-value sentinels so the operator gets a CLEAR
+	// migration error (clean break, not a silent ignore — kong's
+	// generic "unknown flag" is less actionable).
+	ExitAfterAge         string `name:"exit-after-age" hidden:"" help:"REMOVED in v0.67.0."`
+	ExitAfterChainLength string `name:"exit-after-chain-length" hidden:"" help:"REMOVED in v0.67.0."`
 
 	EncryptionFlags
 }
 
 // Run implements `sluice backup stream run`.
 func (b *BackupStreamCmd) Run(_ *Globals) error {
+	if b.ExitAfterAge != "" || b.ExitAfterChainLength != "" {
+		return errors.New("--exit-after-age / --exit-after-chain-length were REMOVED in v0.67.0 (ADR-0046): rotation is now always in-process. Use --retain-rotate-at=DUR and/or --retain-rotate-at-chain-length=N instead — the stream caps the open segment and opens a fresh one over the same CDC handle, no operator wrapper needed")
+	}
 	source, err := resolveEngine(b.SourceDriver)
 	if err != nil {
 		return fmt.Errorf("--source-driver: %w", err)
+	}
+	codec, err := pipeline.ParseCompression(b.Compression)
+	if err != nil {
+		return fmt.Errorf("--compression: %w", err)
 	}
 	if b.OutputDir == "" && b.Target == "" {
 		return errors.New("one of --output-dir or --target is required")
@@ -712,25 +735,26 @@ func (b *BackupStreamCmd) Run(_ *Globals) error {
 		return err
 	}
 	stream := &pipeline.BackupStream{
-		Source:                source,
-		SourceDSN:             b.Source,
-		Store:                 store,
-		ParentRef:             b.Since,
-		SlotName:              b.SlotName,
-		RolloverWindow:        b.RolloverWindow,
-		RolloverMaxChanges:    b.RolloverMaxChanges,
-		RolloverMaxBytes:      b.RolloverMaxBytes,
-		ChunkChanges:          b.ChunkSize,
-		IncludeEmptyRollovers: b.IncludeEmpty,
-		Force:                 b.Force,
-		RolloverHook:          b.RolloverHook,
-		SluiceVersion:         version,
-		Encryption:            encConfig,
-		RetryAttempts:         b.RetryAttempts,
-		RetryBackoffBase:      b.RetryBackoffBase,
-		RetryBackoffCap:       b.RetryBackoffCap,
-		ExitAfterAge:          b.ExitAfterAge,
-		ExitAfterChainLength:  b.ExitAfterChainLength,
+		Source:                    source,
+		SourceDSN:                 b.Source,
+		Store:                     store,
+		ParentRef:                 b.Since,
+		SlotName:                  b.SlotName,
+		RolloverWindow:            b.RolloverWindow,
+		RolloverMaxChanges:        b.RolloverMaxChanges,
+		RolloverMaxBytes:          b.RolloverMaxBytes,
+		ChunkChanges:              b.ChunkSize,
+		IncludeEmptyRollovers:     b.IncludeEmpty,
+		Force:                     b.Force,
+		RolloverHook:              b.RolloverHook,
+		SluiceVersion:             version,
+		Encryption:                encConfig,
+		RetryAttempts:             b.RetryAttempts,
+		RetryBackoffBase:          b.RetryBackoffBase,
+		RetryBackoffCap:           b.RetryBackoffCap,
+		RetainRotateAt:            b.RetainRotateAt,
+		RetainRotateAtChainLength: b.RetainRotateAtChainLength,
+		Codec:                     codec,
 	}
 	return stream.Run(ctx)
 }
@@ -797,7 +821,7 @@ type BackupVerifyCmd struct {
 	BackupRegion    string `help:"Override the S3 region. Only meaningful when --from is an s3:// URL." placeholder:"REGION"`
 	BackupPathStyle bool   `help:"Force path-style addressing. Only meaningful when --from is an s3:// URL."`
 
-	RebuildCatalog bool `help:"Rebuild the chain.json catalog from scratch by walking every manifest, then exit. Use after manual chain mutation (operator-driven prune) or to seed a catalog on a legacy chain produced by sluice older than v0.47.0."`
+	RebuildCatalog bool `help:"Rebuild lineage.json from scratch by walking the conventional one-segment layout (manifest.json + manifests/incr-*.json), then exit. Use after manual mutation of a single-segment backup. NOTE: a multi-segment (rotated) lineage's sub-dir structure is NOT reconstructable from a bare walk by design — lineage.json IS the structural record for a rotated backup."`
 }
 
 // Run implements `sluice backup verify`.
@@ -821,12 +845,13 @@ func (v *BackupVerifyCmd) Run(_ *Globals) error {
 		defer func() { _ = closer() }()
 	}
 	if v.RebuildCatalog {
-		entries, err := pipeline.RebuildChainCatalogAt(ctx, store)
+		segments, manifests, err := pipeline.RebuildLineageCatalogAt(ctx, store)
 		if err != nil {
-			return fmt.Errorf("rebuild chain catalog: %w", err)
+			return fmt.Errorf("rebuild lineage catalog: %w", err)
 		}
-		slog.InfoContext(ctx, "chain catalog rebuilt",
-			slog.Int("entries", entries),
+		slog.InfoContext(ctx, "lineage catalog rebuilt",
+			slog.Int("segments", segments),
+			slog.Int("manifests", manifests),
 		)
 		return nil
 	}

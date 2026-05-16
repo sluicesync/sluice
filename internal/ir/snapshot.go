@@ -133,6 +133,35 @@ func (s *BackupSnapshot) Close() error {
 	return s.CloseFn()
 }
 
+// PositionMonotonicChecker is the OPTIONAL engine surface the
+// inline-rotation FSM (ADR-0046 §2) uses to enforce its load-bearing
+// `S >= P_N` hard-fail assertion: the freshly-opened next segment's
+// snapshot anchor S must be at or after the prior segment's last
+// committed incremental position P_N, or writes in (S, P_N) would be
+// silently gapped out of the new segment.
+//
+// The invariant holds BY CONSTRUCTION when the snapshot is opened on
+// the same in-flight source handle as the CDC pump (the source is
+// position-monotonic). This interface is the DEFENSIVE assertion
+// against a buggy / lying snapshot opener: PrecedesOrEqual reports
+// whether a <= b in the engine's native position order (PG LSN
+// numeric order; MySQL GTID-set containment). The FSM hard-aborts the
+// rotation — staying on the still-open prior segment, never gapping —
+// when the engine implements this and reports the anchor regressed.
+//
+// Engines that don't implement it fall back to the structural
+// same-handle guarantee plus the FSM's non-empty / engine-match
+// assertion (both still loud refusals). PG implements it via its LSN
+// comparator.
+type PositionMonotonicChecker interface {
+	// PrecedesOrEqual reports whether position a is at or before
+	// position b in this engine's native change-stream order. Both
+	// positions must have been produced by this engine. A malformed /
+	// cross-engine position is a non-nil error (the FSM treats an
+	// error as "cannot prove monotonic → hard-abort", loud-failure).
+	PrecedesOrEqual(a, b Position) (bool, error)
+}
+
 // BackupSnapshotOpener is the optional engine surface for opening a
 // backup-scoped consistent snapshot. The full-backup orchestrator
 // type-asserts on this method when starting a run; engines that

@@ -135,9 +135,9 @@ func TestBackupStream_RolloverOnMaxChanges(t *testing.T) {
 	// Verify we got 3 rollovers. Total changes across them = 30 (==
 	// source emitted). The third rollover closes because the CDC
 	// channel closes (no more changes), not because max-changes fires.
-	records, err := listAllManifests(context.Background(), store)
+	records, err := listAllManifestsViaWalk(context.Background(), store)
 	if err != nil {
-		t.Fatalf("listAllManifests: %v", err)
+		t.Fatalf("listAllManifestsViaWalk: %v", err)
 	}
 	var incrementals []*ir.Manifest
 	for _, r := range records {
@@ -222,7 +222,7 @@ func TestBackupStream_SkipEmptyRollover_OnChannelClose(t *testing.T) {
 	if err := stream.Run(context.Background()); err != nil {
 		t.Fatalf("stream.Run: %v", err)
 	}
-	records, _ := listAllManifests(context.Background(), store)
+	records, _ := listAllManifestsViaWalk(context.Background(), store)
 	for _, r := range records {
 		if r.manifest.Kind == ir.BackupKindIncremental {
 			t.Errorf("unexpected incremental manifest committed for empty rollover: %+v", r.manifest)
@@ -266,7 +266,7 @@ func TestBackupStream_IncludeEmptyRollover_WritesManifest(t *testing.T) {
 	if err := stream.Run(context.Background()); err != nil {
 		t.Fatalf("stream.Run: %v", err)
 	}
-	records, _ := listAllManifests(context.Background(), store)
+	records, _ := listAllManifestsViaWalk(context.Background(), store)
 	var sawIncr bool
 	for _, r := range records {
 		if r.manifest.Kind == ir.BackupKindIncremental {

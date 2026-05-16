@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -14,302 +15,205 @@ import (
 	"github.com/orware/sluice/internal/ir"
 )
 
-// TestChainCatalog_LoadAbsent covers the legacy-chain detection path:
-// a store without chain.json must report (nil, false, nil) so callers
-// fall through to the directory walk. Returning an error here would
-// break v0.46.0-and-earlier chains the moment v0.47.0 reads them.
-func TestChainCatalog_LoadAbsent(t *testing.T) {
+// TestLineage_LoadAbsent: a store without lineage.json reports
+// (nil, false, nil); resolveLineage synthesises a single root
+// segment over the conventional layout (the pre-ADR one-segment
+// shape — strict generalization).
+func TestLineage_LoadAbsent(t *testing.T) {
 	store := newMemStore()
-	cat, ok, err := loadChainCatalog(context.Background(), store)
+	cat, ok, err := loadLineageCatalog(context.Background(), store)
+	if err != nil || ok || cat != nil {
+		t.Fatalf("loadLineageCatalog(absent) = (%v,%v,%v); want (nil,false,nil)", cat, ok, err)
+	}
+
+	// With a conventional full present, resolveLineage synthesises a
+	// one-segment lineage (Dir == "", gzip).
+	full := &ir.Manifest{
+		FormatVersion: ir.BackupFormatVersion, CreatedAt: time.Now().UTC(),
+		SourceEngine: "postgres", Kind: ir.BackupKindFull,
+		EndPosition:  ir.Position{Engine: "postgres", Token: `{"slot":"s","lsn":"0/100"}`},
+		PartialState: ir.BackupStateComplete,
+	}
+	full.BackupID = ir.ComputeBackupID(full)
+	mustWriteManifest(t, store, ManifestFileName, full)
+	rl, err := resolveLineage(context.Background(), store)
 	if err != nil {
-		t.Fatalf("loadChainCatalog(empty): err = %v; want nil", err)
+		t.Fatalf("resolveLineage: %v", err)
 	}
-	if ok {
-		t.Errorf("loadChainCatalog(empty): present = true; want false")
-	}
-	if cat != nil {
-		t.Errorf("loadChainCatalog(empty): cat = %v; want nil", cat)
+	if len(rl.Segments) != 1 || rl.Segments[0].Dir != "" || rl.Segments[0].codecOrDefault() != CodecGzip {
+		t.Fatalf("synthetic lineage = %+v; want one root segment, Dir='', gzip", rl.Segments)
 	}
 }
 
-// TestChainCatalog_RoundTrip pins the write/read symmetry. A catalog
-// written by [writeChainCatalog] must come back via [loadChainCatalog]
-// with every field intact.
-func TestChainCatalog_RoundTrip(t *testing.T) {
+// TestLineage_RoundTrip_MixedCodec pins the on-disk JSON shape and
+// proves a mixed-codec multi-segment lineage (de)serialises with each
+// segment's codec preserved (ADR-0046 §5: recorded, never inferred).
+func TestLineage_RoundTrip_MixedCodec(t *testing.T) {
 	store := newMemStore()
-	now := time.Now().UTC().Truncate(time.Millisecond)
-	original := &ChainCatalog{
-		FormatVersion:     chainCatalogFormatVersion,
-		SluiceVersion:     "v0.47.0-test",
-		SourceEngine:      "postgres",
-		ChainRootBackupID: "root123",
-		CreatedAt:         now,
-		UpdatedAt:         now,
-		Entries: []ChainCatalogEntry{
+	cap0 := time.Date(2026, 5, 16, 1, 0, 0, 0, time.UTC)
+	cap1 := time.Date(2026, 5, 16, 2, 0, 0, 0, time.UTC)
+	cat := &LineageCatalog{
+		LineageID:    "lin1",
+		SourceEngine: "postgres",
+		CreatedAt:    time.Date(2026, 5, 16, 0, 0, 0, 0, time.UTC),
+		Segments: []LineageSegment{
 			{
-				BackupID:     "root123",
-				Kind:         ir.BackupKindFull,
-				ManifestPath: ManifestFileName,
-				CreatedAt:    now,
-				FileCount:    7,
+				SegmentID: "s0", Dir: "", FullManifestPath: ManifestFileName,
+				Incrementals:  []string{"manifests/incr-1.json"},
+				StartPosition: ir.Position{Engine: "postgres", Token: "0/100"},
+				EndPosition:   ir.Position{Engine: "postgres", Token: "0/200"},
+				CappedAt:      &cap0, CapReason: rotationReasonAge, Codec: CodecNone,
 			},
 			{
-				BackupID:       "incr001",
-				Kind:           ir.BackupKindIncremental,
-				ParentBackupID: "root123",
-				ManifestPath:   "manifests/incr-0001.json",
-				CreatedAt:      now.Add(time.Minute),
-				FileCount:      1,
+				SegmentID: "s1", Dir: "seg-1", FullManifestPath: ManifestFileName,
+				StartPosition: ir.Position{Engine: "postgres", Token: "0/200"},
+				EndPosition:   ir.Position{Engine: "postgres", Token: "0/300"},
+				CappedAt:      &cap1, CapReason: rotationReasonChainLength, Codec: CodecGzip,
 			},
+			{
+				SegmentID: "s2", Dir: "seg-2", FullManifestPath: ManifestFileName,
+				StartPosition: ir.Position{Engine: "postgres", Token: "0/300"},
+				EndPosition:   ir.Position{Engine: "postgres", Token: "0/300"},
+				Codec:         CodecZstd,
+			}, // open segment: no CappedAt
 		},
 	}
-	if err := writeChainCatalog(context.Background(), store, original); err != nil {
-		t.Fatalf("writeChainCatalog: %v", err)
+	if err := writeLineageCatalog(context.Background(), store, cat); err != nil {
+		t.Fatalf("writeLineageCatalog: %v", err)
 	}
-	got, ok, err := loadChainCatalog(context.Background(), store)
-	if err != nil {
-		t.Fatalf("loadChainCatalog: %v", err)
-	}
-	if !ok {
-		t.Fatalf("loadChainCatalog: present = false; want true")
-	}
-	if got.FormatVersion != chainCatalogFormatVersion {
-		t.Errorf("FormatVersion = %d; want %d", got.FormatVersion, chainCatalogFormatVersion)
-	}
-	if got.ChainRootBackupID != "root123" {
-		t.Errorf("ChainRootBackupID = %q; want %q", got.ChainRootBackupID, "root123")
-	}
-	if len(got.Entries) != 2 {
-		t.Fatalf("len(Entries) = %d; want 2", len(got.Entries))
-	}
-	if got.Entries[1].ParentBackupID != "root123" {
-		t.Errorf("Entries[1].ParentBackupID = %q; want %q", got.Entries[1].ParentBackupID, "root123")
-	}
-}
-
-// TestChainCatalog_FormatVersionGate covers the forward-incompat
-// refusal: a v0.47.0 reader against a chain.json with
-// format_version > 1 must refuse loudly rather than silently parsing
-// fields it might not understand. Operator-actionable: "upgrade
-// sluice".
-func TestChainCatalog_FormatVersionGate(t *testing.T) {
-	store := newMemStore()
-	future := &ChainCatalog{FormatVersion: chainCatalogFormatVersion + 99}
-	if err := writeChainCatalog(context.Background(), store, future); err != nil {
-		t.Fatalf("writeChainCatalog: %v", err)
-	}
-	_, _, err := loadChainCatalog(context.Background(), store)
-	if err == nil {
-		t.Fatal("loadChainCatalog: err = nil; want format-version refusal")
-	}
-	if !strings.Contains(err.Error(), "upgrade sluice") {
-		t.Errorf("loadChainCatalog: err = %v; want operator-actionable upgrade hint", err)
-	}
-}
-
-// TestChainCatalog_AppendDeduplicatesByBackupID pins the per-chunk-
-// checkpoint replay path. Within a single backup-full run, the
-// orchestrator writes the same BackupID's manifest multiple times as
-// chunks complete. updateChainCatalog must replace by BackupID, not
-// accumulate duplicates — otherwise the catalog grows linearly with
-// chunk count for a single backup, defeating the O(1) goal.
-func TestChainCatalog_AppendDeduplicatesByBackupID(t *testing.T) {
-	store := newMemStore()
-	now := time.Now().UTC()
-	m := &ir.Manifest{
-		FormatVersion: ir.BackupFormatVersion,
-		SourceEngine:  "postgres",
-		BackupID:      "abc",
-		Kind:          ir.BackupKindFull,
-		CreatedAt:     now,
-	}
-	// First write — appended.
-	if err := updateChainCatalog(context.Background(), store, m, ManifestFileName, 1); err != nil {
-		t.Fatalf("updateChainCatalog 1: %v", err)
-	}
-	// Same BackupID, different FileCount (simulating mid-run checkpoint).
-	if err := updateChainCatalog(context.Background(), store, m, ManifestFileName, 5); err != nil {
-		t.Fatalf("updateChainCatalog 2: %v", err)
-	}
-	cat, ok, err := loadChainCatalog(context.Background(), store)
+	got, ok, err := loadLineageCatalog(context.Background(), store)
 	if err != nil || !ok {
-		t.Fatalf("loadChainCatalog: ok=%v err=%v", ok, err)
+		t.Fatalf("loadLineageCatalog: (%v,%v)", ok, err)
 	}
-	if len(cat.Entries) != 1 {
-		t.Errorf("len(Entries) = %d; want 1 (dedup by BackupID)", len(cat.Entries))
+	if len(got.Segments) != 3 {
+		t.Fatalf("segments = %d; want 3", len(got.Segments))
 	}
-	if cat.Entries[0].FileCount != 5 {
-		t.Errorf("Entries[0].FileCount = %d; want 5 (latest write should win)", cat.Entries[0].FileCount)
+	wantCodecs := []Codec{CodecNone, CodecGzip, CodecZstd}
+	for i, wc := range wantCodecs {
+		if got.Segments[i].codecOrDefault() != wc {
+			t.Errorf("segment %d codec = %q; want %q", i, got.Segments[i].Codec, wc)
+		}
+	}
+	if !got.Segments[0].open() && got.Segments[2].open() {
+		// expected: seg0 capped, seg2 open
+	} else {
+		t.Errorf("open() wrong: seg0.open=%v seg2.open=%v; want false,true",
+			got.Segments[0].open(), got.Segments[2].open())
+	}
+	// JSON shape: format_version + segments present; capped_at absent
+	// on the open segment.
+	raw, _ := store.Get(context.Background(), LineageCatalogFileName)
+	body, _ := io.ReadAll(raw)
+	var m map[string]any
+	if err := json.Unmarshal(body, &m); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if _, ok := m["format_version"]; !ok {
+		t.Error("lineage.json missing format_version")
+	}
+	if _, ok := m["segments"]; !ok {
+		t.Error("lineage.json missing segments")
+	}
+	segs := m["segments"].([]any)
+	openSeg := segs[2].(map[string]any)
+	if _, present := openSeg["capped_at"]; present {
+		t.Error("open segment must not serialise capped_at")
 	}
 }
 
-// TestChainCatalog_RebuildFromLegacyChain covers the lazy-rebuild
-// path: a chain produced by pre-v0.47.0 sluice (full + incrementals
-// on disk, no chain.json) gets a catalog seeded with every historical
-// entry the first time v0.47.0 writes to the chain.
-func TestChainCatalog_RebuildFromLegacyChain(t *testing.T) {
+// TestLineage_FormatVersionGate: a newer format_version is a loud
+// refusal (forward-incompat — upgrade sluice).
+func TestLineage_FormatVersionGate(t *testing.T) {
 	store := newMemStore()
-	now := time.Now().UTC()
-
-	// Stage a v0.46.0-shape chain: full + two incrementals, no chain.json.
-	full := &ir.Manifest{
-		FormatVersion: ir.BackupFormatVersion,
-		SourceEngine:  "postgres",
-		BackupID:      "full000",
-		Kind:          ir.BackupKindFull,
-		CreatedAt:     now,
-	}
-	incr1 := &ir.Manifest{
-		FormatVersion:  ir.BackupFormatVersion,
-		SourceEngine:   "postgres",
-		BackupID:       "incr001",
-		Kind:           ir.BackupKindIncremental,
-		ParentBackupID: "full000",
-		CreatedAt:      now.Add(time.Minute),
-	}
-	incr2 := &ir.Manifest{
-		FormatVersion:  ir.BackupFormatVersion,
-		SourceEngine:   "postgres",
-		BackupID:       "incr002",
-		Kind:           ir.BackupKindIncremental,
-		ParentBackupID: "incr001",
-		CreatedAt:      now.Add(2 * time.Minute),
-	}
-	mustWriteManifest(t, store, ManifestFileName, full)
-	mustWriteManifest(t, store, "manifests/incr-0001-incr001.json", incr1)
-	mustWriteManifest(t, store, "manifests/incr-0002-incr002.json", incr2)
-
-	// Simulate v0.47.0 writing a new incremental — first updateChainCatalog
-	// triggers the lazy rebuild.
-	incr3 := &ir.Manifest{
-		FormatVersion:  ir.BackupFormatVersion,
-		SourceEngine:   "postgres",
-		BackupID:       "incr003",
-		Kind:           ir.BackupKindIncremental,
-		ParentBackupID: "incr002",
-		CreatedAt:      now.Add(3 * time.Minute),
-	}
-	if err := updateChainCatalog(context.Background(), store, incr3, "manifests/incr-0003-incr003.json", 1); err != nil {
-		t.Fatalf("updateChainCatalog: %v", err)
-	}
-	cat, ok, err := loadChainCatalog(context.Background(), store)
-	if err != nil || !ok {
-		t.Fatalf("loadChainCatalog: ok=%v err=%v", ok, err)
-	}
-	if len(cat.Entries) != 4 {
-		t.Fatalf("len(Entries) = %d; want 4 (3 historical + 1 new)", len(cat.Entries))
-	}
-	// First entry must be the full (chain order).
-	if cat.Entries[0].BackupID != "full000" {
-		t.Errorf("Entries[0].BackupID = %q; want %q (full first)", cat.Entries[0].BackupID, "full000")
-	}
-	// New incremental appended at the end.
-	last := cat.Entries[len(cat.Entries)-1]
-	if last.BackupID != "incr003" {
-		t.Errorf("last entry BackupID = %q; want %q", last.BackupID, "incr003")
-	}
-	if cat.ChainRootBackupID != "full000" {
-		t.Errorf("ChainRootBackupID = %q; want %q", cat.ChainRootBackupID, "full000")
+	store.data[LineageCatalogFileName] = []byte(`{"format_version":99,"segments":[{"segment_id":"x","full_manifest_path":"manifest.json"}]}`)
+	if _, _, err := loadLineageCatalog(context.Background(), store); err == nil ||
+		!strings.Contains(err.Error(), "newer than this build supports") {
+		t.Fatalf("err = %v; want forward-version refusal", err)
 	}
 }
 
-// TestChainCatalog_FilterTombstoned pins the v0.47.0-reader / v0.48.0+
-// -writer forward-compat insurance: an entry marked Tombstoned must be
-// skipped by [readManifestsFromCatalog] so a future compaction's
-// tombstones don't surface compacted-out manifests in a v0.47.0
-// restore.
-func TestChainCatalog_FilterTombstoned(t *testing.T) {
-	entries := []ChainCatalogEntry{
-		{BackupID: "a", ManifestPath: "manifest.json"},
-		{BackupID: "b", ManifestPath: "manifests/incr-0001.json", Tombstoned: true},
-		{BackupID: "c", ManifestPath: "manifests/incr-0002.json"},
-	}
-	active := filterActiveEntries(entries)
-	if len(active) != 2 {
-		t.Fatalf("len(active) = %d; want 2", len(active))
-	}
-	if active[0].BackupID != "a" || active[1].BackupID != "c" {
-		t.Errorf("active = [%q, %q]; want [a, c]", active[0].BackupID, active[1].BackupID)
-	}
-}
-
-// TestListAllManifests_PrefersCatalog asserts the integration: when
-// chain.json is present, listAllManifests reads from it rather than
-// walking the directory. We prove this by writing the catalog with
-// only a subset of manifests' worth of entries and confirming the
-// returned slice matches the catalog, not the on-disk directory.
-func TestListAllManifests_PrefersCatalog(t *testing.T) {
+// TestLineage_ZeroSegmentsRefused: a lineage with no segments is
+// corrupt DR data — loud refusal, never silent continue.
+func TestLineage_ZeroSegmentsRefused(t *testing.T) {
 	store := newMemStore()
-	now := time.Now().UTC()
-	full := &ir.Manifest{
-		FormatVersion: ir.BackupFormatVersion,
-		SourceEngine:  "postgres",
-		BackupID:      "full",
-		Kind:          ir.BackupKindFull,
-		CreatedAt:     now,
+	store.data[LineageCatalogFileName] = []byte(`{"format_version":1,"segments":[]}`)
+	if _, _, err := loadLineageCatalog(context.Background(), store); err == nil ||
+		!strings.Contains(err.Error(), "zero segments") {
+		t.Fatalf("err = %v; want zero-segments refusal", err)
 	}
+}
+
+// TestUpdateLineageForManifest_SeedsAndAppends: a full seeds segment
+// 0; subsequent incrementals append to the open segment with its
+// pinned codec.
+func TestUpdateLineageForManifest_SeedsAndAppends(t *testing.T) {
+	store := newMemStore()
+	full := &ir.Manifest{
+		FormatVersion: ir.BackupFormatVersion, CreatedAt: time.Now().UTC(),
+		SourceEngine: "postgres", Kind: ir.BackupKindFull,
+		EndPosition:  ir.Position{Engine: "postgres", Token: "0/100"},
+		PartialState: ir.BackupStateComplete,
+	}
+	full.BackupID = ir.ComputeBackupID(full)
+	updateLineageForManifestBestEffort(context.Background(), store, full, ManifestFileName, CodecZstd)
+	cat, ok, _ := loadLineageCatalog(context.Background(), store)
+	if !ok || len(cat.Segments) != 1 || cat.Segments[0].codecOrDefault() != CodecZstd {
+		t.Fatalf("after full: %+v; want one zstd segment", cat)
+	}
+
 	incr := &ir.Manifest{
-		FormatVersion:  ir.BackupFormatVersion,
-		SourceEngine:   "postgres",
-		BackupID:       "incr",
-		Kind:           ir.BackupKindIncremental,
-		ParentBackupID: "full",
-		CreatedAt:      now.Add(time.Minute),
+		FormatVersion: ir.BackupFormatVersion, CreatedAt: time.Now().UTC(),
+		SourceEngine: "postgres", Kind: ir.BackupKindIncremental,
+		ParentBackupID: full.BackupID,
+		StartPosition:  ir.Position{Engine: "postgres", Token: "0/100"},
+		EndPosition:    ir.Position{Engine: "postgres", Token: "0/200"},
+		PartialState:   ir.BackupStateComplete,
 	}
-	mustWriteManifest(t, store, ManifestFileName, full)
-	mustWriteManifest(t, store, "manifests/incr-0001.json", incr)
-
-	// Catalog references only the full — list should mirror that
-	// even though incr is on disk.
-	partial := &ChainCatalog{
-		FormatVersion: chainCatalogFormatVersion,
-		CreatedAt:     now,
-		UpdatedAt:     now,
-		Entries: []ChainCatalogEntry{
-			{BackupID: "full", Kind: ir.BackupKindFull, ManifestPath: ManifestFileName, CreatedAt: now},
-		},
+	incr.BackupID = ir.ComputeBackupID(incr)
+	updateLineageForManifestBestEffort(context.Background(), store, incr, "manifests/incr-1.json", CodecZstd)
+	cat, _, _ = loadLineageCatalog(context.Background(), store)
+	if len(cat.Segments) != 1 || len(cat.Segments[0].Incrementals) != 1 ||
+		cat.Segments[0].Incrementals[0] != "manifests/incr-1.json" {
+		t.Fatalf("after incr: %+v; want one incremental appended", cat.Segments[0])
 	}
-	if err := writeChainCatalog(context.Background(), store, partial); err != nil {
-		t.Fatalf("writeChainCatalog: %v", err)
+	if cat.Segments[0].EndPosition.Token != "0/200" {
+		t.Errorf("open segment EndPosition = %q; want 0/200", cat.Segments[0].EndPosition.Token)
 	}
-	records, err := listAllManifests(context.Background(), store)
-	if err != nil {
-		t.Fatalf("listAllManifests: %v", err)
-	}
-	if len(records) != 1 {
-		t.Errorf("len(records) = %d; want 1 (catalog wins)", len(records))
+	// Dedup: re-writing the same path doesn't double-append.
+	updateLineageForManifestBestEffort(context.Background(), store, incr, "manifests/incr-1.json", CodecZstd)
+	cat, _, _ = loadLineageCatalog(context.Background(), store)
+	if len(cat.Segments[0].Incrementals) != 1 {
+		t.Errorf("re-write incrementals = %d; want 1 (deduped)", len(cat.Segments[0].Incrementals))
 	}
 }
 
-// TestListAllManifests_FallsBackToWalk asserts the legacy path: a
-// chain without chain.json must still be readable via the directory
-// walk.
-func TestListAllManifests_FallsBackToWalk(t *testing.T) {
-	store := newMemStore()
-	now := time.Now().UTC()
-	full := &ir.Manifest{
-		FormatVersion: ir.BackupFormatVersion,
-		SourceEngine:  "postgres",
-		BackupID:      "full",
-		Kind:          ir.BackupKindFull,
-		CreatedAt:     now,
+// TestValidateRecordedCodec_UnknownRefused: an unknown recorded codec
+// is a loud refusal — codec is recorded, never inferred (ADR-0046 §5).
+func TestValidateRecordedCodec_UnknownRefused(t *testing.T) {
+	if err := validateRecordedCodec(Codec("snappy")); err == nil ||
+		!strings.Contains(err.Error(), "unknown compression codec") {
+		t.Fatalf("err = %v; want unknown-codec refusal", err)
 	}
-	mustWriteManifest(t, store, ManifestFileName, full)
-	records, err := listAllManifests(context.Background(), store)
-	if err != nil {
-		t.Fatalf("listAllManifests: %v", err)
-	}
-	if len(records) != 1 {
-		t.Fatalf("len(records) = %d; want 1", len(records))
-	}
-	if records[0].manifest.BackupID != "full" {
-		t.Errorf("records[0].BackupID = %q; want %q", records[0].manifest.BackupID, "full")
+	for _, c := range []Codec{"", CodecNone, CodecGzip, CodecZstd} {
+		if err := validateRecordedCodec(c); err != nil {
+			t.Errorf("validateRecordedCodec(%q) = %v; want nil", c, err)
+		}
 	}
 }
 
-// mustWriteManifest is a test helper that writes a manifest at the
-// given path, bypassing the chain-catalog hook so the test controls
-// catalog state explicitly.
+// TestParseCompression covers the CLI codec parse (loud on unknown).
+func TestParseCompression(t *testing.T) {
+	for in, want := range map[string]Codec{"": CodecGzip, "gzip": CodecGzip, "none": CodecNone, "zstd": CodecZstd} {
+		got, err := ParseCompression(in)
+		if err != nil || got != want {
+			t.Errorf("ParseCompression(%q) = (%q,%v); want (%q,nil)", in, got, err, want)
+		}
+	}
+	if _, err := ParseCompression("lz4"); err == nil {
+		t.Error("ParseCompression(lz4) = nil; want unknown-codec error")
+	}
+}
+
 func mustWriteManifest(t *testing.T, store ir.BackupStore, path string, m *ir.Manifest) {
 	t.Helper()
 	if err := writeManifestAt(context.Background(), store, path, m); err != nil {
@@ -317,9 +221,9 @@ func mustWriteManifest(t *testing.T, store ir.BackupStore, path string, m *ir.Ma
 	}
 }
 
-// memStore is a minimal in-memory BackupStore for catalog tests. The
-// real LocalStore + BlobStore have integration coverage; the catalog
-// behaviour is store-agnostic.
+// memStore is a minimal in-memory BackupStore for catalog/lineage
+// tests. The real LocalStore + BlobStore have integration coverage;
+// the lineage behaviour is store-agnostic.
 type memStore struct {
 	data map[string][]byte
 }
@@ -352,6 +256,7 @@ func (s *memStore) List(_ context.Context, prefix string) ([]string, error) {
 			out = append(out, k)
 		}
 	}
+	sort.Strings(out)
 	return out, nil
 }
 
@@ -368,35 +273,3 @@ func (s *memStore) Exists(_ context.Context, path string) (bool, error) {
 type storeNotFoundErr struct{ path string }
 
 func (e *storeNotFoundErr) Error() string { return "memstore: not found: " + e.path }
-
-// assertCatalogJSONShape is a small belt-and-braces check that the
-// on-disk JSON envelope matches the schema docs. Catches accidental
-// json-tag drift on the catalog types.
-func assertCatalogJSONShape(t *testing.T, body []byte) {
-	t.Helper()
-	var raw map[string]any
-	if err := json.Unmarshal(body, &raw); err != nil {
-		t.Fatalf("unmarshal catalog body: %v", err)
-	}
-	if _, ok := raw["format_version"]; !ok {
-		t.Errorf("catalog json missing required field: format_version")
-	}
-	if _, ok := raw["entries"]; !ok {
-		t.Errorf("catalog json missing required field: entries")
-	}
-}
-
-// TestChainCatalog_JSONShape pins the on-disk envelope so future
-// json-tag renames must trip a test rather than silently break
-// readers (or older sluice's forward-compat ignore-unknown behaviour).
-func TestChainCatalog_JSONShape(t *testing.T) {
-	cat := &ChainCatalog{
-		FormatVersion: chainCatalogFormatVersion,
-		Entries:       []ChainCatalogEntry{{BackupID: "x"}},
-	}
-	body, err := json.MarshalIndent(cat, "", "  ")
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-	assertCatalogJSONShape(t, body)
-}

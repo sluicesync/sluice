@@ -12,12 +12,12 @@ import (
 	"github.com/orware/sluice/internal/ir"
 )
 
-// TestPruneChain_KeepIncrementalsDropsOldest pins the basic
-// keep-N-most-recent flow: 1 full + 5 incrementals, keep 2, the 3
-// oldest get pruned.
-func TestPruneChain_KeepIncrementalsDropsOldest(t *testing.T) {
+// TestPruneLineage_KeepIncrementalsDropsOldest: 1 full + 5
+// incrementals in a one-segment lineage, keep 2, the 3 oldest get
+// pruned; the lineage's open segment retains 2.
+func TestPruneLineage_KeepIncrementalsDropsOldest(t *testing.T) {
 	store := newMemStore()
-	seedChain(t, store, 5)
+	seedLineageChain(t, store, 5)
 
 	res, err := PruneChain(context.Background(), store, PruneOpts{KeepIncrementals: 2})
 	if err != nil {
@@ -26,235 +26,232 @@ func TestPruneChain_KeepIncrementalsDropsOldest(t *testing.T) {
 	if len(res.Pruned) != 3 {
 		t.Errorf("Pruned count = %d; want 3", len(res.Pruned))
 	}
-	if len(res.Kept) != 3 { // full + 2 incrs
-		t.Errorf("Kept count = %d; want 3 (full + 2 incrementals)", len(res.Kept))
-	}
-	cat, ok, err := loadChainCatalog(context.Background(), store)
+	cat, ok, err := loadLineageCatalog(context.Background(), store)
 	if err != nil || !ok {
-		t.Fatalf("post-prune loadChainCatalog: ok=%v err=%v", ok, err)
+		t.Fatalf("post-prune loadLineageCatalog: ok=%v err=%v", ok, err)
 	}
-	if len(cat.Entries) != 3 {
-		t.Errorf("post-prune catalog entries = %d; want 3", len(cat.Entries))
+	if len(cat.Segments) != 1 || len(cat.Segments[0].Incrementals) != 2 {
+		t.Errorf("post-prune segment = %+v; want 1 segment with 2 incrementals", cat.Segments)
 	}
 }
 
-// TestPruneChain_KeepDurationDropsOlderThanThreshold covers the
-// time-based mode. Setup: 5 incrementals at 1-hour intervals; keep
-// any within last 2h → the 3 oldest get dropped.
-func TestPruneChain_KeepDurationDropsOlderThanThreshold(t *testing.T) {
+// TestPruneLineage_KeepDuration drops incrementals older than the
+// threshold.
+func TestPruneLineage_KeepDuration(t *testing.T) {
 	store := newMemStore()
-	seedChain(t, store, 5)
+	base := seedLineageChain(t, store, 5)
+	now := func() time.Time { return base.Add(5*time.Hour + time.Minute) }
 
-	// Pin "now" to 5 hours after the chain's last incremental.
-	cat, _, _ := loadChainCatalog(context.Background(), store)
-	lastTime := cat.Entries[len(cat.Entries)-1].CreatedAt
-	now := func() time.Time { return lastTime.Add(time.Hour) }
-
-	res, err := PruneChain(context.Background(), store, PruneOpts{
-		KeepDuration: 2 * time.Hour,
-		Now:          now,
-	})
+	res, err := PruneChain(context.Background(), store, PruneOpts{KeepDuration: 2 * time.Hour, Now: now})
 	if err != nil {
 		t.Fatalf("PruneChain: %v", err)
 	}
-	// 5 incrementals at 1h intervals, threshold = now - 2h.
-	// now is lastTime + 1h. Threshold = lastTime - 1h. So incrementals
-	// whose CreatedAt < (lastTime - 1h) get dropped — that's the 3
-	// oldest (0h, 1h, 2h from start, which are 4h/3h/2h before
-	// lastTime, all earlier than threshold's 1h-before-last).
+	// Incrementals at base+1h..base+5h; now=base+5h1m; keep < 2h old →
+	// keep base+4h and base+5h (2 newest), drop the 3 oldest.
 	if len(res.Pruned) != 3 {
-		t.Errorf("Pruned count = %d; want 3 (older-than-2h)", len(res.Pruned))
+		t.Errorf("Pruned = %d; want 3 (older-than-2h)", len(res.Pruned))
 	}
 }
 
-// TestPruneChain_KeepAllPreservesEverything covers the no-op case:
-// KeepIncrementals >= incremental count → nothing to do.
-func TestPruneChain_KeepAllPreservesEverything(t *testing.T) {
+// TestPruneLineage_KeepAllNoOp: keep >= count → nothing pruned.
+func TestPruneLineage_KeepAllNoOp(t *testing.T) {
 	store := newMemStore()
-	seedChain(t, store, 3)
-
+	seedLineageChain(t, store, 3)
 	res, err := PruneChain(context.Background(), store, PruneOpts{KeepIncrementals: 10})
 	if err != nil {
 		t.Fatalf("PruneChain: %v", err)
 	}
 	if len(res.Pruned) != 0 {
-		t.Errorf("Pruned count = %d; want 0", len(res.Pruned))
+		t.Errorf("Pruned = %d; want 0", len(res.Pruned))
 	}
-	// Catalog should be unchanged.
-	cat, _, _ := loadChainCatalog(context.Background(), store)
-	if len(cat.Entries) != 4 { // full + 3 incrementals
-		t.Errorf("catalog entries = %d; want 4", len(cat.Entries))
+	cat, _, _ := loadLineageCatalog(context.Background(), store)
+	if len(cat.Segments[0].Incrementals) != 3 {
+		t.Errorf("incrementals = %d; want 3 (unchanged)", len(cat.Segments[0].Incrementals))
 	}
 }
 
-// TestPruneChain_DryRunNoSideEffects covers the dry-run mode: the
-// would-prune list is returned but nothing on disk changes.
-func TestPruneChain_DryRunNoSideEffects(t *testing.T) {
+// TestPruneLineage_DryRunNoSideEffects reports the would-prune set
+// without mutating the lineage or deleting chunks.
+func TestPruneLineage_DryRunNoSideEffects(t *testing.T) {
 	store := newMemStore()
-	seedChain(t, store, 4)
-
-	res, err := PruneChain(context.Background(), store, PruneOpts{
-		KeepIncrementals: 1,
-		DryRun:           true,
-	})
+	seedLineageChain(t, store, 4)
+	res, err := PruneChain(context.Background(), store, PruneOpts{KeepIncrementals: 1, DryRun: true})
 	if err != nil {
 		t.Fatalf("PruneChain dry-run: %v", err)
 	}
-	if len(res.Pruned) != 3 {
-		t.Errorf("dry-run Pruned count = %d; want 3", len(res.Pruned))
+	if len(res.Pruned) != 3 || res.ChunksDeleted != 0 {
+		t.Errorf("dry-run Pruned=%d ChunksDeleted=%d; want 3,0", len(res.Pruned), res.ChunksDeleted)
 	}
-	if res.ChunksDeleted != 0 {
-		t.Errorf("dry-run ChunksDeleted = %d; want 0", res.ChunksDeleted)
-	}
-	// Catalog untouched.
-	cat, _, _ := loadChainCatalog(context.Background(), store)
-	if len(cat.Entries) != 5 {
-		t.Errorf("post-dry-run catalog entries = %d; want 5 (unchanged)", len(cat.Entries))
+	cat, _, _ := loadLineageCatalog(context.Background(), store)
+	if len(cat.Segments[0].Incrementals) != 4 {
+		t.Errorf("post-dry-run incrementals = %d; want 4 (unchanged)", len(cat.Segments[0].Incrementals))
 	}
 }
 
-// TestPruneChain_RefusesBothFlags covers the mutual-exclusion gate.
-func TestPruneChain_RefusesBothFlags(t *testing.T) {
+func TestPruneLineage_RefusesBothFlags(t *testing.T) {
 	store := newMemStore()
-	seedChain(t, store, 2)
-
-	_, err := PruneChain(context.Background(), store, PruneOpts{
-		KeepIncrementals: 1,
-		KeepDuration:     time.Hour,
-	})
+	seedLineageChain(t, store, 2)
+	_, err := PruneChain(context.Background(), store, PruneOpts{KeepIncrementals: 1, KeepDuration: time.Hour})
 	if err == nil || !strings.Contains(err.Error(), "exactly one") {
-		t.Errorf("expected mutual-exclusion error; got %v", err)
+		t.Errorf("err = %v; want mutual-exclusion", err)
 	}
 }
 
-// TestPruneChain_RefusesNeitherFlag covers the validation gate.
-func TestPruneChain_RefusesNeitherFlag(t *testing.T) {
+func TestPruneLineage_RefusesNeitherFlag(t *testing.T) {
 	store := newMemStore()
-	seedChain(t, store, 2)
-
+	seedLineageChain(t, store, 2)
 	_, err := PruneChain(context.Background(), store, PruneOpts{})
 	if err == nil || !strings.Contains(err.Error(), "exactly one") {
-		t.Errorf("expected at-least-one error; got %v", err)
+		t.Errorf("err = %v; want at-least-one", err)
 	}
 }
 
-// TestPruneChain_RefusesWhenCatalogAbsent ensures the operator-
-// actionable refusal fires on a chain without chain.json — the
-// expected next step is `--rebuild-catalog`.
-func TestPruneChain_RefusesWhenCatalogAbsent(t *testing.T) {
+func TestPruneLineage_RefusesWhenCatalogAbsent(t *testing.T) {
 	store := newMemStore()
-	// Put a full manifest but no chain.json.
 	mustWriteManifest(t, store, ManifestFileName, &ir.Manifest{
-		FormatVersion: ir.BackupFormatVersion,
-		SourceEngine:  "postgres",
-		BackupID:      "full000",
-		Kind:          ir.BackupKindFull,
-		CreatedAt:     time.Now().UTC(),
+		FormatVersion: ir.BackupFormatVersion, SourceEngine: "postgres",
+		BackupID: "full000", Kind: ir.BackupKindFull, CreatedAt: time.Now().UTC(),
 	})
-
 	_, err := PruneChain(context.Background(), store, PruneOpts{KeepIncrementals: 1})
-	if err == nil || !strings.Contains(err.Error(), "chain.json not found") {
-		t.Errorf("expected chain.json-not-found refusal; got %v", err)
+	if err == nil || !strings.Contains(err.Error(), "lineage.json not found") {
+		t.Errorf("err = %v; want lineage.json-not-found refusal", err)
 	}
 }
 
-// TestPruneChain_RefusesWhenChainWouldBreak covers the orphan-parent
-// guard: if the operator's keep-set would orphan a kept incremental
-// (parent in drop set), the prune refuses with the actionable hint.
-//
-// Constructed shape: 1 full → incr1 → incr2 where incr2's parent is
-// incr1 (chain link). Keep only incr2 (drop full + incr1). The full
-// is always kept by PruneChain, but incr1 dropping leaves incr2
-// orphaned. The refusal fires.
-//
-// We have to handcraft this because seedChain wires parent links
-// in chain order; this test manually breaks the parent chain by
-// renaming an incremental's parent.
-func TestPruneChain_RefusesWhenChainWouldBreak(t *testing.T) {
+// TestPruneLineage_MultiSegmentDropsLeadingWholeSegment: a 2-segment
+// lineage (seg0 capped w/ 2 incrs, seg1 open w/ 2 incrs); keep 2 →
+// the whole seg0 (full + its 2 incrs) is dropped, seg1's full is the
+// new restore base; restore-after-prune stays correct (the segment
+// full is a self-contained snapshot).
+func TestPruneLineage_MultiSegmentDropsLeadingWholeSegment(t *testing.T) {
 	store := newMemStore()
-	now := time.Now().UTC()
-	full := &ir.Manifest{
-		FormatVersion: ir.BackupFormatVersion,
-		SourceEngine:  "postgres",
-		BackupID:      "full000",
-		Kind:          ir.BackupKindFull,
-		CreatedAt:     now,
+	now := time.Date(2026, 5, 16, 0, 0, 0, 0, time.UTC)
+
+	// Contiguous chain: each link's StartPosition == the preceding
+	// link's EndPosition, and seg1.full.Start == seg0.lastIncr.End
+	// (the inter-segment boundary the rotation FSM guarantees).
+	f0 := seedFull(t, store, "", "0/000", "0/100", now)
+	i01 := seedIncr(t, store, "", "incr01", f0.BackupID, "0/100", "0/200", now.Add(time.Hour))
+	i02 := seedIncr(t, store, "", "incr02", i01.BackupID, "0/200", "0/300", now.Add(2*time.Hour))
+	f1 := seedFull(t, store, "seg-1", "0/300", "0/400", now.Add(3*time.Hour))
+	i11 := seedIncr(t, store, "seg-1", "incr11", f1.BackupID, "0/400", "0/500", now.Add(4*time.Hour))
+	i12 := seedIncr(t, store, "seg-1", "incr12", i11.BackupID, "0/500", "0/600", now.Add(5*time.Hour))
+
+	capt := now.Add(3 * time.Hour)
+	cat := &LineageCatalog{
+		FormatVersion: 1, SourceEngine: "postgres",
+		Segments: []LineageSegment{
+			{
+				SegmentID: f0.BackupID, Dir: "", FullManifestPath: ManifestFileName,
+				Incrementals:  []string{"manifests/incr-01.json", "manifests/incr-02.json"},
+				StartPosition: f0.EndPosition, EndPosition: i02.EndPosition,
+				CappedAt: &capt, CapReason: rotationReasonAge, Codec: CodecGzip,
+			},
+			{
+				SegmentID: f1.BackupID, Dir: "seg-1", FullManifestPath: ManifestFileName,
+				Incrementals:  []string{"manifests/incr-11.json", "manifests/incr-12.json"},
+				StartPosition: f1.EndPosition, EndPosition: i12.EndPosition, Codec: CodecGzip,
+			},
+		},
 	}
-	// 5 incrementals all chaining off full000 (parent = full000) so
-	// the parent-link check sees full000 in the drop set... wait —
-	// the full is ALWAYS kept. Need to break differently: make
-	// incr5's parent = incr3 (skip incr4). If we keep incr5 but drop
-	// incr3 + incr4, the refusal must fire (incr5's parent incr3 is
-	// dropped).
-	incrs := make([]*ir.Manifest, 5)
-	for i := range incrs {
-		parent := full.BackupID
-		if i > 0 {
-			parent = incrs[i-1].BackupID
-		}
-		if i == 4 {
-			parent = incrs[2].BackupID // incr5.parent = incr3 (skip incr4)
-		}
-		incrs[i] = &ir.Manifest{
-			FormatVersion:  ir.BackupFormatVersion,
-			SourceEngine:   "postgres",
-			BackupID:       "incr" + string(rune('0'+i+1)),
-			Kind:           ir.BackupKindIncremental,
-			ParentBackupID: parent,
-			CreatedAt:      now.Add(time.Duration(i+1) * time.Hour),
-		}
-	}
-	mustWriteManifest(t, store, ManifestFileName, full)
-	for i, m := range incrs {
-		path := "manifests/incr-" + string(rune('1'+i)) + ".json"
-		mustWriteManifest(t, store, path, m)
-		if err := updateChainCatalog(context.Background(), store, m, path, 1); err != nil {
-			t.Fatalf("seed catalog: %v", err)
-		}
+	if err := writeLineageCatalog(context.Background(), store, cat); err != nil {
+		t.Fatal(err)
 	}
 
-	// Keep last 2 → would drop incrs 1-3. incr5's parent is incr3,
-	// which is in the drop set → refusal.
-	_, err := PruneChain(context.Background(), store, PruneOpts{KeepIncrementals: 2})
-	if err == nil || !strings.Contains(err.Error(), "refusing to break chain") {
-		t.Errorf("expected chain-break refusal; got %v", err)
+	res, err := PruneChain(context.Background(), store, PruneOpts{KeepIncrementals: 2})
+	if err != nil {
+		t.Fatalf("PruneChain: %v", err)
 	}
+	if res.SegmentsDropped != 1 {
+		t.Errorf("SegmentsDropped = %d; want 1 (whole seg0)", res.SegmentsDropped)
+	}
+	got, _, _ := loadLineageCatalog(context.Background(), store)
+	if len(got.Segments) != 1 || got.Segments[0].Dir != "seg-1" {
+		t.Fatalf("post-prune segments = %+v; want only seg-1", got.Segments)
+	}
+	if got.RestorableFromSegment != 0 {
+		t.Errorf("RestorableFromSegment = %d; want 0 (re-based to seg-1)", got.RestorableFromSegment)
+	}
+	// seg0 full + its chunks are gone; seg-1 full survives.
+	if ex, _ := store.Exists(context.Background(), ManifestFileName); ex {
+		t.Error("seg0 root full not deleted after whole-segment prune")
+	}
+	if ex, _ := store.Exists(context.Background(), "seg-1/manifest.json"); !ex {
+		t.Error("seg-1 full must survive (it is the new restore base)")
+	}
+	// Restore-after-prune correctness: the surviving lineage still
+	// validates (the kept segment full is a contiguous base).
+	if _, err := buildLineageChain(context.Background(), store, nil); err != nil {
+		t.Errorf("restore-after-prune buildLineageChain: %v; want valid", err)
+	}
+	_ = i02
 }
 
-// seedChain helper: write a full + N incrementals to store via the
-// production chain.json hooks so the catalog is well-formed.
-// Each incremental's parent points at the prior one. Used by every
-// happy-path test.
-func seedChain(t *testing.T, store ir.BackupStore, incrementals int) {
+// --- seed helpers ---
+
+func seedFull(t *testing.T, root ir.BackupStore, dir, startLSN, lsn string, created time.Time) *ir.Manifest {
 	t.Helper()
-	now := time.Now().UTC()
+	m := &ir.Manifest{
+		FormatVersion: ir.BackupFormatVersion, SourceEngine: "postgres",
+		Kind: ir.BackupKindFull, CreatedAt: created,
+		StartPosition: ir.Position{Engine: "postgres", Token: `{"slot":"s","lsn":"` + startLSN + `"}`},
+		EndPosition:   ir.Position{Engine: "postgres", Token: `{"slot":"s","lsn":"` + lsn + `"}`},
+		PartialState:  ir.BackupStateComplete,
+	}
+	m.BackupID = ir.ComputeBackupID(m)
+	if err := writeManifestAt(context.Background(), newPrefixedStore(root, dir), ManifestFileName, m); err != nil {
+		t.Fatalf("seed full: %v", err)
+	}
+	return m
+}
+
+func seedIncr(t *testing.T, root ir.BackupStore, dir, _id, parent, startLSN, lsn string, created time.Time) *ir.Manifest {
+	t.Helper()
+	m := &ir.Manifest{
+		FormatVersion: ir.BackupFormatVersion, SourceEngine: "postgres",
+		Kind: ir.BackupKindIncremental, CreatedAt: created, ParentBackupID: parent,
+		StartPosition: ir.Position{Engine: "postgres", Token: `{"slot":"s","lsn":"` + startLSN + `"}`},
+		EndPosition:   ir.Position{Engine: "postgres", Token: `{"slot":"s","lsn":"` + lsn + `"}`},
+		PartialState:  ir.BackupStateComplete,
+	}
+	m.BackupID = ir.ComputeBackupID(m)
+	p := "manifests/incr-" + strings.TrimPrefix(_id, "incr") + ".json"
+	if err := writeManifestAt(context.Background(), newPrefixedStore(root, dir), p, m); err != nil {
+		t.Fatalf("seed incr: %v", err)
+	}
+	return m
+}
+
+// seedLineageChain writes a one-segment lineage (full + N
+// incrementals) via the production lineage hooks so lineage.json is
+// well-formed. Returns the base time (incrementals at base+1h..+Nh).
+func seedLineageChain(t *testing.T, store ir.BackupStore, incrementals int) time.Time {
+	t.Helper()
+	base := time.Date(2026, 5, 16, 0, 0, 0, 0, time.UTC)
 	full := &ir.Manifest{
-		FormatVersion: ir.BackupFormatVersion,
-		SourceEngine:  "postgres",
-		BackupID:      "full000",
-		Kind:          ir.BackupKindFull,
-		CreatedAt:     now,
+		FormatVersion: ir.BackupFormatVersion, SourceEngine: "postgres",
+		Kind: ir.BackupKindFull, CreatedAt: base,
+		EndPosition:  ir.Position{Engine: "postgres", Token: `{"slot":"s","lsn":"0/100"}`},
+		PartialState: ir.BackupStateComplete,
 	}
+	full.BackupID = ir.ComputeBackupID(full)
 	mustWriteManifest(t, store, ManifestFileName, full)
-	if err := updateChainCatalog(context.Background(), store, full, ManifestFileName, 1); err != nil {
-		t.Fatalf("seed full catalog: %v", err)
-	}
+	updateLineageForManifestBestEffort(context.Background(), store, full, ManifestFileName, CodecGzip)
 	parent := full.BackupID
 	for i := 1; i <= incrementals; i++ {
-		id := "incr" + string(rune('0'+i))
-		path := "manifests/incr-" + string(rune('0'+i)) + ".json"
 		m := &ir.Manifest{
-			FormatVersion:  ir.BackupFormatVersion,
-			SourceEngine:   "postgres",
-			BackupID:       id,
-			Kind:           ir.BackupKindIncremental,
-			ParentBackupID: parent,
-			CreatedAt:      now.Add(time.Duration(i) * time.Hour),
+			FormatVersion: ir.BackupFormatVersion, SourceEngine: "postgres",
+			Kind: ir.BackupKindIncremental, ParentBackupID: parent,
+			CreatedAt:     base.Add(time.Duration(i) * time.Hour),
+			StartPosition: ir.Position{Engine: "postgres", Token: `{"slot":"s","lsn":"0/100"}`},
+			EndPosition:   ir.Position{Engine: "postgres", Token: `{"slot":"s","lsn":"0/100"}`},
+			PartialState:  ir.BackupStateComplete,
 		}
+		m.BackupID = ir.ComputeBackupID(m)
+		path := "manifests/incr-000" + string(rune('0'+i)) + ".json"
 		mustWriteManifest(t, store, path, m)
-		if err := updateChainCatalog(context.Background(), store, m, path, 0); err != nil {
-			t.Fatalf("seed incr catalog: %v", err)
-		}
-		parent = id
+		updateLineageForManifestBestEffort(context.Background(), store, m, path, CodecGzip)
+		parent = m.BackupID
 	}
+	return base
 }

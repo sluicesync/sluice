@@ -38,7 +38,7 @@ import (
 func writeOneChangeChunk(t *testing.T, store ir.BackupStore, chunkPath string, changes []ir.Change) (sha string, rowCount int64) {
 	t.Helper()
 	var buf bytes.Buffer
-	cw, err := newChangeChunkWriter(&buf, nil)
+	cw, err := newChangeChunkWriter(&buf, nil, CodecGzip)
 	if err != nil {
 		t.Fatalf("newChangeChunkWriter: %v", err)
 	}

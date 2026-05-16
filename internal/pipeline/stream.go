@@ -230,34 +230,33 @@ type BackupStream struct {
 	// [RetryAttempts] > 1.
 	RetryBackoffCap time.Duration
 
-	// ExitAfterAge, when > 0, causes [BackupStream.Run] to commit the
-	// current rollover and then exit cleanly once the stream's age
-	// (now - chain catalog's CreatedAt, OR stream start time as the
-	// fallback when no catalog) exceeds this duration. The chain's
-	// chain.json gets marked with [ChainCatalog.RotatedAt] +
-	// [ChainCatalog.RotationReason] = "retain-rotate-at" on exit so
-	// subsequent runs can detect that the chain is closed and tooling
-	// can chain across rotations via the (eventual) [SucceededBy]
-	// pointer.
+	// RetainRotateAt, when > 0, is the in-process rotation threshold
+	// (ADR-0046 §6): once the open segment's age (now - the open
+	// segment's full CreatedAt) reaches this duration, the rollover-
+	// loop goroutine drives the rotation FSM
+	// (STREAMING→DRAIN→SNAPSHOT→BULKCOPY→COMMIT→STREAMING) over the
+	// SAME CDC handle, appending a fresh segment to the lineage and
+	// continuing. Rotation is ALWAYS in-process — there is no operator
+	// wrapper / clean-exit model (the Phase-1 --exit-after-* knobs are
+	// removed in v0.67.0).
 	//
-	// GitHub issue #20 chunk 14b phase 1: operator wraps `sluice
-	// backup stream run` in a cron / systemd / supervisord loop that
-	// detects the clean exit and restarts the stream with a fresh
-	// --output-dir for the next chain. Phase 2 (v0.52.0+) will
-	// implement in-process rotation that doesn't require the operator
-	// wrapper.
-	//
-	// Zero disables the threshold (preserves pre-v0.51.0 unbounded
-	// behaviour).
-	ExitAfterAge time.Duration
+	// Zero disables rotation (an unbounded single segment — the
+	// pre-rotation behaviour).
+	RetainRotateAt time.Duration
 
-	// ExitAfterChainLength, when > 0, causes [BackupStream.Run] to
-	// exit cleanly after this many incrementals have been committed.
-	// Same chain.json marking as [ExitAfterAge]. Either threshold
-	// fires first wins.
+	// RetainRotateAtChainLength, when > 0, rotates after this many
+	// incrementals have been committed to the open segment. Either
+	// threshold firing wins (length checked first — no I/O).
 	//
-	// Zero disables the threshold.
-	ExitAfterChainLength int
+	// Zero disables the length threshold.
+	RetainRotateAtChainLength int
+
+	// Codec is the operator's --compression choice for chunks written
+	// by this stream. Consulted only to pin a never-catalogued open
+	// segment's codec; the lineage's recorded codec wins once set.
+	// Each rotation-opened segment is written with this codec. Empty
+	// resolves to gzip (pre-ADR default).
+	Codec Codec
 
 	// Now, when set, overrides the wall-clock-time source for
 	// [ir.Manifest.CreatedAt] and `stream_state.json` timestamps. Used
@@ -280,6 +279,28 @@ type BackupStream struct {
 	// file. Defaults to (os.Getpid, os.Hostname); tests inject a stub
 	// to simulate cross-host conflicts.
 	pidHostFn func() (int, string)
+
+	// segStore is the OPEN segment's store view (b.Store narrowed to
+	// the open segment's Dir; a no-op wrap for the common one-segment
+	// shape). Manifest + chunk writes go here. Repointed by the
+	// rotation FSM's COMMIT to the freshly-opened segment. Set by Run.
+	segStore ir.BackupStore
+
+	// segCodec is the codec of the open segment, threaded into the
+	// change-chunk writer. Set by Run; repointed by rotation.
+	segCodec Codec
+
+	// skipThrough, when non-nil, is the per-segment-boundary
+	// snapshot->CDC dedup floor (= the new segment's anchor S). After
+	// a committed rotation the SAME pump still delivers events in
+	// (P_N, S] that the new full's snapshot already captured; the
+	// rollover loop drops every pump event whose position
+	// precedes-or-equals S and clears this once it sees the first
+	// event strictly after S. Requires the source engine to implement
+	// [ir.PositionMonotonicChecker] (PG + MySQL do); without it the
+	// dedup degrades to "no skip" and restore's idempotent replay
+	// absorbs the overlap.
+	skipThrough *ir.Position
 }
 
 // Run executes the long-running stream. Blocks until ctx is cancelled
@@ -331,12 +352,33 @@ func (b *BackupStream) Run(ctx context.Context) error {
 	}
 	pid, host := pidHost()
 
-	// 1. Concurrent-writer check.
+	// 1. Concurrent-writer check (stream_state.json lives at the
+	//    lineage root — it's a stream-level liveness file, not
+	//    per-segment).
 	if err := b.preflightStreamState(ctx, statePath, rolloverWindow, pid, host, now()); err != nil {
 		return err
 	}
 
-	// 2. Resolve parent manifest.
+	// 1.4. Crash recovery: reconcile any rotation_state.json left by a
+	//    crash mid-FSM BEFORE resolving the open segment, so the open
+	//    segment is the post-recovery truth (≤COMMIT → prior segment;
+	//    >COMMIT → the new segment the atomic write made authoritative).
+	if err := recoverRotationState(ctx, b.Store); err != nil {
+		return fmt.Errorf("stream: rotation recovery: %w", err)
+	}
+
+	// 1.5. Resolve the OPEN segment: rollovers append to it under its
+	//    Dir + recorded codec (ADR-0046). For a never-rotated backup
+	//    that's the root (Dir == "") — byte-identical to the pre-ADR
+	//    single chain. Rotation repoints b.segStore / b.segCodec.
+	segStore, segCodec, err := openSegmentStore(ctx, b.Store, b.Codec)
+	if err != nil {
+		return fmt.Errorf("stream: resolve open segment: %w", err)
+	}
+	b.segStore = segStore
+	b.segCodec = segCodec
+
+	// 2. Resolve parent manifest (within the open segment).
 	parent, parentPath, err := b.resolveParent(ctx)
 	if err != nil {
 		return fmt.Errorf("stream: resolve parent: %w", err)
@@ -456,15 +498,14 @@ func (b *BackupStream) Run(ctx context.Context) error {
 				if roll.Manifest != nil && len(roll.Manifest.ChangeChunks) > 0 {
 					commitCtx, commitCancel := context.WithTimeout(context.WithoutCancel(ctx), stopDrainTimeout)
 					manifestPath := buildIncrementalManifestPath(roll.Manifest)
-					if err := writeManifestAt(commitCtx, b.Store, manifestPath, roll.Manifest); err != nil {
+					if err := writeManifestAt(commitCtx, b.segStore, manifestPath, roll.Manifest); err != nil {
 						slog.WarnContext(ctx, "stream: drain-commit of in-flight manifest failed",
 							slog.String("err", err.Error()),
 						)
 					} else {
-						// GitHub #20 (v0.47.0): keep the chain.json
-						// catalog in sync on the drain-commit path
-						// too. Same best-effort posture.
-						updateChainCatalogBestEffort(commitCtx, b.Store, roll.Manifest, manifestPath, manifestFileCount(roll.Manifest))
+						// ADR-0046: append to the open segment in
+						// lineage.json on the drain-commit path too.
+						updateLineageForManifestBestEffort(commitCtx, b.Store, roll.Manifest, manifestPath, b.segCodec)
 						slog.InfoContext(ctx, "stream rollover committed (drain on ctx-cancel)",
 							slog.String("manifest_path", manifestPath),
 							slog.String("backup_id", roll.Manifest.BackupID),
@@ -591,11 +632,12 @@ func (b *BackupStream) Run(ctx context.Context) error {
 		}
 
 		manifestPath := buildIncrementalManifestPath(roll.Manifest)
-		if err := writeManifestAt(ctx, b.Store, manifestPath, roll.Manifest); err != nil {
+		if err := writeManifestAt(ctx, b.segStore, manifestPath, roll.Manifest); err != nil {
 			return fmt.Errorf("stream: write rollover manifest: %w", err)
 		}
-		// GitHub #20 (v0.47.0): keep the chain.json catalog in sync.
-		updateChainCatalogBestEffort(ctx, b.Store, roll.Manifest, manifestPath, manifestFileCount(roll.Manifest))
+		// ADR-0046: append this rollover to the open segment in
+		// lineage.json (best-effort for the non-rotation path).
+		updateLineageForManifestBestEffort(ctx, b.Store, roll.Manifest, manifestPath, b.segCodec)
 
 		if roll.StopRequested {
 			// Stop observed during the window: commit the in-flight
@@ -658,22 +700,59 @@ func (b *BackupStream) Run(ctx context.Context) error {
 		startPos = roll.Manifest.EndPosition
 		rolloverSeq++
 
-		// GitHub #20 chunk 14b phase 1 (v0.51.0): rotation-EXIT
-		// signal. After each successful rollover, check the
-		// configured thresholds. When either trips, mark the
-		// chain.json as rotated + exit cleanly so an operator wrapper
-		// (cron / systemd / supervisord) can restart the stream
-		// pointing at a fresh --output-dir for the next chain. Phase
-		// 2 (v0.52.0+) will implement in-process rotation that
-		// doesn't require the operator wrapper.
-		if reason := b.shouldExitForRotation(ctx, rolloverSeq, now()); reason != "" {
-			markChainRotatedBestEffort(ctx, b.Store, reason, now())
-			slog.InfoContext(ctx, "stream: rotation threshold reached; exiting cleanly",
-				slog.String("rotation_reason", reason),
-				slog.Int("rollovers", rolloverSeq),
-				slog.String("hint", "restart sluice backup stream run with a fresh --output-dir for the next chain; the previous chain.json is marked rotated"),
-			)
-			return nil
+		// ADR-0046 §2/§6: in-process rotation. After each successful
+		// rollover, check the rotation thresholds against the OPEN
+		// segment. When one trips, drive the rotation FSM
+		// (DRAIN→SNAPSHOT→BULKCOPY→COMMIT) over the SAME cdc handle:
+		// it caps the open segment, opens a fresh segment whose full's
+		// snapshot anchor S is hard-asserted S>=P_N, and continues
+		// streaming on the same handle from S. Rotation is in-process;
+		// there is no clean-exit / operator-wrapper model.
+		if reason := b.shouldRotate(ctx, rolloverSeq, now()); reason != "" {
+			res, rotErr := b.performRotation(ctx, rotateInputs{
+				reason:        reason,
+				lastCommitted: currentParent,
+				changesCh:     changesCh,
+				now:           now,
+				clockNow:      clockNow,
+			})
+			if rotErr != nil {
+				// S>=P_N hard-fail or any FSM step failure: loud abort,
+				// STAY on the open segment (never silently gap). The
+				// stream continues streaming the still-open prior
+				// segment from its persisted position.
+				if errors.Is(rotErr, errRotationAbortStayOpen) {
+					slog.ErrorContext(ctx, "stream: rotation aborted; staying on the open segment (no gap introduced)",
+						slog.String("rotation_reason", reason),
+						slog.String("err", rotErr.Error()),
+					)
+				} else {
+					return wrapWithHint(PhaseCDC, fmt.Errorf("stream: rotation (%s): %w", reason, rotErr))
+				}
+			} else {
+				// Rotation committed: the new segment is authoritative.
+				// Re-point the rollover loop at the new open segment +
+				// its CDC resume position S; the SAME cdc handle keeps
+				// streaming (no slot re-open).
+				b.segStore = res.newSegStore
+				b.segCodec = res.newSegCodec
+				changesCh = res.changesCh
+				currentParent = res.newFull
+				startPos = res.resumePos
+				// Per-segment-boundary snapshot->CDC dedup: the SAME
+				// pump will still deliver events in (P_N, S] that the
+				// new full's snapshot at S already captured. Drop pump
+				// events whose position precedes-or-equals S so the
+				// new segment's first incremental begins strictly
+				// after S (StartPosition = S stays consistent).
+				b.skipThrough = &res.resumePos
+				rolloverSeq = 0
+				slog.InfoContext(ctx, "stream: rotation committed; continuing on new segment",
+					slog.String("rotation_reason", reason),
+					slog.String("new_segment_dir", res.newSegDir),
+					slog.String("anchor_token", res.resumePos.Token),
+				)
+			}
 		}
 
 		// Source-channel-closed: pump terminated (test fakes that
@@ -686,89 +765,6 @@ func (b *BackupStream) Run(ctx context.Context) error {
 			return nil
 		}
 	}
-}
-
-// shouldExitForRotation returns a non-empty rotation reason when one
-// of the rotation thresholds has tripped. The caller marks the chain
-// and exits cleanly. Returns "" when no threshold is configured or
-// none has fired yet.
-//
-// Threshold semantics:
-//
-//   - ExitAfterChainLength: rolloverSeq has reached the configured
-//     number of incrementals. Cheaper to check (no I/O).
-//   - ExitAfterAge: now - chain catalog's CreatedAt has exceeded the
-//     configured duration. Reads chain.json once per call when
-//     active; the chain catalog is the authoritative anchor for
-//     "chain age" (stable across stream restarts mid-chain).
-//
-// Either threshold firing returns the corresponding reason; chain-
-// length checked first so length-based rotation doesn't pay the
-// chain.json read cost.
-func (b *BackupStream) shouldExitForRotation(ctx context.Context, rolloverSeq int, now time.Time) string {
-	if b.ExitAfterChainLength > 0 && rolloverSeq >= b.ExitAfterChainLength {
-		return rotationReasonChainLength
-	}
-	if b.ExitAfterAge > 0 {
-		cat, present, err := loadChainCatalog(ctx, b.Store)
-		if err != nil || !present || cat.CreatedAt.IsZero() {
-			// Catalog absent / unreadable — fall back silently. The
-			// chain.json should always be present after v0.47.0 +
-			// at least one rollover, so this path means either a
-			// pre-v0.47.0 chain or an I/O blip. Conservative: don't
-			// exit, let the operator surface the issue via the next
-			// rollover's catalog-update path.
-			return ""
-		}
-		if now.Sub(cat.CreatedAt) >= b.ExitAfterAge {
-			return rotationReasonAge
-		}
-	}
-	return ""
-}
-
-const (
-	// rotationReasonAge is the chain.json RotationReason when
-	// ExitAfterAge fires. Stable string for cross-version tooling.
-	rotationReasonAge = "retain-rotate-at"
-
-	// rotationReasonChainLength is the chain.json RotationReason when
-	// ExitAfterChainLength fires.
-	rotationReasonChainLength = "rotate-at-chain-length"
-)
-
-// markChainRotatedBestEffort updates the chain.json catalog at
-// store's root to record that the chain has been closed by a
-// rotation event. Best-effort: failures log at WARN but don't fail
-// the stream exit (the chain is intact on disk; missing the rotation
-// marker just means tooling can't tell automatically that this chain
-// is closed — operator-recoverable).
-func markChainRotatedBestEffort(ctx context.Context, store ir.BackupStore, reason string, when time.Time) {
-	cat, present, err := loadChainCatalog(ctx, store)
-	if err != nil || !present {
-		slog.WarnContext(ctx, "stream: chain.json absent or unreadable; rotation marker not written",
-			slog.String("err", errOrEmpty(err)),
-			slog.String("rotation_reason", reason),
-		)
-		return
-	}
-	cat.RotatedAt = when.UTC()
-	cat.RotationReason = reason
-	cat.UpdatedAt = when.UTC()
-	if err := writeChainCatalog(ctx, store, cat); err != nil {
-		slog.WarnContext(ctx, "stream: failed to write rotation marker into chain.json",
-			slog.String("err", err.Error()),
-			slog.String("rotation_reason", reason),
-		)
-		return
-	}
-}
-
-func errOrEmpty(err error) string {
-	if err == nil {
-		return ""
-	}
-	return err.Error()
 }
 
 // validate sanity-checks required fields. Mirrors
@@ -793,7 +789,9 @@ func (b *BackupStream) validate() error {
 // [IncrementalBackup.resolveParent] but doesn't return the path
 // because the stream doesn't need it post-resolve.
 func (b *BackupStream) resolveParent(ctx context.Context) (*ir.Manifest, string, error) {
-	manifests, err := listAllManifests(ctx, b.Store)
+	// A stream chains off a manifest in the OPEN segment (b.segStore
+	// is already narrowed to its Dir).
+	manifests, err := listAllManifestsViaWalk(ctx, b.segStore)
 	if err != nil {
 		return nil, "", err
 	}
@@ -1076,7 +1074,7 @@ func (b *BackupStream) captureWindow(
 		path := changeChunkPath(runNamespace, chunkIdx)
 		hash := writer.Hash()
 		nb := int64(buf.Len())
-		if err := b.Store.Put(putCtx, path, buf); err != nil {
+		if err := b.segStore.Put(putCtx, path, buf); err != nil {
 			return fmt.Errorf("store put %q: %w", path, err)
 		}
 		ci := &ir.ChunkInfo{
@@ -1109,7 +1107,7 @@ func (b *BackupStream) captureWindow(
 			return fmt.Errorf("resolve chunk cek: %w", err)
 		}
 		curWrappedCEK = wrapped
-		w, err := newChangeChunkWriter(buf, cek)
+		w, err := newChangeChunkWriter(buf, cek, b.segCodec)
 		if err != nil {
 			return fmt.Errorf("open chunk: %w", err)
 		}
@@ -1215,6 +1213,30 @@ func (b *BackupStream) captureWindow(
 					return out, err
 				}
 				return out, nil
+			}
+			// Per-segment-boundary snapshot->CDC dedup. After a
+			// committed rotation the SAME pump still delivers events
+			// in (P_N, S] that the new full's snapshot at S already
+			// captured; drop them so the new segment's first
+			// incremental begins strictly after S. Cleared on the
+			// first event past S. Mirrors the dedup the initial
+			// full->stream handoff does server-side.
+			if b.skipThrough != nil {
+				cp := change.Pos()
+				if cp.Engine == "" && cp.Token == "" {
+					// Position-less tx boundary while still skipping --
+					// drop it (it belongs to the skipped prefix).
+					continue
+				}
+				if chk, ok := b.Source.(ir.PositionMonotonicChecker); ok {
+					le, cerr := chk.PrecedesOrEqual(cp, *b.skipThrough)
+					if cerr == nil && le {
+						continue // event <= S: in the new full snapshot
+					}
+				}
+				// First event strictly after S (or no comparator):
+				// stop skipping; this event starts the new segment.
+				b.skipThrough = nil
 			}
 			switch change.(type) {
 			case ir.TxBegin:
@@ -1360,7 +1382,7 @@ func newShellCommand(ctx context.Context, cmdStr string) *exec.Cmd {
 // of the parent's WrappedCEK fails with `aes-gcm open: cipher:
 // message authentication failed`.
 func (b *BackupStream) alignEncryption(ctx context.Context, parent *ir.Manifest) ([]byte, error) {
-	parentEnc := chainRootEncryption(ctx, b.Store, parent)
+	parentEnc := chainRootEncryption(ctx, b.segStore, parent)
 	switch {
 	case parentEnc == nil && b.Encryption == nil:
 		return nil, nil

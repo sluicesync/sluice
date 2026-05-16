@@ -25,9 +25,11 @@ import (
 	"github.com/orware/sluice/internal/ir"
 )
 
-// LoadChainTerminalPosition reads every manifest in store, validates
-// the chain's shape via [buildChain], and returns the [ir.Position]
-// at the chain's terminal manifest. Used as the position source by
+// LoadChainTerminalPosition walks the lineage, validates its shape
+// via [buildLineageChain] (the single boundary-monotonicity
+// invariant, intra- and inter-segment), and returns the [ir.Position]
+// at the lineage's terminal manifest (the open segment's last
+// committed incremental). Used as the position source by
 // `sluice sync start --position-from-manifest`.
 //
 // Errors loudly when:
@@ -39,9 +41,13 @@ import (
 //     pre-Phase-3.3 v0.16.x or v0.17.0 full with no recorded position;
 //     the chain handoff path has nowhere to start)
 func LoadChainTerminalPosition(ctx context.Context, store ir.BackupStore) (ir.Position, error) {
-	chain, err := buildChain(ctx, store)
+	// nil comparator: position-from-manifest only reads the terminal
+	// position; the structural + write-time guarantees suffice (no
+	// source engine instance available here without breaking the
+	// pipeline's no-engine-registry layering).
+	chain, err := buildLineageChain(ctx, store, nil)
 	if err != nil {
-		return ir.Position{}, fmt.Errorf("position-from-manifest: build chain: %w", err)
+		return ir.Position{}, fmt.Errorf("position-from-manifest: build lineage: %w", err)
 	}
 	if len(chain) == 0 {
 		return ir.Position{}, errors.New("position-from-manifest: store contains no manifests")

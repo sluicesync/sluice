@@ -107,7 +107,7 @@ func TestBackupStream_MySQL_RolloverByMaxChanges(t *testing.T) {
 	deadline := time.Now().Add(45 * time.Second)
 	var lastCount, stableTicks int
 	for time.Now().Before(deadline) {
-		records, _ := listAllManifests(context.Background(), store)
+		records, _ := listAllManifestsViaWalk(context.Background(), store)
 		var incrCount int
 		for _, r := range records {
 			if r.manifest.Kind == ir.BackupKindIncremental {
@@ -136,7 +136,7 @@ func TestBackupStream_MySQL_RolloverByMaxChanges(t *testing.T) {
 		t.Fatal("stream.Run did not exit within 10s")
 	}
 
-	records, _ := listAllManifests(context.Background(), store)
+	records, _ := listAllManifestsViaWalk(context.Background(), store)
 	var incrementals []*ir.Manifest
 	for _, r := range records {
 		if r.manifest.Kind == ir.BackupKindIncremental {

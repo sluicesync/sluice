@@ -5,173 +5,210 @@ package pipeline
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/orware/sluice/internal/ir"
 )
 
-// TestShouldExitForRotation_ChainLengthFires covers the
-// length-based threshold: when rolloverSeq reaches the configured
-// value, the reason returned is rotationReasonChainLength.
-func TestShouldExitForRotation_ChainLengthFires(t *testing.T) {
-	b := &BackupStream{ExitAfterChainLength: 3}
-	reason := b.shouldExitForRotation(context.Background(), 3, time.Now())
-	if reason != rotationReasonChainLength {
-		t.Errorf("rolloverSeq=3, ExitAfterChainLength=3 → reason = %q; want %q", reason, rotationReasonChainLength)
+// fakeMonotonicEngine is a fakeCDCEngine that also implements
+// [ir.PositionMonotonicChecker] so the S>=P_N hard-fail can be
+// exercised deterministically (the ADR-0046 falsification test).
+type fakeMonotonicEngine struct {
+	fakeCDCEngine
+	// order maps a token to its rank; PrecedesOrEqual(a,b) is
+	// rank[a] <= rank[b]. An unknown token errors (cannot prove
+	// monotonic → FSM hard-aborts).
+	order map[string]int
+}
+
+func (e *fakeMonotonicEngine) PrecedesOrEqual(a, b ir.Position) (bool, error) {
+	ra, oka := e.order[a.Token]
+	rb, okb := e.order[b.Token]
+	if !oka || !okb {
+		return false, fmt.Errorf("fake: unknown token (a=%q ok=%v, b=%q ok=%v)", a.Token, oka, b.Token, okb)
+	}
+	return ra <= rb, nil
+}
+
+// TestAssertAnchorMonotonic_HardFailFires is THE injected-violation
+// proof (ADR-0046 gotcha #1): when the new segment anchor S regresses
+// before the prior segment end P_N, assertAnchorMonotonic returns a
+// loud error so performRotation aborts-and-stays-open (never gaps).
+func TestAssertAnchorMonotonic_HardFailFires(t *testing.T) {
+	eng := &fakeMonotonicEngine{
+		fakeCDCEngine: fakeCDCEngine{name: "postgres"},
+		order:         map[string]int{"P_N": 100, "S_BAD": 50, "S_OK": 100, "S_AHEAD": 200},
+	}
+	pN := ir.Position{Engine: "postgres", Token: "P_N"}
+
+	badS := ir.Position{Engine: "postgres", Token: "S_BAD"}
+	err := assertAnchorMonotonic(eng, pN, badS)
+	if err == nil || !strings.Contains(err.Error(), "S>=P_N hard-fail") || !strings.Contains(err.Error(), "regressed") {
+		t.Fatalf("S<P_N: err = %v; want loud S>=P_N hard-fail", err)
+	}
+	if err := assertAnchorMonotonic(eng, pN, ir.Position{Engine: "postgres", Token: "S_OK"}); err != nil {
+		t.Errorf("S==P_N: err = %v; want nil (contiguous boundary is valid)", err)
+	}
+	if err := assertAnchorMonotonic(eng, pN, ir.Position{Engine: "postgres", Token: "S_AHEAD"}); err != nil {
+		t.Errorf("S>P_N: err = %v; want nil", err)
 	}
 }
 
-// TestShouldExitForRotation_ChainLengthNotYet covers the under-
-// threshold case (no exit).
-func TestShouldExitForRotation_ChainLengthNotYet(t *testing.T) {
-	b := &BackupStream{ExitAfterChainLength: 5}
-	if reason := b.shouldExitForRotation(context.Background(), 2, time.Now()); reason != "" {
-		t.Errorf("rolloverSeq=2, ExitAfterChainLength=5 → reason = %q; want empty", reason)
+// TestAssertAnchorMonotonic_EmptyAndEngineMismatch: the non-empty /
+// engine-match guards always fire, even without a comparator.
+func TestAssertAnchorMonotonic_EmptyAndEngineMismatch(t *testing.T) {
+	plain := &fakeCDCEngine{name: "postgres"} // no PositionMonotonicChecker
+	pN := ir.Position{Engine: "postgres", Token: "P_N"}
+	if err := assertAnchorMonotonic(plain, pN, ir.Position{}); err == nil ||
+		!strings.Contains(err.Error(), "anchor is empty") {
+		t.Errorf("empty S: err = %v; want empty-anchor refusal", err)
+	}
+	if err := assertAnchorMonotonic(plain, pN, ir.Position{Engine: "mysql", Token: "x"}); err == nil ||
+		!strings.Contains(err.Error(), "anchor engine") {
+		t.Errorf("engine mismatch: err = %v; want engine-mismatch refusal", err)
+	}
+	if err := assertAnchorMonotonic(plain, pN, ir.Position{Engine: "postgres", Token: "S"}); err != nil {
+		t.Errorf("no-comparator same-engine: err = %v; want nil (structural guarantee)", err)
 	}
 }
 
-// TestShouldExitForRotation_AgeFires covers the age-based threshold:
-// when (now - chain catalog's CreatedAt) exceeds ExitAfterAge, the
-// reason is rotationReasonAge.
-func TestShouldExitForRotation_AgeFires(t *testing.T) {
+// TestAssertAnchorMonotonic_CannotProveIsHardFail: a comparator that
+// errors (unknown token — cannot prove monotonic) is a hard-fail.
+func TestAssertAnchorMonotonic_CannotProveIsHardFail(t *testing.T) {
+	eng := &fakeMonotonicEngine{
+		fakeCDCEngine: fakeCDCEngine{name: "postgres"},
+		order:         map[string]int{"P_N": 1},
+	}
+	err := assertAnchorMonotonic(eng,
+		ir.Position{Engine: "postgres", Token: "P_N"},
+		ir.Position{Engine: "postgres", Token: "UNKNOWN"})
+	if err == nil || !strings.Contains(err.Error(), "cannot prove monotonic") {
+		t.Fatalf("unknown token: err = %v; want cannot-prove hard-fail", err)
+	}
+}
+
+// TestShouldRotate_LengthFires: length threshold fires without
+// touching the lineage (no I/O), preferred over age.
+func TestShouldRotate_LengthFires(t *testing.T) {
+	b := &BackupStream{RetainRotateAtChainLength: 3, Store: newMemStore()}
+	if r := b.shouldRotate(context.Background(), 3, time.Now()); r != rotationReasonChainLength {
+		t.Errorf("seq=3 len=3 → %q; want %q", r, rotationReasonChainLength)
+	}
+	if r := b.shouldRotate(context.Background(), 2, time.Now()); r != "" {
+		t.Errorf("seq=2 len=3 → %q; want empty", r)
+	}
+}
+
+// TestShouldRotate_AgeFromOpenSegmentFull: age measured from the OPEN
+// segment's full CreatedAt (stable across stream restarts).
+func TestShouldRotate_AgeFromOpenSegmentFull(t *testing.T) {
 	store := newMemStore()
-	createdAt := time.Now().Add(-2 * time.Hour).UTC()
-	cat := &ChainCatalog{
-		FormatVersion: chainCatalogFormatVersion,
-		CreatedAt:     createdAt,
-		UpdatedAt:     createdAt,
-		Entries: []ChainCatalogEntry{
-			{BackupID: "full000", Kind: ir.BackupKindFull, ManifestPath: ManifestFileName, CreatedAt: createdAt},
+	created := time.Date(2026, 5, 16, 0, 0, 0, 0, time.UTC)
+	full := &ir.Manifest{
+		FormatVersion: ir.BackupFormatVersion, CreatedAt: created,
+		SourceEngine: "postgres", Kind: ir.BackupKindFull,
+		EndPosition:  ir.Position{Engine: "postgres", Token: "0/100"},
+		PartialState: ir.BackupStateComplete,
+	}
+	full.BackupID = ir.ComputeBackupID(full)
+	mustWriteManifest(t, store, ManifestFileName, full)
+	updateLineageForManifestBestEffort(context.Background(), store, full, ManifestFileName, CodecGzip)
+
+	b := &BackupStream{RetainRotateAt: time.Hour, Store: store}
+	if r := b.shouldRotate(context.Background(), 0, created.Add(2*time.Hour)); r != rotationReasonAge {
+		t.Errorf("age 2h thresh 1h → %q; want %q", r, rotationReasonAge)
+	}
+	if r := b.shouldRotate(context.Background(), 0, created.Add(30*time.Minute)); r != "" {
+		t.Errorf("age 30m thresh 1h → %q; want empty", r)
+	}
+	none := &BackupStream{Store: store}
+	if r := none.shouldRotate(context.Background(), 1_000_000, created.Add(99*time.Hour)); r != "" {
+		t.Errorf("no thresholds → %q; want empty", r)
+	}
+}
+
+// TestRecoverRotationState_PreCommitDiscards: provisional segment NOT
+// in the lineage is ≤COMMIT — discard it, clear the marker, prior
+// open segment intact.
+func TestRecoverRotationState_PreCommitDiscards(t *testing.T) {
+	store := newMemStore()
+	cat := &LineageCatalog{
+		FormatVersion: 1, SourceEngine: "postgres",
+		Segments: []LineageSegment{{SegmentID: "s0", Dir: "", FullManifestPath: ManifestFileName, Codec: CodecGzip}},
+	}
+	if err := writeLineageCatalog(context.Background(), store, cat); err != nil {
+		t.Fatal(err)
+	}
+	st := &rotationState{Phase: rotationPhaseBulkCopy, Reason: rotationReasonAge, ProvisionalDir: "seg-999"}
+	if err := writeRotationState(context.Background(), store, st); err != nil {
+		t.Fatal(err)
+	}
+	_ = store.Put(context.Background(), "seg-999/manifest.json", strings.NewReader("{}"))
+
+	if err := recoverRotationState(context.Background(), store); err != nil {
+		t.Fatalf("recoverRotationState: %v", err)
+	}
+	if ex, _ := store.Exists(context.Background(), RotationStateFileName); ex {
+		t.Error("rotation_state.json not cleared after ≤COMMIT recovery")
+	}
+	if ex, _ := store.Exists(context.Background(), "seg-999/manifest.json"); ex {
+		t.Error("provisional segment not discarded after ≤COMMIT recovery")
+	}
+	got, _, _ := loadLineageCatalog(context.Background(), store)
+	if len(got.Segments) != 1 {
+		t.Errorf("segments = %d; want 1 (prior segment intact)", len(got.Segments))
+	}
+}
+
+// TestRecoverRotationState_PostCommitKeeps: provisional segment IS in
+// the lineage is >COMMIT — new segment authoritative, marker cleared.
+func TestRecoverRotationState_PostCommitKeeps(t *testing.T) {
+	store := newMemStore()
+	capped := time.Now().UTC()
+	cat := &LineageCatalog{
+		FormatVersion: 1, SourceEngine: "postgres",
+		Segments: []LineageSegment{
+			{
+				SegmentID: "s0", Dir: "", FullManifestPath: ManifestFileName,
+				CappedAt: &capped, CapReason: rotationReasonAge, Codec: CodecGzip,
+			},
+			{SegmentID: "s1", Dir: "seg-777", FullManifestPath: ManifestFileName, Codec: CodecGzip},
 		},
 	}
-	if err := writeChainCatalog(context.Background(), store, cat); err != nil {
-		t.Fatalf("writeChainCatalog: %v", err)
+	if err := writeLineageCatalog(context.Background(), store, cat); err != nil {
+		t.Fatal(err)
 	}
-
-	b := &BackupStream{Store: store, ExitAfterAge: 1 * time.Hour}
-	reason := b.shouldExitForRotation(context.Background(), 0, time.Now())
-	if reason != rotationReasonAge {
-		t.Errorf("chain age 2h, ExitAfterAge=1h → reason = %q; want %q", reason, rotationReasonAge)
+	st := &rotationState{Phase: rotationPhaseCommit, Reason: rotationReasonAge, ProvisionalDir: "seg-777"}
+	if err := writeRotationState(context.Background(), store, st); err != nil {
+		t.Fatal(err)
 	}
-}
-
-// TestShouldExitForRotation_AgeNotYet covers the chain-still-young
-// case.
-func TestShouldExitForRotation_AgeNotYet(t *testing.T) {
-	store := newMemStore()
-	createdAt := time.Now().Add(-30 * time.Minute).UTC()
-	cat := &ChainCatalog{
-		FormatVersion: chainCatalogFormatVersion,
-		CreatedAt:     createdAt,
-		UpdatedAt:     createdAt,
-		Entries: []ChainCatalogEntry{
-			{BackupID: "full000", Kind: ir.BackupKindFull, ManifestPath: ManifestFileName, CreatedAt: createdAt},
-		},
+	if err := recoverRotationState(context.Background(), store); err != nil {
+		t.Fatalf("recoverRotationState: %v", err)
 	}
-	if err := writeChainCatalog(context.Background(), store, cat); err != nil {
-		t.Fatalf("writeChainCatalog: %v", err)
+	if ex, _ := store.Exists(context.Background(), RotationStateFileName); ex {
+		t.Error("rotation_state.json not cleared after >COMMIT recovery")
 	}
-
-	b := &BackupStream{Store: store, ExitAfterAge: 1 * time.Hour}
-	if reason := b.shouldExitForRotation(context.Background(), 0, time.Now()); reason != "" {
-		t.Errorf("chain age 30m, ExitAfterAge=1h → reason = %q; want empty", reason)
+	got, _, _ := loadLineageCatalog(context.Background(), store)
+	if len(got.Segments) != 2 || got.Segments[0].open() {
+		t.Errorf("post-COMMIT lineage = %+v; want 2 segments, seg0 capped", got.Segments)
 	}
 }
 
-// TestShouldExitForRotation_LengthPreferredOverAge covers the
-// either-fires-wins semantic when both thresholds are configured: if
-// length trips first, the length reason takes priority over an age
-// check that would have also tripped.
-func TestShouldExitForRotation_LengthPreferredOverAge(t *testing.T) {
+// TestRecoverRotationState_AbsentAndCorrupt: a missing marker is a
+// no-op; a corrupt marker is treated as ≤COMMIT (cleared).
+func TestRecoverRotationState_AbsentAndCorrupt(t *testing.T) {
 	store := newMemStore()
-	createdAt := time.Now().Add(-2 * time.Hour).UTC()
-	cat := &ChainCatalog{
-		FormatVersion: chainCatalogFormatVersion,
-		CreatedAt:     createdAt,
-		UpdatedAt:     createdAt,
-		Entries: []ChainCatalogEntry{
-			{BackupID: "full000", Kind: ir.BackupKindFull, ManifestPath: ManifestFileName, CreatedAt: createdAt},
-		},
+	if err := recoverRotationState(context.Background(), store); err != nil {
+		t.Fatalf("absent marker: %v", err)
 	}
-	if err := writeChainCatalog(context.Background(), store, cat); err != nil {
-		t.Fatalf("writeChainCatalog: %v", err)
+	store.data[RotationStateFileName] = []byte("{not json")
+	if err := recoverRotationState(context.Background(), store); err != nil {
+		t.Fatalf("corrupt marker: %v", err)
 	}
-
-	b := &BackupStream{Store: store, ExitAfterAge: 1 * time.Hour, ExitAfterChainLength: 3}
-	reason := b.shouldExitForRotation(context.Background(), 3, time.Now())
-	if reason != rotationReasonChainLength {
-		t.Errorf("both thresholds tripped → reason = %q; want %q (length checked first)", reason, rotationReasonChainLength)
-	}
-}
-
-// TestShouldExitForRotation_NoneConfigured covers the default-off
-// case: both thresholds zero → never fires.
-func TestShouldExitForRotation_NoneConfigured(t *testing.T) {
-	store := newMemStore()
-	b := &BackupStream{Store: store}
-	if reason := b.shouldExitForRotation(context.Background(), 1000, time.Now()); reason != "" {
-		t.Errorf("no thresholds configured → reason = %q; want empty", reason)
-	}
-}
-
-// TestShouldExitForRotation_CatalogAbsentSilentlySkipsAge covers the
-// fall-back path: when chain.json is missing, the age check returns
-// empty (conservative; the operator should resolve the catalog
-// issue, not exit silently).
-func TestShouldExitForRotation_CatalogAbsentSilentlySkipsAge(t *testing.T) {
-	store := newMemStore()
-	b := &BackupStream{Store: store, ExitAfterAge: 1 * time.Hour}
-	if reason := b.shouldExitForRotation(context.Background(), 0, time.Now()); reason != "" {
-		t.Errorf("catalog absent → reason = %q; want empty (conservative fall-back)", reason)
-	}
-}
-
-// TestMarkChainRotatedBestEffort_WritesMarker covers the chain.json
-// marking on rotation: the RotatedAt + RotationReason fields land in
-// the catalog so subsequent reads see the chain is closed.
-func TestMarkChainRotatedBestEffort_WritesMarker(t *testing.T) {
-	store := newMemStore()
-	cat := &ChainCatalog{
-		FormatVersion: chainCatalogFormatVersion,
-		CreatedAt:     time.Now().UTC(),
-		UpdatedAt:     time.Now().UTC(),
-		Entries: []ChainCatalogEntry{
-			{BackupID: "full000", Kind: ir.BackupKindFull, ManifestPath: ManifestFileName, CreatedAt: time.Now().UTC()},
-		},
-	}
-	if err := writeChainCatalog(context.Background(), store, cat); err != nil {
-		t.Fatalf("writeChainCatalog: %v", err)
-	}
-
-	rotateAt := time.Now().UTC()
-	markChainRotatedBestEffort(context.Background(), store, rotationReasonAge, rotateAt)
-
-	got, ok, err := loadChainCatalog(context.Background(), store)
-	if err != nil || !ok {
-		t.Fatalf("loadChainCatalog: ok=%v err=%v", ok, err)
-	}
-	if got.RotationReason != rotationReasonAge {
-		t.Errorf("RotationReason = %q; want %q", got.RotationReason, rotationReasonAge)
-	}
-	if got.RotatedAt.IsZero() {
-		t.Errorf("RotatedAt not set after markChainRotatedBestEffort")
-	}
-}
-
-// TestMarkChainRotatedBestEffort_AbsentCatalogNoOp covers the
-// chain.json-absent path: the function silently no-ops rather than
-// erroring, so a stream exit with a missing catalog doesn't fail.
-func TestMarkChainRotatedBestEffort_AbsentCatalogNoOp(t *testing.T) {
-	store := newMemStore()
-	// No panic / no error; just a WARN log entry.
-	markChainRotatedBestEffort(context.Background(), store, rotationReasonAge, time.Now().UTC())
-	// Catalog still absent.
-	_, present, err := loadChainCatalog(context.Background(), store)
-	if err != nil {
-		t.Errorf("loadChainCatalog: unexpected err %v", err)
-	}
-	if present {
-		t.Errorf("catalog should not have been created by no-op marker write")
+	if ex, _ := store.Exists(context.Background(), RotationStateFileName); ex {
+		t.Error("corrupt marker not cleared (should be treated as ≤COMMIT)")
 	}
 }

@@ -5,6 +5,7 @@ package pipeline
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -33,130 +34,220 @@ func makeManifest(t *testing.T, kind string, parent *ir.Manifest, lsn string) *i
 	return m
 }
 
-func TestBuildChain_SingleFull(t *testing.T) {
+// seedSegment writes a single segment's full + incrementals into a
+// per-segment store and returns the LineageSegment describing it. dir
+// == "" is the root (one-segment) layout.
+func seedSegment(t *testing.T, root ir.BackupStore, dir string, full *ir.Manifest, incrs []*ir.Manifest, codec Codec) LineageSegment {
+	t.Helper()
+	ss := newPrefixedStore(root, dir)
+	if err := writeManifestAt(context.Background(), ss, ManifestFileName, full); err != nil {
+		t.Fatalf("write seg full: %v", err)
+	}
+	seg := LineageSegment{
+		SegmentID:        manifestBackupID(full),
+		Dir:              dir,
+		FullManifestPath: ManifestFileName,
+		StartPosition:    full.EndPosition,
+		EndPosition:      full.EndPosition,
+		Codec:            codec,
+	}
+	for i, m := range incrs {
+		p := "manifests/incr-" + fmt.Sprintf("%04d", i) + ".json"
+		if err := writeManifestAt(context.Background(), ss, p, m); err != nil {
+			t.Fatalf("write seg incr: %v", err)
+		}
+		seg.Incrementals = append(seg.Incrementals, p)
+		seg.EndPosition = m.EndPosition
+	}
+	return seg
+}
+
+func TestBuildLineageChain_SingleSegmentNoIncrementals(t *testing.T) {
 	dir := t.TempDir()
 	store, _ := NewLocalStore(dir)
 	full := makeManifest(t, ir.BackupKindFull, nil, "0/100")
-	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
-		t.Fatalf("write: %v", err)
-	}
-	chain, err := buildChain(context.Background(), store)
+	_ = writeManifestAt(context.Background(), store, ManifestFileName, full)
+	// No lineage.json — resolveLineage synthesises a one-segment
+	// lineage; behaviour byte-identical to a pre-ADR single full.
+	chain, err := buildLineageChain(context.Background(), store, nil)
 	if err != nil {
-		t.Fatalf("buildChain: %v", err)
+		t.Fatalf("buildLineageChain: %v", err)
 	}
-	if len(chain) != 1 {
-		t.Errorf("chain len = %d; want 1", len(chain))
+	if len(chain) != 1 || canonicalKind(chain[0].manifest.Kind) != ir.BackupKindFull {
+		t.Errorf("chain = %+v; want one full link", chain)
 	}
 }
 
-func TestBuildChain_LinearChainOK(t *testing.T) {
+func TestBuildLineageChain_LinearOK(t *testing.T) {
 	dir := t.TempDir()
 	store, _ := NewLocalStore(dir)
 	full := makeManifest(t, ir.BackupKindFull, nil, "0/100")
 	incr1 := makeManifest(t, ir.BackupKindIncremental, full, "0/200")
 	incr2 := makeManifest(t, ir.BackupKindIncremental, incr1, "0/300")
-
-	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
-		t.Fatalf("write full: %v", err)
+	seg := seedSegment(t, store, "", full, []*ir.Manifest{incr1, incr2}, CodecGzip)
+	cat := &LineageCatalog{FormatVersion: 1, SourceEngine: "postgres", Segments: []LineageSegment{seg}}
+	if err := writeLineageCatalog(context.Background(), store, cat); err != nil {
+		t.Fatal(err)
 	}
-	if err := writeManifestAt(context.Background(), store, "manifests/incr-0001-aa.json", incr1); err != nil {
-		t.Fatalf("write incr1: %v", err)
-	}
-	if err := writeManifestAt(context.Background(), store, "manifests/incr-0002-bb.json", incr2); err != nil {
-		t.Fatalf("write incr2: %v", err)
-	}
-
-	chain, err := buildChain(context.Background(), store)
+	chain, err := buildLineageChain(context.Background(), store, nil)
 	if err != nil {
-		t.Fatalf("buildChain: %v", err)
+		t.Fatalf("buildLineageChain: %v", err)
 	}
 	if len(chain) != 3 {
 		t.Fatalf("chain len = %d; want 3", len(chain))
-	}
-	if chain[0].manifest.Kind != ir.BackupKindFull {
-		t.Errorf("chain[0] kind = %q; want full", chain[0].manifest.Kind)
-	}
-	if manifestBackupID(chain[1].manifest) != manifestBackupID(incr1) {
-		t.Errorf("chain[1] is not incr1")
 	}
 	if manifestBackupID(chain[2].manifest) != manifestBackupID(incr2) {
 		t.Errorf("chain[2] is not incr2")
 	}
 }
 
-func TestBuildChain_BranchingRefuses(t *testing.T) {
+// TestBuildLineageChain_MultiSegmentBoundaryOK proves a 3-segment
+// lineage walks end-to-end when seg[i].end == seg[i+1].start.
+func TestBuildLineageChain_MultiSegmentBoundaryOK(t *testing.T) {
 	dir := t.TempDir()
 	store, _ := NewLocalStore(dir)
-	full := makeManifest(t, ir.BackupKindFull, nil, "0/100")
-	incrA := makeManifest(t, ir.BackupKindIncremental, full, "0/200")
-	incrB := makeManifest(t, ir.BackupKindIncremental, full, "0/250") // also chains off full → branch
+	f0 := makeManifest(t, ir.BackupKindFull, nil, "0/100")
+	i0 := makeManifest(t, ir.BackupKindIncremental, f0, "0/200")
+	s0 := seedSegment(t, store, "", f0, []*ir.Manifest{i0}, CodecGzip)
 
-	_ = writeManifestAt(context.Background(), store, ManifestFileName, full)
-	_ = writeManifestAt(context.Background(), store, "manifests/incr-0001-a.json", incrA)
-	_ = writeManifestAt(context.Background(), store, "manifests/incr-0001-b.json", incrB)
+	// seg1 full's StartPosition == seg0.end (0/200). makeManifest sets
+	// EndPosition from the lsn arg; force StartPosition = prior end.
+	f1 := makeManifest(t, ir.BackupKindFull, nil, "0/300")
+	f1.StartPosition = i0.EndPosition
+	f1.BackupID = ir.ComputeBackupID(f1)
+	i1 := makeManifest(t, ir.BackupKindIncremental, f1, "0/400")
+	s1 := seedSegment(t, store, "seg-1", f1, []*ir.Manifest{i1}, CodecNone)
 
-	_, err := buildChain(context.Background(), store)
-	if err == nil || !strings.Contains(err.Error(), "branches") {
-		t.Errorf("err = %v; want branching refusal", err)
+	f2 := makeManifest(t, ir.BackupKindFull, nil, "0/500")
+	f2.StartPosition = i1.EndPosition
+	f2.BackupID = ir.ComputeBackupID(f2)
+	s2 := seedSegment(t, store, "seg-2", f2, nil, CodecZstd)
+
+	capt := time.Now().UTC()
+	s0.CappedAt, s0.CapReason = &capt, rotationReasonAge
+	s1.CappedAt, s1.CapReason = &capt, rotationReasonChainLength
+	cat := &LineageCatalog{FormatVersion: 1, SourceEngine: "postgres", Segments: []LineageSegment{s0, s1, s2}}
+	if err := writeLineageCatalog(context.Background(), store, cat); err != nil {
+		t.Fatal(err)
+	}
+	chain, err := buildLineageChain(context.Background(), store, nil)
+	if err != nil {
+		t.Fatalf("buildLineageChain (valid 3-segment): %v", err)
+	}
+	// f0,i0,f1,i1,f2 = 5 links.
+	if len(chain) != 5 {
+		t.Fatalf("chain len = %d; want 5", len(chain))
 	}
 }
 
-func TestBuildChain_OrphanRefuses(t *testing.T) {
-	dir := t.TempDir()
-	store, _ := NewLocalStore(dir)
-	full := makeManifest(t, ir.BackupKindFull, nil, "0/100")
-	incr1 := makeManifest(t, ir.BackupKindIncremental, full, "0/200")
-	// orphan: parent BackupID points at something that doesn't exist
-	orphan := &ir.Manifest{
-		FormatVersion:  ir.BackupFormatVersion,
-		CreatedAt:      time.Date(2026, 5, 8, 11, 0, 0, 0, time.UTC),
-		SourceEngine:   "postgres",
-		Kind:           ir.BackupKindIncremental,
-		ParentBackupID: "0000000000000000",
-		StartPosition:  ir.Position{Engine: "postgres", Token: `{"slot":"x","lsn":"9/9"}`},
-		EndPosition:    ir.Position{Engine: "postgres", Token: `{"slot":"x","lsn":"9/A"}`},
+// TestValidateBoundary_SameCodePathIntraAndInter proves the SINGLE
+// boundary validator is the SAME function for an intra-segment
+// incremental boundary (exact=true, contiguous) AND a
+// segment-to-segment boundary (exact=false, monotonic) — one check
+// site, ADR-0046 §3. A token-ranking comparator stands in for the
+// engine's PositionMonotonicChecker.
+func TestValidateBoundary_SameCodePathIntraAndInter(t *testing.T) {
+	prevEnd := ir.Position{Engine: "postgres", Token: "0/200"}
+	eq := ir.Position{Engine: "postgres", Token: "0/200"}
+	ahead := ir.Position{Engine: "postgres", Token: "0/300"}
+	behind := ir.Position{Engine: "postgres", Token: "0/199"}
+	cmp := &fakeMonotonicEngine{order: map[string]int{"0/199": 199, "0/200": 200, "0/300": 300}}
+
+	// SAME validateBoundary, intra-segment (exact=true): contiguous OK,
+	// any non-equality (gap OR regression) is a loud mismatch.
+	if err := validateBoundary(cmp, prevEnd, eq, true, "seg0 link1", "seg0 incrX"); err != nil {
+		t.Errorf("intra contiguous: err = %v; want nil", err)
 	}
-	orphan.BackupID = ir.ComputeBackupID(orphan)
-
-	_ = writeManifestAt(context.Background(), store, ManifestFileName, full)
-	_ = writeManifestAt(context.Background(), store, "manifests/incr-0001.json", incr1)
-	_ = writeManifestAt(context.Background(), store, "manifests/incr-9999.json", orphan)
-
-	_, err := buildChain(context.Background(), store)
-	if err == nil || !strings.Contains(err.Error(), "orphan") {
-		t.Errorf("err = %v; want orphan refusal", err)
+	if err := validateBoundary(cmp, prevEnd, ahead, true, "seg0 link1", "seg0 incrX"); err == nil ||
+		!strings.Contains(err.Error(), "lineage boundary mismatch") {
+		t.Errorf("intra forward-gap: err = %v; want loud mismatch (exact)", err)
+	}
+	if err := validateBoundary(cmp, prevEnd, behind, true, "seg0 link1", "seg0 incrX"); err == nil {
+		t.Errorf("intra regression: err = nil; want loud mismatch")
+	}
+	// SAME validateBoundary, inter-segment (exact=false): equal OR
+	// ahead OK (S >= P_N); only a REGRESSION is a loud refusal.
+	if err := validateBoundary(cmp, prevEnd, eq, false, "seg0 last", "seg1 start"); err != nil {
+		t.Errorf("inter equal: err = %v; want nil", err)
+	}
+	if err := validateBoundary(cmp, prevEnd, ahead, false, "seg0 last", "seg1 start"); err != nil {
+		t.Errorf("inter S>P_N (ahead): err = %v; want nil (monotonic OK)", err)
+	}
+	if err := validateBoundary(cmp, prevEnd, behind, false, "seg0 last", "seg1 start"); err == nil ||
+		!strings.Contains(err.Error(), "REGRESSION") {
+		t.Errorf("inter regression: err = %v; want loud REGRESSION refusal", err)
+	}
+	// Empty prevEnd tolerance (legacy v0.16 full) — skip either mode.
+	if err := validateBoundary(cmp, ir.Position{}, behind, true, "p", "c"); err != nil {
+		t.Errorf("empty-prev tolerance: err = %v; want nil", err)
 	}
 }
 
-func TestBuildChain_MultipleFullsRefuses(t *testing.T) {
+// TestBuildLineageChain_SegmentBoundaryRegressionRefuses: a
+// position-regression across a segment boundary is a LOUD refusal
+// (DR data — never a silent partial assemble).
+func TestBuildLineageChain_SegmentBoundaryRegressionRefuses(t *testing.T) {
 	dir := t.TempDir()
 	store, _ := NewLocalStore(dir)
-	full1 := makeManifest(t, ir.BackupKindFull, nil, "0/100")
-	full2 := makeManifest(t, ir.BackupKindFull, nil, "0/200")
-	_ = writeManifestAt(context.Background(), store, ManifestFileName, full1)
-	// A second "full" lurking in manifests/ — fabricated test scenario.
-	_ = writeManifestAt(context.Background(), store, "manifests/incr-rogue.json", full2)
-	_, err := buildChain(context.Background(), store)
-	if err == nil || !strings.Contains(err.Error(), "full manifests") {
-		t.Errorf("err = %v; want multiple-full refusal", err)
+	f0 := makeManifest(t, ir.BackupKindFull, nil, "END0")
+	s0 := seedSegment(t, store, "", f0, nil, CodecGzip)
+	f1 := makeManifest(t, ir.BackupKindFull, nil, "END1")
+	s1 := seedSegment(t, store, "seg-1", f1, nil, CodecGzip)
+	// seg1's RECORDED StartPosition REGRESSES before seg0's end
+	// (a tampered / corrupt lineage.json — DR data).
+	s1.StartPosition = ir.Position{Engine: "postgres", Token: "BEFORE0"}
+	capt := time.Now().UTC()
+	s0.CappedAt = &capt
+	cat := &LineageCatalog{FormatVersion: 1, SourceEngine: "postgres", Segments: []LineageSegment{s0, s1}}
+	if err := writeLineageCatalog(context.Background(), store, cat); err != nil {
+		t.Fatal(err)
+	}
+	// Ranking comparator: f0.End ("END0") ranks AFTER the regressed
+	// seg1 start ("BEFORE0") -> inter-segment monotonic check fails.
+	cmp := &fakeMonotonicEngine{order: map[string]int{
+		`{"slot":"sluice_slot","lsn":"END0"}`: 200,
+		"BEFORE0":                             100,
+		`{"slot":"sluice_slot","lsn":"END1"}`: 300,
+	}}
+	_, err := buildLineageChain(context.Background(), store, cmp)
+	if err == nil || !strings.Contains(err.Error(), "REGRESSION") {
+		t.Errorf("err = %v; want loud segment-boundary REGRESSION refusal", err)
 	}
 }
 
-func TestBuildChain_StartPositionMismatchRefuses(t *testing.T) {
+func TestBuildLineageChain_IntraSegmentMismatchRefuses(t *testing.T) {
 	dir := t.TempDir()
 	store, _ := NewLocalStore(dir)
 	full := makeManifest(t, ir.BackupKindFull, nil, "0/100")
-	// Tampered: manually point incremental to a different StartPosition.
 	tampered := makeManifest(t, ir.BackupKindIncremental, full, "0/200")
 	tampered.StartPosition = ir.Position{Engine: "postgres", Token: `{"slot":"x","lsn":"WRONG"}`}
 	tampered.BackupID = ir.ComputeBackupID(tampered)
+	seg := seedSegment(t, store, "", full, []*ir.Manifest{tampered}, CodecGzip)
+	cat := &LineageCatalog{FormatVersion: 1, SourceEngine: "postgres", Segments: []LineageSegment{seg}}
+	if err := writeLineageCatalog(context.Background(), store, cat); err != nil {
+		t.Fatal(err)
+	}
+	_, err := buildLineageChain(context.Background(), store, nil)
+	if err == nil || !strings.Contains(err.Error(), "lineage boundary mismatch") {
+		t.Errorf("err = %v; want intra-segment boundary refusal", err)
+	}
+}
 
-	_ = writeManifestAt(context.Background(), store, ManifestFileName, full)
-	_ = writeManifestAt(context.Background(), store, "manifests/incr-0001.json", tampered)
-
-	_, err := buildChain(context.Background(), store)
-	if err == nil || !strings.Contains(err.Error(), "chain link mismatch") {
-		t.Errorf("err = %v; want chain-link mismatch refusal", err)
+// TestBuildLineageChain_MissingFullRefuses: a segment whose recorded
+// full manifest is absent is a loud refusal.
+func TestBuildLineageChain_MissingFullRefuses(t *testing.T) {
+	dir := t.TempDir()
+	store, _ := NewLocalStore(dir)
+	cat := &LineageCatalog{
+		FormatVersion: 1, SourceEngine: "postgres",
+		Segments: []LineageSegment{{SegmentID: "s0", Dir: "", FullManifestPath: ManifestFileName, Codec: CodecGzip}},
+	}
+	if err := writeLineageCatalog(context.Background(), store, cat); err != nil {
+		t.Fatal(err)
+	}
+	_, err := buildLineageChain(context.Background(), store, nil)
+	if err == nil || !strings.Contains(err.Error(), "full") {
+		t.Errorf("err = %v; want missing-full refusal", err)
 	}
 }
 

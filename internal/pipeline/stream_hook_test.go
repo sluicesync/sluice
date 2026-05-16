@@ -170,7 +170,7 @@ func TestRolloverHook_FailureIsWarned(t *testing.T) {
 	}
 
 	// The rollover should still have committed.
-	records, _ := listAllManifests(context.Background(), store)
+	records, _ := listAllManifestsViaWalk(context.Background(), store)
 	var sawIncr bool
 	for _, r := range records {
 		if r.manifest.Kind == ir.BackupKindIncremental {
