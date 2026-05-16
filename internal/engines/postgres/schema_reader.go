@@ -997,8 +997,23 @@ func translateDefault(d sql.NullString, autoIncrement bool) ir.DefaultValue {
 // deliberately narrow so something like `(x + y)::int` (where the
 // suffix is just `int`) still strips, while `array[1]::int[]` (with
 // brackets) does not.
+//
+// Bug 61: PostgreSQL renders multi-argument function-call defaults
+// with a per-argument `::type` cast inside the call, e.g.
+// `crypt('s'::text, gen_salt('bf'::text))`. A naive `LastIndex(s,"::")`
+// finds the *innermost* cast (`'bf'::text`); because the suffix
+// charset accepts `)`, the value truncates to
+// `crypt('s'::text, gen_salt('bf'` — corrupting the IR and producing
+// a SQLSTATE 42601 on the target. The cast PostgreSQL appends to the
+// whole default sits at the *top level* (paren-depth 0, outside any
+// string literal). So the scan only considers a `::` that is at
+// depth 0 and not inside a single-quoted literal, and walks from the
+// right so a genuine trailing cast still wins over an earlier
+// top-level one. Casts nested inside the argument list are left in
+// place — the cross-dialect translator already handles `'x'::text`
+// fragments, and same-dialect PG→PG emits them verbatim (valid).
 func stripTypeCast(s string) string {
-	idx := strings.LastIndex(s, "::")
+	idx := topLevelCastIndex(s)
 	if idx < 0 {
 		return s
 	}
@@ -1013,6 +1028,45 @@ func stripTypeCast(s string) string {
 		}
 	}
 	return s[:idx]
+}
+
+// topLevelCastIndex returns the byte offset of the last `::` operator
+// that occurs at parenthesis-depth 0 and outside any single-quoted
+// string literal, or -1 if there is none. PostgreSQL doubles embedded
+// single quotes inside string literals (`'O”Brien'`), so a `'` only
+// toggles literal state when it is not the second half of a doubled
+// pair. `::` inside a literal or inside a function-argument list is
+// skipped — those are not the cast PostgreSQL appended to the whole
+// default expression (Bug 61).
+func topLevelCastIndex(s string) int {
+	depth := 0
+	inStr := false
+	last := -1
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case inStr:
+			if c == '\'' {
+				if i+1 < len(s) && s[i+1] == '\'' {
+					i++ // skip the doubled (escaped) quote
+					continue
+				}
+				inStr = false
+			}
+		case c == '\'':
+			inStr = true
+		case c == '(':
+			depth++
+		case c == ')':
+			if depth > 0 {
+				depth--
+			}
+		case c == ':' && depth == 0 && i+1 < len(s) && s[i+1] == ':':
+			last = i
+			i++ // consume the second ':'
+		}
+	}
+	return last
 }
 
 // looksLikeNumber reports whether s parses as a simple integer or
