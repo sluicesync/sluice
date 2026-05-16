@@ -222,12 +222,18 @@ type segmentRecord struct {
 }
 
 // resolveLineage returns the lineage for store. When lineage.json is
-// present it's authoritative. When absent, a single synthetic root
-// segment (Dir == "", codec [DefaultCodec]) is constructed over the conventional
-// layout — the pre-ADR single-chain shape, a one-segment lineage by
-// strict generalization. A multi-segment backup with a missing /
-// unreadable lineage.json is unreconstructable from a bare walk; the
-// load error already surfaced loudly from [loadLineageCatalog].
+// present it's authoritative. When UNREADABLE (parse/version/IO
+// error), [loadLineageCatalog] already surfaced a loud error. When
+// ABSENT, a single synthetic root segment (Dir == "", codec
+// [DefaultCodec]) is constructed over the conventional layout — the
+// pre-ADR single-chain shape, a one-segment lineage by strict
+// generalization — BUT only if the on-disk shape is genuinely
+// single-segment. If rotation-opened segment sub-dirs (`seg-*`) exist
+// while lineage.json is absent, the backup is a rotated multi-segment
+// lineage that cannot be reconstructed from a bare walk: that is a
+// LOUD refusal, never a silent root-only partial (Bug 66 — the absent
+// case does NOT auto-surface from loadLineageCatalog the way the
+// unreadable case does, so resolveLineage must guard it here).
 func resolveLineage(ctx context.Context, store ir.BackupStore) (*LineageCatalog, error) {
 	cat, ok, err := loadLineageCatalog(ctx, store)
 	if err != nil {
@@ -236,8 +242,32 @@ func resolveLineage(ctx context.Context, store ir.BackupStore) (*LineageCatalog,
 	if ok {
 		return cat, nil
 	}
-	// Absent: synthesise the single-segment legacy lineage. The
-	// segment's manifest list is discovered by a directory walk (the
+	// lineage.json ABSENT. Before falling back to the legacy
+	// single-segment synthesis, refuse loudly if the on-disk shape is
+	// actually a rotated MULTI-segment backup (Bug 66): rotation opens
+	// `seg-<unix-millis>/` sub-dirs, and a multi-segment lineage cannot
+	// be reconstructed from a bare root walk — silently restoring only
+	// the root segment would drop every rotation-opened segment with
+	// exit 0 (DR data: loud-fail, never a silent partial — the same
+	// contract the unreadable-lineage.json path already honors). A
+	// genuine never-rotated / pre-ADR backup has no `seg-*` dirs and
+	// still synthesizes + restores below (strict generalization).
+	segEvidence, err := store.List(ctx, rotationSegmentDirPrefix)
+	if err != nil {
+		return nil, fmt.Errorf("inspect rotation segments (%s*): %w", rotationSegmentDirPrefix, err)
+	}
+	if len(segEvidence) > 0 {
+		return nil, fmt.Errorf(
+			"backup has rotation-opened segment directories (%s*) but lineage.json is missing: "+
+				"a multi-segment lineage cannot be reconstructed from a bare directory walk; "+
+				"refusing to restore only the root segment (DR data — never a silent partial). "+
+				"Restore from a copy whose lineage.json is intact (it is the authoritative structural "+
+				"record for a rotated backup; `backup verify --rebuild-catalog` only rebuilds the "+
+				"legacy one-segment shape)",
+			rotationSegmentDirPrefix)
+	}
+	// Absent and genuinely single-segment: synthesise the legacy
+	// lineage. The manifest list is discovered by a directory walk (the
 	// pre-v0.47.0 fall-through, preserved for the one-segment shape).
 	root := &LineageSegment{
 		Dir:              "",

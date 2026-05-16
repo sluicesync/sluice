@@ -283,3 +283,66 @@ func (s *memStore) Exists(_ context.Context, path string) (bool, error) {
 type storeNotFoundErr struct{ path string }
 
 func (e *storeNotFoundErr) Error() string { return "memstore: not found: " + e.path }
+
+// bug66Manifest builds a minimal complete full/incremental manifest for
+// the resolveLineage missing-catalog pins.
+func bug66Manifest(kind, lsn string) *ir.Manifest {
+	m := &ir.Manifest{
+		FormatVersion: ir.BackupFormatVersion,
+		CreatedAt:     time.Now().UTC(),
+		SourceEngine:  "postgres",
+		Kind:          kind,
+		EndPosition:   ir.Position{Engine: "postgres", Token: `{"slot":"s","lsn":"` + lsn + `"}`},
+		PartialState:  ir.BackupStateComplete,
+	}
+	m.BackupID = ir.ComputeBackupID(m)
+	return m
+}
+
+// TestResolveLineage_MissingCatalogMultiSegmentRefused pins Bug 66: a
+// ROTATED multi-segment backup whose lineage.json is absent (e.g. a
+// pre-v0.67.0 chain.json-shaped backup, or a lost catalog) must LOUD-
+// REFUSE — never silently restore only the root segment. Pre-fix this
+// silently synthesised a one-segment lineage and dropped every
+// rotation-opened seg-* segment with exit 0 (~90% data loss observed
+// in the v0.67.0 regression cycle). The unreadable-lineage path was
+// already loud; only this absent+multi-segment branch fell back.
+func TestResolveLineage_MissingCatalogMultiSegmentRefused(t *testing.T) {
+	store := newMemStore()
+	// Root (segment 0) conventional layout.
+	mustWriteManifest(t, store, ManifestFileName, bug66Manifest(ir.BackupKindFull, "0/100"))
+	mustWriteManifest(t, store, "manifests/incr-0000000000001-aaaa.json", bug66Manifest(ir.BackupKindIncremental, "0/200"))
+	// Rotation-opened segment evidence (seg-<unix-millis>/...), but NO
+	// lineage.json — the catalog that is the only structural record of
+	// the rotated segments.
+	mustWriteManifest(t, store, rotationSegmentDirPrefix+"0000000000002/manifest.json", bug66Manifest(ir.BackupKindFull, "0/300"))
+
+	_, err := resolveLineage(context.Background(), store)
+	if err == nil {
+		t.Fatal("resolveLineage: nil error for missing lineage.json on a multi-segment backup; want a loud refusal (Bug 66 — silent root-only partial is DR data loss)")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, rotationSegmentDirPrefix) || !strings.Contains(msg, "lineage.json") {
+		t.Errorf("refusal message = %q; want it to name the seg-* evidence and the missing lineage.json", msg)
+	}
+}
+
+// TestResolveLineage_MissingCatalogLegacySingleSegmentStillResolves is
+// the companion regression guard for the Bug 66 fix: a GENUINE
+// never-rotated / pre-ADR backup (manifest.json + manifests/incr-*, NO
+// seg-* dirs, NO lineage.json) MUST still synthesize a one-segment
+// lineage and restore — the strict-generalization behaviour the fix
+// must not break.
+func TestResolveLineage_MissingCatalogLegacySingleSegmentStillResolves(t *testing.T) {
+	store := newMemStore()
+	mustWriteManifest(t, store, ManifestFileName, bug66Manifest(ir.BackupKindFull, "0/100"))
+	mustWriteManifest(t, store, "manifests/incr-0000000000001-bbbb.json", bug66Manifest(ir.BackupKindIncremental, "0/200"))
+
+	cat, err := resolveLineage(context.Background(), store)
+	if err != nil {
+		t.Fatalf("resolveLineage (legacy single-segment, no seg-*): unexpected error %v — never-rotated backups must still resolve", err)
+	}
+	if len(cat.Segments) != 1 || cat.Segments[0].Dir != "" {
+		t.Fatalf("synthesised lineage = %+v; want exactly one root segment with Dir=\"\"", cat.Segments)
+	}
+}

@@ -79,6 +79,16 @@ const (
 // root. Single small JSON object; rewritten at each FSM phase.
 const RotationStateFileName = "rotation_state.json"
 
+// rotationSegmentDirPrefix is the on-disk prefix of every
+// rotation-opened segment sub-directory (`seg-<unix-millis>/`). Single
+// source of truth shared by the producer ([performRotation]'s
+// provisional-dir construction) and the consumer ([resolveLineage]'s
+// missing-catalog multi-segment-evidence guard, Bug 66): if any
+// `seg-*` path exists but lineage.json is absent, the backup is a
+// rotated multi-segment lineage that cannot be reconstructed from a
+// bare walk — a loud refusal, never a silent root-only partial.
+const rotationSegmentDirPrefix = "seg-"
+
 // rotationPhase enumerates the FSM phases recorded in
 // rotation_state.json. The ordering matters for crash recovery: the
 // authority flip is the lineage.json write, not the phase string --
@@ -244,7 +254,7 @@ func (b *BackupStream) performRotation(ctx context.Context, in rotateInputs) (ro
 	}
 
 	now := in.now()
-	provisionalDir := fmt.Sprintf("seg-%013d", now.UTC().UnixMilli())
+	provisionalDir := fmt.Sprintf(rotationSegmentDirPrefix+"%013d", now.UTC().UnixMilli())
 	st := &rotationState{
 		Phase:           rotationPhaseDrain,
 		Reason:          in.reason,
