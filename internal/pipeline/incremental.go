@@ -429,11 +429,61 @@ func (b *IncrementalBackup) resolveParent(ctx context.Context) (*ir.Manifest, st
 		return nil, "", fmt.Errorf("parent backup %q not found in store; available: %s",
 			b.ParentRef, manifestSummary(manifests))
 	}
-	// Pick the most recent manifest.
-	sort.Slice(manifests, func(i, j int) bool {
-		return manifests[i].manifest.CreatedAt.After(manifests[j].manifest.CreatedAt)
-	})
-	return manifests[0].manifest, manifests[0].path, nil
+	// Resume off the chain TAIL (open segment append order), NOT
+	// max CreatedAt. See [chainTailManifest].
+	tail := chainTailManifest(ctx, b.Store, manifests)
+	return tail.manifest, tail.path, nil
+}
+
+// chainTailManifest returns the chain tail to resume an incremental
+// off of, given the open segment's store, the walk result over that
+// store ([listAllManifestsViaWalk]: the segment full first when
+// present, then the incremental manifests in lexically-sorted path
+// order), and the catalog.
+//
+// The AUTHORITATIVE chain order is the open segment's lineage.json
+// `Incrementals` slice — it is written in append (commit) order by
+// [updateLineageForManifest], so its last entry is the chain tail
+// (ADR-0046: lineage.json is the structural record). The tail
+// manifest is the one at that path. When the lineage is absent (the
+// legacy never-catalogued one-segment shape) or has no incrementals
+// yet, fall back to the walk: the last record (last incremental, or
+// the full if the segment has none).
+//
+// This replaced a max(CreatedAt) selection that branched the lineage
+// on a CreatedAt tie: ir.Manifest.CreatedAt is wall-clock with
+// platform-dependent resolution, not unique nor strictly monotonic
+// with chain order, so two back-to-back rollovers landing in the
+// same millisecond made a post-restart resolveParent resume off the
+// second-to-last link. buildLineageChain's parent-link validator
+// (correctly) refused the resulting branched lineage at restore
+// time. Resolving the parent from the lineage's recorded append
+// order keeps the restart's first incremental stitched exactly where
+// an uninterrupted run would have put it. Path order is NOT a safe
+// substitute: the incremental filename's unix-millis can tie and the
+// short-ID disambiguator is content-derived (effectively unordered),
+// so two same-millisecond incrementals can sort either way.
+//
+// rootStore is the lineage root (lineage.json lives there, NOT inside
+// a segment sub-dir); recs and the segment Incrementals paths are
+// both relative to the open segment's Dir, so they match by path.
+// recs must be non-empty (callers check len == 0 first).
+func chainTailManifest(ctx context.Context, rootStore ir.BackupStore, recs []manifestRecord) manifestRecord {
+	cat, ok, err := loadLineageCatalog(ctx, rootStore)
+	if err == nil && ok && len(cat.Segments) > 0 {
+		seg := &cat.Segments[len(cat.Segments)-1] // open segment
+		if n := len(seg.Incrementals); n > 0 {
+			tailPath := seg.Incrementals[n-1]
+			for i := range recs {
+				if recs[i].path == tailPath {
+					return recs[i]
+				}
+			}
+		}
+	}
+	// No lineage / no incrementals recorded: the walk's last record is
+	// the tail (full when the segment has no incrementals).
+	return recs[len(recs)-1]
 }
 
 // readSourceSchema opens a fresh schema reader and reads the source

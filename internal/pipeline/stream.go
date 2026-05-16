@@ -811,16 +811,17 @@ func (b *BackupStream) resolveParent(ctx context.Context) (*ir.Manifest, string,
 		return nil, "", fmt.Errorf("parent backup %q not found in store; available: %s",
 			b.ParentRef, manifestSummary(manifests))
 	}
-	// Pick the most recent manifest. Mirrors IncrementalBackup; for a
-	// stream re-launching after a crash this naturally picks up the
-	// latest committed rollover as the next parent.
-	mostRecent := manifests[0]
-	for _, m := range manifests[1:] {
-		if m.manifest.CreatedAt.After(mostRecent.manifest.CreatedAt) {
-			mostRecent = m
-		}
-	}
-	return mostRecent.manifest, mostRecent.path, nil
+	// Resume off the chain TAIL. Mirrors IncrementalBackup; for a
+	// stream re-launching after a crash this picks up the latest
+	// committed rollover as the next parent. The tail is defined by
+	// the open segment's append order (chain order) — NOT max
+	// CreatedAt: CreatedAt is wall-clock with platform-dependent
+	// resolution, not unique nor strictly monotonic with chain order,
+	// so a millisecond tie on the two trailing rollovers would resume
+	// off the second-to-last link and branch the lineage (ADR-0046
+	// crash-matrix `pre-commit-write` flake, v0.67.0).
+	tail := chainTailManifest(ctx, b.Store, manifests)
+	return tail.manifest, tail.path, nil
 }
 
 // rolloverOutcome bundles the multi-value result of a single rollover
