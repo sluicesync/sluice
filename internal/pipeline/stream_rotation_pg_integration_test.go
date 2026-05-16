@@ -57,7 +57,12 @@ func rotationSeedFull(t *testing.T, store ir.BackupStore, eng ir.Engine, sourceD
 	// Seed lineage.json so the open segment is catalogued (the first
 	// rollover would also seed it; doing it here makes rotation's
 	// "lineage not yet catalogued" guard a non-issue from rollover 0).
-	updateLineageForManifestBestEffort(context.Background(), store, full, ManifestFileName, CodecGzip)
+	// Record the codec the seed Backup.Run above actually wrote with
+	// (it passes no Codec → DefaultCodec). Hardcoding a literal here
+	// desyncs the recorded codec from the chunk bytes the moment the
+	// default flips (v0.67.0 gzip→zstd) → restore reads with the wrong
+	// codec. DefaultCodec tracks it.
+	updateLineageForManifestBestEffort(context.Background(), store, full, ManifestFileName, DefaultCodec)
 	return full
 }
 
@@ -398,8 +403,8 @@ func TestADR0046_NeverRotatedByteIdentical_PG(t *testing.T) {
 
 	lin, ok, _ := loadLineageCatalog(context.Background(), store)
 	if !ok || len(lin.Segments) != 1 || lin.Segments[0].Dir != "" ||
-		lin.Segments[0].codecOrDefault() != CodecGzip {
-		t.Fatalf("never-rotated lineage = %+v; want exactly one root segment (Dir='', gzip)", lin.Segments)
+		lin.Segments[0].codecOrDefault() != DefaultCodec {
+		t.Fatalf("never-rotated lineage = %+v; want exactly one root segment (Dir='', codec=%s)", lin.Segments, DefaultCodec)
 	}
 	if !lin.Segments[0].open() {
 		t.Error("the only segment of a never-rotated lineage must be open (uncapped)")

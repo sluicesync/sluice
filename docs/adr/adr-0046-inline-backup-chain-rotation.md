@@ -11,12 +11,14 @@ written below, with all three residual scope calls confirmed at
 sign-off: clean-break `lineage.json` (no old-`chain.json` shim);
 Phase 1 `--exit-after-*` removed; **14c prune reframed onto
 segments in this chunk** (the surface is reopened once, not
-twice); `--compression=none|gzip|zstd` folded in (gzip default).
-**zstd added on explicit operator demand** (post-sign-off) — same
-"the codec surface is open; don't reopen it twice" logic, and it
-retires the compression-benchmark doc's "zstd demand-gated"
-hold. The rotation correctness core is unchanged from the prior
-draft. make capped segments + ordered
+twice); `--compression=none|gzip|zstd` folded in, **zstd default**
+(v0.67.0). The default flipped gzip→zstd on the decode-inclusive
+compressbench re-run (zstd decodes 55–85% faster — restore is the
+DR-critical axis — at ~1–5% ratio cost vs klauspost gzip); a
+clean break, no gzip-default shim (zero-users tenet), retiring
+the compression-benchmark doc's earlier "gzip default / zstd
+demand-gated" hold. The rotation correctness core is unchanged
+from the prior draft. make capped segments + ordered
 succession the first-class chain format, not rotation-as-an-event.
 Rationale: zero users + zero on-disk chains means the chain
 format is free *now* and never again; the chain format is the
@@ -143,9 +145,9 @@ tombstone/parent-link surgery.
 
 ### 5. Per-segment compression codec (folded in — the surface is open)
 
-Each segment records its `codec` (`"gzip"` default | `"none"` |
-`"zstd"`). New `--compression=none|gzip|zstd` on `backup full` /
-`backup stream run` (default `gzip`, unchanged behaviour).
+Each segment records its `codec` (`"zstd"` default | `"gzip"` |
+`"none"`). New `--compression=none|gzip|zstd` on `backup full` /
+`backup stream run` (**default `zstd`**, v0.67.0 — was `gzip`).
 Restore reads each segment's recorded codec — **mixed-codec
 lineages are naturally supported** (a `none` segment captured for
 local inspection alongside `gzip`/`zstd` segments restores
@@ -153,16 +155,19 @@ correctly). `none` is the operator-inspectability case the
 validation friction surfaced (local-FS target, eyeball `.jsonl`);
 object stores never auto-compress, so compression is always
 sluice-side for egress/at-rest only — `none` is principled for
-local targets. **`zstd`** is included on explicit operator demand
-(the codec surface is open once; gating it to a later chunk would
-reopen the same manifest/codec surface — the exact double-work
-the native-model rationale rejects). Implement zstd via
-`klauspost/compress/zstd` at **SpeedDefault** — already the
-module graph (indirect via pgx) and the precise choice the
-shipped compression-benchmark decision doc recommends for the
-zstd target, so no new dependency and a pre-vetted setting. The
-codec is **recorded per segment, never inferred** from file
-contents.
+local targets. **`zstd` is the default**: the compressbench
+decision doc was re-run with decode throughput measured (warm
+median, not single-pass) and the conclusion reversed — zstd at
+SpeedDefault decodes **55–85% faster than klauspost gzip on every
+corpus** (restore speed is the DR-critical axis the original
+encode/ratio-only analysis omitted) and encodes 0–30% faster, at
+a ~1–5% ratio cost on representative chunk data (the "~21%" the
+old doc cited was vs *stdlib* gzip, the encoder it also said to
+abandon). gzip→zstd is a clean break — no gzip-default shim, zero
+on-disk backups predate it (zero-users tenet). Implement zstd via
+`klauspost/compress/zstd` at **SpeedDefault** — already a direct
+module dependency, no new dep. The codec is **recorded per
+segment, never inferred** from file contents.
 
 ### 6. CLI: one rotation model (Phase 1 `--exit-after-*` removed)
 

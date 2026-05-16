@@ -6,6 +6,32 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.67.0]
+
+**Native bounded-segment backup lineage + inline rotation (ADR-0046), and the backup compression default flips gzip→zstd.** `sluice backup stream run` no longer grows one unbounded chain forever: a backup is now a *lineage* of capped, full-anchored *segments*, and rotation is `lineage.appendSegment` — not an exceptional event grafted onto a chain. `--retain-rotate-at=DUR` / `--retain-rotate-at-chain-length=N` rotate the open segment in-process (no operator cron wrapper). `chain.json` is replaced by `lineage.json` (clean break — zero on-disk backups predate it, zero-users tenet; no migration shim). A never-rotated backup is a one-segment lineage that takes the same single-segment restore path as before.
+
+### Added
+
+- **Inline segment rotation.** `--retain-rotate-at=DUR` and `--retain-rotate-at-chain-length=N` on `backup stream run`. When a threshold trips, the rollover-loop goroutine drives a `STREAMING→DRAIN→SNAPSHOT→BULKCOPY→COMMIT` FSM over the *same* in-flight CDC handle: it bulk-copies a new segment's `backup full`, then a single atomic `lineage.json` write appends the new segment and caps the prior one. CDC never re-opens the slot. The next segment's snapshot anchor `S` is hard-asserted `≥` the prior segment's last incremental position `P_N` (loud abort that stays on the still-open segment — never a silent gap). `rotation_state.json` makes a crash at any FSM edge recoverable: ≤COMMIT discards the provisional segment and resumes the open one; >COMMIT the new segment is authoritative.
+- **`--compression=none|gzip|zstd`** on `backup full` / `backup stream run`, recorded per segment in `lineage.json` and read back from there on restore (codec is recorded, **never inferred** from bytes). Mixed-codec lineages restore correctly. `none` leaves chunks as human-readable `.jsonl` (local-FS inspectability).
+
+### Changed
+
+- **Backup compression default: gzip → zstd** (klauspost/compress at SpeedDefault). The compressbench decision doc was re-run with decode throughput measured (warm median, not single cold pass) and the conclusion reversed: zstd decodes **55–85% faster than klauspost gzip on every corpus** — restore speed is the DR-critical axis the original encode/ratio-only analysis omitted — and encodes 0–30% faster, at a ~1–5% ratio cost on representative chunk data (the "~21%" the old doc cited was measured against *stdlib* gzip, the encoder it also recommended abandoning). `--compression=gzip` remains available. Clean break, no gzip-default shim.
+- **`chain.json` → `lineage.json`.** The grafted-rotation bimodality (`RotatedAt`/`SucceededBy`/`RotationReason`/`Tombstoned`) is gone; restore is a uniform segment-by-segment lineage walk gated by one boundary-monotonicity invariant (exact intra-segment, monotonic inter-segment — the same `validateBoundary` call site). 14c prune is reframed onto segments. A malformed lineage is a loud refusal, never a silent partial assemble.
+
+### Removed
+
+- **`--exit-after-age` / `--exit-after-chain-length`** (Phase-1 rotation-EXIT, v0.51.0). Superseded by in-process `--retain-rotate-at*`; the flags now error with a clear migration message (clean break, zero-users tenet).
+
+### Fixed
+
+- Per-segment codec is read from `lineage.json`, never sniffed from chunk bytes — an unknown/garbled recorded codec is a loud refusal (a sniffed codec is a latent DR-data corruption path).
+
+### Compatibility
+
+**Breaking, by design (zero-users tenet — no shims).** (1) On-disk format: `chain.json` is gone; existing `chain.json` backups are not read. (2) New backups default to **zstd**-compressed chunks; `gzip` requires `--compression=gzip`. (3) `--exit-after-*` flags removed. There are no production backups predating v0.67.0 to migrate; the clean break was chosen over additive compatibility per the project tenet. Rotation correctness was rig-verified: crash-injection matrix at every FSM edge, an 8-segment zero-loss rotation under continuous write, the `S≥P_N` hard-fail, never-rotated byte-identical restore, and mixed-codec restore.
+
 ## [0.66.1]
 
 **Completes Bug 64 — the MySQL→PostgreSQL column-DEFAULT cell that v0.66.0 (ADR-0045) only partially addressed.** v0.66.0's post-release regression cycle caught that the consolidation reached 3 of 4 expression positions; the DEFAULT cell got the PG-reserved requote but not the source-MySQL-backtick strip the generated/CHECK/index emitters get at the reader. v0.66.0's CHANGELOG/release notes were corrected post-publish; this release closes the bug.

@@ -17,9 +17,15 @@ package pipeline
 // from the segment, full stop. An unknown / garbled recorded codec is
 // a loud refusal (DR data — loud-fail, never silent-assemble).
 //
-// zstd uses klauspost/compress/zstd at SpeedDefault — the choice the
-// shipped compression-benchmark decision doc scoped for the zstd
-// target, and already a direct module dependency (no new dep).
+// zstd uses klauspost/compress/zstd at SpeedDefault and is the
+// v0.67.0+ default ([DefaultCodec]). Grounded in
+// docs/dev/notes/compression-benchmark.md's decode-inclusive evidence:
+// zstd decodes 55–85% faster than gzip on every corpus (restore speed
+// is the DR-critical axis) at a ~1–5% ratio cost vs klauspost gzip on
+// representative chunk data. klauspost/compress is already a direct
+// module dependency (no new dep). The gzip→zstd default flip is a
+// clean break (pre-users; no back-compat shim — sluice's zero-users
+// tenet); --compression=gzip remains available.
 
 import (
 	"compress/gzip"
@@ -31,8 +37,7 @@ import (
 
 // Codec is the per-segment compression codec recorded in lineage.json.
 // The zero value is invalid; callers resolve via [resolveCodec] /
-// [parseCodec] so the gzip default (unchanged pre-ADR behaviour) is
-// applied consistently.
+// [parseCodec] so [DefaultCodec] (zstd) is applied consistently.
 type Codec string
 
 const (
@@ -43,27 +48,28 @@ const (
 	// principled for local targets.
 	CodecNone Codec = "none"
 
-	// CodecGzip is the default codec — unchanged behaviour from every
-	// pre-ADR-0046 backup. A one-segment never-capped lineage with
-	// CodecGzip is byte-identical in restore behaviour to a pre-ADR
-	// single chain.
+	// CodecGzip is the pre-v0.67.0 default, still operator-selectable
+	// via --compression=gzip. No longer the default (see [DefaultCodec]).
 	CodecGzip Codec = "gzip"
 
-	// CodecZstd uses klauspost/compress/zstd at SpeedDefault. Included
-	// on explicit operator demand (ADR-0046 §5); the codec surface is
-	// opened once.
+	// CodecZstd uses klauspost/compress/zstd at SpeedDefault. The
+	// v0.67.0+ default ([DefaultCodec]); the codec surface is opened
+	// once.
 	CodecZstd Codec = "zstd"
 )
 
 // DefaultCodec is the codec applied when the operator does not pass
-// --compression. gzip — the pre-ADR-0046 default; common-path
-// behaviour is unchanged.
-const DefaultCodec = CodecGzip
+// --compression: zstd, chosen on the decode-inclusive compressbench
+// evidence (faster restore — the DR-critical axis; see
+// docs/dev/notes/compression-benchmark.md). Pre-v0.67.0 this was gzip;
+// the flip is a clean break (zero-users tenet — no back-compat shim).
+const DefaultCodec = CodecZstd
 
 // resolveCodec applies the "empty → default" rule. An empty Codec
-// (segment metadata absent, or operator left --compression unset)
-// resolves to [DefaultCodec] (gzip) so a one-segment never-capped
-// lineage is byte-identical behaviour to a pre-ADR single chain.
+// (operator left --compression unset, or a segment recorded none)
+// resolves to [DefaultCodec] (zstd). A v0.67.0+ backup always records
+// its codec explicitly; the empty case is the operator-unset write
+// default.
 func resolveCodec(c Codec) Codec {
 	if c == "" {
 		return DefaultCodec
@@ -71,16 +77,20 @@ func resolveCodec(c Codec) Codec {
 	return c
 }
 
-// parseCodec validates an operator-supplied codec string. Unknown
+// parseCodec validates an operator-supplied codec string. Empty
+// resolves to [DefaultCodec] (zstd) so a programmatic
+// ParseCompression("") agrees with the documented default. Unknown
 // values are a loud refusal — never a silent fallback (DR data).
 func parseCodec(s string) (Codec, error) {
 	switch Codec(s) {
 	case CodecNone:
 		return CodecNone, nil
-	case CodecGzip, "":
+	case CodecGzip:
 		return CodecGzip, nil
 	case CodecZstd:
 		return CodecZstd, nil
+	case "":
+		return DefaultCodec, nil
 	default:
 		return "", fmt.Errorf("unknown compression codec %q; supported: none, gzip, zstd", s)
 	}

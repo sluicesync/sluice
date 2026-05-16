@@ -19,9 +19,10 @@ package pipeline
 //
 // **A never-rotated backup is a one-segment lineage** with the
 // segment's Dir == "" (chunks/manifests at the conventional root
-// paths) and Codec == "gzip". That shape is byte-identical in
-// behaviour and restore path to a pre-ADR single chain — a strict
-// generalization, not a heavier common path.
+// paths). That shape takes the same single-segment restore path as a
+// pre-ADR single chain — a strict generalization, not a heavier common
+// path. (The segment's codec is whatever --compression selected;
+// v0.67.0+ defaults to zstd, not gzip — see [DefaultCodec].)
 //
 // lineage.json is an accelerator for segment-shape queries the same
 // way chain.json was for chain-shape queries, but it is ALSO the
@@ -138,14 +139,13 @@ type LineageSegment struct {
 
 	// Codec is the compression codec every chunk in this segment was
 	// written with (ADR-0046 §5). Recorded here, NEVER inferred from
-	// the chunk bytes on restore. Empty resolves to gzip (the pre-ADR
-	// default) so a legacy-shaped one-segment lineage restores
-	// unchanged.
+	// the chunk bytes on restore. Empty resolves to [DefaultCodec]
+	// (zstd, v0.67.0+); a v0.67.0+ backup always records it explicitly.
 	Codec Codec `json:"codec,omitempty"`
 }
 
 // codecOrDefault returns the segment's recorded codec, resolving an
-// empty value to the gzip default (pre-ADR-0046 behaviour).
+// empty value to [DefaultCodec] (zstd).
 func (s *LineageSegment) codecOrDefault() Codec { return resolveCodec(s.Codec) }
 
 // open reports whether this is the open (last, uncapped) segment.
@@ -223,7 +223,7 @@ type segmentRecord struct {
 
 // resolveLineage returns the lineage for store. When lineage.json is
 // present it's authoritative. When absent, a single synthetic root
-// segment (Dir == "", gzip codec) is constructed over the conventional
+// segment (Dir == "", codec [DefaultCodec]) is constructed over the conventional
 // layout — the pre-ADR single-chain shape, a one-segment lineage by
 // strict generalization. A multi-segment backup with a missing /
 // unreadable lineage.json is unreconstructable from a bare walk; the

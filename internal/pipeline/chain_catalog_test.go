@@ -27,7 +27,7 @@ func TestLineage_LoadAbsent(t *testing.T) {
 	}
 
 	// With a conventional full present, resolveLineage synthesises a
-	// one-segment lineage (Dir == "", gzip).
+	// one-segment lineage (Dir == "", DefaultCodec).
 	full := &ir.Manifest{
 		FormatVersion: ir.BackupFormatVersion, CreatedAt: time.Now().UTC(),
 		SourceEngine: "postgres", Kind: ir.BackupKindFull,
@@ -40,8 +40,8 @@ func TestLineage_LoadAbsent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolveLineage: %v", err)
 	}
-	if len(rl.Segments) != 1 || rl.Segments[0].Dir != "" || rl.Segments[0].codecOrDefault() != CodecGzip {
-		t.Fatalf("synthetic lineage = %+v; want one root segment, Dir='', gzip", rl.Segments)
+	if len(rl.Segments) != 1 || rl.Segments[0].Dir != "" || rl.Segments[0].codecOrDefault() != DefaultCodec {
+		t.Fatalf("synthetic lineage = %+v; want one root segment, Dir='', codec=%s", rl.Segments, DefaultCodec)
 	}
 }
 
@@ -202,12 +202,22 @@ func TestValidateRecordedCodec_UnknownRefused(t *testing.T) {
 }
 
 // TestParseCompression covers the CLI codec parse (loud on unknown).
+// It also pins the v0.67.0 gzip→zstd default flip: empty resolves to
+// the zstd default (clean break, zero-users tenet — no back-compat
+// gzip-default shim). A regression here silently changes every new
+// backup's codec.
 func TestParseCompression(t *testing.T) {
-	for in, want := range map[string]Codec{"": CodecGzip, "gzip": CodecGzip, "none": CodecNone, "zstd": CodecZstd} {
+	if DefaultCodec != CodecZstd {
+		t.Fatalf("DefaultCodec = %q; want zstd (v0.67.0 flip)", DefaultCodec)
+	}
+	for in, want := range map[string]Codec{"": CodecZstd, "gzip": CodecGzip, "none": CodecNone, "zstd": CodecZstd} {
 		got, err := ParseCompression(in)
 		if err != nil || got != want {
 			t.Errorf("ParseCompression(%q) = (%q,%v); want (%q,nil)", in, got, err, want)
 		}
+	}
+	if got := resolveCodec(""); got != CodecZstd {
+		t.Errorf("resolveCodec(\"\") = %q; want zstd (the operator-unset write default)", got)
 	}
 	if _, err := ParseCompression("lz4"); err == nil {
 		t.Error("ParseCompression(lz4) = nil; want unknown-codec error")

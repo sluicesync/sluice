@@ -198,8 +198,24 @@ type changeChunkReader struct {
 // lineage.json — never inferred from the bytes (DR data; an inferred
 // codec is a latent corruption path).
 func newChangeChunkReader(src io.ReadCloser, expectedSHA256 string, cek []byte, codec Codec) (*changeChunkReader, error) {
-	if cek != nil && len(cek) != crypto.CEKLen {
+	// Ownership guard: same as newChunkReader — every early-return error
+	// path releases the store handle + any constructed codec reader so a
+	// corrupt / bad-codec / hash-mismatch change-chunk open doesn't leak
+	// an FD (and on Windows block temp-dir cleanup). One named guard,
+	// covering the header-scan paths the scattered closes missed.
+	var gz codecReadCloser
+	success := false
+	defer func() {
+		if success {
+			return
+		}
+		if gz != nil {
+			_ = gz.Close()
+		}
 		_ = src.Close()
+	}()
+
+	if cek != nil && len(cek) != crypto.CEKLen {
 		return nil, fmt.Errorf("change chunk reader: cek length %d != %d", len(cek), crypto.CEKLen)
 	}
 	hasher := sha256.New()
@@ -213,27 +229,24 @@ func newChangeChunkReader(src io.ReadCloser, expectedSHA256 string, cek []byte, 
 	} else {
 		ct, err := io.ReadAll(src)
 		if err != nil {
-			_ = src.Close()
 			return nil, fmt.Errorf("change chunk reader: read ciphertext: %w", err)
 		}
 		if _, err := hasher.Write(ct); err != nil {
-			_ = src.Close()
 			return nil, fmt.Errorf("change chunk reader: hash ciphertext: %w", err)
 		}
 		pt, err := crypto.DecryptChunk(ct, cek)
 		if err != nil {
-			_ = src.Close()
 			return nil, fmt.Errorf("change chunk reader: decrypt: %w", err)
 		}
 		gzSrc = bytes.NewReader(pt)
 		encrypted = true
 		consumedSrc = true
 	}
-	gz, err := newCodecReader(gzSrc, codec)
+	cr, err := newCodecReader(gzSrc, codec)
 	if err != nil {
-		_ = src.Close()
 		return nil, fmt.Errorf("change chunk reader: codec header: %w", err)
 	}
+	gz = cr
 	sc := bufio.NewScanner(gz)
 	sc.Buffer(make([]byte, 0, 64*1024), 64*1024*1024)
 	if !sc.Scan() {
@@ -253,7 +266,7 @@ func newChangeChunkReader(src io.ReadCloser, expectedSHA256 string, cek []byte, 
 	if hdr.ChunkKind != changeChunkKind {
 		return nil, fmt.Errorf("change chunk reader: chunk_kind = %q; want %q", hdr.ChunkKind, changeChunkKind)
 	}
-	return &changeChunkReader{
+	r := &changeChunkReader{
 		src:         src,
 		hasher:      hasher,
 		gzReader:    gz,
@@ -262,7 +275,9 @@ func newChangeChunkReader(src io.ReadCloser, expectedSHA256 string, cek []byte, 
 		header:      hdr,
 		encrypted:   encrypted,
 		consumedSrc: consumedSrc,
-	}, nil
+	}
+	success = true
+	return r, nil
 }
 
 // ReadChange returns the next [ir.Change] from the chunk, or

@@ -284,7 +284,8 @@ func TestRestore_HashMismatch_FailsLoudly(t *testing.T) {
 		t.Fatalf("close chunk handle: %v", err)
 	}
 	corrupted := append([]byte{}, original.Bytes()...)
-	// Flip a byte in the gzip body region (after the gzip header).
+	// Flip a byte in the compressed body region (after the codec
+	// header). Codec is DefaultCodec (zstd, v0.67.0) via Backup.Run.
 	if len(corrupted) > 30 {
 		corrupted[len(corrupted)/2] ^= 0xff
 	}
@@ -308,10 +309,19 @@ func TestRestore_HashMismatch_FailsLoudly(t *testing.T) {
 	if err == nil {
 		t.Fatal("Restore.Run on corrupted chunk: nil err; want ErrChunkHashMismatch")
 	}
-	// Either the gzip-header check or the SHA-256 check should fire,
-	// depending on which byte was flipped. Both are acceptable —
-	// what matters is that the restore refused to proceed silently.
-	if !errors.Is(err, ErrChunkHashMismatch) && !strings.Contains(err.Error(), "gzip") && !strings.Contains(err.Error(), "decode") && !strings.Contains(err.Error(), "row") {
+	// Either the codec-decode check or the SHA-256 check should fire,
+	// depending on which byte was flipped (zstd magic/frame, gzip
+	// header, decode garbage tripping the size guard, or the hash).
+	// All acceptable — the load-bearing invariant (already enforced by
+	// the nil-check above) is that restore refused to proceed silently;
+	// this only classifies the error as corruption-shaped, codec-neutral.
+	es := err.Error()
+	corruptionShaped := errors.Is(err, ErrChunkHashMismatch) ||
+		strings.Contains(es, "gzip") || strings.Contains(es, "zstd") ||
+		strings.Contains(es, "magic") || strings.Contains(es, "decode") ||
+		strings.Contains(es, "exceeded") || strings.Contains(es, "corrupt") ||
+		strings.Contains(es, "checksum") || strings.Contains(es, "row")
+	if !corruptionShaped {
 		t.Errorf("err = %v; want ErrChunkHashMismatch or a clear corruption error", err)
 	}
 }

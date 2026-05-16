@@ -284,8 +284,27 @@ var ErrChunkHashMismatch = errors.New("backup: chunk SHA-256 mismatch")
 // through from segment metadata; an unknown recorded codec is rejected
 // loudly by [validateRecordedCodec] before this is reached.
 func newChunkReader(src io.ReadCloser, expectedSHA256 string, cek []byte, codec Codec) (*chunkReader, error) {
-	if cek != nil && len(cek) != crypto.CEKLen {
+	// Ownership guard: until the chunkReader is successfully built (and
+	// thereafter owns Close of both the codec reader and src), EVERY
+	// early-return error path must release the underlying store handle
+	// and any constructed codec reader. Without this a corrupt / bad-
+	// codec / hash-mismatch chunk open leaks an FD per failure (on
+	// Windows it also blocks temp-dir cleanup). One named guard instead
+	// of a Close scattered on each path — and it covers the header-scan
+	// paths the scattered form missed.
+	var gz codecReadCloser
+	success := false
+	defer func() {
+		if success {
+			return
+		}
+		if gz != nil {
+			_ = gz.Close()
+		}
 		_ = src.Close()
+	}()
+
+	if cek != nil && len(cek) != crypto.CEKLen {
 		return nil, fmt.Errorf("chunk reader: cek length %d != %d", len(cek), crypto.CEKLen)
 	}
 	hasher := sha256.New()
@@ -299,30 +318,27 @@ func newChunkReader(src io.ReadCloser, expectedSHA256 string, cek []byte, codec 
 		gzSrc = io.TeeReader(src, hasher)
 	} else {
 		// Encrypted: read all ciphertext, hash it, decrypt, feed
-		// plaintext (the gzip stream) to the gzip reader.
+		// plaintext (the codec stream) to the codec reader.
 		ct, err := io.ReadAll(src)
 		if err != nil {
-			_ = src.Close()
 			return nil, fmt.Errorf("chunk reader: read ciphertext: %w", err)
 		}
 		if _, err := hasher.Write(ct); err != nil {
-			_ = src.Close()
 			return nil, fmt.Errorf("chunk reader: hash ciphertext: %w", err)
 		}
 		pt, err := crypto.DecryptChunk(ct, cek)
 		if err != nil {
-			_ = src.Close()
 			return nil, fmt.Errorf("chunk reader: decrypt: %w", err)
 		}
 		gzSrc = bytes.NewReader(pt)
 		encrypted = true
 		consumedSrc = true
 	}
-	gz, err := newCodecReader(gzSrc, codec)
+	cr, err := newCodecReader(gzSrc, codec)
 	if err != nil {
-		_ = src.Close()
 		return nil, fmt.Errorf("chunk reader: codec header: %w", err)
 	}
+	gz = cr
 	sc := bufio.NewScanner(gz)
 	// Allow large rows: 64 MiB max line buffer covers the wide-row
 	// workloads --max-buffer-bytes targets without blowing out memory.
@@ -341,7 +357,7 @@ func newChunkReader(src io.ReadCloser, expectedSHA256 string, cek []byte, codec 
 		return nil, fmt.Errorf("chunk reader: unsupported chunk format version %d (this build supports %d)",
 			hdr.Version, chunkHeaderVersion)
 	}
-	return &chunkReader{
+	r := &chunkReader{
 		src:         src,
 		hasher:      hasher,
 		gzReader:    gz,
@@ -350,7 +366,9 @@ func newChunkReader(src io.ReadCloser, expectedSHA256 string, cek []byte, codec 
 		header:      hdr,
 		encrypted:   encrypted,
 		consumedSrc: consumedSrc,
-	}, nil
+	}
+	success = true
+	return r, nil
 }
 
 // Header returns the chunk's header (column list + format version).

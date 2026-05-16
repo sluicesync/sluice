@@ -69,13 +69,34 @@ The zstd heap cost matters at high concurrency (per-table parallel chunk writes)
 - **No chunk-format change.** The bytes klauspost emits are valid gzip-format streams readable by any gzip decoder (including the stdlib's). The `chunkHeader.Version` stays at 1; restore paths (including from pre-swap backups) continue to work without modification.
 - **klauspost/compress is already in the module graph** as an indirect dependency of `github.com/jackc/pgx/v5`. Promoting it to a direct dependency adds zero binary-size cost.
 
-**Phase 2 — add `--compression=<algo>` flag with `gzip` default and `zstd` opt-in.** Justification only after operator demand:
+> **⚠ SUPERSEDED — see "Decision (v0.67.0)" below.** The Phase-2
+> "gzip default / zstd opt-in" recommendation that stood here was
+> reached *without weighing decode (restore) throughput* and measured
+> its ratio gap against *stdlib* gzip (the encoder this same doc says
+> to abandon). A decode-inclusive re-run reversed it. The original
+> text is retained struck-through for traceability.
 
-- zstd_default's ratio is comparable to gzip on text-heavy and numeric corpora but worse on json_mixed (~21% gap vs stdlib gzip). The headline win is encode CPU on the *next* tier (zstd_default at 280-500 MB/s vs klauspost_gzip at 150-440 MB/s — close enough that the format-version bump cost doesn't pay back unless storage cost matters more than backup-window CPU for a specific operator).
-- zstd_better's marginal ratio gain over zstd_default (≤5%) doesn't justify its encode-speed cost (~2× slower). Skip the level=11 option for the v1 flag.
-- snappy's encode speed is the genuine outlier (5-20×) but the ratio gap (~40% on json/numeric) is too expensive for backup chunks where bytes-on-S3 is a recurring cost. snappy could re-enter the conversation for the CDC streaming path where per-row latency dominates and chunks are smaller.
+**Phase 2 — add `--compression=<algo>` flag with `gzip` default and `zstd` opt-in.** ~~Justification only after operator demand:~~
 
-**Skipped this round** — algorithm-by-corpus auto-selection. The decision would require per-corpus shape detection in the writer, which is a much bigger change for diminishing returns; the corpus-agnostic gzip-or-zstd choice captures 80% of the benefit.
+- ~~zstd_default's ratio is comparable to gzip on text-heavy and numeric corpora but worse on json_mixed (~21% gap vs stdlib gzip). The headline win is encode CPU on the *next* tier — close enough that the format-version bump cost doesn't pay back unless storage cost matters more than backup-window CPU.~~
+- zstd_better's marginal ratio gain over zstd_default (≤5%) doesn't justify its encode-speed cost (~2× slower). Skip the level=11 option for the v1 flag. *(Still holds — zstd_better is the operator opt-in for ratio, not the default.)*
+- snappy's encode speed is the genuine outlier (5-20×) but the ratio gap (~40% on json/numeric) is too expensive for backup chunks. *(Still holds.)*
+
+**Skipped this round** — algorithm-by-corpus auto-selection (per-corpus shape detection is a much bigger change for diminishing returns).
+
+## Decision (v0.67.0) — gzip → zstd default, decode-inclusive re-run
+
+The harness was extended to measure **decode throughput as a warm
+median of 5 iterations** (the single cold pass under-reported zstd
+decode by 20–60%) and re-run at default + 1M-row scale. This reversed
+the Phase-2 conclusion above:
+
+- **Decode is the DR-critical axis the original analysis omitted.** zstd at SpeedDefault decodes **55–85% faster than klauspost gzip on every corpus** (json_mixed +57%, text_heavy +85%, numeric +56%, binary +180% at 1M scale). For a backup/restore tool, restore speed is arguably *the* primary axis.
+- **The "~21% ratio gap" was measured against *stdlib* gzip** — the encoder this doc simultaneously recommends abandoning. vs the shipping **klauspost** gzip the gap is **~5.4%** on the deliberately-pessimistic `json_mixed` floor, and **~1–4%** on representative-redundancy corpora; `zstd_better` actually *beats* klauspost_gzip on ratio while still decoding ~60% faster. Real sluice CDC chunks (repeated per-line envelope/position framing) are *more* redundant than `json_mixed`, so the expected-case gap is at the low end.
+- **zstd_default also encodes 0–30% faster than klauspost_gzip** — not a CPU tradeoff against it.
+- Cost accepted: ~3–7× encoder transient working set vs gzip (relevant only at high per-table fan-out; acceptable). Codec is recorded per segment in `lineage.json` (ADR-0046 §5) so mixed-codec lineages and any future change are non-breaking.
+
+**Shipped (v0.67.0): `--compression` default = `zstd`** (klauspost/compress at SpeedDefault), `gzip` and `none` operator-selectable, `zstd_better`/snappy not exposed. Clean break, no gzip-default shim (zero-users tenet). The short-term "swap stdlib→klauspost gzip" recommendation above is subsumed (zstd uses klauspost/compress, already a direct dep).
 
 ## Reproduce
 

@@ -226,9 +226,9 @@ type Backup struct {
 	// Codec is the per-segment compression codec (ADR-0046 §5) every
 	// chunk this run writes is compressed with. Recorded on the
 	// lineage's segment 0; restore reads it from there, never sniffs
-	// it. Empty resolves to gzip (DefaultCodec) — unchanged pre-ADR
-	// behaviour, so a one-segment never-rotated lineage is
-	// byte-identical to a pre-ADR single chain.
+	// it. Empty resolves to [DefaultCodec] (zstd, v0.67.0+). A
+	// one-segment never-rotated lineage takes the same single-segment
+	// restore path as a pre-ADR single chain (codec aside).
 	Codec Codec
 
 	// Now, when set, overrides the wall-clock-time source for

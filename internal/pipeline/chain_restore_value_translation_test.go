@@ -38,7 +38,10 @@ import (
 func writeOneChangeChunk(t *testing.T, store ir.BackupStore, chunkPath string, changes []ir.Change) (sha string, rowCount int64) {
 	t.Helper()
 	var buf bytes.Buffer
-	cw, err := newChangeChunkWriter(&buf, nil, CodecGzip)
+	// DefaultCodec so encode here agrees with the restore read-default
+	// (these tests fix no codec in the manifest; codec is incidental to
+	// value translation). v0.67.0: DefaultCodec is zstd.
+	cw, err := newChangeChunkWriter(&buf, nil, DefaultCodec)
 	if err != nil {
 		t.Fatalf("newChangeChunkWriter: %v", err)
 	}

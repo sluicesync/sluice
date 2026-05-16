@@ -391,7 +391,7 @@ type BackupFullCmd struct {
 
 	ChunkSize int `help:"Maximum rows per chunk file. The writer rolls over to a new file whenever the current chunk hits this row count. Smaller chunks restore faster (per-chunk SHA-256 verification can fail-fast on the smallest possible unit) but inflate the manifest. Default 100000." default:"100000" placeholder:"N"`
 
-	Compression string `help:"Per-segment chunk compression codec: none | gzip | zstd. Default gzip (unchanged behaviour). 'none' leaves chunks as human-readable .jsonl on a local-FS target; 'zstd' uses klauspost/compress/zstd at SpeedDefault. Recorded in lineage.json and read back from there on restore (never inferred from bytes)." default:"gzip" enum:"none,gzip,zstd" placeholder:"CODEC"`
+	Compression string `help:"Per-segment chunk compression codec: none | gzip | zstd. Default zstd (klauspost/compress at SpeedDefault — 55-85% faster restore, the DR-critical axis; ~1-5% larger than gzip on representative data). 'none' leaves chunks as human-readable .jsonl on a local-FS target; 'gzip' is the pre-v0.67.0 codec. Recorded in lineage.json and read back from there on restore (never inferred from bytes)." default:"zstd" enum:"none,gzip,zstd" placeholder:"CODEC"`
 
 	SlotName string `help:"Replication-slot name suffix on engines with a slot concept (Postgres). Used to label the EndPosition recorded on the manifest so a Phase 3 incremental chained off this full opens CDC against a slot of the same name. Default 'sluice_slot'. Engines without slots (MySQL: binlog stream is the slot) ignore this flag." placeholder:"NAME"`
 
@@ -679,7 +679,7 @@ type BackupStreamCmd struct {
 	RetainRotateAt            time.Duration `help:"In-process backup-segment rotation (ADR-0046): once the open segment reaches this age, the stream caps it and opens a fresh segment over the SAME CDC handle (no operator wrapper, no stream exit). Pair with 'sluice backup prune' to bound total disk. 0 disables (unbounded single segment)." placeholder:"DUR"`
 	RetainRotateAtChainLength int           `help:"Rotate the open segment after this many incrementals are committed to it. Either rotation threshold firing wins. 0 disables." placeholder:"N"`
 
-	Compression string `help:"Per-segment chunk compression codec: none | gzip | zstd. Default gzip (unchanged behaviour). 'none' leaves chunks as human-readable .jsonl on a local-FS target; 'zstd' uses klauspost/compress/zstd at SpeedDefault. Recorded per segment in lineage.json and read back from there on restore (never inferred from bytes)." default:"gzip" enum:"none,gzip,zstd" placeholder:"CODEC"`
+	Compression string `help:"Per-segment chunk compression codec: none | gzip | zstd. Default zstd (klauspost/compress at SpeedDefault — 55-85% faster restore, the DR-critical axis; ~1-5% larger than gzip on representative data). 'none' leaves chunks as human-readable .jsonl on a local-FS target; 'gzip' is the pre-v0.67.0 codec. Recorded per segment in lineage.json and read back from there on restore (never inferred from bytes)." default:"zstd" enum:"none,gzip,zstd" placeholder:"CODEC"`
 
 	// Phase-1 rotation flags removed in v0.67.0 (ADR-0046 §6). Kept as
 	// hidden no-value sentinels so the operator gets a CLEAR
