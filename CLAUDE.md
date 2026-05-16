@@ -126,6 +126,17 @@ If any of the five fails, fix the failure (typically: race conditions caught by 
 
 The session-local `.claude/settings.local.json` should pre-authorize `Bash(git push origin main:*)`, `Bash(git push origin v*:*)`, and `Bash(gh release edit:*)` so the autonomous flow doesn't trip the deny-by-default hook on every release.
 
+### Concurrency chunks: the `-race` integration gate runs BEFORE the tag
+
+The dev box is Windows + `CGO_ENABLED=0` and **cannot run `-race`** (the detector is a CGO/TSan runtime); integration tests also need Docker. So "integration **+** `-race`" exists only on CI's Linux runner. For chunks touching **concurrency** (goroutines, channels, shared state, rotation/FSM, crash-recovery, failpoints), that gate MUST pass *before* the tag is cut — never cut or force-move a tag ahead of the first `-race` run for such a chunk. Cutting first and watching after is the v0.20.x/v0.67.0 trap: it turns a found race/mis-stitch into a force-tag-move + duplicate-draft + ~50–70-min retag loop.
+
+Two ways to satisfy it, in preference order:
+
+1. **Local Docker (`scripts/race-integration.ps1`).** Runs `go test -tags=integration -race ./internal/...` inside a `golang` Linux container with `gcc`/`CGO_ENABLED=1` and the host Docker socket bind-mounted so testcontainers spawns sibling DB containers (DooD). ~1-minute-to-start local pre-tag gate that mirrors CI exactly. Rancher-Desktop socket caveats are documented in the script; if DooD proves flaky on the local Rancher setup, fall through to (2).
+2. **Push-first, tag-after (zero-infra, always applies).** Push the work to `main` (or a branch) and wait for the **Integration** job green *before* cutting the tag. One CI cycle either way — but it eliminates the tag-force-move / duplicate-draft churn entirely. This alone would have prevented the v0.67.0 retag loop.
+
+Non-concurrency chunks keep the existing tag-then-watch flow (CI is almost always green there; the `-race`-before-tag rule is specifically for the chunk class where a race/ordering bug is plausible). When in doubt, treat it as a concurrency chunk.
+
 ## Debugging non-obvious failures (the three-phase protocol)
 
 When a CI failure or test regression doesn't match an obvious hypothesis — or when the first speculative patch doesn't fix it — **stop speculating and run the three-phase protocol.** This pattern has closed Bug 37, the v0.20.0 broker false-failures, the v0.20.1 stream regression, and Bug 41 cleanly; speculative patching ahead of ground truth has burned multi-cycle retag loops in the same session. The discipline is non-negotiable when:
