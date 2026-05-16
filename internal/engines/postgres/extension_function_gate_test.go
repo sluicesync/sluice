@@ -165,7 +165,7 @@ func TestExtensionFunctionDefaultGate(t *testing.T) {
 	msg := err.Error()
 	for _, frag := range []string{
 		`"users"."id"`, "uuid_generate_v4", "uuid-ossp",
-		"--enable-pg-extension uuid-ossp", "--expr-override", "DEFAULT",
+		"--enable-pg-extension uuid-ossp", "--exclude-table", "DEFAULT",
 	} {
 		if !strings.Contains(msg, frag) {
 			t.Errorf("refusal message missing %q; got: %s", frag, msg)

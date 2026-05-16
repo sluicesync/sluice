@@ -2,8 +2,13 @@
 
 ## Status
 
-**Accepted (2026-05-16).** Design signed off; implementation
-pending. Implements the ADR-0032 §Consequences "Tier 3 … the
+**Accepted (2026-05-16); implemented (commit `837769c`), shipping
+in v0.65.0.** One post-implementation correction applied during
+review: the refusal message's escape-hatch wording dropped
+`--expr-override` (verified inapplicable to this read-time gate —
+see §2 and the precedence note) in favour of `--enable-pg-extension`
+/ `--exclude-table`; code, test, and this ADR were updated in
+lock-step. Implements the ADR-0032 §Consequences "Tier 3 … the
 natural v2 chunk." Sign-off decision: the same-engine PG → PG
 **opt-in gate is adopted as drafted** — extension-function
 defaults/generated-exprs require `--enable-pg-extension <ext>` and
@@ -102,8 +107,17 @@ parser; reuse the lightweight matcher style already in
 - **Extension NOT enabled** → **loud refusal at schema-read**:
   `column "users.id" DEFAULT uuid_generate_v4() requires
   --enable-pg-extension uuid-ossp (uuid-ossp owns uuid_generate_v4;
-  pass the flag so sluice preflights it on the target, or supply
-  --expr-override)`. This is a **deliberate behaviour change**:
+  pass the flag so sluice preflights it on the target, or
+  --exclude-table to skip it)`. **Post-implementation correction:**
+  the original draft named `--expr-override` as the escape; that is
+  inaccurate and was removed from the message + this spec.
+  `ApplyExpressionOverrides` rewrites only generated-column
+  expressions (never DEFAULTs) and runs *after* `ReadSchema`, while
+  this gate fires *inside* `ReadSchema` — the run aborts before any
+  override could apply, so `--expr-override` is not a working escape
+  for this gate. The honest escapes are `--enable-pg-extension`
+  (the fix) or `--exclude-table` (skip). This is a **deliberate
+  behaviour change**:
   today the same case passes silently then fails ugly at apply.
   Per the loud-failure-early tenet and the zero-users → cleaner-
   breaking-change tenet, the explicit opt-in is the correct design
@@ -135,8 +149,15 @@ parser; reuse the lightweight matcher style already in
 - Same-engine passthrough mechanics (already verbatim).
 - Core-PG function defaults (`gen_random_uuid()`, `now()`,
   `nextval()`, …) — never gated, never refused.
-- `--expr-override` precedence — still replaces the IR expr before
-  the writer/gate sees it (an override suppresses the Tier-3 gate).
+- `--expr-override` does **not** suppress the same-engine schema-read
+  gate (§2): it rewrites only generated-column expressions and runs
+  *after* `ReadSchema`, whereas the gate fires *inside* `ReadSchema`.
+  It *can* suppress the **cross-engine** crypto refusal (§3) for a
+  *generated-column* expression, because `checkCrossEngineSupportable`
+  runs after `ApplyExpressionOverrides` — but never for a crypto
+  *DEFAULT* (overrides don't touch DEFAULTs). Verified against the
+  pipeline ordering (`ReadSchema` → `ApplyMappings` →
+  `ApplyExpressionOverrides` → `checkCrossEngineSupportable`).
 - IR shape — no `ir` change (`DefaultExpression`/`GeneratedExpr`
   already carry expr+dialect; the gate is reader/preflight-side).
 - Other engines, CDC/row data path, value semantics.

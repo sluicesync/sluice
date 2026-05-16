@@ -863,7 +863,15 @@ func lookupExtensionOwningFunction(fnName string) (extension string, ok bool) {
 // the owning extension is NOT in enabledExtensions, it returns a
 // loud, operator-actionable refusal naming the column, the function,
 // the owning extension, the `--enable-pg-extension <ext>` fix, and
-// the `--expr-override` escape hatch (ADR-0044 §2 message shape).
+// `--exclude-table` as the skip escape (ADR-0044 §2 message shape).
+//
+// The message deliberately does NOT name `--expr-override`: that
+// override (ApplyExpressionOverrides) rewrites only generated-column
+// expressions, never DEFAULTs, and runs *after* ReadSchema — this
+// gate fires inside ReadSchema, so the run aborts before any
+// override could apply. Naming it would be inaccurate operator
+// guidance (verified against the pipeline ordering; ADR-0044 §2
+// corrected post-implementation).
 //
 // When the extension IS enabled the expression passes through
 // unchanged (today's verbatim behaviour) — return nil; the
@@ -894,8 +902,10 @@ func extensionFunctionDefaultGate(
 			"owned by the %q extension. Re-run with "+
 			"--enable-pg-extension %s so sluice preflights the extension "+
 			"on the target (ADR-0032/ADR-0044 opt-in passthrough), or "+
-			"supply --expr-override for the column to replace the "+
-			"expression with target-portable text",
+			"--exclude-table to skip this table (note: --expr-override "+
+			"does not apply — it rewrites only generated-column "+
+			"expressions and runs after schema-read, while this gate "+
+			"fires during schema-read)",
 		tableName, colName, exprKind, fn, owningExt, owningExt)
 }
 
