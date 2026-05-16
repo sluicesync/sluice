@@ -6,6 +6,18 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.67.1]
+
+**Closes Bug 66 (HIGH) — a multi-segment backup whose `lineage.json` was absent silently restored only the root segment.** The v0.67.0 post-release regression cycle found that `restore` of a rotated multi-segment backup with `lineage.json` missing (the pre-v0.67.0 `chain.json`-shaped layout, or a lost catalog) silently degraded to a `manifest.json`-only single-segment + first-incremental restore — observed dropping ~90% of rows (1,200 of 11,925) with `exit 0` and no error/WARN. The *unreadable*/garbled-`lineage.json` path already loud-refused correctly; only the *absent*-and-actually-multi-segment branch fell back silently. v0.67.0's CHANGELOG/release notes overclaimed the clean-break loud-refusal guarantee for this case — corrected below and here.
+
+### Fixed
+
+- **Bug 66 (closed).** `resolveLineage`'s absent-`lineage.json` branch now probes for rotation-opened segment directories (`seg-*`) before the legacy single-segment synthesis. If any exist, the backup is a rotated multi-segment lineage that cannot be reconstructed from a bare directory walk → **loud refusal** (DR data, never a silent partial — the same contract the unreadable-`lineage.json` path already honored). A genuine never-rotated / pre-ADR backup (no `seg-*` dirs) still synthesizes a one-segment lineage and restores unchanged — the strict-generalization behavior is preserved. The segment-dir prefix is now a single shared constant (`rotationSegmentDirPrefix`) used by both the rotation producer and this restore-side guard. Pinned by two no-build-tag regression tests (refuse multi-segment; legacy single-segment still resolves) that run in the fast CI Test job on all OSes.
+
+### Compatibility
+
+Drop-in from v0.67.0. No API/CLI/IR-contract/state-format change. Strictly corrective. A backup whose `lineage.json` is intact is unaffected (that path always restored correctly). The behavior change is solely: a rotated backup with a *missing* `lineage.json` now **refuses loudly** instead of silently restoring a fraction — restore from a copy whose `lineage.json` is intact (it is the authoritative structural record for a rotated backup).
+
 ## [0.67.0]
 
 **Native bounded-segment backup lineage + inline rotation (ADR-0046), and the backup compression default flips gzip→zstd.** `sluice backup stream run` no longer grows one unbounded chain forever: a backup is now a *lineage* of capped, full-anchored *segments*, and rotation is `lineage.appendSegment` — not an exceptional event grafted onto a chain. `--retain-rotate-at=DUR` / `--retain-rotate-at-chain-length=N` rotate the open segment in-process (no operator cron wrapper). `chain.json` is replaced by `lineage.json` (clean break — zero on-disk backups predate it, zero-users tenet; no migration shim). A never-rotated backup is a one-segment lineage that takes the same single-segment restore path as before.
@@ -18,7 +30,7 @@ project follows [Semantic Versioning](https://semver.org/).
 ### Changed
 
 - **Backup compression default: gzip → zstd** (klauspost/compress at SpeedDefault). The compressbench decision doc was re-run with decode throughput measured (warm median, not single cold pass) and the conclusion reversed: zstd decodes **55–85% faster than klauspost gzip on every corpus** — restore speed is the DR-critical axis the original encode/ratio-only analysis omitted — and encodes 0–30% faster, at a ~1–5% ratio cost on representative chunk data (the "~21%" the old doc cited was measured against *stdlib* gzip, the encoder it also recommended abandoning). `--compression=gzip` remains available. Clean break, no gzip-default shim.
-- **`chain.json` → `lineage.json`.** The grafted-rotation bimodality (`RotatedAt`/`SucceededBy`/`RotationReason`/`Tombstoned`) is gone; restore is a uniform segment-by-segment lineage walk gated by one boundary-monotonicity invariant (exact intra-segment, monotonic inter-segment — the same `validateBoundary` call site). 14c prune is reframed onto segments. A malformed lineage is a loud refusal, never a silent partial assemble.
+- **`chain.json` → `lineage.json`.** The grafted-rotation bimodality (`RotatedAt`/`SucceededBy`/`RotationReason`/`Tombstoned`) is gone; restore is a uniform segment-by-segment lineage walk gated by one boundary-monotonicity invariant (exact intra-segment, monotonic inter-segment — the same `validateBoundary` call site). 14c prune is reframed onto segments. A malformed/*unreadable* lineage is a loud refusal, never a silent partial assemble. **(Correction, see v0.67.1 / Bug 66:** an *absent* `lineage.json` on a rotated multi-segment backup was NOT loud in v0.67.0 — it silently restored only the root segment. Fixed in v0.67.1; this sentence's guarantee fully holds only as of v0.67.1.**)**
 
 ### Removed
 
@@ -30,7 +42,7 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Compatibility
 
-**Breaking, by design (zero-users tenet — no shims).** (1) On-disk format: `chain.json` is gone; existing `chain.json` backups are not read. (2) New backups default to **zstd**-compressed chunks; `gzip` requires `--compression=gzip`. (3) `--exit-after-*` flags removed. There are no production backups predating v0.67.0 to migrate; the clean break was chosen over additive compatibility per the project tenet. Rotation correctness was rig-verified: crash-injection matrix at every FSM edge, an 8-segment zero-loss rotation under continuous write, the `S≥P_N` hard-fail, never-rotated byte-identical restore, and mixed-codec restore.
+**Breaking, by design (zero-users tenet — no shims).** (1) On-disk format: `chain.json` is gone; existing `chain.json` backups are not read — **CORRECTION (Bug 66, fixed v0.67.1):** in v0.67.0 a `chain.json`-shaped (lineage.json-absent) *multi-segment* backup was not cleanly rejected — it silently restored only the root segment (~90% loss, exit 0). It loud-refuses as of v0.67.1; upgrade to v0.67.1. (2) New backups default to **zstd**-compressed chunks; `gzip` requires `--compression=gzip`. (3) `--exit-after-*` flags removed. There are no production backups predating v0.67.0 to migrate; the clean break was chosen over additive compatibility per the project tenet. Rotation correctness was rig-verified: crash-injection matrix at every FSM edge, an 8-segment zero-loss rotation under continuous write, the `S≥P_N` hard-fail, never-rotated byte-identical restore, and mixed-codec restore.
 
 ## [0.66.1]
 
