@@ -156,6 +156,52 @@ func TestTranslateDefault_BitAndIntroducer(t *testing.T) {
 			t.Errorf("Dialect = %q; want %q", exp.Dialect, "mysql")
 		}
 	})
+	// Bug 64: an expression-form DEFAULT that references backtick-quoted
+	// columns must have the backticks stripped at the read boundary —
+	// identical to the generated / CHECK / index positions — so the
+	// IR holds portable text and the writer's requote(translate(expr))
+	// composition produces the correct target quoting. Pre-fix the
+	// DEFAULT-expr path skipped stripMySQLIdentifierQuotes, leaving
+	// `` (`order` + `user`) `` in the IR → broken PG DDL (SQLSTATE
+	// 42601). Reserved-vs-bare requoting is a writer concern; the
+	// reader's job is only to remove the source-dialect quoting.
+	t.Run("backticks stripped on expression default (Bug 64)", func(t *testing.T) {
+		got := translateDefault(sql.NullString{String: "(`order` + `user`)", Valid: true}, "DEFAULT_GENERATED", ir.Integer{})
+		exp, ok := got.(ir.DefaultExpression)
+		if !ok {
+			t.Fatalf("got %T; want ir.DefaultExpression", got)
+		}
+		if exp.Expr != "(order + user)" {
+			t.Errorf("Expr = %q; want %q", exp.Expr, "(order + user)")
+		}
+		if exp.Dialect != "mysql" {
+			t.Errorf("Dialect = %q; want %q", exp.Dialect, "mysql")
+		}
+	})
+	t.Run("backticks + charset introducer + escaped apostrophes all stripped on expression default (Bug 64)", func(t *testing.T) {
+		got := translateDefault(sql.NullString{String: "concat(`name`, _utf8mb4\\'!\\')", Valid: true}, "DEFAULT_GENERATED", ir.Varchar{Length: 64})
+		exp, ok := got.(ir.DefaultExpression)
+		if !ok {
+			t.Fatalf("got %T; want ir.DefaultExpression", got)
+		}
+		if exp.Expr != "concat(name, '!')" {
+			t.Errorf("Expr = %q; want %q", exp.Expr, "concat(name, '!')")
+		}
+	})
+	// Bug 62 must stay byte-identical: the bit-literal path returns
+	// before normalizeMySQLExpressionText, so a bit literal is never
+	// backtick-touched (it has none anyway, but the early return is the
+	// load-bearing invariant).
+	t.Run("bit-literal default unaffected by the Bug 64 strip (Bug 62 regression pin)", func(t *testing.T) {
+		got := translateDefault(sql.NullString{String: "b'10100101'", Valid: true}, "DEFAULT_GENERATED", ir.Bit{Length: 8})
+		exp, ok := got.(ir.DefaultExpression)
+		if !ok {
+			t.Fatalf("got %T; want ir.DefaultExpression", got)
+		}
+		if exp.Expr != "b'10100101'" || exp.Dialect != bitLiteralDialect {
+			t.Errorf("Expr=%q Dialect=%q; want %q / %q", exp.Expr, exp.Dialect, "b'10100101'", bitLiteralDialect)
+		}
+	})
 	t.Run("plain literal default unaffected", func(t *testing.T) {
 		got := translateDefault(sql.NullString{String: "hello", Valid: true}, "", ir.Varchar{Length: 32})
 		lit, ok := got.(ir.DefaultLiteral)

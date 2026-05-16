@@ -788,17 +788,26 @@ func isIdentRune(r rune) bool {
 //     0xA5, not the decimal string '165'. The writers render it in
 //     each target's bit-literal syntax (`b'…'` MySQL, `B'…'` PG).
 //
-//   - Expression-form defaults carry MySQL's stored-form charset
-//     introducers (`_utf8mb4'x'`) and C-style apostrophe escapes
-//     (`\'x\'`); a cross-engine Postgres target rejects both
-//     (SQLSTATE 42601 — catalog #6). These are the same MySQL-internal
-//     decorations [normalizeMySQLExpressionText] strips for generated /
-//     CHECK expressions; defaults were the one IR-expression path that
-//     bypassed it. Backtick identifier quotes are *not* stripped here:
-//     the writer's reserved-word re-quoting (catalog #5) needs to see
-//     them, and a same-engine MySQL target requires them — so the
-//     identifier-quote concern is resolved writer-side, not at the
-//     read boundary, for defaults.
+//   - Expression-form defaults carry MySQL's stored-form backtick
+//     identifier quotes, charset introducers (`_utf8mb4'x'`), and
+//     C-style apostrophe escapes (`\'x\'`); a cross-engine Postgres
+//     target rejects all three (SQLSTATE 42601 — catalog #6, Bug 64).
+//     These are the same MySQL-internal decorations
+//     [normalizeMySQLExpressionText] strips for generated / CHECK /
+//     index expressions, so the DEFAULT-expression path uses the
+//     identical helper — the IR holds portable, backtick-free
+//     expression text at all four expression positions, symmetric by
+//     construction. Backtick stripping is dialect-quoting
+//     normalization, not function/operator translation; the writers'
+//     reserved-word re-quoting (ADR-0045's uniform
+//     requote(translate(expr)) composition) re-adds the target's
+//     quoting where a referenced column name is reserved, identically
+//     for the cross-engine and same-engine paths — exactly as it
+//     already does for generated / CHECK / index. (Pre-Bug-64 the
+//     backtick strip was deliberately skipped here under the obsolete
+//     belief the writer needed to see the source backticks; ADR-0045
+//     made the writer composition uniform across all four positions,
+//     so the reader-side strip is now the correct, symmetric locus.)
 func translateDefault(def sql.NullString, extra string, typ ir.Type) ir.DefaultValue {
 	if !def.Valid {
 		return ir.DefaultNone{}
@@ -821,8 +830,7 @@ func translateDefault(def sql.NullString, extra string, typ ir.Type) ir.DefaultV
 		// MySQL-spelled defaults like `(UUID())`, `(RAND() * 100)`, or
 		// `(DATE_ADD(...))` would emit verbatim and fail loud on PG —
 		// see Bugs 28/29/30.
-		expr := stripMySQLCharsetIntroducers(def.String)
-		expr = convertMySQLEscapedApostrophes(expr)
+		expr := normalizeMySQLExpressionText(def.String)
 		return ir.DefaultExpression{Expr: expr, Dialect: "mysql"}
 	}
 	return ir.DefaultLiteral{Value: def.String}

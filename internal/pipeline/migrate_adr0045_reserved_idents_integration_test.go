@@ -29,8 +29,10 @@
 package pipeline
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"strings"
 	"testing"
 	"time"
 
@@ -53,10 +55,22 @@ func TestMigrate_MySQLToPostgres_ReservedWordExprSweep(t *testing.T) {
 
 	// `order` is reserved in both engines. The generated column derives
 	// from it; the CHECK constrains it; the functional index is on an
-	// expression over it; the DEFAULT is a literal expression (so the
-	// requote path is exercised on a column-less default too — the
-	// reserved word here is the column the default lands on, validated
-	// via a bare INSERT).
+	// expression over it; `created_at DEFAULT CURRENT_TIMESTAMP` keeps
+	// the constant-default coverage.
+	//
+	// The Bug 64 cell — a *column-referencing* expression DEFAULT over
+	// reserved-word columns — is exercised in the dedicated
+	// "Bug64_columnref_default_emit" sub-test below via the schema-
+	// preview surface, NOT here: PostgreSQL semantically forbids a
+	// column reference in a DEFAULT expression (SQLSTATE 0A000) for ANY
+	// such column, so a full MySQL→PG migrate of one can never reach
+	// exit 0 by PG's own design. Bug 64's defect is the *emitted DDL*:
+	// pre-fix the MySQL backticks leaked into the PG CREATE TABLE
+	// (SQLSTATE 42601 — a syntax error, the wrong failure). The
+	// fix's contract is that the emitted PG DDL is syntactically
+	// well-formed (backticks stripped at the reader, reserved-word
+	// refs PG-requoted, non-reserved bare); the preview surface is the
+	// correct, deterministic place to assert that.
 	const seedDDL = `
 		CREATE TABLE widgets (
 			id          BIGINT NOT NULL PRIMARY KEY,
@@ -91,8 +105,8 @@ func TestMigrate_MySQLToPostgres_ReservedWordExprSweep(t *testing.T) {
 		t.Fatalf("widgets row count = %d; want 2", n)
 	}
 
-	// GENERATED recompute on a fresh INSERT (also exercises the DEFAULT
-	// on created_at via a bare insert that omits it).
+	// GENERATED recompute on a fresh INSERT (also exercises the
+	// constant-form DEFAULT on created_at via a bare insert).
 	if _, err := tgt.ExecContext(ctx,
 		`INSERT INTO widgets (id, "order") VALUES (3, 7)`); err != nil {
 		t.Fatalf("INSERT into pg widgets (valid): %v", err)
@@ -107,7 +121,7 @@ func TestMigrate_MySQLToPostgres_ReservedWordExprSweep(t *testing.T) {
 		t.Errorf("generated `doubled` = %d; want 14 (order*2, order=7)", doubled)
 	}
 	if !createdAt.Valid {
-		t.Errorf("DEFAULT created_at did not apply on bare INSERT (Bug 64 MySQL→PG)")
+		t.Errorf("DEFAULT created_at did not apply on bare INSERT")
 	}
 
 	// CHECK enforcement: a negative `order` must be rejected.
@@ -120,6 +134,80 @@ func TestMigrate_MySQLToPostgres_ReservedWordExprSweep(t *testing.T) {
 	if !pgIndexExists(t, ctx, tgt, "widgets", "widgets_order_plus1") {
 		t.Errorf("functional index widgets_order_plus1 missing on pg target")
 	}
+
+	// ─── Bug 64 DEFAULT-cell: the coverage hole the v0.66.0 sweep
+	// missed. The 4×2×2 sweep's DEFAULT position only ever used a
+	// constant default (CURRENT_TIMESTAMP) with no column reference and
+	// no backticks, so it never exercised the MySQL→PG backtick-strip
+	// path and stayed green while Bug 64 was broken. This sub-test
+	// drives a column-referencing expression default over reserved-word
+	// AND non-reserved columns and asserts the *emitted PG DDL* (via the
+	// schema-preview surface, which runs the real MySQL reader + PG
+	// writer) is syntactically well-formed:
+	//
+	//   - reserved `def_ord DEFAULT (` + "`order` + `user`" + `)`
+	//     → `("order" + "user")` (backticks stripped at reader,
+	//     reserved refs PG-requoted by the writer)
+	//   - non-reserved control `def_ctl DEFAULT (` + "`name_n` + 100)" + `)`
+	//     → `(name_n + 100)` (stripped, bare, no spurious requote)
+	//   - NO literal backtick anywhere in the emitted DDL.
+	//
+	// Pre-fix this sub-test FAILS: the reader left the backticks in
+	// `ir.DefaultExpression.Expr`, so the emitted DDL contained
+	// `` (`"order"` + `"user"`) `` / `` (`name_n` + 100) ``.
+	t.Run("Bug64_columnref_default_emit", func(t *testing.T) {
+		const defDDL = `
+			CREATE TABLE def_rw (
+				id       INT PRIMARY KEY,
+				` + "`order`" + ` INT NOT NULL,
+				` + "`user`" + `  INT NOT NULL,
+				name_n   INT NOT NULL,
+				def_ord  INT NOT NULL DEFAULT (` + "`order`" + ` + ` + "`user`" + `),
+				def_ctl  INT NOT NULL DEFAULT (name_n + 100)
+			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+		`
+		applyMySQLDDL(t, mysqlSource, defDDL)
+
+		mysqlEng, ok := engines.Get("mysql")
+		if !ok {
+			t.Fatal("mysql engine not registered")
+		}
+		pgEng, ok := engines.Get("postgres")
+		if !ok {
+			t.Fatal("postgres engine not registered")
+		}
+		var buf bytes.Buffer
+		prev := &Previewer{
+			Source:    mysqlEng,
+			Target:    pgEng,
+			SourceDSN: mysqlSource,
+			TargetDSN: pgTarget,
+			Format:    "text",
+			Out:       &buf,
+		}
+		pctx, pcancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer pcancel()
+		if err := prev.Run(pctx); err != nil {
+			t.Fatalf("preview Run: %v", err)
+		}
+		out := buf.String()
+
+		// The exact reserved-requoted / bare-control shapes. These are
+		// the post-fix-correct emit; pre-fix the reader leaked backticks
+		// so neither substring was present.
+		if !strings.Contains(out, `DEFAULT ("order" + "user")`) {
+			t.Errorf("reserved-word column-ref DEFAULT not emitted as `(\"order\" + \"user\")` (Bug 64); preview:\n%s", out)
+		}
+		if !strings.Contains(out, `DEFAULT (name_n + 100)`) {
+			t.Errorf("non-reserved control DEFAULT not emitted bare as `(name_n + 100)` (Bug 64); preview:\n%s", out)
+		}
+		// Hard backtick-leak guard: a literal backtick anywhere in the
+		// emitted PG DDL is the Bug 64 defect, full stop. (The preview
+		// header / source line never contain backticks.)
+		if strings.Contains(out, "`") {
+			t.Errorf("emitted PG DDL contains a literal backtick — Bug 64 backtick leak; preview:\n%s", out)
+		}
+	})
 }
 
 // TestMigrate_PostgresToMySQL_ReservedWordExprSweep is the symmetric

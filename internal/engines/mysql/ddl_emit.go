@@ -384,6 +384,21 @@ func emitDefault(d ir.DefaultValue, t ir.Type) (string, bool) {
 			// output stays byte-identical and the cross-dialect outcomes
 			// for those three forms are preserved.
 			expr = requoteMySQLReservedIdents(translateExprForMySQL(expr))
+		} else {
+			// Same-dialect (or untagged) DEFAULT body. The MySQL read
+			// boundary strips backtick identifier quotes for IR
+			// portability (Bug 64 — symmetric with the generated /
+			// CHECK / index positions), so a same-engine MySQL→MySQL
+			// default referencing a reserved-word column (`order`,
+			// `user`) would otherwise emit bare and fail with Error
+			// 1064. Re-quote bare reserved-word tokens — the exact
+			// same load-bearing same-dialect requote
+			// translateGeneratedExpr / translateCheckExpr /
+			// translateIndexExpr already apply (ADR-0045: "the MySQL
+			// writer requotes even on the same-dialect path"). No
+			// translate pass on this arm: same-dialect bodies are
+			// emitted verbatim modulo the reserved-word requote.
+			expr = requoteMySQLReservedIdents(expr)
 		}
 		// Canonical PG-default-form coverage + MySQL DEFAULT-grammar
 		// shaping. This block is byte-identical to the pre-ADR-0045

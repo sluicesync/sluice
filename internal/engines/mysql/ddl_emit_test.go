@@ -197,6 +197,31 @@ func TestEmitDefault(t *testing.T) {
 		{"literal with quote", ir.DefaultLiteral{Value: "it's"}, ir.Varchar{Length: 32}, "'it''s'", true},
 		{"expression", ir.DefaultExpression{Expr: "CURRENT_TIMESTAMP"}, ir.Timestamp{}, "CURRENT_TIMESTAMP", true},
 
+		// Bug 64 same-dialect requote (load-bearing asymmetry,
+		// ADR-0045): the MySQL reader strips backticks for IR
+		// portability, so a same-engine MySQL→MySQL expression DEFAULT
+		// referencing a reserved-word column must be re-quoted by the
+		// writer — exactly as translateGeneratedExpr / translateCheckExpr
+		// / translateIndexExpr already do on their same-dialect arm.
+		// Without it the emitted `DEFAULT (order + user)` is MySQL
+		// Error 1064. `order` (reserved) requoted, `user` left bare
+		// (non-reserved in MySQL's set) — byte-identical-shape to the
+		// gen/CHECK same-dialect emit.
+		{
+			"same-dialect reserved-word column-ref default requoted (Bug 64)",
+			ir.DefaultExpression{Expr: "(order + user)", Dialect: "mysql"},
+			ir.Integer{Width: 32},
+			"(`order` + user)", true,
+		},
+		// Untagged (hand-built IR / older fixtures) takes the same
+		// same-dialect arm — reserved-word requote, no translate.
+		{
+			"untagged reserved-word column-ref default requoted (Bug 64)",
+			ir.DefaultExpression{Expr: "(`order` + 1)"},
+			ir.Integer{Width: 32},
+			"(`order` + 1)", true,
+		},
+
 		// Boolean literal translation: PG hands us "true"/"false",
 		// MySQL needs "1"/"0".
 		{"bool literal true", ir.DefaultLiteral{Value: "true"}, ir.Boolean{}, "1", true},
