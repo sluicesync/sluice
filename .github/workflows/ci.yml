@@ -164,13 +164,16 @@ jobs:
   integration:
     name: Integration
     runs-on: ubuntu-latest
-    # 35m outer envelope. Was 60m through v0.28.0 because the same job
-    # ran both the integration suite + the postgis-tagged suite (which
-    # is additive — `-tags="integration postgis"` re-runs every
-    # integration test). v0.29.0 split postgis into its own parallel
-    # job (`integration-postgis`); this job no longer pulls the postgis
-    # image or runs the postgis step, so 35m is right-sized again.
-    timeout-minutes: 35
+    # 45m outer envelope. Was 60m through v0.28.0 (job also ran the
+    # additive postgis-tagged suite); v0.29.0 split postgis into its
+    # own parallel job and it dropped to 35m. v0.68.0: the integration
+    # suite grew organically (ADR-0046 inline-rotation crash-injection
+    # matrix ×5 FSM edges + 8-segment zero-loss + the full backup/
+    # restore surface, then ADR-0047 verbatim passthrough) to ~at the
+    # 25m inner go-test timeout by v0.67.1; bumped to 45m outer / 35m
+    # inner for durable headroom (kept go-test-timeout < timeout-minutes
+    # so Go's diagnostic timeout-panic fires before any hard job kill).
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-go@v6
@@ -202,17 +205,24 @@ jobs:
       # would defeat the point). -race catches data-race bugs in the
       # reader/writer code paths under realistic concurrency.
       #
-      # -timeout=25m bumps the per-package timeout from Go's 10-minute
-      # default. History: v0.11.2 surfaced 10-minute false-failure
-      # timeouts where internal/engines/mysql and internal/pipeline
-      # accumulated the budget across ~30 testcontainer boots × ~30s
-      # each + per-test work × -race overhead — bumped to 18m. v0.22.0
-      # (Phase 6.1 encryption) added ~7 new crypto integration tests
-      # to internal/pipeline; tag CI hit the 18m bound while main CI
-      # on the same commit just cleared it (scheduler variance under
-      # heavy CI load). Bumped to 25m for headroom. The job's 35m
-      # timeout-minutes caps the outer envelope.
-      - run: go test -tags=integration -race -count=1 -timeout=25m ./internal/...
+      # -timeout=35m bumps the per-test-binary timeout from Go's
+      # 10-minute default. History: v0.11.2 surfaced 10-minute
+      # false-failure timeouts where internal/engines/mysql and
+      # internal/pipeline accumulated the budget across ~30
+      # testcontainer boots × ~30s each + per-test work × -race
+      # overhead — bumped to 18m. v0.22.0 (Phase 6.1 encryption) added
+      # ~7 crypto integration tests to internal/pipeline; bumped to 25m
+      # for headroom. v0.68.0: the internal/pipeline package binary
+      # under -race reached ~25m at v0.67.1 (ADR-0046 inline-rotation
+      # crash-injection matrix ×5 + 8-segment zero-loss + the full
+      # backup/restore surface), and ADR-0047's verbatim integration
+      # tests tipped it over — a stale budget vs an organically grown
+      # suite, NOT a logic regression (Phase A: `panic: test timed out
+      # after 25m0s`, no FAIL/DATA RACE). Bumped to 35m for durable
+      # headroom; the job's 45m timeout-minutes caps the outer envelope
+      # (kept inner < outer so Go's diagnostic timeout-panic fires
+      # before any hard job kill).
+      - run: go test -tags=integration -race -count=1 -timeout=35m ./internal/...
 
   # ----- Integration: PostGIS -----
   # Split out as a separate parallel job in v0.29.0 (was in-line as a
