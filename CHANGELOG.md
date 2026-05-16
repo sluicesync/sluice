@@ -6,6 +6,30 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.66.0]
+
+**Expression-identifier-translation consolidation (ADR-0045).** Replaces the reactive per-cell point-fixes (#5, Bug 61, Bug 63, Bug 64) with one named, tested mechanism applied uniformly across every expression position and direction — and closes Bug 64, Bug 65, and a latent PG→MySQL gap the new proactive sweep caught during implementation.
+
+### Changed
+
+- **One shared, engine-parameterized identifier-requote mechanism.** New `internal/translate/exprident` leaf package: the previously byte-identical-duplicated scan primitives (`ScanStringLiteral`, `ScanParenGroup`, `SplitTopLevelArgs`, `IsIdentifierByte`) now live there once; `RequoteIdentifiers(expr, Config{QuoteByte, Reserved, GrammarExclusions, SkipWSBeforeParen})` is the single implementation. The per-engine `requoteMySQLReservedIdents` / `requotePGReservedIdents` are thin wrappers; the reserved-word / grammar-keyword sets stay engine-owned (they are dialect definitions). Net production code shrinks (more duplication deleted than added).
+- **Uniform cross-dialect composition `requote(translate(expr))` at all four expression positions × both writers** (generated-column, CHECK, index, **DEFAULT**). Same-dialect short-circuits are byte-identical, including the deliberate asymmetry that the MySQL writer requotes even on the same-dialect path (the MySQL reader strips backticks for IR portability) while PostgreSQL same-dialect stays verbatim.
+- **MySQL index expressions are now cross-dialect translated** (ADR-0045 D2). Previously requote-only; PG-source functional indexes with PG-specific operators (`||`, `::`) now translate for MySQL targets like the other expression positions.
+
+### Fixed
+
+- **Bug 64 — cross-engine column DEFAULT expressions did not requote target-reserved identifiers.** PG-target DEFAULT (MySQL→PG) translated operators but never re-quoted reserved-word column refs; the MySQL-target DEFAULT path (PG→MySQL) used a 3-entry lookup with neither translation nor requote — so MySQL backticks / PG reserved words leaked into the target DDL → `CREATE TABLE` failure. Both DEFAULT cells now route through the uniform `requote(translate(expr))` (the 3-entry lookup folded in, preserving `now()`/`gen_random_uuid()`/`random()` outcomes; the BIT-literal default path from v0.65.1 unchanged).
+- **Bug 65 — PostgreSQL-source expression / functional indexes were silently dropped.** The PG schema reader skipped index entries with no underlying column (`CREATE INDEX … ((lower(name)))`), losing them with no error or warning (a loud-failure-tenet violation). It now surfaces the expression (`pg_get_indexdef`) into `ir.IndexColumn.Expression` — the PostgreSQL-source analogue of the MySQL-source fix (Bug 16, v0.9.1) — and they round-trip to both targets. Operator-class capture (e.g. `gin_trgm_ops`) on expression indexes is preserved.
+- **Latent PG→MySQL identifier-quote gap (caught by the new ADR-0045 proactive sweep during implementation).** `pg_get_expr` returns reserved-word refs double-quoted; the PG reader legitimately cannot strip them (needed for same-dialect PG→PG); the MySQL writer had no source-quote-rewrite leg, emitting a broken mixed-quote shape (`MySQL Error 1292`). New `rewritePGIdentQuotes` first pass in the PG→MySQL translator (cross-dialect only; same-dialect untouched) completes ADR-0016's three-leg policy for that direction.
+
+### Compatibility
+
+- Drop-in from v0.65.2. No API/CLI/IR-contract/state-format change (`ir.IndexColumn.Expression` already existed; Bug 65 only *populates* it for PG sources). Behaviour changes are strictly corrective: previously-failing or silently-lossy cross-engine schema migrations now succeed correctly. The ADR-0045 D2 change makes MySQL index-expression emission consistent with the other expression positions.
+
+### Internal
+
+- A proactive integration sweep now drives reserved-word-named columns through all four expression positions × both directions (plus an opclass-bearing PG expression index) — a regression net so a "fifth cousin" of this defect class cannot land silently.
+
 ## [0.65.2]
 
 **Fixed: reserved-word column references inside generated-column / CHECK / index *expression bodies* were emitted unquoted on MySQL → PostgreSQL (Bug 63).** Found by the v0.65.1 post-release cycle; it is the cross-engine cousin the v0.65.0 cycle predicted as Bug 61's "same family", now confirmed a **distinct** defect (Bug 61 was the PG *reader*'s `stripTypeCast`, fixed in v0.65.1; this is the PG *writer*'s cross-dialect expression-body emitter).
