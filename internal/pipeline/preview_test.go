@@ -374,6 +374,55 @@ func TestPreviewer_Run_PreviewDDLError(t *testing.T) {
 	}
 }
 
+// TestPreviewer_Run_Bug8_LoudRefusalNotFalseGreen pins the v0.68.1
+// structural backstop at the preview surface: a MySQL→PG schema with
+// an untranslatable loud MySQL-only construct must REFUSE (return a
+// non-nil error naming the site) and render NO DDL — not exit 0 with
+// valid-looking DDL (the Bug 8 false-green that preceded migrate's
+// hard mid-pipeline abort).
+func TestPreviewer_Run_Bug8_LoudRefusalNotFalseGreen(t *testing.T) {
+	schema := &ir.Schema{Tables: []*ir.Table{{
+		Name: "events",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 32}},
+			{Name: "status", Type: ir.Varchar{Length: 32}},
+		},
+		CheckConstraints: []*ir.CheckConstraint{{
+			Name:        "events_status_valid",
+			Expr:        "FIND_IN_SET(status, 'pending,active,closed') > 0",
+			ExprDialect: "mysql",
+		}},
+	}}}
+	src := &previewStubEngine{name: "mysql", schema: schema}
+	tgt := &previewStubEngine{
+		name:   "postgres",
+		schema: schema,
+		stmts: []ir.DDLStatement{{
+			Table: "events", Kind: "CREATE TABLE",
+			SQL: "CREATE TABLE \"events\" (...)",
+		}},
+	}
+
+	var buf bytes.Buffer
+	prev := &Previewer{
+		Source: src, Target: tgt,
+		SourceDSN: "src", TargetDSN: "tgt",
+		Out: &buf,
+	}
+	err := prev.Run(context.Background())
+	if err == nil {
+		t.Fatal("expected loud refusal for untranslatable MySQL-only construct; got nil (false-green)")
+	}
+	for _, want := range []string{"schema preview", "events", "events_status_valid", "FIND_IN_SET"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal message missing %q: %v", want, err)
+		}
+	}
+	if strings.Contains(buf.String(), "CREATE TABLE") {
+		t.Errorf("preview rendered DDL despite refusal (false-green leak): %q", buf.String())
+	}
+}
+
 func TestPreviewer_Run_SameEngine_NoNotesNoHints(t *testing.T) {
 	src := &previewStubEngine{name: "postgres", schema: previewFixtureSchema()}
 	tgt := &previewStubEngine{

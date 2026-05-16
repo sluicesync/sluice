@@ -99,6 +99,50 @@ func TestRunEmptySchema(t *testing.T) {
 	}
 }
 
+// TestRun_Bug8_LoudGapRefusesAtPreflight pins the v0.68.1 structural
+// backstop at the migrate surface: a MySQL→PG schema carrying an
+// untranslatable loud MySQL-only construct must refuse at pre-flight
+// — BEFORE the schema writer is opened and BEFORE any CREATE TABLE —
+// so there is never a partially-migrated target. Pre-fix this aborted
+// at the CREATE TABLE phase after some tables already existed.
+func TestRun_Bug8_LoudGapRefusesAtPreflight(t *testing.T) {
+	src := newRecordingEngine("mysql")
+	src.schema = &ir.Schema{Tables: []*ir.Table{{
+		Name: "events",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 32}},
+			{Name: "status", Type: ir.Varchar{Length: 32}},
+		},
+		CheckConstraints: []*ir.CheckConstraint{{
+			Name:        "events_status_valid",
+			Expr:        "FIND_IN_SET(status, 'pending,active') > 0",
+			ExprDialect: "mysql",
+		}},
+	}}}
+	tgt := newRecordingEngine("postgres")
+
+	m := &Migrator{
+		Source: src, Target: tgt,
+		SourceDSN: "src", TargetDSN: "tgt",
+	}
+	err := m.Run(context.Background())
+	if err == nil {
+		t.Fatal("expected pre-flight refusal for untranslatable MySQL-only construct; got nil")
+	}
+	for _, want := range []string{"migrate", "events", "events_status_valid", "FIND_IN_SET", "partially creating the target"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal message missing %q: %v", want, err)
+		}
+	}
+	if tgt.openSchemaWriterCalls != 0 {
+		t.Errorf("schema writer opened %d times; want 0 (refusal must precede any DDL — no partial target)",
+			tgt.openSchemaWriterCalls)
+	}
+	if len(tgt.phaseLog) != 0 {
+		t.Errorf("target phases ran despite refusal: %v (partial-migration leak)", tgt.phaseLog)
+	}
+}
+
 func TestRunDryRunDoesNotOpenWriters(t *testing.T) {
 	src := newRecordingEngine("source")
 	src.schema = sampleSchema()

@@ -34,6 +34,7 @@ var mysqlRequoteConfig = exprident.Config{
 	QuoteByte:         '`',
 	Reserved:          mysqlReservedWords,
 	GrammarExclusions: exprGrammarKeywords,
+	GrammarContextual: mysqlExprContextualKeywords,
 	SkipWSBeforeParen: false,
 }
 

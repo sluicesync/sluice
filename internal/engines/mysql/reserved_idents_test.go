@@ -67,6 +67,32 @@ func TestRequoteMySQLReservedIdents(t *testing.T) {
 			"col + 100",
 			"col + 100",
 		},
+		// ── Context-aware FROM, reverse PG→MySQL leg (v0.68.1) ───────
+		// `FROM` is in mysqlReservedWords but NOT exprGrammarKeywords,
+		// so without the contextual rule a grammar `FROM` (e.g. a PG
+		// generated column `EXTRACT(YEAR FROM d)` translated to MySQL)
+		// would be wrongly backtick-requoted and fail. A de-quoted user
+		// column literally named `from` must still be requoted.
+		{
+			"column `from` requoted (PG→MySQL de-quoted ref)",
+			"from < to",
+			"`from` < `to`",
+		},
+		{
+			"grammar FROM in EXTRACT stays bare (PG→MySQL)",
+			"extract(year from ts) > 2000",
+			"extract(year from ts) > 2000",
+		},
+		{
+			"grammar FROM after DISTINCT stays bare (PG→MySQL)",
+			"a is not distinct from b",
+			"a is not distinct from b",
+		},
+		{
+			"column `from` inside non-FROM call requoted",
+			"coalesce(from, 0)",
+			"coalesce(`from`, 0)",
+		},
 		{"empty", "", ""},
 	}
 	for _, c := range cases {

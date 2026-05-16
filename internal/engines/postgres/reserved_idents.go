@@ -10,6 +10,8 @@
 
 package postgres
 
+import "github.com/orware/sluice/internal/translate/exprident"
+
 // pgExprGrammarKeywords is the subset of PG reserved words that can
 // appear unquoted in an expression body in a grammatical role:
 // logical / comparison operators, the NULL and boolean literals, CAST
@@ -26,6 +28,14 @@ var pgExprGrammarKeywords = map[string]struct{}{
 	"DISTINCT": {}, "SYMMETRIC": {}, "ANY": {}, "ALL": {},
 	"SOME": {}, "OVERLAPS": {}, "ISNULL": {}, "NOTNULL": {},
 	"ESCAPE": {}, "COLLATE": {},
+	// NOTE: `FROM` is deliberately NOT here. It is grammar glue only in
+	// specific positions (`IS [NOT] DISTINCT FROM`,
+	// `EXTRACT/SUBSTRING/TRIM/OVERLAY(… FROM …)`) and is an ordinary
+	// column identifier everywhere else. A blanket exclusion would
+	// suppress re-quoting a de-quoted user column literally named
+	// `from` (MySQL→PG `CHECK (`from` < `to`)` → SQLSTATE 42601). The
+	// position-aware discrimination lives in pgExprContextualKeywords
+	// (see exprident.ContextRule).
 	// Literals.
 	"NULL": {}, "TRUE": {}, "FALSE": {}, "UNKNOWN": {},
 	// CASE / control flow.
@@ -44,6 +54,40 @@ var pgExprGrammarKeywords = map[string]struct{}{
 	"CURRENT_USER": {}, "CURRENT_ROLE": {}, "CURRENT_CATALOG": {},
 	"CURRENT_SCHEMA": {}, "LOCALTIME": {}, "LOCALTIMESTAMP": {},
 	"SESSION_USER": {}, "SYSTEM_USER": {}, "ARRAY": {}, "ROW": {},
+}
+
+// pgExprContextualKeywords holds reserved words that are grammar glue
+// ONLY in a specific syntactic position and are an ordinary column
+// identifier everywhere else (see [exprident.ContextRule]).
+//
+// `FROM` is the sole entry. PostgreSQL's grammar permits a bare,
+// unquoted `FROM` in an expression body in exactly two shapes:
+//
+//   - `IS [NOT] DISTINCT FROM` — `FROM` immediately follows `DISTINCT`.
+//     This is the form the Bug 8b `<=>` rewrite emits
+//     (`a IS NOT DISTINCT FROM b`); its `FROM` must stay bare.
+//   - the special function syntaxes `EXTRACT(field FROM src)`,
+//     `SUBSTRING(s FROM n [FOR len])`, `TRIM([…] FROM s)`,
+//     `OVERLAY(s PLACING r FROM n [FOR len])` — `FROM` sits inside the
+//     call's paren group. (sluice's own translator emits the EXTRACT
+//     form; the others can arrive verbatim from an ANSI/MySQL source
+//     expression — MySQL shares this `EXTRACT(… FROM …)` syntax.)
+//
+// In every other expression position a bare `FROM` can only be a
+// de-quoted user column literally named `from`, which MUST be
+// re-quoted or CREATE TABLE fails with SQLSTATE 42601. The blanket
+// pgExprGrammarKeywords entry that used to live here suppressed that
+// column case (a MySQL→PG regression for `CHECK (`from` < `to`)` and
+// any generated-column / expression-index / DEFAULT referencing a
+// `from` column); the position-aware rule fixes it without regressing
+// the grammar-`FROM` shapes.
+var pgExprContextualKeywords = map[string]exprident.ContextRule{
+	"FROM": {
+		AfterToken: map[string]struct{}{"DISTINCT": {}},
+		InFunction: map[string]struct{}{
+			"EXTRACT": {}, "SUBSTRING": {}, "TRIM": {}, "OVERLAY": {},
+		},
+	},
 }
 
 // pgReservedWords is the PostgreSQL reserved-keyword set: the keywords

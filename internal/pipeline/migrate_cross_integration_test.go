@@ -335,6 +335,113 @@ func TestMigrate_MySQLToPostgres(t *testing.T) {
 	}
 }
 
+// TestMigrate_MySQLToPostgres_Bug8Constructs is the cross-engine
+// regression test for validation-rig Bug 8: MySQL→PG migrate of the
+// 8a/8b/8c construct class (JSON_VALID CHECK, `<=>` NULL-safe
+// equality CHECK, NOW(N)/CURDATE() DEFAULTs) must (1) translate to
+// well-formed PG DDL and (2) complete migrate cleanly — pre-v0.68.1
+// each aborted the pipeline at the CREATE TABLE phase after partial
+// table creation.
+func TestMigrate_MySQLToPostgres_Bug8Constructs(t *testing.T) {
+	mysqlSource, _, mysqlCleanup := startMySQL(t)
+	defer mysqlCleanup()
+	_, pgTarget, pgCleanup := startPostgres(t)
+	defer pgCleanup()
+
+	// 8a: JSON_VALID() in a CHECK. 8b: <=> in a CHECK. 8c: now(3) and
+	// curdate() parenthesised DEFAULTs. All three share the
+	// expr_translate.go gap that pre-v0.68.1 leaked verbatim into PG.
+	const seedDDL = `
+		CREATE TABLE bug8 (
+			id          INT          NOT NULL AUTO_INCREMENT,
+			metadata    LONGTEXT     NOT NULL,
+			a           INT          NULL,
+			b           INT          NULL,
+			created_at  DATETIME(3)  NOT NULL DEFAULT (now(3)),
+			the_date    DATE         NOT NULL DEFAULT (curdate()),
+			PRIMARY KEY (id),
+			CONSTRAINT chk_json     CHECK (JSON_VALID(metadata)),
+			CONSTRAINT chk_nullsafe CHECK (a <=> b OR a IS NULL)
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+		INSERT INTO bug8 (metadata, a, b) VALUES
+			('{"k":"v"}', 1, 1),
+			('[]',        NULL, 7);
+	`
+	applyMySQLDDL(t, mysqlSource, seedDDL)
+
+	mysqlEng, ok := engines.Get("mysql")
+	if !ok {
+		t.Fatal("mysql engine not registered")
+	}
+	pgEng, ok := engines.Get("postgres")
+	if !ok {
+		t.Fatal("postgres engine not registered")
+	}
+
+	mig := &Migrator{
+		Source:    mysqlEng,
+		Target:    pgEng,
+		SourceDSN: mysqlSource,
+		TargetDSN: pgTarget,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	if err := mig.Run(ctx); err != nil {
+		t.Fatalf("Migrator.Run (Bug 8 constructs must migrate cleanly): %v", err)
+	}
+
+	pgDB, err := sql.Open("pgx", pgTarget)
+	if err != nil {
+		t.Fatalf("open pg target: %v", err)
+	}
+	defer func() { _ = pgDB.Close() }()
+
+	// All 2 rows must have arrived (CHECKs are satisfied by the seed).
+	var n int
+	if err := pgDB.QueryRowContext(ctx, `SELECT count(*) FROM bug8`).Scan(&n); err != nil {
+		t.Fatalf("count bug8: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("bug8 row count = %d; want 2", n)
+	}
+
+	// 8a + 8b: both CHECK constraints must exist on the PG target
+	// (translated, not dropped). Query pg_constraint for the table.
+	var checkCount int
+	if err := pgDB.QueryRowContext(ctx, `
+		SELECT count(*) FROM pg_constraint
+		WHERE conrelid = 'public.bug8'::regclass AND contype = 'c'`).Scan(&checkCount); err != nil {
+		t.Fatalf("count check constraints: %v", err)
+	}
+	if checkCount < 2 {
+		t.Errorf("bug8 CHECK constraints = %d; want >= 2 (chk_json + chk_nullsafe translated)", checkCount)
+	}
+
+	// 8a functional: the IS JSON predicate must reject malformed JSON
+	// on the target (proves JSON_VALID → IS JSON, not a no-op).
+	if _, err := pgDB.ExecContext(ctx,
+		`INSERT INTO bug8 (metadata, a, b) VALUES ('not json', 1, 1)`); err == nil {
+		t.Error("expected chk_json (IS JSON) to reject malformed JSON on PG; insert succeeded")
+	}
+
+	// 8c functional: the now(3)/curdate() defaults must be live PG
+	// expressions — an INSERT omitting them must populate both.
+	if _, err := pgDB.ExecContext(ctx,
+		`INSERT INTO bug8 (metadata, a, b) VALUES ('{}', NULL, NULL)`); err != nil {
+		t.Fatalf("insert relying on translated NOW(3)/CURDATE() defaults: %v", err)
+	}
+	var hasTs, hasDate bool
+	if err := pgDB.QueryRowContext(ctx, `
+		SELECT created_at IS NOT NULL, the_date IS NOT NULL
+		FROM bug8 WHERE metadata = '{}'`).Scan(&hasTs, &hasDate); err != nil {
+		t.Fatalf("read defaulted row: %v", err)
+	}
+	if !hasTs || !hasDate {
+		t.Errorf("translated defaults not applied: created_at set=%v the_date set=%v", hasTs, hasDate)
+	}
+}
+
 // findColumn searches a table for the named column. Returns nil when
 // no match.
 func findColumn(t *ir.Table, name string) *ir.Column {

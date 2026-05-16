@@ -346,6 +346,125 @@ func TestScanMySQLToPGGaps_NilSchema_Safe(t *testing.T) {
 	}
 }
 
+// TestLoudGaps_FiltersSilent pins that LoudGaps returns only the
+// SeverityLoud subset. The v0.68.1 structural backstop refuses on
+// loud gaps; silent gaps stay advisory.
+func TestLoudGaps_FiltersSilent(t *testing.T) {
+	gaps := []Gap{
+		{Pattern: "GREATEST", Severity: SeveritySilent},
+		{Pattern: "FIND_IN_SET", Severity: SeverityLoud},
+		{Pattern: "REGEXP_LIKE", Severity: SeveritySilent},
+		{Pattern: "CONVERT_TZ", Severity: SeverityLoud},
+	}
+	loud := LoudGaps(gaps)
+	if len(loud) != 2 {
+		t.Fatalf("got %d loud gaps; want 2", len(loud))
+	}
+	for _, g := range loud {
+		if g.Severity != SeverityLoud {
+			t.Errorf("pattern %s leaked into LoudGaps with severity %v", g.Pattern, g.Severity)
+		}
+	}
+}
+
+// TestRefuseOnLoudGaps_RefusesUntranslatableTail pins that the
+// backstop produces a non-nil, operator-actionable error naming the
+// offending site when a loud, untranslatable MySQL-only construct
+// reaches PG emit. This is the Bug 8 structural fix: instead of a
+// silent false-green at preview + a partial-migration abort at
+// migrate, both surfaces refuse before any DDL.
+func TestRefuseOnLoudGaps_RefusesUntranslatableTail(t *testing.T) {
+	s := &ir.Schema{Tables: []*ir.Table{{
+		Name: "events",
+		CheckConstraints: []*ir.CheckConstraint{{
+			Name:        "events_status_valid",
+			Expr:        "FIND_IN_SET(status, 'a,b,c') > 0",
+			ExprDialect: "mysql",
+		}},
+	}}}
+	for _, ctxID := range []string{"schema preview", "migrate"} {
+		ctxID := ctxID
+		t.Run(ctxID, func(t *testing.T) {
+			err := RefuseOnLoudGaps(s, "mysql", "postgres", ctxID, nil)
+			if err == nil {
+				t.Fatalf("%s: got nil; want a loud-gap refusal", ctxID)
+			}
+			msg := err.Error()
+			for _, want := range []string{ctxID, "events", "events_status_valid", "FIND_IN_SET"} {
+				if !strings.Contains(msg, want) {
+					t.Errorf("%s: refusal message missing %q: %s", ctxID, want, msg)
+				}
+			}
+		})
+	}
+	// migrate phrasing must name the partial-target hazard.
+	if msg := RefuseOnLoudGaps(s, "mysql", "postgres", "migrate", nil).Error(); !strings.Contains(msg, "partially creating the target") {
+		t.Errorf("migrate refusal should warn about partial target: %s", msg)
+	}
+}
+
+// TestRefuseOnLoudGaps_Bug8TranslatedConstructs_NoFalsePositive is
+// the false-positive-safety pin: the v0.68.1-translated constructs
+// (8a JSON_VALID, 8b `<=>`, 8c NOW(N)/CURDATE()) must NOT trip the
+// backstop — they emit valid PG now, so refusing them would block a
+// migratable schema. A missed detection degrades to today's late
+// failure (acceptable); a false-positive refusal of a valid schema
+// is the real hazard this guards against.
+func TestRefuseOnLoudGaps_Bug8TranslatedConstructs_NoFalsePositive(t *testing.T) {
+	s := &ir.Schema{Tables: []*ir.Table{{
+		Name: "t",
+		Columns: []*ir.Column{
+			{
+				Name: "created_at",
+				Type: ir.Timestamp{},
+				Default: ir.DefaultExpression{
+					Expr:    "now(3)",
+					Dialect: "mysql",
+				},
+			},
+			{
+				Name: "d",
+				Type: ir.Date{},
+				Default: ir.DefaultExpression{
+					Expr:    "curdate()",
+					Dialect: "mysql",
+				},
+			},
+		},
+		CheckConstraints: []*ir.CheckConstraint{
+			{Name: "chk_json", Expr: "JSON_VALID(metadata)", ExprDialect: "mysql"},
+			{Name: "chk_nullsafe", Expr: "a <=> b", ExprDialect: "mysql"},
+		},
+	}}}
+	if err := RefuseOnLoudGaps(s, "mysql", "postgres", "schema preview", nil); err != nil {
+		t.Fatalf("Bug 8 translated constructs falsely refused: %v", err)
+	}
+	if gaps := LoudGaps(ScanMySQLToPGGaps(s, "mysql", "postgres", nil)); len(gaps) != 0 {
+		t.Errorf("got %d loud gaps for translated constructs; want 0", len(gaps))
+	}
+}
+
+// TestRefuseOnLoudGaps_NonCrossEngine_Nil pins that the refusal is
+// scoped to MySQL→PG. Same-engine and PG→MySQL never refuse here
+// (ScanMySQLToPGGaps short-circuits the pair).
+func TestRefuseOnLoudGaps_NonCrossEngine_Nil(t *testing.T) {
+	s := &ir.Schema{Tables: []*ir.Table{{
+		Name: "events",
+		CheckConstraints: []*ir.CheckConstraint{{
+			Name:        "c",
+			Expr:        "FIND_IN_SET(status, 'a,b') > 0",
+			ExprDialect: "mysql",
+		}},
+	}}}
+	for _, p := range []struct{ src, tgt string }{
+		{"mysql", "mysql"}, {"postgres", "postgres"}, {"postgres", "mysql"},
+	} {
+		if err := RefuseOnLoudGaps(s, p.src, p.tgt, "migrate", nil); err != nil {
+			t.Errorf("%s→%s: got refusal %v; want nil", p.src, p.tgt, err)
+		}
+	}
+}
+
 // TestSeverity_String pins the string form for both severities.
 // Stable wording is what the JSON renderer / human-readable output
 // uses.

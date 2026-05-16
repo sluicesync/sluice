@@ -208,6 +208,136 @@ func TestMigrate_MySQLToPostgres_ReservedWordExprSweep(t *testing.T) {
 			t.Errorf("emitted PG DDL contains a literal backtick — Bug 64 backtick leak; preview:\n%s", out)
 		}
 	})
+
+	// ─── Context-aware-FROM sweep cell (v0.68.1). The 4×2×2 sweep
+	// above uses the generic reserved word `order`, which has no
+	// grammar role inside an expression body, so it never exercised
+	// the position-sensitive `FROM` keyword. `FROM` is the one PG/MySQL
+	// reserved word that is BOTH legitimate grammar glue
+	// (`IS NOT DISTINCT FROM`, `EXTRACT(… FROM …)`) AND a plausible
+	// column name. The original Bug 8b fix blanket-excluded `FROM` from
+	// re-quoting, which regressed a de-quoted `from` column → SQLSTATE
+	// 42601. This cell drives a column literally named `from` through
+	// CHECK + GENERATED + functional INDEX + (column-ref) DEFAULT
+	// MySQL→PG, and proves both halves: column-`from` is requoted and
+	// grammar-`FROM` (an EXTRACT in the generated body) stays bare.
+	//
+	// DEFAULT-position note: like the parent 4×2×2 sweep, the
+	// column-referencing DEFAULT cell for `from` is asserted on the
+	// schema-preview surface, NOT a full migrate — PostgreSQL forbids a
+	// column reference in a DEFAULT expression (SQLSTATE 0A000) for ANY
+	// such column, so a full MySQL→PG migrate of one can never reach
+	// exit 0 by PG's design. The defect class here is the *emitted DDL*:
+	// the `from` column ref must be PG-requoted `"from"` (not left bare
+	// → 42601), which the preview asserts deterministically.
+	t.Run("FROM_column_sweep_cell", func(t *testing.T) {
+		const fromDDL = `
+			CREATE TABLE spans (
+				id      INT PRIMARY KEY,
+				` + "`from`" + ` INT NOT NULL,
+				` + "`to`" + `   INT NOT NULL,
+				span    INT GENERATED ALWAYS AS (` + "`to`" + ` - ` + "`from`" + `) STORED,
+				CONSTRAINT spans_order_chk CHECK (` + "`from`" + ` < ` + "`to`" + `)
+			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+			CREATE INDEX spans_from_plus1 ON spans ((` + "`from`" + ` + 1));
+
+			INSERT INTO spans (id, ` + "`from`" + `, ` + "`to`" + `) VALUES (1, 2, 9);
+		`
+		applyMySQLDDL(t, mysqlSource, fromDDL)
+
+		// Distinct migration-id + Include scope: the parent test already
+		// migrated `widgets`/`def_rw` into this shared pg target, so the
+		// auto-derived id would be refused ("already complete") and a
+		// re-copy of the populated tables would trip the partial-cold-
+		// start guard. Scope to just the new `spans` table.
+		runMigrateScoped(t, "mysql", "postgres", mysqlSource, pgTarget,
+			"adr0045-from-cell-m2p", "spans")
+
+		fctx, fcancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer fcancel()
+
+		// CREATE TABLE accepted the requoted CHECK + GENERATED bodies
+		// (a bare `from` would have failed with 42601), and the row
+		// copied with the generated column carried.
+		var span int
+		if err := tgt.QueryRowContext(fctx,
+			`SELECT span FROM spans WHERE id = 1`).Scan(&span); err != nil {
+			t.Fatalf("read span row 1 (CREATE TABLE with `from` column failed?): %v", err)
+		}
+		if span != 7 {
+			t.Errorf("generated span = %d; want 7 (to-from, 9-2)", span)
+		}
+
+		// GENERATED recompute on a fresh INSERT.
+		if _, err := tgt.ExecContext(fctx,
+			`INSERT INTO spans (id, "from", "to") VALUES (2, 3, 10)`); err != nil {
+			t.Fatalf("INSERT into pg spans (valid): %v", err)
+		}
+		var span2 int
+		if err := tgt.QueryRowContext(fctx,
+			`SELECT span FROM spans WHERE id = 2`).Scan(&span2); err != nil {
+			t.Fatalf("read back spans row 2: %v", err)
+		}
+		if span2 != 7 {
+			t.Errorf("generated span (row 2) = %d; want 7 (10-3)", span2)
+		}
+
+		// CHECK enforcement: from >= to must be rejected.
+		if _, err := tgt.ExecContext(fctx,
+			`INSERT INTO spans (id, "from", "to") VALUES (3, 8, 8)`); err == nil {
+			t.Errorf("INSERT with from=to should be rejected by CHECK (`from` < `to`)")
+		}
+
+		// Functional INDEX over the `from` column present.
+		if !pgIndexExists(t, fctx, tgt, "spans", "spans_from_plus1") {
+			t.Errorf("functional index spans_from_plus1 missing on pg target")
+		}
+
+		// DEFAULT-position cell for `from`: PG forbids a column-ref
+		// DEFAULT, so assert the *emitted* PG DDL is well-formed (the
+		// `from`/`to` refs PG-requoted, no backtick leak) via the
+		// preview surface — mirrors the parent Bug64 cell.
+		const defDDL = `
+			CREATE TABLE from_def (
+				id    INT PRIMARY KEY,
+				` + "`from`" + ` INT NOT NULL,
+				` + "`to`" + `   INT NOT NULL,
+				dflt  INT NOT NULL DEFAULT (` + "`from`" + ` + ` + "`to`" + `)
+			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+		`
+		applyMySQLDDL(t, mysqlSource, defDDL)
+
+		mysqlEng, ok := engines.Get("mysql")
+		if !ok {
+			t.Fatal("mysql engine not registered")
+		}
+		pgEng, ok := engines.Get("postgres")
+		if !ok {
+			t.Fatal("postgres engine not registered")
+		}
+		var buf bytes.Buffer
+		prev := &Previewer{
+			Source:    mysqlEng,
+			Target:    pgEng,
+			SourceDSN: mysqlSource,
+			TargetDSN: pgTarget,
+			Format:    "text",
+			Out:       &buf,
+		}
+		pctx, pcancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer pcancel()
+		if err := prev.Run(pctx); err != nil {
+			t.Fatalf("preview Run: %v", err)
+		}
+		out := buf.String()
+		if !strings.Contains(out, `DEFAULT ("from" + "to")`) {
+			t.Errorf("`from`-column DEFAULT not emitted as `(\"from\" + \"to\")` (requote regression); preview:\n%s", out)
+		}
+		if strings.Contains(out, "`") {
+			t.Errorf("emitted PG DDL contains a literal backtick; preview:\n%s", out)
+		}
+	})
 }
 
 // TestMigrate_PostgresToMySQL_ReservedWordExprSweep is the symmetric
@@ -300,11 +430,98 @@ func TestMigrate_PostgresToMySQL_ReservedWordExprSweep(t *testing.T) {
 			t.Errorf("functional index %q missing on mysql target; have %v", want, idx)
 		}
 	}
+
+	// ─── Context-aware-FROM sweep cell, reverse leg (v0.68.1). The
+	// symmetric proof for PG→MySQL: `FROM` is in mysqlReservedWords but
+	// not exprGrammarKeywords, so without the contextual rule the MySQL
+	// writer would backtick-requote a grammar `FROM` and emit broken
+	// DDL. This cell drives a PG column literally named `from` through
+	// CHECK + GENERATED + functional INDEX, AND embeds a grammar
+	// `EXTRACT(… FROM …)` in the generated body so the cell fails if
+	// the grammar-FROM gets requoted in the reverse direction.
+	t.Run("FROM_column_sweep_cell", func(t *testing.T) {
+		const fromDDL = `
+			CREATE TABLE spans (
+				id      INT PRIMARY KEY,
+				"from"  INT NOT NULL,
+				"to"    INT NOT NULL,
+				ts      TIMESTAMP NOT NULL DEFAULT now(),
+				span    INT GENERATED ALWAYS AS
+				          (("to" - "from") + EXTRACT(YEAR FROM ts)::int) STORED,
+				CONSTRAINT spans_chk CHECK ("from" < "to")
+			);
+
+			CREATE INDEX spans_from_plus1 ON spans (("from" + 1));
+
+			INSERT INTO spans (id, "from", "to") VALUES (1, 2, 9);
+		`
+		applyPGDDL(t, pgSource, fromDDL)
+
+		// Distinct migration-id + Include scope (see the MySQL→PG note).
+		runMigrateScoped(t, "postgres", "mysql", pgSource, mysqlTarget,
+			"adr0045-from-cell-p2m", "spans")
+
+		fctx, fcancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer fcancel()
+
+		// Row copied + CREATE TABLE accepted the translated bodies (a
+		// requoted grammar-FROM would have failed table creation).
+		var fromV, toV int
+		if err := tgt.QueryRowContext(fctx,
+			"SELECT `from`, `to` FROM spans WHERE id = 1").Scan(&fromV, &toV); err != nil {
+			t.Fatalf("read spans row 1 (CREATE TABLE with `from` + grammar EXTRACT failed?): %v", err)
+		}
+		if fromV != 2 || toV != 9 {
+			t.Errorf("spans row 1 = (%d,%d); want (2,9)", fromV, toV)
+		}
+
+		// GENERATED recompute on a fresh INSERT; the generated body mixes
+		// the column `from`/`to` (must be backtick-requoted) with a
+		// grammar EXTRACT(... FROM ts) (must stay bare).
+		if _, err := tgt.ExecContext(fctx,
+			"INSERT INTO spans (id, `from`, `to`) VALUES (2, 3, 10)"); err != nil {
+			t.Fatalf("INSERT into mysql spans (valid): %v", err)
+		}
+		var span int
+		if err := tgt.QueryRowContext(fctx,
+			"SELECT span FROM spans WHERE id = 2").Scan(&span); err != nil {
+			t.Fatalf("read back spans row 2: %v", err)
+		}
+		// (to-from) + year-of-ts. ts defaults to now() so the year is
+		// the current year; assert only the (to-from)=7 component is
+		// present by checking span > 7 (year component is always > 0).
+		if span <= 7 {
+			t.Errorf("generated span = %d; want > 7 ((to-from)=7 + EXTRACT(YEAR FROM ts))", span)
+		}
+
+		// CHECK enforcement on the `from` column.
+		if _, err := tgt.ExecContext(fctx,
+			"INSERT INTO spans (id, `from`, `to`) VALUES (3, 8, 8)"); err == nil {
+			t.Errorf("INSERT with from=to should be rejected by CHECK (`from` < `to`)")
+		}
+
+		// Functional INDEX over `from` present.
+		if !mysqlIndexNames(t, fctx, tgt, "spans")["spans_from_plus1"] {
+			t.Errorf("functional index spans_from_plus1 missing on mysql target")
+		}
+	})
 }
 
 // runMigrate is a tiny helper that resolves both engines and runs a
 // Migrator end-to-end, failing the test on any error.
 func runMigrate(t *testing.T, srcName, tgtName, srcDSN, tgtDSN string) {
+	t.Helper()
+	runMigrateScoped(t, srcName, tgtName, srcDSN, tgtDSN, "")
+}
+
+// runMigrateScoped is runMigrate with an explicit MigrationID and an
+// Include table filter. A sub-test that migrates a second schema into
+// the shared target container must (1) pass a distinct id so the state
+// row doesn't collide with the parent test's run ("already complete"),
+// and (2) scope the migrate to just its own new table — the parent's
+// already-migrated tables are still in the source and a re-copy into
+// the now-populated target is refused as a partial-cold-start.
+func runMigrateScoped(t *testing.T, srcName, tgtName, srcDSN, tgtDSN, migrationID string, includeTables ...string) {
 	t.Helper()
 	src, ok := engines.Get(srcName)
 	if !ok {
@@ -315,10 +532,12 @@ func runMigrate(t *testing.T, srcName, tgtName, srcDSN, tgtDSN string) {
 		t.Fatalf("%s engine not registered", tgtName)
 	}
 	mig := &Migrator{
-		Source:    src,
-		Target:    tgt,
-		SourceDSN: srcDSN,
-		TargetDSN: tgtDSN,
+		Source:      src,
+		Target:      tgt,
+		SourceDSN:   srcDSN,
+		TargetDSN:   tgtDSN,
+		MigrationID: migrationID,
+		Filter:      TableFilter{Include: includeTables},
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()

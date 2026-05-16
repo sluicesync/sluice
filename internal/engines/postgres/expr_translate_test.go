@@ -123,6 +123,80 @@ func TestTranslateExprForPG(t *testing.T) {
 	}
 }
 
+// TestTranslateExprForPG_Bug8 pins the three v0.68.1 translation
+// rules added for validation-rig Bug 8 (MySQL→PG untranslated
+// constructs leaking into emitted PG DDL). 8a JSON_VALID, 8b the
+// NULL-safe-equality operator, 8c NOW(N)/CURDATE() are covered by
+// the V11Catalog table above; this is the dedicated regression pin
+// keyed by bug number so a future translator refactor can't silently
+// regress them.
+func TestTranslateExprForPG_Bug8(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		// 8a — JSON_VALID(x) → (x IS JSON)
+		{
+			name: "8a JSON_VALID in CHECK body",
+			in:   "JSON_VALID(metadata)",
+			want: "(metadata IS JSON)",
+		},
+		{
+			name: "8a lowercase json_valid",
+			in:   "json_valid(m)",
+			want: "(m IS JSON)",
+		},
+		{
+			name: "8a JSON_VALID nested in a larger CHECK",
+			in:   "(JSON_VALID(doc) AND length(doc) > 2)",
+			want: "((doc IS JSON) AND length(doc) > 2)",
+		},
+		{
+			name: "8a multi-arg JSON_VALID falls through verbatim (loud-fail)",
+			in:   "JSON_VALID(a, b)",
+			want: "JSON_VALID(a, b)",
+		},
+		// 8b — a <=> b → a IS NOT DISTINCT FROM b
+		{
+			name: "8b bare NULL-safe equality",
+			in:   "a <=> b",
+			want: "a IS NOT DISTINCT FROM b",
+		},
+		{
+			name: "8b NULL-safe equality in a CHECK with a literal",
+			in:   "(col_1 <=> 'collection') = (collection_id is not null)",
+			want: "(col_1 IS NOT DISTINCT FROM 'collection') = (collection_id is not null)",
+		},
+		{
+			name: "8b operator inside a string literal is untouched",
+			in:   "x = 'a <=> b'",
+			want: "x = 'a <=> b'",
+		},
+		// 8c — NOW(N) / CURDATE() (also pinned in V11Catalog table)
+		{
+			name: "8c DEFAULT (now(3)) shape",
+			in:   "(now(3))",
+			want: "(CURRENT_TIMESTAMP(3))",
+		},
+		{
+			name: "8c DEFAULT (curdate()) shape",
+			in:   "(curdate())",
+			want: "(CURRENT_DATE)",
+		},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			got := translateExprForPG(c.in, ExprContext{})
+			if got != c.want {
+				t.Errorf("translateExprForPG(%q) =\n  got  %q\n  want %q",
+					c.in, got, c.want)
+			}
+		})
+	}
+}
+
 // TestTranslateExprForPG_BoolIdioms covers the v0.8.0 bool-idiom
 // rewrites. These fire only when the caller supplies a non-empty
 // BoolColumns set — without that context there's no way to tell `0
@@ -391,8 +465,8 @@ func TestTranslateExprForPG_BoolToIntCoalesce(t *testing.T) {
 		// AND/OR chains, NOT prefixes, etc.).
 		{
 			name: "function-call bool side gets cast",
-			in:   "COALESCE(json_valid(payload), 0)",
-			want: "COALESCE((json_valid(payload))::int, 0)",
+			in:   "COALESCE(starts_with(payload, 'x'), 0)",
+			want: "COALESCE((starts_with(payload, 'x'))::int, 0)",
 		},
 		{
 			name: "AND-chain bool side gets cast",
@@ -521,9 +595,46 @@ func TestTranslateExprForPG_V11Catalog(t *testing.T) {
 			want: "LOCALTIMESTAMP",
 		},
 		{
-			name: "NOW with precision arg falls through verbatim",
+			// Bug 8c: the fractional-precision form is translatable —
+			// PG accepts CURRENT_TIMESTAMP(N).
+			name: "NOW with precision arg to CURRENT_TIMESTAMP(N)",
 			in:   "NOW(6)",
-			want: "NOW(6)",
+			want: "CURRENT_TIMESTAMP(6)",
+		},
+		{
+			name: "now(3) parenthesised-default form (Bug 8c)",
+			in:   "(now(3))",
+			want: "(CURRENT_TIMESTAMP(3))",
+		},
+		{
+			name: "CURRENT_TIMESTAMP(N) precision form",
+			in:   "CURRENT_TIMESTAMP(3)",
+			want: "CURRENT_TIMESTAMP(3)",
+		},
+		{
+			name: "NOW with non-literal precision falls through verbatim",
+			in:   "NOW(col)",
+			want: "NOW(col)",
+		},
+		{
+			name: "curdate() to CURRENT_DATE (Bug 8c)",
+			in:   "(curdate())",
+			want: "(CURRENT_DATE)",
+		},
+		{
+			name: "CURDATE() uppercase to CURRENT_DATE",
+			in:   "CURDATE()",
+			want: "CURRENT_DATE",
+		},
+		{
+			name: "curtime() to CURRENT_TIME",
+			in:   "curtime()",
+			want: "CURRENT_TIME",
+		},
+		{
+			name: "curtime(3) precision form to CURRENT_TIME(N)",
+			in:   "curtime(3)",
+			want: "CURRENT_TIME(3)",
 		},
 		{
 			name: "NOW() inside a larger expression",

@@ -366,6 +366,25 @@ func (m *Migrator) Run(ctx context.Context) error {
 		); err != nil {
 			return err
 		}
+		// ---- 1.65. Untranslatable-expression pre-flight refusal ----
+		// (Bug 8 structural backstop, v0.68.1.) MySQL-only constructs
+		// that fall through the translator verbatim and are invalid
+		// PostgreSQL (JSON_VALID was translated in v0.68.1; the
+		// remaining loud tail — FIND_IN_SET, CONVERT_TZ, INET_ATON,
+		// … — has no portable PG form). Previously these emitted
+		// wrong DDL and aborted `migrate` at the CREATE TABLE phase
+		// AFTER some tables were already created (partial-migration
+		// state) with no preview warning. Refuse here — the same
+		// pre-DDL point as the cross-engine-supportable check, before
+		// DryRun and before any schema apply — so there is never a
+		// partially-migrated target and the diagnostic is consistent
+		// with `schema preview`.
+		if err := translate.RefuseOnLoudGaps(
+			schema, m.Source.Name(), m.Target.Name(), "migrate",
+			enabledExtensionSet(m.EnabledPGExtensions),
+		); err != nil {
+			return err
+		}
 	}
 
 	if m.DryRun {

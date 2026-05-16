@@ -106,6 +106,63 @@ func TestRequotePGReservedIdents(t *testing.T) {
 			"table + column",
 			`"table" + "column"`,
 		},
+		// ── Context-aware FROM (v0.68.1 regression fix) ──────────────
+		// `FROM` is reserved in PG. It is grammar glue ONLY in
+		// `IS [NOT] DISTINCT FROM` and the EXTRACT/SUBSTRING/TRIM/
+		// OVERLAY special syntaxes; everywhere else a bare `FROM` is a
+		// de-quoted user column named `from` and MUST be re-quoted. A
+		// blanket grammar exclusion (the original Bug 8b fix) regressed
+		// the column case → SQLSTATE 42601 on MySQL→PG.
+		{
+			"column `from` in CHECK requoted (regression guard)",
+			"from < to",
+			`"from" < "to"`,
+		},
+		{
+			"column `from` arithmetic requoted",
+			"from + to",
+			`"from" + "to"`,
+		},
+		{
+			"grammar FROM after DISTINCT stays bare (Bug 8b <=>)",
+			"a IS NOT DISTINCT FROM b",
+			"a IS NOT DISTINCT FROM b",
+		},
+		{
+			"grammar FROM in EXTRACT call stays bare",
+			"extract(year FROM ts) > 2000",
+			"extract(year FROM ts) > 2000",
+		},
+		{
+			"grammar FROM in SUBSTRING call stays bare",
+			"substring(name FROM 2) = 'x'",
+			"substring(name FROM 2) = 'x'",
+		},
+		{
+			// The FROM (the token under test) stays bare because it is
+			// inside a trim(...) call. No reserved modifier is used so
+			// the case isolates the FROM-in-TRIM assertion; the
+			// orthogonal reserved-modifier requoting (BOTH/LEADING/
+			// TRAILING) is exercised elsewhere and is not this pin.
+			"grammar FROM in TRIM call (string-literal arg) stays bare",
+			"trim(' ' FROM label)",
+			"trim(' ' FROM label)",
+		},
+		{
+			"column `from` and grammar FROM mixed in one expr",
+			"from > 0 AND a IS NOT DISTINCT FROM b",
+			`"from" > 0 AND a IS NOT DISTINCT FROM b`,
+		},
+		{
+			"column `from` referenced inside a non-FROM function call",
+			"coalesce(from, 0)",
+			`coalesce("from", 0)`,
+		},
+		{
+			"case-insensitive grammar FROM after distinct",
+			"x is not distinct from y",
+			"x is not distinct from y",
+		},
 		{"empty", "", ""},
 	}
 	for _, c := range cases {

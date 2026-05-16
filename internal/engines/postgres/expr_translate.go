@@ -150,6 +150,7 @@ func translateExprForPG(expr string, ctx ExprContext) string {
 	// the bare-form replacer doesn't shred the inner call.
 	expr = rewriteJSONUnquoteExtract(expr)
 	expr = rewriteJSONExtract(expr)
+	expr = rewriteJSONVALID(expr)
 	expr = rewriteIFNULL(expr)
 	expr = rewriteIF(expr)
 	expr = rewriteCONCAT(expr)
@@ -226,11 +227,91 @@ func translateExprForPG(expr string, ctx ExprContext) string {
 	// top level becomes `INTERVAL '<int> <unit>'` with the magnitude
 	// quoted (PG's required syntax). See Bug 30.
 	expr = rewriteIntervalLiteral(expr)
+	// v0.68.1 / Bug 8b — MySQL's NULL-safe equality operator `<=>`
+	// becomes PG's `IS NOT DISTINCT FROM`. Operator-form rewrite
+	// (string-literal-safe walk); runs after the function rewrites so
+	// it doesn't disturb function argument parsing.
+	expr = rewriteNullSafeEquals(expr)
 	// Bool-idiom rewrites run last: they need the canonical names
 	// (IFNULL → COALESCE has already happened) and they're gated on
 	// the caller-supplied BoolColumns set — empty means no rewrites.
 	expr = rewriteBoolIdioms(expr, ctx)
 	return expr
+}
+
+// rewriteJSONVALID rewrites MySQL's `JSON_VALID(x)` predicate to PG's
+// `(x IS JSON)` (PG 16+). MySQL uses `JSON_VALID()` chiefly inside
+// CHECK constraints to enforce that a text/longtext column holds
+// well-formed JSON; PG has no `json_valid` function (Bug 8a — PG
+// surfaces `function json_valid(text) does not exist` mid-pipeline)
+// but the `IS JSON` predicate is the direct equivalent. Single-arg
+// form only; the rare 2-arg `JSON_VALID(doc, path)` (not standard
+// MySQL — there is no such overload) and any other arity fall
+// through verbatim under the loud-failure tenet.
+//
+// PG-version note: `IS JSON` is PG 16+. Targets on PG 15 or earlier
+// will reject it at apply time — that is the loud-failure tenet
+// working as intended (a clear PG parse error naming the construct),
+// strictly better than the pre-v0.68.1 behaviour where the
+// untranslated `json_valid(...)` aborted migrate after partial table
+// creation with no preview warning.
+func rewriteJSONVALID(expr string) string {
+	return rewriteFunctionCalls(expr, "JSON_VALID", func(args []string) string {
+		if len(args) != 1 {
+			return ""
+		}
+		return "(" + strings.TrimSpace(args[0]) + " IS JSON)"
+	})
+}
+
+// rewriteNullSafeEquals rewrites MySQL's NULL-safe equality operator
+// `a <=> b` to PG's `a IS NOT DISTINCT FROM b` (Bug 8b). Both have
+// identical semantics: equal when both sides are non-NULL and equal,
+// equal when both are NULL, unequal otherwise. PG has no `<=>`
+// operator (it surfaces `operator does not exist` mid-pipeline), so
+// the verbatim-passthrough policy turned this common MySQL idiom into
+// a partial-migration abort.
+//
+// The walk is string-literal-aware (reusing the shared exprident
+// scan primitive) so a `<=>` appearing inside a quoted string literal
+// is left untouched. The operator binds the same as `=` in both
+// dialects, and `IS NOT DISTINCT FROM` is itself a comparison
+// operator at the same precedence, so a token-level substitution
+// preserves the parse — no re-parenthesisation needed. The `<=>`
+// token cannot be confused with `<=` followed by `>` because MySQL
+// tokenises `<=>` greedily; we match the full three-byte operator
+// only.
+func rewriteNullSafeEquals(expr string) string {
+	const op = "<=>"
+	var sb strings.Builder
+	for i := 0; i < len(expr); {
+		if expr[i] == '\'' {
+			end := scanStringLiteral(expr, i)
+			sb.WriteString(expr[i:end])
+			i = end
+			continue
+		}
+		if i+len(op) <= len(expr) && expr[i:i+len(op)] == op {
+			// Consume any whitespace already adjacent to the operator
+			// in the source so the rewritten form has exactly one
+			// space on each side (no `a  IS NOT DISTINCT FROM  b`
+			// double-spacing when the source was `a <=> b`). Trailing
+			// space already in sb is trimmed; leading source space is
+			// skipped.
+			cur := sb.String()
+			sb.Reset()
+			sb.WriteString(strings.TrimRight(cur, " \t"))
+			sb.WriteString(" IS NOT DISTINCT FROM ")
+			i += len(op)
+			for i < len(expr) && (expr[i] == ' ' || expr[i] == '\t') {
+				i++
+			}
+			continue
+		}
+		sb.WriteByte(expr[i])
+		i++
+	}
+	return sb.String()
 }
 
 // rewriteCONCAT rewrites every top-level CONCAT(a, b, ...) call into
@@ -902,42 +983,130 @@ func intLitToBool(s string) string {
 	return "true"
 }
 
-// rewriteNOWFamily rewrites MySQL's parenthesised current-time
-// functions (`NOW()`, `CURRENT_TIMESTAMP()`, `LOCALTIMESTAMP()`,
-// `LOCALTIME()`) to PG's bare-keyword form. PG accepts
-// `CURRENT_TIMESTAMP` / `LOCALTIMESTAMP` as keywords (no parens) and
-// rejects `NOW()` outright; the bare-keyword form also matches what
-// PG emits when reading back its own DEFAULTs, so the rewrite
-// normalises round-trips. All four forms must be argless — the
-// 1-arg precision form (`NOW(6)`) is rare in DDL and PG's keyword
-// form doesn't accept precision; falls through verbatim and the
-// loud-failure tenet kicks in if it surfaces.
+// rewriteNOWFamily rewrites MySQL's parenthesised current-date/time
+// functions to PG's keyword form:
+//
+//   - NOW() / CURRENT_TIMESTAMP() / LOCALTIMESTAMP() / LOCALTIME()
+//     → CURRENT_TIMESTAMP / LOCALTIMESTAMP (bare keyword)
+//   - the 1-arg fractional-precision form NOW(N) /
+//     CURRENT_TIMESTAMP(N) / LOCALTIMESTAMP(N) / LOCALTIME(N)
+//     → CURRENT_TIMESTAMP(N) / LOCALTIMESTAMP(N)  (Bug 8c — PG
+//     accepts the precision-keyword form; `DEFAULT (now(3))` is
+//     extremely common in MySQL 8 DDL)
+//   - CURDATE() / CURRENT_DATE() → CURRENT_DATE  (Bug 8c)
+//   - CURTIME() / CURRENT_TIME() → CURRENT_TIME; CURTIME(N) →
+//     CURRENT_TIME(N)
+//
+// PG accepts the keyword forms (with optional precision) and rejects
+// the MySQL `NOW()` / `curdate()` spellings outright; the keyword
+// form also matches what PG emits when reading back its own DEFAULTs,
+// so the rewrite normalises round-trips. The precision arg must be a
+// bare integer literal — an expression-valued precision falls through
+// verbatim under the loud-failure tenet.
 func rewriteNOWFamily(expr string) string {
+	// NOW() → CURRENT_TIMESTAMP; NOW(N) → CURRENT_TIMESTAMP(N).
+	// PG accepts the fractional-seconds-precision form
+	// `CURRENT_TIMESTAMP(N)` as a function-of-precision keyword, so
+	// the MySQL `now(3)` / `NOW(6)` shape (common in
+	// `DEFAULT (now(3))` columns) is mechanically translatable —
+	// Bug 8c. Only a single integer-literal precision arg is
+	// translated; anything else (multi-arg, expression arg) falls
+	// through verbatim under the loud-failure tenet.
 	expr = rewriteFunctionCalls(expr, "NOW", func(args []string) string {
-		if len(args) != 0 {
-			return ""
+		switch len(args) {
+		case 0:
+			return "CURRENT_TIMESTAMP"
+		case 1:
+			if p := strings.TrimSpace(args[0]); isIntLiteral(p) {
+				return "CURRENT_TIMESTAMP(" + p + ")"
+			}
 		}
-		return "CURRENT_TIMESTAMP"
+		return ""
 	})
 	expr = rewriteFunctionCalls(expr, "CURRENT_TIMESTAMP", func(args []string) string {
-		if len(args) != 0 {
-			return ""
+		switch len(args) {
+		case 0:
+			return "CURRENT_TIMESTAMP"
+		case 1:
+			if p := strings.TrimSpace(args[0]); isIntLiteral(p) {
+				return "CURRENT_TIMESTAMP(" + p + ")"
+			}
 		}
-		return "CURRENT_TIMESTAMP"
+		return ""
 	})
 	expr = rewriteFunctionCalls(expr, "LOCALTIMESTAMP", func(args []string) string {
-		if len(args) != 0 {
-			return ""
+		switch len(args) {
+		case 0:
+			return "LOCALTIMESTAMP"
+		case 1:
+			if p := strings.TrimSpace(args[0]); isIntLiteral(p) {
+				return "LOCALTIMESTAMP(" + p + ")"
+			}
 		}
-		return "LOCALTIMESTAMP"
+		return ""
 	})
 	expr = rewriteFunctionCalls(expr, "LOCALTIME", func(args []string) string {
+		switch len(args) {
+		case 0:
+			return "LOCALTIMESTAMP"
+		case 1:
+			if p := strings.TrimSpace(args[0]); isIntLiteral(p) {
+				return "LOCALTIMESTAMP(" + p + ")"
+			}
+		}
+		return ""
+	})
+	// CURDATE() / CURRENT_DATE() → CURRENT_DATE (Bug 8c). MySQL's
+	// `curdate()` and the parenthesised `current_date()` synonym
+	// both map to PG's bare `CURRENT_DATE` keyword (PG rejects the
+	// parenthesised forms). Argless only.
+	expr = rewriteFunctionCalls(expr, "CURDATE", func(args []string) string {
 		if len(args) != 0 {
 			return ""
 		}
-		return "LOCALTIMESTAMP"
+		return "CURRENT_DATE"
 	})
+	expr = rewriteFunctionCalls(expr, "CURRENT_DATE", func(args []string) string {
+		if len(args) != 0 {
+			return ""
+		}
+		return "CURRENT_DATE"
+	})
+	// CURTIME() → CURRENT_TIME; CURTIME(N) → CURRENT_TIME(N). PG's
+	// CURRENT_TIME accepts the fractional-precision form, matching
+	// the NOW(N) treatment above. CURRENT_TIME() parenthesised
+	// synonym maps the same way.
+	curTime := func(args []string) string {
+		switch len(args) {
+		case 0:
+			return "CURRENT_TIME"
+		case 1:
+			if p := strings.TrimSpace(args[0]); isIntLiteral(p) {
+				return "CURRENT_TIME(" + p + ")"
+			}
+		}
+		return ""
+	}
+	expr = rewriteFunctionCalls(expr, "CURTIME", curTime)
+	expr = rewriteFunctionCalls(expr, "CURRENT_TIME", curTime)
 	return expr
+}
+
+// isIntLiteral reports whether s is a non-empty run of ASCII digits
+// (an unsigned integer literal). Used by the fractional-precision
+// time rewrites to gate `NOW(N)` → `CURRENT_TIMESTAMP(N)` on N being
+// a literal — an expression-valued precision arg is not portable and
+// falls through verbatim.
+func isIntLiteral(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // rewriteUNIXTIMESTAMP rewrites MySQL's `UNIX_TIMESTAMP(x)` to PG's

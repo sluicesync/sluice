@@ -19,6 +19,8 @@ package translate
 // PostgreSQL → MySQL migrations don't trip these patterns.
 
 import (
+	"errors"
+	"fmt"
 	"regexp"
 	"sort"
 	"strings"
@@ -266,6 +268,78 @@ var gapPatterns = []gapPattern{
 		note:        "PG core has no sha2(). v0.38.0 ships SHA2 → encode(digest(x, '<algo>'), 'hex') GATED on `--enable-pg-extension pgcrypto`. Pass the flag (and ensure pgcrypto is installed on the target) for the auto-rewrite, or use --expr-override.",
 		requiresExt: "pgcrypto",
 	},
+}
+
+// LoudGaps returns only the SeverityLoud subset of gaps. These are
+// the MySQL-only constructs sluice's translator catalog deliberately
+// does NOT rewrite and that PG will reject at parse time — i.e. the
+// untranslated tail that, left unrefused, aborts `migrate` after
+// partial table creation with no preview warning (Bug 8 structural
+// false-green). SeveritySilent gaps stay advisory (they don't abort
+// the pipeline; refusing on them would over-block).
+//
+// This is the keystone of the v0.68.1 structural backstop: a loud
+// gap is a hard refusal at BOTH `schema preview` and `migrate`
+// pre-flight (before any DDL is applied), so preview is never a
+// false-green and migrate never leaves a partially-migrated target.
+// The detector keys strictly on the curated known-MySQL-only
+// gapPatterns set (word-boundary, string-literal-safe) — a construct
+// not in that set degrades to today's late-migrate-failure (no
+// worse than status quo), never a false-positive refusal of a valid
+// schema.
+func LoudGaps(gaps []Gap) []Gap {
+	var out []Gap
+	for _, g := range gaps {
+		if g.Severity == SeverityLoud {
+			out = append(out, g)
+		}
+	}
+	return out
+}
+
+// RefuseOnLoudGaps returns a non-nil, operator-actionable error when
+// scanning schema for the given engine pair surfaces one or more
+// SeverityLoud translator gaps; nil otherwise. The error names every
+// offending site (table + column/constraint + matched construct) and
+// the per-construct workaround so the operator can act before any
+// data or DDL moves.
+//
+// contextID is the caller's phase label ("schema preview" /
+// "migrate") so the same diagnostic reads correctly at either
+// surface. enabledPGExtensions is the operator's
+// `--enable-pg-extension` set (an enabled extension suppresses the
+// extension-gated patterns, mirroring ScanMySQLToPGGaps).
+//
+// Returns nil immediately for non-cross-engine / non-MySQL→PG pairs
+// (ScanMySQLToPGGaps already short-circuits those) — the refusal is
+// scoped exactly to the direction the gap catalog covers.
+func RefuseOnLoudGaps(
+	schema *ir.Schema,
+	sourceEngine, targetEngine, contextID string,
+	enabledPGExtensions map[string]bool,
+) error {
+	loud := LoudGaps(ScanMySQLToPGGaps(schema, sourceEngine, targetEngine, enabledPGExtensions))
+	if len(loud) == 0 {
+		return nil
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s: %d untranslatable MySQL-only construct(s) would emit invalid "+
+		"PostgreSQL DDL and abort the migration", contextID, len(loud))
+	if contextID == "migrate" {
+		b.WriteString(" after partially creating the target")
+	}
+	b.WriteString(". sluice refuses before any DDL is applied (loud-failure tenet) " +
+		"rather than emitting DDL PostgreSQL rejects mid-pipeline:")
+	for _, g := range loud {
+		b.WriteString("\n  - ")
+		if g.Constraint != "" {
+			fmt.Fprintf(&b, "table %q CHECK constraint %q", g.Table, g.Constraint)
+		} else {
+			fmt.Fprintf(&b, "table %q column %q %s", g.Table, g.Column, g.Field)
+		}
+		fmt.Fprintf(&b, ": %s() has no portable PostgreSQL equivalent. %s", g.Pattern, g.Note)
+	}
+	return errors.New(b.String())
 }
 
 // detectGaps scans expr for every gapPattern that's currently

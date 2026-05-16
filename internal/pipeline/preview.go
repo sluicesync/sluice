@@ -220,6 +220,29 @@ func (p *Previewer) Run(ctx context.Context) error {
 		return fmt.Errorf("preview: apply expression overrides: %w", err)
 	}
 
+	// ---- 3.5. Untranslatable-expression refusal (Bug 8 backstop) ----
+	// v0.68.1: preview must refuse — not silently emit invalid PG —
+	// when a MySQL-only construct that falls through the translator
+	// verbatim has no portable PostgreSQL form. Before this, `schema
+	// preview` exited 0 and printed valid-looking DDL while `migrate`
+	// hard-aborted mid-pipeline on the same schema (a structural
+	// false-green). The refusal fires here, BEFORE any DDL is
+	// rendered, with the same diagnostic `migrate` pre-flight emits
+	// so the two surfaces are consistent. SeveritySilent gaps stay
+	// advisory (rendered in the translator-gaps section below); only
+	// the loud, parse-fatal tail refuses. Scoped to MySQL→PG by
+	// RefuseOnLoudGaps; other pairs short-circuit to nil.
+	// Scan the post-override schema (tgtSchema is srcSchema after
+	// ApplyMappings + ApplyExpressionOverrides) so an operator's
+	// `--expr-override` escape hatch — which retags the expression
+	// dialect off "mysql" — correctly suppresses the refusal.
+	if err := translate.RefuseOnLoudGaps(
+		tgtSchema, p.Source.Name(), p.Target.Name(), "schema preview",
+		enabledExtensionSet(p.EnabledPGExtensions),
+	); err != nil {
+		return err
+	}
+
 	// ---- 4. Open the target schema writer; type-assert for preview. ----
 	sw, err := p.Target.OpenSchemaWriter(ctx, p.TargetDSN)
 	if err != nil {

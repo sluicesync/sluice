@@ -10,6 +10,8 @@
 
 package mysql
 
+import "github.com/orware/sluice/internal/translate/exprident"
+
 // exprGrammarKeywords is the subset of MySQL reserved words that can
 // appear unquoted in an expression body in a grammatical role:
 // logical / comparison operators, the NULL and boolean literals, CAST
@@ -38,6 +40,25 @@ var exprGrammarKeywords = map[string]struct{}{
 	"CURRENT_TIMESTAMP": {}, "LOCALTIME": {}, "LOCALTIMESTAMP": {},
 	"UTC_DATE": {}, "UTC_TIME": {}, "UTC_TIMESTAMP": {},
 	"CURRENT_USER": {}, "DEFAULT": {}, "VALUES": {},
+}
+
+// mysqlExprContextualKeywords mirrors the Postgres contextual rule for
+// `FROM` (see postgres/reserved_idents.go and [exprident.ContextRule]).
+// `FROM` is in mysqlReservedWords but not exprGrammarKeywords, so
+// without this rule the reverse (PG→MySQL) path would re-quote a
+// grammar `FROM` — e.g. a PG generated column `EXTRACT(YEAR FROM d)`
+// translated to MySQL would become `EXTRACT(YEAR `FROM` d)` and fail.
+// MySQL accepts the same `IS NOT DISTINCT FROM` (8.0.21+) and
+// `EXTRACT(field FROM src)` / `SUBSTRING(s FROM n)` / `TRIM(… FROM s)`
+// grammar, so the same AfterToken/InFunction discrimination applies;
+// it still re-quotes a de-quoted user column literally named `from`.
+var mysqlExprContextualKeywords = map[string]exprident.ContextRule{
+	"FROM": {
+		AfterToken: map[string]struct{}{"DISTINCT": {}},
+		InFunction: map[string]struct{}{
+			"EXTRACT": {}, "SUBSTRING": {}, "TRIM": {}, "OVERLAY": {},
+		},
+	},
 }
 
 // mysqlReservedWords is the MySQL 8.0 reserved-keyword set (the "(R)"

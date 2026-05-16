@@ -34,6 +34,7 @@ var pgRequoteConfig = exprident.Config{
 	QuoteByte:         '"',
 	Reserved:          pgReservedWords,
 	GrammarExclusions: pgExprGrammarKeywords,
+	GrammarContextual: pgExprContextualKeywords,
 	SkipWSBeforeParen: true,
 }
 
