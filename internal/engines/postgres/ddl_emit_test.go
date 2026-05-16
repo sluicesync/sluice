@@ -249,6 +249,44 @@ func TestEmitColumnType_PgvectorDisabled(t *testing.T) {
 	}
 }
 
+// TestEmitColumnType_VerbatimType pins the ADR-0047 writer path: the
+// captured pg_catalog.format_type spelling is emitted literally in the
+// column-type position, no catalog dispatch, no flag gate.
+func TestEmitColumnType_VerbatimType(t *testing.T) {
+	cases := []struct {
+		name string
+		in   ir.VerbatimType
+		want string
+	}{
+		{"ltree", ir.VerbatimType{Definition: "ltree"}, "ltree"},
+		{"cube", ir.VerbatimType{Definition: "cube"}, "cube"},
+		{"schema-qualified", ir.VerbatimType{Definition: "public.mytype"}, "public.mytype"},
+		{"with modifiers", ir.VerbatimType{Definition: "geometry(Point,4326)"}, "geometry(Point,4326)"},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			// No EnabledExtensions, no flag — verbatim emits unconditionally.
+			got, err := emitColumnType(c.in, emitOpts{})
+			if err != nil {
+				t.Fatalf("emitColumnType: %v", err)
+			}
+			if got != c.want {
+				t.Errorf("emitColumnType = %q; want %q (must be literal)", got, c.want)
+			}
+		})
+	}
+}
+
+// TestEmitColumnType_VerbatimTypeEmptyDefinition guards the corrupt-IR
+// case: an empty Definition is a loud error, never a silent "" column.
+func TestEmitColumnType_VerbatimTypeEmptyDefinition(t *testing.T) {
+	_, err := emitColumnType(ir.VerbatimType{Definition: ""}, emitOpts{})
+	if err == nil {
+		t.Fatal("expected loud error on empty VerbatimType.Definition; got nil")
+	}
+}
+
 // TestResolveIndexMethod_PrefersVerbatimMethod ensures the writer
 // emits the IR's verbatim Method (pgvector's ivfflat / hnsw) ahead
 // of the canonical Kind dispatch — the load-bearing path for

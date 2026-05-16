@@ -86,6 +86,26 @@ type columnMeta struct {
 	// the existing user-defined → enum / loud-failure path runs.
 	ExtensionName     string
 	ExtensionTypeName string
+
+	// FormatType is pg_catalog.format_type(atttypid, atttypmod) for the
+	// column — the exact PG type spelling (e.g. "ltree", "cube",
+	// "public.mytype"). Populated by the schema reader for every column;
+	// consumed only by the ADR-0047 verbatim tier (the catalogued /
+	// enum / geometry / core paths derive their type from the other
+	// fields and ignore it).
+	FormatType string
+
+	// VerbatimEligible is set by the schema reader (populateColumns)
+	// when (a) data_type is USER-DEFINED, (b) the column is NOT
+	// catalogued (the ADR-0032 lookup missed), and (c) the run carries
+	// a same-engine-PG guarantee (ADR-0047 tier (b) — verbatimTierFor
+	// returned verbatimTierVerbatim). When true AND the column has no
+	// first-class IR shape (not an enum, not geometry/geography), the
+	// translator emits [ir.VerbatimType] carrying [FormatType] instead
+	// of the loud refusal. Enum / geometry keep their existing
+	// first-class dispatch; this flag is the last carry before the
+	// refusal, not a reroute of recognised shapes.
+	VerbatimEligible bool
 }
 
 // geometryColumnInfo carries PostGIS's per-column metadata as
@@ -198,6 +218,32 @@ func translateType(c columnMeta) (ir.Type, error) {
 				HasM: parsedM || c.GeometryInfo.HasM,
 			}, nil
 		}
+		// ADR-0047 tier (b): an UNcatalogued USER-DEFINED type the run
+		// is allowed to carry verbatim (provably same-engine PG → PG,
+		// or a PG backup whose PG-restore-only constraint is enforced
+		// by the lineage marker + restore-time engine gate). Reached
+		// only after the catalogued (ExtensionName), enum (EnumValues),
+		// and geometry/geography branches above all declined — so it
+		// never shadows a first-class IR shape. Carries the exact
+		// pg_catalog.format_type spelling; the PG writer re-emits it
+		// literally and values round-trip via the type's text I/O.
+		// VerbatimEligible is false for tier (c) (cross-engine / no
+		// same-engine guarantee), so that path still falls through to
+		// the loud refusal below — the cross-engine default is NOT
+		// weakened.
+		if c.VerbatimEligible {
+			if c.FormatType == "" {
+				return nil, fmt.Errorf(
+					"postgres: user-defined type %q is eligible for "+
+						"verbatim passthrough but pg_catalog.format_type "+
+						"returned empty (cannot re-emit a column with no "+
+						"type spelling) — this is a sluice bug; please "+
+						"report it",
+					c.UDTName)
+			}
+			return ir.VerbatimType{Definition: c.FormatType}, nil
+		}
+
 		// ADR-0032 hint: if udt_name matches a known extension type
 		// the operator didn't opt into, surface the actionable flag
 		// rather than the vague "not a recognised enum" wording. The

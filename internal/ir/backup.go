@@ -549,6 +549,16 @@ type schemaTypeEnvelope struct {
 
 	// Array recursive.
 	Element json.RawMessage `json:"element,omitempty"`
+
+	// ExtensionType (ADR-0032) and VerbatimType (ADR-0047). Extension /
+	// Name / Modifiers carry the catalogued-extension shape;
+	// VerbatimDefinition carries the uncatalogued verbatim PG type
+	// spelling. New fields are append-only (older sluice ignores them);
+	// no existing field was renamed/renumbered.
+	Extension          string `json:"extension,omitempty"`
+	Name               string `json:"name,omitempty"`
+	Modifiers          []int  `json:"modifiers,omitempty"`
+	VerbatimDefinition string `json:"verbatim_definition,omitempty"`
 }
 
 // MarshalType renders an IR [Type] as a tagged-union JSON envelope.
@@ -643,6 +653,13 @@ func MarshalType(t Type) ([]byte, error) {
 		env.Kind = "Cidr"
 	case Macaddr:
 		env.Kind = "Macaddr"
+	case VerbatimType:
+		// ADR-0047: uncatalogued PG extension type carried verbatim.
+		// PG-restore-only; the lineage-segment marker + restore-time
+		// engine gate enforce that. Round-trips the exact format_type
+		// spelling so a PG restore re-creates the column identically.
+		env.Kind = "VerbatimType"
+		env.VerbatimDefinition = v.Definition
 	default:
 		return nil, fmt.Errorf("unsupported IR type for backup encoding: %T", t)
 	}
@@ -722,6 +739,11 @@ func UnmarshalType(b []byte) (Type, error) {
 		return Cidr{}, nil
 	case "Macaddr":
 		return Macaddr{}, nil
+	case "VerbatimType":
+		// ADR-0047. Recover the exact PG type spelling. Decode is
+		// engine-agnostic; the restore-time engine gate (checked before
+		// any data moves) refuses a non-PG target loudly.
+		return VerbatimType{Definition: env.VerbatimDefinition}, nil
 	default:
 		return nil, fmt.Errorf("unknown IR type kind %q in backup", env.Kind)
 	}

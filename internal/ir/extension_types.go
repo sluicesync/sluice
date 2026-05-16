@@ -33,6 +33,13 @@ const (
 	// modifiers; engine-specific binary representation lives in the
 	// catalog entry on the engine side.
 	ExtExtensionType
+	// ExtVerbatimType represents an uncatalogued PG extension column
+	// type carried verbatim for same-engine PG → PG / PG-backup paths
+	// (ADR-0047). Distinct from [ExtExtensionType]: it has no catalog
+	// build/emit dispatch — the writer emits its captured string
+	// literally. Append-only; never reorder/renumber the kinds above
+	// (the values are part of the backup tagged-union enum discipline).
+	ExtVerbatimType
 )
 
 func (k ExtensionKind) String() string {
@@ -55,6 +62,8 @@ func (k ExtensionKind) String() string {
 		return "Macaddr"
 	case ExtExtensionType:
 		return "ExtensionType"
+	case ExtVerbatimType:
+		return "VerbatimType"
 	default:
 		return "unknown"
 	}
@@ -270,6 +279,49 @@ func (e ExtensionType) String() string {
 		e.Extension, e.Name, strings.Join(mods, ","))
 }
 
+// VerbatimType represents an uncatalogued PG extension column type
+// (ADR-0047). Where [ExtensionType] models one of the seven catalogued
+// extensions (ADR-0032) with a rich per-extension build/emit contract
+// — typmod decode, modifier synthesis, cross-engine translators —
+// VerbatimType is the deliberately narrower, lower-fidelity-but-
+// faithful tier *below* that catalog: it carries the column type's
+// exact `pg_catalog.format_type(atttypid, atttypmod)` string and
+// nothing else. There is NO catalog dispatch by construction; the PG
+// writer emits [VerbatimType.Definition] literally in the column-type
+// position and values round-trip via the type's text I/O.
+//
+// It is produced ONLY for the two paths where semantic understanding
+// is provably unnecessary (ADR-0047 §1):
+//
+//   - same-engine PG → PG (live sync / migrate), and
+//   - PG backup whose restore target is also PG (enforced by a
+//     recorded lineage-segment marker + a loud restore-time engine
+//     gate — a verbatim-marked backup restored to MySQL refuses
+//     loudly at preflight, never silently drops/mangles).
+//
+// Cross-engine targets receiving VerbatimType refuse loudly: it is
+// PG-native by definition with no portable equivalent. The
+// [Definition] string is opaque to the IR — engine-neutral by
+// construction (it is just the PG type spelling; no MySQL analogue is
+// implied, which is exactly why the cross-engine refusal is correct).
+type VerbatimType struct {
+	// Definition is the exact PG type spelling as returned by
+	// `pg_catalog.format_type(atttypid, atttypmod)` for the source
+	// column (e.g. "ltree", "cube", "public.mytype", "geometry(Point,
+	// 4326)"). The PG writer emits this verbatim in the CREATE TABLE
+	// column-type position. Same PG major version is the documented
+	// fidelity contract (an extension's text representation is usually
+	// but not guaranteed version-stable — ADR-0047 §Consequences).
+	Definition string
+}
+
+func (VerbatimType) isType()    {}
+func (VerbatimType) Tier() Tier { return TierExtension }
+
+func (v VerbatimType) String() string {
+	return fmt.Sprintf("VerbatimType[%s]", v.Definition)
+}
+
 // KindOf reports the [ExtensionKind] of an extension Type, or returns
 // false if t is a core type.
 func KindOf(t Type) (ExtensionKind, bool) {
@@ -292,6 +344,8 @@ func KindOf(t Type) (ExtensionKind, bool) {
 		return ExtMacaddr, true
 	case ExtensionType:
 		return ExtExtensionType, true
+	case VerbatimType:
+		return ExtVerbatimType, true
 	default:
 		return 0, false
 	}

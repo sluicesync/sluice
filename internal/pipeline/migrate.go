@@ -306,6 +306,13 @@ func (m *Migrator) Run(ctx context.Context) error {
 		return wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: enable PG extensions on source: %w", err))
 	}
 
+	// ADR-0047 tier (b): enable verbatim passthrough for uncatalogued
+	// PG extension types ONLY when the run is provably same-engine
+	// PG → PG (engine-name-only determination; the orchestrator stays
+	// engine-neutral). Cross-engine / non-PG runs never enable it, so
+	// the existing loud refusal (tier (c)) is preserved unchanged.
+	applyVerbatimExtensionPassthrough(sr, verbatimLiveSameEnginePG(m.Source, m.Target))
+
 	schema, err := sr.ReadSchema(ctx)
 	if err != nil {
 		return wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: read source schema: %w", err))

@@ -205,6 +205,20 @@ func unsupportablePGtoMySQL(t ir.Type) string {
 		}
 		return fmt.Sprintf("PG extension type %s.%s", v.Extension, v.Name)
 	}
+	// ADR-0047: ir.VerbatimType is an uncatalogued PG extension type
+	// carried verbatim for same-engine PG → PG / PG-backup ONLY. It is
+	// PG-native by definition with no portable MySQL equivalent — the
+	// cross-engine loud-failure default applies (and there is no
+	// per-extension translator that could carve it out, unlike
+	// hstore/citext). This refusal mirrors the ExtensionType branch
+	// above and keeps the cross-engine default strictly unweakened: a
+	// migrate/restore PG → MySQL with such a column refuses before any
+	// data moves with an operator-actionable message.
+	if v, ok := t.(ir.VerbatimType); ok {
+		return fmt.Sprintf("PG verbatim extension type %q (ADR-0047 — "+
+			"same-engine PG / PG-restore only; no cross-engine MySQL form)",
+			v.Definition)
+	}
 	return ""
 }
 

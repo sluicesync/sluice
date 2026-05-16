@@ -121,6 +121,63 @@ func TestLineage_RoundTrip_MixedCodec(t *testing.T) {
 	}
 }
 
+// TestUpdateLineageForManifest_RecordsVerbatimMarker proves the
+// ADR-0047 backup capability marker is recorded on the open segment
+// from a full manifest whose schema carries ir.VerbatimType columns,
+// and is ABSENT (nil; omitempty in JSON) for a non-verbatim full
+// (legacy/common backups unaffected — additive, no format bump).
+func TestUpdateLineageForManifest_RecordsVerbatimMarker(t *testing.T) {
+	t.Run("verbatim full → marker recorded", func(t *testing.T) {
+		store := newMemStore()
+		m := &ir.Manifest{
+			SourceEngine: "postgres",
+			Kind:         ir.BackupKindFull,
+			Schema: &ir.Schema{Tables: []*ir.Table{{
+				Schema: "public", Name: "docs",
+				Columns: []*ir.Column{
+					{Name: "id", Type: ir.Integer{Width: 64}},
+					{Name: "path", Type: ir.VerbatimType{Definition: "ltree"}},
+				},
+			}}},
+		}
+		if err := updateLineageForManifest(context.Background(), store, m, ManifestFileName, CodecZstd); err != nil {
+			t.Fatalf("updateLineageForManifest: %v", err)
+		}
+		cat, ok, err := loadLineageCatalog(context.Background(), store)
+		if err != nil || !ok {
+			t.Fatalf("loadLineageCatalog: (%v,%v)", ok, err)
+		}
+		seg := cat.Segments[len(cat.Segments)-1]
+		if !seg.hasVerbatimExtensionColumns() {
+			t.Fatal("expected open segment to carry the verbatim marker")
+		}
+		want := "public.docs.path"
+		if len(seg.VerbatimExtensionColumns) != 1 || seg.VerbatimExtensionColumns[0] != want {
+			t.Errorf("VerbatimExtensionColumns = %v; want [%q]", seg.VerbatimExtensionColumns, want)
+		}
+	})
+
+	t.Run("non-verbatim full → marker absent (omitempty)", func(t *testing.T) {
+		store := newMemStore()
+		m := &ir.Manifest{
+			SourceEngine: "postgres",
+			Kind:         ir.BackupKindFull,
+			Schema: &ir.Schema{Tables: []*ir.Table{{
+				Name:    "users",
+				Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}},
+			}}},
+		}
+		if err := updateLineageForManifest(context.Background(), store, m, ManifestFileName, CodecZstd); err != nil {
+			t.Fatalf("updateLineageForManifest: %v", err)
+		}
+		raw, _ := store.Get(context.Background(), LineageCatalogFileName)
+		body, _ := io.ReadAll(raw)
+		if strings.Contains(string(body), "verbatim_extension_columns") {
+			t.Errorf("non-verbatim lineage.json must omit verbatim_extension_columns; got %s", body)
+		}
+	})
+}
+
 // TestLineage_FormatVersionGate: a newer format_version is a loud
 // refusal (forward-incompat — upgrade sluice).
 func TestLineage_FormatVersionGate(t *testing.T) {

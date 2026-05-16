@@ -167,6 +167,27 @@ func emitColumnType(t ir.Type, opts emitOpts) (string, error) {
 				v.String(), v.Extension, v.Extension)
 		}
 		return emitExtensionColumn(v)
+
+	// ADR-0047: verbatim passthrough for an UNcatalogued PG extension
+	// type. There is NO catalog dispatch by construction — the schema
+	// reader captured the exact pg_catalog.format_type spelling and the
+	// writer re-emits it literally in the column-type position. This
+	// path is only ever populated for a provably-same-engine PG → PG
+	// run or a PG backup (the lineage marker + the loud restore-time
+	// engine gate enforce PG-restore-only); a cross-engine target never
+	// receives ir.VerbatimType (checkCrossEngineSupportable refuses it
+	// before any DDL emits — the loud-failure default is preserved).
+	// A target PG instance missing the owning extension fails at its
+	// own CREATE with a clear "type does not exist" — loud and
+	// acceptable, consistent with ADR-0035's PostGIS-absent behaviour.
+	case ir.VerbatimType:
+		if v.Definition == "" {
+			return "", errors.New(
+				"postgres: ir.VerbatimType has an empty Definition — " +
+					"cannot emit a column with no type spelling (ADR-0047; " +
+					"this indicates a corrupt IR / backup manifest)")
+		}
+		return v.Definition, nil
 	}
 	return "", fmt.Errorf("postgres: unknown IR type %T", t)
 }

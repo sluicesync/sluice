@@ -163,6 +163,46 @@ func TestCheckCrossEngineSupportable_PGtoMySQL_ExtensionTypeRefuses(t *testing.T
 	}
 }
 
+// TestCheckCrossEngineSupportable_PGtoMySQL_VerbatimTypeRefuses pins
+// the ADR-0047 cross-engine guard: an uncatalogued verbatim PG
+// extension type has no portable MySQL form and MUST refuse loudly —
+// the cross-engine default is not weakened by the same-engine verbatim
+// tier. Mirrors the ExtensionType refusal.
+func TestCheckCrossEngineSupportable_PGtoMySQL_VerbatimTypeRefuses(t *testing.T) {
+	s := &ir.Schema{Tables: []*ir.Table{{
+		Name: "docs",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}},
+			{Name: "path", Type: ir.VerbatimType{Definition: "ltree"}},
+		},
+	}}}
+	err := checkCrossEngineSupportable(s, "postgres", "mysql", "docs-migration")
+	if err == nil {
+		t.Fatal("err = nil; want VerbatimType cross-engine refusal")
+	}
+	if !strings.Contains(err.Error(), "ltree") {
+		t.Errorf("err = %v; want mention of the verbatim definition \"ltree\"", err)
+	}
+	if !strings.Contains(err.Error(), "path") {
+		t.Errorf("err = %v; want mention of column 'path'", err)
+	}
+	if !strings.Contains(err.Error(), "ADR-0047") {
+		t.Errorf("err = %v; want ADR-0047 reference", err)
+	}
+}
+
+// TestCheckCrossEngineSupportable_PGtoPG_VerbatimTypeOK confirms the
+// same-engine path is unaffected (the verbatim tier's whole point).
+func TestCheckCrossEngineSupportable_PGtoPG_VerbatimTypeOK(t *testing.T) {
+	s := &ir.Schema{Tables: []*ir.Table{{
+		Name:    "docs",
+		Columns: []*ir.Column{{Name: "path", Type: ir.VerbatimType{Definition: "ltree"}}},
+	}}}
+	if err := checkCrossEngineSupportable(s, "postgres", "postgres", "x"); err != nil {
+		t.Errorf("same-engine PG → PG with VerbatimType should be OK; got %v", err)
+	}
+}
+
 // TestCheckCrossEngineSupportable_PGtoMySQL_TrgmIndexRefuses exercises
 // the ADR-0032 Tier 2 lite cross-engine refusal: pg_trgm has no new
 // column type (the column is plain `text`), so the column-level

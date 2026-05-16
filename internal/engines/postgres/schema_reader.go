@@ -42,6 +42,27 @@ type SchemaReader struct {
 	// to route extension-owned column types through pgExtensionCatalog
 	// instead of the existing user-defined / loud-failure dispatch.
 	enabledExtensions map[string]bool
+
+	// verbatimPassthrough enables the ADR-0047 verbatim tier for
+	// UNcatalogued USER-DEFINED types: capture
+	// pg_catalog.format_type(...) and uncatalogued index AM / opclass
+	// verbatim instead of refusing. Set by
+	// [SetVerbatimExtensionPassthrough] — the orchestrator turns it on
+	// only for provably-same-engine PG → PG or for a PG backup (the
+	// determination tiers are the named concept in verbatim_tier.go).
+	// false (the default) preserves tier (c): the existing loud
+	// refusal for uncatalogued user-defined types is unchanged.
+	verbatimPassthrough bool
+}
+
+// SetVerbatimExtensionPassthrough implements [ir.VerbatimExtensionAware]
+// (ADR-0047). The orchestrator calls this with enabled=true only for a
+// provably-same-engine PG → PG run or a PG backup; cross-engine /
+// non-PG paths never call it, so the field stays false and the
+// existing loud refusal for uncatalogued user-defined types is
+// preserved. Idempotent; called at construction time before any read.
+func (r *SchemaReader) SetVerbatimExtensionPassthrough(enabled bool) {
+	r.verbatimPassthrough = enabled
 }
 
 // Close releases the underlying connection pool.
@@ -462,7 +483,8 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 			COALESCE(c.is_generated, 'NEVER'),
 			COALESCE(c.generation_expression, ''),
 			COALESCE(coll.collname, ''),
-			COALESCE(a.atttypmod, -1)
+			COALESCE(a.atttypmod, -1),
+			COALESCE(pg_catalog.format_type(a.atttypid, a.atttypmod), '')
 		FROM   information_schema.columns c
 		LEFT JOIN pg_class      cl   ON cl.relname    = c.table_name
 		                            AND cl.relnamespace = (
@@ -496,6 +518,7 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 			isGenerated, genExpr string
 			collation            string
 			attTypmod            int32
+			formatType           string
 		)
 		if err := rows.Scan(
 			&tableName, &colName, &ordinal,
@@ -506,6 +529,7 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 			&isGenerated, &genExpr,
 			&collation,
 			&attTypmod,
+			&formatType,
 		); err != nil {
 			return err
 		}
@@ -525,6 +549,7 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 			IsAutoIncrement: isAutoIncrement(isIdentity, columnDefault),
 			Collation:       collation,
 			AttTypmod:       attTypmod,
+			FormatType:      formatType,
 		}
 
 		// Resolve enum values for USER-DEFINED columns.
@@ -571,6 +596,21 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 			if ext, name, ok := lookupExtensionForType(udtName, r.enabledExtensions); ok {
 				meta.ExtensionName = ext
 				meta.ExtensionTypeName = name
+			} else if verbatimTierFor(r.verbatimPassthrough) == verbatimTierVerbatim {
+				// ADR-0047 tier (b): the column is USER-DEFINED and NOT
+				// catalogued (the catalog lookup above missed), and the
+				// run carries a same-engine-PG guarantee (live PG → PG
+				// or a PG backup). Flag it for verbatim capture; the
+				// translator emits ir.VerbatimType with the exact
+				// format_type spelling. Catalogued types never reach
+				// here (the lookup above set ExtensionName). Enum /
+				// geometry still win in translateType (they have
+				// first-class IR shapes); the verbatim flag is the
+				// last-resort carry before the loud refusal, so it does
+				// not regress them. Tier (c) (verbatimPassthrough
+				// false) leaves this unset → the existing loud refusal
+				// in translateType is preserved unchanged.
+				meta.VerbatimEligible = true
 			}
 		}
 
@@ -668,7 +708,31 @@ func (r *SchemaReader) populateIndexes(ctx context.Context, tables map[string]*i
 				WHEN a.attname IS NULL
 				THEN pg_get_indexdef(ix.indexrelid, u.ord::int, true)
 				ELSE ''
-			END AS expr
+			END AS expr,
+			-- ADR-0047: is the access method owned by an extension
+			-- (pg_depend deptype 'e')? An extension-owned AM that is
+			-- NOT one of the ADR-0032 catalogued ones is carried
+			-- verbatim under the verbatim tier.
+			EXISTS (
+				SELECT 1 FROM pg_depend d
+				WHERE  d.classid = 'pg_am'::regclass
+				  AND  d.objid   = am.oid
+				  AND  d.deptype = 'e'
+			) AS am_ext_owned,
+			-- ADR-0047 / Bug 47 invariant: an opclass is carried
+			-- verbatim ONLY when it is genuinely extension-owned
+			-- (pg_depend deptype 'e'). Core / default opclasses stay
+			-- unpopulated so a non-empty OperatorClass remains an
+			-- honest "extension-owned" marker the cross-engine refusal
+			-- keys on.
+			COALESCE((
+				SELECT EXISTS (
+					SELECT 1 FROM pg_depend d
+					WHERE  d.classid = 'pg_opclass'::regclass
+					  AND  d.objid   = opc.oid
+					  AND  d.deptype = 'e'
+				)
+			), false) AS opclass_ext_owned
 		FROM   pg_index ix
 		JOIN   pg_class      cl ON cl.oid = ix.indrelid
 		JOIN   pg_class      i  ON i.oid  = ix.indexrelid
@@ -699,11 +763,13 @@ func (r *SchemaReader) populateIndexes(ctx context.Context, tables map[string]*i
 			ord                                   int
 			opclass                               string
 			exprText                              string
+			amExtOwned, opclassExtOwned           bool
 		)
 		if err := rows.Scan(
 			&tableName, &indexName, &method,
 			&isUnique, &isPrimary,
 			&colName, &ord, &opclass, &exprText,
+			&amExtOwned, &opclassExtOwned,
 		); err != nil {
 			return err
 		}
@@ -748,6 +814,20 @@ func (r *SchemaReader) populateIndexes(ctx context.Context, tables map[string]*i
 				extensionAccessMethodEnabled(method, r.enabledExtensions) {
 				idx.Method = method
 			}
+			// ADR-0047 tier (b): an UNcatalogued, extension-owned
+			// access method (TimescaleD's `hypercore`, an in-house
+			// AM, …) on a same-engine-PG / PG-backup run is carried
+			// verbatim so the PG writer re-emits `USING <method>`.
+			// Gated on amExtOwned so a core PG AM (btree/gin/…) never
+			// gets pinned into Method (those round-trip via Kind, and
+			// pinning the bareword would clutter diffs / regress the
+			// Bug 47-style "only-non-core is explicit" property). The
+			// catalogued-AM branch above already won for the ADR-0032
+			// seven; this is the long-tail carry below the catalog.
+			if idx.Method == "" && kind == ir.IndexKindUnspecified &&
+				amExtOwned && verbatimTierFor(r.verbatimPassthrough) == verbatimTierVerbatim {
+				idx.Method = method
+			}
 			collected[k] = idx
 			if isPrimary {
 				primary[tableName] = indexName
@@ -783,6 +863,22 @@ func (r *SchemaReader) populateIndexes(ctx context.Context, tables map[string]*i
 		case opclass != "" && idx.Method != "":
 			col.OperatorClass = opclass
 		case opclass != "" && extensionOperatorClassEnabled(opclass, r.enabledExtensions):
+			col.OperatorClass = opclass
+		case opclass != "" && opclassExtOwned &&
+			verbatimTierFor(r.verbatimPassthrough) == verbatimTierVerbatim:
+			// ADR-0047 tier (b): an UNcatalogued, genuinely
+			// extension-owned operator class (pg_depend deptype 'e')
+			// on a same-engine-PG / PG-backup run. Carry it verbatim
+			// so the same-engine writer re-emits `<col> <opclass>`.
+			// opclassExtOwned is the Bug 47 invariant made literal:
+			// only EXTENSION-owned opclasses ever set OperatorClass,
+			// so a non-empty value passing through the IR is by
+			// construction extension-introduced — which is exactly
+			// what makes a verbatim backup correctly refuse a
+			// cross-engine restore for free (the existing non-empty-
+			// OperatorClass cross-engine signal). Core / default
+			// opclasses have opclassExtOwned=false and stay
+			// unpopulated, unchanged.
 			col.OperatorClass = opclass
 		case opclass != "" && extensionOperatorClassRegistered(opclass):
 			// Operator-owned extension opclass on a core-PG access

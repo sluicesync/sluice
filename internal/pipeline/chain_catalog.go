@@ -142,6 +142,26 @@ type LineageSegment struct {
 	// the chunk bytes on restore. Empty resolves to [DefaultCodec]
 	// (zstd, v0.67.0+); a v0.67.0+ backup always records it explicitly.
 	Codec Codec `json:"codec,omitempty"`
+
+	// VerbatimExtensionColumns is the ADR-0047 backup capability
+	// marker: the "schema.table.column" references in this segment's
+	// schema whose IR type is [ir.VerbatimType] (an uncatalogued PG
+	// extension type carried verbatim). A non-empty list means the
+	// segment is **PG-restore-only** — the restore-target engine is
+	// unknown at backup time, so this is RECORDED here (the
+	// record-never-sniff idiom, exactly like the per-segment Codec)
+	// and enforced LOUDLY at restore preflight against the *actual*
+	// target engine (see [refuseVerbatimRestoreToNonPG]). Empty /
+	// absent on every pre-ADR-0047 and every non-verbatim backup —
+	// older sluice ignores the unknown field (additive; no format
+	// bump), and a legacy/never-rotated backup is unaffected.
+	VerbatimExtensionColumns []string `json:"verbatim_extension_columns,omitempty"`
+}
+
+// hasVerbatimExtensionColumns reports whether the segment carries the
+// ADR-0047 PG-restore-only marker.
+func (s *LineageSegment) hasVerbatimExtensionColumns() bool {
+	return len(s.VerbatimExtensionColumns) > 0
 }
 
 // codecOrDefault returns the segment's recorded codec, resolving an
@@ -415,6 +435,13 @@ func updateLineageForManifest(
 		if seg.Codec == "" {
 			seg.Codec = resolveCodec(codec)
 		}
+		// ADR-0047 backup capability marker. The full carries the
+		// authoritative schema; record the verbatim-typed columns so
+		// the restore-time engine gate can refuse a non-PG target
+		// loudly. Recorded, never sniffed at restore (ADR-0046 idiom);
+		// stays nil for every non-verbatim backup so the field is
+		// absent in the common case (and legacy readers ignore it).
+		seg.VerbatimExtensionColumns = verbatimExtensionColumnsIn(manifest.Schema)
 	case ir.BackupKindIncremental:
 		// Dedup on path (per-chunk checkpoint re-writes the same path).
 		found := false

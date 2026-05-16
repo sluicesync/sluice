@@ -51,6 +51,11 @@ func TestMarshalType_RoundTrip(t *testing.T) {
 		{"Array of Integer", Array{Element: Integer{Width: 32}}},
 		{"Array of UUID", Array{Element: UUID{}}},
 		{"Array of nil element", Array{Element: nil}},
+		// ADR-0047 verbatim (uncatalogued) PG extension type.
+		{"VerbatimType ltree", VerbatimType{Definition: "ltree"}},
+		{"VerbatimType cube", VerbatimType{Definition: "cube"}},
+		{"VerbatimType schema-qualified", VerbatimType{Definition: "public.mytype"}},
+		{"VerbatimType with modifier spelling", VerbatimType{Definition: "geometry(Point,4326)"}},
 	}
 	for _, c := range cases {
 		c := c

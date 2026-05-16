@@ -296,6 +296,14 @@ func (b *Backup) Run(ctx context.Context) error {
 	}
 	defer closeIf(sr)
 
+	// ADR-0047 tier (b): a PG-source backup may carry uncatalogued
+	// extension types verbatim. The restore-target engine is unknown
+	// at backup time, so this only enables CAPTURE — the PG-restore-
+	// only constraint is enforced later by the recorded lineage marker
+	// (verbatimExtensionColumnsIn → LineageSegment) + the loud
+	// restore-time engine gate. A non-PG source never enables it.
+	applyVerbatimExtensionPassthrough(sr, verbatimBackupSourcePG(b.Source))
+
 	schema, err := sr.ReadSchema(ctx)
 	if err != nil {
 		return wrapWithHint(PhaseConnect, fmt.Errorf("backup: read source schema: %w", err))

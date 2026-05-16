@@ -44,6 +44,8 @@ func TestTypesImplementType(t *testing.T) {
 		{"Macaddr", Macaddr{}, TierExtension},
 		// ADR-0032 PG extension passthrough variant.
 		{"ExtensionType", ExtensionType{Extension: "vector", Name: "vector", Modifiers: []int{384}}, TierExtension},
+		// ADR-0047 verbatim (uncatalogued) PG extension type.
+		{"VerbatimType", VerbatimType{Definition: "ltree"}, TierExtension},
 	}
 
 	for _, c := range cases {
@@ -79,6 +81,7 @@ func TestKindOf(t *testing.T) {
 		{"Cidr", Cidr{}, ExtCidr},
 		{"Macaddr", Macaddr{}, ExtMacaddr},
 		{"ExtensionType", ExtensionType{Extension: "vector", Name: "vector"}, ExtExtensionType},
+		{"VerbatimType", VerbatimType{Definition: "ltree"}, ExtVerbatimType},
 	}
 	for _, c := range cases {
 		c := c
@@ -91,6 +94,35 @@ func TestKindOf(t *testing.T) {
 				t.Errorf("KindOf(%s) = %v; want %v", c.name, got, c.want)
 			}
 		})
+	}
+}
+
+// TestExtensionKindEnumIsAppendOnly pins the wire-stable
+// ExtensionKind values. These are part of the backup tagged-union
+// enum discipline (ADR-0047): never reorder/renumber existing kinds —
+// only append. A failure here means an existing kind's value moved,
+// which would silently mis-decode older backups.
+func TestExtensionKindEnumIsAppendOnly(t *testing.T) {
+	want := map[ExtensionKind]string{
+		0: "Enum",
+		1: "Set",
+		2: "UUID",
+		3: "Array",
+		4: "Geometry",
+		5: "Inet",
+		6: "Cidr",
+		7: "Macaddr",
+		8: "ExtensionType",
+		9: "VerbatimType", // ADR-0047 — appended; must stay last.
+	}
+	for k, name := range want {
+		if got := k.String(); got != name {
+			t.Errorf("ExtensionKind(%d).String() = %q; want %q "+
+				"(append-only discipline violated — never renumber)", k, got, name)
+		}
+	}
+	if ExtVerbatimType != 9 {
+		t.Errorf("ExtVerbatimType = %d; want 9 (must be the last appended kind)", ExtVerbatimType)
 	}
 }
 

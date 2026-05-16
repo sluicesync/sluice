@@ -261,7 +261,17 @@ func (w *RowWriter) WriteRows(ctx context.Context, table *ir.Table, rows <-chan 
 	if rows == nil {
 		return errors.New("postgres: WriteRows: rows channel is nil")
 	}
-	if w.useCopy {
+	// ADR-0047: a table with a verbatim (uncatalogued) extension
+	// column takes the batched-INSERT path even when COPY is the
+	// engine default. pgx's binary COPY can't encode an unknown-OID
+	// type's value (no sluice-side codec by construction — the
+	// verbatim tier deliberately ships zero per-extension code); the
+	// parameterised INSERT sends the value as text and PG's type input
+	// function re-parses it, which is the text-I/O round-trip the ADR
+	// specifies. This is contained: it fires ONLY for tables that
+	// actually carry a verbatim column (the catalogued / core path is
+	// untouched and keeps using COPY).
+	if w.useCopy && !tableHasVerbatimColumn(table) {
 		return w.writeViaCopy(ctx, table, rows)
 	}
 	return w.writeViaBatch(ctx, table, rows)
@@ -398,6 +408,31 @@ func tableHasHstoreColumn(table *ir.Table) bool {
 			continue
 		}
 		if ext.Extension == "hstore" {
+			return true
+		}
+	}
+	return false
+}
+
+// tableHasVerbatimColumn reports whether table has any column whose
+// IR type is [ir.VerbatimType] (ADR-0047). Used by [WriteRows] to
+// route the table through the batched-INSERT path instead of binary
+// COPY: an uncatalogued extension type has no sluice-side wire-format
+// codec (that is the whole point of the verbatim tier — zero
+// per-extension code), and pgx's binary COPY would mis-encode the
+// value the same way it did for pgvector/hstore before their codecs.
+// The parameterised-INSERT path sends the value as text and PG's own
+// type input function parses it — exactly the text-I/O round-trip
+// ADR-0047 §2 specifies.
+func tableHasVerbatimColumn(table *ir.Table) bool {
+	if table == nil {
+		return false
+	}
+	for _, col := range table.Columns {
+		if col == nil {
+			continue
+		}
+		if _, ok := col.Type.(ir.VerbatimType); ok {
 			return true
 		}
 	}
@@ -629,6 +664,20 @@ func prepareValue(v any, t ir.Type) (any, error) {
 			return x, nil
 		}
 		return nil, fmt.Errorf("expected string or []byte for ExtensionType column, got %T", v)
+	}
+
+	// ADR-0047: VerbatimType columns pass through as their decoded
+	// text/bytes shape — the type's text-output string (pgx stdlib
+	// mode) or raw bytes — straight back to PG's type input function
+	// on the (PG-only) target. Same opaque shape as ExtensionType.
+	// This path is only reached on a same-engine PG → PG / PG-restore
+	// run; a non-PG target is refused before any value moves.
+	if _, isVerbatim := t.(ir.VerbatimType); isVerbatim {
+		switch x := v.(type) {
+		case string, []byte:
+			return x, nil
+		}
+		return nil, fmt.Errorf("expected string or []byte for VerbatimType column (ADR-0047), got %T", v)
 	}
 
 	return v, nil

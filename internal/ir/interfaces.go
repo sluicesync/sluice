@@ -827,6 +827,32 @@ type ExtensionAware interface {
 	EnableExtensions(ctx context.Context, extensions []string) error
 }
 
+// VerbatimExtensionAware is the optional engine-side surface for
+// engines that can carry an UNcatalogued extension column type
+// verbatim (ADR-0047), as the passthrough tier *below* the ADR-0032
+// catalog. PG implements; MySQL does not (no extension concept).
+//
+// The orchestrator enables the verbatim tier ONLY when it can prove
+// the run does not need semantic type understanding:
+//
+//   - live PG → PG (source engine name == target engine name ==
+//     "postgres"), or
+//   - a PG backup (restore-target unknown at backup time → the
+//     verbatim-typed columns are recorded on the lineage segment and
+//     a loud restore-time engine gate refuses a non-PG target).
+//
+// Engines that don't implement the surface skip cleanly — the
+// existing loud refusal for uncatalogued USER-DEFINED types is
+// preserved (ADR-0047 determination tier (c)). The catalogued seven
+// extensions are unaffected: they keep taking the rich ADR-0032 path
+// regardless of this flag (the engine consults its catalog first).
+//
+// SetVerbatimExtensionPassthrough is idempotent and is called at
+// reader/writer construction time, before any schema read or write.
+type VerbatimExtensionAware interface {
+	SetVerbatimExtensionPassthrough(enabled bool)
+}
+
 // CrossEngineExtensionTranslator is the optional engine-side surface
 // for engines whose extensions have defensible default cross-engine
 // translators (ADR-0032 § "Cross-engine policy"). The pipeline's

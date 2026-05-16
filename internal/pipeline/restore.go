@@ -213,6 +213,17 @@ func (r *Restore) Run(ctx context.Context) error {
 		return errors.New("restore: manifest carries no schema")
 	}
 
+	// 1.4. ADR-0047 verbatim-extension restore-time engine gate. A
+	//      backup carrying verbatim (uncatalogued) PG extension-typed
+	//      columns is PG-restore-only; restoring it to a non-PG target
+	//      is a LOUD refusal before any data moves (never a silent
+	//      drop/mangle). The single-manifest path gates on the
+	//      manifest schema directly — the same schema the lineage
+	//      marker is derived from, so the two restore paths agree.
+	if err := refuseVerbatimManifestRestoreToNonPG(manifest.Schema, r.Target.Name()); err != nil {
+		return wrapWithHint(PhaseConnect, err)
+	}
+
 	// 1.5. Encryption pre-flight. If the chain root manifest carries
 	// [ir.ChainEncryption], the operator MUST have supplied an
 	// envelope that can unwrap the chain's CEK. A missing envelope

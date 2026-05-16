@@ -90,6 +90,19 @@ func decodeValue(raw any, t ir.Type) (any, error) {
 		// engine round-trips natively"; downstream the writer's
 		// prepareValue passes the same bytes through verbatim.
 		return decodeExtensionValue(raw, v)
+	case ir.VerbatimType:
+		// ADR-0047: an uncatalogued PG extension type carried verbatim.
+		// Values round-trip via the type's text I/O (pgx stdlib mode
+		// surfaces an unknown OID as the type's text-output string, or
+		// raw bytes on some codepaths). Same opaque pass-through shape
+		// as ExtensionType / JSON — the IR Row contract is "whatever
+		// the engine round-trips natively"; the writer's prepareValue
+		// hands the same string/bytes back and PG's type input function
+		// re-parses it. Only ever reached on a same-engine PG → PG /
+		// PG-restore path (the cross-engine gate refuses before any
+		// value moves), so text I/O fidelity is the documented same-
+		// PG-major-version contract (ADR-0047).
+		return decodeVerbatimValue(raw)
 	}
 	return nil, fmt.Errorf("postgres: no decoder for IR type %T", t)
 }
@@ -147,6 +160,28 @@ func decodeExtensionValue(raw any, _ ir.ExtensionType) (any, error) {
 		return out, nil
 	}
 	return nil, fmt.Errorf("postgres: cannot decode %T as ExtensionType", raw)
+}
+
+// decodeVerbatimValue routes an ADR-0047 verbatim-typed column value
+// through the canonical opaque-text / opaque-bytes path (the same
+// shape as [decodeExtensionValue]). pgx's stdlib mode hands back an
+// unknown-OID value as its text-output string; some codepaths deliver
+// raw bytes. Both pass through verbatim — the writer's prepareValue
+// hands them back and PG's type input function re-parses on the
+// (PG-only) target. nil maps to nil (NULL preserved).
+func decodeVerbatimValue(raw any) (any, error) {
+	if raw == nil {
+		return nil, nil
+	}
+	switch v := raw.(type) {
+	case string:
+		return v, nil
+	case []byte:
+		out := make([]byte, len(v))
+		copy(out, v)
+		return out, nil
+	}
+	return nil, fmt.Errorf("postgres: cannot decode %T as VerbatimType (ADR-0047)", raw)
 }
 
 func decodeBoolean(raw any) (any, error) {

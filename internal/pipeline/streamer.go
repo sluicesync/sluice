@@ -1300,6 +1300,9 @@ func (s *Streamer) logDryRunPlan(ctx context.Context, streamID string, persisted
 	if err := applyEnabledPGExtensions(ctx, sr, s.EnabledPGExtensions); err != nil {
 		return wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: dry-run: enable PG extensions on source: %w", err))
 	}
+	// ADR-0047 tier (b): live PG → PG sync may carry uncatalogued
+	// extension types verbatim. Engine-name-only determination.
+	applyVerbatimExtensionPassthrough(sr, verbatimLiveSameEnginePG(s.Source, s.Target))
 	schema, err := sr.ReadSchema(ctx)
 	if err != nil {
 		return wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: dry-run: read source schema: %w", err))
@@ -1454,6 +1457,9 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 		closeIf(sr)
 		return nil, wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: enable PG extensions on source: %w", err))
 	}
+	// ADR-0047 tier (b): live PG → PG sync may carry uncatalogued
+	// extension types verbatim. Engine-name-only determination.
+	applyVerbatimExtensionPassthrough(sr, verbatimLiveSameEnginePG(s.Source, s.Target))
 	schema, err := sr.ReadSchema(ctx)
 	closeIf(sr)
 	if err != nil {

@@ -136,6 +136,19 @@ func (r *ChainRestore) Run(ctx context.Context) error {
 		}
 	}
 
+	// 1.9. ADR-0047 verbatim-extension restore-time engine gate. A
+	//      segment carrying the recorded PG-restore-only marker
+	//      restored to a non-PG target is a LOUD refusal before any
+	//      data moves (the load-bearing safety pin; same severity as
+	//      Bug 66 / the ADR-0035 PostGIS-absent refusal). The marker
+	//      is read from lineage.json — the authoritative structural
+	//      record — never sniffed from chunk bytes.
+	if cat, err := resolveLineage(ctx, r.Store); err != nil {
+		return wrapWithHint(PhaseConnect, fmt.Errorf("chain restore: %w", err))
+	} else if err := refuseVerbatimRestoreToNonPG(cat, r.Target.Name()); err != nil {
+		return wrapWithHint(PhaseConnect, err)
+	}
+
 	// 2. Cross-engine routing (Phase 5). Pre-flight the root full's
 	//    schema + every link's delta for unsupportable types.
 	crossEngine := root.manifest.SourceEngine != r.Target.Name() && root.manifest.SourceEngine != ""

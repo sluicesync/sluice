@@ -91,6 +91,56 @@ func applyEnabledPGExtensions(ctx context.Context, target any, extensions []stri
 	return nil
 }
 
+// applyVerbatimExtensionPassthrough threads the ADR-0047 verbatim
+// passthrough decision to a freshly-opened engine reader / writer via
+// the optional [ir.VerbatimExtensionAware] surface. Engines that don't
+// implement it (today: MySQL) skip cleanly.
+//
+// The orchestrator is the determination authority and stays
+// engine-neutral: it passes a boolean computed purely from engine
+// *names* (never importing an engine package). enabled MUST be true
+// only when the run provably does not need semantic type
+// understanding for uncatalogued extension types:
+//
+//   - live PG → PG: source engine name == target engine name ==
+//     "postgres" (see [verbatimLiveSameEnginePG]); or
+//   - a PG backup: the source is PG and the restore-target engine is
+//     unknown at backup time, so verbatim columns are recorded on the
+//     lineage segment and a loud restore-time engine gate enforces
+//     PG-restore-only.
+//
+// Cross-engine and non-PG runs pass enabled=false (or never call
+// this), preserving ADR-0047 tier (c): the existing loud refusal for
+// uncatalogued user-defined types is unchanged.
+func applyVerbatimExtensionPassthrough(target any, enabled bool) {
+	if !enabled {
+		return
+	}
+	if aware, ok := target.(ir.VerbatimExtensionAware); ok {
+		aware.SetVerbatimExtensionPassthrough(true)
+	}
+}
+
+// verbatimLiveSameEnginePG reports whether a LIVE run (migrate / sync)
+// qualifies for the ADR-0047 verbatim tier: both engines are present
+// and are the same PostgreSQL engine. This is the orchestrator's
+// engine-neutral, name-only determination for tier (b) on the live
+// path — no engine package import, no DSN sniffing.
+func verbatimLiveSameEnginePG(source, target ir.Engine) bool {
+	return source != nil && target != nil &&
+		source.Name() == "postgres" && target.Name() == "postgres"
+}
+
+// verbatimBackupSourcePG reports whether a BACKUP run qualifies for
+// the ADR-0047 verbatim tier: the source engine is PostgreSQL. The
+// restore-target engine is unknown at backup time, so qualifying here
+// only enables CAPTURE; the PG-restore-only constraint is enforced by
+// the recorded lineage marker + the loud restore-time engine gate
+// ([refuseVerbatimRestoreToNonPG]).
+func verbatimBackupSourcePG(source ir.Engine) bool {
+	return source != nil && source.Name() == "postgres"
+}
+
 // validateEnabledPGExtensions enforces the engine-name gate for
 // `--enable-pg-extension` (ADR-0032). For most extensions the flag
 // is meaningful only on same-engine PG → PG paths — cross-engine
