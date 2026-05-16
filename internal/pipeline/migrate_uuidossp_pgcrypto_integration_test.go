@@ -19,8 +19,15 @@
 //     at schema-read with the actionable message.
 //  4. PG → PG, DEFAULT gen_random_uuid(), no flag → SUCCEEDS (core
 //     function, never gated) — the core-vs-extension guard.
-//  5. Cross-engine PG → MySQL: uuid_generate_v4() → (UUID());
-//     crypt() → loud cross-engine refusal naming --expr-override.
+//  5. Cross-engine PG → MySQL: --enable-pg-extension uuid-ossp /
+//     pgcrypto is refused up-front by the pre-existing ADR-0032
+//     validateEnabledPGExtensions lossless-only policy (only
+//     hstore/citext have cross-engine default translators). ADR-0044
+//     §3 adds no new cross-engine translation or refusal arm — a
+//     uuid v4 → MySQL v1 mapping would be a dishonest UUID-version
+//     drift, and the ADR-0032 gate already refuses crypto. The
+//     escape is --type-override / --expr-override per the existing
+//     ADR-0032 message, or a PG target.
 //  6. Generated column GENERATED ALWAYS AS (… via pgcrypto digest())
 //     — same gate as defaults.
 
@@ -314,12 +321,17 @@ func TestMigrate_PG_GenRandomUUID_NoFlag_Succeeds(t *testing.T) {
 	}
 }
 
-// Scenario 5: cross-engine PG → MySQL. uuid_generate_v4() → (UUID())
-// (migrate succeeds, default works on MySQL); crypt() → loud
-// cross-engine refusal naming --expr-override.
-func TestMigrate_PG_To_MySQL_UUIDOSSP_TranslatesCrypto_Refuses(t *testing.T) {
-	pgSource, _, pgCleanup := startPostgresWithQuotedExtension(t, "uuid-ossp", false)
-	defer pgCleanup()
+// Scenario 5: cross-engine PG → MySQL. ADR-0044 §3 was rescoped:
+// uuid-ossp and pgcrypto stay refused up-front by the pre-existing
+// ADR-0032 validateEnabledPGExtensions lossless-only policy (only
+// hstore/citext carry a cross-engine default translator). There is no
+// new uuid-ossp → UUID() translation (a PG uuid_generate_v4 random/v4
+// → MySQL UUID() time-based/v1 mapping would be a dishonest
+// UUID-version drift) and no new cross-engine pgcrypto refusal arm —
+// the ADR-0032 gate already refuses both, before schema-read. This
+// pins the REAL behaviour against validateEnabledPGExtensions'
+// message (target_schema.go).
+func TestMigrate_PG_To_MySQL_UUIDOSSP_And_Pgcrypto_RefusedByCrossEnginePolicy(t *testing.T) {
 	_, mysqlTarget, mysqlCleanup := startMySQL(t)
 	defer mysqlCleanup()
 
@@ -328,8 +340,14 @@ func TestMigrate_PG_To_MySQL_UUIDOSSP_TranslatesCrypto_Refuses(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	// Part A — uuid_generate_v4() DEFAULT translates to MySQL UUID().
-	applyPGDDL(t, pgSource, `
+	// Part A — --enable-pg-extension uuid-ossp against a MySQL target
+	// is refused by the ADR-0032 lossless-only gate before any schema
+	// read (uuid-ossp is not in crossEngineDefaultTranslatedExtensions;
+	// a uuid v4 → MySQL v1 mapping would be a dishonest version drift,
+	// so ADR-0044 §3 deliberately adds no translator).
+	pgSourceA, _, pgCleanupA := startPostgresWithQuotedExtension(t, "uuid-ossp", false)
+	defer pgCleanupA()
+	applyPGDDL(t, pgSourceA, `
 		CREATE TABLE widgets (
 			id   uuid PRIMARY KEY DEFAULT uuid_generate_v4(),
 			name VARCHAR(64) NOT NULL
@@ -339,35 +357,32 @@ func TestMigrate_PG_To_MySQL_UUIDOSSP_TranslatesCrypto_Refuses(t *testing.T) {
 	migA := &Migrator{
 		Source:              pgEng,
 		Target:              mysqlEng,
-		SourceDSN:           pgSource,
+		SourceDSN:           pgSourceA,
 		TargetDSN:           mysqlTarget,
 		EnabledPGExtensions: []string{"uuid-ossp"},
 	}
-	if err := migA.Run(ctx); err != nil {
-		t.Fatalf("PG→MySQL with uuid_generate_v4() DEFAULT: %v; want success (→ UUID())", err)
+	errA := migA.Run(ctx)
+	if errA == nil {
+		t.Fatal("PG→MySQL --enable-pg-extension uuid-ossp = nil; " +
+			"want ADR-0032 cross-engine policy refusal")
 	}
-	myDB, err := sql.Open("mysql", mysqlTarget)
-	if err != nil {
-		t.Fatalf("open mysql: %v", err)
-	}
-	defer func() { _ = myDB.Close() }()
-	if _, err := myDB.ExecContext(ctx, "INSERT INTO widgets (name) VALUES ('gamma')"); err != nil {
-		t.Fatalf("insert relying on translated UUID() DEFAULT failed: %v", err)
-	}
-	var uuidVal string
-	if err := myDB.QueryRowContext(ctx,
-		"SELECT id FROM widgets WHERE name = 'gamma'").Scan(&uuidVal); err != nil {
-		t.Fatalf("select translated uuid: %v", err)
-	}
-	if len(uuidVal) != 36 {
-		t.Errorf("MySQL UUID() default = %q (len %d); want 36-char UUID", uuidVal, len(uuidVal))
+	// The real validateEnabledPGExtensions message (target_schema.go):
+	// names the extension, "cross-engine", the hstore/citext carve-out,
+	// and the --type-override / PG-target escapes.
+	for _, frag := range []string{
+		"uuid-ossp", "cross-engine", "--type-override", "PG target",
+	} {
+		if !strings.Contains(errA.Error(), frag) {
+			t.Errorf("uuid-ossp cross-engine refusal missing %q; got: %v", frag, errA)
+		}
 	}
 
-	// Part B — pgcrypto crypt() DEFAULT is refused cross-engine. Fresh
-	// PG source with pgcrypto.
-	pgSource2, _, pgCleanup2 := startPostgresWithQuotedExtension(t, "pgcrypto", false)
-	defer pgCleanup2()
-	applyPGDDL(t, pgSource2, `
+	// Part B — --enable-pg-extension pgcrypto against a MySQL target is
+	// refused by the same ADR-0032 gate (no new ADR-0044 §3 crypto
+	// refusal arm; the lossless-only policy already covers it).
+	pgSourceB, _, pgCleanupB := startPostgresWithQuotedExtension(t, "pgcrypto", false)
+	defer pgCleanupB()
+	applyPGDDL(t, pgSourceB, `
 		CREATE TABLE secrets (
 			id    BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
 			token TEXT NOT NULL DEFAULT crypt('seed', gen_salt('bf'))
@@ -376,17 +391,21 @@ func TestMigrate_PG_To_MySQL_UUIDOSSP_TranslatesCrypto_Refuses(t *testing.T) {
 	migB := &Migrator{
 		Source:              pgEng,
 		Target:              mysqlEng,
-		SourceDSN:           pgSource2,
+		SourceDSN:           pgSourceB,
 		TargetDSN:           mysqlTarget,
 		EnabledPGExtensions: []string{"pgcrypto"},
 	}
-	err = migB.Run(ctx)
-	if err == nil {
-		t.Fatal("PG→MySQL with crypt() DEFAULT = nil; want cross-engine refusal")
+	errB := migB.Run(ctx)
+	if errB == nil {
+		t.Fatal("PG→MySQL --enable-pg-extension pgcrypto = nil; " +
+			"want ADR-0032 cross-engine policy refusal")
 	}
-	if !strings.Contains(err.Error(), "crypt") ||
-		!strings.Contains(err.Error(), "--expr-override") {
-		t.Errorf("err = %v; want crypt + --expr-override in the refusal", err)
+	for _, frag := range []string{
+		"pgcrypto", "cross-engine", "--type-override", "PG target",
+	} {
+		if !strings.Contains(errB.Error(), frag) {
+			t.Errorf("pgcrypto cross-engine refusal missing %q; got: %v", frag, errB)
+		}
 	}
 }
 

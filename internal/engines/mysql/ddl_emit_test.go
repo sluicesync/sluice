@@ -285,15 +285,7 @@ func TestEmitDefault(t *testing.T) {
 		// rule, so the rejection happens for the right reason (MySQL
 		// doesn't have the function), not the wrong reason (missing
 		// outer parens for the function-call form).
-		{"unrelated expr wrapped then loud-fail on target", ir.DefaultExpression{Expr: "some_pg_only_fn()"}, ir.UUID{}, "(some_pg_only_fn())", true},
-
-		// ADR-0044 §3: uuid-ossp generators translate to MySQL's
-		// single UUID generator. v1 / v1mc / v4 all map to (UUID());
-		// the uuid-ossp version distinction does not survive — a
-		// DEFAULT means "generate a UUID".
-		{"adr0044 uuid_generate_v4 → (UUID())", ir.DefaultExpression{Expr: "uuid_generate_v4()"}, ir.UUID{}, "(UUID())", true},
-		{"adr0044 uuid_generate_v1 → (UUID())", ir.DefaultExpression{Expr: "uuid_generate_v1()"}, ir.UUID{}, "(UUID())", true},
-		{"adr0044 uuid_generate_v1mc → (UUID())", ir.DefaultExpression{Expr: "uuid_generate_v1mc()"}, ir.UUID{}, "(UUID())", true},
+		{"unrelated expr wrapped then loud-fail on target", ir.DefaultExpression{Expr: "uuid_generate_v4()"}, ir.UUID{}, "(uuid_generate_v4())", true},
 	}
 	for _, c := range cases {
 		c := c

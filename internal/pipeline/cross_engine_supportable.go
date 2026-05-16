@@ -21,7 +21,6 @@ package pipeline
 
 import (
 	"fmt"
-	"strings"
 
 	"github.com/orware/sluice/internal/ir"
 )
@@ -74,36 +73,6 @@ func checkCrossEngineSupportable(
 					contextID, tbl.Name, col.Name, reason, tbl.Name)
 			}
 		}
-		// ADR-0044 Tier 3: a column DEFAULT / GENERATED expression
-		// that references a pgcrypto crypto/digest function has no
-		// honest MySQL equivalent. Silently rewriting crypt() /
-		// digest() / pgp_sym_encrypt() / … to a MySQL function would
-		// change the security semantics the operator relied on —
-		// exactly the silent corruption the loud-failure tenet
-		// forbids. (uuid-ossp's uuid_generate_v1/v1mc/v4 DO have an
-		// honest mapping → MySQL UUID(); those are translated in
-		// mysql/ddl_emit.go::pgToMySQLDefaultExpr and are NOT refused
-		// here.) The PG schema-read gate already enforced the opt-in,
-		// so a pgcrypto function reaching this point means the
-		// operator enabled the extension for a PG → MySQL run — refuse
-		// with a pointer to --expr-override as the escape hatch.
-		for _, col := range tbl.Columns {
-			if col == nil {
-				continue
-			}
-			if fn, exprKind := unsupportablePGCryptoDefaultExpr(col); fn != "" {
-				return fmt.Errorf(
-					"%s: column %q.%q %s expression uses PG pgcrypto "+
-						"function %s() — no honest MySQL equivalent "+
-						"(translating crypto would change security "+
-						"semantics). Recovery: re-run with "+
-						"--exclude-table=%s to skip the table, or supply "+
-						"--expr-override for the column with a "+
-						"MySQL-portable expression",
-					contextID, tbl.Name, col.Name, exprKind, fn, tbl.Name)
-			}
-		}
-
 		// ADR-0032 Tier 2 lite: indexes carrying an extension-owned
 		// operator class (today's load-bearing case is pg_trgm's
 		// `gin_trgm_ops` / `gist_trgm_ops` on a `text` column) have
@@ -237,124 +206,6 @@ func unsupportablePGtoMySQL(t ir.Type) string {
 		return fmt.Sprintf("PG extension type %s.%s", v.Extension, v.Name)
 	}
 	return ""
-}
-
-// pgcryptoCrossEngineUnsafeFns is the set of pgcrypto function
-// barewords that have no honest MySQL equivalent and therefore
-// trigger the ADR-0044 §3 cross-engine refusal when they appear in a
-// PG-source column DEFAULT / GENERATED expression bound for a MySQL
-// target. Kept inline in the pipeline package (engine-neutral
-// orchestrator rule — no postgres-engine import); it MUST stay in
-// lock-step with pgCryptoDef.defaultExprFunctions in
-// internal/engines/postgres/extension_catalog.go.
-//
-// uuid-ossp's generators are deliberately ABSENT — they DO have an
-// honest MySQL mapping (→ UUID(), via mysql/ddl_emit.go::
-// pgToMySQLDefaultExpr) and must not be refused here. gen_random_uuid
-// is core PG and never reaches an extension gate at all.
-var pgcryptoCrossEngineUnsafeFns = map[string]struct{}{
-	"digest":           {},
-	"hmac":             {},
-	"crypt":            {},
-	"gen_salt":         {},
-	"gen_random_bytes": {},
-	"encrypt":          {},
-	"decrypt":          {},
-	"encrypt_iv":       {},
-	"decrypt_iv":       {},
-	"pgp_sym_encrypt":  {},
-	"pgp_sym_decrypt":  {},
-	"pgp_pub_encrypt":  {},
-	"pgp_pub_decrypt":  {},
-}
-
-// unsupportablePGCryptoDefaultExpr returns the pgcrypto function name
-// and the clause kind ("DEFAULT" / "GENERATED") when col's default
-// expression or generated expression references a pgcrypto
-// crypto/digest function with no honest MySQL equivalent. Returns
-// ("", "") for portable columns.
-//
-// The scan is the same conservative shape as the PG engine's
-// scanExtensionFunctionInExpr (bareword followed by `(`, ignore
-// matches inside single-quoted string literals, no qualified
-// matches), reimplemented here to keep the pipeline package free of
-// an engine import. False negatives degrade to the pre-ADR-0044
-// late MySQL parse error (no worse than status quo); false positives
-// would refuse a valid migration, so the matcher stays tight.
-func unsupportablePGCryptoDefaultExpr(col *ir.Column) (fn, exprKind string) {
-	if col == nil {
-		return "", ""
-	}
-	if de, ok := col.Default.(ir.DefaultExpression); ok {
-		if name := scanForCryptoFn(de.Expr); name != "" {
-			return name, "DEFAULT"
-		}
-	}
-	if col.GeneratedExpr != "" {
-		if name := scanForCryptoFn(col.GeneratedExpr); name != "" {
-			return name, "GENERATED"
-		}
-	}
-	return "", ""
-}
-
-// scanForCryptoFn walks expr and returns the first pgcrypto-unsafe
-// bareword that is used as a function call (followed by `(`, not
-// inside a string literal, not schema-qualified). Returns "" when
-// none is referenced. Case-insensitive (PG lower-cases unquoted
-// identifiers).
-func scanForCryptoFn(expr string) string {
-	for i := 0; i < len(expr); {
-		c := expr[i]
-		if c == '\'' {
-			// Skip a single-quoted string literal (doubled '' escape).
-			i++
-			for i < len(expr) {
-				if expr[i] == '\'' {
-					if i+1 < len(expr) && expr[i+1] == '\'' {
-						i += 2
-						continue
-					}
-					i++
-					break
-				}
-				i++
-			}
-			continue
-		}
-		if !isExprIdentStart(c) {
-			i++
-			continue
-		}
-		start := i
-		j := i + 1
-		for j < len(expr) && isExprIdentCont(expr[j]) {
-			j++
-		}
-		word := expr[start:j]
-		k := j
-		for k < len(expr) && (expr[k] == ' ' || expr[k] == '\t' || expr[k] == '\n' || expr[k] == '\r') {
-			k++
-		}
-		if k < len(expr) && expr[k] == '(' {
-			qualified := start > 0 && expr[start-1] == '.'
-			if !qualified {
-				if _, bad := pgcryptoCrossEngineUnsafeFns[strings.ToLower(word)]; bad {
-					return strings.ToLower(word)
-				}
-			}
-		}
-		i = j
-	}
-	return ""
-}
-
-func isExprIdentStart(b byte) bool {
-	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || b == '_'
-}
-
-func isExprIdentCont(b byte) bool {
-	return isExprIdentStart(b) || (b >= '0' && b <= '9')
 }
 
 // isCrossEngineTranslatablePGExtension reports whether an

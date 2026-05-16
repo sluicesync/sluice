@@ -316,24 +316,10 @@ func quoteSQLString(s string) string {
 //     requires for expression defaults. Symmetric reverse of
 //     v0.11.3's Bug 29 fix (MySQL RAND() → PG random()). Same
 //     [0, 1) semantics on both sides.
-//   - uuid_generate_v1() / uuid_generate_v1mc() / uuid_generate_v4()
-//     → (UUID()). PG's uuid-ossp generators (ADR-0044 §3). MySQL has
-//     a single UUID generator, UUID() (a v1 time-based UUID); the
-//     uuid-ossp version distinction does NOT survive cross-engine.
-//     Fidelity note: a DEFAULT means "generate *a* UUID" — in
-//     practice operators rely on uniqueness, not the RFC-4122
-//     version, so the version-agnostic mapping is the honest one.
-//     v5 (name-based / namespace) is intentionally NOT mapped — it
-//     is not a bare generator (it takes a namespace + name) and has
-//     no MySQL equivalent; it falls through verbatim and the
-//     cross-engine refusal arm catches the pgcrypto/exotic-uuid case.
 var pgToMySQLDefaultExpr = map[string]string{
-	"now()":                "CURRENT_TIMESTAMP",
-	"gen_random_uuid()":    "(UUID())",
-	"random()":             "(RAND())",
-	"uuid_generate_v1()":   "(UUID())",
-	"uuid_generate_v1mc()": "(UUID())",
-	"uuid_generate_v4()":   "(UUID())",
+	"now()":             "CURRENT_TIMESTAMP",
+	"gen_random_uuid()": "(UUID())",
+	"random()":          "(RAND())",
 }
 
 // emitDefault renders a DEFAULT clause body for the given default

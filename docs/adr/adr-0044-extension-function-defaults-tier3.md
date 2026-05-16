@@ -3,20 +3,44 @@
 ## Status
 
 **Accepted (2026-05-16); implemented (commit `837769c`), shipping
-in v0.65.0.** One post-implementation correction applied during
-review: the refusal message's escape-hatch wording dropped
-`--expr-override` (verified inapplicable to this read-time gate —
-see §2 and the precedence note) in favour of `--enable-pg-extension`
-/ `--exclude-table`; code, test, and this ADR were updated in
-lock-step. Implements the ADR-0032 §Consequences "Tier 3 … the
-natural v2 chunk." Sign-off decision: the same-engine PG → PG
-**opt-in gate is adopted as drafted** — extension-function
-defaults/generated-exprs require `--enable-pg-extension <ext>` and
-are refused early-and-clearly otherwise (a deliberate behaviour
-change vs. today's implicit pass-through; correct per the
-loud-failure-early + zero-users → cleaner-breaking-change tenets,
-and consistent with every other ADR-0032 extension). Core PG
-functions (`gen_random_uuid()`, `now()`, …) are never gated.
+in v0.65.0.** Two post-implementation corrections applied during
+review:
+
+1. The refusal message's escape-hatch wording dropped
+   `--expr-override` (verified inapplicable to this read-time gate —
+   see §2 and the precedence note) in favour of
+   `--enable-pg-extension` / `--exclude-table`; code, test, and this
+   ADR were updated in lock-step.
+2. **§3 (cross-engine PG → MySQL) rescoped (2026-05-15, pre-v0.65.0
+   release).** The original §3 design — translate uuid-ossp
+   generators to MySQL `UUID()` and add a new cross-engine pgcrypto
+   refusal arm — was found dead-in-production: the pre-existing
+   ADR-0032 `validateEnabledPGExtensions` lossless-only policy
+   already refuses ANY `--enable-pg-extension uuid-ossp`/`pgcrypto`
+   for a non-PG target (only `hstore`/`citext` are cross-engine
+   translatable) *before* schema-read, so neither the new
+   `pgToMySQL` uuid entries nor the new `cross_engine_supportable.go`
+   crypto arm could ever execute. The uuid mapping was also dishonest
+   (`uuid_generate_v4()` is RFC-4122 v4/random; MySQL `UUID()` is
+   v1/time-based — a silent version drift). The dead translation
+   entries, the cross-engine refusal arm + its helpers/test, and the
+   failing integration assertion were removed; the integration test
+   now pins the REAL ADR-0032-policy refusal. **§1 / §2 (the
+   same-engine gate, the scanner, the `gen_random_uuid` core guard)
+   are the shipped feature and are untouched.** The pre-existing
+   Bug-42 `gen_random_uuid()` / `now()` / `random()` cross-engine
+   `pgToMySQLDefaultExpr` translations are NOT part of §3 and remain
+   in place.
+
+Implements the ADR-0032 §Consequences "Tier 3 … the natural v2
+chunk." Sign-off decision: the same-engine PG → PG **opt-in gate is
+adopted as drafted** — extension-function defaults/generated-exprs
+require `--enable-pg-extension <ext>` and are refused
+early-and-clearly otherwise (a deliberate behaviour change vs.
+today's implicit pass-through; correct per the loud-failure-early +
+zero-users → cleaner-breaking-change tenets, and consistent with
+every other ADR-0032 extension). Core PG functions
+(`gen_random_uuid()`, `now()`, …) are never gated.
 
 ## Context
 
@@ -55,6 +79,14 @@ So **there is no active refusal to lift.** The actual gaps:
    `pgToMySQLDefaultExpr` carries `gen_random_uuid()→(UUID())`,
    `now()`, `random()` — but **not** `uuid_generate_v4()` (uuid-ossp).
    It falls through verbatim → MySQL parse error at apply.
+   **Correction (rescope, see Status correction 2):** gap #3 is not
+   actually reachable — ADR-0032's `validateEnabledPGExtensions`
+   refuses `--enable-pg-extension uuid-ossp`/`pgcrypto` for a non-PG
+   target in preflight (before schema-read / before any
+   `pgToMySQLDefaultExpr` lookup), and without the flag the §2
+   same-engine gate refuses first. The honest resolution is to leave
+   that ADR-0032 policy in force, **not** to add a uuid mapping
+   (v4→v1 would be a dishonest version drift) or a new arm. See §3.
 
 **Core-vs-extension subtlety (load-bearing):** `gen_random_uuid()`
 is **core PostgreSQL 13+** — *not* an extension function on any
@@ -126,23 +158,35 @@ parser; reuse the lightweight matcher style already in
   Core functions (`gen_random_uuid()`, `now()`, …) are never
   gated — they are not in any `defaultExprFunctions` set.
 
-### 3. Cross-engine PG → MySQL: translate the safe, refuse the unsafe
+### 3. Cross-engine PG → MySQL: no new translation, no new arm — the ADR-0032 lossless-only policy already governs this
 
-- **Safe, semantically-honest translations** added as catalog-
-  driven `pgToMySQLDefaultExpr` entries:
-  `uuid_generate_v4()` / `uuid_generate_v1()` / `uuid_generate_v1mc()`
-  → `(UUID())` (MySQL has one UUID generator; the uuid-ossp version
-  distinction does not survive cross-engine — documented fidelity
-  note: a DEFAULT means "generate *a* UUID", version-agnostic in
-  practice).
-- **No honest MySQL equivalent → loud cross-engine refusal**, not
-  a fake translation: pgcrypto `crypt()/gen_salt()/digest()/
-  encrypt()/…`. Silently rewriting crypto to a MySQL function would
-  change security semantics — exactly the silent-corruption the
-  loud-failure tenet forbids. The refusal names `--expr-override`
-  as the operator escape hatch. Wire this into the cross-engine
-  refusal site (`cross_engine_supportable.go`), which today does
-  **not** inspect DEFAULT expressions at all.
+**Rescoped (see Status correction 2).** Cross-engine PG → MySQL
+`uuid-ossp` and `pgcrypto` **remain refused by the pre-existing
+ADR-0032 `validateEnabledPGExtensions` lossless-only policy.** That
+gate refuses ANY `--enable-pg-extension <ext>` for a non-PG target
+unless `ext ∈ {hstore, citext}` (the only extensions with a declared
+cross-engine default translator), and it fires *before* schema-read.
+Therefore:
+
+- **No new `pgToMySQLDefaultExpr` uuid-ossp entries.** A
+  `uuid_generate_v4()` (RFC-4122 v4/random) → MySQL `UUID()`
+  (v1/time-based) mapping is a dishonest UUID-version drift, not a
+  semantically-honest translation. uuid-ossp has no lossless MySQL
+  default translator and is not added to
+  `crossEngineDefaultTranslatedExtensions`.
+- **No new cross-engine pgcrypto refusal arm.** A bespoke
+  `cross_engine_supportable.go` crypto scanner would be dead code:
+  the ADR-0032 engine-name gate already refuses `--enable-pg-extension
+  pgcrypto` for a MySQL target, before any column expression is
+  inspected. (And without the flag, the §2 same-engine schema-read
+  gate refuses first.)
+- **Operator escape:** `--type-override` / `--expr-override` per the
+  existing ADR-0032 refusal message, or use a PG target.
+
+The pre-existing Bug-42 cross-engine default translations
+(`gen_random_uuid()` / `now()` / `random()` → MySQL equivalents in
+`pgToMySQLDefaultExpr`) are core/legitimate, predate Tier 3, and are
+**not** part of §3 — they stay.
 
 ### What does not change
 
@@ -152,12 +196,14 @@ parser; reuse the lightweight matcher style already in
 - `--expr-override` does **not** suppress the same-engine schema-read
   gate (§2): it rewrites only generated-column expressions and runs
   *after* `ReadSchema`, whereas the gate fires *inside* `ReadSchema`.
-  It *can* suppress the **cross-engine** crypto refusal (§3) for a
-  *generated-column* expression, because `checkCrossEngineSupportable`
-  runs after `ApplyExpressionOverrides` — but never for a crypto
-  *DEFAULT* (overrides don't touch DEFAULTs). Verified against the
-  pipeline ordering (`ReadSchema` → `ApplyMappings` →
-  `ApplyExpressionOverrides` → `checkCrossEngineSupportable`).
+  (The original draft also discussed `--expr-override` suppressing a
+  cross-engine §3 crypto arm for generated columns; moot — §3 was
+  rescoped and no such arm exists. Cross-engine uuid-ossp/pgcrypto is
+  refused by ADR-0032's `validateEnabledPGExtensions` engine-name
+  gate, which runs in preflight before `ReadSchema` and is not
+  suppressible by `--expr-override`. The honest cross-engine escape
+  is `--type-override`/`--expr-override` per the ADR-0032 message, or
+  a PG target.)
 - IR shape — no `ir` change (`DefaultExpression`/`GeneratedExpr`
   already carry expr+dialect; the gate is reader/preflight-side).
 - Other engines, CDC/row data path, value semantics.
@@ -201,8 +247,12 @@ parser; reuse the lightweight matcher style already in
      refused at schema-read with the actionable message.
   4. PG → PG, `DEFAULT gen_random_uuid()`, no flag → **succeeds**
      (core function, never gated) — the core-vs-extension guard.
-  5. Cross-engine PG → MySQL: `uuid_generate_v4()` → `(UUID())`;
-     `crypt()` → loud cross-engine refusal naming `--expr-override`.
+  5. Cross-engine PG → MySQL: `--enable-pg-extension uuid-ossp` and
+     `--enable-pg-extension pgcrypto` against a MySQL target are
+     refused up-front by the pre-existing ADR-0032
+     `validateEnabledPGExtensions` lossless-only policy (message
+     names the extension, `cross-engine`, and the `--type-override` /
+     PG-target escape). No new §3 translation or refusal arm to test.
   6. Generated column `GENERATED ALWAYS AS (… uuid_generate_v4())`
      — same gate as defaults.
 
@@ -210,10 +260,12 @@ parser; reuse the lightweight matcher style already in
 
 ~250–400 LOC impl (one `extensionDef` field + uuid-ossp entry +
 pgcrypto entry extension + the conservative scanner + the
-schema-read gate + preflight wiring for Tier-3 extensions + the
-cross-engine refusal arm + `pgToMySQLDefaultExpr` entries) +
-~300–400 LOC tests. One focused release. No IR change, no new CLI
-flag (reuses `--enable-pg-extension`). Closes ADR-0032 to v2.
+schema-read gate + preflight wiring for Tier-3 extensions) +
+~300–400 LOC tests. (The §3 cross-engine refusal arm +
+`pgToMySQLDefaultExpr` uuid entries from the original draft were
+removed as dead code — see Status correction 2.) One focused
+release. No IR change, no new CLI flag (reuses
+`--enable-pg-extension`). Closes ADR-0032 to v2.
 
 ## References
 
@@ -222,6 +274,7 @@ flag (reuses `--enable-pg-extension`). Closes ADR-0032 to v2.
 - ADR-0016 — expression-translator catalog (cross-engine default/
   generated rewrites; `--expr-override`).
 - Bug 42 — `pgToMySQLDefaultExpr` (`gen_random_uuid()→(UUID())`,
-  the cross-engine default-translation precedent this extends).
+  the pre-existing core/legitimate cross-engine default
+  translations; preserved, NOT extended by §3 after the rescope).
 - `docs/research/pg-extensions-deployment-frequency.md` —
   uuid-ossp + pgcrypto named as the Tier-3 v2 candidates.
