@@ -6,6 +6,20 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.68.0]
+
+**Verbatim same-engine / backup extension-type passthrough (ADR-0047).** Sluice no longer refuses a PG column whose type is owned by an *uncatalogued* extension (`ltree`, `cube`, `timescaledb`, `pg_partman`, in-house extensions, …) on the paths that provably need only faithful carry, not translation: **same-engine PG → PG** and **PG-backup → PG-restore**. The ADR-0032 enumerated 7-extension allowlist (the rich path with typmod decode / cross-engine translators) is unchanged; this is a deliberately narrower tier *below* it. Cross-engine (PG → MySQL) still loud-refuses — unweakened.
+
+### Added
+
+- **`ir.VerbatimType`** — a new IR type carrying the column's exact `pg_catalog.format_type(atttypid, atttypmod)` spelling, captured by the PG schema reader and re-emitted **verbatim** by the writer (no typmod decode, no per-extension code). Values round-trip via text I/O: a table carrying a verbatim column takes the parameterised-INSERT path (PG's own type input function parses the text form) instead of binary `COPY`, which cannot encode an unknown-OID type. Uncatalogued extension-owned index access methods / operator classes are carried verbatim too (the Bug 47 `OperatorClass`-is-extension-owned invariant is preserved and leveraged).
+- **Three-level determination** (one named predicate, not scattered conditionals): (a) catalogued + `--enable-pg-extension` → the rich ADR-0032 path (unchanged); (b) uncatalogued **and** the run is provably same-engine-PG (live) or a PG backup → verbatim; (c) otherwise → today's **loud refusal** (the zero-value default — a reader never told otherwise refuses, loud-fail by construction). The orchestrator stays engine-neutral: it toggles (b) via a new optional `ir.VerbatimExtensionAware` surface using engine *names* only.
+- **Backup capability marker.** A backup whose schema carries `ir.VerbatimType` columns records `verbatim_extension_columns` on the `lineage.json` segment (additive, `omitempty` — absent on every pre-0.68.0 / non-verbatim backup; no format-version bump). It is **PG-restore-only**: enforced by a **loud restore-time engine gate** (both the lineage-marker path and the single-manifest/legacy path) that refuses, before any data moves, if the restore target is not PostgreSQL — never a silent cross-engine drop/mangle. Same severity class as Bug 66 / the ADR-0035 PostGIS-absent refusal.
+
+### Compatibility
+
+Additive; drop-in from v0.67.1. No format-version bump (the new IR/envelope fields and the segment marker are append-only / `omitempty`; older sluice ignores them, legacy and never-rotated backups are unaffected). The catalogued-7 extensions keep the rich ADR-0032 path (regression-tested: pgvector / hstore unchanged). Cross-engine PG → MySQL with an uncatalogued extension type still loud-refuses (no weakening). Constraint: a backup containing verbatim extension columns is **PostgreSQL-restore-only** (same PG major version recommended — an extension's text representation is usually but not guaranteed version-stable), and restore to it requires the owning extension installed on the PG target. Rig-verified end-to-end: same-engine `ltree` round-trip, backup→marker→MySQL-refuse→PG-restore-exact, cross-engine still-refuses, catalogued-7 regression — all green incl. under `-race`.
+
 ## [0.67.1]
 
 **Closes Bug 66 (HIGH) — a multi-segment backup whose `lineage.json` was absent silently restored only the root segment.** The v0.67.0 post-release regression cycle found that `restore` of a rotated multi-segment backup with `lineage.json` missing (the pre-v0.67.0 `chain.json`-shaped layout, or a lost catalog) silently degraded to a `manifest.json`-only single-segment + first-incremental restore — observed dropping ~90% of rows (1,200 of 11,925) with `exit 0` and no error/WARN. The *unreadable*/garbled-`lineage.json` path already loud-refused correctly; only the *absent*-and-actually-multi-segment branch fell back silently. v0.67.0's CHANGELOG/release notes overclaimed the clean-break loud-refusal guarantee for this case — corrected below and here.
