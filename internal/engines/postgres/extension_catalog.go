@@ -1154,6 +1154,30 @@ func extensionOperatorClassRegistered(opclass string) bool {
 	return false
 }
 
+// extensionAccessMethodRegistered reports whether `method` is an
+// access-method name owned by ANY catalogued extension (regardless of
+// whether the operator enabled it) — the AM analogue of
+// [extensionOperatorClassRegistered]. ADR-0047's verbatim AM carry
+// must EXCLUDE catalogued-extension AMs: a catalogued extension's AM
+// (pgvector's ivfflat / hnsw) belongs to the ADR-0032 path —
+// enabled → catalogued-AM branch carries it; not-enabled → dropped
+// per the loud-failure default. The verbatim tier is uncatalogued-
+// only (ADR-0047 §Scope); without this exclusion a catalogued-but-
+// not-enabled extension AM would be silently poached into Method on a
+// same-engine run (the Bug 66-class regression the v0.68.0 CI gate
+// caught via TestMigrate_PG_PgTrgm_NotEnabled_DropsOpclass).
+func extensionAccessMethodRegistered(method string) bool {
+	if method == "" {
+		return false
+	}
+	for _, def := range pgExtensionCatalog {
+		if _, ok := def.indexAccessMethods[method]; ok {
+			return true
+		}
+	}
+	return false
+}
+
 // extensionOwningType returns the name of the extension that owns
 // the named PG type (information_schema.columns.udt_name), or "" if
 // no catalog entry claims it. Used by the schema reader's

@@ -824,8 +824,16 @@ func (r *SchemaReader) populateIndexes(ctx context.Context, tables map[string]*i
 			// Bug 47-style "only-non-core is explicit" property). The
 			// catalogued-AM branch above already won for the ADR-0032
 			// seven; this is the long-tail carry below the catalog.
+			// !extensionAccessMethodRegistered excludes a CATALOGUED
+			// extension's AM (pgvector ivfflat/hnsw): when catalogued
+			// but not enabled it must DROP per the loud-failure default,
+			// never be poached into Method by the verbatim tier (which
+			// is uncatalogued-only, ADR-0047 §Scope). Without this the
+			// v0.68.0 CI gate caught TestMigrate_PG_PgTrgm_NotEnabled_
+			// DropsOpclass — the symmetric opclass case is fixed below.
 			if idx.Method == "" && kind == ir.IndexKindUnspecified &&
-				amExtOwned && verbatimTierFor(r.verbatimPassthrough) == verbatimTierVerbatim {
+				amExtOwned && !extensionAccessMethodRegistered(method) &&
+				verbatimTierFor(r.verbatimPassthrough) == verbatimTierVerbatim {
 				idx.Method = method
 			}
 			collected[k] = idx
@@ -865,10 +873,20 @@ func (r *SchemaReader) populateIndexes(ctx context.Context, tables map[string]*i
 		case opclass != "" && extensionOperatorClassEnabled(opclass, r.enabledExtensions):
 			col.OperatorClass = opclass
 		case opclass != "" && opclassExtOwned &&
+			!extensionOperatorClassRegistered(opclass) &&
 			verbatimTierFor(r.verbatimPassthrough) == verbatimTierVerbatim:
 			// ADR-0047 tier (b): an UNcatalogued, genuinely
 			// extension-owned operator class (pg_depend deptype 'e')
-			// on a same-engine-PG / PG-backup run. Carry it verbatim
+			// on a same-engine-PG / PG-backup run. Carry it verbatim.
+			// !extensionOperatorClassRegistered is load-bearing: a
+			// CATALOGUED extension's opclass (pg_trgm's gin_trgm_ops,
+			// PostGIS's gist_geometry_ops_2d, …) must NOT be poached by
+			// the verbatim tier — it belongs to the ADR-0032 path
+			// (enabled → case above; not-enabled → the drop+WARN case
+			// below, the pre-existing Bug 47 / loud-failure default).
+			// The verbatim tier is uncatalogued-only (ADR-0047 §Scope);
+			// omitting this guard regressed TestMigrate_PG_PgTrgm_
+			// NotEnabled_DropsOpclass (v0.68.0 CI gate, caught pre-tag).
 			// so the same-engine writer re-emits `<col> <opclass>`.
 			// opclassExtOwned is the Bug 47 invariant made literal:
 			// only EXTENSION-owned opclasses ever set OperatorClass,
