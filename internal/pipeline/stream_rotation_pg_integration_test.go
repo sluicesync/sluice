@@ -26,6 +26,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -244,10 +245,12 @@ func TestADR0046_CrashInjectionMatrix_PG(t *testing.T) {
 			}
 
 			// Arm the crash failpoint exactly once at this edge.
-			var fired bool
+			// fired is written by the failpoint closure on the rollover
+			// goroutine and read by the test goroutine's spin-wait below
+			// — atomic (CAS gives exactly-once without a TOCTOU window).
+			var fired atomic.Bool
 			rotationCrashPoint = func(e string) error {
-				if e == edge.name && !fired {
-					fired = true
+				if e == edge.name && fired.CompareAndSwap(false, true) {
 					return fmt.Errorf("injected crash at %s", e)
 				}
 				return nil
@@ -271,10 +274,10 @@ func TestADR0046_CrashInjectionMatrix_PG(t *testing.T) {
 			// Wait until the crash fired (the FSM aborts-stay-open; the
 			// stream keeps streaming the prior segment), then stop run 1.
 			deadline := time.Now().Add(30 * time.Second)
-			for time.Now().Before(deadline) && !fired {
+			for time.Now().Before(deadline) && !fired.Load() {
 				time.Sleep(200 * time.Millisecond)
 			}
-			if !fired {
+			if !fired.Load() {
 				c1()
 				<-e1
 				t.Fatalf("crash failpoint %q never fired", edge.name)
