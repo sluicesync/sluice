@@ -122,6 +122,26 @@ type extensionDef struct {
 	// gate); the catalog entry adds the opclass + actionable-hint
 	// surface without rerouting the IR type.
 	hintTypeNames map[string]struct{}
+
+	// defaultExprFunctions: bareword names of functions this extension
+	// owns that legitimately appear in column DEFAULT / GENERATED
+	// expressions (e.g. "uuid_generate_v4", "digest"). Empty for
+	// type/index-only extensions. Catalog-driven so the ADR-0044
+	// Tier-3 schema-read gate, the preflight presence-check, and the
+	// cross-engine policy are not scattered conditionals — every
+	// site that needs "does this expr reference an extension-owned
+	// function?" consults this one set.
+	//
+	// CRITICAL (load-bearing correctness guard): core-PG functions
+	// MUST NOT appear here. `gen_random_uuid()` is core PostgreSQL
+	// 13+, not pgcrypto-owned on any supported modern PG — listing it
+	// would make the gate refuse valid core-PG schemas. The catalog
+	// barewords are deliberately extension-specific; the scanner
+	// (scanExtensionFunctionInExpr) only ever gates names that appear
+	// in some entry's defaultExprFunctions, so a name absent from
+	// every set sails through unconditionally (ADR-0044 §Context
+	// "core-vs-extension subtlety").
+	defaultExprFunctions map[string]struct{}
 }
 
 // pgExtensionCatalog is the registry of recognised PG extensions
@@ -129,12 +149,13 @@ type extensionDef struct {
 // extension is an entry here — no interface changes, no per-call-site
 // switch updates. Keys are the canonical pg_extension.extname value.
 var pgExtensionCatalog = map[string]extensionDef{
-	"vector":   pgVectorDef,
-	"pg_trgm":  pgTrgmDef,
-	"hstore":   pgHstoreDef,
-	"citext":   pgCiTextDef,
-	"postgis":  pgPostGISDef,
-	"pgcrypto": pgCryptoDef,
+	"vector":    pgVectorDef,
+	"pg_trgm":   pgTrgmDef,
+	"hstore":    pgHstoreDef,
+	"citext":    pgCiTextDef,
+	"postgis":   pgPostGISDef,
+	"pgcrypto":  pgCryptoDef,
+	"uuid-ossp": pgUUIDOSSPDef,
 }
 
 // crossEngineDefaultTranslatedExtensions names the PG extensions
@@ -585,6 +606,19 @@ var pgPostGISDef = extensionDef{
 // indexOperatorClasses are empty (pgcrypto introduces neither).
 // hintTypeNames is empty (no operator-visible "you have a pgcrypto
 // type" hint surface needed).
+//
+// ADR-0044 adds defaultExprFunctions: the crypto/digest barewords
+// pgcrypto owns that legitimately appear in column DEFAULT /
+// GENERATED expressions. The v0.38.0 SHA1/SHA2 expr-translator
+// presence-gate role is UNCHANGED — defaultExprFunctions is an
+// additive surface for the Tier-3 schema-read gate; it does not
+// touch expr_translate.go's rewrite path.
+//
+// `gen_random_uuid` is deliberately ABSENT from the set — it is
+// core PostgreSQL 13+, not pgcrypto-owned on any supported modern
+// PG. Listing it would make the Tier-3 gate refuse valid core-PG
+// schemas (ADR-0044's load-bearing core-vs-extension correctness
+// guard; pinned by TestScanExtensionFunction_GenRandomUUIDNotGated).
 var pgCryptoDef = extensionDef{
 	typesByName: map[string]struct{}{},
 	build: func(udtName string, _ int32) (ir.ExtensionType, error) {
@@ -605,6 +639,264 @@ var pgCryptoDef = extensionDef{
 	indexAccessMethods:   map[string]struct{}{},
 	indexOperatorClasses: map[string]struct{}{},
 	hintTypeNames:        map[string]struct{}{},
+	defaultExprFunctions: map[string]struct{}{
+		"digest":           {},
+		"hmac":             {},
+		"crypt":            {},
+		"gen_salt":         {},
+		"gen_random_bytes": {},
+		"encrypt":          {},
+		"decrypt":          {},
+		"encrypt_iv":       {},
+		"decrypt_iv":       {},
+		"pgp_sym_encrypt":  {},
+		"pgp_sym_decrypt":  {},
+		"pgp_pub_encrypt":  {},
+		"pgp_pub_decrypt":  {},
+		// NOTE: gen_random_uuid is intentionally NOT here — core PG
+		// 13+, not pgcrypto. See the doc comment above.
+	},
+}
+
+// pgUUIDOSSPDef is the catalog entry for the `uuid-ossp` extension
+// (ADR-0044 Tier 3). uuid-ossp has no types or indexes sluice needs
+// to passthrough — its entire sluice-relevant surface is the set of
+// UUID-generator functions that appear in column DEFAULT clauses
+// (`DEFAULT uuid_generate_v4()` is the canonical case) and, less
+// commonly, in GENERATED expressions.
+//
+// The entry mirrors pgCryptoDef's shape exactly: typesByName /
+// indexAccessMethods / indexOperatorClasses / hintTypeNames are all
+// empty; build/emitColumn refuse loudly because a uuid-ossp type
+// should never dispatch through the catalog's type machinery (uuid
+// columns are `ir.UUID`, not `ir.ExtensionType`). The only populated
+// surface is defaultExprFunctions.
+//
+// The catalog NAME has a hyphen (`uuid-ossp`) — that is the value of
+// both `pg_extension.extname` and the `--enable-pg-extension`
+// argument; the flag-splitting path must not choke on it (it does
+// not — the flag is repeatable, one extension per occurrence, no
+// comma-splitting).
+//
+// Same-engine PG → PG: with `--enable-pg-extension uuid-ossp` the
+// expression passes through verbatim (today's accidental behaviour,
+// now explicit) and the existing validateAndPreflightExtensions
+// machinery preflights uuid-ossp's presence on both source and
+// target. Without the flag, the Tier-3 schema-read gate refuses
+// loudly and early (ADR-0044 §2).
+//
+// Cross-engine PG → MySQL: uuid_generate_v1/v1mc/v4() translate to
+// MySQL `(UUID())` via pgToMySQLDefaultExpr (ADR-0044 §3); the
+// uuid-ossp version distinction does not survive — a DEFAULT means
+// "generate a UUID", version-agnostic in practice.
+var pgUUIDOSSPDef = extensionDef{
+	typesByName: map[string]struct{}{},
+	build: func(udtName string, _ int32) (ir.ExtensionType, error) {
+		return ir.ExtensionType{}, fmt.Errorf(
+			"postgres: uuid-ossp catalog: build called with udt_name %q, "+
+				"but uuid-ossp has no sluice-passthrough types — the "+
+				"catalog entry exists for the ADR-0044 Tier-3 "+
+				"function-default gate only; this is a framework misuse",
+			udtName)
+	},
+	emitColumn: func(t ir.ExtensionType) (string, error) {
+		return "", fmt.Errorf(
+			"postgres: uuid-ossp catalog: emitColumn called for "+
+				"(extension=%q name=%q), but uuid-ossp has no "+
+				"sluice-passthrough types; this is a framework misuse",
+			t.Extension, t.Name)
+	},
+	indexAccessMethods:   map[string]struct{}{},
+	indexOperatorClasses: map[string]struct{}{},
+	hintTypeNames:        map[string]struct{}{},
+	defaultExprFunctions: map[string]struct{}{
+		"uuid_generate_v1":   {},
+		"uuid_generate_v1mc": {},
+		"uuid_generate_v4":   {},
+		"uuid_generate_v5":   {},
+		"uuid_nil":           {},
+		"uuid_ns_dns":        {},
+		"uuid_ns_url":        {},
+		"uuid_ns_oid":        {},
+		"uuid_ns_x500":       {},
+	},
+}
+
+// scanExtensionFunctionInExpr is the ADR-0044 conservative
+// function-call token scanner. Given a column DEFAULT / GENERATED
+// expression string and the operator's enabled-extension set, it
+// reports the first catalog-declared extension-owned function the
+// expression references, plus the owning extension.
+//
+// It is deliberately NOT a SQL parser. It walks the expression
+// byte-by-byte, skipping single-quoted string literals (so
+// `DEFAULT 'uuid_generate_v4()'` — a literal text default — is NOT
+// matched), and at each identifier-start it reads the bareword and
+// checks whether (a) it is immediately followed by `(` (modulo
+// whitespace) and (b) it is one of the catalog's
+// defaultExprFunctions barewords.
+//
+// Conservatism rules (ADR-0044 §Gotchas — false negatives degrade to
+// today's late-failure which is acceptable; false positives that gate
+// a core/user function are the real hazard, so the matcher is tight):
+//
+//   - Word boundary on BOTH sides: a name is matched only when the
+//     byte before it is not an identifier byte and the bareword that
+//     the scan reads equals the catalog name exactly. So
+//     `my_uuid_generate_v4(` (the scanned bareword is
+//     `my_uuid_generate_v4`, not in any set) and
+//     `uuid_generate_v4_ext(` do NOT match.
+//   - Qualified names are NOT matched: if the matched name is
+//     immediately preceded by `.` (e.g. `public.uuid_generate_v4()`
+//     or `x.uuid_generate_v4()`), the scanner skips it. Rationale:
+//     a schema-qualified call is rare in a DEFAULT clause, and
+//     refusing to gate it is the conservative choice — a missed gate
+//     degrades to the pre-ADR-0044 late parse-error (no worse than
+//     status quo), whereas gating a same-named user function in some
+//     other schema would be a false-positive refusal of a valid
+//     schema. Documented per ADR-0044 §Gotchas.
+//   - Case-insensitive on the function name (PG lower-cases unquoted
+//     identifiers; pg_get_expr output casing is not version-stable).
+//
+// enabledExtensions is the operator's `--enable-pg-extension` set; it
+// is NOT consulted here — the scanner reports what the expression
+// references against the FULL catalog so the caller (the schema-read
+// gate) can produce the "you referenced X owned by ext Y; enable it"
+// message even when the operator did not enable Y. The gate decides
+// pass-vs-refuse from the enabled set; the scanner only classifies.
+//
+// Returns (fnName, owningExtension, true) on the first hit (scan
+// order is left-to-right; the first extension function wins), or
+// ("", "", false) when the expression references no catalog
+// extension function (core functions like gen_random_uuid(), now(),
+// nextval() are absent from every defaultExprFunctions set and so
+// always return false — the load-bearing core-vs-extension guard).
+func scanExtensionFunctionInExpr(expr string) (fnName, owningExtension string, found bool) {
+	if expr == "" {
+		return "", "", false
+	}
+	for i := 0; i < len(expr); {
+		c := expr[i]
+		if c == '\'' {
+			// Skip the whole single-quoted string literal — a
+			// function name inside a literal is data, not a call.
+			i = scanStringLiteral(expr, i)
+			continue
+		}
+		if !isIdentifierStartByte(c) {
+			i++
+			continue
+		}
+		// Read the bareword token [start, j).
+		start := i
+		j := i + 1
+		for j < len(expr) && isIdentifierByte(expr[j]) {
+			j++
+		}
+		word := expr[start:j]
+
+		// Must be a function call: next non-space byte is '('.
+		k := j
+		for k < len(expr) && (expr[k] == ' ' || expr[k] == '\t' || expr[k] == '\n' || expr[k] == '\r') {
+			k++
+		}
+		isCall := k < len(expr) && expr[k] == '('
+		if isCall {
+			// Skip schema/table-qualified references conservatively:
+			// a leading `.` immediately before the token (modulo no
+			// whitespace) means this is `qualifier.word(` — not a
+			// bare extension-function call.
+			qualified := start > 0 && expr[start-1] == '.'
+			if !qualified {
+				if ext, ok := lookupExtensionOwningFunction(word); ok {
+					return word, ext, true
+				}
+			}
+		}
+		i = j
+	}
+	return "", "", false
+}
+
+// isIdentifierStartByte reports whether b can begin an SQL bareword
+// identifier. ASCII letters + underscore (digits cannot start an
+// identifier; the extension function barewords never do).
+func isIdentifierStartByte(b byte) bool {
+	switch {
+	case b >= 'a' && b <= 'z':
+		return true
+	case b >= 'A' && b <= 'Z':
+		return true
+	case b == '_':
+		return true
+	}
+	return false
+}
+
+// lookupExtensionOwningFunction returns the extension that declares
+// fnName in its defaultExprFunctions set, matching case-insensitively
+// (PG lower-cases unquoted identifiers). Consults the FULL catalog —
+// not the operator's enabled subset — so the schema-read gate can
+// name the owning extension in its refusal even when the operator
+// did not enable it. Core functions (gen_random_uuid, now, …) are in
+// no set and return ok=false — the ADR-0044 core-vs-extension guard.
+func lookupExtensionOwningFunction(fnName string) (extension string, ok bool) {
+	if fnName == "" {
+		return "", false
+	}
+	lower := strings.ToLower(fnName)
+	for ext, def := range pgExtensionCatalog {
+		if len(def.defaultExprFunctions) == 0 {
+			continue
+		}
+		if _, hit := def.defaultExprFunctions[lower]; hit {
+			return ext, true
+		}
+	}
+	return "", false
+}
+
+// extensionFunctionDefaultGate is the ADR-0044 §2 schema-read gate.
+// For a column whose DEFAULT is an [ir.DefaultExpression] or whose
+// GENERATED expression is non-empty, it scans the expression text for
+// a catalog-declared extension-owned function. When one is found and
+// the owning extension is NOT in enabledExtensions, it returns a
+// loud, operator-actionable refusal naming the column, the function,
+// the owning extension, the `--enable-pg-extension <ext>` fix, and
+// the `--expr-override` escape hatch (ADR-0044 §2 message shape).
+//
+// When the extension IS enabled the expression passes through
+// unchanged (today's verbatim behaviour) — return nil; the
+// validateAndPreflightExtensions machinery (which already runs for
+// every catalog extension, uuid-ossp / pgcrypto included once
+// registered) handles the target-presence preflight cleanly and
+// early.
+//
+// Core functions (gen_random_uuid(), now(), nextval(), …) are never
+// gated — they are in no defaultExprFunctions set so the scanner
+// returns found=false and this returns nil unconditionally.
+//
+// exprKind is "DEFAULT" or "GENERATED" — woven into the message so
+// the operator can tell which clause tripped the gate.
+func extensionFunctionDefaultGate(
+	tableName, colName, exprKind, exprText string,
+	enabledExtensions map[string]bool,
+) error {
+	fn, owningExt, found := scanExtensionFunctionInExpr(exprText)
+	if !found {
+		return nil
+	}
+	if enabledExtensions[owningExt] {
+		return nil
+	}
+	return fmt.Errorf(
+		"postgres: column %q.%q %s expression references %s(), which is "+
+			"owned by the %q extension. Re-run with "+
+			"--enable-pg-extension %s so sluice preflights the extension "+
+			"on the target (ADR-0032/ADR-0044 opt-in passthrough), or "+
+			"supply --expr-override for the column to replace the "+
+			"expression with target-portable text",
+		tableName, colName, exprKind, fn, owningExt, owningExt)
 }
 
 // emitExtensionColumn dispatches an [ir.ExtensionType] column to the

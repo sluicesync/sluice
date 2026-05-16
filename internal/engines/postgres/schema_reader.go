@@ -599,6 +599,25 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 			Nullable: strings.EqualFold(isNullable, "YES"),
 			Default:  translateDefault(columnDefault, meta.IsAutoIncrement),
 		}
+
+		// ADR-0044 Tier-3 schema-read gate (DEFAULT case). When the
+		// classified default is an expression (not a literal /
+		// auto-increment), scan it for a catalog-declared
+		// extension-owned function (uuid-ossp's uuid_generate_v4,
+		// pgcrypto's digest, …). If the owning extension was not
+		// opted into via --enable-pg-extension, refuse loudly and
+		// early here rather than letting the verbatim passthrough
+		// fail with a raw PG parse error at CREATE TABLE apply time.
+		// Core functions (gen_random_uuid(), now(), …) are in no
+		// catalog set and so are never gated.
+		if de, ok := col.Default.(ir.DefaultExpression); ok {
+			if err := extensionFunctionDefaultGate(
+				tableName, colName, "DEFAULT", de.Expr, r.enabledExtensions,
+			); err != nil {
+				return err
+			}
+		}
+
 		// Postgres only supports STORED generated columns today;
 		// is_generated = 'ALWAYS' implies STORED. The expression
 		// passes through verbatim — translation policy is "loud
@@ -606,6 +625,15 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 		// expressions surface as a target rejection at apply time
 		// rather than a guess at translation.
 		if strings.EqualFold(isGenerated, "ALWAYS") && genExpr != "" {
+			// ADR-0044: gate generated-column expressions identically
+			// to DEFAULTs — the recon confirmed both ride the same
+			// verbatim passthrough, so leaving generated ungated would
+			// be a silent bypass of the Tier-3 opt-in.
+			if err := extensionFunctionDefaultGate(
+				tableName, colName, "GENERATED", genExpr, r.enabledExtensions,
+			); err != nil {
+				return err
+			}
 			col.GeneratedExpr = genExpr
 			col.GeneratedStored = true
 			col.GeneratedExprDialect = dialectName
