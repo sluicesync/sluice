@@ -11,6 +11,7 @@ import (
 	"io"
 
 	kpgzip "github.com/klauspost/compress/gzip"
+	kps2 "github.com/klauspost/compress/s2"
 	kpsnappy "github.com/klauspost/compress/snappy"
 	kpzstd "github.com/klauspost/compress/zstd"
 )
@@ -106,6 +107,30 @@ var allAlgos = []Algo{
 		},
 		NewReader: func(src io.Reader) (io.ReadCloser, error) {
 			return io.NopCloser(kpsnappy.NewReader(src)), nil
+		},
+	},
+	{
+		// s2: klauspost's Snappy-compatible-but-improved format —
+		// higher ratio + faster than snappy. Default (fast) mode, the
+		// snappy peer.
+		Name: "klauspost_s2_default",
+		NewWriter: func(dst io.Writer) (io.WriteCloser, error) {
+			return kps2.NewWriter(dst), nil
+		},
+		NewReader: func(src io.Reader) (io.ReadCloser, error) {
+			return io.NopCloser(kps2.NewReader(src)), nil
+		},
+	},
+	{
+		// s2 "better" mode — still far faster than gzip/zstd while
+		// closing much of the ratio gap; the interesting middle option
+		// the question asks about.
+		Name: "klauspost_s2_better",
+		NewWriter: func(dst io.Writer) (io.WriteCloser, error) {
+			return kps2.NewWriter(dst, kps2.WriterBetterCompression()), nil
+		},
+		NewReader: func(src io.Reader) (io.ReadCloser, error) {
+			return io.NopCloser(kps2.NewReader(src)), nil
 		},
 	},
 }
