@@ -1,6 +1,6 @@
 # ADR-0047 — verbatim same-engine / backup extension-type passthrough (uncatalogued extensions)
 
-**Status:** Proposed (2026-05-16) — design-first; sign-off pending before any code. Roadmap §16. Extends [ADR-0032](adr-0032-pg-extension-passthrough.md); the backup capability marker depends on [ADR-0046](adr-0046-inline-backup-chain-rotation.md)'s lineage-as-authoritative-structural-record (settled v0.67.0 + Bug 66/v0.67.1).
+**Status:** **Accepted (2026-05-16).** Design signed off after a design dialogue; the three load-bearing calls were operator-confirmed (new `ir.VerbatimType` not an `ir.ExtensionType` variant; implicit live determination + recorded backup capability marker as primary, explicit flag only as fallback; ADR committed Proposed then Accepted on sign-off). Implementation pending, ships **v0.68.0**. Roadmap §16. Extends [ADR-0032](adr-0032-pg-extension-passthrough.md); the backup capability marker depends on [ADR-0046](adr-0046-inline-backup-chain-rotation.md)'s lineage-as-authoritative-structural-record (settled v0.67.0 + Bug 66/v0.67.1).
 
 ## Context
 

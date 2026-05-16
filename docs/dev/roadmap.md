@@ -564,7 +564,7 @@ Output: `docs/research/pg-extensions-deployment-frequency.md` (matrix + recommen
 
 ### 16. Verbatim same-engine / backup extension-type passthrough (uncatalogued extensions)
 
-**Design:** [ADR-0047](adr/adr-0047-verbatim-extension-passthrough.md) — *Proposed* (2026-05-16; `ir.VerbatimType`, implicit live determination + recorded backup capability marker, cross-engine stays loud-refuse). Implementation gated on Accepted sign-off.
+**Design:** [ADR-0047](adr/adr-0047-verbatim-extension-passthrough.md) — **Accepted** (2026-05-16; `ir.VerbatimType`, implicit live determination + recorded backup capability marker, cross-engine stays loud-refuse). Implementation in progress, ships **v0.68.0**.
 
 **Why.** ADR-0032's `pgExtensionCatalog` is an **enumerated allowlist** of 7 extensions (`vector`, `pg_trgm`, `hstore`, `citext`, `postgis`, `pgcrypto`, `uuid-ossp`). An uncatalogued extension type (`ltree`, `cube`, `timescaledb`, `pg_partman`, `age`, `h3`, in-house extensions) hits the `USER-DEFINED → enum/loud-failure` fallthrough in `lookupExtensionForType`, fired inside `ReadSchema` — so it refuses identically for **PG → PG sync/migrate AND for `backup full`/`backup stream run`**, and `--enable-pg-extension foo` for an uncatalogued `foo` is itself refused at `validateAndPreflightExtensions`. This is correct for cross-engine (no portable MySQL equivalent; loud-failure tenet) but a real, defensible gap for the paths that *provably do not need semantic understanding*: same-engine PG → PG and PG-backup → PG-restore only need to **carry the type faithfully**, not translate it. Operator payoff: "back up / replicate my PG database PG-to-PG even though it uses an extension sluice has never heard of," without a catalog PR per extension.
 
