@@ -6,6 +6,33 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.65.0]
+
+**PII / extension: ADR-0032 Tier 3 — opt-in passthrough for extension-function column defaults & generated expressions (uuid-ossp + pgcrypto), plus three DDL-emit fidelity fixes surfaced by the PlanetScale validation corpus.**
+
+### Added
+
+- **Tier 3 extension-function passthrough (ADR-0044).** A column `DEFAULT` or `GENERATED ALWAYS AS` expression that references an extension-owned function — uuid-ossp's `uuid_generate_v1/v1mc/v4/v5()` etc., or pgcrypto's `digest/hmac/crypt/gen_salt/…` — now requires `--enable-pg-extension uuid-ossp` (resp. `pgcrypto`). With the flag, the existing preflight verifies the extension is installed on the target *before* any data moves; without it, the migration is **refused early and clearly at schema-read** (column, function, owning extension, and the fix named) instead of failing late with a raw `CREATE TABLE` parse error. New catalog-declarative `extensionDef.defaultExprFunctions`; `pgUUIDOSSPDef` registered; `pgCryptoDef` extended. Conservative bareword/`(`-call scanner (string-literal-aware, word-boundary, qualified-name-safe) — not a SQL parser.
+- **Core-vs-extension guard:** `gen_random_uuid()` (core PostgreSQL 13+), `now()`, `nextval()`, … are **never** gated — only genuinely extension-owned functions are. Triple-pinned (scanner + catalog lookup + gate) plus an integration test (`TestMigrate_PG_GenRandomUUID_NoFlag_Succeeds`).
+
+### Changed
+
+- **Behaviour change (deliberate, pre-1.0/pre-users):** same-engine PG → PG extension-function defaults that previously passed through implicitly (then failed late if the target lacked the extension) now require the explicit `--enable-pg-extension` opt-in — consistent with every other ADR-0032 extension and the loud-failure-early tenet.
+- **Cross-engine PG → MySQL policy clarified (ADR-0044 §3 rescope).** uuid-ossp / pgcrypto remain refused for non-PG targets by the pre-existing ADR-0032 lossless-only policy (`validateEnabledPGExtensions` — only `hstore`/`citext` have honest cross-engine default translators). No `uuid_generate_v4()` → MySQL `UUID()` translation is performed: that would be a silent RFC-4122 v4→v1 version drift. The escape stays `--type-override` per column or a PG target. (The pre-existing Bug-42 `gen_random_uuid()` / `now()` / `random()` core translations are unaffected.)
+
+### Fixed
+
+- **#4 — `bit(N) DEFAULT b'…'` default no longer mistranslated.** Was emitted as a mis-quoted string on **both** MySQL (Error 1067) and PostgreSQL (SQLSTATE 22P02) targets. The MySQL reader now decodes `b'…'`/`B'…'` (incl. the `DEFAULT_GENERATED` parenthesised form) to a dialect-neutral decimal literal; the MySQL writer emits clean `0`/`1` for `TINYINT(1)`.
+- **#5 — generated-column expressions over reserved-word identifiers** (e.g. `` `order` ``, `` `key` ``) no longer drop their quoting on MySQL → MySQL (was Error 1064, STORED and VIRTUAL). The MySQL writer re-quotes bare reserved-word identifiers (expression-grammar-keyword-aware) on emit; the IR-portability strip stays for the PG path.
+- **#6 — PostgreSQL target no longer emits a MySQL `_utf8mb4` introducer / backslash-escaped string default untranslated** (was SQLSTATE 42601). The MySQL reader now normalizes introducers + escaped apostrophes on the `DefaultExpression` path, consistent with the generated/CHECK/index expression paths.
+
+### Who needs this release
+
+- **PG → PG operators whose schemas use `DEFAULT uuid_generate_v4()` / pgcrypto function defaults:** pass `--enable-pg-extension uuid-ossp` / `pgcrypto`. You now get a clean preflight check instead of a late apply-time failure. Without the flag you get an actionable refusal naming the fix.
+- **Anyone migrating MySQL/PlanetScale schemas with `BIT` defaults, reserved-word generated columns, or charset-introducer string defaults:** drop-in correctness fixes (#4/#5/#6), no action needed.
+- **Cross-engine PG → MySQL with uuid-ossp/pgcrypto:** unchanged — still refused by the lossless-only policy (use `--type-override` or a PG target). No behaviour change vs v0.64.0.
+- **Everyone else:** no API/CLI/IR/state-format change; drop-in upgrade from v0.64.0.
+
 ## [0.64.0]
 
 **Parallel bulk-copy now uses the engine-native fast loader on a cold start (ADR-0043; ADR-0042 Phase C).** The within-table parallel-copy path previously routed *every* chunk through a generic `database/sql` batched idempotent-upsert (`INSERT … ON CONFLICT/ON DUPLICATE KEY UPDATE`) — it never used PostgreSQL `COPY` or MySQL `LOAD DATA`, even though the single-reader path already does. That was a deliberate-but-over-broad trade for crash-resume safety. ADR-0042 Phase B profiling proved this generic writer path — not driver encoding or column types — was the dominant cost behind the MySQL↔PG throughput gap. v0.64.0 makes the parallel chunk writer **situation-driven and automatic** (no new flag): a fresh cold-start chunk into a proven-empty target streams through one native `COPY`/`LOAD DATA` call; resume, `--force-cold-start`, and live-add stay on the idempotent path exactly as before.
