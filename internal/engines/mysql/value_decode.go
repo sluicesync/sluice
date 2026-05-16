@@ -38,6 +38,13 @@ func decodeValue(raw any, t ir.Type) (any, error) {
 		return decodeString(raw)
 	case ir.Binary, ir.Varbinary, ir.Blob:
 		return decodeBytes(raw)
+	case ir.Bit:
+		// MySQL's driver hands BIT(N) back as a byte slice (big-endian,
+		// ceil(N/8) bytes) — the same wire shape as VARBINARY, which is
+		// what BIT(N>1) decoded as pre-v0.65.1. Keeping the bytes path
+		// preserves the validated row round-trip (catalog Bug 62 is a
+		// DDL-emit defect only; the value path was already correct).
+		return decodeBytes(raw)
 	case ir.Date, ir.DateTime, ir.Timestamp:
 		return decodeTime(raw)
 	case ir.Time:

@@ -94,14 +94,21 @@ func TestTranslateType(t *testing.T) {
 			want: ir.Boolean{},
 		},
 		{
-			name: "bit(8) is Varbinary(1)",
+			// catalog Bug 62: BIT(N>1) is a fixed-width bit string,
+			// not Varbinary (the pre-v0.65.1 mis-mapping).
+			name: "bit(8) is Bit(8)",
 			in:   columnMeta{DataType: "bit", ColumnType: "bit(8)"},
-			want: ir.Varbinary{Length: 1},
+			want: ir.Bit{Length: 8},
 		},
 		{
-			name: "bit(9) rounds up to Varbinary(2)",
+			name: "bit(16) is Bit(16)",
+			in:   columnMeta{DataType: "bit", ColumnType: "bit(16)"},
+			want: ir.Bit{Length: 16},
+		},
+		{
+			name: "bit(9) is Bit(9) (no byte rounding)",
 			in:   columnMeta{DataType: "bit", ColumnType: "bit(9)"},
-			want: ir.Varbinary{Length: 2},
+			want: ir.Bit{Length: 9},
 		},
 
 		// ----- Strings -----
@@ -314,27 +321,47 @@ func TestTranslateDefault(t *testing.T) {
 		name  string
 		def   sql.NullString
 		extra string
+		typ   ir.Type
 		want  ir.DefaultValue
 	}{
-		{"no default", sql.NullString{Valid: false}, "", ir.DefaultNone{}},
-		{"literal zero", sql.NullString{String: "0", Valid: true}, "", ir.DefaultLiteral{Value: "0"}},
+		{"no default", sql.NullString{Valid: false}, "", ir.Integer{Width: 32}, ir.DefaultNone{}},
+		{"literal zero", sql.NullString{String: "0", Valid: true}, "", ir.Integer{Width: 32}, ir.DefaultLiteral{Value: "0"}},
 		{
 			"expression CURRENT_TIMESTAMP",
 			sql.NullString{String: "CURRENT_TIMESTAMP", Valid: true},
 			"DEFAULT_GENERATED",
+			ir.DateTime{},
 			ir.DefaultExpression{Expr: "CURRENT_TIMESTAMP", Dialect: "mysql"},
 		},
 		{
 			"expression mixed-case extra token",
 			sql.NullString{String: "now()", Valid: true},
 			"default_generated on update current_timestamp",
+			ir.DateTime{},
 			ir.DefaultExpression{Expr: "now()", Dialect: "mysql"},
+		},
+		{
+			// catalog Bug 62: BIT(N>1) default preserved as a tagged
+			// bit literal, not decimal-collapsed.
+			"bit(8) literal preserved",
+			sql.NullString{String: "b'10100101'", Valid: true},
+			"",
+			ir.Bit{Length: 8},
+			ir.DefaultExpression{Expr: "b'10100101'", Dialect: bitLiteralDialect},
+		},
+		{
+			// catalog #4 (unchanged): BIT(1) → Boolean decimal collapse.
+			"bit(1) literal decimal-collapsed",
+			sql.NullString{String: "b'1'", Valid: true},
+			"",
+			ir.Boolean{},
+			ir.DefaultLiteral{Value: "1"},
 		},
 	}
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			got := translateDefault(c.def, c.extra)
+			got := translateDefault(c.def, c.extra, c.typ)
 			if !reflect.DeepEqual(got, c.want) {
 				t.Errorf("got %#v; want %#v", got, c.want)
 			}

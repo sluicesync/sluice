@@ -51,6 +51,11 @@ func emitColumnType(t ir.Type) (string, error) {
 		return fmt.Sprintf("VARBINARY(%d)", v.Length), nil
 	case ir.Blob:
 		return emitBlobType(v.Size), nil
+	case ir.Bit:
+		// Fixed-width bit string. Round-trips MySQL BIT(N) ↔ PG bit(N)
+		// (catalog Bug 62). BIT(1) never reaches here — the reader maps
+		// the conventional single-bit column to ir.Boolean.
+		return fmt.Sprintf("BIT(%d)", v.Length), nil
 
 	// ---- Temporal ----
 	case ir.Date:
@@ -352,6 +357,13 @@ func emitDefault(d ir.DefaultValue, t ir.Type) (string, bool) {
 		}
 		return quoteSQLString(v.Value), true
 	case ir.DefaultExpression:
+		// Bit-literal default on a BIT(N) column (catalog Bug 62). The
+		// reader tags it "bit"; MySQL accepts the literal bare
+		// (`DEFAULT b'10100101'`) — no outer-paren wrap (that path is
+		// for function-call defaults) and no decimal collapse.
+		if v.Dialect == bitLiteralDialect {
+			return v.Expr, true
+		}
 		normalized := strings.ToLower(strings.TrimSpace(v.Expr))
 		expr := v.Expr
 		if translated, ok := pgToMySQLDefaultExpr[normalized]; ok {

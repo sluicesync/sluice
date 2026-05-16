@@ -261,6 +261,24 @@ func (Blob) Tier() Tier { return TierCore }
 
 func (b Blob) String() string { return fmt.Sprintf("Blob[%s]", b.Size) }
 
+// Bit is a fixed-width bit string of Length bits — MySQL's BIT(N) and
+// PostgreSQL's bit(N). Length is the declared bit count (1..64; MySQL
+// caps BIT at 64). BIT(1) is *not* modelled here: the MySQL reader maps
+// the conventional single-bit column to [Boolean] (and the boolean
+// round-trip is the validated path). Bit covers BIT(N) for N > 1, which
+// both engines round-trip losslessly as a native bit string with a
+// `b'…'` / `B'…'` literal default. Modelling it as Varbinary (the
+// pre-v0.65.1 behaviour) mis-typed the column on every target and
+// decimal-stringified the bit-literal default (catalog Bug 62).
+type Bit struct {
+	Length int
+}
+
+func (Bit) isType()    {}
+func (Bit) Tier() Tier { return TierCore }
+
+func (b Bit) String() string { return fmt.Sprintf("Bit(%d)", b.Length) }
+
 // Date is a calendar date with no time-of-day component.
 type Date struct{}
 

@@ -7,8 +7,72 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/jackc/pgx/v5/pgtype"
+
 	"github.com/orware/sluice/internal/ir"
 )
+
+// TestBitBytesMySQLToPG pins the catalog Bug 62 byte re-alignment:
+// MySQL stores BIT(n) right-justified in ceil(n/8) big-endian bytes;
+// PG's bit(n) wire format is left-justified. Byte-aligned widths
+// (BIT(8)/BIT(16)) are a straight copy (the repro shapes); non-byte-
+// aligned widths (BIT(9)) must shift so logical bit 0 is byte 0's MSB.
+func TestBitBytesMySQLToPG(t *testing.T) {
+	cases := []struct {
+		name string
+		src  []byte
+		n    int
+		want []byte
+	}{
+		// BIT(8) b'10100101' = 0xA5 — byte-aligned, identity.
+		{"bit(8) 0xA5", []byte{0xA5}, 8, []byte{0xA5}},
+		// BIT(16) b'1111000011110000' = 0xF0F0 — byte-aligned.
+		{"bit(16) 0xF0F0", []byte{0xF0, 0xF0}, 16, []byte{0xF0, 0xF0}},
+		// BIT(1) value 1 → MSB of the single byte.
+		{"bit(1) one", []byte{0x01}, 1, []byte{0x80}},
+		// BIT(9) value 0b1_0101_0101 (0x155). MySQL right-justified:
+		// [0x01, 0x55]. PG left-justified 9 bits: bit0..bit8 →
+		// byte0 = 1010_1010 (0xAA), byte1 MSB = bit8 (1) → 0x80.
+		{"bit(9) 0x155", []byte{0x01, 0x55}, 9, []byte{0xAA, 0x80}},
+		// BIT(4) value 0b1011 = 0x0B. PG: 1011_0000 = 0xB0.
+		{"bit(4) 0x0B", []byte{0x0B}, 4, []byte{0xB0}},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			got := bitBytesMySQLToPG(c.src, c.n)
+			if !reflect.DeepEqual(got, c.want) {
+				t.Errorf("bitBytesMySQLToPG(%#v, %d) = %#v; want %#v", c.src, c.n, got, c.want)
+			}
+		})
+	}
+}
+
+// TestPrepareValueBit pins that an ir.Bit column's []byte value is
+// wrapped in a pgtype.Bits with the correct Len so pgx's BitsCodec
+// encodes it under COPY binary / batch INSERT (catalog Bug 62).
+func TestPrepareValueBit(t *testing.T) {
+	got, err := prepareValue([]byte{0xA5}, ir.Bit{Length: 8})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	bits, ok := got.(pgtype.Bits)
+	if !ok {
+		t.Fatalf("got %T; want pgtype.Bits", got)
+	}
+	if bits.Len != 8 || !bits.Valid || !reflect.DeepEqual(bits.Bytes, []byte{0xA5}) {
+		t.Errorf("got %+v; want {Bytes:[0xA5] Len:8 Valid:true}", bits)
+	}
+	// Same-engine PG bit value can surface as a '0'/'1' string; pass
+	// through for the codec to parse.
+	gotStr, err := prepareValue("10100101", ir.Bit{Length: 8})
+	if err != nil {
+		t.Fatalf("unexpected error (string path): %v", err)
+	}
+	if gotStr != "10100101" {
+		t.Errorf("string path: got %#v; want %q", gotStr, "10100101")
+	}
+}
 
 func TestBuildBatchInsert(t *testing.T) {
 	table := &ir.Table{

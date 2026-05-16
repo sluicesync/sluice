@@ -590,6 +590,33 @@ func prepareValue(v any, t ir.Type) (any, error) {
 		return ewkb, nil
 	}
 
+	// catalog Bug 62: ir.Bit columns. The MySQL row reader hands BIT(N)
+	// back as ceil(N/8) big-endian bytes with the value *right*-aligned
+	// (MySQL's storage layout). PG's bit(N) binary wire format is
+	// ceil(N/8) bytes *left*-aligned (bit 1 = MSB of byte 0), framed by
+	// an int32 bit-length. We rebuild the byte buffer left-aligned and
+	// hand pgx a pgtype.Bits so its registered BitsCodec encodes it
+	// correctly under COPY binary. Byte-aligned widths (BIT(8)/BIT(16))
+	// are a straight copy; non-byte-aligned widths (BIT(9)) need the
+	// alignment shift, which bitBytesMySQLToPG performs.
+	if bitT, isBit := t.(ir.Bit); isBit {
+		b, ok := v.([]byte)
+		if !ok {
+			// pgx stdlib mode can also surface a same-engine PG bit
+			// value as a '0'/'1' string; pass it through for the codec
+			// to parse. Anything else is an upstream decode bug.
+			if s, isStr := v.(string); isStr {
+				return s, nil
+			}
+			return nil, fmt.Errorf("expected []byte for Bit column, got %T", v)
+		}
+		return pgtype.Bits{
+			Bytes: bitBytesMySQLToPG(b, bitT.Length),
+			Len:   int32(bitT.Length),
+			Valid: true,
+		}, nil
+	}
+
 	// ADR-0032: ExtensionType columns pass through as their decoded
 	// shape — pgvector emits as `[1,2,3]`-style strings under pgx
 	// stdlib mode, which PG's `vector` parser accepts on the INSERT
@@ -605,6 +632,48 @@ func prepareValue(v any, t ir.Type) (any, error) {
 	}
 
 	return v, nil
+}
+
+// bitBytesMySQLToPG re-aligns a MySQL BIT(n) byte buffer into the
+// layout PG's bit(n) binary wire format expects (catalog Bug 62).
+//
+// MySQL stores BIT(n) in ceil(n/8) bytes, big-endian, with the n-bit
+// value *right*-justified (the unused high bits of the first byte are
+// zero). PG's bit(n) stores the bits *left*-justified: logical bit i
+// (0-based, the leftmost bit of the declared string) lives at byte
+// i/8, mask 128>>(i%8); the unused low bits of the last byte are zero.
+//
+// For byte-aligned widths (n % 8 == 0) the two layouts are identical
+// and this is a defensive copy. For non-byte-aligned widths (e.g.
+// BIT(9)) the value must shift left by (8 - n%8) bits within the
+// buffer so logical bit 0 lands on the first byte's MSB. We do that by
+// reading the MySQL value MSB-first into logical bit positions, then
+// writing PG-aligned. n is capped at 64 by the reader so a uint64
+// accumulator is exact.
+func bitBytesMySQLToPG(src []byte, n int) []byte {
+	if n <= 0 {
+		return []byte{}
+	}
+	nbytes := (n + 7) / 8
+	// Right-justified value: interpret the trailing nbytes as a
+	// big-endian unsigned integer holding the n significant low bits.
+	var val uint64
+	start := 0
+	if len(src) > nbytes {
+		start = len(src) - nbytes
+	}
+	for i := start; i < len(src); i++ {
+		val = val<<8 | uint64(src[i])
+	}
+	out := make([]byte, nbytes)
+	// Logical bit i (0 = most-significant of the n-bit value) → PG
+	// position byte i/8, mask 128>>(i%8).
+	for i := 0; i < n; i++ {
+		if val&(1<<uint(n-1-i)) != 0 {
+			out[i/8] |= byte(128 >> uint(i%8))
+		}
+	}
+	return out
 }
 
 // convertArray turns []any (the IR canonical form for arrays) into a

@@ -151,6 +151,11 @@ func TestEmitColumnType(t *testing.T) {
 		{"varbinary → bytea", ir.Varbinary{Length: 64}, "BYTEA"},
 		{"blob → bytea", ir.Blob{Size: ir.BlobLong}, "BYTEA"},
 
+		// ---- Bit (catalog Bug 62) ----
+		{"bit(8) → BIT(8)", ir.Bit{Length: 8}, "BIT(8)"},
+		{"bit(16) → BIT(16)", ir.Bit{Length: 16}, "BIT(16)"},
+		{"bit(9) → BIT(9)", ir.Bit{Length: 9}, "BIT(9)"},
+
 		// ---- Temporal ----
 		{"date", ir.Date{}, "DATE"},
 		{"time precision 0", ir.Time{Precision: 0}, "TIME"},
@@ -515,6 +520,22 @@ func TestEmitDefault(t *testing.T) {
 			"catalog #6: introducer-stripped string-literal default emits verbatim",
 			ir.DefaultExpression{Expr: "'vazio'", Dialect: "mysql"},
 			"'vazio'", true,
+		},
+		// catalog Bug 62: a BIT(N>1) bit-literal default. The MySQL
+		// reader tags it "bit" with the MySQL spelling `b'…'`; the PG
+		// writer rewrites the prefix to PG's `B'…'` bit-string literal
+		// (value identical, only the surface prefix differs). Pre-fix
+		// the column was BYTEA and the literal was the decimal string
+		// '165' → silently corrupted default (\x313635 not \xa5).
+		{
+			"Bug 62: bit literal b'10100101' → B'10100101'",
+			ir.DefaultExpression{Expr: "b'10100101'", Dialect: "bit"},
+			"B'10100101'", true,
+		},
+		{
+			"Bug 62: wide bit literal b'1111000011110000' → B'…'",
+			ir.DefaultExpression{Expr: "b'1111000011110000'", Dialect: "bit"},
+			"B'1111000011110000'", true,
 		},
 	}
 	for _, c := range cases {

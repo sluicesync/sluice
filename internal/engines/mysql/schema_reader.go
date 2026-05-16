@@ -243,7 +243,7 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 			Name:     colName,
 			Type:     typ,
 			Nullable: strings.EqualFold(isNullable, "YES"),
-			Default:  translateDefault(defaultVal, meta.Extra),
+			Default:  translateDefault(defaultVal, meta.Extra, typ),
 			Comment:  comment,
 		}
 		applyGenerated(col, genExpr, meta.Extra)
@@ -568,7 +568,7 @@ func loadTableSchema(ctx context.Context, db *sql.DB, schema, table string) (*ta
 			Name:     colName,
 			Type:     typ,
 			Nullable: strings.EqualFold(isNullable, "YES"),
-			Default:  translateDefault(defaultVal, meta.Extra),
+			Default:  translateDefault(defaultVal, meta.Extra, typ),
 			Comment:  comment,
 		}
 		applyGenerated(col, genExpr, meta.Extra)
@@ -772,14 +772,21 @@ func isIdentRune(r rune) bool {
 // IR, mirroring how generated-column and CHECK expressions are folded
 // toward portable text in [normalizeMySQLExpressionText]:
 //
-//   - A MySQL bit-literal default (`b'0'`, `B'1010'`) is converted to
-//     its decimal value as a dialect-neutral [ir.DefaultLiteral]
-//     (validation-rig catalog #4). MySQL stores `bit(N) DEFAULT b'…'`
-//     and information_schema reports the literal verbatim; emitting it
-//     as a string literal fails on every target (MySQL Error 1067,
-//     Postgres SQLSTATE 22P02) because neither accepts `'b”0”'` as a
-//     TINYINT / boolean default. The decimal form (`0`, `10`) is
+//   - A MySQL bit-literal default (`b'0'`, `B'1010'`) on a BIT(1)
+//     column (IR type [ir.Boolean]) is converted to its decimal value
+//     as a dialect-neutral [ir.DefaultLiteral] (validation-rig catalog
+//     #4). information_schema reports the literal verbatim; emitting
+//     `'b”0”'` as a string literal fails on every target (MySQL Error
+//     1067, Postgres SQLSTATE 22P02) because neither accepts it as a
+//     TINYINT / boolean default. The decimal form (`0`, `1`) is
 //     accepted by MySQL TINYINT and Postgres BOOLEAN alike.
+//
+//   - A bit-literal default on a BIT(N>1) column (IR type [ir.Bit])
+//     is preserved as a tagged bit-literal [ir.DefaultExpression] —
+//     the decimal collapse (catalog Bug 62) was wrong for a real bit
+//     column: BIT(8) DEFAULT b'10100101' must land as the bit value
+//     0xA5, not the decimal string '165'. The writers render it in
+//     each target's bit-literal syntax (`b'…'` MySQL, `B'…'` PG).
 //
 //   - Expression-form defaults carry MySQL's stored-form charset
 //     introducers (`_utf8mb4'x'`) and C-style apostrophe escapes
@@ -792,12 +799,21 @@ func isIdentRune(r rune) bool {
 //     them, and a same-engine MySQL target requires them — so the
 //     identifier-quote concern is resolved writer-side, not at the
 //     read boundary, for defaults.
-func translateDefault(def sql.NullString, extra string) ir.DefaultValue {
+func translateDefault(def sql.NullString, extra string, typ ir.Type) ir.DefaultValue {
 	if !def.Valid {
 		return ir.DefaultNone{}
 	}
-	if v, ok := bitLiteralToDecimal(def.String); ok {
-		return ir.DefaultLiteral{Value: v}
+	if bits, ok := bitLiteralBits(def.String); ok {
+		// BIT(N>1) → ir.Bit: preserve the bit string so the writers can
+		// emit it as a proper bit literal in each target's syntax. The
+		// `bit` dialect tag is recognised by the bit-aware default path
+		// in both writers (catalog Bug 62).
+		if _, isBit := typ.(ir.Bit); isBit {
+			return ir.DefaultExpression{Expr: "b'" + bits + "'", Dialect: bitLiteralDialect}
+		}
+		// BIT(1) → ir.Boolean: the decimal form is what TINYINT(1) /
+		// BOOLEAN accept (catalog #4 — unchanged behaviour).
+		return ir.DefaultLiteral{Value: bitsToDecimal(bits)}
 	}
 	if strings.Contains(strings.ToUpper(extra), "DEFAULT_GENERATED") {
 		// Tag the dialect so a cross-engine writer (e.g. PG) routes the
@@ -812,20 +828,27 @@ func translateDefault(def sql.NullString, extra string) ir.DefaultValue {
 	return ir.DefaultLiteral{Value: def.String}
 }
 
-// bitLiteralToDecimal recognises a MySQL bit-literal default of the
-// form b'<bits>' / B'<bits>' (optionally wrapped in the parenthesised
+// bitLiteralDialect tags a bit-literal [ir.DefaultExpression] so the
+// writers' bit-aware default path recognises it and renders the
+// literal in each target's bit syntax (`b'…'` MySQL, `B'…'` PG). It is
+// deliberately distinct from the "mysql" dialect tag — a bit literal
+// is dialect-neutral in value; only its surface syntax differs, and
+// routing it through the general MySQL→PG expression translator (which
+// has no bit-literal rule) would emit it verbatim and fail on PG.
+const bitLiteralDialect = "bit"
+
+// bitLiteralBits recognises a MySQL bit-literal default of the form
+// b'<bits>' / B'<bits>' (optionally wrapped in the parenthesised
 // `(b'<bits>')` form information_schema reports for the
-// DEFAULT_GENERATED variant) and returns its decimal value.
+// DEFAULT_GENERATED variant) and returns the raw binary-digit string
+// (no quotes, no `b` prefix).
 //
-// MySQL columns declared `bit(N) DEFAULT b'…'` (validation-rig catalog
-// #4) report the literal verbatim in information_schema.COLUMN_DEFAULT.
-// The bit literal is a numeric value — the dialect-neutral IR form is
-// the decimal integer, which both the MySQL writer (bit(1) → TINYINT)
-// and the Postgres writer (bit(1) → BOOLEAN) emit in a form their
-// target accepts. Anything that isn't a well-formed binary-digit
-// literal returns ok=false and the caller falls back to the verbatim
-// path (loud failure on the target beats a silent guess).
-func bitLiteralToDecimal(raw string) (string, bool) {
+// MySQL columns declared `bit(N) DEFAULT b'…'` report the literal
+// verbatim in information_schema.COLUMN_DEFAULT. Anything that isn't a
+// well-formed binary-digit literal returns ok=false and the caller
+// falls back to the verbatim path (loud failure on the target beats a
+// silent guess).
+func bitLiteralBits(raw string) (string, bool) {
 	s := strings.TrimSpace(raw)
 	// Tolerate the parenthesised `(b'…')` form MySQL reports for the
 	// DEFAULT_GENERATED variant.
@@ -839,23 +862,32 @@ func bitLiteralToDecimal(raw string) (string, bool) {
 	if bits == "" {
 		return "", false
 	}
-	var val uint64
+	// 64-bit BIT is MySQL's maximum; anything wider is malformed source
+	// we won't try to translate. Also reject non-binary digits.
+	if len(bits) > 64 {
+		return "", false
+	}
 	for i := 0; i < len(bits); i++ {
-		switch bits[i] {
-		case '0':
-			val <<= 1
-		case '1':
-			val = val<<1 | 1
-		default:
-			return "", false
-		}
-		// 64-bit BIT is MySQL's maximum; anything wider is malformed
-		// source we won't try to translate.
-		if i >= 64 {
+		if bits[i] != '0' && bits[i] != '1' {
 			return "", false
 		}
 	}
-	return strconv.FormatUint(val, 10), true
+	return bits, true
+}
+
+// bitsToDecimal converts a validated binary-digit string (as returned
+// by [bitLiteralBits]) to its unsigned decimal value. Used for the
+// BIT(1) → ir.Boolean default path (catalog #4): TINYINT(1) / BOOLEAN
+// accept `0`/`1`, not `b'0'`.
+func bitsToDecimal(bits string) string {
+	var val uint64
+	for i := 0; i < len(bits); i++ {
+		val <<= 1
+		if bits[i] == '1' {
+			val |= 1
+		}
+	}
+	return strconv.FormatUint(val, 10)
 }
 
 // indexKindFrom maps MySQL's index_type string to an IR IndexKind.

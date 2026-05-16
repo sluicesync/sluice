@@ -50,6 +50,11 @@ func TestEmitColumnType(t *testing.T) {
 		{"blob medium", ir.Blob{Size: ir.BlobMedium}, "MEDIUMBLOB"},
 		{"blob long", ir.Blob{Size: ir.BlobLong}, "LONGBLOB"},
 
+		// ---- Bit (catalog Bug 62) ----
+		{"bit(8)", ir.Bit{Length: 8}, "BIT(8)"},
+		{"bit(16)", ir.Bit{Length: 16}, "BIT(16)"},
+		{"bit(9)", ir.Bit{Length: 9}, "BIT(9)"},
+
 		// ---- Temporal ----
 		{"date", ir.Date{}, "DATE"},
 		{"time precision 0", ir.Time{Precision: 0}, "TIME"},
@@ -206,6 +211,22 @@ func TestEmitDefault(t *testing.T) {
 		// avoids a strict-mode quoted-numeric coercion.
 		{"bool literal 1 unquoted", ir.DefaultLiteral{Value: "1"}, ir.Boolean{}, "1", true},
 		{"bool literal 0 unquoted (bit b'0' → 0)", ir.DefaultLiteral{Value: "0"}, ir.Boolean{}, "0", true},
+
+		// catalog Bug 62: BIT(N>1) default is a bit literal emitted
+		// bare (`DEFAULT b'…'`), NOT decimal-string-quoted ('165') and
+		// NOT outer-paren-wrapped (that path is for function defaults).
+		{
+			"bit(8) literal default emitted bare",
+			ir.DefaultExpression{Expr: "b'10100101'", Dialect: bitLiteralDialect},
+			ir.Bit{Length: 8},
+			"b'10100101'", true,
+		},
+		{
+			"bit(16) literal default emitted bare",
+			ir.DefaultExpression{Expr: "b'1111000011110000'", Dialect: bitLiteralDialect},
+			ir.Bit{Length: 16},
+			"b'1111000011110000'", true,
+		},
 
 		// PG → MySQL DefaultExpression translation. PG's canonical
 		// "current timestamp" function is now(); MySQL's is

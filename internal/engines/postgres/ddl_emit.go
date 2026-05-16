@@ -76,6 +76,12 @@ func emitColumnType(t ir.Type, opts emitOpts) (string, error) {
 	case ir.Binary, ir.Varbinary, ir.Blob:
 		// Postgres has only one binary type, BYTEA.
 		return "BYTEA", nil
+	case ir.Bit:
+		// Fixed-width bit string. PG's bit(N) round-trips MySQL BIT(N)
+		// losslessly (catalog Bug 62). BIT(1) never reaches here — the
+		// MySQL reader maps the conventional single-bit column to
+		// ir.Boolean (→ BOOLEAN).
+		return fmt.Sprintf("BIT(%d)", v.Length), nil
 
 	// ---- Temporal ----
 	case ir.Date:
@@ -269,8 +275,29 @@ func translateDefaultExpr(d ir.DefaultExpression, opts emitOpts) string {
 	if d.Dialect == "" || d.Dialect == dialectName {
 		return d.Expr
 	}
+	if d.Dialect == bitLiteralDialect {
+		// Bit-literal default on a bit(N) column (catalog Bug 62). The
+		// reader emits the MySQL spelling `b'…'`; PG's bit-string
+		// literal is `B'…'` (uppercase prefix). Value is identical;
+		// only the surface prefix differs. Anything not in the expected
+		// `b'…'` shape falls through verbatim (loud failure on target
+		// beats a silent guess) — bitLiteralBits already validated the
+		// digits at the read boundary.
+		if strings.HasPrefix(d.Expr, "b'") {
+			return "B'" + d.Expr[2:]
+		}
+		return d.Expr
+	}
 	return translateExprForPG(d.Expr, ExprContext{EnabledPGExtensions: opts.EnabledExtensions})
 }
+
+// bitLiteralDialect mirrors the MySQL reader's bit-literal dialect tag
+// (mysql.bitLiteralDialect). Package-local copy: the postgres writer
+// can't import the mysql engine package (engine packages are peers,
+// wired only through the IR + registry). The IR's DefaultExpression
+// dialect tag is the cross-package contract; this constant names the
+// value the PG writer recognises on it (catalog Bug 62).
+const bitLiteralDialect = "bit"
 
 // setDefaultToArrayLiteral converts a MySQL-style comma-separated
 // SET default ("a,b" or "" for the empty default) to a Postgres

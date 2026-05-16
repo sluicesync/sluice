@@ -331,6 +331,8 @@ func renderTypeForNote(t ir.Type, engine string) string {
 		return fmt.Sprintf("varbinary(%d)", v.Length)
 	case ir.Blob:
 		return renderBlobSize(v.Size, engine)
+	case ir.Bit:
+		return fmt.Sprintf("bit(%d)", v.Length)
 	case ir.Date:
 		return "date"
 	case ir.Time:

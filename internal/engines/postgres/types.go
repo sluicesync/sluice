@@ -249,6 +249,20 @@ func translateType(c columnMeta) (ir.Type, error) {
 	case "bytea":
 		return ir.Blob{Size: ir.BlobLong}, nil
 
+	// ---- Bit ----
+	// Fixed-width / varying bit string. information_schema reports the
+	// declared bit count in character_maximum_length. Round-trips
+	// MySQL BIT(N) ↔ PG bit(N) (catalog Bug 62 — keeps the PG reader
+	// symmetric with the PG writer's new ir.Bit emission so a
+	// sluice-written bit column reads back to the same IR type). `bit
+	// varying` with no length collapses to bit(1) — PG's default.
+	case "bit", "bit varying":
+		n := int(int64Ptr(c.CharMaxLen))
+		if n < 1 {
+			n = 1
+		}
+		return ir.Bit{Length: n}, nil
+
 	// ---- Temporal ----
 	case "date":
 		return ir.Date{}, nil

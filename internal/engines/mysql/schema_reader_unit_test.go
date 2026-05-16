@@ -16,18 +16,19 @@ package mysql
 
 import (
 	"database/sql"
+	"strings"
 	"testing"
 
 	"github.com/orware/sluice/internal/ir"
 )
 
-// TestBitLiteralToDecimal pins the validation-rig catalog #4 fix: a
-// MySQL `bit(N) DEFAULT b'…'` default is reported verbatim by
-// information_schema, and emitting it as a string literal fails on
-// every target. The read boundary converts the bit literal to its
-// decimal value so the dialect-neutral IR holds something both the
-// MySQL (→ TINYINT) and Postgres (→ BOOLEAN) writers accept.
-func TestBitLiteralToDecimal(t *testing.T) {
+// TestBitLiteralBits pins the bit-literal recognizer: a MySQL
+// `bit(N) DEFAULT b'…'` default is reported verbatim by
+// information_schema. bitLiteralBits extracts the raw binary-digit
+// string; the BIT(1)→Boolean path then decimal-collapses it (catalog
+// #4) while the BIT(N>1)→ir.Bit path preserves it as a bit literal
+// (catalog Bug 62).
+func TestBitLiteralBits(t *testing.T) {
 	cases := []struct {
 		name   string
 		in     string
@@ -37,26 +38,48 @@ func TestBitLiteralToDecimal(t *testing.T) {
 		{"b'0'", "b'0'", "0", true},
 		{"b'1'", "b'1'", "1", true},
 		{"uppercase B'1'", "B'1'", "1", true},
-		{"multi-bit b'1010'", "b'1010'", "10", true},
-		{"wide b'11111111'", "b'11111111'", "255", true},
+		{"multi-bit b'1010'", "b'1010'", "1010", true},
+		{"wide b'11111111'", "b'11111111'", "11111111", true},
+		{"BIT(8) b'10100101'", "b'10100101'", "10100101", true},
 		{"parenthesised (b'1')", "(b'1')", "1", true},
-		{"leading/trailing space", "  b'101' ", "5", true},
+		{"leading/trailing space", "  b'101' ", "101", true},
 		{"not a bit literal — plain int", "0", "", false},
 		{"not a bit literal — string", "'b0'", "", false},
 		{"empty bits", "b''", "", false},
 		{"non-binary digit", "b'012'", "", false},
 		{"hex literal is not a bit literal", "0x01", "", false},
+		{"over 64 bits", "b'" + strings.Repeat("1", 65) + "'", "", false},
 		{"empty", "", "", false},
 	}
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			got, ok := bitLiteralToDecimal(c.in)
+			got, ok := bitLiteralBits(c.in)
 			if ok != c.wantOK {
 				t.Fatalf("ok = %v; want %v", ok, c.wantOK)
 			}
 			if got != c.want {
 				t.Errorf("\n got  %q\n want %q", got, c.want)
+			}
+		})
+	}
+}
+
+// TestBitsToDecimal pins the BIT(1)→Boolean decimal collapse (catalog
+// #4): TINYINT(1) / BOOLEAN accept `0`/`1`, not `b'0'`.
+func TestBitsToDecimal(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"0", "0"},
+		{"1", "1"},
+		{"1010", "10"},
+		{"11111111", "255"},
+		{"10100101", "165"},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.in, func(t *testing.T) {
+			if got := bitsToDecimal(c.in); got != c.want {
+				t.Errorf("bitsToDecimal(%q) = %q; want %q", c.in, got, c.want)
 			}
 		})
 	}
@@ -68,8 +91,11 @@ func TestBitLiteralToDecimal(t *testing.T) {
 // target). Both were the IR-expression paths that bypassed the
 // read-boundary normalization applied to generated / CHECK exprs.
 func TestTranslateDefault_BitAndIntroducer(t *testing.T) {
-	t.Run("bit literal → decimal DefaultLiteral", func(t *testing.T) {
-		got := translateDefault(sql.NullString{String: "b'0'", Valid: true}, "")
+	// catalog #4 (UNCHANGED behaviour — must not regress): BIT(1) maps
+	// to ir.Boolean, and its b'…' default decimal-collapses to the
+	// TINYINT(1)/BOOLEAN-acceptable form.
+	t.Run("bit(1) literal → decimal DefaultLiteral (catalog #4)", func(t *testing.T) {
+		got := translateDefault(sql.NullString{String: "b'0'", Valid: true}, "", ir.Boolean{})
 		lit, ok := got.(ir.DefaultLiteral)
 		if !ok {
 			t.Fatalf("got %T; want ir.DefaultLiteral", got)
@@ -78,8 +104,8 @@ func TestTranslateDefault_BitAndIntroducer(t *testing.T) {
 			t.Errorf("Value = %q; want %q", lit.Value, "0")
 		}
 	})
-	t.Run("bit literal even with DEFAULT_GENERATED extra", func(t *testing.T) {
-		got := translateDefault(sql.NullString{String: "b'1'", Valid: true}, "DEFAULT_GENERATED")
+	t.Run("bit(1) literal even with DEFAULT_GENERATED extra (catalog #4)", func(t *testing.T) {
+		got := translateDefault(sql.NullString{String: "b'1'", Valid: true}, "DEFAULT_GENERATED", ir.Boolean{})
 		lit, ok := got.(ir.DefaultLiteral)
 		if !ok {
 			t.Fatalf("got %T; want ir.DefaultLiteral", got)
@@ -88,8 +114,37 @@ func TestTranslateDefault_BitAndIntroducer(t *testing.T) {
 			t.Errorf("Value = %q; want %q", lit.Value, "1")
 		}
 	})
+	// catalog Bug 62: BIT(N>1) maps to ir.Bit; its b'…' default is
+	// preserved as a bit-literal DefaultExpression tagged "bit" (NOT
+	// decimal-collapsed — that was the Bug 62 defect).
+	t.Run("bit(8) literal → preserved bit-literal DefaultExpression (Bug 62)", func(t *testing.T) {
+		got := translateDefault(sql.NullString{String: "b'10100101'", Valid: true}, "", ir.Bit{Length: 8})
+		exp, ok := got.(ir.DefaultExpression)
+		if !ok {
+			t.Fatalf("got %T (%#v); want ir.DefaultExpression", got, got)
+		}
+		if exp.Expr != "b'10100101'" {
+			t.Errorf("Expr = %q; want %q", exp.Expr, "b'10100101'")
+		}
+		if exp.Dialect != bitLiteralDialect {
+			t.Errorf("Dialect = %q; want %q", exp.Dialect, bitLiteralDialect)
+		}
+	})
+	t.Run("bit(16) literal → preserved bit-literal DefaultExpression (Bug 62)", func(t *testing.T) {
+		got := translateDefault(sql.NullString{String: "b'1111000011110000'", Valid: true}, "", ir.Bit{Length: 16})
+		exp, ok := got.(ir.DefaultExpression)
+		if !ok {
+			t.Fatalf("got %T; want ir.DefaultExpression", got)
+		}
+		if exp.Expr != "b'1111000011110000'" {
+			t.Errorf("Expr = %q; want %q", exp.Expr, "b'1111000011110000'")
+		}
+		if exp.Dialect != bitLiteralDialect {
+			t.Errorf("Dialect = %q; want %q", exp.Dialect, bitLiteralDialect)
+		}
+	})
 	t.Run("charset introducer + escaped apostrophes stripped on expression default", func(t *testing.T) {
-		got := translateDefault(sql.NullString{String: `_utf8mb4\'vazio\'`, Valid: true}, "DEFAULT_GENERATED")
+		got := translateDefault(sql.NullString{String: `_utf8mb4\'vazio\'`, Valid: true}, "DEFAULT_GENERATED", ir.Varchar{Length: 64})
 		exp, ok := got.(ir.DefaultExpression)
 		if !ok {
 			t.Fatalf("got %T; want ir.DefaultExpression", got)
@@ -102,7 +157,7 @@ func TestTranslateDefault_BitAndIntroducer(t *testing.T) {
 		}
 	})
 	t.Run("plain literal default unaffected", func(t *testing.T) {
-		got := translateDefault(sql.NullString{String: "hello", Valid: true}, "")
+		got := translateDefault(sql.NullString{String: "hello", Valid: true}, "", ir.Varchar{Length: 32})
 		lit, ok := got.(ir.DefaultLiteral)
 		if !ok {
 			t.Fatalf("got %T; want ir.DefaultLiteral", got)
@@ -112,7 +167,7 @@ func TestTranslateDefault_BitAndIntroducer(t *testing.T) {
 		}
 	})
 	t.Run("NULL default → DefaultNone", func(t *testing.T) {
-		got := translateDefault(sql.NullString{Valid: false}, "")
+		got := translateDefault(sql.NullString{Valid: false}, "", ir.Varchar{Length: 32})
 		if _, ok := got.(ir.DefaultNone); !ok {
 			t.Fatalf("got %T; want ir.DefaultNone", got)
 		}

@@ -112,11 +112,16 @@ func translateType(c columnMeta) (ir.Type, error) {
 	case "bit":
 		w := bitWidth(c.ColumnType)
 		if w == 1 {
+			// The conventional single-bit column is a boolean; this is
+			// the validated round-trip (bit(1) → TINYINT(1) / BOOLEAN).
 			return ir.Boolean{}, nil
 		}
-		// Round up to the nearest byte.
-		bytes := (w + 7) / 8
-		return ir.Varbinary{Length: bytes}, nil
+		// BIT(N) for N > 1 is a fixed-width bit string. Modelling it as
+		// Varbinary (pre-v0.65.1) mis-typed the column on every target
+		// (VARBINARY(1) on MySQL → Error 1067; BYTEA on PG) and forced
+		// the bit-literal default into a decimal string (catalog Bug
+		// 62). ir.Bit round-trips losslessly MySQL BIT(N) ↔ PG bit(N).
+		return ir.Bit{Length: w}, nil
 
 	// ---- Strings ----
 

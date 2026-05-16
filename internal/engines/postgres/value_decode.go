@@ -45,6 +45,14 @@ func decodeValue(raw any, t ir.Type) (any, error) {
 		return decodeString(raw)
 	case ir.Binary, ir.Varbinary, ir.Blob:
 		return decodeBytes(raw)
+	case ir.Bit:
+		// PG bit/varbit surfaces as a '0'/'1' string under pgx stdlib
+		// mode (or bytes on some paths); decodeBytes tolerates both.
+		// PG-source bit columns are out of scope for catalog Bug 62
+		// (the bug is MySQL-source) — this case exists so a
+		// sluice-written bit(N) column reads back to ir.Bit instead of
+		// erroring in the decode switch (PG→PG symmetry).
+		return decodeBytes(raw)
 	case ir.Date, ir.DateTime, ir.Timestamp:
 		return decodeTime(raw)
 	case ir.Time:
