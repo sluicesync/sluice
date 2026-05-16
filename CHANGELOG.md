@@ -6,6 +6,19 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.65.2]
+
+**Fixed: reserved-word column references inside generated-column / CHECK / index *expression bodies* were emitted unquoted on MySQL → PostgreSQL (Bug 63).** Found by the v0.65.1 post-release cycle; it is the cross-engine cousin the v0.65.0 cycle predicted as Bug 61's "same family", now confirmed a **distinct** defect (Bug 61 was the PG *reader*'s `stripTypeCast`, fixed in v0.65.1; this is the PG *writer*'s cross-dialect expression-body emitter).
+
+### Fixed
+
+- **Bug 63 — PG-target cross-dialect expression bodies now requote PostgreSQL-reserved identifiers.** On MySYQL → PostgreSQL, a generated column `GENERATED ALWAYS AS (`order` + 1)`, a `CHECK (`order` > 0)`, or an expression index over a reserved-word-named column emitted the reference bare (the MySQL reader strips source backticks for IR portability; the PG writer translated function/operator spellings via `translateExprForPG` but never re-quoted bare identifiers). `order` is PostgreSQL-reserved → `CREATE TABLE` failed with `syntax error … (SQLSTATE 42601)`. New `requotePGReservedIdents` (the PG-writer analogue of v0.65.0 #5's `requoteMySQLReservedIdents`) is wired into the cross-dialect generated / CHECK / index expression emitters: string-literal-aware, function-call/operator/keyword/numeric-aware (only bare *identifier* references that are PG-reserved are quoted), using PostgreSQL's reserved-keyword set (e.g. `order`/`user`/`table`/`column` are reserved and requoted; `key` is **non-reserved in PostgreSQL** and correctly left bare — verified against real PG). Same-engine PostgreSQL → PostgreSQL is byte-identical and untouched (the PG reader's `pg_get_expr` already quotes; that path short-circuits before the requote).
+
+### Compatibility
+
+- Drop-in from v0.65.1. No API/CLI/IR/state-format change. Upgrade if you migrate **MySQL → PostgreSQL** schemas with generated columns, CHECK constraints, or expression indexes whose bodies reference reserved-word-named columns — this was a hard `CREATE TABLE` failure.
+- Known adjacent surface (not Bug 63, tracked): the same requote is not yet applied to **column DEFAULT** expression bodies, nor audited for the PostgreSQL → MySQL direction across all expression kinds — candidates for a consolidation pass (a single shared reserved-word-requote mechanism across both writers and all four expression positions).
+
 ## [0.65.1]
 
 **Two DDL-emit correctness fixes surfaced by the v0.65.0 post-release regression cycle.** Both are localized; the ADR-0044 Tier 3 feature and its load-bearing guards are unaffected (re-verified green).
