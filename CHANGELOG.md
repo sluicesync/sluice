@@ -6,6 +6,23 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.66.1]
+
+**Completes Bug 64 — the MySQL→PostgreSQL column-DEFAULT cell that v0.66.0 (ADR-0045) only partially addressed.** v0.66.0's post-release regression cycle caught that the consolidation reached 3 of 4 expression positions; the DEFAULT cell got the PG-reserved requote but not the source-MySQL-backtick strip the generated/CHECK/index emitters get at the reader. v0.66.0's CHANGELOG/release notes were corrected post-publish; this release closes the bug.
+
+### Fixed
+
+- **Bug 64 (closed).** The MySQL schema reader now runs the same `normalizeMySQLExpressionText` (backtick / charset-introducer / escaped-apostrophe strip) on column **DEFAULT** expressions that it already runs on generated-column, CHECK, and index expressions — IR-first and symmetric (source-dialect quoting is reader knowledge). `DEFAULT (\`order\` + \`user\`)` now emits well-formed PG DDL `DEFAULT ("order" + "user")` (reserved requoted, non-reserved bare, zero leaked backticks) instead of the broken `(\`"order"\` + \`"user"\`)` → `SQLSTATE 42601`. Companion fix: because the reader strip would otherwise regress same-engine MySQL→MySQL (bare reserved `order` → `Error 1064`), the MySQL writer's `emitDefault` DEFAULT-expression arm now applies the same reserved-word requote the generated/CHECK/index emitters use — the load-bearing same-dialect requote asymmetry ADR-0045 documents, now consistent across all four positions. Bit-literal defaults (Bug 62), `DefaultLiteral`/constants, the PG→MySQL DEFAULT direction, and `now()`/`gen_random_uuid()`/`random()` outcomes are unaffected.
+- **Scope note (PostgreSQL language limitation, not sluice):** PostgreSQL forbids column references in a column `DEFAULT` (`SQLSTATE 0A000`). Bug 64 was always about sluice emitting *syntactically broken* DDL (leaked backticks → 42601); sluice now emits faithful, well-formed DDL. A MySQL `DEFAULT` that references other columns will still be rejected by PostgreSQL itself — that is a target-engine constraint, surfaced as a loud target error, not a sluice defect.
+
+### Internal
+
+- **The ADR-0045 proactive sweep's coverage hole is closed.** The 4×2×2 sweep stayed green through v0.66.0 while this cell was broken because its DEFAULT-position case used only a constant (`CURRENT_TIMESTAMP`) default — no column reference, no backticks. The sweep's DEFAULT cell now exercises a MySQL→PG column-referencing reserved-word default and asserts the emitted PG DDL is well-formed; it fails on pre-fix code and passes post-fix (verified). A future regression of this exact cell can no longer pass the sweep silently.
+
+### Compatibility
+
+Drop-in from v0.66.0. No API/CLI/IR-contract/state-format change. Strictly corrective. **If you deferred a MySQL→PostgreSQL migration with column-referencing DEFAULT expressions per the v0.66.0 note: sluice now emits correct DDL** (note PostgreSQL's own column-ref-in-DEFAULT limitation still applies — function-call and constant DEFAULTs are the unaffected, fully-working cases).
+
 ## [0.66.0]
 
 **Expression-identifier-translation consolidation (ADR-0045).** Replaces the reactive per-cell point-fixes (#5, Bug 61, Bug 63, Bug 64) with one named, tested mechanism applied uniformly across every expression position and direction — and closes Bug 64, Bug 65, and a latent PG→MySQL gap the new proactive sweep caught during implementation.
