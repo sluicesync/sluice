@@ -475,6 +475,146 @@ func TestMigrate_PostgresToMySQL_GeneratedConcatAndCast(t *testing.T) {
 	}
 }
 
+// TestMigrate_MySQLToPostgres_ReservedWordExprBodies pins
+// validation-rig catalog Bug 63: a MySQL source whose generated-column
+// / CHECK / index expression bodies reference PG-reserved-word columns
+// (`order`, `key`) must land on the PG target without SQLSTATE 42601.
+// Pre-fix the PG writer emitted the reserved-word refs bare inside the
+// expression bodies (only the column *declarations* were quoted), so
+// CREATE TABLE failed with `syntax error at or near "order"`.
+//
+// Covers: (a) a STORED generated col referencing `order`, (b) a MySQL
+// VIRTUAL generated col (→ PG STORED) referencing `key`, (c) a CHECK
+// constraint referencing `order`, (d) an expression index referencing
+// `order`. Asserts migrate succeeds and the generated / CHECK / index
+// semantics are correct against inserted rows.
+func TestMigrate_MySQLToPostgres_ReservedWordExprBodies(t *testing.T) {
+	mysqlSource, _, mysqlCleanup := startMySQL(t)
+	defer mysqlCleanup()
+
+	_, pgTarget, pgCleanup := startPostgres(t)
+	defer pgCleanup()
+
+	// `order` and `key` are PG-reserved; backtick-quoted on the MySQL
+	// source. next_order is STORED; kx is VIRTUAL (PG promotes it to
+	// STORED). The CHECK references `order`; an expression index
+	// references (`order` + 1).
+	const seedDDL = "CREATE TABLE rw (\n" +
+		"  id         INT PRIMARY KEY,\n" +
+		"  `order`    INT NOT NULL,\n" +
+		"  `key`      INT NOT NULL,\n" +
+		"  next_order INT GENERATED ALWAYS AS (`order` + 1) STORED,\n" +
+		"  kx         INT GENERATED ALWAYS AS (`key` * 2) VIRTUAL,\n" +
+		"  CONSTRAINT rw_order_pos CHECK (`order` > 0),\n" +
+		"  INDEX ix_rw_order_plus ((`order` + 1))\n" +
+		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;\n" +
+		"INSERT INTO rw (id, `order`, `key`) VALUES (1, 10, 4), (2, 7, 9);"
+	applyMySQLDDL(t, mysqlSource, seedDDL)
+
+	mysqlEng, ok := engines.Get("mysql")
+	if !ok {
+		t.Fatal("mysql engine not registered")
+	}
+	pgEng, ok := engines.Get("postgres")
+	if !ok {
+		t.Fatal("postgres engine not registered")
+	}
+
+	mig := &Migrator{
+		Source:    mysqlEng,
+		Target:    pgEng,
+		SourceDSN: mysqlSource,
+		TargetDSN: pgTarget,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	if err := mig.Run(ctx); err != nil {
+		// Pre-fix this failed with:
+		// pipeline: create tables: postgres: create table "rw":
+		// ERROR: syntax error at or near "order" (SQLSTATE 42601)
+		t.Fatalf("Migrator.Run: %v", err)
+	}
+
+	tgt, err := sql.Open("pgx", pgTarget)
+	if err != nil {
+		t.Fatalf("open pg target: %v", err)
+	}
+	defer func() { _ = tgt.Close() }()
+
+	// Both generated columns must report as GENERATED ALWAYS.
+	for _, col := range []string{"next_order", "kx"} {
+		var isGenerated, genExpr string
+		const checkQ = `
+			SELECT is_generated, COALESCE(generation_expression, '')
+			FROM   information_schema.columns
+			WHERE  table_schema = 'public'
+			  AND  table_name   = 'rw'
+			  AND  column_name  = $1`
+		if err := tgt.QueryRowContext(ctx, checkQ, col).Scan(&isGenerated, &genExpr); err != nil {
+			t.Fatalf("query pg target %s: %v", col, err)
+		}
+		if isGenerated != "ALWAYS" || genExpr == "" {
+			t.Fatalf("pg target rw.%s: is_generated=%q expr=%q; want ALWAYS + non-empty",
+				col, isGenerated, genExpr)
+		}
+	}
+
+	// Generated semantics: next_order = order + 1, kx = key * 2.
+	rows, err := tgt.QueryContext(ctx,
+		`SELECT id, "order", "key", next_order, kx FROM rw ORDER BY id`)
+	if err != nil {
+		t.Fatalf("select rw: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+	type rwRow struct{ id, order, key, nextOrder, kx int }
+	want := []rwRow{
+		{1, 10, 4, 11, 8},
+		{2, 7, 9, 8, 18},
+	}
+	var got []rwRow
+	for rows.Next() {
+		var r rwRow
+		if err := rows.Scan(&r.id, &r.order, &r.key, &r.nextOrder, &r.kx); err != nil {
+			t.Fatalf("scan rw row: %v", err)
+		}
+		got = append(got, r)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows iteration: %v", err)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("got %d rows; want %d (%v)", len(got), len(want), got)
+	}
+	for i, w := range want {
+		if got[i] != w {
+			t.Errorf("row %d: got %+v; want %+v", i, got[i], w)
+		}
+	}
+
+	// CHECK semantics: `order` > 0 must be enforced — an INSERT with
+	// order = 0 has to be rejected by the constraint, not a parse
+	// error (which would mean the CHECK didn't translate).
+	_, err = tgt.ExecContext(ctx,
+		`INSERT INTO rw (id, "order", "key") VALUES (3, 0, 1)`)
+	if err == nil {
+		t.Fatalf("expected CHECK (order > 0) to reject order=0, but insert succeeded")
+	}
+	if !containsCaseInsensitive(err.Error(), "rw_order_pos") &&
+		!containsCaseInsensitive(err.Error(), "check") {
+		t.Fatalf("expected CHECK-constraint violation, got: %v", err)
+	}
+
+	// Expression index ((order + 1)) must exist on the target.
+	var idxDef string
+	const idxQ = `
+		SELECT indexdef FROM pg_indexes
+		WHERE  schemaname = 'public' AND tablename = 'rw'
+		  AND  indexdef ILIKE '%order%+%1%'`
+	if err := tgt.QueryRowContext(ctx, idxQ).Scan(&idxDef); err != nil {
+		t.Fatalf("expression index on (order + 1) not found on pg target: %v", err)
+	}
+}
+
 // containsCaseInsensitive reports whether s contains substr,
 // case-insensitively. Used to keep the assertions on
 // generation_expression text resilient to engine-side reformatting.

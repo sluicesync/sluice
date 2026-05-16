@@ -842,7 +842,12 @@ func translateIndexExpr(c ir.IndexColumn, opts emitOpts) string {
 	if c.ExpressionDialect == "" || c.ExpressionDialect == dialectName {
 		return c.Expression
 	}
-	return translateExprForPG(c.Expression, ExprContext{EnabledPGExtensions: opts.EnabledExtensions})
+	// Cross-dialect index expression: re-quote PG reserved-word column
+	// refs the source reader de-quoted (catalog Bug 63). Same-dialect
+	// PG→PG returned above with the pg_get_expr text verbatim.
+	return requotePGReservedIdents(
+		translateExprForPG(c.Expression, ExprContext{EnabledPGExtensions: opts.EnabledExtensions}),
+	)
 }
 
 // emitCreateIndex produces a CREATE INDEX statement (UNIQUE if
@@ -1029,7 +1034,15 @@ func translateGeneratedExpr(c *ir.Column, tbl *ir.Table, opts emitOpts) string {
 	if _, isInt := c.Type.(ir.Integer); isInt {
 		ctx.OuterColumnIsInteger = true
 	}
-	return translateExprForPG(c.GeneratedExpr, ctx)
+	// Cross-dialect body: the source reader stripped its engine's
+	// identifier quotes for IR portability, which de-quotes any
+	// reserved-word column reference (a MySQL `order` / `key`).
+	// translateExprForPG rewrites function/operator spellings but not
+	// bare idents, so re-quote PG reserved words here or CREATE TABLE
+	// fails with SQLSTATE 42601 (catalog Bug 63). Same-dialect PG→PG
+	// returns above before this point — the PG reader already emits
+	// properly-quoted refs from pg_get_expr.
+	return requotePGReservedIdents(translateExprForPG(c.GeneratedExpr, ctx))
 }
 
 // translateCheckExpr returns the CHECK-constraint expression to emit,
@@ -1043,7 +1056,10 @@ func translateCheckExpr(c *ir.CheckConstraint, tbl *ir.Table, opts emitOpts) str
 	}
 	ctx := exprContextForTable(tbl)
 	ctx.EnabledPGExtensions = opts.EnabledExtensions
-	return translateExprForPG(c.Expr, ctx)
+	// Cross-dialect CHECK body: re-quote PG reserved-word column refs
+	// the source reader de-quoted (catalog Bug 63). Same-dialect PG→PG
+	// returned above with the pg_get_expr text verbatim.
+	return requotePGReservedIdents(translateExprForPG(c.Expr, ctx))
 }
 
 // exprContextForTable builds the [ExprContext] for tbl, populating
