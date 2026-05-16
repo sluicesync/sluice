@@ -6,6 +6,20 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.68.1]
+
+**Closes Bug #8 (HIGH, MySQL→PostgreSQL) — untranslated MySQL constructs no longer silently leak into emitted PG DDL.** A real-world 329-table battle-test corpus found that certain MySQL expression constructs fell through the MySQL→PG translator verbatim: `sluice schema preview` then printed valid-looking-but-invalid PG DDL with **zero warnings** (a false green), and `sluice migrate` hard-aborted at create-tables with PG `SQLSTATE 42883`, leaving a **partially-migrated target**. Both the specific translation gaps and the structural false-green are fixed.
+
+### Fixed
+
+- **Translation rules (additive):** `JSON_VALID(x)` → `(x IS JSON)`; `a <=> b` (MySQL NULL-safe equality) → `a IS NOT DISTINCT FROM b`; `NOW(N)`/`CURRENT_TIMESTAMP(N)`/`LOCALTIME(N)`/`LOCALTIMESTAMP(N)`/`CURTIME(N)` precision-arg forms and `CURDATE()` → the correct PG temporal forms (`CURRENT_TIMESTAMP(N)` / `CURRENT_DATE` / etc.). Multi-arg/expression-precision variants still fall through loud.
+- **Structural backstop (the load-bearing fix, loud-failure tenet):** any *known MySQL-only* construct that would reach PG emit now produces a **loud, operator-actionable refusal at BOTH `schema preview` AND `migrate` pre-flight — before any DDL is applied** (reusing the existing `ScanMySQLToPGGaps` catalog + the established cross-engine-supportable refusal surface). `schema preview` is no longer a false green, and `migrate` can no longer leave a partially-migrated target on this class. Generalizes: future untranslated MySQL-isms become a consistent loud preview/preflight refusal, not silent invalid DDL.
+- **Requote regression fixed in the same pass (caught by independent review of the Bug #8 fix):** the `<=>`→`IS NOT DISTINCT FROM` translation initially required excluding `FROM` from the ADR-0045 reserved-identifier requoter — but a *blanket* exclusion silently broke re-quoting of a column literally named `from` in any CHECK/generated/index/DEFAULT expression (MySQL→PG). `FROM` is now **context-aware**: treated as grammar only after `DISTINCT` or inside `EXTRACT`/`SUBSTRING`/`TRIM`/`OVERLAY` (via a new `exprident` `GrammarContextual` rule, engine sets stay engine-owned); a bare `from` column reference is re-quoted as before. A latent reverse-direction (PG→MySQL grammar-`FROM`) variant of the same bug is fixed too. The ADR-0045 proactive 4×2×2 sweep gained a `from`-named-reserved-column cell (both directions) so this class can't silently regress.
+
+### Compatibility
+
+Drop-in from v0.68.0. No format/state change. Strictly corrective for MySQL→PostgreSQL of schemas using `JSON_VALID` / `<=>` / `NOW(N)`/`CURDATE()` defaults (now translate) or other MySQL-only expression constructs (now a loud, actionable refusal at preview/preflight instead of a silent false-green + partial-target migrate). PG→MySQL, same-engine, and the catalogued/known-good translations are unaffected (regression-guarded). Bug #9 (a separate loud-failure *quality* gap — generated-col-references-generated-col surfaces a raw PG `42P17` instead of a sluice pre-flight refusal; no data corruption) is tracked, out of scope for this release.
+
 ## [0.68.0]
 
 **Verbatim same-engine / backup extension-type passthrough (ADR-0047).** Sluice no longer refuses a PG column whose type is owned by an *uncatalogued* extension (`ltree`, `cube`, `timescaledb`, `pg_partman`, in-house extensions, …) on the paths that provably need only faithful carry, not translation: **same-engine PG → PG** and **PG-backup → PG-restore**. The ADR-0032 enumerated 7-extension allowlist (the rich path with typmod decode / cross-engine translators) is unchanged; this is a deliberately narrower tier *below* it. Cross-engine (PG → MySQL) still loud-refuses — unweakened.
