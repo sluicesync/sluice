@@ -6,6 +6,19 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.65.1]
+
+**Two DDL-emit correctness fixes surfaced by the v0.65.0 post-release regression cycle.** Both are localized; the ADR-0044 Tier 3 feature and its load-bearing guards are unaffected (re-verified green).
+
+### Fixed
+
+- **Bug 61 — multi-argument function-call column DEFAULTs were silently truncated (PostgreSQL source).** Root cause (corrected from the initial catalogue hypothesis via instrumentation): the PG schema reader's `stripTypeCast` used `strings.LastIndex(s, "::")`. PostgreSQL records multi-arg function defaults in `information_schema.column_default` with a per-argument `::text` cast (e.g. `DEFAULT crypt('seedpw', gen_salt('bf'))` → `crypt('seedpw'::text, gen_salt('bf'::text))`); `LastIndex` matched the **innermost** cast and truncated the expression *in the IR itself* → downstream `syntax error … (SQLSTATE 42601)` on PG targets. **Pre-existing since ≤ v0.64.0** and broad: it hit core PostgreSQL functions (`left('x', 3)`, `round(1.2345, 2)`, `coalesce(a, b)`), not only the v0.65.0 pgcrypto surface that exposed it. Fixed with a paren-depth-0 / string-literal-aware `topLevelCastIndex`. New PG → PG integration regression covers core funcs, a string-literal-with-comma default, and nested `crypt('seedpw', gen_salt('bf'))`.
+- **Bug 62 — `BIT(N)` with `N > 1` was mis-mapped and its `DEFAULT b'…'` corrupted.** Completes the v0.65.0 #4 fix, which only covered `bit(1)`. `BIT(8)` was mapped to `VARBINARY(1)` / `BYTEA` and `b'10100101'` decoded to the decimal string `'165'` → MySQL → MySQL hard-failed (`Error 1067`); MySQL → PG **succeeded with a silently corrupted DEFAULT**. New additive **`ir.Bit{Length}`** type: MySQL `BIT(N)` ↔ PostgreSQL `bit(N)` (lossless, fixed-width, `b'…'`/`B'…'` literals); the bit-literal default round-trips in each target's native syntax; the value path uses `pgtype.Bits` with MySQL-right-justified → PG-left-justified re-alignment (verified end-to-end by integration, not assumed). `bit(1)` → `BOOLEAN` is preserved (v0.65.0 #4 not regressed). Regression tests exercise `BIT(8)` **and** `BIT(16)` on **both** MySQL → MySQL and MySQL → PG (the coverage gap that let this through).
+
+### Compatibility
+
+- Drop-in from v0.65.0. `ir.Bit` is a purely additive IR type (no existing IR type changed); no API/CLI/state-format change. Operators whose schemas use `BIT(N>1)` columns or multi-argument function defaults on a PostgreSQL source should upgrade — these were silent-corruption / hard-fail bugs.
+
 ## [0.65.0]
 
 **PII / extension: ADR-0032 Tier 3 — opt-in passthrough for extension-function column defaults & generated expressions (uuid-ossp + pgcrypto), plus three DDL-emit fidelity fixes surfaced by the PlanetScale validation corpus.**
