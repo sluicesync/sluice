@@ -126,3 +126,59 @@ func TestEmitColumnDef_GeneratedReservedWord(t *testing.T) {
 		})
 	}
 }
+
+// TestRewritePGIdentQuotes pins the writer-side source-quote
+// normalization leg (ADR-0045 §4 PG→MySQL): pg_get_expr emits
+// reserved-word / mixed-case column refs double-quoted, and the PG
+// reader can't strip them, so the MySQL writer converts PG's
+// double-quote identifier form to MySQL backticks before the requote
+// leg. Without this a PG-source generated/CHECK/index/DEFAULT body
+// referencing a reserved-word column emitted the broken `"`order`"`
+// shape (Error 1292 on the MySQL target).
+func TestRewritePGIdentQuotes(t *testing.T) {
+	cases := []struct{ name, in, want string }{
+		{"reserved word double-quoted → backtick", `("order" * 2)`, "(`order` * 2)"},
+		{"mixed-case quoted ident → backtick", `"Mixed Case" + 1`, "`Mixed Case` + 1"},
+		{"doubled-quote escape decoded to literal dquote inside backticks", `"a""b"`, "`a\"b`"},
+		{"bare identifiers untouched", "qty * price - 2", "qty * price - 2"},
+		{"string literal verbatim (contains a dquote)", `note = 'say "hi"'`, `note = 'say "hi"'`},
+		{"multiple quoted refs", `"order" + "user"`, "`order` + `user`"},
+		{"embedded backtick in quoted ident is doubled", "\"a`b\"", "`a``b`"},
+		{"empty", "", ""},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			if got := rewritePGIdentQuotes(c.in); got != c.want {
+				t.Errorf("\n got  %q\n want %q", got, c.want)
+			}
+		})
+	}
+}
+
+// TestTranslateGeneratedExpr_PGSourceReservedWord is the end-to-end
+// pin for the ADR-0045 §4 PG→MySQL leg through the public writer
+// entry point: a PG-dialect generated body that references the
+// reserved word `order` (double-quoted by pg_get_expr) must emit a
+// well-formed MySQL backtick-quoted reference, not the `"`order`"`
+// garbage that broke bulk copy with MySQL Error 1292.
+func TestTranslateGeneratedExpr_PGSourceReservedWord(t *testing.T) {
+	c := &ir.Column{
+		Name:                 "doubled",
+		GeneratedExpr:        `("order" * 2)`,
+		GeneratedExprDialect: "postgres",
+		Type:                 ir.Integer{},
+	}
+	if got, want := translateGeneratedExpr(c), "(`order` * 2)"; got != want {
+		t.Errorf("translateGeneratedExpr = %q; want %q", got, want)
+	}
+	chk := &ir.CheckConstraint{Expr: `("order" >= 0)`, ExprDialect: "postgres"}
+	if got, want := translateCheckExpr(chk), "(`order` >= 0)"; got != want {
+		t.Errorf("translateCheckExpr = %q; want %q", got, want)
+	}
+	// D2: PG functional index body now translate+requote.
+	ic := ir.IndexColumn{Expression: `(("order" + 1))`, ExpressionDialect: "postgres"}
+	if got, want := translateIndexExpr(ic), "((`order` + 1))"; got != want {
+		t.Errorf("translateIndexExpr = %q; want %q", got, want)
+	}
+}

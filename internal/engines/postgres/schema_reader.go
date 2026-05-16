@@ -663,7 +663,12 @@ func (r *SchemaReader) populateIndexes(ctx context.Context, tables map[string]*i
 			ix.indisprimary,
 			COALESCE(a.attname, ''),
 			u.ord,
-			COALESCE(opc.opcname, '') AS opclass
+			COALESCE(opc.opcname, '') AS opclass,
+			CASE
+				WHEN a.attname IS NULL
+				THEN pg_get_indexdef(ix.indexrelid, u.ord::int, true)
+				ELSE ''
+			END AS expr
 		FROM   pg_index ix
 		JOIN   pg_class      cl ON cl.oid = ix.indrelid
 		JOIN   pg_class      i  ON i.oid  = ix.indexrelid
@@ -693,19 +698,34 @@ func (r *SchemaReader) populateIndexes(ctx context.Context, tables map[string]*i
 			isUnique, isPrimary                   bool
 			ord                                   int
 			opclass                               string
+			exprText                              string
 		)
 		if err := rows.Scan(
 			&tableName, &indexName, &method,
 			&isUnique, &isPrimary,
-			&colName, &ord, &opclass,
+			&colName, &ord, &opclass, &exprText,
 		); err != nil {
 			return err
 		}
 		if _, ok := tables[tableName]; !ok {
 			continue
 		}
-		// Skip expression-only entries (no underlying column).
-		if colName == "" {
+		// Expression-index entry (catalog Bug 65): the indkey slot is
+		// the `0` sentinel, so the pg_attribute join yields no column
+		// name. Before ADR-0045 this entry was silently dropped, losing
+		// the whole functional index from the IR — a schema-fidelity
+		// loss that violates the loud-failure tenet. D3 (locked):
+		// full-carry. pg_get_indexdef(idx, ord, true) renders just this
+		// key's expression text (PG dialect); surface it into the IR's
+		// existing IndexColumn.Expression field tagged
+		// ExpressionDialect="postgres", the PG-source analogue of the
+		// MySQL-source post-Bug-16 path. The opclass (Bug 47) still
+		// comes from the independent opc.opcname join below, so an
+		// opclass-bearing expression index is not regressed.
+		isExpr := colName == "" && strings.TrimSpace(exprText) != ""
+		if colName == "" && !isExpr {
+			// Genuinely empty (defensive — shouldn't happen for a real
+			// index column). Preserve the historical skip.
 			continue
 		}
 
@@ -754,6 +774,11 @@ func (r *SchemaReader) populateIndexes(ctx context.Context, tables map[string]*i
 		// whose owning extension wasn't enabled) is dropped, just
 		// like before.
 		col := ir.IndexColumn{Column: colName}
+		if isExpr {
+			col.Column = ""
+			col.Expression = strings.TrimSpace(exprText)
+			col.ExpressionDialect = dialectName
+		}
 		switch {
 		case opclass != "" && idx.Method != "":
 			col.OperatorClass = opclass

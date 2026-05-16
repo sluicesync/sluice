@@ -288,7 +288,17 @@ func translateDefaultExpr(d ir.DefaultExpression, opts emitOpts) string {
 		}
 		return d.Expr
 	}
-	return translateExprForPG(d.Expr, ExprContext{EnabledPGExtensions: opts.EnabledExtensions})
+	// Cross-dialect DEFAULT body (Bug 64, PG side). Before ADR-0045
+	// this arm translated operator/function spellings but, unlike the
+	// generated / CHECK / index sites, did NOT re-quote PG reserved-
+	// word column references the source reader de-quoted — so a MySQL
+	// source default referencing a column named `order` / `user` broke
+	// CREATE TABLE with SQLSTATE 42601. Bring it onto the uniform
+	// cross-dialect composition: requote(translate(expr)). Same-dialect
+	// (and the bit-literal special case) returned above unchanged.
+	return requotePGReservedIdents(
+		translateExprForPG(d.Expr, ExprContext{EnabledPGExtensions: opts.EnabledExtensions}),
+	)
 }
 
 // bitLiteralDialect mirrors the MySQL reader's bit-literal dialect tag

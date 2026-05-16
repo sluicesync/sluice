@@ -1,138 +1,14 @@
 // Copyright 2026 Omar Ramos
 // SPDX-License-Identifier: Apache-2.0
 
+// PostgreSQL dialect definitions for identifier re-quoting. The
+// mechanism that consumes these sets lives in the shared
+// internal/translate/exprident package (ADR-0045); the sets stay here
+// because they are PG dialect definitions, correctly engine-owned.
+// requotePGReservedIdents (the thin wrapper) is in
+// exprident_shared.go.
+
 package postgres
-
-import "strings"
-
-// requotePGReservedIdents re-applies double-quote quoting to bare
-// identifiers in a cross-engine expression body that are PostgreSQL
-// reserved words used as column references.
-//
-// Background (validation-rig catalog Bug 63): when the source dialect
-// is not "postgres", a generated-column / CHECK / index expression
-// arrives in the IR spelled in the source engine's dialect with that
-// engine's identifier quotes stripped at the read boundary (the MySQL
-// reader strips backticks so the IR text is portable). The PG writer's
-// cross-dialect translator (translateExprForPG) rewrites function and
-// operator spellings but does NOT re-quote bare identifiers — so a
-// MySQL source column named `order` or `key` lands in the PG generated-
-// column body as the bare token `order` / `key`. `order` is a PG
-// reserved word, so CREATE TABLE fails with
-// `ERROR: syntax error at or near "order"` (SQLSTATE 42601).
-//
-// This is the PG-writer analogue of the MySQL writer's
-// requoteMySQLReservedIdents (validation-rig catalog #5). The fix is
-// target-side, where PG's reserved-word set is known (target knowledge
-// belongs in the writer, not the IR): walk the expression string-
-// literal-aware and wrap any bare token that is a PG reserved word in
-// double quotes — *unless* the token is one of the expression-grammar
-// keywords (operators, logical keywords, NULL/boolean literals, CAST
-// type names, CASE/control keywords) that can legitimately appear
-// unquoted in a generated/CHECK/index expression body. A token
-// immediately followed by `(` is treated as a function/type call and
-// left alone (several reserved words double as built-in function or
-// type names).
-//
-// Same-engine PG→PG never reaches this helper — the PG reader returns
-// pg_get_expr output with reserved-word column refs already correctly
-// double-quoted, and the writer's same-dialect path emits that text
-// verbatim. The helper is invoked only on the cross-dialect branch.
-//
-// Deliberately a small, mechanical pass: it only re-quotes the
-// reserved-word subset that is realistically a column identifier
-// (never an operator or literal in expression position). Everything
-// else is verbatim passthrough, consistent with the project's
-// translation policy.
-func requotePGReservedIdents(expr string) string {
-	if expr == "" {
-		return expr
-	}
-	var sb strings.Builder
-	sb.Grow(len(expr) + 8)
-	for i := 0; i < len(expr); {
-		c := expr[i]
-		switch {
-		case c == '\'':
-			// String literal — copy verbatim.
-			end := scanStringLiteral(expr, i)
-			sb.WriteString(expr[i:end])
-			i = end
-		case c == '"':
-			// Already double-quoted identifier — copy verbatim
-			// (including the closing quote, honouring doubled-quote
-			// escapes).
-			j := i + 1
-			for j < len(expr) {
-				if expr[j] == '"' {
-					if j+1 < len(expr) && expr[j+1] == '"' {
-						j += 2
-						continue
-					}
-					j++
-					break
-				}
-				j++
-			}
-			sb.WriteString(expr[i:j])
-			i = j
-		case isPGIdentStartByte(c):
-			j := i
-			for j < len(expr) && isIdentifierByte(expr[j]) {
-				j++
-			}
-			tok := expr[i:j]
-			// Look past any whitespace to see if this is a call /
-			// type-name position (`coalesce (...)`, `numeric (...)`).
-			k := j
-			for k < len(expr) && (expr[k] == ' ' || expr[k] == '\t') {
-				k++
-			}
-			callPos := k < len(expr) && expr[k] == '('
-			if !callPos && shouldRequotePGIdent(tok) {
-				sb.WriteByte('"')
-				sb.WriteString(tok)
-				sb.WriteByte('"')
-			} else {
-				sb.WriteString(tok)
-			}
-			i = j
-		default:
-			sb.WriteByte(c)
-			i++
-		}
-	}
-	return sb.String()
-}
-
-// shouldRequotePGIdent reports whether tok (case-insensitive) is a
-// PostgreSQL reserved word that must be double-quoted when it appears
-// as a column reference inside an expression — i.e. it's reserved AND
-// it is not one of the expression-grammar keywords that legitimately
-// appear unquoted in a generated/CHECK/index expression body.
-func shouldRequotePGIdent(tok string) bool {
-	u := strings.ToUpper(tok)
-	if _, excluded := pgExprGrammarKeywords[u]; excluded {
-		return false
-	}
-	_, reserved := pgReservedWords[u]
-	return reserved
-}
-
-// isPGIdentStartByte reports whether b can begin an unquoted SQL
-// identifier (letter or underscore — not a digit, so numeric literals
-// aren't mistaken for identifiers).
-func isPGIdentStartByte(b byte) bool {
-	switch {
-	case b >= 'a' && b <= 'z':
-		return true
-	case b >= 'A' && b <= 'Z':
-		return true
-	case b == '_':
-		return true
-	}
-	return false
-}
 
 // pgExprGrammarKeywords is the subset of PG reserved words that can
 // appear unquoted in an expression body in a grammatical role:

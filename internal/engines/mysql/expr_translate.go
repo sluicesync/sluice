@@ -68,6 +68,21 @@ func translateExprForMySQL(expr string) string {
 	if expr == "" {
 		return expr
 	}
+	// Source-quote normalization (the first leg of ADR-0016's three-leg
+	// policy, performed writer-side for the PG→MySQL direction). The PG
+	// reader's pg_get_expr quotes identifiers that require it — a
+	// reserved-word column ref like `order` comes back as the double-
+	// quoted "order". Unlike the MySQL reader (which strips its
+	// backticks at the read boundary), the PG reader cannot strip these
+	// — it needs them for same-dialect PG→PG correctness — so the
+	// MySQL writer must convert PG's double-quote identifier form to
+	// MySQL's backtick form here, before the requote leg runs. Without
+	// this, a PG-source generated/CHECK/index/DEFAULT body referencing
+	// a reserved-word column emits the broken `"`order`"` shape and the
+	// MySQL parser mis-evaluates it (catalog: the ADR-0045 §4 sweep's
+	// PG→MySQL leg). This runs first because the later operator/function
+	// rewrites and the requote pass must see MySQL-form identifiers.
+	expr = rewritePGIdentQuotes(expr)
 	// Order matters. Casts must run before the || rewriter so a cast
 	// on a string-concat operand doesn't confuse the concat-chain
 	// detector. ANY(ARRAY[...]) must run before the cast pass too —

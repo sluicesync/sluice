@@ -360,12 +360,37 @@ func emitDefault(d ir.DefaultValue, t ir.Type) (string, bool) {
 		// Bit-literal default on a BIT(N) column (catalog Bug 62). The
 		// reader tags it "bit"; MySQL accepts the literal bare
 		// (`DEFAULT b'10100101'`) — no outer-paren wrap (that path is
-		// for function-call defaults) and no decimal collapse.
+		// for function-call defaults) and no decimal collapse. Byte-
+		// identical to the pre-ADR-0045 behaviour.
 		if v.Dialect == bitLiteralDialect {
 			return v.Expr, true
 		}
-		normalized := strings.ToLower(strings.TrimSpace(v.Expr))
 		expr := v.Expr
+		if v.Dialect != "" && v.Dialect != dialectName {
+			// Cross-dialect DEFAULT body (Bug 64, MySQL side). Before
+			// ADR-0045 this arm had NO identifier re-quote and NO
+			// operator/function translation — only the 3-entry
+			// pgToMySQLDefaultExpr lookup — so a PG source default that
+			// referenced a MySQL-reserved column (or used a PG operator
+			// spelling) emitted untranslated and broke the target. Route
+			// it through the uniform cross-dialect composition, the same
+			// shape the generated / CHECK / index sites use:
+			// requote(translate(expr)). The 3 PG-canonical default forms
+			// (now() → CURRENT_TIMESTAMP, gen_random_uuid() → (UUID()),
+			// random() → (RAND())) are folded into translator coverage
+			// via the pgToMySQLDefaultExpr map applied just below — it
+			// runs on both the same- and cross-dialect paths exactly as
+			// the pre-ADR-0045 (un-gated) code did, so same-dialect
+			// output stays byte-identical and the cross-dialect outcomes
+			// for those three forms are preserved.
+			expr = requoteMySQLReservedIdents(translateExprForMySQL(expr))
+		}
+		// Canonical PG-default-form coverage + MySQL DEFAULT-grammar
+		// shaping. This block is byte-identical to the pre-ADR-0045
+		// code and runs on every non-bit DefaultExpression (the lookup
+		// is a no-op for keys it doesn't contain, including the already-
+		// translated CURRENT_TIMESTAMP / (UUID()) / (RAND()) forms).
+		normalized := strings.ToLower(strings.TrimSpace(expr))
 		if translated, ok := pgToMySQLDefaultExpr[normalized]; ok {
 			expr = translated
 		}
@@ -754,10 +779,7 @@ func emitIndexColumnList(cols []ir.IndexColumn) string {
 	for i, c := range cols {
 		var entry string
 		if c.Expression != "" {
-			// Read-boundary backtick strip is lossy for reserved-word
-			// identifiers; re-quote them for the MySQL target the same
-			// way generated / CHECK expressions are (catalog #5).
-			entry = "(" + requoteMySQLReservedIdents(c.Expression) + ")"
+			entry = "(" + translateIndexExpr(c) + ")"
 		} else {
 			entry = quoteIdent(c.Column)
 			if c.Length > 0 {
@@ -915,6 +937,29 @@ func translateCheckExpr(c *ir.CheckConstraint) string {
 		return requoteMySQLReservedIdents(c.Expr)
 	}
 	return requoteMySQLReservedIdents(translateExprForMySQL(c.Expr))
+}
+
+// translateIndexExpr returns the functional-index expression body to
+// emit. Same gate shape as [translateGeneratedExpr] /
+// [translateCheckExpr]: same-dialect (or untagged) emits the source
+// text with only the reserved-word re-quote the read-boundary backtick
+// strip made necessary (catalog #5) — byte-identical to the pre-
+// ADR-0045 emitIndexColumnList behaviour, which applied requote
+// unconditionally.
+//
+// ADR-0045 D2 (locked): the cross-dialect arm gains the
+// translateExprForMySQL pass it historically lacked, bringing the
+// index cell onto the same uniform requote(translate(expr)) composition
+// as the other three positions. This closes the latent
+// PG-source-functional-index → MySQL untranslated gap (a PG
+// `lower(name)` / `||`-concat / `::`-cast index body now translates to
+// MySQL spelling instead of emitting verbatim and failing on the
+// target).
+func translateIndexExpr(c ir.IndexColumn) string {
+	if c.ExpressionDialect == "" || c.ExpressionDialect == dialectName {
+		return requoteMySQLReservedIdents(c.Expression)
+	}
+	return requoteMySQLReservedIdents(translateExprForMySQL(c.Expression))
 }
 
 // emitColumnList renders a parenthesised, comma-separated list of

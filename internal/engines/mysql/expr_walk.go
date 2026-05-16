@@ -693,100 +693,73 @@ func rewriteEqAnyArray(expr string) string {
 	}
 }
 
-// isIdentifierByte reports whether b is a continuation byte for an
-// SQL identifier. ASCII letters, digits, underscore.
-func isIdentifierByte(b byte) bool {
-	switch {
-	case b >= 'a' && b <= 'z':
-		return true
-	case b >= 'A' && b <= 'Z':
-		return true
-	case b >= '0' && b <= '9':
-		return true
-	case b == '_':
-		return true
+// rewritePGIdentQuotes converts PostgreSQL double-quoted identifiers
+// ("order", "Mixed Case") in a PG-dialect expression body into MySQL
+// backtick-quoted form (`order`, `Mixed Case`). It is the writer-side
+// half of ADR-0016's "strip source identifier quoting" leg for the
+// PG→MySQL direction: pg_get_expr quotes only identifiers that need it
+// (reserved words, mixed-case, names with special chars), and the PG
+// reader can't strip those (PG→PG same-dialect needs them), so the
+// MySQL writer normalizes them here.
+//
+// Walk is string-literal-aware: single-quoted SQL string literals are
+// copied verbatim so a literal containing a `"` is never mistaken for
+// an identifier delimiter. PG's doubled-double-quote escape ("" inside
+// a quoted identifier) is decoded to a single `"`; any literal
+// backtick inside the identifier is doubled so the emitted MySQL
+// backtick-quoted form stays well-formed. Unquoted text (operators,
+// function names, numeric literals, already-bare identifiers) passes
+// through untouched — this pass only rewrites the quoting form, never
+// the identifier text or anything else.
+func rewritePGIdentQuotes(expr string) string {
+	if expr == "" {
+		return expr
 	}
-	return false
-}
-
-// scanStringLiteral returns the index just past the closing quote of
-// the single-quoted string starting at expr[start]. Doubled quotes
-// (”) are treated as an escape sequence within the literal.
-func scanStringLiteral(expr string, start int) int {
-	i := start + 1
-	for i < len(expr) {
-		if expr[i] == '\'' {
-			if i+1 < len(expr) && expr[i+1] == '\'' {
-				i += 2
-				continue
-			}
-			return i + 1
-		}
-		i++
-	}
-	return len(expr)
-}
-
-// scanParenGroup, given an index pointing at '(', returns the index
-// of the matching ')' and ok=true. Respects nested parens and string
-// literals.
-func scanParenGroup(expr string, open int) (int, bool) {
-	if open >= len(expr) || expr[open] != '(' {
-		return 0, false
-	}
-	depth := 1
-	for i := open + 1; i < len(expr); {
-		switch expr[i] {
+	var sb strings.Builder
+	sb.Grow(len(expr) + 8)
+	for i := 0; i < len(expr); {
+		c := expr[i]
+		switch c {
 		case '\'':
-			i = scanStringLiteral(expr, i)
-		case '(':
-			depth++
-			i++
-		case ')':
-			depth--
-			if depth == 0 {
-				return i, true
+			end := scanStringLiteral(expr, i)
+			sb.WriteString(expr[i:end])
+			i = end
+		case '"':
+			// Scan the PG quoted identifier, decoding the doubled-quote
+			// escape, until the closing (non-doubled) quote.
+			j := i + 1
+			var ident strings.Builder
+			for j < len(expr) {
+				if expr[j] == '"' {
+					if j+1 < len(expr) && expr[j+1] == '"' {
+						ident.WriteByte('"')
+						j += 2
+						continue
+					}
+					j++ // consume closing quote
+					break
+				}
+				ident.WriteByte(expr[j])
+				j++
 			}
-			i++
+			// Re-quote in MySQL form, doubling any embedded backtick so
+			// the result is a well-formed MySQL quoted identifier.
+			sb.WriteByte('`')
+			sb.WriteString(strings.ReplaceAll(ident.String(), "`", "``"))
+			sb.WriteByte('`')
+			i = j
 		default:
+			sb.WriteByte(c)
 			i++
 		}
 	}
-	return 0, false
+	return sb.String()
 }
 
-// splitTopLevelArgs splits a function-argument string on commas that
-// are at depth zero (not inside nested parens, brackets, or string
-// literals). Returns nil for an empty / whitespace-only input.
-func splitTopLevelArgs(s string) []string {
-	if strings.TrimSpace(s) == "" {
-		return nil
-	}
-	var parts []string
-	depth := 0
-	start := 0
-	for i := 0; i < len(s); {
-		switch s[i] {
-		case '\'':
-			i = scanStringLiteral(s, i)
-		case '(', '[':
-			depth++
-			i++
-		case ')', ']':
-			depth--
-			i++
-		case ',':
-			if depth == 0 {
-				parts = append(parts, s[start:i])
-				start = i + 1
-				i++
-				continue
-			}
-			i++
-		default:
-			i++
-		}
-	}
-	parts = append(parts, s[start:])
-	return parts
-}
+// The string-literal-aware scan primitives (isIdentifierByte,
+// scanStringLiteral, scanParenGroup, splitTopLevelArgs) used to live
+// here as byte-identical duplicates of the Postgres copies. ADR-0045
+// moved them verbatim into internal/translate/exprident; the
+// unexported names below are thin delegations so the ~30 call sites in
+// this package stay unchanged (a behaviour-preserving move). See
+// exprident_shared.go.
