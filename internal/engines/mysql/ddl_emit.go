@@ -358,9 +358,9 @@ func emitDefault(d ir.DefaultValue, t ir.Type) (string, bool) {
 	case ir.DefaultLiteral:
 		if _, isBool := t.(ir.Boolean); isBool {
 			switch strings.ToLower(strings.TrimSpace(v.Value)) {
-			case "true", "t":
+			case "true", "t", "1":
 				return "1", true
-			case "false", "f":
+			case "false", "f", "0":
 				return "0", true
 			}
 		}
@@ -756,7 +756,10 @@ func emitIndexColumnList(cols []ir.IndexColumn) string {
 	for i, c := range cols {
 		var entry string
 		if c.Expression != "" {
-			entry = "(" + c.Expression + ")"
+			// Read-boundary backtick strip is lossy for reserved-word
+			// identifiers; re-quote them for the MySQL target the same
+			// way generated / CHECK expressions are (catalog #5).
+			entry = "(" + requoteMySQLReservedIdents(c.Expression) + ")"
 		} else {
 			entry = quoteIdent(c.Column)
 			if c.Length > 0 {
@@ -896,9 +899,14 @@ func emitCheckConstraint(c *ir.CheckConstraint) string {
 // before the translation layer landed.
 func translateGeneratedExpr(c *ir.Column) string {
 	if c.GeneratedExprDialect == "" || c.GeneratedExprDialect == dialectName {
-		return c.GeneratedExpr
+		// Same-dialect (or untagged) body: emitted verbatim, but the
+		// read boundary stripped backtick identifier quotes for IR
+		// portability. Re-quote any bare token that is a MySQL
+		// reserved word so a column named `order` / `key` doesn't
+		// break the target parser (catalog #5).
+		return requoteMySQLReservedIdents(c.GeneratedExpr)
 	}
-	return translateExprForMySQL(c.GeneratedExpr)
+	return requoteMySQLReservedIdents(translateExprForMySQL(c.GeneratedExpr))
 }
 
 // translateCheckExpr returns the CHECK-constraint expression to emit,
@@ -906,9 +914,9 @@ func translateGeneratedExpr(c *ir.Column) string {
 // tag indicates a different source dialect.
 func translateCheckExpr(c *ir.CheckConstraint) string {
 	if c.ExprDialect == "" || c.ExprDialect == dialectName {
-		return c.Expr
+		return requoteMySQLReservedIdents(c.Expr)
 	}
-	return translateExprForMySQL(c.Expr)
+	return requoteMySQLReservedIdents(translateExprForMySQL(c.Expr))
 }
 
 // emitColumnList renders a parenthesised, comma-separated list of

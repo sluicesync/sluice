@@ -14,7 +14,110 @@
 
 package mysql
 
-import "testing"
+import (
+	"database/sql"
+	"testing"
+
+	"github.com/orware/sluice/internal/ir"
+)
+
+// TestBitLiteralToDecimal pins the validation-rig catalog #4 fix: a
+// MySQL `bit(N) DEFAULT b'…'` default is reported verbatim by
+// information_schema, and emitting it as a string literal fails on
+// every target. The read boundary converts the bit literal to its
+// decimal value so the dialect-neutral IR holds something both the
+// MySQL (→ TINYINT) and Postgres (→ BOOLEAN) writers accept.
+func TestBitLiteralToDecimal(t *testing.T) {
+	cases := []struct {
+		name   string
+		in     string
+		want   string
+		wantOK bool
+	}{
+		{"b'0'", "b'0'", "0", true},
+		{"b'1'", "b'1'", "1", true},
+		{"uppercase B'1'", "B'1'", "1", true},
+		{"multi-bit b'1010'", "b'1010'", "10", true},
+		{"wide b'11111111'", "b'11111111'", "255", true},
+		{"parenthesised (b'1')", "(b'1')", "1", true},
+		{"leading/trailing space", "  b'101' ", "5", true},
+		{"not a bit literal — plain int", "0", "", false},
+		{"not a bit literal — string", "'b0'", "", false},
+		{"empty bits", "b''", "", false},
+		{"non-binary digit", "b'012'", "", false},
+		{"hex literal is not a bit literal", "0x01", "", false},
+		{"empty", "", "", false},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			got, ok := bitLiteralToDecimal(c.in)
+			if ok != c.wantOK {
+				t.Fatalf("ok = %v; want %v", ok, c.wantOK)
+			}
+			if got != c.want {
+				t.Errorf("\n got  %q\n want %q", got, c.want)
+			}
+		})
+	}
+}
+
+// TestTranslateDefault_BitAndIntroducer pins catalog #4 (bit-literal
+// default) and catalog #6 (charset introducer + backslash-escaped
+// apostrophes on an expression-form default reaching a Postgres
+// target). Both were the IR-expression paths that bypassed the
+// read-boundary normalization applied to generated / CHECK exprs.
+func TestTranslateDefault_BitAndIntroducer(t *testing.T) {
+	t.Run("bit literal → decimal DefaultLiteral", func(t *testing.T) {
+		got := translateDefault(sql.NullString{String: "b'0'", Valid: true}, "")
+		lit, ok := got.(ir.DefaultLiteral)
+		if !ok {
+			t.Fatalf("got %T; want ir.DefaultLiteral", got)
+		}
+		if lit.Value != "0" {
+			t.Errorf("Value = %q; want %q", lit.Value, "0")
+		}
+	})
+	t.Run("bit literal even with DEFAULT_GENERATED extra", func(t *testing.T) {
+		got := translateDefault(sql.NullString{String: "b'1'", Valid: true}, "DEFAULT_GENERATED")
+		lit, ok := got.(ir.DefaultLiteral)
+		if !ok {
+			t.Fatalf("got %T; want ir.DefaultLiteral", got)
+		}
+		if lit.Value != "1" {
+			t.Errorf("Value = %q; want %q", lit.Value, "1")
+		}
+	})
+	t.Run("charset introducer + escaped apostrophes stripped on expression default", func(t *testing.T) {
+		got := translateDefault(sql.NullString{String: `_utf8mb4\'vazio\'`, Valid: true}, "DEFAULT_GENERATED")
+		exp, ok := got.(ir.DefaultExpression)
+		if !ok {
+			t.Fatalf("got %T; want ir.DefaultExpression", got)
+		}
+		if exp.Expr != `'vazio'` {
+			t.Errorf("Expr = %q; want %q", exp.Expr, `'vazio'`)
+		}
+		if exp.Dialect != "mysql" {
+			t.Errorf("Dialect = %q; want %q", exp.Dialect, "mysql")
+		}
+	})
+	t.Run("plain literal default unaffected", func(t *testing.T) {
+		got := translateDefault(sql.NullString{String: "hello", Valid: true}, "")
+		lit, ok := got.(ir.DefaultLiteral)
+		if !ok {
+			t.Fatalf("got %T; want ir.DefaultLiteral", got)
+		}
+		if lit.Value != "hello" {
+			t.Errorf("Value = %q; want %q", lit.Value, "hello")
+		}
+	})
+	t.Run("NULL default → DefaultNone", func(t *testing.T) {
+		got := translateDefault(sql.NullString{Valid: false}, "")
+		if _, ok := got.(ir.DefaultNone); !ok {
+			t.Fatalf("got %T; want ir.DefaultNone", got)
+		}
+	})
+}
 
 func TestStripMySQLIdentifierQuotes(t *testing.T) {
 	cases := []struct{ in, want string }{

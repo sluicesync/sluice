@@ -503,6 +503,19 @@ func TestEmitDefault(t *testing.T) {
 			ir.DefaultExpression{Expr: "WEIRD_FN()", Dialect: "mysql"},
 			"WEIRD_FN()", true,
 		},
+		// Validation-rig catalog #6: a MySQL TEXT-family column default
+		// `DEFAULT (_utf8mb4'vazio')` reaches the PG writer. The MySQL
+		// reader now strips the charset introducer + C-style apostrophe
+		// escapes (the same normalization generated/CHECK exprs get) so
+		// the IR carries the portable `'vazio'`. Pre-fix the PG target
+		// emitted `_utf8mb4\'vazio\'` → SQLSTATE 42601. Post-fix the
+		// string-literal default passes through the PG translator
+		// verbatim and is valid PG.
+		{
+			"catalog #6: introducer-stripped string-literal default emits verbatim",
+			ir.DefaultExpression{Expr: "'vazio'", Dialect: "mysql"},
+			"'vazio'", true,
+		},
 	}
 	for _, c := range cases {
 		c := c

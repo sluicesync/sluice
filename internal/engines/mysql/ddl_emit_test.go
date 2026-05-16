@@ -199,8 +199,13 @@ func TestEmitDefault(t *testing.T) {
 		{"bool literal TRUE uppercase", ir.DefaultLiteral{Value: "TRUE"}, ir.Boolean{}, "1", true},
 		{"bool short t", ir.DefaultLiteral{Value: "t"}, ir.Boolean{}, "1", true},
 		{"bool short f", ir.DefaultLiteral{Value: "f"}, ir.Boolean{}, "0", true},
-		// "1"/"0" already arrive from MySQL itself — keep them as-is.
-		{"bool literal 1 passthrough", ir.DefaultLiteral{Value: "1"}, ir.Boolean{}, "'1'", true},
+		// "1"/"0" on a bool column emit unquoted — they arrive either
+		// from MySQL itself or, post catalog-#4, from the reader's
+		// bit-literal → decimal conversion (bit(1) → ir.Boolean). The
+		// unquoted form is the clean MySQL TINYINT(1) default and
+		// avoids a strict-mode quoted-numeric coercion.
+		{"bool literal 1 unquoted", ir.DefaultLiteral{Value: "1"}, ir.Boolean{}, "1", true},
+		{"bool literal 0 unquoted (bit b'0' → 0)", ir.DefaultLiteral{Value: "0"}, ir.Boolean{}, "0", true},
 
 		// PG → MySQL DefaultExpression translation. PG's canonical
 		// "current timestamp" function is now(); MySQL's is
@@ -415,7 +420,10 @@ func TestEmitColumnDef(t *testing.T) {
 				Type:    ir.Boolean{},
 				Default: ir.DefaultLiteral{Value: "1"},
 			},
-			want: "`active` TINYINT(1) NOT NULL DEFAULT '1'",
+			// "1"/"0" on a bool column emit unquoted (catalog #4): the
+			// reader maps bit(1) → ir.Boolean and bit-literal defaults
+			// to "0"/"1"; the clean MySQL TINYINT(1) form is unquoted.
+			want: "`active` TINYINT(1) NOT NULL DEFAULT 1",
 		},
 		{
 			// Regression: a Postgres source hands MySQL a boolean

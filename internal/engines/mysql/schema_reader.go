@@ -7,6 +7,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/orware/sluice/internal/ir"
@@ -766,9 +767,37 @@ func isIdentRune(r rune) bool {
 // information_schema into an [ir.DefaultValue]. MySQL signals
 // expression defaults with the "DEFAULT_GENERATED" token in extra;
 // that distinction is preserved in the IR rather than collapsed.
+//
+// Two read-boundary normalizations apply before the value reaches the
+// IR, mirroring how generated-column and CHECK expressions are folded
+// toward portable text in [normalizeMySQLExpressionText]:
+//
+//   - A MySQL bit-literal default (`b'0'`, `B'1010'`) is converted to
+//     its decimal value as a dialect-neutral [ir.DefaultLiteral]
+//     (validation-rig catalog #4). MySQL stores `bit(N) DEFAULT b'…'`
+//     and information_schema reports the literal verbatim; emitting it
+//     as a string literal fails on every target (MySQL Error 1067,
+//     Postgres SQLSTATE 22P02) because neither accepts `'b”0”'` as a
+//     TINYINT / boolean default. The decimal form (`0`, `10`) is
+//     accepted by MySQL TINYINT and Postgres BOOLEAN alike.
+//
+//   - Expression-form defaults carry MySQL's stored-form charset
+//     introducers (`_utf8mb4'x'`) and C-style apostrophe escapes
+//     (`\'x\'`); a cross-engine Postgres target rejects both
+//     (SQLSTATE 42601 — catalog #6). These are the same MySQL-internal
+//     decorations [normalizeMySQLExpressionText] strips for generated /
+//     CHECK expressions; defaults were the one IR-expression path that
+//     bypassed it. Backtick identifier quotes are *not* stripped here:
+//     the writer's reserved-word re-quoting (catalog #5) needs to see
+//     them, and a same-engine MySQL target requires them — so the
+//     identifier-quote concern is resolved writer-side, not at the
+//     read boundary, for defaults.
 func translateDefault(def sql.NullString, extra string) ir.DefaultValue {
 	if !def.Valid {
 		return ir.DefaultNone{}
+	}
+	if v, ok := bitLiteralToDecimal(def.String); ok {
+		return ir.DefaultLiteral{Value: v}
 	}
 	if strings.Contains(strings.ToUpper(extra), "DEFAULT_GENERATED") {
 		// Tag the dialect so a cross-engine writer (e.g. PG) routes the
@@ -776,9 +805,57 @@ func translateDefault(def sql.NullString, extra string) ir.DefaultValue {
 		// MySQL-spelled defaults like `(UUID())`, `(RAND() * 100)`, or
 		// `(DATE_ADD(...))` would emit verbatim and fail loud on PG —
 		// see Bugs 28/29/30.
-		return ir.DefaultExpression{Expr: def.String, Dialect: "mysql"}
+		expr := stripMySQLCharsetIntroducers(def.String)
+		expr = convertMySQLEscapedApostrophes(expr)
+		return ir.DefaultExpression{Expr: expr, Dialect: "mysql"}
 	}
 	return ir.DefaultLiteral{Value: def.String}
+}
+
+// bitLiteralToDecimal recognises a MySQL bit-literal default of the
+// form b'<bits>' / B'<bits>' (optionally wrapped in the parenthesised
+// `(b'<bits>')` form information_schema reports for the
+// DEFAULT_GENERATED variant) and returns its decimal value.
+//
+// MySQL columns declared `bit(N) DEFAULT b'…'` (validation-rig catalog
+// #4) report the literal verbatim in information_schema.COLUMN_DEFAULT.
+// The bit literal is a numeric value — the dialect-neutral IR form is
+// the decimal integer, which both the MySQL writer (bit(1) → TINYINT)
+// and the Postgres writer (bit(1) → BOOLEAN) emit in a form their
+// target accepts. Anything that isn't a well-formed binary-digit
+// literal returns ok=false and the caller falls back to the verbatim
+// path (loud failure on the target beats a silent guess).
+func bitLiteralToDecimal(raw string) (string, bool) {
+	s := strings.TrimSpace(raw)
+	// Tolerate the parenthesised `(b'…')` form MySQL reports for the
+	// DEFAULT_GENERATED variant.
+	if len(s) >= 2 && s[0] == '(' && s[len(s)-1] == ')' {
+		s = strings.TrimSpace(s[1 : len(s)-1])
+	}
+	if len(s) < 3 || (s[0] != 'b' && s[0] != 'B') || s[1] != '\'' || s[len(s)-1] != '\'' {
+		return "", false
+	}
+	bits := s[2 : len(s)-1]
+	if bits == "" {
+		return "", false
+	}
+	var val uint64
+	for i := 0; i < len(bits); i++ {
+		switch bits[i] {
+		case '0':
+			val <<= 1
+		case '1':
+			val = val<<1 | 1
+		default:
+			return "", false
+		}
+		// 64-bit BIT is MySQL's maximum; anything wider is malformed
+		// source we won't try to translate.
+		if i >= 64 {
+			return "", false
+		}
+	}
+	return strconv.FormatUint(val, 10), true
 }
 
 // indexKindFrom maps MySQL's index_type string to an IR IndexKind.
