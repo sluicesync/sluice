@@ -21,6 +21,7 @@ package pipeline
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -285,6 +286,10 @@ type capturingCDCReader struct {
 	position ir.Position
 	captured chan struct{}
 	once     bool
+	// closed counts Close() calls. The reader-lifetime pin asserts
+	// the streamer Closes the CDC reader before Run returns — see
+	// TestStreamer_ClosesCDCReader_BeforeRunReturns.
+	closed atomic.Int32
 }
 
 func (r *capturingCDCReader) StreamChanges(_ context.Context, from ir.Position) (<-chan ir.Change, error) {
@@ -296,6 +301,88 @@ func (r *capturingCDCReader) StreamChanges(_ context.Context, from ir.Position) 
 	ch := make(chan ir.Change)
 	close(ch) // empty stream — apply loop returns immediately
 	return ch, nil
+}
+
+// Close makes capturingCDCReader an io.Closer so the streamer's
+// deterministic-teardown closure (warmResume's stop = closeIf(cdc))
+// can join it. Counting calls lets the pin assert Close fired —
+// and fired before Run returned.
+func (r *capturingCDCReader) Close() error {
+	r.closed.Add(1)
+	return nil
+}
+
+// TestStreamer_ClosesCDCReader_BeforeRunReturns is the regression pin
+// for the v0.68.2 cross-test DATA RACE. Root cause: warmResume/
+// coldStart spawned an engine-side streaming goroutine (real engine:
+// go-mysql BinlogSyncer) but discarded the closeable handle, relying
+// on "ctx cancel → pump exits → process-exit reclaim". The pump
+// exiting does NOT stop the syncer goroutine; only Close does. That
+// orphaned goroutine kept logging via slog.Default() and, when a
+// later test in the same binary swapped slog.Default() via
+// captureSlog, the go race detector flagged a write-vs-finished-read
+// on the global default logger across the test boundary.
+//
+// The fix gives warmResume/coldStart a `stop` closure (closeIf(cdc) /
+// stream.Close()) that runOnce defers — so the CDC reader is Closed,
+// and the engine-side goroutine joined, BEFORE Run returns and the
+// test that started it observes <-runErr. This pin asserts exactly
+// that ordering with a fake reader so it runs in the unit suite (no
+// Docker / -race needed to catch a regression that drops the defer).
+func TestStreamer_ClosesCDCReader_BeforeRunReturns(t *testing.T) {
+	cdcReader := &capturingCDCReader{captured: make(chan struct{})}
+	source := &resumeDispatchEngine{
+		name:      "mysql",
+		cdcReader: cdcReader,
+		caps:      ir.Capabilities{CDC: ir.CDCBinlog},
+	}
+	target := &resumeDispatchEngine{name: "mysql"}
+	applier := &resumeDispatchApplier{
+		stored: ir.Position{Engine: "mysql", Token: `{"mode":"gtid","gtid_set":"abc:1-1"}`},
+		found:  true, // drives the warmResume branch
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	s := &Streamer{
+		Source:    source,
+		Target:    target,
+		SourceDSN: "src",
+		TargetDSN: "tgt",
+		StreamID:  "test-stream",
+		Applier:   applier,
+	}
+	runErr := make(chan error, 1)
+	go func() { runErr <- s.Run(ctx) }()
+
+	select {
+	case <-cdcReader.captured:
+	case <-time.After(time.Second):
+		cancel()
+		<-runErr
+		t.Fatal("StreamChanges not called within 1s; warm-resume did not run")
+	}
+
+	// capturingCDCReader.StreamChanges returns an already-closed
+	// channel, so dispatchApply returns immediately and Run unwinds
+	// on its own; cancel() is a belt-and-suspenders no-op here. (In
+	// production the channel stays open until ctx-cancel, and stop
+	// fires on the same defer after cancel — the invariant asserted
+	// below is identical in both cases.)
+	cancel()
+	if err := <-runErr; err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run returned unexpected error: %v", err)
+	}
+
+	// The load-bearing assertion: by the time <-runErr unblocked, the
+	// CDC reader MUST already be Closed. If it isn't, runOnce dropped
+	// the stop defer and the real engine's syncer goroutine would be
+	// leaking past Run's return — the exact cross-test race shape.
+	if got := cdcReader.closed.Load(); got == 0 {
+		t.Fatal("CDC reader NOT Closed by the time Run returned — " +
+			"engine-side streaming goroutine would leak past Run (v0.68.2 cross-test slog race regression)")
+	}
 }
 
 // resumeDispatchApplier returns a fixed pre-stored position from

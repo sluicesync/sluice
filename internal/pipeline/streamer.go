@@ -1005,12 +1005,29 @@ func (s *Streamer) runOnce(ctx context.Context) error {
 	applyCtx, cancelApply := context.WithCancel(ctx)
 	defer cancelApply()
 
-	var changes <-chan ir.Change
+	var (
+		changes <-chan ir.Change
+		// stop closes the CDC reader / snapshot stream so the engine-
+		// side streaming goroutine (go-mysql BinlogSyncer, PG slot
+		// reader) is joined deterministically when runOnce returns.
+		// Cancelling streamCtx alone only unwinds the pump; the syncer
+		// goroutine would otherwise run to its reconnect budget after
+		// Run returned and leak into the next test, racing the global
+		// slog.Default() that captureSlog swaps (the -race FAIL this
+		// fixes). Always non-nil; defer is unconditional.
+		stop = func() {}
+	)
+	// The lambda is required, not gocritic's suggested `defer stop()`:
+	// stop is reassigned by coldStart/warmResume below, and a bare
+	// `defer stop()` would bind the no-op value captured here instead
+	// of the real teardown closure.
+	//nolint:gocritic // deferUnlambda: stop is reassigned after this defer; the closure is load-bearing
+	defer func() { stop() }()
 	switch {
 	case s.ResetTargetData:
-		changes, err = s.coldStart(streamCtx, lsnTracker, applier, streamID)
+		changes, stop, err = s.coldStart(streamCtx, lsnTracker, applier, streamID)
 	case found:
-		changes, err = s.warmResume(streamCtx, persisted, lsnTracker)
+		changes, stop, err = s.warmResume(streamCtx, persisted, lsnTracker)
 		// Slot-missing fall-through (ADR-0022) is suppressed when the
 		// position came from a manifest chain: the operator explicitly
 		// asked for "resume from this chain"; silently re-bulking would
@@ -1024,10 +1041,13 @@ func (s *Streamer) runOnce(ctx context.Context) error {
 				slog.String("source_engine", persisted.Engine),
 				slog.String("err", err.Error()),
 			)
-			changes, err = s.coldStart(streamCtx, lsnTracker, applier, streamID)
+			// warmResume failed; its stop is the no-op (it cleaned up
+			// its reader inline). coldStart's stop supersedes it.
+			stop()
+			changes, stop, err = s.coldStart(streamCtx, lsnTracker, applier, streamID)
 		}
 	default:
-		changes, err = s.coldStart(streamCtx, lsnTracker, applier, streamID)
+		changes, stop, err = s.coldStart(streamCtx, lsnTracker, applier, streamID)
 	}
 	if err != nil {
 		return err
@@ -1400,28 +1420,42 @@ func (s *Streamer) openApplier(ctx context.Context) (ir.ChangeApplier, bool, err
 // start; we don't re-read the schema or re-call EnsurePublication
 // here. Defence-in-depth lives in the applier's dispatch path
 // (skip-with-warning on unknown tables).
-func (s *Streamer) warmResume(ctx context.Context, persisted ir.Position, lsnTracker any) (<-chan ir.Change, error) {
+//
+// stop is a non-nil teardown closure the caller MUST defer. It closes
+// the CDC reader, which terminates the engine's binlog/replication
+// goroutine deterministically. Cancelling ctx alone only unwinds the
+// pump (the channel closes when the pump exits); it does NOT stop the
+// go-mysql BinlogSyncer goroutine spawned by StreamChanges. Without an
+// explicit Close that goroutine runs to its reconnect-retry budget
+// (~30s under a torn-down source) and keeps logging via slog.Default()
+// — which, when a later test in the same binary swaps slog.Default()
+// via captureSlog, surfaces a cross-test DATA RACE under `-race`. The
+// closure is always non-nil (no-op on error paths, which clean up
+// inline) so the caller can defer it unconditionally.
+func (s *Streamer) warmResume(ctx context.Context, persisted ir.Position, lsnTracker any) (changes <-chan ir.Change, stop func(), err error) {
+	stop = func() {}
 	slog.InfoContext(ctx, "warm resume from persisted position",
 		slog.String("position_token", persisted.Token),
 	)
 	cdc, err := openCDCReaderWithOptionalSlot(ctx, s.Source, s.SourceDSN, s.SlotName)
 	if err != nil {
-		return nil, wrapWithHint(PhaseCDC, fmt.Errorf("pipeline: open cdc reader: %w", err))
+		return nil, stop, wrapWithHint(PhaseCDC, fmt.Errorf("pipeline: open cdc reader: %w", err))
 	}
 	if lsnTracker != nil {
 		if attacher, ok := cdc.(lsnTrackerAttacher); ok {
 			attacher.AttachLSNTracker(lsnTracker)
 		}
 	}
-	// CDC reader's Close is async (cancellation-driven), but we
-	// don't have a clean handle to call it from here. Streamer.Run's
-	// returning will cancel ctx; the pump exits and closes the
-	// channel.
-	changes, err := cdc.StreamChanges(ctx, persisted)
+	changes, err = cdc.StreamChanges(ctx, persisted)
 	if err != nil {
 		closeIf(cdc)
-		return nil, wrapWithHint(PhaseCDC, fmt.Errorf("pipeline: start cdc: %w", err))
+		return nil, stop, wrapWithHint(PhaseCDC, fmt.Errorf("pipeline: start cdc: %w", err))
 	}
+	// Hand the caller a closure that closes the CDC reader. The reader's
+	// Close cancels its pump AND closes the underlying syncer/slot, so
+	// the engine-side streaming goroutine is joined deterministically
+	// rather than left to run out its reconnect budget after ctx cancel.
+	stop = func() { closeIf(cdc) }
 	// GitHub issue #19: capture the reader's Err method so runOnce
 	// can surface a pump error (transient `read: connection reset`
 	// etc.) into the ADR-0038 retry loop after the changes channel
@@ -1430,7 +1464,7 @@ func (s *Streamer) warmResume(ctx context.Context, persisted ir.Position, lsnTra
 	if errer, ok := cdc.(interface{ Err() error }); ok {
 		s.sourceErrFn = errer.Err
 	}
-	return changes, nil
+	return changes, stop, nil
 }
 
 // coldStart performs the original §4 flow: read schema → ensure
@@ -1448,14 +1482,22 @@ func (s *Streamer) warmResume(ctx context.Context, persisted ir.Position, lsnTra
 // tables are dropped via [ir.TableDropper] before the bulk-copy phase
 // begins. Both surfaces are optional; an engine that doesn't expose
 // them surfaces a clear refusal rather than running a partial reset.
-func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.ChangeApplier, streamID string) (<-chan ir.Change, error) {
+//
+// stop mirrors [warmResume]'s teardown contract: a non-nil closure the
+// caller MUST defer. It closes the snapshot stream, whose CloseFn
+// closes the CDC reader and thus terminates the engine's binlog/
+// replication goroutine deterministically. See warmResume's doc for
+// why ctx cancellation alone leaks that goroutine into the next test
+// (cross-test slog.Default() DATA RACE under `-race`).
+func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.ChangeApplier, streamID string) (changes <-chan ir.Change, stop func(), err error) {
+	stop = func() {}
 	sr, err := s.Source.OpenSchemaReader(ctx, s.SourceDSN)
 	if err != nil {
-		return nil, wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: open source schema reader: %w", err))
+		return nil, stop, wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: open source schema reader: %w", err))
 	}
 	if err := applyEnabledPGExtensions(ctx, sr, s.EnabledPGExtensions); err != nil {
 		closeIf(sr)
-		return nil, wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: enable PG extensions on source: %w", err))
+		return nil, stop, wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: enable PG extensions on source: %w", err))
 	}
 	// ADR-0047 tier (b): live PG → PG sync may carry uncatalogued
 	// extension types verbatim. Engine-name-only determination.
@@ -1463,17 +1505,17 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 	schema, err := sr.ReadSchema(ctx)
 	closeIf(sr)
 	if err != nil {
-		return nil, wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: read source schema: %w", err))
+		return nil, stop, wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: read source schema: %w", err))
 	}
 	if len(schema.Tables) == 0 {
 		slog.InfoContext(ctx, "source schema has no tables; nothing to stream")
-		return nil, nil
+		return nil, stop, nil
 	}
 
 	// Prune by table filter before mappings + bulk-copy so the
 	// excluded tables never reach the target schema-apply phase.
 	if err := applyTableFilter(ctx, schema, s.Filter); err != nil {
-		return nil, err
+		return nil, stop, err
 	}
 	applyViewFilter(ctx, schema, s.ViewFilter, s.SkipViews)
 
@@ -1487,7 +1529,7 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 	if pe, ok := s.Source.(publicationEnsurer); ok {
 		tables := tableNamesForPublication(schema)
 		if err := pe.EnsurePublication(ctx, s.SourceDSN, tables); err != nil {
-			return nil, wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: ensure publication scope: %w", err))
+			return nil, stop, wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: ensure publication scope: %w", err))
 		}
 	}
 
@@ -1496,11 +1538,11 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 	// target schema is already shaped from the cold-start run.
 	schema, err = translate.ApplyMappings(schema, s.Mappings)
 	if err != nil {
-		return nil, fmt.Errorf("pipeline: apply mappings: %w", err)
+		return nil, stop, fmt.Errorf("pipeline: apply mappings: %w", err)
 	}
 	schema, err = translate.ApplyExpressionOverrides(schema, s.ExpressionMappings)
 	if err != nil {
-		return nil, fmt.Errorf("pipeline: apply expression overrides: %w", err)
+		return nil, stop, fmt.Errorf("pipeline: apply expression overrides: %w", err)
 	}
 
 	// Redaction-type pre-flight (Bug 60, v0.58.1): catch
@@ -1509,16 +1551,17 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 	// `--type-override=col=text` workaround short-circuits the
 	// refusal.
 	if err := preflightRedactTypes(s.Redactor, schema); err != nil {
-		return nil, wrapWithHint(PhaseConnect, err)
+		return nil, stop, wrapWithHint(PhaseConnect, err)
 	}
 
 	stream, err := openSnapshotStreamWithOptionalSlot(ctx, s.Source, s.SourceDSN, s.SlotName)
 	if err != nil {
-		return nil, wrapWithHint(PhaseSnapshot, fmt.Errorf("pipeline: open snapshot stream: %w", err))
+		return nil, stop, wrapWithHint(PhaseSnapshot, fmt.Errorf("pipeline: open snapshot stream: %w", err))
 	}
-	// stream.Close is deferred by the caller indirectly via
-	// Streamer.Run's defer chain — we keep the handle alive past
-	// this function so the snapshot+CDC pair stays valid.
+	// The snapshot+CDC handle stays alive past this function; the
+	// returned stop closure (set on the success path below) closes it
+	// so the engine-side streaming goroutine is joined deterministically
+	// when Streamer.Run unwinds.
 	slog.InfoContext(ctx, "cold start; snapshot captured",
 		slog.String("position_token", stream.Position.Token),
 	)
@@ -1526,19 +1569,19 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 	sw, err := s.Target.OpenSchemaWriter(ctx, s.TargetDSN)
 	if err != nil {
 		_ = stream.Close()
-		return nil, wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: open target schema writer: %w", err))
+		return nil, stop, wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: open target schema writer: %w", err))
 	}
 	applyTargetSchema(sw, s.TargetSchema)
 	if err := applyEnabledPGExtensions(ctx, sw, s.EnabledPGExtensions); err != nil {
 		closeIf(sw)
 		_ = stream.Close()
-		return nil, wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: enable PG extensions on target: %w", err))
+		return nil, stop, wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: enable PG extensions on target: %w", err))
 	}
 	rw, err := s.Target.OpenRowWriter(ctx, s.TargetDSN)
 	if err != nil {
 		closeIf(sw)
 		_ = stream.Close()
-		return nil, wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: open target row writer: %w", err))
+		return nil, stop, wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: open target row writer: %w", err))
 	}
 	applyTargetSchema(rw, s.TargetSchema)
 	applyMaxBufferBytes(rw, s.MaxBufferBytes)
@@ -1549,7 +1592,7 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 			closeIf(rw)
 			closeIf(sw)
 			_ = stream.Close()
-			return nil, err
+			return nil, stop, err
 		}
 	case s.SchemaAlreadyApplied:
 		// GitHub issue #17: operator promises every source table
@@ -1573,7 +1616,7 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 			closeIf(rw)
 			closeIf(sw)
 			_ = stream.Close()
-			return nil, err
+			return nil, stop, err
 		}
 	}
 
@@ -1585,7 +1628,7 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 		closeIf(rw)
 		closeIf(sw)
 		_ = stream.Close()
-		return nil, err
+		return nil, stop, err
 	}
 	closeIf(rw)
 	closeIf(sw)
@@ -1627,7 +1670,7 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 	if pw, ok := applier.(ir.PositionWriter); ok {
 		if err := pw.WritePosition(ctx, streamID, stream.Position); err != nil {
 			_ = stream.Close()
-			return nil, wrapWithHint(PhaseCDC, fmt.Errorf("pipeline: persist cold-start CDC anchor position: %w", err))
+			return nil, stop, wrapWithHint(PhaseCDC, fmt.Errorf("pipeline: persist cold-start CDC anchor position: %w", err))
 		}
 		slog.DebugContext(ctx, "cold-start CDC anchor persisted",
 			slog.String("stream_id", streamID),
@@ -1649,11 +1692,18 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 		}
 	}
 
-	changes, err := stream.Changes.StreamChanges(ctx, stream.Position)
+	changes, err = stream.Changes.StreamChanges(ctx, stream.Position)
 	if err != nil {
 		_ = stream.Close()
-		return nil, wrapWithHint(PhaseCDC, fmt.Errorf("pipeline: start cdc: %w", err))
+		return nil, stop, wrapWithHint(PhaseCDC, fmt.Errorf("pipeline: start cdc: %w", err))
 	}
+	// Close the snapshot stream when Streamer.Run unwinds. stream.Close
+	// runs the engine CloseFn, which closes the CDC reader and joins the
+	// engine-side streaming goroutine (go-mysql BinlogSyncer / PG slot
+	// reader). Relying on ctx cancel alone left that goroutine running
+	// to its reconnect budget after Run returned — a cross-test leak
+	// that raced slog.Default() under `-race`.
+	stop = func() { _ = stream.Close() }
 	// GitHub issue #19: capture the reader's Err method so runOnce
 	// can surface a pump error into the ADR-0038 retry loop after the
 	// changes channel closes. See [warmResume] for the rationale —
@@ -1661,12 +1711,11 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 	if errer, ok := stream.Changes.(interface{ Err() error }); ok {
 		s.sourceErrFn = errer.Err
 	}
-	// stream stays alive for the rest of Run; cleanup happens via
-	// the function's defer chain when ctx cancels and pump exits.
-	// We don't have a clean way to defer here while returning the
-	// channel; the OS reclaims connections at process exit, and ctx
-	// cancellation tears down the goroutines that hold them.
-	return changes, nil
+	// stream stays alive for the rest of Run; the returned stop closure
+	// closes it when Run unwinds, joining the engine-side streaming
+	// goroutine deterministically (no longer left to process-exit
+	// reclaim — see the stop assignment above).
+	return changes, stop, nil
 }
 
 // tableNamesForPublication returns the bare table names from a

@@ -18,6 +18,7 @@ project follows [Semantic Versioning](https://semver.org/).
 ### Fixed
 
 - Bug #11 (above). A parallel copy of the same divergence in the `schema preview` note renderer was fixed too, so preview DDL and its inline notes agree.
+- **Deterministic CDC-reader teardown (test-harness goroutine leak surfaced by the battle-test's CI `-race` run).** `Streamer.coldStart`/`warmResume` now return a `stop func()` teardown closure that `runOnce` defers, so the MySQL CDC reader's engine-side syncer goroutine is `Close()`d and joined **before `Streamer.Run` returns**, instead of being left to run out its reconnect budget until process exit. This was a test-only race (a leaked go-mysql syncer goroutine logging via `slog.Default()` while a *later* test's `captureSlog` swapped `slog.SetDefault` — production never re-swaps the default logger mid-stream), but the fix is a genuine production-robustness improvement: stream teardown is now deterministic rather than leaked-until-exit. Pinned by `TestStreamer_ClosesCDCReader_BeforeRunReturns` (unit, all-OS, deterministic).
 
 ### Compatibility
 
