@@ -79,6 +79,25 @@ func TestMigrate_PostgresToMySQL_ArrayColumnBulkCopy(t *testing.T) {
 		TargetDSN: mysqlTarget,
 	}
 
+	// Force the LOAD DATA path. MySQL 8 defaults local_infile=OFF, so
+	// the writer silently falls back to batched INSERT — the path the
+	// original Bug 18 report did NOT hit. The reported `unsupported
+	// value type []interface {}` crash AND the post-value-fix `Error
+	// 3144 ... CHARACTER SET 'binary'` rejection are both
+	// LOAD-DATA-specific (the CHARACTER SET binary + SET-clause form),
+	// so this pin MUST exercise LOAD DATA, not the fallback, or it
+	// re-greens while the default high-throughput path stays broken.
+	func() {
+		sdb, err := sql.Open("mysql", mysqlTarget)
+		if err != nil {
+			t.Fatalf("open target to enable local_infile: %v", err)
+		}
+		defer func() { _ = sdb.Close() }()
+		if _, err := sdb.Exec("SET GLOBAL local_infile = 1"); err != nil {
+			t.Fatalf("SET GLOBAL local_infile: %v", err)
+		}
+	}()
+
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	if err := mig.Run(ctx); err != nil {

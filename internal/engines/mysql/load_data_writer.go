@@ -177,7 +177,17 @@ func buildLoadDataStmt(schema, tableName string, cols []*ir.Column, readerName s
 // conversion handles VARCHAR/TEXT (binary→utf8mb4 reinterpretation),
 // numerics (string parse), and binary types (passthrough).
 func columnSetExpr(col *ir.Column, varName string) string {
-	if _, isJSON := col.Type.(ir.JSON); isJSON {
+	// ir.JSON and ir.Array both emit a MySQL `JSON` column
+	// (emitColumnType maps ir.Array → JSON; the IR keeps the source
+	// type ir.Array). Under `CHARACTER SET binary` MySQL's JSON
+	// validator rejects un-retagged bytes with Error 3144 ("Cannot
+	// create a JSON value from a string with CHARACTER SET 'binary'"),
+	// so both need the utf8mb4 CONVERT wrapper — the LOAD DATA half of
+	// the value-side ir.Array→JSON fix in prepareValue (Bug 18). The
+	// serializer already emits valid UTF-8 JSON text for an array
+	// value; this is only a charset re-tag.
+	switch col.Type.(type) {
+	case ir.JSON, ir.Array:
 		return "CONVERT(" + varName + " USING utf8mb4)"
 	}
 	// Text-like columns: re-tag the binary stream as utf8mb4 so
