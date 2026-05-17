@@ -51,6 +51,17 @@ func emitColumnType(t ir.Type) (string, error) {
 	case ir.Char:
 		return emitCharType("CHAR", v.Length, v.Charset, v.Collation), nil
 	case ir.Varchar:
+		// A bounded VARCHAR(N) wider than MySQL can represent
+		// (utf8mb4's ~16383-char creatable cap, and the 65535-byte
+		// InnoDB row budget a wide VARCHAR exhausts) is down-mapped to
+		// the smallest TEXT tier that still holds N characters —
+		// mirroring the unbounded PG `text` → LONGTEXT policy. Without
+		// this, PG `varchar(16384)` hit a raw MySQL Error 1074 /
+		// `varchar(16383)` Error 1118 at create-tables (catalog
+		// Bug 72). Narrow VARCHARs (the common case) are unchanged.
+		if size, downmap := mysqlTextTierForWideVarchar(v.Length); downmap {
+			return emitTextType(size, v.Charset, v.Collation), nil
+		}
 		return emitCharType("VARCHAR", v.Length, v.Charset, v.Collation), nil
 	case ir.Text:
 		return emitTextType(v.Size, v.Charset, v.Collation), nil
@@ -189,6 +200,53 @@ func emitIntegerType(i ir.Integer) string {
 		sb.WriteString(" AUTO_INCREMENT")
 	}
 	return sb.String()
+}
+
+// MySQL VARCHAR / row-size limits that drive the wide-varchar
+// down-map (catalog Bug 72). All MySQL-documented:
+//
+//   - InnoDB's hard 65535-byte per-row limit. A utf8mb4
+//     VARCHAR(16383) alone is 65532 bytes, so any non-trivial row
+//     containing one overflows (Error 1118) — which is why the inline
+//     cap below sits under the 16383 char limit, not at it.
+//   - mysqlVarcharBytesPerChar: utf8mb4's worst-case bytes/char (4).
+//     sluice's default target charset is utf8mb4, so a VARCHAR(N) can
+//     need up to 4N bytes; MySQL refuses CREATE above ~16383 chars
+//     with Error 1074.
+//   - mysqlMaxInlineVarcharChars: the largest VARCHAR length sluice
+//     keeps as VARCHAR. Set below the 16383 hard cap so the column
+//     leaves room for a primary key / other columns in the 65535-byte
+//     row (the Bug-72 repro is `(id int, v varchar(N))` — a bare
+//     varchar(16383) trips the row limit). Anything wider is faithful-
+//     down-mapped to a TEXT tier sized to hold N characters.
+const (
+	mysqlVarcharBytesPerChar   = 4
+	mysqlMaxInlineVarcharChars = 16000
+
+	mysqlTextMaxBytes     = 65535
+	mysqlMediumTextMaxLen = 16777215
+)
+
+// mysqlTextTierForWideVarchar reports whether a VARCHAR(length) must
+// be down-mapped to a TEXT family type to be representable on MySQL,
+// and if so which tier. The tier is sized by the column's worst-case
+// byte width (length × utf8mb4 bytes/char) so the migrated column
+// never holds fewer characters than the source declared — faithful,
+// not merely "fits". Returns (_, false) for lengths sluice keeps as
+// VARCHAR (the common, narrow case).
+func mysqlTextTierForWideVarchar(length int) (ir.TextSize, bool) {
+	if length <= mysqlMaxInlineVarcharChars {
+		return 0, false
+	}
+	worstCaseBytes := length * mysqlVarcharBytesPerChar
+	switch {
+	case worstCaseBytes <= mysqlTextMaxBytes:
+		return ir.TextRegular, true
+	case worstCaseBytes <= mysqlMediumTextMaxLen:
+		return ir.TextMedium, true
+	default:
+		return ir.TextLong, true
+	}
 }
 
 // emitCharType returns CHAR(N)/VARCHAR(N) plus optional charset/collation.

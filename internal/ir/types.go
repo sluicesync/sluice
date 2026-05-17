@@ -300,15 +300,26 @@ func (Date) isType()        {}
 func (Date) Tier() Tier     { return TierCore }
 func (Date) String() string { return "Date" }
 
-// Time is a time-of-day with sub-second precision.
+// Time is a time-of-day with sub-second precision. WithTimeZone
+// distinguishes Postgres `timetz` (`time with time zone`) from plain
+// `time`, mirroring [Timestamp.WithTimeZone]. The two PG wire types
+// have distinct OIDs (1266 vs 1083) and the tz-bearing form cannot be
+// encoded into the tz-less one — collapsing them mis-mapped timetz to
+// time and hard-failed the COPY writer (catalog Bug 71).
 type Time struct {
-	Precision int
+	Precision    int
+	WithTimeZone bool
 }
 
 func (Time) isType()    {}
 func (Time) Tier() Tier { return TierCore }
 
-func (t Time) String() string { return fmt.Sprintf("Time(%d)", t.Precision) }
+func (t Time) String() string {
+	if t.WithTimeZone {
+		return fmt.Sprintf("TimeTZ(%d)", t.Precision)
+	}
+	return fmt.Sprintf("Time(%d)", t.Precision)
+}
 
 // DateTime is a calendar date plus time-of-day, without a timezone.
 type DateTime struct {

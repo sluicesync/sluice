@@ -140,6 +140,20 @@ func TestPrepareValuePassthrough(t *testing.T) {
 	}
 }
 
+func ptr[T any](v T) *T { return &v }
+
+func dim(n int) pgtype.ArrayDimension {
+	return pgtype.ArrayDimension{Length: int32(n), LowerBound: 1}
+}
+
+// TestPrepareValueArrayConversion pins the pgtype.Array[*T] shape
+// convertArray hands pgx (catalog Bug 70). Pointer leaf elements let a
+// nil slot survive as a SQL NULL element; the explicit Dims +
+// row-major-flattened Elements is the only shape that round-trips
+// multi-dimensional arrays through pgx (a nested Go slice gets
+// flattened by pgx's plain-slice wrapper before the multi-dim wrapper
+// runs). pgx encodes []*T and []T identically, so the 1-D cross-engine
+// wire result is unchanged.
 func TestPrepareValueArrayConversion(t *testing.T) {
 	cases := []struct {
 		name string
@@ -148,28 +162,78 @@ func TestPrepareValueArrayConversion(t *testing.T) {
 		want any
 	}{
 		{
-			"int array → []int64",
+			"int array",
 			[]any{int64(1), int64(2), int64(3)},
 			ir.Integer{Width: 32},
-			[]int64{1, 2, 3},
+			pgtype.Array[*int64]{Elements: []*int64{ptr(int64(1)), ptr(int64(2)), ptr(int64(3))}, Dims: []pgtype.ArrayDimension{dim(3)}, Valid: true},
 		},
 		{
-			"text array → []string",
+			"text array",
 			[]any{"a", "b"},
 			ir.Text{Size: ir.TextLong},
-			[]string{"a", "b"},
+			pgtype.Array[*string]{Elements: []*string{ptr("a"), ptr("b")}, Dims: []pgtype.ArrayDimension{dim(2)}, Valid: true},
 		},
 		{
-			"bool array → []bool",
+			"bool array",
 			[]any{true, false, true},
 			ir.Boolean{},
-			[]bool{true, false, true},
+			pgtype.Array[*bool]{Elements: []*bool{ptr(true), ptr(false), ptr(true)}, Dims: []pgtype.ArrayDimension{dim(3)}, Valid: true},
 		},
 		{
-			"uuid array → []string",
+			"uuid array",
 			[]any{"00000000-0000-0000-0000-000000000001"},
 			ir.UUID{},
-			[]string{"00000000-0000-0000-0000-000000000001"},
+			pgtype.Array[*string]{Elements: []*string{ptr("00000000-0000-0000-0000-000000000001")}, Dims: []pgtype.ArrayDimension{dim(1)}, Valid: true},
+		},
+		// Bug 70: a NULL element inside a typed array. The nil slot
+		// must survive as a typed nil pointer (SQL NULL), not abort
+		// with "expected int64, got <nil>".
+		{
+			"int array with NULL element",
+			[]any{int64(1), nil, int64(3)},
+			ir.Integer{Width: 32},
+			pgtype.Array[*int64]{Elements: []*int64{ptr(int64(1)), nil, ptr(int64(3))}, Dims: []pgtype.ArrayDimension{dim(3)}, Valid: true},
+		},
+		{
+			"text array with NULL element",
+			[]any{"x", nil, "z"},
+			ir.Text{Size: ir.TextLong},
+			pgtype.Array[*string]{Elements: []*string{ptr("x"), nil, ptr("z")}, Dims: []pgtype.ArrayDimension{dim(3)}, Valid: true},
+		},
+		{
+			"numeric[] (string) with NULL element",
+			[]any{"1.5", nil, "3.5"},
+			ir.Decimal{},
+			pgtype.Array[*string]{Elements: []*string{ptr("1.5"), nil, ptr("3.5")}, Dims: []pgtype.ArrayDimension{dim(3)}, Valid: true},
+		},
+		// Bug 70: a multi-dimensional array. Elements is row-major
+		// flattened and Dims carries the 2-D shape so pgx emits
+		// {{1,2},{3,4}} not the flattened {1,2,3,4}.
+		{
+			"int[][] multi-dim",
+			[]any{[]any{int64(1), int64(2)}, []any{int64(3), int64(4)}},
+			ir.Integer{Width: 32},
+			pgtype.Array[*int64]{
+				Elements: []*int64{ptr(int64(1)), ptr(int64(2)), ptr(int64(3)), ptr(int64(4))},
+				Dims:     []pgtype.ArrayDimension{dim(2), dim(2)},
+				Valid:    true,
+			},
+		},
+		{
+			"int[][] multi-dim with NULL element",
+			[]any{[]any{int64(1), nil}, []any{nil, int64(4)}},
+			ir.Integer{Width: 32},
+			pgtype.Array[*int64]{
+				Elements: []*int64{ptr(int64(1)), nil, nil, ptr(int64(4))},
+				Dims:     []pgtype.ArrayDimension{dim(2), dim(2)},
+				Valid:    true,
+			},
+		},
+		{
+			"empty array",
+			[]any{},
+			ir.Integer{Width: 32},
+			pgtype.Array[*int64]{Elements: []*int64{}, Dims: []pgtype.ArrayDimension{dim(0)}, Valid: true},
 		},
 	}
 	for _, c := range cases {

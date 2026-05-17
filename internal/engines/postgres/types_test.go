@@ -69,6 +69,9 @@ func TestTranslateType(t *testing.T) {
 		// ---- Temporal ----
 		{"date", columnMeta{DataType: "date"}, ir.Date{}},
 		{"time", columnMeta{DataType: "time without time zone", DTPrec: int64Val(6)}, ir.Time{Precision: 6}},
+		// Bug 71: timetz must map distinctly from plain time, not
+		// collapse to ir.Time{} (OID 1083) and hard-fail the COPY writer.
+		{"timetz", columnMeta{DataType: "time with time zone", DTPrec: int64Val(6)}, ir.Time{Precision: 6, WithTimeZone: true}},
 		{"timestamp", columnMeta{DataType: "timestamp without time zone", DTPrec: int64Val(3)}, ir.DateTime{Precision: 3}},
 		{"timestamptz", columnMeta{DataType: "timestamp with time zone", DTPrec: int64Val(6)}, ir.Timestamp{Precision: 6, WithTimeZone: true}},
 

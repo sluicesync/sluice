@@ -37,6 +37,22 @@ func TestEmitColumnType(t *testing.T) {
 			ir.Varchar{Length: 255, Charset: "utf8mb4", Collation: "utf8mb4_unicode_ci"},
 			"VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci",
 		},
+		// Bug 72: a wide bounded varchar exceeds MySQL's utf8mb4
+		// VARCHAR cap (Error 1074) / 65535-byte row limit (Error
+		// 1118). Down-map to the smallest TEXT tier that holds N
+		// chars (worst-case N*4 bytes), mirroring text->LONGTEXT.
+		// Narrow varchars are unchanged.
+		{"varchar 255 unchanged", ir.Varchar{Length: 255}, "VARCHAR(255)"},
+		{"varchar 16000 unchanged (boundary)", ir.Varchar{Length: 16000}, "VARCHAR(16000)"},
+		{"varchar 16383 -> TEXT", ir.Varchar{Length: 16383}, "TEXT"},
+		{"varchar 16384 -> MEDIUMTEXT", ir.Varchar{Length: 16384}, "MEDIUMTEXT"},
+		{"varchar 65535 -> MEDIUMTEXT", ir.Varchar{Length: 65535}, "MEDIUMTEXT"},
+		{"varchar 70000 -> MEDIUMTEXT", ir.Varchar{Length: 70000}, "MEDIUMTEXT"},
+		{
+			"wide varchar keeps charset/collation",
+			ir.Varchar{Length: 20000, Charset: "utf8mb4", Collation: "utf8mb4_unicode_ci"},
+			"MEDIUMTEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci",
+		},
 		{"text tiny", ir.Text{Size: ir.TextTiny}, "TINYTEXT"},
 		{"text regular", ir.Text{Size: ir.TextRegular}, "TEXT"},
 		{"text medium", ir.Text{Size: ir.TextMedium}, "MEDIUMTEXT"},

@@ -84,6 +84,16 @@ func retargetPGtoMySQL(t ir.Type) ir.Type {
 		return ir.Varchar{Length: 45}
 	case ir.Macaddr:
 		return ir.Varchar{Length: 30}
+	case ir.Varchar:
+		// Bug 72: a wide bounded varchar(N) is down-mapped to a MySQL
+		// TEXT tier by the engine emitter (mysql/ddl_emit.go). Mirror
+		// it here so `sluice schema diff` against a MySQL target sees
+		// the same translated shape the migrate path lands on. Narrow
+		// varchars pass through unchanged (nil → no rewrite).
+		if size, downmap := mysqlTextTierForWideVarcharIR(v.Length); downmap {
+			return ir.Text{Size: size, Charset: v.Charset, Collation: v.Collation}
+		}
+		return nil
 	case ir.Array:
 		return ir.JSON{Binary: true}
 	case ir.ExtensionType:

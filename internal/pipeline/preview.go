@@ -132,6 +132,11 @@ type PreviewJSON struct {
 	// non-PG→MySQL pairs and when no unconstrained-numeric column is
 	// present. Advisory only — sluice does not refuse.
 	UnconstrainedNumericWidenings []PreviewJSONUnconstrainedNumeric `json:"unconstrained_numeric_widenings,omitempty"`
+	// WideVarcharDownmaps is the Bug 72 wide PG `varchar(N)` → MySQL
+	// TEXT-tier down-map advisory list. Omitted for non-PG→MySQL pairs
+	// and when no wide-varchar column is present. Advisory only —
+	// sluice does not refuse.
+	WideVarcharDownmaps []PreviewJSONWideVarchar `json:"wide_varchar_downmaps,omitempty"`
 }
 
 // PreviewJSONUnsignedBigint is one MySQL `bigint unsigned` → PG
@@ -147,6 +152,14 @@ type PreviewJSONUnsignedBigint struct {
 type PreviewJSONUnconstrainedNumeric struct {
 	Table  string `json:"table"`
 	Column string `json:"column"`
+}
+
+// PreviewJSONWideVarchar is one wide PG `varchar(N)` → MySQL TEXT-tier
+// down-map. Stable shape for tooling consumers.
+type PreviewJSONWideVarchar struct {
+	Table  string `json:"table"`
+	Column string `json:"column"`
+	Length int    `json:"length"`
 }
 
 // PreviewJSONTranslatorGap is one detected MySQL → PG translator
@@ -338,6 +351,16 @@ func (p *Previewer) Run(ctx context.Context) error {
 		tgtSchema, p.Source.Name(), p.Target.Name(),
 	)
 
+	// ---- 3.8. Wide-varchar down-map notice (Bug 72) ----
+	// Advisory — NOT a refusal (wide free-text columns are common and
+	// must still migrate). Scanned on the post-override schema so an
+	// operator's `--type-override` escape hatch suppresses the notice
+	// for that column. Rendered in a dedicated preview section so it's
+	// loud and visible, matching the wording `migrate` preflight logs.
+	wideVarcharNotices := translate.ScanWideVarcharNotices(
+		tgtSchema, p.Source.Name(), p.Target.Name(),
+	)
+
 	// ---- 4. Open the target schema writer; type-assert for preview. ----
 	sw, err := p.Target.OpenSchemaWriter(ctx, p.TargetDSN)
 	if err != nil {
@@ -383,6 +406,7 @@ func (p *Previewer) Run(ctx context.Context) error {
 		),
 		unsignedBigintNotices:       unsignedBigintNotices,
 		unconstrainedNumericNotices: unconstrainedNumericNotices,
+		wideVarcharNotices:          wideVarcharNotices,
 		redactor:                    p.Redactor,
 	}
 
@@ -431,7 +455,11 @@ type previewBundle struct {
 	// for non-PG→MySQL pairs or when no unconstrained-numeric column is
 	// present).
 	unconstrainedNumericNotices []translate.UnconstrainedNumericNotice
-	redactor                    *redact.Registry // PII Phase 1.5 (v0.55.0) — nil/empty disables annotation
+	// wideVarcharNotices is the Bug 72 wide PG `varchar(N)` → MySQL
+	// TEXT-tier down-map advisory list (nil for non-PG→MySQL pairs or
+	// when no wide-varchar column is present).
+	wideVarcharNotices []translate.WideVarcharNotice
+	redactor           *redact.Registry // PII Phase 1.5 (v0.55.0) — nil/empty disables annotation
 }
 
 // enabledExtensionSet converts the operator's `--enable-pg-extension`
@@ -608,6 +636,9 @@ func renderPreviewText(w io.Writer, bundle previewBundle) error {
 	if n := len(bundle.unconstrainedNumericNotices); n > 0 {
 		fmt.Fprintf(&sb, "-- unconstrained-numeric widenings: %d (see section below)\n", n)
 	}
+	if n := len(bundle.wideVarcharNotices); n > 0 {
+		fmt.Fprintf(&sb, "-- wide-varchar down-maps: %d (see section below)\n", n)
+	}
 	sb.WriteByte('\n')
 
 	if len(bundle.translatorGaps) > 0 {
@@ -620,6 +651,10 @@ func renderPreviewText(w io.Writer, bundle previewBundle) error {
 
 	if len(bundle.unconstrainedNumericNotices) > 0 {
 		writeUnconstrainedNumericSection(&sb, bundle.unconstrainedNumericNotices)
+	}
+
+	if len(bundle.wideVarcharNotices) > 0 {
+		writeWideVarcharSection(&sb, bundle.wideVarcharNotices)
 	}
 
 	for _, t := range bundle.tables {
@@ -719,6 +754,31 @@ func writeUnconstrainedNumericSection(sb *strings.Builder, notices []translate.U
 	sb.WriteString("--\n")
 	for _, n := range notices {
 		fmt.Fprintf(sb, "-- %s.%s: numeric (unconstrained) -> DECIMAL(65,30)\n", n.Table, n.Column)
+	}
+	sb.WriteByte('\n')
+}
+
+// writeWideVarcharSection appends the Bug 72 wide PG `varchar(N)` →
+// MySQL TEXT-tier down-map advisory block to sb. NOTICE, not a refusal
+// — `schema preview` still exits 0 and `migrate` still proceeds. It is
+// rendered loudly (its own section, same shape as the unconstrained-
+// numeric block) so the deliberate type swap is never silent. Wording
+// mirrors what `migrate` preflight logs at WARN.
+func writeWideVarcharSection(sb *strings.Builder, notices []translate.WideVarcharNotice) {
+	sb.WriteString("-- ============================================================\n")
+	sb.WriteString("-- Wide-varchar down-map (Postgres -> MySQL)\n")
+	sb.WriteString("-- ============================================================\n")
+	sb.WriteString("-- A wide bounded PostgreSQL `varchar(N)` is down-mapped to a\n")
+	sb.WriteString("-- MySQL TEXT-family type: MySQL cannot represent a VARCHAR this\n")
+	sb.WriteString("-- wide (utf8mb4's ~16383-char creatable cap, and the 65535-byte\n")
+	sb.WriteString("-- InnoDB row limit). The TEXT tier is sized so the column never\n")
+	sb.WriteString("-- holds fewer characters than the source declared (mirrors the\n")
+	sb.WriteString("-- unbounded `text` -> LONGTEXT policy). This is advisory; the\n")
+	sb.WriteString("-- migration proceeds. Override a column that needs a specific\n")
+	sb.WriteString("-- MySQL storage shape with `--type-override TABLE.COL=...`.\n")
+	sb.WriteString("--\n")
+	for _, n := range notices {
+		fmt.Fprintf(sb, "-- %s.%s: varchar(%d) -> TEXT family\n", n.Table, n.Column, n.Length)
 	}
 	sb.WriteByte('\n')
 }
@@ -981,6 +1041,13 @@ func renderPreviewJSON(w io.Writer, bundle previewBundle) error {
 		out.UnconstrainedNumericWidenings = append(out.UnconstrainedNumericWidenings, PreviewJSONUnconstrainedNumeric{
 			Table:  n.Table,
 			Column: n.Column,
+		})
+	}
+	for _, n := range bundle.wideVarcharNotices {
+		out.WideVarcharDownmaps = append(out.WideVarcharDownmaps, PreviewJSONWideVarchar{
+			Table:  n.Table,
+			Column: n.Column,
+			Length: n.Length,
 		})
 	}
 	enc := json.NewEncoder(w)

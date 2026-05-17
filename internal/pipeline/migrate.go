@@ -452,6 +452,22 @@ func (m *Migrator) Run(ctx context.Context) error {
 		); noticeErr != nil {
 			slog.WarnContext(ctx, noticeErr.Error())
 		}
+
+		// ---- 1.69. Wide-varchar down-map notice (Bug 72) ----
+		// A wide bounded PG `varchar(N)` (over MySQL's ~16383-char
+		// utf8mb4 VARCHAR cap / 65535-byte row budget) is down-mapped
+		// to a MySQL TEXT tier sized to hold N chars — mirroring the
+		// unbounded `text` → LONGTEXT policy. The pre-fix behaviour
+		// emitted VARCHAR(N) literally and died with a raw MySQL
+		// Error 1074 / 1118 at create-tables. NOTICE, not a refusal —
+		// wide free-text columns are common and must still migrate.
+		// PG → PG is unaffected (varchar round-trips unchanged); the
+		// scan short-circuits non-MySQL targets.
+		if noticeErr := translate.WideVarcharNoticeError(
+			schema, m.Source.Name(), m.Target.Name(), "migrate",
+		); noticeErr != nil {
+			slog.WarnContext(ctx, noticeErr.Error())
+		}
 	}
 
 	if m.DryRun {
