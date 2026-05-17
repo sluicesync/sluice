@@ -365,6 +365,21 @@ func TestPrepareValue_PGArrayColumnToJSON(t *testing.T) {
 			want: `[[1,2],[3]]`,
 		},
 		{
+			// Bug 68 exact repro values (PG int[][] {{1,2},{3,4}}
+			// decoded by the postgres reader to nested []any) → the
+			// faithful nested MySQL JSON the integration test asserts.
+			name: "Bug 68: int[][] {{1,2},{3,4}} → [[1,2],[3,4]]",
+			in:   []any{[]any{int64(1), int64(2)}, []any{int64(3), int64(4)}},
+			t:    ir.Array{Element: ir.Integer{Width: 32}},
+			want: `[[1,2],[3,4]]`,
+		},
+		{
+			name: "Bug 68: int[][] with NULL element → [[1,null],[null,4]]",
+			in:   []any{[]any{int64(1), nil}, []any{nil, int64(4)}},
+			t:    ir.Array{Element: ir.Integer{Width: 32}},
+			want: `[[1,null],[null,4]]`,
+		},
+		{
 			name: "PG array text literal on ir.Array column → JSON array",
 			in:   "{a,b,c}",
 			t:    ir.Array{Element: ir.Text{Size: ir.TextLong}},

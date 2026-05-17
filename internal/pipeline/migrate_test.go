@@ -409,6 +409,8 @@ func (*recordingRowReader) ReadRows(context.Context, *ir.Table) (<-chan ir.Row, 
 	return ch, nil
 }
 
+func (*recordingRowReader) Err() error { return nil }
+
 type recordingRowWriter struct {
 	phaseLog *[]string
 }

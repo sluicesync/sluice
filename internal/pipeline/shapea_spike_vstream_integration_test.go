@@ -347,6 +347,10 @@ func (r *shardValueRowReader) ReadRows(ctx context.Context, table *ir.Table) (<-
 	return out, nil
 }
 
+// Err delegates to the wrapped reader: this decorator only mutates
+// rows in flight, it has no failure surface of its own.
+func (r *shardValueRowReader) Err() error { return r.inner.Err() }
+
 // =====================================================================
 // The spike test. Table-driven over the two target engines so the
 // cross-engine (Vitess → PG) and same-engine (Vitess → MySQL) cases

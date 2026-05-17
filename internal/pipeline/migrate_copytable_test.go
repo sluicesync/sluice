@@ -24,6 +24,15 @@ type pumpReader struct {
 	rowsToSend int
 	exited     chan struct{} // closed when the streaming goroutine returns
 	exitOnce   sync.Once
+
+	// streamErr, when non-nil, simulates a mid-stream scan/decode
+	// failure: the reader closes its channel after rowsToSend rows
+	// (exactly as the real PG/MySQL readers do on a decode error —
+	// they setErr and return, closing the channel) and surfaces the
+	// error only via Err. Bug 68: the orchestrator MUST observe this
+	// and fail the migrate rather than treat the early channel-close
+	// as "table fully read".
+	streamErr error
 }
 
 func newPumpReader(rowsToSend int) *pumpReader {
@@ -46,6 +55,8 @@ func (p *pumpReader) ReadRows(ctx context.Context, _ *ir.Table) (<-chan ir.Row, 
 	}()
 	return out, nil
 }
+
+func (p *pumpReader) Err() error { return p.streamErr }
 
 // erroringWriter consumes a fixed number of rows then returns an
 // error without draining the rest. Mirrors the shape of MySQL's
@@ -144,6 +155,34 @@ func TestCopyTable_SuccessLogsComplete(t *testing.T) {
 	}
 	if !strings.Contains(out, "rows=3") {
 		t.Errorf("expected rows=3; got %q", out)
+	}
+}
+
+// TestCopyTable_SurfacesReaderStreamError pins the Bug 68 silent-
+// swallow elimination, independent of multi-dim arrays. The reader
+// emits some rows then closes its channel and reports a non-nil
+// Err() — exactly the shape the real PG/MySQL readers produce when a
+// per-row scan/decode fails mid-stream (setErr + return, channel
+// closes). The writer drains cleanly and returns nil. Before the
+// fix, copyTable returned nil here and the migrate exited 0 with a
+// silently-truncated table. After the fix, copyTable MUST surface
+// the reader's sticky error as a hard failure.
+func TestCopyTable_SurfacesReaderStreamError(t *testing.T) {
+	captureSlog(t)
+	rr := newPumpReader(2)
+	rr.streamErr = errors.New("postgres: column \"matrix\": postgres: array text parse: nested arrays not supported")
+	rw := &drainingWriter{} // drains everything, returns nil — the dangerous case
+	table := &ir.Table{Name: "md", Columns: []*ir.Column{{Name: "id"}}}
+
+	err := copyTable(context.Background(), rr, rw, table, nil)
+	if err == nil {
+		t.Fatal("Bug 68: copyTable returned nil despite a mid-stream reader error; this is the silent total-row-loss class")
+	}
+	if !strings.Contains(err.Error(), "nested arrays not supported") {
+		t.Errorf("expected the wrapped reader stream error; got %v", err)
+	}
+	if !strings.Contains(err.Error(), `table "md"`) {
+		t.Errorf("expected the failing table name in the message; got %v", err)
 	}
 }
 

@@ -77,6 +77,8 @@ func (r *fakeRowReader) ReadRows(ctx context.Context, table *ir.Table) (<-chan i
 	return out, nil
 }
 
+func (*fakeRowReader) Err() error { return nil }
+
 func TestBackup_Validate(t *testing.T) {
 	cases := []struct {
 		name string

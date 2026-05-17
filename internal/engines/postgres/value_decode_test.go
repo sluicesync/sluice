@@ -185,6 +185,38 @@ func TestDecodeValue(t *testing.T) {
 			[]any{true, false, true},
 		},
 
+		// ---- Multi-dimensional arrays (Bug 68) ----
+		{
+			"int[][] from text (rectangular 2x2)",
+			"{{1,2},{3,4}}",
+			ir.Array{Element: ir.Integer{Width: 32}},
+			[]any{[]any{int64(1), int64(2)}, []any{int64(3), int64(4)}},
+		},
+		{
+			"int[][] from text (single inner row)",
+			"{{9,8}}",
+			ir.Array{Element: ir.Integer{Width: 32}},
+			[]any{[]any{int64(9), int64(8)}},
+		},
+		{
+			"text[][] from text with quoting edges",
+			`{{"a, b","c"},{"d\"e","NULL"}}`,
+			ir.Array{Element: ir.Text{Size: ir.TextLong}},
+			[]any{[]any{"a, b", "c"}, []any{`d"e`, "NULL"}},
+		},
+		{
+			"int[][] with NULL element",
+			"{{1,NULL},{NULL,4}}",
+			ir.Array{Element: ir.Integer{Width: 32}},
+			[]any{[]any{int64(1), nil}, []any{nil, int64(4)}},
+		},
+		{
+			"int[][][] from text (3-D)",
+			"{{{1,2}},{{3,4}}}",
+			ir.Array{Element: ir.Integer{Width: 32}},
+			[]any{[]any{[]any{int64(1), int64(2)}}, []any{[]any{int64(3), int64(4)}}},
+		},
+
 		// ---- Scalar string fallbacks ----
 		{"int from numeric string", "42", ir.Integer{Width: 32}, int64(42)},
 		{"float from numeric string", "3.14", ir.Float{Precision: ir.FloatDouble}, 3.14},

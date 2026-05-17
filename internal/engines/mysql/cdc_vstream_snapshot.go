@@ -631,6 +631,18 @@ type vstreamSnapshotRows struct {
 	snap *vstreamSnapshotStream
 }
 
+// Err implements [ir.RowReader]. The rows are served from an
+// in-memory buffer that the COPY-phase pump populated, so there is
+// no per-row decode that can fail after the channel opens; the only
+// failure surface is the pump goroutine itself, whose terminal
+// status lives on the backing snapshot stream. Delegating keeps the
+// loud-failure contract (Bug 68) honest for the vstream snapshot
+// path: a pump that died mid-COPY surfaces here rather than looking
+// like an empty buffer.
+func (r *vstreamSnapshotRows) Err() error {
+	return r.snap.Err()
+}
+
 // ReadRows returns a channel that yields every row the COPY phase
 // captured for table.Name, then closes. Synchronous emission inside
 // a goroutine keeps the contract identical to the SQL-backed
