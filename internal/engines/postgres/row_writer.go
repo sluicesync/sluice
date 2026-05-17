@@ -323,6 +323,7 @@ func (w *RowWriter) writeViaCopy(ctx context.Context, table *ir.Table, rows <-ch
 
 	needsPGVectorCodec := tableHasPGVectorColumn(table)
 	needsPGHstoreCodec := tableHasHstoreColumn(table)
+	needsPGTimetzCodec := tableHasTimetzColumn(table)
 
 	var copied int64
 	rawErr := sqlConn.Raw(func(driverConn any) error {
@@ -340,6 +341,9 @@ func (w *RowWriter) writeViaCopy(ctx context.Context, table *ir.Table, rows <-ch
 			if err := registerPGHstoreCodec(ctx, conn, w.db); err != nil {
 				return err
 			}
+		}
+		if needsPGTimetzCodec {
+			registerPGTimetzCodec(conn)
 		}
 		n, copyErr := conn.CopyFrom(
 			ctx,
@@ -725,54 +729,150 @@ func bitBytesMySQLToPG(src []byte, n int) []byte {
 	return out
 }
 
-// convertArray turns []any (the IR canonical form for arrays) into a
-// typed Go slice that pgx can serialise as a Postgres array.
+// convertArray turns []any (the IR canonical form for arrays, possibly
+// nested for multi-dim) into a pgx-encodable Postgres array value —
+// faithfully for both NULL elements and multi-dimensional arrays
+// (catalog Bug 70).
 //
-// We support the element types most common in practice. For others,
-// the function returns an error so the upstream caller knows to
-// translate first.
+// The vehicle is pgtype.Array[*T], NOT a plain/nested Go slice. Two
+// reasons, both load-bearing:
+//
+//   - **NULL elements.** A SQL NULL inside an array decodes to a Go nil
+//     slot (decodePGArrayText). A non-pointer element slice ([]int64,
+//     …) can't carry that and a bare type-assertion blows up with
+//     "expected T, got <nil>". With *T elements a nil slot is a typed
+//     nil pointer, which pgx's array codec encodes as the array NULL
+//     token.
+//   - **Multi-dimensional arrays.** decodePGArrayText (Bug 68) yields
+//     nested []any for int[][]. A nested Go slice does NOT round-trip
+//     dimensions through pgx: pgtype.Map's wrap chain tries
+//     TryWrapSliceEncodePlan (plain slice) BEFORE
+//     TryWrapMultiDimSliceEncodePlan, and the plain-slice reflect
+//     branch greedily matches [][]*T and flattens it to one dimension
+//     ({1,2,3,4} instead of {{1,2},{3,4}}). pgtype.Array[*T] sidesteps
+//     the wrap chain entirely — it is itself an ArrayGetter, so
+//     ArrayCodec.PlanEncode consumes it directly — and carries the
+//     dimensions explicitly in Dims with a flat row-major Elements
+//     slice, which is exactly the multi-dim wire shape.
+//
+// The leaf Go type is chosen by the IR element type. Dimensions and
+// shape are read from the value (ir.Array.Element is the scalar leaf
+// type even for multi-dim, per the Bug 68 reader). PG only ever emits
+// rectangular arrays, so dimension lengths are taken from the first
+// element at each depth.
 func convertArray(v []any, elem ir.Type) (any, error) {
 	switch elem.(type) {
 	case ir.Boolean:
-		out := make([]bool, len(v))
-		for i, e := range v {
+		return buildPGArray[bool](v, func(e any) (bool, error) {
 			b, ok := e.(bool)
 			if !ok {
-				return nil, fmt.Errorf("array element %d: expected bool, got %T", i, e)
+				return false, fmt.Errorf("expected bool, got %T", e)
 			}
-			out[i] = b
-		}
-		return out, nil
+			return b, nil
+		})
 	case ir.Integer:
-		out := make([]int64, len(v))
-		for i, e := range v {
+		return buildPGArray[int64](v, func(e any) (int64, error) {
 			n, ok := e.(int64)
 			if !ok {
-				return nil, fmt.Errorf("array element %d: expected int64, got %T", i, e)
+				return 0, fmt.Errorf("expected int64, got %T", e)
 			}
-			out[i] = n
-		}
-		return out, nil
+			return n, nil
+		})
 	case ir.Float:
-		out := make([]float64, len(v))
-		for i, e := range v {
+		return buildPGArray[float64](v, func(e any) (float64, error) {
 			f, ok := e.(float64)
 			if !ok {
-				return nil, fmt.Errorf("array element %d: expected float64, got %T", i, e)
+				return 0, fmt.Errorf("expected float64, got %T", e)
 			}
-			out[i] = f
-		}
-		return out, nil
+			return f, nil
+		})
 	case ir.Char, ir.Varchar, ir.Text, ir.UUID, ir.Inet, ir.Cidr, ir.Macaddr, ir.Decimal, ir.Time:
-		out := make([]string, len(v))
-		for i, e := range v {
+		return buildPGArray[string](v, func(e any) (string, error) {
 			s, ok := e.(string)
 			if !ok {
-				return nil, fmt.Errorf("array element %d: expected string, got %T", i, e)
+				return "", fmt.Errorf("expected string, got %T", e)
 			}
-			out[i] = s
-		}
-		return out, nil
+			return s, nil
+		})
 	}
 	return nil, fmt.Errorf("postgres: array of element type %T not supported", elem)
+}
+
+// buildPGArray flattens v (a possibly-nested []any) row-major into a
+// pgtype.Array[*T] with explicit Dims. A nil slot becomes a typed nil
+// *T (SQL NULL element); a present slot is converted via conv. The
+// dimension lengths come from the first element at each depth (PG
+// arrays are rectangular). A type mismatch from conv is an upstream
+// translator bug and surfaces as an error.
+func buildPGArray[T any](v []any, conv func(any) (T, error)) (any, error) {
+	dims := arrayDims(v)
+	elems := make([]*T, 0, arrayCardinality(dims))
+	var flatten func(level []any, depth int) error
+	flatten = func(level []any, depth int) error {
+		if depth == len(dims)-1 {
+			for _, e := range level {
+				if e == nil {
+					elems = append(elems, nil) // SQL NULL element
+					continue
+				}
+				cv, err := conv(e)
+				if err != nil {
+					return err
+				}
+				elems = append(elems, &cv)
+			}
+			return nil
+		}
+		for _, e := range level {
+			sub, ok := e.([]any)
+			if !ok {
+				return fmt.Errorf("array element: mixed nested and scalar elements (got %T)", e)
+			}
+			if err := flatten(sub, depth+1); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if err := flatten(v, 0); err != nil {
+		return nil, err
+	}
+	return pgtype.Array[*T]{
+		Elements: elems,
+		Dims:     dims,
+		Valid:    true,
+	}, nil
+}
+
+// arrayDims walks the first element at each depth to recover the
+// rectangular dimension lengths of a (possibly nested) PG array value.
+// An empty array is a single zero-length dimension.
+func arrayDims(v []any) []pgtype.ArrayDimension {
+	var dims []pgtype.ArrayDimension
+	level := v
+	for {
+		dims = append(dims, pgtype.ArrayDimension{Length: int32(len(level)), LowerBound: 1})
+		if len(level) == 0 {
+			return dims
+		}
+		first, ok := level[0].([]any)
+		if !ok {
+			return dims
+		}
+		level = first
+	}
+}
+
+// arrayCardinality is the total element count across all dimensions
+// (product of the dimension lengths) — the capacity the flat Elements
+// slice needs.
+func arrayCardinality(dims []pgtype.ArrayDimension) int {
+	if len(dims) == 0 {
+		return 0
+	}
+	n := 1
+	for _, d := range dims {
+		n *= int(d.Length)
+	}
+	return n
 }

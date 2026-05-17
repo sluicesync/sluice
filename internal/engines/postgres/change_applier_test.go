@@ -13,6 +13,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgtype"
+
 	"github.com/orware/sluice/internal/ir"
 )
 
@@ -223,13 +225,16 @@ func TestBuildInsertSQL_RoutesThroughPrepareValue(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildInsertSQL: %v", err)
 	}
-	// Sorted order: id, tags. tags must be a typed []string after
-	// prepareValue runs; the raw []any would fail pgx serialization.
+	// Sorted order: id, tags. tags must be a pgtype.Array[*string]
+	// after prepareValue runs; the raw []any would fail pgx
+	// serialization. Bug 70: convertArray returns pgtype.Array[*T]
+	// (pointer elements for NULL survival, explicit Dims for multi-dim
+	// fidelity).
 	if len(gotArgs) != 2 {
 		t.Fatalf("args length = %d; want 2", len(gotArgs))
 	}
-	if _, ok := gotArgs[1].([]string); !ok {
-		t.Errorf("tags arg is %T; want []string (Bug 6 mirror — array []any wasn't routed through prepareValue)", gotArgs[1])
+	if _, ok := gotArgs[1].(pgtype.Array[*string]); !ok {
+		t.Errorf("tags arg is %T; want pgtype.Array[*string] (Bug 6 mirror — array []any wasn't routed through prepareValue)", gotArgs[1])
 	}
 }
 
@@ -252,8 +257,8 @@ func TestBuildWhereClause_RoutesThroughPrepareValue(t *testing.T) {
 	if len(gotArgs) != 2 {
 		t.Fatalf("args length = %d; want 2", len(gotArgs))
 	}
-	if _, ok := gotArgs[1].([]string); !ok {
-		t.Errorf("tags WHERE arg is %T; want []string", gotArgs[1])
+	if _, ok := gotArgs[1].(pgtype.Array[*string]); !ok {
+		t.Errorf("tags WHERE arg is %T; want pgtype.Array[*string]", gotArgs[1])
 	}
 }
 
