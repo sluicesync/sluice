@@ -256,6 +256,22 @@ func (p *Previewer) Run(ctx context.Context) error {
 	); err != nil {
 		return err
 	}
+	// Bug 14 GENERAL backstop: the curated RefuseOnLoudGaps above
+	// catches only KNOWN MySQL-only constructs (a denylist). Any
+	// MySQL-only function OUTSIDE that set (SOUNDEX(), ELT(),
+	// CAST(... AS UNSIGNED), POINT(x,y), …) would still fall through
+	// the PG translator verbatim and emit invalid PG (a structural
+	// false-green at preview; a partial-target abort at migrate). This
+	// allowlist gate refuses any function-call identifier with no
+	// provable PG-valid form, AFTER the curated layer so the curated
+	// construct-specific messages win when they apply. Same post-
+	// override schema (tgtSchema) so `--expr-override` suppresses it.
+	if err := translate.RefuseOnUntranslatableExprs(
+		tgtSchema, p.Source.Name(), p.Target.Name(), "schema preview",
+		enabledExtensionSet(p.EnabledPGExtensions),
+	); err != nil {
+		return err
+	}
 
 	// ---- 3.6. Unsigned-bigint range-narrowing notice (Bug 11) ----
 	// Advisory — NOT a refusal (it must still migrate the universal

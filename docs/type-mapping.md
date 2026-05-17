@@ -314,6 +314,14 @@ Type translation is one half of the cross-engine story; expression-body translat
 
 For MySQL → PG migrations, run `sluice schema preview` first — its translator-gap preflight scan (v0.39.0, see [ADR-0024](adr/adr-0024-schema-preview.md)) lists every expression pattern sluice does NOT auto-rewrite, with operator-actionable workaround hints.
 
+### Untranslatable-expression backstop (allowlist gate, v0.68.3 / Bug #14)
+
+The translator's policy is "anything not matched falls through verbatim" (loud-failure tenet: a PG parse error beats a silent wrong translation). To make that loud failure happen **before any DDL is applied** rather than mid-`migrate` (which leaves a partial target) and to stop `schema preview` from being a false green, a post-translation **PG-validity gate** runs at both `schema preview` and `migrate` pre-flight:
+
+- **It is an allowlist, not a denylist.** v0.68.1 shipped a *curated denylist* of known MySQL-only patterns; that is structurally insufficient — any MySQL-only construct outside the curated set still leaked verbatim. v0.68.3 flips it: every function-call identifier in a `DEFAULT`/`GENERATED`/`CHECK` body must be **provably PG-valid** — a MySQL function the translator provably rewrites, a PG core/built-in (or one of the exact forms the translator emits), or a function owned by an `--enable-pg-extension`-enabled extension. Anything else is a loud, operator-actionable refusal naming the site + the `--expr-override` remedy.
+- **False-positive safety is the load-bearing design constraint.** A *missed* detection degrades to the pre-existing late-migrate parse error (no worse than status quo); a *false-positive* that refuses a valid schema is the real hazard. So only a bare unrecognized function-call identifier trips it — string literals, column refs, operators, the catalogued translations, arithmetic, SQL keyword-forms, and qualified `schema.fn(...)` calls never do. `--expr-override` (which retags the expression off the `mysql` dialect) suppresses the gate for that expression.
+- The curated `ScanMySQLToPGGaps` layer is retained as a *construct-specific actionable-hint* layer on top of (not replaced by) the general gate.
+
 ## What the IR is not
 
 The IR is not a wire format. It is not stable. It is not for users. It is an internal Go data model whose only job is to make the four-direction matrix tractable and the type-translation code testable. We will not export it, version it, or guarantee compatibility across releases.

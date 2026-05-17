@@ -385,6 +385,21 @@ func (m *Migrator) Run(ctx context.Context) error {
 		); err != nil {
 			return err
 		}
+		// Bug 14 GENERAL backstop (allowlist). RefuseOnLoudGaps above
+		// is the curated-denylist layer (KNOWN MySQL-only constructs,
+		// better construct-specific messages). This catches the
+		// general tail: any function-call identifier with no provable
+		// PG-valid form (SOUNDEX/ELT/CAST AS UNSIGNED/POINT/…) that the
+		// translator would emit verbatim and PG would reject mid-
+		// pipeline. Fires at the same pre-DDL point — before DryRun and
+		// any schema apply — so there is never a partially-migrated
+		// target and the diagnostic matches `schema preview`.
+		if err := translate.RefuseOnUntranslatableExprs(
+			schema, m.Source.Name(), m.Target.Name(), "migrate",
+			enabledExtensionSet(m.EnabledPGExtensions),
+		); err != nil {
+			return err
+		}
 
 		// ---- 1.67. Unsigned-bigint range-narrowing notice (Bug 11) ----
 		// MySQL `bigint unsigned` maps uniformly to PG `bigint` so PK
