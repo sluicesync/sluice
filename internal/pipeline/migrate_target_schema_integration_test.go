@@ -422,7 +422,13 @@ func TestMigrate_PG_TargetSchema_EnumColumn(t *testing.T) {
 		t.Errorf("customer_svc.orders count = %d; want 3", count)
 	}
 
-	// The enum type lives in the per-source namespace.
+	// The enum type lives in the per-source namespace. Its NAME is the
+	// preserved source type name `order_status` (Bug 19c, v0.69.0): a
+	// same-engine PG→PG migration carries the source enum type name
+	// verbatim rather than synthesizing `<table>_<col>_enum`. The
+	// load-bearing assertion here is the *namespace* qualification
+	// (n.nspname = 'customer_svc'); the name is `order_status` per the
+	// seed `CREATE TYPE order_status`.
 	var typExists bool
 	if err := db.QueryRowContext(ctx, `
 		SELECT EXISTS (
@@ -430,12 +436,12 @@ func TestMigrate_PG_TargetSchema_EnumColumn(t *testing.T) {
 			FROM   pg_type t
 			JOIN   pg_namespace n ON n.oid = t.typnamespace
 			WHERE  n.nspname = 'customer_svc'
-			  AND  t.typname = 'orders_status_enum'
+			  AND  t.typname = 'order_status'
 		)`).Scan(&typExists); err != nil {
 		t.Fatalf("query enum type: %v", err)
 	}
 	if !typExists {
-		t.Error("customer_svc.orders_status_enum does not exist; CREATE TYPE didn't qualify")
+		t.Error("customer_svc.order_status does not exist; CREATE TYPE didn't qualify to the per-source namespace")
 	}
 
 	// The column references the qualified type — INSERT against the

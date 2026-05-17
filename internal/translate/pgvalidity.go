@@ -293,13 +293,29 @@ func castWordIs(lr, word string) bool {
 // expression, not just stop at the first extension function.
 func scanFunctionCallIdents(expr string) []string {
 	var out []string
+	// prevSig: previous significant identifier token (upper-cased),
+	// reset by any non-space/non-ident byte. Only used to recognise a
+	// CAST target — `... AS DECIMAL(10,2)` — so the type specifier is
+	// not misread as a `decimal()` call (Bug #16). Mirrors requote.go's
+	// prevTok discipline.
+	prevSig := ""
 	for i := 0; i < len(expr); {
 		c := expr[i]
 		if c == '\'' {
+			// A string literal is a token boundary, never an AfterToken
+			// trigger.
 			i = exprident.ScanStringLiteral(expr, i)
+			prevSig = ""
 			continue
 		}
 		if !isIdentStartByte(c) {
+			// Whitespace does not break the prev-significant-token chain
+			// (`AS   DECIMAL`); any other punctuation does. `::` and `.`
+			// adjacency is recovered by direct lookback below, so a reset
+			// here is safe.
+			if c != ' ' && c != '\t' && c != '\n' && c != '\r' {
+				prevSig = ""
+			}
 			i++
 			continue
 		}
@@ -317,19 +333,43 @@ func scanFunctionCallIdents(expr string) []string {
 		if k < len(expr) && expr[k] == '(' {
 			// Skip qualified `qualifier.word(` conservatively.
 			qualified := start > 0 && expr[start-1] == '.'
+			// A parameterized CAST/`::` *target type* (`CAST(x AS
+			// DECIMAL(10,2))`, `x::numeric(12,4)`) is grammar, not a
+			// call — Bug #16. This is deliberately context-bound: the
+			// token must be a recognised SQL type name AND sit in
+			// cast-target position (right after `AS`, or right after
+			// `::`). The same word used call-shaped elsewhere (MySQL's
+			// `CHAR(65)` scalar — no PG form, not translator-rewritten)
+			// is still flagged; a blanket type-name allowlist would
+			// re-open the v0.68.1-class false-green.
+			castTarget := (prevSig == "AS" || precededByColonColon(expr, start)) &&
+				sqlCastTargetTypeNames[strings.ToLower(word)]
 			// SQL keyword/operator-forms can legally precede `(` without
 			// being a function call: `x IN (...)`, `... AND (...)`,
 			// `NOT (...)`, `EXISTS (...)`, `ARRAY[...]`, etc. These are
 			// grammar, not callable identifiers — excluding them is a
 			// false-positive-safety requirement (a bare `IN (` is NOT an
 			// "in()" function).
-			if !qualified && !sqlGrammarKeywords[strings.ToLower(word)] {
+			if !qualified && !castTarget && !sqlGrammarKeywords[strings.ToLower(word)] {
 				out = append(out, word)
 			}
 		}
+		prevSig = strings.ToUpper(word)
 		i = j
 	}
 	return out
+}
+
+// precededByColonColon reports whether the byte position start is
+// immediately preceded (skipping only spaces/tabs) by the PG cast
+// operator `::`. Used to recognise `expr :: type(args)` so the type
+// specifier is not misread as a function call (Bug #16).
+func precededByColonColon(expr string, start int) bool {
+	p := start - 1
+	for p >= 0 && (expr[p] == ' ' || expr[p] == '\t') {
+		p--
+	}
+	return p >= 1 && expr[p] == ':' && expr[p-1] == ':'
 }
 
 // isIdentStartByte reports whether b can begin an SQL bareword

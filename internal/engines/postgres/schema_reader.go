@@ -171,6 +171,9 @@ func (r *SchemaReader) ReadSchema(ctx context.Context) (*ir.Schema, error) {
 		if err := r.populateCheckConstraints(ctx, tables); err != nil {
 			return nil, fmt.Errorf("postgres: read check constraints: %w", err)
 		}
+		if err := r.populateComments(ctx, tables); err != nil {
+			return nil, fmt.Errorf("postgres: read comments: %w", err)
+		}
 	}
 
 	out := &ir.Schema{
@@ -556,6 +559,10 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 		if dataType == "user-defined" || dataType == "USER-DEFINED" {
 			if values, ok := enumValues[udtName]; ok {
 				meta.EnumValues = values
+				// Bug 19c: carry the source enum type name so a
+				// same-engine PG → PG migration preserves it verbatim
+				// instead of synthesizing a per-column name.
+				meta.EnumTypeName = udtName
 			}
 			// PostGIS geometry / geography: look up subtype + SRID from
 			// the per-column info we read out of geometry_columns /
@@ -612,6 +619,24 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 				// in translateType is preserved unchanged.
 				meta.VerbatimEligible = true
 			}
+		}
+
+		// Bug 17: core PG types with no rich cross-engine IR shape
+		// (tsvector, tsquery) are carried verbatim on a same-engine-PG
+		// run, mirroring the ADR-0047 USER-DEFINED verbatim tier. The
+		// USER-DEFINED branch above already set (or deliberately
+		// withheld) VerbatimEligible per the catalog lookup; only the
+		// non-USER-DEFINED path needs this. The flag is consulted by
+		// translateType strictly as a last resort, AFTER every
+		// first-class core-type case has returned, so it never shadows
+		// a mapped type — it only converts the final "unsupported
+		// data_type" refusal into a verbatim carry. Cross-engine
+		// (verbatimPassthrough false) leaves it unset, preserving the
+		// loud refusal (tsvector has no MySQL equivalent).
+		isUserDefined := dataType == "user-defined" || dataType == "USER-DEFINED"
+		if !isUserDefined &&
+			verbatimTierFor(r.verbatimPassthrough) == verbatimTierVerbatim {
+			meta.VerbatimEligible = true
 		}
 
 		// Resolve element type for arrays. For now, only built-in
@@ -709,6 +734,19 @@ func (r *SchemaReader) populateIndexes(ctx context.Context, tables map[string]*i
 				THEN pg_get_indexdef(ix.indexrelid, u.ord::int, true)
 				ELSE ''
 			END AS expr,
+			-- Number of *key* columns (Bug 19b). Columns at ordinal
+			-- position > indnkeyatts are non-key INCLUDE payload, not
+			-- part of the index key — flattening them into the key
+			-- list silently changes index semantics.
+			ix.indnkeyatts,
+			-- Per-column ordering bits (Bug 19a). pg_index.indoption is
+			-- an int2vector parallel to indkey; bit 0 (1) = DESC, bit 1
+			-- (2) = NULLS FIRST. Only meaningful for key columns.
+			COALESCE(uo.opt, 0) AS indoption,
+			-- Partial-index WHERE predicate (Bug 19a), rendered in PG
+			-- dialect with table-qualified column refs resolved. Empty
+			-- string for a full (non-partial) index.
+			COALESCE(pg_get_expr(ix.indpred, ix.indrelid), '') AS predicate,
 			-- ADR-0047: is the access method owned by an extension
 			-- (pg_depend deptype 'e')? An extension-owned AM that is
 			-- NOT one of the ADR-0032 catalogued ones is carried
@@ -740,6 +778,7 @@ func (r *SchemaReader) populateIndexes(ctx context.Context, tables map[string]*i
 		JOIN   pg_namespace  n  ON n.oid  = cl.relnamespace
 		JOIN   LATERAL unnest(ix.indkey)   WITH ORDINALITY AS u(attnum, ord) ON TRUE
 		LEFT JOIN LATERAL unnest(ix.indclass) WITH ORDINALITY AS uc(opcoid, ord) ON uc.ord = u.ord
+		LEFT JOIN LATERAL unnest(ix.indoption) WITH ORDINALITY AS uo(opt, ord) ON uo.ord = u.ord
 		LEFT JOIN pg_attribute a   ON a.attrelid = ix.indrelid AND a.attnum = u.attnum
 		LEFT JOIN pg_opclass   opc ON opc.oid    = uc.opcoid
 		WHERE  n.nspname = $1
@@ -763,12 +802,16 @@ func (r *SchemaReader) populateIndexes(ctx context.Context, tables map[string]*i
 			ord                                   int
 			opclass                               string
 			exprText                              string
+			nKeyAtts                              int
+			indOption                             int
+			predicate                             string
 			amExtOwned, opclassExtOwned           bool
 		)
 		if err := rows.Scan(
 			&tableName, &indexName, &method,
 			&isUnique, &isPrimary,
 			&colName, &ord, &opclass, &exprText,
+			&nKeyAtts, &indOption, &predicate,
 			&amExtOwned, &opclassExtOwned,
 		); err != nil {
 			return err
@@ -836,6 +879,15 @@ func (r *SchemaReader) populateIndexes(ctx context.Context, tables map[string]*i
 				verbatimTierFor(r.verbatimPassthrough) == verbatimTierVerbatim {
 				idx.Method = method
 			}
+			// Bug 19a: a partial index's WHERE predicate. pg_get_expr
+			// renders it in PG dialect with table-qualified column refs;
+			// tag the dialect so a cross-dialect target runs the
+			// ADR-0016 translator (same policy as expression-index
+			// bodies). Empty for a full index.
+			if p := strings.TrimSpace(predicate); p != "" {
+				idx.Predicate = p
+				idx.PredicateDialect = dialectName
+			}
 			collected[k] = idx
 			if isPrimary {
 				primary[tableName] = indexName
@@ -861,11 +913,35 @@ func (r *SchemaReader) populateIndexes(ctx context.Context, tables map[string]*i
 		// built-in indexes" property: a non-extension opclass (or one
 		// whose owning extension wasn't enabled) is dropped, just
 		// like before.
+		// Bug 19b: ordinals beyond indnkeyatts are non-key INCLUDE
+		// payload columns, not part of the index key. They carry a
+		// real column name (never expressions — PG forbids expressions
+		// in INCLUDE) and have no ordering/opclass semantics, so they
+		// go to a separate slot. Flattening them into the key list
+		// silently changes the index's comparison/uniqueness scope.
+		if nKeyAtts > 0 && ord > nKeyAtts && colName != "" {
+			idx.IncludeColumns = append(idx.IncludeColumns, colName)
+			continue
+		}
+
 		col := ir.IndexColumn{Column: colName}
 		if isExpr {
 			col.Column = ""
 			col.Expression = strings.TrimSpace(exprText)
 			col.ExpressionDialect = dialectName
+		}
+		// Bug 19a: per-column ordering from pg_index.indoption. Bit 0
+		// (value 1) = DESC; bit 1 (value 2) = NULLS FIRST. PG's
+		// implicit defaults are NULLS LAST for ASC and NULLS FIRST for
+		// DESC; only record NullsFirst when the stored ordering
+		// deviates from that default so emitted DDL stays minimal and
+		// diff-stable (the writer emits the clause only when non-nil).
+		col.Desc = indOption&1 != 0
+		nullsFirst := indOption&2 != 0
+		defaultNullsFirst := col.Desc // ASC→NULLS LAST(false); DESC→NULLS FIRST(true)
+		if nullsFirst != defaultNullsFirst {
+			nf := nullsFirst
+			col.NullsFirst = &nf
 		}
 		switch {
 		case opclass != "" && idx.Method != "":
@@ -1067,6 +1143,75 @@ func (r *SchemaReader) populateCheckConstraints(ctx context.Context, tables map[
 		})
 	}
 	return rows.Err()
+}
+
+// populateComments fills in table- and column-level comments
+// (catalog Bug 19d). Dropping them silently is a loud-failure-tenet
+// violation; PG → PG should round-trip them via COMMENT ON. One query
+// for table comments (obj_description over pg_class) and one for
+// column comments (col_description over pg_attribute), both scoped to
+// the bound schema's ordinary tables.
+func (r *SchemaReader) populateComments(ctx context.Context, tables map[string]*ir.Table) error {
+	const tableQ = `
+		SELECT cl.relname, obj_description(cl.oid, 'pg_class')
+		FROM   pg_class     cl
+		JOIN   pg_namespace n ON n.oid = cl.relnamespace
+		WHERE  n.nspname  = $1
+		  AND  cl.relkind = 'r'
+		  AND  obj_description(cl.oid, 'pg_class') IS NOT NULL`
+
+	rows, err := r.db.QueryContext(ctx, tableQ, r.schema)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var tableName, comment string
+		if err := rows.Scan(&tableName, &comment); err != nil {
+			return err
+		}
+		if t, ok := tables[tableName]; ok {
+			t.Comment = comment
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	const colQ = `
+		SELECT cl.relname, a.attname,
+		       col_description(cl.oid, a.attnum)
+		FROM   pg_class      cl
+		JOIN   pg_namespace  n ON n.oid = cl.relnamespace
+		JOIN   pg_attribute  a ON a.attrelid = cl.oid
+		WHERE  n.nspname  = $1
+		  AND  cl.relkind = 'r'
+		  AND  a.attnum   > 0
+		  AND  NOT a.attisdropped
+		  AND  col_description(cl.oid, a.attnum) IS NOT NULL`
+
+	crows, err := r.db.QueryContext(ctx, colQ, r.schema)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = crows.Close() }()
+	for crows.Next() {
+		var tableName, colName, comment string
+		if err := crows.Scan(&tableName, &colName, &comment); err != nil {
+			return err
+		}
+		t, ok := tables[tableName]
+		if !ok {
+			continue
+		}
+		for _, col := range t.Columns {
+			if col.Name == colName {
+				col.Comment = comment
+				break
+			}
+		}
+	}
+	return crows.Err()
 }
 
 // isAutoIncrement detects SERIAL, BIGSERIAL, and IDENTITY columns.

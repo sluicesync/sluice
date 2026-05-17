@@ -237,6 +237,15 @@ func TestColumnSetExpr(t *testing.T) {
 		{"text → utf8mb4 convert", &ir.Column{Name: "t", Type: ir.Text{Size: ir.TextLong}}, "CONVERT(@c0 USING utf8mb4)"},
 		{"set → utf8mb4 convert", &ir.Column{Name: "x", Type: ir.Set{Values: []string{"a"}}}, "CONVERT(@c0 USING utf8mb4)"},
 		{"json → utf8mb4 convert", &ir.Column{Name: "j", Type: ir.JSON{Binary: true}}, "CONVERT(@c0 USING utf8mb4)"},
+		// Bug 18 LOAD-DATA pin: a PG array column keeps IR type
+		// ir.Array (only ddl_emit renders it as MySQL JSON), so the
+		// SET-clause must give it the SAME utf8mb4 re-tag as ir.JSON —
+		// otherwise its JSON text is loaded under CHARACTER SET binary
+		// and MySQL's JSON column rejects it (Error 3144), 0 rows. This
+		// is the LOAD DATA half of the value-side ir.Array→JSON fix in
+		// prepareValue; missing it left the default high-throughput
+		// path broken.
+		{"array → utf8mb4 convert (Bug 18 LOAD DATA)", &ir.Column{Name: "a", Type: ir.Array{Element: ir.Text{}}}, "CONVERT(@c0 USING utf8mb4)"},
 		// Bug 48 pin: PG extension types with cross-engine default
 		// translators (hstore → JSON; citext → VARCHAR) need the same
 		// utf8mb4 reinterpretation so MySQL doesn't see the LOAD DATA

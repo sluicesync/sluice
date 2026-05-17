@@ -123,6 +123,43 @@ func TestTranslateExprForPG(t *testing.T) {
 	}
 }
 
+// TestTranslateExprForPG_Bug20 pins the catalog Bug 20 fix: a bare
+// string-literal argument to LOWER()/UPPER() gets an explicit ::text
+// cast so PG can resolve a collation in a STORED-generated /
+// CHECK context (MySQL accepts `LOWER('ABC')` there; PG rejects it
+// with SQLSTATE 42P22). The cast is faithful (`lower('ABC'::text)`
+// == `lower('ABC')`). Scope is tight: a column ref already carries a
+// collation and a compound/already-cast argument is left verbatim.
+func TestTranslateExprForPG_Bug20(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"LOWER literal", "LOWER('ABC')", "LOWER('ABC'::text)"},
+		{"lower literal lowercase", "lower('abc')", "LOWER('abc'::text)"},
+		{"UPPER literal", "UPPER('xy')", "UPPER('xy'::text)"},
+		{"LCASE literal → LOWER+cast", "LCASE('AbC')", "LOWER('AbC'::text)"},
+		{"UCASE literal → UPPER+cast", "UCASE('AbC')", "UPPER('AbC'::text)"},
+		{"literal with embedded quote", "LOWER('O''Hara')", "LOWER('O''Hara'::text)"},
+		// Out of scope — must pass through verbatim (no spurious cast):
+		{"column ref untouched", "LOWER(name)", "LOWER(name)"},
+		{"compound arg untouched", "LOWER('a' || x)", "LOWER('a' || x)"},
+		{"already cast idempotent", "LOWER('ABC'::text)", "LOWER('ABC'::text)"},
+		{"two-arg untouched", "LOWER('a', 'b')", "LOWER('a', 'b')"},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			got := translateExprForPG(c.in, ExprContext{})
+			if got != c.want {
+				t.Errorf("translateExprForPG(%q) =\n  got  %q\n  want %q",
+					c.in, got, c.want)
+			}
+		})
+	}
+}
+
 // TestTranslateExprForPG_Bug8 pins the three v0.68.1 translation
 // rules added for validation-rig Bug 8 (MySQL→PG untranslated
 // constructs leaking into emitted PG DDL). 8a JSON_VALID, 8b the

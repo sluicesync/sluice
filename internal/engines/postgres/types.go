@@ -58,6 +58,15 @@ type columnMeta struct {
 	// before invoking the translator.
 	EnumValues []string
 
+	// EnumTypeName is the source-side enum type name (udt_name /
+	// pg_type.typname). Carried onto [ir.Enum.TypeName] so a
+	// same-engine PG → PG migration round-trips the type name verbatim
+	// instead of synthesizing `<table>_<col>_enum` (catalog Bug 19c).
+	// Empty for a MySQL source (column-inline enums have no type
+	// identity); the PG writer then falls back to the synthesized
+	// name.
+	EnumTypeName string
+
 	// GeometryInfo is populated when the column's UDT is the PostGIS
 	// `geometry` type. The schema reader queries PostGIS's
 	// `geometry_columns` view to recover the subtype and SRID that
@@ -182,7 +191,7 @@ func translateType(c columnMeta) (ir.Type, error) {
 			return def.build(c.ExtensionTypeName, c.AttTypmod)
 		}
 		if c.EnumValues != nil {
-			return ir.Enum{Values: c.EnumValues}, nil
+			return ir.Enum{Values: c.EnumValues, TypeName: c.EnumTypeName}, nil
 		}
 		// PostGIS geometry / geography. information_schema reports
 		// both as USER-DEFINED with udt_name="geometry" / "geography";
@@ -339,6 +348,30 @@ func translateType(c columnMeta) (ir.Type, error) {
 		return ir.Cidr{}, nil
 	case "macaddr", "macaddr8":
 		return ir.Macaddr{}, nil
+
+	// ---- Full-text search ----
+	// tsvector / tsquery are PostgreSQL CORE types (pg_catalog, no
+	// pg_extension edge — catalog Bug 17). They have no rich
+	// cross-engine IR shape, but a same-engine PG → PG migration only
+	// needs faithful carry. Mirror the ADR-0047 verbatim tier used for
+	// uncatalogued USER-DEFINED types: when the run carries a
+	// same-engine-PG guarantee (VerbatimEligible), emit ir.VerbatimType
+	// with the exact format_type spelling so the PG writer re-emits it
+	// literally and values round-trip via the type's text I/O.
+	// VerbatimEligible is false cross-engine, so that path still falls
+	// through to the loud refusal below (tsvector has no MySQL
+	// equivalent — a correct refusal, not silent loss).
+	case "tsvector", "tsquery":
+		if c.VerbatimEligible {
+			if c.FormatType == "" {
+				return nil, fmt.Errorf(
+					"postgres: core type %q is eligible for verbatim "+
+						"passthrough but pg_catalog.format_type returned "+
+						"empty — this is a sluice bug; please report it",
+					c.DataType)
+			}
+			return ir.VerbatimType{Definition: c.FormatType}, nil
+		}
 	}
 
 	return nil, fmt.Errorf("postgres: unsupported data_type %q (udt %q)", c.DataType, c.UDTName)

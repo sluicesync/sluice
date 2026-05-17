@@ -263,7 +263,7 @@ MySQL `ENUM` is roughly equivalent in shape but is not a separate type — it is
 
 MySQL has no array type.
 
-**Default policy:** emit as `JSON`. Reads and writes serialise/deserialise transparently in the row pipeline.
+**Default policy:** emit as `JSON`. Reads and writes serialise/deserialise transparently in the row pipeline — a PG array value (`text[]`/`int[]`, incl. empty `{}`→`[]`, NULL whole-column→SQL NULL, NULL element→JSON `null`, nested→nested) is serialised to JSON text on all three MySQL write paths (LOAD DATA, batched INSERT, CDC apply) via the shared `prepareValue` chokepoint (v0.69.0 / Bug #18 — earlier releases crashed the LOAD DATA serializer on a non-empty array column).
 
 **Override:** `array_strategy: json | concat`. The `concat` option is offered for simple scalar arrays where a comma-delimited string is preferable.
 
@@ -312,6 +312,12 @@ Type translation is one half of the cross-engine story; expression-body translat
 
 - **`SHA1(x)` / `SHA2(x, n)` → `encode(digest(x, '<algo>'), 'hex')`** (v0.38.0) — requires `pgcrypto` on the target. Pass `--enable-pg-extension pgcrypto` and ensure `CREATE EXTENSION pgcrypto;` has been run; the rewrite then fires automatically. Without the flag, the calls fall through verbatim and PG's parse-time error signals the missing extension. `MD5(x)` ships unconditionally — PG core has `md5(text)`.
 
+- **`LOWER('lit')` / `UPPER('lit')` over a bare string literal** (v0.69.0 / Bug #20 — operator-visible design call). MySQL accepts `LOWER('ABC')` in a STORED generated column / CHECK; PG rejects it with `SQLSTATE 42P22` ("could not determine which collation") because an unadorned string literal has the `unknown` type and no collation. **Two cases, by position:**
+  - **CHECK / DEFAULT** — sluice wraps the sole string-literal argument in an explicit `::text` cast (`lower('ABC'::text)`), faithful (byte-identical to MySQL's result) and accepted by PG. A column reference (already collatable) and a compound/already-cast argument pass through verbatim.
+  - **GENERATED column** — every migrated generated column is STORED on PG, and a STORED generated column's expression must have a *determinable* collation that even the `::text` cast does not supply; a synthesised `COLLATE` would change Unicode case-folding semantics vs MySQL. The value is a constant, so sluice **loud-refuses at `schema preview` and `migrate` pre-flight** (before any DDL) naming the site and the `--expr-override TABLE.COL=<already-lowered-literal>` remedy — the loud-failure-tenet choice over a fragile/unfaithful cast or a raw mid-pipeline 42P22 + partial target.
+
+- **Known pre-existing limitation — `CAST(x AS BINARY(n))` in a generated column → PG `42804`** (Bug #22, pre-existing on v0.68.x; *not* introduced by the v0.69.0 batch — the #16 fix merely stopped masking it behind a spurious refusal). MySQL's `BINARY(n)` cast target maps to PG `bytea` while the surrounding generated-column type resolves to a text/varchar form, and PG rejects the type mismatch. Loud failure (exit 1, no corruption). Tracked as a separate type-mapping item; the `--expr-override` / `--type-override` / `--exclude-table` escape hatches apply. Not a v0.69.0 release blocker.
+
 For MySQL → PG migrations, run `sluice schema preview` first — its translator-gap preflight scan (v0.39.0, see [ADR-0024](adr/adr-0024-schema-preview.md)) lists every expression pattern sluice does NOT auto-rewrite, with operator-actionable workaround hints.
 
 ### Untranslatable-expression backstop (allowlist gate, v0.68.3 / Bug #14)
@@ -321,6 +327,11 @@ The translator's policy is "anything not matched falls through verbatim" (loud-f
 - **It is an allowlist, not a denylist.** v0.68.1 shipped a *curated denylist* of known MySQL-only patterns; that is structurally insufficient — any MySQL-only construct outside the curated set still leaked verbatim. v0.68.3 flips it: every function-call identifier in a `DEFAULT`/`GENERATED`/`CHECK` body must be **provably PG-valid** — a MySQL function the translator provably rewrites, a PG core/built-in (or one of the exact forms the translator emits), or a function owned by an `--enable-pg-extension`-enabled extension. Anything else is a loud, operator-actionable refusal naming the site + the `--expr-override` remedy.
 - **False-positive safety is the load-bearing design constraint.** A *missed* detection degrades to the pre-existing late-migrate parse error (no worse than status quo); a *false-positive* that refuses a valid schema is the real hazard. So only a bare unrecognized function-call identifier trips it — string literals, column refs, operators, the catalogued translations, arithmetic, SQL keyword-forms, and qualified `schema.fn(...)` calls never do. `--expr-override` (which retags the expression off the `mysql` dialect) suppresses the gate for that expression.
 - The curated `ScanMySQLToPGGaps` layer is retained as a *construct-specific actionable-hint* layer on top of (not replaced by) the general gate.
+- **Cast-target type specifiers are exempt (v0.69.0 / Bug #16 — operator-visible design call).** A parameterized type in CAST/`::` target position — `CAST(x AS DECIMAL(10,2))`, `CAST(x AS CHAR(20))`, `CAST(x AS BINARY(16))`, `x::numeric(20,0)` — is SQL *grammar*, not a function call, and PG accepts these natively (or the translator rewrites `CHAR(n)`→`VARCHAR(n)`). v0.68.3's gate misread the parenthesized type as an unknown call and spuriously refused valid schemas; the fix is **context-aware**: a recognised SQL type name is exempt **only** in cast-target position (immediately after `AS`, or after `::`). The same spelling used call-shaped elsewhere — notably MySQL's `CHAR(65)` *scalar* function, which has no PG form and the translator does not rewrite — is still refused (a blanket type-name allowlist would re-open that false-green). `UNSIGNED`/`SIGNED` cast targets remain refused (no PG spelling).
+
+### Gen-col-references-gen-col is refused up front (v0.69.0 / Bug #9 — operator-visible policy)
+
+MySQL permits a generated column's expression to reference *another* generated column in the same table; PostgreSQL forbids it (`SQLSTATE 42P17`). Left unchecked, PG rejects the `CREATE TABLE` mid-`migrate`, after other tables already migrated (a partial target). sluice now refuses this at **both `schema preview` and `migrate` pre-flight**, before any DDL, naming each site and the remedy: inline the referenced column's own generation expression via `--expr-override TABLE.COL=<inlined-expr>` (or `--exclude-table`). This is the loud-failure tenet applied to a UX-quality gap — no silent corruption either way, but the clean up-front refusal replaces PG's opaque mid-pipeline error.
 
 ## What the IR is not
 

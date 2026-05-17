@@ -12,6 +12,8 @@ package postgres
 import (
 	"strings"
 	"testing"
+
+	"github.com/orware/sluice/internal/ir"
 )
 
 func TestSchemaWriter_SetSchema(t *testing.T) {
@@ -160,7 +162,7 @@ func TestEnumTypeName_PreservesShape(t *testing.T) {
 // load-bearing invariant for ADR-0031's "two sources both have
 // accounts.status enum" collision avoidance.
 func TestEmitCreateEnumType_QualifiesWithSchema(t *testing.T) {
-	got := emitCreateEnumType("customer_svc", "accounts", "status", []string{"active", "inactive"})
+	got := emitCreateEnumType(ir.Enum{Values: []string{"active", "inactive"}}, "customer_svc", "accounts", "status")
 	wantSubstr := `CREATE TYPE "customer_svc"."accounts_status_enum"`
 	if !strings.Contains(got, wantSubstr) {
 		t.Errorf("emitCreateEnumType = %q; want to contain %q", got, wantSubstr)

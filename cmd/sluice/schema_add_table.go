@@ -53,8 +53,8 @@ type SchemaAddTableCmd struct {
 	Table    string `arg:"" help:"Unqualified name of the new source table to add to the active stream's scope. The schema/database is inferred from --source." placeholder:"TABLE"`
 	StreamID string `help:"Stream identifier; must match the active stream's id (run 'sluice sync status' to list)." required:"" placeholder:"ID"`
 
-	TypeOverride []string `help:"Force a specific target type for a column on the new table (repeatable). Format: 'TABLE.COLUMN=TYPE'. CLI form of the YAML 'mappings:' config; for target-type options, use the YAML form." placeholder:"TABLE.COLUMN=TYPE"`
-	ExprOverride []string `help:"Replace a generated column's body with operator-supplied target-dialect text (repeatable). Format: 'TABLE.COLUMN=EXPRESSION'. Emitted verbatim; ADR-0016 translator skips overridden columns." placeholder:"TABLE.COLUMN=EXPRESSION"`
+	TypeOverride []string `help:"Force a specific target type for a column on the new table (repeatable). Format: 'TABLE.COLUMN=TYPE'. CLI form of the YAML 'mappings:' config; for target-type options, use the YAML form." placeholder:"TABLE.COLUMN=TYPE" sep:"none"`
+	ExprOverride []string `help:"Replace a generated column's body with operator-supplied target-dialect text (repeatable). Format: 'TABLE.COLUMN=EXPRESSION'. Emitted verbatim; ADR-0016 translator skips overridden columns." placeholder:"TABLE.COLUMN=EXPRESSION" sep:"none"`
 
 	SlotName string `help:"Override the temporary replication-slot name used for the snapshot capture on engines with a slot concept (Postgres). Defaults to 'sluice_addtable_<table>'. Engines without slots ignore this flag." placeholder:"NAME"`
 

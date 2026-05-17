@@ -400,7 +400,18 @@ func prepareValue(v any, col *ir.Column) any {
 			return strings.Join(ss, ",")
 		}
 	}
-	if _, isJSON := t.(ir.JSON); isJSON {
+	// MySQL has no native array type, so emitColumnType (ddl_emit.go)
+	// renders an ir.Array source column as a MySQL `JSON` column —
+	// the IR keeps the source type ir.Array, only the emitted DDL is
+	// JSON. The value side must follow the same decision: a PG array
+	// arrives from the PG RowReader as a Go []any (string/int64/nil
+	// elements, possibly nested for multi-dim arrays), which the JSON
+	// column accepts only as its JSON text form. Treat ir.Array
+	// exactly like ir.JSON here (Bug 18); without this the []any falls
+	// through to tsvEncode and crashes the LOAD DATA serializer.
+	_, isJSON := t.(ir.JSON)
+	_, isArray := t.(ir.Array)
+	if isJSON || isArray {
 		if converted, ok := convertArrayLikeToJSON(v, col); ok {
 			return converted
 		}

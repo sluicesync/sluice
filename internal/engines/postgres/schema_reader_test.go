@@ -140,10 +140,11 @@ func TestSchemaReader_TypeMatrix(t *testing.T) {
 
 	// ---- users column types ----
 	wantTypes := map[string]ir.Type{
-		"id":          ir.Integer{Width: 64, AutoIncrement: true},
-		"email":       ir.Varchar{Length: 255},
-		"active":      ir.Boolean{},
-		"role":        ir.Enum{Values: []string{"admin", "user", "guest"}},
+		"id":     ir.Integer{Width: 64, AutoIncrement: true},
+		"email":  ir.Varchar{Length: 255},
+		"active": ir.Boolean{},
+		// Bug 19c: the source enum type name is now carried verbatim.
+		"role":        ir.Enum{Values: []string{"admin", "user", "guest"}, TypeName: "user_role"},
 		"score":       ir.Decimal{Precision: 8, Scale: 2},
 		"tags":        ir.Array{Element: ir.Integer{Width: 32}},
 		"profile":     ir.JSON{Binary: true},

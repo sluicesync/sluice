@@ -248,6 +248,34 @@ var sqlGrammarKeywords = stringSet(
 	"escape", "array", "row", "values", "using", "from", "for",
 )
 
+// sqlCastTargetTypeNames are SQL type-name spellings that legitimately
+// appear *as a parameterized CAST/`::` target type* — `CAST(x AS
+// DECIMAL(10,2))`, `CAST(x AS CHAR(20))`, `x::numeric(12,4)`. A
+// type-specifier-with-length is grammar, NOT a function call, so the
+// scanner must not flag it (Bug #16: v0.68.3 misread `DECIMAL(`/
+// `CHAR(`/`BINARY(`/`NCHAR(` as unknown calls and spuriously refused
+// schemas v0.68.2 migrated clean — the translator rewrites CHAR→VARCHAR
+// and PG accepts decimal/numeric natively).
+//
+// This is consulted ONLY when the token is in cast-target position
+// (immediately after `AS` inside a cast, or after `::`). Outside that
+// position these same words used call-shaped are still flagged — that
+// is the load-bearing distinction: MySQL's `CHAR(65)` *scalar* function
+// (no PG form; the translator does NOT rewrite it) must still
+// loud-refuse, so a blanket type-name allowlist would be wrong (it
+// would re-open the v0.68.1-class false-green). The set deliberately
+// EXCLUDES `signed`/`unsigned` — those MySQL-only integer-cast targets
+// have no parens and are owned by mysqlOnlyCastTarget, which must keep
+// refusing them.
+var sqlCastTargetTypeNames = stringSet(
+	"decimal", "dec", "numeric", "char", "character", "varchar",
+	"nchar", "nvarchar", "bpchar", "binary", "varbinary", "bit",
+	"varbit", "float", "real", "double", "money", "smallint", "int",
+	"integer", "bigint", "boolean", "bool", "date", "time", "timestamp",
+	"timestamptz", "datetime", "interval", "uuid", "json", "jsonb",
+	"xml", "text", "bytea", "year",
+)
+
 // stringSet builds a lookup set from the given names. All names are
 // stored already-lower-cased (the source literals above are written
 // lower-case); callers lower-case the scanned identifier before lookup.

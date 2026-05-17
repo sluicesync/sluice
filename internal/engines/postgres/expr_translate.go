@@ -171,6 +171,10 @@ func translateExprForPG(expr string, ctx ExprContext) string {
 	expr = rewriteCHARLENGTH(expr)
 	expr = rewriteLCASE(expr)
 	expr = rewriteUCASE(expr)
+	// Bug 20: must run AFTER LCASE/UCASE so the MySQL synonyms have
+	// already become LOWER/UPPER and a single rule covers all four
+	// spellings.
+	expr = rewriteLowerUpperLiteralCollation(expr)
 	expr = rewriteSUBSTR(expr)
 	expr = rewriteMID(expr)
 	expr = rewriteNOWFamily(expr)
@@ -1190,6 +1194,57 @@ func rewriteUCASE(expr string) string {
 		}
 		return "UPPER(" + strings.TrimSpace(args[0]) + ")"
 	})
+}
+
+// rewriteLowerUpperLiteralCollation wraps a sole string-literal
+// argument to LOWER()/UPPER() in an explicit `::text` cast so
+// PostgreSQL can resolve a collation. MySQL accepts `LOWER('ABC')`
+// in a STORED generated column (and CHECK); PostgreSQL rejects it
+// with SQLSTATE 42P22 ("could not determine which collation to use
+// for lower() function") because an unadorned string literal has the
+// `unknown` type and carries no collation, and a STORED generated
+// column's expression must have a determinable collation at DDL time
+// (catalog Bug 20). Casting the literal to `text` gives it the
+// database default collation; `lower('ABC'::text)` is byte-identical
+// in result to MySQL's `LOWER('ABC')`, so the rewrite is faithful
+// rather than a loud refusal.
+//
+// Scope is deliberately tight (false-rewrite safety, mirroring the
+// other rules' conservatism): only a SINGLE argument that is exactly
+// one string literal is wrapped. A column reference (`lower(name)`)
+// already carries the column's collation; a compound argument
+// (`lower('a' || b)`) or an already-cast one (`lower('a'::text)`) is
+// out of scope and passes through verbatim — if such a form is still
+// non-collatable, PG's loud parse error remains the operator's signal,
+// consistent with the verbatim-passthrough policy.
+func rewriteLowerUpperLiteralCollation(expr string) string {
+	castLiteralArg := func(fn string) func([]string) string {
+		return func(args []string) string {
+			if len(args) != 1 {
+				return ""
+			}
+			a := strings.TrimSpace(args[0])
+			if !isSingleStringLiteral(a) {
+				return ""
+			}
+			return fn + "(" + a + "::text)"
+		}
+	}
+	expr = rewriteFunctionCalls(expr, "LOWER", castLiteralArg("LOWER"))
+	expr = rewriteFunctionCalls(expr, "UPPER", castLiteralArg("UPPER"))
+	return expr
+}
+
+// isSingleStringLiteral reports whether s is exactly one single-quoted
+// SQL string literal with nothing before or after it. A compound
+// expression (`'a' || x`) or an already-cast literal (`'a'::text`)
+// returns false — both are correctly left unwrapped by
+// [rewriteLowerUpperLiteralCollation].
+func isSingleStringLiteral(s string) bool {
+	if len(s) < 2 || s[0] != '\'' {
+		return false
+	}
+	return scanStringLiteral(s, 0) == len(s)
 }
 
 // rewriteSUBSTR renames MySQL's `SUBSTR(x, …)` to PG's

@@ -199,6 +199,16 @@ func (p *Previewer) Run(ctx context.Context) error {
 		return wrapWithHint(PhaseConnect, fmt.Errorf("preview: enable PG extensions on source: %w", err))
 	}
 
+	// ADR-0047 tier (b): enable verbatim passthrough for uncatalogued
+	// PG extension types AND core verbatim-carry types (tsvector /
+	// tsquery, Bug 17) ONLY when the run is provably same-engine
+	// PG → PG. This MUST mirror migrate.go's call exactly — preview's
+	// contract is to render what `migrate` / `sync start` would emit,
+	// so the reader must make the identical tier decision. Without it
+	// `schema preview` loud-refused a type `migrate` carries fine
+	// (Bug 23 preview/migrate inconsistency).
+	applyVerbatimExtensionPassthrough(sr, verbatimLiveSameEnginePG(p.Source, p.Target))
+
 	srcSchema, err := sr.ReadSchema(ctx)
 	if err != nil {
 		return wrapWithHint(PhaseConnect, fmt.Errorf("preview: read source schema: %w", err))
@@ -269,6 +279,27 @@ func (p *Previewer) Run(ctx context.Context) error {
 	if err := translate.RefuseOnUntranslatableExprs(
 		tgtSchema, p.Source.Name(), p.Target.Name(), "schema preview",
 		enabledExtensionSet(p.EnabledPGExtensions),
+	); err != nil {
+		return err
+	}
+	// Bug 9: a generated column referencing another generated column
+	// in the same table — MySQL permits it, PG rejects with 42P17
+	// mid-create-tables. Refuse cleanly up front (post-override
+	// tgtSchema so `--expr-override` inlining suppresses it),
+	// consistent with `migrate`.
+	if err := translate.RefuseOnGeneratedColRefGeneratedCol(
+		tgtSchema, p.Source.Name(), p.Target.Name(), "schema preview",
+	); err != nil {
+		return err
+	}
+	// Bug 20 residual: LOWER()/UPPER() over a bare string literal in a
+	// GENERATED column — PG's STORED generated column needs a
+	// determinable collation a literal lacks (42P22). The ::text
+	// translator rewrite rescues CHECK/DEFAULT but not a STORED gen
+	// col; refuse it cleanly up front (post-override tgtSchema so
+	// `--expr-override` suppresses it), consistent with `migrate`.
+	if err := translate.RefuseOnLowerUpperLiteralInGenerated(
+		tgtSchema, p.Source.Name(), p.Target.Name(), "schema preview",
 	); err != nil {
 		return err
 	}
