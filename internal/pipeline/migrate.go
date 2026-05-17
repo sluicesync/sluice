@@ -410,6 +410,16 @@ func (m *Migrator) Run(ctx context.Context) error {
 		); err != nil {
 			return err
 		}
+		// Bug 20 residual: LOWER()/UPPER() over a bare string literal
+		// in a GENERATED column — PG STORED generated columns need a
+		// determinable collation a literal lacks (42P22). The ::text
+		// rewrite rescues CHECK/DEFAULT but not a STORED gen col;
+		// refuse cleanly up front rather than abort mid-create-tables.
+		if err := translate.RefuseOnLowerUpperLiteralInGenerated(
+			schema, m.Source.Name(), m.Target.Name(), "migrate",
+		); err != nil {
+			return err
+		}
 
 		// ---- 1.67. Unsigned-bigint range-narrowing notice (Bug 11) ----
 		// MySQL `bigint unsigned` maps uniformly to PG `bigint` so PK
