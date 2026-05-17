@@ -272,6 +272,16 @@ func (p *Previewer) Run(ctx context.Context) error {
 	); err != nil {
 		return err
 	}
+	// Bug 9: a generated column referencing another generated column
+	// in the same table — MySQL permits it, PG rejects with 42P17
+	// mid-create-tables. Refuse cleanly up front (post-override
+	// tgtSchema so `--expr-override` inlining suppresses it),
+	// consistent with `migrate`.
+	if err := translate.RefuseOnGeneratedColRefGeneratedCol(
+		tgtSchema, p.Source.Name(), p.Target.Name(), "schema preview",
+	); err != nil {
+		return err
+	}
 
 	// ---- 3.6. Unsigned-bigint range-narrowing notice (Bug 11) ----
 	// Advisory — NOT a refusal (it must still migrate the universal

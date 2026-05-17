@@ -400,6 +400,16 @@ func (m *Migrator) Run(ctx context.Context) error {
 		); err != nil {
 			return err
 		}
+		// Bug 9: a generated column referencing another generated
+		// column in the same table — MySQL permits it, PG rejects with
+		// 42P17 mid-create-tables (after partial migration). Refuse
+		// cleanly up front, at the same pre-DDL point as the gates
+		// above so the diagnostic matches `schema preview`.
+		if err := translate.RefuseOnGeneratedColRefGeneratedCol(
+			schema, m.Source.Name(), m.Target.Name(), "migrate",
+		); err != nil {
+			return err
+		}
 
 		// ---- 1.67. Unsigned-bigint range-narrowing notice (Bug 11) ----
 		// MySQL `bigint unsigned` maps uniformly to PG `bigint` so PK
