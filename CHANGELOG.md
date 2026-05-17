@@ -6,6 +6,8 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.69.5]
+
 **Track 1c — CDC resumability validation (PlanetScale/Vitess readiness) + a node-replace silent-gap hardening.** Validation-first; the one production change is the minimal loud floor a Phase-A ground-truth finding demanded. All outcomes verified vs Docker (vttestserver + mysql:8.0).
 
 ### Fixed
