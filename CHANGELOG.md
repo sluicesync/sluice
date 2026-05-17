@@ -6,6 +6,23 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.68.2]
+
+**Closes Bug #11 (HIGH, the top real-user-readiness blocker) — MySQL→PostgreSQL of the universal ORM schema now works.** Found by the real-user-readiness battle-test: a `bigint unsigned AUTO_INCREMENT` PRIMARY KEY emitted PG `bigint … IDENTITY` while a `bigint unsigned` FK child column emitted `numeric(20,0)` → `ADD FOREIGN KEY` failed `SQLSTATE 42804`, invisible at `schema preview`, partial-migrated target. That divergence existed because PG's `GENERATED … AS IDENTITY` is valid only on `smallint/integer/bigint` (never `numeric`), so the AUTO_INCREMENT path stayed `bigint` while plain columns widened to `numeric(20,0)`. This is the **default schema shape of essentially every Rails / Laravel / Django / Sequelize / Prisma MySQL app** (`id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY` + `*_id BIGINT UNSIGNED` FKs) — previously unmigratable to PG with no `--type-override` workaround.
+
+### Changed
+
+- **MySQL `bigint unsigned` → PostgreSQL `bigint`, uniformly** (PK, FK-child, and standalone alike). The PK and FK types now match by construction (no schema-graph machinery), and `IDENTITY` stays valid. **Deliberate, documented range narrowing:** PG has no uint64, so values in `(2^63-1, 2^64-1]` are not representable (the industry-standard pragmatic mapping, cf. pgloader). Previously plain/FK `bigint unsigned` columns were `numeric(20,0)`. Recorded in `docs/type-mapping.md`. (`int/smallint/tinyint unsigned` were already consistent — unaffected.)
+- This is surfaced **loudly, never silently**: a new operator-actionable advisory notice naming every affected `table.column` fires at **both `schema preview` and `migrate` preflight** (it is an advisory — migration proceeds; PG itself rejects an out-of-range value at insert time). Operators needing the full 2^64 range override per-column with `--type-override TABLE.COL=numeric`.
+
+### Fixed
+
+- Bug #11 (above). A parallel copy of the same divergence in the `schema preview` note renderer was fixed too, so preview DDL and its inline notes agree.
+
+### Compatibility
+
+Drop-in from v0.68.1; no state/format change. **Breaking cross-engine policy change for MySQL→PostgreSQL:** plain/FK `bigint unsigned` columns now map to `bigint` (was `numeric(20,0)`) — values above `2^63-1` are no longer representable without `--type-override`. This is the deliberate trade that makes the universal ORM schema migratable; it is loud (preview + preflight notice) and reversible per-column. PostgreSQL→MySQL, same-engine, signed integers, and other unsigned widths are unaffected (regression-guarded). Still open from the battle-test, tracked, out of scope here: **#14** (general post-translation backstop — `schema preview` can still false-green for MySQL-only constructs outside the curated set; correction banner is on the v0.68.1 release), **#12/#13** (`CAST AS UNSIGNED`/`regexp_like`/spatial in generated-column expressions leak verbatim), **#9** (loud-fail quality, no corruption).
+
 ## [0.68.1]
 
 **Closes Bug #8 (HIGH, MySQL→PostgreSQL) — untranslated MySQL constructs no longer silently leak into emitted PG DDL.** A real-world 329-table battle-test corpus found that certain MySQL expression constructs fell through the MySQL→PG translator verbatim: `sluice schema preview` then printed valid-looking-but-invalid PG DDL with **zero warnings** (a false green), and `sluice migrate` hard-aborted at create-tables with PG `SQLSTATE 42883`, leaving a **partially-migrated target**. Both the specific translation gaps and the structural false-green are fixed.
