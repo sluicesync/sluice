@@ -73,6 +73,14 @@ Other recurring lint signals:
 - **Integration tests** (`//go:build integration`) — testcontainers booting real databases. Same-engine tests live in each engine package; cross-engine tests live in `internal/pipeline` (`migrate_pg_integration_test.go`, `migrate_cross_integration_test.go`).
 - **Value contract** — see `docs/value-types.md`. Cross-engine value translation (e.g. MySQL `TINYINT(1)` → Go `bool` → Postgres `BOOLEAN`) is defined there.
 
+### Pin the class, not the representative (the Bug 74 lesson)
+
+When a change touches an encoder / decoder / codec / serializer that **dispatches on a type *family*** (array/collection elements, numeric vs string vs temporal leaves, per-OID driver codecs, …), the pin must exercise **every family — and every shape variant — not one representative type**. The underlying driver/wire path can differ by the *target* type/OID even when sluice's own code path is byte-identical, so a green test on one family does **not** cover the others.
+
+For array/collection-element work specifically, the pin matrix is **each element family** — native (int/float/bool), string-leaf (text/varchar/char/uuid/inet/cidr/macaddr/decimal), temporal (time/timestamp/timestamptz/date) — **× {scalar/1-D, multi-dim ≥2-D, NULL-element}**, src==dst ground-truthed on the real target (e.g. PG `array_dims` + element `::text`).
+
+**Why this exists (the cost):** v0.69.3's array fix used `pgtype.Array[*string]`; it was pinned green for `int[][]`/`text[][]` and passed independent review — but `numeric[][]` (identical sluice code path, *different pgx target-OID codec*) **silently flattened** to 1-D. That was Bug 74, a CRITICAL silent-loss regression, missed by both the per-representative pin and the reviewer, caught only by the post-release battle-test — costing an extra release and a public correction banner. **Reviewer corollary:** when reviewing a family-dispatched change, re-derive the family matrix yourself and verify the pin covers it; "the integration test is green" is insufficient if the test exercises one family of a family-dispatched path. This is the test-coverage counterpart to the three-phase protocol's "fix the class, not the instance."
+
 ## Where to read more
 
 - `docs/architecture.md` — IR, engine pattern, orchestrator, planned roadmap
