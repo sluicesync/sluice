@@ -225,16 +225,18 @@ func TestBuildInsertSQL_RoutesThroughPrepareValue(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildInsertSQL: %v", err)
 	}
-	// Sorted order: id, tags. tags must be a pgtype.Array[*string]
+	// Sorted order: id, tags. tags must be a pgtype.Array[*pgtype.Text]
 	// after prepareValue runs; the raw []any would fail pgx
-	// serialization. Bug 70: convertArray returns pgtype.Array[*T]
+	// serialization. Bug 70/74: convertArray returns pgtype.Array[*T]
 	// (pointer elements for NULL survival, explicit Dims for multi-dim
-	// fidelity).
+	// fidelity); the string-shaped families use a *pgtype.Text leaf so
+	// pgx's array codec preserves dimensions for every element OID
+	// (a bare *string silently flattens ≥2-D for uuid/inet/cidr/...).
 	if len(gotArgs) != 2 {
 		t.Fatalf("args length = %d; want 2", len(gotArgs))
 	}
-	if _, ok := gotArgs[1].(pgtype.Array[*string]); !ok {
-		t.Errorf("tags arg is %T; want pgtype.Array[*string] (Bug 6 mirror — array []any wasn't routed through prepareValue)", gotArgs[1])
+	if _, ok := gotArgs[1].(pgtype.Array[*pgtype.Text]); !ok {
+		t.Errorf("tags arg is %T; want pgtype.Array[*pgtype.Text] (Bug 6 mirror — array []any wasn't routed through prepareValue)", gotArgs[1])
 	}
 }
 
@@ -257,8 +259,8 @@ func TestBuildWhereClause_RoutesThroughPrepareValue(t *testing.T) {
 	if len(gotArgs) != 2 {
 		t.Fatalf("args length = %d; want 2", len(gotArgs))
 	}
-	if _, ok := gotArgs[1].(pgtype.Array[*string]); !ok {
-		t.Errorf("tags WHERE arg is %T; want pgtype.Array[*string]", gotArgs[1])
+	if _, ok := gotArgs[1].(pgtype.Array[*pgtype.Text]); !ok {
+		t.Errorf("tags WHERE arg is %T; want pgtype.Array[*pgtype.Text]", gotArgs[1])
 	}
 }
 
