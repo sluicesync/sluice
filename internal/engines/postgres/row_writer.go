@@ -8,7 +8,9 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -629,29 +631,35 @@ func prepareValue(v any, t ir.Type) (any, error) {
 		return ewkb, nil
 	}
 
-	// catalog Bug 62: ir.Bit columns. The MySQL row reader hands BIT(N)
-	// back as ceil(N/8) big-endian bytes with the value *right*-aligned
-	// (MySQL's storage layout). PG's bit(N) binary wire format is
-	// ceil(N/8) bytes *left*-aligned (bit 1 = MSB of byte 0), framed by
-	// an int32 bit-length. We rebuild the byte buffer left-aligned and
-	// hand pgx a pgtype.Bits so its registered BitsCodec encodes it
-	// correctly under COPY binary. Byte-aligned widths (BIT(8)/BIT(16))
-	// are a straight copy; non-byte-aligned widths (BIT(9)) need the
-	// alignment shift, which bitBytesMySQLToPG performs.
-	if bitT, isBit := t.(ir.Bit); isBit {
-		b, ok := v.([]byte)
+	// catalog Bug 62 / Bug 75: ir.Bit columns. The IR carries a bit
+	// value as its canonical '0'/'1' bit-string (see internal/ir/bit.go),
+	// regardless of source engine — the MySQL reader converts MySQL's
+	// right-justified big-endian bytes into that form, and the PG reader
+	// passes pgx's '0'/'1' text through. PG's bit(N) binary wire format
+	// is ceil(N/8) bytes *left*-aligned (bit 1 = MSB of byte 0), framed
+	// by an int32 bit-length. ir.BitStringToBytesPG produces exactly
+	// that left-aligned buffer; we hand pgx a pgtype.Bits so its
+	// BitsCodec encodes it correctly under COPY binary.
+	if _, isBit := t.(ir.Bit); isBit {
+		s, ok := v.(string)
 		if !ok {
-			// pgx stdlib mode can also surface a same-engine PG bit
-			// value as a '0'/'1' string; pass it through for the codec
-			// to parse. Anything else is an upstream decode bug.
-			if s, isStr := v.(string); isStr {
-				return s, nil
-			}
-			return nil, fmt.Errorf("expected []byte for Bit column, got %T", v)
+			return nil, fmt.Errorf("expected bit-string string for Bit column, got %T", v)
 		}
+		pgBytes, err := ir.BitStringToBytesPG(s)
+		if err != nil {
+			return nil, err
+		}
+		// PG's bit/varbit binary wire format is `int32 bit-length` +
+		// ceil(bitLen/8) bytes. The length is the VALUE's bit count,
+		// not the column's declared width — a `bit varying(16)` row
+		// holding 4 bits ships Len=4 with 1 byte. Using ir.Bit.Length
+		// (the declared max) here desynced Len from len(Bytes) and PG
+		// rejected the COPY stream with 08P01 "insufficient data". For
+		// fixed bit(N) the value is always exactly N chars so len(s)
+		// equals the declared width anyway.
 		return pgtype.Bits{
-			Bytes: bitBytesMySQLToPG(b, bitT.Length),
-			Len:   int32(bitT.Length),
+			Bytes: pgBytes,
+			Len:   int32(len(s)),
 			Valid: true,
 		}, nil
 	}
@@ -687,48 +695,6 @@ func prepareValue(v any, t ir.Type) (any, error) {
 	return v, nil
 }
 
-// bitBytesMySQLToPG re-aligns a MySQL BIT(n) byte buffer into the
-// layout PG's bit(n) binary wire format expects (catalog Bug 62).
-//
-// MySQL stores BIT(n) in ceil(n/8) bytes, big-endian, with the n-bit
-// value *right*-justified (the unused high bits of the first byte are
-// zero). PG's bit(n) stores the bits *left*-justified: logical bit i
-// (0-based, the leftmost bit of the declared string) lives at byte
-// i/8, mask 128>>(i%8); the unused low bits of the last byte are zero.
-//
-// For byte-aligned widths (n % 8 == 0) the two layouts are identical
-// and this is a defensive copy. For non-byte-aligned widths (e.g.
-// BIT(9)) the value must shift left by (8 - n%8) bits within the
-// buffer so logical bit 0 lands on the first byte's MSB. We do that by
-// reading the MySQL value MSB-first into logical bit positions, then
-// writing PG-aligned. n is capped at 64 by the reader so a uint64
-// accumulator is exact.
-func bitBytesMySQLToPG(src []byte, n int) []byte {
-	if n <= 0 {
-		return []byte{}
-	}
-	nbytes := (n + 7) / 8
-	// Right-justified value: interpret the trailing nbytes as a
-	// big-endian unsigned integer holding the n significant low bits.
-	var val uint64
-	start := 0
-	if len(src) > nbytes {
-		start = len(src) - nbytes
-	}
-	for i := start; i < len(src); i++ {
-		val = val<<8 | uint64(src[i])
-	}
-	out := make([]byte, nbytes)
-	// Logical bit i (0 = most-significant of the n-bit value) → PG
-	// position byte i/8, mask 128>>(i%8).
-	for i := 0; i < n; i++ {
-		if val&(1<<uint(n-1-i)) != 0 {
-			out[i/8] |= byte(128 >> uint(i%8))
-		}
-	}
-	return out
-}
-
 // convertArray turns []any (the IR canonical form for arrays, possibly
 // nested for multi-dim) into a pgx-encodable Postgres array value —
 // faithfully for both NULL elements and multi-dimensional arrays
@@ -755,47 +721,185 @@ func bitBytesMySQLToPG(src []byte, n int) []byte {
 //     dimensions explicitly in Dims with a flat row-major Elements
 //     slice, which is exactly the multi-dim wire shape.
 //
-// The leaf Go type is chosen by the IR element type. Dimensions and
-// shape are read from the value (ir.Array.Element is the scalar leaf
-// type even for multi-dim, per the Bug 68 reader). PG only ever emits
-// rectangular arrays, so dimension lengths are taken from the first
-// element at each depth.
+// The leaf Go type is chosen by the IR element type and is NOT free:
+// pgx's ArrayCodec.PlanEncode plans the element encode against the
+// *target column's element OID* using the leaf type Array[*T].IndexType()
+// reports. If that OID's element codec can't plan the leaf type,
+// ArrayCodec declines and pgx silently falls back through its wrap
+// chain to a plain-slice encoder that FLATTENS multi-dimensional
+// arrays with no error (catalog Bug 74 — a v0.69.3 silent-loss
+// regression). A bare *string leaf only round-trips for the element
+// codecs that accept string (text/varchar/char/macaddr); for
+// numeric/uuid/inet/cidr/time/timestamp/date OIDs it silently
+// flattens ≥2-D. The fix is to pick, per element family, a leaf type
+// the target element codec actually plans:
+//
+//   - native bool/int64/float64 — encoded by the bool/int8/float8
+//     codecs directly (unchanged from Bug 70; proven faithful).
+//   - string-shaped (text, varchar, char, uuid, inet, cidr, macaddr) —
+//     *pgtype.Text. It implements TextValuer/driver.Valuer, which
+//     makes pgx select a dimension-preserving array plan for every one
+//     of these element OIDs (bare *string does not for uuid/inet/cidr).
+//   - numeric/decimal — *pgtype.Numeric (built from the IR's canonical
+//     numeric string; NumericCodec plans NumericValuer, never string).
+//   - date — *pgtype.Date; datetime / timestamp-without-tz —
+//     *pgtype.Timestamp; timestamp-with-tz — *pgtype.Timestamptz;
+//     time-without-tz — *pgtype.Time. The temporal codecs plan their
+//     own pgtype valuer, never string (catalog Bug 73).
+//
+// timetz arrays (`ir.Time{WithTimeZone:true}`) have no faithful
+// binary array leaf — the per-conn scalar timetz codec isn't
+// registered for the `_timetz` array OID, and pgx's built-in Time
+// codec drops the zone. Rather than silently flatten/corrupt them we
+// refuse loudly here (the loud-failure tenet: a refused migration
+// beats a silently corrupted one).
+//
+// Dimensions and shape are read from the value (ir.Array.Element is
+// the scalar leaf type even for multi-dim, per the Bug 68 reader). PG
+// only ever emits rectangular arrays, so dimension lengths are taken
+// from the first element at each depth.
 func convertArray(v []any, elem ir.Type) (any, error) {
-	switch elem.(type) {
+	switch e := elem.(type) {
 	case ir.Boolean:
-		return buildPGArray[bool](v, func(e any) (bool, error) {
-			b, ok := e.(bool)
+		return buildPGArray(v, func(x any) (bool, error) {
+			b, ok := x.(bool)
 			if !ok {
-				return false, fmt.Errorf("expected bool, got %T", e)
+				return false, fmt.Errorf("expected bool, got %T", x)
 			}
 			return b, nil
 		})
 	case ir.Integer:
-		return buildPGArray[int64](v, func(e any) (int64, error) {
-			n, ok := e.(int64)
+		return buildPGArray(v, func(x any) (int64, error) {
+			n, ok := x.(int64)
 			if !ok {
-				return 0, fmt.Errorf("expected int64, got %T", e)
+				return 0, fmt.Errorf("expected int64, got %T", x)
 			}
 			return n, nil
 		})
 	case ir.Float:
-		return buildPGArray[float64](v, func(e any) (float64, error) {
-			f, ok := e.(float64)
+		return buildPGArray(v, func(x any) (float64, error) {
+			f, ok := x.(float64)
 			if !ok {
-				return 0, fmt.Errorf("expected float64, got %T", e)
+				return 0, fmt.Errorf("expected float64, got %T", x)
 			}
 			return f, nil
 		})
-	case ir.Char, ir.Varchar, ir.Text, ir.UUID, ir.Inet, ir.Cidr, ir.Macaddr, ir.Decimal, ir.Time:
-		return buildPGArray[string](v, func(e any) (string, error) {
-			s, ok := e.(string)
+	case ir.Char, ir.Varchar, ir.Text, ir.UUID, ir.Inet, ir.Cidr, ir.Macaddr:
+		return buildPGArray(v, func(x any) (pgtype.Text, error) {
+			s, ok := x.(string)
 			if !ok {
-				return "", fmt.Errorf("expected string, got %T", e)
+				return pgtype.Text{}, fmt.Errorf("expected string, got %T", x)
 			}
-			return s, nil
+			return pgtype.Text{String: s, Valid: true}, nil
+		})
+	case ir.Decimal:
+		return buildPGArray(v, func(x any) (pgtype.Numeric, error) {
+			s, ok := x.(string)
+			if !ok {
+				return pgtype.Numeric{}, fmt.Errorf("expected string, got %T", x)
+			}
+			var n pgtype.Numeric
+			if err := n.Scan(s); err != nil {
+				return pgtype.Numeric{}, fmt.Errorf("parse numeric %q: %w", s, err)
+			}
+			return n, nil
+		})
+	case ir.Date:
+		return buildPGArray(v, func(x any) (pgtype.Date, error) {
+			t, ok := x.(time.Time)
+			if !ok {
+				return pgtype.Date{}, fmt.Errorf("expected time.Time, got %T", x)
+			}
+			return pgtype.Date{Time: t, Valid: true}, nil
+		})
+	case ir.DateTime:
+		return buildPGArray(v, func(x any) (pgtype.Timestamp, error) {
+			t, ok := x.(time.Time)
+			if !ok {
+				return pgtype.Timestamp{}, fmt.Errorf("expected time.Time, got %T", x)
+			}
+			return pgtype.Timestamp{Time: t, Valid: true}, nil
+		})
+	case ir.Timestamp:
+		if e.WithTimeZone {
+			return buildPGArray(v, func(x any) (pgtype.Timestamptz, error) {
+				t, ok := x.(time.Time)
+				if !ok {
+					return pgtype.Timestamptz{}, fmt.Errorf("expected time.Time, got %T", x)
+				}
+				return pgtype.Timestamptz{Time: t, Valid: true}, nil
+			})
+		}
+		return buildPGArray(v, func(x any) (pgtype.Timestamp, error) {
+			t, ok := x.(time.Time)
+			if !ok {
+				return pgtype.Timestamp{}, fmt.Errorf("expected time.Time, got %T", x)
+			}
+			return pgtype.Timestamp{Time: t, Valid: true}, nil
+		})
+	case ir.Time:
+		if e.WithTimeZone {
+			// timetz array: no faithful binary leaf (see doc comment).
+			// Loud-refuse rather than silently flatten/corrupt.
+			return nil, errors.New("postgres: timetz (time with time zone) arrays are not supported for COPY; migrate the column as a scalar timetz or exclude the table")
+		}
+		return buildPGArray(v, func(x any) (pgtype.Time, error) {
+			s, ok := x.(string)
+			if !ok {
+				return pgtype.Time{}, fmt.Errorf("expected string, got %T", x)
+			}
+			usec, err := timeOfDayMicros(s)
+			if err != nil {
+				return pgtype.Time{}, err
+			}
+			return pgtype.Time{Microseconds: usec, Valid: true}, nil
 		})
 	}
 	return nil, fmt.Errorf("postgres: array of element type %T not supported", elem)
+}
+
+// timeOfDayMicros parses the IR canonical time-of-day string
+// ("HH:MM:SS" or "HH:MM:SS.ffffff", as decodeTimeAsString emits) into
+// microseconds since midnight — the unit pgtype.Time encodes. The
+// fractional part is right-padded/truncated to microsecond precision
+// (PG's `time` resolution). Any malformed token is an upstream decode
+// bug and surfaces as a loud error rather than a wrong value.
+func timeOfDayMicros(s string) (int64, error) {
+	hms := s
+	var frac string
+	if dot := strings.IndexByte(s, '.'); dot >= 0 {
+		hms, frac = s[:dot], s[dot+1:]
+	}
+	parts := strings.Split(hms, ":")
+	if len(parts) != 3 {
+		return 0, fmt.Errorf("postgres: malformed time-of-day %q", s)
+	}
+	h, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return 0, fmt.Errorf("postgres: malformed time-of-day %q: %w", s, err)
+	}
+	m, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return 0, fmt.Errorf("postgres: malformed time-of-day %q: %w", s, err)
+	}
+	sec, err := strconv.Atoi(parts[2])
+	if err != nil {
+		return 0, fmt.Errorf("postgres: malformed time-of-day %q: %w", s, err)
+	}
+	var usec int
+	if frac != "" {
+		if len(frac) > 6 {
+			frac = frac[:6]
+		}
+		for len(frac) < 6 {
+			frac += "0"
+		}
+		usec, err = strconv.Atoi(frac)
+		if err != nil {
+			return 0, fmt.Errorf("postgres: malformed time-of-day %q: %w", s, err)
+		}
+	}
+	return int64(h)*3_600_000_000 + int64(m)*60_000_000 + int64(sec)*1_000_000 + int64(usec), nil
 }
 
 // buildPGArray flattens v (a possibly-nested []any) row-major into a
@@ -804,6 +908,13 @@ func convertArray(v []any, elem ir.Type) (any, error) {
 // dimension lengths come from the first element at each depth (PG
 // arrays are rectangular). A type mismatch from conv is an upstream
 // translator bug and surfaces as an error.
+//
+// T is chosen by convertArray per element family so that pgx's
+// ArrayCodec plans the element encode against the target column's
+// element OID (a wrong leaf makes pgx silently flatten ≥2-D arrays —
+// catalog Bug 74). pgtype.Array[*T] is itself an ArrayGetter, so its
+// explicit Dims survive the encode path; the *T element pointer lets
+// a SQL NULL element round-trip as a typed nil.
 func buildPGArray[T any](v []any, conv func(any) (T, error)) (any, error) {
 	dims := arrayDims(v)
 	elems := make([]*T, 0, arrayCardinality(dims))

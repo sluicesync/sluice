@@ -304,6 +304,10 @@ func (b *Backup) Run(ctx context.Context) error {
 	// restore-time engine gate. A non-PG source never enables it.
 	applyVerbatimExtensionPassthrough(sr, verbatimBackupSourcePG(b.Source))
 
+	// catalog Bug 76: scope per-column type validation to the filtered
+	// table set (b.Filter already has engine defaults merged above).
+	applyTableScope(sr, b.Filter)
+
 	schema, err := sr.ReadSchema(ctx)
 	if err != nil {
 		return wrapWithHint(PhaseConnect, fmt.Errorf("backup: read source schema: %w", err))

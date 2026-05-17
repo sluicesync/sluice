@@ -822,6 +822,36 @@ type SchemaSetter interface {
 	SetSchema(name string)
 }
 
+// TableScoper is the optional surface a [SchemaReader] can implement
+// to accept the operator's table filter *before* the schema scan, so
+// per-column type validation is scoped to the tables that will
+// actually be migrated (catalog Bug 76).
+//
+// Without this, a reader validates every column of every table in the
+// database and aborts the whole run when an unsupported column type
+// lives in a table the operator already excluded via
+// `--include-table` / `--exclude-table` — the error even names the
+// unrelated table, which is confusing. The pipeline still applies the
+// authoritative post-read [TableFilter] regardless; this push-down is
+// purely about not validating (and not failing on) out-of-scope
+// tables.
+//
+// allow reports whether a given table name participates in the
+// migration; it is the engine-neutral projection of the pipeline's
+// TableFilter (path.Match semantics, engine defaults already merged).
+// Implementations must treat a nil predicate as "no filtering" and
+// apply allow only to user tables (engine bookkeeping tables are
+// excluded by the reader independently). The predicate must be set
+// before [SchemaReader.ReadSchema]; implementations must not buffer a
+// table list before that call.
+//
+// PG implements; MySQL does not yet (the post-read filter still
+// applies there — no silent loss, only the Bug-76 usability gap
+// remains until MySQL grows the same push-down).
+type TableScoper interface {
+	SetTableScope(allow func(tableName string) bool)
+}
+
 // ExtensionAware is the optional engine-side surface for engines that
 // can pass through column types defined by extensions (ADR-0032). PG
 // implements; MySQL does not (no extension concept in the same shape).

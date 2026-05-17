@@ -327,7 +327,7 @@ func translateType(c columnMeta) (ir.Type, error) {
 		if n < 1 {
 			n = 1
 		}
-		return ir.Bit{Length: n}, nil
+		return ir.Bit{Length: n, Varying: c.DataType == "bit varying"}, nil
 
 	// ---- Temporal ----
 	case "date":

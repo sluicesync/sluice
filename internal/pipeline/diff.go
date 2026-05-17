@@ -161,6 +161,23 @@ func (d *Differ) Run(ctx context.Context) (*ir.SchemaDiff, error) {
 		return nil, wrapWithHint(PhaseConnect, fmt.Errorf("diff: enable PG extensions on source: %w", err))
 	}
 
+	// Engine-default exclusions (Bug 22): same shape as Migrator and
+	// Streamer — merge engine-supplied patterns (e.g. PlanetScale's
+	// `_vt_*`) when the operator is in exclude-or-no-filter mode.
+	// Computed before the read so the Bug-76 scope push-down (below)
+	// matches the authoritative post-read prune.
+	if eff, added := effectiveTableFilter(d.Filter, d.Source, d.SourceDSN); len(added) > 0 {
+		slog.InfoContext(ctx, "applying engine-default table exclusions",
+			slog.String("engine", d.Source.Name()),
+			slog.Any("patterns", added),
+		)
+		d.Filter = eff
+	}
+
+	// catalog Bug 76: scope per-column type validation to the filtered
+	// table set before the schema scan.
+	applyTableScope(sr, d.Filter)
+
 	srcSchema, err := sr.ReadSchema(ctx)
 	if err != nil {
 		return nil, wrapWithHint(PhaseConnect, fmt.Errorf("diff: read source schema: %w", err))
@@ -169,16 +186,6 @@ func (d *Differ) Run(ctx context.Context) (*ir.SchemaDiff, error) {
 		return nil, errors.New("diff: source schema has no tables")
 	}
 
-	// Engine-default exclusions (Bug 22): same shape as Migrator and
-	// Streamer — merge engine-supplied patterns (e.g. PlanetScale's
-	// `_vt_*`) when the operator is in exclude-or-no-filter mode.
-	if eff, added := effectiveTableFilter(d.Filter, d.Source, d.SourceDSN); len(added) > 0 {
-		slog.InfoContext(ctx, "applying engine-default table exclusions",
-			slog.String("engine", d.Source.Name()),
-			slog.Any("patterns", added),
-		)
-		d.Filter = eff
-	}
 	if err := applyTableFilter(ctx, srcSchema, d.Filter); err != nil {
 		return nil, err
 	}

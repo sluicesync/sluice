@@ -5,72 +5,62 @@ package postgres
 
 import (
 	"reflect"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/orware/sluice/internal/ir"
 )
 
-// TestBitBytesMySQLToPG pins the catalog Bug 62 byte re-alignment:
-// MySQL stores BIT(n) right-justified in ceil(n/8) big-endian bytes;
-// PG's bit(n) wire format is left-justified. Byte-aligned widths
-// (BIT(8)/BIT(16)) are a straight copy (the repro shapes); non-byte-
-// aligned widths (BIT(9)) must shift so logical bit 0 is byte 0's MSB.
-func TestBitBytesMySQLToPG(t *testing.T) {
+// TestPrepareValueBit pins the catalog Bug 75 fix: an ir.Bit value is
+// the IR-canonical '0'/'1' bit-string (engine-neutral), and the PG
+// writer must turn it into a pgtype.Bits with PG-left-aligned bytes
+// and the correct Len so pgx's BitsCodec encodes it faithfully under
+// COPY binary / batch INSERT. The prior []byte path silently
+// truncated PG-source values to one byte.
+func TestPrepareValueBit(t *testing.T) {
 	cases := []struct {
-		name string
-		src  []byte
-		n    int
-		want []byte
+		name     string
+		in       string
+		length   int
+		wantByte []byte
+		wantLen  int32
 	}{
-		// BIT(8) b'10100101' = 0xA5 — byte-aligned, identity.
-		{"bit(8) 0xA5", []byte{0xA5}, 8, []byte{0xA5}},
-		// BIT(16) b'1111000011110000' = 0xF0F0 — byte-aligned.
-		{"bit(16) 0xF0F0", []byte{0xF0, 0xF0}, 16, []byte{0xF0, 0xF0}},
-		// BIT(1) value 1 → MSB of the single byte.
-		{"bit(1) one", []byte{0x01}, 1, []byte{0x80}},
-		// BIT(9) value 0b1_0101_0101 (0x155). MySQL right-justified:
-		// [0x01, 0x55]. PG left-justified 9 bits: bit0..bit8 →
-		// byte0 = 1010_1010 (0xAA), byte1 MSB = bit8 (1) → 0x80.
-		{"bit(9) 0x155", []byte{0x01, 0x55}, 9, []byte{0xAA, 0x80}},
-		// BIT(4) value 0b1011 = 0x0B. PG: 1011_0000 = 0xB0.
-		{"bit(4) 0x0B", []byte{0x0B}, 4, []byte{0xB0}},
+		// BIT(8) 10100101 → left-aligned single byte 0xA5.
+		{"bit(8)", "10100101", 8, []byte{0xA5}, 8},
+		// BIT(16) — two bytes, left-aligned.
+		{"bit(16)", "1111000011110000", 16, []byte{0xF0, 0xF0}, 16},
+		// BIT(1) — MSB of the single byte.
+		{"bit(1)", "1", 1, []byte{0x80}, 1},
+		// BIT(9) — 9 bits left-aligned: 1010_1010 1|.......
+		{"bit(9)", "101010101", 9, []byte{0xAA, 0x80}, 9},
+		// BIT(4) 1011 → 1011_0000.
+		{"bit(4)", "1011", 4, []byte{0xB0}, 4},
+		// varbit (Length 0): the value's own length is authoritative.
+		{"varbit", "1100", 0, []byte{0xC0}, 4},
 	}
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			got := bitBytesMySQLToPG(c.src, c.n)
-			if !reflect.DeepEqual(got, c.want) {
-				t.Errorf("bitBytesMySQLToPG(%#v, %d) = %#v; want %#v", c.src, c.n, got, c.want)
+			got, err := prepareValue(c.in, ir.Bit{Length: c.length})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			bits, ok := got.(pgtype.Bits)
+			if !ok {
+				t.Fatalf("got %T; want pgtype.Bits", got)
+			}
+			if bits.Len != c.wantLen || !bits.Valid || !reflect.DeepEqual(bits.Bytes, c.wantByte) {
+				t.Errorf("got %+v; want {Bytes:%#v Len:%d Valid:true}", bits, c.wantByte, c.wantLen)
 			}
 		})
 	}
-}
-
-// TestPrepareValueBit pins that an ir.Bit column's []byte value is
-// wrapped in a pgtype.Bits with the correct Len so pgx's BitsCodec
-// encodes it under COPY binary / batch INSERT (catalog Bug 62).
-func TestPrepareValueBit(t *testing.T) {
-	got, err := prepareValue([]byte{0xA5}, ir.Bit{Length: 8})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	bits, ok := got.(pgtype.Bits)
-	if !ok {
-		t.Fatalf("got %T; want pgtype.Bits", got)
-	}
-	if bits.Len != 8 || !bits.Valid || !reflect.DeepEqual(bits.Bytes, []byte{0xA5}) {
-		t.Errorf("got %+v; want {Bytes:[0xA5] Len:8 Valid:true}", bits)
-	}
-	// Same-engine PG bit value can surface as a '0'/'1' string; pass
-	// through for the codec to parse.
-	gotStr, err := prepareValue("10100101", ir.Bit{Length: 8})
-	if err != nil {
-		t.Fatalf("unexpected error (string path): %v", err)
-	}
-	if gotStr != "10100101" {
-		t.Errorf("string path: got %#v; want %q", gotStr, "10100101")
+	// A non-string ir.Bit value is an upstream decode bug → loud error,
+	// never a silent wrong value.
+	if _, err := prepareValue([]byte{0xA5}, ir.Bit{Length: 8}); err == nil {
+		t.Error("expected error for non-string Bit value; got nil")
 	}
 }
 
@@ -171,7 +161,7 @@ func TestPrepareValueArrayConversion(t *testing.T) {
 			"text array",
 			[]any{"a", "b"},
 			ir.Text{Size: ir.TextLong},
-			pgtype.Array[*string]{Elements: []*string{ptr("a"), ptr("b")}, Dims: []pgtype.ArrayDimension{dim(2)}, Valid: true},
+			pgtype.Array[*pgtype.Text]{Elements: []*pgtype.Text{ptr(pgtype.Text{String: "a", Valid: true}), ptr(pgtype.Text{String: "b", Valid: true})}, Dims: []pgtype.ArrayDimension{dim(2)}, Valid: true},
 		},
 		{
 			"bool array",
@@ -183,7 +173,7 @@ func TestPrepareValueArrayConversion(t *testing.T) {
 			"uuid array",
 			[]any{"00000000-0000-0000-0000-000000000001"},
 			ir.UUID{},
-			pgtype.Array[*string]{Elements: []*string{ptr("00000000-0000-0000-0000-000000000001")}, Dims: []pgtype.ArrayDimension{dim(1)}, Valid: true},
+			pgtype.Array[*pgtype.Text]{Elements: []*pgtype.Text{ptr(pgtype.Text{String: "00000000-0000-0000-0000-000000000001", Valid: true})}, Dims: []pgtype.ArrayDimension{dim(1)}, Valid: true},
 		},
 		// Bug 70: a NULL element inside a typed array. The nil slot
 		// must survive as a typed nil pointer (SQL NULL), not abort
@@ -198,13 +188,7 @@ func TestPrepareValueArrayConversion(t *testing.T) {
 			"text array with NULL element",
 			[]any{"x", nil, "z"},
 			ir.Text{Size: ir.TextLong},
-			pgtype.Array[*string]{Elements: []*string{ptr("x"), nil, ptr("z")}, Dims: []pgtype.ArrayDimension{dim(3)}, Valid: true},
-		},
-		{
-			"numeric[] (string) with NULL element",
-			[]any{"1.5", nil, "3.5"},
-			ir.Decimal{},
-			pgtype.Array[*string]{Elements: []*string{ptr("1.5"), nil, ptr("3.5")}, Dims: []pgtype.ArrayDimension{dim(3)}, Valid: true},
+			pgtype.Array[*pgtype.Text]{Elements: []*pgtype.Text{ptr(pgtype.Text{String: "x", Valid: true}), nil, ptr(pgtype.Text{String: "z", Valid: true})}, Dims: []pgtype.ArrayDimension{dim(3)}, Valid: true},
 		},
 		// Bug 70: a multi-dimensional array. Elements is row-major
 		// flattened and Dims carries the 2-D shape so pgx emits
@@ -255,6 +239,143 @@ func TestPrepareValueArrayWrongElementType(t *testing.T) {
 	_, err := prepareValue([]any{int64(1)}, ir.Array{Element: ir.Text{Size: ir.TextLong}})
 	if err == nil {
 		t.Error("expected error for type mismatch in array element; got nil")
+	}
+}
+
+// The per-family leaf-type matrix (TestConvertArrayPerFamilyLeafAndDims)
+// pins, for every element family, the concrete leaf Go type
+// convertArray must select (catalog Bug 73/74). The leaf type is
+// load-bearing: pgx's ArrayCodec plans the element encode against the
+// *target column element OID*, and a leaf the OID's codec can't plan
+// makes pgx silently flatten ≥2-D arrays (Bug 74) — so it is asserted
+// structurally (leaf type + Dims + NULL positions), not just via a
+// single representative type. The matrix covers every family at 1-D,
+// multi-dim (2-D), and with a NULL element — the class-closing shape
+// the v0.69.3 review gap missed.
+
+func dimsOf(v any) []pgtype.ArrayDimension {
+	return reflect.ValueOf(v).FieldByName("Dims").Interface().([]pgtype.ArrayDimension)
+}
+
+func nullMask(v any) []bool {
+	els := reflect.ValueOf(v).FieldByName("Elements")
+	out := make([]bool, els.Len())
+	for i := 0; i < els.Len(); i++ {
+		out[i] = els.Index(i).IsNil()
+	}
+	return out
+}
+
+func leafType(v any) reflect.Type {
+	// pgtype.Array[*T] -> *T -> T
+	return reflect.TypeOf(v).Field(0).Type.Elem().Elem()
+}
+
+func TestConvertArrayPerFamilyLeafAndDims(t *testing.T) {
+	// IR Go value forms as decodeValue produces them per family:
+	//   int64 / float64 / bool / string / time.Time.
+	ts := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	cases := []struct {
+		name string
+		elem ir.Type
+		one  any // a single representative non-nil element value
+		leaf reflect.Type
+	}{
+		{"integer", ir.Integer{Width: 32}, int64(7), reflect.TypeOf(int64(0))},
+		{"float", ir.Float{}, float64(1.5), reflect.TypeOf(float64(0))},
+		{"boolean", ir.Boolean{}, true, reflect.TypeOf(false)},
+		{"text", ir.Text{Size: ir.TextLong}, "a", reflect.TypeOf(pgtype.Text{})},
+		{"varchar", ir.Varchar{Length: 10}, "a", reflect.TypeOf(pgtype.Text{})},
+		{"char", ir.Char{Length: 3}, "abc", reflect.TypeOf(pgtype.Text{})},
+		{"uuid", ir.UUID{}, "00000000-0000-0000-0000-000000000001", reflect.TypeOf(pgtype.Text{})},
+		{"inet", ir.Inet{}, "10.0.0.1", reflect.TypeOf(pgtype.Text{})},
+		{"cidr", ir.Cidr{}, "10.0.0.0/24", reflect.TypeOf(pgtype.Text{})},
+		{"macaddr", ir.Macaddr{}, "08:00:2b:01:02:03", reflect.TypeOf(pgtype.Text{})},
+		{"decimal", ir.Decimal{}, "1.5", reflect.TypeOf(pgtype.Numeric{})},
+		{"date", ir.Date{}, ts, reflect.TypeOf(pgtype.Date{})},
+		{"datetime", ir.DateTime{}, ts, reflect.TypeOf(pgtype.Timestamp{})},
+		{"timestamp", ir.Timestamp{}, ts, reflect.TypeOf(pgtype.Timestamp{})},
+		{"timestamptz", ir.Timestamp{WithTimeZone: true}, ts, reflect.TypeOf(pgtype.Timestamptz{})},
+		{"time", ir.Time{}, "01:02:03", reflect.TypeOf(pgtype.Time{})},
+		{"time-frac", ir.Time{}, "23:59:59.123456", reflect.TypeOf(pgtype.Time{})},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			// 1-D with a NULL element: [v, nil, v]
+			got1, err := convertArray([]any{c.one, nil, c.one}, c.elem)
+			if err != nil {
+				t.Fatalf("1-D: unexpected error: %v", err)
+			}
+			if lt := leafType(got1); lt != c.leaf {
+				t.Fatalf("1-D leaf type = %v, want %v", lt, c.leaf)
+			}
+			if d := dimsOf(got1); len(d) != 1 || d[0].Length != 3 {
+				t.Fatalf("1-D dims = %+v, want [{3,1}]", d)
+			}
+			if m := nullMask(got1); !reflect.DeepEqual(m, []bool{false, true, false}) {
+				t.Fatalf("1-D null mask = %v, want [false true false]", m)
+			}
+
+			// multi-dim 2x2 with a NULL element.
+			got2, err := convertArray(
+				[]any{[]any{c.one, nil}, []any{c.one, c.one}}, c.elem)
+			if err != nil {
+				t.Fatalf("2-D: unexpected error: %v", err)
+			}
+			if lt := leafType(got2); lt != c.leaf {
+				t.Fatalf("2-D leaf type = %v, want %v", lt, c.leaf)
+			}
+			d := dimsOf(got2)
+			if len(d) != 2 || d[0].Length != 2 || d[1].Length != 2 {
+				t.Fatalf("2-D dims = %+v, want [{2,1},{2,1}]", d)
+			}
+			if m := nullMask(got2); !reflect.DeepEqual(m, []bool{false, true, false, false}) {
+				t.Fatalf("2-D null mask = %v, want [false true false false]", m)
+			}
+		})
+	}
+}
+
+// TestConvertArrayTimetzLoudRefuse pins the loud-failure decision for
+// timetz arrays (catalog Bug 73/74 boundary): no faithful binary array
+// leaf exists, so convertArray must refuse loudly rather than silently
+// flatten/corrupt. A refused migration beats a silently corrupted one.
+func TestConvertArrayTimetzLoudRefuse(t *testing.T) {
+	_, err := convertArray([]any{"01:02:03+05"}, ir.Time{WithTimeZone: true})
+	if err == nil {
+		t.Fatal("expected loud refusal for timetz array; got nil")
+	}
+	if !strings.Contains(err.Error(), "timetz") {
+		t.Errorf("error %q should name timetz", err)
+	}
+}
+
+// TestTimeOfDayMicros pins the IR time-of-day string → microseconds
+// conversion (the pgtype.Time leaf unit). Sub-second precision is
+// right-padded to microseconds; PG `time` resolution is microsecond.
+func TestTimeOfDayMicros(t *testing.T) {
+	cases := []struct {
+		in   string
+		want int64
+	}{
+		{"00:00:00", 0},
+		{"01:02:03", 1*3_600_000_000 + 2*60_000_000 + 3*1_000_000},
+		{"23:59:59.123456", 23*3_600_000_000 + 59*60_000_000 + 59*1_000_000 + 123456},
+		{"12:00:00.5", 12*3_600_000_000 + 500000},
+		{"12:00:00.123456789", 12*3_600_000_000 + 123456}, // truncated to µs
+	}
+	for _, c := range cases {
+		got, err := timeOfDayMicros(c.in)
+		if err != nil {
+			t.Fatalf("%q: unexpected error: %v", c.in, err)
+		}
+		if got != c.want {
+			t.Errorf("%q -> %d, want %d", c.in, got, c.want)
+		}
+	}
+	if _, err := timeOfDayMicros("not-a-time"); err == nil {
+		t.Error("expected error for malformed time-of-day")
 	}
 }
 

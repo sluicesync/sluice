@@ -83,10 +83,16 @@ func emitColumnType(t ir.Type, opts emitOpts) (string, error) {
 		// Postgres has only one binary type, BYTEA.
 		return "BYTEA", nil
 	case ir.Bit:
-		// Fixed-width bit string. PG's bit(N) round-trips MySQL BIT(N)
-		// losslessly (catalog Bug 62). BIT(1) never reaches here — the
-		// MySQL reader maps the conventional single-bit column to
-		// ir.Boolean (→ BOOLEAN).
+		// Fixed-width / varying bit string. PG's bit(N) round-trips
+		// MySQL BIT(N) losslessly (catalog Bug 62). A varying source
+		// (PG `bit varying`) must emit BIT VARYING(N) — emitting fixed
+		// BIT(N) loud-rejected any shorter value with SQLSTATE 22026
+		// (catalog Bug 75, exposed once the value path became
+		// faithful). BIT(1) never reaches here — the MySQL reader maps
+		// the conventional single-bit column to ir.Boolean (→ BOOLEAN).
+		if v.Varying {
+			return fmt.Sprintf("BIT VARYING(%d)", v.Length), nil
+		}
 		return fmt.Sprintf("BIT(%d)", v.Length), nil
 
 	// ---- Temporal ----

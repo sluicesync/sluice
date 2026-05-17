@@ -121,6 +121,32 @@ func applyVerbatimExtensionPassthrough(target any, enabled bool) {
 	}
 }
 
+// applyTableScope threads the operator's table filter to a freshly-
+// opened source [ir.SchemaReader] via the optional [ir.TableScoper]
+// surface, so per-column type validation is scoped to the
+// to-be-migrated tables (catalog Bug 76). Engines that don't implement
+// TableScoper (today: MySQL) skip cleanly — the authoritative
+// post-read [applyTableFilter] still prunes the schema there; only the
+// Bug-76 usability gap (a scoped-out unsupported column aborting the
+// run) remains until that engine grows the same push-down.
+//
+// An empty filter is still threaded: the predicate then admits every
+// table, which is exactly the unscoped behaviour, so this is safe to
+// call unconditionally. The filter passed here MUST already have
+// engine-default exclusions merged (effectiveTableFilter) so the
+// push-down matches the post-read prune.
+func applyTableScope(reader any, filter TableFilter) {
+	scoper, ok := reader.(ir.TableScoper)
+	if !ok {
+		return
+	}
+	if filter.IsEmpty() {
+		scoper.SetTableScope(nil)
+		return
+	}
+	scoper.SetTableScope(filter.Allows)
+}
+
 // verbatimLiveSameEnginePG reports whether a LIVE run (migrate / sync)
 // qualifies for the ADR-0047 verbatim tier: both engines are present
 // and are the same PostgreSQL engine. This is the orchestrator's

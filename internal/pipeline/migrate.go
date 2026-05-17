@@ -313,6 +313,12 @@ func (m *Migrator) Run(ctx context.Context) error {
 	// the existing loud refusal (tier (c)) is preserved unchanged.
 	applyVerbatimExtensionPassthrough(sr, verbatimLiveSameEnginePG(m.Source, m.Target))
 
+	// catalog Bug 76: scope per-column type validation to the
+	// to-be-migrated tables. m.Filter already has engine-default
+	// exclusions merged just above, so this push-down matches the
+	// authoritative post-read applyTableFilter prune below.
+	applyTableScope(sr, m.Filter)
+
 	schema, err := sr.ReadSchema(ctx)
 	if err != nil {
 		return wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: read source schema: %w", err))

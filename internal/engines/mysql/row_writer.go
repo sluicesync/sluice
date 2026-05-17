@@ -472,6 +472,20 @@ func prepareValue(v any, col *ir.Column) any {
 			}
 		}
 	}
+	// catalog Bug 75: an ir.Bit value is the IR-canonical '0'/'1'
+	// bit-string. MySQL's BIT(N) column accepts ceil(N/8) big-endian,
+	// right-justified bytes (and loud-rejects the digit string with
+	// "Data too long"). Convert here so PG-source / MySQL-source bit
+	// values both land faithfully. A malformed bit string is an
+	// upstream decode bug; we let the engine reject the raw value
+	// rather than silently substituting a wrong one.
+	if _, isBit := t.(ir.Bit); isBit {
+		if s, ok := v.(string); ok {
+			if b, err := ir.BitStringToBytesBE(s); err == nil {
+				return b
+			}
+		}
+	}
 	return v
 }
 
