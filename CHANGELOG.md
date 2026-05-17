@@ -6,6 +6,22 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.69.3]
+
+**Closes Bug 70 (HIGH) / 71 / 72 — all surfaced by the v0.69.2 terminal battle-test; all pre-existing (byte-identical ≤v0.69.1), all LOUD (exit 1, clear error, no data corruption — the silent-loss class was already fully closed by Bug 68/69).** Bug 69's DDL fix removed the `22023` early-abort that had been masking #70/#71 on PG→PG.
+
+### Fixed
+
+- **Bug 70 (HIGH, PG→PG) — nullable / multi-dimensional array `COPY` hard-fail.** A SQL-NULL *element* inside any typed array (`int[]`/`text[]`/`numeric[]`) and any multi-dimensional array (`int[][]`) blew up the PG `COPY`-protocol writer (`SQLSTATE 57014`, 0 rows): the encoder built non-pointer element slices, so a nil slot (`got <nil>`) and a nested `[]any` (`got []interface {}`) both failed. A pgx subtlety compounded it — `pgtype.Map`'s wrap chain matches `TryWrapSliceEncodePlan` *before* `TryWrapMultiDimSliceEncodePlan`, flattening `[][]*T` to one dimension. Fix: the encoder now emits `pgtype.Array[*T]` (itself an `ArrayGetter`, so it bypasses the wrap chain; a pointer leaf carries a typed-nil = SQL NULL; explicit `Dims` + row-major-flat `Elements` preserve dimensionality). Faithful round-trip: NULL element → NULL element, `int[][]` → `int[][]`. This is the write-side counterpart to Bug 68's read-side multi-dim fix (different engine-writer/direction than #18 / Bug 68 — regression-guarded).
+- **Bug 71 (MEDIUM, PG→PG) — `timetz` mis-mapped to `time`.** `time with time zone` was mapped identically to plain `time` (the IR carried no time-zone flag), emitting OID 1083 and failing `COPY` (`57014`); pgx also ships no codec for `timetz` (OID 1266). Fix: `ir.Time` gains `WithTimeZone` (additive bool-variant idiom, mirrors `ir.Timestamp`; default-false → plain `time` byte-identical). The PG writer emits `TIME WITH TIME ZONE` and registers a per-connection binary codec for OID 1266 (the validated pgvector/hstore registration pattern). PG→PG round-trips the offset exactly; PG→MySQL zone-flattens (MySQL has no tz-aware time) mirroring the **documented** `timestamptz`→MySQL precedent — loud/documented, not silent.
+- **Bug 72 (MEDIUM, PG→MySQL) — wide bounded `varchar(N)` not down-mapped.** Unbounded `text` was already down-mapped to `LONGTEXT`, but a wide *bounded* `varchar(N)` was emitted literally → MySQL Error 1074 (column length) / 1118 (row size) at create-tables. Fix: `varchar(N > 16000)` is down-mapped to the smallest MySQL `TEXT` tier that holds N characters at worst-case bytes (mirrors the existing text→LONGTEXT logic), with a loud advisory at preview + preflight (the unsigned-bigint/numeric notice pattern). Small `varchar` is unchanged.
+
+Cross-engine policies (Bug 71 `timetz`→MySQL, Bug 72 wide-varchar→TEXT) recorded in `docs/type-mapping.md` (owner-overridable).
+
+### Compatibility
+
+Drop-in from v0.69.2; no state/format change (the backup envelope gains an append-only `time_with_tz` field). Strictly corrective. **Internal:** `ir.Time` gained `WithTimeZone` (the IR is not a stable/exported interface). PG→PG nullable/multi-dim arrays and `timetz` now migrate (were `COPY` hard-fails); PG→MySQL wide `varchar` now migrates with a loud advisory (was a create-tables hard fail). Bug 68/69, #18, constrained types, plain `time`/`timestamp`/`timestamptz`, MySQL→PG, PG→PG baseline, and cross-engine extension paths are regression-guarded — Option-C `-race`+Integration CI green before the tag.
+
 ## [0.69.2]
 
 **Closes Bug 69 (HIGH — PG→PG hard-fail + PG→MySQL silent decimal-precision loss; surfaced by the v0.69.1 close-out battle-test).** An **unconstrained** PostgreSQL `numeric`/`numeric[]` column (declared `numeric` with NO precision/scale — arbitrary precision, a ubiquitous PG column shape) was mis-emitted: **PG→PG** → `NUMERIC(0,0)` → `SQLSTATE 22023` hard create-tables failure (loud, exit 1, no partial); **PG→MySQL** → `DECIMAL(0,0)` → **silent decimal-precision data loss** (exit 0, no `WARN`: `3.14159` → `3`). **Pre-existing** (byte-identical on v0.69.0/earlier; *not* a v0.69.x regression), orthogonal to Bug 68 — masked in every prior verdict because the battle-test corpus used only *constrained* `NUMERIC(15,2)`.
