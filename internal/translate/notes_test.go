@@ -156,7 +156,7 @@ func TestHintsFor_MySQL_DATETIME_to_PG(t *testing.T) {
 }
 
 func TestHintsFor_PG_UnboundedNumeric_to_MySQL(t *testing.T) {
-	src := col("amount", ir.Decimal{Precision: 0, Scale: 0})
+	src := col("amount", ir.Decimal{Unconstrained: true})
 	tgt := col("amount", ir.Decimal{Precision: 65, Scale: 30})
 	got := HintsFor("ledger", src, tgt, "postgres", "mysql")
 	if len(got) != 1 {
@@ -220,7 +220,8 @@ func TestRenderTypeForNote_Coverage(t *testing.T) {
 		{ir.DateTime{Precision: 6}, "postgres", "timestamp(6)"},
 		{ir.DateTime{Precision: 6}, "mysql", "datetime(6)"},
 		{ir.Timestamp{Precision: 6, WithTimeZone: true}, "postgres", "timestamp(6)tz"},
-		{ir.Decimal{}, "postgres", "numeric"},
+		{ir.Decimal{Unconstrained: true}, "postgres", "numeric"},
+		{ir.Decimal{Unconstrained: true}, "mysql", "decimal(65,30)"},
 		{ir.Decimal{Precision: 10, Scale: 2}, "postgres", "numeric(10,2)"},
 		{ir.Decimal{Precision: 10, Scale: 2}, "mysql", "decimal(10,2)"},
 	}

@@ -57,6 +57,12 @@ func emitColumnType(t ir.Type, opts emitOpts) (string, error) {
 	case ir.Integer:
 		return emitIntegerType(v), nil
 	case ir.Decimal:
+		if v.Unconstrained {
+			// Bare arbitrary-precision numeric (catalog Bug 69). PG's
+			// native unbounded form — emitting NUMERIC(0,0) here was the
+			// 22023 hard-fail.
+			return "NUMERIC", nil
+		}
 		return fmt.Sprintf("NUMERIC(%d,%d)", v.Precision, v.Scale), nil
 	case ir.Float:
 		if v.Precision == ir.FloatSingle {

@@ -29,6 +29,17 @@ func emitColumnType(t ir.Type) (string, error) {
 	case ir.Integer:
 		return emitIntegerType(v), nil
 	case ir.Decimal:
+		if v.Unconstrained {
+			// MySQL has no unbounded DECIMAL. Emit the widest
+			// representable form — DECIMAL(65,30), MySQL's documented
+			// maximum precision (65) and scale (30). This preserves far
+			// more than the pre-fix DECIMAL(0,0) silent truncation; the
+			// deliberate, operator-overridable narrowing is surfaced
+			// loudly by translate.UnconstrainedNumericNoticeError at
+			// both `schema preview` and `migrate` preflight (catalog
+			// Bug 69; mirrors the bigint-unsigned precedent).
+			return "DECIMAL(65,30)", nil
+		}
 		return fmt.Sprintf("DECIMAL(%d,%d)", v.Precision, v.Scale), nil
 	case ir.Float:
 		if v.Precision == ir.FloatSingle {

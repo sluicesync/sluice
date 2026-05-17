@@ -26,6 +26,7 @@ func TestEmitColumnType(t *testing.T) {
 		{"int unsigned", ir.Integer{Width: 32, Unsigned: true}, "INT UNSIGNED"},
 		{"bigint unsigned auto_increment", ir.Integer{Width: 64, Unsigned: true, AutoIncrement: true}, "BIGINT UNSIGNED AUTO_INCREMENT"},
 		{"decimal", ir.Decimal{Precision: 10, Scale: 2}, "DECIMAL(10,2)"},
+		{"decimal unconstrained (Bug 69)", ir.Decimal{Unconstrained: true}, "DECIMAL(65,30)"},
 		{"float single", ir.Float{Precision: ir.FloatSingle}, "FLOAT"},
 		{"float double", ir.Float{Precision: ir.FloatDouble}, "DOUBLE"},
 

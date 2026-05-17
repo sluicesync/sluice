@@ -435,6 +435,23 @@ func (m *Migrator) Run(ctx context.Context) error {
 		); noticeErr != nil {
 			slog.WarnContext(ctx, noticeErr.Error())
 		}
+
+		// ---- 1.68. Unconstrained-numeric widening notice (Bug 69) ----
+		// An unconstrained PG `numeric` (no declared precision/scale)
+		// maps to MySQL `DECIMAL(65,30)` (MySQL has no unbounded
+		// DECIMAL). The pre-fix behaviour silently truncated to
+		// DECIMAL(0,0); this preserves far more and surfaces the
+		// deliberate widening LOUDLY here (and at `schema preview`) so
+		// it is never silent. NOTICE, not a refusal — unconstrained
+		// numeric is ubiquitous in PG schemas and must still migrate.
+		// PG → PG is unaffected (round-trips as bare NUMERIC); the scan
+		// short-circuits non-MySQL targets. Emitted at WARN so it
+		// stands out in default-level logs.
+		if noticeErr := translate.UnconstrainedNumericNoticeError(
+			schema, m.Source.Name(), m.Target.Name(), "migrate",
+		); noticeErr != nil {
+			slog.WarnContext(ctx, noticeErr.Error())
+		}
 	}
 
 	if m.DryRun {

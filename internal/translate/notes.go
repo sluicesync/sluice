@@ -267,10 +267,10 @@ var hintEntries = []hintEntry{
 				return false
 			}
 			d, ok := src.Type.(ir.Decimal)
-			// "Unbounded" PG numeric arrives as Precision=0 from the
-			// PG schema reader; bounded numerics carry their declared
-			// precision/scale.
-			return ok && d.Precision == 0
+			// Unbounded PG numeric arrives as ir.Decimal{Unconstrained:
+			// true} from the PG schema reader (catalog Bug 69); bounded
+			// numerics carry their declared precision/scale.
+			return ok && d.Unconstrained
 		},
 		message:        "PG unbounded numeric -> MySQL DECIMAL(65,30); for narrower storage, override to decimal:precision=N,scale=M",
 		suggestedAlias: "decimal:precision=N,scale=M",
@@ -298,11 +298,13 @@ func renderTypeForNote(t ir.Type, engine string) string {
 	case ir.Integer:
 		return renderInteger(v, engine)
 	case ir.Decimal:
-		if v.Precision == 0 {
+		if v.Unconstrained {
 			if engine == "postgres" {
 				return "numeric"
 			}
-			return fmt.Sprintf("decimal(%d,%d)", v.Precision, v.Scale)
+			// MySQL target renders the unconstrained numeric as the
+			// widest representable DECIMAL (catalog Bug 69).
+			return "decimal(65,30)"
 		}
 		if engine == "postgres" {
 			return fmt.Sprintf("numeric(%d,%d)", v.Precision, v.Scale)

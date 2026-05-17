@@ -179,6 +179,7 @@ When the IR is emitted as MySQL DDL, the inverse mapping applies, with the follo
 
   The `mappings:` YAML hook and `--type-override` CLI flag continue to override the auto-shape for operators who want different storage (e.g. binary representations, `LONGTEXT` for array serialisation).
 - `Timestamp{WithTimeZone: false}` is emitted as `DATETIME`.
+- `Decimal{Unconstrained: true}` (an unconstrained Postgres `numeric`) is emitted as `DECIMAL(65,30)` — MySQL's widest representable fixed-point form, since MySQL has no unbounded DECIMAL — plus a loud, operator-overridable widening advisory at `schema preview` and `migrate` preflight. Constrained `Decimal{Precision, Scale}` emits `DECIMAL(p,s)` unchanged. See the [unconstrained numeric](#unconstrained-postgres-numeric-no-precisionscale--owner-surface-design-call-v069x--bug-69) edge case.
 
 ## PostgreSQL ↔ IR
 
@@ -192,6 +193,7 @@ When the IR is emitted as MySQL DDL, the inverse mapping applies, with the follo
 | `bigint`                          | `Integer{Width: 64}`                          | |
 | `serial`, `bigserial`             | `Integer{..., AutoIncrement: true}`           | Sequence is recorded but managed at emit time. |
 | `numeric(p,s)` / `decimal(p,s)`   | `Decimal{Precision, Scale}`                   | |
+| `numeric` / `decimal` (bare)      | `Decimal{Unconstrained: true}`                | Arbitrary precision; `numeric_precision`/`numeric_scale` are NULL. See [unconstrained numeric](#unconstrained-postgres-numeric-no-precisionscale--owner-surface-design-call-v069x--bug-69). |
 | `real`                            | `Float{Single}`                               | |
 | `double precision`                | `Float{Double}`                               | |
 | `char(n)` / `character(n)`        | `Char{Length: n}`                             | |
@@ -215,6 +217,7 @@ When the IR is emitted as MySQL DDL, the inverse mapping applies, with the follo
 - `Integer{Unsigned: true}` widens by one rank: 8→`smallint`, 16→`integer`, 24/32→`bigint`, **64→`bigint` (uniform)**. The widening is documented in a per-run report. See the [MySQL unsigned integers](#mysql-unsigned-integers) edge case below for the load-bearing `bigint unsigned` policy and the deliberate range narrowing it carries.
 - `Enum{}` defaults to a Postgres `enum` type (`CREATE TYPE foo AS ENUM (...)`). Per-column override available to emit as `text` with a `CHECK` constraint instead, which is more flexible at the cost of speed.
 - `Set{}` from a MySQL source is emitted as `text[]` plus a `CHECK` constraint enforcing membership. Storage is larger but semantics are preserved.
+- `Decimal{Unconstrained: true}` is emitted as bare `NUMERIC` (no parentheses) — PostgreSQL's native arbitrary-precision form. Constrained `Decimal{Precision, Scale}` emits `NUMERIC(p,s)` unchanged. See the [unconstrained numeric](#unconstrained-postgres-numeric-no-precisionscale--owner-surface-design-call-v069x--bug-69) edge case.
 - `Boolean{}` is emitted as `boolean`.
 - `JSON{Binary: false}` is emitted as `jsonb` by default, since `jsonb` is almost always the right choice on Postgres. Override available.
 - `Geometry{}` requires the PostGIS extension; if PostGIS is not in the allowlist, the run errors with an explicit message.
@@ -244,6 +247,22 @@ PostgreSQL has no unsigned integer types.
 - **The narrowing is surfaced LOUDLY, never silently.** Both `sluice schema preview` and `sluice migrate` preflight emit a dedicated, operator-actionable **unsigned-bigint range-narrowing notice** that names every affected `table.column`, states the `2^63-1` ceiling, and gives the per-column override. It is an *advisory notice* (the migration proceeds — the universal ORM schema must still migrate), not a hard refusal, but it is visible at both surfaces (a section in `schema preview` output / JSON `unsigned_bigint_narrowings`, and a `WARN` log line at `migrate` preflight). The loud-failure tenet is satisfied by the loud notice, not by silently narrowing.
 
 **Override:** for a column that genuinely stores values above `2^63-1`, supply `--type-override TABLE.COL=numeric` (or the per-column `mappings:` hook) to keep the full unsigned 64-bit range as `numeric(20,0)`. Note such a column then *cannot* also be an `IDENTITY`/`AUTO_INCREMENT` key — that combination is impossible in PostgreSQL and is precisely why the default cannot be `numeric` for autoincrement keys.
+
+### Unconstrained Postgres `numeric` (no precision/scale) — owner-surface design call (v0.69.x / Bug #69)
+
+A PostgreSQL column declared as bare `numeric` / `decimal` with **no precision or scale** is *arbitrary precision* — PostgreSQL stores whatever the value requires. This is an extremely common PG column shape. `information_schema` reports both `numeric_precision` and `numeric_scale` as **NULL** for such a column. The IR models this distinctly from a bounded `numeric(p,s)` via `ir.Decimal.Unconstrained`; collapsing the absent precision to `(0,0)` (the pre-fix behaviour) was catalog Bug 69 — `NUMERIC(0,0)` on a PG target (hard fail, `SQLSTATE 22023`) and `DECIMAL(0,0)` on a MySQL target (**silent decimal-precision data loss**: `3.14159` → `3`, exit 0, no warning at any level).
+
+**PG-target policy (PG → PG):** emit bare `NUMERIC` (no parentheses) — PostgreSQL's native arbitrary-precision form. The value round-trips byte-identically; there is no narrowing and no advisory. Constrained `numeric(p,s)` is unchanged.
+
+**MySQL-target policy (PG → MySQL — deliberate widening, read this):** MySQL has no unbounded `DECIMAL`. An unconstrained `numeric` maps **uniformly to `DECIMAL(65,30)`** — MySQL's documented maximum precision (65) and scale (30), the widest representable fixed-point form. This is an intentional, documented cross-engine policy, mirroring the `bigint unsigned` precedent above:
+
+- **It preserves far more than the alternatives.** `DECIMAL(65,30)` keeps up to 35 integer digits and 30 fractional digits. The pre-fix `DECIMAL(0,0)` silently truncated every fractional value to an integer. A hard refusal would over-block: unconstrained `numeric` is ubiquitous in PG schemas (default for `NUMERIC` columns in countless ORMs and hand-written schemas), so refusing it would block the majority of real PG→MySQL migrations.
+- **Any value exceeding 65/30 is astronomically rare and has no wider MySQL home.** There is no MySQL type that stores more — `DECIMAL(65,30)` is the ceiling.
+- **The widening is surfaced LOUDLY, never silently.** Both `sluice schema preview` and `sluice migrate` preflight emit a dedicated, operator-actionable **unconstrained-numeric widening notice** that names every affected `table.column`, states the `DECIMAL(65,30)` ceiling, and gives the per-column override. It is an *advisory notice* (the migration proceeds), not a hard refusal, visible at both surfaces (a section in `schema preview` output / JSON `unconstrained_numeric_widenings`, and a `WARN` log line at `migrate` preflight). The loud-failure tenet is satisfied by the loud notice, not by silently narrowing. This is the same renderer/preflight wiring as the unsigned-bigint notice.
+
+**`numeric[]` (array of unconstrained numeric):** on a PG target the array round-trips as `NUMERIC[]` (each element bare `NUMERIC`, lossless, no advisory). On a MySQL target the whole array column lands as `JSON` (the [Postgres ARRAY → MySQL](#postgres-array--mysql) policy) — the values are stored as JSON text with no decimal-precision loss, so the widening advisory does **not** fire for the array case (there is nothing to narrow).
+
+**Override:** for a column that needs a specific precision/scale (to recover storage, or because values exceed 65/30), supply `--type-override TABLE.COL=decimal:precision=N,scale=M` (or the per-column `mappings:` hook).
 
 ### MySQL ENUM and SET → Postgres
 
