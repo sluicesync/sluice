@@ -205,7 +205,12 @@ func TestRenderTypeForNote_Coverage(t *testing.T) {
 		{ir.Boolean{}, "mysql", "tinyint(1)"},
 		{ir.Boolean{}, "postgres", "boolean"},
 		{ir.Integer{Width: 64, Unsigned: true}, "mysql", "bigint unsigned"},
-		{ir.Integer{Width: 64, Unsigned: true}, "postgres", "numeric(20,0)"},
+		// Bug 11: `bigint unsigned` renders as PG `bigint` (uniform
+		// mapping), matching the DDL emitter. The (2^63, 2^64) loss is
+		// surfaced via the dedicated unsigned-bigint notice, not a
+		// divergent type rendering.
+		{ir.Integer{Width: 64, Unsigned: true}, "postgres", "bigint"},
+		{ir.Integer{Width: 64, Unsigned: true, AutoIncrement: true}, "postgres", "bigint"},
 		{ir.UUID{}, "postgres", "uuid"},
 		{ir.UUID{}, "mysql", "char(36)"},
 		{ir.JSON{Binary: true}, "postgres", "jsonb"},

@@ -196,14 +196,30 @@ func emitColumnType(t ir.Type, opts emitOpts) (string, error) {
 // expanding unsigned widths to the next signed rank (Postgres has no
 // unsigned integers) and using GENERATED IDENTITY for auto-increment.
 //
-// BIGINT UNSIGNED that isn't auto-increment widens to NUMERIC(20,0).
-// For BIGINT UNSIGNED that IS auto-increment we emit BIGINT IDENTITY
-// and accept the small risk that values may exceed MaxInt64 — in
-// practice an extreme corner case.
+// BIGINT UNSIGNED maps UNIFORMLY to PG BIGINT — for PK, FK-child, and
+// standalone columns alike (Bug 11). The earlier policy split the two
+// cases (NUMERIC(20,0) for plain, BIGINT for AUTO_INCREMENT) because
+// PG's `GENERATED ... AS IDENTITY` is only valid on smallint/integer/
+// bigint, never numeric — so an AUTO_INCREMENT PK *had* to stay BIGINT
+// while a plain column widened to NUMERIC(20,0). That divergence made
+// a `bigint unsigned` FK child (→ NUMERIC(20,0)) type-incompatible with
+// the `bigint unsigned AUTO_INCREMENT` PK it referenced (→ BIGINT
+// IDENTITY): ADD FOREIGN KEY failed SQLSTATE 42804. Since the universal
+// Rails/Laravel/Django/Sequelize/Prisma schema is exactly
+// `id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY` + `*_id BIGINT
+// UNSIGNED` FKs, every default ORM schema hit this.
+//
+// Mapping uniformly to BIGINT makes the PK and FK types match by
+// construction (no FK/schema-graph machinery) and keeps IDENTITY valid.
+// The tradeoff: PG has no uint64, so values in (2^63-1, 2^64-1] are not
+// representable — a deliberate, documented range narrowing (the
+// industry-standard pragmatic mapping, cf. pgloader). It is surfaced
+// LOUDLY via the bigint-unsigned narrowing notice at both `schema
+// preview` and `migrate` preflight (see translate.UnsignedBigintNotices
+// / Refuses... ) so it is never silent. Operators needing the full
+// 2^64 range override per-column with `--type-override
+// TABLE.COL=numeric` (numeric(20,0) for a non-IDENTITY column).
 func emitIntegerType(i ir.Integer) string {
-	if i.Unsigned && i.Width == 64 && !i.AutoIncrement {
-		return "NUMERIC(20,0)"
-	}
 	width := effectiveWidth(i)
 	typeName := postgresIntName(width)
 	if i.AutoIncrement {
@@ -214,7 +230,10 @@ func emitIntegerType(i ir.Integer) string {
 
 // effectiveWidth returns the width Postgres should use for an integer
 // column, widening one rank for unsigned values (so the original
-// numeric range still fits).
+// numeric range still fits). The 64-bit unsigned case maps to 64 (PG
+// BIGINT) rather than a wider numeric — see [emitIntegerType] for the
+// Bug 11 rationale and the loud range-narrowing notice that surfaces
+// the (2^63, 2^64) loss to the operator.
 func effectiveWidth(i ir.Integer) int8 {
 	if !i.Unsigned {
 		return i.Width

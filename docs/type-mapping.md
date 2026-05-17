@@ -212,7 +212,7 @@ When the IR is emitted as MySQL DDL, the inverse mapping applies, with the follo
 
 ### Writer policies
 
-- `Integer{Unsigned: true}` widens by one rank: 8→16, 16→32, 32→64, 64→`numeric(20,0)`. The widening is documented in a per-run report.
+- `Integer{Unsigned: true}` widens by one rank: 8→`smallint`, 16→`integer`, 24/32→`bigint`, **64→`bigint` (uniform)**. The widening is documented in a per-run report. See the [MySQL unsigned integers](#mysql-unsigned-integers) edge case below for the load-bearing `bigint unsigned` policy and the deliberate range narrowing it carries.
 - `Enum{}` defaults to a Postgres `enum` type (`CREATE TYPE foo AS ENUM (...)`). Per-column override available to emit as `text` with a `CHECK` constraint instead, which is more flexible at the cost of speed.
 - `Set{}` from a MySQL source is emitted as `text[]` plus a `CHECK` constraint enforcing membership. Storage is larger but semantics are preserved.
 - `Boolean{}` is emitted as `boolean`.
@@ -235,9 +235,15 @@ MySQL accepts `'0000-00-00'` as a `DATE` value when `NO_ZERO_DATE` is not in `sq
 
 PostgreSQL has no unsigned integer types.
 
-**Default policy:** widen to the next signed integer rank, falling back to `numeric(20,0)` for `BIGINT UNSIGNED`. Widening is reported per-column.
+**Default policy (`tinyint`/`smallint`/`mediumint`/`int` unsigned):** widen to the next signed integer rank — `tinyint unsigned`→`smallint`, `smallint unsigned`→`integer`, `mediumint unsigned`→`integer`, `int unsigned`→`bigint`. The original numeric range still fits losslessly. Widening is reported per-column. This mapping is consistent across PK / FK-child / standalone columns, so a foreign key matches its referenced primary key by construction.
 
-**Override:** `unsigned_strategy: widen | numeric | check_constraint`. The `check_constraint` option keeps the original width and adds a `CHECK (col >= 0)`, accepting that values above `MAXINT` would overflow at apply time.
+**`bigint unsigned` policy (deliberate range narrowing — read this):** `bigint unsigned` maps **uniformly to PostgreSQL `bigint`** — for primary keys, foreign-key child columns, and standalone columns alike. PostgreSQL has no unsigned 64-bit type, so the upper half of the range — values in `(2^63-1, 2^64-1]` — is **not representable on the target**. This is an intentional, documented cross-engine policy, not a silent wart, for these reasons:
+
+- **It is the only mapping that keeps FK types consistent.** PostgreSQL's `GENERATED ... AS IDENTITY` is valid only on `smallint`/`integer`/`bigint`, never `numeric`. A `bigint unsigned AUTO_INCREMENT PRIMARY KEY` therefore *must* emit `bigint ... IDENTITY`. If a plain `bigint unsigned` FK child column instead widened to `numeric(20,0)` (the pre-v0.68.2 policy), the FK column type would not match the IDENTITY PK type and `ALTER TABLE ... ADD FOREIGN KEY` would fail `SQLSTATE 42804` (datatype mismatch) — after the target was partially created. `id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY` + `*_id BIGINT UNSIGNED` foreign keys is the *default* schema shape of essentially every Rails / Laravel / Django / Sequelize / Prisma MySQL application, so the pre-fix policy broke the most common real-world migration with no `schema preview` warning. The uniform `bigint` mapping makes PK and FK types match by construction with zero schema-graph machinery (Bug 11 / v0.68.2).
+- **The narrowed range is virtually never used.** Real `bigint unsigned` columns — especially autoincrement IDs — do not reach `2^63` (≈9.2 × 10¹⁸) in practice. This is the industry-standard pragmatic mapping (pgloader and peers do the same).
+- **The narrowing is surfaced LOUDLY, never silently.** Both `sluice schema preview` and `sluice migrate` preflight emit a dedicated, operator-actionable **unsigned-bigint range-narrowing notice** that names every affected `table.column`, states the `2^63-1` ceiling, and gives the per-column override. It is an *advisory notice* (the migration proceeds — the universal ORM schema must still migrate), not a hard refusal, but it is visible at both surfaces (a section in `schema preview` output / JSON `unsigned_bigint_narrowings`, and a `WARN` log line at `migrate` preflight). The loud-failure tenet is satisfied by the loud notice, not by silently narrowing.
+
+**Override:** for a column that genuinely stores values above `2^63-1`, supply `--type-override TABLE.COL=numeric` (or the per-column `mappings:` hook) to keep the full unsigned 64-bit range as `numeric(20,0)`. Note such a column then *cannot* also be an `IDENTITY`/`AUTO_INCREMENT` key — that combination is impossible in PostgreSQL and is precisely why the default cannot be `numeric` for autoincrement keys.
 
 ### MySQL ENUM and SET → Postgres
 

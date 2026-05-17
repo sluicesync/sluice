@@ -412,9 +412,11 @@ func renderInteger(v ir.Integer, engine string) string {
 		case 24, 32:
 			return "integer"
 		case 64:
-			if v.Unsigned && !v.AutoIncrement {
-				return "numeric(20,0)"
-			}
+			// Bug 11: `bigint unsigned` maps uniformly to PG bigint
+			// (PK, FK, standalone) so FK-to-IDENTITY-PK types match by
+			// construction. The (2^63, 2^64) range loss is surfaced
+			// loudly via the dedicated unsigned-bigint notice, not via
+			// a divergent type rendering here.
 			return "bigint"
 		default:
 			return "bigint"

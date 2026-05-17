@@ -188,14 +188,16 @@ func TestMigrate_MySQLToPostgres(t *testing.T) {
 		t.Errorf("posts FK = %+v; want users on-delete cascade", fk)
 	}
 
-	// §7 type-translation checks: UNSIGNED → NUMERIC(20,0), ENUM →
-	// PG enum, JSON → JSONB.
+	// §7 type-translation checks: BIGINT UNSIGNED → BIGINT (Bug 11
+	// uniform mapping — was NUMERIC(20,0) pre-fix; the divergence
+	// broke FK-to-AUTO_INCREMENT-PK creation for every default ORM
+	// schema), ENUM → PG enum, JSON → JSONB.
 	scoreCol := findColumn(users, "score")
 	if scoreCol == nil {
 		t.Fatalf("users.score missing")
 	}
-	if dec, ok := scoreCol.Type.(ir.Decimal); !ok || dec.Precision != 20 || dec.Scale != 0 {
-		t.Errorf("users.score type = %#v; want ir.Decimal{Precision:20, Scale:0} (BIGINT UNSIGNED → NUMERIC(20,0))", scoreCol.Type)
+	if iv, ok := scoreCol.Type.(ir.Integer); !ok || iv.Width != 64 {
+		t.Errorf("users.score type = %#v; want ir.Integer{Width:64} (BIGINT UNSIGNED → BIGINT, Bug 11)", scoreCol.Type)
 	}
 
 	roleCol := findColumn(users, "role")
@@ -262,8 +264,10 @@ func TestMigrate_MySQLToPostgres(t *testing.T) {
 	}
 
 	// §7 row-value checks for the new columns.
-	if score, ok := usersRows[0]["score"].(string); !ok || score != "100" {
-		t.Errorf("users[0].score = %#v; want \"100\" (NUMERIC decoded as string)", usersRows[0]["score"])
+	// Bug 11: BIGINT UNSIGNED now lands as PG BIGINT, decoded as
+	// int64 (was NUMERIC, decoded as string pre-fix).
+	if score, ok := usersRows[0]["score"].(int64); !ok || score != 100 {
+		t.Errorf("users[0].score = %#v; want int64(100) (BIGINT decoded as int64)", usersRows[0]["score"])
 	}
 	if role, ok := usersRows[0]["role"].(string); !ok || role != "admin" {
 		t.Errorf("users[0].role = %#v; want \"admin\"", usersRows[0]["role"])
@@ -440,6 +444,241 @@ func TestMigrate_MySQLToPostgres_Bug8Constructs(t *testing.T) {
 	if !hasTs || !hasDate {
 		t.Errorf("translated defaults not applied: created_at set=%v the_date set=%v", hasTs, hasDate)
 	}
+}
+
+// TestMigrate_MySQLToPostgres_Bug11UnsignedBigintFK is the cross-engine
+// regression pin for validation-rig Bug 11: a MySQL `bigint unsigned
+// AUTO_INCREMENT` PRIMARY KEY plus a `bigint unsigned` FK child column
+// referencing it. Pre-v0.68.2 the PK emitted PG `bigint ... IDENTITY`
+// but the FK child widened to `numeric(20,0)`, so `ALTER TABLE ... ADD
+// FOREIGN KEY` failed SQLSTATE 42804 (datatype mismatch) AFTER the
+// target was partially created, invisible at `schema preview`. This is
+// the DEFAULT schema shape of essentially every Rails/Laravel/Django/
+// Sequelize/Prisma MySQL app. The fix maps `bigint unsigned` uniformly
+// to PG `bigint`, so the FK matches the IDENTITY PK by construction.
+//
+// Two sub-cases:
+//
+//	minimal — the exact #11 repro (one parent PK, one child FK).
+//	orm     — the ORM-default multi-table shape (users / posts /
+//	          post_tags join table with a composite FK), modelling the
+//	          real Rails/Laravel schema. Every FK must be enforced on
+//	          the PG target (pg_get_constraintdef) and data must
+//	          round-trip with referential integrity intact.
+func TestMigrate_MySQLToPostgres_Bug11UnsignedBigintFK(t *testing.T) {
+	t.Run("minimal", func(t *testing.T) {
+		mysqlSource, _, mysqlCleanup := startMySQL(t)
+		defer mysqlCleanup()
+		_, pgTarget, pgCleanup := startPostgres(t)
+		defer pgCleanup()
+
+		// The exact #11 minimal repro: unsigned-bigint AUTO_INCREMENT
+		// PK + unsigned-bigint FK child referencing it.
+		const seedDDL = `
+			CREATE TABLE parent (
+				id   BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+				name VARCHAR(64)     NOT NULL,
+				PRIMARY KEY (id)
+			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+			CREATE TABLE child (
+				id        BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+				parent_id BIGINT UNSIGNED NOT NULL,
+				PRIMARY KEY (id),
+				KEY child_parent_id_idx (parent_id),
+				CONSTRAINT child_parent_fk FOREIGN KEY (parent_id)
+					REFERENCES parent (id) ON DELETE CASCADE
+			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+			INSERT INTO parent (name) VALUES ('root'), ('other');
+			INSERT INTO child (parent_id) VALUES (1), (1), (2);
+		`
+		applyMySQLDDL(t, mysqlSource, seedDDL)
+
+		runBug11Migrate(t, mysqlSource, pgTarget)
+
+		pgDB, err := sql.Open("pgx", pgTarget)
+		if err != nil {
+			t.Fatalf("open pg target: %v", err)
+		}
+		defer func() { _ = pgDB.Close() }()
+
+		// The FK must exist AND be enforced on the PG target. Pre-fix
+		// the migrate aborted before this constraint was ever created.
+		assertFKEnforced(t, ctx2min(t), pgDB, "public.child", "child_parent_fk")
+
+		// parent.id / child.parent_id must both be PG bigint (uniform
+		// mapping). Pre-fix child.parent_id was numeric(20,0).
+		for _, c := range []struct{ tbl, col string }{
+			{"parent", "id"}, {"child", "id"}, {"child", "parent_id"},
+		} {
+			var dt string
+			if err := pgDB.QueryRow(`
+				SELECT data_type FROM information_schema.columns
+				WHERE table_name = $1 AND column_name = $2`, c.tbl, c.col).Scan(&dt); err != nil {
+				t.Fatalf("read %s.%s data_type: %v", c.tbl, c.col, err)
+			}
+			if dt != "bigint" {
+				t.Errorf("%s.%s data_type = %q; want \"bigint\" (Bug 11 uniform mapping)", c.tbl, c.col, dt)
+			}
+		}
+
+		// Referential integrity: the FK rejects an orphan child.
+		if _, err := pgDB.Exec(
+			`INSERT INTO child (parent_id) VALUES (999999)`); err == nil {
+			t.Error("expected child_parent_fk to reject orphan parent_id=999999; insert succeeded")
+		}
+
+		// Data round-trips.
+		var childCount int
+		if err := pgDB.QueryRow(`SELECT count(*) FROM child`).Scan(&childCount); err != nil {
+			t.Fatalf("count child: %v", err)
+		}
+		if childCount != 3 {
+			t.Errorf("child row count = %d; want 3", childCount)
+		}
+	})
+
+	t.Run("orm", func(t *testing.T) {
+		mysqlSource, _, mysqlCleanup := startMySQL(t)
+		defer mysqlCleanup()
+		_, pgTarget, pgCleanup := startPostgres(t)
+		defer pgCleanup()
+
+		// The ORM-default multi-table shape: every `id` is
+		// `bigint unsigned AUTO_INCREMENT PRIMARY KEY` and every FK
+		// child column is `bigint unsigned` — the canonical
+		// Rails/Laravel/Django schema. post_tags is a join table with
+		// a composite PK and two FKs.
+		const seedDDL = `
+			CREATE TABLE users (
+				id    BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+				email VARCHAR(255)    NOT NULL,
+				PRIMARY KEY (id),
+				UNIQUE KEY users_email_unique (email)
+			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+			CREATE TABLE posts (
+				id      BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+				user_id BIGINT UNSIGNED NOT NULL,
+				title   VARCHAR(255)    NOT NULL,
+				PRIMARY KEY (id),
+				KEY posts_user_id_idx (user_id),
+				CONSTRAINT posts_user_fk FOREIGN KEY (user_id)
+					REFERENCES users (id) ON DELETE CASCADE
+			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+			CREATE TABLE tags (
+				id   BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+				name VARCHAR(64)     NOT NULL,
+				PRIMARY KEY (id)
+			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+			CREATE TABLE post_tags (
+				post_id BIGINT UNSIGNED NOT NULL,
+				tag_id  BIGINT UNSIGNED NOT NULL,
+				PRIMARY KEY (post_id, tag_id),
+				KEY post_tags_tag_id_idx (tag_id),
+				CONSTRAINT post_tags_post_fk FOREIGN KEY (post_id)
+					REFERENCES posts (id) ON DELETE CASCADE,
+				CONSTRAINT post_tags_tag_fk FOREIGN KEY (tag_id)
+					REFERENCES tags (id) ON DELETE CASCADE
+			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+			INSERT INTO users (email) VALUES ('a@x.com'), ('b@x.com');
+			INSERT INTO posts (user_id, title) VALUES (1, 'hello'), (1, 'world'), (2, 'hi');
+			INSERT INTO tags (name) VALUES ('red'), ('blue');
+			INSERT INTO post_tags (post_id, tag_id) VALUES (1, 1), (1, 2), (2, 1), (3, 2);
+		`
+		applyMySQLDDL(t, mysqlSource, seedDDL)
+
+		runBug11Migrate(t, mysqlSource, pgTarget)
+
+		pgDB, err := sql.Open("pgx", pgTarget)
+		if err != nil {
+			t.Fatalf("open pg target: %v", err)
+		}
+		defer func() { _ = pgDB.Close() }()
+		ctx := ctx2min(t)
+
+		// All three FKs (including both legs of the composite-PK join
+		// table) must be enforced on the PG target.
+		assertFKEnforced(t, ctx, pgDB, "public.posts", "posts_user_fk")
+		assertFKEnforced(t, ctx, pgDB, "public.post_tags", "post_tags_post_fk")
+		assertFKEnforced(t, ctx, pgDB, "public.post_tags", "post_tags_tag_fk")
+
+		// Data integrity: every join-table row resolves to a live
+		// post and tag.
+		var joinCount int
+		if err := pgDB.QueryRowContext(ctx, `
+			SELECT count(*) FROM post_tags pt
+			JOIN posts p ON p.id = pt.post_id
+			JOIN tags  g ON g.id = pt.tag_id`).Scan(&joinCount); err != nil {
+			t.Fatalf("join post_tags: %v", err)
+		}
+		if joinCount != 4 {
+			t.Errorf("resolved join rows = %d; want 4 (referential integrity broken)", joinCount)
+		}
+
+		// FK enforcement is live: orphan insert into the join table is
+		// rejected.
+		if _, err := pgDB.ExecContext(ctx,
+			`INSERT INTO post_tags (post_id, tag_id) VALUES (1, 999999)`); err == nil {
+			t.Error("expected post_tags_tag_fk to reject orphan tag_id; insert succeeded")
+		}
+	})
+}
+
+// runBug11Migrate runs a MySQL→PG migration and fails the test if it
+// returns an error. Pre-v0.68.2 the Bug 11 schemas aborted here at the
+// constraint phase (SQLSTATE 42804) after partial table creation.
+func runBug11Migrate(t *testing.T, mysqlSource, pgTarget string) {
+	t.Helper()
+	mysqlEng, ok := engines.Get("mysql")
+	if !ok {
+		t.Fatal("mysql engine not registered")
+	}
+	pgEng, ok := engines.Get("postgres")
+	if !ok {
+		t.Fatal("postgres engine not registered")
+	}
+	mig := &Migrator{
+		Source:    mysqlEng,
+		Target:    pgEng,
+		SourceDSN: mysqlSource,
+		TargetDSN: pgTarget,
+	}
+	if err := mig.Run(ctx2min(t)); err != nil {
+		t.Fatalf("Migrator.Run (Bug 11 unsigned-bigint FK must migrate cleanly): %v", err)
+	}
+}
+
+// assertFKEnforced asserts a named foreign-key constraint exists on
+// the given PG relation and is a FOREIGN KEY (pg_get_constraintdef).
+func assertFKEnforced(t *testing.T, ctx context.Context, db *sql.DB, relation, conname string) {
+	t.Helper()
+	var def string
+	err := db.QueryRowContext(ctx, `
+		SELECT pg_get_constraintdef(c.oid)
+		FROM pg_constraint c
+		WHERE c.conrelid = $1::regclass AND c.conname = $2 AND c.contype = 'f'`,
+		relation, conname).Scan(&def)
+	if err != nil {
+		t.Fatalf("FK %q on %s not found / not enforced: %v", conname, relation, err)
+	}
+	if !strings.Contains(strings.ToUpper(def), "FOREIGN KEY") {
+		t.Errorf("constraint %q on %s = %q; want a FOREIGN KEY definition", conname, relation, def)
+	}
+}
+
+// ctx2min returns a 2-minute context bound to the test's lifetime.
+// Shared by the Bug 11 sub-tests so each doesn't repeat the
+// context.WithTimeout + cleanup boilerplate.
+func ctx2min(t *testing.T) context.Context {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	t.Cleanup(cancel)
+	return ctx
 }
 
 // findColumn searches a table for the named column. Returns nil when

@@ -121,6 +121,20 @@ type PreviewJSON struct {
 	// result. Omitted for non-cross-engine pairs and when the scan
 	// detected nothing.
 	TranslatorGaps []PreviewJSONTranslatorGap `json:"translator_gaps,omitempty"`
+	// UnsignedBigintNarrowings is the Bug 11 MySQL `bigint unsigned`
+	// → PG `bigint` range-narrowing advisory list. Omitted for
+	// non-MySQL→PG pairs and when no unsigned-bigint column is present.
+	// Advisory only — tooling that wants to flag the (2^63, 2^64) loss
+	// can gate on a non-empty list, but sluice itself does not refuse.
+	UnsignedBigintNarrowings []PreviewJSONUnsignedBigint `json:"unsigned_bigint_narrowings,omitempty"`
+}
+
+// PreviewJSONUnsignedBigint is one MySQL `bigint unsigned` → PG
+// `bigint` narrowing. Stable shape for tooling consumers.
+type PreviewJSONUnsignedBigint struct {
+	Table         string `json:"table"`
+	Column        string `json:"column"`
+	AutoIncrement bool   `json:"auto_increment"`
 }
 
 // PreviewJSONTranslatorGap is one detected MySQL → PG translator
@@ -243,6 +257,17 @@ func (p *Previewer) Run(ctx context.Context) error {
 		return err
 	}
 
+	// ---- 3.6. Unsigned-bigint range-narrowing notice (Bug 11) ----
+	// Advisory — NOT a refusal (it must still migrate the universal
+	// ORM schema). Scanned on the post-override schema so an operator's
+	// `--type-override TABLE.COL=numeric` escape hatch suppresses the
+	// notice for that column. Rendered in a dedicated preview section
+	// so it's loud and visible alongside the translator-gaps block,
+	// matching the wording `migrate` preflight logs.
+	unsignedBigintNotices := translate.ScanUnsignedBigintNotices(
+		tgtSchema, p.Source.Name(), p.Target.Name(),
+	)
+
 	// ---- 4. Open the target schema writer; type-assert for preview. ----
 	sw, err := p.Target.OpenSchemaWriter(ctx, p.TargetDSN)
 	if err != nil {
@@ -286,7 +311,8 @@ func (p *Previewer) Run(ctx context.Context) error {
 			srcSchema, p.Source.Name(), p.Target.Name(),
 			enabledExtensionSet(p.EnabledPGExtensions),
 		),
-		redactor: p.Redactor,
+		unsignedBigintNotices: unsignedBigintNotices,
+		redactor:              p.Redactor,
 	}
 
 	switch strings.ToLower(strings.TrimSpace(p.Format)) {
@@ -323,9 +349,13 @@ type previewBundle struct {
 	tables         []previewTable
 	srcByTable     map[string]*ir.Table
 	tgtByTable     map[string]*ir.Table
-	appliedAlias   map[string]bool  // table.column → true when operator already applied an override
-	translatorGaps []translate.Gap  // v0.39.0 MySQL → PG translator-gap scan results (nil for non-cross-engine pairs)
-	redactor       *redact.Registry // PII Phase 1.5 (v0.55.0) — nil/empty disables annotation
+	appliedAlias   map[string]bool // table.column → true when operator already applied an override
+	translatorGaps []translate.Gap // v0.39.0 MySQL → PG translator-gap scan results (nil for non-cross-engine pairs)
+	// unsignedBigintNotices is the Bug 11 MySQL `bigint unsigned` → PG
+	// `bigint` range-narrowing advisory list (nil for non-MySQL→PG
+	// pairs or when no unsigned-bigint column is present).
+	unsignedBigintNotices []translate.UnsignedBigintNotice
+	redactor              *redact.Registry // PII Phase 1.5 (v0.55.0) — nil/empty disables annotation
 }
 
 // enabledExtensionSet converts the operator's `--enable-pg-extension`
@@ -496,10 +526,17 @@ func renderPreviewText(w io.Writer, bundle previewBundle) error {
 	if n := len(bundle.translatorGaps); n > 0 {
 		fmt.Fprintf(&sb, "-- translator gaps: %d (see section below)\n", n)
 	}
+	if n := len(bundle.unsignedBigintNotices); n > 0 {
+		fmt.Fprintf(&sb, "-- unsigned-bigint narrowings: %d (see section below)\n", n)
+	}
 	sb.WriteByte('\n')
 
 	if len(bundle.translatorGaps) > 0 {
 		writeTranslatorGapsSection(&sb, bundle.translatorGaps)
+	}
+
+	if len(bundle.unsignedBigintNotices) > 0 {
+		writeUnsignedBigintSection(&sb, bundle.unsignedBigintNotices)
 	}
 
 	for _, t := range bundle.tables {
@@ -541,6 +578,37 @@ func writeTranslatorGapsSection(sb *strings.Builder, gaps []translate.Gap) {
 		sb.WriteByte('\n')
 		fmt.Fprintf(sb, "--     expr: %s\n", g.Expression)
 		fmt.Fprintf(sb, "--     note: %s\n", g.Note)
+	}
+	sb.WriteByte('\n')
+}
+
+// writeUnsignedBigintSection appends the Bug 11 MySQL `bigint
+// unsigned` → PG `bigint` range-narrowing advisory block to sb. This
+// is a NOTICE, not a refusal — `schema preview` still exits 0 and
+// `migrate` still proceeds. It is rendered loudly (its own section,
+// same shape as the translator-gaps block) so the deliberate
+// (2^63, 2^64) range loss is never silent. Wording mirrors what
+// `migrate` preflight logs at WARN.
+func writeUnsignedBigintSection(sb *strings.Builder, notices []translate.UnsignedBigintNotice) {
+	sb.WriteString("-- ============================================================\n")
+	sb.WriteString("-- Unsigned-bigint range narrowing (MySQL -> Postgres)\n")
+	sb.WriteString("-- ============================================================\n")
+	sb.WriteString("-- MySQL `bigint unsigned` maps uniformly to PostgreSQL `bigint`\n")
+	sb.WriteString("-- (PostgreSQL has no unsigned 64-bit type). This keeps PRIMARY\n")
+	sb.WriteString("-- KEY and FOREIGN KEY column types consistent so FKs to\n")
+	sb.WriteString("-- AUTO_INCREMENT keys are created successfully. The tradeoff:\n")
+	sb.WriteString("-- values > 2^63-1 (9223372036854775807) are NOT representable\n")
+	sb.WriteString("-- on the target. This is advisory; the migration proceeds.\n")
+	sb.WriteString("-- Override a column that genuinely exceeds 2^63-1 with\n")
+	sb.WriteString("-- `--type-override TABLE.COL=numeric` (numeric(20,0) keeps the\n")
+	sb.WriteString("-- full unsigned 64-bit range; it cannot also be an IDENTITY key).\n")
+	sb.WriteString("--\n")
+	for _, n := range notices {
+		fmt.Fprintf(sb, "-- %s.%s: bigint unsigned -> bigint", n.Table, n.Column)
+		if n.AutoIncrement {
+			sb.WriteString(" (AUTO_INCREMENT — IDs in practice never reach 2^63)")
+		}
+		sb.WriteByte('\n')
 	}
 	sb.WriteByte('\n')
 }
@@ -790,6 +858,13 @@ func renderPreviewJSON(w io.Writer, bundle previewBundle) error {
 			Severity:   g.Severity.String(),
 			Expression: g.Expression,
 			Note:       g.Note,
+		})
+	}
+	for _, n := range bundle.unsignedBigintNotices {
+		out.UnsignedBigintNarrowings = append(out.UnsignedBigintNarrowings, PreviewJSONUnsignedBigint{
+			Table:         n.Table,
+			Column:        n.Column,
+			AutoIncrement: n.AutoIncrement,
 		})
 	}
 	enc := json.NewEncoder(w)

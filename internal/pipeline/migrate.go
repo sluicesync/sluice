@@ -385,6 +385,21 @@ func (m *Migrator) Run(ctx context.Context) error {
 		); err != nil {
 			return err
 		}
+
+		// ---- 1.67. Unsigned-bigint range-narrowing notice (Bug 11) ----
+		// MySQL `bigint unsigned` maps uniformly to PG `bigint` so PK
+		// and FK types match by construction (the FK-to-IDENTITY-PK
+		// type mismatch that aborted every default ORM schema is gone).
+		// The (2^63, 2^64) range loss is a deliberate, documented
+		// policy — surfaced LOUDLY here (and at `schema preview`) so it
+		// is never silent. This is a NOTICE, not a refusal: the
+		// universal Rails/Laravel/Django schema must still migrate.
+		// Emitted at WARN so it stands out in default-level logs.
+		if noticeErr := translate.UnsignedBigintNoticeError(
+			schema, m.Source.Name(), m.Target.Name(), "migrate",
+		); noticeErr != nil {
+			slog.WarnContext(ctx, noticeErr.Error())
+		}
 	}
 
 	if m.DryRun {
