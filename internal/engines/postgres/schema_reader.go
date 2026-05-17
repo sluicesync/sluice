@@ -53,6 +53,23 @@ type SchemaReader struct {
 	// false (the default) preserves tier (c): the existing loud
 	// refusal for uncatalogued user-defined types is unchanged.
 	verbatimPassthrough bool
+
+	// tableScope, when non-nil, restricts readTables to the tables the
+	// operator's filter admits, so out-of-scope tables are never read
+	// and their (possibly unsupported) column types are never
+	// validated (catalog Bug 76). nil means "no scoping" — every base
+	// table in the schema is read, the historical behaviour. Set via
+	// [SetTableScope] before ReadSchema.
+	tableScope func(tableName string) bool
+}
+
+// SetTableScope implements [ir.TableScoper]. The pipeline calls this
+// with the engine-neutral projection of the operator's table filter
+// before [ReadSchema], so per-column type validation is scoped to the
+// to-be-migrated table set (catalog Bug 76). A nil predicate clears
+// scoping. Idempotent; must be called before any read.
+func (r *SchemaReader) SetTableScope(allow func(tableName string) bool) {
+	r.tableScope = allow
 }
 
 // SetVerbatimExtensionPassthrough implements [ir.VerbatimExtensionAware]
@@ -262,6 +279,15 @@ func (r *SchemaReader) readTables(ctx context.Context) (map[string]*ir.Table, er
 		var name string
 		if err := rows.Scan(&name); err != nil {
 			return nil, err
+		}
+		// catalog Bug 76: skip tables the operator's filter excludes so
+		// their columns are never type-validated by populateColumns
+		// (which keys off this map). A scoped-out table with an
+		// unsupported column type must not abort an otherwise-valid
+		// migration. The pipeline's post-read TableFilter remains the
+		// authoritative prune; this is the loud-failure-scoping push-down.
+		if r.tableScope != nil && !r.tableScope(name) {
+			continue
 		}
 		out[name] = &ir.Table{Schema: r.schema, Name: name}
 	}

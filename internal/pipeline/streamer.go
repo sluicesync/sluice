@@ -1323,6 +1323,9 @@ func (s *Streamer) logDryRunPlan(ctx context.Context, streamID string, persisted
 	// ADR-0047 tier (b): live PG → PG sync may carry uncatalogued
 	// extension types verbatim. Engine-name-only determination.
 	applyVerbatimExtensionPassthrough(sr, verbatimLiveSameEnginePG(s.Source, s.Target))
+	// catalog Bug 76: scope per-column type validation to the filtered
+	// table set (s.Filter already has engine defaults merged in Run).
+	applyTableScope(sr, s.Filter)
 	schema, err := sr.ReadSchema(ctx)
 	if err != nil {
 		return wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: dry-run: read source schema: %w", err))
@@ -1502,6 +1505,9 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 	// ADR-0047 tier (b): live PG → PG sync may carry uncatalogued
 	// extension types verbatim. Engine-name-only determination.
 	applyVerbatimExtensionPassthrough(sr, verbatimLiveSameEnginePG(s.Source, s.Target))
+	// catalog Bug 76: scope per-column type validation to the filtered
+	// table set (s.Filter already has engine defaults merged in Run).
+	applyTableScope(sr, s.Filter)
 	schema, err := sr.ReadSchema(ctx)
 	closeIf(sr)
 	if err != nil {
