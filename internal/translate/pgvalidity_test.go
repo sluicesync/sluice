@@ -141,6 +141,79 @@ func TestUntranslatable_Bug13(t *testing.T) {
 	}
 }
 
+// TestUntranslatable_Bug16_CastTargetTypeNotFlagged pins Bug #16: the
+// v0.68.3 #14 scanner misread a *parameterized CAST target type*
+// (`DECIMAL(10,2)`, `CHAR(20)`, `BINARY(16)`, `NCHAR(5)`, `x::decimal(10,2)`)
+// as an unknown function call and spuriously refused schemas v0.68.2
+// migrated CLEAN (translator rewrites CHAR→VARCHAR; PG accepts decimal
+// natively). A CAST/`::` *target type specifier* is never a function
+// call and must NOT trip the gate.
+func TestUntranslatable_Bug16_CastTargetTypeNotFlagged(t *testing.T) {
+	valid := []struct {
+		name string
+		expr string
+		fld  string
+	}{
+		{"CAST AS DECIMAL(p,s) in GENERATED", "CAST(amount AS DECIMAL(10,2))", "GENERATED"},
+		{"CAST AS CHAR(n) in CHECK", "CAST(code AS CHAR(8)) <> ''", "CHECK"},
+		{"CAST AS BINARY(n) in GENERATED", "CAST(h AS BINARY(16))", "GENERATED"},
+		{"CAST AS NCHAR(n) in DEFAULT", "CAST('x' AS NCHAR(5))", "DEFAULT"},
+		{"CAST AS DEC(p,s)", "CAST(v AS DEC(12,4))", "GENERATED"},
+		{"CAST AS CHARACTER(n)", "CAST(s AS CHARACTER(10))", "GENERATED"},
+		{":: decimal(p,s)", "amount::decimal(10,2)", "GENERATED"},
+		{"CAST AS DECIMAL nested in expr", "CAST(qty AS DECIMAL(10,2)) > 0", "CHECK"},
+		{"CAST AS CHAR(n) with surrounding fn", "lower(CAST(code AS CHAR(8)))", "GENERATED"},
+	}
+	for _, v := range valid {
+		t.Run(v.name, func(t *testing.T) {
+			var sch *ir.Schema
+			switch v.fld {
+			case "CHECK":
+				sch = schemaWithCheck(v.expr)
+			case "GENERATED":
+				sch = schemaWithGenerated(v.expr)
+			case "DEFAULT":
+				sch = schemaWithDefault(v.expr)
+			}
+			if err := RefuseOnUntranslatableExprs(sch, "mysql", "postgres", "migrate", nil); err != nil {
+				t.Fatalf("Bug #16 FALSE POSITIVE — valid CAST-target %q refused: %s", v.expr, err.Error())
+			}
+		})
+	}
+}
+
+// TestUntranslatable_Bug16_GuardStillRefuses pins the bidirectional
+// guard: the #16 fix must be CONTEXT-AWARE (only a CAST/`::` *target*
+// type-name is exempt). A type-name spelling used as an ordinary
+// function call OUTSIDE cast-target position — MySQL's `CHAR(65)`
+// scalar (no PG form; translator does NOT rewrite it) — must STILL
+// loud-refuse, as must an unknown CAST target type. A blanket
+// type-name allowlist (the wrong fix) would re-open the v0.68.1-class
+// false-green here.
+func TestUntranslatable_Bug16_GuardStillRefuses(t *testing.T) {
+	cases := []struct {
+		name string
+		want string
+		sch  *ir.Schema
+	}{
+		{"MySQL CHAR() scalar outside cast", "char", schemaWithGenerated("CHAR(code_point)")},
+		{"unknown CAST target type", "bogustype", schemaWithGenerated("CAST(x AS bogustype(1))")},
+		{"CAST AS UNSIGNED still refused", "cast(... as unsigned)", schemaWithGenerated("CAST(qty AS UNSIGNED)")},
+		{"BINARY() scalar outside cast", "binary", schemaWithCheck("BINARY(name) = name")},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err := RefuseOnUntranslatableExprs(c.sch, "mysql", "postgres", "migrate", nil)
+			if err == nil {
+				t.Fatalf("%s: must STILL loud-refuse (#16 fix must be context-aware, not a blanket allowlist)", c.name)
+			}
+			if !strings.Contains(strings.ToLower(err.Error()), c.want) {
+				t.Errorf("refusal does not reference %q; got: %s", c.want, err.Error())
+			}
+		})
+	}
+}
+
 // ---------------------------------------------------------------------
 // FALSE-POSITIVE-SAFETY PINS — the load-bearing risk. A broad set of
 // genuinely-PG-valid expressions must NOT trip the gate. A failure here
