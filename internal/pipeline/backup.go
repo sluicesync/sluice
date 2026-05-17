@@ -890,12 +890,11 @@ func (b *Backup) backupTable(
 					return nil, err
 				}
 				// Surface any sticky error captured by the reader's
-				// streaming goroutine. Mirrors the pattern other
-				// pipeline phases follow.
-				if errReader, ok := rr.(interface{ Err() error }); ok {
-					if e := errReader.Err(); e != nil {
-						return nil, fmt.Errorf("row reader: %w", e)
-					}
+				// streaming goroutine (Bug 68 loud-failure gate; now a
+				// first-class [ir.RowReader.Err] surface, no longer an
+				// optional type assertion).
+				if err := readerStreamErr(rr, table); err != nil {
+					return nil, err
 				}
 				entry.RowCount = rowsTotal
 				entry.Partial = false // table EOF reached naturally; flip the partial flag off

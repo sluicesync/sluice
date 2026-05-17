@@ -526,27 +526,21 @@ func decodeArray(raw any, elementType ir.Type) (any, error) {
 		return out, nil
 	}
 
-	// (3) Text form, e.g. "{10,20,30}" or "{\"a\",\"b\"}". Parsed
-	// before the reflect path because string is also a reflect.Kind
-	// that the slice check below would erroneously reject.
+	// (3) Text form, e.g. "{10,20,30}" or "{\"a\",\"b\"}", or the
+	// multi-dimensional nested form "{{1,2},{3,4}}". Parsed before the
+	// reflect path because string is also a reflect.Kind that the
+	// slice check below would erroneously reject. Nested arrays decode
+	// to nested []any (Bug 68): the IR Row contract for an array value
+	// is "[]any, recursively"; the cross-engine MySQL writer's
+	// convertArrayLikeToJSON json.Marshals the nested []any to nested
+	// JSON faithfully ([[1,2],[3,4]]), and same-engine PG→PG hands the
+	// nested []any back to the array writer unchanged.
 	if s, ok := raw.(string); ok {
-		tokens, nullMask, err := parsePGArrayText(s)
+		v, err := decodePGArrayText(s, elementType)
 		if err != nil {
 			return nil, fmt.Errorf("postgres: array text parse: %w", err)
 		}
-		out := make([]any, len(tokens))
-		for i, tok := range tokens {
-			if nullMask[i] {
-				out[i] = nil
-				continue
-			}
-			d, err := decodeValue(tok, elementType)
-			if err != nil {
-				return nil, fmt.Errorf("postgres: array element %d: %w", i, err)
-			}
-			out[i] = d
-		}
-		return out, nil
+		return v, nil
 	}
 
 	// (2) Any other slice/array via reflection.
@@ -565,107 +559,162 @@ func decodeArray(raw any, elementType ir.Type) (any, error) {
 	return out, nil
 }
 
-// parsePGArrayText parses Postgres's text representation of a
-// one-dimensional array into per-element string tokens. The second
-// return value is a parallel "is NULL?" mask so callers can
-// distinguish a string element "NULL" from an actual SQL null —
-// Postgres encodes the literal NULL keyword unquoted, while a string
-// "NULL" would be wrapped in double quotes.
+// decodePGArrayText parses Postgres's text representation of an array
+// — one-dimensional ("{1,2,3}") or multi-dimensional ("{{1,2},{3,4}}")
+// — into a (recursively) nested []any. Leaf elements are decoded
+// through [decodeValue] with elementType; sub-arrays recurse and land
+// as nested []any so the IR Row contract ("[]any, recursively") holds
+// for any number of dimensions (Bug 68). SQL null elements (the
+// unquoted NULL keyword) decode to a nil slot.
 //
 // Format reference (PostgreSQL docs, "Array Input and Output Syntax"):
 //
 //   - Outer braces: "{" and "}"
 //   - Empty array: "{}"
 //   - Element separator: "," (no whitespace expected, but tolerated)
+//   - Sub-array element: a nested "{...}" (multi-dimensional arrays)
 //   - Bare element: any unquoted text up to the next "," or "}". The
 //     literal NULL (case-insensitive) is the SQL null marker.
 //   - Quoted element: enclosed in double quotes; "\" escapes the
 //     following byte (so \" and \\ are literal). Required for
 //     elements containing "{}",", or whitespace.
 //
-// Multi-dimensional arrays (nested braces) are not supported by this
-// parser; the caller will get a parse error. The IR doesn't model
-// dimensions today and adding that surface should come with a real
-// use case.
-func parsePGArrayText(s string) (tokens []string, isNull []bool, err error) {
-	if len(s) < 2 || s[0] != '{' || s[len(s)-1] != '}' {
-		return nil, nil, fmt.Errorf("malformed array literal %q (missing braces)", s)
+// Postgres always emits rectangular multi-dimensional arrays (every
+// sub-array at a given depth has equal length); the parser does not
+// enforce that — it faithfully reproduces whatever shape PG emitted,
+// which is exactly what a faithful migration wants.
+func decodePGArrayText(s string, elementType ir.Type) (any, error) {
+	p := &pgArrayParser{src: s, buf: []byte(s)}
+	p.skipSpace()
+	v, err := p.parseArray(elementType)
+	if err != nil {
+		return nil, err
 	}
-	body := s[1 : len(s)-1]
-	if body == "" {
-		return []string{}, []bool{}, nil
+	p.skipSpace()
+	if p.pos != len(p.buf) {
+		return nil, fmt.Errorf("trailing characters after array at offset %d in %q", p.pos+1, s)
+	}
+	return v, nil
+}
+
+// pgArrayParser is a tiny recursive-descent cursor over a Postgres
+// array text literal. It is single-use (one literal per instance);
+// src is retained only for error messages.
+type pgArrayParser struct {
+	src string
+	buf []byte
+	pos int
+}
+
+func (p *pgArrayParser) skipSpace() {
+	for p.pos < len(p.buf) && (p.buf[p.pos] == ' ' || p.buf[p.pos] == '\t') {
+		p.pos++
+	}
+}
+
+// parseArray consumes a "{...}" group at the cursor and returns its
+// elements as []any. Elements are either nested arrays (recursing) or
+// leaf values decoded via [decodeValue].
+func (p *pgArrayParser) parseArray(elementType ir.Type) (any, error) {
+	if p.pos >= len(p.buf) || p.buf[p.pos] != '{' {
+		return nil, fmt.Errorf("malformed array literal %q (expected '{' at offset %d)", p.src, p.pos+1)
+	}
+	p.pos++ // consume '{'
+
+	out := []any{}
+	p.skipSpace()
+	if p.pos < len(p.buf) && p.buf[p.pos] == '}' {
+		p.pos++ // empty array
+		return out, nil
 	}
 
-	for i := 0; i < len(body); {
-		// Skip leading whitespace before the element.
-		for i < len(body) && (body[i] == ' ' || body[i] == '\t') {
-			i++
-		}
-		if i >= len(body) {
-			break
+	for {
+		p.skipSpace()
+		if p.pos >= len(p.buf) {
+			return nil, fmt.Errorf("unterminated array literal %q", p.src)
 		}
 
-		var (
-			tok   string
-			isNil bool
-		)
-
-		switch body[i] {
-		case '{', '}':
-			return nil, nil, fmt.Errorf("nested arrays not supported in %q", s)
-		case '"':
-			// Quoted element: scan until the matching unescaped quote.
-			i++ // consume opening quote
-			var sb []byte
-			for i < len(body) {
-				c := body[i]
-				if c == '\\' && i+1 < len(body) {
-					sb = append(sb, body[i+1])
-					i += 2
-					continue
-				}
-				if c == '"' {
-					i++ // consume closing quote
-					break
-				}
-				sb = append(sb, c)
-				i++
+		var elem any
+		if p.buf[p.pos] == '{' {
+			// Nested sub-array → recurse; lands as nested []any.
+			sub, err := p.parseArray(elementType)
+			if err != nil {
+				return nil, err
 			}
-			tok = string(sb)
+			elem = sub
+		} else {
+			tok, isNull, err := p.parseScalar()
+			if err != nil {
+				return nil, err
+			}
+			if isNull {
+				elem = nil
+			} else {
+				d, err := decodeValue(tok, elementType)
+				if err != nil {
+					return nil, fmt.Errorf("array element %d: %w", len(out), err)
+				}
+				elem = d
+			}
+		}
+		out = append(out, elem)
+
+		p.skipSpace()
+		if p.pos >= len(p.buf) {
+			return nil, fmt.Errorf("unterminated array literal %q", p.src)
+		}
+		switch p.buf[p.pos] {
+		case ',':
+			p.pos++ // consume separator, parse next element
+		case '}':
+			p.pos++ // end of this array group
+			return out, nil
 		default:
-			// Bare element: scan until the next "," or "}".
-			start := i
-			for i < len(body) && body[i] != ',' {
-				i++
-			}
-			tok = body[start:i]
-			// Trim trailing whitespace inside the bare token.
-			for tok != "" && (tok[len(tok)-1] == ' ' || tok[len(tok)-1] == '\t') {
-				tok = tok[:len(tok)-1]
-			}
-			// Unquoted NULL is the SQL null marker.
-			if eqFold(tok, "NULL") {
-				isNil = true
-				tok = ""
-			}
+			return nil, fmt.Errorf("expected ',' or '}' at offset %d in %q", p.pos+1, p.src)
 		}
-
-		// Skip trailing whitespace before the comma.
-		for i < len(body) && (body[i] == ' ' || body[i] == '\t') {
-			i++
-		}
-		// Consume the comma if present.
-		if i < len(body) {
-			if body[i] != ',' {
-				return nil, nil, fmt.Errorf("expected ',' or '}' at offset %d in %q", i+1, s)
-			}
-			i++
-		}
-
-		tokens = append(tokens, tok)
-		isNull = append(isNull, isNil)
 	}
-	return tokens, isNull, nil
+}
+
+// parseScalar consumes one leaf element (quoted or bare) at the
+// cursor and returns its unescaped string token plus whether it was
+// the unquoted NULL marker. A quoted element is never NULL (a quoted
+// "NULL" is the literal string).
+func (p *pgArrayParser) parseScalar() (tok string, isNull bool, err error) {
+	if p.buf[p.pos] == '"' {
+		p.pos++ // consume opening quote
+		var sb []byte
+		for p.pos < len(p.buf) {
+			c := p.buf[p.pos]
+			if c == '\\' && p.pos+1 < len(p.buf) {
+				sb = append(sb, p.buf[p.pos+1])
+				p.pos += 2
+				continue
+			}
+			if c == '"' {
+				p.pos++ // consume closing quote
+				return string(sb), false, nil
+			}
+			sb = append(sb, c)
+			p.pos++
+		}
+		return "", false, fmt.Errorf("unterminated quoted element in %q", p.src)
+	}
+
+	// Bare element: scan until the next ",", "}", or "{" (the latter
+	// would be malformed at this position but stops the scan cleanly).
+	start := p.pos
+	for p.pos < len(p.buf) && p.buf[p.pos] != ',' && p.buf[p.pos] != '}' && p.buf[p.pos] != '{' {
+		p.pos++
+	}
+	raw := string(p.buf[start:p.pos])
+	// Trim trailing whitespace inside the bare token.
+	for raw != "" && (raw[len(raw)-1] == ' ' || raw[len(raw)-1] == '\t') {
+		raw = raw[:len(raw)-1]
+	}
+	if eqFold(raw, "NULL") {
+		return "", true, nil
+	}
+	return raw, false, nil
 }
 
 // eqFold is a tiny case-insensitive ASCII comparison; avoids pulling

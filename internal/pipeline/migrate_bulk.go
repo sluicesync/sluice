@@ -315,6 +315,17 @@ func copyTableWithCursor(
 		}
 		cancel() // batch goroutines unwind cleanly
 
+		// Loud-failure gate (Bug 68): the batched reader scans/decodes
+		// on a background goroutine and aborts the batch by closing the
+		// channel on a per-row failure — indistinguishable from a clean
+		// short/empty batch below. Check the reader's sticky error
+		// before interpreting batchCount, so a decode failure on the
+		// first row of a batch fails the migrate instead of looking
+		// like "end of table".
+		if err := readerStreamErr(rr, table); err != nil {
+			return err
+		}
+
 		if batchCount == 0 {
 			// Empty batch from the reader → end of table.
 			return nil

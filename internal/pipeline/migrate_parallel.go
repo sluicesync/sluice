@@ -604,6 +604,17 @@ func copyChunk(
 			slog.Int64("rows", batchCount),
 			slog.Duration("wall", batchWall))
 
+		// Loud-failure gate (Bug 68): the batched reader scans/decodes
+		// on a background goroutine and aborts a batch by closing the
+		// channel on a per-row failure — indistinguishable from a clean
+		// short/empty batch. Each chunk owns its own reader instance
+		// (see runChunks), so the sticky error is unambiguous here.
+		// Check before interpreting batchCount so a decode failure
+		// fails the migrate instead of looking like "end of chunk".
+		if err := readerStreamErr(rr, table); err != nil {
+			return err
+		}
+
 		if batchCount == 0 {
 			// End of chunk (either hit upper bound or end of table).
 			break
@@ -795,6 +806,17 @@ func copyChunkFast(
 					pumpErr <- streamCtx.Err()
 					return
 				}
+			}
+			// Loud-failure gate (Bug 68): the batched reader scans/
+			// decodes on a background goroutine and aborts a page by
+			// closing its channel on a per-row failure — that looks
+			// exactly like a clean short/empty page. Check the sticky
+			// reader error after the page drains, before interpreting
+			// batchCount, so a decode failure fails the migrate instead
+			// of silently ending the chunk's stream.
+			if err := readerStreamErr(br, table); err != nil {
+				pumpErr <- err
+				return
 			}
 			if batchCount == 0 {
 				pumpErr <- nil // clean end of chunk range

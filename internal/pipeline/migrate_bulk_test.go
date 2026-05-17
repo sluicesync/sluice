@@ -214,6 +214,8 @@ func (fakePlainReader) ReadRows(context.Context, *ir.Table) (<-chan ir.Row, erro
 	return ch, nil
 }
 
+func (fakePlainReader) Err() error { return nil }
+
 // fakeBatchableReader implements both RowReader and BatchedRowReader.
 type fakeBatchableReader struct{}
 
@@ -228,6 +230,8 @@ func (fakeBatchableReader) ReadRowsBatch(context.Context, *ir.Table, []any, int)
 	close(ch)
 	return ch, nil
 }
+
+func (fakeBatchableReader) Err() error { return nil }
 
 // fakePlainWriter implements only ir.RowWriter.
 type fakePlainWriter struct{}

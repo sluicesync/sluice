@@ -125,8 +125,28 @@ type SchemaWriter interface {
 // RowReader streams rows from a single table for the bulk-copy phase.
 // Implementations should close the returned channel when the table is
 // fully read, and return promptly when ctx is cancelled.
+//
+// Err is the load-bearing loud-failure surface (Bug 68). Streaming
+// readers scan and decode rows on a background goroutine after
+// ReadRows has already returned its channel; a per-row scan/decode
+// failure there cannot be returned synchronously. The implementation
+// MUST store such an error and surface it via Err so the orchestrator
+// can distinguish "channel closed because the table was fully read"
+// from "channel closed because a row failed". Callers MUST call Err
+// after the channel has been fully drained (or ctx-cancelled) and
+// treat a non-nil result as a hard migration failure. Without this
+// check a mid-stream decode error silently truncates the table and
+// the migrate exits 0 with missing rows — the worst failure class
+// under the project's loud-failure tenet.
+//
+// Err returns nil before the first ReadRows call and after a clean,
+// fully-drained read. It is concurrency-safe to call after the
+// channel closes; concurrent calls during an in-flight stream are
+// not required to be meaningful (the contract is "read it once the
+// channel is drained").
 type RowReader interface {
 	ReadRows(ctx context.Context, table *Table) (<-chan Row, error)
+	Err() error
 }
 
 // BatchedRowReader is an optional extension of [RowReader] for engines
