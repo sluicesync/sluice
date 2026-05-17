@@ -6,6 +6,20 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.69.2]
+
+**Closes Bug 69 (HIGH — PG→PG hard-fail + PG→MySQL silent decimal-precision loss; surfaced by the v0.69.1 close-out battle-test).** An **unconstrained** PostgreSQL `numeric`/`numeric[]` column (declared `numeric` with NO precision/scale — arbitrary precision, a ubiquitous PG column shape) was mis-emitted: **PG→PG** → `NUMERIC(0,0)` → `SQLSTATE 22023` hard create-tables failure (loud, exit 1, no partial); **PG→MySQL** → `DECIMAL(0,0)` → **silent decimal-precision data loss** (exit 0, no `WARN`: `3.14159` → `3`). **Pre-existing** (byte-identical on v0.69.0/earlier; *not* a v0.69.x regression), orthogonal to Bug 68 — masked in every prior verdict because the battle-test corpus used only *constrained* `NUMERIC(15,2)`.
+
+### Fixed
+
+- **IR can now represent unconstrained numeric distinctly.** `ir.Decimal` gains `Unconstrained bool` (the established bool-variant idiom — `Integer.Unsigned`, `JSON.Binary`, `Timestamp.WithTimeZone`; additive, default-false → all constrained construction sites and emitters byte-identical; only the Postgres reader sets it). Root cause was the reader collapsing `information_schema`'s NULL `numeric_precision`/`numeric_scale` to `0` into a non-pointer `ir.Decimal{Precision int, Scale int}` indistinguishable from `numeric(0,0)`.
+- **PG-target:** unconstrained → bare `NUMERIC` (arbitrary precision — fixes the `22023`). Constrained `numeric(p,s)` unchanged.
+- **MySQL-target:** MySQL has no unbounded decimal, so unconstrained → `DECIMAL(65,30)` (MySQL's documented maximum) **plus a loud, operator-actionable advisory at BOTH `schema preview` and `migrate` preflight**, naming every affected `table.column` and the `--type-override` escape — the same notice machinery and surfaces as the v0.68.2 `bigint unsigned`→`bigint` range-narrowing advisory. It is an advisory, not a refusal (migration proceeds); the loud-failure floor is satisfied — **no silent truncation**. `numeric[]` is lossless in both directions (PG→PG `NUMERIC[]`; PG→MySQL → JSON via the Bug-68 array path — verified: numeric values decode to strings end-to-end, JSON-encoded with full precision, so the narrowing advisory correctly does not fire for arrays).
+
+### Compatibility
+
+Drop-in from v0.69.1; no state/format change (the backup envelope gains an append-only `decimal_unconstrained` field). Strictly corrective. **Internal interface note:** `ir.Decimal` gained `Unconstrained bool` (the IR is not a stable/exported interface). Unconstrained `numeric` PG→PG now migrates (was a `22023` hard fail) and PG→MySQL preserves precision to `DECIMAL(65,30)` with a loud advisory (was silent truncation to integer). Constrained `numeric(p,s)`, MySQL→PG, PG→PG, the Bug-68 array paths, and prior closures are regression-guarded — Option-C `-race`+Integration CI green before the tag. Cross-engine policy recorded (owner-overridable) in `docs/type-mapping.md`.
+
 ## [0.69.1]
 
 **Closes Bug 68 (HIGH — silent data loss, the worst class; surfaced by the v0.69.0 final readiness battle-test).** A PostgreSQL source table with a **multi-dimensional array column** (`int[][]`, any `T[][]`) migrated cross-engine **PG→MySQL** exited 0 with the target table created but **zero rows for the entire table** — no error, no `WARN` at any log level. **Pre-existing** (reproduces byte-identically on v0.68.2; *not* a v0.69.0 regression) and distinct from #18 (1-D `text[]`/`int[]` work, including at scale). This was the lone caveat on the v0.69.0 PG→MySQL real-user-readiness verdict.
