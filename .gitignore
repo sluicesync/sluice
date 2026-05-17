@@ -53,5 +53,10 @@ config.local.yml
 test/perf/data/
 test/integration/dumps/
 
+# Generative fuzz harness — dumped failing fixtures (replayable from
+# the printed seed; promote to a permanent named pin by hand, don't
+# commit the raw dump dir).
+internal/pipeline/testdata/fuzz-failures/
+
 # Logs
 *.log
