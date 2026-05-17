@@ -80,6 +80,26 @@ make test-it
 
 If Docker isn't available, the tests skip cleanly via `testcontainers.SkipIfProviderIsNotHealthy` — they don't fail. CI's Linux runners have Docker installed, so the integration tests execute there even when local devs can't run them.
 
+### Build-tag layers and their image/time cost
+
+Integration tests are layered by build tag so the normal pass doesn't pull heavy images:
+
+| Tag | Image(s) | Cost | What it gates |
+|-----|----------|------|---------------|
+| `integration` | `mysql:8.0`, `postgres:16`, plus extension images | minutes; runs in CI on every PR | the default cross-engine + same-engine suite |
+| `integration vstream` | `vitess/vttestserver:mysql80` (~2 GB) | +1–2 min container boot; runs in the vstream pass | VStream CDC reader basics, snapshot→CDC handoff, multi-shard snapshot/CDC, **static-sharded Vitess → sluice Migrate → src==dst** (`internal/pipeline`, `TestMigrate_VStreamShardedSource`) |
+| `integration vitessreshard` | `vitess/lite:latest` (~2 GB) + `quay.io/coreos/etcd:v3.5.17` (~70 MB) | cluster bring-up ~40–60 s; each test 80–170 s wall; **heavy, NOT in the normal CI gate** | the Track-1a reshard core: a scripted multi-process Vitess cluster (etcd + vtctld + per-shard primary+replica vttablets + vtgate) that can run `vtctldclient Reshard create` + `SwitchTraffic`. `TestVitessReshard_ProofOfReshardability` (topology feasibility gate) and `TestVitessReshard_ChaosExactlyOnce` (the headline no-gap/no-dup-across-the-journal-cut oracle, `internal/engines/mysql`) |
+
+Why `vitessreshard` is a separate tag rather than reusing `vstream`: the `vstream` tag's `vttestserver` image is single-process `vtcombo` — it serves a *statically* sharded keyspace and ships **no `vtctldclient`/`vtctld`/standalone `vttablet`**, so it physically cannot run a shard-count reshard. The reshard correctness core therefore needs the full multi-process cluster (the `examples/local` topology, containerised), which is heavier and slower and must not burden the normal integration pass. Run it explicitly:
+
+```bash
+# Windows/Rancher: add docker.exe to PATH + disable ryuk first (see below)
+go test -tags='integration vitessreshard' -v -count=1 -timeout=35m \
+  -run 'TestVitessReshard' ./internal/engines/mysql/...
+```
+
+The cheap CI-smoke half of the Track-1a Vitess validation (VStream basics + static-sharded `src==dst`) stays under `vstream` and runs in the normal vstream pass; only the heavy reshard-chaos core is behind `vitessreshard`.
+
 ### Rancher Desktop on Windows
 
 Rancher Desktop works as a Docker Desktop replacement, with two snags worth knowing:
