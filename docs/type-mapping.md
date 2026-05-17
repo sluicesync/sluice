@@ -179,7 +179,9 @@ When the IR is emitted as MySQL DDL, the inverse mapping applies, with the follo
 
   The `mappings:` YAML hook and `--type-override` CLI flag continue to override the auto-shape for operators who want different storage (e.g. binary representations, `LONGTEXT` for array serialisation).
 - `Timestamp{WithTimeZone: false}` is emitted as `DATETIME`.
+- `Time{WithTimeZone: true}` (a Postgres `timetz` / `time with time zone`) is emitted as MySQL `TIME` — MySQL has **no** timezone-aware time type, so the zone is dropped. This is the same documented cross-engine policy as `Timestamp{WithTimeZone: true}` → MySQL `TIMESTAMP` (zone-flattening, not a refusal): a tz-aware temporal still migrates, with the zone offset lost on the MySQL side. PG → PG round-trips `timetz` faithfully (the IR carries `Time.WithTimeZone`, the PG writer emits `TIME WITH TIME ZONE`, and a per-conn binary codec encodes the value — pgx ships none for `timetz`). Catalog Bug 71.
 - `Decimal{Unconstrained: true}` (an unconstrained Postgres `numeric`) is emitted as `DECIMAL(65,30)` — MySQL's widest representable fixed-point form, since MySQL has no unbounded DECIMAL — plus a loud, operator-overridable widening advisory at `schema preview` and `migrate` preflight. Constrained `Decimal{Precision, Scale}` emits `DECIMAL(p,s)` unchanged. See the [unconstrained numeric](#unconstrained-postgres-numeric-no-precisionscale--owner-surface-design-call-v069x--bug-69) edge case.
+- `Varchar{Length: N}` with `N` over MySQL's representable cap (utf8mb4's ~16383-char creatable limit / the 65535-byte InnoDB row budget) is down-mapped to the smallest MySQL **TEXT-family** type that still holds `N` characters (`TEXT` ≤ 65535 bytes, `MEDIUMTEXT` ≤ 16 MiB, else `LONGTEXT`), sized by the column's worst-case byte width (`N × 4`). This mirrors the unbounded PG `text` → `LONGTEXT` policy and is surfaced by a loud, operator-overridable advisory at `schema preview` and `migrate` preflight. Narrow varchars (≤ 16000 chars) are emitted as `VARCHAR(N)` unchanged. PG → PG round-trips `varchar(N)` unchanged (PG has no such limit). Catalog Bug 72.
 
 ## PostgreSQL ↔ IR
 
@@ -202,6 +204,7 @@ When the IR is emitted as MySQL DDL, the inverse mapping applies, with the follo
 | `bytea`                           | `Blob{Size: Long}`                            | |
 | `date`                            | `Date{}`                                      | |
 | `time(p)`                         | `Time{Precision: p}`                          | |
+| `time(p) with time zone` (`timetz`)| `Time{Precision: p, WithTimeZone: true}`     | PG→PG faithful; PG→MySQL drops the zone (no tz-aware MySQL time). Bug 71. |
 | `timestamp(p)`                    | `Timestamp{Precision: p, WithTimeZone: false}`| |
 | `timestamp(p) with time zone`     | `Timestamp{Precision: p, WithTimeZone: true}` | |
 | user-defined `enum` type          | `Enum{Values: [...]}`                         | |
