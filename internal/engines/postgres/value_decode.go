@@ -46,13 +46,15 @@ func decodeValue(raw any, t ir.Type) (any, error) {
 	case ir.Binary, ir.Varbinary, ir.Blob:
 		return decodeBytes(raw)
 	case ir.Bit:
-		// PG bit/varbit surfaces as a '0'/'1' string under pgx stdlib
-		// mode (or bytes on some paths); decodeBytes tolerates both.
-		// PG-source bit columns are out of scope for catalog Bug 62
-		// (the bug is MySQL-source) — this case exists so a
-		// sluice-written bit(N) column reads back to ir.Bit instead of
-		// erroring in the decode switch (PG→PG symmetry).
-		return decodeBytes(raw)
+		// catalog Bug 75: PG `bit`/`varbit` surfaces under pgx stdlib
+		// mode as the canonical '0'/'1' text ("10101010"). The IR
+		// contract for ir.Bit is exactly that bit-string (see
+		// internal/ir/bit.go) — pass it through as a string. The prior
+		// decodeBytes turned the text into the ASCII bytes of the
+		// digits, which the writer then truncated, silently collapsing
+		// every distinct value. []byte inputs are the same ASCII text
+		// on the codepaths that surface it that way.
+		return decodeBitString(raw)
 	case ir.Date, ir.DateTime, ir.Timestamp:
 		return decodeTime(raw)
 	case ir.Time:
@@ -293,6 +295,22 @@ func decodeBytes(raw any) (any, error) {
 		return []byte(v), nil
 	}
 	return nil, fmt.Errorf("postgres: cannot decode %T as bytes", raw)
+}
+
+// decodeBitString returns the IR-canonical bit-string form for a PG
+// `bit`/`varbit` value (catalog Bug 75). pgx stdlib mode surfaces the
+// value as the canonical '0'/'1' text already; []byte on the paths
+// that produce it is the same ASCII text. Anything else is an
+// upstream decode bug and surfaces loudly rather than as a wrong
+// value.
+func decodeBitString(raw any) (any, error) {
+	switch v := raw.(type) {
+	case string:
+		return v, nil
+	case []byte:
+		return string(v), nil
+	}
+	return nil, fmt.Errorf("postgres: cannot decode %T as bit string", raw)
 }
 
 // decodeTime accepts pgx's time.Time (the database/sql path) or a

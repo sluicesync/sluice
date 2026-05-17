@@ -284,14 +284,30 @@ func (b Blob) String() string { return fmt.Sprintf("Blob[%s]", b.Size) }
 // `b'…'` / `B'…'` literal default. Modelling it as Varbinary (the
 // pre-v0.65.1 behaviour) mis-typed the column on every target and
 // decimal-stringified the bit-literal default (catalog Bug 62).
+// Varying distinguishes a variable-length bit string (PostgreSQL `bit
+// varying(N)` / `varbit`) from a fixed-width one (`bit(N)`, MySQL
+// `BIT(N)`). For a varying column Length is the declared maximum and
+// individual values may be shorter; for a fixed column every value is
+// exactly Length bits. Collapsing the two (catalog Bug 75) made the
+// PG DDL emitter render `bit varying(16)` as fixed `bit(16)`, so a
+// shorter value was loud-rejected (SQLSTATE 22026) after the value
+// path was finally faithful. MySQL has no varying-bit type; a
+// varying source lands as MySQL `BIT(Length)` (fixed, the closest
+// faithful shape — values are zero-extended, which BIN() round-trips).
 type Bit struct {
-	Length int
+	Length  int
+	Varying bool
 }
 
 func (Bit) isType()    {}
 func (Bit) Tier() Tier { return TierCore }
 
-func (b Bit) String() string { return fmt.Sprintf("Bit(%d)", b.Length) }
+func (b Bit) String() string {
+	if b.Varying {
+		return fmt.Sprintf("Varbit(%d)", b.Length)
+	}
+	return fmt.Sprintf("Bit(%d)", b.Length)
+}
 
 // Date is a calendar date with no time-of-day component.
 type Date struct{}

@@ -25,7 +25,7 @@ func decodeValue(raw any, t ir.Type) (any, error) {
 		return nil, nil
 	}
 
-	switch t.(type) {
+	switch v := t.(type) {
 	case ir.Boolean:
 		return decodeBoolean(raw)
 	case ir.Integer:
@@ -39,12 +39,14 @@ func decodeValue(raw any, t ir.Type) (any, error) {
 	case ir.Binary, ir.Varbinary, ir.Blob:
 		return decodeBytes(raw)
 	case ir.Bit:
-		// MySQL's driver hands BIT(N) back as a byte slice (big-endian,
-		// ceil(N/8) bytes) — the same wire shape as VARBINARY, which is
-		// what BIT(N>1) decoded as pre-v0.65.1. Keeping the bytes path
-		// preserves the validated row round-trip (catalog Bug 62 is a
-		// DDL-emit defect only; the value path was already correct).
-		return decodeBytes(raw)
+		// catalog Bug 75: MySQL's driver hands BIT(N) back as a byte
+		// slice (big-endian, ceil(N/8) bytes, value right-justified).
+		// The IR contract for ir.Bit is the canonical '0'/'1'
+		// bit-string (engine-neutral; see internal/ir/bit.go) so the
+		// value round-trips faithfully to a PG or MySQL target. The
+		// prior raw-bytes path made the IR's bit representation engine-
+		// specific and was silently corrupted by the PG writer.
+		return decodeBit(raw, v.Length)
 	case ir.Date, ir.DateTime, ir.Timestamp:
 		return decodeTime(raw)
 	case ir.Time:
@@ -198,6 +200,22 @@ func decodeBytes(raw any) (any, error) {
 		return []byte(v), nil
 	}
 	return nil, fmt.Errorf("mysql: cannot decode %T as bytes", raw)
+}
+
+// decodeBit converts MySQL's BIT(N) wire form (a big-endian,
+// right-justified ceil(N/8)-byte slice) into the IR-canonical
+// '0'/'1' bit-string of exactly n characters (catalog Bug 75). A
+// string input (some driver configs surface BIT as text) is parsed
+// the same way. n is the column's declared bit width. NULL is
+// handled by the caller (decodeValue) before reaching here.
+func decodeBit(raw any, n int) (any, error) {
+	switch v := raw.(type) {
+	case []byte:
+		return ir.BitBytesToString(v, n), nil
+	case string:
+		return ir.BitBytesToString([]byte(v), n), nil
+	}
+	return nil, fmt.Errorf("mysql: cannot decode %T as Bit", raw)
 }
 
 // decodeMySQLGeometry strips MySQL's 4-byte little-endian SRID prefix

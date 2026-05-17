@@ -190,6 +190,15 @@ func columnSetExpr(col *ir.Column, varName string) string {
 	case ir.JSON, ir.Array:
 		return "CONVERT(" + varName + " USING utf8mb4)"
 	}
+	// catalog Bug 75: ir.Bit is streamed as the canonical '0'/'1'
+	// bit-string (see encodeRowsTSV). MySQL's BIT(N) column needs the
+	// numeric value, so parse the base-2 digits. NULLIF keeps a NULL
+	// field (\N → SQL NULL) NULL rather than CONV('')→0. CAST to
+	// UNSIGNED so the assignment to BIT(N) is the integer value, not a
+	// re-stringified one.
+	if _, isBit := col.Type.(ir.Bit); isBit {
+		return "CAST(CONV(NULLIF(" + varName + ", ''), 2, 10) AS UNSIGNED)"
+	}
 	// Text-like columns: re-tag the binary stream as utf8mb4 so
 	// CHECK constraints and stored procedures see the column's
 	// declared charset rather than `binary`. The bytes themselves
@@ -249,7 +258,20 @@ func encodeRowsTSV(ctx context.Context, w io.Writer, cols []*ir.Column, rows <-c
 				if i > 0 {
 					buf = append(buf, '\t')
 				}
-				v := prepareValue(row[c.Name], c)
+				raw := row[c.Name]
+				// catalog Bug 75: ir.Bit. The INSERT path wants ceil(N/8)
+				// big-endian bytes (what prepareValue produces), but LOAD
+				// DATA reinterprets a binary field as a string and
+				// corrupts it. Instead emit the IR-canonical '0'/'1'
+				// bit-string verbatim and let columnSetExpr's CONV(...,2,10)
+				// SET expression parse it. NULL stays NULL.
+				if _, isBit := c.Type.(ir.Bit); isBit && raw != nil {
+					if s, ok := raw.(string); ok {
+						buf = appendEscapedString(buf, s)
+						continue
+					}
+				}
+				v := prepareValue(raw, c)
 				var err error
 				buf, err = tsvEncode(buf, v)
 				if err != nil {

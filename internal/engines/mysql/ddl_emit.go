@@ -75,8 +75,11 @@ func emitColumnType(t ir.Type) (string, error) {
 		return emitBlobType(v.Size), nil
 	case ir.Bit:
 		// Fixed-width bit string. Round-trips MySQL BIT(N) ↔ PG bit(N)
-		// (catalog Bug 62). BIT(1) never reaches here — the reader maps
-		// the conventional single-bit column to ir.Boolean.
+		// (catalog Bug 62). MySQL has no varying-bit type, so a PG `bit
+		// varying(N)` source also lands as fixed BIT(N) (catalog Bug
+		// 75) — values are zero-extended to N bits, which BIN(col+0)
+		// round-trips faithfully. BIT(1) never reaches here — the
+		// reader maps the conventional single-bit column to ir.Boolean.
 		return fmt.Sprintf("BIT(%d)", v.Length), nil
 
 	// ---- Temporal ----
