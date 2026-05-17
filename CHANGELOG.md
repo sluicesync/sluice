@@ -6,6 +6,21 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+**Track 1c — CDC resumability validation (PlanetScale/Vitess readiness) + a node-replace silent-gap hardening.** Validation-first; the one production change is the minimal loud floor a Phase-A ground-truth finding demanded. All outcomes verified vs Docker (vttestserver + mysql:8.0).
+
+### Fixed
+
+- **MySQL node-replace / restore-from-backup position-loss (SILENT-gap class → now LOUD).** `verifyBinlogFilePresent` matched the persisted CDC position on binlog **filename only**. A replaced / restored-from-backup / failed-over source instance (the operator-reported PlanetScale pain) carries an independent binlog lineage that frequently **reuses the same filenames** (`mysql-bin.000003`, …); the name check false-positived and the syncer silently resumed at a byte offset in an *unrelated* file — a silent data gap. Fix (minimal loud floor, mirrors `verifyGTIDSetReachable`'s existing refuse-pattern): file/pos positions are now bound to the source `@@server_uuid` (stamped by both the snapshot→CDC handoff and the per-event position emitter); on resume a differing `server_uuid` wraps `ir.ErrPositionInvalid`, routing the existing ADR-0022 cold-start re-snapshot. GTID mode needs no equivalent — GTID UUIDs are instance-bound, so `verifyGTIDSetReachable` already catches a fresh instance. Empty persisted/current uuid degrades to the prior filename-only check (no false refusal; zero-users transitional).
+
+### Validated (no production change — already at the loud-failure floor)
+
+- **VStream + Vitess schema-tracking DISABLED + mid-stream DDL** (the genuinely-open behaviour): ground-truthed against vttestserver for ADD / DROP / MODIFY column — **FAITHFUL in all three**. VStream re-emits a fresh `FIELD` event post-DDL and `dispatchDDL`'s field-cache clear realigns the decode; no silent corruption (the alternative is a loud "row event without preceding FIELD event" hard error — loud + recoverable). `internal/engines/mysql/cdc_vstream_schema_evolution_integration_test.go` (`integration vstream`).
+- **GTID retention-exceeded** (`gtid_purged` advanced past resume) and **`gtid_mode=ON` binlog-purge**: both already LOUD + actionable (`ir.ErrPositionInvalid` → ADR-0022 cold-start; src == dst, exactly-once). Reader-level + streamer-level tests added.
+
+### Compatibility
+
+Drop-in. **Internal IR change:** `binlogPos` gains a `server_uuid` field (the position token is not a stable/exported format). Positions persisted before this field exist resume exactly as before (the identity check skips on an empty persisted uuid). MySQL→MySQL warm-resume, snapshot→CDC handoff, vanilla CDC, and the VStream/sharded path are regression-guarded against Docker; Track-2 fuzz-roundtrip and Track-1a static/sharded VStream baselines re-run green.
+
 ## [0.69.4]
 
 **Closes Bug 74 — a CRITICAL silent-loss regression introduced by v0.69.3's Bug 70 fix (a correction banner is on the v0.69.3 release) — plus pre-existing Bug 73 / 75 / 76.** The two silent bugs (74, 75) were ground-truthed by instrumented probes against real Docker PostgreSQL/MySQL, not code-reading.
