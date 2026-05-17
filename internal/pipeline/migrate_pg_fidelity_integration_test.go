@@ -110,10 +110,14 @@ func TestMigrate_PG_SchemaFidelity_Pass3(t *testing.T) {
 		t.Errorf("#19a: ix_posts_published lost predicate/DESC: %q", pub)
 	}
 
-	// #19b — INCLUDE columns must stay non-key, not flattened.
+	// #19b — INCLUDE columns must stay non-key, not flattened, AND
+	// keep their declared order (the reader's `ORDER BY u.ord`
+	// guarantees ordinal order; pin the exact rendered clause so a
+	// future query/loop change can't silently scramble or drop it).
 	acct := indexDef("ix_posts_acct")
-	if !containsAll(acct, "INCLUDE", "title", "score") {
-		t.Errorf("#19b: ix_posts_acct lost INCLUDE: %q", acct)
+	if !strings.Contains(acct, "INCLUDE (title, score)") {
+		t.Errorf("#19b: ix_posts_acct lost/reordered INCLUDE (want exact %q): %q",
+			"INCLUDE (title, score)", acct)
 	}
 	// title/score must NOT have been promoted into the key list.
 	if containsAll(acct, "(account_id, title") {
