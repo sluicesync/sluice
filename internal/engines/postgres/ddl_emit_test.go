@@ -169,6 +169,10 @@ func TestEmitColumnType(t *testing.T) {
 		{"date", ir.Date{}, "DATE"},
 		{"time precision 0", ir.Time{Precision: 0}, "TIME"},
 		{"time precision 6", ir.Time{Precision: 6}, "TIME(6)"},
+		// Bug 71: timetz round-trips as TIME WITH TIME ZONE on a PG
+		// target (not collapsed to plain TIME).
+		{"timetz precision 0", ir.Time{Precision: 0, WithTimeZone: true}, "TIME WITH TIME ZONE"},
+		{"timetz precision 6", ir.Time{Precision: 6, WithTimeZone: true}, "TIME(6) WITH TIME ZONE"},
 		{"datetime precision 0", ir.DateTime{Precision: 0}, "TIMESTAMP"},
 		{"datetime precision 3", ir.DateTime{Precision: 3}, "TIMESTAMP(3)"},
 		{"timestamp", ir.Timestamp{Precision: 0, WithTimeZone: false}, "TIMESTAMP"},

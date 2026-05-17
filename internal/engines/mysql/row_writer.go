@@ -419,6 +419,22 @@ func prepareValue(v any, col *ir.Column) any {
 			return string(b)
 		}
 	}
+	// catalog Bug 71: a PG `timetz` (ir.Time{WithTimeZone:true}) value
+	// arrives from the PG reader as its canonical text form including
+	// the zone offset ("13:45:30+05"). MySQL has no tz-aware TIME — the
+	// column was emitted as plain MySQL TIME (the documented
+	// zone-flatten cross-engine policy, mirroring timestamptz→MySQL).
+	// MySQL's TIME parser rejects the offset suffix (Error 1292), so we
+	// strip it here, leaving the time-of-day. Plain `time`
+	// (WithTimeZone:false) is untouched.
+	if tt, isTime := t.(ir.Time); isTime && tt.WithTimeZone {
+		if s, ok := v.(string); ok {
+			return stripTimeZoneOffset(s)
+		}
+		if b, ok := v.([]byte); ok {
+			return stripTimeZoneOffset(string(b))
+		}
+	}
 	if geom, isGeom := t.(ir.Geometry); isGeom {
 		if b, ok := v.([]byte); ok {
 			out := make([]byte, 4+len(b))
@@ -457,6 +473,23 @@ func prepareValue(v any, col *ir.Column) any {
 		}
 	}
 	return v
+}
+
+// stripTimeZoneOffset removes a trailing timezone offset from a PG
+// `timetz` text value ("13:45:30+05", "08:00:00-07:30",
+// "23:59:59.123456+00") so it is accepted by a MySQL TIME column
+// (catalog Bug 71 — MySQL has no tz-aware TIME; the zone is dropped
+// per the documented cross-engine policy). The offset sign is the
+// first '+' or '-' after the "HH:MM:SS" head (offset 8+); it never
+// collides with the time digits or the fractional dot. A value with no
+// offset passes through unchanged.
+func stripTimeZoneOffset(s string) string {
+	for i := 8; i < len(s); i++ {
+		if s[i] == '+' || s[i] == '-' {
+			return s[:i]
+		}
+	}
+	return s
 }
 
 // prepareHstoreToJSON converts a PG hstore wire value into a JSON

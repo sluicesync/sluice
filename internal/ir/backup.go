@@ -622,6 +622,7 @@ func MarshalType(t Type) ([]byte, error) {
 	case Time:
 		env.Kind = "Time"
 		env.Precision = v.Precision
+		env.WithTimeZone = v.WithTimeZone
 	case DateTime:
 		env.Kind = "DateTime"
 		env.Precision = v.Precision
@@ -711,7 +712,7 @@ func UnmarshalType(b []byte) (Type, error) {
 	case "Date":
 		return Date{}, nil
 	case "Time":
-		return Time{Precision: env.Precision}, nil
+		return Time{Precision: env.Precision, WithTimeZone: env.WithTimeZone}, nil
 	case "DateTime":
 		return DateTime{Precision: env.Precision}, nil
 	case "Timestamp":

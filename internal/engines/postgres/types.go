@@ -335,10 +335,14 @@ func translateType(c columnMeta) (ir.Type, error) {
 	case "time without time zone", "time":
 		return ir.Time{Precision: int(int64Ptr(c.DTPrec))}, nil
 	case "time with time zone":
-		// The IR currently has a single Time type without a TZ flag.
-		// Modelled as Time; the TZ-ness is implicit and lossy on
-		// MySQL output. A future IR extension could add a TZ flag.
-		return ir.Time{Precision: int(int64Ptr(c.DTPrec))}, nil
+		// `timetz` (PG OID 1266) is a distinct wire type from plain
+		// `time` (OID 1083); the tz-bearing value cannot be encoded
+		// into the tz-less codec. Carry the distinction on the IR so
+		// PG→PG round-trips it faithfully. Cross-engine to MySQL the
+		// tz is dropped (MySQL has no tz-aware TIME) — same documented
+		// policy as timestamptz→MySQL; see docs/type-mapping.md.
+		// (catalog Bug 71.)
+		return ir.Time{Precision: int(int64Ptr(c.DTPrec)), WithTimeZone: true}, nil
 	case "timestamp without time zone", "timestamp":
 		return ir.DateTime{Precision: int(int64Ptr(c.DTPrec))}, nil
 	case "timestamp with time zone":

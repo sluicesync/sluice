@@ -93,7 +93,11 @@ func emitColumnType(t ir.Type, opts emitOpts) (string, error) {
 	case ir.Date:
 		return "DATE", nil
 	case ir.Time:
-		return emitWithPrecision("TIME", v.Precision), nil
+		base := emitWithPrecision("TIME", v.Precision)
+		if v.WithTimeZone {
+			return base + " WITH TIME ZONE", nil
+		}
+		return base, nil
 	case ir.DateTime:
 		return emitWithPrecision("TIMESTAMP", v.Precision), nil
 	case ir.Timestamp:
