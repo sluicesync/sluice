@@ -537,6 +537,14 @@ type schemaTypeEnvelope struct {
 	// JSON.
 	Binary bool `json:"binary,omitempty"`
 
+	// Decimal arbitrary-precision (catalog Bug 69). True for bare
+	// `numeric`/`decimal` with no declared precision/scale. Append-only;
+	// older sluice ignores it and reads the column as numeric(0,0),
+	// which is the pre-fix lossy behaviour — acceptable for forward
+	// compat since manifests are produced and consumed by the same
+	// build in practice.
+	DecimalUnconstrained bool `json:"decimal_unconstrained,omitempty"`
+
 	// Enum / Set values. Empty for other types.
 	Values []string `json:"values,omitempty"`
 
@@ -581,6 +589,7 @@ func MarshalType(t Type) ([]byte, error) {
 		env.Kind = "Decimal"
 		env.Precision = v.Precision
 		env.Scale = v.Scale
+		env.DecimalUnconstrained = v.Unconstrained
 	case Float:
 		env.Kind = "Float"
 		env.FloatPrec = uint8(v.Precision)
@@ -684,7 +693,7 @@ func UnmarshalType(b []byte) (Type, error) {
 	case "Integer":
 		return Integer{Width: env.Width, Unsigned: env.Unsigned, AutoIncrement: env.AutoIncrement}, nil
 	case "Decimal":
-		return Decimal{Precision: env.Precision, Scale: env.Scale}, nil
+		return Decimal{Precision: env.Precision, Scale: env.Scale, Unconstrained: env.DecimalUnconstrained}, nil
 	case "Float":
 		return Float{Precision: FloatPrecision(env.FloatPrec)}, nil
 	case "Char":

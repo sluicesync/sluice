@@ -127,6 +127,11 @@ type PreviewJSON struct {
 	// Advisory only — tooling that wants to flag the (2^63, 2^64) loss
 	// can gate on a non-empty list, but sluice itself does not refuse.
 	UnsignedBigintNarrowings []PreviewJSONUnsignedBigint `json:"unsigned_bigint_narrowings,omitempty"`
+	// UnconstrainedNumericWidenings is the Bug 69 unconstrained PG
+	// `numeric` → MySQL `DECIMAL(65,30)` advisory list. Omitted for
+	// non-PG→MySQL pairs and when no unconstrained-numeric column is
+	// present. Advisory only — sluice does not refuse.
+	UnconstrainedNumericWidenings []PreviewJSONUnconstrainedNumeric `json:"unconstrained_numeric_widenings,omitempty"`
 }
 
 // PreviewJSONUnsignedBigint is one MySQL `bigint unsigned` → PG
@@ -135,6 +140,13 @@ type PreviewJSONUnsignedBigint struct {
 	Table         string `json:"table"`
 	Column        string `json:"column"`
 	AutoIncrement bool   `json:"auto_increment"`
+}
+
+// PreviewJSONUnconstrainedNumeric is one unconstrained PG `numeric` →
+// MySQL `DECIMAL(65,30)` widening. Stable shape for tooling consumers.
+type PreviewJSONUnconstrainedNumeric struct {
+	Table  string `json:"table"`
+	Column string `json:"column"`
 }
 
 // PreviewJSONTranslatorGap is one detected MySQL → PG translator
@@ -315,6 +327,17 @@ func (p *Previewer) Run(ctx context.Context) error {
 		tgtSchema, p.Source.Name(), p.Target.Name(),
 	)
 
+	// ---- 3.7. Unconstrained-numeric widening notice (Bug 69) ----
+	// Advisory — NOT a refusal (unconstrained numeric is ubiquitous in
+	// PG schemas and must still migrate). Scanned on the post-override
+	// schema so an operator's `--type-override` escape hatch suppresses
+	// the notice for that column. Rendered in a dedicated preview
+	// section so it's loud and visible, matching the wording `migrate`
+	// preflight logs.
+	unconstrainedNumericNotices := translate.ScanUnconstrainedNumericNotices(
+		tgtSchema, p.Source.Name(), p.Target.Name(),
+	)
+
 	// ---- 4. Open the target schema writer; type-assert for preview. ----
 	sw, err := p.Target.OpenSchemaWriter(ctx, p.TargetDSN)
 	if err != nil {
@@ -358,8 +381,9 @@ func (p *Previewer) Run(ctx context.Context) error {
 			srcSchema, p.Source.Name(), p.Target.Name(),
 			enabledExtensionSet(p.EnabledPGExtensions),
 		),
-		unsignedBigintNotices: unsignedBigintNotices,
-		redactor:              p.Redactor,
+		unsignedBigintNotices:       unsignedBigintNotices,
+		unconstrainedNumericNotices: unconstrainedNumericNotices,
+		redactor:                    p.Redactor,
 	}
 
 	switch strings.ToLower(strings.TrimSpace(p.Format)) {
@@ -402,7 +426,12 @@ type previewBundle struct {
 	// `bigint` range-narrowing advisory list (nil for non-MySQL→PG
 	// pairs or when no unsigned-bigint column is present).
 	unsignedBigintNotices []translate.UnsignedBigintNotice
-	redactor              *redact.Registry // PII Phase 1.5 (v0.55.0) — nil/empty disables annotation
+	// unconstrainedNumericNotices is the Bug 69 unconstrained PG
+	// `numeric` → MySQL `DECIMAL(65,30)` widening advisory list (nil
+	// for non-PG→MySQL pairs or when no unconstrained-numeric column is
+	// present).
+	unconstrainedNumericNotices []translate.UnconstrainedNumericNotice
+	redactor                    *redact.Registry // PII Phase 1.5 (v0.55.0) — nil/empty disables annotation
 }
 
 // enabledExtensionSet converts the operator's `--enable-pg-extension`
@@ -576,6 +605,9 @@ func renderPreviewText(w io.Writer, bundle previewBundle) error {
 	if n := len(bundle.unsignedBigintNotices); n > 0 {
 		fmt.Fprintf(&sb, "-- unsigned-bigint narrowings: %d (see section below)\n", n)
 	}
+	if n := len(bundle.unconstrainedNumericNotices); n > 0 {
+		fmt.Fprintf(&sb, "-- unconstrained-numeric widenings: %d (see section below)\n", n)
+	}
 	sb.WriteByte('\n')
 
 	if len(bundle.translatorGaps) > 0 {
@@ -584,6 +616,10 @@ func renderPreviewText(w io.Writer, bundle previewBundle) error {
 
 	if len(bundle.unsignedBigintNotices) > 0 {
 		writeUnsignedBigintSection(&sb, bundle.unsignedBigintNotices)
+	}
+
+	if len(bundle.unconstrainedNumericNotices) > 0 {
+		writeUnconstrainedNumericSection(&sb, bundle.unconstrainedNumericNotices)
 	}
 
 	for _, t := range bundle.tables {
@@ -656,6 +692,33 @@ func writeUnsignedBigintSection(sb *strings.Builder, notices []translate.Unsigne
 			sb.WriteString(" (AUTO_INCREMENT — IDs in practice never reach 2^63)")
 		}
 		sb.WriteByte('\n')
+	}
+	sb.WriteByte('\n')
+}
+
+// writeUnconstrainedNumericSection appends the Bug 69 unconstrained PG
+// `numeric` → MySQL `DECIMAL(65,30)` widening advisory block to sb.
+// This is a NOTICE, not a refusal — `schema preview` still exits 0 and
+// `migrate` still proceeds. It is rendered loudly (its own section,
+// same shape as the unsigned-bigint block) so the deliberate
+// widening is never silent. Wording mirrors what `migrate` preflight
+// logs at WARN.
+func writeUnconstrainedNumericSection(sb *strings.Builder, notices []translate.UnconstrainedNumericNotice) {
+	sb.WriteString("-- ============================================================\n")
+	sb.WriteString("-- Unconstrained-numeric widening (Postgres -> MySQL)\n")
+	sb.WriteString("-- ============================================================\n")
+	sb.WriteString("-- An unconstrained PostgreSQL `numeric` (declared with NO\n")
+	sb.WriteString("-- precision/scale — arbitrary precision) maps to MySQL\n")
+	sb.WriteString("-- `DECIMAL(65,30)` (MySQL has no unbounded DECIMAL; 65,30 is\n")
+	sb.WriteString("-- MySQL's widest representable fixed-point form). Values needing\n")
+	sb.WriteString("-- more than 65 total or 30 fractional digits are NOT\n")
+	sb.WriteString("-- representable on the target. This is advisory; the migration\n")
+	sb.WriteString("-- proceeds. Override a column that needs a different\n")
+	sb.WriteString("-- precision/scale with\n")
+	sb.WriteString("-- `--type-override TABLE.COL=decimal:precision=N,scale=M`.\n")
+	sb.WriteString("--\n")
+	for _, n := range notices {
+		fmt.Fprintf(sb, "-- %s.%s: numeric (unconstrained) -> DECIMAL(65,30)\n", n.Table, n.Column)
 	}
 	sb.WriteByte('\n')
 }
@@ -912,6 +975,12 @@ func renderPreviewJSON(w io.Writer, bundle previewBundle) error {
 			Table:         n.Table,
 			Column:        n.Column,
 			AutoIncrement: n.AutoIncrement,
+		})
+	}
+	for _, n := range bundle.unconstrainedNumericNotices {
+		out.UnconstrainedNumericWidenings = append(out.UnconstrainedNumericWidenings, PreviewJSONUnconstrainedNumeric{
+			Table:  n.Table,
+			Column: n.Column,
 		})
 	}
 	enc := json.NewEncoder(w)

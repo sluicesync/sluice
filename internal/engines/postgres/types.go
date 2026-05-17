@@ -284,6 +284,17 @@ func translateType(c columnMeta) (ir.Type, error) {
 
 	// ---- Decimal / float ----
 	case "numeric", "decimal":
+		// A bare `numeric` / `decimal` with no declared precision is
+		// arbitrary-precision: information_schema reports BOTH
+		// numeric_precision and numeric_scale as NULL. Collapsing that
+		// NULL to 0 (the pre-fix behaviour) emitted NUMERIC(0,0) on a
+		// PG target (22023, hard fail) and DECIMAL(0,0) on a MySQL
+		// target (silent decimal-precision loss) — catalog Bug 69.
+		// Model the unconstrained case distinctly so the emitters can
+		// render the correct per-engine form.
+		if c.NumPrec == nil && c.NumScale == nil {
+			return ir.Decimal{Unconstrained: true}, nil
+		}
 		return ir.Decimal{Precision: int(int64Ptr(c.NumPrec)), Scale: int(int64Ptr(c.NumScale))}, nil
 	case "real":
 		return ir.Float{Precision: ir.FloatSingle}, nil

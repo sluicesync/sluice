@@ -172,15 +172,29 @@ func (i Integer) String() string {
 }
 
 // Decimal represents a fixed-point exact-precision number.
+//
+// Unconstrained models the arbitrary-precision case — a column declared
+// as bare `numeric` / `decimal` with NO precision or scale (PostgreSQL
+// supports this; the engine stores the value with whatever precision the
+// data requires). When Unconstrained is true, Precision and Scale carry
+// no meaning and MUST be zero; when false the column is the bounded
+// `numeric(p,s)` form and Precision/Scale are authoritative. The two
+// cases are genuinely distinct on the wire — PG renders bare `NUMERIC`
+// vs `NUMERIC(p,s)` — so the IR must distinguish them rather than
+// collapsing an absent precision to (0,0) (catalog Bug 69).
 type Decimal struct {
-	Precision int // total number of digits
-	Scale     int // digits to the right of the decimal point
+	Precision     int  // total number of digits (meaningful only when !Unconstrained)
+	Scale         int  // digits right of the point (meaningful only when !Unconstrained)
+	Unconstrained bool // true for bare arbitrary-precision numeric/decimal
 }
 
 func (Decimal) isType()    {}
 func (Decimal) Tier() Tier { return TierCore }
 
 func (d Decimal) String() string {
+	if d.Unconstrained {
+		return "Decimal(unconstrained)"
+	}
 	return fmt.Sprintf("Decimal(%d,%d)", d.Precision, d.Scale)
 }
 

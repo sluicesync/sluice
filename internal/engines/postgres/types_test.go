@@ -36,6 +36,25 @@ func TestTranslateType(t *testing.T) {
 			columnMeta{DataType: "numeric", NumPrec: int64Val(18), NumScale: int64Val(4)},
 			ir.Decimal{Precision: 18, Scale: 4},
 		},
+		{
+			// Bug 69: bare `numeric` — information_schema reports BOTH
+			// numeric_precision and numeric_scale as NULL. Must map to
+			// the unconstrained IR shape, NOT Decimal{0,0}.
+			"numeric (unconstrained)",
+			columnMeta{DataType: "numeric", NumPrec: nil, NumScale: nil},
+			ir.Decimal{Unconstrained: true},
+		},
+		{
+			// Bug 69: `numeric[]` element is also bare numeric — the
+			// array recursion must carry the unconstrained shape.
+			"numeric[] (unconstrained element)",
+			columnMeta{
+				DataType:     "ARRAY",
+				UDTName:      "_numeric",
+				ArrayElement: &columnMeta{DataType: "numeric", NumPrec: nil, NumScale: nil},
+			},
+			ir.Array{Element: ir.Decimal{Unconstrained: true}},
+		},
 		{"real", columnMeta{DataType: "real"}, ir.Float{Precision: ir.FloatSingle}},
 		{"double precision", columnMeta{DataType: "double precision"}, ir.Float{Precision: ir.FloatDouble}},
 
