@@ -6,6 +6,25 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.69.4]
+
+**Closes Bug 74 — a CRITICAL silent-loss regression introduced by v0.69.3's Bug 70 fix (a correction banner is on the v0.69.3 release) — plus pre-existing Bug 73 / 75 / 76.** The two silent bugs (74, 75) were ground-truthed by instrumented probes against real Docker PostgreSQL/MySQL, not code-reading.
+
+### Fixed
+
+- **Bug 74 (CRITICAL, SILENT, v0.69.3 regression — PostgreSQL→PostgreSQL).** v0.69.3's `convertArray` → `pgtype.Array[*string]` silently **flattened** a multi-dimensional `numeric[][]` to 1-D (exit 0, no warning) — strictly worse than v0.69.2's loud `SQLSTATE 57014`. A class probe proved the silent flatten was broader than first catalogued (`uuid[][]`/`inet[][]`/`cidr[][]`/`time[][]` too). Phase-A (instrumented, real PG `COPY` binary path): pgx's `ArrayCodec.PlanEncode` plans the element encode against the **target column element OID**; `NumericCodec`/`UUIDCodec`/`InetCodec`/temporal codecs reject a `*string` valuer, so pgx falls back through a dimension-flattening wrap. Fix: `convertArray` now selects the correct pgx-encodable leaf **per element family** — native int/float/bool unchanged; text/varchar/char/uuid/inet/cidr/macaddr → `pgtype.Text`; numeric/decimal → `pgtype.Numeric`; date/timestamp/timestamptz/time → the matching `pgtype` temporal valuer. **Faithful** multi-dimensional round-trip for every family (dimensions + values + NULL elements). `timetz[]` has no faithful binary array leaf → **explicit LOUD refusal** (≥ prior behavior; never silent).
+- **Bug 73 (MEDIUM, LOUD, pre-existing — same `convertArray` subsystem, batched).** `timestamp[]`/`timestamptz[]`/`date[]` hard-failed `57014` (no switch case) — closed by the same element-complete rewrite.
+- **Bug 75 (HIGH, SILENT, pre-existing — PG→MySQL & PG→PG).** `bit`/`varbit` were decoded as the ASCII bytes of the `'0'/'1'` text then collapsed to the trailing byte, so distinct source values mapped irreversibly to the same target value (NULL was preserved). Fix: an engine-neutral `ir.Bit` canonical bit-string plus `ir.Bit.Varying` (clean break — also fixed a latent `bit varying(N)` mis-emitted as fixed `BIT(N)` / `22026`). Faithful round-trip both directions (Docker-verified); the MySQL LOAD DATA path uses a `CONV(…,2,10)` SET expression. The dead `bitBytesMySQLToPG` helper was removed.
+- **Bug 76 (MEDIUM, LOUD, pre-existing).** The PG schema reader validated every column before the `--include-table`/`--exclude-table` filter, so an unsupported type in an *excluded* table still failed schema-read. A new optional `ir.TableScoper` surface threads the engine-default-merged filter to the reader before `ReadSchema`; PG drops out-of-scope tables before per-column validation. The post-read filter is retained (defense-in-depth; MySQL push-down deferred — loud, no silent loss, documented).
+
+### Known limitation (pre-existing, out of scope here, not a regression)
+
+- **`varchar(N)[]` / `char(N)[]` PG→PG** — the PG array-element DDL emitter drops the element length (`VARCHAR(0)[]` → `22023`), a loud create-tables failure. Distinct from this value-path batch (the value leaf is unit-pinned); tracked for a separate fix.
+
+### Compatibility
+
+Drop-in from v0.69.3; the backup envelope gains append-only fields. **Internal IR changes:** `ir.Bit` (now a canonical bit-string type), `ir.Bit.Varying`, `ir.TableScoper` (the IR is not a stable/exported interface; all in-tree implementers updated). PG→PG multi-dimensional arrays of every element family now round-trip faithfully (was silent flatten for `numeric`/`uuid`/… or loud `57014` for temporals); `bit`/`varbit` round-trip faithfully both directions (was silent corruption); excluded tables with unsupported types no longer block schema-read. Bug 70 (int/text/NULL-element)/68/71/72/69/#18, constrained types, plain temporals, MySQL→PG, and PG→PG/PG→MySQL baselines are regression-guarded — Option-C `-race`+Integration CI green before the tag, and the every-element-family multi-dim class pin was independently re-run against Docker by the maintainer (closing the v0.69.3 review gap).
+
 ## [0.69.3]
 
 **Closes Bug 70 (HIGH) / 71 / 72 — all surfaced by the v0.69.2 terminal battle-test; all pre-existing (byte-identical ≤v0.69.1), all LOUD (exit 1, clear error, no data corruption — the silent-loss class was already fully closed by Bug 68/69).** Bug 69's DDL fix removed the `22023` early-abort that had been masking #70/#71 on PG→PG.
