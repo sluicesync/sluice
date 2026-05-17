@@ -462,7 +462,7 @@ func emitColumnDef(table *ir.Table, c *ir.Column, opts emitOpts) (string, error)
 	}
 
 	var typeStr string
-	if _, isEnum := c.Type.(ir.Enum); isEnum {
+	if enum, isEnum := c.Type.(ir.Enum); isEnum {
 		if table == nil {
 			return "", fmt.Errorf("postgres: emitColumnDef: Enum column %q requires a table context", c.Name)
 		}
@@ -479,7 +479,7 @@ func emitColumnDef(table *ir.Table, c *ir.Column, opts emitOpts) (string, error)
 		if c.IsGenerated() {
 			typeStr = "TEXT"
 		} else {
-			typeStr = qualifiedEnumTypeRef(opts.TargetSchema, table.Name, c.Name)
+			typeStr = qualifiedEnumTypeRef(enum, opts.TargetSchema, table.Name, c.Name)
 		}
 	} else {
 		var err error
@@ -558,9 +558,9 @@ func emitColumnDef(table *ir.Table, c *ir.Column, opts emitOpts) (string, error)
 		// expressions like CURRENT_TIMESTAMP) is left alone — the
 		// cast wouldn't be safe there and the loud-failure tenet
 		// surfaces the operator-driven gap.
-		if _, isEnum := c.Type.(ir.Enum); isEnum && enumDefaultShouldCast(c.Default, dflt) {
+		if enum, isEnum := c.Type.(ir.Enum); isEnum && enumDefaultShouldCast(c.Default, dflt) {
 			sb.WriteString("::")
-			sb.WriteString(qualifiedEnumTypeRef(opts.TargetSchema, table.Name, c.Name))
+			sb.WriteString(qualifiedEnumTypeRef(enum, opts.TargetSchema, table.Name, c.Name))
 		}
 	}
 	return sb.String(), nil
@@ -625,9 +625,26 @@ func enumDefaultShouldCast(d ir.DefaultValue, emitted string) bool {
 // enumTypeName generates a deterministic Postgres enum type name for
 // the given table+column pair. Two columns with the same enum values
 // in different tables get separate types — slight inefficiency, but
-// no risk of name collisions or unintended sharing.
+// no risk of name collisions or unintended sharing. This is the
+// fallback used only when the IR enum carries no source-side type
+// name (a MySQL source — MySQL enums are column-inline with no type
+// identity); see [resolveEnumTypeName].
 func enumTypeName(tableName, columnName string) string {
 	return tableName + "_" + columnName + "_enum"
+}
+
+// resolveEnumTypeName returns the Postgres type name to use for an
+// enum column. A same-engine PG source carries the original type name
+// on [ir.Enum.TypeName]; preserving it verbatim keeps casts,
+// shared-enum tables, and app code referencing the type by name
+// working (catalog Bug 19c). A MySQL source has no enum type identity,
+// so TypeName is empty and we fall back to the deterministic
+// table+column synthesis.
+func resolveEnumTypeName(enum ir.Enum, tableName, columnName string) string {
+	if enum.TypeName != "" {
+		return enum.TypeName
+	}
+	return enumTypeName(tableName, columnName)
 }
 
 // qualifiedEnumTypeRef returns the schema-qualified enum type
@@ -646,8 +663,8 @@ func enumTypeName(tableName, columnName string) string {
 // When targetSchema is empty, returns the unqualified ident — the
 // pre-ADR-0031 shape, relying on the type living in `search_path`'s
 // default schema (the DSN's default, typically `public`).
-func qualifiedEnumTypeRef(targetSchema, tableName, columnName string) string {
-	name := enumTypeName(tableName, columnName)
+func qualifiedEnumTypeRef(enum ir.Enum, targetSchema, tableName, columnName string) string {
+	name := resolveEnumTypeName(enum, tableName, columnName)
 	if targetSchema == "" {
 		return quoteIdent(name)
 	}
@@ -740,17 +757,46 @@ func pgIndexName(tableName, sourceName string) string {
 // emitCreateEnumType produces a CREATE TYPE statement for a single
 // enum, named by the table+column generator. Values are quoted and
 // comma-separated.
-func emitCreateEnumType(schema, tableName, columnName string, values []string) string {
-	parts := make([]string, len(values))
-	for i, v := range values {
+func emitCreateEnumType(enum ir.Enum, schema, tableName, columnName string) string {
+	parts := make([]string, len(enum.Values))
+	for i, v := range enum.Values {
 		parts[i] = quoteSQLString(v)
 	}
 	return fmt.Sprintf(
 		"CREATE TYPE %s.%s AS ENUM (%s);",
 		quoteIdent(schema),
-		quoteIdent(enumTypeName(tableName, columnName)),
+		quoteIdent(resolveEnumTypeName(enum, tableName, columnName)),
 		strings.Join(parts, ", "),
 	)
+}
+
+// emitCommentStatements returns the COMMENT ON TABLE / COMMENT ON
+// COLUMN statements for a table's table-level and column-level
+// comments (catalog Bug 19d). PG models comments as standalone
+// catalog statements (unlike MySQL's inline COMMENT clause), so they
+// can't ride in the CREATE TABLE body. `COMMENT ON` is idempotent
+// (it overwrites), so re-running the schema-write phase is safe.
+// Returns nil when the table carries no comments — the common case.
+func emitCommentStatements(schema string, table *ir.Table) []string {
+	if table == nil {
+		return nil
+	}
+	qualified := quoteIdent(schema) + "." + quoteIdent(table.Name)
+	var out []string
+	if table.Comment != "" {
+		out = append(out, fmt.Sprintf(
+			"COMMENT ON TABLE %s IS %s;",
+			qualified, quoteSQLString(table.Comment)))
+	}
+	for _, col := range table.Columns {
+		if col == nil || col.Comment == "" {
+			continue
+		}
+		out = append(out, fmt.Sprintf(
+			"COMMENT ON COLUMN %s.%s IS %s;",
+			qualified, quoteIdent(col.Name), quoteSQLString(col.Comment)))
+	}
+	return out
 }
 
 // emitTableDef produces a CREATE TABLE statement with columns,
@@ -869,6 +915,18 @@ func emitIndexColumnList(cols []ir.IndexColumn, opts emitOpts) string {
 		if c.Desc {
 			entry += " DESC"
 		}
+		// NULLS FIRST/LAST — only set by the reader when the stored
+		// ordering deviates from PG's default for the sort direction
+		// (NULLS LAST for ASC, NULLS FIRST for DESC), so emitting it
+		// here always reflects a genuine non-default and keeps DDL
+		// diff-stable for the common case.
+		if c.NullsFirst != nil {
+			if *c.NullsFirst {
+				entry += " NULLS FIRST"
+			} else {
+				entry += " NULLS LAST"
+			}
+		}
 		parts[i] = entry
 	}
 	return "(" + strings.Join(parts, ", ") + ")"
@@ -942,8 +1000,45 @@ func emitCreateIndex(schema, tableName string, idx *ir.Index, opts emitOpts) (st
 		sb.WriteByte(' ')
 	}
 	sb.WriteString(emitIndexColumnList(idx.Columns, opts))
+	// Covering index: non-key payload columns ride in INCLUDE (...),
+	// kept distinct from the key columns above. Flattening them into
+	// the key list silently changes index semantics (catalog Bug 19b).
+	if len(idx.IncludeColumns) > 0 {
+		sb.WriteString(" INCLUDE (")
+		for i, c := range idx.IncludeColumns {
+			if i > 0 {
+				sb.WriteString(", ")
+			}
+			sb.WriteString(quoteIdent(c))
+		}
+		sb.WriteByte(')')
+	}
+	// Partial index: the WHERE predicate. Dropping it silently turns a
+	// partial index into a full one (catalog Bug 19a). Same-dialect
+	// PG-source text passes through verbatim; a cross-dialect source
+	// runs the ADR-0016 translator first.
+	if pred := strings.TrimSpace(idx.Predicate); pred != "" {
+		sb.WriteString(" WHERE ")
+		sb.WriteString(translateIndexPredicate(idx, opts))
+	}
 	sb.WriteByte(';')
 	return sb.String(), nil
+}
+
+// translateIndexPredicate returns the partial-index WHERE predicate to
+// emit, applying the ADR-0016 cross-dialect translation pass when the
+// IR's PredicateDialect indicates a non-PG source. Same policy as
+// [translateIndexExpr] for expression-index bodies: same-dialect /
+// untagged text passes through verbatim (the PG pg_get_expr output);
+// a MySQL-source predicate is rewritten and PG-reserved idents the
+// source reader de-quoted are re-quoted.
+func translateIndexPredicate(idx *ir.Index, opts emitOpts) string {
+	if idx.PredicateDialect == "" || idx.PredicateDialect == dialectName {
+		return idx.Predicate
+	}
+	return requotePGReservedIdents(
+		translateExprForPG(idx.Predicate, ExprContext{EnabledPGExtensions: opts.EnabledExtensions}),
+	)
 }
 
 // resolveIndexMethod picks the access-method name to emit for an

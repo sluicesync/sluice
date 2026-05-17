@@ -127,8 +127,11 @@ func TestSchemaWriter_RoundTrip(t *testing.T) {
 	// Spot-check column types that exercise the writer's distinct
 	// emission paths.
 	wantTypes := map[string]ir.Type{
-		"id":          ir.Integer{Width: 64, AutoIncrement: true},
-		"role":        ir.Enum{Values: []string{"admin", "user", "guest"}},
+		"id": ir.Integer{Width: 64, AutoIncrement: true},
+		// Bug 19c: input Enum had no TypeName, so the writer synthesized
+		// the deterministic `users_role_enum`; the reader now carries
+		// that name back verbatim on round-trip.
+		"role":        ir.Enum{Values: []string{"admin", "user", "guest"}, TypeName: "users_role_enum"},
 		"created_at":  ir.Timestamp{Precision: 6, WithTimeZone: true},
 		"profile":     ir.JSON{Binary: true},
 		"tags":        ir.Array{Element: ir.Integer{Width: 32}},

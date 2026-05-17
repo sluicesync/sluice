@@ -111,6 +111,17 @@ func (s GeometrySubtype) String() string {
 // MySQL has column-level ENUM; Postgres has CREATE TYPE ... AS ENUM types.
 type Enum struct {
 	Values []string
+
+	// TypeName is the source-side named-type identifier for engines
+	// that model enums as standalone types (Postgres `CREATE TYPE ...
+	// AS ENUM`). Empty for engines with column-inline enums (MySQL,
+	// which has no enum type name) — writers that need a type name then
+	// synthesize a deterministic one from the table+column. Carrying it
+	// lets a same-engine PG → PG migration round-trip the *type name*
+	// verbatim instead of renaming `post_status` to
+	// `posts_status_enum` (which would break casts / shared-enum tables
+	// / app code referencing the type by name).
+	TypeName string
 }
 
 func (Enum) isType()    {}

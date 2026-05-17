@@ -316,6 +316,31 @@ type Index struct {
 	// Engines without extension-aware index methods leave this empty;
 	// the writer's emit dispatch defaults to Kind.
 	Method string
+
+	// IncludeColumns are the non-key payload columns of a covering
+	// index (Postgres `INCLUDE (...)`; SQL Server's equivalent). These
+	// are stored in the leaf pages but are NOT part of the index key —
+	// they don't affect ordering, comparison, or uniqueness scope.
+	// Flattening them into Columns silently changes index semantics
+	// (catalog Bug 19b), so they get their own slot. Empty for the
+	// common (non-covering) case and for engines without INCLUDE.
+	IncludeColumns []string
+
+	// Predicate is the WHERE clause of a partial index (Postgres /
+	// SQLite), in the source dialect's syntax with engine-specific
+	// identifier quoting stripped at the read boundary — same
+	// normalization and layered-translation policy as
+	// [CheckConstraint.Expr]. Empty for a full (non-partial) index.
+	// Dropping it silently turns a partial index into a full one —
+	// different size, different query plans, and a silently widened
+	// uniqueness scope if the index is UNIQUE (catalog Bug 19a).
+	Predicate string
+	// PredicateDialect is the dialect Predicate was read from, in the
+	// readers' canonical form ("mysql" or "postgres"). Writers compare
+	// it against their own dialect: equal → emit verbatim; differ →
+	// run the ADR-0016 cross-dialect translation pass first. Empty
+	// when there is no predicate. Mirrors [CheckConstraint.ExprDialect].
+	PredicateDialect string
 }
 
 // IndexColumn is a single entry within an index. Most entries name a
@@ -346,6 +371,15 @@ type IndexColumn struct {
 	ExpressionDialect string
 	// Desc indicates the column is indexed in descending order.
 	Desc bool
+	// NullsFirst overrides the default NULL ordering for this index
+	// column (Postgres `NULLS FIRST` / `NULLS LAST`). nil means "engine
+	// default" — PG's default is NULLS LAST for ASC and NULLS FIRST for
+	// DESC, so the reader only sets this when the stored ordering
+	// deviates from that default, keeping emitted DDL minimal and
+	// diff-stable. *NullsFirst == true → `NULLS FIRST`; false →
+	// `NULLS LAST`. Engines without per-column NULL ordering leave it
+	// nil.
+	NullsFirst *bool
 	// Length is a prefix length for prefix indexes (MySQL); zero means
 	// the entire column value is indexed.
 	Length int

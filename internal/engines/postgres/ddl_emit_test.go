@@ -850,8 +850,22 @@ func TestEmitTableDef_CheckConstraints(t *testing.T) {
 }
 
 func TestEmitCreateEnumType(t *testing.T) {
-	got := emitCreateEnumType("public", "users", "role", []string{"admin", "user", "guest"})
+	// MySQL-source enum (no type name) → synthesized table+column name.
+	got := emitCreateEnumType(ir.Enum{Values: []string{"admin", "user", "guest"}}, "public", "users", "role")
 	want := `CREATE TYPE "public"."users_role_enum" AS ENUM ('admin', 'user', 'guest');`
+	if got != want {
+		t.Errorf("\n got  %q\n want %q", got, want)
+	}
+}
+
+// Bug 19c: a same-engine PG source carries the original enum type
+// name; it must round-trip verbatim instead of being renamed to the
+// synthesized <table>_<col>_enum.
+func TestEmitCreateEnumType_PreservesSourceTypeName(t *testing.T) {
+	got := emitCreateEnumType(
+		ir.Enum{Values: []string{"draft", "published", "archived", "deleted"}, TypeName: "post_status"},
+		"public", "posts", "status")
+	want := `CREATE TYPE "public"."post_status" AS ENUM ('draft', 'published', 'archived', 'deleted');`
 	if got != want {
 		t.Errorf("\n got  %q\n want %q", got, want)
 	}
@@ -984,6 +998,8 @@ func TestSchemaWriter_QualifyingSchema_TogglesOnSetSchema(t *testing.T) {
 	}
 }
 
+func boolPtr(b bool) *bool { return &b }
+
 func TestEmitCreateIndex(t *testing.T) {
 	cases := []struct {
 		name string
@@ -1105,6 +1121,62 @@ func TestEmitCreateIndex(t *testing.T) {
 				},
 			},
 			want: `CREATE INDEX "users_lower_legacy" ON "public"."users" USING btree ((lower(email)));`,
+		},
+		{
+			// Bug 19a: partial index with a WHERE predicate + DESC.
+			// Pre-fix the predicate and DESC were silently dropped,
+			// turning a partial index into a full one (exit 0, wrong
+			// DDL — the worst class).
+			name: "partial index — DESC + WHERE predicate preserved",
+			idx: &ir.Index{
+				Name: "users_published",
+				Kind: ir.IndexKindBTree,
+				Columns: []ir.IndexColumn{
+					{Column: "published_at", Desc: true},
+				},
+				Predicate:        "status = 'published'::post_status",
+				PredicateDialect: "postgres",
+			},
+			want: `CREATE INDEX "users_published" ON "public"."users" USING btree ("published_at" DESC) WHERE status = 'published'::post_status;`,
+		},
+		{
+			// Bug 19b: covering index — INCLUDE payload columns kept
+			// distinct from the key list. Pre-fix they were flattened
+			// into the key, silently changing index semantics.
+			name: "covering index — INCLUDE non-key columns preserved",
+			idx: &ir.Index{
+				Name:           "users_acct",
+				Kind:           ir.IndexKindBTree,
+				Columns:        []ir.IndexColumn{{Column: "account_id"}},
+				IncludeColumns: []string{"title", "score"},
+			},
+			want: `CREATE INDEX "users_acct" ON "public"."users" USING btree ("account_id") INCLUDE ("title", "score");`,
+		},
+		{
+			// Bug 19a: explicit non-default NULLS ordering. ASC default
+			// is NULLS LAST; NULLS FIRST is non-default and must be
+			// emitted.
+			name: "ASC with explicit NULLS FIRST",
+			idx: &ir.Index{
+				Name:    "users_ranked",
+				Kind:    ir.IndexKindBTree,
+				Columns: []ir.IndexColumn{{Column: "rank", NullsFirst: boolPtr(true)}},
+			},
+			want: `CREATE INDEX "users_ranked" ON "public"."users" USING btree ("rank" NULLS FIRST);`,
+		},
+		{
+			// Unique partial index — the silent uniqueness-scope-change
+			// case called out in catalog Bug 19a.
+			name: "unique partial index",
+			idx: &ir.Index{
+				Name:             "users_active_email",
+				Unique:           true,
+				Kind:             ir.IndexKindBTree,
+				Columns:          []ir.IndexColumn{{Column: "email"}},
+				Predicate:        "active",
+				PredicateDialect: "postgres",
+			},
+			want: `CREATE UNIQUE INDEX "users_active_email" ON "public"."users" USING btree ("email") WHERE active;`,
 		},
 	}
 	for _, c := range cases {

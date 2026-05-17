@@ -126,18 +126,28 @@ func (w *SchemaWriter) CreateTablesWithoutConstraints(ctx context.Context, s *ir
 	}
 
 	// Phase 1a: enum types. We walk all columns and emit one
-	// CREATE TYPE per enum column. Two columns sharing values across
-	// tables get separate types — same naming convention as
-	// emitColumnDef expects. Generated enum columns are skipped:
-	// they emit as TEXT + table-level CHECK (Bug 25 fallback) so
-	// no enum type is needed.
+	// CREATE TYPE per enum *type*. A MySQL source has no enum type
+	// identity, so each column synthesizes its own table+column-scoped
+	// name (no sharing). A same-engine PG source carries the original
+	// type name on ir.Enum.TypeName (catalog Bug 19c): two columns
+	// referencing the same source type now resolve to the same name,
+	// so we dedupe to emit `CREATE TYPE` exactly once — emitting it
+	// twice would fail with "type already exists". Generated enum
+	// columns are skipped: they emit as TEXT + table-level CHECK
+	// (Bug 25 fallback) so no enum type is needed.
+	createdEnumTypes := map[string]struct{}{}
 	for _, table := range orderedTables(s) {
 		for _, col := range table.Columns {
 			enum, ok := col.Type.(ir.Enum)
 			if !ok || col.IsGenerated() {
 				continue
 			}
-			stmt := emitCreateEnumType(w.schema, table.Name, col.Name, enum.Values)
+			typeName := resolveEnumTypeName(enum, table.Name, col.Name)
+			if _, done := createdEnumTypes[typeName]; done {
+				continue
+			}
+			createdEnumTypes[typeName] = struct{}{}
+			stmt := emitCreateEnumType(enum, w.schema, table.Name, col.Name)
 			if _, err := w.db.ExecContext(ctx, stmt); err != nil {
 				return fmt.Errorf("postgres: create enum type for %s.%s: %w", table.Name, col.Name, err)
 			}
@@ -153,6 +163,19 @@ func (w *SchemaWriter) CreateTablesWithoutConstraints(ctx context.Context, s *ir
 		}
 		if _, err := w.db.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("postgres: create table %q: %w", table.Name, err)
+		}
+	}
+
+	// Phase 1c: table / column comments (catalog Bug 19d). PG models
+	// comments as standalone COMMENT ON statements (MySQL carries them
+	// inline, so its writer needs no equivalent phase). Idempotent —
+	// COMMENT ON overwrites — so re-running the schema-write phase is
+	// safe.
+	for _, table := range orderedTables(s) {
+		for _, stmt := range emitCommentStatements(w.schema, table) {
+			if _, err := w.db.ExecContext(ctx, stmt); err != nil {
+				return fmt.Errorf("postgres: set comment on %q: %w", table.Name, err)
+			}
 		}
 	}
 	return nil
@@ -415,19 +438,27 @@ func (w *SchemaWriter) PreviewDDL(_ context.Context, s *ir.Schema) ([]ir.DDLStat
 	opts := w.emitOpts()
 
 	// Phase 1a: enum types, in deterministic table+column order.
-	// Generated enum columns are skipped (Bug 25): they emit as TEXT
-	// + table-level CHECK in the CREATE TABLE body, so no enum type
-	// is needed.
+	// Deduped by resolved type name so a same-engine PG source's
+	// shared enum type (catalog Bug 19c) previews one CREATE TYPE,
+	// matching the apply path. Generated enum columns are skipped
+	// (Bug 25): they emit as TEXT + table-level CHECK in the CREATE
+	// TABLE body, so no enum type is needed.
+	previewedEnumTypes := map[string]struct{}{}
 	for _, table := range orderedTables(s) {
 		for _, col := range table.Columns {
 			enum, ok := col.Type.(ir.Enum)
 			if !ok || col.IsGenerated() {
 				continue
 			}
+			typeName := resolveEnumTypeName(enum, table.Name, col.Name)
+			if _, done := previewedEnumTypes[typeName]; done {
+				continue
+			}
+			previewedEnumTypes[typeName] = struct{}{}
 			out = append(out, ir.DDLStatement{
 				Table: table.Name,
 				Kind:  "CREATE TYPE",
-				SQL:   trimTrailingSemicolon(emitCreateEnumType(w.schema, table.Name, col.Name, enum.Values)),
+				SQL:   trimTrailingSemicolon(emitCreateEnumType(enum, w.schema, table.Name, col.Name)),
 			})
 		}
 	}
@@ -443,6 +474,17 @@ func (w *SchemaWriter) PreviewDDL(_ context.Context, s *ir.Schema) ([]ir.DDLStat
 			Kind:  "CREATE TABLE",
 			SQL:   trimTrailingSemicolon(stmt),
 		})
+	}
+
+	// Phase 1c: table / column comments (catalog Bug 19d).
+	for _, table := range orderedTables(s) {
+		for _, stmt := range emitCommentStatements(w.schema, table) {
+			out = append(out, ir.DDLStatement{
+				Table: table.Name,
+				Kind:  "COMMENT ON",
+				SQL:   trimTrailingSemicolon(stmt),
+			})
+		}
 	}
 
 	// Phase 2: indexes.

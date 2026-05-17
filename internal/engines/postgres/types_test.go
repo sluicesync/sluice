@@ -399,6 +399,48 @@ func TestTranslateType_GeometryCoordDimensionMerge(t *testing.T) {
 	}
 }
 
+// Bug 17: tsvector / tsquery are PG CORE types. Cross-engine they
+// stay a loud refusal (no MySQL equivalent), but a same-engine PG → PG
+// run (VerbatimEligible) must carry them verbatim instead of refusing.
+func TestTranslateType_TsvectorVerbatimSameEngine(t *testing.T) {
+	for _, dt := range []string{"tsvector", "tsquery"} {
+		got, err := translateType(columnMeta{
+			DataType:         dt,
+			UDTName:          dt,
+			FormatType:       dt,
+			VerbatimEligible: true,
+		})
+		if err != nil {
+			t.Fatalf("%s verbatim: unexpected error: %v", dt, err)
+		}
+		want := ir.VerbatimType{Definition: dt}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("%s: got %#v want %#v", dt, got, want)
+		}
+	}
+	// Cross-engine (not eligible) still refuses — no silent loss.
+	if _, err := translateType(columnMeta{DataType: "tsvector", UDTName: "tsvector"}); err == nil {
+		t.Error("tsvector cross-engine: expected loud refusal, got nil")
+	}
+}
+
+// Bug 19c: a PG enum's source type name rides onto ir.Enum.TypeName.
+func TestTranslateType_EnumCarriesTypeName(t *testing.T) {
+	got, err := translateType(columnMeta{
+		DataType:     "USER-DEFINED",
+		UDTName:      "post_status",
+		EnumValues:   []string{"draft", "published"},
+		EnumTypeName: "post_status",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := ir.Enum{Values: []string{"draft", "published"}, TypeName: "post_status"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("got %#v want %#v", got, want)
+	}
+}
+
 func TestTranslateTypeErrors(t *testing.T) {
 	cases := []struct {
 		name string
