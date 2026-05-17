@@ -306,6 +306,83 @@ func TestPrepareValue_AnySliceOnNonJSONPassesThrough(t *testing.T) {
 	}
 }
 
+// TestPrepareValue_PGArrayColumnToJSON pins Bug 18: a PG array source
+// column (text[]/int[]/…) lands on a MySQL column whose IR type is
+// [ir.Array] (NOT rewritten to [ir.JSON] — only ddl_emit's
+// emitColumnType renders ir.Array as MySQL `JSON`). The PG RowReader
+// yields the array as a Go []any (string/int64/nil elements, possibly
+// nested). prepareValue must serialize it to the JSON text form the
+// MySQL JSON column accepts via LOAD DATA — pre-fix the []any fell
+// through untouched and crashed tsvEncode with
+// "unsupported value type []interface {}".
+func TestPrepareValue_PGArrayColumnToJSON(t *testing.T) {
+	cases := []struct {
+		name string
+		in   any
+		t    ir.Type
+		want any
+	}{
+		{
+			name: "text[] {x,y} → JSON string array",
+			in:   []any{"x", "y"},
+			t:    ir.Array{Element: ir.Text{Size: ir.TextLong}},
+			want: `["x","y"]`,
+		},
+		{
+			name: "int[] {1,2} → JSON int array",
+			in:   []any{int64(1), int64(2)},
+			t:    ir.Array{Element: ir.Integer{Width: 32}},
+			want: `[1,2]`,
+		},
+		{
+			name: "empty array {} → []",
+			in:   []any{},
+			t:    ir.Array{Element: ir.Integer{Width: 32}},
+			want: `[]`,
+		},
+		{
+			name: "NULL whole-array column → nil (NULL, not [])",
+			in:   nil,
+			t:    ir.Array{Element: ir.Text{Size: ir.TextLong}},
+			want: nil,
+		},
+		{
+			name: "NULL element inside array → JSON null",
+			in:   []any{"a", nil, "c"},
+			t:    ir.Array{Element: ir.Text{Size: ir.TextLong}},
+			want: `["a",null,"c"]`,
+		},
+		{
+			name: "non-ASCII / needs-escaping text element JSON-escaped",
+			in:   []any{`a"b`, "c\td", "é"},
+			t:    ir.Array{Element: ir.Text{Size: ir.TextLong}},
+			want: `["a\"b","c\td","é"]`,
+		},
+		{
+			name: "nested int[][] → nested JSON array",
+			in:   []any{[]any{int64(1), int64(2)}, []any{int64(3)}},
+			t:    ir.Array{Element: ir.Array{Element: ir.Integer{Width: 32}}},
+			want: `[[1,2],[3]]`,
+		},
+		{
+			name: "PG array text literal on ir.Array column → JSON array",
+			in:   "{a,b,c}",
+			t:    ir.Array{Element: ir.Text{Size: ir.TextLong}},
+			want: `["a","b","c"]`,
+		},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			col := &ir.Column{Name: "c", Type: c.t}
+			got := prepareValue(c.in, col)
+			if !reflect.DeepEqual(got, c.want) {
+				t.Errorf("prepareValue(%#v, %s) = %#v; want %#v", c.in, c.t, got, c.want)
+			}
+		})
+	}
+}
+
 // TestPrepareValue_HstoreToJSON pins the ADR-0032 cross-engine value
 // translator: a PG hstore source column with `col.Type =
 // ir.ExtensionType{Extension: "hstore"}` gets its PG-canonical text
