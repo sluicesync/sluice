@@ -6,6 +6,19 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.69.1]
+
+**Closes Bug 68 (HIGH — silent data loss, the worst class; surfaced by the v0.69.0 final readiness battle-test).** A PostgreSQL source table with a **multi-dimensional array column** (`int[][]`, any `T[][]`) migrated cross-engine **PG→MySQL** exited 0 with the target table created but **zero rows for the entire table** — no error, no `WARN` at any log level. **Pre-existing** (reproduces byte-identically on v0.68.2; *not* a v0.69.0 regression) and distinct from #18 (1-D `text[]`/`int[]` work, including at scale). This was the lone caveat on the v0.69.0 PG→MySQL real-user-readiness verdict.
+
+### Fixed
+
+- **Faithful multi-dimensional array support (the corrective fix).** The PG value reader's flat array-text parser errored on the multi-dim form `{{1,2},{3,4}}` ("nested arrays not supported"); it is replaced with a recursive-descent decoder that yields nested `[]any` for arbitrary array dimensionality. The MySQL writer's existing `convertArrayLikeToJSON` already serializes nested `[]any` → nested JSON faithfully, so `int[][]` now round-trips PG→MySQL into a nested-JSON column. The 1-D path is preserved exactly (#18 unaffected, regression-guarded).
+- **Silent-swallow elimination (the load-bearing class fix, loud-failure tenet).** Root cause beneath the parser gap: `ir.RowReader` exposed no `Err()`, and the bulk-copy orchestrator overloaded *channel-close* as "table fully read". A streaming reader scans/decodes on a background goroutine after `ReadRows` returns; a per-row failure stored a sticky error and closed the channel exactly like a clean end-of-table, so `WriteRows` wrote 0 rows, `copyTable` returned `nil`, and `migrate` exited 0 with the table silently truncated — for **any** decode/scan failure, not just arrays. `Err() error` is now part of the `ir.RowReader` interface (clean break — zero-users tenet; this generalizes the ad-hoc type-assertion `backup.go` already carried), and a `readerStreamErr` gate runs after **every** bulk-copy drain (`copyTable`, both `copyTableIdempotent` branches, `copyTableWithCursor`, `copyChunk`, `copyChunkFast`, `backup.backupTable`). Any per-row scan/decode error on any reader now **fails the migration loudly**. Deliberate per-batch context-cancel teardown is filtered precisely: a reader returns immediately on a decode error and never overwrites it with `context.Canceled`, so the filter cannot mask a genuine error (sound by construction, independently verified).
+
+### Compatibility
+
+Drop-in from v0.69.0; no state/format change. Strictly corrective. **Internal interface change:** `ir.RowReader` gained `Err() error` (the IR is not a stable/exported interface; all in-tree implementers updated). Cross-engine `int[][]` PG→MySQL now migrates faithfully (was silent total-table loss); the broader effect is that **no** per-row reader scan/decode failure can silently truncate a table on any bulk-copy path. 1-D arrays (#18), MySQL→PG, PG→PG, signed integers, and prior closures are regression-guarded (Option-C `-race`+Integration green before tag).
+
 ## [0.69.0]
 
 **Battle-test pass-3/4 fix batch — closes a v0.68.3 regression (#16) plus the real-user-readiness blockers found by the 329-table corpus campaign (#9, #17, #18, #19a–d, #20, #23, #16-sub).** Every fix is Phase-A pinned so the regression test exercises the *exact reported repro path* (not an adjacent one — the discipline that let an earlier pass re-green while the real path stayed broken), independently + adversarially reviewed, and gated by the full local suite **and** the Option-C `-race`+Integration CI before tagging.
