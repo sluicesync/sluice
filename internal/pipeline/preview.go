@@ -199,6 +199,16 @@ func (p *Previewer) Run(ctx context.Context) error {
 		return wrapWithHint(PhaseConnect, fmt.Errorf("preview: enable PG extensions on source: %w", err))
 	}
 
+	// ADR-0047 tier (b): enable verbatim passthrough for uncatalogued
+	// PG extension types AND core verbatim-carry types (tsvector /
+	// tsquery, Bug 17) ONLY when the run is provably same-engine
+	// PG → PG. This MUST mirror migrate.go's call exactly — preview's
+	// contract is to render what `migrate` / `sync start` would emit,
+	// so the reader must make the identical tier decision. Without it
+	// `schema preview` loud-refused a type `migrate` carries fine
+	// (Bug 23 preview/migrate inconsistency).
+	applyVerbatimExtensionPassthrough(sr, verbatimLiveSameEnginePG(p.Source, p.Target))
+
 	srcSchema, err := sr.ReadSchema(ctx)
 	if err != nil {
 		return wrapWithHint(PhaseConnect, fmt.Errorf("preview: read source schema: %w", err))

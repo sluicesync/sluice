@@ -77,6 +77,34 @@ func TestMigrate_PG_SchemaFidelity_Pass3(t *testing.T) {
 		t.Fatal("postgres engine not registered")
 	}
 
+	// #23 preview/migrate parity: `schema preview` must NOT loud-refuse
+	// a type `migrate` carries verbatim. Pre-fix, preview never called
+	// applyVerbatimExtensionPassthrough, so it refused the `search
+	// tsvector` column while migrate (below) carried it fine — a
+	// preview/migrate inconsistency. Run the previewer over the SAME
+	// tsvector-bearing PG source and assert it succeeds and renders the
+	// column.
+	{
+		var pbuf strings.Builder
+		prev := &Previewer{
+			Source:    pgEng,
+			Target:    pgEng,
+			SourceDSN: sourceDSN,
+			TargetDSN: targetDSN,
+			Format:    "text",
+			Out:       &pbuf,
+		}
+		pctx, pcancel := context.WithTimeout(context.Background(), 60*time.Second)
+		if err := prev.Run(pctx); err != nil {
+			pcancel()
+			t.Fatalf("#23: schema preview refused a tsvector-bearing PG→PG schema that migrate carries: %v", err)
+		}
+		pcancel()
+		if !strings.Contains(pbuf.String(), "tsvector") {
+			t.Errorf("#23: preview should render the tsvector column; got:\n%s", pbuf.String())
+		}
+	}
+
 	mig := &Migrator{
 		Source:    pgEng,
 		Target:    pgEng,
