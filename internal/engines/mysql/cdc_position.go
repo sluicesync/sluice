@@ -55,6 +55,31 @@ type binlogPos struct {
 	// File and Pos are populated when Mode == positionModeFilePos.
 	File string `json:"file,omitempty"`
 	Pos  uint32 `json:"pos,omitempty"`
+
+	// ServerUUID binds a file/pos position to the source server
+	// instance it was captured on (@@server_uuid). It is the
+	// loud-failure floor for the PlanetScale "node replaced /
+	// restored from backup" position-loss class (Track 1c): binlog
+	// FILE NAMES are instance-local and a fresh instance frequently
+	// reuses the same names (mysql-bin.000001, .000003, …) for an
+	// entirely unrelated binlog lineage. A name-only resumability
+	// check (verifyBinlogFilePresent) false-positives on that and
+	// silently starts the syncer at a byte offset in an unrelated
+	// file — a silent gap. Stamping the source's server_uuid here and
+	// rejecting a resume whose persisted uuid differs from the
+	// source's current one turns that silent gap into a loud
+	// ir.ErrPositionInvalid → ADR-0022 cold-start re-snapshot.
+	//
+	// GTID mode does not need this: GTID UUIDs are themselves
+	// instance-bound, so verifyGTIDSetReachable already catches a
+	// fresh instance (its gtid_purged/gtid_executed carry a different
+	// source UUID). Empty on positions persisted before this field
+	// existed (zero-users project, but a position could straddle an
+	// in-flight upgrade); the verify path treats an empty persisted
+	// uuid as "skip the identity check" so no false refusal — the
+	// filename check still applies, preserving the pre-existing
+	// behaviour for that one transitional case.
+	ServerUUID string `json:"server_uuid,omitempty"`
 }
 
 // engineNameMySQL is the [ir.Position.Engine] tag the binlog reader

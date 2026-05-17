@@ -47,6 +47,21 @@ Operator-reported: PlanetScale users hit multi-day sync outages requiring full t
 
 STUDY and reuse the existing scaffolding before writing anything: `internal/engines/mysql/cdc_vstream_snapshot.go`, the `integration vstream` build-tagged tests, and `shapea_spike_vstream_integration_test.go` (the Roadmap-#4 Vitess-testcontainers spike). The local-Vitess infra is a *generalisation* of that spike, not a new framework. Document what's reused.
 
+## Track-1c outcome + node-replace loud-failure floor (durable record)
+
+Phase 1c delivered + verified vs Docker (2026-05-17, Windows/Rancher, `TESTCONTAINERS_RYUK_DISABLED=true`):
+
+**Phase A — VStream + Vitess schema-tracking DISABLED + mid-stream DDL (the genuinely-open behaviour):** empirically ground-truthed against vttestserver (vtcombo's vttablet runs WITHOUT `--track_schema_versions` by default — exactly the schema-tracking-OFF case) for all three deploy-request DDL shapes (ADD / DROP / MODIFY column). **Result: FAITHFUL in all three.** VStream re-emits a fresh `FIELD` event after the DDL and sluice's `dispatchDDL` → `clear(r.fields)` forces a re-fetch before the next `ROW` decode. **No silent corruption exists on this path** — the doc-hypothesized field-cache-mismatch hazard manifests as either faithful (FIELD precedes ROW, the observed case) or a loud hard error (`row event ... without preceding FIELD event` if a ROW ever raced ahead — loud + recoverable). The schema-evolution path is already at the loud-failure floor; validation-only, no production change. Tests: `internal/engines/mysql/cdc_vstream_schema_evolution_integration_test.go` (`integration vstream` tag).
+
+**Phase A — position-loss code-truth correction:** the MySQL snapshot→CDC handoff ALWAYS persists a **file/pos** position even on a `gtid_mode=ON` source (`cdc_snapshot.go` captures `SHOW MASTER STATUS`). So the streamer's resume-validation path is `verifyBinlogFilePresent` in both GTID-mode and non-GTID deployments; the GTID branch (`verifyGTIDSetReachable`) is reached only by a caller-supplied GTID position (covered at the reader level).
+
+**Phase B — position-loss chaos results:**
+- GTID retention-exceeded (reader level, `verifyGTIDSetReachable`): **LOUD + ACTIONABLE** — `StreamChanges` refuses with a message naming the cause and wrapping `ir.ErrPositionInvalid`. Test: `cdc_reader_gtid_position_loss_integration_test.go`.
+- `gtid_mode=ON` binlog-purge (streamer level): **LOUD** — file/pos fall-through unaffected by GTID mode; ADR-0022 cold-start re-snapshots, src == dst, exactly-once.
+- **Node-replace / restore-from-backup (the highest-value finding): WAS a silent-gap-class bug.** `verifyBinlogFilePresent` matched on binlog **filename only**; a fresh instance reuses the same names (`mysql-bin.000003`, …) for an unrelated lineage, so the name check false-positived and the syncer silently started at a byte offset in an unrelated file. **Hardening landed (minimal loud floor, mirrors `verifyGTIDSetReachable`'s pattern):** bind file/pos positions to the source `@@server_uuid`; on resume, a differing uuid → wrap `ir.ErrPositionInvalid` → existing ADR-0022 cold-start. GTID mode needs no equivalent (GTID UUIDs are instance-bound; `verifyGTIDSetReachable` already catches it). Empty persisted/current uuid degrades to the old filename-only check (no false refusal, zero-users transitional). A full schema-history store remains OUT of scope.
+
+**Recovery characterization (per the loud-failure tenet's actionability requirement):** the ADR-0022 fall-through is a **whole-stream cold-start re-snapshot** (re-reads source schema → re-bulk-copies all in-scope tables → fresh position), not per-table. The loud message names the unrecoverable position and the recovery path ("cold-start is the only recovery path" / "binlog lineage does not carry over"); the streamer emits a WARN naming the stream id + position token before falling through. Operators get a clear, actionable signal — the cost is a full re-sync (the operator-reported pain is inherent to position-loss; sluice makes it loud + automatic rather than a silent gap or a dead stall).
+
 ## Synergy / boundaries
 
 - Track 2's fuzz harness is **engine-parameterized** — its generator+oracle extend to a Vitess source/target flavor. Track 2-Phase-2 (cross-engine value oracle) ∩ Track 1 should share that, not duplicate.

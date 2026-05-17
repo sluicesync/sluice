@@ -89,6 +89,19 @@ func (e Engine) openBinlogSnapshotStream(ctx context.Context, dsn string) (*ir.S
 		return nil, fmt.Errorf("mysql: snapshot: capture position: %w", err)
 	}
 
+	// Bind the handoff position to the source instance (Track 1c
+	// node-replace floor). @@server_uuid is a global, not
+	// tx-scoped, so reading it on the snapshot conn is fine. A
+	// failed lookup is non-fatal: the position is persisted without
+	// the uuid and the resume path's identity check degrades to the
+	// filename-only behaviour (no regression). Stamping it HERE
+	// means even a cold-start that hasn't yet streamed a single CDC
+	// event persists an instance-bound EndPosition.
+	var serverUUID string
+	if err := conn.QueryRowContext(ctx, "SELECT @@global.server_uuid").Scan(&serverUUID); err != nil {
+		serverUUID = ""
+	}
+
 	// The CDC reader uses an entirely separate connection and protocol
 	// (binlog dump). Construct it with the same DSN so it parses the
 	// host/port/credentials itself.
@@ -101,9 +114,10 @@ func (e Engine) openBinlogSnapshotStream(ctx context.Context, dsn string) (*ir.S
 	}
 
 	position, err := encodeBinlogPos(binlogPos{
-		Mode: positionModeFilePos,
-		File: file,
-		Pos:  pos,
+		Mode:       positionModeFilePos,
+		File:       file,
+		Pos:        pos,
+		ServerUUID: serverUUID,
 	})
 	if err != nil {
 		_ = cdcReader.(closer).Close()

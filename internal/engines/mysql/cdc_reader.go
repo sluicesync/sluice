@@ -127,6 +127,15 @@ type CDCReader struct {
 	gtidSet     mysql.GTIDSet
 	currentFile string
 
+	// serverUUID is the source instance's @@server_uuid, read once at
+	// stream start. Stamped into every file/pos position so a resume
+	// against a replaced/restored instance (Track 1c node-replace
+	// class) is detected loudly rather than silently starting the
+	// syncer at an offset in an unrelated binlog lineage. Empty if
+	// the lookup failed (the verify path then falls back to the
+	// name-only check — no regression, just no extra protection).
+	serverUUID string
+
 	// mu guards err. The streaming goroutine writes; callers read via
 	// [Err] after the channel closes.
 	mu  sync.Mutex
@@ -196,6 +205,21 @@ func (r *CDCReader) StreamChanges(ctx context.Context, from ir.Position) (<-chan
 
 	if r.syncer != nil {
 		return nil, errors.New("mysql: StreamChanges already in progress; construct a new reader for a second stream")
+	}
+
+	// Read the source instance identity once, before resolving the
+	// start position — resolveStartPosition's verify step needs it to
+	// reject a resume against a replaced/restored instance (Track 1c
+	// node-replace class). A failed lookup is non-fatal: serverUUID
+	// stays empty and the verify path falls back to the name-only
+	// check (pre-existing behaviour, no regression).
+	if uuid, err := sourceServerUUID(ctx, r.db); err == nil {
+		r.serverUUID = uuid
+	} else {
+		slog.WarnContext(ctx, "mysql: cdc: could not read @@server_uuid; "+
+			"node-replace position-loss detection degraded to binlog-filename-only",
+			slog.String("err", err.Error()),
+		)
 	}
 
 	startPos, err := r.resolveStartPosition(ctx, from)
@@ -683,9 +707,10 @@ func (r *CDCReader) positionFor(hdr *replication.EventHeader) (ir.Position, erro
 		return encodeBinlogPos(binlogPos{Mode: positionModeGTID, GTIDSet: set})
 	case positionModeFilePos:
 		return encodeBinlogPos(binlogPos{
-			Mode: positionModeFilePos,
-			File: r.currentFile,
-			Pos:  hdr.LogPos,
+			Mode:       positionModeFilePos,
+			File:       r.currentFile,
+			Pos:        hdr.LogPos,
+			ServerUUID: r.serverUUID,
 		})
 	default:
 		return ir.Position{}, fmt.Errorf("mysql: cdc: position mode %q unset", r.posMode)
@@ -726,12 +751,78 @@ func send(ctx context.Context, out chan<- ir.Change, c ir.Change) error {
 func (r *CDCReader) verifyPositionResumable(ctx context.Context, p binlogPos) error {
 	switch p.Mode {
 	case positionModeFilePos:
+		// Track 1c node-replace floor: a file/pos position is only
+		// meaningful on the exact instance it was captured on, because
+		// binlog file NAMES are instance-local and a replaced /
+		// restored-from-backup instance reuses the same names for an
+		// unrelated lineage. Reject loudly when the persisted instance
+		// identity doesn't match the source's current one — BEFORE the
+		// name check, which would false-positive on the name reuse.
+		if err := verifySourceInstanceIdentity(ctx, p.ServerUUID, r.serverUUID); err != nil {
+			return err
+		}
 		return verifyBinlogFilePresent(ctx, r.db, p.File)
 	case positionModeGTID:
+		// GTID UUIDs are themselves instance-bound, so a fresh
+		// instance's gtid_purged/gtid_executed carry a different
+		// source UUID and verifyGTIDSetReachable already catches the
+		// node-replace case without a separate identity check.
 		return verifyGTIDSetReachable(ctx, r.db, p.GTIDSet)
 	default:
 		return fmt.Errorf("mysql: cannot verify position with mode %q", p.Mode)
 	}
+}
+
+// verifySourceInstanceIdentity refuses a file/pos resume whose
+// persisted @@server_uuid differs from the source instance the
+// resume is now connecting to. This is the loud-failure floor for
+// the PlanetScale "node replaced / restored from backup / failed
+// over" position-loss class: the new instance carries the same
+// logical data but an independent binlog lineage that frequently
+// reuses the old filenames, so a filename-only check (the historical
+// behaviour) silently starts the syncer at a byte offset in an
+// unrelated file. Returning ir.ErrPositionInvalid here routes the
+// streamer's existing ADR-0022 fall-through to a clean cold-start
+// re-snapshot instead.
+//
+// persistedUUID is empty for positions written before the
+// ServerUUID field existed (transitional, zero-users) OR when the
+// reader couldn't read @@server_uuid at stream start; in either
+// degraded case we skip the identity check and let the filename
+// check stand — no false refusal, no regression, just no extra
+// protection for that one position. currentUUID empty (lookup
+// failed now) likewise degrades rather than refusing — a transient
+// information_schema hiccup shouldn't force a full re-snapshot.
+func verifySourceInstanceIdentity(ctx context.Context, persistedUUID, currentUUID string) error {
+	if persistedUUID == "" || currentUUID == "" {
+		return nil
+	}
+	if persistedUUID == currentUUID {
+		return nil
+	}
+	slog.WarnContext(ctx, "mysql: cdc: source instance identity changed since the persisted "+
+		"position was captured (node replaced / restored from backup / failed over); the binlog "+
+		"lineage does not carry over — refusing to resume to avoid a silent data gap",
+		slog.String("persisted_server_uuid", persistedUUID),
+		slog.String("current_server_uuid", currentUUID),
+	)
+	return fmt.Errorf("mysql: source server_uuid %q does not match the persisted position's "+
+		"server_uuid %q (source instance was replaced/restored; binlog lineage does not carry "+
+		"over); cannot resume: %w", currentUUID, persistedUUID, ir.ErrPositionInvalid)
+}
+
+// sourceServerUUID reads the source instance's @@server_uuid — a
+// value MySQL generates once per data directory and keeps stable
+// across restarts, but which is necessarily different on a fresh
+// instance / restored-from-backup node. Used to bind a file/pos
+// position to the instance that produced it (see
+// verifySourceInstanceIdentity).
+func sourceServerUUID(ctx context.Context, db *sql.DB) (string, error) {
+	var uuid string
+	if err := db.QueryRowContext(ctx, "SELECT @@global.server_uuid").Scan(&uuid); err != nil {
+		return "", fmt.Errorf("mysql: read @@server_uuid: %w", err)
+	}
+	return uuid, nil
 }
 
 // verifyBinlogFilePresent checks that the named binlog file is in

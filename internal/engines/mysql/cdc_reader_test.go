@@ -4,6 +4,8 @@
 package mysql
 
 import (
+	"context"
+	"errors"
 	"reflect"
 	"testing"
 
@@ -56,6 +58,67 @@ func TestEncodeBinlogPosRejectsInvalidMode(t *testing.T) {
 	_, err := encodeBinlogPos(binlogPos{Mode: "lsn", File: "x", Pos: 1})
 	if err == nil {
 		t.Fatal("expected error for invalid mode")
+	}
+}
+
+// TestEncodeDecodeBinlogPosServerUUID pins that the Track-1c
+// node-replace floor's instance binding survives the position
+// encode/decode round-trip — if ServerUUID were dropped on the wire
+// the resume-time identity check would always see an empty persisted
+// uuid and silently degrade to the old filename-only behaviour.
+func TestEncodeDecodeBinlogPosServerUUID(t *testing.T) {
+	in := binlogPos{
+		Mode:       positionModeFilePos,
+		File:       "mysql-bin.000003",
+		Pos:        3389,
+		ServerUUID: "31f7e90d-5234-11f1-8bd3-c65cb9b6c94f",
+	}
+	enc, err := encodeBinlogPos(in)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	got, ok, err := decodeBinlogPos(enc)
+	if err != nil || !ok {
+		t.Fatalf("decode: ok=%v err=%v", ok, err)
+	}
+	if got.ServerUUID != in.ServerUUID {
+		t.Errorf("ServerUUID round-trip: got %q want %q", got.ServerUUID, in.ServerUUID)
+	}
+}
+
+// TestVerifySourceInstanceIdentity is the unit-level pin for the
+// Track-1c node-replace loud-failure floor. The integration test
+// (TestStreamer_MySQL_FreshInstanceNodeReplaceFallsThroughToColdStart)
+// proves it end-to-end against two real instances; this pins the
+// decision table cheaply so a regression is caught without Docker.
+func TestVerifySourceInstanceIdentity(t *testing.T) {
+	cases := []struct {
+		name             string
+		persisted, cur   string
+		wantPositionLoss bool
+	}{
+		{"same instance — resumable", "uuid-A", "uuid-A", false},
+		{"instance replaced — loud refuse", "uuid-A", "uuid-B", true},
+		{"persisted empty (pre-field / degraded) — skip check", "", "uuid-B", false},
+		{"current empty (lookup failed now) — degrade not refuse", "uuid-A", "", false},
+		{"both empty — skip check", "", "", false},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			err := verifySourceInstanceIdentity(context.Background(), c.persisted, c.cur)
+			if c.wantPositionLoss {
+				if err == nil {
+					t.Fatal("expected an error (loud refuse) on instance mismatch")
+				}
+				if !errors.Is(err, ir.ErrPositionInvalid) {
+					t.Errorf("error must wrap ir.ErrPositionInvalid (the streamer's "+
+						"ADR-0022 fall-through trigger); got %v", err)
+				}
+			} else if err != nil {
+				t.Errorf("expected nil (resumable / degraded-skip); got %v", err)
+			}
+		})
 	}
 }
 
