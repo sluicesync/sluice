@@ -1,7 +1,7 @@
 #Requires -RunAsAdministrator
 <#
 .SYNOPSIS
-  Spin one runner from a sealed golden VHDX (workflow B, step 2 — the
+  Spin one runner from a sealed golden VHDX (workflow B, step 2 - the
   fast path: ~1-2 min to a live runner, repeat per runner).
 
 .DESCRIPTION
@@ -16,7 +16,7 @@
               -Name ("runner-{0:00}" -f $_) -AdminSshPublicKey (gc ~/.ssh/id_ed25519.pub) -WhatIf }
 
 .EXAMPLE
-  # Org-scoped fleet — one golden, runners shared across all org repos
+  # Org-scoped fleet - one golden, runners shared across all org repos
   # (needs gh token admin:org: gh auth refresh -h github.com -s admin:org).
   1..3 | % { .\New-RunnerFromTemplate.ps1 -GoldenVhdx C:\HyperV\golden\sluice-runner-golden.vhdx `
               -Name ("runner-{0:00}" -f $_) -Org orware-code -AdminSshPublicKey (gc ~/.ssh/id_ed25519.pub) }
@@ -30,7 +30,7 @@ param(
     [Parameter(ParameterSetName = 'Repo')] [string] $Repo = 'orware/sluice',
     [Parameter(ParameterSetName = 'Org', Mandatory)] [string] $Org,
     # Pre-minted GitHub registration token. When set, `gh` is NOT
-    # invoked — mint it on a gh-authed box and pass it here so a
+    # invoked - mint it on a gh-authed box and pass it here so a
     # secondary Hyper-V host (e.g. provisioned over RDP) needs no gh.
     # Must match the chosen scope (a repo token for -Repo, an org
     # token for -Org); ~1h TTL, so mint just before the batch.
@@ -87,5 +87,5 @@ $vm = New-RunnerVMObject -Name $Name -OsVhdx $osVhdx -SeedVhdx $seedVhdx `
         -CpuCount $CpuCount -MemoryBytes $MemoryBytes -SwitchName $SwitchName
 if ($vm -and $PSCmdlet.ShouldProcess($Name, "Start VM")) {
     Start-VM -Name $Name
-    Write-Host "Runner '$Name' started from golden template — live in ~1-2 min. Confirm Idle in repo Settings -> Actions -> Runners."
+    Write-Host "Runner '$Name' started from golden template - live in ~1-2 min. Confirm Idle in repo Settings -> Actions -> Runners."
 }

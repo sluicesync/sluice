@@ -11,7 +11,7 @@
   creates a Gen2 VM (Secure Boot ON via the 3rd-party UEFI CA), boots.
 
   Destructive: replaces any existing VM of the same name. Supports
-  -WhatIf — run that first.
+  -WhatIf - run that first.
 
 .EXAMPLE
   .\New-RunnerVM.ps1 -Name runner-01 -AdminSshPublicKey (gc ~/.ssh/id_ed25519.pub) -WhatIf
@@ -20,7 +20,7 @@
 
 .EXAMPLE
   # Org-scoped: runner usable across every repo in the org (needs a gh
-  # token with admin:org — gh auth refresh -h github.com -s admin:org).
+  # token with admin:org - gh auth refresh -h github.com -s admin:org).
   .\New-RunnerVM.ps1 -Name runner-01 -Org orware-code -AdminSshPublicKey (gc ~/.ssh/id_ed25519.pub)
 #>
 [CmdletBinding(SupportsShouldProcess, DefaultParameterSetName = 'Repo')]

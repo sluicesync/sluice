@@ -1,7 +1,7 @@
 #Requires -RunAsAdministrator
 <#
 .SYNOPSIS
-  Build + seal a golden runner VHDX (workflow B, step 1 — README.md).
+  Build + seal a golden runner VHDX (workflow B, step 1 - README.md).
 
 .DESCRIPTION
   Builds one cloud-image VM that fully provisions (docker, packages,
@@ -11,7 +11,7 @@
   the disk out as a sealed golden template. Clones made from it
   (New-RunnerFromTemplate.ps1) come up in ~1-2 min.
 
-  The golden image deliberately has no runner registration — clones
+  The golden image deliberately has no runner registration - clones
   register with their own fresh token, so there is no ghost runner and
   no token baked into the template.
 
@@ -38,7 +38,7 @@ Assert-Prereqs
 
 # 1. Build a provision-only VM (user-data with the runner runcmd
 #    stripped: we render the full template but pass an empty token and
-#    a NO-OP repo so config.sh is skipped — simplest is a dedicated
+#    a NO-OP repo so config.sh is skipped - simplest is a dedicated
 #    provision-only template). Reuse the full template but disable the
 #    runner block via a sentinel the template honours when token empty.
 $runnerVer = Resolve-RunnerVersion

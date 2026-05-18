@@ -18,7 +18,7 @@ $script:CacheDir = New-Item -ItemType Directory -Force -Path (Join-Path $script:
 $script:SeedDir  = New-Item -ItemType Directory -Force -Path (Join-Path $script:WorkRoot 'seeds') | Select-Object -ExpandProperty FullName
 
 # Ubuntu 24.04 LTS generic cloud image (qcow2). Single growable ext4
-# root — no LVM, so cloud-init grows it to fill the VHDX on first boot.
+# root - no LVM, so cloud-init grows it to fill the VHDX on first boot.
 $script:CloudImgUrl = 'https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-amd64.img'
 
 function Assert-Prereqs {
@@ -72,7 +72,7 @@ function New-RunnerToken {
     # just-in-time; never persisted to the repo. Repo OR org scope:
     # an org token registers a runner usable across that org's repos
     # (one pool, many projects). NOTE: the org endpoint requires the
-    # gh token to carry `admin:org` — `repo` + `read:org` alone returns
+    # gh token to carry `admin:org` - `repo` + `read:org` alone returns
     # 403. Grant it once: gh auth refresh -h github.com -s admin:org
     [CmdletBinding(DefaultParameterSetName = 'Repo')]
     param(
@@ -121,7 +121,7 @@ function Expand-Template {
 
 function New-SeedVhdx {
     # Build a tiny FAT32 VHDX labeled CIDATA holding user-data +
-    # meta-data — cloud-init's NoCloud datasource auto-detects it.
+    # meta-data - cloud-init's NoCloud datasource auto-detects it.
     # Pure PowerShell, no oscdimg/ADK dependency.
     [CmdletBinding()] param(
         [Parameter(Mandatory)] [string] $UserData,
@@ -137,7 +137,7 @@ function New-SeedVhdx {
         Format-Volume -DriveLetter $part.DriveLetter -FileSystem FAT32 `
             -NewFileSystemLabel 'CIDATA' -Confirm:$false | Out-Null
         $root = "$($part.DriveLetter):\"
-        # LF line endings — cloud-init is strict about CRLF in user-data.
+        # LF line endings - cloud-init is strict about CRLF in user-data.
         [IO.File]::WriteAllText((Join-Path $root 'user-data'), ($UserData -replace "`r`n", "`n"))
         [IO.File]::WriteAllText((Join-Path $root 'meta-data'), ($MetaData -replace "`r`n", "`n"))
     }
