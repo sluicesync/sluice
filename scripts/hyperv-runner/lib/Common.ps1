@@ -32,7 +32,7 @@ function Assert-Prereqs {
         throw "Hyper-V PowerShell module not available. Enable the Hyper-V feature."
     }
     if (-not (Get-Command qemu-img -ErrorAction SilentlyContinue)) {
-        throw "qemu-img not on PATH. Install: winget install --id qemu.qemu  (Convert-VHD cannot read qcow2)."
+        throw "qemu-img not on PATH. Install: winget install --id cloudbase.qemu-img (or SoftwareFreedomConservancy.QEMU), then ensure its dir is on PATH in a new shell. Convert-VHD cannot read qcow2."
     }
     if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
         throw "gh CLI not on PATH (needed to mint runner registration tokens)."

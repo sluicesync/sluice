@@ -64,7 +64,11 @@ it in minutes after any host event, no re-download, no re-provision.
   **elevated**. (`vmms` service running — already true on this box.)
 - **`qemu-img`** on PATH — the only external tool. Used to convert the
   cloud image (qcow2) to VHDX; `Convert-VHD` cannot read qcow2.
-  `winget install --id qemu.qemu` or drop `qemu-img.exe` on PATH.
+  `winget install --id cloudbase.qemu-img` (lightweight, qemu-img
+  only) or `--id SoftwareFreedomConservancy.QEMU` (full, current).
+  **These packages often do not add themselves to PATH** — after
+  install, verify `qemu-img --version` in a new shell; if missing,
+  add its install dir to PATH (or drop `qemu-img.exe` on PATH).
 - **`gh`** authed to `orware/sluice` (already true on this box) — used
   to mint runner registration tokens (`repos/.../registration-token`,
   ~1 h TTL, minted just-in-time per VM).
