@@ -1,0 +1,5 @@
+# Runtime artifacts — never commit. Contains the cloud-image cache and
+# generated per-VM seed VHDXs (which embed short-lived runner
+# registration tokens). All reproducible from the scripts + a fresh
+# `gh` token.
+.work/

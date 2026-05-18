@@ -1,0 +1,27 @@
+#cloud-config
+# Minimal per-instance seed for a clone built FROM the golden template.
+# The golden image is already fully provisioned (docker, packages, daily
+# cron, hourly disk-pressure guard, root grown). cloud-init was sealed
+# with `cloud-init clean`, so this boot is treated as a fresh instance
+# (new instance-id in meta-data) and runs ONLY this runcmd: set hostname
+# and register a runner with a freshly-minted token. ~1-2 min to live.
+#
+# Placeholders: {{HOSTNAME}}, {{ADMIN_USER}}, {{REPO_URL}},
+# {{RUNNER_LABELS}}, {{RUNNER_TOKEN}}. Rendered token lands only on the
+# gitignored host-side seed VHDX, never the repo.
+
+hostname: {{HOSTNAME}}
+fqdn: {{HOSTNAME}}
+preserve_hostname: false
+
+runcmd:
+  # Defensive grow (clone VHDX may have been resized larger than golden).
+  - [ bash, -c, "growpart /dev/sda 1 || true; resize2fs /dev/sda1 || true" ]
+  # Re-register the runner under the new identity. If a stale runner
+  # config survived the golden seal, remove it first (best-effort).
+  - [ bash, -c, "cd /opt/actions-runner && (sudo -u {{ADMIN_USER}} ./config.sh remove --token {{RUNNER_TOKEN}} 2>/dev/null || true)" ]
+  - [ bash, -c, "cd /opt/actions-runner && sudo -u {{ADMIN_USER}} ./config.sh --url {{REPO_URL}} --token {{RUNNER_TOKEN}} --name {{HOSTNAME}} --labels {{RUNNER_LABELS}} --unattended --replace --work _work" ]
+  - [ bash, -c, "cd /opt/actions-runner && ./svc.sh install {{ADMIN_USER}} && ./svc.sh start" ]
+  - [ bash, -c, "echo \"clone-personalized $(date -Is) host {{HOSTNAME}}\" > /var/log/runner-provision-complete" ]
+
+final_message: "sluice runner clone {{HOSTNAME}} personalized in $UPTIME s"

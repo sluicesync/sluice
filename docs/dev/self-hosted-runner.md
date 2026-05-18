@@ -107,33 +107,51 @@ Then, hands-on on the target:
 
 ## Phase 2 — Ubuntu guest under Hyper-V (the cost-driver runner)
 
-Create a Hyper-V Gen-2 VM: **Ubuntu 24.04 LTS, ≥4 vCPU, ≥12 GB RAM,
-≥100 GB disk** (testcontainers + pulled images: `mysql:8.0`,
-`postgres:16`, vttestserver ~700 MB, `vitess/lite` ~2 GB — disk-hungry).
-Docker-in-a-Linux-guest needs **no nested virtualization** (containers
-≠ VMs). Inside the guest:
+**Automated.** Hand-building this guest is what caused the recurring
+outage: a `.vhdx` was extended but the guest filesystem never grew (and
+Ubuntu Server's guided-install LVM leaves most of the VG unallocated),
+so the disk re-wedged on the same timeline once the Integration job's
+pulled images refilled it. The build is now scripted and structurally
+immune to that — see [`scripts/hyperv-runner/README.md`](../../scripts/hyperv-runner/README.md).
 
-```bash
-sudo apt-get update && sudo apt-get install -y build-essential git curl docker.io
-sudo usermod -aG docker $USER          # re-login after this
-# Go (for -race; the guest CAN run CGO=1/TSan, unlike the Win hosts)
-curl -fsSL https://go.dev/dl/go1.23.linux-amd64.tar.gz | sudo tar -C /usr/local -xz
-echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.bashrc && source ~/.bashrc
-# GitHub Actions runner
-mkdir ~/actions-runner && cd ~/actions-runner
-curl -o r.tar.gz -L https://github.com/actions/runner/releases/latest/download/actions-runner-linux-x64.tar.gz
-tar xzf r.tar.gz
-# Registration token — mint from the PRIMARY box (next section), paste:
-./config.sh --url https://github.com/orware/sluice --token <TOKEN> \
-  --name sluice-linux-guest --labels sluice-linux --unattended --replace
-sudo ./svc.sh install && sudo ./svc.sh start      # run as a service
+Spec unchanged: Gen-2, **≥4 vCPU, ≥12 GB RAM, ≥100 GB disk** (images:
+`mysql:8.0`, `postgres:16`, vttestserver ~700 MB, `vitess/lite` ~2 GB).
+Docker-in-a-Linux-guest needs no nested virtualization. The scripts use
+the **Ubuntu cloud image** (single growable ext4 root — cloud-init
+grows it to fill the VHDX on first boot, so resizing the disk is the
+only knob) and bake in disk hygiene (the runbook's daily
+`docker system prune` cron **plus** an hourly disk-pressure guard that
+prunes when root > 70 %, because the daily-only cron is what failed).
+
+Note: a system Go is **not** installed — CI uses `actions/setup-go`,
+which provisions Go per-job (the guest *can* run `-race`/CGO/TSan, but
+the toolchain comes from the workflow, keeping the image lean).
+
+```powershell
+# elevated, on the runner host; qemu-img + gh required (see README)
+cd C:\Code\sluice\scripts\hyperv-runner
+.\New-RunnerVM.ps1 -Name runner-01 `
+  -AdminSshPublicKey (Get-Content ~\.ssh\id_ed25519.pub) -WhatIf   # then drop -WhatIf
 ```
 
-Disk hygiene (the Integration job will wedge a full disk) — cron:
+### Fleet builds — the golden-template path
 
-```bash
-(crontab -l 2>/dev/null; echo "0 4 * * * /usr/bin/docker system prune -af --volumes") | crontab -
+For more than one runner, build a sealed image once and clone it
+(~1–2 min per runner vs a full image build, no re-download):
+
+```powershell
+.\Build-GoldenTemplate.ps1 -AdminSshPublicKey (gc ~\.ssh\id_ed25519.pub) `
+  -AdminSshKeyPath ~\.ssh\id_ed25519 -OutGoldenVhdx C:\HyperV\golden\sluice-runner-golden.vhdx
+1..4 | ForEach-Object {
+  .\New-RunnerFromTemplate.ps1 -GoldenVhdx C:\HyperV\golden\sluice-runner-golden.vhdx `
+    -Name ("runner-{0:00}" -f $_) -AdminSshPublicKey (gc ~\.ssh\id_ed25519.pub)
+}
 ```
+
+The golden VHDX is the durable artifact: rebuild the whole fleet from
+it in minutes after any host event. Tokens are minted just-in-time per
+VM (never baked into the image or committed). The legacy hands-on
+sequence is preserved in `README.md` for reference / disaster fallback.
 
 ## Phase 3 — native Windows runner on the host (tag-only legs)
 
