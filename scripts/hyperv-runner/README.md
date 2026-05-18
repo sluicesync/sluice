@@ -133,6 +133,39 @@ Truly remote orchestration (one command provisioning onto a remote
 host's Hyper-V) would require adding `-ComputerName`/CIM-session +
 remote path handling to the scripts — not built yet.
 
+## Org-scoped runners (share across all org repos)
+
+By default runners register at **repo** scope (`-Repo owner/repo`,
+default `orware/sluice`) — one runner serves one repo. Pass **`-Org
+<name>`** instead to register at **organization** scope: that runner
+is usable by *every* repo in the org (one pool, many projects). Works
+on both entry scripts:
+
+```powershell
+.\New-RunnerVM.ps1          -Name runner-01 -Org orware-code -AdminSshPublicKey (gc ~/.ssh/id_ed25519.pub)
+.\New-RunnerFromTemplate.ps1 -GoldenVhdx ... -Name runner-01 -Org orware-code -AdminSshPublicKey (gc ~/.ssh/id_ed25519.pub)
+```
+
+`-Repo` and `-Org` are mutually exclusive (PowerShell parameter sets;
+omitting both = the `-Repo` default). **The golden VHDX is
+scope-agnostic** — it registers no runner, so one golden serves repo
+*and* org fleets; scope is chosen per clone.
+
+Prerequisite for `-Org`: the `gh` token must carry **`admin:org`**.
+`repo` + `read:org` alone returns 403 on the org token endpoint.
+Grant once:
+
+```powershell
+gh auth refresh -h github.com -s admin:org
+```
+
+The org must also allow self-hosted runners and the repos must live
+in that org. (To move repos into `orware-code`: GitHub → repo →
+Settings → Transfer ownership.) Org runners land in the org's
+**Default** runner group unless GitHub-side group/visibility rules
+say otherwise — manage that in Org → Settings → Actions → Runner
+groups, not in these scripts.
+
 ## Prerequisites (on the runner host, once)
 
 - Windows Pro/Enterprise with the **Hyper-V** feature + module, run

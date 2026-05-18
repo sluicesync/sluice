@@ -17,13 +17,19 @@
   .\New-RunnerVM.ps1 -Name runner-01 -AdminSshPublicKey (gc ~/.ssh/id_ed25519.pub) -WhatIf
 .EXAMPLE
   .\New-RunnerVM.ps1 -Name runner-01 -AdminSshPublicKey (gc ~/.ssh/id_ed25519.pub)
+
+.EXAMPLE
+  # Org-scoped: runner usable across every repo in the org (needs a gh
+  # token with admin:org — gh auth refresh -h github.com -s admin:org).
+  .\New-RunnerVM.ps1 -Name runner-01 -Org orware-code -AdminSshPublicKey (gc ~/.ssh/id_ed25519.pub)
 #>
-[CmdletBinding(SupportsShouldProcess)]
+[CmdletBinding(SupportsShouldProcess, DefaultParameterSetName = 'Repo')]
 param(
     [Parameter(Mandatory)] [string] $Name,
     [Parameter(Mandatory)] [string] $AdminSshPublicKey,
     [string]  $AdminUser   = 'runner',
-    [string]  $Repo        = 'orware/sluice',
+    [Parameter(ParameterSetName = 'Repo')] [string] $Repo = 'orware/sluice',
+    [Parameter(ParameterSetName = 'Org', Mandatory)] [string] $Org,
     [string]  $RunnerLabels= 'sluice-linux',
     [int]     $DiskGB      = 120,
     [int]     $CpuCount    = 4,
@@ -45,13 +51,23 @@ if ($PSCmdlet.ShouldProcess($osVhdx, "Convert+resize cloud image -> ${DiskGB}GB 
     Convert-CloudImageToVhdx -Qcow2Path $qcow -OutVhdx $osVhdx -SizeGB $DiskGB | Out-Null
 }
 
+# Registration scope: org (shared across the org's repos) or repo.
+if ($PSCmdlet.ParameterSetName -eq 'Org') {
+    $registerUrl = "https://github.com/$Org"
+    $token       = New-RunnerToken -Org $Org
+    Write-Host "Registration scope: org '$Org' (runner usable across the org's repos)"
+} else {
+    $registerUrl = "https://github.com/$Repo"
+    $token       = New-RunnerToken -Repo $Repo
+    Write-Host "Registration scope: repo '$Repo'"
+}
+
 # Seed (token minted just-in-time; ~1h TTL)
-$token = New-RunnerToken -Repo $Repo
 $userData = Expand-Template -TemplatePath "$PSScriptRoot\cloud-init\user-data.template" -Values @{
     HOSTNAME        = $hostName
     ADMIN_USER      = $AdminUser
     ADMIN_SSH_PUBKEY= $AdminSshPublicKey.Trim()
-    REPO_URL        = "https://github.com/$Repo"
+    REPO_URL        = $registerUrl
     RUNNER_LABELS   = $RunnerLabels
     RUNNER_VERSION  = $runnerVer
     RUNNER_TOKEN    = $token

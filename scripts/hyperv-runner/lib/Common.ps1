@@ -69,11 +69,26 @@ function Convert-CloudImageToVhdx {
 
 function New-RunnerToken {
     # Short-lived (~1h) GitHub Actions registration token. Minted
-    # just-in-time; never persisted to the repo.
-    [CmdletBinding()] param([string] $Repo = 'orware/sluice')
-    $t = & gh api -X POST "repos/$Repo/actions/runners/registration-token" --jq .token 2>$null
+    # just-in-time; never persisted to the repo. Repo OR org scope:
+    # an org token registers a runner usable across that org's repos
+    # (one pool, many projects). NOTE: the org endpoint requires the
+    # gh token to carry `admin:org` — `repo` + `read:org` alone returns
+    # 403. Grant it once: gh auth refresh -h github.com -s admin:org
+    [CmdletBinding(DefaultParameterSetName = 'Repo')]
+    param(
+        [Parameter(ParameterSetName = 'Repo')] [string] $Repo = 'orware/sluice',
+        [Parameter(ParameterSetName = 'Org', Mandatory)] [string] $Org
+    )
+    if ($PSCmdlet.ParameterSetName -eq 'Org') {
+        $api = "orgs/$Org/actions/runners/registration-token"
+        $scopeDesc = "org '$Org' (needs gh token scope admin:org)"
+    } else {
+        $api = "repos/$Repo/actions/runners/registration-token"
+        $scopeDesc = "repo '$Repo'"
+    }
+    $t = & gh api -X POST $api --jq .token 2>$null
     if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($t)) {
-        throw "Failed to mint runner registration token for $Repo (is gh authed?)."
+        throw "Failed to mint runner registration token for $scopeDesc (is gh authed with sufficient scope?)."
     }
     return $t.Trim()
 }

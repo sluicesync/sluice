@@ -14,14 +14,21 @@
 .EXAMPLE
   1..4 | % { .\New-RunnerFromTemplate.ps1 -GoldenVhdx C:\HyperV\golden\sluice-runner-golden.vhdx `
               -Name ("runner-{0:00}" -f $_) -AdminSshPublicKey (gc ~/.ssh/id_ed25519.pub) -WhatIf }
+
+.EXAMPLE
+  # Org-scoped fleet — one golden, runners shared across all org repos
+  # (needs gh token admin:org: gh auth refresh -h github.com -s admin:org).
+  1..3 | % { .\New-RunnerFromTemplate.ps1 -GoldenVhdx C:\HyperV\golden\sluice-runner-golden.vhdx `
+              -Name ("runner-{0:00}" -f $_) -Org orware-code -AdminSshPublicKey (gc ~/.ssh/id_ed25519.pub) }
 #>
-[CmdletBinding(SupportsShouldProcess)]
+[CmdletBinding(SupportsShouldProcess, DefaultParameterSetName = 'Repo')]
 param(
     [Parameter(Mandatory)] [string] $GoldenVhdx,
     [Parameter(Mandatory)] [string] $Name,
     [string] $AdminSshPublicKey,
     [string] $AdminUser    = 'runner',
-    [string] $Repo         = 'orware/sluice',
+    [Parameter(ParameterSetName = 'Repo')] [string] $Repo = 'orware/sluice',
+    [Parameter(ParameterSetName = 'Org', Mandatory)] [string] $Org,
     [string] $RunnerLabels = 'sluice-linux',
     [int]    $DiskGB       = 0,            # 0 = keep golden size
     [int]    $CpuCount     = 4,
@@ -40,11 +47,19 @@ if ($PSCmdlet.ShouldProcess($osVhdx, "Copy golden VHDX -> per-VM disk")) {
     if ($DiskGB -gt 0) { Resize-VHD -Path $osVhdx -SizeBytes ($DiskGB * 1GB) }  # guest auto-grows root
 }
 
-$token = New-RunnerToken -Repo $Repo
+if ($PSCmdlet.ParameterSetName -eq 'Org') {
+    $registerUrl = "https://github.com/$Org"
+    $token       = New-RunnerToken -Org $Org
+    Write-Host "Registration scope: org '$Org' (runner usable across the org's repos)"
+} else {
+    $registerUrl = "https://github.com/$Repo"
+    $token       = New-RunnerToken -Repo $Repo
+    Write-Host "Registration scope: repo '$Repo'"
+}
 $userData = Expand-Template -TemplatePath "$PSScriptRoot\cloud-init\user-data-clone.template" -Values @{
     HOSTNAME      = $Name
     ADMIN_USER    = $AdminUser
-    REPO_URL      = "https://github.com/$Repo"
+    REPO_URL      = $registerUrl
     RUNNER_LABELS = $RunnerLabels
     RUNNER_TOKEN  = $token
 }
