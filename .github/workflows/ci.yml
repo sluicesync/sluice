@@ -98,7 +98,14 @@ jobs:
   # (so we see the full picture of which platforms broke).
   test:
     name: Test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    # Self-hosted-runner selector. vars.CI_LINUX_RUNNER /
+    # CI_WINDOWS_RUNNER unset => ubuntu-latest / windows-latest
+    # (identical to pre-selector behaviour). Set a repo variable to
+    # a self-hosted runner label to route there; unset to fall back
+    # (GitHub does NOT auto-fail-over an offline self-hosted runner —
+    # the variable IS the manual fail-back lever). See
+    # docs/dev/self-hosted-runner.md.
+    runs-on: ${{ (matrix.os == 'windows-latest' && (vars.CI_WINDOWS_RUNNER || 'windows-latest')) || (vars.CI_LINUX_RUNNER || 'ubuntu-latest') }}
     strategy:
       fail-fast: false
       matrix:
@@ -163,7 +170,7 @@ jobs:
   # specific compile and test concerns for the unit suite.
   integration:
     name: Integration
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
     # 45m outer envelope. Was 60m through v0.28.0 (job also ran the
     # additive postgis-tagged suite); v0.29.0 split postgis into its
     # own parallel job and it dropped to 35m. v0.68.0: the integration
@@ -247,7 +254,7 @@ jobs:
   # container and do its work. Headroom for growth.
   integration-postgis:
     name: Integration (PostGIS)
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
@@ -267,7 +274,7 @@ jobs:
   # is OS-independent so we only need one runner.
   lint:
     name: Lint
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-go@v6
@@ -305,7 +312,8 @@ jobs:
   # cost-shape note.
   build:
     name: Build (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    # Same self-hosted selector as the test job — see that comment.
+    runs-on: ${{ (matrix.os == 'windows-latest' && (vars.CI_WINDOWS_RUNNER || 'windows-latest')) || (vars.CI_LINUX_RUNNER || 'ubuntu-latest') }}
     strategy:
       fail-fast: false
       matrix:
