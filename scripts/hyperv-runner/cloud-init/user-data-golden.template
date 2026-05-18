@@ -5,9 +5,12 @@
 # image. Clones add the runner via user-data-clone.template with their
 # own fresh token (no ghost runner, no baked-in secret).
 #
-# Placeholders: {{HOSTNAME}}, {{ADMIN_USER}}, {{ADMIN_SSH_PUBKEY}},
-# {{RUNNER_VERSION}}, {{DISK_PRUNE_PCT}}. (No {{RUNNER_TOKEN}} —
-# deliberately.)
+# Placeholders (brace syntax intentionally NOT written here: the
+# strict renderer treats any leftover double-brace token as an error,
+# and substitution would mangle these in-comment): HOSTNAME,
+# ADMIN_USER, ADMIN_SSH_PUBKEY, RUNNER_VERSION, DISK_PRUNE_PCT.
+# RUNNER_TOKEN is deliberately absent — golden registers no runner;
+# clones inject their own fresh token via user-data-clone.template.
 
 hostname: {{HOSTNAME}}
 fqdn: {{HOSTNAME}}
