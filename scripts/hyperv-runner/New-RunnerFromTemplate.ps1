@@ -43,7 +43,9 @@ param(
     [string] $VmDiskDir    = 'C:\HyperV\runners'
 )
 . "$PSScriptRoot\lib\Common.ps1"
-Assert-Prereqs
+# From-template copies the golden (no qemu-img). gh is only needed to
+# mint a token; -RegistrationToken supplies one and skips gh.
+Assert-Prereqs -RequireGh:(-not $RegistrationToken)
 if (-not (Test-Path $GoldenVhdx)) { throw "Golden VHDX not found: $GoldenVhdx (run Build-GoldenTemplate.ps1 first)." }
 
 New-Item -ItemType Directory -Force -Path $VmDiskDir | Out-Null

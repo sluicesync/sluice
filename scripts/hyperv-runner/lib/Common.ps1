@@ -22,7 +22,16 @@ $script:SeedDir  = New-Item -ItemType Directory -Force -Path (Join-Path $script:
 $script:CloudImgUrl = 'https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-amd64.img'
 
 function Assert-Prereqs {
-    [CmdletBinding()] param()
+    # Admin + Hyper-V are always required. qemu-img is needed ONLY by
+    # the cloud-image build path (Convert-CloudImageToVhdx); the
+    # from-template path just Copy-Item's the golden and must not
+    # demand it. gh is needed ONLY when a token is minted here; a
+    # caller passing a pre-minted -RegistrationToken needs no gh.
+    # Each entry script opts in to exactly what it uses.
+    [CmdletBinding()] param(
+        [switch] $RequireQemu,
+        [switch] $RequireGh
+    )
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
     if (-not (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole(
             [Security.Principal.WindowsBuiltinRole]::Administrator)) {
@@ -31,11 +40,11 @@ function Assert-Prereqs {
     if (-not (Get-Command Get-VM -ErrorAction SilentlyContinue)) {
         throw "Hyper-V PowerShell module not available. Enable the Hyper-V feature."
     }
-    if (-not (Get-Command qemu-img -ErrorAction SilentlyContinue)) {
+    if ($RequireQemu -and -not (Get-Command qemu-img -ErrorAction SilentlyContinue)) {
         throw "qemu-img not on PATH. Install: winget install --id cloudbase.qemu-img (or SoftwareFreedomConservancy.QEMU), then ensure its dir is on PATH in a new shell. Convert-VHD cannot read qcow2."
     }
-    if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
-        throw "gh CLI not on PATH (needed to mint runner registration tokens)."
+    if ($RequireGh -and -not (Get-Command gh -ErrorAction SilentlyContinue)) {
+        throw "gh CLI not on PATH (needed to mint a runner registration token; pass -RegistrationToken to skip gh)."
     }
 }
 

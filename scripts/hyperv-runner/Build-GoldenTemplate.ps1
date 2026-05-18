@@ -34,7 +34,7 @@ param(
     [string] $BuildVmName  = 'sluice-golden-build'
 )
 . "$PSScriptRoot\lib\Common.ps1"
-Assert-Prereqs
+Assert-Prereqs -RequireQemu -RequireGh   # converts cloud image + Resolve-RunnerVersion uses gh
 
 # 1. Build a provision-only VM (user-data with the runner runcmd
 #    stripped: we render the full template but pass an empty token and

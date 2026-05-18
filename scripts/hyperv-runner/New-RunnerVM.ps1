@@ -38,7 +38,7 @@ param(
     [string]  $SwitchName  = 'Default Switch'
 )
 . "$PSScriptRoot\lib\Common.ps1"
-Assert-Prereqs
+Assert-Prereqs -RequireQemu -RequireGh   # full build: converts cloud image + mints token
 
 $hostName  = $Name
 $runnerVer = Resolve-RunnerVersion
