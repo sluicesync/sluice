@@ -65,12 +65,25 @@ it in minutes after any host event, no re-download, no re-provision.
 seal is deliberately by-hand (single-shot, hard to verify headless).
 Do it once; thereafter the fleet is one command each.
 
-1. **Wait for provisioning, then find the VM's IP** (first boot runs
-   apt + docker install + pre-stages the runner tarball — allow
-   ~5–10 min before an IP/`cloud-init done` appears):
+1. **Wait for provisioning (~5–10 min: apt + docker + runner tarball),
+   then find the VM's IP.** ⚠️ `(Get-VMNetworkAdapter
+   ...).IPAddresses` **does not work** here — the stock Ubuntu cloud
+   image runs no `hv_kvp_daemon`, so Hyper-V never learns the guest
+   IP (it stays `[]` indefinitely even though DHCP succeeded). Resolve
+   it from the VM's MAC via the host neighbor table instead:
 
    ```powershell
-   (Get-VMNetworkAdapter -VMName sluice-golden-build).IPAddresses
+   $mac = (Get-VMNetworkAdapter -VMName sluice-golden-build).MacAddress
+   Get-NetNeighbor -ErrorAction SilentlyContinue |
+     Where-Object { ($_.LinkLayerAddress -replace '[:-]','') -eq $mac } |
+     Select-Object IPAddress, State, InterfaceAlias
+   ```
+
+   That returns the `172.x` Default-Switch address. Sanity-check it's
+   up and provisioning finished:
+
+   ```powershell
+   ssh -i $HOME\.ssh\id_ed25519 runner@<IP> 'cloud-init status'   # want: status: done
    ```
 
 2. **SSH in as the admin user** (the key you passed
