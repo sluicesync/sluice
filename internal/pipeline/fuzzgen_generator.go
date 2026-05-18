@@ -31,6 +31,19 @@ type genColumn struct {
 	shp    shape
 	ddl    string   // column type spelling, source dialect
 	values []string // one source-dialect literal per row ("NULL" sentinel handled)
+
+	// forceNonNullLeaf guarantees ≥1 non-NULL element in every rendered
+	// cell of this column (and never a whole-column NULL). Set for an
+	// array-shape column whose family loud-refuses for this direction:
+	// the loud-refuse oracle is keyed on (family,shape,dir) with no
+	// all-NULL carve-out, so an all-NULL array would push no element
+	// through the unsupported codec, migrate would legitimately exit 0,
+	// and the loud-refuse assertion would be *vacuous* — a guaranteed
+	// false-positive (Findings 1 & 2). Forcing a real element makes the
+	// refusal path actually fire, so the assertion is meaningful. This
+	// is the generator-side discipline the prep-doc contract mandates:
+	// "a loud-refuse pin must force the refused path."
+	forceNonNullLeaf bool
 }
 
 // genCase is a fully-rendered, replayable test case: the source-dialect
@@ -92,6 +105,11 @@ func generateCase(seed int64, idx int, dir direction) genCase {
 			fam:  f,
 			shp:  shape(s),
 			ddl:  f.columnDDL(dir.src, shape(s)),
+			// An array-shape loud-refuse column must force the refused
+			// path; an all-NULL array would make the assertion vacuous
+			// (Findings 1 & 2).
+			forceNonNullLeaf: shape(s) != shapeScalar &&
+				f.expect(dir, shape(s)) == outcomeLoudRefuse,
 		}
 		if f.name == "enum" && dir.src == enginePG {
 			enumType = enumTypeName
@@ -164,6 +182,19 @@ func renderCell(r *rand.Rand, c *genColumn, src engineKind) string {
 		}
 		return lit
 	}
+	// nonNullScalar forces a real (non-NULL) leaf for a loud-refuse
+	// array column so the unsupported-codec path actually fires (see
+	// genColumn.forceNonNullLeaf). gen's NULL probability is ~1/6, so
+	// the bounded retry effectively never exhausts; the final fallback
+	// keeps generation total even in the impossible all-NULL case.
+	nonNullScalar := func() string {
+		for try := 0; try < 32; try++ {
+			if v := scalar(); v != "NULL" {
+				return v
+			}
+		}
+		return scalar()
+	}
 
 	switch c.shp {
 	case shapeScalar:
@@ -174,18 +205,23 @@ func renderCell(r *rand.Rand, c *genColumn, src engineKind) string {
 		return v
 
 	case shape1DArray:
-		// 1-in-7: the whole array column is SQL NULL.
-		if r.Intn(7) == 0 {
+		// 1-in-7: the whole array column is SQL NULL — unless this is a
+		// loud-refuse column, where a NULL/all-NULL value would make
+		// the refusal assertion vacuous (Findings 1 & 2).
+		if !c.forceNonNullLeaf && r.Intn(7) == 0 {
 			return "NULL"
 		}
 		elems := make([]string, arrayLeafScalars)
 		for i := range elems {
 			elems[i] = scalar() // may be the literal "NULL" → NULL element
 		}
+		if c.forceNonNullLeaf {
+			elems[0] = nonNullScalar() // guarantee ≥1 real element
+		}
 		return pgArrayLiteral(c, elems)
 
 	case shapeMultiDim:
-		if r.Intn(7) == 0 {
+		if !c.forceNonNullLeaf && r.Intn(7) == 0 {
 			return "NULL"
 		}
 		rows := make([]string, multiDimSide)
@@ -195,6 +231,15 @@ func renderCell(r *rand.Rand, c *genColumn, src engineKind) string {
 				inner[j] = scalar()
 			}
 			rows[i] = "[" + strings.Join(inner, ",") + "]"
+		}
+		if c.forceNonNullLeaf {
+			// Re-render the [0][0] leaf as a guaranteed real element.
+			firstInner := make([]string, multiDimSide)
+			for j := range firstInner {
+				firstInner[j] = scalar()
+			}
+			firstInner[0] = nonNullScalar()
+			rows[0] = "[" + strings.Join(firstInner, ",") + "]"
 		}
 		return pgArrayWrap(c, "ARRAY["+strings.Join(rows, ",")+"]")
 	}

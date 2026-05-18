@@ -12,6 +12,7 @@ package pipeline
 
 import (
 	"database/sql"
+	"math/rand"
 	"strings"
 	"testing"
 )
@@ -182,6 +183,101 @@ func TestGenerator_Deterministic(t *testing.T) {
 				t.Fatalf("empty script [%s case %d]", d, i)
 			}
 		}
+	}
+}
+
+// TestGenerator_LoudRefuseArrayForcesNonNull pins the Findings 1 & 2
+// fix: a loud-refuse array column must never render a whole-column
+// NULL or an all-NULL array, or the loud-refuse assertion is vacuous
+// (migrate legitimately exits 0 because nothing traverses the absent
+// codec) — a guaranteed false-positive on the documented loud-refuse
+// set. timetz[]/timetz[][] PG→PG is that load-bearing case.
+func TestGenerator_LoudRefuseArrayForcesNonNull(t *testing.T) {
+	var timetz *family
+	for _, f := range registry() {
+		if f.name == "timetz" {
+			timetz = f
+			break
+		}
+	}
+	if timetz == nil {
+		t.Fatal("timetz family missing from registry")
+	}
+
+	// (a) renderCell mechanism: a forced loud-refuse array column never
+	// emits NULL and always carries ≥1 real timetz literal (a quoted
+	// value). 500 draws covers gen's ~1/6 NULL probability deeply.
+	for _, shp := range []shape{shape1DArray, shapeMultiDim} {
+		c := genColumn{
+			name: "c_timetz", fam: timetz, shp: shp,
+			forceNonNullLeaf: true,
+		}
+		r := rand.New(rand.NewSource(1))
+		for i := 0; i < 500; i++ {
+			out := renderCell(r, &c, enginePG)
+			if out == "NULL" {
+				t.Fatalf("[%s] forced loud-refuse array rendered whole-column NULL at draw %d (vacuous-FP class)", shp, i)
+			}
+			if !strings.Contains(out, "'") {
+				t.Fatalf("[%s] forced loud-refuse array has no non-NULL element at draw %d: %q", shp, i, out)
+			}
+		}
+	}
+
+	// (b) wiring: generateCase must SET forceNonNullLeaf for every
+	// timetz array column in the PG→PG direction, and none of that
+	// column's rendered values may be NULL / all-NULL.
+	var pgpg direction
+	for _, d := range allDirections() {
+		if d.String() == "postgres->postgres" {
+			pgpg = d
+		}
+	}
+	sawTimetzArray := false
+	for idx := 0; idx < 120; idx++ {
+		gc := generateCase(987654321, idx, pgpg)
+		for _, c := range gc.columns {
+			if c.fam.name != "timetz" || c.shp == shapeScalar {
+				continue
+			}
+			sawTimetzArray = true
+			if !c.forceNonNullLeaf {
+				t.Errorf("idx %d col %s: timetz array PG→PG must have forceNonNullLeaf set", idx, c.name)
+			}
+			for ri, v := range c.values {
+				if v == "NULL" || !strings.Contains(v, "'") {
+					t.Errorf("idx %d col %s row %d: vacuous loud-refuse value %q (no real element)", idx, c.name, ri, v)
+				}
+			}
+		}
+	}
+	if !sawTimetzArray {
+		t.Fatal("no timetz array column generated across 120 PG→PG cases — coverage gap")
+	}
+
+	// (c) over-correction guard: a faithful (non-loud-refuse) array
+	// family must still be ABLE to render NULL — the fix must not
+	// globally suppress NULL coverage.
+	var faithfulArr *family
+	for _, f := range registry() {
+		if f.canSource(enginePG, shape1DArray) && f.expect(pgpg, shape1DArray) != outcomeLoudRefuse {
+			faithfulArr = f
+			break
+		}
+	}
+	if faithfulArr == nil {
+		t.Fatal("no faithful array-capable family found")
+	}
+	c := genColumn{name: "c_faithful", fam: faithfulArr, shp: shape1DArray}
+	r := rand.New(rand.NewSource(2))
+	sawNull := false
+	for i := 0; i < 500 && !sawNull; i++ {
+		if renderCell(r, &c, enginePG) == "NULL" {
+			sawNull = true
+		}
+	}
+	if !sawNull {
+		t.Errorf("faithful array family %q never rendered NULL in 500 draws — fix over-suppressed NULLs", faithfulArr.name)
 	}
 }
 
