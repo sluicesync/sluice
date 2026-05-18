@@ -134,8 +134,22 @@ jobs:
       # struct tag typos, copying mutexes) and runs in seconds.
       - run: go vet ./...
 
-      # Tests with the race detector enabled. -count=1 disables the test
-      # cache so we always get a fresh run.
+      # Tests with the race detector enabled on Linux. -count=1 disables
+      # the test cache so we always get a fresh run.
+      #
+      # -race is Linux-only by design (the flag is gated on the
+      # ubuntu-latest matrix entry; Windows runs the same suite without
+      # it). A data race is a property of the program's OS-independent
+      # synchronization under Go's single cross-platform memory model —
+      # the same unit suite already runs under -race on the ubuntu
+      # entry, and the concurrency-heavy surface (the integration suite)
+      # is Linux-only anyway, so a Windows -race pass of the unit suite
+      # is redundant. It is also unrunnable on the self-hosted Windows
+      # runner (CGO_ENABLED=0, no gcc; -race needs the CGO/TSan runtime).
+      # Linux stays the authoritative -race gate (see CLAUDE.md
+      # "Concurrency chunks"); Windows still contributes compile +
+      # Windows-specific behavior coverage via the un-raced `go test`
+      # here and the build job below.
       #
       # Coverage is scoped to ./internal/... — the directories that
       # actually have test files. cmd/sluice is a `package main` with
@@ -144,8 +158,8 @@ jobs:
       # always present in setup-go's install layout. cmd/sluice still
       # gets compile-checked by `go vet ./...` above and by the build
       # job below, so coverage of zero is the right answer for it.
-      - run: go test -race -count=1 -coverprofile=coverage.out ./internal/...
-      - run: go test -race -count=1 ./cmd/...
+      - run: go test ${{ matrix.os == 'ubuntu-latest' && '-race' || '' }} -count=1 -coverprofile=coverage.out ./internal/...
+      - run: go test ${{ matrix.os == 'ubuntu-latest' && '-race' || '' }} -count=1 ./cmd/...
 
       # Upload coverage from the Linux run only (otherwise we'd get three
       # near-identical artifacts). Useful for inspecting coverage trends.
