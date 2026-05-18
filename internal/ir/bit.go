@@ -3,7 +3,10 @@
 
 package ir
 
-import "fmt"
+import (
+	"fmt"
+	"strconv"
+)
 
 // IR-canonical form for [Bit] (PostgreSQL `bit`/`bit varying`, MySQL
 // `BIT(N)`) values: a string of exactly the column's bit-length made
@@ -53,29 +56,34 @@ func BitBytesToString(src []byte, n int) string {
 	return string(out)
 }
 
-// BitStringToBytesBE parses a canonical '0'/'1' bit string into
-// ceil(len(s)/8) big-endian, right-justified bytes — the shape MySQL's
-// driver accepts for a BIT(N) column. A non-'0'/'1' byte is a contract
-// violation (an upstream decode bug) and surfaces as a loud error
-// rather than a silently wrong value.
-func BitStringToBytesBE(s string) ([]byte, error) {
-	n := len(s)
-	if n == 0 {
-		return []byte{}, nil
+// BitStringToUint64 parses a canonical '0'/'1' bit string (MSB first,
+// ≤64 significant chars) into its unsigned integer value — the form
+// go-sql-driver/mysql binds *reliably* to a MySQL BIT(N) column.
+//
+// Why integer and not the big-endian byte form (catalog Bug 77):
+// binding the ceil(N/8) big-endian []byte (the natural BIT(N) storage
+// layout) is NOT reliable through go-sql-driver. The driver sends a
+// []byte parameter as a binary string and MySQL's string→BIT coercion
+// raises `1264 (22003) Out of range value` for some byte patterns
+// (e.g. a leading 0x2D) even when the value fits in N bits — while
+// other patterns store correctly, so it is loud for some values and
+// fine for others. Binding the integer value round-trips for every
+// width 2..64 (MySQL caps BIT at 64, so does [Bit]) including the
+// high-bit-set and all-ones boundaries. This mirrors what the LOAD
+// DATA writer already does (`CAST(CONV(v,2,10) AS UNSIGNED)`).
+//
+// The empty string is 0 (an empty `bit varying` value). More than 64
+// significant bits is a contract violation ([Bit] caps at 64) and
+// surfaces loudly rather than silently truncating.
+func BitStringToUint64(s string) (uint64, error) {
+	if s == "" {
+		return 0, nil
 	}
-	nbytes := (n + 7) / 8
-	out := make([]byte, nbytes)
-	for i := 0; i < n; i++ {
-		c := s[i]
-		if c != '0' && c != '1' {
-			return nil, fmt.Errorf("ir: malformed bit string %q (byte %q at offset %d is not '0'/'1')", s, c, i)
-		}
-		if c == '1' {
-			bitFromLSB := n - 1 - i
-			out[nbytes-1-bitFromLSB/8] |= 1 << uint(bitFromLSB%8)
-		}
+	v, err := strconv.ParseUint(s, 2, 64)
+	if err != nil {
+		return 0, fmt.Errorf("ir: bit string %q is not a valid ≤64-bit binary value: %w", s, err)
 	}
-	return out, nil
+	return v, nil
 }
 
 // BitStringToBytesPG parses a canonical '0'/'1' bit string into

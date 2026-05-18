@@ -472,17 +472,21 @@ func prepareValue(v any, col *ir.Column) any {
 			}
 		}
 	}
-	// catalog Bug 75: an ir.Bit value is the IR-canonical '0'/'1'
-	// bit-string. MySQL's BIT(N) column accepts ceil(N/8) big-endian,
-	// right-justified bytes (and loud-rejects the digit string with
-	// "Data too long"). Convert here so PG-source / MySQL-source bit
-	// values both land faithfully. A malformed bit string is an
-	// upstream decode bug; we let the engine reject the raw value
-	// rather than silently substituting a wrong one.
+	// catalog Bug 77 (was Bug 75): an ir.Bit value is the IR-canonical
+	// '0'/'1' bit-string. Bind it to MySQL's BIT(N) column as the
+	// unsigned integer value, NOT the ceil(N/8) big-endian []byte: the
+	// byte form is bound by go-sql-driver as a binary string and
+	// MySQL's string→BIT coercion raises 1264/22003 for some byte
+	// patterns even when the value fits N bits (Bug 75's fix passed
+	// review only because its pinned values were all ≤1 byte). The
+	// integer form round-trips for every width 2..64 and matches what
+	// the LOAD DATA writer already does (CONV(v,2,10) AS UNSIGNED). A
+	// malformed bit string is an upstream decode bug; we let the engine
+	// reject the raw value rather than silently substituting a wrong one.
 	if _, isBit := t.(ir.Bit); isBit {
 		if s, ok := v.(string); ok {
-			if b, err := ir.BitStringToBytesBE(s); err == nil {
-				return b
+			if n, err := ir.BitStringToUint64(s); err == nil {
+				return n
 			}
 		}
 	}
