@@ -255,9 +255,12 @@ groups, not in these scripts.
    disk-pressure timer. Confirm it appears Idle in repo Settings →
    Actions → Runners.
 3. `Build-GoldenTemplate.ps1`, then `New-RunnerFromTemplate.ps1` ×4.
-4. Re-activate self-hosted routing: `gh variable set CI_LINUX_RUNNER
-   --repo orware/sluice --body sluice-linux` (the fail-back is
-   currently *deleted* → CI is on GitHub-hosted until you do this).
+4. Re-activate self-hosted routing: set `CI_LINUX_RUNNER` **plus** the
+   two integration-timeout vars (`CI_INTEGRATION_TIMEOUT=75m`,
+   `CI_INTEGRATION_JOB_TIMEOUT=90` — the cross-engine suite needs
+   ~39m on the self-hosted box vs <35m hosted). Full command set +
+   fail-back in `docs/dev/self-hosted-runner.md`. CI falls back to
+   GitHub-hosted whenever these are unset.
 
 See each script's comment-based help (`Get-Help .\New-RunnerVM.ps1
 -Full`) for parameters.

@@ -182,13 +182,30 @@ Settings → Actions → Runners):
 ```bash
 gh variable set CI_LINUX_RUNNER   --repo orware/sluice --body sluice-linux
 gh variable set CI_WINDOWS_RUNNER --repo orware/sluice --body sluice-win
+# Integration is slower on the self-hosted box: the cross-engine +
+# fuzz + CDC -race suite needs ~39m there vs <35m on GitHub-hosted,
+# so the default 35m inner / 45m outer budget times out. Give it a
+# larger envelope (defaults stay 35m/45m when these are unset, so the
+# hosted fail-back keeps fast feedback). INVARIANT: inner < outer.
+gh variable set CI_INTEGRATION_TIMEOUT     --repo orware/sluice --body 75m   # inner (go test -timeout)
+gh variable set CI_INTEGRATION_JOB_TIMEOUT --repo orware/sluice --body 90    # outer (job timeout-minutes)
 ```
+
+Set all four together when activating the self-hosted fleet. The
+two integration-timeout vars are read by `ci.yml`; raising the
+envelope later (suite grows) is a `gh variable set`, no code change.
+Observed: 75m budget, ~39m actual — comfortable ~2x headroom.
 
 **Fail-back (a runner is down / box rebooting / over-quota):**
 
 ```bash
 gh variable delete CI_LINUX_RUNNER   --repo orware/sluice   # → ubuntu-latest
 gh variable delete CI_WINDOWS_RUNNER --repo orware/sluice   # → windows-latest
+# Also clear the integration-timeout vars: they are read regardless of
+# runner, so leaving them at 75m/90m would saddle the hosted fail-back
+# with the slow budget (loses fast feedback / regression sensitivity).
+gh variable delete CI_INTEGRATION_TIMEOUT     --repo orware/sluice  # → 35m default
+gh variable delete CI_INTEGRATION_JOB_TIMEOUT --repo orware/sluice  # → 45 default
 ```
 
 This is the manual fail-over lever — GitHub does **not** auto-fail-over
