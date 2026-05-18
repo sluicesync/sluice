@@ -12,6 +12,8 @@ The name is a real piece of canal infrastructure (sluice gate); it regulates flo
 
 These take precedence over feature throughput. Code that violates them is not done.
 
+**Zero users is the current reality, not a problem to rush past.** sluice has no production users yet. That is *why* correctness and trust gate throughput, not the reverse: there is no install base to be impressed by breadth, but the first real migration that silently corrupts data ends the project's credibility permanently. Every silent-loss class the fuzz/battle-test investment catches is worth more than the next engine or feature. This is the *why* behind "Validate end-to-end before building more" and the loud-failure discipline; when either conflicts with feature velocity, user-trust wins.
+
 **Clean, elegant code.** The codebase should read like a story. Composable interfaces, small surface areas, named concepts over scattered conditionals. When pragmatism requires a wart, the wart gets a name, a test, and a comment that explains why it exists. This is non-negotiable.
 
 **IR-first.** All translation passes through the typed IR in `internal/ir`. Source-specific knowledge lives in readers; target-specific knowledge lives in writers; the IR is the only shared contract. No regex over DDL strings, no engine-specific imports leaking into the orchestrator.
@@ -38,7 +40,7 @@ Required to be clean before commit: `gofumpt -l .`, `go vet ./...`, `golangci-li
 
 Integration tests need Docker and the `integration` build tag: `go test -tags=integration ./internal/...`. They take a few minutes (testcontainers boots real MySQL and Postgres). Run them after non-trivial changes to readers/writers/orchestrator.
 
-**Build-tagged files don't compile under bare `go build ./...`.** When changing a package-level symbol's type or signature, also run `go build -tags=integration ./...` (and any other relevant tags like `psverify`) before pushing — otherwise the integration build only fails in CI. This has bitten releases when an `internal/pipeline` symbol got migrated and the integration-tagged tests in the same package missed the rename.
+**Build-tagged files don't compile under bare `go build ./...`.** When changing a package-level symbol's type or signature, before pushing also type-check the build-tagged files — including tagged *test* files. `go build -tags=integration ./...` is **insufficient**: `go build` skips `_test.go`, so a rename that an integration-tagged test still references compiles clean locally and only fails in CI. Use `go vet -tags=integration ./...` (and any other relevant tags like `psverify`) — or `go test -tags=integration -run NoMatch ./...` — which type-check the test files without running them. This has bitten releases when an `internal/pipeline` symbol got migrated and the integration-tagged tests missed the rename; trusting `go build -tags=integration` here cost the v0.58.1 retag.
 
 On Windows with Rancher Desktop, two things bite: `docker.exe` lives at `C:\Program Files\Rancher Desktop\resources\resources\win32\bin\` (often missing from `PATH`), and you need `TESTCONTAINERS_RYUK_DISABLED=true` because the ryuk reaper container vanishes immediately under Rancher's daemon. Without that env var the test loops through ~10 retries and fails with `No such container: ...`. See `docs/dev/development.md` for details. CI on Linux is unaffected.
 
