@@ -194,7 +194,15 @@ jobs:
     # 25m inner go-test timeout by v0.67.1; bumped to 45m outer / 35m
     # inner for durable headroom (kept go-test-timeout < timeout-minutes
     # so Go's diagnostic timeout-panic fires before any hard job kill).
-    timeout-minutes: 45
+    #
+    # Both budgets are variable-driven: GitHub-hosted keeps the tuned
+    # 45/35 (fast feedback; surfaces real perf regressions), while a
+    # slower self-hosted runner can be given a larger envelope WITHOUT
+    # a code change by setting CI_INTEGRATION_JOB_TIMEOUT (outer, minutes)
+    # and CI_INTEGRATION_TIMEOUT (inner, go-test duration). INVARIANT:
+    # inner < outer (keep the diagnostic-panic-before-hard-kill margin)
+    # — when raising for self-hosted, set them together (e.g. 90 / 75m).
+    timeout-minutes: ${{ fromJSON(vars.CI_INTEGRATION_JOB_TIMEOUT || '45') }}
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-go@v6
@@ -240,10 +248,15 @@ jobs:
       # tests tipped it over — a stale budget vs an organically grown
       # suite, NOT a logic regression (Phase A: `panic: test timed out
       # after 25m0s`, no FAIL/DATA RACE). Bumped to 35m for durable
-      # headroom; the job's 45m timeout-minutes caps the outer envelope
+      # headroom; the job's timeout-minutes caps the outer envelope
       # (kept inner < outer so Go's diagnostic timeout-panic fires
-      # before any hard job kill).
-      - run: go test -tags=integration -race -count=1 -timeout=35m ./internal/...
+      # before any hard job kill). v0.x self-hosted: the 4-vCPU runner
+      # under -race does not finish the cross-engine + fuzz + CDC suite
+      # in 35m (Phase A: `panic: test timed out after 35m0s`, still
+      # progressing — slower box, NOT a logic regression). Inner budget
+      # is CI_INTEGRATION_TIMEOUT (default 35m); raise it with the outer
+      # CI_INTEGRATION_JOB_TIMEOUT for self-hosted (invariant above).
+      - run: go test -tags=integration -race -count=1 -timeout=${{ vars.CI_INTEGRATION_TIMEOUT || '35m' }} ./internal/...
 
   # ----- Integration: PostGIS -----
   # Split out as a separate parallel job in v0.29.0 (was in-line as a
