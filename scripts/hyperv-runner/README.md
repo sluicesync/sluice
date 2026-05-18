@@ -58,6 +58,81 @@ dominates), unattended.
 The golden VHDX is the durable artifact: rebuild the whole fleet from
 it in minutes after any host event, no re-download, no re-provision.
 
+## Golden seal — the manual one-shot (step 1 detail)
+
+`Build-GoldenTemplate.ps1` boots a transient build VM
+(`sluice-golden-build`) and then **stops, printing these steps**: the
+seal is deliberately by-hand (single-shot, hard to verify headless).
+Do it once; thereafter the fleet is one command each.
+
+1. **Wait for provisioning, then find the VM's IP** (first boot runs
+   apt + docker install + pre-stages the runner tarball — allow
+   ~5–10 min before an IP/`cloud-init done` appears):
+
+   ```powershell
+   (Get-VMNetworkAdapter -VMName sluice-golden-build).IPAddresses
+   ```
+
+2. **SSH in as the admin user** (the key you passed
+   `-AdminSshKeyPath`; default user `runner`) and seal:
+
+   ```bash
+   ssh -i ~/.ssh/id_ed25519 runner@<VM-IP>
+   sudo cloud-init status --wait        # MUST report: status: done
+   sudo docker system prune -af --volumes
+   sudo cloud-init clean --logs --seed  # next boot re-runs per-instance
+   sudo rm -f /var/log/golden-provision-complete /var/log/runner-provision-complete
+   sudo shutdown -h now
+   ```
+
+   The golden writes `/var/log/golden-provision-complete` (not
+   `runner-`); removing both covers the script's printed line and the
+   real marker. `rm -f` on a missing path is a harmless no-op.
+
+3. **Finalize the VHDX on the host** (after it powers off):
+
+   ```powershell
+   Stop-VM sluice-golden-build -TurnOff -ErrorAction SilentlyContinue
+   Optimize-VHD -Path 'C:\code\sluice\scripts\hyperv-runner\.work\sluice-golden-build-os.vhdx' -Mode Full
+   New-Item -ItemType Directory -Force -Path (Split-Path 'C:\HyperV\golden\sluice-runner-golden.vhdx') | Out-Null
+   Copy-Item 'C:\code\sluice\scripts\hyperv-runner\.work\sluice-golden-build-os.vhdx' 'C:\HyperV\golden\sluice-runner-golden.vhdx' -Force
+   Remove-VM sluice-golden-build -Force
+   ```
+
+   `Optimize-VHD` needs the VHDX detached (the `Remove-VM` is last on
+   purpose; `Stop-VM -TurnOff` first guarantees it's not running).
+   Result: `C:\HyperV\golden\sluice-runner-golden.vhdx`.
+
+## Using the golden on another host
+
+The golden VHDX is fully portable; `New-RunnerFromTemplate.ps1` is the
+lean path (pure `Copy-Item` + `Resize-VHD` — **no `qemu-img`, no image
+download**). The scripts are **local-only** (no `-ComputerName`/CIM
+plumbing), so run them *on* each Hyper-V host, not remotely:
+
+1. Copy `C:\HyperV\golden\sluice-runner-golden.vhdx` to the other
+   Windows machine (any path, e.g. its own `C:\HyperV\golden\`).
+2. On that machine, ensure: **Hyper-V** feature + an external vSwitch,
+   an **elevated** shell, and **`gh` authed to `orware/sluice`** (mints
+   the per-VM registration token). `qemu-img` is **not** needed there.
+3. From a checkout of this repo on that machine:
+
+   ```powershell
+   1..3 | % { .\New-RunnerFromTemplate.ps1 `
+       -GoldenVhdx C:\HyperV\golden\sluice-runner-golden.vhdx `
+       -Name ("runner-{0:00}" -f $_) `
+       -AdminSshPublicKey (gc ~/.ssh/id_ed25519.pub) `
+       -DiskGB 200 }
+   ```
+
+4. Confirm each shows **Idle** in repo Settings → Actions → Runners.
+   Runner names must be unique *across all hosts* (e.g. host A
+   `runner-01..03`, host B `runner-11..13`).
+
+Truly remote orchestration (one command provisioning onto a remote
+host's Hyper-V) would require adding `-ComputerName`/CIM-session +
+remote path handling to the scripts — not built yet.
+
 ## Prerequisites (on the runner host, once)
 
 - Windows Pro/Enterprise with the **Hyper-V** feature + module, run
