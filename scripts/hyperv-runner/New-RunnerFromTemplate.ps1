@@ -29,6 +29,12 @@ param(
     [string] $AdminUser    = 'runner',
     [Parameter(ParameterSetName = 'Repo')] [string] $Repo = 'orware/sluice',
     [Parameter(ParameterSetName = 'Org', Mandatory)] [string] $Org,
+    # Pre-minted GitHub registration token. When set, `gh` is NOT
+    # invoked — mint it on a gh-authed box and pass it here so a
+    # secondary Hyper-V host (e.g. provisioned over RDP) needs no gh.
+    # Must match the chosen scope (a repo token for -Repo, an org
+    # token for -Org); ~1h TTL, so mint just before the batch.
+    [string] $RegistrationToken,
     [string] $RunnerLabels = 'sluice-linux',
     [int]    $DiskGB       = 0,            # 0 = keep golden size
     [int]    $CpuCount     = 4,
@@ -49,12 +55,17 @@ if ($PSCmdlet.ShouldProcess($osVhdx, "Copy golden VHDX -> per-VM disk")) {
 
 if ($PSCmdlet.ParameterSetName -eq 'Org') {
     $registerUrl = "https://github.com/$Org"
-    $token       = New-RunnerToken -Org $Org
-    Write-Host "Registration scope: org '$Org' (runner usable across the org's repos)"
+    $scopeMsg    = "org '$Org' (runner usable across the org's repos)"
 } else {
     $registerUrl = "https://github.com/$Repo"
-    $token       = New-RunnerToken -Repo $Repo
-    Write-Host "Registration scope: repo '$Repo'"
+    $scopeMsg    = "repo '$Repo'"
+}
+if ($RegistrationToken) {
+    $token = $RegistrationToken.Trim()
+    Write-Host "Registration scope: $scopeMsg (pre-minted token; gh not used)"
+} else {
+    $token = if ($PSCmdlet.ParameterSetName -eq 'Org') { New-RunnerToken -Org $Org } else { New-RunnerToken -Repo $Repo }
+    Write-Host "Registration scope: $scopeMsg"
 }
 $userData = Expand-Template -TemplatePath "$PSScriptRoot\cloud-init\user-data-clone.template" -Values @{
     HOSTNAME      = $Name

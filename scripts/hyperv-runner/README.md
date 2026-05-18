@@ -121,30 +121,68 @@ Do it once; thereafter the fleet is one command each.
 The golden VHDX is fully portable; `New-RunnerFromTemplate.ps1` is the
 lean path (pure `Copy-Item` + `Resize-VHD` — **no `qemu-img`, no image
 download**). The scripts are **local-only** (no `-ComputerName`/CIM
-plumbing), so run them *on* each Hyper-V host, not remotely:
+plumbing), so run them *on* each Hyper-V host. If the secondary host
+has WinRM you can drive that over PSRemoting; if it only has RDP open
+(common — WinRM/SMB off by default), use the **RDP + pre-minted
+token** flow below, which needs **no `gh` on the secondary host**.
 
-1. Copy `C:\HyperV\golden\sluice-runner-golden.vhdx` to the other
-   Windows machine (any path, e.g. its own `C:\HyperV\golden\`).
-2. On that machine, ensure: **Hyper-V** feature + an external vSwitch,
-   an **elevated** shell, and **`gh` authed to `orware/sluice`** (mints
-   the per-VM registration token). `qemu-img` is **not** needed there.
-3. From a checkout of this repo on that machine:
+### RDP flow (secondary host has no WinRM/`gh`) — tested for AURORA-R11
+
+On the **primary** machine (this one — `gh` is authed here):
+
+1. Confirm the sealed golden exists:
+   `Test-Path C:\HyperV\golden\sluice-runner-golden.vhdx` (≈5–6 GB).
+2. Mint a registration token (≈1 h TTL — do this right before the
+   batch). Repo scope:
 
    ```powershell
-   1..3 | % { .\New-RunnerFromTemplate.ps1 `
-       -GoldenVhdx C:\HyperV\golden\sluice-runner-golden.vhdx `
-       -Name ("runner-{0:00}" -f $_) `
-       -AdminSshPublicKey (gc ~/.ssh/id_ed25519.pub) `
-       -DiskGB 200 }
+   $tok = gh api -X POST repos/orware/sluice/actions/runners/registration-token --jq .token
+   ```
+   Org scope instead (after `gh auth refresh -h github.com -s admin:org`):
+   `$tok = gh api -X POST orgs/orware-code/actions/runners/registration-token --jq .token`
+3. RDP to the secondary host **with local drive redirection on** so it
+   can read this machine's disks as `\\tsclient\C`:
+
+   ```powershell
+   mstsc /v:192.168.4.91 /drive:C       # or enable Local Resources ▸ Drives in the RDP UI
    ```
 
-4. Confirm each shows **Idle** in repo Settings → Actions → Runners.
-   Runner names must be unique *across all hosts* (e.g. host A
-   `runner-01..03`, host B `runner-11..13`).
+On the **secondary** host (inside the RDP session, elevated PowerShell):
 
-Truly remote orchestration (one command provisioning onto a remote
-host's Hyper-V) would require adding `-ComputerName`/CIM-session +
-remote path handling to the scripts — not built yet.
+4. Prereqs there: **Hyper-V** feature + an external/`Default Switch`
+   vSwitch. `gh`/`qemu-img` **not** needed.
+5. Pull the golden + the `scripts/hyperv-runner` folder across the RDP
+   channel (5–6 GB over `\\tsclient` is slow but unattended-ok; a LAN
+   SMB share or USB is faster if available):
+
+   ```powershell
+   New-Item -ItemType Directory -Force C:\HyperV\golden, C:\sluice-hv | Out-Null
+   Copy-Item \\tsclient\C\HyperV\golden\sluice-runner-golden.vhdx C:\HyperV\golden\ -Force
+   Copy-Item \\tsclient\C\code\sluice\scripts\hyperv-runner\* C:\sluice-hv\ -Recurse -Force
+   ```
+6. Provision, passing the token from step 2 (paste its value — it is
+   NOT redirected automatically). Names must be **globally unique
+   across hosts** (this host uses the `11x` block):
+
+   ```powershell
+   cd C:\sluice-hv
+   1..3 | % { .\New-RunnerFromTemplate.ps1 `
+       -GoldenVhdx C:\HyperV\golden\sluice-runner-golden.vhdx `
+       -Name ("runner-1{0}" -f $_) `
+       -RegistrationToken '<paste $tok value>' `
+       -AdminSshPublicKey (gc \\tsclient\C\Users\orwar\.ssh\id_ed25519.pub) `
+       -DiskGB 200 }
+   ```
+   Add `-Org orware-code` if you minted an org token (token scope and
+   `-Repo`/`-Org` must match). `-RegistrationToken` makes the script
+   skip `gh` entirely.
+7. Confirm each shows **Idle** in repo (or org) Settings → Actions →
+   Runners.
+
+Truly remote orchestration (one command from the primary that
+provisions onto the secondary's Hyper-V) would still want
+`-ComputerName`/CIM plumbing over WinRM — not built; the RDP flow is
+the zero-WinRM substitute.
 
 ## Org-scoped runners (share across all org repos)
 
