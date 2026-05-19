@@ -2,7 +2,51 @@
 
 ## Status
 
-Proposed. Implementation gated on operator review of this design (target: v0.40.x or v0.41.0).
+**Accepted (2026-05-18) — design reviewed and signed off by the owner;
+implementation pending.** The design below is complete and adopted
+as-written, with the four operator-review pin-downs in the next
+section. Not demand-gated and no upstream hard-sequencing dependency
+(see pin-down 2) → implement-ready, modulo owner prioritization
+(target remains a v0.40.x/v0.41.0-class cut). Originating bug:
+GitHub #13.
+
+## Operator-review sign-off (2026-05-18)
+
+The design was reviewed for sign-off (not a multi-round open-question
+dialogue — the ADR was already fully specified). Adopted as-written
+with these four pin-downs, owner-accepted:
+
+1. **`RetriableError` interface lives in `internal/ir`** (resolves the
+   "in `internal/ir` or `internal/pipeline`" ambiguity in the
+   Decision / step 1). Rationale: it is the engine-neutral contract
+   home alongside `Change`/`Position`; engines and pipeline both
+   already import `ir`; the per-engine classifiers stay engine-local
+   and only the interface is shared.
+2. **Risk posture blessed — no hard-sequencing behind GitHub #14.**
+   Retry safety rests entirely on ADR-0010 idempotency; the
+   ambiguous-commit path (target tx committed, ack lost →
+   connection-lost retriable → batch replays) leans on it hardest.
+   The design fences this correctly: the one *suspected* idempotency
+   gap (#14, a duplicate-PK shape) is kept in the **non-retriable**
+   set (`1062`/`23505`) so it surfaces loudly, never masked/amplified.
+   The ambiguous-commit replay path is covered by ADR-0010 (PK-keyed
+   UPSERT / tolerated zero-rows update+delete) + ADR-0007 (atomic
+   position+data). Therefore ADR-0038 is **not** gated on #14 being
+   resolved first (contrast the ADR-0049→0050 hard-sequencing); the
+   suspected gap is fenced in the non-retriable classification.
+3. **Defaults blessed as-written:** 8 attempts, 100ms base → 30s cap
+   (~4 min worst case). Accepted as the right default for the managed
+   Vitess / managed-PG envelope; operators override via
+   `--apply-retry-attempts` (1–64) when a slow Patroni failover under
+   throttler load needs a longer envelope. No change to the table.
+4. **Vitess `Error 1105` substring classification accepted as the
+   pragmatic choice** (Vitess wraps all transients in `1105 (HY000)`
+   with a free-text payload — no structured code exists to match on).
+   Mandatory mitigation: a unit test that **pins the exact matched
+   substrings** (`vttablet` / `code = Aborted` / `code = Unknown` /
+   `code = Unavailable` / `code = ResourceExhausted`) plus an inline
+   comment + this ADR ref so a future Vitess wording change is caught
+   by a failing test, not a silently-non-retried production error.
 
 ## Context
 
