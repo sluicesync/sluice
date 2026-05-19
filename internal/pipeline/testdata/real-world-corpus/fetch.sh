@@ -45,6 +45,15 @@ strip_data() { # infile outfile
     /^[[:space:]]*COPY[[:space:]].*FROM[[:space:]]+stdin;/ { incopy=1; next }
     incopy && /^\\\.[[:space:]]*$/ { incopy=0; next }
     incopy { next }
+    # Chinook PG is a psql script: drop psql backslash meta-commands
+    # (\connect, \encoding, \set, ...) — db.ExecContext is not psql and
+    # errors "syntax error at or near \". Reached only OUTSIDE a COPY
+    # block (incopy handled above), so the COPY terminator is safe.
+    /^[[:space:]]*\\/ { next }
+    # Drop DB-management statements: tests connect to their own
+    # container DB; CREATE/DROP DATABASE is not schema and cannot run
+    # via ExecContext against a fixed DB (single-line in this corpus).
+    /^[[:space:]]*(DROP|CREATE)[[:space:]]+DATABASE[[:space:]]/ { next }
     { print }
   ' "$1" > "$2"
   if ! grep -qiE 'CREATE TABLE' "$2"; then

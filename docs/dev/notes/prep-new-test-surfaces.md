@@ -323,5 +323,13 @@ script + small committed fixtures, not vendored dumps.
   a build-tagged harness reads each via sluice's schema reader and
   records refuse/translate outcomes (extends Idea 1's pattern).
 
-Status: collection + iteration-1 testing started 2026-05-18 ahead of
-the implement-ready ADR backlog, at operator direction.
+Status: **Iteration 1 COMPLETE (2026-05-19) — loop proven, zero
+sluice defects.** Chinook (matched MySQL/PG) MySQL→PG + PG→MySQL
+DryRun green; GitLab `structure.sql` (1444-table real PG) correctly
+loud-refused `tsvector` (loud-failure tenet working as designed). Two
+`fetch.sh` strip fixes (multi-line INSERT; psql-meta + DB-stmt).
+Running findings log: [`real-world-corpus-findings.md`](real-world-corpus-findings.md).
+Harness: `internal/pipeline/migrate_realworld_corpus_integration_test.go`
+(build-tagged; SKIPs when corpus unfetched). Iteration 2 (MediaWiki
+abstract schema / pgloader / WordPress + the deeper matched-pair
+congruence oracle) pending — task #13.
