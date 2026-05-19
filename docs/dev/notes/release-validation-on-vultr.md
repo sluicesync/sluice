@@ -1,18 +1,24 @@
 # Release validation (local Hyper-V validation VM; Vultr retired)
 
-> **HOST MIGRATION (2026-05-19): the paid always-on Vultr box
-> (`sluice-test-lax-1`) is being RETIRED.** It was idle + its clone
-> stale (v0.32.2-era) — not used regularly — and now that local
-> Hyper-V Ubuntu provisioning + a runner fleet exist, the same
-> activity runs on a **local runner-less validation VM** at zero
-> recurring cost. The runbook commands (the `go test` block) are
+> **HOST MIGRATION COMPLETE (2026-05-19): the paid always-on Vultr
+> box (`sluice-test-lax-1`, ID `70087136-…`, `45.76.70.68`) is
+> DECOMMISSIONED — instance deleted, verified 0 instances on the
+> account.** It was idle + its clone stale (v0.32.2-era); with local
+> Hyper-V Ubuntu provisioning + a runner fleet in place, the same
+> activity now runs on a **local runner-less validation VM** at zero
+> recurring cost. Parity was proven before decommission (the
+> validate-before-decommission tenet): all three suites green on the
+> local VM — SUITE1 integration `-race` @ `-timeout=75m` (RC=0,
+> 39:30; the `-timeout=30m` here was a stale under-budget — see the
+> SUITE1 comment below), SUITE2 postgis, and **SUITE3 `integration
+> vstream`** (the CI-skipped Vitess coverage that is this box's whole
+> reason to exist). The runbook commands (the `go test` block) are
 > host-agnostic and unchanged; only provisioning + source-sync + IP
-> discovery differ. The Vultr-specific provisioning text is retained
-> below as historical reference until the box is decommissioned.
-> Filename kept (`release-validation-on-vultr.md`) to avoid breaking
-> the roadmap §10 / `prep-continuous-validation-on-vultr.md` / memory
-> references; treat "the validation box" as the local VM going
-> forward.
+> discovery differ. The Vultr-specific provisioning text below is now
+> purely historical (the box no longer exists). Filename kept
+> (`release-validation-on-vultr.md`) to avoid breaking roadmap §10 /
+> `prep-continuous-validation-on-vultr.md` / memory references; "the
+> validation box" means the local VM.
 
 ## Local Hyper-V validation VM (canonical host)
 
