@@ -2,8 +2,22 @@
 
 ## Status
 
-**Accepted (2026-05-16).** Design signed off; implementation pending,
-shipping as **v0.66.0**. Closes the recurring "identifier references
+**Accepted (2026-05-16); implemented and shipped in v0.66.0**
+(commit `2cce888` — `feat(translate): ADR-0045
+expression-identifier-translation consolidation`), battle-test-
+hardened by Bug #8 / v0.68.1. (Status reconciled 2026-05-19: the
+prior "implementation pending" wording was stale — verified
+against code, not the doc: the shared `internal/translate/exprident`
+package exists with the moved primitives + `RequoteIdentifiers`;
+the per-engine `requote{MySQL,PG}ReservedIdents` are thin wrappers
+over it; both Bug 64 cells emit `requote(translate(expr))` (PG
+`ddl_emit.go:355`, MySQL `:458`); D2's `translateIndexExpr`
+cross-dialect arm is `requoteMySQLReservedIdents(translateExprForMySQL)`
+with the locked-D2 comment; D3's Bug 65 PG expression-index carry is
+in `populateIndexes` (`schema_reader.go` `END AS expr` + the
+`ExpressionDialect` carry, no silent `continue`-drop); the mandated
+unified-`RequoteIdentifiers` table test and the 4×2×2 reserved-word
+integration sweep both exist.) Closes the recurring "identifier references
 inside opaque dialect-tagged expression strings" defect class (4
 confirmed members: v0.65.0 #5, Bug 61, Bug 63, Bug 64) plus the
 orthogonal Bug 65 (PG-reader expression-index silent drop). Sign-off
