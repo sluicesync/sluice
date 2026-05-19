@@ -57,6 +57,25 @@ bundled curl is `C:\Program Files\Rancher Desktop\resources\resources\win32\bin\
 | **Joomla** `installation/sql/postgresql/base.sql` | PostgreSQL | `https://raw.githubusercontent.com/joomla/joomla-cms/5.4-dev/installation/sql/postgresql/base.sql` | same (GPL-2.0) | ~28 tables. Same logical schema as the MySQL file → a **real-CMS matched cross-engine pair** (independently authored per dialect, like Chinook; not generated-from-one-source like MediaWiki). |
 | **WordPress** core schema | MySQL | `https://raw.githubusercontent.com/WordPress/wordpress-develop/trunk/src/wp-admin/includes/schema.php` | **GPL-2.0-or-later** (`WordPress/wordpress-develop`) — see LICENSE SAFETY note; gitignored / not vendored | ~19 tables. Lives in PHP (`wp_get_db_schema()`); `fetch.sh` `extract_wp_schema` pulls the `CREATE TABLE` blocks and substitutes the PHP placeholders (`$wpdb->NAME`→`wp_NAME`, `$max_index_length`→191, `) $charset_collate;`→`);`) to plain MySQL DDL. The canonical operator-brought MySQL shape. |
 
+## Iteration 4 corpora
+
+| Corpus | Engine(s) | Source | License | Notes |
+|---|---|---|---|---|
+| **Vitess** `examples/local/create_commerce_schema.sql` | MySQL | `https://raw.githubusercontent.com/vitessio/vitess/main/examples/local/create_commerce_schema.sql` | **Apache-2.0** (`vitessio/vitess` LICENSE) — permissive; nonetheless gitignored / fetch-on-demand for corpus consistency (see LICENSE SAFETY note; not vendored) | Vitess's own canonical example keyspace (`commerce`). Characterizes Vitess DDL idioms through sluice's MySQL reader: **no foreign keys** (Vitess discourages cross-shard FKs), small no-partition tables, the reference/sequence-table pattern. Schema-only upstream; run through `strip_data` as a discipline/no-op safety pass. **Runtime Vitess/PlanetScale behaviour (resharding, tx-killer, online DDL) is explicitly OUT OF SCOPE here** — routed to Track-1b per `docs/dev/notes/vitess-local-vs-planetscale-equivalence.md`. This corpus member is the static-DDL-idiom slice only. |
+
+> **Iteration 4 also adds two non-corpus legs** (no new fetched file):
+> (1) a **Capabilities-delta** leg — an existing fetched MySQL corpus
+> member (WordPress) read+planned with the source engine resolved to
+> the **`planetscale`** flavor registration (`engines.Get("planetscale")`,
+> `Flavor.String()=="planetscale"`, `internal/engines/mysql/flavor.go`)
+> instead of vanilla `mysql`, exercising the PlanetScale `Capabilities`
+> declaration (no `LOAD DATA INFILE`, no `PARTITION BY`, no spatial) in
+> the read+plan path; (2) a matched-pair **congruence oracle** (the
+> iteration-4 headline) that emits sluice's translation for real and
+> diffs it against the expert-authored other-engine side — see
+> `migrate_realworld_corpus_congruence_integration_test.go` and the
+> findings doc.
+
 ### Evaluated, deliberately NOT fetched (do not "fix" — wrong shape)
 
 - **pgloader** (`dimitri/pgloader`) — its test corpus is `.load`
@@ -72,8 +91,10 @@ bundled curl is `C:\Program Files\Rancher Desktop\resources\resources\win32\bin\
   a murky community dump wouldn't meet this corpus's provenance bar.
   Deferred unless a clean raw artifact surfaces.
 
-Iteration 4+ (Vitess/PlanetScale samples; the deeper matched-pair
-*congruence* oracle) will append here — see the prep doc + findings.
+Iteration 4 (Vitess sample + PlanetScale-flavor Capabilities-delta +
+the deeper matched-pair *congruence* oracle) is recorded above and in
+`docs/dev/notes/real-world-corpus-findings.md` § "Iteration 4". Later
+iterations append here.
 
 ## Usage
 

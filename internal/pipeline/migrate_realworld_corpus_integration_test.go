@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"github.com/orware/sluice/internal/engines"
+	"github.com/orware/sluice/internal/ir"
 
 	_ "github.com/orware/sluice/internal/engines/mysql"
 	_ "github.com/orware/sluice/internal/engines/postgres"
@@ -116,7 +117,8 @@ func corpusRawPGTableCount(t *testing.T, dsn string) int {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	var n int
-	if err := db.QueryRowContext(ctx,
+	if err := db.QueryRowContext(
+		ctx,
 		"SELECT count(*) FROM information_schema.tables WHERE table_schema='public' AND table_type='BASE TABLE'",
 	).Scan(&n); err != nil {
 		t.Fatalf("raw table count: %v", err)
@@ -407,6 +409,88 @@ func TestCorpus_WordPress_MySQLToPG_DryRun(t *testing.T) {
 		t.Fatalf("WordPress MySQL→PG DryRun: schema read/plan failed: %v", truncErr(err))
 	}
 	t.Log("WordPress MySQL→PG DryRun: canonical WP core schema read + cross-engine plan OK")
+}
+
+// --- Iteration 4 (Option-A Vitess/PlanetScale slice; DryRun only) ---
+
+// Capabilities-delta leg: take an EXISTING fetched MySQL corpus member
+// (WordPress — already in MANIFEST/fetch.sh, the canonical operator-
+// brought MySQL shape) and run a cross-engine DryRun plan with the
+// SOURCE engine resolved to the **planetscale** flavor registration
+// (engines.Get("planetscale"); Flavor.String()=="planetscale",
+// internal/engines/mysql/flavor.go) instead of vanilla "mysql". Same
+// engine code, different ir.Capabilities (no LOAD DATA INFILE, no
+// PARTITION BY, no spatial types, CDC=VStream). This exercises the
+// Capabilities-declaration delta in the read+plan path on a real
+// schema, cheaply and with no live PlanetScale (Track-1b owns runtime
+// Vitess/PS behaviour per vitess-local-vs-planetscale-equivalence.md).
+//
+// WordPress's real schema needs WP's permissive sql_mode for the
+// `datetime DEFAULT '0000-00-00 00:00:00'` columns (same as the
+// vanilla WordPress leg) — load AS-IS, don't rewrite.
+func TestCorpus_WordPress_PlanetScaleFlavor_MySQLToPG_DryRun(t *testing.T) {
+	ddl := readCorpus(t, "wordpress_mysql.ddl.sql")
+	src, _, cleanup := startMySQL(t)
+	defer cleanup()
+	_, tgt, pgCleanup := startPostgres(t)
+	defer pgCleanup()
+
+	applyMySQLDDL(t, src, "SET SESSION sql_mode='NO_ENGINE_SUBSTITUTION';\n\n"+ddl)
+	corpusAssertTables(t, "mysql", src, 12) // WP core single-site ≈ 19 tables
+
+	psEng, ok := engines.Get("planetscale")
+	if !ok {
+		t.Fatal("planetscale engine not registered (internal/engines/mysql init)")
+	}
+	if psEng.Name() != "planetscale" {
+		t.Fatalf("resolved engine name = %q; want \"planetscale\" (Capabilities-delta leg "+
+			"must use the PlanetScale flavor registration, not vanilla mysql)", psEng.Name())
+	}
+	// Sanity: the PlanetScale Capabilities declaration must actually
+	// differ from vanilla — otherwise this leg isn't exercising the
+	// delta it claims to. Asserting the documented divergence keeps the
+	// leg honest (and would FAIL loudly if flavor.go's caps regressed).
+	if psEng.Capabilities().SupportsPartitioning {
+		t.Error("planetscale Capabilities.SupportsPartitioning = true; want false (Vitess sharding, not PARTITION BY)")
+	}
+	if psEng.Capabilities().BulkLoad == ir.BulkLoadLoadDataInfile {
+		t.Error("planetscale Capabilities.BulkLoad = LoadDataInfile; want BatchedInsert (no LOAD DATA INFILE on PS)")
+	}
+
+	pgEng, _ := engines.Get("postgres")
+	mig := &Migrator{Source: psEng, Target: pgEng, SourceDSN: src, TargetDSN: tgt, DryRun: true}
+	if err := mig.Run(ctx2min(t)); err != nil {
+		t.Fatalf("WordPress (PlanetScale-flavor source) MySQL→PG DryRun: read/plan failed: %v", truncErr(err))
+	}
+	t.Log("WordPress via PlanetScale-flavor source: read + cross-engine plan OK " +
+		"(Capabilities-delta path: BatchedInsert / no-partition / VStream CDC declared)")
+}
+
+// Vitess example-schema leg: the new iteration-4 corpus member
+// (vitessio/vitess examples/local commerce keyspace, Apache-2.0).
+// Characterizes Vitess DDL idioms — no FKs, small reference/sequence
+// tables — through sluice's MySQL reader + a MySQL→PG DryRun plan.
+// Non-vacuous (>=2 tables: the commerce keyspace defines several).
+// A loud refusal is acceptable-and-characterized; a crash is a finding.
+func TestCorpus_Vitess_Commerce_MySQLToPG_DryRun(t *testing.T) {
+	ddl := readCorpus(t, "vitess_commerce_mysql.ddl.sql")
+	src, _, cleanup := startMySQL(t)
+	defer cleanup()
+	_, tgt, pgCleanup := startPostgres(t)
+	defer pgCleanup()
+
+	applyMySQLDDL(t, src, ddl)
+	corpusAssertTables(t, "mysql", src, 2) // commerce keyspace ≈ product/customer/corder
+
+	myEng, _ := engines.Get("mysql")
+	pgEng, _ := engines.Get("postgres")
+	mig := &Migrator{Source: myEng, Target: pgEng, SourceDSN: src, TargetDSN: tgt, DryRun: true}
+	if err := mig.Run(ctx2min(t)); err != nil {
+		t.Logf("Vitess commerce MySQL→PG DryRun: refused/failed (characterize) — %v", truncErr(err))
+		return
+	}
+	t.Log("Vitess commerce MySQL→PG DryRun: Vitess example-schema idioms " +
+		"(no-FK, reference/sequence tables) read + cross-engine plan OK")
 }
 
 func truncErr(err error) string {
