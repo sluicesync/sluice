@@ -105,7 +105,61 @@ test-input-only — sluice never distributes them. A
 `fetch.sh`. Redistribution (bundling/committing) would be a different
 analysis (only MIT/Chinook-permissive eligible) — not done.
 
-## Iteration 3 (pending — task #13 continuation)
+## Iteration 3 (2026-05-19) — GitLab PG→PG: FINDING (core range-type gap)
+
+**The highest-value corpus finding so far — a genuine product gap,
+surfaced on a real production schema.**
+
+Added a GitLab **PG→PG** DryRun leg (complement of the cross-engine
+leg). On the *same* real schema the two directions are correctly
+asymmetric for `tsvector` (cross-engine loud-refuse = right; same-
+engine verbatim-carry = right) — but PG→PG fails *earlier*, on
+**`int8range`** (`ci_partitions.builds_id_range`):
+
+```
+pipeline: read source schema: postgres: read columns:
+table "ci_partitions" column "builds_id_range":
+postgres: unsupported data_type "int8range" (udt "int8range")
+```
+
+**Root cause (code-confirmed, `internal/engines/postgres/types.go`):**
+`tsvector`/`tsquery` got an explicit same-engine verbatim-carry
+branch (catalog **Bug 17**, types.go:379 — `if c.VerbatimEligible →
+ir.VerbatimType`). That carve-out was made **type-by-type for the
+*representative*, not generalized to the *class*** of core PG types
+(`pg_catalog`, no rich cross-engine IR shape). So same-engine PG→PG
+**loud-refuses core RANGE types** (`int4range/int8range/numrange/
+tsrange/tstzrange/daterange`) at the generic fallthrough (types.go
+~392) — *exactly the gap `tsvector` had pre-Bug-17*. This is the
+project's own "pin the class, not the representative" lesson, at the
+product level, found on real data.
+
+**Scope (Phase-A, GitLab `structure.sql`):** 5 range-type columns —
+2×`int8range`, 2×`daterange`, 1×`tstzrange`; one carries an
+`EXCLUDE USING gist (... WITH &&)` constraint (an adjacent core-PG
+feature that would also need same-engine carry, downstream of the
+type refusal). No `xml`/`money`/`pg_lsn`/`interval` in this schema —
+the surfaced class is **core range types** (others may exist in
+other corpora — characterize as found).
+
+**Severity:** loud refusal → **loud-failure tenet holds, no
+corruption / no silent loss.** But it **blocks PG→PG sync of any
+schema using range types** — common in partition bounds, scheduling,
+analytics (GitLab, Rails, Django). A real fidelity/UX gap, *not* an
+emergency, *not* a fix-mid-testing item (the fix is a design
+decision: which core types, the same-vs-cross-engine boundary,
+interaction with ADR-0047's *USER-DEFINED*-only verbatim tier — range
+types are core, not USER-DEFINED, so ADR-0047 does NOT cover them;
+this is the Bug-17 core-type tier needing generalization).
+
+**Tracked:** roadmap entry added ("generalize core-PG-type
+same-engine verbatim carry beyond tsvector/tsquery"); candidate ADR.
+Harness: `TestCorpus_GitLab_PGToPG_VerbatimCarry` stays GREEN by
+*characterizing* this known class (PASS on a range-type refusal;
+FAIL only on an *unexpected* shape = a new finding) — and will go
+green-as-assertion automatically if the gap is later closed.
+
+## Iteration 3 (still pending — task #14 continuation)
 
 - **pgloader regression/test schemas** — adversarial MySQL→PG prior
   art (the exact job).

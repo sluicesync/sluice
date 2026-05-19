@@ -25,6 +25,7 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -204,6 +205,64 @@ func TestCorpus_GitLab_PG_Characterize(t *testing.T) {
 		return
 	}
 	t.Log("GitLab PG→MySQL DryRun: schema read + cross-engine plan completed (characterization).")
+}
+
+// GitLab PG→PG — the COMPLEMENT of the cross-engine leg above, on the
+// same real schema. catalog_resources.search_vector is a core PG
+// `tsvector`. Cross-engine (above) correctly LOUD-REFUSES it (no
+// MySQL column-type equivalent). Same-engine PG→PG must instead
+// carry it VERBATIM (ir.VerbatimType; ADR-0047 tier, VerbatimEligible
+// set by the PG reader for same-engine runs). This leg PROVES that on
+// a real production tsvector column rather than trusting code-reading:
+// PG→PG DryRun must succeed with NO "unsupported data_type tsvector"
+// — an error here would be a genuine defect (verbatim path not
+// engaged for PG→PG migrate), which is exactly the finding we'd want.
+func TestCorpus_GitLab_PGToPG_VerbatimCarry(t *testing.T) {
+	ddl := readCorpus(t, "gitlab_structure.pg.sql")
+	src, tgt, cleanup := startPostgres(t) // src = load GitLab; tgt = PG→PG target
+	defer cleanup()
+
+	if err := applyPGDDLBestEffort(src, ddl); err != nil {
+		t.Logf("GitLab apply into vanilla PG: PARTIAL/FAILED — %v", truncErr(err))
+	}
+	if n := corpusRawPGTableCount(t, src); n < 100 {
+		t.Fatalf("GitLab loaded only %d base tables (raw) — VACUOUS", n)
+	} else {
+		t.Logf("GitLab: %d base tables loaded (raw) — non-vacuous", n)
+	}
+
+	pgEng, _ := engines.Get("postgres")
+	mig := &Migrator{Source: pgEng, Target: pgEng, SourceDSN: src, TargetDSN: tgt, DryRun: true}
+	err := mig.Run(ctx2min(t))
+	if err == nil {
+		t.Log("GitLab PG→PG DryRun: 1000+ tables read + planned via verbatim carry, " +
+			"NO loud refusal — same-engine fidelity confirmed. (If this passes, the " +
+			"core-range-type gap below was fixed; tighten this leg to an assertion.)")
+		return
+	}
+	// CHARACTERIZED KNOWN GAP (iteration-3 finding, 2026-05-19):
+	// `tsvector`/`tsquery` got an explicit same-engine verbatim branch
+	// (catalog Bug 17, types.go:379) but the carve-out was made
+	// type-by-type for the *representative*, not generalized to the
+	// *class* of core PG types with no rich cross-engine IR shape. So
+	// PG→PG loud-refuses core RANGE types (int4range/int8range/
+	// numrange/tsrange/tstzrange/daterange) though they're trivially
+	// verbatim-carryable — the exact gap tsvector had pre-Bug-17.
+	// Loud, not silent → tenet holds, no corruption; a real
+	// fidelity/UX gap. Tracked: real-world-corpus-findings.md +
+	// roadmap. This leg stays GREEN by characterizing the known class
+	// and only FAILs on an UNEXPECTED error shape (a new finding).
+	msg := err.Error()
+	knownGap := strings.Contains(msg, "int8range") || strings.Contains(msg, "int4range") ||
+		strings.Contains(msg, "numrange") || strings.Contains(msg, "tsrange") ||
+		strings.Contains(msg, "tstzrange") || strings.Contains(msg, "daterange")
+	if !knownGap {
+		t.Fatalf("GitLab PG→PG DryRun failed with an UNEXPECTED shape (not the tracked "+
+			"core-range-type verbatim gap) — investigate as a NEW finding: %v", truncErr(err))
+	}
+	t.Logf("GitLab PG→PG: CHARACTERIZED KNOWN GAP — core range type loud-refused on the "+
+		"same-engine path (should verbatim-carry like tsvector/Bug-17). Not corruption "+
+		"(loud). Tracked in real-world-corpus-findings.md / roadmap. err=%v", truncErr(err))
 }
 
 // --- Iteration 2 ---

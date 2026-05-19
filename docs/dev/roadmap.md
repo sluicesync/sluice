@@ -582,6 +582,20 @@ Output: `docs/research/pg-extensions-deployment-frequency.md` (matrix + recommen
 
 ---
 
+### 17. Generalize core-PG-type same-engine verbatim carry beyond tsvector/tsquery
+
+**Why.** Surfaced by the real-world schema corpus (2026-05-19, GitLab `db/structure.sql`; see [`docs/dev/notes/real-world-corpus-findings.md`](notes/real-world-corpus-findings.md) § "Iteration 3"). `tsvector`/`tsquery` got an explicit same-engine verbatim-carry branch (catalog **Bug 17**, `internal/engines/postgres/types.go:379` — `if c.VerbatimEligible → ir.VerbatimType`), but the carve-out was made **type-by-type for the representative, not generalized to the class** of core `pg_catalog` types with no rich cross-engine IR shape. So same-engine PG→PG **loud-refuses core range types** (`int4range/int8range/numrange/tsrange/tstzrange/daterange`) at the generic fallthrough (`types.go` ~392) — the *exact* gap `tsvector` had pre-Bug-17, on a very common real-world column class (partition bounds, scheduling, analytics — GitLab/Rails/Django). This is the sibling of item 16/ADR-0047: **16 = uncatalogued *USER-DEFINED extension* verbatim; 17 = core *pg_catalog-type* verbatim.** ADR-0047 explicitly does **not** cover range types (they are core, not USER-DEFINED).
+
+**Severity.** Loud refusal → loud-failure tenet holds, **no corruption / no silent loss**. A fidelity/UX gap that blocks PG→PG sync of range-type-using schemas; not an emergency, not a speculative-fix-mid-testing item.
+
+**What.** Generalize the Bug-17 same-engine core-type verbatim tier: route core `pg_catalog` types lacking a rich IR shape (range types first; audit the full set — also consider `pg_lsn`, `txid_snapshot`/`pg_snapshot`, `xml`, `money`, `tsmultirange`/multirange family) through the same `VerbatimEligible → ir.VerbatimType{format_type}` path tsvector/tsquery use, when (and only when) the run is provably same-engine PG (cross-engine stays loud-refuse — correct, no equivalent). Adjacent: an `EXCLUDE USING gist (... WITH &&)` constraint on a range column (seen in GitLab) is a downstream core-PG feature that also needs same-engine verbatim carry once the type is allowed — scope it in the ADR.
+
+**Gotchas.** The same-vs-cross-engine boundary is the load-bearing call (mirror types.go's `VerbatimEligible` exactly). Multirange types (PG 14+) are a related family. Index AM/opclass (GiST on ranges) parallels item 16's Bug-47-invariant concern. Needs an ADR (which core types; the boundary; ADR-0047 interaction — sibling tiers sharing `ir.VerbatimType`).
+
+**Operator demand check.** Strong indirect signal — range types + GiST exclusion constraints are standard in partitioning/scheduling schemas; the corpus hit it immediately on the first large real PG schema (GitLab). Promote when a PG→PG operator hits it, or bundle with item 16 (shared `ir.VerbatimType` mechanism). ~200-400 LOC + ADR + corpus/integration coverage (the harness leg `TestCorpus_GitLab_PGToPG_VerbatimCarry` already pins it — currently characterizes the gap; flips to a strict assertion automatically once closed).
+
+---
+
 ### Open bugs awaiting fix windows
 
 Tracked in detail in `sluice-testing/BUG-CATALOG.md`; recap here for roadmap visibility:
