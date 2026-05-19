@@ -71,13 +71,48 @@ removal of the loud guarantee.
 
 ## Decision points requiring sign-off
 
-1. **DDL-boundary detection, per engine.** Binlog: the `QUERY`/DDL
-   event. PG: relation-message / a periodic catalog check. **Vitess
-   VStream with schema-tracking OFF:** there is no clean DDL event —
-   detection must be a `FIELD`-event field-set delta (the open
-   empirical question Phase 1c is characterizing). The history is only
-   as good as the boundary signal; sign-off needs the per-engine
-   trigger confirmed (Phase-1c evidence).
+1. **DDL-boundary detection, per engine.** — **RESOLVED (2026-05-18,
+   owner). Phase-1c evidence is IN HAND** (delivered + verified
+   2026-05-17, `docs/dev/notes/prep-planetscale-vitess-readiness.md`
+   §"Phase 1c" Phase A; superseding this DP's prior "open empirical
+   question" wording). Per-engine triggers:
+   - **MySQL binlog:** the `QUERY` DDL event (ALTER/CREATE/DROP/
+     RENAME/TRUNCATE — DDL is statement-logged even under ROW format).
+     Boundary = that event; anchor = its GTID.
+   - **PostgreSQL logical replication:** a pgoutput **`Relation`-
+     message column-set delta** (pgoutput re-sends `Relation` before
+     the first change to a table after its definition changes);
+     anchor = that Relation's LSN. The periodic catalog check is
+     demoted to a **belt-and-suspenders backstop** for the benign
+     edge (DDL on a table with no subsequent DML → nothing to
+     mis-decode until the next DML re-sends `Relation`).
+   - **Vitess VStream:** a **`FIELD`-event field-set delta**; anchor =
+     the VGTID at that FIELD event. **Phase-1c-proven** (ADD/DROP/
+     MODIFY ground-truthed vs vttestserver; VStream re-emits a fresh
+     `FIELD` post-DDL, `dispatchDDL → clear(r.fields)` forces re-fetch
+     before the next ROW → faithful; tests
+     `cdc_vstream_schema_evolution_integration_test.go`).
+   **Sign-off points (owner-accepted 2026-05-18):**
+   (i) **Use the VStream `FIELD`-delta signal *uniformly*, regardless
+   of Vitess schema-tracking on/off** — no special-case for
+   tracking-ON; a single uniform signal *is* this ADR's stated goal
+   ("schema-correctness independent of the source's optional
+   schema-tracking feature"); special-casing adds a second path for
+   zero correctness gain.
+   (ii) **Boundary = a *true delta*, not "an event arrived."** VStream
+   emits `FIELD` on (re)start / per-table first-touch and PG re-sends
+   `Relation` on reconnect *without* any DDL; a history version is
+   snapshotted **only when the (column-name set, ordered types)
+   actually differs from the cached schema** — avoids no-op-version
+   bloat and feeds DP-2 (retention sees only real deltas).
+   **Common invariant (Phase-1c-confirmed already-true):** the
+   boundary must be detected *before* the next ROW decodes in the new
+   schema; a ROW racing ahead of its `FIELD`/`Relation` is a **loud
+   hard error**, never silent — the loud floor holds today; this ADR
+   is the efficiency upgrade (position-anchored history → resume-
+   after-DDL stops forcing a whole-stream re-snapshot) on top of it,
+   NOT a fix for an active silent bug (Phase-1c proved none exists on
+   this path).
 2. **Retention / compaction.** How far back the history is kept (bounded
    by the oldest resumable position; compacted past the persisted
    safe-point) vs. unbounded growth.
@@ -122,12 +157,19 @@ removal of the loud guarantee.
 
 ## Status / next
 
-Proposed. **DP-3 resolved (2026-05-18, owner; shared with ADR-0050
-DP-3).** DP-1 + DP-2 still open — do **not** implement before owner
-sign-off on those (DP-1 gated on Phase-1c's empirical
-VStream-tracking-off finding). Independent of #37 (pinned); can
-proceed on its own branch when accepted. **Owner decided
+Proposed. **DP-1 + DP-3 resolved (2026-05-18, owner); only DP-2
+(retention/compaction) still open.** DP-1's Phase-1c evidence is in
+hand (verified 2026-05-17) — it was never a research gap, only an
+un-recorded resolution; now recorded. Do **not** implement before
+owner sign-off on **DP-2** (the sole remaining design decision) +
+the design being design-first. Independent of #37 (pinned); can
+proceed on its own branch once DP-2 is signed off. **Owner decided
 (2026-05-18): keep ADR-0049 and ADR-0050 *separate, not merged* — but
-hard-sequenced: this ADR's DP-1 + Phase-1c evidence MUST land before
-any ADR-0050 implementation** (ADR-0050 DP-3's correctness is
-contingent on this ADR's per-engine DDL-boundary detection).
+hard-sequenced: this ADR (DP-1 now resolved + Phase-1c evidence,
+already satisfied) gates any ADR-0050 implementation** (ADR-0050
+DP-3's correctness is contingent on this ADR's per-engine
+DDL-boundary detection). **Reframe (Phase-1c):** the CDC
+schema-evolution path is *already faithful at the loud floor* — no
+active silent bug — so this ADR is a value/efficiency upgrade
+(resume-after-DDL without a whole-stream re-snapshot), priority/
+demand-gated, not a correctness emergency.
