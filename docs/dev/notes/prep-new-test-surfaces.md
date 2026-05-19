@@ -323,13 +323,21 @@ script + small committed fixtures, not vendored dumps.
   a build-tagged harness reads each via sluice's schema reader and
   records refuse/translate outcomes (extends Idea 1's pattern).
 
-Status: **Iteration 1 COMPLETE (2026-05-19) — loop proven, zero
-sluice defects.** Chinook (matched MySQL/PG) MySQL→PG + PG→MySQL
-DryRun green; GitLab `structure.sql` (1444-table real PG) correctly
-loud-refused `tsvector` (loud-failure tenet working as designed). Two
-`fetch.sh` strip fixes (multi-line INSERT; psql-meta + DB-stmt).
-Running findings log: [`real-world-corpus-findings.md`](real-world-corpus-findings.md).
+Status: **Iterations 1 & 2 COMPLETE (2026-05-19) — zero sluice
+defects; harness hardened.** Chinook (matched MySQL/PG) + **MediaWiki
+(guaranteed-equivalent generated oracle, 64 tables, both directions)**
++ employees (real MySQL `PARTITION BY`) all read + cross-engine-plan
+clean and **provably non-vacuous**; GitLab (1041-table real PG)
+correctly loud-refuses `tsvector` (loud-failure tenet WAD). Harness
+now has a non-vacuous table-count guard + a raw-count vacuity check
+that separates "DDL loaded?" from "sluice can read/translate?"; the
+detour *resolved* (didn't confirm) a vacuous-pass risk in iter-1.
+`fetch.sh` strips multi-line INSERT, psql-meta, `USE`/`SCHEMA`/
+`DATABASE`, `source`. License-safety note in `MANIFEST.md`
+(copyleft never triggers — non-distribution; never vendor `.sql`).
+Findings log: [`real-world-corpus-findings.md`](real-world-corpus-findings.md).
 Harness: `internal/pipeline/migrate_realworld_corpus_integration_test.go`
-(build-tagged; SKIPs when corpus unfetched). Iteration 2 (MediaWiki
-abstract schema / pgloader / WordPress + the deeper matched-pair
-congruence oracle) pending — task #13.
+(build-tagged; SKIPs when corpus unfetched). **Iteration 3 pending —
+task #14:** pgloader corpus / WordPress / the deeper matched-pair
+*congruence* oracle (compare sluice's emitted translation vs the
+authored other-engine schema — true oracle, not smoke).

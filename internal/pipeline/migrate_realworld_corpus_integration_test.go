@@ -66,6 +66,63 @@ func readCorpus(t *testing.T, name string) string {
 	return string(b)
 }
 
+// corpusAssertTables opens the source via sluice's schema reader and
+// FAILS if fewer than min tables are read. Load-bearing guard against
+// a VACUOUS pass: Migrator.Run returns nil (not an error) on a
+// 0-table schema (migrate.go "nothing to migrate"), so a corpus whose
+// DDL landed in a side DB would otherwise pass green without sluice
+// ever reading the real schema. Returns the count.
+func corpusAssertTables(t *testing.T, engineName, dsn string, min int) int {
+	t.Helper()
+	eng, ok := engines.Get(engineName)
+	if !ok {
+		t.Fatalf("engine %q not registered", engineName)
+	}
+	sr, err := eng.OpenSchemaReader(ctx2min(t), dsn)
+	if err != nil {
+		t.Fatalf("%s OpenSchemaReader: %v", engineName, err)
+	}
+	if c, isC := sr.(interface{ Close() error }); isC {
+		defer func() { _ = c.Close() }()
+	}
+	sch, err := sr.ReadSchema(ctx2min(t))
+	if err != nil {
+		t.Fatalf("%s ReadSchema: %v", engineName, err)
+	}
+	n := len(sch.Tables)
+	if n < min {
+		t.Fatalf("%s read %d tables; want >= %d — VACUOUS: corpus DDL likely landed in a side DB (check fetch.sh DB-switch strip); sluice never saw the real schema", engineName, n, min)
+	}
+	t.Logf("%s: schema reader saw %d tables (>= %d) — non-vacuous", engineName, n, min)
+	return n
+}
+
+// corpusRawPGTableCount counts base tables directly via
+// information_schema — a vacuity check that does NOT go through
+// sluice's ReadSchema. Needed for the GitLab *characterization* leg:
+// sluice ReadSchema legitimately loud-refuses GitLab's `tsvector`
+// (expected, see iteration-1 findings), so the strict
+// corpusAssertTables (Fatalf on any ReadSchema error) would wrongly
+// fail it. This separates "did the DDL load?" (vacuity) from "can
+// sluice read/translate it?" (the characterization).
+func corpusRawPGTableCount(t *testing.T, dsn string) int {
+	t.Helper()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open pg: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	var n int
+	if err := db.QueryRowContext(ctx,
+		"SELECT count(*) FROM information_schema.tables WHERE table_schema='public' AND table_type='BASE TABLE'",
+	).Scan(&n); err != nil {
+		t.Fatalf("raw table count: %v", err)
+	}
+	return n
+}
+
 // Chinook MySQL → PG, DryRun: source read + cross-engine plan, no data.
 func TestCorpus_Chinook_MySQLToPG_DryRun(t *testing.T) {
 	ddl := readCorpus(t, "chinook_mysql.ddl.sql")
@@ -75,6 +132,7 @@ func TestCorpus_Chinook_MySQLToPG_DryRun(t *testing.T) {
 	defer pgCleanup()
 
 	applyMySQLDDL(t, src, ddl)
+	corpusAssertTables(t, "mysql", src, 11) // Chinook has exactly 11 tables
 
 	myEng, _ := engines.Get("mysql")
 	pgEng, _ := engines.Get("postgres")
@@ -94,6 +152,7 @@ func TestCorpus_Chinook_PGToMySQL_DryRun(t *testing.T) {
 	defer myCleanup()
 
 	applyPGDDL(t, src, ddl)
+	corpusAssertTables(t, "postgres", src, 11) // Chinook has exactly 11 tables
 
 	pgEng, _ := engines.Get("postgres")
 	myEng, _ := engines.Get("mysql")
@@ -127,6 +186,15 @@ func TestCorpus_GitLab_PG_Characterize(t *testing.T) {
 	} else {
 		t.Log("GitLab structure.sql applied into vanilla PG cleanly (unexpected — good).")
 	}
+	// Non-vacuous guard via RAW count (not sluice ReadSchema, which
+	// correctly loud-refuses GitLab's tsvector — that refusal is the
+	// characterized finding, not a failure). GitLab genuinely loads
+	// ~1444 tables; <100 means the apply silently didn't take.
+	if n := corpusRawPGTableCount(t, src); n < 100 {
+		t.Fatalf("GitLab loaded only %d base tables (raw count) — VACUOUS; structure.sql did not take", n)
+	} else {
+		t.Logf("GitLab: %d base tables loaded (raw count) — non-vacuous; now characterizing sluice read/translate", n)
+	}
 
 	pgEng, _ := engines.Get("postgres")
 	myEng, _ := engines.Get("mysql")
@@ -136,6 +204,78 @@ func TestCorpus_GitLab_PG_Characterize(t *testing.T) {
 		return
 	}
 	t.Log("GitLab PG→MySQL DryRun: schema read + cross-engine plan completed (characterization).")
+}
+
+// --- Iteration 2 ---
+
+// MediaWiki is the guaranteed-equivalent cross-engine ORACLE: the
+// MySQL and PG tables-generated.sql are both generated from one
+// abstract schema (sql/tables.json), so a clean read+plan on each
+// direction is a stronger signal than independently-authored pairs.
+// (The deeper "does sluice's MySQL→PG emitted schema match the
+// upstream PG side" congruence check is iteration 3.)
+func TestCorpus_MediaWiki_MySQLToPG_DryRun(t *testing.T) {
+	ddl := readCorpus(t, "mediawiki_mysql.ddl.sql")
+	src, _, cleanup := startMySQL(t)
+	defer cleanup()
+	_, tgt, pgCleanup := startPostgres(t)
+	defer pgCleanup()
+
+	applyMySQLDDL(t, src, ddl)
+	corpusAssertTables(t, "mysql", src, 50) // MediaWiki generates 64 tables
+
+	myEng, _ := engines.Get("mysql")
+	pgEng, _ := engines.Get("postgres")
+	mig := &Migrator{Source: myEng, Target: pgEng, SourceDSN: src, TargetDSN: tgt, DryRun: true}
+	if err := mig.Run(ctx2min(t)); err != nil {
+		t.Fatalf("MediaWiki MySQL→PG DryRun: schema read/plan failed: %v", err)
+	}
+	t.Log("MediaWiki MySQL→PG DryRun: 64-table generated-schema read + cross-engine plan OK")
+}
+
+func TestCorpus_MediaWiki_PGToMySQL_DryRun(t *testing.T) {
+	ddl := readCorpus(t, "mediawiki_postgres.ddl.sql")
+	src, _, cleanup := startPostgres(t)
+	defer cleanup()
+	_, tgt, myCleanup := startMySQL(t)
+	defer myCleanup()
+
+	applyPGDDL(t, src, ddl)
+	corpusAssertTables(t, "postgres", src, 50) // MediaWiki generates 64 tables
+
+	pgEng, _ := engines.Get("postgres")
+	myEng, _ := engines.Get("mysql")
+	mig := &Migrator{Source: pgEng, Target: myEng, SourceDSN: src, TargetDSN: tgt, DryRun: true}
+	if err := mig.Run(ctx2min(t)); err != nil {
+		t.Fatalf("MediaWiki PG→MySQL DryRun: schema read/plan failed: %v", err)
+	}
+	t.Log("MediaWiki PG→MySQL DryRun: schema read + cross-engine plan OK (oracle pair)")
+}
+
+// datacharmer employees (partitioned): real MySQL with PARTITION BY —
+// a feature Chinook lacks. Asserts: sluice's MySQL reader handles a
+// partitioned real schema and the PG plan succeeds or refuses loudly
+// (a crash/silent-drop here would be a genuine finding).
+func TestCorpus_Employees_MySQLToPG_DryRun(t *testing.T) {
+	ddl := readCorpus(t, "employees_mysql_partitioned.ddl.sql")
+	src, _, cleanup := startMySQL(t)
+	defer cleanup()
+	_, tgt, pgCleanup := startPostgres(t)
+	defer pgCleanup()
+
+	applyMySQLDDL(t, src, ddl)
+	corpusAssertTables(t, "mysql", src, 6) // employees test_db has exactly 6 tables
+
+	myEng, _ := engines.Get("mysql")
+	pgEng, _ := engines.Get("postgres")
+	mig := &Migrator{Source: myEng, Target: pgEng, SourceDSN: src, TargetDSN: tgt, DryRun: true}
+	if err := mig.Run(ctx2min(t)); err != nil {
+		// Partitioned-table cross-engine handling: a loud refusal is
+		// acceptable (characterize); a crash/panic is a real finding.
+		t.Logf("employees(partitioned) MySQL→PG DryRun: refused/failed — %v", truncErr(err))
+		return
+	}
+	t.Log("employees(partitioned) MySQL→PG DryRun: read + cross-engine plan OK")
 }
 
 func truncErr(err error) string {

@@ -48,16 +48,73 @@ one important *correct-behaviour* characterization.
    awk string → `syntax error near unexpected token ')'`. Keep the
    strip awk apostrophe-free.
 
-## Iteration 2 (pending — task #13)
+## Iteration 2 (2026-05-19) — MediaWiki oracle + employees + harness hardening
 
-- **MediaWiki abstract schema** — generated MySQL+PG+SQLite from one
-  expert schema → a *guaranteed-equivalent* cross-engine oracle
-  (stronger than independently-authored Chinook/sakila).
+**Verdict: ZERO sluice defects across the whole suite; harness
+materially hardened.**
+
+| Corpus / direction | Outcome | Guard |
+|---|---|---|
+| **MediaWiki MySQL→PG** DryRun | ✅ PASS | 64 tables, non-vacuous |
+| **MediaWiki PG→MySQL** DryRun | ✅ PASS | 64 tables, non-vacuous |
+| **employees** (partitioned) MySQL→PG | ✅ PASS | 6 tables, non-vacuous |
+| GitLab PG (re-run, characterize) | ✅ PASS | 1041 base tables (raw), non-vacuous; sluice correctly loud-refuses `tsvector` — characterized, expected |
+| Chinook MySQL→PG / PG→MySQL (re-run) | ✅ PASS | **11 tables each, now PROVABLY non-vacuous** |
+
+### Headline
+
+- **MediaWiki is the strongest signal yet.** Both dialects are
+  generated from one abstract schema (`sql/tables.json`), so a clean
+  read+cross-engine-plan in *both* directions on the 64-table schema
+  is a guaranteed-equivalent-oracle pass — sluice handles a real,
+  expert-authored cross-engine schema both ways with zero defects.
+- **employees** adds real MySQL `PARTITION BY` coverage (a surface
+  Chinook lacks) — read + PG plan clean.
+
+### Harness hardening (the rigor detour — worth it)
+
+- **Non-vacuous guard.** `Migrator.Run` returns `nil` (not an error)
+  on a 0-table schema (`migrate.go` "nothing to migrate"), so a
+  corpus whose DDL landed in a side DB would pass GREEN without
+  sluice ever reading it. Added `corpusAssertTables` (reads via
+  sluice's `OpenSchemaReader`/`ReadSchema`, FAILs if `< expected`).
+  This **resolved — did not confirm — the vacuous-pass worry**:
+  iteration-1 Chinook-MySQL now *provably* reads 11 real tables
+  (a real green, not a false one), after the DB-switch strip fix.
+- **DB-switch strip fix (`fetch.sh`).** Drop `USE`, `CREATE/DROP
+  SCHEMA` (in addition to `DATABASE`), and mysql-client `source …;`
+  so every `CREATE TABLE` lands in the connection DB sluice's DSN
+  reads. (Chinook-MySQL kept `CREATE SCHEMA/USE` pre-fix → was the
+  latent vacuity risk.)
+- **Characterization ≠ vacuity.** First full run FAILED GitLab
+  because the strict `ReadSchema` guard hit GitLab's *expected*
+  `tsvector` loud-refuse — *my harness over-strictness, not sluice*.
+  Split it: `corpusRawPGTableCount` (raw `information_schema` count)
+  proves GitLab loaded (~1041 tables) without going through
+  ReadSchema; the sluice read/translate step then *characterizes*
+  the `tsvector` refuse (logged, PASS). "Did the DDL load?" is now
+  separate from "can sluice read/translate it?".
+
+### License safety (operator-raised)
+
+GPL-2.0-or-later (MediaWiki) / CC-BY-SA-3.0 (datacharmer employees)
+copyleft **never triggers**: corpora are gitignored, fetch-on-demand,
+test-input-only — sluice never distributes them. A
+`LICENSE SAFETY — DO NOT VENDOR` note is now in
+`MANIFEST.md`; the `.gitignore` exception tracks only `MANIFEST.md` +
+`fetch.sh`. Redistribution (bundling/committing) would be a different
+analysis (only MIT/Chinook-permissive eligible) — not done.
+
+## Iteration 3 (pending — task #13 continuation)
+
 - **pgloader regression/test schemas** — adversarial MySQL→PG prior
   art (the exact job).
-- **WordPress** core — canonical operator-brought MySQL shape.
-- **Deeper matched-pair oracle:** compare sluice's Chinook MySQL→PG
-  *emitted* schema against the upstream Chinook PG schema for
-  congruence (iteration 1 only checked both read+plan clean, not that
-  the translation equals the hand-authored PG side).
+- **WordPress** core — canonical operator-brought MySQL shape
+  (needs a PHP-`schema.php`-extraction step; note the friction).
+- **Deeper matched-pair *congruence* oracle** — compare sluice's
+  emitted MySQL→PG schema against the upstream hand/abstract-authored
+  PG side (Chinook AND MediaWiki). Iterations 1–2 only assert "both
+  read + plan clean + non-vacuous", not that the *translation equals*
+  the other engine's authored schema. This is the highest-value next
+  signal (true oracle, not just smoke).
 - Then Vitess/PlanetScale sample schemas (Track-1b-adjacent).
