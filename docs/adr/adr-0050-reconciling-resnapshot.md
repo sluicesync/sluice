@@ -19,11 +19,11 @@ re-snapshot watermark*).
 **endorsed** by the owner — worthwhile to pursue, with real cost data
 to be gathered during testing to confirm it stays worth its weight
 (see Consequences: this is source-heavy by nature; the empirical
-validation is an explicit gate, not a formality). **DP-1, DP-2, DP-3
+validation is an explicit gate, not a formality). **DP-1–DP-4
 resolved** (recorded below); new **DP-5** added (checksum compute-
-location) out of the storage/egress sub-thread. **DP-4/5 remain
-open**; status stays **Proposed** until those are signed off. Owner
-also fixed the structural question (DP-3): ADR-0049/0050 stay
+location) out of the storage/egress sub-thread — **DP-5 is the only
+one still open**; status stays **Proposed** until it is signed off.
+Owner also fixed the structural question (DP-3): ADR-0049/0050 stay
 **separate but hard-sequenced** (ADR-0049 DP-1 + Phase-1c before any
 0050 implementation). Still demand-gated: do not implement ahead of a
 real operator hitting the position-loss pain.
@@ -237,11 +237,28 @@ recovery.
    hard-sequenced** — ADR-0049 DP-1 + its Phase-1c evidence MUST land
    before any ADR-0050 implementation. Recorded symmetrically in
    ADR-0049.
-4. **Recovery-only vs. also proactive drift-verification** — v1 is
-   recovery-only; using the same engine for periodic source/target
-   drift audit is explicitly out of v1 scope. *(open; this is also
-   where a storage-efficient columnar hash store would belong if/when
-   drift-audit is promoted — not v1.)*
+4. **Recovery-only vs. also proactive drift-verification** —
+   **RESOLVED (2026-05-18).** v1 is **recovery-only**; proactive
+   periodic source/target drift-audit is explicitly out of scope. The
+   DP-1 fingerprint *is* a source-vs-target block-diff, so drift-audit
+   is a small *code* delta but a different *product* surface (runs
+   against a live healthy stream → cadence/scheduling, "expected
+   drift while CDC mid-apply/lagging," false-positive mgmt, alerting/
+   metrics) — exactly the machinery the narrow-v1/demand-gated/loud-
+   floor stance excludes. Pinned forward pointers (don't lose, but
+   future separately-demand-gated ADR): **(a)** DP-1's fingerprint is
+   deliberately engine-neutral / `value-types.md`-canonical so a
+   future drift-audit reuses it with no rework; **(b)** a persisted
+   **columnar per-range hash store** earns its keep *only* for
+   drift-audit (recovery computes-compares-**discards** — the DP-1
+   freshness argument; zero storage is correct for recovery). The
+   columnar shape (compresses hash columns; append-only; aligns with
+   sluice's JSON-Lines+gzip backup-chunk precedent + the Parquet-
+   export research) is the right *future* design, not v1; **(c)** the
+   future drift-audit's home is **`sluice verify --mode=checksum`**
+   (reusing this fingerprint), not a new top-level feature on the
+   recovery path — keeps the existing `sluice verify` surface
+   coherent.
 5. **Checksum compute-location** *(open; new — from the storage/egress
    sub-thread).* Two modes with different cost/coverage:
    **(a) push-down** — the source/target engine computes the block
@@ -324,10 +341,9 @@ recovery.
 
 ## Status / next
 
-**Proposed; direction owner-endorsed (2026-05-18).** DP-1 + DP-2 +
-DP-3 resolved; **DP-4/5 still open** — do **not** implement before
-owner sign-off on the remaining two *and* the empirical cost-
-validation gate (Consequences: real testing data must show
+**Proposed; direction owner-endorsed (2026-05-18).** DP-1–DP-4
+resolved; **only DP-5 still open** — do **not** implement before
+owner sign-off on it *and* the empirical cost-validation gate (Consequences: real testing data must show
 reconciling-resnapshot beats full re-copy on representative tables;
 the Vitess native-vs-watermark A/B is a deliberate part of that
 evidence) *and* the hard-sequencing dependency: **ADR-0049 DP-1 +
@@ -338,6 +354,5 @@ position-loss case. Independent of #37 (pinned). Phase-1c's empirical
 characterisation of the *current* re-snapshot granularity feeds DP-3
 and the Consequences.
 
-Next dialogue rounds: DP-4 (recovery-only vs drift-audit + the
-columnar hash-store question), DP-5 (compute-location: in-sluice only
-vs +push-down).
+Next dialogue round: DP-5 (compute-location: in-sluice only vs
++push-down) — the last open decision point.
