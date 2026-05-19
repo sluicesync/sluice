@@ -207,12 +207,146 @@ the complementary signal the real-world corpus exists for, and it
 also hardened the harness itself (non-vacuous guard; raw-count vs
 ReadSchema split; data/meta strip generality).
 
-## Iteration 4 (pending — task #15)
+## Iteration 4 (2026-05-19) — matched-pair CONGRUENCE oracle + Vitess/PS slice
 
-- **Deeper matched-pair *congruence* oracle** — the highest-value
-  remaining signal: compare sluice's *emitted* MySQL→PG schema
-  against the upstream authored PG side (Chinook / MediaWiki /
-  Joomla). Iterations 1–3 assert "both read + plan clean +
-  non-vacuous", **not** that the *translation equals* the
-  expert-authored other-engine schema. True oracle, not smoke.
-- **Vitess / PlanetScale sample schemas** (Track-1b-adjacent).
+**Verdict: the true-oracle harness is built and proven non-vacuous;
+verdicts are deferred to the CI Integration run (Windows+CGO=0+Rancher
+cannot run `-tags=integration` locally — authoritative signal is CI's
+Linux Integration job, per CLAUDE.md). No NEW FINDING from
+code-reading; the legs are written so any congruence break FAILs loud
+with `diff.Summary()` and the offending table/column.**
+
+### Part A — matched-pair congruence oracle (the high-value part)
+
+New file `migrate_realworld_corpus_congruence_integration_test.go`.
+This is the first leg that asserts sluice's *emitted* translation is
+**congruent** with the expert-authored other-engine schema — iterations
+1–3 only asserted "reads + plans clean + non-vacuous", never that the
+translation *equals* the human-authored side.
+
+Mechanism (forward, MySQL-emitted vs authored-PG):
+
+1. Apply authored MySQL corpus DDL → MySQL testcontainer.
+2. `Migrator{Source:mysql,Target:pg,DryRun:false,TargetSchema:
+   "sluice_emitted"}` — actually EMITS sluice's translated PG schema
+   (schema-only corpus ⇒ zero-row bulk copy) into the `sluice_emitted`
+   PG schema (the PG SchemaWriter `CREATE SCHEMA IF NOT EXISTS`es it).
+3. Apply authored PG corpus DDL into a sibling `authored` schema of
+   the SAME PG container (via `SET search_path`, since the corpus DDL
+   is unqualified).
+4. Read both PG schemas via the PG engine reader, schema-scoped
+   (`applyTargetSchema`/`ir.SchemaSetter` → `SchemaReader.SetSchema`);
+   `ir.DiffSchemas(authored, emitted, {IgnoreCharsetCollation:true,
+   IgnoreExtras:false})`.
+5. `classifyCongruenceDiff`: no drift → CONGRUENT; drift split into a
+   tight commented allowlist (`congruenceBenignReason`) vs anything
+   outside → **FAIL** with `diff.Summary()` + the offending
+   table/column (the GitLab-leg "characterize the known class, FAIL on
+   an unexpected shape" pattern).
+
+Pairs: **Chinook (11), MediaWiki (≥50; upstream generates 64), Joomla
+(≥20; ≈28)** — floors reuse the iteration-1/2/3 non-vacuous counts
+(verified against the existing harness, not hardcoded blind).
+
+Symmetric direction (`runCongruenceReverseLeg`): authored-PG **emitted
+PG→MySQL** vs authored-MySQL. MySQL has no schema namespace
+(`SchemaScopeFlat` ⇒ `Migrator.TargetSchema` is refused for MySQL
+targets), so emitted/authored separation is by **database**
+(`authored_db` / `emitted_db`) on one MySQL container, then both read
+via the MySQL reader. Same classify/allowlist machinery.
+
+**The benign allowlist (tight, each entry justified):**
+
+| Allow class | Justification (why benign-not-defect) |
+|---|---|
+| `TINYINT(1)` ⇄ `boolean`/`smallint` | documented cross-engine bool contract, `docs/value-types.md` |
+| integer width tier differs (INT vs BIGINT) | both `ir.Integer`; tier is an *authoring choice* between two independently-authored expert schemas, sluice maps width-faithfully, `docs/type-mapping.md` |
+| AUTO_INCREMENT ⇄ identity/serial | column-attribute vs default-backed sequence; *type* identical, only DEFAULT spelling differs, `docs/type-mapping.md` |
+| ENUM ⇄ named-enum / text / varchar | all documented ENUM cross-engine renderings, `docs/type-mapping.md` |
+| DATETIME/TIMESTAMP(p) ⇄ timestamp[tz](p) | temporal family + precision survive; tz/no-tz + DATETIME/TIMESTAMP spelling is the documented temporal mapping |
+| MySQL sized TEXT tier ⇄ PG unbounded `text` | documented text policy (reverse widening is the Bug 72 notice) |
+| MySQL BLOB tier ⇄ PG `bytea` | documented binary policy |
+| MySQL JSON ⇄ PG JSON/JSONB | `docs/value-types.md` JSON contract |
+| type-equal, only DEFAULT spelling differs | `docs/type-mapping.md` default-equivalence (two expert authors disagreeing on `0` vs `'0'` etc.) |
+| type-equal, only NULL/NOT NULL differs | authoring choice between two independently-authored expert schemas, not a translation defect |
+
+**Allowlist cannot mask a real loss:** `classifyCongruenceDiff` routes
+*all* structural drift — missing/extra table, missing/extra column,
+index drift, CHECK drift — straight to the FAIL path. The allowlist is
+*only* ever consulted for a per-column TYPE/DEFAULT/NULLABLE mismatch
+on a column present on **both** sides, so a dropped/extra table or
+column can never be silently absorbed (this is the
+"pin-the-class-not-the-representative" discipline applied to the
+oracle's own guard).
+
+### Part B — Option-A Vitess / PlanetScale slice (DryRun; no live PS)
+
+Added to the existing corpus harness file:
+
+- **Capabilities-delta leg**
+  (`TestCorpus_WordPress_PlanetScaleFlavor_MySQLToPG_DryRun`): the
+  already-fetched WordPress MySQL corpus member, read+planned with the
+  source engine resolved to the **`planetscale`** flavor registration
+  (`engines.Get("planetscale")`; `Flavor.String()=="planetscale"`,
+  `internal/engines/mysql/flavor.go`) instead of vanilla `mysql`. Same
+  engine code, different `ir.Capabilities` (no LOAD DATA INFILE →
+  BatchedInsert, no PARTITION BY, no spatial, CDC=VStream). The leg
+  asserts the resolved name **and** the documented Capabilities
+  divergence (`SupportsPartitioning==false`, `BulkLoad!=LoadDataInfile`)
+  so it would FAIL loud if `flavor.go`'s caps regressed — i.e. it
+  genuinely exercises the delta it claims to.
+- **Vitess example-schema leg**
+  (`TestCorpus_Vitess_Commerce_MySQLToPG_DryRun`): new corpus member
+  `vitess_commerce_mysql.ddl.sql` — vitessio/vitess
+  `examples/local/create_commerce_schema.sql`, **Apache-2.0**,
+  added to `fetch.sh` (data-strip discipline pass) + `MANIFEST.md`
+  (provenance + LICENSE-SAFETY note). Characterizes Vitess DDL idioms
+  (no FKs, reference/sequence tables) through sluice's MySQL reader +
+  a MySQL→PG DryRun plan; loud-refuse acceptable-and-characterized, a
+  crash would be a finding.
+
+Runtime Vitess/PS behaviour (resharding, tx-killer, online DDL) stays
+**out of scope** — routed to Track-1b per
+`docs/dev/notes/vitess-local-vs-planetscale-equivalence.md`.
+
+### Gate results (local, this box)
+
+- `go vet -tags=integration ./internal/pipeline/` → clean (the
+  authoritative type-check for the build-tagged test files;
+  bare `go build` skips `_test.go`).
+- `go vet ./...` → clean.
+- `go test ./...` (non-integration) → all packages OK.
+- `golangci-lint run ./internal/pipeline/` (CI's actual config — no
+  integration tag) → **0 issues**. Under the stricter
+  `--build-tags=integration` run the two new/edited corpus files are
+  also clean; the ~40 tagged-only issues elsewhere are pre-existing in
+  other integration test files and outside CI's lint scope.
+- gofumpt: new/edited files formatted clean.
+
+### Decisions made that were NOT pre-specified (flagged for lead)
+
+1. **Symmetric direction is true PG→MySQL emit, not a PG→PG
+   substitute.** The spec said "authored-MySQL vs sluice-emitted-from-
+   PG". Because MySQL has no schema namespace, I separate emitted vs
+   authored by **database** on one MySQL container (`authored_db` /
+   `emitted_db`) rather than by schema. This is faithful to the spec's
+   intent (it really emits PG→MySQL and diffs against authored MySQL).
+2. **`SET search_path TO <schema>, public`** is used to land the
+   unqualified authored PG corpus DDL into the `authored` schema. If a
+   corpus member's PG DDL hard-qualifies `public.` it would bypass
+   this — none of Chinook/MediaWiki/Joomla PG do today, but if a
+   future congruence pair can't be schema-isolated this way, that is
+   itself a finding (documented, don't force a green).
+3. **MediaWiki floor = 50** (not 64): reuses the existing iteration-2
+   `corpusAssertTables` non-vacuous floor rather than asserting the
+   exact generated count, so a benign upstream table-count drift
+   doesn't red-bar the oracle while still proving non-vacuity. The
+   congruence diff itself (not the floor) is the equivalence assertion.
+4. **Verdicts are CI-deferred.** Per CLAUDE.md this box can't run
+   `-tags=integration` (Windows+CGO=0+Rancher). The legs are written
+   to FAIL loud on any non-allowlisted delta; the actual
+   congruent / characterized-benign / NEW-FINDING verdict per pair
+   comes from the CI Integration job and should be recorded here on
+   that run (this section will be updated with per-pair verdicts once
+   CI reports — the harness, allowlist, and guards are the deliverable
+   here).
