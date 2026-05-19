@@ -1,0 +1,23 @@
+#cloud-config
+# Minimal per-instance seed for a VALIDATION VM cloned FROM the golden
+# template. This box runs the pre-release validation runbook over SSH
+# (release-validation runbook); it is NOT a GitHub Actions runner and
+# deliberately registers none. The golden already bakes docker, the
+# admin user + SSH key, and the root-disk grow; this boot only sets
+# the hostname (and a defensive grow for a resized clone disk).
+#
+# Single placeholder, rendered by Expand-Template: HOSTNAME.
+# (No brace syntax written in this comment on purpose - an unrendered
+#  doubled-brace token would trip Expand-Template's strict check;
+#  see commit f579f7a.)
+
+hostname: {{HOSTNAME}}
+fqdn: {{HOSTNAME}}
+preserve_hostname: false
+
+runcmd:
+  # Defensive grow (clone VHDX may have been resized larger than golden).
+  - [ bash, -c, "growpart /dev/sda 1 || true; resize2fs /dev/sda1 || true" ]
+  - [ bash, -c, "echo \"validation-vm $(date -Is) host {{HOSTNAME}} (NO runner registered)\" > /var/log/validation-provision-complete" ]
+
+final_message: "sluice validation VM {{HOSTNAME}} ready in $UPTIME s (no runner)"

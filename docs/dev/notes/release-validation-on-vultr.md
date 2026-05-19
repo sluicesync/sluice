@@ -1,4 +1,60 @@
-# Release validation on the Vultr test box
+# Release validation (local Hyper-V validation VM; Vultr retired)
+
+> **HOST MIGRATION (2026-05-19): the paid always-on Vultr box
+> (`sluice-test-lax-1`) is being RETIRED.** It was idle + its clone
+> stale (v0.32.2-era) — not used regularly — and now that local
+> Hyper-V Ubuntu provisioning + a runner fleet exist, the same
+> activity runs on a **local runner-less validation VM** at zero
+> recurring cost. The runbook commands (the `go test` block) are
+> host-agnostic and unchanged; only provisioning + source-sync + IP
+> discovery differ. The Vultr-specific provisioning text is retained
+> below as historical reference until the box is decommissioned.
+> Filename kept (`release-validation-on-vultr.md`) to avoid breaking
+> the roadmap §10 / `prep-continuous-validation-on-vultr.md` / memory
+> references; treat "the validation box" as the local VM going
+> forward.
+
+## Local Hyper-V validation VM (canonical host)
+
+A **runner-less** clone of the sealed golden VHDX — explicitly NOT a
+GitHub Actions runner (it runs this runbook over SSH, registers no
+runner).
+
+1. **Provision (elevated PowerShell on the Hyper-V host):**
+   ```powershell
+   cd C:\code\sluice\scripts\hyperv-runner
+   .\New-ValidationVM.ps1 -GoldenVhdx C:\HyperV\golden\sluice-runner-golden.vhdx `
+       -AdminSshPublicKey (gc $HOME\.ssh\id_ed25519.pub) -DiskGB 120 -CpuCount 6 -MemoryBytes 16GB
+   ```
+2. **Find its IP** (stock Ubuntu cloud image has no `hv_kvp_daemon`,
+   so `Get-VMNetworkAdapter ... .IPAddresses` is empty — use the
+   MAC→host-neighbor method, same as the golden seal):
+   ```powershell
+   $mac=(Get-VMNetworkAdapter -VMName sluice-validation).MacAddress
+   Get-NetNeighbor | ? { ($_.LinkLayerAddress -replace '[:-]','') -eq $mac } | Select IPAddress,State
+   ```
+3. **One-time Go bootstrap.** The golden bakes Docker + the admin
+   user/SSH key but **NOT system Go** (CI runners get Go via
+   `actions/setup-go`; this VM needs it installed once, like the old
+   Vultr box did). SSH in (`ssh -i ~/.ssh/id_ed25519 runner@<IP>`):
+   ```bash
+   V=$(curl -fsSL https://go.dev/VERSION?m=text | head -1)   # e.g. go1.26.3
+   curl -fsSL "https://go.dev/dl/${V}.linux-amd64.tar.gz" | sudo tar -C /usr/local -xz
+   echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.bashrc
+   docker pull vitess/vttestserver:mysql80   # 2 GB; the vstream-suite image, pre-pull
+   ```
+   (go.mod's `toolchain` directive auto-fetches the exact pinned
+   version at test time, so installing current stable is sufficient.)
+4. **Sync source + run the runbook below** (the `go test` block is
+   identical to the historical Vultr steps — host-agnostic).
+
+The VM is on-demand: spin it for a release pass, leave it stopped or
+`Remove-VM` it between releases (re-provision in ~1-2 min from the
+golden). No always-on cost.
+
+---
+
+## (Historical) Vultr test box
 
 Pre-release smoke-and-coverage runbook executed on the always-on Vultr instance (`sluice-test-lax-1`, see `C:\vultr-cli\sluice-test-spin-up.md` for provisioning). The intent: before tagging a release, exercise the build-tag combinations that CI doesn't gate on so the operator gets the "would this catch a regression that CI wouldn't?" signal locally.
 

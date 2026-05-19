@@ -1,5 +1,14 @@
 # Prep: continuous-validation on Vultr (migration from operator's workstation)
 
+> **SUPERSEDED (2026-05-19): the Vultr box is being retired** (paid +
+> idle + stale; see `release-validation-on-vultr.md` host-migration
+> banner). The "migrate continuous validation *to Vultr*" premise no
+> longer applies. If continuous validation is ever moved off the
+> operator's workstation, the target is now a **local Hyper-V VM**
+> (provision via `New-ValidationVM.ps1`), not Vultr. This doc is kept
+> for the discovery/rationale it captured; the host is the only part
+> that changed.
+
 When to pick this up: when the operator decides the cycle-time / GitHub-issue-round-trip cost of running continuous validation on a separate workstation outweighs the per-day Vultr cost. The decision is deferred as of writing; this doc captures the plan so a future session can act on it without re-doing the discovery.
 
 ## Current state (verified 2026-05-13)
