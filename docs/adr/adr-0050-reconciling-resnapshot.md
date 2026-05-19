@@ -19,11 +19,12 @@ re-snapshot watermark*).
 **endorsed** by the owner — worthwhile to pursue, with real cost data
 to be gathered during testing to confirm it stays worth its weight
 (see Consequences: this is source-heavy by nature; the empirical
-validation is an explicit gate, not a formality). **DP-1 resolved**
-(recorded below). New **DP-5** added (checksum compute-location) out
-of the storage/egress sub-thread. DP-2/3/4/5 remain open; status stays
-**Proposed** until those are signed off. Still demand-gated: do not
-implement ahead of a real operator hitting the position-loss pain.
+validation is an explicit gate, not a formality). **DP-1 and DP-2
+resolved** (recorded below); new **DP-5** added (checksum compute-
+location) out of the storage/egress sub-thread. **DP-3/4/5 remain
+open**; status stays **Proposed** until those are signed off. Still
+demand-gated: do not implement ahead of a real operator hitting the
+position-loss pain.
 
 ## Context
 
@@ -144,9 +145,61 @@ recovery.
    **BLAKE3 is the documented escalation** *iff* profiling shows
    SHA-256 bottlenecks recovery on non-SHA-NI hardware (take the dep
    then, not speculatively).
-2. **Chunk sizing / adaptivity** and watermark-table provisioning
-   (sluice creates/owns it like the other `sluice_*` control tables).
-   *(open)*
+2. **Chunk sizing / adaptivity + watermark provisioning** — **RESOLVED
+   (2026-05-18).**
+   - **Chunk sizing.** Fixed-N is a footgun (sets memory + the
+     LOW→HIGH log-pause window; trivial for a BIGINT table, OOM for a
+     wide-blob one). **Adaptive, wall-time-targeted** (the proven
+     `pt-table-checksum` model): grow/shrink N to keep each chunk's
+     checksum/select ≈ `Ttarget` (default ~1s, configurable), with
+     hard **row *and* byte bounds** (reuse the ADR-0028 byte-cap
+     precedent; `Nmin` avoids a watermark-write storm, `Nmax` caps
+     memory + pause window). This is fully sluice-controlled **only on
+     the vanilla-MySQL watermark path**; on Vitess/PG the granularity
+     is the stream's natural boundary (VStream `LASTPK` cadence / the
+     PG message bracket), not a free N — sluice checksums per natural
+     boundary there. **v1 = flat adaptive chunks; recursive
+     (Merkle/`pt-table-sync`-style) bisection is the evidence-gated
+     optimization** (descend to localize the minimal divergent
+     sub-range only on a coarse-block miss) — promoted only if the
+     testing gate shows over-shipping-on-divergence is material.
+   - **Watermark provisioning is engine-asymmetric (three-way), not a
+     single source table.** Verified against the codebase: sluice's
+     source role is read+REPLICATION-only today, and its VStream
+     filter is already `{Match:"/.*/"}` (all tables), VStream v1
+     unsharded-only.
+     - **PostgreSQL:** **`pg_logical_emit_message(prefix=>'sluice-wm',
+       content=><LOW/HIGH uuid>)`** — native WAL marker, no table, no
+       DDL; sluice's reader already sees-and-discards such messages
+       (`docs/postgres-source-prep.md`). No source write footprint.
+     - **Vitess / PlanetScale-MySQL:** **native VStream copy +
+       `LASTPK` + VGTID is the preferred default** (`--resnapshot-
+       anchor=vstream-native`) — Vitess already provides the
+       snapshot-consistent chunked-copy-interleaved-with-CDC that
+       DBLog reconstructs by hand; sluice already consumes it
+       (`cdc_vstream_snapshot.go`, `COPY_COMPLETED`/VGTID). **No
+       source write.** A `sluice_watermark` **opt-in A/B mode**
+       (`--resnapshot-anchor=watermark-table`) is *also supported here*
+       for empirical comparison: the `/.*/` filter means its row
+       events already surface in the existing VStream (no raw-binlog
+       access needed — the gating worry is answered), unsharded scope
+       keeps the A/B uncontaminated, and the write→replica-visibility
+       lag the native path avoids becomes a **measured output** of the
+       comparison (feeds the empirical gate), not a defect. On
+       PlanetScale the watermark table may need operator-pre-creation
+       (PS DDL-gating) — a documented prerequisite for the A/B mode;
+       the per-chunk UPDATE itself is ordinary user DML.
+     - **Vanilla MySQL (not behind Vitess):** no in-binlog marker
+       primitive → a sluice-owned **`sluice_watermark`** table is
+       *required* (per-`stream_id` keyed, idempotent `EnsureControl
+       Table`-style, UPDATE-in-place). This is the one real new
+       operator cost: source `CREATE`+`UPDATE`. **Loud-refuse → fall
+       back to full re-copy (ADR-0022)** when the source role can't
+       write — never a silent skip; no regression vs status quo.
+   Both anchor mechanisms yield the *identical* correctness contract
+   (a consistent chunk bracketed relative to the resumed stream); only
+   the anchoring differs, so the Vitess A/B isolates exactly the
+   anchoring cost/consistency tradeoff for the evidence gate.
 3. **Consistency contract with [ADR-0049](adr-0049-cdc-schema-history.md)**
    — the schema applied to re-selected rows must be the
    position-anchored version as of the chunk's watermark, not "now".
@@ -238,19 +291,19 @@ recovery.
 
 ## Status / next
 
-**Proposed; direction owner-endorsed (2026-05-18).** DP-1 resolved;
-**DP-2/3/4/5 still open** — do **not** implement before owner sign-off
-on the remaining four *and* the empirical cost-validation gate
-(Consequences: real testing data must show reconciling-resnapshot
-beats full re-copy on representative tables). Still demand-gated on a
-real operator position-loss case. Independent of #37 (pinned).
-Phase-1c's empirical characterisation of the *current* re-snapshot
-granularity feeds DP-3 and the Consequences. May be merged with
-ADR-0049 into a single "robust CDC recovery" ADR if the owner prefers
-one design.
+**Proposed; direction owner-endorsed (2026-05-18).** DP-1 + DP-2
+resolved; **DP-3/4/5 still open** — do **not** implement before owner
+sign-off on the remaining three *and* the empirical cost-validation
+gate (Consequences: real testing data must show reconciling-resnapshot
+beats full re-copy on representative tables; the Vitess
+native-vs-watermark A/B is a deliberate part of that evidence). Still
+demand-gated on a real operator position-loss case. Independent of #37
+(pinned). Phase-1c's empirical characterisation of the *current*
+re-snapshot granularity feeds DP-3 and the Consequences. May be merged
+with ADR-0049 into a single "robust CDC recovery" ADR if the owner
+prefers one design.
 
-Next dialogue rounds: DP-2 (chunk sizing + watermark-table
-provisioning), DP-3 (ADR-0049 schema-version-as-of-watermark
+Next dialogue rounds: DP-3 (ADR-0049 schema-version-as-of-watermark
 contract), DP-4 (recovery-only vs drift-audit + the columnar
 hash-store question), DP-5 (compute-location: in-sluice only vs
 +push-down).
