@@ -19,12 +19,14 @@ re-snapshot watermark*).
 **endorsed** by the owner — worthwhile to pursue, with real cost data
 to be gathered during testing to confirm it stays worth its weight
 (see Consequences: this is source-heavy by nature; the empirical
-validation is an explicit gate, not a formality). **DP-1 and DP-2
+validation is an explicit gate, not a formality). **DP-1, DP-2, DP-3
 resolved** (recorded below); new **DP-5** added (checksum compute-
-location) out of the storage/egress sub-thread. **DP-3/4/5 remain
-open**; status stays **Proposed** until those are signed off. Still
-demand-gated: do not implement ahead of a real operator hitting the
-position-loss pain.
+location) out of the storage/egress sub-thread. **DP-4/5 remain
+open**; status stays **Proposed** until those are signed off. Owner
+also fixed the structural question (DP-3): ADR-0049/0050 stay
+**separate but hard-sequenced** (ADR-0049 DP-1 + Phase-1c before any
+0050 implementation). Still demand-gated: do not implement ahead of a
+real operator hitting the position-loss pain.
 
 ## Context
 
@@ -201,9 +203,40 @@ recovery.
    the anchoring differs, so the Vitess A/B isolates exactly the
    anchoring cost/consistency tradeoff for the evidence gate.
 3. **Consistency contract with [ADR-0049](adr-0049-cdc-schema-history.md)**
-   — the schema applied to re-selected rows must be the
-   position-anchored version as of the chunk's watermark, not "now".
-   *(open)*
+   — **RESOLVED (2026-05-18).** Shared pact with ADR-0049 DP-3 (same
+   contract, both sides). The trap: a reconciling re-snapshot re-
+   `SELECT`s the source *now* (the table physically has its current
+   columns). Two consistent designs — **(i) down-project** current
+   rows to the pre-DDL schema and let resumed CDC replay the
+   ALTER+backfill, vs **(ii) re-anchor** the watermark *now*, select
+   in current schema, CDC resumes forward from the watermark (the
+   DBLog property). **(i) is rejected — silently lossy:** an instant
+   `ADD COLUMN … DEFAULT` emits **no per-row events**, so a
+   down-projected chunk relying on the log to backfill the new column
+   stays permanently wrong, exit 0 (the Bug 74/75 class). Decision:
+   **(ii), with a single position anchor per table-reconcile** taken
+   at that table's reconcile start; ADR-0049 resolves the `ir` schema
+   as-of that position; every chunk of the table is interpreted/
+   applied in that resolved schema; CDC re-anchors at the watermark
+   and continues forward; **never down-project to a pre-DDL schema.**
+   A **DDL detected before a table's reconcile completes voids that
+   table's in-progress reconcile → loud fall-back to ADR-0022 full
+   re-copy of that table** under the new schema (per-chunk PK-cursor
+   resumability holds only within a stable-schema window; a schema
+   change is the rare reset event — this is ADR-0049's already-stated
+   loud floor, made specific here). Buffered LOW→HIGH events resolved
+   per-event via ADR-0049 (a DDL inside that sub-second window is
+   narrow; same loud floor). **Contingent dependency (load-bearing):**
+   DP-3's safety rests entirely on ADR-0049 **DP-1** (per-engine
+   DDL-boundary detection — the hard case, *VStream schema-tracking
+   OFF* via FIELD-event-delta, is the open Phase-1c empirical
+   question). DP-3 is *decided* but its correctness is gated on
+   ADR-0049 DP-1. **Structural decision (owner, 2026-05-18):** keep
+   ADR-0049 and ADR-0050 **separate** (independently reviewable;
+   ADR-0049 has standalone value for plain resume-after-DDL) **but
+   hard-sequenced** — ADR-0049 DP-1 + its Phase-1c evidence MUST land
+   before any ADR-0050 implementation. Recorded symmetrically in
+   ADR-0049.
 4. **Recovery-only vs. also proactive drift-verification** — v1 is
    recovery-only; using the same engine for periodic source/target
    drift audit is explicitly out of v1 scope. *(open; this is also
@@ -291,19 +324,20 @@ recovery.
 
 ## Status / next
 
-**Proposed; direction owner-endorsed (2026-05-18).** DP-1 + DP-2
-resolved; **DP-3/4/5 still open** — do **not** implement before owner
-sign-off on the remaining three *and* the empirical cost-validation
-gate (Consequences: real testing data must show reconciling-resnapshot
-beats full re-copy on representative tables; the Vitess
-native-vs-watermark A/B is a deliberate part of that evidence). Still
-demand-gated on a real operator position-loss case. Independent of #37
-(pinned). Phase-1c's empirical characterisation of the *current*
-re-snapshot granularity feeds DP-3 and the Consequences. May be merged
-with ADR-0049 into a single "robust CDC recovery" ADR if the owner
-prefers one design.
+**Proposed; direction owner-endorsed (2026-05-18).** DP-1 + DP-2 +
+DP-3 resolved; **DP-4/5 still open** — do **not** implement before
+owner sign-off on the remaining two *and* the empirical cost-
+validation gate (Consequences: real testing data must show
+reconciling-resnapshot beats full re-copy on representative tables;
+the Vitess native-vs-watermark A/B is a deliberate part of that
+evidence) *and* the hard-sequencing dependency: **ADR-0049 DP-1 +
+Phase-1c evidence MUST land before any ADR-0050 implementation**
+(DP-3). Owner decided ADR-0049/0050 stay **separate but
+hard-sequenced** (not merged). Still demand-gated on a real operator
+position-loss case. Independent of #37 (pinned). Phase-1c's empirical
+characterisation of the *current* re-snapshot granularity feeds DP-3
+and the Consequences.
 
-Next dialogue rounds: DP-3 (ADR-0049 schema-version-as-of-watermark
-contract), DP-4 (recovery-only vs drift-audit + the columnar
-hash-store question), DP-5 (compute-location: in-sluice only vs
-+push-down).
+Next dialogue rounds: DP-4 (recovery-only vs drift-audit + the
+columnar hash-store question), DP-5 (compute-location: in-sluice only
+vs +push-down).

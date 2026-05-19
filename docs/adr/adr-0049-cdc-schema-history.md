@@ -82,9 +82,23 @@ removal of the loud guarantee.
    by the oldest resumable position; compacted past the persisted
    safe-point) vs. unbounded growth.
 3. **Consistency contract with [ADR-0050](adr-0050-reconciling-resnapshot.md).**
-   A reconciling re-snapshot selects at a watermark position; the
-   schema version applied to selected rows must be the
-   history-resolved version *as of that watermark*, not "now".
+   — **RESOLVED (2026-05-18, owner; recorded symmetrically in
+   ADR-0050 DP-3, which carries the full reasoning).** Contract: a
+   reconciling re-snapshot uses a **single position anchor per
+   table-reconcile**; this history resolves the `ir` schema as-of
+   that anchor; rows are applied in that resolved schema; CDC
+   re-anchors at the watermark and continues forward; **never
+   down-project current rows to a pre-DDL schema** (an instant
+   `ADD COLUMN … DEFAULT` emits no per-row events → down-projection is
+   silently lossy — the Bug 74/75 class). A DDL detected before a
+   table's reconcile completes voids that reconcile → loud fall-back
+   to ADR-0022 full re-copy of that table (this ADR's loud floor,
+   made specific). **Hard-sequencing decision (owner):** ADR-0049 and
+   ADR-0050 stay **separate, not merged** (independently reviewable;
+   this ADR has standalone value for plain resume-after-DDL), **but
+   ADR-0049 DP-1 + its Phase-1c evidence MUST land before any
+   ADR-0050 implementation** — ADR-0050 DP-3's correctness is
+   contingent on this ADR's per-engine DDL-boundary detection.
 
 ## Consequences
 
@@ -108,8 +122,12 @@ removal of the loud guarantee.
 
 ## Status / next
 
-Proposed. Do **not** implement before owner sign-off on the three
-decision points (DP-1 gated on Phase-1c's empirical
-VStream-tracking-off finding). Independent of #37 (pinned); can proceed
-on its own branch when accepted. Could be merged with ADR-0050 into one
-"robust CDC recovery" ADR if the owner prefers a single design.
+Proposed. **DP-3 resolved (2026-05-18, owner; shared with ADR-0050
+DP-3).** DP-1 + DP-2 still open — do **not** implement before owner
+sign-off on those (DP-1 gated on Phase-1c's empirical
+VStream-tracking-off finding). Independent of #37 (pinned); can
+proceed on its own branch when accepted. **Owner decided
+(2026-05-18): keep ADR-0049 and ADR-0050 *separate, not merged* — but
+hard-sequenced: this ADR's DP-1 + Phase-1c evidence MUST land before
+any ADR-0050 implementation** (ADR-0050 DP-3's correctness is
+contingent on this ADR's per-engine DDL-boundary detection).
