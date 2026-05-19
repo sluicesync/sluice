@@ -233,6 +233,7 @@ func (Engine) OpenChangeApplier(ctx context.Context, dsn string) (ir.ChangeAppli
 		schema:       cfg.DBName,
 		pkCache:      make(map[string][]string),
 		colTypeCache: make(map[string]map[string]*ir.Column),
+		activeSchema: make(map[string]activeSchemaVersion),
 	}, nil
 }
 

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pglogrepl"
@@ -214,6 +215,54 @@ type ChangeApplier struct {
 	// (table, column, PK) tuple) but operators wanting cross-stream
 	// determinism should set the stream-id explicitly.
 	streamID string
+
+	// activeSchema maps "schema.table" → the IR schema in effect at the
+	// most-recently durably-persisted ADR-0049 boundary for that table.
+	// O(1) amortised: populated on cold-start prime (resume from a
+	// persisted position; one storage hit per primed table) and on
+	// every successful SchemaSnapshot dispatch (cache update from
+	// in-memory `ir.SchemaSnapshot.IR` — NO storage hit). Per-row
+	// resolves are cache-only (Chunk D / future cross-engine
+	// source-IR will read via [ChangeApplier.ActiveSchema]); the
+	// storage-side `resolveSchemaVersion` is reached at prime time
+	// only.
+	//
+	// Concurrency: applier-goroutine-owned. The applier serialises
+	// every Apply / ApplyBatch call onto a single goroutine
+	// (per-applier doc: "Concurrent calls on the same applier are not
+	// supported"), and every cache write (Prime, post-commit
+	// SchemaSnapshot) and every cache read ([ActiveSchema]) happens on
+	// that same goroutine. No lock is required. If a future change
+	// introduces a cross-goroutine reader (e.g. an out-of-band metrics
+	// or admin probe), gate this field with sync.RWMutex; until then
+	// the lock-free form is the correct shape.
+	//
+	// Cache-after-commit invariant (ADR-0049 Chunk C): the cache is
+	// updated AT THE CALLER's post-commit observation point
+	// (applyOne / applyOneBatch after `tx.Commit()` returns nil), NOT
+	// inside dispatch. A failed dispatch / rolled-back tx must NOT
+	// leave a cache entry that disagrees with persisted state.
+	activeSchema map[string]activeSchemaVersion
+
+	// resolveCallsForTest counts how many times the applier has
+	// touched the schema-history storage to resolve a schema version
+	// (i.e. the per-table loadRetainedSchemaVersions + resolve hit
+	// inside [PrimeSchemaHistoryCache]). The post-commit cache update
+	// path does NOT increment this counter — it never touches
+	// storage. Read by the O(1)-amortised pin test
+	// (TestApplier_SchemaCache_O1Amortised) to assert that a steady-
+	// state stream of rows + boundaries has exactly #primed-tables
+	// resolve hits, NOT O(rows) or O(boundaries).
+	resolveCallsForTest atomic.Int64
+}
+
+// activeSchemaVersion is one entry in the ADR-0049 Chunk C applier
+// active-version cache: the boundary anchor (for diagnostics +
+// future Chunk D backup-envelope use) and the IR schema in effect
+// at and after that anchor.
+type activeSchemaVersion struct {
+	Anchor ir.Position
+	IR     *ir.Table
 }
 
 // SetMaxBufferBytes implements [ir.MaxBufferBytesSetter]. The
@@ -728,6 +777,13 @@ func (a *ChangeApplier) applyOne(ctx context.Context, streamID string, c ir.Chan
 	}
 	if err := a.commitWithTimeout(tx); err != nil {
 		return classifyApplierError(fmt.Errorf("postgres: applier: commit: %w", err))
+	}
+	// ADR-0049 Chunk C cache-after-commit invariant: a SchemaSnapshot
+	// updates the active-version cache ONLY after its tx has
+	// committed durably. A failed dispatch or commit short-circuits
+	// above; the cache is never mutated on the rolled-back path.
+	if snap, isSnap := c.(ir.SchemaSnapshot); isSnap {
+		a.cacheActiveSchemaAfterCommit(snap)
 	}
 	a.reportAppliedToken(ctx, token)
 	return nil

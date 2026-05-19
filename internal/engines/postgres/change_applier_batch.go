@@ -221,8 +221,16 @@ func (a *ChangeApplier) applyOneBatch(ctx context.Context, streamID string, chan
 	// commitBatch position write rides the SAME tx (locked decision
 	// #4a) and the version lands durably before the post-DDL rows
 	// that follow it on the channel are applied.
-	if _, isSnap := first.(ir.SchemaSnapshot); isSnap {
-		return n, lastPos, false, a.commitBatch(ctx, tx, streamID, lastPos.Token, n)
+	if snap, isSnap := first.(ir.SchemaSnapshot); isSnap {
+		if err := a.commitBatch(ctx, tx, streamID, lastPos.Token, n); err != nil {
+			return 0, ir.Position{}, false, err
+		}
+		// ADR-0049 Chunk C cache-after-commit: only after commitBatch
+		// reports nil do we mutate the in-memory active-version cache.
+		// A failed commit short-circuits above; the cache is never
+		// updated on the rolled-back path.
+		a.cacheActiveSchemaAfterCommit(snap)
+		return n, lastPos, false, nil
 	}
 
 	// Idle-flush timer: if no further change arrives within
@@ -296,8 +304,14 @@ func (a *ChangeApplier) applyOneBatch(ctx context.Context, streamID string, chan
 			// position write rides the SAME tx (locked decision #4a)
 			// and the version is durable before the post-DDL rows
 			// (which arrive in later batches) are applied.
-			if _, isSnap := c.(ir.SchemaSnapshot); isSnap {
-				return n, lastPos, false, a.commitBatch(ctx, tx, streamID, lastPos.Token, n)
+			if snap, isSnap := c.(ir.SchemaSnapshot); isSnap {
+				if err := a.commitBatch(ctx, tx, streamID, lastPos.Token, n); err != nil {
+					return 0, ir.Position{}, false, err
+				}
+				// ADR-0049 Chunk C cache-after-commit: see the first-
+				// change branch above for the rolled-back-tx rationale.
+				a.cacheActiveSchemaAfterCommit(snap)
+				return n, lastPos, false, nil
 			}
 			// Byte-cap flush (ADR-0028): bounds the in-flight tx's
 			// buffered parameter memory on wide-row streams. Checked

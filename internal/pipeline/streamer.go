@@ -93,6 +93,30 @@ type targetSchemaSetter interface {
 	SetTargetSchema(name string)
 }
 
+// schemaHistoryCachePrimer is the optional applier-side surface for
+// engines that maintain an ADR-0049 active-version cache (Chunk C).
+// The streamer calls PrimeSchemaHistoryCache once at apply-loop entry
+// so a warm-resumed stream pre-seeds the cache with the schema
+// version in effect at the persisted position — eliminating a
+// per-row resolve, the "O(1) amortised" Consequences mandate.
+//
+// Brand-new streams (cold-start) pass the snapshot-anchor position,
+// which the engine treats as the brand-new-stream sentinel (empty
+// Token) and skips the prime entirely (there is no history yet; the
+// reader's first SchemaSnapshot populates the cache via the engine's
+// post-commit hook). The engine-side contract is documented on each
+// engine's [PrimeSchemaHistoryCache] doc.
+//
+// Engines that don't implement (cross-engine pairs where the applier
+// is in-memory test stub, or a future engine that hasn't shipped
+// Chunk C yet) silently skip — the cache stays empty and the
+// loud-floor resolve fires on the first event needing schema history,
+// which is the pre-Chunk-C behaviour and an acceptable degradation
+// for engines without active-version support.
+type schemaHistoryCachePrimer interface {
+	PrimeSchemaHistoryCache(ctx context.Context, streamID string, currentPos ir.Position) error
+}
+
 // Streamer is the long-running orchestrator: it captures a consistent
 // source snapshot (cold start) or resumes from a previously-persisted
 // position (warm resume), runs the bulk-copy phase if needed, then
@@ -1021,13 +1045,21 @@ func (s *Streamer) runOnce(ctx context.Context) error {
 	// stop is reassigned by coldStart/warmResume below, and a bare
 	// `defer stop()` would bind the no-op value captured here instead
 	// of the real teardown closure.
-	//nolint:gocritic // deferUnlambda: stop is reassigned after this defer; the closure is load-bearing
-	defer func() { stop() }()
+	defer func() { stop() }() //nolint:gocritic // deferUnlambda: stop is reassigned after this defer; the closure is load-bearing
+	// warmResumed tracks whether the apply loop is about to consume
+	// from a CDC reader opened at the persisted position (vs. a fresh
+	// post-snapshot reader). The ADR-0049 Chunk C cache prime keys on
+	// this discriminator: only a true warm-resume primes from
+	// storage; every cold-start path (initial, --reset-target-data
+	// recovery, or warm-resume → ErrPositionInvalid fall-through) is
+	// brand-new-stream-equivalent and skips the prime.
+	var warmResumed bool
 	switch {
 	case s.ResetTargetData:
 		changes, stop, err = s.coldStart(streamCtx, lsnTracker, applier, streamID)
 	case found:
 		changes, stop, err = s.warmResume(streamCtx, persisted, lsnTracker)
+		warmResumed = err == nil
 		// Slot-missing fall-through (ADR-0022) is suppressed when the
 		// position came from a manifest chain: the operator explicitly
 		// asked for "resume from this chain"; silently re-bulking would
@@ -1045,6 +1077,10 @@ func (s *Streamer) runOnce(ctx context.Context) error {
 			// its reader inline). coldStart's stop supersedes it.
 			stop()
 			changes, stop, err = s.coldStart(streamCtx, lsnTracker, applier, streamID)
+			// coldStart supersedes the warm resume — schema-history
+			// stays brand-new from the applier's perspective (the
+			// snapshot bulk-copy reset effective state).
+			warmResumed = false
 		}
 	default:
 		changes, stop, err = s.coldStart(streamCtx, lsnTracker, applier, streamID)
@@ -1056,6 +1092,38 @@ func (s *Streamer) runOnce(ctx context.Context) error {
 		// coldStart returns (nil, nil) when the source schema is
 		// empty — nothing to do.
 		return nil
+	}
+
+	// ---- 4b. ADR-0049 Chunk C: prime the applier's active-version
+	// cache. On warm resume, the persisted position is non-empty and
+	// the prime resolves the schema in effect there for every table
+	// with retained history (one storage hit per primed table; the
+	// hot path stays cache-only thereafter). On cold start, we pass
+	// the brand-new-stream sentinel (empty Position) — the engine
+	// short-circuits to a no-op (there is no schema-history yet; the
+	// reader's first SchemaSnapshot populates the cache via the
+	// engine's post-commit hook).
+	//
+	// A per-table loud floor (errors.Is ir.ErrPositionInvalid) is
+	// propagated verbatim: the persisted position is older than the
+	// oldest retained schema version on some table → ADR-0022
+	// cold-start re-snapshot is the only safe recovery. Surfacing
+	// the error lets the existing runOnce slot-missing fall-through
+	// branch above handle it (loud → cold-start), preserving the
+	// ADR-0049 DP-2 "loud, never silent" floor.
+	//
+	// Optional-interface probe: engines that don't implement the
+	// primer surface (cross-engine pairs where the applier is an
+	// in-memory test stub, or a future engine pre-Chunk-C) silently
+	// skip — pre-Chunk-C behaviour with the loud-floor still intact.
+	if primer, ok := applier.(schemaHistoryCachePrimer); ok {
+		var primePos ir.Position
+		if warmResumed {
+			primePos = persisted
+		}
+		if err := primer.PrimeSchemaHistoryCache(applyCtx, streamID, primePos); err != nil {
+			return wrapWithHint(PhaseCDC, fmt.Errorf("pipeline: prime schema-history cache: %w", err))
+		}
 	}
 
 	// ---- 5. Apply ----

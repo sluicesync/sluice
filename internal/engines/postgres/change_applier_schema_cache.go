@@ -1,0 +1,242 @@
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
+package postgres
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+
+	"github.com/orware/sluice/internal/ir"
+)
+
+// ADR-0049 Chunk C — applier-side active-version cache + prime + lookup.
+//
+// The cache map itself lives on [ChangeApplier.activeSchema] (see the
+// struct doc in change_applier.go for the concurrency contract and the
+// cache-after-commit invariant). This file adds:
+//
+//   - [ChangeApplier.ActiveSchema]: O(1) lookup, exported so downstream
+//     consumers (ADR-0049 Chunk D backup-envelope; future cross-engine
+//     source-IR) can read the active schema without going through
+//     storage. A miss returns (nil, false); the caller decides whether
+//     the miss is loud.
+//
+//   - [ChangeApplier.PrimeSchemaHistoryCache]: one storage hit per
+//     primed table at startup. Loads every retained schema-history
+//     version for the stream, groups by (schema, table), and seeds
+//     the cache with the in-effect version at `currentPos`. Brand-
+//     new streams (zero/initial position) skip the prime entirely —
+//     there is no history yet, and the reader's first SchemaSnapshot
+//     will populate the cache via the post-commit hook. Resume-from-
+//     non-zero primes; a per-table loud floor (ir.ErrPositionInvalid)
+//     surfaces up to the caller (the streamer; ADR-0022 cold-start
+//     path).
+//
+//   - [ChangeApplier.cacheActiveSchemaAfterCommit]: the post-commit
+//     hook the apply paths (applyOne / applyOneBatch / commitBatch)
+//     call AFTER a SchemaSnapshot's tx commits successfully. Cache
+//     writes are applier-goroutine-owned; this helper just records
+//     the same-goroutine mutation in one place so the apply paths
+//     stay readable.
+//
+// Scope fence: this file does NOT touch the pkCache / colTypeCache /
+// generatedColCache (those are target-side caches for the writer
+// path, orthogonal to the source-IR active-version concern); does
+// NOT add a per-row resolve (storage hits are prime-time only —
+// per-row is cache-only via ActiveSchema); does NOT wire backup-
+// envelope (Chunk D); does NOT touch broker / filter / incremental
+// paths (Chunk B's scope-fence handles SchemaSnapshot transit).
+
+// schemaTableKey returns the cache-key for the active-version map.
+// Matches the layout the PG applier's existing pkCache / colTypeCache
+// use (schema + "." + table) so debugging across caches is
+// consistent.
+func schemaTableKey(schema, table string) string {
+	return schema + "." + table
+}
+
+// ActiveSchema returns the IR schema in effect for (schema, table) at
+// the most-recently durably-persisted ADR-0049 boundary, plus an `ok`
+// flag. A miss (no boundary observed yet for this table on this
+// stream, or the table is not in the stream's filter) returns
+// (nil, false); the caller decides whether the miss is loud.
+//
+// O(1) map lookup, applier-goroutine-owned (no lock; see
+// [ChangeApplier.activeSchema] doc). Returning (nil, false) for a
+// miss matches the "consumer decides loudness" contract; in
+// particular, ADR-0049 Chunk D will treat a miss-on-known-table as
+// loud while a miss-on-untracked-table as a benign passthrough.
+func (a *ChangeApplier) ActiveSchema(schema, table string) (*ir.Table, bool) {
+	if a.activeSchema == nil {
+		return nil, false
+	}
+	v, ok := a.activeSchema[schemaTableKey(schema, table)]
+	if !ok {
+		return nil, false
+	}
+	return v.IR, true
+}
+
+// cacheActiveSchemaAfterCommit records the SchemaSnapshot's version
+// into the active-version cache. Called by the apply paths
+// (applyOne / commitBatch) AFTER the tx carrying the SchemaSnapshot
+// dispatch has committed successfully — the cache-after-commit
+// invariant (ADR-0049 Chunk C locked design point 2): a failed /
+// rolled-back tx must NOT leave a cache entry that disagrees with
+// persisted state.
+//
+// Lazily initialises the map for the benefit of unit tests that
+// construct ChangeApplier struct-literal style (the engine's
+// OpenChangeApplier initialises it; the struct-literal path in
+// applier tests does not, and we shouldn't crash on a nil map).
+func (a *ChangeApplier) cacheActiveSchemaAfterCommit(s ir.SchemaSnapshot) {
+	if a.activeSchema == nil {
+		a.activeSchema = make(map[string]activeSchemaVersion)
+	}
+	a.activeSchema[schemaTableKey(s.Schema, s.Table)] = activeSchemaVersion{
+		Anchor: s.Position,
+		IR:     s.IR,
+	}
+}
+
+// distinctSchemaTablesForStream returns the unique (schema, table)
+// pairs present in the schema-history control table for streamID.
+// One round-trip; used at prime time so the prime can call
+// resolveSchemaVersion once per table-with-history rather than
+// requiring the streamer to know the table list (warm resume skips
+// the source-schema read).
+//
+// A stream with no retained versions returns an empty slice; the
+// prime then has nothing to do (cold-start before any boundary, or
+// the brand-new-stream sentinel filtered upstream).
+func distinctSchemaTablesForStream(ctx context.Context, q schemaHistoryQueryer, controlSchema, streamID string) ([]struct{ Schema, Table string }, error) {
+	tableRef := quoteIdent(controlSchema) + "." + quoteIdent(schemaHistoryTableName)
+	sel := "SELECT DISTINCT schema_name, table_name FROM " + tableRef + " " +
+		"WHERE stream_id = $1"
+	rows, err := q.QueryContext(ctx, sel, streamID)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list schema-history tables for stream: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []struct{ Schema, Table string }
+	for rows.Next() {
+		var s, t string
+		if err := rows.Scan(&s, &t); err != nil {
+			return nil, fmt.Errorf("postgres: scan schema-history table row: %w", err)
+		}
+		out = append(out, struct{ Schema, Table string }{s, t})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("postgres: list schema-history tables for stream: %w", err)
+	}
+	return out, nil
+}
+
+// PrimeSchemaHistoryCache seeds the applier's active-version cache
+// from the schema-history control table, AS OF currentPos, for
+// streamID. Called once at apply-loop entry on warm resume.
+//
+// Brand-new-stream discriminator: a zero/initial persisted position
+// (empty Token) skips the prime entirely. The discriminator is the
+// position token: a warm resume by definition carries a non-empty
+// token (the streamer falls through to cold-start otherwise); a
+// cold-start has nothing in the history yet (the first
+// SchemaSnapshot of the stream will populate the cache via the
+// post-commit hook). The streamer's [Streamer.runOnce] documents
+// this contract at the call site.
+//
+// Per-table loud floor: when resolveSchemaVersion surfaces an error
+// wrapping [ir.ErrPositionInvalid] (the table has retained versions
+// but currentPos is below all of them — compacted past, or two
+// incomparable anchors), the error propagates to the caller. The
+// ADR-0022 pipeline path turns it into a cold-start re-snapshot for
+// the affected stream. NEVER swallow the loud error: a silent miss
+// makes every subsequent decode race the wrong schema, the exact
+// silent-mis-decode class ADR-0049 exists to kill.
+//
+// A non-ErrPositionInvalid resolve error (e.g. engine doesn't
+// implement PositionOrderer; a malformed anchor) also propagates
+// loudly — those signal a real bug, not a recoverable resume event.
+//
+// Returns nil after a successful prime; the cache now holds at most
+// one entry per table-with-history. Caches are reset before the
+// load so a re-prime (e.g. after retry) produces a clean state.
+func (a *ChangeApplier) PrimeSchemaHistoryCache(ctx context.Context, streamID string, currentPos ir.Position) error {
+	if streamID == "" {
+		return errors.New("postgres: applier: PrimeSchemaHistoryCache: streamID is empty")
+	}
+	// Brand-new-stream discriminator: skip the prime entirely. A
+	// cold-start has no history yet; the first SchemaSnapshot on the
+	// stream will populate the cache via the post-commit hook.
+	if currentPos.Token == "" {
+		slog.DebugContext(ctx, "postgres: applier: schema-history prime skipped (brand-new stream)",
+			slog.String("stream_id", streamID),
+		)
+		return nil
+	}
+	if a.db == nil {
+		return errors.New("postgres: applier: PrimeSchemaHistoryCache: db is nil")
+	}
+
+	tables, err := distinctSchemaTablesForStream(ctx, a.db, a.controlSchema, streamID)
+	if err != nil {
+		return err
+	}
+	if len(tables) == 0 {
+		// Resume from a non-zero position but no history yet — the DDL
+		// boundary detector has not snapshotted any version on this
+		// stream. The cache stays empty; the reader's next
+		// SchemaSnapshot will populate it.
+		slog.DebugContext(ctx, "postgres: applier: schema-history prime found no retained versions",
+			slog.String("stream_id", streamID),
+			slog.String("position_token", currentPos.Token),
+		)
+		return nil
+	}
+
+	// Reset the cache so a re-prime (after a retry) doesn't leave
+	// stale entries that disagree with the freshly-resolved versions.
+	a.activeSchema = make(map[string]activeSchemaVersion, len(tables))
+
+	engine := Engine{}
+	for _, st := range tables {
+		// Test-only counter: each iteration is one storage hit
+		// (loadRetainedSchemaVersions) + one in-memory resolve.
+		a.resolveCallsForTest.Add(1)
+		t, err := resolveSchemaVersion(ctx, a.db, engine, a.controlSchema, streamID, st.Schema, st.Table, currentPos)
+		if err != nil {
+			return fmt.Errorf("postgres: applier: prime schema-history cache for %s.%s: %w",
+				st.Schema, st.Table, err)
+		}
+		if t == nil {
+			// Defence-in-depth: ResolveSchemaVersion's contract is "never
+			// (nil, nil)"; a nil table with a nil error would be a bug
+			// in the resolve path. Surface loudly rather than silently
+			// caching a nil entry that masquerades as a hit.
+			return fmt.Errorf("postgres: applier: prime schema-history cache for %s.%s: "+
+				"resolve returned nil table with nil error (resolve-path bug)",
+				st.Schema, st.Table)
+		}
+		// We don't carry the resolved anchor through ResolveSchemaVersion's
+		// return today (the resolver returns the table, not the anchor —
+		// the anchor is internal to selection). For the cache's diagnostic
+		// Anchor field we record currentPos as a "primed-at" marker; the
+		// load-bearing field is IR. Chunk D may widen the resolver's
+		// return to include the anchor if backup-envelope handling needs
+		// it; until then, currentPos is the operationally-useful value.
+		a.activeSchema[schemaTableKey(st.Schema, st.Table)] = activeSchemaVersion{
+			Anchor: currentPos,
+			IR:     t,
+		}
+	}
+	slog.DebugContext(ctx, "postgres: applier: schema-history cache primed",
+		slog.String("stream_id", streamID),
+		slog.String("position_token", currentPos.Token),
+		slog.Int("tables", len(tables)),
+	)
+	return nil
+}
