@@ -367,10 +367,15 @@ three clear:
    reconciling-resnapshot beats full re-copy on representative
    tables; the Vitess native-vs-`sluice_watermark` A/B (DP-2) is a
    deliberate part of that evidence.
-2. **Hard-sequencing (DP-3)** — **ADR-0049 DP-1 + its Phase-1c
-   evidence MUST land before any ADR-0050 implementation**; ADR-0050
-   DP-3's correctness is contingent on ADR-0049's per-engine
-   DDL-boundary signal. ADR-0049/0050 stay **separate, not merged**.
+2. **Hard-sequencing (DP-3)** — **ADR-0049 must be *implemented*
+   before any ADR-0050 implementation**; ADR-0050 DP-3's correctness
+   is contingent on ADR-0049's per-engine DDL-boundary signal. Update
+   (2026-05-18): ADR-0049's **design dialogue is now complete (all its
+   DPs resolved) and its Phase-1c evidence is in hand** — so the
+   design+evidence halves of this prerequisite are satisfied; the
+   **sole remaining gate-2 condition is ADR-0049's implementation**
+   (it is implement-ready, not demand-gated). ADR-0049/0050 stay
+   **separate, not merged**.
 3. **Real operator demand** — still demand-gated on an actual
    position-loss case; not scheduled.
 Independent of #37 (pinned). Phase-1c's empirical characterisation of

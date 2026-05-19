@@ -113,9 +113,36 @@ removal of the loud guarantee.
    after-DDL stops forcing a whole-stream re-snapshot) on top of it,
    NOT a fix for an active silent bug (Phase-1c proved none exists on
    this path).
-2. **Retention / compaction.** How far back the history is kept (bounded
-   by the oldest resumable position; compacted past the persisted
-   safe-point) vs. unbounded growth.
+2. **Retention / compaction.** — **RESOLVED (2026-05-18, owner).**
+   DP-1's true-delta rule already bounds growth to ∝ DDL count (not
+   stream volume), so this is a correctness-of-resume question, not a
+   space one — with one non-obvious hazard.
+   - **Retention floor = `min( live persisted CDC safe-point
+     (ADR-0007 sluice_cdc_state), oldest retained backup-chain resume
+     position )`.** Backups pull the floor *backward*: a backup taken
+     at `P_backup`, restored later and CDC-resumed from there, needs
+     the schema version active at `P_backup`; "compact past the live
+     safe-point" alone would discard it. Compact only past the
+     *combined* floor.
+   - **Schema-history is part of the backup envelope** (append-only —
+     already in Consequences): a restored backup carries the schema
+     versions needed to resume from its own position, closing the
+     restore hazard at the source rather than via retention
+     bookkeeping.
+   - **Conservative / non-eager compaction:** growth is tiny (∝ DDL),
+     so default = **retain generously**; compaction past the combined
+     floor is an available maintenance operation, not an aggressive
+     automatic default (cheap-insurance posture).
+   - **Compaction safety invariant (loud floor):** `resolve(position)`
+     for a position older than the oldest retained version = **loud
+     refuse → ADR-0022 cold-start re-snapshot**, never a silent
+     mis-decode. Compaction can therefore never cause silent
+     corruption — worst case is loud + recoverable.
+   - **No backward retention pressure from ADR-0050:** DP-3's
+     re-anchor-at-watermark means a reconciling re-snapshot resolves
+     schema at ≈now, needing no old versions — retention is governed
+     solely by normal resume + backups; the two ADRs stay consistent
+     (this does not reopen DP-3).
 3. **Consistency contract with [ADR-0050](adr-0050-reconciling-resnapshot.md).**
    — **RESOLVED (2026-05-18, owner; recorded symmetrically in
    ADR-0050 DP-3, which carries the full reasoning).** Contract: a
@@ -157,19 +184,22 @@ removal of the loud guarantee.
 
 ## Status / next
 
-Proposed. **DP-1 + DP-3 resolved (2026-05-18, owner); only DP-2
-(retention/compaction) still open.** DP-1's Phase-1c evidence is in
-hand (verified 2026-05-17) — it was never a research gap, only an
-un-recorded resolution; now recorded. Do **not** implement before
-owner sign-off on **DP-2** (the sole remaining design decision) +
-the design being design-first. Independent of #37 (pinned); can
-proceed on its own branch once DP-2 is signed off. **Owner decided
-(2026-05-18): keep ADR-0049 and ADR-0050 *separate, not merged* — but
-hard-sequenced: this ADR (DP-1 now resolved + Phase-1c evidence,
-already satisfied) gates any ADR-0050 implementation** (ADR-0050
-DP-3's correctness is contingent on this ADR's per-engine
-DDL-boundary detection). **Reframe (Phase-1c):** the CDC
-schema-evolution path is *already faithful at the loud floor* — no
-active silent bug — so this ADR is a value/efficiency upgrade
+**Proposed; design dialogue COMPLETE (2026-05-18, owner-endorsed).**
+**All decision points resolved: DP-1, DP-2, DP-3.** No design
+questions remain; the Phase-1c evidence DP-1 needed was always in
+hand (verified 2026-05-17) — never a research gap, only an
+un-recorded resolution, now recorded. **Not demand-gated** (unlike
+ADR-0050) — this has standalone resume-after-DDL value — so it is
+**implement-ready, modulo owner prioritization** (design-first
+sign-off now given across all DPs). Independent of #37 (pinned); can
+proceed on its own branch. **Cross-ADR (owner, 2026-05-18):**
+ADR-0049 and ADR-0050 stay *separate, not merged*, but
+hard-sequenced — ADR-0050 DP-3's correctness is contingent on this
+ADR's per-engine DDL-boundary detection, so **ADR-0049 must be
+*implemented* before any ADR-0050 implementation** (the design +
+Phase-1c halves of that prerequisite are now satisfied; the
+remaining half is this ADR's implementation). **Reframe (Phase-1c):**
+the CDC schema-evolution path is *already faithful at the loud
+floor* — no active silent bug — so this ADR is a value/efficiency upgrade
 (resume-after-DDL without a whole-stream re-snapshot), priority/
 demand-gated, not a correctness emergency.
