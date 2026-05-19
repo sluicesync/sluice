@@ -3,11 +3,15 @@
 ## Status
 
 **Accepted (2026-05-18) — design reviewed and signed off by the owner;
-implementation pending.** The design below is complete and adopted
-as-written, with the four operator-review pin-downs in the next
-section. Not demand-gated and no upstream hard-sequencing dependency
-(see pin-down 2) → implement-ready, modulo owner prioritization
-(target remains a v0.40.x/v0.41.0-class cut). Originating bug:
+implemented.** The design below is complete and adopted as-written,
+with the four operator-review pin-downs in the next section. Not
+demand-gated and no upstream hard-sequencing dependency (see
+pin-down 2). The classifier + retry loop + flags landed in v0.42.0
+and were extended in v0.46.0 / v0.48.0 / v0.52.x; the final
+pin-down-conformance pass (Vitess `code = Unknown` substring added to
+the MySQL classifier, the mandatory pin-down-4 literal-substring
+test, pin-down-3 startup range validation on the three dials, and the
+operator guide) completes the ADR as-written. Originating bug:
 GitHub #13.
 
 ## Operator-review sign-off (2026-05-18)
@@ -205,6 +209,7 @@ Total: probably ~700-1000 LOC + tests + a docs page. Single PR; cuts a v0.40.x o
 
 ## See also
 
+- [Operator guide: CDC streaming retry policy](../operator/cdc-streaming.md) — the operator-facing summary of this ADR
 - ADR-0010 — idempotent applier (the load-bearing precondition)
 - ADR-0027 — source-transaction-boundary CDC batching (preserved by retry)
 - ADR-0007 — position persistence (preserved by retry)

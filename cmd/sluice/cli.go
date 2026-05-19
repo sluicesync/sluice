@@ -510,6 +510,41 @@ type SyncStartCmd struct {
 }
 
 // Run implements `sluice sync start`.
+// Retry-dial bounds from ADR-0038's Configuration table, pinned by
+// the Operator-review sign-off (pin-down 3). Kept as named constants
+// so the bound is greppable and a single source of truth shared by
+// the validator and its test.
+// Lo/Hi rather than Min/Max: revive's time-naming rule reads a
+// "Min"/"Max" suffix on a time.Duration as a unit-specific name.
+const (
+	retryAttemptsLo    = 1
+	retryAttemptsHi    = 64
+	retryBackoffBaseLo = 10 * time.Millisecond
+	retryBackoffBaseHi = 10 * time.Second
+	retryBackoffCapLo  = 1 * time.Second
+	retryBackoffCapHi  = 300 * time.Second
+)
+
+// validateRetryFlags enforces the ADR-0038 pin-down-3 ranges on the
+// three --apply-retry-* dials. Returns a precise error naming the
+// flag, the offending value, and the allowed range so the operator
+// can correct it without consulting the docs.
+func validateRetryFlags(attempts int, base, capDur time.Duration) error {
+	if attempts < retryAttemptsLo || attempts > retryAttemptsHi {
+		return fmt.Errorf("--apply-retry-attempts=%d out of range; ADR-0038 allows %d–%d (1 = no retry)",
+			attempts, retryAttemptsLo, retryAttemptsHi)
+	}
+	if base < retryBackoffBaseLo || base > retryBackoffBaseHi {
+		return fmt.Errorf("--apply-retry-backoff-base=%s out of range; ADR-0038 allows %s–%s",
+			base, retryBackoffBaseLo, retryBackoffBaseHi)
+	}
+	if capDur < retryBackoffCapLo || capDur > retryBackoffCapHi {
+		return fmt.Errorf("--apply-retry-backoff-cap=%s out of range; ADR-0038 allows %s–%s",
+			capDur, retryBackoffCapLo, retryBackoffCapHi)
+	}
+	return nil
+}
+
 func (s *SyncStartCmd) Run(g *Globals) error {
 	cfg, err := config.Load(g.Config)
 	if err != nil {
@@ -530,6 +565,16 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 	}
 	if len(s.IncludeView) > 0 && len(s.ExcludeView) > 0 {
 		return errors.New("--include-view and --exclude-view are mutually exclusive")
+	}
+
+	// ADR-0038 pin-down 3: the three retry dials carry hard ranges.
+	// Out-of-range values are rejected at startup (loud, before any
+	// connection) rather than silently clamped — a clamp would let
+	// an operator believe they configured a 5-minute envelope when
+	// the policy quietly used 300s, masking the actual failure
+	// behaviour the ADR is careful to keep computable.
+	if err := validateRetryFlags(s.ApplyRetryAttempts, s.ApplyRetryBackoffBase, s.ApplyRetryBackoffCap); err != nil {
+		return err
 	}
 	include, exclude := resolveTableFilterArgs(s.IncludeTable, s.ExcludeTable, cfg)
 	filter, err := pipeline.NewTableFilter(include, exclude)
@@ -712,7 +757,8 @@ func (s *SyncStatusCmd) Run(_ *Globals) error {
 	fmt.Fprintln(tw, "STREAM\tUPDATED\tAGE\tPOSITION")
 	now := time.Now()
 	for _, st := range streams {
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n",
+		fmt.Fprintf(
+			tw, "%s\t%s\t%s\t%s\n",
 			st.StreamID,
 			st.UpdatedAt.UTC().Format(time.RFC3339),
 			humanAgo(now.Sub(st.UpdatedAt)),

@@ -29,9 +29,9 @@ import (
 //   - Error 1213 (40001) — InnoDB deadlock detected. Idempotent
 //     replay against the new lock order is the standard recovery.
 //   - Error 1105 (HY000) with vttablet message AND code = Aborted /
-//     Unavailable / ResourceExhausted — Vitess tx-killer rollback,
-//     vttablet not ready, throttler. Routinely transient on
-//     PlanetScale / managed-Vitess.
+//     Unknown / Unavailable / ResourceExhausted — Vitess tx-killer
+//     rollback, vttablet not ready, throttler. Routinely transient
+//     on PlanetScale / managed-Vitess.
 //   - driver.ErrBadConn / io.EOF / connection-reset shapes — the
 //     driver auto-reconnects on the next exec; retrying the batch
 //     on a fresh connection is the right move.
@@ -108,9 +108,9 @@ func classifyApplierError(err error) error {
 	//   - 1105: HY000 — Vitess uses this code to wrap upstream
 	//     gRPC status codes. The message contains "vttablet: rpc
 	//     error: code = X desc = ..." where X is the gRPC code.
-	//     Aborted / Unavailable / ResourceExhausted are transients;
-	//     other gRPC codes (InvalidArgument, NotFound, etc.) are
-	//     terminal.
+	//     Aborted / Unknown / Unavailable / ResourceExhausted are
+	//     transients; other gRPC codes (InvalidArgument, NotFound,
+	//     etc.) are terminal.
 	//   - 1062: duplicate key — explicitly NOT retriable.
 	var mysqlErr *gomysql.MySQLError
 	if errors.As(err, &mysqlErr) {
@@ -143,6 +143,38 @@ func classifyApplierError(err error) error {
 	return err
 }
 
+// vitessRetriableSubstrings is the EXACT set of substrings that mark a
+// MySQL Error 1105 (HY000) as a Vitess-class transient under ADR-0038.
+//
+// ADR-0038 pin-down 4 (Operator-review sign-off, 2026-05-18): Vitess
+// wraps every transient in a free-text `1105 (HY000)` payload — there
+// is no structured gRPC status code to match on, so classification is
+// substring-based. This slice is the single source of truth for that
+// match set; [TestVitessRetriableSubstrings_PinDown4] pins these
+// literals so a future Vitess wording change fails a test rather than
+// silently non-retrying a production transient. Do NOT inline these
+// strings elsewhere — extend this slice and the pin test together.
+//
+//	"vttablet"            — the discriminator tag. A bare HY000
+//	                        without it is a non-Vitess generic error
+//	                        and stays terminal.
+//	"code = Aborted"      — tx-killer rollback, primary stepping down.
+//	"code = Unknown"      — vttablet wraps several internal transients
+//	                        (e.g. caller-id / pool churn) as Unknown;
+//	                        ADR-0038's MySQL table lists it retriable.
+//	"code = Unavailable"  — vttablet not ready, in-flight failover.
+//	"code = ResourceExhausted" — throttler engaged, pool full.
+//
+// Other gRPC codes (InvalidArgument, FailedPrecondition, NotFound,
+// PermissionDenied, …) are terminal — the operator's SQL is wrong or
+// a constraint is being violated; retrying those would mask real bugs.
+var vitessRetriableSubstrings = []string{
+	"code = Aborted",
+	"code = Unknown",
+	"code = Unavailable",
+	"code = ResourceExhausted",
+}
+
 // classifyVitessMessage returns true when a MySQL Error 1105's text
 // contains a Vitess gRPC code that ADR-0038 marks as transient.
 // vttablet error messages have the shape:
@@ -150,26 +182,17 @@ func classifyApplierError(err error) error {
 //	target: <keyspace>.<shard>.<tablettype>: vttablet: rpc error:
 //	code = <CODE> desc = <reason> (<details>)
 //
-// We discriminate on the gRPC code:
-//
-//   - Aborted: tx-killer rollback, tablet primary stepping down
-//   - Unavailable: vttablet not ready, primary in-flight failover
-//   - ResourceExhausted: throttler engaged, connection pool full
-//
-// Other codes (InvalidArgument, FailedPrecondition, etc.) are
-// terminal — the operator's SQL is wrong, or a constraint is being
-// violated. Retrying those would mask real bugs.
+// The match is "vttablet" present AND one of
+// [vitessRetriableSubstrings] present. See that slice's doc comment
+// and ADR-0038 pin-down 4 for why this is substring-based.
 func classifyVitessMessage(msg string) bool {
 	if !strings.Contains(msg, "vttablet") {
 		return false
 	}
-	// Match on "code = X" — Vitess emits these verbatim in the
-	// error text per the gRPC status proto.
-	switch {
-	case strings.Contains(msg, "code = Aborted"),
-		strings.Contains(msg, "code = Unavailable"),
-		strings.Contains(msg, "code = ResourceExhausted"):
-		return true
+	for _, sub := range vitessRetriableSubstrings {
+		if strings.Contains(msg, sub) {
+			return true
+		}
 	}
 	return false
 }
