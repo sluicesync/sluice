@@ -99,6 +99,18 @@ type vstreamCDCReader struct {
 	// decoding.
 	fields map[string][]*query.Field
 
+	// snapshotSig is the per-table structural fingerprint of the
+	// schema-history version last emitted as an [ir.SchemaSnapshot]
+	// (ADR-0049 Chunk B2). Keyed by the same fieldCacheKey as fields.
+	// It implements DP-1 sign-off point ii (true-delta only): VStream
+	// re-emits a FIELD event on (re)start / per-table first-touch
+	// *without* any DDL; a new schema-history version is emitted ONLY
+	// when the projected (column-name, ordered-type) signature differs
+	// from the one already snapshotted for that key. Absent key = no
+	// version snapshotted yet for that table → the first real FIELD is
+	// always a true delta.
+	snapshotSig map[string]ir.SchemaSignature
+
 	// currentVgtid is the latest position the reader has observed.
 	// VStream emits a VGTID after each transaction; we update this
 	// then promote it to the candidate position emitted alongside
@@ -189,13 +201,14 @@ func openVStreamReader(ctx context.Context, dsn string) (ir.CDCReader, error) {
 	}
 
 	return &vstreamCDCReader{
-		endpoint:   endpoint,
-		authHeader: authHeader,
-		keyspace:   cfg.DBName,
-		shards:     shards,
-		conn:       conn,
-		client:     vtgateservice.NewVitessClient(conn),
-		fields:     make(map[string][]*query.Field),
+		endpoint:    endpoint,
+		authHeader:  authHeader,
+		keyspace:    cfg.DBName,
+		shards:      shards,
+		conn:        conn,
+		client:      vtgateservice.NewVitessClient(conn),
+		fields:      make(map[string][]*query.Field),
+		snapshotSig: make(map[string]ir.SchemaSignature),
 	}, nil
 }
 
@@ -588,7 +601,7 @@ func (r *vstreamCDCReader) dispatch(ctx context.Context, ev *binlogdata.VEvent, 
 		}
 		key := fieldCacheKey(fe.GetShard(), fe.GetTableName())
 		r.fields[key] = fe.GetFields()
-		return nil
+		return r.maybeSnapshotSchema(ctx, fe, out)
 
 	case binlogdata.VEventType_ROW:
 		return r.dispatchRow(ctx, ev, out)
@@ -690,6 +703,95 @@ func (r *vstreamCDCReader) dispatchDDL(ctx context.Context, ev *binlogdata.VEven
 	}
 
 	clear(r.fields)
+	return nil
+}
+
+// maybeSnapshotSchema is the ADR-0049 Chunk B2 boundary path. On
+// every FIELD event it projects the just-cached field metadata into an
+// [ir.Table] (the in-stream position-anchored snapshot — NEVER a fresh
+// information_schema re-introspection, locked decision #2) and emits an
+// [ir.SchemaSnapshot] iff the projected (column-name, ordered-type)
+// signature differs from the one already snapshotted for this table
+// (locked DP-1 sign-off point ii: true-delta only — VStream re-emits
+// FIELD on (re)start / first-touch and a naive "an event arrived"
+// trigger would bloat the history with no-op versions and break DP-2's
+// retention ∝ DDL-count assumption).
+//
+// The anchor is the FIELD event's OWN position — r.currentVgtid as of
+// FIELD detection, BEFORE any post-DDL ROW advances it (locked
+// decision #4c: the boundary event's own position captured at
+// detection, never the first subsequent row's; else a replayed event
+// between the DDL and the first post-DDL row resolves to the pre-DDL
+// schema — the exact silent-mis-decode this ADR kills).
+//
+// Ordering vs the loud floor: the SchemaSnapshot is emitted on the
+// FIELD event itself, strictly before the first post-FIELD ROW for
+// the table, so the existing "row event for %q without preceding
+// FIELD event" hard error (dispatchRow) is untouched — this path adds
+// a durable version write ahead of the rows, it never swallows or
+// reorders the floor.
+//
+// A projection failure is fatal to the stream (returned as an error
+// → the pump's setErr → stream stops loudly): a column whose
+// ColumnType can't be mapped must not be silently dropped from a
+// persisted schema-history version (locked decision #4b; the
+// loud-failure tenet).
+func (r *vstreamCDCReader) maybeSnapshotSchema(ctx context.Context, fe *binlogdata.FieldEvent, out chan<- ir.Change) error {
+	keyspace := fe.GetKeyspace()
+	if keyspace == "" {
+		keyspace = r.keyspace
+	}
+	// The reader is bound to a single keyspace via the DSN; a FIELD
+	// event for an unrelated keyspace carries no table the applier
+	// could host a schema-history row for. Skip — symmetric with
+	// dispatchDDL's keyspace gate.
+	if keyspace != r.keyspace {
+		return nil
+	}
+	table := stripKeyspaceFromTable(fe.GetTableName(), keyspace)
+
+	tbl, err := projectVStreamFields(keyspace, table, fe.GetFields())
+	if err != nil {
+		if errors.Is(err, errFieldMetadataUnavailable) {
+			// Position-anchored metadata absent on this FIELD event —
+			// degrade to the pre-ADR-0049 safe floor (no version
+			// written → a later resume across a real DDL on this table
+			// falls back to ir.ErrPositionInvalid → ADR-0022
+			// cold-start). NOT fatal: the loud ROW-without-FIELD floor
+			// (dispatchRow) is untouched, and halting an otherwise-
+			// healthy stream over a minimal FIELD shape the decode
+			// path already tolerates would be an availability
+			// regression with no correctness gain. See
+			// errFieldMetadataUnavailable's LEAD-REVIEW note.
+			return nil
+		}
+		// A present-but-unmappable ColumnType is a genuine unknown
+		// type — fatal/loud (#4b; the loud-failure tenet).
+		return err
+	}
+
+	cacheKey := fieldCacheKey(fe.GetShard(), fe.GetTableName())
+	sig := ir.SchemaSignatureOf(tbl)
+	if prev, ok := r.snapshotSig[cacheKey]; ok && prev.Equal(sig) {
+		// No-op FIELD re-emit (restart / first-touch / reconnect with
+		// no DDL): not a true delta — do NOT write a new version.
+		return nil
+	}
+
+	pos, err := r.positionFor()
+	if err != nil {
+		return err
+	}
+
+	if err := send(ctx, out, ir.SchemaSnapshot{
+		Position: pos,
+		Schema:   keyspace,
+		Table:    table,
+		IR:       tbl,
+	}); err != nil {
+		return err
+	}
+	r.snapshotSig[cacheKey] = sig
 	return nil
 }
 
