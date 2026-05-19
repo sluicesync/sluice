@@ -403,6 +403,15 @@ func (r *CDCReader) pump(ctx context.Context, conn *pgconn.PgConn, startLSN pglo
 	defer func() { _ = conn.Close(ctx) }()
 
 	relations := map[uint32]*relationCacheEntry{}
+	// snapshotSig is the per-relation structural fingerprint of the
+	// schema-history version last emitted as an [ir.SchemaSnapshot]
+	// (ADR-0049 Chunk B3). Keyed by relation OID, parallel to
+	// relations. Implements DP-1 sign-off point ii (true-delta only):
+	// pgoutput re-sends a RelationMessage on reconnect / first-touch
+	// *without* any DDL; a new schema-history version is written ONLY
+	// when the projected (column-name, ordered-type) signature differs
+	// from the one already snapshotted for that OID.
+	snapshotSig := map[uint32]ir.SchemaSignature{}
 	streamedLSN := startLSN
 	currentTxnLSN := startLSN
 	// currentTxnStartLSN is the WAL position of the BEGIN record for
@@ -486,7 +495,7 @@ func (r *CDCReader) pump(ctx context.Context, conn *pgconn.PgConn, startLSN pglo
 				r.setErr(fmt.Errorf("postgres: cdc: parse xlogdata: %w", err))
 				return
 			}
-			if err := r.dispatchWAL(ctx, xld, relations, &currentTxnLSN, &currentTxnStartLSN, &streamedLSN, &inStream, firstSeenRelLSN, out); err != nil {
+			if err := r.dispatchWAL(ctx, xld, relations, snapshotSig, &currentTxnLSN, &currentTxnStartLSN, &streamedLSN, &inStream, firstSeenRelLSN, out); err != nil {
 				r.setErr(err)
 				return
 			}
@@ -508,6 +517,7 @@ func (r *CDCReader) dispatchWAL(
 	ctx context.Context,
 	xld pglogrepl.XLogData,
 	relations map[uint32]*relationCacheEntry,
+	snapshotSig map[uint32]ir.SchemaSignature,
 	currentTxnLSN *pglogrepl.LSN,
 	currentTxnStartLSN *pglogrepl.LSN,
 	streamedLSN *pglogrepl.LSN,
@@ -537,7 +547,7 @@ func (r *CDCReader) dispatchWAL(
 			slog.String("wal_start", xld.WALStart.String()),
 			slog.String("server_wal_end", xld.ServerWALEnd.String()),
 		)
-		return nil
+		return r.maybeSnapshotSchema(ctx, entry, m.RelationID, xld.WALStart, snapshotSig, out)
 
 	case *pglogrepl.RelationMessage:
 		entry, err := buildRelationCacheEntry(*m)
@@ -553,7 +563,7 @@ func (r *CDCReader) dispatchWAL(
 			slog.String("wal_start", xld.WALStart.String()),
 			slog.String("server_wal_end", xld.ServerWALEnd.String()),
 		)
-		return nil
+		return r.maybeSnapshotSchema(ctx, entry, m.RelationID, xld.WALStart, snapshotSig, out)
 
 	case *pglogrepl.BeginMessage:
 		*currentTxnLSN = m.FinalLSN
@@ -1032,6 +1042,70 @@ func send(ctx context.Context, out chan<- ir.Change, c ir.Change) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// maybeSnapshotSchema is the ADR-0049 Chunk B3 boundary path. On
+// every pgoutput RelationMessage it projects the just-built,
+// already-IR-typed relationCacheEntry into an [ir.Table] (the
+// in-stream position-anchored snapshot — pgoutput's RelationMessage
+// IS the position-anchored metadata; no re-introspection, locked
+// decision #2) and emits an [ir.SchemaSnapshot] iff the projected
+// (column-name, ordered-type) signature differs from the one already
+// snapshotted for this relation OID (locked DP-1 sign-off point ii:
+// true-delta only — pgoutput re-sends Relation on reconnect /
+// first-touch *without* any DDL; a naive "a Relation arrived" trigger
+// would bloat the history with no-op versions and break DP-2's
+// retention ∝ DDL-count assumption).
+//
+// The anchor is the RelationMessage's OWN WAL position (xld.WALStart,
+// passed as relLSN) — captured at detection, BEFORE the first
+// post-DDL row's LSN (locked decision #4c: a replayed event between
+// the Relation and the first post-DDL row must resolve to the
+// post-DDL schema; the Relation always precedes its rows in WAL so
+// WALStart ≤ every subsequent row LSN and the PG LSN-≤ orderer
+// resolves correctly).
+//
+// Out-of-scope schemas are skipped, mirroring the emit-side
+// rel.Schema != r.schema gate: the applier hosts schema-history rows
+// only for the bound schema's tables; a version for a relation whose
+// rows are never applied would be dead weight.
+//
+// A loud floor is preserved: this path only ADDS a durable version
+// write ahead of the relation's rows; the existing "insert/update/
+// delete for unknown relation OID" hard errors in emit* are
+// untouched. A send failure propagates (fatal/loud, decision #4b).
+func (r *CDCReader) maybeSnapshotSchema(
+	ctx context.Context,
+	rel *relationCacheEntry,
+	relID uint32,
+	relLSN pglogrepl.LSN,
+	snapshotSig map[uint32]ir.SchemaSignature,
+	out chan<- ir.Change,
+) error {
+	if rel.Schema != r.schema {
+		return nil // out-of-scope schema; no schema-history row to host
+	}
+	tbl := projectRelation(rel)
+	sig := ir.SchemaSignatureOf(tbl)
+	if prev, ok := snapshotSig[relID]; ok && prev.Equal(sig) {
+		// No-op Relation re-emit (reconnect / first-touch with no
+		// DDL): not a true delta — do NOT write a new version.
+		return nil
+	}
+	pos, err := r.positionAt(relLSN)
+	if err != nil {
+		return err
+	}
+	if err := send(ctx, out, ir.SchemaSnapshot{
+		Position: pos,
+		Schema:   rel.Schema,
+		Table:    rel.Name,
+		IR:       tbl,
+	}); err != nil {
+		return err
+	}
+	snapshotSig[relID] = sig
+	return nil
 }
 
 // buildRelationCacheEntry projects a [pglogrepl.RelationMessage] into

@@ -49,6 +49,29 @@ type relationColumn struct {
 	KeyColumn bool // RelationMessageColumn.Flags & 1
 }
 
+// projectRelation builds an [ir.Table] from a relationCacheEntry —
+// the ADR-0049 Chunk B3 boundary projector. The entry is ALREADY
+// IR-typed (buildRelationCacheEntry resolved every column's OID via
+// oidToType when the RelationMessage arrived), so this is the
+// cheapest of the three engine boundary paths: no re-introspection,
+// no second type mapping (the locked decision #2 "build from
+// in-stream position-anchored metadata, never re-introspection" is
+// satisfied for free — pgoutput's RelationMessage IS that metadata).
+//
+// Nullability is not carried on a pgoutput RelationMessage column
+// (the protocol only sends name/OID/typmod/key-flag), so projected
+// columns are left Nullable=false. The schema-history decode contract
+// (ir.SchemaSignature) compares only column name + IR type, so this
+// does not affect resolve correctness — it is a faithful projection
+// of exactly what the wire carries.
+func projectRelation(rel *relationCacheEntry) *ir.Table {
+	cols := make([]*ir.Column, len(rel.Columns))
+	for i, c := range rel.Columns {
+		cols[i] = &ir.Column{Name: c.Name, Type: c.Type}
+	}
+	return &ir.Table{Schema: rel.Schema, Name: rel.Name, Columns: cols}
+}
+
 // oidToType maps a Postgres data-type OID (as carried in
 // RelationMessageColumn.DataType) to the corresponding IR type.
 // Unknown OIDs return an error rather than a fallback — silent
