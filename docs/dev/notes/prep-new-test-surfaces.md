@@ -270,3 +270,58 @@ After v0.54.0 cycle clears clean, candidate next chunks (in suggested order):
 - PII Phase 1 prep: `docs/dev/notes/prep-pii-redaction-phase-1.md`
 - Inline rotation prep: `docs/dev/notes/prep-backup-chain-rotation.md`
 - Vultr continuous-validation prep: `docs/dev/notes/prep-continuous-validation-on-vultr.md`
+
+## Idea 3 — Real-world schema corpus (2026-05-18, in progress)
+
+Operator-requested 2026-05-18: collect publicly-available real-world
+schemas to exercise sluice's schema reader + cross-engine translation
+against operator-shaped reality (deep FK graphs, partitioning, real
+default expressions, actual extension usage, naming conventions) —
+the things the synthetic fuzz generator won't produce. Complements,
+does not replace, the fuzz harness and the sqllogictest DDL corpus
+(Idea 1). `sakila`/`pagila` (shipped quickstart) is the existing
+matched-pair baseline; this widens beyond it.
+
+**Shortlist (ranked by sluice-specific leverage):**
+
+1. **MediaWiki abstract schema** — one expert-authored abstract schema
+   (JSON) that *generates* MySQL + PG + SQLite DDL → a
+   guaranteed-equivalent cross-engine **oracle** (stronger than
+   independently-authored sakila/pagila). Highest single value;
+   setup needs MediaWiki's generateSchemaSql maintenance step (or its
+   committed generated `.sql`).
+2. **GitLab `db/structure.sql`** — biggest open real **PG** schema
+   (partitioning, hundreds of tables, MIT). Stresses the PG reader at
+   scale + the PG→MySQL loud-refusal surface with real feature
+   density. Secondary: Discourse / Mastodon / Zulip (mature PG with
+   jsonb/arrays/citext/hstore → realistic ADR-0032 extension usage).
+3. **pgloader regression/test schemas** — pgloader is *the* MySQL→PG
+   tool; its corpus is the adversarial MySQL→PG set sluice should also
+   pass (direct prior art).
+4. **WordPress** core schema (+ Drupal/phpBB/Matomo) — the canonical
+   operator-brought **MySQL** shape (unsigned, ENUM/SET, utf8mb4
+   collations, fulltext).
+5. **Chinook** + **TPC-H/C/DS** — more cheap matched cross-engine
+   pairs; decimal/numeric-heavy, big FK graphs.
+6. **Vitess `examples/` + vttestserver + PlanetScale sample apps** —
+   the make-or-break audience (Track 1b).
+
+**Discipline:** schema-only DDL (no data → no data-licensing); per
+corpus record source + license + upstream commit; fetch-on-demand
+script + small committed fixtures, not vendored dumps.
+
+**Plan (iterative; do not boil the ocean):**
+- Signal first = sluice **schema-read + cross-engine dry-run/preview**
+  (where translation bugs live); full data-migrate is a later
+  expansion (heavier, lower bug-yield/effort).
+- **Iteration 1** (in progress): Chinook (ready-made matched MySQL+PG
+  → instant oracle) + GitLab `structure.sql` (one fetch, big real PG)
+  — proves the collect→provenance→read→translate→report loop.
+- **Iteration 2+:** MediaWiki abstract schema, pgloader tests,
+  WordPress, then Vitess/PS samples (Track-1b-adjacent).
+- Corpus lives under a gitignored fetch dir + a provenance manifest;
+  a build-tagged harness reads each via sluice's schema reader and
+  records refuse/translate outcomes (extends Idea 1's pattern).
+
+Status: collection + iteration-1 testing started 2026-05-18 ahead of
+the implement-ready ADR backlog, at operator direction.
