@@ -151,6 +151,11 @@ tag-then-watch; the v0.67.0 retag-trap class).
 
 ## Owner checkpoint ask (the 5 go/no-go decisions)
 
+> **CLEARED 2026-05-19 — all 5 ratified as recommended.** Canonical
+> sign-off record is ADR-0049 §"Implementation checkpoint sign-off".
+> Chunk A is now implement-ready; this section is retained as the
+> historical ask. ADR-0050 stays hard-blocked behind A–D.
+
 1. History payload format = the existing `internal/ir/backup.go`
    tagged-union JSON codec, reused verbatim? (ambiguity #1)
 2. Acknowledge the VStream `[]*query.Field → ir.Table` projector is

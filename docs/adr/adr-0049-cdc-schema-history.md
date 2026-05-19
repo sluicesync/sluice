@@ -213,6 +213,53 @@ demand-gated, not a correctness emergency.
 [`docs/dev/notes/adr-0049-implementation-readiness.md`](../dev/notes/adr-0049-implementation-readiness.md)
 — code-grounded phased chunk plan (A–E), the three implementation
 ambiguities, four hot-path checkpoint decisions, the test matrix, and
-the ADR-0050 A–D sequencing gate. Awaiting the owner interactive
-checkpoint (5 go/no-go decisions); Chunk A can begin immediately once
-answered. Design is complete — no design questions remain.
+the ADR-0050 A–D sequencing gate. **Owner checkpoint CLEARED
+(2026-05-19): all 5 go/no-go decisions ratified as recommended — see
+§"Implementation checkpoint sign-off" below.** Design is complete, no
+design questions remain, and the implementation-level decisions are
+now locked. **Chunk A is implement-ready.**
+
+## Implementation checkpoint sign-off (2026-05-19)
+
+Owner-ratified (all five accepted as recommended; not a re-opened
+dialogue — these are implementation-level decisions, distinct from the
+design DP-1/2/3 sign-off above). Locked:
+
+1. **History payload format = the existing `internal/ir/backup.go`
+   tagged-union JSON codec, reused verbatim.** Rationale: the IR's
+   sealed `Type`/`DefaultValue` can't round-trip plain `encoding/json`;
+   that codec is the only proven serializer, and DP-2 already requires
+   schema-history to ride the same backup envelope. A new codec would
+   duplicate sealed-interface logic for no gain.
+2. **The VStream `[]*query.Field → ir.Table` projector is in-scope
+   new load-bearing code.** The snapshot is built from in-stream
+   position-anchored metadata, **never** re-introspection (the ADR
+   rejects re-introspection in Alternatives). This is the single
+   largest new surface; binlog/PG boundary paths are cheaper.
+3. **Position ordering = an engine-supplied predicate** ("is P ≤
+   anchor A"), a new optional engine interface mirroring the existing
+   `verifyPositionResumable`/`verifyGTIDSetReachable` pattern — NOT a
+   generic token string-compare. Keeps the history table
+   engine-neutral storage with engine-owned ordering.
+4. **Hot-path correctness invariants (all three ratified):**
+   (a) the history-version write is in the **same target tx** as the
+   ADR-0007 position write (a cross-tx crash desyncs them → spurious
+   ADR-0022 cold-start); (b) a history-write failure is **fatal/loud**,
+   never logged-and-continued (a lost version silently degrades future
+   resume — loud-failure tenet); (c) the version anchor is the
+   **DDL/FIELD/Relation event's own position captured at detection**,
+   not the first subsequent row's (else replay between DDL and first
+   post-DDL row silently resolves to the pre-DDL schema — the exact
+   silent-mis-decode class this ADR exists to kill).
+5. **Chunk sequencing approved:** `A → (B1 ∥ B2 ∥ B3) → C → D → E`;
+   B1/B2/B3/C are concurrency chunks (the `-race`-integration-gate-
+   before-tag rule applies). **ADR-0050 implementation stays
+   hard-blocked until ADR-0049 Chunks A–D land + green** (ADR-0050
+   DP-3 correctness is contingent on ADR-0049's per-engine boundary
+   detection being live in code).
+
+Chunk A (additive `sluice_cdc_schema_history` control table +
+`ir`-schema serialization via the (1) codec + `resolveSchemaVersion`
+with the below-floor → `ir.ErrPositionInvalid` loud refuse) is a
+**non-concurrency** chunk (pure storage + lookup) → standard
+tag-then-watch flow; it is the implement-ready entry point.
