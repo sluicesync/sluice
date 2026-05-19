@@ -2,8 +2,15 @@
 
 ## Status
 
-**Accepted (2026-05-16).** Design signed off after a design
-dialogue; implementation pending, ships **v0.67.0**. This
+**Accepted (2026-05-16); implemented and shipped in v0.67.0**
+(commit `1e3f3ca` — `feat(v0.67.0): ADR-0046 native bounded-segment
+lineage + inline rotation`; hardened by Bug 66 / v0.67.1). (Status
+reconciled 2026-05-19: the prior "implementation pending" wording was
+stale — verified against code, not the doc: the bounded-segment
+lineage + `lineage.json` clean-break + `--compression` with zstd
+default landed under that commit; `internal/pipeline/chain_catalog.go`,
+`chain_prune.go`, `chain_restore.go`, and the compress codec carry
+the segment model.) This
 **supersedes the earlier grafted-rotation draft of this ADR**
 (tombstone + `SucceededBy` markers bolted onto an unbounded chain).
 The decision is the **native bounded-segment lineage model**, as
