@@ -86,23 +86,22 @@ tx-ready but **deliberately not wired** to the live applier (that is
 Chunk B/C). Reviewed against the locked decisions; gate green
 (golangci-lint 0 issues on changed pkgs; `ir` unit tests pass).
 
-> **CROSS-CHUNK PREREQUISITE for B/C (do not lose this).** The `ir`
-> backup codec (`MarshalType`/`UnmarshalType`, reused verbatim per
-> locked decision #1) has **no `case Bit` and no `case ExtensionType`**
-> — both hit its loud `default: "unsupported IR type for backup
-> encoding"`. Consequence: once B/C snapshot *real* tables, any table
-> carrying a `ir.Bit`/`ir.BitVarying` column (catalog Bug 62/77 — PG
-> `bit`/`varbit`) or an `ir.ExtensionType` column (the ADR-0032
-> catalogued 7: vector/pg_trgm/hstore/citext/postgis/pgcrypto/uuid-ossp;
-> note `VerbatimType`/ADR-0047 *is* handled) will **loud-fail the
-> schema-history write** — correct loud-not-silent behaviour (no
-> corruption), but a functional blocker for those schemas. **Extending
-> the backup codec with `Bit` + `ExtensionType` cases (+ round-trip
-> pins per the value-types matrix) is a hard prerequisite that must
-> land before — or as the first step of — Chunk B/C.** It was
-> out-of-scope for Chunk A (locked decision #1 = reuse the codec
-> *verbatim*; extending it is its own change, not an A improvisation).
-> Tracked as a task; surfaces loudly so it cannot silently regress.
+> **CROSS-CHUNK PREREQUISITE for B/C — RESOLVED 2026-05-19
+> (`e2969e3`).** The `ir` backup codec (`MarshalType`/`UnmarshalType`)
+> previously had no `case Bit`/`case ExtensionType` → both hit the
+> loud `default`, so once B/C snapshot real tables any
+> `ir.Bit`/`varbit` (catalog Bug 62/77) or ADR-0032-catalogued
+> `ir.ExtensionType` column (vector/pg_trgm/hstore/citext/postgis/
+> pgcrypto/uuid-ossp; `VerbatimType`/ADR-0047 was already handled)
+> would have loud-failed the schema-history write. **Fixed:** both
+> codec cases added (`Bit`: `Length` reuses the envelope string-length
+> field + new append-only `BitVarying`; `ExtensionType`:
+> `Extension`/`Name`/`Modifiers` envelope fields were already
+> provisioned, only the cases were missing), with round-trip pins in
+> *both* matrices (`backup_test` `TestMarshalType_RoundTrip` +
+> `schema_history_test` `codecTypeMatrix` Table-level) covering
+> fixed/varying bit and ext with/without modifiers — pin the class.
+> Chunk B/C are no longer blocked on this.
 
 ## 3. Hot-path checkpoint decisions (concrete, options+tradeoffs)
 
