@@ -72,6 +72,38 @@ on a later chunk — validate-end-to-end-before-building tenet).
 | **D** | backup-envelope inclusion (append-only, no format bump) + retention floor = `min(ADR-0007 safe-point, oldest retained backup resume pos)` | `internal/ir/backup.go`, `internal/pipeline/backup.go`+restore | No |
 | **E** | full cross-engine + regression-pin consolidation | (test-only) | gate before tag |
 
+### Chunk A — LANDED 2026-05-19 (origin/main `db212c8`)
+
+`ir.PositionOrderer` (partial-order `PositionAtOrAfter`, lead-designed,
+Bug-74-trap-avoided) + `ir.ResolveSchemaVersion` (loud floor: no
+anchor / partial-order-ambiguous / nil-orderer → loud, the last two
+not-`ErrPositionInvalid` vs cold-start as appropriate) +
+`ir.MarshalTable`/`UnmarshalTable` (thin reuse of the existing Column
+tagged-union codec, decision #1) + additive `sluice_cdc_schema_history`
+(both engines, `sluice_cdc_state` additive pattern) + MySQL
+(GTID-subset) / PG (LSN ≤) `PositionOrderer` impls. Store API is
+tx-ready but **deliberately not wired** to the live applier (that is
+Chunk B/C). Reviewed against the locked decisions; gate green
+(golangci-lint 0 issues on changed pkgs; `ir` unit tests pass).
+
+> **CROSS-CHUNK PREREQUISITE for B/C (do not lose this).** The `ir`
+> backup codec (`MarshalType`/`UnmarshalType`, reused verbatim per
+> locked decision #1) has **no `case Bit` and no `case ExtensionType`**
+> — both hit its loud `default: "unsupported IR type for backup
+> encoding"`. Consequence: once B/C snapshot *real* tables, any table
+> carrying a `ir.Bit`/`ir.BitVarying` column (catalog Bug 62/77 — PG
+> `bit`/`varbit`) or an `ir.ExtensionType` column (the ADR-0032
+> catalogued 7: vector/pg_trgm/hstore/citext/postgis/pgcrypto/uuid-ossp;
+> note `VerbatimType`/ADR-0047 *is* handled) will **loud-fail the
+> schema-history write** — correct loud-not-silent behaviour (no
+> corruption), but a functional blocker for those schemas. **Extending
+> the backup codec with `Bit` + `ExtensionType` cases (+ round-trip
+> pins per the value-types matrix) is a hard prerequisite that must
+> land before — or as the first step of — Chunk B/C.** It was
+> out-of-scope for Chunk A (locked decision #1 = reuse the codec
+> *verbatim*; extending it is its own change, not an A improvisation).
+> Tracked as a task; surfaces loudly so it cannot silently regress.
+
 ## 3. Hot-path checkpoint decisions (concrete, options+tradeoffs)
 
 - **HP-1 — where the active version lives.** (a) reader-side cache
