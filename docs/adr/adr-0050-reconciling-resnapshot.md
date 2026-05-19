@@ -19,14 +19,15 @@ re-snapshot watermark*).
 **endorsed** by the owner — worthwhile to pursue, with real cost data
 to be gathered during testing to confirm it stays worth its weight
 (see Consequences: this is source-heavy by nature; the empirical
-validation is an explicit gate, not a formality). **DP-1–DP-4
-resolved** (recorded below); new **DP-5** added (checksum compute-
-location) out of the storage/egress sub-thread — **DP-5 is the only
-one still open**; status stays **Proposed** until it is signed off.
-Owner also fixed the structural question (DP-3): ADR-0049/0050 stay
-**separate but hard-sequenced** (ADR-0049 DP-1 + Phase-1c before any
-0050 implementation). Still demand-gated: do not implement ahead of a
-real operator hitting the position-loss pain.
+validation is an explicit gate, not a formality). **ALL decision
+points resolved — DP-1–DP-5 (recorded below) plus the structural
+question** (ADR-0049/0050 stay **separate but hard-sequenced**:
+ADR-0049 DP-1 + Phase-1c before any 0050 implementation). The
+design dialogue is **complete**. Status remains **Proposed** —
+implementation is gated now only on the three non-design gates
+(empirical-validation, ADR-0049-DP-1 sequencing, real operator
+demand), not on any further design decision. Do not implement ahead
+of a real operator hitting the position-loss pain.
 
 ## Context
 
@@ -259,21 +260,37 @@ recovery.
    (reusing this fingerprint), not a new top-level feature on the
    recovery path — keeps the existing `sluice verify` surface
    coherent.
-5. **Checksum compute-location** *(open; new — from the storage/egress
-   sub-thread).* Two modes with different cost/coverage:
-   **(a) push-down** — the source/target engine computes the block
-   hash in SQL (`SHA2()` / `digest()`), only the 128-bit fingerprint
-   crosses the wire → near-zero egress (directly the PlanetScale
-   *cost* relief), but comparable only **same-engine** and depends on
-   engine value-rendering (not the IR contract).
-   **(b) in-sluice** — sluice reads both sides' rows and hashes over
-   the value-types.md IR-canonical form → **cross-engine**-correct and
-   contract-stable, but the source read is itself wire traffic / PS
-   egress (still a big net win vs full re-ship). Decision needed:
-   whether v1 ships (b) only (simplest, cross-engine, correctness-
-   general) or both (b)+(a) (a as the same-engine egress-optimal fast
-   path). DP-1's hash resolves per-mode: SHA-256-in-Go for (b);
-   engine-native `SHA2(...,256)`/`digest(...,'sha256')` for (a).
+5. **Checksum compute-location** — **RESOLVED (2026-05-18).** Modes:
+   **(a) push-down** — engine computes the block hash in SQL
+   (`SHA2()`/`digest()`), only the 128-bit fingerprint crosses the
+   wire → near-zero egress (the *direct* lever for the PlanetScale
+   source-read cost), but **same-engine only** and carries the
+   `pt-table-checksum` SQL-canonicalization footguns
+   (NULL-vs-empty / type / collation / float / decimal / session
+   settings) — must be engineered so they can only ever cause a
+   harmless false-*diverged*, never a false-*match* (DP-1 asymmetry).
+   **(b) in-sluice** — sluice hashes over the `value-types.md`
+   IR-canonical form (DP-1 as written) → cross-engine-correct,
+   contract-stable; the source read is the egress (still a big net
+   win vs full re-ship).
+   **Decoupling that resolves the tension:** push-down only needs to
+   power the **skip-gate decision** (sole invariant: *never
+   false-match*; **not** position-anchored — a skip is safe whenever
+   ranges currently match, CDC syncs forward from the re-anchor). The
+   **reconcile of diverged ranges always goes through the position-
+   anchored watermark/VStream path (DP-2/DP-3) regardless of mode** —
+   cheap divergence *detection* (push-down) is separable from
+   consistent divergence *repair* (anchored).
+   **Decision: v1 = (b) in-sluice only.** Push-down **(a) deferred to
+   v1.1, evidence-gated** — the DP-2 empirical A/B is designed to
+   *measure* the in-sluice source-read egress; that data decides
+   whether (a)'s same-engine-only second mechanism + canonicalization
+   hardening is justified (consistent with the measure-first,
+   complexity-on-evidence stance held throughout). The fingerprint /
+   skip-gate is built **mode-pluggable** so (a) slots in with **no
+   rework** when evidence justifies. DP-1's hash resolves per-mode:
+   SHA-256-in-Go for (b) now; engine-native `SHA2(...,256)` /
+   `digest(...,'sha256')` for (a) in v1.1.
 
 ## Consequences
 
@@ -341,18 +358,23 @@ recovery.
 
 ## Status / next
 
-**Proposed; direction owner-endorsed (2026-05-18).** DP-1–DP-4
-resolved; **only DP-5 still open** — do **not** implement before
-owner sign-off on it *and* the empirical cost-validation gate (Consequences: real testing data must show
-reconciling-resnapshot beats full re-copy on representative tables;
-the Vitess native-vs-watermark A/B is a deliberate part of that
-evidence) *and* the hard-sequencing dependency: **ADR-0049 DP-1 +
-Phase-1c evidence MUST land before any ADR-0050 implementation**
-(DP-3). Owner decided ADR-0049/0050 stay **separate but
-hard-sequenced** (not merged). Still demand-gated on a real operator
-position-loss case. Independent of #37 (pinned). Phase-1c's empirical
-characterisation of the *current* re-snapshot granularity feeds DP-3
-and the Consequences.
-
-Next dialogue round: DP-5 (compute-location: in-sluice only vs
-+push-down) — the last open decision point.
+**Proposed; design dialogue COMPLETE (2026-05-18, owner-endorsed).**
+**All decision points resolved: DP-1–DP-5 + the structural
+question.** No design questions remain open. Implementation is gated
+**only** on three non-design gates — do **not** implement until all
+three clear:
+1. **Empirical cost-validation** — real testing data must show
+   reconciling-resnapshot beats full re-copy on representative
+   tables; the Vitess native-vs-`sluice_watermark` A/B (DP-2) is a
+   deliberate part of that evidence.
+2. **Hard-sequencing (DP-3)** — **ADR-0049 DP-1 + its Phase-1c
+   evidence MUST land before any ADR-0050 implementation**; ADR-0050
+   DP-3's correctness is contingent on ADR-0049's per-engine
+   DDL-boundary signal. ADR-0049/0050 stay **separate, not merged**.
+3. **Real operator demand** — still demand-gated on an actual
+   position-loss case; not scheduled.
+Independent of #37 (pinned). Phase-1c's empirical characterisation of
+the *current* re-snapshot granularity feeds DP-3 and the
+Consequences. When promoted: v1 = in-sluice checksum (b), flat
+adaptive chunks, three-way engine-asymmetric watermark, recovery-only;
+v1.1 evidence-gated = push-down (a) + recursive bisection.
