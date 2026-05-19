@@ -2,10 +2,29 @@
 
 ## Status
 
-Phase A complete; Path A's design hypothesis empirically falsified. Path B (dual-slot) and other mitigation paths remain on the table; no strict-zero-loss implementation has shipped. The verification test
-(`internal/engines/postgres/slot_pause_verify_integration_test.go`) is committed as a permanent ground-truth artifact for the next iteration.
-
-This ADR documents the empirical finding so the next chunk doesn't re-litigate it.
+**RESOLVED — superseded by [ADR-0036](adr-0036-mid-stream-loss-surface-characterization.md); strict-zero-loss SHIPPED v0.32.0.**
+Phase A here empirically falsified Path A (slot-pause) — that finding
+stands, permanently, and the verification test
+(`internal/engines/postgres/slot_pause_verify_integration_test.go`)
+stays committed as the ground-truth regression artifact (re-run on
+any future slot-retention-style proposal). This ADR's recommended
+**Path D** ("diagnose the actual v0.24.0 loss surface FIRST") was then
+taken by ADR-0036: a four-round diagnose campaign localized the real
+loss to `internal/engines/postgres/change_applier.go::dispatch`
+silently dropping events via the `errUnknownTable` branch (target
+table absent between publication-add and `CREATE TABLE`). The
+strict-zero-loss fix shipped in **v0.32.0** (~150 LOC: create the
+target table *before* `ALTER PUBLICATION ADD TABLE` +
+`runBulkCopyForAddTable` through `ir.IdempotentRowWriter`;
+`TestAddTable_LiveMode_PG_UnderLoad` tightened to a strict zero-loss
+assertion). **Forward options B (dual-slot) / C (operator quiesce)
+were shed for this surface** (retained only for unrelated edge cases).
+This ADR is therefore a **closed historical record** (Path-A
+falsification + the Path-D recommendation that ADR-0036 executed) —
+**not an open planning item**; do not re-litigate Path A or re-open
+B/C/D for this surface. (Status reconciled 2026-05-18 during an
+ADR-status audit; the prior "no strict-zero-loss implementation has
+shipped / paths remain on the table" wording predated v0.32.0.)
 
 ## Context
 
