@@ -103,6 +103,50 @@ Chunk B/C). Reviewed against the locked decisions; gate green
 > fixed/varying bit and ext with/without modifiers — pin the class.
 > Chunk B/C are no longer blocked on this.
 
+### Chunk B (B1+B2+B3) — LANDED 2026-05-19 (origin/main `d76601a`)
+
+Subagent 5 commits + lead scope-fence fix, reviewed against the locked
+decisions. B1 binlog (QUERY-event GTID frozen at `clear(schemaCache)`
+into `pendingDDLAnchor`, deferred emit — #4c), B2 VStream FIELD-delta +
+the `[]*query.Field → ir.Table` projector (routes through the canonical
+`translateType`, no parallel switch — avoids the Bug-74 divergence
+class; full family matrix pinned), B3 PG pgoutput Relation-delta. New
+sealed `ir.SchemaSnapshot` Change variant carries the snapshot
+reader→applier so the version write lands in the **same tx as the
+ADR-0007 position write** (#4a); failure → tx rollback → loud stop
+(#4b). True-delta gate = `ir.SchemaSignature.Equal`
+(`reflect.DeepEqual` on IR types — a VARCHAR(10)→(20) / DECIMAL /
+ENUM-set change IS a delta; Bug-74 discipline).
+
+> **Cross-cutting regression caught in review (lead) + fixed in the
+> same landing (`d76601a`).** The CDC reader emits `SchemaSnapshot` on
+> the *same* change stream `internal/pipeline/incremental.go` feeds to
+> `changeChunkWriter.WriteChange` → `encodeChange`'s unknown-type
+> `default` would have **loud-aborted an incremental backup on the
+> first DDL in the window** (pre-Chunk-B a DDL there did not abort).
+> Fix: `WriteChange` scope-fence-skips `SchemaSnapshot` (no record, no
+> count) so backups stay byte-identical to pre-Chunk-B; a
+> restore+resume uses the unchanged loud ADR-0022 cold-start floor.
+> **Chunk D supersedes this skip with real backup-envelope handling**
+> (carry schema-history versions in the envelope so a restored backup
+> resumes without cold-start) — until D, the skip is the correct,
+> loud-floor-preserving scope fence, NOT a silent loss.
+
+Accepted subagent judgement calls (assessed, tenet-consistent): absent
+in-stream `ColumnType` (minimal-fixture edge, not a production path) →
+degrade to the existing `ErrPositionInvalid` cold-start floor rather
+than halt an otherwise-healthy stream — a *present-but-unmappable* type
+still hard-fails loud per #4b; the `SchemaSnapshot` variant + the
+Truncate-class batched-applier handling are the only #4a-satisfying
+shapes. Pre-existing (NOT Chunk B) `psverify` build break tracked
+separately (not a required CI gate). Concurrency chunk → CI Integration
+`-race` is the authoritative gate (lead-watched to completion).
+
+**Remaining:** Chunk C (hot-path active-version resolve cache, O(1)
+amortised — concurrency chunk), Chunk D (backup-envelope inclusion +
+retention floor — supersedes the B scope-fence skip), Chunk E
+(consolidation). ADR-0050 still hard-blocked behind A–D.
+
 ## 3. Hot-path checkpoint decisions (concrete, options+tradeoffs)
 
 - **HP-1 — where the active version lives.** (a) reader-side cache
