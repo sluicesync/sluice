@@ -208,3 +208,11 @@ the CDC schema-evolution path is *already faithful at the loud
 floor* — no active silent bug — so this ADR is a value/efficiency upgrade
 (resume-after-DDL without a whole-stream re-snapshot), priority/
 demand-gated, not a correctness emergency.
+
+**Implementation-readiness brief (2026-05-19):**
+[`docs/dev/notes/adr-0049-implementation-readiness.md`](../dev/notes/adr-0049-implementation-readiness.md)
+— code-grounded phased chunk plan (A–E), the three implementation
+ambiguities, four hot-path checkpoint decisions, the test matrix, and
+the ADR-0050 A–D sequencing gate. Awaiting the owner interactive
+checkpoint (5 go/no-go decisions); Chunk A can begin immediately once
+answered. Design is complete — no design questions remain.
