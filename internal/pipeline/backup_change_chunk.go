@@ -124,6 +124,21 @@ func (w *changeChunkWriter) WriteChange(c ir.Change) error {
 	if w.closed {
 		return errors.New("change chunk writer closed")
 	}
+	// ADR-0049 Chunk B scope-fence: the CDC reader now emits
+	// [ir.SchemaSnapshot] boundary events on the SAME change stream the
+	// incremental-backup writer consumes (internal/pipeline/incremental.go).
+	// Chunk B is the live-apply schema-history path; carrying schema
+	// history *in the backup envelope* is explicitly Chunk D. Until D,
+	// skip it here — a DDL during a backup window must NOT abort the
+	// backup (pre-Chunk-B behaviour: a backup taken now legitimately
+	// carries no schema history; a restore+resume falls to the unchanged
+	// loud ADR-0022 cold-start floor). Skipping (no record, no count)
+	// keeps the chunk byte-identical to pre-Chunk-B. Chunk D replaces
+	// this with real envelope handling — NOT a silent loss: it is the
+	// documented pre-D state, and the resume path is loud.
+	if _, ok := c.(ir.SchemaSnapshot); ok {
+		return nil
+	}
 	wire, err := encodeChange(c)
 	if err != nil {
 		return err

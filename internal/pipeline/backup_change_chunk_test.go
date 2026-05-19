@@ -201,3 +201,41 @@ func rowsEquivalent(a, b ir.Row) bool {
 	}
 	return true
 }
+
+// TestChangeChunk_SchemaSnapshot_SkippedNotErrored pins the ADR-0049
+// Chunk B scope-fence: the CDC reader emits ir.SchemaSnapshot on the
+// same stream the incremental-backup writer consumes. Until Chunk D
+// carries schema history in the backup envelope, WriteChange must SKIP
+// a SchemaSnapshot (return nil, write no record, no count bump) — a
+// DDL during a backup window must not abort the backup via
+// encodeChange's unknown-type loud error. Regression guard for the
+// cross-cutting break Chunk B introduced.
+func TestChangeChunk_SchemaSnapshot_SkippedNotErrored(t *testing.T) {
+	buf := &bytes.Buffer{}
+	w, err := newChangeChunkWriter(buf, nil, CodecGzip)
+	if err != nil {
+		t.Fatalf("newChangeChunkWriter: %v", err)
+	}
+	snap := ir.SchemaSnapshot{
+		Position: ir.Position{Engine: "mysql", Token: "gtid:1-9"},
+		Schema:   "app",
+		Table:    "users",
+		IR:       &ir.Table{Name: "users", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}},
+	}
+	if err := w.WriteChange(snap); err != nil {
+		t.Fatalf("WriteChange(SchemaSnapshot) must skip, not error; got %v", err)
+	}
+	if w.ChangeCount() != 0 {
+		t.Fatalf("SchemaSnapshot must not be counted (scope-fenced until Chunk D); count=%d", w.ChangeCount())
+	}
+	// A real change after a skipped snapshot still works + counts.
+	if err := w.WriteChange(ir.Insert{
+		Position: ir.Position{Engine: "mysql", Token: "gtid:1-10"},
+		Schema:   "app", Table: "users", Row: ir.Row{"id": int64(1)},
+	}); err != nil {
+		t.Fatalf("WriteChange(Insert) after skipped snapshot: %v", err)
+	}
+	if w.ChangeCount() != 1 {
+		t.Fatalf("post-snapshot Insert must count; count=%d", w.ChangeCount())
+	}
+}
