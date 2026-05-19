@@ -183,7 +183,7 @@ jobs:
   # platforms anyway. The cross-OS Test job above already covers OS-
   # specific compile and test concerns for the unit suite.
   integration:
-    name: Integration
+    name: Integration (${{ matrix.shard.name }})
     runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
     # 45m outer envelope. Was 60m through v0.28.0 (job also ran the
     # additive postgis-tagged suite); v0.29.0 split postgis into its
@@ -203,6 +203,50 @@ jobs:
     # inner < outer (keep the diagnostic-panic-before-hard-kill margin)
     # — when raising for self-hosted, set them together (e.g. 90 / 75m).
     timeout-minutes: ${{ fromJSON(vars.CI_INTEGRATION_JOB_TIMEOUT || '45') }}
+    # Matrix-shard the integration suite by package + by test-name
+    # within the dominant internal/pipeline package (228 test
+    # functions vs 18 mysql + 14 postgres files; `TestMigrate_` alone
+    # is 106 — 46% of pipeline). On the 4-runner self-hosted fleet
+    # the four shards run in parallel → wall time drops from ~39m
+    # monolithic to ~max(longest shard) ≈ 18–20m.
+    #
+    # `pipeline-migrate` and `pipeline-rest` exactly partition the
+    # pipeline package: `-run ^TestMigrate_` and `-skip ^TestMigrate_`
+    # are exact complements over the same regex (a test either
+    # matches the pattern or it doesn't), so the union covers every
+    # test the old single shard ran with zero overlap. Go 1.20+
+    # required for `-skip`; go.mod pins >= 1.26.
+    #
+    # `engines-postgres-and-rest` defensively bundles the small
+    # non-pipeline / non-mysql-engine packages (ir, translate,
+    # redact, crypto, config) so any future integration-tagged file
+    # outside pipeline/engines/mysql is still gated — without forcing
+    # a 5th shard the 4-runner fleet would need to queue.
+    #
+    # The rollup job below (`integration-summary`, name: Integration)
+    # preserves the existing required-status-check name so branch
+    # protection on `main` does NOT need to be updated.
+    #
+    # The 45m/35m budget rationale above still applies PER SHARD;
+    # each shard runs less work than the old monolith so headroom is
+    # more generous than strictly needed (pipeline-migrate is the
+    # long pole at ~18–20m). Variable-driven knobs unchanged.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard:
+          - name: pipeline-migrate
+            packages: "./internal/pipeline/"
+            goflags: "-run ^TestMigrate_"
+          - name: pipeline-rest
+            packages: "./internal/pipeline/"
+            goflags: "-skip ^TestMigrate_"
+          - name: engines-mysql
+            packages: "./internal/engines/mysql/..."
+            goflags: ""
+          - name: engines-postgres-and-rest
+            packages: "./internal/engines/postgres/... ./internal/ir/... ./internal/translate/... ./internal/redact/... ./internal/crypto/... ./internal/config/..."
+            goflags: ""
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-go@v6
@@ -256,7 +300,31 @@ jobs:
       # progressing — slower box, NOT a logic regression). Inner budget
       # is CI_INTEGRATION_TIMEOUT (default 35m); raise it with the outer
       # CI_INTEGRATION_JOB_TIMEOUT for self-hosted (invariant above).
-      - run: go test -tags=integration -race -count=1 -timeout=${{ vars.CI_INTEGRATION_TIMEOUT || '35m' }} ./internal/...
+      - run: go test -tags=integration -race -count=1 -timeout=${{ vars.CI_INTEGRATION_TIMEOUT || '35m' }} ${{ matrix.shard.goflags }} ${{ matrix.shard.packages }}
+
+  # ----- Integration (rollup) -----
+  # Rolls up the four `integration` matrix shards into a single
+  # required status check NAMED `Integration` — preserving the
+  # branch-protection check name so `main`'s required-checks list
+  # does NOT need to be updated when the matrix shape changes. All
+  # shards must succeed; any failure (or cancellation) fails the
+  # rollup. `if: always()` ensures this job runs even when a matrix
+  # shard fails so the rollup reports a definite verdict (a skipped
+  # `needs:`-job is the GitHub default when a dependency fails and
+  # would leave the required check stuck "expected — waiting").
+  integration-summary:
+    name: Integration
+    needs: integration
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: assert all integration shards succeeded
+        run: |
+          echo "matrix result: ${{ needs.integration.result }}"
+          if [ "${{ needs.integration.result }}" != "success" ]; then
+            echo "::error::one or more Integration shards did not succeed (result=${{ needs.integration.result }})"
+            exit 1
+          fi
 
   # ----- Integration: PostGIS -----
   # Split out as a separate parallel job in v0.29.0 (was in-line as a
