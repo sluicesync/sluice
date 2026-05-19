@@ -33,6 +33,24 @@ type Position struct {
 // it's merely degraded — `wal_status='lost'` stays strict).
 var ErrPositionInvalid = errors.New("ir: persisted position is no longer valid; cold-start is the only recovery path")
 
+// PositionOrderer is an optional Engine capability the ADR-0049 CDC
+// schema-history store uses to resolve an event's position to the
+// schema version in effect at that position. Positions are
+// engine-opaque (ADR-0007); only the engine can order them. The
+// ordering is a PARTIAL "is-at-or-after" causal predicate — MySQL GTID
+// sets are subsets, NOT a total order; modelling them as a -1/0/1
+// comparator is the Bug-74-class trap and is explicitly rejected.
+type PositionOrderer interface {
+	// PositionAtOrAfter reports whether event position p is at or
+	// after anchor — i.e. whether the schema snapshotted at anchor is
+	// the one in effect for an event at p. Reuse the engine's existing
+	// causal test (MySQL: GTID-subset, the verifyGTIDSetReachable
+	// primitive; PG: LSN <=). err is non-nil ONLY for a
+	// malformed/unparseable position (a real bug), never for an
+	// ordinary "false" answer.
+	PositionAtOrAfter(p, anchor Position) (bool, error)
+}
+
 // Row is a single tuple of values keyed by column name. Values use
 // Go-native types corresponding to the column's IR type; the engine
 // reader is responsible for converting from driver-native types into

@@ -500,6 +500,39 @@ type Argon2idParams struct {
 	KeyLen uint32 `json:"key_len,omitempty"`
 }
 
+// MarshalTable serialises a single [Table] through the same tagged-
+// union JSON codec the backup manifest uses. It is a thin wrapper over
+// the standard json marshaller — [Column.MarshalJSON] does the sealed-
+// interface (Type / DefaultValue) work and Table's other fields are
+// concrete, so the natural struct shape round-trips. Exposed so the
+// ADR-0049 schema-history store has a named, documented entrypoint
+// rather than open-coding json.Marshal at the call site; this is NOT a
+// second serialization scheme — it composes the existing Column codec
+// verbatim (ADR-0049 locked decision #1).
+func MarshalTable(t *Table) ([]byte, error) {
+	if t == nil {
+		return []byte("null"), nil
+	}
+	b, err := json.Marshal(t)
+	if err != nil {
+		return nil, fmt.Errorf("marshal table %q: %w", t.Name, err)
+	}
+	return b, nil
+}
+
+// UnmarshalTable is the inverse of [MarshalTable]. Returns nil for a
+// JSON null / empty input (mirrors the codec's other Unmarshal* helpers).
+func UnmarshalTable(b []byte) (*Table, error) {
+	if len(b) == 0 || string(b) == "null" {
+		return nil, nil
+	}
+	var t Table
+	if err := json.Unmarshal(b, &t); err != nil {
+		return nil, fmt.Errorf("decode table: %w", err)
+	}
+	return &t, nil
+}
+
 // MarshalJSON for [Schema] uses the tagged-union envelope so the
 // sealed Type / DefaultValue interfaces round-trip through standard
 // encoding/json. Same wire shape as the in-memory struct, but with

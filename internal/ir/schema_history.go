@@ -1,0 +1,153 @@
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
+package ir
+
+import (
+	"errors"
+	"fmt"
+)
+
+// ADR-0049 CDC schema-history — engine-neutral resolve.
+//
+// The schema-history store persists, at every detected DDL boundary, a
+// snapshot of the affected table's IR schema keyed by the source
+// position the boundary was observed at (the "anchor"). On resume /
+// replay the applier must decode each event against the schema version
+// that was in effect AT THAT EVENT'S POSITION, not "schema now".
+//
+// Storage and the SQL that loads retained versions is engine-specific
+// (it mirrors the sluice_cdc_state control-table layering exactly —
+// per-engine DDL, placeholders, schema-qualification). What is
+// engine-NEUTRAL is the resolve algorithm: given the retained versions
+// for a key and an event position, pick the schema in effect there.
+// That is this file. It depends only on [PositionOrderer] (the engine
+// supplies the causal ordering; positions are engine-opaque per
+// ADR-0007) and the [Table] codec, so it lives in the IR package the
+// engines already depend on.
+//
+// Chunk-A scope fence: this is storage + serialization + resolve + the
+// orderer impls only. No DDL-boundary detection, no hot-path cache, no
+// applier wiring (ADR-0049 chunks B/C/D).
+
+// RetainedSchemaVersion is one persisted schema-history row as loaded
+// from the engine's sluice_cdc_schema_history control table: the
+// boundary's source position (engine-opaque token) and the IR table
+// snapshot serialized via the [MarshalTable] codec. The engine-
+// specific loader produces these; [ResolveSchemaVersion] consumes
+// them.
+type RetainedSchemaVersion struct {
+	// Anchor is the source position the DDL boundary was observed at
+	// (ADR-0049 HP-3: the boundary event's OWN position, captured at
+	// detection — wired in a later chunk; Chunk A only stores/resolves).
+	Anchor Position
+
+	// TableJSON is the affected table's IR schema, [MarshalTable]-
+	// encoded. Decoded lazily (only the selected version is
+	// deserialized) via [UnmarshalTable].
+	TableJSON []byte
+}
+
+// ResolveSchemaVersion selects, from versions, the schema in effect at
+// event position p and returns its decoded [Table].
+//
+// Selection rule: among all retained anchors A with
+// orderer.PositionAtOrAfter(p, A) == true (p is at or after the
+// boundary A was snapshotted at), pick the GREATEST such A — the most
+// recent boundary at or before p — and return its table. "Greatest" is
+// defined by the same partial order: A1 is greater than A2 when
+// PositionAtOrAfter(A1, A2) is true and the reverse is false. Because
+// the order is PARTIAL (MySQL GTID sets — the Bug-74-class trap a
+// total-order comparator would walk into), the satisfying set may have
+// no unique greatest element; that ambiguity is itself a loud
+// ErrPositionInvalid (a resolve that cannot pick a single in-effect
+// schema must not guess).
+//
+// Loud floor (ADR-0049 DP-2):
+//
+//   - orderer == nil (engine does not implement [PositionOrderer]) →
+//     a loud error, NOT a silent string-compare degrade. Ordering is
+//     a correctness primitive; an engine without it cannot host the
+//     schema-history feature, and pretending otherwise is exactly the
+//     silent-mis-decode class this ADR exists to kill.
+//   - No retained anchor satisfies p (p is older than the oldest
+//     retained version — compacted past, or a replay before the first
+//     boundary) → an error wrapping [ErrPositionInvalid], which the
+//     pipeline's existing ADR-0022 path turns into a loud cold-start
+//     re-snapshot. Never a silent mis-decode.
+func ResolveSchemaVersion(orderer PositionOrderer, versions []RetainedSchemaVersion, p Position) (*Table, error) {
+	if orderer == nil {
+		return nil, errors.New("ir: schema-history resolve: engine does not implement PositionOrderer; " +
+			"position ordering is required and there is no safe fallback (loud-failure tenet)")
+	}
+	if len(versions) == 0 {
+		return nil, fmt.Errorf("ir: schema-history resolve: no retained schema version for position %+v "+
+			"(below the retention floor / before the first boundary): %w", p, ErrPositionInvalid)
+	}
+
+	bestIdx := -1
+	for i := range versions {
+		atOrAfter, err := orderer.PositionAtOrAfter(p, versions[i].Anchor)
+		if err != nil {
+			return nil, fmt.Errorf("ir: schema-history resolve: ordering p vs anchor %+v: %w",
+				versions[i].Anchor, err)
+		}
+		if !atOrAfter {
+			continue
+		}
+		if bestIdx == -1 {
+			bestIdx = i
+			continue
+		}
+		// Keep whichever of (current best, candidate i) is the GREATER
+		// anchor under the partial order. A candidate is strictly
+		// greater when it is at-or-after the current best AND the
+		// current best is not at-or-after it. If neither dominates the
+		// other, the satisfying set has no unique most-recent version
+		// — loud, never a guess.
+		cAfterB, err := orderer.PositionAtOrAfter(versions[i].Anchor, versions[bestIdx].Anchor)
+		if err != nil {
+			return nil, fmt.Errorf("ir: schema-history resolve: ordering anchor %+v vs anchor %+v: %w",
+				versions[i].Anchor, versions[bestIdx].Anchor, err)
+		}
+		bAfterC, err := orderer.PositionAtOrAfter(versions[bestIdx].Anchor, versions[i].Anchor)
+		if err != nil {
+			return nil, fmt.Errorf("ir: schema-history resolve: ordering anchor %+v vs anchor %+v: %w",
+				versions[bestIdx].Anchor, versions[i].Anchor, err)
+		}
+		switch {
+		case cAfterB && !bAfterC:
+			// candidate strictly greater → it wins
+			bestIdx = i
+		case bAfterC && !cAfterB:
+			// current best strictly greater → keep it
+		case cAfterB && bAfterC:
+			// mutually at-or-after = equivalent anchors (same boundary
+			// re-observed); either is fine, keep the current best.
+		default:
+			// Neither dominates: two distinct boundaries both at-or-
+			// before p but unordered relative to each other. No single
+			// in-effect schema → loud.
+			return nil, fmt.Errorf("ir: schema-history resolve: position %+v has two "+
+				"incomparable candidate schema versions (anchors %+v and %+v); cannot pick a "+
+				"single in-effect schema: %w", p, versions[bestIdx].Anchor, versions[i].Anchor,
+				ErrPositionInvalid)
+		}
+	}
+
+	if bestIdx == -1 {
+		return nil, fmt.Errorf("ir: schema-history resolve: no retained schema version at or before "+
+			"position %+v (below the retention floor / before the first boundary): %w", p, ErrPositionInvalid)
+	}
+
+	t, err := UnmarshalTable(versions[bestIdx].TableJSON)
+	if err != nil {
+		return nil, fmt.Errorf("ir: schema-history resolve: decode selected version (anchor %+v): %w",
+			versions[bestIdx].Anchor, err)
+	}
+	if t == nil {
+		return nil, fmt.Errorf("ir: schema-history resolve: selected version (anchor %+v) decoded to a "+
+			"nil table (corrupt history row): %w", versions[bestIdx].Anchor, ErrPositionInvalid)
+	}
+	return t, nil
+}
