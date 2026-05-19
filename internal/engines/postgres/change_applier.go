@@ -463,8 +463,13 @@ func (a *ChangeApplier) Close() error {
 // `sluice_cdc_state` stays in `public` (or whatever the DSN selects)
 // even when user data lands in `customer_svc.users` etc. One control
 // table per target host serves multiple target-schema streams.
+// The ADR-0049 sluice_cdc_schema_history table is created in the same
+// controlSchema, additively — it never touches sluice_cdc_state data.
 func (a *ChangeApplier) EnsureControlTable(ctx context.Context) error {
-	return ensureControlTable(ctx, a.db, a.controlSchema)
+	if err := ensureControlTable(ctx, a.db, a.controlSchema); err != nil {
+		return err
+	}
+	return ensureSchemaHistoryTable(ctx, a.db, a.controlSchema)
 }
 
 // ReadPosition returns the last persisted source position for
