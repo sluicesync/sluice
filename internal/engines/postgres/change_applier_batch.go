@@ -216,6 +216,15 @@ func (a *ChangeApplier) applyOneBatch(ctx context.Context, streamID string, chan
 		return n, lastPos, false, a.commitBatch(ctx, tx, streamID, lastPos.Token, n)
 	}
 
+	// ADR-0049 Chunk B3: a SchemaSnapshot was just dispatched onto
+	// `tx` (the version write). Commit it as a 1-change batch so the
+	// commitBatch position write rides the SAME tx (locked decision
+	// #4a) and the version lands durably before the post-DDL rows
+	// that follow it on the channel are applied.
+	if _, isSnap := first.(ir.SchemaSnapshot); isSnap {
+		return n, lastPos, false, a.commitBatch(ctx, tx, streamID, lastPos.Token, n)
+	}
+
 	// Idle-flush timer: if no further change arrives within
 	// defaultIdleFlushPeriod, commit the partial batch so the slot's
 	// confirmed_flush_lsn can advance past the in-flight work
@@ -280,6 +289,14 @@ func (a *ChangeApplier) applyOneBatch(ctx context.Context, streamID string, chan
 			lastPos = c.Pos()
 			batchBytes += ir.ApproximateChangeBytes(c)
 			if _, isTruncate := c.(ir.Truncate); isTruncate {
+				return n, lastPos, false, a.commitBatch(ctx, tx, streamID, lastPos.Token, n)
+			}
+			// ADR-0049 Chunk B3: the SchemaSnapshot's version write
+			// just landed on `tx`; flush now so the commitBatch
+			// position write rides the SAME tx (locked decision #4a)
+			// and the version is durable before the post-DDL rows
+			// (which arrive in later batches) are applied.
+			if _, isSnap := c.(ir.SchemaSnapshot); isSnap {
 				return n, lastPos, false, a.commitBatch(ctx, tx, streamID, lastPos.Token, n)
 			}
 			// Byte-cap flush (ADR-0028): bounds the in-flight tx's

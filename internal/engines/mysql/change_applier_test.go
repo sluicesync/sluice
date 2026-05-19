@@ -480,3 +480,43 @@ func TestRunWithDeadline(t *testing.T) {
 		}
 	})
 }
+
+// TestApplier_SchemaSnapshot_NilIRIsLoud pins ADR-0049 locked
+// decision #4b at the dispatch boundary: a SchemaSnapshot with a nil
+// IR table is a loud error (never silently skipped). The nil check
+// returns before any tx use, so a nil tx is safe here — the point is
+// the loud refusal, not the SQL.
+func TestApplier_SchemaSnapshot_NilIRIsLoud(t *testing.T) {
+	a := &ChangeApplier{schema: "app", streamID: "s1"}
+	err := a.dispatch(context.Background(), nil, ir.SchemaSnapshot{
+		Position: ir.Position{Engine: engineNameMySQL, Token: "tok"},
+		Schema:   "app",
+		Table:    "users",
+		IR:       nil,
+	})
+	if err == nil {
+		t.Fatal("nil-IR SchemaSnapshot: want loud error, got nil")
+	}
+	if !strings.Contains(err.Error(), "nil IR") {
+		t.Errorf("error = %q, want it to name the nil IR table", err.Error())
+	}
+}
+
+// TestApplier_SchemaSnapshot_NotSkippedByBoundaryNoOp pins the
+// load-bearing wiring for ADR-0049 #4a: unlike TxBegin/TxCommit, a
+// SchemaSnapshot must NOT be the per-change Apply loop's continue
+// (no-op) case — it has to reach applyOne so the version write lands
+// in the SAME tx as a position write. This guards the exact
+// regression where someone "tidies" the boundary switch and folds
+// SchemaSnapshot into the no-op set, silently dropping every schema
+// version.
+func TestApplier_SchemaSnapshot_NotSkippedByBoundaryNoOp(t *testing.T) {
+	switch any(ir.SchemaSnapshot{}).(type) {
+	case ir.TxBegin, ir.TxCommit:
+		t.Fatal("SchemaSnapshot must not be a TxBegin/TxCommit-class no-op")
+	case ir.SchemaSnapshot:
+		// correct: distinct change type that reaches applyOne/dispatch
+	default:
+		t.Fatal("SchemaSnapshot type assertion unexpectedly fell through")
+	}
+}

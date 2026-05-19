@@ -160,3 +160,65 @@ func TestSchemaHistory_WriteResolveRoundTrip(t *testing.T) {
 		t.Fatalf("below-floor resolve must wrap ir.ErrPositionInvalid; got %v", err)
 	}
 }
+
+// TestSchemaHistory_VersionAndPosition_SameTxAtomicity is the
+// locked-decision-#4a integration pin: the schema-version write and
+// the ADR-0007 position write MUST be the same target transaction, so
+// a failure in the version write rolls back the position write (a
+// cross-tx crash that persists a position whose schema version isn't
+// durable causes a spurious ADR-0022 cold-start). We inject a
+// version-write failure (the schema-history table is absent) inside a
+// tx that has already written the position, then assert the position
+// row never landed after the rollback.
+func TestSchemaHistory_VersionAndPosition_SameTxAtomicity(t *testing.T) {
+	dsn, cleanup := startMySQLForApplier(t)
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if err := ensureControlTable(ctx, db); err != nil {
+		t.Fatalf("ensureControlTable: %v", err)
+	}
+	// Deliberately do NOT create sluice_cdc_schema_history so the
+	// version write inside the tx fails (table doesn't exist).
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	// Position write succeeds first (mirrors applyOne ordering: data
+	// + version on the tx, then writePositionTx).
+	if err := writePositionTx(ctx, tx, "atomic-stream", "tok-after-ddl", "", "", ""); err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("writePositionTx: %v", err)
+	}
+	// Version write on the SAME tx fails (no schema-history table).
+	anchor := ir.Position{Engine: engineNameMySQL, Token: "tok-after-ddl"}
+	verr := writeSchemaVersion(ctx, tx, "atomic-stream", "", "users", anchor,
+		&ir.Table{Name: "users", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}})
+	if verr == nil {
+		_ = tx.Rollback()
+		t.Fatal("expected version write to fail (schema-history table absent), got nil")
+	}
+	// #4b: the failure is fatal/loud — the caller rolls back the
+	// WHOLE tx, so the position write must NOT be durable.
+	if err := tx.Rollback(); err != nil {
+		t.Fatalf("rollback: %v", err)
+	}
+
+	_, ok, err := readPosition(ctx, db, "atomic-stream")
+	if err != nil {
+		t.Fatalf("readPosition: %v", err)
+	}
+	if ok {
+		t.Fatal("position row IS present after a version-write failure + rollback — " +
+			"version and position are NOT in the same tx (#4a violated; spurious-cold-start class)")
+	}
+}

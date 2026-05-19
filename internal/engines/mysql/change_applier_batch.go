@@ -198,6 +198,18 @@ func (a *ChangeApplier) applyOneBatch(ctx context.Context, streamID string, chan
 		return 1, first.Pos(), false, nil
 	}
 
+	// ADR-0049 Chunk B: a SchemaSnapshot as the first change applies
+	// alone via applyOne — which writes the version AND a position in
+	// ONE tx (locked decision #4a). Treating it as its own "batch of
+	// 1" keeps the version write atomically paired with a position
+	// write without entangling it with row-change rollback semantics.
+	if _, isSnap := first.(ir.SchemaSnapshot); isSnap {
+		if err := a.applyOne(ctx, streamID, first); err != nil {
+			return 0, ir.Position{}, false, err
+		}
+		return 1, first.Pos(), false, nil
+	}
+
 	byteCap := a.maxBufferBytes
 	if byteCap <= 0 {
 		byteCap = defaultMaxBufferBytes
@@ -281,6 +293,28 @@ func (a *ChangeApplier) applyOneBatch(ctx context.Context, streamID string, chan
 				}
 				// Return rows=1 and the truncate's position so the
 				// outer loop logs the truncate as its own batch.
+				return 1, c.Pos(), false, nil
+			}
+			if _, isSnap := c.(ir.SchemaSnapshot); isSnap {
+				// ADR-0049 Chunk B: flush the in-flight row batch first
+				// so the previous changes' position-write commits, THEN
+				// apply the snapshot alone via applyOne (version write +
+				// position write in one tx, locked decision #4a). The
+				// snapshot must land durably before the post-DDL rows
+				// that follow it on the channel are applied; flushing
+				// here keeps that ordering and keeps the version write
+				// off the row-batch's rollback path.
+				if err := a.commitBatch(ctx, tx, streamID, lastPos.Token, n); err != nil {
+					return 0, ir.Position{}, false, err
+				}
+				slog.DebugContext(ctx, "mysql: applier: batch committed",
+					slog.String("stream_id", streamID),
+					slog.Int("rows", n),
+					slog.String("position_token", truncateBatchToken(lastPos.Token, 80)),
+				)
+				if err := a.applyOne(ctx, streamID, c); err != nil {
+					return 0, ir.Position{}, false, err
+				}
 				return 1, c.Pos(), false, nil
 			}
 			// PII Phase 1.5: redact each subsequent batch member

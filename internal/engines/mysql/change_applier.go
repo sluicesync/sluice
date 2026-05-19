@@ -666,6 +666,16 @@ func (a *ChangeApplier) applyOne(ctx context.Context, streamID string, c ir.Chan
 	if err != nil {
 		return classifyApplierError(fmt.Errorf("mysql: applier: begin tx: %w", err))
 	}
+	// ADR-0049 Chunk B1/B2: a SchemaSnapshot persists the boundary's
+	// IR schema into sluice_cdc_schema_history. Locked decision #4a:
+	// that write MUST be in the SAME target tx as the ADR-0007
+	// position write below — a cross-tx crash that persists a
+	// position whose schema version isn't durable causes a spurious
+	// cold-start. dispatch handles the version write on `tx`; the
+	// position write that follows rides the same `tx`, and a single
+	// commit makes them atomic. A failure rolls back BOTH and
+	// propagates (locked decision #4b: fatal/loud, never
+	// logged-and-continued).
 	if err := a.dispatch(ctx, tx, c); err != nil {
 		_ = tx.Rollback()
 		return classifyApplierError(err)
@@ -739,6 +749,27 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, c ir.Change) e
 		stmt := buildTruncateSQL(applierSchema(a.schema, v.Schema), v.Table)
 		if _, err := a.txExec(ctx, tx, stmt); err != nil {
 			return fmt.Errorf("mysql: applier: truncate %s.%s: %w", v.Schema, v.Table, err)
+		}
+		return nil
+
+	case ir.SchemaSnapshot:
+		// ADR-0049 Chunk B: persist the boundary's IR schema into
+		// sluice_cdc_schema_history on the SAME tx the caller
+		// (applyOne / commitBatch) writes the ADR-0007 position on
+		// (locked decision #4a). a.streamID is set by the streamer's
+		// SetStreamID before Apply/ApplyBatch (the same value passed
+		// as the position-write streamID), keying the history row
+		// identically to the position row so resolve composes. A
+		// failure here returns up through dispatch → the tx rolls
+		// back (position write never lands) and the stream stops
+		// loudly (locked decision #4b: fatal, never
+		// logged-and-continued — a lost version silently degrades
+		// every future resume across this boundary).
+		if v.IR == nil {
+			return errors.New("mysql: applier: schema snapshot has nil IR table")
+		}
+		if err := writeSchemaVersion(ctx, tx, a.streamID, v.Schema, v.Table, v.Position, v.IR); err != nil {
+			return fmt.Errorf("mysql: applier: write schema version for %s.%s: %w", v.Schema, v.Table, err)
 		}
 		return nil
 	}

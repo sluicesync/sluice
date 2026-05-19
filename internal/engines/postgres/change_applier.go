@@ -848,6 +848,26 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, c ir.Change) e
 			return fmt.Errorf("postgres: applier: truncate %s.%s: %w", schema, v.Table, err)
 		}
 		return nil
+
+	case ir.SchemaSnapshot:
+		// ADR-0049 Chunk B3: persist the boundary's IR schema into
+		// sluice_cdc_schema_history on the SAME tx the caller
+		// (applyOne / commitBatch) writes the ADR-0007 position on
+		// (locked decision #4a — controlSchema-qualified, the same
+		// schema writePositionTx targets). a.streamID is set by the
+		// streamer before Apply/ApplyBatch (the position-write
+		// streamID), so the history row keys identically to the
+		// position row and resolve composes. A failure returns up →
+		// the tx rolls back (position write never lands) and the
+		// stream stops loudly (locked decision #4b: fatal, never
+		// logged-and-continued).
+		if v.IR == nil {
+			return errors.New("postgres: applier: schema snapshot has nil IR table")
+		}
+		if err := writeSchemaVersion(ctx, tx, a.controlSchema, a.streamID, v.Schema, v.Table, v.Position, v.IR); err != nil {
+			return fmt.Errorf("postgres: applier: write schema version for %s.%s: %w", v.Schema, v.Table, err)
+		}
+		return nil
 	}
 	return fmt.Errorf("postgres: applier: unknown change type %T", c)
 }
