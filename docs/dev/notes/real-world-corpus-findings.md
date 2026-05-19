@@ -159,16 +159,60 @@ Harness: `TestCorpus_GitLab_PGToPG_VerbatimCarry` stays GREEN by
 FAIL only on an *unexpected* shape = a new finding) — and will go
 green-as-assertion automatically if the gap is later closed.
 
-## Iteration 3 (still pending — task #14 continuation)
+## Iteration 3 corpus results (2026-05-19) — Joomla + WordPress
 
-- **pgloader regression/test schemas** — adversarial MySQL→PG prior
-  art (the exact job).
-- **WordPress** core — canonical operator-brought MySQL shape
-  (needs a PHP-`schema.php`-extraction step; note the friction).
-- **Deeper matched-pair *congruence* oracle** — compare sluice's
-  emitted MySQL→PG schema against the upstream hand/abstract-authored
-  PG side (Chinook AND MediaWiki). Iterations 1–2 only assert "both
-  read + plan clean + non-vacuous", not that the *translation equals*
-  the other engine's authored schema. This is the highest-value next
-  signal (true oracle, not just smoke).
-- Then Vitess/PlanetScale sample schemas (Track-1b-adjacent).
+| Corpus / direction | Outcome | Guard |
+|---|---|---|
+| **Joomla MySQL→PG** DryRun | ✅ PASS | 28 tables, non-vacuous |
+| **Joomla PG→MySQL** DryRun | ✅ PASS | 28 tables, non-vacuous |
+| **WordPress MySQL→PG** DryRun | ✅ PASS | 18 tables, non-vacuous |
+
+- **Joomla = clean real-CMS matched MySQL/PG pair, both directions,
+  zero sluice defects** (independently authored per dialect, like
+  Chinook; ships raw `installation/sql/{mysql,postgresql}/base.sql`).
+- **WordPress = the canonical operator-brought MySQL schema, clean**
+  — after two layers of *corpus-prep* friction handled **faithfully
+  (schema NOT rewritten)**:
+  1. `datetime NOT NULL default '0000-00-00 00:00:00'` → MySQL 8.0
+     strict `sql_mode` (`NO_ZERO_DATE`) rejects it at DDL time
+     (Error 1067). Fix: apply under WP's permissive
+     `sql_mode='NO_ENGINE_SUBSTITUTION'` — load the *real* schema
+     (millions of installs run it), don't mangle it.
+  2. `wp_get_db_schema()` defines `wp_users`/`wp_usermeta` **twice**
+     (mutually-exclusive `$users_single_table` vs `$users_multi_table`
+     scopes) → "table already exists". Fix: `extract_wp_schema`
+     dedupes by table name, keeping the **first** = the canonical
+     single-site schema. → 18 clean tables.
+- **pgloader & Drupal: evaluated, deliberately NOT fetched** (see
+  MANIFEST.md "Evaluated, deliberately NOT fetched"). pgloader's test
+  corpus is `.load` *orchestration* against live MySQL DSNs, not
+  standalone schema `.sql` — its real value to sluice is its **cast
+  ruleset** as a *translator-catalog reference* (cf. ADR-0016 /
+  `docs/type-mapping.md`), not a corpus. Drupal core schema is PHP
+  `hook_schema()` (`*.install`), no raw `.sql` in core. Forcing
+  either would ship a bad-fit/murky artifact below this corpus's
+  provenance bar — honest documentation beats a forced fit.
+
+### Cross-iteration meta-finding (worth stating)
+
+Across iterations 1–3, **every red was either (a) a real,
+well-scoped sluice gap that got tracked** (the single one: PG→PG
+core-range-type verbatim, roadmap item 17 — loud, not silent) **or
+(b) vendor-schema *ingestion* friction the corpus is designed to
+surface** (psql `\meta` scripts, `USE`-switched DBs, multi-row INSERT
+dumps, strict-mode zero-dates, PHP-embedded schemas, dual-scope table
+defs). **Zero silent-corruption defects anywhere.** The synthetic
+fuzz harness would never have produced any of (b) — this is exactly
+the complementary signal the real-world corpus exists for, and it
+also hardened the harness itself (non-vacuous guard; raw-count vs
+ReadSchema split; data/meta strip generality).
+
+## Iteration 4 (pending — task #15)
+
+- **Deeper matched-pair *congruence* oracle** — the highest-value
+  remaining signal: compare sluice's *emitted* MySQL→PG schema
+  against the upstream authored PG side (Chinook / MediaWiki /
+  Joomla). Iterations 1–3 assert "both read + plan clean +
+  non-vacuous", **not** that the *translation equals* the
+  expert-authored other-engine schema. True oracle, not smoke.
+- **Vitess / PlanetScale sample schemas** (Track-1b-adjacent).

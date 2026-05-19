@@ -49,9 +49,31 @@ bundled curl is `C:\Program Files\Rancher Desktop\resources\resources\win32\bin\
 | **MediaWiki** `tables-generated.sql` (PostgreSQL) | PostgreSQL | `https://raw.githubusercontent.com/wikimedia/mediawiki/master/sql/postgres/tables-generated.sql` | same (GPL-2.0-or-later) | 64 tables. **Both dialects are generated from one abstract schema (`sql/tables.json`) → a *guaranteed-equivalent* matched cross-engine ORACLE** (stronger than independently-authored Chinook/sakila). |
 | **datacharmer test_db** `employees_partitioned.sql` | MySQL | `https://raw.githubusercontent.com/datacharmer/test_db/master/employees_partitioned.sql` | **CC-BY-SA-3.0** (`datacharmer/test_db`) — see LICENSE SAFETY note; gitignored / not vendored | 6 tables, real MySQL with `PARTITION BY` (a feature Chinook lacks). Sources data from `.dump` files; `fetch.sh` drops the `source …;` directives → schema-only `employees_mysql_partitioned.ddl.sql`. |
 
-Iteration 2+ (MediaWiki abstract schema, pgloader test corpus,
-WordPress, Vitess/PlanetScale samples) will append rows here as
-collected — see the prep doc.
+## Iteration 3 corpora
+
+| Corpus | Engine(s) | Source | License | Notes |
+|---|---|---|---|---|
+| **Joomla** `installation/sql/mysql/base.sql` | MySQL | `https://raw.githubusercontent.com/joomla/joomla-cms/5.4-dev/installation/sql/mysql/base.sql` | **GPL-2.0** (`joomla/joomla-cms`) — see LICENSE SAFETY note; gitignored / not vendored | ~28 tables, real CMS core. Seed INSERTs stripped by `fetch.sh`. |
+| **Joomla** `installation/sql/postgresql/base.sql` | PostgreSQL | `https://raw.githubusercontent.com/joomla/joomla-cms/5.4-dev/installation/sql/postgresql/base.sql` | same (GPL-2.0) | ~28 tables. Same logical schema as the MySQL file → a **real-CMS matched cross-engine pair** (independently authored per dialect, like Chinook; not generated-from-one-source like MediaWiki). |
+| **WordPress** core schema | MySQL | `https://raw.githubusercontent.com/WordPress/wordpress-develop/trunk/src/wp-admin/includes/schema.php` | **GPL-2.0-or-later** (`WordPress/wordpress-develop`) — see LICENSE SAFETY note; gitignored / not vendored | ~19 tables. Lives in PHP (`wp_get_db_schema()`); `fetch.sh` `extract_wp_schema` pulls the `CREATE TABLE` blocks and substitutes the PHP placeholders (`$wpdb->NAME`→`wp_NAME`, `$max_index_length`→191, `) $charset_collate;`→`);`) to plain MySQL DDL. The canonical operator-brought MySQL shape. |
+
+### Evaluated, deliberately NOT fetched (do not "fix" — wrong shape)
+
+- **pgloader** (`dimitri/pgloader`) — its test corpus is `.load`
+  *orchestration* files that connect to live MySQL DSNs, not
+  standalone schema `.sql`. It doesn't fit the fetch-on-demand
+  schema-corpus pattern. Its genuine value to sluice is its **cast
+  ruleset** (MySQL→PG type-mapping prior art) — a *translator-catalog
+  reference* (cf. ADR-0016 / `docs/type-mapping.md`), not a corpus.
+- **Drupal core** (`drupal/drupal`) — schema is PHP `hook_schema()`
+  arrays in `core/modules/*/*.install`, no raw `.sql` anywhere in
+  core. Extraction would require running Drupal or parsing PHP arrays
+  across dozens of modules — far beyond "grab a schema example", and
+  a murky community dump wouldn't meet this corpus's provenance bar.
+  Deferred unless a clean raw artifact surfaces.
+
+Iteration 4+ (Vitess/PlanetScale samples; the deeper matched-pair
+*congruence* oracle) will append here — see the prep doc + findings.
 
 ## Usage
 

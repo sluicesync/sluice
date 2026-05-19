@@ -323,21 +323,27 @@ script + small committed fixtures, not vendored dumps.
   a build-tagged harness reads each via sluice's schema reader and
   records refuse/translate outcomes (extends Idea 1's pattern).
 
-Status: **Iterations 1 & 2 COMPLETE (2026-05-19) — zero sluice
-defects; harness hardened.** Chinook (matched MySQL/PG) + **MediaWiki
-(guaranteed-equivalent generated oracle, 64 tables, both directions)**
-+ employees (real MySQL `PARTITION BY`) all read + cross-engine-plan
-clean and **provably non-vacuous**; GitLab (1041-table real PG)
-correctly loud-refuses `tsvector` (loud-failure tenet WAD). Harness
-now has a non-vacuous table-count guard + a raw-count vacuity check
-that separates "DDL loaded?" from "sluice can read/translate?"; the
-detour *resolved* (didn't confirm) a vacuous-pass risk in iter-1.
-`fetch.sh` strips multi-line INSERT, psql-meta, `USE`/`SCHEMA`/
-`DATABASE`, `source`. License-safety note in `MANIFEST.md`
-(copyleft never triggers — non-distribution; never vendor `.sql`).
-Findings log: [`real-world-corpus-findings.md`](real-world-corpus-findings.md).
+Status: **Iterations 1–3 COMPLETE (2026-05-19) — zero
+silent-corruption defects; one tracked gap; harness hardened.**
+Corpora all read + cross-engine-plan clean and **provably
+non-vacuous**: Chinook (matched MySQL/PG), **MediaWiki
+(guaranteed-equivalent generated oracle, 64 tables, both dirs)**,
+employees (real MySQL `PARTITION BY`), **Joomla (real-CMS matched
+MySQL/PG pair, 28, both dirs)**, **WordPress (canonical operator
+MySQL, 18)**. GitLab (1041-table real PG): cross-engine correctly
+loud-refuses `tsvector` (WAD); PG→PG surfaced the one real **finding**
+— core range types lack the same-engine verbatim carve-out tsvector
+got (Bug 17) → **roadmap item 17** (loud, not silent; harness
+characterizes it green). Harness hardened: non-vacuous guard +
+raw-count-vs-ReadSchema split. `fetch.sh` strips multi-line INSERT /
+psql-meta / `USE`/`SCHEMA`/`DATABASE` / `source`, extracts WP from
+PHP (`extract_wp_schema`, dedup + applies under WP's `sql_mode`).
+pgloader/Drupal evaluated & documented as non-fitting (not forced).
+License-safety note in `MANIFEST.md` (copyleft never triggers —
+non-distribution; never vendor `.sql`). Findings log:
+[`real-world-corpus-findings.md`](real-world-corpus-findings.md).
 Harness: `internal/pipeline/migrate_realworld_corpus_integration_test.go`
-(build-tagged; SKIPs when corpus unfetched). **Iteration 3 pending —
-task #14:** pgloader corpus / WordPress / the deeper matched-pair
-*congruence* oracle (compare sluice's emitted translation vs the
-authored other-engine schema — true oracle, not smoke).
+(build-tagged; SKIPs when corpus unfetched). **Iteration 4 pending —
+task #15:** the deeper matched-pair *congruence* oracle (compare
+sluice's emitted translation vs the authored other-engine schema —
+true oracle, not smoke; Chinook/MediaWiki/Joomla) + Vitess/PS samples.

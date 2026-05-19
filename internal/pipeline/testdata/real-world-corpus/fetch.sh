@@ -69,6 +69,50 @@ strip_data() { # infile outfile
   fi
 }
 
+# extract_wp_schema: WordPress core schema lives in PHP
+# (wp-admin/includes/schema.php, wp_get_db_schema()) as `"CREATE TABLE
+# $wpdb->NAME ( ... ) $charset_collate;"` string blocks. Pull just the
+# CREATE TABLEs, substituting the PHP placeholders so the result is
+# plain MySQL DDL: $wpdb->NAME -> wp_NAME, $max_index_length -> 191,
+# the `) $charset_collate[ ...];` terminator -> `);`. Per-statement
+# terminator so PHP block boundaries between tables don't matter.
+# DEDUP: wp_get_db_schema() defines wp_users/wp_usermeta TWICE
+# (mutually-exclusive $users_single_table vs $users_multi_table
+# scopes); keep the FIRST occurrence per table name = the canonical
+# single-site schema, skip later duplicates (else "table already
+# exists" on apply).
+extract_wp_schema() { # infile outfile
+  awk '
+    /CREATE TABLE \$wpdb->/ {
+      name=$0
+      sub(/^.*CREATE TABLE \$wpdb->/, "", name)
+      sub(/[^a-zA-Z0-9_].*$/, "", name)          # bare table name
+      if (seen[name]++) { skip=1; inct=0; next } # dup → skip block
+      l=$0
+      sub(/^.*CREATE TABLE \$wpdb->/, "CREATE TABLE wp_", l)
+      gsub(/\$max_index_length/, "191", l)
+      print l; inct=1; skip=0; next
+    }
+    skip {
+      if ($0 ~ /\$charset_collate.*;/) { skip=0 }
+      next
+    }
+    inct {
+      l=$0
+      if (l ~ /\$charset_collate.*;/) {
+        sub(/\)[[:space:]]*\$charset_collate.*;.*/, ");", l)
+        gsub(/\$wpdb->/, "wp_", l); gsub(/\$max_index_length/, "191", l)
+        print l; inct=0; next
+      }
+      gsub(/\$wpdb->/, "wp_", l); gsub(/\$max_index_length/, "191", l)
+      print l; next
+    }
+  ' "$1" > "$2"
+  if ! grep -qiE 'CREATE TABLE wp_' "$2"; then
+    echo "fetch.sh: WARNING $2 has no CREATE TABLE after WP extract" >&2
+  fi
+}
+
 # best-effort upstream-ref capture (never fails the fetch)
 gh_sha=$("$CURL" -fsSL -m 30 \
   "https://api.github.com/repos/lerocha/chinook-database/commits/master" 2>/dev/null \
@@ -106,11 +150,43 @@ get "https://raw.githubusercontent.com/datacharmer/test_db/master/employees_part
     ".employees.raw"
 strip_data ".employees.raw" "employees_mysql_partitioned.ddl.sql"; rm -f ".employees.raw"
 
+# --- iteration 3 ---
+# Joomla ships raw install SQL for BOTH dialects → a real-CMS matched
+# cross-engine pair (independently authored per dialect, like Chinook;
+# not generated-from-one-source like MediaWiki). base.sql = core
+# schema (+ seed INSERTs, stripped). joomla-cms default branch 5.4-dev.
+get "https://raw.githubusercontent.com/joomla/joomla-cms/5.4-dev/installation/sql/mysql/base.sql" \
+    ".joomla_mysql.raw"
+strip_data ".joomla_mysql.raw" "joomla_mysql.ddl.sql"; rm -f ".joomla_mysql.raw"
+get "https://raw.githubusercontent.com/joomla/joomla-cms/5.4-dev/installation/sql/postgresql/base.sql" \
+    ".joomla_postgres.raw"
+strip_data ".joomla_postgres.raw" "joomla_postgres.ddl.sql"; rm -f ".joomla_postgres.raw"
+
+# WordPress core schema is PHP (wp_get_db_schema()); extract the
+# CREATE TABLEs to plain MySQL DDL. Canonical operator-brought MySQL.
+get "https://raw.githubusercontent.com/WordPress/wordpress-develop/trunk/src/wp-admin/includes/schema.php" \
+    ".wordpress.raw"
+extract_wp_schema ".wordpress.raw" "wordpress_mysql.ddl.sql"; rm -f ".wordpress.raw"
+
+# NOTE — evaluated, NOT fetched (do not "fix"): pgloader's test corpus
+# is `.load` orchestration against live MySQL DSNs (no standalone
+# schema .sql); Drupal core schema is PHP hook_schema() in *.install
+# (no raw .sql). Neither fits the fetch-on-demand schema-corpus shape.
+# See MANIFEST.md / real-world-corpus-findings.md for the rationale +
+# the alternative (pgloader's cast ruleset is a translator-catalog
+# reference, not a corpus).
+
 mw_sha=$("$CURL" -fsSL -m 30 \
   "https://api.github.com/repos/wikimedia/mediawiki/commits/master" 2>/dev/null \
   | grep -m1 '"sha"' | sed 's/.*"sha":[[:space:]]*"\([0-9a-f]*\)".*/\1/' || true)
 emp_sha=$("$CURL" -fsSL -m 30 \
   "https://api.github.com/repos/datacharmer/test_db/commits/master" 2>/dev/null \
+  | grep -m1 '"sha"' | sed 's/.*"sha":[[:space:]]*"\([0-9a-f]*\)".*/\1/' || true)
+jm_sha=$("$CURL" -fsSL -m 30 \
+  "https://api.github.com/repos/joomla/joomla-cms/commits/5.4-dev" 2>/dev/null \
+  | grep -m1 '"sha"' | sed 's/.*"sha":[[:space:]]*"\([0-9a-f]*\)".*/\1/' || true)
+wp_sha=$("$CURL" -fsSL -m 30 \
+  "https://api.github.com/repos/WordPress/wordpress-develop/commits/trunk" 2>/dev/null \
   | grep -m1 '"sha"' | sed 's/.*"sha":[[:space:]]*"\([0-9a-f]*\)".*/\1/' || true)
 
 {
@@ -119,6 +195,8 @@ emp_sha=$("$CURL" -fsSL -m 30 \
   echo "chinook_*.ddl.sql                 <- lerocha/chinook-database@master  commit=${gh_sha:-unresolved}  (data stripped)"
   echo "mediawiki_*.ddl.sql               <- wikimedia/mediawiki@master  commit=${mw_sha:-unresolved}  (schema-only upstream)"
   echo "employees_mysql_partitioned.ddl.sql <- datacharmer/test_db@master  commit=${emp_sha:-unresolved}  (source-directives stripped)"
+  echo "joomla_*.ddl.sql                  <- joomla/joomla-cms@5.4-dev  commit=${jm_sha:-unresolved}  (seed data stripped)"
+  echo "wordpress_mysql.ddl.sql           <- WordPress/wordpress-develop@trunk  commit=${wp_sha:-unresolved}  (extracted from PHP wp_get_db_schema())"
 } > FETCHED.txt
 
 echo "done. outputs:"

@@ -337,6 +337,78 @@ func TestCorpus_Employees_MySQLToPG_DryRun(t *testing.T) {
 	t.Log("employees(partitioned) MySQL→PG DryRun: read + cross-engine plan OK")
 }
 
+// --- Iteration 3 ---
+
+// Joomla ships raw install SQL for BOTH MySQL and PG → a real-CMS
+// matched cross-engine pair (28 tables each; independently authored
+// per dialect, like Chinook). Asserts both directions read + plan.
+func TestCorpus_Joomla_MySQLToPG_DryRun(t *testing.T) {
+	ddl := readCorpus(t, "joomla_mysql.ddl.sql")
+	src, _, cleanup := startMySQL(t)
+	defer cleanup()
+	_, tgt, pgCleanup := startPostgres(t)
+	defer pgCleanup()
+
+	applyMySQLDDL(t, src, ddl)
+	corpusAssertTables(t, "mysql", src, 20) // Joomla core ≈ 28 tables
+
+	myEng, _ := engines.Get("mysql")
+	pgEng, _ := engines.Get("postgres")
+	mig := &Migrator{Source: myEng, Target: pgEng, SourceDSN: src, TargetDSN: tgt, DryRun: true}
+	if err := mig.Run(ctx2min(t)); err != nil {
+		t.Fatalf("Joomla MySQL→PG DryRun: schema read/plan failed: %v", truncErr(err))
+	}
+	t.Log("Joomla MySQL→PG DryRun: real-CMS schema read + cross-engine plan OK")
+}
+
+func TestCorpus_Joomla_PGToMySQL_DryRun(t *testing.T) {
+	ddl := readCorpus(t, "joomla_postgres.ddl.sql")
+	src, _, cleanup := startPostgres(t)
+	defer cleanup()
+	_, tgt, myCleanup := startMySQL(t)
+	defer myCleanup()
+
+	applyPGDDL(t, src, ddl)
+	corpusAssertTables(t, "postgres", src, 20)
+
+	pgEng, _ := engines.Get("postgres")
+	myEng, _ := engines.Get("mysql")
+	mig := &Migrator{Source: pgEng, Target: myEng, SourceDSN: src, TargetDSN: tgt, DryRun: true}
+	if err := mig.Run(ctx2min(t)); err != nil {
+		t.Fatalf("Joomla PG→MySQL DryRun: schema read/plan failed: %v", truncErr(err))
+	}
+	t.Log("Joomla PG→MySQL DryRun: read + cross-engine plan OK (matched-pair)")
+}
+
+// WordPress core schema (extracted from PHP wp_get_db_schema()) — the
+// canonical operator-brought MySQL shape.
+func TestCorpus_WordPress_MySQLToPG_DryRun(t *testing.T) {
+	ddl := readCorpus(t, "wordpress_mysql.ddl.sql")
+	src, _, cleanup := startMySQL(t)
+	defer cleanup()
+	_, tgt, pgCleanup := startPostgres(t)
+	defer pgCleanup()
+
+	// WordPress's real schema uses `datetime NOT NULL default
+	// '0000-00-00 00:00:00'` — valid in the permissive sql_mode
+	// WordPress targets (what millions of installs run on), but
+	// MySQL 8.0's default strict mode (NO_ZERO_DATE) rejects it at
+	// DDL time (Error 1067). Load the schema AS-IS under WP's mode
+	// (faithful corpus) rather than rewriting it (which would test a
+	// fake schema). Same session as the CREATE TABLEs (multi-stmt
+	// exec on one conn), so the SET applies.
+	applyMySQLDDL(t, src, "SET SESSION sql_mode='NO_ENGINE_SUBSTITUTION';\n\n"+ddl)
+	corpusAssertTables(t, "mysql", src, 12) // WP core single-site ≈ 19 tables
+
+	myEng, _ := engines.Get("mysql")
+	pgEng, _ := engines.Get("postgres")
+	mig := &Migrator{Source: myEng, Target: pgEng, SourceDSN: src, TargetDSN: tgt, DryRun: true}
+	if err := mig.Run(ctx2min(t)); err != nil {
+		t.Fatalf("WordPress MySQL→PG DryRun: schema read/plan failed: %v", truncErr(err))
+	}
+	t.Log("WordPress MySQL→PG DryRun: canonical WP core schema read + cross-engine plan OK")
+}
+
 func truncErr(err error) string {
 	s := err.Error()
 	if len(s) > 600 {
