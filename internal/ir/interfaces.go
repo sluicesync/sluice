@@ -751,6 +751,33 @@ type PositionWriter interface {
 	WritePosition(ctx context.Context, streamID string, pos Position) error
 }
 
+// SchemaHistoryCompactor is the optional surface a [ChangeApplier] can
+// implement to delete ADR-0049 schema-history rows whose anchor_position
+// is STRICTLY OLDER than the supplied retention floor. ADR-0049 Chunk D,
+// DP-2: the floor is the combined `min(live ADR-0007 safe-point, oldest
+// retained backup-chain resume position)` — the caller computes that
+// combined floor (e.g. via [pipeline.SchemaHistoryRetentionFloor]) and
+// passes it in.
+//
+// Strict-older semantics: rows AT the floor and AFTER the floor remain
+// (locked design "leaves the at-floor and after-floor rows intact").
+// The loud-floor sentinel is preserved by construction: a
+// [ResolveSchemaVersion] for a position BELOW the oldest retained anchor
+// wraps [ErrPositionInvalid] → ADR-0022 cold-start; compaction can only
+// MAKE a resume fall below the floor, which is by construction loud,
+// never silent.
+//
+// Engines without the surface can be ignored by the caller (the live
+// resume path still works without compaction; growth is ∝ DDL count by
+// the Chunk-B true-delta gate, so retention is a maintenance operation,
+// not a runtime correctness requirement).
+type SchemaHistoryCompactor interface {
+	// CompactSchemaHistoryBelow deletes rows strictly older than floor
+	// under the engine's [PositionOrderer]. Returns the count of rows
+	// deleted (operator-facing diagnostic).
+	CompactSchemaHistoryBelow(ctx context.Context, floor Position) (int, error)
+}
+
 // StreamStatus is the operational snapshot of one row in the
 // per-target sluice_cdc_state control table. Returned by
 // [ChangeApplier.ListStreams] for the `sluice sync status` command.

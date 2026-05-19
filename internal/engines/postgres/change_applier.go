@@ -521,6 +521,16 @@ func (a *ChangeApplier) EnsureControlTable(ctx context.Context) error {
 	return ensureSchemaHistoryTable(ctx, a.db, a.controlSchema)
 }
 
+// CompactSchemaHistoryBelow implements [ir.SchemaHistoryCompactor]
+// (ADR-0049 Chunk D). Deletes sluice_cdc_schema_history rows in the
+// applier's controlSchema whose anchor_position is STRICTLY OLDER than
+// floor under this engine's [ir.PositionOrderer]. See
+// compactSchemaHistoryBelow for the strict-older semantics + loud-floor
+// preservation invariant.
+func (a *ChangeApplier) CompactSchemaHistoryBelow(ctx context.Context, floor ir.Position) (int, error) {
+	return compactSchemaHistoryBelow(ctx, a.db, Engine{}, a.controlSchema, floor)
+}
+
 // ReadPosition returns the last persisted source position for
 // streamID, or ok=false when no row exists. The returned Position
 // always has Engine = "postgres" — the persisted token does NOT carry

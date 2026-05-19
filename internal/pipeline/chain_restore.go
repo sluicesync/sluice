@@ -408,7 +408,12 @@ func (r *ChainRestore) applyIncremental(
 	//    `out <- change` send so the goroutine exits. Without this, a
 	//    failed apply would leave the producer hung forever (the
 	//    applier no longer drains the channel).
-	if len(link.manifest.ChangeChunks) == 0 {
+	//
+	//    ADR-0049 Chunk D: a manifest may carry SchemaHistory entries
+	//    even when ChangeChunks is empty (a window observed a DDL but
+	//    no DML, then closed). Replay the schema-history regardless so
+	//    a resumed stream finds the post-DDL version at backup.EndPosition.
+	if len(link.manifest.ChangeChunks) == 0 && len(link.manifest.SchemaHistory) == 0 {
 		slog.InfoContext(ctx, "chain restore: incremental has no change chunks; schema deltas only",
 			slog.String("backup_id", manifestBackupID(link.manifest)),
 		)
@@ -569,11 +574,29 @@ func (r *ChainRestore) applySchemaDeltas(ctx context.Context, link *segmentRecor
 
 // streamIncrementalChanges opens each change chunk in turn and
 // pushes events onto out, verifying SHA-256 along the way.
+//
+// ADR-0049 Chunk D: prepends the manifest's SchemaHistory entries as
+// [ir.SchemaSnapshot] events on the channel before the row events.
+// The applier processes them through its normal dispatch path (engine
+// SchemaSnapshot case → writeSchemaVersion in the SAME target tx as
+// the ADR-0007 position write, locked decision #4a), seeding the
+// target's sluice_cdc_schema_history table under [ChainRestoreStreamID].
+// A subsequent `sluice sync start` using the same stream-id resumes
+// at the backup's EndPosition with the post-DDL schema in effect —
+// closing the previously documented pre-Chunk-D cold-start hazard.
+//
+// Idempotent: re-running chain restore replays the same snapshots; the
+// engine's writeSchemaVersion is UPSERT-on-PK (MySQL ON DUPLICATE KEY
+// UPDATE / PG ON CONFLICT DO UPDATE), so re-applies are value-identical
+// no-ops.
 func (r *ChainRestore) streamIncrementalChanges(
 	ctx context.Context,
 	link *segmentRecord,
 	out chan<- ir.Change,
 ) error {
+	if err := r.streamSchemaHistorySnapshots(ctx, link, out); err != nil {
+		return fmt.Errorf("apply schema history: %w", err)
+	}
 	segStore := link.segment.store(r.Store)
 	codec := link.segment.codecOrDefault()
 	for chunkIdx, chunk := range link.manifest.ChangeChunks {
@@ -586,6 +609,56 @@ func (r *ChainRestore) streamIncrementalChanges(
 			slog.Int64("changes", chunk.RowCount),
 		)
 	}
+	return nil
+}
+
+// streamSchemaHistorySnapshots converts each SchemaHistoryEntry on
+// link.manifest.SchemaHistory into a synthetic [ir.SchemaSnapshot] and
+// pushes it onto out. The applier's SchemaSnapshot dispatch persists
+// the version into sluice_cdc_schema_history (locked decision #4a:
+// same target tx as the position write — engine-side handled).
+//
+// A nil-table entry is loud (not silently skipped): a corrupt manifest
+// would otherwise silently degrade future resume across the boundary
+// (the exact silent-mis-decode class ADR-0049 exists to kill). This
+// composes with the engine applier's own nil-IR guard.
+func (r *ChainRestore) streamSchemaHistorySnapshots(
+	ctx context.Context,
+	link *segmentRecord,
+	out chan<- ir.Change,
+) error {
+	if len(link.manifest.SchemaHistory) == 0 {
+		return nil
+	}
+	for i, entry := range link.manifest.SchemaHistory {
+		if entry == nil {
+			return fmt.Errorf("schema-history entry %d: nil", i)
+		}
+		tbl, err := ir.UnmarshalTable(entry.TableJSON)
+		if err != nil {
+			return fmt.Errorf("schema-history entry %d (%s.%s): decode table: %w",
+				i, entry.Schema, entry.Table, err)
+		}
+		if tbl == nil {
+			return fmt.Errorf("schema-history entry %d (%s.%s) at %+v decoded to a nil table — corrupt manifest",
+				i, entry.Schema, entry.Table, entry.AnchorPosition)
+		}
+		snap := ir.SchemaSnapshot{
+			Position: entry.AnchorPosition,
+			Schema:   entry.Schema,
+			Table:    entry.Table,
+			IR:       tbl,
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case out <- snap:
+		}
+	}
+	slog.DebugContext(ctx, "chain restore: schema-history replayed",
+		slog.String("backup_id", manifestBackupID(link.manifest)),
+		slog.Int("entries", len(link.manifest.SchemaHistory)),
+	)
 	return nil
 }
 

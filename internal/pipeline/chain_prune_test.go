@@ -5,6 +5,7 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -225,6 +226,104 @@ func seedIncr(t *testing.T, root ir.BackupStore, dir, _id, parent, startLSN, lsn
 // seedLineageChain writes a one-segment lineage (full + N
 // incrementals) via the production lineage hooks so lineage.json is
 // well-formed. Returns the base time (incrementals at base+1h..+Nh).
+// stubOrderer is a totally-ordered string-based orderer used by the
+// SchemaHistoryRetentionFloor unit tests. Avoids a real engine's
+// JSON-position parsing while still exercising the partial-order
+// branches (PositionAtOrAfter both-true, both-false-incomparable).
+// "incomparable:X" tokens are NEVER at-or-after anything except
+// themselves, modelling a partial-order edge.
+type stubOrderer struct{}
+
+func (stubOrderer) PositionAtOrAfter(p, anchor ir.Position) (bool, error) {
+	if p.Token == "" || anchor.Token == "" {
+		return false, errors.New("stubOrderer: empty token")
+	}
+	if strings.HasPrefix(p.Token, "incomparable:") || strings.HasPrefix(anchor.Token, "incomparable:") {
+		// Two "incomparable:N" tokens are incomparable unless they
+		// share the exact same token (reflexive).
+		return p.Token == anchor.Token, nil
+	}
+	return p.Token >= anchor.Token, nil
+}
+
+// TestSchemaHistoryRetentionFloor_PicksOlder_LiveOlder confirms the
+// helper returns the live safe-point when it is OLDER than the oldest
+// backup resume position (DP-2: min(live, oldest-backup) — live wins
+// when it pulls the floor backward).
+func TestSchemaHistoryRetentionFloor_PicksOlder_LiveOlder(t *testing.T) {
+	store := newMemStore()
+	seedLineageChain(t, store, 2) // backup oldest = 0/100
+
+	live := ir.Position{Engine: "postgres", Token: `{"slot":"s","lsn":"0/050"}`}
+	// Use a stub orderer that treats string-compare as the order (matches
+	// the seeded lineage's tokens). 0/050 < 0/100, so live is older.
+	floor, ok, err := SchemaHistoryRetentionFloor(context.Background(), store, live, stubOrderer{})
+	if err != nil || !ok {
+		t.Fatalf("expected ok floor; got ok=%v err=%v", ok, err)
+	}
+	if floor.Token != live.Token {
+		t.Errorf("want live floor %q; got %q", live.Token, floor.Token)
+	}
+}
+
+// TestSchemaHistoryRetentionFloor_PicksOlder_BackupOlder confirms the
+// helper returns the backup floor when it is OLDER than the live
+// safe-point.
+func TestSchemaHistoryRetentionFloor_PicksOlder_BackupOlder(t *testing.T) {
+	store := newMemStore()
+	seedLineageChain(t, store, 2) // backup oldest token = `{"slot":"s","lsn":"0/100"}`
+
+	live := ir.Position{Engine: "postgres", Token: `{"slot":"s","lsn":"0/999"}`}
+	floor, ok, err := SchemaHistoryRetentionFloor(context.Background(), store, live, stubOrderer{})
+	if err != nil || !ok {
+		t.Fatalf("expected ok floor; got ok=%v err=%v", ok, err)
+	}
+	if floor.Token != `{"slot":"s","lsn":"0/100"}` {
+		t.Errorf("want backup floor 0/100; got %q", floor.Token)
+	}
+}
+
+// TestSchemaHistoryRetentionFloor_NoBackup_NoLive returns ok=false
+// (the caller must skip compaction; no floor → deleting everything
+// would defeat the loud-floor sentinel).
+func TestSchemaHistoryRetentionFloor_NoBackup_NoLive(t *testing.T) {
+	store := newMemStore()
+	// No lineage seeded.
+	floor, ok, err := SchemaHistoryRetentionFloor(context.Background(), store, ir.Position{}, stubOrderer{})
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	if ok {
+		t.Errorf("ok must be false when neither floor is available; got floor=%+v", floor)
+	}
+}
+
+// TestSchemaHistoryRetentionFloor_Incomparable refuses LOUDLY when
+// live and backup-oldest are incomparable under the partial order
+// (Bug-74 class: never guess a min for unordered candidates).
+func TestSchemaHistoryRetentionFloor_Incomparable(t *testing.T) {
+	store := newMemStore()
+	// Custom lineage with an "incomparable:A" token.
+	full := &ir.Manifest{
+		FormatVersion: ir.BackupFormatVersion, SourceEngine: "postgres",
+		Kind: ir.BackupKindFull, CreatedAt: time.Now(),
+		EndPosition:  ir.Position{Engine: "postgres", Token: "incomparable:A"},
+		PartialState: ir.BackupStateComplete,
+	}
+	full.BackupID = ir.ComputeBackupID(full)
+	mustWriteManifest(t, store, ManifestFileName, full)
+	updateLineageForManifestBestEffort(context.Background(), store, full, ManifestFileName, CodecGzip)
+
+	live := ir.Position{Engine: "postgres", Token: "incomparable:B"}
+	_, _, err := SchemaHistoryRetentionFloor(context.Background(), store, live, stubOrderer{})
+	if err == nil {
+		t.Fatal("incomparable positions must refuse LOUDLY; got nil err")
+	}
+	if !strings.Contains(err.Error(), "incomparable") {
+		t.Errorf("err must mention incomparable; got %v", err)
+	}
+}
+
 func seedLineageChain(t *testing.T, store ir.BackupStore, incrementals int) time.Time {
 	t.Helper()
 	base := time.Date(2026, 5, 16, 0, 0, 0, 0, time.UTC)

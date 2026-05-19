@@ -65,6 +65,14 @@ type changeChunkWriter struct {
 	// cek, when non-nil, enables encrypted mode (mirrors chunkWriter).
 	cek   []byte
 	gzBuf *bytes.Buffer
+
+	// snapshots collects every ir.SchemaSnapshot observed during this
+	// chunk's lifetime so the caller can attach them to the Manifest's
+	// SchemaHistory field at finalisation (ADR-0049 Chunk D —
+	// supersedes the Chunk-B scope-fence skip). Snapshots ride the
+	// Manifest, NOT the per-row JSONL stream (they have no row payload,
+	// and the change-chunk codec dispatches on the row-shaped kinds).
+	snapshots []ir.SchemaSnapshot
 }
 
 // newChangeChunkWriter wraps out (typically a pipe-buffer destined
@@ -124,19 +132,19 @@ func (w *changeChunkWriter) WriteChange(c ir.Change) error {
 	if w.closed {
 		return errors.New("change chunk writer closed")
 	}
-	// ADR-0049 Chunk B scope-fence: the CDC reader now emits
-	// [ir.SchemaSnapshot] boundary events on the SAME change stream the
-	// incremental-backup writer consumes (internal/pipeline/incremental.go).
-	// Chunk B is the live-apply schema-history path; carrying schema
-	// history *in the backup envelope* is explicitly Chunk D. Until D,
-	// skip it here — a DDL during a backup window must NOT abort the
-	// backup (pre-Chunk-B behaviour: a backup taken now legitimately
-	// carries no schema history; a restore+resume falls to the unchanged
-	// loud ADR-0022 cold-start floor). Skipping (no record, no count)
-	// keeps the chunk byte-identical to pre-Chunk-B. Chunk D replaces
-	// this with real envelope handling — NOT a silent loss: it is the
-	// documented pre-D state, and the resume path is loud.
-	if _, ok := c.(ir.SchemaSnapshot); ok {
+	// ADR-0049 Chunk D: collect SchemaSnapshot boundary events into a
+	// side-channel so the orchestrator can attach them to the Manifest's
+	// SchemaHistory field at finalisation. Snapshots ride the Manifest,
+	// NOT the per-row JSONL stream — they have no row payload and the
+	// change-chunk codec dispatches on row-shaped kinds. This supersedes
+	// the Chunk-B scope-fence skip: a DDL during a backup window now
+	// produces schema-history that a restore+resume can replay (the
+	// resumed stream lands at the backup's EndPosition with a primed
+	// schema-history, NOT the loud ADR-0022 cold-start floor that the
+	// pre-Chunk-D state had). The chunk's JSONL bytes remain
+	// byte-identical to pre-Chunk-B: no record written, no count bump.
+	if s, ok := c.(ir.SchemaSnapshot); ok {
+		w.snapshots = append(w.snapshots, s)
 		return nil
 	}
 	wire, err := encodeChange(c)
@@ -193,6 +201,16 @@ func (w *changeChunkWriter) Hash() string {
 
 // ChangeCount returns the number of changes written so far.
 func (w *changeChunkWriter) ChangeCount() int64 { return w.changeCount }
+
+// Snapshots returns the [ir.SchemaSnapshot] events observed during
+// this writer's lifetime so the incremental-backup orchestrator can
+// attach them to the Manifest's SchemaHistory field at finalisation
+// (ADR-0049 Chunk D). Snapshots do NOT appear in the chunk's JSONL
+// stream and do NOT count toward ChangeCount — they ride the
+// Manifest. The returned slice is the writer's own backing slice
+// (callers should not mutate it; this is the same convention as
+// other internal-pipeline accessors).
+func (w *changeChunkWriter) Snapshots() []ir.SchemaSnapshot { return w.snapshots }
 
 // changeChunkReader is the inverse: streams [ir.Change] events back
 // from a change chunk while validating SHA-256. When cek is non-nil,

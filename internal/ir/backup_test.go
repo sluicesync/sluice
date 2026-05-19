@@ -4,6 +4,7 @@
 package ir
 
 import (
+	"bytes"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -411,4 +412,157 @@ func TestManifest_PlaintextStaysPlaintext(t *testing.T) {
 	if got.Tables[0].Chunks[0].Encryption != nil {
 		t.Errorf("ChunkEncryption non-nil after plaintext round-trip")
 	}
+}
+
+// TestManifest_SchemaHistory_RoundTrip pins the ADR-0049 Chunk D
+// Manifest.SchemaHistory wire shape: marshal a Manifest carrying
+// entries that span the codec's type families (reuses the Bug-74
+// "pin the class" discipline so every family the dispatched codec
+// supports is exercised, not one representative), round-trip
+// through encoding/json, and assert deep-equal recovery.
+func TestManifest_SchemaHistory_RoundTrip(t *testing.T) {
+	tblA := &Table{
+		Schema: "public",
+		Name:   "users",
+		Columns: []*Column{
+			{Name: "id", Type: Integer{Width: 64}},
+			{Name: "email", Type: Varchar{Length: 255}, Nullable: true},
+		},
+	}
+	tblB := &Table{
+		Schema: "public",
+		Name:   "events",
+		Columns: []*Column{
+			{Name: "id", Type: Integer{Width: 64}},
+			{Name: "tags", Type: Array{Element: Varchar{Length: 64}}, Nullable: true},
+			{Name: "ts", Type: Timestamp{Precision: 6, WithTimeZone: true}},
+		},
+	}
+	tblC := &Table{
+		Schema: "public",
+		Name:   "geo",
+		Columns: []*Column{
+			{Name: "id", Type: Integer{Width: 64}},
+			{Name: "loc", Type: Geometry{Subtype: GeometryPoint, SRID: 4326, IsGeography: true}},
+			{Name: "tags", Type: ExtensionType{Extension: "vector", Name: "vector", Modifiers: []int{1536}}},
+			{Name: "flags", Type: Bit{Length: 8}},
+		},
+	}
+	mkEntry := func(streamID, schema, table, anchorToken string, tbl *Table) *SchemaHistoryEntry {
+		payload, err := MarshalTable(tbl)
+		if err != nil {
+			panic(err)
+		}
+		return &SchemaHistoryEntry{
+			StreamID:       streamID,
+			Schema:         schema,
+			Table:          table,
+			AnchorPosition: Position{Engine: "postgres", Token: anchorToken},
+			TableJSON:      payload,
+		}
+	}
+	in := &Manifest{
+		FormatVersion: BackupFormatVersion,
+		SourceEngine:  "postgres",
+		Schema:        &Schema{Tables: []*Table{tblA, tblB, tblC}},
+		Kind:          BackupKindIncremental,
+		SchemaHistory: []*SchemaHistoryEntry{
+			mkEntry("", "public", "users", "0/1000000", tblA),
+			mkEntry("", "public", "events", "0/2000000", tblB),
+			mkEntry("", "public", "geo", "0/3000000", tblC),
+		},
+	}
+	b, err := json.Marshal(in)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	var got Manifest
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if len(got.SchemaHistory) != len(in.SchemaHistory) {
+		t.Fatalf("SchemaHistory len: got %d want %d", len(got.SchemaHistory), len(in.SchemaHistory))
+	}
+	for i, want := range in.SchemaHistory {
+		gotE := got.SchemaHistory[i]
+		if gotE == nil {
+			t.Errorf("[%d] entry nil", i)
+			continue
+		}
+		if gotE.StreamID != want.StreamID || gotE.Schema != want.Schema || gotE.Table != want.Table {
+			t.Errorf("[%d] identity mismatch: got %s/%s/%s want %s/%s/%s",
+				i, gotE.StreamID, gotE.Schema, gotE.Table, want.StreamID, want.Schema, want.Table)
+		}
+		if gotE.AnchorPosition != want.AnchorPosition {
+			t.Errorf("[%d] anchor mismatch: got %+v want %+v", i, gotE.AnchorPosition, want.AnchorPosition)
+		}
+		gotT, err := UnmarshalTable(gotE.TableJSON)
+		if err != nil {
+			t.Errorf("[%d] UnmarshalTable: %v", i, err)
+			continue
+		}
+		wantT, err := UnmarshalTable(want.TableJSON)
+		if err != nil {
+			t.Errorf("[%d] UnmarshalTable want: %v", i, err)
+			continue
+		}
+		if gotT.Name != wantT.Name || len(gotT.Columns) != len(wantT.Columns) {
+			t.Errorf("[%d] table shape drift: got %s/%d cols want %s/%d cols",
+				i, gotT.Name, len(gotT.Columns), wantT.Name, len(wantT.Columns))
+		}
+		for j := range wantT.Columns {
+			if gotT.Columns[j].Name != wantT.Columns[j].Name {
+				t.Errorf("[%d][%d] column name drift: got %q want %q",
+					i, j, gotT.Columns[j].Name, wantT.Columns[j].Name)
+			}
+			if !typesEqualForTest(gotT.Columns[j].Type, wantT.Columns[j].Type) {
+				t.Errorf("[%d][%d] column type drift: got %#v want %#v",
+					i, j, gotT.Columns[j].Type, wantT.Columns[j].Type)
+			}
+		}
+	}
+}
+
+// TestManifest_SchemaHistory_BackwardCompat_NoField pins the Chunk D
+// append-only invariant: a pre-Chunk-D manifest (no schema_history
+// key in the JSON) decodes clean with SchemaHistory == nil. Forward-
+// compat for older sluice that ignores unknown fields is guaranteed
+// by encoding/json default unknown-field behaviour; this test pins
+// the reverse — a NEW sluice reading an OLD manifest sees the
+// omitted field as a zero-length slice (nil, NOT an error).
+func TestManifest_SchemaHistory_BackwardCompat_NoField(t *testing.T) {
+	body := `{
+		"format_version": 1,
+		"source_engine": "postgres",
+		"kind": "incremental",
+		"schema": {"tables": []}
+	}`
+	var got Manifest
+	if err := json.Unmarshal([]byte(body), &got); err != nil {
+		t.Fatalf("Unmarshal pre-D manifest: %v", err)
+	}
+	if got.SchemaHistory != nil {
+		t.Errorf("SchemaHistory must be nil for a pre-D manifest; got %v", got.SchemaHistory)
+	}
+	b, err := json.Marshal(&got)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if strings.Contains(string(b), "schema_history") {
+		t.Errorf("re-emitted pre-D manifest unexpectedly carries schema_history: %s", b)
+	}
+}
+
+// typesEqualForTest compares two IR Types by their codec form to
+// avoid sealed-interface DeepEqual pitfalls on equivalent shapes.
+func typesEqualForTest(a, b Type) bool {
+	ab, err := MarshalType(a)
+	if err != nil {
+		return false
+	}
+	bb, err := MarshalType(b)
+	if err != nil {
+		return false
+	}
+	return bytes.Equal(ab, bb)
 }

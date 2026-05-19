@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"io"
 	"strings"
@@ -315,6 +316,139 @@ func TestIncrementalBackup_RoundTrip(t *testing.T) {
 	// Manifest path matches the convention.
 	if !strings.HasPrefix(incrPath, "manifests/incr-") || !strings.HasSuffix(incrPath, ".json") {
 		t.Errorf("manifest path = %q; want manifests/incr-<...>.json", incrPath)
+	}
+}
+
+// TestIncrementalBackup_SchemaHistoryCapture pins the ADR-0049
+// Chunk D contract that supersedes the Chunk-B scope-fence:
+// SchemaSnapshot events flowing through the CDC stream during a backup
+// window are collected into manifest.SchemaHistory (NOT silently
+// skipped, which was the pre-Chunk-D state). Restore-side then replays
+// these so a resumed CDC stream at backup.EndPosition can resolve the
+// post-DDL schema without falling to the loud ADR-0022 cold-start
+// floor. Also pins the defensive dedup-by-SchemaVersionKey (same
+// snapshot fired twice → one entry).
+func TestIncrementalBackup_SchemaHistoryCapture(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewLocalStore(dir)
+	if err != nil {
+		t.Fatalf("NewLocalStore: %v", err)
+	}
+
+	schemaBefore := &ir.Schema{Tables: []*ir.Table{{
+		Name:    "users",
+		Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}},
+	}}}
+	schemaAfter := &ir.Schema{Tables: []*ir.Table{{
+		Name: "users",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}},
+			{Name: "email", Type: ir.Varchar{Length: 255}, Nullable: true},
+		},
+	}}}
+
+	parent := &ir.Manifest{
+		FormatVersion: ir.BackupFormatVersion,
+		CreatedAt:     time.Date(2026, 5, 8, 10, 0, 0, 0, time.UTC),
+		SourceEngine:  "postgres",
+		Schema:        schemaBefore,
+		Kind:          ir.BackupKindFull,
+		EndPosition:   ir.Position{Engine: "postgres", Token: `{"slot":"sluice_slot","lsn":"0/100"}`},
+		PartialState:  ir.BackupStateComplete,
+	}
+	parent.BackupID = ir.ComputeBackupID(parent)
+	writeParentFullManifest(t, store, parent)
+
+	postDDLTable := schemaAfter.Tables[0]
+	snap1 := ir.SchemaSnapshot{
+		Position: ir.Position{Engine: "postgres", Token: `{"slot":"sluice_slot","lsn":"0/115"}`},
+		Schema:   "",
+		Table:    "users",
+		IR:       postDDLTable,
+	}
+	// Same snapshot (same key) repeated → defensive dedup must collapse.
+	snap1Dup := snap1
+	src := &fakeCDCEngine{
+		name:           "postgres",
+		schemaSequence: []*ir.Schema{schemaBefore, schemaAfter},
+		cdcChanges: []ir.Change{
+			ir.TxBegin{Position: ir.Position{Engine: "postgres", Token: `{"slot":"sluice_slot","lsn":"0/110"}`}},
+			snap1,
+			ir.Insert{
+				Position: ir.Position{Engine: "postgres", Token: `{"slot":"sluice_slot","lsn":"0/120"}`},
+				Schema:   "",
+				Table:    "users",
+				Row:      ir.Row{"id": int64(1), "email": "z@example.com"},
+			},
+			snap1Dup,
+			ir.TxCommit{Position: ir.Position{Engine: "postgres", Token: `{"slot":"sluice_slot","lsn":"0/130"}`}},
+		},
+		cdcExpectedFromOK: true,
+	}
+	now := time.Date(2026, 5, 8, 11, 0, 0, 0, time.UTC)
+	b := &IncrementalBackup{
+		Source:    src,
+		SourceDSN: "src",
+		Store:     store,
+		ParentRef: parent.BackupID,
+		Window:    5 * time.Minute,
+		Now:       func() time.Time { return now },
+		clockNow:  func() time.Time { return now },
+	}
+	if err := b.Run(context.Background()); err != nil {
+		t.Fatalf("IncrementalBackup.Run: %v", err)
+	}
+
+	records, err := listAllManifestsViaWalk(context.Background(), store)
+	if err != nil {
+		t.Fatalf("listAllManifestsViaWalk: %v", err)
+	}
+	var incr *ir.Manifest
+	for _, r := range records {
+		if r.manifest.Kind == ir.BackupKindIncremental {
+			incr = r.manifest
+		}
+	}
+	if incr == nil {
+		t.Fatalf("no incremental manifest written")
+	}
+	// SchemaHistory MUST contain exactly one entry (defensive dedup).
+	if len(incr.SchemaHistory) != 1 {
+		t.Fatalf("SchemaHistory len = %d; want 1 (defensive dedup must collapse the duplicate snapshot)", len(incr.SchemaHistory))
+	}
+	got := incr.SchemaHistory[0]
+	if got.AnchorPosition != snap1.Position {
+		t.Errorf("AnchorPosition = %+v; want %+v", got.AnchorPosition, snap1.Position)
+	}
+	if got.Schema != snap1.Schema || got.Table != snap1.Table {
+		t.Errorf("identity mismatch: got %s/%s want %s/%s", got.Schema, got.Table, snap1.Schema, snap1.Table)
+	}
+	// TableJSON decodes back to the post-DDL table.
+	decoded, err := ir.UnmarshalTable(got.TableJSON)
+	if err != nil {
+		t.Fatalf("UnmarshalTable: %v", err)
+	}
+	if decoded == nil || len(decoded.Columns) != 2 {
+		t.Fatalf("decoded table mismatch; got %+v", decoded)
+	}
+	// StreamID stays empty at backup time (no applier in the loop;
+	// restore-time replay substitutes ChainRestoreStreamID).
+	if got.StreamID != "" {
+		t.Errorf("StreamID = %q; want empty at backup time", got.StreamID)
+	}
+	// Round-trip the whole manifest through the on-disk JSON to make
+	// sure the field survives the Manifest envelope, not just the
+	// in-memory struct.
+	body, err := json.Marshal(incr)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	var rt ir.Manifest
+	if err := json.Unmarshal(body, &rt); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if len(rt.SchemaHistory) != 1 {
+		t.Errorf("round-trip SchemaHistory len = %d; want 1", len(rt.SchemaHistory))
 	}
 }
 

@@ -330,3 +330,130 @@ func segQualify(dir, p string) string {
 func appendChunk(res *PruneResult, file string) []string {
 	return append(res.Pruned, file)
 }
+
+// SchemaHistoryRetentionFloor returns the combined floor below which
+// ADR-0049 schema-history rows are safe to compact (DP-2):
+//
+//	min(liveSafePoint, oldest retained backup chain's resume position)
+//
+// "Min" is defined by the engine's [ir.PositionOrderer]: the older of
+// the two, where "older" = the one the other is at-or-after but the
+// reverse is false. Two incomparable positions (partial order, e.g. two
+// MySQL GTID sets that diverge) yield a loud error — compaction can't
+// pick a safe floor when the candidates can't be ordered, and a guess
+// is the Bug-74 silent-loss class this ADR exists to kill.
+//
+// liveSafePoint is the live persisted ADR-0007 CDC safe-point on the
+// target (sluice_cdc_state.source_position for the active stream).
+// Callers extract it from the target before invoking this helper —
+// chain_prune.go has no target connection. An empty live position
+// (no active stream) reduces the floor to the backup-side alone.
+//
+// Returns the chosen floor and ok=true on success; ok=false when there
+// is NO floor to apply (no backups in store and an empty live position
+// — the caller must skip compaction in that case, since deleting
+// everything would defeat the loud-floor sentinel).
+//
+// ADR-0049 Chunk D one-shot wiring: the caller passes the resulting
+// floor to [ir.SchemaHistoryCompactor.CompactSchemaHistoryBelow] on the
+// target's [ir.ChangeApplier]. Compaction is conservative by default
+// (locked DP-2 "retain generously"); this helper is the safety wrapper
+// that ensures the floor is never above the backup-resume needs.
+func SchemaHistoryRetentionFloor(
+	ctx context.Context,
+	store ir.BackupStore,
+	liveSafePoint ir.Position,
+	orderer ir.PositionOrderer,
+) (floor ir.Position, ok bool, err error) {
+	if orderer == nil {
+		return ir.Position{}, false, errors.New("schema-history floor: orderer is nil; ordering is a correctness primitive (loud-failure tenet)")
+	}
+	backupFloor, backupOK, err := oldestRetainedBackupResumePosition(ctx, store)
+	if err != nil {
+		return ir.Position{}, false, fmt.Errorf("schema-history floor: load lineage: %w", err)
+	}
+	liveOK := liveSafePoint.Engine != "" || liveSafePoint.Token != ""
+
+	switch {
+	case !backupOK && !liveOK:
+		return ir.Position{}, false, nil
+	case !backupOK:
+		return liveSafePoint, true, nil
+	case !liveOK:
+		return backupFloor, true, nil
+	}
+	// Both present: pick the OLDER under the partial order.
+	liveAfter, err := orderer.PositionAtOrAfter(liveSafePoint, backupFloor)
+	if err != nil {
+		return ir.Position{}, false, fmt.Errorf("schema-history floor: order live vs backup: %w", err)
+	}
+	backupAfter, err := orderer.PositionAtOrAfter(backupFloor, liveSafePoint)
+	if err != nil {
+		return ir.Position{}, false, fmt.Errorf("schema-history floor: order backup vs live: %w", err)
+	}
+	switch {
+	case liveAfter && !backupAfter:
+		// live > backup → backup is the older (smaller) → it is the
+		// safe min-floor.
+		return backupFloor, true, nil
+	case backupAfter && !liveAfter:
+		return liveSafePoint, true, nil
+	case liveAfter && backupAfter:
+		// Equal positions — either is fine.
+		return liveSafePoint, true, nil
+	default:
+		// Neither is at-or-after the other: incomparable. Loud refuse
+		// (Bug-74 class — never guess on a partial order).
+		return ir.Position{}, false, fmt.Errorf(
+			"schema-history floor: live safe-point %+v and oldest backup resume %+v are incomparable under the engine's partial order; cannot pick a single retention floor (loud-failure tenet)",
+			liveSafePoint, backupFloor)
+	}
+}
+
+// oldestRetainedBackupResumePosition returns the resume position the
+// OLDEST currently-retained backup chain in store would resume CDC
+// from after restore. For a chain root [full, incr_1, …, incr_N]:
+//
+//   - If the full has a recorded EndPosition (v0.18.0+), that IS the
+//     resume position (snapshot's anchor LSN/GTID + the chain's events
+//     forward).
+//   - Else falls back to the OLDEST incremental's StartPosition (the
+//     pre-v0.18.0 shape, where fulls didn't record EndPosition).
+//   - If neither is populated, no usable floor → ok=false.
+//
+// The "oldest retained" chain is the one at the lineage catalog's
+// [LineageCatalog.RestorableFromSegment] index (the first segment the
+// lineage considers restorable post-prune).
+func oldestRetainedBackupResumePosition(ctx context.Context, store ir.BackupStore) (ir.Position, bool, error) {
+	cat, ok, err := loadLineageCatalog(ctx, store)
+	if err != nil {
+		return ir.Position{}, false, fmt.Errorf("load lineage: %w", err)
+	}
+	if !ok || len(cat.Segments) == 0 {
+		return ir.Position{}, false, nil
+	}
+	if cat.RestorableFromSegment < 0 || cat.RestorableFromSegment >= len(cat.Segments) {
+		return ir.Position{}, false, fmt.Errorf("lineage restorable_from_segment=%d out of range", cat.RestorableFromSegment)
+	}
+	seg := &cat.Segments[cat.RestorableFromSegment]
+	segStore := seg.store(store)
+	fm, err := readManifestAt(ctx, segStore, seg.FullManifestPath)
+	if err != nil {
+		return ir.Position{}, false, fmt.Errorf("read oldest full %q: %w", seg.FullManifestPath, err)
+	}
+	if fm.EndPosition.Engine != "" || fm.EndPosition.Token != "" {
+		return fm.EndPosition, true, nil
+	}
+	// Pre-v0.18.0 fall-back: the oldest incremental's StartPosition.
+	if len(seg.Incrementals) == 0 {
+		return ir.Position{}, false, nil
+	}
+	im, err := readManifestAt(ctx, segStore, seg.Incrementals[0])
+	if err != nil {
+		return ir.Position{}, false, fmt.Errorf("read oldest incremental %q: %w", seg.Incrementals[0], err)
+	}
+	if im.StartPosition.Engine == "" && im.StartPosition.Token == "" {
+		return ir.Position{}, false, nil
+	}
+	return im.StartPosition, true, nil
+}

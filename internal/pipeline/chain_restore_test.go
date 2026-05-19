@@ -4,6 +4,7 @@
 package pipeline
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"strings"
@@ -434,6 +435,319 @@ func TestChainRestore_FullPlusOneIncremental_RoundTrip(t *testing.T) {
 	}
 	if _, ok := got[2].(ir.TxCommit); !ok {
 		t.Errorf("got[2] = %T; want TxCommit", got[2])
+	}
+}
+
+// TestChainRestore_SchemaHistoryReplayed pins ADR-0049 Chunk D's
+// restore-side contract: SchemaHistory entries on the incremental
+// manifest are replayed onto the applier as ir.SchemaSnapshot events
+// BEFORE the row-shaped changes (so a subsequent sync resume at
+// backup.EndPosition finds the post-DDL schema version in the target's
+// sluice_cdc_schema_history, NOT the loud cold-start floor).
+//
+// Idempotency: re-running the chain restore must NOT duplicate the
+// snapshots fed to the applier (the engine's writeSchemaVersion is
+// UPSERT-on-PK; this test verifies the orchestrator-side count, the
+// engine's idempotency is covered by the engine integration tests).
+func TestChainRestore_SchemaHistoryReplayed(t *testing.T) {
+	dir := t.TempDir()
+	store, _ := NewLocalStore(dir)
+
+	schema := &ir.Schema{Tables: []*ir.Table{{
+		Name:    "users",
+		Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}},
+	}}}
+	postDDL := &ir.Table{
+		Name: "users",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}},
+			{Name: "email", Type: ir.Varchar{Length: 255}, Nullable: true},
+		},
+	}
+	postDDLPayload, err := ir.MarshalTable(postDDL)
+	if err != nil {
+		t.Fatalf("MarshalTable: %v", err)
+	}
+
+	// Full manifest at 0/100.
+	full := makeManifest(t, ir.BackupKindFull, nil, "0/100")
+	full.Schema = schema
+	full.BackupID = ir.ComputeBackupID(full)
+	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
+		t.Fatalf("write full: %v", err)
+	}
+	updateLineageForManifestBestEffort(context.Background(), store, full, ManifestFileName, CodecGzip)
+
+	// Incremental: carries SchemaHistory + a single Insert event.
+	incr := makeManifest(t, ir.BackupKindIncremental, full, "0/200")
+	incr.Schema = &ir.Schema{Tables: []*ir.Table{postDDL}}
+	incr.SchemaHistory = []*ir.SchemaHistoryEntry{
+		{
+			StreamID:       "",
+			Schema:         "",
+			Table:          "users",
+			AnchorPosition: ir.Position{Engine: "postgres", Token: `{"slot":"sluice_slot","lsn":"0/150"}`},
+			TableJSON:      postDDLPayload,
+		},
+	}
+	// Build a single-Insert change chunk via the writer.
+	buf := &bytes.Buffer{}
+	cw, err := newChangeChunkWriter(buf, nil, CodecGzip)
+	if err != nil {
+		t.Fatalf("newChangeChunkWriter: %v", err)
+	}
+	row := ir.Insert{
+		Position: ir.Position{Engine: "postgres", Token: `{"slot":"sluice_slot","lsn":"0/180"}`},
+		Schema:   "",
+		Table:    "users",
+		Row:      ir.Row{"id": int64(7), "email": "x@example.com"},
+	}
+	if err := cw.WriteChange(row); err != nil {
+		t.Fatalf("WriteChange: %v", err)
+	}
+	if err := cw.Close(); err != nil {
+		t.Fatalf("cw.Close: %v", err)
+	}
+	chunkPath := "chunks/_changes/test/changes-0.jsonl.gz"
+	if err := store.Put(context.Background(), chunkPath, buf); err != nil {
+		t.Fatalf("store.Put: %v", err)
+	}
+	incr.ChangeChunks = []*ir.ChunkInfo{{
+		File:     chunkPath,
+		RowCount: 1,
+		SHA256:   cw.Hash(),
+	}}
+	incr.BackupID = ir.ComputeBackupID(incr)
+	incrPath := "manifests/incr-0001.json"
+	if err := writeManifestAt(context.Background(), store, incrPath, incr); err != nil {
+		t.Fatalf("write incr: %v", err)
+	}
+	updateLineageForManifestBestEffort(context.Background(), store, incr, incrPath, CodecGzip)
+
+	// Run restore.
+	tgt := &chainRestoreRecorderEngine{
+		restoreRecorderEngine: newRestoreRecorderEngine("postgres"),
+	}
+	chain := &ChainRestore{
+		Target:    tgt,
+		TargetDSN: "tgt",
+		Store:     store,
+	}
+	if err := chain.Run(context.Background()); err != nil {
+		t.Fatalf("ChainRestore.Run: %v", err)
+	}
+
+	// Applier MUST have seen the SchemaSnapshot first, then the Insert.
+	tgt.mu.Lock()
+	got := append([]ir.Change(nil), tgt.applied...)
+	tgt.mu.Unlock()
+	if len(got) != 2 {
+		t.Fatalf("applied changes = %d; want 2 (1 SchemaSnapshot + 1 Insert); got %v", len(got), got)
+	}
+	snap, ok := got[0].(ir.SchemaSnapshot)
+	if !ok {
+		t.Fatalf("got[0] = %T; want SchemaSnapshot (must precede the row event)", got[0])
+	}
+	if snap.Table != "users" {
+		t.Errorf("snap.Table = %q; want users", snap.Table)
+	}
+	if snap.IR == nil || len(snap.IR.Columns) != 2 {
+		t.Errorf("snap.IR shape mismatch; got %+v", snap.IR)
+	}
+	wantAnchor := ir.Position{Engine: "postgres", Token: `{"slot":"sluice_slot","lsn":"0/150"}`}
+	if snap.Position != wantAnchor {
+		t.Errorf("snap.Position = %+v; want %+v", snap.Position, wantAnchor)
+	}
+	if _, ok := got[1].(ir.Insert); !ok {
+		t.Errorf("got[1] = %T; want Insert", got[1])
+	}
+}
+
+// TestChainRestore_SchemaHistoryOnlyManifestReplayed pins the
+// "SchemaHistory present but ChangeChunks empty" branch: a window
+// observed a DDL but no DML, so the incremental carries only schema
+// history. The applier must still receive the synthetic SchemaSnapshot
+// (previously the early-return on empty ChangeChunks would skip).
+func TestChainRestore_SchemaHistoryOnlyManifestReplayed(t *testing.T) {
+	dir := t.TempDir()
+	store, _ := NewLocalStore(dir)
+
+	schema := &ir.Schema{Tables: []*ir.Table{{
+		Name:    "users",
+		Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}},
+	}}}
+	postDDL := &ir.Table{
+		Name: "users",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}},
+			{Name: "email", Type: ir.Varchar{Length: 255}, Nullable: true},
+		},
+	}
+	postDDLPayload, _ := ir.MarshalTable(postDDL)
+
+	full := makeManifest(t, ir.BackupKindFull, nil, "0/100")
+	full.Schema = schema
+	full.BackupID = ir.ComputeBackupID(full)
+	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
+		t.Fatalf("write full: %v", err)
+	}
+	updateLineageForManifestBestEffort(context.Background(), store, full, ManifestFileName, CodecGzip)
+
+	incr := makeManifest(t, ir.BackupKindIncremental, full, "0/200")
+	incr.Schema = &ir.Schema{Tables: []*ir.Table{postDDL}}
+	incr.SchemaHistory = []*ir.SchemaHistoryEntry{
+		{
+			Schema:         "",
+			Table:          "users",
+			AnchorPosition: ir.Position{Engine: "postgres", Token: `{"slot":"sluice_slot","lsn":"0/150"}`},
+			TableJSON:      postDDLPayload,
+		},
+	}
+	incr.ChangeChunks = nil // no DML
+	incr.BackupID = ir.ComputeBackupID(incr)
+	incrPath := "manifests/incr-0001.json"
+	if err := writeManifestAt(context.Background(), store, incrPath, incr); err != nil {
+		t.Fatalf("write incr: %v", err)
+	}
+	updateLineageForManifestBestEffort(context.Background(), store, incr, incrPath, CodecGzip)
+
+	tgt := &chainRestoreRecorderEngine{
+		restoreRecorderEngine: newRestoreRecorderEngine("postgres"),
+	}
+	chain := &ChainRestore{
+		Target:    tgt,
+		TargetDSN: "tgt",
+		Store:     store,
+	}
+	if err := chain.Run(context.Background()); err != nil {
+		t.Fatalf("ChainRestore.Run: %v", err)
+	}
+	tgt.mu.Lock()
+	got := append([]ir.Change(nil), tgt.applied...)
+	tgt.mu.Unlock()
+	if len(got) != 1 {
+		t.Fatalf("applied changes = %d; want 1 (schema-history-only replay); got %v", len(got), got)
+	}
+	if _, ok := got[0].(ir.SchemaSnapshot); !ok {
+		t.Errorf("got[0] = %T; want SchemaSnapshot", got[0])
+	}
+}
+
+// TestChainRestore_SchemaHistoryDecodeFailureIsLoud pins the loud-
+// failure contract for a corrupt SchemaHistory entry: a nil table-
+// JSON decode produces a clear refusal (NOT a silent skip — that's
+// the exact silent-mis-decode class ADR-0049 exists to kill).
+func TestChainRestore_SchemaHistoryDecodeFailureIsLoud(t *testing.T) {
+	dir := t.TempDir()
+	store, _ := NewLocalStore(dir)
+
+	full := makeManifest(t, ir.BackupKindFull, nil, "0/100")
+	full.BackupID = ir.ComputeBackupID(full)
+	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
+		t.Fatalf("write full: %v", err)
+	}
+	updateLineageForManifestBestEffort(context.Background(), store, full, ManifestFileName, CodecGzip)
+
+	incr := makeManifest(t, ir.BackupKindIncremental, full, "0/200")
+	// Corrupt SchemaHistory entry: TableJSON is "null" → UnmarshalTable
+	// returns (nil, nil); orchestrator must refuse loudly.
+	incr.SchemaHistory = []*ir.SchemaHistoryEntry{
+		{
+			Schema:         "",
+			Table:          "users",
+			AnchorPosition: ir.Position{Engine: "postgres", Token: `{"slot":"sluice_slot","lsn":"0/150"}`},
+			TableJSON:      []byte("null"),
+		},
+	}
+	incr.BackupID = ir.ComputeBackupID(incr)
+	incrPath := "manifests/incr-0001.json"
+	if err := writeManifestAt(context.Background(), store, incrPath, incr); err != nil {
+		t.Fatalf("write incr: %v", err)
+	}
+	updateLineageForManifestBestEffort(context.Background(), store, incr, incrPath, CodecGzip)
+
+	tgt := &chainRestoreRecorderEngine{
+		restoreRecorderEngine: newRestoreRecorderEngine("postgres"),
+	}
+	chain := &ChainRestore{
+		Target:    tgt,
+		TargetDSN: "tgt",
+		Store:     store,
+	}
+	err := chain.Run(context.Background())
+	if err == nil {
+		t.Fatal("corrupt SchemaHistory must refuse LOUDLY; got nil err")
+	}
+	if !strings.Contains(err.Error(), "schema") || !strings.Contains(err.Error(), "nil table") {
+		t.Errorf("err must mention schema-history + nil-table; got %v", err)
+	}
+}
+
+// TestChainRestore_PreChunkDManifest_BackwardCompat pins that a
+// manifest WITHOUT SchemaHistory (pre-Chunk-D shape) restores cleanly:
+// the orchestrator must NOT require the new field. The applier just
+// gets the row events with no preceding SchemaSnapshot — the
+// documented pre-D state.
+func TestChainRestore_PreChunkDManifest_BackwardCompat(t *testing.T) {
+	dir := t.TempDir()
+	store, _ := NewLocalStore(dir)
+
+	schema := &ir.Schema{Tables: []*ir.Table{{
+		Name:    "users",
+		Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}},
+	}}}
+
+	full := makeManifest(t, ir.BackupKindFull, nil, "0/100")
+	full.Schema = schema
+	full.BackupID = ir.ComputeBackupID(full)
+	if err := writeManifestAt(context.Background(), store, ManifestFileName, full); err != nil {
+		t.Fatalf("write full: %v", err)
+	}
+	updateLineageForManifestBestEffort(context.Background(), store, full, ManifestFileName, CodecGzip)
+
+	incr := makeManifest(t, ir.BackupKindIncremental, full, "0/200")
+	incr.Schema = schema
+	// SchemaHistory deliberately nil (pre-Chunk-D shape).
+	incr.SchemaHistory = nil
+	buf := &bytes.Buffer{}
+	cw, _ := newChangeChunkWriter(buf, nil, CodecGzip)
+	_ = cw.WriteChange(ir.Insert{
+		Position: ir.Position{Engine: "postgres", Token: `{"slot":"sluice_slot","lsn":"0/180"}`},
+		Table:    "users",
+		Row:      ir.Row{"id": int64(9)},
+	})
+	_ = cw.Close()
+	chunkPath := "chunks/_changes/preD/changes-0.jsonl.gz"
+	_ = store.Put(context.Background(), chunkPath, buf)
+	incr.ChangeChunks = []*ir.ChunkInfo{{
+		File:     chunkPath,
+		RowCount: 1,
+		SHA256:   cw.Hash(),
+	}}
+	incr.BackupID = ir.ComputeBackupID(incr)
+	incrPath := "manifests/incr-0001.json"
+	_ = writeManifestAt(context.Background(), store, incrPath, incr)
+	updateLineageForManifestBestEffort(context.Background(), store, incr, incrPath, CodecGzip)
+
+	tgt := &chainRestoreRecorderEngine{
+		restoreRecorderEngine: newRestoreRecorderEngine("postgres"),
+	}
+	chain := &ChainRestore{
+		Target:    tgt,
+		TargetDSN: "tgt",
+		Store:     store,
+	}
+	if err := chain.Run(context.Background()); err != nil {
+		t.Fatalf("pre-Chunk-D manifest must restore cleanly: %v", err)
+	}
+	tgt.mu.Lock()
+	got := append([]ir.Change(nil), tgt.applied...)
+	tgt.mu.Unlock()
+	if len(got) != 1 {
+		t.Fatalf("applied changes = %d; want 1 (Insert only, no synthetic snapshot); got %v", len(got), got)
+	}
+	if _, ok := got[0].(ir.Insert); !ok {
+		t.Errorf("got[0] = %T; want Insert", got[0])
 	}
 }
 

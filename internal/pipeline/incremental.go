@@ -373,6 +373,7 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 		slog.Int("changes", int(totalChanges)),
 		slog.Int("chunks", len(manifest.ChangeChunks)),
 		slog.Int("schema_deltas", len(manifest.SchemaDelta)),
+		slog.Int("schema_history", len(manifest.SchemaHistory)),
 		slog.String("manifest_path", manifestPath),
 	)
 	return nil
@@ -562,9 +563,64 @@ func (b *IncrementalBackup) captureWindow(
 	// uniquely identifies a Run() invocation in practice.
 	runNamespace := changeChunkRunNamespace(manifest)
 
+	// schemaHistorySeen dedupes schema-history entries by
+	// [ir.SchemaVersionKey] across all chunks of this incremental's
+	// window. The Chunk-B true-delta gate means the CDC reader should
+	// only emit one SchemaSnapshot per genuine boundary, but defensive
+	// dedup is cheap and worth the pin (locked design point #3 — the
+	// engine's writeSchemaVersion is idempotent via the PK surrogate,
+	// but de-duping at the manifest level keeps the persisted envelope
+	// minimal).
+	schemaHistorySeen := map[string]struct{}{}
+	// drainSnapshots converts the writer's collected SchemaSnapshots to
+	// SchemaHistoryEntry values and appends them to the manifest. The
+	// StreamID is deliberately empty at backup time — the orchestrator
+	// has no applier in the loop and therefore no source-side streamID
+	// to record. Restore-time replay (applySchemaHistory in
+	// chain_restore.go) substitutes ChainRestoreStreamID when the
+	// entry's StreamID is empty.
+	drainSnapshots := func(snaps []ir.SchemaSnapshot) error {
+		for _, s := range snaps {
+			if s.IR == nil {
+				// A reader should never emit a nil-IR snapshot; if one
+				// does, that's the loud-failure class (locked decision
+				// #4b — never silently degrade schema history).
+				return fmt.Errorf("schema snapshot for %s.%s at %+v has nil IR table",
+					s.Schema, s.Table, s.Position)
+			}
+			key := ir.SchemaVersionKey("", s.Schema, s.Table, s.Position.Token)
+			if _, dup := schemaHistorySeen[key]; dup {
+				continue
+			}
+			schemaHistorySeen[key] = struct{}{}
+			payload, err := ir.MarshalTable(s.IR)
+			if err != nil {
+				return fmt.Errorf("marshal schema-history table %s.%s: %w",
+					s.Schema, s.Table, err)
+			}
+			manifest.SchemaHistory = append(manifest.SchemaHistory, &ir.SchemaHistoryEntry{
+				// StreamID stays empty at backup time; restore-side
+				// substitutes ChainRestoreStreamID. See drainSnapshots
+				// doc above.
+				StreamID:       "",
+				Schema:         s.Schema,
+				Table:          s.Table,
+				AnchorPosition: s.Position,
+				TableJSON:      payload,
+			})
+		}
+		return nil
+	}
+
 	flush := func() error {
 		if writer == nil {
 			return nil
+		}
+		// ADR-0049 Chunk D: drain the writer's collected SchemaSnapshots
+		// into the manifest BEFORE closing the writer. Snapshots ride
+		// the manifest envelope, not the chunk's JSONL stream.
+		if err := drainSnapshots(writer.Snapshots()); err != nil {
+			return fmt.Errorf("drain schema snapshots: %w", err)
 		}
 		if err := writer.Close(); err != nil {
 			return fmt.Errorf("close chunk: %w", err)

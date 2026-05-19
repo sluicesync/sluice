@@ -183,3 +183,87 @@ func resolveSchemaVersion(ctx context.Context, q schemaHistoryQueryer, orderer i
 	}
 	return ir.ResolveSchemaVersion(orderer, versions, p)
 }
+
+// schemaHistoryExecQuerier is the read+write surface compactSchemaHistoryBelow
+// needs (SELECT to scan candidate rows, DELETE to drop strict-older ones).
+// Concrete *sql.DB and *sql.Tx both satisfy it.
+//
+//nolint:unused // ADR-0049 Chunk D storage-only; consumer wires in chain_prune.
+type schemaHistoryExecQuerier interface {
+	schemaHistoryExecer
+	schemaHistoryQueryer
+}
+
+// compactSchemaHistoryBelow deletes every sluice_cdc_schema_history row
+// in the named controlSchema whose anchor_position is STRICTLY OLDER
+// than floor under the engine's [ir.PositionOrderer] (ADR-0049 Chunk D,
+// DP-2 retention floor: min(ADR-0007 safe-point, oldest retained backup
+// resume position) — the caller computes the combined floor; this
+// primitive applies the delete).
+//
+// Strict-older means: floor.PositionAtOrAfter(anchor) AND NOT
+// anchor.PositionAtOrAfter(floor). Rows AT the floor and AFTER the floor
+// remain — the locked design preserves resolve at the floor and leaves
+// the loud-floor sentinel intact (a [ResolveSchemaVersion] for a position
+// BELOW the oldest retained anchor still wraps [ir.ErrPositionInvalid]
+// → ADR-0022 cold-start; compaction can only make a resume fall below
+// the floor, which is by construction LOUD, never silent).
+//
+// Returns the count of rows deleted (operator-facing for `sluice backup
+// prune --vv` diagnostics).
+//
+//nolint:unused // ADR-0049 Chunk D storage-only; consumer wires in chain_prune.
+func compactSchemaHistoryBelow(ctx context.Context, exec schemaHistoryExecQuerier, orderer ir.PositionOrderer, schema string, floor ir.Position) (int, error) {
+	if orderer == nil {
+		return 0, errors.New("postgres: compact schema-history: orderer is nil; ordering is a correctness primitive (loud-failure tenet)")
+	}
+	tableRef := quoteIdent(schema) + "." + quoteIdent(schemaHistoryTableName)
+	sel := "SELECT version_key, anchor_position FROM " + tableRef
+	rows, err := exec.QueryContext(ctx, sel)
+	if err != nil {
+		return 0, fmt.Errorf("postgres: compact schema-history: select: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var toDelete []string
+	for rows.Next() {
+		var (
+			vk        string
+			anchorTok string
+		)
+		if err := rows.Scan(&vk, &anchorTok); err != nil {
+			return 0, fmt.Errorf("postgres: compact schema-history: scan: %w", err)
+		}
+		anchor := ir.Position{Engine: engineNamePostgres, Token: anchorTok}
+		floorAtOrAfter, err := orderer.PositionAtOrAfter(floor, anchor)
+		if err != nil {
+			return 0, fmt.Errorf("postgres: compact schema-history: order floor vs %+v: %w", anchor, err)
+		}
+		if !floorAtOrAfter {
+			continue
+		}
+		anchorAtOrAfter, err := orderer.PositionAtOrAfter(anchor, floor)
+		if err != nil {
+			return 0, fmt.Errorf("postgres: compact schema-history: order %+v vs floor: %w", anchor, err)
+		}
+		if anchorAtOrAfter {
+			continue
+		}
+		toDelete = append(toDelete, vk)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("postgres: compact schema-history: rows iter: %w", err)
+	}
+	_ = rows.Close()
+
+	if len(toDelete) == 0 {
+		return 0, nil
+	}
+	del := "DELETE FROM " + tableRef + " WHERE version_key = $1"
+	for _, vk := range toDelete {
+		if _, err := exec.ExecContext(ctx, del, vk); err != nil {
+			return 0, fmt.Errorf("postgres: compact schema-history: delete %q: %w", vk, err)
+		}
+	}
+	return len(toDelete), nil
+}

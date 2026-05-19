@@ -202,15 +202,28 @@ func rowsEquivalent(a, b ir.Row) bool {
 	return true
 }
 
-// TestChangeChunk_SchemaSnapshot_SkippedNotErrored pins the ADR-0049
-// Chunk B scope-fence: the CDC reader emits ir.SchemaSnapshot on the
-// same stream the incremental-backup writer consumes. Until Chunk D
-// carries schema history in the backup envelope, WriteChange must SKIP
-// a SchemaSnapshot (return nil, write no record, no count bump) — a
-// DDL during a backup window must not abort the backup via
-// encodeChange's unknown-type loud error. Regression guard for the
-// cross-cutting break Chunk B introduced.
-func TestChangeChunk_SchemaSnapshot_SkippedNotErrored(t *testing.T) {
+// TestChangeChunk_SchemaSnapshot_CollectedNotEncoded pins the ADR-0049
+// Chunk D contract that SUPERSEDES the Chunk-B scope-fence skip: the
+// CDC reader emits ir.SchemaSnapshot on the same stream the incremental-
+// backup writer consumes. Chunk D's invariants:
+//
+//  1. WriteChange(SchemaSnapshot) returns nil — a DDL during a backup
+//     window must not abort the backup via encodeChange's unknown-type
+//     loud error.
+//  2. ChangeCount() is NOT incremented — snapshots ride the manifest
+//     envelope, not the per-row JSONL stream; the chunk bytes remain
+//     byte-identical to pre-Chunk-B.
+//  3. Snapshots() returns the snapshot exactly once — the new Chunk D
+//     surface the incremental-backup orchestrator drains at finalisation
+//     to populate manifest.SchemaHistory (where pre-Chunk-D had a
+//     silent skip, leaving the restore + resume path to fall to the
+//     loud ADR-0022 cold-start floor).
+//
+// This is the supersession test for the Chunk-B
+// TestChangeChunk_SchemaSnapshot_SkippedNotErrored regression guard:
+// the "no error, no count" invariants stay, the "no collection"
+// invariant flips to "collected for the manifest envelope".
+func TestChangeChunk_SchemaSnapshot_CollectedNotEncoded(t *testing.T) {
 	buf := &bytes.Buffer{}
 	w, err := newChangeChunkWriter(buf, nil, CodecGzip)
 	if err != nil {
@@ -223,19 +236,30 @@ func TestChangeChunk_SchemaSnapshot_SkippedNotErrored(t *testing.T) {
 		IR:       &ir.Table{Name: "users", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}},
 	}
 	if err := w.WriteChange(snap); err != nil {
-		t.Fatalf("WriteChange(SchemaSnapshot) must skip, not error; got %v", err)
+		t.Fatalf("WriteChange(SchemaSnapshot) must succeed, not error; got %v", err)
 	}
 	if w.ChangeCount() != 0 {
-		t.Fatalf("SchemaSnapshot must not be counted (scope-fenced until Chunk D); count=%d", w.ChangeCount())
+		t.Fatalf("SchemaSnapshot must not be counted (rides the Manifest envelope, not the JSONL stream); count=%d", w.ChangeCount())
 	}
-	// A real change after a skipped snapshot still works + counts.
+	got := w.Snapshots()
+	if len(got) != 1 {
+		t.Fatalf("Snapshots() must return the snapshot exactly once; got %d entries", len(got))
+	}
+	if got[0].Position != snap.Position || got[0].Schema != snap.Schema || got[0].Table != snap.Table {
+		t.Errorf("Snapshots()[0] identity mismatch; got %+v want %+v", got[0], snap)
+	}
+	// A real change after a collected snapshot still works + counts.
 	if err := w.WriteChange(ir.Insert{
 		Position: ir.Position{Engine: "mysql", Token: "gtid:1-10"},
 		Schema:   "app", Table: "users", Row: ir.Row{"id": int64(1)},
 	}); err != nil {
-		t.Fatalf("WriteChange(Insert) after skipped snapshot: %v", err)
+		t.Fatalf("WriteChange(Insert) after collected snapshot: %v", err)
 	}
 	if w.ChangeCount() != 1 {
 		t.Fatalf("post-snapshot Insert must count; count=%d", w.ChangeCount())
+	}
+	// Snapshot count does NOT grow with an Insert.
+	if len(w.Snapshots()) != 1 {
+		t.Fatalf("Snapshots() must not grow with a row-shaped change; got %d entries", len(w.Snapshots()))
 	}
 }

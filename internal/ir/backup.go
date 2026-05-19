@@ -133,6 +133,30 @@ type SchemaDeltaEntry struct {
 	After *Table `json:"after,omitempty"`
 }
 
+// SchemaHistoryEntry is one ADR-0049 (Chunk D) per-table schema-history
+// version observed during an incremental backup's window. Restore-side
+// replay seeds the target's sluice_cdc_schema_history with these so a
+// stream resumed at the backup's EndPosition can resolve the schema in
+// effect there via [ResolveSchemaVersion]. Append-only — older readers
+// ignore unknown fields (the documented pre-Chunk-D state: a restore +
+// resume falls to the loud ADR-0022 cold-start floor, never silent).
+type SchemaHistoryEntry struct {
+	// StreamID is the CDC stream this version belongs to (mirrors
+	// sluice_cdc_schema_history.stream_id).
+	StreamID string `json:"stream_id"`
+
+	// Schema/Table identify the affected table; AnchorPosition is the
+	// boundary event's own position captured at detection (HP-3).
+	Schema         string   `json:"schema"`
+	Table          string   `json:"table"`
+	AnchorPosition Position `json:"anchor_position"`
+
+	// TableJSON is the post-DDL ir.Table serialised via [MarshalTable]
+	// — byte-identical to what the engine stores in
+	// sluice_cdc_schema_history.ir_schema_json (locked decision #1).
+	TableJSON []byte `json:"table_json"`
+}
+
 // BackupStore is the storage abstraction for logical backups. Phase 1
 // ships a single implementation ([pipeline.LocalStore]) backed by the
 // local filesystem; Phase 2 will add S3, GCS, and Azure Blob backends
@@ -312,6 +336,17 @@ type Manifest struct {
 	// during the window. Restore-side applies entries in slice order
 	// before streaming the incremental's row events.
 	SchemaDelta []*SchemaDeltaEntry `json:"schema_delta,omitempty"`
+
+	// SchemaHistory is the ADR-0049 (Chunk D) per-table schema-history
+	// versions emitted during this backup's window. On restore + resume
+	// these are reloaded into the target's sluice_cdc_schema_history so
+	// a stream resuming at the backup's EndPosition can resolve the
+	// schema in effect there (without it, every resumed event before
+	// the first post-restore DDL hits the loud ErrPositionInvalid cold-
+	// start floor — the documented pre-Chunk-D state). Append-only,
+	// older readers ignore (zero BackupFormatVersion bump per locked
+	// decision #1).
+	SchemaHistory []*SchemaHistoryEntry `json:"schema_history,omitempty"`
 
 	// ChangeChunks lists the chunk files containing serialised
 	// [Change] events for an incremental backup. Empty for full
