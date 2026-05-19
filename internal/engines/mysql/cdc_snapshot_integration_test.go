@@ -220,11 +220,13 @@ func drainSnapshotChanges(
 			if !ok {
 				return got
 			}
-			// Skip transaction-boundary events (ADR-0027) — this
-			// helper exists to capture row events for shape
-			// assertions, not transactional bookkeeping.
+			// Skip orthogonal infra events — this helper captures
+			// row events for shape assertions. TxBegin/TxCommit are
+			// tx-boundary bookkeeping (ADR-0027); ir.SchemaSnapshot is
+			// the ADR-0049 schema-history boundary event (emitted at
+			// first-touch + each true DDL delta). Neither is DML.
 			switch c.(type) {
-			case ir.TxBegin, ir.TxCommit:
+			case ir.TxBegin, ir.TxCommit, ir.SchemaSnapshot:
 				continue
 			}
 			got = append(got, c)

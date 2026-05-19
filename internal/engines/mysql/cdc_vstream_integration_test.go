@@ -865,6 +865,15 @@ func drainVTTestChanges(
 			if !ok {
 				return got
 			}
+			// ir.SchemaSnapshot is the ADR-0049 schema-history
+			// boundary event (a VStream reader emits one at
+			// first-touch + each true FIELD-delta). It is orthogonal
+			// infra, not a VTTest row change — skip it so the
+			// data-shape assertions count only row events. Chunk B2's
+			// own snapshot pins use drainSnapshots, not this helper.
+			if _, ok := c.(ir.SchemaSnapshot); ok {
+				continue
+			}
 			got = append(got, c)
 		case <-deadline.C:
 			t.Logf("timed out after %v with %d/%d changes", timeout, len(got), want)

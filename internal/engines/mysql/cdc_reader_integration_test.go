@@ -341,8 +341,17 @@ func drainChanges(
 			if !ok {
 				return got
 			}
+			// TxBegin/TxCommit are applier-internal tx-boundary
+			// signals (ADR-0027); ir.SchemaSnapshot is the ADR-0049
+			// schema-history boundary event (a reader emits one at
+			// first-touch + on each true DDL delta). Both are
+			// orthogonal infra on the change stream, not DML — the
+			// data-flow tests that use this helper count row/tx
+			// changes, so skip them here. Chunk B's own schema-history
+			// pins use dedicated collectors (drainSnapshots), not this
+			// shared helper, so this does not weaken them.
 			switch c.(type) {
-			case ir.TxBegin, ir.TxCommit:
+			case ir.TxBegin, ir.TxCommit, ir.SchemaSnapshot:
 				continue
 			}
 			got = append(got, c)
