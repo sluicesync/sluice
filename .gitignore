@@ -58,5 +58,14 @@ test/integration/dumps/
 # commit the raw dump dir).
 internal/pipeline/testdata/fuzz-failures/
 
+# Real-world schema corpus (Idea 3, prep-new-test-surfaces.md): fetched
+# upstream DDL is large + upstream-owned — fetch-on-demand, do not
+# vendor the dumps. The committed MANIFEST.md (provenance: source /
+# license / upstream commit) and fetch script ARE tracked (exceptions
+# below).
+internal/pipeline/testdata/real-world-corpus/*
+!internal/pipeline/testdata/real-world-corpus/MANIFEST.md
+!internal/pipeline/testdata/real-world-corpus/fetch.sh
+
 # Logs
 *.log
