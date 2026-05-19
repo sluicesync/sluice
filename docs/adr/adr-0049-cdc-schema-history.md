@@ -1,6 +1,11 @@
 # ADR-0049 — sluice-native position-anchored CDC schema history
 
-**Status:** **Proposed (design-first; sign-off pending).** Design pass
+**Status:** **Accepted (2026-05-18) — design signed off across all
+decision points (DP-1/2/3) after a design dialogue; implementation
+pending. Not demand-gated (standalone resume-after-DDL value) →
+implement-ready modulo owner prioritization; see "Status / next".**
+(Header reconciled 2026-05-18: the dialogue is complete; the prior
+"Proposed; sign-off pending" wording was superseded.) Design pass
 *before* code; produced from the Track-1 PlanetScale/Vitess readiness
 investigation (design evidence:
 [`docs/dev/notes/prep-planetscale-vitess-readiness.md`](../dev/notes/prep-planetscale-vitess-readiness.md)

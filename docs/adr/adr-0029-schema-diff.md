@@ -2,7 +2,11 @@
 
 ## Status
 
-Proposed. Implementation gated on operator review of this design.
+**Accepted + Implemented.** Shipped in the v0.8.x schema-diff wave —
+`cmd/sluice/diff.go` (`SchemaDiffCmd.Run`), tests `cmd/sluice/
+diff_test.go`. The original "Proposed; gated on operator review"
+line was **stale** (never updated post-ship); reconciled 2026-05-18
+during an ADR-status audit. Design-of-record below is as-built.
 
 ## Context
 

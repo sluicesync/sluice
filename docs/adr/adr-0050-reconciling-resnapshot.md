@@ -1,6 +1,12 @@
 # ADR-0050 — Reconciling / incremental re-snapshot for CDC position-loss recovery
 
-**Status:** **Proposed (design-first; sign-off pending).** Design pass
+**Status:** **Accepted (2026-05-18) — design dialogue complete: all
+5 DPs + the structural question signed off & owner-endorsed.
+Implementation gated on 3 NON-design conditions (empirical
+cost-validation incl. the DP-2 Vitess A/B · ADR-0049 implementation ·
+real operator demand); still demand-gated — see "Status / next".**
+(Header reconciled 2026-05-18: the dialogue is complete; the prior
+"Proposed; sign-off pending" wording was superseded.) Design pass
 *before* code; from the Track-1 PlanetScale/Vitess readiness
 investigation and an operator-reported cost/outage pain (design
 evidence:
