@@ -119,6 +119,31 @@ type CDCReader struct {
 	// the project tenets call out.
 	schemaCache map[string]*tableSchema
 
+	// pendingDDLAnchor is the ADR-0049 Chunk B1 deferred-snapshot
+	// anchor. clear(r.schemaCache) on a DDL QueryEvent is eager, but
+	// the *tableSchema (→ ir.Table) rebuilds LAZILY on the next row
+	// event for each table. Locked decision #4c requires the
+	// schema-history version be anchored at the DDL event's OWN
+	// position, NOT the first post-DDL row's. So at clear time we
+	// capture the QUERY-event's GTID/file-pos here; when tableFor next
+	// rebuilds a table we emit an ir.SchemaSnapshot keyed with THIS
+	// anchor (gated by the true-delta check). pendingDDLActive
+	// distinguishes "anchor captured, awaiting rebuilds" from the
+	// zero value (no DDL seen yet / all post-DDL tables already
+	// re-snapshotted). Set/cleared only on the single pump goroutine.
+	pendingDDLAnchor ir.Position
+	pendingDDLActive bool
+
+	// snapshotSig is the per-qualified-table structural fingerprint of
+	// the schema-history version last emitted as an
+	// [ir.SchemaSnapshot] (ADR-0049 Chunk B1). Implements DP-1
+	// sign-off point ii (true-delta only): a DDL that does not change
+	// a given table's (column-name, ordered-type) decode contract
+	// (e.g. an ALTER on a *different* table, an index-only change)
+	// must NOT write a new version for that table — the blanket
+	// schemaCache clear is conservative, the snapshot is precise.
+	snapshotSig map[string]ir.SchemaSignature
+
 	// posMode and gtidSet track the current resume position. In GTID
 	// mode, gtidSet accumulates committed GTIDs and is encoded into
 	// each emitted Change. In file/pos mode, currentFile and the
@@ -551,6 +576,22 @@ func (r *CDCReader) dispatch(ctx context.Context, ev *replication.BinlogEvent, o
 		stmtSchema := string(e.Schema)
 		if stmtSchema == r.schema || stmtSchema == "" {
 			clear(r.schemaCache)
+			// ADR-0049 Chunk B1, locked decision #4c: capture THIS
+			// QUERY (DDL) event's own position now. The schemaCache
+			// clear is eager but the *tableSchema rebuilds lazily on
+			// the next row per table; the schema-history version must
+			// be anchored at the DDL boundary, not the first post-DDL
+			// row, else a replayed event between the two resolves to
+			// the pre-DDL schema (the silent-mis-decode this ADR
+			// kills). tableFor consumes pendingDDLAnchor on the next
+			// rebuild. positionFor here reflects the GTID set
+			// accumulated through this DDL's own GTIDEvent.
+			ddlPos, err := r.positionFor(ev.Header)
+			if err != nil {
+				return err
+			}
+			r.pendingDDLAnchor = ddlPos
+			r.pendingDDLActive = true
 		}
 		return nil
 
@@ -597,6 +638,18 @@ func (r *CDCReader) dispatchRows(
 	tbl, err := r.tableFor(ctx, qn)
 	if err != nil {
 		return fmt.Errorf("mysql: cdc: load schema for %s: %w", qn, err)
+	}
+
+	// ADR-0049 Chunk B1: after a DDL invalidated the schema cache,
+	// the first row event per table forces tableFor to rebuild the
+	// *tableSchema. Snapshot that rebuilt schema HERE — strictly
+	// before this row is decoded/sent — anchored at the DDL event's
+	// own captured position (#4c), gated by the true-delta check
+	// (DP-1 ii). This preserves the loud floor: the snapshot is a
+	// durable version write that lands ahead of the row, it never
+	// swallows or reorders the existing decode-error path below.
+	if err := r.maybeSnapshotSchemaB1(ctx, qn, tbl, out); err != nil {
+		return err
 	}
 
 	pos, err := r.positionFor(hdr)
@@ -692,6 +745,56 @@ func (r *CDCReader) tableFor(ctx context.Context, qn string) (*tableSchema, erro
 	}
 	r.schemaCache[qn] = tbl
 	return tbl, nil
+}
+
+// maybeSnapshotSchemaB1 is the ADR-0049 Chunk B1 deferred-snapshot
+// emitter. It runs on every row event but does work only while a DDL
+// boundary is pending (pendingDDLActive — set when the generic-DDL
+// branch cleared the schema cache and captured the DDL's own
+// position). For the rebuilt *tableSchema of the table this row
+// targets it:
+//
+//   - projects *tableSchema → ir.Table (the binlog reader's existing
+//     post-DDL view; locked decision #2 — B1 reuses the lazily-
+//     rebuilt schema, the readiness brief's "cheapest" boundary path,
+//     position-anchored by capturing the DDL GTID at clear time
+//     rather than re-introspecting "schema now" at an arbitrary later
+//     position);
+//   - true-delta gates it (DP-1 ii): the blanket schemaCache clear is
+//     conservative — a DDL on a *different* table, or an index-only
+//     ALTER, leaves THIS table's (column-name, ordered-type) decode
+//     contract unchanged, so no version is written for it;
+//   - emits ir.SchemaSnapshot anchored at pendingDDLAnchor — the DDL
+//     event's OWN position (#4c), NOT this row's — so a replay
+//     between the DDL and the first post-DDL row resolves to the
+//     post-DDL schema.
+//
+// A column whose type can't be reconstructed already failed loudly in
+// loadTableSchema/translateType before reaching here (tableFor
+// returned that error), so this path sees only well-formed tables;
+// its only failure surface is a blocked channel send (propagated —
+// fatal/loud, #4b).
+func (r *CDCReader) maybeSnapshotSchemaB1(ctx context.Context, qn string, tbl *tableSchema, out chan<- ir.Change) error {
+	if !r.pendingDDLActive || tbl == nil {
+		return nil
+	}
+	irTbl := &ir.Table{Schema: tbl.Schema, Name: tbl.Name, Columns: tbl.Columns}
+	sig := ir.SchemaSignatureOf(irTbl)
+	if prev, ok := r.snapshotSig[qn]; ok && prev.Equal(sig) {
+		// This table's decode contract didn't change across the DDL
+		// (blanket-clear was conservative) — not a true delta.
+		return nil
+	}
+	if err := send(ctx, out, ir.SchemaSnapshot{
+		Position: r.pendingDDLAnchor,
+		Schema:   tbl.Schema,
+		Table:    tbl.Name,
+		IR:       irTbl,
+	}); err != nil {
+		return err
+	}
+	r.snapshotSig[qn] = sig
+	return nil
 }
 
 // positionFor builds the [ir.Position] to attach to events emitted from

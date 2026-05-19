@@ -189,6 +189,7 @@ func openBinlogCDCReader(ctx context.Context, dsn string) (ir.CDCReader, error) 
 		serverID:    generateServerID(),
 		tableMap:    make(map[uint64]string),
 		schemaCache: make(map[string]*tableSchema),
+		snapshotSig: make(map[string]ir.SchemaSignature),
 	}, nil
 }
 
