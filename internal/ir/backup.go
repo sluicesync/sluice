@@ -600,6 +600,11 @@ type schemaTypeEnvelope struct {
 	Name               string `json:"name,omitempty"`
 	Modifiers          []int  `json:"modifiers,omitempty"`
 	VerbatimDefinition string `json:"verbatim_definition,omitempty"`
+
+	// Bit (ADR-0049 Chunk B/C prerequisite). Bit.Length reuses the
+	// string `Length` field above; BitVarying distinguishes
+	// `bit varying`/`varbit` from fixed-width `bit`. Append-only.
+	BitVarying bool `json:"bit_varying,omitempty"`
 }
 
 // MarshalType renders an IR [Type] as a tagged-union JSON envelope.
@@ -703,6 +708,22 @@ func MarshalType(t Type) ([]byte, error) {
 		// spelling so a PG restore re-creates the column identically.
 		env.Kind = "VerbatimType"
 		env.VerbatimDefinition = v.Definition
+	case Bit:
+		// ADR-0049 Chunk B/C prerequisite: a schema-history snapshot of
+		// a table carrying a `bit`/`varbit` column (catalog Bug 62/77)
+		// must round-trip, not loud-fail.
+		env.Kind = "Bit"
+		env.Length = v.Length
+		env.BitVarying = v.Varying
+	case ExtensionType:
+		// ADR-0049 Chunk B/C prerequisite: the ADR-0032 catalogued
+		// extension types (vector/pg_trgm/hstore/citext/postgis/
+		// pgcrypto/uuid-ossp). Extension/Name/Modifiers were already
+		// provisioned in the envelope; only the codec case was missing.
+		env.Kind = "ExtensionType"
+		env.Extension = v.Extension
+		env.Name = v.Name
+		env.Modifiers = v.Modifiers
 	default:
 		return nil, fmt.Errorf("unsupported IR type for backup encoding: %T", t)
 	}
@@ -787,6 +808,14 @@ func UnmarshalType(b []byte) (Type, error) {
 		// engine-agnostic; the restore-time engine gate (checked before
 		// any data moves) refuses a non-PG target loudly.
 		return VerbatimType{Definition: env.VerbatimDefinition}, nil
+	case "Bit":
+		return Bit{Length: env.Length, Varying: env.BitVarying}, nil
+	case "ExtensionType":
+		return ExtensionType{
+			Extension: env.Extension,
+			Name:      env.Name,
+			Modifiers: env.Modifiers,
+		}, nil
 	default:
 		return nil, fmt.Errorf("unknown IR type kind %q in backup", env.Kind)
 	}

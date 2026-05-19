@@ -61,6 +61,13 @@ func codecTypeMatrix() []struct {
 		{"array of int", Array{Element: Integer{Width: 32}}},
 		{"array of uuid", Array{Element: UUID{}}},
 		{"verbatim", VerbatimType{Definition: "ltree"}},
+		// ADR-0049 Chunk B/C prerequisite: a schema-history snapshot of
+		// a table with a bit/varbit or ADR-0032 ext column must
+		// round-trip, not loud-fail. Pin the class at Table level.
+		{"bit fixed", Bit{Length: 8}},
+		{"bit varying", Bit{Length: 16, Varying: true}},
+		{"ext no mods", ExtensionType{Extension: "uuid-ossp", Name: "uuid"}},
+		{"ext with mods", ExtensionType{Extension: "vector", Name: "vector", Modifiers: []int{1536}}},
 	}
 }
 

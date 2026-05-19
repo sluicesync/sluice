@@ -56,6 +56,14 @@ func TestMarshalType_RoundTrip(t *testing.T) {
 		{"VerbatimType cube", VerbatimType{Definition: "cube"}},
 		{"VerbatimType schema-qualified", VerbatimType{Definition: "public.mytype"}},
 		{"VerbatimType with modifier spelling", VerbatimType{Definition: "geometry(Point,4326)"}},
+		// ADR-0049 Chunk B/C prerequisite: Bit (catalog Bug 62/77) +
+		// ADR-0032 catalogued ExtensionType. Pin the class — fixed vs
+		// varying bit; ext with and without modifiers.
+		{"Bit fixed", Bit{Length: 8}},
+		{"Bit varying", Bit{Length: 16, Varying: true}},
+		{"ExtensionType no mods", ExtensionType{Extension: "uuid-ossp", Name: "uuid"}},
+		{"ExtensionType vector with mods", ExtensionType{Extension: "vector", Name: "vector", Modifiers: []int{1536}}},
+		{"ExtensionType postgis multi-mod", ExtensionType{Extension: "postgis", Name: "geometry", Modifiers: []int{4326, 2}}},
 	}
 	for _, c := range cases {
 		c := c
