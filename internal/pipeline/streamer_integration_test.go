@@ -138,12 +138,19 @@ func (a *recordingApplier) Apply(ctx context.Context, _ string, changes <-chan i
 			if !ok {
 				return nil
 			}
-			// Skip transaction-boundary events (ADR-0027) — the
-			// recording applier exists to capture row events for
-			// shape assertions; tests that count or inspect changes
-			// expect the pre-ADR-0027 row-only stream.
+			// Skip orthogonal infra events — the recording applier
+			// captures row events for shape assertions. TxBegin/
+			// TxCommit are tx-boundary bookkeeping (ADR-0027);
+			// ir.SchemaSnapshot is the ADR-0049 schema-history
+			// boundary event (a reader emits one at first-touch +
+			// each true DDL delta). Neither is DML. Without this
+			// skip, the leading first-touch SchemaSnapshot races the
+			// data inserts: waitFor(1) returns after recording just
+			// the snapshot and the test asserts on a stream that
+			// never had a chance to dispatch the row events yet
+			// (CI run 26127255685 surfaced this).
 			switch c.(type) {
-			case ir.TxBegin, ir.TxCommit:
+			case ir.TxBegin, ir.TxCommit, ir.SchemaSnapshot:
 				continue
 			}
 			a.mu.Lock()
