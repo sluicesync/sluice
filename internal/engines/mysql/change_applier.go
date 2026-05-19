@@ -438,10 +438,15 @@ func (a *ChangeApplier) Close() error {
 }
 
 // EnsureControlTable creates the per-target sluice_cdc_state table
-// if it doesn't exist. Idempotent. Must run before Apply on any
-// fresh target; the Streamer drives this at startup.
+// and the additive ADR-0049 sluice_cdc_schema_history table if they
+// don't exist. Idempotent. Must run before Apply on any fresh target;
+// the Streamer drives this at startup. The schema-history ensure is
+// strictly additive — it never touches sluice_cdc_state data.
 func (a *ChangeApplier) EnsureControlTable(ctx context.Context) error {
-	return ensureControlTable(ctx, a.db)
+	if err := ensureControlTable(ctx, a.db); err != nil {
+		return err
+	}
+	return ensureSchemaHistoryTable(ctx, a.db)
 }
 
 // ReadPosition returns the last persisted source position for
