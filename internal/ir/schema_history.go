@@ -4,9 +4,34 @@
 package ir
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 )
+
+// SchemaVersionKey derives the deterministic primary-key surrogate for
+// a schema-history row from its natural identity tuple
+// (stream_id, schema_name, table_name, anchor_position).
+//
+// anchor_position is an engine-opaque position token (ADR-0007) that is
+// unbounded — GTID sets run to hundreds of bytes — so the natural tuple
+// cannot be a SQL primary key directly: MySQL InnoDB caps an index key
+// at 3072 bytes (four utf8mb4 VARCHAR(255)s alone are 4080), and a
+// prefix index on the anchor would let two distinct long anchors that
+// share a prefix COLLIDE in the PK and silently overwrite each other's
+// schema version — a silent-loss class. The surrogate is a fixed-width
+// SHA-256 over the full tuple: collision-free in practice, identical
+// across engines, index-safe. Components are NUL-delimited so boundaries
+// are unambiguous (a||b cannot alias a'||b').
+func SchemaVersionKey(streamID, schemaName, tableName, anchorToken string) string {
+	h := sha256.New()
+	for _, part := range []string{streamID, schemaName, tableName, anchorToken} {
+		_, _ = h.Write([]byte(part))
+		_, _ = h.Write([]byte{0})
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
 
 // ADR-0049 CDC schema-history — engine-neutral resolve.
 //

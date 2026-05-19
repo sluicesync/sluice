@@ -65,19 +65,28 @@ type schemaHistoryQueryer interface {
 // anchor_position is LONGTEXT: it holds the engine-opaque position
 // token (ADR-0007), which for GTID sets can be long. ir_schema_json is
 // LONGTEXT: the MarshalTable codec output. created_at defaults to
-// CURRENT_TIMESTAMP for operator diagnostics. PK is the full
-// (stream_id, schema_name, table_name, anchor_position) tuple so a
-// re-observed boundary upserts in place rather than duplicating.
+// CURRENT_TIMESTAMP for operator diagnostics.
+//
+// PK is version_key (CHAR(64)) — a fixed-width [ir.SchemaVersionKey]
+// SHA-256 surrogate over the natural tuple (stream_id, schema_name,
+// table_name, anchor_position). The natural tuple cannot be the PK
+// directly: InnoDB caps a key at 3072 bytes (four utf8mb4
+// VARCHAR(255)s = 4080), and a prefix index on the unbounded anchor
+// would let two distinct long anchors sharing a prefix collide and
+// silently overwrite each other (a silent-loss class). The surrogate
+// is collision-free and index-safe; the natural columns remain stored
+// (NOT NULL) so the resolver round-trips the full anchor token.
 func ensureSchemaHistoryTable(ctx context.Context, db *sql.DB) error {
 	const ddl = `
 		CREATE TABLE IF NOT EXISTS ` + "`" + schemaHistoryTableName + "`" + ` (
+			version_key     CHAR(64)     NOT NULL,
 			stream_id       VARCHAR(255) NOT NULL,
 			schema_name     VARCHAR(255) NOT NULL,
 			table_name      VARCHAR(255) NOT NULL,
 			anchor_position LONGTEXT     NOT NULL,
 			ir_schema_json  LONGTEXT     NOT NULL,
 			created_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
-			PRIMARY KEY (stream_id, schema_name, table_name, anchor_position(255))
+			PRIMARY KEY (version_key)
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
 	if _, err := db.ExecContext(ctx, ddl); err != nil {
 		return fmt.Errorf("mysql: ensure schema-history table: %w", wrapDDLError(err))
@@ -115,11 +124,12 @@ func writeSchemaVersion(ctx context.Context, exec schemaHistoryExecer, streamID,
 	if err != nil {
 		return fmt.Errorf("mysql: write schema version: marshal table: %w", err)
 	}
+	vk := ir.SchemaVersionKey(streamID, schema, table, anchor.Token)
 	const q = "INSERT INTO `" + schemaHistoryTableName + "` " +
-		"(stream_id, schema_name, table_name, anchor_position, ir_schema_json) " +
-		"VALUES (?, ?, ?, ?, ?) " +
+		"(version_key, stream_id, schema_name, table_name, anchor_position, ir_schema_json) " +
+		"VALUES (?, ?, ?, ?, ?, ?) " +
 		"AS new ON DUPLICATE KEY UPDATE ir_schema_json = new.ir_schema_json"
-	if _, err := exec.ExecContext(ctx, q, streamID, schema, table, anchor.Token, string(payload)); err != nil {
+	if _, err := exec.ExecContext(ctx, q, vk, streamID, schema, table, anchor.Token, string(payload)); err != nil {
 		return fmt.Errorf("mysql: write schema version: %w", err)
 	}
 	return nil

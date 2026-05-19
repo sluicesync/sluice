@@ -345,3 +345,40 @@ func TestResolveSchemaVersion_MalformedPosition_IsLoudError(t *testing.T) {
 		t.Fatalf("a malformed position is a bug, not a cold-start trigger; must not be ErrPositionInvalid; got %v", err)
 	}
 }
+
+// TestSchemaVersionKey pins the surrogate-PK contract that replaced the
+// natural composite key after the CI 1071 regression (db212c8): the key
+// must be deterministic, fixed 64-hex-char width, and — the correctness
+// half, not just the InnoDB-3072-byte size half — DISTINCT for two
+// anchors that share a long common prefix. The original
+// anchor_position(255) prefix index would have collided these and
+// silently overwritten one version with the other's schema (a
+// silent-loss class). Pin the class, not one representative.
+func TestSchemaVersionKey(t *testing.T) {
+	// Deterministic + fixed width.
+	k1 := SchemaVersionKey("s", "sch", "tbl", "gtid:1-100")
+	if k1 != SchemaVersionKey("s", "sch", "tbl", "gtid:1-100") {
+		t.Fatal("SchemaVersionKey must be deterministic")
+	}
+	if len(k1) != 64 {
+		t.Fatalf("want 64 hex chars (CHAR(64) PK), got %d (%q)", len(k1), k1)
+	}
+
+	// Prefix-collision class: two distinct anchors sharing a 300-char
+	// prefix (longer than the old 255 prefix index) must NOT collide.
+	common := ""
+	for i := 0; i < 300; i++ {
+		common += "a"
+	}
+	kA := SchemaVersionKey("s", "sch", "tbl", common+"X")
+	kB := SchemaVersionKey("s", "sch", "tbl", common+"Y")
+	if kA == kB {
+		t.Fatal("distinct long anchors sharing a prefix must yield distinct keys (the silent-overwrite class)")
+	}
+
+	// NUL-delimited: component regrouping must not alias
+	// (a||b vs a'||b' where a+b == a'+b' concatenated).
+	if SchemaVersionKey("ab", "c", "t", "p") == SchemaVersionKey("a", "bc", "t", "p") {
+		t.Fatal("component boundaries must be unambiguous (NUL-delimited)")
+	}
+}

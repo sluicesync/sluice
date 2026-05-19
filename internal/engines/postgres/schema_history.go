@@ -59,20 +59,27 @@ type schemaHistoryQueryer interface {
 //
 // anchor_position and ir_schema_json are TEXT (PG TEXT is unbounded).
 // created_at defaults to CURRENT_TIMESTAMP for operator diagnostics.
-// PK is the full (stream_id, schema_name, table_name,
-// anchor_position) tuple so a re-observed boundary upserts in place
-// rather than duplicating.
+//
+// PK is version_key (CHAR(64)) — the fixed-width [ir.SchemaVersionKey]
+// SHA-256 surrogate over the natural tuple (stream_id, schema_name,
+// table_name, anchor_position). PG would tolerate the natural tuple as
+// a PK, but the surrogate is kept ENGINE-IDENTICAL with MySQL (where
+// InnoDB's 3072-byte key limit and the prefix-collision silent-loss
+// hazard force it) so the two stores stay structurally congruent and
+// the key derivation has a single source of truth. Natural columns
+// remain stored (NOT NULL) so the resolver round-trips the full anchor.
 func ensureSchemaHistoryTable(ctx context.Context, db *sql.DB, schema string) error {
 	tableRef := quoteIdent(schema) + "." + quoteIdent(schemaHistoryTableName)
 	ddl := `
 		CREATE TABLE IF NOT EXISTS ` + tableRef + ` (
+			version_key     CHAR(64)     NOT NULL,
 			stream_id       VARCHAR(255) NOT NULL,
 			schema_name     VARCHAR(255) NOT NULL,
 			table_name      VARCHAR(255) NOT NULL,
 			anchor_position TEXT         NOT NULL,
 			ir_schema_json  TEXT         NOT NULL,
 			created_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
-			PRIMARY KEY (stream_id, schema_name, table_name, anchor_position)
+			PRIMARY KEY (version_key)
 		)`
 	if _, err := db.ExecContext(ctx, ddl); err != nil {
 		return fmt.Errorf("postgres: ensure schema-history table: %w", err)
@@ -111,12 +118,13 @@ func writeSchemaVersion(ctx context.Context, exec schemaHistoryExecer, schema, s
 		return fmt.Errorf("postgres: write schema version: marshal table: %w", err)
 	}
 	tableRef := quoteIdent(schema) + "." + quoteIdent(schemaHistoryTableName)
+	vk := ir.SchemaVersionKey(streamID, schemaName, table, anchor.Token)
 	q := "INSERT INTO " + tableRef + " " +
-		"(stream_id, schema_name, table_name, anchor_position, ir_schema_json) " +
-		"VALUES ($1, $2, $3, $4, $5) " +
-		"ON CONFLICT (stream_id, schema_name, table_name, anchor_position) DO UPDATE SET " +
+		"(version_key, stream_id, schema_name, table_name, anchor_position, ir_schema_json) " +
+		"VALUES ($1, $2, $3, $4, $5, $6) " +
+		"ON CONFLICT (version_key) DO UPDATE SET " +
 		"ir_schema_json = EXCLUDED.ir_schema_json"
-	if _, err := exec.ExecContext(ctx, q, streamID, schemaName, table, anchor.Token, string(payload)); err != nil {
+	if _, err := exec.ExecContext(ctx, q, vk, streamID, schemaName, table, anchor.Token, string(payload)); err != nil {
 		return fmt.Errorf("postgres: write schema version: %w", err)
 	}
 	return nil
