@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"reflect"
 )
 
 // SchemaVersionKey derives the deterministic primary-key surrogate for
@@ -54,6 +55,73 @@ func SchemaVersionKey(streamID, schemaName, tableName, anchorToken string) strin
 // Chunk-A scope fence: this is storage + serialization + resolve + the
 // orderer impls only. No DDL-boundary detection, no hot-path cache, no
 // applier wiring (ADR-0049 chunks B/C/D).
+
+// SchemaSignature is the structural fingerprint a CDC reader compares
+// across boundary events to decide whether a FIELD / Relation /
+// post-DDL rebuild is a *true* schema delta (ADR-0049 DP-1 sign-off
+// point ii) or a no-op re-emit. VStream re-emits FIELD on
+// (re)start / per-table first-touch and PG re-sends Relation on
+// reconnect *without* any DDL; snapshotting those would bloat the
+// history with no-op versions and break DP-2's "retention ∝ DDL
+// count" assumption. The signature is the (ordered column-name,
+// ordered column-type) tuple — exactly the two axes the resolve path
+// decodes against. It deliberately excludes nullability, defaults,
+// comments, indexes, and constraints: those don't change how a ROW
+// event's column layout is decoded, so a change confined to them is
+// not a decode-affecting delta (a future chunk may widen this if a
+// constraint-only delta ever needs a version; Chunk B scopes it to
+// the decode contract).
+type SchemaSignature struct {
+	// names is the column list in declaration order.
+	names []string
+	// types is each column's IR type, parallel to names.
+	types []Type
+}
+
+// SchemaSignatureOf derives the [SchemaSignature] of t. A nil table
+// yields the zero signature, which differs from every non-empty
+// table's signature (so the first boundary for a table is always a
+// true delta).
+func SchemaSignatureOf(t *Table) SchemaSignature {
+	if t == nil {
+		return SchemaSignature{}
+	}
+	sig := SchemaSignature{
+		names: make([]string, len(t.Columns)),
+		types: make([]Type, len(t.Columns)),
+	}
+	for i, c := range t.Columns {
+		sig.names[i] = c.Name
+		sig.types[i] = c.Type
+	}
+	return sig
+}
+
+// Equal reports whether two signatures describe the same decode
+// contract: same column names in the same order with the same IR
+// types. Type equality is structural ([reflect.DeepEqual]) because
+// IR types are value structs (Array.Element is an interface,
+// ExtensionType.Modifiers is a slice — both DeepEqual-correct) and a
+// type-parameter change (VARCHAR(10)→VARCHAR(20), DECIMAL(10,2)→
+// DECIMAL(12,4), ENUM value-set change) is a real decode-affecting
+// delta that MUST snapshot a new version. Pinning to the IR type —
+// not a representative scalar — is the Bug-74-class discipline:
+// numeric/temporal/enum/blob parameter changes are silent-loss if
+// treated as no-ops.
+func (s SchemaSignature) Equal(other SchemaSignature) bool {
+	if len(s.names) != len(other.names) {
+		return false
+	}
+	for i := range s.names {
+		if s.names[i] != other.names[i] {
+			return false
+		}
+		if !reflect.DeepEqual(s.types[i], other.types[i]) {
+			return false
+		}
+	}
+	return true
+}
 
 // RetainedSchemaVersion is one persisted schema-history row as loaded
 // from the engine's sluice_cdc_schema_history control table: the

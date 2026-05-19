@@ -59,7 +59,8 @@ type Row map[string]any
 
 // Change is the sealed interface for events in a continuous-sync change
 // stream. Implementations are [Insert], [Update], [Delete], [Truncate],
-// [TxBegin], and [TxCommit]. New variants must be added in this package.
+// [TxBegin], [TxCommit], and [SchemaSnapshot]. New variants must be
+// added in this package.
 type Change interface {
 	// isChange seals the interface.
 	isChange()
@@ -184,3 +185,44 @@ type TxCommit struct {
 func (TxCommit) isChange()               {}
 func (e TxCommit) Pos() Position         { return e.Position }
 func (e TxCommit) QualifiedName() string { return "" }
+
+// SchemaSnapshot is the ADR-0049 (Chunk B) position-anchored
+// schema-history boundary event. A CDC reader emits exactly one of
+// these the moment it detects a *true* DDL-boundary delta for a table
+// (DP-1 sign-off point ii: a real change to the column-name set or
+// ordered column types, NOT merely "a FIELD/Relation event arrived"),
+// carrying the table's post-DDL IR schema (Table) and the boundary
+// event's OWN source position (Position — locked decision #4c: the
+// DDL/FIELD/Relation event's position captured at detection, never the
+// first subsequent row's).
+//
+// The applier persists Table keyed by Position into the engine's
+// sluice_cdc_schema_history control table (ADR-0049 Chunk A store API)
+// *inside the same target transaction as the ADR-0007 position write*
+// (locked decision #4a). A persist failure is fatal to the stream
+// (locked decision #4b) — never logged-and-continued, because a lost
+// version silently degrades every future resume across that boundary,
+// the exact silent-mis-decode class this ADR exists to kill.
+//
+// SchemaSnapshot carries no row data; it sits between the DDL boundary
+// and the first post-DDL row event so the applier durably records the
+// new schema-version anchor before any row decoded in the new shape is
+// applied. It is NOT a no-op for per-change appliers (unlike
+// [TxBegin] / [TxCommit]): the version write must reach a transaction.
+type SchemaSnapshot struct {
+	Position Position
+	Schema   string
+	Table    string
+	// IR is the affected table's post-DDL IR schema, built from the
+	// reader's in-stream position-anchored metadata at the boundary —
+	// NEVER a fresh information_schema / catalog re-introspection
+	// (ADR-0049 locked decision #2; the ADR rejects re-introspection
+	// in Alternatives). Non-nil for a well-formed event.
+	IR *Table
+}
+
+func (SchemaSnapshot) isChange()       {}
+func (e SchemaSnapshot) Pos() Position { return e.Position }
+func (e SchemaSnapshot) QualifiedName() string {
+	return qualified(e.Schema, e.Table)
+}
