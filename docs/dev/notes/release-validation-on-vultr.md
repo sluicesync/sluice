@@ -85,8 +85,17 @@ Then run on the Vultr box (single SSH session, ~30 min total):
 cd /root/code/sluice
 export PATH=$PATH:/usr/local/go/bin
 
-# 1. Full integration suite (the default CI gate, replicated)
-time go test -tags=integration -race -count=1 -timeout=30m ./internal/...
+# 1. Full integration suite (the default CI gate, replicated).
+#    -timeout MUST mirror CI's CI_INTEGRATION_TIMEOUT (75m). The old
+#    30m here was a stale under-budget: CI's integration job already
+#    runs ~39m and was bumped 35m->75m ("stale budget, grown suite",
+#    commit c8f1ca5); this standalone runbook copy never got the
+#    bump, so SUITE1 timed out at exactly 30m on the validation VM
+#    (2026-05-19 ground truth: panic "test timed out after 30m0s",
+#    zero real failures, maxRSS ~970MB, no OOM/swap — purely the
+#    budget, made worse by the VM's slower-than-CI virtual-disk I/O,
+#    not a code or memory defect). engines/mysql alone is ~14.5m.
+time go test -tags=integration -race -count=1 -timeout=75m ./internal/...
 
 # 2. PostGIS suite (parallel job in CI; here run sequentially after #1)
 time go test -tags="integration postgis" -race -count=1 -timeout=15m \
