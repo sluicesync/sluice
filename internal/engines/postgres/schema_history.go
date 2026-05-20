@@ -60,6 +60,16 @@ type schemaHistoryQueryer interface {
 // anchor_position and ir_schema_json are TEXT (PG TEXT is unbounded).
 // created_at defaults to CURRENT_TIMESTAMP for operator diagnostics.
 //
+// source_engine is the engine tag of the anchor token's producer (the
+// source-side engine that emitted the [ir.SchemaSnapshot]). It is
+// NULLABLE so a v0.70.0-shape table that pre-dates the column
+// upgrade-migrates cleanly via the ADD COLUMN IF NOT EXISTS below; on
+// the read path a NULL value falls back to the applier's own engine
+// name (the pre-fix behaviour, correct for same-engine streams).
+// Persisting it is what fixes Bug 78: cross-engine chain-restore
+// preserves the source token's engine identity through the
+// [ir.PositionOrderer] strict engine-tag check.
+//
 // PK is version_key (CHAR(64)) — the fixed-width [ir.SchemaVersionKey]
 // SHA-256 surrogate over the natural tuple (stream_id, schema_name,
 // table_name, anchor_position). PG would tolerate the natural tuple as
@@ -78,11 +88,24 @@ func ensureSchemaHistoryTable(ctx context.Context, db *sql.DB, schema string) er
 			table_name      VARCHAR(255) NOT NULL,
 			anchor_position TEXT         NOT NULL,
 			ir_schema_json  TEXT         NOT NULL,
+			source_engine   TEXT         NULL,
 			created_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			PRIMARY KEY (version_key)
 		)`
 	if _, err := db.ExecContext(ctx, ddl); err != nil {
 		return fmt.Errorf("postgres: ensure schema-history table: %w", err)
+	}
+	// Migration path for v0.70.0 deployments whose
+	// sluice_cdc_schema_history table pre-dates the source_engine column
+	// (Bug 78 fix, v0.70.1). NULLABLE: legacy rows have NULL, the read
+	// path falls back to engineNamePostgres (the pre-fix behaviour, which
+	// is correct for same-engine streams — same-engine chain-restore
+	// worked pre-fix). ADD COLUMN IF NOT EXISTS is supported in every PG
+	// version sluice targets; mirrors the additive migrations in
+	// control_table.go.
+	alter := "ALTER TABLE " + tableRef + " ADD COLUMN IF NOT EXISTS source_engine TEXT NULL"
+	if _, err := db.ExecContext(ctx, alter); err != nil {
+		return fmt.Errorf("postgres: ensure schema-history table: add source_engine: %w", err)
 	}
 	return nil
 }
@@ -119,28 +142,43 @@ func writeSchemaVersion(ctx context.Context, exec schemaHistoryExecer, schema, s
 	}
 	tableRef := quoteIdent(schema) + "." + quoteIdent(schemaHistoryTableName)
 	vk := ir.SchemaVersionKey(streamID, schemaName, table, anchor.Token)
+	// source_engine carries anchor.Engine — the engine identity of the
+	// anchor token's producer. NULLIF on empty preserves the legacy
+	// (pre-Bug-78) NULL shape for any future caller that omits the
+	// engine tag; today the applier dispatch always passes a populated
+	// anchor (from the in-stream SchemaSnapshot's Position.Engine), so
+	// the empty case is defensive.
 	q := "INSERT INTO " + tableRef + " " +
-		"(version_key, stream_id, schema_name, table_name, anchor_position, ir_schema_json) " +
-		"VALUES ($1, $2, $3, $4, $5, $6) " +
+		"(version_key, stream_id, schema_name, table_name, anchor_position, ir_schema_json, source_engine) " +
+		"VALUES ($1, $2, $3, $4, $5, $6, NULLIF($7, '')) " +
 		"ON CONFLICT (version_key) DO UPDATE SET " +
-		"ir_schema_json = EXCLUDED.ir_schema_json"
-	if _, err := exec.ExecContext(ctx, q, vk, streamID, schemaName, table, anchor.Token, string(payload)); err != nil {
+		"ir_schema_json = EXCLUDED.ir_schema_json, " +
+		"source_engine = COALESCE(EXCLUDED.source_engine, " + tableRef + ".source_engine)"
+	if _, err := exec.ExecContext(ctx, q, vk, streamID, schemaName, table, anchor.Token, string(payload), anchor.Engine); err != nil {
 		return fmt.Errorf("postgres: write schema version: %w", err)
 	}
 	return nil
 }
 
 // loadRetainedSchemaVersions reads every retained
-// (anchor_position, ir_schema_json) pair for the (streamID,
-// schemaName, table) key. The Engine field of each reconstructed
-// [ir.Position] is stamped engineNamePostgres so the decoder accepts
-// it on the resolve path (the persisted token alone is opaque without
-// its engine tag).
+// (anchor_position, ir_schema_json, source_engine) tuple for the
+// (streamID, schemaName, table) key. The Engine field of each
+// reconstructed [ir.Position] is the persisted source_engine — the
+// engine that PRODUCED the anchor token, NOT the applier's own engine
+// (Bug 78: a cross-engine chain-restore persisted a MySQL GTID token
+// under a PG applier; stamping it engineNamePostgres on read made the
+// engine-strict [ir.PositionOrderer] reject it during cache-prime).
+//
+// Legacy v0.70.0 rows have source_engine NULL (the column did not
+// exist before the Bug 78 fix); a NULL is treated as "use the
+// applier's own engine name" — i.e. the pre-fix behaviour. That is
+// correct for same-engine streams (target == source), which are the
+// only streams that worked pre-fix.
 //
 //nolint:unused // ADR-0049 Chunk A storage-only; see writeSchemaVersion.
 func loadRetainedSchemaVersions(ctx context.Context, q schemaHistoryQueryer, schema, streamID, schemaName, table string) ([]ir.RetainedSchemaVersion, error) {
 	tableRef := quoteIdent(schema) + "." + quoteIdent(schemaHistoryTableName)
-	sel := "SELECT anchor_position, ir_schema_json FROM " + tableRef + " " +
+	sel := "SELECT anchor_position, ir_schema_json, COALESCE(source_engine, '') FROM " + tableRef + " " +
 		"WHERE stream_id = $1 AND schema_name = $2 AND table_name = $3"
 	rows, err := q.QueryContext(ctx, sel, streamID, schemaName, table)
 	if err != nil {
@@ -151,14 +189,24 @@ func loadRetainedSchemaVersions(ctx context.Context, q schemaHistoryQueryer, sch
 	out := []ir.RetainedSchemaVersion{}
 	for rows.Next() {
 		var (
-			anchorTok string
-			payload   string
+			anchorTok    string
+			payload      string
+			sourceEngine string
 		)
-		if err := rows.Scan(&anchorTok, &payload); err != nil {
+		if err := rows.Scan(&anchorTok, &payload, &sourceEngine); err != nil {
 			return nil, fmt.Errorf("postgres: scan schema version: %w", err)
 		}
+		engine := sourceEngine
+		if engine == "" {
+			// Legacy v0.70.0 row from before the source_engine column
+			// existed: fall back to the applier's own engine name. This
+			// preserves the pre-fix behaviour (correct for same-engine
+			// streams, which are the only streams that worked pre-fix
+			// anyway).
+			engine = engineNamePostgres
+		}
 		out = append(out, ir.RetainedSchemaVersion{
-			Anchor:    ir.Position{Engine: engineNamePostgres, Token: anchorTok},
+			Anchor:    ir.Position{Engine: engine, Token: anchorTok},
 			TableJSON: []byte(payload),
 		})
 	}
