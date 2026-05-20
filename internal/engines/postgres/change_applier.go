@@ -773,7 +773,7 @@ func (a *ChangeApplier) applyOne(ctx context.Context, streamID string, c ir.Chan
 	if err != nil {
 		return classifyApplierError(fmt.Errorf("postgres: applier: begin tx: %w", err))
 	}
-	if err := a.dispatch(ctx, tx, c); err != nil {
+	if err := a.dispatch(ctx, tx, streamID, c); err != nil {
 		_ = tx.Rollback()
 		return classifyApplierError(err)
 	}
@@ -816,7 +816,20 @@ var errUnknownTable = errors.New("postgres: applier: target table does not exist
 // out of the WAL stream in the normal case; this branch handles
 // drift (a manually-altered publication, a stale schema cache,
 // etc.) without taking the whole stream down.
-func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, c ir.Change) error {
+//
+// streamID is the Apply / ApplyBatch caller's streamID arg, threaded
+// through so the [ir.SchemaSnapshot] branch keys its
+// sluice_cdc_schema_history write off the same value the
+// [writePositionTx] caller uses on the same tx (ADR-0049 follow-up
+// task #27). Pre-task-27 the snapshot branch read `a.streamID` (set
+// only via the optional [ir.StreamIDSetter] interface) — every
+// production caller does call SetStreamID before Apply, but a future
+// non-migrate Apply path that didn't would silently key
+// schema-history rows under `""` and surface as a loud
+// [ir.ErrPositionInvalid] at resume time. Sourcing streamID from the
+// Apply arg (the same path writePositionTx already uses) closes the
+// footgun.
+func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID string, c ir.Change) error {
 	switch v := c.(type) {
 	case ir.Insert:
 		// ADR-0036 Phase A.3: applier-side capture probe. Logged at
@@ -920,17 +933,23 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, c ir.Change) e
 		// sluice_cdc_schema_history on the SAME tx the caller
 		// (applyOne / commitBatch) writes the ADR-0007 position on
 		// (locked decision #4a — controlSchema-qualified, the same
-		// schema writePositionTx targets). a.streamID is set by the
-		// streamer before Apply/ApplyBatch (the position-write
-		// streamID), so the history row keys identically to the
-		// position row and resolve composes. A failure returns up →
-		// the tx rolls back (position write never lands) and the
-		// stream stops loudly (locked decision #4b: fatal, never
-		// logged-and-continued).
+		// schema writePositionTx targets). The streamID arg (threaded
+		// through from Apply / ApplyBatch — ADR-0049 follow-up task
+		// #27) keys the history row identically to the position
+		// row's streamID on the same tx, so resolveSchemaVersion
+		// composes cleanly. Pre-task-27 this read a.streamID (set via
+		// the optional [ir.StreamIDSetter]); every CURRENT caller does
+		// call SetStreamID before Apply, but sourcing from the arg
+		// closes the latent footgun where any future non-migrate
+		// Apply path that omits SetStreamID would silently key rows
+		// under "" and surface as a loud [ir.ErrPositionInvalid] at
+		// the next resume. A failure returns up → the tx rolls back
+		// (position write never lands) and the stream stops loudly
+		// (locked decision #4b: fatal, never logged-and-continued).
 		if v.IR == nil {
 			return errors.New("postgres: applier: schema snapshot has nil IR table")
 		}
-		if err := writeSchemaVersion(ctx, tx, a.controlSchema, a.streamID, v.Schema, v.Table, v.Position, v.IR); err != nil {
+		if err := writeSchemaVersion(ctx, tx, a.controlSchema, streamID, v.Schema, v.Table, v.Position, v.IR); err != nil {
 			return fmt.Errorf("postgres: applier: write schema version for %s.%s: %w", v.Schema, v.Table, err)
 		}
 		return nil

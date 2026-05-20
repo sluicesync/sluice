@@ -133,7 +133,7 @@ func TestApplier_CacheAfterCommit_InvariantOnFailure(t *testing.T) {
 		streamID:     "s1",
 		activeSchema: make(map[string]activeSchemaVersion),
 	}
-	err := a.dispatch(context.Background(), nil, ir.SchemaSnapshot{
+	err := a.dispatch(context.Background(), nil, "s1", ir.SchemaSnapshot{
 		Position: ir.Position{Engine: engineNamePostgres, Token: "0/100"},
 		Schema:   "public", Table: "users", IR: nil,
 	})

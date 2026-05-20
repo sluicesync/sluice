@@ -175,7 +175,7 @@ func TestApplier_CacheAfterCommit_InvariantOnFailure(t *testing.T) {
 
 	// Confirm dispatch's nil-IR loud refusal still works (a failure-
 	// path SchemaSnapshot dispatch can't produce a cache mutation).
-	err := a.dispatch(context.Background(), nil, ir.SchemaSnapshot{
+	err := a.dispatch(context.Background(), nil, "s1", ir.SchemaSnapshot{
 		Position: ir.Position{Engine: engineNameMySQL, Token: "tok"},
 		Schema:   "app",
 		Table:    "users",

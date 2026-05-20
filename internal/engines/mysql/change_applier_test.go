@@ -488,7 +488,7 @@ func TestRunWithDeadline(t *testing.T) {
 // the loud refusal, not the SQL.
 func TestApplier_SchemaSnapshot_NilIRIsLoud(t *testing.T) {
 	a := &ChangeApplier{schema: "app", streamID: "s1"}
-	err := a.dispatch(context.Background(), nil, ir.SchemaSnapshot{
+	err := a.dispatch(context.Background(), nil, "s1", ir.SchemaSnapshot{
 		Position: ir.Position{Engine: engineNameMySQL, Token: "tok"},
 		Schema:   "app",
 		Table:    "users",

@@ -226,7 +226,7 @@ func (a *ChangeApplier) applyOneBatch(ctx context.Context, streamID string, chan
 		return 0, ir.Position{}, false, fmt.Errorf("mysql: applier: begin tx: %w", err)
 	}
 
-	if err := a.dispatch(ctx, tx, first); err != nil {
+	if err := a.dispatch(ctx, tx, streamID, first); err != nil {
 		_ = tx.Rollback()
 		slog.WarnContext(ctx, "mysql: applier: batch rollback on error",
 			slog.String("stream_id", streamID),
@@ -323,7 +323,7 @@ func (a *ChangeApplier) applyOneBatch(ctx context.Context, streamID string, chan
 				_ = tx.Rollback()
 				return 0, ir.Position{}, false, classifyApplierError(fmt.Errorf("mysql: applier: redact: %w", err))
 			}
-			if err := a.dispatch(ctx, tx, c); err != nil {
+			if err := a.dispatch(ctx, tx, streamID, c); err != nil {
 				_ = tx.Rollback()
 				slog.WarnContext(ctx, "mysql: applier: batch rollback on error",
 					slog.String("stream_id", streamID),

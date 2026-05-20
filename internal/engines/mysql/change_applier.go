@@ -734,7 +734,7 @@ func (a *ChangeApplier) applyOne(ctx context.Context, streamID string, c ir.Chan
 	// commit makes them atomic. A failure rolls back BOTH and
 	// propagates (locked decision #4b: fatal/loud, never
 	// logged-and-continued).
-	if err := a.dispatch(ctx, tx, c); err != nil {
+	if err := a.dispatch(ctx, tx, streamID, c); err != nil {
 		_ = tx.Rollback()
 		return classifyApplierError(err)
 	}
@@ -759,7 +759,20 @@ func (a *ChangeApplier) applyOne(ctx context.Context, streamID string, c ir.Chan
 }
 
 // dispatch routes a single change to its SQL form on the open tx.
-func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, c ir.Change) error {
+//
+// streamID is the Apply / ApplyBatch caller's streamID arg, threaded
+// through so the [ir.SchemaSnapshot] branch keys its
+// sluice_cdc_schema_history write off the same value the
+// [writePositionTx] caller uses on the same tx (ADR-0049 follow-up
+// task #27). Pre-task-27 the snapshot branch read `a.streamID` (set
+// only via the optional [ir.StreamIDSetter] interface) — every
+// production caller does call SetStreamID before Apply, but a future
+// non-migrate Apply path that didn't would silently key
+// schema-history rows under `""` and surface as a loud
+// [ir.ErrPositionInvalid] at resume time. Sourcing streamID from the
+// Apply arg (the same path writePositionTx already uses) closes the
+// footgun.
+func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID string, c ir.Change) error {
 	switch v := c.(type) {
 	case ir.Insert:
 		schema := applierSchema(a.schema, v.Schema)
@@ -821,19 +834,26 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, c ir.Change) e
 		// ADR-0049 Chunk B: persist the boundary's IR schema into
 		// sluice_cdc_schema_history on the SAME tx the caller
 		// (applyOne / commitBatch) writes the ADR-0007 position on
-		// (locked decision #4a). a.streamID is set by the streamer's
-		// SetStreamID before Apply/ApplyBatch (the same value passed
-		// as the position-write streamID), keying the history row
-		// identically to the position row so resolve composes. A
-		// failure here returns up through dispatch → the tx rolls
-		// back (position write never lands) and the stream stops
-		// loudly (locked decision #4b: fatal, never
-		// logged-and-continued — a lost version silently degrades
-		// every future resume across this boundary).
+		// (locked decision #4a). The streamID arg (threaded through
+		// from Apply / ApplyBatch — ADR-0049 follow-up task #27)
+		// keys the history row identically to the position row's
+		// streamID on the same tx, so resolveSchemaVersion composes
+		// cleanly. Pre-task-27 this read a.streamID (set via the
+		// optional [ir.StreamIDSetter]); every CURRENT caller does
+		// call SetStreamID before Apply, but sourcing from the arg
+		// closes the latent footgun where any future non-migrate
+		// Apply path that omits SetStreamID would silently key
+		// rows under "" and surface as a loud
+		// [ir.ErrPositionInvalid] at the next resume. A failure
+		// here returns up through dispatch → the tx rolls back
+		// (position write never lands) and the stream stops loudly
+		// (locked decision #4b: fatal, never logged-and-continued —
+		// a lost version silently degrades every future resume
+		// across this boundary).
 		if v.IR == nil {
 			return errors.New("mysql: applier: schema snapshot has nil IR table")
 		}
-		if err := writeSchemaVersion(ctx, tx, a.streamID, v.Schema, v.Table, v.Position, v.IR); err != nil {
+		if err := writeSchemaVersion(ctx, tx, streamID, v.Schema, v.Table, v.Position, v.IR); err != nil {
 			return fmt.Errorf("mysql: applier: write schema version for %s.%s: %w", v.Schema, v.Table, err)
 		}
 		return nil
