@@ -6,6 +6,26 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.70.2]
+
+**Closes Bug 79 (HIGH, LOUD) — completes Bug 78 cross-engine chain-restore-resume fix.** v0.70.1 landed only the **storage half** of Bug 78: the persisted `source_engine` column made the anchor round-trip correctly, but `PrimeSchemaHistoryCache` still passed the **target's** `Engine{}` orderer to `ir.ResolveSchemaVersion`. Cross-engine chain-restore-then-resume crashed with the same class of `engine = "mysql"; want "postgres"` error — just at the `decode p` site (currentPos) instead of the anchor decode site. The v0.70.0 Bug 78 catalog originally listed BOTH (a) storage and (b) source-orderer-routing; v0.70.1 implemented only (a). This is the (b) half.
+
+### Fixed
+
+- **Bug 79 (HIGH, LOUD, v0.70.1 incomplete-fix follow-on) — `PrimeSchemaHistoryCache` now routes through the source engine's `ir.PositionOrderer`.** Both engines: hoist the source-engine lookup ONCE per prime call (above the per-table loop, since the orderer is the same for every retained anchor of a given stream), via `engines.Get(currentPos.Engine)` cast to `ir.PositionOrderer`. Loud-fail (`fmt.Errorf`, NOT wrapping `ir.ErrPositionInvalid` — config-bug class, not cold-start) on unregistered engine OR engine that doesn't implement the orderer interface. The empty-`currentPos.Engine` path (pre-`retagPositionForSource` or brand-new stream) falls back to the applier's own engine name — the pre-fix behaviour, correct for same-engine chains (target == source). Pin: `TestPrimeSchemaHistoryCache_CrossEngine_UsesSourceOrderer` (both engines, mirrored — exercises the FULL `PrimeSchemaHistoryCache → resolveSchemaVersion → loadRetainedSchemaVersions → ir.ResolveSchemaVersion → orderer.PositionAtOrAfter` path with cross-engine inputs against a real target's orderer) + `TestPrimeSchemaHistoryCache_UnregisteredSourceEngine_IsLoud` (names the unknown engine + asserts non-`ErrPositionInvalid`). **The v0.70.1 storage round-trip pin (`TestSchemaHistory_LoadPreservesSourceEngine_CrossEngine`) was insufficient — it validated the storage layer but not the orderer-routing.** That pin gap is exactly what the v0.70.1 post-publish cycle's Scenario 1 caught; the new pin closes it explicitly at the unit-of-test scope.
+
+### Compatibility
+
+- **Drop-in upgrade from v0.70.1 (and v0.70.0).** No storage shape change (the v0.70.1 `source_engine` column stays); no `BackupFormatVersion` bump; the orderer-routing change is internal to the cache-prime path. Same-engine chain-restore-then-resume continues to work; cross-engine now also works end-to-end.
+
+- **Internal-only change:** `internal/engines/postgres/change_applier_schema_cache.go` and `internal/engines/mysql/change_applier_schema_cache.go` gained a direct import of `internal/engines` (the registry — already imported by each engine's own `engine.go` for self-registration; no cycle).
+
+### Who needs this
+
+- **Anyone planning to use ADR-0049 cross-engine chain-restore-then-resume** (MySQL backup → PG restore → resume against MySQL src → PG dst, or symmetric directions). v0.70.0 blocked it at the anchor decode; v0.70.1 fixed that but broke at the currentPos decode; v0.70.2 completes the path end-to-end.
+
+- Same-engine chain-restore-then-resume worked under v0.70.0 / v0.70.1 / v0.70.2 (regression-guarded at every release).
+
 ## [0.70.1]
 
 **Closes Bug 78 (HIGH, LOUD) — single-bug v0.70.0 hotfix.** ADR-0049 cross-engine chain-restore-then-resume (e.g. MySQL backup → restore to PG → `sluice sync start` against MySQL src → PG dst) crashed loudly at `PrimeSchemaHistoryCache` with `engine = "mysql"; want "postgres"`. Surfaced by the v0.70.0 post-publish regression cycle. Same-engine chain-restore-then-resume was unaffected and is regression-guarded.
