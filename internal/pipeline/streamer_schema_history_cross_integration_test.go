@@ -155,10 +155,9 @@ func TestStreamer_MySQLToPostgres_SchemaHistoryWarmResumeAcrossDDL(t *testing.T)
 	// the stream just before the ALTER + R3, or in ADR-0049 Chunk
 	// B1's deferred-emit interacting with that COMMIT. Tracked as
 	// task #35 — un-skip once that closes.
-	t.Skip("task #35: MDL deadlock fixed (#34 / Phase 5 ALTER now completes), " +
-		"but R3 post-DDL INSERT doesn't propagate to PG within 30s — " +
-		"separate downstream issue in the binlog-reader / Chunk B1 path; " +
-		"see CI run 26189839632 for the failure shape.")
+	// task #35 Phase A: un-skipped to capture CI ground-truth for the
+	// Phase 7 R3-never-lands failure. Restored once root cause is fixed
+	// or the deferred-feature decision is made.
 
 	mysqlSourceDSN, _, mysqlCleanup := startMySQLBinlog(t)
 	defer mysqlCleanup()
@@ -186,6 +185,12 @@ func TestStreamer_MySQLToPostgres_SchemaHistoryWarmResumeAcrossDDL(t *testing.T)
 	}
 
 	const streamID = "test-cross-mysql-pg-schemahistory"
+
+	// Phase A (task #35) instrumentation: capture slog from the very
+	// beginning so we can see what the applier/streamer reported when
+	// R3 was supposed to land. Removed in Phase C once root cause is
+	// known.
+	phaseALogBuf := captureSlog(t)
 
 	// ---- Phase 3: streamer #1 — cold start, bulk-copy lands R1 ----
 	streamer1 := &Streamer{
@@ -225,7 +230,25 @@ func TestStreamer_MySQLToPostgres_SchemaHistoryWarmResumeAcrossDDL(t *testing.T)
 		"INSERT INTO users (email, nickname) VALUES ('r3@example.com', 'Robbie');")
 
 	// ---- Phase 7: wait for R3 + nickname on PG ----
-	if !waitForRowCount(t, pgTargetDSN, "users", 3, 30*time.Second) {
+	// Phase A (task #35) instrumentation: also watch the streamer
+	// goroutine's runErr channel. If the applier hits a non-retriable
+	// error (e.g. SQLSTATE 42703 "column nickname does not exist"
+	// because there's no cross-engine DDL apply path on the live
+	// streamer), the goroutine exits before the wait expires — that's
+	// load-bearing diagnostic signal vs a pure timing/silent-stall.
+	r3Landed := waitForRowCount(t, pgTargetDSN, "users", 3, 30*time.Second)
+	if !r3Landed {
+		// Dump every log line the applier/streamer emitted up to the
+		// wait expiry, then check whether streamer1 already exited.
+		t.Logf("phase 7 / task #35 Phase A: slog tail:\n%s", phaseALogBuf.String())
+		select {
+		case err := <-runErr1:
+			t.Logf("phase 7 / task #35 Phase A: streamer1.Run returned err = %v", err)
+			// Put the err back so cancel1 / the drain below still sees it.
+			runErr1 <- err
+		default:
+			t.Logf("phase 7 / task #35 Phase A: streamer1 still running (no error reported yet) — silent stall, not loud applier error")
+		}
 		t.Fatalf("phase 7: CDC never delivered R3 (post-DDL INSERT must reach target)")
 	}
 	if !waitForNicknameByEmail(t, pgTargetDSN, "r3@example.com", "Robbie", 15*time.Second) {
