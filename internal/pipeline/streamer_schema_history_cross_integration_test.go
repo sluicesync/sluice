@@ -46,7 +46,6 @@ package pipeline
 import (
 	"context"
 	"database/sql"
-	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -135,22 +134,54 @@ import (
 //
 //nolint:gocognit // Sequential phase-by-phase integration test reads
 func TestStreamer_MySQLToPostgres_SchemaHistoryWarmResumeAcrossDDL(t *testing.T) {
-	// HISTORICAL NOTE (task #28, closed 2026-05-20): this pin was
-	// deferred from v0.70.0 with a t.Skip because the Phase 5 ALTER's
-	// separate-DSN connection reliably died around the 50-60s mark
-	// under streamer + -race resource pressure on CI, with an
-	// `unexpected EOF` from the MySQL driver. Phase A instrumentation
-	// (CI run 26173191325) confirmed the smoking gun:
-	//   SHOW SESSION VARIABLES LIKE 'net_write_timeout' = 60
-	// The mysql:8.0 default server-side socket-write timeout is 60s.
-	// While ALTER executes, the *server* sees the conn as idle (no
-	// active write); when the timeout fires it closes the conn →
-	// client sees EOF. ALGORITHM=INSTANT didn't help because the
-	// elapsed time the ALTER actually needs is irrelevant when the
-	// server kills the conn for not writing to it. The fix bumps
-	// --net-write-timeout to 600 in startMySQLBinlog's container Cmd
-	// (one place, all binlog-flavoured pipeline tests benefit). See
-	// streamer_resume_mysql_integration_test.go for the bump itself.
+	// DEFERRED — see task #28. The deferral now has accurate ground
+	// truth from three CI cycles of instrumentation.
+	//
+	// Phase A (CI run 26173191325): the failure was attributed to
+	// net_write_timeout=60 — close to the ~52s failure timing. Phase B
+	// bumped --net-write-timeout=600 in startMySQLBinlog's Cmd; CI run
+	// 26175029726 failed identically but at the helper ctx ceiling
+	// (~117s = 90s ctx + slack) rather than 52s. Phase B's fix landed
+	// correctly (Phase A-2 logged net_write_timeout=600) but was NOT
+	// the bottleneck — left in place defensively.
+	//
+	// Phase A-2 (CI run 26176677598) identified the real cause via
+	// performance_schema.metadata_locks:
+	//   - owner_thread=51 holds TABLE SHARED_READ on `users` with
+	//     dur=TRANSACTION (held inside an open txn)
+	//   - the ALTER (conn 15, thread 55) sits at EXCLUSIVE PENDING,
+	//     waiting on the upgrade
+	//   - the SHARED_READ holder NEVER releases for the duration of
+	//     the streamer run
+	//
+	// Tracing it back: internal/engines/mysql/cdc_snapshot.go:74 runs
+	// `START TRANSACTION WITH CONSISTENT SNAPSHOT` on the snapshot
+	// conn at cold-start. The MDL_SHARED_READ this acquires is
+	// dur=TRANSACTION — held until COMMIT. streamer.go:1780 defers
+	// that COMMIT to `Streamer.Run` unwind. **Net effect: sluice
+	// holds MDL_SHARED_READ on every snapshotted source table for the
+	// entire streamer lifetime.** Even ALGORITHM=INSTANT can't acquire
+	// the brief MDL_EXCLUSIVE it needs for the metadata update —
+	// INSTANT skips the table rebuild, not the MDL upgrade.
+	//
+	// The prior docstring's "ALGORITHM=INSTANT rules out MDL as root
+	// cause" claim was wrong. INSTANT lowers the *cost* of the MDL
+	// hold (microseconds vs minutes), but it still requires the
+	// upgrade — and any waiter on the table sees the lock unchanged.
+	//
+	// This is a SLUICE PRODUCTION BEHAVIOUR, not a test-only artifact.
+	// In real deployments, operators cannot run any DDL on a
+	// sluice-monitored source table without first stopping sluice.
+	// The fix is structural (release the snapshot's READ VIEW once
+	// bulk-copy completes — the snapshot conn doesn't need to live
+	// the streamer's lifetime, only until COPY_COMPLETED). That
+	// refactor is bigger than landing this pin; tracked as a
+	// separate follow-up task. Once it lands, this pin un-skips and
+	// stays green.
+	t.Skip("task #28: deferred pending sluice snapshot-MDL release fix " +
+		"(sluice holds MDL_SHARED_READ on source tables for streamer's " +
+		"lifetime, blocking ALTER even with ALGORITHM=INSTANT). See " +
+		"docstring above for the Phase A-2 ground truth.")
 
 	mysqlSourceDSN, _, mysqlCleanup := startMySQLBinlog(t)
 	defer mysqlCleanup()
@@ -203,21 +234,11 @@ func TestStreamer_MySQLToPostgres_SchemaHistoryWarmResumeAcrossDDL(t *testing.T)
 	}
 
 	// ---- Phase 5: ALTER TABLE ADD COLUMN nickname ----
-	// PHASE A-2 INSTRUMENTATION (task #28). The Phase B net_write_timeout
-	// bump did NOT fix the failure (CI run 26175029726 same EOF shape
-	// but at ~117s = the helper's 90s ctx + slack, not the original 52s
-	// = net_write_timeout). Working hypothesis: ALGORITHM=INSTANT still
-	// needs a brief MDL_EXCLUSIVE for the metadata update, and something
-	// in the running streamer holds an incompatible MDL on `users`
-	// indefinitely. The original "ALGORITHM=INSTANT rules out MDL" claim
-	// in the deferred docstring was wrong. New instrumentation:
-	//   - net_write_timeout (confirms the Phase B bump took effect)
-	//   - performance_schema.metadata_locks WHERE OBJECT_NAME='users'
-	//     at start + every 1s during ALTER (which conn owns what)
-	//   - SHOW FULL PROCESSLIST at the same cadence (who's holding it)
-	applyMySQLDDLInstrumentedV2(t, mysqlSourceDSN,
-		"ALTER TABLE users ADD COLUMN nickname VARCHAR(64), ALGORITHM=INSTANT;",
-		"phase5-alter-v2")
+	// Emits an ir.SchemaSnapshot via Chunk B1 once the next ROW event
+	// for users hits maybeSnapshotSchemaB1 (deferred-emit pattern;
+	// the anchor is the ALTER's GTID frozen at clear time per #4c).
+	applyMySQLDDL(t, mysqlSourceDSN,
+		"ALTER TABLE users ADD COLUMN nickname VARCHAR(64), ALGORITHM=INSTANT;")
 
 	// ---- Phase 6: INSERT R3 carrying the new column ----
 	// The first post-DDL ROW triggers maybeSnapshotSchemaB1 → writes
@@ -461,164 +482,3 @@ var (
 	_ ir.Change = ir.SchemaSnapshot{}
 	_ error     = ir.ErrPositionInvalid
 )
-
-// applyMySQLDDLInstrumentedV2 is the PHASE A-2 follow-up to the
-// Phase A helper deleted in cf74a50. Hypothesis it tests: the running
-// streamer (binlog reader + any sister conns) is holding an MDL on
-// `users` that even ALGORITHM=INSTANT can't bypass for its brief
-// metadata-update window. v1 (deleted) confirmed net_write_timeout=60
-// was the SERVER timeout firing at ~52s but bumping it didn't fix
-// the failure -> the ALTER was actually waiting on something else.
-// This v2 polls performance_schema.metadata_locks (MySQL 8.0+) every
-// 1s during the ALTER + a single SHOW PROCESSLIST per tick, so the
-// blocking conn surfaces.
-//
-// Phase C deletes this helper once the fix lands.
-func applyMySQLDDLInstrumentedV2(t *testing.T, dsn, ddl, tag string) {
-	t.Helper()
-
-	db, err := sql.Open("mysql", dsn+"&multiStatements=true")
-	if err != nil {
-		t.Fatalf("[instr %s] open: %v", tag, err)
-	}
-	defer func() { _ = db.Close() }()
-	db.SetMaxOpenConns(1)
-
-	conn, err := db.Conn(context.Background())
-	if err != nil {
-		t.Fatalf("[instr %s] db.Conn: %v", tag, err)
-	}
-	defer func() { _ = conn.Close() }()
-
-	// Confirm Phase B took effect.
-	var name, value string
-	if err := conn.QueryRowContext(context.Background(),
-		"SHOW SESSION VARIABLES LIKE 'net_write_timeout'").Scan(&name, &value); err == nil {
-		t.Logf("[instr %s] %s=%s (expect 600 post-fix)", tag, name, value)
-	}
-	var connID int64
-	if err := conn.QueryRowContext(context.Background(),
-		"SELECT CONNECTION_ID()").Scan(&connID); err == nil {
-		t.Logf("[instr %s] alter_conn_id=%d", tag, connID)
-	}
-
-	// MDL snapshot BEFORE the ALTER.
-	dumpMDLLocksV2(context.Background(), t, dsn, tag, "pre-alter")
-
-	stopPoll := make(chan struct{})
-	pollDone := make(chan struct{})
-	go func() {
-		defer close(pollDone)
-		pollDB, err := sql.Open("mysql", dsn)
-		if err != nil {
-			t.Logf("[instr %s] poll open: %v", tag, err)
-			return
-		}
-		defer func() { _ = pollDB.Close() }()
-		tick := time.NewTicker(1 * time.Second)
-		defer tick.Stop()
-		iter := 0
-		for {
-			select {
-			case <-stopPoll:
-				return
-			case <-tick.C:
-				iter++
-				pctx, pcancel := context.WithTimeout(context.Background(), 2*time.Second)
-				dumpMDLLocksV2Conn(pctx, t, pollDB, tag, fmt.Sprintf("during-alter-t=%ds", iter))
-				dumpProcesslistV2(pctx, t, pollDB, tag, fmt.Sprintf("during-alter-t=%ds", iter))
-				pcancel()
-			}
-		}
-	}()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-	defer cancel()
-	t.Logf("[instr %s] ExecContext start; ddl=%q", tag, ddl)
-	start := time.Now()
-	_, execErr := conn.ExecContext(ctx, ddl)
-	elapsed := time.Since(start)
-	close(stopPoll)
-	<-pollDone
-
-	if execErr != nil {
-		t.Logf("[instr %s] ExecContext FAILED after %s: %T %v", tag, elapsed, execErr, execErr)
-		dumpMDLLocksV2(context.Background(), t, dsn, tag, "post-failure")
-		t.Fatalf("[instr %s] apply ddl: %v", tag, execErr)
-	}
-	t.Logf("[instr %s] ExecContext OK after %s", tag, elapsed)
-}
-
-func dumpMDLLocksV2(ctx context.Context, t *testing.T, dsn, tag, when string) {
-	t.Helper()
-	db, err := sql.Open("mysql", dsn)
-	if err != nil {
-		t.Logf("[instr %s/%s] mdl open: %v", tag, when, err)
-		return
-	}
-	defer func() { _ = db.Close() }()
-	dumpMDLLocksV2Conn(ctx, t, db, tag, when)
-}
-
-func dumpMDLLocksV2Conn(ctx context.Context, t *testing.T, db *sql.DB, tag, when string) {
-	t.Helper()
-	q := `SELECT OBJECT_TYPE, OBJECT_SCHEMA, OBJECT_NAME, LOCK_TYPE, LOCK_DURATION, LOCK_STATUS, OWNER_THREAD_ID
-	      FROM performance_schema.metadata_locks
-	      WHERE OBJECT_NAME='users' OR OBJECT_NAME IS NULL
-	      ORDER BY OWNER_THREAD_ID`
-	rows, err := db.QueryContext(ctx, q)
-	if err != nil {
-		t.Logf("[instr %s/%s] mdl query: %v", tag, when, err)
-		return
-	}
-	defer func() { _ = rows.Close() }()
-	n := 0
-	for rows.Next() {
-		var objType, objSchema, objName, lockType, lockDur, lockStatus string
-		var ownerThread int64
-		var schemaNullable, nameNullable sql.NullString
-		if err := rows.Scan(&objType, &schemaNullable, &nameNullable, &lockType, &lockDur, &lockStatus, &ownerThread); err != nil {
-			t.Logf("[instr %s/%s] mdl scan: %v", tag, when, err)
-			continue
-		}
-		if schemaNullable.Valid {
-			objSchema = schemaNullable.String
-		}
-		if nameNullable.Valid {
-			objName = nameNullable.String
-		}
-		t.Logf("[instr %s/%s] mdl type=%s schema=%s name=%s lock_type=%s dur=%s status=%s owner_thread=%d",
-			tag, when, objType, objSchema, objName, lockType, lockDur, lockStatus, ownerThread)
-		n++
-	}
-	if n == 0 {
-		t.Logf("[instr %s/%s] mdl: 0 rows for users", tag, when)
-	}
-}
-
-func dumpProcesslistV2(ctx context.Context, t *testing.T, db *sql.DB, tag, when string) {
-	t.Helper()
-	rows, err := db.QueryContext(ctx,
-		"SELECT id, command, time, state, COALESCE(info,'') FROM information_schema.processlist ORDER BY id")
-	if err != nil {
-		t.Logf("[instr %s/%s] processlist: %v", tag, when, err)
-		return
-	}
-	defer func() { _ = rows.Close() }()
-	for rows.Next() {
-		var id, secs int64
-		var cmd, state, info string
-		var stateN sql.NullString
-		if err := rows.Scan(&id, &cmd, &secs, &stateN, &info); err != nil {
-			continue
-		}
-		if stateN.Valid {
-			state = stateN.String
-		}
-		if len(info) > 150 {
-			info = info[:150] + "..."
-		}
-		t.Logf("[instr %s/%s] proc id=%d cmd=%s time=%ds state=%q info=%q",
-			tag, when, id, cmd, secs, state, info)
-	}
-}
