@@ -6,6 +6,16 @@
 // Track 1c — Phase A ground-truth + Phase B validation: VStream CDC
 // resumability under mid-stream schema evolution.
 //
+// **ADR-0049 DP-1 invariant (Chunk E regression-pin):** the loud
+// floor MUST remain — a ROW racing ahead of its FIELD/Relation is a
+// hard error ("row event for %q without preceding FIELD event" in
+// cdc_vstream.go), NOT silent. ADR-0049's position-anchored history
+// is the efficiency upgrade *on top of* this floor (resume-after-DDL
+// stops forcing a whole-stream re-snapshot), never a removal of it.
+// Any change that quiets the row-without-FIELD error or weakens the
+// FAITHFUL-or-LOUD oracle below also breaks ADR-0049's Phase-1c
+// evidence (DP-1 sign-off rests on this test's empirical proof).
+//
 // The genuinely-open behaviour (per
 // docs/dev/notes/prep-planetscale-vitess-readiness.md, Phase 1c, and
 // docs/vitess-vstream-troubleshooting.md §4): with Vitess

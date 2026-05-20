@@ -66,6 +66,14 @@ func TestEncodeBinlogPosRejectsInvalidMode(t *testing.T) {
 // encode/decode round-trip — if ServerUUID were dropped on the wire
 // the resume-time identity check would always see an empty persisted
 // uuid and silently degrade to the old filename-only behaviour.
+//
+// **ADR-0049 DP-2 invariant (Chunk E regression-pin):** ServerUUID
+// is the position-token field the cdc_reader GTID-position-loss /
+// node-replace loud-refuse hinges on; if a future schema-history
+// change altered the ir.Position serialization in a way that
+// dropped this field, the resolve() floor would silently degrade.
+// Keeping this round-trip pin green guards the position-loss
+// loud-floor that ADR-0049's compaction-floor refuse composes with.
 func TestEncodeDecodeBinlogPosServerUUID(t *testing.T) {
 	in := binlogPos{
 		Mode:       positionModeFilePos,
@@ -91,6 +99,17 @@ func TestEncodeDecodeBinlogPosServerUUID(t *testing.T) {
 // (TestStreamer_MySQL_FreshInstanceNodeReplaceFallsThroughToColdStart)
 // proves it end-to-end against two real instances; this pins the
 // decision table cheaply so a regression is caught without Docker.
+//
+// **ADR-0049 DP-2 invariant (Chunk E regression-pin):** the
+// schema-history compaction floor must COMPOSE with, not bypass,
+// this pre-existing loud-refuse on identity-changed sources.
+// Resume from a position whose @@server_uuid differs from the
+// current source is ir.ErrPositionInvalid here BEFORE ADR-0049
+// resolveSchemaVersion is consulted — a new instance carries no
+// historical schema versions for our anchors, so the schema-history
+// floor would also refuse, but this floor's specificity ("instance
+// replaced, not just compacted past") gives the operator the
+// correct ADR-0022 cold-start signal.
 func TestVerifySourceInstanceIdentity(t *testing.T) {
 	cases := []struct {
 		name             string

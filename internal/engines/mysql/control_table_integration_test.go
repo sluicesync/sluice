@@ -91,7 +91,8 @@ func TestEnsureControlTable_AddsStopRequestedColumn(t *testing.T) {
 	// Existing row should be preserved with its old token.
 	var token string
 	var stopReq sql.NullTime
-	if err := db.QueryRowContext(ctx,
+	if err := db.QueryRowContext(
+		ctx,
 		"SELECT source_position, stop_requested_at FROM `sluice_cdc_state` WHERE stream_id = ?",
 		"legacy-stream",
 	).Scan(&token, &stopReq); err != nil {
@@ -224,6 +225,19 @@ func TestRequestStop_UnknownStreamReturnsSentinel(t *testing.T) {
 // MySQL 8.0.x versions older than 8.0.29 that lack ADD COLUMN IF
 // NOT EXISTS), preserves existing rows, and starts the new columns
 // NULL.
+//
+// **ADR-0049 Chunk A invariant (Chunk E regression-pin):** the
+// additive sluice_cdc_schema_history table introduced by Chunk A
+// must not perturb this existing additive-migration chain. The
+// EnsureControlTable call this test exercises is the same call
+// that, post-Chunk-A, also ensures sluice_cdc_schema_history (via
+// ensureSchemaHistoryTable, see schema_history.go). If a future
+// change broke the additive contract — e.g. dropping pre-existing
+// cdc_state rows on schema-history ensure — this test's "legacy
+// row preserved" assertion still catches it. The
+// TestEnsureSchemaHistoryTable_AdditiveToCDCState test in
+// schema_history_integration_test.go pins the same invariant from
+// the schema-history side; both must stay green.
 func TestEnsureControlTable_AddsCrossEngineParityColumns(t *testing.T) {
 	dsn, cleanup := startMySQLForApplier(t)
 	defer cleanup()
@@ -290,7 +304,8 @@ func TestEnsureControlTable_AddsCrossEngineParityColumns(t *testing.T) {
 		fingerprint sql.NullString
 		tsch        sql.NullString
 	)
-	if err := db.QueryRowContext(ctx,
+	if err := db.QueryRowContext(
+		ctx,
 		"SELECT source_position, slot_name, source_dsn_fingerprint, target_schema FROM `sluice_cdc_state` WHERE stream_id = ?",
 		"legacy-stream",
 	).Scan(&token, &slot, &fingerprint, &tsch); err != nil {

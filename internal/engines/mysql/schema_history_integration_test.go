@@ -170,6 +170,18 @@ func TestSchemaHistory_WriteResolveRoundTrip(t *testing.T) {
 // version-write failure (the schema-history table is absent) inside a
 // tx that has already written the position, then assert the position
 // row never landed after the rollback.
+//
+// **ADR-0049 #4a invariant (Chunk E regression-pin):** the
+// schema-history write rides the SAME target tx as the ADR-0007
+// position write. This test IS the direct extension of the ADR-0007
+// position-and-data atomicity contract into the schema-history
+// realm — pre-Chunk-B, a position write that committed without a
+// version write was structurally impossible (no version write
+// existed); post-Chunk-B, the same property must hold by sharing
+// the tx, NOT by serial writes. Any change that introduces a
+// separate tx for the version write (e.g. write-then-commit-tx,
+// then start-tx for position) silently breaks this invariant and
+// regresses the spurious-cold-start class.
 func TestSchemaHistory_VersionAndPosition_SameTxAtomicity(t *testing.T) {
 	dsn, cleanup := startMySQLForApplier(t)
 	defer cleanup()
