@@ -189,8 +189,17 @@ func TestStreamer_MySQLToPostgres_SchemaHistoryWarmResumeAcrossDDL(t *testing.T)
 	// event for users hits maybeSnapshotSchemaB1 (deferred-emit
 	// pattern; the anchor is the ALTER's GTID frozen at clear time
 	// per #4c).
+	// ALGORITHM=INSTANT bypasses metadata-lock contention with the
+	// running streamer's binlog reader and resource pressure on the
+	// testcontainers MySQL under -race (CI 26136202520 timed out
+	// after 117s with `unexpected EOF`; bumping applyMySQLDDL 30s→90s
+	// in ef21a36 wasn't enough). MySQL 8.0.12+ supports INSTANT for
+	// nullable end-column ADD; mysql:8.0 (the testcontainer image)
+	// satisfies that. Sub-second execution, no metadata-lock wait,
+	// zero impact on the DDL event the binlog emits (the ALGORITHM
+	// clause is local to DDL execution and not in the binlog payload).
 	applyMySQLDDL(t, mysqlSourceDSN,
-		"ALTER TABLE users ADD COLUMN nickname VARCHAR(64);")
+		"ALTER TABLE users ADD COLUMN nickname VARCHAR(64), ALGORITHM=INSTANT;")
 
 	// ---- Phase 6: INSERT R3 carrying the new column ----
 	// The first post-DDL ROW triggers maybeSnapshotSchemaB1 → writes
