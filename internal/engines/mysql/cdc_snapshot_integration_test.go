@@ -38,7 +38,8 @@ func startMySQLForSnapshotCDC(t *testing.T) (dsn string, cleanup func()) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	container, err := mysqltc.Run(ctx,
+	container, err := mysqltc.Run(
+		ctx,
 		"mysql:8.0",
 		mysqltc.WithDatabase("source_db"),
 		mysqltc.WithUsername("root"),
@@ -169,6 +170,145 @@ func TestSnapshotStream_NoGapNoOverlap(t *testing.T) {
 	if email, _ := insR6.Row["email"].(string); email != "r6@example.com" {
 		t.Errorf("R6 insert email = %#v; want r6@example.com", insR6.Row["email"])
 	}
+}
+
+// TestSnapshotStream_ReleaseRowsClosesSnapshotTx exercises the MySQL
+// counterpart of PG's Bug 21 fix. The corresponding PG test in
+// internal/engines/postgres/cdc_snapshot_integration_test.go pinned
+// the property that ReleaseRowsFn commits the snapshot tx and
+// releases the AccessShareLock so the source is free to take DDL.
+// On MySQL the equivalent is the MDL_SHARED_READ that
+// START TRANSACTION WITH CONSISTENT SNAPSHOT acquires with
+// dur=TRANSACTION on every table the snapshot reads — held until
+// COMMIT. Until task #34 (this commit) wired the MySQL engine's
+// ReleaseRowsFn, that MDL stayed alive for the entire streamer
+// lifetime, blocking operator ALTERs even with ALGORITHM=INSTANT
+// (the brief MDL upgrade INSTANT still needs would queue forever
+// behind the snapshot's never-released SHARED_READ). This was the
+// root cause of the long-deferred Chunk E pin in
+// streamer_schema_history_cross_integration_test.go (task #28); see
+// that file's docstring for the diagnostic journey.
+//
+// Asserts:
+//
+//   - ReleaseRows releases the SHARED_READ MDL — performance_schema.
+//     metadata_locks shows zero TABLE SHARED_READ dur=TRANSACTION
+//     entries on `users` after release.
+//   - CDC continues working after ReleaseRows — a post-release INSERT
+//     still surfaces on the change stream.
+//   - ALTER TABLE on the source after ReleaseRows succeeds promptly
+//     (pre-fix it would block on the unreleased MDL).
+//   - Calling ReleaseRows twice is a no-op; Close is idempotent with
+//     ReleaseRows.
+func TestSnapshotStream_ReleaseRowsClosesSnapshotTx(t *testing.T) {
+	dsn, cleanup := startMySQLForSnapshotCDC(t)
+	defer cleanup()
+
+	const seedDDL = `
+		CREATE TABLE users (
+			id    BIGINT       NOT NULL AUTO_INCREMENT,
+			email VARCHAR(255) NOT NULL,
+			PRIMARY KEY (id)
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+		INSERT INTO users (email) VALUES ('a@example.com'), ('b@example.com');
+	`
+	applyMySQLSnap(t, dsn, seedDDL)
+
+	eng := Engine{Flavor: FlavorVanilla}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	stream, err := eng.OpenSnapshotStream(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenSnapshotStream: %v", err)
+	}
+	defer func() { _ = stream.Close() }()
+
+	// Drain the bulk rows so we're at the post-bulk-copy state the
+	// orchestrator would be at when it calls ReleaseRows.
+	usersTable := schemaForUsers()
+	_ = drainAllRows(t, ctx, stream.Rows, usersTable)
+
+	// Pre-release: the snapshot tx holds MDL_SHARED_READ on users.
+	// We don't assert pre-state strictly (its presence depends on
+	// performance_schema's flush cadence after the snapshot tx
+	// started); the load-bearing assertion is post-release.
+
+	if err := stream.ReleaseRows(); err != nil {
+		t.Fatalf("ReleaseRows: %v", err)
+	}
+
+	// Post-release: zero TABLE SHARED_READ MDL on users. Pre-fix this
+	// would be 1 (the snapshot tx's hold).
+	if n := countSnapshotMDLOnUsers(t, ctx, dsn); n != 0 {
+		t.Errorf("expected 0 SHARED_READ MDL entries on users after ReleaseRows; got %d", n)
+	}
+
+	// ALTER on the source must succeed promptly — pre-fix this would
+	// block on the unreleased MDL. We give it 30s; the actual
+	// expectation is sub-second.
+	alterCtx, alterCancel := context.WithTimeout(ctx, 30*time.Second)
+	defer alterCancel()
+	alterDB, err := sql.Open("mysql", dsn+"&multiStatements=true")
+	if err != nil {
+		t.Fatalf("open for ALTER: %v", err)
+	}
+	defer func() { _ = alterDB.Close() }()
+	alterStart := time.Now()
+	if _, err := alterDB.ExecContext(alterCtx, "ALTER TABLE users ADD COLUMN nickname VARCHAR(64), ALGORITHM=INSTANT"); err != nil {
+		t.Fatalf("post-release ALTER failed: %v (pre-fix this would have hung on MDL)", err)
+	}
+	if elapsed := time.Since(alterStart); elapsed > 5*time.Second {
+		t.Errorf("post-release ALTER took %v; expected sub-second (suspect MDL still held)", elapsed)
+	}
+
+	// CDC still works: open StreamChanges after release, commit a row,
+	// watch it surface. Need to issue a multi-statement DDL+INSERT or
+	// the post-ALTER schema is invisible to the prior position; the
+	// existing CDC reader was opened with the pre-ALTER schema in
+	// mind but go-mysql binlog reader re-discovers it from the binlog
+	// QUERY event.
+	changes, err := stream.Changes.StreamChanges(ctx, stream.Position)
+	if err != nil {
+		t.Fatalf("StreamChanges after ReleaseRows: %v", err)
+	}
+	applyMySQLSnap(t, dsn, "INSERT INTO users (email, nickname) VALUES ('c@example.com', 'cc')")
+	got := drainSnapshotChanges(t, ctx, changes, 1, 30*time.Second)
+	if len(got) < 1 {
+		t.Fatalf("got %d post-release changes; want >=1", len(got))
+	}
+
+	// Idempotency: a second ReleaseRows is a no-op.
+	if err := stream.ReleaseRows(); err != nil {
+		t.Errorf("second ReleaseRows: %v; want nil", err)
+	}
+}
+
+// countSnapshotMDLOnUsers returns the count of TABLE SHARED_READ MDL
+// entries on `users` with dur=TRANSACTION (the lock-shape that a
+// REPEATABLE-READ + WITH CONSISTENT SNAPSHOT transaction holds).
+// Used by the task #34 pin to assert the snapshot tx's MDL has been
+// released.
+func countSnapshotMDLOnUsers(t *testing.T, ctx context.Context, dsn string) int {
+	t.Helper()
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	const q = `
+		SELECT COUNT(*) FROM performance_schema.metadata_locks
+		WHERE OBJECT_TYPE     = 'TABLE'
+		  AND OBJECT_NAME     = 'users'
+		  AND LOCK_TYPE       = 'SHARED_READ'
+		  AND LOCK_DURATION   = 'TRANSACTION'`
+	var n int
+	if err := db.QueryRowContext(ctx, q).Scan(&n); err != nil {
+		t.Fatalf("count snapshot MDL: %v", err)
+	}
+	return n
 }
 
 // schemaForUsers returns an [ir.Table] matching the seed DDL above —

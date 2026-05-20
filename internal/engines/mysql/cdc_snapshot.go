@@ -139,24 +139,58 @@ func (e Engine) openBinlogSnapshotStream(ctx context.Context, dsn string) (*ir.S
 		Rows:     rowReader,
 		Changes:  cdcReader,
 	}
-	stream.CloseFn = func() error {
-		// Order matters: stop the CDC reader first (in case the
-		// caller has it streaming), then commit the snapshot tx
-		// (release the read view), then close the conn back to the
-		// pool, then close the schema DB.
-		var firstErr error
-		if c, ok := cdcReader.(closer); ok {
-			if err := c.Close(); err != nil && firstErr == nil {
-				firstErr = err
-			}
+
+	// rowsReleased is the idempotency guard for ReleaseRowsFn / CloseFn.
+	// Once COMMIT has run and the import-side conn+pool are closed,
+	// neither must repeat. Captured by closure; no surrounding mutex
+	// because the orchestrator never calls these concurrently
+	// (bulk-copy is single-goroutine for the snapshot tx, and the
+	// streamer's defer chain serialises Close with everything else).
+	// Mirrors the PG engine's shape in postgres/cdc_snapshot.go.
+	rowsReleased := false
+	releaseRows := func() error {
+		if rowsReleased {
+			return nil
 		}
-		if _, err := conn.ExecContext(context.Background(), "COMMIT"); err != nil && firstErr == nil {
+		rowsReleased = true
+		// COMMIT (not ROLLBACK): nothing was written on this tx, but
+		// COMMIT is the project convention for a clean exit from a
+		// REPEATABLE-READ + WITH CONSISTENT SNAPSHOT tx. Order:
+		// commit the snapshot tx → close the pinned conn → close the
+		// schema-side DB pool. Until this runs, MySQL keeps the
+		// MDL_SHARED_READ acquired by START TRANSACTION WITH
+		// CONSISTENT SNAPSHOT alive (dur=TRANSACTION), which blocks
+		// any operator ALTER on the snapshotted source tables — even
+		// ALGORITHM=INSTANT, which still needs a brief MDL upgrade.
+		// Documented at length on the deferred Chunk E pin
+		// (task #28) and the IR-side SnapshotStream contract; see
+		// ir/snapshot.go's "Optional early release" docstring.
+		var firstErr error
+		if _, err := conn.ExecContext(context.Background(), "COMMIT"); err != nil {
 			firstErr = err
 		}
 		if err := conn.Close(); err != nil && firstErr == nil {
 			firstErr = err
 		}
 		if err := db.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+		return firstErr
+	}
+	stream.ReleaseRowsFn = releaseRows
+	stream.CloseFn = func() error {
+		// Order: stop the CDC reader first (joins the engine-side
+		// streaming goroutine deterministically; relying on ctx-cancel
+		// alone left a goroutine racing slog.Default under -race),
+		// then release the import-side resources (idempotent — fires
+		// the COMMIT + closes only if ReleaseRowsFn hasn't already).
+		var firstErr error
+		if c, ok := cdcReader.(closer); ok {
+			if err := c.Close(); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
+		if err := releaseRows(); err != nil && firstErr == nil {
 			firstErr = err
 		}
 		return firstErr

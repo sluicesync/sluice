@@ -134,54 +134,31 @@ import (
 //
 //nolint:gocognit // Sequential phase-by-phase integration test reads
 func TestStreamer_MySQLToPostgres_SchemaHistoryWarmResumeAcrossDDL(t *testing.T) {
-	// DEFERRED — see task #28. The deferral now has accurate ground
-	// truth from three CI cycles of instrumentation.
+	// HISTORICAL NOTE — task #28's MDL-deadlock root cause was fixed
+	// by task #34 (internal/engines/mysql/cdc_snapshot.go now wires
+	// ReleaseRowsFn to commit the snapshot tx + close the import-side
+	// conn+pool once bulk-copy completes; mirrors PG's Bug 21 shape).
+	// The ALTER at Phase 5 — which previously deadlocked for ~117s
+	// behind MDL_SHARED_READ dur=TRANSACTION held by the snapshot tx
+	// — now completes promptly. Verified end-to-end by the engine-
+	// level pin TestSnapshotStream_ReleaseRowsClosesSnapshotTx in
+	// internal/engines/mysql/cdc_snapshot_integration_test.go.
 	//
-	// Phase A (CI run 26173191325): the failure was attributed to
-	// net_write_timeout=60 — close to the ~52s failure timing. Phase B
-	// bumped --net-write-timeout=600 in startMySQLBinlog's Cmd; CI run
-	// 26175029726 failed identically but at the helper ctx ceiling
-	// (~117s = 90s ctx + slack) rather than 52s. Phase B's fix landed
-	// correctly (Phase A-2 logged net_write_timeout=600) but was NOT
-	// the bottleneck — left in place defensively.
-	//
-	// Phase A-2 (CI run 26176677598) identified the real cause via
-	// performance_schema.metadata_locks:
-	//   - owner_thread=51 holds TABLE SHARED_READ on `users` with
-	//     dur=TRANSACTION (held inside an open txn)
-	//   - the ALTER (conn 15, thread 55) sits at EXCLUSIVE PENDING,
-	//     waiting on the upgrade
-	//   - the SHARED_READ holder NEVER releases for the duration of
-	//     the streamer run
-	//
-	// Tracing it back: internal/engines/mysql/cdc_snapshot.go:74 runs
-	// `START TRANSACTION WITH CONSISTENT SNAPSHOT` on the snapshot
-	// conn at cold-start. The MDL_SHARED_READ this acquires is
-	// dur=TRANSACTION — held until COMMIT. streamer.go:1780 defers
-	// that COMMIT to `Streamer.Run` unwind. **Net effect: sluice
-	// holds MDL_SHARED_READ on every snapshotted source table for the
-	// entire streamer lifetime.** Even ALGORITHM=INSTANT can't acquire
-	// the brief MDL_EXCLUSIVE it needs for the metadata update —
-	// INSTANT skips the table rebuild, not the MDL upgrade.
-	//
-	// The prior docstring's "ALGORITHM=INSTANT rules out MDL as root
-	// cause" claim was wrong. INSTANT lowers the *cost* of the MDL
-	// hold (microseconds vs minutes), but it still requires the
-	// upgrade — and any waiter on the table sees the lock unchanged.
-	//
-	// This is a SLUICE PRODUCTION BEHAVIOUR, not a test-only artifact.
-	// In real deployments, operators cannot run any DDL on a
-	// sluice-monitored source table without first stopping sluice.
-	// The fix is structural (release the snapshot's READ VIEW once
-	// bulk-copy completes — the snapshot conn doesn't need to live
-	// the streamer's lifetime, only until COPY_COMPLETED). That
-	// refactor is bigger than landing this pin; tracked as a
-	// separate follow-up task. Once it lands, this pin un-skips and
-	// stays green.
-	t.Skip("task #28: deferred pending sluice snapshot-MDL release fix " +
-		"(sluice holds MDL_SHARED_READ on source tables for streamer's " +
-		"lifetime, blocking ALTER even with ALGORITHM=INSTANT). See " +
-		"docstring above for the Phase A-2 ground truth.")
+	// HOWEVER (CI run 26189839632 on PR #44): with the MDL fix in
+	// place this test now fails at PHASE 7 instead — the ALTER
+	// completes in ~1s as expected, but R3 (the post-DDL INSERT
+	// carrying the new nickname column) does not propagate to the
+	// PG target within the 30s waitForRowCount budget. Total test
+	// runtime ~49s (vs ~117s pre-fix). This is a SEPARATE downstream
+	// issue from the MDL deadlock — almost certainly in the binlog
+	// reader's handling of the snapshot tx's COMMIT event landing in
+	// the stream just before the ALTER + R3, or in ADR-0049 Chunk
+	// B1's deferred-emit interacting with that COMMIT. Tracked as
+	// task #35 — un-skip once that closes.
+	t.Skip("task #35: MDL deadlock fixed (#34 / Phase 5 ALTER now completes), " +
+		"but R3 post-DDL INSERT doesn't propagate to PG within 30s — " +
+		"separate downstream issue in the binlog-reader / Chunk B1 path; " +
+		"see CI run 26189839632 for the failure shape.")
 
 	mysqlSourceDSN, _, mysqlCleanup := startMySQLBinlog(t)
 	defer mysqlCleanup()
