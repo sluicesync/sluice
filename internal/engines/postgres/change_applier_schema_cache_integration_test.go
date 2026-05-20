@@ -400,3 +400,114 @@ func TestPrimeSchemaHistoryCache_UnregisteredSourceEngine_IsLoud(t *testing.T) {
 		t.Errorf("error message must say `not registered`; got: %v", err)
 	}
 }
+
+// TestApplier_SchemaSnapshotDispatch_UsesApplyArgStreamID is the
+// ADR-0049 follow-up task #27 regression pin (PG-side mirror of the
+// MySQL sibling).
+//
+// The applier's dispatch `case ir.SchemaSnapshot` MUST source streamID
+// from the Apply method's arg, NOT from `a.streamID` (the field set
+// only via the optional [ir.StreamIDSetter]).
+//
+// Repro shape: open the applier directly and DELIBERATELY do NOT call
+// SetStreamID — that simulates a future non-migrate Apply caller (a
+// new sync flow, a test stub, a chain-restore variant) that doesn't
+// know about the optional StreamIDSetter contract. Push a
+// SchemaSnapshot through Apply with an explicit streamID arg, then
+// assert the schema-history row landed under that streamID — NOT
+// under "" (which is what `a.streamID` would default to without
+// SetStreamID).
+//
+// Bug 78 surfaced the symptom (chain_restore.go was missing the
+// SetStreamID call → schema-history rows landed under ""). The
+// 411a71c hotfix patched the call site; task #27 closes the latent
+// footgun at the source by making the dispatch arg-driven so any
+// future non-migrate Apply path is correct by construction.
+func TestApplier_SchemaSnapshotDispatch_UsesApplyArgStreamID(t *testing.T) {
+	dsn, cleanup := startPostgresForApplier(t)
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	eng := Engine{}
+	applier, err := eng.OpenChangeApplier(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenChangeApplier: %v", err)
+	}
+	defer func() {
+		if c, ok := applier.(interface{ Close() error }); ok {
+			_ = c.Close()
+		}
+	}()
+
+	if err := applier.EnsureControlTable(ctx); err != nil {
+		t.Fatalf("EnsureControlTable: %v", err)
+	}
+
+	// DELIBERATELY DO NOT CALL SetStreamID. This is the whole point
+	// of the pin: simulate a future non-migrate Apply caller that
+	// hasn't learned about the optional StreamIDSetter contract.
+	// a.streamID stays "" — pre-task-27 the dispatch would have keyed
+	// the schema-history row under "", silently breaking resume.
+	const argStreamID = "custom-non-migrate-stream"
+
+	snapPos, err := encodePGPos(pgPos{Slot: "s1", LSN: "0/1000000"})
+	if err != nil {
+		t.Fatalf("encodePGPos: %v", err)
+	}
+	snap := ir.SchemaSnapshot{
+		Position: snapPos,
+		Schema:   "public",
+		Table:    "users",
+		IR: &ir.Table{Schema: "public", Name: "users", Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}},
+		}},
+	}
+
+	ch := make(chan ir.Change, 1)
+	ch <- snap
+	close(ch)
+	if err := applier.Apply(ctx, argStreamID, ch); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	// The applier's a.streamID field MUST still be empty (no
+	// SetStreamID was called) — guards against a future "fix" that
+	// silently routes the Apply arg through SetStreamID and defeats
+	// the test.
+	a := applier.(*ChangeApplier)
+	if got := a.streamID; got != "" {
+		t.Errorf("a.streamID = %q after Apply (without SetStreamID); want \"\" — "+
+			"the pin's premise (dispatch must source from arg, NOT field) is invalidated otherwise", got)
+	}
+
+	// Assert: schema-history row landed under the Apply arg's
+	// streamID. Pre-task-27 it would land under "" (a.streamID).
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	got, err := loadRetainedSchemaVersions(ctx, db, a.controlSchema, argStreamID, "public", "users")
+	if err != nil {
+		t.Fatalf("loadRetainedSchemaVersions(arg streamID): %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("schema-history rows under arg streamID %q: got %d, want 1 "+
+			"(pre-task-27 the dispatch keyed off a.streamID=\"\" so this would be 0)", argStreamID, len(got))
+	}
+
+	// Cross-check: the empty-streamID key MUST be empty. If the
+	// dispatch had read a.streamID="", the row would be under "" and
+	// this would return 1 row.
+	gotEmpty, err := loadRetainedSchemaVersions(ctx, db, a.controlSchema, "", "public", "users")
+	if err != nil {
+		t.Fatalf("loadRetainedSchemaVersions(empty streamID): %v", err)
+	}
+	if len(gotEmpty) != 0 {
+		t.Fatalf("schema-history rows under empty streamID: got %d, want 0 — "+
+			"dispatch is keying off a.streamID (\"\") instead of the Apply arg (task #27 regression)", len(gotEmpty))
+	}
+}
