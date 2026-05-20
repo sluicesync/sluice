@@ -7,10 +7,8 @@ import (
 	"io"
 	"os"
 	"os/signal"
-	"sort"
 	"strings"
 	"syscall"
-	"text/tabwriter"
 	"time"
 
 	"github.com/alecthomas/kong"
@@ -698,10 +696,25 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 // When `--stream-id` is supplied, output is filtered to that one
 // stream (matches by exact stream_id). Without it, every row in
 // the control table is printed.
+//
+// Output shape:
+//   - --format=text  (default) — human-readable tab-aligned table.
+//   - --format=json            — JSON array of stream rows; suitable
+//     for scripted consumption / piping
+//     to jq.
+//
+// Live mode: --watch[=DURATION] re-runs the query and re-renders
+// every DURATION (default 2s) until interrupted. The terminal is
+// cleared between renders so the output stays in place rather than
+// scrolling. --summary prepends an aggregate header so a fleet of
+// streams is summarisable at a glance even before scanning rows.
 type SyncStatusCmd struct {
-	TargetDriver string `help:"Target engine name (e.g. mysql, postgres). See 'sluice engines'." required:"" placeholder:"NAME" group:"target"`
-	Target       string `help:"Target database DSN." required:"" env:"SLUICE_TARGET" placeholder:"DSN" group:"target"`
-	StreamID     string `help:"Filter to a specific stream id. When empty, every recorded stream is shown." placeholder:"ID"`
+	TargetDriver string        `help:"Target engine name (e.g. mysql, postgres). See 'sluice engines'." required:"" placeholder:"NAME" group:"target"`
+	Target       string        `help:"Target database DSN." required:"" env:"SLUICE_TARGET" placeholder:"DSN" group:"target"`
+	StreamID     string        `help:"Filter to a specific stream id. When empty, every recorded stream is shown." placeholder:"ID"`
+	Format       string        `help:"Output format: 'text' (human-readable table, default) or 'json' (machine-readable, suitable for jq pipes)." default:"text" enum:"text,json"`
+	Watch        time.Duration `help:"Live-refresh mode: re-render every DURATION until interrupted. 0 (default) disables. Use --watch 2s for the typical operator polling cadence." placeholder:"DURATION"`
+	Summary      bool          `help:"Prepend an aggregate-summary header (stream count, oldest/most-recent ages). Useful when a fleet of streams is hard to skim row-by-row."`
 }
 
 // Run implements `sluice sync status`.
@@ -722,50 +735,19 @@ func (s *SyncStatusCmd) Run(_ *Globals) error {
 		}
 	}()
 
-	streams, err := applier.ListStreams(ctx)
-	if err != nil {
-		return fmt.Errorf("list streams: %w", err)
+	opts := statusRenderOpts{
+		Format:   s.Format,
+		Summary:  s.Summary,
+		StreamID: s.StreamID,
 	}
 
-	if s.StreamID != "" {
-		filtered := streams[:0]
-		for _, st := range streams {
-			if st.StreamID == s.StreamID {
-				filtered = append(filtered, st)
-			}
-		}
-		streams = filtered
+	// One-shot path (default).
+	if s.Watch <= 0 {
+		return runStatusOnce(ctx, applier, os.Stdout, opts)
 	}
 
-	if len(streams) == 0 {
-		if s.StreamID != "" {
-			fmt.Fprintf(os.Stdout, "no stream %q on target\n", s.StreamID)
-			return nil
-		}
-		fmt.Fprintln(os.Stdout, "no streams recorded on target")
-		return nil
-	}
-
-	// Sort for stable output across runs. Most-recently-updated
-	// first matches the operator's interest: "what's been moving?"
-	sort.Slice(streams, func(i, j int) bool {
-		return streams[i].UpdatedAt.After(streams[j].UpdatedAt)
-	})
-
-	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	defer func() { _ = tw.Flush() }()
-	fmt.Fprintln(tw, "STREAM\tUPDATED\tAGE\tPOSITION")
-	now := time.Now()
-	for _, st := range streams {
-		fmt.Fprintf(
-			tw, "%s\t%s\t%s\t%s\n",
-			st.StreamID,
-			st.UpdatedAt.UTC().Format(time.RFC3339),
-			humanAgo(now.Sub(st.UpdatedAt)),
-			truncatePositionToken(st.Position.Token, 60),
-		)
-	}
-	return nil
+	// Live-refresh path.
+	return runStatusWatch(ctx, applier, os.Stdout, opts, s.Watch)
 }
 
 // SyncStopCmd asks a running `sluice sync start` to drain in-flight
