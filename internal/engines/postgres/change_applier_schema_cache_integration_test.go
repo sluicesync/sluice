@@ -13,10 +13,23 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/orware/sluice/internal/ir"
+
+	// Bug 79 (v0.70.2): the cross-engine pin and the unregistered-
+	// source-engine pin exercise PrimeSchemaHistoryCache's
+	// engines.Get(currentPos.Engine) dispatch. The PG test binary
+	// must therefore have the MySQL engine registered so the
+	// "mysql"-source-orderer path resolves to a real
+	// ir.PositionOrderer (and so the "made-up-engine" path's loud
+	// fail is a genuine miss, not a side-effect of the test binary
+	// happening to register only PG). This blank import mirrors the
+	// pattern the pipeline package's cross-engine integration tests
+	// use (e.g. internal/pipeline/migrate_cross_integration_test.go).
+	_ "github.com/orware/sluice/internal/engines/mysql"
 )
 
 func TestPrimeSchemaHistoryCache_Integration_SeedsFromStorage(t *testing.T) {
@@ -218,5 +231,172 @@ func TestPrimeSchemaHistoryCache_Integration_BelowFloorIsLoud(t *testing.T) {
 	}
 	if !errors.Is(err, ir.ErrPositionInvalid) {
 		t.Fatalf("below-floor prime error must wrap ir.ErrPositionInvalid; got: %v", err)
+	}
+}
+
+// TestPrimeSchemaHistoryCache_CrossEngine_UsesSourceOrderer is the
+// headline Bug 79 regression pin (v0.70.2 hotfix).
+//
+// Pin shape: seed PG's sluice_cdc_schema_history with a row whose
+// source_engine is "mysql" (the cross-engine chain-restore shape: a
+// MySQL GTID token persisted under a PG applier). Call
+// PrimeSchemaHistoryCache with currentPos.Engine="mysql" — the shape
+// retagPositionForSource produces on the cross-engine warm-resume
+// path. Pre-fix this would crash with the engine-strict decode reject
+// (`decode p: engine = "mysql"; want "postgres"`) because the prime
+// hardcoded the PG orderer; the v0.70.2 fix routes orderer selection
+// off currentPos.Engine via the engines registry, so the MySQL
+// orderer compares MySQL-shape positions correctly.
+//
+// PASS = prime returns nil; ActiveSchema(schema, table) returns the
+// seeded IR. FAIL = the v0.70.1 crash class recurs. This exercises
+// the full PrimeSchemaHistoryCache → ResolveSchemaVersion →
+// orderer.PositionAtOrAfter path with cross-engine inputs — the path
+// the v0.70.1 storage-only pin (TestSchemaHistory_LoadPreservesSourceEngine_CrossEngine)
+// does NOT cover.
+func TestPrimeSchemaHistoryCache_CrossEngine_UsesSourceOrderer(t *testing.T) {
+	dsn, cleanup := startPostgresForApplier(t)
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	const schema = "public"
+	if err := ensureSchemaHistoryTable(ctx, db, schema); err != nil {
+		t.Fatalf("ensureSchemaHistoryTable: %v", err)
+	}
+
+	// A cross-engine chain-restore (MySQL src → PG dst → resume) lands a
+	// MySQL GTID token in PG's schema-history. The token shape is
+	// opaque to the PG applier — what matters here is that the prime
+	// path dispatches the MySQL orderer (which can decode the GTID
+	// token) rather than the PG orderer (which rejects it loudly).
+	const u = "26d1668c-1234-5678-9abc-def012345678"
+	anchor := ir.Position{
+		Engine: "mysql",
+		Token:  `{"mode":"gtid","gtid_set":"` + u + `:1-10"}`,
+	}
+	tbl := &ir.Table{Schema: schema, Name: "widgets", Columns: []*ir.Column{
+		{Name: "id", Type: ir.Integer{Width: 64}},
+		{Name: "sku", Type: ir.Varchar{Length: 64}, Nullable: true},
+	}}
+	if err := writeSchemaVersion(ctx, db, schema, "sluice_chain_restore", "src_app", "widgets", anchor, tbl); err != nil {
+		t.Fatalf("seed cross-engine row: %v", err)
+	}
+
+	eng := Engine{}
+	applier, err := eng.OpenChangeApplier(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenChangeApplier: %v", err)
+	}
+	defer func() {
+		if c, ok := applier.(interface{ Close() error }); ok {
+			_ = c.Close()
+		}
+	}()
+	a := applier.(*ChangeApplier)
+
+	// resumePos is the streamer's retagPositionForSource(persisted,
+	// sourceEngineName) output: a MySQL GTID position with Engine
+	// re-tagged to "mysql" so the source CDC reader can decode it.
+	// The MySQL orderer's GTID superset check makes 1-20 ⊇ 1-10 = true,
+	// so the anchor at 1-10 is at-or-before resumePos at 1-20.
+	resumePos := ir.Position{
+		Engine: "mysql",
+		Token:  `{"mode":"gtid","gtid_set":"` + u + `:1-20"}`,
+	}
+	if err := a.PrimeSchemaHistoryCache(ctx, "sluice_chain_restore", resumePos); err != nil {
+		t.Fatalf("Bug 79 regression: cross-engine prime failed: %v", err)
+	}
+
+	got, ok := a.ActiveSchema("src_app", "widgets")
+	if !ok {
+		t.Fatal("ActiveSchema(src_app, widgets) miss after cross-engine prime (want hit)")
+	}
+	if got == nil {
+		t.Fatal("ActiveSchema returned (nil, true) after cross-engine prime")
+	}
+	if len(got.Columns) != 2 || got.Columns[1].Name != "sku" {
+		t.Errorf("cross-engine prime IR: got %d cols, col[1]=%q (want 2 cols, sku)",
+			len(got.Columns), got.Columns[1].Name)
+	}
+}
+
+// TestPrimeSchemaHistoryCache_UnregisteredSourceEngine_IsLoud pins the
+// loud-fail behaviour for an unknown source engine name. A
+// currentPos.Engine that doesn't match any registered engine MUST
+// surface a named error (NOT ir.ErrPositionInvalid, which is the
+// below-floor / cold-start signal) — this is a config-bug class, not
+// a recoverable resume event.
+//
+// Per the loud-failure tenet: a silently-ignored unknown engine name
+// would fall back to whatever default the prime might pick and either
+// crash later with a misleading error or, worse, silently succeed
+// with the wrong orderer. Surface it at the dispatch site.
+func TestPrimeSchemaHistoryCache_UnregisteredSourceEngine_IsLoud(t *testing.T) {
+	dsn, cleanup := startPostgresForApplier(t)
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	const schema = "public"
+	if err := ensureSchemaHistoryTable(ctx, db, schema); err != nil {
+		t.Fatalf("ensureSchemaHistoryTable: %v", err)
+	}
+
+	// Seed one row so distinctSchemaTablesForStream returns >0 — the
+	// engine-lookup happens AFTER that early return and must still
+	// fire for a populated stream with a bogus currentPos.Engine.
+	const u = "26d1668c-1234-5678-9abc-def012345678"
+	anchor := ir.Position{
+		Engine: "mysql",
+		Token:  `{"mode":"gtid","gtid_set":"` + u + `:1-10"}`,
+	}
+	tbl := &ir.Table{Schema: schema, Name: "widgets", Columns: []*ir.Column{
+		{Name: "id", Type: ir.Integer{Width: 64}},
+	}}
+	if err := writeSchemaVersion(ctx, db, schema, "bogus-stream", "src_app", "widgets", anchor, tbl); err != nil {
+		t.Fatalf("seed row: %v", err)
+	}
+
+	eng := Engine{}
+	applier, err := eng.OpenChangeApplier(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenChangeApplier: %v", err)
+	}
+	defer func() {
+		if c, ok := applier.(interface{ Close() error }); ok {
+			_ = c.Close()
+		}
+	}()
+	a := applier.(*ChangeApplier)
+
+	bogus := ir.Position{Engine: "made-up-engine", Token: `{"foo":"bar"}`}
+	err = a.PrimeSchemaHistoryCache(ctx, "bogus-stream", bogus)
+	if err == nil {
+		t.Fatal("unregistered source engine prime must surface a loud error (got nil)")
+	}
+	if errors.Is(err, ir.ErrPositionInvalid) {
+		t.Fatalf("unregistered source engine error must NOT wrap ir.ErrPositionInvalid "+
+			"(that's the cold-start signal, not the config-bug signal); got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "made-up-engine") {
+		t.Errorf("error message must name the unknown engine; got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "not registered") {
+		t.Errorf("error message must say `not registered`; got: %v", err)
 	}
 }
