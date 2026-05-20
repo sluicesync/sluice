@@ -3,7 +3,7 @@ module github.com/orware/sluice
 go 1.26.2
 
 require (
-	cloud.google.com/go/kms v1.28.0
+	cloud.google.com/go/kms v1.31.0
 	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.20.0
 	github.com/Azure/azure-sdk-for-go/sdk/azidentity v1.13.1
 	github.com/Azure/azure-sdk-for-go/sdk/security/keyvault/azkeys v1.4.0
