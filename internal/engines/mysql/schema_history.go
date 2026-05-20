@@ -294,10 +294,20 @@ func compactSchemaHistoryBelow(ctx context.Context, exec schemaHistoryExecQuerie
 	if orderer == nil {
 		return 0, errors.New("mysql: compact schema-history: orderer is nil; ordering is a correctness primitive (loud-failure tenet)")
 	}
-	// Scan every row's (version_key, anchor_position). The PK is the
-	// fixed-width SHA-256 surrogate; we delete by it so multiple equal-
-	// length keys can't alias on a prefix.
-	const sel = "SELECT version_key, anchor_position FROM `" + schemaHistoryTableName + "`"
+	// Scan every row's (version_key, anchor_position, source_engine).
+	// The PK is the fixed-width SHA-256 surrogate; we delete by it so
+	// multiple equal-length keys can't alias on a prefix.
+	//
+	// Bug 78 (extended in review): source_engine joins the SELECT so
+	// the orderer compares anchors against the floor using the engine
+	// that PRODUCED the anchor token, not this applier's own engine.
+	// Same fix shape as loadRetainedSchemaVersions; this compactor is
+	// the only other on-disk-anchor consumer. Currently nolint:unused
+	// (Chunk D storage-only, consumer wires in chain_prune later) so
+	// the bug is latent today, but the class is the same — fix both
+	// per the pin-the-class discipline. NULL row (pre-v0.70.1
+	// storage) falls back to engineNameMySQL, the pre-fix behaviour.
+	const sel = "SELECT version_key, anchor_position, COALESCE(source_engine, '') FROM `" + schemaHistoryTableName + "`"
 	rows, err := exec.QueryContext(ctx, sel)
 	if err != nil {
 		return 0, fmt.Errorf("mysql: compact schema-history: select: %w", err)
@@ -307,13 +317,17 @@ func compactSchemaHistoryBelow(ctx context.Context, exec schemaHistoryExecQuerie
 	var toDelete []string
 	for rows.Next() {
 		var (
-			vk        string
-			anchorTok string
+			vk           string
+			anchorTok    string
+			sourceEngine string
 		)
-		if err := rows.Scan(&vk, &anchorTok); err != nil {
+		if err := rows.Scan(&vk, &anchorTok, &sourceEngine); err != nil {
 			return 0, fmt.Errorf("mysql: compact schema-history: scan: %w", err)
 		}
-		anchor := ir.Position{Engine: engineNameMySQL, Token: anchorTok}
+		if sourceEngine == "" {
+			sourceEngine = engineNameMySQL
+		}
+		anchor := ir.Position{Engine: sourceEngine, Token: anchorTok}
 		floorAtOrAfter, err := orderer.PositionAtOrAfter(floor, anchor)
 		if err != nil {
 			return 0, fmt.Errorf("mysql: compact schema-history: order floor vs %+v: %w", anchor, err)

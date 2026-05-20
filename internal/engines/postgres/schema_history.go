@@ -266,7 +266,17 @@ func compactSchemaHistoryBelow(ctx context.Context, exec schemaHistoryExecQuerie
 		return 0, errors.New("postgres: compact schema-history: orderer is nil; ordering is a correctness primitive (loud-failure tenet)")
 	}
 	tableRef := quoteIdent(schema) + "." + quoteIdent(schemaHistoryTableName)
-	sel := "SELECT version_key, anchor_position FROM " + tableRef
+	// Bug 78 (extended in review): include source_engine in the
+	// SELECT so the orderer compares anchors against the floor using
+	// the engine that PRODUCED the anchor token, not the applier's
+	// own engine. Same fix shape as loadRetainedSchemaVersions; this
+	// compactor is the only other on-disk-anchor consumer in the
+	// package. Currently nolint:unused (Chunk D storage-only,
+	// consumer wires in chain_prune later) so the bug is latent
+	// today, but the class is the same — fix both per the
+	// pin-the-class discipline. NULL row (pre-v0.70.1 storage) falls
+	// back to engineNamePostgres, the pre-fix behaviour.
+	sel := "SELECT version_key, anchor_position, COALESCE(source_engine, '') FROM " + tableRef
 	rows, err := exec.QueryContext(ctx, sel)
 	if err != nil {
 		return 0, fmt.Errorf("postgres: compact schema-history: select: %w", err)
@@ -276,13 +286,17 @@ func compactSchemaHistoryBelow(ctx context.Context, exec schemaHistoryExecQuerie
 	var toDelete []string
 	for rows.Next() {
 		var (
-			vk        string
-			anchorTok string
+			vk           string
+			anchorTok    string
+			sourceEngine string
 		)
-		if err := rows.Scan(&vk, &anchorTok); err != nil {
+		if err := rows.Scan(&vk, &anchorTok, &sourceEngine); err != nil {
 			return 0, fmt.Errorf("postgres: compact schema-history: scan: %w", err)
 		}
-		anchor := ir.Position{Engine: engineNamePostgres, Token: anchorTok}
+		if sourceEngine == "" {
+			sourceEngine = engineNamePostgres
+		}
+		anchor := ir.Position{Engine: sourceEngine, Token: anchorTok}
 		floorAtOrAfter, err := orderer.PositionAtOrAfter(floor, anchor)
 		if err != nil {
 			return 0, fmt.Errorf("postgres: compact schema-history: order floor vs %+v: %w", anchor, err)
