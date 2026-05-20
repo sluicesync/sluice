@@ -275,7 +275,7 @@ func TestPSPG_SchemaReaderRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenSchemaReader: %v", err)
 	}
-	defer closeIf(sr)
+	defer psverifyCloseIf(sr)
 
 	got, err := sr.ReadSchema(ctx)
 	if err != nil {
@@ -394,7 +394,7 @@ func TestPSPG_CDCReaderBasic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenCDCReader: %v", err)
 	}
-	defer closeIf(rdr)
+	defer psverifyCloseIf(rdr)
 
 	// Empty position = "from now".
 	changes, err := rdr.StreamChanges(ctx, ir.Position{})
@@ -531,7 +531,7 @@ func TestPSPG_CDCReader_FailoverFlag(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenCDCReader: %v", err)
 	}
-	defer closeIf(rdr)
+	defer psverifyCloseIf(rdr)
 
 	if _, err := rdr.StreamChanges(ctx, ir.Position{}); err != nil {
 		t.Fatalf("StreamChanges: %v", err)
@@ -610,10 +610,10 @@ func withSchemaParam(dsn, schema string) string {
 	return dsn + "?schema=" + schema
 }
 
-// closeIf calls Close on x if it implements an io.Closer-shaped
+// psverifyCloseIf calls Close on x if it implements an io.Closer-shaped
 // interface. Lifted from the regular integration tests so this file
 // stays self-contained.
-func closeIf(x any) {
+func psverifyCloseIf(x any) {
 	type closer interface{ Close() error }
 	if c, ok := x.(closer); ok {
 		_ = c.Close()
