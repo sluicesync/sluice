@@ -9,22 +9,72 @@ import (
 	"errors"
 	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/orware/sluice/internal/ir"
 )
 
-// captureSlog swaps slog.Default with a text handler writing into buf
-// for the duration of the test, restoring the previous default on
-// cleanup. Use it when an assertion needs to look at logged output.
-func captureSlog(t *testing.T) *bytes.Buffer {
+// safeBuffer is a mutex-protected [bytes.Buffer] wrapper used as the
+// slog handler's writer in [captureSlog]. Without the mutex, concurrent
+// goroutines writing to slog.Default (streamer + CDC pump +
+// go-mysql-org binlogsyncer all log from background goroutines while
+// the test reads buf.String()) race on the underlying Buffer growth —
+// caught by CI run 26134035839 in
+// TestBackup_RecordsEndPosition_MySQLIntegration after Chunk E's new
+// pin pulled the binlogsyncer-while-test-reads pattern into a -race
+// run. The race was latent: present since the helper landed, exposed
+// only by the longer-running streamer goroutines Chunk E exercised.
+//
+// API-compatible with [*bytes.Buffer] for the methods existing callers
+// use (.String, .Bytes, .Len, .Write). .Bytes returns a defensive copy
+// so the caller can read without holding the mutex (and writes that
+// race the read can't corrupt the returned slice).
+type safeBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (s *safeBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Write(p)
+}
+
+func (s *safeBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.String()
+}
+
+func (s *safeBuffer) Bytes() []byte {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// Defensive copy — internal slice may grow concurrently with the
+	// caller's use of the returned bytes.
+	out := make([]byte, s.buf.Len())
+	copy(out, s.buf.Bytes())
+	return out
+}
+
+func (s *safeBuffer) Len() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Len()
+}
+
+// captureSlog swaps slog.Default with a text handler writing into a
+// thread-safe buffer for the duration of the test, restoring the
+// previous default on cleanup. Use it when an assertion needs to look
+// at logged output.
+func captureSlog(t *testing.T) *safeBuffer {
 	t.Helper()
 	prev := slog.Default()
 	t.Cleanup(func() { slog.SetDefault(prev) })
-	var buf bytes.Buffer
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
-	return &buf
+	buf := &safeBuffer{}
+	slog.SetDefault(slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	return buf
 }
 
 func TestRunValidates(t *testing.T) {
