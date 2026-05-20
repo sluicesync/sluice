@@ -134,29 +134,54 @@ import (
 //
 //nolint:gocognit // Sequential phase-by-phase integration test reads
 func TestStreamer_MySQLToPostgres_SchemaHistoryWarmResumeAcrossDDL(t *testing.T) {
-	// DEFERRED FROM v0.70.0 — see task #28.
+	// DEFERRED — see task #28. The deferral now has accurate ground
+	// truth from three CI cycles of instrumentation.
 	//
-	// This test reliably fails on CI (run 26134035839, 26135099781,
-	// 26136202520, 26137180288) with `apply ddl: context deadline
-	// exceeded` after ~52s into the ALTER, followed by
-	// `[mysql] packets.go:58 unexpected EOF` — the test's ALTER
-	// connection drops mid-query. Tried (a) bumping the helper
-	// timeout 30s→90s (insufficient), (b) ALGORITHM=INSTANT to
-	// bypass metadata-lock contention (same failure shape — rules
-	// out MDL as root cause). Most plausible remaining: the MySQL
-	// testcontainer fails under streamer-goroutine + -race resource
-	// pressure, killing the separate-DSN connection the test uses
-	// to issue the ALTER. Diagnosing this remotely cost 5 CI cycles
-	// without progress; v0.70.0 ships with Chunk D's
-	// TestIncrementalBackup_PostgresChainRestore_SchemaHistoryReplay
-	// (backup→ALTER→restore→resume, CI-green) as the operational
-	// end-to-end pin. This live-CDC variant lands when task #28
-	// closes — approaches to try documented there.
+	// Phase A (CI run 26173191325): the failure was attributed to
+	// net_write_timeout=60 — close to the ~52s failure timing. Phase B
+	// bumped --net-write-timeout=600 in startMySQLBinlog's Cmd; CI run
+	// 26175029726 failed identically but at the helper ctx ceiling
+	// (~117s = 90s ctx + slack) rather than 52s. Phase B's fix landed
+	// correctly (Phase A-2 logged net_write_timeout=600) but was NOT
+	// the bottleneck — left in place defensively.
 	//
-	// Production code (Chunks A–E) is unchanged + green on every
-	// other pin; this is a test-infra fight, not a feature gap.
-	t.Skip("v0.70.0: deferred — see task #28 (CI MySQL container under " +
-		"streamer + -race kills the ALTER connection; pin lands v0.70.1)")
+	// Phase A-2 (CI run 26176677598) identified the real cause via
+	// performance_schema.metadata_locks:
+	//   - owner_thread=51 holds TABLE SHARED_READ on `users` with
+	//     dur=TRANSACTION (held inside an open txn)
+	//   - the ALTER (conn 15, thread 55) sits at EXCLUSIVE PENDING,
+	//     waiting on the upgrade
+	//   - the SHARED_READ holder NEVER releases for the duration of
+	//     the streamer run
+	//
+	// Tracing it back: internal/engines/mysql/cdc_snapshot.go:74 runs
+	// `START TRANSACTION WITH CONSISTENT SNAPSHOT` on the snapshot
+	// conn at cold-start. The MDL_SHARED_READ this acquires is
+	// dur=TRANSACTION — held until COMMIT. streamer.go:1780 defers
+	// that COMMIT to `Streamer.Run` unwind. **Net effect: sluice
+	// holds MDL_SHARED_READ on every snapshotted source table for the
+	// entire streamer lifetime.** Even ALGORITHM=INSTANT can't acquire
+	// the brief MDL_EXCLUSIVE it needs for the metadata update —
+	// INSTANT skips the table rebuild, not the MDL upgrade.
+	//
+	// The prior docstring's "ALGORITHM=INSTANT rules out MDL as root
+	// cause" claim was wrong. INSTANT lowers the *cost* of the MDL
+	// hold (microseconds vs minutes), but it still requires the
+	// upgrade — and any waiter on the table sees the lock unchanged.
+	//
+	// This is a SLUICE PRODUCTION BEHAVIOUR, not a test-only artifact.
+	// In real deployments, operators cannot run any DDL on a
+	// sluice-monitored source table without first stopping sluice.
+	// The fix is structural (release the snapshot's READ VIEW once
+	// bulk-copy completes — the snapshot conn doesn't need to live
+	// the streamer's lifetime, only until COPY_COMPLETED). That
+	// refactor is bigger than landing this pin; tracked as a
+	// separate follow-up task. Once it lands, this pin un-skips and
+	// stays green.
+	t.Skip("task #28: deferred pending sluice snapshot-MDL release fix " +
+		"(sluice holds MDL_SHARED_READ on source tables for streamer's " +
+		"lifetime, blocking ALTER even with ALGORITHM=INSTANT). See " +
+		"docstring above for the Phase A-2 ground truth.")
 
 	mysqlSourceDSN, _, mysqlCleanup := startMySQLBinlog(t)
 	defer mysqlCleanup()
@@ -209,19 +234,9 @@ func TestStreamer_MySQLToPostgres_SchemaHistoryWarmResumeAcrossDDL(t *testing.T)
 	}
 
 	// ---- Phase 5: ALTER TABLE ADD COLUMN nickname ----
-	// This emits an ir.SchemaSnapshot via Chunk B1 once the next ROW
-	// event for users hits maybeSnapshotSchemaB1 (deferred-emit
-	// pattern; the anchor is the ALTER's GTID frozen at clear time
-	// per #4c).
-	// ALGORITHM=INSTANT bypasses metadata-lock contention with the
-	// running streamer's binlog reader and resource pressure on the
-	// testcontainers MySQL under -race (CI 26136202520 timed out
-	// after 117s with `unexpected EOF`; bumping applyMySQLDDL 30s→90s
-	// in ef21a36 wasn't enough). MySQL 8.0.12+ supports INSTANT for
-	// nullable end-column ADD; mysql:8.0 (the testcontainer image)
-	// satisfies that. Sub-second execution, no metadata-lock wait,
-	// zero impact on the DDL event the binlog emits (the ALGORITHM
-	// clause is local to DDL execution and not in the binlog payload).
+	// Emits an ir.SchemaSnapshot via Chunk B1 once the next ROW event
+	// for users hits maybeSnapshotSchemaB1 (deferred-emit pattern;
+	// the anchor is the ALTER's GTID frozen at clear time per #4c).
 	applyMySQLDDL(t, mysqlSourceDSN,
 		"ALTER TABLE users ADD COLUMN nickname VARCHAR(64), ALGORITHM=INSTANT;")
 
