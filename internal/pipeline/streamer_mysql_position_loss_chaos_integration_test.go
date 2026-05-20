@@ -57,6 +57,7 @@ package pipeline
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -463,7 +464,15 @@ func TestStreamer_MySQL_FreshInstanceNodeReplaceFallsThroughToColdStart(t *testi
 	resumeCancel()
 	select {
 	case err := <-resumeErr:
-		if err != nil {
+		// Tolerate context.Canceled: the streamer can be cancelled mid-
+		// startup (e.g., in `SHOW BINARY LOGS` while reaching steady-
+		// state CDC) and surface that as a wrapped context.Canceled
+		// rather than a clean nil. The assertion's intent is "exits
+		// cleanly on cancel"; both nil and context.Canceled satisfy it.
+		// Surfaced after CI 26135099781: the captureSlog race-fix
+		// removed a slowdown that was reliably putting the streamer
+		// past start-CDC by the time resumeCancel fired.
+		if err != nil && !errors.Is(err, context.Canceled) {
 			t.Errorf("resume Streamer.Run (B) returned err: %v", err)
 		}
 	case <-time.After(15 * time.Second):

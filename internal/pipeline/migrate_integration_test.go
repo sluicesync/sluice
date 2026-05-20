@@ -135,7 +135,14 @@ func applyMySQLDDL(t *testing.T, dsn, ddl string) {
 	}
 	defer func() { _ = db.Close() }()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	// 90s (was 30s through Chunk D): the v0.70.0 release-gate run
+	// 26135099781 surfaced the 30s ceiling on the new Chunk E pin
+	// (TestStreamer_MySQLToPostgres_SchemaHistoryWarmResumeAcrossDDL).
+	// Under -race + an active streamer goroutine + binlog pump, a
+	// simple ALTER can take >30s to acquire its metadata lock and
+	// commit on the testcontainers MySQL. 90s mirrors the most-used
+	// integration timeout precedent in the package.
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	if _, err := db.ExecContext(ctx, ddl); err != nil {
 		t.Fatalf("apply ddl: %v", err)
