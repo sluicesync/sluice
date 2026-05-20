@@ -38,7 +38,8 @@ func startMySQLBinlog(t *testing.T) (sourceDSN, targetDSN string, cleanup func()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	container, err := mysqltc.Run(ctx,
+	container, err := mysqltc.Run(
+		ctx,
 		"mysql:8.0",
 		mysqltc.WithDatabase("source_db"),
 		mysqltc.WithUsername("root"),
@@ -51,6 +52,22 @@ func startMySQLBinlog(t *testing.T) (sourceDSN, targetDSN string, cleanup func()
 					"--log-bin=mysql-bin",
 					"--binlog-format=ROW",
 					"--binlog-row-image=FULL",
+					// task #28 / Chunk E warm-resume pin: bump server-side
+					// socket-write timeout from the mysql:8.0 default of 60s
+					// to 600s. The Phase 5 ALTER in
+					// TestStreamer_MySQLToPostgres_SchemaHistoryWarmResumeAcrossDDL
+					// runs against a server already under streamer-goroutine +
+					// -race load; the ALTER's separate-DSN connection sits
+					// idle from the *server's* perspective while it executes,
+					// and the 60s default kills the conn → client sees
+					// `unexpected EOF` after ~52s. Phase A instrumentation
+					// (run 26173191325) confirmed net_write_timeout=60 +
+					// matched failure timing. The bumped value mirrors what
+					// real operators tune; net_read_timeout bumped in the
+					// same place for symmetry under future longer-running
+					// reads on this container.
+					"--net-write-timeout=600",
+					"--net-read-timeout=600",
 				},
 			},
 		}),
@@ -276,7 +293,8 @@ func readPersistedPositionMySQL(t *testing.T, dsn, streamID string) string {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	var token string
-	err = db.QueryRowContext(ctx,
+	err = db.QueryRowContext(
+		ctx,
 		"SELECT source_position FROM sluice_cdc_state WHERE stream_id = ?",
 		streamID,
 	).Scan(&token)
