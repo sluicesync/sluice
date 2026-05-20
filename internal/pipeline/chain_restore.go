@@ -428,6 +428,24 @@ func (r *ChainRestore) applyIncremental(
 		errCh <- r.streamIncrementalChanges(streamCtx, link, changesCh)
 	}()
 
+	// ADR-0049 Chunk D bug fix (CI 26132654611 ground truth): the
+	// applier's case ir.SchemaSnapshot dispatch writes via
+	// writeSchemaVersion(ctx, tx, a.streamID, ...) — using the FIELD
+	// `a.streamID`, set only by SetStreamID, NOT the Apply/ApplyBatch
+	// arg. migrate.go calls SetStreamID before its applier path
+	// (line 1297-1298); chain restore did not, so a.streamID stayed
+	// "" and the synthetic-SchemaSnapshot replay (Chunk D restore
+	// path) wrote schema-history rows under stream_id="" instead of
+	// ChainRestoreStreamID — defeating the operator value-prop
+	// (resume-after-DDL without full re-snapshot). Mirror migrate.go's
+	// pattern. Follow-up (Chunk F / v0.70.1): the dispatch's use of
+	// a.streamID vs the Apply arg is fragile in general — should be
+	// refactored to take the streamID from the arg consistently so any
+	// future non-migrate sync path is not silently mis-keyed.
+	if setter, ok := applier.(ir.StreamIDSetter); ok {
+		setter.SetStreamID(ChainRestoreStreamID)
+	}
+
 	if batched, ok := applier.(ir.BatchedChangeApplier); ok {
 		if err := batched.ApplyBatch(ctx, ChainRestoreStreamID, changesCh, batchSize); err != nil {
 			streamCancel()
