@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 
+	"github.com/orware/sluice/internal/engines"
 	"github.com/orware/sluice/internal/ir"
 )
 
@@ -202,12 +203,51 @@ func (a *ChangeApplier) PrimeSchemaHistoryCache(ctx context.Context, streamID st
 	// stale entries that disagree with the freshly-resolved versions.
 	a.activeSchema = make(map[string]activeSchemaVersion, len(tables))
 
-	engine := Engine{}
+	// Bug 79 (v0.70.2): the orderer that compares persisted anchors
+	// against currentPos must belong to the SOURCE engine, not the
+	// applier's (target's) engine. v0.70.1's storage fix taught the
+	// load path to preserve each row's source-engine identity on
+	// Position.Engine; v0.70.0's streamer fix already taught
+	// retagPositionForSource to tag currentPos with the source engine
+	// name. Both sides are now source-tagged — but the orderer here
+	// was still hardcoded to `Engine{}` (this package's PG orderer),
+	// whose decodePGPos strict-rejects any non-"postgres" tag. The
+	// loud `decode p: engine = "mysql"; want "postgres"` crash that
+	// followed is Bug 79.
+	//
+	// Hoisted ONCE per prime call (the source is per-stream, not
+	// per-table); all retained anchors for a given stream share the
+	// same source by construction. If a stale row in the table
+	// disagrees with currentPos.Engine that's a data-inconsistency
+	// edge — we use currentPos.Engine's orderer (the resume in-flight
+	// IS what the prime is preparing for); a Position.Engine
+	// disagreement between p and anchor surfaces loudly in the
+	// orderer itself (the engine-strict decoders reject the mismatch).
+	sourceEngineName := currentPos.Engine
+	if sourceEngineName == "" {
+		// Pre-Bug-78 row, a brand-new stream that didn't reach
+		// retagPositionForSource, or a streamer path that omitted the
+		// retag. Fall back to the applier's own engine name — the
+		// pre-fix behaviour, which is correct for same-engine chains
+		// (where target == source).
+		sourceEngineName = engineNamePostgres
+	}
+	srcEng, ok := engines.Get(sourceEngineName)
+	if !ok {
+		return fmt.Errorf("postgres: applier: prime schema-history cache: source engine %q not registered",
+			sourceEngineName)
+	}
+	orderer, ok := srcEng.(ir.PositionOrderer)
+	if !ok {
+		return fmt.Errorf("postgres: applier: prime schema-history cache: source engine %q does not implement ir.PositionOrderer",
+			sourceEngineName)
+	}
+
 	for _, st := range tables {
 		// Test-only counter: each iteration is one storage hit
 		// (loadRetainedSchemaVersions) + one in-memory resolve.
 		a.resolveCallsForTest.Add(1)
-		t, err := resolveSchemaVersion(ctx, a.db, engine, a.controlSchema, streamID, st.Schema, st.Table, currentPos)
+		t, err := resolveSchemaVersion(ctx, a.db, orderer, a.controlSchema, streamID, st.Schema, st.Table, currentPos)
 		if err != nil {
 			return fmt.Errorf("postgres: applier: prime schema-history cache for %s.%s: %w",
 				st.Schema, st.Table, err)
