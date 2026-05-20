@@ -1,0 +1,94 @@
+# Dependabot auto-merge for patch + minor updates.
+#
+# Why this exists: before this workflow, every Dependabot PR sat open
+# until someone manually clicked merge. With weekly bumps across ~50
+# direct + transitive dependencies, that meant a backlog of 5-10
+# stale PRs at any time, plus the inevitable go.sum cross-conflict
+# storm when two siblings landed near each other.
+#
+# Decision (2026-05-20, owner-endorsed): auto-merge PATCH and MINOR
+# updates once CI passes. Hold MAJOR updates for manual review (they
+# often have breaking changes; even a clean CI doesn't guarantee no
+# behavioural regression).
+#
+# Mechanism: this workflow runs on every Dependabot PR. It uses the
+# official `dependabot/fetch-metadata` action to classify the update
+# type (semver-patch / semver-minor / semver-major) and, for the
+# first two, approves + enables auto-merge. GitHub then waits for
+# the existing CI workflow to pass before completing the merge.
+#
+# Safety:
+#   - Only runs when the PR author is `dependabot[bot]` (hard
+#     enforcement; the `if:` on the job gates this).
+#   - Uses `pull_request_target` to get write access to the base repo
+#     (the default `pull_request` trigger from a fork can't approve
+#     or merge). This is the recommended pattern for trusted-bot
+#     workflows; the security guarantee comes from the `if:` filter,
+#     not the trigger.
+#   - Major-version bumps are NEVER auto-merged: the
+#     fetch-metadata-output check + the `if:` on the auto-merge step
+#     ensures only patch + minor qualify.
+#   - `gh pr merge --auto --squash` queues the merge but defers to
+#     the repo's existing CI gate; if CI fails the merge never fires.
+#
+# Repo prereq (one-time, enabled 2026-05-20): `gh repo edit --enable-
+# auto-merge` so the `--auto` flag is honoured. Without this,
+# auto-merge requests are rejected by the GitHub API.
+#
+# Operator override: a major-version PR (or any PR you want to vet
+# regardless of update-type) still gets a normal Dependabot PR with
+# CI; review + merge manually. No changes to that workflow.
+
+name: Dependabot auto-merge
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, ready_for_review]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  automerge:
+    name: Auto-merge patch + minor
+    runs-on: ubuntu-latest
+    if: github.actor == 'dependabot[bot]'
+    steps:
+      - name: Fetch Dependabot metadata
+        id: meta
+        uses: dependabot/fetch-metadata@v2
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Approve patch + minor updates
+        if: |
+          steps.meta.outputs.update-type == 'version-update:semver-patch' ||
+          steps.meta.outputs.update-type == 'version-update:semver-minor'
+        run: gh pr review --approve "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Enable auto-merge (squash) for patch + minor updates
+        if: |
+          steps.meta.outputs.update-type == 'version-update:semver-patch' ||
+          steps.meta.outputs.update-type == 'version-update:semver-minor'
+        run: gh pr merge --auto --squash --delete-branch "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Comment on major updates (hold for manual review)
+        if: steps.meta.outputs.update-type == 'version-update:semver-major'
+        run: |
+          gh pr comment "$PR_URL" --body \
+            "Auto-merge held: this is a **major-version** bump (\
+          $(printf '`%s` %s -> %s' "${{ steps.meta.outputs.dependency-names }}" "${{ steps.meta.outputs.previous-version }}" "${{ steps.meta.outputs.new-version }}")). \
+          Major bumps often carry breaking changes that CI alone won't catch \
+          (renamed/removed APIs, default-value changes, deprecated paths still \
+          accepted but with subtler semantics). Review the upstream CHANGELOG \
+          before merging; if it's safe, merge manually."
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

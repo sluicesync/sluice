@@ -30,6 +30,40 @@ updates:
     commit-message:
       prefix: "deps"
       include: "scope"
+    # Bundle related package families into single PRs so we get one
+    # rollup PR per family per week instead of N independent PRs that
+    # cross-conflict on go.sum the moment one of them merges. The
+    # aws-sdk-go-v2 family is the worst offender (4-6 sibling packages,
+    # all bumping in lockstep upstream). vitess and otel are tracked
+    # for the same reason. Anything not in a group still gets its own
+    # PR (the default behaviour).
+    groups:
+      aws-sdk-go-v2:
+        patterns:
+          - "github.com/aws/aws-sdk-go-v2"
+          - "github.com/aws/aws-sdk-go-v2/*"
+        update-types:
+          - "minor"
+          - "patch"
+      vitess:
+        patterns:
+          - "vitess.io/vitess"
+          - "vitess.io/vitess/*"
+        update-types:
+          - "minor"
+          - "patch"
+      opentelemetry:
+        patterns:
+          - "go.opentelemetry.io/*"
+        update-types:
+          - "minor"
+          - "patch"
+      golang-x:
+        patterns:
+          - "golang.org/x/*"
+        update-types:
+          - "minor"
+          - "patch"
 
   # GitHub Actions updates. Keeps the actions/checkout@v4-style references
   # current so we benefit from upstream fixes and security patches.
