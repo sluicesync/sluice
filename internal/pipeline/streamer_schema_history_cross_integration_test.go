@@ -46,6 +46,7 @@ package pipeline
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -134,29 +135,19 @@ import (
 //
 //nolint:gocognit // Sequential phase-by-phase integration test reads
 func TestStreamer_MySQLToPostgres_SchemaHistoryWarmResumeAcrossDDL(t *testing.T) {
-	// DEFERRED FROM v0.70.0 — see task #28.
-	//
-	// This test reliably fails on CI (run 26134035839, 26135099781,
-	// 26136202520, 26137180288) with `apply ddl: context deadline
-	// exceeded` after ~52s into the ALTER, followed by
-	// `[mysql] packets.go:58 unexpected EOF` — the test's ALTER
-	// connection drops mid-query. Tried (a) bumping the helper
-	// timeout 30s→90s (insufficient), (b) ALGORITHM=INSTANT to
-	// bypass metadata-lock contention (same failure shape — rules
-	// out MDL as root cause). Most plausible remaining: the MySQL
-	// testcontainer fails under streamer-goroutine + -race resource
-	// pressure, killing the separate-DSN connection the test uses
-	// to issue the ALTER. Diagnosing this remotely cost 5 CI cycles
-	// without progress; v0.70.0 ships with Chunk D's
-	// TestIncrementalBackup_PostgresChainRestore_SchemaHistoryReplay
-	// (backup→ALTER→restore→resume, CI-green) as the operational
-	// end-to-end pin. This live-CDC variant lands when task #28
-	// closes — approaches to try documented there.
-	//
-	// Production code (Chunks A–E) is unchanged + green on every
-	// other pin; this is a test-infra fight, not a feature gap.
-	t.Skip("v0.70.0: deferred — see task #28 (CI MySQL container under " +
-		"streamer + -race kills the ALTER connection; pin lands v0.70.1)")
+	// PHASE A INSTRUMENTATION (task #28) — temporarily un-skipped to
+	// capture CI ground truth for why the Phase 5 ALTER's separate-
+	// DSN connection drops mid-query on -race. The applyMySQLDDL
+	// calls at Phases 5 and 6 are routed through
+	// applyMySQLDDLInstrumented below, which logs:
+	//   - SHOW SESSION VARIABLES LIKE '%timeout%'/'%net_%' BEFORE the
+	//     ALTER (probe net_write_timeout / wait_timeout / lock-wait
+	//     defaults on the testcontainer's mysql:8.0)
+	//   - the connection's @@CONNECTION_ID and ping success
+	//   - SHOW FULL PROCESSLIST polled every 5s during the ALTER
+	//   - exact error wrapping + elapsed time at failure
+	// This commit is Phase A only; the fix lands in a follow-up
+	// once the logs tell us which timeout/contention is firing.
 
 	mysqlSourceDSN, _, mysqlCleanup := startMySQLBinlog(t)
 	defer mysqlCleanup()
@@ -209,21 +200,13 @@ func TestStreamer_MySQLToPostgres_SchemaHistoryWarmResumeAcrossDDL(t *testing.T)
 	}
 
 	// ---- Phase 5: ALTER TABLE ADD COLUMN nickname ----
-	// This emits an ir.SchemaSnapshot via Chunk B1 once the next ROW
-	// event for users hits maybeSnapshotSchemaB1 (deferred-emit
-	// pattern; the anchor is the ALTER's GTID frozen at clear time
-	// per #4c).
-	// ALGORITHM=INSTANT bypasses metadata-lock contention with the
-	// running streamer's binlog reader and resource pressure on the
-	// testcontainers MySQL under -race (CI 26136202520 timed out
-	// after 117s with `unexpected EOF`; bumping applyMySQLDDL 30s→90s
-	// in ef21a36 wasn't enough). MySQL 8.0.12+ supports INSTANT for
-	// nullable end-column ADD; mysql:8.0 (the testcontainer image)
-	// satisfies that. Sub-second execution, no metadata-lock wait,
-	// zero impact on the DDL event the binlog emits (the ALGORITHM
-	// clause is local to DDL execution and not in the binlog payload).
-	applyMySQLDDL(t, mysqlSourceDSN,
-		"ALTER TABLE users ADD COLUMN nickname VARCHAR(64), ALGORITHM=INSTANT;")
+	// PHASE A INSTRUMENTED: see applyMySQLDDLInstrumented for what's
+	// captured. The ALGORITHM=INSTANT bypasses MDL contention on
+	// recent MySQL 8 (rules out MDL as root cause if logs still show
+	// the ALTER queued for ≥50s).
+	applyMySQLDDLInstrumented(t, mysqlSourceDSN,
+		"ALTER TABLE users ADD COLUMN nickname VARCHAR(64), ALGORITHM=INSTANT;",
+		"phase5-alter")
 
 	// ---- Phase 6: INSERT R3 carrying the new column ----
 	// The first post-DDL ROW triggers maybeSnapshotSchemaB1 → writes
@@ -467,3 +450,204 @@ var (
 	_ ir.Change = ir.SchemaSnapshot{}
 	_ error     = ir.ErrPositionInvalid
 )
+
+// applyMySQLDDLInstrumented is the PHASE A instrumented variant of
+// applyMySQLDDL used by the Chunk E warm-resume pin to diagnose the
+// "ALTER's connection drops at ~50s under -race" failure shape
+// (task #28). It logs to t.Logf (NOT slog — captureSlog elsewhere
+// in the test swaps the default slog, and we want this output to
+// survive that swap and to be attributed to the test in CI logs):
+//   - server-side timeout configuration BEFORE the DDL (the prime
+//     suspects: net_write_timeout / net_read_timeout / wait_timeout
+//     / lock_wait_timeout / innodb_lock_wait_timeout
+//     / max_execution_time / connect_timeout)
+//   - the connection's CONNECTION_ID
+//   - SHOW FULL PROCESSLIST every 5s during the DDL (capturing the
+//     ALTER's State + Time columns + any blockers)
+//   - the exact error type + elapsed-time at failure
+//
+// This is removed in Phase C once the fix lands; the file's normal
+// applyMySQLDDL helper stays as-is.
+func applyMySQLDDLInstrumented(t *testing.T, dsn, ddl, tag string) {
+	t.Helper()
+
+	t.Logf("[instr %s] opening conn at %s", tag, time.Now().Format(time.RFC3339Nano))
+
+	// Open a single-use connection so the polling goroutine can read
+	// PROCESSLIST while the ALTER blocks the primary conn.
+	db, err := sql.Open("mysql", dsn+"&multiStatements=true")
+	if err != nil {
+		t.Fatalf("[instr %s] open: %v", tag, err)
+	}
+	defer func() { _ = db.Close() }()
+
+	// Bound the pool: 1 conn for the ALTER. PROCESSLIST polls open
+	// their own conn via a separate sql.Open below.
+	db.SetMaxOpenConns(1)
+
+	pingCtx, pingCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer pingCancel()
+	if err := db.PingContext(pingCtx); err != nil {
+		t.Fatalf("[instr %s] ping: %v", tag, err)
+	}
+
+	// Pin one connection for the ALTER (so CONNECTION_ID() and the
+	// subsequent ExecContext both use the same conn).
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("[instr %s] db.Conn: %v", tag, err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	var connID int64
+	if err := conn.QueryRowContext(context.Background(), "SELECT CONNECTION_ID()").Scan(&connID); err != nil {
+		t.Logf("[instr %s] CONNECTION_ID(): %v", tag, err)
+	} else {
+		t.Logf("[instr %s] connection_id=%d", tag, connID)
+	}
+
+	// Dump every timeout/wait/net global variable. The hypothesis
+	// under test: a server-side timeout fires ~50s in, killing the
+	// connection.
+	probeVars := []string{
+		"net_write_timeout",
+		"net_read_timeout",
+		"wait_timeout",
+		"interactive_timeout",
+		"lock_wait_timeout",
+		"innodb_lock_wait_timeout",
+		"max_execution_time",
+		"connect_timeout",
+	}
+	for _, v := range probeVars {
+		var name, value string
+		row := conn.QueryRowContext(context.Background(),
+			fmt.Sprintf("SHOW SESSION VARIABLES LIKE '%s'", v))
+		if err := row.Scan(&name, &value); err != nil {
+			t.Logf("[instr %s] session var %s: %v", tag, v, err)
+			continue
+		}
+		t.Logf("[instr %s] session %s=%s", tag, name, value)
+	}
+
+	// PROCESSLIST poll goroutine. Uses its own sql.Open so it
+	// doesn't fight for our pinned conn.
+	stopPoll := make(chan struct{})
+	pollDone := make(chan struct{})
+	go func() {
+		defer close(pollDone)
+		pollDB, err := sql.Open("mysql", dsn)
+		if err != nil {
+			t.Logf("[instr %s] poll: open: %v", tag, err)
+			return
+		}
+		defer func() { _ = pollDB.Close() }()
+
+		tick := time.NewTicker(5 * time.Second)
+		defer tick.Stop()
+
+		for {
+			select {
+			case <-stopPoll:
+				return
+			case <-tick.C:
+				pctx, pcancel := context.WithTimeout(context.Background(), 3*time.Second)
+				dumpProcesslist(pctx, t, pollDB, tag)
+				pcancel()
+			}
+		}
+	}()
+
+	// 90s ceiling matches the existing applyMySQLDDL. We deliberately
+	// keep the same budget so the failure window is comparable to the
+	// last 4 CI runs.
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	t.Logf("[instr %s] ExecContext start at %s; ddl=%q", tag, time.Now().Format(time.RFC3339Nano), ddl)
+	start := time.Now()
+	_, execErr := conn.ExecContext(ctx, ddl)
+	elapsed := time.Since(start)
+	close(stopPoll)
+	<-pollDone
+
+	if execErr != nil {
+		t.Logf("[instr %s] ExecContext FAILED after %s: %T %v", tag, elapsed, execErr, execErr)
+		// Best-effort post-mortem on a fresh conn — the pinned conn
+		// may already be dead. We use the same DSN to spin up a new
+		// pool just to grab SHOW WARNINGS from the server's POV; the
+		// processlist (which would reveal the killed conn) was
+		// captured by the polling goroutine right up to the moment
+		// the ALTER failed.
+		dumpWarnings(t, dsn, tag)
+		t.Fatalf("[instr %s] apply ddl: %v", tag, execErr)
+	}
+	t.Logf("[instr %s] ExecContext OK after %s", tag, elapsed)
+}
+
+// dumpProcesslist runs SHOW FULL PROCESSLIST and t.Logf's each row.
+// Pulled out of applyMySQLDDLInstrumented so the linter sees a
+// linear rows-lifetime path (sqlclosecheck/rowserrcheck happy).
+// Phase A only; deleted in Phase C.
+func dumpProcesslist(ctx context.Context, t *testing.T, db *sql.DB, tag string) {
+	t.Helper()
+	rows, err := db.QueryContext(ctx,
+		"SELECT id, user, host, db, command, time, state, COALESCE(info,'') FROM information_schema.processlist ORDER BY id")
+	if err != nil {
+		t.Logf("[instr %s] processlist: %v", tag, err)
+		return
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var id, secs int64
+		var user, host, dbName, cmd, state, info string
+		var dbNullable, stateNullable sql.NullString
+		if err := rows.Scan(&id, &user, &host, &dbNullable, &cmd, &secs, &stateNullable, &info); err != nil {
+			t.Logf("[instr %s] processlist scan: %v", tag, err)
+			continue
+		}
+		if dbNullable.Valid {
+			dbName = dbNullable.String
+		}
+		if stateNullable.Valid {
+			state = stateNullable.String
+		}
+		if len(info) > 200 {
+			info = info[:200] + "..."
+		}
+		t.Logf("[instr %s] proc id=%d user=%s host=%s db=%s cmd=%s time=%ds state=%q info=%q",
+			tag, id, user, host, dbName, cmd, secs, state, info)
+	}
+	if err := rows.Err(); err != nil {
+		t.Logf("[instr %s] processlist rows.Err: %v", tag, err)
+	}
+}
+
+// dumpWarnings opens a fresh conn and t.Logf's SHOW WARNINGS.
+// Phase A only.
+func dumpWarnings(t *testing.T, dsn, tag string) {
+	t.Helper()
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		t.Logf("[instr %s] dumpWarnings open: %v", tag, err)
+		return
+	}
+	defer func() { _ = db.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	rows, err := db.QueryContext(ctx, "SHOW WARNINGS")
+	if err != nil {
+		t.Logf("[instr %s] SHOW WARNINGS: %v", tag, err)
+		return
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var lvl, code, msg string
+		if err := rows.Scan(&lvl, &code, &msg); err == nil {
+			t.Logf("[instr %s] warning: level=%s code=%s msg=%s", tag, lvl, code, msg)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Logf("[instr %s] warnings rows.Err: %v", tag, err)
+	}
+}
