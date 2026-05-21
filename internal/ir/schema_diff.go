@@ -436,10 +436,25 @@ func diffTable(expected, actual *Table, opts DiffOptions) TableDiff {
 	sort.Strings(td.ColumnsMissing)
 
 	if !opts.IgnoreExtras {
-		for name := range actCols {
-			if _, ok := expCols[name]; !ok {
-				td.ColumnsExtra = append(td.ColumnsExtra, name)
+		for name, col := range actCols {
+			if _, ok := expCols[name]; ok {
+				continue
 			}
+			// ADR-0048 Shape A: a sluice-injected discriminator column
+			// (added by translate.InjectShardColumn under
+			// `--inject-shard-column NAME=VALUE`) is *expected* to be
+			// present on the consolidated target while ABSENT on the
+			// per-shard source. Without this suppression every
+			// consolidated diff would surface the discriminator as a
+			// permanent "extra column on target" drift, drowning real
+			// signal. The inverse-assert below (in diffColumn) still
+			// requires the column to be NOT NULL and present on
+			// actual — its absence/nullability becomes the real drift
+			// signal for a Shape-A target.
+			if col != nil && col.SluiceInjected {
+				continue
+			}
+			td.ColumnsExtra = append(td.ColumnsExtra, name)
 		}
 		sort.Strings(td.ColumnsExtra)
 	}

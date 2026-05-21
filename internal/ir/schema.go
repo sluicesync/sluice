@@ -238,6 +238,30 @@ type Column struct {
 	// readers should never populate it (the field carries
 	// override-context, not the raw source-engine type).
 	SourceColumnType Type
+
+	// SluiceInjected marks a column that sluice itself added to the
+	// IR (i.e. one that does NOT exist on the operator's source
+	// schema). Today the only producer is
+	// [translate.InjectShardColumn] — the Shape-A discriminator
+	// column the operator opts into via `--inject-shard-column
+	// NAME=VALUE` (ADR-0048). The marker is a provenance bit, not a
+	// behaviour bit: it changes nothing about emit / values, only
+	// about how *diff* / *verify* interpret the column on the
+	// consolidated target.
+	//
+	// [DiffSchemas] treats a target-side column with
+	// SluiceInjected=true as an *expected* extra rather than drift:
+	// it is suppressed from `ColumnsExtra` when absent on the
+	// source-side expected schema (Shape-A diff against a sharded
+	// source whose schema doesn't carry the discriminator), but the
+	// inverse check still fires — the column must remain NOT NULL
+	// and present on the actual target side. Mirrors the
+	// `SourceColumnType` precedent: a small single-purpose
+	// provenance field, lighter than a sealed enum.
+	//
+	// Source-side schema readers leave this false; only translation
+	// passes that *add* a column set it to true.
+	SluiceInjected bool
 }
 
 // IsGenerated reports whether the column is a generated/computed

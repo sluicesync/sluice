@@ -102,6 +102,67 @@ func TestDiffSchemas_ColumnMissingAndExtra(t *testing.T) {
 	}
 }
 
+// TestDiffSchemas_SluiceInjected_SuppressedFromExtras pins ADR-0048
+// Decision 2: a target-side column carrying SluiceInjected=true is
+// expected to be present on the consolidated target but absent on
+// the per-shard source's expected schema, so it must NOT surface as
+// `ColumnsExtra` drift. Without this suppression every Shape-A
+// `schema diff` would emit a permanent false-positive for the
+// discriminator column.
+func TestDiffSchemas_SluiceInjected_SuppressedFromExtras(t *testing.T) {
+	exp := &Schema{Tables: []*Table{{
+		Name: "customer",
+		Columns: []*Column{
+			{Name: "customer_id", Type: Integer{Width: 64}},
+			{Name: "email", Type: Varchar{Length: 255}},
+		},
+		PrimaryKey: &Index{Columns: []IndexColumn{{Column: "customer_id"}}},
+	}}}
+	act := &Schema{Tables: []*Table{{
+		Name: "customer",
+		Columns: []*Column{
+			{Name: "customer_id", Type: Integer{Width: 64}},
+			{Name: "email", Type: Varchar{Length: 255}},
+			{Name: "source_shard_id", Type: Varchar{Length: 64}, SluiceInjected: true},
+		},
+		PrimaryKey: &Index{Columns: []IndexColumn{
+			{Column: "source_shard_id"}, {Column: "customer_id"},
+		}},
+	}}}
+	d := DiffSchemas(exp, act, DiffOptions{})
+	if d.HasChanges() {
+		t.Fatalf("expected no drift on sluice-injected column; got %+v", d)
+	}
+}
+
+// TestDiffSchemas_SluiceInjected_NonInjectedStillSurfaces guards the
+// negative: a target-side column without the SluiceInjected marker
+// still surfaces as `ColumnsExtra` drift. Suppression is opt-in via
+// the marker; turning the gate off must not weaken the general drift
+// signal.
+func TestDiffSchemas_SluiceInjected_NonInjectedStillSurfaces(t *testing.T) {
+	exp := &Schema{Tables: []*Table{{
+		Name:    "users",
+		Columns: []*Column{{Name: "id", Type: Integer{Width: 64}}},
+	}}}
+	act := &Schema{Tables: []*Table{{
+		Name: "users",
+		Columns: []*Column{
+			{Name: "id", Type: Integer{Width: 64}},
+			// SluiceInjected deliberately false — operator's own
+			// schema drift, not a sluice-managed column.
+			{Name: "stray_column", Type: Varchar{Length: 32}},
+		},
+	}}}
+	d := DiffSchemas(exp, act, DiffOptions{})
+	if len(d.TablesMismatched) != 1 {
+		t.Fatalf("expected one mismatched table; got %+v", d)
+	}
+	if !reflect.DeepEqual(d.TablesMismatched[0].ColumnsExtra, []string{"stray_column"}) {
+		t.Errorf("ColumnsExtra = %v; want [stray_column]", d.TablesMismatched[0].ColumnsExtra)
+	}
+}
+
 func TestDiffSchemas_ColumnTypeMismatch(t *testing.T) {
 	cases := []struct {
 		name    string
