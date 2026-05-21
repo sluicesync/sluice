@@ -366,34 +366,86 @@ func translateType(c columnMeta) (ir.Type, error) {
 		return ir.Cidr{}, nil
 	case "macaddr", "macaddr8":
 		return ir.Macaddr{}, nil
+	}
 
-	// ---- Full-text search ----
-	// tsvector / tsquery are PostgreSQL CORE types (pg_catalog, no
-	// pg_extension edge — catalog Bug 17). They have no rich
-	// cross-engine IR shape, but a same-engine PG → PG migration only
-	// needs faithful carry. Mirror the ADR-0047 verbatim tier used for
-	// uncatalogued USER-DEFINED types: when the run carries a
-	// same-engine-PG guarantee (VerbatimEligible), emit ir.VerbatimType
-	// with the exact format_type spelling so the PG writer re-emits it
-	// literally and values round-trip via the type's text I/O.
-	// VerbatimEligible is false cross-engine, so that path still falls
-	// through to the loud refusal below (tsvector has no MySQL
-	// equivalent — a correct refusal, not silent loss).
-	case "tsvector", "tsquery":
-		if c.VerbatimEligible {
-			if c.FormatType == "" {
-				return nil, fmt.Errorf(
-					"postgres: core type %q is eligible for verbatim "+
-						"passthrough but pg_catalog.format_type returned "+
-						"empty — this is a sluice bug; please report it",
-					c.DataType,
-				)
-			}
-			return ir.VerbatimType{Definition: c.FormatType}, nil
+	// ADR-0051 (consolidating catalog Bug 17): core pg_catalog types
+	// lacking a rich cross-engine IR shape carry verbatim on a
+	// same-engine-PG run via [ir.VerbatimType]. Sibling tier to
+	// ADR-0047's USER-DEFINED uncatalogued path: both surfaces emit the
+	// same IR type, share the same downstream pipeline (DDL emit, value
+	// decode, cross-engine refusal), and differ only in where they
+	// dispatch (USER-DEFINED branch vs core-type fallthrough).
+	//
+	// The allowlist is the single named decision — adding a type later
+	// is a one-line additive change plus an ADR-0051 update, not a
+	// scattered switch-case edit. Default fall-through ("anything
+	// VerbatimEligible = verbatim") was deliberately rejected: it would
+	// silently absorb any new PG core type a future major version adds
+	// (loud-failure tenet).
+	//
+	// VerbatimEligible is set by the schema reader only on a provably-
+	// same-engine-PG run (or a PG backup whose PG-restore-only marker
+	// is enforced at restore). Cross-engine leaves it false, so the
+	// generic fallthrough refusal below still fires — the cross-engine
+	// loud-refuse default is NOT weakened. The cross-engine refusal at
+	// `internal/pipeline/cross_engine_supportable.go` rejects
+	// ir.VerbatimType regardless, so the safety is doubly enforced.
+	if coreVerbatimEligibleTypes[c.DataType] && c.VerbatimEligible {
+		if c.FormatType == "" {
+			return nil, fmt.Errorf(
+				"postgres: core type %q is eligible for verbatim "+
+					"passthrough but pg_catalog.format_type returned "+
+					"empty — this is a sluice bug; please report it",
+				c.DataType,
+			)
 		}
+		return ir.VerbatimType{Definition: c.FormatType}, nil
 	}
 
 	return nil, fmt.Errorf("postgres: unsupported data_type %q (udt %q)", c.DataType, c.UDTName)
+}
+
+// coreVerbatimEligibleTypes is the ADR-0051 allowlist of core
+// pg_catalog types that carry verbatim on a same-engine-PG run when
+// no first-class IR shape is appropriate. Consumed by translateType
+// just before the generic fallthrough loud refusal.
+//
+// Stage 1 (this ADR): FTS family (tsvector/tsquery — catalog Bug 17
+// representative, consolidated here), range family, and the PG14+
+// multirange family — all share opaque text-I/O semantics with no
+// locale / dialect quirks, no portable MySQL form (cross-engine stays
+// loud-refuse via [ir.VerbatimType]'s default in
+// `cross_engine_supportable.go`).
+//
+// Stage 2 candidates (deferred per ADR-0051 §"Stage 2 candidates"):
+// xml, money, pg_lsn, txid_snapshot, pg_snapshot. Each has a known
+// text-IO / locale / dialect concern worth a per-type round-trip
+// integration test before adding to the allowlist. Do NOT add a
+// Stage 2 entry without updating ADR-0051 and pinning the per-type
+// round-trip.
+var coreVerbatimEligibleTypes = map[string]bool{
+	// FTS family (catalog Bug 17 — pre-existing tsvector/tsquery
+	// carve-out, consolidated into this allowlist by ADR-0051).
+	"tsvector": true,
+	"tsquery":  true,
+
+	// Range family. Common in partition bounds, scheduling, analytics
+	// (GitLab, Rails, Django). No portable MySQL form.
+	"int4range": true,
+	"int8range": true,
+	"numrange":  true,
+	"tsrange":   true,
+	"tstzrange": true,
+	"daterange": true,
+
+	// Multirange family (PG 14+). Same shape and rationale as ranges —
+	// pin the class, not the representative.
+	"int4multirange": true,
+	"int8multirange": true,
+	"nummultirange":  true,
+	"tsmultirange":   true,
+	"tstzmultirange": true,
+	"datemultirange": true,
 }
 
 // int64Ptr returns *p, or 0 if p is nil. Used to translate

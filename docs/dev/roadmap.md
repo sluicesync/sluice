@@ -582,7 +582,36 @@ Output: `docs/research/pg-extensions-deployment-frequency.md` (matrix + recommen
 
 ---
 
-### 17. Generalize core-PG-type same-engine verbatim carry beyond tsvector/tsquery
+### 17. Generalize core-PG-type same-engine verbatim carry beyond tsvector/tsquery — **Stage 1 SHIPPED (ADR-0051, 2026-05-21)**
+
+**Status.** [ADR-0051](adr/adr-0051-core-pg-type-verbatim-carry.md)
+Accepted 2026-05-21. Stage 1 LANDED: tsvector/tsquery (consolidated
+from the original catalog Bug 17 carve-out), the range family
+(int4range/int8range/numrange/tsrange/tstzrange/daterange), and the
+PG14+ multirange family (int4multirange/int8multirange/nummultirange/
+tsmultirange/tstzmultirange/datemultirange) are now in a single named
+`coreVerbatimEligibleTypes` allowlist in
+`internal/engines/postgres/types.go`. Same-engine PG → PG migrate of
+range-typed schemas (GitLab partition bounds, Rails/Django scheduling)
+just works; cross-engine stays loud-refuse via the existing
+`cross_engine_supportable.go` `ir.VerbatimType` rejection. Integration
+test pins the round-trip; corpus harness leg
+`TestCorpus_GitLab_PGToPG_VerbatimCarry` flipped from
+"characterized gap" to "verified clean."
+
+**Stage 2 (deferred per ADR-0051 §"Stage 2 candidates").** xml, money,
+pg_lsn, txid_snapshot, pg_snapshot — each adds via a one-line
+allowlist entry + a per-type round-trip integration test + an ADR-0051
+update; promoted on operator demand because each has known text-IO /
+locale / dialect quirks worth per-type validation.
+
+**Follow-up.** EXCLUDE USING gist (… WITH &&) constraints on range
+columns (a separate IR surface) remain out of scope per ADR-0051;
+tracked separately. Loud-not-silent until promoted.
+
+---
+
+### 17.original (historical context, retained for traceability)
 
 **Why.** Surfaced by the real-world schema corpus (2026-05-19, GitLab `db/structure.sql`; see [`docs/dev/notes/real-world-corpus-findings.md`](notes/real-world-corpus-findings.md) § "Iteration 3"). `tsvector`/`tsquery` got an explicit same-engine verbatim-carry branch (catalog **Bug 17**, `internal/engines/postgres/types.go:379` — `if c.VerbatimEligible → ir.VerbatimType`), but the carve-out was made **type-by-type for the representative, not generalized to the class** of core `pg_catalog` types with no rich cross-engine IR shape. So same-engine PG→PG **loud-refuses core range types** (`int4range/int8range/numrange/tsrange/tstzrange/daterange`) at the generic fallthrough (`types.go` ~392) — the *exact* gap `tsvector` had pre-Bug-17, on a very common real-world column class (partition bounds, scheduling, analytics — GitLab/Rails/Django). This is the sibling of item 16/ADR-0047: **16 = uncatalogued *USER-DEFINED extension* verbatim; 17 = core *pg_catalog-type* verbatim.** ADR-0047 explicitly does **not** cover range types (they are core, not USER-DEFINED).
 

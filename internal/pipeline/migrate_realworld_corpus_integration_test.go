@@ -236,35 +236,25 @@ func TestCorpus_GitLab_PGToPG_VerbatimCarry(t *testing.T) {
 	pgEng, _ := engines.Get("postgres")
 	mig := &Migrator{Source: pgEng, Target: pgEng, SourceDSN: src, TargetDSN: tgt, DryRun: true}
 	err := mig.Run(ctx2min(t))
-	if err == nil {
-		t.Log("GitLab PG→PG DryRun: 1000+ tables read + planned via verbatim carry, " +
-			"NO loud refusal — same-engine fidelity confirmed. (If this passes, the " +
-			"core-range-type gap below was fixed; tighten this leg to an assertion.)")
-		return
+	// ADR-0051 (2026-05-21) closed the iteration-3 core-range-type gap:
+	// the same-engine PG verbatim tier now allowlists the range +
+	// multirange families (plus the tsvector/tsquery FTS family
+	// consolidated from the original catalog Bug 17 carve-out). PG→PG
+	// of GitLab's range-typed schema must read + plan cleanly — a loud
+	// refusal here is a genuine regression, NOT a tracked
+	// characterization. The adjacent EXCLUDE constraint surface stays
+	// out of scope per ADR-0051 §"Out of scope"; if a *new* unexpected
+	// shape surfaces, fail loudly as a new finding (the iteration-3
+	// discipline is preserved for the next class).
+	if err != nil {
+		t.Fatalf("GitLab PG→PG DryRun: unexpected loud refusal AFTER ADR-0051 "+
+			"closed the core-range-type gap — investigate as a regression OR a "+
+			"NEW finding (e.g. EXCLUDE-constraint surface, an uncovered core "+
+			"type the allowlist missed): %v", truncErr(err))
 	}
-	// CHARACTERIZED KNOWN GAP (iteration-3 finding, 2026-05-19):
-	// `tsvector`/`tsquery` got an explicit same-engine verbatim branch
-	// (catalog Bug 17, types.go:379) but the carve-out was made
-	// type-by-type for the *representative*, not generalized to the
-	// *class* of core PG types with no rich cross-engine IR shape. So
-	// PG→PG loud-refuses core RANGE types (int4range/int8range/
-	// numrange/tsrange/tstzrange/daterange) though they're trivially
-	// verbatim-carryable — the exact gap tsvector had pre-Bug-17.
-	// Loud, not silent → tenet holds, no corruption; a real
-	// fidelity/UX gap. Tracked: real-world-corpus-findings.md +
-	// roadmap. This leg stays GREEN by characterizing the known class
-	// and only FAILs on an UNEXPECTED error shape (a new finding).
-	msg := err.Error()
-	knownGap := strings.Contains(msg, "int8range") || strings.Contains(msg, "int4range") ||
-		strings.Contains(msg, "numrange") || strings.Contains(msg, "tsrange") ||
-		strings.Contains(msg, "tstzrange") || strings.Contains(msg, "daterange")
-	if !knownGap {
-		t.Fatalf("GitLab PG→PG DryRun failed with an UNEXPECTED shape (not the tracked "+
-			"core-range-type verbatim gap) — investigate as a NEW finding: %v", truncErr(err))
-	}
-	t.Logf("GitLab PG→PG: CHARACTERIZED KNOWN GAP — core range type loud-refused on the "+
-		"same-engine path (should verbatim-carry like tsvector/Bug-17). Not corruption "+
-		"(loud). Tracked in real-world-corpus-findings.md / roadmap. err=%v", truncErr(err))
+	t.Log("GitLab PG→PG DryRun: 1000+ tables read + planned via the consolidated " +
+		"core-verbatim tier — same-engine fidelity confirmed end-to-end on a real " +
+		"production schema. ADR-0051 closed the iteration-3 gap.")
 }
 
 // --- Iteration 2 ---
