@@ -92,6 +92,24 @@ func checkCrossEngineSupportable(
 				contextID, idxName, tbl.Name, reason, colRef, tbl.Name,
 			)
 		}
+		// ADR-0053: EXCLUDE constraints are PG-only. MySQL has no
+		// equivalent type, no equivalent semantics. Pre-ADR sluice
+		// silently dropped them from the IR (the schema reader never
+		// queried contype='x'); post-ADR the reader populates them and
+		// this refusal stops a cross-engine restore from landing
+		// tables without the source's semantic invariant.
+		if len(tbl.ExcludeConstraints) > 0 {
+			return fmt.Errorf(
+				"%s: table %q carries EXCLUDE constraint %q (PG-only — "+
+					"no MySQL equivalent exists). EXCLUDE constraints are "+
+					"PG-only by definition; cross-engine targets cannot "+
+					"preserve the source's semantic invariant. "+
+					"Recovery: re-run with --exclude-table=%s to skip the "+
+					"table, or migrate to a PG target",
+				contextID, tbl.Name,
+				tbl.ExcludeConstraints[0].Name, tbl.Name,
+			)
+		}
 	}
 	return nil
 }

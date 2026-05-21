@@ -188,6 +188,9 @@ func (r *SchemaReader) ReadSchema(ctx context.Context) (*ir.Schema, error) {
 		if err := r.populateCheckConstraints(ctx, tables); err != nil {
 			return nil, fmt.Errorf("postgres: read check constraints: %w", err)
 		}
+		if err := r.populateExcludeConstraints(ctx, tables); err != nil {
+			return nil, fmt.Errorf("postgres: read exclude constraints: %w", err)
+		}
 		if err := r.populateComments(ctx, tables); err != nil {
 			return nil, fmt.Errorf("postgres: read comments: %w", err)
 		}
@@ -1167,6 +1170,67 @@ func (r *SchemaReader) populateCheckConstraints(ctx context.Context, tables map[
 			Name:        name,
 			Expr:        expr,
 			ExprDialect: dialectName,
+		})
+	}
+	return rows.Err()
+}
+
+// populateExcludeConstraints fills in ExcludeConstraint lists for
+// each table. ADR-0053: closes the silent-fidelity-loss class where
+// pre-ADR sluice never queried contype='x' and therefore silently
+// dropped every EXCLUDE constraint from the IR — landing target
+// tables missing the semantic invariant.
+//
+// pg_get_constraintdef(oid, true) returns the canonical PG form
+// (e.g. "EXCLUDE USING gist (col WITH &&) WHERE (...)" with optional
+// DEFERRABLE/INITIALLY DEFERRED modifiers), MINUS the
+// `ALTER TABLE ... ADD CONSTRAINT <name>` wrapper. The PG writer
+// re-emits it inline as `CONSTRAINT <name> <Definition>` in the
+// CREATE TABLE body (mirroring the CheckConstraint precedent —
+// inline rather than post-create-ALTER).
+//
+// Same-engine PG → PG carries faithfully; cross-engine targets
+// refuse loudly via checkCrossEngineSupportable (MySQL has no
+// EXCLUDE equivalent).
+func (r *SchemaReader) populateExcludeConstraints(ctx context.Context, tables map[string]*ir.Table) error {
+	const q = `
+		SELECT
+			cl.relname AS table_name,
+			con.conname,
+			pg_catalog.pg_get_constraintdef(con.oid, true)
+		FROM   pg_constraint con
+		JOIN   pg_class      cl ON cl.oid = con.conrelid
+		JOIN   pg_namespace  n  ON n.oid  = cl.relnamespace
+		WHERE  n.nspname    = $1
+		  AND  con.contype  = 'x'
+		ORDER  BY cl.relname, con.conname`
+
+	rows, err := r.db.QueryContext(ctx, q, r.schema)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = rows.Close() }()
+
+	for rows.Next() {
+		var tableName, name, definition string
+		if err := rows.Scan(&tableName, &name, &definition); err != nil {
+			return err
+		}
+		t, ok := tables[tableName]
+		if !ok {
+			continue
+		}
+		if definition == "" {
+			return fmt.Errorf(
+				"postgres: pg_get_constraintdef returned empty for "+
+					"EXCLUDE constraint %q on table %q — this is a sluice "+
+					"bug; please report it",
+				name, tableName,
+			)
+		}
+		t.ExcludeConstraints = append(t.ExcludeConstraints, &ir.ExcludeConstraint{
+			Name:       name,
+			Definition: definition,
 		})
 	}
 	return rows.Err()

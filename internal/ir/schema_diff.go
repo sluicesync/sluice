@@ -105,6 +105,7 @@ func (d SchemaDiff) Summary() string {
 		colMissing, colExtra, colMismatched int
 		idxMissing, idxExtra                int
 		chkMissing, chkExtra, chkMismatched int
+		exMissing, exExtra, exMismatched    int
 	)
 	for _, td := range d.TablesMismatched {
 		colMissing += len(td.ColumnsMissing)
@@ -115,6 +116,9 @@ func (d SchemaDiff) Summary() string {
 		chkMissing += len(td.ChecksMissing)
 		chkExtra += len(td.ChecksExtra)
 		chkMismatched += len(td.ChecksMismatched)
+		exMissing += len(td.ExcludesMissing)
+		exExtra += len(td.ExcludesExtra)
+		exMismatched += len(td.ExcludesMismatched)
 	}
 	add(colMissing, "missing column", "missing columns")
 	add(colExtra, "extra column", "extra columns")
@@ -124,6 +128,9 @@ func (d SchemaDiff) Summary() string {
 	add(chkMissing, "missing CHECK", "missing CHECKs")
 	add(chkExtra, "extra CHECK", "extra CHECKs")
 	add(chkMismatched, "CHECK mismatch", "CHECK mismatches")
+	add(exMissing, "missing EXCLUDE", "missing EXCLUDEs")
+	add(exExtra, "extra EXCLUDE", "extra EXCLUDEs")
+	add(exMismatched, "EXCLUDE mismatch", "EXCLUDE mismatches")
 	add(len(d.ViewsMissing), "missing view", "missing views")
 	add(len(d.ViewsExtra), "extra view", "extra views")
 	add(len(d.ViewsMismatched), "view mismatch", "view mismatches")
@@ -146,6 +153,12 @@ type TableDiff struct {
 	ChecksMissing     []string     `json:"checks_missing,omitempty"`
 	ChecksExtra       []string     `json:"checks_extra,omitempty"`
 	ChecksMismatched  []CheckDiff  `json:"checks_mismatched,omitempty"`
+	// EXCLUDE constraint deltas (ADR-0053). PG-only; MySQL sides always
+	// have empty slices. Definition equality is byte-exact against PG's
+	// canonical pg_get_constraintdef output.
+	ExcludesMissing    []string      `json:"excludes_missing,omitempty"`
+	ExcludesExtra      []string      `json:"excludes_extra,omitempty"`
+	ExcludesMismatched []ExcludeDiff `json:"excludes_mismatched,omitempty"`
 }
 
 // ColumnDiff captures a single column's expected-vs-actual mismatch.
@@ -235,6 +248,18 @@ type CheckDiff struct {
 	Name         string `json:"name"`
 	ExpectedExpr string `json:"expected_expr,omitempty"`
 	ActualExpr   string `json:"actual_expr,omitempty"`
+}
+
+// ExcludeDiff captures a single EXCLUDE constraint's
+// expected-vs-actual Definition mismatch. Only used when a constraint
+// with the same Name appears on both sides but the Definition
+// (pg_get_constraintdef byte-text) differs. EXCLUDE constraints
+// missing from one side surface in TableDiff.ExcludesMissing /
+// ExcludesExtra (set semantics, by name). ADR-0053.
+type ExcludeDiff struct {
+	Name               string `json:"name"`
+	ExpectedDefinition string `json:"expected_definition,omitempty"`
+	ActualDefinition   string `json:"actual_definition,omitempty"`
 }
 
 // DiffOptions configures DiffSchemas. The zero value is the strict
@@ -391,7 +416,10 @@ func (td TableDiff) hasChanges() bool {
 		len(td.IndexesExtra) > 0 ||
 		len(td.ChecksMissing) > 0 ||
 		len(td.ChecksExtra) > 0 ||
-		len(td.ChecksMismatched) > 0
+		len(td.ChecksMismatched) > 0 ||
+		len(td.ExcludesMissing) > 0 ||
+		len(td.ExcludesExtra) > 0 ||
+		len(td.ExcludesMismatched) > 0
 }
 
 func diffTable(expected, actual *Table, opts DiffOptions) TableDiff {
@@ -455,6 +483,7 @@ func diffTable(expected, actual *Table, opts DiffOptions) TableDiff {
 	}
 
 	diffChecks(&td, expected, actual, opts)
+	diffExcludes(&td, expected, actual, opts)
 
 	return td
 }
@@ -823,6 +852,72 @@ func checksByName(t *Table) map[string]*CheckConstraint {
 		out[c.Name] = c
 	}
 	return out
+}
+
+// excludesByName indexes a table's ExcludeConstraints by name.
+// Unnamed entries (Name == "") are skipped on the same rationale as
+// checksByName — the PG schema reader always assigns a name (system-
+// generated when not explicitly named at source), so an unnamed
+// entry would mean a corrupt or hand-built IR. ADR-0053.
+func excludesByName(t *Table) map[string]*ExcludeConstraint {
+	out := make(map[string]*ExcludeConstraint, len(t.ExcludeConstraints))
+	for _, c := range t.ExcludeConstraints {
+		if c == nil || c.Name == "" {
+			continue
+		}
+		out[c.Name] = c
+	}
+	return out
+}
+
+// diffExcludes populates the EXCLUDE-related slices on td. EXCLUDE
+// constraints are matched by Name (set semantics, same as CHECKs).
+// Definition equality is byte-exact: PG's pg_get_constraintdef is
+// canonicalized server-side, so two structurally-identical
+// constraints produce byte-identical text — any divergence (even
+// whitespace) is treated as a real change (operator hand-edited the
+// target / target PG version normalised differently). ADR-0053.
+func diffExcludes(td *TableDiff, expected, actual *Table, opts DiffOptions) {
+	expExcl := excludesByName(expected)
+	actExcl := excludesByName(actual)
+
+	for name := range expExcl {
+		if _, ok := actExcl[name]; !ok {
+			td.ExcludesMissing = append(td.ExcludesMissing, name)
+		}
+	}
+	sort.Strings(td.ExcludesMissing)
+
+	if !opts.IgnoreExtras {
+		for name := range actExcl {
+			if _, ok := expExcl[name]; !ok {
+				td.ExcludesExtra = append(td.ExcludesExtra, name)
+			}
+		}
+		sort.Strings(td.ExcludesExtra)
+	}
+
+	common := make([]string, 0, len(expExcl))
+	for name := range expExcl {
+		if _, ok := actExcl[name]; ok {
+			common = append(common, name)
+		}
+	}
+	sort.Strings(common)
+	for _, name := range common {
+		exp := expExcl[name]
+		act := actExcl[name]
+		expDef := strings.TrimSpace(exp.Definition)
+		actDef := strings.TrimSpace(act.Definition)
+		if expDef == actDef {
+			continue
+		}
+		td.ExcludesMismatched = append(td.ExcludesMismatched, ExcludeDiff{
+			Name:               name,
+			ExpectedDefinition: expDef,
+			ActualDefinition:   actDef,
+		})
+	}
 }
 
 // indexNames returns the set of named indexes on t — both the primary

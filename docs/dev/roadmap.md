@@ -606,8 +606,16 @@ update; promoted on operator demand because each has known text-IO /
 locale / dialect quirks worth per-type validation.
 
 **Follow-up.** EXCLUDE USING gist (… WITH &&) constraints on range
-columns (a separate IR surface) remain out of scope per ADR-0051;
-tracked separately. Loud-not-silent until promoted.
+columns — **SHIPPED 2026-05-21 ([ADR-0053](adr/adr-0053-exclude-constraint-verbatim-carry.md)).**
+Pre-ADR investigation discovered the gap was worse than originally
+framed: the PG schema reader never queried `contype='x'`, so EXCLUDE
+constraints were *silently dropped* from the IR rather than
+loud-refused. ADR-0053 adds `ir.ExcludeConstraint` (verbatim-text via
+`pg_get_constraintdef`, sibling tier to this entry's range-type
+carry) + the reader query + inline DDL emit + cross-engine refusal +
+schema-diff support. Same-engine PG → PG carries faithfully;
+PG → MySQL refuses loudly at preflight rather than dropping silently
+at runtime.
 
 ---
 

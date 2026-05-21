@@ -111,6 +111,12 @@ type Table struct {
 	// engines normalize them into information_schema as table-level
 	// entries, and the IR mirrors that.
 	CheckConstraints []*CheckConstraint
+	// ExcludeConstraints declared on this table (PostgreSQL only).
+	// Carried verbatim via pg_get_constraintdef; cross-engine targets
+	// (MySQL) refuse loudly because no equivalent exists. ADR-0053.
+	// MySQL sources never populate this slice (MySQL has no EXCLUDE
+	// constraint type).
+	ExcludeConstraints []*ExcludeConstraint
 	// Comment is the table-level comment, if any.
 	Comment string
 }
@@ -140,6 +146,33 @@ type CheckConstraint struct {
 	// cross-dialect translation pass first. See ADR-0016 for the
 	// layered translation policy.
 	ExprDialect string
+}
+
+// ExcludeConstraint represents a PostgreSQL EXCLUDE constraint
+// (pg_constraint.contype = 'x'). PG-only by nature — MySQL has no
+// equivalent. Carried verbatim via pg_get_constraintdef as opaque
+// text: same shape as ir.VerbatimType (ADR-0051), sibling tier for
+// the constraint surface. Cross-engine targets refuse loudly via
+// checkCrossEngineSupportable; same-engine PG → PG re-emits the
+// Definition string literally. ADR-0053.
+type ExcludeConstraint struct {
+	// Name is the constraint name (system-generated when not
+	// explicitly named at source). Preserved through DDL emit so a
+	// target's pg_dump shape stays diffable against the source.
+	Name string
+	// Definition is the verbatim pg_get_constraintdef output for
+	// this constraint — the constraint body without the `ALTER
+	// TABLE … ADD CONSTRAINT <name>` wrapper. Example values:
+	//   "EXCLUDE USING gist (builds_id_range WITH &&) WHERE ((builds_id_range IS NOT NULL))"
+	//   "EXCLUDE USING gist (rotation_id WITH =, tstzrange(starts_at, ends_at, '[)'::text) WITH &&)"
+	//   "EXCLUDE USING gist (...) WHERE (...) DEFERRABLE INITIALLY DEFERRED"
+	// Includes USING <index_method>, (col WITH op) pairs, optional
+	// WHERE predicate, and DEFERRABLE modifiers — everything the PG
+	// writer needs to re-emit identically. Empty Definition is a
+	// sluice-bug condition (the reader should never populate the
+	// slice with an empty entry); the PG writer refuses loudly if
+	// seen.
+	Definition string
 }
 
 // Column describes a single column.

@@ -72,6 +72,59 @@ func TestCheckCrossEngineSupportable_UnknownPairOK(t *testing.T) {
 	}
 }
 
+// ADR-0053: PG → MySQL with an EXCLUDE constraint must refuse loudly.
+// MySQL has no equivalent type or semantics; pre-ADR sluice silently
+// dropped the constraint from the IR (the reader never queried
+// contype='x'), so a cross-engine restore landed tables missing the
+// source's semantic invariant. The refusal stops that silent loss.
+func TestCheckCrossEngineSupportable_PGtoMySQL_ExcludeRefuses(t *testing.T) {
+	s := &ir.Schema{Tables: []*ir.Table{{
+		Name: "ci_partitions",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}},
+		},
+		ExcludeConstraints: []*ir.ExcludeConstraint{{
+			Name:       "check_ci_partitions_builds_id_range_no_overlap",
+			Definition: "EXCLUDE USING gist (builds_id_range WITH &&)",
+		}},
+	}}}
+	err := checkCrossEngineSupportable(s, "postgres", "mysql", "test")
+	if err == nil {
+		t.Fatal("PG → MySQL with EXCLUDE: expected refusal, got nil")
+	}
+	// Operator-actionable message must name the constraint, the table,
+	// and the --exclude-table recovery flag.
+	msg := err.Error()
+	wantSubstrings := []string{
+		"EXCLUDE constraint",
+		"check_ci_partitions_builds_id_range_no_overlap",
+		"ci_partitions",
+		"--exclude-table",
+	}
+	for _, want := range wantSubstrings {
+		if !strings.Contains(msg, want) {
+			t.Errorf("refusal message missing %q\n--- got ---\n%s", want, msg)
+		}
+	}
+}
+
+// ADR-0053: PG → PG with an EXCLUDE constraint must NOT refuse
+// (same-engine carries verbatim). Regression guard against an
+// accidentally-too-broad refusal that would block the load-bearing
+// happy path.
+func TestCheckCrossEngineSupportable_PGtoPG_ExcludeAllowed(t *testing.T) {
+	s := &ir.Schema{Tables: []*ir.Table{{
+		Name: "ci_partitions",
+		ExcludeConstraints: []*ir.ExcludeConstraint{{
+			Name:       "ex",
+			Definition: "EXCLUDE USING gist (builds_id_range WITH &&)",
+		}},
+	}}}
+	if err := checkCrossEngineSupportable(s, "postgres", "postgres", "test"); err != nil {
+		t.Errorf("PG → PG with EXCLUDE err = %v; want nil (same-engine carry)", err)
+	}
+}
+
 // TestCheckCrossEngineDeltaSupportable_AddTableWithPostGISAllowed
 // asserts the post-ADR-0035 behaviour: an incremental that adds a
 // table with a geometry column no longer refuses PG → MySQL.

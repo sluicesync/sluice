@@ -664,6 +664,108 @@ func TestDiffSchemas_Summary_IncludesNewCategories(t *testing.T) {
 	}
 }
 
+// ADR-0053 EXCLUDE constraint diff tests. Mirror the CHECK shape
+// exactly — EXCLUDE constraints follow the same set-semantics
+// (matched by Name; Definition equality byte-exact). PG-only; MySQL
+// sides always carry empty slices.
+
+func TestDiffSchemas_ExcludeConstraintMissingExtra(t *testing.T) {
+	exp := &Schema{Tables: []*Table{{
+		Name:    "t",
+		Columns: []*Column{{Name: "id", Type: Integer{Width: 64}}},
+		ExcludeConstraints: []*ExcludeConstraint{
+			{Name: "range_no_overlap", Definition: "EXCLUDE USING gist (id WITH =)"},
+		},
+	}}}
+	act := &Schema{Tables: []*Table{{
+		Name:    "t",
+		Columns: []*Column{{Name: "id", Type: Integer{Width: 64}}},
+		ExcludeConstraints: []*ExcludeConstraint{
+			{Name: "legacy_overlap", Definition: "EXCLUDE USING gist (id WITH &&)"},
+		},
+	}}}
+	d := DiffSchemas(exp, act, DiffOptions{})
+	td := d.TablesMismatched[0]
+	if !reflect.DeepEqual(td.ExcludesMissing, []string{"range_no_overlap"}) {
+		t.Errorf("missing excludes = %v; want [range_no_overlap]", td.ExcludesMissing)
+	}
+	if !reflect.DeepEqual(td.ExcludesExtra, []string{"legacy_overlap"}) {
+		t.Errorf("extra excludes = %v; want [legacy_overlap]", td.ExcludesExtra)
+	}
+}
+
+func TestDiffSchemas_ExcludeConstraintDefinitionMismatch(t *testing.T) {
+	// Byte-exact Definition equality — predicate-whitespace difference
+	// surfaces as a real mismatch (pg_get_constraintdef is server-
+	// canonicalized so a real divergence here means hand-edit on one
+	// side).
+	exp := &Schema{Tables: []*Table{{
+		Name: "t",
+		ExcludeConstraints: []*ExcludeConstraint{
+			{Name: "ex", Definition: "EXCLUDE USING gist (id WITH &&) WHERE (id > 0)"},
+		},
+	}}}
+	act := &Schema{Tables: []*Table{{
+		Name: "t",
+		ExcludeConstraints: []*ExcludeConstraint{
+			{Name: "ex", Definition: "EXCLUDE USING gist (id WITH &&) WHERE ((id > 0))"},
+		},
+	}}}
+	d := DiffSchemas(exp, act, DiffOptions{})
+	td := d.TablesMismatched[0]
+	if len(td.ExcludesMismatched) != 1 {
+		t.Fatalf("expected one EXCLUDE mismatch; got %+v", td)
+	}
+	ed := td.ExcludesMismatched[0]
+	if ed.Name != "ex" {
+		t.Errorf("mismatch Name = %q; want %q", ed.Name, "ex")
+	}
+	if !strings.Contains(ed.ExpectedDefinition, "(id > 0)") {
+		t.Errorf("ExpectedDefinition lost predicate: %q", ed.ExpectedDefinition)
+	}
+	if !strings.Contains(ed.ActualDefinition, "((id > 0))") {
+		t.Errorf("ActualDefinition lost predicate: %q", ed.ActualDefinition)
+	}
+}
+
+func TestDiffSchemas_ExcludeConstraintIgnoreExtras(t *testing.T) {
+	exp := &Schema{Tables: []*Table{{Name: "t"}}}
+	act := &Schema{Tables: []*Table{{
+		Name: "t",
+		ExcludeConstraints: []*ExcludeConstraint{
+			{Name: "legacy_overlap", Definition: "EXCLUDE USING gist (id WITH &&)"},
+		},
+	}}}
+	d := DiffSchemas(exp, act, DiffOptions{IgnoreExtras: true})
+	if d.HasChanges() {
+		t.Errorf("expected no drift under IgnoreExtras for extra EXCLUDE; got %+v", d)
+	}
+}
+
+func TestDiffSchemas_Summary_IncludesExcludeCategories(t *testing.T) {
+	exp := &Schema{Tables: []*Table{{
+		Name: "t",
+		ExcludeConstraints: []*ExcludeConstraint{
+			{Name: "a", Definition: "EXCLUDE USING gist (id WITH &&)"},
+			{Name: "b", Definition: "EXCLUDE USING gist (id WITH =)"},
+		},
+	}}}
+	act := &Schema{Tables: []*Table{{
+		Name: "t",
+		ExcludeConstraints: []*ExcludeConstraint{
+			{Name: "b", Definition: "EXCLUDE USING gist (id WITH <>)"},
+			{Name: "c", Definition: "EXCLUDE USING gist (id WITH @>)"},
+		},
+	}}}
+	d := DiffSchemas(exp, act, DiffOptions{})
+	got := d.Summary()
+	for _, want := range []string{"missing EXCLUDE", "extra EXCLUDE", "EXCLUDE mismatch"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("summary %q missing %q", got, want)
+		}
+	}
+}
+
 // TestDiffSchemas_ViewsMissingAndExtra covers the view-level
 // missing/extra set-semantics added in the view-support Phase 1
 // commit. Mirrors TestDiffSchemas_TableMissingAndExtra.

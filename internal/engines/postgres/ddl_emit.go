@@ -876,6 +876,27 @@ func emitTableDef(schema string, table *ir.Table, opts emitOpts) (string, error)
 		parts = append(parts, emitCheckConstraint(chk, table, opts))
 	}
 
+	// ADR-0053: EXCLUDE constraints emit inline alongside CHECKs.
+	// Each ir.ExcludeConstraint.Definition is the pg_get_constraintdef
+	// body (no `ALTER TABLE ... ADD CONSTRAINT <name>` wrapper);
+	// prefix with `CONSTRAINT <name>` to produce a valid CREATE TABLE
+	// clause. Empty Definition is a sluice-bug condition the reader
+	// should have refused — surface loudly if it ever reaches the
+	// writer.
+	for _, ex := range table.ExcludeConstraints {
+		if ex.Definition == "" {
+			return "", fmt.Errorf(
+				"postgres: ExcludeConstraint %q on %s has empty "+
+					"Definition — this is a sluice bug; the reader should "+
+					"have refused upstream",
+				ex.Name, table.Name,
+			)
+		}
+		parts = append(parts, fmt.Sprintf(
+			"CONSTRAINT %s %s", quoteIdent(ex.Name), ex.Definition,
+		))
+	}
+
 	if table.PrimaryKey != nil {
 		parts = append(parts, "PRIMARY KEY "+emitIndexColumnList(table.PrimaryKey.Columns, opts))
 	}
