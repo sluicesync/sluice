@@ -188,6 +188,20 @@ type ChangeApplier struct {
 	// [SetRedactor]; nil/empty is the no-redactions hot path.
 	redactor *redact.Registry
 
+	// shardColumn / shardValue are the operator-configured
+	// Shape-A discriminator (ADR-0048; CLI:
+	// `--inject-shard-column NAME=VALUE`). When shardColumn != "",
+	// the apply path stamps row[shardColumn]=shardValue onto every
+	// row-bearing change (Insert.Row, Update.Before+After,
+	// Delete.Before) before dispatch, the same way the bulk-copy
+	// path stamps via the orchestrator-side
+	// [internal/pipeline.shardStampRows]. Set via
+	// [SetShardColumn] (the [ir.ShardColumnSetter] surface). Empty
+	// shardColumn is the no-stamp hot path — pre-ADR-0048 single-
+	// source streams pay zero cost.
+	shardColumn string
+	shardValue  any
+
 	// streamID is the active stream's identifier, recorded by
 	// [SetStreamID] at Streamer startup. Threaded through every
 	// redactor.ApplyRow call so randomize:* strategies (PII Phase 2.c,
@@ -348,6 +362,64 @@ func (a *ChangeApplier) SetRedactor(registry any) {
 // per-row seed for randomize:* strategies. Idempotent.
 func (a *ChangeApplier) SetStreamID(streamID string) {
 	a.streamID = streamID
+}
+
+// SetShardColumn implements [ir.ShardColumnSetter] (ADR-0048
+// Shape A; DP-1 resolved 2026-05-21 to option (a) — the
+// two-surface split). Records the operator-supplied discriminator
+// column name + value so the apply path stamps it onto every
+// row-bearing change (Insert.Row, Update.Before+After,
+// Delete.Before) before dispatch, the same way bulk-copy's
+// orchestrator-side wrap stamps the same column.
+//
+// Empty name clears the wiring (no-stamp default; the pre-
+// ADR-0048 single-source hot path). Idempotent; the streamer may
+// call this on every Run.
+func (a *ChangeApplier) SetShardColumn(name string, value any) {
+	a.shardColumn = name
+	a.shardValue = value
+}
+
+// stampShardChange stamps the operator-supplied discriminator
+// onto every row-bearing change before dispatch. Empty
+// shardColumn is the no-op fast path. PII Phase 1.5's
+// `redactChange` is the sibling pattern — both run pre-dispatch,
+// both mutate the change's row map in place, both have the same
+// {Insert.Row, Update.Before/After, Delete.Before} scope.
+// Truncate / TxBegin / TxCommit / SchemaSnapshot carry no row
+// data; pass-through.
+//
+// Stamping happens AFTER redactChange (redaction runs first per
+// the existing call order in applyOne / applyOneBatch), so a
+// redaction strategy that strips/overrides the discriminator
+// column would land before the stamp restores it. The
+// discriminator's IR column is sluice-injected (the operator's
+// source schema cannot match a redaction rule against it), so in
+// practice the order is observable only as a future-proofing
+// guarantee.
+func (a *ChangeApplier) stampShardChange(c ir.Change) {
+	if a.shardColumn == "" {
+		return
+	}
+	name := a.shardColumn
+	val := a.shardValue
+	switch v := c.(type) {
+	case ir.Insert:
+		if v.Row != nil {
+			v.Row[name] = val
+		}
+	case ir.Update:
+		if v.Before != nil {
+			v.Before[name] = val
+		}
+		if v.After != nil {
+			v.After[name] = val
+		}
+	case ir.Delete:
+		if v.Before != nil {
+			v.Before[name] = val
+		}
+	}
 }
 
 // SetBatchSizeProvider implements [ir.BatchSizeProviderSetter]
@@ -757,6 +829,11 @@ func (a *ChangeApplier) applyOne(ctx context.Context, streamID string, c ir.Chan
 	if err := a.redactChange(ctx, c); err != nil {
 		return classifyApplierError(fmt.Errorf("mysql: applier: redact: %w", err))
 	}
+	// ADR-0048 Shape A: stamp the operator-supplied discriminator
+	// (`--inject-shard-column NAME=VALUE`) onto every row-bearing
+	// change before dispatch. Empty shardColumn is a no-op fast
+	// path — single-source streams pay zero cost.
+	a.stampShardChange(c)
 	tx, err := a.db.BeginTx(ctx, nil)
 	if err != nil {
 		return classifyApplierError(fmt.Errorf("mysql: applier: begin tx: %w", err))

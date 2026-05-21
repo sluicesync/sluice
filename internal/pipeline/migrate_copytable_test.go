@@ -91,7 +91,7 @@ func TestCopyTable_CancelsReaderOnWriterError(t *testing.T) {
 	table := &ir.Table{Name: "comments", Columns: []*ir.Column{{Name: "id"}}}
 
 	ctx := context.Background()
-	err := copyTable(ctx, rr, rw, table, nil)
+	err := copyTable(ctx, rr, rw, table, nil, ShardColumnSpec{})
 	if err == nil {
 		t.Fatal("expected copyTable to surface the writer error; got nil")
 	}
@@ -119,7 +119,7 @@ func TestCopyTable_LogsAbortedNotComplete(t *testing.T) {
 	rw := &erroringWriter{consume: 5, err: errors.New("collision")}
 	table := &ir.Table{Name: "comments", Columns: []*ir.Column{{Name: "id"}}}
 
-	if err := copyTable(context.Background(), rr, rw, table, nil); err == nil {
+	if err := copyTable(context.Background(), rr, rw, table, nil, ShardColumnSpec{}); err == nil {
 		t.Fatal("expected error; got nil")
 	}
 
@@ -142,7 +142,7 @@ func TestCopyTable_SuccessLogsComplete(t *testing.T) {
 	rw := &drainingWriter{}
 	table := &ir.Table{Name: "users", Columns: []*ir.Column{{Name: "id"}}}
 
-	if err := copyTable(context.Background(), rr, rw, table, nil); err != nil {
+	if err := copyTable(context.Background(), rr, rw, table, nil, ShardColumnSpec{}); err != nil {
 		t.Fatalf("copyTable: %v", err)
 	}
 
@@ -174,7 +174,7 @@ func TestCopyTable_SurfacesReaderStreamError(t *testing.T) {
 	rw := &drainingWriter{} // drains everything, returns nil — the dangerous case
 	table := &ir.Table{Name: "md", Columns: []*ir.Column{{Name: "id"}}}
 
-	err := copyTable(context.Background(), rr, rw, table, nil)
+	err := copyTable(context.Background(), rr, rw, table, nil, ShardColumnSpec{})
 	if err == nil {
 		t.Fatal("Bug 68: copyTable returned nil despite a mid-stream reader error; this is the silent total-row-loss class")
 	}

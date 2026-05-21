@@ -230,6 +230,7 @@ func tryParallelCopyTable(
 	resuming bool,
 	bulkBatchSize int,
 	redactor *redact.Registry,
+	shard ShardColumnSpec,
 ) (bool, error) {
 	if deps == nil || deps.parallelism <= 1 {
 		return false, nil
@@ -267,7 +268,7 @@ func tryParallelCopyTable(
 		return false, nil
 	}
 
-	if err := runChunks(ctx, rc, state, stateMu, primaryRows, primaryRW, deps, table, chunks, bulkBatchSize, redactor, resuming); err != nil {
+	if err := runChunks(ctx, rc, state, stateMu, primaryRows, primaryRW, deps, table, chunks, bulkBatchSize, redactor, shard, resuming); err != nil {
 		return false, err
 	}
 
@@ -371,6 +372,7 @@ func runChunks(
 	chunks []ir.TableChunkProgress,
 	bulkBatchSize int,
 	redactor *redact.Registry,
+	shard ShardColumnSpec,
 	resuming bool,
 ) error {
 	additionalReaders, additionalWriters, closeFns, err := openChunkConnections(ctx, deps, len(chunks)-1)
@@ -402,7 +404,7 @@ func runChunks(
 			chunkRW = additionalWriters[k-1]
 		}
 		g.Go(func() error {
-			return copyChunk(gctx, rc, state, stateMu, chunkRows, chunkRW, table, pkCols, k, limit, redactor, resuming, deps.forceColdStart)
+			return copyChunk(gctx, rc, state, stateMu, chunkRows, chunkRW, table, pkCols, k, limit, redactor, shard, resuming, deps.forceColdStart)
 		})
 	}
 	return g.Wait()
@@ -482,6 +484,7 @@ func copyChunk(
 	chunkIndex int,
 	limit int,
 	redactor *redact.Registry,
+	shard ShardColumnSpec,
 	resuming bool,
 	forceColdStart bool,
 ) (retErr error) {
@@ -514,7 +517,7 @@ func copyChunk(
 	// loader; otherwise it falls through to the idempotent branch,
 	// which additionally requires the IdempotentRowWriter surface.
 	if useFastLoader(resuming, forceColdStart, chunk) {
-		return copyChunkFast(ctx, rc, state, stateMu, br, rw, table, pkCols, chunkIndex, chunk, limit, redactor)
+		return copyChunkFast(ctx, rc, state, stateMu, br, rw, table, pkCols, chunkIndex, chunk, limit, redactor, shard)
 	}
 
 	iw, ok := rw.(ir.IdempotentRowWriter)
@@ -579,7 +582,11 @@ func copyChunk(
 		teed := teePKAndCount(batchCtx, filtered, tracker, &batchCount, pt.observeRow)
 		// PII Phase 1: same redact-wrap as [copyTable].
 		redacted, redactErrFn := redactRows(batchCtx, teed, redactor, table.Schema, table.Name, table.Columns, pkCols, "")
-		if err := iw.WriteRowsIdempotent(batchCtx, table, redacted); err != nil {
+		// ADR-0048 Shape A: per-row discriminator stamp (see
+		// copyTableWithCursor for the same shape). Zero-cost
+		// passthrough when shard.Name is empty.
+		stamped, _ := shardStampRows(batchCtx, redacted, shard.Name, shard.Value)
+		if err := iw.WriteRowsIdempotent(batchCtx, table, stamped); err != nil {
 			cancel()
 			return fmt.Errorf("write chunk %d batch: %w", chunkIndex, err)
 		}
@@ -742,6 +749,7 @@ func copyChunkFast(
 	chunk ir.TableChunkProgress,
 	limit int,
 	redactor *redact.Registry,
+	shard ShardColumnSpec,
 ) (retErr error) {
 	// ADR-0042 Phase A — per-chunk wall-time instrumentation (kept;
 	// permanent diagnostic). On the fast path there is one logical
@@ -837,13 +845,16 @@ func copyChunkFast(
 
 	// PII Phase 1: same redact-wrap as the idempotent loop / copyTable.
 	redacted, redactErrFn := redactRows(streamCtx, out, redactor, table.Schema, table.Name, table.Columns, pkCols, "")
+	// ADR-0048 Shape A: per-row discriminator stamp. Zero-cost
+	// passthrough when shard.Name is empty.
+	stamped, _ := shardStampRows(streamCtx, redacted, shard.Name, shard.Value)
 
 	// One native bulk-load call for the whole chunk range. WriteRows
-	// drains `redacted` until the pump closes `out`; PG runs a single
+	// drains `stamped` until the pump closes `out`; PG runs a single
 	// CopyFrom, MySQL a single LOAD DATA (each with its automatic
 	// fallback to batched INSERT — still non-upsert, still safe on a
 	// proven-empty cold chunk).
-	writeErr := rw.WriteRows(streamCtx, table, redacted)
+	writeErr := rw.WriteRows(streamCtx, table, stamped)
 
 	// On a writer-side error WriteRows may have returned without
 	// draining `out`, leaving the pump blocked on `out <- row`.

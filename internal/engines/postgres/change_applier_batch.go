@@ -215,6 +215,10 @@ func (a *ChangeApplier) applyOneBatch(ctx context.Context, streamID string, chan
 	if err := a.redactChange(ctx, first); err != nil {
 		return 0, ir.Position{}, false, classifyApplierError(fmt.Errorf("postgres: applier: redact: %w", err))
 	}
+	// ADR-0048 Shape A: stamp the operator-supplied discriminator
+	// onto the first change before dispatch (sibling-tier to the
+	// redact call above). Empty shardColumn is a no-op fast path.
+	a.stampShardChange(first)
 
 	tx, err := a.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -309,6 +313,11 @@ func (a *ChangeApplier) applyOneBatch(ctx context.Context, streamID string, chan
 				_ = tx.Rollback()
 				return 0, ir.Position{}, false, classifyApplierError(fmt.Errorf("postgres: applier: redact: %w", err))
 			}
+			// ADR-0048 Shape A: stamp the operator-supplied
+			// discriminator onto each subsequent batch member
+			// before dispatch (sibling-tier to the redact call
+			// above). Empty shardColumn is a no-op fast path.
+			a.stampShardChange(c)
 			if err := a.dispatch(ctx, tx, streamID, c); err != nil {
 				_ = tx.Rollback()
 				slog.WarnContext(

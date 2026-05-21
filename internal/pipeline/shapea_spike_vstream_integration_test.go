@@ -3,26 +3,24 @@
 // Copyright 2026 Omar Ramos
 // SPDX-License-Identifier: Apache-2.0
 
-// SPIKE harness — Multi-source aggregation Shape A (roadmap §4).
+// Integration test — Multi-source aggregation Shape A (ADR-0048).
 //
-// THIS IS A DESIGN-FIRST SPIKE, NOT A SHIPPED FEATURE. It exists to
-// surface the *real* design pain of Shape A's three pieces by running
-// a sharded Vitess source into a single consolidated target, rather
-// than theorizing. The accompanying design evidence lives in:
+// LANDED 2026-05-21. ADR-0048 was originally accepted design-only
+// with implementation demand-gated per roadmap §4; the operator-
+// direction lifted that gate and the implementation landed. This
+// file was the design-first spike that surfaced the actual design
+// pain; with the real APIs in place (translate.InjectShardColumn,
+// pipeline.shardStampRows, pipeline.preflightShardConsolidation,
+// ir.ShardColumnSetter), the spike's throwaway helpers have been
+// REPLACED with calls to those real APIs. The harness now serves
+// as the permanent Shape-A integration artifact under the
+// `integration vstream` tag — exercising sharded Vitess → both
+// consolidated PG and same-engine MySQL targets end-to-end.
 //
-//   - docs/dev/notes/prep-multi-source-shape-a.md (the prep/research doc)
-//   - docs/adr/adr-0048-multi-source-aggregation-shape-a.md (Proposed ADR)
+// Design evidence (kept for archaeology):
 //
-// Nothing in this file is wired into production code. The
-// `injectShardColumn*` helpers below are THROWAWAY exploratory
-// prototypes that simulate, at the test level, what an IR-stage
-// discriminator-injection transform *would* do — they are clearly
-// marked and deliberately live only in this build-tagged test file so
-// the spike can observe behaviour end-to-end without committing a
-// production surface. If Shape A is greenlit, the real transform lands
-// in internal/translate/ (see the ADR's "Decision" section) and this
-// file becomes the permanent integration artifact (drop the
-// throwaway helpers, point at the real transform).
+//   - docs/dev/notes/prep-multi-source-shape-a.md (prep/research)
+//   - docs/adr/adr-0048-multi-source-aggregation-shape-a.md (Accepted)
 //
 // Build tag rationale: reuses the existing `vstream` tag (not a new
 // one). The spike's defining cost is the vitess/vttestserver image
@@ -58,6 +56,7 @@ import (
 
 	"github.com/orware/sluice/internal/engines"
 	"github.com/orware/sluice/internal/ir"
+	"github.com/orware/sluice/internal/translate"
 
 	_ "github.com/orware/sluice/internal/engines/mysql"
 	_ "github.com/orware/sluice/internal/engines/postgres"
@@ -277,81 +276,18 @@ func pgStrings(t *testing.T, dsn, query string) []string {
 	return out
 }
 
-// =====================================================================
-// THROWAWAY EXPLORATORY PROTOTYPE — discriminator-column injection.
+// (Phase 7 migration 2026-05-21) The previous throwaway helpers
+// — `injectShardColumnIntoSchema` + `shardValueRowReader` — were
+// REPLACED by direct calls to the shipped APIs:
 //
-// This simulates, at the test level, an IR-stage transform that adds
-// a sluice-injected `source_shard_id` column to a table and rewrites
-// the PK to be composite (shard, source_pk). The REAL design must live
-// in internal/translate/ as a pure IR pass (see ADR-0048 Decision 1).
-// It is reproduced here ONLY so the spike can run end-to-end and the
-// prep-doc can record the OBSERVED pain (PK rewrite, value population,
-// diff/verify drift). DO NOT promote this code; it is intentionally
-// crude (no column-origin marker, no IdempotentRowWriter PK plumbing,
-// no CDC-path coverage) precisely so the gaps are visible.
-// =====================================================================
-
-// injectShardColumnIntoSchema returns a deep-ish copy of schema with
-// `colName` (BIGINT NOT NULL) appended to every table and folded into
-// the PK as the leading column. Crude on purpose — see banner.
-func injectShardColumnIntoSchema(schema *ir.Schema, colName string) *ir.Schema {
-	out := &ir.Schema{Views: schema.Views}
-	for _, tbl := range schema.Tables {
-		nt := *tbl
-		nt.Columns = append(append([]*ir.Column{}, tbl.Columns...), &ir.Column{
-			Name:     colName,
-			Type:     ir.Integer{Width: 64},
-			Nullable: false,
-			// NOTE (spike finding): there is no IR field to mark this
-			// column as sluice-injected vs source-derived. The real
-			// design needs one (ADR-0048 Decision 1) or diff/verify
-			// flags it as drift — observed below in
-			// assertConsolidatedSchema's commentary.
-		})
-		if tbl.PrimaryKey != nil {
-			npk := *tbl.PrimaryKey
-			npk.Columns = append([]ir.IndexColumn{{Column: colName}}, tbl.PrimaryKey.Columns...)
-			nt.PrimaryKey = &npk
-		}
-		out.Tables = append(out.Tables, &nt)
-	}
-	return out
-}
-
-// shardValueRowReader wraps an ir.RowReader and stamps every row with
-// the shard's discriminator value. This is the THROWAWAY analogue of
-// what the real value-population step would do; it deliberately sits
-// outside the IR transform to make the "where does population belong?"
-// question concrete in the prep-doc.
-type shardValueRowReader struct {
-	inner    ir.RowReader
-	colName  string
-	shardVal int64
-}
-
-func (r *shardValueRowReader) ReadRows(ctx context.Context, table *ir.Table) (<-chan ir.Row, error) {
-	src, err := r.inner.ReadRows(ctx, table)
-	if err != nil {
-		return nil, err
-	}
-	out := make(chan ir.Row)
-	go func() {
-		defer close(out)
-		for row := range src {
-			row[r.colName] = r.shardVal
-			select {
-			case out <- row:
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
-	return out, nil
-}
-
-// Err delegates to the wrapped reader: this decorator only mutates
-// rows in flight, it has no failure surface of its own.
-func (r *shardValueRowReader) Err() error { return r.inner.Err() }
+//   - schema rewrite → translate.InjectShardColumn (pure IR pass)
+//   - per-row stamp  → pipeline.shardStampRows (orchestrator value wrap)
+//   - preflight      → pipeline.preflightShardConsolidation
+//
+// See runShardConsolidation below for the wiring. The integration
+// surface for the CDC half is exercised separately by the engine-
+// level applier tests + the `ir.ShardColumnSetter` compile-time
+// witness in internal/engines/{mysql,postgres}/change_applier_shape_a_test.go.
 
 // =====================================================================
 // The spike test. Table-driven over the two target engines so the
@@ -512,19 +448,22 @@ type shardConsolidationParams struct {
 }
 
 // runShardConsolidation drives one per-shard stream into the shared
-// consolidated target. It uses the Migrator directly with the
-// THROWAWAY shard-injection wrappers so the spike can observe exactly
-// where the production design has to intervene.
+// consolidated target. Post-Phase-7 (2026-05-21) it uses the SHIPPED
+// APIs end-to-end:
+//   - translate.InjectShardColumn for the IR pass,
+//   - pipeline.preflightShardConsolidation for the populated-target
+//     three-point loud refusal (Decision 3 / DP-2),
+//   - pipeline.shardStampRows for the orchestrator-side per-row
+//     value stamp (DP-1 option (a) — the bulk-copy half).
 func runShardConsolidation(t *testing.T, p shardConsolidationParams) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
 	defer cancel()
 
-	// Read source schema once via the engine so the spike can apply
-	// the throwaway IR-stage injection BEFORE handing it to the
-	// Migrator-equivalent path. NOTE: the production design routes
-	// this through internal/translate (a pure IR pass) — see
-	// ADR-0048. The spike does it inline to keep the harness small.
+	// Read source schema once via the engine and apply the SHIPPED
+	// IR-stage injection. The pass is pure / copy-on-write; the
+	// per-shard value is supplied via ShardColumnSpec to the value
+	// wrap below (DP-1's two-surface split).
 	sr, err := p.srcEng.OpenSchemaReader(ctx, p.srcDSN)
 	if err != nil {
 		t.Fatalf("open source schema reader: %v", err)
@@ -534,7 +473,10 @@ func runShardConsolidation(t *testing.T, p shardConsolidationParams) {
 	if err != nil {
 		t.Fatalf("read source schema: %v", err)
 	}
-	injected := injectShardColumnIntoSchema(schema, p.shardCol)
+	injected, err := translate.InjectShardColumn(schema, p.shardCol, ir.Varchar{Length: 64})
+	if err != nil {
+		t.Fatalf("translate.InjectShardColumn: %v", err)
+	}
 
 	sw, err := p.tgtEng.OpenSchemaWriter(ctx, p.tgtDSN)
 	if err != nil {
@@ -552,34 +494,23 @@ func runShardConsolidation(t *testing.T, p shardConsolidationParams) {
 	}
 	defer closeIf(rr)
 
-	// SPIKE OBSERVATION (Piece 2): on the populated-target pass, run
-	// the existing cold-start preflight to capture its behaviour. We
-	// EXPECT it to refuse (Bug 9), which is the design evidence: the
-	// real Shape-A bypass must replace this with a discriminator-aware
-	// loud preflight, NOT --force-cold-start (which is silent).
-	if p.expectPopulatedTarget {
-		err := preflightColdStart(ctx, injected, rw, false /*force*/, preflightModeMigrate)
-		if err == nil {
-			t.Logf("SPIKE OBSERVATION: populated-target preflight did NOT refuse — unexpected; record in prep-doc Piece 2")
-		} else {
-			t.Logf("SPIKE OBSERVATION (Piece 2): cold-start preflight refused as designed: %v", err)
-			t.Logf("SPIKE OBSERVATION (Piece 2): the production Shape-A path must NOT route around this with --force-cold-start (silent PK-collision corruption). It needs a discriminator-aware loud preflight — see ADR-0048 Decision 2.")
-		}
-		// Proceed past the refusal the way --force-cold-start would,
-		// to demonstrate that the composite PK (shard, source_pk) is
-		// what actually makes the second shard's rows land cleanly —
-		// i.e. the bypass is *correct* IF AND ONLY IF the discriminator
-		// guarantees PK disjointness. That conditional is the entire
-		// design point of Piece 2.
+	// Shape-A populated-target preflight: the LOUD replacement for
+	// --force-cold-start's silent skip. On the first pass (target
+	// empty) every per-table check is short-circuited by the
+	// IsTableEmpty probe; on the second pass the three-point
+	// assertion must pass before any row moves.
+	shardValue := fmt.Sprintf("%d", p.shardVal)
+	if err := preflightShardConsolidation(ctx, injected, rw, p.shardCol, shardValue); err != nil {
+		t.Fatalf("shard preflight refused (shard %d): %v", p.shardVal, err)
 	}
 
 	if err := sw.CreateTablesWithoutConstraints(ctx, injected); err != nil {
 		t.Fatalf("create consolidated table: %v", err)
 	}
 
-	stamped := &shardValueRowReader{inner: rr, colName: p.shardCol, shardVal: p.shardVal}
+	shard := ShardColumnSpec{Name: p.shardCol, Value: shardValue}
 	for _, tbl := range injected.Tables {
-		if err := copyTable(ctx, stamped, rw, tbl, nil /*redactor*/); err != nil {
+		if err := copyTable(ctx, rr, rw, tbl, nil /*redactor*/, shard); err != nil {
 			t.Fatalf("copy table %q (shard %d): %v", tbl.Name, p.shardVal, err)
 		}
 	}

@@ -257,6 +257,53 @@ type Migrator struct {
 	// pre-v0.26.0 behaviour where extension-owned types surface as
 	// loud refusals.
 	EnabledPGExtensions []string
+
+	// InjectShardColumn is the ADR-0048 Shape A discriminator-column
+	// name + value (CLI: `--inject-shard-column NAME=VALUE`). When
+	// non-empty, the orchestrator runs three additional steps:
+	//
+	//   1. [translate.InjectShardColumn] rewrites every PK-bearing
+	//      table's IR — appending the column and making the PK
+	//      composite (discriminator, …source PK). Tables without a
+	//      base PK refuse loudly.
+	//   2. The bulk-copy row stream goes through
+	//      [shardStampRows], which stamps row[name]=value onto
+	//      every row before it reaches the writer.
+	//   3. [preflightShardConsolidation] runs against the target
+	//      and refuses on any of: NULL discriminator on existing
+	//      rows / VALUE already present / non-leading composite PK
+	//      (DP-2 / DP-3 owner-confirmed shapes).
+	//
+	// Empty Name is the no-op default — every existing single-source
+	// migrate path pays zero cost when Shape A isn't engaged.
+	InjectShardColumn ShardColumnSpec
+}
+
+// ShardColumnSpec carries the ADR-0048 Shape A discriminator
+// column the operator opts into via
+// `--inject-shard-column NAME=VALUE`. Both fields must be
+// non-empty for the orchestrator to engage Shape A; an empty
+// Name is the off-default. The pair lives on
+// [Migrator]/[Streamer]/[Previewer]/[Differ] so every entry
+// point can route it through the IR + value paths consistently.
+type ShardColumnSpec struct {
+	// Name is the discriminator column's identifier (e.g.
+	// `source_shard_id`). Required when Shape A is engaged.
+	Name string
+
+	// Value is the per-shard literal the orchestrator stamps onto
+	// every row (e.g. `us-east-1` / `1`). Today the CLI parser
+	// hands a string; the field is `any` so future expansion can
+	// thread an integer or UUID without changing this surface.
+	Value any
+}
+
+// Engaged reports whether the operator has opted into Shape A by
+// supplying both Name and Value. Used as the single
+// branch-condition by every entry point so the off-default path
+// is identical across migrate / sync / preview / diff.
+func (s ShardColumnSpec) Engaged() bool {
+	return s.Name != "" && s.Value != nil
 }
 
 // Run executes the migration. Returns nil on success or a wrapped
@@ -346,6 +393,19 @@ func (m *Migrator) Run(ctx context.Context) error {
 	schema, err = translate.ApplyExpressionOverrides(schema, m.ExpressionMappings)
 	if err != nil {
 		return fmt.Errorf("pipeline: apply expression overrides: %w", err)
+	}
+	// ---- 1.51. Shape A discriminator-column injection (ADR-0048) ----
+	// Runs after ApplyMappings / ApplyExpressionOverrides and BEFORE
+	// the cross-engine supportable pre-flight + every downstream
+	// schema-apply step, so the rewritten composite PK and the
+	// SluiceInjected column reach the target writer's CREATE TABLE
+	// in their final shape. No-op when --inject-shard-column is
+	// unset.
+	if m.InjectShardColumn.Engaged() {
+		schema, err = translate.InjectShardColumn(schema, m.InjectShardColumn.Name, ir.Varchar{Length: 64})
+		if err != nil {
+			return wrapWithHint(PhaseSchemaApply, fmt.Errorf("pipeline: inject shard column: %w", err))
+		}
 	}
 
 	// ---- 1.55. Redaction-type pre-flight refusal (Bug 60, v0.58.1) ----
@@ -535,12 +595,29 @@ func (m *Migrator) Run(ctx context.Context) error {
 				return markFailed(ctx, rc, state, ir.MigrationPhasePending, err)
 			}
 		} else {
+			// ADR-0048 Shape A populated-target preflight. When
+			// --inject-shard-column is set, this is the LOUD
+			// replacement for `--force-cold-start`'s silent skip
+			// (DP-2): empty-target ⇒ pass through to cold-start
+			// preflight; non-empty ⇒ run the three-point check
+			// (NULL / value-present / composite-PK-lead). When
+			// the flag is unset, this is a no-op and the
+			// existing cold-start preflight is the only gate.
+			if err := preflightShardConsolidation(ctx, schema, rw, m.InjectShardColumn.Name, m.InjectShardColumn.Value); err != nil {
+				return markFailed(ctx, rc, state, ir.MigrationPhasePending, err)
+			}
 			// Cold-start pre-flight: refuse if any target table already
 			// contains data. See preflight.go for the rationale (Bug 9).
 			// Skipped on --resume (TableProgress drives that path) and
 			// on --force-cold-start (explicit operator override).
-			if err := preflightColdStart(ctx, schema, rw, m.ForceColdStart, preflightModeMigrate); err != nil {
-				return markFailed(ctx, rc, state, ir.MigrationPhasePending, err)
+			// When --inject-shard-column is engaged, the operator has
+			// opted into the populated-target loud-refusal contract
+			// above; the cold-start preflight is suppressed here
+			// because Shape-A's three-point check is its replacement.
+			if !m.InjectShardColumn.Engaged() {
+				if err := preflightColdStart(ctx, schema, rw, m.ForceColdStart, preflightModeMigrate); err != nil {
+					return markFailed(ctx, rc, state, ir.MigrationPhasePending, err)
+				}
 			}
 		}
 	}
@@ -559,7 +636,7 @@ func (m *Migrator) Run(ctx context.Context) error {
 		forceColdStart: m.ForceColdStart,
 	}
 
-	if err := runBulkCopyPhases(ctx, rc, &state, schema, rr, sw, rw, resuming, m.BulkBatchSize, parallelDeps, m.Redactor); err != nil {
+	if err := runBulkCopyPhases(ctx, rc, &state, schema, rr, sw, rw, resuming, m.BulkBatchSize, parallelDeps, m.Redactor, m.InjectShardColumn); err != nil {
 		return err
 	}
 
@@ -646,6 +723,12 @@ type bulkCopyOpts struct {
 	// no-redactions hot path; see [redactRow] and [redactRows] for
 	// the wrap semantics.
 	Redactor *redact.Registry
+
+	// Shard is the ADR-0048 Shape A discriminator spec. Threaded
+	// into copyTable so the per-row stamp lands on the bulk-copy
+	// channel before the writer sees it. Zero-value (empty Name)
+	// is the no-op default — single-source streams pay nothing.
+	Shard ShardColumnSpec
 }
 
 // runBulkCopyWithOpts is the configurable variant of [runBulkCopy].
@@ -665,7 +748,7 @@ func runBulkCopyWithOpts(
 		}
 	}
 	for _, table := range schema.Tables {
-		if err := copyTable(ctx, rows, rw, table, opts.Redactor); err != nil {
+		if err := copyTable(ctx, rows, rw, table, opts.Redactor, opts.Shard); err != nil {
 			return wrapWithHint(PhaseBulkCopy, fmt.Errorf("pipeline: copy table %q: %w", table.Name, err))
 		}
 	}
@@ -834,6 +917,7 @@ func runBulkCopyPhases(
 	bulkBatchSize int,
 	parallel *parallelBulkCopyDeps,
 	redactor *redact.Registry,
+	shard ShardColumnSpec,
 ) error {
 	// Phase 1: tables.
 	if err := markPhase(ctx, rc, state, ir.MigrationPhaseTables); err != nil {
@@ -860,7 +944,7 @@ func runBulkCopyPhases(
 	// the mutex when checkpointing its cursor.
 	var stateMu sync.Mutex
 	for _, table := range schema.Tables {
-		if err := bulkCopyOneTable(ctx, rc, state, &stateMu, rows, rw, table, resuming, bulkBatchSize, parallel, redactor); err != nil {
+		if err := bulkCopyOneTable(ctx, rc, state, &stateMu, rows, rw, table, resuming, bulkBatchSize, parallel, redactor, shard); err != nil {
 			return err
 		}
 	}
@@ -1078,7 +1162,7 @@ func readerStreamErr(rr ir.RowReader, table *ir.Table) error {
 	return fmt.Errorf("source row stream for table %q failed: %w", table.Name, err)
 }
 
-func copyTable(ctx context.Context, rr ir.RowReader, rw ir.RowWriter, table *ir.Table, redactor *redact.Registry) (retErr error) {
+func copyTable(ctx context.Context, rr ir.RowReader, rw ir.RowWriter, table *ir.Table, redactor *redact.Registry, shard ShardColumnSpec) (retErr error) {
 	copyCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -1109,7 +1193,13 @@ func copyTable(ctx context.Context, rr ir.RowReader, rw ir.RowWriter, table *ir.
 	// randomize:* rule via the strategy's own seed-required check;
 	// preflight catches the same case earlier with a richer message.
 	redacted, redactErrFn := redactRows(copyCtx, teed, redactor, table.Schema, table.Name, table.Columns, tablePKColumns(table), "")
-	if err := rw.WriteRows(copyCtx, table, redacted); err != nil {
+	// ADR-0048 Shape A: stamp the operator-supplied discriminator
+	// onto every row before the writer sees it (the value half
+	// of DP-1's two-surface split; sibling to the optional
+	// ShardColumnSetter on the CDC path). shardStampRows is a
+	// zero-cost passthrough when shard.Name is empty.
+	stamped, _ := shardStampRows(copyCtx, redacted, shard.Name, shard.Value)
+	if err := rw.WriteRows(copyCtx, table, stamped); err != nil {
 		return fmt.Errorf("write rows: %w", err)
 	}
 	if err := redactErrFn(); err != nil {
@@ -1305,5 +1395,27 @@ func applyStreamID(target any, streamID string) {
 	}
 	if setter, ok := target.(ir.StreamIDSetter); ok {
 		setter.SetStreamID(streamID)
+	}
+}
+
+// applyShardColumn plumbs the streamer-side
+// `--inject-shard-column NAME=VALUE` (ADR-0048 Shape A) to an
+// engine-side [ir.ChangeApplier] that opts into
+// [ir.ShardColumnSetter]. CDC apply paths stamp the
+// discriminator onto every row-bearing change the same way the
+// bulk-copy path stamps via [shardStampRows] — the two halves
+// of DP-1's resolved two-surface split. Engines that don't
+// implement the setter inherit the no-stamp default.
+//
+// Empty shard.Name is a no-op; the setter is only invoked when
+// Shape A is engaged. Cross-engine refusal lives separately in
+// [checkCrossEngineSupportable] (a target engine that doesn't
+// implement the setter is refused there before any data moves).
+func applyShardColumn(target any, shard ShardColumnSpec) {
+	if !shard.Engaged() {
+		return
+	}
+	if setter, ok := target.(ir.ShardColumnSetter); ok {
+		setter.SetShardColumn(shard.Name, shard.Value)
 	}
 }

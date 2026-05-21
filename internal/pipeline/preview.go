@@ -107,6 +107,13 @@ type Previewer struct {
 	// follow-on. nil/empty: no annotations rendered (the
 	// pre-v0.55.0 shape).
 	Redactor *redact.Registry
+
+	// InjectShardColumn, when engaged, applies the ADR-0048 Shape A
+	// IR pass to the source schema BEFORE the target writer is asked
+	// for DDL — so the rendered preview includes the discriminator
+	// column + composite PK rewrite the migrate / sync paths would
+	// emit. Mirrors the field on [Migrator] / [Streamer].
+	InjectShardColumn ShardColumnSpec
 }
 
 // PreviewJSON is the JSON-format preview output. The shape is stable
@@ -268,6 +275,16 @@ func (p *Previewer) Run(ctx context.Context) error {
 	tgtSchema, err = translate.ApplyExpressionOverrides(tgtSchema, p.ExpressionMappings)
 	if err != nil {
 		return fmt.Errorf("preview: apply expression overrides: %w", err)
+	}
+	// ADR-0048 Shape A: render the preview with the IR pass applied
+	// so operators SEE the composite-PK + discriminator-column the
+	// migrate / sync paths would emit under --inject-shard-column.
+	// No-op when the flag is unset.
+	if p.InjectShardColumn.Engaged() {
+		tgtSchema, err = translate.InjectShardColumn(tgtSchema, p.InjectShardColumn.Name, ir.Varchar{Length: 64})
+		if err != nil {
+			return fmt.Errorf("preview: inject shard column: %w", err)
+		}
 	}
 
 	// ---- 3.5. Untranslatable-expression refusal (Bug 8 backstop) ----

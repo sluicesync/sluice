@@ -205,6 +205,15 @@ type ChangeApplier struct {
 	// MySQL applier; see that engine for the design.
 	redactor *redact.Registry
 
+	// shardColumn / shardValue are the operator-configured
+	// Shape-A discriminator (ADR-0048; CLI:
+	// `--inject-shard-column NAME=VALUE`). When shardColumn != "",
+	// the apply path stamps the value onto every row-bearing
+	// change before dispatch — mirror of the MySQL applier; see
+	// that engine for the full design.
+	shardColumn string
+	shardValue  any
+
 	// streamID is the active stream's identifier, recorded by
 	// [SetStreamID] at Streamer startup. Threaded through every
 	// redactor.ApplyRow call so randomize:* strategies (PII Phase 2.c,
@@ -318,6 +327,48 @@ func (a *ChangeApplier) SetRedactor(registry any) {
 // streamer may call this on every Run.
 func (a *ChangeApplier) SetStreamID(streamID string) {
 	a.streamID = streamID
+}
+
+// SetShardColumn implements [ir.ShardColumnSetter] (ADR-0048
+// Shape A). Mirror of the MySQL applier; see that engine for the
+// full design. Empty name clears the wiring (no-stamp default).
+// Idempotent.
+func (a *ChangeApplier) SetShardColumn(name string, value any) {
+	a.shardColumn = name
+	a.shardValue = value
+}
+
+// stampShardChange stamps the operator-supplied discriminator
+// onto every row-bearing change before dispatch. Empty
+// shardColumn is the no-op fast path. Mirror of the MySQL
+// applier's stampShardChange; both engines must apply the same
+// {Insert.Row, Update.Before/After, Delete.Before} scope to keep
+// CDC events from per-shard streams identifiable on the
+// consolidated target. Non-row changes (Truncate / TxBegin /
+// TxCommit / SchemaSnapshot) pass through.
+func (a *ChangeApplier) stampShardChange(c ir.Change) {
+	if a.shardColumn == "" {
+		return
+	}
+	name := a.shardColumn
+	val := a.shardValue
+	switch v := c.(type) {
+	case ir.Insert:
+		if v.Row != nil {
+			v.Row[name] = val
+		}
+	case ir.Update:
+		if v.Before != nil {
+			v.Before[name] = val
+		}
+		if v.After != nil {
+			v.After[name] = val
+		}
+	case ir.Delete:
+		if v.Before != nil {
+			v.Before[name] = val
+		}
+	}
 }
 
 // SetBatchSizeProvider implements [ir.BatchSizeProviderSetter]
@@ -806,6 +857,11 @@ func (a *ChangeApplier) applyOne(ctx context.Context, streamID string, c ir.Chan
 	if err := a.redactChange(ctx, c); err != nil {
 		return classifyApplierError(fmt.Errorf("postgres: applier: redact: %w", err))
 	}
+	// ADR-0048 Shape A: stamp the operator-supplied discriminator
+	// (`--inject-shard-column NAME=VALUE`) onto every row-bearing
+	// change before dispatch. Empty shardColumn is a no-op fast
+	// path — single-source streams pay zero cost.
+	a.stampShardChange(c)
 	tx, err := a.db.BeginTx(ctx, nil)
 	if err != nil {
 		return classifyApplierError(fmt.Errorf("postgres: applier: begin tx: %w", err))

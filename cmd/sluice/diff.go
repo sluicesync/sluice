@@ -46,6 +46,8 @@ type SchemaDiffCmd struct {
 	TargetSchema string `help:"Per-source target schema namespace (Postgres-only). When set, the diff reads the target schema from this namespace rather than the DSN's default, and renders DDL suggestions prefixed with the schema name. ADR-0031. MySQL operators use a different --target DSN database instead." placeholder:"NAME"`
 
 	EnablePGExtension []string `help:"Enable passthrough for a Postgres extension type (repeatable). Same-engine PG → PG passthrough; hstore and citext additionally have built-in cross-engine translators on MySQL targets. Recognised: vector (pgvector), pg_trgm, hstore, citext. See ADR-0032." placeholder:"EXT"`
+
+	InjectShardColumn string `help:"ADR-0048 Shape A — diff a consolidated Shape-A target against the per-shard source. Format: NAME=VALUE (matches the value used at migrate / sync start time). The diff applies the same IR-pass the migrate / sync paths apply, then compares; the sluice-injected discriminator column is suppressed from 'extra column on target' drift via the IR's SluiceInjected provenance marker. Off when empty (default)." placeholder:"NAME=VALUE"`
 }
 
 // Run implements `sluice schema diff`. Returns:
@@ -101,6 +103,11 @@ func (s *SchemaDiffCmd) Run(g *Globals) error {
 	var runErr error
 	defer func() { _ = finalize(runErr) }()
 
+	shardSpec, err := parseInjectShardColumn(s.InjectShardColumn)
+	if err != nil {
+		return operationalError{err: err}
+	}
+
 	differ := &pipeline.Differ{
 		Source:                 source,
 		Target:                 target,
@@ -117,6 +124,7 @@ func (s *SchemaDiffCmd) Run(g *Globals) error {
 		Out:                    writer,
 		TargetSchema:           s.TargetSchema,
 		EnabledPGExtensions:    s.EnablePGExtension,
+		InjectShardColumn:      shardSpec,
 	}
 	diff, err := differ.Run(kongContext())
 	if err != nil {

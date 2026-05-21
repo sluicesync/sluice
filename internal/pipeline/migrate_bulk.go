@@ -77,6 +77,7 @@ func bulkCopyOneTable(
 	bulkBatchSize int,
 	parallel *parallelBulkCopyDeps,
 	redactor *redact.Registry,
+	shard ShardColumnSpec,
 ) error {
 	action := classifyTableForResume(*state, table.Name, resuming)
 	switch action {
@@ -117,7 +118,7 @@ func bulkCopyOneTable(
 	// per-chunk cursors. When [tryParallelCopyTable] returns ran=true,
 	// the parallel path handled the table end-to-end; ran=false means
 	// "fall through to the single-reader path".
-	if ran, err := tryParallelCopyTable(ctx, rc, state, stateMu, rows, rw, table, parallel, resuming, bulkBatchSize, redactor); err != nil {
+	if ran, err := tryParallelCopyTable(ctx, rc, state, stateMu, rows, rw, table, parallel, resuming, bulkBatchSize, redactor, shard); err != nil {
 		wrapped := fmt.Errorf("pipeline: copy table %q (parallel): %w", table.Name, err)
 		return wrapWithHint(PhaseBulkCopy, markFailed(ctx, rc, *state, ir.MigrationPhaseBulkCopy, wrapped))
 	} else if ran {
@@ -149,7 +150,7 @@ func bulkCopyOneTable(
 				slog.String("table", table.Name),
 				slog.String("err", err.Error()))
 		}
-		if err := copyTable(ctx, rows, rw, table, redactor); err != nil {
+		if err := copyTable(ctx, rows, rw, table, redactor, shard); err != nil {
 			wrapped := fmt.Errorf("pipeline: copy table %q: %w", table.Name, err)
 			return wrapWithHint(PhaseBulkCopy, markFailed(ctx, rc, *state, ir.MigrationPhaseBulkCopy, wrapped))
 		}
@@ -167,7 +168,7 @@ func bulkCopyOneTable(
 	if limit <= 0 {
 		limit = defaultBulkBatchSize
 	}
-	if err := copyTableWithCursor(ctx, rc, state, rw, rows, table, limit, redactor); err != nil {
+	if err := copyTableWithCursor(ctx, rc, state, rw, rows, table, limit, redactor, shard); err != nil {
 		wrapped := fmt.Errorf("pipeline: copy table %q: %w", table.Name, err)
 		return wrapWithHint(PhaseBulkCopy, markFailed(ctx, rc, *state, ir.MigrationPhaseBulkCopy, wrapped))
 	}
@@ -243,6 +244,7 @@ func copyTableWithCursor(
 	table *ir.Table,
 	limit int,
 	redactor *redact.Registry,
+	shard ShardColumnSpec,
 ) (retErr error) {
 	br, ok := rr.(ir.BatchedRowReader)
 	if !ok {
@@ -305,7 +307,14 @@ func copyTableWithCursor(
 		// PII Phase 1: same redact-wrap as [copyTable]. nil/empty
 		// Registry is the no-op fast path.
 		redacted, redactErrFn := redactRows(batchCtx, teed, redactor, table.Schema, table.Name, table.Columns, pkCols, "")
-		if err := iw.WriteRowsIdempotent(batchCtx, table, redacted); err != nil {
+		// ADR-0048 Shape A: stamp the operator-supplied discriminator
+		// onto every batch row before idempotent write. The teePKAndCount
+		// tracker above already snapshot the source-side PK BEFORE the
+		// stamp — the cursor we persist is the source-side cursor, which
+		// is what subsequent batched-reader calls need. Zero-cost
+		// passthrough when shard.Name is empty.
+		stamped, _ := shardStampRows(batchCtx, redacted, shard.Name, shard.Value)
+		if err := iw.WriteRowsIdempotent(batchCtx, table, stamped); err != nil {
 			cancel()
 			return fmt.Errorf("write batch: %w", err)
 		}

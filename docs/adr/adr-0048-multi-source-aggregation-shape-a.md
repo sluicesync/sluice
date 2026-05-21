@@ -1,16 +1,25 @@
 # ADR-0048 — Multi-source aggregation Shape A (sharded → consolidated)
 
-**Status:** **Accepted (design-only; implementation demand-gated per
-roadmap §4).** This ADR is the design pass *before* code. It was
-produced from a sharded-Vitess → consolidated-target spike (harness:
-`internal/pipeline/shapea_spike_vstream_integration_test.go`, build tag
-`integration vstream`; design evidence:
+**Status:** **Accepted; implementation landed 2026-05-21.** This ADR
+was originally accepted design-only with implementation demand-gated
+per roadmap §4; the operator-direction lifted that gate on 2026-05-21
+and the ten-phase implementation landed in the same window. Closing
+commits include the IR additions (`Column.SluiceInjected` +
+`ir.ShardColumnSetter`), the `internal/translate.InjectShardColumn`
+pure pass, the orchestrator-side `shardStampRows` bulk-copy wrap,
+the preflight (`preflightShardConsolidation`), engine wiring on both
+MySQL and Postgres appliers, the CLI flag `--inject-shard-column
+NAME=VALUE` on `migrate` / `sync start` / `schema preview` /
+`schema diff`, the cross-engine refusal for engines lacking
+`ir.ShardColumnSetter`, and the spike harness migrated to call the
+real APIs. Produced from a sharded-Vitess → consolidated-target spike
+(harness: `internal/pipeline/shapea_spike_vstream_integration_test.go`,
+build tag `integration vstream`; design evidence:
 [`docs/dev/notes/prep-multi-source-shape-a.md`](../dev/notes/prep-multi-source-shape-a.md)).
 All three decision points in §"Decision points requiring sign-off"
 RESOLVED: DP-2 (discriminator-value-presence) and DP-3 (drained model
 for v1) 2026-05-16; DP-1 (two-surface split — (a)) 2026-05-21.
-Acceptance commits to the design; implementation waits for a concrete
-operator workload per roadmap §4 demand-gate. Roadmap §4. Extends
+Roadmap §4. Extends
 [ADR-0031](adr-0031-multi-source-aggregation-target-schema.md) (shipped
 Shape B, v0.25.0, which explicitly deferred Shape A) and builds on the
 control-table additive-column pattern of

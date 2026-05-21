@@ -312,19 +312,13 @@ Closed under [ADR-0036](adr/adr-0036-mid-stream-loss-surface-characterization.md
 
 ---
 
-### 4. Multi-source aggregation — Shape A (sharded → consolidated)
+### 4. Multi-source aggregation — Shape A (sharded → consolidated) — **SHIPPED (v0.72.0)**
 
-**Why.** Multi-source Phase 1 + 2 (Shape B microservices → analytics warehouse) shipped in v0.25.0 — see "Recently landed". Shape A (N functionally-identical sources, sharded by key, consolidated into one target table) is the still-outstanding pattern. ADR-0031 explicitly defers it because it requires meaningfully more machinery; the proto-design at [`design-multi-source-aggregation.md`](design-multi-source-aggregation.md) covers the full surface area.
+**Status.** Shipped 2026-05-21 per ADR-0048 (resolved DP-1/DP-2/DP-3). The demand-gate the original entry placed on this item was lifted by operator-direction in the same window; the ten-phase implementation landed end-to-end.
 
-**What.** Three new pieces:
-- **Discriminator-column injection.** New CLI flag `--inject-shard-column NAME=VALUE` (mirrored on each shard's `sluice sync start`); sluice injects the column at translation time + populates it during writes so the consolidated PK stays unique across shards.
-- **Populated-target bulk-copy.** Today's cold-start preflight refuses bulk-copy into a non-empty target (Bug 9 protection). Shape A needs a "discriminator-aware" bypass that knows which rows belong to which shard so the second/third/Nth shard's bulk-copy can land cleanly alongside the first's data.
-- **Cross-shard schema-migration coordination.** When the operator alters the source schema, every shard's stream needs to coordinate the ALTER on the consolidated target. ADR-0030's `--no-drain` add-table is single-source; Shape A needs cross-stream consensus.
+**Shipped surface.** `--inject-shard-column NAME=VALUE` on `migrate` / `sync start` / `schema preview` / `schema diff`. Sluice appends the discriminator column to every PK-bearing table via the pure `internal/translate.InjectShardColumn` IR pass, rewrites the PK to be composite `(discriminator, …source PK)`, stamps the per-shard VALUE onto every bulk-copy row AND every row-bearing CDC change (Insert.Row, Update.Before/After, Delete.Before) via the new optional `ir.ShardColumnSetter` applier surface — both shipping engines (mysql, postgres) implement it; a future engine that doesn't refuses loudly at `openApplier` time. The populated-target preflight (`preflightShardConsolidation`) is the loud-failure replacement for `--force-cold-start`'s silent skip: target empty ⇒ pass through to cold-start; target non-empty + `--inject-shard-column` ⇒ the three-point assertion (a) NULL discriminator on existing rows, (b) incoming VALUE already present, (c) composite PK doesn't lead with the discriminator — any of which refuses with operator-actionable recovery. Tables without a base PK refuse upfront. The IR's `Column.SluiceInjected` provenance marker suppresses the discriminator from `schema diff` / `verify` "extra column on target" drift while still asserting it must be present and NOT NULL.
 
-**Gotchas.**
-- The discriminator column shape needs a name in the IR (column origin = sluice-injected vs source-derived) so the applier can tell the two apart and the diff doesn't flag an "extra column on target."
-- The cold-start populated-target bypass is a sharp tool — getting it wrong means silent data corruption (one shard overwrites another's rows). Loud preflight: "you've set --inject-shard-column on a fresh stream into a populated target; rows from other shards already present must have shard-column NOT NULL and the new shard's value must be unique."
-- Shape A is heavier than Shape B; it waits for a real operator request with a concrete workload before committing to a design pass.
+**Out of scope for v1 (Phase 2 deferred per ADR-0048 DP-3).** Cross-shard schema-migration coordination via control-table DDL lease. v1's drained-shape contract is `sync stop --wait` → cross-shard schema migrate → `sync start --resume` (ADR-0030 Strategy A); the spike harness migrated to call the real APIs lands the cold-start-equivalent shape, not live cross-shard DDL.
 
 ---
 

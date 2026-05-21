@@ -440,6 +440,19 @@ type Streamer struct {
 	// loud-failure behaviour for extension-owned types.
 	EnabledPGExtensions []string
 
+	// InjectShardColumn is the ADR-0048 Shape A discriminator-column
+	// spec the per-shard streamer opts into via
+	// `--inject-shard-column NAME=VALUE`. When [ShardColumnSpec.Engaged]
+	// is true, the streamer runs the IR-pass + bulk-copy stamp + CDC
+	// applier wiring on every cold-start, and applies the
+	// populated-target preflight (the loud replacement for
+	// `--force-cold-start`). Zero-value (empty Name) is the no-op
+	// default — single-source streams pay nothing.
+	//
+	// Mirror of [Migrator.InjectShardColumn]. See ADR-0048's resolved
+	// DP-1 (option (a) — two-surface split) for the design rationale.
+	InjectShardColumn ShardColumnSpec
+
 	// ApplyRetryAttempts caps the number of consecutive retriable
 	// apply failures the streamer will absorb before giving up and
 	// returning the underlying error. ADR-0038. Zero or one means
@@ -1616,6 +1629,10 @@ func (s *Streamer) openApplier(ctx context.Context) (ir.ChangeApplier, bool, err
 		applyTargetSchema(s.Applier, s.TargetSchema)
 		applyExecTimeout(s.Applier, s.ApplyExecTimeout)
 		applyRedactor(s.Applier, s.Redactor)
+		if err := checkShardColumnSupport(s.Applier, s.InjectShardColumn, "sync"); err != nil {
+			return nil, false, wrapWithHint(PhaseConnect, err)
+		}
+		applyShardColumn(s.Applier, s.InjectShardColumn)
 		return s.Applier, false, nil
 	}
 	a, err := s.Target.OpenChangeApplier(ctx, s.TargetDSN)
@@ -1626,6 +1643,11 @@ func (s *Streamer) openApplier(ctx context.Context) (ir.ChangeApplier, bool, err
 	applyTargetSchema(a, s.TargetSchema)
 	applyExecTimeout(a, s.ApplyExecTimeout)
 	applyRedactor(a, s.Redactor)
+	if err := checkShardColumnSupport(a, s.InjectShardColumn, "sync"); err != nil {
+		closeIf(a)
+		return nil, false, wrapWithHint(PhaseConnect, err)
+	}
+	applyShardColumn(a, s.InjectShardColumn)
 	return a, true, nil
 }
 
@@ -1773,6 +1795,18 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 	if err != nil {
 		return nil, stop, fmt.Errorf("pipeline: apply expression overrides: %w", err)
 	}
+	// ADR-0048 Shape A discriminator-column injection. Runs after
+	// ApplyMappings / ApplyExpressionOverrides and BEFORE the
+	// target-side schema writer opens, so CREATE TABLE on the cold-
+	// start branch sees the rewritten composite PK + the
+	// SluiceInjected column. No-op when --inject-shard-column is
+	// unset.
+	if s.InjectShardColumn.Engaged() {
+		schema, err = translate.InjectShardColumn(schema, s.InjectShardColumn.Name, ir.Varchar{Length: 64})
+		if err != nil {
+			return nil, stop, wrapWithHint(PhaseSchemaApply, fmt.Errorf("pipeline: inject shard column: %w", err))
+		}
+	}
 
 	// Redaction-type pre-flight (Bug 60, v0.58.1): catch
 	// mask:uuid on UUID-typed columns before the target schema
@@ -1838,22 +1872,38 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 			slog.String("stream_id", streamID),
 		)
 	default:
+		// ADR-0048 Shape A populated-target preflight (DP-2). When
+		// --inject-shard-column is set, this is the LOUD replacement
+		// for `--force-cold-start`'s silent skip. No-op when the
+		// flag is unset.
+		if err := preflightShardConsolidation(ctx, schema, rw, s.InjectShardColumn.Name, s.InjectShardColumn.Value); err != nil {
+			closeIf(rw)
+			closeIf(sw)
+			_ = stream.Close()
+			return nil, stop, err
+		}
 		// Cold-start pre-flight: refuse if any target table already
 		// contains data. See preflight.go for the rationale (Bug 9).
 		// Streamer's cold-start branch is the analogue of Migrator's
 		// non-resume cold-start path; warm-resume doesn't run bulk-copy
 		// and is therefore not gated by this check.
-		if err := preflightColdStart(ctx, schema, rw, s.ForceColdStart, preflightModeSync); err != nil {
-			closeIf(rw)
-			closeIf(sw)
-			_ = stream.Close()
-			return nil, stop, err
+		// When --inject-shard-column is engaged, Shape-A's three-point
+		// check above is the operator-opted-in replacement; the
+		// classic cold-start preflight is suppressed in that case.
+		if !s.InjectShardColumn.Engaged() {
+			if err := preflightColdStart(ctx, schema, rw, s.ForceColdStart, preflightModeSync); err != nil {
+				closeIf(rw)
+				closeIf(sw)
+				_ = stream.Close()
+				return nil, stop, err
+			}
 		}
 	}
 
 	bulkOpts := bulkCopyOpts{
 		SkipSchemaApply: s.SchemaAlreadyApplied,
 		Redactor:        s.Redactor,
+		Shard:           s.InjectShardColumn,
 	}
 	if err := runBulkCopyWithOpts(ctx, schema, stream.Rows, sw, rw, bulkOpts); err != nil {
 		closeIf(rw)

@@ -104,6 +104,14 @@ type Differ struct {
 	// then matches target-side `vector(384)` against the expected
 	// shape correctly. Empty preserves the pre-v0.26.0 behaviour.
 	EnabledPGExtensions []string
+
+	// InjectShardColumn, when engaged, applies the ADR-0048 Shape A
+	// IR pass to the source-side expected schema BEFORE the diff
+	// comparison runs. Combined with the [ir.Column.SluiceInjected]
+	// suppression in [ir.DiffSchemas], this lets `schema diff`
+	// against a consolidated Shape-A target report "in sync" rather
+	// than surface the discriminator as drift on every run.
+	InjectShardColumn ShardColumnSpec
 }
 
 // DiffJSON is the JSON-format diff output. The shape is stable for
@@ -199,6 +207,18 @@ func (d *Differ) Run(ctx context.Context) (*ir.SchemaDiff, error) {
 	expected, err = translate.ApplyExpressionOverrides(expected, d.ExpressionMappings)
 	if err != nil {
 		return nil, fmt.Errorf("diff: apply expression overrides: %w", err)
+	}
+	// ADR-0048 Shape A: when the operator's diff targets a
+	// consolidated target, run the IR pass on the source-side
+	// expected schema so the discriminator + composite PK are part
+	// of the comparison. Without this, the diff would report the
+	// discriminator as "extra on target" and the composite PK
+	// shape as "PK mismatch" on every run.
+	if d.InjectShardColumn.Engaged() {
+		expected, err = translate.InjectShardColumn(expected, d.InjectShardColumn.Name, ir.Varchar{Length: 64})
+		if err != nil {
+			return nil, fmt.Errorf("diff: inject shard column: %w", err)
+		}
 	}
 
 	// Cross-engine retarget: rewrite source-native IR types to their
