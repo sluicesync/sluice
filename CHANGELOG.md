@@ -6,6 +6,50 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.71.0]
+
+**One real operability bug fixed, one operator-facing feature added.** Pre-fix, `START TRANSACTION WITH CONSISTENT SNAPSHOT` on the MySQL snapshot conn held `MDL_SHARED_READ` (`dur=TRANSACTION`) on every snapshotted source table for the streamer's entire lifetime — blocking any operator-issued `ALTER` (even `ALGORITHM=INSTANT`) until sluice was stopped. The PG analogue (Bug 21) was fixed long ago via `ReleaseRowsFn` at `COPY_COMPLETED`; the MySQL engine had the same shape designed in the IR but had never wired its half. This release closes that. On the feature side, `sluice sync status` gains live-refresh, JSON output, and an aggregate-summary header — the operator's first first-class "what's my fleet doing right now" surface that doesn't require Prometheus.
+
+### Fixed
+
+- **`fix(engines/mysql): wire SnapshotStream.ReleaseRowsFn` (task #34 / closes the deferred #28 Chunk E pin)** — MySQL engine now mirrors PG's Bug 21 shape: a `rowsReleased`-guarded `releaseRows` closure commits the snapshot tx + closes the pinned conn + closes the schema-side DB pool, called from streamer.go's existing `stream.ReleaseRows()` at `COPY_COMPLETED` (which was a silent no-op on MySQL pre-fix because `ReleaseRowsFn` was unset). Net effect: operators can run `ALTER` on sluice-monitored MySQL source tables without stopping sluice. New engine-of-truth pin `TestSnapshotStream_ReleaseRowsClosesSnapshotTx` asserts `performance_schema.metadata_locks` shows 0 `TABLE SHARED_READ dur=TRANSACTION` on a sample table after `ReleaseRows`, ALTER completes sub-5s, CDC keeps working, idempotent. Diagnostic journey (three-cycle three-phase-protocol instrumentation; preserved in the test docstring for future archaeology): CI run 26173191325 captured `net_write_timeout=60` (the original ~52s failure pattern, a red herring); the actual root cause surfaced in CI run 26176677598 via `performance_schema.metadata_locks` polling, which showed `owner_thread=51` holding `TABLE SHARED_READ dur=TRANSACTION` on `users` for the full 90s while the ALTER sat at `EXCLUSIVE PENDING`.
+
+- **`test(postgres): psverify+integration tag collision on closeIf` (task #23)** — `internal/engines/postgres/schema_reader_test.go` (integration-tagged) and `planetscale_verify_test.go` (psverify-tagged) both defined `closeIf`; combining both tags failed with `closeIf redeclared in this block`. Renamed the psverify variant to `psverifyCloseIf` (5 callsites). Pre-existing defect; the psverify tag is not a required CI gate but the break was friction for anyone running the broader tag matrix locally.
+
+### Features
+
+- **`feat(sync status): --format=text|json + --watch=DURATION + --summary` (task #33 phases 1+2)** — three additions to `sluice sync status`, all backwards-compatible (default text output unchanged). `--format=json` emits a `{generated_at, summary{count, oldest_seconds, newest_seconds}, streams[...]}` document keyed for jq pipes (indented for human skimmability). `--watch` re-renders every DURATION until interrupted, clearing the terminal between renders (ANSI `ESC[2J ESC[H`) so output stays in place rather than scrolling; transient errors log inline and the watch continues (so a brief target outage doesn't abort the operator's screen). `--summary` prepends an aggregate header (`SUMMARY: N streams, oldest=Xm ago, most-recent=Ys ago`) with singular/plural pedantry. Refactor: rendering extracted to `cmd/sluice/status_render.go` (~250 LOC) so the watch loop and the one-shot path share identical logic. Tests cover default text shape, sort order, summary copy, empty-result messaging, JSON shape via stdlib decoder, and `--format=yaml` rejected with an explicit error. Phase 3 (`--dashboard-listen` embedded HTML+JS) deliberately parked for hands-on evaluation against the TUI baseline before committing.
+
+### Operations / CI
+
+- **`ci: Dependabot auto-merge + grouping`** — `.github/workflows/dependabot-automerge.yml` auto-approves and auto-merges patch + minor Dependabot PRs once the existing 4-job CI gate (Build / Test / Lint / Integration) passes; major bumps get an explanatory "held for review" comment instead. `.github/dependabot.yml` now groups four package families (`aws-sdk-go-v2`, `vitess`, `opentelemetry`, `golang.org/x`) into one PR/week each, cutting weekly PR volume ~3–4× and eliminating the cross-family `go.sum` conflict storm. Several dependency bumps auto-merged through this workflow in the same session that it landed (Vitess group, Azure SDK, cloud.google.com/go/kms, google.golang.org/api).
+
+- **`ci: --net-write-timeout / --net-read-timeout = 600 on the MySQL testcontainer`** — bumped server-side socket-write/read timeouts from the `mysql:8.0` default of 60s to 600s in `startMySQLBinlog`'s container `Cmd`. This was the original (red-herring) Phase A finding on the deferred Chunk E pin; the bump is defensive and benefits every binlog-flavoured pipeline integration test, no regression.
+
+### Tests
+
+- **`test(pipeline): un-skip + close the long-deferred Chunk E pin` (tasks #35 + #36)** — `TestStreamer_MySQLToPostgres_SchemaHistoryWarmResumeAcrossDDL`, deferred from v0.70.0 with a `t.Skip` and a series of speculative root-cause claims, now runs end-to-end and asserts the four ADR-0049 Chunk B1/B3/C invariants (a) same-tx schema-history+position write, (b) PG applier active-version cache holds post-ALTER IR after warm-resume, (c) warm-resume does NOT fall through to cold-start across the DDL, (d) post-resume CDC keeps working with the post-DDL schema. Two test-only follow-on fixes were needed once the #34 MDL bug was out of the way: (path b) Phase 5 now ALTERs both source and target in lockstep because sluice does not propagate DDL on the live CDC path (operator-coordinated deploy pattern); (task #36) the Phase 9 assertion (a) query was changed from `schema_name='public'` (PG target's default namespace) to `schema_name='source_db'` (MySQL source's namespace) because Chunk B1's `maybeSnapshotSchemaB1` plumbs the source schema name through `ir.SchemaSnapshot.Schema` → `writeSchemaVersion`'s schema arg by design (so warm-resume / chain-restore can correlate against the source's own namespace).
+
+- **`test(engines): pin dispatch streamID arg via non-SetStreamID Apply` (task #27 follow-up)** — both engines' `ChangeApplier.dispatch` now takes the streamID through the `Apply` arg rather than reading `a.streamID` (set via the optional `ir.StreamIDSetter`). Closes the latent footgun where any future non-migrate Apply path that omits `SetStreamID` would silently key rows under `""` and surface as a loud `ir.ErrPositionInvalid` at the next resume. Pin: `TestApplier_SchemaSnapshotDispatch_UsesApplyArgStreamID` (both engines) deliberately skips `SetStreamID`, pushes a SchemaSnapshot via `Apply(ctx, "custom-non-migrate-stream", ch)`, asserts `a.streamID == ""` AND schema-history row landed under `"custom-non-migrate-stream"`.
+
+### Docs
+
+- **`docs/dev/notes/adr-0050-cost-validation-report.md`** — gate (1) empirical evidence captured against a new `sluice-adr-0050-cv` PlanetScale database. Native VStream copy+CDC ran end-to-end with 1:1 fidelity under sustained concurrent workload (442 K rows / ~49 MiB baseline) and at GB-scale anchor (3.26 M rows / 0.97 GiB; throughput byte-linear at ~1.4 MB/s per table). Probe-B Go binary (`cmd/adr-0050-probe`) measured `sluice_watermark` write→VStream-event visibility lag: p50=3.9ms, p95=916ms, max=1085ms — sharply bimodal (Vitess `HeartbeatInterval=5s` batching), supporting ADR-0050 DP-2's preferred default ordering (`vstream-native` over `watermark-table`). Bottom line: conditional-go on ADR-0050; cost shape is closed at the 1 GiB anchor, the reconciling-resnapshot-vs-full-re-copy delta itself requires the future implementation to measure.
+
+### Compatibility
+
+- **Drop-in upgrade from v0.70.2.** The MySQL `ReleaseRowsFn` wiring is internal; existing streams' on-disk state (`sluice_cdc_state`, `sluice_cdc_schema_history`) is unchanged. The new `sync status` flags are additive — `--watch=0` (default) preserves one-shot behaviour and `--format=text` (default) preserves the existing tab-aligned table. The Dependabot workflow and grouping config are repo-side only.
+
+- **Operator impact (positive):** operators who previously had to stop sluice before issuing any `ALTER TABLE` on a sluice-monitored MySQL source no longer need to. This applies to every flavour — `mysql`, `planetscale` (vanilla + service-token), and any future binlog-flavoured engine that uses `openBinlogSnapshotStream`.
+
+### Who needs this
+
+- **Anyone running a continuous MySQL source under sluice** — the MDL release is the headline. Even if you've never tried an ALTER mid-stream, this brings MySQL behavior in line with PG (which has done this since the Bug 21 fix).
+
+- **Anyone managing more than one continuous-sync stream** — the new `sync status --watch` + `--format=json` + `--summary` flags make fleet visibility cheap. `sluice sync status --watch=2s --summary` is the new operator-runbook default.
+
+- **The Dependabot automation** is repo-side, doesn't affect operators of sluice as a tool — it's a maintainer-side noise reduction (3–4× fewer PRs/week to skim).
+
 ## [0.70.2]
 
 **Closes Bug 79 (HIGH, LOUD) — completes Bug 78 cross-engine chain-restore-resume fix.** v0.70.1 landed only the **storage half** of Bug 78: the persisted `source_engine` column made the anchor round-trip correctly, but `PrimeSchemaHistoryCache` still passed the **target's** `Engine{}` orderer to `ir.ResolveSchemaVersion`. Cross-engine chain-restore-then-resume crashed with the same class of `engine = "mysql"; want "postgres"` error — just at the `decode p` site (currentPos) instead of the anchor decode site. The v0.70.0 Bug 78 catalog originally listed BOTH (a) storage and (b) source-orderer-routing; v0.70.1 implemented only (a). This is the (b) half.
