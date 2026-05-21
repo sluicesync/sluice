@@ -186,16 +186,22 @@ func TestMigrate_PG_CoreVerbatim_RangesAndMultirange(t *testing.T) {
 		t.Errorf("target index def = %q; want USING gist over (valid_during)", idxDef)
 	}
 
-	// Functional check: the GiST range index supports the && overlap
-	// operator. '[50,200)' overlaps weekday-morning's [1,100) and
-	// weekend-evening's [500,1000)? No — only the first.
+	// Functional check: the && overlap operator runs against the
+	// verbatim-carried int8range column. '[50,200)' overlaps:
+	//   - weekday-morning [1,100)   → YES
+	//   - weekend-evening [500,1000) → NO
+	//   - all-quarter     [1,1000)   → YES
+	// So 2 matches expected. The overlap result is the load-bearing
+	// assertion (proves the column was carried as a real int8range, not
+	// silently flattened to text — text wouldn't support &&).
 	var overlapCount int
 	if err := tgtDB.QueryRowContext(ctx,
 		"SELECT COUNT(*) FROM schedule_slots WHERE valid_during && '[50,200)'::int8range").Scan(&overlapCount); err != nil {
 		t.Fatalf("range overlap query: %v", err)
 	}
-	if overlapCount != 1 {
-		t.Errorf("range && [50,200) matched %d rows; want 1 (weekday-morning)", overlapCount)
+	if overlapCount != 2 {
+		t.Errorf("range && [50,200) matched %d rows; want 2 "+
+			"(weekday-morning [1,100) + all-quarter [1,1000))", overlapCount)
 	}
 
 	// NULL element preserved across the verbatim path.
