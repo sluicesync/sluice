@@ -56,7 +56,8 @@ func startPostgresPGToPGWithPostGIS(t *testing.T, enableOnTarget bool) (sourceDS
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 
-	container, err := pgtc.Run(ctx,
+	container, err := pgtc.Run(
+		ctx,
 		"postgis/postgis:16-3.4",
 		pgtc.WithDatabase("source_db"),
 		pgtc.WithUsername("test"),

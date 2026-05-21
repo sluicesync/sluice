@@ -234,7 +234,8 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 		// missed). Operators get a clear log line so the gap is
 		// visible. Future Phase 3.3 work to backfill EndPosition into
 		// fulls will close this gap.
-		slog.WarnContext(ctx, "incremental: parent manifest has no EndPosition; chain will start from CDC's current position (parent is a v0.16.x full or pre-Phase-3 manifest)",
+		slog.WarnContext(
+			ctx, "incremental: parent manifest has no EndPosition; chain will start from CDC's current position (parent is a v0.16.x full or pre-Phase-3 manifest)",
 			slog.String("parent_path", parentPath),
 		)
 	}
@@ -367,7 +368,8 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 	// manifest file is authoritative for the one-segment shape).
 	updateLineageForManifestBestEffort(ctx, b.Store, manifest, manifestPath, b.segCodec)
 
-	slog.InfoContext(ctx, "incremental backup complete",
+	slog.InfoContext(
+		ctx, "incremental backup complete",
 		slog.String("backup_id", manifest.BackupID),
 		slog.String("parent_backup_id", manifest.ParentBackupID),
 		slog.Int("changes", int(totalChanges)),
@@ -507,7 +509,8 @@ func (b *IncrementalBackup) openCDCReader(ctx context.Context) (ir.CDCReader, er
 			return opener.OpenCDCReaderWithSlot(ctx, b.SourceDSN, b.SlotName)
 		}
 		// Engine doesn't support custom slot names — log and fall through.
-		slog.InfoContext(ctx, "incremental: --slot-name supplied but engine has no slot concept; ignoring",
+		slog.InfoContext(
+			ctx, "incremental: --slot-name supplied but engine has no slot concept; ignoring",
 			slog.String("engine", b.Source.Name()),
 			slog.String("slot_name", b.SlotName),
 		)
@@ -797,7 +800,8 @@ func buildIncrementalManifestPath(m *ir.Manifest) string {
 	if len(short) > 8 {
 		short = short[:8]
 	}
-	return fmt.Sprintf("%sincr-%013d-%s.json",
+	return fmt.Sprintf(
+		"%sincr-%013d-%s.json",
 		incrementalManifestPrefix,
 		m.CreatedAt.UTC().UnixMilli(),
 		short,

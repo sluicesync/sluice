@@ -113,7 +113,8 @@ func TestStreamer_PostgresToPostgres_BatchedApply(t *testing.T) {
 		t.Fatalf("source begin: %v", err)
 	}
 	for i := 1; i <= totalRows; i++ {
-		_, err := tx.ExecContext(streamCtx,
+		_, err := tx.ExecContext(
+			streamCtx,
 			"INSERT INTO bulk_users (id, email) VALUES ($1, $2)",
 			i, fmt.Sprintf("user%d@example.com", i),
 		)

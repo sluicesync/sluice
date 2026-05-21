@@ -204,7 +204,8 @@ func TestMigrate_PG_ParallelCopy_V04BackwardCompat(t *testing.T) {
 		t.Fatalf("seed state row: %v", err)
 	}
 	// Insert rows up to PK 2500 to mimic a half-completed previous run.
-	if _, err := tgtDB.ExecContext(ctx,
+	if _, err := tgtDB.ExecContext(
+		ctx,
 		"INSERT INTO events (id, label) SELECT g, 'row-' || g FROM generate_series(1, 2500) AS g",
 	); err != nil {
 		t.Fatalf("seed half-data: %v", err)

@@ -128,7 +128,8 @@ func readPGColumnType(t *testing.T, ctx context.Context, dsn, table, column stri
 	defer cancel()
 
 	var dataType string
-	err = db.QueryRowContext(queryCtx,
+	err = db.QueryRowContext(
+		queryCtx,
 		`SELECT data_type
 		 FROM information_schema.columns
 		 WHERE table_name = $1 AND column_name = $2`,

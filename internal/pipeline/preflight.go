@@ -117,7 +117,8 @@ func preflightColdStart(ctx context.Context, schema *ir.Schema, rw ir.RowWriter,
 		if !empty {
 			return wrapWithHint(PhaseSchemaApply, fmt.Errorf(
 				"%w: target table %q already contains data — %s",
-				errColdStartRefused, table.Name, recoveryHintFor(mode)))
+				errColdStartRefused, table.Name, recoveryHintFor(mode),
+			))
 		}
 	}
 	return nil

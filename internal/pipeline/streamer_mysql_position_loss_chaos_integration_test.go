@@ -86,7 +86,8 @@ func startMySQLGTID(t *testing.T) (sourceDSN, targetDSN string, cleanup func()) 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	container, err := mysqltc.Run(ctx,
+	container, err := mysqltc.Run(
+		ctx,
 		"mysql:8.0",
 		mysqltc.WithDatabase("source_db"),
 		mysqltc.WithUsername("root"),
@@ -513,7 +514,8 @@ func seedCDCStateMySQL(t *testing.T, dsn, streamID, token string) {
 	if _, err := db.ExecContext(ctx, ddl); err != nil {
 		t.Fatalf("create sluice_cdc_state: %v", err)
 	}
-	if _, err := db.ExecContext(ctx,
+	if _, err := db.ExecContext(
+		ctx,
 		`INSERT INTO sluice_cdc_state (stream_id, source_position) VALUES (?, ?)
 		 ON DUPLICATE KEY UPDATE source_position = VALUES(source_position)`,
 		streamID, token,

@@ -230,7 +230,8 @@ func FormatMarkdown(w io.Writer, results []Result) error {
 	sb.WriteString("| Corpus | Algorithm | Input (MiB) | Output (MiB) | Ratio | Encode (MB/s) | Decode (MB/s) | Heap Δ (KiB) |\n")
 	sb.WriteString("|---|---|---:|---:|---:|---:|---:|---:|\n")
 	for _, r := range results {
-		fmt.Fprintf(&sb, "| %s | %s | %.2f | %.2f | %.2fx | %.1f | %.1f | %+d |\n",
+		fmt.Fprintf(
+			&sb, "| %s | %s | %.2f | %.2f | %.2fx | %.1f | %.1f | %+d |\n",
 			r.Corpus,
 			r.Algo,
 			float64(r.InputBytes)/(1<<20),

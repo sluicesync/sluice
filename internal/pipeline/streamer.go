@@ -566,11 +566,13 @@ func (s *Streamer) runWithRetry(ctx context.Context, attempts int) error {
 		// WARN still fires and the single-attempt fall-through is
 		// the right behaviour.
 		if !isTransientOpenError(err) {
-			slog.DebugContext(ctx, "applier: retry policy disabled (cannot open position reader); falling through to single-attempt run",
+			slog.DebugContext(
+				ctx, "applier: retry policy disabled (cannot open position reader); falling through to single-attempt run",
 				slog.String("err", err.Error()),
 			)
 		} else {
-			slog.WarnContext(ctx, "applier: retry policy disabled (cannot open position reader); falling through to single-attempt run",
+			slog.WarnContext(
+				ctx, "applier: retry policy disabled (cannot open position reader); falling through to single-attempt run",
 				slog.String("err", err.Error()),
 			)
 		}
@@ -628,7 +630,8 @@ func (s *Streamer) runWithRetry(ctx context.Context, attempts int) error {
 		}
 
 		backoff := computeRetryBackoff(consecutive, base, maxBackoff, re.RetryHint())
-		slog.InfoContext(ctx, "applier: transient error; retrying",
+		slog.InfoContext(
+			ctx, "applier: transient error; retrying",
 			slog.String("stream_id", streamID),
 			slog.Int("attempt", consecutive),
 			slog.Int("max_attempts", attempts),
@@ -680,7 +683,8 @@ func maybeWarnApplyBatchSizeRisky(ctx context.Context, targetName string, batchS
 	if batchSize <= riskyThreshold {
 		return
 	}
-	slog.WarnContext(ctx, "apply-batch-size > 50 against a planetscale target may exceed Vitess's 20s transaction-killer timeout under sustained CDC load",
+	slog.WarnContext(
+		ctx, "apply-batch-size > 50 against a planetscale target may exceed Vitess's 20s transaction-killer timeout under sustained CDC load",
 		slog.Int("apply_batch_size", batchSize),
 		slog.Int("safe_threshold", riskyThreshold),
 		slog.String("hint", "if you see frequent 'mysql: applier: batch rollback on error' with 'code = Aborted ... for tx killer rollback', reduce --apply-batch-size to 25-50. See GitHub #18 for the auto-tuning controller planned for a future release."),
@@ -768,7 +772,8 @@ func (s *Streamer) runOnce(ctx context.Context) error {
 	// log lines so operators can correlate against
 	// pg_replication_slots.
 	if resolved := resolveSlotName(s.SlotName); resolved != s.SlotName {
-		slog.InfoContext(ctx, "applying sluice slot-name prefix convention",
+		slog.InfoContext(
+			ctx, "applying sluice slot-name prefix convention",
 			slog.String("operator_supplied", s.SlotName),
 			slog.String("resolved", resolved),
 		)
@@ -782,7 +787,8 @@ func (s *Streamer) runOnce(ctx context.Context) error {
 	// pointing at a PlanetScale endpoint. Replaced in-place;
 	// Streamer is single-shot per Run.
 	if eff, added := effectiveTableFilter(s.Filter, s.Source, s.SourceDSN); len(added) > 0 {
-		slog.InfoContext(ctx, "applying engine-default table exclusions",
+		slog.InfoContext(
+			ctx, "applying engine-default table exclusions",
 			slog.String("engine", s.Source.Name()),
 			slog.Any("patterns", added),
 		)
@@ -939,7 +945,8 @@ func (s *Streamer) runOnce(ctx context.Context) error {
 		}
 		persisted = retagPositionForSource(chainPos, s.Source.Name())
 		found = true
-		slog.InfoContext(ctx, "position-from-manifest: using chain terminal position",
+		slog.InfoContext(
+			ctx, "position-from-manifest: using chain terminal position",
 			slog.String("stream_id", streamID),
 			slog.String("position_engine", chainPos.Engine),
 			slog.String("position_token", truncateDryRunToken(chainPos.Token, 60)),
@@ -1067,7 +1074,8 @@ func (s *Streamer) runOnce(ctx context.Context) error {
 		// operator gets the slot-recovery flow's message; cases 7/8
 		// from the design doc cover the recovery options.
 		if err != nil && errors.Is(err, ir.ErrPositionInvalid) && s.PositionFromManifestStore == nil {
-			slog.WarnContext(ctx, "warm resume: persisted position is no longer valid; falling through to cold start",
+			slog.WarnContext(
+				ctx, "warm resume: persisted position is no longer valid; falling through to cold start",
 				slog.String("stream_id", streamID),
 				slog.String("position_token", persisted.Token),
 				slog.String("source_engine", persisted.Engine),
@@ -1205,7 +1213,8 @@ func (s *Streamer) runOnce(ctx context.Context) error {
 	// applyCtx may already be cancelled here.
 	if stopObserved.Load() {
 		if err := applier.ClearStopRequested(ctx, streamID); err != nil {
-			slog.WarnContext(ctx, "failed to clear stop_requested_at after graceful drain; sync stop --wait may time out",
+			slog.WarnContext(
+				ctx, "failed to clear stop_requested_at after graceful drain; sync stop --wait may time out",
 				slog.String("stream_id", streamID),
 				slog.String("error", err.Error()),
 			)
@@ -1253,13 +1262,15 @@ func surfaceSourceError(sourceErrFn func() error) error {
 func (s *Streamer) dispatchApply(ctx context.Context, applier ir.ChangeApplier, streamID string, changes <-chan ir.Change) error {
 	if s.ApplyBatchSize > 1 {
 		if batched, ok := applier.(ir.BatchedChangeApplier); ok {
-			slog.DebugContext(ctx, "applier: batched apply enabled",
+			slog.DebugContext(
+				ctx, "applier: batched apply enabled",
 				slog.String("stream_id", streamID),
 				slog.Int("apply_batch_size", s.ApplyBatchSize),
 			)
 			return batched.ApplyBatch(ctx, streamID, changes, s.ApplyBatchSize)
 		}
-		slog.WarnContext(ctx, "applier: --apply-batch-size requested but applier does not implement BatchedChangeApplier; falling back to per-change apply",
+		slog.WarnContext(
+			ctx, "applier: --apply-batch-size requested but applier does not implement BatchedChangeApplier; falling back to per-change apply",
 			slog.String("stream_id", streamID),
 			slog.Int("apply_batch_size", s.ApplyBatchSize),
 		)
@@ -1285,7 +1296,8 @@ func (s *Streamer) seedLiveAddedFilter(ctx context.Context, applier ir.ChangeApp
 	}
 	tables, err := reader.ReadLiveAddedTables(ctx, streamID)
 	if err != nil {
-		slog.DebugContext(ctx, "live-added-tables seed read failed; poll will retry on first tick",
+		slog.DebugContext(
+			ctx, "live-added-tables seed read failed; poll will retry on first tick",
 			slog.String("stream_id", streamID),
 			slog.String("err", err.Error()),
 		)
@@ -1295,7 +1307,8 @@ func (s *Streamer) seedLiveAddedFilter(ctx context.Context, applier ir.ChangeApp
 		return
 	}
 	target.Set(tables)
-	slog.InfoContext(ctx, "live-added tables observed at startup; merging into dispatch filter (ADR-0034)",
+	slog.InfoContext(
+		ctx, "live-added tables observed at startup; merging into dispatch filter (ADR-0034)",
 		slog.String("stream_id", streamID),
 		slog.Any("tables", tables),
 	)
@@ -1312,12 +1325,14 @@ func (s *Streamer) seedLiveAddedFilter(ctx context.Context, applier ir.ChangeApp
 func (s *Streamer) startLiveAddedTablesPoll(applyCtx context.Context, applier ir.ChangeApplier, streamID string, target *liveAddedFilter) {
 	reader, ok := applier.(liveAddedTablesReader)
 	if !ok {
-		slog.DebugContext(applyCtx, "live-added-tables poll skipped: applier does not implement ReadLiveAddedTables",
+		slog.DebugContext(
+			applyCtx, "live-added-tables poll skipped: applier does not implement ReadLiveAddedTables",
 			slog.String("stream_id", streamID),
 		)
 		return
 	}
-	slog.DebugContext(applyCtx, "live-added-tables poll started",
+	slog.DebugContext(
+		applyCtx, "live-added-tables poll started",
 		slog.String("stream_id", streamID),
 	)
 	go pollLiveAddedTables(applyCtx, reader, streamID, target)
@@ -1339,12 +1354,14 @@ func (s *Streamer) startLiveAddedTablesPoll(applyCtx context.Context, applier ir
 func (s *Streamer) startStopSignalPoll(applyCtx context.Context, applier ir.ChangeApplier, streamID string, cancelStream, cancelApply context.CancelFunc, observed *atomic.Bool) {
 	reader, ok := applier.(stopFlagReader)
 	if !ok {
-		slog.DebugContext(applyCtx, "stop-signal poll skipped: applier does not implement ReadStopRequested",
+		slog.DebugContext(
+			applyCtx, "stop-signal poll skipped: applier does not implement ReadStopRequested",
 			slog.String("stream_id", streamID),
 		)
 		return
 	}
-	slog.DebugContext(applyCtx, "stop-signal poll started",
+	slog.DebugContext(
+		applyCtx, "stop-signal poll started",
 		slog.String("stream_id", streamID),
 	)
 	go pollStopSignal(applyCtx, reader, streamID, cancelStream, cancelApply, observed)
@@ -1362,7 +1379,8 @@ func (s *Streamer) startStopSignalPoll(applyCtx context.Context, applier ir.Chan
 // cold-start would do, just without then opening the snapshot
 // stream or starting CDC.
 func (s *Streamer) logDryRunPlan(ctx context.Context, streamID string, persisted ir.Position, found bool) error {
-	slog.InfoContext(ctx, "dry run: stream plan",
+	slog.InfoContext(
+		ctx, "dry run: stream plan",
 		slog.String("source", s.Source.Name()),
 		slog.String("source_host", redactedHost(s.SourceDSN)),
 		slog.String("target", s.Target.Name()),
@@ -1370,13 +1388,15 @@ func (s *Streamer) logDryRunPlan(ctx context.Context, streamID string, persisted
 		slog.String("stream_id", streamID),
 	)
 	if found {
-		slog.InfoContext(ctx, "dry run: warm resume from persisted position",
+		slog.InfoContext(
+			ctx, "dry run: warm resume from persisted position",
 			slog.String("stream_id", streamID),
 			slog.String("position_token", truncateDryRunToken(persisted.Token, 80)),
 		)
 		return nil
 	}
-	slog.InfoContext(ctx, "dry run: cold start — would capture snapshot, bulk-copy, then start CDC",
+	slog.InfoContext(
+		ctx, "dry run: cold start — would capture snapshot, bulk-copy, then start CDC",
 		slog.String("stream_id", streamID),
 	)
 
@@ -1413,13 +1433,15 @@ func (s *Streamer) logDryRunPlan(ctx context.Context, streamID string, persisted
 	if _, err := translate.ApplyExpressionOverrides(mapped, s.ExpressionMappings); err != nil {
 		return fmt.Errorf("pipeline: dry-run: apply expression overrides: %w", err)
 	}
-	slog.InfoContext(ctx, "dry run: tables to bulk-copy and tail via CDC",
+	slog.InfoContext(
+		ctx, "dry run: tables to bulk-copy and tail via CDC",
 		slog.Int("tables", len(schema.Tables)),
 	)
 	for _, t := range schema.Tables {
 		// secondary_indexes excludes the primary key (reported via
 		// primary_key) — see migrate.go logPlan for the rationale.
-		slog.InfoContext(ctx, "dry run: table",
+		slog.InfoContext(
+			ctx, "dry run: table",
 			slog.String("name", t.Name),
 			slog.Int("columns", len(t.Columns)),
 			slog.Bool("primary_key", t.PrimaryKey != nil),
@@ -1505,7 +1527,8 @@ func (s *Streamer) openApplier(ctx context.Context) (ir.ChangeApplier, bool, err
 // inline) so the caller can defer it unconditionally.
 func (s *Streamer) warmResume(ctx context.Context, persisted ir.Position, lsnTracker any) (changes <-chan ir.Change, stop func(), err error) {
 	stop = func() {}
-	slog.InfoContext(ctx, "warm resume from persisted position",
+	slog.InfoContext(
+		ctx, "warm resume from persisted position",
 		slog.String("position_token", persisted.Token),
 	)
 	cdc, err := openCDCReaderWithOptionalSlot(ctx, s.Source, s.SourceDSN, s.SlotName)
@@ -1636,7 +1659,8 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 	// returned stop closure (set on the success path below) closes it
 	// so the engine-side streaming goroutine is joined deterministically
 	// when Streamer.Run unwinds.
-	slog.InfoContext(ctx, "cold start; snapshot captured",
+	slog.InfoContext(
+		ctx, "cold start; snapshot captured",
 		slog.String("position_token", stream.Position.Token),
 	)
 
@@ -1677,7 +1701,8 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 		// can't validate that without round-trips that the operator
 		// has explicitly opted out of. Bulk-copy runs into the
 		// operator-prepared empty tables.
-		slog.InfoContext(ctx, "schema-already-applied: skipping cold-start preflight + DDL phases (GitHub #17)",
+		slog.InfoContext(
+			ctx, "schema-already-applied: skipping cold-start preflight + DDL phases (GitHub #17)",
 			slog.String("stream_id", streamID),
 		)
 	default:
@@ -1714,7 +1739,8 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 	// position is independent of the exporting tx; CDC continues on
 	// its own connection.
 	if err := stream.ReleaseRows(); err != nil {
-		slog.WarnContext(ctx, "release snapshot rows failed; CDC will continue but the snapshot tx may stay open",
+		slog.WarnContext(
+			ctx, "release snapshot rows failed; CDC will continue but the snapshot tx may stay open",
 			slog.String("error", err.Error()),
 		)
 	}
@@ -1746,7 +1772,8 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 			_ = stream.Close()
 			return nil, stop, wrapWithHint(PhaseCDC, fmt.Errorf("pipeline: persist cold-start CDC anchor position: %w", err))
 		}
-		slog.DebugContext(ctx, "cold-start CDC anchor persisted",
+		slog.DebugContext(
+			ctx, "cold-start CDC anchor persisted",
 			slog.String("stream_id", streamID),
 			slog.String("position_token", stream.Position.Token),
 		)
@@ -1755,7 +1782,8 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 		// that doesn't would have shipped with the issue #15 wedge,
 		// but the fall-through preserves pre-fix behaviour rather than
 		// hard-erroring.
-		slog.WarnContext(ctx, "applier does not implement ir.PositionWriter; cold-start CDC anchor cannot be persisted — GitHub issue #15 wedge risk",
+		slog.WarnContext(
+			ctx, "applier does not implement ir.PositionWriter; cold-start CDC anchor cannot be persisted — GitHub issue #15 wedge risk",
 			slog.String("stream_id", streamID),
 		)
 	}
@@ -1939,7 +1967,8 @@ func openCDCReaderWithOptionalSlot(ctx context.Context, source ir.Engine, dsn, s
 	// Engine doesn't implement the slot-aware surface. Use the
 	// default and emit a debug-level note so the operator can spot
 	// the silent ignore via --log-level=debug if curious.
-	slog.DebugContext(ctx, "engine does not implement CDCReaderWithSlotOpener; --slot-name silently ignored",
+	slog.DebugContext(
+		ctx, "engine does not implement CDCReaderWithSlotOpener; --slot-name silently ignored",
 		slog.String("engine", source.Name()),
 	)
 	return source.OpenCDCReader(ctx, dsn)
@@ -1954,7 +1983,8 @@ func openSnapshotStreamWithOptionalSlot(ctx context.Context, source ir.Engine, d
 	if opener, ok := source.(ir.SnapshotStreamWithSlotOpener); ok {
 		return opener.OpenSnapshotStreamWithSlot(ctx, dsn, slotName)
 	}
-	slog.DebugContext(ctx, "engine does not implement SnapshotStreamWithSlotOpener; --slot-name silently ignored",
+	slog.DebugContext(
+		ctx, "engine does not implement SnapshotStreamWithSlotOpener; --slot-name silently ignored",
 		slog.String("engine", source.Name()),
 	)
 	return source.OpenSnapshotStream(ctx, dsn)

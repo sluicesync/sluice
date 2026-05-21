@@ -147,7 +147,8 @@ func rewriteGeneratedExprs(tbl *ir.Table, colMap map[string]string) *ir.Table {
 		newCol := *c
 		newCol.GeneratedExpr = newExpr
 		newCol.GeneratedExprDialect = ""
-		slog.Info("translate: applying expression override",
+		slog.Info(
+			"translate: applying expression override",
 			slog.String("table", tbl.Name),
 			slog.String("column", c.Name),
 		)

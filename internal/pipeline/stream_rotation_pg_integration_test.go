@@ -111,7 +111,8 @@ func TestADR0046_ZeroLossMultiSegmentRotation_PG(t *testing.T) {
 			default:
 			}
 			applyDDL(t, sourceDSN, fmt.Sprintf(
-				`INSERT INTO users (email) VALUES ('row%03d@example.com');`, i))
+				`INSERT INTO users (email) VALUES ('row%03d@example.com');`, i,
+			))
 			time.Sleep(40 * time.Millisecond)
 		}
 	}()
@@ -241,7 +242,8 @@ func TestADR0046_CrashInjectionMatrix_PG(t *testing.T) {
 			// rotation FSM fires and we crash it at `edge`.
 			for i := 0; i < 8; i++ {
 				applyDDL(t, sourceDSN, fmt.Sprintf(
-					`INSERT INTO users (email) VALUES ('pre%02d@example.com');`, i))
+					`INSERT INTO users (email) VALUES ('pre%02d@example.com');`, i,
+				))
 			}
 
 			// Arm the crash failpoint exactly once at this edge.
@@ -293,7 +295,8 @@ func TestADR0046_CrashInjectionMatrix_PG(t *testing.T) {
 			// Drive a few more writes after the crash.
 			for i := 0; i < 5; i++ {
 				applyDDL(t, sourceDSN, fmt.Sprintf(
-					`INSERT INTO users (email) VALUES ('post%02d@example.com');`, i))
+					`INSERT INTO users (email) VALUES ('post%02d@example.com');`, i,
+				))
 			}
 
 			// Restart: recoverRotationState reconciles the marker. <=COMMIT
@@ -453,7 +456,8 @@ func TestADR0046_MixedCodecLineageRestores_PG(t *testing.T) {
 	var segs []LineageSegment
 	for i, c := range codecs {
 		applyDDL(t, sourceDSN, fmt.Sprintf(
-			`TRUNCATE users; INSERT INTO users (email) VALUES ('seg%d-x@example.com'),('seg%d-y@example.com');`, i, i))
+			`TRUNCATE users; INSERT INTO users (email) VALUES ('seg%d-x@example.com'),('seg%d-y@example.com');`, i, i,
+		))
 		segDir := ""
 		if i > 0 {
 			segDir = fmt.Sprintf("seg-%d", i)

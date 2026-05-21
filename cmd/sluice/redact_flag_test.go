@@ -78,7 +78,8 @@ func TestRedactFlag_KongCommaPreservation(t *testing.T) {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
 			cli := &CLI{}
-			parser, err := kong.New(cli,
+			parser, err := kong.New(
+				cli,
 				kong.Vars{"version": "test"},
 				kong.Exit(func(int) {}),
 			)

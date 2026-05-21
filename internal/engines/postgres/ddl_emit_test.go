@@ -870,7 +870,8 @@ func TestEmitCreateEnumType(t *testing.T) {
 func TestEmitCreateEnumType_PreservesSourceTypeName(t *testing.T) {
 	got := emitCreateEnumType(
 		ir.Enum{Values: []string{"draft", "published", "archived", "deleted"}, TypeName: "post_status"},
-		"public", "posts", "status")
+		"public", "posts", "status",
+	)
 	want := `CREATE TYPE "public"."post_status" AS ENUM ('draft', 'published', 'archived', 'deleted');`
 	if got != want {
 		t.Errorf("\n got  %q\n want %q", got, want)

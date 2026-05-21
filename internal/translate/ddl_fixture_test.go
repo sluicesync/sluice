@@ -137,7 +137,8 @@ func TestDDLFixture(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
 
-	container, err := mysqltc.Run(ctx,
+	container, err := mysqltc.Run(
+		ctx,
 		"mysql:8.0",
 		mysqltc.WithDatabase("sluice_ddlfixture"),
 		mysqltc.WithUsername("test"),

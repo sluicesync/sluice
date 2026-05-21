@@ -295,7 +295,8 @@ func requestStreamStopAt(ctx context.Context, store ir.BackupStore, path string,
 	// [notifyStreamStop] / [registerStreamStopChan] in
 	// stream_stop_registry.go.
 	if notifyStreamStop(store) {
-		slog.DebugContext(ctx, "stream stop: in-process channel signalled",
+		slog.DebugContext(
+			ctx, "stream stop: in-process channel signalled",
 			slog.String("path", path),
 		)
 	}

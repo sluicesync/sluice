@@ -288,7 +288,8 @@ func PruneChain(ctx context.Context, store ir.BackupStore, opts PruneOpts) (*Pru
 	if err := writeLineageCatalog(ctx, store, cat); err != nil {
 		return nil, fmt.Errorf("prune: rewrite lineage catalog: %w", err)
 	}
-	slog.InfoContext(ctx, "prune: lineage pruned",
+	slog.InfoContext(
+		ctx, "prune: lineage pruned",
 		slog.Int("segments_dropped", res.SegmentsDropped),
 		slog.Int("manifests_dropped", len(res.Pruned)),
 		slog.Int("chunks_deleted", res.ChunksDeleted),
@@ -406,7 +407,8 @@ func SchemaHistoryRetentionFloor(
 		// (Bug-74 class — never guess on a partial order).
 		return ir.Position{}, false, fmt.Errorf(
 			"schema-history floor: live safe-point %+v and oldest backup resume %+v are incomparable under the engine's partial order; cannot pick a single retention floor (loud-failure tenet)",
-			liveSafePoint, backupFloor)
+			liveSafePoint, backupFloor,
+		)
 	}
 }
 

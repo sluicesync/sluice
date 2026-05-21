@@ -450,7 +450,8 @@ func TestMigrate_PG_TargetSchema_EnumColumn(t *testing.T) {
 	// SQLSTATE 42704 because the column-type ident wasn't qualified
 	// and the DEFAULT cast pointed at a bare type that search_path
 	// can't resolve.
-	if _, err := db.ExecContext(ctx,
+	if _, err := db.ExecContext(
+		ctx,
 		`INSERT INTO customer_svc.orders (total) VALUES (49.99)`,
 	); err != nil {
 		t.Fatalf("INSERT into customer_svc.orders (with default 'pending'::enum cast): %v", err)

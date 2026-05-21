@@ -142,7 +142,8 @@ func decodeBinlogPos(p ir.Position) (decoded binlogPos, ok bool, err error) {
 	if !isMySQLFamilyEngine(p.Engine) {
 		return binlogPos{}, false, fmt.Errorf(
 			"mysql: decode binlog position: engine = %q; want %q or %q",
-			p.Engine, engineNameMySQL, engineNameVStream)
+			p.Engine, engineNameMySQL, engineNameVStream,
+		)
 	}
 	if p.Token == "" {
 		return binlogPos{}, false, errors.New("mysql: decode binlog position: token is empty")

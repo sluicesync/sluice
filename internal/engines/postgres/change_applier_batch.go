@@ -99,7 +99,8 @@ func (a *ChangeApplier) ApplyBatch(ctx context.Context, streamID string, changes
 			return err
 		}
 		if batchN > 0 {
-			slog.DebugContext(ctx, "postgres: applier: batch committed",
+			slog.DebugContext(
+				ctx, "postgres: applier: batch committed",
 				slog.String("stream_id", streamID),
 				slog.Int("rows", batchN),
 				slog.String("position_token", truncateBatchToken(lastPos.Token, 80)),
@@ -145,7 +146,8 @@ func (a *ChangeApplier) applyOneBatch(ctx context.Context, streamID string, chan
 	batchStart := time.Now()
 	defer func() {
 		if n > 0 {
-			slog.DebugContext(ctx, "applier: batch latency",
+			slog.DebugContext(
+				ctx, "applier: batch latency",
 				slog.String("stream_id", streamID),
 				slog.Int("rows", n),
 				slog.Int64("millis", time.Since(batchStart).Milliseconds()),
@@ -199,7 +201,8 @@ func (a *ChangeApplier) applyOneBatch(ctx context.Context, streamID string, chan
 
 	if err := a.dispatch(ctx, tx, streamID, first); err != nil {
 		_ = tx.Rollback()
-		slog.WarnContext(ctx, "postgres: applier: batch rollback on error",
+		slog.WarnContext(
+			ctx, "postgres: applier: batch rollback on error",
 			slog.String("stream_id", streamID),
 			slog.Int("rows_attempted", 1),
 			slog.String("err", err.Error()),
@@ -286,7 +289,8 @@ func (a *ChangeApplier) applyOneBatch(ctx context.Context, streamID string, chan
 			}
 			if err := a.dispatch(ctx, tx, streamID, c); err != nil {
 				_ = tx.Rollback()
-				slog.WarnContext(ctx, "postgres: applier: batch rollback on error",
+				slog.WarnContext(
+					ctx, "postgres: applier: batch rollback on error",
 					slog.String("stream_id", streamID),
 					slog.Int("rows_attempted", n+1),
 					slog.String("err", err.Error()),
@@ -318,7 +322,8 @@ func (a *ChangeApplier) applyOneBatch(ctx context.Context, streamID string, chan
 			// after the dispatch so the just-dispatched change is
 			// included in the count we commit.
 			if batchBytes >= byteCap {
-				slog.DebugContext(ctx, "postgres: applier: byte-cap flush",
+				slog.DebugContext(
+					ctx, "postgres: applier: byte-cap flush",
 					slog.String("stream_id", streamID),
 					slog.Int("rows", n),
 					slog.Int64("bytes", batchBytes),
@@ -337,7 +342,8 @@ func (a *ChangeApplier) applyOneBatch(ctx context.Context, streamID string, chan
 			}
 			idle.Reset(defaultIdleFlushPeriod)
 		case <-idle.C:
-			slog.DebugContext(ctx, "postgres: applier: idle flush",
+			slog.DebugContext(
+				ctx, "postgres: applier: idle flush",
 				slog.String("stream_id", streamID),
 				slog.Int("rows", n),
 				slog.Duration("idle", defaultIdleFlushPeriod),
@@ -370,7 +376,8 @@ func (a *ChangeApplier) commitBatch(ctx context.Context, tx *sql.Tx, streamID, t
 	posCancel()
 	if err != nil {
 		_ = tx.Rollback()
-		slog.WarnContext(ctx, "postgres: applier: batch rollback on position-write error",
+		slog.WarnContext(
+			ctx, "postgres: applier: batch rollback on position-write error",
 			slog.String("stream_id", streamID),
 			slog.Int("rows_attempted", rows),
 			slog.String("err", err.Error()),
@@ -378,7 +385,8 @@ func (a *ChangeApplier) commitBatch(ctx context.Context, tx *sql.Tx, streamID, t
 		return err
 	}
 	if err := a.commitWithTimeout(tx); err != nil {
-		slog.WarnContext(ctx, "postgres: applier: batch commit error",
+		slog.WarnContext(
+			ctx, "postgres: applier: batch commit error",
 			slog.String("stream_id", streamID),
 			slog.Int("rows_attempted", rows),
 			slog.String("err", err.Error()),

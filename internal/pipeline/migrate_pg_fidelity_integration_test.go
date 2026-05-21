@@ -160,7 +160,8 @@ func TestMigrate_PG_SchemaFidelity_Pass3(t *testing.T) {
 
 	// #19c — enum type name preserved verbatim (not synthesized).
 	var enumName string
-	if err := db.QueryRowContext(ctx,
+	if err := db.QueryRowContext(
+		ctx,
 		`SELECT t.typname FROM pg_type t WHERE t.typtype='e' AND t.typname='post_status'`,
 	).Scan(&enumName); err != nil {
 		t.Errorf("#19c: enum type 'post_status' not found on target (renamed?): %v", err)
@@ -175,7 +176,8 @@ func TestMigrate_PG_SchemaFidelity_Pass3(t *testing.T) {
 	if tblComment.String != "user accounts (self-ref manager FK)" {
 		t.Errorf("#19d: table comment = %q; want preserved", tblComment.String)
 	}
-	if err := db.QueryRowContext(ctx,
+	if err := db.QueryRowContext(
+		ctx,
 		`SELECT col_description('accounts'::regclass,
 			(SELECT attnum FROM pg_attribute WHERE attrelid='accounts'::regclass AND attname='handle'))`,
 	).Scan(&colComment); err != nil {
@@ -187,7 +189,8 @@ func TestMigrate_PG_SchemaFidelity_Pass3(t *testing.T) {
 
 	// #17 — tsvector column carried verbatim (type + data).
 	var tsvType string
-	if err := db.QueryRowContext(ctx,
+	if err := db.QueryRowContext(
+		ctx,
 		`SELECT format_type(a.atttypid, a.atttypmod)
 		   FROM pg_attribute a
 		  WHERE a.attrelid='posts'::regclass AND a.attname='search'`,

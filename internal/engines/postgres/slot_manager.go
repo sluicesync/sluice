@@ -114,7 +114,8 @@ func (m *SlotManager) Drop(ctx context.Context, name string, force bool) error {
 	if active && !force {
 		return fmt.Errorf(
 			"postgres: drop slot %q: slot is active (a CDC consumer is currently connected); pass --force to drop anyway. The connected consumer will fail with a clear error and can be restarted",
-			name)
+			name,
+		)
 	}
 
 	const q = `SELECT pg_drop_replication_slot($1)`

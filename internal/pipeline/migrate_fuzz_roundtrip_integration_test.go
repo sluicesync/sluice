@@ -355,7 +355,8 @@ func dumpFixture(t *testing.T, gc *genCase, msg string) string {
 			"-- seed=%d direction=%s caseIdx=%d\n"+
 			"-- verdict: %s\n"+
 			"-- replay: SLUICE_FUZZ_SEED=%d go test -tags=integration -run TestFuzzRoundtrip_ReplayDumpedFixture ./internal/pipeline\n\n",
-		gc.seed, gc.dir, gc.caseIdx, msg, gc.seed)
+		gc.seed, gc.dir, gc.caseIdx, msg, gc.seed,
+	)
 	if err := os.WriteFile(p, []byte(header+gc.ddl), 0o600); err != nil {
 		t.Logf("could not write fixture %s: %v", p, err)
 		return ""

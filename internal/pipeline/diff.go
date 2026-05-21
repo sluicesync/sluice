@@ -167,7 +167,8 @@ func (d *Differ) Run(ctx context.Context) (*ir.SchemaDiff, error) {
 	// Computed before the read so the Bug-76 scope push-down (below)
 	// matches the authoritative post-read prune.
 	if eff, added := effectiveTableFilter(d.Filter, d.Source, d.SourceDSN); len(added) > 0 {
-		slog.InfoContext(ctx, "applying engine-default table exclusions",
+		slog.InfoContext(
+			ctx, "applying engine-default table exclusions",
 			slog.String("engine", d.Source.Name()),
 			slog.Any("patterns", added),
 		)

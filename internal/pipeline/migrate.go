@@ -281,7 +281,8 @@ func (m *Migrator) Run(ctx context.Context) error {
 	// --include-table short-circuits the merge. Replace the field
 	// in-place because the orchestrator is single-shot per Run.
 	if eff, added := effectiveTableFilter(m.Filter, m.Source, m.SourceDSN); len(added) > 0 {
-		slog.InfoContext(ctx, "applying engine-default table exclusions",
+		slog.InfoContext(
+			ctx, "applying engine-default table exclusions",
 			slog.String("engine", m.Source.Name()),
 			slog.Any("patterns", added),
 		)
@@ -776,7 +777,8 @@ func copyTableIdempotent(ctx context.Context, rr ir.RowReader, rw ir.RowWriter, 
 	redacted, redactErrFn := redactRows(copyCtx, teed, redactor, table.Schema, table.Name, table.Columns, tablePKColumns(table), streamID)
 	idem, ok := rw.(ir.IdempotentRowWriter)
 	if !ok {
-		slog.DebugContext(ctx, "add-table: row writer does not implement IdempotentRowWriter; falling back to plain WriteRows (the [publication-add, snapshot-open] overlap window may surface as a duplicate-key error under sustained load)",
+		slog.DebugContext(
+			ctx, "add-table: row writer does not implement IdempotentRowWriter; falling back to plain WriteRows (the [publication-add, snapshot-open] overlap window may surface as a duplicate-key error under sustained load)",
 			slog.String("table", table.Name),
 		)
 		if err := rw.WriteRows(copyCtx, table, redacted); err != nil {
@@ -948,7 +950,8 @@ func runViewsPhase(ctx context.Context, schema *ir.Schema, sw ir.SchemaWriter) e
 					// Last pass — accumulate the error for the caller.
 					lastErrs = append(lastErrs, fmt.Errorf("view %q: %w", v.Name, err))
 				} else {
-					slog.DebugContext(ctx, "view create failed, will retry",
+					slog.DebugContext(
+						ctx, "view create failed, will retry",
 						slog.String("view", v.Name),
 						slog.Int("pass", pass+1),
 						slog.String("error", err.Error()),
@@ -962,7 +965,8 @@ func runViewsPhase(ctx context.Context, schema *ir.Schema, sw ir.SchemaWriter) e
 			// help (no view-create succeeded to unblock the rest). Force
 			// the next iteration to be the last so the caller gets the
 			// accumulated errors.
-			slog.DebugContext(ctx, "no progress in views phase; bailing to error report",
+			slog.DebugContext(
+				ctx, "no progress in views phase; bailing to error report",
 				slog.Int("pending", len(nextPending)),
 				slog.Int("pass", pass+1),
 			)
@@ -1134,7 +1138,8 @@ func copyTable(ctx context.Context, rr ir.RowReader, rw ir.RowWriter, table *ir.
 // or approximate depending on the engine — see [ir.RowCounter]'s
 // doc-comment.
 func (m *Migrator) logPlan(ctx context.Context, schema *ir.Schema) error {
-	slog.InfoContext(ctx, "dry run: migration plan",
+	slog.InfoContext(
+		ctx, "dry run: migration plan",
 		slog.String("source", m.Source.Name()),
 		slog.String("target", m.Target.Name()),
 		slog.Int("tables", len(schema.Tables)),
@@ -1152,7 +1157,8 @@ func (m *Migrator) logPlan(ctx context.Context, schema *ir.Schema) error {
 		// stores PK on its own field, and operators comparing against
 		// psql / SHOW INDEX output have been confused by a bare
 		// "indexes" count that didn't include PK.
-		slog.InfoContext(ctx, "dry run: table",
+		slog.InfoContext(
+			ctx, "dry run: table",
 			slog.String("name", t.Name),
 			slog.Int("columns", len(t.Columns)),
 			slog.Bool("primary_key", t.PrimaryKey != nil),
@@ -1183,7 +1189,8 @@ func dryRunRowCounts(ctx context.Context, source ir.Engine, dsn string, schema *
 
 	rr, err := source.OpenRowReader(ctx, dsn)
 	if err != nil {
-		slog.WarnContext(ctx, "dry run: row counts unavailable (failed to open source row reader)",
+		slog.WarnContext(
+			ctx, "dry run: row counts unavailable (failed to open source row reader)",
 			slog.String("error", err.Error()),
 		)
 		return counts
@@ -1192,7 +1199,8 @@ func dryRunRowCounts(ctx context.Context, source ir.Engine, dsn string, schema *
 
 	counter, ok := rr.(ir.RowCounter)
 	if !ok {
-		slog.DebugContext(ctx, "dry run: source engine doesn't implement RowCounter; row counts omitted",
+		slog.DebugContext(
+			ctx, "dry run: source engine doesn't implement RowCounter; row counts omitted",
 			slog.String("engine", source.Name()),
 		)
 		return counts
@@ -1201,7 +1209,8 @@ func dryRunRowCounts(ctx context.Context, source ir.Engine, dsn string, schema *
 	for _, t := range schema.Tables {
 		n, err := counter.CountRows(ctx, t)
 		if err != nil {
-			slog.WarnContext(ctx, "dry run: row count failed for table",
+			slog.WarnContext(
+				ctx, "dry run: row count failed for table",
 				slog.String("table", t.Name),
 				slog.String("error", err.Error()),
 			)

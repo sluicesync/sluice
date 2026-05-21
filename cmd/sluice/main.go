@@ -56,7 +56,8 @@ var logLevels = map[string]slog.Level{
 
 func main() {
 	cli := &CLI{}
-	ctx := kong.Parse(cli,
+	ctx := kong.Parse(
+		cli,
 		kong.Name("sluice"),
 		kong.Description("Open-source database migration and continuous-sync tool."),
 		kong.UsageOnError(),
@@ -103,13 +104,15 @@ func startPprofIfRequested(addr string) {
 		fmt.Fprintf(os.Stderr, "sluice: --pprof-listen %q: %v\n", addr, err)
 		os.Exit(1)
 	}
-	slog.InfoContext(context.Background(), "pprof endpoint listening",
+	slog.InfoContext(
+		context.Background(), "pprof endpoint listening",
 		slog.String("addr", addr),
 		slog.String("hint", "fetch /debug/pprof/goroutine?debug=2 to dump goroutine stacks"),
 	)
 	go func() {
 		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
-			slog.WarnContext(context.Background(), "pprof endpoint stopped",
+			slog.WarnContext(
+				context.Background(), "pprof endpoint stopped",
 				slog.String("err", err.Error()),
 			)
 		}

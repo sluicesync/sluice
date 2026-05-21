@@ -142,7 +142,8 @@ func rowExistsCompositeKey(t *testing.T, dsn, table string, orderID, lineNo int)
 	defer cancel()
 
 	var exists bool
-	err = db.QueryRowContext(ctx,
+	err = db.QueryRowContext(
+		ctx,
 		"SELECT EXISTS (SELECT 1 FROM "+table+" WHERE order_id = $1 AND line_no = $2)",
 		orderID, lineNo,
 	).Scan(&exists)

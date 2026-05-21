@@ -391,7 +391,8 @@ func TestPreflight_PG_DetectsPhysicalSlot(t *testing.T) {
 
 	// Create a non-temporary physical replication slot to simulate
 	// the HA-cluster shape.
-	if _, err := db.ExecContext(context.Background(),
+	if _, err := db.ExecContext(
+		context.Background(),
 		`SELECT pg_create_physical_replication_slot('sluice_test_phys_slot', false, false)`,
 	); err != nil {
 		t.Fatalf("create physical slot: %v", err)
@@ -490,7 +491,8 @@ func startPostgresLogicalWithClusterName(t *testing.T, clusterName string) (sour
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	container, err := pgtc.Run(ctx,
+	container, err := pgtc.Run(
+		ctx,
 		"postgres:16",
 		pgtc.WithDatabase("source_db"),
 		pgtc.WithUsername("test"),
@@ -538,7 +540,8 @@ func TestSyncStart_PatroniMode_Off_SuppressesWarning(t *testing.T) {
 	defer func() { _ = db.Close() }()
 
 	// Trip Signal 4: create a non-temporary physical replication slot.
-	if _, err := db.ExecContext(context.Background(),
+	if _, err := db.ExecContext(
+		context.Background(),
 		`SELECT pg_create_physical_replication_slot('sluice_test_phys_off', false, false)`,
 	); err != nil {
 		t.Fatalf("create physical slot: %v", err)

@@ -216,7 +216,8 @@ func TestSyncFromBackup_Postgres_HappyPath(t *testing.T) {
 	// Drive 5 INSERTs on the source so the stream can roll them up.
 	for i := 0; i < 5; i++ {
 		applyDDL(t, sourceDSN, fmt.Sprintf(
-			`INSERT INTO users (email) VALUES ('user%d@example.com');`, i))
+			`INSERT INTO users (email) VALUES ('user%d@example.com');`, i,
+		))
 	}
 
 	// Wait for at least 1 incremental to land in the chain.
@@ -442,7 +443,8 @@ func TestSyncFromBackup_RestartResumes(t *testing.T) {
 	defer streamCancel()
 	for i := 0; i < 10; i++ {
 		applyDDL(t, sourceDSN, fmt.Sprintf(
-			`INSERT INTO users (email) VALUES ('round1-%d@example.com');`, i))
+			`INSERT INTO users (email) VALUES ('round1-%d@example.com');`, i,
+		))
 	}
 	waitForIncrementals(t, store, 2, 30*time.Second)
 
@@ -473,7 +475,8 @@ func TestSyncFromBackup_RestartResumes(t *testing.T) {
 	// incremental.
 	for i := 0; i < 5; i++ {
 		applyDDL(t, sourceDSN, fmt.Sprintf(
-			`INSERT INTO users (email) VALUES ('round2-%d@example.com');`, i))
+			`INSERT INTO users (email) VALUES ('round2-%d@example.com');`, i,
+		))
 	}
 	waitForIncrementals(t, store, 3, 30*time.Second)
 

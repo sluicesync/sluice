@@ -199,7 +199,8 @@ func pollStopSignal(pollCtx context.Context, reader stopFlagReader, streamID str
 			if pollCtx.Err() != nil {
 				return
 			}
-			slog.WarnContext(pollCtx, "stop-signal poll failed; will retry on next tick",
+			slog.WarnContext(
+				pollCtx, "stop-signal poll failed; will retry on next tick",
 				slog.String("err", err.Error()),
 			)
 			continue
@@ -208,7 +209,8 @@ func pollStopSignal(pollCtx context.Context, reader stopFlagReader, streamID str
 			if observed != nil {
 				observed.Store(true)
 			}
-			slog.InfoContext(pollCtx, "stop requested via control table; draining stream and exiting",
+			slog.InfoContext(
+				pollCtx, "stop requested via control table; draining stream and exiting",
 				slog.String("stream_id", streamID),
 			)
 			cancelStream()
@@ -226,7 +228,8 @@ func pollStopSignal(pollCtx context.Context, reader stopFlagReader, streamID str
 				select {
 				case <-pollCtx.Done():
 				case <-time.After(drainTimeout):
-					slog.WarnContext(pollCtx, "graceful drain timed out; hard-cancelling apply",
+					slog.WarnContext(
+						pollCtx, "graceful drain timed out; hard-cancelling apply",
 						slog.String("stream_id", streamID),
 						slog.Duration("timeout", drainTimeout),
 					)

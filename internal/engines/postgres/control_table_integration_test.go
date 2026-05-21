@@ -91,7 +91,8 @@ func TestEnsureControlTable_AddsStopRequestedColumn(t *testing.T) {
 	// Existing row should be preserved with its old token.
 	var token string
 	var stopReq sql.NullTime
-	if err := db.QueryRowContext(ctx,
+	if err := db.QueryRowContext(
+		ctx,
 		`SELECT source_position, stop_requested_at FROM "public"."sluice_cdc_state" WHERE stream_id = $1`,
 		"legacy-stream",
 	).Scan(&token, &stopReq); err != nil {
@@ -287,7 +288,8 @@ func TestEnsureControlTable_AddsTargetSchemaColumn(t *testing.T) {
 		fingerprint sql.NullString
 		ts          sql.NullString
 	)
-	if err := db.QueryRowContext(ctx,
+	if err := db.QueryRowContext(
+		ctx,
 		`SELECT source_position, slot_name, source_dsn_fingerprint, target_schema
 		 FROM   "public"."sluice_cdc_state" WHERE stream_id = $1`,
 		"legacy-stream",

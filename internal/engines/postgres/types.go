@@ -186,7 +186,8 @@ func translateType(c columnMeta) (ir.Type, error) {
 					"postgres: extension %q is not in the catalog "+
 						"(internal error — schema reader recognised it "+
 						"earlier in the pipeline)",
-					c.ExtensionName)
+					c.ExtensionName,
+				)
 			}
 			return def.build(c.ExtensionTypeName, c.AttTypmod)
 		}
@@ -248,7 +249,8 @@ func translateType(c columnMeta) (ir.Type, error) {
 						"returned empty (cannot re-emit a column with no "+
 						"type spelling) — this is a sluice bug; please "+
 						"report it",
-					c.UDTName)
+					c.UDTName,
+				)
 			}
 			return ir.VerbatimType{Definition: c.FormatType}, nil
 		}
@@ -264,7 +266,8 @@ func translateType(c columnMeta) (ir.Type, error) {
 				"postgres: user-defined type %q is owned by extension %q; "+
 					"pass --enable-pg-extension %s to enable passthrough "+
 					"(ADR-0032)",
-				c.UDTName, owningExt, owningExt)
+				c.UDTName, owningExt, owningExt,
+			)
 		}
 		return nil, fmt.Errorf("postgres: user-defined type %q is not a recognised enum", c.UDTName)
 	}
@@ -383,7 +386,8 @@ func translateType(c columnMeta) (ir.Type, error) {
 					"postgres: core type %q is eligible for verbatim "+
 						"passthrough but pg_catalog.format_type returned "+
 						"empty — this is a sluice bug; please report it",
-					c.DataType)
+					c.DataType,
+				)
 			}
 			return ir.VerbatimType{Definition: c.FormatType}, nil
 		}

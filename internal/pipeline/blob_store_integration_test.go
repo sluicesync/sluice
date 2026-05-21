@@ -116,7 +116,8 @@ func randomSuffix() string {
 // (MinIO's default behavior); credentials are the well-known root
 // user from the container env.
 func createMinIOBucket(ctx context.Context, endpoint, name string) error {
-	cfg, err := awsconfig.LoadDefaultConfig(ctx,
+	cfg, err := awsconfig.LoadDefaultConfig(
+		ctx,
 		awsconfig.WithRegion(minioRegion),
 		awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(minioAccessKey, minioSecretKey, "")),
 	)
@@ -244,7 +245,8 @@ func assertS3KeyExists(t *testing.T, endpoint, bucket, key string) error {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	cfg, err := awsconfig.LoadDefaultConfig(ctx,
+	cfg, err := awsconfig.LoadDefaultConfig(
+		ctx,
 		awsconfig.WithRegion(minioRegion),
 		awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(minioAccessKey, minioSecretKey, "")),
 	)

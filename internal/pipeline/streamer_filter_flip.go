@@ -168,7 +168,8 @@ func filterChangesWithLiveAdd(ctx context.Context, in <-chan ir.Change, base Tab
 					return
 				}
 				if !changeAllowedWithLiveAdd(c, base, live) {
-					slog.DebugContext(ctx, "cdc event dropped by table filter",
+					slog.DebugContext(
+						ctx, "cdc event dropped by table filter",
 						slog.String("table", c.QualifiedName()),
 					)
 					continue
@@ -245,7 +246,8 @@ func pollLiveAddedTables(pollCtx context.Context, reader liveAddedTablesReader, 
 			if pollCtx.Err() != nil {
 				return
 			}
-			slog.WarnContext(pollCtx, "live-added-tables poll failed; will retry on next tick",
+			slog.WarnContext(
+				pollCtx, "live-added-tables poll failed; will retry on next tick",
 				slog.String("err", err.Error()),
 			)
 			continue
@@ -256,7 +258,8 @@ func pollLiveAddedTables(pollCtx context.Context, reader liveAddedTablesReader, 
 		}
 		prev = joined
 		target.Set(tables)
-		slog.InfoContext(pollCtx, "live-added tables observed; merging into dispatch filter (ADR-0034)",
+		slog.InfoContext(
+			pollCtx, "live-added tables observed; merging into dispatch filter (ADR-0034)",
 			slog.String("stream_id", streamID),
 			slog.String("tables", joined),
 		)

@@ -330,9 +330,11 @@ func (a *chainRestoreRecordingApplier) Apply(_ context.Context, _ string, change
 	return nil
 }
 
-func (a *chainRestoreRecordingApplier) RequestStop(context.Context, string) error        { return nil }
+func (a *chainRestoreRecordingApplier) RequestStop(context.Context, string) error { return nil }
+
 func (a *chainRestoreRecordingApplier) ClearStopRequested(context.Context, string) error { return nil }
-func (a *chainRestoreRecordingApplier) Close() error                                     { return nil }
+
+func (a *chainRestoreRecordingApplier) Close() error { return nil }
 
 // TestChainRestore_FullPlusOneIncremental_RoundTrip is the load-bearing
 // end-to-end test for Phase 3.2 acceptance criterion 2: write a full

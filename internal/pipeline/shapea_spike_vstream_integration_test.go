@@ -170,7 +170,8 @@ func startMySQLTarget(t *testing.T) (dsn string, cleanup func()) {
 	testcontainers.SkipIfProviderIsNotHealthy(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
-	c, err := mysqltc.Run(ctx, "mysql:8.0",
+	c, err := mysqltc.Run(
+		ctx, "mysql:8.0",
 		mysqltc.WithDatabase("warehouse"),
 		mysqltc.WithUsername("root"),
 		mysqltc.WithPassword("rootpw"),
@@ -205,7 +206,8 @@ func startPGTarget(t *testing.T) (dsn string, cleanup func()) {
 	testcontainers.SkipIfProviderIsNotHealthy(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
-	c, err := pgtc.Run(ctx, "postgres:16",
+	c, err := pgtc.Run(
+		ctx, "postgres:16",
 		pgtc.WithDatabase("warehouse"),
 		pgtc.WithUsername("test"),
 		pgtc.WithPassword("test"),

@@ -72,7 +72,8 @@ func TestBackupStream_MySQL_RolloverByMaxChanges(t *testing.T) {
 	// Drive 25 inserts after the binlog pos was captured.
 	for i := 0; i < 25; i++ {
 		applyDDLMySQL(t, sourceDSN, fmt.Sprintf(
-			`INSERT INTO users (email) VALUES ('user%d@example.com');`, i))
+			`INSERT INTO users (email) VALUES ('user%d@example.com');`, i,
+		))
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)

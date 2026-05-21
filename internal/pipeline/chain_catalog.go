@@ -284,7 +284,8 @@ func resolveLineage(ctx context.Context, store ir.BackupStore) (*LineageCatalog,
 				"Restore from a copy whose lineage.json is intact (it is the authoritative structural "+
 				"record for a rotated backup; `backup verify --rebuild-catalog` only rebuilds the "+
 				"legacy one-segment shape)",
-			rotationSegmentDirPrefix)
+			rotationSegmentDirPrefix,
+		)
 	}
 	// Absent and genuinely single-segment: synthesise the legacy
 	// lineage. The manifest list is discovered by a directory walk (the
@@ -387,7 +388,8 @@ func updateLineageForManifestBestEffort(
 	codec Codec,
 ) {
 	if err := updateLineageForManifest(ctx, store, manifest, manifestPath, codec); err != nil {
-		slog.WarnContext(ctx, "lineage catalog update failed; lineage.json may be stale until next write",
+		slog.WarnContext(
+			ctx, "lineage catalog update failed; lineage.json may be stale until next write",
 			slog.String("manifest_path", manifestPath),
 			slog.String("err", err.Error()),
 		)

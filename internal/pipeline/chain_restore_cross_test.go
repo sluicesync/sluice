@@ -108,8 +108,10 @@ func (w *erroringSchemaWriter) CreateTablesWithoutConstraints(_ context.Context,
 	return nil
 }
 
-func (w *erroringSchemaWriter) CreateIndexes(_ context.Context, _ *ir.Schema) error     { return nil }
+func (w *erroringSchemaWriter) CreateIndexes(_ context.Context, _ *ir.Schema) error { return nil }
+
 func (w *erroringSchemaWriter) CreateConstraints(_ context.Context, _ *ir.Schema) error { return nil }
+
 func (w *erroringSchemaWriter) SyncIdentitySequences(_ context.Context, _ *ir.Schema) error {
 	return nil
 }

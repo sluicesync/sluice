@@ -195,7 +195,8 @@ func TestPSVStream_BasicChangeStream(t *testing.T) {
 	// land just before the registration boundary.
 	time.Sleep(2 * time.Second)
 
-	if err := psMySQLExec(t, dsn,
+	if err := psMySQLExec(
+		t, dsn,
 		"INSERT INTO "+tableName+" (email, active) VALUES ('alice@psverify.example.com', 1)",
 	); err != nil {
 		t.Fatalf("DML: %v", err)

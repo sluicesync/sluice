@@ -261,7 +261,8 @@ func (a *AddTable) Run(ctx context.Context) error {
 		return err
 	}
 
-	slog.InfoContext(ctx, "add-table starting",
+	slog.InfoContext(
+		ctx, "add-table starting",
 		slog.String("source", a.Source.Name()),
 		slog.String("source_host", redactedHost(a.SourceDSN)),
 		slog.String("target", a.Target.Name()),
@@ -344,7 +345,8 @@ func (a *AddTable) Run(ctx context.Context) error {
 		applyTargetSchema(sw, preflight.resolvedTargetSchema)
 		applyTargetSchema(rw, preflight.resolvedTargetSchema)
 		applyTargetSchema(applier, preflight.resolvedTargetSchema)
-		slog.InfoContext(ctx, "add-table: resolved target schema",
+		slog.InfoContext(
+			ctx, "add-table: resolved target schema",
 			slog.String("target_schema", preflight.resolvedTargetSchema),
 			slog.String("source", schemaSourceLabel(a.TargetSchema, preflight.resolvedTargetSchema)),
 		)
@@ -407,19 +409,22 @@ func (a *AddTable) Run(ctx context.Context) error {
 	// (pgoutput catalog-snapshot lag).
 	lsnBeforePubAdd := a.diagReadCurrentWAL(ctx, "before-publication-add")
 	if pa, ok := a.Source.(publicationAdder); ok {
-		slog.InfoContext(ctx, "add-table: extending source publication scope",
+		slog.InfoContext(
+			ctx, "add-table: extending source publication scope",
 			slog.String("table", a.TableName),
 		)
 		if err := pa.AddPublicationTables(ctx, a.SourceDSN, []string{a.TableName}); err != nil {
 			return wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: add-table: extend publication: %w", err))
 		}
 	} else {
-		slog.DebugContext(ctx, "add-table: source engine has no publication concept; skipping extend step",
+		slog.DebugContext(
+			ctx, "add-table: source engine has no publication concept; skipping extend step",
 			slog.String("source", a.Source.Name()),
 		)
 	}
 	lsnAfterPubAdd := a.diagReadCurrentWAL(ctx, "after-publication-add")
-	slog.DebugContext(ctx, "addtable.diag: publication-add LSN window",
+	slog.DebugContext(
+		ctx, "addtable.diag: publication-add LSN window",
 		slog.String("phase", "pub-add-window"),
 		slog.String("table", a.TableName),
 		slog.String("lsn_before_pub_add", lsnBeforePubAdd),
@@ -441,7 +446,8 @@ func (a *AddTable) Run(ctx context.Context) error {
 		}
 	}()
 
-	slog.InfoContext(ctx, "add-table: snapshot captured",
+	slog.InfoContext(
+		ctx, "add-table: snapshot captured",
 		slog.String("table", a.TableName),
 		slog.String("position_token", stream.Position.Token),
 	)
@@ -454,7 +460,8 @@ func (a *AddTable) Run(ctx context.Context) error {
 	// trace answers it directly.
 	if extractor, ok := a.Source.(snapshotLSNExtractor); ok {
 		if snapLSN, present, err := extractor.ExtractSnapshotLSN(stream.Position); err == nil && present {
-			slog.DebugContext(ctx, "addtable.diag: snapshot consistent-point",
+			slog.DebugContext(
+				ctx, "addtable.diag: snapshot consistent-point",
 				slog.String("phase", "snapshot-open"),
 				slog.String("table", a.TableName),
 				slog.String("lsn_snapshot", snapLSN),
@@ -512,7 +519,8 @@ func (a *AddTable) Run(ctx context.Context) error {
 	// just long enough to be dropped in our defer; the slot's
 	// position is independent of the exporting tx.
 	if err := stream.ReleaseRows(); err != nil {
-		slog.WarnContext(ctx, "add-table: release snapshot rows failed; the snapshot tx may stay open until process exit",
+		slog.WarnContext(
+			ctx, "add-table: release snapshot rows failed; the snapshot tx may stay open until process exit",
 			slog.String("error", err.Error()),
 		)
 	}
@@ -540,21 +548,25 @@ func (a *AddTable) Run(ctx context.Context) error {
 		}
 		if err := writer.RecordLiveAddedTable(ctx, a.StreamID, a.TableName); err != nil {
 			return wrapWithHint(PhaseSchemaApply, fmt.Errorf(
-				"pipeline: add-table: --no-drain: record live-added table on cdc-state: %w", err))
+				"pipeline: add-table: --no-drain: record live-added table on cdc-state: %w", err,
+			))
 		}
-		slog.InfoContext(ctx, "add-table: live mode: recorded table on cdc-state.live_added_tables; running streamer's poll will merge into dispatch filter on next tick (ADR-0034)",
+		slog.InfoContext(
+			ctx, "add-table: live mode: recorded table on cdc-state.live_added_tables; running streamer's poll will merge into dispatch filter on next tick (ADR-0034)",
 			slog.String("table", a.TableName),
 			slog.String("stream_id", a.StreamID),
 		)
 	}
 
 	if a.LiveMode {
-		slog.InfoContext(ctx, "add-table: live add complete; the active stream's tail will pick up new-table events on its next consumption",
+		slog.InfoContext(
+			ctx, "add-table: live add complete; the active stream's tail will pick up new-table events on its next consumption",
 			slog.String("table", a.TableName),
 			slog.String("stream_id", a.StreamID),
 		)
 	} else {
-		slog.InfoContext(ctx, "add-table: complete; resume the stream with `sluice sync start --resume` to pick up CDC for the new table",
+		slog.InfoContext(
+			ctx, "add-table: complete; resume the stream with `sluice sync start --resume` to pick up CDC for the new table",
 			slog.String("table", a.TableName),
 			slog.String("stream_id", a.StreamID),
 		)
@@ -727,7 +739,8 @@ func resolveAddTableTargetSchema(streamID, operatorFlag, recorded string) (strin
 		return "", fmt.Errorf(
 			"pipeline: add-table: --target-schema=%q does not match the active stream's recorded target_schema=%q for stream %q "+
 				"(set --target-schema to match the stream, or omit the flag to inherit the recorded namespace)",
-			operatorFlag, recorded, streamID)
+			operatorFlag, recorded, streamID,
+		)
 	}
 }
 
@@ -742,7 +755,8 @@ func (a *AddTable) preflightDrained(ctx context.Context, applier ir.ChangeApplie
 		// Engine doesn't expose the stop-flag surface. We can't
 		// detect an in-flight stop; the operator runs at their own
 		// risk. Log so the absence is visible under --log-level=debug.
-		slog.DebugContext(ctx, "add-table: applier does not expose ReadStopRequested; cannot pre-flight stream-stopped status",
+		slog.DebugContext(
+			ctx, "add-table: applier does not expose ReadStopRequested; cannot pre-flight stream-stopped status",
 			slog.String("engine", a.Target.Name()),
 		)
 		return nil
@@ -788,7 +802,8 @@ func (a *AddTable) preflightLive(ctx context.Context, applier ir.ChangeApplier, 
 	}
 	return addTablePreflight{}, fmt.Errorf(
 		"pipeline: add-table: --no-drain requires either a publication-bearing source engine (PG) or a target applier exposing RecordLiveAddedTable (MySQL); source=%q target=%q expose neither. Use the drained add-table flow (`sluice sync stop --wait`, then `sluice schema add-table` without --no-drain) for unsupported engine pairs",
-		a.Source.Name(), a.Target.Name())
+		a.Source.Name(), a.Target.Name(),
+	)
 }
 
 // preflightLivePG is the original ADR-0030 preflight: capture the
@@ -805,7 +820,8 @@ func (a *AddTable) preflightLivePG(ctx context.Context, status ir.StreamStatus) 
 	if !ok {
 		return addTablePreflight{}, fmt.Errorf(
 			"pipeline: add-table: --no-drain requires the source engine to expose ReadSlotPosition; %q does not. This is a code-side guarantee on PG; the absence indicates a build with the engine surface stripped — file an issue",
-			a.Source.Name())
+			a.Source.Name(),
+		)
 	}
 
 	slotName := activeSlotName(status)
@@ -813,9 +829,11 @@ func (a *AddTable) preflightLivePG(ctx context.Context, status ir.StreamStatus) 
 	if err != nil {
 		return addTablePreflight{}, wrapWithHint(PhaseConnect, fmt.Errorf(
 			"pipeline: add-table: --no-drain: read slot position for %q: %w",
-			slotName, err))
+			slotName, err,
+		))
 	}
-	slog.InfoContext(ctx, "add-table: live mode: captured active-stream slot position",
+	slog.InfoContext(
+		ctx, "add-table: live mode: captured active-stream slot position",
 		slog.String("slot", slotName),
 		slog.String("slot_source", slotNameSource(status)),
 		slog.String("confirmed_flush_lsn", lsn),
@@ -841,9 +859,11 @@ func (a *AddTable) preflightLiveBinlog(ctx context.Context, applier ir.ChangeApp
 	if _, ok := applier.(liveAddedTablesWriter); !ok {
 		return addTablePreflight{}, fmt.Errorf(
 			"pipeline: add-table: --no-drain (binlog-source path): target applier does not implement RecordLiveAddedTable; %q",
-			a.Target.Name())
+			a.Target.Name(),
+		)
 	}
-	slog.InfoContext(ctx, "add-table: live mode: binlog-source filter-flip path (ADR-0034)",
+	slog.InfoContext(
+		ctx, "add-table: live mode: binlog-source filter-flip path (ADR-0034)",
 		slog.String("source", a.Source.Name()),
 		slog.String("target", a.Target.Name()),
 		slog.String("stream_id", a.StreamID),
@@ -921,7 +941,8 @@ func (a *AddTable) verifyLiveModeLSNInvariant(ctx context.Context, slotLSN strin
 
 	extractor, ok := a.Source.(snapshotLSNExtractor)
 	if !ok {
-		slog.DebugContext(ctx, "add-table: live mode: source engine does not expose ExtractSnapshotLSN; skipping invariant check",
+		slog.DebugContext(
+			ctx, "add-table: live mode: source engine does not expose ExtractSnapshotLSN; skipping invariant check",
 			slog.String("source", a.Source.Name()),
 		)
 		return nil
@@ -937,7 +958,8 @@ func (a *AddTable) verifyLiveModeLSNInvariant(ctx context.Context, slotLSN strin
 
 	comparer, ok := a.Source.(lsnComparer)
 	if !ok {
-		slog.DebugContext(ctx, "add-table: live mode: source engine does not expose CompareLSN; skipping invariant check",
+		slog.DebugContext(
+			ctx, "add-table: live mode: source engine does not expose CompareLSN; skipping invariant check",
 			slog.String("source", a.Source.Name()),
 		)
 		return nil
@@ -949,9 +971,11 @@ func (a *AddTable) verifyLiveModeLSNInvariant(ctx context.Context, slotLSN strin
 	if cmp < 0 {
 		return fmt.Errorf(
 			"pipeline: add-table: --no-drain: snapshot LSN %s is behind active stream's slot confirmed_flush_lsn %s; events on table %q in [snapshot, slot] would be silently dropped. This indicates a regression in the publication-add-then-snapshot ordering (ADR-0030); refusing to proceed",
-			snapshotLSN, slotLSN, a.TableName)
+			snapshotLSN, slotLSN, a.TableName,
+		)
 	}
-	slog.InfoContext(ctx, "add-table: live mode: snapshot-LSN ≥ slot-LSN invariant satisfied",
+	slog.InfoContext(
+		ctx, "add-table: live mode: snapshot-LSN ≥ slot-LSN invariant satisfied",
 		slog.String("snapshot_lsn", snapshotLSN),
 		slog.String("slot_confirmed_flush_lsn", slotLSN),
 	)
@@ -967,7 +991,8 @@ func (a *AddTable) verifyLiveModeLSNInvariant(ctx context.Context, slotLSN strin
 func (a *AddTable) diagReadCurrentWAL(ctx context.Context, phase string) string {
 	reader, ok := a.Source.(currentWALPositionReader)
 	if !ok {
-		slog.DebugContext(ctx, "addtable.diag: source engine does not expose ReadCurrentWALPosition; skipping LSN sample",
+		slog.DebugContext(
+			ctx, "addtable.diag: source engine does not expose ReadCurrentWALPosition; skipping LSN sample",
 			slog.String("phase", phase),
 			slog.String("source", a.Source.Name()),
 		)
@@ -975,13 +1000,15 @@ func (a *AddTable) diagReadCurrentWAL(ctx context.Context, phase string) string 
 	}
 	lsn, err := reader.ReadCurrentWALPosition(ctx, a.SourceDSN)
 	if err != nil {
-		slog.DebugContext(ctx, "addtable.diag: ReadCurrentWALPosition failed (best-effort, continuing)",
+		slog.DebugContext(
+			ctx, "addtable.diag: ReadCurrentWALPosition failed (best-effort, continuing)",
 			slog.String("phase", phase),
 			slog.String("err", err.Error()),
 		)
 		return ""
 	}
-	slog.DebugContext(ctx, "addtable.diag: WAL position sample",
+	slog.DebugContext(
+		ctx, "addtable.diag: WAL position sample",
 		slog.String("phase", phase),
 		slog.String("lsn", lsn),
 	)
@@ -1042,7 +1069,8 @@ func preflightAddTable(ctx context.Context, scoped *ir.Schema, rw ir.RowWriter) 
 		if !empty {
 			return wrapWithHint(PhaseSchemaApply, fmt.Errorf(
 				"pipeline: add-table: target table %q already exists with rows — drop it on the target (or pick a different table name on the source) and re-run add-table; this guard prevents accidentally double-copying onto a previously-imported table",
-				t.Name))
+				t.Name,
+			))
 		}
 	}
 	return nil
@@ -1115,7 +1143,8 @@ func (a *AddTable) dropTempSlot(ctx context.Context, slot string) {
 	}
 	mgr, err := opener.OpenSlotManager(ctx, a.SourceDSN)
 	if err != nil {
-		slog.WarnContext(ctx, "add-table: open slot manager to drop temp slot failed; drop the slot manually via `sluice slot drop`",
+		slog.WarnContext(
+			ctx, "add-table: open slot manager to drop temp slot failed; drop the slot manually via `sluice slot drop`",
 			slog.String("slot", slot),
 			slog.String("error", err.Error()),
 		)
@@ -1124,13 +1153,15 @@ func (a *AddTable) dropTempSlot(ctx context.Context, slot string) {
 	defer closeIf(mgr)
 
 	if err := mgr.Drop(ctx, slot, false); err != nil {
-		slog.WarnContext(ctx, "add-table: drop temp snapshot slot failed; the slot may pin source WAL until manually dropped via `sluice slot drop`",
+		slog.WarnContext(
+			ctx, "add-table: drop temp snapshot slot failed; the slot may pin source WAL until manually dropped via `sluice slot drop`",
 			slog.String("slot", slot),
 			slog.String("error", err.Error()),
 		)
 		return
 	}
-	slog.InfoContext(ctx, "add-table: temp snapshot slot dropped",
+	slog.InfoContext(
+		ctx, "add-table: temp snapshot slot dropped",
 		slog.String("slot", slot),
 	)
 }
@@ -1142,7 +1173,8 @@ func (a *AddTable) logDryRun(ctx context.Context, scoped *ir.Schema, resolvedTar
 		return errors.New("pipeline: add-table: dry-run: scoped schema has no tables; this is a bug")
 	}
 	t := scoped.Tables[0]
-	slog.InfoContext(ctx, "dry run: add-table",
+	slog.InfoContext(
+		ctx, "dry run: add-table",
 		slog.String("source", a.Source.Name()),
 		slog.String("target", a.Target.Name()),
 		slog.String("stream_id", a.StreamID),
@@ -1155,7 +1187,8 @@ func (a *AddTable) logDryRun(ctx context.Context, scoped *ir.Schema, resolvedTar
 		slog.String("target_schema", resolvedTargetSchema),
 	)
 	if _, ok := a.Source.(publicationAdder); ok {
-		slog.InfoContext(ctx, "dry run: add-table: would extend source publication via ALTER PUBLICATION ... ADD TABLE",
+		slog.InfoContext(
+			ctx, "dry run: add-table: would extend source publication via ALTER PUBLICATION ... ADD TABLE",
 			slog.String("table", t.Name),
 		)
 	}

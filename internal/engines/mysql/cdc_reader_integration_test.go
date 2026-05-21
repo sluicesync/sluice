@@ -36,7 +36,8 @@ func startMySQLForCDC(t *testing.T) (dsn string, cleanup func()) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	container, err := mysqltc.Run(ctx,
+	container, err := mysqltc.Run(
+		ctx,
 		"mysql:8.0",
 		mysqltc.WithDatabase("source_db"),
 		mysqltc.WithUsername("root"),

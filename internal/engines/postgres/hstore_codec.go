@@ -206,7 +206,8 @@ func appendHstoreBinaryFromPairs(buf []byte, pairs []hstorePair) []byte {
 func decodeHstoreBinary(src []byte) (string, error) {
 	if len(src) < 4 {
 		return "", fmt.Errorf(
-			"postgres: hstore decode: header truncated (got %d bytes, want >= 4)", len(src))
+			"postgres: hstore decode: header truncated (got %d bytes, want >= 4)", len(src),
+		)
 	}
 	n := int32(binary.BigEndian.Uint32(src[0:4]))
 	if n < 0 {
@@ -218,25 +219,29 @@ func decodeHstoreBinary(src []byte) (string, error) {
 		if off+4 > len(src) {
 			return "", fmt.Errorf(
 				"postgres: hstore decode: truncated keylen at pair %d (offset %d, len %d)",
-				i, off, len(src))
+				i, off, len(src),
+			)
 		}
 		kl := int32(binary.BigEndian.Uint32(src[off : off+4]))
 		off += 4
 		if kl < 0 {
 			return "", fmt.Errorf(
-				"postgres: hstore decode: negative keylen %d at pair %d", kl, i)
+				"postgres: hstore decode: negative keylen %d at pair %d", kl, i,
+			)
 		}
 		if off+int(kl) > len(src) {
 			return "", fmt.Errorf(
 				"postgres: hstore decode: truncated key at pair %d (need %d, have %d)",
-				i, kl, len(src)-off)
+				i, kl, len(src)-off,
+			)
 		}
 		key := string(src[off : off+int(kl)])
 		off += int(kl)
 		if off+4 > len(src) {
 			return "", fmt.Errorf(
 				"postgres: hstore decode: truncated vallen at pair %d (offset %d, len %d)",
-				i, off, len(src))
+				i, off, len(src),
+			)
 		}
 		vl := int32(binary.BigEndian.Uint32(src[off : off+4]))
 		off += 4
@@ -251,19 +256,22 @@ func decodeHstoreBinary(src []byte) (string, error) {
 		}
 		if vl < 0 {
 			return "", fmt.Errorf(
-				"postgres: hstore decode: negative vallen %d (not -1) at pair %d", vl, i)
+				"postgres: hstore decode: negative vallen %d (not -1) at pair %d", vl, i,
+			)
 		}
 		if off+int(vl) > len(src) {
 			return "", fmt.Errorf(
 				"postgres: hstore decode: truncated value at pair %d (need %d, have %d)",
-				i, vl, len(src)-off)
+				i, vl, len(src)-off,
+			)
 		}
 		writeHstoreQuoted(&b, string(src[off:off+int(vl)]))
 		off += int(vl)
 	}
 	if off != len(src) {
 		return "", fmt.Errorf(
-			"postgres: hstore decode: trailing %d byte(s) after %d pairs", len(src)-off, n)
+			"postgres: hstore decode: trailing %d byte(s) after %d pairs", len(src)-off, n,
+		)
 	}
 	return b.String(), nil
 }
@@ -406,4 +414,5 @@ func lookupHstoreOID(ctx context.Context, q interface {
 // short-circuit codec registration (no hstore columns to ship) or
 // surface a clear refusal.
 var errHstoreTypeNotFound = errors.New(
-	"postgres: hstore type not found in pg_type — extension not installed?")
+	"postgres: hstore type not found in pg_type — extension not installed?",
+)

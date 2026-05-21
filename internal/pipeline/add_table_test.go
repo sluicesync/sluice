@@ -889,9 +889,13 @@ func (cdcNoneEngine) OpenSchemaReader(context.Context, string) (ir.SchemaReader,
 func (cdcNoneEngine) OpenSchemaWriter(context.Context, string) (ir.SchemaWriter, error) {
 	panic("not used")
 }
+
 func (cdcNoneEngine) OpenRowReader(context.Context, string) (ir.RowReader, error) { panic("not used") }
+
 func (cdcNoneEngine) OpenRowWriter(context.Context, string) (ir.RowWriter, error) { panic("not used") }
+
 func (cdcNoneEngine) OpenCDCReader(context.Context, string) (ir.CDCReader, error) { panic("not used") }
+
 func (cdcNoneEngine) OpenChangeApplier(context.Context, string) (ir.ChangeApplier, error) {
 	panic("not used")
 }

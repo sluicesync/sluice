@@ -120,7 +120,8 @@ func buildBatchUpsert(table *ir.Table, rowCount int, pkCols []string) string {
 	}
 
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "INSERT INTO %s (%s) VALUES %s",
+	fmt.Fprintf(
+		&sb, "INSERT INTO %s (%s) VALUES %s",
 		quoteIdent(table.Name),
 		strings.Join(colNames, ", "),
 		strings.Join(rowParts, ", "),

@@ -94,7 +94,8 @@ func TestBackupStream_Postgres_RolloverByMaxChanges(t *testing.T) {
 	// they're retained in WAL and visible to the stream.
 	for i := 0; i < 25; i++ {
 		applyDDL(t, sourceDSN, fmt.Sprintf(
-			`INSERT INTO users (email) VALUES ('user%d@example.com');`, i))
+			`INSERT INTO users (email) VALUES ('user%d@example.com');`, i,
+		))
 	}
 
 	// Run the stream with small bounds so it commits multiple
@@ -541,7 +542,8 @@ func TestBackupStream_Postgres_SignalDrainExitsClean(t *testing.T) {
 			default:
 			}
 			applyDDL(t, sourceDSN, fmt.Sprintf(
-				`INSERT INTO users (email) VALUES ('streaming%d@example.com');`, i))
+				`INSERT INTO users (email) VALUES ('streaming%d@example.com');`, i,
+			))
 			i++
 			time.Sleep(50 * time.Millisecond)
 		}

@@ -55,7 +55,8 @@ func resetTargetData(ctx context.Context, schema *ir.Schema, rw ir.RowWriter, st
 		if err := store.ClearMigration(ctx, migrationID); err != nil {
 			return fmt.Errorf("pipeline: --reset-target-data: clear migrate-state row: %w", err)
 		}
-		slog.InfoContext(ctx, "reset: cleared migrate-state row",
+		slog.InfoContext(
+			ctx, "reset: cleared migrate-state row",
 			slog.String("migration_id", migrationID),
 		)
 	}
@@ -65,7 +66,8 @@ func resetTargetData(ctx context.Context, schema *ir.Schema, rw ir.RowWriter, st
 	if err := dropSchemaTypes(ctx, rw, schema); err != nil {
 		return err
 	}
-	slog.InfoContext(ctx, "reset: target data wiped; proceeding with cold-start",
+	slog.InfoContext(
+		ctx, "reset: target data wiped; proceeding with cold-start",
 		slog.Int("tables_dropped", len(schema.Tables)),
 	)
 	return nil
@@ -88,7 +90,8 @@ func resetTargetDataForStream(ctx context.Context, schema *ir.Schema, rw ir.RowW
 		if err := cleaner.ClearStream(ctx, streamID); err != nil {
 			return fmt.Errorf("pipeline: --reset-target-data: clear cdc-state row: %w", err)
 		}
-		slog.InfoContext(ctx, "reset: cleared cdc-state row",
+		slog.InfoContext(
+			ctx, "reset: cleared cdc-state row",
 			slog.String("stream_id", streamID),
 		)
 	}
@@ -98,7 +101,8 @@ func resetTargetDataForStream(ctx context.Context, schema *ir.Schema, rw ir.RowW
 	if err := dropSchemaTypes(ctx, rw, schema); err != nil {
 		return err
 	}
-	slog.InfoContext(ctx, "reset: target data wiped; proceeding with cold-start",
+	slog.InfoContext(
+		ctx, "reset: target data wiped; proceeding with cold-start",
 		slog.Int("tables_dropped", len(schema.Tables)),
 	)
 	return nil
@@ -145,7 +149,8 @@ func dropTables(ctx context.Context, dropper ir.TableDropper, tables []*ir.Table
 		// don't surface — but a network-level retry could lose the
 		// summary line.
 		for _, table := range tables {
-			slog.InfoContext(ctx, "reset: dropping target table",
+			slog.InfoContext(
+				ctx, "reset: dropping target table",
 				slog.String("table", table.Name),
 			)
 		}
@@ -158,7 +163,8 @@ func dropTables(ctx context.Context, dropper ir.TableDropper, tables []*ir.Table
 		if err := dropper.DropTable(ctx, table); err != nil {
 			return fmt.Errorf("pipeline: --reset-target-data: drop %q: %w", table.Name, err)
 		}
-		slog.InfoContext(ctx, "reset: dropped target table",
+		slog.InfoContext(
+			ctx, "reset: dropped target table",
 			slog.String("table", table.Name),
 		)
 	}

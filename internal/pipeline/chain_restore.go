@@ -169,7 +169,8 @@ func (r *ChainRestore) Run(ctx context.Context) error {
 				return err
 			}
 		}
-		slog.InfoContext(ctx, "chain restore: cross-engine mode",
+		slog.InfoContext(
+			ctx, "chain restore: cross-engine mode",
 			slog.String("source_engine", root.manifest.SourceEngine),
 			slog.String("target_engine", r.Target.Name()),
 			slog.Int("incrementals", incrementalCount),
@@ -218,7 +219,8 @@ func (r *ChainRestore) Run(ctx context.Context) error {
 			// non-idempotent index/constraint phases — it refreshes
 			// rows via an idempotent upsert (ADR-0046 §3).
 			dataOnly := firstFullApplied
-			slog.InfoContext(ctx, "chain restore: applying segment full",
+			slog.InfoContext(
+				ctx, "chain restore: applying segment full",
 				slog.String("segment_dir", link.segment.Dir),
 				slog.String("manifest_path", link.path),
 				slog.String("backup_id", manifestBackupID(link.manifest)),
@@ -231,7 +233,8 @@ func (r *ChainRestore) Run(ctx context.Context) error {
 			}
 			firstFullApplied = true
 		case ir.BackupKindIncremental:
-			slog.InfoContext(ctx, "chain restore: applying incremental",
+			slog.InfoContext(
+				ctx, "chain restore: applying incremental",
 				slog.Int("link", i),
 				slog.String("manifest_path", link.path),
 				slog.String("backup_id", manifestBackupID(link.manifest)),
@@ -248,7 +251,8 @@ func (r *ChainRestore) Run(ctx context.Context) error {
 		}
 	}
 
-	slog.InfoContext(ctx, "chain restore complete",
+	slog.InfoContext(
+		ctx, "chain restore complete",
 		slog.Int("manifests_applied", len(links)),
 		slog.Int("incrementals", incrementalCount),
 	)
@@ -414,7 +418,8 @@ func (r *ChainRestore) applyIncremental(
 	//    no DML, then closed). Replay the schema-history regardless so
 	//    a resumed stream finds the post-DDL version at backup.EndPosition.
 	if len(link.manifest.ChangeChunks) == 0 && len(link.manifest.SchemaHistory) == 0 {
-		slog.InfoContext(ctx, "chain restore: incremental has no change chunks; schema deltas only",
+		slog.InfoContext(
+			ctx, "chain restore: incremental has no change chunks; schema deltas only",
 			slog.String("backup_id", manifestBackupID(link.manifest)),
 		)
 		return nil
@@ -516,7 +521,8 @@ func (r *ChainRestore) applySchemaDeltas(ctx context.Context, link *segmentRecor
 		return fmt.Errorf(
 			"unsupportable schema delta in incremental %s: %w. "+
 				"Force a fresh full + new chain to recover",
-			manifestBackupID(link.manifest), err)
+			manifestBackupID(link.manifest), err,
+		)
 	}
 
 	// AddTable: build a partial schema containing only the new tables
@@ -532,7 +538,8 @@ func (r *ChainRestore) applySchemaDeltas(ctx context.Context, link *segmentRecor
 		if err := sw.CreateTablesWithoutConstraints(ctx, s); err != nil {
 			return fmt.Errorf("create added tables: %w", err)
 		}
-		slog.InfoContext(ctx, "chain restore: schema delta — added tables",
+		slog.InfoContext(
+			ctx, "chain restore: schema delta — added tables",
 			slog.Int("count", adds),
 		)
 	}
@@ -555,7 +562,8 @@ func (r *ChainRestore) applySchemaDeltas(ctx context.Context, link *segmentRecor
 				continue
 			}
 			if applier == nil {
-				slog.WarnContext(ctx, "chain restore: schema delta — altered table with added columns; engine has no SchemaDeltaApplier; replay will rely on the applier's column-list reconciliation. If inserts fail, force a fresh full + new chain.",
+				slog.WarnContext(
+					ctx, "chain restore: schema delta — altered table with added columns; engine has no SchemaDeltaApplier; replay will rely on the applier's column-list reconciliation. If inserts fail, force a fresh full + new chain.",
 					slog.String("table", d.Table),
 					slog.Int("added_columns", len(added)),
 				)
@@ -565,13 +573,15 @@ func (r *ChainRestore) applySchemaDeltas(ctx context.Context, link *segmentRecor
 			// (UUID → CHAR(36) etc.) get rewritten before emit.
 			retargetSchema := translate.RetargetForEngine(
 				&ir.Schema{Tables: []*ir.Table{d.After}},
-				link.manifest.SourceEngine, r.Target.Name())
+				link.manifest.SourceEngine, r.Target.Name(),
+			)
 			retargetTable := retargetSchema.Tables[0]
 			retargetAdded := addedColumns(d.Before, retargetTable)
 			if err := applier.AlterAddColumn(ctx, retargetTable, retargetAdded); err != nil {
 				return fmt.Errorf("alter add column on %s: %w", d.Table, err)
 			}
-			slog.InfoContext(ctx, "chain restore: schema delta — applied ADD COLUMN",
+			slog.InfoContext(
+				ctx, "chain restore: schema delta — applied ADD COLUMN",
 				slog.String("table", d.Table),
 				slog.Int("added_columns", len(added)),
 			)
@@ -582,7 +592,8 @@ func (r *ChainRestore) applySchemaDeltas(ctx context.Context, link *segmentRecor
 		// Don't auto-drop in v1. The chain might carry inserts into a
 		// table being dropped (out-of-order semantics under chain
 		// replay); silently dropping would risk losing data.
-		slog.WarnContext(ctx, "chain restore: schema delta — dropped tables encountered; v1 does NOT auto-DROP on the target. Drop manually after restore if the operator intent is to remove the table.",
+		slog.WarnContext(
+			ctx, "chain restore: schema delta — dropped tables encountered; v1 does NOT auto-DROP on the target. Drop manually after restore if the operator intent is to remove the table.",
 			slog.Int("count", drops),
 		)
 	}
@@ -621,7 +632,8 @@ func (r *ChainRestore) streamIncrementalChanges(
 		if err := r.streamOneChangeChunk(ctx, segStore, codec, chunk, out); err != nil {
 			return fmt.Errorf("chunk %d (%s): %w", chunkIdx, chunk.File, err)
 		}
-		slog.DebugContext(ctx, "chain restore: chunk verified and streamed",
+		slog.DebugContext(
+			ctx, "chain restore: chunk verified and streamed",
 			slog.String("backup_id", manifestBackupID(link.manifest)),
 			slog.Int("chunk", chunkIdx),
 			slog.Int64("changes", chunk.RowCount),
@@ -673,7 +685,8 @@ func (r *ChainRestore) streamSchemaHistorySnapshots(
 		case out <- snap:
 		}
 	}
-	slog.DebugContext(ctx, "chain restore: schema-history replayed",
+	slog.DebugContext(
+		ctx, "chain restore: schema-history replayed",
 		slog.String("backup_id", manifestBackupID(link.manifest)),
 		slog.Int("entries", len(link.manifest.SchemaHistory)),
 	)
@@ -757,7 +770,8 @@ func validateBoundary(cmp ir.PositionMonotonicChecker, prevEnd, curStart ir.Posi
 		if curStart != prevEnd {
 			return fmt.Errorf(
 				"lineage boundary mismatch at %s: StartPosition %+v does not equal preceding %s EndPosition %+v — refusing to silently assemble a gapped/regressed restore (DR data)",
-				curLabel, curStart, prevLabel, prevEnd)
+				curLabel, curStart, prevLabel, prevEnd,
+			)
 		}
 		return nil
 	}
@@ -775,7 +789,8 @@ func validateBoundary(cmp ir.PositionMonotonicChecker, prevEnd, curStart ir.Posi
 		if !le {
 			return fmt.Errorf(
 				"lineage boundary REGRESSION at %s: StartPosition %+v precedes preceding %s EndPosition %+v — refusing to silently assemble a gapped/regressed restore (DR data)",
-				curLabel, curStart, prevLabel, prevEnd)
+				curLabel, curStart, prevLabel, prevEnd,
+			)
 		}
 		return nil
 	}
@@ -977,7 +992,8 @@ func detectAmbiguousDeltas(deltas []*ir.SchemaDeltaEntry) error {
 			sort.Strings(added)
 			return fmt.Errorf(
 				"table %q has dropped column %q and added column %q within one incremental window; ambiguous (rename vs independent edits)",
-				d.Table, dropped[0], added[0])
+				d.Table, dropped[0], added[0],
+			)
 		}
 	}
 	return nil

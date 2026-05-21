@@ -747,7 +747,8 @@ func (a *ChangeApplier) Apply(ctx context.Context, streamID string, changes <-ch
 			if err := a.applyOne(ctx, streamID, c); err != nil {
 				return err
 			}
-			slog.DebugContext(ctx, "applier: apply latency",
+			slog.DebugContext(
+				ctx, "applier: apply latency",
 				slog.String("stream_id", streamID),
 				slog.Int("rows", 1),
 				slog.Int64("millis", time.Since(applyStart).Milliseconds()),
@@ -996,7 +997,8 @@ func diagApplierInsertReceived(ctx context.Context, defaultSchema string, v ir.I
 	if lsn, err := lsnFromPositionToken(v.Position.Token); err == nil && lsn != 0 {
 		lsnStr = lsn.String()
 	}
-	slog.DebugContext(ctx, "addtable.diag: applier insert received",
+	slog.DebugContext(
+		ctx, "addtable.diag: applier insert received",
 		slog.String("phase", "applier_insert_received"),
 		slog.String("schema", schema),
 		slog.String("relation", v.Table),
@@ -1011,7 +1013,8 @@ func diagApplierInsertReceived(ctx context.Context, defaultSchema string, v ir.I
 // lifetime (the column-type cache is populated on first miss with
 // the sentinel and skipped thereafter).
 func logUnknownTable(ctx context.Context, op, schema, table string) {
-	slog.WarnContext(ctx, "postgres: applier: skipping CDC event for unknown target table",
+	slog.WarnContext(
+		ctx, "postgres: applier: skipping CDC event for unknown target table",
 		slog.String("op", op),
 		slog.String("schema", schema),
 		slog.String("table", table),
@@ -1046,7 +1049,8 @@ func logZeroRowsAffected(ctx context.Context, op, schema, table string, res sql.
 		return
 	}
 	if n == 0 {
-		slog.DebugContext(ctx, "postgres: applier: zero rows affected",
+		slog.DebugContext(
+			ctx, "postgres: applier: zero rows affected",
 			slog.String("op", op),
 			slog.String("schema", schema),
 			slog.String("table", table),

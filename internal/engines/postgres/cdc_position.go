@@ -61,7 +61,8 @@ func decodePGPos(p ir.Position) (decoded pgPos, ok bool, err error) {
 	if p.Engine != engineNamePostgres {
 		return pgPos{}, false, fmt.Errorf(
 			"postgres: decode cdc position: engine = %q; want %q",
-			p.Engine, engineNamePostgres)
+			p.Engine, engineNamePostgres,
+		)
 	}
 	if p.Token == "" {
 		return pgPos{}, false, errors.New("postgres: decode cdc position: token is empty")

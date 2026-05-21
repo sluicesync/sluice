@@ -78,7 +78,8 @@ func (e Engine) OpenBackupSnapshot(ctx context.Context, dsn, chainSlotName strin
 		_ = db.Close()
 		return nil, fmt.Errorf(
 			"postgres: backup snapshot: anchor slot %q already exists; this should be impossible (timestamped name) — drop manually and retry",
-			anchorSlot)
+			anchorSlot,
+		)
 	}
 
 	// Open a replication connection dedicated to slot creation. We
@@ -186,7 +187,8 @@ func (e Engine) OpenBackupSnapshot(ctx context.Context, dsn, chainSlotName strin
 			// Slot drop failure is logged but doesn't escalate — the
 			// backup itself is durable, and a leaked anchor slot is
 			// recoverable via `sluice slot drop` or manual SQL.
-			slog.WarnContext(context.Background(), "postgres: backup snapshot: drop anchor slot failed; manual cleanup may be required",
+			slog.WarnContext(
+				context.Background(), "postgres: backup snapshot: drop anchor slot failed; manual cleanup may be required",
 				slog.String("slot", anchorSlot),
 				slog.String("err", err.Error()),
 			)

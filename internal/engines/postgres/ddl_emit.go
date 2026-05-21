@@ -180,7 +180,8 @@ func emitColumnType(t ir.Type, opts emitOpts) (string, error) {
 				"postgres: column type %s is owned by extension %q which "+
 					"is not enabled; pass --enable-pg-extension %s "+
 					"on this command to opt in (ADR-0032)",
-				v.String(), v.Extension, v.Extension)
+				v.String(), v.Extension, v.Extension,
+			)
 		}
 		return emitExtensionColumn(v)
 
@@ -201,7 +202,8 @@ func emitColumnType(t ir.Type, opts emitOpts) (string, error) {
 			return "", errors.New(
 				"postgres: ir.VerbatimType has an empty Definition — " +
 					"cannot emit a column with no type spelling (ADR-0047; " +
-					"this indicates a corrupt IR / backup manifest)")
+					"this indicates a corrupt IR / backup manifest)",
+			)
 		}
 		return v.Definition, nil
 	}
@@ -521,7 +523,8 @@ func emitColumnDef(table *ir.Table, c *ir.Column, opts emitOpts) (string, error)
 		// per-column mappings hook for what's almost always a
 		// benign translation.
 		if !c.GeneratedStored {
-			slog.Warn("postgres: promoting source-engine VIRTUAL generated column to STORED (postgres has no VIRTUAL support)",
+			slog.Warn(
+				"postgres: promoting source-engine VIRTUAL generated column to STORED (postgres has no VIRTUAL support)",
 				slog.String("table", tableNameForLog(table)),
 				slog.String("column", c.Name),
 			)
@@ -802,7 +805,8 @@ func emitCommentStatements(schema string, table *ir.Table) []string {
 	if table.Comment != "" {
 		out = append(out, fmt.Sprintf(
 			"COMMENT ON TABLE %s IS %s;",
-			qualified, quoteSQLString(table.Comment)))
+			qualified, quoteSQLString(table.Comment),
+		))
 	}
 	for _, col := range table.Columns {
 		if col == nil || col.Comment == "" {
@@ -810,7 +814,8 @@ func emitCommentStatements(schema string, table *ir.Table) []string {
 		}
 		out = append(out, fmt.Sprintf(
 			"COMMENT ON COLUMN %s.%s IS %s;",
-			qualified, quoteIdent(col.Name), quoteSQLString(col.Comment)))
+			qualified, quoteIdent(col.Name), quoteSQLString(col.Comment),
+		))
 	}
 	return out
 }

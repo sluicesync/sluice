@@ -150,7 +150,8 @@ func readActiveByEmail(t *testing.T, dsn, email string) *bool {
 	defer cancel()
 
 	var active bool
-	err = db.QueryRowContext(ctx,
+	err = db.QueryRowContext(
+		ctx,
 		`SELECT active FROM users WHERE email = $1`, email,
 	).Scan(&active)
 	if err != nil {
@@ -187,7 +188,8 @@ func waitForRowAbsentByEmail(t *testing.T, dsn, email string, timeout time.Durat
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		var n int
-		queryErr := db.QueryRowContext(ctx,
+		queryErr := db.QueryRowContext(
+			ctx,
 			`SELECT COUNT(*) FROM users WHERE email = $1`, email,
 		).Scan(&n)
 		cancel()

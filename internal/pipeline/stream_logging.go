@@ -14,7 +14,8 @@ import (
 )
 
 func warnConcurrentWriterOverride(ctx context.Context, prior *streamState, conflict string) {
-	slog.WarnContext(ctx, "stream: --force bypassing concurrent-writer check",
+	slog.WarnContext(
+		ctx, "stream: --force bypassing concurrent-writer check",
 		slog.Int("prior_pid", prior.PID),
 		slog.String("prior_host", prior.Host),
 		slog.Time("prior_last_rollover_at", prior.LastRolloverAt),
@@ -23,7 +24,8 @@ func warnConcurrentWriterOverride(ctx context.Context, prior *streamState, confl
 }
 
 func warnConcurrentWriterTakeover(ctx context.Context, prior *streamState) {
-	slog.WarnContext(ctx, "stream: prior stream_state is stale; taking over destination",
+	slog.WarnContext(
+		ctx, "stream: prior stream_state is stale; taking over destination",
 		slog.Int("prior_pid", prior.PID),
 		slog.String("prior_host", prior.Host),
 		slog.Time("prior_last_rollover_at", prior.LastRolloverAt),

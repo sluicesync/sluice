@@ -1010,7 +1010,8 @@ func (r *SchemaReader) populateIndexes(ctx context.Context, tables map[string]*i
 			// CREATE INDEX failure on the target to the missing
 			// flag rather than to a sluice-side bug.
 			ext := extensionOwningOperatorClass(opclass)
-			slog.WarnContext(ctx,
+			slog.WarnContext(
+				ctx,
 				"postgres: schema reader: dropping extension-owned index opclass; pass --enable-pg-extension to preserve it",
 				slog.String("index", idx.Name),
 				slog.String("column", colName),

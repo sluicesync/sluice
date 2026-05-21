@@ -114,9 +114,11 @@ func (a *brokerPositionWriterRecorder) Apply(_ context.Context, _ string, _ <-ch
 	return nil
 }
 
-func (a *brokerPositionWriterRecorder) RequestStop(context.Context, string) error        { return nil }
+func (a *brokerPositionWriterRecorder) RequestStop(context.Context, string) error { return nil }
+
 func (a *brokerPositionWriterRecorder) ClearStopRequested(context.Context, string) error { return nil }
-func (a *brokerPositionWriterRecorder) Close() error                                     { return nil }
+
+func (a *brokerPositionWriterRecorder) Close() error { return nil }
 
 func (a *brokerPositionWriterRecorder) WritePosition(_ context.Context, _ string, p ir.Position) error {
 	a.written = append(a.written, p)

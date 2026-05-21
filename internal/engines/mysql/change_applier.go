@@ -694,7 +694,8 @@ func (a *ChangeApplier) Apply(ctx context.Context, streamID string, changes <-ch
 			if err := a.applyOne(ctx, streamID, c); err != nil {
 				return err
 			}
-			slog.DebugContext(ctx, "applier: apply latency",
+			slog.DebugContext(
+				ctx, "applier: apply latency",
 				slog.String("stream_id", streamID),
 				slog.Int("rows", 1),
 				slog.Int64("millis", time.Since(applyStart).Milliseconds()),
@@ -882,7 +883,8 @@ func logZeroRowsAffected(ctx context.Context, op, schema, table string, res sql.
 		return
 	}
 	if n == 0 {
-		slog.DebugContext(ctx, "mysql: applier: zero rows affected",
+		slog.DebugContext(
+			ctx, "mysql: applier: zero rows affected",
 			slog.String("op", op),
 			slog.String("schema", schema),
 			slog.String("table", table),

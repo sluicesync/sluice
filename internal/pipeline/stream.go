@@ -385,7 +385,8 @@ func (b *BackupStream) Run(ctx context.Context) error {
 	}
 	startPos := parent.EndPosition
 	if startPos.Engine == "" && startPos.Token == "" {
-		slog.WarnContext(ctx, "stream: parent manifest has no EndPosition; chain will start from CDC's current position",
+		slog.WarnContext(
+			ctx, "stream: parent manifest has no EndPosition; chain will start from CDC's current position",
 			slog.String("parent_path", parentPath),
 		)
 	}
@@ -452,7 +453,8 @@ func (b *BackupStream) Run(ctx context.Context) error {
 	stopCh, deregisterStopCh := registerStreamStopChan(b.Store)
 	defer deregisterStopCh()
 
-	slog.InfoContext(ctx, "stream: started",
+	slog.InfoContext(
+		ctx, "stream: started",
 		slog.String("source_engine", b.Source.Name()),
 		slog.String("parent_backup_id", parent.BackupID),
 		slog.Duration("rollover_window", rolloverWindow),
@@ -471,11 +473,13 @@ func (b *BackupStream) Run(ctx context.Context) error {
 		// short-circuits the same way: the captureWindow loop sees
 		// ctx.Done and returns; we drop into the cleanup block below.
 		if stopReq, sErr := readStreamStopRequested(ctx, b.Store, statePath); sErr != nil {
-			slog.WarnContext(ctx, "stream: failed to read stream_state for stop check; will retry on next rollover",
+			slog.WarnContext(
+				ctx, "stream: failed to read stream_state for stop check; will retry on next rollover",
 				slog.String("err", sErr.Error()),
 			)
 		} else if stopReq != nil {
-			slog.InfoContext(ctx, "stream: stop requested via stream_state.json; exiting after current rollover",
+			slog.InfoContext(
+				ctx, "stream: stop requested via stream_state.json; exiting after current rollover",
 				slog.Time("requested_at", *stopReq),
 			)
 			return nil
@@ -499,14 +503,16 @@ func (b *BackupStream) Run(ctx context.Context) error {
 					commitCtx, commitCancel := context.WithTimeout(context.WithoutCancel(ctx), stopDrainTimeout)
 					manifestPath := buildIncrementalManifestPath(roll.Manifest)
 					if err := writeManifestAt(commitCtx, b.segStore, manifestPath, roll.Manifest); err != nil {
-						slog.WarnContext(ctx, "stream: drain-commit of in-flight manifest failed",
+						slog.WarnContext(
+							ctx, "stream: drain-commit of in-flight manifest failed",
 							slog.String("err", err.Error()),
 						)
 					} else {
 						// ADR-0046: append to the open segment in
 						// lineage.json on the drain-commit path too.
 						updateLineageForManifestBestEffort(commitCtx, b.Store, roll.Manifest, manifestPath, b.segCodec)
-						slog.InfoContext(ctx, "stream rollover committed (drain on ctx-cancel)",
+						slog.InfoContext(
+							ctx, "stream rollover committed (drain on ctx-cancel)",
 							slog.String("manifest_path", manifestPath),
 							slog.String("backup_id", roll.Manifest.BackupID),
 							slog.Int64("changes", roll.TotalChanges),
@@ -516,7 +522,8 @@ func (b *BackupStream) Run(ctx context.Context) error {
 					}
 					commitCancel()
 				} else {
-					slog.InfoContext(ctx, "stream: context cancelled during rollover; in-flight rollover not committed",
+					slog.InfoContext(
+						ctx, "stream: context cancelled during rollover; in-flight rollover not committed",
 						slog.Duration("elapsed", elapsed),
 					)
 				}
@@ -538,7 +545,8 @@ func (b *BackupStream) Run(ctx context.Context) error {
 						rolloverSeq, retryConsecutive, rErr))
 				}
 				backoff := computeRetryBackoff(retryConsecutive, retryBase, retryCap, re.RetryHint())
-				slog.InfoContext(ctx, "stream: transient cdc error; reopening pump and retrying",
+				slog.InfoContext(
+					ctx, "stream: transient cdc error; reopening pump and retrying",
 					slog.Int("rollover_seq", rolloverSeq),
 					slog.Int("attempt", retryConsecutive),
 					slog.Int("max_attempts", retryAttempts),
@@ -576,7 +584,8 @@ func (b *BackupStream) Run(ctx context.Context) error {
 
 		if roll.Manifest == nil {
 			// Empty rollover that we skipped per IncludeEmptyRollovers.
-			slog.InfoContext(ctx, "stream: rollover empty; skipping manifest write",
+			slog.InfoContext(
+				ctx, "stream: rollover empty; skipping manifest write",
 				slog.Int("seq", rolloverSeq),
 				slog.Duration("elapsed", elapsed),
 			)
@@ -587,7 +596,8 @@ func (b *BackupStream) Run(ctx context.Context) error {
 				// `sluice backup stream stop`; clobbering it would
 				// confuse any drain-completion tooling watching the
 				// field).
-				slog.InfoContext(ctx, "stream: stop requested via stream_state.json during rollover; exiting",
+				slog.InfoContext(
+					ctx, "stream: stop requested via stream_state.json during rollover; exiting",
 					slog.Int("rollovers", rolloverSeq),
 				)
 				return nil
@@ -605,12 +615,14 @@ func (b *BackupStream) Run(ctx context.Context) error {
 			state.LastRolloverAt = now().UTC()
 			stopObserved, err := writeStreamStateMergeHeartbeat(ctx, b.Store, statePath, state)
 			if err != nil {
-				slog.WarnContext(ctx, "stream: failed to update state file after empty rollover",
+				slog.WarnContext(
+					ctx, "stream: failed to update state file after empty rollover",
 					slog.String("err", err.Error()),
 				)
 			}
 			if stopObserved {
-				slog.InfoContext(ctx, "stream: heartbeat merge observed concurrent stop_requested_at; exiting",
+				slog.InfoContext(
+					ctx, "stream: heartbeat merge observed concurrent stop_requested_at; exiting",
 					slog.Int("rollovers", rolloverSeq),
 				)
 				return nil
@@ -623,7 +635,8 @@ func (b *BackupStream) Run(ctx context.Context) error {
 			// production the same path triggers when the slot becomes
 			// invalid mid-stream — we want a loud exit, not a busy spin.
 			if roll.SourceClosed {
-				slog.InfoContext(ctx, "stream: cdc channel closed; exiting after final empty rollover",
+				slog.InfoContext(
+					ctx, "stream: cdc channel closed; exiting after final empty rollover",
 					slog.Int("rollovers", rolloverSeq),
 				)
 				return nil
@@ -646,7 +659,8 @@ func (b *BackupStream) Run(ctx context.Context) error {
 			// state file now carries the operator's
 			// stop_requested_at, and writing our heartbeat here would
 			// clobber it. Exit cleanly.
-			slog.InfoContext(ctx, "stream rollover committed; stop requested via stream_state.json — exiting",
+			slog.InfoContext(
+				ctx, "stream rollover committed; stop requested via stream_state.json — exiting",
 				slog.String("manifest_path", manifestPath),
 				slog.String("backup_id", roll.Manifest.BackupID),
 				slog.Int64("changes", roll.TotalChanges),
@@ -668,18 +682,21 @@ func (b *BackupStream) Run(ctx context.Context) error {
 		state.LastRolloverAt = now().UTC()
 		stopObserved, hbErr := writeStreamStateMergeHeartbeat(ctx, b.Store, statePath, state)
 		if hbErr != nil {
-			slog.WarnContext(ctx, "stream: failed to update state file after rollover commit",
+			slog.WarnContext(
+				ctx, "stream: failed to update state file after rollover commit",
 				slog.String("err", hbErr.Error()),
 			)
 		}
 		if stopObserved {
-			slog.InfoContext(ctx, "stream: heartbeat merge observed concurrent stop_requested_at; exiting after committed rollover",
+			slog.InfoContext(
+				ctx, "stream: heartbeat merge observed concurrent stop_requested_at; exiting after committed rollover",
 				slog.Int("rollovers", rolloverSeq),
 			)
 			return nil
 		}
 
-		slog.InfoContext(ctx, "stream rollover committed",
+		slog.InfoContext(
+			ctx, "stream rollover committed",
 			slog.String("manifest_path", manifestPath),
 			slog.String("backup_id", roll.Manifest.BackupID),
 			slog.String("parent_backup_id", roll.Manifest.ParentBackupID),
@@ -722,7 +739,8 @@ func (b *BackupStream) Run(ctx context.Context) error {
 				// stream continues streaming the still-open prior
 				// segment from its persisted position.
 				if errors.Is(rotErr, errRotationAbortStayOpen) {
-					slog.ErrorContext(ctx, "stream: rotation aborted; staying on the open segment (no gap introduced)",
+					slog.ErrorContext(
+						ctx, "stream: rotation aborted; staying on the open segment (no gap introduced)",
 						slog.String("rotation_reason", reason),
 						slog.String("err", rotErr.Error()),
 					)
@@ -747,7 +765,8 @@ func (b *BackupStream) Run(ctx context.Context) error {
 				// after S (StartPosition = S stays consistent).
 				b.skipThrough = &res.resumePos
 				rolloverSeq = 0
-				slog.InfoContext(ctx, "stream: rotation committed; continuing on new segment",
+				slog.InfoContext(
+					ctx, "stream: rotation committed; continuing on new segment",
 					slog.String("rotation_reason", reason),
 					slog.String("new_segment_dir", res.newSegDir),
 					slog.String("anchor_token", res.resumePos.Token),
@@ -759,7 +778,8 @@ func (b *BackupStream) Run(ctx context.Context) error {
 		// emit-then-close, or a real engine whose stream ended). Exit
 		// cleanly rather than spinning on an empty channel.
 		if roll.SourceClosed {
-			slog.InfoContext(ctx, "stream: cdc channel closed after rollover commit; exiting",
+			slog.InfoContext(
+				ctx, "stream: cdc channel closed after rollover commit; exiting",
 				slog.Int("rollovers", rolloverSeq),
 			)
 			return nil
@@ -980,7 +1000,8 @@ func (b *BackupStream) refreshSchemaAndAttachDelta(
 		return fmt.Errorf("rollover: hash post-window schema: %w", err)
 	}
 	manifest.SchemaHash = afterHash
-	slog.InfoContext(ctx, "stream: schema delta detected at rollover",
+	slog.InfoContext(
+		ctx, "stream: schema delta detected at rollover",
 		slog.Int("delta_count", len(delta)),
 	)
 	return nil
@@ -1143,7 +1164,8 @@ func (b *BackupStream) captureWindow(
 			if !inTransaction && writer != nil {
 				flushCtx, flushCancel := context.WithTimeout(context.WithoutCancel(ctx), stopDrainTimeout)
 				if fErr := flushTo(flushCtx); fErr != nil {
-					slog.WarnContext(ctx, "stream: drain-flush failed; in-flight chunk dropped",
+					slog.WarnContext(
+						ctx, "stream: drain-flush failed; in-flight chunk dropped",
 						slog.String("err", fErr.Error()),
 					)
 				}
@@ -1158,7 +1180,8 @@ func (b *BackupStream) captureWindow(
 			// instantaneous observation. Cross-process operators take
 			// the file-poll path below; this case is just a no-op for
 			// them (their stopCh is never closed by a remote process).
-			slog.DebugContext(ctx, "stream: in-process stop signal observed; eager exit",
+			slog.DebugContext(
+				ctx, "stream: in-process stop signal observed; eager exit",
 				slog.Int64("changes_so_far", out.TotalChanges),
 			)
 			out.StopRequested = true
@@ -1189,7 +1212,8 @@ func (b *BackupStream) captureWindow(
 			}
 			req, sErr := readStreamStopRequested(ctx, b.Store, statePath)
 			if sErr != nil {
-				slog.WarnContext(ctx, "stream: stop-poll read failed; will retry on next tick",
+				slog.WarnContext(
+					ctx, "stream: stop-poll read failed; will retry on next tick",
 					slog.String("err", sErr.Error()),
 				)
 				continue
@@ -1307,7 +1331,8 @@ func openCDCReaderWithSlot(ctx context.Context, source ir.Engine, dsn, slotName 
 		if opener, ok := source.(ir.CDCReaderWithSlotOpener); ok {
 			return opener.OpenCDCReaderWithSlot(ctx, dsn, slotName)
 		}
-		slog.InfoContext(ctx, "stream: --slot-name supplied but engine has no slot concept; ignoring",
+		slog.InfoContext(
+			ctx, "stream: --slot-name supplied but engine has no slot concept; ignoring",
 			slog.String("engine", source.Name()),
 			slog.String("slot_name", slotName),
 		)
@@ -1331,7 +1356,8 @@ func runRolloverHook(ctx context.Context, hookCmd string, manifest *ir.Manifest,
 	// Use sh -c on Unix-y systems; cmd /C on Windows. The exec.Command
 	// stdlib helper handles dispatch via the current OS's shell.
 	cmd := newShellCommand(hookCtx, hookCmd)
-	cmd.Env = append(cmd.Env,
+	cmd.Env = append(
+		cmd.Env,
 		fmt.Sprintf("SLUICE_ROLLOVER_MANIFEST_PATH=%s", manifestPath),
 		fmt.Sprintf("SLUICE_ROLLOVER_PARENT_BACKUP_ID=%s", manifest.ParentBackupID),
 		fmt.Sprintf("SLUICE_ROLLOVER_BACKUP_ID=%s", manifest.BackupID),
@@ -1342,14 +1368,16 @@ func runRolloverHook(ctx context.Context, hookCmd string, manifest *ir.Manifest,
 
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		slog.WarnContext(ctx, "stream: rollover hook failed (rollover already committed)",
+		slog.WarnContext(
+			ctx, "stream: rollover hook failed (rollover already committed)",
 			slog.String("hook", hookCmd),
 			slog.String("err", err.Error()),
 			slog.String("output", strings.TrimSpace(string(out))),
 		)
 		return
 	}
-	slog.DebugContext(ctx, "stream: rollover hook ok",
+	slog.DebugContext(
+		ctx, "stream: rollover hook ok",
 		slog.String("hook", hookCmd),
 		slog.String("output", strings.TrimSpace(string(out))),
 	)

@@ -47,7 +47,8 @@ func validateTargetSchema(target ir.Engine, targetSchema string) error {
 			"streams, e.g. --target=mysql://...:3306/customer_svc). "+
 			"Multi-source --target-schema is PG-only in this release; "+
 			"see docs/adr/adr-0031-multi-source-aggregation-target-schema.md",
-		target.Name())
+		target.Name(),
+	)
 }
 
 // applyTargetSchema threads an operator-supplied schema-name override
@@ -198,7 +199,8 @@ func validateEnabledPGExtensions(source, target ir.Engine, extensions []string) 
 			"pipeline: --enable-pg-extension is only supported on PG sources "+
 				"(source engine is %q); the flag opts into PG → PG extension "+
 				"passthrough per ADR-0032",
-			source.Name())
+			source.Name(),
+		)
 	}
 	if target != nil && target.Name() != "postgres" {
 		// Per-extension cross-engine gate: an extension with a
@@ -221,7 +223,8 @@ func validateEnabledPGExtensions(source, target ir.Engine, extensions []string) 
 						"translators for hstore and citext (lossless MySQL "+
 						"mappings). Supply --type-override per column for "+
 						"the named extension, or use a PG target",
-					ext, target.Name())
+					ext, target.Name(),
+				)
 			}
 		}
 	}

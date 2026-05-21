@@ -82,7 +82,8 @@ func (e Engine) OpenSnapshotStreamWithSlot(ctx context.Context, dsn, slotName st
 		_ = db.Close()
 		return nil, fmt.Errorf(
 			"postgres: snapshot: replication slot %q already exists; drop it before starting a snapshot stream (manual cleanup avoids accidentally inheriting a stale consistent_point)",
-			slotName)
+			slotName,
+		)
 	}
 
 	// Open a replication connection dedicated to slot creation. We

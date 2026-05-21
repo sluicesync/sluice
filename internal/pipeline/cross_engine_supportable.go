@@ -70,7 +70,8 @@ func checkCrossEngineSupportable(
 					"%s: column %q.%q has %s — no clean cross-engine translation. "+
 						"Recovery: re-run with --exclude-table=%s to skip the table, "+
 						"or supply a --type-override mapping the column to a portable IR type",
-					contextID, tbl.Name, col.Name, reason, tbl.Name)
+					contextID, tbl.Name, col.Name, reason, tbl.Name,
+				)
 			}
 		}
 		// ADR-0032 Tier 2 lite: indexes carrying an extension-owned
@@ -88,7 +89,8 @@ func checkCrossEngineSupportable(
 					"Recovery: re-run with --exclude-table=%s to skip the table, "+
 					"drop the index on the source before migrating, "+
 					"or supply a --type-override / --index-override mapping",
-				contextID, idxName, tbl.Name, reason, colRef, tbl.Name)
+				contextID, idxName, tbl.Name, reason, colRef, tbl.Name,
+			)
 		}
 	}
 	return nil

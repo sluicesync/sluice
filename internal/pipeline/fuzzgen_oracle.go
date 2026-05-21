@@ -123,12 +123,14 @@ func classify(
 		if migErr == nil {
 			return verdictFail, fmt.Sprintf(
 				"UNEXPECTED SUCCESS: %s — expected a loud refusal but migrate exited 0 (silent corruption risk)",
-				ce.reason)
+				ce.reason,
+			)
 		}
 		if targetRowCount > 0 {
 			return verdictFail, fmt.Sprintf(
 				"PARTIAL TARGET DATA: %s — migrate refused (good) but %d row(s) reached the target (partial data is a FAIL)",
-				ce.reason, targetRowCount)
+				ce.reason, targetRowCount,
+			)
 		}
 		return verdictPass, "loud-refuse as documented (no partial data): " + ce.reason
 	}
@@ -137,7 +139,8 @@ func classify(
 	if migErr != nil {
 		return verdictFail, fmt.Sprintf(
 			"UNEXPECTED REFUSAL: migrate errored on a case with no documented loud-refuse column (the v0.69.0 #16 false-positive class): %v",
-			migErr)
+			migErr,
+		)
 	}
 
 	// Faithful columns must compare src==dst exactly via canonical text.
@@ -146,7 +149,8 @@ func classify(
 	}
 	if len(dst) != len(src) {
 		return verdictFail, fmt.Sprintf(
-			"ROW COUNT MISMATCH: src has %d rows, dst has %d (silent loss)", len(src), len(dst))
+			"ROW COUNT MISMATCH: src has %d rows, dst has %d (silent loss)", len(src), len(dst),
+		)
 	}
 	for _, col := range ce.faithfulCols {
 		sv, ok := src[col]
@@ -156,14 +160,16 @@ func classify(
 		dv := dst[col]
 		if len(dv) != len(sv) {
 			return verdictFail, fmt.Sprintf(
-				"col %s: src %d cells, dst %d cells (silent loss)", col, len(sv), len(dv))
+				"col %s: src %d cells, dst %d cells (silent loss)", col, len(sv), len(dv),
+			)
 		}
 		for i := range sv {
 			if sv[i] != dv[i] {
 				return verdictFail, fmt.Sprintf(
 					"MISMATCH col %s row %d: src=%q dst=%q "+
 						"(silent loss / flatten / corruption — faithful round-trip expected)",
-					col, i, nullStr(sv[i]), nullStr(dv[i]))
+					col, i, nullStr(sv[i]), nullStr(dv[i]),
+				)
 			}
 		}
 	}

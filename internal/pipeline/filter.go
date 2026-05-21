@@ -68,7 +68,8 @@ func NewTableFilter(include, exclude []string) (TableFilter, error) {
 	if len(include) > 0 && len(exclude) > 0 {
 		return TableFilter{}, fmt.Errorf(
 			"pipeline: --include-table and --exclude-table are mutually exclusive (got include=%v exclude=%v)",
-			include, exclude)
+			include, exclude,
+		)
 	}
 	for _, p := range include {
 		if _, err := path.Match(p, ""); err != nil {
@@ -181,7 +182,8 @@ func applyTableFilter(ctx context.Context, schema *ir.Schema, filter TableFilter
 		}
 	}
 	schema.Tables = kept
-	slog.InfoContext(ctx, "table filter applied",
+	slog.InfoContext(
+		ctx, "table filter applied",
 		slog.Int("matched", len(kept)),
 		slog.Int("excluded", original-len(kept)),
 	)
@@ -207,7 +209,8 @@ func NewViewFilter(include, exclude []string) (ViewFilter, error) {
 	if len(include) > 0 && len(exclude) > 0 {
 		return ViewFilter{}, fmt.Errorf(
 			"pipeline: --include-view and --exclude-view are mutually exclusive (got include=%v exclude=%v)",
-			include, exclude)
+			include, exclude,
+		)
 	}
 	for _, p := range include {
 		if _, err := path.Match(p, ""); err != nil {
@@ -252,7 +255,8 @@ func applyViewFilter(ctx context.Context, schema *ir.Schema, filter ViewFilter, 
 		original := len(schema.Views)
 		schema.Views = nil
 		if original > 0 {
-			slog.InfoContext(ctx, "view processing skipped (--skip-views)",
+			slog.InfoContext(
+				ctx, "view processing skipped (--skip-views)",
 				slog.Int("excluded", original),
 			)
 		}
@@ -272,7 +276,8 @@ func applyViewFilter(ctx context.Context, schema *ir.Schema, filter ViewFilter, 
 		}
 	}
 	schema.Views = kept
-	slog.InfoContext(ctx, "view filter applied",
+	slog.InfoContext(
+		ctx, "view filter applied",
 		slog.Int("matched", len(kept)),
 		slog.Int("excluded", original-len(kept)),
 	)
@@ -310,7 +315,8 @@ func filterChanges(ctx context.Context, in <-chan ir.Change, filter TableFilter)
 					return
 				}
 				if !changeAllowed(c, filter) {
-					slog.DebugContext(ctx, "cdc event dropped by table filter",
+					slog.DebugContext(
+						ctx, "cdc event dropped by table filter",
 						slog.String("table", c.QualifiedName()),
 					)
 					continue

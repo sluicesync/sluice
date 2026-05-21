@@ -104,7 +104,8 @@ func TestSlotPause_Verify_RetainedWALReDecodesWithUpdatedPublication(t *testing.
 	defer func() { _ = slotConn.Close(context.Background()) }()
 
 	const slotName = "s_verify"
-	if _, err := pglogrepl.CreateReplicationSlot(ctx, slotConn,
+	if _, err := pglogrepl.CreateReplicationSlot(
+		ctx, slotConn,
 		slotName, "pgoutput",
 		pglogrepl.CreateReplicationSlotOptions{Temporary: false, Mode: pglogrepl.LogicalReplication},
 	); err != nil {
@@ -264,7 +265,8 @@ func verifyH2_TempSlotSnapshotCapturesPrePublicationAddRows(
 	}
 	defer func() { _ = mainSlotConn.Close(context.Background()) }()
 	const mainSlot = "h2_main"
-	if _, err := pglogrepl.CreateReplicationSlot(ctx, mainSlotConn,
+	if _, err := pglogrepl.CreateReplicationSlot(
+		ctx, mainSlotConn,
 		mainSlot, "pgoutput",
 		pglogrepl.CreateReplicationSlotOptions{Mode: pglogrepl.LogicalReplication},
 	); err != nil {
@@ -471,7 +473,8 @@ func currentWALLSN(ctx context.Context, db *sql.DB) (pglogrepl.LSN, error) {
 // diagnostic logging in the verification.
 func readConfirmedFlushLSN(ctx context.Context, db *sql.DB, slotName string) (string, error) {
 	var s sql.NullString
-	err := db.QueryRowContext(ctx,
+	err := db.QueryRowContext(
+		ctx,
 		`SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = $1`,
 		slotName,
 	).Scan(&s)

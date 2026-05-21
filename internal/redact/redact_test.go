@@ -490,7 +490,8 @@ func TestMask_Inner(t *testing.T) {
 
 	t.Run("PAN-style: keep first 4 + last 4", func(t *testing.T) {
 		got, err := (Mask{Form: MaskInner, M1: 4, M2: 4}).Redact(
-			stringColumn("pan", true), "4111111111111111", nil)
+			stringColumn("pan", true), "4111111111111111", nil,
+		)
 		if err != nil {
 			t.Fatalf("unexpected error %v", err)
 		}
@@ -501,7 +502,8 @@ func TestMask_Inner(t *testing.T) {
 
 	t.Run("SSN-style: keep last 4 only (M1=0)", func(t *testing.T) {
 		got, _ := (Mask{Form: MaskInner, M1: 0, M2: 4}).Redact(
-			stringColumn("ssn", true), "123-45-6789", nil)
+			stringColumn("ssn", true), "123-45-6789", nil,
+		)
 		if got != "XXXXXXX6789" {
 			t.Errorf("got %v; want %q", got, "XXXXXXX6789")
 		}
@@ -509,7 +511,8 @@ func TestMask_Inner(t *testing.T) {
 
 	t.Run("custom mask char", func(t *testing.T) {
 		got, _ := (Mask{Form: MaskInner, M1: 4, M2: 4, Char: "*"}).Redact(
-			stringColumn("pan", true), "4111111111111111", nil)
+			stringColumn("pan", true), "4111111111111111", nil,
+		)
 		if got != "4111********1111" {
 			t.Errorf("got %v; want %q", got, "4111********1111")
 		}
@@ -517,7 +520,8 @@ func TestMask_Inner(t *testing.T) {
 
 	t.Run("M1+M2 >= length: input passes through", func(t *testing.T) {
 		got, _ := (Mask{Form: MaskInner, M1: 4, M2: 4}).Redact(
-			stringColumn("short", true), "12345", nil)
+			stringColumn("short", true), "12345", nil,
+		)
 		if got != "12345" {
 			t.Errorf("got %v; want %q (unchanged when margins cover full length)", got, "12345")
 		}
@@ -527,7 +531,8 @@ func TestMask_Inner(t *testing.T) {
 		// "ñ@example.com" has 13 runes. M1=1, M2=4 keeps "ñ" and
 		// ".com", masks the 8 middle runes.
 		got, _ := (Mask{Form: MaskInner, M1: 1, M2: 4}).Redact(
-			stringColumn("email", true), "ñ@example.com", nil)
+			stringColumn("email", true), "ñ@example.com", nil,
+		)
 		if got != "ñXXXXXXXX.com" {
 			t.Errorf("got %v; want %q (UTF-8 rune count)", got, "ñXXXXXXXX.com")
 		}
@@ -535,7 +540,8 @@ func TestMask_Inner(t *testing.T) {
 
 	t.Run("nil input passes through", func(t *testing.T) {
 		got, err := (Mask{Form: MaskInner, M1: 4, M2: 4}).Redact(
-			stringColumn("pan", true), nil, nil)
+			stringColumn("pan", true), nil, nil,
+		)
 		if err != nil || got != nil {
 			t.Errorf("nil input: got %v err %v; want nil, nil", got, err)
 		}
@@ -543,7 +549,8 @@ func TestMask_Inner(t *testing.T) {
 
 	t.Run("non-string input refuses with informative error", func(t *testing.T) {
 		_, err := (Mask{Form: MaskInner, M1: 4, M2: 4}).Redact(
-			intColumn("age", false), int64(42), nil)
+			intColumn("age", false), int64(42), nil,
+		)
 		if err == nil {
 			t.Fatal("expected error for int input")
 		}
@@ -554,7 +561,8 @@ func TestMask_Inner(t *testing.T) {
 
 	t.Run("negative margins treated as 0", func(t *testing.T) {
 		got, _ := (Mask{Form: MaskInner, M1: -1, M2: -1}).Redact(
-			stringColumn("pan", true), "ABCD", nil)
+			stringColumn("pan", true), "ABCD", nil,
+		)
 		if got != "XXXX" {
 			t.Errorf("got %v; want %q (negatives → 0, whole string masked)", got, "XXXX")
 		}
@@ -572,7 +580,8 @@ func TestMask_Outer(t *testing.T) {
 
 	t.Run("Keep middle: mask first 2 + last 2", func(t *testing.T) {
 		got, _ := (Mask{Form: MaskOuter, M1: 2, M2: 2}).Redact(
-			stringColumn("code", true), "ABCDEFGH", nil)
+			stringColumn("code", true), "ABCDEFGH", nil,
+		)
 		if got != "XXCDEFXX" {
 			t.Errorf("got %v; want %q", got, "XXCDEFXX")
 		}
@@ -580,7 +589,8 @@ func TestMask_Outer(t *testing.T) {
 
 	t.Run("M1+M2 >= length: whole value masked", func(t *testing.T) {
 		got, _ := (Mask{Form: MaskOuter, M1: 4, M2: 4}).Redact(
-			stringColumn("short", true), "1234", nil)
+			stringColumn("short", true), "1234", nil,
+		)
 		if got != "XXXX" {
 			t.Errorf("got %v; want %q (margins cover full length → all masked)", got, "XXXX")
 		}
@@ -588,7 +598,8 @@ func TestMask_Outer(t *testing.T) {
 
 	t.Run("nil input passes through", func(t *testing.T) {
 		got, _ := (Mask{Form: MaskOuter, M1: 2, M2: 2}).Redact(
-			stringColumn("code", true), nil, nil)
+			stringColumn("code", true), nil, nil,
+		)
 		if got != nil {
 			t.Errorf("nil input: got %v; want nil", got)
 		}

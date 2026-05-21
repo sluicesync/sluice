@@ -447,7 +447,8 @@ func (b *BackupFullCmd) Run(g *Globals) error {
 		defer func() { _ = closer() }()
 	}
 
-	slog.InfoContext(ctx, "backup: starting full backup",
+	slog.InfoContext(
+		ctx, "backup: starting full backup",
 		slog.String("source_engine", source.Name()),
 		slog.String("destination", storeDesc),
 		slog.Int("chunk_size", b.ChunkSize),
@@ -597,7 +598,8 @@ func (b *BackupIncrementalCmd) Run(_ *Globals) error {
 		defer func() { _ = closer() }()
 	}
 
-	slog.InfoContext(ctx, "backup: starting incremental",
+	slog.InfoContext(
+		ctx, "backup: starting incremental",
 		slog.String("source_engine", source.Name()),
 		slog.String("destination", storeDesc),
 		slog.String("since", b.Since),
@@ -723,7 +725,8 @@ func (b *BackupStreamCmd) Run(_ *Globals) error {
 		defer func() { _ = closer() }()
 	}
 
-	slog.InfoContext(ctx, "backup: starting stream",
+	slog.InfoContext(
+		ctx, "backup: starting stream",
 		slog.String("source_engine", source.Name()),
 		slog.String("destination", storeDesc),
 		slog.String("since", b.Since),
@@ -799,7 +802,8 @@ func (b *BackupStreamStopCmd) Run(_ *Globals) error {
 	if err != nil {
 		return err
 	}
-	slog.InfoContext(ctx, "backup stream stop: signal written; running stream will exit on next rollover-tick",
+	slog.InfoContext(
+		ctx, "backup stream stop: signal written; running stream will exit on next rollover-tick",
 		slog.String("destination", storeDesc),
 		slog.Int("running_pid", prior.PID),
 		slog.String("running_host", prior.Host),
@@ -849,7 +853,8 @@ func (v *BackupVerifyCmd) Run(_ *Globals) error {
 		if err != nil {
 			return fmt.Errorf("rebuild lineage catalog: %w", err)
 		}
-		slog.InfoContext(ctx, "lineage catalog rebuilt",
+		slog.InfoContext(
+			ctx, "lineage catalog rebuilt",
 			slog.Int("segments", segments),
 			slog.Int("manifests", manifests),
 		)
@@ -862,7 +867,8 @@ func (v *BackupVerifyCmd) Run(_ *Globals) error {
 	if mismatches > 0 {
 		return fmt.Errorf("verify: %d of %d chunk(s) failed SHA-256 check", mismatches, total)
 	}
-	slog.InfoContext(ctx, "backup verify: all chunks OK",
+	slog.InfoContext(
+		ctx, "backup verify: all chunks OK",
 		slog.Int("chunks", total),
 	)
 	return nil
@@ -939,14 +945,16 @@ func (p *BackupPruneCmd) Run(_ *Globals) error {
 	if p.DryRun {
 		mode = "would-prune (dry-run)"
 	}
-	slog.InfoContext(ctx, "backup prune: "+mode,
+	slog.InfoContext(
+		ctx, "backup prune: "+mode,
 		slog.Int("manifests_dropped", len(res.Pruned)),
 		slog.Int("manifests_kept", len(res.Kept)),
 		slog.Int("chunks_deleted", res.ChunksDeleted),
 		slog.String("earliest_restorable_backup_id", res.EarliestRestorableBackupID),
 	)
 	for _, p := range res.Pruned {
-		slog.InfoContext(ctx, "  dropped",
+		slog.InfoContext(
+			ctx, "  dropped",
 			slog.String("manifest_path", p),
 		)
 	}
@@ -1029,7 +1037,8 @@ func (r *RestoreCmd) Run(g *Globals) error {
 		defer func() { _ = closer() }()
 	}
 
-	slog.InfoContext(ctx, "restore: starting full restore",
+	slog.InfoContext(
+		ctx, "restore: starting full restore",
 		slog.String("target_engine", target.Name()),
 		slog.String("source", storeDesc),
 	)

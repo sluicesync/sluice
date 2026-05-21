@@ -49,7 +49,8 @@ func startPostgresWithTrgm(t *testing.T, enableOnTarget bool) (sourceDSN, target
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 
-	container, err := pgtc.Run(ctx,
+	container, err := pgtc.Run(
+		ctx,
 		"postgres:16",
 		pgtc.WithDatabase("source_db"),
 		pgtc.WithUsername("test"),

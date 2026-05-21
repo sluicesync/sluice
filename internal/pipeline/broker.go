@@ -258,7 +258,8 @@ func decodeBrokerPosition(pos ir.Position) (*brokerPositionToken, error) {
 	if tok.Engine != BackupBrokerPositionEngine {
 		return nil, fmt.Errorf(
 			"broker: token's _engine field is %q, not %q",
-			tok.Engine, BackupBrokerPositionEngine)
+			tok.Engine, BackupBrokerPositionEngine,
+		)
 	}
 	return &tok, nil
 }
@@ -350,7 +351,8 @@ func (b *SyncFromBackup) Run(ctx context.Context) error {
 				b.StreamID, dErr)
 		}
 		lastAppliedID = tok.LastAppliedBackupID
-		slog.InfoContext(ctx, "broker: warm resume",
+		slog.InfoContext(
+			ctx, "broker: warm resume",
 			slog.String("stream_id", b.StreamID),
 			slog.String("last_applied_backup_id", lastAppliedID),
 		)
@@ -358,7 +360,8 @@ func (b *SyncFromBackup) Run(ctx context.Context) error {
 		return fmt.Errorf(
 			"broker: stream %q is owned by a non-broker writer (position engine %q); "+
 				"choose a different --stream-id or clear the conflicting row first",
-			b.StreamID, persisted.Engine)
+			b.StreamID, persisted.Engine,
+		)
 	default:
 		// Cold-start branch.
 		startID, err := b.coldStart(ctx, applier)
@@ -389,7 +392,8 @@ func (b *SyncFromBackup) Run(ctx context.Context) error {
 	stopCh, deregisterStopCh := registerBrokerStopChan(b.Store)
 	defer deregisterStopCh()
 
-	slog.InfoContext(ctx, "broker: started",
+	slog.InfoContext(
+		ctx, "broker: started",
 		slog.String("stream_id", b.StreamID),
 		slog.String("chain_url", b.ChainURL),
 		slog.String("target_engine", b.Target.Name()),
@@ -410,7 +414,8 @@ func (b *SyncFromBackup) Run(ctx context.Context) error {
 	// resumption assertions.
 	chainSourceEngine := b.detectChainSourceEngine(ctx)
 	if chainSourceEngine != "" && chainSourceEngine != b.Target.Name() {
-		slog.InfoContext(ctx, "broker: cross-engine chain — chain's EndPosition not written to sluice_cdc_state; use --at-chain-id for cross-engine resumption assertions",
+		slog.InfoContext(
+			ctx, "broker: cross-engine chain — chain's EndPosition not written to sluice_cdc_state; use --at-chain-id for cross-engine resumption assertions",
 			slog.String("stream_id", b.StreamID),
 			slog.String("chain_source_engine", chainSourceEngine),
 			slog.String("target_engine", b.Target.Name()),
@@ -437,12 +442,14 @@ func (b *SyncFromBackup) Run(ctx context.Context) error {
 		// ctx-cancel here also short-circuits via the same path.
 		exit, sErr := b.checkStopSignals(ctx, statePath, stopCh)
 		if sErr != nil {
-			slog.WarnContext(ctx, "broker: failed to read broker_state for stop check; will retry on next tick",
+			slog.WarnContext(
+				ctx, "broker: failed to read broker_state for stop check; will retry on next tick",
 				slog.String("err", sErr.Error()),
 			)
 		}
 		if exit {
-			slog.InfoContext(ctx, "broker: stop requested; exiting",
+			slog.InfoContext(
+				ctx, "broker: stop requested; exiting",
 				slog.String("stream_id", b.StreamID),
 				slog.String("last_applied_backup_id", lastAppliedID),
 			)
@@ -455,7 +462,8 @@ func (b *SyncFromBackup) Run(ctx context.Context) error {
 
 		if applyErr != nil {
 			if errors.Is(applyErr, context.Canceled) || errors.Is(applyErr, context.DeadlineExceeded) {
-				slog.InfoContext(ctx, "broker: context cancelled; exiting",
+				slog.InfoContext(
+					ctx, "broker: context cancelled; exiting",
 					slog.String("stream_id", b.StreamID),
 					slog.String("last_applied_backup_id", lastAppliedID),
 				)
@@ -473,7 +481,8 @@ func (b *SyncFromBackup) Run(ctx context.Context) error {
 			lastAppliedID = newApplied
 		}
 
-		slog.InfoContext(ctx, "broker tick",
+		slog.InfoContext(
+			ctx, "broker tick",
 			slog.String("stream_id", b.StreamID),
 			slog.String("last_applied_backup_id", lastAppliedID),
 			slog.Int64("bytes_replayed", totalBytes),
@@ -485,12 +494,14 @@ func (b *SyncFromBackup) Run(ctx context.Context) error {
 		state.LastApplyAt = now().UTC()
 		stopObserved, hbErr := writeBrokerStateMergeHeartbeat(ctx, b.Store, statePath, state)
 		if hbErr != nil {
-			slog.WarnContext(ctx, "broker: failed to update state file after tick",
+			slog.WarnContext(
+				ctx, "broker: failed to update state file after tick",
 				slog.String("err", hbErr.Error()),
 			)
 		}
 		if stopObserved {
-			slog.InfoContext(ctx, "broker: heartbeat merge observed concurrent stop_requested_at; exiting",
+			slog.InfoContext(
+				ctx, "broker: heartbeat merge observed concurrent stop_requested_at; exiting",
 				slog.String("stream_id", b.StreamID),
 				slog.String("last_applied_backup_id", lastAppliedID),
 			)
@@ -500,7 +511,8 @@ func (b *SyncFromBackup) Run(ctx context.Context) error {
 		// Sleep until the next interval, observing both ctx cancel
 		// and the in-process stop channel along the way.
 		if exit := b.waitForNextTick(ctx, pollInterval, statePath, stopCh); exit {
-			slog.InfoContext(ctx, "broker: stop requested during tick wait; exiting",
+			slog.InfoContext(
+				ctx, "broker: stop requested during tick wait; exiting",
 				slog.String("stream_id", b.StreamID),
 				slog.String("last_applied_backup_id", lastAppliedID),
 			)
@@ -554,12 +566,14 @@ func (b *SyncFromBackup) validate() error {
 func (b *SyncFromBackup) coldStart(ctx context.Context, applier ir.ChangeApplier) (string, error) {
 	switch {
 	case b.ResetTargetData:
-		slog.InfoContext(ctx, "broker: cold start with --reset-target-data; running ChainRestore",
+		slog.InfoContext(
+			ctx, "broker: cold start with --reset-target-data; running ChainRestore",
 			slog.String("stream_id", b.StreamID),
 		)
 		return b.coldStartReset(ctx, applier)
 	case b.AtChainID != "":
-		slog.InfoContext(ctx, "broker: cold start with --at-chain-id assertion",
+		slog.InfoContext(
+			ctx, "broker: cold start with --at-chain-id assertion",
 			slog.String("stream_id", b.StreamID),
 			slog.String("at_chain_id", b.AtChainID),
 		)
@@ -571,7 +585,8 @@ func (b *SyncFromBackup) coldStart(ctx context.Context, applier ir.ChangeApplier
 			"either pass --reset-target-data to drop the target's data and replay the entire chain, "+
 			"or pass --at-chain-id=<BACKUP-ID> after manually restoring the chain into the target. "+
 			"Refusing to start without an override prevents silent target overwrites (mirrors `migrate --force-cold-start`)",
-		b.StreamID)
+		b.StreamID,
+	)
 }
 
 // coldStartReset runs an inline ChainRestore to land the chain's full
@@ -621,7 +636,8 @@ func (b *SyncFromBackup) coldStartReset(ctx context.Context, applier ir.ChangeAp
 	if err := b.writePositionDirect(ctx, applier, tailID); err != nil {
 		return "", fmt.Errorf("broker: record post-restore position: %w", err)
 	}
-	slog.InfoContext(ctx, "broker: cold start complete; transitioning to live polling",
+	slog.InfoContext(
+		ctx, "broker: cold start complete; transitioning to live polling",
 		slog.String("stream_id", b.StreamID),
 		slog.String("tail_backup_id", tailID),
 		slog.Int("chain_length", len(chain)),
@@ -647,7 +663,8 @@ func (b *SyncFromBackup) dropExistingTargetTables(ctx context.Context, schema *i
 		return fmt.Errorf(
 			"broker: --reset-target-data: target engine %q does not expose ir.TableDropper; "+
 				"drop dest tables manually before re-running",
-			b.Target.Name())
+			b.Target.Name(),
+		)
 	}
 	if err := dropTables(ctx, dropper, schema.Tables); err != nil {
 		return err
@@ -655,7 +672,8 @@ func (b *SyncFromBackup) dropExistingTargetTables(ctx context.Context, schema *i
 	if err := dropSchemaTypes(ctx, rw, schema); err != nil {
 		return err
 	}
-	slog.InfoContext(ctx, "broker: --reset-target-data: target tables dropped before chain restore",
+	slog.InfoContext(
+		ctx, "broker: --reset-target-data: target tables dropped before chain restore",
 		slog.String("stream_id", b.StreamID),
 		slog.Int("tables_dropped", len(schema.Tables)),
 	)
@@ -684,7 +702,8 @@ func (b *SyncFromBackup) coldStartAtChainID(ctx context.Context, applier ir.Chan
 		}
 		return "", fmt.Errorf(
 			"broker: --at-chain-id=%q not found in chain (available: %s)",
-			b.AtChainID, strings.Join(ids, ", "))
+			b.AtChainID, strings.Join(ids, ", "),
+		)
 	}
 	if err := b.writePositionDirect(ctx, applier, b.AtChainID); err != nil {
 		return "", fmt.Errorf("broker: record at-chain-id position: %w", err)
@@ -720,7 +739,8 @@ func (b *SyncFromBackup) writePositionDirect(ctx context.Context, applier ir.Cha
 		return fmt.Errorf(
 			"broker: target engine %q does not expose ir.PositionWriter; cannot record cold-start position. "+
 				"Wait until at least one incremental is available to apply, or use a target engine that supports the surface (postgres / mysql ≥ v0.20.0)",
-			b.Target.Name())
+			b.Target.Name(),
+		)
 	}
 	pos := encodeBrokerPosition(b.ChainURL, backupID)
 	if err := pw.WritePosition(ctx, b.StreamID, pos); err != nil {
@@ -747,7 +767,8 @@ func (b *SyncFromBackup) replayNewIncrementals(
 	if err != nil {
 		return "", 0, fmt.Errorf("build chain: %w", err)
 	}
-	slog.DebugContext(ctx, "broker: replay tick chain snapshot",
+	slog.DebugContext(
+		ctx, "broker: replay tick chain snapshot",
 		slog.String("stream_id", b.StreamID),
 		slog.String("last_applied", lastAppliedID),
 		slog.Int("chain_len", len(chain)),
@@ -773,7 +794,8 @@ func (b *SyncFromBackup) replayNewIncrementals(
 				"broker: last_applied_backup_id %q not found in chain; "+
 					"the chain may have been re-rooted on the source side. Operator action: "+
 					"clear the broker's `sluice_cdc_state` row and re-run with --reset-target-data or --at-chain-id",
-				lastAppliedID)
+				lastAppliedID,
+			)
 		}
 	}
 	if startIdx >= len(chain) {
@@ -808,7 +830,8 @@ func (b *SyncFromBackup) replayNewIncrementals(
 		}
 		newApplied = manifestBackupID(link.manifest)
 		totalBytes += bytesApplied
-		slog.InfoContext(ctx, "broker: incremental applied",
+		slog.InfoContext(
+			ctx, "broker: incremental applied",
 			slog.String("stream_id", b.StreamID),
 			slog.String("backup_id", newApplied),
 			slog.Int64("bytes", bytesApplied),
@@ -916,7 +939,8 @@ func (b *SyncFromBackup) applySchemaDeltas(ctx context.Context, link *segmentRec
 		return fmt.Errorf(
 			"unsupportable schema delta in incremental %s: %w. "+
 				"Force a fresh full + new chain to recover",
-			manifestBackupID(link.manifest), err)
+			manifestBackupID(link.manifest), err,
+		)
 	}
 
 	sourceEngine := link.manifest.SourceEngine
@@ -943,11 +967,13 @@ func (b *SyncFromBackup) applySchemaDeltas(ctx context.Context, link *segmentRec
 			}
 			retargeted := translate.RetargetForEngine(
 				&ir.Schema{Tables: []*ir.Table{d.After}},
-				sourceEngine, targetEngine)
+				sourceEngine, targetEngine,
+			)
 			if err := sw.CreateTablesWithoutConstraints(ctx, retargeted); err != nil {
 				return fmt.Errorf("create added table %s: %w", d.Table, err)
 			}
-			slog.InfoContext(ctx, "broker: schema delta — added table",
+			slog.InfoContext(
+				ctx, "broker: schema delta — added table",
 				slog.String("stream_id", b.StreamID),
 				slog.String("table", d.Table),
 			)
@@ -960,7 +986,8 @@ func (b *SyncFromBackup) applySchemaDeltas(ctx context.Context, link *segmentRec
 				continue
 			}
 			if deltaApplier == nil {
-				slog.WarnContext(ctx, "broker: schema delta — altered table with added columns; engine has no SchemaDeltaApplier",
+				slog.WarnContext(
+					ctx, "broker: schema delta — altered table with added columns; engine has no SchemaDeltaApplier",
 					slog.String("stream_id", b.StreamID),
 					slog.String("table", d.Table),
 					slog.Int("added_columns", len(added)),
@@ -969,19 +996,22 @@ func (b *SyncFromBackup) applySchemaDeltas(ctx context.Context, link *segmentRec
 			}
 			retargetedSchema := translate.RetargetForEngine(
 				&ir.Schema{Tables: []*ir.Table{d.After}},
-				sourceEngine, targetEngine)
+				sourceEngine, targetEngine,
+			)
 			retargetedTable := retargetedSchema.Tables[0]
 			retargetedAdded := addedColumns(d.Before, retargetedTable)
 			if err := deltaApplier.AlterAddColumn(ctx, retargetedTable, retargetedAdded); err != nil {
 				return fmt.Errorf("alter add column on %s: %w", d.Table, err)
 			}
-			slog.InfoContext(ctx, "broker: schema delta — applied ADD COLUMN",
+			slog.InfoContext(
+				ctx, "broker: schema delta — applied ADD COLUMN",
 				slog.String("stream_id", b.StreamID),
 				slog.String("table", d.Table),
 				slog.Int("added_columns", len(added)),
 			)
 		case ir.SchemaDeltaDropTable:
-			slog.WarnContext(ctx, "broker: schema delta — drop ignored (v1 does not auto-DROP)",
+			slog.WarnContext(
+				ctx, "broker: schema delta — drop ignored (v1 does not auto-DROP)",
 				slog.String("stream_id", b.StreamID),
 				slog.String("table", d.Table),
 			)
@@ -1135,7 +1165,8 @@ func (b *SyncFromBackup) waitForNextTick(
 		case <-stopPoll.C:
 			req, err := readBrokerStopRequested(ctx, b.Store, statePath)
 			if err != nil {
-				slog.WarnContext(ctx, "broker: stop-poll read failed; will retry",
+				slog.WarnContext(
+					ctx, "broker: stop-poll read failed; will retry",
 					slog.String("err", err.Error()),
 				)
 				continue

@@ -47,7 +47,8 @@ func startPostgresWithPGVector(t *testing.T, enableOnTarget bool) (sourceDSN, ta
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 
-	container, err := pgtc.Run(ctx,
+	container, err := pgtc.Run(
+		ctx,
 		pgVectorImage,
 		pgtc.WithDatabase("source_db"),
 		pgtc.WithUsername("test"),

@@ -201,7 +201,8 @@ func (r *Restore) Run(ctx context.Context) error {
 			return wrapWithHint(PhaseConnect, fmt.Errorf("restore: %w", err))
 		}
 	}
-	slog.InfoContext(ctx, "restore: loaded manifest",
+	slog.InfoContext(
+		ctx, "restore: loaded manifest",
 		slog.Int("format_version", manifest.FormatVersion),
 		slog.String("source_engine", manifest.SourceEngine),
 		slog.String("target_engine", r.Target.Name()),
@@ -383,7 +384,8 @@ func (r *Restore) restoreTable(
 				return
 			}
 			rowsApplied += chunkRows
-			slog.DebugContext(ctx, "restore: chunk verified and streamed",
+			slog.DebugContext(
+				ctx, "restore: chunk verified and streamed",
 				slog.String("table", table.Name),
 				slog.Int("chunk", chunkIdx),
 				slog.Int64("rows", chunkRows),
@@ -417,7 +419,8 @@ func (r *Restore) restoreTable(
 		// blocked on `rowCh <- row` unblocks via the streamChunkRows
 		// `<-ctx.Done()` arm. Without this, `<-errCh` below would
 		// deadlock — the silent-hang shape from Bug 40.
-		slog.ErrorContext(ctx, "restore: write rows failed; cancelling chunk producer",
+		slog.ErrorContext(
+			ctx, "restore: write rows failed; cancelling chunk producer",
 			slog.String("table", table.Name),
 			slog.String("err", err.Error()),
 		)
@@ -428,7 +431,8 @@ func (r *Restore) restoreTable(
 	if err := <-errCh; err != nil {
 		return err
 	}
-	slog.InfoContext(ctx, "restore: table complete",
+	slog.InfoContext(
+		ctx, "restore: table complete",
 		slog.String("table", table.Name),
 		slog.Int64("rows", entry.RowCount),
 		slog.Int("chunks", len(entry.Chunks)),
@@ -637,7 +641,8 @@ func VerifyBackup(ctx context.Context, store ir.BackupStore) (total, failed int,
 				total++
 				if err := verifyChunk(ctx, segStore, chunk); err != nil {
 					failed++
-					slog.ErrorContext(ctx, "verify: chunk failed",
+					slog.ErrorContext(
+						ctx, "verify: chunk failed",
 						slog.String("manifest", rec.path),
 						slog.String("table", table.Name),
 						slog.String("file", chunk.File),
@@ -645,7 +650,8 @@ func VerifyBackup(ctx context.Context, store ir.BackupStore) (total, failed int,
 					)
 					continue
 				}
-				slog.DebugContext(ctx, "verify: chunk OK",
+				slog.DebugContext(
+					ctx, "verify: chunk OK",
 					slog.String("manifest", rec.path),
 					slog.String("table", table.Name),
 					slog.String("file", chunk.File),
@@ -657,14 +663,16 @@ func VerifyBackup(ctx context.Context, store ir.BackupStore) (total, failed int,
 			total++
 			if err := verifyChunk(ctx, segStore, chunk); err != nil {
 				failed++
-				slog.ErrorContext(ctx, "verify: change chunk failed",
+				slog.ErrorContext(
+					ctx, "verify: change chunk failed",
 					slog.String("manifest", rec.path),
 					slog.String("file", chunk.File),
 					slog.String("error", err.Error()),
 				)
 				continue
 			}
-			slog.DebugContext(ctx, "verify: change chunk OK",
+			slog.DebugContext(
+				ctx, "verify: change chunk OK",
 				slog.String("manifest", rec.path),
 				slog.String("file", chunk.File),
 			)

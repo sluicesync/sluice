@@ -145,7 +145,8 @@ func buildBatchUpsert(schema string, table *ir.Table, rowCount int, pkCols []str
 
 	tableRef := quoteIdent(schema) + "." + quoteIdent(table.Name)
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "INSERT INTO %s (%s) VALUES %s",
+	fmt.Fprintf(
+		&sb, "INSERT INTO %s (%s) VALUES %s",
 		tableRef,
 		strings.Join(colNames, ", "),
 		strings.Join(rowParts, ", "),

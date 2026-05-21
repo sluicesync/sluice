@@ -204,7 +204,8 @@ func requestBrokerStopAt(ctx context.Context, store ir.BackupStore, path string,
 	// cross-machine rendezvous. See [notifyBrokerStop] /
 	// [registerBrokerStopChan] in broker_stop_registry.go.
 	if notifyBrokerStop(store) {
-		slog.DebugContext(ctx, "broker stop: in-process channel signalled",
+		slog.DebugContext(
+			ctx, "broker stop: in-process channel signalled",
 			slog.String("path", path),
 		)
 	}

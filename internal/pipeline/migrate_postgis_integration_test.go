@@ -42,7 +42,8 @@ func startPostgresWithPostGIS(t *testing.T) (sourceDSN, targetDSN string, cleanu
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 
-	container, err := pgtc.Run(ctx,
+	container, err := pgtc.Run(
+		ctx,
 		"postgis/postgis:16-3.4",
 		pgtc.WithDatabase("source_db"),
 		pgtc.WithUsername("test"),
@@ -239,7 +240,8 @@ func readPostGISColumnType(t *testing.T, ctx context.Context, dsn, table, column
 	queryCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	err = db.QueryRowContext(queryCtx,
+	err = db.QueryRowContext(
+		queryCtx,
 		`SELECT type, srid
 		   FROM geometry_columns
 		  WHERE f_table_name = $1 AND f_geometry_column = $2`,
@@ -366,7 +368,8 @@ func readMySQLGeometrySRID(t *testing.T, ctx context.Context, dsn, table, column
 	queryCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	var srid sql.NullInt64
-	err = db.QueryRowContext(queryCtx,
+	err = db.QueryRowContext(
+		queryCtx,
 		`SELECT srs_id FROM information_schema.columns
 		  WHERE table_schema = DATABASE()
 		    AND table_name   = ?

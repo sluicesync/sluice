@@ -84,7 +84,8 @@ func (r *SchemaReader) PreflightPositionFromManifest(
 	} else if ok && walKeepMB < walKeepSizeWarnThresholdMB {
 		report.Warnings = append(report.Warnings, fmt.Sprintf(
 			"wal_keep_size = %d MB looks small (< %d MB) for a chain handoff; if the chain's typical incremental cadence exceeds the WAL volume per minute the slot covers, CDC may not have the WAL it needs to bridge to the chain's terminal position. Consider raising wal_keep_size on the source. See docs/postgres-source-prep.md.",
-			walKeepMB, walKeepSizeWarnThresholdMB))
+			walKeepMB, walKeepSizeWarnThresholdMB,
+		))
 	}
 
 	// Check 2: Patroni / HA detection. Three signals checked in turn;
@@ -94,7 +95,8 @@ func (r *SchemaReader) PreflightPositionFromManifest(
 	} else if isPatroni {
 		report.Warnings = append(report.Warnings, fmt.Sprintf(
 			"this PG cluster is HA-managed (%s). The slot you're starting CDC from is subject to the idle-slot failover trap — slots not actively consumed don't replicate to standbys and are silently lost on failover. Ensure the slot is being actively consumed; for low-traffic sources, consider a heartbeat-write strategy. See docs/postgres-source-prep.md.",
-			why))
+			why,
+		))
 	}
 
 	// Check 3: slot existence + health. This is the refusal-grade
@@ -110,17 +112,20 @@ func (r *SchemaReader) PreflightPositionFromManifest(
 			"replication slot %q does not exist on the source. The chain's terminal position references this slot; CDC has nowhere to start. "+
 				"Recovery: re-create the slot at the chain's terminal LSN if WAL is still in retention, OR take a fresh full backup and start a new chain. "+
 				"See docs/postgres-source-prep.md for slot lifecycle.",
-			resolvedSlot)
+			resolvedSlot,
+		)
 	case state.WALStatus == "lost":
 		report.Refusal = fmt.Sprintf(
 			"replication slot %q has wal_status=%q — required WAL has been permanently removed; the slot can't be resumed from. "+
 				"Recovery: drop the slot, take a fresh full backup, and start a new chain. To prevent recurrence, raise max_slot_wal_keep_size on the source.",
-			resolvedSlot, state.WALStatus)
+			resolvedSlot, state.WALStatus,
+		)
 	case state.WALStatus == "unreserved":
 		report.Refusal = fmt.Sprintf(
 			"replication slot %q has wal_status=%q — required WAL is on the brink of being lost; CDC handoff is too risky. "+
 				"Recovery: resume the existing CDC consumer immediately to advance the slot, OR drop the slot + take a fresh full + start a new chain.",
-			resolvedSlot, state.WALStatus)
+			resolvedSlot, state.WALStatus,
+		)
 	}
 
 	return report, nil
@@ -207,7 +212,8 @@ func detectPatroniSource(ctx context.Context, db *sql.DB) (detected bool, why st
 	// Signal 1: Patroni-set GUCs. The cleanest tell because Patroni
 	// itself sets these.
 	var gucCount int
-	if err := db.QueryRowContext(ctx,
+	if err := db.QueryRowContext(
+		ctx,
 		`SELECT count(*) FROM pg_settings WHERE name ILIKE '%patroni%'`,
 	).Scan(&gucCount); err != nil {
 		return false, "", fmt.Errorf("query pg_settings for Patroni GUCs: %w", err)
@@ -219,7 +225,8 @@ func detectPatroniSource(ctx context.Context, db *sql.DB) (detected bool, why st
 	// Signal 2: pg_stat_replication.application_name. Catches Patroni's
 	// standby connections.
 	var appCount int
-	if err := db.QueryRowContext(ctx,
+	if err := db.QueryRowContext(
+		ctx,
 		`SELECT count(*) FROM pg_stat_replication WHERE application_name ILIKE 'patroni%'`,
 	).Scan(&appCount); err != nil {
 		// pg_stat_replication is privileged in some PG versions;
@@ -239,7 +246,8 @@ func detectPatroniSource(ctx context.Context, db *sql.DB) (detected bool, why st
 	// Patroni's default install creates a 'patroni' superuser and a
 	// 'replicator' replication role.
 	var roleCount int
-	if err := db.QueryRowContext(ctx,
+	if err := db.QueryRowContext(
+		ctx,
 		`SELECT count(*) FROM pg_roles WHERE rolname IN ('patroni', 'replicator')`,
 	).Scan(&roleCount); err != nil {
 		return false, "", fmt.Errorf("query pg_roles: %w", err)
@@ -254,7 +262,8 @@ func detectPatroniSource(ctx context.Context, db *sql.DB) (detected bool, why st
 	// managed-PG services where signals 1-3 miss because Patroni sets
 	// standard GUCs and pg_stat_replication is permission-restricted.
 	var physSlotCount int
-	if err := db.QueryRowContext(ctx,
+	if err := db.QueryRowContext(
+		ctx,
 		`SELECT count(*) FROM pg_replication_slots WHERE slot_type = 'physical' AND temporary = false`,
 	).Scan(&physSlotCount); err != nil {
 		// pg_replication_slots can be restricted on some managed
@@ -272,7 +281,8 @@ func detectPatroniSource(ctx context.Context, db *sql.DB) (detected bool, why st
 	// convention sets this, and many managed services follow suit.
 	// Empty string = no signal.
 	var clusterName string
-	if err := db.QueryRowContext(ctx,
+	if err := db.QueryRowContext(
+		ctx,
 		`SELECT setting FROM pg_settings WHERE name = 'cluster_name'`,
 	).Scan(&clusterName); err != nil {
 		switch {

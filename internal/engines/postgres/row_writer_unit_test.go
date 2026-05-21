@@ -319,7 +319,8 @@ func TestConvertArrayPerFamilyLeafAndDims(t *testing.T) {
 
 			// multi-dim 2x2 with a NULL element.
 			got2, err := convertArray(
-				[]any{[]any{c.one, nil}, []any{c.one, c.one}}, c.elem)
+				[]any{[]any{c.one, nil}, []any{c.one, c.one}}, c.elem,
+			)
 			if err != nil {
 				t.Fatalf("2-D: unexpected error: %v", err)
 			}

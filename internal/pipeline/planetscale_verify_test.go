@@ -290,7 +290,8 @@ func TestPSPipeline_StreamerPGToPG(t *testing.T) {
 			}
 			queryCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 			var n int
-			qErr := db.QueryRowContext(queryCtx,
+			qErr := db.QueryRowContext(
+				queryCtx,
 				"SELECT COUNT(*) FROM "+schemaName+".users",
 			).Scan(&n)
 			cancel()
@@ -304,7 +305,8 @@ func TestPSPipeline_StreamerPGToPG(t *testing.T) {
 
 	waitOrSurfaceErr(1, "phase D (bulk-copy R1)")
 
-	if err := execPS(t, ctx, pgSrc,
+	if err := execPS(
+		t, ctx, pgSrc,
 		"INSERT INTO sluice_psverify_stream.users (id, email) VALUES (2, 'r2@example.com');",
 	); err != nil {
 		t.Fatalf("R2 insert: %v", err)
@@ -345,7 +347,8 @@ func TestPSPipeline_MigrateMySQLToPG(t *testing.T) {
 	const targetSchema = "sluice_psverify_xeng"
 
 	// MySQL cleanup: drop just the test table.
-	if err := execPSMySQL(t, ctx, mysqlSrc,
+	if err := execPSMySQL(
+		t, ctx, mysqlSrc,
 		"DROP TABLE IF EXISTS "+tableName,
 	); err != nil {
 		t.Fatalf("pre-clean mysql: %v", err)
@@ -372,7 +375,8 @@ func TestPSPipeline_MigrateMySQLToPG(t *testing.T) {
 	if err := execPSMySQL(t, ctx, mysqlSrc, seedDDL); err != nil {
 		t.Fatalf("mysql seed DDL: %v", err)
 	}
-	if err := execPSMySQL(t, ctx, mysqlSrc,
+	if err := execPSMySQL(
+		t, ctx, mysqlSrc,
 		"INSERT INTO "+tableName+" (email, active) VALUES "+
 			"('alice@example.com', 1), ('bob@example.com', 0);",
 	); err != nil {
@@ -472,7 +476,8 @@ func dropPSSlotIfExists(t *testing.T, dsn, slotName string) {
 		defer cancel()
 
 		var exists bool
-		err = db.QueryRowContext(ctx,
+		err = db.QueryRowContext(
+			ctx,
 			"SELECT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)",
 			slotName,
 		).Scan(&exists)
@@ -483,7 +488,8 @@ func dropPSSlotIfExists(t *testing.T, dsn, slotName string) {
 		if !exists {
 			return
 		}
-		if _, err := db.ExecContext(ctx,
+		if _, err := db.ExecContext(
+			ctx,
 			"SELECT pg_drop_replication_slot($1)", slotName,
 		); err != nil {
 			t.Logf("drop slot %s: %v", slotName, err)
@@ -526,7 +532,8 @@ func waitForPSRowCount(
 		}
 		queryCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		var n int
-		err = db.QueryRowContext(queryCtx,
+		err = db.QueryRowContext(
+			queryCtx,
 			"SELECT COUNT(*) FROM "+schema+"."+table,
 		).Scan(&n)
 		cancel()

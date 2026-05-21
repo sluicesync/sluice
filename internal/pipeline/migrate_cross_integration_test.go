@@ -525,7 +525,8 @@ func TestMigrate_MySQLToPostgres_Bug11UnsignedBigintFK(t *testing.T) {
 
 		// Referential integrity: the FK rejects an orphan child.
 		if _, err := pgDB.Exec(
-			`INSERT INTO child (parent_id) VALUES (999999)`); err == nil {
+			`INSERT INTO child (parent_id) VALUES (999999)`,
+		); err == nil {
 			t.Error("expected child_parent_fk to reject orphan parent_id=999999; insert succeeded")
 		}
 

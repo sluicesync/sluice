@@ -248,7 +248,8 @@ func (p *Previewer) Run(ctx context.Context) error {
 	// `_vt_*`) when the operator is in exclude-or-no-filter mode.
 	// Replace the field in-place; Previewer is single-shot per Run.
 	if eff, added := effectiveTableFilter(p.Filter, p.Source, p.SourceDSN); len(added) > 0 {
-		slog.InfoContext(ctx, "applying engine-default table exclusions",
+		slog.InfoContext(
+			ctx, "applying engine-default table exclusions",
 			slog.String("engine", p.Source.Name()),
 			slog.Any("patterns", added),
 		)

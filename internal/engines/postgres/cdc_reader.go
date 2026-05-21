@@ -280,7 +280,8 @@ func (r *CDCReader) resolveStartPosition(
 		if decoded.Slot != r.slotName {
 			return 0, fmt.Errorf(
 				"postgres: position references slot %q but reader is configured with slot %q",
-				decoded.Slot, r.slotName)
+				decoded.Slot, r.slotName,
+			)
 		}
 		info, err := slotInfo(ctx, r.db, r.slotName)
 		if err != nil {
@@ -293,7 +294,8 @@ func (r *CDCReader) resolveStartPosition(
 			// engine-specific so operator-facing logs name the slot.
 			return 0, fmt.Errorf(
 				"postgres: replication slot %q no longer exists; cannot resume from supplied LSN: %w",
-				r.slotName, ir.ErrPositionInvalid)
+				r.slotName, ir.ErrPositionInvalid,
+			)
 		}
 		if err := checkSlotUsable(info); err != nil {
 			return 0, err
@@ -360,19 +362,22 @@ func checkSlotUsable(info *slotState) error {
 		return fmt.Errorf(
 			"postgres: replication slot %q has wal_status=%q — required WAL is on the brink of being lost; "+
 				"resume immediately or recreate the slot. To recreate: `sluice slot drop %s --source-driver=postgres --source ...` then restart with empty position (forces a fresh snapshot)",
-			info.SlotName, info.WALStatus, info.SlotName)
+			info.SlotName, info.WALStatus, info.SlotName,
+		)
 	case "lost":
 		return fmt.Errorf(
 			"postgres: replication slot %q has wal_status=%q — required WAL has been permanently removed; "+
 				"the slot must be dropped and recreated. To recover: `sluice slot drop %s --source-driver=postgres --source ...` then restart with empty position (forces a fresh snapshot). "+
 				"To prevent recurrence, raise max_slot_wal_keep_size on the source — PlanetScale recommends > 4GB",
-			info.SlotName, info.WALStatus, info.SlotName)
+			info.SlotName, info.WALStatus, info.SlotName,
+		)
 	default:
 		// Future PG versions could add states. Surface verbatim
 		// rather than assume.
 		return fmt.Errorf(
 			"postgres: replication slot %q has unrecognised wal_status=%q; refusing to proceed",
-			info.SlotName, info.WALStatus)
+			info.SlotName, info.WALStatus,
+		)
 	}
 }
 
@@ -539,7 +544,8 @@ func (r *CDCReader) dispatchWAL(
 		relations[m.RelationID] = entry
 		// ADR-0036 M3: log RelationMessage arrivals so the diagnostic
 		// run can correlate them with the publication-add LSN.
-		slog.DebugContext(ctx, "cdc.diag: relation message",
+		slog.DebugContext(
+			ctx, "cdc.diag: relation message",
 			slog.String("phase", "relation"),
 			slog.String("schema", entry.Schema),
 			slog.String("relation", entry.Name),
@@ -555,7 +561,8 @@ func (r *CDCReader) dispatchWAL(
 			return fmt.Errorf("postgres: cdc: relation %s.%s: %w", m.Namespace, m.RelationName, err)
 		}
 		relations[m.RelationID] = entry
-		slog.DebugContext(ctx, "cdc.diag: relation message",
+		slog.DebugContext(
+			ctx, "cdc.diag: relation message",
 			slog.String("phase", "relation"),
 			slog.String("schema", entry.Schema),
 			slog.String("relation", entry.Name),
@@ -572,7 +579,8 @@ func (r *CDCReader) dispatchWAL(
 		// alongside the txn's final commit LSN. Lets the diagnostic test
 		// detect transactions that straddle the publication-add LSN
 		// (txn_start < LSN_pubadd < commit).
-		slog.DebugContext(ctx, "cdc.diag: txn begin",
+		slog.DebugContext(
+			ctx, "cdc.diag: txn begin",
 			slog.String("phase", "begin"),
 			slog.String("txn_start_lsn", xld.WALStart.String()),
 			slog.String("txn_commit_lsn", m.FinalLSN.String()),
@@ -591,7 +599,8 @@ func (r *CDCReader) dispatchWAL(
 
 	case *pglogrepl.CommitMessage:
 		*streamedLSN = m.CommitLSN
-		slog.DebugContext(ctx, "cdc.diag: txn commit",
+		slog.DebugContext(
+			ctx, "cdc.diag: txn commit",
 			slog.String("phase", "commit"),
 			slog.String("txn_start_lsn", currentTxnStartLSN.String()),
 			slog.String("txn_commit_lsn", m.CommitLSN.String()),
@@ -693,7 +702,8 @@ func (r *CDCReader) diagRowEvent(
 ) {
 	rel, ok := relations[relID]
 	if !ok {
-		slog.DebugContext(ctx, "cdc.diag: row event (unknown relation)",
+		slog.DebugContext(
+			ctx, "cdc.diag: row event (unknown relation)",
 			slog.String("phase", "row"),
 			slog.String("op", op),
 			slog.Uint64("rel_oid", uint64(relID)),
@@ -708,7 +718,8 @@ func (r *CDCReader) diagRowEvent(
 		firstSeenRelLSN[relID] = xld.WALStart
 		firstSeen = true
 	}
-	slog.DebugContext(ctx, "cdc.diag: row event",
+	slog.DebugContext(
+		ctx, "cdc.diag: row event",
 		slog.String("phase", "row"),
 		slog.String("op", op),
 		slog.String("schema", rel.Schema),
@@ -819,7 +830,8 @@ func synthesizeKeyOnlyBefore(rel *relationCacheEntry, after ir.Row) (ir.Row, err
 	if rel.ReplicaIdentity == 'n' {
 		return nil, fmt.Errorf(
 			"update on %s.%s without identity: relation has REPLICA IDENTITY NOTHING; configure REPLICA IDENTITY DEFAULT, FULL, or USING INDEX before replicating UPDATEs",
-			rel.Schema, rel.Name)
+			rel.Schema, rel.Name,
+		)
 	}
 	before := make(ir.Row, len(rel.Columns))
 	keyCount := 0
@@ -831,7 +843,8 @@ func synthesizeKeyOnlyBefore(rel *relationCacheEntry, after ir.Row) (ir.Row, err
 		if !ok {
 			return nil, fmt.Errorf(
 				"update on %s.%s: identity column %q missing from new tuple; cannot synthesize WHERE",
-				rel.Schema, rel.Name, col.Name)
+				rel.Schema, rel.Name, col.Name,
+			)
 		}
 		before[col.Name] = v
 		keyCount++
@@ -839,7 +852,8 @@ func synthesizeKeyOnlyBefore(rel *relationCacheEntry, after ir.Row) (ir.Row, err
 	if keyCount == 0 {
 		return nil, fmt.Errorf(
 			"update on %s.%s: relation has no identity-key columns (no PRIMARY KEY and no REPLICA IDENTITY index); cannot replicate UPDATE",
-			rel.Schema, rel.Name)
+			rel.Schema, rel.Name,
+		)
 	}
 	return before, nil
 }
@@ -867,7 +881,8 @@ func (r *CDCReader) emitDelete(
 		// (the original Bug 8 surface — see filterDeleteBefore).
 		return fmt.Errorf(
 			"postgres: cdc: delete on %s.%s without identity: relation has REPLICA IDENTITY NOTHING; configure REPLICA IDENTITY DEFAULT, FULL, or USING INDEX before replicating DELETEs",
-			rel.Schema, rel.Name)
+			rel.Schema, rel.Name,
+		)
 	}
 	decoded, err := decodeTuple(oldTuple, rel.Columns)
 	if err != nil {
@@ -946,7 +961,8 @@ func filterDeleteBefore(rel *relationCacheEntry, decoded ir.Row) (ir.Row, error)
 		if !ok {
 			return nil, fmt.Errorf(
 				"delete on %s.%s: identity column %q missing from old tuple; refusing to emit a partial WHERE",
-				rel.Schema, rel.Name, col.Name)
+				rel.Schema, rel.Name, col.Name,
+			)
 		}
 		before[col.Name] = v
 	}
@@ -1146,7 +1162,8 @@ func decodeTuple(tuple *pglogrepl.TupleData, cols []relationColumn) (ir.Row, err
 	}
 	if int(tuple.ColumnNum) != len(cols) {
 		return nil, fmt.Errorf(
-			"tuple has %d columns; relation has %d", tuple.ColumnNum, len(cols))
+			"tuple has %d columns; relation has %d", tuple.ColumnNum, len(cols),
+		)
 	}
 	row := make(ir.Row, len(cols))
 	for i, col := range tuple.Columns {
@@ -1169,7 +1186,8 @@ func decodeTuple(tuple *pglogrepl.TupleData, cols []relationColumn) (ir.Row, err
 			// ever gets hit.
 			return nil, fmt.Errorf(
 				"column %q: binary tuple format is not supported (request text via pgoutput defaults)",
-				c.Name)
+				c.Name,
+			)
 		default:
 			return nil, fmt.Errorf("column %q: unknown tuple data type %q", c.Name, col.DataType)
 		}
@@ -1189,7 +1207,8 @@ func checkWALLevel(ctx context.Context, db *sql.DB) error {
 	if level != "logical" {
 		return fmt.Errorf(
 			"postgres: cdc: wal_level is %q; must be 'logical' for logical replication (set wal_level=logical in postgresql.conf and restart)",
-			level)
+			level,
+		)
 	}
 	return nil
 }

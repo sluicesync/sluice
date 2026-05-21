@@ -111,7 +111,8 @@ func (s *Streamer) runPositionFromManifestPreflight(ctx context.Context, chainTe
 
 	sr, err := s.Source.OpenSchemaReader(ctx, s.SourceDSN)
 	if err != nil {
-		slog.DebugContext(ctx, "position-from-manifest: could not open source schema reader for preflight; skipping",
+		slog.DebugContext(
+			ctx, "position-from-manifest: could not open source schema reader for preflight; skipping",
 			slog.String("engine", s.Source.Name()),
 			slog.String("error", err.Error()),
 		)
@@ -121,7 +122,8 @@ func (s *Streamer) runPositionFromManifestPreflight(ctx context.Context, chainTe
 
 	preflighter, ok := sr.(PositionFromManifestPreflight)
 	if !ok {
-		slog.DebugContext(ctx, "position-from-manifest: source engine has no PreflightPositionFromManifest surface; skipping preflight",
+		slog.DebugContext(
+			ctx, "position-from-manifest: source engine has no PreflightPositionFromManifest surface; skipping preflight",
 			slog.String("engine", s.Source.Name()),
 		)
 		return nil
@@ -144,7 +146,8 @@ func (s *Streamer) runPositionFromManifestPreflight(ctx context.Context, chainTe
 	report = s.applyPatroniMode(report, patroniMode)
 
 	for _, w := range report.Warnings {
-		slog.WarnContext(ctx, "position-from-manifest preflight: "+w,
+		slog.WarnContext(
+			ctx, "position-from-manifest preflight: "+w,
 			slog.String("engine", s.Source.Name()),
 		)
 	}
@@ -187,7 +190,8 @@ func (s *Streamer) applyPatroniMode(report PreflightReport, mode string) Preflig
 				filtered = append(filtered, w)
 			}
 		}
-		filtered = append(filtered,
+		filtered = append(
+			filtered,
 			"this PG cluster is HA-managed (--patroni-mode=on; operator forced). "+
 				"The slot you're starting CDC from is subject to the idle-slot failover trap — slots not actively consumed don't replicate to standbys and are silently lost on failover. "+
 				"Ensure the slot is being actively consumed; for low-traffic sources, consider a heartbeat-write strategy. See docs/postgres-source-prep.md.",

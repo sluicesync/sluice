@@ -198,7 +198,8 @@ func readPersistedPosition(t *testing.T, dsn, streamID string) string {
 	defer cancel()
 
 	var token string
-	err = db.QueryRowContext(ctx,
+	err = db.QueryRowContext(
+		ctx,
 		`SELECT source_position FROM "public"."sluice_cdc_state" WHERE stream_id = $1`,
 		streamID,
 	).Scan(&token)

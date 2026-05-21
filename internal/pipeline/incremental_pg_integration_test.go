@@ -698,7 +698,8 @@ func TestIncrementalBackup_PostgresChainRestore_SchemaHistoryReplay(t *testing.T
 	}
 	defer func() { _ = tgtDB.Close() }()
 	var historyCount int
-	if err := tgtDB.QueryRowContext(context.Background(),
+	if err := tgtDB.QueryRowContext(
+		context.Background(),
 		`SELECT COUNT(*) FROM "public"."sluice_cdc_schema_history" WHERE stream_id = $1`,
 		ChainRestoreStreamID,
 	).Scan(&historyCount); err != nil {

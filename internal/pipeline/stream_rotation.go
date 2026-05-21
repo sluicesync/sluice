@@ -389,7 +389,8 @@ func (b *BackupStream) performRotation(ctx context.Context, in rotateInputs) (ro
 	st.Phase = rotationPhaseDone
 	_ = b.Store.Delete(ctx, RotationStateFileName)
 
-	slog.InfoContext(ctx, "rotation: COMMIT -- new segment authoritative",
+	slog.InfoContext(
+		ctx, "rotation: COMMIT -- new segment authoritative",
 		slog.String("reason", in.reason),
 		slog.String("new_segment_dir", provisionalDir),
 		slog.String("prior_capped_at", cappedAt.Format(time.RFC3339)),
@@ -518,7 +519,8 @@ func recoverRotationState(ctx context.Context, store ir.BackupStore) error {
 		// >COMMIT: new segment is authoritative. The atomic write
 		// already capped the prior segment; nothing to redo (idempotent
 		// re-cap = no-op). Just clear the marker.
-		slog.InfoContext(ctx, "rotation recovery: >COMMIT -- new segment is authoritative; clearing marker",
+		slog.InfoContext(
+			ctx, "rotation recovery: >COMMIT -- new segment is authoritative; clearing marker",
 			slog.String("provisional_dir", st.ProvisionalDir),
 			slog.String("phase_at_crash", string(st.Phase)),
 		)
@@ -530,7 +532,8 @@ func recoverRotationState(ctx context.Context, store ir.BackupStore) error {
 	// provisional segment; the stream resumes STREAMING on the still-
 	// open prior segment from its persisted position (the prior
 	// segment never lost position -- no FSM replay).
-	slog.InfoContext(ctx, "rotation recovery: <=COMMIT -- discarding provisional segment, resuming the still-open prior segment",
+	slog.InfoContext(
+		ctx, "rotation recovery: <=COMMIT -- discarding provisional segment, resuming the still-open prior segment",
 		slog.String("provisional_dir", st.ProvisionalDir),
 		slog.String("phase_at_crash", string(st.Phase)),
 		slog.String("prior_segment_dir", st.PriorSegmentDir),

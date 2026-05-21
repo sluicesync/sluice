@@ -58,7 +58,8 @@ func LoadChainTerminalPosition(ctx context.Context, store ir.BackupStore) (ir.Po
 			"position-from-manifest: terminal manifest %q has no EndPosition recorded "+
 				"(pre-Phase-3.3 full backup or malformed chain). Take a fresh full backup "+
 				"with sluice v0.17.2+ to populate EndPosition automatically",
-			manifestBackupID(terminal))
+			manifestBackupID(terminal),
+		)
 	}
 	return terminal.EndPosition, nil
 }

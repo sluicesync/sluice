@@ -247,7 +247,8 @@ func loadOrInitState(ctx context.Context, rc resumeContext, resume, resetting bo
 		return fresh, false, nil
 
 	case found && state.Phase == ir.MigrationPhaseComplete && resume:
-		slog.InfoContext(ctx, "migration: already complete; nothing to do",
+		slog.InfoContext(
+			ctx, "migration: already complete; nothing to do",
 			slog.String("migration_id", rc.migrationID),
 		)
 		return state, true, nil
@@ -294,7 +295,8 @@ func markPhase(ctx context.Context, rc resumeContext, state *ir.MigrationState, 
 		// load-bearing thing. Surface as warn rather than swallowing
 		// silently — operators inspecting the state table see the
 		// stale phase and know the bookkeeping lagged.
-		slog.WarnContext(ctx, "migration: phase mark failed; continuing",
+		slog.WarnContext(
+			ctx, "migration: phase mark failed; continuing",
 			slog.String("phase", string(phase)),
 			slog.String("err", err.Error()),
 		)
@@ -321,7 +323,8 @@ func markFailed(ctx context.Context, rc resumeContext, state ir.MigrationState, 
 	state.Phase = phase
 	state.LastError = truncateLastError(err.Error())
 	if writeErr := rc.store.Write(ctx, state); writeErr != nil {
-		slog.WarnContext(ctx, "migration: state write on failure also failed; joining",
+		slog.WarnContext(
+			ctx, "migration: state write on failure also failed; joining",
 			slog.String("phase", string(phase)),
 			slog.String("primary_err", err.Error()),
 			slog.String("state_write_err", writeErr.Error()),
@@ -343,7 +346,8 @@ func markComplete(ctx context.Context, rc resumeContext, state ir.MigrationState
 	state.Phase = ir.MigrationPhaseComplete
 	state.LastError = ""
 	if err := rc.store.Write(ctx, state); err != nil {
-		slog.WarnContext(ctx, "migration: failed to mark complete; data is safe but state row is stale",
+		slog.WarnContext(
+			ctx, "migration: failed to mark complete; data is safe but state row is stale",
 			slog.String("migration_id", state.MigrationID),
 			slog.String("err", err.Error()),
 		)
@@ -464,7 +468,8 @@ var updatedAtNow = time.Now
 // one glance whether the resume target matches what they expected.
 func logResumeStart(ctx context.Context, state ir.MigrationState, schema *ir.Schema) {
 	complete, inProgress, missing := summariseTableProgress(schema, state)
-	slog.InfoContext(ctx, "migration: resuming",
+	slog.InfoContext(
+		ctx, "migration: resuming",
 		slog.String("migration_id", state.MigrationID),
 		slog.String("phase", string(state.Phase)),
 		slog.Int("tables_complete", complete),
@@ -474,7 +479,8 @@ func logResumeStart(ctx context.Context, state ir.MigrationState, schema *ir.Sch
 		slog.String("now", updatedAtNow().Format(time.RFC3339)),
 	)
 	if state.LastError != "" {
-		slog.InfoContext(ctx, "migration: prior failure recorded",
+		slog.InfoContext(
+			ctx, "migration: prior failure recorded",
 			slog.String("migration_id", state.MigrationID),
 			slog.String("last_error", state.LastError),
 		)

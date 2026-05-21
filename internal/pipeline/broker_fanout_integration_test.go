@@ -77,7 +77,8 @@ func TestSyncFromBackup_FanOut(t *testing.T) {
 	// Drive 10 inserts.
 	for i := 0; i < 10; i++ {
 		applyDDL(t, sourceDSN, fmt.Sprintf(
-			`INSERT INTO users (email) VALUES ('fanout-%d@example.com');`, i))
+			`INSERT INTO users (email) VALUES ('fanout-%d@example.com');`, i,
+		))
 	}
 	waitForIncrementals(t, store, 1, 30*time.Second)
 

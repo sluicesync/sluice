@@ -47,7 +47,8 @@ func (w *RowWriter) writeLoadData(ctx context.Context, table *ir.Table, rows <-c
 	// Fall back to BatchedInsert when geometry is present.
 	for _, c := range cols {
 		if _, isGeom := c.Type.(ir.Geometry); isGeom {
-			slog.WarnContext(ctx, "mysql: LOAD DATA: falling back to batched INSERT (table has geometry column)",
+			slog.WarnContext(
+				ctx, "mysql: LOAD DATA: falling back to batched INSERT (table has geometry column)",
 				slog.String("table", table.Name),
 				slog.String("column", c.Name),
 			)
@@ -60,7 +61,8 @@ func (w *RowWriter) writeLoadData(ctx context.Context, table *ir.Table, rows <-c
 		return fmt.Errorf("mysql: LOAD DATA: probe @@local_infile: %w", err)
 	}
 	if !enabled {
-		slog.WarnContext(ctx, "mysql: LOAD DATA: server has local_infile=OFF; falling back to batched INSERT",
+		slog.WarnContext(
+			ctx, "mysql: LOAD DATA: server has local_infile=OFF; falling back to batched INSERT",
 			slog.String("hint", "set local_infile=ON on the server (or pass --local-infile=ON to mysqld) for ~5–10x faster bulk load"),
 			slog.String("table", table.Name),
 		)

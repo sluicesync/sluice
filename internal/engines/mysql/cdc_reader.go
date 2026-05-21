@@ -241,8 +241,9 @@ func (r *CDCReader) StreamChanges(ctx context.Context, from ir.Position) (<-chan
 	if uuid, err := sourceServerUUID(ctx, r.db); err == nil {
 		r.serverUUID = uuid
 	} else {
-		slog.WarnContext(ctx, "mysql: cdc: could not read @@server_uuid; "+
-			"node-replace position-loss detection degraded to binlog-filename-only",
+		slog.WarnContext(
+			ctx, "mysql: cdc: could not read @@server_uuid; "+
+				"node-replace position-loss detection degraded to binlog-filename-only",
 			slog.String("err", err.Error()),
 		)
 	}
@@ -441,7 +442,8 @@ func (r *CDCReader) startNoEventsWatchdog(ctx context.Context) {
 	case <-ctx.Done():
 		return
 	case <-t.C:
-		slog.WarnContext(ctx, "mysql: cdc: no binlog row events received during startup grace period",
+		slog.WarnContext(
+			ctx, "mysql: cdc: no binlog row events received during startup grace period",
 			slog.String("hint", "verify binary logging is enabled (log_bin=ON), the connecting role has REPLICATION SLAVE, and the source is producing changes; if running against a localhost docker container, see Bug 12 in the project changelog"),
 		)
 	}
@@ -903,9 +905,10 @@ func verifySourceInstanceIdentity(ctx context.Context, persistedUUID, currentUUI
 	if persistedUUID == currentUUID {
 		return nil
 	}
-	slog.WarnContext(ctx, "mysql: cdc: source instance identity changed since the persisted "+
-		"position was captured (node replaced / restored from backup / failed over); the binlog "+
-		"lineage does not carry over — refusing to resume to avoid a silent data gap",
+	slog.WarnContext(
+		ctx, "mysql: cdc: source instance identity changed since the persisted "+
+			"position was captured (node replaced / restored from backup / failed over); the binlog "+
+			"lineage does not carry over — refusing to resume to avoid a silent data gap",
 		slog.String("persisted_server_uuid", persistedUUID),
 		slog.String("current_server_uuid", currentUUID),
 	)
@@ -989,7 +992,8 @@ func verifyGTIDSetReachable(ctx context.Context, db *sql.DB, resumeSet string) e
 		return fmt.Errorf("mysql: cannot verify empty GTID resume set: %w", ir.ErrPositionInvalid)
 	}
 	var subset int
-	err := db.QueryRowContext(ctx,
+	err := db.QueryRowContext(
+		ctx,
 		"SELECT GTID_SUBSET(@@global.gtid_purged, ?)",
 		resumeSet,
 	).Scan(&subset)

@@ -20,7 +20,8 @@ import (
 // "not installed" without an error.
 func detectPostGIS(ctx context.Context, db *sql.DB) (bool, error) {
 	var present bool
-	err := db.QueryRowContext(ctx,
+	err := db.QueryRowContext(
+		ctx,
 		"SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'postgis')",
 	).Scan(&present)
 	if err != nil {

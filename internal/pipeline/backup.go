@@ -252,7 +252,8 @@ func (b *Backup) Run(ctx context.Context) error {
 	// `_vt_*` shadow tables when the source signals them via the
 	// optional [ir.DefaultTableExcluder] surface.
 	if eff, added := effectiveTableFilter(b.Filter, b.Source, b.SourceDSN); len(added) > 0 {
-		slog.InfoContext(ctx, "backup: applying engine-default table exclusions",
+		slog.InfoContext(
+			ctx, "backup: applying engine-default table exclusions",
 			slog.String("engine", b.Source.Name()),
 			slog.Any("patterns", added),
 		)
@@ -272,7 +273,8 @@ func (b *Backup) Run(ctx context.Context) error {
 			// can see resume happened. The detailed per-table fan-out
 			// (which tables to skip vs resume) follows once the schema
 			// is read; this is the headline.
-			slog.InfoContext(ctx, "resuming from partial backup",
+			slog.InfoContext(
+				ctx, "resuming from partial backup",
 				slog.String("backup_dir", backupStoreDescriptor(b.Store)),
 				slog.Int("tables_in_prior_manifest", len(prior.Tables)),
 				slog.Time("prior_created_at", prior.CreatedAt),
@@ -282,7 +284,8 @@ func (b *Backup) Run(ctx context.Context) error {
 				return fmt.Errorf("backup: a completed backup already exists at this destination (created %s); pass --force-overwrite to replace it",
 					prior.CreatedAt.UTC().Format(time.RFC3339))
 			}
-			slog.InfoContext(ctx, "backup: --force-overwrite set; replacing existing complete backup",
+			slog.InfoContext(
+				ctx, "backup: --force-overwrite set; replacing existing complete backup",
 				slog.Time("prior_created_at", prior.CreatedAt),
 			)
 			prior = nil // discard so we start from scratch
@@ -414,7 +417,8 @@ func (b *Backup) Run(ctx context.Context) error {
 				toResume = append(toResume, table.Name)
 			}
 		}
-		slog.InfoContext(ctx, "resume plan",
+		slog.InfoContext(
+			ctx, "resume plan",
 			slog.Int("tables_already_complete", len(alreadyComplete)),
 			slog.Any("tables_to_resume", toResume),
 		)
@@ -429,7 +433,8 @@ func (b *Backup) Run(ctx context.Context) error {
 				return fmt.Errorf("backup: re-validate prior table %q: %w", table.Name, err)
 			}
 			if full {
-				slog.InfoContext(ctx, "skipping table — already complete in partial backup",
+				slog.InfoContext(
+					ctx, "skipping table — already complete in partial backup",
 					slog.String("table", table.Name),
 					slog.Int64("rows", existing.RowCount),
 					slog.Int("chunks", len(existing.Chunks)),
@@ -440,7 +445,8 @@ func (b *Backup) Run(ctx context.Context) error {
 			// Partial: pass the prior entry through so backupTable can
 			// per-chunk-skip already-uploaded chunks (Bug 34b).
 			priorTable = existing
-			slog.InfoContext(ctx, "resuming table mid-stream — partial chunks present in prior backup",
+			slog.InfoContext(
+				ctx, "resuming table mid-stream — partial chunks present in prior backup",
 				slog.String("table", table.Name),
 				slog.Int("prior_chunks", len(existing.Chunks)),
 				slog.Bool("prior_partial_flag", existing.Partial),
@@ -483,7 +489,8 @@ func (b *Backup) Run(ctx context.Context) error {
 	//     already logged a WARN line so operators know.
 	if snapshotPos != nil {
 		manifest.EndPosition = *snapshotPos
-		slog.InfoContext(ctx, "backup: recorded end position (snapshot-anchored)",
+		slog.InfoContext(
+			ctx, "backup: recorded end position (snapshot-anchored)",
 			slog.String("engine", manifest.SourceEngine),
 			slog.String("position_token", snapshotPos.Token),
 		)
@@ -516,7 +523,8 @@ func (b *Backup) Run(ctx context.Context) error {
 		totalRows += t.RowCount
 		totalChunks += len(t.Chunks)
 	}
-	slog.InfoContext(ctx, "backup complete",
+	slog.InfoContext(
+		ctx, "backup complete",
 		slog.Int("tables", len(manifest.Tables)),
 		slog.Int64("rows", totalRows),
 		slog.Int("chunks", totalChunks),
@@ -566,14 +574,16 @@ func (b *Backup) openSnapshotOrFallback(ctx context.Context) (ir.RowReader, *ir.
 	if opener, ok := b.Source.(ir.BackupSnapshotOpener); ok {
 		snap, err := opener.OpenBackupSnapshot(ctx, b.SourceDSN, b.SlotName)
 		if err == nil {
-			slog.InfoContext(ctx, "backup: opened snapshot-anchored consistent view",
+			slog.InfoContext(
+				ctx, "backup: opened snapshot-anchored consistent view",
 				slog.String("engine", b.Source.Name()),
 				slog.String("position_token", snap.Position.Token),
 			)
 			pos := snap.Position
 			cleanup := func() {
 				if err := snap.Close(); err != nil {
-					slog.WarnContext(ctx, "backup: snapshot close failed; partial cleanup may have leaked resources",
+					slog.WarnContext(
+						ctx, "backup: snapshot close failed; partial cleanup may have leaked resources",
 						slog.String("err", err.Error()),
 					)
 				}
@@ -589,7 +599,8 @@ func (b *Backup) openSnapshotOrFallback(ctx context.Context) (ir.RowReader, *ir.
 		// this backup as a chain root know to enable wal_level=logical
 		// (or pair the backup with continuous `sluice sync start` so
 		// the live stream covers the during-backup window).
-		slog.WarnContext(ctx, "backup: snapshot-anchored consistent view unavailable; falling back to v0.17.x path",
+		slog.WarnContext(
+			ctx, "backup: snapshot-anchored consistent view unavailable; falling back to v0.17.x path",
 			slog.String("engine", b.Source.Name()),
 			slog.String("error", err.Error()),
 			slog.String("implication", "chains rooted in this full will have a during-backup write-window gap (see v0.17.2 release notes); enable wal_level=logical for snapshot-anchored consistency, or pair backups with continuous `sluice sync start`"),
@@ -602,7 +613,8 @@ func (b *Backup) openSnapshotOrFallback(ctx context.Context) (ir.RowReader, *ir.
 		// guaranteed to be captured. The recommended mitigation
 		// (pair backups with continuous `sluice sync start`) is the
 		// same one the v0.17.2 release notes called out.
-		slog.WarnContext(ctx, "backup: engine does not implement BackupSnapshotOpener; falling back to non-snapshot row reads",
+		slog.WarnContext(
+			ctx, "backup: engine does not implement BackupSnapshotOpener; falling back to non-snapshot row reads",
 			slog.String("engine", b.Source.Name()),
 			slog.String("impact", "chains rooted in this full will have a during-backup write-window gap"),
 			slog.String("mitigation", "pair backups with continuous `sluice sync start` so the live stream captures every write"),
@@ -639,7 +651,8 @@ func (b *Backup) openSnapshotOrFallback(ctx context.Context) (ir.RowReader, *ir.
 // captured EndPosition) — the documented v0.17.2 caveat.
 func (b *Backup) captureEndPosition(ctx context.Context, manifest *ir.Manifest) error {
 	if b.Source.Capabilities().CDC == ir.CDCNone {
-		slog.DebugContext(ctx, "backup: source does not support CDC; skipping EndPosition capture",
+		slog.DebugContext(
+			ctx, "backup: source does not support CDC; skipping EndPosition capture",
 			slog.String("engine", b.Source.Name()),
 		)
 		return nil
@@ -656,7 +669,8 @@ func (b *Backup) captureEndPosition(ctx context.Context, manifest *ir.Manifest) 
 
 	capturer, ok := sr.(ir.BackupPositionCapturer)
 	if !ok {
-		slog.DebugContext(ctx, "backup: source SchemaReader does not implement BackupPositionCapturer; manifest EndPosition will be empty",
+		slog.DebugContext(
+			ctx, "backup: source SchemaReader does not implement BackupPositionCapturer; manifest EndPosition will be empty",
 			slog.String("engine", b.Source.Name()),
 		)
 		return nil
@@ -666,7 +680,8 @@ func (b *Backup) captureEndPosition(ctx context.Context, manifest *ir.Manifest) 
 		return fmt.Errorf("capture position: %w", err)
 	}
 	manifest.EndPosition = pos
-	slog.InfoContext(ctx, "backup: recorded end position",
+	slog.InfoContext(
+		ctx, "backup: recorded end position",
 		slog.String("engine", manifest.SourceEngine),
 		slog.String("position_token", pos.Token),
 	)
@@ -827,7 +842,8 @@ func (b *Backup) backupTable(
 			// failure tenet; either way the chunk gets re-written.
 			exists, existsErr := b.Store.Exists(ctx, priorChunk.File)
 			if existsErr == nil && exists {
-				slog.WarnContext(ctx, "prior chunk SHA-256 mismatch — overwriting on resume",
+				slog.WarnContext(
+					ctx, "prior chunk SHA-256 mismatch — overwriting on resume",
 					slog.String("table", table.Name),
 					slog.Int("chunk", chunkIdx),
 					slog.String("path", priorChunk.File),
@@ -855,7 +871,8 @@ func (b *Backup) backupTable(
 			}
 		}
 		rowsTotal += priorChunk.RowCount
-		slog.InfoContext(ctx, "skipping chunk — already complete in partial backup",
+		slog.InfoContext(
+			ctx, "skipping chunk — already complete in partial backup",
 			slog.String("table", table.Name),
 			slog.Int("chunk", chunkIdx),
 			slog.Int64("rows", priorChunk.RowCount),
@@ -902,7 +919,8 @@ func (b *Backup) backupTable(
 				}
 				entry.RowCount = rowsTotal
 				entry.Partial = false // table EOF reached naturally; flip the partial flag off
-				slog.InfoContext(ctx, "backup: table complete",
+				slog.InfoContext(
+					ctx, "backup: table complete",
 					slog.String("table", table.Name),
 					slog.Int64("rows", rowsTotal),
 					slog.Int("chunks", len(entry.Chunks)),

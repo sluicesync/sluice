@@ -126,7 +126,8 @@ func openSlotManager(driver, dsn string) (ir.SlotManager, error) {
 	if !ok {
 		return nil, fmt.Errorf(
 			"engine %q does not support replication-slot management (slots are a Postgres-specific concept)",
-			driver)
+			driver,
+		)
 	}
 	mgr, err := opener.OpenSlotManager(context.Background(), dsn)
 	if err != nil {

@@ -847,7 +847,8 @@ func logRedactionConfig(reg *redact.Registry, scope string) {
 		seen[name] = true
 		strategies = append(strategies, name)
 	}
-	slog.Info("sluice: redaction configured",
+	slog.Info(
+		"sluice: redaction configured",
 		slog.String("scope", scope),
 		slog.Int("columns", len(rules)),
 		slog.Any("strategies", strategies),
@@ -873,7 +874,8 @@ func logKeysetLoaded(keyset *redact.Keyset) {
 	for _, e := range summary {
 		keys = append(keys, fmt.Sprintf("%s{generations=%v active=%d}", e.Name, e.Generations, e.Active))
 	}
-	slog.Info("sluice: keyset loaded",
+	slog.Info(
+		"sluice: keyset loaded",
 		slog.String("source", keyset.Source),
 		slog.Any("keys", keys),
 		slog.String("hmac-algo", "sha256"),

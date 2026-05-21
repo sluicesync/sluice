@@ -169,7 +169,8 @@ func emitColumnType(t ir.Type) (string, error) {
 			"mysql: column type %s is from a PG extension; cross-engine "+
 				"translation is not supported for this extension — supply "+
 				"--type-override TABLE.COL=<MySQL_type> to opt in (ADR-0032)",
-			v.String())
+			v.String(),
+		)
 	}
 
 	return "", fmt.Errorf("mysql: unknown IR type %T", t)
@@ -1089,13 +1090,15 @@ func mysqlForbidsDefault(t ir.Type) bool {
 // specify a value will fail on the target. Operator workflow: drop
 // the NOT NULL on the source, or supply the value at write time.
 func logSuppressedDefault(c *ir.Column, suppressed string) {
-	slog.Warn("cross-engine: dropping DEFAULT on MySQL forbidding-type column; MySQL forbids DEFAULTs on JSON/TEXT/BLOB/GEOMETRY (Error 1101)",
+	slog.Warn(
+		"cross-engine: dropping DEFAULT on MySQL forbidding-type column; MySQL forbids DEFAULTs on JSON/TEXT/BLOB/GEOMETRY (Error 1101)",
 		slog.String("column", c.Name),
 		slog.String("type", fmt.Sprintf("%T", c.Type)),
 		slog.String("suppressed_default", suppressed),
 	)
 	if !c.Nullable {
-		slog.Warn("cross-engine: column is NOT NULL; INSERTs without an explicit value will fail. Consider DROP NOT NULL on source or supply the value at write time",
+		slog.Warn(
+			"cross-engine: column is NOT NULL; INSERTs without an explicit value will fail. Consider DROP NOT NULL on source or supply the value at write time",
 			slog.String("column", c.Name),
 		)
 	}

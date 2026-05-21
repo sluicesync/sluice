@@ -172,7 +172,8 @@ func TestPSPG_Connectivity(t *testing.T) {
 			settings := []string{"wal_level", "max_wal_senders", "max_replication_slots"}
 			for _, s := range settings {
 				var v string
-				err := db.QueryRowContext(ctx,
+				err := db.QueryRowContext(
+					ctx,
 					"SELECT setting FROM pg_settings WHERE name = $1", s,
 				).Scan(&v)
 				if err != nil {
@@ -186,7 +187,8 @@ func TestPSPG_Connectivity(t *testing.T) {
 			// attribute. CDC needs it; calling it out here lets us
 			// document the requirement clearly.
 			var canReplicate bool
-			err = db.QueryRowContext(ctx,
+			err = db.QueryRowContext(
+				ctx,
 				"SELECT rolreplication FROM pg_roles WHERE rolname = current_user",
 			).Scan(&canReplicate)
 			if err != nil {
@@ -198,7 +200,8 @@ func TestPSPG_Connectivity(t *testing.T) {
 			// PostGIS detection — informational; the user noted it
 			// isn't enabled today but can be turned on.
 			var hasPostGIS bool
-			err = db.QueryRowContext(ctx,
+			err = db.QueryRowContext(
+				ctx,
 				"SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'postgis')",
 			).Scan(&hasPostGIS)
 			if err != nil {
@@ -229,12 +232,14 @@ func TestPSPG_SchemaReaderRoundTrip(t *testing.T) {
 	// Use a sluice-prefixed schema so the verification doesn't trip
 	// over operator-owned tables and cleanup is unambiguous.
 	const schemaName = "sluice_psverify"
-	if _, err := db.ExecContext(ctx,
+	if _, err := db.ExecContext(
+		ctx,
 		"DROP SCHEMA IF EXISTS "+schemaName+" CASCADE",
 	); err != nil {
 		t.Fatalf("pre-clean drop schema: %v", err)
 	}
-	if _, err := db.ExecContext(ctx,
+	if _, err := db.ExecContext(
+		ctx,
 		"CREATE SCHEMA "+schemaName,
 	); err != nil {
 		t.Fatalf("create schema: %v", err)
@@ -242,7 +247,8 @@ func TestPSPG_SchemaReaderRoundTrip(t *testing.T) {
 	defer func() {
 		dropCtx, dropCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer dropCancel()
-		if _, err := db.ExecContext(dropCtx,
+		if _, err := db.ExecContext(
+			dropCtx,
 			"DROP SCHEMA IF EXISTS "+schemaName+" CASCADE",
 		); err != nil {
 			t.Logf("post-clean drop schema: %v", err)
@@ -345,7 +351,8 @@ func TestPSPG_CDCReaderBasic(t *testing.T) {
 	// for logical replication. Failing here would be misleading —
 	// it's an operator config decision, not a sluice bug.
 	var walLevel string
-	if err := db.QueryRowContext(ctx,
+	if err := db.QueryRowContext(
+		ctx,
 		"SELECT setting FROM pg_settings WHERE name = 'wal_level'",
 	).Scan(&walLevel); err != nil {
 		t.Fatalf("read wal_level: %v", err)
@@ -354,7 +361,8 @@ func TestPSPG_CDCReaderBasic(t *testing.T) {
 		t.Skipf("wal_level = %q on PS-PG source; need 'logical' for CDC", walLevel)
 	}
 	var canReplicate bool
-	if err := db.QueryRowContext(ctx,
+	if err := db.QueryRowContext(
+		ctx,
 		"SELECT rolreplication FROM pg_roles WHERE rolname = current_user",
 	).Scan(&canReplicate); err == nil && !canReplicate {
 		t.Skipf("current_user lacks REPLICATION attribute; CDC will fail without it")
@@ -457,7 +465,8 @@ func TestPSPG_CDCReader_FailoverFlag(t *testing.T) {
 	// Skip when wal_level isn't logical or REPLICATION attr is
 	// missing — same gates as TestPSPG_CDCReaderBasic.
 	var walLevel string
-	if err := db.QueryRowContext(ctx,
+	if err := db.QueryRowContext(
+		ctx,
 		"SELECT setting FROM pg_settings WHERE name = 'wal_level'",
 	).Scan(&walLevel); err != nil {
 		t.Fatalf("read wal_level: %v", err)
@@ -466,7 +475,8 @@ func TestPSPG_CDCReader_FailoverFlag(t *testing.T) {
 		t.Skipf("wal_level = %q; need 'logical'", walLevel)
 	}
 	var canReplicate bool
-	if err := db.QueryRowContext(ctx,
+	if err := db.QueryRowContext(
+		ctx,
 		"SELECT rolreplication FROM pg_roles WHERE rolname = current_user",
 	).Scan(&canReplicate); err == nil && !canReplicate {
 		t.Skipf("current_user lacks REPLICATION attribute")
@@ -486,7 +496,8 @@ func TestPSPG_CDCReader_FailoverFlag(t *testing.T) {
 
 	// Drop any leftover slot from a previous run so this test is
 	// idempotent. Errors here are informational only.
-	if _, err := db.ExecContext(ctx,
+	if _, err := db.ExecContext(
+		ctx,
 		"SELECT pg_drop_replication_slot('sluice_slot') FROM pg_replication_slots WHERE slot_name = 'sluice_slot'",
 	); err != nil {
 		t.Logf("pre-clean drop slot: %v", err)
@@ -504,7 +515,8 @@ func TestPSPG_CDCReader_FailoverFlag(t *testing.T) {
 		defer dropCancel()
 		// Always try to drop the slot; pg_drop_replication_slot is
 		// safe to call when the slot doesn't exist.
-		if _, err := db.ExecContext(dropCtx,
+		if _, err := db.ExecContext(
+			dropCtx,
 			"SELECT pg_drop_replication_slot('sluice_slot') FROM pg_replication_slots WHERE slot_name = 'sluice_slot'",
 		); err != nil {
 			t.Logf("post-clean drop slot: %v", err)
@@ -540,7 +552,8 @@ func TestPSPG_CDCReader_FailoverFlag(t *testing.T) {
 	// The slot should now exist with failover=true. Use a separate
 	// connection (not the replication conn) to query the view.
 	var failover bool
-	err = db.QueryRowContext(ctx,
+	err = db.QueryRowContext(
+		ctx,
 		"SELECT failover FROM pg_replication_slots WHERE slot_name = $1",
 		"sluice_slot",
 	).Scan(&failover)

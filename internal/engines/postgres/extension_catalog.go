@@ -252,7 +252,8 @@ var pgVectorDef = extensionDef{
 	build: func(udtName string, typmod int32) (ir.ExtensionType, error) {
 		if udtName != "vector" {
 			return ir.ExtensionType{}, fmt.Errorf(
-				"postgres: pgvector catalog: unexpected udt_name %q (want \"vector\")", udtName)
+				"postgres: pgvector catalog: unexpected udt_name %q (want \"vector\")", udtName,
+			)
 		}
 		mods := []int{}
 		if dim, ok := pgVectorDimFromTypmod(typmod); ok {
@@ -268,7 +269,8 @@ var pgVectorDef = extensionDef{
 		if t.Extension != "vector" || t.Name != "vector" {
 			return "", fmt.Errorf(
 				"postgres: pgvector emit: unexpected (extension=%q name=%q); "+
-					"want (vector, vector)", t.Extension, t.Name)
+					"want (vector, vector)", t.Extension, t.Name,
+			)
 		}
 		switch len(t.Modifiers) {
 		case 0:
@@ -279,13 +281,15 @@ var pgVectorDef = extensionDef{
 			dim := t.Modifiers[0]
 			if dim <= 0 {
 				return "", fmt.Errorf(
-					"postgres: pgvector emit: dimension must be > 0 (got %d)", dim)
+					"postgres: pgvector emit: dimension must be > 0 (got %d)", dim,
+				)
 			}
 			return fmt.Sprintf("vector(%d)", dim), nil
 		default:
 			return "", fmt.Errorf(
 				"postgres: pgvector emit: expected 0 or 1 Modifiers (got %d)",
-				len(t.Modifiers))
+				len(t.Modifiers),
+			)
 		}
 	},
 	indexAccessMethods: map[string]struct{}{
@@ -355,13 +359,15 @@ var pgTrgmDef = extensionDef{
 		return ir.ExtensionType{}, fmt.Errorf(
 			"postgres: pg_trgm catalog: build called with udt_name %q, "+
 				"but pg_trgm declares no column types (operator-class only)",
-			udtName)
+			udtName,
+		)
 	},
 	emitColumn: func(t ir.ExtensionType) (string, error) {
 		return "", fmt.Errorf(
 			"postgres: pg_trgm catalog: emitColumn called for "+
 				"(extension=%q name=%q), but pg_trgm declares no column types",
-			t.Extension, t.Name)
+			t.Extension, t.Name,
+		)
 	},
 	indexAccessMethods: map[string]struct{}{},
 	indexOperatorClasses: map[string]struct{}{
@@ -405,7 +411,8 @@ var pgHstoreDef = extensionDef{
 	build: func(udtName string, _ int32) (ir.ExtensionType, error) {
 		if udtName != "hstore" {
 			return ir.ExtensionType{}, fmt.Errorf(
-				"postgres: hstore catalog: unexpected udt_name %q (want \"hstore\")", udtName)
+				"postgres: hstore catalog: unexpected udt_name %q (want \"hstore\")", udtName,
+			)
 		}
 		return ir.ExtensionType{
 			Extension: "hstore",
@@ -416,12 +423,14 @@ var pgHstoreDef = extensionDef{
 		if t.Extension != "hstore" || t.Name != "hstore" {
 			return "", fmt.Errorf(
 				"postgres: hstore emit: unexpected (extension=%q name=%q); "+
-					"want (hstore, hstore)", t.Extension, t.Name)
+					"want (hstore, hstore)", t.Extension, t.Name,
+			)
 		}
 		if len(t.Modifiers) != 0 {
 			return "", fmt.Errorf(
 				"postgres: hstore emit: hstore has no type modifiers (got %d)",
-				len(t.Modifiers))
+				len(t.Modifiers),
+			)
 		}
 		return "hstore", nil
 	},
@@ -463,7 +472,8 @@ var pgCiTextDef = extensionDef{
 	build: func(udtName string, _ int32) (ir.ExtensionType, error) {
 		if udtName != "citext" {
 			return ir.ExtensionType{}, fmt.Errorf(
-				"postgres: citext catalog: unexpected udt_name %q (want \"citext\")", udtName)
+				"postgres: citext catalog: unexpected udt_name %q (want \"citext\")", udtName,
+			)
 		}
 		return ir.ExtensionType{
 			Extension: "citext",
@@ -474,12 +484,14 @@ var pgCiTextDef = extensionDef{
 		if t.Extension != "citext" || t.Name != "citext" {
 			return "", fmt.Errorf(
 				"postgres: citext emit: unexpected (extension=%q name=%q); "+
-					"want (citext, citext)", t.Extension, t.Name)
+					"want (citext, citext)", t.Extension, t.Name,
+			)
 		}
 		if len(t.Modifiers) != 0 {
 			return "", fmt.Errorf(
 				"postgres: citext emit: citext has no type modifiers (got %d)",
-				len(t.Modifiers))
+				len(t.Modifiers),
+			)
 		}
 		return "citext", nil
 	},
@@ -555,7 +567,8 @@ var pgPostGISDef = extensionDef{
 			"postgres: postgis catalog: build called with udt_name %q, "+
 				"but postgis types route through ir.Geometry (not ir.ExtensionType); "+
 				"this is a framework misuse",
-			udtName)
+			udtName,
+		)
 	},
 	emitColumn: func(t ir.ExtensionType) (string, error) {
 		return "", fmt.Errorf(
@@ -563,7 +576,8 @@ var pgPostGISDef = extensionDef{
 				"(extension=%q name=%q), but postgis types route through "+
 				"ir.Geometry's emit path (ddl_emit.go::Geometry case); "+
 				"this is a framework misuse",
-			t.Extension, t.Name)
+			t.Extension, t.Name,
+		)
 	},
 	indexAccessMethods: map[string]struct{}{},
 	indexOperatorClasses: map[string]struct{}{
@@ -627,14 +641,16 @@ var pgCryptoDef = extensionDef{
 				"but pgcrypto has no sluice-passthrough types — the "+
 				"catalog entry is a presence-gate for the SHA1/SHA2 "+
 				"expression translator only; this is a framework misuse",
-			udtName)
+			udtName,
+		)
 	},
 	emitColumn: func(t ir.ExtensionType) (string, error) {
 		return "", fmt.Errorf(
 			"postgres: pgcrypto catalog: emitColumn called for "+
 				"(extension=%q name=%q), but pgcrypto has no "+
 				"sluice-passthrough types; this is a framework misuse",
-			t.Extension, t.Name)
+			t.Extension, t.Name,
+		)
 	},
 	indexAccessMethods:   map[string]struct{}{},
 	indexOperatorClasses: map[string]struct{}{},
@@ -697,14 +713,16 @@ var pgUUIDOSSPDef = extensionDef{
 				"but uuid-ossp has no sluice-passthrough types — the "+
 				"catalog entry exists for the ADR-0044 Tier-3 "+
 				"function-default gate only; this is a framework misuse",
-			udtName)
+			udtName,
+		)
 	},
 	emitColumn: func(t ir.ExtensionType) (string, error) {
 		return "", fmt.Errorf(
 			"postgres: uuid-ossp catalog: emitColumn called for "+
 				"(extension=%q name=%q), but uuid-ossp has no "+
 				"sluice-passthrough types; this is a framework misuse",
-			t.Extension, t.Name)
+			t.Extension, t.Name,
+		)
 	},
 	indexAccessMethods:   map[string]struct{}{},
 	indexOperatorClasses: map[string]struct{}{},
@@ -906,7 +924,8 @@ func extensionFunctionDefaultGate(
 			"does not apply — it rewrites only generated-column "+
 			"expressions and runs after schema-read, while this gate "+
 			"fires during schema-read)",
-		tableName, colName, exprKind, fn, owningExt, owningExt)
+		tableName, colName, exprKind, fn, owningExt, owningExt,
+	)
 }
 
 // emitExtensionColumn dispatches an [ir.ExtensionType] column to the
@@ -921,7 +940,8 @@ func emitExtensionColumn(t ir.ExtensionType) (string, error) {
 			"postgres: extension %q is not in the catalog "+
 				"(recognised: %s); run with --enable-pg-extension or "+
 				"add a catalog entry",
-			t.Extension, strings.Join(recognisedPGExtensionNames(), ", "))
+			t.Extension, strings.Join(recognisedPGExtensionNames(), ", "),
+		)
 	}
 	return def.emitColumn(t)
 }
@@ -999,7 +1019,8 @@ func validateAndPreflightExtensionsAt(ctx context.Context, db *sql.DB, extension
 					"postgis — the full v1 set is shipped). pgcrypto added "+
 					"in v0.38.0 as a presence-gate for the SHA1/SHA2 "+
 					"expression-translator rewrites",
-				name, strings.Join(recognisedPGExtensionNames(), ", "))
+				name, strings.Join(recognisedPGExtensionNames(), ", "),
+			)
 		}
 		enabled[name] = true
 	}
@@ -1041,7 +1062,8 @@ func preflightExtensionsInstalled(ctx context.Context, db *sql.DB, extensions ma
 			return fmt.Errorf(
 				"postgres: --enable-pg-extension preflight: query "+
 					"pg_extension for %q: %w",
-				name, err)
+				name, err,
+			)
 		}
 		if !present {
 			return missingExtensionError(name, side)
@@ -1064,7 +1086,8 @@ func missingExtensionError(name, side string) error {
 			"run `CREATE EXTENSION %s;` (or the extension's documented install "+
 			"command) and re-run sluice; sluice does not auto-install extensions "+
 			"per the contain-Postgres-complexity tenet",
-		name, where, name)
+		name, where, name,
+	)
 }
 
 // errExtensionPreflight is the sentinel that wraps every

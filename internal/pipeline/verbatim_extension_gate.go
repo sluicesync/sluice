@@ -93,7 +93,8 @@ func refuseVerbatimManifestRestoreToNonPG(schema *ir.Schema, targetEngine string
 			"(with the owning extension installed), or take a fresh "+
 			"backup against a schema that excludes these columns "+
 			"(--exclude-table) if a cross-engine copy is required",
-		targetEngine, strings.Join(refs, ", "))
+		targetEngine, strings.Join(refs, ", "),
+	)
 }
 
 // refuseVerbatimRestoreToNonPG is the ADR-0047 loud restore-time
@@ -136,5 +137,6 @@ func refuseVerbatimRestoreToNonPG(cat *LineageCatalog, targetEngine string) erro
 			"(with the owning extension installed), or take a fresh "+
 			"backup against a schema that excludes these columns "+
 			"(--exclude-table) if a cross-engine copy is required",
-		targetEngine, strings.Join(marked, ", "))
+		targetEngine, strings.Join(marked, ", "),
+	)
 }

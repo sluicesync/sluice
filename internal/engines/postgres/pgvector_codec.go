@@ -209,7 +209,8 @@ func appendVectorBinaryFromText(buf []byte, s string) ([]byte, error) {
 func appendVectorBinaryFromFloat32(buf []byte, v []float32) ([]byte, error) {
 	if len(v) > math.MaxInt16 {
 		return nil, fmt.Errorf(
-			"postgres: pgvector encode: dim %d exceeds int16 max", len(v))
+			"postgres: pgvector encode: dim %d exceeds int16 max", len(v),
+		)
 	}
 	header := [4]byte{}
 	binary.BigEndian.PutUint16(header[0:2], uint16(len(v)))
@@ -245,7 +246,8 @@ func parseVectorText(s string) ([]float32, error) {
 	s = strings.TrimSpace(s)
 	if len(s) < 2 || s[0] != '[' || s[len(s)-1] != ']' {
 		return nil, fmt.Errorf(
-			"postgres: pgvector parse: malformed text %q (missing brackets)", s)
+			"postgres: pgvector parse: malformed text %q (missing brackets)", s,
+		)
 	}
 	body := strings.TrimSpace(s[1 : len(s)-1])
 	if body == "" {
@@ -258,7 +260,8 @@ func parseVectorText(s string) ([]float32, error) {
 		f, err := strconv.ParseFloat(p, 32)
 		if err != nil {
 			return nil, fmt.Errorf(
-				"postgres: pgvector parse: component %d %q: %w", i, p, err)
+				"postgres: pgvector parse: component %d %q: %w", i, p, err,
+			)
 		}
 		out[i] = float32(f)
 	}
@@ -273,7 +276,8 @@ func parseVectorText(s string) ([]float32, error) {
 func decodeVectorBinary(src []byte) ([]float32, error) {
 	if len(src) < 4 {
 		return nil, fmt.Errorf(
-			"postgres: pgvector decode: header truncated (got %d bytes, want >= 4)", len(src))
+			"postgres: pgvector decode: header truncated (got %d bytes, want >= 4)", len(src),
+		)
 	}
 	dim := int(binary.BigEndian.Uint16(src[0:2]))
 	// src[2:4] is the unused word; we don't validate it (pgvector itself
@@ -282,7 +286,8 @@ func decodeVectorBinary(src []byte) ([]float32, error) {
 	if len(src) != expected {
 		return nil, fmt.Errorf(
 			"postgres: pgvector decode: payload length %d does not match dim=%d (want %d)",
-			len(src), dim, expected)
+			len(src), dim, expected,
+		)
 	}
 	out := make([]float32, dim)
 	for i := 0; i < dim; i++ {
@@ -324,4 +329,5 @@ func lookupVectorOID(ctx context.Context, q interface {
 // short-circuit codec registration (no vector columns to ship) or
 // surface a clear refusal.
 var errVectorTypeNotFound = errors.New(
-	"postgres: pgvector type not found in pg_type — extension not installed?")
+	"postgres: pgvector type not found in pg_type — extension not installed?",
+)

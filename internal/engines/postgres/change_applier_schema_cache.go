@@ -174,7 +174,8 @@ func (a *ChangeApplier) PrimeSchemaHistoryCache(ctx context.Context, streamID st
 	// cold-start has no history yet; the first SchemaSnapshot on the
 	// stream will populate the cache via the post-commit hook.
 	if currentPos.Token == "" {
-		slog.DebugContext(ctx, "postgres: applier: schema-history prime skipped (brand-new stream)",
+		slog.DebugContext(
+			ctx, "postgres: applier: schema-history prime skipped (brand-new stream)",
 			slog.String("stream_id", streamID),
 		)
 		return nil
@@ -192,7 +193,8 @@ func (a *ChangeApplier) PrimeSchemaHistoryCache(ctx context.Context, streamID st
 		// boundary detector has not snapshotted any version on this
 		// stream. The cache stays empty; the reader's next
 		// SchemaSnapshot will populate it.
-		slog.DebugContext(ctx, "postgres: applier: schema-history prime found no retained versions",
+		slog.DebugContext(
+			ctx, "postgres: applier: schema-history prime found no retained versions",
 			slog.String("stream_id", streamID),
 			slog.String("position_token", currentPos.Token),
 		)
@@ -273,7 +275,8 @@ func (a *ChangeApplier) PrimeSchemaHistoryCache(ctx context.Context, streamID st
 			IR:     t,
 		}
 	}
-	slog.DebugContext(ctx, "postgres: applier: schema-history cache primed",
+	slog.DebugContext(
+		ctx, "postgres: applier: schema-history cache primed",
 		slog.String("stream_id", streamID),
 		slog.String("position_token", currentPos.Token),
 		slog.Int("tables", len(tables)),

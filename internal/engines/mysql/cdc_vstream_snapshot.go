@@ -314,7 +314,8 @@ func (s *vstreamSnapshotStream) dispatchCopyEvent(ev *binlogdata.VEvent) (done b
 			// behind-the-scan emissions Vitess sent that we filtered.
 			// Empty string when no drops fired — most streams.
 			if summary := s.dedup.summary(); summary != "" {
-				slog.DebugContext(context.Background(),
+				slog.DebugContext(
+					context.Background(),
 					"mysql/vstream: snapshot: COPY-phase dedup summary (GitHub #14)",
 					slog.String("drops_by_scope", summary),
 				)
@@ -704,7 +705,8 @@ func (c *vstreamSnapshotChanges) StreamChanges(ctx context.Context, from ir.Posi
 		if ok && !sameVgtid(shards, c.snap.currentVgtid) {
 			return nil, fmt.Errorf(
 				"mysql/vstream: snapshot: StreamChanges: from position %v does not match captured snapshot position %v",
-				shards, c.snap.currentVgtid)
+				shards, c.snap.currentVgtid,
+			)
 		}
 	}
 	return c.snap.startPump(ctx)

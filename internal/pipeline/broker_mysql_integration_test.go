@@ -75,7 +75,8 @@ func TestSyncFromBackup_MySQL_HappyPath(t *testing.T) {
 	// Drive 5 inserts on the source.
 	for i := 0; i < 5; i++ {
 		applyDDLMySQL(t, sourceDSN, fmt.Sprintf(
-			`INSERT INTO users (email) VALUES ('user%d@example.com');`, i))
+			`INSERT INTO users (email) VALUES ('user%d@example.com');`, i,
+		))
 	}
 
 	// Take an incremental that captures them. MaxChanges is generous

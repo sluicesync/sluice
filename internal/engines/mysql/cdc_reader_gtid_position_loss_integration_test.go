@@ -58,7 +58,8 @@ func startMySQLGTIDForCDC(t *testing.T) (dsn string, cleanup func()) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	container, err := mysqltc.Run(ctx,
+	container, err := mysqltc.Run(
+		ctx,
 		"mysql:8.0",
 		mysqltc.WithDatabase("source_db"),
 		mysqltc.WithUsername("root"),
@@ -284,7 +285,8 @@ func assertGTIDPurgedPastResume(t *testing.T, dsn, resumeSet string) {
 		t.Fatalf("read gtid_purged: %v", err)
 	}
 	var subset int
-	if err := db.QueryRowContext(ctx,
+	if err := db.QueryRowContext(
+		ctx,
 		"SELECT GTID_SUBSET(@@global.gtid_purged, ?)", resumeSet,
 	).Scan(&subset); err != nil {
 		t.Fatalf("GTID_SUBSET: %v", err)

@@ -88,7 +88,8 @@ func TestMigrate_PostgresToPostgres_Bug76FilterBeforeColumnValidate(t *testing.T
 		var exists bool
 		if err := dstDB.QueryRow(
 			`SELECT EXISTS (SELECT 1 FROM information_schema.tables
-			 WHERE table_name='bad')`).Scan(&exists); err != nil {
+			 WHERE table_name='bad')`,
+		).Scan(&exists); err != nil {
 			t.Fatalf("probe bad existence: %v", err)
 		}
 		if exists {

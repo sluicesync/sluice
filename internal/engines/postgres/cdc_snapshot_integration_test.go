@@ -35,7 +35,8 @@ func startPostgresForSnapshotCDC(t *testing.T) (dsn string, cleanup func()) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	container, err := pgtc.Run(ctx,
+	container, err := pgtc.Run(
+		ctx,
 		"postgres:16",
 		pgtc.WithDatabase("source_db"),
 		pgtc.WithUsername("test"),

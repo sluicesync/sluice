@@ -66,7 +66,8 @@ func startHeartbeat(ctx context.Context, streamID string, interval time.Duration
 			case <-ctx.Done():
 				return
 			case t := <-ticker.C:
-				logger.InfoContext(ctx, "stream: heartbeat",
+				logger.InfoContext(
+					ctx, "stream: heartbeat",
 					slog.String("stream_id", streamID),
 					slog.Time("at", t.UTC()),
 					slog.Duration("interval", interval),

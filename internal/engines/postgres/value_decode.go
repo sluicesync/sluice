@@ -411,7 +411,8 @@ func decodeUUID(raw any) (any, error) {
 		default:
 			return nil, fmt.Errorf(
 				"postgres: UUID byte slice has length %d; want 16 (binary) or 36 (canonical text)",
-				len(v))
+				len(v),
+			)
 		}
 	case string:
 		// Already a string; pgx may return string in some modes, and

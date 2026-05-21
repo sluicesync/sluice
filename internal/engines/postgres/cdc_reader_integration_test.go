@@ -48,7 +48,8 @@ func startPostgresForCDCImage(t *testing.T, image string) (dsn string, cleanup f
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	container, err := pgtc.Run(ctx,
+	container, err := pgtc.Run(
+		ctx,
 		image,
 		pgtc.WithDatabase("source_db"),
 		pgtc.WithUsername("test"),
@@ -518,7 +519,8 @@ func TestCDCReader_RejectsWrongWALLevel(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	container, err := pgtc.Run(ctx,
+	container, err := pgtc.Run(
+		ctx,
 		"postgres:16",
 		pgtc.WithDatabase("source_db"),
 		pgtc.WithUsername("test"),
@@ -621,7 +623,8 @@ func TestCDCReader_FailoverFlag_PG17(t *testing.T) {
 	defer func() { _ = db.Close() }()
 
 	var failover bool
-	err = db.QueryRowContext(ctx,
+	err = db.QueryRowContext(
+		ctx,
 		"SELECT failover FROM pg_replication_slots WHERE slot_name = $1",
 		"sluice_slot",
 	).Scan(&failover)
@@ -677,7 +680,8 @@ func TestCDCReader_FailoverFlag_PG16(t *testing.T) {
 	defer func() { _ = db.Close() }()
 
 	var slotName string
-	err = db.QueryRowContext(ctx,
+	err = db.QueryRowContext(
+		ctx,
 		"SELECT slot_name FROM pg_replication_slots WHERE slot_name = $1",
 		"sluice_slot",
 	).Scan(&slotName)
