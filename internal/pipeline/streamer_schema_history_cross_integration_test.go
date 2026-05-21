@@ -144,21 +144,60 @@ func TestStreamer_MySQLToPostgres_SchemaHistoryWarmResumeAcrossDDL(t *testing.T)
 	// level pin TestSnapshotStream_ReleaseRowsClosesSnapshotTx in
 	// internal/engines/mysql/cdc_snapshot_integration_test.go.
 	//
-	// HOWEVER (CI run 26189839632 on PR #44): with the MDL fix in
-	// place this test now fails at PHASE 7 instead — the ALTER
-	// completes in ~1s as expected, but R3 (the post-DDL INSERT
-	// carrying the new nickname column) does not propagate to the
-	// PG target within the 30s waitForRowCount budget. Total test
-	// runtime ~49s (vs ~117s pre-fix). This is a SEPARATE downstream
-	// issue from the MDL deadlock — almost certainly in the binlog
-	// reader's handling of the snapshot tx's COMMIT event landing in
-	// the stream just before the ALTER + R3, or in ADR-0049 Chunk
-	// B1's deferred-emit interacting with that COMMIT. Tracked as
-	// task #35 — un-skip once that closes.
-	t.Skip("task #35: MDL deadlock fixed (#34 / Phase 5 ALTER now completes), " +
-		"but R3 post-DDL INSERT doesn't propagate to PG within 30s — " +
-		"separate downstream issue in the binlog-reader / Chunk B1 path; " +
-		"see CI run 26189839632 for the failure shape.")
+	// task #35 — Phase A on PR #45 (CI run 26194652692, job
+	// 77071179523) confirmed the Phase 7 R3-never-lands failure with
+	// the slog tail:
+	//
+	//   streamer1.Run returned err = pipeline: apply changes:
+	//     postgres: applier: insert into public.users:
+	//     ERROR: column "nickname" of relation "users" does not exist
+	//     (SQLSTATE 42703)
+	//
+	// Root cause (structural, not a regression): the live cross-engine
+	// streamer has no DDL-propagation path. ADR-0049 Chunks B1/B3/C
+	// record the post-ALTER source IR into the target's
+	// sluice_cdc_schema_history (Phase 9 assertion still passes — see
+	// below) and prime the applier's active-version cache on warm-
+	// resume, but they do NOT issue the ALTER on the PG target. The
+	// PG applier reads target column types via
+	// information_schema.columns (change_applier.go:loadColumnTypes);
+	// for users that returns (id, email) only because the target was
+	// never altered to add nickname. buildInsertSQL then iterates over
+	// all keys in the source row {id, email, nickname} and emits
+	// `INSERT INTO public.users (id, email, nickname) VALUES (...)`.
+	// PG returns 42703 → classifyApplierError doesn't mark it
+	// retriable → runOnce returns the wrapped error → the goroutine
+	// exits and R3 never lands.
+	//
+	// Assertions (b)+(d) — "the nickname column ends up populated on
+	// the target with the right value" — were aspirational for the
+	// time this test was authored: they require a feature (live
+	// cross-engine DDL apply on the target) that exists ONLY on the
+	// chain-restore broker path (manifest-based SchemaDelta →
+	// SchemaWriter.AlterAddColumn on the target). The live streamer
+	// dispatches ir.SchemaSnapshot to the applier as a *history-write*
+	// only (change_applier.go:writeSchemaVersion).
+	//
+	// The remaining ADR-0049 invariants this test was meant to pin —
+	// (a) schema-history row written same-tx as the position write,
+	// and (c) warm-resume does NOT fall through to cold-start — are
+	// independent of target DDL apply and would pass if the test were
+	// rewritten to apply the ALTER on the target alongside the source
+	// (the realistic operator pattern today). That rewrite is the
+	// follow-up task; this test stays t.Skip'd until the live
+	// cross-engine DDL apply feature lands OR the test is restructured
+	// to coordinate target DDL.
+	//
+	// See task-#35 PR #45 for the Phase A instrumentation that
+	// captured the 42703 ground truth and the full investigation log.
+	t.Skip("task #35: live cross-engine DDL apply is a missing feature, " +
+		"not a regression — Phase 7 R3 INSERT hits PG SQLSTATE 42703 " +
+		"because the target was never altered to add the nickname column " +
+		"(ADR-0049 records source-side history; it does not apply DDL on " +
+		"the target). See test docstring + PR #45 for the Phase A " +
+		"ground-truth investigation. Un-skip once either (a) a live " +
+		"cross-engine DDL apply path lands, or (b) the test is rewritten " +
+		"to apply the ALTER on both source and target.")
 
 	mysqlSourceDSN, _, mysqlCleanup := startMySQLBinlog(t)
 	defer mysqlCleanup()
