@@ -1,18 +1,16 @@
 # ADR-0048 — Multi-source aggregation Shape A (sharded → consolidated)
 
-**Status:** **Proposed (design-first; sign-off pending).** This ADR is
-the design pass *before* code. It was produced from a sharded-Vitess →
-consolidated-target spike (harness:
+**Status:** **Accepted (design-only; implementation demand-gated per
+roadmap §4).** This ADR is the design pass *before* code. It was
+produced from a sharded-Vitess → consolidated-target spike (harness:
 `internal/pipeline/shapea_spike_vstream_integration_test.go`, build tag
 `integration vstream`; design evidence:
 [`docs/dev/notes/prep-multi-source-shape-a.md`](../dev/notes/prep-multi-source-shape-a.md)).
-It is **Proposed → dialogue → Accepted**: the three decision points in
-§"Decision points requiring sign-off" must be resolved with the owner
-before implementation. **Status 2026-05-16: DP-2 (discriminator-value-
-presence) and DP-3 (drained model for v1) RESOLVED; DP-1 OPEN (v1 leans
-the two-surface redaction precedent; the unified-surface option is a
-deferred separate feature-branch ADR). Moves to Accepted once DP-1 is
-owner-confirmed.** Roadmap §4. Extends
+All three decision points in §"Decision points requiring sign-off"
+RESOLVED: DP-2 (discriminator-value-presence) and DP-3 (drained model
+for v1) 2026-05-16; DP-1 (two-surface split — (a)) 2026-05-21.
+Acceptance commits to the design; implementation waits for a concrete
+operator workload per roadmap §4 demand-gate. Roadmap §4. Extends
 [ADR-0031](adr-0031-multi-source-aggregation-target-schema.md) (shipped
 Shape B, v0.25.0, which explicitly deferred Shape A) and builds on the
 control-table additive-column pattern of
@@ -179,17 +177,33 @@ implementation.
   for both bulk and CDC. **Spike lean:** the two-surface split
   (translate-pass for schema, value-wrap for bulk, optional
   applier-surface for CDC) — it matches the redaction precedent exactly.
-  **Owner to confirm or override.** — **OPEN (2026-05-16).** Discussed
-  in depth: option (c) "single unified surface" was explored —
-  conclusion is it requires promoting key-identity to a first-class,
-  transform-visible `ir.Change.Key` and a cross-engine refactor of the
-  CDC-apply identity ownership (the most correctness-critical surface);
-  it carries a latent change-identity-simplification upside but is a
-  deliberate, separately-ADR'd, FEATURE-BRANCH refactor — not a v1
-  Shape A vehicle. v1 leans option (a) (the two-surface redaction
-  precedent: translate-pass schema + value-wrap bulk + optional
-  applier surface CDC). Final owner confirmation of (a)-for-v1 pending;
-  does not block recording the rest of the design.
+  **Owner to confirm or override.** — **RESOLVED 2026-05-21: option
+  (a), the two-surface split** (translate-pass schema + value-wrap bulk
+  + optional `ShardColumnSetter` applier surface CDC). Owner-confirmed
+  after a code-grounded re-examination of the (a)/(b)/(c) tradeoff —
+  see [`docs/dev/notes/adr-0048-dialogue-prep.md`](../dev/notes/adr-0048-dialogue-prep.md)
+  for the dialogue summary. Three findings sharpened the call: (i) the
+  current `ir.Update`/`ir.Delete` carry FULL-row `Before`/`After` maps
+  (`map[string]any`) and both engines build WHERE from every column via
+  `buildWhereClause` (mysql `change_applier.go:1068`+, postgres
+  `change_applier.go:1398`+) — so there is no engine-specific identity
+  tuple today; (b)'s "layering inversion" objection is weaker than the
+  ADR originally implied (orchestrator-side mutation of the maps would
+  work), and the real argument for (a) is the redaction precedent's
+  already-shipped, already-pinned shape. (ii) (c)'s real cost is bigger
+  than first presented: introducing `ir.Change.Key` only pays off if
+  WHERE construction also migrates from full-row predicates to
+  key-only — a deliberate refactor of the most correctness-critical
+  surface, and the current full-row WHERE carries hard-won Bug-6-class
+  robustness (cf. the `logZeroRowsAffected` infrastructure). (iii) Per
+  the CLAUDE.md zero-users tenet, demand-gating is real: confirming (a)
+  commits to the design only; no implementation until a concrete
+  operator workload forces Shape A. If/when an independent forcing
+  function appears for unified change-identity (an upsert/dedup
+  workload that demands key-only WHERE, an ADR-0050 implementation
+  finding, multi-source consolidation evidence), the unified-`Key`
+  refactor becomes its own co-equal ADR at that point — not pre-built
+  on speculation.
 
 - **DP-2 — populated-target first-shard detection.** Shard 1's
   legitimate cold-start into an empty target must NOT trip

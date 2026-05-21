@@ -14,11 +14,18 @@ of context first.
 
 ## Status summary
 
-| DP | Topic | Status (as of 2026-05-16) |
+| DP | Topic | Status |
 |---|---|---|
-| DP-1 | CDC-path injection surface (a / b / c) | **OPEN** — v1 leans (a); owner confirmation pending |
-| DP-2 | Populated-target first-shard detection | RESOLVED — discriminator-value-presence only |
-| DP-3 | Cross-shard DDL coordination: live vs drained for v1 | RESOLVED — drained for v1 (live deferred to Phase 2) |
+| DP-1 | CDC-path injection surface (a / b / c) | **RESOLVED 2026-05-21 — option (a), two-surface split** |
+| DP-2 | Populated-target first-shard detection | RESOLVED 2026-05-16 — discriminator-value-presence only |
+| DP-3 | Cross-shard DDL coordination: live vs drained for v1 | RESOLVED 2026-05-16 — drained for v1 (live deferred to Phase 2) |
+
+ADR-0048 Status: **Accepted** (design-only; implementation demand-gated
+per roadmap §4). The DP-1 dialogue, code-grounded against
+`internal/engines/{mysql,postgres}/change_applier.go`, sharpened three
+findings the original ADR text under-stated; they are recorded in
+ADR-0048's DP-1 resolution block. Implementation waits for a concrete
+operator workload.
 
 The other four pieces of the design (translate-pass for the schema
 half; `ir.Column.SluiceInjected` provenance marker; the loud
