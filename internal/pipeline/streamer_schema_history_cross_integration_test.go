@@ -205,13 +205,15 @@ func TestStreamer_MySQLToPostgres_SchemaHistoryWarmResumeAcrossDDL(t *testing.T)
 	// ALTERs both source and target) so when task #36 closes, the
 	// test runs end-to-end correctly. Until then, re-skip with this
 	// updated docstring as the next session's starting point.
-	t.Skip("task #36: with #35 path (b) coordinated-DDL in place, phases " +
-		"3–7 pass (test runs in 20s); now fails at phase 9 assertion (a) " +
-		"— sluice_cdc_schema_history has 0 rows after the ALTER. ADR-0049 " +
-		"Chunk B1's deferred-emit isn't firing on the live cross-engine " +
-		"path. See PR #47 CI run 26200739605 + this docstring for the " +
-		"failure shape; investigate maybeSnapshotSchemaB1 + " +
-		"pendingDDLAnchor + writeSchemaVersion's controlSchema target.")
+	// task #36 Phase A: un-skipped + the assertion (a) failure path
+	// now dumps the FULL sluice_cdc_schema_history contents to t.Logf
+	// before failing. The strong hypothesis (from code-reading
+	// internal/engines/mysql/cdc_reader.go maybeSnapshotSchemaB1):
+	// the write IS happening, but with schema_name = "source_db" (the
+	// MySQL source schema name), while the test queries WHERE
+	// schema_name = 'public' (the PG target's default namespace).
+	// The dump will show definitively: rows-present-with-wrong-schema
+	// vs no-rows-at-all (each → different fix).
 
 	mysqlSourceDSN, _, mysqlCleanup := startMySQLBinlog(t)
 	defer mysqlCleanup()
@@ -324,9 +326,16 @@ func TestStreamer_MySQLToPostgres_SchemaHistoryWarmResumeAcrossDDL(t *testing.T)
 
 	historyCount := schemaHistoryCountXE(t, pgTargetDSN, streamID, "public", "users")
 	if historyCount == 0 {
+		// task #36 Phase A: dump the full schema-history table contents
+		// so the failure log shows whether rows are present under a
+		// different schema_name (schema-name mismatch — likely; the
+		// MySQL source schema is "source_db", not "public") or absent
+		// entirely (deferred-emit didn't fire).
+		dumpSchemaHistoryRowsForDiag(t, pgTargetDSN, streamID)
 		t.Fatal("phase 9 / assertion (a): sluice_cdc_schema_history has 0 rows for " +
 			"(streamID=" + streamID + ", schema=public, table=users) — ADR-0049 Chunk B1+B3 #4c " +
-			"anchor-at-detection MUST have written the post-ALTER IR table here")
+			"anchor-at-detection MUST have written the post-ALTER IR table here " +
+			"(see Phase A dump above for the actual stored rows)")
 	}
 	t.Logf("phase 9: sluice_cdc_schema_history rows for users = %d", historyCount)
 
@@ -523,3 +532,63 @@ var (
 	_ ir.Change = ir.SchemaSnapshot{}
 	_ error     = ir.ErrPositionInvalid
 )
+
+// dumpSchemaHistoryRowsForDiag is the task #36 Phase A diagnostic
+// helper. Called from the assertion (a) failure path; logs every row
+// of sluice_cdc_schema_history matching the streamID, regardless of
+// schema_name / table_name. The hypothesis under test: rows DO exist
+// but under a schema_name that doesn't match the test's filter (the
+// MySQL source schema "source_db" vs the test's "public"). The dump
+// either confirms that mismatch (rows present with non-public schema)
+// or rules it out (no rows at all — deferred-emit never fired or
+// silently failed).
+//
+// Removed in Phase C once root cause is found + fixed.
+func dumpSchemaHistoryRowsForDiag(t *testing.T, dsn, streamID string) {
+	t.Helper()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Logf("[task #36 dump] open: %v", err)
+		return
+	}
+	defer func() { _ = db.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	rows, err := db.QueryContext(ctx, `
+		SELECT stream_id, schema_name, table_name, anchor_position,
+		       LENGTH(ir_schema_json) AS payload_bytes
+		FROM "public"."sluice_cdc_schema_history"
+		WHERE stream_id = $1
+		ORDER BY schema_name, table_name`, streamID)
+	if err != nil {
+		t.Logf("[task #36 dump] query: %v", err)
+		return
+	}
+	defer func() { _ = rows.Close() }()
+	n := 0
+	for rows.Next() {
+		var sid, schema, table, posToken string
+		var payloadBytes int
+		if err := rows.Scan(&sid, &schema, &table, &posToken, &payloadBytes); err != nil {
+			t.Logf("[task #36 dump] scan: %v", err)
+			continue
+		}
+		preview := posToken
+		if len(preview) > 60 {
+			preview = preview[:60] + "..."
+		}
+		t.Logf("[task #36 dump] stream=%s schema=%q table=%q position=%q ir_payload_bytes=%d",
+			sid, schema, table, preview, payloadBytes)
+		n++
+	}
+	if err := rows.Err(); err != nil {
+		t.Logf("[task #36 dump] rows.Err: %v", err)
+	}
+	if n == 0 {
+		t.Logf("[task #36 dump] 0 rows in sluice_cdc_schema_history for stream_id=%q across ALL schema_name/table_name — Chunk B1's writeSchemaVersion never fired", streamID)
+	} else {
+		t.Logf("[task #36 dump] %d total rows present (across all schema_name/table_name) for stream_id=%q", n, streamID)
+	}
+}
