@@ -6,6 +6,24 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Features
+
+- **`feat(applier): ADR-0052 AIMD apply-batch-size controller`** — when `--apply-batch-size=N > 1` is set, the streamer now auto-tunes the per-batch row count via an Additive-Increase / Multiplicative-Decrease controller. N becomes a CAP the controller never exceeds; the floor stays at ADR-0017's conservative-default of 1. The two control inputs (ADR-0052 DP-4) are rolling p95 batch-apply latency (50-batch window) and retriable-error rate (3+ per 60s rolling window). Engine-default target latency: `planetscale=5s` (4× headroom under Vitess's 20s tx-killer), `mysql/postgres=10s`. Pass `--no-auto-tune` to disable and keep the static-cap behaviour; pass `--apply-tune-target-latency=DUR` to override the target. New `--apply-batch-size=auto` accepts the sentinel form (engine-default ceiling: 1000 mysql/postgres, 100 planetscale). Per-stream state (independent controllers across multi-stream processes). New `internal/appliercontrol` package owns the math; engine appliers consult it via the new `ir.BatchSizeProvider` / `ir.BatchObserver` optional interfaces (sibling-tier to `RedactorSetter` / `StreamIDSetter`).
+
+- **`feat(metrics): four new Prometheus gauges for AIMD telemetry`** — `sluice_apply_batch_size_current{stream_id}`, `sluice_apply_batch_size_p95_seconds{stream_id}`, `sluice_apply_batch_size_decreases_total{stream_id}` (counter), and `sluice_apply_batch_size_cooloff{stream_id}` emit from the existing `--metrics-listen` endpoint when the AIMD controller is engaged. Reads scrape-time via `Controller.Snapshot` — no instrumentation of the apply hot path. INFO log on multiplicative-decrease events, cool-off enter/exit, ceiling cap, and the byte-cap-dominant advisory (DP-4 b: hints the operator to raise `--max-buffer-bytes` when bytes — not rows — are the binding constraint, rate-limited to one log per cool-off period). DEBUG log per batch with size + p95 + decision reason.
+
+### Compatibility
+
+- **Opt-out by default (ADR-0052 DP-1).** Operators with hand-tuned `--apply-batch-size=N` values that benchmarked optimally for their workload should add `--no-auto-tune` to preserve the pre-v0.72.0 strict-static semantics. Otherwise N becomes a CAP and the controller adapts within `[1, N]`. The behaviour change is deliberate — see ADR-0052's resolved DP-1 for the trade-off (better ergonomic default for new adoption vs. semantic stability for hand-tuned operators).
+
+- **`--apply-batch-size` flag type changed from int to string.** The numeric form (`--apply-batch-size=100`) parses unchanged. The new sentinel `auto` accepts engine-default ceilings. Operators using YAML config don't see any change; CLI scripts that pass the value as an integer continue to work because kong's string parser tolerates numeric input.
+
+### Who needs this
+
+- **Anyone running cross-region CDC** — the controller catches the Vitess 20s tx-killer foot-gun automatically; pre-v0.72.0 the operator had to hand-tune below the threshold (the v0.45.0 Phase 2 WARN flagged the risk; this release closes the loop with self-correction).
+
+- **Operators running a heterogeneous fleet of sluice streams** — each stream gets its own controller and its own per-`stream_id` Prometheus gauges, so a fleet-wide Grafana dashboard surfaces "which stream is converging where" without per-stream config.
+
 ## [0.71.0]
 
 **One real operability bug fixed, one operator-facing feature added.** Pre-fix, `START TRANSACTION WITH CONSISTENT SNAPSHOT` on the MySQL snapshot conn held `MDL_SHARED_READ` (`dur=TRANSACTION`) on every snapshotted source table for the streamer's entire lifetime — blocking any operator-issued `ALTER` (even `ALGORITHM=INSTANT`) until sluice was stopped. The PG analogue (Bug 21) was fixed long ago via `ReleaseRowsFn` at `COPY_COMPLETED`; the MySQL engine had the same shape designed in the IR but had never wired its half. This release closes that. On the feature side, `sluice sync status` gains live-refresh, JSON output, and an aggregate-summary header — the operator's first first-class "what's my fleet doing right now" surface that doesn't require Prometheus.
