@@ -94,7 +94,20 @@ func (a *ChangeApplier) ApplyBatch(ctx context.Context, streamID string, changes
 	}
 
 	for {
-		batchN, lastPos, channelClosed, err := a.applyOneBatch(ctx, streamID, changes, maxBatchSize)
+		// ADR-0052: when an AIMD controller is wired via
+		// SetBatchSizeProvider, consult it before each batch so the
+		// controller's current target drives the row cap. The static
+		// maxBatchSize remains the absolute ceiling — provider returns
+		// are clamped to it so an operator-supplied --apply-batch-size=N
+		// remains a hard cap the controller can never exceed.
+		effective := maxBatchSize
+		if a.batchSizeProvider != nil {
+			next := a.batchSizeProvider.NextBatchSize()
+			if next > 0 && next < effective {
+				effective = next
+			}
+		}
+		batchN, lastPos, channelClosed, err := a.applyOneBatch(ctx, streamID, changes, effective)
 		if err != nil {
 			return err
 		}
@@ -143,15 +156,24 @@ func (a *ChangeApplier) applyOneBatch(ctx context.Context, streamID string, chan
 	// GitHub #18 Phase 1: batch-latency telemetry (PG-side mirror of
 	// the MySQL applier). Measure wall-clock from batch start through
 	// position write + commit. DEBUG-only; elided on n==0.
+	//
+	// ADR-0052: if a BatchObserver is wired, the same wall-clock
+	// duration feeds the AIMD controller via ObserveBatch — success
+	// and failure paths both call it so the controller sees retry
+	// signals.
 	batchStart := time.Now()
 	defer func() {
+		latency := time.Since(batchStart)
 		if n > 0 {
 			slog.DebugContext(
 				ctx, "applier: batch latency",
 				slog.String("stream_id", streamID),
 				slog.Int("rows", n),
-				slog.Int64("millis", time.Since(batchStart).Milliseconds()),
+				slog.Int64("millis", latency.Milliseconds()),
 			)
+		}
+		if a.batchObserver != nil && (n > 0 || err != nil) {
+			a.batchObserver.ObserveBatch(ctx, latency, n, err)
 		}
 	}()
 
@@ -329,6 +351,17 @@ func (a *ChangeApplier) applyOneBatch(ctx context.Context, streamID string, chan
 					slog.Int64("bytes", batchBytes),
 					slog.Int64("byte_cap", byteCap),
 				)
+				// ADR-0052 DP-4 (b): when the byte-cap fires before the
+				// row-cap on a sustained shape, AI-ing rows can't help
+				// (the binding constraint is bytes). The controller logs
+				// the advisory at most once per cool-off period.
+				if a.batchSizeProvider != nil && n < maxBatchSize {
+					if hinter, ok := a.batchSizeProvider.(interface {
+						NoteByteCapDominant(ctx context.Context, rows int, bytes, byteCap int64)
+					}); ok {
+						hinter.NoteByteCapDominant(ctx, n, batchBytes, byteCap)
+					}
+				}
 				return n, lastPos, false, a.commitBatch(ctx, tx, streamID, lastPos.Token, n)
 			}
 			// Reset the idle timer for each successful change so the

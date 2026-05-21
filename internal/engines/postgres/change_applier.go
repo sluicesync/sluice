@@ -216,6 +216,23 @@ type ChangeApplier struct {
 	// determinism should set the stream-id explicitly.
 	streamID string
 
+	// batchSizeProvider is the optional AIMD controller's batch-size
+	// surface (ADR-0052). When non-nil, ApplyBatch consults
+	// provider.NextBatchSize() on every outer-loop iteration to
+	// discover the controller's current target. Nil means "no
+	// controller — use the static maxBatchSize from the caller."
+	// Implements [ir.BatchSizeProviderSetter] via [SetBatchSizeProvider].
+	batchSizeProvider ir.BatchSizeProvider
+
+	// batchObserver is the optional AIMD controller's batch-outcome
+	// surface (ADR-0052). When non-nil, applyOneBatch calls
+	// observer.ObserveBatch(ctx, latency, rows, err) after every
+	// commit (success path) or rollback (failure path) so the
+	// controller can update its sliding-window p95 + retry-rate
+	// accumulator. Nil means "no controller; no observation."
+	// Implements [ir.BatchObserverSetter] via [SetBatchObserver].
+	batchObserver ir.BatchObserver
+
 	// activeSchema maps "schema.table" → the IR schema in effect at the
 	// most-recently durably-persisted ADR-0049 boundary for that table.
 	// O(1) amortised: populated on cold-start prime (resume from a
@@ -301,6 +318,25 @@ func (a *ChangeApplier) SetRedactor(registry any) {
 // streamer may call this on every Run.
 func (a *ChangeApplier) SetStreamID(streamID string) {
 	a.streamID = streamID
+}
+
+// SetBatchSizeProvider implements [ir.BatchSizeProviderSetter]
+// (ADR-0052). Threads the AIMD controller onto the applier so each
+// batch's row-cap reflects the controller's current decision. A nil
+// provider clears the wiring (the static --apply-batch-size cap
+// resumes). Idempotent.
+func (a *ChangeApplier) SetBatchSizeProvider(p ir.BatchSizeProvider) {
+	a.batchSizeProvider = p
+}
+
+// SetBatchObserver implements [ir.BatchObserverSetter] (ADR-0052).
+// Threads the AIMD controller's observation surface onto the applier
+// so each post-commit / post-rollback latency feeds the controller's
+// sliding-window p95. A nil observer clears the wiring (no
+// observation; controller decisions stagnate at whatever the last
+// observation drove). Idempotent.
+func (a *ChangeApplier) SetBatchObserver(o ir.BatchObserver) {
+	a.batchObserver = o
 }
 
 // redactChange mirrors the MySQL applier's redactChange. nil/empty

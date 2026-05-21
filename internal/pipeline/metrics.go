@@ -37,8 +37,10 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/orware/sluice/internal/appliercontrol"
 	"github.com/orware/sluice/internal/ir"
 )
 
@@ -46,10 +48,18 @@ import (
 // streamer creates one of these when [Streamer.MetricsListen] is
 // non-empty, hands it the applier handle, and Closes it on stream
 // teardown.
+//
+// As of ADR-0052 the server can optionally snapshot a per-stream
+// [appliercontrol.Controller] alongside the applier-derived stream
+// status. AIMD gauges are emitted only when AttachAIMDController has
+// been called.
 type MetricsServer struct {
 	addr    string
 	applier ir.ChangeApplier
 	server  *http.Server
+
+	mu             sync.RWMutex
+	aimdController *appliercontrol.Controller
 }
 
 // NewMetricsServer wires the HTTP server. Does NOT start listening
@@ -113,6 +123,29 @@ func (m *MetricsServer) Close() error {
 	return m.server.Shutdown(ctx)
 }
 
+// AttachAIMDController plugs an [appliercontrol.Controller] into the
+// metrics server so the AIMD gauges fire alongside the existing
+// stream-status gauges. ADR-0052 DP-3. The controller is snapshotted
+// at scrape time via [appliercontrol.Controller.Snapshot] — no
+// instrumentation of the apply hot path. Idempotent; a nil argument
+// detaches.
+func (m *MetricsServer) AttachAIMDController(c *appliercontrol.Controller) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.aimdController = c
+}
+
+// aimdSnapshot returns a snapshot of the attached AIMD controller, or
+// (snapshot, false) when no controller is attached.
+func (m *MetricsServer) aimdSnapshot() (appliercontrol.MetricsSnapshot, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.aimdController == nil {
+		return appliercontrol.MetricsSnapshot{}, false
+	}
+	return m.aimdController.Snapshot(), true
+}
+
 // handleMetrics is the GET /metrics handler. Reads ListStreams,
 // emits Prometheus exposition format. Errors fall through as
 // 500 so the operator's scraper visibly fails rather than silently
@@ -127,6 +160,9 @@ func (m *MetricsServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	now := time.Now()
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 	emitMetrics(w, streams, now)
+	if snap, ok := m.aimdSnapshot(); ok {
+		emitAIMDMetrics(w, snap)
+	}
 }
 
 // handleHealthz is a tiny "is the server alive" endpoint that
@@ -168,6 +204,61 @@ func emitMetrics(w io.Writer, streams []ir.StreamStatus, now time.Time) {
 	fmt.Fprintln(w, "# HELP sluice_metrics_scrape_unix_seconds Unix timestamp of this scrape, for scraper-side staleness detection.")
 	fmt.Fprintln(w, "# TYPE sluice_metrics_scrape_unix_seconds gauge")
 	fmt.Fprintf(w, "sluice_metrics_scrape_unix_seconds %d\n", now.Unix())
+}
+
+// emitAIMDMetrics renders the AIMD apply-batch-size controller's
+// scrape-time snapshot in Prometheus exposition format. ADR-0052 DP-3
+// gauge set:
+//
+//   - sluice_apply_batch_size_current{stream_id}     — controller's
+//     current target batch size after its latest decision.
+//   - sluice_apply_batch_size_p95_seconds{stream_id} — rolling p95
+//     latency over the controller's sliding window.
+//   - sluice_apply_batch_size_decreases_total{stream_id} — counter of
+//     multiplicative-decrease events (lets operators alert on
+//     persistent oscillation).
+//   - sluice_apply_batch_size_cooloff{stream_id}     — 0 or 1 for
+//     "currently in cool-off period."
+//
+// Reads the controller's state via Snapshot — atomic and lock-light;
+// no per-batch instrumentation cost.
+func emitAIMDMetrics(w io.Writer, s appliercontrol.MetricsSnapshot) {
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "# HELP sluice_apply_batch_size_current AIMD controller's current target apply-batch-size after its latest decision.")
+	fmt.Fprintln(w, "# TYPE sluice_apply_batch_size_current gauge")
+	fmt.Fprintf(w, `sluice_apply_batch_size_current{stream_id=%q} %d`+"\n", s.StreamID, s.CurrentSize)
+	fmt.Fprintln(w)
+
+	fmt.Fprintln(w, "# HELP sluice_apply_batch_size_p95_seconds Rolling p95 batch-apply latency, in seconds, over the AIMD controller's sliding window.")
+	fmt.Fprintln(w, "# TYPE sluice_apply_batch_size_p95_seconds gauge")
+	fmt.Fprintf(w, `sluice_apply_batch_size_p95_seconds{stream_id=%q} %s`+"\n", s.StreamID, formatPrometheusSeconds(s.P95))
+	fmt.Fprintln(w)
+
+	fmt.Fprintln(w, "# HELP sluice_apply_batch_size_decreases_total Number of multiplicative-decrease events the AIMD controller has fired on this stream.")
+	fmt.Fprintln(w, "# TYPE sluice_apply_batch_size_decreases_total counter")
+	fmt.Fprintf(w, `sluice_apply_batch_size_decreases_total{stream_id=%q} %d`+"\n", s.StreamID, s.DecreasesTotal)
+	fmt.Fprintln(w)
+
+	fmt.Fprintln(w, "# HELP sluice_apply_batch_size_cooloff 1 when the AIMD controller is currently in cool-off (suppressing AI), 0 otherwise.")
+	fmt.Fprintln(w, "# TYPE sluice_apply_batch_size_cooloff gauge")
+	coolOff := 0
+	if s.InCoolOff {
+		coolOff = 1
+	}
+	fmt.Fprintf(w, `sluice_apply_batch_size_cooloff{stream_id=%q} %d`+"\n", s.StreamID, coolOff)
+}
+
+// formatPrometheusSeconds renders a duration as a Prometheus gauge
+// value — fixed-point seconds with millisecond resolution (the
+// controller's p95 lives in the milliseconds-to-tens-of-seconds
+// range; sub-millisecond resolution is noise). The output is
+// dot-separated so operators can drop it straight into a Grafana
+// panel.
+func formatPrometheusSeconds(d time.Duration) string {
+	ms := d.Milliseconds()
+	secs := ms / 1000
+	frac := ms % 1000
+	return fmt.Sprintf("%d.%03d", secs, frac)
 }
 
 // quoteForPrometheusLabelValue escapes a string for use as a

@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -475,7 +476,11 @@ type SyncStartCmd struct {
 
 	Yes bool `help:"Skip the destructive-action confirmation prompt for --reset-target-data." short:"y"`
 
-	ApplyBatchSize int `help:"Batch up to N CDC changes per target transaction. Default 1 (one change per tx, conservative). Production tuning: 100-500 typically gives 50-100x throughput on bulk CDC traffic. Schema-change events (TRUNCATE) flush the in-progress batch; the cap is an upper bound on batch size, not a target. Idempotent applier semantics (ADR-0010) keep replay-on-crash safe; ADR-0017 covers the full design." default:"1" placeholder:"N"`
+	ApplyBatchSize string `help:"Batch up to N CDC changes per target transaction, OR 'auto' to use the engine-default ceiling (1000 mysql/postgres, 100 planetscale). Default '1' (one change per tx, conservative — ADR-0017). When N > 1, ADR-0052's AIMD apply-batch-size controller is engaged by default with N as the upper cap; pass --no-auto-tune to disable the controller and keep N strictly static. The controller's floor is 1 (ADR-0017 conservative-default). Schema-change events (TRUNCATE) flush the in-progress batch; idempotent applier semantics (ADR-0010) keep replay-on-crash safe." default:"1" placeholder:"N|auto"`
+
+	NoAutoTune bool `help:"Disable the ADR-0052 AIMD apply-batch-size controller. With this flag set, --apply-batch-size=N becomes a strictly static row-cap (the pre-v0.72.0 behaviour). Useful on workloads where the operator has hand-tuned the batch size for a specific shape and wants no auto-adaptation."`
+
+	ApplyTuneTargetLatency time.Duration `help:"Override the AIMD controller's p95 target latency (ADR-0052 DP-2). Engine-default when zero: 5s for planetscale (Vitess 20s tx-killer + 4x headroom), 10s for mysql/postgres. Only consulted when the controller is active (default; opt-out via --no-auto-tune)." placeholder:"DUR"`
 
 	MaxBufferBytes int64 `help:"Soft cap on per-batch buffered memory in the CDC applier (and, on the cold-start branch, the bulk-copy writer). The applier commits the in-flight target tx when accumulated row-value bytes reach the cap regardless of row count, so wide-row streams (TEXT/BYTEA/JSON at MB scale) don't blow out heap. A single change larger than the cap still applies (soft target). Default 67108864 (64 MiB). See ADR-0028." default:"67108864" placeholder:"N"`
 
@@ -522,6 +527,41 @@ const (
 	retryBackoffCapLo  = 1 * time.Second
 	retryBackoffCapHi  = 300 * time.Second
 )
+
+// resolveApplyBatchSize resolves the --apply-batch-size flag value
+// (string form: a non-negative integer OR the sentinel "auto") to a
+// pipeline.Streamer.ApplyBatchSize int. The "auto" sentinel maps to
+// the engine-default ceiling per ADR-0052 (planetscale=100,
+// mysql/postgres=1000). The numeric form is parsed verbatim. Returns
+// a clear error on unparseable input so the operator gets a precise
+// error rather than a kong parse-error generic.
+func resolveApplyBatchSize(raw string, target ir.Engine) (int, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return 1, nil
+	}
+	if strings.EqualFold(trimmed, "auto") {
+		// ADR-0052 DP-1 engine-default ceiling.
+		name := ""
+		if target != nil {
+			name = target.Name()
+		}
+		switch name {
+		case "planetscale":
+			return 100, nil
+		default:
+			return 1000, nil
+		}
+	}
+	n, err := strconv.Atoi(trimmed)
+	if err != nil {
+		return 0, fmt.Errorf("expected a non-negative integer or 'auto'; got %q", raw)
+	}
+	if n < 0 {
+		return 0, fmt.Errorf("expected a non-negative integer or 'auto'; got %d", n)
+	}
+	return n, nil
+}
 
 // validateRetryFlags enforces the ADR-0038 pin-down-3 ranges on the
 // three --apply-retry-* dials. Returns a precise error naming the
@@ -632,6 +672,13 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 		defer func() { _ = manifestStoreCloser() }()
 	}
 
+	// ADR-0052: parse --apply-batch-size (string of "auto" or numeric).
+	// AutoTune defaults to true; --no-auto-tune flips it off.
+	applyBatchSize, err := resolveApplyBatchSize(s.ApplyBatchSize, target)
+	if err != nil {
+		return fmt.Errorf("--apply-batch-size: %w", err)
+	}
+
 	streamer := &pipeline.Streamer{
 		Source:                    source,
 		Target:                    target,
@@ -648,7 +695,9 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 		ForceColdStart:            s.ForceColdStart,
 		ResetTargetData:           s.ResetTargetData,
 		SchemaAlreadyApplied:      s.SchemaAlreadyApplied,
-		ApplyBatchSize:            s.ApplyBatchSize,
+		ApplyBatchSize:            applyBatchSize,
+		AutoTune:                  !s.NoAutoTune,
+		ApplyTuneTargetLatency:    s.ApplyTuneTargetLatency,
 		MaxBufferBytes:            s.MaxBufferBytes,
 		ApplyExecTimeout:          s.ApplyExecTimeout,
 		ApplyRetryAttempts:        s.ApplyRetryAttempts,

@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/orware/sluice/internal/appliercontrol"
 	"github.com/orware/sluice/internal/config"
 	"github.com/orware/sluice/internal/ir"
 	"github.com/orware/sluice/internal/redact"
@@ -340,6 +341,29 @@ type Streamer struct {
 	// enough for a legitimately slow batch upsert but short enough
 	// to bound the silent-stall window (GitHub issue #23).
 	ApplyExecTimeout time.Duration
+
+	// AutoTune controls whether the AIMD apply-batch-size controller
+	// (ADR-0052) is engaged for this stream. Per ADR-0052 DP-1 the
+	// default is "on" — operators pass `--no-auto-tune` to opt out.
+	// The CLI's [sluice sync start] command resolves the flag to this
+	// field; the default at the streamer level is also true so any
+	// programmatic caller that doesn't set it gets the opted-in shape.
+	//
+	// When true and [ApplyBatchSize] > 1 and the target applier
+	// implements both [ir.BatchSizeProviderSetter] and
+	// [ir.BatchObserverSetter], the streamer constructs an
+	// [appliercontrol.Controller] with engine-default ceiling /
+	// target-latency defaults and threads it onto the applier. When
+	// false, the static [ApplyBatchSize] cap is used (the pre-v0.72.0
+	// behaviour).
+	AutoTune bool
+
+	// ApplyTuneTargetLatency is the operator-supplied p95 target the
+	// AIMD controller drives AI/MD around (ADR-0052 DP-2). Zero falls
+	// back to the engine-default — planetscale=5s, mysql=10s,
+	// postgres=10s — per the resolveAIMDTargetLatency helper. Only
+	// consulted when AutoTune is true.
+	ApplyTuneTargetLatency time.Duration
 
 	// Redactor is the operator-configured PII redaction policy.
 	// PII Phase 1 (roadmap item 15a; GitHub issue #24). Same shape
@@ -812,6 +836,18 @@ func (s *Streamer) runOnce(ctx context.Context) error {
 	// practice resolveStreamID always returns a non-empty value.
 	applyStreamID(applier, streamID)
 
+	// ---- 1.5. Optional AIMD apply-batch-size controller (ADR-0052) ----
+	// When --auto-tune is on (the default) AND --apply-batch-size > 1
+	// AND the applier exposes both BatchSizeProviderSetter +
+	// BatchObserverSetter, construct a controller and wire it onto
+	// the applier. The static ApplyBatchSize becomes a CAP the
+	// controller can never exceed; the floor is 1 (ADR-0017
+	// conservative-default). Off paths (--no-auto-tune, ApplyBatchSize
+	// <= 1, engine without setters) preserve the pre-ADR-0052
+	// static-cap behaviour bit-for-bit — zero overhead on the
+	// opt-out path.
+	aimdController := s.maybeAttachAIMDController(ctx, applier, streamID)
+
 	// ---- 1a. Optional Prometheus metrics endpoint ----
 	// When --metrics-listen is set, a small HTTP server runs alongside
 	// the stream exposing a Prometheus-format /metrics surface.
@@ -825,6 +861,9 @@ func (s *Streamer) runOnce(ctx context.Context) error {
 		metricsSrv, mErr := NewMetricsServer(s.MetricsListen, applier)
 		if mErr != nil {
 			return wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: prepare metrics server: %w", mErr))
+		}
+		if aimdController != nil {
+			metricsSrv.AttachAIMDController(aimdController)
 		}
 		if mErr := metricsSrv.Start(); mErr != nil {
 			return wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: start metrics server: %w", mErr))
@@ -1276,6 +1315,99 @@ func (s *Streamer) dispatchApply(ctx context.Context, applier ir.ChangeApplier, 
 		)
 	}
 	return applier.Apply(ctx, streamID, changes)
+}
+
+// maybeAttachAIMDController constructs an AIMD apply-batch-size
+// controller (ADR-0052) and threads it onto the applier when:
+//
+//   - AutoTune is true (the v0.72.0 default; --no-auto-tune sets it
+//     to false).
+//   - ApplyBatchSize > 1 (the static-cap value; the controller
+//     never exceeds this cap).
+//   - The applier exposes both [ir.BatchSizeProviderSetter] and
+//     [ir.BatchObserverSetter] (both shipping engines do after
+//     ADR-0052).
+//
+// Returns the constructed controller for the metrics server to
+// snapshot via AttachAIMDController, or nil when any of the above
+// preconditions fails (the static --apply-batch-size cap remains
+// the only flush trigger).
+//
+// Engines without the setters silently skip — the AIMD WARN is
+// logged at DEBUG (not INFO) so a custom test stub doesn't drown
+// out the operator-facing log surface; production engines all
+// implement the setters by construction.
+func (s *Streamer) maybeAttachAIMDController(ctx context.Context, applier ir.ChangeApplier, streamID string) *appliercontrol.Controller {
+	if !s.AutoTune || s.ApplyBatchSize <= 1 {
+		return nil
+	}
+	provSetter, hasProv := applier.(ir.BatchSizeProviderSetter)
+	obsSetter, hasObs := applier.(ir.BatchObserverSetter)
+	if !hasProv || !hasObs {
+		slog.DebugContext(
+			ctx, "applier: AIMD controller skipped — engine lacks BatchSizeProviderSetter or BatchObserverSetter",
+			slog.String("stream_id", streamID),
+		)
+		return nil
+	}
+
+	target := s.ApplyTuneTargetLatency
+	if target <= 0 {
+		target = resolveAIMDTargetLatency(s.engineNameForAIMD())
+	}
+
+	cfg := appliercontrol.Config{
+		StreamID:      streamID,
+		EngineName:    s.engineNameForAIMD(),
+		Floor:         1,
+		Ceiling:       s.ApplyBatchSize,
+		InitialSize:   s.ApplyBatchSize,
+		TargetLatency: target,
+	}
+	ctrl, err := appliercontrol.New(cfg)
+	if err != nil {
+		slog.WarnContext(
+			ctx, "applier: failed to construct AIMD controller; falling back to static apply-batch-size cap",
+			slog.String("stream_id", streamID),
+			slog.String("err", err.Error()),
+		)
+		return nil
+	}
+
+	provSetter.SetBatchSizeProvider(ctrl)
+	obsSetter.SetBatchObserver(ctrl)
+	slog.InfoContext(
+		ctx, "applier: AIMD apply-batch-size controller engaged",
+		slog.String("stream_id", streamID),
+		slog.String("engine", cfg.EngineName),
+		slog.Int("ceiling", cfg.Ceiling),
+		slog.Duration("target_latency", cfg.TargetLatency),
+	)
+	return ctrl
+}
+
+// engineNameForAIMD returns the canonical engine name used for the
+// AIMD controller's defaults lookup. Falls back to an empty string
+// when the target engine is unset (test fixtures); resolveAIMDTargetLatency
+// treats empty as "use the cross-engine default."
+func (s *Streamer) engineNameForAIMD() string {
+	if s.Target == nil {
+		return ""
+	}
+	return s.Target.Name()
+}
+
+// resolveAIMDTargetLatency returns the engine-default p95 target
+// latency per ADR-0052 DP-2:
+//
+//   - planetscale: 5s (Vitess 20s tx-killer + 4x headroom)
+//   - mysql / postgres / any other named engine: 10s
+//   - empty (unknown target — typically a test stub): 10s
+func resolveAIMDTargetLatency(engineName string) time.Duration {
+	if engineName == "planetscale" {
+		return 5 * time.Second
+	}
+	return 10 * time.Second
 }
 
 // seedLiveAddedFilter performs a one-shot read of the per-target
