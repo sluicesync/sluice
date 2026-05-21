@@ -134,70 +134,52 @@ import (
 //
 //nolint:gocognit // Sequential phase-by-phase integration test reads
 func TestStreamer_MySQLToPostgres_SchemaHistoryWarmResumeAcrossDDL(t *testing.T) {
-	// HISTORICAL NOTE — task #28's MDL-deadlock root cause was fixed
-	// by task #34 (internal/engines/mysql/cdc_snapshot.go now wires
-	// ReleaseRowsFn to commit the snapshot tx + close the import-side
-	// conn+pool once bulk-copy completes; mirrors PG's Bug 21 shape).
-	// The ALTER at Phase 5 — which previously deadlocked for ~117s
-	// behind MDL_SHARED_READ dur=TRANSACTION held by the snapshot tx
-	// — now completes promptly. Verified end-to-end by the engine-
-	// level pin TestSnapshotStream_ReleaseRowsClosesSnapshotTx in
-	// internal/engines/mysql/cdc_snapshot_integration_test.go.
+	// History (closed): task #28 deferred this pin with a t.Skip
+	// because Phase 5's ALTER deadlocked behind MDL_SHARED_READ
+	// held by sluice's snapshot tx for the streamer's lifetime
+	// (~117s timeouts). Task #34 fixed that: MySQL engine now wires
+	// SnapshotStream.ReleaseRowsFn (mirrors PG's Bug 21 shape) so
+	// the snapshot tx commits + releases its MDL at COPY_COMPLETED,
+	// not Run-unwind. Engine-of-truth pin:
+	// TestSnapshotStream_ReleaseRowsClosesSnapshotTx (MySQL).
 	//
-	// task #35 — Phase A on PR #45 (CI run 26194652692, job
-	// 77071179523) confirmed the Phase 7 R3-never-lands failure with
-	// the slog tail:
+	// Task #35 PR #45 (CI run 26194652692) un-skipped this pin to
+	// capture the next failure shape; ground truth was PG SQLSTATE
+	// 42703 "column nickname of relation users does not exist" at
+	// R3's INSERT. The original test's assertions (b)+(d) presumed
+	// a feature sluice doesn't have: live cross-engine DDL apply.
+	// ADR-0049 Chunks B1/B3/C record the post-ALTER source IR into
+	// the target's sluice_cdc_schema_history (the warm-resume cache
+	// substrate) but DO NOT issue ALTER on the target. PG's
+	// loadColumnTypes therefore sees the unaltered users(id, email)
+	// and PG rejects the source row's nickname value with 42703.
 	//
-	//   streamer1.Run returned err = pipeline: apply changes:
-	//     postgres: applier: insert into public.users:
-	//     ERROR: column "nickname" of relation "users" does not exist
-	//     (SQLSTATE 42703)
+	// PATH (b) — taken in this commit: rewrite to the realistic
+	// operator pattern. Real deploys are coordinated: operator
+	// ALTERs source + target in lockstep (e.g. via a deploy script
+	// that runs both DDLs before turning sluice loose on the
+	// post-deploy schema). The test now does the same: Phase 5
+	// ALTERs MySQL source AND PG target with matching column adds.
+	// CDC then catches up post-DDL rows correctly without sluice
+	// needing to propagate DDL itself. The four ADR-0049 invariants
+	// (a)–(d) become testable end-to-end:
+	//   (a) sluice_cdc_schema_history row written same-tx as the
+	//       position write at Chunk B1's deferred-emit boundary,
+	//   (b) applier's active-version cache holds the post-ALTER
+	//       IR after warm-resume (proven by R4.nickname populating),
+	//   (c) warm-resume does NOT fall through to cold-start across
+	//       the DDL boundary,
+	//   (d) post-resume CDC keeps working with the post-DDL schema.
 	//
-	// Root cause (structural, not a regression): the live cross-engine
-	// streamer has no DDL-propagation path. ADR-0049 Chunks B1/B3/C
-	// record the post-ALTER source IR into the target's
-	// sluice_cdc_schema_history (Phase 9 assertion still passes — see
-	// below) and prime the applier's active-version cache on warm-
-	// resume, but they do NOT issue the ALTER on the PG target. The
-	// PG applier reads target column types via
-	// information_schema.columns (change_applier.go:loadColumnTypes);
-	// for users that returns (id, email) only because the target was
-	// never altered to add nickname. buildInsertSQL then iterates over
-	// all keys in the source row {id, email, nickname} and emits
-	// `INSERT INTO public.users (id, email, nickname) VALUES (...)`.
-	// PG returns 42703 → classifyApplierError doesn't mark it
-	// retriable → runOnce returns the wrapped error → the goroutine
-	// exits and R3 never lands.
-	//
-	// Assertions (b)+(d) — "the nickname column ends up populated on
-	// the target with the right value" — were aspirational for the
-	// time this test was authored: they require a feature (live
-	// cross-engine DDL apply on the target) that exists ONLY on the
-	// chain-restore broker path (manifest-based SchemaDelta →
-	// SchemaWriter.AlterAddColumn on the target). The live streamer
-	// dispatches ir.SchemaSnapshot to the applier as a *history-write*
-	// only (change_applier.go:writeSchemaVersion).
-	//
-	// The remaining ADR-0049 invariants this test was meant to pin —
-	// (a) schema-history row written same-tx as the position write,
-	// and (c) warm-resume does NOT fall through to cold-start — are
-	// independent of target DDL apply and would pass if the test were
-	// rewritten to apply the ALTER on the target alongside the source
-	// (the realistic operator pattern today). That rewrite is the
-	// follow-up task; this test stays t.Skip'd until the live
-	// cross-engine DDL apply feature lands OR the test is restructured
-	// to coordinate target DDL.
-	//
-	// See task-#35 PR #45 for the Phase A instrumentation that
-	// captured the 42703 ground truth and the full investigation log.
-	t.Skip("task #35: live cross-engine DDL apply is a missing feature, " +
-		"not a regression — Phase 7 R3 INSERT hits PG SQLSTATE 42703 " +
-		"because the target was never altered to add the nickname column " +
-		"(ADR-0049 records source-side history; it does not apply DDL on " +
-		"the target). See test docstring + PR #45 for the Phase A " +
-		"ground-truth investigation. Un-skip once either (a) a live " +
-		"cross-engine DDL apply path lands, or (b) the test is rewritten " +
-		"to apply the ALTER on both source and target.")
+	// PATH (a) — feature work for a future cycle: build live cross-
+	// engine DDL apply in the streamer. The mechanism exists today
+	// on the chain-restore broker path (manifest-based SchemaDelta →
+	// SchemaWriter.AlterAddColumn on the target); wiring it into
+	// the live streamer's ir.SchemaSnapshot dispatch would remove
+	// the operator's coordinated-deploy burden. Until that lands,
+	// this test pins what sluice DOES do today (record schema
+	// history, prime warm-resume cache, apply post-DDL rows to a
+	// schema the operator has already migrated).
 
 	mysqlSourceDSN, _, mysqlCleanup := startMySQLBinlog(t)
 	defer mysqlCleanup()
@@ -249,12 +231,23 @@ func TestStreamer_MySQLToPostgres_SchemaHistoryWarmResumeAcrossDDL(t *testing.T)
 		t.Fatalf("phase 4: CDC never delivered R2 (steady-state pre-DDL must work)")
 	}
 
-	// ---- Phase 5: ALTER TABLE ADD COLUMN nickname ----
-	// Emits an ir.SchemaSnapshot via Chunk B1 once the next ROW event
-	// for users hits maybeSnapshotSchemaB1 (deferred-emit pattern;
-	// the anchor is the ALTER's GTID frozen at clear time per #4c).
+	// ---- Phase 5: ALTER TABLE ADD COLUMN nickname (coordinated) ----
+	// Operator-coordinated deploy pattern: ALTER source AND target in
+	// lockstep. The source-side ALTER emits an ir.SchemaSnapshot via
+	// Chunk B1's deferred-emit on the next ROW event (the anchor is
+	// the ALTER's GTID frozen at clear time per locked decision #4c).
+	// The target-side ALTER ensures PG's `users` has the nickname
+	// column when R3's CDC INSERT lands; without it, the applier
+	// would emit `INSERT (id, email, nickname) ...` (buildInsertSQL
+	// iterates source row keys) and PG would return SQLSTATE 42703.
+	// Sluice does NOT propagate DDL on the live CDC path today; this
+	// coordination is the operator's responsibility (the test mirrors
+	// what a real deploy script does). See the docstring above for
+	// why this is the right pattern given today's design.
 	applyMySQLDDL(t, mysqlSourceDSN,
 		"ALTER TABLE users ADD COLUMN nickname VARCHAR(64), ALGORITHM=INSTANT;")
+	applyPGDDL(t, pgTargetDSN,
+		"ALTER TABLE users ADD COLUMN nickname VARCHAR(64)")
 
 	// ---- Phase 6: INSERT R3 carrying the new column ----
 	// The first post-DDL ROW triggers maybeSnapshotSchemaB1 → writes
