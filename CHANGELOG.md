@@ -4,6 +4,21 @@ All notable changes to sluice are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Features
+
+- **ADR-0054 Shape A Phase 2 — live cross-shard DDL coordination.** Lifts ADR-0048 DP-3's "drained model for v1" restriction. When Shape A (`--inject-shard-column`) is engaged and `--no-coordinate-live-ddl` is absent (the new default), observed source DDL boundaries route through a per-target lease (`sluice_shard_consolidation_lease`, additive control table next to `sluice_cdc_state`): the first shard to notice acquires the lease, applies the IR-delta-derived shape change to the consolidated target, records the applied schema version + DDL checksum; peer shards observe the recorded state and skip the apply, continuing CDC without a drain. Resolves the operationally-heavy drain-window-proportional-to-slowest-shard hazard the v0.72.x drained model carries on N-shard fleets.
+  - **DP-A (lease semantics):** Hybrid TTL + heartbeat-extend (Kubernetes leader-election shape). Defaults `--shard-coordination-lease-duration=30s`, `--shard-coordination-renew-deadline=20s`, `--shard-coordination-retry-period=10s` (operator-tunable for unusual ALTER patterns, e.g. tables >100GB).
+  - **DP-B (DDL idempotence):** Recorded-version + DDL-text-checksum on normalized DDL text (whitespace collapse + reserved-keyword lowercase, mirroring ADR-0049's `SchemaSignature.Equal`). Mismatch across shards refuses loudly with both checksums + drained-model recovery commands.
+  - **DP-C (crash recovery):** Probe-and-record on lease takeover. The takeover stream probes the target schema for the prior holder's recorded shape; Applied → record only, NotApplied → re-apply, Inconsistent → refuse loudly. Uniform across PG (transactional DDL) and MySQL (non-transactional DDL).
+  - **DP-D (engagement):** Always-on with `--no-coordinate-live-ddl` opt-out (operators on the v0.72.x drained model pass the flag to preserve pre-ADR-0054 semantics). Behaviour-change-by-default consistent with the ADR-0052 AIMD opt-out pattern.
+  - **DP-E (DDL apply derivation; added 2026-05-22):** Recognized-shape catalog via IR-delta classifier. The lease-holder classifies the delta between the pre-DDL and post-DDL `SchemaSnapshot` IR tables into a finite catalog (ADD COLUMN, DROP COLUMN, CREATE INDEX, DROP INDEX, ALTER COLUMN type/nullability); unrecognized shapes (multi-shape combos, RENAME, CHECK constraints, generated-column changes) refuse loudly with the drained-model recovery hint. Preserves DP-B's "no allow-list, no parser" intent — the classifier compares `*ir.Table` structs, not SQL text, and the shapes are sluice's own structural categories.
+
+### Compatibility
+
+- Operators upgrading from v0.72.x with hand-coordinated drained-model Shape A workflows will see different behavior on next `sluice sync start` unless they add `--no-coordinate-live-ddl`. The flag preserves the pre-ADR-0054 drained semantics exactly. Non-Shape-A streams (`--inject-shard-column` unset) see no observable change.
+
 ## [0.72.2]
 
 **Closes the known follow-up from v0.72.1: MySQL Shape A with `AUTO_INCREMENT` in the source PK now works (Bug 82).** ADR-0048's PK rewrite places the discriminator first, demoting the source's `AUTO_INCREMENT` column from its leading position. MySQL's structural rule "every `AUTO_INCREMENT` column must be a leading key column" then rejected the CREATE TABLE with `Error 1075`. v0.72.0 + v0.72.1 shipped Shape A with this case broken — workaround was "use a non-AUTO_INCREMENT PK on the source or migrate to PG." v0.72.2 closes it: when the rewritten PK contains an `AUTO_INCREMENT` column that doesn't lead, the MySQL DDL emitter now synthesizes a `UNIQUE KEY uq_<table>_<col> (<col>)` inline in the CREATE TABLE, satisfying MySQL's rule via a secondary unique index. The DP-2 leading-shard invariant (discriminator first) is preserved — operators retain source-side identity management — and the synthesis is scoped to the in-PK-but-not-leading case so the existing v0.49.0 / GitHub #25 no-supporting-index loud-error path stays unchanged.
