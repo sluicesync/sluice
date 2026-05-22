@@ -6,6 +6,8 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.73.0] - 2026-05-22
+
 ### Features
 
 - **ADR-0054 Shape A Phase 2 — live cross-shard DDL coordination.** Lifts ADR-0048 DP-3's "drained model for v1" restriction. When Shape A (`--inject-shard-column`) is engaged and `--no-coordinate-live-ddl` is absent (the new default), observed source DDL boundaries route through a per-target lease (`sluice_shard_consolidation_lease`, additive control table next to `sluice_cdc_state`): the first shard to notice acquires the lease, applies the IR-delta-derived shape change to the consolidated target, records the applied schema version + DDL checksum; peer shards observe the recorded state and skip the apply, continuing CDC without a drain. Resolves the operationally-heavy drain-window-proportional-to-slowest-shard hazard the v0.72.x drained model carries on N-shard fleets.
