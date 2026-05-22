@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/orware/sluice/internal/config"
 	"github.com/orware/sluice/internal/pipeline"
@@ -62,6 +63,20 @@ type SchemaAddTableCmd struct {
 
 	TargetSchema string `help:"Per-source target schema namespace (Postgres-only). Must match the active stream's --target-schema, or be omitted to inherit the recorded value (Bug 46 / ADR-0031). When the active stream was started with --target-schema=NAME, the new table lands in NAME (rather than 'public') so CDC events the active stream's applier routes to NAME.<table> arrive at a real table. Mismatch (operator-supplied flag differs from recorded) refuses loudly. MySQL operators use a different --target DSN database instead." placeholder:"NAME"`
 
+	// ADR-0048 Shape A defensive refusal. Per DP-3, cross-shard
+	// schema migration (including add-table mid-stream) is Phase 2;
+	// v1 is the drained model. This flag exists so an operator on
+	// a Shape A stream who tries `schema add-table` gets a loud
+	// operator-actionable refusal instead of running the Phase 1
+	// add-table path against a discriminator-aware target — which
+	// would either silently drop the discriminator on new rows or
+	// crash via Bug-80-shape regression on the read path. Defensive,
+	// not exhaustive: forgetful operators who DON'T pass the flag
+	// will still hit the underlying breakage. Persisting Shape A
+	// state in sluice_cdc_state for automatic detection is the
+	// follow-up. Task #8 / catalog backlog.
+	InjectShardColumn string `help:"Re-pass the Shape A discriminator column NAME=VALUE if this stream was started with --inject-shard-column on 'sync start'. Currently refuses loudly: Shape A add-table mid-stream is Phase 2 per ADR-0048 DP-3 — use the drained model: 'sync stop --wait' -> schema migrate (including add-table) -> 'sync start --resume'." placeholder:"NAME=VALUE"`
+
 	DryRun bool `help:"Print the plan (which table, source publication update, target DDL summary) without modifying the source publication, target schema, or capturing a snapshot." short:"n"`
 	Yes    bool `help:"Skip the typed-confirmation prompt." short:"y"`
 }
@@ -87,6 +102,25 @@ func (s *SchemaAddTableCmd) Run(g *Globals) error {
 	}
 	if s.StreamID == "" {
 		return errors.New("--stream-id is required")
+	}
+
+	// ADR-0048 Shape A defensive refusal (task #8). add-table
+	// mid-stream on a Shape A stream is Phase 2 per DP-3; the v1
+	// path is the drained model. Refuse loudly with operator-
+	// actionable recovery hint when the operator re-passes the
+	// shard-column flag.
+	if strings.TrimSpace(s.InjectShardColumn) != "" {
+		return fmt.Errorf(
+			"add-table mid-stream on a Shape A stream is not supported in v1 — " +
+				"ADR-0048 DP-3 resolved cross-shard schema migration to the drained " +
+				"model (Phase 2 / live add-table is deferred). Recovery: stop the " +
+				"sharded streams via 'sluice sync stop --wait --stream-id <id>' on " +
+				"each shard; on the source side, evolve the table set as needed; " +
+				"resume each shard via 'sluice sync start --resume --inject-shard-column " +
+				"NAME=VALUE --stream-id <id>'. See ADR-0048 §4 'Cross-shard schema-" +
+				"migration coordination' for the design rationale and the Phase 2 " +
+				"surface that would lift this restriction",
+		)
 	}
 
 	mappings, err := resolveMappings(s.TypeOverride, cfg)
