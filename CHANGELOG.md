@@ -6,6 +6,22 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.73.1] - 2026-05-22
+
+### Fixed
+
+- **`fix(adr-0054): Bug 83 — Phase 2 intercept cold-start seed`** — The ADR-0054 Shape A Phase 2 live coordination intercept's table cache started empty at CDC startup and treated the first CDC SchemaSnapshot per table as the cold-start anchor. Because the cold-start phase does not emit SchemaSnapshot through the same channel (only CDC readers do), the first SchemaSnapshot reflected the source's CURRENT schema — which, if source DDL had occurred between cold-start completion and the first CDC row event, was the POST-DDL schema. The intercept cached the post-DDL schema as the cold-start anchor and never routed the boundary; the next CDC row event then crashed the applier with column-does-not-exist. v0.73.1 captures the pre-Shape-A-rewrite source IR per filtered table at cold-start completion and feeds it to the intercept as a synthetic SchemaSnapshot seed, restoring the correct (pre, post) boundary classification on the first real CDC SchemaSnapshot. Closes Bug 83 (cycle session report: orware/sluice-testing v0.73.0.md).
+
+### Tests
+
+- **`test(pipeline): shard_consolidation_bug83_{pg,mysql}_integration_test.go`** — end-to-end pin reproducing the Bug 83 failure path (cold-start + source DDL + first CDC row event) against real PG and MySQL containers. The lease state machine must transition to APPLIED and the post-DDL row must replicate. The "Validate end-to-end before building more" tenet was violated by the consumer-side-only integration tests that shipped in v0.73.0; this pin closes the gap.
+
+- **`test(pipeline): shard_consolidation_intercept_test.go`** — new unit tests for the seed parameter: seed-then-CDC-snapshot routes; seed-only no-CDC doesn't route; seed multi-table dispatch.
+
+### Compatibility
+
+- **Drop-in upgrade from v0.73.0.** No CLI surface change. Operators who applied the v0.73.0 correction-banner workaround (`--no-coordinate-live-ddl` mandatory) can remove the flag after upgrading.
+
 ## [0.73.0] - 2026-05-22
 
 ### Features

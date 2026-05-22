@@ -13,12 +13,14 @@ package pipeline
 // through a [BoundaryRouter] before forwarding it to the applier:
 //
 //   1. The intercept maintains a per-table latest-IR cache (the "pre"
-//      schema for the next boundary's classifier input). Cold-start
-//      seeds the cache with the table's first SchemaSnapshot (no
-//      DDL — that's the bulk-copy schema); from then on each
-//      subsequent SchemaSnapshot computes shape via (cached → snap.IR).
-//   2. For each non-first SchemaSnapshot, the intercept calls
-//      [BoundaryRouter.RouteBoundary] with the (pre, post) pair.
+//      schema for the next boundary's classifier input). The cache is
+//      pre-seeded at cold-start completion with the pre-Shape-A-rewrite
+//      source IR per filtered table (Bug 83 fix — see below); from then
+//      on each SchemaSnapshot computes shape via (cached → snap.IR).
+//   2. For each SchemaSnapshot whose table already has a cache entry
+//      (either from the cold-start seed or a prior in-stream snapshot),
+//      the intercept calls [BoundaryRouter.RouteBoundary] with the
+//      (pre, post) pair.
 //   3. On success the snapshot's IR replaces the cache entry, and the
 //      SchemaSnapshot continues to the applier so the ADR-0049
 //      schema-history write still records the version downstream.
@@ -26,8 +28,27 @@ package pipeline
 //      mismatch) the intercept closes the out-channel and stores the
 //      error for the streamer to surface via runOnce's standard
 //      dispatchErr classification.
+//   5. If a CDC SchemaSnapshot arrives for a table that wasn't in the
+//      cold-start seed (a NEW table appearing live), the intercept
+//      treats the first such snapshot as the cache anchor (no
+//      RouteBoundary call) and forwards it. This preserves the
+//      pre-Bug-83 first-seen behaviour for the live-add-table path
+//      while the Bug 83 fix governs the cold-start-tracked tables.
 //
-// The intercept is opt-in: nil router → pass-through.
+// Bug 83 (v0.73.0 hotfix): the previous "first SchemaSnapshot == cold-
+// start anchor" rule was incorrect because the cold-start phase does
+// not emit ir.SchemaSnapshot through this channel — only CDC readers
+// do. If source DDL occurred between cold-start completion and the
+// first CDC row event, the first snapshot reflected the POST-DDL
+// source schema; caching it as the anchor meant the boundary never
+// routed and the next row crashed the applier with column-does-not-
+// exist. The cold-start seed pre-populates the cache with the pre-
+// Shape-A-rewrite source IR (matching what CDC will later emit
+// shape-wise — CDC emits SOURCE schema, which does not contain the
+// discriminator column).
+//
+// The intercept is opt-in: nil router → pass-through (seed is
+// dropped).
 
 import (
 	"context"
@@ -42,13 +63,23 @@ import (
 
 // interceptSchemaSnapshotsForCoordination wraps changes with a
 // SchemaSnapshot intercept that drives the BoundaryRouter. nil router
-// is a no-op (returns in verbatim). The errStore is the streamer's
-// sourceErrFn-bound error sink; the intercept writes any
+// is a no-op (returns in verbatim; seed is dropped — no router means
+// no coordination means the seed is irrelevant). The errStore is the
+// streamer's sourceErrFn-bound error sink; the intercept writes any
 // RouteBoundary error there so the streamer's standard
 // surfaceSourceError() path picks it up.
+//
+// seed is the ADR-0054 Bug 83 cold-start cache seed — one synthetic
+// SchemaSnapshot per filtered table reflecting the pre-Shape-A-rewrite
+// source IR (built by the streamer's coldStart before
+// translate.InjectShardColumn runs). Seeds are NOT forwarded
+// downstream — the applier already knows the target schema from
+// cold-start's schema-apply phase, and forwarding a seed would write
+// a redundant ADR-0049 schema-history row.
 func interceptSchemaSnapshotsForCoordination(
 	ctx context.Context,
 	in <-chan ir.Change,
+	seed []ir.SchemaSnapshot,
 	router *BoundaryRouter,
 	errStore *atomic.Pointer[error],
 ) <-chan ir.Change {
@@ -58,6 +89,21 @@ func interceptSchemaSnapshotsForCoordination(
 	out := make(chan ir.Change)
 	cache := map[string]*ir.Table{}
 	version := map[string]int64{}
+	// Pre-populate the cache from the cold-start seed. This MUST happen
+	// before the for-select loop drains `in` so the first CDC
+	// SchemaSnapshot per seeded table is correctly classified as a
+	// post-DDL boundary (rather than treated as the cold-start anchor
+	// — the Bug 83 root cause).
+	for i := range seed {
+		snap := seed[i]
+		key := snap.QualifiedName()
+		cache[key] = snap.IR
+		version[key] = 1
+		slog.DebugContext(
+			ctx, "shard consolidation intercept: seeded from cold-start handoff",
+			"table", key,
+		)
+	}
 	go func() {
 		defer close(out)
 		for {
@@ -131,6 +177,40 @@ func interceptSchemaSnapshotsForCoordination(
 			}
 		}
 	}()
+	return out
+}
+
+// synthesizeColdStartSeedSnapshots builds the cold-start cache seed
+// for [interceptSchemaSnapshotsForCoordination]: one synthetic
+// SchemaSnapshot per table in `schema`, with the table's current IR
+// as the cached pre-state. Called by [Streamer.coldStart] BEFORE
+// [translate.InjectShardColumn] runs so the IR matches what CDC
+// readers will later emit (CDC emits the SOURCE's current schema,
+// which doesn't carry the discriminator column).
+//
+// The Position is left zero — the seed isn't anchored to a CDC
+// position and isn't forwarded downstream (the applier already knows
+// the target schema from cold-start's schema-apply phase). The
+// intercept consumes the seed purely to populate its per-table cache
+// so the first real CDC SchemaSnapshot is classified as a true
+// boundary (pre = seeded source IR, post = CDC snapshot IR).
+//
+// ADR-0054 Bug 83 fix (v0.73.1).
+func synthesizeColdStartSeedSnapshots(schema *ir.Schema) []ir.SchemaSnapshot {
+	if schema == nil {
+		return nil
+	}
+	out := make([]ir.SchemaSnapshot, 0, len(schema.Tables))
+	for _, tbl := range schema.Tables {
+		if tbl == nil {
+			continue
+		}
+		out = append(out, ir.SchemaSnapshot{
+			Schema: tbl.Schema,
+			Table:  tbl.Name,
+			IR:     tbl,
+		})
+	}
 	return out
 }
 

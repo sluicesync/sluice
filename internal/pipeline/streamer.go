@@ -556,6 +556,21 @@ type Streamer struct {
 	// streamer's runOnce surfaces the error via the standard
 	// dispatchErr classification path.
 	schemaSnapshotErr atomic.Pointer[error]
+
+	// coldStartSeedSnapshots is the ADR-0054 Bug 83 fix: synthetic
+	// SchemaSnapshots reflecting the pre-Shape-A-rewrite source IR
+	// per filtered table. Set by [coldStart] before
+	// [translate.InjectShardColumn] runs; consumed by
+	// [interceptSchemaSnapshotsForCoordination] to pre-populate its
+	// boundary cache so the first CDC SchemaSnapshot is correctly
+	// classified as a real boundary (not as the cold-start anchor).
+	// Nil when --inject-shard-column is unset, --no-coordinate-live-ddl
+	// is set, or the stream is warm-resuming (warm resume doesn't run
+	// cold-start; the intercept's cache is seeded by the resumed
+	// position's first observed SchemaSnapshot, which is fine because
+	// the applier's target schema is the same as when cold-start
+	// completed).
+	coldStartSeedSnapshots []ir.SchemaSnapshot
 }
 
 // Run executes a snapshot+CDC stream with optional retry on
@@ -1292,7 +1307,10 @@ func (s *Streamer) runOnce(ctx context.Context) error {
 	// applier + probe before forwarding to the downstream applier.
 	// Nil router (drained model / engine doesn't support coordination)
 	// makes the intercept a verbatim pass-through.
-	filtered = interceptSchemaSnapshotsForCoordination(applyCtx, filtered, s.boundaryRouter, &s.schemaSnapshotErr)
+	filtered = interceptSchemaSnapshotsForCoordination(applyCtx, filtered, s.coldStartSeedSnapshots, s.boundaryRouter, &s.schemaSnapshotErr)
+	// Clear the cold-start seed after handing it to the intercept so a
+	// streamer restart picks up a fresh seed in its next coldStart run.
+	s.coldStartSeedSnapshots = nil
 	dispatchErr := s.dispatchApply(applyCtx, applier, streamID, filtered)
 	// ADR-0054 Phase 2d: a SchemaSnapshot intercept error short-
 	// circuits the changes channel; the dispatchErr path sees a clean
@@ -1881,6 +1899,19 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 	if err != nil {
 		return nil, stop, fmt.Errorf("pipeline: apply expression overrides: %w", err)
 	}
+	// ADR-0054 Bug 83 fix — capture the pre-Shape-A-rewrite source IR
+	// per filtered table as the intercept's cold-start cache seed.
+	// Must run BEFORE InjectShardColumn so the seed IR matches what the
+	// CDC reader will later emit (CDC emits source schema; the source
+	// doesn't have the discriminator column — only the target does
+	// after Shape A rewrite). The intercept uses the seed to recognize
+	// the FIRST CDC SchemaSnapshot as a true boundary (rather than
+	// treating it as the cold-start anchor, which was the v0.73.0
+	// Bug 83 root cause).
+	if s.InjectShardColumn.Engaged() && s.CoordinateLiveDDL {
+		s.coldStartSeedSnapshots = synthesizeColdStartSeedSnapshots(schema)
+	}
+
 	// ADR-0048 Shape A discriminator-column injection. Runs after
 	// ApplyMappings / ApplyExpressionOverrides and BEFORE the
 	// target-side schema writer opens, so CREATE TABLE on the cold-
