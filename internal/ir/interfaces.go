@@ -404,6 +404,52 @@ type SchemaDeltaApplier interface {
 	AlterAddColumn(ctx context.Context, table *Table, cols []*Column) error
 }
 
+// ShapeDeltaApplier extends [SchemaDeltaApplier] with the additional
+// per-shape delta methods required by ADR-0054 Shape A Phase 2's
+// recognized-shape catalog (DP-E). Engines that implement live
+// cross-shard DDL coordination must implement this interface; the
+// lease-holder's apply path calls the matching method based on the
+// pipeline's IR-delta classifier.
+//
+// Idempotency: each method is idempotent on the post-state (calling
+// AlterDropColumn on a table whose column is already absent is a
+// no-op; calling CreateShapeIndex on an index that already exists is
+// a no-op). This lets the takeover-stream re-apply when the probe
+// says NotApplied without worrying about partial-state — the engine's
+// IF [NOT] EXISTS clauses handle the half-applied case.
+//
+// All methods are catalog-only DDL — they do NOT modify row data.
+type ShapeDeltaApplier interface {
+	SchemaDeltaApplier
+
+	// AlterDropColumn issues `ALTER TABLE <table> DROP COLUMN <name>`
+	// for each column in cols. Idempotent on columns that don't
+	// exist (engines use IF EXISTS where supported).
+	AlterDropColumn(ctx context.Context, table *Table, cols []*Column) error
+
+	// CreateShapeIndex issues `CREATE INDEX <name> ON <table> (...)`
+	// for each index in indexes. Idempotent on indexes that already
+	// exist (engines use IF NOT EXISTS).
+	CreateShapeIndex(ctx context.Context, table *Table, indexes []*Index) error
+
+	// DropShapeIndex issues `DROP INDEX <name>` for each index in
+	// indexes. Idempotent on indexes that don't exist (engines use
+	// IF EXISTS).
+	DropShapeIndex(ctx context.Context, table *Table, indexes []*Index) error
+
+	// AlterColumnType issues `ALTER TABLE <table> ALTER COLUMN <name>
+	// TYPE <new-type>` (PG) / `ALTER TABLE <table> MODIFY COLUMN
+	// <name> <new-type>` (MySQL). want carries the post-DDL column
+	// shape. Idempotent on columns already at the new type.
+	AlterColumnType(ctx context.Context, table *Table, want *Column) error
+
+	// AlterColumnNullability issues `ALTER TABLE <table> ALTER COLUMN
+	// <name> SET NOT NULL` / `DROP NOT NULL` (PG) or `MODIFY COLUMN
+	// <name> <type> [NOT] NULL` (MySQL). Idempotent on columns
+	// already at the desired nullability.
+	AlterColumnNullability(ctx context.Context, table *Table, want *Column) error
+}
+
 // SchemaTypeDropper is the optional surface a [RowWriter] (or
 // [SchemaWriter]) can implement to drop user-defined database-level
 // types created from the IR schema (e.g. Postgres `CREATE TYPE ...
