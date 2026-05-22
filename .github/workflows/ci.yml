@@ -204,33 +204,45 @@ jobs:
     # — when raising for self-hosted, set them together (e.g. 90 / 75m).
     timeout-minutes: ${{ fromJSON(vars.CI_INTEGRATION_JOB_TIMEOUT || '45') }}
     # Matrix-shard the integration suite by package + by test-name
-    # within the dominant internal/pipeline package (228 test
+    # within the dominant internal/pipeline package (228+ test
     # functions vs 18 mysql + 14 postgres files; `TestMigrate_` alone
-    # is 106 — 46% of pipeline). On the 4-runner self-hosted fleet
-    # the four shards run in parallel → wall time drops from ~39m
-    # monolithic to ~max(longest shard) ≈ 18–20m.
+    # is 106 — 46% of pipeline). On the self-hosted fleet (4 runners)
+    # the shards run in parallel → wall time drops dramatically from
+    # the pre-shard ~39m monolith.
     #
-    # `pipeline-migrate` and `pipeline-rest` exactly partition the
-    # pipeline package: `-run ^TestMigrate_` and `-skip ^TestMigrate_`
-    # are exact complements over the same regex (a test either
-    # matches the pattern or it doesn't), so the union covers every
-    # test the old single shard ran with zero overlap. Go 1.20+
-    # required for `-skip`; go.mod pins >= 1.26.
+    # v0.72.3 rebalance: the original `pipeline-rest` shard
+    # accumulated weight through v0.72.0–v0.72.2 (Shape A Bug 80/81/82
+    # e2e pins, AIMD streamer test, ADR-0046 backup-chain crash-
+    # injection matrix, ADR-0049 schema-history machinery, the corpus
+    # harness) and became the long pole at ~40–45m vs pipeline-migrate's
+    # ~18-20m. Splitting on the TestStreamer_ prefix (32 of the 92
+    # non-migrate test functions; heavier per-test because CDC streams
+    # are long-lived) gives a ~50/50 wall-time split. The 5-shard
+    # layout briefly queues on the 4-runner fleet but the wall-time
+    # win still nets positive (~30%).
+    #
+    # `pipeline-migrate` + `pipeline-rest-streamer` + `pipeline-rest-other`
+    # exactly partition the pipeline package: their -run/-skip regexes
+    # are mutually exclusive AND cover every test (a function either
+    # starts with TestMigrate_, starts with TestStreamer_, or neither).
+    # Zero overlap; zero gap. Go 1.20+ required for `-skip`; go.mod
+    # pins >= 1.26.
     #
     # `engines-postgres-and-rest` defensively bundles the small
     # non-pipeline / non-mysql-engine packages (ir, translate,
     # redact, crypto, config) so any future integration-tagged file
-    # outside pipeline/engines/mysql is still gated — without forcing
-    # a 5th shard the 4-runner fleet would need to queue.
+    # outside pipeline/engines/mysql is still gated.
     #
     # The rollup job below (`integration-summary`, name: Integration)
     # preserves the existing required-status-check name so branch
-    # protection on `main` does NOT need to be updated.
+    # protection on `main` does NOT need to be updated; `needs:
+    # integration` automatically depends on every matrix entry, so
+    # adding a 5th shard required zero rollup change.
     #
     # The 45m/35m budget rationale above still applies PER SHARD;
     # each shard runs less work than the old monolith so headroom is
-    # more generous than strictly needed (pipeline-migrate is the
-    # long pole at ~18–20m). Variable-driven knobs unchanged.
+    # more generous than strictly needed. Variable-driven knobs
+    # unchanged.
     strategy:
       fail-fast: false
       matrix:
@@ -238,9 +250,12 @@ jobs:
           - name: pipeline-migrate
             packages: "./internal/pipeline/"
             goflags: "-run ^TestMigrate_"
-          - name: pipeline-rest
+          - name: pipeline-rest-streamer
             packages: "./internal/pipeline/"
-            goflags: "-skip ^TestMigrate_"
+            goflags: "-run ^TestStreamer_"
+          - name: pipeline-rest-other
+            packages: "./internal/pipeline/"
+            goflags: "-skip ^(TestMigrate_|TestStreamer_)"
           - name: engines-mysql
             packages: "./internal/engines/mysql/..."
             goflags: ""
