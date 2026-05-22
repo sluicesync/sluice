@@ -222,3 +222,19 @@ type ShardConsolidationLeaseStore interface {
 		tableName string,
 	) (row ShardConsolidationLeaseRow, ok bool, err error)
 }
+
+// ShardConsolidationLeaseLister is the optional surface engines can
+// implement to enumerate every row in the
+// `sluice_shard_consolidation_lease` control table. Used by
+// `sluice sync status` for the ADR-0054 §6 operator-visibility
+// surface. The shipping PG and MySQL engines implement it.
+//
+// Sibling-tier to [ShardConsolidationLeaseStore] — distinct interface
+// so engines that don't yet implement listing inherit the
+// no-lease-listing default (status shows the existing per-stream rows
+// but omits the consolidation_lease block). Tolerant of the table
+// being absent (returns an empty slice, nil) so a status query
+// against a fresh target doesn't error.
+type ShardConsolidationLeaseLister interface {
+	ListLeases(ctx context.Context) ([]ShardConsolidationLeaseRow, error)
+}

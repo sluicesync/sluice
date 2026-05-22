@@ -40,7 +40,7 @@ func TestRenderStatusText_DefaultShape(t *testing.T) {
 		makeStream("alpha", 10*time.Second, "mysql", "binlog:mysql-bin.000003:1024"),
 		makeStream("beta", 5*time.Minute, "postgres", "lsn:0/1A2B3C4D"),
 	}
-	err := renderStatus(&buf, streams, statusRenderOpts{Format: "text"}, fixedNow)
+	err := renderStatus(&buf, streams, nil, statusRenderOpts{Format: "text"}, fixedNow)
 	if err != nil {
 		t.Fatalf("renderStatus: %v", err)
 	}
@@ -76,7 +76,7 @@ func TestRenderStatusText_MostRecentFirst(t *testing.T) {
 		makeStream("new", 1*time.Second, "mysql", "y"),
 		makeStream("mid", 5*time.Minute, "mysql", "z"),
 	}
-	if err := renderStatus(&buf, streams, statusRenderOpts{Format: "text"}, fixedNow); err != nil {
+	if err := renderStatus(&buf, streams, nil, statusRenderOpts{Format: "text"}, fixedNow); err != nil {
 		t.Fatalf("renderStatus: %v", err)
 	}
 	got := buf.String()
@@ -97,7 +97,7 @@ func TestRenderStatusText_Summary(t *testing.T) {
 		makeStream("a", 1*time.Second, "mysql", "x"),
 		makeStream("b", 30*time.Minute, "mysql", "y"),
 	}
-	if err := renderStatus(&buf, streams, statusRenderOpts{Format: "text", Summary: true}, fixedNow); err != nil {
+	if err := renderStatus(&buf, streams, nil, statusRenderOpts{Format: "text", Summary: true}, fixedNow); err != nil {
 		t.Fatalf("renderStatus: %v", err)
 	}
 	got := buf.String()
@@ -118,7 +118,7 @@ func TestRenderStatusText_Summary(t *testing.T) {
 func TestRenderStatusText_SummarySingularPlural(t *testing.T) {
 	var buf bytes.Buffer
 	streams := []ir.StreamStatus{makeStream("solo", 5*time.Second, "mysql", "x")}
-	if err := renderStatus(&buf, streams, statusRenderOpts{Format: "text", Summary: true}, fixedNow); err != nil {
+	if err := renderStatus(&buf, streams, nil, statusRenderOpts{Format: "text", Summary: true}, fixedNow); err != nil {
 		t.Fatalf("renderStatus: %v", err)
 	}
 	got := buf.String()
@@ -136,7 +136,7 @@ func TestRenderStatusText_SummarySingularPlural(t *testing.T) {
 func TestRenderStatusText_Empty(t *testing.T) {
 	t.Run("no filter", func(t *testing.T) {
 		var buf bytes.Buffer
-		if err := renderStatus(&buf, nil, statusRenderOpts{Format: "text"}, fixedNow); err != nil {
+		if err := renderStatus(&buf, nil, nil, statusRenderOpts{Format: "text"}, fixedNow); err != nil {
 			t.Fatalf("renderStatus: %v", err)
 		}
 		if got := buf.String(); !strings.Contains(got, "no streams recorded on target") {
@@ -146,7 +146,7 @@ func TestRenderStatusText_Empty(t *testing.T) {
 	t.Run("with stream-id filter", func(t *testing.T) {
 		var buf bytes.Buffer
 		opts := statusRenderOpts{Format: "text", StreamID: "missing-stream"}
-		if err := renderStatus(&buf, nil, opts, fixedNow); err != nil {
+		if err := renderStatus(&buf, nil, nil, opts, fixedNow); err != nil {
 			t.Fatalf("renderStatus: %v", err)
 		}
 		if got := buf.String(); !strings.Contains(got, `no stream "missing-stream" on target`) {
@@ -166,7 +166,7 @@ func TestRenderStatusJSON_Shape(t *testing.T) {
 		makeStream("alpha", 10*time.Second, "mysql", "binlog:mysql-bin.000003:1024"),
 		makeStream("beta", 5*time.Minute, "postgres", "lsn:0/1A2B3C4D"),
 	}
-	if err := renderStatus(&buf, streams, statusRenderOpts{Format: "json"}, fixedNow); err != nil {
+	if err := renderStatus(&buf, streams, nil, statusRenderOpts{Format: "json"}, fixedNow); err != nil {
 		t.Fatalf("renderStatus: %v", err)
 	}
 
@@ -226,7 +226,7 @@ func TestRenderStatusJSON_Shape(t *testing.T) {
 // A consumer parsing this must not need a special "no rows" path.
 func TestRenderStatusJSON_Empty(t *testing.T) {
 	var buf bytes.Buffer
-	if err := renderStatus(&buf, nil, statusRenderOpts{Format: "json"}, fixedNow); err != nil {
+	if err := renderStatus(&buf, nil, nil, statusRenderOpts{Format: "json"}, fixedNow); err != nil {
 		t.Fatalf("renderStatus: %v", err)
 	}
 	var doc struct {
@@ -254,7 +254,7 @@ func TestRenderStatusJSON_Empty(t *testing.T) {
 // enum: validation, which should reject it earlier).
 func TestRenderStatus_UnknownFormat(t *testing.T) {
 	var buf bytes.Buffer
-	err := renderStatus(&buf, nil, statusRenderOpts{Format: "yaml"}, fixedNow)
+	err := renderStatus(&buf, nil, nil, statusRenderOpts{Format: "yaml"}, fixedNow)
 	if err == nil {
 		t.Fatal("expected error for unknown format; got nil")
 	}
@@ -289,6 +289,123 @@ func TestFilterStreams_Match(t *testing.T) {
 				}
 				return ""
 			}())
+	}
+}
+
+// makeLease constructs a [ir.ShardConsolidationLeaseRow] for tests.
+// state is "held" (expires_at in future), "expired" (expires_at in
+// past), or "applied" (applied_at set).
+func makeLease(table, holder, state string, version int64) ir.ShardConsolidationLeaseRow {
+	row := ir.ShardConsolidationLeaseRow{
+		TargetTableFullName:  table,
+		LeaseHolderStreamID:  holder,
+		AppliedSchemaVersion: version,
+	}
+	switch state {
+	case "held":
+		row.LeaseExpiresAt = fixedNow.Add(30 * time.Second)
+		row.HasLeaseExpiresAt = true
+	case "expired":
+		row.LeaseExpiresAt = fixedNow.Add(-30 * time.Second)
+		row.HasLeaseExpiresAt = true
+	case "applied":
+		row.LeaseExpiresAt = fixedNow.Add(30 * time.Second)
+		row.HasLeaseExpiresAt = true
+		row.AppliedAt = fixedNow.Add(-5 * time.Second)
+		row.HasAppliedAt = true
+		row.DDLChecksum = "deadbeef"
+	}
+	return row
+}
+
+// TestRenderStatusText_LeaseSummary pins the ADR-0054 §6 one-line
+// summary appended to text output when consolidation leases exist.
+func TestRenderStatusText_LeaseSummary(t *testing.T) {
+	var buf bytes.Buffer
+	streams := []ir.StreamStatus{
+		makeStream("shard-1", 10*time.Second, "mysql", "binlog:mysql-bin.000003:1024"),
+	}
+	leases := []ir.ShardConsolidationLeaseRow{
+		makeLease("public.users", "shard-1", "applied", 3),
+		makeLease("public.orders", "shard-1", "held", 4),
+		makeLease("public.items", "shard-2", "expired", 2),
+	}
+	if err := renderStatus(&buf, streams, leases, statusRenderOpts{Format: "text"}, fixedNow); err != nil {
+		t.Fatalf("renderStatus: %v", err)
+	}
+	got := buf.String()
+	for _, want := range []string{
+		"Shape A consolidation",
+		"3 tables",
+		"1 applied",
+		"1 held",
+		"1 expired",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q in output:\n%s", want, got)
+		}
+	}
+}
+
+// TestRenderStatusJSON_LeaseBlock pins the JSON shape of
+// consolidation_leases.
+func TestRenderStatusJSON_LeaseBlock(t *testing.T) {
+	var buf bytes.Buffer
+	streams := []ir.StreamStatus{makeStream("shard-1", 10*time.Second, "mysql", "tok")}
+	leases := []ir.ShardConsolidationLeaseRow{
+		makeLease("public.users", "shard-1", "applied", 3),
+		makeLease("public.orders", "shard-1", "held", 4),
+	}
+	if err := renderStatus(&buf, streams, leases, statusRenderOpts{Format: "json"}, fixedNow); err != nil {
+		t.Fatalf("renderStatus: %v", err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &doc); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, buf.String())
+	}
+	rawLeases, ok := doc["consolidation_leases"]
+	if !ok {
+		t.Fatalf("expected consolidation_leases key in JSON:\n%s", buf.String())
+	}
+	asSlice := rawLeases.([]any)
+	if len(asSlice) != 2 {
+		t.Errorf("len(consolidation_leases) = %d, want 2", len(asSlice))
+	}
+}
+
+// TestRenderStatusJSON_NoLeases_OmitsField pins that the
+// consolidation_leases block is omitted entirely (omitempty) when
+// the engine doesn't expose leases.
+func TestRenderStatusJSON_NoLeases_OmitsField(t *testing.T) {
+	var buf bytes.Buffer
+	streams := []ir.StreamStatus{makeStream("shard-1", 10*time.Second, "mysql", "tok")}
+	if err := renderStatus(&buf, streams, nil, statusRenderOpts{Format: "json"}, fixedNow); err != nil {
+		t.Fatalf("renderStatus: %v", err)
+	}
+	if strings.Contains(buf.String(), "consolidation_leases") {
+		t.Errorf("expected no consolidation_leases key when leases is nil; got:\n%s", buf.String())
+	}
+}
+
+// TestClassifyLeaseForJSON pins the state classification logic.
+func TestClassifyLeaseForJSON(t *testing.T) {
+	cases := []struct {
+		name  string
+		row   ir.ShardConsolidationLeaseRow
+		state string
+	}{
+		{"applied", makeLease("t", "s", "applied", 1), "applied"},
+		{"held", makeLease("t", "s", "held", 1), "held"},
+		{"expired", makeLease("t", "s", "expired", 1), "expired"},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			if got := classifyLeaseForJSON(c.row, fixedNow); got != c.state {
+				t.Errorf("state = %q, want %q", got, c.state)
+			}
+		})
 	}
 }
 

@@ -259,6 +259,42 @@ func finalizeShardLeaseApply(ctx context.Context, db *sql.DB, schema, tableName,
 	return n > 0, nil
 }
 
+// listShardLeases returns every row in the per-target lease table.
+// Tolerant of the table being absent. ADR-0054 §6 operator-visibility
+// surface.
+func listShardLeases(ctx context.Context, db *sql.DB, schema string) ([]shardConsolidationLeaseRow, error) {
+	tableRef := quoteIdent(schema) + "." + quoteIdent(shardConsolidationLeaseTableName)
+	q := "SELECT target_table_full_name, COALESCE(lease_holder_stream_id, ''), " +
+		"lease_expires_at, COALESCE(ddl_text, ''), COALESCE(ddl_checksum, ''), " +
+		"applied_schema_version, applied_at FROM " + tableRef
+	rows, err := db.QueryContext(ctx, q)
+	if err != nil {
+		if isUndefinedRelationErr(err) {
+			return []shardConsolidationLeaseRow{}, nil
+		}
+		return nil, fmt.Errorf("postgres: list leases: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	out := []shardConsolidationLeaseRow{}
+	for rows.Next() {
+		var row shardConsolidationLeaseRow
+		if err := rows.Scan(
+			&row.TargetTableFullName,
+			&row.LeaseHolderStreamID,
+			&row.LeaseExpiresAt,
+			&row.DDLText,
+			&row.DDLChecksum,
+			&row.AppliedSchemaVersion,
+			&row.AppliedAt,
+		); err != nil {
+			return nil, fmt.Errorf("postgres: scan lease: %w", err)
+		}
+		out = append(out, row)
+	}
+	return out, rows.Err()
+}
+
 // selectShardLease loads the row for tableName. Returns ok=false when
 // no row exists (ABSENT) or when the table doesn't exist (dry-run
 // path before EnsureControlTable).

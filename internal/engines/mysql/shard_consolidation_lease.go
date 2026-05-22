@@ -78,6 +78,21 @@ func (a *ChangeApplier) ObserveLease(
 	return toIRLeaseRow(row), true, nil
 }
 
+// ListLeases implements [ir.ShardConsolidationLeaseLister] — returns
+// every row in the per-target lease control table for the `sluice
+// sync status` ADR-0054 §6 surface.
+func (a *ChangeApplier) ListLeases(ctx context.Context) ([]ir.ShardConsolidationLeaseRow, error) {
+	rows, err := listShardLeases(ctx, a.db)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]ir.ShardConsolidationLeaseRow, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, toIRLeaseRow(row))
+	}
+	return out, nil
+}
+
 // toIRLeaseRow converts the engine's sql.NullTime-bearing row shape
 // to the cross-package HasX-bool shape.
 func toIRLeaseRow(row shardConsolidationLeaseRow) ir.ShardConsolidationLeaseRow {

@@ -47,7 +47,18 @@ func runStatusOnce(ctx context.Context, applier ir.ChangeApplier, out io.Writer,
 		return fmt.Errorf("list streams: %w", err)
 	}
 	streams = filterStreams(streams, opts.StreamID)
-	return renderStatus(out, streams, opts, time.Now())
+	// ADR-0054 §6: query the per-target lease control table when the
+	// engine implements [ir.ShardConsolidationLeaseLister]. Engines
+	// without the surface return nil leases (the status output omits
+	// the consolidation_lease block, preserving pre-v0.73 shape).
+	var leases []ir.ShardConsolidationLeaseRow
+	if lister, ok := applier.(ir.ShardConsolidationLeaseLister); ok {
+		leases, err = lister.ListLeases(ctx)
+		if err != nil {
+			return fmt.Errorf("list shard consolidation leases: %w", err)
+		}
+	}
+	return renderStatus(out, streams, leases, opts, time.Now())
 }
 
 // runStatusWatch is the live-refresh path: re-query and re-render at
@@ -128,7 +139,7 @@ func filterStreams(streams []ir.StreamStatus, streamID string) []ir.StreamStatus
 // renderStatus dispatches by format. Single entry point so the watch
 // loop and the one-shot path share identical rendering logic; tests
 // drive it directly.
-func renderStatus(out io.Writer, streams []ir.StreamStatus, opts statusRenderOpts, now time.Time) error {
+func renderStatus(out io.Writer, streams []ir.StreamStatus, leases []ir.ShardConsolidationLeaseRow, opts statusRenderOpts, now time.Time) error {
 	// Sort for stable output across runs. Most-recently-updated first
 	// matches the operator's interest ("what's been moving?").
 	sort.Slice(streams, func(i, j int) bool {
@@ -137,9 +148,9 @@ func renderStatus(out io.Writer, streams []ir.StreamStatus, opts statusRenderOpt
 
 	switch opts.Format {
 	case "", "text":
-		return renderStatusText(out, streams, opts, now)
+		return renderStatusText(out, streams, leases, opts, now)
 	case "json":
-		return renderStatusJSON(out, streams, opts, now)
+		return renderStatusJSON(out, streams, leases, opts, now)
 	default:
 		return fmt.Errorf("unknown --format %q (want text or json)", opts.Format)
 	}
@@ -148,7 +159,7 @@ func renderStatus(out io.Writer, streams []ir.StreamStatus, opts statusRenderOpt
 // renderStatusText is the human-readable tabwriter path. Keeps the
 // pre-refactor output shape exactly when --summary is off, so
 // existing scripts that parsed the text output still work.
-func renderStatusText(out io.Writer, streams []ir.StreamStatus, opts statusRenderOpts, now time.Time) error {
+func renderStatusText(out io.Writer, streams []ir.StreamStatus, leases []ir.ShardConsolidationLeaseRow, opts statusRenderOpts, now time.Time) error {
 	if len(streams) == 0 {
 		return writeEmptyText(out, opts.StreamID)
 	}
@@ -173,7 +184,56 @@ func renderStatusText(out io.Writer, streams []ir.StreamStatus, opts statusRende
 			return err
 		}
 	}
+	if err := tw.Flush(); err != nil {
+		return err
+	}
+	// ADR-0054 §6: append the consolidation-lease one-line summary
+	// when any leases exist. Shape: "Shape A: N tables, M applied, K
+	// held, J expired" — operator-skimmable at a glance.
+	if len(leases) > 0 {
+		held, applied, expired := classifyLeasesForSummary(leases, now)
+		if _, err := fmt.Fprintf(
+			out,
+			"\nShape A consolidation: %d %s, %d applied, %d held, %d expired\n",
+			len(leases), pluralize("table", len(leases)), applied, held, expired,
+		); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// classifyLeaseForJSON returns the textual state label for a lease
+// row's JSON entry. Mirrors classifyLeasesForSummary's logic to keep
+// text + JSON consistent.
+func classifyLeaseForJSON(row ir.ShardConsolidationLeaseRow, now time.Time) string {
+	switch {
+	case row.HasAppliedAt:
+		return "applied"
+	case row.HasLeaseExpiresAt && row.LeaseExpiresAt.After(now):
+		return "held"
+	default:
+		return "expired"
+	}
+}
+
+// classifyLeasesForSummary buckets each lease row into held/applied/
+// expired counts for the text-summary one-liner. Mirrors the
+// pipeline's classifyLeaseRow ordering exactly (Applied takes
+// precedence over Held/Expired; absent rows don't appear in the
+// summary because they wouldn't be in the slice).
+func classifyLeasesForSummary(leases []ir.ShardConsolidationLeaseRow, now time.Time) (held, applied, expired int) {
+	for _, row := range leases {
+		switch {
+		case row.HasAppliedAt:
+			applied++
+		case row.HasLeaseExpiresAt && row.LeaseExpiresAt.After(now):
+			held++
+		default:
+			expired++
+		}
+	}
+	return held, applied, expired
 }
 
 // writeEmptyText handles the no-streams case for the text format.
@@ -247,7 +307,7 @@ func agesSpan(streams []ir.StreamStatus, now time.Time) (oldest, newest time.Dur
 // "scriptable output should always include aggregates" is the more
 // useful default). Field names match Go's json:"" tag conventions
 // (snake_case for JSON) so jq pipes are predictable.
-func renderStatusJSON(out io.Writer, streams []ir.StreamStatus, _ statusRenderOpts, now time.Time) error {
+func renderStatusJSON(out io.Writer, streams []ir.StreamStatus, leases []ir.ShardConsolidationLeaseRow, _ statusRenderOpts, now time.Time) error {
 	type jsonPosition struct {
 		Engine string `json:"engine"`
 		Token  string `json:"token"`
@@ -266,10 +326,24 @@ func renderStatusJSON(out io.Writer, streams []ir.StreamStatus, _ statusRenderOp
 		OldestSeconds int64 `json:"oldest_seconds"`
 		NewestSeconds int64 `json:"newest_seconds"`
 	}
+	// ADR-0054 §6 — per-lease block. Field names mirror the storage
+	// columns for jq predictability; the `state` field is the
+	// derived classification (held/applied/expired) for operator
+	// skim.
+	type jsonLease struct {
+		TargetTable          string `json:"target_table"`
+		State                string `json:"state"`
+		HolderStreamID       string `json:"holder_stream_id,omitempty"`
+		ExpiresAt            string `json:"expires_at,omitempty"`
+		DDLChecksum          string `json:"ddl_checksum,omitempty"`
+		AppliedSchemaVersion int64  `json:"applied_schema_version"`
+		AppliedAt            string `json:"applied_at,omitempty"`
+	}
 	type jsonDoc struct {
 		GeneratedAt time.Time    `json:"generated_at"`
 		Summary     jsonSummary  `json:"summary"`
 		Streams     []jsonStream `json:"streams"`
+		Leases      []jsonLease  `json:"consolidation_leases,omitempty"`
 	}
 
 	out2 := make([]jsonStream, 0, len(streams))
@@ -288,6 +362,24 @@ func renderStatusJSON(out io.Writer, streams []ir.StreamStatus, _ statusRenderOp
 		})
 	}
 	oldest, newest := agesSpan(streams, now)
+	leasesJSON := make([]jsonLease, 0, len(leases))
+	for _, l := range leases {
+		state := classifyLeaseForJSON(l, now)
+		entry := jsonLease{
+			TargetTable:          l.TargetTableFullName,
+			State:                state,
+			HolderStreamID:       l.LeaseHolderStreamID,
+			DDLChecksum:          l.DDLChecksum,
+			AppliedSchemaVersion: l.AppliedSchemaVersion,
+		}
+		if l.HasLeaseExpiresAt {
+			entry.ExpiresAt = l.LeaseExpiresAt.UTC().Format(time.RFC3339)
+		}
+		if l.HasAppliedAt {
+			entry.AppliedAt = l.AppliedAt.UTC().Format(time.RFC3339)
+		}
+		leasesJSON = append(leasesJSON, entry)
+	}
 	doc := jsonDoc{
 		GeneratedAt: now.UTC(),
 		Summary: jsonSummary{
@@ -296,6 +388,7 @@ func renderStatusJSON(out io.Writer, streams []ir.StreamStatus, _ statusRenderOp
 			NewestSeconds: int64(newest.Seconds()),
 		},
 		Streams: out2,
+		Leases:  leasesJSON,
 	}
 
 	// Indent for human-skimmable scripted output. jq pipes don't care
