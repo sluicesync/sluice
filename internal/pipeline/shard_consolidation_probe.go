@@ -314,88 +314,21 @@ func diffAlteredColumn(pre, post *ir.Table) (alteredCol, alteredBefore *ir.Colum
 	return nil, nil, ShapeKindNone, false
 }
 
-// ProbeOutcome classifies the takeover-stream's view of the target
-// schema vs the prior holder's recorded shape. See ADR-0054 §4.
-type ProbeOutcome int
+// ProbeOutcome aliases [ir.ProbeOutcome] — defined in `ir` to avoid
+// the engines→pipeline import cycle the integration-tagged tests
+// expose.
+type ProbeOutcome = ir.ProbeOutcome
 
+// Re-exported ProbeOutcome constants for the pipeline-internal call
+// sites (router, tests). The canonical values live in `ir`.
 const (
-	// ProbeOutcomeApplied — the target schema reflects the prior
-	// holder's recorded change (column exists, index exists, …).
-	// The takeover-stream skips the re-apply and just records the
-	// finalize.
-	ProbeOutcomeApplied ProbeOutcome = iota
-
-	// ProbeOutcomeNotApplied — the target schema is unchanged. The
-	// takeover-stream re-applies the DDL, then records.
-	ProbeOutcomeNotApplied
-
-	// ProbeOutcomeInconsistent — the target schema is in a partial
-	// state inconsistent with the recorded shape (column exists but
-	// wrong type, index exists but wrong columns, …). The takeover-
-	// stream refuses loudly with operator-actionable recovery.
-	ProbeOutcomeInconsistent
+	ProbeOutcomeApplied      = ir.ProbeOutcomeApplied
+	ProbeOutcomeNotApplied   = ir.ProbeOutcomeNotApplied
+	ProbeOutcomeInconsistent = ir.ProbeOutcomeInconsistent
 )
 
-// String renders a ProbeOutcome for logs and refusal messages.
-func (o ProbeOutcome) String() string {
-	switch o {
-	case ProbeOutcomeApplied:
-		return "applied"
-	case ProbeOutcomeNotApplied:
-		return "not-applied"
-	case ProbeOutcomeInconsistent:
-		return "inconsistent"
-	}
-	return "unknown"
-}
-
-// ShardConsolidationProber is the engine-side surface for the
-// takeover-stream's probe-and-record path. The pipeline calls one of
-// these methods based on the classified Shape; the engine queries its
-// own information_schema / pg_catalog for the observable effect.
-//
-// Engines implement this on the SchemaReader (where catalog queries
-// already live). The pipeline probes via type-assertion on the
-// reader, the same shape as other optional engine surfaces. An
-// engine that doesn't implement the prober inherits the no-takeover-
-// support default — the takeover path refuses loudly with a clear
-// "engine X doesn't support probe-and-record" message naming
-// --no-coordinate-live-ddl as the recovery flag.
-type ShardConsolidationProber interface {
-	// ProbeAddColumn returns Applied when ALL named columns exist on
-	// the target table with the expected name + IR type; NotApplied
-	// when NONE of the named columns exist; Inconsistent when the
-	// state is partial (some exist, some don't) or a column exists
-	// with a different type.
-	ProbeAddColumn(ctx context.Context, table *ir.Table, cols []*ir.Column) (ProbeOutcome, error)
-
-	// ProbeDropColumn returns Applied when NONE of the named
-	// columns exist; NotApplied when ALL of them exist; Inconsistent
-	// when the state is partial.
-	ProbeDropColumn(ctx context.Context, table *ir.Table, cols []*ir.Column) (ProbeOutcome, error)
-
-	// ProbeCreateIndex returns Applied when ALL named indexes exist
-	// on the target table with the expected column set; NotApplied
-	// when NONE exist; Inconsistent on partial or mismatched-column
-	// state.
-	ProbeCreateIndex(ctx context.Context, table *ir.Table, indexes []*ir.Index) (ProbeOutcome, error)
-
-	// ProbeDropIndex returns Applied when NONE of the named indexes
-	// exist; NotApplied when ALL exist; Inconsistent on partial.
-	ProbeDropIndex(ctx context.Context, table *ir.Table, indexes []*ir.Index) (ProbeOutcome, error)
-
-	// ProbeAlterColumnType returns Applied when the column's IR type
-	// on the target matches `want.Type`; NotApplied when the type
-	// matches the pre-DDL type; Inconsistent when the column exists
-	// but has neither type.
-	ProbeAlterColumnType(ctx context.Context, table *ir.Table, want *ir.Column) (ProbeOutcome, error)
-
-	// ProbeAlterColumnNullability returns Applied when the column's
-	// Nullable on the target matches want.Nullable; NotApplied when
-	// it matches the pre-state; Inconsistent when the column is
-	// absent.
-	ProbeAlterColumnNullability(ctx context.Context, table *ir.Table, want *ir.Column) (ProbeOutcome, error)
-}
+// ShardConsolidationProber aliases [ir.ShardConsolidationProber].
+type ShardConsolidationProber = ir.ShardConsolidationProber
 
 // DispatchProbe runs the right probe for the given shape against the
 // target's prober. Returns ProbeOutcomeInconsistent + an error when

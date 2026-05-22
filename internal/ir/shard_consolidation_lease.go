@@ -72,6 +72,78 @@ type ShardConsolidationLeaseRow struct {
 	HasAppliedAt bool
 }
 
+// ProbeOutcome classifies the takeover-stream's view of the target
+// schema vs the prior lease-holder's recorded shape, per ADR-0054 §4.
+// Used as the return type of the ADR-0054 Phase 2c per-shape probes.
+// Lives in `ir` so engines can implement [ShardConsolidationProber]
+// without importing pipeline (which would create a cycle with the
+// integration-tagged tests in pipeline/).
+type ProbeOutcome int
+
+const (
+	// ProbeOutcomeApplied — the target schema reflects the prior
+	// holder's recorded change.
+	ProbeOutcomeApplied ProbeOutcome = iota
+
+	// ProbeOutcomeNotApplied — the target schema is unchanged; the
+	// takeover-stream re-applies the DDL.
+	ProbeOutcomeNotApplied
+
+	// ProbeOutcomeInconsistent — the target schema is in a partial
+	// state inconsistent with the recorded shape; refuse loudly.
+	ProbeOutcomeInconsistent
+)
+
+// String renders a ProbeOutcome for logs and refusal messages.
+func (o ProbeOutcome) String() string {
+	switch o {
+	case ProbeOutcomeApplied:
+		return "applied"
+	case ProbeOutcomeNotApplied:
+		return "not-applied"
+	case ProbeOutcomeInconsistent:
+		return "inconsistent"
+	}
+	return "unknown"
+}
+
+// ShardConsolidationProber is the engine-side surface for the
+// ADR-0054 Phase 2c takeover-stream's probe-and-record path. The
+// pipeline calls one of these methods based on the classified shape;
+// the engine queries its own information_schema / pg_catalog for the
+// observable effect.
+//
+// Implemented on the ChangeApplier — the same type that holds
+// [ShardConsolidationLeaseStore], so a single type-assertion at
+// engagement time confirms both surfaces.
+type ShardConsolidationProber interface {
+	// ProbeAddColumn returns Applied when ALL named columns exist on
+	// the target; NotApplied when NONE exist; Inconsistent on
+	// partial state.
+	ProbeAddColumn(ctx context.Context, table *Table, cols []*Column) (ProbeOutcome, error)
+
+	// ProbeDropColumn inverts ProbeAddColumn (Applied when NONE
+	// exist).
+	ProbeDropColumn(ctx context.Context, table *Table, cols []*Column) (ProbeOutcome, error)
+
+	// ProbeCreateIndex returns Applied when ALL named indexes exist;
+	// NotApplied when NONE; Inconsistent on partial.
+	ProbeCreateIndex(ctx context.Context, table *Table, indexes []*Index) (ProbeOutcome, error)
+
+	// ProbeDropIndex inverts ProbeCreateIndex.
+	ProbeDropIndex(ctx context.Context, table *Table, indexes []*Index) (ProbeOutcome, error)
+
+	// ProbeAlterColumnType returns Applied when the column's IR type
+	// on the target matches want.Type; NotApplied when it matches
+	// the pre-DDL type; Inconsistent on absent column.
+	ProbeAlterColumnType(ctx context.Context, table *Table, want *Column) (ProbeOutcome, error)
+
+	// ProbeAlterColumnNullability returns Applied when the column's
+	// Nullable on the target matches want.Nullable; NotApplied when
+	// it matches the pre-state; Inconsistent on absent column.
+	ProbeAlterColumnNullability(ctx context.Context, table *Table, want *Column) (ProbeOutcome, error)
+}
+
 // ShardConsolidationLeaseStore is the engine-private surface a
 // [ChangeApplier] (or any handle to the target's control schema) can
 // implement to drive the ADR-0054 lease primitive. Each method maps

@@ -599,16 +599,146 @@ func (w *SchemaWriter) AlterAddColumn(ctx context.Context, table *ir.Table, cols
 		if err != nil {
 			return fmt.Errorf("alter add column: emit %q: %w", col.Name, err)
 		}
-		schemaName := w.schema
-		if table.Schema != "" {
-			schemaName = table.Schema
-		}
-		qualified := quoteIdent(schemaName) + "." + quoteIdent(table.Name)
+		qualified := w.qualifyTable(table)
 		stmt := fmt.Sprintf("ALTER TABLE %s ADD COLUMN IF NOT EXISTS %s", qualified, def)
 		if _, err := w.db.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("alter add column %q on %s.%s: %w",
 				col.Name, table.Schema, table.Name, err)
 		}
+	}
+	return nil
+}
+
+// qualifyTable returns the schema-qualified, quoted table reference
+// for table. Shared across the ADR-0054 Phase 2c ShapeDeltaApplier
+// methods so quoting + schema-override stay consistent.
+func (w *SchemaWriter) qualifyTable(table *ir.Table) string {
+	schemaName := w.schema
+	if table.Schema != "" {
+		schemaName = table.Schema
+	}
+	return quoteIdent(schemaName) + "." + quoteIdent(table.Name)
+}
+
+// AlterDropColumn implements [ir.ShapeDeltaApplier] for Postgres
+// (ADR-0054 Phase 2c). PG supports `DROP COLUMN IF EXISTS` since
+// v9.0; idempotent across re-runs.
+func (w *SchemaWriter) AlterDropColumn(ctx context.Context, table *ir.Table, cols []*ir.Column) error {
+	if len(cols) == 0 {
+		return nil
+	}
+	qualified := w.qualifyTable(table)
+	for _, col := range cols {
+		stmt := fmt.Sprintf("ALTER TABLE %s DROP COLUMN IF EXISTS %s", qualified, quoteIdent(col.Name))
+		if _, err := w.db.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("alter drop column %q on %s.%s: %w",
+				col.Name, table.Schema, table.Name, err)
+		}
+	}
+	return nil
+}
+
+// CreateShapeIndex implements [ir.ShapeDeltaApplier] for Postgres
+// (ADR-0054 Phase 2c). Reuses the existing emitCreateIndex emitter
+// (the same helper CREATE TABLE / CreateIndexes uses) so every
+// supported index variant (UNIQUE, USING <method>, INCLUDE,
+// functional indexes) flows through one path. The emitter doesn't
+// emit IF NOT EXISTS; this method wraps with the idempotent form
+// (PG 9.5+).
+func (w *SchemaWriter) CreateShapeIndex(ctx context.Context, table *ir.Table, indexes []*ir.Index) error {
+	if len(indexes) == 0 {
+		return nil
+	}
+	for _, idx := range indexes {
+		if idx == nil || strings.EqualFold(idx.Name, "PRIMARY") {
+			continue
+		}
+		stmt, err := emitCreateIndex(w.schema, table.Name, idx, w.emitOpts())
+		if err != nil {
+			return fmt.Errorf("create shape index: emit %q: %w", idx.Name, err)
+		}
+		// Promote bare `CREATE [UNIQUE] INDEX <name>` to idempotent
+		// form. The first " INDEX " token is the keyword we want to
+		// follow with IF NOT EXISTS.
+		idempotent := strings.Replace(stmt, "INDEX ", "INDEX IF NOT EXISTS ", 1)
+		if _, err := w.db.ExecContext(ctx, idempotent); err != nil {
+			return fmt.Errorf("create shape index %q on %s.%s: %w",
+				idx.Name, table.Schema, table.Name, err)
+		}
+	}
+	return nil
+}
+
+// DropShapeIndex implements [ir.ShapeDeltaApplier] for Postgres
+// (ADR-0054 Phase 2c). Uses `DROP INDEX IF EXISTS` (PG 8.2+). Index
+// names are schema-scoped on PG; the pgIndexName prefix convention
+// applies (matches emitCreateIndex).
+func (w *SchemaWriter) DropShapeIndex(ctx context.Context, table *ir.Table, indexes []*ir.Index) error {
+	if len(indexes) == 0 {
+		return nil
+	}
+	schemaName := w.schema
+	if table.Schema != "" {
+		schemaName = table.Schema
+	}
+	for _, idx := range indexes {
+		if idx == nil || strings.EqualFold(idx.Name, "PRIMARY") {
+			continue
+		}
+		indexRef := quoteIdent(schemaName) + "." + quoteIdent(pgIndexName(table.Name, idx.Name))
+		stmt := "DROP INDEX IF EXISTS " + indexRef
+		if _, err := w.db.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("drop shape index %q on %s.%s: %w",
+				idx.Name, table.Schema, table.Name, err)
+		}
+	}
+	return nil
+}
+
+// AlterColumnType implements [ir.ShapeDeltaApplier] for Postgres
+// (ADR-0054 Phase 2c). Idempotency on the post-state is by inherent
+// PG behaviour: a same-type ALTER is a fast no-op (PG short-circuits
+// when the catalog already matches).
+//
+// USING clause is intentionally NOT emitted — same-engine widening
+// (INT → BIGINT, VARCHAR(10) → VARCHAR(20)) doesn't need it. Lossy
+// or cross-format conversions surface as PG errors → loud-failure
+// recovery (drained model).
+func (w *SchemaWriter) AlterColumnType(ctx context.Context, table *ir.Table, want *ir.Column) error {
+	if want == nil {
+		return errors.New("postgres: alter column type: want column is nil")
+	}
+	typeStr, err := emitColumnType(want.Type, w.emitOpts())
+	if err != nil {
+		return fmt.Errorf("alter column type: emit %q: %w", want.Name, err)
+	}
+	qualified := w.qualifyTable(table)
+	stmt := fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s TYPE %s",
+		qualified, quoteIdent(want.Name), typeStr)
+	if _, err := w.db.ExecContext(ctx, stmt); err != nil {
+		return fmt.Errorf("alter column type %q on %s.%s: %w",
+			want.Name, table.Schema, table.Name, err)
+	}
+	return nil
+}
+
+// AlterColumnNullability implements [ir.ShapeDeltaApplier] for
+// Postgres (ADR-0054 Phase 2c). Emits SET / DROP NOT NULL based on
+// want.Nullable. Idempotent on the post-state.
+func (w *SchemaWriter) AlterColumnNullability(ctx context.Context, table *ir.Table, want *ir.Column) error {
+	if want == nil {
+		return errors.New("postgres: alter column nullability: want column is nil")
+	}
+	qualified := w.qualifyTable(table)
+	action := "SET NOT NULL"
+	if want.Nullable {
+		action = "DROP NOT NULL"
+	}
+	stmt := fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s %s",
+		qualified, quoteIdent(want.Name), action)
+	if _, err := w.db.ExecContext(ctx, stmt); err != nil {
+		return fmt.Errorf("alter column nullability %q on %s.%s: %w",
+			want.Name, table.Schema, table.Name, err)
 	}
 	return nil
 }

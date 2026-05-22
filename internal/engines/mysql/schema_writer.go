@@ -6,6 +6,7 @@ package mysql
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -354,4 +355,178 @@ func columnExists(ctx context.Context, db *sql.DB, schema, table, col string) (b
 		return false, err
 	}
 	return exists, nil
+}
+
+// indexExists reports whether table.indexName is present in the
+// target's information_schema.statistics. Used by the ADR-0054 Phase
+// 2c shape-applier methods for idempotency — MySQL lacks
+// `CREATE INDEX IF NOT EXISTS` and `DROP INDEX IF EXISTS` in the
+// versions sluice supports (8.0.x), so detect-then-DDL is the
+// portable pattern.
+func indexExists(ctx context.Context, db *sql.DB, schema, table, indexName string) (bool, error) {
+	const q = `SELECT EXISTS(SELECT 1 FROM information_schema.statistics
+		WHERE table_schema = ? AND table_name = ? AND index_name = ?)`
+	var exists bool
+	if err := db.QueryRowContext(ctx, q, schema, table, indexName).Scan(&exists); err != nil {
+		return false, err
+	}
+	return exists, nil
+}
+
+// columnNullable returns the IS_NULLABLE attribute of the named
+// column ("YES" / "NO"). Used by the ADR-0054 Phase 2c nullability
+// applier for idempotency.
+func columnNullable(ctx context.Context, db *sql.DB, schema, table, col string) (nullable string, found bool, err error) {
+	const q = `SELECT IS_NULLABLE FROM information_schema.columns
+		WHERE table_schema = ? AND table_name = ? AND column_name = ?`
+	var v string
+	switch scanErr := db.QueryRowContext(ctx, q, schema, table, col).Scan(&v); {
+	case errors.Is(scanErr, sql.ErrNoRows):
+		return "", false, nil
+	case scanErr != nil:
+		return "", false, scanErr
+	}
+	return v, true, nil
+}
+
+// AlterDropColumn implements [ir.ShapeDeltaApplier] for MySQL
+// (ADR-0054 Phase 2c). Detect-then-ALTER for idempotency — the
+// portable pattern across 8.0.x; `DROP COLUMN IF EXISTS` landed in
+// 8.0.29 and isn't universally available.
+func (w *SchemaWriter) AlterDropColumn(ctx context.Context, table *ir.Table, cols []*ir.Column) error {
+	if len(cols) == 0 {
+		return nil
+	}
+	for _, col := range cols {
+		exists, err := columnExists(ctx, w.db, w.schema, table.Name, col.Name)
+		if err != nil {
+			return fmt.Errorf("alter drop column: probe %q: %w", col.Name, err)
+		}
+		if !exists {
+			continue
+		}
+		stmt := fmt.Sprintf("ALTER TABLE %s DROP COLUMN %s",
+			quoteIdent(table.Name), quoteIdent(col.Name))
+		if _, err := w.db.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("alter drop column %q on %s: %w",
+				col.Name, table.Name, err)
+		}
+	}
+	return nil
+}
+
+// CreateShapeIndex implements [ir.ShapeDeltaApplier] for MySQL
+// (ADR-0054 Phase 2c). Reuses the existing emitCreateIndex emitter
+// (which emits an ALTER TABLE … ADD INDEX form). Idempotency is via
+// detect-then-DDL on information_schema.statistics.
+func (w *SchemaWriter) CreateShapeIndex(ctx context.Context, table *ir.Table, indexes []*ir.Index) error {
+	if len(indexes) == 0 {
+		return nil
+	}
+	for _, idx := range indexes {
+		if idx == nil || strings.EqualFold(idx.Name, "PRIMARY") {
+			continue
+		}
+		exists, err := indexExists(ctx, w.db, w.schema, table.Name, idx.Name)
+		if err != nil {
+			return fmt.Errorf("create shape index: probe %q: %w", idx.Name, err)
+		}
+		if exists {
+			continue
+		}
+		stmt, err := emitCreateIndex(table.Name, idx)
+		if err != nil {
+			return fmt.Errorf("create shape index: emit %q: %w", idx.Name, err)
+		}
+		if _, err := w.db.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("create shape index %q on %s: %w",
+				idx.Name, table.Name, err)
+		}
+	}
+	return nil
+}
+
+// DropShapeIndex implements [ir.ShapeDeltaApplier] for MySQL
+// (ADR-0054 Phase 2c). Detect-then-DROP for idempotency.
+func (w *SchemaWriter) DropShapeIndex(ctx context.Context, table *ir.Table, indexes []*ir.Index) error {
+	if len(indexes) == 0 {
+		return nil
+	}
+	for _, idx := range indexes {
+		if idx == nil || strings.EqualFold(idx.Name, "PRIMARY") {
+			continue
+		}
+		exists, err := indexExists(ctx, w.db, w.schema, table.Name, idx.Name)
+		if err != nil {
+			return fmt.Errorf("drop shape index: probe %q: %w", idx.Name, err)
+		}
+		if !exists {
+			continue
+		}
+		stmt := fmt.Sprintf("DROP INDEX %s ON %s",
+			quoteIdent(idx.Name), quoteIdent(table.Name))
+		if _, err := w.db.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("drop shape index %q on %s: %w",
+				idx.Name, table.Name, err)
+		}
+	}
+	return nil
+}
+
+// AlterColumnType implements [ir.ShapeDeltaApplier] for MySQL
+// (ADR-0054 Phase 2c). Uses `MODIFY COLUMN` — the MySQL form of
+// changing a column's type. The emitted column-def carries the
+// type + nullability; for same-nullability type-widening we still
+// emit the full def so MySQL's column-rewrite path runs cleanly.
+//
+// Idempotency: MySQL accepts a MODIFY that yields the same column
+// shape as a fast no-op; the engine short-circuits when the catalog
+// already matches the def.
+func (w *SchemaWriter) AlterColumnType(ctx context.Context, table *ir.Table, want *ir.Column) error {
+	if want == nil {
+		return errors.New("mysql: alter column type: want column is nil")
+	}
+	def, err := emitColumnDef(want)
+	if err != nil {
+		return fmt.Errorf("alter column type: emit %q: %w", want.Name, err)
+	}
+	stmt := fmt.Sprintf("ALTER TABLE %s MODIFY COLUMN %s",
+		quoteIdent(table.Name), def)
+	if _, err := w.db.ExecContext(ctx, stmt); err != nil {
+		return fmt.Errorf("alter column type %q on %s: %w",
+			want.Name, table.Name, err)
+	}
+	return nil
+}
+
+// AlterColumnNullability implements [ir.ShapeDeltaApplier] for MySQL
+// (ADR-0054 Phase 2c). Detect-then-MODIFY for idempotency: read the
+// catalog's IS_NULLABLE first, skip the MODIFY if it already matches.
+func (w *SchemaWriter) AlterColumnNullability(ctx context.Context, table *ir.Table, want *ir.Column) error {
+	if want == nil {
+		return errors.New("mysql: alter column nullability: want column is nil")
+	}
+	currentNullable, ok, err := columnNullable(ctx, w.db, w.schema, table.Name, want.Name)
+	if err != nil {
+		return fmt.Errorf("alter column nullability: probe %q: %w", want.Name, err)
+	}
+	if !ok {
+		return fmt.Errorf("mysql: alter column nullability: column %q absent on %s", want.Name, table.Name)
+	}
+	wantYes := want.Nullable
+	currentYes := currentNullable == "YES"
+	if wantYes == currentYes {
+		return nil
+	}
+	def, err := emitColumnDef(want)
+	if err != nil {
+		return fmt.Errorf("alter column nullability: emit %q: %w", want.Name, err)
+	}
+	stmt := fmt.Sprintf("ALTER TABLE %s MODIFY COLUMN %s",
+		quoteIdent(table.Name), def)
+	if _, err := w.db.ExecContext(ctx, stmt); err != nil {
+		return fmt.Errorf("alter column nullability %q on %s: %w",
+			want.Name, table.Name, err)
+	}
+	return nil
 }
