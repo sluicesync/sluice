@@ -335,11 +335,11 @@ func TestIntercept_SeededFromColdStart_BareNameKeyAlignment(t *testing.T) {
 func TestSynthesizeColdStartSeedSnapshots(t *testing.T) {
 	t.Parallel()
 	// nil schema → empty seed (defensive).
-	if got := synthesizeColdStartSeedSnapshots(nil); got != nil {
+	if got := synthesizeColdStartSeedSnapshots(nil, nil); got != nil {
 		t.Errorf("nil schema → got %d snapshots; want nil", len(got))
 	}
 	// Empty schema → empty seed.
-	emptyOut := synthesizeColdStartSeedSnapshots(&ir.Schema{})
+	emptyOut := synthesizeColdStartSeedSnapshots(&ir.Schema{}, nil)
 	if len(emptyOut) != 0 {
 		t.Errorf("empty schema → got %d snapshots; want 0", len(emptyOut))
 	}
@@ -350,7 +350,7 @@ func TestSynthesizeColdStartSeedSnapshots(t *testing.T) {
 	tblB := fixtureTable("orders", "id")
 	tblB.Schema = "public"
 	schema := &ir.Schema{Tables: []*ir.Table{tblA, nil, tblB}}
-	out := synthesizeColdStartSeedSnapshots(schema)
+	out := synthesizeColdStartSeedSnapshots(schema, nil)
 	if len(out) != 2 {
 		t.Fatalf("expected 2 snapshots; got %d", len(out))
 	}

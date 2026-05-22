@@ -450,6 +450,50 @@ type ShapeDeltaApplier interface {
 	AlterColumnNullability(ctx context.Context, table *Table, want *Column) error
 }
 
+// CDCSchemaSnapshotNormalizer is the optional engine surface for
+// normalising a [Table] read by [SchemaReader] into the same shape
+// the engine's [CDCReader] will later project from its wire protocol.
+// ADR-0054 Bug 84 fix (v0.73.2).
+//
+// The motivation: live-coordination's [pipeline.ClassifyShape] compares
+// two IR tables via `reflect.DeepEqual` on each column's IR Type. When
+// the "pre" side comes from the cold-start [SchemaReader] (rich
+// information_schema / pg_attribute view) and the "post" side comes
+// from a CDC SchemaSnapshot (whatever the wire protocol carries), the
+// SchemaReader's richer fields surface as a false `altered-col=true`
+// on existing columns — which combines with a legitimate ADD COLUMN
+// into a multi-shape combo refusal.
+//
+// Known PG asymmetries (the pgoutput RelationMessage carries only
+// (name, OID, typmod, key-flag), so any IR field the SchemaReader
+// populates from information_schema is missing on the CDC side):
+//
+//   - [Integer].AutoIncrement (SchemaReader sets true for IDENTITY /
+//     SERIAL; pgoutput leaves false because the OID-to-type mapping
+//     can't distinguish IDENTITY from a plain BIGINT).
+//   - [Varchar].Collation, [Char].Collation, [Text].Collation
+//     (SchemaReader reads pg_attribute.attcollation; pgoutput's
+//     RelationMessage doesn't carry the collation OID).
+//   - [Decimal].Unconstrained (SchemaReader sets true for bare
+//     `numeric`; pgoutput emits typmod=-1 which the OID mapper
+//     interprets as (0, 0) without flipping Unconstrained).
+//
+// MySQL does NOT implement this interface: the MySQL CDC reader's
+// TableMapEvent decoder re-reads information_schema on schema-change
+// boundaries so its projection already matches the SchemaReader's.
+//
+// Engines that don't implement the interface are a no-op fallback
+// (the caller passes the table through unchanged). Implementations
+// MUST return a NEW table struct (deep-enough copy that mutating the
+// returned struct does not mutate the input); the caller treats the
+// return value as the canonical cache entry from then on.
+//
+// Idempotent: NormalizeForCDCComparison(NormalizeForCDCComparison(t))
+// equals NormalizeForCDCComparison(t).
+type CDCSchemaSnapshotNormalizer interface {
+	NormalizeForCDCComparison(t *Table) *Table
+}
+
 // SchemaTypeDropper is the optional surface a [RowWriter] (or
 // [SchemaWriter]) can implement to drop user-defined database-level
 // types created from the IR schema (e.g. Postgres `CREATE TYPE ...

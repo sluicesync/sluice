@@ -1909,7 +1909,7 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 	// treating it as the cold-start anchor, which was the v0.73.0
 	// Bug 83 root cause).
 	if s.InjectShardColumn.Engaged() && s.CoordinateLiveDDL {
-		s.coldStartSeedSnapshots = synthesizeColdStartSeedSnapshots(schema)
+		s.coldStartSeedSnapshots = synthesizeColdStartSeedSnapshots(schema, s.Source)
 	}
 
 	// ADR-0048 Shape A discriminator-column injection. Runs after

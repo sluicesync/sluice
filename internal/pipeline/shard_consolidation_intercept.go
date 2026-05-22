@@ -207,19 +207,36 @@ func interceptSchemaSnapshotsForCoordination(
 // boundary (pre = seeded source IR, post = CDC snapshot IR).
 //
 // ADR-0054 Bug 83 fix (v0.73.1).
-func synthesizeColdStartSeedSnapshots(schema *ir.Schema) []ir.SchemaSnapshot {
+//
+// ADR-0054 Bug 84 fix (v0.73.2): when sourceEngine implements
+// [ir.CDCSchemaSnapshotNormalizer], the seed tables are normalised
+// before being wrapped as SchemaSnapshots. Without this, PG sources
+// that populate richer IR Type fields than pgoutput's RelationMessage
+// projection (Integer.AutoIncrement for IDENTITY columns; Varchar /
+// Char / Text Collation; Decimal.Unconstrained) would trigger a false
+// `altered-col=true` in [ClassifyShape] on every existing column,
+// combining with a legitimate ADD COLUMN into a multi-shape combo
+// refusal. Engines without the normalizer interface (MySQL today) are
+// passed through unchanged — their CDC projection already matches the
+// SchemaReader's shape.
+func synthesizeColdStartSeedSnapshots(schema *ir.Schema, sourceEngine ir.Engine) []ir.SchemaSnapshot {
 	if schema == nil {
 		return nil
 	}
+	normalizer, _ := sourceEngine.(ir.CDCSchemaSnapshotNormalizer)
 	out := make([]ir.SchemaSnapshot, 0, len(schema.Tables))
 	for _, tbl := range schema.Tables {
 		if tbl == nil {
 			continue
 		}
+		seedTable := tbl
+		if normalizer != nil {
+			seedTable = normalizer.NormalizeForCDCComparison(tbl)
+		}
 		out = append(out, ir.SchemaSnapshot{
-			Schema: tbl.Schema,
-			Table:  tbl.Name,
-			IR:     tbl,
+			Schema: seedTable.Schema,
+			Table:  seedTable.Name,
+			IR:     seedTable,
 		})
 	}
 	return out
