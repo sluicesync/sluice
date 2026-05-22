@@ -283,3 +283,113 @@ func TestMigrate_MySQL_ShapeA_Bug80_BulkCopyLandsRows(t *testing.T) {
 		t.Fatalf("target rows = %d; want 3 (MySQL Bug 80 pin)", n)
 	}
 }
+
+// TestMigrate_MySQL_ShapeA_Bug82_AutoIncrementInPK pins the ADR-0048
+// Amendment 2026-05-22 fix: MySQL → MySQL Shape A with the canonical
+// `id BIGINT AUTO_INCREMENT PRIMARY KEY` source shape must succeed
+// end-to-end. Pre-fix, the Shape A rewrite moved id from leading-PK
+// to trailing-position (discriminator first), and MySQL rejected
+// CREATE TABLE with Error 1075. Post-fix, inlineAutoIncrementIndex
+// synthesizes a supporting UNIQUE KEY so MySQL accepts the table; the
+// DP-2 leading-shard invariant is preserved (discriminator still
+// leads PK).
+func TestMigrate_MySQL_ShapeA_Bug82_AutoIncrementInPK(t *testing.T) {
+	sourceDSN, targetDSN, cleanup := startMySQL(t)
+	defer cleanup()
+
+	// The canonical MySQL shape — AUTO_INCREMENT in the PK as the
+	// leading column. v0.72.1 release notes named this case as a
+	// known-still-broken follow-up; this test pins its closure.
+	applyMySQLDDL(t, sourceDSN, `
+		CREATE TABLE widgets (
+			id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+			name VARCHAR(64) NOT NULL,
+			price DECIMAL(10,2)
+		);
+		INSERT INTO widgets (name, price) VALUES
+			('alpha', 1.00), ('beta', 2.50), ('gamma', 3.75);
+	`)
+
+	myEng, _ := engines.Get("mysql")
+	mig := &Migrator{
+		Source:    myEng,
+		Target:    myEng,
+		SourceDSN: sourceDSN,
+		TargetDSN: targetDSN,
+		InjectShardColumn: ShardColumnSpec{
+			Name:  "source_shard_id",
+			Value: "shard_a",
+		},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	if err := mig.Run(ctx); err != nil {
+		t.Fatalf("Migrator.Run: %v (Bug 82 — pre-fix MySQL rejected CREATE TABLE with "+
+			"Error 1075 'Incorrect table definition; there can be only one auto column "+
+			"and it must be defined as a key' because the Shape A rewrite demoted the "+
+			"AUTO_INCREMENT column from leading-PK; the fix synthesizes a supporting "+
+			"UNIQUE KEY)", err)
+	}
+
+	tgtDB, err := sql.Open("mysql", targetDSN)
+	if err != nil {
+		t.Fatalf("open target: %v", err)
+	}
+	defer func() { _ = tgtDB.Close() }()
+
+	// Three load-bearing assertions:
+	//   (1) rows landed
+	//   (2) target schema has the synthesized UNIQUE KEY on id
+	//   (3) DP-2 invariant: composite PK leads with the discriminator
+	var n int
+	if err := tgtDB.QueryRowContext(ctx, "SELECT COUNT(*) FROM widgets").Scan(&n); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if n != 3 {
+		t.Fatalf("target rows = %d; want 3 (Bug 82 pin — bulk-copy must land)", n)
+	}
+
+	// The synthesized UNIQUE KEY satisfies MySQL's auto-column-is-key
+	// rule. Verify it exists with the expected uq_<table>_<col> name.
+	var idxName string
+	err = tgtDB.QueryRowContext(ctx, `
+		SELECT index_name
+		FROM information_schema.statistics
+		WHERE table_schema = DATABASE()
+		  AND table_name = 'widgets'
+		  AND non_unique = 0
+		  AND index_name != 'PRIMARY'
+		  AND column_name = 'id'
+		LIMIT 1
+	`).Scan(&idxName)
+	if err != nil {
+		t.Fatalf("query for synthesized index: %v "+
+			"(if this fails with sql.ErrNoRows, the supporting UNIQUE KEY wasn't "+
+			"emitted — Bug 82 fix didn't take)", err)
+	}
+	if idxName != "uq_widgets_id" {
+		t.Errorf("synthesized index name = %q; want %q", idxName, "uq_widgets_id")
+	}
+
+	// DP-2 leading-shard invariant: the composite PK must lead with
+	// the discriminator, NOT with the auto column. Regression guard
+	// against option (a) (engine-specific PK ordering) ever creeping
+	// back — that option was rejected for correctness reasons.
+	var pkLeading string
+	err = tgtDB.QueryRowContext(ctx, `
+		SELECT column_name
+		FROM information_schema.statistics
+		WHERE table_schema = DATABASE()
+		  AND table_name = 'widgets'
+		  AND index_name = 'PRIMARY'
+		  AND seq_in_index = 1
+	`).Scan(&pkLeading)
+	if err != nil {
+		t.Fatalf("query PK leading column: %v", err)
+	}
+	if pkLeading != "source_shard_id" {
+		t.Errorf("PK leading column = %q; want %q (DP-2 invariant — discriminator "+
+			"must lead the composite PK; Bug 82 fix must NOT compromise this)",
+			pkLeading, "source_shard_id")
+	}
+}

@@ -691,16 +691,19 @@ func emitColumnDef(c *ir.Column) (string, error) {
 // inlineAutoIncrementIndex returns the secondary index that
 // [emitTableDef] emits inline at CREATE TABLE time to satisfy MySQL's
 // "every auto column must be a key" rule when the AUTO_INCREMENT
-// column is NOT in the primary key. Returns nil when:
+// column either is NOT in the primary key OR is in the PK but not as
+// the leading column (the Shape A rewrite case, ADR-0048 Amendment
+// 2026-05-22 / Bug 82). Returns nil when:
 //
 //   - the table has no AUTO_INCREMENT column (the common case)
-//   - the AUTO_INCREMENT column IS in the primary key (also common —
-//     the standard "id BIGINT AUTO_INCREMENT PRIMARY KEY" pattern;
-//     PK itself satisfies the rule)
+//   - the AUTO_INCREMENT column IS the leading PK column (the
+//     standard "id BIGINT AUTO_INCREMENT PRIMARY KEY" shape; PK
+//     itself satisfies MySQL's rule)
 //   - no secondary index in table.Indexes has the auto column as its
-//     leading column (sluice can't satisfy the rule from what's
-//     declared; MySQL will reject the CREATE TABLE downstream and
-//     the existing error path surfaces it — same as pre-v0.49.0)
+//     leading column AND no Shape-A synthesis applies (sluice can't
+//     satisfy the rule from what's declared; MySQL will reject the
+//     CREATE TABLE downstream and the existing error path surfaces
+//     it — same as pre-v0.49.0)
 //
 // When non-nil, the returned index gets emitted inline by
 // [emitTableDef] AND skipped by [CreateIndexes] (phase 2) to avoid a
@@ -712,16 +715,25 @@ func emitColumnDef(c *ir.Column) (string, error) {
 // Error 1075 (Incorrect table definition; there can be only one auto
 // column and it must be defined as a key).
 //
+// Bug 82 (ADR-0048 Shape A) is the symmetric case: Shape A's IR pass
+// rewrites the PK as (discriminator, …origPKCols), so the auto column
+// (originally the leading PK column) gets demoted to trailing. MySQL
+// rejects with the same Error 1075. Resolution: when no operator-
+// declared supporting index is present, synthesize one
+// (`UNIQUE KEY uq_<table>_<col> (<col>)`) so MySQL accepts the table.
+//
 // MySQL allows at most one AUTO_INCREMENT column per table, so at
 // most one supporting index is needed.
 func inlineAutoIncrementIndex(table *ir.Table) *ir.Index {
-	if table == nil || len(table.Indexes) == 0 {
+	if table == nil {
 		return nil
 	}
-	pkCols := make(map[string]struct{})
-	if table.PrimaryKey != nil {
+	pkLeading := ""
+	pkContains := make(map[string]struct{})
+	if table.PrimaryKey != nil && len(table.PrimaryKey.Columns) > 0 {
+		pkLeading = table.PrimaryKey.Columns[0].Column
 		for _, c := range table.PrimaryKey.Columns {
-			pkCols[c.Column] = struct{}{}
+			pkContains[c.Column] = struct{}{}
 		}
 	}
 	var autoColName string
@@ -730,7 +742,9 @@ func inlineAutoIncrementIndex(table *ir.Table) *ir.Index {
 		if !ok || !intT.AutoIncrement {
 			continue
 		}
-		if _, inPK := pkCols[col.Name]; inPK {
+		// If the auto column is the LEADING PK column, the PK alone
+		// satisfies MySQL's rule — no supporting index needed.
+		if autoCol := col.Name; autoCol == pkLeading {
 			return nil
 		}
 		autoColName = col.Name
@@ -739,10 +753,11 @@ func inlineAutoIncrementIndex(table *ir.Table) *ir.Index {
 	if autoColName == "" {
 		return nil
 	}
-	// Pick the first index whose leading column is the auto column.
-	// Prefer unique indexes when both shapes are present — matches the
-	// real-world `UNIQUE KEY uq_<table>_<col> (<col>)` operator
-	// pattern (GitHub #25's example schema).
+	// Look for an operator-declared secondary index whose leading
+	// column is the auto column. Prefer unique indexes when both
+	// shapes are present — matches the real-world
+	// `UNIQUE KEY uq_<table>_<col> (<col>)` operator pattern (GitHub
+	// #25's example schema).
 	var fallback *ir.Index
 	for _, idx := range table.Indexes {
 		if len(idx.Columns) == 0 || idx.Columns[0].Column != autoColName {
@@ -755,7 +770,24 @@ func inlineAutoIncrementIndex(table *ir.Table) *ir.Index {
 			fallback = idx
 		}
 	}
-	return fallback
+	if fallback != nil {
+		return fallback
+	}
+	// Bug 82 / ADR-0048 Amendment 2026-05-22 synthesis: no operator-
+	// declared supporting index. When the auto column IS in the PK
+	// (Shape A rewrite case), synthesize a UNIQUE index so MySQL
+	// accepts the table; otherwise return nil and let the existing
+	// pre-v0.49.0 error path surface (synthesis is scoped to the
+	// Shape A case to avoid masking GitHub #25's no-supporting-index
+	// hazard for non-Shape-A schemas).
+	if _, inPK := pkContains[autoColName]; inPK {
+		return &ir.Index{
+			Name:    "uq_" + table.Name + "_" + autoColName,
+			Columns: []ir.IndexColumn{{Column: autoColName}},
+			Unique:  true,
+		}
+	}
+	return nil
 }
 
 // emitTableDef returns a CREATE TABLE statement with columns and

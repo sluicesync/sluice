@@ -94,6 +94,34 @@ Update/Delete WHERE-clause PK identity must use the **composite** key,
 or the idempotent upsert and CDC row-location silently mis-target across
 shards.
 
+**Amendment 2026-05-22 — MySQL AUTO_INCREMENT in source PK (Bug 82).**
+MySQL imposes a structural constraint sluice didn't initially account
+for: every `AUTO_INCREMENT` column must be **a leading column of some
+index** (typically the PK). When a source table is the canonical
+`id BIGINT AUTO_INCREMENT PRIMARY KEY` shape, the Shape A rewrite
+moves `id` from leading-PK to trailing position behind the
+discriminator, and MySQL rejects the CREATE TABLE with
+`Error 1075 (42000): Incorrect table definition; there can be only
+one auto column and it must be defined as a key`. The v0.72.0 release
+shipped Shape A with this case broken; v0.72.1's release notes named
+the workaround (use a non-AUTO_INCREMENT PK or migrate to PG) but the
+underlying issue is operator-burdensome — AUTO_INCREMENT is the
+typical MySQL PK shape, and most operators don't control their
+source schemas. **Resolution (2026-05-22, owner-confirmed via
+AskUserQuestion dialogue, option (b) chosen over (a)/(c)/(d)):** when
+the rewritten PK contains an AUTO_INCREMENT column that is NOT in the
+leading PK position, the MySQL DDL emitter synthesizes a supporting
+`UNIQUE KEY uq_<table>_<col> (<col>)` inline in the CREATE TABLE so
+MySQL's auto-column-is-key rule is satisfied via the secondary
+unique index rather than the PK. The DP-2 leading-shard invariant
+(option (a) would have violated it) is preserved; operators retain
+source-side identity management (option (d) would have broken it);
+operators don't see a loud refusal on a routine schema shape (option
+(c)). Implementation extends the existing
+`inlineAutoIncrementIndex` machinery in
+`internal/engines/mysql/ddl_emit.go` introduced in v0.49.0 for the
+non-PK auto-column case (GitHub issue #25's symmetric problem).
+
 ### 2. The IR column-origin marker (the load-bearing IR change)
 
 Add a provenance marker to `ir.Column` distinguishing a

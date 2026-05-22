@@ -4,6 +4,24 @@ All notable changes to sluice are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project follows [Semantic Versioning](https://semver.org/).
 
+## [0.72.2]
+
+**Closes the known follow-up from v0.72.1: MySQL Shape A with `AUTO_INCREMENT` in the source PK now works (Bug 82).** ADR-0048's PK rewrite places the discriminator first, demoting the source's `AUTO_INCREMENT` column from its leading position. MySQL's structural rule "every `AUTO_INCREMENT` column must be a leading key column" then rejected the CREATE TABLE with `Error 1075`. v0.72.0 + v0.72.1 shipped Shape A with this case broken — workaround was "use a non-AUTO_INCREMENT PK on the source or migrate to PG." v0.72.2 closes it: when the rewritten PK contains an `AUTO_INCREMENT` column that doesn't lead, the MySQL DDL emitter now synthesizes a `UNIQUE KEY uq_<table>_<col> (<col>)` inline in the CREATE TABLE, satisfying MySQL's rule via a secondary unique index. The DP-2 leading-shard invariant (discriminator first) is preserved — operators retain source-side identity management — and the synthesis is scoped to the in-PK-but-not-leading case so the existing v0.49.0 / GitHub #25 no-supporting-index loud-error path stays unchanged.
+
+### Fixed
+
+- **`fix(engines/mysql): Bug 82 — synthesize supporting UNIQUE KEY when AUTO_INCREMENT is demoted by Shape A rewrite`** — `inlineAutoIncrementIndex` now detects the "auto column in PK but not leading" case (the ADR-0048 Shape A IR-pass output) and synthesizes a unique index named `uq_<table>_<col>` on the auto column. The synthesized index ships inline in `CREATE TABLE`; Phase 2 (`CreateIndexes`) is unaffected because the synthesized index isn't in `table.Indexes` (no double-create risk). The existing v0.49.0 logic for non-PK auto columns with operator-declared supporting indexes is preserved unchanged. Owner-confirmed via the AskUserQuestion design dialogue (option (b) over (a)/(c)/(d) — see the ADR-0048 Amendment 2026-05-22 section for the alternatives + correctness analysis).
+
+### Tests
+
+- **`test(engines/mysql): bug82_autoincrement_pk_demotion_test.go`** — five unit pins covering: the synthesis case, the end-to-end `emitTableDef` output including the DP-2 PK-leading invariant, the regression guard that the standard `id BIGINT AUTO_INCREMENT PRIMARY KEY` shape still returns nil (PK leads, no synthesis needed), the precedence rule (operator-declared supporting index wins over synthesis), and the scope-narrow guard (no synthesis when auto col is not in PK and no operator index exists; pre-v0.49.0 behavior preserved for non-Shape-A schemas).
+
+- **`test(integration): MySQL → MySQL Shape A with AUTO_INCREMENT-in-PK source`** — new build-tagged integration test (`TestMigrate_MySQL_ShapeA_Bug82_AutoIncrementInPK`) exercises the full migrate path on a real MySQL pair with the canonical `id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY` source. Asserts (1) non-zero rows on the target, (2) the synthesized `uq_widgets_id` UNIQUE KEY is present in `information_schema.statistics`, (3) the DP-2 PK-leading invariant holds (target PK leads with `source_shard_id`). The third assertion is a load-bearing regression guard against option (a) (engine-specific PK ordering) ever creeping back in.
+
+### Compatibility
+
+- **Drop-in upgrade from v0.72.1.** No CLI surface change, no storage shape change, no behavior change outside the previously-broken MySQL Shape A AUTO_INCREMENT path. Anyone running Shape A on MySQL with a non-AUTO_INCREMENT PK (the workaround) sees no observable change; the workaround note in v0.72.1's release notes is now obsolete and the AUTO_INCREMENT path "just works." Non-MySQL targets are entirely unaffected.
+
 ## [0.72.1]
 
 **Hotfix — ADR-0048 Shape A end-to-end correctness (Bugs 80 + 81 paired).** The v0.72.0 post-release regression cycle surfaced two paired Shape A regressions: the row reader built its SELECT against the schema-mutated `*ir.Table` (Bug 80, loud — every Shape A bulk-copy crashed with `SQLSTATE 42703 "column does not exist"` on PG / `Error 1054 "Unknown column ... in field list"` on MySQL), and the `shardPreflightProber` interface had no engine implementation so the ADR-0048 DP-2 populated-target three-point preflight was a complete no-op (Bug 81, silent-on-fix — fixing only Bug 80 would have swapped a loud crash for a silent cross-shard collision). v0.72.1 ships both fixes together per the cycle's "pair-the-class" recommendation.
