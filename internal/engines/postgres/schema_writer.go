@@ -595,7 +595,29 @@ func (w *SchemaWriter) AlterAddColumn(ctx context.Context, table *ir.Table, cols
 		return nil
 	}
 	for _, col := range cols {
-		def, err := emitColumnDef(table, col, w.emitOpts())
+		// Bug 83 v0.73.1 — force Nullable=true on the emitted ADD COLUMN
+		// regardless of the IR's Nullable flag. Two reasons:
+		//
+		//   1. Source-of-IR fidelity: pgoutput's RelationMessage (the
+		//      wire shape the CDC reader projects into the post-DDL IR)
+		//      does NOT carry pg_attribute.attnotnull, so every column
+		//      in the CDC-projected IR has Nullable=false by zero-value
+		//      default. Emitting that as `ADD COLUMN ... NOT NULL` on a
+		//      non-empty target raises SQLSTATE 23502 — the exact
+		//      failure shape of Bug 83 v0.73.1's PG integration pin.
+		//
+		//   2. v1 trade-off: target columns added via Phase 2 live
+		//      cross-shard coordination land nullable. Operators who
+		//      need NOT NULL on the target can `ALTER COLUMN SET NOT
+		//      NULL` post-apply (Phase 2 of the consolidation flow is
+		//      idempotent — re-running with a tightened nullability
+		//      will land the constraint once the existing nulls are
+		//      backfilled).
+		//
+		// Documented in CHANGELOG v0.73.1.
+		emitCol := *col
+		emitCol.Nullable = true
+		def, err := emitColumnDef(table, &emitCol, w.emitOpts())
 		if err != nil {
 			return fmt.Errorf("alter add column: emit %q: %w", col.Name, err)
 		}

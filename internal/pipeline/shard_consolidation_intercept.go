@@ -93,7 +93,9 @@ func interceptSchemaSnapshotsForCoordination(
 	// before the for-select loop drains `in` so the first CDC
 	// SchemaSnapshot per seeded table is correctly classified as a
 	// post-DDL boundary (rather than treated as the cold-start anchor
-	// — the Bug 83 root cause).
+	// — the Bug 83 root cause). Key alignment between the seed and
+	// the CDC-emitted SchemaSnapshot is handled by lookupSeedCache
+	// below — see its docstring for the MySQL bare-name fallback case.
 	for i := range seed {
 		snap := seed[i]
 		key := snap.QualifiedName()
@@ -122,7 +124,16 @@ func interceptSchemaSnapshotsForCoordination(
 					continue
 				}
 				key := snap.QualifiedName()
-				pre, hadPre := cache[key]
+				pre, hadPre, preKey := lookupSeedCache(cache, key, snap.Table)
+				// Promote the seed entry to the qualified key when the
+				// fallback hit (so subsequent CDC snapshots also resolve
+				// against the qualified name; preKey != key means the
+				// seed was stored under a different key — the bare-name
+				// MySQL case).
+				if hadPre && preKey != key {
+					delete(cache, preKey)
+					delete(version, preKey)
+				}
 				cache[key] = snap.IR
 				version[key]++
 				if !hadPre {
@@ -212,6 +223,33 @@ func synthesizeColdStartSeedSnapshots(schema *ir.Schema) []ir.SchemaSnapshot {
 		})
 	}
 	return out
+}
+
+// lookupSeedCache resolves a SchemaSnapshot's cache entry, falling
+// back to the bare table-name key when the qualified-name lookup
+// misses. This handles the MySQL Bug 83 v0.73.1 fix: the MySQL
+// source schema reader doesn't populate ir.Table.Schema (it reads
+// information_schema for a single bound DB; the IR convention pre-
+// v0.73.1 left Schema empty), so the cold-start seed's
+// QualifiedName() is the bare table name. The MySQL CDC reader, in
+// contrast, sets Schema to the DSN's DB name on its emitted
+// SchemaSnapshot, so the first CDC snapshot's QualifiedName is
+// "<db>.<table>" — a MISS against the bare-name seed without this
+// fallback.
+//
+// On a fallback hit, the returned preKey is the bare key (caller
+// promotes to qualified key so subsequent snapshots resolve directly).
+// On no hit, preKey is empty.
+func lookupSeedCache(cache map[string]*ir.Table, qualifiedKey, bareKey string) (pre *ir.Table, hadPre bool, preKey string) {
+	if t, ok := cache[qualifiedKey]; ok {
+		return t, true, qualifiedKey
+	}
+	if qualifiedKey != bareKey {
+		if t, ok := cache[bareKey]; ok {
+			return t, true, bareKey
+		}
+	}
+	return nil, false, ""
 }
 
 // deriveDDLText renders a deterministic textual identity for a

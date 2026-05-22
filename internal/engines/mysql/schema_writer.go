@@ -330,7 +330,20 @@ func (w *SchemaWriter) AlterAddColumn(ctx context.Context, table *ir.Table, cols
 		if exists {
 			continue
 		}
-		def, err := emitColumnDef(col)
+		// Bug 83 v0.73.1 — force Nullable=true on the emitted ADD
+		// COLUMN regardless of the IR's Nullable flag. MySQL's binlog-
+		// derived CDC IR DOES carry nullability faithfully (loaded from
+		// information_schema), but the PG sibling does not (pgoutput's
+		// RelationMessage omits attnotnull); to keep the two engines'
+		// behaviour symmetric — and to give operators a single
+		// predictable rule for the live cross-shard coordination flow
+		// — both engines emit ADD COLUMN nullable. Operators who need
+		// NOT NULL on the target can apply `ALTER COLUMN SET NOT NULL`
+		// post-apply once the existing rows have a backfilled value.
+		// See CHANGELOG v0.73.1.
+		emitCol := *col
+		emitCol.Nullable = true
+		def, err := emitColumnDef(&emitCol)
 		if err != nil {
 			return fmt.Errorf("alter add column: emit %q: %w", col.Name, err)
 		}

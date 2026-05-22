@@ -279,6 +279,59 @@ func TestIntercept_SeededFromColdStart_MultiTable(t *testing.T) {
 	}
 }
 
+// TestIntercept_SeededFromColdStart_BareNameKeyAlignment pins the
+// Bug 83 v0.73.1 (second iteration) MySQL key-mismatch case: the
+// MySQL source schema reader leaves ir.Table.Schema empty, so the
+// cold-start seed's QualifiedName() is the bare table name; the
+// MySQL CDC reader, however, populates Schema (from the DSN's DB
+// name) on its emitted SchemaSnapshot, so the first CDC snapshot's
+// QualifiedName is "<db>.<table>". Without the bare-name-fallback
+// lookup added in v0.73.1, the qualified-name miss made the
+// intercept treat the first CDC snapshot as the cold-start anchor
+// (the exact regression the v0.73.1 seed mechanism was supposed to
+// fix). This test pins the fix on the MySQL keying convention so a
+// future refactor can't silently regress.
+func TestIntercept_SeededFromColdStart_BareNameKeyAlignment(t *testing.T) {
+	t.Parallel()
+	clock := newMockClock(testClockNow())
+	store := newFakeLeaseStore(clock.Now)
+	prober := &fakeProber{}
+	applier := &fakeShapeApplier{}
+	mgr := newTestLeaseManager(t, store, "stream-a", LeaseConfig{LeaseDuration: time.Hour, RenewDeadline: 30 * time.Minute, RetryPeriod: 5 * time.Minute}, clock)
+	router, err := NewBoundaryRouter(mgr, applier, prober)
+	if err != nil {
+		t.Fatalf("NewBoundaryRouter: %v", err)
+	}
+
+	// MySQL-style: source IR has Schema="" (bare-name seed key).
+	pre := fixtureTable("widgets", "id")
+	// pre.Schema is empty (matches MySQL source-reader convention)
+	post := fixtureTable("widgets", "id", "price")
+	post.Schema = "source_db" // CDC-emitted SchemaSnapshot includes Schema
+
+	seed := []ir.SchemaSnapshot{
+		{Schema: "", Table: "widgets", IR: pre},
+	}
+	in := make(chan ir.Change, 1)
+	in <- ir.SchemaSnapshot{Schema: "source_db", Table: "widgets", Position: ir.Position{Token: "p1"}, IR: post}
+	close(in)
+
+	var errStore atomic.Pointer[error]
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	out := interceptSchemaSnapshotsForCoordination(ctx, in, seed, router, &errStore)
+	got := drainChanges(t, out, 2*time.Second)
+	if len(got) != 1 {
+		t.Fatalf("expected exactly 1 change forwarded (the CDC SchemaSnapshot); got %d", len(got))
+	}
+	if applier.addColCalls != 1 {
+		t.Errorf("expected exactly 1 AlterAddColumn call (Bug 83 v0.73.1: bare-name seed + qualified CDC snapshot must still route the boundary); got %d", applier.addColCalls)
+	}
+	if errStore.Load() != nil {
+		t.Errorf("errStore should be empty after successful route; got %v", *errStore.Load())
+	}
+}
+
 func TestSynthesizeColdStartSeedSnapshots(t *testing.T) {
 	t.Parallel()
 	// nil schema → empty seed (defensive).
