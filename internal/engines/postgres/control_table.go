@@ -17,6 +17,13 @@ import (
 // positions. ADR-0007 picks the name; v1 honors it verbatim.
 const controlTableName = "sluice_cdc_state"
 
+// shardConsolidationLeaseTableName is the ADR-0054 per-target control
+// table that holds the cross-shard DDL-coordination lease (one row per
+// consolidated target table). Lives in the same controlSchema as
+// sluice_cdc_state; additive, never touches existing data. See
+// ensureShardConsolidationLeaseTable.
+const shardConsolidationLeaseTableName = "sluice_shard_consolidation_lease"
+
 // ensureControlTable creates the per-target sluice_cdc_state table
 // in the named schema if it doesn't exist. Idempotent — second-and-
 // later calls are no-ops courtesy of CREATE TABLE IF NOT EXISTS.
@@ -79,6 +86,238 @@ func ensureControlTable(ctx context.Context, db *sql.DB, schema string) error {
 	alter = "ALTER TABLE " + tableRef + " ADD COLUMN IF NOT EXISTS target_schema TEXT NULL"
 	if _, err := db.ExecContext(ctx, alter); err != nil {
 		return fmt.Errorf("postgres: ensure control table: add target_schema: %w", err)
+	}
+	return nil
+}
+
+// shardConsolidationLeaseRow is the engine-internal mirror of
+// pipeline.ShardConsolidationLeaseRow. Defined here so the engine's
+// lease primitives don't import the pipeline package (which would
+// create a cycle); the ChangeApplier's interface methods (in
+// shard_consolidation_lease.go) translate between this and the
+// pipeline shape.
+type shardConsolidationLeaseRow struct {
+	TargetTableFullName  string
+	LeaseHolderStreamID  string
+	LeaseExpiresAt       sql.NullTime
+	DDLText              string
+	DDLChecksum          string
+	AppliedSchemaVersion int64
+	AppliedAt            sql.NullTime
+}
+
+// tryAcquireShardLease conditionally INSERTs / UPDATEs a lease row
+// under the row-level lock of the conflict-on-PK ON CONFLICT path.
+// The acquire wins iff one of:
+//
+//   - The row is ABSENT (the INSERT lands cleanly), or
+//   - The row's lease_expires_at <= now() AND applied_at IS NULL
+//     (EXPIRED takeover-eligible).
+//
+// A failed acquire (contention or APPLIED state) returns the current
+// row so the caller can classify into LeaseState.
+//
+// Implementation: a single SQL statement does the conditional path.
+// We use an INSERT ... ON CONFLICT (target_table_full_name) DO UPDATE
+// SET ... WHERE clause: the ON CONFLICT path conditionally updates iff
+// the existing row is takeover-eligible. RETURNING + a follow-up
+// SELECT (under PG's snapshot semantics inside the same tx) gives the
+// caller a consistent view.
+func tryAcquireShardLease(ctx context.Context, db *sql.DB, schema, tableName, streamID string, expires time.Time) (acquired bool, current shardConsolidationLeaseRow, err error) {
+	tableRef := quoteIdent(schema) + "." + quoteIdent(shardConsolidationLeaseTableName)
+	// Single-statement upsert; RETURNING gives back whether the
+	// statement actually wrote (acquired) or hit the WHERE-guard
+	// (contended). When acquired, the returned row reflects the
+	// just-acquired state (including any prior-holder ddl_text the
+	// guard preserves below). When contended, we run a follow-up
+	// SELECT to load the current row so the caller can classify.
+	//
+	// The ON CONFLICT WHERE clause is the locked-down conditional:
+	// only the EXPIRED-takeover case wins on conflict. APPLIED rows
+	// (applied_at IS NOT NULL) and HELD rows (lease_expires_at > now)
+	// both fall through to no-update, the RETURNING is empty, and the
+	// SELECT below loads the current row.
+	q := `
+		INSERT INTO ` + tableRef + ` (
+			target_table_full_name,
+			lease_holder_stream_id,
+			lease_expires_at,
+			applied_schema_version,
+			created_at
+		)
+		VALUES ($1, $2, $3, 0, CURRENT_TIMESTAMP)
+		ON CONFLICT (target_table_full_name)
+		DO UPDATE SET
+			lease_holder_stream_id = EXCLUDED.lease_holder_stream_id,
+			lease_expires_at       = EXCLUDED.lease_expires_at
+		WHERE
+			` + tableRef + `.lease_expires_at <= CURRENT_TIMESTAMP
+			AND ` + tableRef + `.applied_at IS NULL
+		RETURNING
+			target_table_full_name,
+			COALESCE(lease_holder_stream_id, ''),
+			lease_expires_at,
+			COALESCE(ddl_text, ''),
+			COALESCE(ddl_checksum, ''),
+			applied_schema_version,
+			applied_at`
+	row := db.QueryRowContext(ctx, q, tableName, streamID, expires)
+	var got shardConsolidationLeaseRow
+	scanErr := row.Scan(
+		&got.TargetTableFullName,
+		&got.LeaseHolderStreamID,
+		&got.LeaseExpiresAt,
+		&got.DDLText,
+		&got.DDLChecksum,
+		&got.AppliedSchemaVersion,
+		&got.AppliedAt,
+	)
+	switch {
+	case errors.Is(scanErr, sql.ErrNoRows):
+		// Conditional upsert WHERE-guard rejected the conflict path:
+		// row exists but is HELD or APPLIED. Load it so the caller
+		// can classify.
+		got, ok, err := selectShardLease(ctx, db, schema, tableName)
+		if err != nil {
+			return false, shardConsolidationLeaseRow{}, err
+		}
+		if !ok {
+			// Very rare: row vanished between the failed RETURNING
+			// and the SELECT (some other stream applied + a GC
+			// sweep). Treat as transient — caller will retry.
+			return false, shardConsolidationLeaseRow{}, errors.New("postgres: lease acquire: row vanished between insert and reload")
+		}
+		return false, got, nil
+	case scanErr != nil:
+		return false, shardConsolidationLeaseRow{}, fmt.Errorf("postgres: lease acquire: %w", scanErr)
+	}
+	return true, got, nil
+}
+
+// heartbeatShardLease extends lease_expires_at to expires iff the row
+// is still held by streamID. Returns extended=false when a peer has
+// taken over (the holder's apply path must exit).
+func heartbeatShardLease(ctx context.Context, db *sql.DB, schema, tableName, streamID string, expires time.Time) (extended bool, err error) {
+	tableRef := quoteIdent(schema) + "." + quoteIdent(shardConsolidationLeaseTableName)
+	// The WHERE guard makes the UPDATE conditional on continued
+	// ownership: holder must match AND applied_at must still be
+	// NULL. A holder that has already finalized would no-op here, but
+	// the heartbeat loop doesn't fire after Apply closes stopCh, so
+	// this case shouldn't arise in practice.
+	q := "UPDATE " + tableRef + " SET lease_expires_at = $1 " +
+		"WHERE target_table_full_name = $2 " +
+		"AND lease_holder_stream_id = $3 " +
+		"AND applied_at IS NULL"
+	res, err := db.ExecContext(ctx, q, expires, tableName, streamID)
+	if err != nil {
+		return false, fmt.Errorf("postgres: lease heartbeat: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("postgres: lease heartbeat: rows affected: %w", err)
+	}
+	return n > 0, nil
+}
+
+// recordShardLeaseDDLText UPDATEs ddl_text for the held lease. Same
+// holder-guard as heartbeatShardLease.
+func recordShardLeaseDDLText(ctx context.Context, db *sql.DB, schema, tableName, streamID, ddlText string) (recorded bool, err error) {
+	tableRef := quoteIdent(schema) + "." + quoteIdent(shardConsolidationLeaseTableName)
+	q := "UPDATE " + tableRef + " SET ddl_text = $1 " +
+		"WHERE target_table_full_name = $2 " +
+		"AND lease_holder_stream_id = $3 " +
+		"AND applied_at IS NULL"
+	res, err := db.ExecContext(ctx, q, ddlText, tableName, streamID)
+	if err != nil {
+		return false, fmt.Errorf("postgres: lease record ddl: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("postgres: lease record ddl: rows affected: %w", err)
+	}
+	return n > 0, nil
+}
+
+// finalizeShardLeaseApply records applied_at + ddl_text + ddl_checksum
+// + applied_schema_version atomically, gated on continued ownership.
+func finalizeShardLeaseApply(ctx context.Context, db *sql.DB, schema, tableName, streamID, ddlText, ddlChecksum string, version int64) (finalized bool, err error) {
+	tableRef := quoteIdent(schema) + "." + quoteIdent(shardConsolidationLeaseTableName)
+	q := "UPDATE " + tableRef + " SET " +
+		"ddl_text = $1, ddl_checksum = $2, " +
+		"applied_schema_version = $3, applied_at = CURRENT_TIMESTAMP " +
+		"WHERE target_table_full_name = $4 " +
+		"AND lease_holder_stream_id = $5 " +
+		"AND applied_at IS NULL"
+	res, err := db.ExecContext(ctx, q, ddlText, ddlChecksum, version, tableName, streamID)
+	if err != nil {
+		return false, fmt.Errorf("postgres: lease finalize: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("postgres: lease finalize: rows affected: %w", err)
+	}
+	return n > 0, nil
+}
+
+// selectShardLease loads the row for tableName. Returns ok=false when
+// no row exists (ABSENT) or when the table doesn't exist (dry-run
+// path before EnsureControlTable).
+func selectShardLease(ctx context.Context, db *sql.DB, schema, tableName string) (row shardConsolidationLeaseRow, ok bool, err error) {
+	tableRef := quoteIdent(schema) + "." + quoteIdent(shardConsolidationLeaseTableName)
+	q := "SELECT target_table_full_name, COALESCE(lease_holder_stream_id, ''), " +
+		"lease_expires_at, COALESCE(ddl_text, ''), COALESCE(ddl_checksum, ''), " +
+		"applied_schema_version, applied_at " +
+		"FROM " + tableRef + " WHERE target_table_full_name = $1"
+	r := db.QueryRowContext(ctx, q, tableName)
+	scanErr := r.Scan(
+		&row.TargetTableFullName,
+		&row.LeaseHolderStreamID,
+		&row.LeaseExpiresAt,
+		&row.DDLText,
+		&row.DDLChecksum,
+		&row.AppliedSchemaVersion,
+		&row.AppliedAt,
+	)
+	switch {
+	case errors.Is(scanErr, sql.ErrNoRows):
+		return shardConsolidationLeaseRow{}, false, nil
+	case isUndefinedRelationErr(scanErr):
+		return shardConsolidationLeaseRow{}, false, nil
+	case scanErr != nil:
+		return shardConsolidationLeaseRow{}, false, fmt.Errorf("postgres: lease select: %w", scanErr)
+	}
+	return row, true, nil
+}
+
+// ensureShardConsolidationLeaseTable creates the per-target
+// sluice_shard_consolidation_lease control table (ADR-0054 §1) in the
+// named schema if it doesn't exist. Idempotent — second-and-later
+// calls are no-ops courtesy of CREATE TABLE IF NOT EXISTS. ADDITIVE:
+// never touches sluice_cdc_state, sluice_cdc_schema_history, or any
+// existing data.
+//
+// The table holds one row per consolidated target table. All shards'
+// streams converge on the same row for the same target table; the
+// conditional-UPDATE acquire path (LeaseManager.Acquire) provides the
+// mutex semantics, and the heartbeat goroutine extends expires_at on
+// the holder's RetryPeriod cadence. See ADR-0054 §1 for the state
+// machine and §2 for the timing defaults.
+func ensureShardConsolidationLeaseTable(ctx context.Context, db *sql.DB, schema string) error {
+	tableRef := quoteIdent(schema) + "." + quoteIdent(shardConsolidationLeaseTableName)
+	ddl := `
+		CREATE TABLE IF NOT EXISTS ` + tableRef + ` (
+			target_table_full_name        VARCHAR(512) NOT NULL,
+			lease_holder_stream_id        VARCHAR(64)  NULL,
+			lease_expires_at              TIMESTAMP    NULL,
+			ddl_text                      TEXT         NULL,
+			ddl_checksum                  VARCHAR(64)  NULL,
+			applied_schema_version        BIGINT       NOT NULL DEFAULT 0,
+			applied_at                    TIMESTAMP    NULL,
+			created_at                    TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			PRIMARY KEY (target_table_full_name)
+		)`
+	if _, err := db.ExecContext(ctx, ddl); err != nil {
+		return fmt.Errorf("postgres: ensure shard consolidation lease table: %w", err)
 	}
 	return nil
 }

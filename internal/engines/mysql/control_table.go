@@ -20,6 +20,11 @@ import (
 // configurable prefix lands as part of roadmap §10.
 const controlTableName = "sluice_cdc_state"
 
+// shardConsolidationLeaseTableName is the ADR-0054 per-target control
+// table that holds the cross-shard DDL-coordination lease (one row per
+// consolidated target table). See ensureShardConsolidationLeaseTable.
+const shardConsolidationLeaseTableName = "sluice_shard_consolidation_lease"
+
 // ensureControlTable creates the per-target sluice_cdc_state table
 // if it doesn't exist. Idempotent — second-and-later calls are no-
 // ops courtesy of CREATE TABLE IF NOT EXISTS.
@@ -83,6 +88,252 @@ func ensureControlTable(ctx context.Context, db *sql.DB) error {
 		return err
 	}
 	return ensureCrossEngineParityColumn(ctx, db, "target_schema", "VARCHAR(255) NULL")
+}
+
+// shardConsolidationLeaseRow is the engine-internal mirror of
+// ir.ShardConsolidationLeaseRow. Defined here so the engine's lease
+// primitives keep their database/sql NullTime types local; the
+// shard_consolidation_lease.go file converts to the pipeline-facing
+// shape.
+type shardConsolidationLeaseRow struct {
+	TargetTableFullName  string
+	LeaseHolderStreamID  string
+	LeaseExpiresAt       sql.NullTime
+	DDLText              string
+	DDLChecksum          string
+	AppliedSchemaVersion int64
+	AppliedAt            sql.NullTime
+}
+
+// tryAcquireShardLease conditionally INSERTs / UPDATEs a lease row.
+// The acquire wins iff one of:
+//
+//   - The row is ABSENT (the INSERT lands cleanly), or
+//   - The row's lease_expires_at <= now() AND applied_at IS NULL
+//     (EXPIRED takeover-eligible).
+//
+// MySQL has no INSERT ... ON CONFLICT WHERE form (unlike PG). We use
+// a SELECT ... FOR UPDATE inside a single tx to serialise concurrent
+// acquires, then INSERT / UPDATE / no-op based on the loaded row's
+// state. The row-level lock on the lease row scopes contention to
+// the consolidated target table, so other tables proceed in parallel.
+func tryAcquireShardLease(ctx context.Context, db *sql.DB, tableName, streamID string, expires time.Time) (acquired bool, current shardConsolidationLeaseRow, err error) {
+	tx, beginErr := db.BeginTx(ctx, nil)
+	if beginErr != nil {
+		return false, shardConsolidationLeaseRow{}, fmt.Errorf("mysql: lease acquire: begin tx: %w", beginErr)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
+	const selectQ = "SELECT target_table_full_name, COALESCE(lease_holder_stream_id, ''), " +
+		"lease_expires_at, COALESCE(ddl_text, ''), COALESCE(ddl_checksum, ''), " +
+		"applied_schema_version, applied_at " +
+		"FROM `" + shardConsolidationLeaseTableName + "` " +
+		"WHERE target_table_full_name = ? FOR UPDATE"
+	var row shardConsolidationLeaseRow
+	scanErr := tx.QueryRowContext(ctx, selectQ, tableName).Scan(
+		&row.TargetTableFullName,
+		&row.LeaseHolderStreamID,
+		&row.LeaseExpiresAt,
+		&row.DDLText,
+		&row.DDLChecksum,
+		&row.AppliedSchemaVersion,
+		&row.AppliedAt,
+	)
+	switch {
+	case errors.Is(scanErr, sql.ErrNoRows):
+		// ABSENT: insert fresh row.
+		const insertQ = "INSERT INTO `" + shardConsolidationLeaseTableName + "` " +
+			"(target_table_full_name, lease_holder_stream_id, lease_expires_at, applied_schema_version) " +
+			"VALUES (?, ?, ?, 0)"
+		if _, execErr := tx.ExecContext(ctx, insertQ, tableName, streamID, expires); execErr != nil {
+			return false, shardConsolidationLeaseRow{}, fmt.Errorf("mysql: lease acquire: insert: %w", execErr)
+		}
+		if commitErr := tx.Commit(); commitErr != nil {
+			return false, shardConsolidationLeaseRow{}, fmt.Errorf("mysql: lease acquire: commit: %w", commitErr)
+		}
+		committed = true
+		return true, shardConsolidationLeaseRow{
+			TargetTableFullName: tableName,
+			LeaseHolderStreamID: streamID,
+			LeaseExpiresAt:      sql.NullTime{Time: expires, Valid: true},
+		}, nil
+	case scanErr != nil:
+		return false, shardConsolidationLeaseRow{}, fmt.Errorf("mysql: lease acquire: select: %w", scanErr)
+	}
+	// Row exists. Classify state:
+	//   APPLIED (applied_at NOT NULL) → contended; return current
+	//     (peer should advance via Observe, not re-acquire).
+	//   HELD (lease_expires_at > now()) → contended; return current.
+	//   EXPIRED (lease_expires_at <= now() AND applied_at IS NULL) →
+	//     takeover-eligible; UPDATE holder + expires; preserve
+	//     ddl_text so the caller's probe-and-record can read it.
+	if row.AppliedAt.Valid {
+		// Commit the (read-only) tx and return.
+		if commitErr := tx.Commit(); commitErr != nil {
+			return false, shardConsolidationLeaseRow{}, fmt.Errorf("mysql: lease acquire: commit (applied): %w", commitErr)
+		}
+		committed = true
+		return false, row, nil
+	}
+	// We must compare lease_expires_at against the target's wall-clock
+	// "now()". MySQL CURRENT_TIMESTAMP is the source of truth here so
+	// peer streams agree on expiry.
+	var nowTime time.Time
+	if err := tx.QueryRowContext(ctx, "SELECT CURRENT_TIMESTAMP").Scan(&nowTime); err != nil {
+		return false, shardConsolidationLeaseRow{}, fmt.Errorf("mysql: lease acquire: read now: %w", err)
+	}
+	if row.LeaseExpiresAt.Valid && row.LeaseExpiresAt.Time.After(nowTime) {
+		// HELD by another stream.
+		if commitErr := tx.Commit(); commitErr != nil {
+			return false, shardConsolidationLeaseRow{}, fmt.Errorf("mysql: lease acquire: commit (held): %w", commitErr)
+		}
+		committed = true
+		return false, row, nil
+	}
+	// EXPIRED takeover-eligible. UPDATE holder + expires; PRESERVE
+	// ddl_text so probe-and-record on the caller side has the prior
+	// holder's recorded text.
+	const updateQ = "UPDATE `" + shardConsolidationLeaseTableName + "` SET " +
+		"lease_holder_stream_id = ?, lease_expires_at = ? " +
+		"WHERE target_table_full_name = ?"
+	if _, execErr := tx.ExecContext(ctx, updateQ, streamID, expires, tableName); execErr != nil {
+		return false, shardConsolidationLeaseRow{}, fmt.Errorf("mysql: lease acquire: takeover update: %w", execErr)
+	}
+	if commitErr := tx.Commit(); commitErr != nil {
+		return false, shardConsolidationLeaseRow{}, fmt.Errorf("mysql: lease acquire: commit (takeover): %w", commitErr)
+	}
+	committed = true
+	// Return the row we acquired, with prior holder's ddl_text
+	// preserved in case the caller needs it for probe-and-record.
+	row.LeaseHolderStreamID = streamID
+	row.LeaseExpiresAt = sql.NullTime{Time: expires, Valid: true}
+	return true, row, nil
+}
+
+// heartbeatShardLease extends lease_expires_at iff the row is still
+// held by streamID.
+func heartbeatShardLease(ctx context.Context, db *sql.DB, tableName, streamID string, expires time.Time) (extended bool, err error) {
+	const q = "UPDATE `" + shardConsolidationLeaseTableName + "` SET lease_expires_at = ? " +
+		"WHERE target_table_full_name = ? " +
+		"AND lease_holder_stream_id = ? " +
+		"AND applied_at IS NULL"
+	res, err := db.ExecContext(ctx, q, expires, tableName, streamID)
+	if err != nil {
+		return false, fmt.Errorf("mysql: lease heartbeat: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("mysql: lease heartbeat: rows affected: %w", err)
+	}
+	return n > 0, nil
+}
+
+// recordShardLeaseDDLText UPDATEs ddl_text for the held lease.
+func recordShardLeaseDDLText(ctx context.Context, db *sql.DB, tableName, streamID, ddlText string) (recorded bool, err error) {
+	const q = "UPDATE `" + shardConsolidationLeaseTableName + "` SET ddl_text = ? " +
+		"WHERE target_table_full_name = ? " +
+		"AND lease_holder_stream_id = ? " +
+		"AND applied_at IS NULL"
+	res, err := db.ExecContext(ctx, q, ddlText, tableName, streamID)
+	if err != nil {
+		return false, fmt.Errorf("mysql: lease record ddl: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("mysql: lease record ddl: rows affected: %w", err)
+	}
+	return n > 0, nil
+}
+
+// finalizeShardLeaseApply records applied_at + ddl_text + ddl_checksum
+// + applied_schema_version atomically, gated on continued ownership.
+//
+// MySQL's RowsAffected uses changed-rows semantics by default — a UPDATE
+// that touches the same row with the same new value reports 0 rows
+// affected rather than 1. The lease primitive's UPDATEs always change
+// applied_at (NULL → CURRENT_TIMESTAMP), so the "0 rows means contention"
+// detection is reliable here.
+func finalizeShardLeaseApply(ctx context.Context, db *sql.DB, tableName, streamID, ddlText, ddlChecksum string, version int64) (finalized bool, err error) {
+	const q = "UPDATE `" + shardConsolidationLeaseTableName + "` SET " +
+		"ddl_text = ?, ddl_checksum = ?, applied_schema_version = ?, applied_at = CURRENT_TIMESTAMP " +
+		"WHERE target_table_full_name = ? " +
+		"AND lease_holder_stream_id = ? " +
+		"AND applied_at IS NULL"
+	res, err := db.ExecContext(ctx, q, ddlText, ddlChecksum, version, tableName, streamID)
+	if err != nil {
+		return false, fmt.Errorf("mysql: lease finalize: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("mysql: lease finalize: rows affected: %w", err)
+	}
+	return n > 0, nil
+}
+
+// selectShardLease loads the row for tableName. Returns ok=false when
+// no row exists OR when the table itself is missing (pre-Ensure
+// inspection path).
+func selectShardLease(ctx context.Context, db *sql.DB, tableName string) (row shardConsolidationLeaseRow, ok bool, err error) {
+	const q = "SELECT target_table_full_name, COALESCE(lease_holder_stream_id, ''), " +
+		"lease_expires_at, COALESCE(ddl_text, ''), COALESCE(ddl_checksum, ''), " +
+		"applied_schema_version, applied_at " +
+		"FROM `" + shardConsolidationLeaseTableName + "` " +
+		"WHERE target_table_full_name = ?"
+	r := db.QueryRowContext(ctx, q, tableName)
+	scanErr := r.Scan(
+		&row.TargetTableFullName,
+		&row.LeaseHolderStreamID,
+		&row.LeaseExpiresAt,
+		&row.DDLText,
+		&row.DDLChecksum,
+		&row.AppliedSchemaVersion,
+		&row.AppliedAt,
+	)
+	switch {
+	case errors.Is(scanErr, sql.ErrNoRows):
+		return shardConsolidationLeaseRow{}, false, nil
+	case isMySQLMissingTableErr(scanErr):
+		return shardConsolidationLeaseRow{}, false, nil
+	case scanErr != nil:
+		return shardConsolidationLeaseRow{}, false, fmt.Errorf("mysql: lease select: %w", scanErr)
+	}
+	return row, true, nil
+}
+
+// ensureShardConsolidationLeaseTable creates the per-target
+// sluice_shard_consolidation_lease control table (ADR-0054 §1) if it
+// doesn't exist. Idempotent — second-and-later calls are no-ops
+// courtesy of CREATE TABLE IF NOT EXISTS. ADDITIVE: never touches
+// sluice_cdc_state, sluice_cdc_schema_history, or any existing data.
+//
+// MySQL CREATE TABLE inside an explicit transaction implicit-commits,
+// so callers run this from the *sql.DB pool at applier startup,
+// alongside ensureControlTable / ensureSchemaHistoryTable.
+//
+// See ADR-0054 §1 for the row schema and state machine, §2 for the
+// timing defaults that govern lease_expires_at extension cadence.
+func ensureShardConsolidationLeaseTable(ctx context.Context, db *sql.DB) error {
+	const ddl = `
+		CREATE TABLE IF NOT EXISTS ` + "`" + shardConsolidationLeaseTableName + "`" + ` (
+			target_table_full_name        VARCHAR(512) NOT NULL,
+			lease_holder_stream_id        VARCHAR(64)  NULL,
+			lease_expires_at              TIMESTAMP    NULL,
+			ddl_text                      TEXT         NULL,
+			ddl_checksum                  VARCHAR(64)  NULL,
+			applied_schema_version        BIGINT       NOT NULL DEFAULT 0,
+			applied_at                    TIMESTAMP    NULL,
+			created_at                    TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			PRIMARY KEY (target_table_full_name)
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
+	if _, err := db.ExecContext(ctx, ddl); err != nil {
+		return fmt.Errorf("mysql: ensure shard consolidation lease table: %w", wrapDDLError(err))
+	}
+	return nil
 }
 
 // ensureCrossEngineParityColumn adds a column to an existing control

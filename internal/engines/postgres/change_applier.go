@@ -605,7 +605,10 @@ func (a *ChangeApplier) EnsureControlTable(ctx context.Context) error {
 	if err := ensureControlTable(ctx, a.db, a.controlSchema); err != nil {
 		return err
 	}
-	return ensureSchemaHistoryTable(ctx, a.db, a.controlSchema)
+	if err := ensureSchemaHistoryTable(ctx, a.db, a.controlSchema); err != nil {
+		return err
+	}
+	return ensureShardConsolidationLeaseTable(ctx, a.db, a.controlSchema)
 }
 
 // CompactSchemaHistoryBelow implements [ir.SchemaHistoryCompactor]

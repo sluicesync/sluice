@@ -1,0 +1,100 @@
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
+package mysql
+
+// ADR-0054 Shape A Phase 2 — ShardConsolidationLeaseStore engine impl.
+//
+// The pipeline's LeaseManager owns the state-machine + heartbeat
+// goroutine; this file's methods on *ChangeApplier own the
+// engine-specific SQL via the primitives in control_table.go. The
+// pipeline probes for this surface via type-assertion on the applier;
+// the canonical interface lives in `ir` so engines don't have to
+// import pipeline (which would create a cycle).
+//
+// MySQL has no schema-qualification — the lease table lives in the
+// applier's connected database. The acquire path uses a SELECT ...
+// FOR UPDATE inside a tx (MySQL has no INSERT ... ON CONFLICT WHERE
+// like PG), serialising concurrent acquires.
+
+import (
+	"context"
+	"time"
+
+	"github.com/orware/sluice/internal/ir"
+)
+
+// TryAcquireLease implements [ir.ShardConsolidationLeaseStore].
+func (a *ChangeApplier) TryAcquireLease(
+	ctx context.Context,
+	tableName, streamID string,
+	expires time.Time,
+) (bool, ir.ShardConsolidationLeaseRow, error) {
+	acquired, row, err := tryAcquireShardLease(ctx, a.db, tableName, streamID, expires)
+	if err != nil {
+		return false, ir.ShardConsolidationLeaseRow{}, err
+	}
+	return acquired, toIRLeaseRow(row), nil
+}
+
+// HeartbeatLease implements [ir.ShardConsolidationLeaseStore].
+func (a *ChangeApplier) HeartbeatLease(
+	ctx context.Context,
+	tableName, streamID string,
+	expires time.Time,
+) (bool, error) {
+	return heartbeatShardLease(ctx, a.db, tableName, streamID, expires)
+}
+
+// RecordDDLText implements [ir.ShardConsolidationLeaseStore].
+func (a *ChangeApplier) RecordDDLText(
+	ctx context.Context,
+	tableName, streamID, ddlText string,
+) (bool, error) {
+	return recordShardLeaseDDLText(ctx, a.db, tableName, streamID, ddlText)
+}
+
+// FinalizeLeaseApply implements [ir.ShardConsolidationLeaseStore].
+func (a *ChangeApplier) FinalizeLeaseApply(
+	ctx context.Context,
+	tableName, streamID, ddlText, ddlChecksum string,
+	appliedSchemaVersion int64,
+) (bool, error) {
+	return finalizeShardLeaseApply(ctx, a.db, tableName, streamID, ddlText, ddlChecksum, appliedSchemaVersion)
+}
+
+// ObserveLease implements [ir.ShardConsolidationLeaseStore].
+func (a *ChangeApplier) ObserveLease(
+	ctx context.Context,
+	tableName string,
+) (ir.ShardConsolidationLeaseRow, bool, error) {
+	row, ok, err := selectShardLease(ctx, a.db, tableName)
+	if err != nil {
+		return ir.ShardConsolidationLeaseRow{}, false, err
+	}
+	if !ok {
+		return ir.ShardConsolidationLeaseRow{}, false, nil
+	}
+	return toIRLeaseRow(row), true, nil
+}
+
+// toIRLeaseRow converts the engine's sql.NullTime-bearing row shape
+// to the cross-package HasX-bool shape.
+func toIRLeaseRow(row shardConsolidationLeaseRow) ir.ShardConsolidationLeaseRow {
+	out := ir.ShardConsolidationLeaseRow{
+		TargetTableFullName:  row.TargetTableFullName,
+		LeaseHolderStreamID:  row.LeaseHolderStreamID,
+		DDLText:              row.DDLText,
+		DDLChecksum:          row.DDLChecksum,
+		AppliedSchemaVersion: row.AppliedSchemaVersion,
+	}
+	if row.LeaseExpiresAt.Valid {
+		out.LeaseExpiresAt = row.LeaseExpiresAt.Time
+		out.HasLeaseExpiresAt = true
+	}
+	if row.AppliedAt.Valid {
+		out.AppliedAt = row.AppliedAt.Time
+		out.HasAppliedAt = true
+	}
+	return out
+}
