@@ -302,6 +302,13 @@ tenet).**
 - Cross-shard DDL coordination's failure contract (DP-3) is genuinely
   hard on non-transactional-DDL engines; the drained-v1 option exists
   precisely to keep v1 loud and simple.
+- **Phase 2 follow-on 2026-05-22:** [ADR-0054](adr-0054-shape-a-phase-2-live-cross-shard-ddl-coordination.md)
+  ships the deferred live-coordination design (hybrid TTL +
+  heartbeat-extend lease, recorded-version + DDL-checksum,
+  probe-and-record crash recovery, `--no-coordinate-live-ddl` opt-out).
+  Decision 4's control-table DDL-lease shape moves from "Phase-2
+  target" to "Accepted-and-implementing"; the drained model remains
+  available behind the opt-out flag.
 
 **Neutral.** Shape B (`--target-schema`) is untouched (no regression).
 Single-source migrate/sync is untouched (the flag is opt-in; nil/empty
