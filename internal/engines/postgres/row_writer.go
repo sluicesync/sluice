@@ -250,6 +250,130 @@ func (w *RowWriter) IsTableEmpty(ctx context.Context, table *ir.Table) (bool, er
 	return false, fmt.Errorf("postgres: probe %q for emptiness: %w", table.Name, err)
 }
 
+// HasNullShardColumn reports whether the named discriminator column
+// exists on the target table AND at least one existing row has it
+// NULL. ADR-0048 Shape A populated-target preflight check (1);
+// catalog Bug 81. Returns (false, nil) when:
+//   - the table doesn't exist (the orchestrator's empty-check
+//     short-circuits earlier; defensive),
+//   - the column doesn't exist on the target (caught structurally —
+//     CompositePKLeadsWith later refuses for the same reason), OR
+//   - every row has the column NOT NULL (the legal Shape-A shape).
+//
+// A genuine engine error (permission denied, network drop) surfaces
+// verbatim; the orchestrator wraps with operator-actionable context.
+func (w *RowWriter) HasNullShardColumn(ctx context.Context, table *ir.Table, column string) (bool, error) {
+	if table == nil {
+		return false, errors.New("postgres: HasNullShardColumn: table is nil")
+	}
+	exists, err := w.columnExistsOnTarget(ctx, table.Name, column)
+	if err != nil {
+		return false, fmt.Errorf("postgres: HasNullShardColumn: %w", err)
+	}
+	if !exists {
+		return false, nil
+	}
+	q := "SELECT 1 FROM " + quoteIdent(w.schema) + "." + quoteIdent(table.Name) +
+		" WHERE " + quoteIdent(column) + " IS NULL LIMIT 1"
+	var dummy int
+	err = w.db.QueryRowContext(ctx, q).Scan(&dummy)
+	if err == nil {
+		return true, nil
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return false, fmt.Errorf("postgres: probe %q for NULL %q: %w", table.Name, column, err)
+}
+
+// ShardValuePresent reports whether the named discriminator column
+// on the target table already has any row matching `value`. ADR-0048
+// Shape A populated-target preflight check (2). Returns (false, nil)
+// when the column is absent (CompositePKLeadsWith catches that case
+// structurally) or no matching row exists. Catalog Bug 81.
+func (w *RowWriter) ShardValuePresent(ctx context.Context, table *ir.Table, column string, value any) (bool, error) {
+	if table == nil {
+		return false, errors.New("postgres: ShardValuePresent: table is nil")
+	}
+	exists, err := w.columnExistsOnTarget(ctx, table.Name, column)
+	if err != nil {
+		return false, fmt.Errorf("postgres: ShardValuePresent: %w", err)
+	}
+	if !exists {
+		return false, nil
+	}
+	q := "SELECT 1 FROM " + quoteIdent(w.schema) + "." + quoteIdent(table.Name) +
+		" WHERE " + quoteIdent(column) + " = $1 LIMIT 1"
+	var dummy int
+	err = w.db.QueryRowContext(ctx, q, value).Scan(&dummy)
+	if err == nil {
+		return true, nil
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return false, fmt.Errorf("postgres: probe %q for %q = %v: %w", table.Name, column, value, err)
+}
+
+// CompositePKLeadsWith reports whether the target table has a
+// composite PRIMARY KEY (>1 column) whose leading column is the
+// named discriminator. ADR-0048 Shape A populated-target preflight
+// check (3) — the disjointness invariant the bypass rests on.
+// Single-column PKs and PKs that don't lead with the discriminator
+// both return (false, nil). Tables without any PK return (false,
+// nil) too — the InjectShardColumn IR pass refuses upstream when the
+// source has no PK, so this is defensive. Catalog Bug 81.
+//
+// Queries pg_index joined with pg_attribute to recover PK column
+// ordering. The `indkey` smallint vector encodes attribute numbers
+// in PK declaration order; element 0 is the leading column.
+func (w *RowWriter) CompositePKLeadsWith(ctx context.Context, table *ir.Table, column string) (bool, error) {
+	if table == nil {
+		return false, errors.New("postgres: CompositePKLeadsWith: table is nil")
+	}
+	const q = `
+		SELECT a.attname, array_length(i.indkey::int[], 1)
+		FROM   pg_index    i
+		JOIN   pg_class    cl ON cl.oid = i.indrelid
+		JOIN   pg_namespace n ON n.oid  = cl.relnamespace
+		JOIN   pg_attribute a  ON a.attrelid = i.indrelid AND a.attnum = i.indkey[0]
+		WHERE  i.indisprimary
+		  AND  cl.relname = $1
+		  AND  n.nspname  = $2`
+	var leadName string
+	var pkLen int
+	err := w.db.QueryRowContext(ctx, q, table.Name, w.schema).Scan(&leadName, &pkLen)
+	if err == nil {
+		return pkLen > 1 && leadName == column, nil
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return false, fmt.Errorf("postgres: probe %q PK lead: %w", table.Name, err)
+}
+
+// columnExistsOnTarget is a small helper for the preflight probers —
+// returns false when the table doesn't exist or the column doesn't
+// exist on it; an unrelated query error surfaces verbatim.
+func (w *RowWriter) columnExistsOnTarget(ctx context.Context, tableName, column string) (bool, error) {
+	const q = `
+		SELECT 1
+		FROM   information_schema.columns
+		WHERE  table_schema = $1
+		  AND  table_name   = $2
+		  AND  column_name  = $3
+		LIMIT  1`
+	var dummy int
+	err := w.db.QueryRowContext(ctx, q, w.schema, tableName, column).Scan(&dummy)
+	if err == nil {
+		return true, nil
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return false, err
+}
+
 // WriteRows is the dispatcher. Validates inputs, then routes to the
 // strategy chosen by useCopy. See [ir.RowWriter.WriteRows] for the
 // contract.

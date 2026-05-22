@@ -4,6 +4,28 @@ All notable changes to sluice are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project follows [Semantic Versioning](https://semver.org/).
 
+## [0.72.1]
+
+**Hotfix — ADR-0048 Shape A end-to-end correctness (Bugs 80 + 81 paired).** The v0.72.0 post-release regression cycle surfaced two paired Shape A regressions: the row reader built its SELECT against the schema-mutated `*ir.Table` (Bug 80, loud — every Shape A bulk-copy crashed with `SQLSTATE 42703 "column does not exist"` on PG / `Error 1054 "Unknown column ... in field list"` on MySQL), and the `shardPreflightProber` interface had no engine implementation so the ADR-0048 DP-2 populated-target three-point preflight was a complete no-op (Bug 81, silent-on-fix — fixing only Bug 80 would have swapped a loud crash for a silent cross-shard collision). v0.72.1 ships both fixes together per the cycle's "pair-the-class" recommendation.
+
+### Fixed
+
+- **`fix(engines): Bug 80 — Shape A reader projection now filters SluiceInjected columns`** — new `sourceReadableColumns` helper on both PG and MySQL row readers filters BOTH generated columns AND `ir.Column.SluiceInjected` columns; consumed by `buildSelect`, the streaming-scan path, and the batched-read path. `nonGeneratedColumns` (the writer-side helper) is deliberately left unchanged — the discriminator column MUST land on the target; the orchestrator's `shardStampRows` wrap stamps the discriminator value onto each row between read and write, and the writer's projection picks it up. The two helpers are intentionally asymmetric and the asymmetry is now compile-pinned by per-engine unit tests.
+
+- **`fix(engines): Bug 81 — shardPreflightProber implemented on PG + MySQL RowWriter`** — three read-only catalog probes per engine (`HasNullShardColumn`, `ShardValuePresent`, `CompositePKLeadsWith`) wire the ADR-0048 DP-2 three-point preflight to actual SQL. Pre-fix the type-assertion `rw.(shardPreflightProber)` silently fell through to `return nil` on every shipping engine; post-fix the preflight refuses loudly with the existing `errShardConsolidationRefused` sentinel + operator-actionable messages naming the offending table, column, and recovery path. PG implementation uses `pg_index`/`pg_attribute`/`information_schema.columns`; MySQL uses `information_schema.statistics`/`information_schema.columns`.
+
+### Tests
+
+- **`test(integration): Bug 80 + Bug 81 end-to-end pins`** — new build-tagged tests in `internal/pipeline/migrate_shape_a_e2e_integration_test.go` exercise the full Shape A migrate path against real PG + MySQL containers with non-zero row counts on the target (the load-bearing assertion that catches both bugs). New `bug81_prober_witness_integration_test.go` compile-pins the `shardPreflightProber` interface assertion on both engines' RowWriter — pre-v0.72.1 the assertion silently failed; post-v0.72.1 it succeeds. New per-engine unit pins (`bug80_source_readable_test.go` on both PG and MySQL) lock the helper-asymmetry: `sourceReadableColumns` filters SluiceInjected; `nonGeneratedColumns` does not.
+
+### Compatibility
+
+- **Drop-in upgrade from v0.72.0.** No storage shape change, no CLI surface change, no behaviour change outside the two fixed bug paths. Anyone who attempted `--inject-shard-column` on v0.72.0 hit Bug 80 immediately (loud, no silent loss); v0.72.1 makes the flag actually usable end-to-end. Anyone who was NOT using `--inject-shard-column` on v0.72.0 sees no change.
+
+### Known follow-ups (not blockers)
+
+- **Shape A on MySQL with `BIGINT AUTO_INCREMENT` PK still fails at CREATE TABLE** with `Error 1075 "Incorrect table definition; there can be only one auto column and it must be defined as a key"` because the composite PK rewrite places the discriminator first, demoting the AUTO_INCREMENT column. This is a separate Shape A design issue (separate from Bugs 80/81); a fix-or-refuse-loudly path will land in a follow-up release after an ADR-0048 amendment.
+
 ## [0.72.0]
 
 **Four ADRs in one release — the largest single-session feature drop in sluice's history.** The longest-deferred design dialogue in the backlog (ADR-0048 Shape A multi-source aggregation) finally lands with implementation, alongside the AIMD apply-batch-size controller (ADR-0052), a verbatim-carry generalization for core PG types — ranges/multiranges/FTS family (ADR-0051), and a silent-fidelity-loss closure for EXCLUDE constraints (ADR-0053). The corpus harness work that surfaced the latter two has now produced two product fixes; the "validate end-to-end" tenet continues to earn its keep. Per CLAUDE.md's zero-users tenet, the silent-loss class addressed by ADR-0053 is treated as the highest-severity issue in the release even though it lands without operator reports — semantic constraint loss in target schemas is exactly the class the tenet exists to prevent.

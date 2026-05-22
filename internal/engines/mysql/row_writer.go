@@ -202,6 +202,125 @@ func (w *RowWriter) IsTableEmpty(ctx context.Context, table *ir.Table) (bool, er
 	return false, fmt.Errorf("mysql: probe %q for emptiness: %w", table.Name, err)
 }
 
+// HasNullShardColumn reports whether the named discriminator column
+// exists on the target table AND at least one existing row has it
+// NULL. ADR-0048 Shape A populated-target preflight check (1);
+// catalog Bug 81. Returns (false, nil) when:
+//   - the column doesn't exist on the target (CompositePKLeadsWith
+//     catches that case structurally), OR
+//   - every row has the column NOT NULL (the legal Shape-A shape).
+//
+// A genuine engine error (permission denied, network drop) surfaces
+// verbatim; the orchestrator wraps with operator-actionable context.
+func (w *RowWriter) HasNullShardColumn(ctx context.Context, table *ir.Table, column string) (bool, error) {
+	if table == nil {
+		return false, errors.New("mysql: HasNullShardColumn: table is nil")
+	}
+	exists, err := w.columnExistsOnTarget(ctx, table.Name, column)
+	if err != nil {
+		return false, fmt.Errorf("mysql: HasNullShardColumn: %w", err)
+	}
+	if !exists {
+		return false, nil
+	}
+	q := "SELECT 1 FROM " + quoteIdent(table.Name) +
+		" WHERE " + quoteIdent(column) + " IS NULL LIMIT 1"
+	var dummy int
+	err = w.db.QueryRowContext(ctx, q).Scan(&dummy)
+	if err == nil {
+		return true, nil
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return false, fmt.Errorf("mysql: probe %q for NULL %q: %w", table.Name, column, err)
+}
+
+// ShardValuePresent reports whether the named discriminator column
+// on the target table already has any row matching `value`. ADR-0048
+// Shape A populated-target preflight check (2). Returns (false, nil)
+// when the column is absent or no matching row exists. Catalog Bug 81.
+func (w *RowWriter) ShardValuePresent(ctx context.Context, table *ir.Table, column string, value any) (bool, error) {
+	if table == nil {
+		return false, errors.New("mysql: ShardValuePresent: table is nil")
+	}
+	exists, err := w.columnExistsOnTarget(ctx, table.Name, column)
+	if err != nil {
+		return false, fmt.Errorf("mysql: ShardValuePresent: %w", err)
+	}
+	if !exists {
+		return false, nil
+	}
+	q := "SELECT 1 FROM " + quoteIdent(table.Name) +
+		" WHERE " + quoteIdent(column) + " = ? LIMIT 1"
+	var dummy int
+	err = w.db.QueryRowContext(ctx, q, value).Scan(&dummy)
+	if err == nil {
+		return true, nil
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return false, fmt.Errorf("mysql: probe %q for %q = %v: %w", table.Name, column, value, err)
+}
+
+// CompositePKLeadsWith reports whether the target table has a
+// composite PRIMARY KEY (>1 column) whose leading column is the
+// named discriminator. ADR-0048 Shape A populated-target preflight
+// check (3) — the disjointness invariant the bypass rests on.
+// Catalog Bug 81. Queries information_schema.statistics: PRIMARY
+// KEY rows have INDEX_NAME='PRIMARY' and SEQ_IN_INDEX numbered from
+// 1, so the row with SEQ_IN_INDEX=1 names the leading column.
+func (w *RowWriter) CompositePKLeadsWith(ctx context.Context, table *ir.Table, column string) (bool, error) {
+	if table == nil {
+		return false, errors.New("mysql: CompositePKLeadsWith: table is nil")
+	}
+	const q = `
+		SELECT  column_name,
+		        (SELECT COUNT(*)
+		         FROM   information_schema.statistics inner_s
+		         WHERE  inner_s.table_schema = s.table_schema
+		           AND  inner_s.table_name   = s.table_name
+		           AND  inner_s.index_name   = 'PRIMARY') AS pk_len
+		FROM    information_schema.statistics s
+		WHERE   s.table_schema = DATABASE()
+		  AND   s.table_name   = ?
+		  AND   s.index_name   = 'PRIMARY'
+		  AND   s.seq_in_index = 1`
+	var leadName string
+	var pkLen int
+	err := w.db.QueryRowContext(ctx, q, table.Name).Scan(&leadName, &pkLen)
+	if err == nil {
+		return pkLen > 1 && leadName == column, nil
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return false, fmt.Errorf("mysql: probe %q PK lead: %w", table.Name, err)
+}
+
+// columnExistsOnTarget is a small helper for the preflight probers —
+// returns false when the table doesn't exist or the column doesn't
+// exist on it; an unrelated query error surfaces verbatim.
+func (w *RowWriter) columnExistsOnTarget(ctx context.Context, tableName, column string) (bool, error) {
+	const q = `
+		SELECT 1
+		FROM   information_schema.columns
+		WHERE  table_schema = DATABASE()
+		  AND  table_name   = ?
+		  AND  column_name  = ?
+		LIMIT  1`
+	var dummy int
+	err := w.db.QueryRowContext(ctx, q, tableName, column).Scan(&dummy)
+	if err == nil {
+		return true, nil
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return false, err
+}
+
 // WriteRows consumes rows from the channel and inserts them into table
 // using the strategy chosen at construction time. The method returns
 // when the channel is closed (success) or when ctx is cancelled / a

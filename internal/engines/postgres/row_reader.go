@@ -117,7 +117,7 @@ func (r *RowReader) stream(ctx context.Context, rows *sql.Rows, table *ir.Table,
 	defer close(out)
 	defer func() { _ = rows.Close() }()
 
-	cols := nonGeneratedColumns(table.Columns)
+	cols := sourceReadableColumns(table.Columns)
 	scanBuf := make([]any, len(cols))
 	scanPtrs := make([]any, len(cols))
 	for i := range scanBuf {
@@ -168,7 +168,7 @@ func (r *RowReader) setErr(err error) {
 // has namespaced schemas, unlike MySQL). Identifiers are double-
 // quoted with internal quotes escaped.
 func buildSelect(schema string, table *ir.Table) string {
-	src := nonGeneratedColumns(table.Columns)
+	src := sourceReadableColumns(table.Columns)
 	cols := make([]string, len(src))
 	for i, c := range src {
 		cols[i] = quoteIdent(c.Name)
@@ -195,6 +195,28 @@ func nonGeneratedColumns(cols []*ir.Column) []*ir.Column {
 	out := make([]*ir.Column, 0, len(cols))
 	for _, c := range cols {
 		if c.IsGenerated() {
+			continue
+		}
+		out = append(out, c)
+	}
+	return out
+}
+
+// sourceReadableColumns returns the columns the reader's SELECT
+// projection should fetch from the source. Filters out both generated
+// columns (the database recomputes them on the target) AND
+// SluiceInjected columns (added by sluice's own ADR-0048 Shape A IR
+// pass; they exist on the mutated schema sluice plans against, but do
+// NOT exist on the source — selecting them surfaces as SQLSTATE 42703
+// "column does not exist", catalog Bug 80). The WRITER path
+// deliberately does NOT use this helper because the injected column
+// MUST land on the target; the orchestrator's [shardStampRows] wrap
+// stamps the discriminator value onto each row between read and
+// write, and the writer's nonGeneratedColumns projection picks it up.
+func sourceReadableColumns(cols []*ir.Column) []*ir.Column {
+	out := make([]*ir.Column, 0, len(cols))
+	for _, c := range cols {
+		if c.IsGenerated() || c.SluiceInjected {
 			continue
 		}
 		out = append(out, c)

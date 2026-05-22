@@ -94,7 +94,7 @@ func (r *RowReader) ReadRowsBatch(ctx context.Context, table *ir.Table, after []
 // and the value is orchestrator-controlled (not user input) so the
 // SQL-injection surface is non-existent.
 func buildBatchedSelect(schema string, table *ir.Table, limit int, hasCursor bool) string {
-	src := nonGeneratedColumns(table.Columns)
+	src := sourceReadableColumns(table.Columns)
 	colsList := make([]string, len(src))
 	for i, c := range src {
 		colsList[i] = quoteIdent(c.Name)

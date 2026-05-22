@@ -85,7 +85,7 @@ func (r *RowReader) ReadRowsBatch(ctx context.Context, table *ir.Table, after []
 // controlled int (no user input) and parameterising LIMIT in MySQL
 // has historical compatibility quirks across versions.
 func buildBatchedSelect(table *ir.Table, limit int, hasCursor bool) string {
-	src := nonGeneratedColumns(table.Columns)
+	src := sourceReadableColumns(table.Columns)
 	colsList := make([]string, len(src))
 	for i, c := range src {
 		colsList[i] = quoteIdent(c.Name)
