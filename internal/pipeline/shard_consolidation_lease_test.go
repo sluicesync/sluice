@@ -14,6 +14,12 @@ import (
 	"github.com/orware/sluice/internal/ir"
 )
 
+// testClockNow returns a fixed wall-clock for tests that don't need to
+// drive state transitions but want a deterministic now.
+func testClockNow() time.Time {
+	return time.Date(2026, 5, 22, 12, 0, 0, 0, time.UTC)
+}
+
 // fakeLeaseStore is an in-memory mock of
 // [ir.ShardConsolidationLeaseStore] backed by a per-table row map and
 // an injected clock. Used by the unit tests in this file to exercise

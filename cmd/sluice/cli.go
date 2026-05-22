@@ -518,6 +518,12 @@ type SyncStartCmd struct {
 
 	InjectShardColumn string `help:"ADR-0048 Shape A — inject a sluice-managed discriminator column on the consolidated target (Format: NAME=VALUE). Each per-shard sync stream passes a distinct VALUE so per-shard rows land disjoint on the shared target via a composite PK. Sluice appends the column to every PK-bearing table, rewrites the PK to be composite, stamps VALUE onto every row (bulk-copy + CDC), and runs a three-point loud preflight on a non-empty target. See 'sluice migrate --inject-shard-column' help text and ADR-0048 for the full design." placeholder:"NAME=VALUE"`
 
+	NoCoordinateLiveDDL bool `help:"ADR-0054 Shape A Phase 2 — disable live cross-shard DDL coordination. Default is ENABLED when --inject-shard-column is set (live coordination: one shard acquires a lease, applies the DDL on the consolidated target, records the schema version + DDL checksum; peer shards verify the checksum, skip the apply, continue CDC against the migrated target). Pass --no-coordinate-live-ddl to keep the pre-v0.73 drained model (operator runs 'sync stop --wait' on every shard, runs schema migrate once, then 'sync start --resume' on every shard). A no-op when --inject-shard-column is unset."`
+
+	ShardCoordinationLeaseDuration time.Duration `help:"ADR-0054 §2 / DP-A lease TTL. The lease-holder writes lease_expires_at = now + this value on every heartbeat. A stalled holder loses the lease after this window; the takeover stream runs probe-and-record. Default 30s (Kubernetes leader-election relaxed for sluice's stream-pause failure mode). Operators running ALTERs on tables >100GB may want 300s to absorb the longer ALTER window. Only consulted when --inject-shard-column is set and --no-coordinate-live-ddl is absent." default:"30s" placeholder:"DUR"`
+	ShardCoordinationRenewDeadline time.Duration `help:"ADR-0054 §2 / DP-A lease renew deadline. A lease-holder considers itself failed if it can't write a heartbeat within this window and exits the apply path. Must be > --shard-coordination-retry-period and < --shard-coordination-lease-duration. Default 20s." default:"20s" placeholder:"DUR"`
+	ShardCoordinationRetryPeriod   time.Duration `help:"ADR-0054 §2 / DP-A lease heartbeat cadence. The lease-holder writes lease_expires_at = now + LeaseDuration at this interval. Must be > 0 and < --shard-coordination-renew-deadline. Default 10s." default:"10s" placeholder:"DUR"`
+
 	Redact       []string `help:"Redact a PII column (repeatable). Format: '[schema.]table.column=STRATEGY[:options]'. Strategies: null (NULLABLE columns only), static:<value>, hash:sha256, hash:hmac-sha256[:<keyname>] (requires --keyset-source), truncate:<n>, mask:inner:<m1>,<m2>[,<char>], mask:outer:<m1>,<m2>[,<char>], mask:ssn, mask:pan, mask:pan-relaxed, mask:email, mask:ca-sin, mask:uk-nin, mask:iban, mask:uuid (Phase 2.b country/format presets, v0.57.0+), randomize:int:<min>,<max>, randomize:email, randomize:us-phone, randomize:uuid (Phase 2.c first wave, v0.59.0+), randomize:ssn, randomize:pan[:<brand>], randomize:ca-sin, randomize:uk-nin, randomize:iban[:<country-code>] (Phase 2.c second wave, v0.60.0+; brand: visa|mastercard|amex; country: DE|GB|FR; all randomize:* require a PK on the source table), randomize:dict:<name>, tokenize:dict:<name>[:<keyname>] (Phase 3 v0.61.0+, keyset-sourced in Phase 4 v0.62.0+; dictionaries declared in YAML 'dictionaries:' block — CLI form REQUIRES YAML config to declare the dictionary content). Examples: --redact users.email=hash:sha256, --redact users.pan=mask:pan, --redact users.id=mask:uuid, --redact users.age=randomize:int:18,90, --redact users.first_name=tokenize:dict:first_names. Phase 1.5 (v0.54.0+): redaction covers BOTH cold-start bulk-copy AND mid-stream CDC events. Bare 'users.email' matches any source schema; schema-qualified 'public.users.email' takes precedence when both registered. See docs/dev/notes/prep-pii-redaction-phase-1.md." placeholder:"RULE" sep:"none"`
 	KeysetSource string   `help:"Operator keyset source for keyset-using redaction strategies (hash:hmac-sha256, tokenize:dict). PII Phase 4 (ADR-0041). Forms: 'file:PATH' (keyset YAML on disk), 'env:VARNAME' (keyset YAML in an env var), 'db:DSN' (sluice_keysets table on the named DSN — shared across streams for cross-stream surrogate stability). Resolved ONCE at startup; rotation takes effect on next process restart only (no hot-reload). Required when any --redact / YAML rule uses hash:hmac-sha256 or tokenize:dict — the Phase 1 --redact-key-source flag and the built-in v0.61.0 tokenize key were removed." placeholder:"SRC"`
 }
@@ -694,6 +700,20 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 		return err
 	}
 
+	// ADR-0054 §2 / DP-A: validate the lease timing knobs eagerly so
+	// an operator-misconfiguration refuses at startup rather than at
+	// the first observed DDL boundary (loud-failure tenet).
+	leaseCfg := pipeline.LeaseConfig{
+		LeaseDuration: s.ShardCoordinationLeaseDuration,
+		RenewDeadline: s.ShardCoordinationRenewDeadline,
+		RetryPeriod:   s.ShardCoordinationRetryPeriod,
+	}
+	if shardSpec.Engaged() && !s.NoCoordinateLiveDDL {
+		if err := leaseCfg.Validate(); err != nil {
+			return err
+		}
+	}
+
 	streamer := &pipeline.Streamer{
 		Source:                    source,
 		Target:                    target,
@@ -726,6 +746,12 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 		TargetSchema:              s.TargetSchema,
 		EnabledPGExtensions:       s.EnablePGExtension,
 		InjectShardColumn:         shardSpec,
+		CoordinateLiveDDL:         !s.NoCoordinateLiveDDL,
+		ShardCoordinationLease: pipeline.LeaseConfig{
+			LeaseDuration: s.ShardCoordinationLeaseDuration,
+			RenewDeadline: s.ShardCoordinationRenewDeadline,
+			RetryPeriod:   s.ShardCoordinationRetryPeriod,
+		},
 	}
 	keysetSource := s.KeysetSource
 	if keysetSource == "" {

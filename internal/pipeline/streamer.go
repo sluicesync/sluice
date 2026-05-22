@@ -453,6 +453,31 @@ type Streamer struct {
 	// DP-1 (option (a) — two-surface split) for the design rationale.
 	InjectShardColumn ShardColumnSpec
 
+	// CoordinateLiveDDL controls ADR-0054 Shape A Phase 2 live
+	// cross-shard DDL coordination. Default true (engaged when
+	// [InjectShardColumn] is engaged; no-op otherwise). Operators on
+	// the v0.72.x drained model — `sync stop --wait` → migrate →
+	// `sync start --resume` — set this to false via the CLI's
+	// `--no-coordinate-live-ddl` flag to preserve pre-ADR-0054
+	// semantics.
+	//
+	// When engaged, observed DDL boundaries on each per-shard stream
+	// route through a [LeaseManager] keyed off the consolidated
+	// target table; the first stream to notice acquires the lease,
+	// applies the DDL exactly once, and records the applied schema
+	// version + DDL checksum. Peer streams observe the recorded
+	// state and skip the apply, continuing CDC against the migrated
+	// target without a drain.
+	CoordinateLiveDDL bool
+
+	// ShardCoordinationLease holds the lease-timing knobs operator-
+	// tunable via the `--shard-coordination-{lease-duration,
+	// renew-deadline,retry-period}` CLI flags. The zero value uses
+	// the ADR-0054 §2 defaults (30s / 20s / 10s). Only consulted
+	// when [CoordinateLiveDDL] is true and [InjectShardColumn] is
+	// engaged.
+	ShardCoordinationLease LeaseConfig
+
 	// ApplyRetryAttempts caps the number of consecutive retriable
 	// apply failures the streamer will absorb before giving up and
 	// returning the underlying error. ADR-0038. Zero or one means
@@ -500,6 +525,19 @@ type Streamer struct {
 	// runWithRetry which classifies it against [ir.RetriableError]
 	// in the standard way.
 	sourceErrFn func() error
+
+	// leaseMgr is the ADR-0054 Shape A Phase 2 live-coordination
+	// lease manager. Constructed by [engageShardCoordination] when
+	// [CoordinateLiveDDL] is true, [InjectShardColumn] is engaged,
+	// and the target applier implements
+	// [ir.ShardConsolidationLeaseStore]. Nil otherwise (drained
+	// model or non-Shape-A stream).
+	//
+	// Currently set by [engageShardCoordination] at applier-open
+	// time; the SchemaSnapshot routing through this manager lands
+	// in Phase 2c (probe-and-record + apply gate). The field is
+	// exposed via [ShardConsolidationLeaseManager] for tests.
+	leaseMgr *LeaseManager
 }
 
 // Run executes a snapshot+CDC stream with optional retry on
@@ -1633,6 +1671,11 @@ func (s *Streamer) openApplier(ctx context.Context) (ir.ChangeApplier, bool, err
 			return nil, false, wrapWithHint(PhaseConnect, err)
 		}
 		applyShardColumn(s.Applier, s.InjectShardColumn)
+		// ADR-0054 Shape A Phase 2: engage live-coordination lease
+		// manager when the operator's flags + target engine allow.
+		if err := s.engageShardCoordination(s.Applier); err != nil {
+			return nil, false, wrapWithHint(PhaseConnect, err)
+		}
 		return s.Applier, false, nil
 	}
 	a, err := s.Target.OpenChangeApplier(ctx, s.TargetDSN)
@@ -1648,6 +1691,12 @@ func (s *Streamer) openApplier(ctx context.Context) (ir.ChangeApplier, bool, err
 		return nil, false, wrapWithHint(PhaseConnect, err)
 	}
 	applyShardColumn(a, s.InjectShardColumn)
+	// ADR-0054 Shape A Phase 2: engage live-coordination lease
+	// manager when the operator's flags + target engine allow.
+	if err := s.engageShardCoordination(a); err != nil {
+		closeIf(a)
+		return nil, false, wrapWithHint(PhaseConnect, err)
+	}
 	return a, true, nil
 }
 
