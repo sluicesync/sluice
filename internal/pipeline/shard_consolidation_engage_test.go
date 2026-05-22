@@ -12,12 +12,13 @@ import (
 	"github.com/orware/sluice/internal/ir"
 )
 
-// supportingApplier is a minimal stub [ir.ChangeApplier] that also
-// implements [ir.ShardConsolidationLeaseStore] and
-// [ir.ShardColumnSetter]. It is used to drive engageShardCoordination
-// without spinning up a real engine.
+// supportingApplier is a minimal stub [ir.ChangeApplier] that ALSO
+// implements [ir.ShardConsolidationLeaseStore] +
+// [ir.ShardConsolidationProber] + [ir.ShardColumnSetter]. Used to
+// drive engageShardCoordination without spinning up a real engine.
 type supportingApplier struct {
 	*fakeLeaseStore
+	*fakeProber
 	shardCol struct {
 		name  string
 		value any
@@ -25,7 +26,10 @@ type supportingApplier struct {
 }
 
 func newSupportingApplier() *supportingApplier {
-	return &supportingApplier{fakeLeaseStore: newFakeLeaseStore(testClockNow)}
+	return &supportingApplier{
+		fakeLeaseStore: newFakeLeaseStore(testClockNow),
+		fakeProber:     &fakeProber{},
+	}
 }
 
 func (a *supportingApplier) SetShardColumn(name string, value any) {
@@ -33,8 +37,7 @@ func (a *supportingApplier) SetShardColumn(name string, value any) {
 	a.shardCol.value = value
 }
 
-// Satisfy ir.ChangeApplier (the unused methods panic — the tests in
-// this file never exercise apply / status / read).
+// Satisfy ir.ChangeApplier (unused — panicking on Apply).
 func (*supportingApplier) EnsureControlTable(context.Context) error { return nil }
 
 func (*supportingApplier) ReadPosition(context.Context, string) (ir.Position, bool, error) {
@@ -65,7 +68,9 @@ func (nonSupportingApplier) Apply(context.Context, string, <-chan ir.Change) err
 func (nonSupportingApplier) RequestStop(context.Context, string) error             { return nil }
 func (nonSupportingApplier) ClearStopRequested(context.Context, string) error      { return nil }
 
-// stubEngine declares its name so the refusal message includes it.
+// stubNamedEngine names itself for the refusal message. OpenSchemaWriter
+// returns a fakeShapeApplier-backed SchemaWriter so the engagement's
+// shape-writer probe succeeds on the supporting-applier path.
 type stubNamedEngine struct {
 	name string
 }
@@ -77,7 +82,7 @@ func (e stubNamedEngine) OpenSchemaReader(context.Context, string) (ir.SchemaRea
 }
 
 func (e stubNamedEngine) OpenSchemaWriter(context.Context, string) (ir.SchemaWriter, error) {
-	return nil, errors.New("not implemented")
+	return &fakeSchemaWriter{}, nil
 }
 
 func (e stubNamedEngine) OpenRowReader(context.Context, string) (ir.RowReader, error) {
@@ -100,14 +105,32 @@ func (e stubNamedEngine) OpenSnapshotStream(context.Context, string) (*ir.Snapsh
 	return nil, errors.New("not implemented")
 }
 
+// fakeSchemaWriter satisfies ir.SchemaWriter + ir.ShapeDeltaApplier
+// for engagement tests. The schema-writer methods are no-ops; the
+// shape-applier methods delegate to an embedded fakeShapeApplier.
+type fakeSchemaWriter struct {
+	fakeShapeApplier
+}
+
+func (*fakeSchemaWriter) CreateTablesWithoutConstraints(context.Context, *ir.Schema) error {
+	return nil
+}
+func (*fakeSchemaWriter) CreateIndexes(context.Context, *ir.Schema) error     { return nil }
+func (*fakeSchemaWriter) CreateConstraints(context.Context, *ir.Schema) error { return nil }
+func (*fakeSchemaWriter) SyncIdentitySequences(context.Context, *ir.Schema) error {
+	return nil
+}
+func (*fakeSchemaWriter) CreateViews(context.Context, *ir.Schema) error { return nil }
+func (*fakeSchemaWriter) Close() error                                  { return nil }
+
 func TestEngage_NoopWhenNotShapeA(t *testing.T) {
 	t.Parallel()
 	s := &Streamer{
 		StreamID:          "stream-a",
 		CoordinateLiveDDL: true,
-		// InjectShardColumn left zero ⇒ not engaged.
+		Target:            stubNamedEngine{name: "stub"},
 	}
-	if err := s.engageShardCoordination(newSupportingApplier()); err != nil {
+	if err := s.engageShardCoordination(context.Background(), newSupportingApplier()); err != nil {
 		t.Fatalf("engageShardCoordination: %v", err)
 	}
 	if s.ShardConsolidationLeaseManager() != nil {
@@ -120,9 +143,10 @@ func TestEngage_NoopWhenOptOut(t *testing.T) {
 	s := &Streamer{
 		StreamID:          "stream-a",
 		InjectShardColumn: ShardColumnSpec{Name: "source_shard_id", Value: "us-east-1"},
-		CoordinateLiveDDL: false, // operator passed --no-coordinate-live-ddl
+		CoordinateLiveDDL: false,
+		Target:            stubNamedEngine{name: "stub"},
 	}
-	if err := s.engageShardCoordination(newSupportingApplier()); err != nil {
+	if err := s.engageShardCoordination(context.Background(), newSupportingApplier()); err != nil {
 		t.Fatalf("engageShardCoordination: %v", err)
 	}
 	if s.ShardConsolidationLeaseManager() != nil {
@@ -138,7 +162,7 @@ func TestEngage_RefusesNonSupportingEngine(t *testing.T) {
 		InjectShardColumn: ShardColumnSpec{Name: "source_shard_id", Value: "us-east-1"},
 		CoordinateLiveDDL: true,
 	}
-	err := s.engageShardCoordination(nonSupportingApplier{})
+	err := s.engageShardCoordination(context.Background(), nonSupportingApplier{})
 	if err == nil {
 		t.Fatal("expected refusal when target engine doesn't implement the lease store; got nil")
 	}
@@ -156,16 +180,24 @@ func TestEngage_ConstructsManagerWhenSupported(t *testing.T) {
 		StreamID:          "stream-a",
 		InjectShardColumn: ShardColumnSpec{Name: "source_shard_id", Value: "us-east-1"},
 		CoordinateLiveDDL: true,
+		Target:            stubNamedEngine{name: "stub"},
 	}
-	if err := s.engageShardCoordination(newSupportingApplier()); err != nil {
+	if err := s.engageShardCoordination(context.Background(), newSupportingApplier()); err != nil {
 		t.Fatalf("engageShardCoordination: %v", err)
 	}
 	mgr := s.ShardConsolidationLeaseManager()
 	if mgr == nil {
-		t.Fatal("expected lease manager to be constructed when engagement conditions are met")
+		t.Fatal("expected lease manager")
 	}
 	if mgr.streamID != "stream-a" {
 		t.Errorf("manager.streamID = %q, want %q", mgr.streamID, "stream-a")
+	}
+	if s.ShardConsolidationBoundaryRouter() == nil {
+		t.Error("expected boundary router to be constructed when engagement succeeds")
+	}
+	s.closeShardCoordination()
+	if s.ShardConsolidationLeaseManager() != nil || s.ShardConsolidationBoundaryRouter() != nil {
+		t.Error("closeShardCoordination should clear lease manager + boundary router")
 	}
 }
 
@@ -175,9 +207,9 @@ func TestEngage_DefaultsZeroLeaseConfig(t *testing.T) {
 		StreamID:          "stream-a",
 		InjectShardColumn: ShardColumnSpec{Name: "source_shard_id", Value: "us-east-1"},
 		CoordinateLiveDDL: true,
-		// ShardCoordinationLease left zero ⇒ defaults kick in.
+		Target:            stubNamedEngine{name: "stub"},
 	}
-	if err := s.engageShardCoordination(newSupportingApplier()); err != nil {
+	if err := s.engageShardCoordination(context.Background(), newSupportingApplier()); err != nil {
 		t.Fatalf("engageShardCoordination: %v", err)
 	}
 	mgr := s.ShardConsolidationLeaseManager()

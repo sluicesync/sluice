@@ -532,12 +532,30 @@ type Streamer struct {
 	// and the target applier implements
 	// [ir.ShardConsolidationLeaseStore]. Nil otherwise (drained
 	// model or non-Shape-A stream).
-	//
-	// Currently set by [engageShardCoordination] at applier-open
-	// time; the SchemaSnapshot routing through this manager lands
-	// in Phase 2c (probe-and-record + apply gate). The field is
-	// exposed via [ShardConsolidationLeaseManager] for tests.
 	leaseMgr *LeaseManager
+
+	// boundaryRouter ties leaseMgr to the per-shape applier + prober
+	// for the SchemaSnapshot intercept path (ADR-0054 Phase 2d).
+	// Constructed alongside leaseMgr when ALL of
+	// [ir.ShardConsolidationLeaseStore], [ir.ShapeDeltaApplier], and
+	// [ir.ShardConsolidationProber] are implementable on the target.
+	// Nil when live-coordination is engaged but the engine doesn't
+	// expose the apply/probe surfaces — in that case the engagement
+	// itself refused loudly upstream, so a nil router here means the
+	// stream is the no-coordinate path.
+	boundaryRouter *BoundaryRouter
+
+	// shapeWriter is the SchemaWriter the BoundaryRouter uses for
+	// the per-shape DDL apply path. Owned by the Streamer's Run
+	// lifetime; closed alongside other streamer resources.
+	shapeWriter ir.SchemaWriter
+
+	// schemaSnapshotErr is the error sink the SchemaSnapshot
+	// intercept writes to when the BoundaryRouter refuses (probe
+	// inconsistent, checksum mismatch, unrecognized shape). The
+	// streamer's runOnce surfaces the error via the standard
+	// dispatchErr classification path.
+	schemaSnapshotErr atomic.Pointer[error]
 }
 
 // Run executes a snapshot+CDC stream with optional retry on
@@ -881,6 +899,10 @@ func (s *Streamer) runOnce(ctx context.Context) error {
 	if ownsApplier {
 		defer closeIf(applier)
 	}
+	// ADR-0054 Phase 2d: release shape-coordination resources when
+	// engaged (SchemaWriter for per-shape DDL; the lease store /
+	// prober live on the applier and are released by closeIf above).
+	defer s.closeShardCoordination()
 	// PII Phase 2.c (v0.59.0): plumb the resolved stream-id into the
 	// applier so randomize:* CDC redactions derive replay-stable seeds.
 	// Empty streamID is a no-op via applyStreamID's guard; in
@@ -1265,7 +1287,22 @@ func (s *Streamer) runOnce(ctx context.Context) error {
 	startHeartbeat(applyCtx, streamID, s.HeartbeatInterval)
 
 	filtered := filterChangesWithLiveAdd(applyCtx, changes, s.Filter, liveFilter)
+	// ADR-0054 Phase 2d: when live coordination is engaged, intercept
+	// SchemaSnapshot events to route through the lease + per-shape
+	// applier + probe before forwarding to the downstream applier.
+	// Nil router (drained model / engine doesn't support coordination)
+	// makes the intercept a verbatim pass-through.
+	filtered = interceptSchemaSnapshotsForCoordination(applyCtx, filtered, s.boundaryRouter, &s.schemaSnapshotErr)
 	dispatchErr := s.dispatchApply(applyCtx, applier, streamID, filtered)
+	// ADR-0054 Phase 2d: a SchemaSnapshot intercept error short-
+	// circuits the changes channel; the dispatchErr path sees a clean
+	// close. Surface the intercept's stored error here so the
+	// streamer's standard error-classification path picks it up.
+	if dispatchErr == nil {
+		if snapErrPtr := s.schemaSnapshotErr.Load(); snapErrPtr != nil && *snapErrPtr != nil {
+			dispatchErr = *snapErrPtr
+		}
+	}
 	if dispatchErr != nil {
 		// Bug 57 fix (v0.52.2): a wrapped [ir.RetriableError] containing
 		// context.DeadlineExceeded (from --apply-exec-timeout) MUST
@@ -1673,7 +1710,7 @@ func (s *Streamer) openApplier(ctx context.Context) (ir.ChangeApplier, bool, err
 		applyShardColumn(s.Applier, s.InjectShardColumn)
 		// ADR-0054 Shape A Phase 2: engage live-coordination lease
 		// manager when the operator's flags + target engine allow.
-		if err := s.engageShardCoordination(s.Applier); err != nil {
+		if err := s.engageShardCoordination(ctx, s.Applier); err != nil {
 			return nil, false, wrapWithHint(PhaseConnect, err)
 		}
 		return s.Applier, false, nil
@@ -1693,7 +1730,7 @@ func (s *Streamer) openApplier(ctx context.Context) (ir.ChangeApplier, bool, err
 	applyShardColumn(a, s.InjectShardColumn)
 	// ADR-0054 Shape A Phase 2: engage live-coordination lease
 	// manager when the operator's flags + target engine allow.
-	if err := s.engageShardCoordination(a); err != nil {
+	if err := s.engageShardCoordination(ctx, a); err != nil {
 		closeIf(a)
 		return nil, false, wrapWithHint(PhaseConnect, err)
 	}
