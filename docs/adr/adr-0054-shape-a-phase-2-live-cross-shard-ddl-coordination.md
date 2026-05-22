@@ -333,6 +333,69 @@ Behaviour-change-by-default consistent with the ADR-0052 AIMD
 opt-out pattern. Documented in release notes' Compatibility
 section.
 
+### DP-E — DDL apply path: how does the lease-holder determine what to apply?
+
+**Added 2026-05-22 in response to implementation finding.** The
+subagent implementing Phase 2a surfaced a real ambiguity between §3
+step 3 ("Apply the DDL to the consolidated target") and §4's probe
+catalog (ADD/DROP COLUMN, CREATE/DROP INDEX, ALTER COLUMN
+type/nullability), reconciling against DP-B's "no allow-list, no
+parser" framing. Three readings were on the table:
+
+- **(a) IR-delta + full extended `SchemaDeltaApplier`** —
+  derive (pre, post) IR delta, apply via per-shape engine methods,
+  add as many shape methods to the interface as the catalog needs.
+  Cross-engine via existing translator. Largest LOC commitment.
+- **(b) Same-engine textual passthrough** — replay source DDL
+  verbatim. Smallest surface but breaks cross-engine, defeating
+  the §"Phase 2e" cross-engine integration test value.
+- **(c) Recognized-shape catalog via IR-delta classifier** —
+  classify the IR delta into a finite catalog of recognized
+  shapes; apply via per-shape engine methods (small extension to
+  `ir.SchemaDeltaApplier`); probe-and-record uses the same
+  classifier on the target schema; unrecognized shapes refuse
+  loudly with the drained-model recovery hint.
+
+**RESOLVED 2026-05-22: (c) recognized-shape catalog via IR-delta
+classifier.** Owner-confirmed via AskUserQuestion dialogue. DP-B's
+"no allow-list, no parser" intent is preserved: the IR-delta
+classifier compares two `*ir.Table` structs (sluice's own canonical
+schema representation, not SQL text), and the "shapes" are sluice's
+own categories of structural changes — not an operator-curated SQL
+allowlist. §4's probe catalog and the apply catalog are the SAME
+set by design (the same classifier picks the apply path on first
+acquire and verifies state on takeover).
+
+**v1 Phase 2 recognized-shape catalog** (apply-side AND probe-side):
+
+1. **ADD COLUMN** — `len(post.Columns) > len(pre.Columns)` AND the
+   extra columns appear at the end (or anywhere — engine emits
+   `ADD COLUMN` accordingly).
+2. **DROP COLUMN** — `len(post.Columns) < len(pre.Columns)` AND a
+   column present in pre is absent in post.
+3. **CREATE INDEX** — `len(post.Indexes) > len(pre.Indexes)` AND a
+   new named index appears in post.
+4. **DROP INDEX** — `len(post.Indexes) < len(pre.Indexes)` AND a
+   named index present in pre is absent in post.
+5. **ALTER COLUMN type / nullability** — a column with the same
+   name exists in both pre and post but `Type` or `Nullable`
+   differs.
+
+**Unrecognized structural changes refuse loudly** — operator gets a
+drained-model recovery hint. The v1 catalog covers the high-frequency
+operator workflows (column adds, index creates, type widening); the
+deferred shapes (CHECK / EXCLUDE / RENAME / TABLE drops, multi-shape
+combo-deltas, generated-column changes, etc.) are tracked as
+follow-ups. Loud-failure tenet preserved.
+
+§3 step 3 ("Apply the DDL to the consolidated target") is read as
+"apply the IR-delta-derived shape changes to the consolidated
+target via `ir.SchemaDeltaApplier`" — not "execute raw DDL text."
+The subagent will extend `ir.SchemaDeltaApplier` with the missing
+shape methods (`AlterDropColumn`, `CreateIndex`, `DropIndex`,
+`AlterColumnType`, `AlterColumnNullability`) as part of Phase 2c;
+today only `AlterAddColumn` exists.
+
 ## Implementation plan
 
 ### Phase 2a — Lease primitive + control table
