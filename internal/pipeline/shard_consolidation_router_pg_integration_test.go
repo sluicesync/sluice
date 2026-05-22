@@ -87,6 +87,33 @@ func TestBoundaryRouter_PG_MultiShardExactlyOnceApply(t *testing.T) {
 		t.Fatalf("create table: %v", err)
 	}
 
+	// Pre-create the sluice control tables (`sluice_cdc_state` +
+	// `sluice_shard_consolidation_lease`) from a single goroutine
+	// BEFORE fanning out to the shard goroutines. Concurrent
+	// `CREATE TABLE IF NOT EXISTS` on a fresh PG target races on
+	// `pg_type`'s unique constraint (`pg_type_typname_nsp_index`,
+	// SQLSTATE 23505): the first transaction allocates a row in
+	// pg_type with the type name; concurrent transactions that
+	// haven't seen the commit attempt to insert their own and
+	// collide. The race shape is well-known
+	// (https://www.postgresql.org/message-id/...). Production
+	// deployments hit it only on the precise "N shards start
+	// simultaneously against a fresh target" boundary (rare); the
+	// test reproduces it deterministically because all 3 shards
+	// start tightly. Pre-creating from one applier avoids the race
+	// without weakening the test's contention assertion — the
+	// shard goroutines below still each call EnsureControlTable
+	// (it's the production code path), but the second-and-third
+	// calls become no-ops on the already-existing tables.
+	prep, err := eng.OpenChangeApplier(ctx, dsn)
+	if err != nil {
+		t.Fatalf("prep OpenChangeApplier: %v", err)
+	}
+	if err := prep.EnsureControlTable(ctx); err != nil {
+		t.Fatalf("prep EnsureControlTable: %v", err)
+	}
+	closeAnyApplier(prep)
+
 	// Each shard gets its own applier + schema writer + lease mgr +
 	// boundary router instance (mirroring the production per-streamer
 	// pattern).
