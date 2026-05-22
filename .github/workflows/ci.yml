@@ -253,9 +253,16 @@ jobs:
           - name: pipeline-rest-streamer
             packages: "./internal/pipeline/"
             goflags: "-run ^TestStreamer_"
+          # The `-skip` regex uses parentheses for alternation — those
+          # are shell-special characters when the goflags string gets
+          # interpolated into the `go test` command line below.
+          # Single-quote the regex so bash treats it as a literal arg
+          # rather than trying to parse `(...)` as a subshell. Without
+          # the quotes, the v0.72.3 first deploy failed at the shell-
+          # parse step with `syntax error near unexpected token '('`.
           - name: pipeline-rest-other
             packages: "./internal/pipeline/"
-            goflags: "-skip ^(TestMigrate_|TestStreamer_)"
+            goflags: "-skip '^(TestMigrate_|TestStreamer_)'"
           - name: engines-mysql
             packages: "./internal/engines/mysql/..."
             goflags: ""
