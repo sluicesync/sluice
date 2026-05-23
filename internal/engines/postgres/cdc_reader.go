@@ -758,9 +758,45 @@ func (r *CDCReader) dispatchWAL(
 		}
 		return send(ctx, out, ir.TxCommit{Position: pos})
 
+	case *pglogrepl.StreamAbortMessageV2:
+		// ADR-0055: refuse loudly. sluice runs pgoutput with
+		// proto_version=2 but does NOT pass streaming='on' (the v2
+		// parser accepts streaming chunks; the publisher only EMITS
+		// them when streaming is explicitly enabled). So a StreamAbort
+		// SHOULD NEVER fire on a sluice stream. If it does, two
+		// possibilities exist:
+		//   (a) PG-side config drift enabled streaming externally; or
+		//   (b) a future sluice change wired streaming='on' without
+		//       teaching this dispatch path how to roll back the
+		//       chunks emitted before the abort.
+		// In either case ADR-0027 has already committed each
+		// pre-abort chunk as its own target transaction (StreamStart
+		// → TxBegin, StreamStop → TxCommit). The source transaction
+		// rolled back; the target's chunks did not. Silently skipping
+		// the abort would leave a target with rows the source no
+		// longer has — silent-loss class. Refuse loudly per the
+		// loud-failure tenet so the operator can drop the slot,
+		// re-snapshot, and reconcile.
+		return fmt.Errorf("postgres: cdc: pgoutput StreamAbortMessageV2 received "+
+			"(xid=%d sub_xid=%d) but sluice does not enable streaming "+
+			"(proto_version=2 without streaming='on'). This message indicates "+
+			"a source-side rolled-back transaction whose pre-abort chunks may "+
+			"have already been committed on the target — data divergence is "+
+			"possible. Either: (a) PG config drift enabled streaming externally; "+
+			"(b) a future sluice change enabled it without wiring StreamAbort "+
+			"rollback. Refusing loudly per the loud-failure tenet. To recover, "+
+			"drop the slot, re-snapshot. See ADR-0055",
+			m.Xid, m.SubXid)
+
 	default:
 		// TypeMessage, OriginMessage, LogicalDecodingMessage,
-		// StreamCommit/Abort: not in v1 scope. Silent skip.
+		// StreamCommitMessageV2: not in v1 scope. Silent skip is safe
+		// for these — they carry no row data sluice would otherwise
+		// have committed (StreamCommit's per-chunk semantics are
+		// already covered by the StreamStop → TxCommit handler above;
+		// the others are diagnostic / origin-routing). StreamAbort is
+		// the one streaming-related message we cannot silently skip
+		// — see its dedicated case immediately above (ADR-0055).
 		return nil
 	}
 }

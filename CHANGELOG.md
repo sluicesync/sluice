@@ -6,6 +6,20 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **`feat(engines/postgres): F1 — refuse loudly on pgoutput StreamAbortMessageV2`** — Closes severity-c finding F1 of the 2026-05-22 PG-internals research run. sluice's `START_REPLICATION` passes `proto_version=2` without `streaming='on'`, so PG should never emit streaming chunk messages — but the receiver's `dispatchWAL` previously silently skipped `StreamAbortMessageV2` via the `default:` arm of its type switch (alongside benign skips for `TypeMessage` / `OriginMessage` / `LogicalDecodingMessage` / `StreamCommitMessageV2`). The silent-skip on StreamAbort was latent silent-loss-class: if streaming ever got enabled externally (PG config drift) or by a future sluice change without wiring chunk-rollback into the IR, each pre-abort `StreamStart` / `StreamStop` chunk has already been emitted as `ir.TxBegin` / `ir.TxCommit` (per ADR-0027) and committed on the target. A silently-skipped abort would leave the target carrying rows the source rolled back — silent unrecoverable divergence. The fix adds an explicit `case *pglogrepl.StreamAbortMessageV2:` returning a self-describing error (xid + sub-xid + recovery hint pointing at slot-drop + re-snapshot, references ADR-0055). No production behaviour change for any current operator — the refusal can only fire if streaming is enabled, which sluice does not do.
+
+### Docs
+
+- **`docs(adr-0055): pgoutput streaming-protocol audit`** — New ADR documenting the pgoutput v1 vs v2 protocol distinction (parsing capability via `proto_version >= 2` vs emitting capability via `streaming='on'`), sluice's current `proto_version=2`-without-streaming config, why the defensive handlers exist (against config drift), and the F1 decision to refuse loudly on StreamAbort. Cross-references ADR-0027 (chunk-as-tx batching), ADR-0028 (memory-bounded streaming), ADR-0007 (position-durability invariant), ADR-0020 (slot-ack-after-apply, related family of silent-loss closures), and ADR-0010 (idempotent applier convergence assumption).
+
+### Tests
+
+- **`test(engines/postgres): cdc_reader_streaming_protocol_test.go`** — F1 unit pin. Constructs synthetic StreamAbortMessageV2 wire-format bytes (`'A'` + xid + sub-xid big-endian uint32s), drives them through `dispatchWAL`, and asserts the returned error names the message type, includes the xid + sub-xid for operator correlation, carries the recovery hint, references ADR-0055, and emits no `ir.Change` before refusing. A second pin asserts the error does NOT wrap `ir.ErrPositionInvalid` (which would incorrectly route through the ADR-0022 cold-start fall-through instead of forcing the operator to drop + re-snapshot).
+- **`test(engines/postgres): cdc_reader_streaming_protocol_integration_test.go`** — F1 integration pin (receiver-side empirical confirmation). Boots PG with `logical_decoding_work_mem=64kB`, runs a single ~1000-row INSERT transaction that comfortably exceeds the cap, drains the changes channel, and asserts EXACTLY ONE `TxBegin` / 1000 `Insert` / EXACTLY ONE `TxCommit` triplet arrives — proving streaming chunks are not being emitted under sluice's default plugin args even when the source spills to disk. A streaming-enabled stream would produce ≥2 `TxBegin` / `TxCommit` pairs (one per chunk).
+- **`test(engines/postgres): confirmed_flush_invariant_integration_test.go`** — F3 pin. Asserts the load-bearing ADR-0007 / ADR-0020 invariant that `pg_replication_slots.confirmed_flush_lsn <= max(target's persisted source_position LSN)` holds continuously during a real CDC stream. Wires CDCReader + ChangeApplier with the LSN tracker, drives 25 distinct insert transactions, and a polling goroutine samples both LSNs every 100 ms — any violation is captured at the time it happens. Also asserts the slot's `confirmed_flush_lsn` advanced strictly above 0 (rules out the trivially-passing case where both sides stayed at zero) and re-checks the invariant post-stop after the stream tears down. F3 is pin-only — no production code change.
+
 ## [0.74.1] - 2026-05-22
 
 ### Added
