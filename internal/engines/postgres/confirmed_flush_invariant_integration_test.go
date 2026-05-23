@@ -347,8 +347,14 @@ func TestCDCReader_ConfirmedFlushInvariant_PinF3(t *testing.T) {
 		if err != nil && !errors.Is(err, context.Canceled) {
 			t.Logf("ApplyBatch returned: %v (treated as drain on closed channel)", err)
 		}
-	case <-time.After(30 * time.Second):
-		t.Errorf("ApplyBatch did not return within 30s of reader close")
+	case <-time.After(2 * time.Minute):
+		// CI's ubuntu-latest runner with `-race` is materially slower
+		// than local Docker; the original 30s budget passed locally
+		// but timed out on CI even though the invariant held cleanly
+		// (line 375 still reported "invariant held throughout N txns"
+		// on the failed run). 2 minutes is the generous-but-bounded
+		// budget that matches the surrounding integration tests.
+		t.Errorf("ApplyBatch did not return within 2 min of reader close")
 	}
 
 	// Post-stop invariant: the final confirmed_flush still satisfies
