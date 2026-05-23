@@ -31,6 +31,23 @@ postgres: cdc: wal_level is "replica"; must be 'logical' for logical replication
 
 To change `wal_level`, edit `postgresql.conf` (or the managed-service equivalent) and restart the cluster. It cannot be changed live.
 
+### WAL volume cost of `wal_level = logical`
+
+Flipping `wal_level` from `replica` to `logical` increases the WAL volume the source emits. Two things happen at logical level that don't at replica level:
+
+1. **Full-page images (FPIs) are still emitted on every checkpoint-boundary first-touch** (this is independent of `wal_level`), but every page that carries a logically-decodable change *also* carries the full new tuple in WAL — not just the heap-page diff. The downstream decoder needs the full row to reconstruct the logical event.
+2. **TOAST'd values for UPDATE/DELETE-target rows are written into WAL even when they didn't change** (`REPLICA IDENTITY FULL` amplifies this; the default `DEFAULT` setting limits it to the primary key, but logical-level still carries more than replica-level does).
+
+In our internal measurements on a typical OLTP workload, the WAL byte-rate roughly **1.2×–1.6×** what the same workload generated under `wal_level = replica` — sometimes more on tables with large TEXT/JSONB columns under `REPLICA IDENTITY FULL`. The exact ratio is workload-dependent; the right way to size storage and replication-slot retention is to measure your own workload at `logical` before depending on it in production.
+
+Operator-visible consequences:
+
+- **Slot-retention disk pressure.** A slot that falls behind during a sluice outage holds WAL until sluice catches up. The 1.2×–1.6× multiplier applies to that retention too; budget `max_slot_wal_keep_size` accordingly.
+- **Backup volume.** WAL-archiving solutions (pgBackRest, wal-g, managed-service WAL archives) ingest the larger WAL stream.
+- **Network bandwidth to replicas / wal_receiver.** Physical replicas downstream of a `wal_level = logical` primary see the same larger stream.
+
+This is fundamental to PG's logical-replication design — sluice cannot avoid it, only surface it. References: The Internals of PostgreSQL Ch 9.4 (WAL record format, FPI semantics under different wal_level settings), Ch 9.5 (asynchronous commit and WAL flush). Sluice's F6 PG-internals research finding (2026-05-22) documents the trade-off in more detail.
+
 ## Connecting role
 
 The role sluice uses to read CDC needs the `REPLICATION` attribute:

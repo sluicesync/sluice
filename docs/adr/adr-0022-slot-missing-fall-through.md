@@ -95,3 +95,9 @@ Integration test in `internal/pipeline/streamer_item_f_integration_test.go::Test
 6. Assert: `slog.Warn` line fires; cold-start runs; new slot is created; CDC events flow; the persisted position is overwritten with a fresh value.
 
 Pre-fix, step 5 errors out at "replication slot ... no longer exists." Post-fix, step 5 logs the WARN and proceeds.
+
+## Related PG-internals research
+
+PG's logical-replication slot state is persisted to disk in `$PGDATA/pg_replslot/<slot>/state` (per *The Internals of PostgreSQL* Ch 11.4 — "Replication slot state file persistence"). The on-disk state file is the source of truth that survives PG restarts; `pg_replication_slots` is a view on top of it. This is the load-bearing detail behind why the slot-missing branch must be a hard refusal: when the state file is absent, the slot is unrecoverable by definition (sluice cannot resume a slot it has no LSN reference frame for).
+
+ADR-0051 (PG CDC source-identity pinning) extends the same `ErrPositionInvalid` machinery to the timeline-change case: a slot whose state file still exists but lives on a different timeline post-PITR triggers the same fall-through, just via a different precondition check (`IDENTIFY_SYSTEM`'s sysid/timeline rather than the slot-existence check). Sluice's F8 / F9 findings (`sluice-pg-internals-research-chapters-9-10-11-2026-05-22.md`) document the chain.

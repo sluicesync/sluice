@@ -523,5 +523,15 @@ operator impact), so the latency budget can be a bit larger.
 - [ADR-0034](adr-0034-mysql-phase-2-live-add-table.md) — MySQL live add-table coordination; control-table additive-column pattern
 - [ADR-0049](adr-0049-cdc-schema-history.md) — schema-history machinery this ADR reuses for DDL boundary detection
 - [ADR-0007](adr-0007-position-persistence.md) — position-and-data atomicity that closes the "applied-but-not-recorded" gap on PG (transactional DDL)
+- [ADR-0051](adr-0051-pg-cdc-source-identity-pinning.md) — PG CDC source-identity pinning (`IDENTIFY_SYSTEM` sysid + timeline). Closes a silent-loss class on the position-resume path that ADR-0054's lease takeover implicitly depends on (the per-stream persisted position must reference the same source instance the lease was acquired against).
 - Vitess OnlineDDL (`vitess/vitess` schema migrations) — the closest direct prior art
 - Kubernetes leader-election defaults (the source of the 30/20/10 timing recommendation)
+
+## Related PG-internals research
+
+The PG-internals research runs (`sluice-pg-internals-research-2026-05-22.md` for Ch 12 logical-replication, `sluice-pg-internals-research-chapters-9-10-11-2026-05-22.md` for Ch 9-11) inform several of this ADR's PG-side guarantees:
+
+- **F1** (pgoutput protocol-version audit) is relevant to the boundary-detection path: if the source's pgoutput version changes (e.g. on a PG upgrade across major versions), new message types may carry schema metadata this ADR's recognized-shape classifier doesn't currently handle. Tracked as a backlog item.
+- **F3** (`confirmed_flush_lsn` pin test) is an invariant that interacts with the lease's recorded-version: a lease APPLIED state implicitly assumes the position-write happened-before the slot's `confirmed_flush_lsn` advanced past the boundary. This is true today (the apply tx is ADR-0007's "position + data in one tx") but worth pinning.
+- **F5** (source-identity pinning — ADR-0051) closes the timeline-change silent-loss class on the resume path. A lease's recorded `applied_schema_version` references a specific source identity; if the source changes underneath sluice (PITR, promotion, wrong-instance pointer), ADR-0051's refusal kicks in before the lease takeover attempts to consume the recorded version against the new identity.
+- **F7** (synchronous_commit hardening — ADR-0007 amendment) closes the durability-bypass class. The lease's APPLIED state is durable only if the position-write tx is durable; F7's `SET LOCAL synchronous_commit = on` ensures that holds even when role/db-level defaults set `synchronous_commit = off`.
