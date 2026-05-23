@@ -14,6 +14,7 @@ package postgres
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"testing"
 	"time"
 
@@ -98,6 +99,41 @@ func applyPGSQL(t *testing.T, dsn, sqlText string) {
 	defer cancel()
 	if _, err := db.ExecContext(ctx, sqlText); err != nil {
 		t.Fatalf("apply sql: %v", err)
+	}
+}
+
+// waitForSlotInactive polls `pg_replication_slots.active` until the
+// named slot is no longer marked active, or the timeout elapses.
+// Required between two CDC reader sessions against the same slot: PG's
+// walsender doesn't release the slot synchronously when the client
+// disconnects — the next `START_REPLICATION` racing against PG's
+// cleanup gets SQLSTATE 55006 (`replication slot ... is active for
+// PID N`).
+func waitForSlotInactive(t *testing.T, dsn, slotName string, timeout time.Duration) {
+	t.Helper()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("waitForSlotInactive: open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	deadline := time.Now().Add(timeout)
+	for {
+		var active bool
+		err := db.QueryRow(`SELECT active FROM pg_replication_slots WHERE slot_name = $1`, slotName).Scan(&active)
+		if errors.Is(err, sql.ErrNoRows) {
+			return // slot doesn't exist; trivially inactive
+		}
+		if err != nil {
+			t.Fatalf("waitForSlotInactive: query: %v", err)
+		}
+		if !active {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("waitForSlotInactive: slot %q still active after %s", slotName, timeout)
+		}
+		time.Sleep(200 * time.Millisecond)
 	}
 }
 

@@ -54,25 +54,36 @@ func TestCDCReader_SourceIdentityPin_HappyPathResume(t *testing.T) {
 
 	// Stage 1: cold-start, emit an event, capture its position.
 	ctx1, cancel1 := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel1()
 	rdr1, err := eng.OpenCDCReader(ctx1, dsn)
 	if err != nil {
+		cancel1()
 		t.Fatalf("OpenCDCReader (stage 1): %v", err)
 	}
 	changes1, err := rdr1.StreamChanges(ctx1, ir.Position{})
 	if err != nil {
+		cancel1()
 		t.Fatalf("StreamChanges (stage 1): %v", err)
 	}
 	time.Sleep(200 * time.Millisecond)
 	applyPGSQL(t, dsn, `INSERT INTO users (email) VALUES ('alice@example.com');`)
 	got := drainChanges(t, ctx1, changes1, 1, 30*time.Second)
 	if len(got) != 1 {
+		cancel1()
 		t.Fatalf("stage 1: got %d changes; want 1", len(got))
 	}
 	capturedPos := got[0].Pos()
 	if c, ok := rdr1.(interface{ Close() error }); ok {
 		_ = c.Close()
 	}
+	// Cancel ctx1 + wait for the slot to go inactive before opening
+	// stage 2. PG's `START_REPLICATION` refuses with SQLSTATE 55006
+	// (`replication slot ... is active for PID N`) if the prior
+	// session's walsender hasn't released the slot yet. Close() returns
+	// before PG's backend cleanup observes the disconnect; without this
+	// drain, stage 2 races against PG's housekeeping and fails
+	// non-deterministically on CI.
+	cancel1()
+	waitForSlotInactive(t, dsn, "sluice_slot", 30*time.Second)
 
 	// Sanity check: the captured position MUST carry the source-identity
 	// pin. If this fails, positionAt isn't propagating r.systemID /
@@ -179,6 +190,8 @@ func TestCDCReader_SourceIdentityPin_DivergenceRefusesLoud(t *testing.T) {
 	if c, ok := rdr1.(interface{ Close() error }); ok {
 		_ = c.Close()
 	}
+	cancel1()
+	waitForSlotInactive(t, dsn, "sluice_slot", 30*time.Second)
 
 	decoded, ok, err := decodePGPos(captured)
 	if err != nil || !ok {
