@@ -172,7 +172,7 @@ func TestBoundaryRouter_PG_MultiShardExactlyOnceApply(t *testing.T) {
 			// Each shard tries to route the SAME boundary. Exactly
 			// one wins the apply; the others observe via the
 			// peer-applied checksum-match path.
-			results <- router.RouteBoundary(ctx, targetTable, preIR, postIR, ddlText, 1)
+			results <- router.RouteBoundary(ctx, targetTable, preIR, postIR, ddlText, 1, ir.Position{})
 		}()
 	}
 	wg.Wait()
@@ -332,7 +332,7 @@ func TestBoundaryRouter_PG_TakeoverProbeAndRecord(t *testing.T) {
 		{Name: "id", Type: ir.Integer{Width: 32}},
 		{Name: "x", Type: ir.Integer{Width: 32}, Nullable: true},
 	}}
-	if err := router.RouteBoundary(ctx, targetTable, pre, post, "ir-schema:takeover_target:add-x", 1); err != nil {
+	if err := router.RouteBoundary(ctx, targetTable, pre, post, "ir-schema:takeover_target:add-x", 1, ir.Position{}); err != nil {
 		t.Fatalf("RouteBoundary takeover: %v", err)
 	}
 

@@ -15,6 +15,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 
 	"github.com/orware/sluice/internal/ir"
@@ -85,21 +86,105 @@ func (a *ChangeApplier) ProbeDropIndex(ctx context.Context, table *ir.Table, ind
 	}
 }
 
-// ProbeAlterColumnType is the v1 minimal: column existence check.
-// Type-matching deferred to a future iteration (see PG counterpart
-// for the rationale + future direction).
+// ProbeAlterColumnType implements the v0.76.0 task #20 IR-type-matching
+// probe (ADR-0054 closure). v1 was existence-only — a column dropped +
+// re-added with a different type silently passed. v2 verifies the
+// column's catalog-reported IR type matches want.Type via the same
+// translateType helper the schema reader uses.
+//
+// Outcomes per ADR-0054 §4:
+//
+//   - Column ABSENT → Inconsistent (catastrophic).
+//   - Column PRESENT and IR-type matches want.Type → Applied.
+//   - Column PRESENT but IR-type differs → Inconsistent + error naming
+//     expected vs observed type.
+//
+// MySQL note: per the ADR-0054 v0.73.2 charset-normalizer amendment,
+// the post-DDL IR doesn't carry per-column charset; v2 builds a meta
+// with empty Charset so the IR comparison is type+length only. A
+// future iteration could pin charset once the normalizer carries it.
 func (a *ChangeApplier) ProbeAlterColumnType(ctx context.Context, table *ir.Table, want *ir.Column) (ir.ProbeOutcome, error) {
 	if want == nil {
 		return ir.ProbeOutcomeInconsistent, errors.New("mysql: probe alter column type: want is nil")
 	}
-	exists, err := a.columnPresent(ctx, table.Name, want.Name)
+	observed, present, err := a.readColumnIRType(ctx, table.Name, want.Name)
 	if err != nil {
 		return ir.ProbeOutcomeInconsistent, err
 	}
-	if !exists {
+	if !present {
 		return ir.ProbeOutcomeInconsistent, nil
 	}
-	return ir.ProbeOutcomeApplied, nil
+	if reflect.DeepEqual(observed, want.Type) {
+		return ir.ProbeOutcomeApplied, nil
+	}
+	return ir.ProbeOutcomeInconsistent, fmt.Errorf(
+		"mysql: probe alter column type %s.%s: observed IR type %v, want %v",
+		table.Name, want.Name, observed, want.Type,
+	)
+}
+
+// readColumnIRType introspects the named column on the target via
+// information_schema.columns and reconstructs the IR Type via the same
+// translateType helper the schema reader uses. Returns (irType, true)
+// when the column exists, (nil, false) when absent. Scoped to the v0.76.0
+// task #20 probe path — only the subset of metadata translateType
+// consumes from information_schema.
+//
+// Charset is intentionally NOT carried (see ProbeAlterColumnType comment
+// for the ADR-0054 amendment context).
+func (a *ChangeApplier) readColumnIRType(ctx context.Context, tableName, colName string) (ir.Type, bool, error) {
+	const q = `
+		SELECT
+			LOWER(data_type),
+			column_type,
+			character_maximum_length,
+			numeric_precision,
+			numeric_scale,
+			datetime_precision,
+			COALESCE(collation_name, ''),
+			COALESCE(srs_id, 0),
+			COALESCE(extra, '')
+		FROM   information_schema.columns
+		WHERE  table_schema = DATABASE() AND table_name = ? AND column_name = ?`
+
+	var (
+		dataType, columnType string
+		charMaxLen, numPrec  sql.NullInt64
+		numScale, dtPrec     sql.NullInt64
+		collation            string
+		srsID                int
+		extra                string
+	)
+	switch err := a.db.QueryRowContext(ctx, q, tableName, colName).Scan(
+		&dataType, &columnType,
+		&charMaxLen, &numPrec, &numScale, &dtPrec,
+		&collation,
+		&srsID,
+		&extra,
+	); {
+	case errors.Is(err, sql.ErrNoRows):
+		return nil, false, nil
+	case err != nil:
+		return nil, false, fmt.Errorf("mysql: probe read column %q: %w", colName, err)
+	}
+
+	meta := columnMeta{
+		DataType:   dataType,
+		ColumnType: strings.ToLower(columnType),
+		CharMaxLen: nullInt64ToPtrMySQL(charMaxLen),
+		NumPrec:    nullInt64ToPtrMySQL(numPrec),
+		NumScale:   nullInt64ToPtrMySQL(numScale),
+		DTPrec:     nullInt64ToPtrMySQL(dtPrec),
+		// Charset deliberately empty — see ProbeAlterColumnType comment.
+		Collation: collation,
+		SrsID:     srsID,
+		Extra:     strings.ToLower(extra),
+	}
+	t, err := translateType(meta)
+	if err != nil {
+		return nil, true, fmt.Errorf("mysql: probe translate type for %s.%s: %w", tableName, colName, err)
+	}
+	return t, true, nil
 }
 
 // ProbeAlterColumnNullability returns Applied when the column's
@@ -157,17 +242,6 @@ func (a *ChangeApplier) countColumnsPresent(ctx context.Context, tableName strin
 	return n, nil
 }
 
-// columnPresent returns whether the named column exists on the target.
-func (a *ChangeApplier) columnPresent(ctx context.Context, tableName, colName string) (bool, error) {
-	const q = `SELECT EXISTS(SELECT 1 FROM information_schema.columns
-		WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?)`
-	var v bool
-	if err := a.db.QueryRowContext(ctx, q, tableName, colName).Scan(&v); err != nil {
-		return false, fmt.Errorf("mysql: probe column %q: %w", colName, err)
-	}
-	return v, nil
-}
-
 // countIndexesPresent returns the number of named indexes present in
 // the target's information_schema.statistics. MySQL index names are
 // table-scoped (no prefix-with-table convention).
@@ -204,4 +278,18 @@ func classifyProbeCount(present, want int) ir.ProbeOutcome {
 	default:
 		return ir.ProbeOutcomeInconsistent
 	}
+}
+
+// nullInt64ToPtrMySQL converts an sql.NullInt64 (returned by Scan) to
+// the *int64 shape columnMeta expects (nil for NULL, &v otherwise). The
+// schema reader uses a custom Scanner type (nullableInt64) wired into
+// QueryContext; the probe scans directly via sql.NullInt64 + this
+// helper so a single column lookup doesn't require the custom scanner
+// machinery.
+func nullInt64ToPtrMySQL(n sql.NullInt64) *int64 {
+	if !n.Valid {
+		return nil
+	}
+	v := n.Int64
+	return &v
 }

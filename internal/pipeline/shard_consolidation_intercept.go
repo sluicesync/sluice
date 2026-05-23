@@ -158,7 +158,11 @@ func interceptSchemaSnapshotsForCoordination(
 				// SchemaSnapshot path — DP-E's "shapes are sluice's
 				// own structural categories" applies).
 				ddlText := deriveDDLText(snap.IR)
-				if err := router.RouteBoundary(ctx, key, pre, snap.IR, ddlText, version[key]); err != nil {
+				// Pass the SchemaSnapshot's source-side Position as the
+				// lease row's anchor — the v0.76.0 lease GC sweep (task
+				// #21) compares it against every stream's persisted
+				// position via the engine's PositionOrderer.
+				if err := router.RouteBoundary(ctx, key, pre, snap.IR, ddlText, version[key], snap.Position); err != nil {
 					slog.ErrorContext(
 						ctx, "shard consolidation intercept: route boundary failed",
 						"table", key,

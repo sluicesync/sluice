@@ -111,12 +111,20 @@ func NewBoundaryRouter(mgr *LeaseManager, applier ir.ShapeDeltaApplier, prober S
 //     ([ErrLeaseChecksumMismatch]).
 //   - Apply error from the engine's ShapeDeltaApplier → propagate.
 //   - Observer timeout (peer never finalized within observeTimeout).
+//
+// anchor is the source-side CDC position at which this boundary's DDL
+// was observed (the SchemaSnapshot's Position). Persisted into the
+// lease row on Apply so the v0.76.0 lease GC sweep (task #21) can
+// compare against every stream's persisted position. A zero-value
+// Position is permitted (callers without CDC context); the row stores
+// NULL and the GC sweep defensively retains it.
 func (r *BoundaryRouter) RouteBoundary(
 	ctx context.Context,
 	tableName string,
 	pre, post *ir.Table,
 	ddlText string,
 	schemaVersion int64,
+	anchor ir.Position,
 ) error {
 	shape, err := ClassifyShape(pre, post)
 	if err != nil {
@@ -136,7 +144,7 @@ func (r *BoundaryRouter) RouteBoundary(
 	lease, err := r.mgr.Acquire(ctx, tableName, ddlText)
 	switch {
 	case err == nil:
-		return r.handleHeldLease(ctx, lease, post, shape, ddlText, checksum, schemaVersion)
+		return r.handleHeldLease(ctx, lease, post, shape, ddlText, checksum, schemaVersion, anchor)
 	case errors.Is(err, ErrLeaseContended):
 		// A peer holds the lease (HELD) or has already finalized
 		// (APPLIED). Observe until APPLIED, verify checksum, return.
@@ -156,6 +164,7 @@ func (r *BoundaryRouter) handleHeldLease(
 	shape Shape,
 	ddlText, checksum string,
 	schemaVersion int64,
+	anchor ir.Position,
 ) (retErr error) {
 	defer func() {
 		if retErr != nil {
@@ -171,7 +180,7 @@ func (r *BoundaryRouter) handleHeldLease(
 		if err := r.applyShape(ctx, post, shape); err != nil {
 			return fmt.Errorf("pipeline: route boundary: apply shape %s: %w", shape.Kind, err)
 		}
-		return r.mgr.Apply(ctx, lease, schemaVersion, ddlText, checksum)
+		return r.mgr.Apply(ctx, lease, schemaVersion, ddlText, checksum, anchor)
 	}
 
 	// Takeover path: probe the target schema for the prior holder's
@@ -190,7 +199,7 @@ func (r *BoundaryRouter) handleHeldLease(
 			"stream_id", r.mgr.streamID,
 			"shape", shape.Kind.String(),
 		)
-		return r.mgr.Apply(ctx, lease, schemaVersion, ddlText, checksum)
+		return r.mgr.Apply(ctx, lease, schemaVersion, ddlText, checksum, anchor)
 	case ProbeOutcomeNotApplied:
 		// Prior holder crashed before applying — re-apply.
 		slog.InfoContext(
@@ -202,7 +211,7 @@ func (r *BoundaryRouter) handleHeldLease(
 		if err := r.applyShape(ctx, post, shape); err != nil {
 			return fmt.Errorf("pipeline: route boundary: takeover apply shape %s: %w", shape.Kind, err)
 		}
-		return r.mgr.Apply(ctx, lease, schemaVersion, ddlText, checksum)
+		return r.mgr.Apply(ctx, lease, schemaVersion, ddlText, checksum, anchor)
 	case ProbeOutcomeInconsistent:
 		return fmt.Errorf(
 			"pipeline: route boundary: takeover probe Inconsistent for %s on %q — "+

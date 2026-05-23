@@ -56,12 +56,31 @@ func (a *ChangeApplier) RecordDDLText(
 }
 
 // FinalizeLeaseApply implements [ir.ShardConsolidationLeaseStore].
+//
+// anchor's Token and Engine are persisted alongside the rest of the
+// applied-row payload so the v0.76.0 lease GC sweep (task #21) can
+// compare against every stream's persisted position via the engine's
+// [ir.PositionOrderer]. A zero-value Position stores NULL (legacy
+// callers / unit-test fakes that don't supply a position).
 func (a *ChangeApplier) FinalizeLeaseApply(
 	ctx context.Context,
 	tableName, streamID, ddlText, ddlChecksum string,
 	appliedSchemaVersion int64,
+	anchor ir.Position,
 ) (bool, error) {
-	return finalizeShardLeaseApply(ctx, a.db, a.controlSchema, tableName, streamID, ddlText, ddlChecksum, appliedSchemaVersion)
+	return finalizeShardLeaseApply(
+		ctx, a.db, a.controlSchema,
+		tableName, streamID, ddlText, ddlChecksum,
+		appliedSchemaVersion,
+		anchor.Token, anchor.Engine,
+	)
+}
+
+// DeleteLease implements [ir.ShardConsolidationLeaseDeleter] — v0.76.0
+// lease GC sweep (task #21). Tolerant of the row or the lease control
+// table itself being absent (returns nil).
+func (a *ChangeApplier) DeleteLease(ctx context.Context, tableName string) error {
+	return deleteShardLease(ctx, a.db, a.controlSchema, tableName)
 }
 
 // ObserveLease implements [ir.ShardConsolidationLeaseStore].
@@ -111,6 +130,18 @@ func toIRLeaseRow(row shardConsolidationLeaseRow) ir.ShardConsolidationLeaseRow 
 	if row.AppliedAt.Valid {
 		out.AppliedAt = row.AppliedAt.Time
 		out.HasAppliedAt = true
+	}
+	// Reconstruct the source-side anchor Position. Both Token + Engine
+	// must be present for an anchor to count as "set" — a half-populated
+	// row (legacy v0.75.0 + a manually-poked anchor_position with
+	// source_engine still NULL) is treated as absent so the GC sweep
+	// defensively retains it.
+	if row.AnchorPosition.Valid && row.AnchorEngine.Valid {
+		out.AnchorPosition = ir.Position{
+			Engine: row.AnchorEngine.String,
+			Token:  row.AnchorPosition.String,
+		}
+		out.HasAnchor = true
 	}
 	return out
 }

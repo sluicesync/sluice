@@ -103,6 +103,13 @@ type shardConsolidationLeaseRow struct {
 	DDLChecksum          string
 	AppliedSchemaVersion int64
 	AppliedAt            sql.NullTime
+
+	// AnchorPosition + AnchorEngine: source-side CDC position + engine
+	// the recorded boundary's DDL was observed at. v0.76.0+ task #21
+	// (lease GC sweep) reads these. Legacy v0.75.0 rows have NULL on
+	// both columns; the GC sweep defensively retains NULL-anchor rows.
+	AnchorPosition sql.NullString
+	AnchorEngine   sql.NullString
 }
 
 // tryAcquireShardLease conditionally INSERTs / UPDATEs a lease row.
@@ -131,7 +138,7 @@ func tryAcquireShardLease(ctx context.Context, db *sql.DB, tableName, streamID s
 
 	const selectQ = "SELECT target_table_full_name, COALESCE(lease_holder_stream_id, ''), " +
 		"lease_expires_at, COALESCE(ddl_text, ''), COALESCE(ddl_checksum, ''), " +
-		"applied_schema_version, applied_at " +
+		"applied_schema_version, applied_at, anchor_position, source_engine " +
 		"FROM `" + shardConsolidationLeaseTableName + "` " +
 		"WHERE target_table_full_name = ? FOR UPDATE"
 	var row shardConsolidationLeaseRow
@@ -143,6 +150,8 @@ func tryAcquireShardLease(ctx context.Context, db *sql.DB, tableName, streamID s
 		&row.DDLChecksum,
 		&row.AppliedSchemaVersion,
 		&row.AppliedAt,
+		&row.AnchorPosition,
+		&row.AnchorEngine,
 	)
 	switch {
 	case errors.Is(scanErr, sql.ErrNoRows):
@@ -251,20 +260,27 @@ func recordShardLeaseDDLText(ctx context.Context, db *sql.DB, tableName, streamI
 }
 
 // finalizeShardLeaseApply records applied_at + ddl_text + ddl_checksum
-// + applied_schema_version atomically, gated on continued ownership.
+// + applied_schema_version + anchor_position + source_engine atomically,
+// gated on continued ownership.
 //
 // MySQL's RowsAffected uses changed-rows semantics by default — a UPDATE
 // that touches the same row with the same new value reports 0 rows
 // affected rather than 1. The lease primitive's UPDATEs always change
 // applied_at (NULL → CURRENT_TIMESTAMP), so the "0 rows means contention"
 // detection is reliable here.
-func finalizeShardLeaseApply(ctx context.Context, db *sql.DB, tableName, streamID, ddlText, ddlChecksum string, version int64) (finalized bool, err error) {
+//
+// anchorPos / anchorEngine carry the source-side CDC position the
+// boundary was observed at (v0.76.0+). Empty strings store NULL via the
+// NULLIF wrapper so legacy callers / unit-test fakes preserve the
+// pre-anchor shape.
+func finalizeShardLeaseApply(ctx context.Context, db *sql.DB, tableName, streamID, ddlText, ddlChecksum string, version int64, anchorPos, anchorEngine string) (finalized bool, err error) {
 	const q = "UPDATE `" + shardConsolidationLeaseTableName + "` SET " +
-		"ddl_text = ?, ddl_checksum = ?, applied_schema_version = ?, applied_at = CURRENT_TIMESTAMP " +
+		"ddl_text = ?, ddl_checksum = ?, applied_schema_version = ?, applied_at = CURRENT_TIMESTAMP, " +
+		"anchor_position = NULLIF(?, ''), source_engine = NULLIF(?, '') " +
 		"WHERE target_table_full_name = ? " +
 		"AND lease_holder_stream_id = ? " +
 		"AND applied_at IS NULL"
-	res, err := db.ExecContext(ctx, q, ddlText, ddlChecksum, version, tableName, streamID)
+	res, err := db.ExecContext(ctx, q, ddlText, ddlChecksum, version, anchorPos, anchorEngine, tableName, streamID)
 	if err != nil {
 		return false, fmt.Errorf("mysql: lease finalize: %w", err)
 	}
@@ -277,11 +293,13 @@ func finalizeShardLeaseApply(ctx context.Context, db *sql.DB, tableName, streamI
 
 // listShardLeases returns every row in the per-target lease table.
 // Tolerant of the table being absent. ADR-0054 §6 operator-visibility
-// surface used by `sluice sync status`.
+// surface used by `sluice sync status`, plus the v0.76.0 lease GC
+// sweep's enumeration source.
 func listShardLeases(ctx context.Context, db *sql.DB) ([]shardConsolidationLeaseRow, error) {
 	const q = "SELECT target_table_full_name, COALESCE(lease_holder_stream_id, ''), " +
 		"lease_expires_at, COALESCE(ddl_text, ''), COALESCE(ddl_checksum, ''), " +
-		"applied_schema_version, applied_at FROM `" + shardConsolidationLeaseTableName + "`"
+		"applied_schema_version, applied_at, anchor_position, source_engine " +
+		"FROM `" + shardConsolidationLeaseTableName + "`"
 	rows, err := db.QueryContext(ctx, q)
 	if err != nil {
 		if isMySQLMissingTableErr(err) {
@@ -302,6 +320,8 @@ func listShardLeases(ctx context.Context, db *sql.DB) ([]shardConsolidationLease
 			&row.DDLChecksum,
 			&row.AppliedSchemaVersion,
 			&row.AppliedAt,
+			&row.AnchorPosition,
+			&row.AnchorEngine,
 		); err != nil {
 			return nil, fmt.Errorf("mysql: scan lease: %w", err)
 		}
@@ -310,13 +330,28 @@ func listShardLeases(ctx context.Context, db *sql.DB) ([]shardConsolidationLease
 	return out, rows.Err()
 }
 
+// deleteShardLease removes the row keyed by tableName. Tolerant of the
+// row being absent (DELETE on a missing PK is a no-op) and of the table
+// itself being absent (returns nil so a GC sweep against a pre-Ensure
+// target is a no-op). v0.76.0 lease GC sweep (task #21).
+func deleteShardLease(ctx context.Context, db *sql.DB, tableName string) error {
+	const q = "DELETE FROM `" + shardConsolidationLeaseTableName + "` WHERE target_table_full_name = ?"
+	if _, err := db.ExecContext(ctx, q, tableName); err != nil {
+		if isMySQLMissingTableErr(err) {
+			return nil
+		}
+		return fmt.Errorf("mysql: lease delete: %w", err)
+	}
+	return nil
+}
+
 // selectShardLease loads the row for tableName. Returns ok=false when
 // no row exists OR when the table itself is missing (pre-Ensure
 // inspection path).
 func selectShardLease(ctx context.Context, db *sql.DB, tableName string) (row shardConsolidationLeaseRow, ok bool, err error) {
 	const q = "SELECT target_table_full_name, COALESCE(lease_holder_stream_id, ''), " +
 		"lease_expires_at, COALESCE(ddl_text, ''), COALESCE(ddl_checksum, ''), " +
-		"applied_schema_version, applied_at " +
+		"applied_schema_version, applied_at, anchor_position, source_engine " +
 		"FROM `" + shardConsolidationLeaseTableName + "` " +
 		"WHERE target_table_full_name = ?"
 	r := db.QueryRowContext(ctx, q, tableName)
@@ -328,6 +363,8 @@ func selectShardLease(ctx context.Context, db *sql.DB, tableName string) (row sh
 		&row.DDLChecksum,
 		&row.AppliedSchemaVersion,
 		&row.AppliedAt,
+		&row.AnchorPosition,
+		&row.AnchorEngine,
 	)
 	switch {
 	case errors.Is(scanErr, sql.ErrNoRows):
@@ -363,10 +400,52 @@ func ensureShardConsolidationLeaseTable(ctx context.Context, db *sql.DB) error {
 			applied_schema_version        BIGINT       NOT NULL DEFAULT 0,
 			applied_at                    TIMESTAMP    NULL,
 			created_at                    TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			anchor_position               TEXT         NULL,
+			source_engine                 TEXT         NULL,
 			PRIMARY KEY (target_table_full_name)
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
 	if _, err := db.ExecContext(ctx, ddl); err != nil {
 		return fmt.Errorf("mysql: ensure shard consolidation lease table: %w", wrapDDLError(err))
+	}
+	// Migration path for v0.75.0 deployments whose
+	// sluice_shard_consolidation_lease table pre-dates the v0.76.0 anchor
+	// columns. Same detect-then-ALTER shape as ensureCrossEngineParityColumn
+	// — keeps the migration portable to MySQL 8.0.x versions older than
+	// 8.0.29 that lack ADD COLUMN IF NOT EXISTS. Task #21 (lease GC sweep)
+	// reads anchor_position / source_engine; legacy rows have NULL and are
+	// defensively retained by the sweeper.
+	for _, col := range []struct{ name, def string }{
+		{"anchor_position", "TEXT NULL"},
+		{"source_engine", "TEXT NULL"},
+	} {
+		if err := ensureShardLeaseColumn(ctx, db, col.name, col.def); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ensureShardLeaseColumn adds a column to the lease control table when
+// missing. Same shape as ensureCrossEngineParityColumn but scoped to the
+// lease table — keeps the additive migration portable to MySQL 8.0.x
+// versions older than 8.0.29 (no ADD COLUMN IF NOT EXISTS).
+func ensureShardLeaseColumn(ctx context.Context, db *sql.DB, columnName, columnDef string) error {
+	const checkQ = `
+		SELECT COUNT(*)
+		FROM   information_schema.COLUMNS
+		WHERE  TABLE_SCHEMA = DATABASE()
+		  AND  TABLE_NAME   = ?
+		  AND  COLUMN_NAME  = ?`
+	var n int
+	if err := db.QueryRowContext(ctx, checkQ, shardConsolidationLeaseTableName, columnName).Scan(&n); err != nil {
+		return fmt.Errorf("mysql: ensure shard consolidation lease table: detect %s: %w", columnName, err)
+	}
+	if n > 0 {
+		return nil
+	}
+	alter := "ALTER TABLE `" + shardConsolidationLeaseTableName + "` ADD COLUMN `" + columnName + "` " + columnDef
+	if _, err := db.ExecContext(ctx, alter); err != nil {
+		return fmt.Errorf("mysql: ensure shard consolidation lease table: add %s: %w", columnName, err)
 	}
 	return nil
 }

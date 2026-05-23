@@ -240,11 +240,19 @@ func TestShardConsolidationProber_AlterColumnNullability(t *testing.T) {
 	}
 }
 
-// TestShardConsolidationProber_AlterColumnType pins the v1-minimal
-// existence-only semantics documented inline at the probe impl. A
-// future v2 (Follow-up #1) would extend to IR-type matching; this
-// test guards the v1 contract from silent regression.
-func TestShardConsolidationProber_AlterColumnType(t *testing.T) {
+// TestShardConsolidationProber_AlterColumnType_V2 pins the v0.76.0
+// task #20 IR-type-matching semantics (ADR-0054 closure):
+//
+//   - Column present with matching IR type → Applied.
+//   - Column present with mismatched IR type → Inconsistent + error.
+//   - Column absent → Inconsistent.
+//
+// Drives the full silent-divergence scenario at the bottom of the test:
+// an ALTER COLUMN INT → BIGINT lands, the probe with want=BIGINT
+// returns Applied; the column is then manually dropped + re-added with
+// the wrong type (TEXT), and the probe with want=BIGINT returns
+// Inconsistent with an error naming both types.
+func TestShardConsolidationProber_AlterColumnType_V2(t *testing.T) {
 	dsn, cleanup := startPostgresForApplier(t)
 	defer cleanup()
 
@@ -256,7 +264,7 @@ func TestShardConsolidationProber_AlterColumnType(t *testing.T) {
 		t.Fatalf("open: %v", err)
 	}
 	defer func() { _ = db.Close() }()
-	if _, err := db.ExecContext(ctx, `CREATE TABLE "public"."shape_type" (id INT PRIMARY KEY, amount INT)`); err != nil {
+	if _, err := db.ExecContext(ctx, `CREATE TABLE "public"."shape_type_v2" (id INT PRIMARY KEY, amount INT)`); err != nil {
 		t.Fatalf("create table: %v", err)
 	}
 
@@ -271,21 +279,135 @@ func TestShardConsolidationProber_AlterColumnType(t *testing.T) {
 		}
 	}()
 	applier := a.(*ChangeApplier)
-	table := &ir.Table{Schema: "public", Name: "shape_type"}
+	table := &ir.Table{Schema: "public", Name: "shape_type_v2"}
 
-	// Column exists → Applied (v1-minimal: existence-only).
+	// Pre-ALTER: column is INT, want=BIGINT → Inconsistent (the v2
+	// type-match catches the mismatch).
 	outcome, err := applier.ProbeAlterColumnType(ctx, table, &ir.Column{Name: "amount", Type: ir.Integer{Width: 64}})
+	if err == nil {
+		t.Fatal("ProbeAlterColumnType: expected error for mismatched type (INT vs BIGINT)")
+	}
+	if outcome != ir.ProbeOutcomeInconsistent {
+		t.Errorf("outcome = %v, want Inconsistent (pre-ALTER mismatch)", outcome)
+	}
+	// Error message includes both observed (Int32) and want (Int64).
+	if !containsAll(err.Error(), "Int64", "Int32") {
+		t.Errorf("error message %q should name expected and observed types", err.Error())
+	}
+
+	// Land the ALTER: INT → BIGINT.
+	if _, err := db.ExecContext(ctx, `ALTER TABLE "public"."shape_type_v2" ALTER COLUMN amount TYPE BIGINT`); err != nil {
+		t.Fatalf("ALTER INT→BIGINT: %v", err)
+	}
+
+	// Post-ALTER: want=BIGINT now matches → Applied.
+	outcome, err = applier.ProbeAlterColumnType(ctx, table, &ir.Column{Name: "amount", Type: ir.Integer{Width: 64}})
 	if err != nil {
-		t.Fatalf("ProbeAlterColumnType (exists): %v", err)
+		t.Fatalf("ProbeAlterColumnType (post-ALTER): %v", err)
 	}
 	if outcome != ir.ProbeOutcomeApplied {
-		t.Errorf("outcome = %v, want Applied (v1 minimal existence-only)", outcome)
+		t.Errorf("outcome = %v, want Applied (post-ALTER, types match)", outcome)
 	}
 
 	// Column absent → Inconsistent.
 	outcome, err = applier.ProbeAlterColumnType(ctx, table, &ir.Column{Name: "missing", Type: ir.Integer{Width: 64}})
 	if err != nil {
 		t.Fatalf("ProbeAlterColumnType (absent): %v", err)
+	}
+	if outcome != ir.ProbeOutcomeInconsistent {
+		t.Errorf("outcome = %v, want Inconsistent (absent)", outcome)
+	}
+
+	// Silent-divergence shape: manually drop + re-add with the WRONG
+	// type. This is the post-DDL state a crashed lease holder + a
+	// bug-induced wrong-type recovery could leave behind; pre-v2 the
+	// probe returned Applied (existence-only); v2 surfaces it as
+	// Inconsistent loudly.
+	if _, err := db.ExecContext(ctx, `ALTER TABLE "public"."shape_type_v2" DROP COLUMN amount`); err != nil {
+		t.Fatalf("DROP COLUMN amount: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `ALTER TABLE "public"."shape_type_v2" ADD COLUMN amount TEXT`); err != nil {
+		t.Fatalf("ADD COLUMN amount TEXT: %v", err)
+	}
+	outcome, err = applier.ProbeAlterColumnType(ctx, table, &ir.Column{Name: "amount", Type: ir.Integer{Width: 64}})
+	if err == nil {
+		t.Fatal("ProbeAlterColumnType v2: expected error for drop+re-add with wrong type")
+	}
+	if outcome != ir.ProbeOutcomeInconsistent {
+		t.Errorf("outcome = %v, want Inconsistent (drop+re-add wrong type — v2 silent-divergence catch)", outcome)
+	}
+	// The error message names both types so the operator can recover.
+	if !containsAll(err.Error(), "Text", "Int64") {
+		t.Errorf("error message %q should name observed Text + expected Int64", err.Error())
+	}
+}
+
+// containsAll is a tiny multi-substring helper for the test's
+// error-message assertions. Returns true when s contains every entry
+// in subs. Named -All to disambiguate from the existing single-needle
+// `contains` helper in cdc_reader_integration_test.go.
+func containsAll(s string, subs ...string) bool {
+	for _, sub := range subs {
+		found := false
+		for i := 0; i+len(sub) <= len(s); i++ {
+			if s[i:i+len(sub)] == sub {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+// TestShardConsolidationProber_AlterColumnType_V2_NumericUnconstrained
+// pins the PG NUMERIC unconstrained vs constrained distinction the v2
+// probe must handle correctly (per the ProbeAlterColumnType comment).
+func TestShardConsolidationProber_AlterColumnType_V2_NumericUnconstrained(t *testing.T) {
+	dsn, cleanup := startPostgresForApplier(t)
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	// Bare NUMERIC = unconstrained.
+	if _, err := db.ExecContext(ctx, `CREATE TABLE "public"."shape_num_v2" (id INT PRIMARY KEY, value NUMERIC)`); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+
+	eng := Engine{}
+	a, err := eng.OpenChangeApplier(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenChangeApplier: %v", err)
+	}
+	defer func() {
+		if c, ok := a.(interface{ Close() error }); ok {
+			_ = c.Close()
+		}
+	}()
+	applier := a.(*ChangeApplier)
+	table := &ir.Table{Schema: "public", Name: "shape_num_v2"}
+
+	// Observed unconstrained, want unconstrained → Applied.
+	outcome, err := applier.ProbeAlterColumnType(ctx, table, &ir.Column{Name: "value", Type: ir.Decimal{Unconstrained: true}})
+	if err != nil {
+		t.Fatalf("ProbeAlterColumnType (unconstrained == unconstrained): %v", err)
+	}
+	if outcome != ir.ProbeOutcomeApplied {
+		t.Errorf("outcome = %v, want Applied", outcome)
+	}
+
+	// Observed unconstrained, want NUMERIC(10,2) → Inconsistent.
+	outcome, err = applier.ProbeAlterColumnType(ctx, table, &ir.Column{Name: "value", Type: ir.Decimal{Precision: 10, Scale: 2}})
+	if err == nil {
+		t.Fatal("expected error for unconstrained vs NUMERIC(10,2)")
 	}
 	if outcome != ir.ProbeOutcomeInconsistent {
 		t.Errorf("outcome = %v, want Inconsistent", outcome)

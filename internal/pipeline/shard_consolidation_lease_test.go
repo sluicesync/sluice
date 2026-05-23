@@ -106,7 +106,7 @@ func (s *fakeLeaseStore) RecordDDLText(_ context.Context, tableName, streamID, d
 	return true, nil
 }
 
-func (s *fakeLeaseStore) FinalizeLeaseApply(_ context.Context, tableName, streamID, ddlText, ddlChecksum string, version int64) (bool, error) {
+func (s *fakeLeaseStore) FinalizeLeaseApply(_ context.Context, tableName, streamID, ddlText, ddlChecksum string, version int64, anchor ir.Position) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	row, ok := s.rows[tableName]
@@ -121,6 +121,12 @@ func (s *fakeLeaseStore) FinalizeLeaseApply(_ context.Context, tableName, stream
 	row.AppliedSchemaVersion = version
 	row.AppliedAt = s.now()
 	row.HasAppliedAt = true
+	// Persist the anchor (Token+Engine present → HasAnchor=true so the
+	// lease GC sweep can compare it). v0.76.0 task #21 contract.
+	if anchor.Engine != "" || anchor.Token != "" {
+		row.AnchorPosition = anchor
+		row.HasAnchor = true
+	}
 	s.rows[tableName] = row
 	return true, nil
 }
@@ -206,7 +212,7 @@ func TestLeaseManager_AcquireAbsentRow(t *testing.T) {
 
 	// Finalize and confirm the row reflects applied state.
 	checksum := ChecksumDDLText("ALTER TABLE users ADD COLUMN x INT")
-	if err := mgr.Apply(ctx, lease, 1, "ALTER TABLE users ADD COLUMN x INT", checksum); err != nil {
+	if err := mgr.Apply(ctx, lease, 1, "ALTER TABLE users ADD COLUMN x INT", checksum, ir.Position{}); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
 	row, _ = store.snapshot("public.users")
@@ -313,7 +319,7 @@ func TestLeaseManager_ObserveStates(t *testing.T) {
 	}
 
 	// APPLIED
-	if err := mgrA.Apply(ctx, leaseA, 7, "alter", ChecksumDDLText("alter")); err != nil {
+	if err := mgrA.Apply(ctx, leaseA, 7, "alter", ChecksumDDLText("alter"), ir.Position{}); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
 	obs, err = mgrB.Observe(ctx, "public.users")
@@ -450,10 +456,10 @@ func TestLeaseManager_FinalizeIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Acquire: %v", err)
 	}
-	if err := mgr.Apply(ctx, lease, 1, "alter", ChecksumDDLText("alter")); err != nil {
+	if err := mgr.Apply(ctx, lease, 1, "alter", ChecksumDDLText("alter"), ir.Position{}); err != nil {
 		t.Fatalf("first Apply: %v", err)
 	}
-	if err := mgr.Apply(ctx, lease, 2, "different", "wrong-checksum"); err != nil {
+	if err := mgr.Apply(ctx, lease, 2, "different", "wrong-checksum", ir.Position{}); err != nil {
 		t.Fatalf("second Apply (idempotent): %v", err)
 	}
 	row, _ := store.snapshot("public.users")

@@ -104,6 +104,16 @@ type shardConsolidationLeaseRow struct {
 	DDLChecksum          string
 	AppliedSchemaVersion int64
 	AppliedAt            sql.NullTime
+
+	// AnchorPosition + AnchorEngine: the source-side CDC position +
+	// engine identity at which the recorded boundary's DDL was
+	// observed. Populated by [finalizeShardLeaseApply] in v0.76.0+; NULL
+	// on legacy rows that pre-date the additive migration (the lease
+	// GC sweep defensively retains NULL-anchor rows). Mirrors the
+	// `anchor_position` / `source_engine` columns the
+	// sluice_cdc_schema_history table carries (ADR-0049 / Bug 78).
+	AnchorPosition sql.NullString
+	AnchorEngine   sql.NullString
 }
 
 // tryAcquireShardLease conditionally INSERTs / UPDATEs a lease row
@@ -160,7 +170,9 @@ func tryAcquireShardLease(ctx context.Context, db *sql.DB, schema, tableName, st
 			COALESCE(ddl_text, ''),
 			COALESCE(ddl_checksum, ''),
 			applied_schema_version,
-			applied_at`
+			applied_at,
+			anchor_position,
+			source_engine`
 	row := db.QueryRowContext(ctx, q, tableName, streamID, expires)
 	var got shardConsolidationLeaseRow
 	scanErr := row.Scan(
@@ -171,6 +183,8 @@ func tryAcquireShardLease(ctx context.Context, db *sql.DB, schema, tableName, st
 		&got.DDLChecksum,
 		&got.AppliedSchemaVersion,
 		&got.AppliedAt,
+		&got.AnchorPosition,
+		&got.AnchorEngine,
 	)
 	switch {
 	case errors.Is(scanErr, sql.ErrNoRows):
@@ -239,16 +253,23 @@ func recordShardLeaseDDLText(ctx context.Context, db *sql.DB, schema, tableName,
 }
 
 // finalizeShardLeaseApply records applied_at + ddl_text + ddl_checksum
-// + applied_schema_version atomically, gated on continued ownership.
-func finalizeShardLeaseApply(ctx context.Context, db *sql.DB, schema, tableName, streamID, ddlText, ddlChecksum string, version int64) (finalized bool, err error) {
+// + applied_schema_version + anchor_position + source_engine
+// atomically, gated on continued ownership.
+//
+// anchorPos / anchorEngine carry the source-side CDC position the
+// boundary was observed at (v0.76.0+); empty strings store NULL so
+// legacy callers (and the unit-test fakes that don't supply an anchor)
+// preserve the pre-anchor shape.
+func finalizeShardLeaseApply(ctx context.Context, db *sql.DB, schema, tableName, streamID, ddlText, ddlChecksum string, version int64, anchorPos, anchorEngine string) (finalized bool, err error) {
 	tableRef := quoteIdent(schema) + "." + quoteIdent(shardConsolidationLeaseTableName)
 	q := "UPDATE " + tableRef + " SET " +
 		"ddl_text = $1, ddl_checksum = $2, " +
-		"applied_schema_version = $3, applied_at = CURRENT_TIMESTAMP " +
-		"WHERE target_table_full_name = $4 " +
-		"AND lease_holder_stream_id = $5 " +
+		"applied_schema_version = $3, applied_at = CURRENT_TIMESTAMP, " +
+		"anchor_position = NULLIF($4, ''), source_engine = NULLIF($5, '') " +
+		"WHERE target_table_full_name = $6 " +
+		"AND lease_holder_stream_id = $7 " +
 		"AND applied_at IS NULL"
-	res, err := db.ExecContext(ctx, q, ddlText, ddlChecksum, version, tableName, streamID)
+	res, err := db.ExecContext(ctx, q, ddlText, ddlChecksum, version, anchorPos, anchorEngine, tableName, streamID)
 	if err != nil {
 		return false, fmt.Errorf("postgres: lease finalize: %w", err)
 	}
@@ -261,12 +282,12 @@ func finalizeShardLeaseApply(ctx context.Context, db *sql.DB, schema, tableName,
 
 // listShardLeases returns every row in the per-target lease table.
 // Tolerant of the table being absent. ADR-0054 §6 operator-visibility
-// surface.
+// surface, plus the v0.76.0 lease GC sweep's enumeration source.
 func listShardLeases(ctx context.Context, db *sql.DB, schema string) ([]shardConsolidationLeaseRow, error) {
 	tableRef := quoteIdent(schema) + "." + quoteIdent(shardConsolidationLeaseTableName)
 	q := "SELECT target_table_full_name, COALESCE(lease_holder_stream_id, ''), " +
 		"lease_expires_at, COALESCE(ddl_text, ''), COALESCE(ddl_checksum, ''), " +
-		"applied_schema_version, applied_at FROM " + tableRef
+		"applied_schema_version, applied_at, anchor_position, source_engine FROM " + tableRef
 	rows, err := db.QueryContext(ctx, q)
 	if err != nil {
 		if isUndefinedRelationErr(err) {
@@ -287,12 +308,30 @@ func listShardLeases(ctx context.Context, db *sql.DB, schema string) ([]shardCon
 			&row.DDLChecksum,
 			&row.AppliedSchemaVersion,
 			&row.AppliedAt,
+			&row.AnchorPosition,
+			&row.AnchorEngine,
 		); err != nil {
 			return nil, fmt.Errorf("postgres: scan lease: %w", err)
 		}
 		out = append(out, row)
 	}
 	return out, rows.Err()
+}
+
+// deleteShardLease removes the row keyed by tableName. Tolerant of the
+// row being absent (DELETE on a missing PK is a no-op) and of the table
+// itself being absent (returns nil so a GC sweep against a pre-Ensure
+// target is a no-op). v0.76.0 lease GC sweep (task #21).
+func deleteShardLease(ctx context.Context, db *sql.DB, schema, tableName string) error {
+	tableRef := quoteIdent(schema) + "." + quoteIdent(shardConsolidationLeaseTableName)
+	q := "DELETE FROM " + tableRef + " WHERE target_table_full_name = $1"
+	if _, err := db.ExecContext(ctx, q, tableName); err != nil {
+		if isUndefinedRelationErr(err) {
+			return nil
+		}
+		return fmt.Errorf("postgres: lease delete: %w", err)
+	}
+	return nil
 }
 
 // selectShardLease loads the row for tableName. Returns ok=false when
@@ -302,7 +341,7 @@ func selectShardLease(ctx context.Context, db *sql.DB, schema, tableName string)
 	tableRef := quoteIdent(schema) + "." + quoteIdent(shardConsolidationLeaseTableName)
 	q := "SELECT target_table_full_name, COALESCE(lease_holder_stream_id, ''), " +
 		"lease_expires_at, COALESCE(ddl_text, ''), COALESCE(ddl_checksum, ''), " +
-		"applied_schema_version, applied_at " +
+		"applied_schema_version, applied_at, anchor_position, source_engine " +
 		"FROM " + tableRef + " WHERE target_table_full_name = $1"
 	r := db.QueryRowContext(ctx, q, tableName)
 	scanErr := r.Scan(
@@ -313,6 +352,8 @@ func selectShardLease(ctx context.Context, db *sql.DB, schema, tableName string)
 		&row.DDLChecksum,
 		&row.AppliedSchemaVersion,
 		&row.AppliedAt,
+		&row.AnchorPosition,
+		&row.AnchorEngine,
 	)
 	switch {
 	case errors.Is(scanErr, sql.ErrNoRows):
@@ -350,10 +391,27 @@ func ensureShardConsolidationLeaseTable(ctx context.Context, db *sql.DB, schema 
 			applied_schema_version        BIGINT       NOT NULL DEFAULT 0,
 			applied_at                    TIMESTAMP    NULL,
 			created_at                    TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			anchor_position               TEXT         NULL,
+			source_engine                 TEXT         NULL,
 			PRIMARY KEY (target_table_full_name)
 		)`
 	if _, err := db.ExecContext(ctx, ddl); err != nil {
 		return fmt.Errorf("postgres: ensure shard consolidation lease table: %w", err)
+	}
+	// Migration path for v0.75.0 deployments whose
+	// sluice_shard_consolidation_lease table pre-dates the v0.76.0
+	// anchor columns. ADD COLUMN IF NOT EXISTS is supported in every
+	// PG version sluice targets; mirrors the additive migrations on
+	// sluice_cdc_state + sluice_cdc_schema_history. Task #21 (lease GC
+	// sweep) reads anchor_position; legacy rows have NULL and are
+	// defensively retained by the sweeper.
+	for _, alter := range []string{
+		"ALTER TABLE " + tableRef + " ADD COLUMN IF NOT EXISTS anchor_position TEXT NULL",
+		"ALTER TABLE " + tableRef + " ADD COLUMN IF NOT EXISTS source_engine TEXT NULL",
+	} {
+		if _, err := db.ExecContext(ctx, alter); err != nil {
+			return fmt.Errorf("postgres: ensure shard consolidation lease table: add anchor columns: %w", err)
+		}
 	}
 	return nil
 }

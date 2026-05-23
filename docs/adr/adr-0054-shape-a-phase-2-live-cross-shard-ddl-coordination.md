@@ -463,6 +463,74 @@ Estimated LOC: ~800-1500 total (lease primitive ~300, DDL
 probes ~200, streamer wiring ~150, status surface ~100, CLI
 ~50, tests ~500).
 
+## v0.76.0 closure update
+
+Two of the v1-ship-deferred items from the "Out of scope (Phase 3+)"
+list below were closed in v0.76.0 (tasks #21 + #20). The remaining
+follow-ups are unchanged.
+
+### Lease GC sweep landed (task #21)
+
+The v1 ADR explicitly deferred a "Cleanup sweep for old lease rows" —
+that gap is now closed by `pipeline.SweepConsolidationLeases` in
+`internal/pipeline/shard_consolidation_lease_gc.go`. The sweep:
+
+- Auto-runs on the existing `LeaseManager` heartbeat loop, every
+  `gcDefaultEveryNTicks` heartbeats (30 ticks × 10s RetryPeriod
+  default = every 5 minutes). No new CLI surface — operationally
+  invisible.
+- Two-condition safety: a row is deletion-eligible iff (1) `applied_at
+  IS NOT NULL` (state APPLIED, never HELD/EXPIRED), AND (2) every
+  stream in `sluice_cdc_state` has a persisted `source_position`
+  at-or-after the lease row's `anchor_position` under the engine's
+  `ir.PositionOrderer`. The check includes stop-requested streams
+  (their persisted position is still authoritative for resume).
+- Anchor persistence: a new additive migration (`anchor_position`
+  TEXT NULL + `source_engine` TEXT NULL on the
+  `sluice_shard_consolidation_lease` control table on both PG and
+  MySQL) carries the source-side CDC position the boundary was
+  observed at. `FinalizeLeaseApply` writes it; legacy v0.75.0 rows
+  (NULL anchor) are defensively retained by the sweeper.
+- Loud-failure tenet: GC errors are LOGGED at WARN but never
+  propagated up. A failing sweep cannot crash an otherwise-healthy
+  stream — retention is a maintenance operation, not a correctness
+  one.
+
+### ProbeAlterColumnType v2 landed (task #20)
+
+The v1 ALTER COLUMN type probe was existence-only — it returned
+`ProbeOutcomeApplied` when the column existed on the target post-DDL,
+regardless of whether the column's catalog-reported type matched what
+the IR said it should be. A column dropped + re-added with a different
+type passed the existence check silently — a known silent-divergence
+gap the v1 ADR called out as a follow-up.
+
+v2 verifies that the column's catalog-reported IR type matches
+`want.Type` via the same per-engine `translateType` helper the schema
+reader uses (no duplicated type-mapping logic):
+
+- Column ABSENT → `ProbeOutcomeInconsistent` (unchanged from v1).
+- Column PRESENT and IR type matches `want.Type` → `ProbeOutcomeApplied`.
+- Column PRESENT but IR type differs → `ProbeOutcomeInconsistent` +
+  an error naming the expected and observed types so the operator can
+  recover via the drained model.
+
+PG NUMERIC's unconstrained-vs-constrained distinction is preserved
+(the IR's `Decimal.Unconstrained` matches PG's NULL precision/scale).
+MySQL VARCHAR length is compared; per the v0.73.2 charset-normalizer
+amendment, per-column charset is NOT compared (the post-DDL IR doesn't
+carry it). Other engine-specific type-projection edges are inherited
+from `translateType` automatically.
+
+### Closes v1 "known follow-ups" list
+
+The "Out of scope (Phase 3+)" section below lists four items. v0.76.0
+closes the two highlighted in the v1 ADR text ("Cleanup sweep" and
+the implicit "ProbeAlterColumnType v2" referenced in the v1 probe's
+inline TODO). The remaining two — operator-issued DDL
+(`sluice schema migrate-shape-a`) and cross-region lease semantics —
+are explicit Phase 3+ items and stay on the roadmap.
+
 ## Out of scope (Phase 3+)
 
 - **Operator-issued DDL through sluice**: a future `sluice schema

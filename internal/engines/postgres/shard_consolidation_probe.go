@@ -19,6 +19,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 
 	"github.com/orware/sluice/internal/ir"
@@ -109,29 +110,132 @@ func (a *ChangeApplier) ProbeDropIndex(ctx context.Context, table *ir.Table, ind
 	}
 }
 
-// ProbeAlterColumnType is a minimal v1 implementation: it verifies
-// the column EXISTS. Type-matching (Applied vs NotApplied based on
-// catalog's data_type vs want.Type) is deferred — the IR-type-to-PG-
-// type inverse mapping isn't trivial to factor without coupling the
-// applier to the schema reader. v1 surfaces "column missing" as
-// Inconsistent (the column should always exist on the target after
-// CREATE TABLE / cold-start), and treats "column exists" as Applied
-// so the takeover record-only path lands. A column-type mismatch
-// (the silent-divergence hazard) is left to surface via Phase 2e
-// integration tests + a future Phase 3 type-matching pass.
+// ProbeAlterColumnType implements the v0.76.0 task #20 IR-type-matching
+// probe (ADR-0054 closure). The v1 implementation was existence-only —
+// a column dropped + re-added with a different type silently passed the
+// existence check. v2 verifies that the column's catalog-reported IR
+// type matches want.Type via the same per-engine type-translation path
+// the schema reader uses (translateType), reusing the type-mapping
+// logic rather than duplicating it.
+//
+// Outcomes per ADR-0054 §4:
+//
+//   - Column ABSENT → Inconsistent (catastrophic — column should always
+//     exist on the target after CREATE TABLE).
+//   - Column PRESENT and IR-type matches want.Type → Applied.
+//   - Column PRESENT but IR-type differs → Inconsistent + error naming
+//     expected vs observed type. The mismatch is the v0.76.0
+//     silent-divergence shape (the v1 probe couldn't distinguish a
+//     legitimate ALTER COLUMN TYPE from a drop+re-add with the wrong
+//     type); v2 closes that gap loudly.
+//
+// Note on PG NUMERIC: PG's information_schema reports
+// numeric_precision / numeric_scale as NULL for bare `numeric`
+// (unconstrained), distinguishing it from `numeric(p,s)`. The IR's
+// Decimal.Unconstrained encodes the same distinction, and
+// translateType maps NULL→Unconstrained=true. So a probe of
+// `numeric(10,2)` against want.Type=Decimal{Unconstrained:true}
+// correctly returns Inconsistent.
 func (a *ChangeApplier) ProbeAlterColumnType(ctx context.Context, table *ir.Table, want *ir.Column) (ir.ProbeOutcome, error) {
 	if want == nil {
 		return ir.ProbeOutcomeInconsistent, errors.New("postgres: probe alter column type: want is nil")
 	}
 	schemaName := a.probeSchemaFor(table)
-	exists, err := a.columnPresent(ctx, schemaName, table.Name, want.Name)
+	observed, present, err := a.readColumnIRType(ctx, schemaName, table.Name, want.Name)
 	if err != nil {
 		return ir.ProbeOutcomeInconsistent, err
 	}
-	if !exists {
+	if !present {
 		return ir.ProbeOutcomeInconsistent, nil
 	}
-	return ir.ProbeOutcomeApplied, nil
+	if reflect.DeepEqual(observed, want.Type) {
+		return ir.ProbeOutcomeApplied, nil
+	}
+	return ir.ProbeOutcomeInconsistent, fmt.Errorf(
+		"postgres: probe alter column type %s.%s.%s: observed IR type %v, want %v",
+		schemaName, table.Name, want.Name, observed, want.Type,
+	)
+}
+
+// readColumnIRType introspects the named column on the target via
+// information_schema + pg_attribute and reconstructs the IR Type the
+// schema reader would build for that column. Returns (irType, true)
+// when the column exists, (nil, false) when absent. The query mirrors
+// the projection list in populateColumns — same per-column metadata
+// columns + the same translateType dispatch — so probe and read see
+// the same IR types for the same target state.
+//
+// Scoped to v0.76.0 task #20: only the subset of fields the v1 probe
+// catalog touches (ALTER COLUMN TYPE leaves Nullable / Default / GenExpr
+// unchanged; the existing ProbeAlterColumnNullability owns nullability).
+// We pass an empty enumValues / geomInfo since the IR-delta classifier
+// in v1 refuses on enum / geometry type alters (multi-shape combo).
+func (a *ChangeApplier) readColumnIRType(ctx context.Context, schemaName, tableName, colName string) (ir.Type, bool, error) {
+	const q = `
+		SELECT
+			LOWER(c.data_type),
+			c.udt_name,
+			c.character_maximum_length,
+			c.numeric_precision,
+			c.numeric_scale,
+			c.datetime_precision,
+			c.is_identity,
+			COALESCE(coll.collname, ''),
+			COALESCE(a.atttypmod, -1),
+			COALESCE(pg_catalog.format_type(a.atttypid, a.atttypmod), '')
+		FROM   information_schema.columns c
+		LEFT JOIN pg_class      cl   ON cl.relname    = c.table_name
+		                            AND cl.relnamespace = (
+		                                  SELECT oid FROM pg_namespace WHERE nspname = c.table_schema)
+		LEFT JOIN pg_attribute  a    ON a.attrelid    = cl.oid
+		                            AND a.attname     = c.column_name
+		                            AND a.attnum      > 0
+		                            AND NOT a.attisdropped
+		LEFT JOIN pg_collation  coll ON coll.oid       = a.attcollation
+		                            AND coll.oid      <> 0
+		                            AND coll.collname <> 'default'
+		WHERE  c.table_schema = $1 AND c.table_name = $2 AND c.column_name = $3`
+
+	var (
+		dataType, udtName   string
+		charMaxLen, numPrec sql.NullInt64
+		numScale, dtPrec    sql.NullInt64
+		isIdentity          string
+		collation           string
+		attTypmod           int32
+		formatType          string
+	)
+	switch err := a.db.QueryRowContext(ctx, q, schemaName, tableName, colName).Scan(
+		&dataType, &udtName,
+		&charMaxLen, &numPrec, &numScale, &dtPrec,
+		&isIdentity,
+		&collation,
+		&attTypmod,
+		&formatType,
+	); {
+	case errors.Is(err, sql.ErrNoRows):
+		return nil, false, nil
+	case err != nil:
+		return nil, false, fmt.Errorf("postgres: probe read column %q: %w", colName, err)
+	}
+
+	meta := columnMeta{
+		DataType:        dataType,
+		UDTName:         udtName,
+		CharMaxLen:      nullInt64ToPtr(charMaxLen),
+		NumPrec:         nullInt64ToPtr(numPrec),
+		NumScale:        nullInt64ToPtr(numScale),
+		DTPrec:          nullInt64ToPtr(dtPrec),
+		IsAutoIncrement: isAutoIncrement(isIdentity, sql.NullString{}),
+		Collation:       collation,
+		AttTypmod:       attTypmod,
+		FormatType:      formatType,
+	}
+	t, err := translateType(meta)
+	if err != nil {
+		return nil, true, fmt.Errorf("postgres: probe translate type for %s.%s.%s: %w", schemaName, tableName, colName, err)
+	}
+	return t, true, nil
 }
 
 // ProbeAlterColumnNullability returns Applied when the column's
@@ -189,17 +293,6 @@ func (a *ChangeApplier) countColumnsPresent(ctx context.Context, schemaName, tab
 		return 0, fmt.Errorf("postgres: probe columns: %w", err)
 	}
 	return n, nil
-}
-
-// columnPresent returns whether the named column exists on the target.
-func (a *ChangeApplier) columnPresent(ctx context.Context, schemaName, tableName, colName string) (bool, error) {
-	const q = `SELECT EXISTS(SELECT 1 FROM information_schema.columns
-		WHERE table_schema = $1 AND table_name = $2 AND column_name = $3)`
-	var v bool
-	if err := a.db.QueryRowContext(ctx, q, schemaName, tableName, colName).Scan(&v); err != nil {
-		return false, fmt.Errorf("postgres: probe column %q: %w", colName, err)
-	}
-	return v, nil
 }
 
 // countIndexesPresent returns the number of named indexes present in

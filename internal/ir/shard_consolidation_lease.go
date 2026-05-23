@@ -70,6 +70,20 @@ type ShardConsolidationLeaseRow struct {
 	// NULL (not-yet-applied) case from a zero time-value.
 	AppliedAt    time.Time
 	HasAppliedAt bool
+
+	// AnchorPosition is the source-side CDC position at which this
+	// boundary's DDL was observed (the SchemaSnapshot's Position).
+	// Recorded by [ShardConsolidationLeaseStore.FinalizeLeaseApply] so
+	// the v0.76.0 lease GC sweep (task #21) can compare it against
+	// every stream's persisted position via the engine's
+	// [PositionOrderer] and only delete rows every live stream has
+	// already advanced past.
+	//
+	// Has{Anchor} distinguishes NULL (legacy v0.75.0 rows that pre-date
+	// the additive `anchor_position` migration; GC defensively retains
+	// them) from a freshly-written boundary.
+	AnchorPosition Position
+	HasAnchor      bool
 }
 
 // ProbeOutcome classifies the takeover-stream's view of the target
@@ -201,14 +215,21 @@ type ShardConsolidationLeaseStore interface {
 
 	// FinalizeLeaseApply UPDATEs the row to applied_at = now,
 	// ddl_text = ddlText, ddl_checksum = ddlChecksum,
-	// applied_schema_version = appliedSchemaVersion, iff the row is
+	// applied_schema_version = appliedSchemaVersion, anchor_position
+	// = anchor.Token + source_engine = anchor.Engine, iff the row is
 	// still held by streamID and not yet finalized. Returns
 	// finalized=false when the lease has been taken over between
 	// heartbeat and finalize.
+	//
+	// anchor is the source-side CDC position at which the boundary's
+	// DDL was observed. A zero-value anchor is permitted (e.g. unit
+	// tests / engines without CDC) and stored as NULL — the v0.76.0
+	// lease GC sweep (task #21) defensively retains NULL-anchor rows.
 	FinalizeLeaseApply(
 		ctx context.Context,
 		tableName, streamID, ddlText, ddlChecksum string,
 		appliedSchemaVersion int64,
+		anchor Position,
 	) (finalized bool, err error)
 
 	// ObserveLease reads the row for tableName, returning ok=false
@@ -237,4 +258,24 @@ type ShardConsolidationLeaseStore interface {
 // against a fresh target doesn't error.
 type ShardConsolidationLeaseLister interface {
 	ListLeases(ctx context.Context) ([]ShardConsolidationLeaseRow, error)
+}
+
+// ShardConsolidationLeaseDeleter is the optional surface engines can
+// implement to remove a single row from the
+// `sluice_shard_consolidation_lease` control table by its primary key
+// (TargetTableFullName). Used by the v0.76.0 lease GC sweep
+// (`pipeline.sweepConsolidationLeases`, task #21) to garbage-collect
+// APPLIED rows every live stream has already advanced past.
+//
+// Sibling-tier to [ShardConsolidationLeaseStore] / Lister — distinct
+// interface so engines that don't yet implement deletion inherit the
+// no-GC default (rows accumulate; operationally fine for v1, the v1
+// follow-up this addresses). Tolerant of the table being absent and
+// of the row being absent (both treated as "nothing to delete"; the
+// sweeper's row-iteration is the authoritative existence check).
+//
+// The shipping PG and MySQL engines both implement it (ADR-0054
+// v0.76.0 closure).
+type ShardConsolidationLeaseDeleter interface {
+	DeleteLease(ctx context.Context, tableName string) error
 }

@@ -284,7 +284,25 @@ type LeaseManager struct {
 	streamID string
 	cfg      LeaseConfig
 	now      func() time.Time // injectable clock for tests
+
+	// gcDeps, when non-nil, drives the v0.76.0 lease GC sweep
+	// piggybacked on the heartbeat ticker (task #21). Zero-value =
+	// no-op (compatible with engines that don't implement the
+	// Deleter surface, and with unit-test paths that don't wire it).
+	gcDeps *LeaseGCDeps
+
+	// gcEveryNTicks is the heartbeat-tick cadence at which to fire a
+	// GC sweep (every Nth tick). Defaults to gcDefaultEveryNTicks.
+	gcEveryNTicks int
 }
+
+// gcDefaultEveryNTicks is the default heartbeat-tick cadence at which
+// the lease GC sweep fires. RetryPeriod defaults to 10s, so 30 ticks
+// = 5 minutes, the cadence ADR-0054 task #21 specifies. The sweep
+// is opportunistic (runs only while a lease is held); a long-lived
+// fleet with no active coordination accumulates leases until the next
+// boundary, at which point the new holder's heartbeat will start GC-ing.
+const gcDefaultEveryNTicks = 30
 
 // NewLeaseManager constructs a LeaseManager that drives store on
 // behalf of streamID. The streamID must be globally unique across all
@@ -303,11 +321,29 @@ func NewLeaseManager(store ShardConsolidationLeaseStore, streamID string, cfg Le
 		return nil, fmt.Errorf("pipeline: NewLeaseManager: %w", err)
 	}
 	return &LeaseManager{
-		store:    store,
-		streamID: streamID,
-		cfg:      cfg.Resolved(),
-		now:      time.Now,
+		store:         store,
+		streamID:      streamID,
+		cfg:           cfg.Resolved(),
+		now:           time.Now,
+		gcEveryNTicks: gcDefaultEveryNTicks,
 	}, nil
+}
+
+// WithGC configures the v0.76.0 lease GC sweep (task #21). When deps
+// is non-nil, the heartbeat goroutine fires SweepConsolidationLeases
+// every gcEveryNTicks heartbeat ticks. Idempotent — passing a nil deps
+// disables GC.
+//
+// The streamer wires this at engagement time after type-asserting the
+// applier for [ir.ShardConsolidationLeaseDeleter] and
+// [ir.PositionOrderer]; engines that don't implement either inherit
+// the no-GC default (deps == nil).
+func (m *LeaseManager) WithGC(deps *LeaseGCDeps) *LeaseManager {
+	if m == nil {
+		return nil
+	}
+	m.gcDeps = deps
+	return m
 }
 
 // Lease is a held lease handle. The owning goroutine (lease-holder
@@ -474,7 +510,8 @@ func (m *LeaseManager) Heartbeat(ctx context.Context, l *Lease) error {
 }
 
 // Apply finalizes the lease: records applied_at + ddl_checksum +
-// applied_schema_version, then stops the heartbeat goroutine.
+// applied_schema_version + anchor Position, then stops the heartbeat
+// goroutine.
 //
 // The caller must run the actual ALTER on the target before calling
 // Apply (or, on a transactional-DDL engine like PG, in the same tx
@@ -484,11 +521,20 @@ func (m *LeaseManager) Heartbeat(ctx context.Context, l *Lease) error {
 // non-transactional-DDL hazard ADR-0054 §4's probe-and-record
 // handles.
 //
+// anchor is the source-side CDC position at which this boundary's DDL
+// was observed (the SchemaSnapshot's Position). Persisted into the
+// lease row so the v0.76.0 lease GC sweep (task #21) can compare each
+// row's anchor against every stream's persisted position via the
+// engine's [ir.PositionOrderer], and only delete rows every live
+// stream has already advanced past. A zero-value Position is permitted
+// (callers without CDC context — unit tests, manual recovery paths);
+// the engine stores NULL and the GC sweep defensively retains the row.
+//
 // Returns nil on success. [ErrLeaseLost] when the lease has been
 // taken over between heartbeat-loop and finalize. Apply is idempotent
 // on the caller's side: a second Apply returns nil without
 // re-issuing the UPDATE.
-func (m *LeaseManager) Apply(ctx context.Context, l *Lease, version int64, ddlText, ddlChecksum string) error {
+func (m *LeaseManager) Apply(ctx context.Context, l *Lease, version int64, ddlText, ddlChecksum string, anchor ir.Position) error {
 	if l == nil {
 		return errors.New("pipeline: LeaseManager.Apply: lease is nil")
 	}
@@ -499,7 +545,7 @@ func (m *LeaseManager) Apply(ctx context.Context, l *Lease, version int64, ddlTe
 	if already {
 		return nil
 	}
-	finalized, err := m.store.FinalizeLeaseApply(ctx, l.tableName, m.streamID, ddlText, ddlChecksum, version)
+	finalized, err := m.store.FinalizeLeaseApply(ctx, l.tableName, m.streamID, ddlText, ddlChecksum, version, anchor)
 	// Stop the heartbeat goroutine regardless of outcome — if the
 	// finalize failed the caller has to surface the error, but the
 	// lease is no longer ours to extend.
@@ -517,6 +563,8 @@ func (m *LeaseManager) Apply(ctx context.Context, l *Lease, version int64, ddlTe
 		"stream_id", m.streamID,
 		"version", version,
 		"ddl_checksum", ddlChecksum,
+		"anchor_engine", anchor.Engine,
+		"anchor_token", anchor.Token,
 	)
 	return nil
 }
@@ -600,6 +648,7 @@ func (m *LeaseManager) heartbeatLoop(ctx context.Context, l *Lease) {
 	defer tick.Stop()
 
 	lastSuccess := m.now()
+	tickCount := 0
 	for {
 		select {
 		case <-l.stopCh:
@@ -618,6 +667,24 @@ func (m *LeaseManager) heartbeatLoop(ctx context.Context, l *Lease) {
 					"table", l.tableName,
 					"stream_id", m.streamID,
 				)
+				tickCount++
+				// Lease GC sweep (task #21): piggyback on the heartbeat
+				// tick; fire every gcEveryNTicks successful heartbeats
+				// so a single fleet doesn't pile on N concurrent
+				// sweeps. Loud-failure tenet: GC errors are LOGGED at
+				// WARN inside the sweeper and never propagated up — a
+				// failing GC sweep must NOT crash an otherwise-healthy
+				// stream (retention is a maintenance op, not a
+				// correctness one).
+				if m.gcDeps != nil && m.gcEveryNTicks > 0 && tickCount%m.gcEveryNTicks == 0 {
+					if _, gcErr := SweepConsolidationLeases(ctx, *m.gcDeps); gcErr != nil {
+						slog.WarnContext(
+							ctx, "shard consolidation lease GC sweep failed (continuing)",
+							"stream_id", m.streamID,
+							"error", gcErr,
+						)
+					}
+				}
 				continue
 			}
 			if errors.Is(err, ErrLeaseLost) {

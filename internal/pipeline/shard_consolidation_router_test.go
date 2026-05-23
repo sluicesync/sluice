@@ -83,7 +83,7 @@ func TestRouteBoundary_NoneShape_NoOp(t *testing.T) {
 
 	pre := fixtureTable("users", "id", "email")
 	post := fixtureTable("users", "id", "email")
-	if err := router.RouteBoundary(context.Background(), "users", pre, post, "no-op", 1); err != nil {
+	if err := router.RouteBoundary(context.Background(), "users", pre, post, "no-op", 1, ir.Position{}); err != nil {
 		t.Fatalf("RouteBoundary: %v", err)
 	}
 	if applier.addColCalls != 0 {
@@ -104,7 +104,7 @@ func TestRouteBoundary_HappyPath_ApplyAndFinalize(t *testing.T) {
 
 	pre := fixtureTable("users", "id")
 	post := fixtureTable("users", "id", "added_at")
-	if err := router.RouteBoundary(context.Background(), "users", pre, post, "ALTER TABLE users ADD COLUMN added_at INT", 1); err != nil {
+	if err := router.RouteBoundary(context.Background(), "users", pre, post, "ALTER TABLE users ADD COLUMN added_at INT", 1, ir.Position{}); err != nil {
 		t.Fatalf("RouteBoundary: %v", err)
 	}
 	if applier.addColCalls != 1 {
@@ -133,7 +133,7 @@ func TestRouteBoundary_UnrecognizedShape_RefuseLoudly(t *testing.T) {
 	// Combo delta: ADD + DROP → unrecognized.
 	pre := fixtureTable("users", "id", "deprecated")
 	post := fixtureTable("users", "id", "added_at")
-	err := router.RouteBoundary(context.Background(), "users", pre, post, "combo", 1)
+	err := router.RouteBoundary(context.Background(), "users", pre, post, "combo", 1, ir.Position{})
 	if err == nil {
 		t.Fatal("expected refusal on unrecognized combo shape")
 	}
@@ -162,7 +162,7 @@ func TestRouteBoundary_TakeoverNotApplied_ReApply(t *testing.T) {
 	router := newTestRouter(t, store, "stream-b", prober, applier, clock)
 	pre := fixtureTable("users", "id")
 	post := fixtureTable("users", "id", "added_at")
-	if err := router.RouteBoundary(context.Background(), "users", pre, post, "ALTER TABLE users ADD COLUMN added_at INT", 1); err != nil {
+	if err := router.RouteBoundary(context.Background(), "users", pre, post, "ALTER TABLE users ADD COLUMN added_at INT", 1, ir.Position{}); err != nil {
 		t.Fatalf("RouteBoundary takeover: %v", err)
 	}
 	if applier.addColCalls != 1 {
@@ -188,7 +188,7 @@ func TestRouteBoundary_TakeoverApplied_RecordOnly(t *testing.T) {
 	router := newTestRouter(t, store, "stream-b", prober, applier, clock)
 	pre := fixtureTable("users", "id")
 	post := fixtureTable("users", "id", "added_at")
-	if err := router.RouteBoundary(context.Background(), "users", pre, post, "ALTER TABLE users ADD COLUMN added_at INT", 1); err != nil {
+	if err := router.RouteBoundary(context.Background(), "users", pre, post, "ALTER TABLE users ADD COLUMN added_at INT", 1, ir.Position{}); err != nil {
 		t.Fatalf("RouteBoundary takeover: %v", err)
 	}
 	if applier.addColCalls != 0 {
@@ -214,7 +214,7 @@ func TestRouteBoundary_TakeoverInconsistent_RefuseLoudly(t *testing.T) {
 	router := newTestRouter(t, store, "stream-b", prober, applier, clock)
 	pre := fixtureTable("users", "id")
 	post := fixtureTable("users", "id", "added_at")
-	err = router.RouteBoundary(context.Background(), "users", pre, post, "ALTER", 1)
+	err = router.RouteBoundary(context.Background(), "users", pre, post, "ALTER", 1, ir.Position{})
 	if err == nil {
 		t.Fatal("expected loud refusal on takeover Inconsistent")
 	}
@@ -237,7 +237,7 @@ func TestRouteBoundary_PeerApplied_ChecksumMatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("mgrA.Acquire: %v", err)
 	}
-	if err := mgrA.Apply(context.Background(), leaseA, 1, ddl, ChecksumDDLText(ddl)); err != nil {
+	if err := mgrA.Apply(context.Background(), leaseA, 1, ddl, ChecksumDDLText(ddl), ir.Position{}); err != nil {
 		t.Fatalf("mgrA.Apply: %v", err)
 	}
 
@@ -246,7 +246,7 @@ func TestRouteBoundary_PeerApplied_ChecksumMatch(t *testing.T) {
 	router := newTestRouter(t, store, "stream-b", prober, applier, clock)
 	pre := fixtureTable("users", "id")
 	post := fixtureTable("users", "id", "added_at")
-	if err := router.RouteBoundary(context.Background(), "users", pre, post, ddl, 1); err != nil {
+	if err := router.RouteBoundary(context.Background(), "users", pre, post, ddl, 1, ir.Position{}); err != nil {
 		t.Fatalf("RouteBoundary peer-applied: %v", err)
 	}
 	if applier.addColCalls != 0 {
@@ -269,7 +269,7 @@ func TestRouteBoundary_PeerApplied_ChecksumMismatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("mgrA.Acquire: %v", err)
 	}
-	if err := mgrA.Apply(context.Background(), leaseA, 1, peerDDL, ChecksumDDLText(peerDDL)); err != nil {
+	if err := mgrA.Apply(context.Background(), leaseA, 1, peerDDL, ChecksumDDLText(peerDDL), ir.Position{}); err != nil {
 		t.Fatalf("mgrA.Apply: %v", err)
 	}
 
@@ -277,7 +277,7 @@ func TestRouteBoundary_PeerApplied_ChecksumMismatch(t *testing.T) {
 	pre := fixtureTable("users", "id")
 	post := fixtureTable("users", "id", "added_at")
 	// This stream's "ddl_text" intentionally differs from the peer's.
-	err = router.RouteBoundary(context.Background(), "users", pre, post, "ALTER TABLE users ADD COLUMN different_col INT", 1)
+	err = router.RouteBoundary(context.Background(), "users", pre, post, "ALTER TABLE users ADD COLUMN different_col INT", 1, ir.Position{})
 	if err == nil {
 		t.Fatal("expected ErrLeaseChecksumMismatch on peer-applied divergent DDL")
 	}

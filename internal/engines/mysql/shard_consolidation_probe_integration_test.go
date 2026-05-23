@@ -181,6 +181,78 @@ func TestShardConsolidationProber_MySQL_AlterColumnNullability(t *testing.T) {
 	}
 }
 
+// TestShardConsolidationProber_MySQL_AlterColumnType_V2 pins the
+// v0.76.0 task #20 IR-type-matching semantics on MySQL (ADR-0054
+// closure). v1 was existence-only; v2 catches the silent-divergence
+// shape where a column is dropped + re-added with the wrong type.
+func TestShardConsolidationProber_MySQL_AlterColumnType_V2(t *testing.T) {
+	dsn, cleanup := startMySQLForApplier(t)
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	if _, err := db.ExecContext(ctx, "CREATE TABLE `shape_type_v2` (id INT PRIMARY KEY, amount INT)"); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+
+	eng := Engine{}
+	a, err := eng.OpenChangeApplier(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenChangeApplier: %v", err)
+	}
+	defer func() {
+		if c, ok := a.(interface{ Close() error }); ok {
+			_ = c.Close()
+		}
+	}()
+	applier := a.(*ChangeApplier)
+	table := &ir.Table{Name: "shape_type_v2"}
+
+	// Pre-ALTER: INT column, want BIGINT → Inconsistent.
+	outcome, err := applier.ProbeAlterColumnType(ctx, table, &ir.Column{Name: "amount", Type: ir.Integer{Width: 64}})
+	if err == nil {
+		t.Fatal("ProbeAlterColumnType v2: expected error for INT vs BIGINT")
+	}
+	if outcome != ir.ProbeOutcomeInconsistent {
+		t.Errorf("outcome = %v, want Inconsistent", outcome)
+	}
+
+	// Land the ALTER: INT → BIGINT.
+	if _, err := db.ExecContext(ctx, "ALTER TABLE `shape_type_v2` MODIFY COLUMN amount BIGINT"); err != nil {
+		t.Fatalf("ALTER INT→BIGINT: %v", err)
+	}
+
+	// Post-ALTER: want=BIGINT matches → Applied.
+	outcome, err = applier.ProbeAlterColumnType(ctx, table, &ir.Column{Name: "amount", Type: ir.Integer{Width: 64}})
+	if err != nil {
+		t.Fatalf("ProbeAlterColumnType (post-ALTER): %v", err)
+	}
+	if outcome != ir.ProbeOutcomeApplied {
+		t.Errorf("outcome = %v, want Applied", outcome)
+	}
+
+	// Drop + re-add with wrong type — v2 silent-divergence catch.
+	if _, err := db.ExecContext(ctx, "ALTER TABLE `shape_type_v2` DROP COLUMN amount"); err != nil {
+		t.Fatalf("DROP COLUMN: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "ALTER TABLE `shape_type_v2` ADD COLUMN amount TEXT"); err != nil {
+		t.Fatalf("ADD COLUMN amount TEXT: %v", err)
+	}
+	outcome, err = applier.ProbeAlterColumnType(ctx, table, &ir.Column{Name: "amount", Type: ir.Integer{Width: 64}})
+	if err == nil {
+		t.Fatal("ProbeAlterColumnType v2: expected error after drop+re-add with TEXT")
+	}
+	if outcome != ir.ProbeOutcomeInconsistent {
+		t.Errorf("outcome = %v, want Inconsistent (drop+re-add wrong type)", outcome)
+	}
+}
+
 // TestShardConsolidationProber_MySQL_CreateDropIndex round-trips
 // CreateShapeIndex + DropShapeIndex against information_schema.
 func TestShardConsolidationProber_MySQL_CreateDropIndex(t *testing.T) {

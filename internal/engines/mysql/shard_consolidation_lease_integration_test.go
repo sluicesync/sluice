@@ -15,6 +15,8 @@ import (
 	"database/sql"
 	"testing"
 	"time"
+
+	"github.com/orware/sluice/internal/ir"
 )
 
 func TestShardConsolidationLease_EnsureCreatesTable(t *testing.T) {
@@ -114,7 +116,7 @@ func TestShardConsolidationLease_AcquireHeartbeatApply(t *testing.T) {
 	}
 
 	const ddlChecksum = "deadbeef"
-	finalized, err := applier.FinalizeLeaseApply(ctx, tableName, streamID, ddlText, ddlChecksum, 1)
+	finalized, err := applier.FinalizeLeaseApply(ctx, tableName, streamID, ddlText, ddlChecksum, 1, ir.Position{})
 	if err != nil {
 		t.Fatalf("FinalizeLeaseApply: %v", err)
 	}
