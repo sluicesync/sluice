@@ -6,6 +6,8 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.74.2] - 2026-05-23
+
 ### Added
 
 - **`feat(engines/postgres): F1 — refuse loudly on pgoutput StreamAbortMessageV2`** — Closes severity-c finding F1 of the 2026-05-22 PG-internals research run. sluice's `START_REPLICATION` passes `proto_version=2` without `streaming='on'`, so PG should never emit streaming chunk messages — but the receiver's `dispatchWAL` previously silently skipped `StreamAbortMessageV2` via the `default:` arm of its type switch (alongside benign skips for `TypeMessage` / `OriginMessage` / `LogicalDecodingMessage` / `StreamCommitMessageV2`). The silent-skip on StreamAbort was latent silent-loss-class: if streaming ever got enabled externally (PG config drift) or by a future sluice change without wiring chunk-rollback into the IR, each pre-abort `StreamStart` / `StreamStop` chunk has already been emitted as `ir.TxBegin` / `ir.TxCommit` (per ADR-0027) and committed on the target. A silently-skipped abort would leave the target carrying rows the source rolled back — silent unrecoverable divergence. The fix adds an explicit `case *pglogrepl.StreamAbortMessageV2:` returning a self-describing error (xid + sub-xid + recovery hint pointing at slot-drop + re-snapshot, references ADR-0055). No production behaviour change for any current operator — the refusal can only fire if streaming is enabled, which sluice does not do.
