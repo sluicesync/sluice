@@ -4,8 +4,12 @@
 package postgres
 
 import (
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/orware/sluice/internal/ir"
 )
@@ -85,5 +89,42 @@ func TestExtractPGLSN_MalformedJSON(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "decode JSON-envelope") {
 		t.Errorf("error should mention decode JSON-envelope; got %v", err)
+	}
+}
+
+// TestIsUndefinedTableError_Matches42P01 pins the F2 "PG < 14 lacks
+// pg_stat_replication_slots" detector: a *pgconn.PgError with Code
+// "42P01" (undefined_table) returns true so the SlotSpillStats caller
+// surfaces ok=false rather than propagating the error to the operator.
+func TestIsUndefinedTableError_Matches42P01(t *testing.T) {
+	err := &pgconn.PgError{Code: "42P01", Message: `relation "pg_stat_replication_slots" does not exist`}
+	if !isUndefinedTableError(err) {
+		t.Errorf("expected true for SQLSTATE 42P01; got false")
+	}
+	// Wrapped via fmt.Errorf — errors.As should still find it.
+	wrapped := fmt.Errorf("postgres: SlotSpillStats: %w", err)
+	if !isUndefinedTableError(wrapped) {
+		t.Errorf("expected true for wrapped 42P01; got false")
+	}
+}
+
+// TestIsUndefinedTableError_RejectsOtherCodes pins the negative: other
+// SQLSTATEs (insufficient_privilege 42501, undefined_column 42703,
+// connection failure) must not match the F2 detector — the caller
+// should propagate them as real errors rather than silently degrade.
+func TestIsUndefinedTableError_RejectsOtherCodes(t *testing.T) {
+	for _, code := range []string{"42501", "42703", "42000", "08006", "23505"} {
+		err := &pgconn.PgError{Code: code, Message: "not undefined_table"}
+		if isUndefinedTableError(err) {
+			t.Errorf("SQLSTATE %s should NOT match; got true", code)
+		}
+	}
+	// Plain (non-PG) error: must not match.
+	if isUndefinedTableError(errors.New("not a pgconn.PgError")) {
+		t.Errorf("plain error should NOT match")
+	}
+	// Nil: must not match.
+	if isUndefinedTableError(nil) {
+		t.Errorf("nil error should NOT match")
 	}
 }

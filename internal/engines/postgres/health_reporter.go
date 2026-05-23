@@ -5,9 +5,12 @@ package postgres
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"strings"
+
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/orware/sluice/internal/ir"
 )
@@ -69,6 +72,65 @@ func (r *SchemaReader) LagBytes(ctx context.Context, earlier, later ir.Position)
 		return 0, fmt.Errorf("postgres: LagBytes (later=%q earlier=%q): %w", laterLSN, earlierLSN, err)
 	}
 	return diff, nil
+}
+
+// SlotSpillStats implements [ir.SlotSpillReporter]. Reads the per-slot
+// CDC-decode spill counters from PG 14+'s `pg_stat_replication_slots`
+// view (severity-B finding F2 of the 2026-05-22 PG-internals research
+// run).
+//
+// Returns ok=false (not an error) in two "no signal" cases the consumer
+// distinguishes from "definitely zero":
+//
+//  1. The view doesn't exist (`SQLSTATE 42P01 undefined_table`) — PG <
+//  14. sluice's declared baseline is PG 14+; this is defensive for
+//     operators pointing sluice at an older server during evaluation.
+//  2. No row exists for the slot in the view yet — the slot has never
+//     been used for decoding (a freshly-created slot before any
+//     `START_REPLICATION` has emitted changes through it).
+//
+// Either case surfaces as "spill stats unavailable" in the health
+// surface rather than a misleading 0.
+//
+// Empty slotName returns an error — the caller didn't supply enough
+// info to scope the query, and returning ok=false would mask a real bug
+// in the wiring layer.
+func (r *SchemaReader) SlotSpillStats(ctx context.Context, slotName string) (ir.SpillStats, bool, error) {
+	if r.db == nil {
+		return ir.SpillStats{}, false, errors.New("postgres: SlotSpillStats: reader not opened")
+	}
+	if slotName == "" {
+		return ir.SpillStats{}, false, errors.New("postgres: SlotSpillStats: slotName is empty")
+	}
+	var stats ir.SpillStats
+	const q = `SELECT spill_txns, spill_bytes FROM pg_stat_replication_slots WHERE slot_name = $1`
+	err := r.db.QueryRowContext(ctx, q, slotName).Scan(&stats.SpillTxns, &stats.SpillBytes)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		// No row for this slot yet — decode hasn't happened. Surface as
+		// "unavailable" rather than 0; a careless reader would mistake
+		// 0 for "definitely no spill" when the real signal is "we can't
+		// tell yet."
+		return ir.SpillStats{}, false, nil
+	case isUndefinedTableError(err):
+		// PG < 14 — the view doesn't exist. Same "unavailable" surface.
+		return ir.SpillStats{}, false, nil
+	case err != nil:
+		return ir.SpillStats{}, false, fmt.Errorf("postgres: SlotSpillStats: %w", err)
+	}
+	return stats, true, nil
+}
+
+// isUndefinedTableError reports whether err wraps a PG `undefined_table`
+// SQLSTATE (42P01). Used to detect the "view doesn't exist on PG < 14"
+// case for `pg_stat_replication_slots` without hard-coding a PG version
+// check.
+func isUndefinedTableError(err error) bool {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr.Code == "42P01"
+	}
+	return false
 }
 
 // extractPGLSN normalises an [ir.Position] into a bare LSN string

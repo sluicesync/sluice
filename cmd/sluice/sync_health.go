@@ -37,6 +37,7 @@ type SyncHealthCmd struct {
 
 	SourceDriver string `help:"Source engine name (optional). When set together with --source, the probe also reads the source's current position and reports source/target tokens plus byte-distance lag (PG only). Without these, the probe stays target-side only — same as v0.13.0 / v0.14.x behavior." placeholder:"NAME" group:"source"`
 	Source       string `help:"Source database DSN (optional). See --source-driver." env:"SLUICE_SOURCE" placeholder:"DSN" group:"source"`
+	SlotName     string `help:"Replication-slot name on the source (PG-only, requires --source). Used to read per-slot CDC-decode spill counters from pg_stat_replication_slots (PG 14+). Defaults to 'sluice_slot' — sluice's built-in slot name — when --source-driver=postgres is set and this flag is unset." placeholder:"NAME" group:"source"`
 
 	MaxStaleSeconds int   `help:"Threshold: exit 1 if target's last apply was more than N seconds ago. 0 disables the check (informational only)." default:"0" placeholder:"N"`
 	MaxLagBytes     int64 `help:"Threshold (PG-only, requires --source): exit 1 if source LSN is more than N bytes ahead of target. 0 disables. MySQL leaves this informational; GTID sets aren't byte-distance comparable." default:"0" placeholder:"N"`
@@ -73,6 +74,15 @@ type HealthResult struct {
 	LagBytesIsAvail bool  `json:"lag_bytes_available"`
 	LagThreshold    int64 `json:"max_lag_bytes_threshold,omitempty"`
 	LagBytesStale   bool  `json:"lag_bytes_stale,omitempty"`
+
+	// Spill stats (severity-B finding F2 of the 2026-05-22 PG-internals
+	// research run). Pointer-omitempty: nil when the engine doesn't
+	// implement [ir.SlotSpillReporter] (MySQL), when the PG view doesn't
+	// exist (PG < 14), or when no decode has happened on the slot yet.
+	// "Unavailable" surfaces as field absence rather than a misleading
+	// 0 a careless reader could mistake for "definitely no spill."
+	SpillTxns  *int64 `json:"spill_txns,omitempty"`
+	SpillBytes *int64 `json:"spill_bytes,omitempty"`
 }
 
 // Run implements `sluice sync health`. Same boilerplate shape as
@@ -210,6 +220,53 @@ func probeSource(ctx context.Context, result *HealthResult, cfg *SyncHealthCmd, 
 	}
 	result.LagBytes = lag
 	result.LagBytesIsAvail = true
+
+	// Spill stats (severity-B finding F2 of the 2026-05-22 PG-internals
+	// research run). Engines that don't implement SlotSpillReporter
+	// (MySQL) leave the pointers nil. PG < 14 (the view doesn't exist)
+	// or a freshly-created slot with no decode yet also surface as nil
+	// via ok=false — see the interface doc on `ir.SlotSpillReporter`
+	// for the "no signal" cases.
+	spiller, spillOK := sr.(ir.SlotSpillReporter)
+	if !spillOK {
+		return
+	}
+	slot := cfg.effectiveSlotName(source)
+	if slot == "" {
+		// Source engine that doesn't have a slot concept (today: only
+		// PG has SlotSpillReporter, so this branch is defensive for
+		// future engines).
+		return
+	}
+	stats, statsOK, err := spiller.SlotSpillStats(ctx, slot)
+	if err != nil {
+		result.SourceProbeReason = fmt.Sprintf("slot-spill-stats: %v", err)
+		return
+	}
+	if !statsOK {
+		return
+	}
+	txns := stats.SpillTxns
+	bytes := stats.SpillBytes
+	result.SpillTxns = &txns
+	result.SpillBytes = &bytes
+}
+
+// effectiveSlotName returns the operator-supplied --slot-name if non-
+// empty, or the engine's default ("sluice_slot" on PG, empty on MySQL —
+// MySQL has no slot concept, the call site's nil-check skips it). Kept
+// out of the engine package because the default-slot identifier is also
+// hard-coded in `internal/engines/postgres/cdc_reader.go`; the duplicate
+// constant here is small and the alternative (exporting `defaultSlot`
+// from the engine package) would couple cmd/ to the engine.
+func (s *SyncHealthCmd) effectiveSlotName(source ir.Engine) string {
+	if s.SlotName != "" {
+		return s.SlotName
+	}
+	if source.Name() == "postgres" {
+		return "sluice_slot"
+	}
+	return ""
 }
 
 // canComputeLagBytes reports whether the target engine ALSO supports
@@ -280,6 +337,14 @@ func renderHealthText(w io.Writer, r HealthResult) error {
 			}
 		} else {
 			if _, err := fmt.Fprintln(w, "lag_bytes: unavailable (cross-engine or non-PG pair)"); err != nil {
+				return err
+			}
+		}
+		// F2: spill counters. Render only when present; "unavailable"
+		// stays implicit (no line) so the absence of the line matches
+		// the JSON omitempty shape.
+		if r.SpillTxns != nil && r.SpillBytes != nil {
+			if _, err := fmt.Fprintf(w, "spill_txns: %d\nspill_bytes: %d\n", *r.SpillTxns, *r.SpillBytes); err != nil {
 				return err
 			}
 		}

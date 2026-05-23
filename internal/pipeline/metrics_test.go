@@ -5,6 +5,11 @@ package pipeline
 
 import (
 	"bytes"
+	"context"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -132,5 +137,229 @@ func TestEmitAIMDMetrics_NotInCoolOff(t *testing.T) {
 	emitAIMDMetrics(&buf, snap)
 	if !strings.Contains(buf.String(), `sluice_apply_batch_size_cooloff{stream_id="s"} 0`) {
 		t.Errorf("cool-off gauge should emit 0 when InCoolOff is false; got:\n%s", buf.String())
+	}
+}
+
+// TestEmitSpillMetrics pins the severity-B finding F2 gauge set. The
+// HELP/TYPE shape and the two counter lines must be present so
+// Prometheus operators get a stable scrape format for the PG-14+
+// pg_stat_replication_slots.spill_* counters.
+func TestEmitSpillMetrics(t *testing.T) {
+	snap := SpillSnapshot{
+		StreamID:   "myapp-prod",
+		SlotName:   "sluice_slot",
+		SpillTxns:  42,
+		SpillBytes: 7_340_032,
+	}
+	var buf bytes.Buffer
+	emitSpillMetrics(&buf, snap)
+	out := buf.String()
+	for _, want := range []string{
+		"# HELP sluice_pg_slot_spill_txns_total",
+		"# TYPE sluice_pg_slot_spill_txns_total counter",
+		`sluice_pg_slot_spill_txns_total{stream_id="myapp-prod",slot="sluice_slot"} 42`,
+		"# HELP sluice_pg_slot_spill_bytes_total",
+		"# TYPE sluice_pg_slot_spill_bytes_total counter",
+		`sluice_pg_slot_spill_bytes_total{stream_id="myapp-prod",slot="sluice_slot"} 7340032`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected %q in spill metrics output; got:\n%s", want, out)
+		}
+	}
+}
+
+// TestMetricsHandler_SpillReporter_AttachedAndEmits pins the end-to-end
+// scrape wiring: when AttachSpillReporter is called with a closure that
+// returns ok=true, /metrics emits the F2 spill lines alongside the
+// existing stream gauges. The test exercises the handler through a real
+// httptest server to catch any HTTP-layer regressions (header set,
+// status code, etc.).
+func TestMetricsHandler_SpillReporter_AttachedAndEmits(t *testing.T) {
+	ms := newTestMetricsServer(t)
+	ms.AttachSpillReporter(func(_ context.Context) (SpillSnapshot, bool, error) {
+		return SpillSnapshot{
+			StreamID:   "myapp-prod",
+			SlotName:   "sluice_slot",
+			SpillTxns:  9,
+			SpillBytes: 1_048_576,
+		}, true, nil
+	})
+	body := scrapeMetrics(t, ms)
+	for _, want := range []string{
+		`sluice_pg_slot_spill_txns_total{stream_id="myapp-prod",slot="sluice_slot"} 9`,
+		`sluice_pg_slot_spill_bytes_total{stream_id="myapp-prod",slot="sluice_slot"} 1048576`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("expected %q in /metrics body; got:\n%s", want, body)
+		}
+	}
+}
+
+// TestMetricsHandler_SpillReporter_NotAttached pins the off-by-default
+// surface: with no reporter attached, /metrics serves the existing
+// stream/AIMD lines and the spill metric names never appear. This
+// guards the "engines without spill stats (MySQL) and streams without
+// source DSNs leave the metric off" contract documented on
+// AttachSpillReporter.
+func TestMetricsHandler_SpillReporter_NotAttached(t *testing.T) {
+	ms := newTestMetricsServer(t)
+	body := scrapeMetrics(t, ms)
+	for _, banned := range []string{
+		"sluice_pg_slot_spill_txns_total",
+		"sluice_pg_slot_spill_bytes_total",
+	} {
+		if strings.Contains(body, banned) {
+			t.Errorf("metric %q should not appear when no reporter attached; got:\n%s", banned, body)
+		}
+	}
+}
+
+// TestMetricsHandler_SpillReporter_NoSignalSkipsEmit pins the ok=false
+// contract: when the reporter returns ok=false (PG < 14, no decode
+// yet), the metric lines are suppressed. A literal 0 here would
+// mislead operators into thinking spill is "definitely zero" when the
+// real signal is "we can't tell yet."
+func TestMetricsHandler_SpillReporter_NoSignalSkipsEmit(t *testing.T) {
+	ms := newTestMetricsServer(t)
+	ms.AttachSpillReporter(func(_ context.Context) (SpillSnapshot, bool, error) {
+		return SpillSnapshot{}, false, nil
+	})
+	body := scrapeMetrics(t, ms)
+	for _, banned := range []string{
+		"sluice_pg_slot_spill_txns_total",
+		"sluice_pg_slot_spill_bytes_total",
+	} {
+		if strings.Contains(body, banned) {
+			t.Errorf("metric %q should not appear when reporter returned ok=false; got:\n%s", banned, body)
+		}
+	}
+}
+
+// TestMetricsHandler_SpillReporter_ErrorRendersComment pins the error
+// posture: a transient source-side failure surfaces as a `# error:`
+// comment in /metrics rather than a 500 (which would blank the rest
+// of the metric set, surfacing as "scrape target down" — misleading
+// because the streamer is fine).
+func TestMetricsHandler_SpillReporter_ErrorRendersComment(t *testing.T) {
+	ms := newTestMetricsServer(t)
+	ms.AttachSpillReporter(func(_ context.Context) (SpillSnapshot, bool, error) {
+		return SpillSnapshot{}, false, errors.New("source connection refused")
+	})
+	body := scrapeMetrics(t, ms)
+	if !strings.Contains(body, "# error: slot-spill-stats: source connection refused") {
+		t.Errorf("expected error comment in /metrics body; got:\n%s", body)
+	}
+	// The rest of the metric set should still render.
+	if !strings.Contains(body, "sluice_metrics_scrape_unix_seconds") {
+		t.Errorf("base metric set should still render alongside spill error; got:\n%s", body)
+	}
+}
+
+// TestMetricsHandler_SpillReporter_DetachOnNil pins idempotent detach:
+// passing nil to AttachSpillReporter removes a previously-attached
+// closure, mirroring AttachAIMDController's contract.
+func TestMetricsHandler_SpillReporter_DetachOnNil(t *testing.T) {
+	ms := newTestMetricsServer(t)
+	ms.AttachSpillReporter(func(_ context.Context) (SpillSnapshot, bool, error) {
+		return SpillSnapshot{StreamID: "s", SlotName: "x", SpillBytes: 100}, true, nil
+	})
+	body := scrapeMetrics(t, ms)
+	if !strings.Contains(body, "sluice_pg_slot_spill_bytes_total") {
+		t.Fatalf("precondition: spill metric should be present before detach; got:\n%s", body)
+	}
+	ms.AttachSpillReporter(nil)
+	body = scrapeMetrics(t, ms)
+	if strings.Contains(body, "sluice_pg_slot_spill_bytes_total") {
+		t.Errorf("spill metric should NOT appear after detach; got:\n%s", body)
+	}
+}
+
+// newTestMetricsServer constructs a MetricsServer wired to an empty
+// applier (ListStreams returns no streams) for use in handler-level
+// tests. The applier's other methods are panics; handlers under test
+// must not call them.
+func newTestMetricsServer(t *testing.T) *MetricsServer {
+	t.Helper()
+	ms, err := NewMetricsServer(":0", &emptyApplier{})
+	if err != nil {
+		t.Fatalf("NewMetricsServer: %v", err)
+	}
+	return ms
+}
+
+// scrapeMetrics invokes the handler via httptest.ResponseRecorder and
+// returns the body. Pulled out so each handler-level test reads as a
+// declarative "set up, scrape, assert."
+func scrapeMetrics(t *testing.T, ms *MetricsServer) string {
+	t.Helper()
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/metrics", http.NoBody)
+	rec := httptest.NewRecorder()
+	ms.handleMetrics(rec, req)
+	res := rec.Result()
+	defer func() { _ = res.Body.Close() }()
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d; want 200. body:\n%s", res.StatusCode, body)
+	}
+	return string(body)
+}
+
+// emptyApplier is the minimum ir.ChangeApplier needed to drive
+// MetricsServer.handleMetrics — only ListStreams is invoked. The rest
+// of the surface panics so an accidental code path that calls them is
+// caught at test-write time rather than running silently.
+type emptyApplier struct{}
+
+func (*emptyApplier) EnsureControlTable(context.Context) error {
+	panic("emptyApplier.EnsureControlTable should not be called from metrics handler")
+}
+
+func (*emptyApplier) ReadPosition(context.Context, string) (ir.Position, bool, error) {
+	panic("emptyApplier.ReadPosition should not be called from metrics handler")
+}
+
+func (*emptyApplier) ListStreams(context.Context) ([]ir.StreamStatus, error) {
+	return nil, nil
+}
+
+func (*emptyApplier) Apply(context.Context, string, <-chan ir.Change) error {
+	panic("emptyApplier.Apply should not be called from metrics handler")
+}
+
+func (*emptyApplier) RequestStop(context.Context, string) error {
+	panic("emptyApplier.RequestStop should not be called from metrics handler")
+}
+
+func (*emptyApplier) ReadStopRequested(context.Context, string) (bool, error) {
+	panic("emptyApplier.ReadStopRequested should not be called from metrics handler")
+}
+
+func (*emptyApplier) ClearStopRequested(context.Context, string) error {
+	panic("emptyApplier.ClearStopRequested should not be called from metrics handler")
+}
+
+// TestEmitSpillMetrics_Zero pins the "decode has happened but no spill"
+// case: the counters render as 0 (not absent) because ok=true upstream
+// means "we have real data, and the real data is 0." The "no signal"
+// case (ok=false) is handled at the call site by skipping the emitter
+// entirely; this test pins what the emitter does when invoked.
+func TestEmitSpillMetrics_Zero(t *testing.T) {
+	snap := SpillSnapshot{
+		StreamID:   "s",
+		SlotName:   "sluice_slot",
+		SpillTxns:  0,
+		SpillBytes: 0,
+	}
+	var buf bytes.Buffer
+	emitSpillMetrics(&buf, snap)
+	out := buf.String()
+	if !strings.Contains(out, `sluice_pg_slot_spill_txns_total{stream_id="s",slot="sluice_slot"} 0`) {
+		t.Errorf("zero spill_txns should render as 0; got:\n%s", out)
+	}
+	if !strings.Contains(out, `sluice_pg_slot_spill_bytes_total{stream_id="s",slot="sluice_slot"} 0`) {
+		t.Errorf("zero spill_bytes should render as 0; got:\n%s", out)
 	}
 }

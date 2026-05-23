@@ -48,6 +48,52 @@ Operator-visible consequences:
 
 This is fundamental to PG's logical-replication design — sluice cannot avoid it, only surface it. References: The Internals of PostgreSQL Ch 9.4 (WAL record format, FPI semantics under different wal_level settings), Ch 9.5 (asynchronous commit and WAL flush). Sluice's F6 PG-internals research finding (2026-05-22) documents the trade-off in more detail.
 
+### Logical-decoding spill (large-transaction memory pressure)
+
+When PG decodes a transaction through a logical-replication slot, the ReorderBuffer holds the decoded change records in memory until commit so it can emit them in commit order. If a transaction is large enough that the buffered changes exceed `logical_decoding_work_mem` (default **64 MB** as of PG 14+), PG spools the un-emitted records to disk under `pg_replslot/<slot>/snap/`.
+
+Spill is not data-loss-class on its own — PG correctly serialises and replays the spilled records when emitting. But sustained spill puts disk pressure on the source's `pg_replslot/` directory, and **if that directory fills, PG can invalidate the slot** (the slot's `wal_status` flips to `lost`). A lost slot IS silent-loss-class for sluice — sluice has to drop and recreate it, and any unconsumed changes are gone.
+
+Sluice surfaces spill stats from PG 14+'s `pg_stat_replication_slots` view in two places:
+
+```
+$ sluice sync health --source-driver postgres --source $SOURCE --target-driver postgres --target $TARGET --stream-id myapp ...
+stream: myapp
+state: healthy
+...
+spill_txns: 17
+spill_bytes: 5_242_880
+```
+
+```
+# Prometheus /metrics (when --metrics-listen is set on sluice sync start)
+sluice_pg_slot_spill_txns_total{stream_id="myapp",slot="sluice_slot"} 17
+sluice_pg_slot_spill_bytes_total{stream_id="myapp",slot="sluice_slot"} 5242880
+```
+
+Both counters are **cumulative since slot creation** — they accumulate over the slot's lifetime and only reset when the slot is dropped + recreated. Operators usually want to alert on the *rate of change* (`rate(sluice_pg_slot_spill_bytes_total[5m])`) rather than the absolute value.
+
+**When the lines are absent:**
+
+- The source is PG < 14 (the `pg_stat_replication_slots` view doesn't exist).
+- The slot has never been used for decoding yet (no row in the view).
+- The source engine isn't Postgres (MySQL has no analogue — binlog decoding doesn't spool the same way).
+
+Sluice deliberately omits the fields rather than emitting `0` in these "no signal" cases, so a careless reader can't mistake "we can't tell" for "definitely no spill."
+
+**Operator action when these grow:**
+
+1. **Bump `logical_decoding_work_mem` on the source.** This is the cheapest fix and is live-reloadable:
+   ```sql
+   ALTER SYSTEM SET logical_decoding_work_mem = '256MB';
+   SELECT pg_reload_conf();
+   ```
+   The right value is workload-dependent — pick something safely above your largest CDC transaction's decoded-change-buffer size. 256 MB to 1 GB is typical for OLTP workloads with occasional bulk loads.
+2. **Split large application transactions.** Bulk `INSERT … SELECT` over millions of rows and large multi-statement `UPDATE`s are the usual culprits. Chunking the work into smaller transactions keeps each within the in-memory budget.
+3. **Watch `pg_replslot/` disk usage** alongside the spill counters. If the directory fills, the slot will be invalidated and recovery requires a full re-snapshot.
+
+References: The Internals of PostgreSQL Ch 9.4 (logical decoding, ReorderBuffer), `pg_stat_replication_slots` view documentation in the PG manual. Sluice's F2 PG-internals research finding (2026-05-22) documents the surface wire-up.
+
 ## Connecting role
 
 The role sluice uses to read CDC needs the `REPLICATION` attribute:

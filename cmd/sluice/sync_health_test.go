@@ -206,3 +206,97 @@ func TestRenderHealth_NotFound(t *testing.T) {
 		t.Errorf("not-found shape should report false; got:\n%s", buf.String())
 	}
 }
+
+// TestRenderHealth_SpillFields pins the severity-B finding F2 surface
+// shape on the sync-health command: spill_txns + spill_bytes render in
+// the text output (and round-trip through JSON) when set, and stay
+// absent from both when nil. The pointer-omitempty pattern is load-
+// bearing — a nil pointer means "stats unavailable" (PG < 14, no decode
+// yet, or non-PG source); rendering a literal 0 in that case would
+// mislead operators into thinking spill is "definitely zero" when the
+// real signal is "we can't tell."
+func TestRenderHealth_SpillFields(t *testing.T) {
+	t.Run("spill present renders both fields", func(t *testing.T) {
+		txns := int64(7)
+		bytes64 := int64(123456)
+		r := HealthResult{
+			StreamID: "myapp", Found: true,
+			Position: "x", SecondsSinceLastApply: 5,
+			SourcePosition: "y", SourceProbeAvailable: true,
+			LagBytesIsAvail: false,
+			SpillTxns:       &txns,
+			SpillBytes:      &bytes64,
+		}
+		var buf bytes.Buffer
+		if err := renderHealth(&buf, r, "text"); err != nil {
+			t.Fatalf("renderHealth: %v", err)
+		}
+		out := buf.String()
+		for _, want := range []string{"spill_txns: 7", "spill_bytes: 123456"} {
+			if !strings.Contains(out, want) {
+				t.Errorf("expected %q in output; got:\n%s", want, out)
+			}
+		}
+	})
+
+	t.Run("spill absent omits both fields in text", func(t *testing.T) {
+		r := HealthResult{
+			StreamID: "myapp", Found: true,
+			Position: "x", SecondsSinceLastApply: 5,
+			SourcePosition: "y", SourceProbeAvailable: true,
+			LagBytesIsAvail: false,
+		}
+		var buf bytes.Buffer
+		if err := renderHealth(&buf, r, "text"); err != nil {
+			t.Fatalf("renderHealth: %v", err)
+		}
+		out := buf.String()
+		for _, banned := range []string{"spill_txns", "spill_bytes"} {
+			if strings.Contains(out, banned) {
+				t.Errorf("expected %q absent (stats unavailable); got:\n%s", banned, out)
+			}
+		}
+	})
+
+	t.Run("JSON omitempty when nil", func(t *testing.T) {
+		r := HealthResult{
+			StreamID: "myapp", Found: true,
+			Position: "x", SecondsSinceLastApply: 5,
+		}
+		b, err := json.Marshal(r)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		out := string(b)
+		for _, banned := range []string{`"spill_txns"`, `"spill_bytes"`} {
+			if strings.Contains(out, banned) {
+				t.Errorf("expected %q absent from JSON when stats unavailable; got:\n%s", banned, out)
+			}
+		}
+	})
+
+	t.Run("JSON round-trip when populated", func(t *testing.T) {
+		txns := int64(3)
+		bytes64 := int64(64 * 1024 * 1024)
+		r := HealthResult{
+			StreamID: "myapp", Found: true,
+			Position: "x", SecondsSinceLastApply: 5,
+			SpillTxns:  &txns,
+			SpillBytes: &bytes64,
+		}
+		b, err := json.Marshal(r)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		var got HealthResult
+		if err := json.Unmarshal(b, &got); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if got.SpillTxns == nil || *got.SpillTxns != 3 {
+			t.Errorf("SpillTxns round-trip; got %v", got.SpillTxns)
+		}
+		if got.SpillBytes == nil || *got.SpillBytes != 64*1024*1024 {
+			t.Errorf("SpillBytes round-trip; got %v", got.SpillBytes)
+		}
+	})
+}

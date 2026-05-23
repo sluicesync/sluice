@@ -60,6 +60,33 @@ type MetricsServer struct {
 
 	mu             sync.RWMutex
 	aimdController *appliercontrol.Controller
+	spillReporter  SpillReporterFunc
+}
+
+// SpillReporterFunc is the scrape-time hook the streamer plugs in to
+// surface PG-14+ `pg_stat_replication_slots.spill_*` counters via the
+// metrics endpoint (severity-B finding F2 of the 2026-05-22 PG-internals
+// research run). The closure owns its own source-database connection
+// (the streamer's CDC reader / replication conn is not safe to share);
+// it's called on every scrape and returns the current cumulative
+// counters for the slot the streamer is using.
+//
+// ok=false signals "no signal available" — same semantics as
+// [ir.SlotSpillReporter]: the consumer omits the metric lines rather
+// than emit a misleading 0. Errors fall through to a single `#` comment
+// in the exposition output so the scraper visibly sees the failure
+// without losing the rest of the metric set.
+type SpillReporterFunc func(ctx context.Context) (snap SpillSnapshot, ok bool, err error)
+
+// SpillSnapshot is the per-scrape, per-stream payload of the spill
+// reporter (severity-B finding F2). Both counters are cumulative since
+// the slot's creation; restarting sluice does NOT reset them — only
+// dropping and recreating the slot does.
+type SpillSnapshot struct {
+	StreamID   string
+	SlotName   string
+	SpillTxns  int64
+	SpillBytes int64
 }
 
 // NewMetricsServer wires the HTTP server. Does NOT start listening
@@ -135,6 +162,21 @@ func (m *MetricsServer) AttachAIMDController(c *appliercontrol.Controller) {
 	m.aimdController = c
 }
 
+// AttachSpillReporter plugs a PG-slot-spill snapshotter into the metrics
+// server (severity-B finding F2). The closure owns its own source DB
+// connection and is invoked at scrape time; see [SpillReporterFunc] for
+// the contract. Idempotent; a nil argument detaches.
+//
+// Off by default — engines that don't surface spill stats (MySQL) and
+// streams that don't supply a source DSN to the metrics server simply
+// never attach a reporter, and the corresponding metric lines never
+// appear in the output.
+func (m *MetricsServer) AttachSpillReporter(fn SpillReporterFunc) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.spillReporter = fn
+}
+
 // aimdSnapshot returns a snapshot of the attached AIMD controller, or
 // (snapshot, false) when no controller is attached.
 func (m *MetricsServer) aimdSnapshot() (appliercontrol.MetricsSnapshot, bool) {
@@ -144,6 +186,16 @@ func (m *MetricsServer) aimdSnapshot() (appliercontrol.MetricsSnapshot, bool) {
 		return appliercontrol.MetricsSnapshot{}, false
 	}
 	return m.aimdController.Snapshot(), true
+}
+
+// spillReporterFn returns the attached spill-reporter closure (or nil
+// when none is attached). Pulled out for read-locking discipline; the
+// closure itself is invoked outside the mutex so a long-running source
+// query doesn't block AttachSpillReporter or aimdSnapshot.
+func (m *MetricsServer) spillReporterFn() SpillReporterFunc {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.spillReporter
 }
 
 // handleMetrics is the GET /metrics handler. Reads ListStreams,
@@ -162,6 +214,21 @@ func (m *MetricsServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	emitMetrics(w, streams, now)
 	if snap, ok := m.aimdSnapshot(); ok {
 		emitAIMDMetrics(w, snap)
+	}
+	if fn := m.spillReporterFn(); fn != nil {
+		snap, ok, err := fn(r.Context())
+		switch {
+		case err != nil:
+			// Surface the failure as an exposition-format comment so
+			// the scraper visibly sees it without losing the rest of
+			// the metric set — same posture as the AIMD-not-attached
+			// case (silently emit nothing) vs the list-streams-failed
+			// case (return 500). Spill is a secondary signal; a
+			// transient source-side hiccup shouldn't blank /metrics.
+			fmt.Fprintf(w, "\n# error: slot-spill-stats: %v\n", err)
+		case ok:
+			emitSpillMetrics(w, snap)
+		}
 	}
 }
 
@@ -259,6 +326,39 @@ func formatPrometheusSeconds(d time.Duration) string {
 	secs := ms / 1000
 	frac := ms % 1000
 	return fmt.Sprintf("%d.%03d", secs, frac)
+}
+
+// emitSpillMetrics renders the PG-14+ logical-decoding spill counters
+// (severity-B finding F2 of the 2026-05-22 PG-internals research run).
+// Both metrics are exposed as counters (cumulative since slot creation;
+// PG resets them only on drop+recreate, which counter semantics handle
+// correctly via the implicit "_total" rate-of-change view in
+// Prometheus).
+//
+// Label set mirrors the existing per-stream gauges (stream_id) plus a
+// `slot` label so operators querying a target with multiple streams
+// (each on its own slot) can disambiguate. Cardinality is bounded by
+// the number of slots a single sluice instance writes to — small.
+//
+//   - sluice_pg_slot_spill_txns_total{stream_id, slot} — cumulative
+//     transactions that spilled to disk during decoding.
+//   - sluice_pg_slot_spill_bytes_total{stream_id, slot} — cumulative
+//     bytes of decoded transaction data that spilled to disk.
+//
+// Operator action when these grow: tune `logical_decoding_work_mem` on
+// the source (default 64 MB) up, or split application transactions to
+// stay under the threshold. See `docs/postgres-source-prep.md` for the
+// operator-facing playbook.
+func emitSpillMetrics(w io.Writer, s SpillSnapshot) {
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "# HELP sluice_pg_slot_spill_txns_total Cumulative count of transactions that spilled out of memory during logical decoding for this PG slot (pg_stat_replication_slots.spill_txns, PG 14+).")
+	fmt.Fprintln(w, "# TYPE sluice_pg_slot_spill_txns_total counter")
+	fmt.Fprintf(w, `sluice_pg_slot_spill_txns_total{stream_id=%q,slot=%q} %d`+"\n", s.StreamID, s.SlotName, s.SpillTxns)
+	fmt.Fprintln(w)
+
+	fmt.Fprintln(w, "# HELP sluice_pg_slot_spill_bytes_total Cumulative bytes of decoded transaction data that spilled to disk for this PG slot (pg_stat_replication_slots.spill_bytes, PG 14+).")
+	fmt.Fprintln(w, "# TYPE sluice_pg_slot_spill_bytes_total counter")
+	fmt.Fprintf(w, `sluice_pg_slot_spill_bytes_total{stream_id=%q,slot=%q} %d`+"\n", s.StreamID, s.SlotName, s.SpillBytes)
 }
 
 // quoteForPrometheusLabelValue escapes a string for use as a
