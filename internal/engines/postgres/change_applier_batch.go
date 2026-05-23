@@ -224,6 +224,13 @@ func (a *ChangeApplier) applyOneBatch(ctx context.Context, streamID string, chan
 	if err != nil {
 		return 0, ir.Position{}, false, fmt.Errorf("postgres: applier: begin tx: %w", err)
 	}
+	// F7: pin synchronous_commit on for the duration of this tx so a
+	// role/db-level default of `off` can't silently break ADR-0007's
+	// "position + data lands durably together" contract.
+	if err := a.forceSynchronousCommitOn(ctx, tx); err != nil {
+		_ = tx.Rollback()
+		return 0, ir.Position{}, false, classifyApplierError(err)
+	}
 
 	if err := a.dispatch(ctx, tx, streamID, first); err != nil {
 		_ = tx.Rollback()

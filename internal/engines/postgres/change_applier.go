@@ -460,6 +460,38 @@ func (a *ChangeApplier) pkForRedact(ctx context.Context, schema, table string) (
 	return pk, nil
 }
 
+// forceSynchronousCommitOn emits `SET LOCAL synchronous_commit = on`
+// as the first statement on every apply transaction. Hardens
+// ADR-0007's "position + data in one tx" durability guarantee against
+// the silent-loss failure mode where a PG role or database default of
+// `synchronous_commit = off` (settable via `ALTER ROLE … SET
+// synchronous_commit = off` or `ALTER DATABASE … SET …`) is inherited
+// by the sluice apply session.
+//
+// Without this hardening, a `COMMIT` ACK from PG would return to
+// sluice BEFORE the WAL is durably flushed to disk; a target-side
+// crash between the ACK and the WAL flush would silently lose the
+// position+data tx despite sluice having persisted forward, breaking
+// the ADR-0007 atomicity contract. See PG Internals Ch 9.5
+// (asynchronous commit semantics) and Ch 11.2 (role/db-level
+// inheritance) for the underlying behaviour.
+//
+// `SET LOCAL` scope reverts automatically at tx end, so non-sluice
+// sessions on the same role keep whatever value the operator
+// configured for them. A session that already has
+// `synchronous_commit = on` (the PG default) sees no behaviour
+// change — the statement is an effective no-op there.
+//
+// Severity-A finding F7 from the 2026-05-22 PG-internals research
+// run (durable findings doc:
+// `sluice-pg-internals-research-chapters-9-10-11-2026-05-22.md`).
+func (a *ChangeApplier) forceSynchronousCommitOn(ctx context.Context, tx *sql.Tx) error {
+	if _, err := a.txExec(ctx, tx, "SET LOCAL synchronous_commit = on"); err != nil {
+		return fmt.Errorf("postgres: applier: force synchronous_commit=on: %w", err)
+	}
+	return nil
+}
+
 // txExec wraps tx.ExecContext with the applier's per-exec timeout
 // (when set). On timeout expiry the pgx driver's ctx-watcher closes
 // the underlying connection; the resulting context.DeadlineExceeded
@@ -718,6 +750,13 @@ func (a *ChangeApplier) WritePosition(ctx context.Context, streamID string, pos 
 	if err != nil {
 		return fmt.Errorf("postgres: applier: WritePosition: begin tx: %w", err)
 	}
+	// F7: pin synchronous_commit on for the duration of this tx so a
+	// role/db-level default of `off` can't silently break ADR-0007's
+	// "position lands durably with the data" contract.
+	if err := a.forceSynchronousCommitOn(ctx, tx); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
 	posCtx, posCancel := a.execTimeoutCtx(ctx)
 	err = writePositionTx(posCtx, tx, a.controlSchema, streamID, pos.Token, a.slotName, a.sourceFingerprint, a.targetSchema)
 	posCancel()
@@ -868,6 +907,13 @@ func (a *ChangeApplier) applyOne(ctx context.Context, streamID string, c ir.Chan
 	tx, err := a.db.BeginTx(ctx, nil)
 	if err != nil {
 		return classifyApplierError(fmt.Errorf("postgres: applier: begin tx: %w", err))
+	}
+	// F7: pin synchronous_commit on for the duration of this tx so a
+	// role/db-level default of `off` can't silently break ADR-0007's
+	// "position + data lands durably together" contract.
+	if err := a.forceSynchronousCommitOn(ctx, tx); err != nil {
+		_ = tx.Rollback()
+		return classifyApplierError(err)
 	}
 	if err := a.dispatch(ctx, tx, streamID, c); err != nil {
 		_ = tx.Rollback()

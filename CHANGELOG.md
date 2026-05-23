@@ -6,6 +6,16 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`fix(engines/postgres): F7 — force synchronous_commit=on inside every apply tx`** — Severity-A silent-loss closure from the 2026-05-22 PG-internals research run (durable findings doc: `sluice-pg-internals-research-chapters-9-10-11-2026-05-22.md`). ADR-0007's "position + data lands durably together" guarantee assumes the COMMIT ACK only returns after the WAL is durably flushed (`synchronous_commit = on`). PG's parameter-precedence chain (PG Internals Ch 11.2) allows `ALTER ROLE name SET synchronous_commit = off` or `ALTER DATABASE name SET synchronous_commit = off` to pre-apply asynchronous-commit semantics (Ch 9.5) on every login from that role or to that database; the sluice apply session inherits this silently, allowing a COMMIT ACK to return BEFORE the WAL is durably flushed. A target-side crash between the ACK and the WAL flush then loses the position+data tx despite sluice having persisted forward — breaking ADR-0007 without any observable signal. Fix: the PG applier now emits `SET LOCAL synchronous_commit = on` as the first statement on every apply transaction (the three apply-tx start sites: `applyOne`, `applyOneBatch`, and `WritePosition`, all in `internal/engines/postgres/change_applier.go` / `change_applier_batch.go`). `SET LOCAL` scope reverts at tx end so non-sluice sessions on the same role are unaffected; sessions that already had `synchronous_commit = on` (the PG default) see no behaviour change. The MySQL applier does not need an analogous fix — its sync-commit settings (`sync_binlog`, `innodb_flush_log_at_trx_commit`) are not per-role inheritable in the same way. ADR-0007 amended with a "Durability hardening for Postgres targets (F7)" section.
+
+### Tests
+
+- **`test(engines/postgres): change_applier_synccommit_test.go`** — unit pin via an in-process `database/sql/driver` recording driver. Confirms `forceSynchronousCommitOn` emits exactly `SET LOCAL synchronous_commit = on` as the first statement on the tx it's handed, so a refactor of the helper can't silently regress the F7 hardening.
+
+- **`test(engines/postgres): change_applier_synccommit_integration_test.go`** — integration pin against a PG container with a role configured `ALTER ROLE … SET synchronous_commit = off`. Asserts (1) the role default DOES propagate to fresh sessions (proving the test exercises the real hazard); (2) end-to-end apply succeeds under the hostile role default; (3) inside an applier-shaped tx after `SET LOCAL synchronous_commit = on`, `current_setting('synchronous_commit')` reads back as `on`. Closes the F7 cycle.
+
 ## [0.73.2] - 2026-05-22
 
 ### Fixed
