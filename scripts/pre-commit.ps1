@@ -15,6 +15,26 @@ $ErrorActionPreference = 'Stop'
 function Red($msg)   { Write-Host $msg -ForegroundColor Red }
 function Green($msg) { Write-Host $msg -ForegroundColor Green }
 
+# ---- Conflict-marker check (applies to ALL files, not just Go) ----
+# Mirrors the .githooks/pre-commit Bash check. Catches the case where a
+# cherry-pick / merge / rebase left unresolved markers in a file the
+# Go-only gates below would skip (the v0.74.0 cycle's F5 cherry-pick
+# left CHANGELOG.md markers on main).
+$stagedFiles = (& git diff --cached --name-only --diff-filter=ACM) -split "`n" |
+    Where-Object { $_ -ne '' -and (Test-Path $_) }
+$markerFiles = @()
+foreach ($f in $stagedFiles) {
+    $hits = Select-String -Path $f -Pattern '^(<<<<<<<|>>>>>>>)' -ErrorAction SilentlyContinue
+    if ($hits) { $markerFiles += $f }
+}
+if ($markerFiles.Count -gt 0) {
+    Red "pre-commit: unresolved merge-conflict markers in staged files:"
+    $markerFiles | ForEach-Object { Write-Host $_ }
+    Write-Host ""
+    Write-Host "Resolve the conflicts and re-stage before committing."
+    exit 1
+}
+
 # ---- gofumpt ----
 $gofumpt = Get-Command gofumpt -ErrorAction SilentlyContinue
 if (-not $gofumpt) {

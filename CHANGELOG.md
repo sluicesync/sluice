@@ -6,6 +6,16 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`fix(engines/postgres): retry EnsureControlTable on pg_type / pg_class catalog race`** — Closes Task #29 (carryover from ADR-0054 Phase 2e). PG's `CREATE TABLE IF NOT EXISTS` checks pg_class for the relation but the table's row type allocates a pg_type row independently; concurrent CREATEs for the same name race on `pg_type_typname_nsp_index` (or `pg_class_relname_nsp_index`) and the loser surfaces SQLSTATE 23505. This is the same race the v0.73.0 Phase 2e test had to work around with pre-creation (`shard_consolidation_router_pg_integration_test.go`). v0.74.0+1 wraps `EnsureControlTable` (the only sluice call site that's prone to this — N shards starting tightly against a fresh target) in `retryOnCatalogRace`: 3 attempts with 50/100/200 ms backoff, ONLY retrying the narrow pg_type / pg_class catalog-race shape (constraint-name match). Other 23505s (user-table unique violations) stay non-retriable per ADR-0038.
+
+- **`fix(githooks): pre-commit fails on unresolved merge-conflict markers in ANY file`** — Closes Task #36. The pre-commit hook previously only ran Go-file checks; merge-conflict markers in non-Go files (CHANGELOG.md, docs/, configs) slipped through to commits and to main. v0.74.0's F5 cherry-pick landed CHANGELOG.md with live `<<<<<<<` / `=======` / `>>>>>>>` markers because the hook short-circuited on "no Go files staged." Both `.githooks/pre-commit` (Bash) and `scripts/pre-commit.ps1` (PowerShell) now check all staged files for `<<<<<<<` and `>>>>>>>` markers (the unambiguous ones — `=======` alone would false-positive on Setext markdown underlines) BEFORE the Go-only gate.
+
+### Tests
+
+- **`test(engines/postgres): change_applier_catalog_race_test.go`** — unit pins on `isCatalogRaceError` (constraint-name discriminator, wrapping via `errors.As`, non-23505 / non-catalog 23505 negatives) and `retryOnCatalogRace` (immediate success, retry-then-success, exhausted retries, non-race-error immediate return, context cancellation observed between retries).
+
 ## [0.74.0] - 2026-05-22
 
 ### Fixed

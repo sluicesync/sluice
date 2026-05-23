@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/jackc/pglogrepl"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/orware/sluice/internal/ir"
 	"github.com/orware/sluice/internal/redact"
@@ -633,14 +634,81 @@ func (a *ChangeApplier) Close() error {
 // table per target host serves multiple target-schema streams.
 // The ADR-0049 sluice_cdc_schema_history table is created in the same
 // controlSchema, additively — it never touches sluice_cdc_state data.
+//
+// Wrapped in [retryOnCatalogRace] to defend against the
+// `pg_type_typname_nsp_index` / `pg_class_relname_nsp_index` SQLSTATE
+// 23505 race that fires when N concurrent shard streams call this
+// against a fresh target tightly (the ADR-0054 Phase 2e test surface
+// — Task #29). All three inner ensure-table calls are idempotent
+// CREATE TABLE IF NOT EXISTS, so retrying the whole bundle is safe
+// even if an earlier inner call already succeeded.
 func (a *ChangeApplier) EnsureControlTable(ctx context.Context) error {
-	if err := ensureControlTable(ctx, a.db, a.controlSchema); err != nil {
-		return err
+	return retryOnCatalogRace(ctx, func() error {
+		if err := ensureControlTable(ctx, a.db, a.controlSchema); err != nil {
+			return err
+		}
+		if err := ensureSchemaHistoryTable(ctx, a.db, a.controlSchema); err != nil {
+			return err
+		}
+		return ensureShardConsolidationLeaseTable(ctx, a.db, a.controlSchema)
+	})
+}
+
+// retryOnCatalogRace wraps fn with a bounded retry on the narrow
+// SQLSTATE 23505 race that PG raises on concurrent `CREATE TABLE IF
+// NOT EXISTS` against a fresh schema. PG's IF NOT EXISTS check is on
+// pg_class, but the table's row type is also allocated in pg_type —
+// a concurrent CREATE TABLE for the same name has pre-allocated the
+// pg_type row by the time the second one checks pg_class, and the
+// `pg_type_typname_nsp_index` (or `pg_class_relname_nsp_index`) unique
+// constraint then fires.
+//
+// Scope: the retry ONLY triggers for the specific pg_type / pg_class
+// catalog-race shape (constraint-name match). Other 23505 cases
+// (user-table unique violations, etc.) stay non-retriable per
+// ADR-0038 — see [classifyError]. Three attempts with 50ms / 100ms /
+// 200ms jitter-free backoff (the race resolves within milliseconds in
+// practice; longer waits would mask non-race causes).
+//
+// Bug 84 cycle / ADR-0054 Phase 2e Task #29.
+func retryOnCatalogRace(ctx context.Context, fn func() error) error {
+	delays := []time.Duration{50 * time.Millisecond, 100 * time.Millisecond, 200 * time.Millisecond}
+	var lastErr error
+	for attempt := 0; attempt <= len(delays); attempt++ {
+		err := fn()
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if !isCatalogRaceError(err) {
+			return err
+		}
+		if attempt == len(delays) {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(delays[attempt]):
+		}
 	}
-	if err := ensureSchemaHistoryTable(ctx, a.db, a.controlSchema); err != nil {
-		return err
+	return lastErr
+}
+
+// isCatalogRaceError reports whether err is the narrow
+// pg_type_typname_nsp_index / pg_class_relname_nsp_index SQLSTATE
+// 23505 we want to retry on. False for every other 23505 (user-data
+// uniqueness violations stay loud).
+func isCatalogRaceError(err error) bool {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return false
 	}
-	return ensureShardConsolidationLeaseTable(ctx, a.db, a.controlSchema)
+	if pgErr.Code != "23505" {
+		return false
+	}
+	return pgErr.ConstraintName == "pg_type_typname_nsp_index" ||
+		pgErr.ConstraintName == "pg_class_relname_nsp_index"
 }
 
 // CompactSchemaHistoryBelow implements [ir.SchemaHistoryCompactor]

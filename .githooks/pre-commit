@@ -16,7 +16,23 @@ set -e
 red()   { printf "\033[31m%s\033[0m\n" "$*"; }
 green() { printf "\033[32m%s\033[0m\n" "$*"; }
 
-# Only run checks if Go files are staged. Lets non-code commits
+# ---- Conflict-marker check (applies to ALL files, not just Go) ----
+# Catches the case where a cherry-pick / merge / rebase left unresolved
+# markers in a file the rest of this hook would skip (the Go-only gate
+# below let CHANGELOG.md markers slip through to main on the v0.74.0
+# cycle's F5 cherry-pick). Checks `<<<<<<<` and `>>>>>>>` only — those
+# are unambiguous; `=======` alone matches legitimate Setext underlines
+# in markdown.
+markers_files=$(git diff --cached --name-only --diff-filter=ACM | xargs -r grep -lE '^(<<<<<<<|>>>>>>>)' 2>/dev/null || true)
+if [ -n "$markers_files" ]; then
+	red "pre-commit: unresolved merge-conflict markers in staged files:"
+	echo "$markers_files"
+	echo ""
+	echo "Resolve the conflicts and re-stage before committing."
+	exit 1
+fi
+
+# Only run Go checks if Go files are staged. Lets non-code commits
 # (docs, CI config, etc.) skip the slow steps.
 if ! git diff --cached --name-only --diff-filter=ACM | grep -q '\.go$'; then
 	green "pre-commit: no Go files staged, skipping checks"
