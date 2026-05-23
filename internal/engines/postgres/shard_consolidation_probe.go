@@ -262,6 +262,76 @@ func (a *ChangeApplier) ProbeAlterColumnNullability(ctx context.Context, table *
 	return ir.ProbeOutcomeNotApplied, nil
 }
 
+// ProbeRenameColumn implements [ir.ShardConsolidationProber] for
+// Postgres (ADR-0054 v0.78.0 — task #22 RENAME COLUMN sub-task).
+// Verifies the recorded RENAME landed on the target. Outcomes:
+//
+//   - newName present + oldName absent + (want.Type matches newName's
+//     observed IR type) → Applied.
+//   - oldName present + newName absent → NotApplied (prior holder
+//     crashed before issuing the RENAME).
+//   - Both absent OR both present → Inconsistent.
+//   - newName present + oldName absent BUT observed IR type differs
+//     from want.Type → Inconsistent + error naming expected vs
+//     observed type (mirrors the v0.76.0 ProbeAlterColumnType v2
+//     silent-divergence catch: a drop+re-add of newName with a
+//     different type would otherwise pass the existence check).
+//
+// want.Type-match guard: like the v0.76.0 type-matching probe, this
+// closes the post-RENAME drop+re-add-with-wrong-type silent
+// divergence. The IR-type reconstruction reuses readColumnIRType
+// (introduced by task #20 for ProbeAlterColumnType v2).
+func (a *ChangeApplier) ProbeRenameColumn(ctx context.Context, table *ir.Table, oldName, newName string, want *ir.Column) (ir.ProbeOutcome, error) {
+	if oldName == "" || newName == "" {
+		return ir.ProbeOutcomeInconsistent, errors.New("postgres: probe rename column: oldName and newName must be non-empty")
+	}
+	if oldName == newName {
+		return ir.ProbeOutcomeInconsistent, errors.New("postgres: probe rename column: oldName and newName are identical")
+	}
+	schemaName := a.probeSchemaFor(table)
+	oldPresent, newPresent, err := pgColumnPairPresence(ctx, a.db, schemaName, table.Name, oldName, newName)
+	if err != nil {
+		return ir.ProbeOutcomeInconsistent, fmt.Errorf("postgres: probe rename column: %w", err)
+	}
+	switch {
+	case oldPresent && !newPresent:
+		return ir.ProbeOutcomeNotApplied, nil
+	case !oldPresent && newPresent:
+		// Type-match guard.
+		if want == nil {
+			return ir.ProbeOutcomeApplied, nil
+		}
+		observed, present, readErr := a.readColumnIRType(ctx, schemaName, table.Name, newName)
+		if readErr != nil {
+			return ir.ProbeOutcomeInconsistent, readErr
+		}
+		if !present {
+			// Shouldn't happen — pgColumnPairPresence said newPresent.
+			return ir.ProbeOutcomeInconsistent, fmt.Errorf(
+				"postgres: probe rename column %s.%s.%s: column vanished between presence and type checks",
+				schemaName, table.Name, newName,
+			)
+		}
+		if reflect.DeepEqual(observed, want.Type) {
+			return ir.ProbeOutcomeApplied, nil
+		}
+		return ir.ProbeOutcomeInconsistent, fmt.Errorf(
+			"postgres: probe rename column %s.%s.%s: observed IR type %v, want %v",
+			schemaName, table.Name, newName, observed, want.Type,
+		)
+	case oldPresent && newPresent:
+		return ir.ProbeOutcomeInconsistent, fmt.Errorf(
+			"postgres: probe rename column %s.%s: both %q and %q exist",
+			schemaName, table.Name, oldName, newName,
+		)
+	default: // both absent
+		return ir.ProbeOutcomeInconsistent, fmt.Errorf(
+			"postgres: probe rename column %s.%s: neither %q nor %q exists",
+			schemaName, table.Name, oldName, newName,
+		)
+	}
+}
+
 // probeSchemaFor resolves which schema's catalog to probe for the
 // given IR table. Mirrors the applier's data-write schema-resolution
 // (table.Schema > the applier's schema setting). The control-schema

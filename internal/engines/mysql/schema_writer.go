@@ -512,6 +512,59 @@ func (w *SchemaWriter) AlterColumnType(ctx context.Context, table *ir.Table, wan
 	return nil
 }
 
+// AlterRenameColumn implements [ir.ShapeDeltaApplier] for MySQL
+// (ADR-0054 v0.78.0 — task #22 RENAME COLUMN sub-task). MySQL 8.0+
+// `ALTER TABLE ... RENAME COLUMN <old> TO <new>` preserves type,
+// nullability, default, comment, identity, and collation; only the
+// name changes. (MySQL 5.7 lacks RENAME COLUMN; sluice supports
+// 8.0+ so this is fine.)
+//
+// Idempotency on the post-state via detect-then-RENAME: MySQL does
+// not support `RENAME COLUMN IF EXISTS`, so we probe both names
+// first against information_schema.columns and only emit the DDL
+// when oldName is present + newName is absent.
+func (w *SchemaWriter) AlterRenameColumn(ctx context.Context, table *ir.Table, oldName, newName string) error {
+	if oldName == "" || newName == "" {
+		return errors.New("mysql: alter rename column: oldName and newName must be non-empty")
+	}
+	if oldName == newName {
+		return nil
+	}
+	oldPresent, err := columnExists(ctx, w.db, w.schema, table.Name, oldName)
+	if err != nil {
+		return fmt.Errorf("alter rename column: probe %q: %w", oldName, err)
+	}
+	newPresent, err := columnExists(ctx, w.db, w.schema, table.Name, newName)
+	if err != nil {
+		return fmt.Errorf("alter rename column: probe %q: %w", newName, err)
+	}
+	switch {
+	case !oldPresent && newPresent:
+		// Idempotent post-state.
+		return nil
+	case oldPresent && !newPresent:
+		// Apply.
+	case oldPresent && newPresent:
+		return fmt.Errorf(
+			"mysql: alter rename column %s.%s: both %q and %q exist — "+
+				"target schema cannot be reconciled without operator intervention",
+			w.schema, table.Name, oldName, newName,
+		)
+	default: // !oldPresent && !newPresent
+		return fmt.Errorf(
+			"mysql: alter rename column %s.%s: neither %q nor %q exists",
+			w.schema, table.Name, oldName, newName,
+		)
+	}
+	stmt := fmt.Sprintf("ALTER TABLE %s RENAME COLUMN %s TO %s",
+		quoteIdent(table.Name), quoteIdent(oldName), quoteIdent(newName))
+	if _, err := w.db.ExecContext(ctx, stmt); err != nil {
+		return fmt.Errorf("alter rename column %s.%s -> %s: %w",
+			table.Name, oldName, newName, err)
+	}
+	return nil
+}
+
 // AlterColumnNullability implements [ir.ShapeDeltaApplier] for MySQL
 // (ADR-0054 Phase 2c). Detect-then-MODIFY for idempotency: read the
 // catalog's IS_NULLABLE first, skip the MODIFY if it already matches.

@@ -156,6 +156,19 @@ type ShardConsolidationProber interface {
 	// Nullable on the target matches want.Nullable; NotApplied when
 	// it matches the pre-state; Inconsistent on absent column.
 	ProbeAlterColumnNullability(ctx context.Context, table *Table, want *Column) (ProbeOutcome, error)
+
+	// ProbeRenameColumn returns Applied when newName is present on
+	// the target AND oldName is absent AND (when want is non-nil) the
+	// IR Type of newName matches want.Type — i.e. the column was
+	// renamed as recorded, preserving its catalog type. NotApplied
+	// when oldName is present AND newName is absent (the prior
+	// holder crashed before issuing the RENAME). Inconsistent on any
+	// other shape — both names absent, both names present, or
+	// newName present with the wrong type. The type-match arm mirrors
+	// the v0.76.0 ProbeAlterColumnType v2 silent-divergence catch:
+	// without it, a drop+re-add of newName with a different type
+	// could pass the existence-only check.
+	ProbeRenameColumn(ctx context.Context, table *Table, oldName, newName string, want *Column) (ProbeOutcome, error)
 }
 
 // ShardConsolidationLeaseStore is the engine-private surface a

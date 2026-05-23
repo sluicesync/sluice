@@ -127,8 +127,16 @@ func TestIntercept_UnrecognizedShape_ShortCircuitsAndStoresError(t *testing.T) {
 	}
 
 	in := make(chan ir.Change, 4)
+	// True combo: drop column + create index. (The v0.78.0 task #22
+	// RENAME classifier consumes a same-attribute drop+add as a
+	// rename, so we mix a column delta with an index delta to
+	// exercise the unrecognized-shape refusal path.)
 	pre := fixtureTable("users", "id", "deprecated")
-	post := fixtureTable("users", "id", "added_at") // combo: drop + add
+	post := fixtureTable("users", "id")
+	post.Indexes = append(post.Indexes, &ir.Index{
+		Name:    "ix_users_id_secondary",
+		Columns: []ir.IndexColumn{{Column: "id"}},
+	})
 	in <- ir.SchemaSnapshot{Schema: "public", Table: "users", Position: ir.Position{Token: "p1"}, IR: pre}
 	in <- ir.SchemaSnapshot{Schema: "public", Table: "users", Position: ir.Position{Token: "p2"}, IR: post}
 	close(in)

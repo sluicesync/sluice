@@ -531,6 +531,96 @@ inline TODO). The remaining two — operator-issued DDL
 (`sluice schema migrate-shape-a`) and cross-region lease semantics —
 are explicit Phase 3+ items and stay on the roadmap.
 
+## v0.78.0 closure update — RENAME COLUMN shape (#22 sub-task)
+
+v0.78.0 extends the recognized-shape catalog with the RENAME COLUMN
+sub-shape of task #22 (catalog expansion). The other two sub-shapes
+ADR-0054's `ShapeKindUnrecognized` explicitly named as v1-deferred
+(CHECK constraint changes, generated-column changes) stay deferred —
+each needs its own design-dialogue territory that this sub-task does
+not need.
+
+### Detection heuristic (locked)
+
+The classifier (`pipeline.ClassifyShape` at
+`internal/pipeline/shard_consolidation_probe.go`) recognizes RENAME
+when, between pre- and post-DDL `SchemaSnapshot` boundaries:
+
+- `diffColumns(pre, post)` returns exactly **1 added** + exactly
+  **1 dropped**, AND
+- The added column's IR equals the dropped column's IR with the
+  `Name` field excluded (via a copy + Name-zero + `reflect.DeepEqual`,
+  the same equality lens `diffAlteredColumn` uses for `Type`).
+- No other delta class fires (no index add/drop, no
+  altered-column-type/nullability on a same-named column).
+
+The "full attribute match minus Name" signal is correct because both
+PG and MySQL `RENAME COLUMN` preserve every column attribute —
+type, nullability, default, comment, identity, collation — and only
+change the name. A drop+add of the same name with DIFFERENT
+type/nullable/attrs is structurally a reshape, not a rename; the
+classifier correctly falls through to the multi-class combo refusal
+for that case (still loudly Unrecognized).
+
+### Indistinguishable-from-drop-add-same-attributes edge
+
+At the IR level a literal `DROP COLUMN foo; ADD COLUMN bar
+<same-attributes>` is byte-identical to
+`RENAME COLUMN foo TO bar`. The classifier treats both as rename,
+and that's intentional:
+
+- From a CDC apply perspective, preserving the column's data under a
+  new identifier is the operator's load-bearing intent. Whether the
+  source produced one DDL statement or two against an empty
+  intermediate state is invisible to the post-DDL `SchemaSnapshot`
+  the classifier consumes.
+- PG and MySQL `RENAME COLUMN` both preserve row data; treating the
+  IR-indistinguishable shape as a rename gives the operator the
+  same data-preserving behaviour on the target either way.
+- If an operator actually wanted to wipe the column's data and
+  start over (the literal drop+add semantics on the source for a
+  rare ephemeral-column case), `--no-coordinate-live-ddl` opts out
+  of the v0.78.0 auto-apply path and falls back to the drained
+  model.
+
+### Out of v1 RENAME scope (still refuses loudly)
+
+- **Multi-column rename in a single source DDL** — e.g.
+  `ALTER TABLE t RENAME COLUMN a TO b, RENAME COLUMN c TO d`. The
+  IR delta there is `added=2, dropped=2`; with the type-match
+  heuristic the pair-up between old and new names is ambiguous
+  (which dropped → which added?). The classifier returns
+  `ok=false` from `diffRenameColumn` in that case and the call
+  site routes to the combo-Unrecognized refusal. Operators with
+  multi-column rename DDL use the drained model.
+
+### Per-engine surface
+
+- `ir.ShapeDeltaApplier` gains `AlterRenameColumn(ctx, table,
+  oldName, newName) error`. PG emits
+  `ALTER TABLE "<schema>"."<table>" RENAME COLUMN "<old>" TO "<new>"`;
+  MySQL emits the backtick-quoted equivalent. Both engines detect
+  the post-state via `information_schema.columns` first so the call
+  is idempotent (no `RENAME COLUMN IF EXISTS` on either engine).
+- `ir.ShardConsolidationProber` gains
+  `ProbeRenameColumn(ctx, table, oldName, newName, want *ir.Column)
+  (ProbeOutcome, error)`. The optional `want.Type` argument enables
+  the same v0.76.0 ProbeAlterColumnType v2 silent-divergence catch:
+  newName-present-with-wrong-type returns `Inconsistent` + an error
+  naming the mismatch instead of passing the existence-only check.
+
+### Compatibility
+
+Additive on the recognized-shape catalog. Chains that previously hit
+`Unrecognized` refusal on a single-column RENAME now get auto-apply
+behaviour. Operators relying on that refusal as a soft no-op should
+add `--no-coordinate-live-ddl` to retain the v0.77.x drained-model
+default for their stream(s).
+
+The two remaining task #22 sub-shapes (CHECK constraint changes,
+generated-column changes) still surface as `Unrecognized` with the
+operator-actionable drained-model recovery hint.
+
 ## Out of scope (Phase 3+)
 
 - **Operator-issued DDL through sluice**: a future `sluice schema

@@ -508,3 +508,210 @@ func TestShardConsolidationProber_CreateDropIndex(t *testing.T) {
 		t.Errorf("outcome = %v, want Applied (post-drop, index gone)", outcome)
 	}
 }
+
+// TestShapeDeltaApplier_RenameColumn_IdempotentRoundtrip pins the
+// v0.78.0 task #22 RENAME COLUMN engine path on PG: AlterRenameColumn
+// is idempotent on the post-state (a second call after the rename
+// landed is a no-op), and the renamed column preserves row data.
+func TestShapeDeltaApplier_RenameColumn_IdempotentRoundtrip(t *testing.T) {
+	dsn, cleanup := startPostgresForApplier(t)
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if _, err := db.ExecContext(ctx, `CREATE TABLE "public"."shape_rename" (
+		id INT PRIMARY KEY,
+		old_name TEXT NOT NULL
+	)`); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO "public"."shape_rename" (id, old_name) VALUES (1, 'alpha'), (2, 'beta')`); err != nil {
+		t.Fatalf("seed rows: %v", err)
+	}
+
+	eng := Engine{}
+	sw, err := eng.OpenSchemaWriter(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenSchemaWriter: %v", err)
+	}
+	defer func() { _ = sw.(*SchemaWriter).Close() }()
+
+	table := &ir.Table{
+		Schema: "public",
+		Name:   "shape_rename",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 32}},
+			{Name: "old_name", Type: ir.Text{}, Nullable: false},
+		},
+	}
+	pgsw := sw.(*SchemaWriter)
+
+	// First rename — fires the actual ALTER.
+	if err := pgsw.AlterRenameColumn(ctx, table, "old_name", "new_name"); err != nil {
+		t.Fatalf("AlterRenameColumn (1st): %v", err)
+	}
+	// Idempotent: second call on the post-state is a no-op.
+	if err := pgsw.AlterRenameColumn(ctx, table, "old_name", "new_name"); err != nil {
+		t.Fatalf("AlterRenameColumn (2nd, idempotent): %v", err)
+	}
+
+	// Verify the catalog reflects the rename + row data preserved.
+	var hasNew, hasOld int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM information_schema.columns
+		WHERE table_schema = 'public' AND table_name = 'shape_rename' AND column_name = 'new_name'`).Scan(&hasNew); err != nil {
+		t.Fatalf("scan new_name: %v", err)
+	}
+	if hasNew != 1 {
+		t.Errorf("new_name column missing post-rename")
+	}
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM information_schema.columns
+		WHERE table_schema = 'public' AND table_name = 'shape_rename' AND column_name = 'old_name'`).Scan(&hasOld); err != nil {
+		t.Fatalf("scan old_name: %v", err)
+	}
+	if hasOld != 0 {
+		t.Errorf("old_name column should be absent post-rename")
+	}
+	// Row data preserved.
+	var got string
+	if err := db.QueryRowContext(ctx, `SELECT new_name FROM "public"."shape_rename" WHERE id = 1`).Scan(&got); err != nil {
+		t.Fatalf("read renamed column: %v", err)
+	}
+	if got != "alpha" {
+		t.Errorf("new_name @ id=1 = %q, want alpha", got)
+	}
+}
+
+// TestShapeDeltaApplier_RenameColumn_BothPresentRefusesLoudly:
+// when both old and new column names exist on the target — a
+// partial-recovery state the operator must resolve — the applier
+// refuses loudly rather than guessing.
+func TestShapeDeltaApplier_RenameColumn_BothPresentRefusesLoudly(t *testing.T) {
+	dsn, cleanup := startPostgresForApplier(t)
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if _, err := db.ExecContext(ctx, `CREATE TABLE "public"."shape_rename_both" (
+		id INT PRIMARY KEY,
+		old_name TEXT,
+		new_name TEXT
+	)`); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+
+	eng := Engine{}
+	sw, err := eng.OpenSchemaWriter(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenSchemaWriter: %v", err)
+	}
+	defer func() { _ = sw.(*SchemaWriter).Close() }()
+
+	table := &ir.Table{Schema: "public", Name: "shape_rename_both"}
+	if err := sw.(*SchemaWriter).AlterRenameColumn(ctx, table, "old_name", "new_name"); err == nil {
+		t.Fatal("expected refusal when both old and new columns exist")
+	}
+}
+
+// TestShardConsolidationProber_RenameColumn pins the v0.78.0 task #22
+// RENAME COLUMN probe semantics on PG:
+//
+//   - Pre-rename (oldName present, newName absent) → NotApplied.
+//   - Post-rename (newName present, oldName absent, type matches) →
+//     Applied.
+//   - newName present but with WRONG TYPE → Inconsistent + error.
+//   - Both absent → Inconsistent.
+func TestShardConsolidationProber_RenameColumn(t *testing.T) {
+	dsn, cleanup := startPostgresForApplier(t)
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if _, err := db.ExecContext(ctx, `CREATE TABLE "public"."shape_probe_rename" (
+		id INT PRIMARY KEY,
+		legacy_name TEXT NOT NULL
+	)`); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+
+	eng := Engine{}
+	a, err := eng.OpenChangeApplier(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenChangeApplier: %v", err)
+	}
+	defer func() {
+		if c, ok := a.(interface{ Close() error }); ok {
+			_ = c.Close()
+		}
+	}()
+	applier := a.(*ChangeApplier)
+	table := &ir.Table{Schema: "public", Name: "shape_probe_rename"}
+	// PG TEXT maps to ir.Text{Size: TextLong} (unbounded), per the
+	// Text comment in internal/ir/types.go.
+	wantText := &ir.Column{Name: "current_name", Type: ir.Text{Size: ir.TextLong}}
+
+	// Pre-rename: legacy_name present, current_name absent → NotApplied.
+	outcome, err := applier.ProbeRenameColumn(ctx, table, "legacy_name", "current_name", wantText)
+	if err != nil {
+		t.Fatalf("ProbeRenameColumn (pre): %v", err)
+	}
+	if outcome != ir.ProbeOutcomeNotApplied {
+		t.Errorf("outcome = %v, want NotApplied (pre-rename)", outcome)
+	}
+
+	// Land the rename.
+	if _, err := db.ExecContext(ctx, `ALTER TABLE "public"."shape_probe_rename" RENAME COLUMN legacy_name TO current_name`); err != nil {
+		t.Fatalf("apply rename: %v", err)
+	}
+
+	// Post-rename: current_name present, legacy_name absent, type
+	// matches → Applied.
+	outcome, err = applier.ProbeRenameColumn(ctx, table, "legacy_name", "current_name", wantText)
+	if err != nil {
+		t.Fatalf("ProbeRenameColumn (post): %v", err)
+	}
+	if outcome != ir.ProbeOutcomeApplied {
+		t.Errorf("outcome = %v, want Applied (post-rename)", outcome)
+	}
+
+	// WRONG TYPE: want=Integer when observed is Text → Inconsistent +
+	// error naming the mismatch. Mirrors the v0.76.0 ProbeAlterColumnType
+	// v2 silent-divergence catch on the rename path.
+	wantWrongType := &ir.Column{Name: "current_name", Type: ir.Integer{Width: 64}}
+	outcome, err = applier.ProbeRenameColumn(ctx, table, "legacy_name", "current_name", wantWrongType)
+	if err == nil {
+		t.Fatal("expected error on type mismatch")
+	}
+	if outcome != ir.ProbeOutcomeInconsistent {
+		t.Errorf("outcome = %v, want Inconsistent (post-rename wrong type)", outcome)
+	}
+
+	// Both absent → Inconsistent.
+	outcome, err = applier.ProbeRenameColumn(ctx, table, "no_such_old", "no_such_new", wantText)
+	if err == nil {
+		t.Fatal("expected error when neither column exists")
+	}
+	if outcome != ir.ProbeOutcomeInconsistent {
+		t.Errorf("outcome = %v, want Inconsistent (both absent)", outcome)
+	}
+}

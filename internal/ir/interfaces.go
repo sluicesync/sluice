@@ -448,6 +448,26 @@ type ShapeDeltaApplier interface {
 	// <name> <type> [NOT] NULL` (MySQL). Idempotent on columns
 	// already at the desired nullability.
 	AlterColumnNullability(ctx context.Context, table *Table, want *Column) error
+
+	// AlterRenameColumn issues `ALTER TABLE <table> RENAME COLUMN
+	// <oldName> TO <newName>` (PG 9.2+, MySQL 8.0+ — both engines
+	// preserve type, nullability, default, comment, identity, and
+	// collation across a RENAME). Idempotent on the post-state: when
+	// newName is already present (and oldName already absent), the
+	// implementation no-ops; takeover-stream re-apply on a probe-
+	// reported NotApplied is safe.
+	//
+	// v1 catalog: single-column rename only (one old → one new). The
+	// upstream IR-delta classifier in pipeline.ClassifyShape refuses
+	// multi-column rename loudly (added=N + dropped=N with N>1 is
+	// ambiguous which old→new pair is which) — implementations need
+	// only handle the single-rename shape.
+	//
+	// Inconsistent state recovery: when neither oldName nor newName
+	// is present, the implementation returns a clear error; the
+	// caller routes to the loud-failure path (drained model recovery
+	// hint).
+	AlterRenameColumn(ctx context.Context, table *Table, oldName, newName string) error
 }
 
 // CDCSchemaSnapshotNormalizer is the optional engine surface for

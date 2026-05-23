@@ -210,6 +210,79 @@ func (a *ChangeApplier) ProbeAlterColumnNullability(ctx context.Context, table *
 	return ir.ProbeOutcomeNotApplied, nil
 }
 
+// ProbeRenameColumn implements [ir.ShardConsolidationProber] for
+// MySQL (ADR-0054 v0.78.0 — task #22 RENAME COLUMN sub-task).
+// Outcomes mirror the PG implementation: newName present + oldName
+// absent + IR type matches → Applied; oldName present + newName
+// absent → NotApplied; everything else → Inconsistent. The IR-type
+// match closes the drop+re-add-with-wrong-type silent divergence
+// the v0.76.0 ProbeAlterColumnType v2 chases on the type-alter
+// shape.
+func (a *ChangeApplier) ProbeRenameColumn(ctx context.Context, table *ir.Table, oldName, newName string, want *ir.Column) (ir.ProbeOutcome, error) {
+	if oldName == "" || newName == "" {
+		return ir.ProbeOutcomeInconsistent, errors.New("mysql: probe rename column: oldName and newName must be non-empty")
+	}
+	if oldName == newName {
+		return ir.ProbeOutcomeInconsistent, errors.New("mysql: probe rename column: oldName and newName are identical")
+	}
+	oldPresent, err := a.singleColumnPresent(ctx, table.Name, oldName)
+	if err != nil {
+		return ir.ProbeOutcomeInconsistent, err
+	}
+	newPresent, err := a.singleColumnPresent(ctx, table.Name, newName)
+	if err != nil {
+		return ir.ProbeOutcomeInconsistent, err
+	}
+	switch {
+	case oldPresent && !newPresent:
+		return ir.ProbeOutcomeNotApplied, nil
+	case !oldPresent && newPresent:
+		if want == nil {
+			return ir.ProbeOutcomeApplied, nil
+		}
+		observed, present, readErr := a.readColumnIRType(ctx, table.Name, newName)
+		if readErr != nil {
+			return ir.ProbeOutcomeInconsistent, readErr
+		}
+		if !present {
+			return ir.ProbeOutcomeInconsistent, fmt.Errorf(
+				"mysql: probe rename column %s.%s: column vanished between presence and type checks",
+				table.Name, newName,
+			)
+		}
+		if reflect.DeepEqual(observed, want.Type) {
+			return ir.ProbeOutcomeApplied, nil
+		}
+		return ir.ProbeOutcomeInconsistent, fmt.Errorf(
+			"mysql: probe rename column %s.%s: observed IR type %v, want %v",
+			table.Name, newName, observed, want.Type,
+		)
+	case oldPresent && newPresent:
+		return ir.ProbeOutcomeInconsistent, fmt.Errorf(
+			"mysql: probe rename column %s: both %q and %q exist",
+			table.Name, oldName, newName,
+		)
+	default: // both absent
+		return ir.ProbeOutcomeInconsistent, fmt.Errorf(
+			"mysql: probe rename column %s: neither %q nor %q exists",
+			table.Name, oldName, newName,
+		)
+	}
+}
+
+// singleColumnPresent reports whether the named column exists on
+// table in the current database. Thin wrapper over the existing
+// information_schema.columns query.
+func (a *ChangeApplier) singleColumnPresent(ctx context.Context, tableName, colName string) (bool, error) {
+	const q = `SELECT EXISTS(SELECT 1 FROM information_schema.columns
+		WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?)`
+	var exists bool
+	if err := a.db.QueryRowContext(ctx, q, tableName, colName).Scan(&exists); err != nil {
+		return false, fmt.Errorf("mysql: probe single column %q on %q: %w", colName, tableName, err)
+	}
+	return exists, nil
+}
+
 // countColumnsPresent returns the number of named columns present in
 // the target's information_schema.columns. MySQL's
 // information_schema queries use DATABASE() to scope to the

@@ -21,8 +21,10 @@ package pipeline
 // by design.
 //
 // v1 catalog: ADD COLUMN, DROP COLUMN, CREATE INDEX, DROP INDEX,
-// ALTER COLUMN type/nullability. Unrecognized structural changes
-// refuse loudly with operator-actionable drained-model recovery hint.
+// ALTER COLUMN type/nullability, RENAME COLUMN (single column, full
+// attribute match — see ShapeKindRenameColumn). Unrecognized
+// structural changes refuse loudly with operator-actionable
+// drained-model recovery hint.
 
 import (
 	"context"
@@ -69,10 +71,29 @@ const (
 	// type, but Nullable differs.
 	ShapeKindAlterColumnNullability
 
+	// ShapeKindRenameColumn — exactly one column appears in post
+	// that's absent from pre AND exactly one column appears in pre
+	// that's absent from post AND the added column's IR Type +
+	// Nullable + (full ir.Column equality minus Name) match the
+	// dropped column's. The post-DDL IR comparison treats a same-
+	// attribute drop+add as a rename per the v0.78.0 catalog
+	// expansion (task #22): from a CDC-apply perspective preserving
+	// the column's data under a new identifier is operationally
+	// equivalent to a rename, and PG / MySQL `RENAME COLUMN`
+	// preserves every column attribute except the name.
+	//
+	// Indistinguishable-from-drop-add-same-attributes edge: at the
+	// IR level a literal `DROP COLUMN foo; ADD COLUMN bar <same-
+	// attrs>` is byte-identical to `RENAME COLUMN foo TO bar`. The
+	// classifier treats both as rename; the ADR-0054 v0.78.0
+	// amendment documents this as intentional (operator intent
+	// preserves the data under a new identifier either way).
+	ShapeKindRenameColumn
+
 	// ShapeKindUnrecognized — the delta doesn't fit a single
-	// recognized shape (e.g. multi-shape combo, RENAME, CHECK
-	// constraint change, generated-column change, FK change, ...).
-	// Refuses loudly per the loud-failure tenet.
+	// recognized shape (e.g. multi-shape combo, multi-column
+	// rename, CHECK constraint change, generated-column change,
+	// FK change, ...). Refuses loudly per the loud-failure tenet.
 	ShapeKindUnrecognized
 )
 
@@ -93,6 +114,8 @@ func (k ShapeKind) String() string {
 		return "alter-column-type"
 	case ShapeKindAlterColumnNullability:
 		return "alter-column-nullability"
+	case ShapeKindRenameColumn:
+		return "rename-column"
 	case ShapeKindUnrecognized:
 		return "unrecognized"
 	}
@@ -128,6 +151,16 @@ type Shape struct {
 	// AlteredColumnBefore; the post-state is in AlteredColumn.
 	AlteredColumn       *ir.Column
 	AlteredColumnBefore *ir.Column
+
+	// RenamedColumnBefore is the pre-DDL column whose Name appears
+	// in pre but not post. Populated for ShapeKindRenameColumn.
+	// RenamedColumnAfter is the post-DDL column whose Name appears
+	// in post but not pre — same Type / Nullable / (other column
+	// attributes) as Before, only Name differs. The pair is what
+	// the engine's AlterRenameColumn needs to emit
+	// `ALTER TABLE <t> RENAME COLUMN <Before.Name> TO <After.Name>`.
+	RenamedColumnBefore *ir.Column
+	RenamedColumnAfter  *ir.Column
 }
 
 // ClassifyShape derives the IR-delta shape from (pre, post). Returns
@@ -153,6 +186,26 @@ func ClassifyShape(pre, post *ir.Table) (Shape, error) {
 	added, dropped := diffColumns(pre, post)
 	createdIdx, droppedIdx := diffIndexes(pre, post)
 	alteredCol, alteredBefore, alteredKind, hasAlter := diffAlteredColumn(pre, post)
+
+	// RENAME COLUMN detection (task #22): exactly one added + exactly
+	// one dropped, with full ir.Column attribute equality minus Name.
+	// Must fire BEFORE the multi-class combo refusal below — at the
+	// add/dropped-column-count level it would otherwise look like a
+	// combo of ShapeKindAddColumn + ShapeKindDropColumn. The rename
+	// classification consumes BOTH the added and dropped slices so
+	// the class-counter sees neither.
+	//
+	// No index / altered-column overlap permitted — a rename plus
+	// an index change in the same boundary is still a combo
+	// refusal (multi-shape combo deltas refuse loudly).
+	if renamedBefore, renamedAfter, ok := diffRenameColumn(added, dropped); ok &&
+		len(createdIdx) == 0 && len(droppedIdx) == 0 && !hasAlter {
+		return Shape{
+			Kind:                ShapeKindRenameColumn,
+			RenamedColumnBefore: renamedBefore,
+			RenamedColumnAfter:  renamedAfter,
+		}, nil
+	}
 
 	// Count which delta classes fired. Exactly-one is recognized;
 	// zero is None; more-than-one is Unrecognized (combo deltas
@@ -202,6 +255,95 @@ func ClassifyShape(pre, post *ir.Table) (Shape, error) {
 			len(added), len(dropped), len(createdIdx), len(droppedIdx), hasAlter,
 		)
 	}
+}
+
+// diffRenameColumn detects the RENAME COLUMN shape from the
+// (added, dropped) result of diffColumns. The locked heuristic
+// (task #22, ADR-0054 v0.78.0 amendment):
+//
+//   - len(added) == 1 AND len(dropped) == 1.
+//   - The added column's Type, Nullable, and every other ir.Column
+//     attribute (Default, AutoIncrement, Comment, GeneratedExpr,
+//     GeneratedKind, Identity flags, etc.) match the dropped
+//     column's — equality holds on the FULL ir.Column struct with
+//     the Name field excluded.
+//
+// Why full-attribute-match is the right signal: both PG and MySQL
+// `RENAME COLUMN` preserve every column attribute except the name.
+// A drop+add of the same name with DIFFERENT type/nullable/attrs
+// represents an operator reshaping the table (not a rename); the
+// IR-level intent there is genuinely two separate columns, and the
+// existing combo-Unrecognized refusal path is correct for that case.
+//
+// Indistinguishable-from-drop-add-same-attributes edge: a literal
+// `DROP COLUMN foo; ADD COLUMN bar <same-attrs>` is byte-identical
+// to `RENAME COLUMN foo TO bar` at the IR level. The classifier
+// treats both as rename; from a CDC apply perspective the
+// operator's intent — preserve column data under a new identifier
+// — is preserved either way. The ADR-0054 v0.78.0 amendment
+// documents this as intentional.
+//
+// Multi-column rename (len(added) == N + len(dropped) == N for N>1)
+// is OUT of v1 scope: with the type-match heuristic the pair-up
+// between old and new names is ambiguous (which dropped name maps
+// to which added name?). The classifier returns ok=false in that
+// case; the call site falls through to the combo-Unrecognized
+// refusal — operators issuing multi-column ALTER ... RENAME use
+// the drained model.
+func diffRenameColumn(added, dropped []*ir.Column) (before, after *ir.Column, ok bool) {
+	if len(added) != 1 || len(dropped) != 1 {
+		return nil, nil, false
+	}
+	a, d := added[0], dropped[0]
+	if a == nil || d == nil {
+		return nil, nil, false
+	}
+	// Compare on a copy with Name zeroed — every other LOAD-BEARING
+	// attribute on ir.Column must match. The load-bearing attributes
+	// are exactly the ones PG and MySQL `RENAME COLUMN` preserve:
+	// Type (via reflect.DeepEqual — mirrors diffAlteredColumn),
+	// Nullable, Default, Comment, GeneratedExpr / GeneratedStored
+	// (a generated column expression change is a separate shape),
+	// and the source-tagging dialect.
+	//
+	// SourceColumnType + SluiceInjected are deliberately NOT compared:
+	// they're translation-pass provenance fields the readers and CDC
+	// projections populate asymmetrically (the cold-start seed
+	// captures Schema-reader provenance; the CDC SchemaSnapshot
+	// projects from the wire protocol and never sets them). Including
+	// them in the equality lens would create false reshape verdicts on
+	// every CDC-flowed boundary.
+	aCopy, dCopy := *a, *d
+	aCopy.Name = ""
+	dCopy.Name = ""
+	// Erase provenance-only fields per the comment above.
+	aCopy.SourceColumnType = nil
+	dCopy.SourceColumnType = nil
+	aCopy.SluiceInjected = false
+	dCopy.SluiceInjected = false
+	// Normalize Default: the cold-start SchemaReader populates
+	// ir.DefaultNone{} for columns with no DEFAULT; the CDC reader
+	// leaves Default==nil for the same case (pgoutput's
+	// RelationMessage doesn't carry attdefault). Both encode "no
+	// default", so collapse to a single canonical form for equality.
+	aCopy.Default = normalizeDefaultForRename(aCopy.Default)
+	dCopy.Default = normalizeDefaultForRename(dCopy.Default)
+	return d, a, reflect.DeepEqual(aCopy, dCopy)
+}
+
+// normalizeDefaultForRename folds the two encodings of "no default" —
+// nil and ir.DefaultNone{} — into a single canonical nil. Other
+// DefaultValue variants (DefaultLiteral, DefaultExpression) are
+// returned unchanged so a genuine default-clause difference still
+// reads as a reshape (drop+add).
+func normalizeDefaultForRename(d ir.DefaultValue) ir.DefaultValue {
+	if d == nil {
+		return nil
+	}
+	if _, isNone := d.(ir.DefaultNone); isNone {
+		return nil
+	}
+	return d
 }
 
 // diffColumns returns the columns present in post but not pre
@@ -362,6 +504,17 @@ func DispatchProbe(ctx context.Context, prober ShardConsolidationProber, table *
 		return prober.ProbeAlterColumnType(ctx, table, shape.AlteredColumn)
 	case ShapeKindAlterColumnNullability:
 		return prober.ProbeAlterColumnNullability(ctx, table, shape.AlteredColumn)
+	case ShapeKindRenameColumn:
+		if shape.RenamedColumnBefore == nil || shape.RenamedColumnAfter == nil {
+			return ProbeOutcomeInconsistent, errors.New(
+				"pipeline: dispatch probe: rename-column shape missing before/after column",
+			)
+		}
+		return prober.ProbeRenameColumn(
+			ctx, table,
+			shape.RenamedColumnBefore.Name, shape.RenamedColumnAfter.Name,
+			shape.RenamedColumnAfter,
+		)
 	case ShapeKindUnrecognized:
 		return ProbeOutcomeInconsistent, errors.New(
 			"pipeline: dispatch probe: unrecognized shape — refuse loudly per ADR-0054 DP-E",

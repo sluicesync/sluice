@@ -239,6 +239,11 @@ func (r *BoundaryRouter) applyShape(ctx context.Context, post *ir.Table, shape S
 		return r.applier.AlterColumnType(ctx, post, shape.AlteredColumn)
 	case ShapeKindAlterColumnNullability:
 		return r.applier.AlterColumnNullability(ctx, post, shape.AlteredColumn)
+	case ShapeKindRenameColumn:
+		if shape.RenamedColumnBefore == nil || shape.RenamedColumnAfter == nil {
+			return errors.New("pipeline: apply shape: rename-column shape missing before/after column")
+		}
+		return r.applier.AlterRenameColumn(ctx, post, shape.RenamedColumnBefore.Name, shape.RenamedColumnAfter.Name)
 	case ShapeKindNone:
 		return nil
 	}

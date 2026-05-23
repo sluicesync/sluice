@@ -331,3 +331,181 @@ func TestShardConsolidationProber_MySQL_CreateDropIndex(t *testing.T) {
 		t.Errorf("outcome = %v, want Applied (post-drop)", outcome)
 	}
 }
+
+// TestShapeDeltaApplier_MySQL_RenameColumn_IdempotentRoundtrip pins
+// the v0.78.0 task #22 RENAME COLUMN engine path on MySQL:
+// AlterRenameColumn is idempotent on the post-state and the renamed
+// column preserves row data.
+func TestShapeDeltaApplier_MySQL_RenameColumn_IdempotentRoundtrip(t *testing.T) {
+	dsn, cleanup := startMySQLForApplier(t)
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	if _, err := db.ExecContext(ctx, "CREATE TABLE `shape_rename` (id INT PRIMARY KEY, old_name VARCHAR(64) NOT NULL)"); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "INSERT INTO `shape_rename` (id, old_name) VALUES (1, 'alpha'), (2, 'beta')"); err != nil {
+		t.Fatalf("seed rows: %v", err)
+	}
+
+	eng := Engine{}
+	sw, err := eng.OpenSchemaWriter(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenSchemaWriter: %v", err)
+	}
+	defer func() { _ = sw.(*SchemaWriter).Close() }()
+
+	table := &ir.Table{Name: "shape_rename"}
+	mysw := sw.(*SchemaWriter)
+
+	// First rename — fires the actual ALTER.
+	if err := mysw.AlterRenameColumn(ctx, table, "old_name", "new_name"); err != nil {
+		t.Fatalf("AlterRenameColumn (1st): %v", err)
+	}
+	// Idempotent: second call on the post-state is a no-op.
+	if err := mysw.AlterRenameColumn(ctx, table, "old_name", "new_name"); err != nil {
+		t.Fatalf("AlterRenameColumn (2nd, idempotent): %v", err)
+	}
+
+	// Verify the catalog reflects the rename + row data preserved.
+	var hasNew, hasOld int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM information_schema.columns
+		WHERE table_schema = DATABASE() AND table_name = 'shape_rename' AND column_name = 'new_name'`).Scan(&hasNew); err != nil {
+		t.Fatalf("scan new_name: %v", err)
+	}
+	if hasNew != 1 {
+		t.Errorf("new_name column missing post-rename")
+	}
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM information_schema.columns
+		WHERE table_schema = DATABASE() AND table_name = 'shape_rename' AND column_name = 'old_name'`).Scan(&hasOld); err != nil {
+		t.Fatalf("scan old_name: %v", err)
+	}
+	if hasOld != 0 {
+		t.Errorf("old_name column should be absent post-rename")
+	}
+	var got string
+	if err := db.QueryRowContext(ctx, "SELECT new_name FROM `shape_rename` WHERE id = 1").Scan(&got); err != nil {
+		t.Fatalf("read renamed column: %v", err)
+	}
+	if got != "alpha" {
+		t.Errorf("new_name @ id=1 = %q, want alpha", got)
+	}
+}
+
+// TestShapeDeltaApplier_MySQL_RenameColumn_BothPresentRefusesLoudly:
+// when both old and new column names exist on the target, the
+// applier refuses loudly.
+func TestShapeDeltaApplier_MySQL_RenameColumn_BothPresentRefusesLoudly(t *testing.T) {
+	dsn, cleanup := startMySQLForApplier(t)
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	if _, err := db.ExecContext(ctx, "CREATE TABLE `shape_rename_both` (id INT PRIMARY KEY, old_name VARCHAR(64), new_name VARCHAR(64))"); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+
+	eng := Engine{}
+	sw, err := eng.OpenSchemaWriter(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenSchemaWriter: %v", err)
+	}
+	defer func() { _ = sw.(*SchemaWriter).Close() }()
+
+	table := &ir.Table{Name: "shape_rename_both"}
+	if err := sw.(*SchemaWriter).AlterRenameColumn(ctx, table, "old_name", "new_name"); err == nil {
+		t.Fatal("expected refusal when both old and new columns exist")
+	}
+}
+
+// TestShardConsolidationProber_MySQL_RenameColumn pins the v0.78.0
+// task #22 RENAME COLUMN probe on MySQL.
+func TestShardConsolidationProber_MySQL_RenameColumn(t *testing.T) {
+	dsn, cleanup := startMySQLForApplier(t)
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	// INT columns avoid the MySQL Varchar Charset/Collation
+	// projection edge that the v0.76.0 MySQL ProbeAlterColumnType v2
+	// test sidesteps the same way (see Varchar charset normalizer
+	// note in shard_consolidation_probe.go).
+	if _, err := db.ExecContext(ctx, "CREATE TABLE `shape_probe_rename` (id INT PRIMARY KEY, legacy_count INT NOT NULL)"); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+
+	eng := Engine{}
+	a, err := eng.OpenChangeApplier(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenChangeApplier: %v", err)
+	}
+	defer func() {
+		if c, ok := a.(interface{ Close() error }); ok {
+			_ = c.Close()
+		}
+	}()
+	applier := a.(*ChangeApplier)
+	table := &ir.Table{Name: "shape_probe_rename"}
+	wantInt := &ir.Column{Name: "current_count", Type: ir.Integer{Width: 32}}
+
+	// Pre-rename: legacy_count present, current_count absent → NotApplied.
+	outcome, err := applier.ProbeRenameColumn(ctx, table, "legacy_count", "current_count", wantInt)
+	if err != nil {
+		t.Fatalf("ProbeRenameColumn (pre): %v", err)
+	}
+	if outcome != ir.ProbeOutcomeNotApplied {
+		t.Errorf("outcome = %v, want NotApplied (pre-rename)", outcome)
+	}
+
+	// Land the rename.
+	if _, err := db.ExecContext(ctx, "ALTER TABLE `shape_probe_rename` RENAME COLUMN legacy_count TO current_count"); err != nil {
+		t.Fatalf("apply rename: %v", err)
+	}
+
+	// Post-rename: types match → Applied.
+	outcome, err = applier.ProbeRenameColumn(ctx, table, "legacy_count", "current_count", wantInt)
+	if err != nil {
+		t.Fatalf("ProbeRenameColumn (post): %v", err)
+	}
+	if outcome != ir.ProbeOutcomeApplied {
+		t.Errorf("outcome = %v, want Applied (post-rename)", outcome)
+	}
+
+	// Wrong type → Inconsistent + error.
+	wantWrongType := &ir.Column{Name: "current_count", Type: ir.Integer{Width: 64}}
+	outcome, err = applier.ProbeRenameColumn(ctx, table, "legacy_count", "current_count", wantWrongType)
+	if err == nil {
+		t.Fatal("expected error on type mismatch")
+	}
+	if outcome != ir.ProbeOutcomeInconsistent {
+		t.Errorf("outcome = %v, want Inconsistent (post-rename wrong type)", outcome)
+	}
+
+	// Both absent → Inconsistent.
+	outcome, err = applier.ProbeRenameColumn(ctx, table, "no_such_old", "no_such_new", wantInt)
+	if err == nil {
+		t.Fatal("expected error when neither column exists")
+	}
+	if outcome != ir.ProbeOutcomeInconsistent {
+		t.Errorf("outcome = %v, want Inconsistent (both absent)", outcome)
+	}
+}

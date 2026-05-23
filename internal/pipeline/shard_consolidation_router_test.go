@@ -58,6 +58,10 @@ func (f *fakeShapeApplier) AlterColumnNullability(_ context.Context, _ *ir.Table
 	return f.record("AlterColumnNullability")
 }
 
+func (f *fakeShapeApplier) AlterRenameColumn(_ context.Context, _ *ir.Table, _ /*oldName*/, _ /*newName*/ string) error {
+	return f.record("AlterRenameColumn")
+}
+
 func newTestRouter(t *testing.T, store *fakeLeaseStore, streamID string, prober ShardConsolidationProber, applier ir.ShapeDeltaApplier, clock *mockClock) *BoundaryRouter {
 	t.Helper()
 	cfg := LeaseConfig{LeaseDuration: time.Minute, RenewDeadline: 30 * time.Second, RetryPeriod: 5 * time.Second}
@@ -122,6 +126,43 @@ func TestRouteBoundary_HappyPath_ApplyAndFinalize(t *testing.T) {
 	}
 }
 
+// TestRouteBoundary_RenameColumn_HappyPath: rename-shaped delta
+// fires AlterRenameColumn on the applier (task #22).
+func TestRouteBoundary_RenameColumn_HappyPath(t *testing.T) {
+	t.Parallel()
+	clock := newMockClock(time.Date(2026, 5, 22, 12, 0, 0, 0, time.UTC))
+	store := newFakeLeaseStore(clock.Now)
+	prober := &fakeProber{}
+	applier := &fakeShapeApplier{}
+	router := newTestRouter(t, store, "stream-a", prober, applier, clock)
+
+	pre := &ir.Table{Name: "users", Columns: []*ir.Column{
+		{Name: "id", Type: ir.Integer{Width: 32}},
+		{Name: "email", Type: ir.Text{}},
+	}}
+	post := &ir.Table{Name: "users", Columns: []*ir.Column{
+		{Name: "id", Type: ir.Integer{Width: 32}},
+		{Name: "email_address", Type: ir.Text{}},
+	}}
+	if err := router.RouteBoundary(context.Background(), "users", pre, post,
+		"ALTER TABLE users RENAME COLUMN email TO email_address", 1, ir.Position{}); err != nil {
+		t.Fatalf("RouteBoundary rename: %v", err)
+	}
+	applier.mu.Lock()
+	calls := append([]string(nil), applier.calls...)
+	applier.mu.Unlock()
+	if len(calls) != 1 || calls[0] != "AlterRenameColumn" {
+		t.Errorf("applier calls = %v, want [AlterRenameColumn]", calls)
+	}
+	row, ok := store.snapshot("users")
+	if !ok {
+		t.Fatal("expected lease row to be created")
+	}
+	if !row.HasAppliedAt {
+		t.Error("expected applied_at to be set after rename apply")
+	}
+}
+
 func TestRouteBoundary_UnrecognizedShape_RefuseLoudly(t *testing.T) {
 	t.Parallel()
 	clock := newMockClock(time.Date(2026, 5, 22, 12, 0, 0, 0, time.UTC))
@@ -130,9 +171,16 @@ func TestRouteBoundary_UnrecognizedShape_RefuseLoudly(t *testing.T) {
 	applier := &fakeShapeApplier{}
 	router := newTestRouter(t, store, "stream-a", prober, applier, clock)
 
-	// Combo delta: ADD + DROP → unrecognized.
+	// True combo delta: DROP column + CREATE INDEX. (The v0.78.0
+	// task #22 RENAME classifier treats a same-attribute drop+add
+	// as a rename, so we mix a column delta with an index delta to
+	// exercise the genuine combo refusal.)
 	pre := fixtureTable("users", "id", "deprecated")
-	post := fixtureTable("users", "id", "added_at")
+	post := fixtureTable("users", "id")
+	post.Indexes = append(post.Indexes, &ir.Index{
+		Name:    "ix_users_id_secondary",
+		Columns: []ir.IndexColumn{{Column: "id"}},
+	})
 	err := router.RouteBoundary(context.Background(), "users", pre, post, "combo", 1, ir.Position{})
 	if err == nil {
 		t.Fatal("expected refusal on unrecognized combo shape")

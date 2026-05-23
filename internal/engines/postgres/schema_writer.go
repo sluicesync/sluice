@@ -764,3 +764,98 @@ func (w *SchemaWriter) AlterColumnNullability(ctx context.Context, table *ir.Tab
 	}
 	return nil
 }
+
+// AlterRenameColumn implements [ir.ShapeDeltaApplier] for Postgres
+// (ADR-0054 v0.78.0 — task #22 RENAME COLUMN sub-task). PG
+// `ALTER TABLE ... RENAME COLUMN <old> TO <new>` preserves type,
+// nullability, default, comment, identity, and collation; only the
+// name changes.
+//
+// Idempotency on the post-state: detect-then-RENAME via
+// information_schema.columns. PG does not support
+// `RENAME COLUMN IF EXISTS`, so we probe both names first:
+//
+//   - newName already present + oldName absent → no-op (post-state).
+//   - oldName present + newName absent → emit RENAME.
+//   - Both absent OR both present → return error (the takeover
+//     stream's probe path catches this branch as Inconsistent;
+//     direct apply path surfaces an operator-actionable refusal).
+func (w *SchemaWriter) AlterRenameColumn(ctx context.Context, table *ir.Table, oldName, newName string) error {
+	if oldName == "" || newName == "" {
+		return errors.New("postgres: alter rename column: oldName and newName must be non-empty")
+	}
+	if oldName == newName {
+		return nil
+	}
+	schemaName := w.schema
+	if table.Schema != "" {
+		schemaName = table.Schema
+	}
+	oldPresent, newPresent, err := pgColumnPairPresence(ctx, w.db, schemaName, table.Name, oldName, newName)
+	if err != nil {
+		return fmt.Errorf("alter rename column: probe %s.%s.(%s,%s): %w",
+			schemaName, table.Name, oldName, newName, err)
+	}
+	switch {
+	case !oldPresent && newPresent:
+		// Idempotent post-state.
+		return nil
+	case oldPresent && !newPresent:
+		// Apply.
+	case oldPresent && newPresent:
+		return fmt.Errorf(
+			"postgres: alter rename column %s.%s: both %q and %q exist — "+
+				"target schema cannot be reconciled without operator intervention",
+			schemaName, table.Name, oldName, newName,
+		)
+	default: // !oldPresent && !newPresent
+		return fmt.Errorf(
+			"postgres: alter rename column %s.%s: neither %q nor %q exists",
+			schemaName, table.Name, oldName, newName,
+		)
+	}
+	qualified := w.qualifyTable(table)
+	stmt := fmt.Sprintf("ALTER TABLE %s RENAME COLUMN %s TO %s",
+		qualified, quoteIdent(oldName), quoteIdent(newName))
+	if _, err := w.db.ExecContext(ctx, stmt); err != nil {
+		return fmt.Errorf("alter rename column %s.%s.%s -> %s: %w",
+			schemaName, table.Name, oldName, newName, err)
+	}
+	return nil
+}
+
+// pgColumnPairPresence returns whether oldName and newName each
+// exist in information_schema.columns for the named table. One
+// query for both names so the probe is a single round-trip.
+func pgColumnPairPresence(ctx context.Context, db sqlExecQueryer, schemaName, tableName, oldName, newName string) (oldPresent, newPresent bool, err error) {
+	const q = `SELECT column_name FROM information_schema.columns
+		WHERE table_schema = $1 AND table_name = $2 AND column_name = ANY($3)`
+	rows, err := db.QueryContext(ctx, q, schemaName, tableName, []string{oldName, newName})
+	if err != nil {
+		return false, false, err
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var name string
+		if scanErr := rows.Scan(&name); scanErr != nil {
+			return false, false, scanErr
+		}
+		switch name {
+		case oldName:
+			oldPresent = true
+		case newName:
+			newPresent = true
+		}
+	}
+	if rowsErr := rows.Err(); rowsErr != nil {
+		return false, false, rowsErr
+	}
+	return oldPresent, newPresent, nil
+}
+
+// sqlExecQueryer is the narrow surface pgColumnPairPresence needs
+// from *sql.DB / *sql.Tx — kept private to this file so the helper
+// stays focused.
+type sqlExecQueryer interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
