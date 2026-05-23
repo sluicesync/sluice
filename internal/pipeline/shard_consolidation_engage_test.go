@@ -52,6 +52,32 @@ func (*supportingApplier) Apply(context.Context, string, <-chan ir.Change) error
 func (*supportingApplier) RequestStop(context.Context, string) error             { return nil }
 func (*supportingApplier) ClearStopRequested(context.Context, string) error      { return nil }
 
+// Bug 85 pin: supportingApplier also implements
+// ShardConsolidationLeaseLister + ShardConsolidationLeaseDeleter +
+// PositionOrderer so the GC wire-up at engagement time can be
+// exercised. The fakeLeaseStore already carries the rows; this
+// surface just lets the engagement type-assertions hit.
+func (a *supportingApplier) ListLeases(context.Context) ([]ir.ShardConsolidationLeaseRow, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	out := make([]ir.ShardConsolidationLeaseRow, 0, len(a.rows))
+	for _, r := range a.rows {
+		out = append(out, r)
+	}
+	return out, nil
+}
+
+func (a *supportingApplier) DeleteLease(_ context.Context, tableName string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	delete(a.rows, tableName)
+	return nil
+}
+
+func (*supportingApplier) PositionAtOrAfter(_, _ ir.Position) (bool, error) {
+	return false, nil // no rows in the fake fleet would be GC-eligible anyway
+}
+
 // nonSupportingApplier implements ir.ChangeApplier but NOT
 // ShardConsolidationLeaseStore — exercises the loud-refusal path.
 type nonSupportingApplier struct{}
@@ -224,5 +250,90 @@ func TestEngage_DefaultsZeroLeaseConfig(t *testing.T) {
 	}
 	if mgr.cfg.RetryPeriod != DefaultRetryPeriod {
 		t.Errorf("RetryPeriod = %v, want default %v", mgr.cfg.RetryPeriod, DefaultRetryPeriod)
+	}
+}
+
+// TestEngage_WiresGCDepsWhenAllSurfacesPresent pins Bug 85 (v0.76.0
+// shipped #21's GC sweep but missed the WithGC wire-up in
+// engageShardCoordination). When the applier implements all three
+// optional surfaces (Lister + Deleter + Orderer), engagement must
+// populate the LeaseManager's gcDeps so the heartbeat loop's
+// GC-trigger guard sees non-nil deps.
+func TestEngage_WiresGCDepsWhenAllSurfacesPresent(t *testing.T) {
+	t.Parallel()
+	s := &Streamer{
+		StreamID:          "stream-a",
+		InjectShardColumn: ShardColumnSpec{Name: "source_shard_id", Value: "us-east-1"},
+		CoordinateLiveDDL: true,
+		Target:            stubNamedEngine{name: "stub"},
+	}
+	if err := s.engageShardCoordination(context.Background(), newSupportingApplier()); err != nil {
+		t.Fatalf("engageShardCoordination: %v", err)
+	}
+	mgr := s.ShardConsolidationLeaseManager()
+	if mgr == nil {
+		t.Fatal("expected lease manager")
+	}
+	if mgr.gcDeps == nil {
+		t.Fatal("Bug 85: gcDeps must be non-nil when applier supports lister + deleter + orderer; v0.76.0 shipped with this wire-up missing")
+	}
+	if mgr.gcDeps.Lister == nil {
+		t.Error("gcDeps.Lister nil")
+	}
+	if mgr.gcDeps.Deleter == nil {
+		t.Error("gcDeps.Deleter nil")
+	}
+	if mgr.gcDeps.PosReader == nil {
+		t.Error("gcDeps.PosReader nil")
+	}
+	if mgr.gcDeps.Orderer == nil {
+		t.Error("gcDeps.Orderer nil")
+	}
+}
+
+// TestEngage_InheritsNoGCDefaultWhenSurfacesMissing — the no-GC
+// default when the applier implements the lease store + prober (so
+// engagement succeeds) but NOT the deleter/orderer surfaces.
+// supportingApplier-without-deleter is enough to exercise this since
+// adding lease store but not the deleter is realistic for older engines.
+type leaseStoreOnlyApplier struct {
+	*fakeLeaseStore
+	*fakeProber
+}
+
+func (*leaseStoreOnlyApplier) EnsureControlTable(context.Context) error { return nil }
+func (*leaseStoreOnlyApplier) ReadPosition(context.Context, string) (ir.Position, bool, error) {
+	return ir.Position{}, false, nil
+}
+
+func (*leaseStoreOnlyApplier) ListStreams(context.Context) ([]ir.StreamStatus, error) {
+	return nil, nil
+}
+
+func (*leaseStoreOnlyApplier) Apply(context.Context, string, <-chan ir.Change) error { return nil }
+func (*leaseStoreOnlyApplier) RequestStop(context.Context, string) error             { return nil }
+func (*leaseStoreOnlyApplier) ClearStopRequested(context.Context, string) error      { return nil }
+
+func TestEngage_InheritsNoGCDefaultWhenSurfacesMissing(t *testing.T) {
+	t.Parallel()
+	s := &Streamer{
+		StreamID:          "stream-a",
+		InjectShardColumn: ShardColumnSpec{Name: "source_shard_id", Value: "us-east-1"},
+		CoordinateLiveDDL: true,
+		Target:            stubNamedEngine{name: "stub"},
+	}
+	applier := &leaseStoreOnlyApplier{
+		fakeLeaseStore: newFakeLeaseStore(testClockNow),
+		fakeProber:     &fakeProber{},
+	}
+	if err := s.engageShardCoordination(context.Background(), applier); err != nil {
+		t.Fatalf("engageShardCoordination: %v", err)
+	}
+	mgr := s.ShardConsolidationLeaseManager()
+	if mgr == nil {
+		t.Fatal("expected lease manager")
+	}
+	if mgr.gcDeps != nil {
+		t.Error("gcDeps should be nil when applier doesn't implement deleter/orderer (no-GC default)")
 	}
 }

@@ -66,6 +66,28 @@ func (s *Streamer) engageShardCoordination(ctx context.Context, applier ir.Chang
 	}
 	s.leaseMgr = mgr
 
+	// Bug 85 fix: wire the v0.76.0 lease GC sweep into the LeaseManager
+	// so its heartbeat loop's GC-trigger guard sees non-nil gcDeps.
+	// The v0.76.0 release shipped #21's sweep but missed this wire-up,
+	// making the sweep dead code in production (the lease table grew
+	// unboundedly despite the release notes claiming otherwise).
+	//
+	// All four surfaces type-assert on the applier. Engines that don't
+	// implement deleter / orderer (e.g. test stubs) inherit the no-GC
+	// default — the sweep is a maintenance op, never load-bearing.
+	if lister, ok := applier.(ir.ShardConsolidationLeaseLister); ok {
+		if deleter, ok := applier.(ir.ShardConsolidationLeaseDeleter); ok {
+			if orderer, ok := applier.(ir.PositionOrderer); ok {
+				mgr.WithGC(&LeaseGCDeps{
+					Lister:    lister,
+					Deleter:   deleter,
+					PosReader: applier,
+					Orderer:   orderer,
+				})
+			}
+		}
+	}
+
 	// Open a SchemaWriter for the per-shape DDL apply path. The
 	// writer's lifetime is owned by the Streamer; closed via
 	// closeShardCoordination on Run exit.
