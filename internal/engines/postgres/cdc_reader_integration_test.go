@@ -103,12 +103,19 @@ func applyPGSQL(t *testing.T, dsn, sqlText string) {
 }
 
 // waitForSlotInactive polls `pg_replication_slots.active` until the
-// named slot is no longer marked active, or the timeout elapses.
-// Required between two CDC reader sessions against the same slot: PG's
-// walsender doesn't release the slot synchronously when the client
-// disconnects — the next `START_REPLICATION` racing against PG's
-// cleanup gets SQLSTATE 55006 (`replication slot ... is active for
-// PID N`).
+// named slot is no longer marked active. Required between two CDC
+// reader sessions against the same slot.
+//
+// [CDCReader.Close] is deliberately asynchronous (see its doc comment):
+// it cancels the streamer ctx and returns immediately, leaving the
+// pump goroutine to close `replConn` "on the way out." PG keeps the
+// slot marked active until its walsender backend observes the
+// disconnect — which can take many seconds, longer than is reasonable
+// for a test poll. We poll briefly for natural release, then force-
+// terminate the active backend via `pg_terminate_backend(active_pid)`
+// and poll again. This is the standard test idiom for "I need the
+// slot back NOW"; production paths don't need this because they
+// don't immediately re-attach to the same slot in the same process.
 func waitForSlotInactive(t *testing.T, dsn, slotName string, timeout time.Duration) {
 	t.Helper()
 	db, err := sql.Open("pgx", dsn)
@@ -117,24 +124,53 @@ func waitForSlotInactive(t *testing.T, dsn, slotName string, timeout time.Durati
 	}
 	defer func() { _ = db.Close() }()
 
-	deadline := time.Now().Add(timeout)
-	for {
-		var active bool
-		err := db.QueryRow(`SELECT active FROM pg_replication_slots WHERE slot_name = $1`, slotName).Scan(&active)
+	checkActive := func() (active bool, exists bool) {
+		var a bool
+		err := db.QueryRow(`SELECT active FROM pg_replication_slots WHERE slot_name = $1`, slotName).Scan(&a)
 		if errors.Is(err, sql.ErrNoRows) {
-			return // slot doesn't exist; trivially inactive
+			return false, false
 		}
 		if err != nil {
 			t.Fatalf("waitForSlotInactive: query: %v", err)
 		}
-		if !active {
+		return a, true
+	}
+
+	// Phase 1: short polling window for natural release.
+	gracePeriod := 3 * time.Second
+	if timeout < gracePeriod {
+		gracePeriod = timeout
+	}
+	graceDeadline := time.Now().Add(gracePeriod)
+	for time.Now().Before(graceDeadline) {
+		active, exists := checkActive()
+		if !exists || !active {
 			return
 		}
-		if time.Now().After(deadline) {
-			t.Fatalf("waitForSlotInactive: slot %q still active after %s", slotName, timeout)
-		}
-		time.Sleep(200 * time.Millisecond)
+		time.Sleep(100 * time.Millisecond)
 	}
+
+	// Phase 2: force-terminate the active backend.
+	if _, err := db.Exec(
+		`SELECT pg_terminate_backend(active_pid)
+		 FROM pg_replication_slots
+		 WHERE slot_name = $1 AND active`,
+		slotName,
+	); err != nil {
+		t.Fatalf("waitForSlotInactive: pg_terminate_backend: %v", err)
+	}
+
+	// Phase 3: poll until PG marks the slot inactive after the
+	// terminate signal lands.
+	deadline := time.Now().Add(timeout - gracePeriod)
+	for time.Now().Before(deadline) {
+		active, exists := checkActive()
+		if !exists || !active {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("waitForSlotInactive: slot %q still active after %s (including pg_terminate_backend)", slotName, timeout)
 }
 
 // TestCDCReader_BasicChangeStream exercises the full pgoutput pipeline:
