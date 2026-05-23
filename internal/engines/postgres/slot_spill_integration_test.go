@@ -111,11 +111,13 @@ func TestSlotSpillStats_DecodeProducesNonZeroBytes(t *testing.T) {
 
 	// Tune work_mem down so the smallest realistic transaction spills.
 	// 64 kB is the documented PG minimum for logical_decoding_work_mem.
-	applyPGSQL(t, dsn, `
-		ALTER SYSTEM SET logical_decoding_work_mem = '64kB';
-		SELECT pg_reload_conf();
-		CREATE TABLE bulk (id INT PRIMARY KEY, payload TEXT);
-	`)
+	//
+	// ALTER SYSTEM cannot run inside a transaction block (SQLSTATE
+	// 25001); pgx's simple-query path wraps multi-statement scripts
+	// implicitly, so split into individual statements.
+	applyPGSQL(t, dsn, "ALTER SYSTEM SET logical_decoding_work_mem = '64kB'")
+	applyPGSQL(t, dsn, "SELECT pg_reload_conf()")
+	applyPGSQL(t, dsn, "CREATE TABLE bulk (id INT PRIMARY KEY, payload TEXT)")
 
 	const slotName = "spill_pin_slot"
 
