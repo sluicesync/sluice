@@ -66,18 +66,28 @@ func (s *Streamer) engageShardCoordination(ctx context.Context, applier ir.Chang
 	}
 	s.leaseMgr = mgr
 
-	// Bug 85 fix: wire the v0.76.0 lease GC sweep into the LeaseManager
+	// Bug 85.b fix: wire the v0.76.0 lease GC sweep into the LeaseManager
 	// so its heartbeat loop's GC-trigger guard sees non-nil gcDeps.
-	// The v0.76.0 release shipped #21's sweep but missed this wire-up,
-	// making the sweep dead code in production (the lease table grew
-	// unboundedly despite the release notes claiming otherwise).
 	//
-	// All four surfaces type-assert on the applier. Engines that don't
-	// implement deleter / orderer (e.g. test stubs) inherit the no-GC
-	// default — the sweep is a maintenance op, never load-bearing.
+	// Three surfaces, TWO sources:
+	//   - Lister + Deleter live on the applier (ChangeApplier interface
+	//     extensions, implemented by PG + MySQL applier structs).
+	//   - PositionOrderer lives on the SOURCE ENGINE
+	//     (e.g. internal/engines/postgres/position_orderer.go:33's
+	//     `func (Engine) PositionAtOrAfter(...)` — it's a method on
+	//     the engine factory value, NOT on *ChangeApplier).
+	//
+	// v0.77.0's fix attempt (Bug 85.a) wrongly type-asserted the
+	// orderer on `applier`, which silently failed on every real
+	// engine — gcDeps stayed nil, sweep stayed dead. Bug 85.b: assert
+	// on s.Source, not applier.
+	//
+	// Engines that don't implement any of the three surfaces inherit
+	// the no-GC default — the sweep is a maintenance op, never
+	// load-bearing on the apply path.
 	if lister, ok := applier.(ir.ShardConsolidationLeaseLister); ok {
 		if deleter, ok := applier.(ir.ShardConsolidationLeaseDeleter); ok {
-			if orderer, ok := applier.(ir.PositionOrderer); ok {
+			if orderer, ok := s.Source.(ir.PositionOrderer); ok {
 				mgr.WithGC(&LeaseGCDeps{
 					Lister:    lister,
 					Deleter:   deleter,

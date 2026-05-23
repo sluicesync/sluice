@@ -74,9 +74,11 @@ func (a *supportingApplier) DeleteLease(_ context.Context, tableName string) err
 	return nil
 }
 
-func (*supportingApplier) PositionAtOrAfter(_, _ ir.Position) (bool, error) {
-	return false, nil // no rows in the fake fleet would be GC-eligible anyway
-}
+// (Bug 85.b: supportingApplier does NOT implement PositionAtOrAfter
+// any more — the orderer is type-asserted on s.Source in production,
+// not on the applier. Stubbing it here previously masked the v0.76.0
+// production gap that v0.77.0 then re-hid. The orderer interface is
+// satisfied at the engine level by stubNamedEngine.)
 
 // nonSupportingApplier implements ir.ChangeApplier but NOT
 // ShardConsolidationLeaseStore — exercises the loud-refusal path.
@@ -129,6 +131,15 @@ func (e stubNamedEngine) OpenChangeApplier(context.Context, string) (ir.ChangeAp
 
 func (e stubNamedEngine) OpenSnapshotStream(context.Context, string) (*ir.SnapshotStream, error) {
 	return nil, errors.New("not implemented")
+}
+
+// Bug 85.b pin: stubNamedEngine implements ir.PositionOrderer so the
+// engagement's `s.Source.(ir.PositionOrderer)` assertion succeeds in
+// tests. v0.77.0's first fix wrongly type-asserted the orderer on
+// the applier; the corrected fix asserts on s.Source (the engine,
+// where PositionAtOrAfter actually lives).
+func (e stubNamedEngine) PositionAtOrAfter(_, _ ir.Position) (bool, error) {
+	return false, nil
 }
 
 // fakeSchemaWriter satisfies ir.SchemaWriter + ir.ShapeDeltaApplier
@@ -255,16 +266,18 @@ func TestEngage_DefaultsZeroLeaseConfig(t *testing.T) {
 
 // TestEngage_WiresGCDepsWhenAllSurfacesPresent pins Bug 85 (v0.76.0
 // shipped #21's GC sweep but missed the WithGC wire-up in
-// engageShardCoordination). When the applier implements all three
-// optional surfaces (Lister + Deleter + Orderer), engagement must
-// populate the LeaseManager's gcDeps so the heartbeat loop's
-// GC-trigger guard sees non-nil deps.
+// engageShardCoordination). When the applier implements lister +
+// deleter AND the source engine implements PositionOrderer (Bug 85.b
+// — v0.77.0's first fix wrongly checked the applier for the orderer),
+// engagement must populate the LeaseManager's gcDeps so the heartbeat
+// loop's GC-trigger guard sees non-nil deps.
 func TestEngage_WiresGCDepsWhenAllSurfacesPresent(t *testing.T) {
 	t.Parallel()
 	s := &Streamer{
 		StreamID:          "stream-a",
 		InjectShardColumn: ShardColumnSpec{Name: "source_shard_id", Value: "us-east-1"},
 		CoordinateLiveDDL: true,
+		Source:            stubNamedEngine{name: "src-stub"},
 		Target:            stubNamedEngine{name: "stub"},
 	}
 	if err := s.engageShardCoordination(context.Background(), newSupportingApplier()); err != nil {
@@ -275,7 +288,7 @@ func TestEngage_WiresGCDepsWhenAllSurfacesPresent(t *testing.T) {
 		t.Fatal("expected lease manager")
 	}
 	if mgr.gcDeps == nil {
-		t.Fatal("Bug 85: gcDeps must be non-nil when applier supports lister + deleter + orderer; v0.76.0 shipped with this wire-up missing")
+		t.Fatal("Bug 85.b: gcDeps must be non-nil when applier supports lister+deleter AND s.Source supports orderer; v0.77.0's first fix wrongly checked the applier for the orderer")
 	}
 	if mgr.gcDeps.Lister == nil {
 		t.Error("gcDeps.Lister nil")
@@ -289,6 +302,68 @@ func TestEngage_WiresGCDepsWhenAllSurfacesPresent(t *testing.T) {
 	if mgr.gcDeps.Orderer == nil {
 		t.Error("gcDeps.Orderer nil")
 	}
+}
+
+// TestEngage_NoGCWhenSourceLacksOrderer is the Bug 85.b regression
+// guard: if s.Source doesn't implement PositionOrderer (e.g. a future
+// engine that doesn't ship one), engagement should inherit the no-GC
+// default rather than crashing or wiring a nil orderer.
+func TestEngage_NoGCWhenSourceLacksOrderer(t *testing.T) {
+	t.Parallel()
+	s := &Streamer{
+		StreamID:          "stream-a",
+		InjectShardColumn: ShardColumnSpec{Name: "source_shard_id", Value: "us-east-1"},
+		CoordinateLiveDDL: true,
+		Source:            engineWithoutOrderer{name: "no-orderer-src"},
+		Target:            stubNamedEngine{name: "stub"},
+	}
+	if err := s.engageShardCoordination(context.Background(), newSupportingApplier()); err != nil {
+		t.Fatalf("engageShardCoordination: %v", err)
+	}
+	mgr := s.ShardConsolidationLeaseManager()
+	if mgr == nil {
+		t.Fatal("expected lease manager")
+	}
+	if mgr.gcDeps != nil {
+		t.Error("gcDeps should be nil when s.Source lacks PositionOrderer (no-GC default)")
+	}
+}
+
+// engineWithoutOrderer satisfies ir.Engine but NOT ir.PositionOrderer
+// (it doesn't define PositionAtOrAfter). Used by the Bug 85.b no-GC-
+// default pin.
+type engineWithoutOrderer struct {
+	name string
+}
+
+func (e engineWithoutOrderer) Name() string                  { return e.name }
+func (e engineWithoutOrderer) Capabilities() ir.Capabilities { return ir.Capabilities{} }
+func (e engineWithoutOrderer) OpenSchemaReader(context.Context, string) (ir.SchemaReader, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (e engineWithoutOrderer) OpenSchemaWriter(context.Context, string) (ir.SchemaWriter, error) {
+	return &fakeSchemaWriter{}, nil
+}
+
+func (e engineWithoutOrderer) OpenRowReader(context.Context, string) (ir.RowReader, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (e engineWithoutOrderer) OpenRowWriter(context.Context, string) (ir.RowWriter, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (e engineWithoutOrderer) OpenCDCReader(context.Context, string) (ir.CDCReader, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (e engineWithoutOrderer) OpenChangeApplier(context.Context, string) (ir.ChangeApplier, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (e engineWithoutOrderer) OpenSnapshotStream(context.Context, string) (*ir.SnapshotStream, error) {
+	return nil, errors.New("not implemented")
 }
 
 // TestEngage_InheritsNoGCDefaultWhenSurfacesMissing — the no-GC
