@@ -2,15 +2,20 @@
 
 ## Status
 
-**Accepted (2026-05-16); implemented and shipped in v0.67.0**
-(commit `1e3f3ca` — `feat(v0.67.0): ADR-0046 native bounded-segment
-lineage + inline rotation`; hardened by Bug 66 / v0.67.1). (Status
-reconciled 2026-05-19: the prior "implementation pending" wording was
-stale — verified against code, not the doc: the bounded-segment
-lineage + `lineage.json` clean-break + `--compression` with zstd
-default landed under that commit; `internal/pipeline/chain_catalog.go`,
-`chain_prune.go`, `chain_restore.go`, and the compress codec carry
-the segment model.) This
+**Accepted (2026-05-16); implemented through §14d (Task #15) in
+v0.77.0.** (§14a/§14b Phase 1/§14b Phase 2/§14c implemented in
+v0.47.0/v0.51.0/v0.67.0/v0.67.1; commit `1e3f3ca` —
+`feat(v0.67.0): ADR-0046 native bounded-segment lineage + inline
+rotation`; hardened by Bug 66 / v0.67.1.) (§14d Compact —
+`internal/pipeline/chain_compact.go`, `CompactChain`,
+`sluice backup compact` — implemented in v0.77.0 / Task #15;
+see the §14d Compact subsection below for the locked design.)
+(Status reconciled 2026-05-19: the prior "implementation pending"
+wording was stale — verified against code, not the doc: the
+bounded-segment lineage + `lineage.json` clean-break +
+`--compression` with zstd default landed under the v0.67.0 commit;
+`internal/pipeline/chain_catalog.go`, `chain_prune.go`,
+`chain_restore.go`, and the compress codec carry the segment model.) This
 **supersedes the earlier grafted-rotation draft of this ADR**
 (tombstone + `SucceededBy` markers bolted onto an unbounded chain).
 The decision is the **native bounded-segment lineage model**, as
@@ -149,6 +154,132 @@ leading incrementals within the oldest kept segment; advance
 "merge incrementals within a segment" — built *on* the lineage
 model, not beside it. Both are list/segment-local ops; no
 tombstone/parent-link surgery.
+
+### §14d Compact (v0.77.0, Task #15)
+
+**Implemented.** Compact is the operator-explicit counterpart to
+prune: where prune drops segments off the OLDEST end of a lineage,
+compact concatenates CONSECUTIVE retained segments whose CreatedAt
+gaps fall within a single operator-supplied `--merge-window`.
+
+The §4 sketch above was reframed during implementation from
+"merge incrementals **within** a segment" to **merge consecutive
+SEGMENTS**: N in-window segments become one merged segment whose
+full = the OLDEST source's full (the restore base — its snapshot
+anchor S_0 covers the group's whole restore range), whose
+incrementals = the union of every source's incrementals in
+lineage order, and whose Codec / ChainEncryption / VerbatimExtension
+markers carry over from the oldest source unchanged. Each merged
+chunk file is MOVED verbatim; bytes are never decompressed,
+recompressed, or re-encrypted (that's #16's event-level dedup
+territory).
+
+**Locked design decisions.**
+
+1. **"Naive" = byte-level chunk concatenation within a time window.**
+   No event-level dedup, no same-row collapsing — deferred to #16.
+   A row inserted then updated then deleted across three merged
+   segments stays as three separate events post-compact.
+
+2. **Pairwise greedy left-to-right** grouping by CreatedAt distance.
+   Walk the lineage's retained segments oldest-to-newest; cut a new
+   group whenever the gap exceeds `--merge-window`. Groups of size
+   1 are no-ops (still reported in the dry-run plan); groups of
+   size >= 2 merge.
+
+3. **Atomic safety = catalog-swap commit boundary** (mirroring
+   ADR-0046 §2's rotation-COMMIT linearization point). The flow is:
+   stage every merged group's chunks + manifests under
+   `.compact-staging-<groupID>/` → rename to the merged segment's
+   final `seg-merged-<groupID>/` (copy-then-delete inside the store
+   — BackupStore has no rename primitive; the staging-dir marker
+   lets a crashed run distinguish "in-progress" from "committed"
+   without inspecting the catalog) → atomically swap lineage.json
+   in ONE Put referencing the merged segment in place of its
+   sources → delete the now-orphaned source segments' files.
+   Pre-swap → "compact never happened" (sources still
+   authoritative); post-swap → "compact happened" (merged segment
+   is authoritative). Mid-compact crash recovery: leftover
+   `.compact-staging-*` dirs on resume are unsalvageable garbage
+   that the next compact run sweeps.
+
+4. **Loud-failure refusals (the ADR-0046 / loud-failure tenet
+   applied to compact).** The pre-flight pass refuses LOUDLY,
+   BEFORE any mutation, on three boundary conditions:
+
+   - **Codec mismatch** within a merge group (some segments gzip,
+     others zstd, others none): byte-level concat across different
+     codecs would require re-encoding (silent data-handling
+     change — exactly what loud-failure rejects). Operator
+     recovery: split the merge window so each group is
+     codec-uniform, or re-encode the chain first.
+   - **Encryption-keyset boundary** within a merge group: the
+     fingerprint is the (KEKMode, KEKRef, Mode, Argon2id-salt)
+     tuple recorded on each segment full's `ChainEncryption`.
+     Mismatched fingerprints would produce a merged segment whose
+     chunks are wrapped under multiple CEKs sharing no common KEK
+     — restore has no way to pick the right one per chunk under
+     sluice's per-chain (now per-segment) encryption model.
+     Operator recovery: split the merge window OR re-key the chain
+     first.
+   - **Position gap** between consecutive sources in a group
+     (`seg[i].EndPosition != seg[i+1].StartPosition`): the rotation
+     FSM guarantees `<=`, with equality the common case. A
+     strict-less gap means events between `seg[i].End` and
+     `seg[i+1].Start` live ONLY in `seg[i+1]`'s full snapshot,
+     which naive compact is about to drop — refusing avoids silent
+     event loss. The position is engine-tagged-token compared
+     (the conservative discriminator; positions across a rotation
+     share an engine, so token equality is sufficient).
+
+5. **Chain root preservation.** Compact never moves or rewrites the
+   chain root's identity. The oldest retained segment's full
+   becomes the merged segment's full unchanged — same
+   `ChainEncryption`, same `BackupID` carried in `Manifest.json`,
+   same schema. Operators inspecting a compacted lineage see the
+   merged segment as a normal multi-incremental segment with a
+   `cap_reason: "compacted"` discriminator distinguishing it from
+   a naturally-rotated segment.
+
+6. **`--dry-run` mirrors prune.** Reports the per-group plan
+   (source segment IDs, merged segment ID, window span, bytes
+   moved) without touching storage or rewriting the catalog. The
+   reporting-only path runs the same pre-flight refusals so a
+   keyset-mismatched window surfaces before the operator commits.
+
+7. **Never automatic.** Compact runs only via `sluice backup
+   compact`. No flag on `sluice backup full` / `sluice backup
+   stream run` schedules a compact step; no rotation event chains
+   into compact. The bytes-savings story for naive compact is
+   zero by construction (bytes are moved, never rewritten); the
+   operational win is segment-count reduction (fewer per-segment
+   directories to walk on restore, fewer manifests). When #16's
+   event-level compactor lands, real savings will surface — and
+   it slots in behind the same CLI surface (`--strategy=naive |
+   event-dedup`, etc.).
+
+**Implementation files.**
+
+- `internal/pipeline/chain_compact.go` — `CompactChain`,
+  `CompactOpts`, `CompactResult`, the staging + rename + catalog
+  swap dance, the three loud-failure pre-flights.
+- `internal/pipeline/chain_compact_test.go` — unit pin matrix:
+  2-segment merge, 3-segment merge, out-of-window untouched,
+  mixed in/out window groups, keyset boundary refusal, codec
+  boundary refusal, position gap refusal, single-segment no-op,
+  all-out-of-window no-op, dry-run no side effects, missing
+  catalog refusal, post-compact buildLineageChain shape, stale
+  staging-dir cleanup.
+- `internal/pipeline/backup_compact_integration_test.go`
+  (`integration` build tag) — drives a 3+-segment lineage under
+  CDC writes on real PG (testcontainers), restores pre-compact +
+  post-compact, asserts byte-identical row sets.
+- `cmd/sluice/backup.go` — `BackupCompactCmd` wired into the
+  `BackupCmd` group as `sluice backup compact`. Surface mirrors
+  prune: `--from-dir` / `--from` (mutually exclusive),
+  `--backup-endpoint` / `--backup-region` / `--backup-path-style`
+  for S3-compatible providers, `--merge-window` (required positive
+  duration), `--dry-run`.
 
 ### 5. Per-segment compression codec (folded in — the surface is open)
 

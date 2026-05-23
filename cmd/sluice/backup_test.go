@@ -6,6 +6,7 @@ package main
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/alecthomas/kong"
 )
@@ -174,6 +175,42 @@ func TestBackupCmdParse(t *testing.T) {
 			check: func(t *testing.T, cli *CLI) {
 				if !cli.Backup.Full.ForceOverwrite {
 					t.Errorf("ForceOverwrite = false; want true")
+				}
+			},
+		},
+		{
+			name: "backup compact happy path",
+			args: []string{
+				"backup", "compact",
+				"--from-dir=/tmp/backup",
+				"--merge-window=1h",
+			},
+			check: func(t *testing.T, cli *CLI) {
+				if cli.Backup.Compact.FromDir != "/tmp/backup" {
+					t.Errorf("Compact.FromDir = %q", cli.Backup.Compact.FromDir)
+				}
+				if cli.Backup.Compact.MergeWindow != time.Hour {
+					t.Errorf("Compact.MergeWindow = %v; want 1h", cli.Backup.Compact.MergeWindow)
+				}
+			},
+		},
+		{
+			name: "backup compact dry-run parses",
+			args: []string{
+				"backup", "compact",
+				"--from=s3://bucket/prefix",
+				"--merge-window=24h",
+				"--dry-run",
+			},
+			check: func(t *testing.T, cli *CLI) {
+				if cli.Backup.Compact.From != "s3://bucket/prefix" {
+					t.Errorf("Compact.From = %q", cli.Backup.Compact.From)
+				}
+				if !cli.Backup.Compact.DryRun {
+					t.Errorf("Compact.DryRun = false; want true")
+				}
+				if cli.Backup.Compact.MergeWindow != 24*time.Hour {
+					t.Errorf("Compact.MergeWindow = %v; want 24h", cli.Backup.Compact.MergeWindow)
 				}
 			},
 		},

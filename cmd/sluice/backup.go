@@ -350,6 +350,7 @@ type BackupCmd struct {
 	Stream      BackupStreamCmdGroup `cmd:"" help:"Long-running stream that produces rolling incrementals (Phase 4)."`
 	Verify      BackupVerifyCmd      `cmd:"" help:"Re-checksum every chunk in an existing backup chain and report any mismatches."`
 	Prune       BackupPruneCmd       `cmd:"" help:"Drop the oldest incrementals from an existing chain to bound disk + restore time (GitHub #20 chunk 14c)."`
+	Compact     BackupCompactCmd     `cmd:"" help:"Concatenate consecutive segments whose CreatedAt gaps fall within --merge-window into a single segment (GitHub #20 chunk 14d, Task #15)."`
 }
 
 // BackupFullCmd runs `sluice backup full`. Reads the source schema,
@@ -956,6 +957,117 @@ func (p *BackupPruneCmd) Run(_ *Globals) error {
 		slog.InfoContext(
 			ctx, "  dropped",
 			slog.String("manifest_path", p),
+		)
+	}
+	return nil
+}
+
+// BackupCompactCmd runs `sluice backup compact`. Concatenates
+// consecutive lineage segments whose CreatedAt gaps fall within
+// --merge-window into a single merged segment, in place. Closes
+// GitHub #20 roadmap chunk 14d (Task #15).
+//
+// Semantics (see internal/pipeline/chain_compact.go):
+//
+//   - Walk the lineage's retained segments oldest-first; group
+//     consecutive segments where each pairwise CreatedAt gap is <=
+//     --merge-window. Groups of size >= 2 merge into one segment;
+//     size-1 groups are no-ops.
+//   - "Naive" = byte-level chunk concat. Each merged source's chunk
+//     files are moved verbatim; bytes are NEVER decompressed,
+//     recompressed, or re-encrypted (that's event-level dedup,
+//     deferred to #16). The merged segment's full = the OLDEST
+//     source's full; its incrementals = the union of every source's
+//     incrementals in lineage order.
+//   - Loud-failure refusals: mixed codecs within a group, divergent
+//     encryption keysets within a group, OR position gaps between
+//     consecutive sources REFUSE LOUDLY before any mutation. The
+//     operator's recovery is to split the merge window so each group
+//     is uniform / contiguous.
+//   - Atomic safety: staging-dir → final-dir move → ATOMIC catalog
+//     swap (lineage.json rewrite). The catalog swap is the
+//     linearization commit; a crash before it leaves "compact never
+//     happened", a crash after it leaves "compact happened" with
+//     orphan source files the next run sweeps.
+//   - --dry-run reports the would-merge plan without touching
+//     storage or the catalog.
+//
+// Compact never runs automatically; it is an explicit operator
+// action. The chain root (oldest retained segment) is preserved
+// (compact operates on the retained segments oldest-first; the
+// oldest's full BECOMES the merged segment's full, never moved or
+// rewritten in identity).
+type BackupCompactCmd struct {
+	FromDir string `help:"Directory containing the chain to compact (the same directory --output-dir wrote to). Mutually exclusive with --from." placeholder:"DIR"`
+	From    string `help:"URL of the chain to compact (s3://, gs://, azblob://, file:///). Mutually exclusive with --from-dir." placeholder:"URL"`
+
+	BackupEndpoint  string `help:"Override the S3 endpoint for S3-compatible providers. Only meaningful when --from is an s3:// URL." placeholder:"URL"`
+	BackupRegion    string `help:"Override the S3 region. Only meaningful when --from is an s3:// URL." placeholder:"REGION"`
+	BackupPathStyle bool   `help:"Force path-style addressing. Only meaningful when --from is an s3:// URL."`
+
+	MergeWindow time.Duration `help:"Maximum CreatedAt gap between consecutive segments to be considered part of the same merge group. Required. Examples: 1h, 24h, 168h (7d)." placeholder:"DUR"`
+
+	DryRun bool `help:"Report the would-merge plan without touching storage or rewriting the catalog."`
+}
+
+// Run implements `sluice backup compact`.
+func (c *BackupCompactCmd) Run(_ *Globals) error {
+	if c.FromDir == "" && c.From == "" {
+		return errors.New("one of --from-dir or --from is required")
+	}
+	if c.FromDir != "" && c.From != "" {
+		return errors.New("--from-dir and --from are mutually exclusive")
+	}
+	if c.MergeWindow <= 0 {
+		return errors.New("--merge-window is required (positive duration)")
+	}
+	ctx := kongContext()
+	store, _, closer, err := openBackupStore(ctx, c.FromDir, c.From, pipeline.BlobStoreOptions{
+		Endpoint:  c.BackupEndpoint,
+		Region:    c.BackupRegion,
+		PathStyle: c.BackupPathStyle,
+	})
+	if err != nil {
+		return err
+	}
+	if closer != nil {
+		defer func() { _ = closer() }()
+	}
+
+	res, err := pipeline.CompactChain(ctx, store, pipeline.CompactOpts{
+		MergeWindow: c.MergeWindow,
+		DryRun:      c.DryRun,
+	})
+	if err != nil {
+		return err
+	}
+	mode := "compacted"
+	if c.DryRun {
+		mode = "would-compact (dry-run)"
+	}
+	slog.InfoContext(
+		ctx, "backup compact: "+mode,
+		slog.Int("groups_considered", res.GroupsConsidered),
+		slog.Int("groups_merged", res.GroupsMerged),
+		slog.Int("segments_removed", res.SegmentsRemoved),
+		slog.Int64("bytes_before", res.BytesBefore),
+		slog.Int64("bytes_after", res.BytesAfter),
+	)
+	for _, g := range res.Plan {
+		if g.MergedSegmentID == "" {
+			slog.InfoContext(
+				ctx, "  group (size-1, skipped)",
+				slog.Any("source_segment_ids", g.SourceSegmentIDs),
+			)
+			continue
+		}
+		slog.InfoContext(
+			ctx, "  group merged",
+			slog.String("merged_segment_id", g.MergedSegmentID),
+			slog.String("merged_segment_dir", g.MergedSegmentDir),
+			slog.Any("source_segment_ids", g.SourceSegmentIDs),
+			slog.Duration("window_span", g.WindowSpan),
+			slog.Int64("bytes_moved", g.BytesEstimate),
 		)
 	}
 	return nil
