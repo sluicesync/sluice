@@ -1,7 +1,7 @@
 # Release validation (local Hyper-V validation VM; Vultr retired)
 
 > **HOST MIGRATION COMPLETE (2026-05-19): the paid always-on Vultr
-> box (`sluice-test-lax-1`, ID `70087136-…`, `45.76.70.68`) is
+> box (`sluice-test-lax-1`, ID `<previous-vultr-instance-ID>`, `<previous-vultr-IP>`) is
 > DECOMMISSIONED — instance deleted, verified 0 instances on the
 > account.** It was idle + its clone stale (v0.32.2-era); with local
 > Hyper-V Ubuntu provisioning + a runner fleet in place, the same

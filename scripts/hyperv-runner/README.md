@@ -126,7 +126,7 @@ has WinRM you can drive that over PSRemoting; if it only has RDP open
 (common — WinRM/SMB off by default), use the **RDP + pre-minted
 token** flow below, which needs **no `gh` on the secondary host**.
 
-### RDP flow (secondary host has no WinRM/`gh`) — tested for AURORA-R11
+### RDP flow (secondary host has no WinRM/`gh`) — tested on a secondary Windows host without WinRM
 
 On the **primary** machine (this one — `gh` is authed here):
 

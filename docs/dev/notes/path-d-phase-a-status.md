@@ -18,10 +18,10 @@ The instrumentation is gated entirely behind DEBUG slog (`Level: slog.LevelDebug
 
 ## How to run on the Vultr box
 
-Assumes the standing Vultr instance is up at `root@45.76.70.68` per `C:\vultr-cli\sluice-test-spin-up.md`. The repo is bootstrapped at `/root/code/sluice` via the github deploy-key path (Path B in the spin-up runbook).
+Assumes the standing Vultr instance is up at `root@<previous-vultr-IP>` per `C:\vultr-cli\sluice-test-spin-up.md`. The repo is bootstrapped at `/root/code/sluice` via the github deploy-key path (Path B in the spin-up runbook).
 
 ```bash
-ssh root@45.76.70.68
+ssh root@<previous-vultr-IP>
 cd /root/code/sluice
 git fetch origin
 git checkout path-d-phase-a-diagnose

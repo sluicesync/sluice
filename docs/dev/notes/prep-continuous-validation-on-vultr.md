@@ -13,8 +13,8 @@ When to pick this up: when the operator decides the cycle-time / GitHub-issue-ro
 
 ## Current state (verified 2026-05-13)
 
-- **Vultr box**: `sluice-test-lax-1` (ID `70087136-0cb7-4b8b-8f5d-b0f6a68e9f5c`), `45.76.70.68`, `vhf-3c-8gb`, Ubuntu 24.04, active, 3-day uptime, idle.
-- **SSH access from this session**: works via `ssh root@45.76.70.68` (the local `~/.ssh/id_ed25519` key was registered as `824ae442-9312-4ccb-950f-f1af8a97d8c5` during provisioning — see [`release-validation-on-vultr.md`](release-validation-on-vultr.md) for the full provisioning runbook).
+- **Vultr box**: `sluice-test-lax-1` (ID `<previous-vultr-instance-ID>`), `<previous-vultr-IP>`, `vhf-3c-8gb`, Ubuntu 24.04, active, 3-day uptime, idle.
+- **SSH access from this session**: works via `ssh root@<previous-vultr-IP>` (the local `~/.ssh/id_ed25519` key was registered as `<previous-vultr-SSH-key-ID>` during provisioning — see [`release-validation-on-vultr.md`](release-validation-on-vultr.md) for the full provisioning runbook).
 - **Tooling installed**: Go 1.26.2 (matches `go.mod`), Docker 29.1.3 (daemon running, no containers). Matches the pre-release validation runbook's needs.
 - **`/root/code/sluice` clone**: **STALE** at commit `1a978293` (v0.32.2-era, ~Nov 2025). Current main is far ahead — needs `git pull` (or a fresh `git bundle` push from Windows) before any continuous-validation work.
 - **PlanetScale credentials**: **NOT present** on the box. Operator's local rig has `PLANETSCALE_CREDENTIALS.env` and `PLANETSCALE_SERVICE_TOKEN.env` at the `sluice-testing` repo root.
@@ -37,7 +37,7 @@ Cost: the Vultr instance is already running ($48/mo). Migrating doesn't change b
 ### Step 1 — Update source
 
 ```bash
-ssh root@45.76.70.68 'cd /root/code/sluice && git pull'
+ssh root@<previous-vultr-IP> 'cd /root/code/sluice && git pull'
 ```
 
 If deploy-key wasn't set up (current state unclear), fall back to the `git bundle` push from Windows per the provisioning runbook:
@@ -45,18 +45,18 @@ If deploy-key wasn't set up (current state unclear), fall back to the `git bundl
 ```powershell
 cd C:\code\sluice
 git bundle create C:\code\sluice.bundle --all
-scp C:\code\sluice.bundle root@45.76.70.68:/root/sluice.bundle
-ssh root@45.76.70.68 'cd /root/code && rm -rf sluice && git clone /root/sluice.bundle sluice'
+scp C:\code\sluice.bundle root@<previous-vultr-IP>:/root/sluice.bundle
+ssh root@<previous-vultr-IP> 'cd /root/code && rm -rf sluice && git clone /root/sluice.bundle sluice'
 ```
 
-Verify with `ssh root@45.76.70.68 'cd /root/code/sluice && git rev-parse --short HEAD'` — should match `main`'s tip.
+Verify with `ssh root@<previous-vultr-IP> 'cd /root/code/sluice && git rev-parse --short HEAD'` — should match `main`'s tip.
 
 ### Step 2 — Pre-stage current release binary
 
 Saves a `go build` per cycle. Build on Vultr (matches the production binary the operator has been running):
 
 ```bash
-ssh root@45.76.70.68 'export PATH=$PATH:/usr/local/go/bin && cd /root/code/sluice && \
+ssh root@<previous-vultr-IP> 'export PATH=$PATH:/usr/local/go/bin && cd /root/code/sluice && \
     git checkout v0.48.0 && \
     go build -ldflags "-X main.version=0.48.0 -X main.commit=$(git rev-parse --short HEAD)" \
         -o /root/bin/sluice-0.48.0 ./cmd/sluice && \
@@ -70,9 +70,9 @@ ssh root@45.76.70.68 'export PATH=$PATH:/usr/local/go/bin && cd /root/code/sluic
 From operator's workstation:
 
 ```powershell
-scp C:\code\sluice-testing\PLANETSCALE_CREDENTIALS.env root@45.76.70.68:/root/code/sluice/
-scp C:\code\sluice-testing\PLANETSCALE_SERVICE_TOKEN.env root@45.76.70.68:/root/code/sluice/
-ssh root@45.76.70.68 'chmod 600 /root/code/sluice/PLANETSCALE_*.env'
+scp C:\code\sluice-testing\PLANETSCALE_CREDENTIALS.env root@<previous-vultr-IP>:/root/code/sluice/
+scp C:\code\sluice-testing\PLANETSCALE_SERVICE_TOKEN.env root@<previous-vultr-IP>:/root/code/sluice/
+ssh root@<previous-vultr-IP> 'chmod 600 /root/code/sluice/PLANETSCALE_*.env'
 ```
 
 These are gitignored upstream; the `chmod 600` is defence-in-depth on the single-tenant box.
@@ -82,22 +82,22 @@ These are gitignored upstream; the `chmod 600` is defence-in-depth on the single
 The `sluice-testing` git repo can stay as the artifact-of-record on operator's workstation. On the Vultr box, set up a parallel structure that writes the same files (cycle reports, BUG-CATALOG entries, supervisor logs) but commits/pushes back to the same `orware/sluice-testing` repo from the box.
 
 ```bash
-ssh root@45.76.70.68 'mkdir -p /root/sluice-validation && cd /root/sluice-validation'
+ssh root@<previous-vultr-IP> 'mkdir -p /root/sluice-validation && cd /root/sluice-validation'
 # Clone the artifact-of-record repo (needs the operator's GitHub auth or a deploy key)
-ssh root@45.76.70.68 'cd /root/sluice-validation && git clone git@github.com:orware/sluice-testing.git'
+ssh root@<previous-vultr-IP> 'cd /root/sluice-validation && git clone git@github.com:orware/sluice-testing.git'
 ```
 
 Plus operator-side `scp` of any custom supervisor scripts:
 
 ```powershell
-scp C:\code\sluice-testing\work\supervisor_*.sh root@45.76.70.68:/root/sluice-validation/sluice-testing/work/
+scp C:\code\sluice-testing\work\supervisor_*.sh root@<previous-vultr-IP>:/root/sluice-validation/sluice-testing/work/
 ```
 
 ### Step 5 — Cycle-subagent invocation pattern (defer until 1-4 verified)
 
 Once the box is set up, the cycle subagent runs **on the Vultr box via SSH-from-this-session**. Pattern:
 
-- Agent in dev session spawns a `general-purpose` subagent with prompt: "SSH to root@45.76.70.68; run the v0.48.0 cycle per `/root/sluice-validation/sluice-testing/NEXT-CYCLE.md`; write `session-reports/v0.48.0.md` on the box; `git push` to `orware/sluice-testing`; report verdict (CLEAN / BUG_FOUND) back."
+- Agent in dev session spawns a `general-purpose` subagent with prompt: "SSH to root@<previous-vultr-IP>; run the v0.48.0 cycle per `/root/sluice-validation/sluice-testing/NEXT-CYCLE.md`; write `session-reports/v0.48.0.md` on the box; `git push` to `orware/sluice-testing`; report verdict (CLEAN / BUG_FOUND) back."
 - Subagent operates entirely over SSH; no local tooling needed in the dev-session workspace.
 - Cycle artifacts (binary dir, session report, BUG-CATALOG additions, supervisor logs) live on the box AND get committed to `sluice-testing` repo → operator can review on workstation either way.
 
