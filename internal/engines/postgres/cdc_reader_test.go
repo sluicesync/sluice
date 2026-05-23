@@ -4,6 +4,8 @@
 package postgres
 
 import (
+	"context"
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -31,6 +33,18 @@ func TestEncodeDecodePGPos(t *testing.T) {
 			"zero lsn",
 			pgPos{Slot: "sluice_slot", LSN: "0/0"},
 		},
+		{
+			// ADR-0051 / research finding F5: position carrying the
+			// source-identity pin (systemid + timeline). Both fields
+			// must round-trip cleanly so reconnect-time divergence
+			// detection has the persisted values to compare against.
+			"with source identity pin",
+			pgPos{Slot: "sluice_slot", LSN: "0/16B7350", SystemID: "7351234567890123456", Timeline: 3},
+		},
+		{
+			"with source identity pin, timeline=1 (fresh primary)",
+			pgPos{Slot: "sluice_slot", LSN: "1/0", SystemID: "7351234567890123456", Timeline: 1},
+		},
 	}
 	for _, c := range cases {
 		c := c
@@ -51,6 +65,150 @@ func TestEncodeDecodePGPos(t *testing.T) {
 			}
 			if !reflect.DeepEqual(got, c.pos) {
 				t.Errorf("round-trip\n got = %#v\nwant = %#v", got, c.pos)
+			}
+		})
+	}
+}
+
+// TestDecodePGPosPreADR0051CompatibleToken pins the additive-field
+// promise: an older sluice persisted a position whose token has only
+// {slot, lsn} (no systemid/timeline). decodePGPos must accept it
+// cleanly, populating SystemID="" and Timeline=0 — the sentinel
+// values the resume path uses to engage lazy pin-install
+// (ADR-0051). Without this pin, a JSON-schema tightening could
+// silently break in-flight upgrades.
+func TestDecodePGPosPreADR0051CompatibleToken(t *testing.T) {
+	// The exact JSON shape pre-ADR-0051 sluice wrote: just slot + lsn,
+	// no systemid / timeline keys at all.
+	legacy := ir.Position{
+		Engine: engineNamePostgres,
+		Token:  `{"slot":"sluice_slot","lsn":"0/16B7350"}`,
+	}
+	got, ok, err := decodePGPos(legacy)
+	if err != nil {
+		t.Fatalf("decode legacy token: %v", err)
+	}
+	if !ok {
+		t.Fatal("decode legacy token: ok=false; want true")
+	}
+	if got.Slot != "sluice_slot" || got.LSN != "0/16B7350" {
+		t.Errorf("slot/lsn round-trip\n got = %+v\nwant = slot=sluice_slot, lsn=0/16B7350", got)
+	}
+	if got.SystemID != "" {
+		t.Errorf("legacy token must decode with SystemID=\"\" (sentinel for lazy-install); got %q", got.SystemID)
+	}
+	if got.Timeline != 0 {
+		t.Errorf("legacy token must decode with Timeline=0 (sentinel for lazy-install); got %d", got.Timeline)
+	}
+}
+
+// TestEncodePGPosOmitsZeroIdentityFields documents the wire-format
+// contract: when SystemID is empty and Timeline is zero, the encoded
+// JSON MUST NOT include those keys (omitempty). This keeps positions
+// emitted by code paths that don't have a live IDENTIFY_SYSTEM (e.g.
+// the cdc-snapshot path, the change-applier schema-cache path) byte-
+// identical to pre-ADR-0051 sluice — a load-bearing invariant for
+// "older positions are accepted unchanged" working in both
+// directions.
+func TestEncodePGPosOmitsZeroIdentityFields(t *testing.T) {
+	got, err := encodePGPos(pgPos{Slot: "s1", LSN: "0/1"})
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	if strings.Contains(got.Token, "systemid") {
+		t.Errorf("token contains \"systemid\" key with zero value: %q", got.Token)
+	}
+	if strings.Contains(got.Token, "timeline") {
+		t.Errorf("token contains \"timeline\" key with zero value: %q", got.Token)
+	}
+}
+
+// TestCheckSourceIdentity exercises the ADR-0051 divergence detector:
+// match (silent), pre-ADR-0051 sentinel (lazy install — silent),
+// timeline mismatch (refuse), sysid mismatch (refuse). The refusal
+// MUST wrap ir.ErrPositionInvalid so the streamer's existing
+// ADR-0022 fall-through path can re-route to cold-start, and MUST
+// name both old and new (sysid, timeline) so operators can confirm
+// the divergence matches their intended PITR/promotion event.
+func TestCheckSourceIdentity(t *testing.T) {
+	cases := []struct {
+		name           string
+		persistedSysID string
+		persistedTL    int32
+		liveSysID      string
+		liveTL         int32
+		wantErr        bool
+		wantContains   []string
+	}{
+		{
+			name:           "exact match — silent pass",
+			persistedSysID: "7351234567890123456",
+			persistedTL:    1,
+			liveSysID:      "7351234567890123456",
+			liveTL:         1,
+			wantErr:        false,
+		},
+		{
+			name:           "pre-ADR-0051 sentinel — lazy-install silent pass",
+			persistedSysID: "",
+			persistedTL:    0,
+			liveSysID:      "7351234567890123456",
+			liveTL:         1,
+			wantErr:        false,
+		},
+		{
+			name:           "timeline diverges (promotion / PITR same-cluster) — refuse",
+			persistedSysID: "7351234567890123456",
+			persistedTL:    1,
+			liveSysID:      "7351234567890123456",
+			liveTL:         2,
+			wantErr:        true,
+			wantContains:   []string{"systemid=\"7351234567890123456\"", "timeline=1", "timeline=2", "PITR"},
+		},
+		{
+			name:           "sysid diverges (pointed at wrong instance) — refuse",
+			persistedSysID: "7351234567890123456",
+			persistedTL:    1,
+			liveSysID:      "9999999999999999999",
+			liveTL:         1,
+			wantErr:        true,
+			wantContains:   []string{"systemid=\"7351234567890123456\"", "systemid=\"9999999999999999999\"", "different instance"},
+		},
+		{
+			name:           "both diverge — refuse (e.g. failover to a fresh primary)",
+			persistedSysID: "7351234567890123456",
+			persistedTL:    1,
+			liveSysID:      "9999999999999999999",
+			liveTL:         2,
+			wantErr:        true,
+			wantContains:   []string{"systemid=\"7351234567890123456\"", "timeline=1", "systemid=\"9999999999999999999\"", "timeline=2"},
+		},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			err := checkSourceIdentity(context.Background(), "sluice_slot", c.persistedSysID, c.persistedTL, c.liveSysID, c.liveTL)
+			if c.wantErr {
+				if err == nil {
+					t.Fatal("expected error; got nil")
+				}
+				if !errors.Is(err, ir.ErrPositionInvalid) {
+					t.Errorf("error must wrap ir.ErrPositionInvalid so the streamer's ADR-0022 fall-through engages; got: %v", err)
+				}
+				for _, sub := range c.wantContains {
+					if !strings.Contains(err.Error(), sub) {
+						t.Errorf("error message missing substring %q\nfull message: %s", sub, err.Error())
+					}
+				}
+				// Operator recovery hint must name the slot.
+				if !strings.Contains(err.Error(), "sluice_slot") {
+					t.Errorf("error must name the slot for the operator recovery command; got: %s", err.Error())
+				}
+				if !strings.Contains(err.Error(), "sluice slot drop") {
+					t.Errorf("error must point at the slot-drop recovery command; got: %s", err.Error())
+				}
+			} else if err != nil {
+				t.Errorf("unexpected error: %v", err)
 			}
 		})
 	}

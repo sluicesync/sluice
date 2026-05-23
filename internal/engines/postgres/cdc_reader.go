@@ -102,6 +102,18 @@ type CDCReader struct {
 	// a tracker).
 	appliedLSN *lsnTracker
 
+	// systemID and timeline pin the source's identity (ADR-0051,
+	// research finding F5). Populated from IDENTIFY_SYSTEM at the
+	// start of each StreamChanges call. Emitted on every change's
+	// Position so a subsequent reconnect can compare the persisted
+	// pin against what the new connection's IDENTIFY_SYSTEM reports.
+	// After a source-side PITR or standby promotion the (sysid,
+	// timeline) tuple changes; without this pin, sluice would
+	// silently advance LSN values that live in a different timeline's
+	// reference frame — silent-loss class.
+	systemID string
+	timeline int32
+
 	// mu guards err. The pump writes; callers read via Err after
 	// the channel closes.
 	mu  sync.Mutex
@@ -263,6 +275,14 @@ func (r *CDCReader) StreamChanges(ctx context.Context, from ir.Position) (<-chan
 // it does. A non-empty position must reference an existing slot —
 // silently re-creating one would skip changes between the recorded
 // LSN and "now".
+//
+// IDENTIFY_SYSTEM is invoked on BOTH paths (cold-start and resume):
+// its (systemid, timeline) reply pins the source's identity so the
+// reader can refuse loudly when a subsequent reconnect lands on a
+// source whose identity has changed — post-PITR, post-promotion, or
+// the operator pointed sluice at the wrong instance. Without the pin
+// sluice would silently advance LSN values that live in a different
+// timeline's reference frame (ADR-0051, research finding F5).
 func (r *CDCReader) resolveStartPosition(
 	ctx context.Context,
 	conn *pgconn.PgConn,
@@ -274,14 +294,45 @@ func (r *CDCReader) resolveStartPosition(
 		return 0, err
 	}
 
+	// IDENTIFY_SYSTEM runs unconditionally so every StreamChanges call
+	// captures the current source identity. Run BEFORE the slot
+	// existence check on the resume path so a diverged source surfaces
+	// the identity-mismatch error rather than a slot-missing error
+	// (which would be misleading — the slot may genuinely exist on the
+	// new source).
+	sysident, err := pglogrepl.IdentifySystem(ctx, conn)
+	if err != nil {
+		return 0, fmt.Errorf("postgres: IDENTIFY_SYSTEM: %w", err)
+	}
+	r.systemID = sysident.SystemID
+	r.timeline = sysident.Timeline
+
 	if ok {
-		// Resume path: caller provided a {slot, lsn}. Verify slot
-		// matches and exists, then start at the supplied LSN.
+		// Resume path: caller provided a {slot, lsn[, sysid, timeline]}.
+		// Verify slot matches and exists, then start at the supplied LSN.
 		if decoded.Slot != r.slotName {
 			return 0, fmt.Errorf(
 				"postgres: position references slot %q but reader is configured with slot %q",
 				decoded.Slot, r.slotName,
 			)
+		}
+		// Source-identity pin check. If the persisted position carries a
+		// (sysid, timeline) pair, the live source's reply MUST match
+		// exactly — divergence indicates a PITR / promotion / wrong
+		// instance, and any LSN comparison across the boundary is
+		// silently meaningless (different timelines have independent
+		// LSN reference frames). Refuse loudly, wrapping
+		// ErrPositionInvalid so the pipeline orchestrator can route
+		// the error through the ADR-0022 cold-start fall-through path
+		// (the only recovery for a position that no longer points at
+		// the same database).
+		//
+		// Positions persisted by pre-ADR-0051 sluice have empty
+		// SystemID/Timeline and are accepted unchanged: a one-time INFO
+		// log notes that the pin is being installed lazily. Subsequent
+		// reconnects must match the now-pinned identity.
+		if err := checkSourceIdentity(ctx, r.slotName, decoded.SystemID, decoded.Timeline, sysident.SystemID, sysident.Timeline); err != nil {
+			return 0, err
 		}
 		info, err := slotInfo(ctx, r.db, r.slotName)
 		if err != nil {
@@ -326,10 +377,6 @@ func (r *CDCReader) resolveStartPosition(
 			return 0, err
 		}
 		*slotJustCreated = true
-	}
-	sysident, err := pglogrepl.IdentifySystem(ctx, conn)
-	if err != nil {
-		return 0, fmt.Errorf("postgres: IDENTIFY_SYSTEM: %w", err)
 	}
 	return sysident.XLogPos, nil
 }
@@ -379,6 +426,50 @@ func checkSlotUsable(info *slotState) error {
 			info.SlotName, info.WALStatus,
 		)
 	}
+}
+
+// checkSourceIdentity compares a persisted (systemid, timeline) pin
+// against the live source's IDENTIFY_SYSTEM reply (ADR-0051, research
+// finding F5). Returns:
+//
+//   - nil when the pin matches the live values, or when the persisted
+//     position is from pre-ADR-0051 sluice (empty SystemID, zero
+//     Timeline). The lazy-install case emits a one-time INFO log so
+//     operators can see the pin going in.
+//   - an error wrapping [ir.ErrPositionInvalid] when the pin diverges
+//     from live. Wrapping the sentinel routes the error through the
+//     ADR-0022 cold-start fall-through (the only recovery for a
+//     position that no longer points at the same database — different
+//     timelines have independent LSN reference frames, so cross-
+//     timeline LSN comparisons are silently meaningless and the
+//     persisted LSN cannot be resumed).
+//
+// The error message names both the OLD and NEW (systemid, timeline)
+// pairs so operators have enough information to confirm whether the
+// divergence matches their intended PITR or promotion event.
+func checkSourceIdentity(ctx context.Context, slotName, persistedSysID string, persistedTimeline int32, liveSysID string, liveTimeline int32) error {
+	if persistedSysID == "" && persistedTimeline == 0 {
+		// Lazy-install case: pre-ADR-0051 position. Accept and log.
+		slog.InfoContext(
+			ctx, "postgres: cdc: source-identity pin installed lazily from IDENTIFY_SYSTEM (pre-ADR-0051 persisted position lacked it)",
+			slog.String("slot", slotName),
+			slog.String("systemid", liveSysID),
+			slog.Int("timeline", int(liveTimeline)),
+		)
+		return nil
+	}
+	if persistedSysID == liveSysID && persistedTimeline == liveTimeline {
+		return nil
+	}
+	return fmt.Errorf(
+		"postgres: source identity has changed: persisted position pinned (systemid=%q, timeline=%d) but live source reports (systemid=%q, timeline=%d); "+
+			"this indicates a source-side PITR, standby promotion, or that sluice is now pointed at a different instance — "+
+			"the persisted LSN belongs to a different timeline's reference frame and is no longer valid. "+
+			"To recover: confirm the change matches your intended PITR/promotion event, then drop the slot and persisted position so a fresh cold-start runs against the new source — "+
+			"`sluice slot drop %s --source-driver=postgres --source ...` then restart with empty position (forces a fresh snapshot): %w",
+		persistedSysID, persistedTimeline, liveSysID, liveTimeline,
+		slotName, ir.ErrPositionInvalid,
+	)
 }
 
 // pump is the event loop. Owns the replication connection from this
@@ -1002,8 +1093,20 @@ func (r *CDCReader) emitTruncate(
 // positionAt is a thin wrapper over [encodePGPos] specialised to the
 // reader's slot. Each emitted Change carries this so resume points
 // at the start of the change's transaction.
+//
+// The reader's pinned (systemID, timeline) — captured from
+// IDENTIFY_SYSTEM at stream-start — is propagated onto every emitted
+// position so that on a subsequent reconnect, [resolveStartPosition]
+// can compare the persisted pin against the new connection's
+// IDENTIFY_SYSTEM reply and refuse loudly on divergence
+// (ADR-0051, research finding F5).
 func (r *CDCReader) positionAt(lsn pglogrepl.LSN) (ir.Position, error) {
-	return encodePGPos(pgPos{Slot: r.slotName, LSN: lsn.String()})
+	return encodePGPos(pgPos{
+		Slot:     r.slotName,
+		LSN:      lsn.String(),
+		SystemID: r.systemID,
+		Timeline: r.timeline,
+	})
 }
 
 // ackLSN picks the LSN to advertise to the upstream slot. When an

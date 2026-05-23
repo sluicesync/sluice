@@ -17,16 +17,31 @@ import (
 // JSON-serialised into [ir.Position.Token] when surfaced to the IR;
 // the IR contract treats Token as opaque.
 //
-// Resume requires both fields:
+// Resume requires both core fields:
 //
 //   - Slot binds the server-side WAL retention. Without the slot the
 //     LSN may already have been recycled.
 //   - LSN is the confirmed-flush position to resume after, encoded
 //     in the canonical Postgres "X/XXXXXXXX" form pglogrepl.LSN
 //     emits via String().
+//
+// The SystemID and Timeline fields pin the source's identity (ADR-0051,
+// finding F5 of the PG-internals research). They are populated from
+// IDENTIFY_SYSTEM at stream-start; on subsequent reconnects the reader
+// re-runs IDENTIFY_SYSTEM and refuses loudly when they diverge —
+// otherwise sluice would silently advance LSN values that live in a
+// different timeline's reference frame after a source-side PITR or
+// standby promotion (silent-loss class).
+//
+// Both fields are additive: positions persisted by pre-ADR-0051 sluice
+// have empty SystemID/Timeline and are accepted unchanged on the first
+// reconnect — the pin is installed lazily with a one-time INFO log,
+// after which subsequent reconnects must match exactly.
 type pgPos struct {
-	Slot string `json:"slot"`
-	LSN  string `json:"lsn"`
+	Slot     string `json:"slot"`
+	LSN      string `json:"lsn"`
+	SystemID string `json:"systemid,omitempty"`
+	Timeline int32  `json:"timeline,omitempty"`
 }
 
 // engineNamePostgres is the [ir.Position.Engine] tag this engine
