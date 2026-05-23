@@ -305,6 +305,8 @@ func TestCDCReader_SourceIdentityPin_LegacyPositionLazyInstalls(t *testing.T) {
 	if c, ok := rdr1.(interface{ Close() error }); ok {
 		_ = c.Close()
 	}
+	cancel1()
+	waitForSlotInactive(t, dsn, "sluice_slot", 30*time.Second)
 	decoded, ok, err := decodePGPos(captured)
 	if err != nil || !ok {
 		t.Fatalf("decode captured position: ok=%v err=%v", ok, err)
