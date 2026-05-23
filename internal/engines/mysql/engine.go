@@ -65,7 +65,7 @@ func (e Engine) Capabilities() ir.Capabilities { return e.Flavor.capabilities() 
 // identified by dsn. The caller is responsible for closing the
 // returned SchemaReader (via its Close method) to release the
 // underlying connection pool.
-func (Engine) OpenSchemaReader(ctx context.Context, dsn string) (ir.SchemaReader, error) {
+func (e Engine) OpenSchemaReader(ctx context.Context, dsn string) (ir.SchemaReader, error) {
 	cfg, err := parseDSN(dsn)
 	if err != nil {
 		return nil, err
@@ -74,7 +74,7 @@ func (Engine) OpenSchemaReader(ctx context.Context, dsn string) (ir.SchemaReader
 	if err != nil {
 		return nil, err
 	}
-	return &SchemaReader{db: db, schema: cfg.DBName}, nil
+	return &SchemaReader{db: db, schema: cfg.DBName, flavor: e.Flavor}, nil
 }
 
 // OpenSchemaWriter returns a [SchemaWriter] bound to the database

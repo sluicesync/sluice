@@ -21,6 +21,15 @@ import (
 type SchemaReader struct {
 	db     *sql.DB
 	schema string // database name to read
+
+	// flavor records the engine flavor (vanilla MySQL, PlanetScale)
+	// the reader was opened under. Threaded in by [Engine.OpenSchemaReader]
+	// so optional surfaces (ADR-0056 diagnose probe, future flavor-
+	// specific probes) can declare flavor-accurate capabilities
+	// without re-deriving them. Zero value = FlavorVanilla, which
+	// preserves the historical behaviour of every reader that
+	// pre-dates this field.
+	flavor Flavor
 }
 
 // Close releases the underlying connection pool.

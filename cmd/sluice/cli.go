@@ -47,15 +47,16 @@ type CLI struct {
 	// supplied via kong.Vars{"version": ...} in main().
 	Version kong.VersionFlag `help:"Print version and exit." short:"V"`
 
-	Engines EnginesCmd `cmd:"" help:"List registered database engines."`
-	Migrate MigrateCmd `cmd:"" help:"Run a one-time schema + data migration (simple mode)."`
-	Sync    SyncCmd    `cmd:"" help:"Manage continuous-sync streams."`
-	Slot    SlotCmd    `cmd:"" help:"Manage source-side replication slots (Postgres)."`
-	Schema  SchemaCmd  `cmd:"" help:"Inspect and describe schemas (preview translation, etc.)."`
-	Verify  VerifyCmd  `cmd:"" help:"Verify data integrity between source and target (v0.12.0+ count mode)."`
-	Backup  BackupCmd  `cmd:"" help:"Take and verify logical backups (Phase 1: full snapshot to local filesystem)."`
-	Restore RestoreCmd `cmd:"" help:"Restore a logical backup into a target database."`
-	Matview MatviewCmd `cmd:"" help:"Operate on PostgreSQL materialized views (refresh; PG-only)."`
+	Engines  EnginesCmd  `cmd:"" help:"List registered database engines."`
+	Migrate  MigrateCmd  `cmd:"" help:"Run a one-time schema + data migration (simple mode)."`
+	Sync     SyncCmd     `cmd:"" help:"Manage continuous-sync streams."`
+	Slot     SlotCmd     `cmd:"" help:"Manage source-side replication slots (Postgres)."`
+	Schema   SchemaCmd   `cmd:"" help:"Inspect and describe schemas (preview translation, etc.)."`
+	Verify   VerifyCmd   `cmd:"" help:"Verify data integrity between source and target (v0.12.0+ count mode)."`
+	Backup   BackupCmd   `cmd:"" help:"Take and verify logical backups (Phase 1: full snapshot to local filesystem)."`
+	Restore  RestoreCmd  `cmd:"" help:"Restore a logical backup into a target database."`
+	Matview  MatviewCmd  `cmd:"" help:"Operate on PostgreSQL materialized views (refresh; PG-only)."`
+	Diagnose DiagnoseCmd `cmd:"" help:"Assemble an operator-bundle (cockroach-debug-zip-shape) for filing GitHub issues. ADR-0056."`
 }
 
 // EnginesCmd lists the database engines registered in the binary,
@@ -131,6 +132,8 @@ type MigrateCmd struct {
 
 	Redact       []string `help:"Redact a PII column (repeatable). Format: '[schema.]table.column=STRATEGY[:options]'. Strategies: null (NULLABLE columns only), static:<value>, hash:sha256, hash:hmac-sha256[:<keyname>] (requires --keyset-source), truncate:<n>, mask:inner:<m1>,<m2>[,<char>], mask:outer:<m1>,<m2>[,<char>], mask:ssn, mask:pan, mask:pan-relaxed, mask:email, mask:ca-sin, mask:uk-nin, mask:iban, mask:uuid (Phase 2.b country/format presets, v0.57.0+), randomize:int:<min>,<max>, randomize:email, randomize:us-phone, randomize:uuid (Phase 2.c first wave, v0.59.0+), randomize:ssn, randomize:pan[:<brand>], randomize:ca-sin, randomize:uk-nin, randomize:iban[:<country-code>] (Phase 2.c second wave, v0.60.0+; brand: visa|mastercard|amex; country: DE|GB|FR; all randomize:* require a PK on the source table), randomize:dict:<name>, tokenize:dict:<name>[:<keyname>] (Phase 3 v0.61.0+, keyset-sourced in Phase 4 v0.62.0+; dictionaries declared in YAML 'dictionaries:' block — CLI form REQUIRES YAML config to declare the dictionary content). Examples: --redact users.email=hash:sha256, --redact users.pan=mask:pan, --redact users.id=mask:uuid, --redact users.age=randomize:int:18,90, --redact users.first_name=tokenize:dict:first_names. Bulk-copy + CDC paths both honour --redact. YAML form available under config 'redactions:' block. See docs/dev/notes/prep-pii-redaction-phase-1.md." placeholder:"RULE" sep:"none"`
 	KeysetSource string   `help:"Operator keyset source for keyset-using redaction strategies (hash:hmac-sha256, tokenize:dict). PII Phase 4 (ADR-0041). Forms: 'file:PATH' (keyset YAML on disk), 'env:VARNAME' (keyset YAML in an env var), 'db:DSN' (sluice_keysets table on the named DSN — shared across streams for cross-stream surrogate stability). Resolved ONCE at startup; rotation takes effect on next process restart only (no hot-reload). Required when any --redact / YAML rule uses hash:hmac-sha256 or tokenize:dict — the Phase 1 --redact-key-source flag and the built-in v0.61.0 tokenize key were removed." placeholder:"SRC"`
+
+	CrashHookFlags
 }
 
 // Run implements the migrate subcommand.
@@ -244,7 +247,16 @@ func (m *MigrateCmd) Run(g *Globals) error {
 	mig.Redactor = redactor
 	logKeysetLoaded(keyset)
 	logRedactionConfig(redactor, "migrate")
-	return mig.Run(kongContext())
+	// ADR-0056 auto-on-crash hook (opt-in). When
+	// --diagnose-on-crash-dir is set, the hook writes a bundle to the
+	// directory if Run returns an error. The hook NEVER masks the
+	// original error per the loud-failure tenet.
+	crashWrap, err := installCrashHook(m.CrashHookFlags,
+		crashHookRequestForStreamer(m.MigrationID, source, target, m.Source, m.Target, ""))
+	if err != nil {
+		return err
+	}
+	return crashWrap(mig.Run(kongContext()))
 }
 
 // resolveTableFilterArgs picks the include/exclude list to use,
@@ -526,6 +538,8 @@ type SyncStartCmd struct {
 
 	Redact       []string `help:"Redact a PII column (repeatable). Format: '[schema.]table.column=STRATEGY[:options]'. Strategies: null (NULLABLE columns only), static:<value>, hash:sha256, hash:hmac-sha256[:<keyname>] (requires --keyset-source), truncate:<n>, mask:inner:<m1>,<m2>[,<char>], mask:outer:<m1>,<m2>[,<char>], mask:ssn, mask:pan, mask:pan-relaxed, mask:email, mask:ca-sin, mask:uk-nin, mask:iban, mask:uuid (Phase 2.b country/format presets, v0.57.0+), randomize:int:<min>,<max>, randomize:email, randomize:us-phone, randomize:uuid (Phase 2.c first wave, v0.59.0+), randomize:ssn, randomize:pan[:<brand>], randomize:ca-sin, randomize:uk-nin, randomize:iban[:<country-code>] (Phase 2.c second wave, v0.60.0+; brand: visa|mastercard|amex; country: DE|GB|FR; all randomize:* require a PK on the source table), randomize:dict:<name>, tokenize:dict:<name>[:<keyname>] (Phase 3 v0.61.0+, keyset-sourced in Phase 4 v0.62.0+; dictionaries declared in YAML 'dictionaries:' block — CLI form REQUIRES YAML config to declare the dictionary content). Examples: --redact users.email=hash:sha256, --redact users.pan=mask:pan, --redact users.id=mask:uuid, --redact users.age=randomize:int:18,90, --redact users.first_name=tokenize:dict:first_names. Phase 1.5 (v0.54.0+): redaction covers BOTH cold-start bulk-copy AND mid-stream CDC events. Bare 'users.email' matches any source schema; schema-qualified 'public.users.email' takes precedence when both registered. See docs/dev/notes/prep-pii-redaction-phase-1.md." placeholder:"RULE" sep:"none"`
 	KeysetSource string   `help:"Operator keyset source for keyset-using redaction strategies (hash:hmac-sha256, tokenize:dict). PII Phase 4 (ADR-0041). Forms: 'file:PATH' (keyset YAML on disk), 'env:VARNAME' (keyset YAML in an env var), 'db:DSN' (sluice_keysets table on the named DSN — shared across streams for cross-stream surrogate stability). Resolved ONCE at startup; rotation takes effect on next process restart only (no hot-reload). Required when any --redact / YAML rule uses hash:hmac-sha256 or tokenize:dict — the Phase 1 --redact-key-source flag and the built-in v0.61.0 tokenize key were removed." placeholder:"SRC"`
+
+	CrashHookFlags
 }
 
 // Run implements `sluice sync start`.
@@ -776,7 +790,16 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 	streamer.Redactor = redactor
 	logKeysetLoaded(keyset)
 	logRedactionConfig(redactor, "sync start")
-	return streamer.Run(kongContext())
+	// ADR-0056 auto-on-crash hook (opt-in). When
+	// --diagnose-on-crash-dir is set, the hook writes a bundle to the
+	// directory if Run returns an error. The hook NEVER masks the
+	// original error per the loud-failure tenet.
+	crashWrap, err := installCrashHook(s.CrashHookFlags,
+		crashHookRequestForStreamer(s.StreamID, source, target, s.Source, s.Target, s.SlotName))
+	if err != nil {
+		return err
+	}
+	return crashWrap(streamer.Run(kongContext()))
 }
 
 // SyncStatusCmd reports the state of every continuous-sync stream
