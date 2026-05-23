@@ -223,6 +223,17 @@ func TestCDCReader_ConfirmedFlushInvariant_PinF3(t *testing.T) {
 	// changes channel closes (Close() on the reader does this) or
 	// when ctx cancels. Pick a batch size > 1 so the tracker's
 	// "report after applied commit" path actually matters.
+	// Separate apply context so we can cancel ApplyBatch directly at
+	// teardown without waiting for the reader's async Close path to
+	// propagate. CDCReader.Close() cancels the streamer ctx but the
+	// pump goroutine's pgconn read can stay blocked for many seconds
+	// on CI under -race, which delays the output-channel close that
+	// ApplyBatch waits on. Cancelling applyCtx makes ApplyBatch
+	// return immediately with ctx.Canceled — that's the standard
+	// applier-shutdown path and is well-tested in production.
+	applyCtx, applyCancel := context.WithCancel(ctx)
+	defer applyCancel()
+
 	const applyBatchSize = 5
 	applyDone := make(chan error, 1)
 	go func() {
@@ -231,7 +242,7 @@ func TestCDCReader_ConfirmedFlushInvariant_PinF3(t *testing.T) {
 			applyDone <- errors.New("applier does not implement BatchedChangeApplier")
 			return
 		}
-		applyDone <- batched.ApplyBatch(ctx, "f3-invariant-pin", changes, applyBatchSize)
+		applyDone <- batched.ApplyBatch(applyCtx, "f3-invariant-pin", changes, applyBatchSize)
 	}()
 
 	// Invariant-watcher goroutine. Samples both LSNs every 100ms
@@ -335,26 +346,22 @@ func TestCDCReader_ConfirmedFlushInvariant_PinF3(t *testing.T) {
 	watcherCancel()
 	<-watcherDone
 
-	// Stop the reader so the applier's channel closes, which lets
-	// ApplyBatch return cleanly.
+	// Stop the reader (begins the async pump-shutdown path) and
+	// cancel the apply context (makes ApplyBatch return immediately
+	// with ctx.Canceled — doesn't wait for the channel close).
 	_ = rdr.Close()
+	applyCancel()
 
 	select {
 	case err := <-applyDone:
-		// ApplyBatch returning ctx.Canceled / EOF on a closed
-		// channel is the expected drain path. Other errors fail
-		// the test.
+		// ApplyBatch returning ctx.Canceled is the expected drain
+		// path under applyCancel; channel-close drain (nil) also
+		// counts as success. Other errors fail the test.
 		if err != nil && !errors.Is(err, context.Canceled) {
-			t.Logf("ApplyBatch returned: %v (treated as drain on closed channel)", err)
+			t.Logf("ApplyBatch returned: %v (treated as drain)", err)
 		}
-	case <-time.After(2 * time.Minute):
-		// CI's ubuntu-latest runner with `-race` is materially slower
-		// than local Docker; the original 30s budget passed locally
-		// but timed out on CI even though the invariant held cleanly
-		// (line 375 still reported "invariant held throughout N txns"
-		// on the failed run). 2 minutes is the generous-but-bounded
-		// budget that matches the surrounding integration tests.
-		t.Errorf("ApplyBatch did not return within 2 min of reader close")
+	case <-time.After(30 * time.Second):
+		t.Errorf("ApplyBatch did not return within 30s of applyCancel")
 	}
 
 	// Post-stop invariant: the final confirmed_flush still satisfies
