@@ -6,6 +6,10 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Tests
+
+- **`test(pipeline): shard_consolidation_lease_gc_end_to_end_integration_test.go`** (task #39) — closes the "known gap" v0.77.1's `### Tests` block flagged. New real-engine ChangeApplier integration pin (`TestSweepFiresEndToEnd_OnRealPGEngagement`) exercises the streamer-side wire-up of the v0.76.0 lease GC sweep end-to-end against a real PG container: drives `engageShardCoordination` with a REAL `postgres.Engine` as both Source (the `ir.PositionOrderer` surface — Bug 85.b's load-bearing assertion site) and Target, plus a REAL `postgres.ChangeApplier` (the lease store / lister / deleter surface) — no stubs anywhere on the lease-coordination path. Compile-pins `mgr.gcDeps != nil` plus each of the four fields non-nil; would have caught Bug 85 (missing wire-up) AND Bug 85.b (orderer on wrong surface) immediately. Drives an eligible lease through APPLIED state with a populated anchor, writes a `sluice_cdc_state` row whose LSN is past the anchor, acquires a second never-Applied lease to keep a heartbeat goroutine alive, then polls (300ms sweep cadence via `gcEveryNTicks=3` + `RetryPeriod=100ms`) until the heartbeat-driven sweep deletes the row. Test-only addition; no production code change. **The regression guard for the Bug 85 saga's test/production surface-mismatch class** — every prior pin (unit fakes calling `SweepConsolidationLeases` directly, the v0.76.0 PG integration test driving the sweep function directly, v0.77.0's stub-based engagement pin) bypassed the production glue, which is why the bug shipped across three releases.
+
 ## [0.77.1] - 2026-05-23
 
 ### Fixed
