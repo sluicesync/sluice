@@ -6,6 +6,20 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.77.1] - 2026-05-23
+
+### Fixed
+
+- **`fix(pipeline): Bug 85.b — assert PositionOrderer on s.Source not applier (#38)`**. v0.77.0's Bug 85 fix attempt added `mgr.WithGC(...)` wiring to `engageShardCoordination` but used the wrong type-assertion surface: `applier.(ir.PositionOrderer)`. `PositionAtOrAfter` is defined on the `Engine` factory type (e.g. `internal/engines/postgres/position_orderer.go:33` — `func (Engine) PositionAtOrAfter(...)`), NOT on `*ChangeApplier`. Type-assertion silently failed on every real engine → `gcDeps` stayed nil → heartbeat-loop guard evaluated false → sweep STILL dead code. **Same Bug 85 failure mode, second cycle.** The v0.77.0 unit pin test passed because `supportingApplier` stubbed `PositionAtOrAfter` on itself — test/production surface mismatch hiding the real gap. v0.77.1 asserts the orderer on `s.Source.(ir.PositionOrderer)` (the source engine, where the orderer actually lives); the supportingApplier's misleading orderer stub is REMOVED (it was actively misleading); `stubNamedEngine` gains a `PositionAtOrAfter` method so the pin test's `s.Source` assertion succeeds at the right surface; new `TestEngage_NoGCWhenSourceLacksOrderer` pin guards the no-GC default when a future engine doesn't ship a PositionOrderer.
+
+### Tests
+
+- **`test(pipeline): shard_consolidation_engage_test.go`** — updated Bug 85 pins to assert on the right surfaces (orderer on engine, lister+deleter on applier). New `TestEngage_NoGCWhenSourceLacksOrderer` regression guard for the no-GC default. **Known gap**: a real-engine ChangeApplier integration test that exercises the heartbeat-fires-sweep path end-to-end is still missing — without it, future regressions of this test/production surface-mismatch class can hide for another release cycle. Tracked as a follow-up.
+
+### Compatibility
+
+- **Drop-in upgrade from v0.77.0.** Behaviour change: lease GC sweep now actually fires (it was claimed-but-dead in both v0.76.0 and v0.77.0). Operators with accumulated lease rows from v0.76.0+ deployments see them GC'd on the next heartbeat sweep (every ~5 min) after upgrading. Severity b/c — operational regression closure, NOT silent-loss-class.
+
 ## [0.77.0] - 2026-05-23
 
 ### Added
