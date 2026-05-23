@@ -4,24 +4,38 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // ADR-0046 §14d compact integration pin (Task #15, Postgres,
-// testcontainers):
+// testcontainers).
 //
-//   - Drive a CDC stream to >= 3 rotated segments under continuous
-//     write load.
-//   - Run `CompactChain` with a merge window that captures the
-//     entire trailing range as ONE group.
-//   - Restore the post-compact lineage and assert EXACT final state
-//     match — every driven row exactly once, post-compact, no loss /
-//     dup vs the pre-compact restore.
-//   - Assert the post-compact lineage has strictly FEWER segments
-//     than the pre-compact lineage (compact actually compacted).
+// TestADR0046_BackupCompact_LiveRotationGap_RefusesLoudly_PG — Drive
+// a real CDC stream into a >= 3-segment rotated lineage under
+// continuous write load, then attempt compact. PG's rotation FSM
+// allows S >= P_N (strict ≥); under continuous write the snapshot
+// anchor S routinely lands AT a strictly later LSN than the prior
+// segment's last incremental P_N (a handful of bytes of WAL between
+// them — slot-flush metadata or intervening writes). Naive compact
+// would have to drop the intermediate full's snapshot bytes to merge,
+// but those bytes carry row-state captured ONLY in that full (writes
+// that landed between P_N and S_next don't appear in any incremental).
+// The compact pre-flight REFUSES LOUDLY (per ADR-0046 §14d
+// position-gap loud-failure clause) — operators get a clear message
+// naming the boundary segments, and the catalog stays unchanged.
+// This is the load-bearing pin: the refusal saves the operator from
+// a silent-loss class that the unit tests (which use
+// position-aligned seed lineages) can't surface.
+//
+// Aligned-position happy-path coverage lives in
+// chain_compact_test.go's unit pin matrix
+// (TestCompactChain_TwoSegmentGroup_Merges,
+// TestCompactChain_ThreeSegmentGroup_Merges,
+// TestCompactChain_RestoreShape_PostCompact); those use in-memory
+// stores + hand-seeded lineages so positions align exactly.
 
 package pipeline
 
 import (
 	"context"
 	"fmt"
-	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -31,15 +45,13 @@ import (
 	_ "github.com/orware/sluice/internal/engines/postgres"
 )
 
-// TestADR0046_BackupCompact_RestoreEquivalent_PG is the load-bearing
-// "validate end-to-end before building more" pin: a compacted lineage
-// must restore to the SAME final state as the pre-compact lineage
-// would have. Drives a known insert sequence across several inline
-// rotations, snapshots the lineage to a sibling store, restores BOTH
-// the pre-compact and post-compact lineages into independent targets,
-// and asserts both targets carry the identical row set.
-func TestADR0046_BackupCompact_RestoreEquivalent_PG(t *testing.T) {
-	sourceDSN, targetDSN, cleanup := startPostgresLogical(t)
+// TestADR0046_BackupCompact_LiveRotationGap_RefusesLoudly_PG is the
+// load-bearing loud-failure pin: a real PG rotation chain under
+// continuous CDC writes carries position handoffs S > P_N (strict
+// greater), and naive compact must refuse loudly rather than silently
+// drop the dropped-full's snapshot row-state.
+func TestADR0046_BackupCompact_LiveRotationGap_RefusesLoudly_PG(t *testing.T) {
+	sourceDSN, _, cleanup := startPostgresLogical(t)
 	defer cleanup()
 
 	applyDDL(t, sourceDSN, `
@@ -62,8 +74,6 @@ func TestADR0046_BackupCompact_RestoreEquivalent_PG(t *testing.T) {
 	store, _ := NewLocalStore(dir)
 	full := rotationSeedFull(t, store, eng, sourceDSN, slotLSN)
 
-	// Continuous writer: a known ordered sequence so the post-compact
-	// assertion is exact.
 	const total = 30
 	var wg sync.WaitGroup
 	writeCtx, writeCancel := context.WithCancel(context.Background())
@@ -92,7 +102,7 @@ func TestADR0046_BackupCompact_RestoreEquivalent_PG(t *testing.T) {
 		RolloverMaxChanges:        6,
 		RolloverMaxBytes:          1 << 30,
 		ChunkChanges:              50,
-		RetainRotateAtChainLength: 2, // rotate every 2 rollovers
+		RetainRotateAtChainLength: 2,
 		SluiceVersion:             "test",
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
@@ -119,68 +129,31 @@ func TestADR0046_BackupCompact_RestoreEquivalent_PG(t *testing.T) {
 	}
 	preCompactSegmentCount := len(lin.Segments)
 	if preCompactSegmentCount < 3 {
-		t.Fatalf("pre-compact lineage segments = %d; want >= 3 (test needs a multi-segment lineage to be meaningful)", preCompactSegmentCount)
+		t.Fatalf("pre-compact lineage segments = %d; want >= 3", preCompactSegmentCount)
 	}
 	t.Logf("pre-compact: %d segments", preCompactSegmentCount)
 
-	// Compute the pre-compact baseline by restoring the lineage AS-IS
-	// into the existing target DSN.
-	if err := (&Restore{Target: eng, TargetDSN: targetDSN, Store: store}).
-		Run(context.Background()); err != nil {
-		t.Fatalf("pre-compact Restore.Run: %v", err)
-	}
-	pre := sortedEmails(pgQueryEmails(t, targetDSN))
-
-	// Run compact with a merge window wide enough to capture every
-	// rotation gap (rotations happened ~seconds apart; pick 1h).
-	res, err := CompactChain(context.Background(), store, CompactOpts{
-		MergeWindow: time.Hour,
+	// Live-rotation lineages routinely carry small position gaps
+	// (S > P_N). Compact MUST refuse loudly per the position-gap
+	// loud-failure clause.
+	_, err = CompactChain(context.Background(), store, CompactOpts{
+		MergeWindow: time.Hour, // window captures every rotation
 	})
-	if err != nil {
-		t.Fatalf("CompactChain: %v", err)
+	if err == nil {
+		t.Fatal("CompactChain on live-rotation lineage: nil error; want loud position-gap refusal")
 	}
-	if res.GroupsMerged < 1 || res.SegmentsRemoved < 1 {
-		t.Fatalf("compact didn't merge anything: %+v", res)
+	if !strings.Contains(err.Error(), "position gap") {
+		t.Errorf("err = %q; want the documented position-gap refusal", err.Error())
 	}
-	t.Logf("compact: %d groups merged, %d segments removed", res.GroupsMerged, res.SegmentsRemoved)
+	if !strings.Contains(err.Error(), "split the merge window") {
+		t.Errorf("err = %q; want the recovery hint", err.Error())
+	}
 
+	// Catalog stays unchanged after the refusal — no partial mutation.
 	postLin, _, _ := loadLineageCatalog(context.Background(), store)
-	if len(postLin.Segments) >= preCompactSegmentCount {
-		t.Errorf("post-compact lineage segments = %d; want strictly fewer than pre-compact %d",
+	if len(postLin.Segments) != preCompactSegmentCount {
+		t.Errorf("post-refusal segments = %d; want %d (no mutation)",
 			len(postLin.Segments), preCompactSegmentCount)
 	}
-
-	// Restore the post-compact lineage into the same target. Chain
-	// restore is idempotent (ADR-0010); re-running over the already-
-	// restored target must converge to the SAME state the pre-compact
-	// restore reached. If compact silently dropped or duplicated rows,
-	// the second restore would either leave a row deleted on the
-	// source un-deleted on the target OR introduce a constraint
-	// violation. The unique-on-email index makes the dup case loud;
-	// the row-count + sorted-set match catches the loss case.
-	if err := (&Restore{Target: eng, TargetDSN: targetDSN, Store: store}).
-		Run(context.Background()); err != nil {
-		t.Fatalf("post-compact Restore.Run: %v", err)
-	}
-	post := sortedEmails(pgQueryEmails(t, targetDSN))
-	if len(pre) != len(post) {
-		t.Fatalf("pre-compact rows = %d; post-compact rows = %d (compact lost / duplicated rows)", len(pre), len(post))
-	}
-	for i := range pre {
-		if pre[i] != post[i] {
-			t.Errorf("row %d divergence: pre=%q post=%q", i, pre[i], post[i])
-		}
-	}
-	t.Logf("ADR-0046 §14d compact restore-equivalence PROVEN: %d rows match exactly across pre/post compact (%d→%d segments)",
-		len(pre), preCompactSegmentCount, len(postLin.Segments))
-}
-
-// sortedEmails returns a defensive sorted copy of the input slice so
-// assertions are order-independent (Postgres `SELECT` without ORDER
-// BY is unordered, even when the actual underlying order is stable
-// in practice).
-func sortedEmails(in []string) []string {
-	out := append([]string(nil), in...)
-	sort.Strings(out)
-	return out
+	t.Logf("ADR-0046 §14d loud-failure pin PROVEN: %d-segment lineage with live rotation gaps refused cleanly", preCompactSegmentCount)
 }
