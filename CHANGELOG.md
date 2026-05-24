@@ -6,6 +6,8 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.79.0] - 2026-05-24
+
 ### Added
 
 - **`feat(pipeline): online ADD COLUMN forwarding through the CDC apply path (--forward-schema-add-column, --backfill-added-column) (#45 / ADR-0058)`** — Sluice now optionally forwards `ALTER TABLE … ADD COLUMN` from source to target through the live CDC apply path. Two new opt-in flags on `sluice sync start`:
