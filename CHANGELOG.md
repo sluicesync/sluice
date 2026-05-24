@@ -6,6 +6,21 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.78.1] - 2026-05-23
+
+### Fixed
+
+- **`fix(engines/postgres): Bug 86 — extend NormalizeForCDCComparison to cover Nullable + temporal Precision (#41)`** — v0.78.0's RENAME COLUMN classifier refused on any PG schema carrying a nullable `NUMERIC`, `TEXT`, or default-precision temporal column. Same Bug 84-family pgoutput-vs-SchemaReader IR-canonicalization asymmetry, two additional fields the v0.73.2 normalizer didn't cover. **`ir.Column.Nullable`** is the catalogued repro's smoking gun: pgoutput's `RelationMessage` format carries `(name, OID, typmod, key-flag)` only — no `attnotnull` — so `projectRelation` leaves Nullable=false on every CDC-projected column, while cold-start's `SchemaReader.populateColumns` reads `information_schema.columns.is_nullable` faithfully. Any nullable column on the source-side schema triggered `diffAlteredColumn`'s `nullDiffers` branch with a phantom `ShapeKindAlterColumnNullability`, which combined with the RENAME's added=1/dropped=1 into a multi-shape combo refusal. **`ir.DateTime.Precision`** (plus `Time` / `Timestamp`) is a Type-level asymmetry surfaced by the post-fix matrix test: cold-start reads `datetime_precision=6` (PG's default reporting) for a plain `TIMESTAMP`; CDC's `temporalTypmod(-1)` returns 0. `diffAlteredColumn` fires `ShapeKindAlterColumnType` on the mismatch. Fix extends `internal/engines/postgres/cdc_normalize.go` to zero `Nullable` / `Default` / `Comment` on every seed column (CDC can never carry these) and to collapse `Precision == 6 → 0` on temporal types when the wire-shape is the default-precision zero (explicit non-default precisions like `TIMESTAMP(3)` pass through unchanged via the negative-precision-passthrough test).
+
+### Tests
+
+- **`test(engines/postgres): cdc_normalize_test.go`** — Five new `TestNormalizeForCDCComparison_PG/*` subtests pin the new normalizer behaviour: numeric-nullable zeroing, text-nullable zeroing, varchar-nullable zeroing, temporal-default-precision collapse (6→0), and the explicit-non-default-precision negative (passthrough).
+- **`test(pipeline): shard_consolidation_rename_pg_integration_test.go` + `shard_consolidation_rename_mysql_integration_test.go`** — Per the Bug 74 "pin the class, not the representative" lesson, both engines' RENAME integration tests now exercise a **six-cell type matrix** at the boundary: a `name VARCHAR(64) NOT NULL → product_name VARCHAR(64) NOT NULL` rename against schemas carrying `extra_numeric_nullable NUMERIC(10,2)`, `extra_text_nullable TEXT`, `extra_varchar_nullable VARCHAR(64)`, `extra_integer_nullable INTEGER`, `extra_timestamp_nullable TIMESTAMP`, and `extra_boolean_nullable BOOLEAN`. The original v0.78.0 RENAME pin used a single fixture whose representative-of-one didn't expose either asymmetric field — the matrix would have caught Bug 86 in the same CI roundtrip that produced v0.78.0. The matrix now pins the class on both engines.
+
+### Compatibility
+
+- **Drop-in upgrade from v0.78.0.** Pure bugfix; no flag surface change. Operators who hit v0.78.0's spurious "Unrecognized combo" refusal on RENAME against PG schemas with nullable NUMERIC / TEXT / temporal columns now get the auto-apply behaviour ADR-0054's RENAME shape advertises. Severity a — the v0.78.0 RENAME feature was effectively broken on the majority of real-world PG schemas (any column reading default precision from `information_schema` or any nullable NUMERIC / TEXT — both extremely common); cycle subagent hit it on the first realistic test schema.
+
 ## [0.78.0] - 2026-05-23
 
 ### Added
