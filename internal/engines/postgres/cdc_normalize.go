@@ -45,6 +45,37 @@ import "github.com/orware/sluice/internal/ir"
 // information_schema on schema-change boundaries so the CDC projection
 // already matches the SchemaReader's.
 //
+// Bug 86 extension (v0.78.1): also normalize column-level fields that
+// pgoutput cannot carry over the wire. The pgoutput RelationMessage
+// format only carries (name, OID, typmod, key-flag) per column — it
+// does NOT carry the column's nullability, default expression, or
+// comment. [projectRelation] therefore leaves these fields at their
+// Go zero values on every CDC-projected snapshot, while the cold-
+// start SchemaReader populates them faithfully from
+// information_schema. Without normalization, the classifier's
+// [diffAlteredColumn] (which inspects `Nullable` directly) fires
+// `ShapeKindAlterColumnNullability` on every nullable existing column
+// at the first post-DDL boundary — combining with a legitimate
+// RENAME's added=1 / dropped=1 into the multi-shape combo refusal
+// path. The fix zeroes `Nullable`, `Default`, and `Comment` on the
+// seed so the comparison aligns with what pgoutput can actually
+// carry. The cost is that the live-coordination classifier cannot
+// detect genuine ALTER COLUMN NULLABILITY / DEFAULT / COMMENT shapes
+// on PG via CDC — but it could not detect them anyway (the wire
+// doesn't carry the signal), so this just makes the existing
+// limitation explicit at the comparison surface.
+//
+// Bug 86 also surfaced a Type-level asymmetry on the temporal family
+// (TIMESTAMP / TIMESTAMPTZ / TIME / TIMETZ): the SchemaReader reads
+// information_schema.columns.datetime_precision, which PG reports as
+// 6 (the default) for any temporal column declared WITHOUT explicit
+// precision; the CDC OID-to-type mapper reads pg_attribute.atttypmod,
+// which is -1 for that same "no explicit precision" case and decodes
+// to Precision=0. [normalizeTypeForCDCComparison] now collapses
+// Precision=6 to 0 for these temporal types so the default-precision
+// case round-trips equally — see the per-type cases for the accepted
+// false-negative-on-explicit-TIMESTAMP(6) trade-off.
+//
 // Returns a new *ir.Table (deep enough copy that mutating the returned
 // struct cannot mutate the input). Idempotent on repeated calls.
 func (Engine) NormalizeForCDCComparison(t *ir.Table) *ir.Table {
@@ -59,6 +90,16 @@ func (Engine) NormalizeForCDCComparison(t *ir.Table) *ir.Table {
 		}
 		newCol := *col
 		newCol.Type = normalizeTypeForCDCComparison(col.Type)
+		// Bug 86 (v0.78.1): zero the column-level fields pgoutput
+		// cannot carry. See the docstring above for the per-field
+		// rationale; the smoking-gun field for the catalogued repro
+		// was Nullable (Bug 86 was triggered by a NUMERIC(10,2) /
+		// TEXT column with no NOT NULL — cold-start saw Nullable=true,
+		// CDC projection saw Nullable=false). Default and Comment
+		// are zeroed pre-emptively to close the class.
+		newCol.Nullable = false
+		newCol.Default = nil
+		newCol.Comment = ""
 		out.Columns[i] = &newCol
 	}
 	return &out
@@ -100,6 +141,39 @@ func normalizeTypeForCDCComparison(t ir.Type) ir.Type {
 			v.Unconstrained = false
 			v.Precision = 0
 			v.Scale = 0
+		}
+		return v
+	case ir.DateTime:
+		// Bug 86 (v0.78.1): the SchemaReader reads
+		// information_schema.columns.datetime_precision, which PG
+		// reports as 6 (the default) for any `TIMESTAMP` declared
+		// WITHOUT an explicit precision. The CDC OID-to-type mapper
+		// reads pg_attribute.atttypmod, which is -1 for the same
+		// "no explicit precision" case; temporalTypmod(-1) returns 0.
+		// Collapse the default-precision case to Precision=0 on the
+		// seed so it matches the CDC projection. Operators who
+		// explicitly declare TIMESTAMP(6) hit a false-negative ALTER
+		// (cold-start 6 → normalized to 0; CDC sees 6) — an accepted
+		// v1 limitation: classifier-level detection of explicit-
+		// precision-changes is out of scope, and the operator-visible
+		// behaviour is no worse than v0.78.0's blanket refusal of
+		// every TIMESTAMP-having table.
+		if v.Precision == 6 {
+			v.Precision = 0
+		}
+		return v
+	case ir.Time:
+		// Same TIMESTAMP-default-precision asymmetry as ir.DateTime
+		// above; PG `TIME` and `TIMETZ` default to precision 6 too.
+		if v.Precision == 6 {
+			v.Precision = 0
+		}
+		return v
+	case ir.Timestamp:
+		// Same TIMESTAMP-default-precision asymmetry; covers
+		// `TIMESTAMP WITH TIME ZONE` (TIMESTAMPTZ).
+		if v.Precision == 6 {
+			v.Precision = 0
 		}
 		return v
 	}

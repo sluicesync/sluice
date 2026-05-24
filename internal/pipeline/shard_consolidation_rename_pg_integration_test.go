@@ -178,3 +178,159 @@ func TestStreamer_RenameColumn_PG_LiveCoordination(t *testing.T) {
 		t.Fatal("Streamer.Run did not return after ctx cancel")
 	}
 }
+
+// TestStreamer_RenameColumn_PG_LiveCoordination_TypeFamilyMatrix pins
+// the Bug 86 fix (v0.78.1) and the Bug 74 "pin the class, not the
+// representative" lesson: the v0.78.0 RENAME COLUMN pin used a single
+// column type (TEXT NOT NULL) that did not exercise the
+// SchemaReader-vs-pgoutput IR canonicalization asymmetry. Bug 86
+// fired specifically when the table had a NULLABLE non-renamed column
+// of types NUMERIC or TEXT — the cold-start SchemaReader populated
+// Nullable=true, the pgoutput RelationMessage's projectRelation left
+// Nullable=false (pgoutput cannot carry attnotnull), and the
+// classifier's diffAlteredColumn surfaced a phantom
+// ShapeKindAlterColumnNullability that combined with the RENAME's
+// added=1/dropped=1 into the multi-shape combo refusal path.
+//
+// The matrix below covers the column-type families a real PG schema
+// is likely to carry — every variant carries an EXTRA nullable
+// non-renamed column whose type exercises a different family:
+//
+//   - VARCHAR(N): the original-pin coverage (the column type the
+//     v0.78.0 test happened to use; ground-truth control for "type
+//     families that round-trip stably").
+//   - TEXT: Bug 86 catalogued case A3 — fixed by Nullable
+//     normalization.
+//   - NUMERIC(P,S): Bug 86 catalogued case A1 — fixed by Nullable
+//     normalization.
+//   - INTEGER: integer-family sanity coverage.
+//   - TIMESTAMP: temporal-family coverage.
+//   - BOOLEAN: leaf-type coverage.
+//
+// Each variant carries the same rename target (`name -> product_name`)
+// with `name VARCHAR(64) NOT NULL`; the extra column is what varies.
+// The extra column is left NULLABLE deliberately — that's what
+// triggered Bug 86 (a NOT NULL extra column would have matched on
+// both sides and masked the asymmetry, which is exactly what
+// happened with the v0.78.0 release-pin's `name TEXT NOT NULL`
+// fixture).
+//
+// See `BUG-CATALOG.md` (sluice-testing) for the upstream Bug 86
+// catalogue.
+func TestStreamer_RenameColumn_PG_LiveCoordination_TypeFamilyMatrix(t *testing.T) {
+	cases := []struct {
+		name      string
+		extraCol  string // column name of the extra (non-renamed) column
+		extraDecl string // its declared DDL — e.g. "NUMERIC(10,2)"
+	}{
+		// Bug 86 catalogued failures (pre-fix these refused; post-fix pass).
+		{name: "extra_numeric_nullable", extraCol: "price", extraDecl: "NUMERIC(10,2)"},
+		{name: "extra_text_nullable", extraCol: "description", extraDecl: "TEXT"},
+		// Round-trip-stable type families (passed pre-fix; sanity coverage).
+		{name: "extra_varchar_nullable", extraCol: "tagline", extraDecl: "VARCHAR(64)"},
+		{name: "extra_integer_nullable", extraCol: "count", extraDecl: "INTEGER"},
+		{name: "extra_timestamp_nullable", extraCol: "ts", extraDecl: "TIMESTAMP"},
+		{name: "extra_boolean_nullable", extraCol: "flag", extraDecl: "BOOLEAN"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sourceDSN, targetDSN, cleanup := startPostgresLogical(t)
+			defer cleanup()
+
+			applyPGDDL(t, sourceDSN, `
+				CREATE TABLE widgets (
+					id INT PRIMARY KEY,
+					name VARCHAR(64) NOT NULL,
+					`+tc.extraCol+` `+tc.extraDecl+`
+				);
+				ALTER TABLE widgets REPLICA IDENTITY FULL;
+				INSERT INTO widgets (id, name) VALUES (1, 'alpha'), (2, 'beta');
+			`)
+
+			pgEng, ok := engines.Get("postgres")
+			if !ok {
+				t.Fatal("postgres engine not registered")
+			}
+
+			streamer := &Streamer{
+				Source:    pgEng,
+				Target:    pgEng,
+				SourceDSN: sourceDSN,
+				TargetDSN: targetDSN,
+				StreamID:  "test-rename-pg-" + tc.name,
+				InjectShardColumn: ShardColumnSpec{
+					Name:  "source_shard_id",
+					Value: "shard_a",
+				},
+				CoordinateLiveDDL: true,
+				ShardCoordinationLease: LeaseConfig{
+					LeaseDuration: 30 * time.Second,
+					RenewDeadline: 20 * time.Second,
+					RetryPeriod:   5 * time.Second,
+				},
+			}
+
+			streamCtx, streamCancel := context.WithCancel(context.Background())
+			defer streamCancel()
+
+			runErr := make(chan error, 1)
+			go func() { runErr <- streamer.Run(streamCtx) }()
+
+			if !waitForPGRowCount(t, targetDSN, "widgets", 2, 30*time.Second) {
+				t.Fatalf("phase A: bulk-copy never landed seed rows")
+			}
+
+			// Source RENAME + INSERT under the new column name. The
+			// pre-Bug-86 failure shape: this RENAME would refuse with
+			// `altered-col=true` because the unchanged extra column's
+			// Nullable=true (cold-start) ≠ Nullable=false (pgoutput
+			// projection) triggered a phantom ShapeKindAlterColumn-
+			// Nullability that combined with added=1/dropped=1 into
+			// the multi-shape combo refusal.
+			applyPGDDL(t, sourceDSN, `
+				ALTER TABLE widgets RENAME COLUMN name TO product_name;
+				INSERT INTO widgets (id, product_name) VALUES (3, 'gamma');
+			`)
+
+			if !waitForPGRowCount(t, targetDSN, "widgets", 3, 60*time.Second) {
+				t.Fatalf("phase B (%s): post-RENAME row never landed — Bug 86 fix may have regressed "+
+					"(classifier likely surfaced phantom altered-col=true on the extra "+
+					"nullable %s column)", tc.name, tc.extraDecl)
+			}
+
+			tgtDB, err := sql.Open("pgx", targetDSN)
+			if err != nil {
+				t.Fatalf("open target: %v", err)
+			}
+			defer func() { _ = tgtDB.Close() }()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+
+			var hasNew, hasOld int
+			if err := tgtDB.QueryRowContext(ctx, `
+				SELECT COUNT(*) FROM information_schema.columns
+				WHERE table_schema = 'public' AND table_name = 'widgets' AND column_name = 'product_name'`).Scan(&hasNew); err != nil {
+				t.Fatalf("check product_name: %v", err)
+			}
+			if hasNew != 1 {
+				t.Errorf("target widgets.product_name column missing — RENAME apply didn't fire")
+			}
+			if err := tgtDB.QueryRowContext(ctx, `
+				SELECT COUNT(*) FROM information_schema.columns
+				WHERE table_schema = 'public' AND table_name = 'widgets' AND column_name = 'name'`).Scan(&hasOld); err != nil {
+				t.Fatalf("check name: %v", err)
+			}
+			if hasOld != 0 {
+				t.Errorf("target widgets.name column still present — RENAME left both columns")
+			}
+			streamCancel()
+			select {
+			case <-runErr:
+			case <-time.After(15 * time.Second):
+				t.Fatal("Streamer.Run did not return after ctx cancel")
+			}
+		})
+	}
+}
