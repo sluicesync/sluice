@@ -6,6 +6,37 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **`feat(pipeline): online ADD COLUMN forwarding through the CDC apply path (--forward-schema-add-column, --backfill-added-column) (#45 / ADR-0058)`** — Sluice now optionally forwards `ALTER TABLE … ADD COLUMN` from source to target through the live CDC apply path. Two new opt-in flags on `sluice sync start`:
+  - `--forward-schema-add-column` (off by default): when a source ADD COLUMN is observed in the CDC stream, the streamer applies the equivalent ALTER on the target via the existing `ir.SchemaDeltaApplier.AlterAddColumn` surface (the same call chain-restore + Shape A live-coordination already use). The IF NOT EXISTS semantics on both engines make the ALTER idempotent on retry.
+  - `--backfill-added-column` (off by default; only consulted when `--forward-schema-add-column` is set): after the target ALTER lands, the streamer issues a bounded PK-cursor SELECT against the source for already-shipped rows and emits synthetic UPDATE events to populate the new column with the source's per-row values.
+
+  **Why this exists**: F12 + F16 from the task #40 Reddit research identified ADD COLUMN as the marquee positioning feature where every CDC competitor falls down differently — SQL Server native CDC silently ignores it; DMS / Qlik require manual restart; Debezium forwards but doesn't backfill. The OSS tier of HVR (the gold standard) handles both, but is paid. v0.79.0 puts sluice in HVR's category on this dimension, on the OSS tier, cross-engine.
+
+  **Refuse-loudly catalog (preserved)**: every other recognized shape — DROP COLUMN, ALTER COLUMN TYPE, RENAME COLUMN, CREATE / DROP INDEX, multi-shape combos, ADD COLUMN with a computed DEFAULT (e.g. `DEFAULT NOW()` / sequence reference) — continues to refuse loudly with the drained-model recovery hint. ADR-0058 §1a documents the scope split: ADD COLUMN is the additive case where target rows have a clean default; every other shape benefits from explicit operator coordination.
+
+  **No-op when Shape A is engaged**: `--inject-shard-column` streams already forward every recognized shape via the ADR-0054 lease + boundary router. The `--forward-schema-add-column` flag is silently a no-op on Shape A streams (Shape A's intercept already covers the case).
+
+  **Cross-engine works**: PG → MySQL and MySQL → PG forward correctly via the existing `translate.RetargetForEngine` path (the same call broker + chain-restore use).
+
+### Docs
+
+- **`docs(adr): ADR-0058 — Online schema-change forwarding in the CDC apply path`** (`docs/adr/adr-0058-online-schema-change-forwarding.md`) — 14-section ADR covering: F12 + F16 motivation, scope split (why ADD COLUMN only in v0.79.0), opt-in flag rationale, backfill design + positions, computed-default refusal (§2a), target-ALTER failure mode (§2b), source-backfill failure modes (§2c), why no MySQL INSTANT, same-engine vs cross-engine, difference from the chain-restore caller, forward-compat note with F11 (CDC schema-drift detection — task #47). Status Accepted (v0.79.0).
+
+### Tests
+
+- **`test(pipeline): schema_forward_intercept_test.go`** — 11 unit tests covering intercept dispatch (nil applier pass-through, first-snapshot anchor, ADD COLUMN happy path, every refuse-loudly shape including DROP / RENAME / ALTER TYPE, computed DEFAULT refusal, literal DEFAULT forwarding, applier-error rewind, NoneShape passthrough, non-snapshot pass-through, backfill UPDATE synthesis, backfill no-PK refusal).
+- **`test(pipeline): migrate_add_column_forward_pg_integration_test.go`** — 3 PG → PG integration pins: flag-on forwards the ALTER + post-ALTER INSERT lands; flag-on + backfill populates already-shipped rows; flag-off preserves pre-v0.79.0 refuse-loudly behaviour (lowercase control).
+- **`test(pipeline): migrate_add_column_forward_mysql_integration_test.go`** — 2 MySQL → MySQL integration pins (flag-on + flag-on with backfill).
+- **`test(pipeline): migrate_add_column_forward_cross_integration_test.go`** — 2 cross-engine integration pins: MySQL → PG and PG → MySQL.
+
+### Compatibility
+
+- **Drop-in upgrade from v0.78.4.** Default behavior unchanged: operators who don't set `--forward-schema-add-column` see exactly the pre-v0.79.0 path (source ADD COLUMN surfaces as `column does not exist` on the next row event, refuses loudly through the standard retry path).
+- **Minor version bump (v0.79.0, not v0.78.5)** because new operator-facing flags are added.
+- **Two flags are opt-in by design.** Operators on staging environments where DDL is gated through a separate change-management process must continue to refuse loudly on any source DDL; default-off honors that. Operators who want Debezium-class schema evolution opt in explicitly with both flags. The two-flag form (rather than a single tristate) was chosen for grep-ability in CI/deployment manifests and forward-compat with future shape flags.
+
 ## [0.78.4] - 2026-05-24
 
 ### Added
