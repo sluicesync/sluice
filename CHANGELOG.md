@@ -6,6 +6,20 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.78.2] - 2026-05-23
+
+### Fixed
+
+- **`fix(engines/postgres): Bug 87 — quote schema.table in syncOneIdentity (#43)`** — `internal/engines/postgres/schema_writer.go:345` passed `w.schema + "." + table.Name` as the `tableArg` to `pg_get_serial_sequence($1, $2)` without quoting. `pg_get_serial_sequence` parses its first argument as identifier text — and per PG's identifier rules, **unquoted identifiers fold to lowercase**. For any target table with case-preserved name + an IDENTITY / SERIAL column (e.g. source `CREATE TABLE "Widgets" ("id" BIGSERIAL PRIMARY KEY)`), `tableArg` became `public.Widgets`, which PG interpreted as `public.widgets` and raised `relation "public.widgets" does not exist (SQLSTATE 42P01)`. The MAX read on the line just above (line 328) already quoted correctly via `quoteIdent`; the fix is the same single-statement consistency: `tableArg := quoteIdent(w.schema) + "." + quoteIdent(table.Name)`. **Downstream symptom (initially misdiagnosed as a separate "Bug 2"):** for the CDC streamer, `coldStart` calls the same `SyncIdentitySequences` phase as the Migrator. When this errored, the streamer's runOnce loop hit its retry backoff and never transitioned to CDC mode — operator-visible as "bulk copy complete (2 rows) + nothing replicates after that", a silent-loss-class shape. Phase A instrumentation (six DEBUG probes on the pgoutput → applier dispatch chain) ruled out the four hypothesized fold-points in the CDC apply path and traced the symptom back to the failed identity-sync phase. **The one-line fix closes both the loud-Migrator-abort and the silent-streamer-stall.**
+
+### Tests
+
+- **`test(pipeline): Bug 87 — cross-engine case-preservation matrix (32 scenarios)`** — Per the Bug 74 "pin the class, not the representative" lesson, three new integration test files (`migrate_case_preservation_pg_integration_test.go` + `_mysql_integration_test.go` + `_cross_integration_test.go`, totalling ~1160 LOC) pin a **4-direction × 4-shape × 2-path matrix**: directions are PG↔PG, MySQL↔MySQL, PG↔MySQL, MySQL↔PG; shapes are `lowercase_simple` (control), `UPPERCASE_ONLY`, `MixedCase`, and `Snake_With_Caps`; paths are bulk-copy (Migrator) and CDC (Streamer). All 32 scenarios pass on the Bug 87 fix. Without the fix, the 12 PG-target case-preserved scenarios fail in the two ways the bug report described. MySQL containers are explicitly configured with `--lower-case-table-names=0` via dedicated `startMySQLCaseSensitive` / `startMySQLBinlogCaseSensitive` helpers so the test is hermetic against the per-OS default-folding policy.
+
+### Compatibility
+
+- **Drop-in upgrade from v0.78.1.** Pure bugfix; no flag surface change. **Severity a** — v0.78.1 (and every prior release) silently broke PG-target migration / streaming for any operator who used quoted mixed-case or uppercase table names with an IDENTITY column. The Migrator-side surface (loud SQLSTATE 42P01 abort) was at least visible; the Streamer-side surface (silent-loss after a successful bulk copy) is exactly the user-trust-gates-throughput class the project's CLAUDE.md tenets are designed against. The matrix test now pins both engines so the next regression of the always-quote invariant surfaces in CI, not in user reports.
+
 ## [0.78.1] - 2026-05-23
 
 ### Fixed
