@@ -478,6 +478,35 @@ type Streamer struct {
 	// engaged.
 	ShardCoordinationLease LeaseConfig
 
+	// ForwardSchemaAddColumn is the ADR-0058 single-stream forward-
+	// add-column toggle. When true AND [InjectShardColumn] is NOT
+	// engaged, the streamer wraps the CDC change channel with the
+	// [interceptAddColumnForward] intercept: observed ADD COLUMN
+	// shapes on the source forward to the target via
+	// [ir.SchemaDeltaApplier.AlterAddColumn]; every other recognized
+	// shape (DROP / ALTER TYPE / RENAME / index / multi-shape combo)
+	// refuses loudly with the drained-model recovery hint.
+	//
+	// Default false — pre-v0.79.0 behavior is preserved (ADD COLUMN
+	// on source surfaces as `column does not exist` on the next row
+	// event). Wired via the `--forward-schema-add-column` CLI flag.
+	//
+	// No-op when [InjectShardColumn] is engaged: Shape A's
+	// [BoundaryRouter] already handles every recognized shape via
+	// the lease (ADR-0054 DP-E).
+	ForwardSchemaAddColumn bool
+
+	// BackfillAddedColumn enables source-side bounded backfill of
+	// already-shipped target rows after a forwarded ADD COLUMN
+	// lands. Only consulted when [ForwardSchemaAddColumn] is true.
+	// ADR-0058 §1c.
+	//
+	// When set, the intercept opens a [ir.BatchedRowReader] against
+	// the source and emits synthetic [ir.Update] events for every
+	// row already on the target, populating the new column with the
+	// source's per-row value rather than the column's DEFAULT.
+	BackfillAddedColumn bool
+
 	// ApplyRetryAttempts caps the number of consecutive retriable
 	// apply failures the streamer will absorb before giving up and
 	// returning the underlying error. ADR-0038. Zero or one means
@@ -549,6 +578,21 @@ type Streamer struct {
 	// the per-shape DDL apply path. Owned by the Streamer's Run
 	// lifetime; closed alongside other streamer resources.
 	shapeWriter ir.SchemaWriter
+
+	// addColumnForwardWriter is the SchemaWriter the ADR-0058
+	// single-stream ADD COLUMN forwarding intercept uses to issue
+	// [ir.SchemaDeltaApplier.AlterAddColumn] against the target.
+	// Constructed by [engageAddColumnForward] when
+	// [ForwardSchemaAddColumn] is true and Shape A is NOT engaged
+	// (Shape A has its own writer via [shapeWriter]). Closed via
+	// [closeAddColumnForward] alongside other streamer resources.
+	addColumnForwardWriter ir.SchemaWriter
+
+	// addColumnForwardReader is the source-side row reader used by
+	// the ADR-0058 backfill loop (only opened when
+	// [BackfillAddedColumn] is true). Owned by the Streamer's Run
+	// lifetime.
+	addColumnForwardReader ir.RowReader
 
 	// schemaSnapshotErr is the error sink the SchemaSnapshot
 	// intercept writes to when the BoundaryRouter refuses (probe
@@ -918,6 +962,10 @@ func (s *Streamer) runOnce(ctx context.Context) error {
 	// engaged (SchemaWriter for per-shape DDL; the lease store /
 	// prober live on the applier and are released by closeIf above).
 	defer s.closeShardCoordination()
+	// ADR-0058: release the single-stream ADD COLUMN forwarding
+	// resources (SchemaWriter + optional source RowReader). No-op
+	// when the feature isn't engaged.
+	defer s.closeAddColumnForward()
 	// PII Phase 2.c (v0.59.0): plumb the resolved stream-id into the
 	// applier so randomize:* CDC redactions derive replay-stable seeds.
 	// Empty streamID is a no-op via applyStreamID's guard; in
@@ -1321,6 +1369,32 @@ func (s *Streamer) runOnce(ctx context.Context) error {
 	// Clear the cold-start seed after handing it to the intercept so a
 	// streamer restart picks up a fresh seed in its next coldStart run.
 	s.coldStartSeedSnapshots = nil
+	// ADR-0058: when --forward-schema-add-column is set AND Shape A is
+	// NOT engaged, wrap the changes channel with the
+	// [interceptAddColumnForward] intercept. The intercept observes
+	// SchemaSnapshot boundaries, applies the target ALTER for ADD
+	// COLUMN, optionally backfills, and refuses loudly on every other
+	// recognized shape. When Shape A IS engaged, the boundary router
+	// above already handles every shape — this branch is skipped.
+	if s.ForwardSchemaAddColumn && s.boundaryRouter == nil && s.addColumnForwardWriter != nil {
+		if deltaApplier, ok := s.addColumnForwardWriter.(ir.SchemaDeltaApplier); ok {
+			deps := schemaForwardDeps{
+				applier:          deltaApplier,
+				sourceEngineName: s.Source.Name(),
+				targetEngineName: s.Target.Name(),
+			}
+			if s.BackfillAddedColumn {
+				if br, ok := s.addColumnForwardReader.(ir.BatchedRowReader); ok {
+					deps.backfill = &schemaForwardBackfill{
+						reader:    br,
+						streamID:  streamID,
+						batchSize: defaultBulkBatchSize,
+					}
+				}
+			}
+			filtered = interceptAddColumnForward(applyCtx, filtered, deps, &s.schemaSnapshotErr)
+		}
+	}
 	dispatchErr := s.dispatchApply(applyCtx, applier, streamID, filtered)
 	// ADR-0054 Phase 2d: a SchemaSnapshot intercept error short-
 	// circuits the changes channel; the dispatchErr path sees a clean
@@ -1819,6 +1893,12 @@ func (s *Streamer) openApplier(ctx context.Context) (ir.ChangeApplier, bool, err
 		if err := s.engageShardCoordination(ctx, s.Applier); err != nil {
 			return nil, false, wrapWithHint(PhaseConnect, err)
 		}
+		// ADR-0058: engage single-stream ADD COLUMN forwarding when
+		// the operator opts in and Shape A is NOT engaged. No-op
+		// otherwise.
+		if err := s.engageAddColumnForward(ctx); err != nil {
+			return nil, false, wrapWithHint(PhaseConnect, err)
+		}
 		return s.Applier, false, nil
 	}
 	a, err := s.Target.OpenChangeApplier(ctx, s.TargetDSN)
@@ -1837,6 +1917,13 @@ func (s *Streamer) openApplier(ctx context.Context) (ir.ChangeApplier, bool, err
 	// ADR-0054 Shape A Phase 2: engage live-coordination lease
 	// manager when the operator's flags + target engine allow.
 	if err := s.engageShardCoordination(ctx, a); err != nil {
+		closeIf(a)
+		return nil, false, wrapWithHint(PhaseConnect, err)
+	}
+	// ADR-0058: engage single-stream ADD COLUMN forwarding when
+	// the operator opts in and Shape A is NOT engaged. No-op
+	// otherwise.
+	if err := s.engageAddColumnForward(ctx); err != nil {
 		closeIf(a)
 		return nil, false, wrapWithHint(PhaseConnect, err)
 	}

@@ -532,6 +532,10 @@ type SyncStartCmd struct {
 
 	NoCoordinateLiveDDL bool `help:"ADR-0054 Shape A Phase 2 — disable live cross-shard DDL coordination. Default is ENABLED when --inject-shard-column is set (live coordination: one shard acquires a lease, applies the DDL on the consolidated target, records the schema version + DDL checksum; peer shards verify the checksum, skip the apply, continue CDC against the migrated target). Pass --no-coordinate-live-ddl to keep the pre-v0.73 drained model (operator runs 'sync stop --wait' on every shard, runs schema migrate once, then 'sync start --resume' on every shard). A no-op when --inject-shard-column is unset."`
 
+	ForwardSchemaAddColumn bool `help:"ADR-0058 — opt-in online forwarding of ALTER TABLE ADD COLUMN through the live CDC apply path. Default OFF (pre-v0.79.0 behavior: source ADD COLUMN surfaces as 'column does not exist' on the next row event). When set, observed source ADD COLUMN events apply on the target via the same AlterAddColumn surface chain-restore uses; every other recognized shape (DROP / ALTER TYPE / RENAME / CREATE/DROP INDEX / multi-shape combo / computed DEFAULT) refuses loudly with the drained-model recovery hint. No-op when --inject-shard-column is set (Shape A's live coordination already forwards every shape via the lease, ADR-0054)."`
+
+	BackfillAddedColumn bool `help:"ADR-0058 §1c — opt-in source-side bounded backfill of already-shipped target rows after a forwarded ADD COLUMN lands. Default OFF (existing target rows carry the column's DEFAULT, NULL if none). When set, the streamer issues a bounded PK-cursor SELECT (pk, new_col) against the source and emits synthetic UPDATE events to populate the new column with per-row source values. Only consulted when --forward-schema-add-column is also set. Large tables: backfill cost is proportional to the table's row count on the source — operators must opt in knowingly."`
+
 	ShardCoordinationLeaseDuration time.Duration `help:"ADR-0054 §2 / DP-A lease TTL. The lease-holder writes lease_expires_at = now + this value on every heartbeat. A stalled holder loses the lease after this window; the takeover stream runs probe-and-record. Default 30s (Kubernetes leader-election relaxed for sluice's stream-pause failure mode). Operators running ALTERs on tables >100GB may want 300s to absorb the longer ALTER window. Only consulted when --inject-shard-column is set and --no-coordinate-live-ddl is absent." default:"30s" placeholder:"DUR"`
 	ShardCoordinationRenewDeadline time.Duration `help:"ADR-0054 §2 / DP-A lease renew deadline. A lease-holder considers itself failed if it can't write a heartbeat within this window and exits the apply path. Must be > --shard-coordination-retry-period and < --shard-coordination-lease-duration. Default 20s." default:"20s" placeholder:"DUR"`
 	ShardCoordinationRetryPeriod   time.Duration `help:"ADR-0054 §2 / DP-A lease heartbeat cadence. The lease-holder writes lease_expires_at = now + LeaseDuration at this interval. Must be > 0 and < --shard-coordination-renew-deadline. Default 10s." default:"10s" placeholder:"DUR"`
@@ -761,6 +765,8 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 		EnabledPGExtensions:       s.EnablePGExtension,
 		InjectShardColumn:         shardSpec,
 		CoordinateLiveDDL:         !s.NoCoordinateLiveDDL,
+		ForwardSchemaAddColumn:    s.ForwardSchemaAddColumn,
+		BackfillAddedColumn:       s.BackfillAddedColumn,
 		ShardCoordinationLease: pipeline.LeaseConfig{
 			LeaseDuration: s.ShardCoordinationLeaseDuration,
 			RenewDeadline: s.ShardCoordinationRenewDeadline,
