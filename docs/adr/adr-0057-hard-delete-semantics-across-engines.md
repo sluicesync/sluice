@@ -122,6 +122,45 @@ The skipped cells remain in the matrix file so when the production
 fix lands, removing the skip is the contract — no matrix-discovery
 work required.
 
+##### Bug 88 closure (v0.78.3, 2026-05-24)
+
+The Task #44 finding is fixed. The MySQL CDC reader now narrows the
+DELETE Before-image to primary-key columns before emit, via a
+`filterDeleteBefore` helper mirroring the PG-side helper of the
+same name. The fix locus is the binlog reader's `DELETE_ROWS_EVENT`
+emit path (`internal/engines/mysql/cdc_reader.go`), not the
+applier — same shape as PG's locus, per the Bug-74 family-pin
+discipline ("fix the class, not the instance"; here the class is
+the wire-format reader's responsibility for delivering a usable
+identity, not the applier's responsibility for emitting an
+identity-friendly WHERE).
+
+The four previously-`t.Skip()`'d matrix cells are now live and
+pass:
+
+- `MINIMAL` × `plain-delete`
+- `MINIMAL` × `update-then-delete`
+- `NOBLOB` × `toast-delete` (the load-bearing cell — BLOB column
+  absent from BEFORE-image, non-BLOB non-PK column `name` nil)
+- (The previously-passing `NOBLOB` × `plain-delete` /
+  `update-then-delete` cells continue to pass.)
+
+A unit-level pin (`TestFilterDeleteBefore` in
+`internal/engines/mysql/cdc_reader_test.go`) covers the helper's
+narrowing behaviour across MINIMAL / FULL / NOBLOB / composite-PK
+/ PK-less shapes so regressions surface cheaply, without spinning
+up a testcontainer.
+
+**Scope note: VStream (PlanetScale) is out of scope for this fix.**
+The Bug 88 fix targets the binlog reader (`cdc_reader.go`); the
+VStream reader (`cdc_vstream.go`) has its own DELETE emit path
+that currently passes the full Before-image through unchanged. If
+PlanetScale ever exposes a `binlog_row_image=MINIMAL`-equivalent
+on the VStream wire format, the same narrowing would need to land
+there too. Pinned by the existing
+`cdc_vstream_composite_pk_integration_test.go` matrix expanding
+when needed.
+
 #### Postgres source (same-engine PG→PG)
 
 | `REPLICA IDENTITY` | plain DELETE | UPDATE-then-DELETE | TOAST'd row DELETE |

@@ -380,3 +380,121 @@ func TestParseTruncateTable(t *testing.T) {
 		})
 	}
 }
+
+// TestFilterDeleteBefore pins the Bug 88 fix at unit level: the CDC
+// reader narrows the Before-image of a DELETE rows-event to its PK
+// columns before emit, so the applier's [buildWhereClause] never
+// gets to emit `non_pk_col IS NULL` predicates that fail to match
+// real target rows whose non-PK columns hold non-null values.
+//
+// The matrix integration test (cdc_delete_matrix_mysql_integration_test.go)
+// pins the end-to-end behaviour; this unit test pins the narrowing
+// helper itself so a regression that drops the filter or alters the
+// PK lookup shape fails cheaply, without spinning up a testcontainer.
+//
+// Same name and shape as the PG-side test pinning the equivalent
+// helper — the family-dispatched fix-locus matches between engines
+// per ADR-0057's Bug-74 family-pin discipline.
+func TestFilterDeleteBefore(t *testing.T) {
+	cases := []struct {
+		name string
+		tbl  *tableSchema
+		in   ir.Row
+		want ir.Row
+	}{
+		{
+			name: "MINIMAL plain-delete narrows nil non-PK columns away",
+			tbl: &tableSchema{
+				Schema:     "source_db",
+				Name:       "widgets",
+				PrimaryKey: []string{"id"},
+			},
+			// What MySQL emits under MINIMAL: PK carries its value,
+			// every non-PK column is nil. Without the filter, the
+			// applier builds "WHERE `id`=? AND `name` IS NULL AND
+			// `payload` IS NULL AND `created_at` IS NULL", which
+			// fails to match real rows.
+			in: ir.Row{
+				"id":         int64(42),
+				"name":       nil,
+				"payload":    nil,
+				"created_at": nil,
+			},
+			want: ir.Row{"id": int64(42)},
+		},
+		{
+			name: "FULL plain-delete narrows non-PK columns away (correct, just shorter)",
+			tbl: &tableSchema{
+				Schema:     "source_db",
+				Name:       "widgets",
+				PrimaryKey: []string{"id"},
+			},
+			// Under FULL every column is present with its real
+			// value. The filter still narrows to PK — same target
+			// row, shorter WHERE clause, identical effect.
+			in: ir.Row{
+				"id":      int64(42),
+				"name":    "alice",
+				"payload": "hello",
+			},
+			want: ir.Row{"id": int64(42)},
+		},
+		{
+			name: "NOBLOB with TOAST'd BLOB narrows nil name + absent payload away",
+			tbl: &tableSchema{
+				Schema:     "source_db",
+				Name:       "widgets",
+				PrimaryKey: []string{"id"},
+			},
+			// Under NOBLOB the BLOB column is absent from the map
+			// entirely; the non-BLOB non-PK column (name) is present
+			// as nil. The filter narrows both away.
+			in: ir.Row{
+				"id":   int64(42),
+				"name": nil,
+				// payload absent (NOBLOB drops it from the map).
+			},
+			want: ir.Row{"id": int64(42)},
+		},
+		{
+			name: "composite PK keeps both PK columns",
+			tbl: &tableSchema{
+				Schema:     "source_db",
+				Name:       "memberships",
+				PrimaryKey: []string{"org_id", "user_id"},
+			},
+			in: ir.Row{
+				"org_id":  int64(1),
+				"user_id": int64(7),
+				"role":    nil, // nil under MINIMAL
+			},
+			want: ir.Row{"org_id": int64(1), "user_id": int64(7)},
+		},
+		{
+			name: "PK-less table falls back to the full image (no shorter identity exists)",
+			tbl: &tableSchema{
+				Schema:     "source_db",
+				Name:       "events",
+				PrimaryKey: nil,
+			},
+			// With no PK, there's no narrowing possible — return the
+			// full Before-image verbatim. Same fallback as PG's
+			// filterDeleteBefore on a PK-less REPLICA IDENTITY FULL
+			// relation.
+			in: ir.Row{
+				"event_id": int64(99),
+				"payload":  "x",
+			},
+			want: ir.Row{"event_id": int64(99), "payload": "x"},
+		},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			got := filterDeleteBefore(c.tbl, c.in)
+			if !reflect.DeepEqual(got, c.want) {
+				t.Errorf("filterDeleteBefore(...) = %#v; want %#v", got, c.want)
+			}
+		})
+	}
+}

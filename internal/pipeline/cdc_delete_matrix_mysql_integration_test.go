@@ -143,22 +143,14 @@ func waitForExactRowCountMySQL(dsn, table string, want int, timeout time.Duratio
 // {plain DELETE, UPDATE-then-DELETE, DELETE of a row with TOAST'd
 // BLOB column (NOBLOB-only — that's the interesting cell)}.
 //
-// Current ground truth: sluice's MySQL CDC reader + applier ASSUMES
-// binlog_row_image=FULL (documented at docs/dev/notes/prep-change-applier.md:26).
-// Under MINIMAL or NOBLOB-with-BLOB-cols, the binlog DELETE event
-// carries nil values for non-PK / BLOB columns; the apply path's
-// buildWhereClause (internal/engines/mysql/change_applier.go:1240-1248)
-// then emits "col IS NULL" predicates for those entries, which fail
-// to match real rows whose non-PK columns hold non-NULL values. The
-// DELETE matches zero rows, ADR-0010 absorbs the miss, and the
-// position advances — Bug-8-equivalent silent data loss.
-//
-// The MINIMAL and NOBLOB-toast cells are kept in the matrix as
-// t.Skip()'d with the production behaviour described, so when sluice
-// adds MINIMAL/NOBLOB support these cells become live without
-// requiring matrix discovery work. Task #44 discovered this and
-// filed it as a finding; per the prompt's discipline ("Don't change
-// production code") the fix is out of scope for this chunk.
+// Bug 88 closure: the MINIMAL and NOBLOB-toast cells were previously
+// `t.Skip()`'d with a "sluice requires binlog_row_image=FULL"
+// finding from Task #44. The CDC reader now narrows the DELETE
+// Before-image to PK columns before emit (see
+// `internal/engines/mysql/cdc_reader.go` `filterDeleteBefore`),
+// mirroring the PG-side helper of the same name. All matrix cells
+// now run; a regression that drops the narrowing would fail one or
+// more of the previously-skipped cells loudly.
 func TestStreamer_CDCDeleteMatrix_MySQLToMySQL(t *testing.T) {
 	const big = 100 * 1024 // 100KB MEDIUMTEXT — exercise NOBLOB's drop-blob behaviour.
 
@@ -170,41 +162,19 @@ func TestStreamer_CDCDeleteMatrix_MySQLToMySQL(t *testing.T) {
 		// shape=="toast-delete" requires includeBlob=true.
 		includeBlob bool
 		// skipReason, when non-empty, makes this cell a documented
-		// skip with the production behaviour spelled out. See the
-		// TestStreamer_CDCDeleteMatrix_MySQLToMySQL doc comment for
-		// the underlying root cause.
+		// skip with the production behaviour spelled out. Currently
+		// empty for every cell after the Bug 88 fix landed; kept as
+		// a field so a future configuration cell that re-introduces
+		// a skip has a place to put the reason.
 		skipReason string
 	}{
 		{rowImage: "FULL", shape: "plain-delete"},
 		{rowImage: "FULL", shape: "update-then-delete"},
-		{
-			rowImage:   "MINIMAL",
-			shape:      "plain-delete",
-			skipReason: "sluice requires binlog_row_image=FULL; under MINIMAL the binlog DELETE event omits non-PK columns and the applier's WHERE clause builds `col IS NULL` predicates that fail to match — Bug-8-equivalent silent drop. Task #44 finding; production fix out of scope.",
-		},
-		{
-			rowImage:   "MINIMAL",
-			shape:      "update-then-delete",
-			skipReason: "sluice requires binlog_row_image=FULL; same root cause as MINIMAL/plain-delete (the UPDATE's BEFORE-image is also minimal). Task #44 finding; production fix out of scope.",
-		},
-		{rowImage: "NOBLOB", shape: "plain-delete"}, // no BLOB columns on this table; NOBLOB has no effect → expected to pass.
+		{rowImage: "MINIMAL", shape: "plain-delete"},
+		{rowImage: "MINIMAL", shape: "update-then-delete"},
+		{rowImage: "NOBLOB", shape: "plain-delete"},
 		{rowImage: "NOBLOB", shape: "update-then-delete"},
-		{
-			// NOBLOB × TOAST'd is the load-bearing cell: BEFORE-image
-			// lacks the MEDIUMTEXT column. The PK-only WHERE clause
-			// would be correct, but sluice's buildWhereClause uses
-			// every column present in the Before image — and under
-			// NOBLOB the BLOB column is absent from the Before map
-			// (not "nil"), so the WHERE doesn't include a payload
-			// predicate. However the non-BLOB non-PK column (name)
-			// IS present-as-nil in the NOBLOB BEFORE-image, and the
-			// "name IS NULL" predicate fails to match. Same Bug-8
-			// shape as MINIMAL.
-			rowImage:    "NOBLOB",
-			shape:       "toast-delete",
-			includeBlob: true,
-			skipReason:  "sluice requires binlog_row_image=FULL; under NOBLOB the BEFORE-image carries non-BLOB non-PK columns as nil values, the applier's WHERE adds `name IS NULL` predicates that fail to match, and the DELETE silently no-ops. Task #44 finding; production fix out of scope.",
-		},
+		{rowImage: "NOBLOB", shape: "toast-delete", includeBlob: true},
 	}
 
 	for _, c := range cells {

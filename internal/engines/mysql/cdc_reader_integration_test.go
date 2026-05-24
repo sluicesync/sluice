@@ -199,8 +199,25 @@ func TestCDCReader_BasicChangeStream(t *testing.T) {
 	if !ok {
 		t.Fatalf("change[3] = %T; want ir.Delete", got[3])
 	}
-	if email, _ := del.Before["email"].(string); email != "bob@example.com" {
-		t.Errorf("delete.Before[email] = %#v; want bob@example.com", del.Before["email"])
+	// Bug 88: the CDC reader narrows the DELETE Before-image to PK
+	// columns before emit (see filterDeleteBefore in cdc_reader.go).
+	// Under the seed DDL above (PRIMARY KEY id), the Before should
+	// carry exactly {id} — non-PK columns (email, active) are
+	// excluded so the applier doesn't construct WHERE clauses with
+	// nil-IS-NULL predicates that fail to match under MINIMAL /
+	// NOBLOB binlog_row_image. Bob is row id=2 from the INSERT
+	// ordering above.
+	if _, ok := del.Before["id"]; !ok {
+		t.Errorf("delete.Before missing PK column id: %+v", del.Before)
+	}
+	if id, _ := del.Before["id"].(int64); id != 2 {
+		t.Errorf("delete.Before[id] = %#v; want int64(2) (bob's row)", del.Before["id"])
+	}
+	if _, present := del.Before["email"]; present {
+		t.Errorf("delete.Before unexpectedly carries non-PK email column (Bug 88 narrowing regressed?): %+v", del.Before)
+	}
+	if _, present := del.Before["active"]; present {
+		t.Errorf("delete.Before unexpectedly carries non-PK active column (Bug 88 narrowing regressed?): %+v", del.Before)
 	}
 
 	// Position bookkeeping: every emitted change must carry a non-empty

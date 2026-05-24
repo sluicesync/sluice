@@ -179,12 +179,26 @@ type CDCReader struct {
 
 // tableSchema is the slice of [ir.Table] the CDC dispatcher actually
 // needs: the column list, in declaration order, with each column's IR
-// type. Indexes and foreign keys are not consulted on a row event so
-// we don't pay to load them on every cache miss.
+// type, plus the primary-key column-name list. Indexes (other than the
+// PK) and foreign keys are not consulted on a row event so we don't
+// pay to load them on every cache miss.
+//
+// PrimaryKey was added for Bug 88: under `binlog_row_image=MINIMAL`
+// (and `NOBLOB` when BLOB/TEXT non-PK columns exist), the binlog
+// DELETE rows-event carries `nil` for non-PK columns; the CDC
+// reader's DELETE emit path narrows the Before-image to PK columns
+// only via [filterDeleteBefore] so the applier's `buildWhereClause`
+// doesn't emit "non_pk_col IS NULL" predicates that fail to match
+// real target rows. Same shape as the PG-side helper of the same
+// name. Empty slice on a PK-less table — [filterDeleteBefore] falls
+// back to the full Before-image in that case (the only usable
+// identity on a PK-less table is "every column", same fallback as
+// PG's REPLICA IDENTITY FULL on a PK-less relation).
 type tableSchema struct {
-	Schema  string
-	Name    string
-	Columns []*ir.Column
+	Schema     string
+	Name       string
+	Columns    []*ir.Column
+	PrimaryKey []string
 }
 
 // Close releases the schema-DB pool and stops the binlog syncer if one
@@ -713,6 +727,17 @@ func (r *CDCReader) dispatchRows(
 			if err != nil {
 				return fmt.Errorf("mysql: cdc: decode delete: %w", err)
 			}
+			// Bug 88: narrow the Before-image to PK columns before
+			// emit. Under `binlog_row_image=MINIMAL` (and `NOBLOB`
+			// when BLOB/TEXT non-PK columns exist), the binlog DELETE
+			// rows-event carries `nil` for non-PK columns; without
+			// this filter the applier's buildWhereClause would emit
+			// `non_pk_col IS NULL` predicates that fail to match real
+			// target rows whose non-PK columns hold non-null values
+			// — Bug-8-equivalent silent data loss. Mirrors the
+			// PG-side helper of the same name. See
+			// docs/adr/adr-0057-hard-delete-semantics-across-engines.md.
+			before = filterDeleteBefore(tbl, before)
 			if err := send(ctx, out, ir.Delete{
 				Position: pos,
 				Schema:   tbl.Schema,
@@ -1335,4 +1360,66 @@ func decodeBinlogRow(raw []any, cols []*ir.Column) (ir.Row, error) {
 		row[col.Name] = v
 	}
 	return row, nil
+}
+
+// filterDeleteBefore narrows a binlog DELETE event's Before-image down
+// to its primary-key columns. The narrowing is load-bearing for
+// silent-data-loss prevention (Bug 88), so the protocol detail driving
+// it is worth spelling out:
+//
+// Under `binlog_row_image=MINIMAL` the BEFORE-image of a DELETE
+// rows-event carries only the PK column(s); MySQL emits every non-PK
+// column as nil. Under `binlog_row_image=NOBLOB`, BLOB/TEXT/JSON
+// non-PK columns are also stripped (sent as nil), but every other
+// column carries its actual value. [decodeBinlogRow] faithfully
+// translates the binlog's nil markers into present-but-nil entries
+// in the row map. The applier's [buildWhereClause]
+// (`change_applier.go:1240-1248`) then emits "non_pk_col IS NULL"
+// for those entries, predicates that fail to match real rows whose
+// non-PK columns hold non-null values. The DELETE matches zero
+// rows, ADR-0010 absorbs the miss for resume idempotency, and the
+// position advances — silent data divergence.
+//
+// Filtering to PK columns produces a WHERE that uses only the
+// identity-key predicates, which is exactly what an idempotent
+// DELETE against the primary key needs. The same filter is correct
+// under FULL (every column is in the Before-image, but only the PK
+// columns are required to identify the row; the WHERE is still
+// right, just shorter).
+//
+// PK-less tables: MySQL allows tables without a PRIMARY KEY (and
+// historically the source-readability check at ADR-0036 refuses to
+// stream such a table, but a defensive fallback here keeps the
+// helper total). With no PK there is no shorter identity than the
+// full row image, so we hand back `before` verbatim. Same shape as
+// PG's filterDeleteBefore on a PK-less REPLICA IDENTITY FULL
+// relation.
+//
+// Same name and shape as the PG-side helper at
+// `internal/engines/postgres/cdc_reader.go`; the family-dispatched
+// fix locus matches between engines (per ADR-0057's Bug-74
+// family-pin discipline).
+func filterDeleteBefore(tbl *tableSchema, before ir.Row) ir.Row {
+	if len(tbl.PrimaryKey) == 0 {
+		// PK-less table: no shorter identity exists. Hand back the
+		// full image — anything else would silently lose DELETEs on
+		// PK-less tables, the very class of bug this helper exists
+		// to prevent.
+		return before
+	}
+	out := make(ir.Row, len(tbl.PrimaryKey))
+	for _, col := range tbl.PrimaryKey {
+		// A PK column missing from the Before-image is structurally
+		// impossible under any binlog_row_image setting (the PK is
+		// always carried; that's the whole point of MINIMAL). If it
+		// somehow happens, copying the (possibly nil) value through
+		// produces a `pk IS NULL` predicate — the same behaviour
+		// the un-narrowed code path would have produced. We don't
+		// refuse loudly here because the binlog wire format makes
+		// the "PK missing" case unreachable in practice and the
+		// alternative (returning an error from the rows-loop) is
+		// noisier than the structural impossibility warrants.
+		out[col] = before[col]
+	}
+	return out
 }

@@ -589,7 +589,56 @@ func loadTableSchema(ctx context.Context, db *sql.DB, schema, table string) (*ta
 	if len(out.Columns) == 0 {
 		return nil, fmt.Errorf("mysql: table %s.%s has no columns (does it exist?)", schema, table)
 	}
+
+	// Bug 88: the CDC reader's DELETE emit path narrows the BEFORE-image
+	// to PK columns to avoid silent zero-match on MINIMAL / NOBLOB
+	// sources (see filterDeleteBefore in cdc_reader.go). Load the PK
+	// column-name list now so the cached *tableSchema carries it.
+	// loadPrimaryKeyDB is a *sql.DB-flavoured sibling of the applier's
+	// loadPrimaryKey (which takes *sql.Tx).
+	pk, err := loadPrimaryKeyDB(ctx, db, schema, table)
+	if err != nil {
+		return nil, fmt.Errorf("mysql: loadTableSchema %s.%s: pk lookup: %w", schema, table, err)
+	}
+	out.PrimaryKey = pk
+
 	return out, nil
+}
+
+// loadPrimaryKeyDB reads the PK column-name list for the named table
+// via a *sql.DB rather than a *sql.Tx. Mirror of the applier's
+// loadPrimaryKey (change_applier.go), which uses a *sql.Tx for
+// symmetry with the data write tx; the CDC reader's schema cache
+// loads metadata outside any data tx, so a *sql.DB is correct here.
+//
+// Returns an empty slice (not nil) for tables with no PK; the
+// caller's [filterDeleteBefore] falls back to the full Before-image
+// in that case (same semantics as PG's REPLICA IDENTITY FULL on a
+// PK-less relation).
+func loadPrimaryKeyDB(ctx context.Context, db *sql.DB, schema, table string) ([]string, error) {
+	const q = `
+		SELECT column_name
+		FROM   information_schema.statistics
+		WHERE  table_schema = ?
+		  AND  table_name   = ?
+		  AND  index_name   = 'PRIMARY'
+		ORDER  BY seq_in_index`
+
+	rows, err := db.QueryContext(ctx, q, schema, table)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	pk := make([]string, 0, 4)
+	for rows.Next() {
+		var col string
+		if err := rows.Scan(&col); err != nil {
+			return nil, err
+		}
+		pk = append(pk, col)
+	}
+	return pk, rows.Err()
 }
 
 // applyGenerated populates the IR column's GeneratedExpr / GeneratedStored
