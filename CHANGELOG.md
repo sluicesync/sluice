@@ -6,6 +6,25 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.78.3] - 2026-05-24
+
+### Fixed
+
+- **`fix(engines/mysql): Bug 88 — narrow DELETE Before-image to PK columns (mirror PG's filterDeleteBefore) (#51)`** — Bug-8-equivalent silent-loss class discovered by the v0.78.2 #44 hard-delete family-matrix pin (per Bug 74's "pin the class, not the representative" discipline — the matrix existed to find exactly this class of finding). Under MySQL `binlog_row_image=MINIMAL` (and `NOBLOB` when a BLOB/TEXT non-PK column exists), the binlog DELETE rows-event carries `nil` for non-PK columns. The MySQL applier's `buildWhereClause` (`internal/engines/mysql/change_applier.go:1240-1248`) emitted `col IS NULL` predicates for those nils → DELETE matched zero rows on target → ADR-0010 idempotency absorbed the miss → position advanced → **source DELETE silently didn't propagate**. Exactly the Bug 8 pattern PG already fixed via `filterDeleteBefore` in `internal/engines/postgres/cdc_reader.go`. v0.78.3 mirrors the PG pattern: MySQL CDC reader now narrows the DELETE Before-image to PK columns only before emitting `ir.Delete`. The applier path is unchanged — `buildWhereClause` produces correct SQL when given only identity-key columns; the bug was in the CDC reader emitting the full Before-image with nils, not in the applier consuming them. Phase A instrumentation (six DEBUG probes from binlog emit through applier txExec) confirmed the hypothesis verbatim before the fix landed. The four matrix cells previously t.Skip()'d in `cdc_delete_matrix_mysql_integration_test.go` (`MINIMAL × {plain-delete, update-then-delete}` and `NOBLOB × toast-delete`) are now un-skipped and PASS. New unit pin `TestFilterDeleteBefore` in `internal/engines/mysql/cdc_reader_test.go` pins the narrowing behaviour across 5 sub-cases (MINIMAL, FULL, NOBLOB-with-TOAST, composite-PK, PK-less fallback).
+
+### Docs
+
+- **ADR-0057 closure** (`docs/adr/adr-0057-hard-delete-semantics-across-engines.md`) — appended "Bug 88 closure (v0.78.3, 2026-05-24)" subsection under the MySQL matrix section noting the fix locus (CDC reader, not applier), the four un-skipped cells, the unit-test pin, and the VStream-out-of-scope note. The original "Task #44 finding" text is preserved for historical context.
+
+### Tests
+
+- **4 matrix cells un-skipped** in `internal/pipeline/cdc_delete_matrix_mysql_integration_test.go`: `binlog_row_image=MINIMAL × {plain-delete, update-then-delete}` and `binlog_row_image=NOBLOB × toast-delete`. All now PASS post-fix.
+- **`test(engines/mysql): cdc_reader_test.go (Bug 88 unit pin)`** — `TestFilterDeleteBefore` with 5 sub-cases pinning the PK-only narrowing.
+
+### Compatibility
+
+- **Drop-in upgrade from v0.78.2.** Pure bugfix; no flag surface change. **Severity a — silent-loss class.** Operators running MySQL→{MySQL, PG} streams against sources with `binlog_row_image` set to MINIMAL (or NOBLOB with BLOB/TEXT columns) silently lost DELETEs prior to v0.78.3. `docs/dev/notes/prep-change-applier.md:26` declares `binlog_row_image=FULL` as the only supported config — so in spec, this only affected operators who'd switched to MINIMAL/NOBLOB for perf. The fix closes the gap regardless of declared support, matching PG's already-narrowed behavior across the engine pair.
+
 ## [0.78.2] - 2026-05-23
 
 ### Fixed
