@@ -342,7 +342,11 @@ func (w *SchemaWriter) syncOneIdentity(ctx context.Context, table *ir.Table, col
 	const setvalQuery = `
 		SELECT setval(pg_get_serial_sequence($1, $2), $3, true)
 		WHERE pg_get_serial_sequence($1, $2) IS NOT NULL`
-	tableArg := w.schema + "." + table.Name
+	// pg_get_serial_sequence parses arg 1 as an identifier text → regclass;
+	// per SQL rules unquoted identifiers fold to lowercase. We must
+	// quote both schema and table so case-preserved names ("Widgets")
+	// resolve to the actual relation (Bug 87 / task #42 regression pin).
+	tableArg := quoteIdent(w.schema) + "." + quoteIdent(table.Name)
 	if _, err := w.db.ExecContext(ctx, setvalQuery, tableArg, column, maxVal.Int64); err != nil {
 		return fmt.Errorf("setval: %w", err)
 	}
