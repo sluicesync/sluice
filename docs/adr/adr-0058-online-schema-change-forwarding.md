@@ -543,6 +543,97 @@ sibling classes that all happened to surface as the same symptom
 locus keeps the fix readable and gives future contributors three
 independent regression guards rather than one bundled patch.
 
+### Bug 90 closure (v0.79.1, 2026-05-24)
+
+v0.79.0 shipped §2a's "refuse loudly on computed DEFAULT" guard, but
+the check fired only when [ir.Column.Default] was [ir.DefaultExpression].
+The CDC reader's projection drops the DEFAULT field entirely:
+pgoutput's RelationMessage carries no `attdefault` slot, and MySQL's
+TableMapEvent carries no `COLUMN_DEFAULT`. The post-DDL SchemaSnapshot
+therefore arrived at the intercept with `Default == nil` on every
+column, so the guard was dead-code in production. Operators turning
+on `--forward-schema-add-column` for a routine `created_at TIMESTAMPTZ
+DEFAULT NOW()` ALTER saw the happy-path log line, the target ALTER
+landed, and existing target rows silently diverged from source:
+source materialized per-row insert timestamps via the table rewrite,
+target materialized one target-session-evaluated timestamp for its
+own pre-existing rows (or NULL on engines that don't backfill on
+ADD COLUMN). The class also reproduced with `nextval(seq)`,
+confirming the failure dispatches on the DEFAULT-expression
+**volatility class**, not on `NOW()` specifically. Severity-A
+silent-loss on the marquee F12+F16 forwarding path.
+
+The fix lives at two loci:
+
+1. **Source-side default probe.** A new
+   `addColumnForwardSchemaReader` ([ir.SchemaReader]) opens alongside
+   the existing forward-side writer when `--forward-schema-add-column`
+   is set. The intercept's `schemaForwardDeps` carries a
+   `defaultProberFunc` closure backed by that reader. When an ADD
+   COLUMN forwards, the intercept consults the column's
+   `ir.Column.Default` — if it's nil (the production CDC case), the
+   prober runs a single `ReadSchema()` on the source and surfaces the
+   canonical `ir.DefaultValue`. The probe runs at most once per ADD
+   COLUMN forward (rare event), so the cost is bounded.
+
+2. **Text-based volatility classifier.** A new
+   `classifyDefaultVolatility(expr string) (safe bool, reason string)`
+   scans the DEFAULT expression text against an explicit volatility
+   deny-list (NOW / CURRENT_TIMESTAMP / nextval / random /
+   gen_random_uuid / UUID / RAND / LAST_INSERT_ID / CURRENT_USER /
+   inet_client_addr / … on both PG and MySQL) and a small
+   deterministic allow-list (ABS / COALESCE / CAST / …). Any function
+   call not on either list triggers **refuse-on-uncertainty** — better
+   to over-refuse than to silently corrupt. The brief's Bug 74
+   "pin the class, not the representative" discipline applies: the
+   unit test pin matrix covers every volatility family (time-volatile
+   / sequence-stateful / random / session-state) on both PG and
+   MySQL syntax, plus the safe cases (literal / NULL / numeric /
+   quoted-string / allowlist-deterministic) and the refuse-on-
+   uncertainty path.
+
+**Refuse-message shape.** Names the column, the table, the actual
+DEFAULT expression text, the volatility reason ("references
+volatile/stateful identifier `now`" / "references unknown function
+`my_default`"), and the drained-model recovery hint:
+
+```
+pipeline: apply changes: pipeline: forward schema add-column: ADD
+COLUMN "created_at" on "public.widgets" has a computed DEFAULT
+expression "now()" which references volatile/stateful identifier
+"now" — target-session evaluation diverges from source per-row
+insert (ADR-0058 §2a). recovery: drained model — run 'sluice sync
+stop --wait', then run schema migrate … against "public.widgets",
+then resume via 'sluice sync start --resume'.
+```
+
+**Pinned by:**
+
+- `internal/pipeline/schema_forward_volatility_test.go` —
+  `TestClassifyDefaultVolatility_Class` (53-cell matrix covering the
+  volatility families × {PG-syntax, MySQL-syntax,
+  refuse-on-uncertainty, allowlist-deterministic}) and
+  `TestClassifyDefaultValueVolatility_IRTypes` (the
+  [ir.DefaultValue] variant dispatch).
+- `internal/pipeline/schema_forward_intercept_test.go` —
+  `TestForwardAddColumn_ProbedVolatileDefault_Refuse` (6-cell
+  class-pin: NOW / CURRENT_TIMESTAMP / nextval / random / UUID /
+  unknown-fn), `TestForwardAddColumn_ProbedLiteralDefault_Forwards`
+  (5-cell safe-pass control), and
+  `TestForwardAddColumn_ProberError_Refuse` (probe-error
+  refuse-on-uncertainty).
+- `internal/pipeline/migrate_add_column_forward_pg_integration_test.go`
+  — `TestAddColumnForward_PG_RefusesComputedDefault` (NOW() +
+  nextval(seq) end-to-end on PG → PG).
+- `internal/pipeline/migrate_add_column_forward_mysql_integration_test.go`
+  — `TestAddColumnForward_MySQL_RefusesComputedDefault`
+  (CURRENT_TIMESTAMP + UUID() end-to-end on MySQL → MySQL).
+
+The pre-existing happy-path integration tests
+(`*_FlagOn_ForwardsALTER`, `*_Backfill`, the four cross-engine cells)
+remain green — literal DEFAULTs and no-DEFAULT ADD COLUMNs continue
+to forward.
+
 ## Glossary anchors
 
 - "ADD COLUMN forwarding": the new behavior this ADR ships.

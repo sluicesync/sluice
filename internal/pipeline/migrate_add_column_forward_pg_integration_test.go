@@ -23,6 +23,7 @@ package pipeline
 import (
 	"context"
 	"database/sql"
+	"strings"
 	"testing"
 	"time"
 
@@ -315,5 +316,139 @@ func TestAddColumnForward_PG_FlagOff_RefusesLoudly(t *testing.T) {
 	case <-runErr:
 	case <-time.After(15 * time.Second):
 		t.Fatal("Streamer.Run did not return after ctx cancel")
+	}
+}
+
+// TestAddColumnForward_PG_RefusesComputedDefault pins Bug 90's fix
+// (v0.79.1): v0.79.0 silently forwarded an ADD COLUMN with a
+// computed DEFAULT (NOW() / nextval / random / etc.) because the CDC
+// reader's RelationMessage projection dropped the DEFAULT clause and
+// the existing intercept's `ir.DefaultExpression` check found
+// Default=nil. The fix wires a source-side SchemaReader probe and a
+// text-based volatility scan; this test exercises the production
+// flow end-to-end on PG → PG.
+//
+// Class-pin (Bug 74): the test runs two scenarios — NOW() (time-
+// volatile) and nextval(seq) (sequence-stateful). The fix dispatches
+// on the same volatility classifier so a single representative would
+// only prove the classifier triggered, not that every class is
+// covered. Two scenarios in one test file keeps the integration
+// suite's runtime in check while still pinning both major Bug 90
+// failure shapes.
+func TestAddColumnForward_PG_RefusesComputedDefault(t *testing.T) {
+	scenarios := []struct {
+		name   string
+		ddl    string
+		expect string // substring expected in the streamer error
+	}{
+		{
+			name:   "now-default",
+			ddl:    `ALTER TABLE widgets ADD COLUMN created_at TIMESTAMPTZ DEFAULT NOW();`,
+			expect: "now",
+		},
+		{
+			name: "nextval-default",
+			ddl: `CREATE SEQUENCE IF NOT EXISTS widgets_counter START 100;
+ALTER TABLE widgets ADD COLUMN seq_id BIGINT DEFAULT nextval('widgets_counter');`,
+			expect: "nextval",
+		},
+	}
+	for _, sc := range scenarios {
+		t.Run(sc.name, func(t *testing.T) {
+			sourceDSN, targetDSN, cleanup := startPostgresLogical(t)
+			defer cleanup()
+
+			applyPGDDL(t, sourceDSN, `
+				CREATE TABLE widgets (
+					id BIGSERIAL PRIMARY KEY,
+					name TEXT NOT NULL
+				);
+				ALTER TABLE widgets REPLICA IDENTITY FULL;
+				INSERT INTO widgets (name) VALUES ('alpha'), ('beta');
+			`)
+
+			pgEng, ok := engines.Get("postgres")
+			if !ok {
+				t.Fatal("postgres engine not registered")
+			}
+
+			streamer := &Streamer{
+				Source:                 pgEng,
+				Target:                 pgEng,
+				SourceDSN:              sourceDSN,
+				TargetDSN:              targetDSN,
+				StreamID:               "test-addcol-refuse-vol-" + sc.name,
+				ForwardSchemaAddColumn: true,
+			}
+
+			streamCtx, streamCancel := context.WithCancel(context.Background())
+			defer streamCancel()
+
+			runErr := make(chan error, 1)
+			go func() { runErr <- streamer.Run(streamCtx) }()
+
+			if !waitForPGRowCount(t, targetDSN, "widgets", 2, 30*time.Second) {
+				t.Fatalf("phase A: bulk-copy never landed seed rows")
+			}
+
+			// Source ALTER with the volatile DEFAULT + post-ALTER
+			// INSERT to push the DDL through PG's logical replication.
+			// The intercept must refuse the ADD COLUMN before issuing
+			// the target ALTER; the post-ALTER INSERT then never
+			// lands because the schema's diverged.
+			applyPGDDL(t, sourceDSN, sc.ddl+`
+				INSERT INTO widgets (name) VALUES ('gamma');
+			`)
+
+			// Wait for the stream to surface the refuse-loudly error.
+			// The streamer's retry loop may try a few times before
+			// giving up; cap the wait to keep CI runtime in check.
+			var err error
+			select {
+			case err = <-runErr:
+			case <-time.After(60 * time.Second):
+				t.Fatal("streamer did not surface refuse-loudly error within timeout")
+			}
+			if err == nil {
+				t.Fatal("streamer returned nil error; expected refuse-loudly on computed DEFAULT")
+			}
+			errStr := strings.ToLower(err.Error())
+			if !strings.Contains(errStr, "computed default") {
+				t.Errorf("error %q does not mention 'computed default'", err)
+			}
+			if !strings.Contains(errStr, sc.expect) {
+				t.Errorf("error %q does not mention %q (volatile function name)", err, sc.expect)
+			}
+			if !strings.Contains(err.Error(), "ADR-0058 §2a") {
+				t.Errorf("error %q does not cite ADR-0058 §2a", err)
+			}
+
+			// The target widgets table must NOT have the new column
+			// (the intercept refused BEFORE issuing the target
+			// ALTER).
+			tgtDB, openErr := sql.Open("pgx", targetDSN)
+			if openErr != nil {
+				t.Fatalf("open target: %v", openErr)
+			}
+			defer func() { _ = tgtDB.Close() }()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+
+			var newColCount int
+			colName := "created_at"
+			if sc.name == "nextval-default" {
+				colName = "seq_id"
+			}
+			if err := tgtDB.QueryRowContext(ctx, `
+				SELECT COUNT(*) FROM information_schema.columns
+				WHERE table_schema='public' AND table_name='widgets' AND column_name=$1
+			`, colName).Scan(&newColCount); err != nil {
+				t.Fatalf("check target column: %v", err)
+			}
+			if newColCount != 0 {
+				t.Errorf("target widgets.%s exists — intercept did NOT refuse the volatile DEFAULT (silent forwarding regression)", colName)
+			}
+		})
 	}
 }

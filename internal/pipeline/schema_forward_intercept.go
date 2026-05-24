@@ -65,7 +65,31 @@ type schemaForwardDeps struct {
 	// shipped target rows after the ALTER lands. Built by the Streamer
 	// when --backfill-added-column is set; nil otherwise.
 	backfill *schemaForwardBackfill
+
+	// defaultProber, when non-nil, returns the source's canonical
+	// [ir.DefaultValue] for the named column. Used by the ADR-0058 §2a
+	// volatility refusal to surface the DEFAULT text that the CDC
+	// reader's projection drops (pgoutput RelationMessage doesn't
+	// carry attdefault; MySQL's TableMapEvent doesn't carry it
+	// either). Built by [engageAddColumnForward] using a source-side
+	// SchemaReader; nil in unit tests that exercise the intercept
+	// against synthesized SchemaSnapshots whose IR already carries the
+	// DEFAULT field (e.g. [ir.DefaultExpression]). Errors from the
+	// prober propagate as refuse-loudly via the standard intercept
+	// path — refuse-on-uncertainty.
+	defaultProber defaultProberFunc
 }
+
+// defaultProberFunc returns the source's canonical [ir.DefaultValue]
+// for the column identified by (schema, table, column). Non-nil
+// (schema, table) must match the source's catalog naming; the
+// schema may be empty (MySQL's bare-name convention). Returns
+// ([ir.DefaultNone]{}, nil) if the column has no DEFAULT clause.
+//
+// The closure may issue a database query on every call — callers
+// should batch when possible (the intercept calls once per ADD
+// COLUMN forward, not once per row).
+type defaultProberFunc func(ctx context.Context, schema, table, column string) (ir.DefaultValue, error)
 
 // schemaForwardBackfill bundles the source-read + applier-write side
 // of the optional backfill loop. Held by [schemaForwardDeps] when
@@ -308,7 +332,7 @@ func applyAddColumnForward(
 	shape Shape,
 	out chan<- ir.Change,
 ) error {
-	if err := refuseComputedDefaults(tableName, shape.AddedColumns); err != nil {
+	if err := refuseComputedDefaults(ctx, deps, tableName, snap, shape.AddedColumns); err != nil {
 		return err
 	}
 	retargetedTable, retargetedAdded := retargetAddedColumns(
@@ -340,27 +364,90 @@ func applyAddColumnForward(
 }
 
 // refuseComputedDefaults walks the added columns and returns an
-// operator-actionable error if any column carries a
-// [ir.DefaultExpression]. ADR-0058 §2a — computed defaults evaluate
-// in the target's session at ALTER time, not the source's per-row
-// insert context; silent forwarding would diverge.
+// operator-actionable error if any column's source DEFAULT expression
+// is non-deterministic / stateful / session-dependent. ADR-0058 §2a —
+// such DEFAULTs evaluate in the target's session at ALTER time, not
+// the source's per-row insert context; silent forwarding would
+// diverge. Bug 90 (v0.79.1) is exactly this gap on the live CDC path.
 //
-// [ir.DefaultLiteral] and [ir.DefaultNone] pass through cleanly.
-func refuseComputedDefaults(tableName string, cols []*ir.Column) error {
+// Probe order:
+//
+//   - If the column's [ir.Column.Default] is already populated as a
+//     non-nil [ir.DefaultValue] (i.e. the test harness wired the IR
+//     directly, or a future CDC reader carries the field), classify
+//     the in-band value via [classifyDefaultValueVolatility].
+//   - Otherwise (the production CDC case — pgoutput's RelationMessage
+//     and MySQL's TableMapEvent both drop the DEFAULT), the
+//     deps.defaultProber is called to surface the source's canonical
+//     Default text. The probe is a single targeted query against the
+//     source SchemaReader; cost is one round-trip per ADD COLUMN
+//     forward (rare event).
+//   - If the prober is also nil (a unit test that didn't wire one),
+//     pass through — the test's IR is the ground truth.
+//   - If the prober returns an error, refuse loudly with the probe
+//     error wrapped (refuse-on-uncertainty).
+//
+// Detection is text-based — see [classifyDefaultVolatility]. The
+// allowlist + denylist is the documented examples from ADR-0058 §2a
+// (NOW, nextval, random) plus the obvious cousins across PG and
+// MySQL. Unknown function names trigger refusal (better safe than
+// silent corruption).
+func refuseComputedDefaults(
+	ctx context.Context,
+	deps schemaForwardDeps,
+	tableName string,
+	snap ir.SchemaSnapshot,
+	cols []*ir.Column,
+) error {
 	for _, c := range cols {
 		if c == nil {
 			continue
 		}
-		if _, isExpr := c.Default.(ir.DefaultExpression); isExpr {
+		def := c.Default
+		// CDC projection drops the DEFAULT — probe the source for
+		// the canonical text when the in-band value is nil.
+		if def == nil && deps.defaultProber != nil {
+			probed, err := deps.defaultProber(ctx, snap.Schema, snap.Table, c.Name)
+			if err != nil {
+				// Refuse-on-uncertainty: a probe error can't be
+				// distinguished from "the column does have a
+				// volatile default but we couldn't read it." Safe
+				// path is to refuse.
+				return fmt.Errorf(
+					"probe DEFAULT for ADD COLUMN %q on %q: %w "+
+						"(refusing on uncertainty; ADR-0058 §2a). %s",
+					c.Name, tableName, err, forwardRecoveryHint(tableName),
+				)
+			}
+			def = probed
+		}
+		safe, reason := classifyDefaultValueVolatility(def)
+		if !safe {
+			exprText := defaultExpressionText(def)
 			return fmt.Errorf(
 				"ADD COLUMN %q on %q has a computed DEFAULT expression "+
-					"(target-session evaluation diverges from source per-row "+
-					"insert; ADR-0058 §2a). %s",
-				c.Name, tableName, forwardRecoveryHint(tableName),
+					"%q which %s — target-session evaluation diverges from "+
+					"source per-row insert (ADR-0058 §2a). %s",
+				c.Name, tableName, exprText, reason,
+				forwardRecoveryHint(tableName),
 			)
 		}
 	}
 	return nil
+}
+
+// defaultExpressionText returns the human-readable expression text for
+// a [ir.DefaultValue] — for inclusion in the refuse-loudly message.
+// Empty string for [ir.DefaultNone] / nil.
+func defaultExpressionText(d ir.DefaultValue) string {
+	switch v := d.(type) {
+	case ir.DefaultExpression:
+		return v.Expr
+	case ir.DefaultLiteral:
+		return v.Value
+	default:
+		return ""
+	}
 }
 
 // retargetAddedColumns wraps the post IR + the slice of added columns

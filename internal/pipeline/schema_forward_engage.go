@@ -76,6 +76,22 @@ func (s *Streamer) engageAddColumnForward(ctx context.Context) error {
 		}
 		s.addColumnForwardWriter = sw
 	}
+	// Bug 90 (v0.79.1): a source-side SchemaReader is required for the
+	// ADR-0058 §2a volatility probe. pgoutput's RelationMessage and
+	// MySQL's TableMapEvent both drop the DEFAULT clause, so the
+	// intercept can't classify a computed DEFAULT from the CDC IR
+	// alone. The reader is opened once per stream and shared across
+	// every ADD COLUMN forward (the probe issues one ReadSchema per
+	// forward — a rare event).
+	if s.addColumnForwardSchemaReader == nil {
+		sr, err := s.Source.OpenSchemaReader(ctx, s.SourceDSN)
+		if err != nil {
+			_ = closeIfErrIgnored(s.addColumnForwardWriter)
+			s.addColumnForwardWriter = nil
+			return fmt.Errorf("pipeline: engage add-column-forward: open source schema reader: %w", err)
+		}
+		s.addColumnForwardSchemaReader = sr
+	}
 	if s.BackfillAddedColumn && s.addColumnForwardReader == nil {
 		rr, err := s.Source.OpenRowReader(ctx, s.SourceDSN)
 		if err != nil {
@@ -95,8 +111,8 @@ func (s *Streamer) engageAddColumnForward(ctx context.Context) error {
 }
 
 // closeAddColumnForward releases the SchemaWriter + (optional)
-// RowReader opened by [engageAddColumnForward]. Idempotent — safe to
-// call on streams that never engaged.
+// RowReader + SchemaReader opened by [engageAddColumnForward].
+// Idempotent — safe to call on streams that never engaged.
 func (s *Streamer) closeAddColumnForward() {
 	if s == nil {
 		return
@@ -108,6 +124,65 @@ func (s *Streamer) closeAddColumnForward() {
 	if s.addColumnForwardReader != nil {
 		_ = closeIfErrIgnored(s.addColumnForwardReader)
 		s.addColumnForwardReader = nil
+	}
+	if s.addColumnForwardSchemaReader != nil {
+		_ = closeIfErrIgnored(s.addColumnForwardSchemaReader)
+		s.addColumnForwardSchemaReader = nil
+	}
+}
+
+// newSourceDefaultProber returns a [defaultProberFunc] backed by the
+// given source [ir.SchemaReader]. The closure issues a single
+// targeted ReadSchema() per call and walks the result to find the
+// column's [ir.DefaultValue].
+//
+// This is wasteful at scale (ReadSchema reads every table the source
+// exposes), but the intercept calls it at most once per ADD COLUMN
+// forward — a rare event. A future refinement could add a
+// per-column probe interface to [ir.SchemaReader]; until then,
+// ReadSchema is the only available surface every shipping engine
+// implements.
+//
+// Bug 90 (v0.79.1): probing the source is the only way to surface
+// the canonical DEFAULT text — pgoutput's RelationMessage and
+// MySQL's TableMapEvent both drop the field, so the in-band CDC IR
+// cannot be the source of truth for ADR-0058 §2a's volatility
+// classification.
+func newSourceDefaultProber(sr ir.SchemaReader) defaultProberFunc {
+	return func(ctx context.Context, schema, table, column string) (ir.DefaultValue, error) {
+		sch, err := sr.ReadSchema(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("read source schema: %w", err)
+		}
+		for _, t := range sch.Tables {
+			if t == nil {
+				continue
+			}
+			// Match on table name; schema may be empty on MySQL
+			// (the SchemaReader convention) so prefer name-match
+			// when the caller's schema is empty OR the catalog's
+			// schema is empty.
+			if t.Name != table {
+				continue
+			}
+			if schema != "" && t.Schema != "" && schema != t.Schema {
+				continue
+			}
+			for _, c := range t.Columns {
+				if c == nil || c.Name != column {
+					continue
+				}
+				if c.Default == nil {
+					return ir.DefaultNone{}, nil
+				}
+				return c.Default, nil
+			}
+		}
+		// Column not found — surface as a probe error so the
+		// intercept refuses-on-uncertainty rather than silently
+		// passing.
+		return nil, fmt.Errorf("column %q on %q.%q not present in source catalog",
+			column, schema, table)
 	}
 }
 

@@ -324,6 +324,173 @@ func TestForwardAddColumn_ComputedDefault_Refuse(t *testing.T) {
 	}
 }
 
+// TestForwardAddColumn_ProbedVolatileDefault_Refuse pins the Bug 90
+// production path (v0.79.1): the CDC reader's RelationMessage /
+// TableMapEvent projection drops the column's DEFAULT clause, so the
+// post-DDL SchemaSnapshot's IR arrives with Default == nil. The
+// intercept must call the source-side default prober to surface the
+// canonical text — if the prober returns a volatile/stateful
+// DEFAULT, the intercept must refuse loudly.
+//
+// Class-pin (Bug 74): cover representative volatility classes
+// (time-volatile, sequence-stateful, random, session-state) plus
+// refuse-on-uncertainty (unknown function name).
+func TestForwardAddColumn_ProbedVolatileDefault_Refuse(t *testing.T) {
+	cases := []struct {
+		name       string
+		probedExpr string
+		wantIn     string // substring expected in the refusal (lower-cased)
+	}{
+		{"now-pg", "now()", "now"},
+		{"current-timestamp-mysql", "CURRENT_TIMESTAMP", "current_timestamp"},
+		{"nextval-pg", "nextval('my_seq'::regclass)", "nextval"},
+		{"random-pg", "random()", "random"},
+		{"uuid-mysql", "UUID()", "uuid"},
+		{"unknown-fn-uncertainty", "my_custom_default()", "unknown function"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			in := make(chan ir.Change, 2)
+			applier := &fakeShapeApplier{}
+			pre := addColForwardTable("users")
+			// Post IR carries the new column with Default=nil — the
+			// production CDC-projection case. The prober is the
+			// source of truth.
+			post := addColForwardTable("users", &ir.Column{
+				Name: "v_col", Type: ir.Timestamp{}, Nullable: true,
+			})
+			in <- addColForwardSnap(pre)
+			in <- addColForwardSnap(post)
+			close(in)
+			errStore := &atomic.Pointer[error]{}
+			out := interceptAddColumnForward(ctx, in, nil, schemaForwardDeps{
+				applier:          applier,
+				sourceEngineName: "postgres",
+				targetEngineName: "postgres",
+				defaultProber: func(_ context.Context, _, _, col string) (ir.DefaultValue, error) {
+					if col == "v_col" {
+						return ir.DefaultExpression{Expr: tc.probedExpr}, nil
+					}
+					return ir.DefaultNone{}, nil
+				},
+			}, errStore)
+			_ = drainChannel(t, out, time.Second)
+			ePtr := errStore.Load()
+			if ePtr == nil {
+				t.Fatalf("expected refuse-loudly on probed volatile DEFAULT %q; got nil", tc.probedExpr)
+			}
+			errStr := strings.ToLower((*ePtr).Error())
+			if !strings.Contains(errStr, tc.wantIn) {
+				t.Errorf("error %q does not mention %q", errStr, tc.wantIn)
+			}
+			if !strings.Contains((*ePtr).Error(), "ADR-0058 §2a") {
+				t.Errorf("error %q does not cite ADR-0058 §2a", (*ePtr).Error())
+			}
+			if applier.addColCalls != 0 {
+				t.Errorf("AlterAddColumn called %d times on probed-volatile path; want 0", applier.addColCalls)
+			}
+		})
+	}
+}
+
+// TestForwardAddColumn_ProbedLiteralDefault_Forwards verifies the
+// happy-path on the production CDC case: the IR carries Default=nil,
+// the prober returns a DefaultLiteral / DefaultNone, the ALTER
+// forwards cleanly.
+func TestForwardAddColumn_ProbedLiteralDefault_Forwards(t *testing.T) {
+	cases := []struct {
+		name       string
+		probed     ir.DefaultValue
+		probeCalls int
+	}{
+		{"no-default", ir.DefaultNone{}, 1},
+		{"literal-string", ir.DefaultLiteral{Value: "pending"}, 1},
+		{"literal-numeric", ir.DefaultLiteral{Value: "0"}, 1},
+		{"expr-literal-quoted", ir.DefaultExpression{Expr: "'active'"}, 1},
+		{"expr-allowlist-coalesce", ir.DefaultExpression{Expr: "COALESCE(NULL, 0)"}, 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			in := make(chan ir.Change, 2)
+			applier := &fakeShapeApplier{}
+			pre := addColForwardTable("users")
+			post := addColForwardTable("users", &ir.Column{
+				Name: "status", Type: ir.Varchar{Length: 20}, Nullable: true,
+			})
+			in <- addColForwardSnap(pre)
+			in <- addColForwardSnap(post)
+			close(in)
+			errStore := &atomic.Pointer[error]{}
+			calls := 0
+			out := interceptAddColumnForward(ctx, in, nil, schemaForwardDeps{
+				applier:          applier,
+				sourceEngineName: "postgres",
+				targetEngineName: "postgres",
+				defaultProber: func(_ context.Context, _, _, _ string) (ir.DefaultValue, error) {
+					calls++
+					return tc.probed, nil
+				},
+			}, errStore)
+			_ = drainChannel(t, out, time.Second)
+			if e := errStore.Load(); e != nil {
+				t.Errorf("safe probed default rejected: %v", *e)
+			}
+			if applier.addColCalls != 1 {
+				t.Errorf("AlterAddColumn calls = %d; want 1", applier.addColCalls)
+			}
+			if calls != tc.probeCalls {
+				t.Errorf("prober calls = %d; want %d", calls, tc.probeCalls)
+			}
+		})
+	}
+}
+
+// TestForwardAddColumn_ProberError_Refuse pins refuse-on-uncertainty
+// when the source-side probe itself errors (connection drop, catalog
+// permission, column-missing). The intercept must refuse rather than
+// silently forwarding without knowing the DEFAULT shape.
+func TestForwardAddColumn_ProberError_Refuse(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	in := make(chan ir.Change, 2)
+	applier := &fakeShapeApplier{}
+	pre := addColForwardTable("users")
+	post := addColForwardTable("users", &ir.Column{
+		Name: "newcol", Type: ir.Integer{Width: 32}, Nullable: true,
+	})
+	in <- addColForwardSnap(pre)
+	in <- addColForwardSnap(post)
+	close(in)
+	errStore := &atomic.Pointer[error]{}
+	probeErr := errors.New("source catalog read failed: connection reset")
+	out := interceptAddColumnForward(ctx, in, nil, schemaForwardDeps{
+		applier:          applier,
+		sourceEngineName: "postgres",
+		targetEngineName: "postgres",
+		defaultProber: func(_ context.Context, _, _, _ string) (ir.DefaultValue, error) {
+			return nil, probeErr
+		},
+	}, errStore)
+	_ = drainChannel(t, out, time.Second)
+	ePtr := errStore.Load()
+	if ePtr == nil {
+		t.Fatalf("expected refuse-on-uncertainty on probe error; got nil")
+	}
+	if !errors.Is(*ePtr, probeErr) {
+		t.Errorf("error chain does not include probe error: %v", *ePtr)
+	}
+	if !strings.Contains((*ePtr).Error(), "refusing on uncertainty") {
+		t.Errorf("error %q does not mention refuse-on-uncertainty", (*ePtr).Error())
+	}
+	if applier.addColCalls != 0 {
+		t.Errorf("AlterAddColumn called %d times on probe-error path; want 0", applier.addColCalls)
+	}
+}
+
 // TestForwardAddColumn_LiteralDefault_Forwards verifies that
 // ir.DefaultLiteral (a static constant) does NOT trip the
 // computed-default refusal — operators using `DEFAULT 0` or

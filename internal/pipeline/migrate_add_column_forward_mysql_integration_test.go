@@ -11,6 +11,7 @@ package pipeline
 import (
 	"context"
 	"database/sql"
+	"strings"
 	"testing"
 	"time"
 
@@ -195,5 +196,122 @@ func TestAddColumnForward_MySQL_Backfill(t *testing.T) {
 	case <-runErr:
 	case <-time.After(15 * time.Second):
 		t.Fatal("Streamer.Run did not return after ctx cancel")
+	}
+}
+
+// TestAddColumnForward_MySQL_RefusesComputedDefault pins Bug 90's fix
+// (v0.79.1) on MySQL → MySQL. MySQL's TableMapEvent doesn't carry
+// COLUMN_DEFAULT either, so the production CDC path arrives at the
+// intercept with Default=nil; the fix's source-side SchemaReader
+// probe surfaces the canonical text and the text-scan classifies
+// the volatility class.
+//
+// Class-pin (Bug 74): NOW() (time-volatile) + UUID() (random /
+// non-deterministic). MySQL also has UTC_TIMESTAMP, RAND(),
+// LAST_INSERT_ID — those are pinned in the unit-test class matrix
+// (TestClassifyDefaultVolatility_Class) so the integration tier
+// stays small.
+func TestAddColumnForward_MySQL_RefusesComputedDefault(t *testing.T) {
+	scenarios := []struct {
+		name   string
+		ddl    string
+		col    string
+		expect string // substring expected in error (lower-cased)
+	}{
+		{
+			name:   "now-default",
+			ddl:    "ALTER TABLE widgets ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;",
+			col:    "created_at",
+			expect: "current_timestamp",
+		},
+		{
+			name:   "uuid-default",
+			ddl:    "ALTER TABLE widgets ADD COLUMN uid VARCHAR(36) DEFAULT (UUID());",
+			col:    "uid",
+			expect: "uuid",
+		},
+	}
+	for _, sc := range scenarios {
+		t.Run(sc.name, func(t *testing.T) {
+			sourceDSN, targetDSN, cleanup := startMySQLBinlog(t)
+			defer cleanup()
+
+			applyDDLMySQL(t, sourceDSN, `
+				CREATE TABLE widgets (
+					id BIGINT NOT NULL PRIMARY KEY,
+					name VARCHAR(64) NOT NULL
+				) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+			`)
+			applyDDLMySQL(t, sourceDSN, "INSERT INTO widgets (id, name) VALUES (1, 'alpha'), (2, 'beta');")
+
+			myEng, ok := engines.Get("mysql")
+			if !ok {
+				t.Fatal("mysql engine not registered")
+			}
+
+			streamer := &Streamer{
+				Source:                 myEng,
+				Target:                 myEng,
+				SourceDSN:              sourceDSN,
+				TargetDSN:              targetDSN,
+				StreamID:               "test-addcol-refuse-mysql-" + sc.name,
+				ForwardSchemaAddColumn: true,
+			}
+
+			streamCtx, streamCancel := context.WithCancel(context.Background())
+			defer streamCancel()
+
+			runErr := make(chan error, 1)
+			go func() { runErr <- streamer.Run(streamCtx) }()
+
+			if !waitForRowCountMySQL(t, targetDSN, "widgets", 2, 30*time.Second) {
+				t.Fatalf("phase A: bulk-copy never landed seed rows")
+			}
+
+			applyDDLMySQL(t, sourceDSN, sc.ddl)
+			applyDDLMySQL(t, sourceDSN, "INSERT INTO widgets (id, name) VALUES (3, 'gamma');")
+
+			var err error
+			select {
+			case err = <-runErr:
+			case <-time.After(60 * time.Second):
+				t.Fatal("streamer did not surface refuse-loudly error within timeout")
+			}
+			if err == nil {
+				t.Fatal("streamer returned nil error; expected refuse-loudly on computed DEFAULT")
+			}
+			errStr := strings.ToLower(err.Error())
+			if !strings.Contains(errStr, "computed default") {
+				t.Errorf("error %q does not mention 'computed default'", err)
+			}
+			if !strings.Contains(errStr, sc.expect) {
+				t.Errorf("error %q does not mention %q", err, sc.expect)
+			}
+			if !strings.Contains(err.Error(), "ADR-0058 §2a") {
+				t.Errorf("error %q does not cite ADR-0058 §2a", err)
+			}
+
+			// The target widgets table must NOT have the new column
+			// (the intercept refused BEFORE issuing the target ALTER).
+			tgtDB, openErr := sql.Open("mysql", targetDSN)
+			if openErr != nil {
+				t.Fatalf("open target: %v", openErr)
+			}
+			defer func() { _ = tgtDB.Close() }()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+
+			var newColCount int
+			if err := tgtDB.QueryRowContext(ctx, `
+				SELECT COUNT(*) FROM information_schema.columns
+				WHERE table_schema = DATABASE() AND table_name='widgets' AND column_name=?
+			`, sc.col).Scan(&newColCount); err != nil {
+				t.Fatalf("check target column: %v", err)
+			}
+			if newColCount != 0 {
+				t.Errorf("target widgets.%s exists — intercept did NOT refuse the volatile DEFAULT (silent forwarding regression)", sc.col)
+			}
+		})
 	}
 }

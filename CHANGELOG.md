@@ -6,6 +6,14 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`fix(pipeline): refuse loudly on ADD COLUMN with computed DEFAULT — Bug 90 closure (ADR-0058 §2a)`** — v0.79.0's `--forward-schema-add-column` did not fire the §2a refusal in production. The check only ran when [ir.Column.Default] was [ir.DefaultExpression], but the CDC reader's RelationMessage / TableMapEvent projection drops the DEFAULT clause on every column (pgoutput has no `attdefault` slot; MySQL's TableMapEvent has no `COLUMN_DEFAULT`), so the post-DDL SchemaSnapshot always arrived with `Default == nil`. Operators turning on `--forward-schema-add-column` for a routine `created_at TIMESTAMPTZ DEFAULT NOW()` ALTER saw the happy-path log line, the target ALTER landed, and every pre-existing row on the target silently diverged from source (source materialized per-row insert timestamps via the table rewrite; target's pre-existing rows carried either a single target-session-evaluated timestamp or NULL). Class also reproduces with `nextval(seq)`, `random()`, `gen_random_uuid()`, `UUID()`, `RAND()` — the failure dispatches on the DEFAULT-expression volatility class, not on `NOW()` specifically. **Severity-A silent-loss** on the marquee F12+F16 forwarding path.
+
+  Fix wires a source-side SchemaReader probe through the intercept (`schemaForwardDeps.defaultProber`) and runs a text-based volatility scan (`classifyDefaultVolatility`) against an explicit deny-list (time-volatile / sequence-stateful / random / session-state on both PG and MySQL) plus a small allow-list (ABS / COALESCE / CAST / …). Any function call not on either list triggers refuse-on-uncertainty — better to over-refuse than to silently corrupt. Refuse message names the column, table, DEFAULT expression text, volatility reason, and the drained-model recovery hint. Pinned by `schema_forward_volatility_test.go` (53-cell class matrix), three new unit tests in `schema_forward_intercept_test.go` covering the probe path, and two new integration tests (`TestAddColumnForward_PG_RefusesComputedDefault`, `TestAddColumnForward_MySQL_RefusesComputedDefault`).
+
+  Literal DEFAULTs (`DEFAULT 'pending'`, `DEFAULT 0`, `DEFAULT FALSE`, `DEFAULT NULL`) continue to forward — the existing happy-path integration tests remain green.
+
 ## [0.79.0] - 2026-05-24
 
 ### Added

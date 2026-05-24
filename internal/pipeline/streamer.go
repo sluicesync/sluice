@@ -594,6 +594,17 @@ type Streamer struct {
 	// lifetime.
 	addColumnForwardReader ir.RowReader
 
+	// addColumnForwardSchemaReader is the source-side schema reader
+	// used by the ADR-0058 §2a volatility probe (Bug 90 closure,
+	// v0.79.1). Always opened alongside [addColumnForwardWriter] when
+	// [ForwardSchemaAddColumn] is true and Shape A is NOT engaged.
+	// The intercept calls ReadSchema() at most once per ADD COLUMN
+	// forward to surface the source's canonical DEFAULT expression
+	// text — pgoutput's RelationMessage and MySQL's TableMapEvent
+	// both drop the DEFAULT, so the in-band CDC IR can't be the
+	// source of truth for the volatility classification.
+	addColumnForwardSchemaReader ir.SchemaReader
+
 	// schemaSnapshotErr is the error sink the SchemaSnapshot
 	// intercept writes to when the BoundaryRouter refuses (probe
 	// inconsistent, checksum mismatch, unrecognized shape). The
@@ -1388,6 +1399,9 @@ func (s *Streamer) runOnce(ctx context.Context) error {
 				applier:          deltaApplier,
 				sourceEngineName: s.Source.Name(),
 				targetEngineName: s.Target.Name(),
+			}
+			if s.addColumnForwardSchemaReader != nil {
+				deps.defaultProber = newSourceDefaultProber(s.addColumnForwardSchemaReader)
 			}
 			if s.BackfillAddedColumn {
 				if br, ok := s.addColumnForwardReader.(ir.BatchedRowReader); ok {
