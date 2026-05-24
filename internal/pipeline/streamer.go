@@ -1946,11 +1946,12 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 	// table set (s.Filter already has engine defaults merged in Run).
 	applyTableScope(sr, s.Filter)
 	schema, err := sr.ReadSchema(ctx)
-	closeIf(sr)
 	if err != nil {
+		closeIf(sr)
 		return nil, stop, wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: read source schema: %w", err))
 	}
 	if len(schema.Tables) == 0 {
+		closeIf(sr)
 		slog.InfoContext(ctx, "source schema has no tables; nothing to stream")
 		return nil, stop, nil
 	}
@@ -1958,9 +1959,23 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 	// Prune by table filter before mappings + bulk-copy so the
 	// excluded tables never reach the target schema-apply phase.
 	if err := applyTableFilter(ctx, schema, s.Filter); err != nil {
+		closeIf(sr)
 		return nil, stop, err
 	}
 	applyViewFilter(ctx, schema, s.ViewFilter, s.SkipViews)
+
+	// Source-side RLS preflight (task #52 sub-deliverable 1). Refuses
+	// loudly when any in-scope source table has RLS enabled AND the
+	// connecting role lacks BYPASSRLS — the silent-snapshot-filter
+	// class. Runs against the still-open source SchemaReader (sr)
+	// AFTER the table filter so `--exclude-table` of an RLS table
+	// short-circuits the refusal (one of the recovery hints). No-op
+	// on non-PG sources.
+	if err := preflightRLS(ctx, schema, sr, rlsSideSource); err != nil {
+		closeIf(sr)
+		return nil, stop, err
+	}
+	closeIf(sr)
 
 	// ---- Scope the source-side publication to the filtered table
 	// list (Bug 13, ADR-0021). On engines that don't have
@@ -2054,6 +2069,22 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 	}
 	applyTargetSchema(rw, s.TargetSchema)
 	applyMaxBufferBytes(rw, s.MaxBufferBytes)
+
+	// Target-side RLS preflight (task #52 sub-deliverable 1). Refuses
+	// when any in-scope target table has RLS enabled AND the connecting
+	// role lacks BYPASSRLS — the INSERT-blocked-by-WITH-CHECK class.
+	// Skipped under --schema-already-applied (GitHub #17): the operator
+	// promised the target is fully set up including permissions, so the
+	// RLS gate is the operator's responsibility on that path. No-op on
+	// non-PG targets.
+	if !s.SchemaAlreadyApplied {
+		if err := preflightRLS(ctx, schema, rw, rlsSideTarget); err != nil {
+			closeIf(rw)
+			closeIf(sw)
+			_ = stream.Close()
+			return nil, stop, err
+		}
+	}
 
 	switch {
 	case s.ResetTargetData:

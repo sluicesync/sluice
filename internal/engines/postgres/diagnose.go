@@ -132,12 +132,89 @@ func (r *SchemaReader) DiagnoseBundle(ctx context.Context, streamID string) (ir.
 	}
 	state["stream_id_scope"] = streamID
 
+	// Row-level security state (task #52 sub-deliverable 1). Per-table
+	// `relrowsecurity` / `relforcerowsecurity` plus the connected
+	// role's `rolbypassrls` attribute. Lets an operator run
+	// `sluice diagnose` and see whether the RLS preflight will refuse
+	// without running a full migration first. Best-effort: any sub-
+	// probe failure surfaces as a `*_reason` entry rather than
+	// propagating.
+	if rlsSection, err := r.probeRLSState(ctx); err != nil {
+		state["rls_reason"] = err.Error()
+	} else {
+		state["rls"] = rlsSection
+	}
+
 	payload, err := json.Marshal(state)
 	if err != nil {
 		return snap, fmt.Errorf("postgres: marshal diagnose state: %w", err)
 	}
 	snap.EngineState = payload
 	return snap, nil
+}
+
+// probeRLSState collects every base table's RLS-enable flags in the
+// reader's bound schema plus the connected role's BYPASSRLS attribute.
+// Surfaced under `state.rls` in the diagnose bundle so an operator
+// can see exactly which tables would trigger the RLS preflight
+// refusal without running a full migration. Catalog-only reads (no
+// row data); pg_class + pg_namespace + pg_roles are all readable by
+// every role.
+func (r *SchemaReader) probeRLSState(ctx context.Context) (map[string]any, error) {
+	out := map[string]any{}
+
+	// Role attribute first — short-circuits the operator-facing
+	// diagnosis (if the role has BYPASSRLS, no per-table state matters).
+	bypass, role, err := probeCurrentRoleBypassesRLS(ctx, r.db)
+	if err != nil {
+		out["role_reason"] = err.Error()
+	} else {
+		out["role"] = role
+		out["rolbypassrls"] = bypass
+	}
+
+	// Per-table relrowsecurity / relforcerowsecurity.
+	const q = `
+		SELECT cl.relname, cl.relrowsecurity, cl.relforcerowsecurity
+		FROM   pg_class     cl
+		JOIN   pg_namespace n ON n.oid = cl.relnamespace
+		WHERE  n.nspname  = $1
+		  AND  cl.relkind IN ('r', 'p')
+		ORDER  BY cl.relname`
+	rows, err := r.db.QueryContext(ctx, q, r.schema)
+	if err != nil {
+		out["tables_reason"] = err.Error()
+		return out, nil
+	}
+	defer func() { _ = rows.Close() }()
+
+	var tables []map[string]any
+	for rows.Next() {
+		var (
+			name            string
+			enabled, forced bool
+		)
+		if err := rows.Scan(&name, &enabled, &forced); err != nil {
+			out["tables_reason"] = err.Error()
+			return out, nil
+		}
+		// Only surface tables that actually carry RLS state — the
+		// common case (RLS off everywhere) keeps the bundle compact.
+		if !enabled && !forced {
+			continue
+		}
+		tables = append(tables, map[string]any{
+			"table":               name,
+			"relrowsecurity":      enabled,
+			"relforcerowsecurity": forced,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		out["tables_reason"] = err.Error()
+		return out, nil
+	}
+	out["tables_with_rls"] = tables
+	return out, nil
 }
 
 // probeSluiceSlots enumerates pg_replication_slots rows whose name

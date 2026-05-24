@@ -385,6 +385,18 @@ func (m *Migrator) Run(ctx context.Context) error {
 	}
 	applyViewFilter(ctx, schema, m.ViewFilter, m.SkipViews)
 
+	// ---- 1.45. Source-side RLS preflight (task #52 sub-deliverable 1) ----
+	// Refuses when any in-scope source table has RLS enabled AND the
+	// connecting role lacks BYPASSRLS — the silent-snapshot-filter
+	// class. Runs against the source SchemaReader (sr) AFTER the table
+	// filter so an operator's `--exclude-table` of an RLS-enabled
+	// table short-circuits the refusal (one of the documented
+	// recovery hints). No-op on non-PG sources (the interface
+	// type-assertion falls through silently).
+	if err := preflightRLS(ctx, schema, sr, rlsSideSource); err != nil {
+		return err
+	}
+
 	// ---- 1.5. Apply per-column type-mapping overrides ----
 	schema, err = translate.ApplyMappings(schema, m.Mappings)
 	if err != nil {
@@ -578,6 +590,16 @@ func (m *Migrator) Run(ctx context.Context) error {
 	applyTargetSchema(rw, m.TargetSchema)
 	applyMaxBufferBytes(rw, m.MaxBufferBytes)
 	defer closeIf(rw)
+
+	// ---- 2.5. Target-side RLS preflight (task #52 sub-deliverable 1) ----
+	// Refuses when any in-scope target table has RLS enabled AND the
+	// connecting role lacks BYPASSRLS — the INSERT-blocked-by-WITH-
+	// CHECK class. Runs against the target RowWriter (rw) regardless
+	// of resume / reset-target-data state: RLS is a role-permission
+	// gate, not a state gate. No-op on non-PG targets.
+	if err := preflightRLS(ctx, schema, rw, rlsSideTarget); err != nil {
+		return markFailed(ctx, rc, state, ir.MigrationPhasePending, err)
+	}
 
 	// ---- 3-6. Schema apply (phase 1) → bulk copy → indexes → constraints.
 	rr, err := m.Source.OpenRowReader(ctx, m.SourceDSN)
