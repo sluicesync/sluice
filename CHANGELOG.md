@@ -6,6 +6,30 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.78.4] - 2026-05-24
+
+### Added
+
+- **`feat(pipeline, engines/postgres): PG Row-Level Security preflight (refuse loudly when role lacks BYPASSRLS) (#52 sub-deliverable 1)`** — Sluice now probes every included table for `pg_class.relrowsecurity` + `relforcerowsecurity`, and probes the connecting role for `pg_roles.rolbypassrls`, then refuses to proceed if ANY included table has RLS enabled AND the connecting role lacks `rolbypassrls=true`. Runs on both source-read and target-write sides (different refuse-message wording: source-side warns about silent filter via USING expressions, target-side warns about WITH CHECK rejection). Operator-actionable recovery hint names the role, lists offending tables, calls out FORCE ROW LEVEL SECURITY explicitly (even table owner is checked under FORCE), and offers three recovery paths: `ALTER ROLE <role> BYPASSRLS;` (preferred), re-run with a superuser/owner role, or `--exclude-table` if the data is intentionally tenant-scoped and should not cross to the target.
+
+  **Why this exists**: PG RLS is a known silent-loss class (see [PlanetScale's "RLS sounds great until it isn't"](https://planetscale.com/blog/rls-sounds-great-until-it-isnt)). Prior to v0.78.4, sluice happily proceeded against an RLS-enabled source whose connecting role lacked BYPASSRLS — the source snapshot was silently filtered by policy `USING` expressions, the migration "succeeded" with fewer rows than the source, and no error surfaced. Per CLAUDE.md's loud-failure tenet, v0.78.4 refuses loudly with operator-actionable recovery instead.
+
+  **What this does NOT do** (deferred to #52 sub-deliverables 2-3, planned for v0.79.0): does NOT capture `pg_policies` into the IR, does NOT emit `CREATE POLICY` from the schema writer, does NOT include the full Bug-74-style matrix integration suite. The v0.78.4 scope closes the worst silent-loss path; the full RLS feature ships with ADR-0058 in v0.79.0.
+
+  **Diagnose-bundle integration**: `sluice diagnose` standard-level bundle now reports per-table RLS state (`enabled` / `forced`) + the connecting role's `rolbypassrls` attribute under `EngineState.rls`. Operators can run diagnose to see the state before attempting a migration.
+
+### Tests
+
+- **`test(pipeline): rls_preflight_test.go`** — 12 table-driven unit tests covering the 4 cells of {RLS on/off} × {role BYPASSRLS yes/no} + the FORCE-RLS variant + source-vs-target-side wording + multiple-offenders-sorted + empty-schema no-op + missing-prober no-op + probe-error propagation.
+- **`test(engines/postgres): rls_preflight_integration_test.go`** — 9 integration tests against a real PG container with a fixture that creates `rls_off` / `rls_on` / `rls_force` tables + a non-superuser `sluice_app` role explicitly `NOBYPASSRLS NOSUPERUSER`. Pins the catalog SQL against actual `pg_class` / `pg_roles` values, validates the diagnose bundle's rendered JSON, and verifies an unprivileged role's INSERT into a FORCE-RLS table is actually refused by PG (ground-truth pin on the silent-loss class itself).
+- **Lowercase control verified** — non-RLS PG → PG migrations continue to work clean; no false-positive refusal on the common case.
+
+### Compatibility
+
+- **Drop-in upgrade from v0.78.3.** Behaviour change: if an operator was previously running sluice against an RLS-enabled PG source/target with a non-BYPASSRLS role, the migration was silently filtering or failing opaquely; v0.78.4 will now refuse loudly with the recovery hint. **This is a deliberate user-visible change** consistent with the loud-failure tenet. Operators on the common case (no RLS tables, or BYPASSRLS-equipped role) see no change.
+- **Severity a — closes a catalogued silent-loss class.** PG operators who run migrations against multi-tenant RLS-segregated tables are the most likely to have hit the silent-filter mode and not realized it. The refusal-with-recovery-hint shape lets them surface the misconfiguration before data loss.
+- **No new flag.** Per the loud-failure tenet, no `--allow-rls-without-bypass` opt-out is added — the recovery is operator action (grant BYPASSRLS or exclude the table), not a sluice-side bypass.
+
 ## [0.78.3] - 2026-05-24
 
 ### Fixed
