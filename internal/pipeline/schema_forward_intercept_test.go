@@ -73,7 +73,7 @@ func TestForwardAddColumn_NilApplier_PassThrough(t *testing.T) {
 	in <- snap
 	close(in)
 	errStore := &atomic.Pointer[error]{}
-	out := interceptAddColumnForward(ctx, in, schemaForwardDeps{}, errStore)
+	out := interceptAddColumnForward(ctx, in, nil, schemaForwardDeps{}, errStore)
 	got := drainChannel(t, out, time.Second)
 	if len(got) != 1 {
 		t.Fatalf("got %d changes, want 1 pass-through", len(got))
@@ -95,7 +95,7 @@ func TestForwardAddColumn_FirstSnapshotIsAnchor(t *testing.T) {
 	in <- addColForwardSnap(tbl)
 	close(in)
 	errStore := &atomic.Pointer[error]{}
-	out := interceptAddColumnForward(ctx, in, schemaForwardDeps{
+	out := interceptAddColumnForward(ctx, in, nil, schemaForwardDeps{
 		applier:          applier,
 		sourceEngineName: "postgres",
 		targetEngineName: "postgres",
@@ -124,7 +124,7 @@ func TestForwardAddColumn_AddColumnShape_CallsApplier(t *testing.T) {
 	in <- addColForwardSnap(post)
 	close(in)
 	errStore := &atomic.Pointer[error]{}
-	out := interceptAddColumnForward(ctx, in, schemaForwardDeps{
+	out := interceptAddColumnForward(ctx, in, nil, schemaForwardDeps{
 		applier:          applier,
 		sourceEngineName: "postgres",
 		targetEngineName: "postgres",
@@ -138,6 +138,89 @@ func TestForwardAddColumn_AddColumnShape_CallsApplier(t *testing.T) {
 	}
 	if e := errStore.Load(); e != nil {
 		t.Errorf("errStore set on happy path: %v", *e)
+	}
+}
+
+// TestForwardAddColumn_SeededPre_ClassifiesFirstCDCSnapshot pins the
+// Bug 89 fix: a cold-start seed pre-populates the per-table cache so
+// the FIRST CDC SchemaSnapshot is classified as a real boundary (not
+// treated as the anchor). Without this, MySQL sources silently passed
+// the ALTER through because pgoutput's first-touch Relation has no
+// MySQL binlog equivalent — the first SchemaSnapshot emitted on the
+// MySQL CDC reader is already POST-DDL.
+func TestForwardAddColumn_SeededPre_ClassifiesFirstCDCSnapshot(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	in := make(chan ir.Change, 1)
+	applier := &fakeShapeApplier{}
+	pre := addColForwardTable("users")
+	post := addColForwardTable("users", &ir.Column{Name: "nickname", Type: ir.Varchar{Length: 100}, Nullable: true})
+	// Only ONE CDC SchemaSnapshot — the post-DDL one. The seed
+	// supplies the pre.
+	in <- addColForwardSnap(post)
+	close(in)
+	errStore := &atomic.Pointer[error]{}
+	seed := []ir.SchemaSnapshot{addColForwardSnap(pre)}
+	out := interceptAddColumnForward(ctx, in, seed, schemaForwardDeps{
+		applier:          applier,
+		sourceEngineName: "postgres",
+		targetEngineName: "postgres",
+	}, errStore)
+	got := drainChannel(t, out, time.Second)
+	if len(got) != 1 {
+		t.Fatalf("got %d changes, want 1 (single CDC snapshot forwarded after ALTER applied)", len(got))
+	}
+	if applier.addColCalls != 1 {
+		t.Errorf("AlterAddColumn calls = %d; want exactly 1 (Bug 89: seed classifies first CDC snap as boundary)", applier.addColCalls)
+	}
+	if e := errStore.Load(); e != nil {
+		t.Errorf("errStore set on happy path: %v", *e)
+	}
+}
+
+// TestForwardAddColumn_SeededPre_BareName_FallbackResolves pins the
+// MySQL Bug-83-equivalent for the ADR-0058 intercept: the cold-start
+// seed's QualifiedName() is the bare table name (MySQL SchemaReader
+// leaves Schema empty), but the CDC-emitted SchemaSnapshot
+// QualifiedName() is "<db>.<table>". The lookupSeedCache fallback must
+// promote the bare-name seed entry to the qualified key so subsequent
+// snapshots resolve directly. Without this, the first CDC snapshot
+// would miss the seed and be treated as the anchor — Bug 89 reopens.
+func TestForwardAddColumn_SeededPre_BareName_FallbackResolves(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	in := make(chan ir.Change, 1)
+	applier := &fakeShapeApplier{}
+	// Pre IR has Schema="" (mirrors MySQL SchemaReader output).
+	pre := addColForwardTable("users")
+	pre.Schema = ""
+	// Post IR has Schema="source_db" (mirrors MySQL CDC reader output).
+	post := addColForwardTable("users", &ir.Column{Name: "nickname", Type: ir.Varchar{Length: 100}, Nullable: true})
+	post.Schema = "source_db"
+	in <- ir.SchemaSnapshot{
+		Position: ir.Position{Engine: "mysql", Token: "binlog/1"},
+		Schema:   post.Schema,
+		Table:    post.Name,
+		IR:       post,
+	}
+	close(in)
+	errStore := &atomic.Pointer[error]{}
+	seed := []ir.SchemaSnapshot{{
+		Schema: pre.Schema, // ""
+		Table:  pre.Name,
+		IR:     pre,
+	}}
+	out := interceptAddColumnForward(ctx, in, seed, schemaForwardDeps{
+		applier:          applier,
+		sourceEngineName: "mysql",
+		targetEngineName: "mysql",
+	}, errStore)
+	got := drainChannel(t, out, time.Second)
+	if len(got) != 1 {
+		t.Fatalf("got %d changes, want 1", len(got))
+	}
+	if applier.addColCalls != 1 {
+		t.Errorf("AlterAddColumn calls = %d; want exactly 1 (bare-name fallback must resolve to seed)", applier.addColCalls)
 	}
 }
 
@@ -184,7 +267,7 @@ func TestForwardAddColumn_DropColumnShape_RefuseLoudly(t *testing.T) {
 			in <- addColForwardSnap(tc.post)
 			close(in)
 			errStore := &atomic.Pointer[error]{}
-			out := interceptAddColumnForward(ctx, in, schemaForwardDeps{
+			out := interceptAddColumnForward(ctx, in, nil, schemaForwardDeps{
 				applier:          applier,
 				sourceEngineName: "postgres",
 				targetEngineName: "postgres",
@@ -223,7 +306,7 @@ func TestForwardAddColumn_ComputedDefault_Refuse(t *testing.T) {
 	in <- addColForwardSnap(post)
 	close(in)
 	errStore := &atomic.Pointer[error]{}
-	out := interceptAddColumnForward(ctx, in, schemaForwardDeps{
+	out := interceptAddColumnForward(ctx, in, nil, schemaForwardDeps{
 		applier:          applier,
 		sourceEngineName: "postgres",
 		targetEngineName: "postgres",
@@ -261,7 +344,7 @@ func TestForwardAddColumn_LiteralDefault_Forwards(t *testing.T) {
 	in <- addColForwardSnap(post)
 	close(in)
 	errStore := &atomic.Pointer[error]{}
-	out := interceptAddColumnForward(ctx, in, schemaForwardDeps{
+	out := interceptAddColumnForward(ctx, in, nil, schemaForwardDeps{
 		applier:          applier,
 		sourceEngineName: "postgres",
 		targetEngineName: "postgres",
@@ -291,7 +374,7 @@ func TestForwardAddColumn_ApplierError_Rewinds(t *testing.T) {
 	in <- addColForwardSnap(post)
 	close(in)
 	errStore := &atomic.Pointer[error]{}
-	out := interceptAddColumnForward(ctx, in, schemaForwardDeps{
+	out := interceptAddColumnForward(ctx, in, nil, schemaForwardDeps{
 		applier:          applier,
 		sourceEngineName: "postgres",
 		targetEngineName: "postgres",
@@ -323,7 +406,7 @@ func TestForwardAddColumn_NoneShape_Passthrough(t *testing.T) {
 	in <- addColForwardSnap(tbl)
 	close(in)
 	errStore := &atomic.Pointer[error]{}
-	out := interceptAddColumnForward(ctx, in, schemaForwardDeps{
+	out := interceptAddColumnForward(ctx, in, nil, schemaForwardDeps{
 		applier:          applier,
 		sourceEngineName: "postgres",
 		targetEngineName: "postgres",
@@ -354,7 +437,7 @@ func TestForwardAddColumn_NonSnapshotChange_Forwards(t *testing.T) {
 	in <- ir.TxCommit{Position: ir.Position{Engine: "postgres", Token: "lsn/3"}}
 	close(in)
 	errStore := &atomic.Pointer[error]{}
-	out := interceptAddColumnForward(ctx, in, schemaForwardDeps{
+	out := interceptAddColumnForward(ctx, in, nil, schemaForwardDeps{
 		applier:          applier,
 		sourceEngineName: "postgres",
 		targetEngineName: "postgres",
@@ -453,7 +536,7 @@ func TestForwardAddColumn_Backfill_EmitsUpdates(t *testing.T) {
 	in <- addColForwardSnap(post)
 	close(in)
 	errStore := &atomic.Pointer[error]{}
-	out := interceptAddColumnForward(ctx, in, schemaForwardDeps{
+	out := interceptAddColumnForward(ctx, in, nil, schemaForwardDeps{
 		applier:          applier,
 		sourceEngineName: "postgres",
 		targetEngineName: "postgres",
@@ -507,7 +590,7 @@ func TestForwardAddColumn_Backfill_NoPK_Refuses(t *testing.T) {
 	in <- ir.SchemaSnapshot{Position: ir.Position{Engine: "postgres", Token: "lsn/2"}, Schema: "public", Table: "nopk", IR: post}
 	close(in)
 	errStore := &atomic.Pointer[error]{}
-	out := interceptAddColumnForward(ctx, in, schemaForwardDeps{
+	out := interceptAddColumnForward(ctx, in, nil, schemaForwardDeps{
 		applier:          applier,
 		sourceEngineName: "postgres",
 		targetEngineName: "postgres",

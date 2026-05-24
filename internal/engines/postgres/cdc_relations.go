@@ -69,7 +69,24 @@ func projectRelation(rel *relationCacheEntry) *ir.Table {
 	for i, c := range rel.Columns {
 		cols[i] = &ir.Column{Name: c.Name, Type: c.Type}
 	}
-	return &ir.Table{Schema: rel.Schema, Name: rel.Name, Columns: cols}
+	tbl := &ir.Table{Schema: rel.Schema, Name: rel.Name, Columns: cols}
+	// Bug 89: surface PK column names from the RelationMessage's
+	// per-column KeyColumn flag. ADR-0058 backfill (and any future per-PK
+	// path consuming a CDC-emitted SchemaSnapshot) needs the PK to drive
+	// cursor-paginated iteration. KeyColumn=true on a pgoutput Relation
+	// is set for replica-identity columns; with REPLICA IDENTITY DEFAULT
+	// (the default) this is the PK column set, which is what
+	// runBackfillForAddedColumn requires.
+	var pkCols []ir.IndexColumn
+	for _, c := range rel.Columns {
+		if c.KeyColumn {
+			pkCols = append(pkCols, ir.IndexColumn{Column: c.Name})
+		}
+	}
+	if len(pkCols) > 0 {
+		tbl.PrimaryKey = &ir.Index{Columns: pkCols}
+	}
+	return tbl
 }
 
 // oidToType maps a Postgres data-type OID (as carried in

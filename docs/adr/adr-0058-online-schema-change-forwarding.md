@@ -465,6 +465,84 @@ The integration tests' negative-pin case exercises the flag-off
 path (refuse-loudly behavior preserved) so future contributors who
 broaden the default behavior have a regression-guard.
 
+### Bug 89 closure (v0.79.0, 2026-05-24)
+
+The four MySQL-side integration tests
+(`TestAddColumnForward_MySQL_FlagOn_ForwardsALTER`,
+`TestAddColumnForward_MySQL_Backfill`,
+`TestAddColumnForward_Cross_MySQLToPG`,
+`TestAddColumnForward_Cross_PGToMySQL`) failed in main CI after the
+initial feature commit (`7ca4b5a`) and were tracked as Bug 89. Three
+distinct fold points surfaced; each is a representative of a class
+the original implementation didn't account for, so the fix locus for
+each lives where the class is decided rather than where the failure
+surfaced.
+
+1. **Intercept cache seeding (cross-engine asymmetry).** The intercept
+   tracks per-table IR state in a `cache` map and classifies the
+   second-and-later SchemaSnapshot's delta via `ClassifyShape`. PG's
+   pgoutput emits a `RelationMessage` on first-touch of every
+   relation (with `KeyColumn` flags), so the very first row event
+   surfaces a `SchemaSnapshot` with the **pre-DDL** schema — seeding
+   the cache. The MySQL binlog has no first-touch equivalent;
+   `maybeSnapshotSchemaB1` only fires when `pendingDDLActive` is
+   true, which is set on the first observed DDL `QUERY_EVENT`. So on
+   MySQL the FIRST `SchemaSnapshot` the intercept sees is the
+   **post-ALTER** schema, the cache is empty (`hadPre=false`), the
+   intercept seeds the cache and forwards the snapshot as the
+   anchor, and the ADD COLUMN is never classified. The fix
+   pre-populates the intercept's cache from the cold-start source
+   IR (the same `synthesizeColdStartSeedSnapshots` mechanism Shape A
+   uses for the ADR-0054 Bug 83 fix), promoted to also feed the
+   ADR-0058 intercept when `--forward-schema-add-column` is set and
+   Shape A is not engaged. The fix locus is
+   `internal/pipeline/streamer.go` (extend the seed gate) +
+   `internal/pipeline/schema_forward_intercept.go` (accept the seed
+   parameter; reuse `lookupSeedCache` for the MySQL bare-name
+   fallback). Pinned by
+   `TestForwardAddColumn_SeededPre_ClassifiesFirstCDCSnapshot` and
+   `TestForwardAddColumn_SeededPre_BareName_FallbackResolves`.
+
+2. **PrimaryKey absent from CDC-emitted SchemaSnapshot IR.**
+   `runBackfillForAddedColumn` requires the post-ALTER table's
+   `ir.Table.PrimaryKey` to drive the cursor-paginated source SELECT.
+   Both engines' CDC-side projections produced `*ir.Table` values
+   with `PrimaryKey` left unset: PG's `projectRelation` only copies
+   name and type; MySQL's `maybeSnapshotSchemaB1` only copies
+   Schema/Name/Columns. Backfill then refused with "table has no
+   primary key" on both engines as soon as the seed fix above let
+   the intercept actually reach the backfill branch. The fix is at
+   the projection locus (not the backfill consumer): PG projects
+   `KeyColumn`-flagged columns into `ir.Index{Columns: ...}`; MySQL
+   projects its pre-existing `tableSchema.PrimaryKey []string` field
+   into the same shape. The class here is "CDC-emitted SchemaSnapshot
+   IR must carry every identity-bearing field downstream consumers
+   reasonably expect," so the projection — not the consumer — is the
+   right locus.
+
+3. **Cross-engine target schema name leakage.** The CDC-emitted IR
+   carries the SOURCE database name in `ir.Table.Schema` (MySQL:
+   `source_db`; PG: `public`). PG's `SchemaWriter.qualifyTable`
+   honors a non-empty `table.Schema` over its own bound schema, so
+   forwarding `ALTER TABLE source_db.widgets ADD COLUMN price` to a
+   PG target raised `ERROR: schema "source_db" does not exist`
+   (SQLSTATE 3F000). MySQL's writer doesn't qualify by schema in its
+   ALTER (just uses `w.schema` for the probe), so MySQL targets
+   weren't affected. The chain-restore caller of `AlterAddColumn`
+   never hit this because manifest-derived tables carry
+   `Schema=""`. The fix is in `retargetAddedColumns`: clear the
+   retargeted table's `Schema` field so the target SchemaWriter's
+   `qualifyTable` falls back to its own DSN-derived bound schema.
+   The cross-engine class — source identifiers must not leak through
+   into target DDL — is the deciding principle.
+
+All 7 cells (3 PG + 2 MySQL + 2 cross-engine) now pass. The Bug 89
+shape is **not** a single bug at a single locus — it's three
+sibling classes that all happened to surface as the same symptom
+("post-ALTER INSERT never lands"). Pinning each class at its own
+locus keeps the fix readable and gives future contributors three
+independent regression guards rather than one bundled patch.
+
 ## Glossary anchors
 
 - "ADD COLUMN forwarding": the new behavior this ADR ships.

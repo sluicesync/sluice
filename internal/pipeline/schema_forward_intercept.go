@@ -100,10 +100,20 @@ type schemaForwardBackfill struct {
 //     recovery hint (DROP / ALTER TYPE / RENAME / CHECK / generated /
 //     CREATE INDEX / DROP INDEX / multi-shape combo).
 //
-// The first snapshot per table is the cache anchor (no DDL boundary
-// to route — the source schema state at that point is the post-cold-
-// start "pre" state). From the second snapshot onward, the
-// (cached, snap.IR) delta is the routable shape.
+// seed is the cold-start cache seed — one synthetic SchemaSnapshot per
+// filtered table reflecting the source IR captured at cold-start
+// (built by [Streamer.coldStart] via
+// [synthesizeColdStartSeedSnapshots]). The seed pre-populates the
+// per-table cache so the FIRST CDC SchemaSnapshot is classified as a
+// real boundary against the cold-start IR rather than treated as the
+// anchor. Without the seed, MySQL sources fail Bug 89: pgoutput emits
+// a Relation on first-touch (giving PG an effective pre-DDL seed), but
+// MySQL's binlog only surfaces SchemaSnapshot on DDL detection
+// (already POST-DDL), so the intercept's cache stays empty until the
+// first DDL fires and the ALTER silently passes through as the anchor.
+// Seed snapshots are NOT forwarded downstream — the applier already
+// wrote the schema-history row at cold-start via the schema-apply
+// phase.
 //
 // On any refuse-loudly error, the intercept closes the out-channel
 // and stores the error in errStore for the streamer's
@@ -111,6 +121,7 @@ type schemaForwardBackfill struct {
 func interceptAddColumnForward(
 	ctx context.Context,
 	in <-chan ir.Change,
+	seed []ir.SchemaSnapshot,
 	deps schemaForwardDeps,
 	errStore *atomic.Pointer[error],
 ) <-chan ir.Change {
@@ -121,6 +132,23 @@ func interceptAddColumnForward(
 	}
 	out := make(chan ir.Change)
 	cache := map[string]*ir.Table{}
+	// Pre-populate the cache from the cold-start seed BEFORE consuming
+	// from `in`. The seed is keyed under whatever QualifiedName() the
+	// SchemaReader produced (MySQL: bare table name because the reader
+	// leaves Schema empty; PG: schema.table). lookupSeedCache below
+	// handles the bare-name fallback on the CDC side so MySQL's
+	// schema-qualified first CDC SchemaSnapshot still finds the seed.
+	for i := range seed {
+		snap := seed[i]
+		if snap.IR == nil {
+			continue
+		}
+		cache[snap.QualifiedName()] = snap.IR
+		slog.DebugContext(
+			ctx, "forward-add-column intercept: seeded from cold-start handoff",
+			"table", snap.QualifiedName(),
+		)
+	}
 	go func() {
 		defer close(out)
 		for {
@@ -137,7 +165,13 @@ func interceptAddColumnForward(
 					continue
 				}
 				key := snap.QualifiedName()
-				pre, hadPre := cache[key]
+				pre, hadPre, preKey := lookupSeedCache(cache, key, snap.Table)
+				// Promote a bare-name seed hit to the qualified key so
+				// subsequent snapshots resolve directly (mirrors the
+				// Shape A intercept's behaviour).
+				if hadPre && preKey != key {
+					delete(cache, preKey)
+				}
 				cache[key] = snap.IR
 				if !hadPre {
 					slog.DebugContext(
@@ -336,15 +370,28 @@ func refuseComputedDefaults(tableName string, cols []*ir.Column) error {
 // table. Same call pattern as broker.go:997 and chain_restore.go:574.
 //
 // Same-engine pairs are a no-op pass-through inside RetargetForEngine.
+//
+// The returned table's Schema field is cleared so the target
+// SchemaWriter's `qualifyTable` falls back to its own bound database
+// (DSN-derived). The CDC-emitted source IR carries the SOURCE's DB
+// name (e.g. "source_db") which doesn't exist on the target, and a
+// raw forwarded ALTER would fail with "schema does not exist" (PG)
+// or "Unknown database" (MySQL). The chain-restore caller passes
+// manifest-derived tables with Schema unset (see chain_restore_cross_test.go)
+// so it never hit this problem; the live CDC caller has to scrub the
+// field here.
 func retargetAddedColumns(post *ir.Table, added []*ir.Column, sourceEngine, targetEngine string) (*ir.Table, []*ir.Column) {
 	retargetedSchema := translate.RetargetForEngine(
 		&ir.Schema{Tables: []*ir.Table{post}},
 		sourceEngine, targetEngine,
 	)
 	if len(retargetedSchema.Tables) == 0 {
-		return post, added
+		scrubbed := *post
+		scrubbed.Schema = ""
+		return &scrubbed, added
 	}
 	retargetedTable := retargetedSchema.Tables[0]
+	retargetedTable.Schema = ""
 	// Find the retargeted columns matching the added names.
 	addedNames := make(map[string]struct{}, len(added))
 	for _, c := range added {

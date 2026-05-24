@@ -806,6 +806,17 @@ func (r *CDCReader) maybeSnapshotSchemaB1(ctx context.Context, qn string, tbl *t
 		return nil
 	}
 	irTbl := &ir.Table{Schema: tbl.Schema, Name: tbl.Name, Columns: tbl.Columns}
+	// Bug 89: surface the PK so downstream consumers (ADR-0058 backfill,
+	// other future per-PK paths) can resolve a cursor-paginated iteration
+	// against the table. The CDC reader's tableSchema already carries the
+	// PK column name list (Bug 88); project it into the IR Index shape.
+	if len(tbl.PrimaryKey) > 0 {
+		pkCols := make([]ir.IndexColumn, len(tbl.PrimaryKey))
+		for i, name := range tbl.PrimaryKey {
+			pkCols[i] = ir.IndexColumn{Column: name}
+		}
+		irTbl.PrimaryKey = &ir.Index{Columns: pkCols}
+	}
 	sig := ir.SchemaSignatureOf(irTbl)
 	if prev, ok := r.snapshotSig[qn]; ok && prev.Equal(sig) {
 		// This table's decode contract didn't change across the DDL

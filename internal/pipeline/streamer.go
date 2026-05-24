@@ -1366,9 +1366,6 @@ func (s *Streamer) runOnce(ctx context.Context) error {
 	// Nil router (drained model / engine doesn't support coordination)
 	// makes the intercept a verbatim pass-through.
 	filtered = interceptSchemaSnapshotsForCoordination(applyCtx, filtered, s.coldStartSeedSnapshots, s.boundaryRouter, &s.schemaSnapshotErr)
-	// Clear the cold-start seed after handing it to the intercept so a
-	// streamer restart picks up a fresh seed in its next coldStart run.
-	s.coldStartSeedSnapshots = nil
 	// ADR-0058: when --forward-schema-add-column is set AND Shape A is
 	// NOT engaged, wrap the changes channel with the
 	// [interceptAddColumnForward] intercept. The intercept observes
@@ -1376,6 +1373,15 @@ func (s *Streamer) runOnce(ctx context.Context) error {
 	// COLUMN, optionally backfills, and refuses loudly on every other
 	// recognized shape. When Shape A IS engaged, the boundary router
 	// above already handles every shape — this branch is skipped.
+	//
+	// The cold-start seed (s.coldStartSeedSnapshots) is consumed here
+	// when Shape A is NOT engaged — the Shape-A intercept above ignores
+	// the seed when router==nil. Bug 89 fix: without this hand-off, the
+	// intercept's per-table cache stays empty until the first DDL
+	// boundary, and MySQL's CDC reader (unlike PG's pgoutput) emits
+	// SchemaSnapshot only AFTER DDL — so the first ALTER silently
+	// passes through as the anchor rather than being classified and
+	// forwarded.
 	if s.ForwardSchemaAddColumn && s.boundaryRouter == nil && s.addColumnForwardWriter != nil {
 		if deltaApplier, ok := s.addColumnForwardWriter.(ir.SchemaDeltaApplier); ok {
 			deps := schemaForwardDeps{
@@ -1392,9 +1398,13 @@ func (s *Streamer) runOnce(ctx context.Context) error {
 					}
 				}
 			}
-			filtered = interceptAddColumnForward(applyCtx, filtered, deps, &s.schemaSnapshotErr)
+			filtered = interceptAddColumnForward(applyCtx, filtered, s.coldStartSeedSnapshots, deps, &s.schemaSnapshotErr)
 		}
 	}
+	// Clear the cold-start seed after handing it to BOTH intercepts so
+	// a streamer restart picks up a fresh seed in its next coldStart
+	// run.
+	s.coldStartSeedSnapshots = nil
 	dispatchErr := s.dispatchApply(applyCtx, applier, streamID, filtered)
 	// ADR-0054 Phase 2d: a SchemaSnapshot intercept error short-
 	// circuits the changes channel; the dispatchErr path sees a clean
@@ -2098,7 +2108,20 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 	// the FIRST CDC SchemaSnapshot as a true boundary (rather than
 	// treating it as the cold-start anchor, which was the v0.73.0
 	// Bug 83 root cause).
-	if s.InjectShardColumn.Engaged() && s.CoordinateLiveDDL {
+	//
+	// ADR-0058 Bug 89 fix — the same seed feeds [interceptAddColumnForward]
+	// when --forward-schema-add-column is set and Shape A is NOT
+	// engaged. Without it, the MySQL CDC reader's first SchemaSnapshot
+	// (emitted only on the FIRST observed DDL boundary, with the
+	// already-post-DDL schema) seeds the intercept's cache with
+	// hadPre=false, so the ALTER is silently treated as the anchor
+	// rather than classified and forwarded. Seeding from the cold-start
+	// source IR gives the classifier a real pre-state to diff against.
+	// PG sources already work without this seed because pgoutput emits
+	// RelationMessage on first-touch (before any DDL); MySQL's binlog
+	// has no first-touch equivalent.
+	if (s.InjectShardColumn.Engaged() && s.CoordinateLiveDDL) ||
+		(s.ForwardSchemaAddColumn && !s.InjectShardColumn.Engaged()) {
 		s.coldStartSeedSnapshots = synthesizeColdStartSeedSnapshots(schema, s.Source)
 	}
 
