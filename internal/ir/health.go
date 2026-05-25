@@ -204,7 +204,7 @@ type SlotHealthReporter interface {
 
 // HeartbeatWriter is the optional engine-side surface for the source-
 // side periodic heartbeat-table writer — severity-A finding F17 of the
-// 2026-05-22 Reddit-research run, see ADR-0060. Engines implement it on
+// 2026-05-22 Reddit-research run, see ADR-0061. Engines implement it on
 // the same value that satisfies [SchemaReader] (today Postgres and MySQL
 // both implement; future engines opt in by satisfying the interface).
 //

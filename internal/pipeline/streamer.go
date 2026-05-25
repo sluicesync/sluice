@@ -542,7 +542,7 @@ type Streamer struct {
 	HeartbeatInterval time.Duration
 
 	// SourceHeartbeatInterval, when > 0, enables the F17 source-side
-	// heartbeat writer (ADR-0060). The streamer attaches a per-stream
+	// heartbeat writer (ADR-0061). The streamer attaches a per-stream
 	// goroutine that periodically INSERTs a row into the sluice-owned
 	// heartbeat table on the source DB; the INSERT generates WAL /
 	// binlog traffic so the consumer's position advances even against
@@ -1078,7 +1078,7 @@ func (s *Streamer) runOnce(ctx context.Context) error {
 		defer slotProbe.Close()
 	}
 
-	// ---- 1c. Source-side heartbeat writer (ADR-0060, F17) ----
+	// ---- 1c. Source-side heartbeat writer (ADR-0061, F17) ----
 	// Opt-in (gated on --source-heartbeat-interval > 0). The writer
 	// periodically INSERTs a row into a sluice-owned table on the
 	// source so the CDC consumer's position advances even against an

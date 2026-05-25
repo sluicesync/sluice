@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Integration test for the PG source-side heartbeat writer
-// (ADR-0060, F17). Boots a Postgres container with logical replication,
+// (ADR-0061, F17). Boots a Postgres container with logical replication,
 // creates a slot, runs the heartbeat writer for a brief window, and
 // asserts:
 //

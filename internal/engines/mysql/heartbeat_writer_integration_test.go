@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Integration test for the MySQL source-side heartbeat writer
-// (ADR-0060, F17). Boots the shared mysql:8.0 container (binlog ROW +
+// (ADR-0061, F17). Boots the shared mysql:8.0 container (binlog ROW +
 // FULL row-image), runs the heartbeat writer briefly, and asserts:
 //
 //   - the heartbeat table exists with the expected schema;

@@ -16,7 +16,7 @@ import (
 
 // EnsureHeartbeatTable / WriteHeartbeat / PruneHeartbeat implement
 // [ir.HeartbeatWriter] for Postgres — severity-A finding F17 of the
-// 2026-05-22 Reddit-research run, see ADR-0060.
+// 2026-05-22 Reddit-research run, see ADR-0061.
 //
 // The heartbeat table lives in the SchemaReader's bound schema (the
 // DSN's `schema` query parameter, default "public"). It carries three

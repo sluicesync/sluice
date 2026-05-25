@@ -4,7 +4,7 @@
 package pipeline
 
 // Source-side sluice_heartbeat writer — severity-A finding F17 of the
-// 2026-05-22 Reddit-research run. See ADR-0060.
+// 2026-05-22 Reddit-research run. See ADR-0061.
 //
 // The streamer attaches a background goroutine that periodically INSERTs
 // a row into a sluice-owned table on the source database. The INSERT
@@ -131,7 +131,7 @@ func sourceHeartbeatLoop(
 						slog.String("stream_id", streamID),
 						slog.String("table", tableName),
 						slog.String("err", err.Error()),
-						slog.String("see", "ADR-0060"),
+						slog.String("see", "ADR-0061"),
 					)
 					return
 				}
@@ -238,7 +238,7 @@ func (s *Streamer) attachSourceHeartbeat(ctx context.Context, streamID string) *
 			ctx, "source heartbeat: open source schema reader failed — skipping",
 			slog.String("stream_id", streamID),
 			slog.String("err", err.Error()),
-			slog.String("see", "ADR-0060"),
+			slog.String("see", "ADR-0061"),
 		)
 		return noop
 	}
@@ -264,7 +264,7 @@ func (s *Streamer) attachSourceHeartbeat(ctx context.Context, streamID string) *
 					"the connecting role on the source lacks CREATE TABLE; either grant CREATE on the schema, pre-create %q manually, or set --no-source-heartbeat to silence this warning. F17 (idle-source slot/binlog protection) will not be active for this stream.",
 					tableName,
 				)),
-				slog.String("see", "ADR-0060"),
+				slog.String("see", "ADR-0061"),
 				slog.String("err", err.Error()),
 			)
 			closeIf(sr)
@@ -276,7 +276,7 @@ func (s *Streamer) attachSourceHeartbeat(ctx context.Context, streamID string) *
 			slog.String("stream_id", streamID),
 			slog.String("table", tableName),
 			slog.String("err", err.Error()),
-			slog.String("see", "ADR-0060"),
+			slog.String("see", "ADR-0061"),
 		)
 		closeIf(sr)
 		return noop
@@ -296,7 +296,7 @@ func (s *Streamer) attachSourceHeartbeat(ctx context.Context, streamID string) *
 		slog.String("table", tableName),
 		slog.Duration("write_interval", s.SourceHeartbeatInterval),
 		slog.Duration("prune_window", pruneWindow),
-		slog.String("see", "ADR-0060"),
+		slog.String("see", "ADR-0061"),
 	)
 	return att
 }

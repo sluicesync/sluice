@@ -1,4 +1,4 @@
-# ADR-0060 — Source-side `sluice_heartbeat` writer (F17)
+# ADR-0061 — Source-side `sluice_heartbeat` writer (F17)
 
 * Status: Accepted (2026-05-25)
 * Severity: A (silent-loss-class on idle sources)

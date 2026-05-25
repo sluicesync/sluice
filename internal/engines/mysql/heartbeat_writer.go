@@ -16,7 +16,7 @@ import (
 
 // EnsureHeartbeatTable / WriteHeartbeat / PruneHeartbeat implement
 // [ir.HeartbeatWriter] for MySQL — severity-A finding F17 of the
-// 2026-05-22 Reddit-research run, see ADR-0060.
+// 2026-05-22 Reddit-research run, see ADR-0061.
 //
 // MySQL has a flat namespace (no schema-vs-database distinction in the
 // shape PG carries), so the table lives in the connection's default

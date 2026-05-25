@@ -3,7 +3,7 @@
 
 package pipeline
 
-// Unit tests for the source-side heartbeat writer (ADR-0060, F17).
+// Unit tests for the source-side heartbeat writer (ADR-0061, F17).
 // Pins:
 //   - the loop's ticker drives WriteHeartbeat at the configured cadence
 //     and ctx cancellation tears it down cleanly;
