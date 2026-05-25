@@ -307,7 +307,7 @@ func (w *trackingWriter) TruncateTable(ctx context.Context, table *ir.Table) err
 
 // ---- 1. fresh parallel cold-start uses the fast loader --------------
 
-func TestFastLoader_FreshColdStart_UsesFastLoader(t *testing.T) {
+func TestMigrate_FastLoader_FreshColdStart_UsesFastLoader(t *testing.T) {
 	for _, kind := range []fastLoaderEngineKind{flEnginePG, flEngineMySQL} {
 		kind := kind
 		t.Run(kind.name(), func(t *testing.T) {
@@ -366,7 +366,7 @@ func TestFastLoader_FreshColdStart_UsesFastLoader(t *testing.T) {
 //   - the fix: gate (1) routes the entire resumed chunk through
 //     WriteRowsIdempotent, so the re-delivered prefix upserts and the
 //     final target is byte-correct and collision-free.
-func TestFastLoader_CrashMidFastChunk_ResumeIsIdempotent(t *testing.T) {
+func TestMigrate_FastLoader_CrashMidFastChunk_ResumeIsIdempotent(t *testing.T) {
 	for _, kind := range []fastLoaderEngineKind{flEnginePG, flEngineMySQL} {
 		kind := kind
 		t.Run(kind.name(), func(t *testing.T) {
@@ -471,7 +471,7 @@ func TestFastLoader_CrashMidFastChunk_ResumeIsIdempotent(t *testing.T) {
 
 // ---- 3. --force-cold-start into a populated target → idempotent -----
 
-func TestFastLoader_ForceColdStart_PopulatedTarget_UsesIdempotent(t *testing.T) {
+func TestMigrate_FastLoader_ForceColdStart_PopulatedTarget_UsesIdempotent(t *testing.T) {
 	for _, kind := range []fastLoaderEngineKind{flEnginePG, flEngineMySQL} {
 		kind := kind
 		t.Run(kind.name(), func(t *testing.T) {
@@ -556,7 +556,7 @@ func seedFastLoaderTableTarget(t *testing.T, env flEnv, table string, rowCount i
 
 // ---- 4. resume of a partially-done parallel copy still completes ----
 
-func TestFastLoader_ResumePartialParallelCopy_Completes(t *testing.T) {
+func TestMigrate_FastLoader_ResumePartialParallelCopy_Completes(t *testing.T) {
 	for _, kind := range []fastLoaderEngineKind{flEnginePG, flEngineMySQL} {
 		kind := kind
 		t.Run(kind.name(), func(t *testing.T) {

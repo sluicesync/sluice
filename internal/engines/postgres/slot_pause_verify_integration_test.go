@@ -343,7 +343,7 @@ func verifyH2_TempSlotSnapshotCapturesPrePublicationAddRows(
 		}
 	}
 	if containsPreAddRow {
-		t.Logf("VERDICT_H2: HOLDS. The temp-slot snapshot taken after publication-add DOES capture rows committed on the new table BEFORE publication-add. v0.24.0's bulk-copy path correctly covers pre-publication-add rows; observed loss in TestAddTable_LiveMode_PG_UnderLoad must come from a different surface (timing race in snapshot creation under sustained burst, not from the publication-add boundary itself).")
+		t.Logf("VERDICT_H2: HOLDS. The temp-slot snapshot taken after publication-add DOES capture rows committed on the new table BEFORE publication-add. v0.24.0's bulk-copy path correctly covers pre-publication-add rows; observed loss in TestStreamer_AddTable_LiveMode_PG_UnderLoad must come from a different surface (timing race in snapshot creation under sustained burst, not from the publication-add boundary itself).")
 		return true
 	}
 	t.Errorf("VERDICT_H2: FAILS. The temp-slot snapshot did NOT capture the pre-publication-add row (h2-f1-pre-pub-add); only saw %v. This contradicts standard PG MVCC snapshot semantics — the snapshot's consistent point should be ≥ publication-add LSN, and rows committed before that LSN should be visible.", tags)

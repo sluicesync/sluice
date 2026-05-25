@@ -39,7 +39,7 @@
 //
 // A failure prints the seed + case index and dumps the replayable
 // source-dialect script to a fixtures dir, deterministically
-// reproducible via TestFuzzRoundtrip_ReplayDumpedFixture.
+// reproducible via TestMigrate_FuzzRoundtrip_ReplayDumpedFixture.
 
 package pipeline
 
@@ -338,7 +338,7 @@ func runOneCase(t *testing.T, fe *fuzzEnv, gc *genCase) (v verdict, diag string)
 
 // dumpFixture writes the replayable source-dialect script so a failure
 // is deterministically reproducible (design decision #4). The path is
-// printed so an operator (or TestFuzzRoundtrip_ReplayDumpedFixture) can
+// printed so an operator (or TestMigrate_FuzzRoundtrip_ReplayDumpedFixture) can
 // promote it to a permanent named pin.
 func dumpFixture(t *testing.T, gc *genCase, msg string) string {
 	t.Helper()
@@ -354,7 +354,7 @@ func dumpFixture(t *testing.T, gc *genCase, msg string) string {
 		"-- FUZZ FAILURE — deterministically replayable\n"+
 			"-- seed=%d direction=%s caseIdx=%d\n"+
 			"-- verdict: %s\n"+
-			"-- replay: SLUICE_FUZZ_SEED=%d go test -tags=integration -run TestFuzzRoundtrip_ReplayDumpedFixture ./internal/pipeline\n\n",
+			"-- replay: SLUICE_FUZZ_SEED=%d go test -tags=integration -run TestMigrate_FuzzRoundtrip_ReplayDumpedFixture ./internal/pipeline\n\n",
 		gc.seed, gc.dir, gc.caseIdx, msg, gc.seed,
 	)
 	if err := os.WriteFile(p, []byte(header+gc.ddl), 0o600); err != nil {
@@ -364,11 +364,11 @@ func dumpFixture(t *testing.T, gc *genCase, msg string) string {
 	return p
 }
 
-// TestFuzzRoundtrip is the property driver. With the default (smoke)
+// TestMigrate_FuzzRoundtrip is the property driver. With the default (smoke)
 // budget it runs cheaply inside the normal `-tags=integration` suite so
 // CI exercises the harness every run; set SLUICE_FUZZ_ITERS high for
 // the nightly/pre-release budget.
-func TestFuzzRoundtrip(t *testing.T) {
+func TestMigrate_FuzzRoundtrip(t *testing.T) {
 	seed := fuzzEnvSeed()
 	iters := fuzzEnvInt("SLUICE_FUZZ_ITERS", fuzzSmokeIters)
 	dirs := fuzzSelectedDirections(t)
@@ -399,12 +399,12 @@ func TestFuzzRoundtrip(t *testing.T) {
 	}
 }
 
-// TestFuzzRoundtrip_ReplayDumpedFixture is the determinism self-check:
+// TestMigrate_FuzzRoundtrip_ReplayDumpedFixture is the determinism self-check:
 // regenerate a case purely from (seed, idx, direction) and confirm the
 // rendered script is byte-identical to a prior run. This proves a
 // dumped fixture replays deterministically without needing the dumped
 // file itself (the seed IS the fixture).
-func TestFuzzRoundtrip_ReplayDumpedFixture(t *testing.T) {
+func TestMigrate_FuzzRoundtrip_ReplayDumpedFixture(t *testing.T) {
 	seed := fuzzEnvSeed()
 	for _, d := range allDirections() {
 		for i := 0; i < fuzzSmokeIters; i++ {

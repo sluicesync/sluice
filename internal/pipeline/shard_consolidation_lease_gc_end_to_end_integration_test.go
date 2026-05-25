@@ -97,14 +97,14 @@ func e2ePGPos(t *testing.T, slot, lsn string) ir.Position {
 	return ir.Position{Engine: "postgres", Token: string(b)}
 }
 
-// TestSweepFiresEndToEnd_OnRealPGEngagement is the Bug 85 / 85.b
+// TestStreamer_SweepFiresEndToEnd_OnRealPGEngagement is the Bug 85 / 85.b
 // regression guard for the streamer-side wire-up of the lease GC
 // sweep. Drives [engageShardCoordination] on a Streamer wired with a
 // REAL postgres engine + REAL ChangeApplier; asserts that the
 // heartbeat-driven sweep actually deletes an eligible APPLIED lease
 // row WITHOUT any direct call to [SweepConsolidationLeases] from test
 // code.
-func TestSweepFiresEndToEnd_OnRealPGEngagement(t *testing.T) {
+func TestStreamer_SweepFiresEndToEnd_OnRealPGEngagement(t *testing.T) {
 	dsn, cleanup := startPGForRouterTest(t)
 	defer cleanup()
 

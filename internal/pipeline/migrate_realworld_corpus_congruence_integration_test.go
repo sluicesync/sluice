@@ -403,7 +403,7 @@ func runCongruenceLeg(t *testing.T, mysqlDDLFile, pgDDLFile string, pairSize int
 
 // --- Chinook (independently authored MySQL/PG pair, 11 tables) ---
 
-func TestCorpus_Chinook_Congruence_MySQLEmittedVsAuthoredPG(t *testing.T) {
+func TestMigrate_Corpus_Chinook_Congruence_MySQLEmittedVsAuthoredPG(t *testing.T) {
 	runCongruenceLeg(t, "chinook_mysql.ddl.sql", "chinook_postgres.ddl.sql", 11)
 }
 
@@ -413,12 +413,12 @@ func TestCorpus_Chinook_Congruence_MySQLEmittedVsAuthoredPG(t *testing.T) {
 // (matches the existing iteration-2 corpusAssertTables floor; the
 // upstream generator emits 64 — verified against the iteration-2
 // findings, not hardcoded blind).
-func TestCorpus_MediaWiki_Congruence_MySQLEmittedVsAuthoredPG(t *testing.T) {
+func TestMigrate_Corpus_MediaWiki_Congruence_MySQLEmittedVsAuthoredPG(t *testing.T) {
 	runCongruenceLeg(t, "mediawiki_mysql.ddl.sql", "mediawiki_postgres.ddl.sql", 50)
 }
 
 // --- Joomla (independently authored real-CMS pair, ~28) ---
-func TestCorpus_Joomla_Congruence_MySQLEmittedVsAuthoredPG(t *testing.T) {
+func TestMigrate_Corpus_Joomla_Congruence_MySQLEmittedVsAuthoredPG(t *testing.T) {
 	runCongruenceLeg(t, "joomla_mysql.ddl.sql", "joomla_postgres.ddl.sql", 20)
 }
 
@@ -559,14 +559,14 @@ func runCongruenceReverseLeg(t *testing.T, pgDDLFile, mysqlDDLFile string, pairS
 	}
 }
 
-func TestCorpus_Chinook_Congruence_PGEmittedVsAuthoredMySQL(t *testing.T) {
+func TestMigrate_Corpus_Chinook_Congruence_PGEmittedVsAuthoredMySQL(t *testing.T) {
 	runCongruenceReverseLeg(t, "chinook_postgres.ddl.sql", "chinook_mysql.ddl.sql", 11)
 }
 
-func TestCorpus_MediaWiki_Congruence_PGEmittedVsAuthoredMySQL(t *testing.T) {
+func TestMigrate_Corpus_MediaWiki_Congruence_PGEmittedVsAuthoredMySQL(t *testing.T) {
 	runCongruenceReverseLeg(t, "mediawiki_postgres.ddl.sql", "mediawiki_mysql.ddl.sql", 50)
 }
 
-func TestCorpus_Joomla_Congruence_PGEmittedVsAuthoredMySQL(t *testing.T) {
+func TestMigrate_Corpus_Joomla_Congruence_PGEmittedVsAuthoredMySQL(t *testing.T) {
 	runCongruenceReverseLeg(t, "joomla_postgres.ddl.sql", "joomla_mysql.ddl.sql", 20)
 }

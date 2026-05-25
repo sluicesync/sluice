@@ -94,13 +94,13 @@ func TestBackup_RecordsEndPosition_PostgresIntegration(t *testing.T) {
 	}
 }
 
-// TestSyncStart_PositionFromManifest_PG_SlotExists pins acceptance
+// TestStreamer_SyncStart_PositionFromManifest_PG_SlotExists pins acceptance
 // criterion 6: a chain restored into a target plus
 // `sync start --position-from-manifest` reuses the existing slot to
 // resume CDC. The full's recorded EndPosition becomes the resume
 // position; the slot is created fresh before CDC starts so its
 // restart_lsn covers the chain terminal.
-func TestSyncStart_PositionFromManifest_PG_SlotExists(t *testing.T) {
+func TestStreamer_SyncStart_PositionFromManifest_PG_SlotExists(t *testing.T) {
 	sourceDSN, targetDSN, cleanup := startPostgresLogical(t)
 	defer cleanup()
 
@@ -185,13 +185,13 @@ func TestSyncStart_PositionFromManifest_PG_SlotExists(t *testing.T) {
 	}
 }
 
-// TestSyncStart_PositionFromManifest_PG_SlotMissing_Refuses pins
+// TestStreamer_SyncStart_PositionFromManifest_PG_SlotMissing_Refuses pins
 // acceptance criterion 6's failure mode and 8's headline: when the
 // slot named in the chain's terminal position doesn't exist on the
 // source, Phase 3.3.C's preflight refuses with a clear error rather
 // than silently proceeding to a slot-creation that would advance
 // past the chain's terminal LSN and miss data.
-func TestSyncStart_PositionFromManifest_PG_SlotMissing_Refuses(t *testing.T) {
+func TestStreamer_SyncStart_PositionFromManifest_PG_SlotMissing_Refuses(t *testing.T) {
 	sourceDSN, targetDSN, cleanup := startPostgresLogical(t)
 	defer cleanup()
 
@@ -248,7 +248,7 @@ func TestSyncStart_PositionFromManifest_PG_SlotMissing_Refuses(t *testing.T) {
 	}
 }
 
-// TestSyncStart_PositionFromManifest_PG_StrictPreflight_LowWalKeep
+// TestStreamer_SyncStart_PositionFromManifest_PG_StrictPreflight_LowWalKeep
 // pins acceptance criterion 9's strict path: a small wal_keep_size on
 // a chatty source surfaces as a soft warning under default settings;
 // --strict-preflight escalates to a refusal.
@@ -257,7 +257,7 @@ func TestSyncStart_PositionFromManifest_PG_SlotMissing_Refuses(t *testing.T) {
 // PG's default (which is 0 on PG 13+, then changed to use
 // max_slot_wal_keep_size). Setting it explicitly to a small value
 // triggers the v0.17.2 threshold.
-func TestSyncStart_PositionFromManifest_PG_StrictPreflight_LowWalKeep(t *testing.T) {
+func TestStreamer_SyncStart_PositionFromManifest_PG_StrictPreflight_LowWalKeep(t *testing.T) {
 	sourceDSN, targetDSN, cleanup := startPostgresLogical(t)
 	defer cleanup()
 
@@ -315,12 +315,12 @@ func TestSyncStart_PositionFromManifest_PG_StrictPreflight_LowWalKeep(t *testing
 	}
 }
 
-// TestPreflight_PG_DetectsLowWalKeepSize confirms the preflight
+// TestStreamer_Preflight_PG_DetectsLowWalKeepSize confirms the preflight
 // query side: a low wal_keep_size on the source produces a warning
 // (without StrictPreflight, the warning logs but the run proceeds).
 // We exercise the preflight directly via the SchemaReader surface so
 // the test doesn't have to wait for a CDC stream.
-func TestPreflight_PG_DetectsLowWalKeepSize(t *testing.T) {
+func TestStreamer_Preflight_PG_DetectsLowWalKeepSize(t *testing.T) {
 	sourceDSN, _, cleanup := startPostgresLogical(t)
 	defer cleanup()
 
@@ -372,14 +372,14 @@ func TestPreflight_PG_DetectsLowWalKeepSize(t *testing.T) {
 	}
 }
 
-// TestPreflight_PG_DetectsPhysicalSlot confirms Bug 36 (v0.17.3)
+// TestStreamer_Preflight_PG_DetectsPhysicalSlot confirms Bug 36 (v0.17.3)
 // Signal 4: a non-temporary physical replication slot on the source
 // is detected as an HA-cluster signal. Most non-HA PG deployments
 // don't carry standby physical slots, so the presence of one is a
 // strong heuristic — and it covers managed-PG services where the
 // v0.17.2 SQL signals (Patroni-prefixed GUCs / pg_stat_replication /
 // patroni-named roles) all systematically miss.
-func TestPreflight_PG_DetectsPhysicalSlot(t *testing.T) {
+func TestStreamer_Preflight_PG_DetectsPhysicalSlot(t *testing.T) {
 	sourceDSN, _, cleanup := startPostgresLogical(t)
 	defer cleanup()
 
@@ -432,7 +432,7 @@ func TestPreflight_PG_DetectsPhysicalSlot(t *testing.T) {
 	}
 }
 
-// TestPreflight_PG_DetectsClusterNameGUC confirms Bug 36 (v0.17.3)
+// TestStreamer_Preflight_PG_DetectsClusterNameGUC confirms Bug 36 (v0.17.3)
 // Signal 5: a populated cluster_name GUC on the source is detected as
 // an HA-managed-convention signal. Patroni sets this; many managed
 // services do too. This signal catches managed-PG services where
@@ -442,7 +442,7 @@ func TestPreflight_PG_DetectsPhysicalSlot(t *testing.T) {
 // cluster_name is a postmaster-context GUC: it can only be set at
 // server startup, not via ALTER SYSTEM + reload. The test boots a
 // dedicated container with cluster_name passed as a server arg.
-func TestPreflight_PG_DetectsClusterNameGUC(t *testing.T) {
+func TestStreamer_Preflight_PG_DetectsClusterNameGUC(t *testing.T) {
 	sourceDSN, cleanup := startPostgresLogicalWithClusterName(t, "sluice-test-cluster")
 	defer cleanup()
 
@@ -525,11 +525,11 @@ func startPostgresLogicalWithClusterName(t *testing.T, clusterName string) (sour
 	return srcConn, terminate
 }
 
-// TestSyncStart_PatroniMode_Off_SuppressesWarning confirms Bug 36
+// TestStreamer_SyncStart_PatroniMode_Off_SuppressesWarning confirms Bug 36
 // (v0.17.3) override: --patroni-mode=off skips the Patroni-detection
 // signals entirely and suppresses the warning, even when a heuristic
 // would fire. Other warnings (wal_keep_size) are unaffected.
-func TestSyncStart_PatroniMode_Off_SuppressesWarning(t *testing.T) {
+func TestStreamer_SyncStart_PatroniMode_Off_SuppressesWarning(t *testing.T) {
 	sourceDSN, _, cleanup := startPostgresLogical(t)
 	defer cleanup()
 
@@ -575,12 +575,12 @@ func TestSyncStart_PatroniMode_Off_SuppressesWarning(t *testing.T) {
 	}
 }
 
-// TestSyncStart_PatroniMode_On_FiresOnVanilla confirms Bug 36
+// TestStreamer_SyncStart_PatroniMode_On_FiresOnVanilla confirms Bug 36
 // (v0.17.3) override: --patroni-mode=on emits the Patroni warning
 // even on a vanilla PG container with no Patroni signals (no GUCs,
 // no pg_stat_replication entries, no patroni-named roles, no
 // physical slots, no cluster_name set).
-func TestSyncStart_PatroniMode_On_FiresOnVanilla(t *testing.T) {
+func TestStreamer_SyncStart_PatroniMode_On_FiresOnVanilla(t *testing.T) {
 	sourceDSN, _, cleanup := startPostgresLogical(t)
 	defer cleanup()
 

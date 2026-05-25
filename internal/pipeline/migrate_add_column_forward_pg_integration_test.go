@@ -32,11 +32,11 @@ import (
 	_ "github.com/orware/sluice/internal/engines/postgres"
 )
 
-// TestAddColumnForward_PG_FlagOn_ForwardsALTER pins ADR-0058's
+// TestStreamer_AddColumnForward_PG_FlagOn_ForwardsALTER pins ADR-0058's
 // load-bearing happy path on PG → PG: with --forward-schema-add-column
 // set, a source ALTER TABLE ADD COLUMN forwards to the target and a
 // subsequent INSERT carrying the new column lands.
-func TestAddColumnForward_PG_FlagOn_ForwardsALTER(t *testing.T) {
+func TestStreamer_AddColumnForward_PG_FlagOn_ForwardsALTER(t *testing.T) {
 	sourceDSN, targetDSN, cleanup := startPostgresLogical(t)
 	defer cleanup()
 
@@ -134,10 +134,10 @@ func TestAddColumnForward_PG_FlagOn_ForwardsALTER(t *testing.T) {
 	}
 }
 
-// TestAddColumnForward_PG_Backfill_PopulatesPriorRows pins the
+// TestStreamer_AddColumnForward_PG_Backfill_PopulatesPriorRows pins the
 // --backfill-added-column path: rows shipped to the target before the
 // ALTER get the source's per-row values for the new column.
-func TestAddColumnForward_PG_Backfill_PopulatesPriorRows(t *testing.T) {
+func TestStreamer_AddColumnForward_PG_Backfill_PopulatesPriorRows(t *testing.T) {
 	sourceDSN, targetDSN, cleanup := startPostgresLogical(t)
 	defer cleanup()
 
@@ -255,12 +255,12 @@ func TestAddColumnForward_PG_Backfill_PopulatesPriorRows(t *testing.T) {
 	}
 }
 
-// TestAddColumnForward_PG_FlagOff_RefusesLoudly pins the negative
+// TestStreamer_AddColumnForward_PG_FlagOff_RefusesLoudly pins the negative
 // case: with --forward-schema-add-column UNSET (default), the
 // post-ALTER INSERT errors the streamer. This is the pre-v0.79.0
 // behavior; the test guards against accidental default-on changes
 // that would silently shift operator-visible semantics.
-func TestAddColumnForward_PG_FlagOff_RefusesLoudly(t *testing.T) {
+func TestStreamer_AddColumnForward_PG_FlagOff_RefusesLoudly(t *testing.T) {
 	sourceDSN, targetDSN, cleanup := startPostgresLogical(t)
 	defer cleanup()
 
@@ -319,7 +319,7 @@ func TestAddColumnForward_PG_FlagOff_RefusesLoudly(t *testing.T) {
 	}
 }
 
-// TestAddColumnForward_PG_RefusesComputedDefault pins Bug 90's fix
+// TestStreamer_AddColumnForward_PG_RefusesComputedDefault pins Bug 90's fix
 // (v0.79.1): v0.79.0 silently forwarded an ADD COLUMN with a
 // computed DEFAULT (NOW() / nextval / random / etc.) because the CDC
 // reader's RelationMessage projection dropped the DEFAULT clause and
@@ -335,7 +335,7 @@ func TestAddColumnForward_PG_FlagOff_RefusesLoudly(t *testing.T) {
 // covered. Two scenarios in one test file keeps the integration
 // suite's runtime in check while still pinning both major Bug 90
 // failure shapes.
-func TestAddColumnForward_PG_RefusesComputedDefault(t *testing.T) {
+func TestStreamer_AddColumnForward_PG_RefusesComputedDefault(t *testing.T) {
 	scenarios := []struct {
 		name   string
 		ddl    string

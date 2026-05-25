@@ -37,12 +37,12 @@ import (
 	_ "github.com/orware/sluice/internal/engines/postgres"
 )
 
-// TestAddTable_LiveMode_PG runs the load-bearing scenario: live add
+// TestStreamer_AddTable_LiveMode_PG runs the load-bearing scenario: live add
 // of a new table against an actively-running stream. Verifies the
 // existing table's CDC is unaffected and the new table is fully
 // brought into the stream's scope (existing rows via snapshot + new
 // rows via CDC).
-func TestAddTable_LiveMode_PG(t *testing.T) {
+func TestStreamer_AddTable_LiveMode_PG(t *testing.T) {
 	sourceDSN, targetDSN, cleanup := startPostgresLogical(t)
 	defer cleanup()
 
@@ -147,13 +147,13 @@ func TestAddTable_LiveMode_PG(t *testing.T) {
 	}
 }
 
-// TestAddTable_LiveMode_PG_UnderLoad runs live add while a goroutine
+// TestStreamer_AddTable_LiveMode_PG_UnderLoad runs live add while a goroutine
 // drives sustained INSERTs on the new table. Pins: zero data loss
 // (snapshot + CDC overlap fully covered) and no duplicates (the
 // idempotent applier absorbs the [snapshot-LSN, slot-LSN] overlap on
 // the new table). ADR-0030's "what could go wrong" lives or dies on
 // this test.
-func TestAddTable_LiveMode_PG_UnderLoad(t *testing.T) {
+func TestStreamer_AddTable_LiveMode_PG_UnderLoad(t *testing.T) {
 	sourceDSN, targetDSN, cleanup := startPostgresLogical(t)
 	defer cleanup()
 
@@ -348,7 +348,7 @@ func TestAddTable_LiveMode_PG_UnderLoad(t *testing.T) {
 		// count disagrees with finalInserted the loader race is back —
 		// reach for the diagnose test to characterize.
 		gotSource := pollRowCount(sourceDSN, "events")
-		t.Errorf("under-load events row count = %d; want exactly %d (snapshot %d + load %d + post-add 1). Source committed = %d. ADR-0036 Phase B closes the in-flight-loss gap; a non-zero gap here is a regression — run TestAddTable_LiveMode_PG_DiagnoseLossSurface against the same Postgres to characterize.",
+		t.Errorf("under-load events row count = %d; want exactly %d (snapshot %d + load %d + post-add 1). Source committed = %d. ADR-0036 Phase B closes the in-flight-loss gap; a non-zero gap here is a regression — run TestStreamer_AddTable_LiveMode_PG_DiagnoseLossSurface against the same Postgres to characterize.",
 			got, maxTotal, seedRowCount, finalInserted, gotSource)
 	}
 

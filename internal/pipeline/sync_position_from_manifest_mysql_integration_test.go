@@ -73,11 +73,11 @@ func TestBackup_RecordsEndPosition_MySQLIntegration(t *testing.T) {
 	}
 }
 
-// TestSyncStart_PositionFromManifest_MySQL_HappyPath pins acceptance
+// TestStreamer_SyncStart_PositionFromManifest_MySQL_HappyPath pins acceptance
 // criterion 5: take a v0.17.2 full, restore into target, insert on
 // source, run sync with --position-from-manifest, verify CDC catches
 // up.
-func TestSyncStart_PositionFromManifest_MySQL_HappyPath(t *testing.T) {
+func TestStreamer_SyncStart_PositionFromManifest_MySQL_HappyPath(t *testing.T) {
 	sourceDSN, targetDSN, cleanup := startMySQLBinlog(t)
 	defer cleanup()
 

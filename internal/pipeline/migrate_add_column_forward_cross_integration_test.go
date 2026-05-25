@@ -23,13 +23,13 @@ import (
 	_ "github.com/orware/sluice/internal/engines/postgres"
 )
 
-// TestAddColumnForward_Cross_MySQLToPG verifies that an ALTER TABLE
+// TestStreamer_AddColumnForward_Cross_MySQLToPG verifies that an ALTER TABLE
 // ADD COLUMN on a MySQL source forwards through the live CDC apply
 // to a PG target. The translate.RetargetForEngine rewrite handles
 // MySQL's type → PG dialect mapping (e.g. DECIMAL(10,2) stays
 // NUMERIC(10,2) — both engines spell it identically in IR, but
 // VARCHAR/TEXT/etc. would translate per the existing path).
-func TestAddColumnForward_Cross_MySQLToPG(t *testing.T) {
+func TestStreamer_AddColumnForward_Cross_MySQLToPG(t *testing.T) {
 	mysqlDSN, _, mysqlCleanup := startMySQLBinlog(t)
 	defer mysqlCleanup()
 	_, pgDSN, pgCleanup := startPostgresLogical(t)
@@ -106,10 +106,10 @@ func TestAddColumnForward_Cross_MySQLToPG(t *testing.T) {
 	}
 }
 
-// TestAddColumnForward_Cross_PGToMySQL verifies the mirror: PG source,
+// TestStreamer_AddColumnForward_Cross_PGToMySQL verifies the mirror: PG source,
 // MySQL target. Cross-engine column-def emission flows through the
 // SchemaWriter's MySQL dialect.
-func TestAddColumnForward_Cross_PGToMySQL(t *testing.T) {
+func TestStreamer_AddColumnForward_Cross_PGToMySQL(t *testing.T) {
 	pgDSN, _, pgCleanup := startPostgresLogical(t)
 	defer pgCleanup()
 	_, mysqlDSN, mysqlCleanup := startMySQLBinlog(t)

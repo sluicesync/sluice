@@ -126,7 +126,7 @@ func corpusRawPGTableCount(t *testing.T, dsn string) int {
 }
 
 // Chinook MySQL → PG, DryRun: source read + cross-engine plan, no data.
-func TestCorpus_Chinook_MySQLToPG_DryRun(t *testing.T) {
+func TestMigrate_Corpus_Chinook_MySQLToPG_DryRun(t *testing.T) {
 	ddl := readCorpus(t, "chinook_mysql.ddl.sql")
 	src, _, cleanup := startMySQL(t)
 	defer cleanup()
@@ -146,7 +146,7 @@ func TestCorpus_Chinook_MySQLToPG_DryRun(t *testing.T) {
 }
 
 // Chinook PG → MySQL, DryRun.
-func TestCorpus_Chinook_PGToMySQL_DryRun(t *testing.T) {
+func TestMigrate_Corpus_Chinook_PGToMySQL_DryRun(t *testing.T) {
 	ddl := readCorpus(t, "chinook_postgres.ddl.sql")
 	src, _, cleanup := startPostgres(t)
 	defer cleanup()
@@ -172,7 +172,7 @@ func TestCorpus_Chinook_PGToMySQL_DryRun(t *testing.T) {
 // Outcomes are logged so a failing apply or a loud refusal is
 // recorded, never a red bar (the schema isn't expected to be
 // cross-engine-clean — the point is to find where sluice strains).
-func TestCorpus_GitLab_PG_Characterize(t *testing.T) {
+func TestMigrate_Corpus_GitLab_PG_Characterize(t *testing.T) {
 	ddl := readCorpus(t, "gitlab_structure.pg.sql")
 	src, _, cleanup := startPostgres(t)
 	defer cleanup()
@@ -218,7 +218,7 @@ func TestCorpus_GitLab_PG_Characterize(t *testing.T) {
 // PG→PG DryRun must succeed with NO "unsupported data_type tsvector"
 // — an error here would be a genuine defect (verbatim path not
 // engaged for PG→PG migrate), which is exactly the finding we'd want.
-func TestCorpus_GitLab_PGToPG_VerbatimCarry(t *testing.T) {
+func TestMigrate_Corpus_GitLab_PGToPG_VerbatimCarry(t *testing.T) {
 	ddl := readCorpus(t, "gitlab_structure.pg.sql")
 	src, tgt, cleanup := startPostgres(t) // src = load GitLab; tgt = PG→PG target
 	defer cleanup()
@@ -264,7 +264,7 @@ func TestCorpus_GitLab_PGToPG_VerbatimCarry(t *testing.T) {
 // direction is a stronger signal than independently-authored pairs.
 // (The deeper "does sluice's MySQL→PG emitted schema match the
 // upstream PG side" congruence check is iteration 3.)
-func TestCorpus_MediaWiki_MySQLToPG_DryRun(t *testing.T) {
+func TestMigrate_Corpus_MediaWiki_MySQLToPG_DryRun(t *testing.T) {
 	ddl := readCorpus(t, "mediawiki_mysql.ddl.sql")
 	src, _, cleanup := startMySQL(t)
 	defer cleanup()
@@ -283,7 +283,7 @@ func TestCorpus_MediaWiki_MySQLToPG_DryRun(t *testing.T) {
 	t.Log("MediaWiki MySQL→PG DryRun: 64-table generated-schema read + cross-engine plan OK")
 }
 
-func TestCorpus_MediaWiki_PGToMySQL_DryRun(t *testing.T) {
+func TestMigrate_Corpus_MediaWiki_PGToMySQL_DryRun(t *testing.T) {
 	ddl := readCorpus(t, "mediawiki_postgres.ddl.sql")
 	src, _, cleanup := startPostgres(t)
 	defer cleanup()
@@ -306,7 +306,7 @@ func TestCorpus_MediaWiki_PGToMySQL_DryRun(t *testing.T) {
 // a feature Chinook lacks. Asserts: sluice's MySQL reader handles a
 // partitioned real schema and the PG plan succeeds or refuses loudly
 // (a crash/silent-drop here would be a genuine finding).
-func TestCorpus_Employees_MySQLToPG_DryRun(t *testing.T) {
+func TestMigrate_Corpus_Employees_MySQLToPG_DryRun(t *testing.T) {
 	ddl := readCorpus(t, "employees_mysql_partitioned.ddl.sql")
 	src, _, cleanup := startMySQL(t)
 	defer cleanup()
@@ -333,7 +333,7 @@ func TestCorpus_Employees_MySQLToPG_DryRun(t *testing.T) {
 // Joomla ships raw install SQL for BOTH MySQL and PG → a real-CMS
 // matched cross-engine pair (28 tables each; independently authored
 // per dialect, like Chinook). Asserts both directions read + plan.
-func TestCorpus_Joomla_MySQLToPG_DryRun(t *testing.T) {
+func TestMigrate_Corpus_Joomla_MySQLToPG_DryRun(t *testing.T) {
 	ddl := readCorpus(t, "joomla_mysql.ddl.sql")
 	src, _, cleanup := startMySQL(t)
 	defer cleanup()
@@ -352,7 +352,7 @@ func TestCorpus_Joomla_MySQLToPG_DryRun(t *testing.T) {
 	t.Log("Joomla MySQL→PG DryRun: real-CMS schema read + cross-engine plan OK")
 }
 
-func TestCorpus_Joomla_PGToMySQL_DryRun(t *testing.T) {
+func TestMigrate_Corpus_Joomla_PGToMySQL_DryRun(t *testing.T) {
 	ddl := readCorpus(t, "joomla_postgres.ddl.sql")
 	src, _, cleanup := startPostgres(t)
 	defer cleanup()
@@ -373,7 +373,7 @@ func TestCorpus_Joomla_PGToMySQL_DryRun(t *testing.T) {
 
 // WordPress core schema (extracted from PHP wp_get_db_schema()) — the
 // canonical operator-brought MySQL shape.
-func TestCorpus_WordPress_MySQLToPG_DryRun(t *testing.T) {
+func TestMigrate_Corpus_WordPress_MySQLToPG_DryRun(t *testing.T) {
 	ddl := readCorpus(t, "wordpress_mysql.ddl.sql")
 	src, _, cleanup := startMySQL(t)
 	defer cleanup()
@@ -417,7 +417,7 @@ func TestCorpus_WordPress_MySQLToPG_DryRun(t *testing.T) {
 // WordPress's real schema needs WP's permissive sql_mode for the
 // `datetime DEFAULT '0000-00-00 00:00:00'` columns (same as the
 // vanilla WordPress leg) — load AS-IS, don't rewrite.
-func TestCorpus_WordPress_PlanetScaleFlavor_MySQLToPG_DryRun(t *testing.T) {
+func TestMigrate_Corpus_WordPress_PlanetScaleFlavor_MySQLToPG_DryRun(t *testing.T) {
 	ddl := readCorpus(t, "wordpress_mysql.ddl.sql")
 	src, _, cleanup := startMySQL(t)
 	defer cleanup()
@@ -461,7 +461,7 @@ func TestCorpus_WordPress_PlanetScaleFlavor_MySQLToPG_DryRun(t *testing.T) {
 // tables — through sluice's MySQL reader + a MySQL→PG DryRun plan.
 // Non-vacuous (>=2 tables: the commerce keyspace defines several).
 // A loud refusal is acceptable-and-characterized; a crash is a finding.
-func TestCorpus_Vitess_Commerce_MySQLToPG_DryRun(t *testing.T) {
+func TestMigrate_Corpus_Vitess_Commerce_MySQLToPG_DryRun(t *testing.T) {
 	ddl := readCorpus(t, "vitess_commerce_mysql.ddl.sql")
 	src, _, cleanup := startMySQL(t)
 	defer cleanup()

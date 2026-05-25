@@ -20,9 +20,9 @@ import (
 	_ "github.com/orware/sluice/internal/engines/mysql"
 )
 
-// TestAddColumnForward_MySQL_FlagOn_ForwardsALTER pins the
+// TestStreamer_AddColumnForward_MySQL_FlagOn_ForwardsALTER pins the
 // MySQL → MySQL load-bearing happy path.
-func TestAddColumnForward_MySQL_FlagOn_ForwardsALTER(t *testing.T) {
+func TestStreamer_AddColumnForward_MySQL_FlagOn_ForwardsALTER(t *testing.T) {
 	sourceDSN, targetDSN, cleanup := startMySQLBinlog(t)
 	defer cleanup()
 
@@ -101,10 +101,10 @@ func TestAddColumnForward_MySQL_FlagOn_ForwardsALTER(t *testing.T) {
 	}
 }
 
-// TestAddColumnForward_MySQL_Backfill verifies the backfill loop on
+// TestStreamer_AddColumnForward_MySQL_Backfill verifies the backfill loop on
 // MySQL → MySQL. Source post-ALTER UPDATEs assign per-row values; the
 // final target state reflects them.
-func TestAddColumnForward_MySQL_Backfill(t *testing.T) {
+func TestStreamer_AddColumnForward_MySQL_Backfill(t *testing.T) {
 	sourceDSN, targetDSN, cleanup := startMySQLBinlog(t)
 	defer cleanup()
 
@@ -199,7 +199,7 @@ func TestAddColumnForward_MySQL_Backfill(t *testing.T) {
 	}
 }
 
-// TestAddColumnForward_MySQL_RefusesComputedDefault pins Bug 90's fix
+// TestStreamer_AddColumnForward_MySQL_RefusesComputedDefault pins Bug 90's fix
 // (v0.79.1) on MySQL → MySQL. MySQL's TableMapEvent doesn't carry
 // COLUMN_DEFAULT either, so the production CDC path arrives at the
 // intercept with Default=nil; the fix's source-side SchemaReader
@@ -224,7 +224,7 @@ func TestAddColumnForward_MySQL_Backfill(t *testing.T) {
 // LAST_INSERT_ID and every other MySQL volatile family lives in the
 // unit-test matrix (TestClassifyDefaultVolatility_Class), which
 // exercises the classifier directly with no MySQL-DDL gating.
-func TestAddColumnForward_MySQL_RefusesComputedDefault(t *testing.T) {
+func TestStreamer_AddColumnForward_MySQL_RefusesComputedDefault(t *testing.T) {
 	scenarios := []struct {
 		name   string
 		ddl    string

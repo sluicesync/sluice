@@ -9,7 +9,7 @@
 // This is a Phase A *characterization* test, NOT a correctness fix.
 // Path A (slot-pause) was empirically falsified in ADR-0033; H2
 // (temp-slot snapshot covers pre-publication-add rows) holds. Where
-// does the ~36% loss observed in TestAddTable_LiveMode_PG_UnderLoad
+// does the ~36% loss observed in TestStreamer_AddTable_LiveMode_PG_UnderLoad
 // at high burst rates actually come from?
 //
 // Phase A.2 (committed on main as f8fc85c) falsified reframed M3
@@ -86,7 +86,7 @@
 // sections).
 //
 // Pure observability — does NOT enforce zero-loss assertions. The
-// existing TestAddTable_LiveMode_PG_UnderLoad continues to enforce
+// existing TestStreamer_AddTable_LiveMode_PG_UnderLoad continues to enforce
 // snapshot + post-add CDC correctness; this test enforces only that
 // the diagnostic markers are emitted.
 
@@ -113,14 +113,14 @@ import (
 	_ "github.com/orware/sluice/internal/engines/postgres"
 )
 
-// TestAddTable_LiveMode_PG_DiagnoseLossSurface is the ADR-0036 Phase A
+// TestStreamer_AddTable_LiveMode_PG_DiagnoseLossSurface is the ADR-0036 Phase A
 // instrumentation run. Captures cdc.diag + addtable.diag DEBUG-level
 // slog lines emitted by the v0.24.0 mid-stream add-table flow under
 // the same burst-writer conditions that exhibit ~36% loss in the
 // original under-load test, then introspects them to render four
 // VERDICT_M[1-4] lines. See the file-level comment for the structure
 // and what each VERDICT means.
-func TestAddTable_LiveMode_PG_DiagnoseLossSurface(t *testing.T) {
+func TestStreamer_AddTable_LiveMode_PG_DiagnoseLossSurface(t *testing.T) {
 	sourceDSN, targetDSN, cleanup := startPostgresLogical(t)
 	defer cleanup()
 

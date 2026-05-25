@@ -11,13 +11,13 @@
 //
 // Three scenarios:
 //
-//   - TestAddTable_LiveMode_MySQL: happy path. Active stream with
+//   - TestStreamer_AddTable_LiveMode_MySQL: happy path. Active stream with
 //     Filter:Include=[users]; live-add `orders`; verify orders snapshot
 //     rows + post-add CDC delivery.
-//   - TestAddTable_LiveMode_MySQL_UnderLoad: best-effort under load.
+//   - TestStreamer_AddTable_LiveMode_MySQL_UnderLoad: best-effort under load.
 //     Sustained INSERTs on `orders` during the live add; pin snapshot
 //     rows + post-flip CDC; in-flight gap logged as best-effort.
-//   - TestAddTable_LiveMode_MySQL_FilterRespectedAfterFlip: pins
+//   - TestStreamer_AddTable_LiveMode_MySQL_FilterRespectedAfterFlip: pins
 //     additive semantics. Operator's existing Include=[users] stays in
 //     scope; live-added `orders` joins; an OUT-OF-SCOPE table
 //     `audit_log` stays excluded.
@@ -38,13 +38,13 @@ import (
 	_ "github.com/orware/sluice/internal/engines/mysql"
 )
 
-// TestAddTable_LiveMode_MySQL is the load-bearing scenario for ADR-
+// TestStreamer_AddTable_LiveMode_MySQL is the load-bearing scenario for ADR-
 // 0034: live add of a new table against an actively-running MySQL
 // stream that started with --include-table=users. Verifies the
 // existing table's CDC is unaffected and the new table is fully
 // brought into the stream's scope (existing rows via snapshot + new
 // rows via CDC after the filter-flip).
-func TestAddTable_LiveMode_MySQL(t *testing.T) {
+func TestStreamer_AddTable_LiveMode_MySQL(t *testing.T) {
 	srcDSN, tgtDSN, cleanup := startMySQLBinlog(t)
 	defer cleanup()
 
@@ -160,12 +160,12 @@ func TestAddTable_LiveMode_MySQL(t *testing.T) {
 	}
 }
 
-// TestAddTable_LiveMode_MySQL_UnderLoad runs live add while a
+// TestStreamer_AddTable_LiveMode_MySQL_UnderLoad runs live add while a
 // goroutine drives sustained INSERTs on the new table. Pin: snapshot
 // rows + post-flip CDC are delivered (load-bearing). In-flight events
 // during the add window are best-effort (ADR-0034 § "best-effort
 // caveat") — logged but not asserted.
-func TestAddTable_LiveMode_MySQL_UnderLoad(t *testing.T) {
+func TestStreamer_AddTable_LiveMode_MySQL_UnderLoad(t *testing.T) {
 	srcDSN, tgtDSN, cleanup := startMySQLBinlog(t)
 	defer cleanup()
 
@@ -337,11 +337,11 @@ func TestAddTable_LiveMode_MySQL_UnderLoad(t *testing.T) {
 	}
 }
 
-// TestAddTable_LiveMode_MySQL_FilterRespectedAfterFlip pins the
+// TestStreamer_AddTable_LiveMode_MySQL_FilterRespectedAfterFlip pins the
 // additive semantics: the live-flip extends the stream's scope; it
 // does NOT replace the operator's filter. Tables outside both the
 // base filter and the live-added set stay excluded.
-func TestAddTable_LiveMode_MySQL_FilterRespectedAfterFlip(t *testing.T) {
+func TestStreamer_AddTable_LiveMode_MySQL_FilterRespectedAfterFlip(t *testing.T) {
 	srcDSN, tgtDSN, cleanup := startMySQLBinlog(t)
 	defer cleanup()
 
