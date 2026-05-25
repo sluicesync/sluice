@@ -51,6 +51,14 @@ import (
 // mode. Sibling of startMySQLForCDC; the gtid-mode flags make the
 // reader's resolveStartPosition auto-detect GTID and emit GTID-mode
 // positions (the ones verifyGTIDSetReachable validates on resume).
+//
+// Why this helper keeps booting its own container (unlike the rest
+// of the engine's integration tests, which now share one mysqld via
+// TestMain — see shared_container_integration_test.go): this test's
+// PURGE BINARY LOGS mutates *global* binlog state on the server, so
+// running it against the shared container would truncate every
+// other CDC test's binlog history mid-shard. One extra container
+// boot per shard run is the price of test isolation here.
 func startMySQLGTIDForCDC(t *testing.T) (dsn string, cleanup func()) {
 	t.Helper()
 	testcontainers.SkipIfProviderIsNotHealthy(t)

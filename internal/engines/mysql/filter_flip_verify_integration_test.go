@@ -48,7 +48,6 @@ package mysql
 import (
 	"context"
 	"database/sql"
-	"fmt"
 	"testing"
 	"time"
 
@@ -214,45 +213,20 @@ func TestFilterFlip_Verify_PostFlipEventsDelivered(t *testing.T) {
 // level test stays self-contained — it answers a structural-mechanism
 // question, not a full end-to-end one).
 
-// startMySQLBinlogVerify boots a MySQL container with binlog enabled
-// and creates source_db + target_db on it. Mirrors the pipeline
-// package's startMySQLBinlog helper.
+// startMySQLBinlogVerify returns DSNs pointed at freshly-reset
+// `source_db` and `target_db` databases on the shard's shared
+// mysqld container (see shared_container_integration_test.go).
+// Both schemas live on the same mysqld so cross-db binlog tests
+// continue to work; reset semantics match the pre-refactor behaviour
+// of booting a fresh container with both databases empty.
+//
+// The (dsn, dsn, cleanup) shape is preserved; cleanup is a no-op
+// because TestMain owns container teardown.
 func startMySQLBinlogVerify(t *testing.T) (sourceDSN, targetDSN string, cleanup func()) {
 	t.Helper()
-	dsn, terminate := startMySQLForCDC(t)
-
-	// Create target_db on the same container.
-	db, err := sql.Open("mysql", dsn+"&multiStatements=true")
-	if err != nil {
-		terminate()
-		t.Fatalf("verify: open: %v", err)
-	}
-	defer func() { _ = db.Close() }()
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	if _, err := db.ExecContext(ctx, "CREATE DATABASE target_db"); err != nil {
-		terminate()
-		t.Fatalf("verify: create target_db: %v", err)
-	}
-
-	tgt, err := buildVerifyTargetDSN(dsn, "target_db")
-	if err != nil {
-		terminate()
-		t.Fatalf("verify: build target DSN: %v", err)
-	}
-	return dsn, tgt, terminate
-}
-
-// buildVerifyTargetDSN swaps the database segment of a MySQL DSN —
-// same shape as buildMySQLDSN in the pipeline package, kept local to
-// this engine-level test.
-func buildVerifyTargetDSN(srcDSN, dbName string) (string, error) {
-	cfg, err := parseDSN(srcDSN)
-	if err != nil {
-		return "", fmt.Errorf("parse: %w", err)
-	}
-	cfg.DBName = dbName
-	return cfg.FormatDSN(), nil
+	src, _ := newSharedDB(t, "source_db")
+	tgt, _ := newSharedDB(t, "target_db")
+	return src, tgt, func() {}
 }
 
 func applyVerifyDDL(t *testing.T, dsn, sqlText string) {

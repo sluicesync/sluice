@@ -25,41 +25,16 @@ import (
 	"time"
 
 	"github.com/orware/sluice/internal/ir"
-
-	"github.com/testcontainers/testcontainers-go"
-	mysqltc "github.com/testcontainers/testcontainers-go/modules/mysql"
 )
 
+// startMySQLForApplier returns a DSN pointed at a freshly-reset
+// `target_db` database on the shard's shared mysqld container (see
+// shared_container_integration_test.go). The (dsn, cleanup) shape
+// is preserved so the many callers' `defer cleanup()` compile
+// unchanged; cleanup is a no-op because TestMain owns the container.
 func startMySQLForApplier(t *testing.T) (dsn string, cleanup func()) {
 	t.Helper()
-	testcontainers.SkipIfProviderIsNotHealthy(t)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-
-	container, err := mysqltc.Run(
-		ctx,
-		"mysql:8.0",
-		mysqltc.WithDatabase("target_db"),
-		mysqltc.WithUsername("root"),
-		mysqltc.WithPassword("rootpw"),
-	)
-	if err != nil {
-		t.Fatalf("start container: %v", err)
-	}
-
-	terminate := func() {
-		shutdown, c := context.WithTimeout(context.Background(), 30*time.Second)
-		defer c()
-		_ = container.Terminate(shutdown)
-	}
-
-	conn, err := container.ConnectionString(ctx, "parseTime=true")
-	if err != nil {
-		terminate()
-		t.Fatalf("connection string: %v", err)
-	}
-	return conn, terminate
+	return newSharedDB(t, "target_db")
 }
 
 func applyMySQLApplier(t *testing.T, dsn, sqlText string) {
