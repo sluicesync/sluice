@@ -158,7 +158,7 @@ This is the category claim: sluice is the open-source tool whose feature set mos
 
 ## Project state
 
-**Pre-1.0** (`v0.83.x` series at time of writing). sluice has shipped 80+ tagged releases across the v0.x line. The feature surface is settled enough that the recent v0.79 → v0.83 arc was all severity-a operator-pain features (F10 / F11 / F13 / F17) rather than core-engine work. **No known production users today.**
+**Pre-1.0** (`v0.83.x` series at time of writing). sluice has shipped 150+ tagged releases across the v0.x line. The feature surface is settled enough that the recent v0.79 → v0.83 arc was all severity-a operator-pain features (F10 / F11 / F13 / F17) rather than core-engine work. **No known production users today.**
 
 This is a deliberate posture, not an accident:
 
@@ -251,8 +251,6 @@ Full history: [CHANGELOG.md](CHANGELOG.md).
 ## Why "sluice"
 
 A sluice is a gate that controls the flow of water through a canal — it doesn't generate the flow, it regulates and directs it. That's the posture this tool takes toward your data: it doesn't transform what's flowing, it manages how, when, and where it moves.
-
-The name has a personal connection too. The author grew up in California's Imperial Valley, where the Imperial Irrigation District manages an extensive canal system. Sluice gates are a familiar sight there — unassuming pieces of infrastructure that raise and lower water levels and let the right amount through at the right time. That's the spirit the project aims for.
 
 ## License
 
