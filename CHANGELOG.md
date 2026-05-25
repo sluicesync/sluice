@@ -6,6 +6,51 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.82.0] - 2026-05-25
+
+### Added
+
+- **`feat(pipeline/engines): F17 — source-side sluice_heartbeat writer (#48 / ADR-0061)`** — Sluice now optionally writes a tiny periodic row to a sluice-owned table on the source DB. The INSERT generates WAL (Postgres) / binlog (MySQL) so the CDC consumer's position advances even against a quiet source — preventing the silent slot-eviction / binlog-rotation-past-consumer class on low-traffic source DBs (off-hours, weekends, dev environments).
+
+  **Default-OFF**: operators opt in with `--source-heartbeat-interval=30s`. The INSERT is a behavior change on the source DB — operators on regulated systems must explicitly enable.
+
+  **Permission-denied path is graceful**: when the role lacks `CREATE TABLE`, the writer WARNs once and the stream continues — F17 is not fatal to the rest of sluice. The WARN names three remediation options (grant CREATE, pre-create the table, `--no-source-heartbeat`).
+
+  **F13 (ADR-0059) pairs with F17 (ADR-0061)**: F13 detects the slot-eviction symptom; F17 prevents the cause.
+
+  ### CLI surface
+
+  - `--source-heartbeat-interval=DUR` (default `0s` = disabled)
+  - `--source-heartbeat-prune-window=DUR` (default 1h; 0 disables) — bounds heartbeat-table growth via periodic DELETE
+  - `--source-heartbeat-table-name=NAME` (default `sluice_heartbeat`) — override for hostile DBA-managed namespaces
+  - `--no-source-heartbeat` — opt-out escape hatch
+
+  ### Architecture
+
+  - `ir.HeartbeatWriter` optional interface + `ir.ErrHeartbeatPermission` sentinel (`internal/ir/health.go`)
+  - PG impl: `internal/engines/postgres/heartbeat_writer.go` — `BIGSERIAL` + `TIMESTAMPTZ DEFAULT NOW()` schema
+  - MySQL impl: `internal/engines/mysql/heartbeat_writer.go` — `AUTO_INCREMENT` PK + `TIMESTAMP DEFAULT CURRENT_TIMESTAMP`
+  - Pipeline wiring: `internal/pipeline/source_heartbeat.go` — per-stream goroutine driven by `time.Ticker`, dedicated `*sql.DB`, `sync.Once`-guarded cleanup. Mirrors F13's `attachSlotHealthProbe` shape.
+
+### Docs
+
+- **ADR-0061 — Source-side sluice_heartbeat writer** (`docs/adr/adr-0061-source-side-heartbeat-writer.md`). Covers motivation (Reddit-research F17), config surface, opt-out rationale, why default-off, permission-denied semantics, and the F13/F17 pairing.
+
+### Tests
+
+- **7 pipeline-package unit tests** — loop / attachment / opt-out branches (Bug 74 "pin the class" discipline)
+- **3 MySQL engine unit tests** — table-name guard, permission classifier, sentinel matching
+- **5 PG integration tests** — table create + schema, accumulation, prune, WAL advancement, permission-denied surfaces sentinel
+- **5 MySQL integration tests** — same matrix against binlog position
+- **All 12 CI jobs SUCCESS including the `-race` Integration shards** on Linux. **-race gate (per CLAUDE.md "Concurrency chunks") verified before tag.**
+
+### Compatibility
+
+- **Drop-in upgrade from v0.81.0.** Default-OFF; operators who don't set `--source-heartbeat-interval` see no observable change.
+- **Minor version bump (v0.82.0)** because four new operator-facing flags are added.
+- **Severity a** — prevents the silent slot-eviction / binlog-rotation class for low-traffic sources. PG operators against busy-by-day-quiet-by-night sources are the most likely audience.
+- **Behavior change to flag for opted-in operators**: a new sluice-owned table `sluice_heartbeat` is auto-created on the source. At 30s cadence + 1h default prune, the table holds ~120 rows steady-state.
+
 ## [0.81.0] - 2026-05-25
 
 ### Added
