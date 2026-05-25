@@ -260,8 +260,14 @@ func routeForwardBoundary(
 ) error {
 	shape, err := ClassifyShape(pre, snap.IR)
 	if err != nil {
-		return fmt.Errorf("classify shape on %q: %w. %s",
-			tableName, err, forwardRecoveryHint(tableName))
+		// ADR-0060 (F11) — surface the structured per-table drift
+		// alongside the classify error so the operator sees WHAT
+		// changed even on multi-shape / unrecognized combos. The
+		// classify error itself names the class counts; the drift
+		// rendering names the specific columns / indexes / checks.
+		return fmt.Errorf("classify shape on %q: %w.%s %s",
+			tableName, err, renderDriftForRefusal(pre, snap.IR),
+			forwardRecoveryHint(tableName))
 	}
 	switch shape.Kind {
 	case ShapeKindNone:
@@ -275,22 +281,47 @@ func routeForwardBoundary(
 		ShapeKindAlterColumnNullability,
 		ShapeKindRenameColumn,
 		ShapeKindUnrecognized:
-		return refuseShapeOutOfV1Scope(tableName, shape)
+		return refuseShapeOutOfV1Scope(tableName, shape, pre, snap.IR)
 	}
-	return fmt.Errorf("unrecognized shape kind %v on %q. %s",
-		shape.Kind, tableName, forwardRecoveryHint(tableName))
+	return fmt.Errorf("unrecognized shape kind %v on %q.%s %s",
+		shape.Kind, tableName, renderDriftForRefusal(pre, snap.IR),
+		forwardRecoveryHint(tableName))
+}
+
+// renderDriftForRefusal computes the [ir.SchemaDriftReport] for the
+// (pre, post) pair and renders it for inclusion in a refuse-loudly
+// error message. Returns the empty string when there are no drift
+// entries to surface (caller's outer message reads naturally without
+// a blank section).
+//
+// ADR-0060 — this is the F11 "tell the operator what changed" half
+// of the refuse-loudly contract. The classify error names the SHAPE
+// (multi-shape combo, drop-column, etc.); this function names the
+// SPECIFIC columns / indexes / constraints. Both go into the same
+// error so the operator gets a single grep-friendly message.
+func renderDriftForRefusal(pre, post *ir.Table) string {
+	report := ir.DiffTable(pre, post)
+	rendered := RenderSchemaDriftReport(report)
+	if rendered == "" {
+		return ""
+	}
+	// Lead with " observed drift:" so the rendered block reads as a
+	// natural continuation of the outer error sentence.
+	return " observed drift:" + rendered + "\n"
 }
 
 // refuseShapeOutOfV1Scope is the operator-actionable refusal shape for
 // every recognized-but-not-forwarded shape (DROP / ALTER TYPE /
 // NULLABILITY / RENAME / CREATE/DROP INDEX / multi-shape combo). Names
-// the table, the shape, and the drained-recovery hint per ADR-0058 §1a.
-func refuseShapeOutOfV1Scope(tableName string, shape Shape) error {
+// the table, the shape, the per-change drift (ADR-0060 / F11), and
+// the drained-recovery hint per ADR-0058 §1a.
+func refuseShapeOutOfV1Scope(tableName string, shape Shape, pre, post *ir.Table) error {
 	return fmt.Errorf(
 		"shape %s on %q is out of --forward-schema-add-column scope "+
 			"(v0.79.0 forwards ADD COLUMN only; ADR-0058 §1a documents the "+
-			"scope split). %s",
-		shape.Kind, tableName, forwardRecoveryHint(tableName),
+			"scope split).%s %s",
+		shape.Kind, tableName, renderDriftForRefusal(pre, post),
+		forwardRecoveryHint(tableName),
 	)
 }
 
