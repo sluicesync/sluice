@@ -142,6 +142,17 @@ This is the category claim: sluice is the open-source tool whose feature set mos
 
 ---
 
+## When NOT to use sluice
+
+Calling out the gaps explicitly so operators don't waste a discovery cycle:
+
+- **Heroku Postgres as a source.** Heroku Postgres does not grant the `REPLICATION` role attribute, does not allow `CREATE_REPLICATION_SLOT`, and does not expose logical replication to customers ([Heroku Help — third-party replication](https://help.heroku.com/E10ZZ6IJ/why-can-t-i-use-third-party-tools-to-replicate-my-heroku-postgres-database-to-a-non-heroku-database), [Heroku Help — logical replication](https://help.heroku.com/TVS8OHTR/does-heroku-postgres-support-logical-replication)). sluice's PG source path requires all three. For Heroku migrations today, use trigger-based tools like [Bucardo](https://bucardo.org/) or PlanetScale's [heroku-migrator](https://github.com/planetscale/heroku-migrator). A `postgres-trigger` engine variant for sluice is on the roadmap (Go-based alternative to Perl-based Bucardo) but not in the current release.
+- **One-off snapshot, same engine, no CDC catch-up needed.** Just use `pg_dump` / `mysqldump`. sluice's value is the schema translation and the continuous-sync lifecycle; for trivial same-engine snapshots, the native tools are simpler.
+- **Logical decoding to applications.** sluice writes to a target database, not a Kafka topic or application stream. If you want raw decode events going to your own consumer, Debezium + Kafka is the right shape.
+- **Schema migration tooling.** sluice translates schemas between engines as part of a data migration, but it's not a versioned-migration tool like Atlas, Flyway, or Bytebase. Use those for application-driven schema evolution; use sluice when the goal is moving data between systems.
+
+---
+
 ## What to do when something looks wrong
 
 | Symptom | First-look |
