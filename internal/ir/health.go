@@ -113,3 +113,87 @@ type SlotSpillReporter interface {
 	// the fields from its output rather than emitting a misleading 0.
 	SlotSpillStats(ctx context.Context, slotName string) (stats SpillStats, ok bool, err error)
 }
+
+// SlotHealth carries the per-probe snapshot of a Postgres replication
+// slot's retention pressure and liveness — severity-A finding F13 of
+// the 2026-05-22 Reddit-research run. The struct lives in IR because
+// the optional reporter interface needs a return type the orchestrator
+// can render and threshold-test without importing engine packages.
+// Postgres is the only engine that produces these values today; MySQL
+// binlog retention has a different shape (filename + position +
+// expire_logs_days policy) and is tracked as a deferred follow-up.
+//
+// **Why operators care:** when a slot's restart_lsn falls behind the
+// source's current WAL position, Postgres retains every WAL segment
+// between the two. The retention size is bounded by the
+// `max_slot_wal_keep_size` GUC; once a slot's lag exceeds that bound,
+// Postgres invalidates the slot (wal_status → 'lost') and the consumer
+// loses its CDC checkpoint without warning. F13's promise is to log a
+// WARN before that happens so the operator can intervene (check the
+// consumer, bump the bound, or accept a fresh re-snapshot).
+//
+// **Bounds are bytes.** Both LagBytes and MaxKeepSizeBytes are signed
+// int64 byte counts. MaxKeepSizeBytes == -1 (the GUC's documented
+// "unlimited" sentinel) signals no retention bound is in effect — the
+// pressure-percentage warnings are skipped on that path because there's
+// no ceiling to be close to.
+//
+// **Active liveness is observation-based.** Postgres exposes
+// `pg_replication_slots.active` but no first-class "active_since" /
+// "inactive_since" timestamp on the slot row itself; the
+// `pg_stat_replication_slots.stats_reset` column tracks a different
+// concept (stats counter reset). The threshold evaluator tracks the
+// most recent observation of `active=true` in-process and computes
+// inactivity duration relative to that.
+type SlotHealth struct {
+	// SlotName is the replication slot the snapshot describes.
+	SlotName string
+
+	// Active mirrors `pg_replication_slots.active`. true when a backend
+	// is currently consuming from the slot; false when the slot exists
+	// but has no consumer (sluice crashed, was paused, or the
+	// replication connection dropped).
+	Active bool
+
+	// LagBytes is the WAL distance the slot is holding back —
+	// `pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)`. Always >= 0
+	// in practice (restart_lsn never advances past pg_current_wal_lsn);
+	// a negative value would indicate a clock-or-LSN inconsistency
+	// worth surfacing rather than silently clamping.
+	LagBytes int64
+
+	// MaxKeepSizeBytes is the `max_slot_wal_keep_size` GUC converted to
+	// bytes. -1 means unlimited (the GUC's default and "no pressure
+	// possible" sentinel); 0 means "slots cannot retain any WAL beyond
+	// a checkpoint" which is an extreme operator-set value and is
+	// treated as "every non-zero lag is over the bound" by the
+	// percentage math; the evaluator special-cases 0 to avoid divide-
+	// by-zero.
+	MaxKeepSizeBytes int64
+
+	// WALStatus mirrors `pg_replication_slots.wal_status` (PG 13+). One
+	// of "reserved", "extended", "unreserved", "lost". Informational —
+	// the threshold logic doesn't depend on it, but it's useful in the
+	// WARN log line so operators can correlate sluice's view with the
+	// raw PG view.
+	WALStatus string
+}
+
+// SlotHealthReporter is an optional engine-side surface exposing
+// retention-pressure + active-liveness signals for a replication slot
+// (severity-A finding F13, ADR-0059). Today Postgres is the only
+// implementer; MySQL's binlog-retention parallel has a different shape
+// and is a separate task.
+//
+// **The boolean return.** ok=false when the named slot isn't present
+// in `pg_replication_slots` (e.g. a fresh stream that hasn't completed
+// its first START_REPLICATION call yet, or the operator dropped the
+// slot out-of-band). Consumers treat this as "no signal" and skip the
+// threshold evaluation for this tick rather than logging a misleading
+// warning.
+//
+// Empty slotName returns an error — the caller didn't supply enough
+// info to scope the query.
+type SlotHealthReporter interface {
+	SlotHealth(ctx context.Context, slotName string) (health SlotHealth, ok bool, err error)
+}
