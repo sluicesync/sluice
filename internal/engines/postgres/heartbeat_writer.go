@@ -137,16 +137,17 @@ func (r *SchemaReader) PruneHeartbeat(ctx context.Context, tableName string, old
 		schema = "public"
 	}
 	tableRef := quoteIdent(schema) + "." + quoteIdent(tableName)
-	// PG accepts INTERVAL '<seconds>' string literals or `make_interval`.
-	// We pass seconds as a parameter and cast it inline; the cast keeps
-	// the value out of the SQL text so the prune duration can't be
-	// confused with an injection vector.
-	q := "DELETE FROM " + tableRef + " WHERE ts < NOW() - ($1 || ' seconds')::interval"
 	seconds := int64(olderThan / time.Second)
 	if seconds < 1 {
 		seconds = 1
 	}
-	res, err := r.db.ExecContext(ctx, q, seconds)
+	// Embed the second-count directly in the SQL — it's a server-validated
+	// integer derived from a Go time.Duration, no operator input reaches
+	// this path so there's no injection surface. Avoids pgx's bind-type
+	// inference resolving the parameter to `text` when concatenated with
+	// 'seconds' (the prior shape that tripped the v0.81 CI gate).
+	q := fmt.Sprintf("DELETE FROM %s WHERE ts < NOW() - INTERVAL '%d seconds'", tableRef, seconds)
+	res, err := r.db.ExecContext(ctx, q)
 	if err != nil {
 		if isPGPermissionDenied(err) {
 			return 0, errors.Join(ir.ErrHeartbeatPermission, err)
