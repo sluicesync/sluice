@@ -3,7 +3,11 @@
 
 package ir
 
-import "context"
+import (
+	"context"
+	"errors"
+	"time"
+)
 
 // HealthReporter is the optional engine-side surface for liveness /
 // lag reporting. Engines that already track CDC positions (MySQL
@@ -197,3 +201,71 @@ type SlotHealth struct {
 type SlotHealthReporter interface {
 	SlotHealth(ctx context.Context, slotName string) (health SlotHealth, ok bool, err error)
 }
+
+// HeartbeatWriter is the optional engine-side surface for the source-
+// side periodic heartbeat-table writer — severity-A finding F17 of the
+// 2026-05-22 Reddit-research run, see ADR-0060. Engines implement it on
+// the same value that satisfies [SchemaReader] (today Postgres and MySQL
+// both implement; future engines opt in by satisfying the interface).
+//
+// **Why operators care:** when a source database has no writes for an
+// extended period (off-hours, weekends, dev environments), the CDC
+// position the consumer is reading from never advances. On Postgres this
+// means the replication slot's `restart_lsn` doesn't move and PG's
+// `max_slot_wal_keep_size` policy can eventually evict the slot. On
+// MySQL it means the binlog position the consumer is reading from gets
+// further from current; if `binlog_expire_logs_seconds` rotates past the
+// consumer's position, the consumer loses its ability to resume.
+//
+// F17's promise: sluice periodically INSERTs a tiny heartbeat row into a
+// sluice-owned table on the source. This generates WAL (PG) / binlog
+// (MySQL) traffic so the consumer always sees forward progress, even
+// against an otherwise-idle source. Operators don't have to manage this
+// themselves.
+//
+// **Opt-in by default.** The heartbeat INSERTs are a behaviour change
+// on the source DB (a new sluice-owned table, plus periodic writes
+// against it). Operators must explicitly enable via
+// `--source-heartbeat-interval=DUR` on the streamer; the empty / zero
+// default leaves the engine surface untouched.
+//
+// **Loud failures are non-fatal.** When EnsureHeartbeatTable returns an
+// insufficient-privilege error (PG SQLSTATE 42501 / MySQL Error 1142),
+// the pipeline wiring WARNs once and skips the writer goroutine —
+// operators on managed DBs / read-replicas where DDL is restricted get a
+// stream that still works, just without F17's idle-source resilience.
+// Engines surface this case via [ErrHeartbeatPermission] (errors.Is
+// matchable) so the wiring can branch deterministically.
+type HeartbeatWriter interface {
+	// EnsureHeartbeatTable creates the sluice-owned heartbeat table on
+	// the source if it doesn't exist. Idempotent — second-and-later
+	// calls are no-ops courtesy of CREATE TABLE IF NOT EXISTS. The
+	// tableName parameter is the operator-configurable identifier
+	// (default `sluice_heartbeat`).
+	//
+	// Returns an error wrapping [ErrHeartbeatPermission] when the
+	// connecting role lacks CREATE TABLE privilege; callers (pipeline
+	// wiring) detect this via errors.Is and degrade to "WARN once,
+	// skip the writer."
+	EnsureHeartbeatTable(ctx context.Context, tableName string) error
+
+	// WriteHeartbeat INSERTs a single row into the named heartbeat
+	// table with the current server time and the supplied streamID.
+	// Called on the heartbeat-loop's ticker tick.
+	WriteHeartbeat(ctx context.Context, tableName, streamID string) error
+
+	// PruneHeartbeat DELETEs rows older than olderThan from the named
+	// heartbeat table. Bounded periodic prune so the table doesn't
+	// grow unbounded over long-running streams. Returns the rows
+	// deleted (operator-facing diagnostic on the next loop tick).
+	// olderThan <= 0 is a no-op (returns 0, nil) — callers gate the
+	// prune cadence at the pipeline layer.
+	PruneHeartbeat(ctx context.Context, tableName string, olderThan time.Duration) (rowsDeleted int64, err error)
+}
+
+// ErrHeartbeatPermission is the sentinel engines wrap when the
+// connecting role lacks CREATE TABLE / INSERT privilege on the source
+// (PG SQLSTATE 42501 / MySQL Error 1142). The pipeline's heartbeat
+// wiring errors.Is checks this sentinel to degrade to WARN-once-then-
+// skip rather than failing the whole stream.
+var ErrHeartbeatPermission = errors.New("heartbeat: insufficient privilege")

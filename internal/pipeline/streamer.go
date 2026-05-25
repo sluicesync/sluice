@@ -541,6 +541,43 @@ type Streamer struct {
 	// chasing a stall set --heartbeat-interval=10s for faster signal.
 	HeartbeatInterval time.Duration
 
+	// SourceHeartbeatInterval, when > 0, enables the F17 source-side
+	// heartbeat writer (ADR-0060). The streamer attaches a per-stream
+	// goroutine that periodically INSERTs a row into the sluice-owned
+	// heartbeat table on the source DB; the INSERT generates WAL /
+	// binlog traffic so the consumer's position advances even against
+	// an otherwise-idle source. Zero (the default) leaves the source
+	// untouched — F17 is opt-in because the INSERT is a behaviour
+	// change on the source DB that operators on regulated systems must
+	// explicitly enable. Operators on low-traffic / idle-prone sources
+	// set --source-heartbeat-interval=30s (typical) to prevent slot
+	// eviction / binlog rotation past the consumer's position.
+	SourceHeartbeatInterval time.Duration
+
+	// SourceHeartbeatPruneWindow is the age threshold for the periodic
+	// DELETE that bounds heartbeat-table growth. Rows whose ts column
+	// is older than this duration are dropped. Zero disables prune (the
+	// table grows unbounded — useful for forensic inspection on short
+	// runs); the production default is 1h (see
+	// [DefaultSourceHeartbeatPruneWindow]). Only consulted when
+	// [SourceHeartbeatInterval] > 0.
+	SourceHeartbeatPruneWindow time.Duration
+
+	// SourceHeartbeatTableName overrides the per-source table name the
+	// F17 writer uses (default `sluice_heartbeat`). Operators with a
+	// hostile DBA-managed namespace can pre-create a differently-named
+	// table and point the writer at it. Empty falls back to the
+	// default. Only consulted when [SourceHeartbeatInterval] > 0.
+	SourceHeartbeatTableName string
+
+	// NoSourceHeartbeat is the opt-OUT escape hatch: when true, the
+	// F17 writer is skipped even if [SourceHeartbeatInterval] > 0
+	// (e.g. an operator overrode the YAML config's interval via the
+	// CLI flag without wanting to edit YAML). The streamer's
+	// attachSourceHeartbeat returns the noop attachment immediately
+	// when this is set.
+	NoSourceHeartbeat bool
+
 	// sourceErrFn is the per-attempt closure that returns the source
 	// CDC reader's stored Err() — see GitHub issue #19. The pump's
 	// channel close is the normal EOF path; without surfacing the
@@ -1039,6 +1076,21 @@ func (s *Streamer) runOnce(ctx context.Context) error {
 	if !s.DryRun {
 		slotProbe := s.attachSlotHealthProbe(ctx, streamID)
 		defer slotProbe.Close()
+	}
+
+	// ---- 1c. Source-side heartbeat writer (ADR-0060, F17) ----
+	// Opt-in (gated on --source-heartbeat-interval > 0). The writer
+	// periodically INSERTs a row into a sluice-owned table on the
+	// source so the CDC consumer's position advances even against an
+	// otherwise-idle source — preventing PG slot eviction / MySQL
+	// binlog rotation past the consumer position. Skipped on DryRun
+	// (writes are not dry-run-safe). Non-fatal on every branch: a
+	// missing engine surface, failed source open, or insufficient
+	// privilege all WARN once and leave the writer unattached. See
+	// attachSourceHeartbeat for the gating logic.
+	if !s.DryRun {
+		heartbeat := s.attachSourceHeartbeat(ctx, streamID)
+		defer heartbeat.Close()
 	}
 
 	// ---- 2. Ensure the control table exists ----
