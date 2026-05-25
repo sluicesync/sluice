@@ -6,6 +6,45 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.83.0] - 2026-05-25
+
+### Added
+
+- **`feat(cli/engines): F10 — sluice cutover subcommand for sequence priming (#49 / ADR-0062)`** — New `sluice cutover` subcommand reads source sequences (PG `pg_sequences.last_value`) / `AUTO_INCREMENT` values (MySQL) and bumps the target's by `--cutover-sequence-margin=N` (default 1000). Closes the PK-collision-on-first-INSERT-after-cutover class: between snapshot and cutover, the source advances sequences as new rows are inserted; CDC ships rows to target but the target's sequence still lags by the catch-up window. Pre-F10, operators ran `SELECT setval(...)` per table by hand; v0.83.0 makes it one command.
+
+  ### CLI surface
+
+  - `sluice cutover --config sluice.yaml` — reads source sequences, applies to target with safety margin
+  - `--cutover-sequence-margin=N` (default 1000) — buffer above source value
+  - **Idempotent**: target-side guarded; running cutover twice does not regress sequence values
+  - **Refuses loudly** when target value is >margin ahead of source (recovery hint: "manual re-snapshot recommended" — signals post-cutover-INSERT-before-cutover-command)
+  - **Skips composite-PK / UUID / no-sequence tables** gracefully (no false-positive refusal on identifier-only tables)
+
+  ### Architecture
+
+  - `ir.SequencePrimer` interface + `ir.SequenceState` / `ir.SequencePrimeReport` / `ir.ErrCutoverSequenceTargetAhead`
+  - PG impl: `internal/engines/postgres/cutover_sequence.go` — `pg_get_serial_sequence` for column→sequence resolution; `pg_sequences.last_value` (NULL = never called) on source; `setval('<target_seq>', N+margin, true)` on target
+  - MySQL impl: `internal/engines/mysql/cutover_sequence.go` — `INFORMATION_SCHEMA.TABLES.AUTO_INCREMENT` with `information_schema_stats_expiry = 0` to bypass catalog cache; `ALTER TABLE … AUTO_INCREMENT = N` on target
+  - Pipeline orchestrator: `internal/pipeline/cutover.go` — single-goroutine, table-by-table, target-side-read-guarded for idempotency
+  - CLI subcommand: `cmd/sluice/cutover.go`
+
+### Tests
+
+- **11 unit tests**: orchestrator dispatch / refuse-loudly / margin (7), IR-shape (2), PG sequence-name parser (2) — covers 4 shape variants: bare, fully-quoted, mixed-quoted, dot-in-quoted (Bug 74 class-pin)
+- **3 PG integration tests**: prime + idempotency, refuse-loudly when target ahead, composite-PK skip
+- **3 MySQL integration tests**: same matrix
+- **1 cross-engine integration test**: PG → MySQL full handoff + idempotency
+
+### Docs
+
+- **ADR-0062 — Cutover sequence priming** (`docs/adr/adr-0062-cutover-sequence-priming.md`). Covers motivation (Reddit-research F10), two-phase model, safety-margin rationale, idempotency contract, refuse-loudly class, and relationship to chain-restore + bulk-copy phase.
+
+### Compatibility
+
+- **Drop-in upgrade from v0.82.0.** New subcommand only — operators who don't run `sluice cutover` see no behavior change.
+- **Minor version bump (v0.83.0)** because of the new subcommand.
+- **Severity a** — closes the PK-collision-on-first-post-cutover-INSERT class. Operators migrating to a new system who hit this used to surface "data corruption" tickets that were actually sequence-priming gaps.
+
 ## [0.82.0] - 2026-05-25
 
 ### Added
