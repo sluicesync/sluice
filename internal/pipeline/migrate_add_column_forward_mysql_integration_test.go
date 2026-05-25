@@ -206,11 +206,24 @@ func TestAddColumnForward_MySQL_Backfill(t *testing.T) {
 // probe surfaces the canonical text and the text-scan classifies
 // the volatility class.
 //
-// Class-pin (Bug 74): NOW() (time-volatile) + UUID() (random /
-// non-deterministic). MySQL also has UTC_TIMESTAMP, RAND(),
-// LAST_INSERT_ID — those are pinned in the unit-test class matrix
-// (TestClassifyDefaultVolatility_Class) so the integration tier
-// stays small.
+// Class-pin (Bug 74) — why one scenario, not many (Bug 91 closure):
+// the only volatile DEFAULT shape MySQL itself accepts on ADD COLUMN
+// is CURRENT_TIMESTAMP / NOW() on TIMESTAMP|DATETIME columns. Every
+// other volatile function (UUID(), RAND(), UTC_TIMESTAMP(),
+// LAST_INSERT_ID(), …) is rejected at MySQL DDL parse time with
+// Error 1674 ("Statement is unsafe because it uses a system function
+// that may return a different value on the replica") REGARDLESS of
+// binlog_format — even with --binlog-format=ROW the server refuses
+// to compile the ALTER (the safety check is unconditional in MySQL
+// 8.0; only `SET SESSION sql_log_bin = 0` bypasses it, which then
+// hides the DDL from the binlog and defeats the test). The
+// integration tier therefore carries the one scenario MySQL permits
+// (now-default) — sufficient to prove the production plumbing
+// (TableMapEvent → SchemaSnapshot → intercept → prober → classifier
+// → refuse-loudly). Class coverage for UUID / RAND / UTC_TIMESTAMP /
+// LAST_INSERT_ID and every other MySQL volatile family lives in the
+// unit-test matrix (TestClassifyDefaultVolatility_Class), which
+// exercises the classifier directly with no MySQL-DDL gating.
 func TestAddColumnForward_MySQL_RefusesComputedDefault(t *testing.T) {
 	scenarios := []struct {
 		name   string
@@ -223,12 +236,6 @@ func TestAddColumnForward_MySQL_RefusesComputedDefault(t *testing.T) {
 			ddl:    "ALTER TABLE widgets ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;",
 			col:    "created_at",
 			expect: "current_timestamp",
-		},
-		{
-			name:   "uuid-default",
-			ddl:    "ALTER TABLE widgets ADD COLUMN uid VARCHAR(36) DEFAULT (UUID());",
-			col:    "uid",
-			expect: "uuid",
 		},
 	}
 	for _, sc := range scenarios {

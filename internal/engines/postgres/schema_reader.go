@@ -6,6 +6,7 @@ package postgres
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -88,6 +89,51 @@ func (r *SchemaReader) Close() error {
 		return nil
 	}
 	return r.db.Close()
+}
+
+// ReadRawColumnDefault implements the pipeline's RawDefaultReader
+// optional interface (Bug 91, v0.79.1). Returns the unprocessed
+// `column_default` text from information_schema.columns for the named
+// column, bypassing [translateDefault]'s SERIAL/BIGSERIAL auto-
+// increment heuristic. The pipeline's ADR-0058 §2a volatility
+// classifier needs the raw expression text because user-written
+// `BIGINT DEFAULT nextval('manual_seq')` defaults are otherwise
+// collapsed to [ir.DefaultNone] (hiding the volatility from the
+// classifier).
+//
+// schema=="" falls back to r.schema (the DSN-derived default — same
+// search scope as ReadSchema).
+//
+// Returns (rawText, hasDefault, err). hasDefault=false when the
+// column has no DEFAULT clause; the caller treats that as safe.
+func (r *SchemaReader) ReadRawColumnDefault(ctx context.Context, schema, table, column string) (rawText string, hasDefault bool, err error) {
+	if r.db == nil {
+		return "", false, errors.New("postgres: schema reader closed or uninitialised")
+	}
+	effSchema := schema
+	if effSchema == "" {
+		effSchema = r.schema
+	}
+	const q = `
+		SELECT column_default
+		FROM   information_schema.columns
+		WHERE  table_schema = $1
+		  AND  table_name   = $2
+		  AND  column_name  = $3`
+	var def sql.NullString
+	row := r.db.QueryRowContext(ctx, q, effSchema, table, column)
+	if scanErr := row.Scan(&def); scanErr != nil {
+		if errors.Is(scanErr, sql.ErrNoRows) {
+			return "", false, fmt.Errorf("postgres: column %q on %q.%q not found",
+				column, effSchema, table)
+		}
+		return "", false, fmt.Errorf("postgres: read column_default for %q.%q.%q: %w",
+			effSchema, table, column, scanErr)
+	}
+	if !def.Valid || def.String == "" {
+		return "", false, nil
+	}
+	return def.String, true, nil
 }
 
 // SetSchema implements [ir.SchemaSetter]. Called by the pipeline

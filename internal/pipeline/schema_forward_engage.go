@@ -131,10 +131,48 @@ func (s *Streamer) closeAddColumnForward() {
 	}
 }
 
+// RawDefaultReader is the optional interface engines may implement to
+// surface the unprocessed source `column_default` text for a single
+// column, bypassing any engine-side translation that would otherwise
+// drop or normalise the expression.
+//
+// Why this exists (Bug 91 closure, v0.79.1): PG's schema-reader
+// classifies `nextval(`-prefixed defaults as auto-increment and
+// returns [ir.DefaultNone] for them — the AutoIncrement flag on
+// [ir.Integer] is the canonical representation for SERIAL/BIGSERIAL
+// columns. But a user-created `BIGINT DEFAULT nextval('manual_seq')`
+// (without OWNED BY) is structurally identical at column_default
+// level and gets the same treatment, hiding the volatility from the
+// ADR-0058 §2a classifier. A raw read is the cheapest correct probe:
+// it bypasses translateDefault entirely so the classifier sees the
+// original expression text. MySQL's translateDefault preserves the
+// expression text for DEFAULT_GENERATED columns, so this interface is
+// PG-only at the moment; an engine that doesn't implement it falls
+// back to the IR-translated probe (which is correct for that engine's
+// translation).
+//
+// Returns (rawText, hasDefault, err):
+//   - rawText: the verbatim text PG returns in
+//     information_schema.columns.column_default (may include type
+//     casts, schema qualifiers, etc.).
+//   - hasDefault: false when the column has no DEFAULT clause; the
+//     classifier treats this as safe.
+//   - err: non-nil when the probe failed (column not found, query
+//     error). The caller's refuse-on-uncertainty wrapper escalates.
+type RawDefaultReader interface {
+	ReadRawColumnDefault(ctx context.Context, schema, table, column string) (rawText string, hasDefault bool, err error)
+}
+
 // newSourceDefaultProber returns a [defaultProberFunc] backed by the
 // given source [ir.SchemaReader]. The closure issues a single
 // targeted ReadSchema() per call and walks the result to find the
 // column's [ir.DefaultValue].
+//
+// When the reader also implements [RawDefaultReader] (PG does), the
+// closure prefers a raw-text probe — necessary because PG's
+// schema-reader collapses `nextval(`-prefixed defaults to
+// [ir.DefaultNone] under the AutoIncrement heuristic, hiding
+// volatile sequence defaults from the classifier (Bug 91).
 //
 // This is wasteful at scale (ReadSchema reads every table the source
 // exposes), but the intercept calls it at most once per ADD COLUMN
@@ -149,7 +187,27 @@ func (s *Streamer) closeAddColumnForward() {
 // cannot be the source of truth for ADR-0058 §2a's volatility
 // classification.
 func newSourceDefaultProber(sr ir.SchemaReader) defaultProberFunc {
+	rawReader, hasRaw := sr.(RawDefaultReader)
 	return func(ctx context.Context, schema, table, column string) (ir.DefaultValue, error) {
+		// Bug 91: prefer the raw-text probe when the engine supports it.
+		// PG's translateDefault collapses any `nextval(`-prefixed default
+		// to [ir.DefaultNone] under the SERIAL auto-increment heuristic;
+		// the IR-translated probe path therefore sees DefaultNone for
+		// user-written sequence defaults and the classifier passes.
+		// Reading the verbatim column_default text bypasses that
+		// translation so the volatility classifier sees the original
+		// expression.
+		if hasRaw {
+			raw, hasDefault, err := rawReader.ReadRawColumnDefault(ctx, schema, table, column)
+			if err != nil {
+				return nil, fmt.Errorf("read raw column default: %w", err)
+			}
+			if !hasDefault {
+				return ir.DefaultNone{}, nil
+			}
+			return ir.DefaultExpression{Expr: raw}, nil
+		}
+
 		sch, err := sr.ReadSchema(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("read source schema: %w", err)

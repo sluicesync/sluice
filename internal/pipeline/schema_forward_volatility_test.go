@@ -66,7 +66,17 @@ func TestClassifyDefaultVolatility_Class(t *testing.T) {
 		// ----- Sequence-stateful (PG + MySQL) -----
 		{"nextval-pg", "nextval('my_seq')", false, "nextval"},
 		{"nextval-pg-qualified", "nextval('public.my_seq'::regclass)", false, "nextval"},
+		// Bug 91 (v0.79.1) class pins: PG's information_schema returns
+		// nextval/setval defaults with the ::regclass cast inside the
+		// argument. The raw-text probe surfaces them verbatim; pin the
+		// surface-syntax variants here so a regression in the classifier
+		// (or in the cast-stripping helper) trips immediately.
+		{"nextval-pg-qualified-uppercase", "NEXTVAL('public.bar_seq'::regclass)", false, "nextval"},
+		{"nextval-pg-bare-regclass", "nextval('my_seq'::regclass)", false, "nextval"},
+		{"setval-pg-regclass", "setval('s'::regclass, 1, true)", false, "setval"},
+		{"setval-pg-qualified-uppercase", "SETVAL('public.bar_seq'::regclass, 100)", false, "setval"},
 		{"currval-pg", "currval('my_seq')", false, "currval"},
+		{"currval-pg-regclass", "currval('my_seq'::regclass)", false, "currval"},
 		{"setval-pg", "setval('my_seq', 100)", false, "setval"},
 		{"last-insert-id-mysql", "LAST_INSERT_ID()", false, "last_insert_id"},
 
