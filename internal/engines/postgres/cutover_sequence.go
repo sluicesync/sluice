@@ -113,14 +113,20 @@ func (r *SchemaReader) readOneSequenceState(ctx context.Context, schema, table, 
 		return ir.SequenceState{}, false, fmt.Errorf("split sequence name %q: %w", seqName.String, err)
 	}
 
+	// pg_sequences exposes last_value as NULL when the sequence has
+	// never been called (no nextval()) and as the most-recently-issued
+	// value once it has. There is no `is_called` column on the view —
+	// the NULL-vs-not distinction is the canonical signal. (Compare:
+	// the underlying sequence object has an is_called row when queried
+	// directly via `SELECT * FROM <seq>`, but pg_sequences does not
+	// surface it.)
 	const lastQuery = `
-		SELECT last_value, COALESCE(is_called, false)
+		SELECT last_value
 		FROM   pg_sequences
 		WHERE  schemaname   = $1
 		  AND  sequencename = $2`
 	var lastValue sql.NullInt64
-	var isCalled bool
-	switch err := r.db.QueryRowContext(ctx, lastQuery, seqSchema, seqLocal).Scan(&lastValue, &isCalled); {
+	switch err := r.db.QueryRowContext(ctx, lastQuery, seqSchema, seqLocal).Scan(&lastValue); {
 	case errors.Is(err, sql.ErrNoRows):
 		// pg_get_serial_sequence returned a name pg_sequences
 		// doesn't know about — surfaces on PG <10 (no pg_sequences
@@ -135,13 +141,13 @@ func (r *SchemaReader) readOneSequenceState(ctx context.Context, schema, table, 
 	}
 
 	// Canonicalise to "last issued":
-	//   is_called=true  → last_value is the most-recently issued.
-	//   is_called=false → sequence has never produced a value; treat
-	//                     as 0 so the target side's no-op branch is
-	//                     reached (or the margin bumps the target
-	//                     starting at the engine default).
+	//   last_value IS NOT NULL → sequence has produced at least one value.
+	//   last_value IS NULL     → sequence has never produced a value; treat
+	//                            as 0 so the target side's no-op branch is
+	//                            reached (or the margin bumps the target
+	//                            starting at the engine default).
 	var value int64
-	if isCalled && lastValue.Valid {
+	if lastValue.Valid {
 		value = lastValue.Int64
 	}
 	return ir.SequenceState{
@@ -326,21 +332,23 @@ func (w *SchemaWriter) primeOneSequence(
 	if err != nil {
 		return action, fmt.Errorf("split target sequence name %q: %w", seqName.String, err)
 	}
+	// pg_sequences exposes last_value as NULL when the sequence has
+	// never been called; non-NULL once nextval() has issued at least
+	// one value. There is no is_called column on the view.
 	const lastQuery = `
-		SELECT last_value, COALESCE(is_called, false)
+		SELECT last_value
 		FROM   pg_sequences
 		WHERE  schemaname   = $1
 		  AND  sequencename = $2`
 	var lastValue sql.NullInt64
-	var isCalled bool
-	switch err := w.db.QueryRowContext(ctx, lastQuery, seqSchema, seqLocal).Scan(&lastValue, &isCalled); {
+	switch err := w.db.QueryRowContext(ctx, lastQuery, seqSchema, seqLocal).Scan(&lastValue); {
 	case errors.Is(err, sql.ErrNoRows):
 		return action, fmt.Errorf("target sequence %q.%q not visible in pg_sequences", seqSchema, seqLocal)
 	case err != nil:
 		return action, fmt.Errorf("read target pg_sequences row: %w", err)
 	}
 	var targetBefore int64
-	if isCalled && lastValue.Valid {
+	if lastValue.Valid {
 		targetBefore = lastValue.Int64
 	}
 	action.TargetBefore = targetBefore
