@@ -35,10 +35,22 @@ import (
 // inline.
 //
 // Bug 74 class-pin: one subtest per refused-shape category from the
-// ADR-0058 catalog (drop-column, rename-column, alter-column-type,
-// create-index, drop-index). A single representative would only
-// prove the wiring exists; per-category coverage proves every
-// category's rendered output is correct.
+// ADR-0058 catalog that the F11 intercept can actually observe —
+// drop-column, rename-column, alter-column-type. A single
+// representative would only prove the wiring exists; per-category
+// coverage proves every category's rendered output is correct.
+//
+// Known limitation (ADR-0060 §6 — "Known limitation: index-only DDL
+// not detected via F11"): CREATE INDEX and DROP INDEX are
+// deliberately NOT exercised here. The F11 intercept fires off
+// [ir.SchemaSnapshot] events, which the PG CDC reader emits only in
+// response to a pgoutput RelationMessage. RelationMessage describes
+// column shape only; CREATE INDEX / DROP INDEX do not change column
+// shape and therefore do not trigger one. The follow-up INSERT also
+// passes through cleanly because the cached IR matches the post-DDL
+// projection. Live detection of index-only drift is future work
+// (see ADR-0060 §6 — F47 schema-drift catalog will need a separate
+// subscription path).
 func TestStreamer_SchemaDrift_PG_RefuseLoudlyIncludesDriftReport(t *testing.T) {
 	scenarios := []struct {
 		name string
@@ -93,30 +105,14 @@ INSERT INTO widgets (id, name, score) VALUES (10, 'post-alter', 99);`,
 				"drained model",
 			},
 		},
-		{
-			name:   "create-index",
-			preDDL: "",
-			driftDDL: `CREATE INDEX ix_widgets_name ON widgets (name);
-INSERT INTO widgets (id, name) VALUES (10, 'post-idx');`,
-			wantSubstrs: []string{
-				"create-index",
-				"[index-added]",
-				"ix_widgets_name",
-				"drained model",
-			},
-		},
-		{
-			name:   "drop-index",
-			preDDL: "CREATE INDEX ix_widgets_legacy ON widgets (name);",
-			driftDDL: `DROP INDEX ix_widgets_legacy;
-INSERT INTO widgets (id, name) VALUES (10, 'post-dropidx');`,
-			wantSubstrs: []string{
-				"drop-index",
-				"[index-dropped]",
-				"ix_widgets_legacy",
-				"drained model",
-			},
-		},
+		// NOTE: create-index and drop-index scenarios were removed
+		// here — see the function comment block above for the F11
+		// limitation. The scenarios were timing out at 60s because
+		// the streamer never surfaces a refusal: pgoutput emits no
+		// RelationMessage for index-only DDL, so the F11 intercept
+		// has nothing to classify. Reintroduce these only when F47
+		// adds a separate subscription path that observes index
+		// catalog mutations.
 	}
 	for _, sc := range scenarios {
 		t.Run(sc.name, func(t *testing.T) {

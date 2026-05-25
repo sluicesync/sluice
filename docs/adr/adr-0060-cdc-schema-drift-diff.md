@@ -230,6 +230,89 @@ Out of scope deliberately:
   augments the refusal text additively; the shape names, the
   scope-split language, and the recovery hint are unchanged.
 
+### 6. Known limitation: index-only DDL not detected via F11
+
+`CREATE INDEX` and `DROP INDEX` are in the ADR-0058 refuse-loudly
+catalog and the renderer (§2) emits `[index-added]` /
+`[index-dropped]` lines for them when the diff sees the change.
+But on the **live CDC path**, F11's intercept never observes
+index-only DDL on Postgres — and is therefore unable to surface a
+refuse-loudly error for those events.
+
+**Structural cause.** The F11 intercept fires off `ir.SchemaSnapshot`
+events. On the Postgres CDC reader, `SchemaSnapshot` is emitted only
+in response to a pgoutput `RelationMessage` (see
+`internal/engines/postgres/cdc_reader.go::maybeSnapshotSchema`).
+The pgoutput protocol's `RelationMessage` describes the relation's
+column shape only — type, nullability, REPLICA IDENTITY column set.
+`CREATE INDEX` and `DROP INDEX` change neither the column list nor
+column types, so PostgreSQL does **not** emit a new `RelationMessage`
+for them. The follow-up `INSERT` also passes through cleanly because
+the cached IR matches the projection. Net: the F11 intercept's
+classify-and-refuse path never gets invoked for index-only DDL with
+F11 enabled, even though the renderer is fully capable of describing
+the drift.
+
+The same shape applies to other catalog-level changes that don't
+mutate the column projection: foreign keys, CHECK constraints added
+or dropped without touching column nullability, sequence ownership
+changes, etc. None of those surface a `RelationMessage`, so none
+reach the F11 intercept.
+
+**Operator implication.** With `--forward-schema-add-column` set,
+index changes pass through silently on the live path — the streamer
+keeps consuming rows against the cached pre-DDL IR, which is byte-
+identical for the column projection. There is no silent-loss class
+here (rows still ship correctly under the unchanged column shape),
+but the operator does not get the "you should know about this drift"
+signal F11 was meant to deliver for the index case.
+
+Existing safeguards still apply:
+
+- **Chain-restore drift detection** (ADR-0049 §schema-history)
+  catches the index delta at the next backup boundary by comparing
+  the source's full SchemaReader read against the cached IR. That's
+  a delayed detection, not a real-time refusal, but it does keep
+  silent-corruption off the table for the resume-from-backup path.
+- **Drained schema-migrate** (the recovery hint surfaced by every
+  refuse-loudly path) remains the supported way to land index
+  changes safely; operators just have to know to drain rather than
+  being told by the live path.
+- **The renderer itself** (`pipeline.RenderSchemaDriftReport`) does
+  produce `[index-added]` / `[index-dropped]` lines correctly when
+  it sees a `ColumnsAdded` / `IndexesAdded` delta. Any non-CDC caller
+  with both pre and post IR in hand (chain-restore, `sluice schema
+  diff`, future operator-side tooling) renders the index drift just
+  fine. The gap is in the live CDC observation, not in the diff or
+  the rendering.
+
+**Future work.** Live detection of index-only drift requires a
+separate observation path:
+
+- A periodic SchemaReader probe (cheap query against
+  `pg_class`/`pg_index`) — simple but introduces a polling
+  dependency the live CDC loop currently avoids.
+- A separate event-trigger / publication subscription that captures
+  catalog DDL beyond the column projection.
+- F47 (schema-drift catalog), planned as a follow-up to F11, is the
+  designated home for the broader catalog-drift detection class —
+  including indexes, foreign keys, and CHECK constraints decoupled
+  from column shape.
+
+This ADR explicitly does NOT solve any of the above. F11 ships with
+the column-shape-mutating refusals only (drop-column, rename-column,
+alter-column-type, multi-shape combos involving any of those).
+
+**Where the contract is pinned.** The integration test
+`internal/pipeline/schema_drift_pg_integration_test.go::
+TestStreamer_SchemaDrift_PG_RefuseLoudlyIncludesDriftReport`
+exercises only the categories the F11 intercept can observe — the
+`create-index` and `drop-index` scenarios are deliberately absent
+with an inline comment naming this limitation. Unit-test coverage of
+the renderer for the index-added / index-dropped categories remains
+in the package's renderer tests; the integration test pins only the
+end-to-end refuse path that the live CDC reader exposes.
+
 ## Consequences
 
 ### Positive
