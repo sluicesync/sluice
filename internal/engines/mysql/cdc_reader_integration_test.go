@@ -19,57 +19,16 @@ import (
 	"time"
 
 	"github.com/orware/sluice/internal/ir"
-
-	"github.com/testcontainers/testcontainers-go"
-	mysqltc "github.com/testcontainers/testcontainers-go/modules/mysql"
 )
 
-// startMySQLForCDC boots a MySQL container with binlog enabled. We
-// can't reuse the existing startMySQL helper from the pipeline package
-// because that one uses default container args; the reproducible thing
-// to do is to spell out the binlog flags here even though MySQL 8.0
-// happens to default to ROW-formatted binlogs.
+// startMySQLForCDC returns a DSN pointed at a freshly-reset
+// `source_db` database on the shard's shared mysqld container,
+// which boots with binlog ROW + full row-image. See
+// shared_container_integration_test.go. The (dsn, cleanup) shape
+// is preserved; cleanup is a no-op because TestMain owns teardown.
 func startMySQLForCDC(t *testing.T) (dsn string, cleanup func()) {
 	t.Helper()
-	testcontainers.SkipIfProviderIsNotHealthy(t)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-
-	container, err := mysqltc.Run(
-		ctx,
-		"mysql:8.0",
-		mysqltc.WithDatabase("source_db"),
-		mysqltc.WithUsername("root"),
-		mysqltc.WithPassword("rootpw"),
-		testcontainers.CustomizeRequest(testcontainers.GenericContainerRequest{
-			ContainerRequest: testcontainers.ContainerRequest{
-				Cmd: []string{
-					"mysqld",
-					"--server-id=1",
-					"--log-bin=mysql-bin",
-					"--binlog-format=ROW",
-					"--binlog-row-image=FULL",
-				},
-			},
-		}),
-	)
-	if err != nil {
-		t.Fatalf("start container: %v", err)
-	}
-
-	terminate := func() {
-		shutdown, c := context.WithTimeout(context.Background(), 30*time.Second)
-		defer c()
-		_ = container.Terminate(shutdown)
-	}
-
-	conn, err := container.ConnectionString(ctx, "parseTime=true")
-	if err != nil {
-		terminate()
-		t.Fatalf("connection string: %v", err)
-	}
-	return conn, terminate
+	return newSharedDB(t, "source_db")
 }
 
 // applyMySQL runs a possibly-multi-statement DDL/DML script against a

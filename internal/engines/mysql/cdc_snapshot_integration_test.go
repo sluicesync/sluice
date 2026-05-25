@@ -23,55 +23,17 @@ import (
 	"time"
 
 	"github.com/orware/sluice/internal/ir"
-
-	"github.com/testcontainers/testcontainers-go"
-	mysqltc "github.com/testcontainers/testcontainers-go/modules/mysql"
 )
 
-// startMySQLForSnapshotCDC boots a MySQL container with binlog
-// enabled. Identical to the standalone CDC test's helper but kept
-// local so this file is self-contained.
+// startMySQLForSnapshotCDC returns a DSN pointed at a freshly-reset
+// `source_db` database on the shard's shared mysqld container (the
+// same one startMySQLForCDC uses — binlog ROW + full row-image is
+// the shared default). See shared_container_integration_test.go.
+// The (dsn, cleanup) shape is preserved; cleanup is a no-op because
+// TestMain owns teardown.
 func startMySQLForSnapshotCDC(t *testing.T) (dsn string, cleanup func()) {
 	t.Helper()
-	testcontainers.SkipIfProviderIsNotHealthy(t)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-
-	container, err := mysqltc.Run(
-		ctx,
-		"mysql:8.0",
-		mysqltc.WithDatabase("source_db"),
-		mysqltc.WithUsername("root"),
-		mysqltc.WithPassword("rootpw"),
-		testcontainers.CustomizeRequest(testcontainers.GenericContainerRequest{
-			ContainerRequest: testcontainers.ContainerRequest{
-				Cmd: []string{
-					"mysqld",
-					"--server-id=1",
-					"--log-bin=mysql-bin",
-					"--binlog-format=ROW",
-					"--binlog-row-image=FULL",
-				},
-			},
-		}),
-	)
-	if err != nil {
-		t.Fatalf("start container: %v", err)
-	}
-
-	terminate := func() {
-		shutdown, c := context.WithTimeout(context.Background(), 30*time.Second)
-		defer c()
-		_ = container.Terminate(shutdown)
-	}
-
-	conn, err := container.ConnectionString(ctx, "parseTime=true")
-	if err != nil {
-		terminate()
-		t.Fatalf("connection string: %v", err)
-	}
-	return conn, terminate
+	return newSharedDB(t, "source_db")
 }
 
 func applyMySQLSnap(t *testing.T, dsn, sqlText string) {

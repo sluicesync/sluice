@@ -25,46 +25,16 @@ import (
 	"time"
 
 	"github.com/orware/sluice/internal/ir"
-
-	"github.com/testcontainers/testcontainers-go"
-	mysqltc "github.com/testcontainers/testcontainers-go/modules/mysql"
 )
 
+// startMySQL returns a DSN pointed at a freshly-reset `sluice_test`
+// database on the shard's shared mysqld container (see
+// shared_container_integration_test.go). The (dsn, cleanup) shape
+// is preserved so tests' `defer cleanup()` continues to compile;
+// container teardown is owned by TestMain, so cleanup is a no-op.
 func startMySQL(t *testing.T) (dsn string, cleanup func()) {
 	t.Helper()
-
-	// Skip cleanly when the host has no usable Docker provider (a dev
-	// machine without Docker Desktop, or Linux rootless on Windows,
-	// etc.). CI runners on Linux have Docker available and will run
-	// the test for real.
-	testcontainers.SkipIfProviderIsNotHealthy(t)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-
-	container, err := mysqltc.Run(
-		ctx,
-		"mysql:8.0",
-		mysqltc.WithDatabase("sluice_test"),
-		mysqltc.WithUsername("test"),
-		mysqltc.WithPassword("test"),
-	)
-	if err != nil {
-		t.Fatalf("start container: %v", err)
-	}
-
-	conn, err := container.ConnectionString(ctx, "parseTime=true")
-	if err != nil {
-		_ = container.Terminate(context.Background())
-		t.Fatalf("connection string: %v", err)
-	}
-
-	cleanup = func() {
-		shutdown, c := context.WithTimeout(context.Background(), 30*time.Second)
-		defer c()
-		_ = container.Terminate(shutdown)
-	}
-	return conn, cleanup
+	return newSharedDB(t, "sluice_test")
 }
 
 func applyDDL(t *testing.T, dsn, ddl string) {
