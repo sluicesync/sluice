@@ -6,6 +6,36 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.81.0] - 2026-05-25
+
+### Added
+
+- **`feat(pipeline): F11 — per-table schema-drift diff in CDC refuse-loudly messages (#47 / ADR-0060)`** — When sluice's ADR-0058 intercept refuses a non-ADD-COLUMN source DDL, the error message now names the **specific columns, indexes, and constraints** that drifted plus an operator-action hint per category. Closes the silent-under-information class where pre-F11 the refusal said "schema change detected on table X" with no detail, forcing operators to manually `pg_dump`-diff to find out *what* changed.
+
+  Pure-function `ir.DiffTable(pre, post)` returns a `SchemaDriftReport` covering column add/drop/alter/rename, index add/drop, CHECK add/drop/alter, FK add/drop/alter. Bug-74 class-pin discipline: per-category unit tests + per-category integration test on PG → PG.
+
+  Operator-action wording in `pipeline.RenderSchemaDriftReport` — e.g. `[column-added] foo TIMESTAMP NULL — drained schema migrate ... OR restart with --forward-schema-add-column ...`. Greppable category prefixes for ticket-paste / Slack workflows.
+
+  **Augments** the existing refuse-loudly catalog; does NOT add auto-remediation flags. Tenet is loud-failure-to-operator; F11 makes the loudness *more useful*. The "do it automatically" half is ADR-0058 (#45) ADD COLUMN forwarding.
+
+### Docs
+
+- **ADR-0060 — CDC apply-side schema-drift diff** (`docs/adr/adr-0060-cdc-schema-drift-diff.md`). Covers motivation (Reddit-research F11), diff structure, operator-action mapping, scope exclusions, and ADR-0058/ADR-0029/ADR-0054 relationships. §6 documents the known limitation: index-only DDL (CREATE/DROP INDEX) not detected via F11 because pgoutput RelationMessage describes column-shape only — CREATE INDEX doesn't trigger a snapshot. Operators see index drift through chain-restore at backup boundaries; live detection deferred to F47 schema-drift catalog.
+
+### Tests
+
+- **`test(ir): schema_drift_test.go`** — 19 unit tests covering Bug-74 class matrix (column add/drop/type/nullable/default/rename + multi-kind, index add/drop, CHECK add/drop/alter, FK alter via OnDelete change, multi-shape combo, deterministic ordering, nil-handling)
+- **`test(pipeline): schema_drift_render_test.go`** — 8 renderer unit tests asserting greppable prefixes + per-category hint content
+- **`test(pipeline): schema_forward_intercept_drift_test.go`** — 6+ subtests pinning per-category intercept refusal output
+- **`test(pipeline): schema_drift_pg_integration_test.go`** — PG → PG integration test exercising 3 refused shapes (drop column / rename column / alter type) end-to-end with testcontainers
+- **Existing 17 ADR-0058 `TestForwardAddColumn_*` subtests remain green** — F11 only augments refuse-message strings; happy paths untouched
+
+### Compatibility
+
+- **Drop-in upgrade from v0.80.0.** No new flag surface; F11 augments existing refuse-loudly messages.
+- **Minor version bump (v0.81.0)** because the refusal-message shape is a new observable behavior operators can grep on.
+- **Severity a** — operator-trust improvement: reduces median time-to-diagnose for source-side DDL drift from ~15-30min (manual pg_dump diff) to ~30 seconds (paste refusal into ticket).
+
 ## [0.80.0] - 2026-05-25
 
 ### Added
