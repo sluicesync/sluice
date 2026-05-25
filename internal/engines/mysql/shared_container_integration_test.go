@@ -44,6 +44,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log"
 	"os"
 	"sync"
 	"testing"
@@ -74,12 +75,116 @@ var sharedMySQL sharedMySQLState
 // sharedMySQLBootTimeout is generous: cold-start of mysql:8.0 with
 // binlog enabled occasionally takes ~30 s on CI, plus image-pull on
 // the first run of a fresh runner can add another minute. The same
-// 2-minute budget the per-test helpers used pre-refactor.
+// 2-minute budget the per-test helpers used pre-refactor — applied
+// per attempt of the retry loop (see sharedMySQLBootAttempts).
 const sharedMySQLBootTimeout = 2 * time.Minute
+
+// sharedMySQLBootAttempts is the total number of attempts the retry
+// loop in ensureSharedMySQL will make before giving up. Backoff is
+// 30s after attempt 1, 60s after attempt 2, then attempt 3 is the
+// final try. Cumulative worst-case wall time:
+//
+//	3 * sharedMySQLBootTimeout (per-attempt budget) + 30s + 60s
+//	= 3 * 2min + 90s
+//	= ~7.5 min
+//
+// well under the CI 30-minute shard timeout. Task #60: prior to this
+// loop the boot was single-shot — any wait-until-ready timeout (e.g.
+// `port: 3306 ... matched 0 times, expected 1` followed by `context
+// deadline exceeded`) failed all ~62 tests in the engines-mysql
+// shard with "shared mysql unavailable", costing 3-5 CI reruns per
+// release tag.
+const sharedMySQLBootAttempts = 3
+
+// sharedMySQLBootBackoff returns the sleep duration to apply between
+// a failed boot attempt and the next one. attempt is 1-indexed and
+// refers to the attempt that JUST failed; the function is only
+// consulted while attempt < sharedMySQLBootAttempts.
+//
+// Schedule: 30s after #1, 60s after #2. Doubling matches the
+// `30s * (1 << (attempt-1))` formula but is spelled out as a switch
+// so the actual numbers are visible at the call site.
+func sharedMySQLBootBackoff(attempt int) time.Duration {
+	switch attempt {
+	case 1:
+		return 30 * time.Second
+	case 2:
+		return 60 * time.Second
+	default:
+		// Defensive: 120s would be the next term in the sequence if
+		// we ever raise sharedMySQLBootAttempts past 3. Never hit
+		// today because the loop exits after attempt 3 without
+		// sleeping further.
+		return 120 * time.Second
+	}
+}
+
+// bootSharedMySQLOnce runs a single boot attempt against a fresh
+// container. On any error it terminates the half-state container
+// (idempotent / safe to call even on a never-started instance) so
+// the next attempt starts from clean slate. Returns the boot
+// primitives on success or (zero-values, error) on any failure of
+// the underlying testcontainers boot, Host lookup, or MappedPort
+// lookup.
+//
+// Separated from the retry loop so the loop body is a clean
+// "attempt → backoff → attempt" rhythm and so a unit test can
+// exercise the retry path without booting a real container.
+func bootSharedMySQLOnce(ctx context.Context) (host, port string, container *mysqltc.MySQLContainer, err error) {
+	const (
+		rootUser = "root"
+		rootPass = "rootpw"
+		seedDB   = "sluice_shared_seed"
+	)
+
+	container, err = mysqltc.Run(
+		ctx,
+		"mysql:8.0",
+		mysqltc.WithDatabase(seedDB),
+		mysqltc.WithUsername(rootUser),
+		mysqltc.WithPassword(rootPass),
+		testcontainers.CustomizeRequest(testcontainers.GenericContainerRequest{
+			ContainerRequest: testcontainers.ContainerRequest{
+				Cmd: []string{
+					"mysqld",
+					"--server-id=1",
+					"--log-bin=mysql-bin",
+					"--binlog-format=ROW",
+					"--binlog-row-image=FULL",
+				},
+			},
+		}),
+	)
+	if err != nil {
+		if container != nil {
+			_ = container.Terminate(context.Background())
+		}
+		return "", "", nil, fmt.Errorf("mysqltc.Run: %w", err)
+	}
+
+	hostV, err := container.Host(ctx)
+	if err != nil {
+		_ = container.Terminate(context.Background())
+		return "", "", nil, fmt.Errorf("container.Host: %w", err)
+	}
+	portV, err := container.MappedPort(ctx, "3306/tcp")
+	if err != nil {
+		_ = container.Terminate(context.Background())
+		return "", "", nil, fmt.Errorf("container.MappedPort: %w", err)
+	}
+	return hostV, portV.Port(), container, nil
+}
 
 // ensureSharedMySQL boots the shared container the first time it's
 // called and is a no-op on subsequent calls. Returns the connection
 // primitives needed to build a DSN for an arbitrary database.
+//
+// Boot is retried up to sharedMySQLBootAttempts times with
+// sharedMySQLBootBackoff between attempts; the testcontainers
+// `wait until ready` window can spuriously time out under CI load
+// and the single-shot boot from task #56 made that flake fail all
+// ~62 tests in the shard. Each attempt's failure is logged so the
+// CI logs surface the retry pattern.
 //
 // Boot failures are sticky: bootErr is captured and returned by
 // every subsequent call, so the FIRST test to touch the shared
@@ -90,56 +195,40 @@ func ensureSharedMySQL(t *testing.T) (host, port, user, password string) {
 	testcontainers.SkipIfProviderIsNotHealthy(t)
 
 	sharedMySQL.once.Do(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), sharedMySQLBootTimeout)
-		defer cancel()
-
 		const (
 			rootUser = "root"
 			rootPass = "rootpw"
-			seedDB   = "sluice_shared_seed"
 		)
 
-		container, err := mysqltc.Run(
-			ctx,
-			"mysql:8.0",
-			mysqltc.WithDatabase(seedDB),
-			mysqltc.WithUsername(rootUser),
-			mysqltc.WithPassword(rootPass),
-			testcontainers.CustomizeRequest(testcontainers.GenericContainerRequest{
-				ContainerRequest: testcontainers.ContainerRequest{
-					Cmd: []string{
-						"mysqld",
-						"--server-id=1",
-						"--log-bin=mysql-bin",
-						"--binlog-format=ROW",
-						"--binlog-row-image=FULL",
-					},
-				},
-			}),
-		)
-		if err != nil {
-			sharedMySQL.bootErr = fmt.Errorf("shared mysql boot: %w", err)
-			return
+		var lastErr error
+		for attempt := 1; attempt <= sharedMySQLBootAttempts; attempt++ {
+			ctx, cancel := context.WithTimeout(context.Background(), sharedMySQLBootTimeout)
+			hostV, portV, container, err := bootSharedMySQLOnce(ctx)
+			cancel()
+			if err == nil {
+				sharedMySQL.host = hostV
+				sharedMySQL.port = portV
+				sharedMySQL.user = rootUser
+				sharedMySQL.password = rootPass
+				sharedMySQL.container = container
+				if attempt > 1 {
+					log.Printf("shared mysql boot attempt %d/%d succeeded", attempt, sharedMySQLBootAttempts)
+				}
+				return
+			}
+			lastErr = err
+			if attempt < sharedMySQLBootAttempts {
+				backoff := sharedMySQLBootBackoff(attempt)
+				log.Printf("shared mysql boot attempt %d/%d failed: %v; retrying in %s",
+					attempt, sharedMySQLBootAttempts, err, backoff)
+				time.Sleep(backoff)
+				continue
+			}
+			log.Printf("shared mysql boot attempt %d/%d failed: %v; giving up",
+				attempt, sharedMySQLBootAttempts, err)
 		}
-
-		hostV, err := container.Host(ctx)
-		if err != nil {
-			sharedMySQL.bootErr = fmt.Errorf("shared mysql host: %w", err)
-			_ = container.Terminate(context.Background())
-			return
-		}
-		portV, err := container.MappedPort(ctx, "3306/tcp")
-		if err != nil {
-			sharedMySQL.bootErr = fmt.Errorf("shared mysql port: %w", err)
-			_ = container.Terminate(context.Background())
-			return
-		}
-
-		sharedMySQL.host = hostV
-		sharedMySQL.port = portV.Port()
-		sharedMySQL.user = rootUser
-		sharedMySQL.password = rootPass
-		sharedMySQL.container = container
+		sharedMySQL.bootErr = fmt.Errorf("shared mysql boot: %d attempts exhausted: %w",
+			sharedMySQLBootAttempts, lastErr)
 	})
 
 	if sharedMySQL.bootErr != nil {
