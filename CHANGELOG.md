@@ -6,6 +6,37 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.80.0] - 2026-05-25
+
+### Added
+
+- **`feat(pipeline/postgres): pre-emptive PG slot-health warnings (70% / 85% retention + 30m inactivity) (#46 / ADR-0059)`** — Sluice now runs a 30-second-cadence background probe per PG-sourced stream that surfaces three operator-actionable WARN conditions BEFORE Postgres can silently evict the replication slot:
+  - **WAL retention ≥70% of `max_slot_wal_keep_size`** — warning level. Names the slot, the bytes held, the percentage, and the action ("consumer may be falling behind; check…").
+  - **WAL retention ≥85%** — critical level. Same shape with a more urgent action hint.
+  - **Slot inactive ≥30m** — when `pg_replication_slots.active = false` and no recent re-attach. Action hint: "check whether the consumer (sluice or otherwise) is still running."
+
+  Each condition is **de-duplicated within a 5-minute rate-limit window**; severity transitions (e.g. 70 → 85) emit immediately even within the window; **condition-clears emit a one-line INFO** so operators see the recovery, not just the alarm. `max_slot_wal_keep_size = -1` (unlimited; the PG default) cleanly bypasses the percentage warnings.
+
+  **Why this exists**: the dominant operator pain in Postgres logical-replication threads is silent slot loss — a slot accumulates WAL because the consumer falls behind or disconnects, retention limits eventually fire, and the slot drops with **no warning**, leaving the operator with a broken pipeline and no way back without a full re-snapshot. Reddit-research F13 catalogued this as severity-a. v0.80.0 closes the silent-slot-loss class by surfacing the slow burn *before* eviction. Loud-failure discipline applied to a class of slow-burning silent failure.
+
+  **Architecture**: `ir.SlotHealthReporter` optional interface + `ir.SlotHealth` value type; `internal/engines/postgres/slot_health_reporter.go` queries `pg_replication_slots` + `pg_current_wal_lsn()` + `max_slot_wal_keep_size` GUC; `internal/pipeline/slot_health.go` houses the pure-function threshold evaluator + the rate-limit state + the per-stream goroutine. Wiring mirrors F2's `attachSpillReporter` shape (dedicated `*sql.DB`, non-fatal on cross-engine sources).
+
+### Tests
+
+- **`test(pipeline): slot_health_test.go`** + **`slot_health_loop_test.go`** — 18 unit tests covering every threshold/rate-limit boundary (Bug 74 "pin the class" discipline): 70%/85% + skip-past-70 transitions, -1 unlimited bypass, 0 extreme bypass, inactive below/above threshold, active-probe-resets-inactivity, rate-limit suppress + expire, 70→85 transition emits inside window, clear→INFO, still-clean silent, retention-supersedes-inactive, plus 4 lifecycle tests for the probe goroutine + `slotHealthProbeAttachment.Close` idempotency.
+- **`test(engines/postgres): slot_health_integration_test.go`** — 4 PG 16 testcontainer integration pins (no-slot / empty-slot / default-unlimited GUC / explicit-64MB-GUC-to-bytes); ~8.4s total.
+
+### Docs
+
+- **`docs(adr): ADR-0059 — Pre-emptive PG slot-health pre-warning`** (`docs/adr/adr-0059-pg-slot-health-prewarning.md`) — covers motivation (F13), thresholds + their rationale, the rate-limit policy + state-transition semantics, the per-stream goroutine + dedicated-`*sql.DB` design, and explicitly documents what's deferred: MySQL binlog-retention parallel (different shape, separate task), Prometheus metric exposure (small follow-up), `sluice diagnose` integration, and any auto-action on threshold cross (tenet is loud-failure-to-operator, not auto-remediation).
+
+### Compatibility
+
+- **Behavior change to flag**: every Postgres-sourced stream now gets a background probe goroutine + a dedicated `*sql.DB` connection on the source. Cost is one idle backend session per stream (negligible against any production sluice deployment); benefit is operator-visible WARN before silent slot eviction. Disabled in `--dry-run` mode (the wiring path is bypassed). MySQL-sourced and target-only streams see no change. Cross-engine sources without a `SlotHealthReporter` impl (e.g. MySQL source) silently skip the probe.
+- **Minor version bump (v0.80.0)** because the operator-visible WARN surface is a new observable behavior.
+- **Severity a** — closes a catalogued silent-loss class. Postgres operators running long-lived sluice streams against busy sources are the most likely to have been near the silent-eviction edge without realizing it.
+- **No new flag**. Always-on (except DryRun); the rate-limit window prevents noise on healthy slots.
+
 ## [0.79.1] - 2026-05-25
 
 ### Fixed
