@@ -1008,6 +1008,10 @@ type BackupCompactCmd struct {
 	MergeWindow time.Duration `help:"Maximum CreatedAt gap between consecutive segments to be considered part of the same merge group. Required. Examples: 1h, 24h, 168h (7d)." placeholder:"DUR"`
 
 	DryRun bool `help:"Report the would-merge plan without touching storage or rewriting the catalog."`
+
+	SmartCompaction      bool   `name:"smart-compaction" help:"Enable ADR-0064 event-level collapse (INSERT+UPDATE → INSERT, UPDATE+UPDATE → UPDATE, INSERT+DELETE → nothing, UPDATE+DELETE → DELETE) within each merge group's change-chunks. Default off in v1; opt in once update-heavy workload makes the CPU tax worthwhile. Mutually exclusive with --smart-compaction-off."`
+	SmartCompactionOff   bool   `name:"smart-compaction-off" help:"Explicitly disable smart compaction (the v1 default). Useful as an audit trail or as the recovery flag after a corrupt-PK refuse-loudly fail. Mutually exclusive with --smart-compaction."`
+	CompactionPKStrategy string `name:"compaction-pk-strategy" enum:"pk,replica-identity,none" default:"pk" help:"Row-identity strategy for smart compaction. 'pk' (default) uses the table's declared primary key; 'replica-identity' is a PG-targeted alias for 'pk' (v1); 'none' disables per-row collapse (debugging escape hatch). Has no effect without --smart-compaction." placeholder:"STRATEGY"`
 }
 
 // Run implements `sluice backup compact`.
@@ -1020,6 +1024,9 @@ func (c *BackupCompactCmd) Run(_ *Globals) error {
 	}
 	if c.MergeWindow <= 0 {
 		return errors.New("--merge-window is required (positive duration)")
+	}
+	if c.SmartCompaction && c.SmartCompactionOff {
+		return errors.New("--smart-compaction and --smart-compaction-off are mutually exclusive")
 	}
 	ctx := kongContext()
 	store, _, closer, err := openBackupStore(ctx, c.FromDir, c.From, pipeline.BlobStoreOptions{
@@ -1035,8 +1042,10 @@ func (c *BackupCompactCmd) Run(_ *Globals) error {
 	}
 
 	res, err := pipeline.CompactChain(ctx, store, pipeline.CompactOpts{
-		MergeWindow: c.MergeWindow,
-		DryRun:      c.DryRun,
+		MergeWindow:     c.MergeWindow,
+		DryRun:          c.DryRun,
+		SmartCompaction: c.SmartCompaction,
+		PKStrategy:      pipeline.PKStrategy(c.CompactionPKStrategy),
 	})
 	if err != nil {
 		return err
@@ -1045,14 +1054,25 @@ func (c *BackupCompactCmd) Run(_ *Globals) error {
 	if c.DryRun {
 		mode = "would-compact (dry-run)"
 	}
-	slog.InfoContext(
-		ctx, "backup compact: "+mode,
+	topArgs := []any{
 		slog.Int("groups_considered", res.GroupsConsidered),
 		slog.Int("groups_merged", res.GroupsMerged),
 		slog.Int("segments_removed", res.SegmentsRemoved),
 		slog.Int64("bytes_before", res.BytesBefore),
 		slog.Int64("bytes_after", res.BytesAfter),
-	)
+	}
+	if c.SmartCompaction {
+		topArgs = append(
+			topArgs,
+			slog.Bool("smart_compaction", true),
+			slog.Int64("events_before", res.EventsBefore),
+			slog.Int64("events_after", res.EventsAfter),
+			slog.Int64("events_collapsed", res.EventsCollapsed),
+			slog.Int64("rows_collapsed", res.RowsCollapsed),
+			slog.Any("tables_without_pk", res.TablesWithoutPK),
+		)
+	}
+	slog.InfoContext(ctx, "backup compact: "+mode, topArgs...)
 	for _, g := range res.Plan {
 		if g.MergedSegmentID == "" {
 			slog.InfoContext(
@@ -1061,14 +1081,23 @@ func (c *BackupCompactCmd) Run(_ *Globals) error {
 			)
 			continue
 		}
-		slog.InfoContext(
-			ctx, "  group merged",
+		groupArgs := []any{
 			slog.String("merged_segment_id", g.MergedSegmentID),
 			slog.String("merged_segment_dir", g.MergedSegmentDir),
 			slog.Any("source_segment_ids", g.SourceSegmentIDs),
 			slog.Duration("window_span", g.WindowSpan),
 			slog.Int64("bytes_moved", g.BytesEstimate),
-		)
+		}
+		if c.SmartCompaction {
+			groupArgs = append(
+				groupArgs,
+				slog.Int64("events_before", g.EventsBefore),
+				slog.Int64("events_after", g.EventsAfter),
+				slog.Int64("events_collapsed", g.EventsCollapsed),
+				slog.Int64("rows_collapsed", g.RowsCollapsed),
+			)
+		}
+		slog.InfoContext(ctx, "  group merged", groupArgs...)
 	}
 	return nil
 }
