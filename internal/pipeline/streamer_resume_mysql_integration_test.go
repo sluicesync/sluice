@@ -33,14 +33,9 @@ import (
 // configuration the streamer needs.
 func startMySQLBinlog(t *testing.T) (sourceDSN, targetDSN string, cleanup func()) {
 	t.Helper()
-	testcontainers.SkipIfProviderIsNotHealthy(t)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-
-	container, err := mysqltc.Run(
-		ctx,
-		"mysql:8.0",
+	container := runMySQLWithRetry(
+		t,
 		mysqltc.WithDatabase("source_db"),
 		mysqltc.WithUsername("root"),
 		mysqltc.WithPassword("rootpw"),
@@ -72,9 +67,9 @@ func startMySQLBinlog(t *testing.T) (sourceDSN, targetDSN string, cleanup func()
 			},
 		}),
 	)
-	if err != nil {
-		t.Fatalf("start container: %v", err)
-	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
 
 	terminate := func() {
 		shutdown, c := context.WithTimeout(context.Background(), 30*time.Second)
