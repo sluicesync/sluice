@@ -52,31 +52,38 @@ import (
 )
 
 const (
-	// mysqlBootAttempts: total per-helper attempts. Bumped 3 → 5 by
-	// task #12 Phase B; see engines/mysql/shared_container_integration_test.go
-	// for the rationale (two captured runs where 3 attempts exhausted
-	// under runner load). Worst-case wall time: 5 * 2min + 30s + 60s
-	// + 120s + 240s = ~17.5 min, still under CI shard timeout.
-	mysqlBootAttempts = 5
+	// mysqlBootAttempts: total per-helper attempts. Kept at 3 (NOT
+	// raised in sync with engines/mysql.sharedMySQLBootAttempts =
+	// 5) because pipeline-package helpers are *per-test* boots —
+	// the cost multiplies by the test count in the shard. PR #62's
+	// initial CI run captured a slow-runner case where bumping the
+	// per-test cap to 5 attempts had multiple pipeline-* shards
+	// hit the 75-minute go-test-binary timeout: each failing test
+	// burned ~13 min of retry + backoff (worst-case 5 * 2min + 30s
+	// + 60s + 120s + 240s ≈ 17.5 min) instead of ~7.5 min at 3
+	// attempts. The shared TestMain in engines/mysql boots once
+	// per shard, so its 5-attempt budget adds at most ~10 min to
+	// the shard's wall-time — single boot, no multiplier. The
+	// per-test wrappers here multiply by ~20 tests, so the 3-attempt
+	// cap is the right setting for this layer.
+	mysqlBootAttempts = 3
 	mysqlBootTimeout  = 2 * time.Minute
 )
 
 // mysqlBootBackoff returns the sleep duration between a failed boot
 // attempt and the next one. attempt is 1-indexed and refers to the
-// attempt that JUST failed. Schedule mirrors
-// engines/mysql.sharedMySQLBootBackoff: 30s, 60s, 120s, 240s.
+// attempt that JUST failed. Schedule: 30s, 60s. The default branch
+// (120s) is defensive — never reached at 3 attempts but kept for
+// the case where a future raise of mysqlBootAttempts past 3 reuses
+// this function.
 func mysqlBootBackoff(attempt int) time.Duration {
 	switch attempt {
 	case 1:
 		return 30 * time.Second
 	case 2:
 		return 60 * time.Second
-	case 3:
-		return 120 * time.Second
-	case 4:
-		return 240 * time.Second
 	default:
-		return 480 * time.Second
+		return 120 * time.Second
 	}
 }
 
