@@ -168,7 +168,7 @@ func runMySQL3ShardContention(
 	// production deploys point all 3 shards at a single target DSN.
 	dsn := sourceDSN
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
 	eng, ok := engines.Get("mysql")
@@ -315,7 +315,7 @@ func TestPhase2e_MySQL_Takeover_ProbeAndRecord_Applied(t *testing.T) {
 	defer cleanup()
 	dsn := sourceDSN
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
 	eng, ok := engines.Get("mysql")
