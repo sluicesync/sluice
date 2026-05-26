@@ -102,6 +102,23 @@ func (Engine) NormalizeForCDCComparison(t *ir.Table) *ir.Table {
 		newCol.Comment = ""
 		out.Columns[i] = &newCol
 	}
+	// ADR-0065 (task #22 CHECK sub-shape): pgoutput's RelationMessage
+	// carries no constraint metadata, so the CDC-projected IR
+	// always leaves CheckConstraints nil. The cold-start
+	// SchemaReader populates it from pg_constraint. Without
+	// normalization, the classifier's [pipeline.diffChecks] would
+	// fire ShapeKindDropCheck on every CDC boundary for any table
+	// that carries a CHECK constraint — false-positive class.
+	//
+	// The cost: live-coordination cannot detect CHECK constraint
+	// shapes via CDC (the wire doesn't carry the signal anyway).
+	// Operators issuing constraint-only DDL on the source while
+	// live-coordination is engaged see the cold-start side land
+	// the change at the next snapshot boundary; the CDC stream's
+	// row apply path observes whatever the new CHECK admits /
+	// refuses at INSERT/UPDATE time. ADR-0065 documents this
+	// trade-off explicitly under "What's deferred".
+	out.CheckConstraints = nil
 	return &out
 }
 

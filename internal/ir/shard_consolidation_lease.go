@@ -169,6 +169,30 @@ type ShardConsolidationProber interface {
 	// without it, a drop+re-add of newName with a different type
 	// could pass the existence-only check.
 	ProbeRenameColumn(ctx context.Context, table *Table, oldName, newName string, want *Column) (ProbeOutcome, error)
+
+	// ProbeAddCheck returns Applied when ALL named CHECK constraints
+	// exist on the target; NotApplied when NONE exist; Inconsistent
+	// on partial state. CHECK identity is by Name (the catalog
+	// requires named CHECKs per ADR-0065 — unnamed CHECKs are
+	// classifier-skipped upstream).
+	ProbeAddCheck(ctx context.Context, table *Table, checks []*CheckConstraint) (ProbeOutcome, error)
+
+	// ProbeDropCheck inverts ProbeAddCheck (Applied when NONE
+	// exist).
+	ProbeDropCheck(ctx context.Context, table *Table, checks []*CheckConstraint) (ProbeOutcome, error)
+
+	// ProbeModifyCheck returns Applied when oldName is absent AND
+	// newConstraint.Name is present on the target (and, when the
+	// engine can read the catalog's constraint expression, it
+	// matches newConstraint.Expr after the same dialect-normalization
+	// the emit-path uses). NotApplied when oldName is present AND
+	// newConstraint.Name is absent (the DROP half didn't fire).
+	// Inconsistent on any other shape — both names absent, both
+	// names present, newConstraint.Name present with the wrong
+	// expression — mirroring the v0.76.0 ProbeAlterColumnType v2
+	// silent-divergence catch (a DROP+ADD with a different expression
+	// must not pass the existence check).
+	ProbeModifyCheck(ctx context.Context, table *Table, oldName string, newConstraint *CheckConstraint) (ProbeOutcome, error)
 }
 
 // ShardConsolidationLeaseStore is the engine-private surface a

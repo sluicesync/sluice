@@ -90,10 +90,26 @@ const (
 	// preserves the data under a new identifier either way).
 	ShapeKindRenameColumn
 
+	// ShapeKindAddCheck — one or more named CHECK constraints
+	// appear in post that are absent from pre; no other structural
+	// change. v1 catalog expansion per ADR-0065 (task #22 sub-task).
+	ShapeKindAddCheck
+
+	// ShapeKindDropCheck — one or more named CHECK constraints from
+	// pre are absent in post; no other structural change. Per
+	// ADR-0065.
+	ShapeKindDropCheck
+
+	// ShapeKindModifyCheck — exactly one same-named CHECK exists in
+	// both pre and post but its Expr text differs. The engine applies
+	// as DROP + ADD (neither PG nor MySQL supports in-place CHECK
+	// expression rewrite). Per ADR-0065.
+	ShapeKindModifyCheck
+
 	// ShapeKindUnrecognized — the delta doesn't fit a single
 	// recognized shape (e.g. multi-shape combo, multi-column
-	// rename, CHECK constraint change, generated-column change,
-	// FK change, ...). Refuses loudly per the loud-failure tenet.
+	// rename, generated-column expression change, FK change, ...).
+	// Refuses loudly per the loud-failure tenet.
 	ShapeKindUnrecognized
 )
 
@@ -116,6 +132,12 @@ func (k ShapeKind) String() string {
 		return "alter-column-nullability"
 	case ShapeKindRenameColumn:
 		return "rename-column"
+	case ShapeKindAddCheck:
+		return "add-check"
+	case ShapeKindDropCheck:
+		return "drop-check"
+	case ShapeKindModifyCheck:
+		return "modify-check"
 	case ShapeKindUnrecognized:
 		return "unrecognized"
 	}
@@ -161,6 +183,22 @@ type Shape struct {
 	// `ALTER TABLE <t> RENAME COLUMN <Before.Name> TO <After.Name>`.
 	RenamedColumnBefore *ir.Column
 	RenamedColumnAfter  *ir.Column
+
+	// AddedChecks is the slice of named CHECK constraints that
+	// exist in post but not pre. Populated for ShapeKindAddCheck.
+	AddedChecks []*ir.CheckConstraint
+
+	// DroppedChecks is the slice of named CHECK constraints that
+	// exist in pre but not post. Populated for ShapeKindDropCheck.
+	DroppedChecks []*ir.CheckConstraint
+
+	// ModifiedCheckBefore / ModifiedCheckAfter are the pre/post
+	// constraints for the same name whose Expr differs. Populated
+	// for ShapeKindModifyCheck. The engine applies as DROP + ADD —
+	// AlterModifyCheck takes both so the recovery path on takeover
+	// has the original-Expr to compare against when probing.
+	ModifiedCheckBefore *ir.CheckConstraint
+	ModifiedCheckAfter  *ir.CheckConstraint
 }
 
 // ClassifyShape derives the IR-delta shape from (pre, post). Returns
@@ -186,6 +224,7 @@ func ClassifyShape(pre, post *ir.Table) (Shape, error) {
 	added, dropped := diffColumns(pre, post)
 	createdIdx, droppedIdx := diffIndexes(pre, post)
 	alteredCol, alteredBefore, alteredKind, hasAlter := diffAlteredColumn(pre, post)
+	addedChecks, droppedChecks, modBefore, modAfter, hasModCheck := diffChecks(pre, post)
 
 	// RENAME COLUMN detection (task #22): exactly one added + exactly
 	// one dropped, with full ir.Column attribute equality minus Name.
@@ -195,11 +234,12 @@ func ClassifyShape(pre, post *ir.Table) (Shape, error) {
 	// classification consumes BOTH the added and dropped slices so
 	// the class-counter sees neither.
 	//
-	// No index / altered-column overlap permitted — a rename plus
-	// an index change in the same boundary is still a combo
+	// No index / altered-column / CHECK overlap permitted — a rename
+	// plus another delta class in the same boundary is still a combo
 	// refusal (multi-shape combo deltas refuse loudly).
 	if renamedBefore, renamedAfter, ok := diffRenameColumn(added, dropped); ok &&
-		len(createdIdx) == 0 && len(droppedIdx) == 0 && !hasAlter {
+		len(createdIdx) == 0 && len(droppedIdx) == 0 && !hasAlter &&
+		len(addedChecks) == 0 && len(droppedChecks) == 0 && !hasModCheck {
 		return Shape{
 			Kind:                ShapeKindRenameColumn,
 			RenamedColumnBefore: renamedBefore,
@@ -232,6 +272,18 @@ func ClassifyShape(pre, post *ir.Table) (Shape, error) {
 		classes++
 		kind = alteredKind
 	}
+	if len(addedChecks) > 0 {
+		classes++
+		kind = ShapeKindAddCheck
+	}
+	if len(droppedChecks) > 0 {
+		classes++
+		kind = ShapeKindDropCheck
+	}
+	if hasModCheck {
+		classes++
+		kind = ShapeKindModifyCheck
+	}
 	switch classes {
 	case 0:
 		return Shape{Kind: ShapeKindNone}, nil
@@ -244,6 +296,10 @@ func ClassifyShape(pre, post *ir.Table) (Shape, error) {
 			DroppedIndexes:      droppedIdx,
 			AlteredColumn:       alteredCol,
 			AlteredColumnBefore: alteredBefore,
+			AddedChecks:         addedChecks,
+			DroppedChecks:       droppedChecks,
+			ModifiedCheckBefore: modBefore,
+			ModifiedCheckAfter:  modAfter,
 		}, nil
 	default:
 		// Multi-shape combo delta — refuse loudly per ADR-0054
@@ -251,8 +307,10 @@ func ClassifyShape(pre, post *ir.Table) (Shape, error) {
 		// hint (drained model).
 		return Shape{Kind: ShapeKindUnrecognized}, fmt.Errorf(
 			"pipeline: classify shape: unrecognized multi-shape combo delta "+
-				"(added=%d dropped=%d created-idx=%d dropped-idx=%d altered-col=%t)",
+				"(added=%d dropped=%d created-idx=%d dropped-idx=%d altered-col=%t "+
+				"added-check=%d dropped-check=%d modified-check=%t)",
 			len(added), len(dropped), len(createdIdx), len(droppedIdx), hasAlter,
+			len(addedChecks), len(droppedChecks), hasModCheck,
 		)
 	}
 }
@@ -411,6 +469,71 @@ func diffIndexes(pre, post *ir.Table) (created, dropped []*ir.Index) {
 	return created, dropped
 }
 
+// diffChecks returns the named CHECK constraints present in post but
+// not pre (added), present in pre but not post (dropped), and at
+// most one same-named constraint whose Expr differs between pre and
+// post (modified — modBefore + modAfter populated, hasMod=true).
+//
+// Unnamed CHECKs are skipped (the classifier policy mirrors
+// diffIndexes: the catalog requires named constraints; engines and
+// SchemaReaders synthesize a name when the source omits one so
+// production data should not hit this case).
+//
+// Multiple same-name modified constraints in a single boundary
+// returns hasMod=false (modBefore/modAfter nil) and lets the
+// class-counter fall through to the combo refusal. v1 catalog
+// deliberately scopes to single-constraint-modified deltas —
+// multi-modify is sufficiently uncommon that the drained model
+// is the right recovery path (mirrors diffAlteredColumn's
+// single-column policy).
+func diffChecks(pre, post *ir.Table) (added, dropped []*ir.CheckConstraint, modBefore, modAfter *ir.CheckConstraint, hasMod bool) {
+	preChecks := checksByName(pre)
+	postChecks := checksByName(post)
+	for name, postC := range postChecks {
+		preC, ok := preChecks[name]
+		if !ok {
+			added = append(added, postC)
+			continue
+		}
+		// Same-name match: compare Expr text. Expr is the
+		// already-quote-normalized expression text the SchemaReader
+		// captured; equality is byte-level so the classifier doesn't
+		// have to interpret SQL.
+		if preC.Expr != postC.Expr {
+			if hasMod {
+				// Second modify on the same boundary — combo refusal.
+				return nil, nil, nil, nil, false
+			}
+			modBefore = preC
+			modAfter = postC
+			hasMod = true
+		}
+	}
+	for name, preC := range preChecks {
+		if _, ok := postChecks[name]; !ok {
+			dropped = append(dropped, preC)
+		}
+	}
+	return added, dropped, modBefore, modAfter, hasMod
+}
+
+// checksByName indexes a table's CheckConstraints by Name. Unnamed
+// constraints are skipped per the classifier policy (see diffChecks).
+// nil-table-safe — returns an empty map so callers can range cleanly.
+func checksByName(t *ir.Table) map[string]*ir.CheckConstraint {
+	if t == nil {
+		return map[string]*ir.CheckConstraint{}
+	}
+	out := make(map[string]*ir.CheckConstraint, len(t.CheckConstraints))
+	for _, c := range t.CheckConstraints {
+		if c == nil || c.Name == "" {
+			continue
+		}
+		out[c.Name] = c
+	}
+	return out
+}
+
 // diffAlteredColumn detects a same-name column whose Type or Nullable
 // differs between pre and post. Returns the post-state column, the
 // pre-state column, the shape (alter-type vs alter-nullability), and
@@ -515,6 +638,17 @@ func DispatchProbe(ctx context.Context, prober ShardConsolidationProber, table *
 			shape.RenamedColumnBefore.Name, shape.RenamedColumnAfter.Name,
 			shape.RenamedColumnAfter,
 		)
+	case ShapeKindAddCheck:
+		return prober.ProbeAddCheck(ctx, table, shape.AddedChecks)
+	case ShapeKindDropCheck:
+		return prober.ProbeDropCheck(ctx, table, shape.DroppedChecks)
+	case ShapeKindModifyCheck:
+		if shape.ModifiedCheckBefore == nil || shape.ModifiedCheckAfter == nil {
+			return ProbeOutcomeInconsistent, errors.New(
+				"pipeline: dispatch probe: modify-check shape missing before/after constraint",
+			)
+		}
+		return prober.ProbeModifyCheck(ctx, table, shape.ModifiedCheckBefore.Name, shape.ModifiedCheckAfter)
 	case ShapeKindUnrecognized:
 		return ProbeOutcomeInconsistent, errors.New(
 			"pipeline: dispatch probe: unrecognized shape — refuse loudly per ADR-0054 DP-E",

@@ -244,6 +244,15 @@ func (r *BoundaryRouter) applyShape(ctx context.Context, post *ir.Table, shape S
 			return errors.New("pipeline: apply shape: rename-column shape missing before/after column")
 		}
 		return r.applier.AlterRenameColumn(ctx, post, shape.RenamedColumnBefore.Name, shape.RenamedColumnAfter.Name)
+	case ShapeKindAddCheck:
+		return r.applier.AlterAddCheck(ctx, post, shape.AddedChecks)
+	case ShapeKindDropCheck:
+		return r.applier.AlterDropCheck(ctx, post, shape.DroppedChecks)
+	case ShapeKindModifyCheck:
+		if shape.ModifiedCheckBefore == nil || shape.ModifiedCheckAfter == nil {
+			return errors.New("pipeline: apply shape: modify-check shape missing before/after constraint")
+		}
+		return r.applier.AlterModifyCheck(ctx, post, shape.ModifiedCheckBefore, shape.ModifiedCheckAfter)
 	case ShapeKindNone:
 		return nil
 	}
