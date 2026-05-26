@@ -37,6 +37,18 @@ type fakeLeaseStore struct {
 	mu   sync.Mutex
 	rows map[string]ir.ShardConsolidationLeaseRow
 	now  func() time.Time
+
+	// changedRowsRecordDDL, when true, models the MySQL
+	// go-sql-driver default (ClientFoundRows=false): RecordDDLText
+	// returns recorded=false when the UPDATE doesn't change the
+	// row's ddl_text (same-value write is a no-op at the wire
+	// level). Used by task #66's regression pin.
+	changedRowsRecordDDL bool
+
+	// recordDDLCalls counts invocations of RecordDDLText; the task
+	// #66 pin asserts the fix path skips this call entirely on
+	// takeover with unchanged ddl_text.
+	recordDDLCalls int
 }
 
 func newFakeLeaseStore(now func() time.Time) *fakeLeaseStore {
@@ -94,11 +106,19 @@ func (s *fakeLeaseStore) HeartbeatLease(_ context.Context, tableName, streamID s
 func (s *fakeLeaseStore) RecordDDLText(_ context.Context, tableName, streamID, ddlText string) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.recordDDLCalls++
 	row, ok := s.rows[tableName]
 	if !ok {
 		return false, nil
 	}
 	if row.LeaseHolderStreamID != streamID || row.HasAppliedAt {
+		return false, nil
+	}
+	// Model MySQL's go-sql-driver default (ClientFoundRows=false):
+	// a UPDATE that doesn't actually change any column value
+	// returns RowsAffected()=0. The engine wrapper translates that
+	// to recorded=false. See task #66 / Phase A report.
+	if s.changedRowsRecordDDL && row.DDLText == ddlText {
 		return false, nil
 	}
 	row.DDLText = ddlText
@@ -280,6 +300,117 @@ func TestLeaseManager_TakeoverAfterExpiry(t *testing.T) {
 	}
 	if leaseB.PriorDDLText() != "ALTER TABLE users ADD COLUMN x INT" {
 		t.Errorf("priorDDLText = %q, want recorded", leaseB.PriorDDLText())
+	}
+}
+
+// TestLeaseManager_TakeoverSkipsRedundantRecordDDL pins task #66:
+// when shard-b takes over an expired lease where shard-a already
+// recorded the same ddl_text, Acquire MUST NOT issue a redundant
+// RecordDDLText call. The redundant call is a no-op under MySQL's
+// default ClientFoundRows=false changed-rows RowsAffected semantics
+// → wrapper returns recorded=false → Acquire previously misclassified
+// this as ErrLeaseContended, sending the caller into a 60s
+// observeUntilApplied timeout on its own freshly-acquired lease.
+//
+// Phase A diagnostic (PR #69) confirmed this exact path via local
+// Docker repro of TestPhase2e_MySQL_Takeover_ProbeAndRecord_Applied.
+func TestLeaseManager_TakeoverSkipsRedundantRecordDDL(t *testing.T) {
+	t.Parallel()
+	clock := newMockClock(time.Date(2026, 5, 22, 12, 0, 0, 0, time.UTC))
+	store := newFakeLeaseStore(clock.Now)
+	// Critical: model the MySQL changed-rows semantics. Without
+	// this, the fake's RecordDDLText would return recorded=true
+	// even on a no-op same-value UPDATE, masking the production
+	// bug entirely.
+	store.changedRowsRecordDDL = true
+	cfg := LeaseConfig{LeaseDuration: 30 * time.Second, RenewDeadline: 20 * time.Second, RetryPeriod: 10 * time.Second}
+	mgrA := newTestLeaseManager(t, store, "stream-a", cfg, clock)
+	mgrB := newTestLeaseManager(t, store, "stream-b", cfg, clock)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	const ddl = "ir-schema:takeover_target:add-x"
+
+	leaseA, err := mgrA.Acquire(ctx, "public.takeover_target", ddl)
+	if err != nil {
+		t.Fatalf("mgrA.Acquire: %v", err)
+	}
+	// Initial acquire: ddl_text was "" → "ir-..."; recordDDLCalls
+	// should be 1.
+	if got := store.recordDDLCalls; got != 1 {
+		t.Errorf("recordDDLCalls after first acquire = %d, want 1", got)
+	}
+	mgrA.Release(ctx, leaseA)
+	clock.Advance(31 * time.Second)
+
+	// Shard-b takes over the expired lease with the SAME ddl_text.
+	// With the task #66 fix, RecordDDLText is skipped (no redundant
+	// no-op call); without the fix, the call would be made and
+	// returned recorded=false → ErrLeaseContended.
+	leaseB, err := mgrB.Acquire(ctx, "public.takeover_target", ddl)
+	if err != nil {
+		t.Fatalf("mgrB.Acquire (takeover): %v", err)
+	}
+	defer mgrB.Release(ctx, leaseB)
+
+	if !leaseB.Takeover() {
+		t.Error("expected Takeover() true on stream-b's takeover of expired stream-a")
+	}
+	if leaseB.PriorDDLText() != ddl {
+		t.Errorf("priorDDLText = %q, want %q", leaseB.PriorDDLText(), ddl)
+	}
+	if got := store.recordDDLCalls; got != 1 {
+		t.Errorf("recordDDLCalls after takeover = %d, want 1 (skip redundant call on same-text takeover)", got)
+	}
+	// Sanity: shard-b is now the holder.
+	row, _ := store.snapshot("public.takeover_target")
+	if row.LeaseHolderStreamID != "stream-b" {
+		t.Errorf("holder = %q, want stream-b", row.LeaseHolderStreamID)
+	}
+	if row.DDLText != ddl {
+		t.Errorf("ddl_text = %q, want %q (preserved from prior holder)", row.DDLText, ddl)
+	}
+}
+
+// TestLeaseManager_TakeoverWithDifferentDDLStillRecords confirms the
+// task #66 fix's predicate scope: only same-text takeovers skip
+// RecordDDLText. When the operator's coordinator hands shard-b a
+// different ddl_text on takeover (rare but allowed; e.g. operator
+// patched the migration between shards), RecordDDLText must still
+// run so the new text replaces the stale value.
+func TestLeaseManager_TakeoverWithDifferentDDLStillRecords(t *testing.T) {
+	t.Parallel()
+	clock := newMockClock(time.Date(2026, 5, 22, 12, 0, 0, 0, time.UTC))
+	store := newFakeLeaseStore(clock.Now)
+	store.changedRowsRecordDDL = true
+	cfg := LeaseConfig{LeaseDuration: 30 * time.Second, RenewDeadline: 20 * time.Second, RetryPeriod: 10 * time.Second}
+	mgrA := newTestLeaseManager(t, store, "stream-a", cfg, clock)
+	mgrB := newTestLeaseManager(t, store, "stream-b", cfg, clock)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	leaseA, err := mgrA.Acquire(ctx, "public.takeover_target", "ir-schema:add-x")
+	if err != nil {
+		t.Fatalf("mgrA.Acquire: %v", err)
+	}
+	mgrA.Release(ctx, leaseA)
+	clock.Advance(31 * time.Second)
+
+	// Shard-b takes over with a different ddl_text; the value
+	// changes, so MySQL's changed-rows path returns recorded=true
+	// and Acquire succeeds.
+	leaseB, err := mgrB.Acquire(ctx, "public.takeover_target", "ir-schema:add-y")
+	if err != nil {
+		t.Fatalf("mgrB.Acquire (different-ddl takeover): %v", err)
+	}
+	defer mgrB.Release(ctx, leaseB)
+
+	if got := store.recordDDLCalls; got != 2 {
+		t.Errorf("recordDDLCalls = %d, want 2 (one per acquire — different text records)", got)
+	}
+	row, _ := store.snapshot("public.takeover_target")
+	if row.DDLText != "ir-schema:add-y" {
+		t.Errorf("ddl_text = %q, want updated", row.DDLText)
 	}
 }
 

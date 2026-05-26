@@ -461,7 +461,20 @@ func (m *LeaseManager) Acquire(ctx context.Context, tableName, ddlText string) (
 	if takeover {
 		priorDDLText = current.DDLText
 	}
-	if ddlText != "" {
+	// Task #66: skip RecordDDLText on takeover when the prior holder
+	// already recorded the same ddl_text. TryAcquireLease's expired
+	// takeover branch UPDATEs holder/expires atomically (gated on
+	// applied_at IS NULL) and preserves the prior ddl_text; calling
+	// RecordDDLText again with the *same* text is redundant. Worse,
+	// MySQL's go-sql-driver defaults to changed-rows RowsAffected
+	// semantics (ClientFoundRows=false), so a no-op UPDATE returns
+	// recorded=false, which the wrapper would otherwise mis-interpret
+	// as contention and turn into a 60s observeUntilApplied timeout
+	// on the caller's own lease (see internal/engines/mysql/
+	// control_table.go finalizeShardLeaseApply for the companion
+	// gotcha note). Phase A diagnostic confirmed this exact path.
+	needsRecord := ddlText != "" && (!takeover || priorDDLText != ddlText)
+	if needsRecord {
 		if recorded, err := m.store.RecordDDLText(ctx, tableName, m.streamID, ddlText); err != nil {
 			return nil, fmt.Errorf("pipeline: lease record ddl %q: %w", tableName, err)
 		} else if !recorded {
