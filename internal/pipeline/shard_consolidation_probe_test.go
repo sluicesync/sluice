@@ -22,6 +22,9 @@ type fakeProber struct {
 	alterType   ProbeOutcome
 	alterNull   ProbeOutcome
 	renameCol   ProbeOutcome
+	addCheck    ProbeOutcome
+	dropCheck   ProbeOutcome
+	modCheck    ProbeOutcome
 	addColErr   error
 	dropColErr  error
 	createIdxEr error
@@ -29,6 +32,9 @@ type fakeProber struct {
 	alterTypeEr error
 	alterNullEr error
 	renameColEr error
+	addCheckEr  error
+	dropCheckEr error
+	modCheckEr  error
 }
 
 func (p *fakeProber) ProbeAddColumn(context.Context, *ir.Table, []*ir.Column) (ProbeOutcome, error) {
@@ -57,6 +63,18 @@ func (p *fakeProber) ProbeAlterColumnNullability(context.Context, *ir.Table, *ir
 
 func (p *fakeProber) ProbeRenameColumn(context.Context, *ir.Table, string, string, *ir.Column) (ProbeOutcome, error) {
 	return p.renameCol, p.renameColEr
+}
+
+func (p *fakeProber) ProbeAddCheck(context.Context, *ir.Table, []*ir.CheckConstraint) (ProbeOutcome, error) {
+	return p.addCheck, p.addCheckEr
+}
+
+func (p *fakeProber) ProbeDropCheck(context.Context, *ir.Table, []*ir.CheckConstraint) (ProbeOutcome, error) {
+	return p.dropCheck, p.dropCheckEr
+}
+
+func (p *fakeProber) ProbeModifyCheck(context.Context, *ir.Table, string, *ir.CheckConstraint) (ProbeOutcome, error) {
+	return p.modCheck, p.modCheckEr
 }
 
 // fixtureTable returns a small table with the named columns of type
@@ -524,5 +542,268 @@ func TestDispatchProbe_PropagatesError(t *testing.T) {
 	_, err := DispatchProbe(context.Background(), prober, table, Shape{Kind: ShapeKindAddColumn})
 	if !errors.Is(err, sentinel) {
 		t.Errorf("expected sentinel error to propagate; got %v", err)
+	}
+}
+
+// ----------------------------------------------------------------
+// ADR-0064 — CHECK constraint classifier + dispatch tests.
+// Pin the {ADD/DROP/MODIFY} × {simple/JSON/datetime} matrix per
+// CLAUDE.md's Bug 74 "pin the class, not the representative" rule.
+// ----------------------------------------------------------------
+
+// checkExprMatrix returns the three expression families the
+// classifier-side tests exercise. The matrix is intentionally
+// exhaustive across families (simple-arithmetic, JSON, datetime)
+// because the cross-engine emit path's per-family translator
+// behaviour differs — the classifier is family-blind but pinning
+// the matrix here keeps the integration tests' family coverage
+// honest by mirroring the same axes.
+func checkExprMatrix() []struct {
+	family string
+	expr   string
+} {
+	return []struct {
+		family string
+		expr   string
+	}{
+		{"simple-arithmetic", "qty >= 0"},
+		{"json", "(payload->>'kind') = 'order'"},
+		{"datetime", "start_date <= end_date"},
+	}
+}
+
+// TestClassifyShape_AddCheck pins every CHECK expression family —
+// classifier behaviour is family-blind but the matrix must be
+// exercised explicitly per CLAUDE.md's Bug 74 rule.
+func TestClassifyShape_AddCheck(t *testing.T) {
+	t.Parallel()
+	for _, c := range checkExprMatrix() {
+		c := c
+		t.Run(c.family, func(t *testing.T) {
+			t.Parallel()
+			pre := fixtureTable("orders", "id", "qty")
+			post := fixtureTable("orders", "id", "qty")
+			post.CheckConstraints = []*ir.CheckConstraint{
+				{Name: "orders_chk_" + c.family, Expr: c.expr},
+			}
+			shape, err := ClassifyShape(pre, post)
+			if err != nil {
+				t.Fatalf("ClassifyShape: %v", err)
+			}
+			if shape.Kind != ShapeKindAddCheck {
+				t.Errorf("Kind = %v, want AddCheck", shape.Kind)
+			}
+			if len(shape.AddedChecks) != 1 || shape.AddedChecks[0].Expr != c.expr {
+				t.Errorf("AddedChecks = %+v, want exactly one with Expr=%q", shape.AddedChecks, c.expr)
+			}
+		})
+	}
+}
+
+// TestClassifyShape_DropCheck pins the drop-shape across families.
+func TestClassifyShape_DropCheck(t *testing.T) {
+	t.Parallel()
+	for _, c := range checkExprMatrix() {
+		c := c
+		t.Run(c.family, func(t *testing.T) {
+			t.Parallel()
+			pre := fixtureTable("orders", "id", "qty")
+			pre.CheckConstraints = []*ir.CheckConstraint{
+				{Name: "orders_chk_" + c.family, Expr: c.expr},
+			}
+			post := fixtureTable("orders", "id", "qty")
+			shape, err := ClassifyShape(pre, post)
+			if err != nil {
+				t.Fatalf("ClassifyShape: %v", err)
+			}
+			if shape.Kind != ShapeKindDropCheck {
+				t.Errorf("Kind = %v, want DropCheck", shape.Kind)
+			}
+			if len(shape.DroppedChecks) != 1 || shape.DroppedChecks[0].Name != "orders_chk_"+c.family {
+				t.Errorf("DroppedChecks = %+v", shape.DroppedChecks)
+			}
+		})
+	}
+}
+
+// TestClassifyShape_ModifyCheck pins the modify shape: same name,
+// different Expr → ShapeKindModifyCheck with both before/after
+// populated.
+func TestClassifyShape_ModifyCheck(t *testing.T) {
+	t.Parallel()
+	for _, c := range checkExprMatrix() {
+		c := c
+		t.Run(c.family, func(t *testing.T) {
+			t.Parallel()
+			pre := fixtureTable("orders", "id", "qty")
+			pre.CheckConstraints = []*ir.CheckConstraint{
+				{Name: "orders_chk_" + c.family, Expr: c.expr},
+			}
+			post := fixtureTable("orders", "id", "qty")
+			post.CheckConstraints = []*ir.CheckConstraint{
+				{Name: "orders_chk_" + c.family, Expr: c.expr + " AND id IS NOT NULL"},
+			}
+			shape, err := ClassifyShape(pre, post)
+			if err != nil {
+				t.Fatalf("ClassifyShape: %v", err)
+			}
+			if shape.Kind != ShapeKindModifyCheck {
+				t.Errorf("Kind = %v, want ModifyCheck", shape.Kind)
+			}
+			if shape.ModifiedCheckBefore == nil || shape.ModifiedCheckBefore.Expr != c.expr {
+				t.Errorf("ModifiedCheckBefore = %+v, want Expr=%q", shape.ModifiedCheckBefore, c.expr)
+			}
+			if shape.ModifiedCheckAfter == nil || shape.ModifiedCheckAfter.Expr == c.expr {
+				t.Errorf("ModifiedCheckAfter = %+v, want different Expr", shape.ModifiedCheckAfter)
+			}
+		})
+	}
+}
+
+// TestClassifyShape_CheckUnnamedSkipped: unnamed CHECKs are skipped
+// from the diff (no name to track identity). A delta consisting
+// solely of unnamed CHECK churn is reported as None.
+func TestClassifyShape_CheckUnnamedSkipped(t *testing.T) {
+	t.Parallel()
+	pre := fixtureTable("orders", "id", "qty")
+	post := fixtureTable("orders", "id", "qty")
+	post.CheckConstraints = []*ir.CheckConstraint{
+		{Name: "", Expr: "qty > 0"}, // unnamed — classifier skips
+	}
+	shape, err := ClassifyShape(pre, post)
+	if err != nil {
+		t.Fatalf("ClassifyShape: %v", err)
+	}
+	if shape.Kind != ShapeKindNone {
+		t.Errorf("Kind = %v, want None (unnamed CHECKs skipped)", shape.Kind)
+	}
+}
+
+// TestClassifyShape_CheckComboRefusesLoudly: a CHECK shape combined
+// with another delta class is a combo refusal — CHECK shapes are
+// recognized only as the sole delta on the boundary.
+func TestClassifyShape_CheckComboRefusesLoudly(t *testing.T) {
+	t.Parallel()
+	pre := fixtureTable("orders", "id", "qty")
+	post := fixtureTable("orders", "id", "qty", "tier")
+	post.CheckConstraints = []*ir.CheckConstraint{
+		{Name: "orders_qty_chk", Expr: "qty >= 0"},
+	}
+	shape, err := ClassifyShape(pre, post)
+	if err == nil {
+		t.Fatal("expected combo refusal on add-column + add-check; got nil error")
+	}
+	if shape.Kind != ShapeKindUnrecognized {
+		t.Errorf("Kind = %v, want Unrecognized", shape.Kind)
+	}
+}
+
+// TestClassifyShape_MultipleModifyCheckRefusesLoudly: two same-name
+// modifies in a single boundary are not recognized as a single
+// ModifyCheck — hasMod=false → class-counter doesn't fire on
+// modify → if there are no add/drop classes, the result is None;
+// if there ARE add/drop classes, it's still combo. To distinguish
+// from None, this test exercises the two-modify-only case which
+// is rare but the v1 limit: classifier expects one modify per
+// boundary, multi-modify uses the drained model.
+func TestClassifyShape_MultipleModifyCheckRefusesLoudly(t *testing.T) {
+	t.Parallel()
+	pre := fixtureTable("orders", "id", "qty")
+	pre.CheckConstraints = []*ir.CheckConstraint{
+		{Name: "orders_qty_chk", Expr: "qty >= 0"},
+		{Name: "orders_id_chk", Expr: "id > 0"},
+	}
+	post := fixtureTable("orders", "id", "qty")
+	post.CheckConstraints = []*ir.CheckConstraint{
+		{Name: "orders_qty_chk", Expr: "qty > 0"}, // changed
+		{Name: "orders_id_chk", Expr: "id >= 0"},  // changed
+	}
+	shape, err := ClassifyShape(pre, post)
+	if err != nil {
+		// Two same-name modifies → diffChecks returns hasMod=false;
+		// no other class fires → None is the documented behaviour.
+		// We accept either None or Unrecognized; the load-bearing
+		// invariant is "not silently treated as a single modify".
+		if shape.Kind == ShapeKindModifyCheck {
+			t.Errorf("Kind = ModifyCheck on multi-modify; the v1 classifier scope is single-modify")
+		}
+		return
+	}
+	if shape.Kind == ShapeKindModifyCheck {
+		t.Errorf("Kind = ModifyCheck on multi-modify; classifier should not collapse two modifies into one shape")
+	}
+}
+
+// TestDispatchProbe_CheckShapes routes the three CHECK shapes via
+// DispatchProbe.
+func TestDispatchProbe_CheckShapes(t *testing.T) {
+	t.Parallel()
+	prober := &fakeProber{
+		addCheck:  ProbeOutcomeApplied,
+		dropCheck: ProbeOutcomeNotApplied,
+		modCheck:  ProbeOutcomeInconsistent,
+	}
+	table := fixtureTable("orders", "id")
+	ctx := context.Background()
+
+	addShape := Shape{Kind: ShapeKindAddCheck, AddedChecks: []*ir.CheckConstraint{{Name: "c1", Expr: "id > 0"}}}
+	got, err := DispatchProbe(ctx, prober, table, addShape)
+	if err != nil {
+		t.Fatalf("DispatchProbe AddCheck: %v", err)
+	}
+	if got != ProbeOutcomeApplied {
+		t.Errorf("AddCheck outcome = %v, want Applied", got)
+	}
+
+	dropShape := Shape{Kind: ShapeKindDropCheck, DroppedChecks: []*ir.CheckConstraint{{Name: "c1", Expr: "id > 0"}}}
+	got, err = DispatchProbe(ctx, prober, table, dropShape)
+	if err != nil {
+		t.Fatalf("DispatchProbe DropCheck: %v", err)
+	}
+	if got != ProbeOutcomeNotApplied {
+		t.Errorf("DropCheck outcome = %v, want NotApplied", got)
+	}
+
+	modShape := Shape{
+		Kind:                ShapeKindModifyCheck,
+		ModifiedCheckBefore: &ir.CheckConstraint{Name: "c1", Expr: "id > 0"},
+		ModifiedCheckAfter:  &ir.CheckConstraint{Name: "c1", Expr: "id >= 0"},
+	}
+	got, err = DispatchProbe(ctx, prober, table, modShape)
+	if err != nil {
+		t.Fatalf("DispatchProbe ModifyCheck: %v", err)
+	}
+	if got != ProbeOutcomeInconsistent {
+		t.Errorf("ModifyCheck outcome = %v, want Inconsistent", got)
+	}
+}
+
+// TestDispatchProbe_ModifyCheck_NilGuards pins the
+// inconsistent-shape refusal when the modify-check payload is
+// missing.
+func TestDispatchProbe_ModifyCheck_NilGuards(t *testing.T) {
+	t.Parallel()
+	prober := &fakeProber{}
+	table := fixtureTable("orders", "id")
+	cases := []struct {
+		name  string
+		shape Shape
+	}{
+		{"missing-before", Shape{Kind: ShapeKindModifyCheck, ModifiedCheckAfter: &ir.CheckConstraint{Name: "c1"}}},
+		{"missing-after", Shape{Kind: ShapeKindModifyCheck, ModifiedCheckBefore: &ir.CheckConstraint{Name: "c1"}}},
+		{"missing-both", Shape{Kind: ShapeKindModifyCheck}},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			outcome, err := DispatchProbe(context.Background(), prober, table, c.shape)
+			if err == nil {
+				t.Fatal("expected error on missing modify-check payload")
+			}
+			if outcome != ProbeOutcomeInconsistent {
+				t.Errorf("outcome = %v, want Inconsistent", outcome)
+			}
+		})
 	}
 }

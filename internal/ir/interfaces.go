@@ -468,6 +468,37 @@ type ShapeDeltaApplier interface {
 	// caller routes to the loud-failure path (drained model recovery
 	// hint).
 	AlterRenameColumn(ctx context.Context, table *Table, oldName, newName string) error
+
+	// AlterAddCheck issues `ALTER TABLE <table> ADD CONSTRAINT
+	// <name> CHECK (<expr>)` for each constraint in checks
+	// (ADR-0064). Idempotent on the post-state via detect-then-emit
+	// against the engine's CHECK catalog (pg_constraint /
+	// information_schema.CHECK_CONSTRAINTS) — neither engine
+	// reliably supports `ADD CONSTRAINT IF NOT EXISTS` in 8.0+ /
+	// 16.x. Cross-dialect Expr values are routed through the
+	// existing ADR-0016 / ADR-0045 translator at the writer
+	// boundary; the implementation returns a refuse-loudly error
+	// when the translation pass produces an expression containing
+	// well-known untranslatable tokens (operator can opt in via
+	// `--expr-override` per ADR-0016).
+	AlterAddCheck(ctx context.Context, table *Table, checks []*CheckConstraint) error
+
+	// AlterDropCheck issues `ALTER TABLE <table> DROP CONSTRAINT
+	// [IF EXISTS] <name>` for each constraint in checks (ADR-0064).
+	// Idempotent: PG supports `DROP CONSTRAINT IF EXISTS` natively;
+	// MySQL implementations detect-then-DROP via
+	// information_schema.CHECK_CONSTRAINTS.
+	AlterDropCheck(ctx context.Context, table *Table, checks []*CheckConstraint) error
+
+	// AlterModifyCheck issues DROP + ADD against the same target
+	// for the modify-shape (ADR-0064). Neither engine supports an
+	// in-place expression rewrite of an existing CHECK constraint
+	// without dropping and re-adding; the v1 implementation emits
+	// the DROP and ADD in sequence under the same applier method
+	// so the takeover-stream's probe-and-record loop sees a single
+	// logical step. The cross-dialect refuse-loudly pre-flight
+	// described on AlterAddCheck applies to the ADD half here.
+	AlterModifyCheck(ctx context.Context, table *Table, oldConstraint, newConstraint *CheckConstraint) error
 }
 
 // CDCSchemaSnapshotNormalizer is the optional engine surface for

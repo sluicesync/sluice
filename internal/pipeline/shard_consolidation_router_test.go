@@ -62,6 +62,18 @@ func (f *fakeShapeApplier) AlterRenameColumn(_ context.Context, _ *ir.Table, _ /
 	return f.record("AlterRenameColumn")
 }
 
+func (f *fakeShapeApplier) AlterAddCheck(_ context.Context, _ *ir.Table, _ []*ir.CheckConstraint) error {
+	return f.record("AlterAddCheck")
+}
+
+func (f *fakeShapeApplier) AlterDropCheck(_ context.Context, _ *ir.Table, _ []*ir.CheckConstraint) error {
+	return f.record("AlterDropCheck")
+}
+
+func (f *fakeShapeApplier) AlterModifyCheck(_ context.Context, _ *ir.Table, _, _ *ir.CheckConstraint) error {
+	return f.record("AlterModifyCheck")
+}
+
 func newTestRouter(t *testing.T, store *fakeLeaseStore, streamID string, prober ShardConsolidationProber, applier ir.ShapeDeltaApplier, clock *mockClock) *BoundaryRouter {
 	t.Helper()
 	cfg := LeaseConfig{LeaseDuration: time.Minute, RenewDeadline: 30 * time.Second, RetryPeriod: 5 * time.Second}
