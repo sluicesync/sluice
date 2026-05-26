@@ -38,6 +38,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"log"
 	"testing"
 	"time"
 
@@ -63,32 +64,68 @@ func startMySQLGTIDForCDC(t *testing.T) (dsn string, cleanup func()) {
 	t.Helper()
 	testcontainers.SkipIfProviderIsNotHealthy(t)
 
+	// Task #12 Phase B: this per-test helper bypasses the shared
+	// TestMain container (the test's PURGE BINARY LOGS would truncate
+	// other tests' binlog history), so it doesn't get task #60's
+	// retry path automatically. The same wait-until-ready flake that
+	// hits the shared container hits this boot too — instrumented by
+	// PR #59's CI runs where this test failed with the same shape.
+	// Apply the same retry schedule as ensureSharedMySQL.
+	var (
+		container *mysqltc.MySQLContainer
+		lastErr   error
+	)
+	for attempt := 1; attempt <= sharedMySQLBootAttempts; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), sharedMySQLBootTimeout)
+		c, err := mysqltc.Run(
+			ctx,
+			"mysql:8.0",
+			mysqltc.WithDatabase("source_db"),
+			mysqltc.WithUsername("root"),
+			mysqltc.WithPassword("rootpw"),
+			testcontainers.CustomizeRequest(testcontainers.GenericContainerRequest{
+				ContainerRequest: testcontainers.ContainerRequest{
+					Cmd: []string{
+						"mysqld",
+						"--server-id=1",
+						"--log-bin=mysql-bin",
+						"--binlog-format=ROW",
+						"--binlog-row-image=FULL",
+						"--gtid-mode=ON",
+						"--enforce-gtid-consistency=ON",
+					},
+				},
+			}),
+		)
+		cancel()
+		if err == nil {
+			container = c
+			if attempt > 1 {
+				log.Printf("startMySQLGTIDForCDC boot attempt %d/%d succeeded",
+					attempt, sharedMySQLBootAttempts)
+			}
+			break
+		}
+		if c != nil {
+			_ = c.Terminate(context.Background())
+		}
+		lastErr = err
+		if attempt < sharedMySQLBootAttempts {
+			backoff := sharedMySQLBootBackoff(attempt)
+			log.Printf("startMySQLGTIDForCDC boot attempt %d/%d failed: %v; retrying in %s",
+				attempt, sharedMySQLBootAttempts, err, backoff)
+			time.Sleep(backoff)
+			continue
+		}
+		log.Printf("startMySQLGTIDForCDC boot attempt %d/%d failed: %v; giving up",
+			attempt, sharedMySQLBootAttempts, err)
+	}
+	if container == nil {
+		t.Fatalf("start container: %d attempts exhausted: %v", sharedMySQLBootAttempts, lastErr)
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-
-	container, err := mysqltc.Run(
-		ctx,
-		"mysql:8.0",
-		mysqltc.WithDatabase("source_db"),
-		mysqltc.WithUsername("root"),
-		mysqltc.WithPassword("rootpw"),
-		testcontainers.CustomizeRequest(testcontainers.GenericContainerRequest{
-			ContainerRequest: testcontainers.ContainerRequest{
-				Cmd: []string{
-					"mysqld",
-					"--server-id=1",
-					"--log-bin=mysql-bin",
-					"--binlog-format=ROW",
-					"--binlog-row-image=FULL",
-					"--gtid-mode=ON",
-					"--enforce-gtid-consistency=ON",
-				},
-			},
-		}),
-	)
-	if err != nil {
-		t.Fatalf("start container: %v", err)
-	}
 	terminate := func() {
 		shutdown, c := context.WithTimeout(context.Background(), 30*time.Second)
 		defer c()

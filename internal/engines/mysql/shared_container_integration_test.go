@@ -80,42 +80,53 @@ var sharedMySQL sharedMySQLState
 const sharedMySQLBootTimeout = 2 * time.Minute
 
 // sharedMySQLBootAttempts is the total number of attempts the retry
-// loop in ensureSharedMySQL will make before giving up. Backoff is
-// 30s after attempt 1, 60s after attempt 2, then attempt 3 is the
-// final try. Cumulative worst-case wall time:
+// loop in ensureSharedMySQL will make before giving up. Bumped from
+// 3 to 5 by task #12 Phase B: the v0.83.0 → ~v0.84.x session
+// captured two CI runs (PR #54 first-run + PR #61 first-run) where
+// the original 3-attempt schedule exhausted under runner load — the
+// boot was hitting `wait until ready` every time, not quick-failing
+// for ~2 minutes per attempt. 5 attempts buys two more chances at
+// 120s + 240s backoff. Cumulative worst-case wall time:
 //
-//	3 * sharedMySQLBootTimeout (per-attempt budget) + 30s + 60s
-//	= 3 * 2min + 90s
-//	= ~7.5 min
+//	5 * sharedMySQLBootTimeout (per-attempt budget)
+//	  + 30s + 60s + 120s + 240s
+//	= 5 * 2min + 7.5min
+//	= ~17.5 min
 //
-// well under the CI 30-minute shard timeout. Task #60: prior to this
-// loop the boot was single-shot — any wait-until-ready timeout (e.g.
-// `port: 3306 ... matched 0 times, expected 1` followed by `context
-// deadline exceeded`) failed all ~62 tests in the engines-mysql
-// shard with "shared mysql unavailable", costing 3-5 CI reruns per
-// release tag.
-const sharedMySQLBootAttempts = 3
+// still under the CI 30-minute shard timeout, and the marginal cost
+// vs. 3 attempts is paid only when the runner is sick (a few
+// minutes once a release cycle, vs. a full CI rerun without it).
+//
+// Task #60 history (the original 3-attempt landing): prior to that
+// loop the boot was single-shot — any wait-until-ready timeout
+// (e.g. `port: 3306 ... matched 0 times, expected 1` followed by
+// `context deadline exceeded`) failed all ~62 tests in the
+// engines-mysql shard with "shared mysql unavailable", costing 3-5
+// CI reruns per release tag.
+const sharedMySQLBootAttempts = 5
 
 // sharedMySQLBootBackoff returns the sleep duration to apply between
 // a failed boot attempt and the next one. attempt is 1-indexed and
 // refers to the attempt that JUST failed; the function is only
 // consulted while attempt < sharedMySQLBootAttempts.
 //
-// Schedule: 30s after #1, 60s after #2. Doubling matches the
-// `30s * (1 << (attempt-1))` formula but is spelled out as a switch
-// so the actual numbers are visible at the call site.
+// Schedule: 30s, 60s, 120s, 240s (doubling). Spelled out as a
+// switch so the actual numbers are visible at the call site rather
+// than computed from a `30s << (attempt-1)` formula.
 func sharedMySQLBootBackoff(attempt int) time.Duration {
 	switch attempt {
 	case 1:
 		return 30 * time.Second
 	case 2:
 		return 60 * time.Second
-	default:
-		// Defensive: 120s would be the next term in the sequence if
-		// we ever raise sharedMySQLBootAttempts past 3. Never hit
-		// today because the loop exits after attempt 3 without
-		// sleeping further.
+	case 3:
 		return 120 * time.Second
+	case 4:
+		return 240 * time.Second
+	default:
+		// Defensive: never hit today because the loop exits after
+		// attempt 5 without sleeping further.
+		return 480 * time.Second
 	}
 }
 

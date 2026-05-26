@@ -52,21 +52,31 @@ import (
 )
 
 const (
-	mysqlBootAttempts = 3
+	// mysqlBootAttempts: total per-helper attempts. Bumped 3 → 5 by
+	// task #12 Phase B; see engines/mysql/shared_container_integration_test.go
+	// for the rationale (two captured runs where 3 attempts exhausted
+	// under runner load). Worst-case wall time: 5 * 2min + 30s + 60s
+	// + 120s + 240s = ~17.5 min, still under CI shard timeout.
+	mysqlBootAttempts = 5
 	mysqlBootTimeout  = 2 * time.Minute
 )
 
 // mysqlBootBackoff returns the sleep duration between a failed boot
 // attempt and the next one. attempt is 1-indexed and refers to the
-// attempt that JUST failed.
+// attempt that JUST failed. Schedule mirrors
+// engines/mysql.sharedMySQLBootBackoff: 30s, 60s, 120s, 240s.
 func mysqlBootBackoff(attempt int) time.Duration {
 	switch attempt {
 	case 1:
 		return 30 * time.Second
 	case 2:
 		return 60 * time.Second
-	default:
+	case 3:
 		return 120 * time.Second
+	case 4:
+		return 240 * time.Second
+	default:
+		return 480 * time.Second
 	}
 }
 
