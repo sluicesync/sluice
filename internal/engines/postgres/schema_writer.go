@@ -178,6 +178,23 @@ func (w *SchemaWriter) CreateTablesWithoutConstraints(ctx context.Context, s *ir
 			}
 		}
 	}
+
+	// Phase 1d: row-level security (ADR-0063 — task #52 sub-deliverables
+	// 2 + 3). For each table the source had RLS on, emit
+	// `ALTER TABLE ... ENABLE ROW LEVEL SECURITY` (and `FORCE` when
+	// the source had it), then `CREATE POLICY` for each captured
+	// policy. ENABLE MUST precede CREATE POLICY: without ENABLE the
+	// policies are defined but inert, which is the subtle-silent-
+	// security-regression class the ADR exists to close. Empty
+	// Policies + RLSEnabled=false (the common case on most schemas)
+	// is a no-op.
+	for _, table := range orderedTables(s) {
+		for _, stmt := range emitRLSStatements(w.schema, table) {
+			if _, err := w.db.ExecContext(ctx, stmt); err != nil {
+				return fmt.Errorf("postgres: apply RLS on %q: %w", table.Name, err)
+			}
+		}
+	}
 	return nil
 }
 
@@ -486,6 +503,18 @@ func (w *SchemaWriter) PreviewDDL(_ context.Context, s *ir.Schema) ([]ir.DDLStat
 			out = append(out, ir.DDLStatement{
 				Table: table.Name,
 				Kind:  "COMMENT ON",
+				SQL:   trimTrailingSemicolon(stmt),
+			})
+		}
+	}
+
+	// Phase 1d: row-level security (ADR-0063). Same order as the
+	// apply path: ALTER ... ENABLE / FORCE before any CREATE POLICY.
+	for _, table := range orderedTables(s) {
+		for _, stmt := range emitRLSStatements(w.schema, table) {
+			out = append(out, ir.DDLStatement{
+				Table: table.Name,
+				Kind:  rlsStatementKind(stmt),
 				SQL:   trimTrailingSemicolon(stmt),
 			})
 		}

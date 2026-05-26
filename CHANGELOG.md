@@ -6,6 +6,10 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **`feat(engines/postgres,engines/mysql,ir): task #52 sub-deliverables 2 + 3 — RLS IR capture + emit (ADR-0063)`** — closes the "target schema arrives without policies" silent-security-regression class (failure mode 3 of five enumerated in task #52). PG `SchemaReader` now captures `pg_class.relrowsecurity` / `relforcerowsecurity` and every `pg_policies` row into the IR (`ir.Table.RLSEnabled` / `RLSForced` / `Policies`); PG `SchemaWriter` re-emits `ALTER TABLE … ENABLE ROW LEVEL SECURITY` (+ `FORCE`) and `CREATE POLICY` for each policy on the target, in that order (ENABLE before CREATE POLICY — without ENABLE the policies are defined but inert). Cross-engine PG → MySQL writer logs exactly one WARN per stream naming affected tables (MySQL has no RLS surface — operators routing PG → MySQL accept the policy-layer drop). MySQL → PG is a no-op (MySQL sources never populate the new IR fields). Sub-deliverable 1 (RLS preflight) shipped earlier in v0.78.4; this lands sub-deliverables 2 + 3 to complete the failure-mode-3 fix. Bug-74-style class-pin coverage: integration test exercises Command × Permissive × USING/CHECK × ENABLE/FORCE matrix end-to-end on a real PG container.
+
 ## [0.83.0] - 2026-05-25
 
 ### Added
