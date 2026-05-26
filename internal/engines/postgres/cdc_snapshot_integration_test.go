@@ -23,51 +23,17 @@ import (
 	"time"
 
 	"github.com/orware/sluice/internal/ir"
-
-	"github.com/testcontainers/testcontainers-go"
-	pgtc "github.com/testcontainers/testcontainers-go/modules/postgres"
 )
 
+// startPostgresForSnapshotCDC returns a DSN pointed at a freshly-reset
+// database on the shared PG container booted by TestMain. The shared
+// container is started with wal_level=logical and the same
+// max_wal_senders / max_replication_slots this helper used to set
+// directly, so the snapshot+CDC handoff exercises the same server
+// shape it did pre-refactor.
 func startPostgresForSnapshotCDC(t *testing.T) (dsn string, cleanup func()) {
 	t.Helper()
-	testcontainers.SkipIfProviderIsNotHealthy(t)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-
-	container, err := pgtc.Run(
-		ctx,
-		"postgres:16",
-		pgtc.WithDatabase("source_db"),
-		pgtc.WithUsername("test"),
-		pgtc.WithPassword("test"),
-		pgtc.BasicWaitStrategies(),
-		testcontainers.CustomizeRequest(testcontainers.GenericContainerRequest{
-			ContainerRequest: testcontainers.ContainerRequest{
-				Cmd: []string{
-					"-c", "wal_level=logical",
-					"-c", "max_wal_senders=4",
-					"-c", "max_replication_slots=4",
-				},
-			},
-		}),
-	)
-	if err != nil {
-		t.Fatalf("start container: %v", err)
-	}
-
-	terminate := func() {
-		shutdown, c := context.WithTimeout(context.Background(), 30*time.Second)
-		defer c()
-		_ = container.Terminate(shutdown)
-	}
-
-	srcConn, err := container.ConnectionString(ctx, "sslmode=disable")
-	if err != nil {
-		terminate()
-		t.Fatalf("connection string: %v", err)
-	}
-	return srcConn, terminate
+	return newSharedPGDB(t, "source_db")
 }
 
 func applyPGSnap(t *testing.T, dsn, sqlText string) {

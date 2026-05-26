@@ -24,12 +24,21 @@ import (
 	pgtc "github.com/testcontainers/testcontainers-go/modules/postgres"
 )
 
-// startPostgresForCDC boots a Postgres container with logical
-// replication enabled. Mirrors the pipeline package's startPostgres
-// helper but adds the wal_level command-line override the CDC
-// reader needs.
+// startPostgresForCDC returns a DSN pointed at a freshly-reset
+// database on the shared PG container booted by TestMain. The shared
+// container is started with wal_level=logical (and matching
+// max_wal_senders / max_replication_slots) so the CDC reader's
+// precondition check passes. cleanup is a no-op; teardown belongs to
+// TestMain.
+//
+// Why this helper now uses the shared container while
+// startPostgres17ForCDC and startPostgresForCDCImage do NOT: PG 16 is
+// the shared container's image; PG 17 is a different image and the
+// failover-flag tests need version-specific behaviour, so those
+// callers keep booting their own container.
 func startPostgresForCDC(t *testing.T) (dsn string, cleanup func()) {
-	return startPostgresForCDCImage(t, "postgres:16")
+	t.Helper()
+	return newSharedPGDB(t, "source_db")
 }
 
 // startPostgres17ForCDC is the PG 17+ counterpart used by the
@@ -38,20 +47,27 @@ func startPostgresForCDC(t *testing.T) (dsn string, cleanup func()) {
 // "postgres:16" — important because not all behaviour we test is
 // version-stable, and silently rolling the default would put load-
 // bearing test invariants on a moving target.
+//
+// Stays per-test (does NOT share the container) because the image is
+// different from the shared container's postgres:16 — sharing would
+// defeat the purpose of the PG 17–specific assertion. See the comment
+// block at the foot of shared_container_integration_test.go.
 func startPostgres17ForCDC(t *testing.T) (dsn string, cleanup func()) {
 	return startPostgresForCDCImage(t, "postgres:17")
 }
 
+// startPostgresForCDCImage boots a per-test PG container with
+// wal_level=logical. Kept per-test (not shared) because it accepts
+// the image as a parameter and gets called with "postgres:17" by the
+// failover-flag tests. The retry shape mirrors
+// pipeline.runMySQLWithRetry / engines/postgres.runPGWithRetry's
+// 3-attempt cap — per-test boots multiply by the test count so
+// budgets are tighter than the shared TestMain's 5 attempts.
 func startPostgresForCDCImage(t *testing.T, image string) (dsn string, cleanup func()) {
 	t.Helper()
-	testcontainers.SkipIfProviderIsNotHealthy(t)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-
-	container, err := pgtc.Run(
-		ctx,
-		image,
+	container := runPGWithRetry(
+		t, image,
 		pgtc.WithDatabase("source_db"),
 		pgtc.WithUsername("test"),
 		pgtc.WithPassword("test"),
@@ -68,9 +84,9 @@ func startPostgresForCDCImage(t *testing.T, image string) (dsn string, cleanup f
 			},
 		}),
 	)
-	if err != nil {
-		t.Fatalf("start container: %v", err)
-	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
 
 	terminate := func() {
 		shutdown, c := context.WithTimeout(context.Background(), 30*time.Second)
@@ -585,24 +601,24 @@ func TestCDCReader_DeleteCompositePKUnderReplicaIdentityDefault(t *testing.T) {
 // stock postgres images is also replica unless we override) and
 // confirms OpenCDCReader → StreamChanges fails with a clear error
 // before any replication command is issued.
+//
+// Stays per-test (does NOT share the container) because the shared
+// container is wal_level=logical — it can't test the refusal path
+// for a wal_level=replica server. The retry shape applied here is
+// the per-test 3-attempt cap (see runPGWithRetry).
 func TestCDCReader_RejectsWrongWALLevel(t *testing.T) {
-	testcontainers.SkipIfProviderIsNotHealthy(t)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-
-	container, err := pgtc.Run(
-		ctx,
-		"postgres:16",
+	container := runPGWithRetry(
+		t, "postgres:16",
 		pgtc.WithDatabase("source_db"),
 		pgtc.WithUsername("test"),
 		pgtc.WithPassword("test"),
 		pgtc.BasicWaitStrategies(),
 		// No wal_level override → server defaults to "replica".
 	)
-	if err != nil {
-		t.Fatalf("start container: %v", err)
-	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
 	defer func() {
 		shutdown, c := context.WithTimeout(context.Background(), 30*time.Second)
 		defer c()

@@ -25,42 +25,15 @@ import (
 	"time"
 
 	"github.com/orware/sluice/internal/ir"
-
-	"github.com/testcontainers/testcontainers-go"
-	pgtc "github.com/testcontainers/testcontainers-go/modules/postgres"
 )
 
+// startPostgresForApplier returns a DSN pointed at a freshly-reset
+// database on the shared PG container booted by TestMain (see
+// shared_container_integration_test.go). The cleanup is a no-op;
+// container teardown is owned by TestMain.
 func startPostgresForApplier(t *testing.T) (dsn string, cleanup func()) {
 	t.Helper()
-	testcontainers.SkipIfProviderIsNotHealthy(t)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-
-	container, err := pgtc.Run(
-		ctx,
-		"postgres:16",
-		pgtc.WithDatabase("target_db"),
-		pgtc.WithUsername("test"),
-		pgtc.WithPassword("test"),
-		pgtc.BasicWaitStrategies(),
-	)
-	if err != nil {
-		t.Fatalf("start container: %v", err)
-	}
-
-	terminate := func() {
-		shutdown, c := context.WithTimeout(context.Background(), 30*time.Second)
-		defer c()
-		_ = container.Terminate(shutdown)
-	}
-
-	srcConn, err := container.ConnectionString(ctx, "sslmode=disable")
-	if err != nil {
-		terminate()
-		t.Fatalf("connection string: %v", err)
-	}
-	return srcConn, terminate
+	return newSharedPGDB(t, "target_db")
 }
 
 func applyPGApplier(t *testing.T, dsn, sqlText string) {

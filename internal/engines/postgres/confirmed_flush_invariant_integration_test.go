@@ -289,7 +289,21 @@ func TestCDCReader_ConfirmedFlushInvariant_PinF3(t *testing.T) {
 				// the first persisted row exists, confirmed_flush
 				// may legitimately reflect only the start-LSN
 				// fallback (ackLSN's pre-first-applied branch).
-				if havePersisted && confirmed > persisted {
+				//
+				// Note: `havePersisted` alone is insufficient as
+				// the gate — readPersistedSourceLSN returns
+				// `ok=true` when the row exists with a zero-LSN
+				// token (the applier writes its initial row
+				// before its first commit). Pre-#59 each test
+				// got a fresh ~12s container boot which masked
+				// that window; under the shared TestMain the
+				// reset takes ~50ms and the watcher's 100ms
+				// polling occasionally catches the
+				// applier-wrote-initial-row-but-not-yet-committed
+				// state. Gate explicitly on `persisted > 0` so
+				// the invariant kicks in only once a real applied
+				// position exists.
+				if havePersisted && persisted > 0 && confirmed > persisted {
 					violations = append(violations, sample{
 						when:          time.Now(),
 						confirmed:     confirmed,
@@ -366,10 +380,13 @@ func TestCDCReader_ConfirmedFlushInvariant_PinF3(t *testing.T) {
 
 	// Post-stop invariant: the final confirmed_flush still satisfies
 	// the invariant (no late keepalive advanced it past the persisted
-	// position after the stream tore down).
+	// position after the stream tore down). Gate on `finalPersisted > 0`
+	// for the same reason as the watcher's in-flight check above —
+	// readPersistedSourceLSN returns havePersisted=true for the
+	// applier's initial zero-LSN row.
 	finalConfirmed, confirmedOK := readConfirmedFlushLSNParsed(t, dsn, "sluice_slot")
 	finalPersisted, havePersisted := readPersistedSourceLSN(t, dsn, "f3-invariant-pin")
-	if confirmedOK && havePersisted && finalConfirmed > finalPersisted {
+	if confirmedOK && havePersisted && finalPersisted > 0 && finalConfirmed > finalPersisted {
 		t.Errorf("post-stop invariant violated: confirmed_flush_lsn=%s > persisted_lsn=%s",
 			finalConfirmed.String(), finalPersisted.String())
 	}

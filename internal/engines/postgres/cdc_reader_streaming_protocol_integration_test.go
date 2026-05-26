@@ -47,16 +47,18 @@ import (
 // logical_decoding_work_mem aggressively low so the streaming-or-not
 // observation has bite. 64 kB is far below the default 64 MB; any
 // reasonably-sized transaction crosses it.
+//
+// Stays per-test (does NOT share the container booted by TestMain)
+// because logical_decoding_work_mem is set at server boot and the
+// 64 kB override would corrupt the spill semantics of every other CDC
+// test if the container were shared. The 3-attempt retry shape is
+// applied via runPGWithRetry — see ci-retry-asymmetry: per-test boots
+// stay at 3 attempts, NOT the shared container's 5.
 func startPostgresForCDCWithSmallDecodeMem(t *testing.T) (dsn string, cleanup func()) {
 	t.Helper()
-	testcontainers.SkipIfProviderIsNotHealthy(t)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-
-	container, err := pgtc.Run(
-		ctx,
-		"postgres:16",
+	container := runPGWithRetry(
+		t, "postgres:16",
 		pgtc.WithDatabase("source_db"),
 		pgtc.WithUsername("test"),
 		pgtc.WithPassword("test"),
@@ -76,9 +78,9 @@ func startPostgresForCDCWithSmallDecodeMem(t *testing.T) (dsn string, cleanup fu
 			},
 		}),
 	)
-	if err != nil {
-		t.Fatalf("start container: %v", err)
-	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
 
 	terminate := func() {
 		shutdown, c := context.WithTimeout(context.Background(), 30*time.Second)
