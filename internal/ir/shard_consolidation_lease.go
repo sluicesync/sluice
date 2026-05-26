@@ -173,7 +173,7 @@ type ShardConsolidationProber interface {
 	// ProbeAddCheck returns Applied when ALL named CHECK constraints
 	// exist on the target; NotApplied when NONE exist; Inconsistent
 	// on partial state. CHECK identity is by Name (the catalog
-	// requires named CHECKs per ADR-0064 — unnamed CHECKs are
+	// requires named CHECKs per ADR-0065 — unnamed CHECKs are
 	// classifier-skipped upstream).
 	ProbeAddCheck(ctx context.Context, table *Table, checks []*CheckConstraint) (ProbeOutcome, error)
 

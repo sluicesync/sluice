@@ -102,7 +102,7 @@ func (Engine) NormalizeForCDCComparison(t *ir.Table) *ir.Table {
 		newCol.Comment = ""
 		out.Columns[i] = &newCol
 	}
-	// ADR-0064 (task #22 CHECK sub-shape): pgoutput's RelationMessage
+	// ADR-0065 (task #22 CHECK sub-shape): pgoutput's RelationMessage
 	// carries no constraint metadata, so the CDC-projected IR
 	// always leaves CheckConstraints nil. The cold-start
 	// SchemaReader populates it from pg_constraint. Without
@@ -116,7 +116,7 @@ func (Engine) NormalizeForCDCComparison(t *ir.Table) *ir.Table {
 	// live-coordination is engaged see the cold-start side land
 	// the change at the next snapshot boundary; the CDC stream's
 	// row apply path observes whatever the new CHECK admits /
-	// refuses at INSERT/UPDATE time. ADR-0064 documents this
+	// refuses at INSERT/UPDATE time. ADR-0065 documents this
 	// trade-off explicitly under "What's deferred".
 	out.CheckConstraints = nil
 	return &out

@@ -3,7 +3,7 @@
 
 package mysql
 
-// ADR-0064 — Shape A recognized-shape catalog: CHECK constraint
+// ADR-0065 — Shape A recognized-shape catalog: CHECK constraint
 // changes (task #22). Per-shape DDL emit for MySQL 8.0+ (MySQL 5.7
 // silently ignored CHECKs — sluice supports 8.0+ where CHECK is
 // enforced).
@@ -24,7 +24,7 @@ import (
 )
 
 // AlterAddCheck implements [ir.ShapeDeltaApplier] for MySQL
-// (ADR-0064). Emits `ALTER TABLE <t> ADD CONSTRAINT <name>
+// (ADR-0065). Emits `ALTER TABLE <t> ADD CONSTRAINT <name>
 // CHECK (<expr>)` per constraint, detect-then-emit on
 // information_schema.CHECK_CONSTRAINTS for idempotency.
 func (w *SchemaWriter) AlterAddCheck(ctx context.Context, table *ir.Table, checks []*ir.CheckConstraint) error {
@@ -56,7 +56,7 @@ func (w *SchemaWriter) AlterAddCheck(ctx context.Context, table *ir.Table, check
 }
 
 // AlterDropCheck implements [ir.ShapeDeltaApplier] for MySQL
-// (ADR-0064). MySQL 8.0+ does not support `DROP CONSTRAINT IF
+// (ADR-0065). MySQL 8.0+ does not support `DROP CONSTRAINT IF
 // EXISTS` for CHECKs (added in 8.0.19's `DROP CHECK <name>` but
 // the IF EXISTS qualifier landed only in 8.0.29 and even then only
 // for some constraint kinds). Detect-then-DROP is the portable
@@ -86,7 +86,7 @@ func (w *SchemaWriter) AlterDropCheck(ctx context.Context, table *ir.Table, chec
 }
 
 // AlterModifyCheck implements [ir.ShapeDeltaApplier] for MySQL
-// (ADR-0064). Emits DROP + ADD; pre-flight refuse-loudly check on
+// (ADR-0065). Emits DROP + ADD; pre-flight refuse-loudly check on
 // the NEW expression fires BEFORE the DROP so an untranslatable
 // cross-dialect Expr doesn't leave the target without either
 // constraint.

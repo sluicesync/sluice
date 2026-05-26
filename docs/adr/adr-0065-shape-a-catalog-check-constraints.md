@@ -1,4 +1,4 @@
-# ADR-0064 — Shape A recognized-shape catalog: CHECK constraint changes
+# ADR-0065 — Shape A recognized-shape catalog: CHECK constraint changes
 
 **Status:** **Accepted (2026-05-26).** Extends ADR-0054's recognized-shape
 catalog (DP-E) with `ShapeKindAddCheck`, `ShapeKindDropCheck`, and

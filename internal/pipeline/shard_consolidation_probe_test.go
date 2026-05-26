@@ -546,7 +546,7 @@ func TestDispatchProbe_PropagatesError(t *testing.T) {
 }
 
 // ----------------------------------------------------------------
-// ADR-0064 — CHECK constraint classifier + dispatch tests.
+// ADR-0065 — CHECK constraint classifier + dispatch tests.
 // Pin the {ADD/DROP/MODIFY} × {simple/JSON/datetime} matrix per
 // CLAUDE.md's Bug 74 "pin the class, not the representative" rule.
 // ----------------------------------------------------------------

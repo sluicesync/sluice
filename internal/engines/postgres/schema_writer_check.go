@@ -3,7 +3,7 @@
 
 package postgres
 
-// ADR-0064 — Shape A recognized-shape catalog: CHECK constraint
+// ADR-0065 — Shape A recognized-shape catalog: CHECK constraint
 // changes (task #22). Per-shape DDL emit for PG.
 //
 // Each method is idempotent on the post-state via detect-then-emit
@@ -29,7 +29,7 @@ import (
 )
 
 // AlterAddCheck implements [ir.ShapeDeltaApplier] for Postgres
-// (ADR-0064). Emits `ALTER TABLE <t> ADD CONSTRAINT <name>
+// (ADR-0065). Emits `ALTER TABLE <t> ADD CONSTRAINT <name>
 // CHECK (<expr>)` per constraint. Detect-then-emit on
 // pg_constraint for idempotency. Cross-dialect Expr is routed
 // through translateCheckExpr; the pre-flight refuse-loudly check
@@ -70,7 +70,7 @@ func (w *SchemaWriter) AlterAddCheck(ctx context.Context, table *ir.Table, check
 }
 
 // AlterDropCheck implements [ir.ShapeDeltaApplier] for Postgres
-// (ADR-0064). PG supports `DROP CONSTRAINT IF EXISTS` natively
+// (ADR-0065). PG supports `DROP CONSTRAINT IF EXISTS` natively
 // (since 9.0), making the call idempotent across re-runs.
 func (w *SchemaWriter) AlterDropCheck(ctx context.Context, table *ir.Table, checks []*ir.CheckConstraint) error {
 	if len(checks) == 0 {
@@ -92,7 +92,7 @@ func (w *SchemaWriter) AlterDropCheck(ctx context.Context, table *ir.Table, chec
 }
 
 // AlterModifyCheck implements [ir.ShapeDeltaApplier] for Postgres
-// (ADR-0064). Neither PG nor MySQL supports in-place expression
+// (ADR-0065). Neither PG nor MySQL supports in-place expression
 // rewrite of an existing CHECK constraint without dropping +
 // re-adding. The applier emits a refuse-loudly pre-flight check on
 // the new constraint BEFORE the DROP fires so an untranslated

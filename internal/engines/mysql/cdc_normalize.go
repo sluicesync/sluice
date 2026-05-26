@@ -19,14 +19,14 @@ import "github.com/orware/sluice/internal/ir"
 // at [maybeSnapshotSchemaB1] builds a fresh `*ir.Table` carrying
 // only Schema / Name / Columns / PrimaryKey — no CheckConstraints.
 //
-// Without normalization, [pipeline.diffChecks] (ADR-0064 task #22
+// Without normalization, [pipeline.diffChecks] (ADR-0065 task #22
 // classifier extension) fires a false `ShapeKindDropCheck` on every
 // CDC boundary for any table that carries a CHECK constraint at
 // cold-start. The asymmetry is identical in shape to the PG
 // Bug 86 column-attribute fix; the normalizer makes the loss
 // explicit at the comparison surface.
 //
-// Trade-off (ADR-0064): live-coordination cannot detect CHECK
+// Trade-off (ADR-0065): live-coordination cannot detect CHECK
 // constraint shapes via CDC. Operators issuing constraint-only
 // DDL while live-coordination is engaged see the cold-start
 // SchemaReader land the change at the next snapshot boundary;
@@ -42,7 +42,7 @@ func (Engine) NormalizeForCDCComparison(t *ir.Table) *ir.Table {
 		return nil
 	}
 	out := *t
-	// ADR-0064: strip the constraint slices the CDC projection
+	// ADR-0065: strip the constraint slices the CDC projection
 	// cannot carry — see file-level docstring.
 	out.CheckConstraints = nil
 	return &out

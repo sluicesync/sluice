@@ -471,7 +471,7 @@ type ShapeDeltaApplier interface {
 
 	// AlterAddCheck issues `ALTER TABLE <table> ADD CONSTRAINT
 	// <name> CHECK (<expr>)` for each constraint in checks
-	// (ADR-0064). Idempotent on the post-state via detect-then-emit
+	// (ADR-0065). Idempotent on the post-state via detect-then-emit
 	// against the engine's CHECK catalog (pg_constraint /
 	// information_schema.CHECK_CONSTRAINTS) — neither engine
 	// reliably supports `ADD CONSTRAINT IF NOT EXISTS` in 8.0+ /
@@ -484,14 +484,14 @@ type ShapeDeltaApplier interface {
 	AlterAddCheck(ctx context.Context, table *Table, checks []*CheckConstraint) error
 
 	// AlterDropCheck issues `ALTER TABLE <table> DROP CONSTRAINT
-	// [IF EXISTS] <name>` for each constraint in checks (ADR-0064).
+	// [IF EXISTS] <name>` for each constraint in checks (ADR-0065).
 	// Idempotent: PG supports `DROP CONSTRAINT IF EXISTS` natively;
 	// MySQL implementations detect-then-DROP via
 	// information_schema.CHECK_CONSTRAINTS.
 	AlterDropCheck(ctx context.Context, table *Table, checks []*CheckConstraint) error
 
 	// AlterModifyCheck issues DROP + ADD against the same target
-	// for the modify-shape (ADR-0064). Neither engine supports an
+	// for the modify-shape (ADR-0065). Neither engine supports an
 	// in-place expression rewrite of an existing CHECK constraint
 	// without dropping and re-adding; the v1 implementation emits
 	// the DROP and ADD in sequence under the same applier method

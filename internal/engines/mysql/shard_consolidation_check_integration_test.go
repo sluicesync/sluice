@@ -3,7 +3,7 @@
 // Copyright 2026 Omar Ramos
 // SPDX-License-Identifier: Apache-2.0
 
-// Integration tests for the ADR-0064 CHECK constraint shape on MySQL
+// Integration tests for the ADR-0065 CHECK constraint shape on MySQL
 // 8.0+. CHECK is enforced by MySQL since 8.0.16; sluice supports
 // 8.0.x.
 

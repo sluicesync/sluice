@@ -3,7 +3,7 @@
 
 package mysql
 
-// ADR-0064 Shape A catalog expansion: CHECK constraint probes for
+// ADR-0065 Shape A catalog expansion: CHECK constraint probes for
 // the MySQL ChangeApplier (ADR-0054 §4 takeover-stream contract).
 
 import (
@@ -16,7 +16,7 @@ import (
 )
 
 // ProbeAddCheck implements [ir.ShardConsolidationProber] for MySQL
-// (ADR-0064). Applied when ALL named CHECK constraints exist on the
+// (ADR-0065). Applied when ALL named CHECK constraints exist on the
 // target; NotApplied when NONE exist; Inconsistent on partial.
 func (a *ChangeApplier) ProbeAddCheck(ctx context.Context, table *ir.Table, checks []*ir.CheckConstraint) (ir.ProbeOutcome, error) {
 	if len(checks) == 0 {

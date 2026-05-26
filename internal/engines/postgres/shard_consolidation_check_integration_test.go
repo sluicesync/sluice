@@ -3,7 +3,7 @@
 // Copyright 2026 Omar Ramos
 // SPDX-License-Identifier: Apache-2.0
 
-// Integration tests for the ADR-0064 CHECK constraint shape: full
+// Integration tests for the ADR-0065 CHECK constraint shape: full
 // classify → apply → probe loop on real PG 16 containers. Mirrors
 // the existing v0.78.0 RENAME COLUMN integration matrix.
 

@@ -92,18 +92,18 @@ const (
 
 	// ShapeKindAddCheck — one or more named CHECK constraints
 	// appear in post that are absent from pre; no other structural
-	// change. v1 catalog expansion per ADR-0064 (task #22 sub-task).
+	// change. v1 catalog expansion per ADR-0065 (task #22 sub-task).
 	ShapeKindAddCheck
 
 	// ShapeKindDropCheck — one or more named CHECK constraints from
 	// pre are absent in post; no other structural change. Per
-	// ADR-0064.
+	// ADR-0065.
 	ShapeKindDropCheck
 
 	// ShapeKindModifyCheck — exactly one same-named CHECK exists in
 	// both pre and post but its Expr text differs. The engine applies
 	// as DROP + ADD (neither PG nor MySQL supports in-place CHECK
-	// expression rewrite). Per ADR-0064.
+	// expression rewrite). Per ADR-0065.
 	ShapeKindModifyCheck
 
 	// ShapeKindUnrecognized — the delta doesn't fit a single
