@@ -509,6 +509,24 @@ func TestPhase2e_PG_StreamerHarness_3SourcesToTarget_ExactlyOnceApply(t *testing
 		phase2eApplyDDL(t, h.sourceDSNs[i], altSQL)
 	}
 
+	// Task #67: PG's pgoutput logical-decoding plugin does NOT decode
+	// DDL. A RelationMessage (which sluice intercepts as a
+	// SchemaSnapshot to drive BoundaryRouter) is emitted only when
+	// the next DML against the altered relation crosses the slot.
+	// Without a post-ALTER DML, the streamer's CDC reader never
+	// emits, the router never fires, and the column never lands on
+	// the target. This matches operational reality (any real
+	// workload produces DML after a DDL) and is a test-design fix —
+	// no production code change. Phase A diagnostic on PR #69
+	// confirmed 5 cold-start handoffs but 0 SchemaSnapshot arrivals
+	// across the 98s window between DDL and timeout. See
+	// docs/releases/task-65-phase-a-report.md.
+	for i := 0; i < 3; i++ {
+		phase2eApplyDDL(t, h.sourceDSNs[i], `
+			INSERT INTO users (email) VALUES ('`+phase2eShardLabels()[i]+`_postddl_trigger@example.com');
+		`)
+	}
+
 	// Wait for the column to land on the target. Exactly one DDL
 	// apply happens (the lease serializes them); the other 2 routers
 	// observe-and-record.
@@ -534,15 +552,20 @@ func TestPhase2e_PG_StreamerHarness_3SourcesToTarget_ExactlyOnceApply(t *testing
 		`)
 	}
 
-	// 6 rows total (3 seed + 3 post-DDL).
-	if !waitForPhase2eTargetCount(h.targetDSN, 6, 60*time.Second) {
+	// 9 rows total (3 seed + 3 post-ALTER trigger inserts from
+	// Phase C + 3 post-DDL inserts from this phase). The trigger
+	// inserts were necessary to make pgoutput emit a RelationMessage
+	// after the ALTER (PG's logical-decoding plugin doesn't decode
+	// DDL on its own — task #67).
+	if !waitForPhase2eTargetCount(h.targetDSN, 9, 60*time.Second) {
 		t.Fatalf("phase D: not all post-DDL rows landed on the target — CDC-resume-after-DDL " +
 			"on at least one shard didn't continue past the boundary")
 	}
 
-	// Each shard contributed exactly 2 rows (seed + post-DDL).
+	// Each shard contributed exactly 3 rows: seed + Phase C trigger
+	// insert + Phase D post-DDL insert.
 	assertPhase2eShardDistribution(t, h.targetDSN, map[string]int{
-		"shard_a": 2, "shard_b": 2, "shard_c": 2,
+		"shard_a": 3, "shard_b": 3, "shard_c": 3,
 	})
 
 	// Every post-DDL row has active=TRUE (the default landed correctly
@@ -626,6 +649,17 @@ func TestPhase2e_PG_StreamerHarness_RestartResumeAfterBoundary(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		phase2eApplyDDL(t, h.sourceDSNs[i], altSQL)
 	}
+	// Task #67: PG's pgoutput plugin doesn't decode DDL; without a
+	// post-ALTER DML on each source, the streamer's CDC reader
+	// never emits a RelationMessage / SchemaSnapshot, and the
+	// router never fires. Drive a tiny INSERT per source to
+	// trigger the relation-mapping emit. See task-65 Phase A
+	// report.
+	for i := 0; i < 2; i++ {
+		phase2eApplyDDL(t, h.sourceDSNs[i], `
+			INSERT INTO users (email) VALUES ('`+phase2eShardLabels()[i]+`_postddl_trigger@example.com');
+		`)
+	}
 	if !waitForPhase2eTargetColumn(t, h.targetDSN, "active", 90*time.Second) {
 		cancelA()
 		<-runErrA
@@ -671,8 +705,9 @@ func TestPhase2e_PG_StreamerHarness_RestartResumeAfterBoundary(t *testing.T) {
 	}()
 
 	// The new shard_a row lands on the target. Total: 2 seed rows
-	// (shard_a + shard_b) + 1 post-restart shard_a row = 3.
-	if !waitForPhase2eTargetCount(h.targetDSN, 3, 60*time.Second) {
+	// (shard_a + shard_b) + 2 Phase-B trigger inserts (per task
+	// #67) + 1 post-restart shard_a row = 5.
+	if !waitForPhase2eTargetCount(h.targetDSN, 5, 60*time.Second) {
 		t.Fatalf("phase D: post-restart shard_a row never landed — warm-resume CDC didn't fire")
 	}
 
