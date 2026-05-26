@@ -126,10 +126,30 @@ func (r *BoundaryRouter) RouteBoundary(
 	schemaVersion int64,
 	anchor ir.Position,
 ) error {
+	// Phase A instrumentation (task #65): log every decision point in
+	// the BoundaryRouter routing/observe-flow to gather ground truth
+	// on the MySQL takeover + PG streamer-harness failures. Remove
+	// once Phase B fix lands.
+	slog.DebugContext(
+		ctx, "phase-a: RouteBoundary entry",
+		"table", tableName,
+		"stream_id", r.mgr.streamID,
+		"ddl_text", ddlText,
+		"schema_version", schemaVersion,
+		"pre_nil", pre == nil,
+		"post_nil", post == nil,
+	)
 	shape, err := ClassifyShape(pre, post)
 	if err != nil {
+		slog.DebugContext(ctx, "phase-a: ClassifyShape err", "err", err)
 		return fmt.Errorf("pipeline: route boundary: %w. %s", err, RecoveryHint(tableName))
 	}
+	slog.DebugContext(
+		ctx, "phase-a: ClassifyShape ok",
+		"table", tableName,
+		"stream_id", r.mgr.streamID,
+		"shape_kind", shape.Kind.String(),
+	)
 	if shape.Kind == ShapeKindNone {
 		slog.DebugContext(
 			ctx, "shard consolidation boundary: no-op (no structural change)",
@@ -142,6 +162,34 @@ func (r *BoundaryRouter) RouteBoundary(
 	checksum := ChecksumDDLText(ddlText)
 
 	lease, err := r.mgr.Acquire(ctx, tableName, ddlText)
+	// Phase A: log post-Acquire decision branch.
+	switch {
+	case err == nil:
+		takeover := false
+		if lease != nil {
+			takeover = lease.Takeover()
+		}
+		slog.DebugContext(
+			ctx, "phase-a: Acquire ok",
+			"table", tableName,
+			"stream_id", r.mgr.streamID,
+			"takeover", takeover,
+		)
+	case errors.Is(err, ErrLeaseContended):
+		slog.DebugContext(
+			ctx, "phase-a: Acquire returned ErrLeaseContended",
+			"table", tableName,
+			"stream_id", r.mgr.streamID,
+			"err", err.Error(),
+		)
+	default:
+		slog.DebugContext(
+			ctx, "phase-a: Acquire returned other err",
+			"table", tableName,
+			"stream_id", r.mgr.streamID,
+			"err", err.Error(),
+		)
+	}
 	switch {
 	case err == nil:
 		return r.handleHeldLease(ctx, lease, post, shape, ddlText, checksum, schemaVersion, anchor)
@@ -166,6 +214,14 @@ func (r *BoundaryRouter) handleHeldLease(
 	schemaVersion int64,
 	anchor ir.Position,
 ) (retErr error) {
+	// Phase A instrumentation (task #65).
+	slog.DebugContext(
+		ctx, "phase-a: handleHeldLease entry",
+		"table", lease.tableName,
+		"stream_id", r.mgr.streamID,
+		"takeover", lease.Takeover(),
+		"shape_kind", shape.Kind.String(),
+	)
 	defer func() {
 		if retErr != nil {
 			// On any error, release the lease so it expires on TTL
@@ -186,6 +242,15 @@ func (r *BoundaryRouter) handleHeldLease(
 	// Takeover path: probe the target schema for the prior holder's
 	// recorded effect. Three outcomes per ADR-0054 §4.
 	outcome, err := DispatchProbe(ctx, r.prober, post, shape)
+	// Phase A instrumentation: log probe outcome.
+	slog.DebugContext(
+		ctx, "phase-a: DispatchProbe done",
+		"table", lease.tableName,
+		"stream_id", r.mgr.streamID,
+		"shape_kind", shape.Kind.String(),
+		"outcome", int(outcome),
+		"err", fmt.Sprintf("%v", err),
+	)
 	if err != nil {
 		return fmt.Errorf("pipeline: route boundary: probe %s: %w. %s",
 			shape.Kind, err, RecoveryHint(lease.tableName))
@@ -271,11 +336,29 @@ func (r *BoundaryRouter) applyShape(ctx context.Context, post *ir.Table, shape S
 // recovery flow (drained model) is the loud-failure path.
 func (r *BoundaryRouter) observeUntilApplied(ctx context.Context, tableName, ourChecksum, ourDDLText string) error {
 	deadline := time.Now().Add(r.observeTimeout)
+	slog.DebugContext(
+		ctx, "phase-a: observeUntilApplied entry",
+		"table", tableName,
+		"stream_id", r.mgr.streamID,
+		"our_checksum", ourChecksum,
+		"deadline", deadline.Format(time.RFC3339),
+		"observe_timeout", r.observeTimeout.String(),
+	)
 	for {
 		obs, err := r.mgr.Observe(ctx, tableName)
 		if err != nil {
 			return fmt.Errorf("pipeline: observe lease %q: %w", tableName, err)
 		}
+		slog.DebugContext(
+			ctx, "phase-a: observe loop iteration",
+			"table", tableName,
+			"stream_id", r.mgr.streamID,
+			"obs_state", obs.State.String(),
+			"obs_holder", obs.HolderStreamID,
+			"obs_ddl_checksum", obs.DDLChecksum,
+			"obs_expires_at", obs.ExpiresAt.Format(time.RFC3339),
+			"time_remaining", time.Until(deadline).String(),
+		)
 		switch obs.State {
 		case LeaseStateApplied:
 			if obs.DDLChecksum == ourChecksum {

@@ -434,13 +434,39 @@ func (m *LeaseManager) Acquire(ctx context.Context, tableName, ddlText string) (
 		return nil, errors.New("pipeline: LeaseManager.Acquire: tableName is empty")
 	}
 
+	// Phase A instrumentation (task #65).
+	slog.DebugContext(
+		ctx, "phase-a: lease Acquire entry",
+		"table", tableName,
+		"stream_id", m.streamID,
+		"ddl_text", ddlText,
+	)
 	expires := m.now().Add(m.cfg.LeaseDuration)
 	acquired, current, err := m.store.TryAcquireLease(ctx, tableName, m.streamID, expires)
 	if err != nil {
 		return nil, fmt.Errorf("pipeline: lease acquire %q: %w", tableName, err)
 	}
+	// Phase A: log TryAcquireLease result + observed row state.
+	slog.DebugContext(
+		ctx, "phase-a: TryAcquireLease result",
+		"table", tableName,
+		"stream_id", m.streamID,
+		"acquired", acquired,
+		"current_holder", current.LeaseHolderStreamID,
+		"current_has_expires", current.HasLeaseExpiresAt,
+		"current_expires_at", current.LeaseExpiresAt.Format(time.RFC3339),
+		"current_ddl_text", current.DDLText,
+		"current_has_applied_at", current.HasAppliedAt,
+		"current_applied_at", current.AppliedAt.Format(time.RFC3339),
+	)
 	if !acquired {
 		state := classifyLeaseRow(current, m.now())
+		slog.DebugContext(
+			ctx, "phase-a: TryAcquireLease NOT acquired (contended)",
+			"table", tableName,
+			"stream_id", m.streamID,
+			"classified_state", state.String(),
+		)
 		return nil, fmt.Errorf("%w: lease for %q is %s (holder %q expires %s)",
 			ErrLeaseContended, tableName, state, current.LeaseHolderStreamID, current.LeaseExpiresAt.Format(time.RFC3339))
 	}
@@ -461,10 +487,28 @@ func (m *LeaseManager) Acquire(ctx context.Context, tableName, ddlText string) (
 	if takeover {
 		priorDDLText = current.DDLText
 	}
+	slog.DebugContext(
+		ctx, "phase-a: takeover decision",
+		"table", tableName,
+		"stream_id", m.streamID,
+		"takeover", takeover,
+		"prior_ddl_text", priorDDLText,
+		"new_ddl_text", ddlText,
+		"ddl_text_equal", priorDDLText == ddlText,
+	)
 	if ddlText != "" {
-		if recorded, err := m.store.RecordDDLText(ctx, tableName, m.streamID, ddlText); err != nil {
+		recorded, err := m.store.RecordDDLText(ctx, tableName, m.streamID, ddlText)
+		slog.DebugContext(
+			ctx, "phase-a: RecordDDLText result",
+			"table", tableName,
+			"stream_id", m.streamID,
+			"recorded", recorded,
+			"err", fmt.Sprintf("%v", err),
+		)
+		if err != nil {
 			return nil, fmt.Errorf("pipeline: lease record ddl %q: %w", tableName, err)
-		} else if !recorded {
+		}
+		if !recorded {
 			return nil, fmt.Errorf("%w: lease for %q taken over between acquire and ddl-record",
 				ErrLeaseContended, tableName)
 		}
@@ -594,14 +638,17 @@ func (m *LeaseManager) Release(_ context.Context, l *Lease) {
 // loudly. Tolerant of the row being absent (returns
 // LeaseStateAbsent).
 func (m *LeaseManager) Observe(ctx context.Context, tableName string) (LeaseObservation, error) {
+	// Phase A instrumentation (task #65).
+	slog.DebugContext(ctx, "phase-a: Observe entry", "table", tableName, "stream_id", m.streamID)
 	row, ok, err := m.store.ObserveLease(ctx, tableName)
 	if err != nil {
 		return LeaseObservation{}, fmt.Errorf("pipeline: lease observe %q: %w", tableName, err)
 	}
 	if !ok {
+		slog.DebugContext(ctx, "phase-a: Observe row absent", "table", tableName, "stream_id", m.streamID)
 		return LeaseObservation{State: LeaseStateAbsent}, nil
 	}
-	return LeaseObservation{
+	obs := LeaseObservation{
 		State:                classifyLeaseRow(row, m.now()),
 		HolderStreamID:       row.LeaseHolderStreamID,
 		ExpiresAt:            row.LeaseExpiresAt,
@@ -609,7 +656,18 @@ func (m *LeaseManager) Observe(ctx context.Context, tableName string) (LeaseObse
 		DDLChecksum:          row.DDLChecksum,
 		AppliedSchemaVersion: row.AppliedSchemaVersion,
 		AppliedAt:            row.AppliedAt,
-	}, nil
+	}
+	slog.DebugContext(
+		ctx, "phase-a: Observe exit",
+		"table", tableName,
+		"stream_id", m.streamID,
+		"state", obs.State.String(),
+		"holder", obs.HolderStreamID,
+		"expires_at", obs.ExpiresAt.Format(time.RFC3339),
+		"ddl_checksum", obs.DDLChecksum,
+		"applied_at_set", row.HasAppliedAt,
+	)
+	return obs, nil
 }
 
 // classifyLeaseRow maps a loaded row to its LeaseState given the

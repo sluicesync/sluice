@@ -123,6 +123,15 @@ func interceptSchemaSnapshotsForCoordination(
 					}
 					continue
 				}
+				// Phase A instrumentation (task #65): log every
+				// SchemaSnapshot arrival on the intercept so we can
+				// correlate "DDL fired on source" with "intercept saw
+				// the boundary".
+				slog.DebugContext(
+					ctx, "phase-a: intercept received SchemaSnapshot",
+					"table", snap.QualifiedName(),
+					"column_count", len(snap.IR.Columns),
+				)
 				key := snap.QualifiedName()
 				pre, hadPre, preKey := lookupSeedCache(cache, key, snap.Table)
 				// Promote the seed entry to the qualified key when the
