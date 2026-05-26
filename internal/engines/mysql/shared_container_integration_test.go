@@ -72,12 +72,18 @@ type sharedMySQLState struct {
 
 var sharedMySQL sharedMySQLState
 
-// sharedMySQLBootTimeout is generous: cold-start of mysql:8.0 with
-// binlog enabled occasionally takes ~30 s on CI, plus image-pull on
-// the first run of a fresh runner can add another minute. The same
-// 2-minute budget the per-test helpers used pre-refactor — applied
-// per attempt of the retry loop (see sharedMySQLBootAttempts).
-const sharedMySQLBootTimeout = 2 * time.Minute
+// sharedMySQLBootTimeout: per-attempt budget for the testcontainers
+// MySQL boot. Bumped from 2min to 4min in task #69 after CI logs on
+// the self-hosted runner pool showed every failed attempt hitting
+// the 2-minute `wait until ready: "port: 3306 ... matched 0 times"`
+// deadline, while successful attempts in the same runs took ~50s.
+// Root cause is disk-I/O contention when multiple integration
+// shards boot MySQL containers concurrently against the same
+// `/var/lib/docker` — MySQL init writes 50-100MB during cold boot
+// and slow attempts can stretch past 2min under load. 4min absorbs
+// load spikes without unbounded budget growth. Pre-baked images
+// would eliminate the contention entirely (follow-up task #68).
+const sharedMySQLBootTimeout = 4 * time.Minute
 
 // sharedMySQLBootAttempts is the total number of attempts the retry
 // loop in ensureSharedMySQL will make before giving up. Bumped from
@@ -90,10 +96,14 @@ const sharedMySQLBootTimeout = 2 * time.Minute
 //
 //	5 * sharedMySQLBootTimeout (per-attempt budget)
 //	  + 30s + 60s + 120s + 240s
-//	= 5 * 2min + 7.5min
-//	= ~17.5 min
+//	= 5 * 4min + 7.5min
+//	= ~27.5 min
 //
-// still under the CI 30-minute shard timeout, and the marginal cost
+// (task #69 bumped per-attempt budget 2min → 4min; cumulative
+// worst-case grew from 17.5 → 27.5 min, still under the 45m outer
+// integration-job timeout — the shared TestMain is single-boot per
+// shard, so the budget growth doesn't multiply by test count.)
+// Still under the CI shard timeout, and the marginal cost
 // vs. 3 attempts is paid only when the runner is sick (a few
 // minutes once a release cycle, vs. a full CI rerun without it).
 //

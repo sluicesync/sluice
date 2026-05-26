@@ -16,13 +16,18 @@
 // followed by `context deadline exceeded`. A rerun was clean.
 //
 // Retry shape mirrors task #60: 3 attempts with 30s/60s backoff
-// between, per-attempt budget of 2 minutes (matches the original
-// single-shot timeout). Worst-case wall time:
+// between, per-attempt budget of 4 minutes. Bumped from 2 minutes
+// in task #69 after CI logs showed every failed boot attempt was
+// hitting the 2-minute testcontainers wait-until-ready deadline on
+// the self-hosted runner pool — successful attempts in the same
+// runs took ~50s but slow attempts could exceed 2min under disk-I/O
+// contention from concurrent shards. 4min gives load-spike headroom
+// without unbounded budget growth. Worst-case wall time:
 //
-//	3 * 2min + 30s + 60s = ~7.5min
+//	3 * 4min + 30s + 60s = ~13.5min
 //
-// well under the CI shard timeout. Callers replace the previous
-// pattern
+// well under the CI shard timeout (75min go-test inner). Callers
+// replace the previous pattern
 //
 //	testcontainers.SkipIfProviderIsNotHealthy(t)
 //	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
@@ -67,7 +72,7 @@ const (
 	// per-test wrappers here multiply by ~20 tests, so the 3-attempt
 	// cap is the right setting for this layer.
 	mysqlBootAttempts = 3
-	mysqlBootTimeout  = 2 * time.Minute
+	mysqlBootTimeout  = 4 * time.Minute
 )
 
 // mysqlBootBackoff returns the sleep duration between a failed boot
