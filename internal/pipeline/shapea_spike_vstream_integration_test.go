@@ -166,18 +166,14 @@ func truncate(s string, n int) string {
 
 func startMySQLTarget(t *testing.T) (dsn string, cleanup func()) {
 	t.Helper()
-	testcontainers.SkipIfProviderIsNotHealthy(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
-	defer cancel()
-	c, err := mysqltc.Run(
-		ctx, "mysql:8.0",
+	c := runMySQLWithRetry(
+		t,
 		mysqltc.WithDatabase("warehouse"),
 		mysqltc.WithUsername("root"),
 		mysqltc.WithPassword("rootpw"),
 	)
-	if err != nil {
-		t.Fatalf("start mysql target: %v", err)
-	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
 	term := func() {
 		sd, cc := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cc()

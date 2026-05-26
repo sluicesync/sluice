@@ -60,14 +60,9 @@ import (
 // behaviour identical across the matrix cells.
 func startMySQLBinlogWithRowImage(t *testing.T, rowImage string) (sourceDSN, targetDSN string, cleanup func()) {
 	t.Helper()
-	testcontainers.SkipIfProviderIsNotHealthy(t)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-
-	container, err := mysqltc.Run(
-		ctx,
-		"mysql:8.0",
+	container := runMySQLWithRetry(
+		t,
 		mysqltc.WithDatabase("source_db"),
 		mysqltc.WithUsername("root"),
 		mysqltc.WithPassword("rootpw"),
@@ -85,9 +80,9 @@ func startMySQLBinlogWithRowImage(t *testing.T, rowImage string) (sourceDSN, tar
 			},
 		}),
 	)
-	if err != nil {
-		t.Fatalf("start container (row-image=%s): %v", rowImage, err)
-	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
 
 	terminate := func() {
 		shutdown, c := context.WithTimeout(context.Background(), 30*time.Second)
