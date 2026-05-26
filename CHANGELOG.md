@@ -6,9 +6,23 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.84.0] - 2026-05-26
+
 ### Added
 
 - **`feat(engines/postgres,engines/mysql,ir): task #52 sub-deliverables 2 + 3 — RLS IR capture + emit (ADR-0063)`** — closes the "target schema arrives without policies" silent-security-regression class (failure mode 3 of five enumerated in task #52). PG `SchemaReader` now captures `pg_class.relrowsecurity` / `relforcerowsecurity` and every `pg_policies` row into the IR (`ir.Table.RLSEnabled` / `RLSForced` / `Policies`); PG `SchemaWriter` re-emits `ALTER TABLE … ENABLE ROW LEVEL SECURITY` (+ `FORCE`) and `CREATE POLICY` for each policy on the target, in that order (ENABLE before CREATE POLICY — without ENABLE the policies are defined but inert). Cross-engine PG → MySQL writer logs exactly one WARN per stream naming affected tables (MySQL has no RLS surface — operators routing PG → MySQL accept the policy-layer drop). MySQL → PG is a no-op (MySQL sources never populate the new IR fields). Sub-deliverable 1 (RLS preflight) shipped earlier in v0.78.4; this lands sub-deliverables 2 + 3 to complete the failure-mode-3 fix. Bug-74-style class-pin coverage: integration test exercises Command × Permissive × USING/CHECK × ENABLE/FORCE matrix end-to-end on a real PG container.
+
+- **`docs(task #50): use-cases + cutover + comparison + copywriting-guardrails (F20 + F21 + F15 + F22)`** — Marketing/positioning bundle. `docs/use-cases.md` names four concrete operator scenarios (managed-PG upgrades, cross-cloud migration, MySQL ↔ PG consolidation, logical-CDC backups). `docs/cutover.md` is the operator companion to ADR-0062 — when to run `sluice cutover`, refuse-loudly classes, procedural rollback shapes. `docs/comparison.md` is the longer-form per-row companion to the README's matrix. `docs/dev/copywriting-guardrails.md` codifies F22: claim only what the loud-failure machinery enforces.
+
+- **`docs(readme): rewrite around HVR-class positioning + Heroku scope statement (F50)`** — README rewrites the hero around "Open-source HVR-class CDC for MySQL ↔ Postgres". New "When NOT to use sluice" section names Heroku Postgres, one-off same-engine snapshots, logical-decoding-to-applications, and versioned-schema-migration tooling as explicit non-fits.
+
+### Fixed — CI hardening
+
+- **`test(engines/mysql): task #60 — retry-with-backoff on shared TestMain boot`** — engines/mysql shared TestMain container now retries `mysqltc.Run` with backoff on `wait until ready` failures.
+
+- **`test(pipeline): task #63 — retry-with-backoff on per-test MySQL boots`** — pipeline package gets `runMySQLWithRetry(t, opts...)` helper applied to all 7 `startMySQL*` helpers.
+
+- **`test(engines/mysql,pipeline): task #12 — bump retry attempts 3 → 5 + wrap GTID per-test boot`** — Bumps both shared TestMain and pipeline wrapper from 3 to 5 attempts (schedule: 30s / 60s / 120s / 240s), and wraps the engines/mysql `startMySQLGTIDForCDC` per-test boot which previously bypassed task #60's retry by design. Closes the in_progress portion of task #12 (TestCDCReader_GTIDPositionLoss_DetectedLoud + TestAddTable_LiveMode_MySQL_UnderLoad flake class).
 
 ## [0.83.0] - 2026-05-25
 
