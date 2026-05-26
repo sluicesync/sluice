@@ -36,9 +36,12 @@ import (
 // shape: prime once → expect "primed" actions; prime again → expect
 // "noop" actions without regressing the target.
 func TestCutoverSequencePrimer_PG_PrimesPlusIdempotent(t *testing.T) {
-	srcDSN, srcCleanup := startPostgres(t)
+	// Distinct database names so the shared-container reset doesn't
+	// collide the second helper call onto the first's database (the
+	// MySQL #56 pattern). See shared_container_integration_test.go.
+	srcDSN, srcCleanup := newSharedPGDB(t, "sluice_cutover_src")
 	defer srcCleanup()
-	tgtDSN, tgtCleanup := startPostgres(t)
+	tgtDSN, tgtCleanup := newSharedPGDB(t, "sluice_cutover_tgt")
 	defer tgtCleanup()
 
 	// Source: id GENERATED IDENTITY, INSERT rows so source sequence
@@ -151,9 +154,9 @@ func TestCutoverSequencePrimer_PG_PrimesPlusIdempotent(t *testing.T) {
 // more than the idempotency tolerance, the primer returns
 // ErrCutoverSequenceTargetAhead and the action's Outcome is "refused".
 func TestCutoverSequencePrimer_PG_RefusesTargetAhead(t *testing.T) {
-	srcDSN, srcCleanup := startPostgres(t)
+	srcDSN, srcCleanup := newSharedPGDB(t, "sluice_cutover_refusal_src")
 	defer srcCleanup()
-	tgtDSN, tgtCleanup := startPostgres(t)
+	tgtDSN, tgtCleanup := newSharedPGDB(t, "sluice_cutover_refusal_tgt")
 	defer tgtCleanup()
 
 	// Source: id GENERATED IDENTITY, 5 rows.
@@ -211,9 +214,9 @@ func TestCutoverSequencePrimer_PG_RefusesTargetAhead(t *testing.T) {
 // from the source-side read (no entry in states) and yields no action
 // on the target.
 func TestCutoverSequencePrimer_PG_SkipsCompositePK(t *testing.T) {
-	srcDSN, srcCleanup := startPostgres(t)
+	srcDSN, srcCleanup := newSharedPGDB(t, "sluice_cutover_skip_src")
 	defer srcCleanup()
-	tgtDSN, tgtCleanup := startPostgres(t)
+	tgtDSN, tgtCleanup := newSharedPGDB(t, "sluice_cutover_skip_tgt")
 	defer tgtCleanup()
 
 	applyDDL(t, srcDSN, `

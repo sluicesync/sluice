@@ -19,42 +19,15 @@ import (
 	"time"
 
 	"github.com/orware/sluice/internal/ir"
-
-	"github.com/testcontainers/testcontainers-go"
-	pgtc "github.com/testcontainers/testcontainers-go/modules/postgres"
 )
 
+// startPostgres returns a DSN pointed at a freshly-reset database on
+// the shared PG container booted by TestMain (see
+// shared_container_integration_test.go). The cleanup is a no-op;
+// container teardown is owned by TestMain.
 func startPostgres(t *testing.T) (dsn string, cleanup func()) {
 	t.Helper()
-	testcontainers.SkipIfProviderIsNotHealthy(t)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-
-	container, err := pgtc.Run(
-		ctx,
-		"postgres:16",
-		pgtc.WithDatabase("sluice_test"),
-		pgtc.WithUsername("test"),
-		pgtc.WithPassword("test"),
-		pgtc.BasicWaitStrategies(),
-	)
-	if err != nil {
-		t.Fatalf("start container: %v", err)
-	}
-
-	conn, err := container.ConnectionString(ctx, "sslmode=disable")
-	if err != nil {
-		_ = container.Terminate(context.Background())
-		t.Fatalf("connection string: %v", err)
-	}
-
-	cleanup = func() {
-		shutdown, c := context.WithTimeout(context.Background(), 30*time.Second)
-		defer c()
-		_ = container.Terminate(shutdown)
-	}
-	return conn, cleanup
+	return newSharedPGDB(t, "sluice_test")
 }
 
 // applyDDL runs a possibly-multi-statement DDL block against the
