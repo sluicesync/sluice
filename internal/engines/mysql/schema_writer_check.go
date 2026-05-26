@@ -145,23 +145,30 @@ var untranslatedPGToMySQLTokens = []string{
 }
 
 // refuseUntranslatedCheckExprMySQL returns a refuse-loudly error
-// when the post-translation CHECK Expr text contains a well-known
-// PG-only token that MySQL cannot parse. Only fires on
-// cross-dialect cases (chk.ExprDialect != "" and != "mysql").
+// when either the SOURCE CHECK Expr text or the POST-translation
+// text contains a well-known PG-only token that MySQL cannot
+// reliably execute. Only fires on cross-dialect cases
+// (chk.ExprDialect != "" and != "mysql"). Mirrors the PG-side
+// fix — checking input catches the case where the translator
+// produces a MySQL idiom with subtle semantic differences (and
+// would otherwise let SQL through that fails at runtime with a
+// generic MySQL parse error rather than sluice's actionable
+// refuse-loudly + --expr-override hint).
 func refuseUntranslatedCheckExprMySQL(chk *ir.CheckConstraint, exprText string) error {
 	if chk == nil || chk.ExprDialect == "" || chk.ExprDialect == dialectName {
 		return nil
 	}
-	lower := strings.ToLower(exprText)
+	lowerInput := strings.ToLower(chk.Expr)
+	lowerOutput := strings.ToLower(exprText)
 	for _, tok := range untranslatedPGToMySQLTokens {
-		if strings.Contains(lower, tok) {
+		if strings.Contains(lowerInput, tok) || strings.Contains(lowerOutput, tok) {
 			return fmt.Errorf(
 				"refuse loudly: CHECK constraint %q expression carries untranslated "+
-					"%s-dialect token %q in cross-engine apply (post-translation expr: %q). "+
+					"%s-dialect token %q in cross-engine apply (source expr: %q, post-translation expr: %q). "+
 					"Operator recovery: drop the source-side change and re-issue with "+
 					"--expr-override=<constraint-name>=<mysql-equivalent-expr>, OR run "+
 					"the drained model (sluice sync stop --wait / migrate / start --resume)",
-				chk.Name, chk.ExprDialect, tok, exprText,
+				chk.Name, chk.ExprDialect, tok, chk.Expr, exprText,
 			)
 		}
 	}

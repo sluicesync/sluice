@@ -170,24 +170,38 @@ var untranslatedMySQLToPGTokens = []string{
 }
 
 // refuseUntranslatedCheckExprPG returns a refuse-loudly error when
-// the post-translation CHECK Expr text contains a well-known
-// MySQL-only token that PG cannot parse. Only fires on
-// cross-dialect cases (chk.ExprDialect != "" and != "postgres");
-// same-dialect Exprs (PG → PG or untagged) pass through unchanged.
+// either the SOURCE CHECK Expr text or the POST-translation text
+// contains a well-known MySQL-only token that PG cannot reliably
+// execute. Only fires on cross-dialect cases (chk.ExprDialect != ""
+// and != "postgres"); same-dialect Exprs (PG → PG or untagged) pass
+// through unchanged.
+//
+// Checking BOTH input and output catches two failure modes:
+//
+//  1. Translator doesn't recognise the token and passes it through
+//     verbatim — output still contains the MySQL token.
+//  2. Translator recognises the token and produces a PG idiom, but
+//     the idiom has subtle semantic differences (e.g. `json_extract`
+//     → `::json->'k'` casting that fails at runtime against JSONB
+//     columns with PG error 22P02). Without the input-side check we
+//     would emit SQL that PG rejects with a generic SQLSTATE; the
+//     refuse-loudly with `--expr-override` hint is the operator-
+//     actionable signal we want first.
 func refuseUntranslatedCheckExprPG(chk *ir.CheckConstraint, exprText string) error {
 	if chk == nil || chk.ExprDialect == "" || chk.ExprDialect == dialectName {
 		return nil
 	}
-	lower := strings.ToLower(exprText)
+	lowerInput := strings.ToLower(chk.Expr)
+	lowerOutput := strings.ToLower(exprText)
 	for _, tok := range untranslatedMySQLToPGTokens {
-		if strings.Contains(lower, tok) {
+		if strings.Contains(lowerInput, tok) || strings.Contains(lowerOutput, tok) {
 			return fmt.Errorf(
 				"refuse loudly: CHECK constraint %q expression carries untranslated "+
-					"%s-dialect token %q in cross-engine apply (post-translation expr: %q). "+
+					"%s-dialect token %q in cross-engine apply (source expr: %q, post-translation expr: %q). "+
 					"Operator recovery: drop the source-side change and re-issue with "+
 					"--expr-override=<constraint-name>=<pg-equivalent-expr>, OR run "+
 					"the drained model (sluice sync stop --wait / migrate / start --resume)",
-				chk.Name, chk.ExprDialect, tok, exprText,
+				chk.Name, chk.ExprDialect, tok, chk.Expr, exprText,
 			)
 		}
 	}
