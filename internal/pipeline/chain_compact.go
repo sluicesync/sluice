@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"sort"
 	"strings"
 	"time"
 
@@ -104,6 +105,17 @@ type CompactOpts struct {
 	// rewriting lineage.json.
 	DryRun bool
 
+	// SmartCompaction enables ADR-0064 §14e event-level collapsing
+	// over each merge group's staged change-chunks. When false (the
+	// v1 default), naive byte-level concat applies and chunks are
+	// moved verbatim. See ADR-0064.
+	SmartCompaction bool
+
+	// PKStrategy controls how smart compaction identifies "the same
+	// row" across CDC events. Empty resolves to [PKStrategyPK]. Has
+	// no effect when SmartCompaction is false.
+	PKStrategy PKStrategy
+
 	// Now overrides the wall-clock source. Used by tests to make the
 	// merged-segment CappedAt + UpdatedAt deterministic.
 	Now func() time.Time
@@ -130,12 +142,36 @@ type CompactResult struct {
 	SegmentsRemoved int
 
 	// BytesBefore / BytesAfter are the summed chunk-byte totals before
-	// and after compact. The arithmetic identity is BytesBefore ==
-	// BytesAfter on naive compact (we move bytes, never rewrite them);
-	// the field pair is exposed so a future event-level compactor can
-	// report a real savings figure under the same result shape.
+	// and after compact. Under naive compact BytesBefore == BytesAfter
+	// (bytes are moved, never rewritten). Under smart compact (ADR-0064)
+	// BytesAfter < BytesBefore because the rewritten change-chunks
+	// drop the collapsed-out events' bytes.
 	BytesBefore int64
 	BytesAfter  int64
+
+	// EventsBefore / EventsAfter are ADR-0064 §9 per-row event tallies
+	// summed across every merged group. Both zero under naive compact
+	// (it doesn't decode events). Under smart compact:
+	//   EventsBefore = INSERT/UPDATE/DELETE/TRUNCATE count in the
+	//                  source chunks
+	//   EventsAfter  = same count after the policy-table collapse
+	//   EventsCollapsed = EventsBefore - EventsAfter
+	EventsBefore    int64
+	EventsAfter     int64
+	EventsCollapsed int64
+
+	// RowsCollapsed is the count of distinct (schema, table,
+	// PK-tuple) keys whose accumulator had >1 event (collapse
+	// candidates). Zero under naive compact.
+	RowsCollapsed int64
+
+	// TablesWithoutPK is the sorted list of "schema.table"
+	// references that smart compact skipped because the table has
+	// no declared PK; their events passed through verbatim under
+	// the naive fall-through path (ADR-0064 §4). Empty under naive
+	// compact AND under smart compact when every touched table has
+	// a PK.
+	TablesWithoutPK []string
 
 	// Plan is the per-group breakdown — populated under DryRun (the
 	// reporting-only path) AND under real compact (so callers can log
@@ -167,6 +203,20 @@ type CompactPlanGroup struct {
 	// BytesEstimate is the sum of source chunk bytes the merge moves.
 	// Always EQUALS the merged segment's BytesAfter on naive compact.
 	BytesEstimate int64
+
+	// EventsBefore / EventsAfter / EventsCollapsed / RowsCollapsed
+	// are ADR-0064 §9 per-group event tallies. Zero under naive
+	// compact and under size-1 (skipped) groups. See CompactResult
+	// for field semantics.
+	EventsBefore    int64
+	EventsAfter     int64
+	EventsCollapsed int64
+	RowsCollapsed   int64
+
+	// TablesWithoutPK lists "schema.table" refs smart compact skipped
+	// in this group. Empty for naive compact and for groups where
+	// every touched table has a PK.
+	TablesWithoutPK []string
 }
 
 // compactStagingDirPrefix is the on-disk marker for a mid-compact
@@ -367,6 +417,8 @@ func CompactChain(ctx context.Context, store ir.BackupStore, opts CompactOpts) (
 		)
 	}
 
+	smartPK := resolvePKStrategy(opts.PKStrategy)
+	tablesWithoutPK := make(map[string]struct{})
 	for i := range planned {
 		pg := &planned[i]
 		if pg.plan.MergedSegmentID == "" {
@@ -375,6 +427,67 @@ func CompactChain(ctx context.Context, store ir.BackupStore, opts CompactOpts) (
 		if err := executeMergeGroup(ctx, store, eligible, pg); err != nil {
 			return nil, fmt.Errorf("backup compact: merge group %s: %w", pg.plan.MergedSegmentID, err)
 		}
+		if !opts.SmartCompaction {
+			continue
+		}
+		// Smart compaction (ADR-0064 §14e) — rewrite the merged
+		// segment's change-chunks in place to collapse same-row
+		// event chains. Runs AFTER the staging→final rename so the
+		// chunks live at their final paths; pre-catalog-swap so a
+		// crash here leaves the merged segment authoritative-but-
+		// pre-compact (the catalog still references the sources).
+		mergedStore := newPrefixedStore(store, pg.plan.MergedSegmentDir)
+		codec := eligible[pg.span[0].idx].codecOrDefault()
+		// Encryption CEK: smart compaction needs to decrypt + re-
+		// encrypt under the segment's keyset. v1 keeps parity with
+		// the naive path's "no re-encryption" stance by REFUSING
+		// when the segment is encrypted — the operator must
+		// disable smart compaction (--smart-compaction-off) for
+		// encrypted chains until cross-keyset event-level recompaction
+		// is designed (a follow-on chunk). Plaintext chains (the
+		// common case for local-FS DR archives) flow through.
+		if span0Enc := pg.span[0].fullMani.ChainEncryption; span0Enc != nil {
+			return nil, fmt.Errorf("backup compact: --smart-compaction is not yet supported on encrypted chains (merge group %s is bound to keyset %s); re-run with --smart-compaction-off to use naive concat",
+				pg.plan.MergedSegmentID, encryptionFingerprint(span0Enc))
+		}
+		groupRes, err := applySmartCompactionToStagedGroup(ctx, mergedStore, pg, codec, nil, smartPK)
+		if err != nil {
+			return nil, fmt.Errorf("backup compact: smart-compact merge group %s: %w", pg.plan.MergedSegmentID, err)
+		}
+		// Update the per-group plan entry + the top-level result.
+		// res.Plan was already appended to during planning; locate
+		// the entry by MergedSegmentID and update it.
+		for pi := range res.Plan {
+			if res.Plan[pi].MergedSegmentID != pg.plan.MergedSegmentID {
+				continue
+			}
+			res.Plan[pi].EventsBefore = groupRes.eventsBefore
+			res.Plan[pi].EventsAfter = groupRes.eventsAfter
+			res.Plan[pi].EventsCollapsed = groupRes.eventsBefore - groupRes.eventsAfter
+			res.Plan[pi].RowsCollapsed = groupRes.rowsCollapsed
+			res.Plan[pi].TablesWithoutPK = groupRes.tablesWithoutPKList()
+			break
+		}
+		res.EventsBefore += groupRes.eventsBefore
+		res.EventsAfter += groupRes.eventsAfter
+		res.RowsCollapsed += groupRes.rowsCollapsed
+		// Re-derive BytesAfter for this group: the chunks have been
+		// rewritten with possibly-fewer events, so the merged
+		// segment's actual byte total is groupRes.bytesAfter (chunk
+		// data only; manifest bytes are negligible and the naive
+		// BytesEstimate was chunk-byte sums).
+		res.BytesAfter += groupRes.bytesAfter - pg.plan.BytesEstimate
+		for k := range groupRes.tablesWithoutPK {
+			tablesWithoutPK[k] = struct{}{}
+		}
+	}
+	res.EventsCollapsed = res.EventsBefore - res.EventsAfter
+	if len(tablesWithoutPK) > 0 {
+		res.TablesWithoutPK = make([]string, 0, len(tablesWithoutPK))
+		for k := range tablesWithoutPK {
+			res.TablesWithoutPK = append(res.TablesWithoutPK, k)
+		}
+		sort.Strings(res.TablesWithoutPK)
 	}
 
 	// Catalog swap (the linearization commit). Build the post-compact
@@ -405,13 +518,24 @@ func CompactChain(ctx context.Context, store ir.BackupStore, opts CompactOpts) (
 		}
 	}
 
-	slog.InfoContext(
-		ctx, "backup compact: lineage compacted",
+	logArgs := []any{
 		slog.Int("groups_merged", res.GroupsMerged),
 		slog.Int("segments_removed", res.SegmentsRemoved),
 		slog.Int64("bytes_before", res.BytesBefore),
 		slog.Int64("bytes_after", res.BytesAfter),
-	)
+	}
+	if opts.SmartCompaction {
+		logArgs = append(
+			logArgs,
+			slog.Bool("smart_compaction", true),
+			slog.Int64("events_before", res.EventsBefore),
+			slog.Int64("events_after", res.EventsAfter),
+			slog.Int64("events_collapsed", res.EventsCollapsed),
+			slog.Int64("rows_collapsed", res.RowsCollapsed),
+			slog.Int("tables_without_pk", len(res.TablesWithoutPK)),
+		)
+	}
+	slog.InfoContext(ctx, "backup compact: lineage compacted", logArgs...)
 	return res, nil
 }
 
