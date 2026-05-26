@@ -131,8 +131,13 @@ func TestShapeDeltaApplier_MySQL_AlterModifyCheck(t *testing.T) {
 		" WHERE CONSTRAINT_SCHEMA = DATABASE() AND CONSTRAINT_NAME = 'chk_qty'").Scan(&clause); err != nil {
 		t.Fatalf("read check clause: %v", err)
 	}
-	if !strings.Contains(clause, "qty > 0") {
-		t.Errorf("check clause = %q, want to contain 'qty > 0'", clause)
+	// MySQL CHECK_CLAUSE re-emits identifier refs with backticks
+	// (e.g. "qty > 0" → "(`qty` > 0)"). Strip backticks before the
+	// substring assertion so the test pins the structural shape, not
+	// the catalog's re-quoting cosmetic.
+	normalized := strings.ReplaceAll(clause, "`", "")
+	if !strings.Contains(normalized, "qty > 0") {
+		t.Errorf("check clause = %q (normalized %q), want to contain 'qty > 0'", clause, normalized)
 	}
 }
 

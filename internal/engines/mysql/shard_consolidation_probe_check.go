@@ -178,7 +178,17 @@ func mysqlCheckExprsEquivalent(observed, recorded string) bool {
 }
 
 func normalizeMySQLCheckExprForCompare(s string) string {
-	out := strings.Join(strings.Fields(s), " ")
+	// MySQL's CHECK_CONSTRAINTS.CHECK_CLAUSE re-emits identifier
+	// references with backticks (e.g. "qty > 0" comes back as
+	// "(`qty` > 0)"). Strip backticks before the structural compare
+	// so the silent-divergence guard isn't tripped by the round-trip
+	// formatting alone. False-positive risk is minimal — backtick is
+	// never part of a column-name or value within a CHECK Expr we
+	// care about; the worst case is a string literal containing a
+	// backtick, where the recorded expression would presumably also
+	// contain one and the comparison still holds.
+	out := strings.ReplaceAll(s, "`", "")
+	out = strings.Join(strings.Fields(out), " ")
 	for len(out) >= 2 && out[0] == '(' && out[len(out)-1] == ')' &&
 		isMatchedOuterParensMySQL(out) {
 		out = strings.TrimSpace(out[1 : len(out)-1])
