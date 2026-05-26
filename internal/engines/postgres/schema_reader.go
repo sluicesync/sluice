@@ -6,6 +6,7 @@ package postgres
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -236,6 +237,9 @@ func (r *SchemaReader) ReadSchema(ctx context.Context) (*ir.Schema, error) {
 		}
 		if err := r.populateExcludeConstraints(ctx, tables); err != nil {
 			return nil, fmt.Errorf("postgres: read exclude constraints: %w", err)
+		}
+		if err := r.populateRLS(ctx, tables); err != nil {
+			return nil, fmt.Errorf("postgres: read row-level security: %w", err)
 		}
 		if err := r.populateComments(ctx, tables); err != nil {
 			return nil, fmt.Errorf("postgres: read comments: %w", err)
@@ -1280,6 +1284,160 @@ func (r *SchemaReader) populateExcludeConstraints(ctx context.Context, tables ma
 		})
 	}
 	return rows.Err()
+}
+
+// populateRLS fills in [ir.Table.RLSEnabled], [ir.Table.RLSForced],
+// and [ir.Table.Policies] for each table the reader is scoped to.
+// ADR-0063 (task #52 sub-deliverables 2 + 3): closes the silent-
+// security regression class where the target schema arrives without
+// the source's row-level-security policies, leaving every row
+// readable by every role on the target.
+//
+// Two queries:
+//
+//   - One catalog read against `pg_class.relrowsecurity` /
+//     `relforcerowsecurity` to populate the table-level flags. The
+//     two are orthogonal (FORCE applies even to the table owner;
+//     ENABLE is the gate for non-owner enforcement); the writer
+//     emits `ALTER TABLE ... ENABLE` when RLSEnabled and a
+//     subsequent `... FORCE` when RLSForced.
+//   - One query against the public `pg_policies` view, which projects
+//     `pg_policy` joined to the role catalog for human-readable role
+//     names and renders the USING / WITH CHECK expressions through
+//     `pg_get_expr` (canonical PG-dialect text). `roles` is rendered
+//     as JSON text (`array_to_json` → string) and parsed in Go so the
+//     reader stays driver-neutral — no pgtype-array dance for what is
+//     ultimately a small list of role names.
+//
+// A schema with no RLS-enabled tables produces zero `pg_policies`
+// rows; the function is a fast no-op (two cheap catalog scans) on the
+// common case. Empty `Roles` is a sluice-bug condition the writer
+// later refuses loudly — PG always populates the array with at least
+// `{public}`.
+func (r *SchemaReader) populateRLS(ctx context.Context, tables map[string]*ir.Table) error {
+	if err := r.populateRLSTableFlags(ctx, tables); err != nil {
+		return err
+	}
+	return r.populateRLSPolicies(ctx, tables)
+}
+
+// populateRLSTableFlags fills RLSEnabled / RLSForced from pg_class.
+// Scoped to the bound schema; the catalog read costs one round-trip
+// regardless of table count.
+func (r *SchemaReader) populateRLSTableFlags(ctx context.Context, tables map[string]*ir.Table) error {
+	const q = `
+		SELECT cl.relname, cl.relrowsecurity, cl.relforcerowsecurity
+		FROM   pg_class     cl
+		JOIN   pg_namespace n ON n.oid = cl.relnamespace
+		WHERE  n.nspname  = $1
+		  AND  cl.relkind = 'r'`
+	rows, err := r.db.QueryContext(ctx, q, r.schema)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var (
+			name            string
+			enabled, forced bool
+		)
+		if err := rows.Scan(&name, &enabled, &forced); err != nil {
+			return err
+		}
+		t, ok := tables[name]
+		if !ok {
+			continue
+		}
+		t.RLSEnabled = enabled
+		t.RLSForced = forced
+	}
+	return rows.Err()
+}
+
+// populateRLSPolicies fills Table.Policies from pg_policies. Renders
+// `roles` (an array of role names) as JSON text via array_to_json so
+// the scan stays driver-neutral and we don't introduce a pgtype
+// dependency just for this surface. PG always populates Roles with at
+// least `{public}`; an empty list after JSON decode is treated as a
+// sluice-bug condition and surfaces loudly when the writer later
+// refuses an empty Roles slice.
+//
+// Permissive vs restrictive: pg_policies.permissive is "PERMISSIVE" /
+// "RESTRICTIVE" text. Map to the bool field; the writer renders the
+// keyword back on emit.
+//
+// USING / WITH CHECK: pg_policies renders these through pg_get_expr.
+// PG returns NULL for absent clauses (e.g. an INSERT policy has no
+// USING; a SELECT policy has no WITH CHECK); scan into sql.NullString
+// and treat NULL as empty so a faithful round-trip survives.
+func (r *SchemaReader) populateRLSPolicies(ctx context.Context, tables map[string]*ir.Table) error {
+	const q = `
+		SELECT
+			tablename,
+			policyname,
+			cmd,
+			permissive,
+			array_to_json(roles)::text AS roles_json,
+			COALESCE(qual, '')         AS using_expr,
+			COALESCE(with_check, '')   AS check_expr
+		FROM   pg_policies
+		WHERE  schemaname = $1
+		ORDER  BY tablename, policyname`
+	rows, err := r.db.QueryContext(ctx, q, r.schema)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var (
+			tableName, policyName string
+			cmd, permissive       string
+			rolesJSON             string
+			usingExpr, checkExpr  string
+		)
+		if err := rows.Scan(
+			&tableName, &policyName, &cmd, &permissive,
+			&rolesJSON, &usingExpr, &checkExpr,
+		); err != nil {
+			return err
+		}
+		t, ok := tables[tableName]
+		if !ok {
+			continue
+		}
+		roles, err := decodeRoleArray(rolesJSON)
+		if err != nil {
+			return fmt.Errorf("postgres: decode pg_policies.roles for %q on %q: %w",
+				policyName, tableName, err)
+		}
+		t.Policies = append(t.Policies, &ir.Policy{
+			Name:       policyName,
+			Command:    strings.ToUpper(cmd),
+			Permissive: strings.EqualFold(permissive, "PERMISSIVE"),
+			Roles:      roles,
+			Using:      usingExpr,
+			Check:      checkExpr,
+		})
+	}
+	return rows.Err()
+}
+
+// decodeRoleArray parses pg_policies.roles rendered as JSON via
+// array_to_json. PG renders an empty array as "null" (when the column
+// itself is null, which shouldn't happen for pg_policies — PG always
+// populates the list with at least `{public}`); accept that gracefully
+// as an empty slice so a malformed catalog row doesn't crash the
+// reader. The writer's defensive check still refuses an empty Roles
+// when it tries to emit CREATE POLICY.
+func decodeRoleArray(jsonText string) ([]string, error) {
+	if jsonText == "" || jsonText == "null" {
+		return nil, nil
+	}
+	var roles []string
+	if err := json.Unmarshal([]byte(jsonText), &roles); err != nil {
+		return nil, err
+	}
+	return roles, nil
 }
 
 // populateComments fills in table- and column-level comments

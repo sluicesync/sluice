@@ -117,8 +117,101 @@ type Table struct {
 	// MySQL sources never populate this slice (MySQL has no EXCLUDE
 	// constraint type).
 	ExcludeConstraints []*ExcludeConstraint
+
+	// RLSEnabled mirrors PG's `pg_class.relrowsecurity` — true when
+	// the table has `ALTER TABLE ... ENABLE ROW LEVEL SECURITY` in
+	// effect on the source side. PG-only: MySQL has no equivalent
+	// concept and always leaves this false. Populated by the PG
+	// SchemaReader; consumed by the PG SchemaWriter to re-emit the
+	// ENABLE on the target so policies it creates are actually
+	// enforced (without ENABLE, CREATE POLICY rows are inert). See
+	// ADR-0063 and [Policy] for the full RLS-IR contract.
+	RLSEnabled bool
+	// RLSForced mirrors PG's `pg_class.relforcerowsecurity` — true
+	// when the table has `ALTER TABLE ... FORCE ROW LEVEL SECURITY`
+	// in effect, which extends RLS enforcement to the table owner
+	// (without FORCE, the owner bypasses by default). PG-only.
+	// Meaningful only when RLSEnabled is true; the writer emits FORCE
+	// only when both are set. See ADR-0063.
+	RLSForced bool
+	// Policies are the `pg_policies` rows attached to this table on
+	// the source side. The PG SchemaWriter re-emits each as a
+	// `CREATE POLICY` after the table's `ENABLE ROW LEVEL SECURITY`,
+	// so the target carries the same per-tenant filter/check rules
+	// the source had (closes task #52's silent-security-regression
+	// failure mode: a target schema arriving without policies).
+	// PG-only: MySQL has no RLS surface; the MySQL writer warns once
+	// per stream when this slice is non-empty (cross-engine PG →
+	// MySQL drops policies — see ADR-0063). MySQL sources never
+	// populate this slice.
+	Policies []*Policy
+
 	// Comment is the table-level comment, if any.
 	Comment string
+}
+
+// Policy is a dialect-neutral description of a PostgreSQL row-level-
+// security policy (`pg_policies` row). PG-only by definition — MySQL
+// has no RLS surface. Field names mirror `pg_policies` columns so the
+// reader / writer correspondence is direct; the writer renders these
+// back as `CREATE POLICY <name> ON <table> ...` after the table's
+// `ALTER TABLE ... ENABLE ROW LEVEL SECURITY` (the ENABLE must come
+// first or the CREATE POLICY rows land inert).
+//
+// Captured into the IR (rather than carried as a side-channel) so the
+// existing IR-first translation contract holds: the PG SchemaReader
+// emits one [*Policy] per source row, the PG SchemaWriter consumes
+// them on emit, and cross-engine writers (today: MySQL) detect their
+// presence and warn loudly per ADR-0063's loud-failure tenet. See
+// ADR-0063 for the motivation and the bug-74-style test matrix the
+// IR contract pins (Command × Permissive × USING/CHECK shape ×
+// ENABLE/FORCE).
+type Policy struct {
+	// Name is the policy identifier within the table's namespace
+	// (`pg_policies.policyname`). System-generated when not
+	// explicitly named at source. Preserved verbatim so the
+	// target's pg_dump shape stays diffable against the source.
+	Name string
+
+	// Command is the operation the policy applies to: one of "ALL",
+	// "SELECT", "INSERT", "UPDATE", or "DELETE". Mirrors
+	// `pg_policies.cmd`. "ALL" matches every command (the PG
+	// default when `CREATE POLICY` omits the `FOR ...` clause).
+	Command string
+
+	// Permissive is true for permissive policies (the default —
+	// rows the policy admits ride OR'd with other permissive
+	// policies), false for restrictive (rows must satisfy AND'd
+	// with permissive). Mirrors `pg_policies.permissive` (which
+	// returns "PERMISSIVE" / "RESTRICTIVE" — readers map to bool
+	// for compactness; the writer renders the keyword back).
+	Permissive bool
+
+	// Roles is the role-list the policy applies to. Mirrors
+	// `pg_policies.roles`. PG stores `{public}` (a one-element
+	// list) for the default "every role" case; readers carry that
+	// through verbatim and the writer re-emits `TO public`. An
+	// empty slice is a sluice-bug condition the writer refuses
+	// loudly — PG always populates the list.
+	Roles []string
+
+	// Using is the `USING (...)` expression text, in PG dialect
+	// (the only RLS dialect today). Empty for INSERT-scoped
+	// policies that supply only a WITH CHECK. Mirrors
+	// `pg_policies.qual`. The writer emits `USING (<text>)`
+	// only when non-empty; the parentheses are added by the
+	// emitter so the IR text doesn't need to carry them.
+	Using string
+
+	// Check is the `WITH CHECK (...)` expression text, in PG
+	// dialect. Empty for SELECT-scoped policies that supply only
+	// USING. Mirrors `pg_policies.with_check`. The writer emits
+	// `WITH CHECK (<text>)` only when non-empty. PG falls back to
+	// USING as the default WITH CHECK for INSERT/UPDATE policies
+	// when WITH CHECK is omitted; the reader captures the
+	// catalog's explicit value (which may be NULL on those
+	// fallback-to-USING cases) so the round-trip stays faithful.
+	Check string
 }
 
 // CheckConstraint represents a single CHECK clause on a table.

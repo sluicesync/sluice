@@ -8,8 +8,10 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/orware/sluice/internal/ir"
 )
@@ -36,6 +38,17 @@ import (
 type SchemaWriter struct {
 	db     *sql.DB
 	schema string
+
+	// rlsWarnOnce gates the cross-engine PG → MySQL RLS-drop WARN
+	// (ADR-0063 — task #52 sub-deliverable 3). A PG source carrying
+	// any RLS-enabled table or attached policy logs a single WARN
+	// line per writer lifetime (per stream) — fires once and never
+	// again, regardless of how many tables carry RLS state. MySQL
+	// has no RLS equivalent, so this is a documented "policy layer
+	// silently dropped" carve-out the operator accepts by choosing
+	// the PG → MySQL direction. Same-engine MySQL → PG passes
+	// through cleanly (MySQL sources never populate the RLS fields).
+	rlsWarnOnce sync.Once
 }
 
 // Close releases the underlying connection pool.
@@ -54,6 +67,7 @@ func (w *SchemaWriter) CreateTablesWithoutConstraints(ctx context.Context, s *ir
 	if s == nil {
 		return fmt.Errorf("mysql: CreateTablesWithoutConstraints: schema is nil")
 	}
+	w.maybeWarnRLSDrop(ctx, s)
 	for _, table := range orderedTables(s) {
 		stmt, err := emitTableDef(table)
 		if err != nil {
@@ -64,6 +78,54 @@ func (w *SchemaWriter) CreateTablesWithoutConstraints(ctx context.Context, s *ir
 		}
 	}
 	return nil
+}
+
+// maybeWarnRLSDrop logs a single WARN per writer lifetime when the
+// incoming schema carries any RLS-enabled table or attached policy
+// (ADR-0063 — task #52 sub-deliverable 3). MySQL has no RLS surface,
+// so policies and per-table ENABLE/FORCE flags drop silently
+// otherwise — the WARN makes the cross-engine carve-out visible so
+// operators routing PG → MySQL aren't surprised that their tenant
+// filters didn't carry to the target.
+//
+// One WARN per stream regardless of table count: the sync.Once on
+// the writer is the right scope. Per-table WARNs would flood logs
+// for any non-trivial multi-tenant schema; the operator-visible fact
+// is "policies are dropped on this run," not "policies are dropped
+// on table X" (the latter would imply per-table opt-in which the
+// engine doesn't provide).
+//
+// MySQL → PG never hits this path: the MySQL SchemaReader leaves
+// RLSEnabled / RLSForced false and Policies empty by construction.
+// The (unit-tested) MySQL-source-no-op shape is the symmetric green
+// path for the cross-engine carve-out.
+func (w *SchemaWriter) maybeWarnRLSDrop(ctx context.Context, s *ir.Schema) {
+	if s == nil {
+		return
+	}
+	var affected []string
+	for _, t := range s.Tables {
+		if t == nil {
+			continue
+		}
+		if t.RLSEnabled || t.RLSForced || len(t.Policies) > 0 {
+			affected = append(affected, t.Name)
+		}
+	}
+	if len(affected) == 0 {
+		return
+	}
+	w.rlsWarnOnce.Do(func() {
+		slog.WarnContext(
+			ctx,
+			"mysql: PG → MySQL drops row-level security; "+
+				"tables with policies will land on MySQL without per-tenant filters",
+			slog.Int("affected_table_count", len(affected)),
+			slog.String("affected_tables", strings.Join(affected, ",")),
+			slog.String("hint", "MySQL has no RLS equivalent — operators routing PG → MySQL "+
+				"accept the policy-layer drop, or re-target to PG (ADR-0063)"),
+		)
+	})
 }
 
 // CreateIndexes adds every non-PRIMARY index across the schema. Each
