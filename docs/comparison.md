@@ -1,0 +1,157 @@
+# sluice vs. alternatives — deep dive
+
+The README carries the headline comparison matrix; this page is the longer-form companion. Each row of the matrix gets a paragraph here explaining *what the capability means in operator terms*, *what failure shape it closes*, and *why an alternative does or doesn't have it*.
+
+This is the page to send a skeptical evaluator who's already seen the matrix and wants the "why does that row matter to me" version.
+
+If a row in the README's matrix doesn't land for your scenario, the answer is in this doc — or it's a sign sluice isn't the right pick (see also the README's "When NOT to use sluice" section and [`docs/use-cases.md`](use-cases.md)).
+
+---
+
+## Cross-engine MySQL ↔ Postgres in all four directions
+
+**Capability claim.** sluice handles `MySQL → MySQL`, `MySQL → Postgres`, `Postgres → Postgres`, and `Postgres → MySQL`, plus the PlanetScale-MySQL flavor as a registered engine variant.
+
+**Why this matters.** Most CDC tooling pivots on a single direction: Debezium needs a sink connector to land somewhere non-Kafka, AWS DMS only reads into AWS, Fivetran assumes a SaaS warehouse target, pgcopydb is PG → PG only. The cross-engine + cross-direction combination is the operational shape that lets one tool cover both the "moving in" and "moving out" sides of a multi-year platform migration.
+
+**Where the alternatives land.**
+- **Debezium:** requires a sink connector (JDBC sink, dedicated Postgres sink, etc.). Adds operational surface (Kafka + connector versions + serialization format).
+- **AWS DMS:** all four directions in principle, but target must be in AWS or AWS-managed; bringing data *out* of AWS isn't the supported direction.
+- **Fivetran / Stitch / Airbyte:** source-to-warehouse shape; not a peer-to-peer DB-to-DB story.
+- **pgcopydb:** PG → PG only. The fast-path tactics (parallel COPY, deferred indexes) are the inspiration for sluice's bulk-copy implementation.
+- **HVR / Striim / Qlik:** all four directions. The enterprise tier is where sluice positions against.
+
+---
+
+## `ADD COLUMN` auto-forwarding (since v0.79.0)
+
+**Capability claim.** When the source executes `ALTER TABLE … ADD COLUMN …` mid-stream, sluice detects the DDL on the binlog (MySQL) or pgoutput stream (PG), applies the matching `ADD COLUMN` on the target, and continues replicating without an operator-driven stop/restart cycle.
+
+**Why this matters.** Schema evolution is the #1 reason CDC pipelines break in production. The naive shape — stop replication, run the DDL by hand on both ends, restart — leaks application work onto the platform team. Operators want the platform to handle the safe cases; sluice does, while refusing loudly on the unsafe ones (computed `DEFAULT`s with side effects, etc.).
+
+**Where the alternatives land.**
+- **Debezium:** has it via the schema-history connector; configuration complexity is the trade.
+- **AWS DMS:** partial — some DDL is forwarded, some silently skipped (problematic for safety-conscious operators).
+- **Fivetran:** has it for SaaS targets.
+- **pgcopydb:** snapshot-only; out of scope.
+- **HVR:** has it, with operator-tunable refuse/auto-apply policies.
+
+---
+
+## Refuse-loudly on unsafe DDL with structured diff (F11, v0.81.0)
+
+**Capability claim.** When the source emits DDL sluice can't safely translate or apply (a structural change outside the recognized-shape catalog, or a translation gap), the CDC stream halts with a structured error message naming the table, the unrecognized clause, and an operator-actionable hint (often "refuse-loudly with the drained-model recovery hint" from ADR-0054).
+
+**Why this matters.** The alternative posture is "silent skip" — DMS, Fivetran (occasionally), and some Debezium connectors will continue the stream with the DDL un-applied, leaving target schema and source schema increasingly divergent. The drift surfaces later, usually as a row-apply failure with a confusing error, or worse, as silent value truncation. Loud refusal at the moment of the unsafe DDL is sluice's tenet (`CLAUDE.md`); operators get an actionable error at the right time.
+
+**Where the alternatives land.**
+- **Debezium:** varies by connector. The PG connector has decent surface here; MySQL connectors with strict mode behave better.
+- **AWS DMS:** silent skip is the documented default; operators flag this in support tickets and the response is "audit your schema-evolution events out of band."
+- **Fivetran:** silent skip with table-resync trigger. Operators learn after the row-count drifts.
+- **HVR:** loud refuse + operator-tunable policy.
+
+---
+
+## Pre-emptive slot-retention warnings (F13, v0.80.0)
+
+**Capability claim.** sluice's PG source-side stream watches `pg_stat_replication_slots`. When the slot's `restart_lsn` retention hits 70% of `max_slot_wal_keep_size`, sluice emits a WARN. At 85%, escalates. If the slot is `inactive` for ≥30 minutes, separate WARN. Operators learn *before* the slot evicts and the stream goes cold-start.
+
+**Why this matters.** PG's slot eviction is the silent-failure case sluice's slot-health work was built around. The first sign an operator gets without sluice's monitoring is the cold-start fall-through (sluice surfaces it loudly per ADR-0022) or, worse, a `wal_keep_size`-shaped surprise: the operator's cluster fills disk because the slot is holding WAL the consumer never claimed. F13's pre-emptive warnings give a window for action.
+
+**Where the alternatives land.**
+- **Debezium:** operator monitors `pg_stat_replication` themselves. Some monitoring stacks (Datadog, Grafana) ship dashboards for this; sluice ships the warning logic in-process.
+- **AWS DMS / Fivetran:** SaaS-managed; the operator doesn't see the slot at all (until disk fills).
+- **HVR:** has it.
+
+---
+
+## Source-side heartbeat writer (F17, v0.82.0)
+
+**Capability claim.** Opt-in `--source-heartbeat-interval=30s`. Sluice writes a tiny periodic row to a sluice-owned table on the source; the INSERT generates WAL (PG) / binlog (MySQL) so the CDC consumer's position advances even against a quiet source. Default OFF (it's a behavioural change on the source DB).
+
+**Why this matters.** The complement to F13: F13 *detects* slot-retention pressure; F17 *prevents* it. On low-traffic source DBs (off-hours, weekends, dev environments), the slot's `restart_lsn` stagnates and the slot eventually evicts. F17 keeps the heartbeat moving so the consumer's claim stays current.
+
+**Where the alternatives land.**
+- **Debezium:** PG connector has a source-side heartbeat option (similar shape).
+- **AWS DMS / Fivetran:** SaaS-managed; the operator can't add a heartbeat directly.
+- **pgcopydb:** snapshot-only; no slot to manage.
+- **HVR:** has it.
+
+---
+
+## Cutover sequence priming as one command (F10, v0.83.0)
+
+**Capability claim.** `sluice cutover` — after sync stop, before traffic flip — reads source sequences and applies them to target with a safety margin. Closes the PK-collision-on-first-INSERT class without per-table `setval` by hand. See [`docs/cutover.md`](cutover.md).
+
+**Why this matters.** Pre-v0.83.0 the manual procedure was "list every BIGSERIAL/AUTO_INCREMENT table, write `SELECT setval(seq, source_max + 1000)` for each, run them as the operator." A dozen-table migration was tractable; a 200-table migration was a 200-line bash script with no idempotency guarantees. F10 replaces it with one idempotent, refuse-loudly-on-target-ahead command.
+
+**Where the alternatives land.**
+- **Debezium / DMS / Fivetran / pgcopydb:** no equivalent. The operator handles cutover sequence priming themselves, typically with the same hand-rolled `setval` script.
+- **partial in pgcopydb:** has primitives for sequence sync as part of its `pgcopydb clone` flow.
+- **HVR:** has it.
+
+---
+
+## Single static binary, no daemon, no Kafka
+
+**Capability claim.** sluice is one Go binary (cross-platform via GoReleaser). No coordinator process, no Kafka cluster, no manifest server, no daemon. Run it from a bastion host, a build agent, or a laptop with network reach to both endpoints. State lives in target's `sluice_*` control tables; no external state store.
+
+**Why this matters.** Operational complexity is a real cost. Standing up Kafka just to use Debezium adds days of setup work and ongoing operational burden (broker quorum, retention, partition counts, ACLs). Sluice's single-binary shape mirrors what `pg_dump`, `mysqldump`, and `pgcopydb` get right: low ceremony, predictable failure modes, easy to reason about.
+
+**Where the alternatives land.**
+- **Debezium:** Kafka + connector framework. Operational surface is significant.
+- **AWS DMS / Fivetran:** SaaS, so no operator-side daemon — but operator gives up the "run anywhere" property.
+- **pgcopydb:** single binary, same shape. The shared philosophy.
+- **HVR:** dedicated coordinator process.
+
+---
+
+## Open-source (Apache 2.0)
+
+**Capability claim.** sluice is Apache 2.0 licensed; full source on GitHub; no enterprise feature gating; no telemetry phone-home.
+
+**Why this matters.** For operators in regulated industries (healthcare, finance, government), no-vendor-dependency replication is sometimes the only compliant shape. For self-hosted / air-gapped deployments, an OSS tool is the only option. For organizations where the platform team's tools must be auditable end-to-end, sluice's source is the auditor's source.
+
+**Where the alternatives land.**
+- **Debezium:** Apache 2.0.
+- **AWS DMS:** proprietary.
+- **Fivetran:** proprietary, SaaS-only.
+- **pgcopydb:** BSD.
+- **HVR / Striim / Qlik:** proprietary, commercial.
+
+---
+
+## Per-row pricing: none
+
+**Capability claim.** sluice has no usage-based pricing. The cost is whatever compute and egress the operator already pays for. A 50TB migration costs the same in licensing as a 50GB one (zero).
+
+**Why this matters.** SaaS CDC tools price on Monthly Active Rows (Fivetran's MAR), DMS instance-hours (AWS), or per-source connection (HVR). For a one-time migration of a large dataset, those line items can dominate the engineering budget. For an *ongoing* CDC sync of a high-volume source, the cost crossover with running sluice yourself happens early.
+
+**Where the alternatives land.**
+- **Debezium:** no per-row cost (you pay for Kafka + compute).
+- **AWS DMS:** per-DMS-instance-hour.
+- **Fivetran:** per-MAR (Monthly Active Rows) tier.
+- **pgcopydb:** no cost.
+- **HVR:** per-source license. Multi-year contracts in the six-figure range are common.
+
+---
+
+## The honest take
+
+For each row above, an operator's decision usually breaks down to:
+
+1. **What's already in your stack?** If you have Kafka, Debezium is the path of least resistance — you've already paid the operational cost.
+2. **What does the destination look like?** AWS-targeted? DMS. Warehouse-targeted? Fivetran or Airbyte. Cross-engine peer-to-peer? sluice is built for this.
+3. **What's your tolerance for SaaS dependency?** SaaS shifts the operational burden to the vendor; OSS keeps it on your team. The trade is real and personal.
+4. **What's the failure-mode discipline you need?** sluice's loud-failure tenet is opinionated — operators who want auto-remediation may find sluice's refusal-on-uncertainty grating. Operators who've been burned by silent-skip surprises tend to prefer it.
+
+sluice is not the right tool for every shape — see the README's "When NOT to use sluice" section. But for the cross-engine, on-prem-friendly, OSS-licensed, no-Kafka shape, it's the most-direct fit on the spectrum.
+
+---
+
+## Cross-references
+
+- [`README.md`](../README.md) — the headline matrix
+- [`docs/use-cases.md`](use-cases.md) — concrete operator scenarios
+- [`docs/cutover.md`](cutover.md) — the `sluice cutover` shipped capability
+- [`docs/architecture.md`](architecture.md) — IR + engine pattern that makes cross-engine work
