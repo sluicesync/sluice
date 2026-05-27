@@ -104,23 +104,25 @@ func runPhase2ePGWithRetry(t *testing.T, dbName string) *pgtc.PostgresContainer 
 				},
 			},
 		}),
-		// Task #68: single-occurrence wait — required for the
-		// pre-baked image (datadir already initialized, so postgres
-		// only logs "ready to accept connections" once). Replaces
-		// BasicWaitStrategies' 2-occurrence inner strategy.
-		pgPrebakedWaitStrategy(),
 	}
 
 	var lastErr error
 	for attempt := 1; attempt <= phase2eBootAttempts; attempt++ {
 		ctx, cancel := context.WithTimeout(context.Background(), phase2eBootTimeout)
-		// Task #68: pre-baked PG image. The dbName here is dynamic
-		// per-test so it is NOT in the bake's seed-DB list — but
-		// testcontainers' WithDatabase env var won't take effect on
-		// the pre-initialized datadir, so the caller's setup path is
-		// responsible for CREATE DATABASE-ing dbName before connecting
-		// against it. See pg_prebaked_integration_test.go.
-		container, err := pgtc.Run(ctx, pgPrebakedImage, opts...)
+		// Task #68 exception: this multi-source streamer harness
+		// spins up 3 distinct PG source containers AND relies on
+		// sluice's source-identity pin (ADR-0051 / task #30) to
+		// distinguish them. The pre-baked PG image bakes pg_control
+		// with a fixed cluster system identifier — every container
+		// started from it shares the same systemid, so sluice cannot
+		// distinguish the three sources and the streamer's
+		// first-source seed row never lands on the target. Use
+		// upstream postgres:16 here so initdb generates a fresh
+		// system_id per container. The startup-time cost (~5-10s
+		// extra per container vs the pre-baked image) is bounded —
+		// only this test pays it; every other PG test keeps the
+		// pre-baked image's fast boot.
+		container, err := pgtc.Run(ctx, "postgres:16", opts...)
 		cancel()
 		if err == nil {
 			if attempt > 1 {
