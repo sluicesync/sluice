@@ -88,9 +88,25 @@ import (
 // host/port come from the container at boot time; user/password are
 // the credentials the postgres testcontainer module seeds; container
 // is kept for TestMain's terminate.
+//
+// containerDeadOnce + containerDead together implement the
+// mid-shard-death sentinel (task #64): if the shared container dies
+// after a successful boot — observed on the self-hosted CI runner
+// pool when the docker engine restarts mid-shard, see PR #71 d00f9a2
+// run https://github.com/orware/sluice/actions/runs/26524797251/job/78125648574
+// where ~80 tests each spent ~30ms hitting "connection refused" in
+// resetSharedDB — every subsequent reset would otherwise fail
+// individually with the same noisy stack. The sentinel collapses
+// that into one loud log line via the sync.Once and a fast t.Fatalf
+// for the rest of the shard so the failure reason is unmistakable
+// in CI logs rather than buried in 80x repeated stack traces.
 type sharedPostgresState struct {
-	once      sync.Once
-	bootErr   error
+	once    sync.Once
+	bootErr error
+
+	containerDeadOnce sync.Once
+	containerDead     bool
+
 	host      string
 	port      string
 	user      string
@@ -311,6 +327,58 @@ func ensureSharedPostgres(t *testing.T) (host, port, user, password string) {
 		t.Fatalf("shared postgres unavailable: %v", sharedPostgres.bootErr)
 	}
 	return sharedPostgres.host, sharedPostgres.port, sharedPostgres.user, sharedPostgres.password
+}
+
+// checkSharedContainerAlive is the mid-shard-death sentinel (task #64).
+// Probes the container's local Docker state via Container.IsRunning()
+// — a fast in-process / docker-API check, no SQL connection involved —
+// and short-circuits the test if the container has died since boot.
+//
+// On the FIRST dead-container observation in the shard, the sentinel
+// records the failure via containerDeadOnce + log.Printf so the CI log
+// shows a single loud "docker engine dead mid-shard" message. Every
+// subsequent test sees containerDead == true and t.Fatalf's quickly
+// against that flag, skipping the SQL work that would otherwise
+// produce 80x "connection refused" stack traces (~30ms each).
+//
+// Why this exists: PR #71 d00f9a2 (run
+// https://github.com/orware/sluice/actions/runs/26524797251/job/78125648574)
+// showed the cascade — the shared container died mid-shard and every
+// subsequent test in the engines-postgres package logged the same
+// dial-tcp connection-refused error from resetSharedDB. The boot
+// retry above (sharedPostgresBootAttempts) only protects the initial
+// boot; this sentinel covers the post-boot lifetime where the same
+// container instance is shared across the whole shard.
+//
+// Caller contract: invoke before any SQL work that touches the
+// shared container. Returns true on alive (caller proceeds); calls
+// t.Fatalf and does not return on dead.
+func checkSharedContainerAlive(t *testing.T) bool {
+	t.Helper()
+	if sharedPostgres.container == nil {
+		// Boot never happened (or failed and bootErr was set). Caller
+		// should not have reached this path; defensive Fatalf so the
+		// failure mode is loud rather than a nil-deref.
+		t.Fatalf("shared postgres container is nil; ensureSharedPostgres was not called or failed")
+		return false
+	}
+	if sharedPostgres.containerDead {
+		t.Fatalf("shared postgres container died mid-shard; skipping (see prior 'docker engine dead' message)")
+		return false
+	}
+	if sharedPostgres.container.IsRunning() {
+		return true
+	}
+	sharedPostgres.containerDeadOnce.Do(func() {
+		sharedPostgres.containerDead = true
+		log.Printf("DOCKER-ENGINE-DEAD: shared postgres container %s is no longer running mid-shard; "+
+			"every remaining test in engines/postgres will fail fast with this sentinel. "+
+			"Root cause is almost always the docker daemon restarting under the self-hosted runner, "+
+			"NOT a sluice bug. See task #64 / PR #71 d00f9a2 for the original cascade.",
+			sharedPostgres.container.GetContainerID())
+	})
+	t.Fatalf("shared postgres container died mid-shard (docker engine likely restarted); see prior 'DOCKER-ENGINE-DEAD' log line")
+	return false
 }
 
 // sharedPGDSN builds a DSN pointed at dbName on the shared container.
@@ -605,6 +673,14 @@ func reassignAndDropOwnedAcrossDatabases(ctx context.Context, host, port, user, 
 // vanish.
 func resetSharedDB(t *testing.T, dbName string) {
 	t.Helper()
+
+	// Task #64 sentinel: probe container liveness BEFORE opening the
+	// SQL connection. If the shared container died mid-shard (docker
+	// engine restart, OOM kill, etc.), this short-circuits with a
+	// single loud log line instead of letting each of the ~80 tests
+	// in the shard waste ~30ms hitting "connection refused".
+	checkSharedContainerAlive(t)
+
 	host, port, user, password := sharedPrimitives()
 
 	adminDSN := sharedPGDSN(host, port, user, password, sharedPGAdminDB)
@@ -678,6 +754,20 @@ func newSharedPGDB(t *testing.T, dbName string) (dsn string, cleanup func()) {
 // equivalent for the program-exit path.
 func TestMain(m *testing.M) {
 	code := m.Run()
+
+	// Task #64: if the mid-shard-death sentinel fired during the run,
+	// surface that fact at the very end of TestMain so the operator
+	// reading CI logs from the bottom up sees "docker engine died" as
+	// the LAST log line — not buried among the cascading test
+	// failures. Once-only log is also emitted by
+	// checkSharedContainerAlive at the moment of detection; this is
+	// the trailing summary so the cause is visible at both ends of
+	// the failure region.
+	if sharedPostgres.containerDead {
+		log.Printf("DOCKER-ENGINE-DEAD: shared postgres container died mid-shard during this run; " +
+			"all engines/postgres failures above with 'died mid-shard' are downstream of this. " +
+			"This is a runner-infrastructure issue, NOT a sluice code bug.")
+	}
 
 	if sharedPostgres.container != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
