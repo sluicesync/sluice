@@ -427,17 +427,17 @@ BEGIN
         v_op     := 'I';
         v_after  := to_jsonb(NEW);
         v_before := NULL;
-        v_pk     := (SELECT jsonb_object_agg(k, v) FROM jsonb_each(v_after) WHERE k = ANY(v_pk_cols));
+        v_pk     := (SELECT jsonb_object_agg(key, value) FROM jsonb_each(v_after) WHERE key = ANY(v_pk_cols));
     ELSIF TG_OP = 'UPDATE' THEN
         v_op     := 'U';
         v_before := to_jsonb(OLD);
         v_after  := to_jsonb(NEW);
-        v_pk     := (SELECT jsonb_object_agg(k, v) FROM jsonb_each(v_after) WHERE k = ANY(v_pk_cols));
+        v_pk     := (SELECT jsonb_object_agg(key, value) FROM jsonb_each(v_after) WHERE key = ANY(v_pk_cols));
     ELSIF TG_OP = 'DELETE' THEN
         v_op     := 'D';
         v_before := to_jsonb(OLD);
         v_after  := NULL;
-        v_pk     := (SELECT jsonb_object_agg(k, v) FROM jsonb_each(v_before) WHERE k = ANY(v_pk_cols));
+        v_pk     := (SELECT jsonb_object_agg(key, value) FROM jsonb_each(v_before) WHERE key = ANY(v_pk_cols));
     ELSE
         RAISE EXCEPTION 'sluice_capture_change: unexpected TG_OP %', TG_OP;
     END IF;
