@@ -278,8 +278,10 @@ LABEL sluice.baseimage="${POSTGRES_BASE_IMAGE}"
 USER postgres
 RUN set -e; \\
     echo postgres > /tmp/pgpw; \\
-    initdb --username=postgres --pwfile=/tmp/pgpw --auth-local=trust --auth-host=md5 --encoding=UTF8 -D /var/lib/postgresql/data; \\
+    initdb --username=postgres --pwfile=/tmp/pgpw --auth-local=trust --auth-host=trust --encoding=UTF8 -D /var/lib/postgresql/data; \\
     rm -f /tmp/pgpw; \\
+    echo "host all all 0.0.0.0/0 trust" >> /var/lib/postgresql/data/pg_hba.conf; \\
+    echo "host all all ::/0 trust"      >> /var/lib/postgresql/data/pg_hba.conf; \\
     mkdir -p /tmp/pgsock; \\
     pg_ctl -D /var/lib/postgresql/data -o "-c listen_addresses='' -c unix_socket_directories='/tmp/pgsock'" -l /tmp/pg.log -w start; \\
     psql -h /tmp/pgsock -U postgres -d postgres \\
@@ -327,8 +329,10 @@ LABEL sluice.baseimage="${POSTGIS_BASE_IMAGE}"
 USER postgres
 RUN set -e; \\
     echo postgres > /tmp/pgpw; \\
-    initdb --username=postgres --pwfile=/tmp/pgpw --auth-local=trust --auth-host=md5 --encoding=UTF8 -D /var/lib/postgresql/data; \\
+    initdb --username=postgres --pwfile=/tmp/pgpw --auth-local=trust --auth-host=trust --encoding=UTF8 -D /var/lib/postgresql/data; \\
     rm -f /tmp/pgpw; \\
+    echo "host all all 0.0.0.0/0 trust" >> /var/lib/postgresql/data/pg_hba.conf; \\
+    echo "host all all ::/0 trust"      >> /var/lib/postgresql/data/pg_hba.conf; \\
     mkdir -p /tmp/pgsock; \\
     pg_ctl -D /var/lib/postgresql/data -o "-c listen_addresses='' -c unix_socket_directories='/tmp/pgsock'" -l /tmp/pg.log -w start; \\
     psql -h /tmp/pgsock -U postgres -d postgres \\
