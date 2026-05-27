@@ -109,6 +109,19 @@ func runPhase2ePGWithRetry(t *testing.T, dbName string) *pgtc.PostgresContainer 
 	var lastErr error
 	for attempt := 1; attempt <= phase2eBootAttempts; attempt++ {
 		ctx, cancel := context.WithTimeout(context.Background(), phase2eBootTimeout)
+		// Task #68 exception: this multi-source streamer harness
+		// spins up 3 distinct PG source containers AND relies on
+		// sluice's source-identity pin (ADR-0051 / task #30) to
+		// distinguish them. The pre-baked PG image bakes pg_control
+		// with a fixed cluster system identifier — every container
+		// started from it shares the same systemid, so sluice cannot
+		// distinguish the three sources and the streamer's
+		// first-source seed row never lands on the target. Use
+		// upstream postgres:16 here so initdb generates a fresh
+		// system_id per container. The startup-time cost (~5-10s
+		// extra per container vs the pre-baked image) is bounded —
+		// only this test pays it; every other PG test keeps the
+		// pre-baked image's fast boot.
 		container, err := pgtc.Run(ctx, "postgres:16", opts...)
 		cancel()
 		if err == nil {
@@ -149,6 +162,13 @@ func phase2eSourceDSN(t *testing.T, dbName string) (dsn string, teardown func())
 	}
 	dsnCtx, dsnCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer dsnCancel()
+	// Task #68: the pre-baked image ignores POSTGRES_DB env var on the
+	// already-initialized datadir, so create the dbName explicitly.
+	// Safe no-op if dbName is one of the bake's seed databases.
+	if err := pgPrebakedEnsureDB(dsnCtx, c, dbName); err != nil {
+		teardown()
+		t.Fatalf("ensure db (db=%s): %v", dbName, err)
+	}
 	var err error
 	dsn, err = c.ConnectionString(dsnCtx, "sslmode=disable")
 	if err != nil {

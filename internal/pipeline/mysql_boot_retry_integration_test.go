@@ -73,7 +73,19 @@ const (
 	// per-test wrappers here multiply by ~20 tests, so the 3-attempt
 	// cap is the right setting for this layer.
 	mysqlBootAttempts = 3
-	mysqlBootTimeout  = 4 * time.Minute
+
+	// mysqlBootTimeout: per-attempt budget. TODO(#68-follow-up):
+	// with mysqlBootImage pre-baked, cold-start drops to ~5s — this
+	// can revert to 2min (or possibly 1min) once a few CI cycles
+	// confirm the pre-baked image is reliable. Retry scaffolding
+	// above stays for defense in depth.
+	mysqlBootTimeout = 4 * time.Minute
+
+	// mysqlBootImage: pre-baked MySQL image (task #68). See
+	// internal/engines/mysql/shared_container_integration_test.go's
+	// sharedMySQLImage doc comment for the full rationale; this
+	// constant is the pipeline-package counterpart.
+	mysqlBootImage = "ghcr.io/orware/sluice-mysql:8.0-prebaked"
 )
 
 // mysqlBootBackoff returns the sleep duration between a failed boot
@@ -126,7 +138,7 @@ func runMySQLWithRetry(t *testing.T, opts ...testcontainers.ContainerCustomizer)
 	var lastErr error
 	for attempt := 1; attempt <= mysqlBootAttempts; attempt++ {
 		ctx, cancel := context.WithTimeout(context.Background(), mysqlBootTimeout)
-		container, err := mysqltc.Run(ctx, "mysql:8.0", waitOpts...)
+		container, err := mysqltc.Run(ctx, mysqlBootImage, waitOpts...)
 		cancel()
 		if err == nil {
 			if attempt > 1 {

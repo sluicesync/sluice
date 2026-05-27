@@ -57,11 +57,18 @@ func startPostgresWithExtension(t *testing.T, extensionName string, enableOnTarg
 
 	container, err := pgtc.Run(
 		ctx,
-		"postgres:16",
+		// Task #68: pre-baked PG image — see pgPrebakedImage doc in
+		// pg_prebaked_integration_test.go.
+		pgPrebakedImage,
 		pgtc.WithDatabase("source_db"),
 		pgtc.WithUsername("test"),
 		pgtc.WithPassword("test"),
 		pgtc.BasicWaitStrategies(),
+		// Single-occurrence wait — required for the pre-baked image
+		// (datadir already initialized, so postgres only logs "ready
+		// to accept connections" once). Replaces BasicWaitStrategies'
+		// 2-occurrence inner strategy.
+		pgPrebakedWaitStrategy(),
 	)
 	if err != nil {
 		t.Fatalf("start container: %v", err)

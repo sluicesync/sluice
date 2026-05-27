@@ -58,11 +58,16 @@ func startPostgresPGToPGWithPostGIS(t *testing.T, enableOnTarget bool) (sourceDS
 
 	container, err := pgtc.Run(
 		ctx,
-		"postgis/postgis:16-3.4",
+		// Task #68: pre-baked postgis image (postgisPrebakedImage const,
+		// defined in migrate_postgis_integration_test.go). Same rationale
+		// as the sibling helper there: avoids the initdb cold-start path
+		// on the self-hosted runner pool.
+		postgisPrebakedImage,
 		pgtc.WithDatabase("source_db"),
 		pgtc.WithUsername("test"),
 		pgtc.WithPassword("test"),
 		pgtc.BasicWaitStrategies(),
+		pgPrebakedWaitStrategy(),
 	)
 	if err != nil {
 		t.Fatalf("start container: %v", err)

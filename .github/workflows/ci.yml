@@ -185,6 +185,14 @@ jobs:
   integration:
     name: Integration (${{ matrix.shard.name }})
     runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
+    # Need packages:read so the pre-baked images on ghcr.io
+    # (ghcr.io/orware/sluice-mysql:8.0-prebaked etc., task #68) can be
+    # pulled by `docker pull` below. Default token permissions are
+    # read-only (see workflow-level `permissions:` block) but don't
+    # include `packages:` — opt in here.
+    permissions:
+      contents: read
+      packages: read
     # 45m outer envelope. Was 60m through v0.28.0 (job also ran the
     # additive postgis-tagged suite); v0.29.0 split postgis into its
     # own parallel job and it dropped to 35m. v0.68.0: the integration
@@ -276,23 +284,41 @@ jobs:
           go-version-file: "go.mod"
       - run: go mod download
 
+      # Log in to ghcr.io so the pre-baked images (task #68) can be
+      # pulled. GITHUB_TOKEN here has `packages: read` granted by the
+      # job-level permissions block; the `orware/sluice-*` packages
+      # are owned by the same org as the workflow so no PAT is needed.
+      - name: Log in to ghcr.io (pre-baked images)
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
       # Pre-pull the container images the tests need. testcontainers-go
       # would pull them implicitly the first time it boots a container,
-      # but doing it up-front gives a cleaner failure mode if Docker Hub
-      # is rate-limiting or unreachable: we see "pull failed" before
-      # touching any test code, instead of mid-test as a timeout.
+      # but doing it up-front gives a cleaner failure mode if the
+      # registry is unreachable: we see "pull failed" before touching
+      # any test code, instead of mid-test as a timeout.
+      #
+      # Task #68: MySQL + Postgres run from the pre-baked images
+      # (ghcr.io/orware/sluice-{mysql,postgres}:*-prebaked) built by
+      # .github/workflows/build-prebaked-images.yml. The pre-baked
+      # image has the heavy first-boot init step already done so
+      # cold-start drops from ~30-60s (under self-hosted runner
+      # disk-I/O contention, up to 2-3 min) to ~5s. See
+      # docs/dev/ci-images.md.
       #
       # pgvector/pgvector:0.7.4-pg16 (added v0.26.0) backs the
       # internal/pipeline/migrate_pgvector_integration_test.go suite
       # (ADR-0032 PG → PG extension passthrough). The image is a
       # superset of postgres:16 with the pgvector extension files
-      # bundled; cold-start size is ~110 MB layer-compressed.
+      # bundled; cold-start size is ~110 MB layer-compressed. Kept on
+      # upstream (NOT pre-baked) — it's a niche extension image used
+      # by one test suite, and pre-baking a third artifact for a
+      # narrow use case isn't worth the maintenance.
       #
-      # postgis/postgis:16-3.4 is pulled in the dedicated
+      # postgis pre-baked image is pulled in the dedicated
       # `integration-postgis` job below — not here.
       - run: |
-          docker pull mysql:8.0
-          docker pull postgres:16
+          docker pull ghcr.io/orware/sluice-mysql:8.0-prebaked
+          docker pull ghcr.io/orware/sluice-postgres:16-prebaked
           docker pull pgvector/pgvector:0.7.4-pg16
 
       # Run every package's integration tests. -count=1 disables the
@@ -373,16 +399,24 @@ jobs:
     name: Integration (PostGIS)
     runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 20
+    # See the integration job's permissions block for the rationale.
+    permissions:
+      contents: read
+      packages: read
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-go@v6
         with:
           go-version-file: "go.mod"
       - run: go mod download
+      - name: Log in to ghcr.io (pre-baked images)
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+      # Task #68: pre-baked MySQL/Postgres/PostGIS images. Same cold-
+      # start rationale as the main integration job above.
       - run: |
-          docker pull mysql:8.0
-          docker pull postgres:16
-          docker pull postgis/postgis:16-3.4
+          docker pull ghcr.io/orware/sluice-mysql:8.0-prebaked
+          docker pull ghcr.io/orware/sluice-postgres:16-prebaked
+          docker pull ghcr.io/orware/sluice-postgis:16-3.4-prebaked
       - run: go test -tags="integration postgis" -race -count=1 -timeout=15m -run TestMigrate_PostGIS_ ./internal/pipeline/...
 
   # ----- Lint -----

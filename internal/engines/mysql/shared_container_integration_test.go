@@ -78,12 +78,17 @@ var sharedMySQL sharedMySQLState
 // the self-hosted runner pool showed every failed attempt hitting
 // the 2-minute `wait until ready: "port: 3306 ... matched 0 times"`
 // deadline, while successful attempts in the same runs took ~50s.
-// Root cause is disk-I/O contention when multiple integration
+// Root cause was disk-I/O contention when multiple integration
 // shards boot MySQL containers concurrently against the same
 // `/var/lib/docker` — MySQL init writes 50-100MB during cold boot
-// and slow attempts can stretch past 2min under load. 4min absorbs
-// load spikes without unbounded budget growth. Pre-baked images
-// would eliminate the contention entirely (follow-up task #68).
+// and slow attempts could stretch past 2min under load. 4min absorbs
+// load spikes without unbounded budget growth.
+//
+// TODO(#68-follow-up): with the pre-baked image (sharedMySQLImage
+// below) the init step is already on disk, so cold-start drops to
+// ~5s. Once several CI cycles confirm the pre-baked image is reliable
+// this budget can revert to 2min (and possibly 1min); the retry-with-
+// backoff scaffolding stays for defense in depth.
 const sharedMySQLBootTimeout = 4 * time.Minute
 
 // sharedMySQLBootAttempts is the total number of attempts the retry
@@ -115,6 +120,41 @@ const sharedMySQLBootTimeout = 4 * time.Minute
 // engines-mysql shard with "shared mysql unavailable", costing 3-5
 // CI reruns per release tag.
 const sharedMySQLBootAttempts = 5
+
+// sharedMySQLImage is the testcontainers image reference used by the
+// shared TestMain boot and by per-test boots in this package.
+//
+// Task #68: this is the pre-baked image
+// (ghcr.io/orware/sluice-mysql:8.0-prebaked) — built nightly from
+// upstream mysql:8.0 by .github/workflows/build-prebaked-images.yml.
+// The pre-baked image already has the heavy first-boot init step
+// (mysqld --initialize-insecure writes 50-100MB of system tables)
+// completed, so cold-start drops from 30-60s — up to 2-3 minutes
+// under self-hosted runner disk-I/O contention — to ~5s.
+//
+// Byte-equivalent to upstream mysql:8.0 except that
+// /var/lib/mysql is pre-populated; ENTRYPOINT, CMD, EXPOSE, and the
+// MySQL version are identical to the base. The Cmd args
+// (--log-bin, --binlog-format, --binlog-row-image, --server-id) in
+// bootSharedMySQLOnce are still applied at boot time the same way
+// they would be against the upstream image; the pre-bake just removes
+// the init-on-first-boot step from the critical path.
+//
+// History — why this constant exists:
+//   - Tasks #60, #63, #64, and #69 walked the boot timeout / retry
+//     budget upward (single-shot → 3 retries → 4-min timeout →
+//     WithWaitStrategyAndDeadline) to absorb the init-time disk-I/O
+//     contention on the self-hosted runner pool. Each round added
+//     headroom without eliminating the contention.
+//   - Task #68 cuts the root cause by baking the init step into the
+//     image. The retry-with-backoff scaffolding above stays as defense
+//     in depth — if ghcr.io is unreachable or the bake is broken, the
+//     retry layer absorbs the boot failure rather than failing all
+//     ~62 tests in the shard.
+//
+// See docs/dev/ci-images.md for how the pre-baked images are built and
+// when to bump the base version (e.g. MySQL 8.0 → 8.4).
+const sharedMySQLImage = "ghcr.io/orware/sluice-mysql:8.0-prebaked"
 
 // sharedMySQLBootBackoff returns the sleep duration to apply between
 // a failed boot attempt and the next one. attempt is 1-indexed and
@@ -161,7 +201,7 @@ func bootSharedMySQLOnce(ctx context.Context) (host, port string, container *mys
 
 	container, err = mysqltc.Run(
 		ctx,
-		"mysql:8.0",
+		sharedMySQLImage,
 		mysqltc.WithDatabase(seedDB),
 		mysqltc.WithUsername(rootUser),
 		mysqltc.WithPassword(rootPass),

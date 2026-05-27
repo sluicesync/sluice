@@ -31,7 +31,20 @@ import (
 	pgtc "github.com/testcontainers/testcontainers-go/modules/postgres"
 )
 
-// startPostgresWithPostGIS boots the postgis/postgis:16-3.4 image,
+// postgisPrebakedImage is the task-#68 pre-baked postgis container
+// image — built nightly from upstream postgis/postgis:16-3.4 by
+// .github/workflows/build-prebaked-images.yml. Cold-start drops from
+// ~30-60s (postgis initdb is heavier than vanilla postgres initdb) to
+// ~5s. Byte-equivalent to the upstream image except
+// /var/lib/postgresql/data is pre-populated. See docs/dev/ci-images.md.
+//
+// Defined here (not in shared_container_integration_test.go) because
+// the postgis-tagged tests live in their own build-tag bucket; the
+// shared TestMain in the postgres engine package never boots a postgis
+// container, so threading the constant through there isn't needed.
+const postgisPrebakedImage = "ghcr.io/orware/sluice-postgis:16-3.4-prebaked"
+
+// startPostgresWithPostGIS boots the pre-baked postgis image,
 // creates source and target databases, and runs CREATE EXTENSION
 // postgis on the target so the engine's open-time detection
 // reports PostGIS available.
@@ -44,11 +57,23 @@ func startPostgresWithPostGIS(t *testing.T) (sourceDSN, targetDSN string, cleanu
 
 	container, err := pgtc.Run(
 		ctx,
-		"postgis/postgis:16-3.4",
+		// Task #68: pre-baked postgis image — already has initdb done so
+		// the boot avoids the disk-I/O contention path that the
+		// upstream postgis/postgis:16-3.4 hits on the self-hosted runner
+		// pool. Byte-equivalent to upstream postgis/postgis:16-3.4
+		// except /var/lib/postgresql/data is pre-populated; the PostGIS
+		// extension's shared libraries are present the same way they
+		// are in the upstream image. See docs/dev/ci-images.md.
+		postgisPrebakedImage,
 		pgtc.WithDatabase("source_db"),
 		pgtc.WithUsername("test"),
 		pgtc.WithPassword("test"),
 		pgtc.BasicWaitStrategies(),
+		// Pre-baked image's datadir is pre-initialized so postgres
+		// only logs "ready to accept connections" once — single-
+		// occurrence wait replaces BasicWaitStrategies' 2-occurrence
+		// inner strategy. See pg_prebaked_integration_test.go.
+		pgPrebakedWaitStrategy(),
 	)
 	if err != nil {
 		t.Fatalf("start container: %v", err)
