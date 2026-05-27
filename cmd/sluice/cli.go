@@ -58,6 +58,7 @@ type CLI struct {
 	Matview  MatviewCmd  `cmd:"" help:"Operate on PostgreSQL materialized views (refresh; PG-only)."`
 	Diagnose DiagnoseCmd `cmd:"" help:"Assemble an operator-bundle (cockroach-debug-zip-shape) for filing GitHub issues. ADR-0056."`
 	Cutover  CutoverCmd  `cmd:"" help:"Two-phase sequence priming at cutover — re-read source sequence/AUTO_INCREMENT state and apply to the target with a safety margin (F10, ADR-0062)."`
+	Trigger  TriggerCmd  `cmd:"" help:"Install / remove the postgres-trigger engine's source-side state (ADR-0066)."`
 }
 
 // EnginesCmd lists the database engines registered in the binary,

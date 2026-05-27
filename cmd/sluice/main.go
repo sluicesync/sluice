@@ -32,6 +32,7 @@ import (
 	// register them with the engines registry. Add a new engine by
 	// importing its package here.
 	_ "github.com/orware/sluice/internal/engines/mysql"
+	_ "github.com/orware/sluice/internal/engines/pgtrigger"
 	_ "github.com/orware/sluice/internal/engines/postgres"
 )
 

@@ -1,0 +1,143 @@
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"strings"
+
+	"github.com/orware/sluice/internal/engines/pgtrigger"
+)
+
+// TriggerCmd groups the operator-facing trigger-engine setup +
+// teardown commands. ADR-0066 §10: setup is deliberately explicit —
+// the operator runs `sluice trigger setup --dsn=...` once, separately
+// from `sluice sync start`, so the source-side DDL is visible at the
+// CLI rather than implicitly applied on first sync.
+//
+// The subcommand namespace is generic (`sluice trigger ...`) rather
+// than engine-specific (`sluice pgtrigger ...`) so a hypothetical
+// future `mysql-trigger` engine can share the same surface without a
+// CLI breaking change.
+type TriggerCmd struct {
+	Setup    TriggerSetupCmd    `cmd:"" help:"Install the trigger-engine state (change-log table, capture function, per-table triggers) on the source PG database."`
+	Teardown TriggerTeardownCmd `cmd:"" help:"Remove every trace of the trigger engine from the source PG database."`
+}
+
+// TriggerSetupCmd installs the source-side state needed by the
+// `postgres-trigger` engine. See ADR-0066 §10 for the operator-side
+// flow. The command refuses-loudly on any §14 boundary (no-PK,
+// UNLOGGED, generated columns, custom domain-over-UDT).
+type TriggerSetupCmd struct {
+	DSN    string   `help:"PG source DSN (URI or libpq KV form). The connecting role needs CREATE on the target schema, TRIGGER on each replicated table, and INSERT on sluice_change_log." required:"" placeholder:"DSN"`
+	Tables []string `help:"Tables to install per-table row + truncate triggers on (comma-separated, repeatable). Required for v1; empty-list discovery is a follow-up." required:"" sep:"," placeholder:"TABLE"`
+	Schema string   `help:"PG schema (namespace) the change-log + capture function + per-table triggers live in. Defaults to the DSN's 'schema' query parameter (typically 'public')." placeholder:"NAME"`
+	DryRun bool     `help:"Print the DDL the command would apply and exit; no source-side state is modified." short:"n"`
+
+	AllowPolledFingerprint bool `help:"Opt in to the polled schema-fingerprint fallback (§7) on tiers that deny event-trigger creation. Default off: the engine refuses-loudly on such tiers so the operator explicitly acknowledges the weaker DDL-detection mode."`
+}
+
+// Run implements `sluice trigger setup`.
+func (c *TriggerSetupCmd) Run(_ *Globals) error {
+	if c.DSN == "" {
+		return errors.New("--dsn is required")
+	}
+	if len(c.Tables) == 0 {
+		return errors.New("--tables is required for v1 (pass --tables=t1,t2,...)")
+	}
+	ctx := kongContext()
+	plan, err := pgtrigger.Setup(ctx, c.DSN, pgtrigger.SetupOptions{
+		Tables:                 c.Tables,
+		Schema:                 c.Schema,
+		DryRun:                 c.DryRun,
+		AllowPolledFingerprint: c.AllowPolledFingerprint,
+	})
+	if plan != nil && len(plan.Refusals) > 0 {
+		fmt.Fprintln(os.Stderr, "trigger setup refused — see refusals below:")
+		for _, r := range plan.Refusals {
+			fmt.Fprintf(os.Stderr, "  - %s.%s: %s\n      → %s\n", r.Schema, r.Table, r.Reason, r.Hint)
+		}
+		return err
+	}
+	if err != nil {
+		return err
+	}
+	if c.DryRun {
+		fmt.Fprintf(os.Stdout, "-- pgtrigger setup --dry-run (%d statement(s)) --\n", len(plan.Statements))
+		for _, s := range plan.Statements {
+			fmt.Fprintln(os.Stdout, s+";")
+			fmt.Fprintln(os.Stdout)
+		}
+		if !plan.EventTriggerSupported {
+			fmt.Fprintln(os.Stdout, "-- NOTE: the connecting role lacks event-trigger creation; --allow-polled-fingerprint was used or required (§7).")
+		}
+		return nil
+	}
+	mode := "event-trigger + polling"
+	if !plan.EventTriggerSupported {
+		mode = "polled-fingerprint-only"
+	}
+	fmt.Fprintf(
+		os.Stdout,
+		"pgtrigger setup applied (%d statement(s); DDL-detection mode: %s; PG version_num=%d)\n",
+		len(plan.Statements), mode, plan.PGVersionNum,
+	)
+	return nil
+}
+
+// TriggerTeardownCmd removes every trace of the trigger engine from
+// the source. Idempotent — re-running on a partially-uninstalled
+// source proceeds cleanly via DROP ... IF EXISTS.
+type TriggerTeardownCmd struct {
+	DSN      string   `help:"PG source DSN." required:"" placeholder:"DSN"`
+	Tables   []string `help:"Tables whose per-table triggers should be dropped. Empty (default) discovers every table with a sluice-installed trigger in the active schema." sep:"," placeholder:"TABLE"`
+	Schema   string   `help:"PG schema. Defaults to the DSN's 'schema' query parameter." placeholder:"NAME"`
+	KeepData bool     `help:"Retain sluice_change_log (and the meta table) for forensics. Default drops them — the engine's promise is to remove every trace from the source."`
+	DryRun   bool     `help:"Print the DDL and exit." short:"n"`
+}
+
+// Run implements `sluice trigger teardown`.
+func (c *TriggerTeardownCmd) Run(_ *Globals) error {
+	if c.DSN == "" {
+		return errors.New("--dsn is required")
+	}
+	ctx := kongContext()
+	plan, err := pgtrigger.Teardown(ctx, c.DSN, pgtrigger.TeardownOptions{
+		Tables:   c.Tables,
+		Schema:   c.Schema,
+		KeepData: c.KeepData,
+		DryRun:   c.DryRun,
+	})
+	if err != nil {
+		return err
+	}
+	if c.DryRun {
+		fmt.Fprintf(os.Stdout, "-- pgtrigger teardown --dry-run (%d statement(s)) --\n", len(plan.Statements))
+		for _, s := range plan.Statements {
+			fmt.Fprintln(os.Stdout, s+";")
+		}
+		return nil
+	}
+	fmt.Fprintf(os.Stdout, "pgtrigger teardown applied (%d statement(s); keep-data=%v)\n",
+		len(plan.Statements), c.KeepData)
+	return nil
+}
+
+// triggerSetupExampleSchema is a tiny helper the help-text generator
+// could reach for if we ever wanted to render an example DSN in the
+// command's --help output. Kept around but unused for now; keeps the
+// strings import non-conditional.
+//
+//nolint:unused
+func triggerSetupExampleSchema(s string) string {
+	return strings.TrimSpace(s)
+}
+
+// _ ensures the context import stays referenced even if the kong
+// wiring ever moves Run signatures around. The Run method uses
+// kongContext() which returns context.Context.
+var _ = context.Background
