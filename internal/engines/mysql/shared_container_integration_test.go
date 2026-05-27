@@ -52,6 +52,7 @@ import (
 
 	"github.com/testcontainers/testcontainers-go"
 	mysqltc "github.com/testcontainers/testcontainers-go/modules/mysql"
+	"github.com/testcontainers/testcontainers-go/wait"
 )
 
 // sharedMySQL holds the lazily-booted container and the connection
@@ -161,6 +162,18 @@ func bootSharedMySQLOnce(ctx context.Context) (host, port string, container *mys
 	container, err = mysqltc.Run(
 		ctx,
 		"mysql:8.0",
+		// Wait-strategy override BEFORE other opts: the testcontainers
+		// mysql module's default `wait until ready` log-wait uses a 60s
+		// startup timeout. On self-hosted runner pool with disk-I/O
+		// contention from concurrent shards, MySQL init regularly
+		// stretches past 60s — the inner 60s wait fires before our
+		// outer sharedMySQLBootTimeout budget, which is what makes the
+		// outer-budget bump (task #69) ineffective on its own. 4-minute
+		// startup matches the outer budget.
+		testcontainers.WithWaitStrategy(
+			wait.ForLog("port: 3306  MySQL Community Server").
+				WithStartupTimeout(sharedMySQLBootTimeout),
+		),
 		mysqltc.WithDatabase(seedDB),
 		mysqltc.WithUsername(rootUser),
 		mysqltc.WithPassword(rootPass),

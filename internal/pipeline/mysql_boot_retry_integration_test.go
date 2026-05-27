@@ -54,6 +54,7 @@ import (
 
 	"github.com/testcontainers/testcontainers-go"
 	mysqltc "github.com/testcontainers/testcontainers-go/modules/mysql"
+	"github.com/testcontainers/testcontainers-go/wait"
 )
 
 const (
@@ -101,10 +102,30 @@ func runMySQLWithRetry(t *testing.T, opts ...testcontainers.ContainerCustomizer)
 	t.Helper()
 	testcontainers.SkipIfProviderIsNotHealthy(t)
 
+	// Prepend a wait-strategy override BEFORE caller opts so testcontainers'
+	// internal `wait until ready` deadline matches our per-attempt budget.
+	// Without this, the testcontainers mysql module defaults to a 60-second
+	// startup-timeout on its "port: 3306  MySQL Community Server" log-wait,
+	// which fires before our outer mysqlBootTimeout under self-hosted runner
+	// disk-I/O contention (task #69 follow-up: CI logs showed 3 attempts ×
+	// ~100s each = ~300s wall-time exhaustion, not the 3 × 4min the outer
+	// budget allowed for — the inner 60s wait was the binding constraint).
+	// Prepending means a caller can still override if a specific test needs
+	// a different wait shape.
+	waitOpts := append(
+		[]testcontainers.ContainerCustomizer{
+			testcontainers.WithWaitStrategy(
+				wait.ForLog("port: 3306  MySQL Community Server").
+					WithStartupTimeout(mysqlBootTimeout),
+			),
+		},
+		opts...,
+	)
+
 	var lastErr error
 	for attempt := 1; attempt <= mysqlBootAttempts; attempt++ {
 		ctx, cancel := context.WithTimeout(context.Background(), mysqlBootTimeout)
-		container, err := mysqltc.Run(ctx, "mysql:8.0", opts...)
+		container, err := mysqltc.Run(ctx, "mysql:8.0", waitOpts...)
 		cancel()
 		if err == nil {
 			if attempt > 1 {
