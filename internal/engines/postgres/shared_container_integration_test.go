@@ -79,6 +79,7 @@ import (
 
 	"github.com/testcontainers/testcontainers-go"
 	pgtc "github.com/testcontainers/testcontainers-go/modules/postgres"
+	"github.com/testcontainers/testcontainers-go/wait"
 )
 
 // sharedPostgres holds the lazily-booted container and the connection
@@ -105,6 +106,12 @@ var sharedPostgres sharedPostgresState
 // minute. Matches the 2-minute budget the per-test helpers used
 // pre-refactor — applied per attempt of the retry loop (see
 // sharedPostgresBootAttempts).
+//
+// TODO(#68-follow-up): with the pre-baked image (sharedPGImage below)
+// the initdb step is already on disk, so cold-start drops to ~5s.
+// Once a few CI cycles confirm the pre-baked image is reliable this
+// budget can revert to ~1min; the retry-with-backoff scaffolding stays
+// for defense in depth.
 const sharedPostgresBootTimeout = 2 * time.Minute
 
 // sharedPostgresBootAttempts is the total number of attempts the
@@ -152,10 +159,33 @@ func sharedPostgresBootBackoff(attempt int) time.Duration {
 }
 
 const (
-	sharedPGUser    = "test"
-	sharedPGPass    = "test"
-	sharedPGSeedDB  = "sluice_shared_seed"
-	sharedPGImage   = "postgres:16"
+	sharedPGUser   = "test"
+	sharedPGPass   = "test"
+	sharedPGSeedDB = "sluice_shared_seed"
+
+	// sharedPGImage is the testcontainers image reference used by the
+	// shared TestMain boot.
+	//
+	// Task #68: this is the pre-baked image
+	// (ghcr.io/orware/sluice-postgres:16-prebaked) — built nightly from
+	// upstream postgres:16 by
+	// .github/workflows/build-prebaked-images.yml. The pre-baked image
+	// already has the heavy first-boot initdb step (~40MB written)
+	// completed, so cold-start drops from ~30s — up to 2-3 minutes
+	// under self-hosted runner disk-I/O contention — to ~5s.
+	//
+	// Byte-equivalent to upstream postgres:16 except that
+	// /var/lib/postgresql/data is pre-populated; ENTRYPOINT, CMD,
+	// EXPOSE, and the PG version are identical. The runtime GUCs
+	// (wal_level=logical, max_wal_senders=4, max_replication_slots=4)
+	// in bootSharedPostgresOnce are still applied at boot the same way
+	// they would be against the upstream image; the pre-bake just
+	// removes the initdb-on-first-boot step from the critical path.
+	//
+	// See docs/dev/ci-images.md for how the pre-baked images are
+	// built and when to bump the base version (e.g. PG 16 → 17).
+	sharedPGImage = "ghcr.io/orware/sluice-postgres:16-prebaked"
+
 	sharedPGAdminDB = "postgres"
 )
 
@@ -176,7 +206,21 @@ func bootSharedPostgresOnce(ctx context.Context) (host, port string, container *
 		pgtc.WithDatabase(sharedPGSeedDB),
 		pgtc.WithUsername(sharedPGUser),
 		pgtc.WithPassword(sharedPGPass),
-		pgtc.BasicWaitStrategies(),
+		// Task #68: with the pre-baked image the datadir is already
+		// initialized, so postgres only logs "database system is ready
+		// to accept connections" ONCE on boot (not twice — the second
+		// occurrence in BasicWaitStrategies is from the postgres image's
+		// first-boot init-then-restart sequence, which doesn't happen
+		// on a pre-baked datadir). Use an explicit 1-occurrence wait
+		// matched with the listen-port check that BasicWaitStrategies
+		// also includes.
+		testcontainers.WithWaitStrategyAndDeadline(
+			sharedPostgresBootTimeout,
+			wait.ForAll(
+				wait.ForLog("database system is ready to accept connections"),
+				wait.ForListeningPort("5432/tcp"),
+			),
+		),
 		testcontainers.CustomizeRequest(testcontainers.GenericContainerRequest{
 			ContainerRequest: testcontainers.ContainerRequest{
 				// Union of every per-test CDC helper's GUC overrides.
@@ -710,14 +754,36 @@ func pgPerTestBootBackoff(attempt int) time.Duration {
 // testcontainers.SkipIfProviderIsNotHealthy internally so callers
 // don't need to; t.Fatalf on final exhaustion mirrors the prior
 // single-shot helpers' error path.
+//
+// Task #68: the caller's opts may include pgtc.BasicWaitStrategies()
+// which waits for "ready to accept connections" × 2 — that count is
+// correct for the upstream postgres image's first-boot
+// init-then-restart cycle, but the pre-baked image only logs the
+// message once. We append a single-occurrence wait at the end of opts
+// so it replaces the BasicWaitStrategies' inner strategy without
+// requiring every caller to know about pre-baking.
 func runPGWithRetry(t *testing.T, image string, opts ...testcontainers.ContainerCustomizer) *pgtc.PostgresContainer {
 	t.Helper()
 	testcontainers.SkipIfProviderIsNotHealthy(t)
 
+	// Allocate a new slice with the wait-strategy override appended;
+	// `append(opts, ...)` could share underlying storage with the
+	// caller's opts slice (gocritic appendAssign), which would surface
+	// later if a caller built opts with extra capacity.
+	waitOpts := make([]testcontainers.ContainerCustomizer, 0, len(opts)+1)
+	waitOpts = append(waitOpts, opts...)
+	waitOpts = append(waitOpts, testcontainers.WithWaitStrategyAndDeadline(
+		pgPerTestBootTimeout,
+		wait.ForAll(
+			wait.ForLog("database system is ready to accept connections"),
+			wait.ForListeningPort("5432/tcp"),
+		),
+	))
+
 	var lastErr error
 	for attempt := 1; attempt <= pgPerTestBootAttempts; attempt++ {
 		ctx, cancel := context.WithTimeout(context.Background(), pgPerTestBootTimeout)
-		container, err := pgtc.Run(ctx, image, opts...)
+		container, err := pgtc.Run(ctx, image, waitOpts...)
 		cancel()
 		if err == nil {
 			if attempt > 1 {

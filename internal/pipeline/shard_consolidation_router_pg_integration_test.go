@@ -43,11 +43,14 @@ func startPGForRouterTest(t *testing.T) (string, func()) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 	c, err := pgtc.Run(
-		ctx, "postgres:16",
+		// Task #68: pre-baked PG image. `warehouse` is in the bake's
+		// seed-DB list. See pg_prebaked_integration_test.go.
+		ctx, pgPrebakedImage,
 		pgtc.WithDatabase("warehouse"),
 		pgtc.WithUsername("test"),
 		pgtc.WithPassword("test"),
 		pgtc.BasicWaitStrategies(),
+		pgPrebakedWaitStrategy(),
 	)
 	if err != nil {
 		t.Fatalf("start pg target: %v", err)

@@ -104,12 +104,23 @@ func runPhase2ePGWithRetry(t *testing.T, dbName string) *pgtc.PostgresContainer 
 				},
 			},
 		}),
+		// Task #68: single-occurrence wait — required for the
+		// pre-baked image (datadir already initialized, so postgres
+		// only logs "ready to accept connections" once). Replaces
+		// BasicWaitStrategies' 2-occurrence inner strategy.
+		pgPrebakedWaitStrategy(),
 	}
 
 	var lastErr error
 	for attempt := 1; attempt <= phase2eBootAttempts; attempt++ {
 		ctx, cancel := context.WithTimeout(context.Background(), phase2eBootTimeout)
-		container, err := pgtc.Run(ctx, "postgres:16", opts...)
+		// Task #68: pre-baked PG image. The dbName here is dynamic
+		// per-test so it is NOT in the bake's seed-DB list — but
+		// testcontainers' WithDatabase env var won't take effect on
+		// the pre-initialized datadir, so the caller's setup path is
+		// responsible for CREATE DATABASE-ing dbName before connecting
+		// against it. See pg_prebaked_integration_test.go.
+		container, err := pgtc.Run(ctx, pgPrebakedImage, opts...)
 		cancel()
 		if err == nil {
 			if attempt > 1 {
@@ -149,6 +160,13 @@ func phase2eSourceDSN(t *testing.T, dbName string) (dsn string, teardown func())
 	}
 	dsnCtx, dsnCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer dsnCancel()
+	// Task #68: the pre-baked image ignores POSTGRES_DB env var on the
+	// already-initialized datadir, so create the dbName explicitly.
+	// Safe no-op if dbName is one of the bake's seed databases.
+	if err := pgPrebakedEnsureDB(dsnCtx, c, dbName); err != nil {
+		teardown()
+		t.Fatalf("ensure db (db=%s): %v", dbName, err)
+	}
 	var err error
 	dsn, err = c.ConnectionString(dsnCtx, "sslmode=disable")
 	if err != nil {

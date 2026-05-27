@@ -63,11 +63,14 @@ func startPostgresWithQuotedExtension(t *testing.T, extensionName string, enable
 
 	container, err := pgtc.Run(
 		ctx,
-		"postgres:16",
+		// Task #68: pre-baked PG image. See
+		// pg_prebaked_integration_test.go for the full rationale.
+		pgPrebakedImage,
 		pgtc.WithDatabase("source_db"),
 		pgtc.WithUsername("test"),
 		pgtc.WithPassword("test"),
 		pgtc.BasicWaitStrategies(),
+		pgPrebakedWaitStrategy(),
 	)
 	if err != nil {
 		t.Fatalf("start container: %v", err)

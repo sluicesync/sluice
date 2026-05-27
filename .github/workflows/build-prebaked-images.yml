@@ -1,0 +1,90 @@
+# Pre-baked CI image builder.
+#
+# Runs `scripts/build-prebaked-images.sh` to rebuild the
+# ghcr.io/orware/sluice-{mysql,postgres,postgis} images that
+# `ci.yml`'s integration jobs consume. The script is idempotent
+# (skips when the upstream base digest hasn't moved) so the weekly
+# cron is a no-op on uneventful weeks and rebakes when MySQL 8.0 /
+# postgres:16 / postgis:16-3.4 publish a patch bump upstream.
+#
+# Why this workflow exists at all:
+#   Tasks #60, #63, #64, and #69 walked the integration-suite boot
+#   timeout / retry budget upward to absorb disk-I/O contention on
+#   the self-hosted runner when multiple MySQL containers boot
+#   concurrently. The first-boot init (mysqld --initialize-insecure
+#   writes 50-100MB; initdb writes ~40MB) is the root cause. Baking
+#   that step into the image eliminates it; cold-start drops from
+#   30-60s (or 2-3 min under contention) to ~5s.
+#
+# Triggers:
+#   - weekly cron (Sunday 06:00 UTC): keep current with upstream
+#     patch bumps without operator action.
+#   - workflow_dispatch: manual rebake from the UI, e.g. for a base-
+#     image security advisory before the next Sunday tick.
+#   - push on this workflow file or the build script: prove a change
+#     to the bake logic still pushes successfully.
+#
+# Failure surface:
+#   GitHub's default behavior on a workflow_run failure emails the
+#   commit author / scheduled-event subscriber (the repo owner here).
+#   No extra notification plumbing required.
+
+name: Build pre-baked CI images
+
+on:
+  schedule:
+    # 06:00 UTC every Sunday. Off-hours for the repo owner's timezone
+    # (US west coast) so a flaky bake doesn't compete with active dev.
+    - cron: "0 6 * * 0"
+  workflow_dispatch: {}
+  push:
+    branches: [main]
+    paths:
+      - "scripts/build-prebaked-images.sh"
+      - ".github/workflows/build-prebaked-images.yml"
+
+# Need to write to GHCR (the registry under the repo's GH org).
+# `packages: write` grants the GITHUB_TOKEN that scope so we don't need
+# a separate PAT. `contents: read` is the default and required for
+# actions/checkout. id-token unused — using docker login with the
+# GITHUB_TOKEN is sufficient for ghcr.io within the same org.
+permissions:
+  contents: read
+  packages: write
+
+# Cancel a queued run if a new push to this workflow lands. Cron runs
+# don't interfere with each other (different ref each time).
+concurrency:
+  group: build-prebaked-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  bake:
+    name: Bake ${{ matrix.engine }} image
+    runs-on: ubuntu-latest
+    # Pre-baking is independent per engine; run them in parallel.
+    # If one engine fails the others still publish — partial progress
+    # is better than none, and the failed engine's CI shard will
+    # keep using whatever was last published (or the upstream image if
+    # never published).
+    strategy:
+      fail-fast: false
+      matrix:
+        engine: [mysql, postgres, postgis]
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+
+      # GHCR_TOKEN is the GITHUB_TOKEN piped through to the script
+      # (the script accepts GHCR_TOKEN or GITHUB_TOKEN). GHCR_USER
+      # defaults to `orware` in the script.
+      - name: Build + push ${{ matrix.engine }} image
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ENGINES: ${{ matrix.engine }}
+        run: |
+          bash scripts/build-prebaked-images.sh

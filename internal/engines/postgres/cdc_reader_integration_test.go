@@ -44,14 +44,20 @@ func startPostgresForCDC(t *testing.T) (dsn string, cleanup func()) {
 // startPostgres17ForCDC is the PG 17+ counterpart used by the
 // failover-flag tests. The image is parameterised on
 // startPostgresForCDCImage so the existing PG 16 path keeps using
-// "postgres:16" — important because not all behaviour we test is
-// version-stable, and silently rolling the default would put load-
-// bearing test invariants on a moving target.
+// the same PG 16 image as the shared TestMain — important because
+// not all behaviour we test is version-stable, and silently rolling
+// the default would put load-bearing test invariants on a moving
+// target.
+//
+// PG 17 is kept on the upstream `postgres:17` image (not pre-baked,
+// task #68): the failover-flag tests are the only callers, the
+// per-boot cost on a niche path is acceptable, and adding a third
+// pre-baked artifact for one test isn't worth the maintenance.
 //
 // Stays per-test (does NOT share the container) because the image is
-// different from the shared container's postgres:16 — sharing would
-// defeat the purpose of the PG 17–specific assertion. See the comment
-// block at the foot of shared_container_integration_test.go.
+// different from the shared container's PG 16 — sharing would defeat
+// the purpose of the PG 17–specific assertion. See the comment block
+// at the foot of shared_container_integration_test.go.
 func startPostgres17ForCDC(t *testing.T) (dsn string, cleanup func()) {
 	return startPostgresForCDCImage(t, "postgres:17")
 }
@@ -608,7 +614,13 @@ func TestCDCReader_DeleteCompositePKUnderReplicaIdentityDefault(t *testing.T) {
 // the per-test 3-attempt cap (see runPGWithRetry).
 func TestCDCReader_RejectsWrongWALLevel(t *testing.T) {
 	container := runPGWithRetry(
-		t, "postgres:16",
+		// sharedPGImage is the task-#68 pre-baked PG image. Safe to
+		// reuse here even though the test asserts wal_level=replica
+		// refusal: wal_level is a runtime GUC set by container Cmd
+		// args, not baked into the image. With no wal_level override
+		// in Cmd the server starts at its default "replica" the same
+		// way it would against the upstream postgres:16 image.
+		t, sharedPGImage,
 		pgtc.WithDatabase("source_db"),
 		pgtc.WithUsername("test"),
 		pgtc.WithPassword("test"),

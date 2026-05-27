@@ -61,6 +61,9 @@ import (
 // running it against the shared container would truncate every
 // other CDC test's binlog history mid-shard. One extra container
 // boot per shard run is the price of test isolation here.
+//
+// Uses the pre-baked sharedMySQLImage (task #68) so the per-test
+// boot also avoids the init-step disk-I/O contention.
 func startMySQLGTIDForCDC(t *testing.T) (dsn string, cleanup func()) {
 	t.Helper()
 	testcontainers.SkipIfProviderIsNotHealthy(t)
@@ -80,7 +83,7 @@ func startMySQLGTIDForCDC(t *testing.T) (dsn string, cleanup func()) {
 		ctx, cancel := context.WithTimeout(context.Background(), sharedMySQLBootTimeout)
 		c, err := mysqltc.Run(
 			ctx,
-			"mysql:8.0",
+			sharedMySQLImage,
 			mysqltc.WithDatabase("source_db"),
 			mysqltc.WithUsername("root"),
 			mysqltc.WithPassword("rootpw"),
