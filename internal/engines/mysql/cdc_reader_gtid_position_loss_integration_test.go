@@ -46,6 +46,7 @@ import (
 
 	"github.com/testcontainers/testcontainers-go"
 	mysqltc "github.com/testcontainers/testcontainers-go/modules/mysql"
+	"github.com/testcontainers/testcontainers-go/wait"
 )
 
 // startMySQLGTIDForCDC boots a MySQL container with binlog + GTID
@@ -96,6 +97,18 @@ func startMySQLGTIDForCDC(t *testing.T) (dsn string, cleanup func()) {
 					},
 				},
 			}),
+			// Wait-strategy override LAST so it replaces the module's
+			// default 60s deadline. testcontainers' `WithWaitStrategy`
+			// hard-wraps with 60s; use `WithWaitStrategyAndDeadline`
+			// (matching the per-attempt sharedMySQLBootTimeout) so both
+			// outer wait.ForAll deadline AND inner LogStrategy timeout
+			// honour the 4-min budget under self-hosted runner load
+			// (task #69 + WithStartupTimeout follow-up).
+			testcontainers.WithWaitStrategyAndDeadline(
+				sharedMySQLBootTimeout,
+				wait.ForLog("port: 3306  MySQL Community Server").
+					WithStartupTimeout(sharedMySQLBootTimeout),
+			),
 		)
 		cancel()
 		if err == nil {
