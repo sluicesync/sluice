@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 # build-prebaked-images.sh — bake the heavy first-boot init step into
-# MySQL / Postgres / PostGIS images so testcontainers cold-starts in CI
-# avoid the 30-60s (under disk-I/O contention: 2-3 min) init writes.
+# MySQL / Postgres / PostGIS / pgvector images so testcontainers cold-
+# starts in CI avoid the 30-60s (under disk-I/O contention: 2-3 min)
+# init writes. Task #70 added pgvector to the matrix to additionally
+# eliminate docker.io as a single-point-of-failure pull source (the
+# self-hosted runner pool hit 3-consecutive docker.io TLS handshake
+# timeouts pulling pgvector/pgvector:0.7.4-pg16 on PR #72).
 #
 # History: tasks #60, #63, #64, and #69 walked the budget upward
 # (single-shot → 3-retry → 4-min timeout → WithWaitStrategyAndDeadline)
@@ -13,7 +17,7 @@
 # "ready to accept connections" in ~5s instead of ~30-60s.
 #
 # What it does for each engine:
-#   1. Pull the upstream base image (mysql:8.0 / postgres:16 / postgis/postgis:16-3.4).
+#   1. Pull the upstream base image (mysql:8.0 / postgres:16 / postgis/postgis:16-3.4 / pgvector/pgvector:0.7.4-pg16).
 #   2. Generate a Dockerfile that FROMs the base and RUNs the
 #      init step inline. The init also creates the test user with the
 #      password the integration suite uses (rootpw for MySQL, test/test
@@ -54,10 +58,10 @@
 #   that owns the token (defaults to `orware`).
 #
 # Usage:
-#   ./scripts/build-prebaked-images.sh             # build + push all 3
+#   ./scripts/build-prebaked-images.sh             # build + push all 4
 #   SKIP_PUSH=1 ./scripts/build-prebaked-images.sh # build only, no push
 #   ENGINES=mysql ./scripts/build-prebaked-images.sh
-#   ENGINES="postgres postgis" ./scripts/build-prebaked-images.sh
+#   ENGINES="postgres postgis pgvector" ./scripts/build-prebaked-images.sh
 #
 # CI usage: invoked by .github/workflows/build-prebaked-images.yml on a
 # weekly cron + workflow_dispatch.
@@ -70,7 +74,7 @@ GHCR_NAMESPACE="${GHCR_NAMESPACE:-ghcr.io/orware}"
 GHCR_USER="${GHCR_USER:-orware}"
 
 # Engines to bake. Override via $ENGINES (space-separated subset).
-ENGINES_DEFAULT="mysql postgres postgis"
+ENGINES_DEFAULT="mysql postgres postgis pgvector"
 ENGINES="${ENGINES:-$ENGINES_DEFAULT}"
 
 # Base + target image identifiers. Keep these aligned with the imports
@@ -84,6 +88,18 @@ POSTGRES_TARGET_IMAGE="${GHCR_NAMESPACE}/sluice-postgres:16-prebaked"
 
 POSTGIS_BASE_IMAGE="postgis/postgis:16-3.4"
 POSTGIS_TARGET_IMAGE="${GHCR_NAMESPACE}/sluice-postgis:16-3.4-prebaked"
+
+# pgvector (task #70): mirror docker.io/pgvector/pgvector:0.7.4-pg16 to
+# GHCR to eliminate the docker.io TLS-handshake-timeout flake the
+# self-hosted runner pool started hitting in May 2026 (3-consecutive
+# failures on PR #72's pipeline-rest-other shard pulling the upstream
+# tag). pgvector's image is a stock postgres:16 with the extension's
+# shared libraries preinstalled — so its bake mirrors the postgres bake
+# (initdb + pg_hba.conf trust + test superuser + seed databases). The
+# extension itself stays inert until CREATE EXTENSION vector runs at
+# test time, which is the upstream image's contract.
+PGVECTOR_BASE_IMAGE="pgvector/pgvector:0.7.4-pg16"
+PGVECTOR_TARGET_IMAGE="${GHCR_NAMESPACE}/sluice-pgvector:0.7.4-pg16-prebaked"
 
 # --- Helpers ----------------------------------------------------------
 
@@ -362,6 +378,62 @@ DOCKERFILE
     fi
 }
 
+# bake_pgvector mirrors bake_postgres but uses the pgvector-flavored
+# base image (pgvector/pgvector:0.7.4-pg16 — a stock postgres:16 with
+# the pgvector extension's shared libraries preinstalled). Task #70:
+# this exists to eliminate docker.io as a single point of failure for
+# CI — the self-hosted runner pool hit 3-consecutive docker.io TLS
+# handshake timeouts pulling the upstream tag on PR #72. The pgvector
+# extension stays inert in the image until CREATE EXTENSION vector
+# runs at test time (which matches the upstream contract); we're
+# baking initdb + the test role + seed databases, NOT CREATE
+# EXTENSION (which is per-database and test-driven).
+bake_pgvector() {
+    log "baking ${PGVECTOR_TARGET_IMAGE}"
+
+    docker pull "$PGVECTOR_BASE_IMAGE"
+    local base_digest
+    base_digest="$(base_digest_local "$PGVECTOR_BASE_IMAGE")"
+    log "base digest: ${base_digest}"
+
+    if image_exists_remote "$PGVECTOR_TARGET_IMAGE"; then
+        local existing
+        existing="$(baked_label_remote "$PGVECTOR_TARGET_IMAGE")"
+        if [[ "${FORCE_REBUILD:-0}" != "1" && -n "$existing" && "$existing" == "$base_digest" ]]; then
+            log "${PGVECTOR_TARGET_IMAGE} already up-to-date against base digest; skipping"
+            return 0
+        fi
+        log "remote tag exists but base digest differs (was=${existing}); rebaking"
+    fi
+
+    log "running initdb + test-user fixup (pgvector flavor)"
+    bake_via_dockerfile "$PGVECTOR_TARGET_IMAGE" <<DOCKERFILE
+FROM ${PGVECTOR_BASE_IMAGE}
+LABEL sluice.basedigest="${base_digest}"
+LABEL sluice.baseimage="${PGVECTOR_BASE_IMAGE}"
+USER postgres
+RUN set -e; \\
+    echo postgres > /tmp/pgpw; \\
+    initdb --username=postgres --pwfile=/tmp/pgpw --auth-local=trust --auth-host=trust --encoding=UTF8 -D /var/lib/postgresql/data; \\
+    rm -f /tmp/pgpw; \\
+    echo "host all all 0.0.0.0/0 trust" >> /var/lib/postgresql/data/pg_hba.conf; \\
+    echo "host all all ::/0 trust"      >> /var/lib/postgresql/data/pg_hba.conf; \\
+    mkdir -p /tmp/pgsock; \\
+    pg_ctl -D /var/lib/postgresql/data -o "-c listen_addresses='' -c unix_socket_directories='/tmp/pgsock'" -l /tmp/pg.log -w start; \\
+    psql -h /tmp/pgsock -U postgres -d postgres \\
+        -c "CREATE ROLE test WITH SUPERUSER LOGIN BYPASSRLS PASSWORD 'test'" \\
+        -c "CREATE DATABASE sluice_shared_seed OWNER test" \\
+        -c "CREATE DATABASE source_db OWNER test" \\
+        -c "CREATE DATABASE warehouse OWNER test"; \\
+    pg_ctl -D /var/lib/postgresql/data -w stop
+DOCKERFILE
+
+    if [[ "${SKIP_PUSH:-0}" != "1" ]]; then
+        log "pushing ${PGVECTOR_TARGET_IMAGE}"
+        docker push "$PGVECTOR_TARGET_IMAGE"
+    fi
+}
+
 # --- Main -------------------------------------------------------------
 
 main() {
@@ -374,8 +446,9 @@ main() {
             mysql)    bake_mysql ;;
             postgres) bake_postgres ;;
             postgis)  bake_postgis ;;
+            pgvector) bake_pgvector ;;
             *)
-                log "ERROR: unknown engine '${engine}' (want one of: mysql postgres postgis)"
+                log "ERROR: unknown engine '${engine}' (want one of: mysql postgres postgis pgvector)"
                 exit 1
                 ;;
         esac

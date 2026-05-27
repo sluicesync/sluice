@@ -4,12 +4,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // PG → PG pgvector passthrough integration tests (ADR-0032).
-// Boots the pgvector/pgvector:0.7-pg16 image (which ships with both
-// PG 16 and the pgvector extension files installed but inactive),
-// CREATE EXTENSION on both source and target, exercises the
-// full migrate path with a vector column + ivfflat / hnsw indexes,
-// and verifies the round-trip preserves the column type, indexes,
-// and row data.
+// Boots the pre-baked pgvector image (task #70 — mirror of upstream
+// pgvector/pgvector:0.7.4-pg16, which ships with both PG 16 and the
+// pgvector extension files installed but inactive), CREATE EXTENSION
+// on both source and target, exercises the full migrate path with a
+// vector column + ivfflat / hnsw indexes, and verifies the round-trip
+// preserves the column type, indexes, and row data.
 
 package pipeline
 
@@ -29,11 +29,18 @@ import (
 	pgtc "github.com/testcontainers/testcontainers-go/modules/postgres"
 )
 
-// pgVectorImage is the image tag the pgvector tests boot. The
-// upstream pgvector/pgvector image bundles the extension's shared
-// libraries on a stock postgres image; CREATE EXTENSION flips the
-// per-database bit.
-const pgVectorImage = "pgvector/pgvector:0.7.4-pg16"
+// pgVectorImage is the image tag the pgvector tests boot. Task #70
+// pre-baked it to ghcr.io to eliminate docker.io as a single point of
+// failure for CI pulls (3-consecutive docker.io TLS-handshake-timeouts
+// on PR #72's pipeline-rest-other shard pulling the upstream tag drove
+// the migration). Byte-equivalent to upstream pgvector/pgvector:
+// 0.7.4-pg16 except /var/lib/postgresql/data has initdb already run +
+// the `test` superuser and seed databases (source_db, warehouse,
+// sluice_shared_seed) already created. The pgvector extension's
+// shared libraries are present the same way they are in upstream;
+// CREATE EXTENSION vector still flips the per-database bit at test
+// time. See docs/dev/ci-images.md.
+const pgVectorImage = "ghcr.io/orware/sluice-pgvector:0.7.4-pg16-prebaked"
 
 // startPostgresWithPGVector boots a pgvector-enabled PG container,
 // creates the source and target databases, and runs CREATE
@@ -54,6 +61,11 @@ func startPostgresWithPGVector(t *testing.T, enableOnTarget bool) (sourceDSN, ta
 		pgtc.WithUsername("test"),
 		pgtc.WithPassword("test"),
 		pgtc.BasicWaitStrategies(),
+		// Single-occurrence wait — required for the pre-baked image
+		// (datadir already initialized, so postgres only logs "ready
+		// to accept connections" once). Replaces BasicWaitStrategies'
+		// 2-occurrence inner strategy. See pg_prebaked_integration_test.go.
+		pgPrebakedWaitStrategy(),
 	)
 	if err != nil {
 		t.Fatalf("start container: %v", err)
