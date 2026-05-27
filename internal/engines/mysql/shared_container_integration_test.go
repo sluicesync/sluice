@@ -45,6 +45,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"sync"
 	"testing"
@@ -61,9 +62,37 @@ import (
 // host/port come from the container at boot time; dbName is the
 // container's seed db (we ignore it and create per-test dbs below).
 // container is kept for TestMain's terminate.
+//
+// containerDeadOnce + containerDead together implement the
+// mid-shard-death sentinel (task #71, mirror of task #64's PG
+// counterpart): if the shared container becomes unreachable after a
+// successful boot — observed on the self-hosted CI runner pool when
+// the docker engine restarts mid-shard, or when the mysqld process
+// inside the container dies while Docker still considers the
+// container running, see PR #73 run
+// https://github.com/orware/sluice/actions/runs/26533999631/job/78157843061
+// where ~80 tests each emitted "[mysql] packets.go:58 unexpected EOF"
+// in resetSharedDB — every subsequent reset would otherwise fail
+// individually with the same noisy stack. The sentinel collapses
+// that into one loud log line via the sync.Once and a fast t.Fatalf
+// for the rest of the shard so the failure reason is unmistakable
+// in CI logs rather than buried in 80x repeated stack traces.
+//
+// The liveness probe used is a fast TCP dial against the mapped SQL
+// port, not Container.IsRunning(). The PG counterpart (PR #72)
+// demonstrated that Docker can report the container as running while
+// the SQL port refuses connections — so IsRunning() is too coarse a
+// signal. The MySQL failure mode in PR #73's run is the same shape
+// (driver-level "unexpected EOF" instead of "connection refused"
+// because go-sql-driver/mysql translates the dead-socket signal
+// differently, but the underlying liveness issue is identical).
 type sharedMySQLState struct {
-	once      sync.Once
-	bootErr   error
+	once    sync.Once
+	bootErr error
+
+	containerDeadOnce sync.Once
+	containerDead     bool
+
 	host      string
 	port      string
 	user      string
@@ -314,6 +343,80 @@ func ensureSharedMySQL(t *testing.T) (host, port, user, password string) {
 	return sharedMySQL.host, sharedMySQL.port, sharedMySQL.user, sharedMySQL.password
 }
 
+// checkSharedContainerAlive is the mid-shard-death sentinel (task #71,
+// mirror of the PG counterpart in task #64). Probes the container's
+// mapped SQL port via a fast TCP-dial — the liveness signal that
+// actually matters to the SQL work the caller is about to do — and
+// short-circuits the test if the port is no longer reachable.
+//
+// **Why TCP-dial, not Container.IsRunning():** the PG counterpart's
+// first cut used IsRunning(), which queries Docker's view of the
+// container. Its own CI rerun
+// (https://github.com/orware/sluice/actions/runs/26527039528/job/78138790049)
+// reproduced the exact cascade the sentinel was supposed to catch
+// and the loud DOCKER-ENGINE-DEAD log line was NOT emitted, proving
+// IsRunning() returned true while the SQL port was unreachable. The
+// failure mode in practice is "container alive by Docker's lights
+// but mysqld process dead inside (or port mapping broken)", not
+// "Docker engine restarted entirely". A TCP-dial against host:port
+// catches both failure modes; IsRunning() catches only the latter.
+// Dial cost is ~1ms locally vs ~30ms for a SQL ping, and we call
+// this from every test's reset, so the dial is the right cheap
+// signal. If the dial succeeds but SQL still fails inside reset(),
+// the test fails loudly anyway — no silent loss.
+//
+// On the FIRST unreachable-container observation in the shard, the
+// sentinel records the failure via containerDeadOnce + log.Printf so
+// the CI log shows a single loud "docker engine dead mid-shard"
+// message. Every subsequent test sees containerDead == true and
+// t.Fatalf's quickly against that flag, skipping the SQL work that
+// would otherwise produce 80x "[mysql] packets.go:58 unexpected EOF"
+// stack traces.
+//
+// Original MySQL cascade: PR #73 run
+// https://github.com/orware/sluice/actions/runs/26533999631/job/78157843061
+// where ~80 engines-mysql tests all reported the driver-level EOF in
+// resetSharedDB after the shared mysqld died mid-shard. The boot
+// retry above (sharedMySQLBootAttempts) only protects the initial
+// boot; this sentinel covers the post-boot lifetime where the same
+// container instance is shared across the whole shard.
+//
+// Caller contract: invoke before any SQL work that touches the
+// shared container. Returns true on alive (caller proceeds); calls
+// t.Fatalf and does not return on dead.
+func checkSharedContainerAlive(t *testing.T) bool {
+	t.Helper()
+	if sharedMySQL.container == nil {
+		// Boot never happened (or failed and bootErr was set). Caller
+		// should not have reached this path; defensive Fatalf so the
+		// failure mode is loud rather than a nil-deref.
+		t.Fatalf("shared mysql container is nil; ensureSharedMySQL was not called or failed")
+		return false
+	}
+	if sharedMySQL.containerDead {
+		t.Fatalf("shared mysql container unreachable mid-shard; skipping (see prior 'DOCKER-ENGINE-DEAD' message)")
+		return false
+	}
+	addr := net.JoinHostPort(sharedMySQL.host, sharedMySQL.port)
+	conn, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)
+	if err == nil {
+		_ = conn.Close()
+		return true
+	}
+	sharedMySQL.containerDeadOnce.Do(func() {
+		sharedMySQL.containerDead = true
+		log.Printf("DOCKER-ENGINE-DEAD: shared mysql container %s is unreachable mid-shard "+
+			"(TCP dial to %s failed: %v); every remaining test in engines/mysql will fail "+
+			"fast with this sentinel. Root cause is almost always the docker daemon restarting "+
+			"under the self-hosted runner — or the mysqld process dying inside an otherwise "+
+			"alive container — NOT a sluice bug. See task #71 / PR #73 for the original "+
+			"cascade and task #64 / PR #72 for the matching PG implementation.",
+			sharedMySQL.container.GetContainerID(), addr, err)
+	})
+	t.Fatalf("shared mysql container unreachable mid-shard (TCP dial to %s failed); see prior 'DOCKER-ENGINE-DEAD' log line", addr)
+	return false
+}
+
 // sharedDSN builds a DSN pointed at dbName on the shared container.
 // parseTime=true matches every per-test helper's prior connection
 // string so test code that compares time.Time values behaves the
@@ -337,6 +440,15 @@ func sharedDSN(host, port, user, password, dbName string) string {
 // enabled by default; the DROP/CREATE is unconditional and atomic.
 func resetSharedDB(t *testing.T, dbName string) {
 	t.Helper()
+
+	// Task #71 sentinel: probe container liveness BEFORE opening the
+	// SQL connection. If the shared container died mid-shard (docker
+	// engine restart, OOM kill, etc.), this short-circuits with a
+	// single loud log line instead of letting each of the ~80 tests
+	// in the shard waste time hitting "[mysql] packets.go:58
+	// unexpected EOF".
+	checkSharedContainerAlive(t)
+
 	host, port, user, password := sharedPrimitives()
 
 	const sharedSeedDB = "sluice_shared_seed"
@@ -400,6 +512,21 @@ func newSharedDB(t *testing.T, dbName string) (dsn string, cleanup func()) {
 // process is about to terminate) avoids the lint.
 func TestMain(m *testing.M) {
 	code := m.Run()
+
+	// Task #71: if the mid-shard-death sentinel fired during the run,
+	// surface that fact at the very end of TestMain so the operator
+	// reading CI logs from the bottom up sees "docker engine died" as
+	// the LAST log line — not buried among the cascading test
+	// failures. Once-only log is also emitted by
+	// checkSharedContainerAlive at the moment of detection; this is
+	// the trailing summary so the cause is visible at both ends of
+	// the failure region.
+	if sharedMySQL.containerDead {
+		log.Printf("DOCKER-ENGINE-DEAD: shared mysql container became unreachable mid-shard during this run; " +
+			"all engines/mysql failures above with 'unreachable mid-shard' are downstream of this. " +
+			"This is a runner-infrastructure issue (docker daemon restart or mysqld process death), " +
+			"NOT a sluice code bug.")
+	}
 
 	if sharedMySQL.container != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
