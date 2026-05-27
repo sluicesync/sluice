@@ -1,6 +1,6 @@
 # Pre-baked CI container images
 
-The integration suite's MySQL, Postgres, and PostGIS containers boot from pre-baked images published to GitHub Container Registry, not from the upstream Docker Hub tags. This page explains why, how the images are built, how the weekly cron keeps them current, and what to do when the upstream base version genuinely changes (e.g. MySQL 8.0 → 8.4).
+The integration suite's MySQL, Postgres, PostGIS, and pgvector containers boot from pre-baked images published to GitHub Container Registry, not from the upstream Docker Hub tags. This page explains why, how the images are built, how the weekly cron keeps them current, and what to do when the upstream base version genuinely changes (e.g. MySQL 8.0 → 8.4).
 
 ## Why this exists
 
@@ -13,7 +13,9 @@ The integration suite repeatedly hit boot-time flakes on the self-hosted runner 
 
 Each round bought headroom without eliminating the root cause. **The root cause is the first-boot init step:** `mysqld --initialize-insecure` writes 50-100 MB of system tables to disk, and `initdb` writes ~40 MB; when multiple containers do that concurrently on a contended runner, individual boots stretch past whatever budget is currently in place.
 
-**Task #68** cuts the root cause by baking the init step into the image. The script in `scripts/build-prebaked-images.sh` runs the init once, then `docker commit`s the resulting filesystem to an image tagged `ghcr.io/orware/sluice-{mysql,postgres,postgis}:*-prebaked`. The integration suite pulls these images instead of upstream, so cold-start drops from 30-60s (or 2-3 minutes under contention) to ~5s.
+**Task #68** cuts the root cause by baking the init step into the image. The script in `scripts/build-prebaked-images.sh` runs the init once, then `docker commit`s the resulting filesystem to an image tagged `ghcr.io/orware/sluice-{mysql,postgres,postgis,pgvector}:*-prebaked`. The integration suite pulls these images instead of upstream, so cold-start drops from 30-60s (or 2-3 minutes under contention) to ~5s.
+
+**Task #70** added pgvector to the matrix for a different reason: not boot-cost but registry availability. The self-hosted runner pool hit 3-consecutive `docker.io` TLS-handshake timeouts pulling `pgvector/pgvector:0.7.4-pg16` on PR #72, blocking unrelated work. Mirroring the image to GHCR eliminates docker.io as a single point of failure for all CI runs — the bake shape mirrors `postgres:16` since pgvector is itself a postgres image with the extension's shared libraries preinstalled.
 
 The retry-with-backoff and 4-minute timeout scaffolding stays in place as defense in depth — if ghcr.io is unreachable or the bake is broken, the retry layer absorbs the boot failure rather than failing all ~62 tests in the shard. A `TODO(#68-follow-up)` near `sharedMySQLBootTimeout` / `mysqlBootTimeout` notes that the timeout can revert to 2 minutes (or even 1 minute) once a few CI cycles confirm the pre-baked image is reliable.
 
@@ -24,10 +26,10 @@ Pre-baked:
 - `ghcr.io/orware/sluice-mysql:8.0-prebaked` — upstream `mysql:8.0` + `mysqld --initialize-insecure` with `--log-bin --binlog-format=ROW --binlog-row-image=FULL` flags matching the shared TestMain's Cmd args.
 - `ghcr.io/orware/sluice-postgres:16-prebaked` — upstream `postgres:16` + `initdb`.
 - `ghcr.io/orware/sluice-postgis:16-3.4-prebaked` — upstream `postgis/postgis:16-3.4` + `initdb`.
+- `ghcr.io/orware/sluice-pgvector:0.7.4-pg16-prebaked` — upstream `pgvector/pgvector:0.7.4-pg16` + `initdb` (task #70 — mirrors to GHCR to bypass docker.io flakes; the pgvector extension stays inert until `CREATE EXTENSION vector` runs at test time, matching the upstream image's contract).
 
 NOT pre-baked:
 
-- `pgvector/pgvector:0.7.4-pg16` — niche extension image used by one test suite. Pre-baking a third artifact for a narrow use case isn't worth the maintenance cost.
 - `postgres:17` — used only by the failover-flag tests in `internal/engines/postgres/cdc_reader_integration_test.go`; per-boot cost on a niche path is acceptable.
 - `vitess/vttestserver:mysql80`, `vitess/lite`, `quay.io/coreos/etcd` — Vitess test images; behind opt-in `vstream` / `vitessreshard` build tags, not in the default CI gate.
 
@@ -80,6 +82,7 @@ When upstream MySQL 8.0 → 8.4 (or postgres:16 → 17) is a real, intentional v
    - `internal/pipeline/mysql_boot_retry_integration_test.go` — `mysqlBootImage`
    - `internal/engines/postgres/shared_container_integration_test.go` — `sharedPGImage`
    - `internal/pipeline/migrate_postgis_integration_test.go` — `postgisPrebakedImage`
+   - `internal/pipeline/migrate_pgvector_integration_test.go` — `pgVectorImage`
 3. Edit `.github/workflows/ci.yml` — update the `docker pull` references in both the `integration` and `integration-postgis` jobs.
 4. Run the rebuild workflow (`workflow_dispatch` of `Build pre-baked CI images`) first; verify the new tag is published; only then merge the PR. The integration CI on the PR will exercise the new image end-to-end.
 
