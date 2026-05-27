@@ -42,6 +42,19 @@ on:
     paths:
       - "scripts/build-prebaked-images.sh"
       - ".github/workflows/build-prebaked-images.yml"
+  # Also run on PRs that touch the bake script or this workflow so
+  # the bake logic is exercised end-to-end before merge. Without this
+  # the first cron run after merge becomes the integration test for
+  # the bake itself, which has bitten this kind of CI plumbing before.
+  # SECURITY: pull_request from forks gets a read-only GITHUB_TOKEN
+  # by default, so the push step would fail — but the build step
+  # still exercises the bake. For PRs from the same repo (the common
+  # case for orware/sluice work), the token has packages:write and
+  # the bake fully publishes.
+  pull_request:
+    paths:
+      - "scripts/build-prebaked-images.sh"
+      - ".github/workflows/build-prebaked-images.yml"
 
 # Need to write to GHCR (the registry under the repo's GH org).
 # `packages: write` grants the GITHUB_TOKEN that scope so we don't need
