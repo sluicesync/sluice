@@ -93,11 +93,15 @@ jobs:
       - uses: actions/checkout@v6
 
       # GHCR_TOKEN is the GITHUB_TOKEN piped through to the script
-      # (the script accepts GHCR_TOKEN or GITHUB_TOKEN). GHCR_USER
-      # defaults to `orware` in the script.
+      # (the script accepts GHCR_TOKEN or GITHUB_TOKEN). GHCR_USER is
+      # the actor who triggered the workflow — for scheduled runs this
+      # is `github-actions[bot]`, for workflow_dispatch / push it's the
+      # operator's GitHub login. Either is accepted by ghcr.io when
+      # paired with a GITHUB_TOKEN of sufficient scope.
       - name: Build + push ${{ matrix.engine }} image
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USER: ${{ github.actor }}
           ENGINES: ${{ matrix.engine }}
         run: |
           bash scripts/build-prebaked-images.sh
