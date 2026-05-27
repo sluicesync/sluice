@@ -102,24 +102,25 @@ func runMySQLWithRetry(t *testing.T, opts ...testcontainers.ContainerCustomizer)
 	t.Helper()
 	testcontainers.SkipIfProviderIsNotHealthy(t)
 
-	// Prepend a wait-strategy override BEFORE caller opts so testcontainers'
-	// internal `wait until ready` deadline matches our per-attempt budget.
-	// Without this, the testcontainers mysql module defaults to a 60-second
-	// startup-timeout on its "port: 3306  MySQL Community Server" log-wait,
-	// which fires before our outer mysqlBootTimeout under self-hosted runner
-	// disk-I/O contention (task #69 follow-up: CI logs showed 3 attempts ×
-	// ~100s each = ~300s wall-time exhaustion, not the 3 × 4min the outer
-	// budget allowed for — the inner 60s wait was the binding constraint).
-	// Prepending means a caller can still override if a specific test needs
-	// a different wait shape.
+	// Wait-strategy override matching our per-attempt budget. testcontainers'
+	// `WithWaitStrategy` hard-wraps the inner strategy with a 60-second
+	// deadline at the OUTER wait.ForAll, which overrides any inner
+	// WithStartupTimeout on the LogStrategy — that's the testcontainers
+	// pattern, not a bug we can fix at the wait-strategy layer. The fix is
+	// to use `WithWaitStrategyAndDeadline` (deadline-explicit variant) so
+	// the outer wait.ForAll deadline matches our 4-minute per-attempt
+	// budget. Without this, every failed attempt hits the 60s default
+	// deadline (CI evidence: PR #67 post-bump runs failed ~100s per attempt,
+	// not 4min). APPENDED after caller opts so it definitively replaces
+	// any opt the caller may have set; if a specific test needs a different
+	// wait it can pass its own WithWaitStrategyAndDeadline AFTER.
 	waitOpts := append(
-		[]testcontainers.ContainerCustomizer{
-			testcontainers.WithWaitStrategy(
-				wait.ForLog("port: 3306  MySQL Community Server").
-					WithStartupTimeout(mysqlBootTimeout),
-			),
-		},
-		opts...,
+		opts,
+		testcontainers.WithWaitStrategyAndDeadline(
+			mysqlBootTimeout,
+			wait.ForLog("port: 3306  MySQL Community Server").
+				WithStartupTimeout(mysqlBootTimeout),
+		),
 	)
 
 	var lastErr error

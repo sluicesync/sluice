@@ -162,18 +162,6 @@ func bootSharedMySQLOnce(ctx context.Context) (host, port string, container *mys
 	container, err = mysqltc.Run(
 		ctx,
 		"mysql:8.0",
-		// Wait-strategy override BEFORE other opts: the testcontainers
-		// mysql module's default `wait until ready` log-wait uses a 60s
-		// startup timeout. On self-hosted runner pool with disk-I/O
-		// contention from concurrent shards, MySQL init regularly
-		// stretches past 60s — the inner 60s wait fires before our
-		// outer sharedMySQLBootTimeout budget, which is what makes the
-		// outer-budget bump (task #69) ineffective on its own. 4-minute
-		// startup matches the outer budget.
-		testcontainers.WithWaitStrategy(
-			wait.ForLog("port: 3306  MySQL Community Server").
-				WithStartupTimeout(sharedMySQLBootTimeout),
-		),
 		mysqltc.WithDatabase(seedDB),
 		mysqltc.WithUsername(rootUser),
 		mysqltc.WithPassword(rootPass),
@@ -188,6 +176,21 @@ func bootSharedMySQLOnce(ctx context.Context) (host, port string, container *mys
 				},
 			},
 		}),
+		// Wait-strategy override LAST so it definitively replaces module
+		// defaults. testcontainers' `WithWaitStrategy` hard-wraps any
+		// strategy with a 60s deadline at the OUTER wait.ForAll, which
+		// overrides any inner WithStartupTimeout — use the explicit
+		// `WithWaitStrategyAndDeadline` form so both inner and outer
+		// timeouts match our 4-minute boot budget. Without this, the
+		// outer 60s deadline fires under self-hosted runner disk-I/O
+		// contention (task #69 / PR #69-follow-up: CI evidence showed
+		// each failed attempt at ~100s — the 60s deadline, not the
+		// 4-minute inner timeout).
+		testcontainers.WithWaitStrategyAndDeadline(
+			sharedMySQLBootTimeout,
+			wait.ForLog("port: 3306  MySQL Community Server").
+				WithStartupTimeout(sharedMySQLBootTimeout),
+		),
 	)
 	if err != nil {
 		if container != nil {
