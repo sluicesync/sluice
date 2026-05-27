@@ -309,17 +309,23 @@ jobs:
       # internal/pipeline/migrate_pgvector_integration_test.go suite
       # (ADR-0032 PG → PG extension passthrough). The image is a
       # superset of postgres:16 with the pgvector extension files
-      # bundled; cold-start size is ~110 MB layer-compressed. Kept on
-      # upstream (NOT pre-baked) — it's a niche extension image used
-      # by one test suite, and pre-baking a third artifact for a
-      # narrow use case isn't worth the maintenance.
+      # bundled.
+      #
+      # Task #70: now pre-baked to ghcr.io/orware/sluice-pgvector:
+      # 0.7.4-pg16-prebaked. The self-hosted runner pool hit 3
+      # consecutive docker.io TLS-handshake-timeouts pulling the
+      # upstream tag on PR #72; mirroring to GHCR eliminates docker.io
+      # as a single point of failure for ALL future CI runs. Same
+      # bake shape as postgres:16 (initdb + test superuser + seed
+      # databases); CREATE EXTENSION vector remains test-time (the
+      # upstream image's contract).
       #
       # postgis pre-baked image is pulled in the dedicated
       # `integration-postgis` job below — not here.
       - run: |
           docker pull ghcr.io/orware/sluice-mysql:8.0-prebaked
           docker pull ghcr.io/orware/sluice-postgres:16-prebaked
-          docker pull pgvector/pgvector:0.7.4-pg16
+          docker pull ghcr.io/orware/sluice-pgvector:0.7.4-pg16-prebaked
 
       # Run every package's integration tests. -count=1 disables the
       # test cache so we always exercise real containers (cached results

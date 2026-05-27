@@ -1,11 +1,13 @@
 # Pre-baked CI image builder.
 #
 # Runs `scripts/build-prebaked-images.sh` to rebuild the
-# ghcr.io/orware/sluice-{mysql,postgres,postgis} images that
+# ghcr.io/orware/sluice-{mysql,postgres,postgis,pgvector} images that
 # `ci.yml`'s integration jobs consume. The script is idempotent
 # (skips when the upstream base digest hasn't moved) so the weekly
 # cron is a no-op on uneventful weeks and rebakes when MySQL 8.0 /
-# postgres:16 / postgis:16-3.4 publish a patch bump upstream.
+# postgres:16 / postgis:16-3.4 / pgvector:0.7.4-pg16 publish a patch
+# bump upstream. Task #70 added pgvector to eliminate docker.io as a
+# single point of failure for CI pulls.
 #
 # Why this workflow exists at all:
 #   Tasks #60, #63, #64, and #69 walked the integration-suite boot
@@ -87,7 +89,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        engine: [mysql, postgres, postgis]
+        engine: [mysql, postgres, postgis, pgvector]
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
