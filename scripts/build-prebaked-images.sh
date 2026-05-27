@@ -224,7 +224,20 @@ RUN set -e; \\
     mysql --socket=/tmp/mysql-bake.sock -uroot -e "ALTER USER 'root'@'localhost' IDENTIFIED BY 'rootpw'; CREATE USER 'root'@'%' IDENTIFIED BY 'rootpw'; GRANT ALL PRIVILEGES ON *.* TO 'root'@'%' WITH GRANT OPTION; FLUSH PRIVILEGES; CREATE DATABASE sluice_shared_seed CHARACTER SET utf8mb4; CREATE DATABASE source_db CHARACTER SET utf8mb4; CREATE DATABASE warehouse CHARACTER SET utf8mb4;"; \\
     mysqladmin --socket=/tmp/mysql-bake.sock -uroot -prootpw shutdown; \\
     wait \$mysqld_pid || true; \\
-    rm -f /tmp/mysql-bake.sock
+    rm -f /tmp/mysql-bake.sock; \\
+    # Delete auto.cnf so each container that boots from this image
+    # regenerates a unique server_uuid. The bake-time mysqld wrote a
+    # specific UUID into /var/lib/mysql/auto.cnf; without removing it,
+    # EVERY container started from this pre-baked image would share
+    # the same server_uuid. Tests like
+    # TestStreamer_MySQL_FreshInstanceNodeReplaceFallsThroughToColdStart
+    # simulate "node replace" by spinning up a SECOND MySQL container
+    # and expecting a different server_uuid to drive the ADR-0022
+    # cold-start fall-through — with shared UUIDs that test sees no
+    # divergence and resumes from a stale position. Deleting auto.cnf
+    # forces fresh UUID generation on first start (mysqld autocreates
+    # auto.cnf when missing).
+    rm -f /var/lib/mysql/auto.cnf
 DOCKERFILE
 
     if [[ "${SKIP_PUSH:-0}" != "1" ]]; then
@@ -285,7 +298,7 @@ RUN set -e; \\
     mkdir -p /tmp/pgsock; \\
     pg_ctl -D /var/lib/postgresql/data -o "-c listen_addresses='' -c unix_socket_directories='/tmp/pgsock'" -l /tmp/pg.log -w start; \\
     psql -h /tmp/pgsock -U postgres -d postgres \\
-        -c "CREATE ROLE test WITH SUPERUSER LOGIN PASSWORD 'test'" \\
+        -c "CREATE ROLE test WITH SUPERUSER LOGIN BYPASSRLS PASSWORD 'test'" \\
         -c "CREATE DATABASE sluice_shared_seed OWNER test" \\
         -c "CREATE DATABASE source_db OWNER test" \\
         -c "CREATE DATABASE warehouse OWNER test"; \\
@@ -336,7 +349,7 @@ RUN set -e; \\
     mkdir -p /tmp/pgsock; \\
     pg_ctl -D /var/lib/postgresql/data -o "-c listen_addresses='' -c unix_socket_directories='/tmp/pgsock'" -l /tmp/pg.log -w start; \\
     psql -h /tmp/pgsock -U postgres -d postgres \\
-        -c "CREATE ROLE test WITH SUPERUSER LOGIN PASSWORD 'test'" \\
+        -c "CREATE ROLE test WITH SUPERUSER LOGIN BYPASSRLS PASSWORD 'test'" \\
         -c "CREATE DATABASE sluice_shared_seed OWNER test" \\
         -c "CREATE DATABASE source_db OWNER test" \\
         -c "CREATE DATABASE warehouse OWNER test"; \\
