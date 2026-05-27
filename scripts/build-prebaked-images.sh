@@ -198,7 +198,7 @@ bake_mysql() {
     if image_exists_remote "$MYSQL_TARGET_IMAGE"; then
         local existing
         existing="$(baked_label_remote "$MYSQL_TARGET_IMAGE")"
-        if [[ -n "$existing" && "$existing" == "$base_digest" ]]; then
+        if [[ "${FORCE_REBUILD:-0}" != "1" && -n "$existing" && "$existing" == "$base_digest" ]]; then
             log "${MYSQL_TARGET_IMAGE} already up-to-date against base digest; skipping"
             return 0
         fi
@@ -259,7 +259,7 @@ bake_postgres() {
     if image_exists_remote "$POSTGRES_TARGET_IMAGE"; then
         local existing
         existing="$(baked_label_remote "$POSTGRES_TARGET_IMAGE")"
-        if [[ -n "$existing" && "$existing" == "$base_digest" ]]; then
+        if [[ "${FORCE_REBUILD:-0}" != "1" && -n "$existing" && "$existing" == "$base_digest" ]]; then
             log "${POSTGRES_TARGET_IMAGE} already up-to-date against base digest; skipping"
             return 0
         fi
@@ -314,7 +314,7 @@ bake_postgis() {
     if image_exists_remote "$POSTGIS_TARGET_IMAGE"; then
         local existing
         existing="$(baked_label_remote "$POSTGIS_TARGET_IMAGE")"
-        if [[ -n "$existing" && "$existing" == "$base_digest" ]]; then
+        if [[ "${FORCE_REBUILD:-0}" != "1" && -n "$existing" && "$existing" == "$base_digest" ]]; then
             log "${POSTGIS_TARGET_IMAGE} already up-to-date against base digest; skipping"
             return 0
         fi

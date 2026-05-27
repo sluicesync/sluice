@@ -103,5 +103,13 @@ jobs:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GHCR_USER: ${{ github.actor }}
           ENGINES: ${{ matrix.engine }}
+          # When the bake script or workflow file itself changes, the
+          # base-image digest hasn't moved but the bake LOGIC has — the
+          # script's default base-digest-match skip would silently
+          # reuse the old image (this bit PR #70's first iteration of
+          # the pg_hba.conf fix). Force a rebuild on push and PR
+          # triggers; the weekly cron stays optimised against the
+          # base-digest check.
+          FORCE_REBUILD: ${{ (github.event_name == 'push' || github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') && '1' || '0' }}
         run: |
           bash scripts/build-prebaked-images.sh
