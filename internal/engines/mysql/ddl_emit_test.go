@@ -648,8 +648,61 @@ func TestEmitCheckConstraint(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			if got := emitCheckConstraint(c.in); got != c.want {
+			got, err := emitCheckConstraint(c.in)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != c.want {
 				t.Errorf("\n got  %q\n want %q", got, c.want)
+			}
+		})
+	}
+}
+
+// TestEmitTableDef_CheckRefusesRegexCrossDialect pins Bug 77: the
+// CREATE TABLE path (not just the Shape A AlterAddCheck path) must
+// refuse a PG-source CHECK carrying a POSIX-regex operator before
+// emitting verbatim DDL that fails on the MySQL parser with an opaque
+// Error 1064. Exercises all four regex operators (the class, not one
+// representative — every operator routes the same emit path but the
+// token-list miss in v0.85.0 only covered `~*`).
+func TestEmitTableDef_CheckRefusesRegexCrossDialect(t *testing.T) {
+	for _, op := range []string{"~", "~*", "!~", "!~*"} {
+		op := op
+		t.Run("regex_"+op, func(t *testing.T) {
+			tbl := &ir.Table{
+				Name: "products",
+				Columns: []*ir.Column{
+					{Name: "id", Type: ir.Integer{Width: 64}},
+					{Name: "sku", Type: ir.Varchar{Length: 32}},
+				},
+				PrimaryKey: &ir.Index{
+					Name:    "PRIMARY",
+					Unique:  true,
+					Columns: []ir.IndexColumn{{Column: "id"}},
+				},
+				CheckConstraints: []*ir.CheckConstraint{
+					{
+						Name:        "products_sku_check",
+						Expr:        "sku " + op + " '^[A-Z]{3}-[0-9]{4}$'",
+						ExprDialect: "postgres",
+					},
+				},
+			}
+			_, err := emitTableDef(tbl)
+			if err == nil {
+				t.Fatalf("expected refuse-loudly for regex operator %q, got nil", op)
+			}
+			if !strings.Contains(err.Error(), "refuse loudly") {
+				t.Errorf("error should be the refuse-loudly form, got: %v", err)
+			}
+			// The error must name the table and constraint so the
+			// operator can act without reverse-engineering an Error 1064.
+			if !strings.Contains(err.Error(), "products") {
+				t.Errorf("error should name the table; got: %v", err)
+			}
+			if !strings.Contains(err.Error(), "products_sku_check") {
+				t.Errorf("error should name the constraint; got: %v", err)
 			}
 		})
 	}

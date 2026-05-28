@@ -866,8 +866,12 @@ func emitTableDef(table *ir.Table) (string, error) {
 	// phase would gain nothing and lose diff-readability against the
 	// source's pg_dump shape.
 	for i, chk := range table.CheckConstraints {
+		clause, err := emitCheckConstraint(chk)
+		if err != nil {
+			return "", fmt.Errorf("table %q: %w", table.Name, err)
+		}
 		sb.WriteString("  ")
-		sb.WriteString(emitCheckConstraint(chk))
+		sb.WriteString(clause)
 		if i < len(table.CheckConstraints)-1 {
 			sb.WriteByte(',')
 		}
@@ -1019,7 +1023,17 @@ func emitAddForeignKey(childTable string, fk *ir.ForeignKey) (string, error) {
 // CASE, function names that differ between dialects — fail loudly at
 // CREATE TABLE time on the target rather than be guessed-at, which
 // matches the project's verbatim-passthrough translation policy.
-func emitCheckConstraint(c *ir.CheckConstraint) string {
+// Bug 77: the cross-dialect refuse-loudly pre-flight (shared with the
+// Shape A AlterAddCheck path) fires here too, so a PG-source CHECK
+// carrying an untranslatable predicate (e.g. the POSIX-regex `~`
+// operator) is rejected with an operator-actionable error at
+// CREATE-TABLE time rather than emitted verbatim and failing on the
+// MySQL parser with an opaque Error 1064.
+func emitCheckConstraint(c *ir.CheckConstraint) (string, error) {
+	exprText := translateCheckExpr(c)
+	if err := refuseUntranslatedCheckExprMySQL(c, exprText); err != nil {
+		return "", err
+	}
 	var sb strings.Builder
 	if c.Name != "" {
 		sb.WriteString("CONSTRAINT ")
@@ -1027,9 +1041,9 @@ func emitCheckConstraint(c *ir.CheckConstraint) string {
 		sb.WriteByte(' ')
 	}
 	sb.WriteString("CHECK (")
-	sb.WriteString(translateCheckExpr(c))
+	sb.WriteString(exprText)
 	sb.WriteByte(')')
-	return sb.String()
+	return sb.String(), nil
 }
 
 // translateGeneratedExpr returns the generated-column expression to

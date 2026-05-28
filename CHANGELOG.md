@@ -6,6 +6,12 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.85.1] - 2026-05-28
+
+### Fixed
+
+- **`fix(engines/mysql): Bug 77 — CHECK constraint POSIX-regex refuse-loudly on the CREATE TABLE path`** — v0.85.0's release notes claimed PG → MySQL migrations with non-translatable CHECK expressions "refuse loudly", but two gaps meant a PG `CHECK (col ~ '...')` regex constraint reached MySQL verbatim and failed at CREATE TABLE with an opaque `Error 1064` syntax error: (1) the untranslatable-token list carried only `~*` (case-insensitive regex), missing bare `~`, `!~`, and `!~*`; (2) the refuse-loudly pre-flight (`refuseUntranslatedCheckExprMySQL`) was wired into the Shape A `AlterAddCheck` live-migration path but **not** the cold-start CREATE TABLE emit (`emitCheckConstraint`), which is the path a plain `sluice migrate` uses. v0.85.1 adds the three missing regex operators to the token list and runs the refuse-loudly check inside `emitCheckConstraint`, so a cross-dialect CHECK carrying any POSIX-regex operator now fails before any DDL is issued with a structured error naming the table, the constraint, and the offending token. The recovery hint is also corrected: the v0.85.0 notes referenced a `--checks` flag (and the in-code message referenced `--expr-override` for constraint keys) — **neither mechanism exists for CHECK constraints** (`--expr-override` only targets generated columns). The honest recovery is to drop the CHECK on the source before migrating and re-create an equivalent MySQL CHECK (using `REGEXP`) on the target post-migration; the error message now says exactly this. Failure mode was always loud (CREATE TABLE failed, no data landed — no silent loss), so severity is MEDIUM; this fix makes the error operator-actionable and matches the binary to the documented contract.
+
 ## [0.85.0] - 2026-05-27
 
 ### Added

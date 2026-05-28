@@ -41,6 +41,32 @@ func TestRefuseUntranslatedCheckExprMySQL(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			// Bug 77: bare POSIX-regex `~` (case-sensitive). v0.85.0
+			// listed only `~*`, so this reached MySQL verbatim.
+			name:    "untranslated-regex-match",
+			chk:     &ir.CheckConstraint{Name: "products_sku_chk", Expr: "sku ~ '^[A-Z]{3}-[0-9]{4}$'", ExprDialect: "postgres"},
+			expr:    "sku ~ CAST('^[A-Z]{3}-[0-9]{4}$' AS CHAR)",
+			wantErr: true,
+		},
+		{
+			name:    "untranslated-regex-imatch",
+			chk:     &ir.CheckConstraint{Name: "products_sku_chk", Expr: "sku ~* 'abc'", ExprDialect: "postgres"},
+			expr:    "sku ~* 'abc'",
+			wantErr: true,
+		},
+		{
+			name:    "untranslated-regex-not-match",
+			chk:     &ir.CheckConstraint{Name: "products_sku_chk", Expr: "sku !~ 'abc'", ExprDialect: "postgres"},
+			expr:    "sku !~ 'abc'",
+			wantErr: true,
+		},
+		{
+			name:    "untranslated-regex-not-imatch",
+			chk:     &ir.CheckConstraint{Name: "products_sku_chk", Expr: "sku !~* 'abc'", ExprDialect: "postgres"},
+			expr:    "sku !~* 'abc'",
+			wantErr: true,
+		},
+		{
 			name:    "same-dialect-passes",
 			chk:     &ir.CheckConstraint{Name: "orders_chk", Expr: "qty >= 0", ExprDialect: "mysql"},
 			expr:    "qty >= 0",

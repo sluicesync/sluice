@@ -132,8 +132,15 @@ func mysqlCheckConstraintExists(ctx context.Context, db *sql.DB, schema, tableNa
 // error and avoids leaving a partially-modified constraint.
 //
 // The list is conservative — covers the common PG-only spellings.
-// Operators with novel cross-dialect expressions can bypass via
-// --expr-override per ADR-0016.
+//
+// The four POSIX-regex operators (`~`, `~*`, `!~`, `!~*`) have no
+// MySQL equivalent in a CHECK predicate (MySQL spells it `REGEXP` /
+// `RLIKE`), so a cross-dialect CHECK carrying any of them is
+// untranslatable. Bare `~` is listed last and subsumes the other
+// three as a substring, but all four are spelled out so the intent
+// reads clearly (Bug 77: v0.85.0 shipped only `~*`, so a plain
+// `col ~ '...'` regex CHECK reached MySQL verbatim and failed with an
+// opaque Error 1064 instead of this refuse-loudly).
 var untranslatedPGToMySQLTokens = []string{
 	" ->> ",
 	"->>'",
@@ -141,7 +148,10 @@ var untranslatedPGToMySQLTokens = []string{
 	"->'",
 	"::", // PG cast syntax (e.g. "x::text")
 	" similar to ",
-	"~*", // PG case-insensitive regex
+	"!~*", // PG negated case-insensitive regex
+	"~*",  // PG case-insensitive regex
+	"!~",  // PG negated regex
+	"~",   // PG regex (case-sensitive); also catches the three above
 }
 
 // refuseUntranslatedCheckExprMySQL returns a refuse-loudly error
@@ -165,10 +175,12 @@ func refuseUntranslatedCheckExprMySQL(chk *ir.CheckConstraint, exprText string) 
 			return fmt.Errorf(
 				"refuse loudly: CHECK constraint %q expression carries untranslated "+
 					"%s-dialect token %q in cross-engine apply (source expr: %q, post-translation expr: %q). "+
-					"Operator recovery: drop the source-side change and re-issue with "+
-					"--expr-override=<constraint-name>=<mysql-equivalent-expr>, OR run "+
-					"the drained model (sluice sync stop --wait / migrate / start --resume)",
-				chk.Name, chk.ExprDialect, tok, chk.Expr, exprText,
+					"Operator recovery: drop the CHECK on the source before migrating "+
+					"(ALTER TABLE ... DROP CONSTRAINT %s), then re-create an equivalent "+
+					"MySQL CHECK on the target post-migration using MySQL syntax "+
+					"(e.g. REGEXP instead of the PG ~ operator). sluice does not "+
+					"auto-translate dialect-specific CHECK predicates",
+				chk.Name, chk.ExprDialect, tok, chk.Expr, exprText, chk.Name,
 			)
 		}
 	}
