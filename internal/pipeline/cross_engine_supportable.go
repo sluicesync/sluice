@@ -52,7 +52,20 @@ func checkCrossEngineSupportable(
 	// extension carries SRID + complex spatial-reference metadata
 	// that doesn't round-trip through a MySQL target without
 	// operator intervention).
-	pgToMySQL := sourceEngine == "postgres" &&
+	//
+	// `postgres-trigger` (the trigger-based capture engine for
+	// slot-less managed PG, ADR-0066) is a PG source for the purposes
+	// of these refusals: its schema surface delegates to the vanilla
+	// postgres engine, so a `postgres-trigger` source can carry every
+	// PG-native shape (PostGIS Geometry, pg_trgm opclass indexes,
+	// EXCLUDE constraints) that has no portable MySQL form. Treating
+	// it as `postgres` here keeps the cross-engine loud-failure default
+	// in place for its Phase 2 cross-engine targets (task #72) — without
+	// it a trigger source would silently skip every PG-native refusal.
+	// The literal (not pgtrigger.EngineName) keeps the orchestrator
+	// engine-neutral — the pipeline package never imports an engine
+	// package (see CLAUDE.md "IR-first" / "engine-neutral orchestrator").
+	pgToMySQL := isPGSourceEngine(sourceEngine) &&
 		(targetEngine == "mysql" || targetEngine == "planetscale")
 	if !pgToMySQL {
 		return nil
@@ -240,6 +253,19 @@ func unsupportablePGtoMySQL(t ir.Type) string {
 			v.Definition)
 	}
 	return ""
+}
+
+// isPGSourceEngine reports whether engine is a Postgres-family source for
+// cross-engine supportability purposes. Both the vanilla `postgres` engine
+// and the trigger-based `postgres-trigger` engine (ADR-0066) carry the
+// full PG-native type surface — `postgres-trigger`'s schema reader
+// delegates to the vanilla postgres engine — so both must trip the same
+// PG → MySQL cross-engine refusals (PostGIS Geometry, pg_trgm opclass
+// indexes, EXCLUDE constraints). String literals (not pgtrigger.EngineName)
+// keep the orchestrator engine-neutral: the pipeline package never imports
+// a specific engine package.
+func isPGSourceEngine(engine string) bool {
+	return engine == "postgres" || engine == "postgres-trigger"
 }
 
 // isCrossEngineTranslatablePGExtension reports whether an
