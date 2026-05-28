@@ -4,6 +4,7 @@
 package mysql
 
 import (
+	"encoding/json"
 	"reflect"
 	"testing"
 	"time"
@@ -395,6 +396,176 @@ func TestPrepareValue_PGArrayColumnToJSON(t *testing.T) {
 				t.Errorf("prepareValue(%#v, %s) = %#v; want %#v", c.in, c.t, got, c.want)
 			}
 		})
+	}
+}
+
+// TestPrepareValue_PGTriggerCDCValueFamilies is the task #72 / Bug-74
+// value-family pin at the value-prepare layer. The postgres-trigger CDC
+// reader (internal/engines/pgtrigger/cdc_reader.go decodeJSONBRow) decodes
+// the JSONB capture log into a DIFFERENT value shape than the proven
+// pgoutput path's value_decode.go:
+//
+//	integers              -> int64        (same as pgoutput)
+//	non-integer numerics  -> json.Number  (pgoutput: string)
+//	bytea                 -> `\x`-hex TEXT string  (pgoutput: raw []byte)
+//	timestamp             -> ISO string   (pgoutput: time.Time)
+//	timestamptz           -> ISO+offset string (pgoutput: time.Time)
+//	jsonb                 -> map[string]any / []any (pgoutput: []byte)
+//	bool                  -> bool         (same)
+//
+// Those shapes flow straight into prepareValue when the trigger source
+// targets MySQL cross-engine. This test pins that EVERY family lands as a
+// driver-bindable, byte-correct value — the cross-engine differential
+// integration test asserts the same end-to-end, but this keeps the unit
+// pin close to the code so a regression names the family.
+//
+// Per CLAUDE.md "pin the class, not the representative": this exercises
+// every family + the danger shapes (bytea silent corruption, jsonb map
+// LOUD failure, timestamptz offset rejection), not one representative.
+func TestPrepareValue_PGTriggerCDCValueFamilies(t *testing.T) {
+	cases := []struct {
+		name string
+		in   any
+		t    ir.Type
+		want any
+	}{
+		// int4 / int8: trigger reader yields int64 — pass through.
+		{name: "int4 int64", in: int64(147), t: ir.Integer{Width: 32}, want: int64(147)},
+		{name: "int8 int64", in: int64(21), t: ir.Integer{Width: 64}, want: int64(21)},
+
+		// numeric(30,12): trigger reader yields json.Number. json.Number
+		// is a string kind; the driver binds it as the exact numeric text,
+		// which MySQL DECIMAL parses without precision loss. We pin that
+		// prepareValue passes it through unchanged (it is already correct).
+		{
+			name: "numeric json.Number passes through (binds as numeric string)",
+			in:   json.Number("99999.999999999999"),
+			t:    ir.Decimal{Precision: 30, Scale: 12},
+			want: json.Number("99999.999999999999"),
+		},
+
+		// text / varchar: trigger reader yields a Go string — pass through.
+		{name: "text string", in: "multi-col-update-中", t: ir.Text{Size: ir.TextLong}, want: "multi-col-update-中"},
+		{name: "varchar string", in: "CODE-0021", t: ir.Varchar{Length: 32}, want: "CODE-0021"},
+
+		// boolean: trigger reader yields Go bool — pass through.
+		{name: "bool true", in: true, t: ir.Boolean{}, want: true},
+		{name: "bool false", in: false, t: ir.Boolean{}, want: false},
+
+		// timestamp (PG `timestamp` -> MySQL DATETIME): ISO string, no
+		// offset — passes through; stripTimeZoneOffset is a no-op.
+		{
+			name: "timestamp ISO string (no offset)",
+			in:   "2026-02-02 02:02:02.020202",
+			t:    ir.DateTime{Precision: 6},
+			want: "2026-02-02 02:02:02.020202",
+		},
+
+		// timestamptz (PG `timestamptz` -> MySQL TIMESTAMP): ISO string
+		// WITH a +00 zone offset. MySQL's TIMESTAMP parser rejects the
+		// offset (Error 1292) — the LOUD-failure divergence. The fix
+		// strips the offset (documented zone-flatten policy). DANGER family.
+		{
+			name: "timestamptz +00 offset stripped",
+			in:   "2026-02-02 02:02:02.020202+00",
+			t:    ir.Timestamp{Precision: 6, WithTimeZone: true},
+			want: "2026-02-02 02:02:02.020202",
+		},
+		{
+			name: "timestamptz +05:30 offset stripped",
+			in:   "2026-05-02 12:34:56.123456+05:30",
+			t:    ir.Timestamp{Precision: 6, WithTimeZone: true},
+			want: "2026-05-02 12:34:56.123456",
+		},
+
+		// bytea (PG `bytea` -> MySQL LONGBLOB): the trigger reader emits
+		// the `\x`-hex TEXT form. Binding it as a string stores the literal
+		// ASCII of the hex text (SILENT corruption, Bug-92 class). The fix
+		// hex-decodes to raw bytes. THE most dangerous family.
+		{
+			name: "bytea \\x-hex string → raw bytes (Blob)",
+			in:   `\xdeadbeef`,
+			t:    ir.Blob{Size: ir.BlobLong},
+			want: []byte{0xde, 0xad, 0xbe, 0xef},
+		},
+		{
+			name: "bytea \\x-hex string → raw bytes (Varbinary)",
+			in:   `\x010203`,
+			t:    ir.Varbinary{Length: 16},
+			want: []byte{0x01, 0x02, 0x03},
+		},
+		{
+			name: "bytea raw []byte passes through (same-engine / pgoutput shape)",
+			in:   []byte{0xca, 0xfe},
+			t:    ir.Blob{Size: ir.BlobLong},
+			want: []byte{0xca, 0xfe},
+		},
+
+		// jsonb (PG `jsonb` -> MySQL JSON): the trigger reader yields a
+		// nested map[string]any (object) or []any (top-level array). A bare
+		// map reaches the driver as reflect.Map → "unsupported type map"
+		// (LOUD failure). The fix marshals it. json.Number leaves preserve
+		// exact numeric precision inside the document.
+		{
+			name: "jsonb map[string]any → JSON object string",
+			in:   map[string]any{"k": int64(7), "ok": true},
+			t:    ir.JSON{Binary: true},
+			want: `{"k":7,"ok":true}`,
+		},
+		{
+			name: "jsonb map with json.Number leaf preserves precision",
+			in:   map[string]any{"ratio": json.Number("7.777777777")},
+			t:    ir.JSON{Binary: true},
+			want: `{"ratio":7.777777777}`,
+		},
+		{
+			name: "jsonb top-level array []any → JSON array string",
+			in:   []any{"u", "p", "d"},
+			t:    ir.JSON{Binary: true},
+			want: `["u","p","d"]`,
+		},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			col := &ir.Column{Name: "c", Type: c.t}
+			got := prepareValue(c.in, col)
+			if !reflect.DeepEqual(got, c.want) {
+				t.Errorf("prepareValue(%#v, %T) = %#v (%T); want %#v (%T)",
+					c.in, c.t, got, got, c.want, c.want)
+			}
+		})
+	}
+}
+
+// TestDecodeHexByteaText pins the helper directly: only `\x`-prefixed,
+// even-length, valid-hex strings decode; everything else reports false so
+// the caller passes the value through unchanged (the same-engine / non-PG
+// shape is untouched).
+func TestDecodeHexByteaText(t *testing.T) {
+	cases := []struct {
+		in     string
+		want   []byte
+		wantOK bool
+	}{
+		{`\xdeadbeef`, []byte{0xde, 0xad, 0xbe, 0xef}, true},
+		{`\x`, []byte{}, true}, // empty bytea
+		{`\x00`, []byte{0x00}, true},
+		{`deadbeef`, nil, false},    // no prefix
+		{`\xabc`, nil, false},       // odd length
+		{`\xZZ`, nil, false},        // not hex
+		{`plain text`, nil, false},  // ordinary string
+		{`\xdead beef`, nil, false}, // space → invalid hex
+	}
+	for _, c := range cases {
+		got, ok := decodeHexByteaText(c.in)
+		if ok != c.wantOK {
+			t.Errorf("decodeHexByteaText(%q) ok = %v; want %v", c.in, ok, c.wantOK)
+			continue
+		}
+		if ok && !reflect.DeepEqual(got, c.want) {
+			t.Errorf("decodeHexByteaText(%q) = %#v; want %#v", c.in, got, c.want)
+		}
 	}
 }
 

@@ -6,6 +6,7 @@ package mysql
 import (
 	"context"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -554,6 +555,48 @@ func prepareValue(v any, col *ir.Column) any {
 			return stripTimeZoneOffset(string(b))
 		}
 	}
+	// task #72 / Bug-74 family pin: cross-engine trigger-CDC temporal
+	// values. The postgres-trigger CDC reader (cdc_reader.go) decodes a
+	// captured timestamp/timestamptz column into an ISO TEXT string, NOT
+	// the time.Time the pgoutput path's value_decode.go produces. For a
+	// MySQL DATETIME (PG `timestamp`) the bare ISO string is accepted by
+	// the driver as-is — but a PG `timestamptz` (ir.Timestamp{WithTimeZone})
+	// carries a numeric zone offset suffix ("2026-02-02 02:02:02.020202+00")
+	// that MySQL's TIMESTAMP/DATETIME parser rejects with Error 1292,
+	// exactly like the timetz case above. The documented cross-engine
+	// policy flattens the zone (timestamptz → MySQL TIMESTAMP stored in
+	// the session zone); strip the offset so the time-of-day lands. A
+	// time.Time value (same-engine / pgoutput path) is untouched. Plain
+	// ir.DateTime strings have no offset, so stripTimeZoneOffset is a
+	// no-op there — but we route them through it too so a stray offset on
+	// a DateTime-typed column (defensive) doesn't crash the apply.
+	switch t.(type) {
+	case ir.Timestamp, ir.DateTime:
+		if s, ok := v.(string); ok {
+			return stripTimeZoneOffset(s)
+		}
+		if b, ok := v.([]byte); ok {
+			return stripTimeZoneOffset(string(b))
+		}
+	}
+	// task #72 / Bug-74 family pin: cross-engine trigger-CDC bytea values.
+	// The postgres-trigger CDC reader emits a captured `bytea` column as
+	// PG's `\x`-hex TEXT (e.g. "\xdeadbeef") — the JSON-scalar string form
+	// — NOT the raw []byte the pgoutput path's value_decode.go hex-decodes.
+	// A MySQL VARBINARY / BLOB column bound with that string stores the
+	// literal ASCII of the hex text (10 bytes "\xdeadbeef") instead of the
+	// 4 raw bytes 0xDEADBEEF: SILENT bytea corruption, the Bug-92 class.
+	// Hex-decode the `\x`-prefixed text here so the raw bytes land. Raw
+	// []byte (same-engine / pgoutput path) and non-`\x` strings pass
+	// through unchanged.
+	switch t.(type) {
+	case ir.Binary, ir.Varbinary, ir.Blob:
+		if s, ok := v.(string); ok {
+			if b, decoded := decodeHexByteaText(s); decoded {
+				return b
+			}
+		}
+	}
 	if geom, isGeom := t.(ir.Geometry); isGeom {
 		if b, ok := v.([]byte); ok {
 			out := make([]byte, 4+len(b))
@@ -620,6 +663,12 @@ func prepareValue(v any, col *ir.Column) any {
 // first '+' or '-' after the "HH:MM:SS" head (offset 8+); it never
 // collides with the time digits or the fractional dot. A value with no
 // offset passes through unchanged.
+//
+// task #72 reuse: the same shape strips a `timestamptz` text value's
+// trailing offset ("2026-02-02 02:02:02.020202+00"). The offset never
+// appears before index 8 (a "YYYY-MM-DD HH:..." prefix is >= 11 chars),
+// and the only '-' chars in the date portion are at offsets 4 and 7, so
+// starting the scan at 8 skips them and finds only the zone sign.
 func stripTimeZoneOffset(s string) string {
 	for i := 8; i < len(s); i++ {
 		if s[i] == '+' || s[i] == '-' {
@@ -627,6 +676,34 @@ func stripTimeZoneOffset(s string) string {
 		}
 	}
 	return s
+}
+
+// decodeHexByteaText recognises PG's `bytea_output = hex` text form (a
+// `\x` prefix followed by an even-length hex string) and returns the
+// decoded raw bytes. The bool is false when s is not in that form so the
+// caller falls back to passing the value through unchanged.
+//
+// task #72 / Bug-74 bytea family pin: the postgres-trigger CDC reader
+// surfaces a captured bytea value as this `\x`-hex TEXT (the JSON-scalar
+// string form), which must be decoded to raw bytes before binding to a
+// MySQL VARBINARY / BLOB column — otherwise the literal ASCII of the hex
+// text is stored (silent corruption). Mirrors the postgres engine's
+// value_decode.go decodeHexByteaText (kept duplicated; the mysql package
+// does not import the postgres engine).
+func decodeHexByteaText(s string) ([]byte, bool) {
+	const prefix = `\x`
+	if !strings.HasPrefix(s, prefix) {
+		return nil, false
+	}
+	body := s[len(prefix):]
+	if len(body)%2 != 0 {
+		return nil, false
+	}
+	b, err := hex.DecodeString(body)
+	if err != nil {
+		return nil, false
+	}
+	return b, true
 }
 
 // prepareHstoreToJSON converts a PG hstore wire value into a JSON
@@ -809,6 +886,24 @@ func parseHstoreText(s string) (map[string]any, error) {
 // empty PG array landing as JSON).
 func convertArrayLikeToJSON(v any, col *ir.Column) (any, bool) {
 	switch shaped := v.(type) {
+	case map[string]any:
+		// Cross-engine trigger-CDC path (task #72 / Bug-74 family pin):
+		// the postgres-trigger CDC reader decodes a jsonb capture-log
+		// value into a nested map[string]any (cdc_reader.go
+		// decodeJSONBRow), NOT the []byte the pgoutput path produces. A
+		// bare map reaches go-sql-driver as reflect.Map, which it rejects
+		// ("unsupported type map[string]interface {}, a map") — a LOUD
+		// cross-engine failure the same-engine PG path never hit (pgx
+		// marshals a map to jsonb natively). Marshal it to a JSON object
+		// string here, the same shape the []any branch produces for a
+		// top-level JSON array. json.Number leaves marshal to their exact
+		// numeric text (no float widening), preserving numeric precision
+		// inside the document.
+		out, err := json.Marshal(shaped)
+		if err != nil {
+			return nil, false
+		}
+		return string(out), true
 	case []any:
 		out, err := json.Marshal(shaped)
 		if err != nil {
