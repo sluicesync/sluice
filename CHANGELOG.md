@@ -6,6 +6,12 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.85.2] - 2026-05-28
+
+### Fixed
+
+- **`fix(engines/postgres): Bug 92 — silent UPDATE/DELETE loss under REPLICA IDENTITY FULL with rich-type columns (CRITICAL)`** — A PostgreSQL source table set to `REPLICA IDENTITY FULL` could silently drop CDC UPDATEs (and, latently, DELETEs) when a row carried a rich-type column (jsonb, timestamptz, bytea, high-precision numeric). Root cause: under FULL, pgoutput marks **every** column as part of the replica identity, and the CDC reader trusted that wire flag to build the `Update.Before` / `Delete.Before` image — so the applier's `WHERE` clause spanned all columns. A rich-type OLD value did not `=`-match the target after the pgoutput decode→rebind round-trip, the statement matched **zero rows**, and the ADR-0010 idempotency tolerance swallowed it with no error and no WARN — silent divergence. The DELETE path was equally affected; it only appeared to work because the prior FULL test corpus used int/varchar-only tables that round-trip exactly. **Fix:** the reader now resolves an `IdentityKeyCols` set per relation — `DEFAULT`/`USING INDEX` keep the pgoutput wire-flagged columns, but `FULL` now narrows `Before` to the table's **true PRIMARY KEY** (read from `pg_index`), so the `WHERE` is `id = $N` for both UPDATE and DELETE; a PK-less FULL table falls back to the full row. **Also fixed** a bytea CDC silent-corruption surfaced by the new test: the CDC path delivers bytea as pgoutput `\x`-hex text, which the shared decoder copied verbatim (`\xcafebabe` → 10 literal ASCII bytes instead of 4) — a new `decodeBytea` hex-decodes the `\x`-prefixed CDC shape while preserving the row-reader raw-bytes path. Pinned by `TestCDCReader_UpdateUnderReplicaIdentityFull_FamilyMatrix` (every value family × FULL + UPDATE, including an unchanged-rich-column UPDATE) and a postgres-trigger-vs-parent congruence integration test. Found by the postgres-trigger Phase-2 readiness gate's congruence test on its first run — the trigger engine was correct; the slot-based parent was dropping the writes. Pre-existing latent bug (not introduced in v0.85.x); severity CRITICAL (silent data loss on the core engine).
+
 ## [0.85.1] - 2026-05-28
 
 ### Fixed
