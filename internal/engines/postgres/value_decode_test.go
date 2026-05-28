@@ -4,6 +4,7 @@
 package postgres
 
 import (
+	"bytes"
 	"net"
 	"net/netip"
 	"reflect"
@@ -407,6 +408,70 @@ func TestDecodeBytesIsCopy(t *testing.T) {
 	src[0] = 0x00
 	if out[0] != 0xaa {
 		t.Errorf("mutating source mutated decoded value: got %#v", out)
+	}
+}
+
+// TestDecodeBytea pins the two shapes the bytea value-decoder must
+// disambiguate (Bug 92 follow-up — surfaced by the FULL family-matrix
+// pin exercising a bytea column end-to-end):
+//
+//   - CDC (pgoutput tuple text format): the value arrives as the
+//     server's `bytea_output = hex` text — `\x`-prefixed even-length
+//     hex, delivered as the ASCII bytes of that text. It MUST be
+//     hex-decoded to the raw bytes, not copied verbatim (verbatim was
+//     the pre-fix silent bytea corruption: `\xcafebabe` stored as the
+//     10 literal ASCII bytes instead of 4).
+//   - row-reader (database/sql via pgx): pgx hands raw decoded bytes
+//     that do NOT carry the `\x` text prefix; those are copied verbatim.
+func TestDecodeBytea(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  any
+		want []byte
+	}{
+		{
+			name: "CDC hex text (bytes) decodes to raw bytes",
+			raw:  []byte(`\xcafebabe`),
+			want: []byte{0xca, 0xfe, 0xba, 0xbe},
+		},
+		{
+			name: "CDC hex text (string) decodes to raw bytes",
+			raw:  `\xdeadbeef`,
+			want: []byte{0xde, 0xad, 0xbe, 0xef},
+		},
+		{
+			name: "CDC empty bytea (\\x prefix only) decodes to empty",
+			raw:  []byte(`\x`),
+			want: []byte{},
+		},
+		{
+			name: "row-reader raw bytes copied verbatim",
+			raw:  []byte{0xde, 0xad},
+			want: []byte{0xde, 0xad},
+		},
+		{
+			name: "row-reader raw bytes that happen to start with 0x5c not hex",
+			// 0x5c 0x78 is the ASCII for `\x`, but the remainder ("zz")
+			// is not valid hex, so it falls through to a verbatim copy.
+			raw:  []byte{0x5c, 0x78, 'z', 'z'},
+			want: []byte{0x5c, 0x78, 'z', 'z'},
+		},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			got, err := decodeValue(c.raw, ir.Blob{Size: ir.BlobLong})
+			if err != nil {
+				t.Fatalf("decodeValue: %v", err)
+			}
+			b, ok := got.([]byte)
+			if !ok {
+				t.Fatalf("decodeValue returned %T; want []byte", got)
+			}
+			if !bytes.Equal(b, c.want) {
+				t.Errorf("got %#v; want %#v", b, c.want)
+			}
+		})
 	}
 }
 

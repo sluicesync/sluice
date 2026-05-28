@@ -313,8 +313,21 @@ func TestCDCReader_BasicChangeStream(t *testing.T) {
 	if del.Before == nil {
 		t.Fatal("delete.Before is nil despite REPLICA IDENTITY FULL")
 	}
-	if email, _ := del.Before["email"].(string); email != "bob@example.com" {
-		t.Errorf("delete.Before[email] = %#v; want bob@example.com", del.Before["email"])
+	// Bug 92: under REPLICA IDENTITY FULL pgoutput flags every column as a
+	// key column, so the DELETE Before is narrowed to the table's TRUE
+	// PRIMARY KEY (id) — NOT the full row. bob is id=2 (the only PK
+	// column). The non-key email/active columns must NOT appear, or a
+	// rich-typed DELETE under FULL would carry round-trip-fragile values
+	// into the WHERE and silently match zero rows (the same silent-loss
+	// class the UPDATE assertion above guards).
+	if len(del.Before) != 1 {
+		t.Errorf("delete.Before must be key-only under FULL; got %#v", del.Before)
+	}
+	if id, _ := del.Before["id"].(int64); id != 2 {
+		t.Errorf("delete.Before[id] = %#v; want int64(2)", del.Before["id"])
+	}
+	if _, present := del.Before["email"]; present {
+		t.Errorf("delete.Before should be key-only; email leaked in: %#v", del.Before)
 	}
 
 	// Positions: each change must encode a slot+lsn pair the engine

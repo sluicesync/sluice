@@ -490,6 +490,7 @@ func TestSynthesizeKeyOnlyBefore(t *testing.T) {
 			{Name: "email", Type: ir.Varchar{Length: 255}, KeyColumn: false},
 			{Name: "active", Type: ir.Boolean{}, KeyColumn: false},
 		},
+		IdentityKeyCols: []string{"id"},
 	}
 	after := ir.Row{
 		"id":     int64(42),
@@ -520,6 +521,7 @@ func TestSynthesizeKeyOnlyBeforeCompositeKey(t *testing.T) {
 			{Name: "group_id", Type: ir.Integer{Width: 64}, KeyColumn: true},
 			{Name: "role", Type: ir.Text{Size: ir.TextLong}, KeyColumn: false},
 		},
+		IdentityKeyCols: []string{"user_id", "group_id"},
 	}
 	after := ir.Row{
 		"user_id":  int64(7),
@@ -626,11 +628,17 @@ func TestDecodeTupleDeleteOldTupleHasNullMarkersForNonKey(t *testing.T) {
 }
 
 // TestFilterBeforeToKeyCols exercises every REPLICA IDENTITY shape the
-// helper has to handle. The canonical Bug 8 surface is the composite-PK
-// + DEFAULT case (third row); the FULL-with-PK case (Bug 92) is the
-// UPDATE-path surface where non-key columns carry real rich-type data
-// that must be dropped from the WHERE; the others are correctness
-// invariants the same code path needs to preserve.
+// helper has to handle. The narrowing keys off rel.IdentityKeyCols (the
+// resolved replica-identity set produced by resolveIdentityKeyCols),
+// NOT the per-column wire flag — so each fixture sets IdentityKeyCols to
+// whatever resolveIdentityKeyCols would have produced for that identity.
+//
+// The canonical Bug 8 surface is the composite-PK + DEFAULT case; the
+// FULL-with-PK case (Bug 92) is the UPDATE-path surface where EVERY
+// column is wire-flagged KeyColumn=true (pgoutput's real FULL shape) yet
+// only the resolved PK must survive into the WHERE — the regression the
+// first fix attempt missed by trusting the wire flag. The others are
+// correctness invariants the same code path needs to preserve.
 func TestFilterBeforeToKeyCols(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -649,6 +657,7 @@ func TestFilterBeforeToKeyCols(t *testing.T) {
 					{Name: "email", KeyColumn: false},
 					{Name: "active", KeyColumn: false},
 				},
+				IdentityKeyCols: []string{"id"},
 			},
 			decoded: ir.Row{"id": int64(42), "email": nil, "active": nil},
 			want:    ir.Row{"id": int64(42)},
@@ -665,6 +674,7 @@ func TestFilterBeforeToKeyCols(t *testing.T) {
 					{Name: "qty", KeyColumn: false},
 					{Name: "unit_price", KeyColumn: false},
 				},
+				IdentityKeyCols: []string{"order_id", "line_no"},
 			},
 			decoded: ir.Row{
 				"order_id":   int64(100),
@@ -675,22 +685,27 @@ func TestFilterBeforeToKeyCols(t *testing.T) {
 			want: ir.Row{"order_id": int64(100), "line_no": int64(1)},
 		},
 		{
-			name: "FULL with PK (non-key cols carry real values; still filtered)",
+			// Bug 92: under FULL pgoutput flags EVERY column KeyColumn=true,
+			// but resolveIdentityKeyCols resolved the real PK to {id}, so
+			// the rich non-key values must be dropped from the WHERE even
+			// though they're wire-flagged.
+			name: "FULL with PK (all cols wire-flagged; narrowed to resolved PK)",
 			rel: &relationCacheEntry{
 				Schema:          "public",
 				Name:            "users",
 				ReplicaIdentity: 'f',
 				Columns: []relationColumn{
 					{Name: "id", KeyColumn: true},
-					{Name: "email", KeyColumn: false},
-					{Name: "active", KeyColumn: false},
+					{Name: "email", KeyColumn: true},
+					{Name: "active", KeyColumn: true},
 				},
+				IdentityKeyCols: []string{"id"},
 			},
 			decoded: ir.Row{"id": int64(42), "email": "alice@example.com", "active": true},
 			want:    ir.Row{"id": int64(42)},
 		},
 		{
-			name: "USING INDEX (only the indexed columns are flagged KeyColumn)",
+			name: "USING INDEX (only the indexed columns are the identity)",
 			rel: &relationCacheEntry{
 				Schema:          "public",
 				Name:            "events",
@@ -700,20 +715,24 @@ func TestFilterBeforeToKeyCols(t *testing.T) {
 					{Name: "event_uuid", KeyColumn: true},
 					{Name: "payload", KeyColumn: false},
 				},
+				IdentityKeyCols: []string{"event_uuid"},
 			},
 			decoded: ir.Row{"id": nil, "event_uuid": "abc123", "payload": nil},
 			want:    ir.Row{"event_uuid": "abc123"},
 		},
 		{
+			// FULL with no PK: resolveIdentityKeyCols leaves IdentityKeyCols
+			// empty, and the helper falls back to the full row.
 			name: "FULL on a PK-less relation falls back to the full row",
 			rel: &relationCacheEntry{
 				Schema:          "public",
 				Name:            "audit",
 				ReplicaIdentity: 'f',
 				Columns: []relationColumn{
-					{Name: "actor", KeyColumn: false},
-					{Name: "happened_at", KeyColumn: false},
+					{Name: "actor", KeyColumn: true},
+					{Name: "happened_at", KeyColumn: true},
 				},
+				IdentityKeyCols: nil,
 			},
 			decoded: ir.Row{"actor": "alice", "happened_at": "2024-01-01"},
 			want:    ir.Row{"actor": "alice", "happened_at": "2024-01-01"},
@@ -744,6 +763,7 @@ func TestFilterBeforeToKeyColsRejectsMissingKeyValue(t *testing.T) {
 			{Name: "id", KeyColumn: true},
 			{Name: "email", KeyColumn: false},
 		},
+		IdentityKeyCols: []string{"id"},
 	}
 	_, err := filterBeforeToKeyCols(rel, ir.Row{"email": "alice@example.com"})
 	if err == nil {
@@ -767,6 +787,7 @@ func TestSynthesizeKeyOnlyBeforeRejectsMissingKeyValue(t *testing.T) {
 			{Name: "id", Type: ir.Integer{Width: 64}, KeyColumn: true},
 			{Name: "email", Type: ir.Varchar{Length: 255}, KeyColumn: false},
 		},
+		IdentityKeyCols: []string{"id"},
 	}
 	_, err := synthesizeKeyOnlyBefore(rel, ir.Row{"email": "alice@example.com"})
 	if err == nil {
