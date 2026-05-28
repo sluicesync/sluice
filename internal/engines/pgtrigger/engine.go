@@ -13,7 +13,7 @@
 //
 //	import _ "github.com/orware/sluice/internal/engines/pgtrigger"
 //
-// See ADR-0066 for the full design. Phase 1 (this commit) ships:
+// See ADR-0066 for the full design. Phase 1 (v0.85.0) shipped:
 //
 //   - The engine type, composed by embedding [postgres.Engine] (§9), so
 //     schema-read / schema-write / row-read / row-write surfaces stay
@@ -24,10 +24,27 @@
 //   - A polling [CDCReader] (§2, §6) that scans `sluice_change_log`
 //     using the §2 xmin safety-lag query.
 //   - Refuse-loudly preflights for the §14 boundaries.
+//   - Same-engine `postgres-trigger → postgres-trigger` bulk-copy + CDC.
 //
-// Cross-engine targets (postgres-trigger → mysql / planetscale), the
-// full §15 family-matrix pin, and `--use-partitioning` are deferred to
-// follow-up phases per the task #62 plan.
+// Phase 2 (task #72) shipped cross-engine targets:
+//
+//   - `postgres-trigger → mysql` / `postgres-trigger → planetscale` for
+//     bulk-copy + CDC. The cross-engine supportability gate treats a
+//     `postgres-trigger` source as a PG source (PostGIS Geometry,
+//     pg_trgm opclass indexes, EXCLUDE constraints refuse loudly the
+//     same as a `postgres` source).
+//   - The full §15 Bug-74 value-family matrix pinned cross-engine via a
+//     `postgres-trigger`-vs-`postgres` MySQL-target congruence test —
+//     the trigger reader's JSON-scalar value shapes (bytea `\x`-hex,
+//     jsonb nested map, timestamptz ISO+offset, numeric `json.Number`)
+//     land byte-correct on MySQL through the applier's value-prepare
+//     path.
+//   - Sequence/AUTO_INCREMENT cutover priming (PG IDENTITY → MySQL
+//     AUTO_INCREMENT), working via the delegated SchemaReader's
+//     [ir.SequenceStateReader] surface.
+//
+// `--use-partitioning` remains deferred to a follow-up phase per the
+// task #62 plan.
 package pgtrigger
 
 import (

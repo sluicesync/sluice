@@ -563,6 +563,166 @@ func TestCheckCrossEngineSupportable_PGtoMySQL_BtreePassesThrough(t *testing.T) 
 	}
 }
 
+// ---- task #72: postgres-trigger is a PG source for cross-engine refusals.
+
+// TestCheckCrossEngineSupportable_PGTriggerToMySQL_ExcludeRefuses pins the
+// task #72 gate fix: a `postgres-trigger` source carries the full PG-native
+// type surface (its schema reader delegates to vanilla postgres), so a
+// cross-engine `postgres-trigger` → MySQL with an EXCLUDE constraint must
+// refuse with the SAME message a `postgres` source does. Pre-fix the gate
+// only matched sourceEngine=="postgres", so a trigger source silently
+// skipped every PG-native refusal — a Phase-2 cross-engine silent-loss
+// hole.
+func TestCheckCrossEngineSupportable_PGTriggerToMySQL_ExcludeRefuses(t *testing.T) {
+	s := &ir.Schema{Tables: []*ir.Table{{
+		Name: "ci_partitions",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}},
+		},
+		ExcludeConstraints: []*ir.ExcludeConstraint{{
+			Name:       "check_ci_partitions_builds_id_range_no_overlap",
+			Definition: "EXCLUDE USING gist (builds_id_range WITH &&)",
+		}},
+	}}}
+	// Trigger source must refuse identically to a `postgres` source.
+	trigErr := checkCrossEngineSupportable(s, "postgres-trigger", "mysql", "test")
+	if trigErr == nil {
+		t.Fatal("postgres-trigger → MySQL with EXCLUDE: expected refusal, got nil")
+	}
+	pgErr := checkCrossEngineSupportable(s, "postgres", "mysql", "test")
+	if pgErr == nil {
+		t.Fatal("postgres → MySQL with EXCLUDE: expected refusal, got nil (test fixture invalid)")
+	}
+	if trigErr.Error() != pgErr.Error() {
+		t.Errorf("trigger-source refusal differs from postgres-source refusal:\n  trigger: %s\n  postgres: %s",
+			trigErr.Error(), pgErr.Error())
+	}
+}
+
+// TestCheckCrossEngineSupportable_PGTriggerToPlanetScale_GeometryRefusesIndex
+// confirms the gate fix covers the planetscale target too AND the
+// index-level (pg_trgm / GIN) refusal, not just EXCLUDE — a trigger source
+// with a PG GIN index must refuse cross-engine the same as a postgres
+// source.
+func TestCheckCrossEngineSupportable_PGTriggerToPlanetScale_GinIndexRefuses(t *testing.T) {
+	s := &ir.Schema{Tables: []*ir.Table{{
+		Name: "documents",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}},
+			{Name: "body", Type: ir.Text{}},
+		},
+		Indexes: []*ir.Index{
+			{
+				Name: "documents_body_trgm",
+				Kind: ir.IndexKindGIN,
+				Columns: []ir.IndexColumn{
+					{Column: "body", OperatorClass: "gin_trgm_ops"},
+				},
+			},
+		},
+	}}}
+	err := checkCrossEngineSupportable(s, "postgres-trigger", "planetscale", "documents-migration")
+	if err == nil {
+		t.Fatal("postgres-trigger → planetscale with GIN index: expected refusal, got nil")
+	}
+	if !strings.Contains(err.Error(), "gin_trgm_ops") {
+		t.Errorf("err = %v; want mention of \"gin_trgm_ops\"", err)
+	}
+}
+
+// TestCheckCrossEngineSupportable_PGTriggerToPGTrigger_ExcludeAllowed pins
+// that the gate fix does NOT over-broaden: same-engine postgres-trigger →
+// postgres-trigger carries verbatim (the trigger engine's same-engine path
+// is the Phase-1 shipped shape), so an EXCLUDE constraint must NOT refuse.
+func TestCheckCrossEngineSupportable_PGTriggerToPGTrigger_ExcludeAllowed(t *testing.T) {
+	s := &ir.Schema{Tables: []*ir.Table{{
+		Name: "ci_partitions",
+		ExcludeConstraints: []*ir.ExcludeConstraint{{
+			Name:       "ex",
+			Definition: "EXCLUDE USING gist (builds_id_range WITH &&)",
+		}},
+	}}}
+	if err := checkCrossEngineSupportable(s, "postgres-trigger", "postgres-trigger", "test"); err != nil {
+		t.Errorf("postgres-trigger → postgres-trigger with EXCLUDE err = %v; want nil (same-engine carry)", err)
+	}
+}
+
+// TestCheckCrossEngineDeltaSupportable_PGTriggerAddTableGeometryAllowed
+// confirms the delta path inherits the gate fix (it delegates to
+// checkCrossEngineSupportable): an incremental adding a geometry-bearing
+// table from a postgres-trigger source no longer skips the (now-allowed)
+// PostGIS path, and a refusable shape still refuses. Geometry is allowed
+// post-ADR-0035, so this asserts the no-refuse case — proving the trigger
+// source is routed through the same delta gate as postgres.
+func TestCheckCrossEngineDeltaSupportable_PGTriggerAddTableGeometryAllowed(t *testing.T) {
+	deltas := []*ir.SchemaDeltaEntry{
+		{
+			Kind:  ir.SchemaDeltaAddTable,
+			Table: "places",
+			After: &ir.Table{
+				Name: "places",
+				Columns: []*ir.Column{
+					{Name: "id", Type: ir.Integer{Width: 64}},
+					{Name: "loc", Type: ir.Geometry{Subtype: ir.GeometryPolygon}},
+				},
+			},
+		},
+	}
+	if err := checkCrossEngineDeltaSupportable(deltas, "postgres-trigger", "mysql", "incr-0001"); err != nil {
+		t.Errorf("err = %v; want nil (geometry allowed PG-trigger → MySQL)", err)
+	}
+}
+
+// TestCheckCrossEngineDeltaSupportable_PGTriggerAddTableExtensionRefuses
+// pins the delta refusal for the trigger source: an incremental adding a
+// table with an uncatalogued ExtensionType column must refuse the same as a
+// postgres source would.
+func TestCheckCrossEngineDeltaSupportable_PGTriggerAddTableExtensionRefuses(t *testing.T) {
+	deltas := []*ir.SchemaDeltaEntry{
+		{
+			Kind:  ir.SchemaDeltaAddTable,
+			Table: "items",
+			After: &ir.Table{
+				Name: "items",
+				Columns: []*ir.Column{
+					{Name: "id", Type: ir.Integer{Width: 64}},
+					{Name: "embedding", Type: ir.ExtensionType{Extension: "vector", Name: "vector"}},
+				},
+			},
+		},
+	}
+	err := checkCrossEngineDeltaSupportable(deltas, "postgres-trigger", "mysql", "incr-0002")
+	if err == nil {
+		t.Fatal("postgres-trigger delta AddTable with ExtensionType: expected refusal, got nil")
+	}
+	if !strings.Contains(err.Error(), "vector.vector") {
+		t.Errorf("err = %v; want mention of \"vector.vector\"", err)
+	}
+}
+
+// TestIsPGSourceEngine pins the small helper that drives the gate fix.
+func TestIsPGSourceEngine(t *testing.T) {
+	cases := []struct {
+		name string
+		want bool
+	}{
+		{"postgres", true},
+		{"postgres-trigger", true},
+		{"mysql", false},
+		{"planetscale", false},
+		{"", false},
+		{"future", false},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			if got := isPGSourceEngine(c.name); got != c.want {
+				t.Errorf("isPGSourceEngine(%q) = %v; want %v", c.name, got, c.want)
+			}
+		})
+	}
+}
+
 // stubNoShardColumnSetter is a target type that intentionally does
 // NOT implement ir.ShardColumnSetter. Used to pin the Shape-A
 // cross-engine refusal — a future engine that ships without the
