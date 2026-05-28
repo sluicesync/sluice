@@ -813,10 +813,120 @@ func TestEmitCheckConstraint(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			if got := emitCheckConstraint(c.in, nil, emitOpts{}); got != c.want {
+			got, err := emitCheckConstraint(c.in, nil, emitOpts{})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != c.want {
 				t.Errorf("\n got  %q\n want %q", got, c.want)
 			}
 		})
+	}
+}
+
+// TestEmitTableDef_CheckRefusesUntranslatedCrossDialect pins Bug 77
+// symmetric (task #73): the CREATE TABLE path (not just the Shape A
+// AlterAddCheck path) must refuse a MySQL-source CHECK whose predicate
+// the translator could not rewrite into PG before emitting verbatim
+// DDL that fails on the PG parser with an opaque SQLSTATE 42601.
+// Exercises every token in untranslatedMySQLToPGTokens — the class,
+// not one representative; each routes the same emit path, but a
+// per-token list miss (the MySQL-side v0.85.0 trap) would only be
+// caught by covering all of them. The argument shapes here are ones
+// the translator leaves untouched, so the token survives into the
+// output and the output-only refuse fires.
+func TestEmitTableDef_CheckRefusesUntranslatedCrossDialect(t *testing.T) {
+	// Each expr is a form the translator does NOT rewrite, so the
+	// MySQL-only token survives into the emitted PG output.
+	cases := []struct {
+		token string
+		expr  string
+	}{
+		// JSON_EXTRACT with a non-simple path arg: not rewritten.
+		{"json_extract(", "json_extract(payload, concat('$.', col)) = 'v'"},
+		// JSON_UNQUOTE wrapping a non-JSON_EXTRACT arg: not rewritten.
+		{"json_unquote(", "json_unquote(payload) = 'v'"},
+		// DATE_FORMAT with a non-literal format: not rewritten.
+		{"date_format(", "date_format(d, fmt) > '2020'"},
+		// STR_TO_DATE has no PG rewrite at all.
+		{"str_to_date(", "str_to_date(s, '%Y-%m-%d') > '2020-01-01'"},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.token, func(t *testing.T) {
+			tbl := &ir.Table{
+				Name: "events",
+				Columns: []*ir.Column{
+					{Name: "id", Type: ir.Integer{Width: 64}},
+					{Name: "payload", Type: ir.JSON{}},
+				},
+				PrimaryKey: &ir.Index{
+					Columns: []ir.IndexColumn{{Column: "id"}},
+				},
+				CheckConstraints: []*ir.CheckConstraint{
+					{
+						Name:        "events_payload_check",
+						Expr:        c.expr,
+						ExprDialect: "mysql",
+					},
+				},
+			}
+			_, err := emitTableDef("public", tbl, emitOpts{})
+			if err == nil {
+				t.Fatalf("expected refuse-loudly for token %q, got nil", c.token)
+			}
+			if !strings.Contains(err.Error(), "refuse loudly") {
+				t.Errorf("error should be the refuse-loudly form, got: %v", err)
+			}
+			// The error must name the table and constraint so the
+			// operator can act without reverse-engineering a 42601.
+			if !strings.Contains(err.Error(), "events") {
+				t.Errorf("error should name the table; got: %v", err)
+			}
+			if !strings.Contains(err.Error(), "events_payload_check") {
+				t.Errorf("error should name the constraint; got: %v", err)
+			}
+		})
+	}
+}
+
+// TestEmitTableDef_CheckAllowsTranslatedCrossDialect is the regression
+// pin (Bug 77 symmetric, task #73): a MySQL-source CHECK whose
+// predicate the translator DOES rewrite into a valid PG idiom must NOT
+// be false-refused on the CREATE TABLE path. The source carries
+// json_extract / json_unquote tokens, but the translator rewrites them
+// to ->/->> so the output is clean PG — the earlier input-OR-output
+// match would have wrongly refused this.
+func TestEmitTableDef_CheckAllowsTranslatedCrossDialect(t *testing.T) {
+	tbl := &ir.Table{
+		Name: "events",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}},
+			{Name: "payload", Type: ir.JSON{}},
+		},
+		PrimaryKey: &ir.Index{
+			Columns: []ir.IndexColumn{{Column: "id"}},
+		},
+		CheckConstraints: []*ir.CheckConstraint{
+			{
+				Name:        "events_kind_check",
+				Expr:        "JSON_UNQUOTE(JSON_EXTRACT(payload, '$.kind')) = 'click'",
+				ExprDialect: "mysql",
+			},
+		},
+	}
+	got, err := emitTableDef("public", tbl, emitOpts{})
+	if err != nil {
+		t.Fatalf("translatable cross-dialect CHECK must not be refused: %v", err)
+	}
+	// Sanity: the emitted CHECK uses the PG ->> idiom, not the MySQL
+	// JSON_UNQUOTE/JSON_EXTRACT spelling.
+	if strings.Contains(strings.ToLower(got), "json_extract") ||
+		strings.Contains(strings.ToLower(got), "json_unquote") {
+		t.Errorf("output should have rewritten the MySQL JSON funcs; got:\n%s", got)
+	}
+	if !strings.Contains(got, "->>") {
+		t.Errorf("output should contain the PG ->> operator; got:\n%s", got)
 	}
 }
 

@@ -358,11 +358,17 @@ func TestAlterAddCheck_CrossEngineRefusesLoudly_PG(t *testing.T) {
 	pgsw := sw.(*SchemaWriter)
 	table := &ir.Table{Schema: "public", Name: "chk_xeng"}
 
-	// MySQL-tagged Expr with a token translateExprForPG doesn't
-	// know how to handle → refuse loudly.
+	// MySQL-tagged Expr whose JSON_EXTRACT the translator CANNOT
+	// rewrite (the path arg is a concat(), not a simple '$.key'
+	// literal), so the json_extract( token survives into the PG
+	// output → refuse loudly. Bug 77 symmetric (task #73): the refuse
+	// now matches the POST-translation OUTPUT only, so a translatable
+	// `json_extract(payload, '$.k')` (which rewrites to (payload->'k'))
+	// would correctly NOT be refused; this expr exercises the
+	// genuinely-untranslatable case where the token survives.
 	chk := &ir.CheckConstraint{
 		Name:        "chk_json_xeng",
-		Expr:        "json_extract(payload, '$.k') = 'v'",
+		Expr:        "json_extract(payload, concat('$.', 'k')) = 'v'",
 		ExprDialect: "mysql",
 	}
 	err = pgsw.AlterAddCheck(ctx, table, []*ir.CheckConstraint{chk})
@@ -372,8 +378,11 @@ func TestAlterAddCheck_CrossEngineRefusesLoudly_PG(t *testing.T) {
 	if !strings.Contains(err.Error(), "refuse loudly") {
 		t.Errorf("error should be a refuse-loudly: %v", err)
 	}
-	if !strings.Contains(err.Error(), "--expr-override") {
-		t.Errorf("error should mention --expr-override recovery: %v", err)
+	// Bug 77 symmetric (task #73): the recovery hint is "drop the
+	// CHECK on the source" — NOT --expr-override, which only targets
+	// generated columns and never applied to CHECK constraints.
+	if !strings.Contains(err.Error(), "drop the CHECK on the source") {
+		t.Errorf("error should mention the drop-source-CHECK recovery: %v", err)
 	}
 
 	// Verify nothing landed on the target — the refusal must be

@@ -873,7 +873,11 @@ func emitTableDef(schema string, table *ir.Table, opts emitOpts) (string, error)
 	// generated SET checks. Order is the IR's preserved source order
 	// so the target's pg_dump shape stays diffable against the source.
 	for _, chk := range table.CheckConstraints {
-		parts = append(parts, emitCheckConstraint(chk, table, opts))
+		clause, err := emitCheckConstraint(chk, table, opts)
+		if err != nil {
+			return "", fmt.Errorf("table %q: %w", table.Name, err)
+		}
+		parts = append(parts, clause)
 	}
 
 	// ADR-0053: EXCLUDE constraints emit inline alongside CHECKs.
@@ -1189,7 +1193,19 @@ func emitAddForeignKey(schema, childTable string, fk *ir.ForeignKey) (string, er
 // CASE, function names that differ between dialects — fail loudly at
 // CREATE TABLE time on the target rather than be guessed-at, which
 // matches the project's verbatim-passthrough translation policy.
-func emitCheckConstraint(c *ir.CheckConstraint, tbl *ir.Table, opts emitOpts) string {
+//
+// Bug 77 symmetric (task #73): the cross-dialect refuse-loudly
+// pre-flight (shared with the Shape A AlterAddCheck path) fires here
+// too, so a MySQL-source CHECK carrying an untranslatable predicate
+// (e.g. a json_extract call the translator could not rewrite) is
+// rejected with an operator-actionable error at CREATE-TABLE time
+// rather than emitted verbatim and failing on the PG parser with an
+// opaque SQLSTATE 42601.
+func emitCheckConstraint(c *ir.CheckConstraint, tbl *ir.Table, opts emitOpts) (string, error) {
+	exprText := translateCheckExpr(c, tbl, opts)
+	if err := refuseUntranslatedCheckExprPG(c, exprText); err != nil {
+		return "", err
+	}
 	var sb strings.Builder
 	if c.Name != "" {
 		sb.WriteString("CONSTRAINT ")
@@ -1197,9 +1213,9 @@ func emitCheckConstraint(c *ir.CheckConstraint, tbl *ir.Table, opts emitOpts) st
 		sb.WriteByte(' ')
 	}
 	sb.WriteString("CHECK (")
-	sb.WriteString(translateCheckExpr(c, tbl, opts))
+	sb.WriteString(exprText)
 	sb.WriteByte(')')
-	return sb.String()
+	return sb.String(), nil
 }
 
 // translateGeneratedExpr returns the generated-column expression to

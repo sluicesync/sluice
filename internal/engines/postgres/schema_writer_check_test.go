@@ -47,9 +47,36 @@ func TestRefuseUntranslatedCheckExprPG(t *testing.T) {
 			wantErr: false,
 		},
 		{
+			name:    "untranslated-str_to_date",
+			chk:     &ir.CheckConstraint{Name: "orders_chk", Expr: "str_to_date(s, '%Y-%m-%d') > '2020-01-01'", ExprDialect: "mysql"},
+			expr:    "str_to_date(s, '%Y-%m-%d') > '2020-01-01'",
+			wantErr: true,
+		},
+		{
+			name:    "untranslated-json_unquote",
+			chk:     &ir.CheckConstraint{Name: "orders_chk", Expr: "json_unquote(payload) = 'v'", ExprDialect: "mysql"},
+			expr:    "json_unquote(payload) = 'v'",
+			wantErr: true,
+		},
+		{
 			name:    "translated-cross-dialect-passes",
 			chk:     &ir.CheckConstraint{Name: "orders_chk", Expr: "(payload->>'k') = 'v'", ExprDialect: "mysql"},
 			expr:    "(payload->>'k') = 'v'",
+			wantErr: false,
+		},
+		{
+			// Bug 77 symmetric (task #73) regression pin: the SOURCE
+			// carries the MySQL JSON funcs, but the translator rewrote
+			// them to the PG ->> idiom, so the OUTPUT is clean and must
+			// NOT be refused. An earlier input-OR-output match would
+			// false-refuse this on the source json_extract( token.
+			name: "translated-json-funcs-passes",
+			chk: &ir.CheckConstraint{
+				Name:        "events_kind_chk",
+				Expr:        "JSON_UNQUOTE(JSON_EXTRACT(payload, '$.kind')) = 'click'",
+				ExprDialect: "mysql",
+			},
+			expr:    "(payload->>'kind') = 'click'",
 			wantErr: false,
 		},
 	}

@@ -150,18 +150,22 @@ func pgCheckConstraintExists(ctx context.Context, db sqlExecQueryer, schemaName,
 	return present, rows.Err()
 }
 
-// untranslatedMySQLToPGTokens lists tokens that survive
-// translateExprForMySQL→PG passes unchanged when the source CHECK
-// expression uses MySQL-only constructs. A post-translation
-// expression containing any of these is almost-certainly going to
-// fail at the PG parser with SQLSTATE 42601; refusing pre-emit
-// gives a cleaner operator-visible error and avoids leaving a
-// partially-modified constraint.
+// untranslatedMySQLToPGTokens lists tokens that, when they survive
+// into the POST-translation expression, signal a MySQL-only construct
+// PG cannot execute. A post-translation expression containing any of
+// these is almost-certainly going to fail at the PG parser with
+// SQLSTATE 42601; refusing pre-emit gives a cleaner operator-visible
+// error and avoids leaving a partially-modified constraint.
 //
 // The list is intentionally conservative — it covers the common
-// MySQL-only spellings (json_extract, IF(...), date_format with
-// MySQL format specifiers). Operators with novel cross-dialect
-// expressions can bypass via --expr-override per ADR-0016.
+// MySQL-only spellings (json_extract, json_unquote, date_format,
+// str_to_date). The translator faithfully rewrites the recognised,
+// well-formed forms of these into PG idioms (JSON_EXTRACT → ->,
+// JSON_UNQUOTE(JSON_EXTRACT(...)) → ->>, DATE_FORMAT → TO_CHAR), so a
+// token here only survives into the output when the translator could
+// NOT rewrite it (e.g. an unsupported argument shape, or str_to_date
+// which has no PG rewrite) — which is precisely the untranslatable
+// case we want to refuse.
 var untranslatedMySQLToPGTokens = []string{
 	"json_extract(",
 	"json_unquote(",
@@ -169,39 +173,41 @@ var untranslatedMySQLToPGTokens = []string{
 	"str_to_date(",
 }
 
-// refuseUntranslatedCheckExprPG returns a refuse-loudly error when
-// either the SOURCE CHECK Expr text or the POST-translation text
-// contains a well-known MySQL-only token that PG cannot reliably
-// execute. Only fires on cross-dialect cases (chk.ExprDialect != ""
-// and != "postgres"); same-dialect Exprs (PG → PG or untagged) pass
-// through unchanged.
+// refuseUntranslatedCheckExprPG returns a refuse-loudly error when the
+// POST-translation text still contains a well-known MySQL-only token
+// that PG cannot execute. Only fires on cross-dialect cases
+// (chk.ExprDialect != "" and != "postgres"); same-dialect Exprs
+// (PG → PG or untagged) pass through unchanged.
 //
-// Checking BOTH input and output catches two failure modes:
-//
-//  1. Translator doesn't recognise the token and passes it through
-//     verbatim — output still contains the MySQL token.
-//  2. Translator recognises the token and produces a PG idiom, but
-//     the idiom has subtle semantic differences (e.g. `json_extract`
-//     → `::json->'k'` casting that fails at runtime against JSONB
-//     columns with PG error 22P02). Without the input-side check we
-//     would emit SQL that PG rejects with a generic SQLSTATE; the
-//     refuse-loudly with `--expr-override` hint is the operator-
-//     actionable signal we want first.
+// The check is on the OUTPUT (post-translation) text, not the source.
+// The translator faithfully rewrites the safe MySQL idioms —
+// JSON_EXTRACT → ->, JSON_UNQUOTE(JSON_EXTRACT(...)) → ->>,
+// DATE_FORMAT → TO_CHAR — so a source expr containing those tokens
+// lands as valid PG and must NOT be refused (Bug 77 symmetric, task
+// #73: the earlier input-OR-output match would false-refuse a
+// well-formed `json_extract(payload, '$.k')` even though it translates
+// cleanly to `(payload->'k')`). A token that *survives* translation
+// into the output is the real signal that the construct has no PG
+// equivalent (e.g. an unsupported call shape, or str_to_date, which
+// the translator leaves untouched). Output-only matching is the
+// precise definition of "untranslatable" — this mirrors the MySQL-side
+// refuseUntranslatedCheckExprMySQL fix.
 func refuseUntranslatedCheckExprPG(chk *ir.CheckConstraint, exprText string) error {
 	if chk == nil || chk.ExprDialect == "" || chk.ExprDialect == dialectName {
 		return nil
 	}
-	lowerInput := strings.ToLower(chk.Expr)
 	lowerOutput := strings.ToLower(exprText)
 	for _, tok := range untranslatedMySQLToPGTokens {
-		if strings.Contains(lowerInput, tok) || strings.Contains(lowerOutput, tok) {
+		if strings.Contains(lowerOutput, tok) {
 			return fmt.Errorf(
 				"refuse loudly: CHECK constraint %q expression carries untranslated "+
 					"%s-dialect token %q in cross-engine apply (source expr: %q, post-translation expr: %q). "+
-					"Operator recovery: drop the source-side change and re-issue with "+
-					"--expr-override=<constraint-name>=<pg-equivalent-expr>, OR run "+
-					"the drained model (sluice sync stop --wait / migrate / start --resume)",
-				chk.Name, chk.ExprDialect, tok, chk.Expr, exprText,
+					"Operator recovery: drop the CHECK on the source before migrating "+
+					"(ALTER TABLE ... DROP CONSTRAINT %s), then re-create an equivalent "+
+					"PG CHECK on the target post-migration using PG syntax "+
+					"(e.g. ->/->> JSON operators instead of MySQL JSON_EXTRACT). "+
+					"sluice does not auto-translate dialect-specific CHECK predicates",
+				chk.Name, chk.ExprDialect, tok, chk.Expr, exprText, chk.Name,
 			)
 		}
 	}
