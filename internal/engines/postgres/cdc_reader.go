@@ -1550,8 +1550,31 @@ func ensurePublication(ctx context.Context, db *sql.DB, name, schema string, tab
 	// the publication is metadata only — slots reference WAL by
 	// LSN, not by publication name binding.
 	if len(tables) == 0 {
-		// No-op: caller hasn't supplied a scope; respect whatever
-		// the publication currently is.
+		// Caller hasn't supplied a scope, so we normally respect
+		// whatever the publication currently is. The one exception:
+		// a publication that exists but is genuinely empty — not FOR
+		// ALL TABLES (ruled out below), no member tables, and no
+		// FOR-TABLES-IN-SCHEMA memberships — can never emit a single
+		// pgoutput row. Streaming from it leaves the slot's
+		// confirmed_flush_lsn pinned forever: the run "succeeds"
+		// (exit 0) while silently replicating nothing. That shape is
+		// almost always a stale publication left over from an aborted
+		// run (DROP SCHEMA does not drop publications). Refuse loudly
+		// with a recovery hint rather than stalling silently.
+		empty, err := publicationIsEmpty(ctx, db, name)
+		if err != nil {
+			return err
+		}
+		if empty {
+			return fmt.Errorf(
+				"postgres: publication %q exists but has no tables (and is not FOR ALL TABLES); "+
+					"it would emit no CDC events and the stream would silently stall with nothing replicated. "+
+					"This usually means a stale publication left over from a prior or aborted run "+
+					"(DROP SCHEMA does not drop publications). Recover with `DROP PUBLICATION %s;` "+
+					"(sluice will recreate it) or `ALTER PUBLICATION %s ADD TABLE <table>;` to scope it",
+				name, quoteIdent(name), quoteIdent(name),
+			)
+		}
 		return nil
 	}
 	if allTables {
@@ -1575,6 +1598,52 @@ func ensurePublication(ctx context.Context, db *sql.DB, name, schema string, tab
 		return fmt.Errorf("postgres: alter publication %q tables: %w", name, err)
 	}
 	return nil
+}
+
+// publicationIsEmpty reports whether the named publication has no
+// member tables (pg_publication_rel) and no schema-level memberships
+// (pg_publication_namespace, FOR TABLES IN SCHEMA — PG 15+). The
+// caller must have already established that the publication exists and
+// is not FOR ALL TABLES; an empty publication in that state can never
+// emit a pgoutput row, so streaming from it stalls the slot silently.
+//
+// The schema-membership catalog only exists on PG 15+. We probe for it
+// with to_regclass and skip its count on older servers (where FOR
+// TABLES IN SCHEMA isn't a feature) so the query stays valid there
+// rather than failing to parse on a missing relation.
+func publicationIsEmpty(ctx context.Context, db *sql.DB, name string) (bool, error) {
+	const relCountQuery = `SELECT count(*) FROM pg_publication_rel pr
+		JOIN pg_publication p ON p.oid = pr.prpubid
+		WHERE p.pubname = $1`
+	var relCount int
+	if err := db.QueryRowContext(ctx, relCountQuery, name).Scan(&relCount); err != nil {
+		return false, fmt.Errorf("postgres: count tables in publication %q: %w", name, err)
+	}
+	if relCount > 0 {
+		return false, nil
+	}
+
+	var hasSchemaCatalog bool
+	if err := db.QueryRowContext(
+		ctx,
+		`SELECT to_regclass('pg_catalog.pg_publication_namespace') IS NOT NULL`,
+	).Scan(&hasSchemaCatalog); err != nil {
+		return false, fmt.Errorf("postgres: probe pg_publication_namespace: %w", err)
+	}
+	if !hasSchemaCatalog {
+		// PG < 15: no schema-level publications possible, so zero
+		// member tables means genuinely empty.
+		return true, nil
+	}
+
+	const nsCountQuery = `SELECT count(*) FROM pg_publication_namespace pn
+		JOIN pg_publication p ON p.oid = pn.pnpubid
+		WHERE p.pubname = $1`
+	var nsCount int
+	if err := db.QueryRowContext(ctx, nsCountQuery, name).Scan(&nsCount); err != nil {
+		return false, fmt.Errorf("postgres: count schemas in publication %q: %w", name, err)
+	}
+	return nsCount == 0, nil
 }
 
 // addTablesToPublication issues `ALTER PUBLICATION ... ADD TABLE
