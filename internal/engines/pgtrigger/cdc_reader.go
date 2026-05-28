@@ -446,6 +446,83 @@ func readChangeLogMaxID(ctx context.Context, db *sql.DB, schema string) (int64, 
 	return id.Int64, nil
 }
 
+// anchorQuerier is the slice of database/sql readChangeLogAnchor needs.
+// Both *sql.DB and a snapshot-pinned *sql.Conn satisfy it — the anchor
+// MUST be read on the SAME connection/transaction the snapshot Rows are
+// read on (see [readChangeLogAnchor]).
+type anchorQuerier interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+// readChangeLogAnchor computes the CDC handoff anchor as the CONTIGUOUS
+// COMMITTED-PREFIX high-water of the capture log. This is the
+// load-bearing correctness point of the snapshot→CDC handoff (Bug 94).
+//
+// Why not MAX(id): the BIGSERIAL `id` is allocated at INSERT time but
+// is NOT commit-ordered. A transaction can allocate a LOW id and commit
+// AFTER a transaction that allocated a HIGHER id; rolled-back txns leave
+// permanent id gaps. So a naive MAX(id) anchor risks a SILENT GAP — an
+// in-flight txn's low id is masked by an already-committed higher id, so
+// CDC (which replays `id > anchor`) skips the low id forever once it
+// commits. Silent data loss is FORBIDDEN under the loud-failure tenet.
+//
+// The anchor is instead "(first not-yet-safe id) − 1, else MAX(id) when
+// nothing is in-flight":
+//
+//	SELECT COALESCE(
+//	  (SELECT MIN(id) - 1 FROM <schema>.sluice_change_log
+//	     WHERE xmin::text::bigint >= pg_snapshot_xmin(pg_current_snapshot())::text::bigint),
+//	  (SELECT COALESCE(MAX(id), 0) FROM <schema>.sluice_change_log)
+//	)
+//
+// `xmin >= pg_snapshot_xmin(current)` selects rows whose allocating txid
+// is NOT yet definitely-committed-old relative to the reading
+// transaction's snapshot — i.e. the rows the §2 steady-state safety-lag
+// predicate (`xmin < pg_snapshot_xmin`) would currently hold back. The
+// FIRST such id minus one is the highest id we can prove is committed
+// AND in our REPEATABLE READ snapshot. Everything ≤ anchor is
+// committed-old (in the snapshot, copied by Rows); everything > anchor
+// is replayed by CDC.
+//
+// Over-replay (anchor too LOW) is SAFE: the applier is idempotent
+// (ADR-0010), so an event whose row is ALSO in the bulk-copy snapshot
+// just re-applies to the same value. A GAP (anchor too HIGH) is silent
+// loss and is forbidden. When in doubt the formula anchors LOWER (it
+// subtracts one from the first in-flight id rather than trusting MAX).
+//
+// Worked example (the one the task asks be pinned in a comment):
+// in-flight id=5 (its txid still ≥ snapshot xmin) + committed id=6.
+// MIN(id) WHERE in-flight = 5 ⇒ anchor = 5 − 1 = 4. CDC replays id > 4,
+// i.e. BOTH 5 and 6. id=6 is also in the REPEATABLE READ snapshot and
+// thus already bulk-copied, but the idempotent applier makes the
+// re-apply a no-op. id=5 commits and is replayed by CDC. No gap. A
+// MAX(id)=6 anchor would have skipped id=5 forever once it committed —
+// the silent-loss bug this formula exists to prevent.
+//
+// q MUST be the same connection/transaction the snapshot Rows read on,
+// so `pg_current_snapshot()` reflects the snapshot the bulk copy sees.
+func readChangeLogAnchor(ctx context.Context, q anchorQuerier, schema string) (int64, error) {
+	tableRef := quoteIdent(schema) + "." + quoteIdent(ChangeLogTable)
+	query := `
+SELECT COALESCE(
+  (SELECT MIN(id) - 1 FROM ` + tableRef + `
+     WHERE xmin::text::bigint >= pg_snapshot_xmin(pg_current_snapshot())::text::bigint),
+  (SELECT COALESCE(MAX(id), 0) FROM ` + tableRef + `)
+)`
+	var anchor int64
+	if err := q.QueryRowContext(ctx, query).Scan(&anchor); err != nil {
+		return 0, err
+	}
+	if anchor < 0 {
+		// MIN(id) - 1 can only go negative if the lowest in-flight id is
+		// 0, which BIGSERIAL never allocates (it starts at 1). Clamp
+		// defensively so the position decoder's last_id >= 0 invariant
+		// holds; anchoring at 0 replays everything (safe over-replay).
+		anchor = 0
+	}
+	return anchor, nil
+}
+
 // Compile-time check that [CDCReader] implements [ir.CDCReader] with
 // the addition of an Err method (the load-bearing loud-failure
 // surface for streaming readers — see [ir.RowReader] Err doc).

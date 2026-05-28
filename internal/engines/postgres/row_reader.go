@@ -42,6 +42,33 @@ type RowReader struct {
 	err error // sticky error from the most recent ReadRows call
 }
 
+// NewSnapshotRowReader builds an [ir.RowReader] over a caller-pinned
+// *sql.Conn that is ALREADY inside a consistent-read transaction
+// (typically `BEGIN ISOLATION LEVEL REPEATABLE READ`). The returned
+// reader runs its SELECTs on that single connection so every table is
+// read within the same MVCC snapshot — the same shape OpenSnapshotStream
+// / OpenBackupSnapshot use internally, but exposed so a sibling engine
+// that composes postgres by delegation (engines/pgtrigger) can reuse
+// the value-decode + buildSelect machinery on its OWN snapshot
+// transaction without re-implementing it.
+//
+// The reader does NOT own the connection lifecycle: its Close is a
+// no-op (closer==nil), exactly like the snapshot-mode readers built in
+// cdc_snapshot.go / backup_snapshot.go. The caller is responsible for
+// COMMIT/ROLLBACK-ing the transaction and returning the conn to its
+// pool. schema is the namespace SELECTs are qualified against (the
+// DSN's `schema`, default "public").
+//
+// All the optional RowReader surfaces ([ir.BatchedRowReader],
+// [ir.RangeBoundsQuerier], [ir.RowCounter], [ir.SchemaSetter]) are
+// available on the returned value because it is a *RowReader — callers
+// type-asserting on those interfaces (the bulk-copy orchestrator's
+// parallel/cursor paths) get the same behaviour as the slot-based
+// snapshot stream's Rows reader.
+func NewSnapshotRowReader(conn *sql.Conn, schema string) ir.RowReader {
+	return &RowReader{q: conn, schema: schema, closer: nil}
+}
+
 // Close releases the underlying connection resources. Safe to call
 // multiple times. In snapshot mode (closer==nil) this is a no-op —
 // the SnapshotStream's Close is the operative cleanup.

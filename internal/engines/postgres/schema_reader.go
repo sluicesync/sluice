@@ -306,19 +306,37 @@ func (r *SchemaReader) readViews(ctx context.Context) ([]*ir.View, error) {
 
 // readTables loads the table list for the bound schema.
 //
-// sluice's own bookkeeping tables (sluice_cdc_state from continuous
-// sync, sluice_migrate_state from resumable migrations) are excluded
-// — they're persisted on the target as a side effect of running
-// sluice itself, not user data, and including them would surface as
-// "your migration has an extra table" surprises in cross-engine
-// re-migrations.
+// sluice's own bookkeeping tables are excluded — they're persisted as
+// a side effect of running sluice itself, not user data, and including
+// them would surface as "your migration has an extra table" surprises
+// in cross-engine re-migrations:
+//
+//   - sluice_cdc_state — continuous-sync position store (target side).
+//   - sluice_migrate_state — resumable-migration progress (target side).
+//   - sluice_change_log / sluice_change_log_meta — the postgres-trigger
+//     engine's source-side capture log + meta row (ADR-0066 §2/§3). The
+//     trigger engine reads schema via this reader by delegation
+//     (engines/pgtrigger), so excluding the names here fixes Bug 93 for
+//     BOTH the migrate (Migrator) and sync-start (Streamer) paths
+//     uniformly: without it the capture tables read back as user tables
+//     and a cross-engine `migrate` to MySQL hard-fails at create-tables
+//     (committed_at's statement_timestamp() default is untranslatable).
+//     The names are sluice-reserved, so the exclusion is harmless on a
+//     vanilla `postgres` source (a user table named sluice_change_log
+//     would itself be a name collision with sluice's own artifact). The
+//     literals are duplicated here rather than imported from pgtrigger
+//     to avoid a postgres→pgtrigger import cycle (pgtrigger imports
+//     postgres).
 func (r *SchemaReader) readTables(ctx context.Context) (map[string]*ir.Table, error) {
 	const q = `
 		SELECT table_name
 		FROM   information_schema.tables
 		WHERE  table_schema = $1
 		  AND  table_type   = 'BASE TABLE'
-		  AND  table_name NOT IN ('sluice_cdc_state', 'sluice_migrate_state')
+		  AND  table_name NOT IN (
+		           'sluice_cdc_state', 'sluice_migrate_state',
+		           'sluice_change_log', 'sluice_change_log_meta'
+		       )
 		ORDER  BY table_name`
 
 	rows, err := r.db.QueryContext(ctx, q, r.schema)
