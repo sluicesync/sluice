@@ -300,8 +300,11 @@ func TestAlterAddCheck_CrossEngineRefusesLoudly_MySQL(t *testing.T) {
 	if !strings.Contains(err.Error(), "refuse loudly") {
 		t.Errorf("error should be a refuse-loudly: %v", err)
 	}
-	if !strings.Contains(err.Error(), "--expr-override") {
-		t.Errorf("error should mention --expr-override recovery: %v", err)
+	// Bug 77 v0.85.1: the recovery hint is "drop the CHECK on the
+	// source" — NOT --expr-override, which only targets generated
+	// columns and never applied to CHECK constraints.
+	if !strings.Contains(err.Error(), "drop the CHECK on the source") {
+		t.Errorf("error should mention the drop-source-CHECK recovery: %v", err)
 	}
 
 	var present bool
