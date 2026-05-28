@@ -632,6 +632,9 @@ func (r *CDCReader) dispatchWAL(
 		if err != nil {
 			return fmt.Errorf("postgres: cdc: relation %s.%s: %w", m.Namespace, m.RelationName, err)
 		}
+		if err := r.resolveIdentityKeyCols(ctx, entry); err != nil {
+			return fmt.Errorf("postgres: cdc: relation %s.%s: %w", m.Namespace, m.RelationName, err)
+		}
 		relations[m.RelationID] = entry
 		// ADR-0036 M3: log RelationMessage arrivals so the diagnostic
 		// run can correlate them with the publication-add LSN.
@@ -649,6 +652,9 @@ func (r *CDCReader) dispatchWAL(
 	case *pglogrepl.RelationMessage:
 		entry, err := buildRelationCacheEntry(*m)
 		if err != nil {
+			return fmt.Errorf("postgres: cdc: relation %s.%s: %w", m.Namespace, m.RelationName, err)
+		}
+		if err := r.resolveIdentityKeyCols(ctx, entry); err != nil {
 			return fmt.Errorf("postgres: cdc: relation %s.%s: %w", m.Namespace, m.RelationName, err)
 		}
 		relations[m.RelationID] = entry
@@ -912,9 +918,30 @@ func (r *CDCReader) emitUpdate(
 	}
 	var before ir.Row
 	if oldTuple != nil {
-		before, err = decodeTuple(oldTuple, rel.Columns)
+		decoded, err := decodeTuple(oldTuple, rel.Columns)
 		if err != nil {
 			return fmt.Errorf("postgres: cdc: decode update.before for %s.%s: %w", rel.Schema, rel.Name, err)
+		}
+		// Narrow Before to the relation's resolved identity-key columns
+		// (rel.IdentityKeyCols) before it becomes the applier's UPDATE
+		// WHERE source — the exact symmetry the DELETE path has via
+		// filterBeforeToKeyCols. Under REPLICA IDENTITY FULL the OldTuple
+		// carries every column with real data, including rich types
+		// (jsonb / timestamptz / bytea / high-precision numeric) that do
+		// NOT `=`-match the stored target value after the pgoutput
+		// decode→rebind round-trip; a WHERE over those columns matches
+		// zero rows, which ADR-0010's resume-idempotent zero-rows-ok
+		// behaviour silently absorbs — silent UPDATE loss (Bug 92).
+		// Crucially the narrowing keys off IdentityKeyCols (resolved to
+		// the TRUE PRIMARY KEY under FULL by resolveIdentityKeyCols), NOT
+		// the pgoutput per-column wire key flag — which under FULL is set
+		// on EVERY column and so would narrow to nothing. The result is a
+		// key-only WHERE (WHERE id = $N). Under DEFAULT/USING INDEX
+		// IdentityKeyCols is the wire-flagged replica-identity set, so the
+		// pre-Bug-92 correct behaviour is preserved.
+		before, err = filterBeforeToKeyCols(rel, decoded)
+		if err != nil {
+			return fmt.Errorf("postgres: cdc: %w", err)
 		}
 	} else {
 		before, err = synthesizeKeyOnlyBefore(rel, after)
@@ -939,15 +966,21 @@ func (r *CDCReader) emitUpdate(
 // after-tuple's identity-key columns. Used when pgoutput omits the
 // old tuple from an UPDATE message — under REPLICA IDENTITY DEFAULT
 // (and USING INDEX), the publisher omits OldTuple whenever the
-// UPDATE didn't change any of the identity-key columns. The Before
-// image is still required by the applier to construct a WHERE clause;
-// without this helper the applier would emit
+// UPDATE didn't change any of the identity-key columns. (Under FULL
+// the OldTuple is always present, so this path is not reached for FULL
+// relations.) The Before image is still required by the applier to
+// construct a WHERE clause; without this helper the applier would emit
 // "UPDATE t SET ... WHERE " with an empty predicate and Postgres
 // rejects with "syntax error at end of input".
 //
 // The post-image identity values are correct as a Before substitute
 // because, by construction, those columns are unchanged from the
 // row's pre-image (otherwise pgoutput would have included OldTuple).
+//
+// The identity columns come from rel.IdentityKeyCols (the resolved
+// replica-identity set — see [CDCReader.resolveIdentityKeyCols]), not
+// the raw per-column wire flag, so this stays consistent with the
+// [filterBeforeToKeyCols] narrowing.
 //
 // Errors loudly when the relation has REPLICA IDENTITY NOTHING (no
 // old tuple is ever emitted, regardless of column changes — UPDATEs
@@ -960,27 +993,22 @@ func synthesizeKeyOnlyBefore(rel *relationCacheEntry, after ir.Row) (ir.Row, err
 			rel.Schema, rel.Name,
 		)
 	}
-	before := make(ir.Row, len(rel.Columns))
-	keyCount := 0
-	for _, col := range rel.Columns {
-		if !col.KeyColumn {
-			continue
-		}
-		v, ok := after[col.Name]
-		if !ok {
-			return nil, fmt.Errorf(
-				"update on %s.%s: identity column %q missing from new tuple; cannot synthesize WHERE",
-				rel.Schema, rel.Name, col.Name,
-			)
-		}
-		before[col.Name] = v
-		keyCount++
-	}
-	if keyCount == 0 {
+	if len(rel.IdentityKeyCols) == 0 {
 		return nil, fmt.Errorf(
 			"update on %s.%s: relation has no identity-key columns (no PRIMARY KEY and no REPLICA IDENTITY index); cannot replicate UPDATE",
 			rel.Schema, rel.Name,
 		)
+	}
+	before := make(ir.Row, len(rel.IdentityKeyCols))
+	for _, name := range rel.IdentityKeyCols {
+		v, ok := after[name]
+		if !ok {
+			return nil, fmt.Errorf(
+				"update on %s.%s: identity column %q missing from new tuple; cannot synthesize WHERE",
+				rel.Schema, rel.Name, name,
+			)
+		}
+		before[name] = v
 	}
 	return before, nil
 }
@@ -1005,7 +1033,7 @@ func (r *CDCReader) emitDelete(
 		// NOTHING, which is unreplicatable for DELETE: the applier has
 		// no way to identify the row. Surface this loudly so the
 		// operator fixes the source rather than silently losing rows
-		// (the original Bug 8 surface — see filterDeleteBefore).
+		// (the original Bug 8 surface — see filterBeforeToKeyCols).
 		return fmt.Errorf(
 			"postgres: cdc: delete on %s.%s without identity: relation has REPLICA IDENTITY NOTHING; configure REPLICA IDENTITY DEFAULT, FULL, or USING INDEX before replicating DELETEs",
 			rel.Schema, rel.Name,
@@ -1015,7 +1043,7 @@ func (r *CDCReader) emitDelete(
 	if err != nil {
 		return fmt.Errorf("postgres: cdc: decode delete for %s.%s: %w", rel.Schema, rel.Name, err)
 	}
-	before, err := filterDeleteBefore(rel, decoded)
+	before, err := filterBeforeToKeyCols(rel, decoded)
 	if err != nil {
 		return fmt.Errorf("postgres: cdc: %w", err)
 	}
@@ -1031,67 +1059,79 @@ func (r *CDCReader) emitDelete(
 	})
 }
 
-// filterDeleteBefore narrows the decoded OldTuple of a DELETE event
-// down to its identity-key columns. The narrowing is load-bearing for
-// silent-data-loss prevention (Bug 8), so the protocol detail driving
-// it is worth spelling out:
+// filterBeforeToKeyCols narrows the decoded OldTuple of a DELETE or
+// UPDATE event down to its identity-key columns, so the Before image
+// the applier turns into a WHERE clause uses only the replica-identity
+// predicates. The narrowing is load-bearing for silent-data-loss
+// prevention on BOTH paths, and the protocol details driving it are
+// asymmetric enough to be worth spelling out:
 //
-// Under REPLICA IDENTITY DEFAULT (and USING INDEX), pgoutput's
-// DeleteMessage carries an 'K' OldTuple with ColumnNum equal to the
-// relation's full column count, but only the identity-key columns
-// hold actual data — non-key columns are sent as 'n' (null) markers.
-// [decodeTuple] faithfully translates 'n' into a present-but-nil
-// entry in the row map. The applier's [buildWhereClause] then emits
-// "non_key_col IS NULL" for those entries, predicates that fail to
-// match real rows whose non-key columns hold non-null values. The
-// DELETE matches zero rows, ADR-0010 absorbs the miss for resume
-// idempotency, and the position advances — silent data divergence.
+// DELETE (Bug 8): under REPLICA IDENTITY DEFAULT (and USING INDEX),
+// pgoutput's DeleteMessage carries a 'K' OldTuple with ColumnNum equal
+// to the relation's full column count, but only the identity-key
+// columns hold actual data — non-key columns are sent as 'n' (null)
+// markers. [decodeTuple] faithfully translates 'n' into a
+// present-but-nil entry in the row map. The applier's
+// [buildWhereClause] then emits "non_key_col IS NULL" for those
+// entries, predicates that fail to match real rows whose non-key
+// columns hold non-null values. The DELETE matches zero rows, ADR-0010
+// absorbs the miss for resume idempotency, and the position advances —
+// silent data divergence.
 //
-// Filtering to key columns produces a WHERE that uses only the
-// identity-key predicates, which is exactly what an idempotent DELETE
-// against the replica identity needs. The same filter is correct
-// under FULL (every column is in the OldTuple, but only key columns
-// are flagged KeyColumn=true; the WHERE is still right, just shorter)
-// and under USING INDEX (only the named index columns are present
-// and they're flagged KeyColumn=true; nothing to drop).
+// UPDATE/DELETE (Bug 92): under REPLICA IDENTITY FULL the OldTuple
+// carries EVERY column with real data ('t'), not null markers — AND
+// pgoutput sets the per-column wire key flag on EVERY column (the whole
+// row is "the identity"). The first Bug-92 fix attempt narrowed via
+// relationColumn.KeyColumn (the wire flag) and so was a silent no-op
+// under FULL: every column was flagged, nothing got dropped, and the
+// WHERE still spanned rich types (jsonb / timestamptz / bytea /
+// high-precision numeric) whose decoded→rebound text does NOT `=`-match
+// the value already stored on the target. The statement matched zero
+// rows, ADR-0010 absorbed the miss, and the new value was silently
+// dropped. (DELETEs appeared to "land" pre-fix only because the test
+// tables that exercised FULL+DELETE carried no rich-typed columns — a
+// rich-typed DELETE under FULL drops just the same.)
+//
+// The correct narrowing therefore keys off rel.IdentityKeyCols, which
+// is resolved per-relation by [CDCReader.resolveIdentityKeyCols]:
+//   - DEFAULT / USING INDEX → the wire-flagged replica-identity columns;
+//   - FULL → the table's TRUE PRIMARY KEY (queried via pg_index, NOT the
+//     all-set wire flags). The WHERE becomes key-only (WHERE id = $N),
+//     robust to round-trip representation drift in non-key columns.
 //
 // Edge cases:
 //
-//   - REPLICA IDENTITY NOTHING is rejected upstream in [emitDelete]
-//     (no OldTuple is ever sent), so this helper is never called for it.
+//   - REPLICA IDENTITY NOTHING is rejected upstream in [emitDelete] and
+//     [synthesizeKeyOnlyBefore] (no usable OldTuple), so this helper is
+//     never reached with a NOTHING relation's tuple.
 //   - A relation with no key columns at all (no PK and no REPLICA
 //     IDENTITY index) under REPLICA IDENTITY FULL is unusual but
-//     legitimate: the operator deliberately set FULL knowing there
-//     was no PK to flag. We honour that by falling back to the full
-//     decoded row — anything else would silently lose DELETEs on
-//     PK-less FULL tables, the very class of bug this helper exists
-//     to prevent.
-func filterDeleteBefore(rel *relationCacheEntry, decoded ir.Row) (ir.Row, error) {
-	keyCount := 0
-	for _, col := range rel.Columns {
-		if col.KeyColumn {
-			keyCount++
-		}
-	}
-	if keyCount == 0 {
-		// REPLICA IDENTITY FULL on a PK-less relation: the only
-		// usable identity is "every column", which is exactly what
-		// `decoded` already holds. Hand it back verbatim.
+//     legitimate: the operator deliberately set FULL knowing there was
+//     no PK. resolveIdentityKeyCols leaves IdentityKeyCols empty, and we
+//     honour that by falling back to the full decoded row — anything
+//     else would silently lose DELETEs/UPDATEs on PK-less FULL tables,
+//     the very class of bug this helper exists to prevent. (FULL with no
+//     key is the one case where rich-type round-trip drift can still
+//     bite, but there is no narrower identity to fall back to; the
+//     alternative — dropping the row — is strictly worse.)
+func filterBeforeToKeyCols(rel *relationCacheEntry, decoded ir.Row) (ir.Row, error) {
+	if len(rel.IdentityKeyCols) == 0 {
+		// No resolvable identity (PK-less FULL, or a hand-built unit
+		// fixture with no flagged columns): the only usable identity is
+		// "every column", which is exactly what `decoded` already holds.
+		// Hand it back verbatim.
 		return decoded, nil
 	}
-	before := make(ir.Row, keyCount)
-	for _, col := range rel.Columns {
-		if !col.KeyColumn {
-			continue
-		}
-		v, ok := decoded[col.Name]
+	before := make(ir.Row, len(rel.IdentityKeyCols))
+	for _, name := range rel.IdentityKeyCols {
+		v, ok := decoded[name]
 		if !ok {
 			return nil, fmt.Errorf(
-				"delete on %s.%s: identity column %q missing from old tuple; refusing to emit a partial WHERE",
-				rel.Schema, rel.Name, col.Name,
+				"%s.%s: identity column %q missing from old tuple; refusing to emit a partial WHERE",
+				rel.Schema, rel.Name, name,
 			)
 		}
-		before[col.Name] = v
+		before[name] = v
 	}
 	return before, nil
 }
@@ -1288,6 +1328,106 @@ func buildRelationCacheEntry(m pglogrepl.RelationMessage) (*relationCacheEntry, 
 		ReplicaIdentity: m.ReplicaIdentity,
 		Columns:         cols,
 	}, nil
+}
+
+// resolveIdentityKeyCols populates entry.IdentityKeyCols — the column
+// set the Before image must narrow to before it becomes an
+// UPDATE/DELETE WHERE clause. Called once per RelationMessage (a fresh
+// one is emitted on schema change), so it is off the per-row hot path.
+//
+// The resolution is asymmetric by replica identity, and that asymmetry
+// IS the Bug 92 fix:
+//
+//   - DEFAULT ('d') / USING INDEX ('i'): the pgoutput per-column key
+//     flag (relationColumn.KeyColumn) faithfully marks the replica-
+//     identity index columns. Use them directly — no DB round-trip.
+//
+//   - FULL ('f'): pgoutput sets the key flag on EVERY column (the whole
+//     row is "the identity"), so the wire flags are useless for
+//     narrowing — trusting them keeps every column in the WHERE,
+//     including rich types whose decoded→rebound text fails to `=`-match
+//     the stored target value, the statement matches zero rows, and
+//     ADR-0010's resume-idempotent zero-rows-ok behaviour silently
+//     swallows the loss (Bug 92, a CRITICAL silent UPDATE/DELETE-loss
+//     class). Under FULL we therefore IGNORE the wire flags and resolve
+//     the table's TRUE PRIMARY KEY via pg_index. If the table has no PK,
+//     IdentityKeyCols is left empty and filterBeforeToKeyCols falls back
+//     to the full row (the only identity available on a PK-less FULL
+//     table — anything narrower would be guessing).
+//
+//   - NOTHING ('n'): never reaches here with a usable tuple (emitDelete
+//     and synthesizeKeyOnlyBefore reject first).
+//
+// A nil r.db (hand-built reader in non-streaming unit paths) skips the
+// FULL PK lookup and falls through to the wire flags; the integration
+// path always has a live pool.
+func (r *CDCReader) resolveIdentityKeyCols(ctx context.Context, entry *relationCacheEntry) error {
+	if entry.ReplicaIdentity == 'f' && r.db != nil {
+		pkCols, err := primaryKeyColumnsFromCatalog(ctx, r.db, entry.Schema, entry.Name)
+		if err != nil {
+			return fmt.Errorf("resolve primary key for REPLICA IDENTITY FULL narrowing: %w", err)
+		}
+		// pkCols may be empty (FULL table with no PK) — that's a valid
+		// state; the full-row fallback in filterBeforeToKeyCols handles
+		// it. Store whatever we found; emptiness is meaningful.
+		entry.IdentityKeyCols = pkCols
+		return nil
+	}
+	// DEFAULT / USING INDEX (and the nil-db unit fallback): the wire key
+	// flags are the replica-identity columns. Project them in column
+	// order so the WHERE is deterministic.
+	for _, col := range entry.Columns {
+		if col.KeyColumn {
+			entry.IdentityKeyCols = append(entry.IdentityKeyCols, col.Name)
+		}
+	}
+	return nil
+}
+
+// primaryKeyColumnsFromCatalog returns the ordered PRIMARY KEY column
+// names for schema.table by querying the live catalog (pg_index), or an
+// empty slice if the table has no PRIMARY KEY. The ordering follows the
+// index's column order (pg_index.indkey), which is the order an
+// idempotent WHERE clause should use. Used only on the REPLICA IDENTITY
+// FULL narrowing path (Bug 92), where pgoutput's wire key flags are
+// all-set and cannot identify the real PK.
+//
+// Distinct from the IR-based [primaryKeyColumns] in row_writer_batch.go:
+// that one extracts the PK from an already-introspected *ir.Table; this
+// one runs a fresh catalog query because the CDC reader has only the
+// pgoutput RelationMessage (which doesn't distinguish the PK under FULL)
+// plus a live *sql.DB pool.
+func primaryKeyColumnsFromCatalog(ctx context.Context, db *sql.DB, schema, table string) ([]string, error) {
+	const q = `
+		SELECT a.attname
+		FROM   pg_index ix
+		JOIN   pg_class      cl ON cl.oid = ix.indrelid
+		JOIN   pg_namespace  n  ON n.oid  = cl.relnamespace
+		JOIN   LATERAL unnest(ix.indkey) WITH ORDINALITY AS u(attnum, ord) ON TRUE
+		JOIN   pg_attribute  a  ON a.attrelid = ix.indrelid AND a.attnum = u.attnum
+		WHERE  ix.indisprimary
+		  AND  n.nspname  = $1
+		  AND  cl.relname = $2
+		  AND  cl.relkind = 'r'
+		ORDER  BY u.ord`
+	rows, err := db.QueryContext(ctx, q, schema, table)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var cols []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		cols = append(cols, name)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return cols, nil
 }
 
 // decodeTuple turns a pgoutput TupleData (positional, parallel to the

@@ -44,7 +44,7 @@ func decodeValue(raw any, t ir.Type) (any, error) {
 	case ir.Char, ir.Varchar, ir.Text:
 		return decodeString(raw)
 	case ir.Binary, ir.Varbinary, ir.Blob:
-		return decodeBytes(raw)
+		return decodeBytea(raw)
 	case ir.Bit:
 		// catalog Bug 75: PG `bit`/`varbit` surfaces under pgx stdlib
 		// mode as the canonical '0'/'1' text ("10101010"). The IR
@@ -285,6 +285,12 @@ func decodeString(raw any) (any, error) {
 
 // decodeBytes returns a fresh []byte. pgx may reuse buffers across
 // rows, so we copy to make values safe to retain.
+//
+// Used for value families whose IR contract IS the verbatim byte/text
+// payload — JSON / JSONB (stored as text) and the opaque
+// extension/verbatim passthroughs. The bytea family has its own decoder
+// ([decodeBytea]) because the CDC path delivers bytea in `\x`-hex TEXT
+// form, which must be hex-decoded rather than copied verbatim.
 func decodeBytes(raw any) (any, error) {
 	switch v := raw.(type) {
 	case []byte:
@@ -295,6 +301,67 @@ func decodeBytes(raw any) (any, error) {
 		return []byte(v), nil
 	}
 	return nil, fmt.Errorf("postgres: cannot decode %T as bytes", raw)
+}
+
+// decodeBytea decodes a PG `bytea` value to its raw bytes. It must
+// handle two shapes the two reader paths deliver:
+//
+//   - row-reader (database/sql via pgx stdlib mode): pgx decodes bytea
+//     to the raw Go []byte already. Copied verbatim.
+//   - CDC (pgoutput tuple, text format): the value arrives as the
+//     server's `bytea_output` text representation. With the PG default
+//     `bytea_output = hex` that is a `\x`-prefixed, even-length lowercase
+//     hex string (e.g. `\xcafebabe`), delivered as the ASCII bytes of
+//     that text. Copying it verbatim — as the old shared decodeBytes did
+//     — stored the literal 10 ASCII bytes `\xcafebabe` instead of the 4
+//     bytes 0xCAFEBABE: silent bytea corruption over CDC, uncaught until
+//     the Bug 92 family-matrix pin exercised a bytea column end-to-end.
+//
+// Disambiguation mirrors [decodePGGeometry] (which already strips the
+// same `\x` bytea-style prefix): a value is treated as hex-encoded text
+// ONLY when it carries the `\x` prefix AND the remainder is valid,
+// even-length hex. Raw bytes that don't fit that shape — the row-reader
+// path — fall through to a verbatim copy unchanged.
+func decodeBytea(raw any) (any, error) {
+	var s string
+	switch v := raw.(type) {
+	case []byte:
+		s = string(v)
+		if b, ok := decodeHexByteaText(s); ok {
+			return b, nil
+		}
+		// Not `\x`-hex text: row-reader raw bytes. Copy (pgx reuses
+		// buffers across rows).
+		out := make([]byte, len(v))
+		copy(out, v)
+		return out, nil
+	case string:
+		if b, ok := decodeHexByteaText(v); ok {
+			return b, nil
+		}
+		return []byte(v), nil
+	}
+	return nil, fmt.Errorf("postgres: cannot decode %T as bytea", raw)
+}
+
+// decodeHexByteaText recognises the PG `bytea_output = hex` text form
+// (`\x` + even-length lowercase/uppercase hex) and returns the decoded
+// bytes. The bool is false when s is not in that form, so the caller can
+// fall back to a verbatim byte copy (the row-reader raw-bytes shape).
+func decodeHexByteaText(s string) ([]byte, bool) {
+	const prefix = `\x`
+	if !strings.HasPrefix(s, prefix) {
+		return nil, false
+	}
+	body := s[len(prefix):]
+	if len(body)%2 != 0 {
+		return nil, false
+	}
+	b, err := hex.DecodeString(body)
+	if err != nil {
+		return nil, false
+	}
+	return b, true
 }
 
 // decodeBitString returns the IR-canonical bit-string form for a PG

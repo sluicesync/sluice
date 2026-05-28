@@ -36,6 +36,33 @@ type relationCacheEntry struct {
 	ReplicaIdentity uint8
 
 	Columns []relationColumn
+
+	// IdentityKeyCols is the ordered set of column names that identify
+	// a row for the purpose of building an UPDATE/DELETE WHERE clause —
+	// the "Before image must narrow to these" set (Bug 92).
+	//
+	// It is NOT simply the per-column wire key flag (relationColumn.
+	// KeyColumn = pgoutput's RelationMessageColumn.Flags&1). Under
+	// REPLICA IDENTITY FULL pgoutput flags EVERY column as a key column
+	// (empirically confirmed: a 12-column FULL table arrives with all 12
+	// flagged), so trusting the wire flag would narrow to "all columns"
+	// — a no-op that leaves rich-typed columns (jsonb / timestamptz /
+	// bytea / high-precision numeric) in the WHERE, where their
+	// decoded→rebound text fails to `=`-match the stored target value
+	// and the statement silently matches zero rows (the Bug 92 silent
+	// UPDATE/DELETE-loss class).
+	//
+	// Resolution, by replica identity:
+	//   - DEFAULT / USING INDEX: the wire key flags ARE the replica-
+	//     identity index columns, so IdentityKeyCols = the flagged
+	//     columns (no DB round-trip needed).
+	//   - FULL: the wire flags are useless (all-set); IdentityKeyCols is
+	//     resolved to the table's TRUE PRIMARY KEY via pg_index. A FULL
+	//     table with no PK leaves this empty, and the Before-narrowing
+	//     falls back to the full row (the only available identity).
+	//   - NOTHING: no old tuple is ever emitted; the upstream emit paths
+	//     reject before this is consulted.
+	IdentityKeyCols []string
 }
 
 // relationColumn carries the resolved IR view of one column. The raw
