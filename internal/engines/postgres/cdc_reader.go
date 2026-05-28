@@ -922,20 +922,23 @@ func (r *CDCReader) emitUpdate(
 		if err != nil {
 			return fmt.Errorf("postgres: cdc: decode update.before for %s.%s: %w", rel.Schema, rel.Name, err)
 		}
-		// Narrow Before to the identity-key columns before it becomes
-		// the applier's UPDATE WHERE source — the exact symmetry the
-		// DELETE path already has via filterBeforeToKeyCols. Under
-		// REPLICA IDENTITY FULL the OldTuple carries every column with
-		// real data, including rich types (jsonb / timestamptz / bytea /
-		// high-precision numeric) that do NOT `=`-match the stored
-		// target value after the pgoutput decode→rebind round-trip. An
-		// UPDATE WHERE built over those columns matches zero rows, which
-		// ADR-0010's resume-idempotent zero-rows-ok behaviour silently
-		// absorbs — silent UPDATE loss (Bug 92). Filtering to key
-		// columns makes the WHERE key-only (WHERE id = $N), identical to
-		// the DELETE path. Under DEFAULT/USING INDEX it's a no-op-shaped
-		// filter (non-key columns arrive as nil markers and get dropped
-		// anyway), so the pre-Bug-92 correct behaviour is preserved.
+		// Narrow Before to the relation's resolved identity-key columns
+		// (rel.IdentityKeyCols) before it becomes the applier's UPDATE
+		// WHERE source — the exact symmetry the DELETE path has via
+		// filterBeforeToKeyCols. Under REPLICA IDENTITY FULL the OldTuple
+		// carries every column with real data, including rich types
+		// (jsonb / timestamptz / bytea / high-precision numeric) that do
+		// NOT `=`-match the stored target value after the pgoutput
+		// decode→rebind round-trip; a WHERE over those columns matches
+		// zero rows, which ADR-0010's resume-idempotent zero-rows-ok
+		// behaviour silently absorbs — silent UPDATE loss (Bug 92).
+		// Crucially the narrowing keys off IdentityKeyCols (resolved to
+		// the TRUE PRIMARY KEY under FULL by resolveIdentityKeyCols), NOT
+		// the pgoutput per-column wire key flag — which under FULL is set
+		// on EVERY column and so would narrow to nothing. The result is a
+		// key-only WHERE (WHERE id = $N). Under DEFAULT/USING INDEX
+		// IdentityKeyCols is the wire-flagged replica-identity set, so the
+		// pre-Bug-92 correct behaviour is preserved.
 		before, err = filterBeforeToKeyCols(rel, decoded)
 		if err != nil {
 			return fmt.Errorf("postgres: cdc: %w", err)
