@@ -1550,30 +1550,40 @@ func ensurePublication(ctx context.Context, db *sql.DB, name, schema string, tab
 	// the publication is metadata only — slots reference WAL by
 	// LSN, not by publication name binding.
 	if len(tables) == 0 {
-		// Caller hasn't supplied a scope, so we normally respect
-		// whatever the publication currently is. The one exception:
-		// a publication that exists but is genuinely empty — not FOR
-		// ALL TABLES (ruled out below), no member tables, and no
-		// FOR-TABLES-IN-SCHEMA memberships — can never emit a single
-		// pgoutput row. Streaming from it leaves the slot's
-		// confirmed_flush_lsn pinned forever: the run "succeeds"
-		// (exit 0) while silently replicating nothing. That shape is
-		// almost always a stale publication left over from an aborted
-		// run (DROP SCHEMA does not drop publications). Refuse loudly
-		// with a recovery hint rather than stalling silently.
-		empty, err := publicationIsEmpty(ctx, db, name)
-		if err != nil {
-			return err
-		}
-		if empty {
-			return fmt.Errorf(
-				"postgres: publication %q exists but has no tables (and is not FOR ALL TABLES); "+
-					"it would emit no CDC events and the stream would silently stall with nothing replicated. "+
-					"This usually means a stale publication left over from a prior or aborted run "+
-					"(DROP SCHEMA does not drop publications). Recover with `DROP PUBLICATION %s;` "+
-					"(sluice will recreate it) or `ALTER PUBLICATION %s ADD TABLE <table>;` to scope it",
-				name, quoteIdent(name), quoteIdent(name),
-			)
+		// Caller hasn't supplied a scope, so respect whatever the
+		// publication currently is. One shape is worth a loud warning
+		// though: a publication that is NOT FOR ALL TABLES and has no
+		// member tables / no FOR-TABLES-IN-SCHEMA memberships can never
+		// emit a pgoutput row, so streaming from it pins the slot's
+		// confirmed_flush_lsn and replicates nothing — a silent stall
+		// that is painful to diagnose. It is usually a stale publication
+		// left from an aborted run (DROP SCHEMA does not drop
+		// publications).
+		//
+		// We WARN rather than refuse: an empty publication legitimately
+		// occurs on this no-scope path (a reader reusing a publication
+		// whose tables were just dropped; the streamer's own scoped
+		// EnsurePublication call is what establishes scope in the normal
+		// migrate/sync flow), so a hard error here would break those
+		// callers. The warning names the publication and the recovery so
+		// the stall is no longer silent. FOR ALL TABLES is implicitly
+		// non-empty, so it is excluded.
+		if !allTables {
+			empty, err := publicationIsEmpty(ctx, db, name)
+			if err != nil {
+				return err
+			}
+			if empty {
+				slog.WarnContext(
+					ctx,
+					"postgres: publication has no tables and is not FOR ALL TABLES — "+
+						"the CDC stream will replicate nothing until it is scoped. This is "+
+						"usually a stale publication left from a prior or aborted run "+
+						"(DROP SCHEMA does not drop publications); recover by dropping it "+
+						"(sluice recreates it) or `ALTER PUBLICATION ... ADD TABLE <table>`",
+					slog.String("publication", name),
+				)
+			}
 		}
 		return nil
 	}
