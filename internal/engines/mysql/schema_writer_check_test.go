@@ -84,6 +84,21 @@ func TestRefuseUntranslatedCheckExprMySQL(t *testing.T) {
 			expr:    "JSON_EXTRACT(payload, '$.k') = 'v'",
 			wantErr: false,
 		},
+		{
+			// Bug 77 v0.85.1 regression pin: the SOURCE carries `::`
+			// (PG cast) and `~~` (PG LIKE), but the translator rewrote
+			// both into valid MySQL, so the OUTPUT is clean and must NOT
+			// be refused. An earlier input-OR-output match false-refused
+			// this on the source `::`.
+			name: "translated-cast-and-like-passes",
+			chk: &ir.CheckConstraint{
+				Name:        "accounts_email_check",
+				Expr:        "((email)::text ~~ '%@%'::text)",
+				ExprDialect: "postgres",
+			},
+			expr:    "(CAST(email AS CHAR) LIKE CAST('%@%' AS CHAR))",
+			wantErr: false,
+		},
 	}
 	for _, c := range cases {
 		c := c

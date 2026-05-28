@@ -154,24 +154,30 @@ var untranslatedPGToMySQLTokens = []string{
 	"~",   // PG regex (case-sensitive); also catches the three above
 }
 
-// refuseUntranslatedCheckExprMySQL returns a refuse-loudly error
-// when either the SOURCE CHECK Expr text or the POST-translation
-// text contains a well-known PG-only token that MySQL cannot
-// reliably execute. Only fires on cross-dialect cases
-// (chk.ExprDialect != "" and != "mysql"). Mirrors the PG-side
-// fix — checking input catches the case where the translator
-// produces a MySQL idiom with subtle semantic differences (and
-// would otherwise let SQL through that fails at runtime with a
-// generic MySQL parse error rather than sluice's actionable
-// refuse-loudly + --expr-override hint).
+// refuseUntranslatedCheckExprMySQL returns a refuse-loudly error when
+// the POST-translation text still contains a well-known PG-only token
+// that MySQL cannot execute. Only fires on cross-dialect cases
+// (chk.ExprDialect != "" and != "mysql").
+//
+// The check is on the OUTPUT (post-translation) text, not the source.
+// The translator faithfully rewrites the safe PG idioms — `::` → CAST,
+// `~~` → LIKE, `->>` → JSON_EXTRACT — so a source expr containing those
+// tokens lands as valid MySQL and must NOT be refused (Bug 77 v0.85.1:
+// an earlier input-OR-output match false-refused
+// `(email)::text ~~ '%@%'` even though it translated cleanly to
+// `CAST(email AS CHAR) LIKE CAST('%@%' AS CHAR)`). A token that
+// *survives* translation into the output is the real signal that the
+// construct has no MySQL equivalent (e.g. the POSIX-regex `~` family,
+// which the translator leaves untouched). Output-only matching is the
+// precise definition of "untranslatable", and it also avoids the
+// `~~` (LIKE) source false-matching the bare `~` regex token.
 func refuseUntranslatedCheckExprMySQL(chk *ir.CheckConstraint, exprText string) error {
 	if chk == nil || chk.ExprDialect == "" || chk.ExprDialect == dialectName {
 		return nil
 	}
-	lowerInput := strings.ToLower(chk.Expr)
 	lowerOutput := strings.ToLower(exprText)
 	for _, tok := range untranslatedPGToMySQLTokens {
-		if strings.Contains(lowerInput, tok) || strings.Contains(lowerOutput, tok) {
+		if strings.Contains(lowerOutput, tok) {
 			return fmt.Errorf(
 				"refuse loudly: CHECK constraint %q expression carries untranslated "+
 					"%s-dialect token %q in cross-engine apply (source expr: %q, post-translation expr: %q). "+
