@@ -43,6 +43,14 @@
 //     AUTO_INCREMENT), working via the delegated SchemaReader's
 //     [ir.SequenceStateReader] surface.
 //
+// v0.86.1 (Bug 94) made [Engine.OpenSnapshotStream] trigger-native (see
+// cdc_snapshot.go): the orchestrator's engine-neutral `sync start`
+// cold-start now drives a REPEATABLE READ bulk-copy snapshot anchored at
+// the capture log's contiguous committed-prefix high-water, handed off
+// to the trigger CDC poller — with NO replication slot. Previously it
+// delegated to the composed slot-based pgoutput path, which silently
+// created a slot the managed tier forbids and never engaged the poller.
+//
 // `--use-partitioning` remains deferred to a follow-up phase per the
 // task #62 plan.
 package pgtrigger
@@ -114,17 +122,12 @@ func (e Engine) OpenChangeApplier(ctx context.Context, dsn string) (ir.ChangeApp
 	return e.pg.OpenChangeApplier(ctx, dsn)
 }
 
-// OpenSnapshotStream delegates to the composed [postgres.Engine]'s
-// snapshot path, which today returns the same engine's
-// snapshot-and-pgoutput-CDC stream. Phase 1 of the trigger engine
-// does not exercise this code path (cold-start bulk-copy uses the
-// row-reader / row-writer surfaces directly via the orchestrator),
-// so delegating is correct for the same-engine round-trip but it
-// will be revisited in Phase 2 / Phase 3 for the cross-engine
-// snapshot+CDC handoff.
-func (e Engine) OpenSnapshotStream(ctx context.Context, dsn string) (*ir.SnapshotStream, error) {
-	return e.pg.OpenSnapshotStream(ctx, dsn)
-}
+// OpenSnapshotStream is implemented trigger-natively in cdc_snapshot.go
+// (Bug 94): a REPEATABLE READ bulk-copy snapshot anchored at the
+// capture log's contiguous committed-prefix high-water, handed off to
+// the trigger CDC poller — NO replication slot, NO pgoutput. It does
+// NOT delegate to [postgres.Engine].OpenSnapshotStream (the slot-based
+// path the slot-less managed tier forbids).
 
 // Capabilities returns the trigger-engine capability surface (§8).
 // Differs from the vanilla PG engine in three places:
