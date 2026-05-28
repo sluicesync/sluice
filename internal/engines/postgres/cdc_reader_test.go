@@ -574,7 +574,7 @@ func TestSynthesizeKeyOnlyBeforeRejectsNoKeyColumns(t *testing.T) {
 }
 
 // TestDecodeTupleDeleteOldTupleHasNullMarkersForNonKey documents the
-// pgoutput protocol detail that motivates [filterDeleteBefore]: a
+// pgoutput protocol detail that motivates [filterBeforeToKeyCols]: a
 // DELETE message under REPLICA IDENTITY DEFAULT carries an OldTuple
 // whose ColumnNum equals the relation's full column count, but with
 // 'n' (null) markers for non-key columns. decodeTuple — correctly,
@@ -625,11 +625,13 @@ func TestDecodeTupleDeleteOldTupleHasNullMarkersForNonKey(t *testing.T) {
 	}
 }
 
-// TestFilterDeleteBefore exercises every REPLICA IDENTITY shape the
+// TestFilterBeforeToKeyCols exercises every REPLICA IDENTITY shape the
 // helper has to handle. The canonical Bug 8 surface is the composite-PK
-// + DEFAULT case (third row); the others are correctness invariants
-// the same code path needs to preserve.
-func TestFilterDeleteBefore(t *testing.T) {
+// + DEFAULT case (third row); the FULL-with-PK case (Bug 92) is the
+// UPDATE-path surface where non-key columns carry real rich-type data
+// that must be dropped from the WHERE; the others are correctness
+// invariants the same code path needs to preserve.
+func TestFilterBeforeToKeyCols(t *testing.T) {
 	cases := []struct {
 		name    string
 		rel     *relationCacheEntry
@@ -720,9 +722,9 @@ func TestFilterDeleteBefore(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			got, err := filterDeleteBefore(c.rel, c.decoded)
+			got, err := filterBeforeToKeyCols(c.rel, c.decoded)
 			if err != nil {
-				t.Fatalf("filterDeleteBefore: %v", err)
+				t.Fatalf("filterBeforeToKeyCols: %v", err)
 			}
 			if !reflect.DeepEqual(got, c.want) {
 				t.Errorf("\n got = %#v\nwant = %#v", got, c.want)
@@ -731,7 +733,7 @@ func TestFilterDeleteBefore(t *testing.T) {
 	}
 }
 
-func TestFilterDeleteBeforeRejectsMissingKeyValue(t *testing.T) {
+func TestFilterBeforeToKeyColsRejectsMissingKeyValue(t *testing.T) {
 	// A key column declared on the relation but absent from the
 	// decoded tuple: should refuse to build a partial WHERE, on the
 	// same principle as synthesizeKeyOnlyBefore.
@@ -743,7 +745,7 @@ func TestFilterDeleteBeforeRejectsMissingKeyValue(t *testing.T) {
 			{Name: "email", KeyColumn: false},
 		},
 	}
-	_, err := filterDeleteBefore(rel, ir.Row{"email": "alice@example.com"})
+	_, err := filterBeforeToKeyCols(rel, ir.Row{"email": "alice@example.com"})
 	if err == nil {
 		t.Fatal("expected error when key column missing from decoded tuple")
 	}

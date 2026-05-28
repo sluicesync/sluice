@@ -225,20 +225,129 @@ func TestMigratePGTrigger_CongruenceVsParent(t *testing.T) {
 	stopB := runCongruenceTriggerLeg(t, srcTrig, tgtTrig)
 	defer stopB()
 
-	// Quiesce: wait for both targets to settle at the expected stable
-	// row count after the CDC sequence. Generous deadline; the trigger
-	// engine polls.
-	if !waitForExactRowCount(tgtSlot, congruenceTable, congruenceExpectedRows, 90*time.Second) {
-		t.Fatalf("slot-based target never settled at %d rows; got %d",
-			congruenceExpectedRows, pollRowCount(tgtSlot, congruenceTable))
+	// Quiesce with a CONTENT-AWARE drain predicate, not a bare row count.
+	//
+	// The stable post-CDC row count is ALSO 20 (seed 20 - del id=12 -
+	// del id=22 + ins id=21 + ins id=22 = 20), identical to the seed
+	// count. A `count == 20` gate is therefore ambiguous: it's satisfied
+	// the instant the bulk copy lands the 20 seed rows — BEFORE any CDC
+	// mutation applies — so the test could snapshot mid-drain and pass or
+	// fail on timing. (This ambiguity is exactly how the Bug 92 silent
+	// UPDATE loss could have slipped past a count-only gate: the dropped
+	// UPDATEs don't change the row count.) Instead, poll until the target
+	// reflects EVERY applied CDC mutation: the two deletes are gone, the
+	// insert is present, the single-column UPDATE landed, and the
+	// multi-column RICH UPDATE (id=7 amount — the Bug 92 shape) landed.
+	if !waitForCongruenceDrained(tgtSlot, 90*time.Second) {
+		t.Fatalf("slot-based target never reflected the full CDC sequence: %s",
+			congruenceDrainDiag(tgtSlot))
 	}
-	if !waitForExactRowCount(tgtTrig, congruenceTable, congruenceExpectedRows, 90*time.Second) {
-		t.Fatalf("trigger-based target never settled at %d rows; got %d",
-			congruenceExpectedRows, pollRowCount(tgtTrig, congruenceTable))
+	if !waitForCongruenceDrained(tgtTrig, 90*time.Second) {
+		t.Fatalf("trigger-based target never reflected the full CDC sequence: %s",
+			congruenceDrainDiag(tgtTrig))
 	}
 
 	// ---- CONGRUENCE assertion ----
 	assertPGTrigCongruent(t, tgtSlot, tgtTrig)
+}
+
+// waitForCongruenceDrained polls a target until it reflects the ENTIRE
+// congruenceCDCDML sequence — not just a row count. The predicate is
+// satisfied only when every CDC mutation has landed simultaneously:
+//
+//	id=12  absent  (DELETE)
+//	id=22  absent  (INSERT then DELETE)
+//	id=21  present (INSERT)
+//	id=3   seq    = 30000               (single-column UPDATE)
+//	id=7   amount = 271828.182845904523 (multi-column RICH UPDATE — the
+//	                                     Bug 92 shape: a numeric WHERE-
+//	                                     poisoning family)
+//	row count = congruenceExpectedRows  (belt-and-suspenders)
+//
+// At seed time NONE of the per-id predicates hold; they can only all
+// become true once the CDC stream has fully drained. That makes this a
+// deterministic quiescence gate immune to the count==seed-count==20
+// ambiguity (see the call site).
+func waitForCongruenceDrained(dsn string, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if congruenceFullyDrained(dsn) {
+			return true
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	return false
+}
+
+// congruenceFullyDrained is the single-shot predicate behind
+// waitForCongruenceDrained. Returns false (not an error) on any read
+// failure so the poll loop keeps trying until the deadline.
+func congruenceFullyDrained(dsn string) bool {
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		return false
+	}
+	defer func() { _ = db.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// One query folds every marker into a single boolean so the read is
+	// atomic w.r.t. the target's MVCC snapshot — no chance of observing a
+	// half-applied tx across multiple round-trips.
+	var drained bool
+	q := fmt.Sprintf(`
+		SELECT
+			NOT EXISTS (SELECT 1 FROM %[1]s WHERE id = 12)
+			AND NOT EXISTS (SELECT 1 FROM %[1]s WHERE id = 22)
+			AND EXISTS (SELECT 1 FROM %[1]s WHERE id = 21)
+			AND EXISTS (SELECT 1 FROM %[1]s WHERE id = 3 AND seq = 30000)
+			AND EXISTS (SELECT 1 FROM %[1]s WHERE id = 7 AND amount = 271828.182845904523)
+			AND (SELECT count(*) FROM %[1]s) = %[2]d
+	`, congruenceTable, congruenceExpectedRows)
+	if err := db.QueryRowContext(ctx, q).Scan(&drained); err != nil {
+		return false
+	}
+	return drained
+}
+
+// congruenceDrainDiag renders a compact human-readable snapshot of the
+// drain markers for a failure message — so a never-drained target tells
+// the operator WHICH mutation is missing rather than just "timed out".
+func congruenceDrainDiag(dsn string) string {
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		return fmt.Sprintf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var (
+		rows   int
+		has12  bool
+		has22  bool
+		has21  bool
+		seq3OK bool
+		amt7OK bool
+	)
+	q := fmt.Sprintf(`
+		SELECT
+			(SELECT count(*) FROM %[1]s),
+			EXISTS (SELECT 1 FROM %[1]s WHERE id = 12),
+			EXISTS (SELECT 1 FROM %[1]s WHERE id = 22),
+			EXISTS (SELECT 1 FROM %[1]s WHERE id = 21),
+			EXISTS (SELECT 1 FROM %[1]s WHERE id = 3 AND seq = 30000),
+			EXISTS (SELECT 1 FROM %[1]s WHERE id = 7 AND amount = 271828.182845904523)
+	`, congruenceTable)
+	if err := db.QueryRowContext(ctx, q).Scan(&rows, &has12, &has22, &has21, &seq3OK, &amt7OK); err != nil {
+		return fmt.Sprintf("diag query: %v", err)
+	}
+	return fmt.Sprintf(
+		"rows=%d (want %d) id12_gone=%v id22_gone=%v id21_present=%v id3_seq_updated=%v id7_amount_updated=%v",
+		rows, congruenceExpectedRows, !has12, !has22, has21, seq3OK, amt7OK,
+	)
 }
 
 // runCongruenceSlotLeg drives the parent slot-based postgres -> postgres
