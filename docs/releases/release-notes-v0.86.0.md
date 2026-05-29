@@ -1,5 +1,8 @@
 # sluice v0.86.0 — postgres-trigger goes cross-engine (postgres-trigger → MySQL / PlanetScale)
 
+> ⚠️ **Known issue — fixed in v0.86.1. Upgrade past v0.86.0 for the `postgres-trigger` CDC path.**
+> Post-release testing found that `sync start` / `migrate` with `--source-driver=postgres-trigger` route the CDC stream through the **slot-based** reader instead of the trigger capture-log poller — so on managed PG that genuinely cannot create replication slots (the engine's entire purpose), the documented `trigger setup → migrate → sync start` flow does not engage the trigger capture path. Additionally, `migrate` includes the engine's own `sluice_change_log` capture tables in the user set, which hard-fails cross-engine create-tables on MySQL (workaround: `--exclude-table=sluice_change_log,sluice_change_log_meta`). The bulk-copy, cutover/AUTO_INCREMENT priming, and all non-trigger directions in this release are unaffected. **v0.86.1 fixes both.**
+
 **Headline:** The `postgres-trigger` engine — sluice's Go-native, slot-less CDC capture for managed PG that locks down logical replication (Heroku Postgres Essential, Render Basic, Supabase free, some RDS/Cloud SQL tiers) — now migrates **cross-engine to MySQL and PlanetScale**, not just same-engine `postgres-trigger → postgres-trigger`. This completes ADR-0066 Phase 2. Building it surfaced and fixed three cross-engine value-fidelity bugs in the MySQL applier (one a silent-corruption, Bug-92 class) that the trigger capture path exposed.
 
 ## Features
