@@ -4,6 +4,17 @@ All notable changes to sluice are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project follows [Semantic Versioning](https://semver.org/).
 
+## [0.88.0] - 2026-05-29
+
+### Fixed
+
+- **`fix(backup): rotated backup chains are now compactable (Bug 95, ADR-0067)`** — `sluice backup compact` could never merge across a rotation boundary on a continuously-written source. The rotation handoff dropped the `(P_N, S]` window of changes between the prior segment's terminal position `P_N` and the new segment's snapshot anchor `S` (`skipThrough = S`), so those changes lived ONLY in the new segment's full snapshot — which naive compaction discards. The §14d contiguity pre-flight correctly refused every such merge (loud, no data loss), but because update-heavy churn implies continuous writes, every rotation boundary gapped and the documented "rotate a long chain, then compact the churn" workflow was unreachable. **Fix (ADR-0067):** the rotation handoff now KEEPS the `(P_N, S]` overlap in the new segment's incrementals (`skipThrough = P_N`), so rotated chains are born-contiguous and compactable by both the naive and smart compactors — for all table shapes (PK and no-PK) and encrypted or not, because the fix is upstream of the compactor. A new additive `lineage.json` field `incremental_coverage_start` records where a segment's incrementals begin (the prior terminal `P_N` for a rotated segment); the compaction (§14d) and restore segment-boundary contiguity checks key off it, while `start_position` keeps its full-anchor / restore-base meaning (empty resolves to `start_position`, so existing one-segment and pre-0067 chains are unaffected — no lineage-format bump). The kept overlap re-applies idempotently on restore (the same snapshot→CDC handoff dedup proven at the initial full→stream transition, ADR-0010), and the within-segment full→first-incremental boundary tolerates it while still refusing a forward gap. The field is derived from the ACTUAL first incremental at commit time (not recorded at rotation), so it stays honest across a crash that resumes at `S` instead of `P_N`. A latent compaction gap this fix reached for the first time — merged segments never re-stitched `ParentBackupID` across the dropped intermediate fulls, so a merged real chain would have failed its own restore-walk — is also fixed (cascade-free, since `ir.ComputeBackupID` excludes `ParentBackupID`). A genuine position gap (a pre-0067, imported, or crash-truncated lineage) is still refused loudly. Pinned by a unit boundary matrix + a rotated-overlap restore/compaction suite, and a live-rotation integration test that flipped from asserting the old "refuses loudly" to asserting "merges + restore-walks clean."
+
+### Compatibility
+
+- **Minor bump (v0.88.0)** — additive, drop-in from v0.87.0. The new `incremental_coverage_start` lineage field is optional (absent → resolves to `start_position`); no lineage-format-version bump, no config / schema / IR changes. Existing one-segment and never-compacted chains restore byte-identically.
+- **One behavior change:** rotated backup chains (`backup stream run --retain-rotate-at*`) now retain a small `(P_N, S]` event overlap per rotation boundary (re-applied idempotently on restore, so the restored result is unchanged) — this is what makes the chain compactable. `backup compact` collapses the redundancy; standalone restore correctness is unaffected.
+
 ## [0.87.0] - 2026-05-29
 
 ### Added
