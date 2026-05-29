@@ -2221,6 +2221,23 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 		closeIf(sr)
 		return nil, stop, err
 	}
+
+	// Source-side replication-capability preflight (task #61). The
+	// slot-based `postgres` CDC engine creates a logical replication
+	// slot at cold start (openSnapshotStreamWithOptionalSlot below);
+	// that requires the connecting role to be a superuser or carry the
+	// REPLICATION attribute. Refuses loudly UPFRONT — naming the role
+	// and pointing managed-PG operators at `--source-driver=postgres-
+	// trigger` — instead of failing mid-cold-start with a raw permission
+	// error. Gated on the source engine NAME: fires only for `postgres`,
+	// never for the slot-less `postgres-trigger` (which delegates the
+	// same SchemaReader, so interface-presence alone wouldn't exclude
+	// it) nor for MySQL. Runs against the still-open source SchemaReader
+	// (sr) before it's closed below.
+	if err := preflightSourceReplication(ctx, sr, s.Source.Name()); err != nil {
+		closeIf(sr)
+		return nil, stop, err
+	}
 	closeIf(sr)
 
 	// ---- Scope the source-side publication to the filtered table
