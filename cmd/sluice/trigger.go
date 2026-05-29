@@ -39,6 +39,8 @@ type TriggerSetupCmd struct {
 	DryRun bool     `help:"Print the DDL the command would apply and exit; no source-side state is modified." short:"n"`
 
 	AllowPolledFingerprint bool `help:"Opt in to the polled schema-fingerprint fallback (§7) on tiers that deny event-trigger creation. Default off: the engine refuses-loudly on such tiers so the operator explicitly acknowledges the weaker DDL-detection mode."`
+
+	CapturePayload string `help:"How much of each changed row the capture trigger writes to sluice_change_log (ADR-0068). 'full' (default) writes the full before- and after-image on every UPDATE — byte-identical to prior releases, keeps a full-before-image apply WHERE. 'changed' trims the UPDATE after-image to PK + changed columns while keeping the full before-image (so the apply WHERE still does optimistic divergence detection). 'minimal' also trims the before-image to the PK, so the apply WHERE becomes a PK match (last-write-wins; safe for one-way CDC with no concurrent target writers) — reaches toward ~2x source-write overhead. INSERT is unchanged in all modes." enum:"full,changed,minimal" default:"full"`
 }
 
 // Run implements `sluice trigger setup`.
@@ -55,6 +57,7 @@ func (c *TriggerSetupCmd) Run(_ *Globals) error {
 		Schema:                 c.Schema,
 		DryRun:                 c.DryRun,
 		AllowPolledFingerprint: c.AllowPolledFingerprint,
+		CapturePayload:         pgtrigger.CapturePayload(c.CapturePayload),
 	})
 	if plan != nil && len(plan.Refusals) > 0 {
 		fmt.Fprintln(os.Stderr, "trigger setup refused — see refusals below:")

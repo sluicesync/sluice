@@ -214,8 +214,8 @@ func TestDecodeDDLTag(t *testing.T) {
 // polled-fingerprint loop's setup-time hook is the only DDL-detection
 // surface.
 func TestRenderSetupDDL_EventTriggerToggle(t *testing.T) {
-	withET := renderSetupDDL("public", []string{"orders"}, true)
-	withoutET := renderSetupDDL("public", []string{"orders"}, false)
+	withET := renderSetupDDL("public", []string{"orders"}, true, CapturePayloadFull)
+	withoutET := renderSetupDDL("public", []string{"orders"}, false, CapturePayloadFull)
 
 	if !anyContains(withET, "CREATE EVENT TRIGGER") {
 		t.Errorf("renderSetupDDL(canEventTrigger=true) missing CREATE EVENT TRIGGER")
@@ -275,6 +275,155 @@ func TestTableRefusal_Error(t *testing.T) {
 		if !strings.Contains(s, want) {
 			t.Errorf("Error() = %q; missing substring %q", s, want)
 		}
+	}
+}
+
+// captureRowFn renders the row-capture function for one mode. Helper
+// keeps the ADR-0068 mode-shape tests terse.
+func captureRowFn(payload CapturePayload) string {
+	return renderCaptureRowFunction("public", `"public"."sluice_change_log"`, payload)
+}
+
+// TestCaptureRowFunction_Full pins the default mode (ADR-0068): the
+// UPDATE branch writes BOTH full images and the DELETE before-image is
+// the full OLD row — byte-identical to prior releases. It must NOT
+// contain the changed-set diff.
+func TestCaptureRowFunction_Full(t *testing.T) {
+	ddl := captureRowFn(CapturePayloadFull)
+
+	// UPDATE: full before AND full after.
+	if !strings.Contains(ddl, "v_before := to_jsonb(OLD)") {
+		t.Errorf("full mode: UPDATE before should be to_jsonb(OLD); ddl=\n%s", ddl)
+	}
+	if !strings.Contains(ddl, "v_after  := to_jsonb(NEW)") {
+		t.Errorf("full mode: UPDATE after should be to_jsonb(NEW)")
+	}
+	// No changed-set diff in full mode.
+	if strings.Contains(ddl, "IS DISTINCT FROM") {
+		t.Errorf("full mode: must NOT compute the changed-set diff")
+	}
+	// DELETE before is full OLD, not PK-only.
+	if strings.Contains(ddl, "v_before := v_pk") {
+		t.Errorf("full mode: before must never be the PK-only v_pk")
+	}
+}
+
+// TestCaptureRowFunction_Changed pins ADR-0068 `changed`: the UPDATE
+// after-image is the PK ∪ changed-cols diff, but the before-image stays
+// the full OLD row (divergence WHERE), and DELETE before is full OLD.
+func TestCaptureRowFunction_Changed(t *testing.T) {
+	ddl := captureRowFn(CapturePayloadChanged)
+
+	// The changed-set diff (the load-bearing snippet) must be present.
+	for _, want := range []string{
+		"jsonb_object_agg(n.key, n.value)",
+		"jsonb_each(to_jsonb(NEW)) n",
+		"(to_jsonb(OLD) -> n.key) IS DISTINCT FROM n.value",
+		"n.key = ANY(v_pk_cols)", // PK union
+	} {
+		if !strings.Contains(ddl, want) {
+			t.Errorf("changed mode: missing changed-set fragment %q; ddl=\n%s", want, ddl)
+		}
+	}
+	// before stays the FULL old row (not PK-only) so the apply WHERE
+	// keeps optimistic divergence detection.
+	if !strings.Contains(ddl, "v_before := to_jsonb(OLD);  -- full before-image") {
+		t.Errorf("changed mode: UPDATE before must be the full to_jsonb(OLD)")
+	}
+	if strings.Contains(ddl, "v_before := v_pk") {
+		t.Errorf("changed mode: before must NOT be trimmed to the PK")
+	}
+}
+
+// TestCaptureRowFunction_Minimal pins ADR-0068 `minimal`: the UPDATE
+// after-image is the changed-set diff AND both the UPDATE and DELETE
+// before-images are trimmed to the PK only (v_pk).
+func TestCaptureRowFunction_Minimal(t *testing.T) {
+	ddl := captureRowFn(CapturePayloadMinimal)
+
+	// changed-set diff for the after image (same as `changed`).
+	if !strings.Contains(ddl, "IS DISTINCT FROM n.value") {
+		t.Errorf("minimal mode: UPDATE after must be the changed-set diff; ddl=\n%s", ddl)
+	}
+	// before trimmed to PK in BOTH UPDATE and DELETE. UPDATE before is
+	// the OLD-PK projection (a PK-changing UPDATE must still locate the
+	// target by its OLD PK — using the NEW PK would silently lose the
+	// update); DELETE before is v_pk (also the OLD PK).
+	if !strings.Contains(ddl, "v_before := (SELECT jsonb_object_agg(key, value) FROM jsonb_each(to_jsonb(OLD)) WHERE key = ANY(v_pk_cols))") {
+		t.Errorf("minimal mode: UPDATE before must be the OLD-PK projection (PK-changing-UPDATE correctness); ddl=\n%s", ddl)
+	}
+	if n := strings.Count(ddl, "v_before := v_pk"); n != 1 {
+		t.Errorf("minimal mode: want 1 `v_before := v_pk` (DELETE only; UPDATE uses the OLD-PK projection); got %d; ddl=\n%s", n, ddl)
+	}
+	// The FULL OLD row must NOT be captured into before (that would be
+	// the `changed`/`full` shape, defeating the source-write saving).
+	// Note: the OLD-PK *projection* references to_jsonb(OLD) inside a
+	// jsonb_each(...) — that is fine; what must be absent is the whole-row
+	// assignment `v_before := to_jsonb(OLD);`.
+	if strings.Contains(ddl, "v_before := to_jsonb(OLD);") {
+		t.Errorf("minimal mode: before must be PK-only, never the full-row `v_before := to_jsonb(OLD);`")
+	}
+}
+
+// TestCaptureRowFunction_InsertSharedAcrossModes confirms the INSERT
+// branch (full new-row image) is identical in all three modes — ADR-0068
+// trims only UPDATE/DELETE, never INSERT.
+func TestCaptureRowFunction_InsertSharedAcrossModes(t *testing.T) {
+	const insertWant = "IF TG_OP = 'INSERT' THEN"
+	for _, m := range []CapturePayload{CapturePayloadFull, CapturePayloadChanged, CapturePayloadMinimal} {
+		ddl := captureRowFn(m)
+		if !strings.Contains(ddl, insertWant) {
+			t.Errorf("mode %q: missing shared INSERT branch", m)
+		}
+		// The INSERT after-image is always the full new row.
+		if !strings.Contains(ddl, "v_after  := to_jsonb(NEW);\n        v_before := NULL;") {
+			t.Errorf("mode %q: INSERT must write the full new-row image", m)
+		}
+		// Shared scaffold present in every mode.
+		for _, want := range []string{"SECURITY DEFINER", "SET search_path = pg_catalog, pg_temp", "INSERT INTO"} {
+			if !strings.Contains(ddl, want) {
+				t.Errorf("mode %q: missing shared scaffold %q", m, want)
+			}
+		}
+	}
+}
+
+// TestNormalizePayload validates the SetupOptions payload-mode contract:
+// empty defaults to full, the three known modes pass through, and an
+// unknown value refuses-loudly (ADR-0068).
+func TestNormalizePayload(t *testing.T) {
+	cases := []struct {
+		in      CapturePayload
+		want    CapturePayload
+		wantErr bool
+	}{
+		{"", CapturePayloadFull, false},
+		{CapturePayloadFull, CapturePayloadFull, false},
+		{CapturePayloadChanged, CapturePayloadChanged, false},
+		{CapturePayloadMinimal, CapturePayloadMinimal, false},
+		{"lite", "", true},
+		{"FULL", "", true}, // case-sensitive; the kong enum is lowercase
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(string(c.in), func(t *testing.T) {
+			got, err := normalizePayload(c.in)
+			if c.wantErr {
+				if err == nil {
+					t.Fatalf("normalizePayload(%q): want error; got nil (got=%q)", c.in, got)
+				}
+				if !strings.Contains(err.Error(), "capture-payload") {
+					t.Errorf("error %q should name --capture-payload", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("normalizePayload(%q): unexpected error %v", c.in, err)
+			}
+			if got != c.want {
+				t.Errorf("normalizePayload(%q) = %q; want %q", c.in, got, c.want)
+			}
+		})
 	}
 }
 
