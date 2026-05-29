@@ -176,6 +176,72 @@ func TestSchemaReader_TypeMatrix(t *testing.T) {
 
 // findTable searches by name (no schema qualifier — single-schema
 // reader for now).
+// TestSchemaReader_ExcludesExtensionOwnedRelations pins Bug 96: an
+// extension-owned relation (here pg_buffercache's view — mirroring the
+// pg_stat_statements views that Heroku / RDS / Cloud SQL / Supabase
+// pre-install in `public`) must be excluded from the read schema, while
+// user tables AND user views are kept. Without the exclusion, a default
+// migrate from a managed-PG source tries to recreate the extension view
+// on the target and hard-fails at create-views (`function ... does not
+// exist`, SQLSTATE 42883) after user data has already copied.
+func TestSchemaReader_ExcludesExtensionOwnedRelations(t *testing.T) {
+	dsn, cleanup := newSharedPGDB(t, "sluice_bug96")
+	defer cleanup()
+
+	const ddl = `
+		CREATE TABLE widgets (id BIGINT PRIMARY KEY, name TEXT NOT NULL);
+		CREATE VIEW widget_names AS SELECT id, name FROM widgets;
+		CREATE EXTENSION pg_buffercache;
+	`
+	applyDDL(t, dsn, ddl)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	r, err := Engine{}.OpenSchemaReader(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenSchemaReader: %v", err)
+	}
+	defer closeIf(r)
+
+	schema, err := r.ReadSchema(ctx)
+	if err != nil {
+		t.Fatalf("ReadSchema: %v", err)
+	}
+
+	hasView := func(name string) bool {
+		for _, v := range schema.Views {
+			if v.Name == name {
+				return true
+			}
+		}
+		return false
+	}
+	viewNames := func() []string {
+		out := make([]string, 0, len(schema.Views))
+		for _, v := range schema.Views {
+			out = append(out, v.Name)
+		}
+		return out
+	}
+
+	// User table kept; the extension's relation never leaks as a table.
+	if findTable(schema, "widgets") == nil {
+		t.Errorf("user table widgets missing; have %v", tableNames(schema))
+	}
+	if findTable(schema, "pg_buffercache") != nil {
+		t.Errorf("extension-owned relation pg_buffercache leaked into the table set")
+	}
+	// User view kept (no over-exclusion).
+	if !hasView("widget_names") {
+		t.Errorf("user view widget_names missing; have %v", viewNames())
+	}
+	// Bug 96: extension-owned view excluded.
+	if hasView("pg_buffercache") {
+		t.Errorf("extension-owned view pg_buffercache was NOT excluded (Bug 96); views: %v", viewNames())
+	}
+}
+
 func findTable(s *ir.Schema, name string) *ir.Table {
 	for _, t := range s.Tables {
 		if t.Name == name {
