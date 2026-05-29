@@ -2,11 +2,18 @@
 
 ## Status
 
-**Accepted (2026-05-29) — design signed off; implementation to follow.** Per
+**Accepted (2026-05-29); implemented in PR #89 / `origin/main @ 428fe0e`.** Per
 owner decision, sluice ships **all three** payload modes (`full` / `changed` /
 `minimal`, §1) as selectable rather than picking the before-trim level up front
 — so the overhead/behavior tradeoffs can be validated **head-to-head** under
 different workloads before any default flip. Default stays `full`.
+Head-to-head measurement also completed 2026-05-29; see §Measurement results
+below. Headline: the trim modes do **not** speed up source-side writes on this
+workload (the plpgsql diff CPU exceeds the bytes saved on the change-log
+INSERT), but they DO deliver a 30 % / 70 % smaller change-log — the win is
+storage, not latency. Recommendation: **keep `full` as the default.** A
+trigger-CPU optimization (caching `to_jsonb(NEW)` / `to_jsonb(OLD)` in local
+plpgsql vars, §Follow-ups) is a likely lever that could flip that story.
 This is roadmap item 18 sub-item (b). Driven by the sluice-vs-Bucardo
 head-to-head (`sluice-testing/session-reports/bucardo-vs-sluice-v0.89.0.md`):
 the `postgres-trigger` capture trigger imposes ~10.8x source-write
@@ -219,19 +226,64 @@ include a generated column's new value harmlessly since the applier filters it.
 - **Default behavior is byte-identical** to today (mode `full`), so existing
   installs and the gap-free contract are untouched.
 
-### Measurement plan (gates the default + the before-trim choice)
+### Measurement results (2026-05-29)
 
-Reproduce the Bucardo microbench *and* a realistic mixed-width workload on the
-local rig, **head-to-head across all three modes** (`full` vs `changed` vs
-`minimal`): source-write time per change (3 trials each), change-log table
-size, trigger CPU, and end-to-end CDC correctness (ordered md5 src vs target)
-on the standard rich-type table. Pin the class per CLAUDE.md: exercise
-narrow-update-on-wide-table, all-columns-changed, zero-columns-changed,
-NULL-transition, and large-TOAST-unchanged cases, plus the rich-type matrix
-(numeric/jsonb/bytea/timestamptz/array) through the JSONB-round-trip path
-(ADR-0066 §4 / Bug-74 matrix). The comparison data is what a later default-flip
-decision (if any) rests on, and it validates `minimal`'s PK-`WHERE` semantics
-against `changed`/`full` under each workload.
+Head-to-head benchmark on the local rig (PG-16, 9-col wide table, 20 000-row
+seed, 30 000 UPDATE / 100 INSERT / 100 DELETE per trial, 5 trials per mode
+plus a 3-trial per-shape breakdown). Report:
+`sluice-testing/session-reports/capture-payload-head-to-head.md` (push
+`6ab1952`).
+
+| mode | source-write × no-trigger baseline (412 ms) | change-log total | per-row payload | correctness |
+|---|---|---|---|---|
+| `full` | **7.39 ×** (3 043 ms) | 44.4 MB | 959 B | MATCH `a38511ab…` |
+| `changed` | **11.94 ×** (4 920 ms) | 31.1 MB (70 % of full) | 641 B | MATCH `a38511ab…` |
+| `minimal` | **12.27 ×** (5 053 ms) | 13.3 MB (30 % of full) | 185 B | MATCH `a38511ab…` |
+
+Three findings the design didn't predict:
+
+1. **Trim modes are SLOWER source-side, not faster.** The plpgsql `IS DISTINCT
+   FROM` diff + `jsonb_each` projections cost more CPU than the bytes saved on
+   the change-log INSERT. The narrow-update-on-wide-row shape is where the trim
+   loses most (`minimal` is 2.25 × slower than `full` on narrow). So the "trim
+   cuts source-write overhead toward Bucardo's ~2 ×" framing in the original
+   Context section was **wrong for this rig's workload**.
+2. **The trim win is STORAGE, not latency.** Change-log size drops 30 % /
+   70 %, per-row payload drops to 67 % / 19 %. That has real value (retention
+   cost, prune cadence, restore time when chained with §14 backup work) — just
+   not the value the ADR originally claimed.
+3. **Apply-side stayed unmeasured.** Network bytes to target, target INSERT
+   cost, and downstream retention are all expected to favour the leaner modes
+   (smaller payloads → faster wire + apply) — that would be the next bench
+   if the owner wants to revisit. Today's apply-side is "byte-identical, but
+   the cost ratio is unknown."
+
+**Decision based on the data: keep `full` as the default.** The trim modes
+are operator-selectable for storage-sensitive deployments, but flipping the
+default would trade a known source-write cost for an unmeasured apply-side
+win — premature.
+
+### Follow-ups (open, not in this ADR's scope)
+
+1. **Trigger-CPU optimization — cache `to_jsonb(OLD)` / `to_jsonb(NEW)` in
+   local plpgsql vars.** Today the trim-mode UPDATE branch re-evaluates
+   `to_jsonb(NEW)` twice (in `v_pk` and `v_after`'s `FROM`) and re-evaluates
+   `to_jsonb(OLD)` 1 + N times (once for `v_before` if full-before, N times
+   for the per-column `(to_jsonb(OLD) -> n.key)` lookup inside `v_after`'s
+   `WHERE`). For a 9-col table that is ~10 × `to_jsonb(OLD)` and 2 ×
+   `to_jsonb(NEW)` per UPDATE, vs 1 × each in `full` — which lines up exactly
+   with the ~1.6 × slowdown the measurement showed. A two-line change at the
+   start of the UPDATE branch (`v_new_json := to_jsonb(NEW); v_old_json :=
+   to_jsonb(OLD);`, then reference the cached vars) would compute each once
+   and likely close (or invert) the source-write gap, given the trim modes
+   already write less to the change-log. **Worth a follow-up measurement
+   before deciding any default flip.**
+2. **Apply-side benchmark — network bytes + target INSERT cost across the
+   three modes.** Today's number is "byte-identical apply"; the cost ratio
+   per mode is the missing half of the picture.
+3. **Per-table mode selection** — granularity is per-`trigger setup`
+   invocation today; per-table is a follow-up if a real operator needs mixed
+   modes against one source.
 
 ## Alternatives considered
 
