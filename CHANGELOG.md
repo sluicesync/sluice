@@ -4,6 +4,17 @@ All notable changes to sluice are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project follows [Semantic Versioning](https://semver.org/).
 
+## [0.89.0] - 2026-05-29
+
+### Fixed
+
+- **`fix(engines/postgres): exclude extension-owned relations from schema read (Bug 96)`** — A default `sluice migrate` / `sync` from a managed-Postgres source (Heroku, RDS, Cloud SQL, Supabase) failed at the create-views phase. Those platforms pre-install `pg_stat_statements`, whose views (`pg_stat_statements`, `pg_stat_statements_info`) live in `public`; sluice's `SchemaReader` returned them as user views, so recreating them on a target that lacks the extension errored with `function pg_stat_statements does not exist` (SQLSTATE 42883) — *after* the user tables had already bulk-copied (a completed-but-errored migrate). The reader now excludes **extension-member relations** (those recorded in `pg_depend` with `deptype='e'` against a `pg_extension`) from both the table and view sets, via a new `extensionMemberRelations()` helper. This mirrors `pg_dump`'s extension-member exclusion and sluice's existing Vitess `_vt_*` shadow-table (Bug 22) and bookkeeping-table (Bug 93) exclusions: extension-provided objects (also PostGIS `spatial_ref_sys` / `geometry_columns`, etc.) belong to the extension and are recreated by `CREATE EXTENSION` on the target — the operator's `--enable-pg-extension` decision — never silently copied as user data. Pinned by an integration test (an extension view is excluded; user tables + user views kept) and validated A/B against a real Heroku Postgres source (essential-0 + standard-0): the prior binary failed at create-views, the fixed binary completes the default migrate cleanly with no `--skip-views`.
+
+### Compatibility
+
+- **Minor bump (v0.89.0)** — additive, drop-in from v0.88.0. No config / schema / IR / lineage-format changes.
+- **One behavior change:** a PG source's extension-owned tables/views (e.g. `pg_stat_statements`, PostGIS `spatial_ref_sys`/`geometry_columns`) are no longer migrated as user data — they belong to the target's `CREATE EXTENSION`. This fixes the previously-failing default migrate from every managed-PG provider; operators who (unusually) relied on sluice copying an extension's relations should recreate the extension on the target via `--enable-pg-extension`.
+
 ## [0.88.0] - 2026-05-29
 
 ### Fixed
