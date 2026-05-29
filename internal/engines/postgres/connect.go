@@ -11,8 +11,10 @@ import (
 	"net/url"
 	"strings"
 
-	// stdlib registers pgx as a database/sql driver under the name "pgx".
-	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/stdlib"
+
+	"github.com/orware/sluice/internal/netkeepalive"
 )
 
 // pgConfig captures the bits of the DSN sluice cares about beyond what
@@ -90,11 +92,30 @@ func parseKVDSN(dsn string) (*pgConfig, error) {
 	return &pgConfig{dsn: strings.Join(keepers, " "), schema: schema}, nil
 }
 
+// OpenPgxDB opens a lazy *sql.DB against the Postgres server named by
+// dsn, with sluice's standard TCP keep-alive policy installed on the
+// dial path (see [netkeepalive]). It does not ping — like [sql.Open],
+// the first real connection is established on first use; callers that
+// need an eager liveness check should call PingContext themselves.
+//
+// This is the single funnel for every pgx-backed pool in sluice
+// (the postgres engine's own pools and the postgres-trigger poller),
+// so the keep-alive policy is applied uniformly. The DSN must already
+// have any sluice-custom parameters (such as `schema`) stripped — see
+// [parseDSN].
+func OpenPgxDB(dsn string) (*sql.DB, error) {
+	connConfig, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: parse dsn: %w", err)
+	}
+	connConfig.DialFunc = netkeepalive.Dialer().DialContext
+	return stdlib.OpenDB(*connConfig), nil
+}
+
 // openDB opens a *sql.DB against the Postgres server and pings to
-// confirm the connection is usable. The pgx driver registered itself
-// under the name "pgx" via the blank import at the top of this file.
+// confirm the connection is usable.
 func openDB(ctx context.Context, cfg *pgConfig) (*sql.DB, error) {
-	db, err := sql.Open("pgx", cfg.dsn)
+	db, err := OpenPgxDB(cfg.dsn)
 	if err != nil {
 		return nil, fmt.Errorf("postgres: open: %w", err)
 	}

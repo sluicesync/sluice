@@ -22,6 +22,7 @@ import (
 	"github.com/go-mysql-org/go-mysql/replication"
 
 	"github.com/orware/sluice/internal/ir"
+	"github.com/orware/sluice/internal/netkeepalive"
 )
 
 // cdcChannelBuffer is the number of [ir.Change] events the CDC channel
@@ -318,6 +319,13 @@ func (r *CDCReader) StreamChanges(ctx context.Context, from ir.Position) (<-chan
 		// outages, short enough that test-side ctx cancellation
 		// doesn't leave goroutines piling up.
 		MaxReconnectAttempts: 30,
+		// Dialer is the transport-level complement to HeartbeatPeriod
+		// above: the heartbeat keeps MySQL from timing the replica out,
+		// while sluice's shared TCP keep-alive policy keeps a cloud-NAT
+		// mapping warm on an idle binlog stream and bounds dead-peer
+		// detection to seconds rather than the kernel's multi-minute
+		// default. #77.
+		Dialer: netkeepalive.Dialer().DialContext,
 	}
 	r.syncer = replication.NewBinlogSyncer(syncerCfg)
 

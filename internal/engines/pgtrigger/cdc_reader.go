@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/orware/sluice/internal/engines/postgres"
 	"github.com/orware/sluice/internal/ir"
 )
 
@@ -61,7 +62,7 @@ func openCDCReader(ctx context.Context, dsn string) (ir.CDCReader, error) {
 	if err != nil {
 		return nil, err
 	}
-	db, err := sql.Open("pgx", cfg.dsn)
+	db, err := postgres.OpenPgxDB(cfg.dsn)
 	if err != nil {
 		return nil, fmt.Errorf("pgtrigger: cdc open: %w", err)
 	}
