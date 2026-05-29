@@ -395,6 +395,26 @@ func TestPSPG_CDCReaderBasic(t *testing.T) {
 		t.Fatalf("seed DDL: %v", err)
 	}
 
+	// Ensure a clean, scoped publication that includes this test's table.
+	// The reader's no-scope path reuses an existing publication as-is; on
+	// managed PS-PG (non-superuser) it cannot create a FOR ALL TABLES
+	// publication, and a stale empty `sluice_pub` left by a prior run
+	// makes pgoutput emit nothing — the 0-changes failure this guards
+	// against. The table owner can scope its own table in.
+	if _, err := db.ExecContext(ctx, "DROP PUBLICATION IF EXISTS sluice_pub"); err != nil {
+		t.Fatalf("drop stale publication: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "CREATE PUBLICATION sluice_pub FOR TABLE sluice_psverify_cdc.users"); err != nil {
+		t.Fatalf("create scoped publication: %v", err)
+	}
+	defer func() {
+		dropCtx, dropCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer dropCancel()
+		if _, err := db.ExecContext(dropCtx, "DROP PUBLICATION IF EXISTS sluice_pub"); err != nil {
+			t.Logf("post-clean publication: %v", err)
+		}
+	}()
+
 	psDSN := withSchemaParam(sourceDSN, schemaName)
 
 	eng := Engine{}
@@ -411,8 +431,10 @@ func TestPSPG_CDCReaderBasic(t *testing.T) {
 	}
 
 	// Settle window — let the slot fully attach to the publication
-	// before we generate events.
-	time.Sleep(500 * time.Millisecond)
+	// before we generate events. Managed PlanetScale Postgres has higher
+	// control-plane latency than a local container; too short a window
+	// let the "from now" anchor race the writes (0 events captured).
+	time.Sleep(5 * time.Second)
 
 	const dml = `
 		INSERT INTO sluice_psverify_cdc.users (id, email, active) VALUES
@@ -594,7 +616,7 @@ func drainPSChanges(
 				return got
 			}
 			switch c.(type) {
-			case ir.TxBegin, ir.TxCommit:
+			case ir.TxBegin, ir.TxCommit, ir.SchemaSnapshot:
 				continue
 			}
 			got = append(got, c)
