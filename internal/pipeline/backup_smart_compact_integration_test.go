@@ -109,13 +109,12 @@ func TestADR0064_SmartCompaction_CollapsesUpdateChain_PG(t *testing.T) {
 		t.Fatal("stream.Run did not exit within 20s of cancel")
 	}
 
-	// Smart compact. Note: the live PG rotation FSM may produce
-	// strict S > P_N gaps under continuous-write workloads (see
-	// TestADR0046_BackupCompact_LiveRotationGap_RefusesLoudly_PG);
-	// the test workload runs INSERT/UPDATE then waits for stream
-	// drain, so position-contiguity should hold. If the position-
-	// gap refusal trips, the test passes that signal up — it's a
-	// real refusal, not a regression.
+	// Smart compact. ADR-0067: the rotation handoff KEEPS the (P_N, S]
+	// overlap in each new segment's incrementals (recording
+	// IncrementalCoverageStart = P_N), so a live-rotation chain is
+	// born-contiguous and smart compact MERGES it. A position-gap refusal
+	// here would be an ADR-0067 regression (the genuine-gap refusal is
+	// unit-covered for pre-0067 / corrupted lineages).
 	startCompact := time.Now()
 	res, err := CompactChain(context.Background(), store, CompactOpts{
 		MergeWindow:     time.Hour,
@@ -126,8 +125,7 @@ func TestADR0064_SmartCompaction_CollapsesUpdateChain_PG(t *testing.T) {
 
 	if err != nil {
 		if strings.Contains(err.Error(), "position gap") {
-			t.Logf("ADR-0046 position-gap refusal under live-rotation: %v", err)
-			t.Skip("live rotation produced a position gap; smart-compact correctly refused (per ADR-0046 §14d)")
+			t.Fatalf("ADR-0067 regression: smart compact refused a live-rotation chain on a position gap — rotated chains must be born-contiguous and compactable: %v", err)
 		}
 		t.Fatalf("CompactChain smart: %v", err)
 	}

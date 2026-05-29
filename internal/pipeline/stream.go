@@ -290,16 +290,18 @@ type BackupStream struct {
 	// change-chunk writer. Set by Run; repointed by rotation.
 	segCodec Codec
 
-	// skipThrough, when non-nil, is the per-segment-boundary
-	// snapshot->CDC dedup floor (= the new segment's anchor S). After
-	// a committed rotation the SAME pump still delivers events in
-	// (P_N, S] that the new full's snapshot already captured; the
-	// rollover loop drops every pump event whose position
-	// precedes-or-equals S and clears this once it sees the first
-	// event strictly after S. Requires the source engine to implement
-	// [ir.PositionMonotonicChecker] (PG + MySQL do); without it the
-	// dedup degrades to "no skip" and restore's idempotent replay
-	// absorbs the overlap.
+	// skipThrough, when non-nil, is the per-segment-boundary dedup
+	// floor. ADR-0067: it is set to P_N (the prior segment's
+	// EndPosition), NOT the new segment's anchor S. The rollover loop
+	// drops every pump event whose position precedes-or-equals P_N
+	// (events already in the prior segment's tail) and clears this once
+	// it sees the first event strictly after P_N -- so the new segment
+	// KEEPS the (P_N, S] overlap the new full's snapshot also captured,
+	// making the lineage born-contiguous and compactable. That overlap
+	// re-applies idempotently on restore. Requires the source engine to
+	// implement [ir.PositionMonotonicChecker] (PG + MySQL do); without
+	// it the floor degrades to "no skip" and restore's idempotent replay
+	// still absorbs the (now slightly larger) overlap.
 	skipThrough *ir.Position
 }
 
@@ -749,21 +751,24 @@ func (b *BackupStream) Run(ctx context.Context) error {
 				}
 			} else {
 				// Rotation committed: the new segment is authoritative.
-				// Re-point the rollover loop at the new open segment +
-				// its CDC resume position S; the SAME cdc handle keeps
-				// streaming (no slot re-open).
+				// Re-point the rollover loop at the new open segment;
+				// the SAME cdc handle keeps streaming (no slot re-open).
 				b.segStore = res.newSegStore
 				b.segCodec = res.newSegCodec
 				changesCh = res.changesCh
 				currentParent = res.newFull
-				startPos = res.resumePos
-				// Per-segment-boundary snapshot->CDC dedup: the SAME
-				// pump will still deliver events in (P_N, S] that the
-				// new full's snapshot at S already captured. Drop pump
-				// events whose position precedes-or-equals S so the
-				// new segment's first incremental begins strictly
-				// after S (StartPosition = S stays consistent).
-				b.skipThrough = &res.resumePos
+				// ADR-0067: the new segment's incrementals begin at P_N
+				// (the prior segment's EndPosition), KEEPING the (P_N, S]
+				// overlap so the lineage is born-contiguous and
+				// compactable. startPos = P_N makes the first
+				// incremental's manifest honest about its coverage; the
+				// skipThrough floor at P_N drops only events already in
+				// the prior segment's tail (<= P_N), never the overlap.
+				// The (P_N, S] events the new full also captured re-apply
+				// idempotently on restore (ADR-0010 / the initial
+				// snapshot->CDC handoff dedup, per segment boundary).
+				startPos = res.priorEnd
+				b.skipThrough = &res.priorEnd
 				rolloverSeq = 0
 				slog.InfoContext(
 					ctx, "stream: rotation committed; continuing on new segment",
@@ -1239,13 +1244,14 @@ func (b *BackupStream) captureWindow(
 				}
 				return out, nil
 			}
-			// Per-segment-boundary snapshot->CDC dedup. After a
-			// committed rotation the SAME pump still delivers events
-			// in (P_N, S] that the new full's snapshot at S already
-			// captured; drop them so the new segment's first
-			// incremental begins strictly after S. Cleared on the
-			// first event past S. Mirrors the dedup the initial
-			// full->stream handoff does server-side.
+			// Per-segment-boundary dedup floor (ADR-0067: floor = P_N,
+			// the prior segment's EndPosition). After a committed
+			// rotation the SAME pump resumes from ~P_N; drop only events
+			// already in the prior segment's tail (position <= P_N) so
+			// the new segment's first incremental begins strictly after
+			// P_N -- KEEPING the (P_N, S] overlap (which the new full's
+			// snapshot at S also captured) so the lineage is contiguous
+			// and compactable. Cleared on the first event past P_N.
 			if b.skipThrough != nil {
 				cp := change.Pos()
 				if cp.Engine == "" && cp.Token == "" {
@@ -1256,10 +1262,10 @@ func (b *BackupStream) captureWindow(
 				if chk, ok := b.Source.(ir.PositionMonotonicChecker); ok {
 					le, cerr := chk.PrecedesOrEqual(cp, *b.skipThrough)
 					if cerr == nil && le {
-						continue // event <= S: in the new full snapshot
+						continue // event <= P_N: already in the prior segment
 					}
 				}
-				// First event strictly after S (or no comparator):
+				// First event strictly after P_N (or no comparator):
 				// stop skipping; this event starts the new segment.
 				b.skipThrough = nil
 			}

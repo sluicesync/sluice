@@ -128,6 +128,24 @@ type LineageSegment struct {
 	// incrementals yet (a freshly-opened segment).
 	EndPosition ir.Position `json:"end_position"`
 
+	// IncrementalCoverageStart is the position of the FIRST event this
+	// segment's incrementals cover (ADR-0067). For a rotation-opened
+	// segment it is the PRIOR segment's EndPosition (P_N): rotation keeps
+	// the (P_N, S] overlap in the new segment's incrementals instead of
+	// dropping it, so the lineage is born-contiguous and compactable
+	// (the overlap re-applies idempotently on restore, ADR-0010, the same
+	// snapshot->CDC handoff dedup used at the initial full->stream
+	// transition). It may therefore PRECEDE StartPosition (the segment's
+	// full anchor S). StartPosition keeps its meaning (full anchor /
+	// restore base); only the two CONTIGUITY checks (compaction §14d +
+	// restore's segment-to-segment boundary) key off this field.
+	//
+	// Empty/absent resolves to StartPosition via
+	// [LineageSegment.incrementalCoverageStartOrStart] — the pre-ADR-0067
+	// behavior (never-rotated segments, segment 0, and every backup
+	// written before this field existed; additive, no format bump).
+	IncrementalCoverageStart ir.Position `json:"incremental_coverage_start,omitempty"`
+
 	// CappedAt is the instant the rotation FSM's COMMIT closed this
 	// segment. nil/zero on the open (last) segment.
 	CappedAt *time.Time `json:"capped_at,omitempty"`
@@ -167,6 +185,23 @@ func (s *LineageSegment) hasVerbatimExtensionColumns() bool {
 // codecOrDefault returns the segment's recorded codec, resolving an
 // empty value to [DefaultCodec] (zstd).
 func (s *LineageSegment) codecOrDefault() Codec { return resolveCodec(s.Codec) }
+
+// incrementalCoverageStartOrStart returns the segment's earliest
+// incremental-coverage position (ADR-0067). When
+// [LineageSegment.IncrementalCoverageStart] is set (a rotation-opened
+// segment, where it equals the prior segment's EndPosition P_N) that
+// value wins; otherwise it resolves to StartPosition (never-rotated
+// segments, segment 0, and pre-ADR-0067 backups — the historical
+// behavior where a segment's incrementals began at its full anchor).
+// The two contiguity checks (compaction §14d + restore segment-to-
+// segment boundary) compare against THIS, not StartPosition, so a
+// rotated lineage reads as gapless.
+func (s *LineageSegment) incrementalCoverageStartOrStart() ir.Position {
+	if s.IncrementalCoverageStart.Engine == "" && s.IncrementalCoverageStart.Token == "" {
+		return s.StartPosition
+	}
+	return s.IncrementalCoverageStart
+}
 
 // open reports whether this is the open (last, uncapped) segment.
 func (s *LineageSegment) open() bool { return s.CappedAt == nil || s.CappedAt.IsZero() }
