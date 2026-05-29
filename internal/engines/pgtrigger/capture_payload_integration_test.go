@@ -187,6 +187,11 @@ func payloadWideSeedRows() string {
 //	NULL → value      (id=5:  label was NULL, set to a value)
 //	value → NULL      (id=2:  observed_at had a value, set to NULL)
 //	rich multi-col    (id=9:  numeric + jsonb + bytea + array together)
+//	PK-changing update(id=10 → 40: relocates the row by mutating its PK.
+//	                   The apply WHERE must target the OLD PK; `minimal`
+//	                   trims `before` to the PK, so if it used the NEW PK
+//	                   the row would silently diverge — this case pins
+//	                   that it uses the OLD PK. ADR-0068.)
 //	DELETE (id=12)
 const payloadWideCDCDML = `
 	INSERT INTO ` + payloadWideTable + `
@@ -218,6 +223,8 @@ const payloadWideCDCDML = `
 	       blob = '\xbadc0de5',
 	       tags = '{"a",null,"c"}'
 	 WHERE id = 9;
+
+	UPDATE ` + payloadWideTable + ` SET id = 40 WHERE id = 10;
 
 	DELETE FROM ` + payloadWideTable + ` WHERE id = 12;
 `

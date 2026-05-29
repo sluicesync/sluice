@@ -568,12 +568,16 @@ func captureUpdateDeleteBlock(payload CapturePayload) string {
 		return `    ELSIF TG_OP = 'UPDATE' THEN
         v_op     := 'U';
         v_pk     := (SELECT jsonb_object_agg(key, value) FROM jsonb_each(to_jsonb(NEW)) WHERE key = ANY(v_pk_cols));
-        v_before := v_pk;  -- PK only (PK-scoped WHERE)
+        -- before drives the apply WHERE, which must locate the row by its
+        -- identity BEFORE the change. Use the OLD PK (not v_pk, which is the
+        -- NEW PK) so a PK-changing UPDATE still finds the existing target
+        -- row; pk_jsonb stays the NEW PK (metadata, consistent w/ full/changed).
+        v_before := (SELECT jsonb_object_agg(key, value) FROM jsonb_each(to_jsonb(OLD)) WHERE key = ANY(v_pk_cols));  -- OLD PK (PK-scoped WHERE)
 ` + changedAfter + `
     ELSIF TG_OP = 'DELETE' THEN
         v_op     := 'D';
         v_pk     := (SELECT jsonb_object_agg(key, value) FROM jsonb_each(to_jsonb(OLD)) WHERE key = ANY(v_pk_cols));
-        v_before := v_pk;  -- PK only
+        v_before := v_pk;  -- PK only (OLD PK — DELETE WHERE targets the existing row)
         v_after  := NULL;
 `
 	default: // CapturePayloadFull

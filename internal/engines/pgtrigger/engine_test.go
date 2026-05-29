@@ -345,15 +345,23 @@ func TestCaptureRowFunction_Minimal(t *testing.T) {
 	if !strings.Contains(ddl, "IS DISTINCT FROM n.value") {
 		t.Errorf("minimal mode: UPDATE after must be the changed-set diff; ddl=\n%s", ddl)
 	}
-	// before trimmed to PK in BOTH UPDATE and DELETE — exactly two
-	// `v_before := v_pk` assignments.
-	if n := strings.Count(ddl, "v_before := v_pk"); n != 2 {
-		t.Errorf("minimal mode: want 2 `v_before := v_pk` (UPDATE + DELETE); got %d; ddl=\n%s", n, ddl)
+	// before trimmed to PK in BOTH UPDATE and DELETE. UPDATE before is
+	// the OLD-PK projection (a PK-changing UPDATE must still locate the
+	// target by its OLD PK — using the NEW PK would silently lose the
+	// update); DELETE before is v_pk (also the OLD PK).
+	if !strings.Contains(ddl, "v_before := (SELECT jsonb_object_agg(key, value) FROM jsonb_each(to_jsonb(OLD)) WHERE key = ANY(v_pk_cols))") {
+		t.Errorf("minimal mode: UPDATE before must be the OLD-PK projection (PK-changing-UPDATE correctness); ddl=\n%s", ddl)
 	}
-	// The full OLD row must NOT be captured into before (that would be
+	if n := strings.Count(ddl, "v_before := v_pk"); n != 1 {
+		t.Errorf("minimal mode: want 1 `v_before := v_pk` (DELETE only; UPDATE uses the OLD-PK projection); got %d; ddl=\n%s", n, ddl)
+	}
+	// The FULL OLD row must NOT be captured into before (that would be
 	// the `changed`/`full` shape, defeating the source-write saving).
-	if strings.Contains(ddl, "v_before := to_jsonb(OLD)") {
-		t.Errorf("minimal mode: before must be the PK-only v_pk, never to_jsonb(OLD)")
+	// Note: the OLD-PK *projection* references to_jsonb(OLD) inside a
+	// jsonb_each(...) — that is fine; what must be absent is the whole-row
+	// assignment `v_before := to_jsonb(OLD);`.
+	if strings.Contains(ddl, "v_before := to_jsonb(OLD);") {
+		t.Errorf("minimal mode: before must be PK-only, never the full-row `v_before := to_jsonb(OLD);`")
 	}
 }
 
