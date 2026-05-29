@@ -412,6 +412,15 @@ func (m *Migrator) Run(ctx context.Context) error {
 		return err
 	}
 
+	// XID-wraparound preflight (pgcopydb PR #17 adoption). Refuses
+	// upfront when the source PG database is near the 32-bit wraparound
+	// horizon (age(datfrozenxid) ≥ ~1.5B) — migrating from such a source
+	// either races PG's global write-block or makes it worse. Gated on
+	// PG-flavoured sources only; non-PG paths short-circuit.
+	if err := preflightSourceXIDWraparound(ctx, sr, m.Source.Name()); err != nil {
+		return err
+	}
+
 	// ---- 1.5. Apply per-column type-mapping overrides ----
 	schema, err = translate.ApplyMappings(schema, m.Mappings)
 	if err != nil {

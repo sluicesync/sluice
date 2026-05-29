@@ -2238,6 +2238,15 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 		closeIf(sr)
 		return nil, stop, err
 	}
+	// XID-wraparound preflight (pgcopydb PR #17 adoption). Refuses
+	// upfront when the source PG database is near the 32-bit wraparound
+	// horizon — long-running CDC against such a source either races
+	// PG's global write-block or holds back autovacuum and makes it
+	// worse. Gated on PG-flavoured sources (postgres + postgres-trigger).
+	if err := preflightSourceXIDWraparound(ctx, sr, s.Source.Name()); err != nil {
+		closeIf(sr)
+		return nil, stop, err
+	}
 	closeIf(sr)
 
 	// ---- Scope the source-side publication to the filtered table
