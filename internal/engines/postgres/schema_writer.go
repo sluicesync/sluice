@@ -11,6 +11,8 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/jackc/pgx/v5/pgconn"
+
 	"github.com/orware/sluice/internal/ir"
 )
 
@@ -58,6 +60,21 @@ type SchemaWriter struct {
 	// Threaded into emitOpts so emitColumnType can dispatch
 	// [ir.ExtensionType] columns through pgExtensionCatalog.
 	enabledExtensions map[string]bool
+
+	// allowDegradedFKs is the operator's `--allow-degraded-fks` opt-in
+	// (ir.DegradedFKAllower / pgcopydb PR #27 / pgcopydb fork review
+	// notes). When true, [CreateConstraints] tolerates SQLSTATE 23503
+	// from a validating ADD CONSTRAINT by retrying as `NOT VALID` and
+	// appending the constraint to degradedFKs. Default off — the
+	// loud-failure tenet stays the baseline; operators opt in
+	// explicitly when migrating from a known-dirty source.
+	allowDegradedFKs bool
+
+	// degradedFKs accumulates the FKs that CreateConstraints attached
+	// degraded on the most-recent run. Returned via DegradedFKs() so
+	// the pipeline can surface them in the operator-facing report.
+	// Reset at the start of each CreateConstraints call.
+	degradedFKs []ir.DegradedFK
 }
 
 // SetSchema implements [ir.SchemaSetter]. Called by the pipeline
@@ -223,10 +240,25 @@ func (w *SchemaWriter) CreateIndexes(ctx context.Context, s *ir.Schema) error {
 
 // CreateConstraints adds every foreign-key constraint across the
 // schema. All referenced tables must already exist.
+//
+// When [EnableDegradedFKs] has been called (the operator opted into
+// `--allow-degraded-fks`), SQLSTATE 23503 from the validating
+// `ADD CONSTRAINT` triggers a one-shot retry of the same DDL with a
+// trailing `NOT VALID` clause. PG attaches the constraint on the
+// catalog without scanning existing rows; new rows are still rejected
+// by the FK on write. The operator runs `ALTER TABLE ... VALIDATE
+// CONSTRAINT <name>` after cleaning the orphan rows. The degraded
+// constraint is appended to the writer's degradedFKs slice with an
+// actionable Hint string; the pipeline surfaces the list to the
+// operator after the constraints phase completes.
+//
+// Resets degradedFKs on entry so repeat invocations of the same
+// writer don't carry residual state.
 func (w *SchemaWriter) CreateConstraints(ctx context.Context, s *ir.Schema) error {
 	if s == nil {
 		return errors.New("postgres: CreateConstraints: schema is nil")
 	}
+	w.degradedFKs = nil
 	for _, table := range orderedTables(s) {
 		fks := append([]*ir.ForeignKey(nil), table.ForeignKeys...)
 		sort.Slice(fks, func(i, j int) bool {
@@ -237,12 +269,83 @@ func (w *SchemaWriter) CreateConstraints(ctx context.Context, s *ir.Schema) erro
 			if err != nil {
 				return err
 			}
-			if _, err := w.db.ExecContext(ctx, stmt); err != nil {
-				return fmt.Errorf("postgres: add foreign key %q on %q: %w", fk.Name, table.Name, err)
+			_, execErr := w.db.ExecContext(ctx, stmt)
+			if execErr == nil {
+				continue
 			}
+			if !w.allowDegradedFKs || !isFKViolation(execErr) {
+				return fmt.Errorf("postgres: add foreign key %q on %q: %w", fk.Name, table.Name, execErr)
+			}
+			// Operator opted into degraded FKs and PG reported 23503
+			// (orphan rows on the child). Retry as NOT VALID — PG
+			// records the constraint on the catalog without rescanning
+			// existing rows; the operator validates later after fixing
+			// the orphans (see Hint below).
+			notValidStmt := appendNotValid(stmt)
+			if _, retryErr := w.db.ExecContext(ctx, notValidStmt); retryErr != nil {
+				return fmt.Errorf("postgres: add foreign key %q on %q (NOT VALID retry after %w): %w",
+					fk.Name, table.Name, execErr, retryErr)
+			}
+			refTable := fk.ReferencedTable
+			w.degradedFKs = append(w.degradedFKs, ir.DegradedFK{
+				Schema:            w.schema,
+				Table:             table.Name,
+				ConstraintName:    fk.Name,
+				LocalColumns:      append([]string(nil), fk.Columns...),
+				ReferencedTable:   refTable,
+				ReferencedColumns: append([]string(nil), fk.ReferencedColumns...),
+				Reason:            execErr.Error(),
+				Hint: fmt.Sprintf(
+					"FK attached as NOT VALID due to orphan rows on the child table. "+
+						"After fixing the orphan rows, run: "+
+						"ALTER TABLE %s.%s VALIDATE CONSTRAINT %s;",
+					quoteIdent(w.schema), quoteIdent(table.Name), quoteIdent(fk.Name),
+				),
+			})
 		}
 	}
 	return nil
+}
+
+// EnableDegradedFKs implements [ir.DegradedFKAllower]. Called by the
+// pipeline orchestrator when the operator passes `--allow-degraded-fks`.
+// Must be called BEFORE [CreateConstraints]; calling it after a run
+// has no effect on that run's behaviour.
+func (w *SchemaWriter) EnableDegradedFKs() { w.allowDegradedFKs = true }
+
+// DegradedFKs implements [ir.DegradedFKReporter]. Returns the list of
+// FKs that the most-recent [CreateConstraints] attached degraded —
+// nil/empty when either the feature wasn't enabled or every FK
+// validated cleanly. The slice is a shallow copy; mutating the
+// returned entries does not affect the writer's internal state, but
+// don't rely on the slice header being independent (it is).
+func (w *SchemaWriter) DegradedFKs() []ir.DegradedFK {
+	if len(w.degradedFKs) == 0 {
+		return nil
+	}
+	out := make([]ir.DegradedFK, len(w.degradedFKs))
+	copy(out, w.degradedFKs)
+	return out
+}
+
+// isFKViolation reports whether err is the SQLSTATE 23503 (foreign
+// key violation) that PG returns when a validating `ADD CONSTRAINT
+// ... FOREIGN KEY` finds at least one orphan row on the child table.
+// The class also covers some other 23503 cases (inserts that would
+// orphan a row); within the constraints phase, 23503 is unambiguously
+// the validation-on-add case.
+func isFKViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23503"
+}
+
+// appendNotValid takes the SQL produced by [emitAddForeignKey] (which
+// ends in a trailing `;`) and rewrites it to `... NOT VALID;`. Kept as
+// a tiny helper rather than threading a bool through emitAddForeignKey
+// to keep the existing emitter's call shape stable across the test
+// surface and the rest of the writer.
+func appendNotValid(stmt string) string {
+	return strings.TrimSuffix(stmt, ";") + " NOT VALID;"
 }
 
 // SyncIdentitySequences advances every identity column's sequence
