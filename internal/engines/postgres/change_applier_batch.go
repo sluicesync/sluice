@@ -51,19 +51,35 @@ import (
 	"github.com/orware/sluice/internal/ir"
 )
 
-// defaultIdleFlushPeriod bounds the wait between the last applied
-// change in an in-flight batch and that batch's commit. Without an
-// idle flush, a partial batch (n < maxBatchSize) would sit in memory
-// until either the channel closes or the next event arrives — which
-// on a quiet stream means the slot's confirmed_flush_lsn never
-// advances past the last *full* batch. ADR-0020's "trailing-row
-// latency" footnote.
+// defaultIdleFlushPeriod is the maximum time a partial batch
+// (n < maxBatchSize) waits after the last applied change before it
+// commits. It exists to bound trailing-row latency on a quiet stream
+// (ADR-0020): without it, a partial batch would sit in memory until
+// either the channel closes or the next event arrives, and the slot's
+// confirmed_flush_lsn would never advance past the last *full* batch.
 //
-// 5s matches the keepalive round-trip headroom: the next standby
-// status update sends the freshly-committed appliedLSN, the slot
-// advances, and warm-resume from a quiet stream now starts from the
-// most recent commit rather than the previous batch boundary.
-const defaultIdleFlushPeriod = 5 * time.Second
+// Why 100ms (the roadmap item-18 latency fix):
+//
+//   - When the channel is being fed (a burst / sustained high-
+//     throughput drain) the next change arrives well within 100ms, so
+//     batches still fill to maxBatchSize. The poller's adaptive
+//     immediate-repoll on full batches keeps the channel fed, so there
+//     is NO throughput regression — the grace only ever fires once the
+//     producer genuinely pauses.
+//   - When the stream drains / pauses, the partial batch flushes within
+//     ~100ms instead of the old 5s, so single-change apply latency on a
+//     sparse stream drops by ~5s and the slot's confirmed_flush_lsn
+//     advances promptly (the original ADR-0020 purpose, now served
+//     faster).
+//   - 100ms comfortably rides producer/scheduler jitter within a burst
+//     while staying negligible against the ~1s poll interval, so it
+//     never truncates a burst that is still in flight.
+//
+// The pre-item-18 value was 5s, which made a single sparse change cost
+// ~5s of pure trailing latency — the dominant component of the 5.9s
+// measured on the postgres-trigger CDC path under
+// --apply-batch-size=auto.
+const defaultIdleFlushPeriod = 100 * time.Millisecond
 
 // ApplyBatch implements [ir.BatchedChangeApplier]. See the file-
 // header comment for the design and invariants.
@@ -153,16 +169,33 @@ func (a *ChangeApplier) ApplyBatch(ctx context.Context, streamID string, changes
 // cap, byte cap, channel close, Truncate flush, or TxCommit flush)
 // the transaction is committed.
 func (a *ChangeApplier) applyOneBatch(ctx context.Context, streamID string, changes <-chan ir.Change, maxBatchSize int) (n int, lastPos ir.Position, channelClosed bool, err error) {
-	// GitHub #18 Phase 1: batch-latency telemetry (PG-side mirror of
-	// the MySQL applier). Measure wall-clock from batch start through
-	// position write + commit. DEBUG-only; elided on n==0.
+	// GitHub #18 Phase 1 + roadmap item 18: batch-latency telemetry
+	// (PG-side mirror of the MySQL applier). Measure wall-clock for the
+	// APPLY WORK only — begin-tx → dispatch(es) → position write →
+	// commit — NOT the time spent blocked in the pre-tx wait loop below
+	// waiting for the first row-bearing change. batchStart is therefore
+	// declared here (so the closure captures it) but assigned only after
+	// the pre-tx wait loop, immediately before BeginTx.
 	//
-	// ADR-0052: if a BatchObserver is wired, the same wall-clock
-	// duration feeds the AIMD controller via ObserveBatch — success
-	// and failure paths both call it so the controller sees retry
-	// signals.
-	batchStart := time.Now()
+	// Why this matters (ADR-0052): the same wall-clock duration feeds
+	// the AIMD controller via ObserveBatch. Including the wait-for-work
+	// made a sparse/bursty stream's first batch report ~31s of latency
+	// (~0.4s apply + ~31s blocked), which the controller read as "apply
+	// is catastrophically slow" and collapsed batch size 1000→1 —
+	// throttling drain throughput ~2x. Timing apply-only un-collapses it.
+	//
+	// IsZero guard: the n==0 early-return paths inside the pre-tx wait
+	// loop leave batchStart at its zero value. The DEBUG log is already
+	// elided on n==0, but the ctx.Done path there returns n==0 with a
+	// non-nil err, which would otherwise feed ObserveBatch a bogus
+	// (~now-since-zero-Time) latency. Guarding both the log and the
+	// observe call on !batchStart.IsZero() keeps a pre-tx-wait
+	// cancellation from poisoning the controller's window.
+	var batchStart time.Time
 	defer func() {
+		if batchStart.IsZero() {
+			return
+		}
 		latency := time.Since(batchStart)
 		if n > 0 {
 			slog.DebugContext(
@@ -220,6 +253,11 @@ func (a *ChangeApplier) applyOneBatch(ctx context.Context, streamID string, chan
 	// redact call above). Empty shardColumn is a no-op fast path.
 	a.stampShardChange(first)
 
+	// Item 18 Fix A: start the apply-latency clock here — after the
+	// pre-tx wait loop has returned the first change — so the measured
+	// latency reflects apply work (begin-tx → dispatch → position write
+	// → commit) and not the blocked wait for the first change.
+	batchStart = time.Now()
 	tx, err := a.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, ir.Position{}, false, fmt.Errorf("postgres: applier: begin tx: %w", err)
