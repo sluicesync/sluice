@@ -284,6 +284,13 @@ func drainPSVStreamChanges(
 			if !ok {
 				return got
 			}
+			// Skip metadata events so callers count only row changes: a
+			// SchemaSnapshot precedes the first row event (ADR-0049) and
+			// tx markers bracket the changes.
+			switch c.(type) {
+			case ir.SchemaSnapshot, ir.TxBegin, ir.TxCommit:
+				continue
+			}
 			got = append(got, c)
 		case <-deadline.C:
 			t.Logf("timed out after %v with %d/%d changes", timeout, len(got), want)
