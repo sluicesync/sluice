@@ -277,6 +277,21 @@ type Migrator struct {
 	// Empty Name is the no-op default — every existing single-source
 	// migrate path pays zero cost when Shape A isn't engaged.
 	InjectShardColumn ShardColumnSpec
+
+	// AllowDegradedFKs opts the operator into the pgcopydb-PR-#27-style
+	// "tolerate dirty FK source" behaviour: when [SchemaWriter.CreateConstraints]
+	// hits SQLSTATE 23503 on a validating `ADD CONSTRAINT`, retry as
+	// `NOT VALID` and surface the degraded constraint in the pipeline's
+	// operator-facing report. Default off — loud-failure-on-dirty-source
+	// stays baseline; the operator opts in explicitly when migrating
+	// from a known-dirty source.
+	//
+	// PG-target only by design. Other engines (today: MySQL) do not
+	// implement the [ir.DegradedFKAllower] optional interface — the
+	// orchestrator type-asserts at writer-open time and refuses loudly
+	// if the flag is set against an unsupported target. See
+	// `docs/dev/notes/pgcopydb-planetscale-fork-review.md`.
+	AllowDegradedFKs bool
 }
 
 // ShardColumnSpec carries the ADR-0048 Shape A discriminator
@@ -580,6 +595,16 @@ func (m *Migrator) Run(ctx context.Context) error {
 		return wrapWithHint(PhaseConnect, markFailed(ctx, rc, state, ir.MigrationPhasePending,
 			fmt.Errorf("pipeline: enable PG extensions on target: %w", err)))
 	}
+	if m.AllowDegradedFKs {
+		a, ok := sw.(ir.DegradedFKAllower)
+		if !ok {
+			return wrapWithHint(PhaseConnect, markFailed(ctx, rc, state, ir.MigrationPhasePending,
+				errors.New("pipeline: --allow-degraded-fks is set but the target engine doesn't support degraded FKs "+
+					"(PG-target only by design; MySQL's nearest analogue, FOREIGN_KEY_CHECKS=0, is a different contract — "+
+					"clean the source FK violations before migrating to a MySQL target)")))
+		}
+		a.EnableDegradedFKs()
+	}
 	defer closeIf(sw)
 
 	rw, err := m.Target.OpenRowWriter(ctx, m.TargetDSN)
@@ -728,6 +753,39 @@ func (m *Migrator) resolveMigrationID() string {
 // bulkCopyOpts groups the optional behaviours that vary across
 // runBulkCopy call sites without forcing a parameter explosion on
 // the common path. Zero value is the historical behaviour.
+// reportDegradedFKs surfaces any FK constraints the most-recent
+// [ir.SchemaWriter.CreateConstraints] attached as NOT VALID (the
+// operator opted into `--allow-degraded-fks` and the source had
+// orphan rows). Each gets a WARN log line with the actionable Hint;
+// a single summary line follows so the count is hard to miss in CLI
+// output. No-op when the writer doesn't implement
+// [ir.DegradedFKReporter] or when nothing was degraded.
+func reportDegradedFKs(ctx context.Context, sw ir.SchemaWriter) {
+	r, ok := sw.(ir.DegradedFKReporter)
+	if !ok {
+		return
+	}
+	fks := r.DegradedFKs()
+	if len(fks) == 0 {
+		return
+	}
+	for _, fk := range fks {
+		slog.WarnContext(
+			ctx, "constraint attached degraded (NOT VALID)",
+			slog.String("schema", fk.Schema),
+			slog.String("table", fk.Table),
+			slog.String("constraint", fk.ConstraintName),
+			slog.String("referenced_table", fk.ReferencedTable),
+			slog.String("reason", fk.Reason),
+			slog.String("hint", fk.Hint),
+		)
+	}
+	slog.WarnContext(ctx, "constraints phase: degraded FKs",
+		slog.Int("count", len(fks)),
+		slog.String("action_required",
+			"run `ALTER TABLE ... VALIDATE CONSTRAINT <name>` for each after fixing the orphan rows on the child tables"))
+}
+
 type bulkCopyOpts struct {
 	// SkipSchemaApply, when true, suppresses every DDL phase
 	// (CreateTablesWithoutConstraints, SyncIdentitySequences,
@@ -790,6 +848,7 @@ func runBulkCopyWithOpts(
 	if err := sw.CreateConstraints(ctx, schema); err != nil {
 		return wrapWithHint(PhaseConstraints, fmt.Errorf("pipeline: create constraints: %w", err))
 	}
+	reportDegradedFKs(ctx, sw)
 	if err := runViewsPhase(ctx, schema, sw); err != nil {
 		return wrapWithHint(PhaseViews, err)
 	}
@@ -849,6 +908,7 @@ func runBulkCopyForAddTable(
 	if err := sw.CreateConstraints(ctx, schema); err != nil {
 		return wrapWithHint(PhaseConstraints, fmt.Errorf("pipeline: create constraints: %w", err))
 	}
+	reportDegradedFKs(ctx, sw)
 	if err := runViewsPhase(ctx, schema, sw); err != nil {
 		return wrapWithHint(PhaseViews, err)
 	}
@@ -1000,6 +1060,7 @@ func runBulkCopyPhases(
 		err = fmt.Errorf("pipeline: create constraints: %w", err)
 		return wrapWithHint(PhaseConstraints, markFailed(ctx, rc, *state, ir.MigrationPhaseConstraints, err))
 	}
+	reportDegradedFKs(ctx, sw)
 	slog.InfoContext(ctx, "migration: phase complete", slog.String("phase", string(ir.MigrationPhaseConstraints)))
 
 	// Phase 6: views. Final phase so all referenced base tables
