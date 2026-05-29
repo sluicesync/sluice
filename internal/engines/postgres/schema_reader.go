@@ -267,7 +267,51 @@ func (r *SchemaReader) ReadSchema(ctx context.Context) (*ir.Schema, error) {
 // Materialized-view CDC refresh is a Phase 2 future enhancement; the
 // Phase 1 writer emits `WITH DATA` so the target's matview is
 // populated immediately from the just-loaded target tables.
+// extensionMemberRelations returns the set of relation names in the
+// bound schema that are EXTENSION MEMBERS — relations recorded in
+// pg_depend with deptype 'e' against a pg_extension. Such relations
+// belong to the extension, not the user: e.g. the pg_stat_statements
+// views that Heroku / RDS / Cloud SQL / Supabase pre-install in `public`,
+// or PostGIS's spatial_ref_sys / geometry_columns. Their definitions
+// depend on the extension's functions, so migrating them as user
+// tables/views fails on a target that lacks the extension (Bug 96:
+// `function pg_stat_statements does not exist` at create-views); and they
+// are recreated by `CREATE EXTENSION` on the target anyway. We exclude
+// them from the migration set by default, mirroring pg_dump's
+// extension-member exclusion. The operator opts a target into an
+// extension explicitly via --enable-pg-extension; sluice never silently
+// copies extension-owned objects.
+func (r *SchemaReader) extensionMemberRelations(ctx context.Context) (map[string]struct{}, error) {
+	const q = `
+		SELECT c.relname
+		FROM   pg_depend     d
+		JOIN   pg_class      c ON c.oid = d.objid
+		JOIN   pg_namespace  n ON n.oid = c.relnamespace
+		WHERE  d.classid    = 'pg_class'::regclass
+		  AND  d.refclassid = 'pg_extension'::regclass
+		  AND  d.deptype    = 'e'
+		  AND  n.nspname    = $1`
+	rows, err := r.db.QueryContext(ctx, q, r.schema)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	set := map[string]struct{}{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		set[name] = struct{}{}
+	}
+	return set, rows.Err()
+}
+
 func (r *SchemaReader) readViews(ctx context.Context) ([]*ir.View, error) {
+	extMembers, err := r.extensionMemberRelations(ctx)
+	if err != nil {
+		return nil, err
+	}
 	const q = `
 		SELECT viewname AS name, definition, false AS materialized
 		FROM   pg_views
@@ -292,6 +336,10 @@ func (r *SchemaReader) readViews(ctx context.Context) ([]*ir.View, error) {
 		)
 		if err := rows.Scan(&name, &definition, &materialized); err != nil {
 			return nil, err
+		}
+		// Bug 96: skip extension-owned views (e.g. pg_stat_statements).
+		if _, isExt := extMembers[name]; isExt {
+			continue
 		}
 		out = append(out, &ir.View{
 			Schema:            r.schema,
@@ -328,6 +376,10 @@ func (r *SchemaReader) readViews(ctx context.Context) ([]*ir.View, error) {
 //     to avoid a postgres→pgtrigger import cycle (pgtrigger imports
 //     postgres).
 func (r *SchemaReader) readTables(ctx context.Context) (map[string]*ir.Table, error) {
+	extMembers, err := r.extensionMemberRelations(ctx)
+	if err != nil {
+		return nil, err
+	}
 	const q = `
 		SELECT table_name
 		FROM   information_schema.tables
@@ -350,6 +402,12 @@ func (r *SchemaReader) readTables(ctx context.Context) (map[string]*ir.Table, er
 		var name string
 		if err := rows.Scan(&name); err != nil {
 			return nil, err
+		}
+		// Bug 96: skip extension-owned tables (e.g. PostGIS spatial_ref_sys);
+		// they belong to the extension, not the user, and are recreated by
+		// CREATE EXTENSION on the target.
+		if _, isExt := extMembers[name]; isExt {
+			continue
 		}
 		// catalog Bug 76: skip tables the operator's filter excludes so
 		// their columns are never type-validated by populateColumns
