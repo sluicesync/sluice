@@ -321,9 +321,17 @@ func TestChangeApplier_ApplyBatch_CtxCancelRollsBack(t *testing.T) {
 		done <- batched.ApplyBatch(applyCtx, testStreamID, ch, 100)
 	}()
 
-	// Brief sleep so the goroutine has a chance to dispatch a few
-	// of the buffered changes before we cancel.
-	time.Sleep(200 * time.Millisecond)
+	// Cancel while the batch is still in-flight (un-committed). With the
+	// item-18 idle-flush grace (defaultIdleFlushPeriod, now 100ms) a
+	// partial batch auto-commits ~100ms after the last dispatch, so we
+	// must cancel well inside that window — the pre-item-18 200ms sleep
+	// now loses the race to the flush and the batch commits. A short
+	// fraction of the grace gives the goroutine time to open the tx and
+	// dispatch the buffered changes while leaving a wide margin before
+	// the flush; cancelling at any point before the flush (even during
+	// the pre-tx wait or BeginTx) yields 0 rows + no persisted position,
+	// which is what we assert.
+	time.Sleep(defaultIdleFlushPeriod / 5)
 	cancelApply()
 
 	select {
