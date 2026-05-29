@@ -264,6 +264,52 @@ func TestBuildWhereClause_RoutesThroughPrepareValue(t *testing.T) {
 	}
 }
 
+// TestBuildWhereClause_JSONCastUnderReplicaIdentityFull pins the apply
+// WHERE clause's type-aware predicate for PG's `json` type. Under
+// REPLICA IDENTITY FULL the OldTuple carries every column, so the
+// applier emits a predicate for each. PG's `json` (text-backed) has
+// NO `=` operator — a bare `col = $N` against it errors with
+// `42883 could not identify an equality operator for type json` and
+// every UPDATE/DELETE apply against a target with a `json` column
+// silently breaks. The fix casts both sides to text for json columns
+// only; `jsonb` is unaffected (it has a native `=` operator with
+// semantic equality). Mirrors pgcopydb PR #28.
+func TestBuildWhereClause_JSONCastUnderReplicaIdentityFull(t *testing.T) {
+	before := ir.Row{
+		"id":       int64(7),
+		"doc_text": `{"a":1}`, // PG json (text-backed) — needs ::text cast
+		"doc_bin":  `{"b":2}`, // PG jsonb — uses native `=`
+		"label":    "hello",   // plain text — uses native `=`
+	}
+	colTypes := map[string]ir.Type{
+		"id":       ir.Integer{Width: 64},
+		"doc_text": ir.JSON{Binary: false},
+		"doc_bin":  ir.JSON{Binary: true},
+		"label":    ir.Text{Size: ir.TextLong},
+	}
+
+	gotSQL, _, err := buildWhereClause(before, 1, colTypes, nil)
+	if err != nil {
+		t.Fatalf("buildWhereClause: %v", err)
+	}
+	// The json column MUST have the ::text cast on both sides.
+	if !strings.Contains(gotSQL, `"doc_text"::text = $`) {
+		t.Errorf("json column predicate missing ::text cast on LHS; sql=%q", gotSQL)
+	}
+	if !strings.Contains(gotSQL, `::text`) || !strings.Contains(gotSQL, `::text = $`) {
+		t.Errorf("json column predicate missing ::text cast; sql=%q", gotSQL)
+	}
+	// The `jsonb` column MUST NOT carry the ::text cast — it has a
+	// native `=` operator and casting would lose semantic equality.
+	if strings.Contains(gotSQL, `"doc_bin"::text`) {
+		t.Errorf("jsonb column must not get the ::text cast; sql=%q", gotSQL)
+	}
+	// Non-json columns must still use the plain `col = $N` form.
+	if !strings.Contains(gotSQL, `"id" = $`) || !strings.Contains(gotSQL, `"label" = $`) {
+		t.Errorf("non-json column predicates regressed; sql=%q", gotSQL)
+	}
+}
+
 // TestPrepareApplierValue_FallsBackOnMissingType: defensive —
 // matches the MySQL applier's behavior. Cache cold or column
 // unknown → raw value passes through.
