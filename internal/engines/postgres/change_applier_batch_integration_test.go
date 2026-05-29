@@ -321,9 +321,17 @@ func TestChangeApplier_ApplyBatch_CtxCancelRollsBack(t *testing.T) {
 		done <- batched.ApplyBatch(applyCtx, testStreamID, ch, 100)
 	}()
 
-	// Brief sleep so the goroutine has a chance to dispatch a few
-	// of the buffered changes before we cancel.
-	time.Sleep(200 * time.Millisecond)
+	// Cancel while the batch is still in-flight (un-committed). With the
+	// item-18 idle-flush grace (defaultIdleFlushPeriod, now 100ms) a
+	// partial batch auto-commits ~100ms after the last dispatch, so we
+	// must cancel well inside that window — the pre-item-18 200ms sleep
+	// now loses the race to the flush and the batch commits. A short
+	// fraction of the grace gives the goroutine time to open the tx and
+	// dispatch the buffered changes while leaving a wide margin before
+	// the flush; cancelling at any point before the flush (even during
+	// the pre-tx wait or BeginTx) yields 0 rows + no persisted position,
+	// which is what we assert.
+	time.Sleep(defaultIdleFlushPeriod / 5)
 	cancelApply()
 
 	select {
@@ -359,11 +367,15 @@ func TestChangeApplier_ApplyBatch_CtxCancelRollsBack(t *testing.T) {
 // warm-resume from a quiet stream, the slot would replay from a
 // stale boundary.
 //
-// Post-fix: an idle timer (5s default) commits the partial batch.
-// This test feeds 3 changes through an open channel (kept open!),
-// waits one idle window plus headroom, and asserts both the rows
-// landed AND the persisted position advanced — both load-bearing
-// signals that the partial batch committed.
+// Post-fix (roadmap item 18 Fix B): the idle grace is now 100ms (was
+// 5s), so a drained/sparse stream's partial batch flushes promptly.
+// This test feeds 3 changes through an open channel (kept open!), then
+// polls for the commit. It asserts the rows landed AND the persisted
+// position advanced — both load-bearing signals that the partial batch
+// committed — AND that the commit landed well inside the old 5s grace
+// (the load-bearing item-18 latency assertion). The poll deadline of
+// 2s is comfortably above 100ms-plus-CI-jitter while still failing
+// loudly if the grace regressed back to seconds.
 func TestChangeApplier_ApplyBatch_IdleFlushCommitsPartial(t *testing.T) {
 	dsn, cleanup := startPostgresForApplier(t)
 	defer cleanup()
@@ -415,16 +427,51 @@ func TestChangeApplier_ApplyBatch_IdleFlushCommitsPartial(t *testing.T) {
 	applyCtx, cancelApply := context.WithCancel(parentCtx)
 	defer cancelApply()
 
+	start := time.Now()
 	done := make(chan error, 1)
 	go func() {
 		done <- batched.ApplyBatch(applyCtx, testStreamID, ch, 100)
 	}()
 
-	// Wait for one idle-flush window plus headroom. The applier's
-	// `applyOneBatch` will dispatch all 3 changes (sub-millisecond),
-	// then sit on the select with the idle timer running. After 5s
-	// the timer fires and commitBatch runs.
-	time.Sleep(7 * time.Second)
+	// The applier's applyOneBatch dispatches all 3 changes (sub-
+	// millisecond), then sits on the select with the idle timer
+	// running. With the item-18 Fix B grace (100ms) the timer fires
+	// promptly and commitBatch runs. Poll for the persisted position
+	// rather than sleeping a fixed window so the test asserts the
+	// *latency* of the flush, not just that it eventually happens.
+	//
+	// Deadline 2s: comfortably above 100ms + CI scheduling/commit
+	// jitter, but far below the pre-fix 5s grace — so a regression that
+	// restored the 5s value fails this loop loudly.
+	const flushDeadline = 2 * time.Second
+	var pos ir.Position
+	var found bool
+	deadline := time.Now().Add(flushDeadline)
+	for time.Now().Before(deadline) {
+		pos, found, err = applier.ReadPosition(parentCtx, testStreamID)
+		if err != nil {
+			cancelApply()
+			<-done
+			t.Fatalf("ReadPosition: %v", err)
+		}
+		if found {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	flushElapsed := time.Since(start)
+
+	if !found {
+		cancelApply()
+		<-done
+		t.Fatalf("idle-flush did not persist the partial batch within %v (Fix B grace is %v; a regression to the 5s grace would manifest here)",
+			flushDeadline, defaultIdleFlushPeriod)
+	}
+	if flushElapsed >= 5*time.Second {
+		cancelApply()
+		<-done
+		t.Errorf("idle flush took %v; want well under the pre-fix 5s grace (item 18 Fix B = %v)", flushElapsed, defaultIdleFlushPeriod)
+	}
 
 	// Rows landed (the in-flight tx committed).
 	if got := countAllRows(t, dsn, "users"); got != 3 {
@@ -434,17 +481,6 @@ func TestChangeApplier_ApplyBatch_IdleFlushCommitsPartial(t *testing.T) {
 	}
 
 	// Position advanced to the last applied change's token.
-	pos, found, err := applier.ReadPosition(parentCtx, testStreamID)
-	if err != nil {
-		cancelApply()
-		<-done
-		t.Fatalf("ReadPosition: %v", err)
-	}
-	if !found {
-		cancelApply()
-		<-done
-		t.Fatal("ReadPosition: no row found; idle-flush did not persist the partial batch")
-	}
 	if pos.Token != lastToken {
 		cancelApply()
 		<-done
