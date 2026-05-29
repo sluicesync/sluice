@@ -475,6 +475,12 @@ DECLARE
     v_before   JSONB;
     v_after    JSONB;
     v_op       CHAR(1);
+    -- v_new_json / v_old_json cache to_jsonb(NEW) / to_jsonb(OLD) so the
+    -- changed/minimal UPDATE branches compute each ONCE per row instead of
+    -- 2x and 1+Nx respectively (N = column count). Unused (NULL) in the
+    -- INSERT/DELETE branches and in the full mode. See ADR-0068 follow-ups.
+    v_new_json JSONB;
+    v_old_json JSONB;
 BEGIN
     -- Discover the source table's PK column list at fire time.
     SELECT array_agg(att.attname::text ORDER BY array_position(con.conkey, att.attnum))
@@ -546,18 +552,20 @@ func captureUpdateDeleteBlock(payload CapturePayload) string {
 	// type-exact on jsonb).
 	const changedAfter = `        v_after  := (
             SELECT jsonb_object_agg(n.key, n.value)
-            FROM jsonb_each(to_jsonb(NEW)) n
+            FROM jsonb_each(v_new_json) n
             WHERE n.key = ANY(v_pk_cols)
-               OR (to_jsonb(OLD) -> n.key) IS DISTINCT FROM n.value
+               OR (v_old_json -> n.key) IS DISTINCT FROM n.value
         );`
 
 	switch payload {
 	case CapturePayloadChanged:
 		return `    ELSIF TG_OP = 'UPDATE' THEN
-        v_op     := 'U';
-        v_before := to_jsonb(OLD);  -- full before-image (divergence WHERE)
+        v_op       := 'U';
+        v_new_json := to_jsonb(NEW);
+        v_old_json := to_jsonb(OLD);
+        v_before   := v_old_json;  -- full before-image (divergence WHERE)
 ` + changedAfter + `
-        v_pk     := (SELECT jsonb_object_agg(key, value) FROM jsonb_each(to_jsonb(NEW)) WHERE key = ANY(v_pk_cols));
+        v_pk     := (SELECT jsonb_object_agg(key, value) FROM jsonb_each(v_new_json) WHERE key = ANY(v_pk_cols));
     ELSIF TG_OP = 'DELETE' THEN
         v_op     := 'D';
         v_before := to_jsonb(OLD);
@@ -566,13 +574,15 @@ func captureUpdateDeleteBlock(payload CapturePayload) string {
 `
 	case CapturePayloadMinimal:
 		return `    ELSIF TG_OP = 'UPDATE' THEN
-        v_op     := 'U';
-        v_pk     := (SELECT jsonb_object_agg(key, value) FROM jsonb_each(to_jsonb(NEW)) WHERE key = ANY(v_pk_cols));
+        v_op       := 'U';
+        v_new_json := to_jsonb(NEW);
+        v_old_json := to_jsonb(OLD);
+        v_pk       := (SELECT jsonb_object_agg(key, value) FROM jsonb_each(v_new_json) WHERE key = ANY(v_pk_cols));
         -- before drives the apply WHERE, which must locate the row by its
         -- identity BEFORE the change. Use the OLD PK (not v_pk, which is the
         -- NEW PK) so a PK-changing UPDATE still finds the existing target
         -- row; pk_jsonb stays the NEW PK (metadata, consistent w/ full/changed).
-        v_before := (SELECT jsonb_object_agg(key, value) FROM jsonb_each(to_jsonb(OLD)) WHERE key = ANY(v_pk_cols));  -- OLD PK (PK-scoped WHERE)
+        v_before   := (SELECT jsonb_object_agg(key, value) FROM jsonb_each(v_old_json) WHERE key = ANY(v_pk_cols));  -- OLD PK (PK-scoped WHERE)
 ` + changedAfter + `
     ELSIF TG_OP = 'DELETE' THEN
         v_op     := 'D';
