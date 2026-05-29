@@ -284,48 +284,37 @@ jobs:
           go-version-file: "go.mod"
       - run: go mod download
 
-      # Log in to ghcr.io so the pre-baked images (task #68) can be
-      # pulled. GITHUB_TOKEN here has `packages: read` granted by the
-      # job-level permissions block; the `orware/sluice-*` packages
-      # are owned by the same org as the workflow so no PAT is needed.
-      - name: Log in to ghcr.io (pre-baked images)
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-
-      # Pre-pull the container images the tests need. testcontainers-go
-      # would pull them implicitly the first time it boots a container,
-      # but doing it up-front gives a cleaner failure mode if the
-      # registry is unreachable: we see "pull failed" before touching
-      # any test code, instead of mid-test as a timeout.
+      # Log in to ghcr.io and pre-pull the pre-baked images the tests
+      # need (task #68). GITHUB_TOKEN has `packages: read` from the
+      # job-level permissions block; the `orware/sluice-*` packages are
+      # owned by the same org as the workflow so no PAT is needed.
       #
-      # Task #68: MySQL + Postgres run from the pre-baked images
-      # (ghcr.io/orware/sluice-{mysql,postgres}:*-prebaked) built by
-      # .github/workflows/build-prebaked-images.yml. The pre-baked
-      # image has the heavy first-boot init step already done so
-      # cold-start drops from ~30-60s (under self-hosted runner
-      # disk-I/O contention, up to 2-3 min) to ~5s. See
-      # docs/dev/ci-images.md.
+      # Pre-pulling up-front (rather than letting testcontainers-go pull
+      # implicitly on first boot) gives a cleaner failure mode: a
+      # registry problem surfaces here, before any test code, instead of
+      # mid-test as a timeout. The pre-baked images (built by
+      # .github/workflows/build-prebaked-images.yml) have the heavy
+      # first-boot init already done, dropping cold-start from ~30-60s
+      # (up to 2-3 min under self-hosted disk-I/O contention) to ~5s; the
+      # pgvector image (ADR-0032 PG→PG extension passthrough,
+      # migrate_pgvector_integration_test.go) is a postgres:16 superset.
+      # See docs/dev/ci-images.md. (postgis is pulled in its own job.)
       #
-      # pgvector/pgvector:0.7.4-pg16 (added v0.26.0) backs the
-      # internal/pipeline/migrate_pgvector_integration_test.go suite
-      # (ADR-0032 PG → PG extension passthrough). The image is a
-      # superset of postgres:16 with the pgvector extension files
-      # bundled.
-      #
-      # Task #70: now pre-baked to ghcr.io/orware/sluice-pgvector:
-      # 0.7.4-pg16-prebaked. The self-hosted runner pool hit 3
-      # consecutive docker.io TLS-handshake-timeouts pulling the
-      # upstream tag on PR #72; mirroring to GHCR eliminates docker.io
-      # as a single point of failure for ALL future CI runs. Same
-      # bake shape as postgres:16 (initdb + test superuser + seed
-      # databases); CREATE EXTENSION vector remains test-time (the
-      # upstream image's contract).
-      #
-      # postgis pre-baked image is pulled in the dedicated
-      # `integration-postgis` job below — not here.
-      - run: |
-          docker pull ghcr.io/orware/sluice-mysql:8.0-prebaked
-          docker pull ghcr.io/orware/sluice-postgres:16-prebaked
-          docker pull ghcr.io/orware/sluice-pgvector:0.7.4-pg16-prebaked
+      # The login + pulls run through scripts/ci-ghcr-pull.sh, which
+      # retries with backoff: the self-hosted runner pool intermittently
+      # hits `docker login ghcr.io: context deadline exceeded` / pull
+      # i/o timeouts, and a transient blip would otherwise red-fail the
+      # whole shard (costing a manual `gh run rerun --failed`). Genuine
+      # registry outages still fail loudly after the retry budget.
+      - name: Log in to ghcr.io + pre-pull pre-baked images (bounded retry)
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          bash scripts/ci-ghcr-pull.sh \
+            ghcr.io/orware/sluice-mysql:8.0-prebaked \
+            ghcr.io/orware/sluice-postgres:16-prebaked \
+            ghcr.io/orware/sluice-pgvector:0.7.4-pg16-prebaked
 
       # Run every package's integration tests. -count=1 disables the
       # test cache so we always exercise real containers (cached results
@@ -415,14 +404,19 @@ jobs:
         with:
           go-version-file: "go.mod"
       - run: go mod download
-      - name: Log in to ghcr.io (pre-baked images)
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-      # Task #68: pre-baked MySQL/Postgres/PostGIS images. Same cold-
-      # start rationale as the main integration job above.
-      - run: |
-          docker pull ghcr.io/orware/sluice-mysql:8.0-prebaked
-          docker pull ghcr.io/orware/sluice-postgres:16-prebaked
-          docker pull ghcr.io/orware/sluice-postgis:16-3.4-prebaked
+      # Task #68: pre-baked MySQL/Postgres/PostGIS images. Login + pulls
+      # go through scripts/ci-ghcr-pull.sh (bounded retry) — same
+      # cold-start + transient-GHCR-flake rationale as the main
+      # integration job above.
+      - name: Log in to ghcr.io + pre-pull pre-baked images (bounded retry)
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          bash scripts/ci-ghcr-pull.sh \
+            ghcr.io/orware/sluice-mysql:8.0-prebaked \
+            ghcr.io/orware/sluice-postgres:16-prebaked \
+            ghcr.io/orware/sluice-postgis:16-3.4-prebaked
       - run: go test -tags="integration postgis" -race -count=1 -timeout=15m -run TestMigrate_PostGIS_ ./internal/pipeline/...
 
   # ----- Lint -----
