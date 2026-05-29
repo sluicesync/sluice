@@ -11,8 +11,7 @@ import (
 	"sort"
 	"strings"
 
-	// stdlib registers pgx as a database/sql driver under "pgx".
-	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/orware/sluice/internal/engines/postgres"
 )
 
 // Standard names for the engine's source-side artifacts. ADR-0066 §2,
@@ -136,7 +135,7 @@ func Setup(ctx context.Context, dsn string, opts SetupOptions) (*Plan, error) {
 		opts.Schema = cfg.schema
 	}
 
-	db, err := sql.Open("pgx", cfg.dsn)
+	db, err := postgres.OpenPgxDB(cfg.dsn)
 	if err != nil {
 		return nil, fmt.Errorf("pgtrigger: setup: open: %w", err)
 	}
@@ -236,7 +235,7 @@ func Teardown(ctx context.Context, dsn string, opts TeardownOptions) (*Plan, err
 		opts.Schema = cfg.schema
 	}
 
-	db, err := sql.Open("pgx", cfg.dsn)
+	db, err := postgres.OpenPgxDB(cfg.dsn)
 	if err != nil {
 		return nil, fmt.Errorf("pgtrigger: teardown: open: %w", err)
 	}

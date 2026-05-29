@@ -8,11 +8,28 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net"
 	"strings"
 	"time"
 
 	"github.com/go-sql-driver/mysql"
+
+	"github.com/orware/sluice/internal/netkeepalive"
 )
+
+// keepaliveNet is a custom driver "network" name registered with the
+// MySQL driver that routes plain-TCP connections through sluice's
+// shared TCP keep-alive dialer (see [netkeepalive]). parseDSN swaps a
+// `tcp` DSN onto this network so every MySQL query connection inherits
+// the keep-alive policy; unix sockets and operator-specified networks
+// are left untouched (TCP keep-alive is meaningless off TCP).
+const keepaliveNet = "tcp+sluicekeepalive"
+
+func init() {
+	mysql.RegisterDialContext(keepaliveNet, func(ctx context.Context, addr string) (net.Conn, error) {
+		return netkeepalive.Dialer().DialContext(ctx, "tcp", addr)
+	})
+}
 
 // dsnShapeHint inspects a DSN that failed to parse and returns a
 // short, leading-newline-terminated hint when sluice can recognise
@@ -103,6 +120,14 @@ func parseDSN(dsn string) (*mysql.Config, error) {
 	}
 	if cfg.DBName == "" {
 		return nil, errors.New("mysql: DSN must include a database name")
+	}
+
+	// Route plain-TCP query connections through the keep-alive dialer.
+	// Long-lived pools (the change applier, schema reader) would
+	// otherwise sit idle behind cloud NAT and stall on a dropped
+	// mapping. Non-TCP networks (unix sockets) are left as-is.
+	if cfg.Net == "tcp" {
+		cfg.Net = keepaliveNet
 	}
 
 	cfg.ParseTime = true

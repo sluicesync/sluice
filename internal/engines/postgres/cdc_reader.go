@@ -20,6 +20,7 @@ import (
 	"github.com/jackc/pgx/v5/pgproto3"
 
 	"github.com/orware/sluice/internal/ir"
+	"github.com/orware/sluice/internal/netkeepalive"
 )
 
 // cdcChannelBuffer is the number of [ir.Change] events buffered before
@@ -1802,7 +1803,15 @@ func openReplicationConn(ctx context.Context, dsn string) (*pgconn.PgConn, error
 	if err != nil {
 		return nil, fmt.Errorf("postgres: prepare replication DSN: %w", err)
 	}
-	conn, err := pgconn.Connect(ctx, withRepl)
+	// Parse then connect-by-config so the streaming connection — the
+	// longest-lived, most idle-prone connection sluice holds — gets the
+	// shared TCP keep-alive policy on its dial path (see [netkeepalive]).
+	connConfig, err := pgconn.ParseConfig(withRepl)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: parse replication DSN: %w", err)
+	}
+	connConfig.DialFunc = netkeepalive.Dialer().DialContext
+	conn, err := pgconn.ConnectConfig(ctx, connConfig)
 	if err != nil {
 		return nil, err
 	}

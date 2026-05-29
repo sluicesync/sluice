@@ -5,7 +5,6 @@ package pgtrigger
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 
 	"github.com/orware/sluice/internal/engines/postgres"
@@ -55,7 +54,7 @@ func (e Engine) OpenSnapshotStream(ctx context.Context, dsn string) (*ir.Snapsho
 	// Dedicated pool for the snapshot read. The CDC poller opens its
 	// OWN pool (via openCDCReader below) so the snapshot pool can be
 	// released by ReleaseRows independently of the CDC lifetime.
-	db, err := sql.Open("pgx", cfg.dsn)
+	db, err := postgres.OpenPgxDB(cfg.dsn)
 	if err != nil {
 		return nil, fmt.Errorf("pgtrigger: snapshot: open: %w", err)
 	}

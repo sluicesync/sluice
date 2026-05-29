@@ -46,6 +46,33 @@ func TestDSNShapeHint_BranchPathDetected(t *testing.T) {
 	}
 }
 
+// TestParseDSN_TCPRoutesThroughKeepaliveNet pins #77: a plain-TCP DSN
+// is rerouted onto the custom keep-alive network so the connection
+// inherits sluice's TCP keep-alive policy. A regression here (back to
+// bare "tcp") would silently drop the cloud-NAT idle-timeout hardening.
+func TestParseDSN_TCPRoutesThroughKeepaliveNet(t *testing.T) {
+	cfg, err := parseDSN("user:pw@tcp(host:3306)/mydb")
+	if err != nil {
+		t.Fatalf("parseDSN: %v", err)
+	}
+	if cfg.Net != keepaliveNet {
+		t.Errorf("cfg.Net = %q, want %q (tcp should reroute through the keep-alive dialer)", cfg.Net, keepaliveNet)
+	}
+}
+
+// TestParseDSN_UnixSocketNotRerouted confirms the keep-alive rerouting
+// only touches TCP — unix sockets (where TCP keep-alive is meaningless)
+// are left on their original network.
+func TestParseDSN_UnixSocketNotRerouted(t *testing.T) {
+	cfg, err := parseDSN("root@unix(/tmp/mysql.sock)/foo")
+	if err != nil {
+		t.Fatalf("parseDSN: %v", err)
+	}
+	if cfg.Net != "unix" {
+		t.Errorf("cfg.Net = %q, want \"unix\" (unix sockets must not be rerouted)", cfg.Net)
+	}
+}
+
 // TestDSNShapeHint_PlainPathNoHint confirms a well-formed DSN with
 // just `db` in the path produces no hint (we don't want false
 // positives noising every DSN parse error).
