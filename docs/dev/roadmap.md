@@ -627,6 +627,28 @@ at runtime.
 
 ---
 
+### 18. postgres-trigger CDC runtime performance — NOTIFY-kick, lighter capture payload, drain throughput
+
+**Source.** The sluice-vs-Bucardo head-to-head benchmark (2026-05-29; `sluice-testing/session-reports/bucardo-vs-sluice-v0.89.0.md`). Both are trigger-based PG capture replicators; on identical local workloads (1M-row initial copy + 110k-change CDC stream) sluice's `postgres-trigger` engine won initial copy (~208k vs ~77k rows/s, 8-way parallel COPY), setup (single static binary vs Bucardo's plperl+DBI control DB + Perl daemon), clean teardown (0 residue vs Bucardo's leftover `bucardo` schema + source triggers), and the structural differentiator — cross-engine to MySQL/PlanetScale, which Bucardo fundamentally cannot do. Bucardo won the three *runtime CDC* axes below; these are the candidate items to close that gap. All enhancements — no correctness bug (both tools verified byte-identical).
+
+**Why.** For the slot-less managed-PG CDC use case (Heroku/RDS/Cloud SQL/Supabase, where `postgres-trigger` is the only viable path), Bucardo's runtime CDC is currently faster: ~6x lower single-change latency (~0.95s vs ~5.9s), ~5x higher bulk-drain throughput (~13k vs ~2.5k changes/s), and ~2x source-write overhead vs sluice's ~10.8x. Closing this makes `postgres-trigger` competitive on live-replication latency/throughput while keeping sluice's setup/portability/cross-engine wins.
+
+**What (three independent sub-items, in payoff order).**
+1. **NOTIFY-kick instead of fixed-interval poll.** `postgres-trigger` polls the capture log on an interval (~5s in the benchmark) → single-change latency ~5.9s. Bucardo uses a LISTEN/NOTIFY kick → ~0.95s. Add a source-side `NOTIFY` from the capture trigger (or a lightweight notifier) + a `LISTEN` in the poller that wakes the drain immediately, with the interval poll RETAINED as a fallback (managed PG that drops/coalesces NOTIFY, missed notifications). Biggest single latency win.
+2. **Lighter capture payload (optional mode).** The capture log stores the full before/after row image as JSONB (self-contained, replay-safe — the poller never re-reads the source). That costs ~10.8x source-write amplification vs Bucardo's ~2x (Bucardo stores only the changed PK + re-reads the live row at sync). A configurable "PK-only / changed-columns-only" capture mode that re-reads at apply would cut source overhead for write-heavy sources, trading away replay self-containment. Keep the full-image mode the default (the gap-free contract).
+3. **CDC drain throughput.** ~2.5k changes/s vs Bucardo ~13k on bulk drain — partly downstream of (1)+(2); also poller→decode→apply batching/tuning specific to the trigger engine (the slot-based pgoutput path is separately tuned). The benchmark ran `--apply-batch-size=auto`.
+
+**Gotchas / open questions.**
+- NOTIFY is best-effort + bounded (8KB payload, dropped with no listener, coalesced) — it must be a *kick* (wake the poller), never the data channel; the interval poll stays the source of truth so no change is ever missed. Verify on managed PG (Heroku/RDS allow LISTEN/NOTIFY).
+- The lighter-payload mode changes the replay contract — needs an ADR (interacts with the ADR-0066 capture-log design + the gapless-handoff anchor). Default must stay the self-contained full-image mode.
+- The ~10.8x figure is a 50k-UPDATE microbench; confirm on a realistic write mix before committing to (2).
+
+**Sizing.** (1) NOTIFY-kick is the cheap high-payoff piece (~150-300 LOC, no IR/format change, fallback poll preserved) — do first, standalone. (2) lighter payload is an ADR + capture-schema option (~400-700 LOC), demand-gated on a write-heavy-source operator. (3) is profiling + tuning, partly free once (1)/(2) land.
+
+**Sequencing.** Demand-shaped; (1) is the clear quick win if an operator flags `postgres-trigger` latency. Pairs with the postgres-trigger Phase 2 work. Not a correctness gate — sluice already wins setup/portability/cross-engine; this closes the runtime-CDC gap the Bucardo comparison surfaced.
+
+---
+
 ### Open bugs awaiting fix windows
 
 Tracked in detail in `sluice-testing/BUG-CATALOG.md`; recap here for roadmap visibility:
