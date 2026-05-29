@@ -4,6 +4,25 @@ All notable changes to sluice are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project follows [Semantic Versioning](https://semver.org/).
 
+## [0.87.0] - 2026-05-29
+
+### Added
+
+- **`feat(pipeline): Heroku-permission refuse-loudly preflight for slot-based Postgres CDC (task #61)`** — Slot-based `postgres` source CDC creates a logical replication slot at cold start, which requires the connecting role to be a superuser or carry the `REPLICATION` attribute. On managed Postgres tiers that forbid `REPLICATION` (Heroku Postgres Essential, Render Basic, Supabase free), `sluice sync start --source-driver=postgres` previously failed **mid-cold-start** with a raw `ERROR: permission denied to create replication slot` (SQLSTATE 42501) — opaque, fired after schema-read + filter work, and gave no hint that a slot-less path exists. A new source-side preflight (`SchemaReader.SourceReplicationCapability`, probing `pg_roles.rolsuper OR rolreplication` for `current_user`) now detects the missing capability **upfront** and refuses loudly with an operator-actionable message that names the role and points at `--source-driver=postgres-trigger` — sluice's slot-less trigger-capture engine built for exactly this tier. The refusal is gated on the source **engine name** being the slot-based `postgres` engine, so it never fires for `postgres-trigger` (whose delegated SchemaReader would otherwise satisfy the same probe interface), for MySQL sources, or for a pure bulk `migrate` (which needs only `SELECT` and genuinely works on Heroku). Pinned by unit tests (gate + message + the postgres-trigger/mysql exclusions) and an integration test against a real `NOSUPERUSER NOREPLICATION` role.
+
+### Changed
+
+- **`feat(net): TCP keep-alives on all long-lived database connections (task #77)`** — sluice's CDC streams (Postgres pgoutput, MySQL binlog) and the postgres-trigger poller hold a TCP connection open across quiet periods; cloud NAT gateways and L4 load balancers (Heroku, Render, GCP Cloud SQL, AWS NLB) silently evict idle connections, after which the next read/write stalls for minutes on the kernel's TCP-retransmit budget rather than failing fast. A new `internal/netkeepalive` package centralises one TCP keep-alive policy (enable + idle 30s + interval 10s + count 3, mirroring the three TCP settings PlanetScale's heroku-migrator PR #7 found necessary) and wires it into **all four** long-lived dial paths: the Postgres query pool + the pgoutput replication connection, the postgres-trigger poller/snapshot/setup pools (via a new exported `postgres.OpenPgxDB` funnel), the MySQL query pool (custom-registered keep-alive network), and the MySQL binlog syncer (`BinlogSyncerConfig.Dialer`). This is the transport-level complement to the existing application-level keepalives (pgoutput standby-status updates, binlog `HeartbeatPeriod`): it keeps the NAT mapping warm and bounds dead-peer detection to seconds. Values are fixed (not config surface). No behavior change for short-lived/pooled query connections beyond the keep-alive probes themselves.
+
+### Internal
+
+- **`ci: bounded-retry GHCR login + image pull (self-heal transient registry flakes)`** — the self-hosted runner pool intermittently hit `docker login ghcr.io: context deadline exceeded` / pull i/o timeouts on the pre-baked-image step, red-failing a whole integration shard. The login + pulls now run through `scripts/ci-ghcr-pull.sh`, which retries with linear backoff (5 attempts) and still fails loudly after the budget so a real outage isn't masked. CI-only; no effect on the shipped binary.
+
+### Compatibility
+
+- **Minor bump (v0.87.0)** — additive, drop-in from v0.86.1. No config / schema / IR changes.
+- Two operator-visible behavior changes, both improvements: (1) long-lived connections now carry TCP keep-alive probes (transparent stability hardening on cloud-NAT networks); (2) a slot-based `postgres` source whose role lacks `REPLICATION` is now refused **upfront** (pointing to `--source-driver=postgres-trigger`) instead of failing mid-cold-start — a clearer, earlier failure for a role that genuinely cannot create a slot. Pure bulk `migrate`, the `postgres-trigger` engine, and all MySQL directions are unaffected.
+
 ## [0.86.1] - 2026-05-28
 
 ### Fixed
