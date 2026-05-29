@@ -1686,7 +1686,7 @@ func buildWhereClause(row ir.Row, startIdx int, colTypes map[string]ir.Type, gen
 			parts = append(parts, quoteIdent(c)+" IS NULL")
 			continue
 		}
-		parts = append(parts, fmt.Sprintf("%s = $%d", quoteIdent(c), idx))
+		parts = append(parts, equalityPredicate(c, idx, colTypes))
 		prepared, perr := prepareApplierValue(v, colTypes, c)
 		if perr != nil {
 			return "", nil, fmt.Errorf("column %q: %w", c, perr)
@@ -1695,6 +1695,24 @@ func buildWhereClause(row ir.Row, startIdx int, colTypes map[string]ir.Type, gen
 		idx++
 	}
 	return strings.Join(parts, " AND "), args, nil
+}
+
+// equalityPredicate renders a single `col = $N` predicate for an apply
+// WHERE clause, type-aware for column types whose underlying PG type
+// lacks an `=` operator. PG's `json` (text-backed) has no equality
+// operator and a bare `col = $N` against it errors with 42883 "could
+// not identify an equality operator for type json" — so for `json`
+// (but NOT `jsonb`, which has native `=`) cast both sides to text for
+// a byte-exact comparison. This matters under REPLICA IDENTITY FULL
+// where the apply WHERE includes every column of the OldTuple — a
+// `json` column would otherwise break every UPDATE/DELETE apply on
+// the target. Mirrors pgcopydb PR #28; see
+// `docs/dev/notes/pgcopydb-planetscale-fork-review.md`.
+func equalityPredicate(col string, paramIdx int, colTypes map[string]ir.Type) string {
+	if j, ok := colTypes[col].(ir.JSON); ok && !j.Binary {
+		return fmt.Sprintf("%s::text = $%d::text", quoteIdent(col), paramIdx)
+	}
+	return fmt.Sprintf("%s = $%d", quoteIdent(col), paramIdx)
 }
 
 // nonGeneratedRowKeys returns the row's keys in sorted order with
