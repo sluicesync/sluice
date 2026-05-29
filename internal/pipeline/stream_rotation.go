@@ -371,14 +371,20 @@ func (b *BackupStream) performRotation(ctx context.Context, in rotateInputs) (ro
 		FullManifestPath: ManifestFileName,
 		StartPosition:    s,
 		EndPosition:      s,
-		// ADR-0067: the new segment's incrementals keep the (P_N, S]
-		// overlap (skipThrough = P_N in the rollover loop), so its
-		// earliest incremental coverage is P_N == the prior segment's
-		// EndPosition. This makes prior.EndPosition ==
-		// newSeg.incrementalCoverageStartOrStart() -> the lineage reads
-		// as gapless to the compaction §14d and restore boundary checks.
-		IncrementalCoverageStart: pN,
-		Codec:                    segCodec,
+		// ADR-0067: IncrementalCoverageStart is intentionally left UNSET
+		// at COMMIT. The new segment KEEPS the (P_N, S] overlap by
+		// replaying CDC from P_N (skipThrough = P_N in the rollover loop),
+		// so its first incremental normally starts at P_N. But skipThrough
+		// is in-process state: a crash between this COMMIT and the first
+		// overlap incremental resumes at S (the new full's anchor), NOT
+		// P_N. So P_N is only the INTENDED coverage start here, not a
+		// durable fact. The field is recorded from the ACTUAL first
+		// incremental when it commits (updateLineageForManifest) — P_N in
+		// the normal case, S after a post-COMMIT crash-recovery resume.
+		// That keeps the recorded coverage honest across crashes; an unset
+		// field resolves to StartPosition (S) until the first incremental
+		// proves an overlap.
+		Codec: segCodec,
 	})
 	cat.UpdatedAt = cappedAt
 	if err := writeLineageCatalog(ctx, b.Store, cat); err != nil {

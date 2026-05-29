@@ -480,6 +480,20 @@ func updateLineageForManifest(
 		// absent in the common case (and legacy readers ignore it).
 		seg.VerbatimExtensionColumns = verbatimExtensionColumnsIn(manifest.Schema)
 	case ir.BackupKindIncremental:
+		// ADR-0067: the FIRST incremental's StartPosition defines the
+		// segment's earliest incremental coverage. Record it ONLY when it
+		// differs from the full anchor (StartPosition) — i.e. a rotation
+		// that kept the (P_N, S] overlap, where the first incremental
+		// starts at P_N < S. Derived from the ACTUAL first incremental
+		// (not recorded at rotation COMMIT) so it stays honest across a
+		// crash-recovery that resumes at S rather than P_N: there the
+		// first incremental starts at S, equals StartPosition, and the
+		// field correctly stays unset (a normal, non-overlap segment).
+		// The root segment's first incremental also starts at the full
+		// anchor, so the field stays unset there too.
+		if len(seg.Incrementals) == 0 && manifest.StartPosition != seg.StartPosition {
+			seg.IncrementalCoverageStart = manifest.StartPosition
+		}
 		// Dedup on path (per-chunk checkpoint re-writes the same path).
 		found := false
 		for _, ip := range seg.Incrementals {
