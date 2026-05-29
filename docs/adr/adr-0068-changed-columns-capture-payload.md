@@ -7,13 +7,14 @@ owner decision, sluice ships **all three** payload modes (`full` / `changed` /
 `minimal`, §1) as selectable rather than picking the before-trim level up front
 — so the overhead/behavior tradeoffs can be validated **head-to-head** under
 different workloads before any default flip. Default stays `full`.
-Head-to-head measurement also completed 2026-05-29; see §Measurement results
-below. Headline: the trim modes do **not** speed up source-side writes on this
-workload (the plpgsql diff CPU exceeds the bytes saved on the change-log
-INSERT), but they DO deliver a 30 % / 70 % smaller change-log — the win is
-storage, not latency. Recommendation: **keep `full` as the default.** A
-trigger-CPU optimization (caching `to_jsonb(NEW)` / `to_jsonb(OLD)` in local
-plpgsql vars, §Follow-ups) is a likely lever that could flip that story.
+Head-to-head measurement completed 2026-05-29 and **re-run after PR #90's
+`to_jsonb` cache landed** — see §Measurement results + §Post-cache
+re-measurement. Headline (post-cache): `changed` is now within ~11 % of `full`
+on source-write (was ~62 % pre-cache) while still writing 30 % less to the
+change-log; `minimal` is ~21 % slower (was ~66 %) and writes 70 % less.
+Recommendation: **keep `full` as the default for now,** but a flip to
+`changed` is a credible call after the apply-side bench (the one missing piece)
+— which was not true pre-cache.
 This is roadmap item 18 sub-item (b). Driven by the sluice-vs-Bucardo
 head-to-head (`sluice-testing/session-reports/bucardo-vs-sluice-v0.89.0.md`):
 the `postgres-trigger` capture trigger imposes ~10.8x source-write
@@ -263,21 +264,46 @@ are operator-selectable for storage-sensitive deployments, but flipping the
 default would trade a known source-write cost for an unmeasured apply-side
 win — premature.
 
+### Post-cache re-measurement (2026-05-29, PR #90)
+
+Follow-up #1 below (cache `to_jsonb(NEW)` / `to_jsonb(OLD)` in local plpgsql
+vars) was implemented in PR #90 (`origin/main @ 6257f7b`) and the head-to-head
+re-run on the identical rig. Report:
+`sluice-testing/session-reports/capture-payload-head-to-head-postcache.md`
+(push `c6bd65c`).
+
+| mode | × baseline pre-cache | × baseline post-cache | Δ vs `full` source-write (post) | change-log size |
+|---|---|---|---|---|
+| `full` | 7.39 × | **7.15 ×** (484 ms baseline) | — | 44.4 MB |
+| `changed` | 11.94 × | **7.97 ×** | **+11 %** (was +62 %) | 31.1 MB (70 %) |
+| `minimal` | 12.27 × | **8.69 ×** | **+21 %** (was +66 %) | 13.3 MB (30 %) |
+
+`full` is unchanged within noise (it doesn't use the cache vars). `changed`
+went from "clearly slower" to "essentially at source-write parity, still
+30 % smaller change-log." `minimal` went from "clearly slower" to "modestly
+slower, 70 % smaller change-log." Change-log sizes are unchanged from pre-cache
+(the cache only affects compute, not bytes written).
+
+**Updated framing.** The pre-cache reason to keep `full` default ("trim modes
+are slower AND apply-side win is unmeasured") no longer holds for `changed` —
+the source-write penalty is within noise. The remaining input is the
+**apply-side benchmark** (Follow-up #2 below): with `changed`'s source-write
+penalty now negligible, even a modest apply-side win likely tips the balance.
+The recommendation stays "keep `full` default" until that data lands, but a
+default flip to `changed` is a credible call after the apply-side bench —
+which was not true pre-cache.
+
 ### Follow-ups (open, not in this ADR's scope)
 
 1. **Trigger-CPU optimization — cache `to_jsonb(OLD)` / `to_jsonb(NEW)` in
-   local plpgsql vars.** Today the trim-mode UPDATE branch re-evaluates
-   `to_jsonb(NEW)` twice (in `v_pk` and `v_after`'s `FROM`) and re-evaluates
-   `to_jsonb(OLD)` 1 + N times (once for `v_before` if full-before, N times
-   for the per-column `(to_jsonb(OLD) -> n.key)` lookup inside `v_after`'s
-   `WHERE`). For a 9-col table that is ~10 × `to_jsonb(OLD)` and 2 ×
-   `to_jsonb(NEW)` per UPDATE, vs 1 × each in `full` — which lines up exactly
-   with the ~1.6 × slowdown the measurement showed. A two-line change at the
-   start of the UPDATE branch (`v_new_json := to_jsonb(NEW); v_old_json :=
-   to_jsonb(OLD);`, then reference the cached vars) would compute each once
-   and likely close (or invert) the source-write gap, given the trim modes
-   already write less to the change-log. **Worth a follow-up measurement
-   before deciding any default flip.**
+   local plpgsql vars. DONE — PR #90, `origin/main @ 6257f7b`.** The pre-cache
+   trim-mode UPDATE branch re-evaluated `to_jsonb(NEW)` twice and
+   `to_jsonb(OLD)` 1 + N times per row (N = column count), which the
+   pre-cache bench showed lined up with the ~1.6 × source-write slowdown vs
+   `full`. PR #90 caches both in `v_new_json` / `v_old_json` at the top of the
+   trim-mode UPDATE branches; the §Post-cache re-measurement above shows the
+   gap closing materially (`changed`: ~1.62 × → ~1.11 ×; `minimal`: ~1.66 × →
+   ~1.21 ×).
 2. **Apply-side benchmark — network bytes + target INSERT cost across the
    three modes.** Today's number is "byte-identical apply"; the cost ratio
    per mode is the missing half of the picture.
