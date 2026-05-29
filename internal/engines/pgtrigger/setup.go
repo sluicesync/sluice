@@ -28,6 +28,54 @@ const (
 	ChangeLogSchemaVer = 1 // schema-version pin recorded in the meta table
 )
 
+// CapturePayload selects how much of each changed row the capture
+// trigger writes into `sluice_change_log` (ADR-0068). The three modes
+// are points on a single axis of decreasing payload — they change ONLY
+// the source-side trigger body; the CDC reader and applier are
+// payload-shape-agnostic (they build the apply SET from whatever is in
+// `after` and the WHERE from whatever is in `before`), so the mode is
+// entirely a property of the installed trigger.
+type CapturePayload string
+
+const (
+	// CapturePayloadFull writes the full before-image AND full
+	// after-image on every UPDATE (and the full old row on DELETE).
+	// Today's behaviour, byte-identical. Conservative default per the
+	// loud-failure / validate-end-to-end tenets.
+	CapturePayloadFull CapturePayload = "full"
+
+	// CapturePayloadChanged trims only the UPDATE `after` image to
+	// `PK ∪ {changed columns}`; the full `before` image is retained so
+	// the apply WHERE still does optimistic divergence detection.
+	CapturePayloadChanged CapturePayload = "changed"
+
+	// CapturePayloadMinimal trims the UPDATE `after` image (as
+	// `changed`) AND trims the UPDATE/DELETE `before` image to the PK
+	// only, so the apply WHERE becomes a PK match (last-write-wins CDC).
+	// Reaches toward Bucardo's ~2x source-write overhead; trades the
+	// divergence-detecting WHERE, acceptable for one-way CDC.
+	CapturePayloadMinimal CapturePayload = "minimal"
+)
+
+// normalizePayload returns the effective mode (empty → full) and an
+// error for any unrecognised value. The empty-default keeps a
+// zero-value SetupOptions on today's byte-identical behaviour.
+func normalizePayload(p CapturePayload) (CapturePayload, error) {
+	switch p {
+	case "", CapturePayloadFull:
+		return CapturePayloadFull, nil
+	case CapturePayloadChanged:
+		return CapturePayloadChanged, nil
+	case CapturePayloadMinimal:
+		return CapturePayloadMinimal, nil
+	default:
+		return "", fmt.Errorf(
+			"pgtrigger: setup: unknown --capture-payload %q; valid modes are full, changed, minimal (ADR-0068)",
+			string(p),
+		)
+	}
+}
+
 // SetupOptions controls the behaviour of [Setup]. Zero values are the
 // safe defaults; the CLI threads operator flags through.
 type SetupOptions struct {
@@ -55,6 +103,14 @@ type SetupOptions struct {
 	// `pg_create_event_trigger`. Phase 1 only records the operator's
 	// intent — the polled-fingerprint loop itself is a follow-up.
 	AllowPolledFingerprint bool
+
+	// CapturePayload selects how much of each changed row the capture
+	// trigger writes (ADR-0068). Empty defaults to [CapturePayloadFull]
+	// (today's byte-identical behaviour). Validated by Setup, which
+	// refuses-loudly on an unrecognised value. The mode is a property
+	// of the installed trigger body only — the reader and applier are
+	// unaffected.
+	CapturePayload CapturePayload
 }
 
 // Plan is the result of a dry-run [Setup]. Holds the DDL statements
@@ -127,6 +183,14 @@ func Setup(ctx context.Context, dsn string, opts SetupOptions) (*Plan, error) {
 		return nil, errors.New("pgtrigger: setup: no tables specified; pass --tables=t1,t2,…")
 	}
 
+	// Validate (and default) the capture-payload mode before touching
+	// any source-side state, so an unknown value refuses loudly upfront.
+	payload, err := normalizePayload(opts.CapturePayload)
+	if err != nil {
+		return nil, err
+	}
+	opts.CapturePayload = payload
+
 	cfg, err := parseDSNCompat(dsn)
 	if err != nil {
 		return nil, err
@@ -182,7 +246,7 @@ func Setup(ctx context.Context, dsn string, opts SetupOptions) (*Plan, error) {
 		EventTriggerSupported: canEventTrigger,
 		PGVersionNum:          pgver,
 	}
-	plan.Statements = renderSetupDDL(opts.Schema, opts.Tables, canEventTrigger)
+	plan.Statements = renderSetupDDL(opts.Schema, opts.Tables, canEventTrigger, opts.CapturePayload)
 
 	if len(refusals) > 0 {
 		// Refusals block the run even on dry-run — the operator
@@ -273,7 +337,7 @@ func Teardown(ctx context.Context, dsn string, opts TeardownOptions) (*Plan, err
 // engine. Order matters: the change-log table must exist before the
 // capture function references it; the function must exist before the
 // per-table triggers reference it.
-func renderSetupDDL(schema string, tables []string, canEventTrigger bool) []string {
+func renderSetupDDL(schema string, tables []string, canEventTrigger bool, payload CapturePayload) []string {
 	tableRef := func(name string) string {
 		return quoteIdent(schema) + "." + quoteIdent(name)
 	}
@@ -306,8 +370,9 @@ func renderSetupDDL(schema string, tables []string, canEventTrigger bool) []stri
 		// Row-event capture function. TG_RELID drives a catalog
 		// lookup at fire time to discover the source table's PK
 		// column list; jsonb_object_agg projects pk_jsonb out of
-		// OLD/NEW.
-		renderCaptureRowFunction(schema, tableRef(ChangeLogTable)),
+		// OLD/NEW. The capture-payload mode (ADR-0068) selects the
+		// per-op v_before / v_after assignment block.
+		renderCaptureRowFunction(schema, tableRef(ChangeLogTable), payload),
 
 		// TRUNCATE companion — separate function because TRUNCATE
 		// triggers are FOR EACH STATEMENT, not FOR EACH ROW.
@@ -374,7 +439,8 @@ func ddlFnRef(schema string) string {
 }
 
 // renderCaptureRowFunction returns the CREATE OR REPLACE FUNCTION
-// statement for the shared row-event capture function. ADR-0066 §3.
+// statement for the shared row-event capture function. ADR-0066 §3,
+// ADR-0068 (the capture-payload modes).
 //
 // TG_ARGV[0] carries the source-table-qualified name; the function
 // reads pg_attribute through information_schema to derive the PK
@@ -384,7 +450,14 @@ func ddlFnRef(schema string) string {
 // access. The catalog hit per row is fine for Phase 1's design
 // ceiling (§11) — the §11 5000/sec ceiling is on the change-log
 // write path, not the function's complexity.
-func renderCaptureRowFunction(schema, changeLogTableRef string) string {
+//
+// The PK-discovery block, the INSERT branch, the INSERT INTO
+// scaffolding, SECURITY DEFINER, and SET search_path are SHARED across
+// all three payload modes — only the UPDATE/DELETE v_before/v_after
+// assignment block differs (ADR-0068). The per-mode block is produced
+// by captureUpdateDeleteBlock so the shared scaffold lives in exactly
+// one place.
+func renderCaptureRowFunction(schema, changeLogTableRef string, payload CapturePayload) string {
 	// Hand-written SQL — the source string is operator-readable and
 	// avoids the per-engine identifier-quoting tangle of building
 	// the function body programmatically. SECURITY DEFINER lets a
@@ -423,21 +496,13 @@ BEGIN
     END IF;
 
     IF TG_OP = 'INSERT' THEN
+        -- INSERT is identical in all three modes: the after image is
+        -- all-new data, so there is nothing to trim (ADR-0068).
         v_op     := 'I';
         v_after  := to_jsonb(NEW);
         v_before := NULL;
         v_pk     := (SELECT jsonb_object_agg(key, value) FROM jsonb_each(v_after) WHERE key = ANY(v_pk_cols));
-    ELSIF TG_OP = 'UPDATE' THEN
-        v_op     := 'U';
-        v_before := to_jsonb(OLD);
-        v_after  := to_jsonb(NEW);
-        v_pk     := (SELECT jsonb_object_agg(key, value) FROM jsonb_each(v_after) WHERE key = ANY(v_pk_cols));
-    ELSIF TG_OP = 'DELETE' THEN
-        v_op     := 'D';
-        v_before := to_jsonb(OLD);
-        v_after  := NULL;
-        v_pk     := (SELECT jsonb_object_agg(key, value) FROM jsonb_each(v_before) WHERE key = ANY(v_pk_cols));
-    ELSE
+` + captureUpdateDeleteBlock(payload) + `    ELSE
         RAISE EXCEPTION 'sluice_capture_change: unexpected TG_OP %', TG_OP;
     END IF;
 
@@ -455,6 +520,75 @@ BEGIN
     RETURN NULL;  -- AFTER triggers ignore the return value
 END
 $sluice$;`
+}
+
+// captureUpdateDeleteBlock returns the per-mode UPDATE + DELETE branch
+// of the capture function (the only part that differs across the three
+// ADR-0068 payload modes). The returned snippet slots in directly after
+// the shared INSERT branch's closing line; it begins with `    ELSIF`
+// and ends with a trailing newline so the shared scaffold reads as one
+// IF/ELSIF chain.
+//
+//   - full:    UPDATE before = full OLD, after = full NEW; DELETE before = full OLD.
+//   - changed: UPDATE before = full OLD, after = PK ∪ changed cols;  DELETE before = full OLD.
+//   - minimal: UPDATE before = PK only,  after = PK ∪ changed cols;  DELETE before = PK only.
+//
+// The changed-set `after` always unions the PK (key = ANY(v_pk_cols))
+// so the applier's WHERE and SET both have the key. jsonb_object_agg
+// over zero rows returns NULL, but the PK union guarantees ≥1 row, so
+// v_after is never NULL for a PK'd table (the engine refuses no-PK
+// tables, §14). A zero-non-PK-column UPDATE (SET a=a) yields a PK-only
+// after; that is a harmless idempotent no-op on apply and is NOT
+// suppressed (per-stream change counts stay faithful).
+func captureUpdateDeleteBlock(payload CapturePayload) string {
+	// Shared changed-set computation for the UPDATE after image
+	// (changed + minimal). PK union + IS DISTINCT FROM diff (NULL-safe,
+	// type-exact on jsonb).
+	const changedAfter = `        v_after  := (
+            SELECT jsonb_object_agg(n.key, n.value)
+            FROM jsonb_each(to_jsonb(NEW)) n
+            WHERE n.key = ANY(v_pk_cols)
+               OR (to_jsonb(OLD) -> n.key) IS DISTINCT FROM n.value
+        );`
+
+	switch payload {
+	case CapturePayloadChanged:
+		return `    ELSIF TG_OP = 'UPDATE' THEN
+        v_op     := 'U';
+        v_before := to_jsonb(OLD);  -- full before-image (divergence WHERE)
+` + changedAfter + `
+        v_pk     := (SELECT jsonb_object_agg(key, value) FROM jsonb_each(to_jsonb(NEW)) WHERE key = ANY(v_pk_cols));
+    ELSIF TG_OP = 'DELETE' THEN
+        v_op     := 'D';
+        v_before := to_jsonb(OLD);
+        v_after  := NULL;
+        v_pk     := (SELECT jsonb_object_agg(key, value) FROM jsonb_each(v_before) WHERE key = ANY(v_pk_cols));
+`
+	case CapturePayloadMinimal:
+		return `    ELSIF TG_OP = 'UPDATE' THEN
+        v_op     := 'U';
+        v_pk     := (SELECT jsonb_object_agg(key, value) FROM jsonb_each(to_jsonb(NEW)) WHERE key = ANY(v_pk_cols));
+        v_before := v_pk;  -- PK only (PK-scoped WHERE)
+` + changedAfter + `
+    ELSIF TG_OP = 'DELETE' THEN
+        v_op     := 'D';
+        v_pk     := (SELECT jsonb_object_agg(key, value) FROM jsonb_each(to_jsonb(OLD)) WHERE key = ANY(v_pk_cols));
+        v_before := v_pk;  -- PK only
+        v_after  := NULL;
+`
+	default: // CapturePayloadFull
+		return `    ELSIF TG_OP = 'UPDATE' THEN
+        v_op     := 'U';
+        v_before := to_jsonb(OLD);
+        v_after  := to_jsonb(NEW);
+        v_pk     := (SELECT jsonb_object_agg(key, value) FROM jsonb_each(v_after) WHERE key = ANY(v_pk_cols));
+    ELSIF TG_OP = 'DELETE' THEN
+        v_op     := 'D';
+        v_before := to_jsonb(OLD);
+        v_after  := NULL;
+        v_pk     := (SELECT jsonb_object_agg(key, value) FROM jsonb_each(v_before) WHERE key = ANY(v_pk_cols));
+`
+	}
 }
 
 // renderCaptureTruncateFunction returns the CREATE OR REPLACE

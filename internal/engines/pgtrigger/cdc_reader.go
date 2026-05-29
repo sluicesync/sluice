@@ -315,11 +315,19 @@ func (r *CDCReader) poll(ctx context.Context, lastSeen int64) (events []ir.Chang
 		case "I":
 			events = append(events, ir.Insert{Position: pos, Schema: schema, Table: table, Row: afterRow})
 		case "U":
-			// When the source's REPLICA IDENTITY is DEFAULT, OLD
-			// carries only the PK columns; the applier's
-			// Update.Before then carries only the PK columns, matching
-			// the pgoutput engine's same-setting behaviour (ADR-0066
-			// §3).
+			// `before`/`after` completeness is a deliberate
+			// capture-payload mode choice (ADR-0068), NOT a REPLICA
+			// IDENTITY artifact: a plpgsql trigger's OLD/NEW are ALWAYS
+			// the full row regardless of REPLICA IDENTITY (that setting
+			// governs only the WAL old-tuple for logical decoding — the
+			// slot/pgoutput path, not trigger variables). So `before`
+			// carries the full old row in `full`/`changed` modes and
+			// PK-only in `minimal`; `after` carries the full new row in
+			// `full` and PK ∪ changed-cols in `changed`/`minimal`. The
+			// reader decodes whatever the change-log holds verbatim and
+			// the applier builds its WHERE from `before` and SET from
+			// `after` — both correct and idempotent for any of the
+			// modes, with no reader/applier code change.
 			events = append(events, ir.Update{Position: pos, Schema: schema, Table: table, Before: beforeRow, After: afterRow})
 		case "D":
 			// Delete events carry only OLD; the applier's PK-only
