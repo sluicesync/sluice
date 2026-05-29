@@ -3,32 +3,30 @@
 // Copyright 2026 Omar Ramos
 // SPDX-License-Identifier: Apache-2.0
 
-// ADR-0046 §14d compact integration pin (Task #15, Postgres,
+// ADR-0046 §14d / ADR-0067 compact integration pin (Postgres,
 // testcontainers).
 //
-// TestADR0046_BackupCompact_LiveRotationGap_RefusesLoudly_PG — Drive
-// a real CDC stream into a >= 3-segment rotated lineage under
-// continuous write load, then attempt compact. PG's rotation FSM
-// allows S >= P_N (strict ≥); under continuous write the snapshot
-// anchor S routinely lands AT a strictly later LSN than the prior
-// segment's last incremental P_N (a handful of bytes of WAL between
-// them — slot-flush metadata or intervening writes). Naive compact
-// would have to drop the intermediate full's snapshot bytes to merge,
-// but those bytes carry row-state captured ONLY in that full (writes
-// that landed between P_N and S_next don't appear in any incremental).
-// The compact pre-flight REFUSES LOUDLY (per ADR-0046 §14d
-// position-gap loud-failure clause) — operators get a clear message
-// naming the boundary segments, and the catalog stays unchanged.
-// This is the load-bearing pin: the refusal saves the operator from
-// a silent-loss class that the unit tests (which use
-// position-aligned seed lineages) can't surface.
+// TestADR0067_BackupCompact_LiveRotationContiguous_Merges_PG — Drive a
+// real CDC stream into a >= 3-segment rotated lineage under continuous
+// write load, then compact. ADR-0067: the rotation handoff KEEPS the
+// (P_N, S] overlap in each new segment's incrementals and records
+// IncrementalCoverageStart = P_N, so consecutive segments are
+// contiguous (prior.End == cur.IncrementalCoverageStart). Naive compact
+// MERGES the chain, re-stitches the parent links across the former
+// segment joins, and the merged chain restore-walks clean with a real
+// position comparator. This is the Bug 95 regression pin.
 //
-// Aligned-position happy-path coverage lives in
-// chain_compact_test.go's unit pin matrix
-// (TestCompactChain_TwoSegmentGroup_Merges,
-// TestCompactChain_ThreeSegmentGroup_Merges,
-// TestCompactChain_RestoreShape_PostCompact); those use in-memory
-// stores + hand-seeded lineages so positions align exactly.
+// Pre-ADR-0067 this test asserted the OPPOSITE: live rotation produced
+// strict S > P_N handoffs, the (P_N, S] window lived only in the
+// dropped intermediate full, and compact refused loudly at the
+// position-gap pre-flight. That genuine-gap refusal is still unit-
+// covered (chain_compact_test.go's TestCompactChain_PositionGap_
+// RefusesLoudly) for pre-0067 / imported / corrupted lineages.
+//
+// Aligned-position happy-path + rotated-overlap unit coverage lives in
+// chain_compact_test.go (TestCompactChain_*Merges, ...RestoreShape...,
+// TestCompactChain_RotatedOverlap_Merges) and the boundary matrix in
+// chain_contiguous_rotation_test.go.
 
 package pipeline
 
@@ -45,12 +43,17 @@ import (
 	_ "github.com/orware/sluice/internal/engines/postgres"
 )
 
-// TestADR0046_BackupCompact_LiveRotationGap_RefusesLoudly_PG is the
-// load-bearing loud-failure pin: a real PG rotation chain under
-// continuous CDC writes carries position handoffs S > P_N (strict
-// greater), and naive compact must refuse loudly rather than silently
-// drop the dropped-full's snapshot row-state.
-func TestADR0046_BackupCompact_LiveRotationGap_RefusesLoudly_PG(t *testing.T) {
+// TestADR0067_BackupCompact_LiveRotationContiguous_Merges_PG is the
+// load-bearing Bug 95 pin: a real PG rotation chain under continuous CDC
+// writes is now born-CONTIGUOUS (ADR-0067 keeps the (P_N, S] overlap in
+// each new segment's incrementals and records IncrementalCoverageStart =
+// P_N), so naive compact MERGES it and the merged chain restore-walks
+// clean. Pre-ADR-0067 the strict S > P_N handoff forced a position-gap
+// refusal (this test asserted that refusal); ADR-0067 deliberately
+// replaces it with a successful, restorable merge. The position-gap
+// refusal itself stays unit-covered for genuine gaps
+// (TestCompactChain_PositionGap_RefusesLoudly).
+func TestADR0067_BackupCompact_LiveRotationContiguous_Merges_PG(t *testing.T) {
 	sourceDSN, _, cleanup := startPostgresLogical(t)
 	defer cleanup()
 
@@ -133,27 +136,45 @@ func TestADR0046_BackupCompact_LiveRotationGap_RefusesLoudly_PG(t *testing.T) {
 	}
 	t.Logf("pre-compact: %d segments", preCompactSegmentCount)
 
-	// Live-rotation lineages routinely carry small position gaps
-	// (S > P_N). Compact MUST refuse loudly per the position-gap
-	// loud-failure clause.
-	_, err = CompactChain(context.Background(), store, CompactOpts{
+	// ADR-0067: live rotation now KEEPS the (P_N, S] overlap in each new
+	// segment's incrementals (recording IncrementalCoverageStart = P_N),
+	// so consecutive segments are CONTIGUOUS and naive compact MERGES
+	// them — where pre-ADR-0067 the strict S > P_N handoff forced a
+	// position-gap refusal. This is the Bug 95 regression pin.
+	res, err := CompactChain(context.Background(), store, CompactOpts{
 		MergeWindow: time.Hour, // window captures every rotation
 	})
-	if err == nil {
-		t.Fatal("CompactChain on live-rotation lineage: nil error; want loud position-gap refusal")
+	if err != nil {
+		if strings.Contains(err.Error(), "position gap") {
+			t.Fatalf("ADR-0067 regression: live rotation produced a position gap that compact refused — rotated chains must be born-contiguous and compactable: %v", err)
+		}
+		t.Fatalf("CompactChain on live-rotation lineage: %v", err)
 	}
-	if !strings.Contains(err.Error(), "position gap") {
-		t.Errorf("err = %q; want the documented position-gap refusal", err.Error())
-	}
-	if !strings.Contains(err.Error(), "split the merge window") {
-		t.Errorf("err = %q; want the recovery hint", err.Error())
+	if res.GroupsMerged < 1 {
+		t.Fatalf("GroupsMerged = %d; want >= 1 (a contiguous rotated chain must merge)", res.GroupsMerged)
 	}
 
-	// Catalog stays unchanged after the refusal — no partial mutation.
+	// Segments were merged: the count dropped.
 	postLin, _, _ := loadLineageCatalog(context.Background(), store)
-	if len(postLin.Segments) != preCompactSegmentCount {
-		t.Errorf("post-refusal segments = %d; want %d (no mutation)",
+	if len(postLin.Segments) >= preCompactSegmentCount {
+		t.Errorf("post-compact segments = %d; want < %d (merge reduces the segment count)",
 			len(postLin.Segments), preCompactSegmentCount)
 	}
-	t.Logf("ADR-0046 §14d loud-failure pin PROVEN: %d-segment lineage with live rotation gaps refused cleanly", preCompactSegmentCount)
+
+	// The merged lineage must pass the full restore-walk boundary
+	// validation with a REAL position comparator — proving the kept
+	// (P_N, S] overlap is tolerated at the within-segment boundary AND
+	// the re-stitched parent links chain cleanly across the former
+	// segment joins (DR data — a merge that can't restore would be worse
+	// than the old refusal).
+	cmp := sameEngineComparator(context.Background(), store, eng)
+	chain, err := buildLineageChain(context.Background(), store, cmp)
+	if err != nil {
+		t.Fatalf("post-compact buildLineageChain (restore-walk): %v", err)
+	}
+	if len(chain) < 2 {
+		t.Fatalf("post-compact chain links = %d; want the merged full + its incrementals", len(chain))
+	}
+	t.Logf("ADR-0067 Bug-95 pin PROVEN: %d-segment live-rotation lineage merged to %d; merged chain restore-walks clean (%d links)",
+		preCompactSegmentCount, len(postLin.Segments), len(chain))
 }

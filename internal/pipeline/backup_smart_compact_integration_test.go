@@ -62,10 +62,14 @@ func TestADR0064_SmartCompaction_CollapsesUpdateChain_PG(t *testing.T) {
 	store, _ := NewLocalStore(dir)
 	full := rotationSeedFull(t, store, eng, sourceDSN, slotLSN)
 
-	// Produce a heavily-collapsing workload: 100 accounts, each
-	// updated 10 times. 100 INSERT + 1000 UPDATE = 1100 events on
-	// 100 distinct rows → expected ~91% reduction (one INSERT per
-	// row after collapse).
+	// Produce an update-heavy workload: 100 accounts, each updated 10
+	// times. 100 INSERT + 1000 UPDATE = 1100 events on 100 distinct rows.
+	// NOTE: v1 smart compaction collapses PER-INCREMENTAL (one accumulator
+	// per incremental manifest — cross-incremental collapse within a merge
+	// group is the ADR-0064 §C follow-on, out of scope). So the realized
+	// reduction reflects only same-row events that land within a single
+	// rollover-incremental, well below the cross-incremental ceiling
+	// (~91% if every row's 11 events collapsed to 1).
 	const rows = 100
 	const updates = 10
 	for i := 1; i <= rows; i++ {
@@ -109,13 +113,12 @@ func TestADR0064_SmartCompaction_CollapsesUpdateChain_PG(t *testing.T) {
 		t.Fatal("stream.Run did not exit within 20s of cancel")
 	}
 
-	// Smart compact. Note: the live PG rotation FSM may produce
-	// strict S > P_N gaps under continuous-write workloads (see
-	// TestADR0046_BackupCompact_LiveRotationGap_RefusesLoudly_PG);
-	// the test workload runs INSERT/UPDATE then waits for stream
-	// drain, so position-contiguity should hold. If the position-
-	// gap refusal trips, the test passes that signal up — it's a
-	// real refusal, not a regression.
+	// Smart compact. ADR-0067: the rotation handoff KEEPS the (P_N, S]
+	// overlap in each new segment's incrementals (recording
+	// IncrementalCoverageStart = P_N), so a live-rotation chain is
+	// born-contiguous and smart compact MERGES it. A position-gap refusal
+	// here would be an ADR-0067 regression (the genuine-gap refusal is
+	// unit-covered for pre-0067 / corrupted lineages).
 	startCompact := time.Now()
 	res, err := CompactChain(context.Background(), store, CompactOpts{
 		MergeWindow:     time.Hour,
@@ -126,8 +129,7 @@ func TestADR0064_SmartCompaction_CollapsesUpdateChain_PG(t *testing.T) {
 
 	if err != nil {
 		if strings.Contains(err.Error(), "position gap") {
-			t.Logf("ADR-0046 position-gap refusal under live-rotation: %v", err)
-			t.Skip("live rotation produced a position gap; smart-compact correctly refused (per ADR-0046 §14d)")
+			t.Fatalf("ADR-0067 regression: smart compact refused a live-rotation chain on a position gap — rotated chains must be born-contiguous and compactable: %v", err)
 		}
 		t.Fatalf("CompactChain smart: %v", err)
 	}
@@ -144,8 +146,17 @@ func TestADR0064_SmartCompaction_CollapsesUpdateChain_PG(t *testing.T) {
 		compactWall,
 	)
 
-	if reduction < 50 {
-		t.Errorf("event reduction = %.1f%%; want >= 50%% on the synthetic INSERT+UPDATE workload",
+	// Robust floor: assert collapse ENGAGED and achieved a meaningful
+	// per-incremental reduction, without coupling to rollover timing
+	// (which determines how many same-row events share an incremental and
+	// so varies run-to-run). The v1 per-incremental ceiling for this
+	// workload is far under the theoretical ~91% cross-incremental bound.
+	if res.EventsCollapsed == 0 || res.RowsCollapsed == 0 {
+		t.Errorf("EventsCollapsed=%d RowsCollapsed=%d; smart compaction collapsed nothing",
+			res.EventsCollapsed, res.RowsCollapsed)
+	}
+	if reduction < 15 {
+		t.Errorf("event reduction = %.1f%%; want >= 15%% (per-incremental collapse, ADR-0064 §14e)",
 			reduction)
 	}
 

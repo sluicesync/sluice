@@ -268,6 +268,26 @@ func PruneChain(ctx context.Context, store ir.BackupStore, opts PruneOpts) (*Pru
 			res.Kept = append(res.Kept, segQualify(seg.Dir, ip))
 		}
 	}
+	// ADR-0067: if prune trimmed the floor segment's leading incrementals,
+	// its earliest incremental coverage moved forward; resync the floor
+	// segment's IncrementalCoverageStart so the restore-time within-segment
+	// integrity check (validateFirstIncrementalBoundary) stays valid. An
+	// untrimmed floor segment keeps its recorded value.
+	if len(newSegs) > 0 {
+		switch {
+		case len(kept) > 0 && kept[0].segIdx == floorSeg && keepFromInSeg > 0:
+			// Floor segment's leading incrementals were trimmed; the new
+			// first incremental is kept[0] — its StartPosition is the new
+			// earliest coverage.
+			newSegs[0].IncrementalCoverageStart = kept[0].manifest.StartPosition
+		case len(kept) == 0:
+			// Everything dropped: the floor segment retains only its full,
+			// so there is no incremental coverage — clear the field (it
+			// resolves to StartPosition, the full anchor).
+			newSegs[0].IncrementalCoverageStart = ir.Position{}
+		}
+	}
+
 	cat.Segments = newSegs
 	cat.RestorableFromSegment = 0
 

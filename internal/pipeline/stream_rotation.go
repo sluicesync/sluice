@@ -171,13 +171,14 @@ type rotateInputs struct {
 	// consuming. ADR-0046 step 5: CDC continues on the SAME handle --
 	// the FSM does NOT re-open / re-position the pump (the engine's
 	// CDC reader is single-stream; re-calling StreamChanges errors).
-	// The pump is forward-only and already past ~P_N; the new
-	// segment's full snapshot at S >= P_N covers the (P_N, S] window,
-	// and the new segment's incrementals record StartPosition = S, so
-	// the idempotent restore + the seg[i].end <= seg[i+1].start
-	// boundary invariant absorb the overlap (the snapshot->CDC handoff
-	// dedup sluice already proves for the initial full->stream
-	// transition, replicated per segment boundary).
+	// The pump is forward-only and already past ~P_N. ADR-0067: the new
+	// segment KEEPS the (P_N, S] window in its incrementals (skipThrough
+	// = P_N, NOT S) and records IncrementalCoverageStart = P_N, so the
+	// lineage is born-contiguous (prior.End == new.IncrementalCoverageStart)
+	// and compactable. The (P_N, S] events the new full's snapshot ALSO
+	// captured re-apply idempotently on restore -- the snapshot->CDC
+	// handoff dedup sluice already proves for the initial full->stream
+	// transition, replicated per segment boundary.
 	changesCh <-chan ir.Change
 	now       func() time.Time
 	clockNow  func() time.Time
@@ -190,8 +191,14 @@ type rotateResult struct {
 	newSegCodec Codec
 	newSegDir   string
 	newFull     *ir.Manifest
-	resumePos   ir.Position // S -- where the SAME cdc handle resumes
-	changesCh   <-chan ir.Change
+	resumePos   ir.Position // S -- the new segment's full anchor
+	// priorEnd is P_N, the prior segment's EndPosition. ADR-0067: the
+	// rollover loop sets skipThrough = priorEnd (NOT S) so the new
+	// segment's incrementals KEEP the (P_N, S] overlap the new full's
+	// snapshot also captured, making the lineage born-contiguous and
+	// compactable. The overlap re-applies idempotently on restore.
+	priorEnd  ir.Position
+	changesCh <-chan ir.Change
 }
 
 // shouldRotate returns a non-empty rotation reason when a threshold
@@ -326,11 +333,12 @@ func (b *BackupStream) performRotation(ctx context.Context, in rotateInputs) (ro
 	// CDC continues on the SAME handle (ADR-0046 step 5). We do NOT
 	// re-call StreamChanges -- the engine's CDC reader is single-
 	// stream and the pump is already flowing forward from ~P_N. The
-	// rollover loop keeps consuming the SAME channel; the new
-	// segment's incrementals record StartPosition = S, so the
-	// (P_N, S] window the new full's snapshot also captured is
-	// absorbed idempotently on restore (the per-segment-boundary
-	// replica of the snapshot->CDC handoff dedup).
+	// rollover loop keeps consuming the SAME channel. ADR-0067: it sets
+	// skipThrough = P_N (priorEnd), so the new segment's incrementals
+	// KEEP the (P_N, S] window (which the new full's snapshot also
+	// captured); that overlap re-applies idempotently on restore, and
+	// the recorded IncrementalCoverageStart = P_N makes the lineage
+	// contiguous for compaction.
 	changesCh := in.changesCh
 
 	// COMMIT -- the single atomic linearization point. The new full is
@@ -363,7 +371,20 @@ func (b *BackupStream) performRotation(ctx context.Context, in rotateInputs) (ro
 		FullManifestPath: ManifestFileName,
 		StartPosition:    s,
 		EndPosition:      s,
-		Codec:            segCodec,
+		// ADR-0067: IncrementalCoverageStart is intentionally left UNSET
+		// at COMMIT. The new segment KEEPS the (P_N, S] overlap by
+		// replaying CDC from P_N (skipThrough = P_N in the rollover loop),
+		// so its first incremental normally starts at P_N. But skipThrough
+		// is in-process state: a crash between this COMMIT and the first
+		// overlap incremental resumes at S (the new full's anchor), NOT
+		// P_N. So P_N is only the INTENDED coverage start here, not a
+		// durable fact. The field is recorded from the ACTUAL first
+		// incremental when it commits (updateLineageForManifest) — P_N in
+		// the normal case, S after a post-COMMIT crash-recovery resume.
+		// That keeps the recorded coverage honest across crashes; an unset
+		// field resolves to StartPosition (S) until the first incremental
+		// proves an overlap.
+		Codec: segCodec,
 	})
 	cat.UpdatedAt = cappedAt
 	if err := writeLineageCatalog(ctx, b.Store, cat); err != nil {
@@ -403,6 +424,7 @@ func (b *BackupStream) performRotation(ctx context.Context, in rotateInputs) (ro
 		newSegDir:   provisionalDir,
 		newFull:     newFull,
 		resumePos:   s,
+		priorEnd:    pN,
 		changesCh:   changesCh,
 	}, nil
 }

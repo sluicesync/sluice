@@ -803,6 +803,84 @@ func validateBoundary(cmp ir.PositionMonotonicChecker, prevEnd, curStart ir.Posi
 	return nil
 }
 
+// validateFirstIncrementalBoundary validates a segment's full ->
+// first-incremental boundary, tolerating the ADR-0067 overlap. A
+// rotation-opened segment KEEPS the (P_N, S] window in its incrementals,
+// so its first incremental legitimately starts at P_N, which PRECEDES
+// the full's anchor (fullEnd == S). Two properties are checked:
+//
+//  1. INTEGRITY: the first incremental must start exactly at the
+//     segment's recorded coverage start (coverageStart ==
+//     IncrementalCoverageStart, or StartPosition when unset). This is
+//     what lets the no-comparator path trust the overlap: the rotation
+//     FSM hard-asserted P_N <= S when it recorded coverageStart = P_N at
+//     write time, so a first incremental that matches coverageStart is
+//     known-good even when restore can't re-order positions. It also
+//     catches a tampered/corrupt first incremental. Prune keeps
+//     coverageStart in sync when it trims leading incrementals (see
+//     PruneChain), so this does not spuriously fire post-prune.
+//  2. NO FORWARD GAP: the first incremental must start at-or-before the
+//     full's end -- the (firstStart, fullEnd] overlap re-applies
+//     idempotently on restore (ADR-0010); a first incremental AFTER the
+//     full's end would leave (fullEnd, firstStart) uncovered (a silent
+//     data gap -> loud refusal). For a never-rotated segment firstStart
+//     == fullEnd and this is the historical exact match.
+func validateFirstIncrementalBoundary(cmp ir.PositionMonotonicChecker, fullEnd, recordedCoverage, firstStart ir.Position, segLabel string) error {
+	if fullEnd.Engine == "" && fullEnd.Token == "" {
+		return nil // legacy full with no recorded position (historical tolerance)
+	}
+	// Where the first incremental must start:
+	//   - rotated segment (recordedCoverage set): the kept-overlap start
+	//     P_N (which precedes the full's anchor fullEnd == S);
+	//   - never-rotated segment (recordedCoverage unset): the full's own
+	//     end — the historical contiguous chain. We compare against the
+	//     full MANIFEST's EndPosition (authoritative), NOT the catalog's
+	//     StartPosition, which legacy/rebuilt catalogs may leave unset.
+	rotated := recordedCoverage.Engine != "" || recordedCoverage.Token != ""
+	expected := fullEnd
+	if rotated {
+		expected = recordedCoverage
+	}
+	if firstStart != expected {
+		return fmt.Errorf(
+			"lineage boundary mismatch at %s: first incremental StartPosition %+v does not equal the expected start %+v — refusing to silently assemble a gapped/regressed restore (DR data)",
+			segLabel, firstStart, expected,
+		)
+	}
+	if !rotated {
+		return nil // exact match against the full's end — historical behavior
+	}
+	// Rotated: the kept (recordedCoverage, fullEnd] overlap re-applies
+	// idempotently on restore (ADR-0010). Require no FORWARD gap — the
+	// coverage start must be at-or-before the full's end; a coverage start
+	// AHEAD of the full would leave (fullEnd, recordedCoverage) uncovered.
+	if recordedCoverage == fullEnd {
+		return nil
+	}
+	if cmp != nil {
+		le, err := cmp.PrecedesOrEqual(recordedCoverage, fullEnd)
+		if err != nil {
+			return fmt.Errorf("lineage %s: cannot prove first incremental start %+v <= full end %+v (DR data, refusing): %w",
+				segLabel, recordedCoverage, fullEnd, err)
+		}
+		if !le {
+			return fmt.Errorf(
+				"lineage boundary mismatch at %s: first incremental StartPosition %+v is AHEAD of the segment full's end %+v — a forward gap would lose events between them (DR data, refusing)",
+				segLabel, recordedCoverage, fullEnd,
+			)
+		}
+		return nil
+	}
+	// No comparator: the rotation FSM hard-asserted P_N <= S from the live
+	// source at write time when it recorded recordedCoverage; require the
+	// same engine as the structural guarantee.
+	if recordedCoverage.Engine != fullEnd.Engine {
+		return fmt.Errorf("lineage %s: first incremental engine %q != full engine %q (DR data, refusing)",
+			segLabel, recordedCoverage.Engine, fullEnd.Engine)
+	}
+	return nil
+}
+
 // buildLineageChain walks the lineage segment-by-segment and returns a
 // flat ordered link list (each segment's full followed by its
 // incrementals in chain order), validated by the SINGLE
@@ -856,9 +934,9 @@ func buildLineageChain(ctx context.Context, store ir.BackupStore, cmp ir.Positio
 		// manifest's empty StartPosition field). SAME validator as the
 		// intra-segment boundary below, `exact=false`.
 		if prevLink != nil {
-			if err := validateBoundary(cmp, prevLink.manifest.EndPosition, seg.StartPosition, false,
+			if err := validateBoundary(cmp, prevLink.manifest.EndPosition, seg.incrementalCoverageStartOrStart(), false,
 				fmt.Sprintf("segment %d last link %s", si-1, manifestBackupID(prevLink.manifest)),
-				fmt.Sprintf("segment %d (%s) recorded start", si, seg.SegmentID)); err != nil {
+				fmt.Sprintf("segment %d (%s) incremental coverage start", si, seg.SegmentID)); err != nil {
 				return nil, err
 			}
 		}
@@ -889,7 +967,21 @@ func buildLineageChain(ctx context.Context, store ir.BackupStore, cmp ir.Positio
 				return nil, fmt.Errorf("segment %d incremental %q parent %q does not chain off preceding link %q — branching/mis-stitched lineage",
 					si, ip, im.ParentBackupID, parentID)
 			}
-			if err := validateBoundary(cmp, prevLink.manifest.EndPosition, im.StartPosition, true,
+			if ii == 0 {
+				// Full -> first-incremental boundary. ADR-0067: a
+				// rotation-opened segment KEEPS the (P_N, S] overlap, so
+				// its first incremental starts at IncrementalCoverageStart
+				// (P_N), which PRECEDES the full's anchor (full.End == S).
+				// Tolerate that backward overlap (it re-applies
+				// idempotently on restore); refuse only a FORWARD gap
+				// (first incremental starting AFTER the full's end would
+				// lose events). For a never-rotated segment the coverage
+				// start == full.End and this is the historical exact match.
+				if err := validateFirstIncrementalBoundary(cmp, fm.EndPosition, seg.IncrementalCoverageStart, im.StartPosition,
+					fmt.Sprintf("segment %d (%s)", si, seg.SegmentID)); err != nil {
+					return nil, err
+				}
+			} else if err := validateBoundary(cmp, prevLink.manifest.EndPosition, im.StartPosition, true,
 				fmt.Sprintf("segment %d link %d", si, ii),
 				fmt.Sprintf("segment %d incremental %s", si, id)); err != nil {
 				return nil, err

@@ -628,31 +628,37 @@ func assertGroupEncryptionKeysetUniform(eligible []LineageSegment, span []segMet
 	return nil
 }
 
-// assertGroupBoundaryContiguous refuses LOUDLY when there's a position
-// gap between consecutive sources in a merge group:
-// `seg[i].EndPosition != seg[i+1].StartPosition` under the engine-
-// tagged token comparison the lineage records. The rotation FSM
-// guarantees `<=`, never strict less, in the normal case — equality
-// is the common case (same TxCommit boundary handed off). A strict
-// inequality (gap) would mean events between seg[i].End and
-// seg[i+1].Start live ONLY in seg[i+1]'s full snapshot, which naive
-// compact is about to drop — refusing here avoids silent event loss.
+// assertGroupBoundaryContiguous refuses LOUDLY when there's a real
+// position gap between consecutive sources in a merge group: the prior
+// segment's EndPosition does not equal the next segment's earliest
+// incremental coverage. The comparison is against
+// [LineageSegment.incrementalCoverageStartOrStart] (ADR-0067), NOT
+// StartPosition: a rotation-opened segment keeps the (P_N, S] overlap
+// in its incrementals and records IncrementalCoverageStart = P_N ==
+// the prior segment's EndPosition, so a rotated lineage is contiguous
+// by construction and this check passes. (For a never-rotated /
+// pre-ADR-0067 segment the resolver falls back to StartPosition — the
+// historical comparison.)
 //
-// We compare via raw engine + token equality (positions on either
-// side of a rotation handoff share an engine, so JSON-string equality
-// is a sufficient and conservative discriminator). Operators see a
-// clear refusal that names the boundary; #16's event-level compactor
-// can replay smarter.
+// A strict inequality therefore means a GENUINE gap: events between
+// prev.End and cur's coverage start would live ONLY in cur's full
+// snapshot, which naive compact is about to drop. Post-ADR-0067 that
+// can only arise on a pre-0067, imported, or corrupted lineage —
+// refuse LOUDLY rather than silently lose them. We compare via raw
+// engine + token equality (positions across a rotation handoff share
+// an engine, so JSON-string equality is a sufficient, conservative
+// discriminator).
 func assertGroupBoundaryContiguous(eligible []LineageSegment, span []segMeta) error {
 	for i := 1; i < len(span); i++ {
 		prev := &eligible[span[i-1].idx]
 		cur := &eligible[span[i].idx]
-		if prev.EndPosition.Token != cur.StartPosition.Token ||
-			prev.EndPosition.Engine != cur.StartPosition.Engine {
+		curStart := cur.incrementalCoverageStartOrStart()
+		if prev.EndPosition.Token != curStart.Token ||
+			prev.EndPosition.Engine != curStart.Engine {
 			return fmt.Errorf(
-				"backup compact: merge group has a position gap between segment %s (end=%+v) and segment %s (start=%+v); naive compact would drop events live only in the later segment's full snapshot — split the merge window so the gap is on a group boundary",
+				"backup compact: merge group has a position gap between segment %s (end=%+v) and segment %s (incremental coverage starts at %+v): events in that range live only in the later segment's full snapshot, which compaction drops — refusing to silently lose them (DR data). Rotated chains are contiguous and compactable (ADR-0067); a gap here indicates a pre-ADR-0067, imported, or corrupted lineage",
 				prev.SegmentID, prev.EndPosition,
-				cur.SegmentID, cur.StartPosition,
+				cur.SegmentID, curStart,
 			)
 		}
 	}
@@ -754,6 +760,20 @@ func executeMergeGroup(
 	//    the path encodes the chunk's source CreatedAt).
 	incrCount := 0
 	finalIncrPaths := make([]string, 0)
+	// ADR-0067 parent re-stitch: a merged segment drops every source
+	// segment's full except the oldest, so the FIRST incremental of each
+	// dropped-full segment must re-chain off the previous link (its
+	// original parent full is gone). Walk the merged incrementals in
+	// lineage order, pointing each one's ParentBackupID at the prior
+	// link. ir.ComputeBackupID ignores ParentBackupID (it hashes
+	// created_at/engine/kind/end_position), so the BackupID is unchanged
+	// and there is NO cascade — the boundary positions already proved
+	// linearity; this only fixes the linkage metadata the restore-walk's
+	// parent-link check enforces. (Pre-ADR-0067 this was never exercised:
+	// the only multi-segment merges reachable were position-aligned seed
+	// lineages whose incrementals carried no ParentBackupID, and live
+	// rotation chains refused at the position-gap pre-flight.)
+	prevLinkID := manifestBackupID(oldestFull)
 	for _, s := range pg.span {
 		seg := &eligible[s.idx]
 		segStore := seg.store(store)
@@ -767,6 +787,8 @@ func executeMergeGroup(
 					return fmt.Errorf("stage incremental chunk %q: %w", ch.File, err)
 				}
 			}
+			im.ParentBackupID = prevLinkID
+			prevLinkID = manifestBackupID(im)
 			newPath := fmt.Sprintf("%sincr-%05d-%s.json",
 				incrementalManifestPrefix, incrCount, manifestBackupID(im))
 			b, err := json.MarshalIndent(im, "", "  ")
@@ -939,12 +961,21 @@ func mergedSegmentFromGroup(cat *LineageCatalog, pg *plannedGroup, now time.Time
 	}
 
 	return LineageSegment{
-		SegmentID:                pg.plan.MergedSegmentID,
-		Dir:                      pg.plan.MergedSegmentDir,
-		FullManifestPath:         ManifestFileName,
-		Incrementals:             append([]string(nil), pg.finalIncrementalPaths...),
-		StartPosition:            oldest.StartPosition,
-		EndPosition:              newest.EndPosition,
+		SegmentID:        pg.plan.MergedSegmentID,
+		Dir:              pg.plan.MergedSegmentDir,
+		FullManifestPath: ManifestFileName,
+		Incrementals:     append([]string(nil), pg.finalIncrementalPaths...),
+		StartPosition:    oldest.StartPosition,
+		EndPosition:      newest.EndPosition,
+		// ADR-0067: the merged segment's full IS the oldest source's full
+		// (anchor = oldest.StartPosition) and its first incremental IS the
+		// oldest source's first incremental — so its earliest incremental
+		// coverage is the oldest source's. Carry IncrementalCoverageStart
+		// verbatim so (a) the merged segment's own full->first-incremental
+		// boundary validates (the kept (P_N, S] overlap), and (b) it stays
+		// contiguous with any segment preceding the merge group. Empty
+		// (oldest never-rotated) stays empty -> resolves to StartPosition.
+		IncrementalCoverageStart: oldest.IncrementalCoverageStart,
 		CappedAt:                 &cappedAt,
 		CapReason:                compactedCapReason,
 		Codec:                    oldest.codecOrDefault(),

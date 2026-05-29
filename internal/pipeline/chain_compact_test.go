@@ -231,6 +231,33 @@ func TestCompactChain_PositionGap_RefusesLoudly(t *testing.T) {
 	}
 }
 
+// TestCompactChain_RotatedOverlap_Merges is the unit-level Bug 95 pin:
+// a chain rotated in the ADR-0067 shape (each non-root segment keeps the
+// (P_N, S] overlap and records IncrementalCoverageStart = P_N) is
+// CONTIGUOUS and so MERGES — where the pre-ADR-0067 gap shape
+// (TestCompactChain_PositionGap_RefusesLoudly) correctly refused. Pins
+// that the contiguity check keys off IncrementalCoverageStart, and that
+// the merged lineage still walks (restore-build) cleanly.
+func TestCompactChain_RotatedOverlap_Merges(t *testing.T) {
+	store := newMemStore()
+	now := time.Date(2026, 5, 16, 0, 0, 0, 0, time.UTC)
+	seedSegmentsWithGapsOpts(t, store, now, []time.Duration{time.Hour}, segmentSeedOpts{rotatedOverlap: true})
+
+	res, err := CompactChain(context.Background(), store, CompactOpts{MergeWindow: 2 * time.Hour})
+	if err != nil {
+		t.Fatalf("CompactChain on a rotated-overlap (contiguous) chain: %v; want a clean merge (ADR-0067)", err)
+	}
+	if res.GroupsMerged != 1 {
+		t.Fatalf("GroupsMerged = %d; want 1 (the rotated chain is contiguous and compactable)", res.GroupsMerged)
+	}
+	// The post-compact lineage must still build (the restore-walk): the
+	// merged segment's full is the oldest (non-rotated) source's, the
+	// former inter-segment boundary is now an exact intra-segment one.
+	if _, err := buildLineageChain(context.Background(), store, nil); err != nil {
+		t.Errorf("post-compact buildLineageChain: %v", err)
+	}
+}
+
 // TestCompactChain_OnlyFull_NoOp: a chain with no incrementals (a
 // one-segment lineage) is a no-op, no error.
 func TestCompactChain_OnlyFull_NoOp(t *testing.T) {
@@ -409,6 +436,14 @@ type segmentSeedOpts struct {
 	// segment's StartPosition past the prior's EndPosition (creating
 	// the contiguity-violation shape).
 	gapBetweenBoundaries bool
+	// rotatedOverlap, when true, produces the ADR-0067 rotation shape for
+	// each non-root segment: the full is anchored at S = prior.End + 50
+	// (a gap, like gapBetweenBoundaries), BUT the segment's incrementals
+	// KEEP the (P_N, S] overlap — they start at P_N (== prior.End) — and
+	// the segment records IncrementalCoverageStart = P_N. Such a lineage
+	// is contiguous (prior.End == cur.IncrementalCoverageStart) and so
+	// compactable, unlike the gapBetweenBoundaries shape.
+	rotatedOverlap bool
 }
 
 func seedSegmentsWithGapsOpts(t *testing.T, store ir.BackupStore, base time.Time, gaps []time.Duration, opts segmentSeedOpts) {
@@ -442,21 +477,30 @@ func seedSegmentsWithGapsOpts(t *testing.T, store ir.BackupStore, base time.Time
 			chainEnc = opts.encPerSegment[i]
 		}
 
-		// Segment's full at start LSN = prior segment's EndPosition
-		// (contiguous) unless gapBetweenBoundaries is set.
-		startLSN := prevEndLSN
-		if i > 0 && opts.gapBetweenBoundaries {
-			startLSN = prevEndLSN + 50 // strict-greater → gap shape
+		// Segment's full anchor + incremental-coverage start. Default:
+		// both at the prior segment's EndPosition (contiguous, no
+		// overlap). gapBetweenBoundaries advances BOTH past P_N (an
+		// uncompactable gap — the (P_N, S] window lives only in the
+		// full). rotatedOverlap (ADR-0067) anchors the full at S = P_N+50
+		// but KEEPS the incrementals starting at P_N (the overlap).
+		pN := prevEndLSN
+		fullAnchorLSN := pN
+		incrStartLSN := pN
+		switch {
+		case i > 0 && opts.gapBetweenBoundaries:
+			fullAnchorLSN, incrStartLSN = pN+50, pN+50
+		case i > 0 && opts.rotatedOverlap:
+			fullAnchorLSN, incrStartLSN = pN+50, pN
 		}
-		// Full is a snapshot at startLSN: Start == End == startLSN.
-		full := compactSeedFullManifest(t, segCreatedAt, startLSN, chainEnc)
+		// Full is a snapshot at fullAnchorLSN: Start == End == fullAnchorLSN.
+		full := compactSeedFullManifest(t, segCreatedAt, fullAnchorLSN, chainEnc)
 		segStore := newPrefixedStore(store, dir)
 		if err := writeManifestAt(context.Background(), segStore, ManifestFileName, full); err != nil {
 			t.Fatalf("seed full %d: %v", i, err)
 		}
 		// Two incrementals stepping LSN forward by 50 each.
 		incrPaths := []string{}
-		curLSN := startLSN
+		curLSN := incrStartLSN
 		for j := 1; j <= 2; j++ {
 			incrCreatedAt := segCreatedAt.Add(time.Duration(j) * 10 * time.Minute)
 			nextLSN := curLSN + 50
@@ -486,6 +530,12 @@ func seedSegmentsWithGapsOpts(t *testing.T, store ir.BackupStore, base time.Time
 			StartPosition:    full.EndPosition,
 			EndPosition:      ir.Position{Engine: "postgres", Token: lsnToken(curLSN)},
 			Codec:            codec,
+		}
+		if i > 0 && opts.rotatedOverlap {
+			// ADR-0067: incrementals kept the (P_N, S] overlap; record
+			// P_N as the earliest incremental coverage so the lineage is
+			// contiguous with the prior segment (prior.End == this).
+			segEntry.IncrementalCoverageStart = ir.Position{Engine: "postgres", Token: lsnToken(pN)}
 		}
 		// Cap every segment except the last (the lineage's open
 		// segment). For compact tests we mostly want closed segments
