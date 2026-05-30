@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased — v0.92.2 in progress]
+
+### Fixed
+
+- **`fix(pipeline): refuse loudly when a redaction rule targets a GENERATED column (Bug 109 — CRITICAL silent PII leak)`** — `--redact='<generated_column>=<strategy>'` (or YAML equivalent) silently no-op'd at apply time: the target's `GENERATED ALWAYS AS (...) STORED` / virtual column re-derives from the source columns the expression depends on, so the operator's intent to block PII propagation was silently nullified — exit 0, dst still shows the PII via the re-derivation. Same family as Bug 99 (selector unresolved silent no-op). The fix adds a third case to `preflightRedactTypes` (`internal/pipeline/redact_preflight.go`): every rule whose selector resolves to a column with non-empty `GeneratedExpr` is refused with the new `errRedactOnGeneratedColumn` sentinel naming the column, the generated expression, the dialect, and the recovery hint ("redact the source columns the expression depends on"). Found by the v0.92.0 deep bug-finding sweep #3.
+
 ## [0.92.1] - 2026-05-30
 
 ### Added
