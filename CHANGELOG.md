@@ -4,7 +4,7 @@ All notable changes to sluice are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project follows [Semantic Versioning](https://semver.org/).
 
-## [Unreleased — v0.92.1 in progress]
+## [0.92.1] - 2026-05-30
 
 ### Added
 
