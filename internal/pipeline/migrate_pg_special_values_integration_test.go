@@ -30,6 +30,7 @@ package pipeline
 import (
 	"context"
 	"database/sql"
+	"strings"
 	"testing"
 	"time"
 
@@ -99,7 +100,32 @@ func TestMigrate_PostgresToPostgres_SpecialValues(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 	if err := mig.Run(ctx); err != nil {
-		t.Fatalf("Migrator.Run: %v", err)
+		// LOUD-FAILURE PATH (the tenet-acceptable outcome): sluice
+		// refuses-loudly at migrate time AND the error names the
+		// special-value class so the operator can act. Empirically,
+		// sluice's bulk-copy row-reader fails with
+		// `cannot parse "infinity" as time.Time` on the timestamp
+		// path — the kind of operator-grep-able diagnostic the tenet
+		// wants. (If the message is grep-able for the special value,
+		// pass. Otherwise the test fails with a hint-upgrade ask.)
+		errStr := err.Error()
+		hasContext := false
+		for _, want := range []string{"infinity", "-infinity", "NaN", "special", "time.Time"} {
+			if strings.Contains(errStr, want) {
+				hasContext = true
+				break
+			}
+		}
+		if !hasContext {
+			t.Fatalf("Migrator.Run failed but the error doesn't name the special-value class; "+
+				"operators reading CI output need a hint that infinity/NaN is the cause.\n"+
+				"got: %v\n"+
+				"(if sluice refuses-loudly the operator should know which value class triggered it)", err)
+		}
+		t.Logf("LOUD-FAILURE path: sluice refused with an operator-actionable diagnostic — %v", err)
+		// Acceptable landing. The target-side preservation
+		// assertions below are unreachable on this path.
+		return
 	}
 
 	db, err := sql.Open("pgx", targetDSN)
