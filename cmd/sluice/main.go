@@ -31,7 +31,7 @@ import (
 	// Engine packages are imported for their init() side effects, which
 	// register them with the engines registry. Add a new engine by
 	// importing its package here.
-	_ "github.com/orware/sluice/internal/engines/mysql"
+	"github.com/orware/sluice/internal/engines/mysql"
 	_ "github.com/orware/sluice/internal/engines/pgtrigger"
 	_ "github.com/orware/sluice/internal/engines/postgres"
 )
@@ -71,6 +71,13 @@ func main() {
 	)
 	configureLogging(cli.LogLevel)
 	startPprofIfRequested(cli.PprofListen)
+	// v0.92.1 escape hatch: thread the operator's --mysql-sql-mode
+	// override into the mysql engine package before any engine opens
+	// a connection. Empty string means "fall through to server
+	// default" — required for migrating legacy MySQL data with
+	// zero-dates / silently-truncated values that pre-MySQL-5.7
+	// schemas commonly carry. See docs/operator/migrating-legacy-mysql.md.
+	mysql.SetSessionSQLMode(cli.MySQLSQLMode)
 	err := ctx.Run(&cli.Globals)
 	ctx.FatalIfErrorf(err)
 }

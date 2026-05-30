@@ -31,6 +31,46 @@ func init() {
 	})
 }
 
+// defaultStrictSQLMode is the v0.92.1 strict-by-default mode list
+// applied to every MySQL connection unless the operator overrides
+// it via --mysql-sql-mode (CLI) or `sql_mode` in the DSN params.
+// Closes Bugs 102/103 silent-loss class by surfacing MySQL's own
+// loud-error path instead of inheriting whatever sql_mode the
+// server defaults to (often relaxed on dev / older / managed
+// deployments).
+const defaultStrictSQLMode = "STRICT_TRANS_TABLES,NO_ZERO_DATE,NO_ZERO_IN_DATE,ERROR_FOR_DIVISION_BY_ZERO"
+
+// sessionSQLMode is the value sluice injects into every MySQL
+// connection's `SET SESSION sql_mode = '...'` post-handshake. Set
+// once at process startup by [SetSessionSQLMode] (called from
+// main.go with the operator's --mysql-sql-mode value). Default
+// value matches [defaultStrictSQLMode] so a bare `go test ./...`
+// or any path that doesn't go through main() still gets the strict
+// mode.
+//
+// Empty string is the explicit "fall through to server default"
+// path — operators with legacy MySQL data (zero-dates / silently-
+// truncated values) opt out via --mysql-sql-mode=” .
+var sessionSQLMode = defaultStrictSQLMode
+
+// SetSessionSQLMode overrides the sql_mode sluice forces on every
+// MySQL connection. main.go calls this once at startup with the
+// operator's --mysql-sql-mode CLI value. The DSN-level override
+// (`?sql_mode=...` query param in the connection string) takes
+// precedence over this value if both are set.
+//
+// Empty string disables the override — no SET SESSION sql_mode is
+// issued, so the server's own default applies. Use this when
+// migrating legacy MySQL data with zero-dates / silently-truncated
+// values that a strict mode would refuse.
+//
+// Concurrency: this is process-wide global state set once at
+// startup, before any engine opens a connection. Don't call it
+// from long-lived goroutines.
+func SetSessionSQLMode(modes string) {
+	sessionSQLMode = modes
+}
+
 // dsnShapeHint inspects a DSN that failed to parse and returns a
 // short, leading-newline-terminated hint when sluice can recognise
 // a known operator-side mistake. Returns the empty string for
@@ -155,15 +195,23 @@ func parseDSN(dsn string) (*mysql.Config, error) {
 	// PG always enforces; sluice's silent-on-MySQL was a pure
 	// connection-config oversight.
 	//
-	// Forcing the strict modes here on every sluice MySQL connection
-	// turns the silent-loss class into loud MySQL errors
-	// (1264 / 1265 / 1292) which then surface through the existing
-	// applier error path. An operator who explicitly wants the
-	// relaxed-mode behaviour can override by setting sql_mode in the
-	// DSN params; the literal-quotes pattern matches the time_zone
-	// override above.
-	if _, ok := cfg.Params["sql_mode"]; !ok {
-		cfg.Params["sql_mode"] = "'STRICT_TRANS_TABLES,NO_ZERO_DATE,NO_ZERO_IN_DATE,ERROR_FOR_DIVISION_BY_ZERO'"
+	// The injected sql_mode follows a two-tier override policy:
+	//
+	//   1. DSN-level override (`sql_mode=...` in the connection
+	//      string params) wins absolutely. An operator who needs
+	//      different modes for source vs target sets each DSN's own
+	//      sql_mode.
+	//   2. CLI-level override via --mysql-sql-mode (threaded into
+	//      [sessionSQLMode] from main.go). Empty string means "fall
+	//      through to server default" — the legacy-data escape hatch
+	//      for migrations involving zero-dates / silently-truncated
+	//      values that pre-MySQL-5.7 schemas commonly carry.
+	//
+	// If neither is set, [defaultStrictSQLMode] applies (the
+	// loud-failure-tenet default). The literal-quotes pattern matches
+	// the time_zone override above.
+	if _, ok := cfg.Params["sql_mode"]; !ok && sessionSQLMode != "" {
+		cfg.Params["sql_mode"] = "'" + sessionSQLMode + "'"
 	}
 	// Bug 106 (v0.92.1). Pre-fix the connection's default character
 	// set could fall back to 3-byte utf8 on older MySQL servers /
