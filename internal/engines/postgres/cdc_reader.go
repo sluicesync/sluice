@@ -737,9 +737,9 @@ func (r *CDCReader) dispatchWAL(
 		return r.emitDelete(ctx, relations, m.RelationID, m.OldTuple, *currentTxnLSN, out)
 
 	case *pglogrepl.TruncateMessageV2:
-		return r.emitTruncate(ctx, relations, m.RelationIDs, *currentTxnLSN, out)
+		return r.emitTruncate(ctx, relations, m.RelationIDs, m.Option, *currentTxnLSN, out)
 	case *pglogrepl.TruncateMessage:
-		return r.emitTruncate(ctx, relations, m.RelationIDs, *currentTxnLSN, out)
+		return r.emitTruncate(ctx, relations, m.RelationIDs, m.Option, *currentTxnLSN, out)
 
 	case *pglogrepl.StreamStartMessageV2:
 		*inStream = true
@@ -1137,10 +1137,18 @@ func filterBeforeToKeyCols(rel *relationCacheEntry, decoded ir.Row) (ir.Row, err
 	return before, nil
 }
 
+// emitTruncate fans the pgoutput TruncateMessage into one ir.Truncate
+// per relation. option is the pgoutput TruncateMessage.Option byte:
+// bit 0 = CASCADE, bit 1 = RESTART IDENTITY (per the PG pgoutput
+// logical-decoding protocol). Bug 98 (v0.92.0): pre-fix this byte
+// was discarded; a source-side `TRUNCATE … CASCADE` reached the
+// applier as a naked TRUNCATE and failed on FK-referenced targets
+// (SQLSTATE 0A000), crashing the stream.
 func (r *CDCReader) emitTruncate(
 	ctx context.Context,
 	relations map[uint32]*relationCacheEntry,
 	relIDs []uint32,
+	option uint8,
 	lsn pglogrepl.LSN,
 	out chan<- ir.Change,
 ) error {
@@ -1148,6 +1156,16 @@ func (r *CDCReader) emitTruncate(
 	if err != nil {
 		return err
 	}
+	// PG pgoutput TruncateMessage.Option flags (per the logical-
+	// decoding protocol §"Truncate"):
+	//   bit 0 (0x01) = CASCADE
+	//   bit 1 (0x02) = RESTART IDENTITY
+	const (
+		truncateOptCascade         = 1 << 0
+		truncateOptRestartIdentity = 1 << 1
+	)
+	cascade := option&truncateOptCascade != 0
+	restart := option&truncateOptRestartIdentity != 0
 	for _, id := range relIDs {
 		rel, ok := relations[id]
 		if !ok {
@@ -1157,9 +1175,11 @@ func (r *CDCReader) emitTruncate(
 			continue
 		}
 		if err := send(ctx, out, ir.Truncate{
-			Position: pos,
-			Schema:   rel.Schema,
-			Table:    rel.Name,
+			Position:        pos,
+			Schema:          rel.Schema,
+			Table:           rel.Name,
+			Cascade:         cascade,
+			RestartIdentity: restart,
 		}); err != nil {
 			return err
 		}

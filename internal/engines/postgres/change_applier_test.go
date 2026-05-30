@@ -142,10 +142,28 @@ func TestBuildDeleteSQL(t *testing.T) {
 }
 
 func TestBuildTruncateSQL(t *testing.T) {
-	got := buildTruncateSQL("public", "users")
-	want := `TRUNCATE TABLE "public"."users"`
-	if got != want {
-		t.Errorf("\n got: %q\nwant: %q", got, want)
+	// Bug 98 (v0.92.0) — TRUNCATE flag plumbing. Each combination of
+	// CASCADE / RESTART IDENTITY produces the correct PG clause order
+	// (RESTART IDENTITY before CASCADE per PG's grammar).
+	cases := []struct {
+		name            string
+		cascade         bool
+		restartIdentity bool
+		want            string
+	}{
+		{"plain", false, false, `TRUNCATE TABLE "public"."users"`},
+		{"cascade", true, false, `TRUNCATE TABLE "public"."users" CASCADE`},
+		{"restart_identity", false, true, `TRUNCATE TABLE "public"."users" RESTART IDENTITY`},
+		{"both", true, true, `TRUNCATE TABLE "public"."users" RESTART IDENTITY CASCADE`},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			got := buildTruncateSQL("public", "users", c.cascade, c.restartIdentity)
+			if got != c.want {
+				t.Errorf("\n got: %q\nwant: %q", got, c.want)
+			}
+		})
 	}
 }
 

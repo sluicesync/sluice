@@ -260,6 +260,49 @@ func TestRenderTeardownDDL_KeepData(t *testing.T) {
 	}
 }
 
+// TestRenderCaptureDDLFunction_OrphanedTriggerRecoveryMessage pins the
+// Bug 101 (v0.92.0) fix: the DDL event-trigger function wraps its
+// INSERT in an EXCEPTION handler so an operator who manually drops
+// sluice_change_log without running `sluice trigger teardown` sees a
+// clear recovery message naming the recovery command, instead of
+// PG's raw "relation does not exist" + function-body dump (which
+// blocks ALL DDL on the source with no operator-visible recovery
+// path).
+func TestRenderCaptureDDLFunction_OrphanedTriggerRecoveryMessage(t *testing.T) {
+	ddl := renderCaptureDDLFunction("public", `"public"."sluice_change_log"`)
+
+	// The EXCEPTION handler must be present in the function body.
+	for _, want := range []string{
+		"EXCEPTION",
+		"WHEN undefined_table THEN",
+		"RAISE EXCEPTION",
+	} {
+		if !strings.Contains(ddl, want) {
+			t.Errorf("DDL function body missing %q (Bug 101 fix not wired):\n%s", want, ddl)
+		}
+	}
+
+	// The recovery message must name BOTH the diagnostic ("partially
+	// uninstalled") and the operator-actionable commands so the
+	// operator can paste-and-run the fix.
+	for _, want := range []string{
+		"partially uninstalled",
+		"sluice trigger teardown",
+		"sluice trigger setup",
+	} {
+		if !strings.Contains(ddl, want) {
+			t.Errorf("recovery message missing %q (operator can't recover without it):\n%s", want, ddl)
+		}
+	}
+
+	// Pin the SQLSTATE so monitoring / log-grep tools can key off it.
+	// `object_not_in_prerequisite_state` (55000) is the closest match
+	// for "the engine is half-installed".
+	if !strings.Contains(ddl, "object_not_in_prerequisite_state") {
+		t.Errorf("ERRCODE should be object_not_in_prerequisite_state for monitoring keyability:\n%s", ddl)
+	}
+}
+
 // TestTableRefusal_Error formats the operator-facing error string.
 // The shape carries the schema-qualified table, the refusal reason,
 // and the actionable hint so an operator can paste the message and

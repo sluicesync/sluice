@@ -289,6 +289,33 @@ func TestOIDToType(t *testing.T) {
 		{"macaddr", pgtype.MacaddrOID, -1, ir.Macaddr{}},
 		// numeric(8,2) typmod = ((8<<16)|2) + 4 = 524294
 		{"numeric(8,2)", pgtype.NumericOID, 524294, ir.Decimal{Precision: 8, Scale: 2}},
+
+		// Bug 97 (v0.92.0) Stage 1 + Stage 2 verbatim-carry OID
+		// coverage. The schema reader's text-keyed allowlist drifted
+		// from the CDC reader's OID switch; pre-fix every entry below
+		// fell through to "unsupported column type OID N" and crashed
+		// the sync stream on first DML. Each entry's expected
+		// ir.VerbatimType.Definition is the pg_catalog typname (which
+		// is what coreVerbatimCDCOIDs maps each OID to).
+		{"tsvector", pgtype.TSVectorOID, -1, ir.VerbatimType{Definition: "tsvector"}},
+		{"tsquery", 3615, -1, ir.VerbatimType{Definition: "tsquery"}},
+		{"int4range", pgtype.Int4rangeOID, -1, ir.VerbatimType{Definition: "int4range"}},
+		{"int8range", pgtype.Int8rangeOID, -1, ir.VerbatimType{Definition: "int8range"}},
+		{"numrange", pgtype.NumrangeOID, -1, ir.VerbatimType{Definition: "numrange"}},
+		{"tsrange", pgtype.TsrangeOID, -1, ir.VerbatimType{Definition: "tsrange"}},
+		{"tstzrange", pgtype.TstzrangeOID, -1, ir.VerbatimType{Definition: "tstzrange"}},
+		{"daterange", pgtype.DaterangeOID, -1, ir.VerbatimType{Definition: "daterange"}},
+		{"int4multirange", pgtype.Int4multirangeOID, -1, ir.VerbatimType{Definition: "int4multirange"}},
+		{"int8multirange", pgtype.Int8multirangeOID, -1, ir.VerbatimType{Definition: "int8multirange"}},
+		{"nummultirange", pgtype.NummultirangeOID, -1, ir.VerbatimType{Definition: "nummultirange"}},
+		{"tsmultirange", pgtype.TsmultirangeOID, -1, ir.VerbatimType{Definition: "tsmultirange"}},
+		{"tstzmultirange", pgtype.TstzmultirangeOID, -1, ir.VerbatimType{Definition: "tstzmultirange"}},
+		{"datemultirange", pgtype.DatemultirangeOID, -1, ir.VerbatimType{Definition: "datemultirange"}},
+		{"xml", pgtype.XMLOID, -1, ir.VerbatimType{Definition: "xml"}},
+		{"money", 790, -1, ir.VerbatimType{Definition: "money"}},
+		{"pg_lsn", 3220, -1, ir.VerbatimType{Definition: "pg_lsn"}},
+		{"txid_snapshot", 2970, -1, ir.VerbatimType{Definition: "txid_snapshot"}},
+		{"pg_snapshot", 5038, -1, ir.VerbatimType{Definition: "pg_snapshot"}},
 	}
 	for _, c := range cases {
 		c := c
