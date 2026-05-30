@@ -15,6 +15,21 @@ func TestQuoteIdent(t *testing.T) {
 		{"with space", "`with space`"},
 		{"weird`name", "`weird``name`"},
 		{"", "``"},
+
+		// Multi-byte UTF-8 identifiers. Sluice's loud-failure tenet is
+		// most at-risk from SILENT identifier corruption — the worst
+		// class of bug. Bucardo's t/10-object-names.t pins these; sluice
+		// previously had no equivalent. The quote-by-byte-wrap policy
+		// passes UTF-8 through verbatim (the backtick is ASCII and isn't
+		// part of any multi-byte sequence under UTF-8), so these MUST
+		// come back byte-exact. From
+		// docs/dev/notes/test-gap-mining-broader.md (#1).
+		{"café", "`café`"},                 // Latin-1 supplement (2-byte sequences)
+		{"jeu_d'études", "`jeu_d'études`"}, // ASCII apostrophe + multi-byte (regression — apostrophe is NOT the MySQL quote char)
+		{"имя", "`имя`"},                   // Cyrillic (2-byte sequences)
+		{"用户表", "`用户表`"},                   // CJK (3-byte sequences)
+		{"日本語", "`日本語`"},                   // CJK kanji
+		{"naïve`col", "`naïve``col`"},      // Multi-byte mixed with the MySQL quote char — must STILL double the backtick per the escape rule
 	}
 	for _, c := range cases {
 		if got := quoteIdent(c.in); got != c.want {
