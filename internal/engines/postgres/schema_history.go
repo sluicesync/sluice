@@ -36,16 +36,12 @@ const schemaHistoryTableName = "sluice_cdc_schema_history"
 // and *sql.Tx. writeSchemaVersion takes this (not a concrete type) so
 // a later chunk can hand it the position-write tx without an API
 // change.
-//
-//nolint:unused // ADR-0049 Chunk A storage-only; consumers wire in B/C (see file scope fence).
 type schemaHistoryExecer interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
 }
 
 // schemaHistoryQueryer is the minimal read surface shared by *sql.DB
 // and *sql.Tx.
-//
-//nolint:unused // ADR-0049 Chunk A storage-only; consumers wire in B/C (see file scope fence).
 type schemaHistoryQueryer interface {
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
 }
@@ -130,8 +126,6 @@ func ensureSchemaHistoryTable(ctx context.Context, db *sql.DB, schema string) er
 // integration-tagged round-trip test, which the unused linter (run
 // without the integration tag) can't see — same documented pattern as
 // control_table.go's readStopRequested.
-//
-//nolint:unused // ADR-0049 Chunk A storage-only; consumers wire in B/C.
 func writeSchemaVersion(ctx context.Context, exec schemaHistoryExecer, schema, streamID, schemaName, table string, anchor ir.Position, t *ir.Table) error {
 	if t == nil {
 		return errors.New("postgres: write schema version: table is nil")
@@ -174,8 +168,6 @@ func writeSchemaVersion(ctx context.Context, exec schemaHistoryExecer, schema, s
 // applier's own engine name" — i.e. the pre-fix behaviour. That is
 // correct for same-engine streams (target == source), which are the
 // only streams that worked pre-fix.
-//
-//nolint:unused // ADR-0049 Chunk A storage-only; see writeSchemaVersion.
 func loadRetainedSchemaVersions(ctx context.Context, q schemaHistoryQueryer, schema, streamID, schemaName, table string) ([]ir.RetainedSchemaVersion, error) {
 	tableRef := quoteIdent(schema) + "." + quoteIdent(schemaHistoryTableName)
 	sel := "SELECT anchor_position, ir_schema_json, COALESCE(source_engine, '') FROM " + tableRef + " " +
@@ -222,8 +214,6 @@ func loadRetainedSchemaVersions(ctx context.Context, q schemaHistoryQueryer, sch
 // [ir.PositionOrderer]. A position below the retention floor / before
 // the first boundary surfaces as an error wrapping
 // [ir.ErrPositionInvalid] (→ ADR-0022 cold-start).
-//
-//nolint:unused // ADR-0049 Chunk A storage-only; see writeSchemaVersion.
 func resolveSchemaVersion(ctx context.Context, q schemaHistoryQueryer, orderer ir.PositionOrderer, schema, streamID, schemaName, table string, p ir.Position) (*ir.Table, error) {
 	versions, err := loadRetainedSchemaVersions(ctx, q, schema, streamID, schemaName, table)
 	if err != nil {
@@ -235,8 +225,6 @@ func resolveSchemaVersion(ctx context.Context, q schemaHistoryQueryer, orderer i
 // schemaHistoryExecQuerier is the read+write surface compactSchemaHistoryBelow
 // needs (SELECT to scan candidate rows, DELETE to drop strict-older ones).
 // Concrete *sql.DB and *sql.Tx both satisfy it.
-//
-//nolint:unused // ADR-0049 Chunk D storage-only; consumer wires in chain_prune.
 type schemaHistoryExecQuerier interface {
 	schemaHistoryExecer
 	schemaHistoryQueryer
@@ -259,8 +247,6 @@ type schemaHistoryExecQuerier interface {
 //
 // Returns the count of rows deleted (operator-facing for `sluice backup
 // prune --vv` diagnostics).
-//
-//nolint:unused // ADR-0049 Chunk D storage-only; consumer wires in chain_prune.
 func compactSchemaHistoryBelow(ctx context.Context, exec schemaHistoryExecQuerier, orderer ir.PositionOrderer, schema string, floor ir.Position) (int, error) {
 	if orderer == nil {
 		return 0, errors.New("postgres: compact schema-history: orderer is nil; ordering is a correctness primitive (loud-failure tenet)")
