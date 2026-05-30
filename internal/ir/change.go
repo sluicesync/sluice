@@ -125,10 +125,24 @@ func (e Delete) QualifiedName() string { return qualified(e.Schema, e.Table) }
 // Truncate is a whole-table truncation event. Some sources emit this as
 // a DDL-flavoured event; the IR treats it as a data-stream change so
 // appliers can react without parsing DDL.
+//
+// Cascade + RestartIdentity carry the PG pgoutput TruncateMessage
+// option flags (bit 0 = CASCADE, bit 1 = RESTART IDENTITY) through to
+// the target applier. Bug 98 (v0.92.0): pre-fix these were discarded,
+// so a source-side `TRUNCATE ... CASCADE` on a parent of an FK chain
+// landed on the target as a naked `TRUNCATE`, which fails with
+// `ERROR: cannot truncate a table referenced in a foreign key
+// constraint` (SQLSTATE 0A000) and crashes the stream. Engines that
+// don't surface CASCADE-at-truncate semantics (MySQL: TRUNCATE has no
+// FK CASCADE concept) silently ignore the flags on emit (applier WARN
+// at apply time when set); cross-engine PG → MySQL with CASCADE set
+// is the same: best-effort plain TRUNCATE, WARN logged.
 type Truncate struct {
-	Position Position
-	Schema   string
-	Table    string
+	Position        Position
+	Schema          string
+	Table           string
+	Cascade         bool
+	RestartIdentity bool
 }
 
 func (Truncate) isChange()               {}

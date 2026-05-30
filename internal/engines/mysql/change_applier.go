@@ -941,6 +941,25 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 		return nil
 
 	case ir.Truncate:
+		// Bug 98 (v0.92.0): the source's pgoutput TruncateMessage may
+		// carry CASCADE / RESTART IDENTITY option flags. MySQL TRUNCATE
+		// has no CASCADE concept (InnoDB refuses TRUNCATE on FK-
+		// referenced parents outright; there's no operator-side way to
+		// express "cascade the delete to children" via TRUNCATE) and
+		// no RESTART IDENTITY clause (TRUNCATE always resets
+		// AUTO_INCREMENT in InnoDB). Log a WARN so the operator can
+		// see the option-loss on cross-engine PG → MySQL CDC; emit
+		// the plain TRUNCATE.
+		if v.Cascade || v.RestartIdentity {
+			slog.WarnContext(
+				ctx,
+				"mysql: applier: TRUNCATE option flag(s) ignored on MySQL target — MySQL TRUNCATE has no CASCADE / RESTART IDENTITY clause",
+				slog.String("schema", v.Schema),
+				slog.String("table", v.Table),
+				slog.Bool("source_cascade", v.Cascade),
+				slog.Bool("source_restart_identity", v.RestartIdentity),
+			)
+		}
 		stmt := buildTruncateSQL(applierSchema(a.schema, v.Schema), v.Table)
 		if _, err := a.txExec(ctx, tx, stmt); err != nil {
 			return fmt.Errorf("mysql: applier: truncate %s.%s: %w", v.Schema, v.Table, err)

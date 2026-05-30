@@ -307,6 +307,47 @@ func (r *SchemaReader) extensionMemberRelations(ctx context.Context) (map[string
 	return set, rows.Err()
 }
 
+// PartitionedTables returns the names of every partitioned-parent
+// table in the schema reader's active namespace. A partitioned
+// parent is a row in `pg_partitioned_table`; its children are
+// individual heap tables that information_schema lists as ordinary
+// BASE TABLEs. The names returned here are exactly the parents.
+//
+// Used by the pipeline's [preflightPartitionedTables] (Bug 100,
+// v0.92.0) to refuse-loudly when a source schema contains
+// declaratively-partitioned tables that sluice doesn't yet support
+// correctly. Pre-fix, the parent was silently flattened to a plain
+// heap (partition key dropped, partition children gone, composite
+// PK dropped) AND the child tables were also copied as ordinary
+// heaps — leading to either data loss (children excluded) or data
+// duplication (parent + children both copied).
+//
+// Returns an empty slice on a schema with no partitioned tables; nil
+// only on a query failure.
+func (r *SchemaReader) PartitionedTables(ctx context.Context) ([]string, error) {
+	const q = `
+		SELECT c.relname
+		FROM   pg_partitioned_table pt
+		JOIN   pg_class             c ON c.oid = pt.partrelid
+		JOIN   pg_namespace         n ON n.oid = c.relnamespace
+		WHERE  n.nspname = $1
+		ORDER  BY c.relname`
+	rows, err := r.db.QueryContext(ctx, q, r.schema)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var names []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		names = append(names, name)
+	}
+	return names, rows.Err()
+}
+
 func (r *SchemaReader) readViews(ctx context.Context) ([]*ir.View, error) {
 	extMembers, err := r.extensionMemberRelations(ctx)
 	if err != nil {

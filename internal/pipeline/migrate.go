@@ -421,6 +421,16 @@ func (m *Migrator) Run(ctx context.Context) error {
 		return err
 	}
 
+	// Partition preflight (Bug 100 / v0.92.0). Refuses upfront when
+	// the source schema contains declaratively-partitioned tables,
+	// since sluice would otherwise silently flatten the parent to a
+	// plain heap (dropping the partition key + composite PK) AND
+	// re-copy the children as separate heaps. PG-only; the source-
+	// engine name gate inside the preflight excludes non-PG paths.
+	if err := preflightPartitionedTables(ctx, sr, m.Source.Name(), schema); err != nil {
+		return err
+	}
+
 	// ---- 1.5. Apply per-column type-mapping overrides ----
 	schema, err = translate.ApplyMappings(schema, m.Mappings)
 	if err != nil {

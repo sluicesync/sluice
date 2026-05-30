@@ -1125,7 +1125,7 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 
 	case ir.Truncate:
 		schema := applierSchema(a.schema, v.Schema)
-		stmt := buildTruncateSQL(schema, v.Table)
+		stmt := buildTruncateSQL(schema, v.Table, v.Cascade, v.RestartIdentity)
 		if _, err := a.txExec(ctx, tx, stmt); err != nil {
 			// Truncate of a missing table fails with "relation does
 			// not exist"; treat as a benign skip-with-warning so the
@@ -1640,9 +1640,19 @@ func buildDeleteSQL(schema, table string, before ir.Row, colTypes map[string]ir.
 	return "DELETE FROM " + tableRef + " WHERE " + whereSQL, whereArgs, nil
 }
 
-// buildTruncateSQL builds a TRUNCATE TABLE statement.
-func buildTruncateSQL(schema, table string) string {
-	return "TRUNCATE TABLE " + quoteIdent(schema) + "." + quoteIdent(table)
+// buildTruncateSQL builds a TRUNCATE TABLE statement, appending the
+// CASCADE / RESTART IDENTITY clauses when the source's pgoutput
+// TruncateMessage carried those option flags (Bug 98 / v0.92.0).
+// CASCADE must come before RESTART IDENTITY per PG's grammar.
+func buildTruncateSQL(schema, table string, cascade, restartIdentity bool) string {
+	stmt := "TRUNCATE TABLE " + quoteIdent(schema) + "." + quoteIdent(table)
+	if restartIdentity {
+		stmt += " RESTART IDENTITY"
+	}
+	if cascade {
+		stmt += " CASCADE"
+	}
+	return stmt
 }
 
 // buildSetClause renders "col1 = $N, col2 = $N+1" for an UPDATE SET.

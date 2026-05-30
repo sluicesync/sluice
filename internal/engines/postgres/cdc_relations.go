@@ -199,7 +199,71 @@ func oidToType(oid uint32, typmod int32) (ir.Type, error) {
 	case pgtype.MacaddrOID, pgtype.Macaddr8OID:
 		return ir.Macaddr{}, nil
 	}
+	// Bug 97 (v0.92.0): verbatim-carry families landed in the schema
+	// reader via [coreVerbatimEligibleTypes] (ADR-0051 Stage 1, then
+	// ADR-0070 Stage 2) — but the schema reader uses a text-keyed map
+	// while the CDC reader sees pgoutput OIDs. The two registries
+	// drifted: a same-engine PG→PG migrate worked because schema
+	// translation hit the eligible map; the first DML on the same
+	// schema crashed the sync stream because oidToType fell through
+	// to the unsupported-type refusal. The OID-based lookup below
+	// reconciles the two for every verbatim family. Cross-engine
+	// safety is preserved by the orchestrator's `ir.VerbatimType`
+	// refusal in cross_engine_supportable.go.
+	if name, ok := coreVerbatimCDCOIDs[oid]; ok {
+		return ir.VerbatimType{Definition: name}, nil
+	}
 	return nil, fmt.Errorf("postgres: cdc: unsupported column type OID %d (typmod %d)", oid, typmod)
+}
+
+// coreVerbatimCDCOIDs is the CDC-side mirror of the schema reader's
+// `coreVerbatimEligibleTypes` allowlist (defined in types.go). The two
+// registries MUST stay in sync — a type that's eligible at schema-read
+// but missing here crashes the sync stream on the first DML; a type
+// that's here but not eligible at schema-read would silently translate
+// CDC events for a column type the migration refused.
+//
+// Manual synchronization is the v0.92.0 hotfix shape; a unified
+// registry that both files consume is the structural follow-up
+// (deferred per the bug-finding sweep's recommendation).
+//
+// Definition string is the pg_catalog `typname` (matches what
+// `format_type` would emit for the same OID at typmod=-1). For Stage
+// 2 types this is sufficient since none of the five carry meaningful
+// typmod data (xml/money/pg_lsn/txid_snapshot/pg_snapshot are all
+// fixed-shape). For Stage 1 (tsvector/tsquery/range/multirange) the
+// same holds — none take parameters.
+var coreVerbatimCDCOIDs = map[uint32]string{
+	// Stage 1 FTS family (ADR-0051 — tsvector/tsquery; pgtype has
+	// TSVectorOID but not TsqueryOID, hence the literal for the
+	// latter).
+	pgtype.TSVectorOID: "tsvector",
+	3615:               "tsquery",
+
+	// Stage 1 range family (ADR-0051).
+	pgtype.Int4rangeOID: "int4range",
+	pgtype.Int8rangeOID: "int8range",
+	pgtype.NumrangeOID:  "numrange",
+	pgtype.TsrangeOID:   "tsrange",
+	pgtype.TstzrangeOID: "tstzrange",
+	pgtype.DaterangeOID: "daterange",
+
+	// Stage 1 multirange family (PG 14+, ADR-0051).
+	pgtype.Int4multirangeOID: "int4multirange",
+	pgtype.Int8multirangeOID: "int8multirange",
+	pgtype.NummultirangeOID:  "nummultirange",
+	pgtype.TsmultirangeOID:   "tsmultirange",
+	pgtype.TstzmultirangeOID: "tstzmultirange",
+	pgtype.DatemultirangeOID: "datemultirange",
+
+	// Stage 2 (ADR-0070). pgtype exposes XMLOID; the others are
+	// hardcoded literals because pgtype doesn't expose a constant
+	// for them. OIDs are stable per PG catalog conventions.
+	pgtype.XMLOID: "xml",
+	790:           "money",
+	3220:          "pg_lsn",
+	2970:          "txid_snapshot",
+	5038:          "pg_snapshot",
 }
 
 // charTypmod extracts the declared length N from a typmod value

@@ -637,6 +637,15 @@ $sluice$;`
 // event trigger emits a marker row with op='X' for every recognised
 // DDL command tag; the polling reader translates these into a
 // refuse-loudly error with the drained-model recovery hint.
+//
+// Bug 101 (v0.92.0): the function wraps the INSERT in an EXCEPTION
+// handler for `undefined_table` so an operator who manually dropped
+// `sluice_change_log` without running `sluice trigger teardown` sees
+// a clear recovery message instead of PG's default "relation does
+// not exist" / function-body dump. Pre-fix, every subsequent DDL on
+// the source was blocked with the raw PG error, leaving the operator
+// to grep for the right recovery command — that's a catastrophic
+// blast-radius for what should be a five-second operator fix.
 func renderCaptureDDLFunction(schema, changeLogTableRef string) string {
 	return `CREATE OR REPLACE FUNCTION ` + ddlFnRef(schema) + `()
 RETURNS event_trigger
@@ -650,16 +659,28 @@ BEGIN
         IF r.object_identity IS NULL THEN
             CONTINUE;
         END IF;
-        INSERT INTO ` + changeLogTableRef + `
-            (txid, schema_name, table_name, op, pk_jsonb, before_jsonb, after_jsonb)
-        VALUES
-            (pg_current_xact_id()::text::bigint,
-             COALESCE(r.schema_name, 'public'),
-             COALESCE(r.object_identity, 'unknown'),
-             'X',
-             jsonb_build_object('command_tag', r.command_tag, 'object_type', r.object_type),
-             NULL,
-             NULL);
+        BEGIN
+            INSERT INTO ` + changeLogTableRef + `
+                (txid, schema_name, table_name, op, pk_jsonb, before_jsonb, after_jsonb)
+            VALUES
+                (pg_current_xact_id()::text::bigint,
+                 COALESCE(r.schema_name, 'public'),
+                 COALESCE(r.object_identity, 'unknown'),
+                 'X',
+                 jsonb_build_object('command_tag', r.command_tag, 'object_type', r.object_type),
+                 NULL,
+                 NULL);
+        EXCEPTION
+            WHEN undefined_table THEN
+                -- Bug 101 (v0.92.0): the change-log table was dropped
+                -- without running ` + "`sluice trigger teardown`" + `, leaving this
+                -- event trigger orphaned. Block the DDL with a clear
+                -- recovery message instead of PG's raw error dump.
+                RAISE EXCEPTION USING
+                    ERRCODE = 'object_not_in_prerequisite_state',
+                    MESSAGE = 'sluice trigger engine is partially uninstalled (` + changeLogTableRef + ` missing); DDL blocked by orphaned event trigger',
+                    HINT    = 'To fully remove the sluice trigger engine, run: sluice trigger teardown --dsn=<source-dsn> --yes. To restore CDC capture, re-run: sluice trigger setup --dsn=<source-dsn> --tables=<...>.';
+        END;
     END LOOP;
 END
 $sluice$;`

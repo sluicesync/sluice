@@ -2292,6 +2292,13 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 		closeIf(sr)
 		return nil, stop, err
 	}
+	// Partition preflight (Bug 100 / v0.92.0). Same shape as the
+	// migrate preflight — refuses upfront when the source schema
+	// contains declaratively-partitioned tables.
+	if err := preflightPartitionedTables(ctx, sr, s.Source.Name(), schema); err != nil {
+		closeIf(sr)
+		return nil, stop, err
+	}
 	closeIf(sr)
 
 	// ---- Scope the source-side publication to the filtered table
