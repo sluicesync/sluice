@@ -1,5 +1,21 @@
 # Path D Phase A — runbook + status
 
+> **HISTORICAL (ADR-0036 closed v0.32.0):** Phase A's diagnostic
+> instrumentation surfaced the applier-side drop (`internal/engines/
+> postgres/change_applier.go::dispatch` returning nil when
+> `colTypesFor` hit `errUnknownTable` because the target table didn't
+> exist yet). The Phase B fix shipped in v0.32.0; the strict zero-loss
+> contract is now CI-locked. This doc is kept for the discovery
+> narrative + the "How to run" recipe.
+>
+> **Validation host:** the "Vultr box" recipe below has been
+> SUPERSEDED — the Vultr instance was retired 2026-05-19. The local
+> Hyper-V VM (`scripts/hyperv-runner/New-ValidationVM.ps1`) is the
+> current validation target; see `release-validation-on-vultr.md`'s
+> host-migration banner for the up-to-date provisioning flow. The
+> `ssh root@<previous-vultr-IP>` commands here will not work; adapt
+> them to whatever runner host you're using.
+
 ADR-0036 Phase A status note. Read this with `docs/adr/adr-0036-mid-stream-loss-surface-characterization.md` open.
 
 ## What's on this branch
