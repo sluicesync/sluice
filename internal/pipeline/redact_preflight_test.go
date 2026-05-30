@@ -291,6 +291,64 @@ func TestPreflightRedactTypes(t *testing.T) {
 		}
 	})
 
+	// Bug 109 / v0.92.2 — redact rule on a GENERATED column silently
+	// no-ops (the target's generated column re-derives from unredacted
+	// source columns; PII leaks via re-derivation). The new preflight
+	// surfaces this as a loud refusal naming the dependency-tracing
+	// workflow as recovery.
+	t.Run("redact on GENERATED column refuses loudly (Bug 109 canonical repro)", func(t *testing.T) {
+		r := redact.New()
+		r.Set("", "users", "email_lower", redact.Hash{Algo: "sha256"})
+		schema := &ir.Schema{Tables: []*ir.Table{
+			{
+				Name: "users",
+				Columns: []*ir.Column{
+					{Name: "id", Type: ir.Integer{Width: 64}},
+					{Name: "email", Type: ir.Text{}},
+					{
+						Name:                 "email_lower",
+						Type:                 ir.Text{},
+						GeneratedExpr:        "lower(email)",
+						GeneratedExprDialect: "postgres",
+					},
+				},
+				PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "id"}}},
+			},
+		}}
+		err := preflightRedactTypes(r, schema)
+		if err == nil {
+			t.Fatal("got nil; want loud refusal — Bug 109: rule on GENERATED column silently no-ops → PII leak via re-derivation")
+		}
+		if !errors.Is(err, errRedactOnGeneratedColumn) {
+			t.Errorf("want errRedactOnGeneratedColumn sentinel; got: %v", err)
+		}
+		msg := err.Error()
+		for _, want := range []string{"users.email_lower", "lower(email)", "GENERATED", "redact those source columns instead"} {
+			if !strings.Contains(msg, want) {
+				t.Errorf("refusal should mention %q; got: %v", want, err)
+				break
+			}
+		}
+	})
+
+	t.Run("redact on non-GENERATED column passes (Bug 109 control)", func(t *testing.T) {
+		r := redact.New()
+		r.Set("", "users", "email", redact.Hash{Algo: "sha256"})
+		schema := &ir.Schema{Tables: []*ir.Table{
+			{
+				Name: "users",
+				Columns: []*ir.Column{
+					{Name: "id", Type: ir.Integer{Width: 64}},
+					{Name: "email", Type: ir.Text{}}, // plain column, not GENERATED
+				},
+				PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "id"}}},
+			},
+		}}
+		if err := preflightRedactTypes(r, schema); err != nil {
+			t.Errorf("plain column should pass; got: %v", err)
+		}
+	})
+
 	// Bug 105 / v0.92.1 — randomize:int range-vs-column-width pins.
 	// Pre-fix, an out-of-range Min/Max silently clamped to the column's
 	// MAX at apply time (defeating randomization → PII compliance
