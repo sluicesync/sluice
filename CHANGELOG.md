@@ -4,6 +4,16 @@ All notable changes to sluice are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project follows [Semantic Versioning](https://semver.org/).
 
+## [0.91.1] - 2026-05-30
+
+### Fixed
+
+- **`fix(pipeline): refuse loudly when a redaction rule's selector doesn't resolve (Bug 99 — CRITICAL silent-PII-loss)`** — `sluice migrate` / `sluice sync start` with a typo'd `--redact='TABLE.COLUMN=STRATEGY'` selector (e.g. `users.emial` instead of `users.email`) silently no-op'd the rule, leaving plaintext PII to land at the destination. The pre-existing per-strategy preflight checks (`mask:uuid` type compatibility, `randomize:*` PK requirement, `hash:hmac-sha256` / `tokenize:dict` keyset presence) all `continue`d on a missed schema lookup; strategies with no per-strategy guard (most notably `hash:sha256`, `static`, `truncate`, `null`) hit no check at all, so a typo on those strategies passed preflight silently and applied to no rows at the apply step. The fix adds a selector-resolution check at the top of `preflightRedactTypes` (`internal/pipeline/redact_preflight.go`): every rule's `(Table, Column)` must resolve to a real column in the post-mappings schema; a rule that doesn't is refused with the new `errRedactSelectorUnresolved` sentinel ("redaction rule's TABLE.COLUMN selector does not resolve to any column in the source schema (typo class — would silently leak PII)") naming the unresolved selector. Found by the v0.91.0 deep bug-finding sweep (sluice-testing/BUG-CATALOG.md Bug 99). **Behavior change:** an existing pipeline with a typo'd rule that previously "worked" by silently doing nothing will now refuse loudly at startup. This is correct: a rule that applies to nothing is not a no-op, it's a silent compliance failure — operators discovering the refusal should fix the typo (or remove the dead rule). Two existing unit-test pins that asserted the silent-skip-as-feature behavior were inverted to assert the new loud refusal (the pre-fix pins were pinning the bug). Three new pins document the load-bearing cases: selector-unresolved on `mask:uuid`, on `randomize:*`, and on `hash:sha256` (the canonical Bug 99 repro: the strategy with no per-strategy guard).
+
+### Compatibility
+
+- **Patch bump (v0.91.1) — hotfix.** Drop-in from v0.91.0 except for the one documented behavior change above: typo'd redaction rules now refuse loudly at preflight instead of silently leaking. Operators with a redact rule that doesn't match anything in their schema will see the refusal at the next `migrate` / `sync start`; the actionable fix is to correct the selector or remove the dead rule. No config / schema / IR / lineage-format changes.
+
 ## [0.91.0] - 2026-05-30
 
 ### Added

@@ -69,14 +69,59 @@ func TestPreflightRedactTypes(t *testing.T) {
 		}
 	})
 
-	t.Run("mask:uuid on missing column is silent", func(t *testing.T) {
-		// Column filter pruned the table; rule registered but the
-		// column isn't in scope. Don't refuse; the operator may have
-		// intentionally narrowed the migration.
+	t.Run("selector-unresolved table refuses loudly (Bug 99 / v0.91.1)", func(t *testing.T) {
+		// Bug 99 (v0.91.1): a rule whose Table.Column doesn't resolve
+		// to any column in the source schema is a typo-class silent
+		// PII-leak hazard, NOT a "narrowed migration" no-op. The
+		// pre-fix behaviour (silent skip on missing table) is the
+		// exact failure mode the Bug-99 hotfix closes. Refuse loudly
+		// at preflight so the operator's compliance posture is
+		// visible at startup, not after PII has already moved.
 		r := redact.New()
 		r.Set("", "other_table", "id", redact.MaskUUID{})
-		if err := preflightRedactTypes(r, schemaWith("users", uuidCol)); err != nil {
-			t.Errorf("got %v; want nil (column not in scope)", err)
+		err := preflightRedactTypes(r, schemaWith("users", uuidCol))
+		if err == nil {
+			t.Fatal("got nil; want loud refusal — selector-unresolved silent skip = silent PII leak (Bug 99)")
+		}
+		if !errors.Is(err, errRedactSelectorUnresolved) {
+			t.Errorf("want errRedactSelectorUnresolved sentinel; got: %v", err)
+		}
+		msg := err.Error()
+		for _, want := range []string{"other_table.id", "typo"} {
+			if !strings.Contains(msg, want) {
+				t.Errorf("err should name the unresolved selector + hint typo class; got: %v", err)
+				break
+			}
+		}
+	})
+
+	t.Run("typo'd column on hash:sha256 refuses loudly (Bug 99 / v0.91.1 canonical repro)", func(t *testing.T) {
+		// Bug 99's CRITICAL silent-PII-loss repro: hash:sha256 has no
+		// per-strategy preflight (no UUID check, no PK check, no
+		// keyset check), so a typo'd column with this strategy hit
+		// none of the existing guards — it silently passed preflight
+		// and silently no-op'd at apply time. The selector-resolution
+		// check is the load-bearing rejection that closes the leak
+		// for strategies with no other type-level guard.
+		r := redact.New()
+		r.Set("", "users", "emial", redact.Hash{Algo: "sha256"}) // typo: "emial"
+		schema := &ir.Schema{
+			Tables: []*ir.Table{
+				{Name: "users", Columns: []*ir.Column{
+					{Name: "id", Type: ir.UUID{}},
+					{Name: "email", Type: ir.Text{}}, // the real column name
+				}},
+			},
+		}
+		err := preflightRedactTypes(r, schema)
+		if err == nil {
+			t.Fatal("got nil; want loud refusal — Bug 99: hash:sha256 typo silently no-ops → cleartext PII leak")
+		}
+		if !errors.Is(err, errRedactSelectorUnresolved) {
+			t.Errorf("want errRedactSelectorUnresolved sentinel; got: %v", err)
+		}
+		if !strings.Contains(err.Error(), "users.emial") {
+			t.Errorf("err should name the typo'd selector users.emial; got: %v", err)
 		}
 	})
 
@@ -169,13 +214,24 @@ func TestPreflightRedactTypes(t *testing.T) {
 		}
 	})
 
-	t.Run("randomize:* on table not in scope is silent", func(t *testing.T) {
-		// Operator's filter pruned the table; nothing to check.
+	t.Run("randomize:* on selector-unresolved table refuses loudly (Bug 99 / v0.91.1)", func(t *testing.T) {
+		// Bug 99 (v0.91.1): same shape as the mask:uuid case above —
+		// the selector-resolution check now fires before the
+		// per-strategy randomize-no-PK check, so a randomize:* rule
+		// against a typo'd table name refuses loudly with the
+		// selector-unresolved sentinel (not the no-PK one).
 		r := redact.New()
 		r.Set("", "missing", "id", redact.RandomizeUUID{})
 		schema := &ir.Schema{Tables: []*ir.Table{{Name: "users"}}}
-		if err := preflightRedactTypes(r, schema); err != nil {
-			t.Errorf("got %v; want nil (table out of scope)", err)
+		err := preflightRedactTypes(r, schema)
+		if err == nil {
+			t.Fatal("got nil; want loud refusal — selector-unresolved silent skip = silent PII leak (Bug 99)")
+		}
+		if !errors.Is(err, errRedactSelectorUnresolved) {
+			t.Errorf("want errRedactSelectorUnresolved sentinel; got: %v", err)
+		}
+		if !strings.Contains(err.Error(), "missing.id") {
+			t.Errorf("err should name the unresolved selector; got: %v", err)
 		}
 	})
 

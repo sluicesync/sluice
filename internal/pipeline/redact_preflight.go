@@ -56,6 +56,17 @@ var errRedactRandomizeNoPK = errors.New("pipeline: randomize:* strategy requires
 // data path.
 var errRedactKeysetMissing = errors.New("pipeline: hash:hmac-sha256 / tokenize:dict rule requires --keyset-source")
 
+// errRedactSelectorUnresolved is the sentinel for the Bug 99 silent-
+// PII-loss refusal: a `--redact='TABLE.COLUMN=STRATEGY'` rule whose
+// (Table, Column) doesn't resolve to a real column in the source
+// schema. Pre-fix, the existing per-strategy checks silently `continue`
+// on a missed lookup — a typo in the table or column name → the rule
+// applies to nothing → plaintext PII lands at the destination. This
+// is the silent-loss class the loud-failure tenet exists to catch.
+// The fix is to validate selector resolution for every rule before
+// the per-strategy type/PK/keyset checks run.
+var errRedactSelectorUnresolved = errors.New("pipeline: redaction rule's TABLE.COLUMN selector does not resolve to any column in the source schema (typo class — would silently leak PII)")
+
 // preflightRedactTypes inspects every redaction rule in the
 // registry against the (post-mappings) schema, refusing
 // combinations whose strategy output won't satisfy the target
@@ -71,6 +82,14 @@ var errRedactKeysetMissing = errors.New("pipeline: hash:hmac-sha256 / tokenize:d
 //
 // Checks:
 //
+//   - **Selector resolution (Bug 99 / v0.91.1).** Every rule's
+//     (Table, Column) must resolve to a real column in the post-
+//     mappings schema. A rule whose selector resolves to nothing
+//     applies to nothing → silent PII leak. Refuses BEFORE the per-
+//     strategy checks below so a typo'd `--redact` is caught even
+//     when none of the type / PK / keyset checks would fire (e.g.,
+//     `static` or `hash:sha256` strategies that have no preflight
+//     of their own).
 //   - `mask:uuid` on a column whose (post-mappings) type is still
 //     [ir.UUID]. Refuses with a clear message naming the column
 //     and pointing at the `--type-override=table.col=text`
@@ -92,16 +111,39 @@ func preflightRedactTypes(reg *redact.Registry, schema *ir.Schema) error {
 	var typeProblems []string
 	var randomizeProblems []string
 	var keysetProblems []string
+	var selectorProblems []string
 	for _, rule := range reg.Rules() {
 		name := rule.Strategy.Name()
+		qualified := rule.Column
+		if rule.Table != "" {
+			qualified = rule.Table + "." + rule.Column
+		}
+		if rule.Schema != "" {
+			qualified = rule.Schema + "." + qualified
+		}
+		// Selector resolution check (Bug 99 / v0.91.1). Rules whose
+		// (Table, Column) doesn't resolve are typo-class
+		// misconfigurations that would silently leak PII; refuse loudly
+		// before the per-strategy checks run. The check is gated on
+		// rule.Table being non-empty — a future "redact every column
+		// named X" wildcard rule (no Table) is not in v1's scope and
+		// not handled here.
+		if rule.Table != "" {
+			if findSchemaColumn(schema, rule.Table, rule.Column) == nil {
+				selectorProblems = append(selectorProblems, fmt.Sprintf(
+					"  - %s: rule's selector does not match any column in the source schema. "+
+						"Check the table and column names against `sluice schema preview --source-driver=...`; "+
+						"this almost always means a typo. If the rule was intentionally targeted at a "+
+						"table excluded via --exclude-table, remove the rule (a rule that applies to nothing "+
+						"is a silent PII-leak hazard, not a no-op). Strategy: %s.",
+					qualified, name,
+				))
+				// Skip the per-strategy checks below — a rule that doesn't
+				// resolve has nothing meaningful to validate against.
+				continue
+			}
+		}
 		if redact.StrategyNeedsKeyButMissing(rule.Strategy) {
-			qualified := rule.Column
-			if rule.Table != "" {
-				qualified = rule.Table + "." + rule.Column
-			}
-			if rule.Schema != "" {
-				qualified = rule.Schema + "." + qualified
-			}
 			keysetProblems = append(keysetProblems, fmt.Sprintf(
 				"  - %s: strategy %s requires --keyset-source; the built-in v0.61.0 key was removed in PII Phase 4 (ADR-0041). Supply --keyset-source=file:<path>|env:<var>|db:<dsn> and reference a key via the rule's 'key:' option (or rely on the keyset default / sole entry).",
 				qualified, name,
@@ -116,13 +158,6 @@ func preflightRedactTypes(reg *redact.Registry, schema *ir.Schema) error {
 			if _, isUUID := col.Type.(ir.UUID); !isUUID {
 				continue
 			}
-			qualified := rule.Column
-			if rule.Table != "" {
-				qualified = rule.Table + "." + rule.Column
-			}
-			if rule.Schema != "" {
-				qualified = rule.Schema + "." + qualified
-			}
 			typeProblems = append(typeProblems, fmt.Sprintf(
 				"  - %s: mask:uuid output contains 'X' characters which are not valid hex; the target's UUID column type will refuse them mid-bulk-copy. Either switch to a different strategy (hash:sha256 / truncate:N) or override the target column type via --type-override=%s.%s=text (the latter re-types the destination column so the masked string lands cleanly).",
 				qualified, rule.Table, rule.Column,
@@ -135,40 +170,40 @@ func preflightRedactTypes(reg *redact.Registry, schema *ir.Schema) error {
 			if table.PrimaryKey != nil && len(table.PrimaryKey.Columns) > 0 {
 				continue
 			}
-			qualified := rule.Column
-			if rule.Table != "" {
-				qualified = rule.Table + "." + rule.Column
-			}
-			if rule.Schema != "" {
-				qualified = rule.Schema + "." + qualified
-			}
 			randomizeProblems = append(randomizeProblems, fmt.Sprintf(
 				"  - %s: strategy %s requires a primary key on the source table (replay-stable randomization derives its seed from PK values; without a PK each row would draw an unrelated random value on every run, breaking idempotency). Either add a PRIMARY KEY to %s on the source, or pick a non-random strategy (hash:sha256, mask:*, static:) for this column.",
 				qualified, name, rule.Table,
 			))
 		}
 	}
-	if len(typeProblems) == 0 && len(randomizeProblems) == 0 && len(keysetProblems) == 0 {
+	if len(typeProblems) == 0 && len(randomizeProblems) == 0 && len(keysetProblems) == 0 && len(selectorProblems) == 0 {
 		return nil
 	}
-	// Keyset-missing is the most fundamental misconfiguration (no key
-	// material at all); surface it first and on its own when it's the
-	// only failure so the operator gets the single actionable fix.
-	if len(keysetProblems) > 0 && len(typeProblems) == 0 && len(randomizeProblems) == 0 {
+	// Selector-unresolved is the most fundamental misconfiguration —
+	// the rule can't possibly do anything; surface it first and on
+	// its own when it's the only failure so the operator gets the
+	// single actionable fix (typo correction).
+	if len(selectorProblems) > 0 && len(typeProblems) == 0 && len(randomizeProblems) == 0 && len(keysetProblems) == 0 {
+		return fmt.Errorf("%w (Bug 99 / v0.91.1 preflight):\n%s", errRedactSelectorUnresolved, strings.Join(selectorProblems, "\n"))
+	}
+	// Keyset-missing is the next most fundamental (no key material at
+	// all); surface it second.
+	if len(keysetProblems) > 0 && len(typeProblems) == 0 && len(randomizeProblems) == 0 && len(selectorProblems) == 0 {
 		return fmt.Errorf("%w (PII Phase 4 / ADR-0041 preflight):\n%s", errRedactKeysetMissing, strings.Join(keysetProblems, "\n"))
 	}
-	if len(typeProblems) > 0 && len(randomizeProblems) == 0 && len(keysetProblems) == 0 {
+	if len(typeProblems) > 0 && len(randomizeProblems) == 0 && len(keysetProblems) == 0 && len(selectorProblems) == 0 {
 		return fmt.Errorf("%w (Bug 60 / v0.58.1 preflight):\n%s", errRedactTypeMismatch, strings.Join(typeProblems, "\n"))
 	}
-	if len(randomizeProblems) > 0 && len(typeProblems) == 0 && len(keysetProblems) == 0 {
+	if len(randomizeProblems) > 0 && len(typeProblems) == 0 && len(keysetProblems) == 0 && len(selectorProblems) == 0 {
 		return fmt.Errorf("%w (PII Phase 2.c / v0.59.0 preflight):\n%s", errRedactRandomizeNoPK, strings.Join(randomizeProblems, "\n"))
 	}
 	// Multiple categories non-empty: surface all with a combined
 	// header so the operator sees the full picture in one run.
-	combined := append([]string{}, keysetProblems...)
+	combined := append([]string{}, selectorProblems...)
+	combined = append(combined, keysetProblems...)
 	combined = append(combined, typeProblems...)
 	combined = append(combined, randomizeProblems...)
-	return fmt.Errorf("%w / %w / %w (combined preflight):\n%s", errRedactKeysetMissing, errRedactTypeMismatch, errRedactRandomizeNoPK, strings.Join(combined, "\n"))
+	return fmt.Errorf("%w / %w / %w / %w (combined preflight):\n%s", errRedactSelectorUnresolved, errRedactKeysetMissing, errRedactTypeMismatch, errRedactRandomizeNoPK, strings.Join(combined, "\n"))
 }
 
 // findSchemaTable returns the *ir.Table for name, or nil if not
