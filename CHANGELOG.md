@@ -4,6 +4,18 @@ All notable changes to sluice are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased — v0.92.1 in progress]
+
+### Added
+
+- **`feat(mysql): force strict sql_mode + utf8mb4 collation on every connection (Bug 102 + Bug 103 + Bug 106 closure)`** — sluice previously inherited the MySQL server's `sql_mode` and connection collation, which on dev / older / managed deployments allowed three CRITICAL silent-loss classes: PG NUMERIC overflow → silent clamp on MySQL target (Bug 102), PG TIMESTAMPTZ out-of-range → silent `'0000-00-00 00:00:00'` (Bug 103), and MySQL ENUM labels containing 4-byte UTF-8 → silent `?` substitution during MySQL → PG schema-read (Bug 106). v0.92.1 forces `sql_mode='STRICT_TRANS_TABLES,NO_ZERO_DATE,NO_ZERO_IN_DATE,ERROR_FOR_DIVISION_BY_ZERO'` and `Collation='utf8mb4_general_ci'` on every sluice MySQL connection, turning the silent-loss class into the loud MySQL error path. DSN-level `?sql_mode=...` still wins absolutely.
+- **`feat(cli): --mysql-sql-mode top-level flag (legacy-data escape hatch)`** — the strict-by-default closes the silent-loss class but would refuse legacy MySQL data (zero-dates, silently-truncated VARCHARs) that pre-MySQL-5.7 schemas commonly carry (20+ year-old WHMCS-shaped corpus is the canonical example). The new `--mysql-sql-mode` Globals flag is the escape hatch: pass `--mysql-sql-mode=''` (explicit empty) to fall through to the server's default sql_mode for migrating such data; pass a specific comma-separated mode list to force exactly those modes. See [docs/operator/migrating-legacy-mysql.md](docs/operator/migrating-legacy-mysql.md) for the full migration story.
+- **`feat(pipeline): randomize:int target-column range preflight (Bug 105 closure)`** — `--redact='COL=randomize:int:LO,HI'` whose `LO,HI` exceeded the target column's representable integer range previously had its values silently clamped to the column MAX every row at apply time, defeating PII randomization. The new preflight check compares the rule's `Min`/`Max` against the source column's `ir.Integer{Width, Unsigned}` range and refuses loudly via the new `errRedactRandomizeRangeOverflow` sentinel if out-of-range.
+
+### Fixed
+
+- **`fix(postgres): refuse VARCHAR(0)/CHAR(0) at emit with operator-actionable recovery hint (Bug 107)`** — MySQL allowed `VARCHAR(0)` as a marker column for 20+ years; PG refuses zero-length char/varchar at CREATE TABLE with `length for type varchar must be at least 1` (SQLSTATE 22023). Pre-fix sluice forwarded the VARCHAR(0) into the PG schema-apply DDL and crashed with that raw error AFTER the cold-start preamble had already run — late, ugly, recovery non-obvious. v0.92.1 catches this at sluice's PG `emitColumnType` and refuses loudly with the recovery flag named (`--type-override=TABLE.COL=text` or `--type-override=TABLE.COL=boolean`). Same fix covers `CHAR(0)`. Found by an operator question that referenced a real-world WHMCS-shaped schema.
+
 ## [0.92.0] - 2026-05-30
 
 ### Fixed
