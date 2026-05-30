@@ -95,18 +95,40 @@ func (c *TriggerSetupCmd) Run(_ *Globals) error {
 // TriggerTeardownCmd removes every trace of the trigger engine from
 // the source. Idempotent — re-running on a partially-uninstalled
 // source proceeds cleanly via DROP ... IF EXISTS.
+//
+// Destructive: drops sluice_change_log (unless --keep-data) and every
+// per-table sluice-installed trigger. Mirrors `sluice slot drop`: a
+// confirmation prompt fires by default; --yes skips it for
+// scripted/CI use.
 type TriggerTeardownCmd struct {
 	DSN      string   `help:"PG source DSN." required:"" placeholder:"DSN"`
 	Tables   []string `help:"Tables whose per-table triggers should be dropped. Empty (default) discovers every table with a sluice-installed trigger in the active schema." sep:"," placeholder:"TABLE"`
 	Schema   string   `help:"PG schema. Defaults to the DSN's 'schema' query parameter." placeholder:"NAME"`
 	KeepData bool     `help:"Retain sluice_change_log (and the meta table) for forensics. Default drops them — the engine's promise is to remove every trace from the source."`
 	DryRun   bool     `help:"Print the DDL and exit." short:"n"`
+	Yes      bool     `help:"Skip the destructive-action confirmation prompt. Mirrors 'slot drop --yes'." short:"y"`
 }
 
 // Run implements `sluice trigger teardown`.
 func (c *TriggerTeardownCmd) Run(_ *Globals) error {
 	if c.DSN == "" {
 		return errors.New("--dsn is required")
+	}
+	if !c.DryRun && !c.Yes {
+		prompt := "Tear down the sluice trigger engine on the source (drop per-table triggers"
+		if c.KeepData {
+			prompt += "; keep the change-log table)? [y/N] "
+		} else {
+			prompt += " AND the sluice_change_log table)? [y/N] "
+		}
+		ok, err := confirmDestructive(os.Stdin, os.Stdout, prompt)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			fmt.Fprintln(os.Stdout, "aborted")
+			return nil
+		}
 	}
 	ctx := kongContext()
 	plan, err := pgtrigger.Teardown(ctx, c.DSN, pgtrigger.TeardownOptions{

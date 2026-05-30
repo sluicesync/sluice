@@ -519,6 +519,8 @@ type SyncStartCmd struct {
 
 	HeartbeatInterval time.Duration `help:"Wall-clock cadence the per-stream heartbeat goroutine logs an INFO 'stream: heartbeat' line at. GitHub #23 Phase A: distinguishes silent-stall (process alive but no apply, no log) from wedge (process alive, no heartbeat either). 0 disables." default:"60s" placeholder:"DUR"`
 
+	PollInterval time.Duration `help:"Override the CDC reader's poll cadence for poll-based engines (today: postgres-trigger; default 1s). Push-based engines (postgres pgoutput, mysql binlog, planetscale VStream) silently ignore — they have no poll loop. Operators chasing lower CDC latency on a write-heavy postgres-trigger stream tighten this to e.g. 250ms; operators trading latency for source load loosen to 5s. 0 (the default) keeps the engine's built-in cadence. ADR-0066 §6; roadmap item 18(c)." placeholder:"DUR"`
+
 	SourceHeartbeatInterval    time.Duration `help:"ADR-0061 / F17 — enable the source-side heartbeat writer at this cadence. Sluice INSERTs a row into a sluice-owned table on the source every interval; the INSERT generates WAL (Postgres) / binlog (MySQL) so the CDC consumer's position advances even against an idle source, preventing slot eviction / binlog rotation past the consumer. 0 (default) disables — F17 is opt-in because the INSERT is a behaviour change on the source DB that operators on regulated systems must explicitly enable. Typical value 30s. The source-side table (default 'sluice_heartbeat') is auto-created; on roles without CREATE TABLE privilege the streamer WARNs once and continues without F17." default:"0s" placeholder:"DUR"`
 	SourceHeartbeatPruneWindow time.Duration `help:"ADR-0061 / F17 — age threshold for the periodic DELETE that bounds heartbeat-table growth. Rows older than this duration are dropped on a periodic prune pass. 0 disables prune (table grows unbounded). Only consulted when --source-heartbeat-interval > 0." default:"1h" placeholder:"DUR"`
 	SourceHeartbeatTableName   string        `help:"ADR-0061 / F17 — override the source-side heartbeat table name. Default 'sluice_heartbeat'. Operators with hostile DBA-managed namespaces can pre-create a differently-named table and point the writer at it. Only consulted when --source-heartbeat-interval > 0." default:"sluice_heartbeat" placeholder:"NAME"`
@@ -768,6 +770,7 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 		ApplyRetryBackoffCap:   s.ApplyRetryBackoffCap,
 		MetricsListen:          s.MetricsListen,
 		HeartbeatInterval:      s.HeartbeatInterval,
+		PollInterval:           s.PollInterval,
 
 		SourceHeartbeatInterval:    s.SourceHeartbeatInterval,
 		SourceHeartbeatPruneWindow: s.SourceHeartbeatPruneWindow,

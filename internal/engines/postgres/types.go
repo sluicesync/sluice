@@ -417,12 +417,14 @@ func translateType(c columnMeta) (ir.Type, error) {
 // loud-refuse via [ir.VerbatimType]'s default in
 // `cross_engine_supportable.go`).
 //
-// Stage 2 candidates (deferred per ADR-0051 §"Stage 2 candidates"):
-// xml, money, pg_lsn, txid_snapshot, pg_snapshot. Each has a known
-// text-IO / locale / dialect concern worth a per-type round-trip
-// integration test before adding to the allowlist. Do NOT add a
-// Stage 2 entry without updating ADR-0051 and pinning the per-type
-// round-trip.
+// Stage 2 (promoted 2026-05-30 in ADR-0070 after the per-type
+// round-trip pins shipped in v0.90.0): xml, money, pg_lsn,
+// txid_snapshot, pg_snapshot. Each pin asserts the three-outcome
+// shape (refuse-loudly / preserve / SILENT-TYPE-LOSS) and now hits
+// the "preserve" branch with this promotion. Cross-engine stays
+// loud-refuse via [ir.VerbatimType] in `cross_engine_supportable.go`.
+// Do NOT add a Stage 3 entry without the same evidence: per-type
+// integration pin + ADR update + cross-engine refusal verified.
 var coreVerbatimEligibleTypes = map[string]bool{
 	// FTS family (catalog Bug 17 — pre-existing tsvector/tsquery
 	// carve-out, consolidated into this allowlist by ADR-0051).
@@ -446,6 +448,14 @@ var coreVerbatimEligibleTypes = map[string]bool{
 	"tsmultirange":   true,
 	"tstzmultirange": true,
 	"datemultirange": true,
+
+	// Stage 2 (ADR-0070, promoted 2026-05-30). Per-type round-trip
+	// pins live in `internal/pipeline/migrate_pg_*_type_integration_test.go`.
+	"xml":           true,
+	"money":         true,
+	"pg_lsn":        true,
+	"txid_snapshot": true,
+	"pg_snapshot":   true,
 }
 
 // int64Ptr returns *p, or 0 if p is nil. Used to translate
