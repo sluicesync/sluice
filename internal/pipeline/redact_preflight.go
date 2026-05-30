@@ -68,6 +68,17 @@ var errRedactKeysetMissing = errors.New("pipeline: hash:hmac-sha256 / tokenize:d
 // the per-strategy type/PK/keyset checks run.
 var errRedactSelectorUnresolved = errors.New("pipeline: redaction rule's TABLE.COLUMN selector does not resolve to any column in the source schema (typo class — would silently leak PII)")
 
+// errRedactOnGeneratedColumn is the sentinel for the Bug 109 silent-
+// PII-leak refusal (v0.92.2): a rule whose selector resolves to a
+// GENERATED column (PG `GENERATED ALWAYS AS (...) STORED` or MySQL
+// `GENERATED ALWAYS AS (...)` virtual/stored). Pre-fix the redact
+// rule silently no-op'd at apply time — the target's generated
+// column re-derives from the unredacted *source* columns the
+// expression depends on, so the operator's intent to block PII
+// propagation was silently nullified. The recovery is to redact the
+// source columns the expression depends on. Same family as Bug 99.
+var errRedactOnGeneratedColumn = errors.New("pipeline: redaction rule targets a GENERATED column whose value is re-derived from other columns at target write-time — rule silently no-ops and PII leaks via re-derivation. Redact the source columns the expression depends on instead")
+
 // errRedactRandomizeRangeOverflow is the sentinel for the Bug 105
 // silent-PII-loss refusal (v0.92.1): a `randomize:int:LO,HI` rule
 // where LO or HI exceeds the target column's representable integer
@@ -125,6 +136,7 @@ func preflightRedactTypes(reg *redact.Registry, schema *ir.Schema) error {
 	var randomizeOverflowProblems []string
 	var keysetProblems []string
 	var selectorProblems []string
+	var generatedColumnProblems []string
 	for _, rule := range reg.Rules() {
 		name := rule.Strategy.Name()
 		qualified := rule.Column
@@ -142,7 +154,8 @@ func preflightRedactTypes(reg *redact.Registry, schema *ir.Schema) error {
 		// named X" wildcard rule (no Table) is not in v1's scope and
 		// not handled here.
 		if rule.Table != "" {
-			if findSchemaColumn(schema, rule.Table, rule.Column) == nil {
+			col := findSchemaColumn(schema, rule.Table, rule.Column)
+			if col == nil {
 				selectorProblems = append(selectorProblems, fmt.Sprintf(
 					"  - %s: rule's selector does not match any column in the source schema. "+
 						"Check the table and column names against `sluice schema preview --source-driver=...`; "+
@@ -153,6 +166,28 @@ func preflightRedactTypes(reg *redact.Registry, schema *ir.Schema) error {
 				))
 				// Skip the per-strategy checks below — a rule that doesn't
 				// resolve has nothing meaningful to validate against.
+				continue
+			}
+			// Bug 109 (v0.92.2) — refuse rules targeting GENERATED
+			// columns. The target's generated column re-derives from
+			// the source columns the expression depends on; the
+			// redact rule on the generated column itself silently
+			// no-ops and PII leaks via the re-derivation. The recovery
+			// hint names the dependency-tracing workflow.
+			if col.IsGenerated() {
+				generatedColumnProblems = append(generatedColumnProblems, fmt.Sprintf(
+					"  - %s: column is GENERATED (expression: %q, dialect %q). The rule would "+
+						"silently no-op at apply time — the target's generated column re-derives "+
+						"from the source columns the expression depends on, so PII would still "+
+						"appear on the target via the re-derivation. Strategy: %s. "+
+						"Recovery: trace the columns the GENERATED expression depends on, and "+
+						"redact those source columns instead. Example: if the GENERATED column "+
+						"is `lower(email)`, redact `email` (not the generated column).",
+					qualified, col.GeneratedExpr, col.GeneratedExprDialect, name,
+				))
+				// Skip the per-strategy checks below — the rule isn't
+				// going to be applied anyway, so its strategy-level
+				// constraints aren't meaningful to validate.
 				continue
 			}
 		}
@@ -219,38 +254,45 @@ func preflightRedactTypes(reg *redact.Registry, schema *ir.Schema) error {
 			}
 		}
 	}
-	if len(typeProblems) == 0 && len(randomizeProblems) == 0 && len(randomizeOverflowProblems) == 0 && len(keysetProblems) == 0 && len(selectorProblems) == 0 {
+	if len(typeProblems) == 0 && len(randomizeProblems) == 0 && len(randomizeOverflowProblems) == 0 && len(keysetProblems) == 0 && len(selectorProblems) == 0 && len(generatedColumnProblems) == 0 {
 		return nil
 	}
-	// Selector-unresolved is the most fundamental misconfiguration —
-	// the rule can't possibly do anything; surface it first and on
-	// its own when it's the only failure so the operator gets the
-	// single actionable fix (typo correction).
-	if len(selectorProblems) > 0 && len(typeProblems) == 0 && len(randomizeProblems) == 0 && len(randomizeOverflowProblems) == 0 && len(keysetProblems) == 0 {
+	onlySelector := len(selectorProblems) > 0 && len(typeProblems) == 0 && len(randomizeProblems) == 0 && len(randomizeOverflowProblems) == 0 && len(keysetProblems) == 0 && len(generatedColumnProblems) == 0
+	if onlySelector {
 		return fmt.Errorf("%w (Bug 99 / v0.91.1 preflight):\n%s", errRedactSelectorUnresolved, strings.Join(selectorProblems, "\n"))
 	}
-	// Keyset-missing is the next most fundamental (no key material at
-	// all); surface it second.
-	if len(keysetProblems) > 0 && len(typeProblems) == 0 && len(randomizeProblems) == 0 && len(randomizeOverflowProblems) == 0 && len(selectorProblems) == 0 {
+	// Generated-column refusal — also fundamental (rule would silently
+	// no-op). Surface on its own when it's the only failure so the
+	// operator sees the actionable recovery (redact source columns).
+	onlyGenerated := len(generatedColumnProblems) > 0 && len(selectorProblems) == 0 && len(typeProblems) == 0 && len(randomizeProblems) == 0 && len(randomizeOverflowProblems) == 0 && len(keysetProblems) == 0
+	if onlyGenerated {
+		return fmt.Errorf("%w (Bug 109 / v0.92.2 preflight):\n%s", errRedactOnGeneratedColumn, strings.Join(generatedColumnProblems, "\n"))
+	}
+	onlyKeyset := len(keysetProblems) > 0 && len(typeProblems) == 0 && len(randomizeProblems) == 0 && len(randomizeOverflowProblems) == 0 && len(selectorProblems) == 0 && len(generatedColumnProblems) == 0
+	if onlyKeyset {
 		return fmt.Errorf("%w (PII Phase 4 / ADR-0041 preflight):\n%s", errRedactKeysetMissing, strings.Join(keysetProblems, "\n"))
 	}
-	if len(typeProblems) > 0 && len(randomizeProblems) == 0 && len(randomizeOverflowProblems) == 0 && len(keysetProblems) == 0 && len(selectorProblems) == 0 {
+	onlyType := len(typeProblems) > 0 && len(randomizeProblems) == 0 && len(randomizeOverflowProblems) == 0 && len(keysetProblems) == 0 && len(selectorProblems) == 0 && len(generatedColumnProblems) == 0
+	if onlyType {
 		return fmt.Errorf("%w (Bug 60 / v0.58.1 preflight):\n%s", errRedactTypeMismatch, strings.Join(typeProblems, "\n"))
 	}
-	if len(randomizeProblems) > 0 && len(randomizeOverflowProblems) == 0 && len(typeProblems) == 0 && len(keysetProblems) == 0 && len(selectorProblems) == 0 {
+	onlyRandomizeNoPK := len(randomizeProblems) > 0 && len(randomizeOverflowProblems) == 0 && len(typeProblems) == 0 && len(keysetProblems) == 0 && len(selectorProblems) == 0 && len(generatedColumnProblems) == 0
+	if onlyRandomizeNoPK {
 		return fmt.Errorf("%w (PII Phase 2.c / v0.59.0 preflight):\n%s", errRedactRandomizeNoPK, strings.Join(randomizeProblems, "\n"))
 	}
-	if len(randomizeOverflowProblems) > 0 && len(randomizeProblems) == 0 && len(typeProblems) == 0 && len(keysetProblems) == 0 && len(selectorProblems) == 0 {
+	onlyRandomizeOverflow := len(randomizeOverflowProblems) > 0 && len(randomizeProblems) == 0 && len(typeProblems) == 0 && len(keysetProblems) == 0 && len(selectorProblems) == 0 && len(generatedColumnProblems) == 0
+	if onlyRandomizeOverflow {
 		return fmt.Errorf("%w (Bug 105 / v0.92.1 preflight):\n%s", errRedactRandomizeRangeOverflow, strings.Join(randomizeOverflowProblems, "\n"))
 	}
 	// Multiple categories non-empty: surface all with a combined
 	// header so the operator sees the full picture in one run.
 	combined := append([]string{}, selectorProblems...)
+	combined = append(combined, generatedColumnProblems...)
 	combined = append(combined, keysetProblems...)
 	combined = append(combined, typeProblems...)
 	combined = append(combined, randomizeProblems...)
 	combined = append(combined, randomizeOverflowProblems...)
-	return fmt.Errorf("%w / %w / %w / %w / %w (combined preflight):\n%s", errRedactSelectorUnresolved, errRedactKeysetMissing, errRedactTypeMismatch, errRedactRandomizeNoPK, errRedactRandomizeRangeOverflow, strings.Join(combined, "\n"))
+	return fmt.Errorf("%w / %w / %w / %w / %w / %w (combined preflight):\n%s", errRedactSelectorUnresolved, errRedactOnGeneratedColumn, errRedactKeysetMissing, errRedactTypeMismatch, errRedactRandomizeNoPK, errRedactRandomizeRangeOverflow, strings.Join(combined, "\n"))
 }
 
 // integerColumnRange returns the inclusive [min, max] integer range

@@ -1354,22 +1354,39 @@ func loadColumnTypes(ctx context.Context, db *sql.DB, schema, table string) (typ
 	// in 12 with GENERATED ALWAYS AS … STORED). For older PG versions
 	// it returns 'NEVER' for every column — fail-safe behaviour: the
 	// applier behaves exactly as it did pre-fix.
+	//
+	// The pg_catalog join supplies format_type for ADR-0051/-0070
+	// verbatim-carry types (money/xml/tsvector/range/multirange/
+	// pg_lsn/txid_snapshot/pg_snapshot). Pre-v0.92.2 the applier's
+	// query didn't fetch format_type and didn't set VerbatimEligible,
+	// so [translateType] hit the generic loud refusal on the first
+	// DML touching one of those types — Bug 97's applier-side gap.
+	// The schema reader and CDC reader's OID switch already carried
+	// the allowlist; v0.92.2 closes the third dispatch site.
 	const q = `
 		SELECT
-			column_name,
-			LOWER(data_type),
-			udt_name,
-			character_maximum_length,
-			numeric_precision,
-			numeric_scale,
-			datetime_precision,
-			is_identity,
-			column_default,
-			is_generated
-		FROM   information_schema.columns
-		WHERE  table_schema = $1
-		  AND  table_name   = $2
-		ORDER  BY ordinal_position`
+			c.column_name,
+			LOWER(c.data_type),
+			c.udt_name,
+			c.character_maximum_length,
+			c.numeric_precision,
+			c.numeric_scale,
+			c.datetime_precision,
+			c.is_identity,
+			c.column_default,
+			c.is_generated,
+			COALESCE(pg_catalog.format_type(a.atttypid, a.atttypmod), '')
+		FROM   information_schema.columns c
+		LEFT JOIN pg_class      cl   ON cl.relname    = c.table_name
+		                            AND cl.relnamespace = (
+		                                  SELECT oid FROM pg_namespace WHERE nspname = c.table_schema)
+		LEFT JOIN pg_attribute  a    ON a.attrelid    = cl.oid
+		                            AND a.attname     = c.column_name
+		                            AND a.attnum      > 0
+		                            AND NOT a.attisdropped
+		WHERE  c.table_schema = $1
+		  AND  c.table_name   = $2
+		ORDER  BY c.ordinal_position`
 
 	rows, err := db.QueryContext(ctx, q, schema, table)
 	if err != nil {
@@ -1387,11 +1404,13 @@ func loadColumnTypes(ctx context.Context, db *sql.DB, schema, table string) (typ
 			isIdentity                 string
 			columnDefault              sql.NullString
 			isGenerated                string
+			formatType                 string
 		)
 		if err := rows.Scan(
 			&colName, &dataType, &udtName,
 			&charMaxLen, &numPrec, &numScale, &dtPrec,
 			&isIdentity, &columnDefault, &isGenerated,
+			&formatType,
 		); err != nil {
 			return nil, nil, err
 		}
@@ -1407,6 +1426,14 @@ func loadColumnTypes(ctx context.Context, db *sql.DB, schema, table string) (typ
 			NumScale:        nullInt64ToPtr(numScale),
 			DTPrec:          nullInt64ToPtr(dtPrec),
 			IsAutoIncrement: isAutoIncrement(isIdentity, columnDefault),
+			FormatType:      formatType,
+			// VerbatimEligible=true: the applier writes to a PG target,
+			// so ADR-0051/-0070 verbatim-carry types round-trip via
+			// ir.VerbatimType. Cross-engine sources (MySQL) cannot
+			// produce these types in the first place, so this flag has
+			// no effect on cross-engine streams. (Bug 97 / v0.92.2
+			// applier-side gap closure.)
+			VerbatimEligible: true,
 		}
 		if dataType == "user-defined" || dataType == "USER-DEFINED" {
 			if values, ok := enumValues[udtName]; ok {

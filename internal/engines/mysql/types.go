@@ -6,6 +6,7 @@ package mysql
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 
 	"github.com/orware/sluice/internal/ir"
@@ -173,12 +174,14 @@ func translateType(c columnMeta) (ir.Type, error) {
 		if err != nil {
 			return nil, err
 		}
+		warnIfLikelyTruncatedEnumLabel(c.ColumnType, "enum", values)
 		return ir.Enum{Values: values}, nil
 	case "set":
 		values, err := parseEnumOrSet(c.ColumnType, "set")
 		if err != nil {
 			return nil, err
 		}
+		warnIfLikelyTruncatedEnumLabel(c.ColumnType, "set", values)
 		return ir.Set{Values: values}, nil
 
 	// ---- JSON ----
@@ -328,4 +331,32 @@ func int64Ptr(p *int64) int64 {
 		return 0
 	}
 	return *p
+}
+
+// warnIfLikelyTruncatedEnumLabel emits an INFO-level warning when an
+// ENUM/SET label looks like a MySQL-truncated 4-byte UTF-8 sequence
+// (Bug 106 / v0.92.2). MySQL's data dictionary silently substitutes
+// `?` for supplementary-plane characters at CREATE TABLE time
+// regardless of the column's charset; mysqldump reproduces the same
+// loss. There is no recovery from sluice's side — the original code
+// point is gone before sluice ever sees the column. The warning gives
+// operators visibility so they can investigate before the runtime
+// row-INSERT loud-fails ("invalid input value for enum ..." on PG).
+//
+// Heuristic (deliberately narrow to keep false positives low): warn
+// only when the column_type string contains a `?` character. A bare
+// `?` is legitimate as an ENUM label (e.g. enum('y','n','?')) but
+// rare enough that surfacing it once per column at read time is
+// acceptable, and the warning text names the recovery path so an
+// operator with a legitimate `?` label can ignore it knowingly.
+func warnIfLikelyTruncatedEnumLabel(columnType, kind string, values []string) {
+	if !strings.Contains(columnType, "?") {
+		return
+	}
+	slog.Warn(
+		"mysql: "+kind+" labels contain '?' — likely MySQL data-dictionary truncation of 4-byte UTF-8 (Bug 106)",
+		slog.String("column_type", columnType),
+		slog.Any("labels", values),
+		slog.String("hint", "MySQL's data dictionary silently truncates supplementary-plane (4-byte UTF-8) characters in ENUM/SET labels to '?' at CREATE TABLE time, regardless of CHARSET=utf8mb4. mysqldump reproduces the same loss. If this column's source rows contain non-'?' values, the target write will loud-fail at row INSERT. Recovery: widen this column to VARCHAR/TEXT via --type-override; or fix the source ENUM labels to ASCII before migration; or ignore this warning if your data legitimately uses '?' as a label."),
+	)
 }

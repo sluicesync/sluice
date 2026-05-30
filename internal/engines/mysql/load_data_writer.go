@@ -6,6 +6,7 @@ package mysql
 import (
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -95,8 +96,19 @@ func (w *RowWriter) writeLoadData(ctx context.Context, table *ir.Table, rows <-c
 		encErr <- err
 	}()
 
+	// Pin a single connection for the LOAD DATA + post-load warning
+	// check (Bugs 102/103/106 closure, v0.92.2). @@warning_count and
+	// SHOW WARNINGS are session-scoped; without connection affinity
+	// the pool can hand us a different conn for the warning probe and
+	// the refusal silently misses.
+	conn, err := w.db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("mysql: LOAD DATA: pin connection: %w", err)
+	}
+	defer func() { _ = conn.Close() }()
+
 	stmt := buildLoadDataStmt(w.schema, table.Name, cols, name)
-	_, execErr := w.db.ExecContext(ctx, stmt)
+	_, execErr := conn.ExecContext(ctx, stmt)
 
 	// Wait for the encoder so we don't leak a goroutine.
 	serErr := <-encErr
@@ -108,7 +120,86 @@ func (w *RowWriter) writeLoadData(ctx context.Context, table *ir.Table, rows <-c
 	if execErr != nil {
 		return fmt.Errorf("mysql: LOAD DATA into %q: %w", table.Name, execErr)
 	}
-	return nil
+
+	// CRITICAL (Bugs 102/103 v0.92.2 root cause): LOAD DATA LOCAL
+	// INFILE silently bypasses strict sql_mode for per-row type-
+	// conversion errors. The session's @@sql_mode is strict (we
+	// inject it in parseDSN), and a direct INSERT of an 80-digit
+	// NUMERIC into DECIMAL(65,30) correctly errors 1264 — but the
+	// same value through LOAD DATA with `(@var) SET col=@var`
+	// indirection silently clamps to MAX and bumps @@warning_count.
+	//
+	// Empirically (probed against MySQL 8.0 with strict sql_mode):
+	//   - Direct INSERT 80-digit → Error 1264, statement aborts
+	//   - LOAD DATA same value → row inserted with MAX clamp;
+	//     @@warning_count = 1; SHOW WARNINGS exposes the truncation
+	//   - Same for TIMESTAMP out-of-range / zero-date
+	//   - Explicit CAST(@var AS DECIMAL(65,30)) in SET still clamps
+	//
+	// The only reliable closure is the post-load warning probe.
+	// Surface any non-zero warning count as a loud refusal with the
+	// SHOW WARNINGS detail. Existing operators with intentionally
+	// lossy data should pass `--mysql-sql-mode=''` (the legacy-data
+	// escape hatch) — that path also disables sluice's strict
+	// session forcing, so warnings against a relaxed server fall
+	// outside this refusal.
+	return refuseOnLoadDataWarnings(ctx, conn, table.Name)
+}
+
+// refuseOnLoadDataWarnings queries @@warning_count on the pinned LOAD
+// DATA connection and, if non-zero, surfaces the SHOW WARNINGS detail
+// as a loud refusal. See the rationale comment at the writeLoadData
+// call site for why this is necessary even under strict sql_mode.
+//
+// Skipped (returns nil) when the operator opted out of sluice's
+// strict-default sql_mode injection via --mysql-sql-mode=” — in
+// that mode the operator has explicitly accepted server-side
+// behaviour, and surfaced warnings are not silent corruption per
+// sluice's tenet (the operator was warned at flag-set time via the
+// legacy-data docs).
+func refuseOnLoadDataWarnings(ctx context.Context, conn *sql.Conn, table string) error {
+	if sessionSQLMode == "" {
+		return nil
+	}
+	var count int
+	if err := conn.QueryRowContext(ctx, "SELECT @@warning_count").Scan(&count); err != nil {
+		return fmt.Errorf("mysql: LOAD DATA into %q: probe @@warning_count: %w", table, err)
+	}
+	if count == 0 {
+		return nil
+	}
+	rows, err := conn.QueryContext(ctx, "SHOW WARNINGS")
+	if err != nil {
+		return fmt.Errorf("mysql: LOAD DATA into %q: %d warnings reported; SHOW WARNINGS failed: %w",
+			table, count, err)
+	}
+	defer rows.Close()
+	var details []string
+	for rows.Next() {
+		var level, code, msg string
+		if err := rows.Scan(&level, &code, &msg); err != nil {
+			return fmt.Errorf("mysql: LOAD DATA into %q: scan warning: %w", table, err)
+		}
+		// Cap at a few warnings — gigantic loads can emit thousands
+		// and we just need enough for the operator to diagnose.
+		if len(details) < 8 {
+			details = append(details, fmt.Sprintf("%s %s: %s", level, code, msg))
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("mysql: LOAD DATA into %q: iterate warnings: %w", table, err)
+	}
+	more := ""
+	if count > 8 {
+		more = fmt.Sprintf(" (… and %d more)", count-8)
+	}
+	return fmt.Errorf("mysql: LOAD DATA into %q produced %d warning(s) under strict sql_mode — "+
+		"LOAD DATA's per-row type-conversion errors are silently downgraded to warnings (a MySQL "+
+		"behaviour quirk this refusal closes; Bugs 102/103 / v0.92.2). Examples: [%s]%s. Recovery: "+
+		"narrow the column type via --type-override, fix the source data, or pass "+
+		"--mysql-sql-mode='' to fall through to the server's default sql_mode (legacy-data escape "+
+		"hatch — see docs/operator/migrating-legacy-mysql.md)",
+		table, count, strings.Join(details, "; "), more)
 }
 
 // checkLocalInfile reports whether the server's `local_infile` system

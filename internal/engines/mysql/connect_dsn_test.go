@@ -73,6 +73,64 @@ func TestParseDSN_UnixSocketNotRerouted(t *testing.T) {
 	}
 }
 
+// TestParseDSN_InjectsStrictSQLMode pins the v0.92.1 sql_mode plumbing
+// the cycle-time validation called into question. The post-handshake
+// SET path the driver emits depends on every entry in cfg.Params,
+// including this one — if the value isn't here, no SET happens, and
+// Bugs 102/103 silently re-open.
+func TestParseDSN_InjectsStrictSQLMode(t *testing.T) {
+	cfg, err := parseDSN("user:pw@tcp(host:3306)/mydb")
+	if err != nil {
+		t.Fatalf("parseDSN: %v", err)
+	}
+	val, ok := cfg.Params["sql_mode"]
+	if !ok {
+		t.Fatal("cfg.Params[\"sql_mode\"] absent — driver won't issue SET sql_mode at handshake")
+	}
+	if !strings.Contains(val, "STRICT_TRANS_TABLES") {
+		t.Errorf("cfg.Params[\"sql_mode\"] = %q; expected to contain STRICT_TRANS_TABLES", val)
+	}
+	if !strings.HasPrefix(val, "'") || !strings.HasSuffix(val, "'") {
+		t.Errorf("cfg.Params[\"sql_mode\"] = %q; expected SQL-literal quotes for driver's verbatim `SET key = value` emission", val)
+	}
+	if cfg.Collation != "utf8mb4_general_ci" {
+		t.Errorf("cfg.Collation = %q; expected utf8mb4_general_ci so handshake collation ID supports 4-byte UTF-8", cfg.Collation)
+	}
+}
+
+// TestParseDSN_DSNSqlModeWinsOverInjected confirms an operator-supplied
+// sql_mode in the DSN takes precedence over sluice's default. The two-
+// tier override policy documented in connect.go depends on this.
+func TestParseDSN_DSNSqlModeWinsOverInjected(t *testing.T) {
+	cfg, err := parseDSN("user:pw@tcp(host:3306)/mydb?sql_mode=%27ANSI_QUOTES%27")
+	if err != nil {
+		t.Fatalf("parseDSN: %v", err)
+	}
+	val := cfg.Params["sql_mode"]
+	if !strings.Contains(val, "ANSI_QUOTES") {
+		t.Errorf("DSN-supplied sql_mode should win; got %q", val)
+	}
+	if strings.Contains(val, "STRICT_TRANS_TABLES") {
+		t.Errorf("DSN-supplied sql_mode should have replaced the default; got %q", val)
+	}
+}
+
+// TestParseDSN_SetSessionSQLModeEmptyDisablesInjection covers the
+// legacy-data escape hatch (--mysql-sql-mode=”). Empty string means
+// "don't inject anything — let the server's default apply".
+func TestParseDSN_SetSessionSQLModeEmptyDisablesInjection(t *testing.T) {
+	orig := sessionSQLMode
+	defer func() { sessionSQLMode = orig }()
+	SetSessionSQLMode("")
+	cfg, err := parseDSN("user:pw@tcp(host:3306)/mydb")
+	if err != nil {
+		t.Fatalf("parseDSN: %v", err)
+	}
+	if _, ok := cfg.Params["sql_mode"]; ok {
+		t.Errorf("--mysql-sql-mode='' should suppress sql_mode injection; got cfg.Params[\"sql_mode\"]=%q", cfg.Params["sql_mode"])
+	}
+}
+
 // TestDSNShapeHint_PlainPathNoHint confirms a well-formed DSN with
 // just `db` in the path produces no hint (we don't want false
 // positives noising every DSN parse error).

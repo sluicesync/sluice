@@ -125,6 +125,37 @@ The MySQL driver-level overrides (UTF-8 charset, `time_zone='+00:00'`,
 sluice issues post-handshake; if you want to fully control all of
 those, pass them in the DSN params and sluice respects them.
 
+## ENUM/SET labels with 4-byte UTF-8 (emoji, supplementary plane)
+
+This is a **MySQL server-side limitation, not a sluice bug**. MySQL's
+data dictionary silently substitutes `?` for supplementary-plane
+characters in ENUM/SET labels at `CREATE TABLE` time, regardless of
+the column's character set. `CHARSET=utf8mb4` does not change this;
+`SET NAMES utf8mb4` before the CREATE does not change this;
+`mysqldump` reproduces the same loss. The label is already gone from
+the source server's catalog by the time sluice ever sees the column.
+
+Sluice surfaces this at schema-read time via a WARN line of the form:
+
+```
+mysql: enum labels contain '?' — likely MySQL data-dictionary
+truncation of 4-byte UTF-8 (Bug 106). column_type=enum('a','?')
+```
+
+If the source's row data happens to contain non-`?` values for the
+column, the target write will loud-fail at row INSERT (PG: `invalid
+input value for enum`; MySQL → MySQL: same data-dictionary loss on
+both sides so the write succeeds). Recovery options:
+
+- `--type-override=TABLE.COL=text` — emit the column as PG TEXT (or
+  MySQL VARCHAR) on the target so the actual row values land
+  faithfully; ENUM enforcement is lost but the data round-trips.
+- Fix the source ENUM labels to use ASCII (or 3-byte UTF-8 — CJK
+  characters survive; only emoji / mathematical symbols / etc. are
+  4-byte) via `ALTER TABLE` before migration.
+- Ignore the warning if your source legitimately uses `?` as a label
+  and the runtime doesn't surface a false positive.
+
 ## Migrating, then tightening
 
 A reasonable workflow for moving legacy data onto a new strict-mode
