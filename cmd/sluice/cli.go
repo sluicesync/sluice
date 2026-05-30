@@ -56,7 +56,13 @@ type Globals struct {
 	// same forced strict mode. An explicit empty `--mysql-sql-mode=''`
 	// is distinguishable (the field becomes the empty string, which
 	// differs from the strict default) and disables forcing.
-	MySQLSQLMode string `help:"Override sluice's default strict sql_mode on every MySQL connection. Pass --mysql-sql-mode='' (explicit empty) to fall through to the server's default sql_mode — required for migrating legacy MySQL data with zero-dates / silently-truncated values. Pass a specific comma-separated mode list to force exactly those modes. See docs/operator/migrating-legacy-mysql.md." default:"STRICT_TRANS_TABLES,NO_ZERO_DATE,NO_ZERO_IN_DATE,ERROR_FOR_DIVISION_BY_ZERO" placeholder:"MODES"`
+	// Explicit name:"mysql-sql-mode" overrides kong's auto-kebab
+	// derivation. Without it, kong reads the field name `MySQLSQLMode`
+	// as `My` + `SQLSQL` (one acronym block, no lowercase break) +
+	// `Mode` and emits the flag as `--my-sqlsql-mode` — a typo that
+	// contradicts the help text. v0.92.1 shipped with this defect;
+	// v0.92.2 pins the public name explicitly.
+	MySQLSQLMode string `name:"mysql-sql-mode" help:"Override sluice's default strict sql_mode on every MySQL connection. Pass --mysql-sql-mode='' (explicit empty) to fall through to the server's default sql_mode — required for migrating legacy MySQL data with zero-dates / silently-truncated values. Pass a specific comma-separated mode list to force exactly those modes. See docs/operator/migrating-legacy-mysql.md." default:"STRICT_TRANS_TABLES,NO_ZERO_DATE,NO_ZERO_IN_DATE,ERROR_FOR_DIVISION_BY_ZERO" placeholder:"MODES"`
 }
 
 // CLI is the root of the sluice command tree. Kong populates this from
