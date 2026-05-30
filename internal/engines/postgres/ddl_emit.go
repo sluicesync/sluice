@@ -85,7 +85,7 @@ func emitColumnType(t ir.Type, opts emitOpts) (string, error) {
 					"(PG refuses zero-length char/varchar at CREATE TABLE — SQLSTATE 22023). " +
 					"This usually means a MySQL marker column; recovery: --type-override=TABLE.COL=text " +
 					"(land it as PG TEXT) or --type-override=TABLE.COL=boolean (if the column is used as a flag). " +
-					"See docs/operator/migrating-legacy-mysql.md for the legacy-MySQL migration story.",
+					"See docs/operator/migrating-legacy-mysql.md for the legacy-MySQL migration story",
 			)
 		}
 		return fmt.Sprintf("CHAR(%d)", v.Length), nil
@@ -108,7 +108,7 @@ func emitColumnType(t ir.Type, opts emitOpts) (string, error) {
 					"VARCHAR(0) is a MySQL idiom for a marker column (exists/doesn't exist); recovery: " +
 					"--type-override=TABLE.COL=text (land it as PG TEXT — the most common workaround) " +
 					"or --type-override=TABLE.COL=boolean (if the column is used as a flag). " +
-					"See docs/operator/migrating-legacy-mysql.md for the legacy-MySQL migration story.",
+					"See docs/operator/migrating-legacy-mysql.md for the legacy-MySQL migration story",
 			)
 		}
 		return fmt.Sprintf("VARCHAR(%d)", v.Length), nil
