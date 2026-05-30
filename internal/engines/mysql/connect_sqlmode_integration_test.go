@@ -33,7 +33,7 @@ func TestConnectAppliesStrictSQLModeOnSession(t *testing.T) {
 	dsn := getenvOr("MYSQL_PROBE_DSN", "")
 	if dsn == "" {
 		host, port, user, password := ensureSharedMySQL(t)
-		dsn = sharedDSN(host, port, user, password, "")
+		dsn = sharedDSN(host, port, user, password, "mysql")
 	}
 	cfg, err := parseDSN(dsn)
 	if err != nil {
@@ -76,7 +76,7 @@ func TestLoadDataWarningCountRefusesSilentClamp(t *testing.T) {
 	dsn := getenvOr("MYSQL_PROBE_DSN", "")
 	if dsn == "" {
 		host, port, user, password := ensureSharedMySQL(t)
-		dsn = sharedDSN(host, port, user, password, "")
+		dsn = sharedDSN(host, port, user, password, "mysql")
 	}
 	cfg, err := parseDSN(dsn)
 	if err != nil {
@@ -139,7 +139,7 @@ func TestLoadDataWarningCountSkippedWhenSQLModeEmpty(t *testing.T) {
 	dsn := getenvOr("MYSQL_PROBE_DSN", "")
 	if dsn == "" {
 		host, port, user, password := ensureSharedMySQL(t)
-		dsn = sharedDSN(host, port, user, password, "")
+		dsn = sharedDSN(host, port, user, password, "mysql")
 	}
 
 	orig := sessionSQLMode
@@ -197,7 +197,7 @@ func TestConnectAppliesUtf8mb4OnResults(t *testing.T) {
 	dsn := getenvOr("MYSQL_PROBE_DSN", "")
 	if dsn == "" {
 		host, port, user, password := ensureSharedMySQL(t)
-		dsn = sharedDSN(host, port, user, password, "")
+		dsn = sharedDSN(host, port, user, password, "mysql")
 	}
 	cfg, err := parseDSN(dsn)
 	if err != nil {
@@ -234,7 +234,7 @@ func TestDirectInsertHonoursStrictMode(t *testing.T) {
 	dsn := getenvOr("MYSQL_PROBE_DSN", "")
 	if dsn == "" {
 		host, port, user, password := ensureSharedMySQL(t)
-		dsn = sharedDSN(host, port, user, password, "")
+		dsn = sharedDSN(host, port, user, password, "mysql")
 	}
 	cfg, err := parseDSN(dsn)
 	if err != nil {
