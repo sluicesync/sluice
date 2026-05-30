@@ -38,6 +38,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/orware/sluice/internal/appliercontrol"
@@ -61,6 +62,11 @@ type MetricsServer struct {
 	mu             sync.RWMutex
 	aimdController *appliercontrol.Controller
 	spillReporter  SpillReporterFunc
+
+	// ready flips to true once the streamer has finished its cold-start
+	// or warm-resume preamble and entered the apply loop. /readyz reads
+	// it via atomic.Bool so handler lookups stay lock-free.
+	ready atomic.Bool
 }
 
 // SpillReporterFunc is the scrape-time hook the streamer plugs in to
@@ -106,6 +112,7 @@ func NewMetricsServer(addr string, applier ir.ChangeApplier) (*MetricsServer, er
 	}
 	mux.HandleFunc("/metrics", ms.handleMetrics)
 	mux.HandleFunc("/healthz", ms.handleHealthz)
+	mux.HandleFunc("/readyz", ms.handleReadyz)
 	ms.server = &http.Server{
 		Addr:              addr,
 		Handler:           mux,
@@ -232,13 +239,48 @@ func (m *MetricsServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleHealthz is a tiny "is the server alive" endpoint that
-// monitoring stacks use to distinguish "scrape target is gone" from
-// "scrape target is up but reports zero streams". Returns 200 with
-// the word "ok"; doesn't touch the applier.
+// handleHealthz is the liveness probe — "is the process responsive?".
+// Returns 200 "ok" unconditionally; doesn't touch the applier. k8s
+// pulls a pod and restarts it when this stops responding.
+//
+// Paired with handleReadyz, which gates traffic on the streamer being
+// past the cold-start preamble.
 func (m *MetricsServer) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	_, _ = io.WriteString(w, "ok\n")
+}
+
+// handleReadyz is the readiness probe — "is the streamer past its
+// cold-start / warm-resume preamble and into the apply loop?". Returns
+// 200 "ready" once [MetricsServer.MarkReady] has been called; otherwise
+// 503 "not ready". k8s, Heroku, and systemd-based orchestrators use
+// this to delay routing traffic or marking the unit as Started until
+// the stream is actually mirroring.
+//
+// The signal is "streaming phase entered" only — no lag-threshold
+// check, no per-scrape DB roundtrip. A streamer that has begun applying
+// but fallen badly behind still reports ready; operators alert on lag
+// via the `sluice_seconds_since_last_apply` metric, not /readyz. (This
+// design choice was the operator-confirmed default in the #110 design
+// review; see ADR-0069.)
+func (m *MetricsServer) handleReadyz(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	if m.ready.Load() {
+		_, _ = io.WriteString(w, "ready\n")
+		return
+	}
+	w.WriteHeader(http.StatusServiceUnavailable)
+	_, _ = io.WriteString(w, "not ready\n")
+}
+
+// MarkReady flips the /readyz signal to 200 OK. The streamer calls
+// this once after cold-start / warm-resume returns success and before
+// the apply loop begins consuming events. Idempotent — repeated calls
+// have no effect; the signal is monotonic (no "un-ready" path, since
+// a streamer that loses the stream exits and the process is restarted
+// by the orchestrator).
+func (m *MetricsServer) MarkReady() {
+	m.ready.Store(true)
 }
 
 // emitMetrics renders the current stream snapshot as Prometheus
