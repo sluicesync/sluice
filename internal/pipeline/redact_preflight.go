@@ -6,6 +6,7 @@ package pipeline
 import (
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 
 	"github.com/orware/sluice/internal/ir"
@@ -67,6 +68,17 @@ var errRedactKeysetMissing = errors.New("pipeline: hash:hmac-sha256 / tokenize:d
 // the per-strategy type/PK/keyset checks run.
 var errRedactSelectorUnresolved = errors.New("pipeline: redaction rule's TABLE.COLUMN selector does not resolve to any column in the source schema (typo class — would silently leak PII)")
 
+// errRedactRandomizeRangeOverflow is the sentinel for the Bug 105
+// silent-PII-loss refusal (v0.92.1): a `randomize:int:LO,HI` rule
+// where LO or HI exceeds the target column's representable integer
+// range. Pre-fix, the random int64 sluice generated was silently
+// clamped at the DB layer (with the MySQL silent-mode bug — Bug
+// 102/103 family) to the column's MAX, so every row got the same
+// surrogate, defeating the randomization that PII compliance
+// depends on. Refusing at preflight keeps the operator's compliance
+// posture visible at startup, BEFORE any data moves.
+var errRedactRandomizeRangeOverflow = errors.New("pipeline: randomize:int rule has Min/Max outside the target column's representable integer range (would silently clamp to MAX — defeats randomization)")
+
 // preflightRedactTypes inspects every redaction rule in the
 // registry against the (post-mappings) schema, refusing
 // combinations whose strategy output won't satisfy the target
@@ -110,6 +122,7 @@ func preflightRedactTypes(reg *redact.Registry, schema *ir.Schema) error {
 	}
 	var typeProblems []string
 	var randomizeProblems []string
+	var randomizeOverflowProblems []string
 	var keysetProblems []string
 	var selectorProblems []string
 	for _, rule := range reg.Rules() {
@@ -168,34 +181,67 @@ func preflightRedactTypes(reg *redact.Registry, schema *ir.Schema) error {
 				continue // table not in scope; nothing to check
 			}
 			if table.PrimaryKey != nil && len(table.PrimaryKey.Columns) > 0 {
+				// PK present — continue to the randomize:int range
+				// check below; other randomize:* strategies have no
+				// further check.
+			} else {
+				randomizeProblems = append(randomizeProblems, fmt.Sprintf(
+					"  - %s: strategy %s requires a primary key on the source table (replay-stable randomization derives its seed from PK values; without a PK each row would draw an unrelated random value on every run, breaking idempotency). Either add a PRIMARY KEY to %s on the source, or pick a non-random strategy (hash:sha256, mask:*, static:) for this column.",
+					qualified, name, rule.Table,
+				))
 				continue
 			}
-			randomizeProblems = append(randomizeProblems, fmt.Sprintf(
-				"  - %s: strategy %s requires a primary key on the source table (replay-stable randomization derives its seed from PK values; without a PK each row would draw an unrelated random value on every run, breaking idempotency). Either add a PRIMARY KEY to %s on the source, or pick a non-random strategy (hash:sha256, mask:*, static:) for this column.",
-				qualified, name, rule.Table,
-			))
+			// Bug 105 (v0.92.1) — randomize:int:LO,HI must fit the
+			// target column's integer width. If LO or HI exceeds the
+			// representable range, every row would silently clamp to
+			// MAX (with sql_mode-strict on MySQL the clamp becomes
+			// loud at apply time — Bugs 102+103+strict-mode patch in
+			// this same release — but the preflight catches the
+			// configuration error one round-trip earlier).
+			if ri, ok := rule.Strategy.(redact.RandomizeInt); ok {
+				col := findSchemaColumn(schema, rule.Table, rule.Column)
+				if col == nil {
+					continue // selector-unresolved already caught above
+				}
+				intT, isInt := col.Type.(ir.Integer)
+				if !isInt {
+					continue // non-integer column — let DB enforce type compatibility
+				}
+				lo, hi := integerColumnRange(intT)
+				if ri.Min < lo || ri.Max > hi {
+					randomizeOverflowProblems = append(randomizeOverflowProblems, fmt.Sprintf(
+						"  - %s: strategy %s has Min=%d Max=%d outside the column's representable integer range [%d,%d] (Width=%d, Unsigned=%v). "+
+							"Either narrow the Min,Max to fit the column, or widen the column type via --type-override. Pre-v0.92.1, an out-of-range randomize:int silently clamped to MAX every row "+
+							"(defeating randomization → PII compliance failure).",
+						qualified, name, ri.Min, ri.Max, lo, hi, intT.Width, intT.Unsigned,
+					))
+				}
+			}
 		}
 	}
-	if len(typeProblems) == 0 && len(randomizeProblems) == 0 && len(keysetProblems) == 0 && len(selectorProblems) == 0 {
+	if len(typeProblems) == 0 && len(randomizeProblems) == 0 && len(randomizeOverflowProblems) == 0 && len(keysetProblems) == 0 && len(selectorProblems) == 0 {
 		return nil
 	}
 	// Selector-unresolved is the most fundamental misconfiguration —
 	// the rule can't possibly do anything; surface it first and on
 	// its own when it's the only failure so the operator gets the
 	// single actionable fix (typo correction).
-	if len(selectorProblems) > 0 && len(typeProblems) == 0 && len(randomizeProblems) == 0 && len(keysetProblems) == 0 {
+	if len(selectorProblems) > 0 && len(typeProblems) == 0 && len(randomizeProblems) == 0 && len(randomizeOverflowProblems) == 0 && len(keysetProblems) == 0 {
 		return fmt.Errorf("%w (Bug 99 / v0.91.1 preflight):\n%s", errRedactSelectorUnresolved, strings.Join(selectorProblems, "\n"))
 	}
 	// Keyset-missing is the next most fundamental (no key material at
 	// all); surface it second.
-	if len(keysetProblems) > 0 && len(typeProblems) == 0 && len(randomizeProblems) == 0 && len(selectorProblems) == 0 {
+	if len(keysetProblems) > 0 && len(typeProblems) == 0 && len(randomizeProblems) == 0 && len(randomizeOverflowProblems) == 0 && len(selectorProblems) == 0 {
 		return fmt.Errorf("%w (PII Phase 4 / ADR-0041 preflight):\n%s", errRedactKeysetMissing, strings.Join(keysetProblems, "\n"))
 	}
-	if len(typeProblems) > 0 && len(randomizeProblems) == 0 && len(keysetProblems) == 0 && len(selectorProblems) == 0 {
+	if len(typeProblems) > 0 && len(randomizeProblems) == 0 && len(randomizeOverflowProblems) == 0 && len(keysetProblems) == 0 && len(selectorProblems) == 0 {
 		return fmt.Errorf("%w (Bug 60 / v0.58.1 preflight):\n%s", errRedactTypeMismatch, strings.Join(typeProblems, "\n"))
 	}
-	if len(randomizeProblems) > 0 && len(typeProblems) == 0 && len(keysetProblems) == 0 && len(selectorProblems) == 0 {
+	if len(randomizeProblems) > 0 && len(randomizeOverflowProblems) == 0 && len(typeProblems) == 0 && len(keysetProblems) == 0 && len(selectorProblems) == 0 {
 		return fmt.Errorf("%w (PII Phase 2.c / v0.59.0 preflight):\n%s", errRedactRandomizeNoPK, strings.Join(randomizeProblems, "\n"))
+	}
+	if len(randomizeOverflowProblems) > 0 && len(randomizeProblems) == 0 && len(typeProblems) == 0 && len(keysetProblems) == 0 && len(selectorProblems) == 0 {
+		return fmt.Errorf("%w (Bug 105 / v0.92.1 preflight):\n%s", errRedactRandomizeRangeOverflow, strings.Join(randomizeOverflowProblems, "\n"))
 	}
 	// Multiple categories non-empty: surface all with a combined
 	// header so the operator sees the full picture in one run.
@@ -203,7 +249,48 @@ func preflightRedactTypes(reg *redact.Registry, schema *ir.Schema) error {
 	combined = append(combined, keysetProblems...)
 	combined = append(combined, typeProblems...)
 	combined = append(combined, randomizeProblems...)
-	return fmt.Errorf("%w / %w / %w / %w (combined preflight):\n%s", errRedactSelectorUnresolved, errRedactKeysetMissing, errRedactTypeMismatch, errRedactRandomizeNoPK, strings.Join(combined, "\n"))
+	combined = append(combined, randomizeOverflowProblems...)
+	return fmt.Errorf("%w / %w / %w / %w / %w (combined preflight):\n%s", errRedactSelectorUnresolved, errRedactKeysetMissing, errRedactTypeMismatch, errRedactRandomizeNoPK, errRedactRandomizeRangeOverflow, strings.Join(combined, "\n"))
+}
+
+// integerColumnRange returns the inclusive [min, max] integer range
+// for the given ir.Integer column. Handles signed widths 8/16/24/32/64
+// and the unsigned [0, 2^width - 1] mirror. Width=24 is MySQL's
+// MEDIUMINT (range [-2^23, 2^23-1] signed, [0, 2^24-1] unsigned).
+//
+// 64-bit unsigned overflows int64; sluice's randomize:int Min/Max are
+// int64-typed, so an unsigned 64-bit column's effective upper bound
+// for a randomize:int rule is math.MaxInt64 — Min/Max in the
+// 2^63..2^64-1 range can't be expressed as int64 and the operator
+// would need a different strategy (the configuration would also fail
+// the int64 CLI parse).
+func integerColumnRange(t ir.Integer) (lo, hi int64) {
+	if t.Unsigned {
+		switch t.Width {
+		case 8:
+			return 0, 255
+		case 16:
+			return 0, 65535
+		case 24:
+			return 0, 16777215
+		case 32:
+			return 0, 4294967295
+		default: // 64-bit unsigned — clamp at int64 max for rule purposes
+			return 0, math.MaxInt64
+		}
+	}
+	switch t.Width {
+	case 8:
+		return -128, 127
+	case 16:
+		return -32768, 32767
+	case 24:
+		return -8388608, 8388607
+	case 32:
+		return -2147483648, 2147483647
+	default: // 64-bit signed
+		return math.MinInt64, math.MaxInt64
+	}
 }
 
 // findSchemaTable returns the *ir.Table for name, or nil if not

@@ -290,4 +290,130 @@ func TestPreflightRedactTypes(t *testing.T) {
 			t.Errorf("keyed hmac: got %v; want nil", err)
 		}
 	})
+
+	// Bug 105 / v0.92.1 — randomize:int range-vs-column-width pins.
+	// Pre-fix, an out-of-range Min/Max silently clamped to the column's
+	// MAX at apply time (defeating randomization → PII compliance
+	// failure). The new preflight surfaces it as a loud refusal.
+	intCol := func(name string, width int8, unsigned bool) *ir.Column {
+		return &ir.Column{Name: name, Type: ir.Integer{Width: width, Unsigned: unsigned}}
+	}
+	intSchemaWithPK := func(table string, pk string, cols ...*ir.Column) *ir.Schema {
+		return &ir.Schema{Tables: []*ir.Table{
+			{Name: table, Columns: cols, PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: pk}}}},
+		}}
+	}
+
+	t.Run("randomize:int Min/Max fitting int32 column passes (Bug 105 control)", func(t *testing.T) {
+		r := redact.New()
+		r.Set("", "events", "id", redact.RandomizeInt{Min: 0, Max: 999_999})
+		schema := intSchemaWithPK("events", "id", intCol("id", 32, false))
+		if err := preflightRedactTypes(r, schema); err != nil {
+			t.Errorf("in-range randomize:int should pass; got: %v", err)
+		}
+	})
+
+	t.Run("randomize:int Max overflows int32 column refuses (Bug 105 canonical repro)", func(t *testing.T) {
+		r := redact.New()
+		// Max=2_147_483_648 is INT32_MAX+1 — would silently clamp pre-fix.
+		r.Set("", "events", "id", redact.RandomizeInt{Min: 0, Max: 2_147_483_648})
+		schema := intSchemaWithPK("events", "id", intCol("id", 32, false))
+		err := preflightRedactTypes(r, schema)
+		if err == nil {
+			t.Fatal("got nil; want loud refusal — overflow would silently clamp to MAX (PII compliance failure)")
+		}
+		if !errors.Is(err, errRedactRandomizeRangeOverflow) {
+			t.Errorf("want errRedactRandomizeRangeOverflow sentinel; got: %v", err)
+		}
+		for _, want := range []string{"events.id", "Max=2147483648", "[-2147483648,2147483647]", "PII compliance"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("refusal should mention %q; got: %v", want, err)
+				break
+			}
+		}
+	})
+
+	t.Run("randomize:int negative Min on unsigned column refuses (Bug 105 underflow shape)", func(t *testing.T) {
+		r := redact.New()
+		r.Set("", "events", "id", redact.RandomizeInt{Min: -1, Max: 100})
+		// UNSIGNED INT — negative Min is out-of-range.
+		schema := intSchemaWithPK("events", "id", intCol("id", 32, true))
+		err := preflightRedactTypes(r, schema)
+		if err == nil {
+			t.Fatal("got nil; want refusal on negative Min for UNSIGNED column")
+		}
+		if !errors.Is(err, errRedactRandomizeRangeOverflow) {
+			t.Errorf("want errRedactRandomizeRangeOverflow sentinel; got: %v", err)
+		}
+	})
+
+	t.Run("randomize:int on non-integer column passes (no false positives)", func(t *testing.T) {
+		r := redact.New()
+		r.Set("", "events", "tag", redact.RandomizeInt{Min: 0, Max: 999_999_999_999})
+		// Column is TEXT — let the DB enforce type compatibility.
+		schema := intSchemaWithPK("events", "tag", &ir.Column{Name: "tag", Type: ir.Text{Size: ir.TextLong}})
+		if err := preflightRedactTypes(r, schema); err != nil {
+			t.Errorf("non-integer column should pass without the range check; got: %v", err)
+		}
+	})
+
+	t.Run("randomize:int int8 / int16 / int24 / int64 boundary pins", func(t *testing.T) {
+		cases := []struct {
+			name     string
+			width    int8
+			unsigned bool
+			ok       []redact.RandomizeInt
+			refused  []redact.RandomizeInt
+		}{
+			{
+				name: "int8 signed", width: 8, unsigned: false,
+				ok:      []redact.RandomizeInt{{Min: -128, Max: 127}, {Min: 0, Max: 99}},
+				refused: []redact.RandomizeInt{{Min: -129, Max: 127}, {Min: 0, Max: 128}},
+			},
+			{
+				name: "uint16", width: 16, unsigned: true,
+				ok:      []redact.RandomizeInt{{Min: 0, Max: 65535}, {Min: 100, Max: 65535}},
+				refused: []redact.RandomizeInt{{Min: -1, Max: 65535}, {Min: 0, Max: 65536}},
+			},
+			{
+				name: "int24 signed (MySQL MEDIUMINT)", width: 24, unsigned: false,
+				ok:      []redact.RandomizeInt{{Min: -8388608, Max: 8388607}},
+				refused: []redact.RandomizeInt{{Min: 0, Max: 8388608}},
+			},
+			{
+				name: "int64 signed", width: 64, unsigned: false,
+				ok: []redact.RandomizeInt{{Min: -1 << 62, Max: 1 << 62}},
+				// int64 range is [MinInt64, MaxInt64] — no Min/Max can
+				// exceed without overflowing int64 itself, so the
+				// "refused" list is empty for this width.
+				refused: nil,
+			},
+		}
+		for _, c := range cases {
+			c := c
+			t.Run(c.name, func(t *testing.T) {
+				col := intCol("id", c.width, c.unsigned)
+				schema := intSchemaWithPK("events", "id", col)
+				for _, ok := range c.ok {
+					r := redact.New()
+					r.Set("", "events", "id", ok)
+					if err := preflightRedactTypes(r, schema); err != nil {
+						t.Errorf("%s in-range %v: got %v; want nil", c.name, ok, err)
+					}
+				}
+				for _, ref := range c.refused {
+					r := redact.New()
+					r.Set("", "events", "id", ref)
+					err := preflightRedactTypes(r, schema)
+					if err == nil {
+						t.Errorf("%s out-of-range %v: got nil; want refusal", c.name, ref)
+						continue
+					}
+					if !errors.Is(err, errRedactRandomizeRangeOverflow) {
+						t.Errorf("%s out-of-range %v: want errRedactRandomizeRangeOverflow; got: %v", c.name, ref, err)
+					}
+				}
+			})
+		}
+	})
 }

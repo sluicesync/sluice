@@ -143,6 +143,44 @@ func parseDSN(dsn string) (*mysql.Config, error) {
 	if _, ok := cfg.Params["time_zone"]; !ok {
 		cfg.Params["time_zone"] = "'+00:00'"
 	}
+	// Bug 102 + Bug 103 (CRITICAL silent-loss, v0.92.1). Pre-fix
+	// sluice inherited the MySQL server's sql_mode, which on dev
+	// containers and some managed deployments doesn't include the
+	// strict modes — so PG `NUMERIC(40,5)` values overflowing
+	// MySQL `DECIMAL(65,30)` silently clamped to the column max
+	// (every overflowing row → same constant; Bug 102 CRITICAL silent
+	// data loss), and PG `TIMESTAMPTZ` values outside MySQL
+	// `TIMESTAMP` range silently became `0000-00-00 00:00:00` (Bug
+	// 103). Both manifestations LOUD-refused on a PG target because
+	// PG always enforces; sluice's silent-on-MySQL was a pure
+	// connection-config oversight.
+	//
+	// Forcing the strict modes here on every sluice MySQL connection
+	// turns the silent-loss class into loud MySQL errors
+	// (1264 / 1265 / 1292) which then surface through the existing
+	// applier error path. An operator who explicitly wants the
+	// relaxed-mode behaviour can override by setting sql_mode in the
+	// DSN params; the literal-quotes pattern matches the time_zone
+	// override above.
+	if _, ok := cfg.Params["sql_mode"]; !ok {
+		cfg.Params["sql_mode"] = "'STRICT_TRANS_TABLES,NO_ZERO_DATE,NO_ZERO_IN_DATE,ERROR_FOR_DIVISION_BY_ZERO'"
+	}
+	// Bug 106 (v0.92.1). Pre-fix the connection's default character
+	// set could fall back to 3-byte utf8 on older MySQL servers /
+	// managed deployments, silently corrupting 4-byte UTF-8 sequences
+	// (emoji, supplementary-plane glyphs) — observed concretely when
+	// MySQL → PG schema-read encountered an ENUM whose labels
+	// contained 4-byte UTF-8, which arrived in sluice's IR as `?`
+	// substitutes and then loud-failed at the target row INSERT (the
+	// loud-fail was the visible symptom; the silent label corruption
+	// was the silent class). Forcing utf8mb4 here ensures the
+	// connection charset always supports the full Unicode range, so
+	// 4-byte sequences round-trip cleanly. utf8mb4_general_ci is the
+	// safe default — operators who need a different collation can
+	// override in the DSN.
+	if cfg.Collation == "" {
+		cfg.Collation = "utf8mb4_general_ci"
+	}
 
 	return cfg, nil
 }
