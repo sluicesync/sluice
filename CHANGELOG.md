@@ -4,6 +4,14 @@ All notable changes to sluice are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **`feat(postgres): Stage 2 verbatim-carry promote — xml / money / pg_lsn / txid_snapshot / pg_snapshot (ADR-0070)`** — same-engine PG → PG `sluice migrate` / `sync` of columns whose `pg_catalog` type is `xml`, `money`, `pg_lsn`, `txid_snapshot`, or `pg_snapshot` now preserves the column type (`typname`) and round-trips the value byte-equal, instead of refusing loudly at translate time. The five types were the [ADR-0051 §"Stage 2 candidates"](docs/adr/adr-0051-core-pg-type-verbatim-carry.md) list, deferred until per-type round-trip integration pins shipped in v0.90.0. With those pins now CI-locked, the allowlist add is a five-line additive change in `internal/engines/postgres/types.go::coreVerbatimEligibleTypes` and the existing pins automatically hit the "preserve" branch instead of the "refuse-loudly" branch. **Cross-engine PG → MySQL behaviour is unchanged** — `ir.VerbatimType` continues to refuse loudly at preflight via `cross_engine_supportable.go`. See [ADR-0070](docs/adr/adr-0070-stage-2-verbatim-carry-promote.md) for the per-type rationale and the Stage 3 closing-the-door analysis.
+- **`feat(pipeline): --poll-interval flag on sync start (roadmap item 18(c))`** — operator-tunable cadence for poll-based CDC readers. Default `0` (engines use their built-in cadence; today: postgres-trigger 1 s); set to e.g. `--poll-interval=250ms` to tighten apply latency on a write-heavy postgres-trigger stream, or `--poll-interval=5s` to trade latency for source load. Push-based engines (postgres pgoutput, mysql binlog, planetscale VStream) have no poll loop and silently ignore the flag. The setter contract — a `pollIntervalSetter` optional interface on the CDC reader, type-asserted by the streamer between open and `StreamChanges` — leaves the `ir.Engine` interface unchanged. **Item 18(c) sub-piece `--idle-flush-grace` is deferred** to a separate release: the batched applier's idle-flush timer touches concurrent state (the apply goroutine + the timer), so it needs the `-race` + integration gate per the CLAUDE.md concurrency-chunk rule.
+- **`feat(cli): trigger teardown --yes flag`** — `sluice trigger teardown` now mirrors `sluice slot drop`: it prompts for confirmation by default (`Tear down the sluice trigger engine on the source ...? [y/N]`) and accepts `--yes` (`-y`) to skip the prompt for scripted/CI use. Previous behavior had no confirmation but also rejected `--yes` with help-text output, which surprised operators (and the post-release cycle subagent) into thinking the command needed `--yes` and then silently no-op'd when it was passed.
+
 ## [0.90.0] - 2026-05-29
 
 ### Added

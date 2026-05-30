@@ -92,6 +92,24 @@ func openCDCReader(ctx context.Context, dsn string) (ir.CDCReader, error) {
 	}, nil
 }
 
+// SetPollInterval overrides the default 1 s poll cadence for this
+// reader. Called by the orchestrator after [openCDCReader] when the
+// operator passes `--poll-interval=DUR` on `sync start`. Idempotent;
+// must be called before [StreamChanges] (the polling loop captures
+// the interval at start). A zero or negative duration is rejected to
+// keep the loop from spinning.
+//
+// Surfaced via a setter rather than the engine's [ir.Engine.OpenCDCReader]
+// signature to preserve the existing interface contract — the
+// streamer type-asserts on [pollIntervalSetter] and silently skips
+// the call against engines that don't implement it. ADR-0066 §6 / roadmap
+// item 18(c).
+func (r *CDCReader) SetPollInterval(d time.Duration) {
+	if d > 0 {
+		r.pollInterval = d
+	}
+}
+
 // Close releases the underlying connection pool and stops any
 // in-flight polling goroutine.
 func (r *CDCReader) Close() error {

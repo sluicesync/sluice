@@ -112,9 +112,13 @@ func TestTranslateType_CoreVerbatim_EmptyFormatTypeIsLoudBug(t *testing.T) {
 // version's new core type does NOT silently reach the verbatim path
 // without an ADR review.
 func TestTranslateType_CoreVerbatim_NonAllowlistedRefuses(t *testing.T) {
-	// Stage 2 candidates per ADR-0051 — explicitly NOT in the allowlist.
-	// Each is documented in the ADR as needing per-type validation.
-	for _, dt := range []string{"xml", "money", "pg_lsn", "txid_snapshot", "pg_snapshot"} {
+	// PG geometric types (point/line/lseg/box/path/polygon/circle):
+	// PG has them natively but sluice deliberately routes geometry
+	// through PostGIS (ADR-0035), not these. They are real PG core
+	// types that are NOT on the verbatim allowlist; if a future
+	// reader path started passing them through, we want this pin to
+	// catch it.
+	for _, dt := range []string{"point", "line", "lseg", "box", "path", "polygon", "circle"} {
 		dt := dt
 		t.Run(dt, func(t *testing.T) {
 			_, err := translateType(columnMeta{
@@ -133,8 +137,8 @@ func TestTranslateType_CoreVerbatim_NonAllowlistedRefuses(t *testing.T) {
 
 // TestCoreVerbatimEligibleTypes_AllowlistShape is a structural pin:
 // adding a type later should be an additive one-line change; removing
-// one (without an ADR update) would be a stealth scope reduction. This
-// test fixes the Stage 1 membership exactly so review notices.
+// one (without an ADR update) would be a stealth scope reduction.
+// Membership pinned at Stage 1 (ADR-0051) + Stage 2 (ADR-0070).
 func TestCoreVerbatimEligibleTypes_AllowlistShape(t *testing.T) {
 	stage1 := []string{
 		"tsvector", "tsquery",
@@ -143,14 +147,23 @@ func TestCoreVerbatimEligibleTypes_AllowlistShape(t *testing.T) {
 		"int4multirange", "int8multirange", "nummultirange",
 		"tsmultirange", "tstzmultirange", "datemultirange",
 	}
-	if got, want := len(coreVerbatimEligibleTypes), len(stage1); got != want {
-		t.Errorf("allowlist length = %d; want %d (Stage 1 per ADR-0051; "+
-			"if you ADDED a type, update this pin AND ADR-0051 §Stage 1)",
+	stage2 := []string{
+		"xml", "money", "pg_lsn", "txid_snapshot", "pg_snapshot",
+	}
+	want := len(stage1) + len(stage2)
+	if got := len(coreVerbatimEligibleTypes); got != want {
+		t.Errorf("allowlist length = %d; want %d (Stage 1 ADR-0051 + Stage 2 ADR-0070; "+
+			"if you ADDED a type, update this pin AND the corresponding ADR)",
 			got, want)
 	}
 	for _, dt := range stage1 {
 		if !coreVerbatimEligibleTypes[dt] {
 			t.Errorf("Stage 1 allowlist missing %q", dt)
+		}
+	}
+	for _, dt := range stage2 {
+		if !coreVerbatimEligibleTypes[dt] {
+			t.Errorf("Stage 2 allowlist missing %q", dt)
 		}
 	}
 }

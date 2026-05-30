@@ -74,6 +74,18 @@ type slotNameSetter interface {
 	SetSlotName(slotName string)
 }
 
+// pollIntervalSetter is the optional CDC-reader-side surface for
+// engines that poll the source (today: postgres-trigger; cadence
+// default 1 s). Push-based engines (pgoutput, binlog, VStream) do not
+// implement this — they have no poll loop to tune. The streamer
+// calls SetPollInterval at most once per stream, between
+// [ir.CDCReader] open and [ir.CDCReader.StreamChanges]; the engine
+// reader captures the new value before the first poll fires.
+// Roadmap item 18(c) / ADR-0066 §6.
+type pollIntervalSetter interface {
+	SetPollInterval(d time.Duration)
+}
+
 // targetSchemaSetter is the optional applier-side surface for
 // engines that record the operator-supplied `--target-schema NAME`
 // on the per-target control table (Bug 46, ADR-0031). PG implements;
@@ -540,6 +552,14 @@ type Streamer struct {
 	// either). Zero disables; the CLI's default is 60s. Operators
 	// chasing a stall set --heartbeat-interval=10s for faster signal.
 	HeartbeatInterval time.Duration
+
+	// PollInterval overrides the engine's default CDC-reader poll
+	// cadence. Roadmap item 18(c) / ADR-0066 §6. Consulted only by
+	// CDC readers that implement the [pollIntervalSetter] optional
+	// surface — today: postgres-trigger (default 1 s). Engines whose
+	// CDC stream is push-based (pgoutput, binlog, VStream) silently
+	// ignore this. Zero leaves the engine's default in place.
+	PollInterval time.Duration
 
 	// SourceHeartbeatInterval, when > 0, enables the F17 source-side
 	// heartbeat writer (ADR-0061). The streamer attaches a per-stream
@@ -2148,6 +2168,15 @@ func (s *Streamer) warmResume(ctx context.Context, persisted ir.Position, lsnTra
 			attacher.AttachLSNTracker(lsnTracker)
 		}
 	}
+	// Roadmap item 18(c): apply operator-supplied --poll-interval to
+	// poll-based CDC readers (today: postgres-trigger). Push-based
+	// engines (pgoutput, binlog, VStream) don't implement the setter
+	// and silently ignore.
+	if s.PollInterval > 0 {
+		if setter, ok := cdc.(pollIntervalSetter); ok {
+			setter.SetPollInterval(s.PollInterval)
+		}
+	}
 	changes, err = cdc.StreamChanges(ctx, persisted)
 	if err != nil {
 		closeIf(cdc)
@@ -2510,6 +2539,14 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 	if lsnTracker != nil {
 		if attacher, ok := stream.Changes.(lsnTrackerAttacher); ok {
 			attacher.AttachLSNTracker(lsnTracker)
+		}
+	}
+	// Roadmap item 18(c): apply operator-supplied --poll-interval to
+	// poll-based CDC readers on the cold-start path too. Same
+	// type-assert/silent-ignore shape as warmResume.
+	if s.PollInterval > 0 {
+		if setter, ok := stream.Changes.(pollIntervalSetter); ok {
+			setter.SetPollInterval(s.PollInterval)
 		}
 	}
 
