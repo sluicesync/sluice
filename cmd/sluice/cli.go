@@ -36,6 +36,27 @@ type Globals struct {
 	// operator hits /debug/pprof/goroutine?debug=2 to dump every
 	// goroutine's stack, which is what's needed to localise a wedge.
 	PprofListen string `help:"Bind net/http/pprof's debug endpoints at this address (e.g. ':6060', '127.0.0.1:6060') for the duration of the subcommand. Off by default. Useful for diagnosing silent stalls (GitHub #23 Phase A) — fetch /debug/pprof/goroutine?debug=2 to dump every goroutine's stack." placeholder:"ADDR"`
+
+	// MySQLSQLMode is the v0.92.1 escape hatch for the new strict-by-
+	// default mode forcing (Bugs 102/103/105). Sluice forces strict
+	// modes on every MySQL connection to close the silent-clamp /
+	// silent-zero-date class — but legacy MySQL data (zero-dates from
+	// pre-MySQL-5.7 schemas, silently-truncated VARCHARs, etc.) was
+	// already accepted under a relaxed sql_mode and would refuse
+	// under strict-by-default. Operators migrating such data set
+	// --mysql-sql-mode='' (explicit empty) to keep the server's
+	// default sql_mode, or pass a specific mode list. The DSN-level
+	// override (cfg.Params["sql_mode"] in the connection string)
+	// takes precedence if both are set. See
+	// docs/operator/migrating-legacy-mysql.md.
+	//
+	// The default value matches the strict literal so kong's "value
+	// from CLI" vs "field zero-value" indistinguishability doesn't
+	// matter: not-passed and passed-with-default both produce the
+	// same forced strict mode. An explicit empty `--mysql-sql-mode=''`
+	// is distinguishable (the field becomes the empty string, which
+	// differs from the strict default) and disables forcing.
+	MySQLSQLMode string `help:"Override sluice's default strict sql_mode on every MySQL connection. Pass --mysql-sql-mode='' (explicit empty) to fall through to the server's default sql_mode — required for migrating legacy MySQL data with zero-dates / silently-truncated values. Pass a specific comma-separated mode list to force exactly those modes. See docs/operator/migrating-legacy-mysql.md." default:"STRICT_TRANS_TABLES,NO_ZERO_DATE,NO_ZERO_IN_DATE,ERROR_FOR_DIVISION_BY_ZERO" placeholder:"MODES"`
 }
 
 // CLI is the root of the sluice command tree. Kong populates this from

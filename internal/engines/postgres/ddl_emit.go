@@ -72,8 +72,45 @@ func emitColumnType(t ir.Type, opts emitOpts) (string, error) {
 
 	// ---- Character / binary ----
 	case ir.Char:
+		if v.Length <= 0 {
+			// Bug 107 (v0.92.1): CHAR(0) reaches sluice via the same
+			// schema-reader path as VARCHAR(0) (MySQL allows both as
+			// effectively-empty-marker columns); PG refuses both at
+			// CREATE TABLE with `length for type char must be at
+			// least 1` (SQLSTATE 22023). Loud-refuse at emit time
+			// with the actionable recovery hint so the operator
+			// doesn't get a raw PG error after partial-table copy.
+			return "", fmt.Errorf(
+				"postgres: column type CHAR(0) has no cross-engine PG translation " +
+					"(PG refuses zero-length char/varchar at CREATE TABLE — SQLSTATE 22023). " +
+					"This usually means a MySQL marker column; recovery: --type-override=TABLE.COL=text " +
+					"(land it as PG TEXT) or --type-override=TABLE.COL=boolean (if the column is used as a flag). " +
+					"See docs/operator/migrating-legacy-mysql.md for the legacy-MySQL migration story",
+			)
+		}
 		return fmt.Sprintf("CHAR(%d)", v.Length), nil
 	case ir.Varchar:
+		if v.Length <= 0 {
+			// Bug 107 (v0.92.1). MySQL allows VARCHAR(0) — useful only
+			// as a marker (the column exists or it doesn't) — and a
+			// surprising number of long-lived MySQL schemas (e.g. the
+			// 20+ year-old WHMCS-shaped corpus) carry one or two.
+			// PG refuses VARCHAR(0) at CREATE TABLE with `length for
+			// type varchar must be at least 1` (SQLSTATE 22023). Pre-
+			// v0.92.1 sluice forwarded the VARCHAR(0) into the PG
+			// schema-apply DDL and crashed with that raw error AFTER
+			// the cold-start preamble had already run. Loud-refusing
+			// here at emit time keeps the error operator-actionable
+			// and names the recovery flag.
+			return "", fmt.Errorf(
+				"postgres: column type VARCHAR(0) has no cross-engine PG translation " +
+					"(PG refuses zero-length varchar at CREATE TABLE — SQLSTATE 22023). " +
+					"VARCHAR(0) is a MySQL idiom for a marker column (exists/doesn't exist); recovery: " +
+					"--type-override=TABLE.COL=text (land it as PG TEXT — the most common workaround) " +
+					"or --type-override=TABLE.COL=boolean (if the column is used as a flag). " +
+					"See docs/operator/migrating-legacy-mysql.md for the legacy-MySQL migration story",
+			)
+		}
 		return fmt.Sprintf("VARCHAR(%d)", v.Length), nil
 	case ir.Text:
 		// Postgres TEXT is unbounded; the IR's TextSize buckets
