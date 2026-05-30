@@ -4,6 +4,16 @@ All notable changes to sluice are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **`feat(pipeline): /readyz on sluice sync start (ADR-0069)`** — the metrics HTTP server (`--metrics-listen ADDR`) now exposes a `/readyz` endpoint alongside the existing `/metrics` + `/healthz`. Returns **503 "not ready"** while the streamer is in its cold-start / warm-resume preamble (snapshot, bulk-copy, schema apply, cache prime), then flips to **200 "ready"** once the apply loop is about to begin consuming events. Lets k8s readiness probes, Heroku release-phase scripts, and systemd unit-started gates wait for the stream to actually be mirroring rather than just for the process to be up. The signal is monotonic — a streamer that exits brings down the process and the orchestrator restarts it, which starts at 503 again. `/readyz` deliberately does **not** check apply lag (use the `sluice_seconds_since_last_apply` gauge from `/metrics` for that); the choice was the operator-confirmed default in the design review. See [ADR-0069](docs/adr/adr-0069-service-mode-readyz.md) for full rationale and [docs/operator/running-as-a-service.md](docs/operator/running-as-a-service.md) for systemd / docker / k8s / Heroku wiring examples.
+
+### Test coverage (no behavior change)
+
+- **Broader-mining + Stage-2 type pins** — eleven new integration pins document sluice's current behavior on edge classes mined from prior incidents and the ADR-0051 Stage-2 verbatim-carry type list. Each pin asserts **one of three legitimate outcomes** (refuse-loudly with an operator-grep-able hint / preserve correctly / fail loudly on silent type-loss); only silent flatten fails the test. Covered: PG special floats / temporals (`infinity` / `-infinity` / `NaN`), TOAST round-trip under REPLICA IDENTITY DEFAULT, ENUM mid-stream `ALTER TYPE ADD VALUE` drift, DOMAIN-typed array, `money`, SAVEPOINT / ROLLBACK TO suppression, TRUNCATE CDC event, `xml`, `pg_lsn`, `txid_snapshot`, `pg_snapshot`. No production code changed by these pins — they freeze the loud-failure surface and will catch a future regression that silently maps any of these types to text/varchar.
+
 ## [0.89.0] - 2026-05-29
 
 ### Fixed

@@ -1034,15 +1034,21 @@ func (s *Streamer) runOnce(ctx context.Context) error {
 
 	// ---- 1a. Optional Prometheus metrics endpoint ----
 	// When --metrics-listen is set, a small HTTP server runs alongside
-	// the stream exposing a Prometheus-format /metrics surface.
-	// Off by default; opt-in. Lifecycle is scoped to the streamer's
-	// Run — Started before the stream begins, Closed in the deferred
+	// the stream exposing /metrics, /healthz, and /readyz. Off by
+	// default; opt-in. Lifecycle is scoped to the streamer's Run —
+	// Started before the stream begins, Closed in the deferred
 	// teardown. A bind failure at startup is fatal (operator asked
 	// for the listener; misconfigured port shouldn't be silent).
 	// Skipped on DryRun: dry-run doesn't run a real stream, so
 	// metrics for it aren't useful.
+	//
+	// metricsSrv is hoisted outside the block so the apply-phase
+	// preamble below can flip its /readyz signal after cold-start /
+	// warm-resume completes.
+	var metricsSrv *MetricsServer
 	if s.MetricsListen != "" && !s.DryRun {
-		metricsSrv, mErr := NewMetricsServer(s.MetricsListen, applier)
+		var mErr error
+		metricsSrv, mErr = NewMetricsServer(s.MetricsListen, applier)
 		if mErr != nil {
 			return wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: prepare metrics server: %w", mErr))
 		}
@@ -1392,6 +1398,16 @@ func (s *Streamer) runOnce(ctx context.Context) error {
 		if err := primer.PrimeSchemaHistoryCache(applyCtx, streamID, primePos); err != nil {
 			return wrapWithHint(PhaseCDC, fmt.Errorf("pipeline: prime schema-history cache: %w", err))
 		}
+	}
+
+	// Streaming phase entered — flip /readyz to 200. Orchestrators
+	// (k8s, Heroku, systemd) gating traffic on readiness now see the
+	// stream as in-service. Bound on the apply-loop entry, not the
+	// channel hand-off below, so a failing prime-cache above keeps
+	// /readyz at 503 (the right signal — the streamer is about to
+	// return an error and exit).
+	if metricsSrv != nil {
+		metricsSrv.MarkReady()
 	}
 
 	// ---- 5. Apply ----

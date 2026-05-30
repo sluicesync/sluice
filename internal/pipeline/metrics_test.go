@@ -274,6 +274,104 @@ func TestMetricsHandler_SpillReporter_DetachOnNil(t *testing.T) {
 	}
 }
 
+// TestReadyz_InitialIs503 pins the default: a freshly constructed
+// MetricsServer reports /readyz = 503 until [MetricsServer.MarkReady]
+// is called. The streamer flips the flag after cold-start / warm-resume
+// returns success; until then the orchestrator should NOT route traffic
+// or mark the unit started.
+func TestReadyz_InitialIs503(t *testing.T) {
+	ms := newTestMetricsServer(t)
+	status, body := probeReadyz(t, ms)
+	if status != http.StatusServiceUnavailable {
+		t.Errorf("initial /readyz status = %d; want 503", status)
+	}
+	if !strings.Contains(body, "not ready") {
+		t.Errorf("initial /readyz body = %q; want to contain 'not ready'", body)
+	}
+}
+
+// TestReadyz_AfterMarkReadyIs200 pins the monotonic transition: once
+// MarkReady is called, /readyz reports 200 with body "ready". There is
+// no un-ready path — a streamer that loses the stream exits, and the
+// orchestrator restarts the process, which starts with a fresh 503.
+func TestReadyz_AfterMarkReadyIs200(t *testing.T) {
+	ms := newTestMetricsServer(t)
+	ms.MarkReady()
+	status, body := probeReadyz(t, ms)
+	if status != http.StatusOK {
+		t.Errorf("post-MarkReady /readyz status = %d; want 200", status)
+	}
+	if !strings.Contains(body, "ready") || strings.Contains(body, "not ready") {
+		t.Errorf("post-MarkReady /readyz body = %q; want 'ready'", body)
+	}
+}
+
+// TestReadyz_MarkReadyIsIdempotent pins the "repeated calls have no
+// effect" contract documented on MarkReady — a defensive check so a
+// future call site that fires MarkReady more than once (e.g., a retry
+// loop) doesn't accidentally regress the signal.
+func TestReadyz_MarkReadyIsIdempotent(t *testing.T) {
+	ms := newTestMetricsServer(t)
+	ms.MarkReady()
+	ms.MarkReady()
+	ms.MarkReady()
+	status, _ := probeReadyz(t, ms)
+	if status != http.StatusOK {
+		t.Errorf("after idempotent MarkReady calls, /readyz status = %d; want 200", status)
+	}
+}
+
+// TestHealthz_AlwaysOK pins the liveness probe's "process responsive"
+// semantics — it returns 200 regardless of readiness state. k8s uses
+// /healthz to decide whether to restart the pod; conflating it with
+// readiness would cause a cold-starting streamer to be killed mid-bulk.
+func TestHealthz_AlwaysOK(t *testing.T) {
+	ms := newTestMetricsServer(t)
+	// Before MarkReady — /healthz should still be 200.
+	status, body := probeHealthz(t, ms)
+	if status != http.StatusOK || !strings.Contains(body, "ok") {
+		t.Errorf("pre-ready /healthz: status=%d body=%q; want 200 'ok'", status, body)
+	}
+	ms.MarkReady()
+	// Post MarkReady — /healthz is the same.
+	status, body = probeHealthz(t, ms)
+	if status != http.StatusOK || !strings.Contains(body, "ok") {
+		t.Errorf("post-ready /healthz: status=%d body=%q; want 200 'ok'", status, body)
+	}
+}
+
+// probeReadyz invokes the /readyz handler via httptest.ResponseRecorder
+// and returns the status code and body, pulled out so each readyz test
+// reads as a declarative call.
+func probeReadyz(t *testing.T, ms *MetricsServer) (status int, body string) {
+	t.Helper()
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/readyz", http.NoBody)
+	rec := httptest.NewRecorder()
+	ms.handleReadyz(rec, req)
+	res := rec.Result()
+	defer func() { _ = res.Body.Close() }()
+	raw, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	return res.StatusCode, string(raw)
+}
+
+// probeHealthz mirrors probeReadyz for /healthz.
+func probeHealthz(t *testing.T, ms *MetricsServer) (status int, body string) {
+	t.Helper()
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/healthz", http.NoBody)
+	rec := httptest.NewRecorder()
+	ms.handleHealthz(rec, req)
+	res := rec.Result()
+	defer func() { _ = res.Body.Close() }()
+	raw, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	return res.StatusCode, string(raw)
+}
+
 // newTestMetricsServer constructs a MetricsServer wired to an empty
 // applier (ListStreams returns no streams) for use in handler-level
 // tests. The applier's other methods are panics; handlers under test
