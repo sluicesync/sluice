@@ -95,6 +95,22 @@ var hintRegistry = []errorHint{
 		hint:     "target table not found — did the schema-apply phase fail or apply to a different schema?",
 	},
 
+	// Bulk-copy: any per-table failure that wasn't caught by a more
+	// specific entry above. The migrate phases are tables → bulk_copy
+	// → identity_sync → indexes → constraints → views, so a mid-
+	// bulk_copy abort leaves earlier tables with data but WITHOUT
+	// their declared secondary indexes — the index phase only runs
+	// after ALL tables finish bulk_copy. Operators inspecting the
+	// target see "table has rows" and may conclude it migrated
+	// cleanly; in fact only the PK index is present. The substring
+	// matches the wrapper prefix in migrate_bulk.go's copy-table
+	// failure paths so this fires for any underlying engine error.
+	{
+		phase:    PhaseBulkCopy,
+		contains: "pipeline: copy table",
+		hint:     "any earlier tables in this run have data but NOT their declared secondary indexes (the indexes phase runs after ALL tables finish bulk-copy); use --resume to continue after fixing the offending table, or --exclude-table=<name> to skip it",
+	},
+
 	// Connect-time DSN errors. These three cover the bulk of
 	// "I can't even start the migration" reports: the host is
 	// unreachable, the credentials are wrong, or the named
