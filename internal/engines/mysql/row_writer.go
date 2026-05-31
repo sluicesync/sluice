@@ -515,6 +515,22 @@ func prepareValue(v any, col *ir.Column) any {
 		return v
 	}
 	t := col.Type
+	// Bug 122 (v0.95.3): an ir.Domain column in the schema unwraps to
+	// its base type for value-prep purposes. The MySQL retarget layer
+	// downgrades the DOMAIN to its base type in the COLUMN DDL emit
+	// path, but the COLUMN-list passed to prepareValue carries the
+	// source's IR types verbatim. Synthesize a column whose Type is
+	// the base type and recurse so every downstream branch
+	// (Set / JSON / Array / Time-stripping / scalar passthrough)
+	// reaches its existing case.
+	if dom, isDomain := t.(ir.Domain); isDomain {
+		if dom.BaseType == nil {
+			return v
+		}
+		baseCol := *col
+		baseCol.Type = dom.BaseType
+		return prepareValue(v, &baseCol)
+	}
 	if _, isSet := t.(ir.Set); isSet {
 		if ss, ok := v.([]string); ok {
 			return strings.Join(ss, ",")
