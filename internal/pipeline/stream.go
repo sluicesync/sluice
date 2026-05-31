@@ -892,7 +892,11 @@ func (b *BackupStream) runRollover(
 	}
 
 	manifest := &ir.Manifest{
-		FormatVersion:  ir.BackupFormatVersion,
+		// Bug 116 closure: same proportional version-stamp rule as
+		// other manifest constructors. Streaming incrementals inherit
+		// the parent's effective schema; if it carries security
+		// metadata, the streamed manifest is stamped FormatVersion=2.
+		FormatVersion:  ir.FormatVersionFor(beforeSchema),
 		SluiceVersion:  b.SluiceVersion,
 		CreatedAt:      now().UTC(),
 		SourceEngine:   b.Source.Name(),

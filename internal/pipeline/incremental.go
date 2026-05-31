@@ -325,7 +325,9 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 	}
 
 	manifest := &ir.Manifest{
-		FormatVersion:  ir.BackupFormatVersion,
+		// Bug 116 closure: stamp the smallest format version safe for
+		// this incremental's schema. Same proportional rule as fulls.
+		FormatVersion:  ir.FormatVersionFor(beforeSchema),
 		SluiceVersion:  b.SluiceVersion,
 		CreatedAt:      now().UTC(),
 		SourceEngine:   b.Source.Name(),
