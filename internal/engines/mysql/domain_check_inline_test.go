@@ -41,8 +41,11 @@ func TestEmitTableDef_DomainCheck_TextRegex_InlineCheckSupported(t *testing.T) {
 	if !strings.Contains(stmt, "REGEXP_LIKE(`email`,") {
 		t.Errorf("CREATE TABLE should contain REGEXP_LIKE on email; got:\n%s", stmt)
 	}
-	if !strings.Contains(stmt, `'^[^@]+@[^@]+\.[^@]+$'`) {
-		t.Errorf("CREATE TABLE should preserve the regex pattern; got:\n%s", stmt)
+	// v0.97.1: backslashes in the pattern are doubled in the SQL
+	// literal so MySQL's string parser produces `\.` for the regex,
+	// not `.` (which would match any char).
+	if !strings.Contains(stmt, `'^[^@]+@[^@]+\\.[^@]+$'`) {
+		t.Errorf("CREATE TABLE should preserve the regex pattern with backslash-doubled escape; got:\n%s", stmt)
 	}
 }
 

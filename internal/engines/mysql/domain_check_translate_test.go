@@ -28,25 +28,46 @@ func TestTranslateDomainCheckToMySQL(t *testing.T) {
 	}{
 		// --- Regex DOMAINs (the email_address exemplar) ---
 		{
-			name:      "regex with ::text cast (canonical PG output)",
+			// v0.97.1 fix: backslashes in the pattern double in the SQL
+			// literal so MySQL's string-literal parser produces `\.` for
+			// the regex engine, not `.` (which matches any char). Without
+			// this, the email regex's `\.` collapses to `.` and the
+			// constraint accepts `aliceXexample.com` (functionally
+			// harmless on this regex because `@` carries the rejection,
+			// but a strict-fidelity gap nonetheless).
+			name:      "regex with ::text cast (canonical PG output, v0.97.1 backslash-doubling)",
 			col:       "email",
 			body:      `(VALUE ~ '^[^@]+@[^@]+\.[^@]+$'::text)`,
 			wantOK:    true,
-			wantParts: []string{"REGEXP_LIKE(`email`,", `'^[^@]+@[^@]+\.[^@]+$'`},
+			wantParts: []string{"REGEXP_LIKE(`email`,", `'^[^@]+@[^@]+\\.[^@]+$'`},
 		},
 		{
-			name:      "regex without cast",
+			name:      "regex without cast (v0.97.1 backslash-doubling)",
 			col:       "email",
 			body:      `(VALUE ~ '^[^@]+@[^@]+\.[^@]+$')`,
 			wantOK:    true,
-			wantParts: []string{"REGEXP_LIKE(`email`,", `'^[^@]+@[^@]+\.[^@]+$'`},
+			wantParts: []string{"REGEXP_LIKE(`email`,", `'^[^@]+@[^@]+\\.[^@]+$'`},
 		},
 		{
-			name:      "regex without outer parens",
+			// No backslash in the pattern → no doubling needed; the
+			// translator emits the pattern verbatim.
+			name:      "regex without outer parens (no backslashes — verbatim emit)",
 			col:       "code",
 			body:      `VALUE ~ '^[A-Z]{3}$'`,
 			wantOK:    true,
 			wantParts: []string{"REGEXP_LIKE(`code`,", `'^[A-Z]{3}$'`},
+		},
+		{
+			// v0.97.1 pin for the strict-fidelity assertion: a PG-source
+			// backslash MUST appear as TWO backslashes in the emitted SQL
+			// literal so MySQL's string parser produces ONE backslash for
+			// the regex engine. Tests both common shorthands (`\d`, `\s`)
+			// and the literal-dot case at once.
+			name:      "regex with multiple backslash escapes (\\d, \\s, \\.) all doubled",
+			col:       "x",
+			body:      `VALUE ~ '^\d+\s\.[a-z]+$'`,
+			wantOK:    true,
+			wantParts: []string{`'^\\d+\\s\\.[a-z]+$'`},
 		},
 
 		// --- Range DOMAINs (the percentage exemplar) ---

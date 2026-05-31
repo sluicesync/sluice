@@ -6,6 +6,14 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`fix(mysql): double-escape backslashes in PG → MySQL DOMAIN CHECK regex emission (v0.97.0 strict-fidelity follow-up)`** — v0.97.0's inline-CHECK translator emitted the source regex pattern into MySQL's SQL string literal without escaping backslashes. MySQL's string-literal parser treats `\` as an escape character by default, so the literal `'\.'` arrived at the regex engine as `.` (any character) rather than `\.` (literal dot). The email-DOMAIN regex `^[^@]+@[^@]+\.[^@]+$` stayed *functionally* correct (the `@` and negated character classes carried the rejection — an input without `@` was still rejected, an input with `@` but matching the `[^@]+\.[^@]+` shape was still accepted), but the stored expression diverged from PG's source semantics — a strict-fidelity gap flagged by the v0.97.0 post-release cycle. v0.97.1 closes the gap: `translateRegexCheckBody` now `strings.ReplaceAll(pattern, \`\\\`, \`\\\\\`)` before passing to `quoteSQLString`, so the SQL literal `'\\.'` arrives at the regex engine as `\.` regardless of the operator's `SQL_MODE` setting. PG regex shorthands (`\d`, `\s`, `\w`, `\b`) translate the same way. Pinned by an updated `TestTranslateDomainCheckToMySQL` sub-pin asserting the doubly-escaped emission AND a new sub-pin exercising multiple backslash escapes in the same pattern (`\d+\s\.[a-z]+`).
+
+### Added (docs)
+
+- **`docs(cookbook): three more recipes — sluice vs pg_dump, Heroku migration, PostGIS round-trip`** — extends the v0.97.0 cookbook scaffolding with the operator-facing comparisons + walkthroughs the existing breadth was missing. `compare-pg-dump.md` is the "why not just use pg_dump?" answer; `recipe-heroku-migration.md` is the slot-less managed-PG walkthrough that doubles as the canonical RDS / Crunchy Bridge / Supabase template; `recipe-postgis.md` is the cross-engine geometry round-trip recipe demonstrating the Bug 26/27 closure. All three link in from `docs/cookbook/README.md`.
+
 ## [0.97.0] - 2026-05-31
 
 ### Added

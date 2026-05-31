@@ -225,29 +225,30 @@ VALUES (1, tstzrange('2026-06-01 09:15:00+00', '2026-06-01 09:45:00+00'), 'colli
 All three rejections should fire. The source's invariants are now
 the target's invariants — that's the point.
 
-### A known v0.97.0 caveat — strict regex-dot fidelity
+### A v0.97.0 → v0.97.1 fidelity follow-up — strict regex-dot fidelity
 
-The PG → MySQL regex translation in v0.97.0 emits the source regex
-verbatim into MySQL's `REGEXP_LIKE`. PG and MySQL share the basic
-regex surface (`^`, `$`, `[]`, `+`, `*`, character classes), but
-they diverge on escaped metacharacters — PG `\.` (escaped dot, matches
-literal `.`) lands as MySQL `.` (which matches any single character)
-in the stored CHECK expression.
+Initial v0.97.0 release emitted the regex pattern into MySQL's SQL
+string literal without escaping the source backslashes. MySQL's
+string-literal parser treats `\` as an escape character by default,
+so the literal `'\.'` arrived at the regex engine as `.` (any
+character) rather than `\.` (literal dot). The constraint stayed
+functionally correct for the email case — the `@` and negated
+character classes carried the rejection — but the stored expression
+diverged from the source semantics.
 
-For the email regex above (`^[^@]+@[^@]+\.[^@]+$`) this is
-**functionally harmless** — the `@` and the negated character classes
-do the heavy lifting; an input without a literal `.` would still be
-rejected because the `[^@]+\.[^@]+` portion requires at least one
-non-`@` character on each side of the dot. The strict-dot fidelity
-gap is filed as a v0.97.x stretch follow-up; operators who need
-byte-exact regex fidelity should hand-translate the CHECK against
-MySQL's ICU regex syntax.
+v0.97.1 closes the gap: backslashes in the source pattern are doubled
+when emitting the MySQL SQL literal, so `'\.'` arrives as `\.` at the
+regex engine regardless of the operator's `SQL_MODE` setting. The
+email regex now stores byte-faithfully on the MySQL target, and shared
+PG regex shorthands (`\d`, `\s`, `\w`, `\b`) translate the same way.
 
 This is the kind of carefully-bounded translation gap sluice's
-design tenet expects — loud failure on shapes that can't be carried
-*correctly*, observable behavior on shapes that translate
-*approximately*, and a documented path to operator-controlled fidelity
-when approximation isn't enough.
+design tenet expects — observed during the v0.97.0 validation cycle,
+filed honestly, closed in the next patch. Operators who hit a more
+exotic PG-vs-MySQL regex divergence (Unicode property escapes,
+lookbehind, possessive quantifiers) still need to hand-translate the
+CHECK against MySQL's ICU syntax; the loud-failure path covers those
+shapes by leaving the v0.96.2 WARN to fire.
 
 ## What happens cross-engine (PG → MySQL)?
 

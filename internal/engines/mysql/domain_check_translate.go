@@ -140,12 +140,25 @@ func translateDomainCheckToMySQL(col string, check ir.DomainCheck) (clause strin
 // escapes, possessive quantifiers) MAY differ between engines; for
 // v0.97.0 we accept that operators using those features need to
 // hand-translate. The fallback path (ok=false) is the v0.96.2 WARN.
+//
+// v0.97.1: backslashes in the pattern are doubled when emitting the
+// MySQL SQL literal. MySQL's string-literal parser treats `\` as an
+// escape character by default, so `'\.'` in the SQL literal arrives at
+// the regex engine as `.` (any character) rather than `\.` (literal
+// dot). Doubling backslashes — `'\\.' → MySQL string parser → \.` →
+// regex engine sees `\.` — preserves PG's escape semantics regardless
+// of the operator's SQL_MODE setting. Without this, the email regex
+// `^[^@]+@[^@]+\.[^@]+$` lands on dst as a constraint that matches
+// `aliceXexample.com` (the `\.` collapsing to `.` accepts any char
+// where the source rejected); functionally harmless on this specific
+// shape because the `@` carries the rejection, but a strict-fidelity
+// gap nonetheless.
 func translateRegexCheckBody(col, body string) (string, bool) {
 	m := regexCheckBodyPattern.FindStringSubmatch(body)
 	if m == nil {
 		return "", false
 	}
-	pattern := m[1]
+	pattern := strings.ReplaceAll(m[1], `\`, `\\`)
 	return fmt.Sprintf("CHECK (REGEXP_LIKE(%s, %s))", quoteIdent(col), quoteSQLString(pattern)), true
 }
 
