@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **`fix(postgres): refuse loudly when a column references a PG DOMAIN (Bug 113 closure)`** — pre-fix a column referencing a Postgres `CREATE DOMAIN` user-defined type (e.g. `CREATE DOMAIN email_address AS text CHECK (VALUE ~ '...@..\\..*')`) surfaced through `information_schema.columns` as the underlying base type — `information_schema` silently unwraps DOMAINs (`data_type` returns `text`, not `USER-DEFINED`) — so the PG schema reader translated the column to `ir.Text{}` and the DOMAIN's CHECK constraints disappeared on PG→PG migrate (CRITICAL silent-constraint-loss class: every input-validation invariant the operator encoded as a DOMAIN was silently destroyed on the target). The bug catalog (Bug 113) records this as a same-engine PG→PG class: the target accepted values the source would reject, with no WARN, no error, and exit 0. v0.95.1 reads `pg_type.typtype` directly alongside the per-column dispatch; when `typtype == 'd'` the reader refuses loudly at the read boundary so no partial schema lands on the target, and the operator gets a clear actionable error naming the table, column, and domain name, plus the recovery `ALTER TABLE … ALTER COLUMN … TYPE … USING …::…` shape. Per the bug-catalog suggested-fix: "Either is acceptable; silent-drop is not." Round-trip DOMAIN carry is queued for a v0.95.2 follow-up; this release ships the IR scaffolding (`ir.Domain{Name, BaseType, Checks}`, `ir.DomainCheck{Name, Body}`, `ir.ExtDomain` ExtensionKind, JSON tagged-union round-trip in `MarshalType` / `UnmarshalType`) and the loud-refusal. Negative control pinned alongside: a column referencing a `CREATE TYPE ... AS ENUM` (`pg_type.typtype == 'e'`, also `USER-DEFINED` in `information_schema`) continues to round-trip cleanly so the DOMAIN refusal doesn't over-broaden to every user-defined type and regress the v0.16.x ENUM handling. Pinned by `TestSchemaReader_DomainRefusal_Bug113` + `TestSchemaReader_DomainRefusal_NonDomainUserDefinedStillRoundTrips`.
+
 ## [0.95.0] - 2026-05-31
 
 ### Fixed
