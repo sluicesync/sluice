@@ -636,6 +636,9 @@ func (r *CDCReader) dispatchWAL(
 		if err := r.resolveIdentityKeyCols(ctx, entry); err != nil {
 			return fmt.Errorf("postgres: cdc: relation %s.%s: %w", m.Namespace, m.RelationName, err)
 		}
+		if err := checkSchemaRace(relations, m.RelationID, entry); err != nil {
+			return err
+		}
 		relations[m.RelationID] = entry
 		// ADR-0036 M3: log RelationMessage arrivals so the diagnostic
 		// run can correlate them with the publication-add LSN.
@@ -657,6 +660,9 @@ func (r *CDCReader) dispatchWAL(
 		}
 		if err := r.resolveIdentityKeyCols(ctx, entry); err != nil {
 			return fmt.Errorf("postgres: cdc: relation %s.%s: %w", m.Namespace, m.RelationName, err)
+		}
+		if err := checkSchemaRace(relations, m.RelationID, entry); err != nil {
+			return err
 		}
 		relations[m.RelationID] = entry
 		slog.DebugContext(

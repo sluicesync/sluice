@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased — v0.93.0 in progress]
+
+### Fixed
+
+- **`fix(postgres): refuse loudly on incompatible CDC schema-race situations mid-stream (Bugs 112 + 119 + 120 v0.93.0 closure)`** — pre-fix the applier's `colTypeCache` (keyed by `"schema.table"` with no invalidation) silently used stale shape when the source's relation changed mid-stream: Bug 112 (RENAME) saw writes to the renamed table vanish from dst because pgoutput's new RelationMessage carried the new name while the dst still had the old name, so apply hit `errUnknownTable` and silently skipped; Bug 119 (DROP COLUMN) silently drifted dst's column populated as NULL on new INSERTs; Bug 120 (DROP+CREATE same name) silently dropped the new relation's writes onto the orphaned old cache entry. The shared root cause is the applier's cache having no awareness of relation-OID changes mid-stream. v0.93.0 adds `detectIncompatibleRelationChange` + `checkSchemaRace` in the CDC reader's RelationMessage handler (`internal/engines/postgres/cdc_relations.go`) that compare every incoming RelationMessage against the previously-cached entry for the same OID, and scan the relations map for any orphaned entry with the same `(Schema, Name)` but a different OID. Detected RENAME / DROP COLUMN / RENAME COLUMN / ALTER COLUMN TYPE / DROP+CREATE all surface as a loud stream-killing error naming the table, OID(s), and the drained-model recovery hint (`sluice sync stop --wait` → migration tool → `sluice sync start --resume`). ADD COLUMN appended at the end remains compatible — the existing ADR-0058 `--forward-schema-add-column` opt-in forwarding path continues to work. Pinned by `TestDetectIncompatibleRelationChange` (9 sub-pins covering each shape including the benign re-send pgoutput emits on reconnect) + `TestCheckSchemaRace_DROPCREATESameNameDifferentOID` + `TestCheckSchemaRace_SameOIDReentryIsBenign` + `TestCheckSchemaRace_ADDColumnIsCompatible`. Concurrency-adjacent — `-race` integration gate runs on the push-first-tag-after branch before tag cut per CLAUDE.md.
+
 ## [0.92.4] - 2026-05-31
 
 ### Fixed
