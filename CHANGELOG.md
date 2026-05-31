@@ -6,6 +6,10 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`fix(mysql): emit structured WARN on cross-engine PG → MySQL DOMAIN-CHECK silent-downgrade (Bug 113 PG→MySQL follow-up closure)`** — v0.95.2/v0.95.3 closed Bug 113 round-trip carry on same-engine PG → PG (`CREATE DOMAIN` emitted, CHECK preserved, row stream byte-faithful). The cross-engine PG → MySQL path's row stream also carried (Bug 122 fix covers cross-engine), but the MySQL writer silently downgraded the DOMAIN column to its base type with no WARN and no MySQL-level CHECK inlined — a residual silent-CHECK-loss class on the cross-engine path, same family as the original Bug 113. v0.96.2 adds `maybeWarnDomainCheckDrop` to `internal/engines/mysql/schema_writer.go` alongside the existing RLS-drop WARN pattern: at `CreateTablesWithoutConstraints` time, walk every table's columns, collect tuples of `(table.column, source_domain, target_base_type, check_count)` for every `ir.Domain`-typed column, and emit one structured `slog.WarnContext` per writer lifetime (one per stream, sync.Once-gated to avoid per-column flooding) carrying `affected_column_count`, `affected_columns`, `source_domains`, `target_base_types`, `check_constraint_dropped`, and an actionable `hint` line ("add a MySQL table-level CHECK (MySQL 8.0.16+) manually if input validation matters, or re-target to PG to preserve the DOMAIN"). The DOMAIN's MySQL base type is computed by recursing through the writer's existing `emitColumnType` so the WARN names the actual target MySQL spelling (e.g. `TINYTEXT`/`LONGTEXT` for PG `text` DOMAINs, `DECIMAL(65,30)` for unconstrained `numeric` DOMAINs). Same-engine MySQL → PG / MySQL → MySQL is unaffected (MySQL has no DOMAIN; the MySQL SchemaReader never populates `ir.Domain`). Pinned by `TestMaybeWarnDomainCheckDrop_*` covering text-DOMAIN, numeric-DOMAIN, MySQL-source-no-op, sync.Once-across-many-columns, sync.Once-across-many-calls, CHECK-less DOMAIN still WARNs, per-writer independence, and nil-schema defensiveness — 8 sub-pins mirroring the RLS WARN test matrix.
+
 ## [0.96.1] - 2026-05-31
 
 ### Fixed

@@ -49,6 +49,22 @@ type SchemaWriter struct {
 	// the PG → MySQL direction. Same-engine MySQL → PG passes
 	// through cleanly (MySQL sources never populate the RLS fields).
 	rlsWarnOnce sync.Once
+
+	// domainWarnOnce gates the cross-engine PG → MySQL DOMAIN-CHECK
+	// silent-downgrade WARN (residual carry-over from v0.95.x Bug 113
+	// round-trip closure). When a PG source has a column typed as a
+	// DOMAIN with attached CHECK constraints, the MySQL writer
+	// downgrades the column to the DOMAIN's base type (MySQL has no
+	// DOMAIN counterpart) — the column shape is preserved but the
+	// CHECK constraint is dropped. Without a WARN this is a silent
+	// CHECK-loss class on the cross-engine path (same family as the
+	// original Bug 113). One WARN per writer lifetime carries the
+	// list of affected (column, source_domain, target_base_type)
+	// tuples plus the count of dropped CHECK constraints. Same-engine
+	// PG → PG is unaffected (Bug 113 round-trip carry handles it);
+	// MySQL-source schemas never populate ir.Domain so MySQL → PG /
+	// MySQL → MySQL pass through cleanly.
+	domainWarnOnce sync.Once
 }
 
 // Close releases the underlying connection pool.
@@ -68,6 +84,7 @@ func (w *SchemaWriter) CreateTablesWithoutConstraints(ctx context.Context, s *ir
 		return fmt.Errorf("mysql: CreateTablesWithoutConstraints: schema is nil")
 	}
 	w.maybeWarnRLSDrop(ctx, s)
+	w.maybeWarnDomainCheckDrop(ctx, s)
 	for _, table := range orderedTables(s) {
 		stmt, err := emitTableDef(table)
 		if err != nil {
@@ -124,6 +141,92 @@ func (w *SchemaWriter) maybeWarnRLSDrop(ctx context.Context, s *ir.Schema) {
 			slog.String("affected_tables", strings.Join(affected, ",")),
 			slog.String("hint", "MySQL has no RLS equivalent — operators routing PG → MySQL "+
 				"accept the policy-layer drop, or re-target to PG (ADR-0063)"),
+		)
+	})
+}
+
+// maybeWarnDomainCheckDrop logs a single WARN per writer lifetime
+// when the incoming schema carries any column typed as ir.Domain
+// (residual carry-over from v0.95.x Bug 113 round-trip closure).
+// MySQL has no DOMAIN counterpart; the writer's emitColumnType
+// downgrades the column to the DOMAIN's base type (preserves the
+// column shape) but the DOMAIN's CHECK constraints attached to the
+// type are NOT re-emitted as MySQL table-level CHECKs. Without this
+// WARN that's a silent CHECK-loss class on the cross-engine path —
+// same family as the original Bug 113 silent-constraint-loss class.
+//
+// One WARN per writer lifetime carries the comma-joined list of
+// affected columns (in "table.column" form), the parallel list of
+// source DOMAIN names, the parallel list of target MySQL base types,
+// and the count of dropped CHECK constraints. The structured fields
+// are machine-parseable for operators piping slog JSON.
+//
+// MySQL → PG never hits this path: MySQL has no DOMAIN, so the MySQL
+// SchemaReader never populates ir.Domain. Same-engine PG → PG is
+// handled by the Bug 113 round-trip carry (Phase 1a' CREATE DOMAIN
+// emission); only the PG → MySQL cross-engine path needs the WARN.
+func (w *SchemaWriter) maybeWarnDomainCheckDrop(ctx context.Context, s *ir.Schema) {
+	if s == nil {
+		return
+	}
+	type affectedCol struct {
+		table, column, domain, baseType string
+		checkCount                      int
+	}
+	var affected []affectedCol
+	totalChecks := 0
+	for _, t := range s.Tables {
+		if t == nil {
+			continue
+		}
+		for _, c := range t.Columns {
+			if c == nil {
+				continue
+			}
+			dom, ok := c.Type.(ir.Domain)
+			if !ok {
+				continue
+			}
+			baseSpelling := dom.Name
+			if dom.BaseType != nil {
+				if spelled, err := emitColumnType(dom.BaseType); err == nil {
+					baseSpelling = spelled
+				}
+			}
+			affected = append(affected, affectedCol{
+				table:      t.Name,
+				column:     c.Name,
+				domain:     dom.Name,
+				baseType:   baseSpelling,
+				checkCount: len(dom.Checks),
+			})
+			totalChecks += len(dom.Checks)
+		}
+	}
+	if len(affected) == 0 {
+		return
+	}
+	cols := make([]string, len(affected))
+	domains := make([]string, len(affected))
+	baseTypes := make([]string, len(affected))
+	for i, a := range affected {
+		cols[i] = a.table + "." + a.column
+		domains[i] = a.domain
+		baseTypes[i] = a.baseType
+	}
+	w.domainWarnOnce.Do(func() {
+		slog.WarnContext(
+			ctx,
+			"mysql: PG → MySQL downgrades DOMAIN-typed columns to their base type; "+
+				"DOMAIN CHECK constraints are NOT re-emitted as MySQL table-level CHECKs",
+			slog.Int("affected_column_count", len(affected)),
+			slog.String("affected_columns", strings.Join(cols, ",")),
+			slog.String("source_domains", strings.Join(domains, ",")),
+			slog.String("target_base_types", strings.Join(baseTypes, ",")),
+			slog.Int("check_constraint_dropped", totalChecks),
+			slog.String("hint", "MySQL has no DOMAIN equivalent; "+
+				"add a MySQL table-level CHECK (MySQL 8.0.16+) manually if input validation matters, "+
+				"or re-target to PG to preserve the DOMAIN"),
 		)
 	})
 }
