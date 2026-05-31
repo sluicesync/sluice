@@ -361,7 +361,12 @@ func (b *Backup) Run(ctx context.Context) error {
 	// appended (or copied from the prior run) as they finish; the
 	// manifest is committed after each table completes.
 	manifest := &ir.Manifest{
-		FormatVersion: ir.BackupFormatVersion,
+		// Bug 116 closure: stamp the smallest format version safe for
+		// this schema. Schemas using RLS / policies / exclude
+		// constraints get FormatVersion=2 so older binaries refuse
+		// rather than silently drop those fields; innocent schemas
+		// stay on FormatVersion=1 for max backward compatibility.
+		FormatVersion: ir.FormatVersionFor(schema),
 		SluiceVersion: b.SluiceVersion,
 		CreatedAt:     now().UTC(),
 		SourceEngine:  b.Source.Name(),

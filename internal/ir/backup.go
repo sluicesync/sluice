@@ -49,20 +49,88 @@ import (
 	"time"
 )
 
-// BackupFormatVersion is the integer version of the manifest schema.
-// Bumped whenever a non-additive change is made (a field added or
-// removed in a way that older readers couldn't safely ignore). Older
-// sluice refuses newer manifests with a clear error; newer sluice
-// always reads older.
+// BackupFormatVersion is the highest manifest-schema version this
+// build understands. Older sluice refuses newer manifests with a
+// clear error (preflight in `internal/pipeline.readManifest`); newer
+// sluice always reads older.
 //
 // v0.16.x manifests carry FormatVersion=1 (full backups only). v0.17.0
-// keeps FormatVersion=1: every Phase 3 addition is forward-compatible
-// (older sluice ignores [Manifest.Kind]/[Manifest.ParentBackupID]/etc.
+// kept FormatVersion=1: every Phase 3 addition was forward-compatible
+// (older sluice ignored [Manifest.Kind]/[Manifest.ParentBackupID]/etc.
 // — those manifests appear as orphan fulls when read by an older
 // binary, which is the right degraded behaviour for incrementals
-// nobody can chain anyway). The version bumps when a future change
-// would break older readers.
-const BackupFormatVersion = 1
+// nobody can chain anyway).
+//
+// v0.94.1 introduces FormatVersion=2 to close Bug 116: schema-
+// metadata fields ([Table.RLSEnabled], [Table.RLSForced],
+// [Table.Policies], [Table.ExcludeConstraints]) added under the
+// FormatVersion=1 "field-additions are forward-compatible" policy were
+// silently dropped by older binaries reading manifests written by
+// newer binaries — a CRITICAL silent-loss class for security policies
+// (RLS / policies) and correctness constraints (EXCLUDE). The fix is
+// proportional: a v0.94.1+ manifest is stamped FormatVersion=2 ONLY
+// when its schema actually uses one of those features; otherwise it
+// stays FormatVersion=1 and continues to restore on older binaries.
+// Older binaries reading a v2 manifest refuse loudly at the preflight
+// rather than silently dropping the security/correctness metadata.
+//
+// Going forward: any schema-metadata addition with security or
+// correctness implications bumps FormatVersion. Purely informational
+// or behaviorally-idempotent additions (e.g. annotations, statistics
+// hints) can stay under the field-additions-are-forward-compatible
+// rule.
+const BackupFormatVersion = 2
+
+// FormatVersionLegacy / FormatVersionSecurityMetadata name the
+// historically-recorded values so callers don't sprinkle bare ints
+// around. New code should use FormatVersionFor / chooseFormatVersion.
+const (
+	// FormatVersionLegacy is the pre-Bug-116 manifest version
+	// (v0.16.x..v0.94.0). Carries schema metadata under the
+	// "field-additions are forward-compatible" rule.
+	FormatVersionLegacy = 1
+
+	// FormatVersionSecurityMetadata is the v0.94.1+ version stamped
+	// on manifests whose schema uses security or correctness fields
+	// older binaries would silently drop. Bug 116 closure.
+	FormatVersionSecurityMetadata = 2
+)
+
+// chooseFormatVersion returns the smallest manifest format version
+// safe for the supplied schema: [FormatVersionSecurityMetadata] when
+// the schema uses any field older binaries would silently drop,
+// [FormatVersionLegacy] otherwise. nil schema → legacy (a manifest
+// with no schema can't carry security drift; degenerate cases stay
+// maximally compatible).
+//
+// Closes Bug 116 by proportionally bumping only the manifests that
+// actually carry the bumped-feature surface — innocent backups
+// continue to restore on older binaries.
+func chooseFormatVersion(s *Schema) int {
+	if s == nil {
+		return FormatVersionLegacy
+	}
+	for _, t := range s.Tables {
+		if t == nil {
+			continue
+		}
+		if t.RLSEnabled || t.RLSForced {
+			return FormatVersionSecurityMetadata
+		}
+		if len(t.Policies) > 0 {
+			return FormatVersionSecurityMetadata
+		}
+		if len(t.ExcludeConstraints) > 0 {
+			return FormatVersionSecurityMetadata
+		}
+	}
+	return FormatVersionLegacy
+}
+
+// FormatVersionFor is the exported wrapper around [chooseFormatVersion]
+// so the pipeline package (which builds [Manifest] values directly)
+// stamps the correct version without duplicating the detection logic.
+func FormatVersionFor(s *Schema) int { return chooseFormatVersion(s) }
 
 // Manifest kind constants. String literals are part of the on-disk
 // format; renaming requires a [BackupFormatVersion] bump.
