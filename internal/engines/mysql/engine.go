@@ -90,7 +90,17 @@ func (Engine) OpenSchemaWriter(ctx context.Context, dsn string) (ir.SchemaWriter
 	if err != nil {
 		return nil, err
 	}
-	return &SchemaWriter{db: db, schema: cfg.DBName}, nil
+	w := &SchemaWriter{db: db, schema: cfg.DBName}
+	// Probe SELECT VERSION() once at open so the v0.97.0 inline-CHECK
+	// path knows whether the target is MySQL 8.0.16+. A probe failure
+	// is non-fatal: zero-value inlineCheckSupported (false) preserves
+	// the pre-v0.97.0 WARN-only behavior, which is the safe default
+	// — no inline CHECK is emitted, no regression from prior releases.
+	var version string
+	if err := db.QueryRowContext(ctx, "SELECT VERSION()").Scan(&version); err == nil {
+		w.inlineCheckSupported = mysqlVersionSupportsInlineCheck(version)
+	}
+	return w, nil
 }
 
 // OpenRowReader returns a [RowReader] bound to the database identified
