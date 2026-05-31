@@ -50,6 +50,17 @@ type SchemaWriter struct {
 	// through cleanly (MySQL sources never populate the RLS fields).
 	rlsWarnOnce sync.Once
 
+	// inlineCheckSupported records whether the open MySQL server is
+	// at least 8.0.16 — the version that added enforced CHECK
+	// constraints. v0.97.0's PG → MySQL DOMAIN-CHECK inline translator
+	// gates its emission on this flag: on supported servers a
+	// translatable DOMAIN CHECK becomes a MySQL table-level CHECK on
+	// CREATE TABLE; on older servers it falls through to the v0.96.2
+	// WARN-only path. Probed once at writer open; zero value (false)
+	// is the safe default — no inline CHECK is emitted, no regression
+	// from pre-v0.97.0 behavior.
+	inlineCheckSupported bool
+
 	// domainWarnOnce gates the cross-engine PG → MySQL DOMAIN-CHECK
 	// silent-downgrade WARN (residual carry-over from v0.95.x Bug 113
 	// round-trip closure). When a PG source has a column typed as a
@@ -86,7 +97,7 @@ func (w *SchemaWriter) CreateTablesWithoutConstraints(ctx context.Context, s *ir
 	w.maybeWarnRLSDrop(ctx, s)
 	w.maybeWarnDomainCheckDrop(ctx, s)
 	for _, table := range orderedTables(s) {
-		stmt, err := emitTableDef(table)
+		stmt, err := emitTableDefWithDomainChecks(table, w.inlineCheckSupported)
 		if err != nil {
 			return err
 		}
@@ -171,10 +182,10 @@ func (w *SchemaWriter) maybeWarnDomainCheckDrop(ctx context.Context, s *ir.Schem
 	}
 	type affectedCol struct {
 		table, column, domain, baseType string
-		checkCount                      int
+		droppedChecks                   int
 	}
 	var affected []affectedCol
-	totalChecks := 0
+	totalDropped := 0
 	for _, t := range s.Tables {
 		if t == nil {
 			continue
@@ -187,6 +198,31 @@ func (w *SchemaWriter) maybeWarnDomainCheckDrop(ctx context.Context, s *ir.Schem
 			if !ok {
 				continue
 			}
+			// v0.97.0: when the target MySQL supports inline CHECK
+			// (8.0.16+) AND every attached DomainCheck translates, the
+			// column's CHECKs are preserved verbatim on the dst — no
+			// silent-CHECK-drop class to warn about. A column reaches
+			// this branch only when at least one CHECK didn't translate,
+			// when the version doesn't support CHECK at all, OR when
+			// the DOMAIN has zero CHECKs (the column type was just a
+			// type alias whose name doesn't carry to MySQL — still a
+			// shape difference worth flagging).
+			dropped := 0
+			for _, chk := range dom.Checks {
+				if !w.inlineCheckSupported {
+					dropped++
+					continue
+				}
+				if _, ok := translateDomainCheckToMySQL(c.Name, chk); !ok {
+					dropped++
+				}
+			}
+			// Column carries no silent-loss risk when it has at least
+			// one CHECK AND all CHECKs translated AND emit-time inlined
+			// them. Skip the WARN for that column.
+			if len(dom.Checks) > 0 && dropped == 0 {
+				continue
+			}
 			baseSpelling := dom.Name
 			if dom.BaseType != nil {
 				if spelled, err := emitColumnType(dom.BaseType); err == nil {
@@ -194,13 +230,13 @@ func (w *SchemaWriter) maybeWarnDomainCheckDrop(ctx context.Context, s *ir.Schem
 				}
 			}
 			affected = append(affected, affectedCol{
-				table:      t.Name,
-				column:     c.Name,
-				domain:     dom.Name,
-				baseType:   baseSpelling,
-				checkCount: len(dom.Checks),
+				table:         t.Name,
+				column:        c.Name,
+				domain:        dom.Name,
+				baseType:      baseSpelling,
+				droppedChecks: dropped,
 			})
-			totalChecks += len(dom.Checks)
+			totalDropped += dropped
 		}
 	}
 	if len(affected) == 0 {
@@ -223,7 +259,7 @@ func (w *SchemaWriter) maybeWarnDomainCheckDrop(ctx context.Context, s *ir.Schem
 			slog.String("affected_columns", strings.Join(cols, ",")),
 			slog.String("source_domains", strings.Join(domains, ",")),
 			slog.String("target_base_types", strings.Join(baseTypes, ",")),
-			slog.Int("check_constraint_dropped", totalChecks),
+			slog.Int("check_constraint_dropped", totalDropped),
 			slog.String("hint", "MySQL has no DOMAIN equivalent; "+
 				"add a MySQL table-level CHECK (MySQL 8.0.16+) manually if input validation matters, "+
 				"or re-target to PG to preserve the DOMAIN"),
@@ -383,7 +419,7 @@ func (w *SchemaWriter) PreviewDDL(_ context.Context, s *ir.Schema) ([]ir.DDLStat
 
 	// Phase 1: tables.
 	for _, table := range orderedTables(s) {
-		stmt, err := emitTableDef(table)
+		stmt, err := emitTableDefWithDomainChecks(table, w.inlineCheckSupported)
 		if err != nil {
 			return nil, err
 		}

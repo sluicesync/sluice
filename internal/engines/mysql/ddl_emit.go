@@ -820,11 +820,49 @@ func inlineAutoIncrementIndex(table *ir.Table) *ir.Index {
 // driver doesn't require it but it keeps logged statements consistent
 // with what a human would write.
 func emitTableDef(table *ir.Table) (string, error) {
+	return emitTableDefWithDomainChecks(table, false)
+}
+
+// emitTableDefWithDomainChecks is the v0.97.0 variant of emitTableDef
+// that conditionally inlines translatable PG DOMAIN CHECKs as MySQL
+// table-level CHECK clauses. inlineCheckSupported reflects whether
+// the target MySQL is at least 8.0.16 (probed at SchemaWriter open).
+// When inlineCheckSupported is false the function is byte-for-byte
+// equivalent to the v0.96.x emitTableDef.
+//
+// Columns whose ir.Type is ir.Domain are walked for each attached
+// DomainCheck; translatable ones (the regex + range shapes documented
+// in domain_check_translate.go) emit inline CHECK clauses alongside
+// the existing table.CheckConstraints. Un-translatable DOMAIN CHECKs
+// are silently dropped here — the v0.96.2 WARN at
+// maybeWarnDomainCheckDrop covers them.
+func emitTableDefWithDomainChecks(table *ir.Table, inlineCheckSupported bool) (string, error) {
 	if table == nil {
 		return "", fmt.Errorf("mysql: emitTableDef: table is nil")
 	}
 	if len(table.Columns) == 0 {
 		return "", fmt.Errorf("mysql: emitTableDef: table %q has no columns", table.Name)
+	}
+	// Pre-compute the inline DOMAIN CHECK clauses so the column-list
+	// trailing-comma logic below can know up-front whether to emit a
+	// comma. Order is stable (column iteration order × DomainCheck
+	// slice order) so DDL diffs against pg_dump round-trips are
+	// reproducible.
+	var domainCheckClauses []string
+	if inlineCheckSupported {
+		for _, col := range table.Columns {
+			dom, ok := col.Type.(ir.Domain)
+			if !ok {
+				continue
+			}
+			for _, chk := range dom.Checks {
+				clause, ok := translateDomainCheckToMySQL(col.Name, chk)
+				if !ok {
+					continue
+				}
+				domainCheckClauses = append(domainCheckClauses, clause)
+			}
+		}
 	}
 
 	var sb strings.Builder
@@ -839,6 +877,11 @@ func emitTableDef(table *ir.Table) (string, error) {
 	hasPK := table.PrimaryKey != nil
 	inlineIdx := inlineAutoIncrementIndex(table)
 	hasInlineIdx := inlineIdx != nil
+	tailHas := func() bool {
+		return hasPK || hasInlineIdx || len(table.CheckConstraints) > 0 || len(domainCheckClauses) > 0
+	}
+	hasUserChecks := len(table.CheckConstraints) > 0
+	hasDomainChecks := len(domainCheckClauses) > 0
 	for i, col := range table.Columns {
 		def, err := emitColumnDef(col)
 		if err != nil {
@@ -846,7 +889,7 @@ func emitTableDef(table *ir.Table) (string, error) {
 		}
 		sb.WriteString("  ")
 		sb.WriteString(def)
-		if i < len(table.Columns)-1 || hasPK || hasInlineIdx || len(table.CheckConstraints) > 0 {
+		if i < len(table.Columns)-1 || tailHas() {
 			sb.WriteByte(',')
 		}
 		sb.WriteByte('\n')
@@ -855,7 +898,7 @@ func emitTableDef(table *ir.Table) (string, error) {
 	if hasPK {
 		sb.WriteString("  PRIMARY KEY ")
 		sb.WriteString(emitIndexColumnList(table.PrimaryKey.Columns))
-		if hasInlineIdx || len(table.CheckConstraints) > 0 {
+		if hasInlineIdx || hasUserChecks || hasDomainChecks {
 			sb.WriteByte(',')
 		}
 		sb.WriteByte('\n')
@@ -875,7 +918,7 @@ func emitTableDef(table *ir.Table) (string, error) {
 		sb.WriteString(quoteIdent(inlineIdx.Name))
 		sb.WriteByte(' ')
 		sb.WriteString(emitIndexColumnList(inlineIdx.Columns))
-		if len(table.CheckConstraints) > 0 {
+		if hasUserChecks || hasDomainChecks {
 			sb.WriteByte(',')
 		}
 		sb.WriteByte('\n')
@@ -892,7 +935,20 @@ func emitTableDef(table *ir.Table) (string, error) {
 		}
 		sb.WriteString("  ")
 		sb.WriteString(clause)
-		if i < len(table.CheckConstraints)-1 {
+		if i < len(table.CheckConstraints)-1 || hasDomainChecks {
+			sb.WriteByte(',')
+		}
+		sb.WriteByte('\n')
+	}
+
+	// v0.97.0: PG DOMAIN-derived CHECK clauses emit alongside the
+	// user-declared table.CheckConstraints (same semantic shape — both
+	// are inline CHECK clauses on this CREATE TABLE). The translator
+	// has already produced fully-formed `CHECK (...)` text per clause.
+	for i, clause := range domainCheckClauses {
+		sb.WriteString("  ")
+		sb.WriteString(clause)
+		if i < len(domainCheckClauses)-1 {
 			sb.WriteByte(',')
 		}
 		sb.WriteByte('\n')
