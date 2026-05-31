@@ -190,6 +190,73 @@ func TestBuildSQL_VerbatimTypeCasts(t *testing.T) {
 	})
 }
 
+// TestPrepareApplierValue_VerbatimTypeBytesBecomeString pins the v0.92.4
+// Bug 97 wire-encoding REDO. v0.92.3 added explicit `$N::TYPE` casts in
+// the apply SQL but the cycle subagent found the fix didn't actually
+// close the bug for money/pg_lsn: PG received the value as bytea
+// (because pgx binds Go `[]byte` as bytea) and the implicit
+// `bytea → TYPE` cast fails through the `\x…` text form. prepareApplierValue
+// must convert `[]byte` to `string` for ir.VerbatimType columns so pgx
+// binds as text and PG's `text::TYPE` parse sees the canonical form.
+func TestPrepareApplierValue_VerbatimTypeBytesBecomeString(t *testing.T) {
+	colTypes := map[string]ir.Type{
+		"price": ir.VerbatimType{Definition: "money"},
+		"lsn":   ir.VerbatimType{Definition: "pg_lsn"},
+		"doc":   ir.VerbatimType{Definition: "xml"},
+		"plain": ir.Text{Size: ir.TextLong},
+	}
+
+	cases := []struct {
+		name string
+		col  string
+		in   any
+		want any
+	}{
+		{
+			name: "money bytes → string",
+			col:  "price",
+			in:   []byte("$99.99"),
+			want: "$99.99",
+		},
+		{
+			name: "pg_lsn bytes → string",
+			col:  "lsn",
+			in:   []byte("0/3000000"),
+			want: "0/3000000",
+		},
+		{
+			name: "xml bytes → string (uniform across families)",
+			col:  "doc",
+			in:   []byte("<a/>"),
+			want: "<a/>",
+		},
+		{
+			name: "money string → string (idempotent)",
+			col:  "price",
+			in:   "$50.00",
+			want: "$50.00",
+		},
+		{
+			name: "plain text bytes preserved as bytes (not a verbatim column)",
+			col:  "plain",
+			in:   []byte("hello"),
+			want: []byte("hello"),
+		},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			got, err := prepareApplierValue(c.in, colTypes, c.col)
+			if err != nil {
+				t.Fatalf("prepareApplierValue: %v", err)
+			}
+			if !reflect.DeepEqual(got, c.want) {
+				t.Errorf("got %#v (%T); want %#v (%T)", got, got, c.want, c.want)
+			}
+		})
+	}
+}
+
 func TestBuildUpdateSQL(t *testing.T) {
 	before := ir.Row{"id": int64(7), "email": "old@example.com"}
 	after := ir.Row{"id": int64(7), "email": "new@example.com", "active": false}

@@ -1837,6 +1837,21 @@ func nonGeneratedRowKeys(row ir.Row, generated map[string]bool) []string {
 // Routing through the shared helper keeps any future shaping rules
 // added to prepareValue (for new IR types or new corner cases)
 // automatically picked up by the applier without touching this file.
+//
+// v0.92.4 Bug 97 wire-encoding REDO: for ir.VerbatimType columns the
+// applier emits explicit `$N::<TYPE>` casts in the SQL (v0.92.3). But
+// pgx's database/sql adapter binds Go `[]byte` as PG bytea on the
+// wire; PG then evaluates `bytea::<TYPE>` which goes through an
+// implicit `bytea → text` cast that produces a `\x…` hex literal,
+// which then fails the `text → <TYPE>` parse with `invalid input
+// syntax for type <TYPE>: "\x…"`. (Observed concretely against money
+// and pg_lsn on the v0.92.3 verification cycle.) The fix: when the
+// shared helper returns `[]byte` for a verbatim column, convert to
+// string so pgx binds as text, and PG's cast machinery sees the
+// actual canonical text form (`$99.99`, `0/3000000`, …). xml /
+// tsvector / int4range syntactically tolerated the bytea-hex form
+// pre-v0.92.4 and round-tripped, but the conversion is uniform —
+// every verbatim family lands as text on the wire.
 func prepareApplierValue(v any, colTypes map[string]ir.Type, colName string) (any, error) {
 	if colTypes == nil {
 		return v, nil
@@ -1845,7 +1860,16 @@ func prepareApplierValue(v any, colTypes map[string]ir.Type, colName string) (an
 	if !ok {
 		return v, nil
 	}
-	return prepareValue(v, t)
+	out, err := prepareValue(v, t)
+	if err != nil {
+		return nil, err
+	}
+	if _, isVerbatim := t.(ir.VerbatimType); isVerbatim {
+		if b, isBytes := out.([]byte); isBytes {
+			return string(b), nil
+		}
+	}
+	return out, nil
 }
 
 // (sortedKeys is shared with the schema reader — see schema_reader.go
