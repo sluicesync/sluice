@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased — v0.92.4 in progress]
+
+### Fixed
+
+- **`fix(postgres): convert []byte to string for ir.VerbatimType columns in prepareApplierValue (Bug 97 wire-encoding REDO — v0.92.3 partial-close did not actually close it)`** — v0.92.3 added explicit `$N::TYPE` casts in the apply SQL, but the v0.92.3 verification cycle found the bug STILL reproduces for `money` and `pg_lsn`: pgx's `database/sql` adapter binds Go `[]byte` as PG `bytea` on the wire, so PG evaluates `bytea::TYPE` which goes through an implicit `bytea → text` cast producing a `\x…` hex literal, which then fails the `text → TYPE` parse with `invalid input syntax for type money: "\x2439392e3939"` / `pg_lsn: "\x302f33303030303030"`. `xml` / `tsvector` / `int4range` syntactically tolerated the bytea-hex form. v0.92.4 closes the second wire-format layer: `prepareApplierValue` now converts `[]byte` to `string` for `ir.VerbatimType` columns so pgx binds as text. PG's cast machinery then sees the canonical text form (`$99.99`, `0/3000000`, etc.). Pinned by `TestPrepareApplierValue_VerbatimTypeBytesBecomeString` (5 sub-pins covering money / pg_lsn / xml / string-idempotency / non-verbatim-byte-passthrough). Bug 74 family-dispatch lesson applied uniformly across every verbatim family.
+
 ## [0.92.3] - 2026-05-31
 
 ### Fixed
