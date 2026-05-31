@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **`feat(postgres): round-trip PG DOMAIN with CHECK constraints (Bug 113 full closure)`** — v0.95.1 shipped the loud-refuse closure for Bug 113 (silent CHECK-constraint loss prevented at the read boundary). v0.95.2 rotates to actual round-trip carry: the PG schema reader pre-reads every DOMAIN's CHECK definitions via `pg_get_constraintdef` (`readDomainChecks` — keyed by `pg_type.typname`, joined to `pg_constraint` on `contypid` + `contype='c'`), and `populateColumns` wraps the column's BASE-translated IR type in `ir.Domain{Name, BaseType, Checks}` when `pg_type.typtype == 'd'`. The base IR type comes for free because `information_schema.columns` unwraps DOMAINs at every field it exposes (`data_type`, `udt_name`, `char_max_len`, etc.) so the existing `translateType` call produces the base type; the DOMAIN-specific metadata (name + CHECKs) is wrapped on AFTER. PG schema writer adds Phase 1a' (after Phase 1a enum types, before Phase 1b tables): walk every column for `ir.Domain`, dedupe by `Name`, emit `CREATE DOMAIN <schema>.<name> AS <base type DDL> [CONSTRAINT <name>] CHECK (<body>);` so column references in CREATE TABLE resolve to the just-created DOMAIN. `emitColumnType` dispatches `ir.Domain` to emit the schema-qualified DOMAIN name (NOT the base type's DDL) when a table-column reference is rendered. Cross-engine PG→MySQL: MySQL has no DOMAIN counterpart; the MySQL writer downgrades to the DOMAIN's BASE type DDL (a partial close — the CHECK constraints attached to the DOMAIN are not yet re-emitted as table-level CHECKs; tracked as a follow-up). Pinned by `TestSchemaReader_DomainRoundTrip_Bug113` (DOMAIN round-trips as `ir.Domain` with BaseType=`ir.Text` + one CHECK with non-empty body) + `TestSchemaReader_DomainRoundTrip_NonDomainUserDefinedStillRoundTrips` (negative control: ENUM still round-trips as `ir.Enum`, not wrapped as Domain).
+
 ## [0.95.1] - 2026-05-31
 
 ### Fixed

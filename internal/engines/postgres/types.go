@@ -115,6 +115,18 @@ type columnMeta struct {
 	// first-class dispatch; this flag is the last carry before the
 	// refusal, not a reroute of recognised shapes.
 	VerbatimEligible bool
+
+	// IsDomain + DomainName carry the Bug 113 (v0.95.2) DOMAIN-
+	// detection signal from populateColumns through the per-column
+	// translate step. information_schema.columns unwraps DOMAINs at
+	// every column it exposes, so the existing translateType call
+	// produces the BASE IR type; the populateColumns site (after
+	// translateType returns) wraps that base type in ir.Domain when
+	// IsDomain is set. DomainName is the operator-declared identifier
+	// resolved via pg_type.typname (information_schema's udt_name
+	// ALSO unwraps so it is unreliable here).
+	IsDomain   bool
+	DomainName string
 }
 
 // geometryColumnInfo carries PostGIS's per-column metadata as

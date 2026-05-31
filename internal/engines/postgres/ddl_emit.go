@@ -189,6 +189,22 @@ func emitColumnType(t ir.Type, opts emitOpts) (string, error) {
 	case ir.Enum:
 		return "", errors.New("postgres: Enum DDL emission requires column context (table+column); use emitColumnDef")
 
+	// Bug 113 round-trip carry (v0.95.2). When a column's type is a
+	// DOMAIN, emit the operator-declared DOMAIN identifier (NOT the
+	// base type's DDL spelling); the writer's Phase 1a' has already
+	// emitted `CREATE DOMAIN <name> AS <base> CHECK (...)` before any
+	// table reference, so the column's CREATE TABLE clause just
+	// references the name. The target schema's `<target-schema>.<name>`
+	// qualification is applied when opts.TargetSchema is non-empty
+	// (mirrors the enum-type qualification rule). Empty TargetSchema
+	// emits the unqualified ident — the pre-ADR-0031 shape relying on
+	// the DOMAIN living in the search_path's default schema.
+	case ir.Domain:
+		if opts.TargetSchema == "" {
+			return quoteIdent(v.Name), nil
+		}
+		return quoteIdent(opts.TargetSchema) + "." + quoteIdent(v.Name), nil
+
 	// PostGIS-aware GEOMETRY emission. With the extension detected
 	// at writer-open time, geometry(<subtype>, <srid>) carries the
 	// IR's subtype and SRID into a typed PostGIS column. Without it,
@@ -808,6 +824,43 @@ func pgIndexName(tableName, sourceName string) string {
 		return sourceName
 	}
 	return full
+}
+
+// emitCreateDomainType produces a CREATE DOMAIN statement for a single
+// DOMAIN. Bug 113 round-trip carry (v0.95.2). Emits the schema-
+// qualified DOMAIN name + the base type's DDL spelling + one CHECK
+// clause per recorded constraint. Source ordering of CHECKs is
+// preserved verbatim — PG evaluates them in catalog order, which is
+// the source's declaration order after read-back.
+//
+// Returns a non-nil error when the base type can't be rendered
+// (e.g. a nested DOMAIN whose base is itself a USER-DEFINED type
+// the IR doesn't model — exceedingly rare in practice).
+func emitCreateDomainType(d ir.Domain, schema string, opts emitOpts) (string, error) {
+	if d.BaseType == nil {
+		return "", fmt.Errorf("postgres: emitCreateDomainType: DOMAIN %q has nil BaseType", d.Name)
+	}
+	baseDDL, err := emitColumnType(d.BaseType, opts)
+	if err != nil {
+		return "", fmt.Errorf("postgres: emitCreateDomainType: DOMAIN %q base type: %w", d.Name, err)
+	}
+	out := fmt.Sprintf(
+		"CREATE DOMAIN %s.%s AS %s",
+		quoteIdent(schema),
+		quoteIdent(d.Name),
+		baseDDL,
+	)
+	for _, c := range d.Checks {
+		// pg_get_constraintdef-stripped Body holds the bare expression
+		// (no `CHECK (...)` wrapper). Re-wrap on emit; preserve the
+		// constraint name when the source declared one.
+		if c.Name != "" {
+			out += fmt.Sprintf(" CONSTRAINT %s CHECK (%s)", quoteIdent(c.Name), c.Body)
+		} else {
+			out += fmt.Sprintf(" CHECK (%s)", c.Body)
+		}
+	}
+	return out + ";", nil
 }
 
 // emitCreateEnumType produces a CREATE TYPE statement for a single

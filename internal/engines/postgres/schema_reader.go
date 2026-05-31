@@ -223,7 +223,21 @@ func (r *SchemaReader) ReadSchema(ctx context.Context) (*ir.Schema, error) {
 			return nil, fmt.Errorf("postgres: read geography columns: %w", err)
 		}
 
-		if err := r.populateColumns(ctx, tables, enumValues, geomInfo, geogInfo); err != nil {
+		// Bug 113 (v0.95.2 round-trip carry): pre-read every DOMAIN's
+		// CHECK constraints so populateColumns can wrap a base-type-
+		// translated column in ir.Domain. The base IR type comes for
+		// free from translateType because information_schema.columns
+		// unwraps DOMAINs at every column it exposes (data_type,
+		// udt_name, char_max_len, etc. all carry the BASE type's
+		// values); the only DOMAIN-specific metadata that requires
+		// a separate catalog read is the DOMAIN's name and its
+		// CHECK definitions.
+		domainChecks, err := r.readDomainChecks(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("postgres: read domain checks: %w", err)
+		}
+
+		if err := r.populateColumns(ctx, tables, enumValues, geomInfo, geogInfo, domainChecks); err != nil {
 			return nil, fmt.Errorf("postgres: read columns: %w", err)
 		}
 		if err := r.populateIndexes(ctx, tables); err != nil {
@@ -493,6 +507,70 @@ func (r *SchemaReader) readEnumValues(ctx context.Context) (map[string][]string,
 	return out, rows.Err()
 }
 
+// readDomainChecks fetches every DOMAIN in the bound schema along with
+// its CHECK-constraint definitions. Returns a map keyed by the DOMAIN
+// name (pg_type.typname) to the list of recorded checks. Empty inner
+// slice for a DOMAIN with no CHECKs (rare — most operator-declared
+// DOMAINs carry at least one CHECK, but the IR shape allows a name-only
+// "type alias" DOMAIN to round-trip too).
+//
+// Bug 113 round-trip carry (v0.95.2). The DOMAIN's name and CHECKs are
+// the only metadata not exposed by information_schema.columns —
+// information_schema unwraps DOMAINs to their base type at every column
+// it exposes, so the base IR type comes for free from translateType.
+// This helper supplies the wrapping context. pg_get_constraintdef is
+// used to render the CHECK body verbatim; the `CHECK (...)` wrapper is
+// stripped so the IR's [ir.DomainCheck.Body] holds the bare expression.
+func (r *SchemaReader) readDomainChecks(ctx context.Context) (map[string][]ir.DomainCheck, error) {
+	const q = `
+		SELECT t.typname,
+		       COALESCE(con.conname, '')                     AS conname,
+		       COALESCE(pg_get_constraintdef(con.oid, true), '') AS condef
+		FROM   pg_type t
+		JOIN   pg_namespace n ON n.oid = t.typnamespace
+		LEFT JOIN pg_constraint con
+		       ON con.contypid = t.oid
+		      AND con.contype  = 'c'
+		WHERE  n.nspname = $1
+		  AND  t.typtype = 'd'
+		ORDER  BY t.typname, con.conname`
+
+	rows, err := r.db.QueryContext(ctx, q, r.schema)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	out := map[string][]ir.DomainCheck{}
+	for rows.Next() {
+		var name, conname, condef string
+		if err := rows.Scan(&name, &conname, &condef); err != nil {
+			return nil, err
+		}
+		// Ensure the DOMAIN is present in the map even when it has no
+		// CHECKs (a name-only DOMAIN is still a DOMAIN that needs
+		// CREATE DOMAIN emit on the target).
+		if _, exists := out[name]; !exists {
+			out[name] = []ir.DomainCheck{}
+		}
+		if condef == "" {
+			continue
+		}
+		// pg_get_constraintdef returns `CHECK (<body>)`; strip the
+		// outer `CHECK (` and trailing `)` so the IR's
+		// DomainCheck.Body holds the bare expression. The writer
+		// re-wraps with `CHECK (...)` on emit.
+		body := condef
+		const prefix = "CHECK ("
+		if strings.HasPrefix(body, prefix) {
+			body = strings.TrimPrefix(body, prefix)
+			body = strings.TrimSuffix(body, ")")
+		}
+		out[name] = append(out[name], ir.DomainCheck{Name: conname, Body: body})
+	}
+	return out, rows.Err()
+}
+
 // readGeometryColumnInfo loads per-column PostGIS subtype + SRID
 // metadata from the geometry_columns view. The view is created by
 // the PostGIS extension; when PostGIS isn't installed, the SELECT
@@ -659,7 +737,7 @@ func isUndefinedRelationErr(err error) bool {
 // server_encoding is global — so the Charset field on the IR types
 // stays empty for PG sources. MySQL writers accept that as "use the
 // table / database default."
-func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*ir.Table, enumValues map[string][]string, geomInfo, geogInfo map[string]geometryColumnInfo) error {
+func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*ir.Table, enumValues map[string][]string, geomInfo, geogInfo map[string]geometryColumnInfo, domainChecks map[string][]ir.DomainCheck) error {
 	// COALESCE(a.atttypmod, -1) supplies the per-column typmod for
 	// extension-owned types whose modifiers ride on atttypmod
 	// (pgvector dimension; future PostGIS subtype/SRID). -1 is the
@@ -759,47 +837,6 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 			continue
 		}
 
-		// Bug 113 (v0.95.1): loud-refuse the silent constraint-loss
-		// class. A column whose pg_type.typtype == 'd' references an
-		// operator-declared DOMAIN (e.g. CREATE DOMAIN email_address
-		// AS text CHECK (VALUE ~ '...')). information_schema.columns
-		// unwraps the DOMAIN — data_type returns 'text', not
-		// 'USER-DEFINED' — so pre-v0.95.1 the existing dispatch saw
-		// a plain text column and silently dropped the DOMAIN's
-		// CHECK constraints on PG→PG migrate. The bug catalog (Bug
-		// 113) classes this as CRITICAL silent-constraint-loss for
-		// any operator who encoded input-validation invariants as
-		// DOMAINs. v0.95.1 ships only the loud-refusal closure —
-		// the operator gets a clear actionable error naming the
-		// table, column, and domain name; round-trip DOMAIN-carry
-		// is a v0.95.2 follow-up using the [ir.Domain] IR
-		// scaffolding added in this release. The refusal is at the
-		// READ boundary so no partial schema lands on the target;
-		// "Either is acceptable; silent-drop is not" per the
-		// bug-catalog suggested-fix.
-		if columnTypeKind == "d" {
-			// pg_type.typname is the actual DOMAIN identifier (e.g.
-			// "email_address"). Pre-fix we used c.udt_name here, but
-			// information_schema unwraps DOMAINs to the base type at
-			// every column it exposes (including udt_name), so the
-			// error mis-named the DOMAIN as its base type. The pg_type
-			// join (added for typtype detection) carries the real name.
-			domainName := columnTypeName
-			if domainName == "" {
-				// Defensive fallback if the pg_type join missed
-				// (shouldn't happen with the LEFT JOIN above, but the
-				// fallback keeps the refusal loud even on catalog edge
-				// cases). The base-type spelling here is what the
-				// operator would see in pg_dump output anyway.
-				domainName = udtName
-			}
-			return fmt.Errorf(
-				"postgres: schema reader: table %q column %q references PG DOMAIN %q which sluice does not yet round-trip (Bug 113 closure: silent CHECK-constraint loss prevented). Drop the DOMAIN reference (ALTER TABLE %s ALTER COLUMN %s TYPE %s USING %s::%s) and re-emit the operator's input-validation invariant as a table-level CHECK constraint, then re-run the migrate. Round-trip DOMAIN carry is planned for a v0.95.2 follow-up",
-				tableName, colName, domainName,
-				tableName, colName, formatType, colName, formatType,
-			)
-		}
-
 		meta := columnMeta{
 			DataType:        dataType,
 			UDTName:         udtName,
@@ -811,6 +848,29 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 			Collation:       collation,
 			AttTypmod:       attTypmod,
 			FormatType:      formatType,
+		}
+
+		// Bug 113 round-trip carry (v0.95.2). A column whose
+		// pg_type.typtype == 'd' references an operator-declared
+		// DOMAIN. information_schema.columns unwraps DOMAINs to the
+		// base type at every column it exposes, so the existing
+		// translateType call below produces the BASE IR type for
+		// free; the DOMAIN-specific metadata (name + CHECKs) is
+		// wrapped on AFTER translateType returns. IsDomain +
+		// DomainName carry through columnMeta so the wrap site
+		// has everything it needs without re-reading the catalog.
+		// v0.95.1 refused loudly here; v0.95.2 rotates to
+		// round-trip carry per the bug-catalog's preferred closure.
+		if columnTypeKind == "d" {
+			meta.IsDomain = true
+			// pg_type.typname is the actual DOMAIN identifier (e.g.
+			// "email_address"). udt_name unwraps to the base type
+			// (information_schema column-projection), so the pg_type
+			// join is the only source of the real name.
+			meta.DomainName = columnTypeName
+			if meta.DomainName == "" {
+				meta.DomainName = udtName
+			}
 		}
 
 		// Resolve enum values for USER-DEFINED columns.
@@ -914,6 +974,22 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 		typ, err := translateType(meta)
 		if err != nil {
 			return fmt.Errorf("table %q column %q: %w", tableName, colName, err)
+		}
+
+		// Bug 113 round-trip carry (v0.95.2). When the column
+		// references a DOMAIN (pg_type.typtype='d'), wrap the
+		// just-translated BASE IR type in ir.Domain with the name
+		// resolved from pg_type.typname and the CHECK definitions
+		// pre-read by readDomainChecks. The writer's Phase 1a' emits
+		// CREATE DOMAIN before tables that reference it; emitTableDef
+		// uses the DOMAIN name (not the base type spelling) when
+		// emitting the column type.
+		if meta.IsDomain {
+			typ = ir.Domain{
+				Name:     meta.DomainName,
+				BaseType: typ,
+				Checks:   domainChecks[meta.DomainName],
+			}
 		}
 
 		col := &ir.Column{
