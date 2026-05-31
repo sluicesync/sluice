@@ -683,7 +683,23 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 			COALESCE(c.generation_expression, ''),
 			COALESCE(coll.collname, ''),
 			COALESCE(a.atttypmod, -1),
-			COALESCE(pg_catalog.format_type(a.atttypid, a.atttypmod), '')
+			COALESCE(pg_catalog.format_type(a.atttypid, a.atttypmod), ''),
+			-- Bug 113 (v0.95.1): pg_type.typtype for the column's
+			-- declared type. 'd' means DOMAIN — operator-declared
+			-- user type that wraps a base type with CHECK
+			-- constraints. information_schema.columns unwraps
+			-- DOMAINs at EVERY column it exposes (data_type,
+			-- udt_name): both return the underlying base type's
+			-- name, never the domain name itself. So the only way
+			-- to detect domains AND name them is to read pg_type
+			-- directly. column_type_name carries pg_type.typname
+			-- — the actual domain name on typtype='d' columns;
+			-- ignored for non-domain rows (the existing dispatch
+			-- uses c.udt_name). Pre-v0.95.1 the silent unwrap
+			-- caused silent constraint loss on PG→PG migrate;
+			-- v0.95.1 detects the 'd' and refuses loudly.
+			COALESCE(pt.typtype::text, '') AS column_type_kind,
+			COALESCE(pt.typname, '')       AS column_type_name
 		FROM   information_schema.columns c
 		LEFT JOIN pg_class      cl   ON cl.relname    = c.table_name
 		                            AND cl.relnamespace = (
@@ -695,6 +711,7 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 		LEFT JOIN pg_collation  coll ON coll.oid       = a.attcollation
 		                            AND coll.oid      <> 0
 		                            AND coll.collname <> 'default'
+		LEFT JOIN pg_type       pt   ON pt.oid         = a.atttypid
 		WHERE  c.table_schema = $1
 		ORDER  BY c.table_name, c.ordinal_position`
 
@@ -718,6 +735,8 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 			collation            string
 			attTypmod            int32
 			formatType           string
+			columnTypeKind       string
+			columnTypeName       string
 		)
 		if err := rows.Scan(
 			&tableName, &colName, &ordinal,
@@ -729,6 +748,8 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 			&collation,
 			&attTypmod,
 			&formatType,
+			&columnTypeKind,
+			&columnTypeName,
 		); err != nil {
 			return err
 		}
@@ -736,6 +757,47 @@ func (r *SchemaReader) populateColumns(ctx context.Context, tables map[string]*i
 		t, ok := tables[tableName]
 		if !ok {
 			continue
+		}
+
+		// Bug 113 (v0.95.1): loud-refuse the silent constraint-loss
+		// class. A column whose pg_type.typtype == 'd' references an
+		// operator-declared DOMAIN (e.g. CREATE DOMAIN email_address
+		// AS text CHECK (VALUE ~ '...')). information_schema.columns
+		// unwraps the DOMAIN — data_type returns 'text', not
+		// 'USER-DEFINED' — so pre-v0.95.1 the existing dispatch saw
+		// a plain text column and silently dropped the DOMAIN's
+		// CHECK constraints on PG→PG migrate. The bug catalog (Bug
+		// 113) classes this as CRITICAL silent-constraint-loss for
+		// any operator who encoded input-validation invariants as
+		// DOMAINs. v0.95.1 ships only the loud-refusal closure —
+		// the operator gets a clear actionable error naming the
+		// table, column, and domain name; round-trip DOMAIN-carry
+		// is a v0.95.2 follow-up using the [ir.Domain] IR
+		// scaffolding added in this release. The refusal is at the
+		// READ boundary so no partial schema lands on the target;
+		// "Either is acceptable; silent-drop is not" per the
+		// bug-catalog suggested-fix.
+		if columnTypeKind == "d" {
+			// pg_type.typname is the actual DOMAIN identifier (e.g.
+			// "email_address"). Pre-fix we used c.udt_name here, but
+			// information_schema unwraps DOMAINs to the base type at
+			// every column it exposes (including udt_name), so the
+			// error mis-named the DOMAIN as its base type. The pg_type
+			// join (added for typtype detection) carries the real name.
+			domainName := columnTypeName
+			if domainName == "" {
+				// Defensive fallback if the pg_type join missed
+				// (shouldn't happen with the LEFT JOIN above, but the
+				// fallback keeps the refusal loud even on catalog edge
+				// cases). The base-type spelling here is what the
+				// operator would see in pg_dump output anyway.
+				domainName = udtName
+			}
+			return fmt.Errorf(
+				"postgres: schema reader: table %q column %q references PG DOMAIN %q which sluice does not yet round-trip (Bug 113 closure: silent CHECK-constraint loss prevented). Drop the DOMAIN reference (ALTER TABLE %s ALTER COLUMN %s TYPE %s USING %s::%s) and re-emit the operator's input-validation invariant as a table-level CHECK constraint, then re-run the migrate. Round-trip DOMAIN carry is planned for a v0.95.2 follow-up",
+				tableName, colName, domainName,
+				tableName, colName, formatType, colName, formatType,
+			)
 		}
 
 		meta := columnMeta{

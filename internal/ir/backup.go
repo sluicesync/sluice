@@ -708,6 +708,25 @@ type schemaTypeEnvelope struct {
 	// string `Length` field above; BitVarying distinguishes
 	// `bit varying`/`varbit` from fixed-width `bit`. Append-only.
 	BitVarying bool `json:"bit_varying,omitempty"`
+
+	// Domain (Bug 113 closure, v0.95.1). DomainName carries the
+	// operator-declared identifier; DomainBaseType is the recursively-
+	// encoded base [Type] envelope (same pattern as Array.Element);
+	// DomainChecks carries the CHECK definitions. Append-only —
+	// older sluice ignores these fields and reads a Domain envelope
+	// as a no-base Kind=Domain it doesn't know how to construct,
+	// which surfaces as a clear "unknown IR type kind" error
+	// rather than silent drop.
+	DomainName     string              `json:"domain_name,omitempty"`
+	DomainBaseType json.RawMessage     `json:"domain_base_type,omitempty"`
+	DomainChecks   []domainCheckOnDisk `json:"domain_checks,omitempty"`
+}
+
+// domainCheckOnDisk is the wire shape of one [DomainCheck] inside a
+// schema-type envelope. Append-only.
+type domainCheckOnDisk struct {
+	Name string `json:"name,omitempty"`
+	Body string `json:"body,omitempty"`
 }
 
 // MarshalType renders an IR [Type] as a tagged-union JSON envelope.
@@ -827,6 +846,26 @@ func MarshalType(t Type) ([]byte, error) {
 		env.Extension = v.Extension
 		env.Name = v.Name
 		env.Modifiers = v.Modifiers
+	case Domain:
+		// Bug 113 closure (v0.95.1). Round-trips Domain.Name +
+		// Domain.BaseType (recursive) + Domain.Checks so the PG
+		// writer can re-emit `CREATE DOMAIN ... AS ... CHECK (...)`
+		// before tables that reference it.
+		env.Kind = "Domain"
+		env.DomainName = v.Name
+		if v.BaseType != nil {
+			base, err := MarshalType(v.BaseType)
+			if err != nil {
+				return nil, fmt.Errorf("domain base type: %w", err)
+			}
+			env.DomainBaseType = base
+		}
+		if len(v.Checks) > 0 {
+			env.DomainChecks = make([]domainCheckOnDisk, len(v.Checks))
+			for i, c := range v.Checks {
+				env.DomainChecks[i] = domainCheckOnDisk(c)
+			}
+		}
 	default:
 		return nil, fmt.Errorf("unsupported IR type for backup encoding: %T", t)
 	}
@@ -919,6 +958,24 @@ func UnmarshalType(b []byte) (Type, error) {
 			Name:      env.Name,
 			Modifiers: env.Modifiers,
 		}, nil
+	case "Domain":
+		// Bug 113 closure (v0.95.1).
+		var base Type
+		if len(env.DomainBaseType) > 0 && string(env.DomainBaseType) != "null" {
+			var err error
+			base, err = UnmarshalType(env.DomainBaseType)
+			if err != nil {
+				return nil, fmt.Errorf("domain base type: %w", err)
+			}
+		}
+		var checks []DomainCheck
+		if len(env.DomainChecks) > 0 {
+			checks = make([]DomainCheck, len(env.DomainChecks))
+			for i, c := range env.DomainChecks {
+				checks[i] = DomainCheck(c)
+			}
+		}
+		return Domain{Name: env.DomainName, BaseType: base, Checks: checks}, nil
 	default:
 		return nil, fmt.Errorf("unknown IR type kind %q in backup", env.Kind)
 	}

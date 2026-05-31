@@ -40,6 +40,19 @@ const (
 	// literally. Append-only; never reorder/renumber the kinds above
 	// (the values are part of the backup tagged-union enum discipline).
 	ExtVerbatimType
+	// ExtDomain represents a Postgres `CREATE DOMAIN` user-defined type
+	// (`pg_type.typtype = 'd'`). A domain wraps an arbitrary base type
+	// and attaches operator-supplied CHECK constraints that the source
+	// enforces on every value. Pre-v0.95.1 the schema reader resolved a
+	// domain-typed column to its underlying base type and the CHECK was
+	// silently lost on PG→PG migrate — Bug 113 (CRITICAL silent-
+	// constraint-loss). v0.95.1 carries the domain name + base type +
+	// captured CHECK definitions via [Domain] so the same-engine writer
+	// emits `CREATE DOMAIN ... AS ... CHECK (...)` before any table
+	// that references it. Cross-engine PG → MySQL emits a WARN and
+	// downgrades to the base type with the CHECK inlined at the table
+	// level (MySQL 8.0.16+).
+	ExtDomain
 )
 
 func (k ExtensionKind) String() string {
@@ -64,6 +77,8 @@ func (k ExtensionKind) String() string {
 		return "ExtensionType"
 	case ExtVerbatimType:
 		return "VerbatimType"
+	case ExtDomain:
+		return "Domain"
 	default:
 		return "unknown"
 	}
@@ -128,6 +143,80 @@ func (Enum) isType()    {}
 func (Enum) Tier() Tier { return TierExtension }
 func (e Enum) String() string {
 	return fmt.Sprintf("Enum{%s}", strings.Join(e.Values, ","))
+}
+
+// Domain is a Postgres `CREATE DOMAIN` user-defined type — `pg_type.typtype
+// = 'd'`. It wraps an arbitrary base type with operator-supplied CHECK
+// constraints the source enforces on every value. Pre-v0.95.1 the
+// schema reader resolved a domain-typed column to its underlying base
+// type and the CHECK was silently lost on PG→PG migrate — Bug 113
+// (CRITICAL silent-constraint-loss class: the operator's input-
+// validation invariant disappeared with no WARN, no error, exit 0).
+// v0.95.1 carries the domain name + base type + captured CHECK
+// definitions so the same-engine PG writer can emit `CREATE DOMAIN
+// ... AS ... CHECK (...)` before any table that references it. The
+// IR type is itself a [Type], so a column whose declared type is a
+// domain stores `Domain{...}` directly in [Column.Type] (the same
+// shape [Enum] uses for `CREATE TYPE … AS ENUM` types — both are
+// user-defined types that must be created before referencing tables).
+//
+// Cross-engine PG → MySQL: domains have no MySQL counterpart. The
+// MySQL writer downgrades the column to the domain's base type and
+// emits a WARN naming the lost CHECK constraints; operators relying
+// on the DB-level invariant must either replicate it as a table-
+// level CHECK on MySQL 8.0.16+ or move enforcement to the app layer
+// (the WARN names both options).
+type Domain struct {
+	// Name is the operator-declared domain identifier (the source's
+	// `pg_type.typname`). Required for same-engine round-trip; cross-
+	// engine writers ignore it.
+	Name string
+
+	// BaseType is the [Type] the domain wraps (e.g. `Text{}` for the
+	// canonical `CREATE DOMAIN email_address AS text CHECK (...)`).
+	// Always populated — a domain without a base type is malformed.
+	BaseType Type
+
+	// Checks are the CHECK constraint definitions attached to the
+	// domain, in source order. Each entry is the raw constraint body
+	// suitable for re-emission (`VALUE ~ '...'`, `VALUE BETWEEN 0 AND
+	// 100`, etc.). The same-engine writer emits each as `CHECK
+	// (<body>)` after the base type in the `CREATE DOMAIN` statement;
+	// cross-engine writers inline each as a table-level CHECK on the
+	// degraded base column with a WARN. Empty for a domain that
+	// happens to carry no checks (rare — most operator-declared
+	// domains have at least one CHECK; without one the domain is
+	// effectively a type alias).
+	Checks []DomainCheck
+}
+
+// DomainCheck is one CHECK constraint attached to an [Domain]. The
+// body is the raw source-dialect expression (PG dialect; cross-engine
+// targets run it through the ADR-0016 translator before inlining at
+// the table level). The Name carries the constraint's identifier if
+// the source declared one — operator-readable on DDL diffs and
+// preserved on same-engine round-trip; cross-engine writers may drop
+// it since MySQL's table-level CHECK names live in a different
+// namespace.
+type DomainCheck struct {
+	// Name is the CHECK constraint identifier (`pg_constraint.conname`).
+	// Empty for anonymous CHECKs.
+	Name string
+
+	// Body is the raw constraint expression as parsed by the source,
+	// with no surrounding `CHECK (...)` wrapper. E.g.
+	// `VALUE ~ '^[^@]+@[^@]+\\.[^@]+$'`.
+	Body string
+}
+
+func (Domain) isType()    {}
+func (Domain) Tier() Tier { return TierExtension }
+func (d Domain) String() string {
+	base := "<nil>"
+	if d.BaseType != nil {
+		base = d.BaseType.String()
+	}
+	return fmt.Sprintf("Domain{%s AS %s, %d check(s)}", d.Name, base, len(d.Checks))
 }
 
 // Set is a value composed of zero or more elements drawn from a fixed
