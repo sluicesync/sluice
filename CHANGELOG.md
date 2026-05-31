@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased — v0.94.0 in progress]
+
+### Fixed
+
+- **`fix(pipeline): scope incremental backup's end-position schema-read to the parent chain's table set (Bug 110 closure)`** — pre-fix `IncrementalBackup.readSourceSchema` called the schema reader's unscoped `ReadSchema`, which iterated every table in the source. A chain originally taken with `--include-table=X` would silently re-read every table at end-position recording, and a single unrelated table carrying a verbatim-eligible column type (`xml` / `money` / `interval` / `tsvector` / etc.) failed the whole incremental at `read source schema (end): postgres: read columns: table "Y" column "Z": postgres: unsupported data_type` — a previously-working chain broke because an unrelated table was added to the source. v0.94.0 derives a table-name predicate from the parent manifest's recorded `Schema.Tables` at `Run` start and threads it through `readSourceSchema` so on engines that implement `ir.TableScoper` (PostgreSQL today; MySQL falls through to the unscoped read because MySQL has no verbatim-type-in-schema problem to begin with), the end-position read restricts itself to the chain's original table set. A parent manifest with no recorded table list (corrupt / pre-v0.94 fallback) leaves the scope nil and preserves the historical unscoped behaviour. Pinned by `TestIncrementalBackup_ScopeFromParentManifest` (5 sub-pins: nil-schema unscoped fallback, empty-schema unscoped fallback, single-table admit, multi-table exact set with the Bug 110 false-positive cases (`unrelated_xml`, `unrelated_money`), nil-element tolerance in the table slice).
+
 ## [0.93.0] - 2026-05-31
 
 ### Fixed

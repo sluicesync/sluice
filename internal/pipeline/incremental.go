@@ -192,6 +192,15 @@ type IncrementalBackup struct {
 	// timing. Defaults to time.Now; tests can override via NowFn for
 	// deterministic window expiry.
 	clockNow func() time.Time
+
+	// scope is the parent-derived table-name predicate threaded into
+	// [readSourceSchema] so the end-position schema-read on engines
+	// that implement [ir.TableScoper] (PostgreSQL today) restricts
+	// itself to the chain's original table set. Set once at Run start
+	// from the parent manifest's recorded schema. Nil means
+	// "unscoped" — preserves the historical behaviour for chains
+	// whose parent has no recorded table list. Bug 110 closure.
+	scope func(tableName string) bool
 }
 
 // Run executes the incremental backup. Returns nil on success.
@@ -252,6 +261,30 @@ func (b *IncrementalBackup) Run(ctx context.Context) error {
 	beforeHash, err := ir.ComputeSchemaHash(beforeSchema)
 	if err != nil {
 		return fmt.Errorf("incremental: hash source schema (start): %w", err)
+	}
+
+	// Build the parent-derived table-name predicate so the
+	// end-position schema-read in step 5 restricts itself to the
+	// chain's original table set. This closes Bug 110: pre-fix the
+	// schema-read iterated every table in the source and a single
+	// unrelated table carrying a verbatim-eligible column type
+	// (xml / money / interval / etc.) failed the whole incremental.
+	// Engines that don't implement [ir.TableScoper] (today: MySQL)
+	// silently fall through to the unscoped read in
+	// [readSourceSchema]. A parent with no recorded tables (corrupt
+	// manifest / pre-v0.94 fall-back) leaves b.scope nil — also
+	// equivalent to the historical behaviour.
+	if beforeSchema != nil && len(beforeSchema.Tables) > 0 {
+		allowed := make(map[string]struct{}, len(beforeSchema.Tables))
+		for _, t := range beforeSchema.Tables {
+			if t != nil {
+				allowed[t.Name] = struct{}{}
+			}
+		}
+		b.scope = func(tableName string) bool {
+			_, ok := allowed[tableName]
+			return ok
+		}
 	}
 
 	// 3. Open CDC reader at parent's EndPosition.
@@ -492,12 +525,36 @@ func chainTailManifest(ctx context.Context, rootStore ir.BackupStore, recs []man
 // readSourceSchema opens a fresh schema reader and reads the source
 // schema. Used at the start and end of the incremental's window for
 // SchemaDelta computation.
+// readSourceSchema reads the source's schema and, on engines that
+// implement [ir.TableScoper], restricts the read to the parent
+// chain's table set. Pre-fix Bug 110: an unscoped read iterated
+// every table in the source schema, so a single unrelated table
+// carrying a verbatim-eligible column type (xml / money / interval
+// / etc.) on a chain originally taken with `--include-table=X`
+// failed the incremental at
+// `read source schema (end): postgres: read columns: table "Y"
+// column "Z": postgres: unsupported data_type` — a previously-
+// working chain broke because an unrelated table was added to the
+// source. The scope is derived from the parent manifest's recorded
+// schema (the originally-included tables); engines that don't
+// implement TableScoper (today: MySQL) fall through to the
+// unscoped ReadSchema.
+//
+// b.scope is the engine-neutral predicate built once per Run from
+// the parent manifest. When nil (a parent with no table list, e.g.
+// pre-v0.94.0 manifests written before the scope was recorded),
+// the historical unscoped behaviour is preserved.
 func (b *IncrementalBackup) readSourceSchema(ctx context.Context) (*ir.Schema, error) {
 	sr, err := b.Source.OpenSchemaReader(ctx, b.SourceDSN)
 	if err != nil {
 		return nil, fmt.Errorf("open schema reader: %w", err)
 	}
 	defer closeIf(sr)
+	if b.scope != nil {
+		if scoper, ok := sr.(ir.TableScoper); ok {
+			scoper.SetTableScope(b.scope)
+		}
+	}
 	return sr.ReadSchema(ctx)
 }
 
