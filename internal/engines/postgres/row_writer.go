@@ -816,6 +816,20 @@ func prepareValue(v any, t ir.Type) (any, error) {
 		return nil, fmt.Errorf("expected string or []byte for VerbatimType column (ADR-0047), got %T", v)
 	}
 
+	// Bug 122 (v0.95.3): a DOMAIN-typed column carries values in the
+	// base type's representation (PG's wire / text I/O is identical
+	// for a DOMAIN and its base type; the DOMAIN's CHECK applies at
+	// INSERT/UPDATE time on the source and target). Dispatch
+	// prepareValue recursively against the base type so every
+	// downstream specialization (Array / Geometry / Bit / Extension /
+	// Verbatim / scalar passthrough) reaches its existing branch.
+	if dom, isDomain := t.(ir.Domain); isDomain {
+		if dom.BaseType == nil {
+			return nil, fmt.Errorf("DOMAIN %q has nil BaseType", dom.Name)
+		}
+		return prepareValue(v, dom.BaseType)
+	}
+
 	return v, nil
 }
 

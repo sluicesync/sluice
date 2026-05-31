@@ -105,6 +105,22 @@ func decodeValue(raw any, t ir.Type) (any, error) {
 		// value moves), so text I/O fidelity is the documented same-
 		// PG-major-version contract (ADR-0047).
 		return decodeVerbatimValue(raw)
+	case ir.Domain:
+		// Bug 122 (v0.95.3): a column typed as an `ir.Domain` is a
+		// thin wrapper over its base type. PG's wire / text I/O
+		// surface a DOMAIN-typed column identically to its base type
+		// (the DOMAIN's CHECK constraints apply at INSERT/UPDATE time
+		// on the source AND target; the value's representation is
+		// the base type's). So the decoder dispatches to the base
+		// type's decoder recursively. Without this case the row
+		// stream aborted bulk_copy on the first row with `no decoder
+		// for IR type ir.Domain` — the v0.95.2 cycle's Focus A
+		// failure that surfaced Bug 122 once the schema-half landed
+		// correctly.
+		if v.BaseType == nil {
+			return nil, fmt.Errorf("postgres: decode: DOMAIN %q has nil BaseType", v.Name)
+		}
+		return decodeValue(raw, v.BaseType)
 	}
 	return nil, fmt.Errorf("postgres: no decoder for IR type %T", t)
 }
