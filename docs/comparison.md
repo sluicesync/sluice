@@ -6,6 +6,8 @@ This is the page to send a skeptical evaluator who's already seen the matrix and
 
 If a row in the README's matrix doesn't land for your scenario, the answer is in this doc — or it's a sign sluice isn't the right pick (see also the README's "When NOT to use sluice" section and [`docs/use-cases.md`](use-cases.md)).
 
+For the **canonical open-source PG → PG comparison point (Bucardo)**, see the standalone [`docs/comparison-bucardo.md`](comparison-bucardo.md). That page carries measured head-to-head numbers from a one-on-one benchmark and the honest "which one should you pick" framing.
+
 ---
 
 ## Cross-engine MySQL ↔ Postgres in all four directions

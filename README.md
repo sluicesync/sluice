@@ -232,6 +232,10 @@ A few terms recur in the codebase and docs:
 ## Documentation
 
 - [`docs/architecture.md`](docs/architecture.md) — IR, engine pattern, orchestrator, what sluice is and isn't
+- [`docs/comparison.md`](docs/comparison.md) — sluice vs. Debezium / AWS DMS / Fivetran / pgcopydb / HVR / Striim / Qlik (deep dive)
+- [`docs/comparison-bucardo.md`](docs/comparison-bucardo.md) — sluice vs. Bucardo (the canonical open-source PG → PG comparison; honest measured numbers, where each tool wins)
+- [`docs/use-cases.md`](docs/use-cases.md) — operator-persona-by-persona breakdown of "which sluice surface do I need?"
+- [`docs/cookbook/`](docs/cookbook/) — task-shaped recipes: one-shot migrate, bidirectional cutover, encrypted backup chains, PII redaction with keyset persistence, GitLab-shape schema case study
 - [`docs/managed-services.md`](docs/managed-services.md) — PlanetScale-specific notes, operator preconditions
 - [`docs/postgres-source-prep.md`](docs/postgres-source-prep.md) — required PG GUCs, slot lifecycle, failover-survival mechanisms
 - [`docs/vitess-vstream-troubleshooting.md`](docs/vitess-vstream-troubleshooting.md) — operator runbook for PlanetScale-MySQL VStream lag (throttler, replication lag, deploy requests)
