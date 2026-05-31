@@ -10,6 +10,31 @@ Each entry has the same shape: a one-line summary, a *why* (the user-visible pay
 
 For continuity when a chunk references "the previous work":
 
+### Silent-loss-class hardening + cross-engine DOMAIN closure arc (v0.93.0 → v0.97.1)
+
+A push through the BUG-CATALOG.md backlog that took the open numbered-bug count from 8 to 0. Each release closed a numbered silent-loss class or operator-friction class; the v0.95.x → v0.97.x portion is the same Bug 113 family pursued from "loud refuse" → "round-trip carry" → "cross-engine WARN" → "cross-engine inline-CHECK enforcement on MySQL 8.0.16+" + strict-fidelity follow-up.
+
+- **v0.93.0** — Bugs 112 + 119 + 120 (PG CDC schema-race silent drops on RENAME / DROP COLUMN / DROP+CREATE-same-name) closed via the `detectIncompatibleRelationChange` + `checkSchemaRace` RelationMessage-handler check at `internal/engines/postgres/cdc_relations.go`. Loud refusal with drained-model recovery hint; ADD COLUMN forwarding unaffected.
+- **v0.94.0** — Bug 110 (incremental backup's end-position schema-read scope) closed via the `ir.TableScoper` predicate from the parent chain's recorded table set. An unrelated table carrying a verbatim-eligible type no longer breaks a chain originally scoped with `--include-table`.
+- **v0.94.1** — Bug 117 verify-path closure (`VerifyBackupWith` + `probeChunkDecrypt`) + Bug 116 (manifest `FormatVersion=2` proportional version-stamp for RLS / Policies / EXCLUDE-bearing schemas). Older sluice restoring a newer-manifest chain now refuses loudly instead of silently dropping security metadata. Bug 118 re-verified closed in the same cycle.
+- **v0.95.0** — Bug 115 (non-default core PG opclasses `text_pattern_ops` / `varchar_pattern_ops` / `jsonb_path_ops`) now carry through PG → PG via the `pg_opclass.opcdefault` reader branch.
+- **v0.95.1** — Bug 113 loud-refuse: PG DOMAIN-typed columns refuse loudly at the read boundary instead of silently unwrapping to the base type. IR scaffolding (`ir.Domain`, `ir.DomainCheck`, `ir.ExtDomain`, JSON tagged-union round-trip) shipped here.
+- **v0.95.2** — Bug 113 round-trip carry (schema half): PG schema reader populates `ir.Domain` from `pg_type` + `pg_constraint` joins; writer's Phase 1a' emits `CREATE DOMAIN` before tables.
+- **v0.95.3** — Bug 122 closure (`ir.Domain` value codec dispatch in PG `decodeValue` + `prepareValue`, defense-in-depth MySQL `prepareValue` case). Unblocks Bug 113's row-data-carries outcome end-to-end on PG → PG.
+- **v0.96.0** — Bug 108 (CLI-overrides-YAML on redaction rules) closed. `mergeYAMLRedactions` now checks `reg.Get` and skips YAML entries when a CLI `--redact` rule already exists, with a loud `slog.WARN` naming the displaced column + YAML strategy.
+- **v0.96.1** — Bug 114 (PG migrate partial-failure leaves earlier tables without secondary indexes) closed via the `hints.go` PhaseBulkCopy registry entry. Loud abort now carries an actionable `hint:` line naming the missing-indexes state + the `--resume --exclude-table=<name>` recovery.
+- **v0.96.2** — PG → MySQL DOMAIN-CHECK silent-downgrade WARN closed the residual cross-engine silent-loss carry-over from Bug 113. `maybeWarnDomainCheckDrop` emits one structured `slog.WARN` per writer lifetime carrying `affected_columns` / `source_domains` / `target_base_types` / `check_constraint_dropped` / actionable `hint`.
+- **v0.96.3** — Bug 117 ingestion-path closure (symmetric to v0.94.1's verify-path closure). `IncrementalBackup.alignEncryption` + `BackupStream.alignEncryption` now probe the operator envelope against the parent's first per-chunk `WrappedCEK`; rotation surfaces at incremental start instead of at restore.
+- **v0.97.0** — Bug 113 PG → MySQL inline-CHECK closure (Option A from the v0.96.x successor). MySQL 8.0.16+ targets get inline table-level CHECK clauses for the regex and range DOMAIN CHECK shapes — `VALUE ~ 'pattern'` → `REGEXP_LIKE(col, 'pattern')`, `VALUE >= X AND VALUE <= Y` → `col >= X AND col <= Y`. Version-gated via `SELECT VERSION()` probe; v0.96.2 WARN suppressed for fully-translated columns. Conservative whitelist; un-translatable shapes fall through to v0.96.2 WARN behavior.
+- **v0.97.1** — PG → MySQL inline-CHECK regex backslash byte-fidelity follow-up. `translateRegexCheckBody` now doubles backslashes before quoting so MySQL's string-literal parser produces `\.` for the regex engine, not `.`. v0.97.0's `\.` → `.` collapse was functionally harmless on the email regex (the `@` carried the rejection) but the v0.97.0 cycle subagent flagged it as a strict-fidelity gap and this closes it.
+
+Plus the docs layer that the arc unlocked:
+
+- **v0.97.0 docs PR #131** — `docs/comparison-bucardo.md` (canonical OSS PG → PG head-to-head with corrected default-config latency framing) + `docs/cookbook/` scaffolding (4 recipes + GitLab case study).
+- **v0.97.1 docs ride-along** — 3 more cookbook recipes (`compare-pg-dump.md`, `recipe-heroku-migration.md`, `recipe-postgis.md`) bringing the cookbook to 8 entries.
+
+End-of-arc state: 0 numbered bugs open; 0 tracked silent-loss-class follow-ups. Roadmap "Next up" items 11 (Tier 3 ext fn-defaults), 13 (view Phase 3), 15c (JSON-path redaction), and 18 sub-bullets beyond ADR-0068 remain as the demand-gated forward-looking pieces.
+
 ### Bulk-copy throughput arc — ADR-0042 / ADR-0043 (v0.62.0 → v0.64.0)
 
 - **v0.62.0 — `--bulk-parallel-min-rows` default 100,000 → 80,000.** Absorbs the typical InnoDB `table_rows` catalog undershoot so 100k-actual tables consistently engage parallel-copy by default. `defaultBulkParallelMinRows` constant change; explicit-value behaviour unchanged.
@@ -547,9 +572,9 @@ Closed end-to-end. See "Recently landed: Backup chain retention — chunks 14a�
 
 ---
 
-### 16. Verbatim same-engine / backup extension-type passthrough (uncatalogued extensions)
+### 16. Verbatim same-engine / backup extension-type passthrough (uncatalogued extensions) — **SHIPPED v0.68.0**
 
-**Design:** [ADR-0047](adr/adr-0047-verbatim-extension-passthrough.md) — **Accepted** (2026-05-16; `ir.VerbatimType`, implicit live determination + recorded backup capability marker, cross-engine stays loud-refuse). Implementation in progress, ships **v0.68.0**.
+**Design:** [ADR-0047](adr/adr-0047-verbatim-extension-passthrough.md) — **Accepted** (2026-05-16; `ir.VerbatimType`, implicit live determination + recorded backup capability marker, cross-engine stays loud-refuse). **SHIPPED v0.68.0** (2026-05-16).
 
 **Why.** ADR-0032's `pgExtensionCatalog` is an **enumerated allowlist** of 7 extensions (`vector`, `pg_trgm`, `hstore`, `citext`, `postgis`, `pgcrypto`, `uuid-ossp`). An uncatalogued extension type (`ltree`, `cube`, `timescaledb`, `pg_partman`, `age`, `h3`, in-house extensions) hits the `USER-DEFINED → enum/loud-failure` fallthrough in `lookupExtensionForType`, fired inside `ReadSchema` — so it refuses identically for **PG → PG sync/migrate AND for `backup full`/`backup stream run`**, and `--enable-pg-extension foo` for an uncatalogued `foo` is itself refused at `validateAndPreflightExtensions`. This is correct for cross-engine (no portable MySQL equivalent; loud-failure tenet) but a real, defensible gap for the paths that *provably do not need semantic understanding*: same-engine PG → PG and PG-backup → PG-restore only need to **carry the type faithfully**, not translate it. Operator payoff: "back up / replicate my PG database PG-to-PG even though it uses an extension sluice has never heard of," without a catalog PR per extension.
 
@@ -584,11 +609,14 @@ test pins the round-trip; corpus harness leg
 `TestCorpus_GitLab_PGToPG_VerbatimCarry` flipped from
 "characterized gap" to "verified clean."
 
-**Stage 2 (deferred per ADR-0051 §"Stage 2 candidates").** xml, money,
-pg_lsn, txid_snapshot, pg_snapshot — each adds via a one-line
-allowlist entry + a per-type round-trip integration test + an ADR-0051
-update; promoted on operator demand because each has known text-IO /
-locale / dialect quirks worth per-type validation.
+**Stage 2 — SHIPPED (ADR-0070, promoted 2026-05-30).** xml, money,
+pg_lsn, txid_snapshot, pg_snapshot all promoted to the
+`coreVerbatimEligibleTypes` allowlist after per-type round-trip
+integration pins shipped in v0.90.0 covering each type's three
+outcomes (refuse-loudly / preserve / SILENT-TYPE-LOSS). Cross-engine
+stays loud-refuse via `ir.VerbatimType`. Stage 3 would require the
+same evidence (per-type integration pin + ADR update + cross-engine
+refusal verified) for the next-tier candidates; demand-gated.
 
 **Follow-up.** EXCLUDE USING gist (… WITH &&) constraints on range
 columns — **SHIPPED 2026-05-21 ([ADR-0053](adr/adr-0053-exclude-constraint-verbatim-carry.md)).**
@@ -618,7 +646,7 @@ at runtime.
 
 ---
 
-### 18. postgres-trigger CDC runtime performance — batched-apply latency, lighter capture payload, drain throughput
+### 18. postgres-trigger CDC runtime performance — batched-apply latency, lighter capture payload, drain throughput — **(a) + (b) SHIPPED (v0.94.0); (c) demand-gated**
 
 **Source.** The sluice-vs-Bucardo head-to-head benchmark (2026-05-29; `sluice-testing/session-reports/bucardo-vs-sluice-v0.89.0.md`) plus the follow-up latency measurement that *re-attributed* its headline finding. Both are trigger-based PG capture replicators; on identical local workloads (1M-row initial copy + 110k-change CDC stream) sluice's `postgres-trigger` engine won initial copy (~208k vs ~77k rows/s, 8-way parallel COPY), setup (single static binary vs Bucardo's plperl+DBI control DB + Perl daemon), clean teardown (0 residue vs Bucardo's leftover `bucardo` schema + source triggers), and the structural differentiator — cross-engine to MySQL/PlanetScale, which Bucardo fundamentally cannot do. All enhancements — no correctness bug (both tools verified byte-identical).
 
@@ -629,9 +657,9 @@ at runtime.
 So NOTIFY-kick is **demoted** — the poll isn't the bottleneck. Closing the real gap is the two batched-apply fixes (done) plus a lighter capture payload for write-heavy sources.
 
 **What (three sub-items, re-ordered by the corrected attribution).**
-1. **[DONE — this work] Short idle-flush grace + AIMD apply-only timing.** (a) `defaultIdleFlushPeriod` reduced 5s → 100ms in *both* engines' batched appliers, so a drained/sparse stream's partial batch flushes within ~100ms instead of 5s (the slot's `confirmed_flush_lsn` / the persisted `source_position` also advances that much faster — the original ADR-0020 purpose, now served faster). When the channel is being fed the next change arrives well within 100ms so batches still fill to `maxBatchSize` — the poller's adaptive immediate-repoll on full batches keeps the channel fed, so no throughput regression. (b) the batch-latency clock now starts *after* the pre-tx wait loop (begin-tx → dispatch → position write → commit), with an `IsZero` guard so a pre-tx-wait cancellation can't feed a bogus latency — so AIMD sees apply-only cost and stops collapsing. Single-change latency drops from ~5.9s toward ~1s; drain throughput recovers ~2x from the un-collapsed controller.
-2. **Lighter capture payload — next piece (design locked: ADR-0068).** The capture log stores the full before/after row image as JSONB (self-contained, replay-safe — the poller never re-reads the source). That costs ~10.8x source-write amplification vs Bucardo's ~2x (Bucardo stores only the changed PK + re-reads the live row at sync). ADR-0068 adds a `sluice trigger setup --capture-payload=full|changed|minimal` mode (default `full`): `changed` trims the UPDATE `after` to PK+changed-columns (keeps the full `before`), `minimal` also trims `before` to the PK (→ PK-`WHERE`, reaches toward ~2x). **Crucially this stays self-contained + point-in-time-faithful** (the changed values are in the log — NOT Bucardo's PK-only+re-read, which is what trades away self-containment). Verified: the trigger sees full OLD/NEW regardless of REPLICA IDENTITY, and the reader/applier are payload-shape-agnostic, so this is a trigger-only change. Owner chose to ship all three modes so `full`/`changed`/`minimal` can be benchmarked head-to-head before any default flip.
-3. **Optional `--poll-interval` config + configurable idle grace.** Make the poll interval and the (now-100ms) idle-flush grace operator-tunable for the rare workload that wants them tighter or looser, rather than hard-coded. NOTIFY-kick stays demoted — poll latency isn't the bottleneck the measurement found.
+1. **[SHIPPED v0.94.0] Short idle-flush grace + AIMD apply-only timing.** (a) `defaultIdleFlushPeriod` reduced 5s → 100ms in *both* engines' batched appliers, so a drained/sparse stream's partial batch flushes within ~100ms instead of 5s. (b) the batch-latency clock now starts *after* the pre-tx wait loop. Both engines pinned with unit tests; CI green incl `-race`. Single-change latency drops from ~5.9s toward ~1s; drain throughput recovers ~2x from the un-collapsed controller.
+2. **[SHIPPED v0.94.0 — ADR-0068] Lighter capture payload.** `sluice trigger setup --capture-payload=full|changed|minimal` (default `full`, all three selectable for head-to-head benchmarking). Trigger-only change; reader/applier are payload-shape-agnostic. `changed` trims the UPDATE `after` to PK+changed-columns (keeps full `before`); `minimal` also trims `before` to the OLD PK (→ PK-`WHERE`, reaches toward ~2x source-write amplification). A silent-loss bug caught in review (minimal's UPDATE-before was the NEW PK → PK-changing UPDATEs would diverge) was fixed pre-merge by using the OLD-PK projection + adding PK-update to the integration matrix.
+3. **Optional `--poll-interval` config + configurable idle grace.** Make the poll interval and the (now-100ms) idle-flush grace operator-tunable for the rare workload that wants them tighter or looser, rather than hard-coded. NOTIFY-kick stays demoted — poll latency isn't the bottleneck the measurement found. **Demand-gated** — no operator has surfaced a workload yet that needs the tunable.
 
 **Gotchas / open questions.**
 - The 100ms idle grace rides producer/scheduler jitter within a burst while staying negligible against the ~1s poll interval. If a future poll-interval config drops the interval well below ~1s, re-check that the grace still doesn't truncate in-flight bursts (it shouldn't — full batches immediate-repoll — but verify).
@@ -660,6 +688,28 @@ Tracked in detail in `sluice-testing/BUG-CATALOG.md`; recap here for roadmap vis
 - **Bug 51** — PG `geography(POINT, srid)` widened to `geography(Geometry, srid)` due to mixed-case `geography_columns.type`. *Closed in v0.33.2.*
 - **Bug 52** — PG `geometry(POINTZ, srid)` Z/M/ZM dimensional variants lost on emit. *Closed in v0.33.3 (partial in v0.33.2, full closure via `coord_dimension` capture in v0.33.3).*
 - **Bug 53** — PostGIS `coord_dimension` not captured in schema reader. *Closed in v0.33.3 (same release as Bug 52 full closure).*
+- **Bug 64** — `DEFAULT` expression backtick leak on cross-engine MySQL → PG. *Closed in v0.66.1.*
+- **Bug 65** — same-engine PG → PG expression-index `gin_trgm_ops` opclass survival. *Closed in v0.66.0.*
+- **Bug 66** — multi-segment backup with absent `lineage.json` silently restored only the chain root. *Closed in v0.67.1.*
+- **Bug 68** — PG multi-dimensional array column silently lost all rows on cross-engine PG → MySQL. *Closed in v0.69.0.*
+- **Bug 69** — unconstrained PG `numeric`/`numeric[]` mis-emit. *Closed in v0.69.1.*
+- **Bug 70** — NULL element inside any typed PG array hard-fails the PG → PG COPY-protocol writer. *Closed in v0.69.3.*
+- **Bug 71** — PG `timetz` mis-mapped to `time` (OID 1083) and rejected at COPY encode. *Closed in v0.71.0.*
+- **Bug 72** — wide PG `varchar(N)` emitted literally as MySQL `VARCHAR(N)` and not down-mapped to TEXT/MEDIUMTEXT. *Closed in v0.71.0.*
+- **Bug 95** — backup chain rotation not born-contiguous (compaction blocker). *Closed in v0.88.0 (ADR-0067).*
+- **Bug 96** — ext-owned-relation exclusion gap on cross-engine PG → MySQL. *Closed in v0.89.0.*
+- **Bug 108** — CLI-overrides-YAML silent failure on redaction rules. *Closed in v0.96.0.*
+- **Bug 110** — incremental backup's end-position schema-read scope. *Closed in v0.94.0.*
+- **Bug 112** — PG table-RENAME mid-CDC stream silently drops subsequent writes. *Closed in v0.93.0.*
+- **Bug 113** — PG DOMAIN-typed columns silently unwrap to base type (and CHECK lost). *Closed across v0.95.1 (loud-refuse) → v0.95.2/v0.95.3 (PG → PG round-trip carry) → v0.96.2 (PG → MySQL WARN) → v0.97.0 (PG → MySQL inline-CHECK on 8.0.16+) → v0.97.1 (regex backslash byte-fidelity).*
+- **Bug 114** — PG migrate partial-failure leaves earlier tables without secondary indexes (no recovery hint). *Closed in v0.96.1.*
+- **Bug 115** — non-default core PG opclasses dropped silently. *Closed in v0.95.0.*
+- **Bug 116** — manifest `FormatVersion=1` silently drops security metadata on older sluice restore. *Closed in v0.94.1.*
+- **Bug 117** — per-chunk encryption mode silently accepts a rotated passphrase between full and incremental. *Closed across v0.94.1 (verify-path probe) → v0.96.3 (incremental/stream ingestion-path probe).*
+- **Bug 118** — PG `pg_lsn` / `txid_snapshot` CDC apply crash. *Re-verified closed in v0.94.1 cycle (likely already closed by v0.92.4's verbatim-type wire-encoding fix).*
+- **Bug 119** — `ALTER TABLE ... DROP COLUMN` mid-CDC stream silently leaves the dropped column on the destination. *Closed in v0.93.0.*
+- **Bug 120** — `DROP TABLE` + `CREATE TABLE <same-name>` mid-CDC stream silently drops every subsequent write. *Closed in v0.93.0.*
+- **Bug 122** — `ir.Domain` value codec dispatch missing on PG row stream. *Closed in v0.95.3.*
 
 UUID PK support across cross-engine restore is fully landed: Bug 41 (CDC value decode) + Bug 42 (schema-side default translation, PG → MySQL) + Bug 44 (same-engine MySQL function-call default wrapping) + v0.11.3's Bugs 28/29 (the MySQL → PG direction). All four corners covered for modern PG schemas (Rails, Django, Hasura, Supabase).
 
