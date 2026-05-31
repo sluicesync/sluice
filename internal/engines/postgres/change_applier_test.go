@@ -106,6 +106,90 @@ func TestBuildInsertSQL(t *testing.T) {
 	}
 }
 
+// TestBuildSQL_VerbatimTypeCasts pins the v0.92.3 Bug 97 wire-encoding
+// closure. INSERT VALUES, UPDATE SET, and WHERE-equality must emit
+// `$N::<verbatim-type>` casts for ir.VerbatimType columns so pgx
+// binds the value as text instead of falling through to bytea
+// encoding (which produced `\x…` hex literals on the wire and PG
+// rejected with `invalid input syntax for type money` / `pg_lsn`).
+// Every verbatim-eligible family is exercised — money / pg_lsn
+// (the cycle-observed failures) plus xml / tsvector / int4range
+// (cycle-observed pass; the cast hardens them too) plus pg_snapshot
+// / txid_snapshot / multirange (likely-affected families not
+// exercised in the cycle but structurally identical).
+func TestBuildSQL_VerbatimTypeCasts(t *testing.T) {
+	colTypes := map[string]ir.Type{
+		"id":    ir.Integer{Width: 64},
+		"price": ir.VerbatimType{Definition: "money"},
+		"lsn":   ir.VerbatimType{Definition: "pg_lsn"},
+		"doc":   ir.VerbatimType{Definition: "xml"},
+		"r":     ir.VerbatimType{Definition: "int4range"},
+		"v":     ir.VerbatimType{Definition: "tsvector"},
+	}
+
+	t.Run("INSERT VALUES placeholders carry the cast", func(t *testing.T) {
+		row := ir.Row{"id": int64(1), "price": "$99.99", "lsn": "0/16B3748", "doc": "<a/>", "r": "[1,10)", "v": "'foo':1"}
+		gotSQL, _, err := buildInsertSQL("public", "t", row, []string{"id"}, colTypes, nil)
+		if err != nil {
+			t.Fatalf("buildInsertSQL: %v", err)
+		}
+		for _, want := range []string{
+			`"doc", "id", "lsn", "price", "r", "v"`,
+			`$1::xml`,
+			`$2`,
+			`$3::pg_lsn`,
+			`$4::money`,
+			`$5::int4range`,
+			`$6::tsvector`,
+		} {
+			if !strings.Contains(gotSQL, want) {
+				t.Errorf("buildInsertSQL output missing %q\nfull SQL: %s", want, gotSQL)
+			}
+		}
+	})
+
+	t.Run("UPDATE SET clause carries the cast", func(t *testing.T) {
+		before := ir.Row{"id": int64(1)}
+		after := ir.Row{"id": int64(1), "price": "$50.00", "lsn": "0/100"}
+		gotSQL, _, err := buildUpdateSQL("public", "t", before, after, colTypes, nil)
+		if err != nil {
+			t.Fatalf("buildUpdateSQL: %v", err)
+		}
+		for _, want := range []string{
+			`"lsn" = $2::pg_lsn`,
+			`"price" = $3::money`,
+		} {
+			if !strings.Contains(gotSQL, want) {
+				t.Errorf("buildUpdateSQL output missing %q\nfull SQL: %s", want, gotSQL)
+			}
+		}
+	})
+
+	t.Run("WHERE equality predicate casts both sides", func(t *testing.T) {
+		before := ir.Row{"id": int64(1), "price": "$50.00"}
+		gotSQL, _, err := buildDeleteSQL("public", "t", before, colTypes, nil)
+		if err != nil {
+			t.Fatalf("buildDeleteSQL: %v", err)
+		}
+		// Money column matched via canonical text form.
+		if !strings.Contains(gotSQL, `"price"::text = $2::money::text`) {
+			t.Errorf("WHERE predicate missing cast on both sides; got: %s", gotSQL)
+		}
+	})
+
+	t.Run("non-verbatim columns keep bare $N", func(t *testing.T) {
+		row := ir.Row{"plain": "x"}
+		colTypesBare := map[string]ir.Type{"plain": ir.Text{Size: ir.TextLong}}
+		gotSQL, _, err := buildInsertSQL("public", "t", row, nil, colTypesBare, nil)
+		if err != nil {
+			t.Fatalf("buildInsertSQL: %v", err)
+		}
+		if !strings.Contains(gotSQL, `VALUES ($1)`) || strings.Contains(gotSQL, `::`) {
+			t.Errorf("plain text column should use bare $1 placeholder; got: %s", gotSQL)
+		}
+	})
+}
+
 func TestBuildUpdateSQL(t *testing.T) {
 	before := ir.Row{"id": int64(7), "email": "old@example.com"}
 	after := ir.Row{"id": int64(7), "email": "new@example.com", "active": false}
