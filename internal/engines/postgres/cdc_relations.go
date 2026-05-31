@@ -76,6 +76,118 @@ type relationColumn struct {
 	KeyColumn bool // RelationMessageColumn.Flags & 1
 }
 
+// detectIncompatibleRelationChange compares a previously-cached relation
+// against a newly-received one for the same relation OID and returns a
+// short human-readable description of an incompatible change, or "" if
+// the change is either no-op (pgoutput re-sends RelationMessage on
+// reconnect / first-touch with identical content) or compatible with
+// the ADR-0058 ADD COLUMN forwarding path.
+//
+// Bugs 112 (RENAME) / 119 (DROP COLUMN) / 120 (DROP+CREATE same name)
+// closure (v0.93.0). Pre-fix the applier's colTypeCache (keyed by
+// "schema.table" with no invalidation) silently used stale shape: writes
+// to a renamed table vanished from dst, DROP COLUMN drifted dst's column
+// (populated as NULL on new INSERTs), DROP+CREATE silently dropped the
+// new table's writes onto the old cached entry. With this detector, the
+// reader surfaces the race as a loud-failure error that crashes the
+// stream cleanly with the drained-model recovery hint.
+//
+// ADD COLUMN (new columns appended to the existing list, prior columns
+// unchanged in name and OID) returns "" so the existing ADR-0058
+// `--forward-schema-add-column` opt-in forwarding path continues to
+// work. ALTER COLUMN TYPE (existing column's OID changed) is rejected
+// — the forwarding path doesn't cover that shape either.
+//
+// The DROP+CREATE-same-name case (Bug 120) is detected separately at
+// the call site by scanning the relations map for an existing entry
+// with the same (Schema, Name) but a different OID, because pgoutput
+// allocates a fresh OID for the new relation and this function only
+// sees one OID at a time.
+func detectIncompatibleRelationChange(prev, current *relationCacheEntry) string {
+	if prev == nil {
+		return ""
+	}
+	if prev.Schema != current.Schema || prev.Name != current.Name {
+		return fmt.Sprintf("RENAME %s.%s → %s.%s",
+			prev.Schema, prev.Name, current.Schema, current.Name)
+	}
+	// Existing columns must remain identical in order, name, and OID.
+	// Type-OID change (ALTER COLUMN TYPE) is a forward-incompatible
+	// shape. New columns appended at the end (ADD COLUMN) is the only
+	// compatible shape — the existing ADR-0058 forwarding path handles
+	// the propagation when --forward-schema-add-column is set.
+	if len(current.Columns) < len(prev.Columns) {
+		return fmt.Sprintf("DROP COLUMN (column count %d → %d)",
+			len(prev.Columns), len(current.Columns))
+	}
+	for i, col := range prev.Columns {
+		nc := current.Columns[i]
+		if col.Name != nc.Name {
+			return fmt.Sprintf("RENAME COLUMN %s → %s (ordinal %d)",
+				col.Name, nc.Name, i)
+		}
+		if col.OID != nc.OID {
+			return fmt.Sprintf("ALTER COLUMN TYPE %s (type OID %d → %d, ordinal %d)",
+				col.Name, col.OID, nc.OID, i)
+		}
+	}
+	return ""
+}
+
+// checkSchemaRace surfaces incompatible-DDL situations as a loud
+// stream-killing error. It runs on every RelationMessage arrival, just
+// before the cache entry is replaced, and detects:
+//
+//   - Same-OID shape change (RENAME / DROP COLUMN / RENAME COLUMN /
+//     ALTER COLUMN TYPE) by comparing the new entry against the
+//     previously-cached entry for the same OID. See
+//     [detectIncompatibleRelationChange].
+//   - DROP+CREATE-same-name by scanning the relations map for any other
+//     OID with the same (Schema, Name) — pgoutput allocates a fresh
+//     OID for the new relation, so the old entry is orphaned in the
+//     map but still detectable.
+//
+// Returns nil when no race is detected, or when the change is a pure
+// ADD COLUMN (the [detectIncompatibleRelationChange] contract — the
+// existing ADR-0058 forwarding path handles that shape when
+// `--forward-schema-add-column` is set).
+//
+// Bug 112 (RENAME silent drop) / Bug 119 (DROP COLUMN silent drift) /
+// Bug 120 (DROP+CREATE silent drop) v0.93.0 closure.
+func checkSchemaRace(relations map[uint32]*relationCacheEntry, relationID uint32, current *relationCacheEntry) error {
+	if race := detectIncompatibleRelationChange(relations[relationID], current); race != "" {
+		return fmt.Errorf("postgres: cdc: incompatible schema change mid-stream on %s.%s (OID %d): %s. %s",
+			current.Schema, current.Name, relationID, race, schemaRaceRecoveryHint)
+	}
+	// DROP+CREATE-same-name (Bug 120): a different OID claims the same
+	// (Schema, Name). pgoutput re-issues RelationMessage for the new
+	// relation; the old OID's entry is now orphaned but still cached.
+	for otherOID, other := range relations {
+		if otherOID == relationID {
+			continue
+		}
+		if other != nil && other.Schema == current.Schema && other.Name == current.Name {
+			return fmt.Errorf(
+				"postgres: cdc: DROP+CREATE detected mid-stream on %s.%s (old OID %d, new OID %d). %s",
+				current.Schema, current.Name, otherOID, relationID, schemaRaceRecoveryHint,
+			)
+		}
+	}
+	return nil
+}
+
+// schemaRaceRecoveryHint is the operator-actionable recovery text the
+// reader appends to every schema-race error. Centralised here so the
+// wording stays consistent across RENAME / DROP COLUMN / ALTER TYPE /
+// DROP+CREATE call sites and is straightforward for operators to grep
+// for. The "drained model" workflow is the same one ADR-0058's existing
+// non-ADD-COLUMN refusal directs operators to.
+const schemaRaceRecoveryHint = "sluice does not support this DDL shape mid-stream. Drained-model recovery: " +
+	"(1) `sluice sync stop --wait` on every shard, " +
+	"(2) apply the schema change via your migration tool on source AND target, " +
+	"(3) `sluice sync start --resume` to continue from the last applied LSN. " +
+	"For ADD COLUMN only, opt-in to live forwarding via --forward-schema-add-column (ADR-0058)."
+
 // projectRelation builds an [ir.Table] from a relationCacheEntry —
 // the ADR-0049 Chunk B3 boundary projector. The entry is ALREADY
 // IR-typed (buildRelationCacheEntry resolved every column's OID via
