@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **`fix(cmd/sluice): apply CLI-overrides-YAML semantics to redaction rules (Bug 108 closure)`** — pre-fix when an operator passed BOTH a YAML config (`redactions:` block) AND a CLI `--redact` flag declaring DIFFERENT strategies for the SAME column, sluice silently picked the YAML rule and ignored the CLI flag — the OPPOSITE of the documented precedence model ("CLI flags … override anything set here" from `docs/examples/sluice.yaml`). The root cause was the YAML merge step running AFTER CLI parsing and calling `redact.Registry.Set` for every YAML entry, where the underlying map-Set silently overwrote any existing CLI rule. The bug surfaced as silent policy substitution on a compliance-critical feature: an operator inheriting a weak team-template YAML strategy (e.g. `static:redacted`) who tried to override per-run with a stronger CLI strategy (`hash:hmac-sha256` for cross-run consistency) would silently get the team-template's weak strategy applied. Discovered only by comparing dst output against expected output of the CLI strategy. v0.96.0 closes this in `mergeYAMLRedactions` by checking `reg.Get(schema, table, column)` for each YAML entry; when a CLI rule is already present, the YAML entry is skipped with a loud `slog.Warn` naming the column AND the YAML strategy that was skipped, so operators get a clear "your YAML rule was overridden by your CLI flag" signal instead of silent substitution. Pinned by `TestMergeYAMLRedactions_CLIOverridesYAML` (2 sub-pins covering BUG-CATALOG.md Bug 108 entry's variant A (YAML hash + CLI static → CLI static wins) and variant B (YAML static + CLI hash → CLI hash wins)).
+
 ## [0.95.3] - 2026-05-31
 
 ### Fixed

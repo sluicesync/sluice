@@ -77,9 +77,16 @@ func parseRedactFlags(values []string, keyset *redact.Keyset, streamID string, d
 
 // mergeYAMLRedactions extends an existing Registry (from CLI flag
 // parsing) with the YAML `redactions:` block from the operator's
-// config. CLI rules are processed FIRST, so YAML entries on the
-// same column are silently overwritten — operators wanting YAML to
-// be authoritative should not pass conflicting CLI flags.
+// config. CLI rules WIN on conflict (Bug 108 closure, v0.96.0):
+// when both CLI and YAML declare a rule for the same column triple,
+// the CLI rule takes precedence and the YAML rule is skipped with
+// a loud WARN naming the column. This matches the documented
+// CLI-overrides-YAML semantics from docs/examples/sluice.yaml
+// ("CLI flags … override anything set here"). Pre-fix, YAML was
+// merged second and silently overwrote the CLI rule via the
+// underlying map-Set — the OPPOSITE of the documented contract,
+// surfacing as silent policy substitution on a compliance-critical
+// feature.
 //
 // keyset is the startup-resolved operator keyset (ADR-0041); a
 // YAML entry's optional `key:` field names which keyset key the
@@ -99,13 +106,29 @@ func mergeYAMLRedactions(reg *redact.Registry, entries []config.Redaction, keyse
 		reg = redact.New()
 	}
 	for i, entry := range entries {
-		strategy, err := yamlStrategyToSluice(entry, keyset, streamID, dictionaries)
-		if err != nil {
-			return nil, fmt.Errorf("redactions[%d] (table=%q strategy=%q): %w", i, entry.Table, entry.Strategy, err)
-		}
 		schema, table, column, err := splitTriple(entry.Table)
 		if err != nil {
 			return nil, fmt.Errorf("redactions[%d]: %w", i, err)
+		}
+		// Bug 108 closure (v0.96.0): CLI-overrides-YAML. If a CLI
+		// --redact flag already declared a rule for this column
+		// triple, skip the YAML entry with a loud WARN naming the
+		// column. Operators reading the docs (CLI overrides YAML)
+		// expect the CLI rule to apply; pre-fix the YAML rule
+		// silently overwrote the CLI rule via the underlying map
+		// Set, violating the documented contract on a compliance-
+		// critical feature.
+		if existing := reg.Get(schema, table, column); existing != nil {
+			slog.Warn(
+				"redact: YAML redaction rule skipped because CLI --redact already declared a rule for the same column (CLI-overrides-YAML semantics per docs/examples/sluice.yaml); Bug 108 closure",
+				slog.String("column", entry.Table),
+				slog.String("yaml_strategy", entry.Strategy),
+			)
+			continue
+		}
+		strategy, err := yamlStrategyToSluice(entry, keyset, streamID, dictionaries)
+		if err != nil {
+			return nil, fmt.Errorf("redactions[%d] (table=%q strategy=%q): %w", i, entry.Table, entry.Strategy, err)
 		}
 		reg.Set(schema, table, column, strategy)
 	}
