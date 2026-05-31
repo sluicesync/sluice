@@ -1051,8 +1051,52 @@ func (b *IncrementalBackup) alignEncryption(ctx context.Context, parent *ir.Mani
 		}
 		return cek, nil
 	}
-	// Per-chunk mode: no chain-level CEK.
+	// Per-chunk mode: no chain-level CEK to unwrap (each chunk wraps
+	// its own CEK). Probe the operator's envelope against one of the
+	// parent's existing chunk WrappedCEKs so a rotated passphrase
+	// surfaces loudly at incremental start instead of silently
+	// extending the chain with chunks wrapped under the new envelope
+	// — Bug 117 ingestion-path closure. v0.94.1's VerifyBackupWith
+	// closed the symmetric verify path; this closes the ingestion
+	// side. If the parent carries no probe-able chunks (e.g. an empty
+	// prior incremental window), the probe falls through silently and
+	// any rotation surfaces later at restore — same behaviour as
+	// pre-fix, no regression introduced.
+	if probe := firstPerChunkProbe(parent); probe != nil {
+		if err := probeChunkDecrypt(b.Encryption.Envelope, probe); err != nil {
+			return nil, fmt.Errorf("incremental: %w", err)
+		}
+	}
 	return nil, nil
+}
+
+// firstPerChunkProbe returns the first chunk in the parent manifest
+// whose ChunkEncryption.WrappedCEK is non-empty — i.e. an existing
+// per-chunk-mode chunk whose CEK can be probe-unwrapped against the
+// operator's envelope. Searches Tables[].Chunks first (the full-manifest
+// shape, where the chain root holds bulk-copy chunks) then ChangeChunks
+// (the incremental-manifest shape). Returns nil when the parent carries
+// no probe-able chunks; the caller then falls through without probing.
+func firstPerChunkProbe(m *ir.Manifest) *ir.ChunkInfo {
+	if m == nil {
+		return nil
+	}
+	for _, t := range m.Tables {
+		if t == nil {
+			continue
+		}
+		for _, c := range t.Chunks {
+			if c != nil && c.Encryption != nil && len(c.Encryption.WrappedCEK) > 0 {
+				return c
+			}
+		}
+	}
+	for _, c := range m.ChangeChunks {
+		if c != nil && c.Encryption != nil && len(c.Encryption.WrappedCEK) > 0 {
+			return c
+		}
+	}
+	return nil
 }
 
 // resolveChunkCEK returns the (cek, wrappedCEK) pair to use for the

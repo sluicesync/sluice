@@ -1455,6 +1455,17 @@ func (b *BackupStream) alignEncryption(ctx context.Context, parent *ir.Manifest)
 		}
 		return cek, nil
 	}
+	// Per-chunk mode: probe the operator's envelope against one of the
+	// parent's existing chunk WrappedCEKs so a rotated passphrase
+	// surfaces loudly at stream-extend start. Mirrors the Bug 117
+	// ingestion-path closure in [IncrementalBackup.alignEncryption];
+	// stream and incremental share the same risk shape on per-chunk
+	// rotation.
+	if probe := firstPerChunkProbe(parent); probe != nil {
+		if err := probeChunkDecrypt(b.Encryption.Envelope, probe); err != nil {
+			return nil, fmt.Errorf("stream: %w", err)
+		}
+	}
 	return nil, nil
 }
 
