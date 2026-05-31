@@ -4,6 +4,14 @@ All notable changes to sluice are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased — v0.92.3 in progress]
+
+### Fixed
+
+- **`fix(postgres): emit `$N::TYPE` casts for ir.VerbatimType columns in apply SQL (Bug 97 v0.92.3 wire-encoding closure)`** — v0.92.2 closed the applier-side translator gap (the column type now lands as `ir.VerbatimType`), but the v0.92.2 verification cycle found that `money` and `pg_lsn` rows still failed at runtime: pgx fell back to bytea binary encoding for the unknown PG type, sending the value's ASCII bytes as a `\x…` hex literal, and PG rejected with `invalid input syntax for type money` / `invalid input syntax for type pg_lsn`. The `xml` / `tsvector` / `int4range` families happened to round-trip because their text-IO syntactically tolerated the bytea-hex form. v0.92.3 closes the wire-encoding gap with explicit `$N::<verbatim-type>` casts in INSERT VALUES + UPDATE SET clauses, and `col::text = $N::TYPE::text` in WHERE equality predicates (canonical text comparison). The `Definition` string comes from `pg_catalog.format_type` which produces canonical type names with no user-controlled input, so it's safe to interpolate. New `applyPlaceholder` + `verbatimPlaceholder` helpers in `internal/engines/postgres/change_applier.go`. Pinned by `TestBuildSQL_VerbatimTypeCasts` (4 sub-pins covering INSERT VALUES, UPDATE SET, WHERE equality, and the non-verbatim plain-`$N` path). Bug 74 family-dispatch lesson applied per-family.
+
+- **`fix(cli): route --slot-name through pipeline.ResolveSlotName for backup incremental + backup stream (Bug 121)`** — `sluice backup full --slot-name=X` correctly applied the sluice-prefix convention (`X` → `sluice_X`); `sluice backup incremental --slot-name=X` and `sluice backup stream run --slot-name=X` took `X` literally. Operators following a chain workflow with consistent `--slot-name=X` across commands hit `position references slot "sluice_X" but reader is configured with slot "X"` and the chain stalled. v0.92.3 routes the two missing call sites through `pipeline.ResolveSlotName(...)` so the convention applies uniformly. Same kong-tag-drift class as v0.92.1's `--mysql-sql-mode` typo — found by the v0.92.2 verification cycle.
+
 ## [0.92.2] - 2026-05-30
 
 ### Fixed

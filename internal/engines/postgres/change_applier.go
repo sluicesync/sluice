@@ -1585,8 +1585,8 @@ func buildInsertSQL(schema, table string, row ir.Row, pk []string, colTypes map[
 
 	tableRef := quoteIdent(schema) + "." + quoteIdent(table)
 	placeholders := make([]string, len(cols))
-	for i := range placeholders {
-		placeholders[i] = fmt.Sprintf("$%d", i+1)
+	for i, c := range cols {
+		placeholders[i] = applyPlaceholder(c, i+1, colTypes)
 	}
 
 	var sb strings.Builder
@@ -1691,7 +1691,7 @@ func buildSetClause(row ir.Row, startIdx int, colTypes map[string]ir.Type, gener
 	parts := make([]string, len(cols))
 	args = make([]any, 0, len(cols))
 	for i, c := range cols {
-		parts[i] = fmt.Sprintf("%s = $%d", quoteIdent(c), startIdx+i)
+		parts[i] = fmt.Sprintf("%s = %s", quoteIdent(c), applyPlaceholder(c, startIdx+i, colTypes))
 		v, perr := prepareApplierValue(row[c], colTypes, c)
 		if perr != nil {
 			return "", nil, fmt.Errorf("column %q: %w", c, perr)
@@ -1745,11 +1745,56 @@ func buildWhereClause(row ir.Row, startIdx int, colTypes map[string]ir.Type, gen
 // `json` column would otherwise break every UPDATE/DELETE apply on
 // the target. Mirrors pgcopydb PR #28; see
 // `docs/dev/notes/pgcopydb-planetscale-fork-review.md`.
+//
+// ir.VerbatimType columns (ADR-0051/-0070 — money / pg_lsn / xml /
+// tsvector / ranges / multiranges / etc.) take a `$N::<type>` cast
+// on the value side AND a left-side `col::text` so the equality
+// comparison happens on the canonical text form. Without the cast,
+// pgx falls back to bytea binary encoding (the value's ASCII bytes
+// arrive as a `\x…` hex literal) and PG rejects with "invalid input
+// syntax for type money/pg_lsn" — the v0.92.2 Bug-97 partial-close
+// surfaced this for money + pg_lsn (the bytea-fallback families).
+// xml / tsvector / int4range happened to round-trip because their
+// PG text-IO accepts the bytea-hex form as a syntactic accident;
+// the cast makes the apply unambiguous for every verbatim family.
+// v0.92.3 closure.
 func equalityPredicate(col string, paramIdx int, colTypes map[string]ir.Type) string {
-	if j, ok := colTypes[col].(ir.JSON); ok && !j.Binary {
-		return fmt.Sprintf("%s::text = $%d::text", quoteIdent(col), paramIdx)
+	if t, ok := colTypes[col]; ok {
+		if j, isJSON := t.(ir.JSON); isJSON && !j.Binary {
+			return fmt.Sprintf("%s::text = $%d::text", quoteIdent(col), paramIdx)
+		}
+		if v, isVerbatim := t.(ir.VerbatimType); isVerbatim {
+			return fmt.Sprintf("%s::text = %s::text", quoteIdent(col), verbatimPlaceholder(paramIdx, v))
+		}
 	}
 	return fmt.Sprintf("%s = $%d", quoteIdent(col), paramIdx)
+}
+
+// verbatimPlaceholder renders `$N::<verbatim-type>` for a value bound
+// to an ir.VerbatimType column. The Definition string comes from
+// pg_catalog.format_type and is safe to interpolate directly — PG's
+// own format_type produces canonical type names ("money", "pg_lsn",
+// "int4range", "tsvector", "xml", etc.) with no user-controlled
+// input. ranges and multiranges include the parameterized form
+// ("int4range" rather than "int4multirange[]") which PG's cast
+// machinery accepts verbatim. v0.92.3 Bug-97 wire-encoding closure.
+func verbatimPlaceholder(paramIdx int, t ir.VerbatimType) string {
+	return fmt.Sprintf("$%d::%s", paramIdx, t.Definition)
+}
+
+// applyPlaceholder is the canonical "$N or $N::TYPE" renderer for
+// any value bound on the apply path (INSERT VALUES, UPDATE SET).
+// Bare placeholder for everything except ir.VerbatimType, which gets
+// the explicit cast — same v0.92.3 Bug-97 wire-encoding closure as
+// equalityPredicate. The WHERE/equality predicate has its own
+// renderer because it also needs to cast the LEFT side.
+func applyPlaceholder(col string, paramIdx int, colTypes map[string]ir.Type) string {
+	if t, ok := colTypes[col]; ok {
+		if v, isVerbatim := t.(ir.VerbatimType); isVerbatim {
+			return verbatimPlaceholder(paramIdx, v)
+		}
+	}
+	return fmt.Sprintf("$%d", paramIdx)
 }
 
 // nonGeneratedRowKeys returns the row's keys in sorted order with
