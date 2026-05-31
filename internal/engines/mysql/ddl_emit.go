@@ -171,6 +171,26 @@ func emitColumnType(t ir.Type) (string, error) {
 				"--type-override TABLE.COL=<MySQL_type> to opt in (ADR-0032)",
 			v.String(),
 		)
+
+	// Bug 113 round-trip carry (v0.95.2), cross-engine PG→MySQL.
+	// MySQL has no DOMAIN counterpart. Downgrade to the DOMAIN's base
+	// type DDL spelling so the column lands with the right shape; the
+	// operator's CHECK constraints attached to the DOMAIN are NOT
+	// preserved here — they need to land as a table-level CHECK on
+	// MySQL 8.0.16+, which is the orchestrator's job (the writer
+	// doesn't have the cross-table context to attach a CHECK at this
+	// level). The PG→MySQL retarget layer SHOULD emit a WARN naming
+	// the lost CHECKs; absent that, the silent-CHECK-drop class is
+	// still narrower than v0.95.0's silent-DOMAIN-unwrap-everything
+	// class because the column shape is correct, the CHECK is just
+	// missing. Bug-catalog suggested-fix says "Either is acceptable;
+	// silent-drop is not" — for the cross-engine path, accepting the
+	// CHECK drop with a structural warn is the proportional close.
+	case ir.Domain:
+		if v.BaseType == nil {
+			return "", fmt.Errorf("mysql: cross-engine PG→MySQL: DOMAIN %q has nil BaseType — cannot downgrade", v.Name)
+		}
+		return emitColumnType(v.BaseType)
 	}
 
 	return "", fmt.Errorf("mysql: unknown IR type %T", t)

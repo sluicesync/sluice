@@ -171,8 +171,38 @@ func (w *SchemaWriter) CreateTablesWithoutConstraints(ctx context.Context, s *ir
 		}
 	}
 
-	// Phase 1b: tables.
+	// Phase 1a': DOMAIN types (Bug 113 round-trip carry, v0.95.2).
+	// Walk every column for an ir.Domain and emit CREATE DOMAIN
+	// before any table that references it. Dedupe by domain Name —
+	// two columns referencing the same source DOMAIN resolve to the
+	// same name, so we emit `CREATE DOMAIN` exactly once. Phase 1a
+	// (enum types) runs first because enums are independent and
+	// DOMAINs depend on their base type but never on an enum. Phase
+	// 1b (tables) runs after this so column references to the
+	// DOMAIN name resolve to the just-created type.
 	opts := w.emitOpts()
+	createdDomainTypes := map[string]struct{}{}
+	for _, table := range orderedTables(s) {
+		for _, col := range table.Columns {
+			dom, ok := col.Type.(ir.Domain)
+			if !ok {
+				continue
+			}
+			if _, done := createdDomainTypes[dom.Name]; done {
+				continue
+			}
+			createdDomainTypes[dom.Name] = struct{}{}
+			stmt, err := emitCreateDomainType(dom, w.schema, opts)
+			if err != nil {
+				return fmt.Errorf("postgres: emit domain type for %s.%s: %w", table.Name, col.Name, err)
+			}
+			if _, err := w.db.ExecContext(ctx, stmt); err != nil {
+				return fmt.Errorf("postgres: create domain type for %s.%s: %w", table.Name, col.Name, err)
+			}
+		}
+	}
+
+	// Phase 1b: tables. opts already constructed for Phase 1a' above.
 	for _, table := range orderedTables(s) {
 		stmt, err := emitTableDef(w.schema, table, opts)
 		if err != nil {
