@@ -818,6 +818,13 @@ func (b *BackupStreamStopCmd) Run(_ *Globals) error {
 // any that don't match the manifest. Useful for cron probes against
 // archived backups — confirms the bits are still good without needing
 // a target database to restore into.
+//
+// When the chain is encrypted and the operator supplies `--encrypt`
+// + a passphrase / KMS reference, verify additionally performs a
+// decrypt probe on every per-chunk WrappedCEK — the Bug 117 closure.
+// A passphrase rotation mid-chain (per-chunk mode) surfaces here as
+// a "wrong passphrase for chunk X" verify failure instead of a
+// partial-fail at restore-time.
 type BackupVerifyCmd struct {
 	FromDir string `help:"Directory containing the backup to verify (the same directory --output-dir wrote to). Mutually exclusive with --from." placeholder:"DIR"`
 	From    string `help:"URL of the backup to verify (s3://, gs://, azblob://, file:///). Mutually exclusive with --from-dir." placeholder:"URL"`
@@ -827,6 +834,8 @@ type BackupVerifyCmd struct {
 	BackupPathStyle bool   `help:"Force path-style addressing. Only meaningful when --from is an s3:// URL."`
 
 	RebuildCatalog bool `help:"Rebuild lineage.json from scratch by walking the conventional one-segment layout (manifest.json + manifests/incr-*.json), then exit. Use after manual mutation of a single-segment backup. NOTE: a multi-segment (rotated) lineage's sub-dir structure is NOT reconstructable from a bare walk by design — lineage.json IS the structural record for a rotated backup."`
+
+	EncryptionFlags
 }
 
 // Run implements `sluice backup verify`.
@@ -861,16 +870,44 @@ func (v *BackupVerifyCmd) Run(_ *Globals) error {
 		)
 		return nil
 	}
-	total, mismatches, err := pipeline.VerifyBackup(ctx, store)
+	// Bug 117 closure (v0.94.1): when --encrypt is on, load the
+	// chain-root manifest so the read envelope re-derives the same
+	// Argon2id KEK the writer used, then thread the envelope into
+	// VerifyBackupWith. SHA-only verify silently accepted per-chunk
+	// passphrase rotation; the decrypt probe refuses it.
+	rootManifest, err := pipeline.ReadRootManifest(ctx, store)
+	if err != nil {
+		return fmt.Errorf("verify: read root manifest: %w", err)
+	}
+	envelope, err := v.buildReadEnvelope(rootManifest)
+	if err != nil {
+		return err
+	}
+	if envelope == nil && rootManifest != nil && rootManifest.ChainEncryption != nil {
+		// Encrypted chain + no envelope = SHA-only verify (legacy
+		// behavior). Bug 117's silent passphrase-rotation acceptance
+		// is invisible without a decrypt probe — warn the operator
+		// loudly so they know to re-run with `--encrypt` + their
+		// passphrase for full coverage.
+		slog.WarnContext(
+			ctx, "backup verify: chain is encrypted but no envelope supplied — running SHA-only verify; passphrase rotation (Bug 117) is undetectable in this mode. Re-run with --encrypt + the chain's passphrase / KMS reference to enable the per-chunk decrypt probe.",
+			slog.String("kek_mode", rootManifest.ChainEncryption.KEKMode),
+			slog.String("kek_ref", rootManifest.ChainEncryption.KEKRef),
+		)
+	}
+	total, mismatches, err := pipeline.VerifyBackupWith(ctx, store, pipeline.VerifyOptions{
+		Envelope: envelope,
+	})
 	if err != nil {
 		return err
 	}
 	if mismatches > 0 {
-		return fmt.Errorf("verify: %d of %d chunk(s) failed SHA-256 check", mismatches, total)
+		return fmt.Errorf("verify: %d of %d chunk(s) failed verification", mismatches, total)
 	}
 	slog.InfoContext(
 		ctx, "backup verify: all chunks OK",
 		slog.Int("chunks", total),
+		slog.Bool("decrypt_probe", envelope != nil),
 	)
 	return nil
 }

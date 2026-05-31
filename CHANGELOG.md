@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **`fix(pipeline): add envelope decrypt probe to backup verify (Bug 117 closure)`** — pre-fix `sluice backup verify` was SHA-256-only: it hashed each chunk's on-disk bytes and compared against the manifest. For per-chunk-mode encrypted chains (`--encrypt-mode=per-chunk`), each chunk's CEK is wrapped freshly at write time with the current envelope; an operator who ran `backup incremental` with a *different* `--encryption-passphrase` than the original `backup full` produced a chain where each segment's chunks were wrapped under different KEKs, but every chunk's on-disk SHA still matched the manifest — `backup verify` reported "all chunks OK", and the divergence only surfaced at `restore` time as a partial-fail at the first rotated chunk with no rollback (target left mid-state). v0.94.1 adds `VerifyOptions{Envelope}` + `VerifyBackupWith` (the historical `VerifyBackup(ctx, store)` is preserved as a SHA-only wrapper for backward compatibility) and wires `cmd/sluice backup verify` to load the chain root manifest, build a read envelope from the operator's `--encrypt` flags (re-deriving the chain's Argon2id KEK against the chain's recorded salt), and pass it through. When the envelope is non-nil, verify performs an up-front chain-CEK unwrap probe (per-chain mode + chain-level KEKMode mismatch fail fast with a clear error) and a per-chunk `probeChunkDecrypt` that unwraps each chunk's `WrappedCEK` — an unwrap failure on a per-chunk-mode chain (Bug 117 signature) is counted as a verify failure with a descriptive `unwrap chunk cek (passphrase rotated mid-chain?)` error that names the chunk path. When the chain is encrypted but the operator omits `--encrypt`, verify falls through to the legacy SHA-only path AND emits a loud `slog.Warn` advising the operator to re-run with `--encrypt` for full coverage. Pinned by `TestVerifyBackupWith_DecryptProbe_Bug117` (6 sub-pins: plaintext+nil-envelope, per-chain+correct-envelope, per-chain+wrong-passphrase fast-refuse, per-chunk+correct-envelope, per-chunk+rotated-passphrase fail-every-chunk with belt-and-suspenders confirmation that legacy SHA-only still reports 0 failed on the same store, KEKMode mismatch fast-refuse) + `TestProbeChunkDecrypt_NilSafe`.
+
 ## [0.94.0] - 2026-05-31
 
 ### Fixed
