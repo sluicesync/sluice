@@ -235,7 +235,9 @@ A few terms recur in the codebase and docs:
 - [`docs/comparison.md`](docs/comparison.md) — sluice vs. Debezium / AWS DMS / Fivetran / pgcopydb / HVR / Striim / Qlik (deep dive)
 - [`docs/comparison-bucardo.md`](docs/comparison-bucardo.md) — sluice vs. Bucardo (the canonical open-source PG → PG comparison; honest measured numbers, where each tool wins)
 - [`docs/use-cases.md`](docs/use-cases.md) — operator-persona-by-persona breakdown of "which sluice surface do I need?"
-- [`docs/cookbook/`](docs/cookbook/) — task-shaped recipes: one-shot migrate, bidirectional cutover, encrypted backup chains, PII redaction with keyset persistence, GitLab-shape schema case study
+- [`docs/cookbook/`](docs/cookbook/) — task-shaped recipes: one-shot migrate, bidirectional cutover, Heroku-style slot-less migration, encrypted backup chains, PII redaction, PostGIS round-trip, GitLab-shape case study, and the `pg_dump` comparison
+- [`docs/translator-catalog.md`](docs/translator-catalog.md) — consolidated cross-engine expression translator reference: shipped translations + deferred rules + escape hatches
+- [`docs/adr/README.md`](docs/adr/README.md) — index of all 70+ ADRs with one-line summary per decision
 - [`docs/managed-services.md`](docs/managed-services.md) — PlanetScale-specific notes, operator preconditions
 - [`docs/postgres-source-prep.md`](docs/postgres-source-prep.md) — required PG GUCs, slot lifecycle, failover-survival mechanisms
 - [`docs/vitess-vstream-troubleshooting.md`](docs/vitess-vstream-troubleshooting.md) — operator runbook for PlanetScale-MySQL VStream lag (throttler, replication lag, deploy requests)
