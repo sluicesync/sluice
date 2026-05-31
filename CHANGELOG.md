@@ -4,6 +4,12 @@ All notable changes to sluice are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **`fix(postgres): carry non-default core operator classes through schema reader (Bug 115 closure)`** — pre-fix the PG schema reader populated `ir.IndexColumn.OperatorClass` only when (a) the index used an extension-introduced access method (pgvector's hnsw), (b) the opclass was owned by an enabled extension on a core AM (pg_trgm's `gin_trgm_ops` / `gist_trgm_ops`), or (c) an uncatalogued extension-owned opclass surfaced under the ADR-0047 verbatim tier. Operator-explicit **non-default core PG opclasses** on core AMs fell through every branch and were silently dropped: `btree (col text_pattern_ops)` (required for `LIKE 'prefix%'` index use in C locale), `btree (col varchar_pattern_ops)` (same case for varchar), and `gin (col jsonb_path_ops)` (~50% smaller, substantially faster for `@>` containment vs default `jsonb_ops`) all migrated PG→PG to an index using the default opclass — index name preserved, structure intact, but the operational semantics differ and "we migrated and our `@>` queries are 10× slower" became a debug mystery. v0.95.0 extends the reader's SQL to fetch `pg_opclass.opcdefault` alongside `opcname` and adds a dispatch branch: when `opclass != "" && !opclassExtOwned && !opclassDefault`, the bareword is carried verbatim through `ir.IndexColumn.OperatorClass`. The existing same-engine PG writer at `emitIndexColumnList` already emits `<column> <opclass>` for any non-empty `OperatorClass`, so the fix is purely on the reader side. Default-opclass cases on built-in types continue to leave `OperatorClass` empty so the writer emits nothing extra (preserves the Bug 47 invariant that a non-empty value through the IR is an honest "operator-significant opclass" marker and keeps DDL diffs stable against `pg_get_indexdef` across PG major versions). Pinned by `TestSchemaReader_NonDefaultCoreOpclasses_Bug115` (integration test against a real Postgres covering the three documented Bug 115 cases — `text_pattern_ops`, `varchar_pattern_ops`, `jsonb_path_ops` — plus a default-opclass negative control that asserts the IR stays empty).
+
 ## [0.94.1] - 2026-05-31
 
 ### Fixed

@@ -925,6 +925,17 @@ func (r *SchemaReader) populateIndexes(ctx context.Context, tables map[string]*i
 			COALESCE(a.attname, ''),
 			u.ord,
 			COALESCE(opc.opcname, '') AS opclass,
+			-- Bug 115 (v0.95.0): is this opclass the AM+input-type's
+			-- DEFAULT opclass? PG records the same indclass OID
+			-- regardless of whether the operator typed it explicitly or
+			-- the planner defaulted. A non-default core opclass
+			-- (text_pattern_ops / varchar_pattern_ops / jsonb_path_ops
+			-- and similar) is operator-significant and must carry to
+			-- the target via [ir.IndexColumn.OperatorClass]; a default
+			-- opclass on a core AM is irrelevant noise. Read the flag
+			-- alongside opcname so the dispatch below can pick the
+			-- right branch without a second catalog lookup.
+			COALESCE(opc.opcdefault, true) AS opclass_default,
 			CASE
 				WHEN a.attname IS NULL
 				THEN pg_get_indexdef(ix.indexrelid, u.ord::int, true)
@@ -997,6 +1008,7 @@ func (r *SchemaReader) populateIndexes(ctx context.Context, tables map[string]*i
 			isUnique, isPrimary                   bool
 			ord                                   int
 			opclass                               string
+			opclassDefault                        bool
 			exprText                              string
 			nKeyAtts                              int
 			indOption                             int
@@ -1006,7 +1018,7 @@ func (r *SchemaReader) populateIndexes(ctx context.Context, tables map[string]*i
 		if err := rows.Scan(
 			&tableName, &indexName, &method,
 			&isUnique, &isPrimary,
-			&colName, &ord, &opclass, &exprText,
+			&colName, &ord, &opclass, &opclassDefault, &exprText,
 			&nKeyAtts, &indOption, &predicate,
 			&amExtOwned, &opclassExtOwned,
 		); err != nil {
@@ -1143,6 +1155,29 @@ func (r *SchemaReader) populateIndexes(ctx context.Context, tables map[string]*i
 		case opclass != "" && idx.Method != "":
 			col.OperatorClass = opclass
 		case opclass != "" && extensionOperatorClassEnabled(opclass, r.enabledExtensions):
+			col.OperatorClass = opclass
+		case opclass != "" && !opclassExtOwned && !opclassDefault:
+			// Bug 115 (v0.95.0): operator-explicit non-default CORE
+			// PG opclass on a core access method. Examples observed in
+			// the wild that pre-fix silently dropped:
+			//
+			//   - btree (col text_pattern_ops)     — required for
+			//     LIKE 'prefix%' to use the index in the C locale
+			//   - btree (col varchar_pattern_ops)  — same; varchar
+			//   - gin   (col jsonb_path_ops)       — half-size,
+			//     substantially faster for @> containment vs default
+			//     jsonb_ops
+			//
+			// PG records the same indclass OID whether the operator
+			// typed it explicitly or the planner defaulted; the
+			// distinction is in pg_opclass.opcdefault. A non-default
+			// core opclass is operator-significant and must carry to
+			// the target via OperatorClass; a default opclass is
+			// implicit noise the catalog round-trip drops correctly
+			// per the pre-existing Bug 47 design ("no spurious
+			// opclass on built-in indexes" for default opclasses
+			// stays). Cross-engine PG → MySQL: the writer drops with
+			// a WARN, mirroring the pg_trgm-not-enabled branch below.
 			col.OperatorClass = opclass
 		case opclass != "" && opclassExtOwned &&
 			!extensionOperatorClassRegistered(opclass) &&

@@ -988,10 +988,15 @@ func emitIndexColumnList(cols []ir.IndexColumn, opts emitOpts) string {
 			entry = quoteIdent(c.Column)
 		}
 		// Per-column operator class — populated by the schema reader
-		// only for extension-introduced access methods that need an
+		// for (a) extension-introduced access methods that need an
 		// explicit opclass (pgvector's hnsw rejects the index at
-		// CREATE without one). Default-opclass cases (btree/hash/gin
-		// over built-ins) leave this empty and emit nothing extra.
+		// CREATE without one), (b) extension-owned opclasses on core
+		// AMs (pg_trgm's gin_trgm_ops / gist_trgm_ops), (c) Bug 115
+		// (v0.95.0) — operator-explicit NON-DEFAULT core opclasses
+		// (text_pattern_ops / varchar_pattern_ops / jsonb_path_ops
+		// and similar) that pre-fix dropped silently into the
+		// default opclass on round-trip. Default-opclass cases on
+		// built-in types leave this empty and emit nothing extra.
 		if c.OperatorClass != "" {
 			entry += " " + c.OperatorClass
 		}
