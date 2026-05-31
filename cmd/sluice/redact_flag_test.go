@@ -387,6 +387,69 @@ func TestMergeYAMLRedactions_AppendsToCLIRegistry(t *testing.T) {
 	}
 }
 
+// TestMergeYAMLRedactions_CLIOverridesYAML pins the v0.96.0 Bug 108
+// closure: when CLI --redact AND YAML redactions: declare DIFFERENT
+// rules for the SAME column, the CLI rule wins (matches the
+// documented "CLI flags … override anything set here" precedence
+// model from docs/examples/sluice.yaml). Pre-fix the YAML rule was
+// merged second and silently overwrote the CLI rule via the
+// underlying map Set — silent policy substitution on a compliance-
+// critical feature.
+//
+// Variants A (YAML hash + CLI static) and B (YAML static + CLI hash)
+// from BUG-CATALOG.md Bug 108 entry are both pinned.
+func TestMergeYAMLRedactions_CLIOverridesYAML(t *testing.T) {
+	t.Run("variant A: YAML hash overwritten by CLI static", func(t *testing.T) {
+		cli, err := parseRedactFlags([]string{"users.email=static:CLI-OVERRIDE"}, nil, "", nil)
+		if err != nil {
+			t.Fatalf("CLI parse failed: %v", err)
+		}
+		yaml := []config.Redaction{
+			{Table: "users.email", Strategy: "hash", Algo: "sha256"},
+		}
+		reg, err := mergeYAMLRedactions(cli, yaml, nil, "", nil)
+		if err != nil {
+			t.Fatalf("merge failed: %v", err)
+		}
+		got := reg.Get("", "users", "email")
+		if got == nil {
+			t.Fatalf("rule missing after merge")
+		}
+		s, ok := got.(redact.Static)
+		if !ok {
+			t.Errorf("strategy = %T (%v); want redact.Static (the CLI rule) — Bug 108 silent-overwrite signature", got, got)
+		}
+		if ok && s.Value != "CLI-OVERRIDE" {
+			t.Errorf("Static.Value = %q; want %q", s.Value, "CLI-OVERRIDE")
+		}
+	})
+
+	t.Run("variant B: YAML static overwritten by CLI hash", func(t *testing.T) {
+		cli, err := parseRedactFlags([]string{"users.email=hash:sha256"}, nil, "", nil)
+		if err != nil {
+			t.Fatalf("CLI parse failed: %v", err)
+		}
+		yaml := []config.Redaction{
+			{Table: "users.email", Strategy: "static", Value: "YAML-VALUE"},
+		}
+		reg, err := mergeYAMLRedactions(cli, yaml, nil, "", nil)
+		if err != nil {
+			t.Fatalf("merge failed: %v", err)
+		}
+		got := reg.Get("", "users", "email")
+		if got == nil {
+			t.Fatalf("rule missing after merge")
+		}
+		h, ok := got.(redact.Hash)
+		if !ok {
+			t.Errorf("strategy = %T (%v); want redact.Hash (the CLI rule)", got, got)
+		}
+		if ok && h.Algo != "sha256" {
+			t.Errorf("Hash.Algo = %q; want %q", h.Algo, "sha256")
+		}
+	})
+}
+
 // TestMergeYAMLRedactions_RefusalPaths covers malformed YAML
 // entries.
 func TestMergeYAMLRedactions_RefusalPaths(t *testing.T) {
@@ -1197,7 +1260,7 @@ func TestParseRedactFlags_TokenizeDict(t *testing.T) {
 }
 
 // TestParseRedactFlags_TokenizeDictRefusals covers documented CLI
-// refusal paths for the dict strategies.
+// refusal paths for the dict gotegies.
 func TestParseRedactFlags_TokenizeDictRefusals(t *testing.T) {
 	dicts := map[string][]string{"first_names": {"Alice", "Bob"}}
 	cases := []struct {
