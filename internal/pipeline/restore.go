@@ -604,6 +604,33 @@ func (r *Restore) chunkCEK(chunk *ir.ChunkInfo) ([]byte, error) {
 	return r.chainCEK, nil
 }
 
+// VerifyOptions controls [VerifyBackup]'s verification surface. The
+// zero value performs only the byte-level SHA-256 check (the historical
+// behavior, preserved for backward compatibility).
+type VerifyOptions struct {
+	// Envelope, when non-nil, enables decrypt-probe verification on
+	// every encrypted chunk. Closes Bug 117 (v0.94.1): pre-fix,
+	// per-chunk-mode chains accepted a passphrase rotation
+	// mid-chain silently — `backup verify` was SHA-only, the
+	// later chunks' SHAs still matched (the bytes on disk DID
+	// hash correctly), and the divergence only surfaced at restore
+	// time as a partial-fail with no rollback. Post-fix, the
+	// envelope is used to unwrap each per-chunk WrappedCEK; an
+	// unwrap failure (wrong passphrase / wrong KMS key for that
+	// chunk) is reported as a verify failure with a clear
+	// chunk-naming error so the operator can identify the rotation
+	// point before attempting restore.
+	//
+	// Per-chain mode is also probed (unwrap the chain-level CEK
+	// once up-front) so a fully-wrong passphrase fails fast with a
+	// single clear error rather than 0 verify failures + a
+	// restore-time surprise.
+	//
+	// Must match the chain root's recorded KEKMode when set; a
+	// mismatch returns an irrecoverable error from VerifyBackup.
+	Envelope crypto.EnvelopeEncryption
+}
+
 // VerifyBackup walks every chunk referenced by the manifest in store,
 // rehashes each chunk's bytes, and reports any mismatches. Used by
 // `sluice backup verify` for "is my backup still intact?" cron probes
@@ -621,13 +648,51 @@ func (r *Restore) chunkCEK(chunk *ir.ChunkInfo) ([]byte, error) {
 // plus one or more incremental manifests), VerifyBackup walks every
 // manifest's chunks — both the row chunks of the full and the
 // change chunks of each incremental.
+//
+// VerifyBackup is the historical SHA-only entrypoint preserved for
+// backward compatibility (all existing tests rely on this signature).
+// Operators wanting the Bug 117 decrypt probe pass a non-nil
+// VerifyOptions.Envelope via [VerifyBackupWith].
 func VerifyBackup(ctx context.Context, store ir.BackupStore) (total, failed int, err error) {
+	return VerifyBackupWith(ctx, store, VerifyOptions{})
+}
+
+// VerifyBackupWith is the options-bearing form of [VerifyBackup]. When
+// opts.Envelope is non-nil, every encrypted chunk's WrappedCEK is
+// unwrapped against the supplied envelope so a passphrase rotation
+// mid-chain (Bug 117) surfaces at verify-time instead of partial-failing
+// the restore.
+func VerifyBackupWith(ctx context.Context, store ir.BackupStore, opts VerifyOptions) (total, failed int, err error) {
 	records, err := listAllSegmentManifests(ctx, store)
 	if err != nil {
 		return 0, 0, fmt.Errorf("verify: %w", err)
 	}
 	if len(records) == 0 {
 		return 0, 0, errors.New("verify: no manifests found in store")
+	}
+	// Bug 117 closure: when an envelope is supplied AND the chain
+	// root records ChainEncryption, validate the chain-level
+	// envelope eagerly so the operator gets a single clear "wrong
+	// passphrase / wrong KMS key" error up front. For per-chain
+	// mode this is also the only decrypt probe per verify run; for
+	// per-chunk mode it confirms the operator's envelope is
+	// well-formed before per-chunk probes run in the chunk loop.
+	if opts.Envelope != nil {
+		if rootEnc := records[0].manifest.ChainEncryption; rootEnc != nil {
+			if rootEnc.KEKMode != "" && opts.Envelope.Mode() != rootEnc.KEKMode {
+				return 0, 0, fmt.Errorf(
+					"verify: envelope mode %q does not match chain's recorded kek_mode %q",
+					opts.Envelope.Mode(), rootEnc.KEKMode,
+				)
+			}
+			if len(rootEnc.WrappedCEK) > 0 {
+				if _, uerr := opts.Envelope.UnwrapCEK(rootEnc.WrappedCEK); uerr != nil {
+					return 0, 0, fmt.Errorf(
+						"verify: unwrap chain cek (wrong passphrase / KMS key?): %w", uerr,
+					)
+				}
+			}
+		}
 	}
 	for _, rec := range records {
 		manifest := rec.manifest
@@ -647,6 +712,17 @@ func VerifyBackup(ctx context.Context, store ir.BackupStore) (total, failed int,
 						slog.String("table", table.Name),
 						slog.String("file", chunk.File),
 						slog.String("error", err.Error()),
+					)
+					continue
+				}
+				if perr := probeChunkDecrypt(opts.Envelope, chunk); perr != nil {
+					failed++
+					slog.ErrorContext(
+						ctx, "verify: chunk decrypt probe failed",
+						slog.String("manifest", rec.path),
+						slog.String("table", table.Name),
+						slog.String("file", chunk.File),
+						slog.String("error", perr.Error()),
 					)
 					continue
 				}
@@ -671,6 +747,16 @@ func VerifyBackup(ctx context.Context, store ir.BackupStore) (total, failed int,
 				)
 				continue
 			}
+			if perr := probeChunkDecrypt(opts.Envelope, chunk); perr != nil {
+				failed++
+				slog.ErrorContext(
+					ctx, "verify: change chunk decrypt probe failed",
+					slog.String("manifest", rec.path),
+					slog.String("file", chunk.File),
+					slog.String("error", perr.Error()),
+				)
+				continue
+			}
 			slog.DebugContext(
 				ctx, "verify: change chunk OK",
 				slog.String("manifest", rec.path),
@@ -679,6 +765,26 @@ func VerifyBackup(ctx context.Context, store ir.BackupStore) (total, failed int,
 		}
 	}
 	return total, failed, nil
+}
+
+// probeChunkDecrypt attempts to unwrap a per-chunk WrappedCEK using the
+// supplied envelope. No-op when the envelope is nil (no decrypt probe
+// requested), the chunk is plaintext (no Encryption metadata), or the
+// chunk is per-chain-mode (empty WrappedCEK; the chain root's probe
+// already covered it). Returns a wrapping error on unwrap failure so
+// the caller can surface "wrong passphrase for THIS chunk" — the
+// Bug 117 signal.
+func probeChunkDecrypt(env crypto.EnvelopeEncryption, chunk *ir.ChunkInfo) error {
+	if env == nil || chunk == nil || chunk.Encryption == nil {
+		return nil
+	}
+	if len(chunk.Encryption.WrappedCEK) == 0 {
+		return nil
+	}
+	if _, err := env.UnwrapCEK(chunk.Encryption.WrappedCEK); err != nil {
+		return fmt.Errorf("unwrap chunk cek (passphrase rotated mid-chain?): %w", err)
+	}
+	return nil
 }
 
 // verifyChunk fetches a chunk and recomputes its SHA-256, returning
