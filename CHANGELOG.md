@@ -6,6 +6,10 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`fix(pipeline): surface 'previously-completed tables have no indexes yet' hint on bulk-copy mid-phase abort (Bug 114 closure)`** — pre-fix when `sluice migrate` hit a bulk-copy failure on table N+1, the loud error correctly named the failing table (good — preserves loud-fail tenet) but said nothing about the state of tables 1..N. Because the migrate phases are `tables → bulk_copy → identity_sync → indexes → constraints → views`, an N+1 abort leaves tables 1..N with full row counts AND the PK index (from CREATE TABLE), but WITHOUT any of their declared secondary indexes — the index phase runs only after every table finishes bulk_copy. Operators inspecting `pg_indexes` on those earlier tables saw the PK and concluded "this table migrated cleanly", missing the absent secondary indexes; recovery (`--resume`) wasn't surfaced as the next step in the error message. v0.96.1 extends the `hints.go` registry (the existing operator-friendly post-error-hint layer) with a `PhaseBulkCopy` substring-keyed entry matching the standard `pipeline: copy table` wrapper prefix produced by `migrate_bulk.go`'s copy-table failure paths. The hint reads `any earlier tables in this run have data but NOT their declared secondary indexes (the indexes phase runs after ALL tables finish bulk-copy); use --resume to continue after fixing the offending table, or --exclude-table=<name> to skip it`. The existing "does not exist" / "doesn't exist" PhaseBulkCopy entries continue to win first (first-match-wins ordering) so the more-actionable "target table not found" hint still fires for schema-apply-mismatch errors; the new entry catches the residual "underlying engine error" class (e.g. Bug 114's `jsonb[]` COPY-protocol refusal). Pinned by `TestHintForRegistry` adding a new sub-case naming Bug 114 with the catalog's `sentry_releases` repro shape.
+
 ## [0.96.0] - 2026-05-31
 
 ### Fixed

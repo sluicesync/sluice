@@ -36,6 +36,14 @@ func TestHintForRegistry(t *testing.T) {
 			want:  "target table not found",
 		},
 		{
+			name:  "bulk-copy generic copy-table failure surfaces resume hint (Bug 114)",
+			phase: PhaseBulkCopy,
+			err: errors.New(
+				`pipeline: copy table "sentry_releases": postgres: insert into "sentry_releases": array of element type ir.JSON not supported (SQLSTATE 57014)`,
+			),
+			want: "use --resume to continue",
+		},
+		{
 			name:  "connect: connection refused",
 			phase: PhaseConnect,
 			err:   errors.New(`postgres: open replication connection: dial tcp 127.0.0.1:5432: connect: connection refused`),
