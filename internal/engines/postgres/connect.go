@@ -103,8 +103,19 @@ func parseKVDSN(dsn string) (*pgConfig, error) {
 // so the keep-alive policy is applied uniformly. The DSN must already
 // have any sluice-custom parameters (such as `schema`) stripped — see
 // [parseDSN].
+//
+// Connections opened here are labelled with the [roleControl]
+// application_name; the postgres engine's own pools call [openDBAs]
+// with a more specific role.
 func OpenPgxDB(dsn string) (*sql.DB, error) {
-	connConfig, err := pgx.ParseConfig(dsn)
+	return openPgxDBAs(dsn, roleControl)
+}
+
+// openPgxDBAs is the role-aware variant behind [OpenPgxDB]. It stamps
+// the application_name for role (unless the operator already set one)
+// before handing the DSN to pgx.
+func openPgxDBAs(dsn string, role connRole) (*sql.DB, error) {
+	connConfig, err := pgx.ParseConfig(withApplicationName(dsn, role))
 	if err != nil {
 		return nil, fmt.Errorf("postgres: parse dsn: %w", err)
 	}
@@ -113,9 +124,19 @@ func OpenPgxDB(dsn string) (*sql.DB, error) {
 }
 
 // openDB opens a *sql.DB against the Postgres server and pings to
-// confirm the connection is usable.
+// confirm the connection is usable. The connection is labelled with the
+// [roleControl] application_name; callers that know their subsystem use
+// [openDBAs] to label more precisely.
 func openDB(ctx context.Context, cfg *pgConfig) (*sql.DB, error) {
-	db, err := OpenPgxDB(cfg.dsn)
+	return openDBAs(ctx, cfg, roleControl)
+}
+
+// openDBAs is the role-aware variant of [openDB]: it stamps the
+// application_name for role on the connection (see [withApplicationName])
+// so the engine's snapshot / applier / cdc-reader / schema pools are
+// distinguishable in pg_stat_activity.
+func openDBAs(ctx context.Context, cfg *pgConfig, role connRole) (*sql.DB, error) {
+	db, err := openPgxDBAs(cfg.dsn, role)
 	if err != nil {
 		return nil, fmt.Errorf("postgres: open: %w", err)
 	}

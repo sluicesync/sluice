@@ -337,6 +337,21 @@ type Streamer struct {
 	// land it than to wedge the stream. See ADR-0028.
 	MaxBufferBytes int64
 
+	// MaxTargetConnections is the operator's --max-target-connections
+	// explicit ceiling on the target connection budget (connection-
+	// resilience item 4). On the cold-start branch the streamer runs a
+	// connection-budget preflight that refuses loudly when the target
+	// has no free slot for the copy + CDC connections (the opaque
+	// slot-exhaustion FATAL the feature targets). Unlike the Migrator's
+	// parallel-copy path there's no parallelism to cap here — the
+	// streamer's cold-start is single-reader — so this value's role is
+	// the loud-refusal floor plus an explicit ceiling.
+	//
+	// Zero (the default) means "auto" — probe-and-refuse-on-exhaustion
+	// with no operator-imposed ceiling. Target-engine-specific: a no-op
+	// on engines without a connection-slot model (today: MySQL).
+	MaxTargetConnections int
+
 	// ApplyExecTimeout is the per-statement deadline plumbed to the
 	// target [ir.ChangeApplier] via the optional
 	// [ir.ApplyExecTimeoutSetter] interface. Each tx.ExecContext call
@@ -2406,6 +2421,20 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 	}
 	applyTargetSchema(rw, s.TargetSchema)
 	applyMaxBufferBytes(rw, s.MaxBufferBytes)
+
+	// Connection-budget preflight (connection-resilience item 4). The
+	// streamer's cold-start is single-reader (requested=1), so there's
+	// no parallelism to cap — but the loud refusal still fires when the
+	// target has no free slot for the copy + CDC connections, and an
+	// operator --max-target-connections ceiling is honoured. No-op on
+	// engines without a connection-slot model (MySQL). Discarded
+	// effective value (it can only be 1 here); we run it for the refusal.
+	if _, err := resolveTargetCopyParallelism(ctx, s.Target, s.TargetDSN, 1, s.MaxTargetConnections); err != nil {
+		closeIf(rw)
+		closeIf(sw)
+		_ = stream.Close()
+		return nil, stop, err
+	}
 
 	// Target-side RLS preflight (task #52 sub-deliverable 1). Refuses
 	// when any in-scope target table has RLS enabled AND the connecting
