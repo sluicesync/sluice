@@ -237,6 +237,7 @@ A few terms recur in the codebase and docs:
 - [`docs/use-cases.md`](docs/use-cases.md) — operator-persona-by-persona breakdown of "which sluice surface do I need?"
 - [`docs/cookbook/`](docs/cookbook/) — task-shaped recipes: one-shot migrate, bidirectional cutover, Heroku-style slot-less migration, encrypted backup chains, PII redaction, PostGIS round-trip, GitLab-shape case study, and the `pg_dump` comparison
 - [`docs/translator-catalog.md`](docs/translator-catalog.md) — consolidated cross-engine expression translator reference: shipped translations + deferred rules + escape hatches
+- [`docs/backup-format-versioning.md`](docs/backup-format-versioning.md) — backup manifest `FormatVersion` contract: proportional version-stamp, refuse-before-touch on older binaries, how older sluice doesn't silently drop RLS / EXCLUDE metadata (Bug 116 closure reference)
 - [`docs/adr/README.md`](docs/adr/README.md) — index of all 70+ ADRs with one-line summary per decision
 - [`docs/managed-services.md`](docs/managed-services.md) — PlanetScale-specific notes, operator preconditions
 - [`docs/postgres-source-prep.md`](docs/postgres-source-prep.md) — required PG GUCs, slot lifecycle, failover-survival mechanisms
