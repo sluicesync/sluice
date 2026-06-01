@@ -18,6 +18,7 @@ quickstart's "install sluice" preamble.
 | [One-shot migration MySQL → Postgres](recipe-migrate-once.md) | You want to move data once and stop. The simple `sluice migrate` path. |
 | [Bidirectional cutover with sequence priming](recipe-bidirectional-cutover.md) | Live migration with low downtime — snapshot, sync, then cutover to the new target without PK collisions. |
 | [Migrating off Heroku Postgres (slot-less)](recipe-heroku-migration.md) | Managed PG without `REPLICATION` role — the slot-less migration path. Applies equally to RDS / Crunchy Bridge / Supabase Free tier. |
+| [Continuous replication via the backup chain (broker)](recipe-broker-replay.md) | Producer + consumer pattern using the backup chain as decoupled-transport. Air-gapped targets, cross-region with shared store, compliance-driven audit-trail, multi-target fan-out. Includes broker-vs-`sync start` decision matrix. |
 | [PostGIS geospatial round-trip](recipe-postgis.md) | PG ↔ MySQL migration of geometry / geography columns with SRID preserved end-to-end. |
 | [Backup chain with at-rest encryption](recipe-backup-encrypted.md) | Periodic full + incremental backups with passphrase-based or AWS-KMS-based encryption. |
 | [PII redaction with persisted keyset](recipe-redaction-keyset.md) | Replicate to a staging/analytics target with PII redacted but deterministic across runs. |
