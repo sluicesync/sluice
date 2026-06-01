@@ -84,14 +84,56 @@ window so orphans self-clear faster. It is partial help for the server-side
 governs detection), but it is correct hygiene and helps every other half-open
 case (applier writes, CDC reads).
 
-### Bonus: connection-budget awareness
+### 4. Connection-budget awareness for parallel COPY
 
-The slot-exhaustion we hit is worsened by sluice's **parallel COPY** opening
-several connections at once against a small target. Consider a
-`--max-target-connections` cap (or adaptive backoff on `53300
-too_many_connections` / the superuser-slots FATAL), and have the migrator default
-it conservatively for small managed targets. Orthogonal to (1)–(3) but the same
-incident surfaced it.
+`--bulk-parallelism` (ADR-0019) defaults to `min(8, NumCPU)` and opens one target
+connection per chunk (`COPY FROM STDIN`), **blind to the target's connection
+budget** — `runtime.NumCPU()` on a managed-PG host typically reports the host's
+core count, so a tight node gets hit with ~8 + control connections regardless of
+its `max_connections`. On a small node (e.g. PlanetScale PS-5 with
+`max_connections=20`, minus `superuser_reserved_connections`, minus the rig's own
+usage), that plus any leaked backends exhausts the slot budget and fails
+opaquely *mid-COPY* (`FATAL: remaining connection slots are reserved for roles
+with the SUPERUSER attribute`) instead of loud-and-early at preflight.
+
+**Probe the budget at target preflight:**
+
+```sql
+SHOW max_connections;                                              -- global cap
+SHOW superuser_reserved_connections;                              -- non-superuser can't use these
+SELECT count(*) FROM pg_stat_activity;                            -- current total
+SELECT rolconnlimit FROM pg_roles WHERE rolname = current_user;  -- per-role cap (-1 = unlimited)
+SELECT count(*) FROM pg_stat_activity WHERE usename = current_user;
+SELECT datconnlimit FROM pg_database WHERE datname = current_database();
+```
+
+**Effective non-superuser budget:**
+
+```
+global_available = max_connections - superuser_reserved_connections - current_total
+role_available   = rolconnlimit  < 0 ? +inf : rolconnlimit  - role_current
+db_available     = datconnlimit  < 0 ? +inf : datconnlimit  - db_current
+available        = min(global_available, role_available, db_available)
+copy_budget      = available - reserve   # reserve for control conn + CDC reader + operator headroom (~3-4)
+effective_parallelism = clamp(requested, 1, copy_budget)
+```
+
+- If `copy_budget < 1`, **refuse loudly** at preflight with the numbers
+  (`target has 18/20 slots in use; only 2 available to role X, need ≥ <reserve+1>`),
+  pointing at the stale-backend reaper (1)+(2) as the likely fix — never start a
+  copy that can't finish.
+- **Auto-cap is default-on** (it only ever *reduces* parallelism on a tight
+  target — safe), with an explicit `--max-target-connections N` ceiling override
+  and the existing `--bulk-parallelism` as the requested upper bound.
+- **Adaptive backoff:** if a chunk's connection open returns SQLSTATE `53300`
+  (`too_many_connections`) or the superuser-slots FATAL, AIMD-decrease parallelism
+  and retry rather than fail the run — sluice already has AIMD machinery for the
+  applier batch (`sluice_apply_batch_size_*`), so the pattern is established.
+- `application_name` (1) lets the probe distinguish *sluice's own* connections
+  from everyone else's, so the budget math and any reaping target only our slots.
+
+This is the same-incident companion to (1)–(3): reaping stops the leak, budget
+awareness makes each run self-limit and fail early instead of opaquely.
 
 ## Why this is correctness, not just convenience
 
