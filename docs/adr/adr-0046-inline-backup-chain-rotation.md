@@ -336,10 +336,26 @@ linearization point.
   Only the *catalog/segment metadata* + the codec wrapper change.
 - Common-path operator experience (never set a rotation flag → a
   one-segment lineage, same as today).
-- Out of scope: `zstd`; backup-broker (Phase 4.5) following a
-  multi-segment lineage (flagged, deferred — prep doc open Q3);
-  per-segment encryption keying stays per the existing per-chain
-  rule (now per-segment; prep doc open Q1, documented).
+- Out of scope: `zstd`; per-segment encryption keying stays per the
+  existing per-chain rule (now per-segment; prep doc open Q1,
+  documented).
+
+  **Update — broker following a multi-segment lineage (prep doc open
+  Q3): CLOSED.** Phase 4.5 originally deferred this with a flag-and-
+  defer pending validation that the existing chain walker +
+  idempotent applier covered the rotation seam. The Round D soak
+  (2026-05-31) characterized the gap: the broker's apply loop
+  already skips full manifests unconditionally, so segment-N+1's
+  rotation snapshot is auto-skipped. ADR-0067's born-contiguous
+  rotation guarantees the next segment's first incremental covers
+  the `(P_N, S]` overlap from the prior segment's end position;
+  ADR-0010's idempotent applier handles the brief re-application of
+  any changes that landed between the broker's last advance and the
+  rotation moment. `buildBrokerChain` now delegates to
+  `buildLineageChain` directly (the same multi-segment walker
+  `sluice restore` uses) — single-segment behavior is byte-identical.
+  Pinned by `TestBuildBrokerChain_MultiSegmentFollows` and
+  `TestBuildBrokerChain_DeferralRemoved`.
 
 ## Gotchas
 
