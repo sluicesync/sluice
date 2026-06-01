@@ -1017,23 +1017,24 @@ func sameEngineComparator(ctx context.Context, store ir.BackupStore, eng ir.Engi
 	return chk
 }
 
-// buildBrokerChain is the backup-broker (Phase 4.5) entry point. The
-// broker following a MULTI-segment lineage is explicitly deferred
-// (ADR-0046 §"What does NOT change" / prep-doc open Q3 — flag-and-
-// defer). It returns the flat link list for a SINGLE-segment lineage
-// (the common broker case, byte-identical to pre-ADR) and a LOUD
-// refusal for a multi-segment one — never a silent partial follow.
+// buildBrokerChain is the backup-broker (Phase 4.5) entry point. It
+// walks the full lineage — single OR multi-segment — and returns the
+// flat link list. The broker's apply loop skips every link whose
+// manifest Kind is BackupKindFull (`broker.go::replayNewIncrementals`),
+// so segment-N+1's rotation full is auto-skipped and the broker
+// continues with the new segment's incremental tail. ADR-0067's
+// born-contiguous rotation guarantees the new segment's first
+// incremental covers the `(P_N, S]` overlap from the prior segment's
+// end position; ADR-0010's idempotent applier handles the brief
+// re-application of changes that landed before the broker last
+// advanced its `last_applied_backup_id`. Phase 4.5 originally deferred
+// multi-segment broker following pending validation that the existing
+// chain-walker + idempotent-applier infrastructure actually covered
+// the seam; Round D's soak (2026-05-31) characterized the gap and
+// this commit closes it. Same comparator semantics as the single-
+// segment path — nil is fine because the rotation FSM's write-time
+// S>=P_N hard-assert is the authoritative monotonicity gate.
 func buildBrokerChain(ctx context.Context, store ir.BackupStore) ([]segmentRecord, error) {
-	cat, err := resolveLineage(ctx, store)
-	if err != nil {
-		return nil, err
-	}
-	if len(cat.Segments) > 1 {
-		return nil, fmt.Errorf("backup broker: the source lineage has %d segments (rotated). Broker following a multi-segment lineage is deferred (ADR-0046 Phase 4.5); point the broker at a single-segment backup, or restore the multi-segment lineage with `sluice restore` instead",
-			len(cat.Segments))
-	}
-	// Single segment: no inter-segment boundary to monotonic-check;
-	// nil comparator is sufficient (intra-segment uses exact equality).
 	return buildLineageChain(ctx, store, nil)
 }
 

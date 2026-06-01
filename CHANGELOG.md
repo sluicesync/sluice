@@ -6,6 +6,10 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **`feat(pipeline): close the Phase 4.5 multi-segment broker deferral`** — `sluice sync from-backup run` now follows the full lineage across rotation boundaries instead of refusing loudly on multi-segment chains. Phase 4.5 originally deferred this with a flag-and-defer pending validation that the existing chain walker + idempotent applier covered the rotation seam; the v0.97.1 Round D soak (2026-05-31 — `sluice-testing/session-reports/v0.97.1-roundD-broker-soak.md`) characterized the gap. The implementation is a ~5-line change at `buildBrokerChain`: instead of refusing on `len(cat.Segments) > 1`, it now delegates to `buildLineageChain` directly — the same multi-segment walker `sluice restore` uses. The broker's apply loop already skips full manifests unconditionally (`broker.go:823`), so segment-N+1's rotation snapshot is auto-skipped; ADR-0067's born-contiguous rotation guarantees the new segment's first incremental covers the `(P_N, S]` overlap from the prior segment's end position; ADR-0010's idempotent applier handles the brief re-application of any changes that landed between the broker's last advance and the rotation moment. Single-segment broker behavior is byte-identical to the pre-fix code path. Pinned by `TestBuildBrokerChain_MultiSegmentFollows` (3-segment lineage walked end-to-end; chain ordering + kinds asserted) + `TestBuildBrokerChain_DeferralRemoved` (the literal Phase 4.5 refusal is gone on the 2-segment minimal case). ADR-0046 updated to mark the deferral CLOSED with the resolution.
+
 ## [0.97.1] - 2026-05-31
 
 ### Fixed

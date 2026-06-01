@@ -141,6 +141,112 @@ func TestBuildLineageChain_MultiSegmentBoundaryOK(t *testing.T) {
 	}
 }
 
+// TestBuildBrokerChain_MultiSegmentFollows pins the post-Round-D
+// closure of the Phase 4.5 multi-segment-broker deferral. Pre-fix
+// buildBrokerChain refused loudly on any chain with >1 segment with
+// the documented "Broker following a multi-segment lineage is deferred
+// (ADR-0046 Phase 4.5); ..." error. Post-fix, the broker walks the
+// full lineage via buildLineageChain — same code path sluice restore
+// uses for multi-segment chains.
+//
+// The broker's apply loop (broker.go::replayNewIncrementals) skips
+// any link whose Kind is BackupKindFull, so segment-N+1's rotation
+// snapshot is auto-skipped and the broker continues with the new
+// segment's incremental tail. ADR-0067's born-contiguous rotation
+// guarantees that tail's first incremental covers the (P_N, S]
+// overlap from the prior segment's end; ADR-0010's idempotent
+// applier handles the brief re-application of any changes that
+// landed between the broker's last advance and the rotation moment.
+//
+// This test pins the CHAIN ASSEMBLY shape (no refusal, all manifests
+// from all segments present in chain order). The end-to-end apply-
+// across-rotation invariant is pinned by the broker integration
+// tests (TestSyncFromBackup_Postgres_HappyPath + the Round D soak
+// re-run against the fixed binary).
+func TestBuildBrokerChain_MultiSegmentFollows(t *testing.T) {
+	dir := t.TempDir()
+	store, _ := NewLocalStore(dir)
+
+	// 3-segment lineage, same shape as
+	// TestBuildLineageChain_MultiSegmentBoundaryOK.
+	f0 := makeManifest(t, ir.BackupKindFull, nil, "0/100")
+	i0 := makeManifest(t, ir.BackupKindIncremental, f0, "0/200")
+	s0 := seedSegment(t, store, "", f0, []*ir.Manifest{i0}, CodecGzip)
+
+	f1 := makeManifest(t, ir.BackupKindFull, nil, "0/300")
+	f1.StartPosition = i0.EndPosition
+	f1.BackupID = ir.ComputeBackupID(f1)
+	i1 := makeManifest(t, ir.BackupKindIncremental, f1, "0/400")
+	s1 := seedSegment(t, store, "seg-1", f1, []*ir.Manifest{i1}, CodecNone)
+
+	f2 := makeManifest(t, ir.BackupKindFull, nil, "0/500")
+	f2.StartPosition = i1.EndPosition
+	f2.BackupID = ir.ComputeBackupID(f2)
+	s2 := seedSegment(t, store, "seg-2", f2, nil, CodecZstd)
+
+	capt := time.Now().UTC()
+	s0.CappedAt, s0.CapReason = &capt, rotationReasonAge
+	s1.CappedAt, s1.CapReason = &capt, rotationReasonChainLength
+	cat := &LineageCatalog{FormatVersion: 1, SourceEngine: "postgres", Segments: []LineageSegment{s0, s1, s2}}
+	if err := writeLineageCatalog(context.Background(), store, cat); err != nil {
+		t.Fatal(err)
+	}
+
+	chain, err := buildBrokerChain(context.Background(), store)
+	if err != nil {
+		t.Fatalf("buildBrokerChain (3-segment): unexpected refusal: %v", err)
+	}
+	// f0,i0,f1,i1,f2 = 5 links across 3 segments.
+	if len(chain) != 5 {
+		t.Fatalf("chain len = %d; want 5 (f0,i0,f1,i1,f2)", len(chain))
+	}
+
+	// Verify chain ordering: full → incrementals within each segment,
+	// segments in lineage order.
+	expectedKinds := []string{
+		ir.BackupKindFull, ir.BackupKindIncremental, // seg0
+		ir.BackupKindFull, ir.BackupKindIncremental, // seg1
+		ir.BackupKindFull, // seg2 (no incrementals)
+	}
+	for i, want := range expectedKinds {
+		got := canonicalKind(chain[i].manifest.Kind)
+		if got != want {
+			t.Errorf("chain[%d].Kind = %q; want %q", i, got, want)
+		}
+	}
+}
+
+// TestBuildBrokerChain_DeferralRemoved asserts the literal Phase 4.5
+// refusal message is no longer emitted on multi-segment lineages. The
+// prior message was load-bearing for operator-visible behavior; this
+// test pins that it's gone (anyone re-introducing the refusal trips
+// this assertion). Single-segment behavior is byte-identical to the
+// pre-deferral-removed code path.
+func TestBuildBrokerChain_DeferralRemoved(t *testing.T) {
+	dir := t.TempDir()
+	store, _ := NewLocalStore(dir)
+
+	// Minimal 2-segment lineage to trigger the prior multi-segment path.
+	f0 := makeManifest(t, ir.BackupKindFull, nil, "0/100")
+	s0 := seedSegment(t, store, "", f0, nil, CodecGzip)
+	f1 := makeManifest(t, ir.BackupKindFull, nil, "0/200")
+	f1.StartPosition = f0.EndPosition
+	f1.BackupID = ir.ComputeBackupID(f1)
+	s1 := seedSegment(t, store, "seg-1", f1, nil, CodecNone)
+	capt := time.Now().UTC()
+	s0.CappedAt, s0.CapReason = &capt, rotationReasonAge
+	cat := &LineageCatalog{FormatVersion: 1, SourceEngine: "postgres", Segments: []LineageSegment{s0, s1}}
+	if err := writeLineageCatalog(context.Background(), store, cat); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := buildBrokerChain(context.Background(), store)
+	if err != nil {
+		// Any error here is unexpected — the chain is well-formed.
+		t.Fatalf("buildBrokerChain on valid 2-segment lineage: unexpected error %v", err)
+	}
+}
+
 // TestValidateBoundary_SameCodePathIntraAndInter proves the SINGLE
 // boundary validator is the SAME function for an intra-segment
 // incremental boundary (exact=true, contiguous) AND a
