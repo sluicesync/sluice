@@ -61,7 +61,7 @@ A different version of the same shape: the operator is leaving the *provider*, n
 ### Pain shapes
 
 - **AWS RDS → GCP Cloud SQL** (or any cross-cloud direction). The cloud's own DMS-equivalent service is either single-cloud or requires extensive setup.
-- **Heroku Postgres → anywhere.** Heroku Postgres doesn't grant `REPLICATION`; sluice's PG source path can't apply (see *When NOT to use sluice* in the README and [Heroku's third-party-replication note](https://help.heroku.com/E10ZZ6IJ/why-can-t-i-use-third-party-tools-to-replicate-my-heroku-postgres-database-to-a-non-heroku-database)). Use Bucardo or PlanetScale's heroku-migrator until the `postgres-trigger` engine variant ships.
+- **Heroku Postgres → anywhere.** Heroku Postgres doesn't grant `REPLICATION` or expose logical replication ([Heroku's third-party-replication note](https://help.heroku.com/E10ZZ6IJ/why-can-t-i-use-third-party-tools-to-replicate-my-heroku-postgres-database-to-a-non-heroku-database)), so slot-based CDC is out — but sluice's **`postgres-trigger` engine** (ADR-0066, shipped) migrates a Heroku source with triggers instead of a slot: `--source-driver=postgres-trigger` + `sluice trigger setup` (add `--allow-polled-fingerprint` for Heroku's non-superuser role). Validated end-to-end Heroku → PlanetScale; the Go-native alternative to Perl-based Bucardo.
 - **Self-hosted on-prem → managed cloud.** No cross-cloud DMS exists; AWS DMS only reads *into* AWS.
 - **PlanetScale-MySQL → vanilla MySQL** (Aurora MySQL, GCP Cloud SQL MySQL, on-prem). The PlanetScale flavor handles Vitess-fronted MySQL specifics; the vanilla MySQL writer drops them cleanly.
 
