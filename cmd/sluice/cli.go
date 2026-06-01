@@ -785,7 +785,7 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 	}
 
 	// connection-resilience (1): label every Postgres connection sluice
-	// opens with application_name=sluice/<stream-id>/<role> so the
+	// opens with application_name=sluice/<role>/<stream-id> so the
 	// operator can find sluice's sessions in pg_stat_activity. Set once
 	// here, before any engine opens a connection. Empty --stream-id is
 	// normalised to the "-" fallback inside SetApplicationID.

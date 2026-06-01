@@ -42,8 +42,11 @@ Today sluice does **not** set a distinctive `application_name` on its own
 connections — the only `application_name` references in the tree
 (`internal/engines/postgres/position_from_manifest_preflight.go`) *read*
 `pg_stat_replication` to detect Patroni standbys; nothing labels sluice's own
-sessions. Set something like `application_name=sluice/<stream-id>/<role>` (snapshot,
-applier, cdc-reader) on every connection (one DSN/conn-config param per engine).
+sessions. Set `application_name=sluice/<role>/<stream-id>` (role ∈ snapshot,
+applier, cdc-reader, schema, control) on every connection — role *before* the id
+so the `sluice/` prefix + role survive PostgreSQL's silent 63-byte
+(`NAMEDATALEN-1`) truncation of `application_name`; the id tail is what gets
+clamped (one DSN/conn-config param per engine).
 
 Value on its own: operators can find sluice's sessions in `pg_stat_activity`
 instead of guessing a PID. It is also the **enabler** for (2): you cannot safely

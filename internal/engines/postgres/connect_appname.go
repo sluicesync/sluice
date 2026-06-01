@@ -6,14 +6,15 @@ package postgres
 import (
 	"net/url"
 	"strings"
+	"unicode/utf8"
 )
 
 // connRole names the sluice subsystem a Postgres connection belongs to.
-// It is the trailing segment of the application_name sluice stamps on
-// every connection it opens (see [withApplicationName]) so operators can
-// tell a snapshot pool apart from the CDC reader or the control-table
-// session in pg_stat_activity. The set is deliberately small and stable:
-// each value maps to one of the engine's Open* entry points.
+// It is the role segment of the application_name sluice stamps on every
+// connection it opens — `sluice/<role>/<id>`, see [withApplicationName] —
+// so operators can tell a snapshot pool apart from the CDC reader or the
+// control-table session in pg_stat_activity. The set is deliberately small
+// and stable: each value maps to one of the engine's Open* entry points.
 type connRole string
 
 const (
@@ -44,7 +45,7 @@ const (
 // every ir.Engine.Open* signature.
 //
 // Empty (the default) is the stable fallback: connections are labelled
-// `sluice/-/<role>`. Paths that never go through main() (a bare
+// `sluice/<role>/-`. Paths that never go through main() (a bare
 // `go test ./...`, direct Go-API callers) get that fallback rather than
 // no label at all.
 var applicationID = "-"
@@ -55,7 +56,7 @@ var applicationID = "-"
 // the operator's resolved --stream-id (sync) or --migration-id (migrate).
 //
 // An empty id is normalised to "-" so the application_name format
-// (`sluice/<id>/<role>`) stays well-formed and greppable even when no id
+// (`sluice/<role>/<id>`) stays well-formed and greppable even when no id
 // is available.
 //
 // Concurrency: this is process-wide global state set once at startup,
@@ -68,22 +69,56 @@ func SetApplicationID(id string) {
 	applicationID = id
 }
 
+// maxAppNameBytes is PostgreSQL's effective application_name limit:
+// pg_stat_activity holds it in a NAMEDATALEN (64) byte buffer and silently
+// truncates anything past NAMEDATALEN-1 = 63 bytes (replacing non-printable
+// bytes with '?'). sluice truncates proactively so the stored value is
+// deterministic, and — because role precedes the id — so the truncation
+// eats the *id tail* rather than letting PG silently chop the role (the
+// discriminator the budget probe + Phase-2 reaping match on) off the end.
+const maxAppNameBytes = 63
+
+// buildApplicationName assembles sluice's application_name for a role.
+//
+// Format: `sluice/<role>/<id>`. The role comes *before* the id so the
+// machine-readable parts (the `sluice/` prefix and the role) always
+// survive truncation — only a long operator stream-/migration-id loses its
+// tail. The whole value is clamped to [maxAppNameBytes] on a rune boundary.
+func buildApplicationName(role connRole, id string) string {
+	return clampUTF8("sluice/"+string(role)+"/"+id, maxAppNameBytes)
+}
+
+// clampUTF8 truncates s to at most maxBytes bytes without splitting a
+// multibyte rune. (PG sanitises non-ASCII application_name bytes to '?'
+// regardless, but we keep the DSN handed to the driver valid UTF-8.)
+func clampUTF8(s string, maxBytes int) string {
+	if len(s) <= maxBytes {
+		return s
+	}
+	b := s[:maxBytes]
+	for b != "" && !utf8.ValidString(b) {
+		b = b[:len(b)-1]
+	}
+	return b
+}
+
 // withApplicationName returns dsn with sluice's application_name added
 // for the given role, unless the operator already set application_name
 // in the DSN — an operator-supplied value is never clobbered (they may
 // be coordinating with their own pg_stat_activity tooling).
 //
-// The stamped value is `sluice/<applicationID>/<role>`. Both DSN forms
-// are handled, mirroring [parseDSN]:
+// The stamped value is `sluice/<role>/<applicationID>` (clamped to 63
+// bytes, see [buildApplicationName]). Both DSN forms are handled,
+// mirroring [parseDSN]:
 //
-//   - URI: postgres://…?application_name=sluice/mystream/snapshot
-//   - libpq KV: host=… application_name=sluice/mystream/snapshot
+//   - URI: postgres://…?application_name=sluice/snapshot/mystream
+//   - libpq KV: host=… application_name=sluice/snapshot/mystream
 //
 // A DSN that fails to parse as a URI is returned unchanged; the driver's
 // own parse step will surface the malformed-DSN error with a better
 // message than anything we could synthesise here.
 func withApplicationName(dsn string, role connRole) string {
-	appName := "sluice/" + applicationID + "/" + string(role)
+	appName := buildApplicationName(role, applicationID)
 
 	if strings.HasPrefix(dsn, "postgres://") || strings.HasPrefix(dsn, "postgresql://") {
 		u, err := url.Parse(dsn)
