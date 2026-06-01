@@ -16,6 +16,7 @@ import (
 
 	"github.com/orware/sluice/internal/config"
 	"github.com/orware/sluice/internal/engines"
+	"github.com/orware/sluice/internal/engines/postgres"
 	"github.com/orware/sluice/internal/ir"
 	"github.com/orware/sluice/internal/pipeline"
 	"github.com/orware/sluice/internal/redact"
@@ -149,6 +150,8 @@ type MigrateCmd struct {
 
 	BulkParallelism int `help:"Number of parallel reader/writer pairs per table during bulk copy. Tables above --bulk-parallel-min-rows are split into this many PK ranges and copied concurrently. Tables without a single integer PK fall back to single-reader. 0 means use min(8, NumCPU); 1 disables parallelism. See ADR-0019." default:"0" placeholder:"N"`
 
+	MaxTargetConnections int `help:"Explicit ceiling on the number of connections the bulk-copy pool opens against the target (connection-resilience item 4). 0 (default) = auto: sluice probes the target's connection-slot budget (Postgres max_connections / role / database limits minus in-use and a small reserve) and caps --bulk-parallelism to fit, refusing loudly if no budget is free. When set, it's an explicit upper bound the auto-cap further bounds — it never raises --bulk-parallelism. Inert against engines without a connection-slot model (MySQL target)." default:"0" placeholder:"N"`
+
 	BulkParallelMinRows int64 `help:"Row-count threshold below which a table is copied with a single reader/writer pair regardless of --bulk-parallelism. Avoids per-chunk overhead on small tables. Default 80000 (v0.62.0+; pre-v0.62.0 default was 100000) — sits below 100k to absorb the typical information_schema row-count estimate undershoot on InnoDB, so 100k-actual tables don't miss the threshold by ~1%." default:"80000" placeholder:"N"`
 
 	MaxBufferBytes int64 `help:"Soft cap on per-batch buffered memory in the bulk-copy writer. The writer flushes when accumulated row-value bytes reach the cap regardless of row count, so wide-row workloads (TEXT/BYTEA/JSON at MB scale) don't blow out heap. A single row larger than the cap still applies (soft target). Default 67108864 (64 MiB). See ADR-0028." default:"67108864" placeholder:"N"`
@@ -232,29 +235,37 @@ func (m *MigrateCmd) Run(g *Globals) error {
 		return err
 	}
 
+	// connection-resilience (1): label every Postgres connection sluice
+	// opens with application_name=sluice/<migration-id>/<role> so the
+	// operator can find sluice's sessions in pg_stat_activity. Set once
+	// here, before any engine opens a connection. Empty --migration-id
+	// is normalised to the "-" fallback inside SetApplicationID.
+	postgres.SetApplicationID(m.MigrationID)
+
 	mig := &pipeline.Migrator{
-		Source:              source,
-		Target:              target,
-		SourceDSN:           m.Source,
-		TargetDSN:           m.Target,
-		DryRun:              m.DryRun,
-		Mappings:            mappings,
-		ExpressionMappings:  exprMappings,
-		Filter:              filter,
-		ViewFilter:          viewFilter,
-		SkipViews:           m.SkipViews,
-		Resume:              m.Resume,
-		MigrationID:         m.MigrationID,
-		ForceColdStart:      m.ForceColdStart,
-		ResetTargetData:     m.ResetTargetData,
-		BulkBatchSize:       m.BulkBatchSize,
-		BulkParallelism:     m.BulkParallelism,
-		BulkParallelMinRows: m.BulkParallelMinRows,
-		MaxBufferBytes:      m.MaxBufferBytes,
-		TargetSchema:        m.TargetSchema,
-		EnabledPGExtensions: m.EnablePGExtension,
-		InjectShardColumn:   shardSpec,
-		AllowDegradedFKs:    m.AllowDegradedFKs,
+		Source:               source,
+		Target:               target,
+		SourceDSN:            m.Source,
+		TargetDSN:            m.Target,
+		DryRun:               m.DryRun,
+		Mappings:             mappings,
+		ExpressionMappings:   exprMappings,
+		Filter:               filter,
+		ViewFilter:           viewFilter,
+		SkipViews:            m.SkipViews,
+		Resume:               m.Resume,
+		MigrationID:          m.MigrationID,
+		ForceColdStart:       m.ForceColdStart,
+		ResetTargetData:      m.ResetTargetData,
+		BulkBatchSize:        m.BulkBatchSize,
+		BulkParallelism:      m.BulkParallelism,
+		BulkParallelMinRows:  m.BulkParallelMinRows,
+		MaxTargetConnections: m.MaxTargetConnections,
+		MaxBufferBytes:       m.MaxBufferBytes,
+		TargetSchema:         m.TargetSchema,
+		EnabledPGExtensions:  m.EnablePGExtension,
+		InjectShardColumn:    shardSpec,
+		AllowDegradedFKs:     m.AllowDegradedFKs,
 	}
 	keysetSource := m.KeysetSource
 	if keysetSource == "" {
@@ -536,6 +547,8 @@ type SyncStartCmd struct {
 
 	MaxBufferBytes int64 `help:"Soft cap on per-batch buffered memory in the CDC applier (and, on the cold-start branch, the bulk-copy writer). The applier commits the in-flight target tx when accumulated row-value bytes reach the cap regardless of row count, so wide-row streams (TEXT/BYTEA/JSON at MB scale) don't blow out heap. A single change larger than the cap still applies (soft target). Default 67108864 (64 MiB). See ADR-0028." default:"67108864" placeholder:"N"`
 
+	MaxTargetConnections int `help:"Explicit ceiling on the target connection budget (connection-resilience item 4). On cold-start, sluice probes the target's connection-slot budget (Postgres max_connections / role / database limits minus in-use and a small reserve) and refuses loudly if no slot is free for the copy + CDC connections. 0 (default) = auto (probe-and-refuse-on-exhaustion, no operator ceiling). The streamer's cold-start is single-reader, so there's no parallelism to cap here — this is the loud-refusal floor plus an explicit ceiling. Inert against engines without a connection-slot model (MySQL target)." default:"0" placeholder:"N"`
+
 	ApplyExecTimeout time.Duration `help:"Per-statement deadline applied to every tx.ExecContext on the apply path. GitHub #23 Phase B fix (v0.52.0): closes the silent-stall failure mode where a half-closed destination connection blocked the apply goroutine indefinitely inside the driver's TLS read path. On expiry the driver returns context.DeadlineExceeded, which is classified retriable so the runWithRetry loop reopens the applier and retries the batch on a fresh connection. 0 disables (the pre-v0.52.0 behaviour: unbounded). Tune up for legitimately slow batch upserts on slow targets; down for tighter stall detection." default:"60s" placeholder:"DUR"`
 
 	ApplyRetryAttempts    int           `help:"Maximum consecutive retriable apply failures the streamer absorbs before exiting. ADR-0038. 1 = no retry (exit on first transient — pre-v0.42.0 behaviour). 8 = default for managed-Vitess / Vitess-flavoured MySQL where tx-killer transients are routine. Counter resets when persisted CDC position advances between attempts; a streamer surviving for hours doesn't carry retry debt." default:"8" placeholder:"N"`
@@ -771,6 +784,13 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 		}
 	}
 
+	// connection-resilience (1): label every Postgres connection sluice
+	// opens with application_name=sluice/<stream-id>/<role> so the
+	// operator can find sluice's sessions in pg_stat_activity. Set once
+	// here, before any engine opens a connection. Empty --stream-id is
+	// normalised to the "-" fallback inside SetApplicationID.
+	postgres.SetApplicationID(s.StreamID)
+
 	streamer := &pipeline.Streamer{
 		Source:                 source,
 		Target:                 target,
@@ -791,6 +811,7 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 		AutoTune:               !s.NoAutoTune,
 		ApplyTuneTargetLatency: s.ApplyTuneTargetLatency,
 		MaxBufferBytes:         s.MaxBufferBytes,
+		MaxTargetConnections:   s.MaxTargetConnections,
 		ApplyExecTimeout:       s.ApplyExecTimeout,
 		ApplyRetryAttempts:     s.ApplyRetryAttempts,
 		ApplyRetryBackoffBase:  s.ApplyRetryBackoffBase,

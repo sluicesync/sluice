@@ -69,7 +69,7 @@ func (Engine) OpenSchemaReader(ctx context.Context, dsn string) (ir.SchemaReader
 	if err != nil {
 		return nil, err
 	}
-	db, err := openDB(ctx, cfg)
+	db, err := openDBAs(ctx, cfg, roleSchema)
 	if err != nil {
 		return nil, err
 	}
@@ -87,7 +87,7 @@ func (Engine) OpenSchemaWriter(ctx context.Context, dsn string) (ir.SchemaWriter
 	if err != nil {
 		return nil, err
 	}
-	db, err := openDB(ctx, cfg)
+	db, err := openDBAs(ctx, cfg, roleSchema)
 	if err != nil {
 		return nil, err
 	}
@@ -107,7 +107,7 @@ func (Engine) OpenRowReader(ctx context.Context, dsn string) (ir.RowReader, erro
 	if err != nil {
 		return nil, err
 	}
-	db, err := openDB(ctx, cfg)
+	db, err := openDBAs(ctx, cfg, roleSnapshot)
 	if err != nil {
 		return nil, err
 	}
@@ -126,7 +126,7 @@ func (e Engine) OpenRowWriter(ctx context.Context, dsn string) (ir.RowWriter, er
 	if err != nil {
 		return nil, err
 	}
-	db, err := openDB(ctx, cfg)
+	db, err := openDBAs(ctx, cfg, roleSnapshot)
 	if err != nil {
 		return nil, err
 	}
@@ -171,7 +171,7 @@ func (Engine) OpenCDCReaderWithSlot(ctx context.Context, dsn, slotName string) (
 	if err != nil {
 		return nil, err
 	}
-	db, err := openDB(ctx, cfg)
+	db, err := openDBAs(ctx, cfg, roleCDCReader)
 	if err != nil {
 		return nil, err
 	}
@@ -442,7 +442,7 @@ func (Engine) OpenChangeApplier(ctx context.Context, dsn string) (ir.ChangeAppli
 	if err != nil {
 		return nil, err
 	}
-	db, err := openDB(ctx, cfg)
+	db, err := openDBAs(ctx, cfg, roleApplier)
 	if err != nil {
 		return nil, err
 	}

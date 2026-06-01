@@ -278,6 +278,19 @@ type Migrator struct {
 	// migrate path pays zero cost when Shape A isn't engaged.
 	InjectShardColumn ShardColumnSpec
 
+	// MaxTargetConnections is the operator's --max-target-connections
+	// explicit ceiling on the bulk-copy connection pool (connection-
+	// resilience item 4). Zero (the default) means "auto": the
+	// connection-budget preflight probes the target's slot budget and
+	// caps parallelism to fit. When set, it's an explicit upper bound the
+	// auto-cap further bounds — it never raises the resolved
+	// --bulk-parallelism.
+	//
+	// Target-engine-specific: engines without a connection-slot model
+	// (today: MySQL) don't implement [ir.TargetConnectionBudgetProber],
+	// so the budget preflight is a no-op and this ceiling is inert.
+	MaxTargetConnections int
+
 	// AllowDegradedFKs opts the operator into the pgcopydb-PR-#27-style
 	// "tolerate dirty FK source" behaviour: when [SchemaWriter.CreateConstraints]
 	// hits SQLSTATE 23503 on a validating `ADD CONSTRAINT`, retry as
@@ -688,12 +701,27 @@ func (m *Migrator) Run(ctx context.Context) error {
 		}
 	}
 
+	// Connection-budget preflight (connection-resilience item 4). Probe
+	// the target's connection-slot budget BEFORE the per-table parallel-
+	// copy pool opens, and cap the resolved parallelism so a wide
+	// --bulk-parallelism can't exhaust a small target's slots mid-COPY.
+	// No-op on engines without a connection-slot model (MySQL); refuses
+	// loudly if the target has no free budget at all.
+	copyParallelism, err := resolveTargetCopyParallelism(
+		ctx, m.Target, m.TargetDSN,
+		resolveBulkParallelism(m.BulkParallelism, runtime.NumCPU()),
+		m.MaxTargetConnections,
+	)
+	if err != nil {
+		return markFailed(ctx, rc, state, ir.MigrationPhasePending, err)
+	}
+
 	parallelDeps := &parallelBulkCopyDeps{
 		source:         m.Source,
 		target:         m.Target,
 		sourceDSN:      m.SourceDSN,
 		targetDSN:      m.TargetDSN,
-		parallelism:    resolveBulkParallelism(m.BulkParallelism, runtime.NumCPU()),
+		parallelism:    copyParallelism,
 		minRows:        resolveBulkParallelMinRows(m.BulkParallelMinRows),
 		maxBufferBytes: m.MaxBufferBytes,
 		// ADR-0043 gate (3): --force-cold-start skipped the Bug 9

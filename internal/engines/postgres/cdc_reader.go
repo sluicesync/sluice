@@ -1831,8 +1831,9 @@ func openReplicationConn(ctx context.Context, dsn string) (*pgconn.PgConn, error
 	}
 	// Parse then connect-by-config so the streaming connection — the
 	// longest-lived, most idle-prone connection sluice holds — gets the
-	// shared TCP keep-alive policy on its dial path (see [netkeepalive]).
-	connConfig, err := pgconn.ParseConfig(withRepl)
+	// shared TCP keep-alive policy on its dial path (see [netkeepalive])
+	// and the cdc-reader application_name label (see [withApplicationName]).
+	connConfig, err := pgconn.ParseConfig(withApplicationName(withRepl, roleCDCReader))
 	if err != nil {
 		return nil, fmt.Errorf("postgres: parse replication DSN: %w", err)
 	}
