@@ -28,10 +28,10 @@ package pipeline
 // tenet); --compression=gzip remains available.
 
 import (
-	"compress/gzip"
 	"fmt"
 	"io"
 
+	"github.com/klauspost/compress/gzip"
 	"github.com/klauspost/compress/zstd"
 )
 
