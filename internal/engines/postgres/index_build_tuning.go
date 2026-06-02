@@ -56,6 +56,20 @@ const (
 	// which the note flags as expected and fine — parallelism is the
 	// secondary lever below PS-640.
 	parallelMaintenanceReserve = 1
+
+	// indexBuildConcurrencyHardCap bounds the auto concurrency regardless
+	// of how generous the connection + memory budgets look. The note's
+	// tier data shows max_worker_processes is flat at 4 until PS-640, so
+	// concurrent builds contend for a tiny shared pool on the vast
+	// majority of plans — spawning 16 build workers on such a node buys
+	// nothing and just multiplies connection + memory pressure. The auto
+	// path therefore never exceeds this without an explicit operator
+	// --index-build-parallelism. (The operator cap is honored verbatim
+	// and is NOT bounded by this — they may know their box.) 8 is well
+	// above the point where index-build parallelism stops helping on
+	// every tier below PS-640 yet leaves headroom on the largest
+	// instances; the connection + memory budgets clamp it further.
+	indexBuildConcurrencyHardCap = 8
 )
 
 // indexBuildTuningProbe is the raw pg_settings reading
@@ -109,18 +123,43 @@ func computeMaintenanceWorkMem(p indexBuildTuningProbe, override int64) int64 {
 	if override > 0 {
 		return override
 	}
+	return indexBuildMemBudget(p)
+}
 
-	// Auto: size from shared_buffers (the cleanest RAM proxy), clamped to
-	// [floor, cap], then raised to at least the provider's current default.
-	// The provider already auto-scales the default to ~4% of RAM, so sluice
-	// only ever pushes it *up* for the idle build phase — it never guesses
-	// lower than what the provider already tuned.
+// indexBuildMemBudget is the auto-derived per-build maintenance_work_mem
+// for a *single* serial build — the Phase A value. It doubles as the
+// aggregate memory envelope Phase B divides across N concurrent builds:
+// the total build memory across the worker pool stays within this number
+// (see [computeIndexBuildConcurrency] and the note's "memory × concurrency
+// trap"). Pulled out of [computeMaintenanceWorkMem] so the concurrency
+// math and the serial-mem math share one definition of "the budget".
+//
+// Sized from shared_buffers (the cleanest RAM proxy), clamped to
+// [floor, cap], then raised to at least the provider's current default.
+// The provider already auto-scales the default to ~4% of RAM, so sluice
+// only ever pushes it *up* for the idle build phase — it never guesses
+// lower than what the provider already tuned.
+func indexBuildMemBudget(p indexBuildTuningProbe) int64 {
 	ramEst := p.sharedBuffersBytes * ramFromSharedBuffersFactor
 	auto := clampInt64(int64(indexBuildMemFraction*float64(ramEst)), indexBuildMemFloor, indexBuildMemCap)
 	if p.maintenanceWorkMemBytes > auto {
 		return p.maintenanceWorkMemBytes
 	}
 	return auto
+}
+
+// indexBuildMemFloorFor returns the lowest per-build maintenance_work_mem
+// a single concurrent build may be handed: the larger of sluice's own
+// floor and the provider's current default. Dividing the aggregate budget
+// across N builds must never drop a build below this — both because the
+// provider default is the "known-safe" baseline and because a build below
+// the floor spills to disk and erases the whole point of the tuning.
+func indexBuildMemFloorFor(p indexBuildTuningProbe) int64 {
+	floor := int64(indexBuildMemFloor)
+	if p.maintenanceWorkMemBytes > floor {
+		return p.maintenanceWorkMemBytes
+	}
+	return floor
 }
 
 // computeParallelMaintenanceWorkers implements the
@@ -143,6 +182,123 @@ func computeParallelMaintenanceWorkers(p indexBuildTuningProbe) int {
 		target = 0
 	}
 	return target
+}
+
+// indexBuildConcurrency is the Phase B verdict [computeIndexBuildConcurrency]
+// returns: how many concurrent build workers to spawn, and the
+// per-build maintenance_work_mem each worker SETs on its own dedicated
+// connection. The invariant the caller relies on:
+//
+//	workers >= 1
+//	workers × perBuildMemBytes <= the memory budget   (aggregate guard)
+//	perBuildMemBytes >= the per-build floor            (never spill)
+//
+// N=1 degenerates to exactly Phase A: one worker, perBuildMemBytes equal
+// to the single-build value [computeMaintenanceWorkMem] returns.
+type indexBuildConcurrency struct {
+	workers          int
+	perBuildMemBytes int64
+}
+
+// computeIndexBuildConcurrency is the pure heart of Phase B: it turns the
+// memory + connection budgets, the index count, and the operator cap into
+// a worker count N and the per-build maintenance_work_mem each of the N
+// concurrent builds SETs. No I/O — the whole tier matrix is
+// table-unit-testable.
+//
+// The memory × concurrency trap (the note's critical constraint): N
+// concurrent builds each consume their own maintenance_work_mem, so total
+// build memory ≈ N × perBuildMem. Sizing each build at Phase A's
+// single-build value and then running N of them would OOM a small node.
+// So the budget is DIVIDED: the aggregate (N × perBuildMem) is held within
+// memBudget, and N itself is bounded by how many full-floor builds fit in
+// the budget.
+//
+// N = clamp(min(memoryBound, connBound, numIndexes, operatorCapOrAuto), 1, …)
+// where:
+//   - memoryBound  = memBudget / perBuildFloor   (how many floor-sized
+//     builds the budget affords — the OOM guard)
+//   - connBound    = connBudget                  (extra build connections
+//     the target can spare; <=0 means "no extra room" → fall to 1)
+//   - numIndexes   = no point spawning more workers than indexes
+//   - operatorCap  = --index-build-parallelism when >0 (honored verbatim,
+//     NOT bounded by the auto hard cap — the operator knows their box),
+//     else the conservative auto hard cap (the note: parallelism barely
+//     helps below PS-640, so auto stays modest).
+//
+// perBuildMem:
+//   - override > 0 (operator set --index-build-mem): per-build mem is the
+//     override verbatim; the memoryBound above already capped N so that
+//     N × override stays within the budget (at least 1 worker always).
+//   - else auto: perBuildMem = max(memBudget / N, perBuildFloor) — the
+//     budget divided across the N workers, never below the floor.
+//
+// memBudget and perBuildFloor are passed in (not recomputed) so the caller
+// derives them once from the probe via [indexBuildMemBudget] /
+// [indexBuildMemFloorFor] and the override, keeping one definition of
+// "the budget".
+func computeIndexBuildConcurrency(
+	memBudget, perBuildFloor, override int64,
+	connBudget, numIndexes, operatorCap int,
+) indexBuildConcurrency {
+	// Per-build memory: the operator override wins verbatim, else the
+	// floor-or-better auto baseline. This is what each worker would SET if
+	// it were the only worker; the division below may lower the auto value
+	// (never below the floor) once N is known.
+	perBuild := override
+	if perBuild <= 0 {
+		perBuild = perBuildFloor
+	}
+
+	// Memory bound: how many full perBuild-sized builds the aggregate
+	// budget affords. This is the OOM guard — it never lets N × perBuild
+	// exceed memBudget. Guard against a zero/negative floor (degenerate
+	// probe) producing a divide-by-zero.
+	memoryBound := 1
+	if perBuild > 0 && memBudget >= perBuild {
+		memoryBound = int(memBudget / perBuild)
+	}
+
+	// The operator cap (when set) is honored verbatim and is NOT bounded by
+	// the conservative auto hard cap. When unset (0), auto stays modest per
+	// the note (parallelism barely helps below PS-640).
+	capBound := operatorCap
+	if capBound <= 0 {
+		capBound = indexBuildConcurrencyHardCap
+	}
+
+	workers := minInt(memoryBound, capBound)
+	workers = minInt(workers, connBudget)
+	workers = minInt(workers, numIndexes)
+	if workers < 1 {
+		workers = 1
+	}
+
+	// Per-build memory on the auto path: divide the aggregate budget across
+	// the chosen worker count, never below the floor. On the override path
+	// the operator's value stands verbatim (N was already bounded so the
+	// aggregate fits). The max() with perBuildFloor on the auto path can,
+	// in a tight-budget corner, push the aggregate slightly over memBudget
+	// when workers was floored up to 1 — but a single build at the floor is
+	// exactly the Phase A serial baseline, which is by definition safe.
+	perBuildMem := perBuild
+	if override <= 0 {
+		divided := memBudget / int64(workers)
+		if divided < perBuildFloor {
+			divided = perBuildFloor
+		}
+		perBuildMem = divided
+	}
+
+	return indexBuildConcurrency{workers: workers, perBuildMemBytes: perBuildMem}
+}
+
+// minInt returns the smaller of a and b.
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // clampInt64 bounds v to [lo, hi]. lo is assumed <= hi.
@@ -208,4 +364,34 @@ func probeIndexBuildTuning(ctx context.Context, q rowQueryer) (indexBuildTuningP
 // works on either the pooled handle or a dedicated connection.
 type rowQueryer interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+// probeIndexBuildConnBudget reads the target's spare connection budget for
+// the concurrent index-build pool. It reuses the Phase 1 catalog probe +
+// pure budget math ([probeConnectionBudget] / [computeConnectionBudget])
+// so the two features share one definition of "how many slots are free".
+//
+// The returned int is the number of *additional* connections the build
+// pool may open, i.e. the [connectionBudget.CopyBudget]
+// (available − reserve). It is best-effort: a probe failure returns
+// (0, err) so the caller degrades to serial (N=1) with a WARN rather than
+// hard-failing a working index phase — same disposition as the tuning
+// probe. A non-error return is always >= 0; the concurrency math floors
+// the worker count at 1 regardless, so even a zero budget still builds
+// serially.
+//
+// The same connBudgetReserve the COPY pool uses applies: the index phase
+// runs after the COPY pool has closed, but a sync's long-lived control /
+// CDC connection and operator headroom still want the slack, and the
+// reserve is deliberately conservative.
+func probeIndexBuildConnBudget(ctx context.Context, db *sql.DB) (int, error) {
+	probe, err := probeConnectionBudget(ctx, db)
+	if err != nil {
+		return 0, err
+	}
+	budget := computeConnectionBudget(probe, connBudgetReserve)
+	if budget.CopyBudget < 0 {
+		return 0, nil
+	}
+	return budget.CopyBudget, nil
 }

@@ -1005,9 +1005,21 @@ type SchemaSetter interface {
 //
 // Zero or negative bytes is the auto sentinel — the writer derives
 // maintenance_work_mem from a pg_settings probe instead of the override.
+//
+// SetIndexBuildParallelism accepts the operator's
+// `--index-build-parallelism` value (the number of concurrent index
+// builds; 0 = auto). Phase B: the PG writer builds the deferred
+// secondary indexes with a bounded concurrent worker pool, each worker
+// on its own connection with its own (divided) maintenance_work_mem. The
+// auto count is bounded by the target's spare connection budget AND a
+// memory budget (total build memory ≈ N × per-build mem — the memory ×
+// concurrency trap), so it can't OOM a small node. Zero or negative is
+// the auto sentinel.
+//
 // See docs/dev/notes/index-build-phase-tuning.md.
 type IndexBuildTuner interface {
 	SetIndexBuildMem(bytes int64)
+	SetIndexBuildParallelism(n int)
 }
 
 // TableScoper is the optional surface a [SchemaReader] can implement

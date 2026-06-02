@@ -204,6 +204,241 @@ func TestComputeIndexBuildTuning(t *testing.T) {
 	}
 }
 
+// TestComputeIndexBuildConcurrency pins the Phase B concurrency bound
+// across the tier matrix and every clamping dimension: memory-budget-
+// bounds-N, connection-budget-bounds-N, index-count-bounds-N, the
+// operator cap winning verbatim (above the auto hard cap), and the N=1
+// degenerate. The load-bearing invariant — aggregate (N × per-build mem)
+// never exceeds the budget, and per-build mem never drops below the floor
+// — is asserted on every case.
+func TestComputeIndexBuildConcurrency(t *testing.T) {
+	tests := []struct {
+		name        string
+		memBudget   int64
+		floor       int64
+		override    int64
+		connBudget  int
+		numIndexes  int
+		operatorCap int
+
+		wantWorkers int
+		wantPerMem  int64
+	}{
+		{
+			// Tiny node (PS-5-ish): a 117 MB budget at a 64 MiB floor
+			// affords only 1 floor-sized build → N stays 1 even with
+			// plenty of connections and indexes. The memory budget is the
+			// binding constraint — exactly the OOM guard.
+			name:        "tiny node memory-bounds N to 1",
+			memBudget:   117 * mib,
+			floor:       64 * mib,
+			override:    0,
+			connBudget:  16,
+			numIndexes:  20,
+			operatorCap: 0,
+			wantWorkers: 1,
+			wantPerMem:  117 * mib, // budget / 1, above floor
+		},
+		{
+			// Bigger budget (1 GiB) at a 64 MiB floor affords 16 builds,
+			// but the auto hard cap (8) and a generous conn budget land it
+			// at 8; mem is divided: 1 GiB / 8 = 128 MiB per build.
+			name:        "large budget auto-caps at hard cap, mem divided",
+			memBudget:   1 * gib,
+			floor:       64 * mib,
+			override:    0,
+			connBudget:  16,
+			numIndexes:  20,
+			operatorCap: 0,
+			wantWorkers: 8,
+			wantPerMem:  (1 * gib) / 8,
+		},
+		{
+			// Connection budget is the binding constraint: only 3 spare
+			// slots → N=3 even though memory affords 8 and there are 20
+			// indexes. Mem divided across 3.
+			name:        "connection budget bounds N",
+			memBudget:   1 * gib,
+			floor:       64 * mib,
+			override:    0,
+			connBudget:  3,
+			numIndexes:  20,
+			operatorCap: 0,
+			wantWorkers: 3,
+			wantPerMem:  (1 * gib) / 3,
+		},
+		{
+			// Index count is the binding constraint: only 2 indexes to
+			// build → no point spawning more than 2 workers.
+			name:        "index count bounds N",
+			memBudget:   1 * gib,
+			floor:       64 * mib,
+			override:    0,
+			connBudget:  16,
+			numIndexes:  2,
+			operatorCap: 0,
+			wantWorkers: 2,
+			wantPerMem:  (1 * gib) / 2,
+		},
+		{
+			// Operator cap wins verbatim and is NOT bounded by the auto
+			// hard cap (8): a cap of 12, with budget/conn/indexes all
+			// affording it, lands at 12. Mem divided across 12 (still
+			// above floor: 1 GiB / 12 ≈ 89 MiB > 64 MiB).
+			name:        "operator cap exceeds auto hard cap, honored verbatim",
+			memBudget:   1 * gib,
+			floor:       64 * mib,
+			override:    0,
+			connBudget:  32,
+			numIndexes:  50,
+			operatorCap: 12,
+			wantWorkers: 12,
+			wantPerMem:  (1 * gib) / 12,
+		},
+		{
+			// Operator cap of 1 forces the serial build even on a big node.
+			name:        "operator cap of 1 forces serial",
+			memBudget:   1 * gib,
+			floor:       64 * mib,
+			override:    0,
+			connBudget:  16,
+			numIndexes:  20,
+			operatorCap: 1,
+			wantWorkers: 1,
+			wantPerMem:  1 * gib, // budget / 1
+		},
+		{
+			// Override path: the operator set --index-build-mem=256MiB.
+			// Per-build mem is the override verbatim; N is bounded so that
+			// N × 256 MiB <= the 1 GiB budget → N=4. Conn/indexes/hardcap
+			// all afford more.
+			name:        "override mem caps N so aggregate fits budget",
+			memBudget:   1 * gib,
+			floor:       64 * mib,
+			override:    256 * mib,
+			connBudget:  16,
+			numIndexes:  20,
+			operatorCap: 0,
+			wantWorkers: 4,
+			wantPerMem:  256 * mib,
+		},
+		{
+			// Override larger than the whole budget: N floors at 1, and
+			// the override stands verbatim per-build (operator's explicit
+			// choice; the serial build at that size is the Phase A
+			// override behaviour).
+			name:        "override exceeding budget floors N at 1",
+			memBudget:   512 * mib,
+			floor:       64 * mib,
+			override:    1 * gib,
+			connBudget:  16,
+			numIndexes:  20,
+			operatorCap: 0,
+			wantWorkers: 1,
+			wantPerMem:  1 * gib,
+		},
+		{
+			// Zero connection budget (probe failed / no spare slots) →
+			// serial, never below 1.
+			name:        "zero connection budget floors N at 1",
+			memBudget:   1 * gib,
+			floor:       64 * mib,
+			override:    0,
+			connBudget:  0,
+			numIndexes:  20,
+			operatorCap: 0,
+			wantWorkers: 1,
+			wantPerMem:  1 * gib,
+		},
+		{
+			// Degenerate floor (0, from a pathological probe) must not
+			// divide-by-zero: memoryBound falls back to 1.
+			name:        "zero floor degenerate does not divide by zero",
+			memBudget:   1 * gib,
+			floor:       0,
+			override:    0,
+			connBudget:  16,
+			numIndexes:  20,
+			operatorCap: 0,
+			wantWorkers: 1,
+			wantPerMem:  1 * gib, // budget / 1, floor 0 doesn't raise
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := computeIndexBuildConcurrency(
+				tt.memBudget, tt.floor, tt.override,
+				tt.connBudget, tt.numIndexes, tt.operatorCap,
+			)
+			if got.workers != tt.wantWorkers {
+				t.Errorf("workers = %d, want %d", got.workers, tt.wantWorkers)
+			}
+			if got.perBuildMemBytes != tt.wantPerMem {
+				t.Errorf("perBuildMemBytes = %d, want %d", got.perBuildMemBytes, tt.wantPerMem)
+			}
+			if got.workers < 1 {
+				t.Errorf("workers = %d must never be below 1", got.workers)
+			}
+			// Aggregate guard: N × per-build mem must not exceed the
+			// budget — EXCEPT the two correctness-forced corners where a
+			// single serial build is the safe Phase A baseline:
+			//   - override > budget (operator's explicit per-build choice), or
+			//   - workers floored up to 1 and per-build = budget itself.
+			aggregate := int64(got.workers) * got.perBuildMemBytes
+			overrideExceedsBudget := tt.override > 0 && tt.override > tt.memBudget
+			serialBaseline := got.workers == 1
+			if aggregate > tt.memBudget && !overrideExceedsBudget && !serialBaseline {
+				t.Errorf("aggregate %d (= %d workers × %d) exceeds budget %d",
+					aggregate, got.workers, got.perBuildMemBytes, tt.memBudget)
+			}
+			// Per-build never below the floor on the auto path (the
+			// override path is the operator's explicit choice).
+			if tt.override <= 0 && tt.floor > 0 && got.perBuildMemBytes < tt.floor {
+				t.Errorf("auto per-build mem %d below floor %d", got.perBuildMemBytes, tt.floor)
+			}
+		})
+	}
+}
+
+// TestComputeIndexBuildConcurrencyTierMatrix walks the note's tier table
+// end-to-end: from each tier's probe-derived budget + floor, with a
+// generous connection budget and index count, confirm the auto worker
+// count stays conservative on small tiers (parallelism barely helps below
+// PS-640) and that the aggregate memory never exceeds the tier's budget.
+func TestComputeIndexBuildConcurrencyTierMatrix(t *testing.T) {
+	tiers := []struct {
+		name         string
+		sharedBuf    int64
+		providerMWM  int64
+		wantMaxWorks int // auto N must not exceed this on this tier
+	}{
+		{"PS-5", 67 * mib, 16 * mib, 2},
+		{"PS-20", 335 * mib, 83 * mib, 8},
+		{"PS-80", 1 * gib, 337 * mib, 8},
+		{"PS-160", 2 * gib, 690 * mib, 8},
+	}
+	for _, tier := range tiers {
+		t.Run(tier.name, func(t *testing.T) {
+			p := indexBuildTuningProbe{
+				sharedBuffersBytes:        tier.sharedBuf,
+				maintenanceWorkMemBytes:   tier.providerMWM,
+				maxWorkerProcesses:        4,
+				maxParallelMaintenanceWrk: 2,
+			}
+			budget := indexBuildMemBudget(p)
+			floor := indexBuildMemFloorFor(p)
+			got := computeIndexBuildConcurrency(budget, floor, 0, 64, 50, 0)
+			if got.workers > tier.wantMaxWorks {
+				t.Errorf("%s auto workers = %d, want <= %d", tier.name, got.workers, tier.wantMaxWorks)
+			}
+			if agg := int64(got.workers) * got.perBuildMemBytes; agg > budget && got.workers > 1 {
+				t.Errorf("%s aggregate %d exceeds budget %d", tier.name, agg, budget)
+			}
+		})
+	}
+}
+
 // TestComputeIndexBuildTuningMemMonotonic confirms the auto-derived
 // maintenance_work_mem is monotonic in shared_buffers up to the cap —
 // a larger node never gets less memory than a smaller one. Guards
