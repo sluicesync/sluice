@@ -151,7 +151,7 @@ What you can do with it:
 - Chunked encrypted backup chains with `sluice backup full` and
   `backup stream run`
 - PII redaction with a persisted keyset for cross-stream
-  determinism (27 strategies including format-preserving SSN / PAN
+  determinism (26 strategies including format-preserving SSN / PAN
   / email masks)
 
 What it's opinionated about:

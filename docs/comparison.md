@@ -94,6 +94,60 @@ For the **canonical open-source PG → PG comparison point (Bucardo)**, see the 
 
 ---
 
+## Inline PII redaction (bulk + CDC)
+
+**Capability claim.** `--redact 'table.column=STRATEGY'` masks / hashes / tokenizes / randomizes PII inline — on both the cold-start bulk copy and the live CDC stream — so the data lands already-redacted on the target and PII never sits in plaintext on disk (backup chunks included). 26 strategies across 5 phases, including format-preserving presets (SSN / PAN / email / IBAN) and keyset-backed deterministic tokenization for cross-stream surrogate stability. See [`docs/redaction.md`](redaction.md).
+
+**Why this matters.** The common shape is "migrate prod → a staging / analytics / vendor target that must not hold raw PII." A post-load `UPDATE` leaves a plaintext window; redacting in the application leaves the migration path uncovered. Redacting in the replication path closes both.
+
+**Where the alternatives land.**
+- **Debezium:** partial — SMTs (single-message transforms) can mask or drop fields, but it's per-connector wiring, not a first-class strategy catalog.
+- **AWS DMS:** partial — transformation rules remove / rename columns and do limited value rewriting; not a redaction-strategy library.
+- **Fivetran:** partial — column hashing and column blocking are supported; format-preserving masks and tokenization are a different surface.
+- **pgcopydb:** none.
+- **HVR:** yes — agent-side data transformation can mask in-flight.
+
+---
+
+## Slot-less CDC for locked-down Postgres
+
+**Capability claim.** The `postgres-trigger` engine (`--source-driver=postgres-trigger`) captures changes via triggers + a change-log table instead of a logical-replication slot, so sluice can stream CDC from managed Postgres that doesn't grant `REPLICATION` or expose logical decoding (Heroku Postgres is the canonical case). `sluice trigger setup` installs the source-side state; `--allow-polled-fingerprint` covers DDL detection on a non-superuser role. See the slot-less recipe in [`docs/cookbook/`](cookbook/).
+
+**Why this matters.** Slot-based CDC is the default everywhere, but a whole tier of managed Postgres simply won't let a customer create a slot. Without a trigger fallback the answer is "you can't replicate continuously from that source" — exactly the gap operators hit on Heroku.
+
+**Where the alternatives land.**
+- **Debezium / AWS DMS:** no — both require logical decoding (a slot) for Postgres CDC; a source that blocks slots blocks them.
+- **Fivetran:** partial — offers non-log incremental sync by polling, with the usual polling caveats (delete fidelity, latency).
+- **pgcopydb:** none — snapshot copy only, no CDC.
+- **HVR:** yes — trigger-based capture has long been a first-class option for sources without log access; it's the closest analogue, and the model sluice's trigger engine follows.
+
+---
+
+## Encrypted logical backups + continuous-backup broker
+
+**Capability claim.** `sluice backup` writes encrypted logical backup chains (a full snapshot plus incremental CDC segments) to local disk or a blob store, under a versioned `FormatVersion` manifest contract that refuses-before-touch on an older binary rather than silently dropping metadata. `sluice restore` replays a chain into a target, and `sluice sync from-backup run` runs a long-lived **broker** that follows a growing chain and applies incrementals into a target continuously — backup-as-replication-source. See [`docs/backup-format-versioning.md`](backup-format-versioning.md).
+
+**Why this matters.** It decouples capture from apply: take encrypted backups on a schedule, then restore or broker them into one or many targets (cross-region, air-gapped, compliance-driven audit trail) without holding a live source connection the whole time.
+
+**Where the alternatives land.**
+- **Debezium / AWS DMS / Fivetran / pgcopydb:** none ship this — they are live source-to-sink paths (or, for DMS / Fivetran, managed services), not an encrypted logical-backup-chain format with a broker replay loop. Physical provider snapshots (RDS, etc.) are a different, non-portable shape.
+- **HVR:** no direct equivalent; its file-integrate targets are not an encrypted, restorable logical-backup chain.
+
+---
+
+## Schema fidelity: RLS, PostGIS, DOMAIN / CHECK, generated columns
+
+**Capability claim.** sluice carries schema constructs most data-movement tools drop on the floor. PG Row-Level Security policies are captured into the IR and re-emitted on a same-engine target (and the cross-engine PG → MySQL case refuses loudly rather than silently shipping unprotected rows). PostGIS geometry round-trips with SRID. PG `DOMAIN` `CHECK` constraints translate to MySQL 8.0.16+ table-level `CHECK` where the shape is safely translatable, and refuse loudly where it isn't. Generated columns and many `CHECK` idioms translate via the ADR-0016 expression translator, with `--expr-override` as the escape hatch.
+
+**Why this matters.** The failure these close is the *silent* one: a migration that "succeeds" but quietly leaves the target without the RLS policy, the geometry SRID, or the constraint that was enforcing integrity on the source. The operator finds out when bad data lands — or when one tenant sees another tenant's rows.
+
+**Where the alternatives land.**
+- **Debezium / AWS DMS / Fivetran:** generally do not migrate RLS policies, `DOMAIN` / `CHECK` semantics, or PostGIS SRID metadata as first-class objects; schema handling centers on column types. Constraint / policy fidelity is the operator's separate problem.
+- **pgcopydb:** same-engine PG → PG, so native objects copy faithfully — but it's PG-only, so the cross-engine translation question doesn't arise.
+- **HVR:** strong schema handling within its supported matrix; RLS / cross-engine constraint-translation specifics vary by configuration.
+
+---
+
 ## Single static binary, no daemon, no Kafka
 
 **Capability claim.** sluice is one Go binary (cross-platform via GoReleaser). No coordinator process, no Kafka cluster, no manifest server, no daemon. Run it from a bastion host, a build agent, or a laptop with network reach to both endpoints. State lives in target's `sluice_*` control tables; no external state store.

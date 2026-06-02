@@ -1,7 +1,7 @@
 # PII redaction in sluice
 
-Operator guide to the `--redact` surface — 27 strategies across 5
-phases (Phase 1 / 1.5 / 2.a / 2.b / 2.c / 3). Covers every
+Operator guide to the `--redact` surface — 26 strategies across 5
+phases (Phase 1 / 2.a / 2.b / 2.c / 3). Covers every
 strategy operators can configure today, the determinism contracts
 that govern their output, and the wiring patterns (CLI flag vs.
 YAML config + dictionary loader).
@@ -555,6 +555,6 @@ manually.
 
 | 4 | v0.62.0 line | operator keyset (`--keyset-source=file:\|env:\|db:`), `key:` rule option, `sluice_keysets` table on PG + MySQL; `--redact-key-source` and the built-in `tokenize:dict` key removed (ADR-0041) |
 
-**27 strategies, 5 phases.** Phase 4 landed the operator-keyset
+**26 strategies, 5 phases.** Phase 4 landed the operator-keyset
 story; remaining keyset ergonomics (`sluice keyset rotate`/`list`
 CLI, KMS/Vault adapters, live-watch) are deferred to Phase 4.5+.

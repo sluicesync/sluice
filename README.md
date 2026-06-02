@@ -5,8 +5,9 @@
 Continuous sync between MySQL and Postgres in all four directions, with the schema-evolution, cutover-priming, and slot-health capabilities that have lived behind enterprise-tier paywalls (HVR, Striim, Qlik Replicate). Initial snapshot, CDC catch-up, and operator-driven cutover in one tool, opinionated about correctness.
 
 - 🔄 **Bidirectional** — MySQL → Postgres, Postgres → MySQL, same-engine in both directions, PlanetScale flavors included
+- 🔌 **Slot-less Postgres sources** — managed Postgres that blocks logical replication (e.g. Heroku Postgres) still streams via a trigger-based CDC engine (`--source-driver=postgres-trigger`) — no replication slot or `REPLICATION` role required
 - 🪶 **Schema evolution** — `ADD COLUMN` forwards automatically; every other shape refuses loudly with a structured drift diff naming the column that changed
-- 🩺 **Operational telemetry** — pre-emptive PG slot-health warnings (70 % / 85 % retention + 30 min inactivity); source-side heartbeat writer keeps slots alive against quiet sources
+- 🩺 **Operational telemetry** — pre-emptive PG slot-health warnings (70 % / 85 % retention + 30 min inactivity); source-side heartbeat writer keeps slots alive against quiet sources; `sync start --metrics-listen ADDR` serves Prometheus `/metrics` + a `/readyz` readiness probe (200 once the stream enters its apply phase) for k8s / load-balancer health checks
 - 🔁 **Cutover** — one-command sequence priming (`sluice cutover`) prevents PK collisions on the first post-cutover `INSERT`
 - 🛑 **Loud failure by default** — every silent-loss class we have caught has a structured refuse-loudly message with an operator-action recovery hint. Paste into Slack and the on-call DBA knows what to fix.
 
@@ -64,6 +65,8 @@ These are the operator-pain features Reddit's `/r/PostgreSQL`, `/r/mysql`, and `
 | **F11 — Per-table schema-drift diff in refuse messages** | [v0.81.0](https://github.com/orware/sluice/releases/tag/v0.81.0) | When a non-`ADD COLUMN` source DDL arrives over CDC, the refusal now names the specific columns, indexes, and constraints that drifted plus an operator-action hint per category (`[column-added] foo TIMESTAMP NULL — drained schema migrate ...`). Greppable prefixes for Slack / ticket workflows. Pre-F11, operators ran `pg_dump`-diff by hand to find out *what* changed. ([ADR-0060](docs/adr/adr-0060-cdc-schema-drift-diff.md)) |
 | **F17 — Source-side heartbeat writer** | [v0.82.0](https://github.com/orware/sluice/releases/tag/v0.82.0) | Optionally writes a tiny periodic row to a sluice-owned table on the source. The `INSERT` generates WAL / binlog so the consumer's position advances even against a quiet source, preventing silent slot eviction / binlog rotation past the consumer on low-traffic sources. Default-off; opt in with `--source-heartbeat-interval=30s`. Pairs with F13: F13 detects the symptom, F17 prevents the cause. ([ADR-0061](docs/adr/adr-0061-source-side-heartbeat-writer.md)) |
 | **F10 — Cutover sequence priming** | [v0.83.0](https://github.com/orware/sluice/releases/tag/v0.83.0) | `sluice cutover` reads source PG sequences (`pg_sequences.last_value`) / MySQL `AUTO_INCREMENT` values and bumps the target by `--cutover-sequence-margin=N` (default 1000). Closes the PK-collision-on-first-post-cutover-`INSERT` class. Idempotent; refuses loudly when target value is already above the safety margin (signal that traffic landed before cutover priming ran). Skips composite-PK / UUID / no-sequence tables gracefully. ([ADR-0062](docs/adr/adr-0062-cutover-sequence-priming.md)) |
+
+Since that arc, the **v0.84 → v0.98 releases** widened the surface well beyond those four: encrypted logical backups with incremental chains, point-in-time restore, and a continuous-backup broker; PII redaction (26 strategies); the slot-less `postgres-trigger` CDC engine; PG Row-Level Security capture/emit; PostGIS geometry round-trips; multi-source aggregation; and connection-resilience + index-build tuning for large migrations. See [Recent releases](#recent-releases) and the [CHANGELOG](CHANGELOG.md).
 
 ### Engines and directions
 
@@ -127,6 +130,9 @@ This is the category claim: sluice is the open-source tool whose feature set mos
 | **Pre-emptive slot-retention warnings** | ✓ (F13, v0.80.0) | ✗ (operator monitors `pg_stat_replication`) | ✗ | n/a (SaaS) | ✗ | ✓ |
 | **Source-side heartbeat writer** | ✓ (F17, v0.82.0) | ✓ (PG only) | ✗ | n/a | ✗ | ✓ |
 | **Cutover sequence priming as one command** | ✓ (F10, v0.83.0) | ✗ (manual `setval`) | ✗ | ✗ | partial | ✓ |
+| **Inline PII redaction (bulk + CDC)** | ✓ (26 strategies) | partial (SMT masking) | partial (transform rules) | partial (column hashing/blocking) | ✗ | ✓ (agent transform) |
+| **Slot-less CDC for locked-down Postgres** | ✓ (`postgres-trigger` engine) | ✗ (needs logical replication) | ✗ (needs logical replication) | partial (polling-based) | ✗ (snapshot only) | ✓ (trigger capture) |
+| **Encrypted logical backups + broker replay** | ✓ (full + incremental chains) | ✗ | ✗ | ✗ | ✗ | ✗ |
 | **Single static binary, no daemon, no Kafka** | ✓ | requires Kafka + connector | managed service | SaaS | ✓ | ✓ |
 | **Open-source** | Apache 2.0 | Apache 2.0 | proprietary | proprietary | BSD | proprietary |
 | **Per-row pricing** | none | none | per-DMS-instance | per-MAR | none | per-source |
@@ -146,7 +152,6 @@ This is the category claim: sluice is the open-source tool whose feature set mos
 
 Calling out the gaps explicitly so operators don't waste a discovery cycle:
 
-- **Heroku Postgres as a source — use the trigger engine, not slots.** Heroku Postgres does not grant the `REPLICATION` role attribute, does not allow `CREATE_REPLICATION_SLOT`, and does not expose logical replication to customers ([Heroku Help — third-party replication](https://help.heroku.com/E10ZZ6IJ/why-can-t-i-use-third-party-tools-to-replicate-my-heroku-postgres-database-to-a-non-heroku-database), [Heroku Help — logical replication](https://help.heroku.com/TVS8OHTR/does-heroku-postgres-support-logical-replication)), so sluice's *slot-based* PG CDC cannot run there. Use the **`postgres-trigger` engine** instead (ADR-0066, shipped): `--source-driver=postgres-trigger` with `sluice trigger setup` captures changes via triggers + a change-log table — no replication slot required — and is the Go-native alternative to Perl-based [Bucardo](https://bucardo.org/). On Heroku's non-superuser role, add `--allow-polled-fingerprint` (event-trigger creation is reserved for superusers; the polled-fingerprint fallback covers DDL detection). Validated end-to-end against real Heroku Postgres → PlanetScale.
 - **One-off snapshot, same engine, no CDC catch-up needed.** Just use `pg_dump` / `mysqldump`. sluice's value is the schema translation and the continuous-sync lifecycle; for trivial same-engine snapshots, the native tools are simpler.
 - **Logical decoding to applications.** sluice writes to a target database, not a Kafka topic or application stream. If you want raw decode events going to your own consumer, Debezium + Kafka is the right shape.
 - **Schema migration tooling.** sluice translates schemas between engines as part of a data migration, but it's not a versioned-migration tool like Atlas, Flyway, or Bytebase. Use those for application-driven schema evolution; use sluice when the goal is moving data between systems.
@@ -169,7 +174,7 @@ Calling out the gaps explicitly so operators don't waste a discovery cycle:
 
 ## Project state
 
-**Pre-1.0** (`v0.83.x` series at time of writing). sluice has shipped 150+ tagged releases across the v0.x line. The feature surface is settled enough that the recent v0.79 → v0.83 arc was all severity-a operator-pain features (F10 / F11 / F13 / F17) rather than core-engine work. **No known production users today.**
+**Pre-1.0** (`v0.98.x` series at time of writing, 180+ tagged releases across the v0.x line). The v0.84 → v0.98 arc kept widening the capability surface — encrypted logical backups + restore + a continuous-backup broker, PII redaction, the slot-less `postgres-trigger` engine, PG Row-Level Security, PostGIS round-trips, multi-source aggregation, and connection-resilience tuning — each landing with the same class-pin test discipline rather than a happy-path-only ship. **No known production users today.**
 
 This is a deliberate posture, not an accident:
 
@@ -205,10 +210,15 @@ Commands:
   sync status              Show status of a running sync stream.
   sync stop                Gracefully drain and stop a running stream.
   sync health              Probe a stream's freshness; cron-friendly exit code.
+  sync from-backup run     Replay a backup chain into a target as a long-running broker.
   cutover                  Prime target sequences from source (post-snapshot, pre-traffic-switch).
+  backup                   Take and verify encrypted logical backups (full + incremental chains).
+  restore                  Restore a logical backup chain into a target database.
+  trigger setup            Install / remove the postgres-trigger engine's source-side state (slot-less CDC).
   schema preview           Print the target DDL sluice would emit.
   schema diff              Diff a target against what sluice would produce.
-  verify                   Compare row counts (and forthcoming sampled / full content checks) between source and target.
+  verify                   Compare row counts between source and target.
+  matview refresh          Refresh PostgreSQL materialized views (PG-only).
   slot list / slot drop    Manage Postgres replication slots.
   diagnose                 Bundle source/target capability + role state for operator handoff.
 ```
@@ -238,29 +248,30 @@ A few terms recur in the codebase and docs:
 - [`docs/cookbook/`](docs/cookbook/) — task-shaped recipes: one-shot migrate, bidirectional cutover, Heroku-style slot-less migration, encrypted backup chains, PII redaction, PostGIS round-trip, GitLab-shape case study, and the `pg_dump` comparison
 - [`docs/translator-catalog.md`](docs/translator-catalog.md) — consolidated cross-engine expression translator reference: shipped translations + deferred rules + escape hatches
 - [`docs/backup-format-versioning.md`](docs/backup-format-versioning.md) — backup manifest `FormatVersion` contract: proportional version-stamp, refuse-before-touch on older binaries, how older sluice doesn't silently drop RLS / EXCLUDE metadata (Bug 116 closure reference)
-- [`docs/adr/README.md`](docs/adr/README.md) — index of all 70+ ADRs with one-line summary per decision
+- [`docs/adr/README.md`](docs/adr/README.md) — index of all 70 ADRs (ADR-0001 – ADR-0070), one-line summary per decision
 - [`docs/managed-services.md`](docs/managed-services.md) — PlanetScale-specific notes, operator preconditions
 - [`docs/postgres-source-prep.md`](docs/postgres-source-prep.md) — required PG GUCs, slot lifecycle, failover-survival mechanisms
 - [`docs/vitess-vstream-troubleshooting.md`](docs/vitess-vstream-troubleshooting.md) — operator runbook for PlanetScale-MySQL VStream lag (throttler, replication lag, deploy requests)
 - [`docs/throughput-tuning.md`](docs/throughput-tuning.md) — knobs that matter at scale
-- [`docs/redaction.md`](docs/redaction.md) — PII redaction operator guide: 27 strategies, determinism contracts, dictionary loader
+- [`docs/redaction.md`](docs/redaction.md) — PII redaction operator guide: 26 strategies, determinism contracts, dictionary loader
 - [`docs/snapshot-cdc-handoff.md`](docs/snapshot-cdc-handoff.md) — operator reference for the cold-start → CDC handoff
 - [`docs/schema-change-runbook.md`](docs/schema-change-runbook.md) — `ADD COLUMN` / `DROP COLUMN` / `MODIFY` against a running stream
 - [`docs/type-mapping.md`](docs/type-mapping.md), [`docs/value-types.md`](docs/value-types.md) — type translation policies and runtime row contract
 - [`docs/testing.md`](docs/testing.md) — testing strategy, the Bug 74 class-pin lesson
-- [`docs/adr/`](docs/adr/) — Architecture Decision Records (ADR-0001 through ADR-0062)
+- [`docs/adr/`](docs/adr/) — Architecture Decision Records (ADR-0001 through ADR-0070)
 - [`docs/dev/`](docs/dev/) — local development setup, roadmap, design proto-ADRs
 - [`docs/examples/`](docs/examples/) — runnable quickstart, sample `sluice.yaml` config
 
 ## Recent releases
 
-The severity-a feature arc lives in:
+Selected highlights from the **v0.94 → v0.98** arc:
 
-- [v0.83.0](https://github.com/orware/sluice/releases/tag/v0.83.0) — F10: cutover sequence priming
-- [v0.82.0](https://github.com/orware/sluice/releases/tag/v0.82.0) — F17: source-side heartbeat writer
-- [v0.81.0](https://github.com/orware/sluice/releases/tag/v0.81.0) — F11: schema-drift diff in refuse messages
-- [v0.80.0](https://github.com/orware/sluice/releases/tag/v0.80.0) — F13: pre-emptive PG slot-health warnings
-- [v0.79.0](https://github.com/orware/sluice/releases/tag/v0.79.0) — Online `ADD COLUMN` forwarding through CDC apply
+- [v0.98.0](https://github.com/orware/sluice/releases/tag/v0.98.0) — Connection-resilience (target connection-budget cap, stale-backend reaping, AIMD copy-pool backoff) + Postgres deferred-index build tuning
+- [v0.97.0](https://github.com/orware/sluice/releases/tag/v0.97.0) — Inline MySQL `CHECK` enforcement for translatable PG `DOMAIN` checks; multi-segment backup-broker following (v0.97.2)
+- [v0.96.0](https://github.com/orware/sluice/releases/tag/v0.96.0) — Redaction config-precedence hardening; backup-chain passphrase-rotation probes (Bug 116 / 117)
+- [v0.94.0](https://github.com/orware/sluice/releases/tag/v0.94.0) — Encrypted logical backup chains (full + incremental) with the `FormatVersion` refuse-before-touch contract + restore
+
+The slot-less `postgres-trigger` engine, PG Row-Level Security, PostGIS round-trips, and multi-source aggregation landed across **v0.84 → v0.93**; the original HVR-feature arc (F10 / F11 / F13 / F17) is **v0.80 → v0.83**.
 
 Full history: [CHANGELOG.md](CHANGELOG.md).
 
