@@ -86,6 +86,22 @@ func applyIndexBuildMem(target any, bytes int64) {
 	}
 }
 
+// applyIndexBuildParallelism threads the operator's
+// `--index-build-parallelism` value (the concurrent index-build worker
+// count; 0 = auto) to a freshly-opened target [ir.SchemaWriter] via the
+// optional [ir.IndexBuildTuner] surface, before CreateIndexes runs
+// (Phase B). Engines that don't implement the tuner (today: MySQL) skip
+// cleanly. Called unconditionally (even when n == 0): the PG writer
+// treats 0 as the auto sentinel and derives a conservative concurrency
+// from the memory + connection budgets, so concurrent index builds are
+// on by default without a per-command opt-in. See
+// docs/dev/notes/index-build-phase-tuning.md.
+func applyIndexBuildParallelism(target any, n int) {
+	if tuner, ok := target.(ir.IndexBuildTuner); ok {
+		tuner.SetIndexBuildParallelism(n)
+	}
+}
+
 // applyEnabledPGExtensions threads the operator's
 // `--enable-pg-extension` allowlist (ADR-0032) through to a freshly-
 // opened engine reader / writer / applier via the optional

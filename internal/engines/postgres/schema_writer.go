@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/jackc/pgx/v5/pgconn"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/orware/sluice/internal/ir"
 )
@@ -86,6 +87,17 @@ type SchemaWriter struct {
 	// auto-tuning runs regardless; this field only feeds the override
 	// into the pure [computeIndexBuildTuning] computation.
 	indexBuildMemOverride int64
+
+	// indexBuildParallelism is the operator's `--index-build-parallelism`
+	// value (0 = auto), threaded via [SetIndexBuildParallelism] before
+	// CreateIndexes (Phase B). When >0 it caps the concurrent index-build
+	// worker count verbatim; 0 leaves CreateIndexes to derive a
+	// conservative N from the memory + connection budgets (see
+	// index_build_tuning.go). N=1 degenerates to exactly the Phase A
+	// serial build. The auto path runs regardless; this field only feeds
+	// the operator cap into the pure [computeIndexBuildConcurrency]
+	// computation.
+	indexBuildParallelism int
 }
 
 // SetIndexBuildMem implements [ir.IndexBuildTuner]. Called by the
@@ -99,6 +111,19 @@ func (w *SchemaWriter) SetIndexBuildMem(bytes int64) {
 		bytes = 0
 	}
 	w.indexBuildMemOverride = bytes
+}
+
+// SetIndexBuildParallelism implements [ir.IndexBuildTuner] (Phase B).
+// Called by the pipeline orchestrator when the operator passes
+// `--index-build-parallelism` (0 = auto). Must be called BEFORE
+// [CreateIndexes]; calling it after a run has no effect on that run.
+// Negative or zero is the auto sentinel — CreateIndexes derives a
+// conservative concurrency from the memory + connection budgets instead.
+func (w *SchemaWriter) SetIndexBuildParallelism(n int) {
+	if n < 0 {
+		n = 0
+	}
+	w.indexBuildParallelism = n
 }
 
 // SetSchema implements [ir.SchemaSetter]. Called by the pipeline
@@ -269,29 +294,177 @@ func (w *SchemaWriter) CreateTablesWithoutConstraints(ctx context.Context, s *ir
 	return nil
 }
 
-// CreateIndexes adds every non-PK index across the schema.
+// indexBuildJob is one (table, index) unit of work the concurrent
+// CreateIndexes worker pool consumes. The table name is carried
+// alongside the index because emitCreateIndex needs it and the error
+// message names it.
+type indexBuildJob struct {
+	tableName string
+	idx       *ir.Index
+}
+
+// CreateIndexes adds every non-PK index across the schema, building them
+// with a bounded concurrent worker pool (Phase B).
 //
-// The secondary indexes are deferred to this phase (after the bulk
-// COPY) so they build against an idle target. CreateIndexes grabs one
-// dedicated connection from the pool, probes pg_settings, and raises
-// maintenance_work_mem + max_parallel_maintenance_workers on that
-// session before running the serial CREATE INDEX loop *on the same
-// connection* — pooled w.db.ExecContext would land each statement on an
-// arbitrary connection that doesn't carry the SET. maintenance_work_mem
-// is the dominant index-build lever (in-memory sort vs external-merge);
-// see index_build_tuning.go and docs/dev/notes/index-build-phase-tuning.md.
+// The secondary indexes are deferred to this phase (after the bulk COPY)
+// so they build against an idle target. CreateIndexes computes a worker
+// count N bounded by BOTH the target's spare connection budget AND a
+// memory budget (each concurrent build consumes its own
+// maintenance_work_mem, so total ≈ N × per-build mem — the note's
+// "memory × concurrency trap"), plus the index count and an operator
+// `--index-build-parallelism` cap. Each of the N workers grabs its OWN
+// dedicated connection, raises maintenance_work_mem (the aggregate
+// budget DIVIDED across the workers) + max_parallel_maintenance_workers
+// on that session, and builds its assigned indexes with plain
+// `CREATE INDEX` (not CONCURRENTLY — the target is idle, so the faster
+// locking build is correct). N=1 degenerates to exactly the prior serial
+// behaviour. See index_build_tuning.go and
+// docs/dev/notes/index-build-phase-tuning.md.
 //
-// The tuning is best-effort, mirroring the synchronous_commit precedent
-// (change_applier.go): if the dedicated-conn grab, the probe, or a SET
-// fails (permissions / managed-PG quirk), CreateIndexes logs a WARN and
-// proceeds with the build untuned — the speedup must never be the thing
-// that breaks a working index phase. A pooled-conn open failure or a
-// CREATE INDEX failure is still a hard error.
+// Tuning is best-effort, mirroring the synchronous_commit precedent: a
+// failed probe or denied SET logs a WARN and the affected worker builds
+// untuned — the speedup must never break a working index phase. A
+// dedicated-conn open failure or a CREATE INDEX failure IS a hard error:
+// the first such error cancels the group so peers unwind, and surfaces.
 func (w *SchemaWriter) CreateIndexes(ctx context.Context, s *ir.Schema) error {
 	if s == nil {
 		return errors.New("postgres: CreateIndexes: schema is nil")
 	}
 
+	jobs := w.indexBuildJobs(s)
+	if len(jobs) == 0 {
+		return nil
+	}
+
+	conc := w.resolveIndexBuildConcurrency(ctx, len(jobs))
+
+	slog.InfoContext(ctx,
+		"postgres: building indexes",
+		slog.Int("indexes", len(jobs)),
+		slog.Int("workers", conc.workers),
+		slog.Int64("per_build_maintenance_work_mem_kb", conc.perBuildMemBytes/1024),
+		slog.Int("max_parallel_maintenance_workers", conc.parallelMaintenanceWorkers),
+		slog.Bool("mem_operator_override", w.indexBuildMemOverride > 0),
+		slog.Bool("parallelism_operator_override", w.indexBuildParallelism > 0))
+
+	// N=1 keeps the exact prior serial shape: one dedicated connection,
+	// no errgroup, no channel. This is the common case on every plan
+	// below PS-640 (the note: parallelism barely helps there) and the
+	// degenerate base case the worker pool must reduce to.
+	if conc.workers <= 1 {
+		return w.buildIndexesOnDedicatedConn(ctx, jobs, conc)
+	}
+
+	// Concurrent path: a shared, index-ordered job queue and N workers,
+	// each on its own dedicated connection. errgroup's derived ctx
+	// cancels every peer on the first hard error so no worker keeps
+	// building after a sibling failed; each worker's deferred conn.Close
+	// guarantees no connection leaks on the error/panic path.
+	jobCh := make(chan indexBuildJob)
+	g, gctx := errgroup.WithContext(ctx)
+	for i := 0; i < conc.workers; i++ {
+		g.Go(func() error {
+			return w.indexBuildWorker(gctx, jobCh, conc)
+		})
+	}
+	// Feed the queue from the parent goroutine. Stop feeding (and surface
+	// no feed error) if the group ctx is cancelled by a failing worker.
+	g.Go(func() error {
+		defer close(jobCh)
+		for _, job := range jobs {
+			select {
+			case jobCh <- job:
+			case <-gctx.Done():
+				return nil
+			}
+		}
+		return nil
+	})
+	return g.Wait()
+}
+
+// indexBuildJobs flattens the schema into a deterministically-ordered
+// (table, index) work-list: tables alphabetical, indexes alphabetical
+// within each table. The ordering is the same one the prior serial loop
+// used, so a single-worker run reproduces the prior CREATE INDEX
+// sequence exactly.
+func (w *SchemaWriter) indexBuildJobs(s *ir.Schema) []indexBuildJob {
+	var jobs []indexBuildJob
+	for _, table := range orderedTables(s) {
+		indexes := append([]*ir.Index(nil), table.Indexes...)
+		sort.Slice(indexes, func(i, j int) bool {
+			return indexes[i].Name < indexes[j].Name
+		})
+		for _, idx := range indexes {
+			jobs = append(jobs, indexBuildJob{tableName: table.Name, idx: idx})
+		}
+	}
+	return jobs
+}
+
+// indexBuildPlan carries the resolved Phase B concurrency decision: the
+// worker count, the per-build maintenance_work_mem each worker SETs, and
+// the max_parallel_maintenance_workers value (the intra-build parallel
+// worker count, shared by every worker). Bundled so the worker functions
+// take one value rather than three loose ints.
+type indexBuildPlan struct {
+	workers                    int
+	perBuildMemBytes           int64
+	parallelMaintenanceWorkers int
+}
+
+// resolveIndexBuildConcurrency probes the target for the memory + worker
+// tuning and the spare connection budget, then runs the pure
+// [computeIndexBuildConcurrency] to decide the worker count and per-build
+// memory. Best-effort throughout: a failed tuning probe degrades to a
+// serial, untuned build (N=1, provider-default mem); a failed connection
+// probe degrades to serial (N=1) but keeps whatever mem tuning succeeded.
+// numJobs is the index count (an upper bound on useful workers).
+func (w *SchemaWriter) resolveIndexBuildConcurrency(ctx context.Context, numJobs int) indexBuildPlan {
+	// Probe the tuning GUCs on a throwaway pooled query. The per-worker
+	// sessions re-derive their own SET values from this same plan; the
+	// probe here only needs the numbers, not a dedicated session.
+	probe, err := probeIndexBuildTuning(ctx, w.db)
+	if err != nil {
+		slog.WarnContext(ctx,
+			"postgres: index-build tuning probe failed; building indexes serially with provider-default maintenance_work_mem",
+			slog.String("error", err.Error()))
+		// Serial, untuned: the worker path will see workers=1 and a zero
+		// per-build mem (sentinel → leave the session at provider default).
+		return indexBuildPlan{workers: 1, perBuildMemBytes: 0, parallelMaintenanceWorkers: 0}
+	}
+
+	workers := computeParallelMaintenanceWorkers(probe)
+	memBudget := indexBuildMemBudget(probe)
+	floor := indexBuildMemFloorFor(probe)
+
+	// Connection budget bounds N alongside memory. A probe failure
+	// degrades to serial (connBudget 0 → workers floored at 1) but keeps
+	// the mem tuning.
+	connBudget, cbErr := probeIndexBuildConnBudget(ctx, w.db)
+	if cbErr != nil {
+		slog.WarnContext(ctx,
+			"postgres: index-build connection-budget probe failed; building indexes serially",
+			slog.String("error", cbErr.Error()))
+		connBudget = 0
+	}
+
+	conc := computeIndexBuildConcurrency(
+		memBudget, floor, w.indexBuildMemOverride,
+		connBudget, numJobs, w.indexBuildParallelism,
+	)
+	return indexBuildPlan{
+		workers:                    conc.workers,
+		perBuildMemBytes:           conc.perBuildMemBytes,
+		parallelMaintenanceWorkers: workers,
+	}
+}
+
+// buildIndexesOnDedicatedConn is the serial (N=1) path: one dedicated
+// connection, tuned once, then every job built in order on it. This is
+// the exact prior behaviour and the degenerate base case of the
+// concurrent path.
+func (w *SchemaWriter) buildIndexesOnDedicatedConn(ctx context.Context, jobs []indexBuildJob, plan indexBuildPlan) error {
 	conn, err := w.db.Conn(ctx)
 	if err != nil {
 		// Couldn't even grab a dedicated connection from the pool — that
@@ -301,46 +474,79 @@ func (w *SchemaWriter) CreateIndexes(ctx context.Context, s *ir.Schema) error {
 	}
 	defer func() { _ = conn.Close() }()
 
-	w.tuneIndexBuildSession(ctx, conn)
+	w.tuneIndexBuildConn(ctx, conn, plan)
+	return w.buildJobsOn(ctx, conn, jobs)
+}
 
-	for _, table := range orderedTables(s) {
-		indexes := append([]*ir.Index(nil), table.Indexes...)
-		sort.Slice(indexes, func(i, j int) bool {
-			return indexes[i].Name < indexes[j].Name
-		})
-		for _, idx := range indexes {
-			stmt, err := emitCreateIndex(w.schema, table.Name, idx, w.emitOpts())
-			if err != nil {
+// indexBuildWorker is the concurrent-path worker body: grab a dedicated
+// connection, tune it (best-effort), and drain the shared job channel.
+// Each worker owns its connection for its whole lifetime so the SET
+// session GUCs apply to every CREATE INDEX it runs; the deferred Close
+// guarantees the connection is released even if a build fails or the
+// group is cancelled.
+func (w *SchemaWriter) indexBuildWorker(ctx context.Context, jobCh <-chan indexBuildJob, plan indexBuildPlan) error {
+	conn, err := w.db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("postgres: CreateIndexes: acquire worker connection: %w", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	w.tuneIndexBuildConn(ctx, conn, plan)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case job, ok := <-jobCh:
+			if !ok {
+				return nil
+			}
+			if err := w.buildOneIndex(ctx, conn, job); err != nil {
 				return err
 			}
-			if _, err := conn.ExecContext(ctx, stmt); err != nil {
-				return fmt.Errorf("postgres: create index %q on %q: %w", idx.Name, table.Name, err)
-			}
+		}
+	}
+}
+
+// buildJobsOn runs every job in order on conn. Shared by the serial path
+// (the concurrent path drains a channel instead so workers interleave).
+func (w *SchemaWriter) buildJobsOn(ctx context.Context, conn *sql.Conn, jobs []indexBuildJob) error {
+	for _, job := range jobs {
+		if err := w.buildOneIndex(ctx, conn, job); err != nil {
+			return err
 		}
 	}
 	return nil
 }
 
-// tuneIndexBuildSession probes pg_settings on conn and raises
-// maintenance_work_mem + max_parallel_maintenance_workers for the index
-// build. Best-effort: every failure path WARNs and returns, leaving the
-// session at the provider defaults so the build still runs. Logs the
-// values actually applied (INFO) on success so an operator can confirm
-// the tuning took.
-func (w *SchemaWriter) tuneIndexBuildSession(ctx context.Context, conn *sql.Conn) {
-	probe, err := probeIndexBuildTuning(ctx, conn)
+// buildOneIndex emits and executes the CREATE INDEX for one job on conn.
+func (w *SchemaWriter) buildOneIndex(ctx context.Context, conn *sql.Conn, job indexBuildJob) error {
+	stmt, err := emitCreateIndex(w.schema, job.tableName, job.idx, w.emitOpts())
 	if err != nil {
-		slog.WarnContext(ctx,
-			"postgres: index-build tuning probe failed; building indexes with provider-default maintenance_work_mem",
-			slog.String("error", err.Error()))
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, stmt); err != nil {
+		return fmt.Errorf("postgres: create index %q on %q: %w", job.idx.Name, job.tableName, err)
+	}
+	return nil
+}
+
+// tuneIndexBuildConn raises maintenance_work_mem + max_parallel_maintenance_workers
+// on conn from the resolved plan. Best-effort: every failure path WARNs
+// and returns, leaving the session at the provider defaults so the build
+// still runs.
+//
+// A zero plan.perBuildMemBytes is the "probe failed → untuned" sentinel:
+// skip the SETs entirely and leave the session at provider defaults.
+func (w *SchemaWriter) tuneIndexBuildConn(ctx context.Context, conn *sql.Conn, plan indexBuildPlan) {
+	if plan.perBuildMemBytes <= 0 {
+		// Probe failed upstream; nothing to apply, build untuned.
 		return
 	}
 
-	memBytes, workers := computeIndexBuildTuning(probe, w.indexBuildMemOverride)
-
 	// maintenance_work_mem accepts a unit-suffixed string; PG's smallest
 	// unit here is kB, so emit kB to avoid sub-kB truncation surprises.
-	memKB := memBytes / 1024
+	memKB := plan.perBuildMemBytes / 1024
 	if _, err := conn.ExecContext(ctx, fmt.Sprintf("SET maintenance_work_mem = '%dkB'", memKB)); err != nil {
 		slog.WarnContext(ctx,
 			"postgres: SET maintenance_work_mem denied; building indexes with provider-default value",
@@ -348,22 +554,13 @@ func (w *SchemaWriter) tuneIndexBuildSession(ctx context.Context, conn *sql.Conn
 			slog.String("error", err.Error()))
 		return
 	}
-	if _, err := conn.ExecContext(ctx, fmt.Sprintf("SET max_parallel_maintenance_workers = %d", workers)); err != nil {
+	if _, err := conn.ExecContext(ctx, fmt.Sprintf("SET max_parallel_maintenance_workers = %d", plan.parallelMaintenanceWorkers)); err != nil {
 		slog.WarnContext(ctx,
 			"postgres: SET max_parallel_maintenance_workers denied; maintenance_work_mem applied, workers left at default",
-			slog.Int("requested_workers", workers),
+			slog.Int("requested_workers", plan.parallelMaintenanceWorkers),
 			slog.String("error", err.Error()))
 		return
 	}
-
-	slog.InfoContext(ctx,
-		"postgres: index-build session tuned",
-		slog.Int64("maintenance_work_mem_kb", memKB),
-		slog.Int("max_parallel_maintenance_workers", workers),
-		slog.Bool("operator_override", w.indexBuildMemOverride > 0),
-		slog.Int64("probe_shared_buffers_bytes", probe.sharedBuffersBytes),
-		slog.Int64("probe_maintenance_work_mem_bytes", probe.maintenanceWorkMemBytes),
-		slog.Int("probe_max_worker_processes", probe.maxWorkerProcesses))
 }
 
 // CreateConstraints adds every foreign-key constraint across the

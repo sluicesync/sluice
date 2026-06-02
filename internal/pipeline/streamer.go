@@ -348,6 +348,17 @@ type Streamer struct {
 	// docs/dev/notes/index-build-phase-tuning.md.
 	IndexBuildMem int64
 
+	// IndexBuildParallelism is the operator's `--index-build-parallelism`
+	// value (the number of concurrent index builds; 0 = auto), threaded
+	// to the PG target SchemaWriter on the cold-start branch via
+	// [ir.IndexBuildTuner] before the deferred CreateIndexes phase
+	// (Phase B). 0 lets the writer derive a conservative worker count
+	// bounded by the target's spare connection budget AND a memory budget.
+	// Only the cold-start path builds indexes; warm-resume never opens a
+	// SchemaWriter. Inert on engines without the tuner (MySQL target).
+	// See docs/dev/notes/index-build-phase-tuning.md.
+	IndexBuildParallelism int
+
 	// MaxTargetConnections is the operator's --max-target-connections
 	// explicit ceiling on the target connection budget (connection-
 	// resilience item 4). On the cold-start branch the streamer runs a
@@ -2430,6 +2441,7 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 	}
 	applyTargetSchema(sw, s.TargetSchema)
 	applyIndexBuildMem(sw, s.IndexBuildMem)
+	applyIndexBuildParallelism(sw, s.IndexBuildParallelism)
 	if err := applyEnabledPGExtensions(ctx, sw, s.EnabledPGExtensions); err != nil {
 		closeIf(sw)
 		_ = stream.Close()

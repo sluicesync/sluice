@@ -161,6 +161,8 @@ type MigrateCmd struct {
 
 	IndexBuildMem string `help:"Postgres-only: per-build maintenance_work_mem for the deferred secondary-index phase (CREATE INDEX runs after the bulk COPY, against an idle target). Accepts a human size ('512MB', '2GB') or a raw byte count. Default 'auto': sluice probes pg_settings (shared_buffers as the RAM proxy) and raises maintenance_work_mem well above the provider's steady-state ~4%-of-RAM default — the dominant index-build speedup — flooring at the provider's current value (sluice only ever raises). It also raises max_parallel_maintenance_workers toward the max_worker_processes ceiling. Best-effort: a denied SET logs a WARN and the build proceeds untuned, never failing the index phase. Inert on MySQL targets. See docs/dev/notes/index-build-phase-tuning.md." default:"auto" placeholder:"SIZE|auto"`
 
+	IndexBuildParallelism int `help:"Postgres-only: number of secondary indexes to build CONCURRENTLY in the deferred index phase (Phase B). Each concurrent build runs plain CREATE INDEX on its own connection with its own maintenance_work_mem, so the aggregate memory budget is DIVIDED across the workers (total ≈ N × per-build mem). 0 (default) = auto: sluice derives a conservative N bounded by the target's spare connection-slot budget AND a memory budget (so it can't OOM a small node) AND the index count. The note's tier data shows parallelism barely helps below PS-640 (max_worker_processes flat at 4), so auto stays modest there and scales up on large instances. Set >0 to override the auto count verbatim. N=1 forces the serial single-connection build. Inert on MySQL targets. See docs/dev/notes/index-build-phase-tuning.md." default:"0" placeholder:"N"`
+
 	TargetSchema string `help:"Per-source target schema namespace (Postgres-only). When set, every emitted CREATE TABLE / ALTER TABLE / CREATE INDEX / CREATE TYPE prefixes the table reference with this schema. Use to land multiple sluice streams on the same target without table-name collisions (Shape B microservices → analytics warehouse, ADR-0031). The schema is auto-created on the target if it doesn't exist. The control table sluice_cdc_state stays in the DSN's default schema regardless. MySQL operators use a different --target DSN database instead — schemas and databases collapse on MySQL." placeholder:"NAME"`
 
 	EnablePGExtension []string `help:"Enable passthrough for a Postgres extension type (repeatable). Same-engine PG → PG passthrough preserves the source-native shape on the target. Cross-engine targets (MySQL) keep the loud-failure default except for hstore (→ JSON) and citext (→ VARCHAR with case-insensitive collation), which have built-in default translators. Each named extension must be installed on both source and target — sluice preflights via pg_extension before any data moves. Recognised: vector (pgvector), pg_trgm, hstore, citext. v1 shortlist per docs/research/pg-extensions-deployment-frequency.md. See ADR-0032." placeholder:"EXT"`
@@ -252,31 +254,32 @@ func (m *MigrateCmd) Run(g *Globals) error {
 	postgres.SetApplicationID(m.MigrationID)
 
 	mig := &pipeline.Migrator{
-		Source:               source,
-		Target:               target,
-		SourceDSN:            m.Source,
-		TargetDSN:            m.Target,
-		DryRun:               m.DryRun,
-		Mappings:             mappings,
-		ExpressionMappings:   exprMappings,
-		Filter:               filter,
-		ViewFilter:           viewFilter,
-		SkipViews:            m.SkipViews,
-		Resume:               m.Resume,
-		MigrationID:          m.MigrationID,
-		ForceColdStart:       m.ForceColdStart,
-		ResetTargetData:      m.ResetTargetData,
-		BulkBatchSize:        m.BulkBatchSize,
-		BulkParallelism:      m.BulkParallelism,
-		BulkParallelMinRows:  m.BulkParallelMinRows,
-		MaxTargetConnections: m.MaxTargetConnections,
-		ReapStaleBackends:    m.ReapStaleBackends,
-		MaxBufferBytes:       m.MaxBufferBytes,
-		IndexBuildMem:        indexBuildMem,
-		TargetSchema:         m.TargetSchema,
-		EnabledPGExtensions:  m.EnablePGExtension,
-		InjectShardColumn:    shardSpec,
-		AllowDegradedFKs:     m.AllowDegradedFKs,
+		Source:                source,
+		Target:                target,
+		SourceDSN:             m.Source,
+		TargetDSN:             m.Target,
+		DryRun:                m.DryRun,
+		Mappings:              mappings,
+		ExpressionMappings:    exprMappings,
+		Filter:                filter,
+		ViewFilter:            viewFilter,
+		SkipViews:             m.SkipViews,
+		Resume:                m.Resume,
+		MigrationID:           m.MigrationID,
+		ForceColdStart:        m.ForceColdStart,
+		ResetTargetData:       m.ResetTargetData,
+		BulkBatchSize:         m.BulkBatchSize,
+		BulkParallelism:       m.BulkParallelism,
+		BulkParallelMinRows:   m.BulkParallelMinRows,
+		MaxTargetConnections:  m.MaxTargetConnections,
+		ReapStaleBackends:     m.ReapStaleBackends,
+		MaxBufferBytes:        m.MaxBufferBytes,
+		IndexBuildMem:         indexBuildMem,
+		IndexBuildParallelism: m.IndexBuildParallelism,
+		TargetSchema:          m.TargetSchema,
+		EnabledPGExtensions:   m.EnablePGExtension,
+		InjectShardColumn:     shardSpec,
+		AllowDegradedFKs:      m.AllowDegradedFKs,
 	}
 	keysetSource := m.KeysetSource
 	if keysetSource == "" {
@@ -559,6 +562,8 @@ type SyncStartCmd struct {
 	MaxBufferBytes int64 `help:"Soft cap on per-batch buffered memory in the CDC applier (and, on the cold-start branch, the bulk-copy writer). The applier commits the in-flight target tx when accumulated row-value bytes reach the cap regardless of row count, so wide-row streams (TEXT/BYTEA/JSON at MB scale) don't blow out heap. A single change larger than the cap still applies (soft target). Default 67108864 (64 MiB). See ADR-0028." default:"67108864" placeholder:"N"`
 
 	IndexBuildMem string `help:"Postgres-only, cold-start branch: per-build maintenance_work_mem for the deferred secondary-index phase (CREATE INDEX runs after the cold-start bulk COPY, against an idle target). Accepts a human size ('512MB', '2GB') or a raw byte count. Default 'auto': sluice probes pg_settings (shared_buffers as the RAM proxy) and raises maintenance_work_mem well above the provider's steady-state ~4%-of-RAM default — the dominant index-build speedup — flooring at the provider's current value. Best-effort: a denied SET logs a WARN and the build proceeds untuned. Only the cold-start path builds indexes; warm-resume ignores this. Inert on MySQL targets. See docs/dev/notes/index-build-phase-tuning.md." default:"auto" placeholder:"SIZE|auto"`
+
+	IndexBuildParallelism int `help:"Postgres-only, cold-start branch: number of secondary indexes to build CONCURRENTLY in the deferred index phase (Phase B). Each concurrent build runs plain CREATE INDEX on its own connection with its own maintenance_work_mem, so the aggregate memory budget is DIVIDED across the workers. 0 (default) = auto: sluice derives a conservative N bounded by the target's spare connection-slot budget AND a memory budget (so it can't OOM a small node) AND the index count. Parallelism barely helps below PS-640 (max_worker_processes flat at 4), so auto stays modest there. Set >0 to override the auto count verbatim; N=1 forces the serial build. Only the cold-start path builds indexes; warm-resume ignores this. Inert on MySQL targets. See docs/dev/notes/index-build-phase-tuning.md." default:"0" placeholder:"N"`
 
 	MaxTargetConnections int `help:"Explicit ceiling on the target connection budget (connection-resilience item 4). On cold-start, sluice probes the target's connection-slot budget (Postgres max_connections / role / database limits minus in-use and a small reserve) and refuses loudly if no slot is free for the copy + CDC connections. 0 (default) = auto (probe-and-refuse-on-exhaustion, no operator ceiling). The streamer's cold-start is single-reader, so there's no parallelism to cap here — this is the loud-refusal floor plus an explicit ceiling. Inert against engines without a connection-slot model (MySQL target)." default:"0" placeholder:"N"`
 
@@ -854,6 +859,7 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 		ApplyTuneTargetLatency: s.ApplyTuneTargetLatency,
 		MaxBufferBytes:         s.MaxBufferBytes,
 		IndexBuildMem:          indexBuildMem,
+		IndexBuildParallelism:  s.IndexBuildParallelism,
 		MaxTargetConnections:   s.MaxTargetConnections,
 		ReapStaleBackends:      s.ReapStaleBackends,
 		ApplyExecTimeout:       s.ApplyExecTimeout,

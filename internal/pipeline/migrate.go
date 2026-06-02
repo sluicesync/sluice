@@ -227,6 +227,17 @@ type Migrator struct {
 	// docs/dev/notes/index-build-phase-tuning.md.
 	IndexBuildMem int64
 
+	// IndexBuildParallelism is the operator's `--index-build-parallelism`
+	// value (the number of concurrent index builds; 0 = auto), threaded
+	// to the PG target SchemaWriter via [ir.IndexBuildTuner] before the
+	// deferred CreateIndexes phase (Phase B). 0 lets the writer derive a
+	// conservative worker count bounded by the target's spare connection
+	// budget AND a memory budget (total ≈ N × per-build mem — the memory
+	// × concurrency trap), so it can't OOM a small node. Inert on engines
+	// without the tuner (MySQL target). See
+	// docs/dev/notes/index-build-phase-tuning.md.
+	IndexBuildParallelism int
+
 	// Redactor is the operator-configured PII redaction policy.
 	// PII Phase 1 (roadmap item 15a; GitHub issue #24). When non-nil
 	// and non-empty, every row's per-column values are passed through
@@ -648,6 +659,7 @@ func (m *Migrator) Run(ctx context.Context) error {
 	}
 	applyTargetSchema(sw, m.TargetSchema)
 	applyIndexBuildMem(sw, m.IndexBuildMem)
+	applyIndexBuildParallelism(sw, m.IndexBuildParallelism)
 	if err := applyEnabledPGExtensions(ctx, sw, m.EnabledPGExtensions); err != nil {
 		return wrapWithHint(PhaseConnect, markFailed(ctx, rc, state, ir.MigrationPhasePending,
 			fmt.Errorf("pipeline: enable PG extensions on target: %w", err)))
