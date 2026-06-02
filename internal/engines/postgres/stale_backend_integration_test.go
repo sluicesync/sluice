@@ -34,46 +34,62 @@ import (
 // openLabelledIdleInTx opens a connection with the given application_name,
 // creates the table (if needed), then BEGINs and LOCKs it in
 // AccessExclusive mode — leaving the backend "idle in transaction" while
-// holding a relation lock. Returns the live *sql.DB (kept open by the
+// holding a relation lock. Returns a pinned *sql.Conn (kept open by the
 // caller so the backend persists) and its server-side pid.
-func openLabelledIdleInTx(t *testing.T, dsn, appName, table string) (db *sql.DB, pid int) {
+//
+// The lock-holding transaction MUST live on a single pinned backend.
+// Running BEGIN / LOCK TABLE as separate db.ExecContext calls on a
+// *sql.DB does not achieve this even with SetMaxOpenConns(1): the pgx
+// stdlib driver implements driver.SessionResetter, so when the BEGIN
+// connection is returned to the pool it reports a non-idle TxStatus,
+// database/sql discards it as a bad conn, and the next statement opens a
+// fresh backend with no open transaction (LOCK TABLE then fails with
+// SQLSTATE 25P01, "can only be used in transaction blocks"). Checking out
+// one *sql.Conn and holding it keeps every statement on the same backend
+// and defers the session reset until Close.
+func openLabelledIdleInTx(t *testing.T, dsn, appName, table string) (conn *sql.Conn, pid int) {
 	t.Helper()
 	labelled := dsn + "&application_name=" + appName
 
-	var err error
-	db, err = sql.Open("pgx", labelled)
+	db, err := sql.Open("pgx", labelled)
 	if err != nil {
 		t.Fatalf("open labelled connection: %v", err)
 	}
-	// Single connection so the lock-holding tx and the pid query share
-	// the SAME backend.
-	db.SetMaxOpenConns(1)
+	// The parent pool outlives this function via the pinned conn; close it
+	// when the test ends (after the caller's defer conn.Close() has run).
+	t.Cleanup(func() { _ = db.Close() })
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	if _, err := db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS `+table+` (id INT PRIMARY KEY)`); err != nil {
-		_ = db.Close()
+	// Pin one backend for the whole lock-holding transaction.
+	conn, err = db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("pin connection: %v", err)
+	}
+
+	if _, err := conn.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS `+table+` (id INT PRIMARY KEY)`); err != nil {
+		_ = conn.Close()
 		t.Fatalf("create %s: %v", table, err)
 	}
 
 	// Begin a transaction and acquire an AccessExclusive lock, then leave
-	// it open. We don't use db.BeginTx because we want the lock held on
-	// the pinned connection across subsequent reads on the same pool.
-	if _, err := db.ExecContext(ctx, `BEGIN`); err != nil {
-		_ = db.Close()
+	// it open. Both statements run on the pinned conn so the lock and the
+	// pid query observe the SAME backend.
+	if _, err := conn.ExecContext(ctx, `BEGIN`); err != nil {
+		_ = conn.Close()
 		t.Fatalf("begin: %v", err)
 	}
-	if _, err := db.ExecContext(ctx, `LOCK TABLE `+table+` IN ACCESS EXCLUSIVE MODE`); err != nil {
-		_ = db.Close()
+	if _, err := conn.ExecContext(ctx, `LOCK TABLE `+table+` IN ACCESS EXCLUSIVE MODE`); err != nil {
+		_ = conn.Close()
 		t.Fatalf("lock %s: %v", table, err)
 	}
 
-	if err := db.QueryRowContext(ctx, `SELECT pg_backend_pid()`).Scan(&pid); err != nil {
-		_ = db.Close()
+	if err := conn.QueryRowContext(ctx, `SELECT pg_backend_pid()`).Scan(&pid); err != nil {
+		_ = conn.Close()
 		t.Fatalf("backend pid: %v", err)
 	}
-	return db, pid
+	return conn, pid
 }
 
 // backendAlive reports whether a backend with the given pid still exists.
