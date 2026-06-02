@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="sluice">
+  <!-- PRIMARY mark (semi-final): #F35815 flat, hard-edge gate, rounded water,
+       connected T-handle. -->
+  <rect x="4" y="4" width="120" height="120" rx="4" fill="#F35815"/>
+
+  <!-- channel walls (square) -->
+  <rect x="37" y="36" width="8" height="60" fill="#FFFFFF"/>
+  <rect x="83" y="36" width="8" height="60" fill="#FFFFFF"/>
+
+  <!-- raised gate paddle (square) -->
+  <rect x="44" y="46" width="40" height="11" fill="#FFFFFF"/>
+
+  <!-- connected T-handle: bar + stem overlapping it (the gate lift) -->
+  <rect x="52" y="20" width="24" height="6" fill="#FFFFFF"/>
+  <rect x="61.5" y="23" width="5" height="24" fill="#FFFFFF"/>
+
+  <!-- regulated flow underneath (rounded) -->
+  <rect x="49" y="68" width="30" height="6" rx="3" fill="#FFDCC6"/>
+  <rect x="53" y="79" width="22" height="6" rx="3" fill="#FFDCC6"/>
+  <rect x="57" y="90" width="14" height="6" rx="3" fill="#FFDCC6"/>
+</svg>
