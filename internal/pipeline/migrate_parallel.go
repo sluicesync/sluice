@@ -352,14 +352,36 @@ func resolveChunks(
 	return chunks, nil
 }
 
-// runChunks opens N-1 additional reader/writer connections (chunk 0
-// reuses the orchestrator's primary connections) and spawns one
-// goroutine per chunk via errgroup. The first error cancels the
-// shared ctx so peers unwind cleanly.
+// runChunks spawns one goroutine per chunk via errgroup. Chunk 0 reuses
+// the orchestrator's already-open primary connections; chunks 1..N-1
+// acquire their own reader/writer connections lazily, inside the
+// goroutine, through a shared [copyParallelismGate] that caps how many
+// chunk connections are concurrently open and applies the Phase 2b
+// adaptive backoff on connection-slot exhaustion (SQLSTATE 53300). The
+// first non-retryable error cancels the shared ctx so peers unwind
+// cleanly.
 //
 // resuming (gate (1)) and deps.forceColdStart (gate (3)) are threaded
 // to every chunk so [copyChunk] can run the ADR-0043 [useFastLoader]
 // gate per chunk.
+//
+// Connection-resilience Phase 2b (closes the openChunkConnections
+// TODO): the pre-Phase-2b code opened all N-1 extra connections eagerly
+// up front inside this function and a single 53300 there failed the
+// whole errgroup. The eager open is now replaced by per-chunk lazy
+// acquisition with a retry loop (see [acquireChunkConn]); a transient
+// mid-copy slot shortage multiplicatively shrinks parallelism and
+// retries the failed chunk instead of aborting the migration. Phase 1's
+// budget preflight still right-sizes parallelism up front, so this is
+// defense-in-depth for the rare race where slots vanish *after* the
+// preflight measured them as free.
+//
+// Double-copy safety on retry: the only retryable failure here is a
+// connection-OPEN (ping) failure, which happens strictly before any
+// COPY/WriteRows runs — so a retried chunk wrote zero rows on the failed
+// attempt and re-runs [copyChunk]/[copyChunkFast] from its recorded
+// cursor (or LowerPK when fresh). No partial write can precede a 53300,
+// so a retry never double-copies. See the PR's safety argument.
 func runChunks(
 	ctx context.Context,
 	rc resumeContext,
@@ -375,97 +397,135 @@ func runChunks(
 	shard ShardColumnSpec,
 	resuming bool,
 ) error {
-	additionalReaders, additionalWriters, closeFns, err := openChunkConnections(ctx, deps, len(chunks)-1)
-	if err != nil {
-		return fmt.Errorf("pipeline: open chunk connections for %q: %w", table.Name, err)
-	}
-	defer func() {
-		for _, fn := range closeFns {
-			fn()
-		}
-	}()
-
 	pkCols := primaryKeyColumnNames(table)
 	limit := bulkBatchSize
 	if limit <= 0 {
 		limit = defaultBulkBatchSize
 	}
 
+	// The gate caps concurrently-open chunk connections at the
+	// post-preflight effective parallelism (= len(chunks)) and shrinks it
+	// on a 53300. Chunk 0 reuses the primaries and never goes through the
+	// gate, so the gate governs only the N-1 lazily-opened chunks.
+	gate := newCopyParallelismGate(len(chunks), defaultCopyBackoffPolicy)
+
+	// classifySlotExhaustion is the engine-supplied predicate that decides
+	// whether an open error is the retryable slot-exhaustion class. A
+	// target engine without the classifier (today: MySQL) makes every
+	// open error non-retryable — the safe default (fail loudly).
+	classifySlotExhaustion := func(error) bool { return false }
+	if c, ok := deps.target.(ir.ConnectionSlotClassifier); ok {
+		classifySlotExhaustion = c.IsConnectionSlotExhausted
+	}
+
 	g, gctx := errgroup.WithContext(ctx)
 	for k := 0; k < len(chunks); k++ {
 		k := k
-		var chunkRows ir.RowReader
-		var chunkRW ir.RowWriter
-		if k == 0 {
-			chunkRows = primaryRows
-			chunkRW = primaryRW
-		} else {
-			chunkRows = additionalReaders[k-1]
-			chunkRW = additionalWriters[k-1]
-		}
 		g.Go(func() error {
+			if k == 0 {
+				// Chunk 0 reuses the orchestrator's primary connections;
+				// they are already open, so there is no acquire/retry and
+				// no gate token to manage.
+				return copyChunk(gctx, rc, state, stateMu, primaryRows, primaryRW, table, pkCols, k, limit, redactor, shard, resuming, deps.forceColdStart)
+			}
+			chunkRows, chunkRW, releaseConn, err := acquireChunkConn(gctx, deps, gate, classifySlotExhaustion, k)
+			if err != nil {
+				return err
+			}
+			defer releaseConn()
 			return copyChunk(gctx, rc, state, stateMu, chunkRows, chunkRW, table, pkCols, k, limit, redactor, shard, resuming, deps.forceColdStart)
 		})
 	}
 	return g.Wait()
 }
 
-// openChunkConnections opens n source readers and n target writers
-// for the parallel-copy goroutines beyond chunk 0 (which reuses the
-// orchestrator's primary connections). Returns the readers, the
-// writers, and a slice of close functions.
+// acquireChunkConn opens one source reader + one target writer for a
+// non-zero chunk, retrying under the Phase 2b adaptive backoff when the
+// open returns the connection-slot-exhaustion class (SQLSTATE 53300).
+// It takes a gate token before each open attempt (capping concurrently-
+// open connections) and returns a release function the caller defers to
+// close the connections and return the token.
 //
-// On any open error, in-flight resources are closed and the error
-// surfaces with no leaked connections.
+// Retry / double-copy safety: only a slot-exhaustion error on the OPEN
+// (which fails at ping, before any COPY/WriteRows) is retried; every
+// other error — bad DSN, permission denied, a real connection failure —
+// surfaces immediately and loudly. Because a 53300 fails before any rows
+// are written, a retry re-opens a fresh connection and re-runs the chunk
+// from its recorded cursor with zero risk of duplicate rows.
 //
-// TODO(phase 2b): connection-resilience item 4-adaptive (AIMD backoff
-// mid-copy). When a chunk's target-writer open here (or its first
-// statement) returns SQLSTATE 53300 (too_many_connections) or the
-// superuser-reserved-slots FATAL, AIMD-decrease the effective
-// parallelism and retry that chunk rather than failing the whole run
-// (floor at 1, logged). This was deliberately deferred from Phase 2:
-// the pool opens all N connections eagerly up-front (here) inside a
-// single errgroup with no per-chunk retry/backoff loop, so retrofitting
-// AIMD entangles the eager-open + errgroup lifecycle significantly —
-// the must-have (stale-backend reaper, item 2) is what closes the
-// orphan-lockout, and Phase 1's budget preflight already right-sizes
-// parallelism up front so mid-copy slot exhaustion is the rare race.
-// The decrease/retry decision should be a pure function (mirroring the
-// applier's AIMD in change_applier_batch.go) so it is unit-testable
-// before the pool restructuring lands. See the PR for the full rationale.
-func openChunkConnections(ctx context.Context, deps *parallelBulkCopyDeps, n int) ([]ir.RowReader, []ir.RowWriter, []func(), error) {
-	if n <= 0 {
-		return nil, nil, nil, nil
+// A slot-exhaustion that persists past the AIMD give-up bound surfaces a
+// loud, bounded errCopySlotsExhausted — never an infinite spin.
+func acquireChunkConn(
+	ctx context.Context,
+	deps *parallelBulkCopyDeps,
+	gate *copyParallelismGate,
+	isSlotExhausted func(error) bool,
+	chunkIndex int,
+) (ir.RowReader, ir.RowWriter, func(), error) {
+	if err := gate.acquire(ctx); err != nil {
+		return nil, nil, nil, err
 	}
-	readers := make([]ir.RowReader, 0, n)
-	writers := make([]ir.RowWriter, 0, n)
-	closeFns := make([]func(), 0, n*2)
+	// The token is held for the whole lifetime of this chunk's
+	// connections; release() returns it (or swallows it if a shrink
+	// retired it) when the caller's deferred releaseConn runs.
+	release := func() { gate.release() }
 
-	cleanup := func() {
-		for _, fn := range closeFns {
-			fn()
+	for {
+		rdr, wr, err := openOneChunkConn(ctx, deps)
+		if err == nil {
+			closeConns := func() {
+				if wr != nil {
+					closeIf(wr)
+				}
+				if rdr != nil {
+					closeIf(rdr)
+				}
+				release()
+			}
+			return rdr, wr, closeConns, nil
+		}
+
+		// Non-retryable: surface loudly and immediately. Return the token
+		// so peers aren't starved while the errgroup unwinds.
+		if !isSlotExhausted(err) {
+			release()
+			return nil, nil, nil, fmt.Errorf("open connections for chunk %d: %w", chunkIndex, err)
+		}
+
+		// Slot exhaustion: shrink parallelism + back off, then retry the
+		// open. shrinkAndBackoff returns a give-up error once the AIMD
+		// bound is exhausted.
+		delay, giveErr := gate.shrinkAndBackoff(ctx, chunkIndex)
+		if giveErr != nil {
+			release()
+			return nil, nil, nil, giveErr
+		}
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+			release()
+			return nil, nil, nil, ctx.Err()
 		}
 	}
+}
 
-	for i := 0; i < n; i++ {
-		rdr, err := deps.source.OpenRowReader(ctx, deps.sourceDSN)
-		if err != nil {
-			cleanup()
-			return nil, nil, nil, fmt.Errorf("open source reader for chunk %d: %w", i+1, err)
-		}
-		closeFns = append(closeFns, func() { closeIf(rdr) })
-		readers = append(readers, rdr)
-
-		wr, err := deps.target.OpenRowWriter(ctx, deps.targetDSN)
-		if err != nil {
-			cleanup()
-			return nil, nil, nil, fmt.Errorf("open target writer for chunk %d: %w", i+1, err)
-		}
-		applyMaxBufferBytes(wr, deps.maxBufferBytes)
-		closeFns = append(closeFns, func() { closeIf(wr) })
-		writers = append(writers, wr)
+// openOneChunkConn opens a single source reader + target writer pair for
+// a parallel-copy chunk. On a writer-open failure the just-opened reader
+// is closed so no connection leaks. Returns the pair, or the first open
+// error verbatim (so [acquireChunkConn]'s classifier sees the engine's
+// real error, including any SQLSTATE).
+func openOneChunkConn(ctx context.Context, deps *parallelBulkCopyDeps) (ir.RowReader, ir.RowWriter, error) {
+	rdr, err := deps.source.OpenRowReader(ctx, deps.sourceDSN)
+	if err != nil {
+		return nil, nil, err
 	}
-	return readers, writers, closeFns, nil
+	wr, err := deps.target.OpenRowWriter(ctx, deps.targetDSN)
+	if err != nil {
+		closeIf(rdr)
+		return nil, nil, err
+	}
+	applyMaxBufferBytes(wr, deps.maxBufferBytes)
+	return rdr, wr, nil
 }
 
 // copyChunk runs the per-batch cursor loop for a single chunk. The

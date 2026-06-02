@@ -128,10 +128,28 @@ effective_parallelism = clamp(requested, 1, copy_budget)
 - **Auto-cap is default-on** (it only ever *reduces* parallelism on a tight
   target — safe), with an explicit `--max-target-connections N` ceiling override
   and the existing `--bulk-parallelism` as the requested upper bound.
-- **Adaptive backoff:** if a chunk's connection open returns SQLSTATE `53300`
-  (`too_many_connections`) or the superuser-slots FATAL, AIMD-decrease parallelism
-  and retry rather than fail the run — sluice already has AIMD machinery for the
-  applier batch (`sluice_apply_batch_size_*`), so the pattern is established.
+- **Adaptive backoff (DONE — Phase 2b):** if a chunk's connection open (or
+  first statement) returns SQLSTATE `53300` (`too_many_connections`, which also
+  covers the superuser-reserved-slots FATAL), the parallel-copy pool
+  multiplicatively-decreases the effective parallelism (halve, floor at 1), waits
+  a bounded exponential backoff, and retries the chunk rather than failing the
+  run; a permanently-saturated target gives up loudly after a bounded number of
+  retries / total wait (never an infinite spin). This is defense-in-depth for the
+  rare race where slots vanish *after* Phase 1's budget preflight measured them as
+  free (a peer process grabbed them mid-copy). Only the slot-exhaustion class is
+  retried — every other open error (bad DSN, permission denied, a real COPY
+  failure) still fails loudly and immediately, never masked as backpressure. The
+  retry is safe against double-copy because a `53300` fails at connection
+  open/ping, strictly before any COPY/`WriteRows` runs, so a retried chunk wrote
+  zero rows and replays from its recorded cursor. Implementation:
+  the engine-side classifier (`ir.ConnectionSlotClassifier`, PG SQLSTATE 53300 in
+  `internal/engines/postgres/connection_slot.go`), the pure AIMD decision
+  (`internal/pipeline/copy_backoff.go`), and the shared effective-parallelism gate
+  + per-chunk retry seam (`internal/pipeline/copy_parallelism_gate.go`,
+  `runChunks`/`acquireChunkConn` in `migrate_parallel.go`). Mirrors the applier
+  batch AIMD's feel (`change_applier_batch.go` /`sluice_apply_batch_size_*`); the
+  copy path is decrease-only (no additive-increase within a bounded one-shot
+  copy — re-probing upward would just re-trigger the same 53300).
 - `application_name` (1) lets the probe distinguish *sluice's own* connections
   from everyone else's, so the budget math and any reaping target only our slots.
 
