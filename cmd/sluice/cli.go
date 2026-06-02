@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/alecthomas/kong"
+	units "github.com/docker/go-units"
 
 	"github.com/orware/sluice/internal/config"
 	"github.com/orware/sluice/internal/engines"
@@ -156,6 +157,8 @@ type MigrateCmd struct {
 
 	MaxBufferBytes int64 `help:"Soft cap on per-batch buffered memory in the bulk-copy writer. The writer flushes when accumulated row-value bytes reach the cap regardless of row count, so wide-row workloads (TEXT/BYTEA/JSON at MB scale) don't blow out heap. A single row larger than the cap still applies (soft target). Default 67108864 (64 MiB). See ADR-0028." default:"67108864" placeholder:"N"`
 
+	IndexBuildMem string `help:"Postgres-only: per-build maintenance_work_mem for the deferred secondary-index phase (CREATE INDEX runs after the bulk COPY, against an idle target). Accepts a human size ('512MB', '2GB') or a raw byte count. Default 'auto': sluice probes pg_settings (shared_buffers as the RAM proxy) and raises maintenance_work_mem well above the provider's steady-state ~4%-of-RAM default — the dominant index-build speedup — flooring at the provider's current value (sluice only ever raises). It also raises max_parallel_maintenance_workers toward the max_worker_processes ceiling. Best-effort: a denied SET logs a WARN and the build proceeds untuned, never failing the index phase. Inert on MySQL targets. See docs/dev/notes/index-build-phase-tuning.md." default:"auto" placeholder:"SIZE|auto"`
+
 	TargetSchema string `help:"Per-source target schema namespace (Postgres-only). When set, every emitted CREATE TABLE / ALTER TABLE / CREATE INDEX / CREATE TYPE prefixes the table reference with this schema. Use to land multiple sluice streams on the same target without table-name collisions (Shape B microservices → analytics warehouse, ADR-0031). The schema is auto-created on the target if it doesn't exist. The control table sluice_cdc_state stays in the DSN's default schema regardless. MySQL operators use a different --target DSN database instead — schemas and databases collapse on MySQL." placeholder:"NAME"`
 
 	EnablePGExtension []string `help:"Enable passthrough for a Postgres extension type (repeatable). Same-engine PG → PG passthrough preserves the source-native shape on the target. Cross-engine targets (MySQL) keep the loud-failure default except for hstore (→ JSON) and citext (→ VARCHAR with case-insensitive collation), which have built-in default translators. Each named extension must be installed on both source and target — sluice preflights via pg_extension before any data moves. Recognised: vector (pgvector), pg_trgm, hstore, citext. v1 shortlist per docs/research/pg-extensions-deployment-frequency.md. See ADR-0032." placeholder:"EXT"`
@@ -205,6 +208,10 @@ func (m *MigrateCmd) Run(g *Globals) error {
 		return err
 	}
 	viewFilter, err := pipeline.NewViewFilter(m.IncludeView, m.ExcludeView)
+	if err != nil {
+		return err
+	}
+	indexBuildMem, err := parseIndexBuildMem(m.IndexBuildMem)
 	if err != nil {
 		return err
 	}
@@ -262,6 +269,7 @@ func (m *MigrateCmd) Run(g *Globals) error {
 		BulkParallelMinRows:  m.BulkParallelMinRows,
 		MaxTargetConnections: m.MaxTargetConnections,
 		MaxBufferBytes:       m.MaxBufferBytes,
+		IndexBuildMem:        indexBuildMem,
 		TargetSchema:         m.TargetSchema,
 		EnabledPGExtensions:  m.EnablePGExtension,
 		InjectShardColumn:    shardSpec,
@@ -547,6 +555,8 @@ type SyncStartCmd struct {
 
 	MaxBufferBytes int64 `help:"Soft cap on per-batch buffered memory in the CDC applier (and, on the cold-start branch, the bulk-copy writer). The applier commits the in-flight target tx when accumulated row-value bytes reach the cap regardless of row count, so wide-row streams (TEXT/BYTEA/JSON at MB scale) don't blow out heap. A single change larger than the cap still applies (soft target). Default 67108864 (64 MiB). See ADR-0028." default:"67108864" placeholder:"N"`
 
+	IndexBuildMem string `help:"Postgres-only, cold-start branch: per-build maintenance_work_mem for the deferred secondary-index phase (CREATE INDEX runs after the cold-start bulk COPY, against an idle target). Accepts a human size ('512MB', '2GB') or a raw byte count. Default 'auto': sluice probes pg_settings (shared_buffers as the RAM proxy) and raises maintenance_work_mem well above the provider's steady-state ~4%-of-RAM default — the dominant index-build speedup — flooring at the provider's current value. Best-effort: a denied SET logs a WARN and the build proceeds untuned. Only the cold-start path builds indexes; warm-resume ignores this. Inert on MySQL targets. See docs/dev/notes/index-build-phase-tuning.md." default:"auto" placeholder:"SIZE|auto"`
+
 	MaxTargetConnections int `help:"Explicit ceiling on the target connection budget (connection-resilience item 4). On cold-start, sluice probes the target's connection-slot budget (Postgres max_connections / role / database limits minus in-use and a small reserve) and refuses loudly if no slot is free for the copy + CDC connections. 0 (default) = auto (probe-and-refuse-on-exhaustion, no operator ceiling). The streamer's cold-start is single-reader, so there's no parallelism to cap here — this is the loud-refusal floor plus an explicit ceiling. Inert against engines without a connection-slot model (MySQL target)." default:"0" placeholder:"N"`
 
 	ApplyExecTimeout time.Duration `help:"Per-statement deadline applied to every tx.ExecContext on the apply path. GitHub #23 Phase B fix (v0.52.0): closes the silent-stall failure mode where a half-closed destination connection blocked the apply goroutine indefinitely inside the driver's TLS read path. On expiry the driver returns context.DeadlineExceeded, which is classified retriable so the runWithRetry loop reopens the applier and retries the batch on a fresh connection. 0 disables (the pre-v0.52.0 behaviour: unbounded). Tune up for legitimately slow batch upserts on slow targets; down for tighter stall detection." default:"60s" placeholder:"DUR"`
@@ -645,6 +655,28 @@ func resolveApplyBatchSize(raw string, target ir.Engine) (int, error) {
 	}
 	if n < 0 {
 		return 0, fmt.Errorf("expected a non-negative integer or 'auto'; got %d", n)
+	}
+	return n, nil
+}
+
+// parseIndexBuildMem turns the --index-build-mem flag value into a byte
+// count for the PG index-build tuner. "auto" / "" → 0 (the auto
+// sentinel: the writer derives maintenance_work_mem from a pg_settings
+// probe). Otherwise a human size ("512MB", "2GB") or raw byte count is
+// parsed via units.RAMInBytes (power-of-two units, case-insensitive,
+// optional 'b'). Negative or unparseable input is a loud error — better
+// than silently disabling the tuning.
+func parseIndexBuildMem(raw string) (int64, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" || strings.EqualFold(trimmed, "auto") {
+		return 0, nil
+	}
+	n, err := units.RAMInBytes(trimmed)
+	if err != nil {
+		return 0, fmt.Errorf("--index-build-mem: expected a size ('512MB', '2GB') or 'auto'; got %q", raw)
+	}
+	if n < 0 {
+		return 0, fmt.Errorf("--index-build-mem: expected a non-negative size; got %q", raw)
 	}
 	return n, nil
 }
@@ -770,6 +802,11 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 		return err
 	}
 
+	indexBuildMem, err := parseIndexBuildMem(s.IndexBuildMem)
+	if err != nil {
+		return err
+	}
+
 	// ADR-0054 §2 / DP-A: validate the lease timing knobs eagerly so
 	// an operator-misconfiguration refuses at startup rather than at
 	// the first observed DDL boundary (loud-failure tenet).
@@ -811,6 +848,7 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 		AutoTune:               !s.NoAutoTune,
 		ApplyTuneTargetLatency: s.ApplyTuneTargetLatency,
 		MaxBufferBytes:         s.MaxBufferBytes,
+		IndexBuildMem:          indexBuildMem,
 		MaxTargetConnections:   s.MaxTargetConnections,
 		ApplyExecTimeout:       s.ApplyExecTimeout,
 		ApplyRetryAttempts:     s.ApplyRetryAttempts,

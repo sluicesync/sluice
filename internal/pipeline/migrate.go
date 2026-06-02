@@ -217,6 +217,16 @@ type Migrator struct {
 	// migrations). See ADR-0028.
 	MaxBufferBytes int64
 
+	// IndexBuildMem is the operator's `--index-build-mem` value (a
+	// per-build maintenance_work_mem in bytes; 0 = auto), threaded to
+	// the PG target SchemaWriter via [ir.IndexBuildTuner] before the
+	// deferred CreateIndexes phase. 0 leaves the writer to autotune
+	// maintenance_work_mem from a pg_settings probe — the dominant
+	// index-build lever, on by default. Inert on engines without the
+	// tuner (MySQL target). See
+	// docs/dev/notes/index-build-phase-tuning.md.
+	IndexBuildMem int64
+
 	// Redactor is the operator-configured PII redaction policy.
 	// PII Phase 1 (roadmap item 15a; GitHub issue #24). When non-nil
 	// and non-empty, every row's per-column values are passed through
@@ -623,6 +633,7 @@ func (m *Migrator) Run(ctx context.Context) error {
 			fmt.Errorf("pipeline: open target schema writer: %w", err)))
 	}
 	applyTargetSchema(sw, m.TargetSchema)
+	applyIndexBuildMem(sw, m.IndexBuildMem)
 	if err := applyEnabledPGExtensions(ctx, sw, m.EnabledPGExtensions); err != nil {
 		return wrapWithHint(PhaseConnect, markFailed(ctx, rc, state, ir.MigrationPhasePending,
 			fmt.Errorf("pipeline: enable PG extensions on target: %w", err)))

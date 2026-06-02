@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 
@@ -75,6 +76,29 @@ type SchemaWriter struct {
 	// the pipeline can surface them in the operator-facing report.
 	// Reset at the start of each CreateConstraints call.
 	degradedFKs []ir.DegradedFK
+
+	// indexBuildMemOverride is the operator's `--index-build-mem` value
+	// in bytes (0 = auto), threaded via [SetIndexBuildMem] before
+	// CreateIndexes. When >0 it overrides the autotuned
+	// maintenance_work_mem for the dedicated index-build session; 0
+	// leaves CreateIndexes to derive the value from a pg_settings probe
+	// (the dominant Phase-A lever — see index_build_tuning.go). The
+	// auto-tuning runs regardless; this field only feeds the override
+	// into the pure [computeIndexBuildTuning] computation.
+	indexBuildMemOverride int64
+}
+
+// SetIndexBuildMem implements [ir.IndexBuildTuner]. Called by the
+// pipeline orchestrator when the operator passes `--index-build-mem`
+// (a byte size; 0 = auto). Must be called BEFORE [CreateIndexes];
+// calling it after a run has no effect on that run. Negative or zero is
+// the auto sentinel — CreateIndexes derives maintenance_work_mem from a
+// pg_settings probe instead.
+func (w *SchemaWriter) SetIndexBuildMem(bytes int64) {
+	if bytes < 0 {
+		bytes = 0
+	}
+	w.indexBuildMemOverride = bytes
 }
 
 // SetSchema implements [ir.SchemaSetter]. Called by the pipeline
@@ -246,10 +270,39 @@ func (w *SchemaWriter) CreateTablesWithoutConstraints(ctx context.Context, s *ir
 }
 
 // CreateIndexes adds every non-PK index across the schema.
+//
+// The secondary indexes are deferred to this phase (after the bulk
+// COPY) so they build against an idle target. CreateIndexes grabs one
+// dedicated connection from the pool, probes pg_settings, and raises
+// maintenance_work_mem + max_parallel_maintenance_workers on that
+// session before running the serial CREATE INDEX loop *on the same
+// connection* — pooled w.db.ExecContext would land each statement on an
+// arbitrary connection that doesn't carry the SET. maintenance_work_mem
+// is the dominant index-build lever (in-memory sort vs external-merge);
+// see index_build_tuning.go and docs/dev/notes/index-build-phase-tuning.md.
+//
+// The tuning is best-effort, mirroring the synchronous_commit precedent
+// (change_applier.go): if the dedicated-conn grab, the probe, or a SET
+// fails (permissions / managed-PG quirk), CreateIndexes logs a WARN and
+// proceeds with the build untuned — the speedup must never be the thing
+// that breaks a working index phase. A pooled-conn open failure or a
+// CREATE INDEX failure is still a hard error.
 func (w *SchemaWriter) CreateIndexes(ctx context.Context, s *ir.Schema) error {
 	if s == nil {
 		return errors.New("postgres: CreateIndexes: schema is nil")
 	}
+
+	conn, err := w.db.Conn(ctx)
+	if err != nil {
+		// Couldn't even grab a dedicated connection from the pool — that
+		// is the operator's connectivity problem, not a tuning concern;
+		// fail loudly the same as every other connection open.
+		return fmt.Errorf("postgres: CreateIndexes: acquire connection: %w", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	w.tuneIndexBuildSession(ctx, conn)
+
 	for _, table := range orderedTables(s) {
 		indexes := append([]*ir.Index(nil), table.Indexes...)
 		sort.Slice(indexes, func(i, j int) bool {
@@ -260,12 +313,57 @@ func (w *SchemaWriter) CreateIndexes(ctx context.Context, s *ir.Schema) error {
 			if err != nil {
 				return err
 			}
-			if _, err := w.db.ExecContext(ctx, stmt); err != nil {
+			if _, err := conn.ExecContext(ctx, stmt); err != nil {
 				return fmt.Errorf("postgres: create index %q on %q: %w", idx.Name, table.Name, err)
 			}
 		}
 	}
 	return nil
+}
+
+// tuneIndexBuildSession probes pg_settings on conn and raises
+// maintenance_work_mem + max_parallel_maintenance_workers for the index
+// build. Best-effort: every failure path WARNs and returns, leaving the
+// session at the provider defaults so the build still runs. Logs the
+// values actually applied (INFO) on success so an operator can confirm
+// the tuning took.
+func (w *SchemaWriter) tuneIndexBuildSession(ctx context.Context, conn *sql.Conn) {
+	probe, err := probeIndexBuildTuning(ctx, conn)
+	if err != nil {
+		slog.WarnContext(ctx,
+			"postgres: index-build tuning probe failed; building indexes with provider-default maintenance_work_mem",
+			slog.String("error", err.Error()))
+		return
+	}
+
+	memBytes, workers := computeIndexBuildTuning(probe, w.indexBuildMemOverride)
+
+	// maintenance_work_mem accepts a unit-suffixed string; PG's smallest
+	// unit here is kB, so emit kB to avoid sub-kB truncation surprises.
+	memKB := memBytes / 1024
+	if _, err := conn.ExecContext(ctx, fmt.Sprintf("SET maintenance_work_mem = '%dkB'", memKB)); err != nil {
+		slog.WarnContext(ctx,
+			"postgres: SET maintenance_work_mem denied; building indexes with provider-default value",
+			slog.Int64("requested_kb", memKB),
+			slog.String("error", err.Error()))
+		return
+	}
+	if _, err := conn.ExecContext(ctx, fmt.Sprintf("SET max_parallel_maintenance_workers = %d", workers)); err != nil {
+		slog.WarnContext(ctx,
+			"postgres: SET max_parallel_maintenance_workers denied; maintenance_work_mem applied, workers left at default",
+			slog.Int("requested_workers", workers),
+			slog.String("error", err.Error()))
+		return
+	}
+
+	slog.InfoContext(ctx,
+		"postgres: index-build session tuned",
+		slog.Int64("maintenance_work_mem_kb", memKB),
+		slog.Int("max_parallel_maintenance_workers", workers),
+		slog.Bool("operator_override", w.indexBuildMemOverride > 0),
+		slog.Int64("probe_shared_buffers_bytes", probe.sharedBuffersBytes),
+		slog.Int64("probe_maintenance_work_mem_bytes", probe.maintenanceWorkMemBytes),
+		slog.Int("probe_max_worker_processes", probe.maxWorkerProcesses))
 }
 
 // CreateConstraints adds every foreign-key constraint across the
