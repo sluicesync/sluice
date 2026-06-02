@@ -103,12 +103,20 @@ func TestReapStaleBackends_QueryReappliesScope(t *testing.T) {
 			t.Errorf("reap query missing required fragment %q\nquery: %s", frag, reapStaleBackendsQuery)
 		}
 	}
-	// pg_terminate_backend must be ANDed with the scope, not standalone:
-	// the scope clause must appear before the terminate call in the WHERE.
-	scopeIdx := strings.Index(reapStaleBackendsQuery, "pid <> pg_backend_pid()")
+	// Safety: pg_terminate_backend must sit in the SELECT projection, which
+	// is evaluated only for rows that already passed the WHERE scope — NOT
+	// in the WHERE qual list, where the planner could (qual order is not
+	// guaranteed, and the function is VOLATILE) evaluate the kill before the
+	// safety predicates. Assert the terminate appears before the WHERE and
+	// the scope lives inside the WHERE.
+	whereIdx := strings.Index(reapStaleBackendsQuery, "WHERE")
 	termIdx := strings.Index(reapStaleBackendsQuery, "pg_terminate_backend(a.pid)")
-	if scopeIdx < 0 || termIdx < 0 || scopeIdx > termIdx {
-		t.Errorf("scope must be ANDed before pg_terminate_backend (scope@%d, term@%d)", scopeIdx, termIdx)
+	scopeIdx := strings.Index(reapStaleBackendsQuery, "pid <> pg_backend_pid()")
+	if termIdx < 0 || whereIdx < 0 || termIdx > whereIdx {
+		t.Errorf("pg_terminate_backend must be in the SELECT projection, before WHERE (term@%d, where@%d)", termIdx, whereIdx)
+	}
+	if scopeIdx < 0 || scopeIdx < whereIdx {
+		t.Errorf("safety scope must live inside the WHERE clause (scope@%d, where@%d)", scopeIdx, whereIdx)
 	}
 }
 

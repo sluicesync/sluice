@@ -217,18 +217,22 @@ func scanStaleBackends(ctx context.Context, db *sql.DB, schemas []string) ([]ir.
 // true for a still-live, still-in-scope backend). A pid that vanished
 // between detect and reap simply doesn't appear in the result.
 // reapStaleBackendsQuery is the termination statement. pg_terminate_
-// backend(pid) returns bool; selecting it for the set of in-scope pids
-// terminates each and reports the outcome. [staleBackendScope] is
-// re-applied here — the pid list is an additional filter, never the sole
-// authority, so a recycled pid can't be terminated outside the safety
-// bound. Held as a package constant so the safety test can assert the
-// scope is embedded.
+// backend(pid) returns bool and is in the SELECT *projection*, not the
+// WHERE — so it is evaluated only for rows that already passed the WHERE
+// scope (WHERE is logically applied before the target list; a qual's
+// evaluation order, by contrast, is not guaranteed, and pg_terminate_
+// backend is VOLATILE — keeping it out of the qual list removes any risk
+// the planner evaluates the kill before the safety predicates).
+// [staleBackendScope] bounds the WHERE — the pid list is an additional
+// filter, never the sole authority, so a recycled pid can't be terminated
+// outside the safety bound. The returned bool reports per-pid success.
+// Held as a package constant so the safety test can assert the scope is
+// embedded.
 const reapStaleBackendsQuery = `
-SELECT a.pid
+SELECT a.pid, pg_terminate_backend(a.pid) AS terminated
 FROM pg_stat_activity a
 WHERE a.pid = ANY ($1)
   AND ` + staleBackendScope + `
-  AND pg_terminate_backend(a.pid)
 `
 
 func reapStaleBackends(ctx context.Context, db *sql.DB, pids []int) ([]int, error) {
@@ -243,11 +247,19 @@ func reapStaleBackends(ctx context.Context, db *sql.DB, pids []int) ([]int, erro
 
 	var reaped []int
 	for rows.Next() {
-		var pid int
-		if err := rows.Scan(&pid); err != nil {
+		var (
+			pid        int
+			terminated bool
+		)
+		if err := rows.Scan(&pid, &terminated); err != nil {
 			return nil, fmt.Errorf("scan reaped pid: %w", err)
 		}
-		reaped = append(reaped, pid)
+		// pg_terminate_backend returns false if the signal couldn't be
+		// sent (e.g. the backend vanished between detect and reap) — only
+		// report pids actually signalled.
+		if terminated {
+			reaped = append(reaped, pid)
+		}
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate reaped pids: %w", err)
