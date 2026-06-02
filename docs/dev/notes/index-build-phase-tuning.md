@@ -57,9 +57,27 @@ validation PlanetScale node as the non-superuser `pscale_api` role:
 
 So the two knobs sluice wants are **`user`-context and settable per-session by the
 managed non-superuser role — no UI change, no cluster restart**. The ceilings are
-read-only but readable. (Observed values on that small node: `maintenance_work_mem`
-default 16 MB, `max_worker_processes`=4, `shared_buffers`≈67 MB,
-`effective_cache_size`≈203 MB — a small instance.)
+read-only but readable.
+
+**Crucially, those ceilings scale with the plan.** The probed node was a
+PlanetScale **PS-5 — the *smallest* tier (512 MiB RAM, 1⁄16 vCPU)** — so its values
+(`maintenance_work_mem` default 16 MB, `max_worker_processes`=4, `shared_buffers`≈67 MB,
+`effective_cache_size`≈203 MB) are the conservative *floor*. PlanetScale
+provider-sizes these GUCs per plan, and RAM/vCPU roughly double each tier
+([pricing](https://planetscale.com/pricing)):
+
+| Tier | vCPU | RAM |
+|---|---|---|
+| PS-5 (probed) | 1⁄16 | 512 MiB |
+| PS-80 | 1 | 8 GiB |
+| PS-320 | 4 | 32 GiB |
+| PS-1280 | 16 | 128 GiB |
+| PS-2560 | 32 | 256 GiB |
+
+So a PS-320 / PS-2560 reports proportionally larger `shared_buffers` /
+`effective_cache_size` and a higher `max_worker_processes` — i.e. the same probe
+that clamps the autotune *down* on a PS-5 lets it scale *up* on a big instance.
+That's what makes proxy-based autotuning worthwhile rather than just a safety floor.
 
 ## Autotuning: what Postgres exposes (and what it doesn't)
 
@@ -77,10 +95,14 @@ The hard part of autotuning: **Postgres exposes no direct host RAM or CPU via SQ
   them — but on managed providers they're auto-sized to the instance, so they're a
   usable signal for "is this a 256 MB node or a 64 GB node."
 
-**Honest limitation:** absolute RAM/CPU can't be read robustly, so *aggressive*
-full-auto is fragile. The safe shape is **conservative-auto derived from the
-readable proxies, always overridable by an operator flag** — never an auto value
-that could OOM a small managed node.
+**Honest limitation, and where it's actually fine:** absolute RAM/CPU still can't
+be read robustly, so the proxies can mislead on a *self-hosted / hand-tuned*
+instance where `effective_cache_size` was set by guess. But on a **managed
+provider that sizes these GUCs to the plan** (PlanetScale per the table above;
+RDS / Cloud SQL similarly) the proxies *do* track the instance class, so
+proxy-based auto is reliable there. The safe shape is therefore **proxy-derived
+auto, always overridable by an operator flag, and floored/capped so it can never
+OOM a small node** — conservative on a PS-5, proportionally larger on a PS-320.
 
 ## Proposed design
 
