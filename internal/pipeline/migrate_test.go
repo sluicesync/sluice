@@ -249,6 +249,81 @@ func TestRunCallsThreePhasesInOrder(t *testing.T) {
 	}
 }
 
+// staleBackendOrderEngine and its row writer record the sequence in
+// which the stale-backend reap (DetectStaleBackends) and the cold-start
+// empty-table probe (IsTableEmpty) are invoked during Migrator.Run, into
+// a shared order log. It pins Bug 123: the reap MUST run before the
+// cold-start preflight reads the target table. A hard-killed prior run's
+// orphan holds an AccessExclusive lock on the table; the cold-start
+// preflight's IsTableEmpty takes a conflicting AccessShare lock, so if
+// the reap ran *after* the preflight it would block on (or be refused by)
+// the very lock it exists to clear — making --reap-stale-backends
+// unreachable in its primary designed scenario.
+type staleBackendOrderEngine struct {
+	*recordingEngine
+	order *[]string
+}
+
+func (e *staleBackendOrderEngine) DetectStaleBackends(context.Context, string, []string, bool) (ir.StaleBackendReport, error) {
+	*e.order = append(*e.order, "reap")
+	return ir.StaleBackendReport{}, nil
+}
+
+func (e *staleBackendOrderEngine) OpenRowWriter(context.Context, string) (ir.RowWriter, error) {
+	return &staleBackendOrderRowWriter{
+		recordingRowWriter: &recordingRowWriter{phaseLog: &e.phaseLog},
+		order:              e.order,
+	}, nil
+}
+
+type staleBackendOrderRowWriter struct {
+	*recordingRowWriter
+	order *[]string
+}
+
+func (w *staleBackendOrderRowWriter) IsTableEmpty(context.Context, *ir.Table) (bool, error) {
+	*w.order = append(*w.order, "coldstart")
+	return true, nil // empty → cold-start preflight passes and the run proceeds
+}
+
+// TestRunReapsStaleBackendsBeforeColdStartPreflight pins that the
+// stale-backend reap runs before the cold-start empty-table probe on the
+// non-resume cold-start path (Bug 123 regression guard).
+func TestRunReapsStaleBackendsBeforeColdStartPreflight(t *testing.T) {
+	var order []string
+	src := newRecordingEngine("source")
+	src.schema = sampleSchema()
+	tgt := &staleBackendOrderEngine{recordingEngine: newRecordingEngine("target"), order: &order}
+
+	m := &Migrator{
+		Source: src, Target: tgt,
+		SourceDSN: "src", TargetDSN: "tgt",
+		ReapStaleBackends: true,
+	}
+	if err := m.Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	reapIdx, coldIdx := -1, -1
+	for i, ev := range order {
+		if ev == "reap" && reapIdx == -1 {
+			reapIdx = i
+		}
+		if ev == "coldstart" && coldIdx == -1 {
+			coldIdx = i
+		}
+	}
+	if reapIdx == -1 {
+		t.Fatalf("stale-backend reap never ran; order=%v", order)
+	}
+	if coldIdx == -1 {
+		t.Fatalf("cold-start preflight never probed the target; order=%v", order)
+	}
+	if reapIdx > coldIdx {
+		t.Errorf("stale-backend reap ran AFTER the cold-start probe (Bug 123 regression): order=%v", order)
+	}
+}
+
 // TestRunFilterPrunesTables exercises the orchestrator-side prune:
 // with three source tables and an exclude filter that drops one,
 // only the remaining two should be passed to the row writer.

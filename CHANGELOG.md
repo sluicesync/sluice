@@ -6,6 +6,12 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.98.1] - 2026-06-02
+
+### Fixed
+
+- **`fix(pipeline): reap stale backends before the cold-start preflight (Bug 123)`** — v0.98.0's `--reap-stale-backends` was unreachable in its primary designed scenario. In `Migrator.Run` the cold-start preflight (which reads each target table to enforce the empty-target contract — an AccessShare lock) ran **before** the stale-backend preflight. A `sluice/`-labelled orphan from a hard-killed prior run holds an AccessExclusive lock on a target table — exactly the lockout the reaper exists to clear — so the cold-start preflight's `IsTableEmpty` probe blocked on (or, if the table read through, refused on) that lock *before* the reap could fire. The reaper itself was correct (an idle-in-tx orphan on an empty target was reaped, the default detect-and-report WARN fired, a non-`sluice/` backend was left untouched); only the preflight ordering defeated the lock-holding case. v0.98.1 moves `preflightStaleBackends` ahead of the cold-start preflight (and it remains ahead of the connection-budget probe, preserving that invariant), so the reap clears both the table lock the cold-start preflight then needs and the slots the budget math sees. The streamer cold-start path already ran the reap first and is unaffected. Pinned by `TestRunReapsStaleBackendsBeforeColdStartPreflight` (drives `Migrator.Run` with a fake recording the reap/cold-start call order; asserts reap-before-probe). Found by the v0.98.0 post-release regression cycle (focus F3).
+
 ## [0.98.0] - 2026-06-02
 
 A connection-resilience + index-build-throughput arc. Five opt-in

@@ -695,6 +695,28 @@ func (m *Migrator) Run(ctx context.Context) error {
 		return markFailed(ctx, rc, state, ir.MigrationPhasePending, err)
 	}
 
+	// Stale-backend preflight (connection-resilience Phase 2, item 2).
+	// Detect sluice's OWN orphaned backends on the target — a hard-killed
+	// prior run whose server-side COPY backend still holds a target-table
+	// lock and a connection slot. Detection runs always and reports
+	// loudly; --reap-stale-backends authorises terminating them. No-op on
+	// engines without a backend model (MySQL).
+	//
+	// This MUST run before BOTH the cold-start preflight and the
+	// connection-budget probe below: the cold-start preflight reads each
+	// target table (an AccessShare lock) to enforce the empty-target
+	// contract, which an orphan's AccessExclusive lock blocks — so a reap
+	// that ran *after* the preflight could never clear the very lockout it
+	// exists to clear (Bug 123). Reaping here frees both the table lock the
+	// cold-start preflight then needs and the slots the budget math sees.
+	if err := preflightStaleBackends(
+		ctx, m.Target, m.TargetDSN,
+		targetWriteSchemas(schema, m.TargetSchema),
+		m.ReapStaleBackends,
+	); err != nil {
+		return markFailed(ctx, rc, state, ir.MigrationPhasePending, err)
+	}
+
 	// ---- 3-6. Schema apply (phase 1) → bulk copy → indexes → constraints.
 	rr, err := m.Source.OpenRowReader(ctx, m.SourceDSN)
 	if err != nil {
@@ -736,21 +758,6 @@ func (m *Migrator) Run(ctx context.Context) error {
 				}
 			}
 		}
-	}
-
-	// Stale-backend preflight (connection-resilience Phase 2, item 2).
-	// Detect sluice's OWN orphaned backends on the target — a hard-killed
-	// prior run whose server-side COPY backend still holds a target-table
-	// lock and a connection slot. Detection runs always and reports
-	// loudly; --reap-stale-backends authorises terminating them. Runs
-	// BEFORE the connection-budget probe so a reap frees slots the budget
-	// math then sees. No-op on engines without a backend model (MySQL).
-	if err := preflightStaleBackends(
-		ctx, m.Target, m.TargetDSN,
-		targetWriteSchemas(schema, m.TargetSchema),
-		m.ReapStaleBackends,
-	); err != nil {
-		return markFailed(ctx, rc, state, ir.MigrationPhasePending, err)
 	}
 
 	// Connection-budget preflight (connection-resilience item 4). Probe
