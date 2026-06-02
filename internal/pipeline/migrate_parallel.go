@@ -417,6 +417,22 @@ func runChunks(
 //
 // On any open error, in-flight resources are closed and the error
 // surfaces with no leaked connections.
+//
+// TODO(phase 2b): connection-resilience item 4-adaptive (AIMD backoff
+// mid-copy). When a chunk's target-writer open here (or its first
+// statement) returns SQLSTATE 53300 (too_many_connections) or the
+// superuser-reserved-slots FATAL, AIMD-decrease the effective
+// parallelism and retry that chunk rather than failing the whole run
+// (floor at 1, logged). This was deliberately deferred from Phase 2:
+// the pool opens all N connections eagerly up-front (here) inside a
+// single errgroup with no per-chunk retry/backoff loop, so retrofitting
+// AIMD entangles the eager-open + errgroup lifecycle significantly —
+// the must-have (stale-backend reaper, item 2) is what closes the
+// orphan-lockout, and Phase 1's budget preflight already right-sizes
+// parallelism up front so mid-copy slot exhaustion is the rare race.
+// The decrease/retry decision should be a pure function (mirroring the
+// applier's AIMD in change_applier_batch.go) so it is unit-testable
+// before the pool restructuring lands. See the PR for the full rationale.
 func openChunkConnections(ctx context.Context, deps *parallelBulkCopyDeps, n int) ([]ir.RowReader, []ir.RowWriter, []func(), error) {
 	if n <= 0 {
 		return nil, nil, nil, nil

@@ -363,6 +363,16 @@ type Streamer struct {
 	// on engines without a connection-slot model (today: MySQL).
 	MaxTargetConnections int
 
+	// ReapStaleBackends opts the operator into terminating sluice's own
+	// orphaned backends on the target during the cold-start preflight
+	// (connection-resilience Phase 2, item 2). Detection runs always and
+	// reports loudly; this flag authorises the destructive
+	// pg_terminate_backend. Default off — detect-and-report is the safe
+	// baseline (a legitimately-running concurrent sluice process on the
+	// same target is a real possibility). No-op on engines without a
+	// backend model (today: MySQL).
+	ReapStaleBackends bool
+
 	// ApplyExecTimeout is the per-statement deadline plumbed to the
 	// target [ir.ChangeApplier] via the optional
 	// [ir.ApplyExecTimeoutSetter] interface. Each tx.ExecContext call
@@ -2433,6 +2443,23 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 	}
 	applyTargetSchema(rw, s.TargetSchema)
 	applyMaxBufferBytes(rw, s.MaxBufferBytes)
+
+	// Stale-backend preflight (connection-resilience Phase 2, item 2).
+	// Detect sluice's OWN orphaned backends on the target before the
+	// budget probe so a reap frees slots the budget math then sees.
+	// Detection runs always and reports loudly; --reap-stale-backends
+	// authorises terminating them. No-op on engines without a backend
+	// model (MySQL).
+	if err := preflightStaleBackends(
+		ctx, s.Target, s.TargetDSN,
+		targetWriteSchemas(schema, s.TargetSchema),
+		s.ReapStaleBackends,
+	); err != nil {
+		closeIf(rw)
+		closeIf(sw)
+		_ = stream.Close()
+		return nil, stop, err
+	}
 
 	// Connection-budget preflight (connection-resilience item 4). The
 	// streamer's cold-start is single-reader (requested=1), so there's

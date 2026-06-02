@@ -301,6 +301,20 @@ type Migrator struct {
 	// so the budget preflight is a no-op and this ceiling is inert.
 	MaxTargetConnections int
 
+	// ReapStaleBackends opts the operator into terminating sluice's own
+	// orphaned backends on the target during the cold-start preflight
+	// (connection-resilience Phase 2, item 2). Detection runs always and
+	// reports loudly; this flag is what authorises the destructive
+	// pg_terminate_backend on each detected orphan. Default off —
+	// detect-and-report is the safe baseline because a legitimately-
+	// running concurrent sluice process on the same target is a real
+	// possibility (the loud-failure / contain-Postgres-complexity tenets).
+	//
+	// Target-engine-specific: engines without a backend model (today:
+	// MySQL) don't implement [ir.TargetStaleBackendReaper], so the step
+	// is a no-op and this flag is inert.
+	ReapStaleBackends bool
+
 	// AllowDegradedFKs opts the operator into the pgcopydb-PR-#27-style
 	// "tolerate dirty FK source" behaviour: when [SchemaWriter.CreateConstraints]
 	// hits SQLSTATE 23503 on a validating `ADD CONSTRAINT`, retry as
@@ -710,6 +724,21 @@ func (m *Migrator) Run(ctx context.Context) error {
 				}
 			}
 		}
+	}
+
+	// Stale-backend preflight (connection-resilience Phase 2, item 2).
+	// Detect sluice's OWN orphaned backends on the target — a hard-killed
+	// prior run whose server-side COPY backend still holds a target-table
+	// lock and a connection slot. Detection runs always and reports
+	// loudly; --reap-stale-backends authorises terminating them. Runs
+	// BEFORE the connection-budget probe so a reap frees slots the budget
+	// math then sees. No-op on engines without a backend model (MySQL).
+	if err := preflightStaleBackends(
+		ctx, m.Target, m.TargetDSN,
+		targetWriteSchemas(schema, m.TargetSchema),
+		m.ReapStaleBackends,
+	); err != nil {
+		return markFailed(ctx, rc, state, ir.MigrationPhasePending, err)
 	}
 
 	// Connection-budget preflight (connection-resilience item 4). Probe
