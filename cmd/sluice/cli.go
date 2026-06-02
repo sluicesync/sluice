@@ -153,6 +153,8 @@ type MigrateCmd struct {
 
 	MaxTargetConnections int `help:"Explicit ceiling on the number of connections the bulk-copy pool opens against the target (connection-resilience item 4). 0 (default) = auto: sluice probes the target's connection-slot budget (Postgres max_connections / role / database limits minus in-use and a small reserve) and caps --bulk-parallelism to fit, refusing loudly if no budget is free. When set, it's an explicit upper bound the auto-cap further bounds — it never raises --bulk-parallelism. Inert against engines without a connection-slot model (MySQL target)." default:"0" placeholder:"N"`
 
+	ReapStaleBackends bool `help:"Terminate sluice's OWN orphaned backends on the target during the cold-start preflight (connection-resilience Phase 2, item 2). Detection runs ALWAYS and reports loudly; this flag authorises pg_terminate_backend on each orphan. An orphan is a backend whose application_name carries the 'sluice/' prefix, owned by the connecting role, NOT the current session, and either idle-in-transaction or holding a lock on a relation sluice is about to write — typically a SIGKILL'd / OOM'd prior run whose server-side COPY backend still holds a target-table lock and a connection slot. Default off — detect-and-report is the safe baseline, because a legitimately-running concurrent sluice process on the same target is a real possibility (the report is shown first so you can tell them apart). Termination is always scoped to your own sluice backends; it never touches another role's or a non-sluice session, and needs no superuser grant. Inert against engines without a backend model (MySQL target)."`
+
 	BulkParallelMinRows int64 `help:"Row-count threshold below which a table is copied with a single reader/writer pair regardless of --bulk-parallelism. Avoids per-chunk overhead on small tables. Default 80000 (v0.62.0+; pre-v0.62.0 default was 100000) — sits below 100k to absorb the typical information_schema row-count estimate undershoot on InnoDB, so 100k-actual tables don't miss the threshold by ~1%." default:"80000" placeholder:"N"`
 
 	MaxBufferBytes int64 `help:"Soft cap on per-batch buffered memory in the bulk-copy writer. The writer flushes when accumulated row-value bytes reach the cap regardless of row count, so wide-row workloads (TEXT/BYTEA/JSON at MB scale) don't blow out heap. A single row larger than the cap still applies (soft target). Default 67108864 (64 MiB). See ADR-0028." default:"67108864" placeholder:"N"`
@@ -268,6 +270,7 @@ func (m *MigrateCmd) Run(g *Globals) error {
 		BulkParallelism:      m.BulkParallelism,
 		BulkParallelMinRows:  m.BulkParallelMinRows,
 		MaxTargetConnections: m.MaxTargetConnections,
+		ReapStaleBackends:    m.ReapStaleBackends,
 		MaxBufferBytes:       m.MaxBufferBytes,
 		IndexBuildMem:        indexBuildMem,
 		TargetSchema:         m.TargetSchema,
@@ -558,6 +561,8 @@ type SyncStartCmd struct {
 	IndexBuildMem string `help:"Postgres-only, cold-start branch: per-build maintenance_work_mem for the deferred secondary-index phase (CREATE INDEX runs after the cold-start bulk COPY, against an idle target). Accepts a human size ('512MB', '2GB') or a raw byte count. Default 'auto': sluice probes pg_settings (shared_buffers as the RAM proxy) and raises maintenance_work_mem well above the provider's steady-state ~4%-of-RAM default — the dominant index-build speedup — flooring at the provider's current value. Best-effort: a denied SET logs a WARN and the build proceeds untuned. Only the cold-start path builds indexes; warm-resume ignores this. Inert on MySQL targets. See docs/dev/notes/index-build-phase-tuning.md." default:"auto" placeholder:"SIZE|auto"`
 
 	MaxTargetConnections int `help:"Explicit ceiling on the target connection budget (connection-resilience item 4). On cold-start, sluice probes the target's connection-slot budget (Postgres max_connections / role / database limits minus in-use and a small reserve) and refuses loudly if no slot is free for the copy + CDC connections. 0 (default) = auto (probe-and-refuse-on-exhaustion, no operator ceiling). The streamer's cold-start is single-reader, so there's no parallelism to cap here — this is the loud-refusal floor plus an explicit ceiling. Inert against engines without a connection-slot model (MySQL target)." default:"0" placeholder:"N"`
+
+	ReapStaleBackends bool `help:"Terminate sluice's OWN orphaned backends on the target during the cold-start preflight (connection-resilience Phase 2, item 2). Detection runs ALWAYS and reports loudly; this flag authorises pg_terminate_backend on each orphan. An orphan is a backend whose application_name carries the 'sluice/' prefix, owned by the connecting role, NOT the current session, and either idle-in-transaction or holding a lock on a relation sluice is about to write — typically a SIGKILL'd / OOM'd prior run whose server-side COPY backend still holds a target-table lock and a connection slot. Default off — detect-and-report is the safe baseline, because a legitimately-running concurrent sluice process on the same target is a real possibility (the report is shown first so you can tell them apart). Termination is always scoped to your own sluice backends; it never touches another role's or a non-sluice session, and needs no superuser grant. Inert against engines without a backend model (MySQL target)."`
 
 	ApplyExecTimeout time.Duration `help:"Per-statement deadline applied to every tx.ExecContext on the apply path. GitHub #23 Phase B fix (v0.52.0): closes the silent-stall failure mode where a half-closed destination connection blocked the apply goroutine indefinitely inside the driver's TLS read path. On expiry the driver returns context.DeadlineExceeded, which is classified retriable so the runWithRetry loop reopens the applier and retries the batch on a fresh connection. 0 disables (the pre-v0.52.0 behaviour: unbounded). Tune up for legitimately slow batch upserts on slow targets; down for tighter stall detection." default:"60s" placeholder:"DUR"`
 
@@ -850,6 +855,7 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 		MaxBufferBytes:         s.MaxBufferBytes,
 		IndexBuildMem:          indexBuildMem,
 		MaxTargetConnections:   s.MaxTargetConnections,
+		ReapStaleBackends:      s.ReapStaleBackends,
 		ApplyExecTimeout:       s.ApplyExecTimeout,
 		ApplyRetryAttempts:     s.ApplyRetryAttempts,
 		ApplyRetryBackoffBase:  s.ApplyRetryBackoffBase,
