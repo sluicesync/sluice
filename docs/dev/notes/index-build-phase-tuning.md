@@ -66,18 +66,29 @@ PlanetScale **PS-5 — the *smallest* tier (512 MiB RAM, 1⁄16 vCPU)** — so i
 provider-sizes these GUCs per plan, and RAM/vCPU roughly double each tier
 ([pricing](https://planetscale.com/pricing)):
 
-| Tier | vCPU | RAM |
-|---|---|---|
-| PS-5 (probed) | 1⁄16 | 512 MiB |
-| PS-80 | 1 | 8 GiB |
-| PS-320 | 4 | 32 GiB |
-| PS-1280 | 16 | 128 GiB |
-| PS-2560 | 32 | 256 GiB |
+Measured `effective_cache_size` across tiers (PS-5 probed by sluice; the rest
+operator-reported):
 
-So a PS-320 / PS-2560 reports proportionally larger `shared_buffers` /
-`effective_cache_size` and a higher `max_worker_processes` — i.e. the same probe
-that clamps the autotune *down* on a PS-5 lets it scale *up* on a big instance.
-That's what makes proxy-based autotuning worthwhile rather than just a safety floor.
+| Tier | vCPU | RAM | `effective_cache_size` | ≈ % RAM |
+|---|---|---|---|---|
+| PS-5 (probed) | 1⁄16 | 512 MiB | 203 MB | ~40% |
+| PS-10 | 1⁄8 | 1 GiB | 477 MB | ~47% |
+| PS-20 | 1⁄4 | 2 GiB | 1007 MB | ~49% |
+| PS-40 | 1⁄2 | 4 GiB | ~1024 MB | ~25% (anomaly) |
+| PS-80 | 1 | 8 GiB | 3 GB | ~37% |
+| PS-160 | 2 | 16 GiB | 8 GB | ~50% |
+| PS-320 -> PS-2560 | 4 -> 32 | 32 -> 256 GiB | (scales up) | -- |
+
+So the probe lets the autotune scale *up* on a bigger instance (clamp down on a
+PS-5, open up on a PS-160) — that's what makes proxy-based autotuning worthwhile
+rather than a one-way floor. **But the sizing isn't perfectly proportional:** PS-40
+reports ~1 GB `effective_cache_size` (~25% of its 4 GB), essentially flat vs PS-20,
+not the ~40-50% the other tiers show. Design lesson: a
+fraction-of-`effective_cache_size` heuristic *under*-tunes that anomalous tier
+(sizes a PS-40 like a PS-20) — which is the **safe** direction (under-tuning is
+slower, never an OOM). Treat `effective_cache_size` as a conservative lower-bound
+signal, floor/cap the result, and let the operator flag reclaim headroom on tiers
+where the proxy under-sells the instance.
 
 ## Autotuning: what Postgres exposes (and what it doesn't)
 
