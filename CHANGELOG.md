@@ -6,6 +6,33 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.98.0] - 2026-06-02
+
+A connection-resilience + index-build-throughput arc. Five opt-in
+capabilities harden Postgres targets against connection-slot exhaustion
+and orphaned backends, and make the deferred secondary-index build phase
+materially faster on managed Postgres. Every new behavior is default-safe:
+connection labelling is the only thing on by default, the budget cap is
+auto-sizing (refuse-loudly only when a target genuinely cannot host the
+copy), and reaping / memory / parallelism tuning are explicit opt-ins.
+
+### Added
+
+- **`feat(connection-resilience): phase 1 — application_name, PG keepalive, connection-budget cap`** — every Postgres connection is now stamped `application_name=sluice/<id>/<role>` (role ∈ {snapshot, applier, cdc-reader, schema, control}), never clobbering an operator-set value — the enabler for orphan detection and for finding sluice in `pg_stat_activity`. A new `ir.TargetConnectionBudgetProber` capability (engine-neutral; MySQL no-ops) probes `max_connections` / `superuser_reserved_connections` / live `pg_stat_activity` / `rolconnlimit` / `datconnlimit` before the bulk-copy pool opens, clamps requested parallelism to the available budget, and **refuses loudly** when the copy budget falls below 1 rather than failing mid-copy with `too_many_connections`. Probe failure degrades to a WARN, never breaks a working migration. New flag `--max-target-connections N` (default `0` = auto) on `migrate` + `sync start`.
+- **`feat(connection-resilience): phase 2 — stale-backend detection + opt-in reaping`** — closes the orphan-lockout class: a SIGKILL'd / OOM'd / partitioned prior run leaves its server-side COPY backend alive, still holding the target-table lock and a connection slot, blocking the next cold-start's DROP/CREATE. `DetectStaleBackends` scans `pg_stat_activity LEFT JOIN pg_locks` for *own* orphaned backends (idle-in-transaction or holding a lock on a schema sluice is about to write), reports them loudly by default, and — only under `--reap-stale-backends` — terminates them. The safety scope (`application_name LIKE 'sluice/%' AND usename = current_user AND pid <> pg_backend_pid()`) is one greppable constant re-applied by both the detect scan and the terminate statement, so a recycled pid can never be hit out of bound. Runs before the budget probe so a reap frees slots the budget math then sees. New flag `--reap-stale-backends` on `migrate` + `sync start`.
+- **`feat(connection-resilience): phase 2b — AIMD backoff on copy-pool slot exhaustion`** — a transient mid-copy slot shortage (a peer process grabbing slots *after* Phase 1's preflight measured them free) no longer fails the whole migration. A `SQLSTATE 53300` (`too_many_connections`, including the superuser-reserved-slots startup FATAL) on a chunk connection now multiplicatively-decreases effective parallelism (halve, floor 1), backs off (bounded exponential), and retries — giving up loudly only after a bounded retry/total-wait. **Only** the slot-exhaustion class is retried; every other open error (bad DSN, permission denied, real COPY failure) still fails loudly and immediately. Double-copy-safe: a 53300 fails at connection open/ping, strictly before any row is written, so a retried chunk replays from its recorded cursor and can never duplicate rows.
+- **`feat(postgres): index-build phase tuning — phase A (maintenance_work_mem + parallel workers)`** — the deferred secondary-index build runs against an idle target after the bulk COPY, but `maintenance_work_mem` (the dominant in-memory-sort vs external-merge lever) sat at the provider's steady-state ~4%-of-RAM default. sluice now probes `shared_buffers` as a RAM proxy and raises `maintenance_work_mem` + `max_parallel_maintenance_workers` (never lowers) on a dedicated connection for the build phase. Best-effort: a denied SET / failed probe WARNs and proceeds untuned. New flag `--index-build-mem` (human size like `512MB` / `2GB`, or `auto`) on `migrate` + `sync start`.
+- **`feat(postgres): index-build phase tuning — phase B (concurrent index builds)`** — the deferred indexes now build through a bounded concurrent worker pool instead of a serial loop, each worker on its own connection. Because N concurrent builds each consume their own `maintenance_work_mem`, auto-N divides the Phase A memory budget across workers and bounds N by **both** the memory budget **and** the target's spare connection budget (reusing the Phase 1 probe), plus the index count and an operator cap (conservative hard cap 8). `N=1` degenerates to exactly the prior serial path. New flag `--index-build-parallelism N` (default `0` = auto) on `migrate` + `sync start`. PG-target only; MySQL unaffected.
+
+### Performance
+
+- **`perf(backup): use klauspost/compress gzip for the gzip codec`** — the non-default gzip backup codec (`--compression=gzip`; zstd has been the default since v0.67.0) now uses `github.com/klauspost/compress/gzip` instead of stdlib `compress/gzip` for a ~2–6× encode speedup at <5% ratio cost. Drop-in replacement — identical gzip wire format, so **no chunk-format change and no backup-version bump**; existing gzip backups read back unchanged. klauspost/compress is already a direct dependency (zstd codec), so this adds zero binary-size or module cost.
+
+### Added (docs)
+
+- **`docs(cookbook): broker continuous-replication recipe`** (#136) — adds the broker continuous-replication recipe with a broker-vs-`sync start` decision matrix.
+- **`docs: correct Heroku-source guidance`** — the Heroku-source prep guidance now reflects the shipped postgres-trigger engine as the supported path (Heroku's managed tiers have `rolreplication=f`, so slot-based PG CDC is unavailable at any tier).
+
 ## [0.97.2] - 2026-05-31
 
 ### Added
