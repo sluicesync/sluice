@@ -66,29 +66,47 @@ PlanetScale **PS-5 — the *smallest* tier (512 MiB RAM, 1⁄16 vCPU)** — so i
 provider-sizes these GUCs per plan, and RAM/vCPU roughly double each tier
 ([pricing](https://planetscale.com/pricing)):
 
-Measured `effective_cache_size` across tiers (PS-5 probed by sluice; the rest
-operator-reported):
+Measured GUC defaults across tiers (PS-5 probed by sluice; the rest
+operator-reported). RAM/vCPU roughly double each tier, but the GUCs do *not* all
+track RAM the same way:
 
-| Tier | vCPU | RAM | `effective_cache_size` | ≈ % RAM |
-|---|---|---|---|---|
-| PS-5 (probed) | 1⁄16 | 512 MiB | 203 MB | ~40% |
-| PS-10 | 1⁄8 | 1 GiB | 477 MB | ~47% |
-| PS-20 | 1⁄4 | 2 GiB | 1007 MB | ~49% |
-| PS-40 | 1⁄2 | 4 GiB | ~1024 MB | ~25% (anomaly) |
-| PS-80 | 1 | 8 GiB | 3 GB | ~37% |
-| PS-160 | 2 | 16 GiB | 8 GB | ~50% |
-| PS-320 -> PS-2560 | 4 -> 32 | 32 -> 256 GiB | (scales up) | -- |
+| Tier | RAM | `shared_buffers` | `effective_cache_size` | `maintenance_work_mem` (default) | `max_worker_processes` | `max_parallel_maintenance_workers` (default) |
+|---|---|---|---|---|---|---|
+| PS-5 | 512 MB | 67 MB | 203 MB | 16 MB | 4 | 2 |
+| PS-10 | 1 GB | 159 MB | 477 MB | 39 MB | 4 | 2 |
+| PS-20 | 2 GB | 335 MB | 1007 MB | 83 MB | 4 | 2 |
+| PS-40 | 4 GB | 644 MB | ~1 GB (anomaly) | 161 MB | 4 | 2 |
+| PS-80 | 8 GB | 1 GB | 3 GB | 337 MB | 4 | 2 |
+| PS-160 | 16 GB | 2 GB | 8 GB | 690 MB | 4 | 2 |
+| PS-640 | 64 GB | -- | -- | -- | 6 | 4 |
+| PS-1280 | 128 GB | -- | -- | -- | 12 | 4 |
+| PS-2560 | 256 GB | -- | -- | -- | 25 | 4 |
 
-So the probe lets the autotune scale *up* on a bigger instance (clamp down on a
-PS-5, open up on a PS-160) — that's what makes proxy-based autotuning worthwhile
-rather than a one-way floor. **But the sizing isn't perfectly proportional:** PS-40
-reports ~1 GB `effective_cache_size` (~25% of its 4 GB), essentially flat vs PS-20,
-not the ~40-50% the other tiers show. Design lesson: a
-fraction-of-`effective_cache_size` heuristic *under*-tunes that anomalous tier
-(sizes a PS-40 like a PS-20) — which is the **safe** direction (under-tuning is
-slower, never an OOM). Treat `effective_cache_size` as a conservative lower-bound
-signal, floor/cap the result, and let the operator flag reclaim headroom on tiers
-where the proxy under-sells the instance.
+Three findings that shape the design:
+
+1. **`shared_buffers` is the most reliable memory proxy** — a clean ~13-16% of RAM,
+   monotonic, ~2x per tier, and (unlike `effective_cache_size`) **no PS-40 anomaly**.
+   So `RAM ≈ shared_buffers × ~7` is a usable estimate; use `shared_buffers` as the
+   primary proxy and `effective_cache_size` (noisier — PS-40 reports ~25% of RAM,
+   flat vs PS-20) only as a cross-check.
+
+2. **The provider already auto-scales the `maintenance_work_mem` *default* to ~4% of
+   RAM** (16 MB → 690 MB, PS-5 → PS-160), cleanly. But ~4% is a *steady-state
+   multi-tenant* default. During a dedicated migration index-build phase the target
+   is **idle** (not serving traffic), so sluice can safely push `maintenance_work_mem`
+   well above 4% — a large fraction of RAM — which is exactly the speedup the original
+   discussion was after. The provider's default leaves it on the table for the
+   one-shot bulk-build case; **that gap is the feature.**
+
+3. **Parallelism barely scales until the very top.** `max_worker_processes` is flat at
+   **4** through PS-320 (a 4-vCPU PS-320 has the same worker pool as a PS-5), only
+   rising at PS-640 (6) / PS-1280 (12) / PS-2560 (25); `max_parallel_maintenance_workers`
+   default is **2** until PS-640 (then 4). Both are `user`-settable, but the *effective*
+   worker count is hard-capped by `max_worker_processes`. So **parallel + concurrent
+   index builds give little below PS-640 — the dominant lever on the vast majority of
+   plans is `maintenance_work_mem`, not parallelism.** This reprioritizes the phasing
+   (below): Phase A (memory) captures nearly all the win; Phase B (parallelism) only
+   pays off on the largest instances.
 
 ## Autotuning: what Postgres exposes (and what it doesn't)
 
@@ -101,10 +119,13 @@ The hard part of autotuning: **Postgres exposes no direct host RAM or CPU via SQ
   `max_parallel_maintenance_workers`, the *effective* worker count is bounded by
   these (a shared pool). On the probed node both = 4, so parallel-maintenance is
   capped at ~4 regardless. This is a dependable, readable bound.
-- **Memory proxy (soft):** `shared_buffers` (~25% RAM by convention) and
-  `effective_cache_size` (~50–75% RAM). Imperfect — an operator *can* misconfigure
-  them — but on managed providers they're auto-sized to the instance, so they're a
-  usable signal for "is this a 256 MB node or a 64 GB node."
+- **Memory proxy (primary = `shared_buffers`):** the tier data above shows
+  `shared_buffers` tracks RAM cleanly at ~13-16% (monotonic, no anomaly), so
+  `RAM ≈ shared_buffers × ~7` is the most usable estimate. `effective_cache_size`
+  is the secondary cross-check (noisier — the PS-40 anomaly). An operator *can*
+  misconfigure either on a self-hosted box, but on managed providers they're
+  auto-sized to the instance, so they reliably answer "is this a 256 MB node or a
+  64 GB node."
 
 **Honest limitation, and where it's actually fine:** absolute RAM/CPU still can't
 be read robustly, so the proxies can mislead on a *self-hosted / hand-tuned*
@@ -145,13 +166,18 @@ the natural home for the bound — the two features compose.
 The hard architectural part (the deferral seam, a dedicated `CreateIndexes` phase)
 is **already built**, so this is low-difficulty:
 
-- **Phase A (cheap, safe, high-leverage):** `SET maintenance_work_mem` +
-  `max_parallel_maintenance_workers` on the existing *serial* `CreateIndexes`
-  session, with the flag + conservative auto from `pg_settings` probes. No
-  concurrency, no new failure modes.
-- **Phase B:** concurrent index builds — a bounded worker pool over the existing
-  loop, bounded by the connection + memory budget. Larger; depends on the budget
-  work landing first.
+- **Phase A (cheap, safe, captures nearly all the win):** `SET maintenance_work_mem`
+  (the dominant lever — push well past the provider's ~4%-of-RAM default during the
+  idle build phase, sized from `shared_buffers`) + `SET max_parallel_maintenance_workers`
+  on the existing *serial* `CreateIndexes` session, with the flag + conservative auto
+  from `pg_settings` probes. No concurrency, no new failure modes. The tier data says
+  this alone is the bulk of the speedup on every plan below PS-640.
+- **Phase B (only pays off at the top):** concurrent index builds — a bounded worker
+  pool over the existing loop, bounded by the connection + memory budget. But note
+  `max_worker_processes` is flat at 4 until PS-640, so concurrent/parallel builds
+  contend for a tiny shared pool on most plans; Phase B mainly earns its keep on
+  PS-640+ (and as I/O overlap when a single build doesn't saturate). Lower priority
+  than Phase A, and depends on the budget work landing first.
 
 Engine-neutral note: MySQL index builds have their own characteristics
 (`ALGORITHM=INPLACE`, `innodb_sort_buffer_size`, …) — out of scope for v1. This is
