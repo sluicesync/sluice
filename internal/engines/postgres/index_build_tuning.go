@@ -81,13 +81,12 @@ type indexBuildTuningProbe struct {
 // matrix is table-unit-testable.
 //
 // maintenance_work_mem (the dominant lever):
-//   - override > 0 → used verbatim (operator knows their box), still
-//     floored at the provider's current default so an override can only
-//     ever raise, never lower below what the provider already tuned.
+//   - override > 0 → used verbatim (operator knows their box; they may
+//     know the target isn't idle, or want a gentler build).
 //   - else auto: clamp(fraction × shared_buffers × factor, floor, cap),
 //     then raised to at least the provider's current default. The
-//     provider already auto-scales the default to ~4% of RAM; sluice
-//     only ever pushes it *up* for the idle build phase.
+//     provider already auto-scales the default to ~4% of RAM; on the auto
+//     path sluice only ever pushes it *up* for the idle build phase.
 //
 // max_parallel_maintenance_workers (secondary): raise toward
 // (max_worker_processes − reserve), bounded by the max_worker_processes
@@ -103,24 +102,25 @@ func computeIndexBuildTuning(p indexBuildTuningProbe, override int64) (maintenan
 // [computeIndexBuildTuning]. Split out to keep each lever's policy
 // readable in isolation.
 func computeMaintenanceWorkMem(p indexBuildTuningProbe, override int64) int64 {
-	var target int64
+	// An explicit operator override wins verbatim — they know their box
+	// (the target may not actually be idle; they may want a gentler build).
+	// The "never below the provider default" floor below is an *auto*-path
+	// guard, not a cap on what the operator is allowed to ask for.
 	if override > 0 {
-		target = override
-	} else {
-		ramEst := p.sharedBuffersBytes * ramFromSharedBuffersFactor
-		auto := int64(indexBuildMemFraction * float64(ramEst))
-		target = clampInt64(auto, indexBuildMemFloor, indexBuildMemCap)
+		return override
 	}
-	// Never set below the provider's existing default — the provider
-	// already tuned it; sluice only ever raises for the idle build
-	// phase. Applies to the override path too: an operator who passes a
-	// value smaller than the provider default still gets at least the
-	// provider default (lowering it would be a pessimisation with no
-	// upside on an idle node).
-	if p.maintenanceWorkMemBytes > target {
-		target = p.maintenanceWorkMemBytes
+
+	// Auto: size from shared_buffers (the cleanest RAM proxy), clamped to
+	// [floor, cap], then raised to at least the provider's current default.
+	// The provider already auto-scales the default to ~4% of RAM, so sluice
+	// only ever pushes it *up* for the idle build phase — it never guesses
+	// lower than what the provider already tuned.
+	ramEst := p.sharedBuffersBytes * ramFromSharedBuffersFactor
+	auto := clampInt64(int64(indexBuildMemFraction*float64(ramEst)), indexBuildMemFloor, indexBuildMemCap)
+	if p.maintenanceWorkMemBytes > auto {
+		return p.maintenanceWorkMemBytes
 	}
-	return target
+	return auto
 }
 
 // computeParallelMaintenanceWorkers implements the

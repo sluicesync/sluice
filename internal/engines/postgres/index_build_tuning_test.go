@@ -113,9 +113,11 @@ func TestComputeIndexBuildTuning(t *testing.T) {
 			wantWorkers: 3,
 		},
 		{
-			// Override below the provider's current default is raised to
-			// the provider default — sluice only ever raises.
-			name: "override below provider default floored at default",
+			// An explicit operator override wins verbatim, even below the
+			// provider's current default — they may know the target isn't
+			// idle, or want a gentler build. The "never below default" rule
+			// is an auto-path guard only, not a floor on the operator.
+			name: "override honored verbatim even below provider default",
 			probe: indexBuildTuningProbe{
 				sharedBuffersBytes:        2 * gib,
 				maintenanceWorkMemBytes:   690 * mib,
@@ -123,7 +125,7 @@ func TestComputeIndexBuildTuning(t *testing.T) {
 				maxParallelMaintenanceWrk: 2,
 			},
 			override:    100 * mib,
-			wantMem:     690 * mib,
+			wantMem:     100 * mib,
 			wantWorkers: 3,
 		},
 		{
