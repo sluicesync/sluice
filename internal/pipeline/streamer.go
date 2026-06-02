@@ -337,6 +337,17 @@ type Streamer struct {
 	// land it than to wedge the stream. See ADR-0028.
 	MaxBufferBytes int64
 
+	// IndexBuildMem is the operator's `--index-build-mem` value (a
+	// per-build maintenance_work_mem in bytes; 0 = auto), threaded to
+	// the PG target SchemaWriter on the cold-start branch via
+	// [ir.IndexBuildTuner] before the deferred CreateIndexes phase. 0
+	// leaves the writer to autotune from a pg_settings probe (the
+	// dominant index-build lever, on by default). Only the cold-start
+	// path builds indexes; warm-resume never opens a SchemaWriter.
+	// Inert on engines without the tuner (MySQL target). See
+	// docs/dev/notes/index-build-phase-tuning.md.
+	IndexBuildMem int64
+
 	// MaxTargetConnections is the operator's --max-target-connections
 	// explicit ceiling on the target connection budget (connection-
 	// resilience item 4). On the cold-start branch the streamer runs a
@@ -2408,6 +2419,7 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 		return nil, stop, wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: open target schema writer: %w", err))
 	}
 	applyTargetSchema(sw, s.TargetSchema)
+	applyIndexBuildMem(sw, s.IndexBuildMem)
 	if err := applyEnabledPGExtensions(ctx, sw, s.EnabledPGExtensions); err != nil {
 		closeIf(sw)
 		_ = stream.Close()

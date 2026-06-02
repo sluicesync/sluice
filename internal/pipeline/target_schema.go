@@ -68,6 +68,24 @@ func applyTargetSchema(target any, targetSchema string) {
 	}
 }
 
+// applyIndexBuildMem threads the operator's `--index-build-mem` value
+// (a per-build maintenance_work_mem in bytes; 0 = auto) to a freshly-
+// opened target [ir.SchemaWriter] via the optional [ir.IndexBuildTuner]
+// surface, before CreateIndexes runs. Engines that don't implement the
+// tuner (today: MySQL) skip cleanly — the PG writer auto-tunes from a
+// pg_settings probe regardless, so the flag only ever overrides the
+// auto value on a PG target.
+//
+// Called unconditionally (even when bytes == 0): the PG writer treats
+// 0 as the auto sentinel and still runs the dominant maintenance_work_mem
+// auto-tune. That keeps the speedup on by default without a separate
+// per-command opt-in. See docs/dev/notes/index-build-phase-tuning.md.
+func applyIndexBuildMem(target any, bytes int64) {
+	if tuner, ok := target.(ir.IndexBuildTuner); ok {
+		tuner.SetIndexBuildMem(bytes)
+	}
+}
+
 // applyEnabledPGExtensions threads the operator's
 // `--enable-pg-extension` allowlist (ADR-0032) through to a freshly-
 // opened engine reader / writer / applier via the optional

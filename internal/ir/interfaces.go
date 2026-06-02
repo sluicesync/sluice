@@ -990,6 +990,26 @@ type SchemaSetter interface {
 	SetSchema(name string)
 }
 
+// IndexBuildTuner is the optional surface a [SchemaWriter] can implement
+// to accept the operator's `--index-build-mem` value (a per-build
+// maintenance_work_mem in bytes; 0 = auto). The pipeline orchestrator
+// threads it to the writer before [SchemaWriter.CreateIndexes] so the
+// dedicated index-build session can raise maintenance_work_mem above the
+// provider's steady-state default — the dominant lever for the deferred
+// secondary-index build, which runs against an idle target.
+//
+// PG implements; MySQL does not (its index-build tuning is a different
+// contract — ALGORITHM=INPLACE / innodb_sort_buffer_size — out of scope
+// for v1). Engines that don't implement it are silently passed through:
+// the auto path is the default and the flag simply has no target.
+//
+// Zero or negative bytes is the auto sentinel — the writer derives
+// maintenance_work_mem from a pg_settings probe instead of the override.
+// See docs/dev/notes/index-build-phase-tuning.md.
+type IndexBuildTuner interface {
+	SetIndexBuildMem(bytes int64)
+}
+
 // TableScoper is the optional surface a [SchemaReader] can implement
 // to accept the operator's table filter *before* the schema scan, so
 // per-column type validation is scoped to the tables that will
