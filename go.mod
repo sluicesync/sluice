@@ -1,6 +1,6 @@
 module sluicesync.dev/sluice
 
-go 1.26.2
+go 1.26.4
 
 require (
 	cloud.google.com/go/kms v1.31.0
