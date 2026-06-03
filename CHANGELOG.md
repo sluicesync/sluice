@@ -6,6 +6,25 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.99.0] - 2026-06-02
+
+The "new home" release: sluice moved to its own GitHub organization and a
+vanity module path, and now ships an official container image. No functional
+engine changes from v0.98.1 — the connection-resilience + index-build work
+shipped in v0.98.0 / v0.98.1.
+
+### Changed
+
+- **New home — `github.com/sluicesync/sluice`, module path `sluicesync.dev/sluice`.** The repository moved from `orware/sluice` to the new `sluicesync` organization, and the Go module path is now the vanity path `sluicesync.dev/sluice` (served via GitHub Pages, so imports are decoupled from the host and won't break on any future move). Install with `go install sluicesync.dev/sluice/cmd/sluice@latest`. GitHub's transfer redirect keeps the old `github.com/orware/sluice` URLs — and existing `go get github.com/orware/sluice@<oldtag>` pins — working; new code should use the vanity path. The prebaked CI test images also moved to `ghcr.io/sluicesync/sluice-*`.
+
+### Added
+
+- **Official multi-arch runtime container image.** `ghcr.io/sluicesync/sluice:0.99.0` + `:latest` (linux/amd64 + linux/arm64) — a distroless image wrapping the static binary (no shell, non-root, tiny). Run sluice as a Kubernetes Deployment (`sync start` behind the `/healthz` / `/readyz` / `/metrics` endpoints, ADR-0069), a CronJob (`backup` / `cutover` / `matview refresh`), or a one-shot CI migration step instead of managing the binary on a host. See [`docs/operator/running-as-a-service.md`](docs/operator/running-as-a-service.md). Published by GoReleaser on each tagged release.
+
+### Dependencies
+
+- Routine Dependabot bumps: aws-sdk-go-v2 group, google.golang.org/api, smithy-go, golang.org/x/crypto.
+
 ## [0.98.1] - 2026-06-02
 
 ### Fixed
