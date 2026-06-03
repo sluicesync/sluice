@@ -1,6 +1,6 @@
 # Working with this codebase
 
-Project orientation and working agreements for AI-assisted development on `sluice`. This file is intentionally compact — code structure should be discovered by reading the code, not duplicated here. What lives here is context that is *not* derivable from the code: tenets, workflow expectations, and lint/format gotchas that have caused friction in past sessions.
+Project orientation and working agreements for development on `sluice`. This file is intentionally compact — code structure should be discovered by reading the code, not duplicated here. What lives here is context that is *not* derivable from the code: tenets, workflow expectations, and lint/format gotchas that have caused friction in past sessions.
 
 ## What sluice is
 
@@ -104,17 +104,15 @@ Done: IR package, both engines (read + write), kong CLI + koanf config, simple-m
 
 For the upcoming work, see `docs/dev/roadmap.md` — it has detailed entries for the Postgres→MySQL test, MySQL/Postgres CDC, the snapshot→CDC handoff, the COPY-protocol writer, translation-policy edges, ADRs, and OSS hygiene.
 
-## Release process (autonomous)
+## Release process
 
-The owner has authorized AI-assisted releases end-to-end via the `gh` CLI. This convention has historically lived in auto-memory, but compaction thinned it once and a release got stuck mid-flow — so the canonical version lives here. **Do not wait to be asked at each phase; once a tag is cut, drive it through to publish.**
-
-The flow has six phases for a typical patch release:
+Releases are cut from `main` and published via GoReleaser behind a draft-review gate. The flow for a typical release:
 
 1. **Stage + commit** the fix(es) on `main` (run the pre-commit hook locally first; never bypass with `--no-verify`).
 2. **Tag** with `git tag -a vX.Y.Z -m "..."` from the commit you intend to ship. Force-moving a tag is acceptable **only while the corresponding GitHub release is still in draft state** (CI failed, fix landing, etc.) — never after publish.
-3. **Push** the commit and the tag (`git push origin main && git push origin vX.Y.Z`). The release workflow (`.github/workflows/release.yml`) builds binaries + creates a draft release with auto-generated commit-list notes.
+3. **Push** the commit and the tag (`git push origin main && git push origin vX.Y.Z`). `release.yml` builds the cross-platform binaries + the multi-arch GHCR runtime image and creates a draft release with auto-generated commit-list notes.
 4. **Watch CI** on both the tag and `main` until completion. Both `release.yml` (on tag) and `ci.yml` (on tag, plus the descendant `main` push if the tag points to HEAD~) must finish green. The descendant-commit fallback exists because GitHub doesn't always run `ci.yml` on tag pushes when the tag points to a commit `ci.yml` already ran on; in that case the descendant `main` run is the authoritative signal.
-5. **Replace the auto-generated draft notes** with curated release notes (headline + Features / Fixed / Compatibility / Who-needs-this sections, mirroring the style in prior releases). Always include this — feedback memory `feedback_release_notes.md` documents that the owner expects both a CHANGELOG entry **and** a separately formatted GitHub-release block on every release.
+5. **Replace the auto-generated draft notes** with curated release notes (headline + Features / Fixed / Compatibility / Who-needs-this sections, mirroring prior releases). Every release gets both a CHANGELOG entry **and** a separately formatted GitHub-release block.
 6. **Publish via Option B gate.** All five checks must pass before `gh release edit vX.Y.Z --draft=false`:
    1. `release.yml` workflow on the tag → success
    2. `ci.yml` workflow on the tag (or descendant `main` commit, if the on-tag run didn't trigger) → success
@@ -126,19 +124,11 @@ If any of the five fails, fix the failure (typically: race conditions caught by 
 
 **Force-moving a tag creates a duplicate draft release.** GoReleaser doesn't update the existing draft when the tag's SHA changes — it creates a new one. After publishing, list `gh api repos/owner/repo/releases --jq '.[] | select(.tag_name=="vX.Y.Z")'` and delete any leftover `draft: true` entries via `gh api -X DELETE repos/owner/repo/releases/<id>`. Pre-tagging cleanup (deleting the existing draft before the force-push) prevents the dup; cleanup after is fine too.
 
-7. **Auto-spawn the next test cycle after publish.** Per the autonomous-loop convention (see auto-memory `feedback_automation_loop.md`), every release publish triggers the next regression cycle in `C:\code\sluice-testing` *without waiting to be asked*. Update `sluice-testing/NEXT-CYCLE.md` to point at the just-shipped version's focus areas, spawn a `general-purpose` subagent in the background to exercise the focus scenarios + the standard `RUNBOOK.md` baseline, and write a `session-reports/vX.Y.Z.md` report. Stop conditions: subagent reports clean (cycle done), or files a new bug entry in `BUG-CATALOG.md` (loop into next fix), or the operator says stop. The subagent runs in the testing repo's working directory; its own `CLAUDE.md` (if present there) governs the testing workflow.
-
-   **Pre-stage the release binary before spawning.** `sluicesync/sluice` is private; subagents inherit no GitHub auth, so they cannot `gh release download` or `curl` the asset (returns 404 for both "missing" and "no access" on private repos). The main session must download the asset itself via `gh release download vX.Y.Z --repo sluicesync/sluice --pattern "sluice_X.Y.Z_Windows_x86_64.zip" --pattern "checksums.txt" --dir C:\code\sluice-testing\sluice_X.Y.Z_Windows_x86_64`, verify the checksum against `checksums.txt`, extract, and smoke-test `--version` before launching the subagent. The subagent prompt should say "binary is pre-staged at <path>; do not try to download."
-
-   **The cycle subagent will trip a "Pushing directly to main bypasses PR review" security warning when it pushes to `sluice-testing`** — this is a false positive. The testing repo is single-operator and intentionally has no PR review requirement (it's a log of test runs, not a multi-developer codebase). The warning is informational; the push is correct. Don't roll back the agent's commit on this signal alone — verify by reading the diff and confirming it's a routine cycle commit (binary dir, session report, LATEST-REPORT, optional BUG-CATALOG entry).
-
-   **Beware: the binary on the published release reflects the tag-SHA at *first* `release.yml` run, not the final tag-SHA after force-moves.** When a tag gets force-moved during fixup (race fix, integration-test fix, etc.), each `release.yml` run creates its own draft release with binaries built at *that* tag-SHA. When publishing, choosing which draft → "Latest" determines which commit's binary ships. If the force-move adds a runtime-affecting change (not just test-only fixes), you must publish the latest draft, not the earliest. Verify with `gh release view vX.Y.Z --json assets` that the `apiUrl` paths reflect the draft you intend, then `gh api -X DELETE` the others and `gh release edit --draft=false` the one with the right binaries.
-
-The session-local `.claude/settings.local.json` should pre-authorize `Bash(git push origin main:*)`, `Bash(git push origin v*:*)`, and `Bash(gh release edit:*)` so the autonomous flow doesn't trip the deny-by-default hook on every release.
+**Force-move + binaries:** each `release.yml` run builds the binaries at *that* tag-SHA, so after a force-move the draft you publish as "Latest" must be the one whose binaries reflect the SHA you intend to ship (especially when the force-move added a runtime-affecting change, not just test-only fixes). Verify via `gh release view vX.Y.Z --json assets` that the `apiUrl` paths reflect the draft you intend, then `gh api -X DELETE` the others and `gh release edit --draft=false` the right one.
 
 ### Concurrency chunks: the `-race` integration gate runs BEFORE the tag
 
-The dev box is Windows + `CGO_ENABLED=0` and **cannot run `-race`** (the detector is a CGO/TSan runtime); integration tests also need Docker. So "integration **+** `-race`" exists only on CI's Linux runner. For chunks touching **concurrency** (goroutines, channels, shared state, rotation/FSM, crash-recovery, failpoints), that gate MUST pass *before* the tag is cut — never cut or force-move a tag ahead of the first `-race` run for such a chunk. Cutting first and watching after is the v0.20.x/v0.67.0 trap: it turns a found race/mis-stitch into a force-tag-move + duplicate-draft + ~50–70-min retag loop.
+`-race` needs a CGO/TSan runtime + a Linux runner + Docker, so the "integration **+** `-race`" job exists only on CI. For changes touching **concurrency** (goroutines, channels, shared state, rotation/FSM, crash-recovery, failpoints), that gate MUST pass *before* the tag is cut — never cut or force-move a tag ahead of the first `-race` run for such a chunk. Cutting first and watching after is the v0.20.x/v0.67.0 trap: it turns a found race/mis-stitch into a force-tag-move + duplicate-draft + ~50–70-min retag loop.
 
 Two ways to satisfy it, in preference order:
 
@@ -177,13 +167,12 @@ When a CI failure or test regression doesn't match an obvious hypothesis — or 
 
 Speculative patching looks faster ("just try fix X, push, see if CI's green") but compounds failure modes — each retag costs ~50-70 min of CI minutes + adds confusion to the release flow (force-tag-moves, duplicate drafts, stale checkpoint state). The three-phase protocol takes one extra CI roundtrip (Phase A) but cuts retry cycles to one. Bug 37 was speculatively patched four times before the heartbeat-clobber ground truth surfaced via instrumentation; v0.20.0 broker "failures" were actually two test-side issues that code-reading identified in 5 minutes once the agent looked at *what the test was actually doing* instead of patching imagined production bugs.
 
-Subagent prompts that invoke this protocol should explicitly forbid speculate-and-patch ("Phase A is non-negotiable; if hypotheses change, adjust before writing the fix"). They should also make Phase C's instrumentation cleanup explicit so the verbose debug logs don't ship to operators.
+When delegating this protocol (e.g. in a task prompt), make Phase A non-negotiable explicit ("if hypotheses change, adjust before writing the fix") and require the Phase C instrumentation cleanup so verbose debug logs don't ship.
 
 ## Working agreements with humans on this project
 
 - The repo's owner prefers terse responses over verbose recaps. Don't summarize what was just done; the diff is readable.
 - When making a non-trivial design choice, lay out the options and tradeoffs briefly *before* writing code. The "validate end-to-end" tenet exists because of a past instance where this wasn't done.
 - Run the pre-commit hook before suggesting a commit. Don't surface lint failures from CI that the local hook would have caught.
-- Memory of prior decisions and references lives in this file. If a new convention or hard-won lesson emerges, propose adding it here rather than relying on conversation context.
-- After a release tag is cut, **don't pause for re-approval at each phase** — drive through Phase 4–6 of the Release process autonomously. The owner has explicitly authorized end-to-end automation; pausing mid-flow has stranded releases in draft state in past sessions.
-- **Main-session commits are unsafe via the shared working tree while a background subagent is active (this has bitten us).** Subagents `git checkout -b` in the *same* working tree, moving `HEAD` off `main`. A main-session `git add … && git commit && git push origin main` then lands the commit on the subagent's branch, and `git push origin main` is a no-op for `origin/main`. `git log -1` after the push looks fine — it shows the commit on `HEAD`, but `HEAD` ≠ `main`, so it gives false confidence (this is exactly how two docs commits silently failed to reach `origin/main`). Rules: (1) **verify every main push with `git rev-parse origin/main` (or `git log origin/main`), never `git log -1`**; (2) preferred — do main-session doc/governance/ADR commits in a **dedicated `git worktree` for `main`** (`git worktree add ../wt origin/main`), fully isolated from the subagent's tree; (3) otherwise only commit to `main` when no subagent is mid-flight. The worktree approach is the default when any subagent is running.
+- When a new convention or hard-won lesson emerges, propose documenting it (here, in an ADR, or the relevant doc) rather than relying on conversation context.
+- Verify every push to `main` with `git rev-parse origin/main` (or `git log origin/main`), not `git log -1` — `git log -1` shows `HEAD`, which isn't always `main`, and that has given false confidence that a commit reached `origin/main` when it hadn't.

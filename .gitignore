@@ -49,6 +49,9 @@ vendor/
 config.local.yaml
 config.local.yml
 
+# Machine-local Claude Code operator/automation runbook (never committed)
+CLAUDE.local.md
+
 # Generated test fixtures and large datasets
 test/perf/data/
 test/integration/dumps/
