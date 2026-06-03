@@ -1,6 +1,15 @@
-# sluice
+<div align="center">
 
-## Open-source enterprise-class CDC for MySQL ↔ Postgres
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="branding/sluice-logo-dark.png">
+  <img alt="sluice" src="branding/sluice-logo.png" width="340">
+</picture>
+
+### Open-source enterprise-class CDC for MySQL&nbsp;↔&nbsp;Postgres
+
+[**Website**](https://sluicesync.com) · [**Documentation**](https://sluicesync.com/docs/) · [**Releases**](https://github.com/sluicesync/sluice/releases/latest)
+
+</div>
 
 Continuous sync between MySQL and Postgres in all four directions, with the schema-evolution, cutover-priming, and slot-health capabilities usually found only in commercial/enterprise CDC tools. Initial snapshot, CDC catch-up, and operator-driven cutover in one tool, opinionated about correctness.
 
