@@ -1,6 +1,6 @@
 # Cutover
 
-The operator-driven moment at the end of a sluice migration: source writes are stopped, the CDC catch-up window has drained, and application traffic is about to switch from the old source to the new target. This page covers `sluice cutover` — the subcommand introduced in [v0.83.0](https://github.com/orware/sluice/releases/tag/v0.83.0) (F10, ADR-0062) — and the procedural shape of cutover as a whole.
+The operator-driven moment at the end of a sluice migration: source writes are stopped, the CDC catch-up window has drained, and application traffic is about to switch from the old source to the new target. This page covers `sluice cutover` — the subcommand introduced in [v0.83.0](https://github.com/sluicesync/sluice/releases/tag/v0.83.0) (F10, ADR-0062) — and the procedural shape of cutover as a whole.
 
 The summary: between the snapshot and the traffic switch, source advances sequences as new rows land. CDC ships those rows to target, but target's *sequence value* still lags source by the catch-up window. Without a priming step, the operator's first post-cutover `INSERT` on target collides with an already-replicated row's PK. Pre-v0.83.0, operators ran `SELECT setval(...)` per table by hand; v0.83.0 makes it one command.
 
@@ -125,7 +125,7 @@ Less load on both endpoints than option 1, but recovery is bulk-replay rather th
 
 ## Cross-references
 
-- [v0.83.0 release notes](https://github.com/orware/sluice/releases/tag/v0.83.0) — F10 ship narrative
+- [v0.83.0 release notes](https://github.com/sluicesync/sluice/releases/tag/v0.83.0) — F10 ship narrative
 - [`docs/adr/adr-0062-cutover-sequence-priming.md`](adr/adr-0062-cutover-sequence-priming.md) — design rationale, idempotency contract, two-phase model
 - [`docs/use-cases.md`](use-cases.md) — concrete scenarios where cutover lands in the operator workflow
 - [`docs/architecture.md`](architecture.md) — the IR + engine pattern that makes cross-engine cutover work

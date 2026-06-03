@@ -50,7 +50,7 @@ ADR-0054 closes the deferred Phase 2 surface from ADR-0048 §4. All five decisio
 
 ## Cross-references
 
-- [ADR-0054 — Shape A Phase 2: live cross-shard DDL coordination](https://github.com/orware/sluice/blob/main/docs/adr/adr-0054-shape-a-phase-2-live-cross-shard-ddl-coordination.md) — full design with DP-A through DP-E resolutions
-- [ADR-0048 — Multi-source aggregation Shape A](https://github.com/orware/sluice/blob/main/docs/adr/adr-0048-multi-source-aggregation-shape-a.md) §4 — the deferred Phase 2 sketch this ADR fills in
-- [ADR-0030 — Mid-stream live add-table](https://github.com/orware/sluice/blob/main/docs/adr/adr-0030-mid-stream-live-add-table.md) — Strategy A drained-model precedent; v1 alternative now preserved behind `--no-coordinate-live-ddl`
-- [ADR-0052 — AIMD apply-batch-size controller](https://github.com/orware/sluice/blob/main/docs/adr/adr-0052-aimd-apply-batch-size-controller.md) — the opt-out-by-default pattern this release follows
+- [ADR-0054 — Shape A Phase 2: live cross-shard DDL coordination](https://github.com/sluicesync/sluice/blob/main/docs/adr/adr-0054-shape-a-phase-2-live-cross-shard-ddl-coordination.md) — full design with DP-A through DP-E resolutions
+- [ADR-0048 — Multi-source aggregation Shape A](https://github.com/sluicesync/sluice/blob/main/docs/adr/adr-0048-multi-source-aggregation-shape-a.md) §4 — the deferred Phase 2 sketch this ADR fills in
+- [ADR-0030 — Mid-stream live add-table](https://github.com/sluicesync/sluice/blob/main/docs/adr/adr-0030-mid-stream-live-add-table.md) — Strategy A drained-model precedent; v1 alternative now preserved behind `--no-coordinate-live-ddl`
+- [ADR-0052 — AIMD apply-batch-size controller](https://github.com/sluicesync/sluice/blob/main/docs/adr/adr-0052-aimd-apply-batch-size-controller.md) — the opt-out-by-default pattern this release follows

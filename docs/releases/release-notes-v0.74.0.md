@@ -46,8 +46,8 @@ End-to-end pins added on both severity-a closures so they can't regress silently
 
 ## Cross-references
 
-- [ADR-0007 — Position persistence](https://github.com/orware/sluice/blob/main/docs/adr/adr-0007-position-persistence.md) — amended with F7 durability-hardening section
-- [ADR-0022 — Slot-missing fall-through](https://github.com/orware/sluice/blob/main/docs/adr/adr-0022-slot-missing-fall-through.md) — F9 cross-reference paragraph
-- [ADR-0051 — PG CDC source-identity pinning](https://github.com/orware/sluice/blob/main/docs/adr/adr-0051-pg-cdc-source-identity-pinning.md) — new ADR for F5
-- [ADR-0054 — Shape A Phase 2: live cross-shard DDL coordination](https://github.com/orware/sluice/blob/main/docs/adr/adr-0054-shape-a-phase-2-live-cross-shard-ddl-coordination.md) — F8 cross-reference section
+- [ADR-0007 — Position persistence](https://github.com/sluicesync/sluice/blob/main/docs/adr/adr-0007-position-persistence.md) — amended with F7 durability-hardening section
+- [ADR-0022 — Slot-missing fall-through](https://github.com/sluicesync/sluice/blob/main/docs/adr/adr-0022-slot-missing-fall-through.md) — F9 cross-reference paragraph
+- [ADR-0051 — PG CDC source-identity pinning](https://github.com/sluicesync/sluice/blob/main/docs/adr/adr-0051-pg-cdc-source-identity-pinning.md) — new ADR for F5
+- [ADR-0054 — Shape A Phase 2: live cross-shard DDL coordination](https://github.com/sluicesync/sluice/blob/main/docs/adr/adr-0054-shape-a-phase-2-live-cross-shard-ddl-coordination.md) — F8 cross-reference section
 - The Internals of PostgreSQL (https://www.interdb.jp/pg/) Ch 9.4, 9.5, 10.3, 10.4, 11.1, 11.2, 11.4

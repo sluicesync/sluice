@@ -130,7 +130,7 @@ spec:
           restartPolicy: OnFailure
           containers:
           - name: sluice
-            image: ghcr.io/orware/sluice:latest
+            image: ghcr.io/sluicesync/sluice:latest
             env:
             - name: SLUICE_TARGET
               valueFrom:

@@ -47,7 +47,7 @@ import (
 // Mirrors startPostgresWithTrgm's shape, generalised on the extension
 // name. The duplication kept tight rather than DRY'd because the
 // pgvector helper boots a different image (task #70 pre-baked
-// ghcr.io/orware/sluice-pgvector:0.7.4-pg16-prebaked) and merging the
+// ghcr.io/sluicesync/sluice-pgvector:0.7.4-pg16-prebaked) and merging the
 // three would obscure the per-extension provisioning.
 func startPostgresWithExtension(t *testing.T, extensionName string, enableOnTarget bool) (sourceDSN, targetDSN string, cleanup func()) {
 	t.Helper()

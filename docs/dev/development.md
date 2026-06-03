@@ -82,7 +82,7 @@ If Docker isn't available, the tests skip cleanly via `testcontainers.SkipIfProv
 
 ### Pre-baked CI images
 
-In CI, the MySQL and Postgres containers boot from pre-baked images on GHCR (`ghcr.io/orware/sluice-mysql:8.0-prebaked`, `ghcr.io/orware/sluice-postgres:16-prebaked`, `ghcr.io/orware/sluice-postgis:16-3.4-prebaked`) rather than the upstream Docker Hub tags. The bake step runs `mysqld --initialize-insecure` / `initdb` once and `docker commit`s the result, so containers cold-start in ~5 s instead of 30-60 s (or 2-3 minutes under self-hosted runner disk-I/O contention). See [docs/dev/ci-images.md](ci-images.md) for the full story, the weekly rebuild cron, and how to bump the base version.
+In CI, the MySQL and Postgres containers boot from pre-baked images on GHCR (`ghcr.io/sluicesync/sluice-mysql:8.0-prebaked`, `ghcr.io/sluicesync/sluice-postgres:16-prebaked`, `ghcr.io/sluicesync/sluice-postgis:16-3.4-prebaked`) rather than the upstream Docker Hub tags. The bake step runs `mysqld --initialize-insecure` / `initdb` once and `docker commit`s the result, so containers cold-start in ~5 s instead of 30-60 s (or 2-3 minutes under self-hosted runner disk-I/O contention). See [docs/dev/ci-images.md](ci-images.md) for the full story, the weekly rebuild cron, and how to bump the base version.
 
 Local `make test-it` uses upstream images by default — the pre-baked optimization addresses concurrent-boot contention that doesn't typically happen on a developer's box.
 

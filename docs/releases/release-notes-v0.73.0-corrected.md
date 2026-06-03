@@ -1,6 +1,6 @@
 # sluice v0.73.0 — Shape A Phase 2: live cross-shard DDL coordination
 
-> **⚠️ Post-release correction (2026-05-22) — Bug 83: headline feature non-functional on this release. FIXED in [v0.73.1](https://github.com/orware/sluice/releases/tag/v0.73.1) (MySQL) + [v0.73.2](https://github.com/orware/sluice/releases/tag/v0.73.2) (PG). Upgrade to v0.73.2 strongly recommended — Bug 84 (PG cold-start seed CDC-projection mismatch) was a follow-on that v0.73.1's PG happy path also missed.**
+> **⚠️ Post-release correction (2026-05-22) — Bug 83: headline feature non-functional on this release. FIXED in [v0.73.1](https://github.com/sluicesync/sluice/releases/tag/v0.73.1) (MySQL) + [v0.73.2](https://github.com/sluicesync/sluice/releases/tag/v0.73.2) (PG). Upgrade to v0.73.2 strongly recommended — Bug 84 (PG cold-start seed CDC-projection mismatch) was a follow-on that v0.73.1's PG happy path also missed.**
 >
 > Within hours of publish, the autonomous regression cycle caught a critical regression: the ADR-0054 lease + classifier + intercept consumer side landed without correct seeding from the cold-start handoff. As a result, the intercept treated the first CDC `SchemaSnapshot` as a cold-start anchor regardless of whether source DDL had happened since cold-start — so the lease state machine never engaged on the first DDL boundary and the next CDC row event crashed the applier with `column "<new>" does not exist` (PG) / `Unknown column '<new>'` (MySQL).
 >
@@ -10,7 +10,7 @@
 >
 > **What's NOT affected:** non-Shape-A streams (`migrate` paths, plain `sync start` without `--inject-shard-column`) are entirely unaffected — the RUNBOOK 4-direction baseline is green on this binary. Loud-failure tenet was satisfied: sluice halted on the first DDL-mismatched row; no silent data loss observed.
 >
-> Bug 83 details: cycle session report at [orware/sluice-testing/session-reports/v0.73.0.md](https://github.com/orware/sluice-testing/blob/main/session-reports/v0.73.0.md); fix details in the [v0.73.1 release notes](https://github.com/orware/sluice/releases/tag/v0.73.1).
+> Bug 83 details: cycle session report at [sluicesync/sluice-testing/session-reports/v0.73.0.md](https://github.com/sluicesync/sluice-testing/blob/main/session-reports/v0.73.0.md); fix details in the [v0.73.1 release notes](https://github.com/sluicesync/sluice/releases/tag/v0.73.1).
 
 ---
 
@@ -66,7 +66,7 @@ ADR-0054 closes the deferred Phase 2 surface from ADR-0048 §4. All five decisio
 
 ## Cross-references
 
-- [ADR-0054 — Shape A Phase 2: live cross-shard DDL coordination](https://github.com/orware/sluice/blob/main/docs/adr/adr-0054-shape-a-phase-2-live-cross-shard-ddl-coordination.md) — full design with DP-A through DP-E resolutions
-- [ADR-0048 — Multi-source aggregation Shape A](https://github.com/orware/sluice/blob/main/docs/adr/adr-0048-multi-source-aggregation-shape-a.md) §4 — the deferred Phase 2 sketch this ADR fills in
-- [ADR-0030 — Mid-stream live add-table](https://github.com/orware/sluice/blob/main/docs/adr/adr-0030-mid-stream-live-add-table.md) — Strategy A drained-model precedent; v1 alternative now preserved behind `--no-coordinate-live-ddl`
-- [ADR-0052 — AIMD apply-batch-size controller](https://github.com/orware/sluice/blob/main/docs/adr/adr-0052-aimd-apply-batch-size-controller.md) — the opt-out-by-default pattern this release follows
+- [ADR-0054 — Shape A Phase 2: live cross-shard DDL coordination](https://github.com/sluicesync/sluice/blob/main/docs/adr/adr-0054-shape-a-phase-2-live-cross-shard-ddl-coordination.md) — full design with DP-A through DP-E resolutions
+- [ADR-0048 — Multi-source aggregation Shape A](https://github.com/sluicesync/sluice/blob/main/docs/adr/adr-0048-multi-source-aggregation-shape-a.md) §4 — the deferred Phase 2 sketch this ADR fills in
+- [ADR-0030 — Mid-stream live add-table](https://github.com/sluicesync/sluice/blob/main/docs/adr/adr-0030-mid-stream-live-add-table.md) — Strategy A drained-model precedent; v1 alternative now preserved behind `--no-coordinate-live-ddl`
+- [ADR-0052 — AIMD apply-batch-size controller](https://github.com/sluicesync/sluice/blob/main/docs/adr/adr-0052-aimd-apply-batch-size-controller.md) — the opt-out-by-default pattern this release follows

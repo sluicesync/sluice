@@ -31,7 +31,7 @@ import (
 // databases (source_db, warehouse, sluice_shared_seed) already
 // created. Cold-start drops from 30-60s (under CI disk-I/O
 // contention, up to 2-3 min) to ~5s. See docs/dev/ci-images.md.
-const pgPrebakedImage = "ghcr.io/orware/sluice-postgres:16-prebaked"
+const pgPrebakedImage = "ghcr.io/sluicesync/sluice-postgres:16-prebaked"
 
 // pgPrebakedBootTimeout is the per-attempt budget passed to the
 // wait-strategy override below. Generous because the pre-baked

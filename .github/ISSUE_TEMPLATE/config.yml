@@ -8,5 +8,5 @@ blank_issues_enabled: false
 # set the URL when GitHub Discussions is enabled on the repo.
 # contact_links:
 #   - name: Question or discussion
-#     url: https://github.com/orware/sluice/discussions
+#     url: https://github.com/sluicesync/sluice/discussions
 #     about: Use Discussions for open-ended questions and design conversations.

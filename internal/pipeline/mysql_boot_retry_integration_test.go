@@ -85,7 +85,7 @@ const (
 	// internal/engines/mysql/shared_container_integration_test.go's
 	// sharedMySQLImage doc comment for the full rationale; this
 	// constant is the pipeline-package counterpart.
-	mysqlBootImage = "ghcr.io/orware/sluice-mysql:8.0-prebaked"
+	mysqlBootImage = "ghcr.io/sluicesync/sluice-mysql:8.0-prebaked"
 )
 
 // mysqlBootBackoff returns the sleep duration between a failed boot

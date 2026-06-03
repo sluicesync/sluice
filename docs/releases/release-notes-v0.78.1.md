@@ -45,7 +45,7 @@ The same cycle that produced v0.78.0 would have caught both with a six-cell type
 
 ## Cross-references
 
-- [v0.78.0 release notes](https://github.com/orware/sluice/releases/tag/v0.78.0) — the prior release whose RENAME shape this hotfix completes
-- [v0.73.2 release notes](https://github.com/orware/sluice/releases/tag/v0.73.2) — the Bug 84 hotfix that introduced `NormalizeForCDCComparison`; v0.78.1 extends the same surface
-- [ADR-0054 — Shape A Phase 2: live cross-shard DDL coordination](https://github.com/orware/sluice/blob/main/docs/adr/adr-0054-shape-a-phase-2-live-cross-shard-ddl-coordination.md)
+- [v0.78.0 release notes](https://github.com/sluicesync/sluice/releases/tag/v0.78.0) — the prior release whose RENAME shape this hotfix completes
+- [v0.73.2 release notes](https://github.com/sluicesync/sluice/releases/tag/v0.73.2) — the Bug 84 hotfix that introduced `NormalizeForCDCComparison`; v0.78.1 extends the same surface
+- [ADR-0054 — Shape A Phase 2: live cross-shard DDL coordination](https://github.com/sluicesync/sluice/blob/main/docs/adr/adr-0054-shape-a-phase-2-live-cross-shard-ddl-coordination.md)
 - Bug 74 lesson: see `CLAUDE.md` § *Pin the class, not the representative*

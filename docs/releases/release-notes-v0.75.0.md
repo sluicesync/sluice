@@ -48,11 +48,11 @@ Privacy-level pins applying the Bug 74 "pin the class" discipline (separate test
 
 ## Public-release readiness
 
-With v0.75.0 the [2026-05-22 public-release audit](https://github.com/orware/sluice)'s gating items are all closed. The repo is structurally ready for the private→public flip. The v0.74.x → v0.75.0 chain covers: the entire 2026-05-22 PG-internals research backlog (F1–F9), the post-public-release prep cluster (#17 / #18 / #19), and the v0.73.0 → v0.73.2 hotfix chain that closed the ADR-0054 Shape A Phase 2 misship + its follow-on bugs.
+With v0.75.0 the [2026-05-22 public-release audit](https://github.com/sluicesync/sluice)'s gating items are all closed. The repo is structurally ready for the private→public flip. The v0.74.x → v0.75.0 chain covers: the entire 2026-05-22 PG-internals research backlog (F1–F9), the post-public-release prep cluster (#17 / #18 / #19), and the v0.73.0 → v0.73.2 hotfix chain that closed the ADR-0054 Shape A Phase 2 misship + its follow-on bugs.
 
 ## Cross-references
 
-- [ADR-0056 — sluice diagnose operator-bundle](https://github.com/orware/sluice/blob/main/docs/adr/adr-0056-sluice-diagnose-operator-bundle.md) *(new)*
-- [ADR-0049 — CDC schema history](https://github.com/orware/sluice/blob/main/docs/adr/adr-0049-cdc-schema-history.md)
-- [ADR-0054 — Shape A Phase 2 live cross-shard DDL coordination](https://github.com/orware/sluice/blob/main/docs/adr/adr-0054-shape-a-phase-2-live-cross-shard-ddl-coordination.md)
+- [ADR-0056 — sluice diagnose operator-bundle](https://github.com/sluicesync/sluice/blob/main/docs/adr/adr-0056-sluice-diagnose-operator-bundle.md) *(new)*
+- [ADR-0049 — CDC schema history](https://github.com/sluicesync/sluice/blob/main/docs/adr/adr-0049-cdc-schema-history.md)
+- [ADR-0054 — Shape A Phase 2 live cross-shard DDL coordination](https://github.com/sluicesync/sluice/blob/main/docs/adr/adr-0054-shape-a-phase-2-live-cross-shard-ddl-coordination.md)
 - Prior art: `cockroach debug zip` from CockroachDB

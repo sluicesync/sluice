@@ -79,12 +79,12 @@ These are gitignored upstream; the `chmod 600` is defence-in-depth on the single
 
 ### Step 4 — Replicate the testing-repo skeleton
 
-The `sluice-testing` git repo can stay as the artifact-of-record on operator's workstation. On the Vultr box, set up a parallel structure that writes the same files (cycle reports, BUG-CATALOG entries, supervisor logs) but commits/pushes back to the same `orware/sluice-testing` repo from the box.
+The `sluice-testing` git repo can stay as the artifact-of-record on operator's workstation. On the Vultr box, set up a parallel structure that writes the same files (cycle reports, BUG-CATALOG entries, supervisor logs) but commits/pushes back to the same `sluicesync/sluice-testing` repo from the box.
 
 ```bash
 ssh root@<previous-vultr-IP> 'mkdir -p /root/sluice-validation && cd /root/sluice-validation'
 # Clone the artifact-of-record repo (needs the operator's GitHub auth or a deploy key)
-ssh root@<previous-vultr-IP> 'cd /root/sluice-validation && git clone git@github.com:orware/sluice-testing.git'
+ssh root@<previous-vultr-IP> 'cd /root/sluice-validation && git clone git@github.com:sluicesync/sluice-testing.git'
 ```
 
 Plus operator-side `scp` of any custom supervisor scripts:
@@ -97,7 +97,7 @@ scp C:\code\sluice-testing\work\supervisor_*.sh root@<previous-vultr-IP>:/root/s
 
 Once the box is set up, the cycle subagent runs **on the Vultr box via SSH-from-this-session**. Pattern:
 
-- Agent in dev session spawns a `general-purpose` subagent with prompt: "SSH to root@<previous-vultr-IP>; run the v0.48.0 cycle per `/root/sluice-validation/sluice-testing/NEXT-CYCLE.md`; write `session-reports/v0.48.0.md` on the box; `git push` to `orware/sluice-testing`; report verdict (CLEAN / BUG_FOUND) back."
+- Agent in dev session spawns a `general-purpose` subagent with prompt: "SSH to root@<previous-vultr-IP>; run the v0.48.0 cycle per `/root/sluice-validation/sluice-testing/NEXT-CYCLE.md`; write `session-reports/v0.48.0.md` on the box; `git push` to `sluicesync/sluice-testing`; report verdict (CLEAN / BUG_FOUND) back."
 - Subagent operates entirely over SSH; no local tooling needed in the dev-session workspace.
 - Cycle artifacts (binary dir, session report, BUG-CATALOG additions, supervisor logs) live on the box AND get committed to `sluice-testing` repo → operator can review on workstation either way.
 
@@ -117,5 +117,5 @@ Vultr LAX → PlanetScale us-east cross-region latency is different from operato
 
 - Provisioning + standing config: [`release-validation-on-vultr.md`](release-validation-on-vultr.md)
 - Vultr CLI: `C:\vultr-cli\vultr-cli.exe`, config `C:\vultr-cli\vultr-cli.yaml`
-- Testing-repo conventions (NEXT-CYCLE.md, RUNBOOK.md, BUG-CATALOG.md, session-reports/): operator's workstation at `C:\code\sluice-testing\`, plus `orware/sluice-testing` repo on GitHub
+- Testing-repo conventions (NEXT-CYCLE.md, RUNBOOK.md, BUG-CATALOG.md, session-reports/): operator's workstation at `C:\code\sluice-testing\`, plus `sluicesync/sluice-testing` repo on GitHub
 - Auto-memory pointer: `reference_vultr_continuous_validation.md`

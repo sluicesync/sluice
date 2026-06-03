@@ -81,9 +81,9 @@ Also in this release: a curated docs+marketing bundle (`docs/use-cases.md`, `doc
 
 ## Cross-references
 
-- [ADR-0063 — PG Row-Level Security IR capture + emit](https://github.com/orware/sluice/blob/main/docs/adr/adr-0063-pg-rls-ir-capture-and-emit.md)
-- [docs/use-cases.md — operator scenarios](https://github.com/orware/sluice/blob/main/docs/use-cases.md)
-- [docs/cutover.md — `sluice cutover` operator guide](https://github.com/orware/sluice/blob/main/docs/cutover.md)
-- [docs/comparison.md — per-row deep dive vs. alternatives](https://github.com/orware/sluice/blob/main/docs/comparison.md)
+- [ADR-0063 — PG Row-Level Security IR capture + emit](https://github.com/sluicesync/sluice/blob/main/docs/adr/adr-0063-pg-rls-ir-capture-and-emit.md)
+- [docs/use-cases.md — operator scenarios](https://github.com/sluicesync/sluice/blob/main/docs/use-cases.md)
+- [docs/cutover.md — `sluice cutover` operator guide](https://github.com/sluicesync/sluice/blob/main/docs/cutover.md)
+- [docs/comparison.md — per-row deep dive vs. alternatives](https://github.com/sluicesync/sluice/blob/main/docs/comparison.md)
 - [PlanetScale RLS blog](https://planetscale.com/blog/rls-sounds-great-until-it-isnt) — motivation
 - Task #52 description in the project backlog — full enumeration of the 5 RLS failure modes; sub-deliverables 2 + 3 in this release close failure mode 3

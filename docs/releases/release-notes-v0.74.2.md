@@ -34,8 +34,8 @@ Both findings come from the 2026-05-22 PG-internals research (`sluice-pg-interna
 
 ## Cross-references
 
-- [ADR-0055 — pgoutput streaming-protocol audit](https://github.com/orware/sluice/blob/main/docs/adr/adr-0055-pgoutput-streaming-protocol-audit.md) *(new)*
-- [ADR-0027 — Source-transaction-boundary CDC batching](https://github.com/orware/sluice/blob/main/docs/adr/adr-0027-source-transaction-boundary-cdc-batching.md)
-- [ADR-0007 — Position persistence](https://github.com/orware/sluice/blob/main/docs/adr/adr-0007-position-persistence.md)
-- [ADR-0020 — Slot ack after apply](https://github.com/orware/sluice/blob/main/docs/adr/adr-0020-slot-ack-after-apply.md)
+- [ADR-0055 — pgoutput streaming-protocol audit](https://github.com/sluicesync/sluice/blob/main/docs/adr/adr-0055-pgoutput-streaming-protocol-audit.md) *(new)*
+- [ADR-0027 — Source-transaction-boundary CDC batching](https://github.com/sluicesync/sluice/blob/main/docs/adr/adr-0027-source-transaction-boundary-cdc-batching.md)
+- [ADR-0007 — Position persistence](https://github.com/sluicesync/sluice/blob/main/docs/adr/adr-0007-position-persistence.md)
+- [ADR-0020 — Slot ack after apply](https://github.com/sluicesync/sluice/blob/main/docs/adr/adr-0020-slot-ack-after-apply.md)
 - Durable research artifact: `sluice-pg-internals-research-2026-05-22.md` (Ch 12)

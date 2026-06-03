@@ -56,6 +56,6 @@ This release is a clean example of the loud-failure tenet from CLAUDE.md: when a
 ## Cross-references
 
 - [PlanetScale: "RLS sounds great until it isn't"](https://planetscale.com/blog/rls-sounds-great-until-it-isnt) — the operator-pain blog that triggered this task
-- [v0.78.3 release notes](https://github.com/orware/sluice/releases/tag/v0.78.3) — Bug 88 hotfix (the prior release)
+- [v0.78.3 release notes](https://github.com/sluicesync/sluice/releases/tag/v0.78.3) — Bug 88 hotfix (the prior release)
 - Task #52 (PG RLS handling, full scope) — three sub-deliverables; this is sub-deliverable 1
 - CLAUDE.md § *Tenets* (loud-failure) — this release's design rationale

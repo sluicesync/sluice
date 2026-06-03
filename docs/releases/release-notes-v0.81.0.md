@@ -60,6 +60,6 @@
 
 ## Cross-references
 
-- [ADR-0060 — CDC apply-side schema-drift diff](https://github.com/orware/sluice/blob/main/docs/adr/adr-0060-cdc-schema-drift-diff.md)
-- [ADR-0058 — Online schema-change forwarding](https://github.com/orware/sluice/blob/main/docs/adr/adr-0058-online-schema-change-forwarding.md) — the "do it automatically when opted-in" sibling; F11 is the "tell operator loudly" half
+- [ADR-0060 — CDC apply-side schema-drift diff](https://github.com/sluicesync/sluice/blob/main/docs/adr/adr-0060-cdc-schema-drift-diff.md)
+- [ADR-0058 — Online schema-change forwarding](https://github.com/sluicesync/sluice/blob/main/docs/adr/adr-0058-online-schema-change-forwarding.md) — the "do it automatically when opted-in" sibling; F11 is the "tell operator loudly" half
 - Bug 74 lesson: see `CLAUDE.md` § *Pin the class, not the representative* — 19 unit tests + per-category integration coverage follow this discipline

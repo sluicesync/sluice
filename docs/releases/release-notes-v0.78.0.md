@@ -44,6 +44,6 @@
 
 ## Cross-references
 
-- [ADR-0054 — Shape A Phase 2: live cross-shard DDL coordination](https://github.com/orware/sluice/blob/main/docs/adr/adr-0054-shape-a-phase-2-live-cross-shard-ddl-coordination.md) *(v0.78.0 closure update appended)*
-- [v0.77.1 release notes](https://github.com/orware/sluice/releases/tag/v0.77.1) — prior release; this builds on the Bug 85.b wire-up correction
-- [#22 catalog expansion](https://github.com/orware/sluice) — RENAME shipped; CHECK + generated-column remain
+- [ADR-0054 — Shape A Phase 2: live cross-shard DDL coordination](https://github.com/sluicesync/sluice/blob/main/docs/adr/adr-0054-shape-a-phase-2-live-cross-shard-ddl-coordination.md) *(v0.78.0 closure update appended)*
+- [v0.77.1 release notes](https://github.com/sluicesync/sluice/releases/tag/v0.77.1) — prior release; this builds on the Bug 85.b wire-up correction
+- [#22 catalog expansion](https://github.com/sluicesync/sluice) — RENAME shipped; CHECK + generated-column remain

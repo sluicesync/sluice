@@ -58,7 +58,7 @@ This is the second feature release in the v0.79.x → v0.80.x arc closing severi
 
 ## Cross-references
 
-- [ADR-0059 — Pre-emptive PG slot-health pre-warning](https://github.com/orware/sluice/blob/main/docs/adr/adr-0059-pg-slot-health-prewarning.md)
-- [F2 spill-bytes surfacing (v0.74.0)](https://github.com/orware/sluice/releases/tag/v0.74.0) — the foundation this release builds on
-- [Reddit research F13 catalogue entry](https://github.com/orware/sluice/blob/main/docs/research/) — operator-pain source
+- [ADR-0059 — Pre-emptive PG slot-health pre-warning](https://github.com/sluicesync/sluice/blob/main/docs/adr/adr-0059-pg-slot-health-prewarning.md)
+- [F2 spill-bytes surfacing (v0.74.0)](https://github.com/sluicesync/sluice/releases/tag/v0.74.0) — the foundation this release builds on
+- [Reddit research F13 catalogue entry](https://github.com/sluicesync/sluice/blob/main/docs/research/) — operator-pain source
 - Bug 74 lesson: see `CLAUDE.md` § *Pin the class, not the representative* — the 18-unit-test class matrix follows this discipline

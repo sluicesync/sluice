@@ -40,7 +40,7 @@ import (
 // shared libraries are present the same way they are in upstream;
 // CREATE EXTENSION vector still flips the per-database bit at test
 // time. See docs/dev/ci-images.md.
-const pgVectorImage = "ghcr.io/orware/sluice-pgvector:0.7.4-pg16-prebaked"
+const pgVectorImage = "ghcr.io/sluicesync/sluice-pgvector:0.7.4-pg16-prebaked"
 
 // startPostgresWithPGVector boots a pgvector-enabled PG container,
 // creates the source and target databases, and runs CREATE

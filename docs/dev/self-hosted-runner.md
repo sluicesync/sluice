@@ -2,13 +2,13 @@
 
 Runbook for standing up a **second Windows box** as (a) a full-parity
 sluice working machine and (b) a self-hosted GitHub Actions runner pair
-for `orware/sluice`. Pair with the `runs-on` selector in
+for `sluicesync/sluice`. Pair with the `runs-on` selector in
 `.github/workflows/ci.yml` (repo variables `CI_LINUX_RUNNER` /
 `CI_WINDOWS_RUNNER`).
 
 ## Why this topology (ground-truthed, not theorized)
 
-May usage on `orware/sluice`: **492 `ci.yml` + 166 `release.yml` runs
+May usage on `sluicesync/sluice`: **492 `ci.yml` + 166 `release.yml` runs
 in 17 days** (battle-test campaign — volume is largely transient).
 Per `ci.yml` run ≈ 96 billed-minutes. Per-OS reality, confirmed from
 run-job timing:
@@ -32,7 +32,7 @@ its minor tag-only cost, and it is not the driver.
 Networking: GitHub Actions self-hosted runners are **outbound-only**
 (the agent long-polls GitHub over HTTPS/443; GitHub never dials in).
 **No public IP, no inbound port-forward, no DDNS.** NAT/home-LAN is the
-supported topology. `orware/sluice` being **private** neutralizes the
+supported topology. `sluicesync/sluice` being **private** neutralizes the
 major self-hosted risk (untrusted-PR code execution) — acceptable.
 
 ## The remote-automation reality (read before starting)
@@ -94,9 +94,9 @@ Then, hands-on on the target:
 3. **Repos + secrets** (mirror the primary layout under `C:\Code\` and
    `C:\code\`):
    ```powershell
-   git clone https://github.com/orware/sluice C:\Code\sluice
-   git clone https://github.com/orware/sluice-testing C:\code\sluice-testing
-   git clone https://github.com/orware/sluice-validation C:\code\sluice-validation
+   git clone https://github.com/sluicesync/sluice C:\Code\sluice
+   git clone https://github.com/sluicesync/sluice-testing C:\code\sluice-testing
+   git clone https://github.com/sluicesync/sluice-validation C:\code\sluice-validation
    cd C:\Code\sluice; git config core.hooksPath .githooks
    ```
    Copy `PLANETSCALE_CREDENTIALS.env` (+ `PLANETSCALE_SERVICE_TOKEN.env`)
@@ -163,7 +163,7 @@ for those jobs):
 mkdir C:\actions-runner; cd C:\actions-runner
 Invoke-WebRequest -Uri https://github.com/actions/runner/releases/latest/download/actions-runner-win-x64.zip -OutFile r.zip
 Expand-Archive r.zip -DestinationPath . ; del r.zip
-.\config.cmd --url https://github.com/orware/sluice --token <TOKEN> `
+.\config.cmd --url https://github.com/sluicesync/sluice --token <TOKEN> `
   --name sluice-win-host --labels sluice-win --unattended --replace --runasservice
 ```
 
@@ -173,22 +173,22 @@ From the **primary box** (already `gh`-authed). Tokens expire in ~1 h —
 mint immediately before each `config` run:
 
 ```bash
-gh api -X POST repos/orware/sluice/actions/runners/registration-token --jq .token
+gh api -X POST repos/sluicesync/sluice/actions/runners/registration-token --jq .token
 ```
 
 Activate the selector (only after both runners show **Idle** in repo
 Settings → Actions → Runners):
 
 ```bash
-gh variable set CI_LINUX_RUNNER   --repo orware/sluice --body sluice-linux
-gh variable set CI_WINDOWS_RUNNER --repo orware/sluice --body sluice-win
+gh variable set CI_LINUX_RUNNER   --repo sluicesync/sluice --body sluice-linux
+gh variable set CI_WINDOWS_RUNNER --repo sluicesync/sluice --body sluice-win
 # Integration is slower on the self-hosted box: the cross-engine +
 # fuzz + CDC -race suite needs ~39m there vs <35m on GitHub-hosted,
 # so the default 35m inner / 45m outer budget times out. Give it a
 # larger envelope (defaults stay 35m/45m when these are unset, so the
 # hosted fail-back keeps fast feedback). INVARIANT: inner < outer.
-gh variable set CI_INTEGRATION_TIMEOUT     --repo orware/sluice --body 75m   # inner (go test -timeout)
-gh variable set CI_INTEGRATION_JOB_TIMEOUT --repo orware/sluice --body 90    # outer (job timeout-minutes)
+gh variable set CI_INTEGRATION_TIMEOUT     --repo sluicesync/sluice --body 75m   # inner (go test -timeout)
+gh variable set CI_INTEGRATION_JOB_TIMEOUT --repo sluicesync/sluice --body 90    # outer (job timeout-minutes)
 ```
 
 Set all four together when activating the self-hosted fleet. The
@@ -199,13 +199,13 @@ Observed: 75m budget, ~39m actual — comfortable ~2x headroom.
 **Fail-back (a runner is down / box rebooting / over-quota):**
 
 ```bash
-gh variable delete CI_LINUX_RUNNER   --repo orware/sluice   # → ubuntu-latest
-gh variable delete CI_WINDOWS_RUNNER --repo orware/sluice   # → windows-latest
+gh variable delete CI_LINUX_RUNNER   --repo sluicesync/sluice   # → ubuntu-latest
+gh variable delete CI_WINDOWS_RUNNER --repo sluicesync/sluice   # → windows-latest
 # Also clear the integration-timeout vars: they are read regardless of
 # runner, so leaving them at 75m/90m would saddle the hosted fail-back
 # with the slow budget (loses fast feedback / regression sensitivity).
-gh variable delete CI_INTEGRATION_TIMEOUT     --repo orware/sluice  # → 35m default
-gh variable delete CI_INTEGRATION_JOB_TIMEOUT --repo orware/sluice  # → 45 default
+gh variable delete CI_INTEGRATION_TIMEOUT     --repo sluicesync/sluice  # → 35m default
+gh variable delete CI_INTEGRATION_JOB_TIMEOUT --repo sluicesync/sluice  # → 45 default
 ```
 
 This is the manual fail-over lever — GitHub does **not** auto-fail-over

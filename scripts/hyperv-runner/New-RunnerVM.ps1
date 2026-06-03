@@ -28,7 +28,7 @@ param(
     [Parameter(Mandatory)] [string] $Name,
     [Parameter(Mandatory)] [string] $AdminSshPublicKey,
     [string]  $AdminUser   = 'runner',
-    [Parameter(ParameterSetName = 'Repo')] [string] $Repo = 'orware/sluice',
+    [Parameter(ParameterSetName = 'Repo')] [string] $Repo = 'sluicesync/sluice',
     [Parameter(ParameterSetName = 'Org', Mandatory)] [string] $Org,
     [string]  $RunnerLabels= 'sluice-linux',
     [int]     $DiskGB      = 120,

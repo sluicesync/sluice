@@ -67,6 +67,6 @@
 
 ## Cross-references
 
-- [ADR-0062 — Cutover sequence priming](https://github.com/orware/sluice/blob/main/docs/adr/adr-0062-cutover-sequence-priming.md)
-- [Reddit research F10 catalogue entry](https://github.com/orware/sluice/blob/main/docs/research/) — operator-pain source
+- [ADR-0062 — Cutover sequence priming](https://github.com/sluicesync/sluice/blob/main/docs/adr/adr-0062-cutover-sequence-priming.md)
+- [Reddit research F10 catalogue entry](https://github.com/sluicesync/sluice/blob/main/docs/research/) — operator-pain source
 - Bug 74 lesson: see `CLAUDE.md` § *Pin the class, not the representative* — the 11-unit-test matrix follows this discipline

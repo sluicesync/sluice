@@ -53,7 +53,7 @@ For release-tag protection (so an accidental tag delete doesn't drop a release):
 If you prefer code over clicks, the same rules can be applied with `gh api`. Example for the basic ruleset:
 
 ```bash
-gh api -X PUT repos/orware/sluice/branches/main/protection \
+gh api -X PUT repos/sluicesync/sluice/branches/main/protection \
   --input - <<'JSON'
 {
   "required_status_checks": {

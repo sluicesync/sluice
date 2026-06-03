@@ -53,6 +53,6 @@ The repo is structurally ready for the private→public flip.
 
 ## Cross-references
 
-- [ADR-0054 — Shape A Phase 2 live cross-shard DDL coordination](https://github.com/orware/sluice/blob/main/docs/adr/adr-0054-shape-a-phase-2-live-cross-shard-ddl-coordination.md) (v0.76.0 closure update appended)
-- [ADR-0048 — Multi-source aggregation Shape A](https://github.com/orware/sluice/blob/main/docs/adr/adr-0048-multi-source-aggregation-shape-a.md) §4 — the original v1 follow-ups list this closes
-- [v0.75.0 release notes](https://github.com/orware/sluice/releases/tag/v0.75.0) — the prior release
+- [ADR-0054 — Shape A Phase 2 live cross-shard DDL coordination](https://github.com/sluicesync/sluice/blob/main/docs/adr/adr-0054-shape-a-phase-2-live-cross-shard-ddl-coordination.md) (v0.76.0 closure update appended)
+- [ADR-0048 — Multi-source aggregation Shape A](https://github.com/sluicesync/sluice/blob/main/docs/adr/adr-0048-multi-source-aggregation-shape-a.md) §4 — the original v1 follow-ups list this closes
+- [v0.75.0 release notes](https://github.com/sluicesync/sluice/releases/tag/v0.75.0) — the prior release

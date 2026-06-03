@@ -62,6 +62,6 @@ The discipline cost: one extra subagent cycle for Phase A instrumentation. The d
 
 ## Cross-references
 
-- [v0.78.1 release notes](https://github.com/orware/sluice/releases/tag/v0.78.1) — the prior release; v0.78.2 builds on the Bug 86 hotfix arc
+- [v0.78.1 release notes](https://github.com/sluicesync/sluice/releases/tag/v0.78.1) — the prior release; v0.78.2 builds on the Bug 86 hotfix arc
 - Bug 74 lesson: see `CLAUDE.md` § *Pin the class, not the representative* — the test matrix expansion is the regression-guard counterpart
 - Three-phase protocol: `CLAUDE.md` § *Debugging non-obvious failures*

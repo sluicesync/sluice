@@ -73,5 +73,5 @@ Operators with both enabled get full lifecycle coverage: F17 keeps the slot/binl
 
 ## Cross-references
 
-- [ADR-0061 — Source-side sluice_heartbeat writer](https://github.com/orware/sluice/blob/main/docs/adr/adr-0061-source-side-heartbeat-writer.md)
-- [ADR-0059 — Pre-emptive PG slot-health pre-warning (v0.80.0 / F13)](https://github.com/orware/sluice/blob/main/docs/adr/adr-0059-pg-slot-health-prewarning.md) — the symptom-detection sibling
+- [ADR-0061 — Source-side sluice_heartbeat writer](https://github.com/sluicesync/sluice/blob/main/docs/adr/adr-0061-source-side-heartbeat-writer.md)
+- [ADR-0059 — Pre-emptive PG slot-health pre-warning (v0.80.0 / F13)](https://github.com/sluicesync/sluice/blob/main/docs/adr/adr-0059-pg-slot-health-prewarning.md) — the symptom-detection sibling

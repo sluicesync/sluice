@@ -43,7 +43,7 @@
 
 ## Cross-references
 
-- [ADR-0007 — Position persistence](https://github.com/orware/sluice/blob/main/docs/adr/adr-0007-position-persistence.md)
-- [ADR-0054 — Shape A Phase 2: live cross-shard DDL coordination](https://github.com/orware/sluice/blob/main/docs/adr/adr-0054-shape-a-phase-2-live-cross-shard-ddl-coordination.md) — Task #29 retry closes the Phase 2e race the integration test was working around
+- [ADR-0007 — Position persistence](https://github.com/sluicesync/sluice/blob/main/docs/adr/adr-0007-position-persistence.md)
+- [ADR-0054 — Shape A Phase 2: live cross-shard DDL coordination](https://github.com/sluicesync/sluice/blob/main/docs/adr/adr-0054-shape-a-phase-2-live-cross-shard-ddl-coordination.md) — Task #29 retry closes the Phase 2e race the integration test was working around
 - Durable research artifact: `sluice-pg-internals-research-2026-05-22.md` (Ch 12)
 - The Internals of PostgreSQL (https://www.interdb.jp/pg/) Ch 9.4 (logical decoding, ReorderBuffer)

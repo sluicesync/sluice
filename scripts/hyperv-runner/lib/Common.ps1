@@ -85,7 +85,7 @@ function New-RunnerToken {
     # 403. Grant it once: gh auth refresh -h github.com -s admin:org
     [CmdletBinding(DefaultParameterSetName = 'Repo')]
     param(
-        [Parameter(ParameterSetName = 'Repo')] [string] $Repo = 'orware/sluice',
+        [Parameter(ParameterSetName = 'Repo')] [string] $Repo = 'sluicesync/sluice',
         [Parameter(ParameterSetName = 'Org', Mandatory)] [string] $Org
     )
     if ($PSCmdlet.ParameterSetName -eq 'Org') {

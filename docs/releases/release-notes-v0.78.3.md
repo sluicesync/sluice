@@ -59,7 +59,7 @@ This is the third release in 4 days (v0.78.0 → v0.78.1, v0.78.1 → v0.78.2, v
 
 ## Cross-references
 
-- [v0.78.2 release notes](https://github.com/orware/sluice/releases/tag/v0.78.2) — the prior release that shipped the #44 matrix pin
-- [ADR-0057](https://github.com/orware/sluice/blob/main/docs/adr/adr-0057-hard-delete-semantics-across-engines.md) — hard-delete semantics across engines (Bug 88 closure section appended)
+- [v0.78.2 release notes](https://github.com/sluicesync/sluice/releases/tag/v0.78.2) — the prior release that shipped the #44 matrix pin
+- [ADR-0057](https://github.com/sluicesync/sluice/blob/main/docs/adr/adr-0057-hard-delete-semantics-across-engines.md) — hard-delete semantics across engines (Bug 88 closure section appended)
 - Bug 8 (PG's original `filterDeleteBefore`) and Bug 74 ("pin the class") — see `CLAUDE.md`
 - Three-phase protocol used for the Phase A instrumentation — see `CLAUDE.md` § *Debugging non-obvious failures*

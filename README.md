@@ -11,7 +11,7 @@ Continuous sync between MySQL and Postgres in all four directions, with the sche
 - 🔁 **Cutover** — one-command sequence priming (`sluice cutover`) prevents PK collisions on the first post-cutover `INSERT`
 - 🛑 **Loud failure by default** — every silent-loss class we have caught has a structured refuse-loudly message with an operator-action recovery hint. Paste into Slack and the on-call DBA knows what to fix.
 
-Pre-built Linux / macOS / Windows binaries on every tagged release: [latest release](https://github.com/orware/sluice/releases/latest). Apache 2.0, single static binary, no daemon, no SaaS dependency.
+Pre-built Linux / macOS / Windows binaries on every tagged release: [latest release](https://github.com/sluicesync/sluice/releases/latest). Apache 2.0, single static binary, no daemon, no SaaS dependency.
 
 ---
 
@@ -61,10 +61,10 @@ These are the operator-pain features Reddit's `/r/PostgreSQL`, `/r/mysql`, and `
 
 | Feature | Shipped in | What it does |
 |---|---|---|
-| **F13 — Pre-emptive PG slot-health warnings** | [v0.80.0](https://github.com/orware/sluice/releases/tag/v0.80.0) | A 30-second background probe per PG-sourced stream emits structured WARNs when `pg_replication_slots` retention crosses 70 % / 85 % of `max_slot_wal_keep_size`, or when a slot has been inactive for ≥30 min. De-duplicates within a 5-min window; severity transitions and clears emit immediately. Surfaces the slow burn *before* Postgres silently evicts the slot. ([ADR-0059](docs/adr/adr-0059-pg-slot-health-prewarning.md)) |
-| **F11 — Per-table schema-drift diff in refuse messages** | [v0.81.0](https://github.com/orware/sluice/releases/tag/v0.81.0) | When a non-`ADD COLUMN` source DDL arrives over CDC, the refusal now names the specific columns, indexes, and constraints that drifted plus an operator-action hint per category (`[column-added] foo TIMESTAMP NULL — drained schema migrate ...`). Greppable prefixes for Slack / ticket workflows. Pre-F11, operators ran `pg_dump`-diff by hand to find out *what* changed. ([ADR-0060](docs/adr/adr-0060-cdc-schema-drift-diff.md)) |
-| **F17 — Source-side heartbeat writer** | [v0.82.0](https://github.com/orware/sluice/releases/tag/v0.82.0) | Optionally writes a tiny periodic row to a sluice-owned table on the source. The `INSERT` generates WAL / binlog so the consumer's position advances even against a quiet source, preventing silent slot eviction / binlog rotation past the consumer on low-traffic sources. Default-off; opt in with `--source-heartbeat-interval=30s`. Pairs with F13: F13 detects the symptom, F17 prevents the cause. ([ADR-0061](docs/adr/adr-0061-source-side-heartbeat-writer.md)) |
-| **F10 — Cutover sequence priming** | [v0.83.0](https://github.com/orware/sluice/releases/tag/v0.83.0) | `sluice cutover` reads source PG sequences (`pg_sequences.last_value`) / MySQL `AUTO_INCREMENT` values and bumps the target by `--cutover-sequence-margin=N` (default 1000). Closes the PK-collision-on-first-post-cutover-`INSERT` class. Idempotent; refuses loudly when target value is already above the safety margin (signal that traffic landed before cutover priming ran). Skips composite-PK / UUID / no-sequence tables gracefully. ([ADR-0062](docs/adr/adr-0062-cutover-sequence-priming.md)) |
+| **F13 — Pre-emptive PG slot-health warnings** | [v0.80.0](https://github.com/sluicesync/sluice/releases/tag/v0.80.0) | A 30-second background probe per PG-sourced stream emits structured WARNs when `pg_replication_slots` retention crosses 70 % / 85 % of `max_slot_wal_keep_size`, or when a slot has been inactive for ≥30 min. De-duplicates within a 5-min window; severity transitions and clears emit immediately. Surfaces the slow burn *before* Postgres silently evicts the slot. ([ADR-0059](docs/adr/adr-0059-pg-slot-health-prewarning.md)) |
+| **F11 — Per-table schema-drift diff in refuse messages** | [v0.81.0](https://github.com/sluicesync/sluice/releases/tag/v0.81.0) | When a non-`ADD COLUMN` source DDL arrives over CDC, the refusal now names the specific columns, indexes, and constraints that drifted plus an operator-action hint per category (`[column-added] foo TIMESTAMP NULL — drained schema migrate ...`). Greppable prefixes for Slack / ticket workflows. Pre-F11, operators ran `pg_dump`-diff by hand to find out *what* changed. ([ADR-0060](docs/adr/adr-0060-cdc-schema-drift-diff.md)) |
+| **F17 — Source-side heartbeat writer** | [v0.82.0](https://github.com/sluicesync/sluice/releases/tag/v0.82.0) | Optionally writes a tiny periodic row to a sluice-owned table on the source. The `INSERT` generates WAL / binlog so the consumer's position advances even against a quiet source, preventing silent slot eviction / binlog rotation past the consumer on low-traffic sources. Default-off; opt in with `--source-heartbeat-interval=30s`. Pairs with F13: F13 detects the symptom, F17 prevents the cause. ([ADR-0061](docs/adr/adr-0061-source-side-heartbeat-writer.md)) |
+| **F10 — Cutover sequence priming** | [v0.83.0](https://github.com/sluicesync/sluice/releases/tag/v0.83.0) | `sluice cutover` reads source PG sequences (`pg_sequences.last_value`) / MySQL `AUTO_INCREMENT` values and bumps the target by `--cutover-sequence-margin=N` (default 1000). Closes the PK-collision-on-first-post-cutover-`INSERT` class. Idempotent; refuses loudly when target value is already above the safety margin (signal that traffic landed before cutover priming ran). Skips composite-PK / UUID / no-sequence tables gracefully. ([ADR-0062](docs/adr/adr-0062-cutover-sequence-priming.md)) |
 
 Since that arc, the **v0.84 → v0.98 releases** widened the surface well beyond those four: encrypted logical backups with incremental chains, point-in-time restore, and a continuous-backup broker; PII redaction (26 strategies); the slot-less `postgres-trigger` CDC engine; PG Row-Level Security capture/emit; PostGIS geometry round-trips; multi-source aggregation; and connection-resilience + index-build tuning for large migrations. See [Recent releases](#recent-releases) and the [CHANGELOG](CHANGELOG.md).
 
@@ -168,7 +168,7 @@ Calling out the gaps explicitly so operators don't waste a discovery cycle:
 | `sluice sync health --max-stale-seconds N` exits 1 | Stream stopped or fell behind. Check `sluice sync status` for the position; check the source-side CDC reader (PG `pg_stat_replication`, MySQL `SHOW REPLICA STATUS`); if PlanetScale-MySQL, see [`docs/vitess-vstream-troubleshooting.md`](docs/vitess-vstream-troubleshooting.md). |
 | `schema diff` reports drift after migrate | Either sluice didn't translate something cleanly (see ADR-0016 + `--expr-override`), or the target is being modified outside sluice's scope. Each diff entry has a copy-paste DDL suggestion; run them at your discretion. |
 | F13 emits `slot retention ≥85 %` WARN | Consumer (sluice or otherwise) is falling behind. Check `sluice sync status` first; if sluice is the consumer and is healthy, the source side has more writes than the consumer can drain — see [`docs/throughput-tuning.md`](docs/throughput-tuning.md). |
-| Cross-engine translation surfaces a bug | File against the issue tracker, or use the [sluice-testing](https://github.com/orware/sluice-testing) companion repo's `BUG-CATALOG.md`. Workaround in the meantime: `--expr-override TABLE.COLUMN=EXPRESSION` or `--type-override TABLE.COLUMN=TYPE`. |
+| Cross-engine translation surfaces a bug | File against the issue tracker, or use the [sluice-testing](https://github.com/sluicesync/sluice-testing) companion repo's `BUG-CATALOG.md`. Workaround in the meantime: `--expr-override TABLE.COLUMN=EXPRESSION` or `--type-override TABLE.COLUMN=TYPE`. |
 
 ---
 
@@ -266,10 +266,10 @@ A few terms recur in the codebase and docs:
 
 Selected highlights from the **v0.94 → v0.98** arc:
 
-- [v0.98.0](https://github.com/orware/sluice/releases/tag/v0.98.0) — Connection-resilience (target connection-budget cap, stale-backend reaping, AIMD copy-pool backoff) + Postgres deferred-index build tuning
-- [v0.97.0](https://github.com/orware/sluice/releases/tag/v0.97.0) — Inline MySQL `CHECK` enforcement for translatable PG `DOMAIN` checks; multi-segment backup-broker following (v0.97.2)
-- [v0.96.0](https://github.com/orware/sluice/releases/tag/v0.96.0) — Redaction config-precedence hardening; backup-chain passphrase-rotation probes (Bug 116 / 117)
-- [v0.94.0](https://github.com/orware/sluice/releases/tag/v0.94.0) — Encrypted logical backup chains (full + incremental) with the `FormatVersion` refuse-before-touch contract + restore
+- [v0.98.0](https://github.com/sluicesync/sluice/releases/tag/v0.98.0) — Connection-resilience (target connection-budget cap, stale-backend reaping, AIMD copy-pool backoff) + Postgres deferred-index build tuning
+- [v0.97.0](https://github.com/sluicesync/sluice/releases/tag/v0.97.0) — Inline MySQL `CHECK` enforcement for translatable PG `DOMAIN` checks; multi-segment backup-broker following (v0.97.2)
+- [v0.96.0](https://github.com/sluicesync/sluice/releases/tag/v0.96.0) — Redaction config-precedence hardening; backup-chain passphrase-rotation probes (Bug 116 / 117)
+- [v0.94.0](https://github.com/sluicesync/sluice/releases/tag/v0.94.0) — Encrypted logical backup chains (full + incremental) with the `FormatVersion` refuse-before-touch contract + restore
 
 The slot-less `postgres-trigger` engine, PG Row-Level Security, PostGIS round-trips, and multi-source aggregation landed across **v0.84 → v0.93**; the original HVR-feature arc (F10 / F11 / F13 / F17) is **v0.80 → v0.83**.
 

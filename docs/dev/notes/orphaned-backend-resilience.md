@@ -1,7 +1,7 @@
 # Orphaned-backend resilience (hard-kill / OOM / crash recovery)
 
 **Status:** proposal / finding. Discovered 2026-06-01 while load-testing the
-sluice-powered Heroku→PlanetScale migrator (`orware/sluice-heroku-migrator`)
+sluice-powered Heroku→PlanetScale migrator (`sluicesync/sluice-heroku-migrator`)
 against real Heroku Postgres and a small single-node PlanetScale Postgres.
 
 ## What happened

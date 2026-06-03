@@ -96,7 +96,7 @@ echo "sluice mirroring is live."
 ```yaml
 services:
   sluice:
-    image: ghcr.io/orware/sluice:latest
+    image: ghcr.io/sluicesync/sluice:latest
     command:
       - sync
       - start
@@ -137,7 +137,7 @@ spec:
     spec:
       containers:
       - name: sluice
-        image: ghcr.io/orware/sluice:0.89.0
+        image: ghcr.io/sluicesync/sluice:0.89.0
         args:
         - sync
         - start

@@ -85,7 +85,7 @@ The v0.47.0 catalog has a `tombstoned bool` placeholder field. 14b uses it for t
 ```
 
 **Backwards-compat (v0.47.0 → v0.51.0)**:
-- v0.47.0 readers refuse `format_version: 2` with "upgrade sluice" hint — load-bearing per the v0.47.0 catalog code's [forward-version refusal](https://github.com/orware/sluice/blob/main/internal/pipeline/chain_catalog.go).
+- v0.47.0 readers refuse `format_version: 2` with "upgrade sluice" hint — load-bearing per the v0.47.0 catalog code's [forward-version refusal](https://github.com/sluicesync/sluice/blob/main/internal/pipeline/chain_catalog.go).
 - v0.50.0 readers (after 14c/14d ship) need to handle `format_version: 2` gracefully even though 14b hasn't shipped yet. **Action**: bump the reader's max-supported version to 2 in v0.50.0; the new fields will be ignored by v0.50.0 but won't trigger the refusal.
 
 This deferred-bump is required to avoid forcing operators to upgrade in lockstep when 14b lands — v0.50.0 + chain-rotated-to-v0.51.0 mixed deployments need to be safe.

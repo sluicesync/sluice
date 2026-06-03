@@ -55,6 +55,6 @@ Repo is structurally ready for the private→public flip.
 
 ## Cross-references
 
-- [ADR-0046 — Native bounded-segment lineage model + inline rotation](https://github.com/orware/sluice/blob/main/docs/adr/adr-0046-inline-backup-chain-rotation.md) *(§14d amendment added)*
-- [ADR-0054 — Shape A Phase 2](https://github.com/orware/sluice/blob/main/docs/adr/adr-0054-shape-a-phase-2-live-cross-shard-ddl-coordination.md) — Bug 85 closes its v1 GC follow-up properly
-- [v0.76.0 release notes](https://github.com/orware/sluice/releases/tag/v0.76.0)
+- [ADR-0046 — Native bounded-segment lineage model + inline rotation](https://github.com/sluicesync/sluice/blob/main/docs/adr/adr-0046-inline-backup-chain-rotation.md) *(§14d amendment added)*
+- [ADR-0054 — Shape A Phase 2](https://github.com/sluicesync/sluice/blob/main/docs/adr/adr-0054-shape-a-phase-2-live-cross-shard-ddl-coordination.md) — Bug 85 closes its v1 GC follow-up properly
+- [v0.76.0 release notes](https://github.com/sluicesync/sluice/releases/tag/v0.76.0)

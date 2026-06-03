@@ -193,7 +193,7 @@ const (
 	// shared TestMain boot.
 	//
 	// Task #68: this is the pre-baked image
-	// (ghcr.io/orware/sluice-postgres:16-prebaked) — built nightly from
+	// (ghcr.io/sluicesync/sluice-postgres:16-prebaked) — built nightly from
 	// upstream postgres:16 by
 	// .github/workflows/build-prebaked-images.yml. The pre-baked image
 	// already has the heavy first-boot initdb step (~40MB written)
@@ -210,7 +210,7 @@ const (
 	//
 	// See docs/dev/ci-images.md for how the pre-baked images are
 	// built and when to bump the base version (e.g. PG 16 → 17).
-	sharedPGImage = "ghcr.io/orware/sluice-postgres:16-prebaked"
+	sharedPGImage = "ghcr.io/sluicesync/sluice-postgres:16-prebaked"
 
 	sharedPGAdminDB = "postgres"
 )

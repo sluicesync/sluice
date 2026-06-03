@@ -71,10 +71,10 @@ Also in this release: closure of ADR-0054 Phase 2e (the streamer-orchestrated cr
 
 - **`test(ci): task #68 — pre-bake MySQL/Postgres/PostGIS CI container images`** + **`test(ci): task #70 — pre-bake pgvector to GHCR (#68 follow-up)`** — Four GHCR-hosted pre-baked images replace the upstream Docker Hub pulls for CI integration tests:
 
-  - `ghcr.io/orware/sluice-mysql:8.0-prebaked` (first-boot `mysqld --initialize-insecure` pre-applied; `auto.cnf` cleared so each container boots with a distinct `server_uuid`).
-  - `ghcr.io/orware/sluice-postgres:16-prebaked` (`initdb` pre-applied; `pg_hba.conf` configured for the docker bridge network with `host all all all trust`; `test` superuser created with `BYPASSRLS LOGIN`; system identifier cleared so each container boots distinct).
-  - `ghcr.io/orware/sluice-postgis:16-3.4-prebaked` (PostGIS extension preinstalled).
-  - `ghcr.io/orware/sluice-pgvector:0.7.4-pg16-prebaked` (pgvector preinstalled). **This one was added in task #70 specifically because `pipeline-rest-other` failed 3 consecutive times pulling `pgvector/pgvector:0.7.4-pg16` from Docker Hub with `TLS handshake timeout` — moving to GHCR eliminates docker.io as a single point of failure for the pgvector path.**
+  - `ghcr.io/sluicesync/sluice-mysql:8.0-prebaked` (first-boot `mysqld --initialize-insecure` pre-applied; `auto.cnf` cleared so each container boots with a distinct `server_uuid`).
+  - `ghcr.io/sluicesync/sluice-postgres:16-prebaked` (`initdb` pre-applied; `pg_hba.conf` configured for the docker bridge network with `host all all all trust`; `test` superuser created with `BYPASSRLS LOGIN`; system identifier cleared so each container boots distinct).
+  - `ghcr.io/sluicesync/sluice-postgis:16-3.4-prebaked` (PostGIS extension preinstalled).
+  - `ghcr.io/sluicesync/sluice-pgvector:0.7.4-pg16-prebaked` (pgvector preinstalled). **This one was added in task #70 specifically because `pipeline-rest-other` failed 3 consecutive times pulling `pgvector/pgvector:0.7.4-pg16` from Docker Hub with `TLS handshake timeout` — moving to GHCR eliminates docker.io as a single point of failure for the pgvector path.**
 
   ### Plumbing
 

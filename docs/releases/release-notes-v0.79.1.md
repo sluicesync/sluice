@@ -75,7 +75,7 @@ The cumulative cost: each hotfix release is ~1-2 hours of subagent work + a CI r
 
 ## Cross-references
 
-- [v0.79.0 release notes](https://github.com/orware/sluice/releases/tag/v0.79.0) — the marquee F12+F16 release this hotfix completes
-- [ADR-0058 — Online schema-change forwarding](https://github.com/orware/sluice/blob/main/docs/adr/adr-0058-online-schema-change-forwarding.md) (Bug 90 closure subsection appended)
+- [v0.79.0 release notes](https://github.com/sluicesync/sluice/releases/tag/v0.79.0) — the marquee F12+F16 release this hotfix completes
+- [ADR-0058 — Online schema-change forwarding](https://github.com/sluicesync/sluice/blob/main/docs/adr/adr-0058-online-schema-change-forwarding.md) (Bug 90 closure subsection appended)
 - Bug 74 lesson: see `CLAUDE.md` § *Pin the class, not the representative*
 - Three-phase protocol: `CLAUDE.md` § *Debugging non-obvious failures* (Phase A was non-negotiable here — the v0.79.0 guard's text suggested it was working; Phase A logs proved it was dead code)

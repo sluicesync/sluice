@@ -43,7 +43,7 @@ spec:
         spec:
           containers:
           - name: sluice
-            image: orware/sluice:0.36.0
+            image: sluicesync/sluice:0.36.0
             command:
             - sluice
             - matview

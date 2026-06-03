@@ -186,7 +186,7 @@ jobs:
     name: Integration (${{ matrix.shard.name }})
     runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
     # Need packages:read so the pre-baked images on ghcr.io
-    # (ghcr.io/orware/sluice-mysql:8.0-prebaked etc., task #68) can be
+    # (ghcr.io/sluicesync/sluice-mysql:8.0-prebaked etc., task #68) can be
     # pulled by `docker pull` below. Default token permissions are
     # read-only (see workflow-level `permissions:` block) but don't
     # include `packages:` — opt in here.
@@ -286,7 +286,7 @@ jobs:
 
       # Log in to ghcr.io and pre-pull the pre-baked images the tests
       # need (task #68). GITHUB_TOKEN has `packages: read` from the
-      # job-level permissions block; the `orware/sluice-*` packages are
+      # job-level permissions block; the `sluicesync/sluice-*` packages are
       # owned by the same org as the workflow so no PAT is needed.
       #
       # Pre-pulling up-front (rather than letting testcontainers-go pull
@@ -312,9 +312,9 @@ jobs:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           bash scripts/ci-ghcr-pull.sh \
-            ghcr.io/orware/sluice-mysql:8.0-prebaked \
-            ghcr.io/orware/sluice-postgres:16-prebaked \
-            ghcr.io/orware/sluice-pgvector:0.7.4-pg16-prebaked
+            ghcr.io/sluicesync/sluice-mysql:8.0-prebaked \
+            ghcr.io/sluicesync/sluice-postgres:16-prebaked \
+            ghcr.io/sluicesync/sluice-pgvector:0.7.4-pg16-prebaked
 
       # Run every package's integration tests. -count=1 disables the
       # test cache so we always exercise real containers (cached results
@@ -414,9 +414,9 @@ jobs:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           bash scripts/ci-ghcr-pull.sh \
-            ghcr.io/orware/sluice-mysql:8.0-prebaked \
-            ghcr.io/orware/sluice-postgres:16-prebaked \
-            ghcr.io/orware/sluice-postgis:16-3.4-prebaked
+            ghcr.io/sluicesync/sluice-mysql:8.0-prebaked \
+            ghcr.io/sluicesync/sluice-postgres:16-prebaked \
+            ghcr.io/sluicesync/sluice-postgis:16-3.4-prebaked
       - run: go test -tags="integration postgis" -race -count=1 -timeout=15m -run TestMigrate_PostGIS_ ./internal/pipeline/...
 
   # ----- Lint -----

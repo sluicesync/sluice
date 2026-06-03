@@ -13,7 +13,7 @@ The integration suite repeatedly hit boot-time flakes on the self-hosted runner 
 
 Each round bought headroom without eliminating the root cause. **The root cause is the first-boot init step:** `mysqld --initialize-insecure` writes 50-100 MB of system tables to disk, and `initdb` writes ~40 MB; when multiple containers do that concurrently on a contended runner, individual boots stretch past whatever budget is currently in place.
 
-**Task #68** cuts the root cause by baking the init step into the image. The script in `scripts/build-prebaked-images.sh` runs the init once, then `docker commit`s the resulting filesystem to an image tagged `ghcr.io/orware/sluice-{mysql,postgres,postgis,pgvector}:*-prebaked`. The integration suite pulls these images instead of upstream, so cold-start drops from 30-60s (or 2-3 minutes under contention) to ~5s.
+**Task #68** cuts the root cause by baking the init step into the image. The script in `scripts/build-prebaked-images.sh` runs the init once, then `docker commit`s the resulting filesystem to an image tagged `ghcr.io/sluicesync/sluice-{mysql,postgres,postgis,pgvector}:*-prebaked`. The integration suite pulls these images instead of upstream, so cold-start drops from 30-60s (or 2-3 minutes under contention) to ~5s.
 
 **Task #70** added pgvector to the matrix for a different reason: not boot-cost but registry availability. The self-hosted runner pool hit 3-consecutive `docker.io` TLS-handshake timeouts pulling `pgvector/pgvector:0.7.4-pg16` on PR #72, blocking unrelated work. Mirroring the image to GHCR eliminates docker.io as a single point of failure for all CI runs — the bake shape mirrors `postgres:16` since pgvector is itself a postgres image with the extension's shared libraries preinstalled.
 
@@ -23,10 +23,10 @@ The retry-with-backoff and 4-minute timeout scaffolding stays in place as defens
 
 Pre-baked:
 
-- `ghcr.io/orware/sluice-mysql:8.0-prebaked` — upstream `mysql:8.0` + `mysqld --initialize-insecure` with `--log-bin --binlog-format=ROW --binlog-row-image=FULL` flags matching the shared TestMain's Cmd args.
-- `ghcr.io/orware/sluice-postgres:16-prebaked` — upstream `postgres:16` + `initdb`.
-- `ghcr.io/orware/sluice-postgis:16-3.4-prebaked` — upstream `postgis/postgis:16-3.4` + `initdb`.
-- `ghcr.io/orware/sluice-pgvector:0.7.4-pg16-prebaked` — upstream `pgvector/pgvector:0.7.4-pg16` + `initdb` (task #70 — mirrors to GHCR to bypass docker.io flakes; the pgvector extension stays inert until `CREATE EXTENSION vector` runs at test time, matching the upstream image's contract).
+- `ghcr.io/sluicesync/sluice-mysql:8.0-prebaked` — upstream `mysql:8.0` + `mysqld --initialize-insecure` with `--log-bin --binlog-format=ROW --binlog-row-image=FULL` flags matching the shared TestMain's Cmd args.
+- `ghcr.io/sluicesync/sluice-postgres:16-prebaked` — upstream `postgres:16` + `initdb`.
+- `ghcr.io/sluicesync/sluice-postgis:16-3.4-prebaked` — upstream `postgis/postgis:16-3.4` + `initdb`.
+- `ghcr.io/sluicesync/sluice-pgvector:0.7.4-pg16-prebaked` — upstream `pgvector/pgvector:0.7.4-pg16` + `initdb` (task #70 — mirrors to GHCR to bypass docker.io flakes; the pgvector extension stays inert until `CREATE EXTENSION vector` runs at test time, matching the upstream image's contract).
 
 NOT pre-baked:
 
@@ -58,7 +58,7 @@ Idempotency: the script consults `docker manifest inspect` for the target tag an
 
 ## Weekly cron
 
-`.github/workflows/build-prebaked-images.yml` runs `scripts/build-prebaked-images.sh` on a weekly cron (Sunday 06:00 UTC) and on `workflow_dispatch`. It uses the workflow's `GITHUB_TOKEN` with `packages: write` to push to `ghcr.io/orware/sluice-*`. On uneventful weeks (upstream digest unchanged), the script's idempotency check makes each job a few-second no-op. When MySQL 8.0 or postgres:16 publish a patch bump, the next Sunday tick rebakes against the new base.
+`.github/workflows/build-prebaked-images.yml` runs `scripts/build-prebaked-images.sh` on a weekly cron (Sunday 06:00 UTC) and on `workflow_dispatch`. It uses the workflow's `GITHUB_TOKEN` with `packages: write` to push to `ghcr.io/sluicesync/sluice-*`. On uneventful weeks (upstream digest unchanged), the script's idempotency check makes each job a few-second no-op. When MySQL 8.0 or postgres:16 publish a patch bump, the next Sunday tick rebakes against the new base.
 
 Failure surface: GitHub's default behavior on a workflow failure emails the repo owner. No extra notification plumbing required.
 
@@ -68,7 +68,7 @@ You can also trigger a rebake manually from the Actions UI (`Build pre-baked CI 
 
 The integration jobs `docker login` to ghcr.io using the workflow's `GITHUB_TOKEN` (with `packages: read` granted by the job's `permissions:` block). This works without any per-runner secret because the package is hosted under the same org that runs the workflow.
 
-**If you ever fork the repo:** the integration CI on the fork will fail until either (a) the fork publishes its own pre-baked images to its own ghcr namespace and updates the image references in the test files, or (b) you grant the fork's `GITHUB_TOKEN` cross-org read access to `orware/sluice-*` packages (which requires the upstream owner to explicitly grant that access; not the default).
+**If you ever fork the repo:** the integration CI on the fork will fail until either (a) the fork publishes its own pre-baked images to its own ghcr namespace and updates the image references in the test files, or (b) you grant the fork's `GITHUB_TOKEN` cross-org read access to `sluicesync/sluice-*` packages (which requires the upstream owner to explicitly grant that access; not the default).
 
 For an isolated dev environment that can't reach ghcr.io: the script supports `SKIP_PUSH=1` so you can build the images locally, and the test image strings can be temporarily pointed at local tags via a one-line `s/ghcr.io\/orware\/sluice-mysql:8.0-prebaked/mysql:8.0/` sed. Don't commit that change.
 
@@ -76,7 +76,7 @@ For an isolated dev environment that can't reach ghcr.io: the script supports `S
 
 When upstream MySQL 8.0 → 8.4 (or postgres:16 → 17) is a real, intentional version bump — not just a patch-level rebuild — the change is intrusive and lives in code review, not in the weekly cron:
 
-1. Edit `scripts/build-prebaked-images.sh`. Update the relevant `*_BASE_IMAGE` and `*_TARGET_IMAGE` constants in the `Config` section. For MySQL, the target tag should reflect the new version (e.g. `ghcr.io/orware/sluice-mysql:8.4-prebaked`).
+1. Edit `scripts/build-prebaked-images.sh`. Update the relevant `*_BASE_IMAGE` and `*_TARGET_IMAGE` constants in the `Config` section. For MySQL, the target tag should reflect the new version (e.g. `ghcr.io/sluicesync/sluice-mysql:8.4-prebaked`).
 2. Edit the test files that reference the old tag:
    - `internal/engines/mysql/shared_container_integration_test.go` — `sharedMySQLImage`
    - `internal/pipeline/mysql_boot_retry_integration_test.go` — `mysqlBootImage`
@@ -92,4 +92,4 @@ If the new version changes mysqld / postgres semantics in a way that affects loa
 
 You don't need to use the pre-baked image locally. `make test-it` works fine against the upstream `mysql:8.0` / `postgres:16` images that testcontainers will pull automatically when the pre-baked tag isn't on the local daemon. The pre-baked image is a CI-runner-pool optimization; the disk-I/O contention it addresses doesn't typically happen on a developer's box with one container booting at a time.
 
-If you want to mirror CI exactly locally: `docker pull ghcr.io/orware/sluice-mysql:8.0-prebaked` etc. (requires being logged into ghcr.io). Then run the integration tests as usual.
+If you want to mirror CI exactly locally: `docker pull ghcr.io/sluicesync/sluice-mysql:8.0-prebaked` etc. (requires being logged into ghcr.io). Then run the integration tests as usual.

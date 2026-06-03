@@ -55,7 +55,7 @@
 # Auth:
 #   When pushing, $GHCR_TOKEN (or $GITHUB_TOKEN with packages:write
 #   scope) must be exported. Set GHCR_USER to the GitHub username
-#   that owns the token (defaults to `orware`).
+#   that owns the token (defaults to `sluicesync`).
 #
 # Usage:
 #   ./scripts/build-prebaked-images.sh             # build + push all 4
@@ -70,8 +70,8 @@ set -euo pipefail
 
 # --- Config -----------------------------------------------------------
 
-GHCR_NAMESPACE="${GHCR_NAMESPACE:-ghcr.io/orware}"
-GHCR_USER="${GHCR_USER:-orware}"
+GHCR_NAMESPACE="${GHCR_NAMESPACE:-ghcr.io/sluicesync}"
+GHCR_USER="${GHCR_USER:-sluicesync}"
 
 # Engines to bake. Override via $ENGINES (space-separated subset).
 ENGINES_DEFAULT="mysql postgres postgis pgvector"

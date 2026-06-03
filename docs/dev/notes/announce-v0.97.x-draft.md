@@ -37,9 +37,9 @@ of v0.97.1; this is here to be lightly adapted, not posted verbatim.
 > CDC tool) and against `pg_dump` + `pg_restore` in the docs. Apache
 > 2.0. Pre-built binaries on every tagged release.
 >
-> 🔗 https://github.com/orware/sluice
-> 🔗 https://github.com/orware/sluice/blob/main/docs/comparison-bucardo.md
-> 🔗 https://github.com/orware/sluice/blob/main/docs/cookbook/case-gitlab.md
+> 🔗 https://github.com/sluicesync/sluice
+> 🔗 https://github.com/sluicesync/sluice/blob/main/docs/comparison-bucardo.md
+> 🔗 https://github.com/sluicesync/sluice/blob/main/docs/cookbook/case-gitlab.md
 
 ## Longer version (Hacker News)
 
@@ -85,7 +85,7 @@ Three opinionated stances that matter more than the feature list:
    migrate, passphrase rotation silently accepted in encrypted backup
    chains, mid-CDC-stream `RENAME` / `DROP COLUMN` silently lost,
    etc. The fixes are all in the open; see the BUG-CATALOG.md in
-   `orware/sluice-testing` for the full record.
+   `sluicesync/sluice-testing` for the full record.
 
 3. **No SaaS dependency.** Single static binary, Apache 2.0, no
    daemon, no control DB, no Kafka, no Perl interpreter. Runs in a
@@ -96,21 +96,21 @@ Three opinionated stances that matter more than the feature list:
 Honest comparison docs against the alternatives:
 
 - vs. Bucardo (the canonical OSS PG → PG CDC tool):
-  [`docs/comparison-bucardo.md`](https://github.com/orware/sluice/blob/main/docs/comparison-bucardo.md).
+  [`docs/comparison-bucardo.md`](https://github.com/sluicesync/sluice/blob/main/docs/comparison-bucardo.md).
   Measured head-to-head. Bucardo wins runtime CDC throughput;
   sluice wins setup, cross-engine, single-binary deploy, and clean
   teardown. The choice is "PG-only and tuned for runtime
   performance" vs "cross-engine, managed-PG-first, single-binary,
   opinionated about teardown."
 - vs. `pg_dump` + `pg_restore`:
-  [`docs/cookbook/compare-pg-dump.md`](https://github.com/orware/sluice/blob/main/docs/cookbook/compare-pg-dump.md).
+  [`docs/cookbook/compare-pg-dump.md`](https://github.com/sluicesync/sluice/blob/main/docs/cookbook/compare-pg-dump.md).
   Short version: if your migration fits `pg_dump`'s shape, use
   `pg_dump`. sluice fits the cross-engine, continuous-sync,
   redaction-pipeline, and low-downtime cutover cases.
 - Real-world schema case study (GitLab shape — DOMAINs, range
   types, EXCLUDE constraints, partial / covering / functional
   indexes):
-  [`docs/cookbook/case-gitlab.md`](https://github.com/orware/sluice/blob/main/docs/cookbook/case-gitlab.md).
+  [`docs/cookbook/case-gitlab.md`](https://github.com/sluicesync/sluice/blob/main/docs/cookbook/case-gitlab.md).
 
 I have no commercial interest in sluice; it's a multi-month side
 project that reached the point where the public surface is worth
@@ -120,10 +120,10 @@ file the bugs you find, the project would benefit. If you decide
 Bucardo or `pg_dump` fits better, the comparison docs walk through
 which is right for your shape.
 
-🔗 Repo: https://github.com/orware/sluice
+🔗 Repo: https://github.com/sluicesync/sluice
 🔗 Quickstart (10-min walkthrough):
-   https://github.com/orware/sluice/blob/main/docs/examples/quickstart.md
-🔗 Latest release: https://github.com/orware/sluice/releases/latest
+   https://github.com/sluicesync/sluice/blob/main/docs/examples/quickstart.md
+🔗 Latest release: https://github.com/sluicesync/sluice/releases/latest
 
 ## Reddit version (operator-pain framing)
 
@@ -171,15 +171,15 @@ What it's opinionated about:
 Honest comparisons in the docs:
 
 - vs. Bucardo (the canonical FOSS PG → PG CDC):
-  [comparison-bucardo.md](https://github.com/orware/sluice/blob/main/docs/comparison-bucardo.md).
+  [comparison-bucardo.md](https://github.com/sluicesync/sluice/blob/main/docs/comparison-bucardo.md).
   Measured numbers. Bucardo wins runtime CDC; sluice wins
   setup / cross-engine / clean teardown.
 - vs. `pg_dump` + `pg_restore`:
-  [compare-pg-dump.md](https://github.com/orware/sluice/blob/main/docs/cookbook/compare-pg-dump.md).
+  [compare-pg-dump.md](https://github.com/sluicesync/sluice/blob/main/docs/cookbook/compare-pg-dump.md).
   Short version: if `pg_dump` fits your shape, use it. sluice fills
   the cross-engine + CDC + redaction gap.
 - Real-world schema case study (GitLab-shape):
-  [case-gitlab.md](https://github.com/orware/sluice/blob/main/docs/cookbook/case-gitlab.md).
+  [case-gitlab.md](https://github.com/sluicesync/sluice/blob/main/docs/cookbook/case-gitlab.md).
 
 If you've been on Bucardo for years and it's working, this isn't a
 reason to change. If you've been writing one-off scripts for managed
@@ -187,7 +187,7 @@ PG to MySQL migrations, give sluice a look. Bugs welcome —
 particularly any silent-loss class you find. They're the only ones
 that matter.
 
-🔗 https://github.com/orware/sluice
+🔗 https://github.com/sluicesync/sluice
 
 ## Per-platform tweaks
 

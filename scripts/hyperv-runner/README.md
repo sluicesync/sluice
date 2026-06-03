@@ -136,7 +136,7 @@ On the **primary** machine (this one — `gh` is authed here):
    batch). Repo scope:
 
    ```powershell
-   $tok = gh api -X POST repos/orware/sluice/actions/runners/registration-token --jq .token
+   $tok = gh api -X POST repos/sluicesync/sluice/actions/runners/registration-token --jq .token
    ```
    Org scope instead (after `gh auth refresh -h github.com -s admin:org`):
    `$tok = gh api -X POST orgs/orware-code/actions/runners/registration-token --jq .token`
@@ -187,7 +187,7 @@ the zero-WinRM substitute.
 ## Org-scoped runners (share across all org repos)
 
 By default runners register at **repo** scope (`-Repo owner/repo`,
-default `orware/sluice`) — one runner serves one repo. Pass **`-Org
+default `sluicesync/sluice`) — one runner serves one repo. Pass **`-Org
 <name>`** instead to register at **organization** scope: that runner
 is usable by *every* repo in the org (one pool, many projects). Works
 on both entry scripts:
@@ -228,7 +228,7 @@ groups, not in these scripts.
   **These packages often do not add themselves to PATH** — after
   install, verify `qemu-img --version` in a new shell; if missing,
   add its install dir to PATH (or drop `qemu-img.exe` on PATH).
-- **`gh`** authed to `orware/sluice` (already true on this box) — used
+- **`gh`** authed to `sluicesync/sluice` (already true on this box) — used
   to mint runner registration tokens (`repos/.../registration-token`,
   ~1 h TTL, minted just-in-time per VM).
 - An external vSwitch (default `Default Switch` works; pass `-SwitchName`).

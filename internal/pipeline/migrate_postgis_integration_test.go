@@ -42,7 +42,7 @@ import (
 // the postgis-tagged tests live in their own build-tag bucket; the
 // shared TestMain in the postgres engine package never boots a postgis
 // container, so threading the constant through there isn't needed.
-const postgisPrebakedImage = "ghcr.io/orware/sluice-postgis:16-3.4-prebaked"
+const postgisPrebakedImage = "ghcr.io/sluicesync/sluice-postgis:16-3.4-prebaked"
 
 // startPostgresWithPostGIS boots the pre-baked postgis image,
 // creates source and target databases, and runs CREATE EXTENSION

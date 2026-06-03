@@ -1,7 +1,7 @@
 # Pre-baked CI image builder.
 #
 # Runs `scripts/build-prebaked-images.sh` to rebuild the
-# ghcr.io/orware/sluice-{mysql,postgres,postgis,pgvector} images that
+# ghcr.io/sluicesync/sluice-{mysql,postgres,postgis,pgvector} images that
 # `ci.yml`'s integration jobs consume. The script is idempotent
 # (skips when the upstream base digest hasn't moved) so the weekly
 # cron is a no-op on uneventful weeks and rebakes when MySQL 8.0 /
@@ -51,7 +51,7 @@ on:
   # SECURITY: pull_request from forks gets a read-only GITHUB_TOKEN
   # by default, so the push step would fail — but the build step
   # still exercises the bake. For PRs from the same repo (the common
-  # case for orware/sluice work), the token has packages:write and
+  # case for sluicesync/sluice work), the token has packages:write and
   # the bake fully publishes.
   pull_request:
     paths:

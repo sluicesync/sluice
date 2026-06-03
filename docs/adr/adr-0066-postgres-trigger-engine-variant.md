@@ -581,9 +581,9 @@ override the CDC-related methods, and delegate everything else.**
 package pgtrigger
 
 import (
-    "github.com/orware/sluice/internal/engines"
-    "github.com/orware/sluice/internal/engines/postgres"
-    "github.com/orware/sluice/internal/ir"
+    "github.com/sluicesync/sluice/internal/engines"
+    "github.com/sluicesync/sluice/internal/engines/postgres"
+    "github.com/sluicesync/sluice/internal/ir"
 )
 
 type Engine struct {

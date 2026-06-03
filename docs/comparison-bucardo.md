@@ -251,7 +251,7 @@ issue; it's a different operational model.
 
 ## How to decide
 
-Read the [head-to-head report](https://github.com/orware/sluice-testing/blob/main/session-reports/bucardo-vs-sluice-v0.89.0.md)
+Read the [head-to-head report](https://github.com/sluicesync/sluice-testing/blob/main/session-reports/bucardo-vs-sluice-v0.89.0.md)
 (public, single file, every number measured with command-line
 reproduction notes) if you want the underlying data. Then:
 

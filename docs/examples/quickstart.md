@@ -18,7 +18,7 @@ A 10-minute walkthrough that migrates a real ~30 MB dataset between MySQL and Po
 ## 1. Install sluice
 
 ```sh
-$ go install github.com/orware/sluice/cmd/sluice@latest
+$ go install github.com/sluicesync/sluice/cmd/sluice@latest
 
 $ sluice --version
 sluice version v0.x.x

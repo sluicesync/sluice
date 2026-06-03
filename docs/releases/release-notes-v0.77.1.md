@@ -42,6 +42,6 @@ A **real-engine ChangeApplier integration test** that exercises the heartbeat-fi
 
 ## Cross-references
 
-- [v0.77.0 release notes](https://github.com/orware/sluice/releases/tag/v0.77.0) — prior release; Bug 85.b is the wire-up fix that v0.77.0's Bug 85 fix attempt missed
-- [ADR-0054 — Shape A Phase 2](https://github.com/orware/sluice/blob/main/docs/adr/adr-0054-shape-a-phase-2-live-cross-shard-ddl-coordination.md)
+- [v0.77.0 release notes](https://github.com/sluicesync/sluice/releases/tag/v0.77.0) — prior release; Bug 85.b is the wire-up fix that v0.77.0's Bug 85 fix attempt missed
+- [ADR-0054 — Shape A Phase 2](https://github.com/sluicesync/sluice/blob/main/docs/adr/adr-0054-shape-a-phase-2-live-cross-shard-ddl-coordination.md)
 - The autonomous post-release cycle pattern that caught this: cycle subagent in `C:\code\sluice-testing\session-reports\v0.77.0.md`

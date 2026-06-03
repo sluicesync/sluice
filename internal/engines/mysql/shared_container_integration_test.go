@@ -154,7 +154,7 @@ const sharedMySQLBootAttempts = 5
 // shared TestMain boot and by per-test boots in this package.
 //
 // Task #68: this is the pre-baked image
-// (ghcr.io/orware/sluice-mysql:8.0-prebaked) — built nightly from
+// (ghcr.io/sluicesync/sluice-mysql:8.0-prebaked) — built nightly from
 // upstream mysql:8.0 by .github/workflows/build-prebaked-images.yml.
 // The pre-baked image already has the heavy first-boot init step
 // (mysqld --initialize-insecure writes 50-100MB of system tables)
@@ -183,7 +183,7 @@ const sharedMySQLBootAttempts = 5
 //
 // See docs/dev/ci-images.md for how the pre-baked images are built and
 // when to bump the base version (e.g. MySQL 8.0 → 8.4).
-const sharedMySQLImage = "ghcr.io/orware/sluice-mysql:8.0-prebaked"
+const sharedMySQLImage = "ghcr.io/sluicesync/sluice-mysql:8.0-prebaked"
 
 // sharedMySQLBootBackoff returns the sleep duration to apply between
 // a failed boot attempt and the next one. attempt is 1-indexed and

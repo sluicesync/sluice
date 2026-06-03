@@ -27,7 +27,7 @@ param(
     [Parameter(Mandatory)] [string] $Name,
     [string] $AdminSshPublicKey,
     [string] $AdminUser    = 'runner',
-    [Parameter(ParameterSetName = 'Repo')] [string] $Repo = 'orware/sluice',
+    [Parameter(ParameterSetName = 'Repo')] [string] $Repo = 'sluicesync/sluice',
     [Parameter(ParameterSetName = 'Org', Mandatory)] [string] $Org,
     # Pre-minted GitHub registration token. When set, `gh` is NOT
     # invoked - mint it on a gh-authed box and pass it here so a

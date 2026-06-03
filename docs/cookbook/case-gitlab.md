@@ -292,7 +292,7 @@ The features in this case study aren't aspirational. Each one has:
 3. An integration test in the sluice repo pinning the round-trip.
 
 The case study is reproducible against the v0.97.0 binary published
-at <https://github.com/orware/sluice/releases/latest>. Every command
+at <https://github.com/sluicesync/sluice/releases/latest>. Every command
 above was run during validation; the expected outputs are the
 post-fix observed behavior.
 

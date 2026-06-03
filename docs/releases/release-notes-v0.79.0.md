@@ -49,8 +49,8 @@
 
 ## Cross-references
 
-- [ADR-0058 — Online schema-change forwarding](https://github.com/orware/sluice/blob/main/docs/adr/adr-0058-online-schema-change-forwarding.md)
-- [Reddit research findings F12 + F16](https://github.com/orware/sluice/blob/main/docs/research/) — the operator-pain source
-- [v0.78.4 release notes](https://github.com/orware/sluice/releases/tag/v0.78.4) — prior release; this builds on the PG RLS preflight as the second positioning feature in the v0.78.x → v0.79.x arc
-- [ADR-0054 — Shape A Phase 2](https://github.com/orware/sluice/blob/main/docs/adr/adr-0054-shape-a-phase-2-live-cross-shard-ddl-coordination.md) — the per-shard lease coordination model that handles the same shape on Shape A streams; this ADR's intercept is the non-Shape-A counterpart
+- [ADR-0058 — Online schema-change forwarding](https://github.com/sluicesync/sluice/blob/main/docs/adr/adr-0058-online-schema-change-forwarding.md)
+- [Reddit research findings F12 + F16](https://github.com/sluicesync/sluice/blob/main/docs/research/) — the operator-pain source
+- [v0.78.4 release notes](https://github.com/sluicesync/sluice/releases/tag/v0.78.4) — prior release; this builds on the PG RLS preflight as the second positioning feature in the v0.78.x → v0.79.x arc
+- [ADR-0054 — Shape A Phase 2](https://github.com/sluicesync/sluice/blob/main/docs/adr/adr-0054-shape-a-phase-2-live-cross-shard-ddl-coordination.md) — the per-shard lease coordination model that handles the same shape on Shape A streams; this ADR's intercept is the non-Shape-A counterpart
 - Task #47 (F11 schema-drift detection) — the complementary "tell the operator" half; together with this, the full schema-evolution story
