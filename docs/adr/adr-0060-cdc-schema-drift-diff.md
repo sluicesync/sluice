@@ -22,8 +22,7 @@ debugging the diff themselves.
 
 ### The F11 finding (Reddit research)
 
-The Reddit research catalog (task #40,
-`C:\code\sluice-reddit-research-2026-05-23.md`) classified F11 as a
+The Reddit research catalog (task #40) classified F11 as a
 severity-A operator-pain class: across Debezium-users, Striim
 forum, and AWS DMS community, operators reported the same
 diagnostic gap. When a CDC tool refuses a source DDL, the operator

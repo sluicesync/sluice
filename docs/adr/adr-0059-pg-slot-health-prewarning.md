@@ -3,8 +3,7 @@
 ## Status
 
 **Accepted (2026-05-24).** Closes task #46 — severity-A finding F13 of
-the 2026-05-22 Reddit-research run
-(`C:\code\sluice-reddit-research-2026-05-23.md`). Sluice now probes
+the 2026-05-22 Reddit-research run. Sluice now probes
 the active replication slot's WAL-retention pressure and active-
 liveness on a 30-second cadence and emits structured slog WARNs
 before the slot can be invalidated by Postgres's retention-bound
@@ -252,7 +251,7 @@ conversion is correct (64 MB → 67108864 bytes, -1 → -1).
 ## References
 
 - Task #46 (F13 implementation prompt).
-- `C:\code\sluice-reddit-research-2026-05-23.md` — F13 finding,
+- Reddit-research run (2026-05-22) — F13 finding,
   severity A, source-thread quotes.
 - ADR shipped in v0.74.x covering F2 (`pg_stat_replication_slots`
   spill counters) — adjacent surface, related but distinct signal.

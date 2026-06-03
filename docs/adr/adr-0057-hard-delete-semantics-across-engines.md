@@ -29,9 +29,7 @@ Regression matrix pinned by:
 ## Context
 
 Hard-delete handling is the most-cited operator pain in the F18
-Reddit-research dataset (`C:\code\sluice-reddit-research-2026-05-23.md`,
-finding F18; triage in
-`.claude/worktrees/agent-792c52fcfe42ce6a/TASK40-TRIAGE.md`). Three
+Reddit-research dataset (finding F18). Three
 independent operator quotes across Fivetran (`u/sloth_king_617`),
 Airbyte (`u/minormisgnomer`), and AWS DMS / Estuary describe
 competitor CDC tools silently dropping hard deletes — same class as

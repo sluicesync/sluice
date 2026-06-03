@@ -5,8 +5,7 @@
 **Accepted (2026-05-24), shipped v0.79.0.** Lifts the long-standing
 "non-Shape-A streams refuse loudly on any source DDL during CDC" gap
 identified by the F12 (online schema evolution) and F16 (backfill of
-already-shipped rows) Reddit-research findings (task #40,
-`C:\code\sluice-reddit-research-2026-05-23.md`). Sluice now optionally
+already-shipped rows) Reddit-research findings (task #40). Sluice now optionally
 forwards `ALTER TABLE … ADD COLUMN` from source to target through the
 live CDC apply path, with an opt-in source-side backfill of rows that
 shipped to the target before the ALTER landed.

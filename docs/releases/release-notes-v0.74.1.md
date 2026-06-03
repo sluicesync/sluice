@@ -23,7 +23,7 @@
 
 - **`docs: rename tmp/ → docs/releases/`** *(Task #17)*. `tmp/` implied session-local scratch but the folder held the maintainer's curated GitHub-release-notes files for every released version. 52 tracked files renamed (git detects 100% match — no content changes) + 6 release-notes drafts for v0.73.0-v0.74.0 added at the new path.
 
-- **`docs: public-release scrub — Vultr identifiers + AURORA-R11 hostname`** *(Task #19)*. Privacy-sensitive identifiers redacted from pre-public-release files per the 2026-05-22 audit doc: Vultr public IP `45.76.70.68` → `<previous-vultr-IP>` (3 files), Vultr instance ID + SSH key ID redacted, operator's private workstation name `AURORA-R11` → generic placeholder (1 file). Historical references in CHANGELOG.md + ADR-0036 (the bare brand name "Vultr" in past-tense narrative) deliberately left untouched — those are part of the project's documented design-discipline history; scrubbing them would falsify the record.
+- **`docs: public-release scrub — Vultr identifiers + AURORA-R11 hostname`** *(Task #19)*. Privacy-sensitive identifiers redacted from pre-public-release files per the 2026-05-22 audit doc: Vultr public IP (redacted) → `<previous-vultr-IP>` (3 files), Vultr instance ID + SSH key ID redacted, operator's private workstation name `AURORA-R11` → generic placeholder (1 file). Historical references in CHANGELOG.md + ADR-0036 (the bare brand name "Vultr" in past-tense narrative) deliberately left untouched — those are part of the project's documented design-discipline history; scrubbing them would falsify the record.
 
 ## Tests
 
