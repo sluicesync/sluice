@@ -3,7 +3,7 @@
 ## Status
 
 **Proposed (2026-05-29) — pending owner sign-off before implementation.**
-Driven by Bug 95 (sluice-testing `BUG-CATALOG.md`): `sluice backup
+Driven by Bug 95 (project's internal regression catalog): `sluice backup
 compact --smart-compaction` can never merge across a rotation boundary
 on a continuously-written PG source, so the headline "rotate a long
 chain, then compact the churn" value-prop is unreachable via the
@@ -223,8 +223,8 @@ This is the cheapest this fix will ever be.
 
 ## References
 
-- Bug 95 — sluice-testing `BUG-CATALOG.md`; report
-  `session-reports/v0.87.0-complex.md`.
+- Bug 95 — project's internal regression catalog; the v0.87.0
+  regression cycle.
 - ADR-0046 — native bounded-segment lineage + inline rotation (the FSM,
   the `S ≥ P_N` spine, COMMIT linearization, crash matrix).
 - ADR-0064 — backup smart compaction (§14d contiguity pre-flight, §14e

@@ -238,7 +238,6 @@ End-of-arc state: 0 numbered bugs open; 0 tracked silent-loss-class follow-ups. 
 - **v0.11.3 — DEFAULT-expression translator gating + INTERVAL operator-form rewrite.** New `Dialect` field on `ir.DefaultExpression` (mirrors `Column.GeneratedExprDialect` / `CheckConstraint.ExprDialect`); PG writer's `emitDefault` routes `DefaultExpression` through translator when source dialect differs. New `rewriteIntervalLiteral` operates on the operator-form `INTERVAL <int> <unit>` since MySQL canonicalizes `DATE_ADD(...)` to the operator form before sluice ever sees it. All three v0.11.2 bugs closed.
 - **OSS-hygiene track complete.** SPDX license headers swept across all 211 `.go` files in `internal/` via reproducible Go script (commit 575b134). Public README rewrite for operator-scanning audience (commit d749700). License at repo root + per-file headers + goreleaser-published binaries + CONTRIBUTING.md = the OSS-readiness checklist done.
 - **CI Integration timeout bumped 10m→18m per package.** Slow CI runners + `-race` overhead were hitting Go's per-package default test timeout. Job timeout-minutes 20→30 to match. Pure infra change; no runtime behaviour.
-- **Autonomous release-test-fix loop authorized 2026-05-07.** After each release publishes (Option B 5-gate verification), main session auto-spawns next test cycle (sluice-testing's localhost-docker + PlanetScale harnesses both in scope), reacts to results (fix bugs OR pick next roadmap item), loops until stop condition. Stop conditions: user interrupt, saturation (3 clean cycles + roadmap exhausted), unfixable bug, infra blocker. See `feedback_automation_loop.md` in agent memory.
 
 ### Backup chain retention — chunks 14a–14e complete (v0.47.0 → Task #16)
 
@@ -433,7 +432,7 @@ The doc also flags five open questions the eventual chunk's prep doc should NOT 
 
 ### 10. PlanetScale MySQL+Vitess test-matrix expansion
 
-**Why.** Sluice has a `psverify` build-tag harness for PlanetScale-backed Vitess source coverage (`docs/dev/notes/psverify-status.md`), gated by `PLANETSCALE_CREDENTIALS.env`. Coverage today is operator-driven (the harness exists; the user runs it before releases when they have credentials available) rather than continuously exercised in CI. Several VStream-specific edge cases live in this gap:
+**Why.** Default Vitess/VStream coverage runs against container-based Vitess (vttestserver, via the `integration vstream` build tag) in the normal test flow. Sluice also has a `psverify` build-tag harness for source coverage against a real PlanetScale endpoint (requires PlanetScale credentials), which is operator-run on-demand before releases rather than continuously exercised in CI. Several VStream-specific edge cases live in this gap:
 
 - **Bug 27** (VStream POINT bytes mis-parsed) is the canonical example — explicitly deferred to the "GEOMETRY/SPATIAL support" entry's Phase B because the test infrastructure is operator-run.
 - **Mid-stream MySQL Phase 2.5** — VStream is a separate code path from vanilla MySQL binlog. v0.27.0's MySQL Phase 2 (ADR-0034 filter-flip mechanism) ships only the binlog-source path. VStream's own table-scope semantics (per-shard streams, COPY-mode handoff) need their own analysis before the same `--no-drain` UX can extend to PlanetScale operators. Demand-driven; track here when an operator surfaces a real PS workload that needs live add-table.
@@ -444,9 +443,9 @@ The doc also flags five open questions the eventual chunk's prep doc should NOT 
 
 - **Path A — Operator-run coverage matrix.** Document a "before each release" PlanetScale checklist: spin up a PS branch, run sluice against it for the canonical scenarios (vanilla migrate, CDC stream, slot recovery, geometry types, slot rename via `--slot-name=Logical slot name`). Output: `docs/dev/notes/ps-release-checklist.md`. ~1 day to write + populate; no code chunk.
 - **Path B — CI-integrated coverage.** Move `psverify` (and/or `vstream`) from operator-run to CI-conditional (PR labels, scheduled workflows). Requires a non-revocable PlanetScale credential surface in CI; operationally heavier. Defer until Path C's signal surfaces enough recurring gaps to justify the CI cost.
-- **Path C — pre-release validation VM (LANDED; host migrated 2026-05-19).** Runs `integration vstream` (vttestserver-based VStream coverage) on every release-validation pass without burning CI minutes. **Originally the always-on paid Vultr box; that is being RETIRED (idle + stale) and replaced by a local runner-less Hyper-V validation VM** (`New-ValidationVM.ps1` in the private sluicesync/sluice-ops repo, cloned from the golden — zero recurring cost, ~1-2 min to provision on demand). Runbook (host-agnostic `go test` block + the new local-Hyper-V provisioning/Go-bootstrap) in `docs/dev/notes/release-validation-on-vultr.md`. Reference timing: ~4 min per run. Captures the Vitess-side coverage gap CI explicitly skips for cost. The remaining gap vs `psverify` is real-PlanetScale-specific behavior (TLS, vendor pgwire-proxy quirks); Path A still covers that surface.
+- **Path C — pre-release validation pass.** Runs `integration vstream` (vttestserver-based VStream coverage) on every release-validation pass without burning CI minutes, via a provision-on-demand validation VM. Reference timing: ~4 min per run. Captures the Vitess-side coverage gap CI explicitly skips for cost. The remaining gap vs `psverify` is real-PlanetScale-specific behavior (TLS, vendor pgwire-proxy quirks); Path A still covers that surface.
 
-**Operator demand check.** Path C closed the loop on the most-frequent vstream-edge-case worry without a CI cost spike. Path A remains the right answer for real-PlanetScale-only quirks. Path B is a "if PS coverage gaps keep biting *and* Path C alone isn't enough" follow-on.
+**Operator demand check.** Path C closed the loop on the most-frequent vstream-edge-case worry without a CI cost spike. Path A remains the right answer for PlanetScale-specific quirks. Path B is a "if PS coverage gaps keep biting *and* Path C alone isn't enough" follow-on.
 
 ---
 
@@ -660,7 +659,7 @@ at runtime.
 
 ### 18. postgres-trigger CDC runtime performance — batched-apply latency, lighter capture payload, drain throughput — **(a) + (b) SHIPPED (v0.94.0); (c) demand-gated**
 
-**Source.** The sluice-vs-Bucardo head-to-head benchmark (2026-05-29; `sluice-testing/session-reports/bucardo-vs-sluice-v0.89.0.md`) plus the follow-up latency measurement that *re-attributed* its headline finding. Both are trigger-based PG capture replicators; on identical local workloads (1M-row initial copy + 110k-change CDC stream) sluice's `postgres-trigger` engine won initial copy (~208k vs ~77k rows/s, 8-way parallel COPY), setup (single static binary vs Bucardo's plperl+DBI control DB + Perl daemon), clean teardown (0 residue vs Bucardo's leftover `bucardo` schema + source triggers), and the structural differentiator — cross-engine to MySQL/PlanetScale, which Bucardo fundamentally cannot do. All enhancements — no correctness bug (both tools verified byte-identical).
+**Source.** The sluice-vs-Bucardo head-to-head benchmark (2026-05-29; the v0.89.0 regression cycle) plus the follow-up latency measurement that *re-attributed* its headline finding. Both are trigger-based PG capture replicators; on identical local workloads (1M-row initial copy + 110k-change CDC stream) sluice's `postgres-trigger` engine won initial copy (~208k vs ~77k rows/s, 8-way parallel COPY), setup (single static binary vs Bucardo's plperl+DBI control DB + Perl daemon), clean teardown (0 residue vs Bucardo's leftover `bucardo` schema + source triggers), and the structural differentiator — cross-engine to MySQL/PlanetScale, which Bucardo fundamentally cannot do. All enhancements — no correctness bug (both tools verified byte-identical).
 
 **Why (corrected — the latency premise was measurement-disproven).** The original framing blamed the fixed-interval poll and proposed a NOTIFY-kick as the headline win, citing single-change latency of ~5.9s vs Bucardo's ~0.95s. A direct measurement disproved that premise: the **default per-change apply path is already ~0.88s** (≈ Bucardo's ~0.95s), so the poll interval is *not* the dominant latency term. The ~5.9s was an artifact of running `--apply-batch-size=auto` and traced to two bugs in the *batched* applier, not the poller:
 1. **5s idle-flush on partial batches.** A trailing partial batch waited up to the 5s idle-flush grace for the next change before committing — on a single sparse change that is ~5s of pure latency, the dominant component of the 5.9s.
@@ -687,7 +686,7 @@ So NOTIFY-kick is **demoted** — the poll isn't the bottleneck. Closing the rea
 
 ### Open bugs awaiting fix windows
 
-Tracked in detail in `sluice-testing/BUG-CATALOG.md`; recap here for roadmap visibility:
+Tracked in detail in the project's internal regression catalog; recap here for roadmap visibility:
 
 - **Bug 17** (deferred, low priority) — `impact_items` cross-engine COALESCE handling in expression translator.
 - **Bug 25** (deferred, low priority) — PG immutability of enum-typed STORED generated columns.
@@ -746,11 +745,11 @@ PlanetScale-specific tracking:
 | Bug 27 VStream POINT bytes prefix | Closed in v0.28.0 (ADR-0035) at the unit-test layer; operator-run end-to-end verification via `psverify` build tag follows the existing PS test pattern | "Recently landed: GEOMETRY / SPATIAL — PostGIS-aware translation" |
 | Mid-stream Phase 2.5 (VStream-specific add-table mechanism) | Demand-driven follow-on to v0.27.0's MySQL Phase 2; VStream is a separate code path from vanilla MySQL binlog | (no roadmap entry yet — track here when demand surfaces) |
 | PlanetScale Postgres slot lifecycle (Patroni-managed; silent loss on failover without `Logical slot name` config) | Documented in `docs/postgres-source-prep.md`; not exercised in default CI | "PlanetScale MySQL+Vitess test-matrix expansion" entry above |
-| Broader VStream coverage (cross-shard PK, geometry edge cases, slot recovery) | Operator-run via `psverify` build tag with `PLANETSCALE_CREDENTIALS.env`; not in default CI | "PlanetScale MySQL+Vitess test-matrix expansion" entry above |
+| Broader VStream coverage (cross-shard PK, geometry edge cases, slot recovery) | Operator-run via the `psverify` build tag (requires PlanetScale credentials); not in default CI | "PlanetScale MySQL+Vitess test-matrix expansion" entry above |
 
 ### Bug 27 (closed in v0.28.0)
 
-Closed by ADR-0035 — VStream's `query.Type_GEOMETRY` cell decoder now strips the 4-byte little-endian SRID prefix before delivering bytes downstream, matching the vanilla MySQL driver path. Operator-run end-to-end verification on a real PlanetScale source with a POINT column follows the existing `psverify` build-tag pattern (operators with PLANETSCALE_CREDENTIALS.env loaded can spot-check before each release; not in default CI). See [ADR-0035](adr/adr-0035-postgis-geometry-spatial-support.md).
+Closed by ADR-0035 — VStream's `query.Type_GEOMETRY` cell decoder now strips the 4-byte little-endian SRID prefix before delivering bytes downstream, matching the vanilla MySQL driver path. Operator-run end-to-end verification on a real PlanetScale source with a POINT column follows the existing `psverify` build-tag pattern (operators with PlanetScale credentials loaded can spot-check before each release; not in default CI). See [ADR-0035](adr/adr-0035-postgis-geometry-spatial-support.md).
 
 ---
 

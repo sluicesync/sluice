@@ -21,7 +21,7 @@ v0.48.0 mirrors the sync-stream retry policy on the rollover loop:
 
 ## Lands GitHub #23 Phase A — silent-stall diagnostics
 
-The silent-stall failure mode (process alive, no apply, no log, no exit) has been observed twice on this validation rig — on PG/v0.43.0 and Local MySQL/v0.46.0 — engine-agnostic. Phase A doesn't try to *fix* the stall yet; per the CLAUDE.md three-phase debug protocol, that comes in Phase B once we have ground truth from operator-collected goroutine dumps.
+The silent-stall failure mode (process alive, no apply, no log, no exit) has been observed twice on the local validation rig — on PG/v0.43.0 and Local MySQL/v0.46.0 — engine-agnostic. Phase A doesn't try to *fix* the stall yet; per the CLAUDE.md three-phase debug protocol, that comes in Phase B once we have ground truth from operator-collected goroutine dumps.
 
 **`stream: heartbeat` INFO log line every `--heartbeat-interval` (default 60s).** Per-stream goroutine emits a positive liveness signal at default log level. Distinguishes silent-stall (process alive, no apply, no log) from wedge (process alive, no heartbeat either). When the next stall fires, the log shows heartbeats stopping AND the operator can hit pprof to dump goroutines.
 

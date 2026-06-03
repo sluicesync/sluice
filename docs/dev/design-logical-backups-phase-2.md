@@ -92,15 +92,15 @@ Archil is a POSIX-mountable elastic storage layer backed by S3/GCS-compatible ob
 - **Signature v4** standard (default in any modern SDK).
 - **Per-disk credential scope** — credentials grant access to one disk only; cross-bucket requests return `AccessDenied`.
 
-### Setup checklist (sluice-testing harness)
+### Setup checklist (operator harness)
 
 1. Create a disk in Archil web console (region close to the test environment)
 2. Disk → Details → Authorized Users → Add User → **S3 credentials**. Copy Access Key ID + Secret Access Key **immediately** — secret can't be retrieved later.
-3. Save to `sluice-testing/ARCHIL_CREDENTIALS.env` (gitignored, mirroring `PLANETSCALE_CREDENTIALS.env` shape).
+3. Save the credentials to a gitignored env file for local runs.
 4. For mount-path testing: install the `archil` CLI on the test host; `archil mount <disk-id> /mnt/archil`.
 5. For S3-API testing: pass `--backup-endpoint <region-endpoint>` + path-style flag; sluice's `BlobStore` handles the rest.
 
-Archil testing **stays in `sluice-testing`**, not main sluice CI. An optional `archilverify` build tag (analogous to `psverify`) lets the test live in the codebase without forcing every CI run to need credentials.
+Archil testing stays operator-run, not main sluice CI. An optional `archilverify` build tag (analogous to `psverify`) lets the test live in the codebase without forcing every CI run to need credentials.
 
 ## Backup-chain → CDC handoff (Phase 3 acceptance criterion)
 
@@ -191,7 +191,7 @@ New surface: `sluice sync from-backup --backup-dir=<url> --target-driver=... --t
 ### Definition of done
 
 1. `sluice backup full --target=s3://...` rountrips against MinIO in CI.
-2. `sluice backup full --target=s3://... --backup-endpoint=...` works against an arbitrary S3-compatible endpoint (validated against Archil read-path in `sluice-testing`'s harness).
+2. `sluice backup full --target=s3://... --backup-endpoint=...` works against an arbitrary S3-compatible endpoint (validated against the Archil read-path in the operator harness).
 3. Resumable writer: kill the backup process mid-job, restart, completes from where it left off (integration test).
 4. Cross-engine restore from cloud (PG backup → MySQL target) works.
 5. Encryption default-on; `--no-encryption` opt-out works.

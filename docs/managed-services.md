@@ -62,30 +62,10 @@ required.
 
 ### Verification suite
 
-`internal/engines/postgres/planetscale_verify_test.go` and
-`internal/pipeline/planetscale_verify_test.go` are gated behind the
-`psverify` build tag. They consume credentials from env vars
-(`SLUICE_POSTGRES_SOURCE`, `SLUICE_POSTGRES_DESTINATION`,
-`SLUICE_MYSQL_SOURCE`, `SLUICE_MYSQL_DESTINATION`) and fall back to
-a repo-root `PLANETSCALE_CREDENTIALS.env` file for local runs.
-
-Run from a shell:
-
-```bash
-go test -tags=psverify -v -count=1 -timeout=10m \
-  -run 'TestPSPG' ./internal/engines/postgres/...
-go test -tags=psverify -v -count=1 -timeout=15m \
-  -run 'TestPSPipeline' ./internal/pipeline/...
-```
-
-Each phase that creates objects on PS-PG drops them at the end so
-re-runs are idempotent. The streamer test additionally drops the
-`sluice_slot` replication slot before and after, in case a previous
-failed run left it behind.
-
-In CI, see `.github/workflows/psverify.yml` — manual-trigger only
-(workflow_dispatch). The required secrets are listed in the file
-header.
+Sluice has automated PlanetScale/Vitess coverage behind a `psverify`
+build tag (requires PlanetScale credentials), run on-demand before
+releases. Each phase that creates objects on PS-PG drops them at the
+end so re-runs are idempotent.
 
 ### Operational notes
 
@@ -195,17 +175,9 @@ those are the service-token name and value.
 
 ### Verification
 
-`internal/engines/mysql/cdc_vstream_psverify_test.go` (psverify
-build tag) exercises the real PlanetScale endpoint:
-
-```bash
-go test -tags=psverify -v -count=1 -timeout=10m \
-  -run 'TestPSVStream' ./internal/engines/mysql/...
-```
-
-`internal/engines/mysql/cdc_vstream_integration_test.go`
-(`integration && vstream` build tag) exercises a vanilla Vitess
-deployment via testcontainers:
+Default VStream coverage runs against a container-based Vitess
+deployment (vttestserver) via testcontainers, under the
+`integration && vstream` build tag:
 
 ```bash
 go test -tags='integration vstream' -v -count=1 -timeout=15m \
@@ -216,6 +188,11 @@ The vttestserver image is heavier (~700 MB) than the plain
 `mysql:8.0` the default integration suite uses, so the standard
 `make test-it` doesn't pull it. The split build tag pattern
 mirrors the `postgis` tag for the PostGIS integration test.
+
+Sluice additionally has a `psverify` build tag that exercises a real
+PlanetScale endpoint (requires PlanetScale credentials), run
+on-demand before releases for vendor-specific coverage beyond what
+container Vitess exhibits.
 
 ## Other managed services
 

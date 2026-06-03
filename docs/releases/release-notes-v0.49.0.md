@@ -39,7 +39,7 @@ previously failed at sluice's index-creation phase on PG targets with `SQLSTATE 
 
 2. **Length-check fallback** — if the explicit `<tableName>_` prepend would exceed 63 chars, emit verbatim instead. Sacrifices the (historical) sibling-table disambiguation for collision-freedom; the same-table self-collision is the more urgent failure mode.
 
-Note: **FK constraint names are NOT affected by this fix.** Empirical testing on the validation rig (two rounds — synthetic + the operator's literal Vitess-renamed examples) showed sluice's PG FK emitter does NOT prepend the table name, so FK names land verbatim from source. No parallel `pgConstraintName` helper needed. See `sluice-validation/BUG-CATALOG.md` entry 3 for the full diagnostic.
+Note: **FK constraint names are NOT affected by this fix.** Empirical testing on the local validation rig (two rounds — synthetic + the operator's literal Vitess-renamed examples) showed sluice's PG FK emitter does NOT prepend the table name, so FK names land verbatim from source. No parallel `pgConstraintName` helper needed. See the project's internal regression catalog (entry 3) for the full diagnostic.
 
 ## Migration / Compatibility
 
@@ -60,7 +60,7 @@ Note: **FK constraint names are NOT affected by this fix.** Empirical testing on
   - `TestInlineAutoIncrementIndex_DetectionTable` — 4 detector cases
   - `TestPgIndexName_GitHub26` — 9 subtests (regression preservation + new behavior shapes)
   - `TestPgIndexName_NoCollisionAcrossLongSiblingNames` — load-bearing pin
-- **End-to-end re-verification via the validation rig** at `sluice-validation/`. Both `start_sync_mysql_dest.ps1 -AllTables` (re-triggers #25 pre-fix) and `start_sync_pg_dest.ps1 -AllTables` (re-triggers #26 pre-fix) should now succeed end-to-end with the v0.49.0 binary.
+- **End-to-end re-verification via the local validation rig.** Both `start_sync_mysql_dest.ps1 -AllTables` (re-triggers #25 pre-fix) and `start_sync_pg_dest.ps1 -AllTables` (re-triggers #26 pre-fix) should now succeed end-to-end with the v0.49.0 binary.
 
 ## Issue tracker after v0.49.0
 

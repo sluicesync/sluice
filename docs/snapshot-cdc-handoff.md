@@ -143,12 +143,11 @@ Common findings:
 
 ## Stress test (local rig)
 
-The sluice-testing repo's local-rig (`local-rig/`) supports
-sync-mode CDC. To exercise the handoff:
+A local benchmarking rig supports sync-mode CDC. To exercise the
+handoff:
 
 ```powershell
 # 1. Boot the rig + seed the medium fixture.
-cd sluice-testing/local-rig
 .\bootstrap.ps1 -Engine mysql -Fixture medium-25t-100k
 
 # 2. Launch sync (this includes cold-start + CDC handoff).

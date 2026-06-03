@@ -55,7 +55,7 @@ After v0.52.0+ phase 2 lands, the workflow collapses to a single long-running `s
 
 - 9 new unit tests in `internal/pipeline/stream_rotation_test.go` covering: both thresholds (fires + not-yet), length-preferred-over-age tie-breaker, none-configured no-op, catalog-absent conservative fall-back, marker-write success + no-op.
 - 3 new unit tests in `internal/pipeline/prefixed_store_test.go` for the wrapper's transparency invariants.
-- End-to-end validation deferred to operator re-test via `sluice-validation/` rig — `--exit-after-chain-length=2` is the quickest reproduction.
+- End-to-end validation deferred to operator re-test via the local validation rig — `--exit-after-chain-length=2` is the quickest reproduction.
 
 ## What's NOT in v0.51.0
 

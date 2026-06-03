@@ -84,8 +84,8 @@ Three opinionated stances that matter more than the feature list:
    PG DOMAIN constraints silently dropped to base type on cross-engine
    migrate, passphrase rotation silently accepted in encrypted backup
    chains, mid-CDC-stream `RENAME` / `DROP COLUMN` silently lost,
-   etc. The fixes are all in the open; see the BUG-CATALOG.md in
-   `sluicesync/sluice-testing` for the full record.
+   etc. The fixes are all in the open; the project's internal
+   regression catalog holds the full record.
 
 3. **No SaaS dependency.** Single static binary, Apache 2.0, no
    daemon, no control DB, no Kafka, no Perl interpreter. Runs in a

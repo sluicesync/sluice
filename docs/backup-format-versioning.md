@@ -61,7 +61,7 @@ The fields that broke the contract:
 All three are **operator-visible data-integrity invariants**.
 Silently dropping them on restore produces a target that diverges
 from the source's data model without any error or warning. Catalogued
-as **Bug 116** in `sluice-testing/BUG-CATALOG.md` — closed in
+as **Bug 116** in the project's internal regression catalog — closed in
 v0.94.1.
 
 ## The proportional rule
@@ -248,8 +248,8 @@ end-to-end on real binaries (not just in the test suite):
    the RLS enabled/forced flags + the 2 rows. Round-trip
    byte-identical.
 
-Documented in `sluice-testing/session-reports/v0.97.1-roundC-cross-version-matrix.md`
-(sub-case 2). The control sub-case 1 covered the symmetric forward-
+Documented in the v0.97.1 round-C cross-version-matrix regression
+cycle (sub-case 2). The control sub-case 1 covered the symmetric forward-
 compat direction (v0.94.0 takes an innocent FormatVersion=1 chain;
 v0.97.1 restores it cleanly), proving the proportional rule keeps
 the boring path working.
@@ -264,5 +264,5 @@ the boring path working.
 - ADR-0046 in [`docs/adr/`](adr/) — the inline backup chain rotation
   ADR that defines the chain root + segment + lineage model the
   FormatVersion field lives in.
-- `sluice-testing/BUG-CATALOG.md` § Bug 116 — the original silent-loss
-  class report that drove the v0.94.1 fix.
+- Bug 116 in the project's internal regression catalog — the original
+  silent-loss class report that drove the v0.94.1 fix.

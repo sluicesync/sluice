@@ -23,16 +23,16 @@ onto the native bulk loader) is proposed but **not implemented**;
 it is a separate gated decision. The N1 decision remains open.
 
 Recommendation #3 (re-run the medium baseline against v0.62.0 and
-record in `local-rig/baselines.md`) is **satisfied**: the v0.62.0
+record the local-rig baseline) is **satisfied**: the v0.62.0
 post-release validation cycle re-ran the medium fixture on the
 local-local rig at ~85.7k–89.4k rows/sec under default config
-(vs the v0.61.0 default-config ~33k baseline), recorded the result
-in `sluice-testing/local-rig/baselines.md`, and additionally
+(vs the v0.61.0 default-config ~33k baseline), recorded the
+baseline, and additionally
 captured the per-table `information_schema.tables.table_rows`
 estimate vs actual `COUNT(*)` delta (0.10–2.6% undershoot, and
 *noisy* — a ~2.7% swing across `ANALYZE` runs on identical data),
-which directly feeds the H-list in this ADR. See
-`sluice-testing/session-reports/v0.62.0.md`.
+which directly feeds the H-list in this ADR. See the v0.62.0
+regression cycle.
 
 ## Context
 
@@ -481,7 +481,7 @@ separate, gated decision.
 
 ## References
 
-- `sluice-testing/local-rig/baselines.md` — empirical baselines
+- Local benchmarking-rig baselines — the empirical baselines
   cited above.
 - v0.62.0 CHANGELOG entry — default-threshold change.
 - ADR-0019 — Parallel within-table bulk copy (the architectural

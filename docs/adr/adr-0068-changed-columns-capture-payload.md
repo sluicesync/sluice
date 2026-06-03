@@ -16,7 +16,7 @@ Recommendation: **keep `full` as the default for now,** but a flip to
 `changed` is a credible call after the apply-side bench (the one missing piece)
 — which was not true pre-cache.
 This is roadmap item 18 sub-item (b). Driven by the sluice-vs-Bucardo
-head-to-head (`sluice-testing/session-reports/bucardo-vs-sluice-v0.89.0.md`):
+head-to-head (the v0.89.0 regression cycle):
 the `postgres-trigger` capture trigger imposes ~10.8x source-write
 amplification on a 50k-UPDATE microbench, versus Bucardo's ~2x, because it
 writes the **full** before-image *and* the **full** after-image as JSONB into
@@ -231,9 +231,8 @@ include a generated column's new value harmlessly since the applier filters it.
 
 Head-to-head benchmark on the local rig (PG-16, 9-col wide table, 20 000-row
 seed, 30 000 UPDATE / 100 INSERT / 100 DELETE per trial, 5 trials per mode
-plus a 3-trial per-shape breakdown). Report:
-`sluice-testing/session-reports/capture-payload-head-to-head.md` (push
-`6ab1952`).
+plus a 3-trial per-shape breakdown). Measured in the
+capture-payload head-to-head regression cycle.
 
 | mode | source-write × no-trigger baseline (412 ms) | change-log total | per-row payload | correctness |
 |---|---|---|---|---|
@@ -268,9 +267,8 @@ win — premature.
 
 Follow-up #1 below (cache `to_jsonb(NEW)` / `to_jsonb(OLD)` in local plpgsql
 vars) was implemented in PR #90 (`origin/main @ 6257f7b`) and the head-to-head
-re-run on the identical rig. Report:
-`sluice-testing/session-reports/capture-payload-head-to-head-postcache.md`
-(push `c6bd65c`).
+re-run on the identical rig in the post-cache capture-payload
+head-to-head regression cycle.
 
 | mode | × baseline pre-cache | × baseline post-cache | Δ vs `full` source-write (post) | change-log size |
 |---|---|---|---|---|
@@ -335,7 +333,7 @@ which was not true pre-cache.
   §4 jsonb shape, §14 refuse boundaries).
 - ADR-0010 — idempotent applier replay contract.
 - ADR-0007 — position-and-data atomicity.
-- `sluice-testing/session-reports/bucardo-vs-sluice-v0.89.0.md` — the ~10.8x
+- The v0.89.0 Bucardo-vs-sluice regression cycle — the ~10.8x
   source-write measurement + the latency-breakdown addendum that re-attributed
   item 18.
 - Roadmap item 18 (`docs/dev/roadmap.md`) — (a) merged (PR #88); (b) is this ADR.

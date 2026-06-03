@@ -40,8 +40,8 @@ lifetime of a stream:
    single tx that exceeds **20 seconds**; cross-region 100-row batches
    were observed hitting the timeout and tripping the ADR-0038
    retry path (GH #18 finding #2).
-2. **Source CDC event rate.** Under sustained ~175 ops/sec the
-   PlanetScale validation rig observed Local MySQL keeping pace at
+2. **Source CDC event rate.** Under sustained ~175 ops/sec,
+   pre-release PlanetScale validation observed Local MySQL keeping pace at
    `batch=100` but PS-Postgres falling behind at the same setting.
 3. **Target write throughput.** PG `COPY` and MySQL
    `LOAD DATA INFILE` reward large batches; PlanetScale-MySQL via
@@ -57,15 +57,14 @@ mitigates the specific cross-region foot-gun but doesn't generalize.
 ### Why now
 
 Phase 1+2 shipped in v0.45.0 — the telemetry and the safety rail. The
-empirical evidence from the PlanetScale validation rig is concrete
+empirical evidence from pre-release PlanetScale validation is concrete
 (GH #18's table). The retry classifier ADR-0038 provides the
 retriable-error signal AIMD needs. The pieces a controller would
 consume already exist.
 
-The chunk has waited for "real operator demand" — the validation rig
-is the operator (and the PlanetScale validation track is the
-make-or-break audience per the [[planetscale-validation-track]] memory).
-This isn't theoretical demand; it's the rig's recurring footgun.
+The chunk has waited for "real operator demand" — and the PlanetScale
+cross-region path is the make-or-break audience.
+This isn't theoretical demand; it's a recurring footgun on that path.
 
 ## Decision (proposed; some elements require owner sign-off below)
 

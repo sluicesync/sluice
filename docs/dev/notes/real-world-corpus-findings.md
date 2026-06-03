@@ -306,7 +306,7 @@ Added to the existing corpus harness file:
   crash would be a finding.
 
 Runtime Vitess/PS behaviour (resharding, tx-killer, online DDL) stays
-**out of scope** — routed to Track-1b per
+**out of scope** — routed to the on-demand PlanetScale pass per
 `docs/dev/notes/vitess-local-vs-planetscale-equivalence.md`.
 
 ### Gate results (local, this box)

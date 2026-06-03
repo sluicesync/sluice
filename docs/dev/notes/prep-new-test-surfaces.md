@@ -2,7 +2,7 @@
 
 Two test-coverage expansions the operator proposed 2026-05-14 after
 reading a MySQL Enterprise blog post + observing the latency /
-table-limit friction of the PlanetScale validation rig:
+table-limit friction of pre-release PlanetScale validation:
 
 1. **DDL test fixture** seeded from `sqllogictest/test/ddl/createtable/createtable1.test` (Dolt fork of the SQLite consortium's logic-test corpus) — many `CREATE TABLE` statements with `statement ok` markers; lets sluice's schema-handling get exercised against a wider variety of real-world DDL shapes than the current synthetic test corpus.
 2. **Local-local MySQL → sluice → MySQL rig** — two local MySQL containers (or one container with two databases) connected via sluice on the same machine. Eliminates PlanetScale latency / 2048-table-limit / SSL-handshake costs and lets us measure raw throughput.
@@ -182,7 +182,7 @@ writer drives the source at maximum sustainable rate; we measure:
 
 ### Implementation sketch
 
-1. New directory `sluice-testing/local-rig/` (or `sluice-validation/local-rig/`):
+1. New local benchmarking-rig directory:
    - `docker-compose.yml` with two `mysql:8.0` services + a
      traffic_gen container
    - `bootstrap.ps1` / `bootstrap.sh` to start, create databases,
@@ -220,7 +220,7 @@ writer drives the source at maximum sustainable rate; we measure:
 
 ### Sequencing
 
-Could land as a `sluice-testing/local-rig/` directory addition
+Could land as a local benchmarking-rig directory addition
 alongside (or independent of) sluice releases. Doesn't gate any
 sluice release; serves the cycle-test workflow.
 
@@ -240,7 +240,7 @@ After v0.54.0 cycle clears clean, candidate next chunks (in suggested order):
 
 2. **v0.56.0 DDL fixture test surface** (idea 1 above). Test-only; doesn't change operator surface. Could be paired with v0.55.0 if scope feels right. ~430 LOC.
 
-3. **sluice-testing local-rig Phase 1** (idea 2 above). Could land as a sluice-testing PR (separate repo); doesn't gate sluice releases. ~300 LOC across the bootstrap + manual-run pieces.
+3. **Local benchmarking-rig Phase 1** (idea 2 above). Could land in the separate testing repo; doesn't gate sluice releases. ~300 LOC across the bootstrap + manual-run pieces.
 
 4. **v0.57.0 PII Phase 2.a**: generic `mask:inner` + `mask:outer` + Luhn helper. ~120 LOC.
 
@@ -256,7 +256,7 @@ After v0.54.0 cycle clears clean, candidate next chunks (in suggested order):
 
 2. **Local-rig disk layout**: in-container Docker volumes vs bind-mounted host paths. Volumes are simpler and isolated; bind mounts let operators inspect the on-disk InnoDB files. Recommendation: Docker volumes default, bind-mount via env-var override for advanced use.
 
-3. **Throughput baseline storage**: where do we record `medium fixture: 12,500 rows/sec on M2 Pro` so regressions are caught? Recommendation: in `sluice-testing/local-rig/baselines.yaml`, keyed by hardware fingerprint. Regression check is best-effort if no matching baseline exists.
+3. **Throughput baseline storage**: where do we record `medium fixture: 12,500 rows/sec on M2 Pro` so regressions are caught? Recommendation: in a local benchmarking-rig `baselines.yaml`, keyed by hardware fingerprint. Regression check is best-effort if no matching baseline exists.
 
 4. **Which fixtures from sqllogictest beyond createtable1?** The Dolt repo has hundreds of `.test` files (SELECT, INSERT, UPDATE, DELETE, JOIN, etc.). For sluice's purposes the DDL ones are most relevant; selecting from the data-manipulation ones for CDC coverage is a follow-on. Phase 1 stays DDL-only.
 
@@ -318,7 +318,7 @@ script + small committed fixtures, not vendored dumps.
   → instant oracle) + GitLab `structure.sql` (one fetch, big real PG)
   — proves the collect→provenance→read→translate→report loop.
 - **Iteration 2+:** MediaWiki abstract schema, pgloader tests,
-  WordPress, then Vitess/PS samples (Track-1b-adjacent).
+  WordPress, then Vitess/PlanetScale samples.
 - Corpus lives under a gitignored fetch dir + a provenance manifest;
   a build-tagged harness reads each via sluice's schema reader and
   records refuse/translate outcomes (extends Idea 1's pattern).

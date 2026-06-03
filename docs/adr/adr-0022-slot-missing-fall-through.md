@@ -27,7 +27,7 @@ The error was correct as a diagnosis but offered no recovery path. There is no `
 
 Steps 2 and 3 are state cleanup that should not require operators to edit databases by hand. They're also error-prone — an operator who skips step 2 gets the same error message on the next run. The whole flow violates the "Contain Postgres complexity" tenet.
 
-This was Item F in the v0.4.0 real-world testing report (`sluice-testing/ITEM-F-WAL-LOST-TEST.md`). The accompanying `wal_status='lost'` error message was praised as gold-standard operator UX *because* it explained recovery in detail; the pre-v0.5.2 follow-on error was the opposite — it described an impossible state without offering a way to leave it.
+This was Item F in the v0.4.0 real-world testing report. The accompanying `wal_status='lost'` error message was praised as gold-standard operator UX *because* it explained recovery in detail; the pre-v0.5.2 follow-on error was the opposite — it described an impossible state without offering a way to leave it.
 
 ## Decision
 

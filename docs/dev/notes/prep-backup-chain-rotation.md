@@ -148,7 +148,7 @@ Before writing code for v0.51.0:
 - [ ] Read this prep doc.
 - [ ] Confirm chain.json format_version 2 is acceptable (no chains in operator production today; safe to bump).
 - [ ] Decide on the `--retain-rotate-at` threshold default. Suggest 24h as the operator-friendly default; document that "0 = disabled" preserves pre-v0.51.0 unbounded behaviour.
-- [ ] Run the validation rig's continuous workload at a tight `--retain-rotate-at 5m` to exercise the FSM on every state transition + crash-recovery cases.
+- [ ] Run a local benchmarking rig's continuous workload at a tight `--retain-rotate-at 5m` to exercise the FSM on every state transition + crash-recovery cases.
 
 ## Pointers
 

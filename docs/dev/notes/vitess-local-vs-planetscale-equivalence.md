@@ -1,12 +1,11 @@
 # Local Vitess (vttestserver) vs real PlanetScale — equivalence & on-demand harness
 
-> **Purpose.** Decide what daily Vitess regression signal *must* come
-> from real PlanetScale vs what local vttestserver already proves, so
-> PlanetScale databases can move from always-on to **on-demand /
-> time-boxed** (cost reduction) without losing the signal that
-> actually catches sluice regressions. Same philosophy as the
-> 2026-05-19 Vultr decommission: validate-on-demand, not idle-always-on.
-> Authored 2026-05-19.
+> **Purpose.** Decide what Vitess regression signal *must* come
+> from a real PlanetScale endpoint vs what local vttestserver already
+> proves, so PlanetScale coverage can stay **on-demand / time-boxed**
+> (cost reduction) without losing the signal that actually catches
+> sluice regressions. Philosophy: validate-on-demand, not
+> idle-always-on. Authored 2026-05-19.
 
 ## TL;DR
 
@@ -65,22 +64,18 @@ rows below.
 ## On-demand PlanetScale harness (ephemeral-branch, near-zero idle cost)
 
 PlanetScale **branches** spin up/tear down fast; the cost driver is
-*databases kept online*, not branch lifetime. The pscale service token
-is already provisioned (see auto-memory `planetscale-creds`;
-`PLANETSCALE_SERVICE_TOKEN.env` in `sluice-testing`). Pattern (mirrors
-the Vultr validate-then-teardown discipline):
+*databases kept online*, not branch lifetime. With a pscale service
+token provisioned, the pattern (validate-then-teardown discipline) is:
 
 1. `pscale branch create <db> ps-validate-<date>` (or create the DB if
    none kept) — only now does PS cost accrue.
 2. Wait ready; capture the connection DSN into the run env (never echo
-   credentials — `planetscale-creds` standing rule).
+   credentials).
 3. Run **only the PS-only-scoped suite** (a narrow `psverify`-tagged
    target — *not* the full integration matrix): latency/batch-sizing
    (#18), cold-start dedup under write load (#14), TCP-reset resilience
    (#21), tx-killer/throttler-under-load, online-DDL-vs-ADR-0049.
-4. Capture verdict + logs to the validation track artifact
-   (`sluice-validation` rig / Track-1b — *not* `sluice-testing`; see
-   `planetscale-validation-track`).
+4. Capture verdict + logs to the validation artifact.
 5. `pscale branch delete …` (and the DB, if ephemeral) — **cost stops.**
 6. Cadence: per-release or on-demand when touching VStream/applier
    /CDC-recovery code, **not** 24/7. "Every so often, as-needed" is the
@@ -90,7 +85,7 @@ the Vultr validate-then-teardown discipline):
 is broad; tightening it to a PS-only-scoped subset (so step 3 is
 genuinely narrow and the online window is minutes, not an hour) is the
 concrete next implementation step when the operator moves PS to
-on-demand. Tracked alongside corpus iter-4 / Track-1b.
+on-demand. Tracked alongside corpus iter-4.
 
 ## References
 
@@ -100,5 +95,3 @@ on-demand. Tracked alongside corpus iter-4 / Track-1b.
   managed-Vitess transient class (GitHub #13) that is PS-real.
 - `docs/adr/adr-0049-cdc-schema-history.md` + Phase-1c — what
   vttestserver *does* prove about schema-evolution.
-- auto-memory: `planetscale-validation-track`, `planetscale-creds`,
-  `vultr-retired-local-validation-vm` (the precedent decommission).

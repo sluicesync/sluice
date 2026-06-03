@@ -40,7 +40,7 @@ threshold and engages parallel copy. Operators wanting the
 pre-v0.62.0 behaviour pass `--bulk-parallel-min-rows=100000`
 explicitly.
 
-Empirical baseline (sluice-testing `local-rig`, 25-table-100k-row
+Empirical baseline (local benchmarking rig, 25-table-100k-row
 medium fixture, Win11 + Rancher Desktop):
 
 | Configuration | Rows/sec | Wall (2.5M rows) |
@@ -56,9 +56,9 @@ the same fixture / same host. The delta is reader-side
 (PG's COPY-binary protocol + parallel chunks vs MySQL's per-table
 LOAD DATA INFILE). Worth investigating in a future throughput pass.
 
-For local-machine measurement of your own workload, see the
-sluice-testing repo's `local-rig/` directory — `bootstrap.ps1` +
-`run-throughput.ps1` + `record-baseline.ps1` cover the workflow.
+For local-machine measurement of your own workload, a local
+benchmarking rig (bootstrap + throughput-run + record-baseline
+scripts) covers the workflow.
 
 ## Network compression for cross-host copies
 
@@ -101,11 +101,10 @@ negotiated automatically by the gRPC layer — no DSN tuning needed.
 Compression hurts on local docker (CPU dominates over already-fast
 loopback bandwidth). Worth measuring for any workload where the
 sluice host and database host are on different physical machines.
-The sluice-testing `LOCAL-TESTCONTAINER.md` reference includes
-PS-vs-local throughput tables — the 70-85× gap there is mostly
-network latency, not bandwidth, so compression won't recover most of
-it. Compression is the right knob for cross-region high-bandwidth
-workloads, not for cross-region high-latency ones.
+Measured PlanetScale-vs-local throughput tables show a 70-85× gap
+that is mostly network latency, not bandwidth, so compression won't
+recover most of it. Compression is the right knob for cross-region
+high-bandwidth workloads, not for cross-region high-latency ones.
 
 ## Memory-bounded streaming: `--max-buffer-bytes`
 
