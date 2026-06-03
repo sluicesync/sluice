@@ -107,13 +107,13 @@ services:
     ports:
       - "9090:9090"
     restart: unless-stopped
-    healthcheck:
-      # Liveness — restarts the container if the process hangs.
-      test: ["CMD", "curl", "-sf", "http://localhost:9090/healthz"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 60s
+    # The official image (ghcr.io/sluicesync/sluice) is distroless — no shell
+    # or curl — so an in-container `healthcheck:` that shells out to curl won't
+    # work. Rely on `restart: unless-stopped` for liveness, and gate readiness
+    # externally on /readyz (the poll-before-flip pattern above). If you need a
+    # Compose-native healthcheck, run a curl-bearing sidecar that probes
+    # http://sluice:9090/healthz, or use Kubernetes (its httpGet probes hit the
+    # endpoints directly — see below).
 ```
 
 Docker's `healthcheck` is liveness-only — it doesn't have a separate

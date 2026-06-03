@@ -49,6 +49,54 @@ archives:
 checksum:
   name_template: checksums.txt
 
+# Multi-arch runtime container image (linux/amd64 + linux/arm64) published
+# to GHCR. The Dockerfile only COPYs the pre-built static binary, so each
+# per-arch build is a trivial layer — buildx + QEMU handle the arm64 one.
+dockers:
+  - id: sluice-amd64
+    goos: linux
+    goarch: amd64
+    dockerfile: Dockerfile
+    use: buildx
+    image_templates:
+      - "ghcr.io/sluicesync/sluice:{{ .Version }}-amd64"
+      - "ghcr.io/sluicesync/sluice:latest-amd64"
+    build_flag_templates:
+      - "--platform=linux/amd64"
+      - "--label=org.opencontainers.image.title=sluice"
+      - "--label=org.opencontainers.image.description=Open-source MySQL <-> Postgres CDC migration and continuous-sync tool"
+      - "--label=org.opencontainers.image.source=https://github.com/sluicesync/sluice"
+      - "--label=org.opencontainers.image.version={{ .Version }}"
+      - "--label=org.opencontainers.image.revision={{ .FullCommit }}"
+      - "--label=org.opencontainers.image.licenses=Apache-2.0"
+  - id: sluice-arm64
+    goos: linux
+    goarch: arm64
+    dockerfile: Dockerfile
+    use: buildx
+    image_templates:
+      - "ghcr.io/sluicesync/sluice:{{ .Version }}-arm64"
+      - "ghcr.io/sluicesync/sluice:latest-arm64"
+    build_flag_templates:
+      - "--platform=linux/arm64"
+      - "--label=org.opencontainers.image.title=sluice"
+      - "--label=org.opencontainers.image.description=Open-source MySQL <-> Postgres CDC migration and continuous-sync tool"
+      - "--label=org.opencontainers.image.source=https://github.com/sluicesync/sluice"
+      - "--label=org.opencontainers.image.version={{ .Version }}"
+      - "--label=org.opencontainers.image.revision={{ .FullCommit }}"
+      - "--label=org.opencontainers.image.licenses=Apache-2.0"
+
+# Combine the per-arch images into a single multi-arch manifest per tag.
+docker_manifests:
+  - name_template: "ghcr.io/sluicesync/sluice:{{ .Version }}"
+    image_templates:
+      - "ghcr.io/sluicesync/sluice:{{ .Version }}-amd64"
+      - "ghcr.io/sluicesync/sluice:{{ .Version }}-arm64"
+  - name_template: "ghcr.io/sluicesync/sluice:latest"
+    image_templates:
+      - "ghcr.io/sluicesync/sluice:latest-amd64"
+      - "ghcr.io/sluicesync/sluice:latest-arm64"
+
 snapshot:
   version_template: "{{ incpatch .Version }}-snapshot"
 
