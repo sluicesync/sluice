@@ -52,6 +52,12 @@ config.local.yml
 # Machine-local Claude Code operator/automation runbook (never committed)
 CLAUDE.local.md
 
+# The Hyper-V self-hosted-runner provisioning kit moved to the private
+# sluicesync/sluice-ops repo. This guards a maintainer's leftover local
+# VHDX cache (scripts/hyperv-runner/.work/, ~90 GB) from ever being
+# accidentally staged here. Fresh clones won't have this directory.
+scripts/hyperv-runner/
+
 # Generated test fixtures and large datasets
 test/perf/data/
 test/integration/dumps/

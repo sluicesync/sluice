@@ -1,6 +1,0 @@
-# NoCloud meta-data. instance-id MUST change per (re)build so cloud-init
-# treats a golden-template clone as a fresh instance and re-runs the
-# per-instance modules (runcmd) — that is how a clone re-personalizes
-# (new hostname + fresh runner registration) off a sealed image.
-instance-id: {{INSTANCE_ID}}
-local-hostname: {{HOSTNAME}}

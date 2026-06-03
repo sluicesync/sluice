@@ -103,8 +103,8 @@ jobs:
     # (identical to pre-selector behaviour). Set a repo variable to
     # a self-hosted runner label to route there; unset to fall back
     # (GitHub does NOT auto-fail-over an offline self-hosted runner —
-    # the variable IS the manual fail-back lever). See
-    # docs/dev/self-hosted-runner.md.
+    # the variable IS the manual fail-back lever). Runner provisioning
+    # lives in the private sluicesync/sluice-ops repo (self-hosted-runner.md).
     runs-on: ${{ (matrix.os == 'windows-latest' && (vars.CI_WINDOWS_RUNNER || 'windows-latest')) || (vars.CI_LINUX_RUNNER || 'ubuntu-latest') }}
     strategy:
       fail-fast: false
