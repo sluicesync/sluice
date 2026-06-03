@@ -50,10 +50,12 @@ and the [vdiff source](https://github.com/vitessio/vitess/blob/main/go/vt/vttabl
 6. **Heavy on tables without PK or PKE** — the docs explicitly call
    out the additional cost of full table scan + filesort.
 
-Reputation: heavy / slow on multi-TB tables. The cost is fundamental
-to the approach — if you stream every row, you pay the full-table-
-read cost on both sides. Operators have reported runs taking hours
-or days on large workflows.
+Because vdiff compares every row, its runtime scales with table size —
+a full read on both sides — so larger workflows take proportionally
+longer. That cost is fundamental to any full-row verifier (sluice's own
+deep-comparison modes included). Vitess reworked vdiff in v2 into a
+managed, resumable VReplication workflow; see the [vdiff v2 announcement](https://vitess.io/blog/2022-11-22-vdiff-v2/)
+for its current design and capabilities.
 
 ## What `sluice verify` does
 

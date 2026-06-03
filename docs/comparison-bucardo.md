@@ -71,7 +71,7 @@ varchar). Change stream = 110,000 changes (100k UPDATEs + 5k INSERTs +
 | Time-to-first-sync (once familiar) | ~5 s | seconds |
 | Setup commands | `sluice trigger setup … && sluice migrate …` | `bucardo add db … && add table … && add sync … && start && kick` |
 | **Initial copy (1M rows)** | **4.80 s** (~208,000 rows/s, 8 parallel COPY chunks) | 12.9 s (~77,000 rows/s, single COPY) |
-| **CDC drain throughput (110k changes)** | ~2,500 changes/s (sluice numbers shown as measured at v0.89.0; item-18 applier-latency fix landed post-benchmark, expected ~2× lift to ~5,000) | ~13,000 changes/s (NOTIFY + efficient delta replay) |
+| **CDC drain throughput (110k changes)** | ~2,500 changes/s (measured at v0.89.0; an applier-latency fix landed post-benchmark and has not yet been re-measured) | ~13,000 changes/s (NOTIFY + efficient delta replay) |
 | **Single-change latency (default config)** | **~0.88 s** — poll-floor at ~1 s | **~0.95 s** — NOTIFY-kick |
 | **Source-side write overhead (50k UPDATE)** | ~3,946 ms (~10.8× the no-trigger baseline) | ~742 ms (~2× baseline) |
 | **Source residue after teardown** | **0 triggers, 0 capture tables** (`trigger teardown` cleans 100%) | `bucardo` schema (21 objects) + `bucardo_delta` / `bucardo_kick` triggers per table — **operator must drop manually** |
@@ -177,9 +177,12 @@ the answer.
   cross-engine path. **Bucardo is Postgres-only and has no path to
   MySQL.** This is the structural differentiator that no benchmark
   number captures: if your target *isn't* PG, Bucardo isn't an option.
-- **Initial copy throughput** — ~2.7× faster in the head-to-head
-  (208k vs 77k rows/s). sluice runs 8 parallel COPY chunks by default
-  on tables above the threshold; Bucardo runs a single COPY.
+- **Initial copy throughput** — both achieve strong bulk-copy
+  throughput. sluice runs 8 parallel COPY chunks by default on tables
+  above its threshold where Bucardo runs a single COPY, which gives
+  sluice an edge on large tables; on smaller tables the two are
+  comparable. Your numbers will depend on hardware, schema, and
+  configuration.
 - **Managed-PG support out of the box.** sluice is opinionated about
   refusing loudly when a managed source can't grant what's needed
   (e.g. event-trigger creation on RDS/Heroku) and offering the
@@ -251,9 +254,9 @@ issue; it's a different operational model.
 
 ## How to decide
 
-Read the [head-to-head report](https://github.com/sluicesync/sluice-testing/blob/main/session-reports/bucardo-vs-sluice-v0.89.0.md)
-(public, single file, every number measured with command-line
-reproduction notes) if you want the underlying data. Then:
+The numbers above come from a controlled local head-to-head with each
+tool on its defaults; treat them as directional rather than definitive —
+your results will vary with hardware, schema, and configuration. Then:
 
 1. **If you're already comfortable with Bucardo and it's working for
    you, this page isn't a reason to change.** Bucardo is mature and

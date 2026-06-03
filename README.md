@@ -1,8 +1,8 @@
 # sluice
 
-## Open-source HVR-class CDC for MySQL ↔ Postgres
+## Open-source enterprise-class CDC for MySQL ↔ Postgres
 
-Continuous sync between MySQL and Postgres in all four directions, with the schema-evolution, cutover-priming, and slot-health capabilities that have lived behind enterprise-tier paywalls (HVR, Striim, Qlik Replicate). Initial snapshot, CDC catch-up, and operator-driven cutover in one tool, opinionated about correctness.
+Continuous sync between MySQL and Postgres in all four directions, with the schema-evolution, cutover-priming, and slot-health capabilities usually found only in commercial/enterprise CDC tools. Initial snapshot, CDC catch-up, and operator-driven cutover in one tool, opinionated about correctness.
 
 - 🔄 **Bidirectional** — MySQL → Postgres, Postgres → MySQL, same-engine in both directions, PlanetScale flavors included
 - 🔌 **Slot-less Postgres sources** — managed Postgres that blocks logical replication (e.g. Heroku Postgres) still streams via a trigger-based CDC engine (`--source-driver=postgres-trigger`) — no replication slot or `REPLICATION` role required
@@ -55,7 +55,7 @@ sluice is built around three product surfaces, each independently runnable:
 | **Probe** a running sync's freshness against a staleness threshold | `sluice sync health` |
 | Do all of the above against **PlanetScale** | Same commands; PS-MySQL uses VStream automatically when the DSN host matches `*.connect.psdb.cloud` |
 
-### The four HVR-class features that landed in v0.80.0 – v0.83.0
+### The four enterprise-class features that landed in v0.80.0 – v0.83.0
 
 These are the operator-pain features Reddit's `/r/PostgreSQL`, `/r/mysql`, and `/r/dataengineering` keep flagging as the reason teams reach for paid CDC tooling. Each one closed a catalogued silent-loss or silent-under-information class.
 
@@ -120,13 +120,13 @@ The longer story lives in [`docs/architecture.md`](docs/architecture.md).
 
 ## Where sluice fits (vs. alternatives)
 
-This is the category claim: sluice is the open-source tool whose feature set most directly overlaps the enterprise-tier CDC products operators reach for when DMS / Debezium / Fivetran fall short on schema evolution, cutover priming, or slot health.
+This is the category claim: sluice is the open-source tool whose feature set most directly overlaps the commercial/enterprise CDC products operators reach for when they need schema evolution, cutover priming, or slot health. The table below maps the feature surface; it's a capability comparison, not a verdict on any one tool.
 
 |  | sluice | Debezium | AWS DMS | Fivetran | pgcopydb | HVR (commercial) |
 |---|---|---|---|---|---|---|
 | **Cross-engine MySQL ↔ Postgres** | ✓ all 4 directions | requires sink connector | ✓ | ✓ | PG → PG only | ✓ |
 | **`ADD COLUMN` auto-forwards** | ✓ (opt-in, since v0.79.0) | ✓ via schema-history connector | partial | ✓ | ✗ (snapshot only) | ✓ |
-| **Refuse-loudly on unsafe DDL with structured diff** | ✓ (F11, v0.81.0) | varies by connector | ✗ (silent skip) | ✗ | n/a | ✓ |
+| **Refuse-loudly on unsafe DDL with structured diff** | ✓ (F11, v0.81.0) | varies by connector | ✗ | ✗ | n/a | ✓ |
 | **Pre-emptive slot-retention warnings** | ✓ (F13, v0.80.0) | ✗ (operator monitors `pg_stat_replication`) | ✗ | n/a (SaaS) | ✗ | ✓ |
 | **Source-side heartbeat writer** | ✓ (F17, v0.82.0) | ✓ (PG only) | ✗ | n/a | ✗ | ✓ |
 | **Cutover sequence priming as one command** | ✓ (F10, v0.83.0) | ✗ (manual `setval`) | ✗ | ✗ | partial | ✓ |

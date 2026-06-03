@@ -33,7 +33,7 @@ For the **canonical open-source PG → PG comparison point (Bucardo)**, see the 
 
 **Where the alternatives land.**
 - **Debezium:** has it via the schema-history connector; configuration complexity is the trade.
-- **AWS DMS:** partial — some DDL is forwarded, some silently skipped (problematic for safety-conscious operators).
+- **AWS DMS:** partial — some DDL is forwarded, some is skipped by default; behavior varies by configuration.
 - **Fivetran:** has it for SaaS targets.
 - **pgcopydb:** snapshot-only; out of scope.
 - **HVR:** has it, with operator-tunable refuse/auto-apply policies.
@@ -44,12 +44,12 @@ For the **canonical open-source PG → PG comparison point (Bucardo)**, see the 
 
 **Capability claim.** When the source emits DDL sluice can't safely translate or apply (a structural change outside the recognized-shape catalog, or a translation gap), the CDC stream halts with a structured error message naming the table, the unrecognized clause, and an operator-actionable hint (often "refuse-loudly with the drained-model recovery hint" from ADR-0054).
 
-**Why this matters.** The alternative posture is "silent skip" — DMS, Fivetran (occasionally), and some Debezium connectors will continue the stream with the DDL un-applied, leaving target schema and source schema increasingly divergent. The drift surfaces later, usually as a row-apply failure with a confusing error, or worse, as silent value truncation. Loud refusal at the moment of the unsafe DDL is sluice's tenet (`CLAUDE.md`); operators get an actionable error at the right time.
+**Why this matters.** The alternative posture is to continue the stream with the unsafe DDL un-applied, which some tools do by default and some do depending on connector and configuration. When that happens, target and source schemas can diverge, and the drift surfaces later — usually as a row-apply failure with a confusing error, or as value truncation. Loud refusal at the moment of the unsafe DDL is sluice's tenet (`CLAUDE.md`); operators get an actionable error at the right time.
 
 **Where the alternatives land.**
 - **Debezium:** varies by connector. The PG connector has decent surface here; MySQL connectors with strict mode behave better.
-- **AWS DMS:** silent skip is the documented default; operators flag this in support tickets and the response is "audit your schema-evolution events out of band."
-- **Fivetran:** silent skip with table-resync trigger. Operators learn after the row-count drifts.
+- **AWS DMS:** skips unsafe DDL by default; schema-evolution auditing is handled out of band.
+- **Fivetran:** typically resyncs the affected table rather than applying the DDL in place; exact behavior varies by connector and configuration.
 - **HVR:** loud refuse + operator-tunable policy.
 
 ---

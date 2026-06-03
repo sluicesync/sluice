@@ -44,7 +44,7 @@
 ## Who needs this
 
 - **Operators running continuous-sync mode** with evolving source schemas — the everyone-eventually-hits audience. Add a column on Monday morning without stopping the stream.
-- **Operators migrating from Fivetran / Airbyte / DMS** who've been burned by their tool's schema-change handling — F12's "schema change is the dominant CDC pain" cluster cites them by name.
+- **Operators migrating from Fivetran / Airbyte / DMS** who've hit friction with their tool's schema-change handling — F12's "schema change is the dominant CDC pain" research cluster covers this surface.
 - **Operators NOT enabling the flag** see no observable change — pre-v0.79.0 behavior preserved exactly.
 
 ## Cross-references
