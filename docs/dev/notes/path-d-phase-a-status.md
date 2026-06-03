@@ -9,10 +9,8 @@
 > narrative + the "How to run" recipe.
 >
 > **Validation host:** the "Vultr box" recipe below has been
-> SUPERSEDED — the Vultr instance was retired 2026-05-19. The local
-> Hyper-V VM (`scripts/hyperv-runner/New-ValidationVM.ps1`) is the
-> current validation target; see `release-validation-on-vultr.md`'s
-> host-migration banner for the up-to-date provisioning flow. The
+> SUPERSEDED — the Vultr instance was retired 2026-05-19; pre-release
+> validation now runs on a local, provision-on-demand Hyper-V VM. The
 > `ssh root@<previous-vultr-IP>` commands here will not work; adapt
 > them to whatever runner host you're using.
 

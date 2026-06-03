@@ -127,7 +127,6 @@ Some ADRs were drafted from dialogue artifacts in `docs/dev/notes/`. Notable com
 
 - [`docs/dev/notes/adr-0048-dialogue-prep.md`](../dev/notes/adr-0048-dialogue-prep.md)
 - [`docs/dev/notes/adr-0049-implementation-readiness.md`](../dev/notes/adr-0049-implementation-readiness.md)
-- [`docs/dev/notes/adr-0050-cost-validation-report.md`](../dev/notes/adr-0050-cost-validation-report.md)
 
 These aren't ADRs themselves — they're the source material the ADR was promoted from. Treat them as historical context.
 

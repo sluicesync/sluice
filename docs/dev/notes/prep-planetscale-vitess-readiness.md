@@ -1,6 +1,6 @@
 # Prep — PlanetScale / Vitess production-readiness validation (Track 1)
 
-Design contract. Audience: the make-or-break one — Vitess and especially **PlanetScale** users. The v0.69.x campaign validated vanilla MySQL↔PG only; PS/Vitess is the unexercised frontier (`psverify` / `integration vstream` tags + the separate PlanetScale validation rig exist as scaffolding).
+Design contract. Audience: the make-or-break one — Vitess and especially **PlanetScale** users. The v0.69.x campaign validated vanilla MySQL↔PG only; PS/Vitess is the unexercised frontier (`psverify` / `integration vstream` tags exist as scaffolding).
 
 ## Confirmed topology (the principled split — reasoned, not arbitrary)
 
@@ -35,7 +35,7 @@ Operator-reported: PlanetScale users hit multi-day sync outages requiring full t
 - **Recovery granularity/cost**: is the ADR-0022 fall-through whole-stream or per-table re-snapshot? (Operators' pain was "re-sync an entire table.") Validate + document what is re-snapshotted (all vs only affected) and whether the loud message names the affected tables + the recovery command (actionability per the loud-failure tenet).
 - **Schema evolution mid-stream**: a deploy-request-style DDL (column add/drop/type change) while streaming, on BOTH paths, and specifically the **VStream + schema-tracking-DISABLED** case — does sluice loud-fail with actionable guidance (acceptable: "enable Vitess schema-tracking" / re-snapshot) or silently apply mis-aligned rows (silent corruption — a FAIL)?
 
-### Phase 1b (real PlanetScale via `pscale`, on the existing PLANETSCALE_CREDENTIALS.env / `psverify` scaffolding)
+### Phase 1b (real PlanetScale via `pscale`, on the existing `psverify` scaffolding)
 
 - **Static sharded source** — `pscale keyspace create --shards N` + `vschema update` → sluice migrates a real already-sharded PS keyspace (real vtgate/scatter/edge).
 - **No-`LOCAL INFILE` batched-INSERT at scale** — PS's *default* copy path (the #18 LOAD-DATA hardening does NOT apply to PS); throughput + correctness at 10M+ / wide rows.

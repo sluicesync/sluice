@@ -89,8 +89,6 @@ on-demand. Tracked alongside corpus iter-4.
 
 ## References
 
-- `docs/dev/notes/prep-continuous-validation-on-vultr.md` §"The one
-  concern worth re-evaluating" — origin of the #14/#18/#21 latency list.
 - `docs/adr/adr-0038-applier-retry-on-transient-errors.md` — the
   managed-Vitess transient class (GitHub #13) that is PS-real.
 - `docs/adr/adr-0049-cdc-schema-history.md` + Phase-1c — what

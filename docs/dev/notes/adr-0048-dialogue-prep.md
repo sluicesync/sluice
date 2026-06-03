@@ -124,9 +124,8 @@ further questions surface.
 ## Adjacent state worth knowing
 
 - ADR-0050 (reconciling re-snapshot) is also Proposed and gate-(1)
-  empirical evidence has been gathered (see
-  [adr-0050-cost-validation-report.md](adr-0050-cost-validation-report.md)
-  in the same notes/ folder). Bottom line: conditional-go; cost shape
+  empirical evidence has been gathered (in a separate cost-validation
+  report). Bottom line: conditional-go; cost shape
   closed at 1 GiB anchor; reconciling-resnapshot-vs-full-recopy delta
   needs the implementation to measure. Independent of 0048.
 - ADR-0049 (CDC schema history) is fully implemented + the Chunk E

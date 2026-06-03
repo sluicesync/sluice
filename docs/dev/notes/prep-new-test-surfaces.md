@@ -269,7 +269,6 @@ After v0.54.0 cycle clears clean, candidate next chunks (in suggested order):
 - PII Phase 2 catalog: `docs/dev/notes/prep-pii-redaction-phase-2-strategy-catalog.md`
 - PII Phase 1 prep: `docs/dev/notes/prep-pii-redaction-phase-1.md`
 - Inline rotation prep: `docs/dev/notes/prep-backup-chain-rotation.md`
-- Vultr continuous-validation prep: `docs/dev/notes/prep-continuous-validation-on-vultr.md`
 
 ## Idea 3 — Real-world schema corpus (2026-05-18, in progress)
 

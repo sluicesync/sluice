@@ -1,6 +1,6 @@
 # sluice v0.49.0 — closes #25 + #26 (real-world schema bootstrap fixes)
 
-**Two bug fixes bundled in one release** to reduce per-release CI cost. Both blocked sluice cold-start on real-world MySQL source schemas — #25 against MySQL targets, #26 against PostgreSQL targets. Both reproduced reliably on v0.48.0 via the operator's validation rig; both reproductions now closed by the targeted fixes below.
+**Two bug fixes bundled in one release** to reduce per-release CI cost. Both blocked sluice cold-start on real-world MySQL source schemas — #25 against MySQL targets, #26 against PostgreSQL targets. Both reproduced reliably on v0.48.0 via a local validation rig; both reproductions now closed by the targeted fixes below.
 
 ## Closes GitHub #25 — MySQL `AUTO_INCREMENT` on non-PK column
 
@@ -44,7 +44,7 @@ Note: **FK constraint names are NOT affected by this fix.** Empirical testing on
 ## Migration / Compatibility
 
 - **Drop-in upgrade from v0.48.x.** Both fixes are additive at the operator surface; no flag changes, no behaviour change for schemas that don't hit either pattern.
-- The supervisor-workaround `--include-table` filters operators were using to skip the failing tables (per the validation rig scripts) are no longer needed for #25/#26.
+- The supervisor-workaround `--include-table` filters operators were using to skip the failing tables (per the local validation rig scripts) are no longer needed for #25/#26.
 - Emitted PG index identifiers may differ for long source names: pre-v0.49.0 they silently truncated; post-v0.49.0 they emit verbatim. Existing PG targets that already received the truncated names can either re-bulk via `--reset-target-data` or accept the silent truncation as historical (PG catalog references are by OID, not name).
 
 ## Who needs this release
