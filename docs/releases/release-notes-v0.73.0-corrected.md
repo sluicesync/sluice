@@ -10,7 +10,7 @@
 >
 > **What's NOT affected:** non-Shape-A streams (`migrate` paths, plain `sync start` without `--inject-shard-column`) are entirely unaffected — the RUNBOOK 4-direction baseline is green on this binary. Loud-failure tenet was satisfied: sluice halted on the first DDL-mismatched row; no silent data loss observed.
 >
-> Bug 83 details: cycle session report at [sluicesync/sluice-testing/session-reports/v0.73.0.md](https://github.com/sluicesync/sluice-testing/blob/main/session-reports/v0.73.0.md); fix details in the [v0.73.1 release notes](https://github.com/sluicesync/sluice/releases/tag/v0.73.1).
+> Bug 83 was caught by the post-release regression cycle; fix details in the [v0.73.1 release notes](https://github.com/sluicesync/sluice/releases/tag/v0.73.1).
 
 ---
 

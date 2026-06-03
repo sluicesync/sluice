@@ -168,7 +168,7 @@ Calling out the gaps explicitly so operators don't waste a discovery cycle:
 | `sluice sync health --max-stale-seconds N` exits 1 | Stream stopped or fell behind. Check `sluice sync status` for the position; check the source-side CDC reader (PG `pg_stat_replication`, MySQL `SHOW REPLICA STATUS`); if PlanetScale-MySQL, see [`docs/vitess-vstream-troubleshooting.md`](docs/vitess-vstream-troubleshooting.md). |
 | `schema diff` reports drift after migrate | Either sluice didn't translate something cleanly (see ADR-0016 + `--expr-override`), or the target is being modified outside sluice's scope. Each diff entry has a copy-paste DDL suggestion; run them at your discretion. |
 | F13 emits `slot retention ≥85 %` WARN | Consumer (sluice or otherwise) is falling behind. Check `sluice sync status` first; if sluice is the consumer and is healthy, the source side has more writes than the consumer can drain — see [`docs/throughput-tuning.md`](docs/throughput-tuning.md). |
-| Cross-engine translation surfaces a bug | File against the issue tracker, or use the [sluice-testing](https://github.com/sluicesync/sluice-testing) companion repo's `BUG-CATALOG.md`. Workaround in the meantime: `--expr-override TABLE.COLUMN=EXPRESSION` or `--type-override TABLE.COLUMN=TYPE`. |
+| Cross-engine translation surfaces a bug | File against the issue tracker. Workaround in the meantime: `--expr-override TABLE.COLUMN=EXPRESSION` or `--type-override TABLE.COLUMN=TYPE`. |
 
 ---
 

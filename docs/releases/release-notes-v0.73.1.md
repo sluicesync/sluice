@@ -36,5 +36,4 @@ ADR-0054 closes the deferred Phase 2 surface from ADR-0048 §4. All five decisio
 ## Cross-references
 
 - [ADR-0054 — Shape A Phase 2: live cross-shard DDL coordination](https://github.com/sluicesync/sluice/blob/main/docs/adr/adr-0054-shape-a-phase-2-live-cross-shard-ddl-coordination.md)
-- [Bug 83 cycle session report (sluicesync/sluice-testing)](https://github.com/sluicesync/sluice-testing/blob/main/session-reports/v0.73.0.md)
 - [v0.73.0 release notes with correction banner](https://github.com/sluicesync/sluice/releases/tag/v0.73.0)

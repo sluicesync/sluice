@@ -51,4 +51,3 @@ Each iteration's end-to-end integration pin closed the next layer the previous f
 - [ADR-0054 — Shape A Phase 2: live cross-shard DDL coordination](https://github.com/sluicesync/sluice/blob/main/docs/adr/adr-0054-shape-a-phase-2-live-cross-shard-ddl-coordination.md)
 - [v0.73.1 release notes](https://github.com/sluicesync/sluice/releases/tag/v0.73.1)
 - [v0.73.0 release notes with correction banner](https://github.com/sluicesync/sluice/releases/tag/v0.73.0)
-- [Bug 84 cycle session report (sluicesync/sluice-testing)](https://github.com/sluicesync/sluice-testing/blob/main/session-reports/v0.73.1.md)
