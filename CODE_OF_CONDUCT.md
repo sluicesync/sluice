@@ -8,7 +8,7 @@ By participating in this project — through issues, pull requests, discussions,
 
 Concerns about conduct in this project's spaces can be reported privately to the project maintainer:
 
-- **Email:** orware@gmail.com (subject line: `[sluice conduct]`)
+- **Email:** conduct@sluicesync.com (subject line: `[sluice conduct]`)
 
 All reports are reviewed and investigated promptly and fairly. The maintainer is responsible for clarifying and enforcing the standards of acceptable behavior described in the Contributor Covenant.
 

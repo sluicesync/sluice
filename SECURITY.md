@@ -6,7 +6,7 @@ If you believe you've found a security vulnerability in sluice, please report it
 
 **Preferred channel:** [GitHub Security Advisories](https://github.com/sluicesync/sluice/security/advisories/new). Click "Report a vulnerability" to start a private disclosure thread visible only to maintainers.
 
-If GitHub Security Advisories is unavailable for any reason, you can email **orware@gmail.com** with the subject line `[sluice security]`. Encrypted reports via the maintainer's public key are welcome but not required.
+If GitHub Security Advisories is unavailable for any reason, you can email **security@sluicesync.com** with the subject line `[sluice security]`. Encrypted reports via the maintainer's public key are welcome but not required.
 
 Please include, at a minimum:
 

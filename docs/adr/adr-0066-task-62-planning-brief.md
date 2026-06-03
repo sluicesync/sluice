@@ -72,7 +72,7 @@ in on before any code is written.
 
 ## Open questions for the operator
 
-All resolved 2026-05-27 (orware@gmail.com). Originals retained for
+All resolved 2026-05-27. Originals retained for
 context; the operator's decisions are summarised inline.
 
 1. **Design ceiling (§11) — Resolved: ship as stated.** 5000 chgs/sec
