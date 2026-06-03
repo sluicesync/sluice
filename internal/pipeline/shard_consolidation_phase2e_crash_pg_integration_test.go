@@ -41,11 +41,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orware/sluice/internal/engines"
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/ir"
 
 	// Register the PG engine for the test harness.
-	_ "github.com/orware/sluice/internal/engines/postgres"
+	_ "sluicesync.dev/sluice/internal/engines/postgres"
 )
 
 // TestPhase2e_PG_Takeover_ProbeAndRecord_NotApplied exercises the

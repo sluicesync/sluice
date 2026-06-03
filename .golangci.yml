@@ -126,7 +126,7 @@ formatters:
     goimports:
       # Group sluice imports separately from third-party deps.
       local-prefixes:
-        - github.com/orware/sluice
+        - sluicesync.dev/sluice
 
 issues:
   # Caps to keep output manageable on a fresh codebase. Remove these

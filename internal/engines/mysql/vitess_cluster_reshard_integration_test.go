@@ -77,7 +77,7 @@ import (
 	"github.com/testcontainers/testcontainers-go/network"
 	"github.com/testcontainers/testcontainers-go/wait"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // ---------------------------------------------------------------------

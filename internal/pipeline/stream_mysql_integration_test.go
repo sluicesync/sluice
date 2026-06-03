@@ -15,10 +15,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orware/sluice/internal/engines"
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/ir"
 
-	_ "github.com/orware/sluice/internal/engines/mysql"
+	_ "sluicesync.dev/sluice/internal/engines/mysql"
 )
 
 // TestBackupStream_MySQL_RolloverByMaxChanges drives the MySQL happy-

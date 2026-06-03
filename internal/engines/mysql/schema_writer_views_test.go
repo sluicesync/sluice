@@ -14,7 +14,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // TestEmitCreateView covers the single-view DDL string. The shape is

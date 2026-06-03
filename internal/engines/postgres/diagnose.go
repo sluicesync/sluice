@@ -12,7 +12,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgconn"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // ADR-0056 diagnose surface for the Postgres engine.

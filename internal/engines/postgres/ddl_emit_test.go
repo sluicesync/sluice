@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // TestPgIndexName_GitHub26 covers the v0.49.0 pgIndexName fix:

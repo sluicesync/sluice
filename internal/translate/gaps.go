@@ -25,7 +25,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // Severity classifies how a detected gap will surface if the operator

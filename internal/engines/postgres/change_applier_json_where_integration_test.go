@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // TestChangeApplier_Apply_JSONColumnUnderReplicaIdentityFull is the

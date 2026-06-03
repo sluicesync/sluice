@@ -37,7 +37,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // TestVStream_VTTestServer_CompositePK exercises a table with a

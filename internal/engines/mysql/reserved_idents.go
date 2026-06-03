@@ -10,7 +10,7 @@
 
 package mysql
 
-import "github.com/orware/sluice/internal/translate/exprident"
+import "sluicesync.dev/sluice/internal/translate/exprident"
 
 // exprGrammarKeywords is the subset of MySQL reserved words that can
 // appear unquoted in an expression body in a grammatical role:

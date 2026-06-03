@@ -9,8 +9,8 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/orware/sluice/internal/ir"
-	"github.com/orware/sluice/internal/redact"
+	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/redact"
 )
 
 // redactRow applies the operator-configured redaction strategies to

@@ -21,7 +21,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // TryAcquireLease implements [ir.ShardConsolidationLeaseStore].

@@ -9,7 +9,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // ReadSequenceState implements [ir.SequenceStateReader] for Postgres

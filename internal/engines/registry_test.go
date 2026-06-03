@@ -7,7 +7,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // fakeEngine is a minimal ir.Engine for registry tests. It implements

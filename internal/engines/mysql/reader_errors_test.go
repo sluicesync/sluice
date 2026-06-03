@@ -11,7 +11,7 @@ import (
 
 	gomysql "github.com/go-sql-driver/mysql"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // TestClassifyReaderError_DelegatesToApplierClassifier asserts the

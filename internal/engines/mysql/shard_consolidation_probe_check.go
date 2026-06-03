@@ -12,7 +12,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // ProbeAddCheck implements [ir.ShardConsolidationProber] for MySQL

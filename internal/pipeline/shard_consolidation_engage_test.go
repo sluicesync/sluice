@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // supportingApplier is a minimal stub [ir.ChangeApplier] that ALSO

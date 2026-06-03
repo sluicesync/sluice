@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // SyncHealthCmd implements `sluice sync health` (proto-ADR

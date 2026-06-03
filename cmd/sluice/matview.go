@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	pgkms "github.com/orware/sluice/internal/engines/postgres"
+	pgkms "sluicesync.dev/sluice/internal/engines/postgres"
 )
 
 // MatviewCmd groups subcommands that operate on PostgreSQL materialized

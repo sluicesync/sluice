@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // pgNumericSchema models a PG source mixing an unconstrained `numeric`

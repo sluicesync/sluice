@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // TestDetectIncompatibleRelationChange pins the v0.93.0 CDC schema-race

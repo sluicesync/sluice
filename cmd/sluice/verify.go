@@ -9,8 +9,8 @@ import (
 	"io"
 	"os"
 
-	"github.com/orware/sluice/internal/config"
-	"github.com/orware/sluice/internal/pipeline"
+	"sluicesync.dev/sluice/internal/config"
+	"sluicesync.dev/sluice/internal/pipeline"
 )
 
 // VerifyCmd implements `sluice verify`. v0.12.0 ships count-mode

@@ -36,7 +36,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // WriteRowsIdempotent implements [ir.IdempotentRowWriter]. The shape

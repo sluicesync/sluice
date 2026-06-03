@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // decodeValue converts a single value as returned by the go-sql-driver/mysql

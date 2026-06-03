@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 func TestEncodeDecodeVStreamPos(t *testing.T) {

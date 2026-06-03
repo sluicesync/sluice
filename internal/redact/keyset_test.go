@@ -12,7 +12,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 func b64(s string) string { return base64.StdEncoding.EncodeToString([]byte(s)) }

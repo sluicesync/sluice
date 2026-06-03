@@ -8,7 +8,7 @@ import (
 	"math/rand/v2"
 	"strconv"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // PII Phase 2.c second wave — checksum-aware replay-stable

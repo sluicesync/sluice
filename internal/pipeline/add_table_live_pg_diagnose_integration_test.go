@@ -108,9 +108,9 @@ import (
 
 	"github.com/jackc/pglogrepl"
 
-	"github.com/orware/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/engines"
 
-	_ "github.com/orware/sluice/internal/engines/postgres"
+	_ "sluicesync.dev/sluice/internal/engines/postgres"
 )
 
 // TestStreamer_AddTable_LiveMode_PG_DiagnoseLossSurface is the ADR-0036 Phase A

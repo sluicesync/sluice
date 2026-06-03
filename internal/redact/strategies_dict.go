@@ -10,7 +10,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // PII Phase 3 — dictionary-based redaction strategies (v0.61.0).

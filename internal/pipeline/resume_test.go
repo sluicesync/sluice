@@ -10,7 +10,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // fakeStateStore is an in-memory ir.MigrationStateStore for unit

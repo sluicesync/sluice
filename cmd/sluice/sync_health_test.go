@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 func TestEvaluateHealth_StreamFound_NotStale(t *testing.T) {

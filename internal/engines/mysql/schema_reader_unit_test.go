@@ -19,7 +19,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // TestBitLiteralBits pins the bit-literal recognizer: a MySQL

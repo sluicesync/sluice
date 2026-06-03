@@ -12,7 +12,7 @@ import (
 
 	"github.com/go-sql-driver/mysql"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // ADR-0056 diagnose surface for the MySQL engine.

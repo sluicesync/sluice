@@ -38,7 +38,7 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // BoundaryRouter coordinates a single SchemaSnapshot boundary's

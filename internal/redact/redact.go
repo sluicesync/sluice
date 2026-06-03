@@ -54,7 +54,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // Strategy is the per-column redaction policy. Implementations are

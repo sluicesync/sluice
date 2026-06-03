@@ -10,7 +10,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // controlTableName is the per-target table that holds CDC stream

@@ -35,11 +35,11 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/orware/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/engines"
 
 	// Both engines must be registered for engines.Get to find them.
-	_ "github.com/orware/sluice/internal/engines/mysql"
-	_ "github.com/orware/sluice/internal/engines/postgres"
+	_ "sluicesync.dev/sluice/internal/engines/mysql"
+	_ "sluicesync.dev/sluice/internal/engines/postgres"
 )
 
 // bug69SeedDDL is the canonical BUG-CATALOG section 69 repro: an

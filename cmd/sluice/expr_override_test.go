@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/orware/sluice/internal/config"
+	"sluicesync.dev/sluice/internal/config"
 )
 
 // TestParseExprOverride covers the CLI flag's split rules: first

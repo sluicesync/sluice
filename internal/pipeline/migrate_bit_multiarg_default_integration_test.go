@@ -32,10 +32,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orware/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/engines"
 
-	_ "github.com/orware/sluice/internal/engines/mysql"
-	_ "github.com/orware/sluice/internal/engines/postgres"
+	_ "sluicesync.dev/sluice/internal/engines/mysql"
+	_ "sluicesync.dev/sluice/internal/engines/postgres"
 )
 
 // TestMigrate_Bug61_PG_MultiArgFunctionDefaults pins Bug 61: a PG → PG

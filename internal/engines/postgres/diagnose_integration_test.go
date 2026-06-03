@@ -20,8 +20,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orware/sluice/internal/diagnose"
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/diagnose"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // TestDiagnose_ListSchemaHistory_OrdersByCreatedAtDesc pins that the

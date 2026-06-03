@@ -38,10 +38,10 @@ import (
 	"github.com/testcontainers/testcontainers-go"
 	pgtc "github.com/testcontainers/testcontainers-go/modules/postgres"
 
-	"github.com/orware/sluice/internal/engines"
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/ir"
 
-	_ "github.com/orware/sluice/internal/engines/postgres"
+	_ "sluicesync.dev/sluice/internal/engines/postgres"
 )
 
 // TestConnectionSlotClassifier_RealPG53300 boots a PG capped at a small

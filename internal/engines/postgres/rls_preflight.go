@@ -31,7 +31,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // TableRLSStatus reports whether RLS is enabled for the source-side

@@ -7,7 +7,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // slotAwareEngine is a stub that implements both ir.Engine and the

@@ -31,7 +31,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // migrateStateTableName is the per-target table that holds simple-

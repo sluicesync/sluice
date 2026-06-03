@@ -9,8 +9,8 @@ import (
 	"fmt"
 	"log/slog"
 
-	"github.com/orware/sluice/internal/engines"
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // ADR-0049 Chunk C — applier-side active-version cache + prime + lookup.

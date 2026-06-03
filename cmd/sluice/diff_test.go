@@ -4,7 +4,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // TestDriftError_ExitCode confirms that the drift sentinel reports

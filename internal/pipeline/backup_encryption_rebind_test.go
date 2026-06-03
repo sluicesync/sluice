@@ -8,8 +8,8 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/orware/sluice/internal/crypto"
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/crypto"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // TestBackupEncryption_RebindForChain_NilSafe exercises the safe

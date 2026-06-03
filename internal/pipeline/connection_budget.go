@@ -22,7 +22,7 @@ import (
 	"context"
 	"log/slog"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // resolveTargetCopyParallelism returns the bulk-copy parallelism to use

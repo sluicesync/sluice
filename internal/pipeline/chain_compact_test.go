@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // TestCompactChain_TwoSegmentGroup_Merges: a 2-segment in-window group

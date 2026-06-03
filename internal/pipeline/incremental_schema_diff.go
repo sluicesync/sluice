@@ -22,7 +22,7 @@ package pipeline
 import (
 	"reflect"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // diffSchemas returns the structural delta from before to after.

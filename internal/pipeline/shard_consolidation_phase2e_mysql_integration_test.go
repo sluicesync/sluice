@@ -29,11 +29,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orware/sluice/internal/engines"
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/ir"
 
 	// Register the MySQL engine for the test harness.
-	_ "github.com/orware/sluice/internal/engines/mysql"
+	_ "sluicesync.dev/sluice/internal/engines/mysql"
 )
 
 // TestPhase2e_MySQL_3ShardContention_ExactlyOnceApply boots a single

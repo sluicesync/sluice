@@ -31,7 +31,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // TestSyncFromBackup_DetectChainSourceEngine_PG verifies the helper

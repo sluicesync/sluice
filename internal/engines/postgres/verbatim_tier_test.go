@@ -6,7 +6,7 @@ package postgres
 import (
 	"testing"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // TestVerbatimTierFor pins the ADR-0047 (b)-vs-(c) determination. Tier

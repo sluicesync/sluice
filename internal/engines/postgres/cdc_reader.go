@@ -19,8 +19,8 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgproto3"
 
-	"github.com/orware/sluice/internal/ir"
-	"github.com/orware/sluice/internal/netkeepalive"
+	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/netkeepalive"
 )
 
 // cdcChannelBuffer is the number of [ir.Change] events buffered before

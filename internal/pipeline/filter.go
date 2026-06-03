@@ -36,7 +36,7 @@ import (
 	"log/slog"
 	"path"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // TableFilter decides whether a table participates in the migration

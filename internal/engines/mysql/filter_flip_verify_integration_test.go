@@ -51,8 +51,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orware/sluice/internal/ir"
-	"github.com/orware/sluice/internal/pipeline"
+	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline"
 )
 
 // TestFilterFlip_Verify_PostFlipEventsDelivered is the load-bearing

@@ -15,9 +15,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orware/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/engines"
 
-	_ "github.com/orware/sluice/internal/engines/mysql"
+	_ "sluicesync.dev/sluice/internal/engines/mysql"
 )
 
 // TestStreamer_AddColumnForward_MySQL_FlagOn_ForwardsALTER pins the

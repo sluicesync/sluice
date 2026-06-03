@@ -9,7 +9,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // ADR-0049 CDC schema-history — Postgres store (Chunk A).

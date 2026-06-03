@@ -24,10 +24,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orware/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/engines"
 
-	_ "github.com/orware/sluice/internal/engines/mysql"
-	_ "github.com/orware/sluice/internal/engines/postgres"
+	_ "sluicesync.dev/sluice/internal/engines/mysql"
+	_ "sluicesync.dev/sluice/internal/engines/postgres"
 )
 
 // TestStreamer_MySQLToMySQL_Generated drives the snapshot+CDC path

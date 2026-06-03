@@ -12,7 +12,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // TestEmitCreateView_Regular covers the regular view DDL shape.

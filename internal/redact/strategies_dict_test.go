@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // tokTestKey is the shared HMAC secret for the tokenize:dict tests.

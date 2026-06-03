@@ -10,7 +10,7 @@ import (
 
 	"vitess.io/vitess/go/vt/proto/query"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 const priKeyFlag = uint32(query.MySqlFlag_PRI_KEY_FLAG)

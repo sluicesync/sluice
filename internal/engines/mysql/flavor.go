@@ -6,7 +6,7 @@ package mysql
 import (
 	"fmt"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // Flavor identifies which MySQL-compatible service the engine is

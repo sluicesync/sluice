@@ -55,7 +55,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // errRLSRefused is the sentinel cause for an RLS-preflight refusal.

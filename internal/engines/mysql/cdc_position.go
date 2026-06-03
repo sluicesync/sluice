@@ -8,7 +8,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // positionMode identifies which of MySQL's two equivalent "where am I in

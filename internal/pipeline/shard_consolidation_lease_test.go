@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // testClockNow returns a fixed wall-clock for tests that don't need to

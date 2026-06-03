@@ -27,11 +27,11 @@ import (
 
 	"github.com/testcontainers/testcontainers-go"
 
-	"github.com/orware/sluice/internal/engines"
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/ir"
 
 	// Register the PG engine for the test harness.
-	_ "github.com/orware/sluice/internal/engines/postgres"
+	_ "sluicesync.dev/sluice/internal/engines/postgres"
 )
 
 // startPGForRouterTest boots a minimal PG container for the Phase 2e

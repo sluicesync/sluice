@@ -8,8 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/orware/sluice/internal/crypto"
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/crypto"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // TestIncrementalAlignEncryption_PerChunkDecryptProbe_Bug117_Ingestion

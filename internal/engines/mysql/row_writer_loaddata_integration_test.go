@@ -22,7 +22,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 func TestRowWriter_LoadDataInfile_RoundTrip(t *testing.T) {

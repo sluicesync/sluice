@@ -8,7 +8,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // TestStripTypeCast covers the cast-suffix stripper used by

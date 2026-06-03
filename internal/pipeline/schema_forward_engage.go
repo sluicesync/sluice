@@ -16,7 +16,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // engageAddColumnForward opens the target SchemaWriter the ADR-0058

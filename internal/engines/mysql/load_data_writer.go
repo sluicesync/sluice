@@ -18,7 +18,7 @@ import (
 
 	driver "github.com/go-sql-driver/mysql"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // loadDataReaderPrefix names the handler-registry slots this engine

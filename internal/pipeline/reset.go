@@ -33,7 +33,7 @@ import (
 	"fmt"
 	"log/slog"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // resetTargetData clears the migration-state row for migrationID,

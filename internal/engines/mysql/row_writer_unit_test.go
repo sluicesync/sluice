@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 func TestBuildRowPlaceholder(t *testing.T) {

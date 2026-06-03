@@ -8,7 +8,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // SourceCurrentPosition implements [ir.HealthReporter]. Returns the

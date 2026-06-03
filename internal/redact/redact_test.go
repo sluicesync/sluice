@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // stringColumn returns a [ir.Column] with the named string type,

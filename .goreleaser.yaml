@@ -65,13 +65,13 @@ changelog:
 
 release:
   github:
-    owner: orware
+    owner: sluicesync
     name: sluice
   draft: true
   prerelease: auto
   header: |
     ## sluice {{ .Version }}
 
-    See the [changelog](https://github.com/orware/sluice/blob/main/CHANGELOG.md) for highlights.
+    See the [changelog](https://github.com/sluicesync/sluice/blob/main/CHANGELOG.md) for highlights.
 
     During the v0.x series, no API or CLI stability guarantees are made. See the README for details.

@@ -14,7 +14,7 @@
 //
 // The engine is registered automatically when this package is imported:
 //
-//	import _ "github.com/orware/sluice/internal/engines/mysql"
+//	import _ "sluicesync.dev/sluice/internal/engines/mysql"
 //
 // Users select a flavor via the engine name in their configuration
 // (`driver: mysql` or `driver: planetscale`).
@@ -30,8 +30,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/orware/sluice/internal/engines"
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // ErrNotImplemented is returned by Engine methods whose underlying

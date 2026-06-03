@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // fakeShapeApplier records calls and (optionally) injects an error.

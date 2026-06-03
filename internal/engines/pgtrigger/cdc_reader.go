@@ -14,8 +14,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/orware/sluice/internal/engines/postgres"
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/engines/postgres"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // Defaults for the polling loop. ADR-0066 §6 — operator-tunable in a

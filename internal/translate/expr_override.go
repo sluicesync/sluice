@@ -8,8 +8,8 @@ import (
 	"fmt"
 	"log/slog"
 
-	"github.com/orware/sluice/internal/config"
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/config"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // ApplyExpressionOverrides rewrites generated-column bodies in s

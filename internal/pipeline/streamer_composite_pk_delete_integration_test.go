@@ -24,7 +24,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orware/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/engines"
 )
 
 // TestStreamer_PostgresToPostgres_CompositePKDelete is the Bug 8

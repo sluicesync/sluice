@@ -17,8 +17,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orware/sluice/internal/ir"
-	"github.com/orware/sluice/internal/pipeline"
+	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline"
 )
 
 // gcPos builds a Postgres-engine ir.Position for the test. The PG

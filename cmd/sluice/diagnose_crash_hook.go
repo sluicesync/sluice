@@ -7,8 +7,8 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/orware/sluice/internal/diagnose"
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/diagnose"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // CrashHookFlags is the embeddable flag group long-running

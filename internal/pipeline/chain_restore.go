@@ -34,9 +34,9 @@ import (
 	"log/slog"
 	"sort"
 
-	"github.com/orware/sluice/internal/crypto"
-	"github.com/orware/sluice/internal/ir"
-	"github.com/orware/sluice/internal/translate"
+	"sluicesync.dev/sluice/internal/crypto"
+	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/translate"
 )
 
 // ChainRestoreStreamID is the stream identifier used by chain

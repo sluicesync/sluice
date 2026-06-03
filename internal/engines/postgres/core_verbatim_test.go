@@ -6,7 +6,7 @@ package postgres
 import (
 	"testing"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // ADR-0051 pins. Sibling tier to ADR-0047's USER-DEFINED uncatalogued

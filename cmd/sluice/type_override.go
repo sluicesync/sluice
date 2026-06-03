@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/orware/sluice/internal/config"
+	"sluicesync.dev/sluice/internal/config"
 )
 
 // resolveMappings combines the --type-override CLI flags with the

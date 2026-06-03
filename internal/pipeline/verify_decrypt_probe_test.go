@@ -9,8 +9,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/orware/sluice/internal/crypto"
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/crypto"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // TestVerifyBackupWith_DecryptProbe_Bug117 pins the Bug 117 (v0.94.1)

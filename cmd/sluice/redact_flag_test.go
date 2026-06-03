@@ -12,9 +12,9 @@ import (
 
 	"github.com/alecthomas/kong"
 
-	"github.com/orware/sluice/internal/config"
-	"github.com/orware/sluice/internal/ir"
-	"github.com/orware/sluice/internal/redact"
+	"sluicesync.dev/sluice/internal/config"
+	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/redact"
 )
 
 // TestRedactFlag_KongCommaPreservation pins Bug 59's regression

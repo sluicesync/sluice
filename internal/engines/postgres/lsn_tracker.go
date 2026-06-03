@@ -42,7 +42,7 @@ import (
 
 	"github.com/jackc/pglogrepl"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // lsnTracker is a single-producer / single-consumer holder for the

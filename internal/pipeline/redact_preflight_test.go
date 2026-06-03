@@ -8,8 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/orware/sluice/internal/ir"
-	"github.com/orware/sluice/internal/redact"
+	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/redact"
 )
 
 // TestPreflightRedactTypes covers Bug 60's preflight refusal +

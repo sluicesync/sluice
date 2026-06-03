@@ -1,7 +1,7 @@
 .PHONY: all build test test-it test-all bench lint vet fmt fmt-check pre-commit tidy clean help
 
 GO         ?= go
-PKG        := github.com/orware/sluice
+PKG        := sluicesync.dev/sluice
 BINARY     := sluice
 BUILD_DIR  := bin
 

@@ -28,9 +28,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orware/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/engines"
 
-	_ "github.com/orware/sluice/internal/engines/postgres"
+	_ "sluicesync.dev/sluice/internal/engines/postgres"
 )
 
 // TestADR0064_SmartCompaction_CollapsesUpdateChain_PG verifies that

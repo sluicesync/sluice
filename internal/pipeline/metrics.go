@@ -41,8 +41,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/orware/sluice/internal/appliercontrol"
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/appliercontrol"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // MetricsServer serves `/metrics` for an active sync stream. The

@@ -13,7 +13,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 func TestSchemaWriter_SetSchema(t *testing.T) {

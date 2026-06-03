@@ -7,7 +7,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // chanCopySource adapts an [ir.Row] channel to pgx's [CopyFromSource]

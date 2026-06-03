@@ -10,7 +10,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // PG → PG extension passthrough catalog (ADR-0032). The framework

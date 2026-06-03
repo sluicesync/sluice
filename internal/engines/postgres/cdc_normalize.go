@@ -3,7 +3,7 @@
 
 package postgres
 
-import "github.com/orware/sluice/internal/ir"
+import "sluicesync.dev/sluice/internal/ir"
 
 // NormalizeForCDCComparison strips IR Type / Column fields that PG's
 // CDC reader (pgoutput's RelationMessage projection — see

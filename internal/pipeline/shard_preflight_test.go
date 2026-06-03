@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // stubShardProber implements both [ir.TableEmptyChecker] and

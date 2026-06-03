@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/orware/sluice/internal/config"
+	"sluicesync.dev/sluice/internal/config"
 )
 
 func TestParseTypeOverride(t *testing.T) {

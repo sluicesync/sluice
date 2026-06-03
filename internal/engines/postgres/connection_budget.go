@@ -9,7 +9,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // connBudgetReserve is the number of connections sluice holds back from

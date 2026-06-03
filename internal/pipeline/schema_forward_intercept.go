@@ -39,8 +39,8 @@ import (
 	"log/slog"
 	"sync/atomic"
 
-	"github.com/orware/sluice/internal/ir"
-	"github.com/orware/sluice/internal/translate"
+	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/translate"
 )
 
 // schemaForwardDeps is the dependency surface

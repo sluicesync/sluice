@@ -27,10 +27,10 @@ import (
 	"database/sql"
 	"testing"
 
-	"github.com/orware/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/engines"
 
-	_ "github.com/orware/sluice/internal/engines/mysql"
-	_ "github.com/orware/sluice/internal/engines/postgres"
+	_ "sluicesync.dev/sluice/internal/engines/mysql"
+	_ "sluicesync.dev/sluice/internal/engines/postgres"
 )
 
 func TestMigrate_PostgresToPostgres_Bug76FilterBeforeColumnValidate(t *testing.T) {

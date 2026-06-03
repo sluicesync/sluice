@@ -10,7 +10,7 @@ import (
 
 	"github.com/jackc/pglogrepl"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // pgPos is the engine-side representation of a Postgres CDC position.

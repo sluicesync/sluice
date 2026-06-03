@@ -21,8 +21,8 @@ import (
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/replication"
 
-	"github.com/orware/sluice/internal/ir"
-	"github.com/orware/sluice/internal/netkeepalive"
+	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/netkeepalive"
 )
 
 // cdcChannelBuffer is the number of [ir.Change] events the CDC channel

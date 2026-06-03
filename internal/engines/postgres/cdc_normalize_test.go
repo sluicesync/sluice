@@ -6,7 +6,7 @@ package postgres
 import (
 	"testing"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // TestNormalizeForCDCComparison_PG pins the per-field zeroing rules

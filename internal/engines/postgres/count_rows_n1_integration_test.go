@@ -19,7 +19,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 func TestCountRows_N1_NeverAnalyzedSourceUsesExactCount(t *testing.T) {

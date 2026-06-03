@@ -6,7 +6,7 @@ package mysql
 import (
 	"testing"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 func TestQuoteIdent(t *testing.T) {

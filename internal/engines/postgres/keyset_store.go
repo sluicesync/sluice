@@ -8,7 +8,7 @@ import (
 	"database/sql"
 	"fmt"
 
-	"github.com/orware/sluice/internal/redact"
+	"sluicesync.dev/sluice/internal/redact"
 )
 
 // PII Phase 4 — Postgres `db:` keyset store (ADR-0041).

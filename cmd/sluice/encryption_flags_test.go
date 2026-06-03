@@ -10,8 +10,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/orware/sluice/internal/crypto"
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/crypto"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 func TestEncryptionFlags_ResolvePassphrase_Direct(t *testing.T) {

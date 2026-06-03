@@ -47,7 +47,7 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // Default lease timing per ADR-0054 §2 / DP-A. Mirror Kubernetes

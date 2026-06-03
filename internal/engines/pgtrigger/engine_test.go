@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/orware/sluice/internal/engines"
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // TestEngine_Registered confirms the package's init() side-effect

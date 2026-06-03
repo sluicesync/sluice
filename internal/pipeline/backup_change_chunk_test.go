@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // TestChangeChunk_RoundTrip is the load-bearing codec test for the

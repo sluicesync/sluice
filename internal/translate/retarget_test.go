@@ -6,7 +6,7 @@ package translate
 import (
 	"testing"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // TestRetargetForEngine_PGtoMySQL pins the v0.7.0 auto-emit defaults

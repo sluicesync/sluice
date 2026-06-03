@@ -11,7 +11,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // restoreRecorderEngine is a fake [ir.Engine] for restore tests: a

@@ -31,9 +31,9 @@ import (
 	// Engine packages are imported for their init() side effects, which
 	// register them with the engines registry. Add a new engine by
 	// importing its package here.
-	"github.com/orware/sluice/internal/engines/mysql"
-	_ "github.com/orware/sluice/internal/engines/pgtrigger"
-	_ "github.com/orware/sluice/internal/engines/postgres"
+	"sluicesync.dev/sluice/internal/engines/mysql"
+	_ "sluicesync.dev/sluice/internal/engines/pgtrigger"
+	_ "sluicesync.dev/sluice/internal/engines/postgres"
 )
 
 // version, commit, and date are populated at build time via -ldflags.

@@ -21,7 +21,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // TestProbeIndexBuildTuning_SaneNumbers asserts the raw probe reads

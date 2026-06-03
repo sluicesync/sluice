@@ -11,7 +11,7 @@ import (
 
 	"vitess.io/vitess/go/vt/proto/query"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // # VStream COPY-phase dedup (GitHub issue #14)

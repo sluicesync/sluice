@@ -32,11 +32,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orware/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/engines"
 
 	// Both engines must be registered for engines.Get to find them.
-	_ "github.com/orware/sluice/internal/engines/mysql"
-	_ "github.com/orware/sluice/internal/engines/postgres"
+	_ "sluicesync.dev/sluice/internal/engines/mysql"
+	_ "sluicesync.dev/sluice/internal/engines/postgres"
 )
 
 // TestMigrate_PostgresToMySQL_ArrayColumnBulkCopy pins the Bug 18

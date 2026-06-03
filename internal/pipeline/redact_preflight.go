@@ -9,8 +9,8 @@ import (
 	"math"
 	"strings"
 
-	"github.com/orware/sluice/internal/ir"
-	"github.com/orware/sluice/internal/redact"
+	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/redact"
 )
 
 // Bug 60 (closed v0.58.1): the `mask:uuid` strategy produces output

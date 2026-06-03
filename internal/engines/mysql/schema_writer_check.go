@@ -20,7 +20,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // AlterAddCheck implements [ir.ShapeDeltaApplier] for MySQL

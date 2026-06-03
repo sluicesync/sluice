@@ -33,7 +33,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // volatileDefaultFunctions is the explicit deny-list of source DEFAULT

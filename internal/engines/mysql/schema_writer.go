@@ -13,7 +13,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // SchemaWriter applies an IR Schema to a MySQL database in three

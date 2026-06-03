@@ -7,8 +7,8 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/orware/sluice/internal/engines/postgres"
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/engines/postgres"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // OpenSnapshotStream opens a TRIGGER-NATIVE consistent snapshot + CDC

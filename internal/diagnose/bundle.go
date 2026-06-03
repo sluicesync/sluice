@@ -18,7 +18,7 @@ import (
 	"sort"
 	"time"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // Request is the operator's diagnose-bundle request, populated by the

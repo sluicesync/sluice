@@ -10,7 +10,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // SchemaReader reads schema metadata from a MySQL database via

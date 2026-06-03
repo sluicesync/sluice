@@ -10,8 +10,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/orware/sluice/internal/ir"
-	"github.com/orware/sluice/internal/redact"
+	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/redact"
 )
 
 // helper: build a *ir.Column with name + nullable; type defaults

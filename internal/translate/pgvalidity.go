@@ -81,8 +81,8 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/orware/sluice/internal/ir"
-	"github.com/orware/sluice/internal/translate/exprident"
+	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/translate/exprident"
 )
 
 // UntranslatableExpr is one detected untranslatable function-call site.

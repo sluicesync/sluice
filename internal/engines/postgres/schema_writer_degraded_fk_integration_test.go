@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // degradedFKSeed is the IR shape both phases of the test share:

@@ -61,7 +61,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // TestVStream_SchemaEvolution_AddColumnMidStream is the headline

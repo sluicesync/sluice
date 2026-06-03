@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // TestSchemaReader_NonDefaultCoreOpclasses_Bug115 pins the v0.95.0

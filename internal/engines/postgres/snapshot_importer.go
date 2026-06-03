@@ -27,7 +27,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // SnapshotImporter is the engine-level surface for [ir.SnapshotImporter].

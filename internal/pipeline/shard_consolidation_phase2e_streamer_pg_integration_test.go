@@ -57,9 +57,9 @@ import (
 
 	"github.com/testcontainers/testcontainers-go"
 
-	"github.com/orware/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/engines"
 
-	_ "github.com/orware/sluice/internal/engines/postgres"
+	_ "sluicesync.dev/sluice/internal/engines/postgres"
 )
 
 // ---- per-test PG boot retry (ci-retry-asymmetry: per-test = 3

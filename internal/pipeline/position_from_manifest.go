@@ -22,7 +22,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // LoadChainTerminalPosition walks the lineage, validates its shape

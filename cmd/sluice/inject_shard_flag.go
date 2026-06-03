@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/orware/sluice/internal/pipeline"
+	"sluicesync.dev/sluice/internal/pipeline"
 )
 
 // parseInjectShardColumn parses the operator-supplied

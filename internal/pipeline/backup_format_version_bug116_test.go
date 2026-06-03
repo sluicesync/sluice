@@ -7,7 +7,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // TestBackup_FormatVersion_Bug116 pins the v0.94.1 Bug 116 closure at

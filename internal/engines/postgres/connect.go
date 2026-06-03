@@ -14,7 +14,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/stdlib"
 
-	"github.com/orware/sluice/internal/netkeepalive"
+	"sluicesync.dev/sluice/internal/netkeepalive"
 )
 
 // pgConfig captures the bits of the DSN sluice cares about beyond what

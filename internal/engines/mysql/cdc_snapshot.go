@@ -9,7 +9,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // OpenSnapshotStream opens a consistent source snapshot and returns

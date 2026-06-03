@@ -4,7 +4,7 @@
 package translate
 
 import (
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // RetargetForEngine rewrites a schema's column types from their

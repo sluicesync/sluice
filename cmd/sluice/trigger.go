@@ -10,7 +10,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/orware/sluice/internal/engines/pgtrigger"
+	"sluicesync.dev/sluice/internal/engines/pgtrigger"
 )
 
 // TriggerCmd groups the operator-facing trigger-engine setup +

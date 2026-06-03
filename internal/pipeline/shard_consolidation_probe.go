@@ -32,7 +32,7 @@ import (
 	"fmt"
 	"reflect"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // ShapeKind classifies an IR-delta into one of the recognized shapes

@@ -21,9 +21,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orware/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/engines"
 
-	_ "github.com/orware/sluice/internal/engines/mysql"
+	_ "sluicesync.dev/sluice/internal/engines/mysql"
 )
 
 func TestStreamer_Bug83_MySQL_LiveCoordination_AddColumn(t *testing.T) {

@@ -40,7 +40,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // Compile-time assertion that the PG engine satisfies the structural

@@ -70,7 +70,7 @@ import (
 // the docker engine restarts mid-shard, or when the mysqld process
 // inside the container dies while Docker still considers the
 // container running, see PR #73 run
-// https://github.com/orware/sluice/actions/runs/26533999631/job/78157843061
+// https://sluicesync.dev/sluice/actions/runs/26533999631/job/78157843061
 // where ~80 tests each emitted "[mysql] packets.go:58 unexpected EOF"
 // in resetSharedDB — every subsequent reset would otherwise fail
 // individually with the same noisy stack. The sentinel collapses
@@ -352,7 +352,7 @@ func ensureSharedMySQL(t *testing.T) (host, port, user, password string) {
 // **Why TCP-dial, not Container.IsRunning():** the PG counterpart's
 // first cut used IsRunning(), which queries Docker's view of the
 // container. Its own CI rerun
-// (https://github.com/orware/sluice/actions/runs/26527039528/job/78138790049)
+// (https://sluicesync.dev/sluice/actions/runs/26527039528/job/78138790049)
 // reproduced the exact cascade the sentinel was supposed to catch
 // and the loud DOCKER-ENGINE-DEAD log line was NOT emitted, proving
 // IsRunning() returned true while the SQL port was unreachable. The
@@ -374,7 +374,7 @@ func ensureSharedMySQL(t *testing.T) (host, port, user, password string) {
 // stack traces.
 //
 // Original MySQL cascade: PR #73 run
-// https://github.com/orware/sluice/actions/runs/26533999631/job/78157843061
+// https://sluicesync.dev/sluice/actions/runs/26533999631/job/78157843061
 // where ~80 engines-mysql tests all reported the driver-level EOF in
 // resetSharedDB after the shared mysqld died mid-shard. The boot
 // retry above (sharedMySQLBootAttempts) only protects the initial

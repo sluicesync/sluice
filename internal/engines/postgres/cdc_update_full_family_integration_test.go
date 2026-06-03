@@ -51,7 +51,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // bug92SeedDDL is applied identically to source and target: a table that

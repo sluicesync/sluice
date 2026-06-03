@@ -22,7 +22,7 @@ import (
 	"reflect"
 	"strings"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // ProbeAddColumn implements [pipeline.ShardConsolidationProber] for

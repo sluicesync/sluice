@@ -37,7 +37,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // SlotHealthThresholds carries the configurable bounds the threshold

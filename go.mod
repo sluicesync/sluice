@@ -1,4 +1,4 @@
-module github.com/orware/sluice
+module sluicesync.dev/sluice
 
 go 1.26.2
 

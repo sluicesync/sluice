@@ -12,7 +12,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // failOnNthPutStore wraps a [LocalStore] and returns ErrInjected on the

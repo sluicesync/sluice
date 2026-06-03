@@ -12,7 +12,7 @@ import (
 	"vitess.io/vitess/go/vt/proto/binlogdata"
 	"vitess.io/vitess/go/vt/proto/query"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // TestVStreamSnapshot_CopyPhaseBuffering walks the dispatcher

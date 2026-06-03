@@ -13,7 +13,7 @@ import (
 
 	gomysql "github.com/go-sql-driver/mysql"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // TestClassifyApplierError_NilInNilOut is the boring boundary case

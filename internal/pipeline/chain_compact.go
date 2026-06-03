@@ -17,7 +17,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // # `sluice backup compact` — naive lineage segment compaction (ADR-0046 §14d)

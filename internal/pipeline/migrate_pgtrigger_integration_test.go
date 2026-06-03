@@ -40,13 +40,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orware/sluice/internal/engines"
-	"github.com/orware/sluice/internal/engines/pgtrigger"
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/engines/pgtrigger"
+	"sluicesync.dev/sluice/internal/ir"
 
 	// Side-effect imports register both engines.
-	_ "github.com/orware/sluice/internal/engines/pgtrigger"
-	_ "github.com/orware/sluice/internal/engines/postgres"
+	_ "sluicesync.dev/sluice/internal/engines/pgtrigger"
+	_ "sluicesync.dev/sluice/internal/engines/postgres"
 
 	"github.com/testcontainers/testcontainers-go"
 	pgtc "github.com/testcontainers/testcontainers-go/modules/postgres"

@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // TestResolveParent_CreatedAtTieDoesNotBranchChain pins the ADR-0046

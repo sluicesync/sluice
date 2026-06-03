@@ -26,7 +26,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // pumpBatchedChanges feeds a slice of changes through ApplyBatch.

@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/orware/sluice/internal/config"
+	"sluicesync.dev/sluice/internal/config"
 )
 
 // TestLoadDictionaries_NilEmpty pins the no-op default: nil / empty

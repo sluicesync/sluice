@@ -35,8 +35,8 @@ import (
 	"hash"
 	"io"
 
-	"github.com/orware/sluice/internal/crypto"
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/crypto"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // changeChunkHeader is the on-wire shape of a change-chunk's first

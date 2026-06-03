@@ -6,7 +6,7 @@ package pipeline
 import (
 	"testing"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // TestIncrementalBackup_ScopeFromParentManifest pins the v0.94.0

@@ -28,7 +28,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // openLabelledIdleInTx opens a connection with the given application_name,

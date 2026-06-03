@@ -11,7 +11,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // querier is the slice of database/sql RowReader needs from its query

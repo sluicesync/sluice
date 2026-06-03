@@ -48,7 +48,7 @@ import (
 	"sort"
 	"time"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // LineageCatalogFileName is the filename of the lineage catalog within

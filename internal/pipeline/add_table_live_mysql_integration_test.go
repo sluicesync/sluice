@@ -33,9 +33,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orware/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/engines"
 
-	_ "github.com/orware/sluice/internal/engines/mysql"
+	_ "sluicesync.dev/sluice/internal/engines/mysql"
 )
 
 // TestStreamer_AddTable_LiveMode_MySQL is the load-bearing scenario for ADR-

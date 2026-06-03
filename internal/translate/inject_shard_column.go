@@ -6,7 +6,7 @@ package translate
 import (
 	"fmt"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // InjectShardColumn returns a copy of s with a sluice-injected

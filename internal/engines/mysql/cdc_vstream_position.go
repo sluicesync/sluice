@@ -9,7 +9,7 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // VStream position encoding lives in its own file because it's

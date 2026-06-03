@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // stubEmptyChecker is a fake [ir.RowWriter] + [ir.TableEmptyChecker]

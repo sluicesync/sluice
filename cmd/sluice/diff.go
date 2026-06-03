@@ -4,9 +4,9 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/orware/sluice/internal/config"
-	"github.com/orware/sluice/internal/ir"
-	"github.com/orware/sluice/internal/pipeline"
+	"sluicesync.dev/sluice/internal/config"
+	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline"
 )
 
 // SchemaDiffCmd implements `sluice schema diff` (ADR-0029). Reads the

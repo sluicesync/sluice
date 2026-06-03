@@ -12,11 +12,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/orware/sluice/internal/config"
-	"github.com/orware/sluice/internal/crypto"
-	"github.com/orware/sluice/internal/ir"
-	"github.com/orware/sluice/internal/pipeline"
-	"github.com/orware/sluice/internal/redact"
+	"sluicesync.dev/sluice/internal/config"
+	"sluicesync.dev/sluice/internal/crypto"
+	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline"
+	"sluicesync.dev/sluice/internal/redact"
 )
 
 // EncryptionFlags is the shared kong flag set for `--encrypt*` and

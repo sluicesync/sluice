@@ -58,7 +58,7 @@ import (
 	"log/slog"
 	"sync/atomic"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // interceptSchemaSnapshotsForCoordination wraps changes with a

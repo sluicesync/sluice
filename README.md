@@ -19,7 +19,7 @@ Pre-built Linux / macOS / Windows binaries on every tagged release: [latest rele
 
 ```bash
 # Install
-go install github.com/orware/sluice/cmd/sluice@latest
+go install sluicesync.dev/sluice/cmd/sluice@latest
 
 # One-shot migration: MySQL → Postgres
 sluice migrate \

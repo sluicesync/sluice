@@ -16,7 +16,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // pgCheckExprMatrix returns the same {simple, JSON, datetime}

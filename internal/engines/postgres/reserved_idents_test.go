@@ -6,7 +6,7 @@ package postgres
 import (
 	"testing"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // TestRequotePGReservedIdents pins the validation-rig catalog Bug 63

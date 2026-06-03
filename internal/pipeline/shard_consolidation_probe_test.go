@@ -8,7 +8,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // fakeProber is an in-memory ShardConsolidationProber that returns

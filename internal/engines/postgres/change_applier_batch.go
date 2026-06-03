@@ -48,7 +48,7 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // defaultIdleFlushPeriod is the maximum time a partial batch

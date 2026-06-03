@@ -26,9 +26,9 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/orware/sluice/internal/config"
-	"github.com/orware/sluice/internal/ir"
-	"github.com/orware/sluice/internal/translate"
+	"sluicesync.dev/sluice/internal/config"
+	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/translate"
 )
 
 // Differ runs a single schema-diff against the configured source/

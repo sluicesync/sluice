@@ -9,7 +9,7 @@ import (
 
 	gomysql "github.com/go-mysql-org/go-mysql/mysql"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // PositionAtOrAfter implements [ir.PositionOrderer] for the MySQL

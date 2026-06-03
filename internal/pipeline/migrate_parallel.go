@@ -58,8 +58,8 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
-	"github.com/orware/sluice/internal/ir"
-	"github.com/orware/sluice/internal/redact"
+	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/redact"
 )
 
 // parallelBulkCopyDeps bundles the engine-level dependencies

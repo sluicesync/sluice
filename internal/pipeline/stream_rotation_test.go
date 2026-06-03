@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // fakeMonotonicEngine is a fakeCDCEngine that also implements

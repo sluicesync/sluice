@@ -8,7 +8,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // budgetProberEngine is a fake ir.Engine that implements

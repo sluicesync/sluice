@@ -10,7 +10,7 @@
 
 package postgres
 
-import "github.com/orware/sluice/internal/translate/exprident"
+import "sluicesync.dev/sluice/internal/translate/exprident"
 
 // pgExprGrammarKeywords is the subset of PG reserved words that can
 // appear unquoted in an expression body in a grammatical role:

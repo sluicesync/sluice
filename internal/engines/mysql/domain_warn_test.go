@@ -25,7 +25,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // TestMaybeWarnDomainCheckDrop_NoOpForMySQLSource: a schema with no

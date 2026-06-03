@@ -53,8 +53,8 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/orware/sluice/internal/crypto"
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/crypto"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // chunkHeaderVersion is the chunk-file format version embedded in

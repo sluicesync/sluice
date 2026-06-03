@@ -10,7 +10,7 @@
 
 package postgres
 
-import "github.com/orware/sluice/internal/translate/exprident"
+import "sluicesync.dev/sluice/internal/translate/exprident"
 
 func isIdentifierByte(b byte) bool { return exprident.IsIdentifierByte(b) }
 

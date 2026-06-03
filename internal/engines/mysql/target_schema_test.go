@@ -14,7 +14,7 @@ package mysql
 import (
 	"testing"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // TestMySQLEngine_DeclaresFlatSchemaScope is the load-bearing

@@ -21,7 +21,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // VerifyDepth selects which depth of verification to run. Count is the

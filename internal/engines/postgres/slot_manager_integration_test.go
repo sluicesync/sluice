@@ -18,7 +18,7 @@ import (
 
 	"github.com/jackc/pglogrepl"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // TestSlotManager_ListEmpty confirms the manager returns an empty

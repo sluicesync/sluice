@@ -33,7 +33,7 @@ import (
 
 	"github.com/jackc/pglogrepl"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // streamAbortWireBytes builds the pgoutput StreamAbort message body.

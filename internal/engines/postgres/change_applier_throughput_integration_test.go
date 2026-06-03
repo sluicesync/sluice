@@ -19,7 +19,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // TestChangeApplier_ApplyBatch_ThroughputComparison runs the same

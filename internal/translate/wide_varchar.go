@@ -31,7 +31,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // wideVarcharThresholdChars mirrors mysqlMaxInlineVarcharChars in

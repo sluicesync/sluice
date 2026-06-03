@@ -64,7 +64,7 @@ import (
 	"fmt"
 	"log/slog"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // LeaseGCDeps bundles the engine surfaces the sweeper dispatches

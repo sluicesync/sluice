@@ -59,8 +59,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/orware/sluice/internal/crypto"
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/crypto"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // DefaultRolloverWindow is the wall-clock cadence each rollover commits

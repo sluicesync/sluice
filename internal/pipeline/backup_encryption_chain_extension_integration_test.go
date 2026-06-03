@@ -38,11 +38,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orware/sluice/internal/crypto"
-	"github.com/orware/sluice/internal/engines"
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/crypto"
+	"sluicesync.dev/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/ir"
 
-	_ "github.com/orware/sluice/internal/engines/postgres"
+	_ "sluicesync.dev/sluice/internal/engines/postgres"
 )
 
 // passphraseRebuildHook is the test-local mirror of the CLI helper

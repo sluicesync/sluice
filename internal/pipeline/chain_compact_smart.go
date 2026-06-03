@@ -60,7 +60,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // PKStrategy controls how smart-compact identifies "the same row"

@@ -9,7 +9,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // Bug 100 (v0.92.0). PG native declarative partitioning

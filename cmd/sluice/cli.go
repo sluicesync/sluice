@@ -15,12 +15,12 @@ import (
 	"github.com/alecthomas/kong"
 	units "github.com/docker/go-units"
 
-	"github.com/orware/sluice/internal/config"
-	"github.com/orware/sluice/internal/engines"
-	"github.com/orware/sluice/internal/engines/postgres"
-	"github.com/orware/sluice/internal/ir"
-	"github.com/orware/sluice/internal/pipeline"
-	"github.com/orware/sluice/internal/redact"
+	"sluicesync.dev/sluice/internal/config"
+	"sluicesync.dev/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/engines/postgres"
+	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline"
+	"sluicesync.dev/sluice/internal/redact"
 )
 
 // Globals are flags shared across every subcommand. Embedding into the

@@ -39,7 +39,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // defaultBulkParallelMinRows is the row-count threshold below which a

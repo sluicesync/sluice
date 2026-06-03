@@ -52,10 +52,10 @@ import (
 	"log/slog"
 	"strings"
 
-	"github.com/orware/sluice/internal/config"
-	"github.com/orware/sluice/internal/ir"
-	"github.com/orware/sluice/internal/redact"
-	"github.com/orware/sluice/internal/translate"
+	"sluicesync.dev/sluice/internal/config"
+	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/redact"
+	"sluicesync.dev/sluice/internal/translate"
 )
 
 // publicationAdder is the optional engine-side surface for the

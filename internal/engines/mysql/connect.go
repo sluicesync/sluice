@@ -14,7 +14,7 @@ import (
 
 	"github.com/go-sql-driver/mysql"
 
-	"github.com/orware/sluice/internal/netkeepalive"
+	"sluicesync.dev/sluice/internal/netkeepalive"
 )
 
 // keepaliveNet is a custom driver "network" name registered with the

@@ -28,7 +28,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // RangeBounds implements [ir.RangeBoundsQuerier]. Queries the source

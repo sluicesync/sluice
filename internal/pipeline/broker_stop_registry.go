@@ -32,7 +32,7 @@ package pipeline
 import (
 	"sync"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // brokerStopRegistry tracks running [SyncFromBackup] instances by

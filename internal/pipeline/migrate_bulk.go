@@ -36,8 +36,8 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/orware/sluice/internal/ir"
-	"github.com/orware/sluice/internal/redact"
+	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/redact"
 )
 
 // defaultBulkBatchSize is the per-batch row count when [Migrator]'s

@@ -35,7 +35,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // UnconstrainedNumericNotice names one column whose unconstrained PG

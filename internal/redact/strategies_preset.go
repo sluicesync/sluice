@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // This file holds PII Phase 2.b country/format-specific mask

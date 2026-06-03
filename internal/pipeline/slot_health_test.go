@@ -25,7 +25,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // fixedNow returns a wall-clock baseline the tests can offset from.

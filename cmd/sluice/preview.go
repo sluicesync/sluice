@@ -7,9 +7,9 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/orware/sluice/internal/config"
-	"github.com/orware/sluice/internal/pipeline"
-	"github.com/orware/sluice/internal/redact"
+	"sluicesync.dev/sluice/internal/config"
+	"sluicesync.dev/sluice/internal/pipeline"
+	"sluicesync.dev/sluice/internal/redact"
 )
 
 // SchemaCmd groups subcommands that inspect or describe schemas

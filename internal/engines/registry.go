@@ -10,7 +10,7 @@
 //
 //	package mysql
 //
-//	import "github.com/orware/sluice/internal/engines"
+//	import "sluicesync.dev/sluice/internal/engines"
 //
 //	func init() {
 //	    engines.Register(&Engine{})
@@ -26,7 +26,7 @@ import (
 	"sort"
 	"sync"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 var (

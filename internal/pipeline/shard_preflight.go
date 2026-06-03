@@ -46,7 +46,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // errShardConsolidationRefused is the sentinel cause for a Shape-A

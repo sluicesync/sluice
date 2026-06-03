@@ -30,7 +30,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // TestCDCReader_CompositePK exercises a table with a two-column

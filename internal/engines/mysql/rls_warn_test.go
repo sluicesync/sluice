@@ -27,7 +27,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // captureSlogWarn installs a JSON slog handler that writes into a

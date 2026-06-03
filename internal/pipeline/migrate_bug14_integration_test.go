@@ -26,11 +26,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orware/sluice/internal/config"
-	"github.com/orware/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/config"
+	"sluicesync.dev/sluice/internal/engines"
 
-	_ "github.com/orware/sluice/internal/engines/mysql"
-	_ "github.com/orware/sluice/internal/engines/postgres"
+	_ "sluicesync.dev/sluice/internal/engines/mysql"
+	_ "sluicesync.dev/sluice/internal/engines/postgres"
 )
 
 // TestMigrate_PostgresToMySQL_ArrayToJSONOverride exercises the

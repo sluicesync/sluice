@@ -30,7 +30,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // psMySQLDSN returns the PS-MySQL source DSN. Same env-then-file

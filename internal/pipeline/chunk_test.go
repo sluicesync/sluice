@@ -10,7 +10,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // stubRangeQuerier returns prearranged min/max values without hitting

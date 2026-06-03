@@ -29,7 +29,7 @@ import (
 	"log/slog"
 	"strings"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // PatroniMode constants for [Streamer.PatroniMode]. The flag is a

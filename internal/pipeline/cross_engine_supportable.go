@@ -22,7 +22,7 @@ package pipeline
 import (
 	"fmt"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // checkCrossEngineSupportable scans the schema for column types that

@@ -13,7 +13,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgconn"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // TestClassifyApplierError_NilInNilOut — boundary case the pipeline

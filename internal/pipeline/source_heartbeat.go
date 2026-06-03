@@ -40,7 +40,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // DefaultSourceHeartbeatTableName is the source-side table the per-

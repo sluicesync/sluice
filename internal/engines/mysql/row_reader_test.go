@@ -17,7 +17,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // TestRowReader_TypeRoundTrip exercises a fixture covering the common

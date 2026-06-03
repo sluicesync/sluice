@@ -11,7 +11,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/orware/sluice/internal/engines/postgres"
+	"sluicesync.dev/sluice/internal/engines/postgres"
 )
 
 // Standard names for the engine's source-side artifacts. ADR-0066 §2,

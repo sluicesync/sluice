@@ -6,7 +6,7 @@ package postgres
 import (
 	"testing"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // Postgres-side mirror of the MySQL applier's Shape-A applier

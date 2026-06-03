@@ -8,7 +8,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // engineNamePosition is the [ir.Position.Engine] tag this engine

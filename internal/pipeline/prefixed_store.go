@@ -9,7 +9,7 @@ import (
 	"path"
 	"strings"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // prefixedStore wraps an [ir.BackupStore] with a path prefix that's

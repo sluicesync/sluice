@@ -17,7 +17,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orware/sluice/internal/redact"
+	"sluicesync.dev/sluice/internal/redact"
 )
 
 func TestKeysetStore_PG_RoundTrip(t *testing.T) {

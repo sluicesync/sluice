@@ -27,7 +27,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // applyRLSFixture creates two tables, enables RLS (one regular, one

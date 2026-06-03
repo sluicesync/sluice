@@ -11,8 +11,8 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"github.com/orware/sluice/internal/config"
-	"github.com/orware/sluice/internal/redact"
+	"sluicesync.dev/sluice/internal/config"
+	"sluicesync.dev/sluice/internal/redact"
 )
 
 // parseRedactFlags converts the operator's `--redact TABLE.COLUMN=STRATEGY[:options]`

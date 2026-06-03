@@ -11,8 +11,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/orware/sluice/internal/config"
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/config"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // previewStubEngine is a minimal ir.Engine implementation for the

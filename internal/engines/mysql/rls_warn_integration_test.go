@@ -32,7 +32,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 func TestRLSWarn_PGtoMySQL_DropsPoliciesAndWarnsOnce(t *testing.T) {

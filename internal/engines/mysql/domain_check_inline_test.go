@@ -11,7 +11,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // TestEmitTableDef_DomainCheck_TextRegex_InlineCheckSupported pins the

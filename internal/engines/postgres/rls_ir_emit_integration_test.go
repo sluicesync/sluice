@@ -26,7 +26,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // rlsMatrixFixtureDDL is the source-side multi-policy schema that

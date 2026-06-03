@@ -10,7 +10,7 @@ import (
 	"io"
 	"log/slog"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // Cutover drives the two-phase cutover sequence priming pass —

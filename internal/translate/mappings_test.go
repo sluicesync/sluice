@@ -8,8 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/orware/sluice/internal/config"
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/config"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // schemaWith returns a small fixture schema with the named columns,

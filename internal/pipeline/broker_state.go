@@ -29,7 +29,7 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // DefaultBrokerStateFilename is the path within the chain store the

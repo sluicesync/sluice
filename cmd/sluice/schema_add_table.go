@@ -9,8 +9,8 @@ import (
 	"os"
 	"strings"
 
-	"github.com/orware/sluice/internal/config"
-	"github.com/orware/sluice/internal/pipeline"
+	"sluicesync.dev/sluice/internal/config"
+	"sluicesync.dev/sluice/internal/pipeline"
 )
 
 // SchemaAddTableCmd implements `sluice schema add-table` — the

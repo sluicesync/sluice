@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // TestIsStreamNotFoundErr mirrors TestIsSlotNotFoundErr: the helper

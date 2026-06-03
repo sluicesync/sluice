@@ -19,7 +19,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // validateTargetSchema enforces the engine-capability gate for

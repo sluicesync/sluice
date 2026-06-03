@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // TestCompactChain_SmartCompaction_CollapsesAcrossGroup pins the

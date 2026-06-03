@@ -22,7 +22,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // startPostgresForSnapshotCDC returns a DSN pointed at a freshly-reset

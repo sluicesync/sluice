@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // TestCutover_ValidatesInputs pins the validate-first ordering — any

@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // backupRecorderEngine is a fake [ir.Engine] tailored to backup tests:

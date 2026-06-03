@@ -7,7 +7,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // int64Val is a small helper so test cases can write &int64Val(255)

@@ -4,7 +4,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/orware/sluice/internal/config"
+	"sluicesync.dev/sluice/internal/config"
 )
 
 // TestResolveTableFilterArgs covers the precedence rule between

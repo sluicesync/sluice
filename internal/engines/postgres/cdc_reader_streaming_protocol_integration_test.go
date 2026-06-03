@@ -40,7 +40,7 @@ import (
 	"github.com/testcontainers/testcontainers-go"
 	pgtc "github.com/testcontainers/testcontainers-go/modules/postgres"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // startPostgresForCDCWithSmallDecodeMem boots a PG container with

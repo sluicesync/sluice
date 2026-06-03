@@ -11,7 +11,7 @@ import (
 	"sort"
 	"time"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // # `sluice backup prune` — lineage retention pruning (ADR-0046 §4)

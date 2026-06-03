@@ -10,7 +10,7 @@ import (
 
 	"vitess.io/vitess/go/vt/proto/query"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // TestProjectVStreamFields_EveryFieldFamily is the Bug-74-class pin

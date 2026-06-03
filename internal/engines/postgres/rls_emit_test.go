@@ -17,7 +17,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // TestEmitRLSStatements_NoOpWhenNothingToEmit pins the common-case

@@ -26,7 +26,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // verbatimExtensionColumnsIn returns the sorted "schema.table.column"

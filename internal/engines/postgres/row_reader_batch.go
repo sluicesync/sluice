@@ -32,7 +32,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // ReadRowsBatch implements [ir.BatchedRowReader]. See the file-header

@@ -9,7 +9,7 @@ import (
 
 	"github.com/jackc/pglogrepl"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 func collectPGSnapshots(out chan ir.Change) []ir.SchemaSnapshot {

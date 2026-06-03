@@ -17,7 +17,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // stubSlotHealthReporter is a controllable reporter for the loop tests.

@@ -6,7 +6,7 @@ package pipeline
 import (
 	"context"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // recordingEngineWithStore wraps recordingEngine with the

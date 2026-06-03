@@ -55,7 +55,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // regexCheckBodyPattern matches a PG DOMAIN regex CHECK body. The

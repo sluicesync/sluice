@@ -17,7 +17,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // schemaDeltaRecorderEngine: an [ir.Engine] whose schema writer

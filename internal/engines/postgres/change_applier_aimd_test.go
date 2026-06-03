@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // closedDB opens a pgx-backed *sql.DB on a throwaway DSN and closes it

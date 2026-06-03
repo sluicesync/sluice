@@ -29,9 +29,9 @@ import (
 	"io"
 	"log/slog"
 
-	"github.com/orware/sluice/internal/crypto"
-	"github.com/orware/sluice/internal/ir"
-	"github.com/orware/sluice/internal/translate"
+	"sluicesync.dev/sluice/internal/crypto"
+	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/translate"
 )
 
 // Restore runs a single Phase 1 full restore from Store into Target /

@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/orware/sluice/internal/diagnose"
+	"sluicesync.dev/sluice/internal/diagnose"
 )
 
 // DiagnoseCmd implements `sluice diagnose` — the operator-bundle

@@ -11,7 +11,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // defaultCountChunkSize controls the chunked-count fallback for

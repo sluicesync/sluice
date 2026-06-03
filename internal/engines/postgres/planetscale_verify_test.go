@@ -30,7 +30,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // dsnPair returns the source/destination PS-PG DSNs. Tries env vars

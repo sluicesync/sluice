@@ -10,7 +10,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // ExactRowCount implements [ir.Verifier]. Returns the exact row count

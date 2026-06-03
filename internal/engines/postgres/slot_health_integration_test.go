@@ -24,7 +24,7 @@ import (
 
 	"github.com/jackc/pglogrepl"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // TestSlotHealth_NoSlot pins the "unavailable" surface: querying for a

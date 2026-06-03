@@ -3,7 +3,7 @@
 
 package mysql
 
-import "github.com/orware/sluice/internal/ir"
+import "sluicesync.dev/sluice/internal/ir"
 
 // NormalizeForCDCComparison strips Table fields the MySQL CDC
 // reader's tableSchema-derived projection cannot carry from the

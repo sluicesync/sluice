@@ -7,7 +7,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // # PlanetScale backup snapshot via VStream COPY mode (GitHub issue #16)

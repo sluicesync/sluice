@@ -27,7 +27,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // TestCutoverSequencePrimer_MySQL_PrimesPlusIdempotent pins the cold

@@ -30,7 +30,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // stubHeartbeatWriter is a controllable HeartbeatWriter for the loop

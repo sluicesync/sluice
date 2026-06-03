@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // TestLineage_LoadAbsent: a store without lineage.json reports

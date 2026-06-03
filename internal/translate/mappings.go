@@ -18,8 +18,8 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/orware/sluice/internal/config"
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/config"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // ApplyMappings rewrites column types in s according to the per-

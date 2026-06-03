@@ -16,7 +16,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orware/sluice/internal/redact"
+	"sluicesync.dev/sluice/internal/redact"
 )
 
 func TestKeysetStore_MySQL_RoundTrip(t *testing.T) {

@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // fakeCDCEngine is a backup-recorder analogue for incremental tests:

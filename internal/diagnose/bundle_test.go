@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // fakeEngine + fakeApplier + fakeSchemaReader are minimal in-memory

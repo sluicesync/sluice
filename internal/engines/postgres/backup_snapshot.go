@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // backupSnapshotSlotPrefix is the prefix the backup-anchor temporary

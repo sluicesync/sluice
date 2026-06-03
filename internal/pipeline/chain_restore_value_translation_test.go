@@ -28,7 +28,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // writeOneChangeChunk encodes the supplied changes into a change

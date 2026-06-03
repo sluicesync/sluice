@@ -14,8 +14,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orware/sluice/internal/appliercontrol"
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/appliercontrol"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // appliercontrolSnapshot builds an appliercontrol.MetricsSnapshot

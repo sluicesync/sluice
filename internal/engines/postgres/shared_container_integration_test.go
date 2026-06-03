@@ -96,7 +96,7 @@ import (
 // self-hosted CI runner pool when the docker engine restarts
 // mid-shard, or when the postgres process inside the container dies
 // while Docker still considers the container running, see PR #71
-// d00f9a2 run https://github.com/orware/sluice/actions/runs/26524797251/job/78125648574
+// d00f9a2 run https://sluicesync.dev/sluice/actions/runs/26524797251/job/78125648574
 // where ~80 tests each spent ~30ms hitting "connection refused" in
 // resetSharedDB — every subsequent reset would otherwise fail
 // individually with the same noisy stack. The sentinel collapses
@@ -106,7 +106,7 @@ import (
 //
 // The liveness probe used is a fast TCP dial against the mapped SQL
 // port, not Container.IsRunning(). PR #72's own CI run
-// (https://github.com/orware/sluice/actions/runs/26527039528/job/78138790049)
+// (https://sluicesync.dev/sluice/actions/runs/26527039528/job/78138790049)
 // reproduced the cascade with IsRunning() in place and proved that
 // Docker can report the container as running while the SQL port
 // refuses connections — so IsRunning() is too coarse a signal.
@@ -348,7 +348,7 @@ func ensureSharedPostgres(t *testing.T) (host, port, user, password string) {
 // **Why TCP-dial, not Container.IsRunning():** the first cut of this
 // sentinel used IsRunning(), which queries Docker's view of the
 // container. PR #72's own CI run
-// (https://github.com/orware/sluice/actions/runs/26527039528/job/78138790049)
+// (https://sluicesync.dev/sluice/actions/runs/26527039528/job/78138790049)
 // reproduced the exact cascade the sentinel was supposed to catch —
 // ~80 tests all failing in resetSharedDB with "dial tcp ...: connect:
 // connection refused" — and the loud DOCKER-ENGINE-DEAD log line was
@@ -371,7 +371,7 @@ func ensureSharedPostgres(t *testing.T) (host, port, user, password string) {
 // (~30ms each).
 //
 // Original cascade: PR #71 d00f9a2 (run
-// https://github.com/orware/sluice/actions/runs/26524797251/job/78125648574).
+// https://sluicesync.dev/sluice/actions/runs/26524797251/job/78125648574).
 // PR #72's own retrigger reproduced it again with the IsRunning()
 // sentinel still in place, which is what motivated the TCP-dial
 // upgrade. The boot retry above (sharedPostgresBootAttempts) only

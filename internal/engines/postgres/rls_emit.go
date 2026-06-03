@@ -21,7 +21,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // emitRLSStatements renders the row-level-security DDL for a single

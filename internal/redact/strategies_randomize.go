@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // PII Phase 2.c first wave — replay-stable randomize strategies.

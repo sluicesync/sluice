@@ -36,7 +36,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 
 	// Bug 79 (v0.70.2): the cross-engine pin and the unregistered-
 	// source-engine pin exercise PrimeSchemaHistoryCache's
@@ -48,7 +48,7 @@ import (
 	// happening to register only MySQL). This blank import mirrors
 	// the pattern the pipeline package's cross-engine integration
 	// tests use (e.g. internal/pipeline/migrate_cross_integration_test.go).
-	_ "github.com/orware/sluice/internal/engines/postgres"
+	_ "sluicesync.dev/sluice/internal/engines/postgres"
 )
 
 func TestPrimeSchemaHistoryCache_Integration_SeedsFromStorage(t *testing.T) {

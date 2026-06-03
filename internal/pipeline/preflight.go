@@ -45,7 +45,7 @@ import (
 	"fmt"
 	"log/slog"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // errColdStartRefused is the sentinel cause for a pre-flight refusal.

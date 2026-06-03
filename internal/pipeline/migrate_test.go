@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // safeBuffer is a mutex-protected [bytes.Buffer] wrapper used as the

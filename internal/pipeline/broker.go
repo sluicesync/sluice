@@ -66,9 +66,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/orware/sluice/internal/crypto"
-	"github.com/orware/sluice/internal/ir"
-	"github.com/orware/sluice/internal/translate"
+	"sluicesync.dev/sluice/internal/crypto"
+	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/translate"
 )
 
 // BackupBrokerPositionEngine is the sentinel value the broker writes

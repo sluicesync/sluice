@@ -37,7 +37,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // UnsignedBigintNotice names one column whose MySQL `bigint unsigned`

@@ -30,7 +30,7 @@ package pipeline
 import (
 	"sync"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // streamStopRegistry tracks running [BackupStream] instances by their

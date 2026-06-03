@@ -27,8 +27,8 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/orware/sluice/internal/ir"
-	"github.com/orware/sluice/internal/translate/exprident"
+	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/translate/exprident"
 )
 
 // GeneratedColRefGeneratedCol is one detected site where a generated

@@ -10,7 +10,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/orware/sluice/internal/config"
+	"sluicesync.dev/sluice/internal/config"
 )
 
 // PII Phase 3 — dictionary loading.

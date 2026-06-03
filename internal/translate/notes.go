@@ -16,7 +16,7 @@ package translate
 import (
 	"fmt"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // Note describes a single per-column translation note. Returned by

@@ -27,7 +27,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // engageShardCoordination constructs the LeaseManager + BoundaryRouter

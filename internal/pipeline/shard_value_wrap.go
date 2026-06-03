@@ -7,7 +7,7 @@ import (
 	"context"
 	"sync"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // shardStampRow stamps the operator-supplied discriminator

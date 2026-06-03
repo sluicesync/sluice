@@ -11,7 +11,7 @@
 //
 // The engine is registered automatically when this package is imported:
 //
-//	import _ "github.com/orware/sluice/internal/engines/pgtrigger"
+//	import _ "sluicesync.dev/sluice/internal/engines/pgtrigger"
 //
 // See ADR-0066 for the full design. Phase 1 (v0.85.0) shipped:
 //
@@ -58,9 +58,9 @@ package pgtrigger
 import (
 	"context"
 
-	"github.com/orware/sluice/internal/engines"
-	"github.com/orware/sluice/internal/engines/postgres"
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/engines/postgres"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // EngineName is the short identifier the engine self-registers under.

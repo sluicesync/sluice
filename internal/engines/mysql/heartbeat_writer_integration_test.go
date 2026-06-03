@@ -29,7 +29,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // TestEnsureHeartbeatTable_CreatesAndIdempotent pins the table-create

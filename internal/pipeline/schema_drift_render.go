@@ -31,7 +31,7 @@ package pipeline
 import (
 	"strings"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // RenderSchemaDriftReport produces the multi-line operator-actionable

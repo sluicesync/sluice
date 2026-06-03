@@ -8,7 +8,7 @@ import (
 
 	"github.com/jackc/pglogrepl"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // PositionAtOrAfter implements [ir.PositionOrderer] for the Postgres

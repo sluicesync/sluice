@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // TestStreamState_RoundTrip verifies the JSON round-trip of the state

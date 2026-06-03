@@ -8,7 +8,7 @@
 //
 // The engine is registered automatically when this package is imported:
 //
-//	import _ "github.com/orware/sluice/internal/engines/postgres"
+//	import _ "sluicesync.dev/sluice/internal/engines/postgres"
 //
 // At this stage of the project, only [SchemaReader] is implemented;
 // the other Open* methods return [ErrNotImplemented]. RowReader,
@@ -24,8 +24,8 @@ import (
 
 	"github.com/jackc/pglogrepl"
 
-	"github.com/orware/sluice/internal/engines"
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/engines"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // ErrNotImplemented is returned by Engine methods whose underlying

@@ -9,8 +9,8 @@ import (
 	"os"
 	"strings"
 
-	"github.com/orware/sluice/internal/ir"
-	"github.com/orware/sluice/internal/pipeline"
+	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/pipeline"
 )
 
 // CutoverCmd implements `sluice cutover`. The two-phase sequence

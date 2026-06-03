@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orware/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // pumpReader emits rows on a goroutine that selects on ctx.Done(). It
