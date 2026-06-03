@@ -18,7 +18,7 @@ When to pick this up: when the operator decides the cycle-time / GitHub-issue-ro
 - **Tooling installed**: Go 1.26.2 (matches `go.mod`), Docker 29.1.3 (daemon running, no containers). Matches the pre-release validation runbook's needs.
 - **`/root/code/sluice` clone**: **STALE** at commit `1a978293` (v0.32.2-era, ~Nov 2025). Current main is far ahead — needs `git pull` (or a fresh `git bundle` push from Windows) before any continuous-validation work.
 - **PlanetScale credentials**: **NOT present** on the box. Operator's local rig has `PLANETSCALE_CREDENTIALS.env` and `PLANETSCALE_SERVICE_TOKEN.env` at the `sluice-testing` repo root.
-- **Continuous-validation scaffolding**: **NOT present**. No `RUNBOOK.md`, no supervisor scripts, no cycle-report dir, no `BUG-CATALOG.md` on the box. All currently lives at `C:\code\sluice-testing\` on operator's local rig.
+- **Continuous-validation scaffolding**: **NOT present**. No `RUNBOOK.md`, no supervisor scripts, no cycle-report dir, no `BUG-CATALOG.md` on the box. All currently lives at `sluice-testing/` on operator's local rig.
 
 ## Why migrate (operator's framing)
 
@@ -43,9 +43,9 @@ ssh root@<previous-vultr-IP> 'cd /root/code/sluice && git pull'
 If deploy-key wasn't set up (current state unclear), fall back to the `git bundle` push from Windows per the provisioning runbook:
 
 ```powershell
-cd C:\code\sluice
-git bundle create C:\code\sluice.bundle --all
-scp C:\code\sluice.bundle root@<previous-vultr-IP>:/root/sluice.bundle
+cd sluice
+git bundle create sluice.bundle --all
+scp sluice.bundle root@<previous-vultr-IP>:/root/sluice.bundle
 ssh root@<previous-vultr-IP> 'cd /root/code && rm -rf sluice && git clone /root/sluice.bundle sluice'
 ```
 
@@ -70,8 +70,8 @@ ssh root@<previous-vultr-IP> 'export PATH=$PATH:/usr/local/go/bin && cd /root/co
 From operator's workstation:
 
 ```powershell
-scp C:\code\sluice-testing\PLANETSCALE_CREDENTIALS.env root@<previous-vultr-IP>:/root/code/sluice/
-scp C:\code\sluice-testing\PLANETSCALE_SERVICE_TOKEN.env root@<previous-vultr-IP>:/root/code/sluice/
+scp sluice-testing/PLANETSCALE_CREDENTIALS.env root@<previous-vultr-IP>:/root/code/sluice/
+scp sluice-testing/PLANETSCALE_SERVICE_TOKEN.env root@<previous-vultr-IP>:/root/code/sluice/
 ssh root@<previous-vultr-IP> 'chmod 600 /root/code/sluice/PLANETSCALE_*.env'
 ```
 
@@ -90,7 +90,7 @@ ssh root@<previous-vultr-IP> 'cd /root/sluice-validation && git clone git@github
 Plus operator-side `scp` of any custom supervisor scripts:
 
 ```powershell
-scp C:\code\sluice-testing\work\supervisor_*.sh root@<previous-vultr-IP>:/root/sluice-validation/sluice-testing/work/
+scp sluice-testing/work/supervisor_*.sh root@<previous-vultr-IP>:/root/sluice-validation/sluice-testing/work/
 ```
 
 ### Step 5 — Cycle-subagent invocation pattern (defer until 1-4 verified)
@@ -117,5 +117,5 @@ Vultr LAX → PlanetScale us-east cross-region latency is different from operato
 
 - Provisioning + standing config: [`release-validation-on-vultr.md`](release-validation-on-vultr.md)
 - Vultr CLI: `C:\vultr-cli\vultr-cli.exe`, config `C:\vultr-cli\vultr-cli.yaml`
-- Testing-repo conventions (NEXT-CYCLE.md, RUNBOOK.md, BUG-CATALOG.md, session-reports/): operator's workstation at `C:\code\sluice-testing\`, plus `sluicesync/sluice-testing` repo on GitHub
+- Testing-repo conventions (NEXT-CYCLE.md, RUNBOOK.md, BUG-CATALOG.md, session-reports/): operator's workstation at `sluice-testing/`, plus `sluicesync/sluice-testing` repo on GitHub
 - Auto-memory pointer: `reference_vultr_continuous_validation.md`

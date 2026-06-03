@@ -27,7 +27,7 @@ PlanetScale exposes that local Vitess cannot:
 `pscale` authenticates **non-interactively via service token** (no
 browser `auth login`). Confirmed working 2026-05-17:
 
-- Token file: `C:\code\sluice-testing\PLANETSCALE_SERVICE_TOKEN.env`
+- Token file: `sluice-testing/PLANETSCALE_SERVICE_TOKEN.env`
   (keys `PLANETSCALE_SERVICE_TOKEN`, `PLANETSCALE_SERVICE_TOKEN_ID`;
   gitignored). Source into env in the *same* shell as the pscale
   command (Bash tool doesn't persist env): `set -a; . <file>; set +a`.
@@ -89,7 +89,7 @@ graceful degradation (loud, retried, not silent corruption).
   `.github/workflows/psverify.yml` — `workflow_dispatch` only, never
   default CI: quota + security boundary).
 - Results/log narrative go to the **validation rig**
-  (`C:\code\sluice-validation`, RUNBOOK-governed, own BUG-CATALOG /
+  (`sluice-validation`, RUNBOOK-governed, own BUG-CATALOG /
   session-reports) — *not* sluice-testing (post-release regression) and
   *not* committed to sluice. See memory `planetscale-validation-track`.
 - Reuse, don't rebuild: the `psverify` scaffolding + the validation

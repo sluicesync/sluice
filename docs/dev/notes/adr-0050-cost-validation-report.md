@@ -374,7 +374,7 @@ the ADR positions it.
 
 ## Deliverables (file list)
 
-All new files under `C:\code\sluice-validation\` unless noted. Nothing
+All new files under `sluice-validation/` unless noted. Nothing
 in this exercise modifies sluice itself; everything is measurement
 infrastructure or this report.
 
@@ -397,23 +397,23 @@ infrastructure or this report.
 | `work\mode-a-sluice-ma-base-20260520-082202.log.err` | Mode-A baseline sluice log |
 | `work\workload-ma-base-20260520-082202.csv` | Mode-A baseline workload oracle |
 | `creds\PLANETSCALE_ADR_0050.env` | Admin DSN for the new DB (gitignored) |
-| `C:\code\sluice\docs\dev\notes\adr-0050-cost-validation-report.md` | **this report** |
+| `docs/dev/notes/adr-0050-cost-validation-report.md` | **this report** |
 
 ### Cleanup when ADR-0050 implementation lands
 
 ```powershell
-$env:PLANETSCALE_SERVICE_TOKEN    = (Get-Content C:\code\sluice-testing\PLANETSCALE_SERVICE_TOKEN.env | ? { $_ -match '^PLANETSCALE_SERVICE_TOKEN=' }) -replace '^PLANETSCALE_SERVICE_TOKEN=', ''
-$env:PLANETSCALE_SERVICE_TOKEN_ID = (Get-Content C:\code\sluice-testing\PLANETSCALE_SERVICE_TOKEN.env | ? { $_ -match '^PLANETSCALE_SERVICE_TOKEN_ID=' }) -replace '^PLANETSCALE_SERVICE_TOKEN_ID=', ''
+$env:PLANETSCALE_SERVICE_TOKEN    = (Get-Content sluice-testing/PLANETSCALE_SERVICE_TOKEN.env | ? { $_ -match '^PLANETSCALE_SERVICE_TOKEN=' }) -replace '^PLANETSCALE_SERVICE_TOKEN=', ''
+$env:PLANETSCALE_SERVICE_TOKEN_ID = (Get-Content sluice-testing/PLANETSCALE_SERVICE_TOKEN.env | ? { $_ -match '^PLANETSCALE_SERVICE_TOKEN_ID=' }) -replace '^PLANETSCALE_SERVICE_TOKEN_ID=', ''
 & C:\pscale\pscale.exe database delete sluice-adr-0050-cv `
   --org regions-metrics `
   --force `
   --service-token $env:PLANETSCALE_SERVICE_TOKEN `
   --service-token-id $env:PLANETSCALE_SERVICE_TOKEN_ID
 # Local cleanup:
-Remove-Item -Recurse -Force C:\code\sluice-validation\work\probe-b-*.csv
-Remove-Item -Recurse -Force C:\code\sluice-validation\work\mode-a-*.log*
-Remove-Item -Recurse -Force C:\code\sluice-validation\work\workload-ma-*.csv
-Remove-Item -Force C:\code\sluice-validation\creds\PLANETSCALE_ADR_0050.env
+Remove-Item -Recurse -Force sluice-validation/work/probe-b-*.csv
+Remove-Item -Recurse -Force sluice-validation/work/mode-a-*.log*
+Remove-Item -Recurse -Force sluice-validation/work/workload-ma-*.csv
+Remove-Item -Force sluice-validation/creds/PLANETSCALE_ADR_0050.env
 ```
 
 Cost while up: ~PS-10 single DB ≈ $39/mo prorated (per the existing

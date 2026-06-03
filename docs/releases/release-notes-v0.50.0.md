@@ -38,7 +38,7 @@ sluice backup prune --from-dir /backups/stream/ --keep-duration 168h
 ## Verification surface
 
 - 8 new unit tests in `internal/pipeline/chain_prune_test.go` covering: basic keep-N-most-recent, keep-duration with `Now` injection, no-op cases, dry-run mode, mutual-exclusion + at-least-one validation gates, catalog-absent refusal, and structural-break refusal for hand-corrupted chains.
-- **End-to-end validation deferred to operator re-test** — the validation rig at `C:\code\sluice-validation\` has the 4-table chain that can be pruned + restored to verify the re-stitch + restore-side behavior.
+- **End-to-end validation deferred to operator re-test** — the validation rig at `sluice-validation/` has the 4-table chain that can be pruned + restored to verify the re-stitch + restore-side behavior.
 
 ## What's NOT in v0.50.0 (scope decisions)
 

@@ -148,7 +148,7 @@ sync-mode CDC. To exercise the handoff:
 
 ```powershell
 # 1. Boot the rig + seed the medium fixture.
-cd C:\code\sluice-testing\local-rig
+cd sluice-testing/local-rig
 .\bootstrap.ps1 -Engine mysql -Fixture medium-25t-100k
 
 # 2. Launch sync (this includes cold-start + CDC handoff).

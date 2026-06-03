@@ -101,7 +101,7 @@ The `pollStopSignal` signature changed (added `cancelStream` parameter); this is
 - Unit test `TestAckLSN_AnchorsAtStartLSNUntilFirstApply` (`internal/engines/postgres/lsn_tracker_test.go`) pins the contract: when `applied=0`, ack returns `startLSN` even when streamedLSN has advanced past it.
 - Unit test `TestPollStopSignal_HardCancelsApplyOnDrainTimeout` (`internal/pipeline/stop_signal_test.go`) verifies the watchdog escalates to `cancelApply` after `drainTimeoutForTest` elapses.
 - Unit test `TestPollStopSignal_WatchdogExitsCleanlyOnApplyDone` verifies the watchdog exits without firing `cancelApply` when apply finishes naturally.
-- Real-world repro at `C:\code\sluice-testing\workspace\bug15_repro_dev.sh` (sustained writer, `--apply-batch-size=50`, mid-stream `sync stop`): pre-fix dropped 25-42 rows; post-fix drops 0.
+- Real-world repro at `sluice-testing/workspace/bug15_repro_dev.sh` (sustained writer, `--apply-batch-size=50`, mid-stream `sync stop`): pre-fix dropped 25-42 rows; post-fix drops 0.
 
 ## Added in v0.9.0: `sync stop --wait`
 

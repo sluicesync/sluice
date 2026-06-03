@@ -69,7 +69,7 @@ chunk.
 **Mechanism = DBLog watermark-based chunked select** (Netflix DBLog;
 [blog](https://netflixtechblog.com/dblog-a-generic-change-data-capture-framework-69351fb9099b),
 [arXiv 2010.12597](https://arxiv.org/abs/2010.12597); a local copy is
-in `C:\code\sluice-useful-papers` — implementers verify the exact step
+in `sluice-useful-papers` — implementers verify the exact step
 sequence against it) **plus a sluice-specific chunk-fingerprint skip
 gate** (the contribution beyond DBLog).
 

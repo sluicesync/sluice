@@ -686,7 +686,7 @@ copy), and reaping / memory / parallelism tuning are explicit opt-ins.
 
 ### Docs
 
-- **`docs(adr-0056): sluice diagnose operator-bundle`** — New ADR documenting the privacy-level inclusion / exclusion contract (per-level table), the auto-on-crash safety semantics (best-effort, never masks the original error, default `basic` level for unattended bundles), the DSN-redaction surface boundary versus the existing row-value-level `internal/redact` package, and the bundle ZIP layout. Cross-references ADR-0007 (position persistence), ADR-0049 (schema history), ADR-0054 (lease state), and the `C:\code\sluice-public-release-audit-2026-05-22.md` audit doc that named Task #18 as the last pre-public-release item.
+- **`docs(adr-0056): sluice diagnose operator-bundle`** — New ADR documenting the privacy-level inclusion / exclusion contract (per-level table), the auto-on-crash safety semantics (best-effort, never masks the original error, default `basic` level for unattended bundles), the DSN-redaction surface boundary versus the existing row-value-level `internal/redact` package, and the bundle ZIP layout. Cross-references ADR-0007 (position persistence), ADR-0049 (schema history), ADR-0054 (lease state), and the `sluice-public-release-audit-2026-05-22.md` audit doc that named Task #18 as the last pre-public-release item.
 
 ### Tests
 
@@ -2048,7 +2048,7 @@ See [docs/dev/notes/prep-pii-redaction-phase-1.md](docs/dev/notes/prep-pii-redac
   - MySQL: `change_applier.go::applyOne` (line ~469), `change_applier.go::WritePosition` (line ~405), `change_applier_batch.go::commitBatch` (line ~332)
   - Postgres: `change_applier.go::applyOne` (line ~526), `change_applier.go::WritePosition` (line ~395), `change_applier_batch.go::commitBatch` (line ~327)
 - **Per-engine unit tests** for the new helpers: `TestExecTimeoutCtx` pins the ctx-wrapping contract; `TestRunWithDeadline` pins the watchdog race semantics (passthrough on zero/negative timeout, fast-f-wins on positive timeout, slow-f-trips-watchdog with `DeadlineExceeded` and bounded wall-clock cost). 8 new test cases (4 per engine).
-- **End-to-end validation deferred to the v0.52.1 cycle** on the validation rig at `C:\code\sluice-validation\` — same scenarios as the v0.52.0 cycle's #23 scenario 1, with the load-bearing pin being "no apply goroutine ever blocks at unwrapped sites for >60s in 3 sequential pprof snapshots".
+- **End-to-end validation deferred to the v0.52.1 cycle** on the validation rig at `sluice-validation/` — same scenarios as the v0.52.0 cycle's #23 scenario 1, with the load-bearing pin being "no apply goroutine ever blocks at unwrapped sites for >60s in 3 sequential pprof snapshots".
 
 ## [0.52.0]
 
@@ -2082,7 +2082,7 @@ See [docs/dev/notes/prep-pii-redaction-phase-1.md](docs/dev/notes/prep-pii-redac
 
 ### Verification
 
-- **End-to-end live capture on validation rig** documented in `C:\code\sluice-validation\PHASE-B-DIAGNOSIS-ISSUE-23.md` — goroutine 1 stack traces (`mysql-stall-goroutines.txt`, `pg-stall-goroutines.txt`) show the exact blocked frame the fix unblocks.
+- **End-to-end live capture on validation rig** documented in `sluice-validation/PHASE-B-DIAGNOSIS-ISSUE-23.md` — goroutine 1 stack traces (`mysql-stall-goroutines.txt`, `pg-stall-goroutines.txt`) show the exact blocked frame the fix unblocks.
 - **6 new test cases** in `applier_errors_test.go` (3 MySQL, 3 PG) covering bare + wrapped `context.DeadlineExceeded` retriable classification.
 - **4 new test cases** in `internal/pipeline/migrate_test.go::TestApplyExecTimeout` pinning the plumbing helper's zero-no-op + negative-no-op + positive-sets-once + non-setter-degrades invariants.
 - **Existing classifier-table tests** (`TestClassifyApplierError_RetriableShapes`) extended to cover the new shape symmetrically on both engines.
@@ -2145,7 +2145,7 @@ After phase 2 (v0.52.0+) lands, the same operator workflow collapses to a single
 
 - **9 new unit tests in `internal/pipeline/stream_rotation_test.go`** covering: length-threshold fires + not-yet, age-threshold fires + not-yet (catalog-CreatedAt-based math), length-preferred-over-age tie-breaker, none-configured no-op, catalog-absent conservative fall-back, marker-write success + absent-catalog no-op.
 - **3 new unit tests in `internal/pipeline/prefixed_store_test.go`** pinning the wrapper's transparency invariants.
-- **End-to-end validation deferred to operator re-test** via the validation rig at `C:\code\sluice-validation\` — pair the new flags with a brief `--exit-after-age=1m` (or `--exit-after-chain-length=2`) run to confirm the exit + chain.json marking behavior.
+- **End-to-end validation deferred to operator re-test** via the validation rig at `sluice-validation/` — pair the new flags with a brief `--exit-after-age=1m` (or `--exit-after-chain-length=2`) run to confirm the exit + chain.json marking behavior.
 
 ### What's NOT in v0.51.0 (deferred to v0.52.0+ phase 2)
 
@@ -2191,7 +2191,7 @@ After phase 2 (v0.52.0+) lands, the same operator workflow collapses to a single
   - `TestPruneChain_RefusesNeitherFlag` — at-least-one gate
   - `TestPruneChain_RefusesWhenCatalogAbsent` — operator-actionable hint
   - `TestPruneChain_RefusesWhenChainWouldBreak` — interior-orphan refusal (manually-broken parent-link)
-- **End-to-end validation deferred to operator re-test** — the rig at `C:\code\sluice-validation\` has a 4-table chain that can be pruned + restored to verify the re-stitch + restore-side behavior; operator workflow once the next test cycle runs.
+- **End-to-end validation deferred to operator re-test** — the rig at `sluice-validation/` has a 4-table chain that can be pruned + restored to verify the re-stitch + restore-side behavior; operator workflow once the next test cycle runs.
 
 ### What's not in v0.50.0
 
@@ -2228,7 +2228,7 @@ After phase 2 (v0.52.0+) lands, the same operator workflow collapses to a single
   - `internal/engines/mysql/ddl_emit_test.go::TestInlineAutoIncrementIndex_DetectionTable` — 4 cases covering PK-auto / non-PK-auto-with-support / non-PK-auto-without-support / prefer-unique-over-non-unique
   - `internal/engines/postgres/ddl_emit_test.go::TestPgIndexName_GitHub26` — 9 subtests covering both regression preservation AND new behavior shapes (convention-prefix detection, length-check fallback, exact-match edge case, empty-source)
   - `internal/engines/postgres/ddl_emit_test.go::TestPgIndexName_NoCollisionAcrossLongSiblingNames` — load-bearing pin: the two sibling indexes that triggered #26 must now emit to distinct PG identifiers
-- **End-to-end re-verification via the validation rig at `C:\code\sluice-validation\`** — both `start_sync_mysql_dest.ps1 -AllTables` (re-triggers #25 pre-fix) and `start_sync_pg_dest.ps1 -AllTables` (re-triggers #26 pre-fix) are documented entry points. With the v0.49.0 binary, both should now succeed end-to-end.
+- **End-to-end re-verification via the validation rig at `sluice-validation/`** — both `start_sync_mysql_dest.ps1 -AllTables` (re-triggers #25 pre-fix) and `start_sync_pg_dest.ps1 -AllTables` (re-triggers #26 pre-fix) are documented entry points. With the v0.49.0 binary, both should now succeed end-to-end.
 
 ## [0.48.0]
 
@@ -4595,7 +4595,7 @@ Performance round 2 + ergonomics + reliability follow-ups. Four new ADRs (0025 g
 
   Unit-level regression guard: `TestAckLSN_AnchorsAtStartLSNUntilFirstApply`
   pins the contract. Empirical integration repro lives at
-  `C:\code\sluice-testing\workspace\bug15_repro_dev.sh` (sustained
+  `sluice-testing/workspace/bug15_repro_dev.sh` (sustained
   writer, mid-stream `sync stop`): pre-fix dropped 25-42 rows;
   post-fix drops 0. The existing programmatic-RequestStop integration
   test (`TestStreamer_PostgresToPostgres_StopRestartNoLoss`) still

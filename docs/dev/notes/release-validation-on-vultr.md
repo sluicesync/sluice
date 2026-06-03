@@ -28,7 +28,7 @@ runner).
 
 1. **Provision (elevated PowerShell on the Hyper-V host):**
    ```powershell
-   cd C:\code\sluice\scripts\hyperv-runner
+   cd sluice/scripts/hyperv-runner
    .\New-ValidationVM.ps1 -GoldenVhdx C:\HyperV\golden\sluice-runner-golden.vhdx `
        -AdminSshPublicKey (gc $HOME\.ssh\id_ed25519.pub) -DiskGB 120 -CpuCount 6 -MemoryBytes 16GB
    ```
@@ -82,7 +82,7 @@ Notably **not** gated by CI: `integration vstream` (vttestserver-based Vitess co
 ## What the Vultr box runs (release-validation runbook)
 
 Sync source first (one of):
-- Bundle path: `git bundle create C:\code\sluice.bundle --all` from Windows, `scp` to `root@<vultr-ip>:/root/`, then on Vultr `cd /root/code && rm -rf sluice && git clone /root/sluice.bundle sluice`.
+- Bundle path: `git bundle create sluice.bundle --all` from Windows, `scp` to `root@<vultr-ip>:/root/`, then on Vultr `cd /root/code && rm -rf sluice && git clone /root/sluice.bundle sluice`.
 - Deploy-key path: `git -C /root/code/sluice fetch && git checkout <tag-or-sha>`.
 
 Then run on the Vultr box (single SSH session, ~30 min total):

@@ -6,7 +6,7 @@ Accepted. Implemented in `internal/diagnose/` (bundle assembler), `cmd/sluice/di
 
 ## Context
 
-sluice is heading into public release (audit `C:\code\sluice-public-release-audit-2026-05-22.md`); the cluster of pre-release prep tasks #17 + #19 (the renames and the scrub pass) are shipped, and #18 — the `sluice diagnose` operator-bundle — was named as the last item before flipping the GitHub repo visibility.
+sluice is heading into public release (audit `sluice-public-release-audit-2026-05-22.md`); the cluster of pre-release prep tasks #17 + #19 (the renames and the scrub pass) are shipped, and #18 — the `sluice diagnose` operator-bundle — was named as the last item before flipping the GitHub repo visibility.
 
 The shape is well-trodden: `cockroach debug zip` is the prior art every database operator who has ever filed a CockroachDB issue is familiar with. The recipient (a sluice maintainer triaging a GitHub issue) asks the operator to "attach a diagnose bundle" and gets a single ZIP carrying every piece of server-state diagnostic information needed to reproduce the bug, in one structured archive.
 
@@ -102,7 +102,7 @@ The redaction helpers live in `internal/diagnose/redact.go` as **siblings** to t
 - **ADR-0007** (position persistence) — defines the `sluice_cdc_state` row shape the bundle's basic-level state dump embeds.
 - **ADR-0049** (CDC schema-history) — defines the `sluice_cdc_schema_history` table the bundle's basic-level dump enumerates (via the new `ir.SchemaHistoryReader` interface).
 - **ADR-0054** (Shape A live cross-shard DDL coordination) — defines `sluice_shard_consolidation_lease` and `ir.ShardConsolidationLeaseLister`, which the basic-level dump embeds.
-- **`C:\code\sluice-public-release-audit-2026-05-22.md`** — the audit doc that named `sluice diagnose` as the last public-release prep item (Task #18) and cross-linked the scrub findings (Vultr identifiers, internal paths) to diagnose's redaction patterns.
+- **`sluice-public-release-audit-2026-05-22.md`** — the audit doc that named `sluice diagnose` as the last public-release prep item (Task #18) and cross-linked the scrub findings (Vultr identifiers, internal paths) to diagnose's redaction patterns.
 - **`internal/redact` package** — row-value redaction (NOT used by diagnose). See package comment on `internal/diagnose/redact.go` for the boundary.
 - **`cmd/sluice/sync_health.go`** — the existing `sluice sync health` probe whose JSON shape the diagnose bundle's `health/sync_health.json` mirrors.
 
