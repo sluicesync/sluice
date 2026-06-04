@@ -6,6 +6,24 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.99.2] - 2026-06-03
+
+A distribution release — sluice is now installable via Homebrew, Scoop, WinGet,
+and native Debian/RedHat packages. No engine, API, or runtime changes from
+v0.99.1.
+
+### Added
+
+- **Package-manager distribution.** GoReleaser now publishes on every release:
+  - **Homebrew** (macOS + Linux): `brew install sluicesync/tap/sluice` (tap: [`sluicesync/homebrew-tap`](https://github.com/sluicesync/homebrew-tap)).
+  - **Scoop** (Windows): `scoop bucket add sluicesync https://github.com/sluicesync/scoop-bucket; scoop install sluice`.
+  - **WinGet** (Windows): `winget install sluicesync.sluice` (manifest submitted to `microsoft/winget-pkgs`; available once their review lands).
+  - **Debian / RedHat / Alpine**: `.deb` / `.rpm` / `.apk` packages for amd64 + arm64 attached to the release — `sudo dpkg -i` / `sudo rpm -i`.
+
+### Changed
+
+- **CI:** fork pull requests now pull the public pre-baked test images anonymously (the GHCR login is skipped when no token is present), so external-contributor PRs pass the integration suite without maintainer intervention.
+
 ## [0.99.1] - 2026-06-03
 
 The first release published from the public repository. No new features — a
