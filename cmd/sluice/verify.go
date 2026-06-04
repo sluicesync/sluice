@@ -15,7 +15,7 @@ import (
 
 // VerifyCmd implements `sluice verify`. v0.12.0 ships count-mode
 // only — row-count comparison per table. Sample mode and full mode
-// follow per the proto-ADR (docs/dev/design-sluice-verify.md).
+// follow per the proto-ADR (docs/dev/design/sluice-verify.md).
 //
 // Exit codes mirror `schema diff`:
 //   - 0 on clean (every table's source count == target count).

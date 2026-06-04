@@ -18,7 +18,7 @@ import (
 //
 // v0.15.0 ships the minimum viable interface — `SourceCurrentPosition`
 // only. Phase 3 of the sync-health monitoring proto-ADR
-// (`docs/dev/design-sync-health-monitoring.md`) covers later additions
+// (`docs/dev/design/sync-health-monitoring.md`) covers later additions
 // like wall-clock-time-of-position and per-event lag arithmetic; the
 // interface is small now and grows as operator demand surfaces.
 //

@@ -106,7 +106,7 @@ confidence raise N or use full mode.
 
 ### `--depth full` (planned)
 
-Per the [verify proto-ADR](dev/design-sluice-verify.md), full mode
+Per the [verify proto-ADR](dev/design/sluice-verify.md), full mode
 will compute a rolling content-hash over every row in PK order on
 both sides, then bisect to find divergent ranges. Cost is one full
 table scan per side — same fundamental cost as vdiff, just with
@@ -254,10 +254,10 @@ scenarios today.
 
 ## See also
 
-- [Verify proto-ADR](dev/design-sluice-verify.md) — design rationale
+- [Verify proto-ADR](dev/design/sluice-verify.md) — design rationale
   and phase plan.
 - [Vitess vdiff documentation](https://vitess.io/docs/archive/22.0/reference/vreplication/vdiff/).
-- [Sync-health monitoring proto-ADR](dev/design-sync-health-monitoring.md)
+- [Sync-health monitoring proto-ADR](dev/design/sync-health-monitoring.md)
   — the liveness side of the "100% confidence" goal.
 - [`docs/vitess-vstream-troubleshooting.md`](vitess-vstream-troubleshooting.md)
   — operator runbook for diagnosing VStream lag.

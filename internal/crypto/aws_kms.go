@@ -4,7 +4,7 @@
 package crypto
 
 // AWS KMS-backed envelope-encryption implementation. Phase 6.2 of the
-// logical-backup feature (`docs/dev/design-logical-backups-phase-6.md`):
+// logical-backup feature (`docs/dev/design/logical-backups-phase-6.md`):
 // the operator hands sluice a KMS key ARN (or alias); WrapCEK / UnwrapCEK
 // route through `kms.Encrypt` / `kms.Decrypt` instead of an Argon2id-
 // derived KEK.

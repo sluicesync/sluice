@@ -1067,7 +1067,7 @@ func TestEmitAddForeignKey_NoActions(t *testing.T) {
 }
 
 // TestEmitAddForeignKey_SelfReferential — same shape as the PG sibling.
-// Pinned per design-schema-completeness.md so self-ref FK support
+// Pinned per design/schema-completeness.md so self-ref FK support
 // can't regress silently.
 func TestEmitAddForeignKey_SelfReferential(t *testing.T) {
 	fk := &ir.ForeignKey{

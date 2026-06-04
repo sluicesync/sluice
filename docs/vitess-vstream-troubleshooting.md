@@ -8,7 +8,7 @@ VStream gRPC API. That extra layer adds failure modes that don't
 exist with vanilla MySQL `binlog`. This doc names them, says what
 you can do about each, and flags what's coming with Vitess 24.
 
-If `sluice sync health` (see `docs/dev/design-sync-health-monitoring.md`)
+If `sluice sync health` (see `docs/dev/design/sync-health-monitoring.md`)
 is reporting non-zero `lag_seconds` or `seconds_since_last_event`,
 start here. Sluice's VStream client lives in
 `internal/engines/mysql/cdc_vstream.go`; DSN flags
@@ -222,7 +222,7 @@ Some delays are properties of the underlying system:
 
 ## Detection: what to watch
 
-Metrics from `docs/dev/design-sync-health-monitoring.md`:
+Metrics from `docs/dev/design/sync-health-monitoring.md`:
 
 - **`sluice_lag_seconds`**: source-event timestamp vs. now. Most
   meaningful. Sustained > 60s on a write-active source = worth
@@ -305,7 +305,7 @@ rollouts.
 ## What sluice plans to do
 
 Forward-looking; tracks against `docs/dev/roadmap.md` and the
-proto-ADR in `docs/dev/design-sync-health-monitoring.md`.
+proto-ADR in `docs/dev/design/sync-health-monitoring.md`.
 
 1. **Ship `sluice sync health` and `--metrics-listen`** so the
    `sluice_lag_seconds`, `sluice_seconds_since_last_event`,

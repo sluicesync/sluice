@@ -9,7 +9,7 @@ the human sign-off on ADR-0048 is grounded in observed pain rather than
 theory.
 
 Companion references (read alongside, not duplicated here):
-- Proto-design: [`design-multi-source-aggregation.md`](../design-multi-source-aggregation.md) — Shape A is its explicitly-deferred case.
+- Proto-design: [`design/multi-source-aggregation.md`](../design/multi-source-aggregation.md) — Shape A is its explicitly-deferred case.
 - [ADR-0031](../../adr/adr-0031-multi-source-aggregation-target-schema.md) — shipped Shape B (v0.25.0); §"Why Shape B (not A)" enumerates exactly the three pieces this spike exercises.
 - Roadmap §4 — the spec (why / what / 3 gotchas).
 

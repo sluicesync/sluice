@@ -7,7 +7,7 @@ import "context"
 
 // Verifier is the optional engine-side surface for data-integrity
 // verification. The `sluice verify` command (proto-ADR
-// docs/dev/design-sluice-verify.md) uses this interface to compare
+// docs/dev/design/sluice-verify.md) uses this interface to compare
 // source and target row-level state without committing sluice's row-
 // reader (which is bulk-copy-shaped) to a "verify many small queries"
 // shape.

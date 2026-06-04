@@ -6,7 +6,7 @@
 // Phase 5 integration tests: cross-engine chain restore.
 //
 // PG-rooted chain → MySQL target and the reverse direction.
-// Acceptance criteria 1-4 from design-logical-backups-phase-5.md:
+// Acceptance criteria 1-4 from design/logical-backups-phase-5.md:
 //
 //   1. PG-rooted chain → MySQL target restore (full + 2 incrementals).
 //   2. MySQL-rooted chain → PG target restore (mix of INSERT/UPDATE/DELETE).

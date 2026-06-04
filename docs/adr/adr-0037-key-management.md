@@ -131,7 +131,7 @@ A future ADR could revisit this if a real operator surfaces a "I have backups wr
 
 ## See also
 
-- [`docs/dev/design-logical-backups-phase-6.md`](design-logical-backups-phase-6.md) — full Phase 6 design + threat model
+- [`docs/dev/design/logical-backups-phase-6.md`](design/logical-backups-phase-6.md) — full Phase 6 design + threat model
 - [`docs/operator/encryption.md`](../operator/encryption.md) — operator-facing setup guide (passphrase + 3 KMS providers)
 - [`internal/crypto/envelope.go`](../../internal/crypto/envelope.go) — `EnvelopeEncryption` interface + passphrase implementation
 - [`internal/crypto/aws_kms.go`](../../internal/crypto/aws_kms.go) — AWS KMS implementation (Phase 6.2)

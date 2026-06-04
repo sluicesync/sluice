@@ -1,12 +1,12 @@
 # Apache Arrow / Parquet integration — research findings
 
-**Status:** Research-only. Written to inform an operator decision; no code changes proposed and no dependencies added. Companion to the existing proto-ADR at [`docs/dev/design-apache-arrow-integration.md`](../dev/design-apache-arrow-integration.md), which already laid out the three integration shapes and a tenet-check. This doc revisits the question after Phase 1 logical-backup landed, validates the proto-ADR's library + dep assumptions against current upstream state, and tightens the recommendation.
+**Status:** Research-only. Written to inform an operator decision; no code changes proposed and no dependencies added. Companion to the existing proto-ADR at [`docs/dev/design/apache-arrow-integration.md`](../dev/design/apache-arrow-integration.md), which already laid out the three integration shapes and a tenet-check. This doc revisits the question after Phase 1 logical-backup landed, validates the proto-ADR's library + dep assumptions against current upstream state, and tightens the recommendation.
 
 **Bottom line:** Defer Shape A. The conditional-yes in the proto-ADR was gated on Phase 1 logical-backup picking Parquet — it didn't (it picked gzipped JSON-Lines, [`internal/pipeline/backup_chunk.go`](../../internal/pipeline/backup_chunk.go)), which removes the combined-cycle justification. Shape A standalone for data-lake offload is a real but unverified use case; a small operator-facing feature flag and a public note ("we'd build this if asked") is a cheaper signal-collection move than building it pre-emptively. Shape B and Shape C remain rejected for the same reasons the proto-ADR gave.
 
 ## What changed since the proto-ADR
 
-The proto-ADR (`docs/dev/design-apache-arrow-integration.md`, ~v0.10.x → v0.11.x window) made a **conditional yes** call: ship Shape A *if* logical-backup picked Parquet, defer otherwise. Two things have moved since:
+The proto-ADR (`docs/dev/design/apache-arrow-integration.md`, ~v0.10.x → v0.11.x window) made a **conditional yes** call: ship Shape A *if* logical-backup picked Parquet, defer otherwise. Two things have moved since:
 
 1. **Logical-backup Phase 1 shipped with non-Parquet chunks.** The current chunk format is gzip-compressed JSON-Lines with a tagged-value envelope ([`internal/pipeline/backup_chunk.go`](../../internal/pipeline/backup_chunk.go)). The format-version is pinned (`chunkHeaderVersion = 1`) and the rationale ("debuggable; engine-portable; forward-compat through new tag kinds; gzip is stdlib") is documented in the file's preamble. Phase 2 considered swapping gzip → zstd; Parquet was not adopted. The combined-cycle argument the proto-ADR rested on is therefore no longer available.
 2. **`apache/arrow-go` matured but did not consolidate.** Latest is `v18.6.0` (2026-04-28), continuing a quarterly minor-release cadence ([github.com/apache/arrow-go/releases](https://github.com/apache/arrow-go/releases)). Module path is `github.com/apache/arrow-go/v18`. The dependency graph in the current `go.mod` is broader than the proto-ADR estimated — see "Dependency footprint" below.
@@ -107,7 +107,7 @@ The proto-ADR's "3–5 weeks" remains the right order of magnitude; the lower bo
 The original Shape A in this finding's framing was "Parquet as a chunk-format option for backups" — replace `backup_chunk.go`'s gzip+JSON-Lines with Parquet for the operators who want to grep their backups with DuckDB. **Do not pursue this.** Reasoning:
 
 - Phase 1 logical-backup just shipped with the JSON-Lines format; it's the public chunk format contract operators are reading and tooling is being built against. Adding a second chunk format mid-flight is a UX regression.
-- The Phase 2 / Phase 3 / Phase 4–6 design docs ([`docs/dev/design-logical-backups-phase-2.md`](../dev/design-logical-backups-phase-2.md) onward) are still in flight; introducing a chunk-format choice axis to those phases multiplies the test surface for no operator-asked benefit.
+- The Phase 2 / Phase 3 / Phase 4–6 design docs ([`docs/dev/design/logical-backups-phase-2.md`](../dev/design/logical-backups-phase-2.md) onward) are still in flight; introducing a chunk-format choice axis to those phases multiplies the test surface for no operator-asked benefit.
 - If an operator genuinely wants to query backup chunks with DuckDB, the path of less resistance is `sluice backup export-as-parquet <backup-id>` — a one-shot transcoding command — not a chunk-format choice the user has to decide at backup time. The transcoding command is also strictly cheaper to implement (one direction, manifest-driven, no orchestrator changes) than mid-pipeline format switching.
 
 **Defer this until an operator asks for it concretely**, then ship the export-as-parquet command rather than a backup-time chunk format. Cost of waiting: zero (no decision blocks on this).
@@ -241,9 +241,9 @@ These are the design questions where the operator's preference would materially 
 
 ## See also
 
-- [`docs/dev/design-apache-arrow-integration.md`](../dev/design-apache-arrow-integration.md) — the original proto-ADR; full type-mapping table; tenet-check; the conditional-yes rationale this finding reverses on the gating dissolving.
+- [`docs/dev/design/apache-arrow-integration.md`](../dev/design/apache-arrow-integration.md) — the original proto-ADR; full type-mapping table; tenet-check; the conditional-yes rationale this finding reverses on the gating dissolving.
 - [`docs/dev/roadmap.md`](../dev/roadmap.md) §2 — current roadmap entry, to be updated to "deferred" per the recommendation.
-- [`docs/dev/design-logical-backups.md`](../dev/design-logical-backups.md) and the Phase 2/3/4–6 follow-ons — the logical-backup work whose chunk-format choice (JSON-Lines, not Parquet) dissolved the Arrow conditional-yes gate.
+- [`docs/dev/design/logical-backups.md`](../dev/design/logical-backups.md) and the Phase 2/3/4–6 follow-ons — the logical-backup work whose chunk-format choice (JSON-Lines, not Parquet) dissolved the Arrow conditional-yes gate.
 - [`internal/pipeline/backup_chunk.go`](../../internal/pipeline/backup_chunk.go) — the Phase 1 chunk format Shape A-prime would have replaced; the file's preamble documents the JSON-Lines + gzip rationale.
 - [`docs/value-types.md`](../value-types.md) — the runtime contract for `ir.Row` values that any Arrow writer has to honour.
 - [`docs/type-mapping.md`](../type-mapping.md) — the engine-pair type tables; an Arrow column would slot alongside if the work happens.

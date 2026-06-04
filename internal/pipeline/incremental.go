@@ -4,7 +4,7 @@
 package pipeline
 
 // Incremental backup orchestrator. Phase 3.1 of the logical-backup
-// feature (`docs/dev/design-logical-backups-phase-3.md`): take a
+// feature (`docs/dev/design/logical-backups-phase-3.md`): take a
 // previous backup's terminal CDC position, stream every event after
 // it for a bounded window, write each event to a chunk file, and emit
 // a manifest that links to the parent.

@@ -15,7 +15,7 @@ import (
 
 // SchemaAddTableCmd implements `sluice schema add-table` — the
 // Phase 1 MVP of the mid-stream add-table feature
-// (`docs/dev/design-mid-stream-add-table.md`). It brings a new
+// (`docs/dev/design/mid-stream-add-table.md`). It brings a new
 // source table into an active CDC stream's scope without forcing a
 // destructive `--reset-target-data` recovery cycle.
 //
@@ -42,7 +42,7 @@ import (
 // the stream must be drained first, and the source/target must be the
 // same engine pair the active stream uses. Phase 2 (`--no-drain`,
 // PG-only, ADR-0030) lifts the drain precondition for high-availability
-// workloads. See `docs/dev/design-mid-stream-add-table.md` and ADR-0030
+// workloads. See `docs/dev/design/mid-stream-add-table.md` and ADR-0030
 // for the design space and correctness story.
 type SchemaAddTableCmd struct {
 	SourceDriver string `help:"Source engine name (e.g. mysql, postgres). See 'sluice engines'." required:"" placeholder:"NAME" group:"source"`

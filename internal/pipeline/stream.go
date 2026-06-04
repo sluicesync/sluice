@@ -4,7 +4,7 @@
 package pipeline
 
 // Continuous-incremental long-running stream orchestrator. Phase 4 of
-// the logical-backup feature (`docs/dev/design-logical-backups-phase-4.md`):
+// the logical-backup feature (`docs/dev/design/logical-backups-phase-4.md`):
 // a single long-running process that produces rolling incrementals at a
 // configured cadence, no per-incremental cron orchestration.
 //

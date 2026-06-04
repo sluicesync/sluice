@@ -11,7 +11,7 @@
 
 ## What encryption does NOT protect against
 
-See `docs/dev/design-logical-backups-phase-6.md` for the full threat model. Briefly:
+See `docs/dev/design/logical-backups-phase-6.md` for the full threat model. Briefly:
 
 - In-flight network traffic between sluice and source/target databases (use TLS at the connection layer).
 - Compromise of the host running sluice while a backup is in flight.
@@ -515,7 +515,7 @@ Most operators pick one cloud and stay there; passphrase mode is the right answe
 
 ## See also
 
-- `docs/dev/design-logical-backups-phase-6.md` — full design + threat model
+- `docs/dev/design/logical-backups-phase-6.md` — full design + threat model
 - `docs/dev/adr-0037-key-management.md` — design rationale, threat-model recap, per-provider trade-offs
-- `docs/dev/design-logical-backups.md` — original logical-backup proto-ADR
+- `docs/dev/design/logical-backups.md` — original logical-backup proto-ADR
 - `docs/postgres-source-prep.md` — TLS at the database-connection layer

@@ -11,7 +11,7 @@
 // separate OS processes — Go's testing framework can drive both with
 // shared lifecycle control.
 //
-// Acceptance criteria covered (per design-logical-backups-phase-4-5.md):
+// Acceptance criteria covered (per design/logical-backups-phase-4-5.md):
 //
 //   1. End-to-end PG happy path (TestSyncFromBackup_Postgres_HappyPath).
 //   3. Schema evolution (TestSyncFromBackup_SchemaEvolution).

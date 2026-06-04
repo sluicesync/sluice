@@ -1,6 +1,6 @@
 # Logical Backups Phase 4.5 — Implementation Design
 
-Supplement to [`design-logical-backups.md`](design-logical-backups.md), [`design-logical-backups-phase-2.md`](design-logical-backups-phase-2.md), [`design-logical-backups-phase-3.md`](design-logical-backups-phase-3.md), and [`design-logical-backups-phase-4.md`](design-logical-backups-phase-4.md). This file covers Phase 4.5: **backup-as-broker** — `sluice sync from-backup` — the watcher that consumes a continuously-written backup chain and replays incrementals into a target.
+Supplement to [`logical-backups.md`](logical-backups.md), [`logical-backups-phase-2.md`](logical-backups-phase-2.md), [`logical-backups-phase-3.md`](logical-backups-phase-3.md), and [`logical-backups-phase-4.md`](logical-backups-phase-4.md). This file covers Phase 4.5: **backup-as-broker** — `sluice sync from-backup` — the watcher that consumes a continuously-written backup chain and replays incrementals into a target.
 
 The headline operator outcome: **decouple source and target via the backup chain as the message log.** Source-side `sluice backup stream` writes incrementals to S3/GCS/Azure/local-FS; target-side `sluice sync from-backup` polls the same destination and replays incrementals into its own database, producing log-based ETL without direct source-target connectivity.
 
@@ -134,10 +134,10 @@ The broker refuses without one of these flags when `sluice_cdc_state` has no row
 
 ## See also
 
-- [`design-logical-backups.md`](design-logical-backups.md) — original proto-ADR; Phase 4.5 mentioned as a future direction
-- [`design-logical-backups-phase-2.md`](design-logical-backups-phase-2.md) — "Backup-as-broker pattern (Phase 4.5+ direction)" section sketches the use cases this design now formalizes
-- [`design-logical-backups-phase-3.md`](design-logical-backups-phase-3.md) — chain-walker + chain-restore the broker reuses
-- [`design-logical-backups-phase-4.md`](design-logical-backups-phase-4.md) — `backup stream` + `stream_state.json` patterns the broker mirrors at the consumer side
+- [`logical-backups.md`](logical-backups.md) — original proto-ADR; Phase 4.5 mentioned as a future direction
+- [`logical-backups-phase-2.md`](logical-backups-phase-2.md) — "Backup-as-broker pattern (Phase 4.5+ direction)" section sketches the use cases this design now formalizes
+- [`logical-backups-phase-3.md`](logical-backups-phase-3.md) — chain-walker + chain-restore the broker reuses
+- [`logical-backups-phase-4.md`](logical-backups-phase-4.md) — `backup stream` + `stream_state.json` patterns the broker mirrors at the consumer side
 - ADR-0007 (per-target control table) — the conceptual cousin of `broker_state.json`
 - ADR-0010 (idempotent CDC apply) — the load-bearing assumption for safe broker re-replay on crash
 - ADR-0025 (graceful-drain `sync stop`) — the conceptual cousin of `sync from-backup stop`

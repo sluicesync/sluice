@@ -1,6 +1,6 @@
 # sluice v0.21.0
 
-Logical backups Phase 5 lands. **Cross-engine chain restore.** A PG-rooted backup chain can now restore (and stream-apply via `sync from-backup`) into a MySQL target, and vice versa. Closes the loud refusal at `chain_restore.go:99` (`"cross-engine chain restore is a Phase 5+ topic"`) that v0.17.0 through v0.20.x raised when the chain's source engine differed from the target. Implementation supplement: `docs/dev/design-logical-backups-phase-5.md`.
+Logical backups Phase 5 lands. **Cross-engine chain restore.** A PG-rooted backup chain can now restore (and stream-apply via `sync from-backup`) into a MySQL target, and vice versa. Closes the loud refusal at `chain_restore.go:99` (`"cross-engine chain restore is a Phase 5+ topic"`) that v0.17.0 through v0.20.x raised when the chain's source engine differed from the target. Implementation supplement: `docs/dev/design/logical-backups-phase-5.md`.
 
 ## Features
 

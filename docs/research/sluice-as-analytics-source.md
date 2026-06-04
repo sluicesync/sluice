@@ -121,7 +121,7 @@ These are surfaced now so the eventual chunk's prep doc doesn't re-derive them:
 
 ## Stance vs the proto-ADR
 
-The proto-ADR ([`docs/dev/design-apache-arrow-integration.md`](../dev/design-apache-arrow-integration.md)) made a conditional-yes call gated on Phase 1 logical-backup picking Parquet. Phase 1 picked JSON-Lines + gzip; that conditional dissolved. The arrow-findings doc made deferral on Shape A explicit. This doc narrows the question: **don't defer everything — the export-as-parquet slice has cheap-enough dep weight and broad-enough persona reach to be worth a roadmap chunk once an operator asks for it.**
+The proto-ADR ([`docs/dev/design/apache-arrow-integration.md`](../dev/design/apache-arrow-integration.md)) made a conditional-yes call gated on Phase 1 logical-backup picking Parquet. Phase 1 picked JSON-Lines + gzip; that conditional dissolved. The arrow-findings doc made deferral on Shape A explicit. This doc narrows the question: **don't defer everything — the export-as-parquet slice has cheap-enough dep weight and broad-enough persona reach to be worth a roadmap chunk once an operator asks for it.**
 
 ## Tenet check
 
@@ -139,7 +139,7 @@ The proto-ADR ([`docs/dev/design-apache-arrow-integration.md`](../dev/design-apa
 ## References
 
 - [`docs/research/apache-arrow-findings.md`](apache-arrow-findings.md) — the prior Arrow research; Shape A deferred.
-- [`docs/dev/design-apache-arrow-integration.md`](../dev/design-apache-arrow-integration.md) — the proto-ADR that named the three shapes.
+- [`docs/dev/design/apache-arrow-integration.md`](../dev/design/apache-arrow-integration.md) — the proto-ADR that named the three shapes.
 - [`docs/dev/notes/compression-benchmark.md`](../dev/notes/compression-benchmark.md) — recommendation surface for Phase 2 chunk compression (zstd) which Parquet export inherits.
 - [GeoParquet specification](https://geoparquet.org/) — metadata-only convention; relevant if `ir.Geometry` round-trips through Parquet matter.
 - [DuckDB `read_json`](https://duckdb.org/docs/data/json/overview.html), [`read_parquet`](https://duckdb.org/docs/data/parquet/overview.html), [`httpfs` extension](https://duckdb.org/docs/extensions/httpfs/overview.html) — the read-side primitives Surface 2 leans on.

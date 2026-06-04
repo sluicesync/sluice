@@ -4,7 +4,7 @@
 package pipeline
 
 // Backup-as-broker orchestrator. Phase 4.5 of the logical-backup
-// feature (`docs/dev/design-logical-backups-phase-4-5.md`):
+// feature (`docs/dev/design/logical-backups-phase-4-5.md`):
 // `sluice sync from-backup` is the consumer-side companion to
 // Phase 4's `sluice backup stream`. It polls the same chain root the
 // stream writes to, detects new incrementals via ParentBackupID

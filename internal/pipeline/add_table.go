@@ -11,7 +11,7 @@ package pipeline
 // new table into an active stream's scope without a destructive
 // `--reset-target-data` cycle.
 //
-// Strategy A from `docs/dev/design-mid-stream-add-table.md`: the
+// Strategy A from `docs/dev/design/mid-stream-add-table.md`: the
 // operator drains the running stream first (`sluice sync stop --wait`),
 // then runs `sluice schema add-table SOURCE.NAME`, then resumes
 // (`sluice sync start --resume`). AddTable refuses if the stream is

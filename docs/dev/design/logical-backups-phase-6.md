@@ -1,6 +1,6 @@
 # Logical Backups Phase 6 — Implementation Design
 
-Supplement to [`design-logical-backups.md`](design-logical-backups.md), [`design-logical-backups-phase-2.md`](design-logical-backups-phase-2.md) (which corrected the v0.16.0 release notes' claim that encryption was shipped — it wasn't), [`design-logical-backups-phase-3.md`](design-logical-backups-phase-3.md), [`design-logical-backups-phase-4.md`](design-logical-backups-phase-4.md), [`design-logical-backups-phase-4-5.md`](design-logical-backups-phase-4-5.md), and [`design-logical-backups-phase-5.md`](design-logical-backups-phase-5.md). This file covers Phase 6: **client-side at-rest encryption**, including KMS-backed key management.
+Supplement to [`logical-backups.md`](logical-backups.md), [`logical-backups-phase-2.md`](logical-backups-phase-2.md) (which corrected the v0.16.0 release notes' claim that encryption was shipped — it wasn't), [`logical-backups-phase-3.md`](logical-backups-phase-3.md), [`logical-backups-phase-4.md`](logical-backups-phase-4.md), [`logical-backups-phase-4-5.md`](logical-backups-phase-4-5.md), and [`logical-backups-phase-5.md`](logical-backups-phase-5.md). This file covers Phase 6: **client-side at-rest encryption**, including KMS-backed key management.
 
 The headline operator outcome: **chunks land in cloud storage as ciphertext, not plaintext.** Even an attacker with full read access to the bucket can't recover the underlying database rows. Closes the v0.16.0 + v0.17.2 release-notes-disclosed gap that sluice currently writes plaintext chunks; unlocks compliance-driven adoption (HIPAA, PCI-DSS, SOC 2 Type II, GDPR with customer-controlled keys) + air-gapped DR workflows where bucket-SSE doesn't follow the bytes.
 
@@ -178,8 +178,8 @@ A clean Phase 6 must:
 
 ## See also
 
-- [`design-logical-backups.md`](design-logical-backups.md) — original proto-ADR (Phase 6 was always on the roadmap)
-- [`design-logical-backups-phase-2.md`](design-logical-backups-phase-2.md) — corrected the v0.16.0 release notes' incorrect encryption claim; v0.16.1 amended the live release body
+- [`logical-backups.md`](logical-backups.md) — original proto-ADR (Phase 6 was always on the roadmap)
+- [`logical-backups-phase-2.md`](logical-backups-phase-2.md) — corrected the v0.16.0 release notes' incorrect encryption claim; v0.16.1 amended the live release body
 - ADR-0016 (cross-engine type-policy) — the pattern Phase 6's manifest extensions follow (additive fields, forward-compat)
 - AWS KMS docs: https://docs.aws.amazon.com/kms/latest/developerguide/concepts.html
 - GCP Cloud KMS docs: https://cloud.google.com/kms/docs/concepts

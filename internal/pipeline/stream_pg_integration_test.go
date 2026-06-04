@@ -7,7 +7,7 @@
 // a real Postgres testcontainer. Mirrors the shape of the Phase 3.1
 // incremental tests in incremental_pg_integration_test.go.
 //
-// Acceptance criteria covered (per design-logical-backups-phase-4.md):
+// Acceptance criteria covered (per design/logical-backups-phase-4.md):
 //
 //   1. PG long-running stream produces rolling incrementals.
 //   3. Time-bound rollover triggers (quiet source + small window).

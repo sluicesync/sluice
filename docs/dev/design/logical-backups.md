@@ -212,7 +212,7 @@ Estimated size: ~2000-2800 LOC including tests + ADR. (Smaller than a cloud-MVP 
 
 Estimated size: ~1000-1500 LOC.
 
-> **Implementation supplement:** see [`design-logical-backups-phase-2.md`](design-logical-backups-phase-2.md) for the post-Phase-1 decisions (gocloud.dev/blob library pivot, Archil integration findings, resumable backup writer additions, backup-chain → CDC handoff design, and the backup-as-broker pattern for Phase 4.5+).
+> **Implementation supplement:** see [`logical-backups-phase-2.md`](logical-backups-phase-2.md) for the post-Phase-1 decisions (gocloud.dev/blob library pivot, Archil integration findings, resumable backup writer additions, backup-chain → CDC handoff design, and the backup-as-broker pattern for Phase 4.5+).
 
 ### Phase 3: Incremental backups
 
@@ -249,7 +249,7 @@ Retention policies, lifecycle integration, cross-region replication of backup ob
 ## Open questions
 
 1. **Schema-evolution within an incremental chain.** What if `ALTER TABLE` runs between full and incremental? Current schema-change runbook is "stop the stream, ALTER, resume" — analogous fits backups (stop, ALTER, take a fresh full), but heavier than expected. A lighter design: incremental manifests carry a schema-fingerprint; on schema change, a "schema delta" entry. Restore applies deltas in order. Out of scope for v1; pin down before incrementals ship.
-2. **Multi-table-source backups for sharded sources.** If the source is Vitess-sharded, does `sluice backup full` produce one backup per shard or a consolidated one? Probably per-shard. Multi-source aggregation (`docs/dev/design-multi-source-aggregation.md`) and backups interact here.
+2. **Multi-table-source backups for sharded sources.** If the source is Vitess-sharded, does `sluice backup full` produce one backup per shard or a consolidated one? Probably per-shard. Multi-source aggregation (`docs/dev/design/multi-source-aggregation.md`) and backups interact here.
 3. **Backup-of-encrypted-source.** TDE-protected sources are decrypted at the connection layer — the backup contains plaintext. The MVP's client-side AES-GCM (default-on) protects the at-rest backup; operators who need stronger key-management (KMS-managed keys, BYOK) wait for Phase 6. Document the threat model.
 4. **Restore into a populated target.** Mirror `migrate`'s `--force-cold-start` and `--reset-target-data` (ADR-0023). Probably reuse the existing `Migrator` directly — restore is a migrate with a backup-store source.
 5. **Format versioning across sluice releases.** Manifest carries `sluice_backup_version: 1`; future versions add fields. Old sluice refuses newer manifests with a clear error; new sluice always reads older.
@@ -302,4 +302,4 @@ If the conditions aren't met, the design sits as a reference. Building it ahead 
 - `docs/adr/adr-0010-idempotent-applier.md` — idempotent-apply semantics that make restore-replay safe.
 - `docs/adr/adr-0019-parallel-within-table-bulk-copy.md` — the parallel bulk-read path that makes backups fast on large tables.
 - `docs/adr/adr-0023-reset-target-data.md` — the destructive-recovery pattern restore-into-populated-target should mirror.
-- `docs/dev/design-mid-stream-add-table.md`, `docs/dev/design-multi-source-aggregation.md` — sibling proto-ADRs in the same shape.
+- `docs/dev/design/mid-stream-add-table.md`, `docs/dev/design/multi-source-aggregation.md` — sibling proto-ADRs in the same shape.

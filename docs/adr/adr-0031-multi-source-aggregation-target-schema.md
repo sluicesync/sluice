@@ -3,7 +3,7 @@
 **Status:** Accepted (v0.25.0)
 
 **Companion docs:**
-- Proto-design: [`docs/dev/design-multi-source-aggregation.md`](../dev/design-multi-source-aggregation.md)
+- Proto-design: [`docs/dev/design/multi-source-aggregation.md`](../dev/design/multi-source-aggregation.md)
 - Position-and-data atomicity: [ADR-0007](adr-0007-position-persistence.md)
 - Slot-name plumbing on `sluice_cdc_state` (architectural template): [ADR-0030](adr-0030-mid-stream-live-add-table.md)
 
@@ -158,11 +158,11 @@ Five operator-error scenarios this design surfaces loudly:
 
 ## Versioning
 
-Lands in v0.25.0. Follow-on work is tracked in `docs/dev/roadmap.md` and the proto-design doc (`docs/dev/design-multi-source-aggregation.md` Phase 3+).
+Lands in v0.25.0. Follow-on work is tracked in `docs/dev/roadmap.md` and the proto-design doc (`docs/dev/design/multi-source-aggregation.md` Phase 3+).
 
 ## See also
 
-- [`docs/dev/design-multi-source-aggregation.md`](../dev/design-multi-source-aggregation.md) — proto-design with use-case enumeration and phased plan.
+- [`docs/dev/design/multi-source-aggregation.md`](../dev/design/multi-source-aggregation.md) — proto-design with use-case enumeration and phased plan.
 - [ADR-0007](adr-0007-position-persistence.md) — per-target control-table shape this design extends.
 - [ADR-0023](adr-0023-reset-target-data.md) — destructive-recovery escape hatch operators use to resolve fingerprint-mismatch errors.
 - [ADR-0030](adr-0030-mid-stream-live-add-table.md) — slot_name plumbing pattern (architectural template for the source_dsn_fingerprint column migration).

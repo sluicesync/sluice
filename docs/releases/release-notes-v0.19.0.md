@@ -1,6 +1,6 @@
 # sluice v0.19.0
 
-Logical backups Phase 4 lands. `sluice backup stream` is a single long-running process that produces rolling incrementals at a configured cadence — no per-incremental cron orchestration, no `for { sluice backup incremental }` shell loop, no slot churn between windows. Fits k8s "always-on protection" deployments naturally and pairs with continuous CDC + chain-restore for full disaster-recovery coverage. Implementation supplement: `docs/dev/design-logical-backups-phase-4.md`.
+Logical backups Phase 4 lands. `sluice backup stream` is a single long-running process that produces rolling incrementals at a configured cadence — no per-incremental cron orchestration, no `for { sluice backup incremental }` shell loop, no slot churn between windows. Fits k8s "always-on protection" deployments naturally and pairs with continuous CDC + chain-restore for full disaster-recovery coverage. Implementation supplement: `docs/dev/design/logical-backups-phase-4.md`.
 
 ## Features
 

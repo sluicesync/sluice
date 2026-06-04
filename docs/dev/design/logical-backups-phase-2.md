@@ -1,6 +1,6 @@
 # Logical Backups Phase 2 — Implementation Design
 
-Supplement to [`design-logical-backups.md`](design-logical-backups.md) (the original proto-ADR). This file captures the implementation-time decisions for Phase 2 (cloud backends), the Archil integration findings, the backup-chain → CDC handoff design (a Phase 3 enabler), and the backup-as-broker pattern (a Phase 4.5+ direction). The original doc remains the authoritative high-level design; this one carries the deltas.
+Supplement to [`logical-backups.md`](logical-backups.md) (the original proto-ADR). This file captures the implementation-time decisions for Phase 2 (cloud backends), the Archil integration findings, the backup-chain → CDC handoff design (a Phase 3 enabler), and the backup-as-broker pattern (a Phase 4.5+ direction). The original doc remains the authoritative high-level design; this one carries the deltas.
 
 ## Decisions revised since the original proto-ADR
 
@@ -199,6 +199,6 @@ New surface: `sluice sync from-backup --backup-dir=<url> --target-driver=... --t
 
 ## See also
 
-- [`design-logical-backups.md`](design-logical-backups.md) — original proto-ADR
-- [`design-sluice-verify.md`](design-sluice-verify.md) — verify command (paired feature for the "100% confidence" goal)
+- [`logical-backups.md`](logical-backups.md) — original proto-ADR
+- [`sluice-verify.md`](sluice-verify.md) — verify command (paired feature for the "100% confidence" goal)
 - [`postgres-source-prep.md`](../postgres-source-prep.md) — operator-facing PG setup, will gain a "zero-rebuild disaster recovery" subsection in Phase 3

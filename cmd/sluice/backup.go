@@ -341,9 +341,9 @@ func (e *EncryptionFlags) buildReadEnvelope(rootManifest *ir.Manifest) (crypto.E
 // `verify`; Phase 3 (v0.17.0) adds `incremental` for chained backups
 // taken on top of a previous full or incremental; Phase 4 (v0.19.0)
 // adds `stream` for continuous-incremental long-running streams. See
-// `docs/dev/design-logical-backups.md`,
-// `docs/dev/design-logical-backups-phase-3.md`, and
-// `docs/dev/design-logical-backups-phase-4.md` for the staged plan.
+// `docs/dev/design/logical-backups.md`,
+// `docs/dev/design/logical-backups-phase-3.md`, and
+// `docs/dev/design/logical-backups-phase-4.md` for the staged plan.
 type BackupCmd struct {
 	Full        BackupFullCmd        `cmd:"" help:"Take a full logical backup of a source database to a local directory."`
 	Incremental BackupIncrementalCmd `cmd:"" help:"Take an incremental backup chained off a previous full or incremental (Phase 3)."`

@@ -1,6 +1,6 @@
 # Logical Backups Phase 3 — Implementation Design
 
-Supplement to [`design-logical-backups.md`](design-logical-backups.md) (the original proto-ADR) and [`design-logical-backups-phase-2.md`](design-logical-backups-phase-2.md) (cloud backends + resumable writer). This file covers Phase 3: **incremental backups + backup-chain → CDC handoff**, the load-bearing piece that closes the resync-avoidance story for irrecoverable position loss.
+Supplement to [`logical-backups.md`](logical-backups.md) (the original proto-ADR) and [`logical-backups-phase-2.md`](logical-backups-phase-2.md) (cloud backends + resumable writer). This file covers Phase 3: **incremental backups + backup-chain → CDC handoff**, the load-bearing piece that closes the resync-avoidance story for irrecoverable position loss.
 
 The headline operator outcome: when CDC position is gone (PG slot dropped past `wal_keep_size`, MySQL binlog purged), restoring the backup chain leaves the target ready for `sync start` to resume CDC from the chain's terminal position **without re-bulking from source**.
 
@@ -17,13 +17,13 @@ The headline operator outcome: when CDC position is gone (PG slot dropped past `
 
 **Shipped in Phase 4 (continuous-incremental):**
 
-- `sluice backup stream` long-running process producing rolling incrementals — see [design-logical-backups-phase-4.md](design-logical-backups-phase-4.md).
+- `sluice backup stream` long-running process producing rolling incrementals — see [logical-backups-phase-4.md](logical-backups-phase-4.md).
 - Manifest update under concurrent writers
 - Operator UX for the long-running mode
 
 **Shipped in Phase 4.5 (backup-as-broker):**
 
-- `sluice sync from-backup` watcher that polls the chain and replays incrementals into a target — see [design-logical-backups-phase-4-5.md](design-logical-backups-phase-4-5.md).
+- `sluice sync from-backup` watcher that polls the chain and replays incrementals into a target — see [logical-backups-phase-4-5.md](logical-backups-phase-4-5.md).
 - Decoupled source / target sync via backup as the message log
 
 **Shipped in Phase 6 (passphrase + AWS KMS + GCP + Azure KMS):**
@@ -187,8 +187,8 @@ Out of Phase 3 scope; capture for the post-Phase-3 backlog.
 
 ## See also
 
-- [`design-logical-backups.md`](design-logical-backups.md) — original proto-ADR
-- [`design-logical-backups-phase-2.md`](design-logical-backups-phase-2.md) — cloud backends + resumable writer (v0.16.x)
+- [`logical-backups.md`](logical-backups.md) — original proto-ADR
+- [`logical-backups-phase-2.md`](logical-backups-phase-2.md) — cloud backends + resumable writer (v0.16.x)
 - [`../postgres-source-prep.md`](../postgres-source-prep.md) — operator setup including the idle-slot failover trap (load-bearing for Phase 3 PG handoff)
 - ADR-0010 (idempotent CDC apply) — the load-bearing assumption for chain replay
 - ADR-0022 (slot-missing fall-through) — the existing recovery path that Phase 3 supplements but does not replace

@@ -3,7 +3,7 @@
 **Status:** proto-ADR (research / design draft, not yet implementation-bound)
 **Author:** main session
 **Date:** 2026-05-07
-**Related:** ADR-0029 (`sluice schema diff`), v0.4.0 FK-failure test (FUTURE-TESTS.md item L), `design-sluice-verify.md` (cross-reference for completeness verification)
+**Related:** ADR-0029 (`sluice schema diff`), v0.4.0 FK-failure test (FUTURE-TESTS.md item L), `sluice-verify.md` (cross-reference for completeness verification)
 
 ## Why
 

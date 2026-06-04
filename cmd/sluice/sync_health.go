@@ -15,7 +15,7 @@ import (
 )
 
 // SyncHealthCmd implements `sluice sync health` (proto-ADR
-// docs/dev/design-sync-health-monitoring.md).
+// docs/dev/design/sync-health-monitoring.md).
 //
 // v0.13.0 (probe MVP): reads the target's sluice_cdc_state for the
 // supplied --stream-id, computes wall-clock seconds-since-last-apply.

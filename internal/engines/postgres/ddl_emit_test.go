@@ -1334,7 +1334,7 @@ func TestEmitAddForeignKey(t *testing.T) {
 // apply (tables → bulk_copy → indexes → constraints) sidesteps the
 // create-order problem because FKs land in phase 5 after all tables
 // exist; this test pins the DDL emit so a regression couldn't drop
-// the self-ref support silently. Per design-schema-completeness.md.
+// the self-ref support silently. Per design/schema-completeness.md.
 func TestEmitAddForeignKey_SelfReferential(t *testing.T) {
 	fk := &ir.ForeignKey{
 		Name:              "employees_manager_fk",

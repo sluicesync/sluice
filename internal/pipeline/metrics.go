@@ -5,7 +5,7 @@ package pipeline
 
 // Prometheus-format `/metrics` endpoint for `sluice sync start
 // --metrics-listen ADDR`. Phase 2 of the sync-health monitoring proto-
-// ADR (`docs/dev/design-sync-health-monitoring.md`).
+// ADR (`docs/dev/design/sync-health-monitoring.md`).
 //
 // MVP scope: scrape-time read of the target's sluice_cdc_state for
 // each stream the target has been a destination for; emit a small

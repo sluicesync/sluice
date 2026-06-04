@@ -15,7 +15,7 @@ Re-reading the Phase 1 orchestrator after it shipped: **the conservative refusal
 - Step 6: bulk-copy via the temp-slot snapshot stream, then drop the temp slot.
 - Persisted CDC position is intentionally NOT updated. The active stream's existing position is still the right resume point for the other tables; the **idempotent applier** (ADR-0010, `INSERT ... ON CONFLICT DO NOTHING`) absorbs the [persisted_LSN, snapshot_LSN] overlap on the new table when the operator runs `sync start --resume`.
 
-The ONLY thing keeping Phase 1 from being live-safe is the explicit refusal in `preflightStream` (lines 326–360 in the Phase 1 file). The `stop_requested_at` check is a partial-detection of stream activity that erred conservative because the proto-ADR (`docs/dev/design-mid-stream-add-table.md`) flagged Strategy B/C as v2 work. After implementation, Phase 1 already implements the correctness story for Strategy C variant (c) — publication-add-then-snapshot — and the refusal is the only gate.
+The ONLY thing keeping Phase 1 from being live-safe is the explicit refusal in `preflightStream` (lines 326–360 in the Phase 1 file). The `stop_requested_at` check is a partial-detection of stream activity that erred conservative because the proto-ADR (`docs/dev/design/mid-stream-add-table.md`) flagged Strategy B/C as v2 work. After implementation, Phase 1 already implements the correctness story for Strategy C variant (c) — publication-add-then-snapshot — and the refusal is the only gate.
 
 ## Decision
 
@@ -78,7 +78,7 @@ These are all "fail loudly with a clear message" paths — there's no silent rec
 
 ## Why not Strategy B (dual-slot)
 
-The proto-ADR (`docs/dev/design-mid-stream-add-table.md`, "Strategy B" section) sketches a dual-slot approach: a separate replication slot streams alongside the main one, then atomically swaps publication scope at the LSN the new snapshot ended at. It avoids the conservative refusal but adds:
+The proto-ADR (`docs/dev/design/mid-stream-add-table.md`, "Strategy B" section) sketches a dual-slot approach: a separate replication slot streams alongside the main one, then atomically swaps publication scope at the LSN the new snapshot ended at. It avoids the conservative refusal but adds:
 
 - A second slot consuming WAL on the source until the swap completes.
 - The "atomic swap" requires careful coordination: the new slot's progress must overlap with the main slot's at the swap LSN, and the swap itself isn't a single command.
@@ -115,6 +115,6 @@ Integration tests in `internal/pipeline/add_table_live_pg_integration_test.go`:
 
 ## See also
 
-- `docs/dev/design-mid-stream-add-table.md` — the proto-ADR for Phase 1 + Phase 2 design space; the "Phase 2 status" section references this ADR.
+- `docs/dev/design/mid-stream-add-table.md` — the proto-ADR for Phase 1 + Phase 2 design space; the "Phase 2 status" section references this ADR.
 - `docs/adr/adr-0021-publication-scope-by-table.md` — the publication-scope-by-table baseline that makes `AddPublicationTables` an additive operation.
 - `docs/adr/adr-0010-idempotent-applier.md` — the INSERT ON CONFLICT DO NOTHING semantics that absorb the [snapshot-LSN, slot-LSN] overlap.

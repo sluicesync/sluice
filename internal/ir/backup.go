@@ -39,7 +39,7 @@ package ir
 //   - Compression algorithm choice — Phase 1 uses gzip via stdlib.
 //     Phase 2 may swap to zstd if benchmarks show it matters.
 //
-// See `docs/dev/design-logical-backups.md` for the full design.
+// See `docs/dev/design/logical-backups.md` for the full design.
 
 import (
 	"context"
@@ -145,7 +145,7 @@ const (
 	// backup incremental` — a window of [Change] events sourced from
 	// the engine's CDC pump, replayed at restore time on top of a
 	// parent (full or earlier incremental). Phase 3 of the logical-
-	// backup feature; see `docs/dev/design-logical-backups-phase-3.md`.
+	// backup feature; see `docs/dev/design/logical-backups-phase-3.md`.
 	BackupKindIncremental = "incremental"
 )
 

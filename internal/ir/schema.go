@@ -15,7 +15,7 @@ type Schema struct {
 	// included with View.Materialized = true. View support is a
 	// schema-only round-trip in v1: the writer creates the view from
 	// View.Definition; cross-engine view-definition translation is a
-	// future Phase 3 effort. See `docs/dev/design-schema-completeness.md`.
+	// future Phase 3 effort. See `docs/dev/design/schema-completeness.md`.
 	Views []*View
 }
 
@@ -24,7 +24,7 @@ type Schema struct {
 // statement, captured verbatim from the source dialect.
 //
 // View support is intentionally minimal in v1 ("Phase 1" of the proto-
-// ADR `docs/dev/design-schema-completeness.md`):
+// ADR `docs/dev/design/schema-completeness.md`):
 //
 //   - Schema-only round-trip: source views are read from the catalog,
 //     emitted to the target via `CREATE VIEW`/`CREATE MATERIALIZED VIEW`.

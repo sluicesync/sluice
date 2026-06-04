@@ -5,7 +5,7 @@ package pipeline
 
 // `sluice verify` orchestration. v0.12.0 ships count-mode only —
 // row-count comparison per table — per the proto-ADR's MVP slice
-// (docs/dev/design-sluice-verify.md). Sample mode and full mode follow.
+// (docs/dev/design/sluice-verify.md). Sample mode and full mode follow.
 //
 // Engine-neutral: every per-engine operation goes through the
 // [ir.Verifier] optional interface, type-asserted from the engine's
@@ -39,7 +39,7 @@ const (
 // DefaultSampleRowsPerTable is the per-table sample size when --depth
 // sample is requested without an explicit --sample-rows-per-table.
 // 100 gives ~99% confidence of detecting a 5%+ corruption rate per
-// the proto-ADR (`docs/dev/design-sluice-verify.md`).
+// the proto-ADR (`docs/dev/design/sluice-verify.md`).
 const DefaultSampleRowsPerTable = 100
 
 // DefaultSampleSeed is the seed used when sample mode runs without an

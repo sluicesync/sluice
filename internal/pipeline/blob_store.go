@@ -5,8 +5,8 @@ package pipeline
 
 // Cloud-blob implementation of [ir.BackupStore] over `gocloud.dev/blob`.
 //
-// Phase 2 of the logical-backup feature (`docs/dev/design-logical-backups.md`
-// + `docs/dev/design-logical-backups-phase-2.md`). Mirrors [LocalStore]'s
+// Phase 2 of the logical-backup feature (`docs/dev/design/logical-backups.md`
+// + `docs/dev/design/logical-backups-phase-2.md`). Mirrors [LocalStore]'s
 // shape so the orchestrator code in `backup.go` / `restore.go` doesn't
 // know which backend is underneath; only the URL scheme passed to
 // [OpenBlobStore] changes between local-FS, S3, GCS, and Azure.

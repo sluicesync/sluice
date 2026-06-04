@@ -1,6 +1,6 @@
 # sluice v0.20.0
 
-Logical backups Phase 4.5 lands. `sluice sync from-backup` is the consumer-side companion to v0.19.0's `sluice backup stream` — a long-running broker that polls a backup chain and replays incrementals into a target. The headline operator outcome: **decouple source and target via the backup chain as the message log.** Source-side `backup stream` writes incrementals to S3/GCS/Azure/local-FS; target-side `sync from-backup` polls the same destination and replays into its own database. Log-based ETL without direct source-target connectivity. Implementation supplement: `docs/dev/design-logical-backups-phase-4-5.md`.
+Logical backups Phase 4.5 lands. `sluice sync from-backup` is the consumer-side companion to v0.19.0's `sluice backup stream` — a long-running broker that polls a backup chain and replays incrementals into a target. The headline operator outcome: **decouple source and target via the backup chain as the message log.** Source-side `backup stream` writes incrementals to S3/GCS/Azure/local-FS; target-side `sync from-backup` polls the same destination and replays into its own database. Log-based ETL without direct source-target connectivity. Implementation supplement: `docs/dev/design/logical-backups-phase-4-5.md`.
 
 ## Features
 

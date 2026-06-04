@@ -5,7 +5,7 @@
 
 // Phase 6.1 integration tests: passphrase-mode envelope encryption.
 // Covers the load-bearing acceptance criteria from
-// `docs/dev/design-logical-backups-phase-6.md`:
+// `docs/dev/design/logical-backups-phase-6.md`:
 //
 //   1. Round-trip — encrypted backup + correct-passphrase restore lands
 //      the original data byte-for-byte; chunk bytes on disk are NOT

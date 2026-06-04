@@ -14,7 +14,7 @@ Logical backups Phase 2 — cloud backends. Phase 1 (v0.15.0) shipped the manife
 
 - **Resumable backup writer.** A backup process killed mid-job (process crash, host restart, network blip, operator Ctrl-C) resumes on re-run rather than restarting from scratch. Two mechanisms work together: per-chunk skip via the new `BackupStore.Exists` method + the manifest's recorded SHA-256 (skip if present and checksum-matches), and per-table progress checkpoints (manifest is updated atomically after each table completes). Re-run against the same `--output-dir` / `--target` and the orchestrator detects the partial state and resumes from the next un-completed table. Use `--force-overwrite` to discard the partial backup and start fresh.
 
-- **Archil integration** as a side benefit of the S3-compatible flag work. Their S3 API is read-only (write path is POSIX mount via Phase 1's `LocalStore`), but the cross-environment restore-from-Archil flow is now zero-extra-code. See `docs/dev/design-logical-backups-phase-2.md` for the full integration shape including the per-disk credential setup checklist.
+- **Archil integration** as a side benefit of the S3-compatible flag work. Their S3 API is read-only (write path is POSIX mount via Phase 1's `LocalStore`), but the cross-environment restore-from-Archil flow is now zero-extra-code. See `docs/dev/design/logical-backups-phase-2.md` for the full integration shape including the per-disk credential setup checklist.
 
 ## Compatibility
 

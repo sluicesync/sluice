@@ -4,7 +4,7 @@
 package pipeline
 
 // Cross-engine supportability check. Phase 5 of the logical-backup
-// feature (`docs/dev/design-logical-backups-phase-5.md`): cross-engine
+// feature (`docs/dev/design/logical-backups-phase-5.md`): cross-engine
 // chain restore reuses [translate.RetargetForEngine] to rewrite types
 // where a clean translation exists (UUID → CHAR(36) etc.), but a
 // handful of source-engine-native types have no portable target-engine

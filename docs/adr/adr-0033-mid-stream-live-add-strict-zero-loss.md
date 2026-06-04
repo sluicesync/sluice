@@ -126,7 +126,7 @@ Land the verification test as a permanent regression artifact. Update ADR-0030's
 
 The next chunk that picks this up should consider:
 
-- **Path B — Strategy B (dual-slot)** as originally sketched in `docs/dev/design-mid-stream-add-table.md`. A second slot created at `LSN_pubadd` (or strictly after) that streams events on the new table from that point forward; main slot continues without scope change. The events at `LSN ∈ [LSN_pubadd, LSN_S]` are delivered by both slots' pgoutput streams (because both decode at LSN ≥ `LSN_pubadd` after the publication includes the table); idempotent applier handles overlap. The "LSN race" the original ADR-0030 wanted to avoid is the price; deterministic test fixtures will need careful construction.
+- **Path B — Strategy B (dual-slot)** as originally sketched in `docs/dev/design/mid-stream-add-table.md`. A second slot created at `LSN_pubadd` (or strictly after) that streams events on the new table from that point forward; main slot continues without scope change. The events at `LSN ∈ [LSN_pubadd, LSN_S]` are delivered by both slots' pgoutput streams (because both decode at LSN ≥ `LSN_pubadd` after the publication includes the table); idempotent applier handles overlap. The "LSN race" the original ADR-0030 wanted to avoid is the price; deterministic test fixtures will need careful construction.
 - **Path C — Quiesce the source.** Take a brief `LOCK TABLE` or coordinate with the application to stop writes on the new table (or all tables) for the publication-add window. Operator-coordinated; not "live" in the strictest sense, but a viable middle ground for ops who can quiesce briefly.
 - **Path D — Diagnose the actual v0.24.0 loss surface FIRST.** Per "what we still don't know" above. Maybe the loss is smaller-scope than thought and a targeted fix (e.g. preventing long-running transactions across the boundary, or improving the snapshot consistent-point capture) closes the gap without needing a dual-slot.
 
@@ -135,5 +135,5 @@ Path D is the most CLAUDE.md-aligned next step: it's the "instrument the actual 
 ## See also
 
 - `docs/adr/adr-0030-mid-stream-live-add-table.md` — Phase 2 design and the "What could go wrong" entry this ADR references.
-- `docs/dev/design-mid-stream-add-table.md` — proto-ADR with Strategy B (dual-slot) sketch.
+- `docs/dev/design/mid-stream-add-table.md` — proto-ADR with Strategy B (dual-slot) sketch.
 - `internal/engines/postgres/slot_pause_verify_integration_test.go` — the load-bearing Phase A test artifact. Re-run on any future chunk that revisits Path A or proposes a similar slot-retention-based mechanism.

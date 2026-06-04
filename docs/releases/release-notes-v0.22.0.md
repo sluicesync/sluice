@@ -1,6 +1,6 @@
 # sluice v0.22.0
 
-Logical backups Phase 6.1 lands. **Client-side passphrase-mode encryption** for backup chunks. The headline operator outcome: **chunks land in cloud storage as ciphertext, not plaintext.** Even an attacker with full read access to the bucket can't recover the underlying database rows. Closes the v0.16.0 / v0.17.2 release-notes-disclosed gap that sluice currently writes plaintext chunks; unlocks compliance-driven adoption (HIPAA, PCI-DSS, SOC 2 Type II, GDPR with customer-controlled keys) + air-gapped DR workflows where bucket-SSE doesn't follow the bytes. Implementation supplement: `docs/dev/design-logical-backups-phase-6.md`.
+Logical backups Phase 6.1 lands. **Client-side passphrase-mode encryption** for backup chunks. The headline operator outcome: **chunks land in cloud storage as ciphertext, not plaintext.** Even an attacker with full read access to the bucket can't recover the underlying database rows. Closes the v0.16.0 / v0.17.2 release-notes-disclosed gap that sluice currently writes plaintext chunks; unlocks compliance-driven adoption (HIPAA, PCI-DSS, SOC 2 Type II, GDPR with customer-controlled keys) + air-gapped DR workflows where bucket-SSE doesn't follow the bytes. Implementation supplement: `docs/dev/design/logical-backups-phase-6.md`.
 
 ## Features
 

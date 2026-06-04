@@ -15,7 +15,7 @@ import (
 // SchemaCmd groups subcommands that inspect or describe schemas
 // without modifying them — plus the read-mostly `add-table`
 // command that brings a new source table into an active stream's
-// scope (Phase 1 MVP, see `docs/dev/design-mid-stream-add-table.md`).
+// scope (Phase 1 MVP, see `docs/dev/design/mid-stream-add-table.md`).
 //
 // `add-table` lives here rather than under `sync` because it is a
 // schema-shape mutation that the operator drives explicitly,

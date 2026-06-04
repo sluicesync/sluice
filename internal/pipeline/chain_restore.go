@@ -4,7 +4,7 @@
 package pipeline
 
 // Chain-aware restore orchestrator. Phase 3.2 of the logical-backup
-// feature (`docs/dev/design-logical-backups-phase-3.md`):
+// feature (`docs/dev/design/logical-backups-phase-3.md`):
 // `sluice restore --from=<chain-url>` walks the chain
 // [full, incr_1, incr_2, …, incr_N] in order, applying the full first
 // and then replaying each incremental's serialised [Change] events

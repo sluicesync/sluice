@@ -1,6 +1,6 @@
 # Logical Backups Phase 5 — Implementation Design
 
-Supplement to [`design-logical-backups.md`](design-logical-backups.md), [`design-logical-backups-phase-2.md`](design-logical-backups-phase-2.md), [`design-logical-backups-phase-3.md`](design-logical-backups-phase-3.md), [`design-logical-backups-phase-4.md`](design-logical-backups-phase-4.md), and [`design-logical-backups-phase-4-5.md`](design-logical-backups-phase-4-5.md). This file covers Phase 5: **cross-engine chain restore** — `sluice restore --from=<chain-url>` and `sluice sync from-backup` against a chain whose source engine differs from the target engine.
+Supplement to [`logical-backups.md`](logical-backups.md), [`logical-backups-phase-2.md`](logical-backups-phase-2.md), [`logical-backups-phase-3.md`](logical-backups-phase-3.md), [`logical-backups-phase-4.md`](logical-backups-phase-4.md), and [`logical-backups-phase-4-5.md`](logical-backups-phase-4-5.md). This file covers Phase 5: **cross-engine chain restore** — `sluice restore --from=<chain-url>` and `sluice sync from-backup` against a chain whose source engine differs from the target engine.
 
 The headline operator outcome: **a PG-rooted chain can restore (and stream-apply) into a MySQL target, and vice versa.** Closes the loud refusal that `chain_restore.go:99` currently raises (`"cross-engine chain restore is a Phase 5+ topic"`). Builds on `internal/translate.RetargetForEngine` which already handles full-backup cross-engine translation (since v0.16.x); Phase 5 extends the translation pass into incrementals' schema deltas + change-event row payloads.
 
@@ -140,11 +140,11 @@ A clean Phase 5 must:
 
 ## See also
 
-- [`design-logical-backups.md`](design-logical-backups.md) — original proto-ADR
-- [`design-logical-backups-phase-2.md`](design-logical-backups-phase-2.md) — cloud backends
-- [`design-logical-backups-phase-3.md`](design-logical-backups-phase-3.md) — incrementals + chain restore (Phase 3.2 has the cross-engine refusal Phase 5 lifts)
-- [`design-logical-backups-phase-4.md`](design-logical-backups-phase-4.md) — `backup stream`
-- [`design-logical-backups-phase-4-5.md`](design-logical-backups-phase-4-5.md) — `sync from-backup` broker
+- [`logical-backups.md`](logical-backups.md) — original proto-ADR
+- [`logical-backups-phase-2.md`](logical-backups-phase-2.md) — cloud backends
+- [`logical-backups-phase-3.md`](logical-backups-phase-3.md) — incrementals + chain restore (Phase 3.2 has the cross-engine refusal Phase 5 lifts)
+- [`logical-backups-phase-4.md`](logical-backups-phase-4.md) — `backup stream`
+- [`logical-backups-phase-4-5.md`](logical-backups-phase-4-5.md) — `sync from-backup` broker
 - ADR-0016 (cross-engine type-policy retargeting) — the foundation `RetargetForEngine` builds on
 - `internal/translate/retarget.go` — the type-translation table Phase 5 reuses verbatim
 - `internal/translate/notes.go` — translation notes surface (operator-facing warnings on lossy translations)

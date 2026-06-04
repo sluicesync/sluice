@@ -3,7 +3,7 @@
 
 // Package crypto carries the envelope-encryption primitives that gate
 // Phase 6 of the logical-backup feature
-// (`docs/dev/design-logical-backups-phase-6.md`). Phase 6.1 ships the
+// (`docs/dev/design/logical-backups-phase-6.md`). Phase 6.1 ships the
 // passphrase-mode implementation; Phase 6.2/6.3 add KMS-backed modes
 // behind the same [EnvelopeEncryption] interface so the chunk
 // writer/reader paths don't change when those land.
@@ -29,7 +29,7 @@
 // (`--encrypt-mode=per-chunk`) is opt-in for operators who want
 // defense-in-depth at the cost of one wrap operation per chunk.
 //
-// See `docs/dev/design-logical-backups-phase-6.md` for the full design,
+// See `docs/dev/design/logical-backups-phase-6.md` for the full design,
 // threat model, and operator-facing UX.
 package crypto
 

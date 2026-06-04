@@ -1,6 +1,6 @@
 # Logical Backups Phase 4 — Implementation Design
 
-Supplement to [`design-logical-backups.md`](design-logical-backups.md), [`design-logical-backups-phase-2.md`](design-logical-backups-phase-2.md), and [`design-logical-backups-phase-3.md`](design-logical-backups-phase-3.md). This file covers Phase 4: **continuous-incremental long-running stream** (`sluice backup stream`).
+Supplement to [`logical-backups.md`](logical-backups.md), [`logical-backups-phase-2.md`](logical-backups-phase-2.md), and [`logical-backups-phase-3.md`](logical-backups-phase-3.md). This file covers Phase 4: **continuous-incremental long-running stream** (`sluice backup stream`).
 
 The headline operator outcome: a single long-running process produces rolling incrementals at a configured cadence, no per-incremental cron orchestration. Fits k8s-style "always-on protection" deployments naturally; pairs with continuous CDC + chain-restore for full DR coverage.
 
@@ -25,7 +25,7 @@ The headline operator outcome: a single long-running process produces rolling in
 
 **Shipped in Phase 4.5 (backup-as-broker):**
 
-- `sluice sync from-backup` watcher that polls the chain and replays incrementals into a target — see [design-logical-backups-phase-4-5.md](design-logical-backups-phase-4-5.md).
+- `sluice sync from-backup` watcher that polls the chain and replays incrementals into a target — see [logical-backups-phase-4-5.md](logical-backups-phase-4-5.md).
 
 **Shipped in Phase 5+ (cross-engine chain restore):**
 
@@ -148,9 +148,9 @@ So default: skip empty. `--rollover-include-empty` for operators who want the he
 
 ## See also
 
-- [`design-logical-backups.md`](design-logical-backups.md) — original proto-ADR
-- [`design-logical-backups-phase-2.md`](design-logical-backups-phase-2.md) — cloud backends + resumable writer
-- [`design-logical-backups-phase-3.md`](design-logical-backups-phase-3.md) — incrementals + chain-aware restore + CDC handoff + snapshot-anchored EndPosition
+- [`logical-backups.md`](logical-backups.md) — original proto-ADR
+- [`logical-backups-phase-2.md`](logical-backups-phase-2.md) — cloud backends + resumable writer
+- [`logical-backups-phase-3.md`](logical-backups-phase-3.md) — incrementals + chain-aware restore + CDC handoff + snapshot-anchored EndPosition
 - ADR-0007 (per-target control table) — the conceptual cousin of `stream_state.json`
 - ADR-0022 (slot-missing fall-through, Item F) — what happens when stream's slot is lost mid-run
 - ADR-0025 (graceful-drain `sync stop`) — the conceptual cousin of `backup stream stop`

@@ -4,7 +4,7 @@
 package pipeline
 
 // Backup orchestrator. Phase 1 of the logical-backup feature
-// (`docs/dev/design-logical-backups.md`): full snapshot to a
+// (`docs/dev/design/logical-backups.md`): full snapshot to a
 // [ir.BackupStore], one chunk file per N rows per table, plus a
 // JSON manifest that lists schema + chunks + per-chunk SHA-256.
 //
@@ -109,7 +109,7 @@ type BackupEncryption struct {
 	RebuildForChain func(parentParams *ir.Argon2idParams) (crypto.EnvelopeEncryption, error)
 
 	// Mode is "per-chain" (default) or "per-chunk". See
-	// `docs/dev/design-logical-backups-phase-6.md` for the trade-off.
+	// `docs/dev/design/logical-backups-phase-6.md` for the trade-off.
 	Mode string
 
 	// KEKRef is the operator-visible reference recorded in
@@ -609,7 +609,7 @@ func (b *Backup) openSnapshotOrFallback(ctx context.Context) (ir.RowReader, *ir.
 			slog.String("engine", b.Source.Name()),
 			slog.String("error", err.Error()),
 			slog.String("implication", "chains rooted in this full will have a during-backup write-window gap (see v0.17.2 release notes); enable wal_level=logical for snapshot-anchored consistency, or pair backups with continuous `sluice sync start`"),
-			slog.String("see_also", "v0.17.2 release notes; docs/dev/design-logical-backups-phase-3.md"),
+			slog.String("see_also", "v0.17.2 release notes; docs/dev/design/logical-backups-phase-3.md"),
 		)
 	} else {
 		// Engine doesn't implement BackupSnapshotOpener at all.
@@ -623,7 +623,7 @@ func (b *Backup) openSnapshotOrFallback(ctx context.Context) (ir.RowReader, *ir.
 			slog.String("engine", b.Source.Name()),
 			slog.String("impact", "chains rooted in this full will have a during-backup write-window gap"),
 			slog.String("mitigation", "pair backups with continuous `sluice sync start` so the live stream captures every write"),
-			slog.String("see_also", "v0.17.2 release notes; docs/dev/design-logical-backups-phase-3.md"),
+			slog.String("see_also", "v0.17.2 release notes; docs/dev/design/logical-backups-phase-3.md"),
 		)
 	}
 

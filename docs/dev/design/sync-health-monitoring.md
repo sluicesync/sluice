@@ -3,7 +3,7 @@
 **Status:** proto-ADR (research / design draft, not yet implementation-bound)
 **Author:** main session
 **Date:** 2026-05-07
-**Related:** `docs/dev/design-sluice-verify.md` (companion — verify covers data-integrity, this covers liveness/lag), ADR-0017/0020/0025/0027 (batched apply, slot-ack, sync stop, source-tx-boundary batching)
+**Related:** `docs/dev/design/sluice-verify.md` (companion — verify covers data-integrity, this covers liveness/lag), ADR-0017/0020/0025/0027 (batched apply, slot-ack, sync stop, source-tx-boundary batching)
 
 ## Why
 

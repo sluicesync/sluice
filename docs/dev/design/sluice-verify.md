@@ -3,7 +3,7 @@
 **Status:** proto-ADR (research / design draft, not yet implementation-bound)
 **Author:** main session
 **Date:** 2026-05-07
-**Related:** ADR-0029 (`sluice schema diff`), ADR-0017/0018/0026 (batched-apply, per-batch checkpoints, LOAD DATA writer), `docs/dev/design-logical-backups.md` (parallel research; verify is a building block for backup-restore correctness)
+**Related:** ADR-0029 (`sluice schema diff`), ADR-0017/0018/0026 (batched-apply, per-batch checkpoints, LOAD DATA writer), `docs/dev/design/logical-backups.md` (parallel research; verify is a building block for backup-restore correctness)
 
 ## Why
 
@@ -209,7 +209,7 @@ JSON form preserves the same data with predictable field names; `VerifyResult` i
 
 5. **JSON/JSONB and array columns.** Hashing structured values has edge cases (key ordering, whitespace, type coercion). The IR's value-types contract (`docs/value-types.md`) defines canonical forms; verify uses those. May surface edge cases that aren't currently pinned by tests — file as bugs if they come up.
 
-6. **Logical-backup tie-in.** The parallel `design-logical-backups.md` proto-ADR notes that backup correctness depends on a verify-style restore-roundtrip check. The two designs share machinery; we should ensure the `Verifier` interface is general enough to verify "source vs. backup file" not just "source vs. live target." Likely: parameterize the `Target` side as either `Engine` (live DB) or a backup-file reader (post-MVP).
+6. **Logical-backup tie-in.** The parallel `logical-backups.md` proto-ADR notes that backup correctness depends on a verify-style restore-roundtrip check. The two designs share machinery; we should ensure the `Verifier` interface is general enough to verify "source vs. backup file" not just "source vs. live target." Likely: parameterize the `Target` side as either `Engine` (live DB) or a backup-file reader (post-MVP).
 
 ## What this is not
 
