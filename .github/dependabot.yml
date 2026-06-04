@@ -89,3 +89,15 @@ updates:
     commit-message:
       prefix: "ci"
       include: "scope"
+    # Bundle the docker/* official actions into one rollup PR. They bump
+    # in lockstep upstream and live in the same workflow files
+    # (build-prebaked-images.yml / release.yml), so as independent PRs
+    # they cross-conflict on those files the moment one of them merges —
+    # the same go.sum-style churn the gomod groups above exist to avoid.
+    groups:
+      docker-actions:
+        patterns:
+          - "docker/*"
+        update-types:
+          - "minor"
+          - "patch"
