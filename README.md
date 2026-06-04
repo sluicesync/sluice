@@ -20,7 +20,25 @@ Continuous sync between MySQL and Postgres in all four directions, with the sche
 - 🔁 **Cutover** — one-command sequence priming (`sluice cutover`) prevents PK collisions on the first post-cutover `INSERT`
 - 🛑 **Loud failure by default** — every silent-loss class we have caught has a structured refuse-loudly message with an operator-action recovery hint. Paste into Slack and the on-call DBA knows what to fix.
 
-Pre-built Linux / macOS / Windows binaries on every tagged release: [latest release](https://github.com/sluicesync/sluice/releases/latest). Apache 2.0, single static binary, no daemon, no SaaS dependency.
+Apache 2.0, single static binary, no daemon, no SaaS dependency. Install via Homebrew, Scoop, WinGet, a `.deb`/`.rpm`, `go install`, or the container image — see **[Installation](#installation)**.
+
+---
+
+## Installation
+
+| Platform | Command |
+|----------|---------|
+| **macOS / Linux** — Homebrew | `brew install sluicesync/tap/sluice` |
+| **Windows** — Scoop | `scoop bucket add sluicesync https://github.com/sluicesync/scoop-bucket`<br>`scoop install sluice` |
+| **Windows** — WinGet | `winget install sluicesync.sluice` &nbsp;¹ |
+| **Debian / Ubuntu** | grab the `.deb` from the [latest release](https://github.com/sluicesync/sluice/releases/latest) → `sudo dpkg -i sluice_*_linux_amd64.deb` |
+| **RHEL / Fedora** | grab the `.rpm` → `sudo rpm -i sluice_*_linux_amd64.rpm` |
+| **Go** | `go install sluicesync.dev/sluice/cmd/sluice@latest` |
+| **Container** | `docker pull ghcr.io/sluicesync/sluice:latest` |
+
+Self-contained binaries (Linux / macOS / Windows × amd64 / arm64) plus `.deb` / `.rpm` / `.apk` packages are attached to [every release](https://github.com/sluicesync/sluice/releases/latest).
+
+<sub>¹ WinGet availability follows acceptance into the [microsoft/winget-pkgs](https://github.com/microsoft/winget-pkgs) community repo, which is submitted per release.</sub>
 
 ---
 
