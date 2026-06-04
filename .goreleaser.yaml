@@ -221,10 +221,13 @@ winget:
       name: winget-pkgs
       branch: "sluice-{{ .Version }}"
       token: "{{ .Env.TAP_GITHUB_TOKEN }}"
+      # Auto-PR to microsoft/winget-pkgs is intentionally OFF. A fine-grained
+      # PAT can only act on repos in its scope, so it cannot open a PR against
+      # microsoft/winget-pkgs (out of scope) — that step failed the first
+      # v0.99.2 release attempt even though the manifest pushed to our fork
+      # cleanly. GoReleaser still commits the manifest to the
+      # sluicesync/winget-pkgs fork branch; open the upstream PR manually
+      # (microsoft reviews every version anyway). To re-enable auto-PR, swap in
+      # a classic PAT with the public_repo scope.
       pull_request:
-        enabled: true
-        draft: false
-        base:
-          owner: microsoft
-          name: winget-pkgs
-          branch: master
+        enabled: false
