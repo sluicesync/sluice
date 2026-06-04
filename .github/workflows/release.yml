@@ -68,3 +68,10 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Cross-repo token for the brews / scoops / winget pipes, which
+          # commit a formula/manifest into sluicesync/{homebrew-tap,
+          # scoop-bucket, winget-pkgs}. The default GITHUB_TOKEN can't push to
+          # other repos. Fine-grained PAT, contents:write on those three repos.
+          # Renders empty until the secret exists; brews/scoops/winget then
+          # fail at release time, so don't tag a release until it's set.
+          TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
