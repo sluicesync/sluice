@@ -1,0 +1,505 @@
+// Copyright 2026 Omar Ramos
+// SPDX-License-Identifier: Apache-2.0
+
+package mysql
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"google.golang.org/grpc"
+	"vitess.io/vitess/go/vt/proto/binlogdata"
+	"vitess.io/vitess/go/vt/proto/query"
+	"vitess.io/vitess/go/vt/proto/vtgate"
+
+	"sluicesync.dev/sluice/internal/ir"
+)
+
+// fakeVStreamClient is a deterministic stand-in for
+// [vtgateservice.Vitess_VStreamClient]. The COPY/CDC pumps only ever
+// call Recv, so embedding a nil grpc.ClientStream and overriding Recv
+// is enough — any other method would panic, which is the desired
+// "this fake is Recv-only" contract. Recv replays scripted responses
+// in order; once drained it blocks until ctx cancels (mirrors a real
+// stream that's gone idle waiting for the server), so a pump that has
+// consumed the COPY phase parks rather than spinning.
+type fakeVStreamClient struct {
+	grpc.ClientStream
+
+	ctx  context.Context
+	mu   sync.Mutex
+	next int
+	resp []*vtgate.VStreamResponse
+}
+
+func (f *fakeVStreamClient) Recv() (*vtgate.VStreamResponse, error) {
+	f.mu.Lock()
+	if f.next < len(f.resp) {
+		r := f.resp[f.next]
+		f.next++
+		f.mu.Unlock()
+		return r, nil
+	}
+	f.mu.Unlock()
+	// Drained: block until cancelled so the pump parks like a real
+	// idle stream rather than EOF-ing the COPY phase prematurely.
+	<-f.ctx.Done()
+	return nil, f.ctx.Err()
+}
+
+// oneEvent wraps a single VEvent in its own VStreamResponse so the
+// pump's per-response, per-event loops both get exercised.
+func oneEvent(ev *binlogdata.VEvent) *vtgate.VStreamResponse {
+	return &vtgate.VStreamResponse{Events: []*binlogdata.VEvent{ev}}
+}
+
+func snapFieldEvent(shard string, fields ...*query.Field) *binlogdata.VEvent {
+	return &binlogdata.VEvent{
+		Type: binlogdata.VEventType_FIELD,
+		FieldEvent: &binlogdata.FieldEvent{
+			TableName: "t",
+			Keyspace:  "main",
+			Shard:     shard,
+			Fields:    fields,
+		},
+	}
+}
+
+func snapRowEvent(shard string, vals ...string) *binlogdata.VEvent {
+	return &binlogdata.VEvent{
+		Type: binlogdata.VEventType_ROW,
+		RowEvent: &binlogdata.RowEvent{
+			TableName:  "t",
+			Keyspace:   "main",
+			Shard:      shard,
+			RowChanges: []*binlogdata.RowChange{{After: makeRow(vals)}},
+		},
+	}
+}
+
+func snapVgtidEvent(gtid string) *binlogdata.VEvent {
+	return &binlogdata.VEvent{
+		Type: binlogdata.VEventType_VGTID,
+		Vgtid: &binlogdata.VGtid{
+			ShardGtids: []*binlogdata.ShardGtid{
+				{Keyspace: "main", Shard: "-", Gtid: gtid},
+			},
+		},
+	}
+}
+
+func globalCopyCompleted() *binlogdata.VEvent {
+	return &binlogdata.VEvent{Type: binlogdata.VEventType_COPY_COMPLETED}
+}
+
+// newStreamingHarness wires a snapshot stream around a scripted fake
+// gRPC client and spawns the COPY pump exactly as the constructor
+// does. Returns the snap, the SnapshotStream the pump records Position
+// onto, and a cancel that tears the pump down.
+func newStreamingHarness(t *testing.T, resp []*vtgate.VStreamResponse) (*vstreamSnapshotStream, *ir.SnapshotStream, context.CancelFunc) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+
+	s := newTestSnapshotStream()
+	s.copyDone = make(chan struct{})
+	s.grpcStream = &fakeVStreamClient{ctx: ctx, resp: resp}
+
+	stream := &ir.SnapshotStream{
+		Rows:    &vstreamSnapshotRows{snap: s},
+		Changes: &vstreamSnapshotChanges{snap: s},
+	}
+	go s.copyPump(ctx, stream)
+	return s, stream, cancel
+}
+
+// snapPKField is an INT64 field carrying the PRI_KEY_FLAG so the dedup
+// tracker treats it as the table's primary key.
+func snapPKField(name string) *query.Field {
+	return &query.Field{
+		Name:  name,
+		Type:  query.Type_INT64,
+		Flags: uint32(query.MySqlFlag_PRI_KEY_FLAG),
+	}
+}
+
+// TestVStreamSnapshot_StreamingBoundedMemory is the ADR-0071 pin: a
+// single table whose total row volume dwarfs the byte cap streams
+// through ReadRows in CONSTANT memory. Under the pre-streaming reader
+// every row buffered before ReadRows ran (the OOM class); here we
+// assert buffered + in-flight bytes never exceed the cap by more than
+// one row while the consumed-row count climbs to the full total.
+func TestVStreamSnapshot_StreamingBoundedMemory(t *testing.T) {
+	const (
+		nRows    = 4000
+		rowSize  = 256 // each row's payload bytes (approx)
+		capBytes = 8 * 1024
+	)
+	// Script: FIELD, then nRows ROWs, a VGTID, and the global
+	// COPY_COMPLETED. No PK flag → dedup is a no-op, every row kept.
+	resp := make([]*vtgate.VStreamResponse, 0, nRows+3)
+	resp = append(resp, oneEvent(snapFieldEvent(
+		"-",
+		&query.Field{Name: "id", Type: query.Type_INT64},
+		&query.Field{Name: "blob", Type: query.Type_VARCHAR},
+	)))
+	payload := strings.Repeat("x", rowSize)
+	for i := 0; i < nRows; i++ {
+		resp = append(resp, oneEvent(snapRowEvent("-", fmt.Sprintf("%d", i), payload)))
+	}
+	resp = append(
+		resp,
+		oneEvent(snapVgtidEvent("MySQL56/abc:1-100")),
+		oneEvent(globalCopyCompleted()),
+	)
+
+	s, _, cancel := newStreamingHarness(t, resp)
+	defer cancel()
+	s.mu.Lock()
+	s.maxBufferBytes = capBytes
+	s.mu.Unlock()
+
+	// Sample the buffered-bytes high-water mark from a watchdog while
+	// the consumer drains, so we observe the pump's steady state rather
+	// than only the post-drain zero.
+	var peak int64
+	stopWatch := make(chan struct{})
+	var watchWG sync.WaitGroup
+	watchWG.Add(1)
+	go func() {
+		defer watchWG.Done()
+		tick := time.NewTicker(50 * time.Microsecond)
+		defer tick.Stop()
+		for {
+			select {
+			case <-stopWatch:
+				return
+			case <-tick.C:
+				s.mu.Lock()
+				if s.bufferedBytes > peak {
+					peak = s.bufferedBytes
+				}
+				s.mu.Unlock()
+			}
+		}
+	}()
+
+	ctx, ccancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer ccancel()
+	tbl := &ir.Table{Name: "t", Columns: []*ir.Column{
+		{Name: "id", Type: ir.Integer{Width: 64}},
+		{Name: "blob", Type: ir.Varchar{Length: 4096}},
+	}}
+	ch, err := (&vstreamSnapshotRows{snap: s}).ReadRows(ctx, tbl)
+	if err != nil {
+		t.Fatalf("ReadRows: %v", err)
+	}
+
+	consumed := 0
+	var maxObservedBuffered int64
+	for range ch {
+		// Inspect the queue depth on the consumer side too — a slow
+		// consumer (this loop) must keep the pump bounded.
+		s.mu.Lock()
+		if s.bufferedBytes > maxObservedBuffered {
+			maxObservedBuffered = s.bufferedBytes
+		}
+		s.mu.Unlock()
+		consumed++
+	}
+	close(stopWatch)
+	watchWG.Wait()
+
+	if err := (&vstreamSnapshotRows{snap: s}).Err(); err != nil {
+		t.Fatalf("Err after drain: %v", err)
+	}
+	if consumed != nRows {
+		t.Fatalf("consumed %d rows; want %d (streaming must surface every row)", consumed, nRows)
+	}
+
+	// The cap is a soft target: the pump may overshoot by at most one
+	// in-flight row (the row whose append crossed the cap before the
+	// consumer debited). Allow one row's slack over the cap.
+	limit := int64(capBytes) + rowSize + 64
+	if peak > limit {
+		t.Errorf("watchdog peak buffered bytes = %d; want <= %d (cap %d + 1 row slack) — memory not bounded", peak, limit, capBytes)
+	}
+	if maxObservedBuffered > limit {
+		t.Errorf("consumer-observed peak buffered bytes = %d; want <= %d — memory not bounded", maxObservedBuffered, limit)
+	}
+	// Sanity: the total volume really did exceed the cap many times
+	// over, so a passing bound is meaningful (not a too-small input).
+	if int64(nRows)*rowSize < int64(capBytes)*10 {
+		t.Fatalf("test input too small to prove bounding: total %d, cap %d", int64(nRows)*rowSize, capBytes)
+	}
+}
+
+// TestVStreamSnapshot_StreamingMultiShardFanIn confirms that under the
+// streaming path rows for one logical table arriving from TWO shards
+// all surface through a single ReadRows call (the fan-in invariant the
+// pre-streaming reader had, preserved by keying the queue on the
+// unqualified table name).
+func TestVStreamSnapshot_StreamingMultiShardFanIn(t *testing.T) {
+	resp := []*vtgate.VStreamResponse{
+		oneEvent(snapFieldEvent("-80", &query.Field{Name: "id", Type: query.Type_INT64})),
+		oneEvent(snapFieldEvent("80-", &query.Field{Name: "id", Type: query.Type_INT64})),
+		oneEvent(snapRowEvent("-80", "1")),
+		oneEvent(snapRowEvent("80-", "2")),
+		oneEvent(snapRowEvent("-80", "3")),
+		oneEvent(snapRowEvent("80-", "4")),
+		oneEvent(snapVgtidEvent("MySQL56/abc:1-100")),
+		oneEvent(globalCopyCompleted()),
+	}
+	s, _, cancel := newStreamingHarness(t, resp)
+	defer cancel()
+
+	ctx, ccancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer ccancel()
+	tbl := &ir.Table{Name: "t", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}}
+	ch, err := (&vstreamSnapshotRows{snap: s}).ReadRows(ctx, tbl)
+	if err != nil {
+		t.Fatalf("ReadRows: %v", err)
+	}
+	got := map[int64]bool{}
+	for r := range ch {
+		id, _ := r["id"].(int64)
+		got[id] = true
+	}
+	if err := (&vstreamSnapshotRows{snap: s}).Err(); err != nil {
+		t.Fatalf("Err: %v", err)
+	}
+	for _, want := range []int64{1, 2, 3, 4} {
+		if !got[want] {
+			t.Errorf("row id=%d from shard fan-in missing; got=%v", want, got)
+		}
+	}
+	if len(got) != 4 {
+		t.Errorf("got %d distinct rows; want 4 (both shards merged)", len(got))
+	}
+}
+
+// TestVStreamSnapshot_StreamingDedup confirms the behind-the-scan
+// re-emission drop still fires on the streaming path: the dedup
+// tracker runs inline in the COPY pump, so a re-emitted (lower-or-equal
+// PK) row never reaches the queue or the consumer.
+func TestVStreamSnapshot_StreamingDedup(t *testing.T) {
+	resp := []*vtgate.VStreamResponse{
+		oneEvent(snapFieldEvent("-", snapPKField("id"))),
+		oneEvent(snapRowEvent("-", "1")),
+		oneEvent(snapRowEvent("-", "2")),
+		oneEvent(snapRowEvent("-", "3")),
+		// Behind-the-scan re-emissions (PK <= max seen) — must drop.
+		oneEvent(snapRowEvent("-", "2")),
+		oneEvent(snapRowEvent("-", "1")),
+		// Forward again — kept.
+		oneEvent(snapRowEvent("-", "4")),
+		oneEvent(snapVgtidEvent("MySQL56/abc:1-100")),
+		oneEvent(globalCopyCompleted()),
+	}
+	s, _, cancel := newStreamingHarness(t, resp)
+	defer cancel()
+
+	ctx, ccancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer ccancel()
+	tbl := &ir.Table{Name: "t", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}}
+	ch, err := (&vstreamSnapshotRows{snap: s}).ReadRows(ctx, tbl)
+	if err != nil {
+		t.Fatalf("ReadRows: %v", err)
+	}
+	var ids []int64
+	for r := range ch {
+		id, _ := r["id"].(int64)
+		ids = append(ids, id)
+	}
+	if err := (&vstreamSnapshotRows{snap: s}).Err(); err != nil {
+		t.Fatalf("Err: %v", err)
+	}
+	want := []int64{1, 2, 3, 4}
+	if len(ids) != len(want) {
+		t.Fatalf("got ids %v; want %v (behind-the-scan re-emissions dropped)", ids, want)
+	}
+	for i := range want {
+		if ids[i] != want[i] {
+			t.Errorf("ids[%d] = %d; want %d", i, ids[i], want[i])
+		}
+	}
+}
+
+// TestVStreamSnapshot_StreamingPositionAfterDrain is the race-clean
+// pump↔consumer handoff pin: a concurrent COPY pump fills the stream
+// while a consumer drains via ReadRows, and AFTER the drain completes
+// the orchestrator-style read of stream.Position observes the final
+// VGTID the pump recorded at COPY_COMPLETED. The happens-before edge is
+// the ReadRows channel close (the pump writes Position + sets
+// copyComplete under mu before the consumer can observe copyComplete
+// and close its channel). Run with -race to exercise the edge.
+func TestVStreamSnapshot_StreamingPositionAfterDrain(t *testing.T) {
+	const finalGtid = "MySQL56/abc:1-12345"
+	resp := []*vtgate.VStreamResponse{
+		oneEvent(snapFieldEvent("-", &query.Field{Name: "id", Type: query.Type_INT64})),
+		oneEvent(snapVgtidEvent("MySQL56/abc:1-1")), // intermediate
+		oneEvent(snapRowEvent("-", "1")),
+		oneEvent(snapRowEvent("-", "2")),
+		oneEvent(snapVgtidEvent(finalGtid)), // snapshot-consistent position
+		oneEvent(globalCopyCompleted()),
+	}
+	s, stream, cancel := newStreamingHarness(t, resp)
+	defer cancel()
+
+	ctx, ccancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer ccancel()
+	tbl := &ir.Table{Name: "t", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}}
+	ch, err := (&vstreamSnapshotRows{snap: s}).ReadRows(ctx, tbl)
+	if err != nil {
+		t.Fatalf("ReadRows: %v", err)
+	}
+	count := 0
+	for range ch {
+		count++
+	}
+	if count != 2 {
+		t.Fatalf("consumed %d rows; want 2", count)
+	}
+	if err := (&vstreamSnapshotRows{snap: s}).Err(); err != nil {
+		t.Fatalf("Err after drain: %v", err)
+	}
+
+	// Post-drain read, exactly as the cold-start orchestrator does
+	// after runBulkCopy. The channel-close edge orders this read after
+	// the pump's Position write.
+	want, err := encodeVStreamPos([]shardGtid{{Keyspace: "main", Shard: "-", Gtid: finalGtid}})
+	if err != nil {
+		t.Fatalf("encodeVStreamPos: %v", err)
+	}
+	if stream.Position.Token != want.Token || stream.Position.Engine != want.Engine {
+		t.Fatalf("stream.Position = %+v after drain; want final VGTID %+v", stream.Position, want)
+	}
+
+	// StreamChanges with the captured position must validate (no
+	// mismatch) now that the pump has joined.
+	if _, err := stream.Changes.StreamChanges(ctx, stream.Position); err != nil {
+		t.Fatalf("StreamChanges with captured position: %v", err)
+	}
+}
+
+// TestVStreamSnapshot_StreamingMultiTableInterleaveRefuse pins the
+// Phase 1 loud refusal (ADR-0071): rows for a not-yet-consumed table
+// accumulating past the cap WHILE a different table is being drained is
+// a loud error, not an OOM or a deadlock. We drive table "a" rows
+// while a consumer holds table "b" active; once "a" crosses the cap the
+// pump records a refusal that Err surfaces.
+func TestVStreamSnapshot_StreamingMultiTableInterleaveRefuse(t *testing.T) {
+	field := func(table string) *binlogdata.VEvent {
+		return &binlogdata.VEvent{
+			Type: binlogdata.VEventType_FIELD,
+			FieldEvent: &binlogdata.FieldEvent{
+				TableName: table, Keyspace: "main", Shard: "-",
+				Fields: []*query.Field{
+					{Name: "id", Type: query.Type_INT64},
+					{Name: "blob", Type: query.Type_VARCHAR},
+				},
+			},
+		}
+	}
+	row := func(table, id, blob string) *binlogdata.VEvent {
+		return &binlogdata.VEvent{
+			Type: binlogdata.VEventType_ROW,
+			RowEvent: &binlogdata.RowEvent{
+				TableName: table, Keyspace: "main", Shard: "-",
+				RowChanges: []*binlogdata.RowChange{{After: makeRow([]string{id, blob})}},
+			},
+		}
+	}
+	const capBytes = 4 * 1024
+	payload := strings.Repeat("y", 512)
+	resp := []*vtgate.VStreamResponse{
+		oneEvent(field("b")),
+		oneEvent(row("b", "1", "small")), // gives consumer of "b" one row
+		oneEvent(field("a")),
+	}
+	// Pile "a" rows well past the cap.
+	for i := 0; i < 200; i++ {
+		resp = append(resp, oneEvent(row("a", fmt.Sprintf("%d", i), payload)))
+	}
+	resp = append(resp, oneEvent(globalCopyCompleted()))
+
+	s, _, cancel := newStreamingHarness(t, resp)
+	defer cancel()
+	s.mu.Lock()
+	s.maxBufferBytes = capBytes
+	s.mu.Unlock()
+
+	ctx, ccancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer ccancel()
+
+	// Consume table "b" but DO NOT consume "a". Holding "b" active
+	// means "a"'s over-cap growth has no drain → loud refuse.
+	tblB := &ir.Table{Name: "b", Columns: []*ir.Column{
+		{Name: "id", Type: ir.Integer{Width: 64}},
+		{Name: "blob", Type: ir.Varchar{Length: 4096}},
+	}}
+	ch, err := (&vstreamSnapshotRows{snap: s}).ReadRows(ctx, tblB)
+	if err != nil {
+		t.Fatalf("ReadRows(b): %v", err)
+	}
+	// Drain whatever "b" yields; its channel closes when copy completes
+	// or the pump errors (which also flips copyComplete).
+	for range ch {
+	}
+
+	gotErr := (&vstreamSnapshotRows{snap: s}).Err()
+	if gotErr == nil {
+		t.Fatal("expected a loud refusal Err for the multi-table interleave over-cap case; got nil")
+	}
+	if !strings.Contains(gotErr.Error(), "max-buffer-bytes") {
+		t.Errorf("refusal Err = %q; want it to name --max-buffer-bytes", gotErr.Error())
+	}
+}
+
+// TestVStreamSnapshot_ActiveTableToggles asserts ReadRows marks its
+// table active synchronously (so the pump backpressures rather than
+// refuses on that table) and clears it once the channel closes. We
+// check "set" via a backpressure proxy rather than racing the drain
+// goroutine's clear: ReadRows sets activeTable before spawning its
+// goroutine, so it is observable immediately on return.
+func TestVStreamSnapshot_ActiveTableToggles(t *testing.T) {
+	resp := []*vtgate.VStreamResponse{
+		oneEvent(snapFieldEvent("-", &query.Field{Name: "id", Type: query.Type_INT64})),
+		oneEvent(snapRowEvent("-", "1")),
+		oneEvent(snapVgtidEvent("MySQL56/abc:1-1")),
+		oneEvent(globalCopyCompleted()),
+	}
+	s, _, cancel := newStreamingHarness(t, resp)
+	defer cancel()
+
+	ctx, ccancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer ccancel()
+	tbl := &ir.Table{Name: "t", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}}
+	ch, err := (&vstreamSnapshotRows{snap: s}).ReadRows(ctx, tbl)
+	if err != nil {
+		t.Fatalf("ReadRows: %v", err)
+	}
+	// activeTable is set synchronously in ReadRows, before the drain
+	// goroutine runs — observable immediately. (It may be cleared again
+	// by the time we drain; the clear is asserted after.)
+	s.mu.Lock()
+	setNow := s.activeTable
+	s.mu.Unlock()
+	if setNow != "t" {
+		t.Errorf("activeTable = %q right after ReadRows; want %q", setNow, "t")
+	}
+
+	for range ch {
+	}
+
+	// After the channel closes, activeTable is cleared.
+	s.mu.Lock()
+	cleared := s.activeTable == ""
+	s.mu.Unlock()
+	if !cleared {
+		t.Errorf("activeTable = %q after drain; want cleared", s.activeTable)
+	}
+}
