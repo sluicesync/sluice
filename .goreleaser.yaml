@@ -123,3 +123,108 @@ release:
     See the [changelog](https://github.com/sluicesync/sluice/blob/main/CHANGELOG.md) for highlights.
 
     During the v0.x series, no API or CLI stability guarantees are made. See the README for details.
+
+# ---------------------------------------------------------------------------
+# Package-manager distribution.
+#
+# brews / scoops / winget each commit a formula/manifest into a SEPARATE repo,
+# so they need a cross-repo token: TAP_GITHUB_TOKEN, a fine-grained PAT with
+# contents:write on sluicesync/{homebrew-tap, scoop-bucket, winget-pkgs},
+# wired into release.yml's goreleaser step env. nfpms only attaches native
+# packages to the GitHub release and rides the default GITHUB_TOKEN.
+# ---------------------------------------------------------------------------
+
+# Native Linux packages (.deb / .rpm / .apk) attached to each release.
+# Install: `sudo dpkg -i sluice_*_amd64.deb` (Debian/Ubuntu) or
+# `sudo rpm -i sluice_*_x86_64.rpm` (RHEL/Fedora). A hosted apt/dnf repo
+# (`apt install sluice`) is a future follow-up (needs hosting + GPG signing).
+nfpms:
+  - id: sluice
+    package_name: sluice
+    vendor: sluicesync
+    homepage: "https://sluicesync.com"
+    maintainer: "sluicesync <hello@sluicesync.com>"
+    description: "Open-source MySQL <-> Postgres database migration and continuous-sync (CDC) tool"
+    license: Apache-2.0
+    formats:
+      - deb
+      - rpm
+      - apk
+    bindir: /usr/bin
+    contents:
+      - src: LICENSE
+        dst: /usr/share/doc/sluice/LICENSE
+      - src: README.md
+        dst: /usr/share/doc/sluice/README.md
+
+# Homebrew formula -> sluicesync/homebrew-tap. `brew install sluicesync/tap/sluice`
+brews:
+  - name: sluice
+    repository:
+      owner: sluicesync
+      name: homebrew-tap
+      branch: main
+      token: "{{ .Env.TAP_GITHUB_TOKEN }}"
+    directory: Formula
+    homepage: "https://sluicesync.com"
+    description: "Open-source MySQL <-> Postgres database migration and continuous-sync (CDC) tool"
+    license: Apache-2.0
+    commit_author:
+      name: sluicesync-bot
+      email: hello@sluicesync.com
+    install: |
+      bin.install "sluice"
+    test: |
+      system "#{bin}/sluice", "--version"
+
+# Scoop manifest -> sluicesync/scoop-bucket.
+# `scoop bucket add sluicesync https://github.com/sluicesync/scoop-bucket; scoop install sluice`
+scoops:
+  - repository:
+      owner: sluicesync
+      name: scoop-bucket
+      branch: main
+      token: "{{ .Env.TAP_GITHUB_TOKEN }}"
+    homepage: "https://sluicesync.com"
+    description: "Open-source MySQL <-> Postgres database migration and continuous-sync (CDC) tool"
+    license: Apache-2.0
+    commit_author:
+      name: sluicesync-bot
+      email: hello@sluicesync.com
+
+# WinGet manifest -> committed to the sluicesync/winget-pkgs fork, then a PR is
+# opened to microsoft/winget-pkgs (community validation + review per version).
+# Install (once accepted upstream): `winget install sluicesync.sluice`
+winget:
+  - name: sluice
+    publisher: sluicesync
+    publisher_url: "https://sluicesync.com"
+    package_identifier: sluicesync.sluice
+    short_description: "Open-source MySQL <-> Postgres database migration and continuous-sync (CDC) tool"
+    description: "sluice is an open-source database migration and continuous-sync (CDC) tool covering MySQL and Postgres in all four directions."
+    license: Apache-2.0
+    license_url: "https://github.com/sluicesync/sluice/blob/main/LICENSE"
+    copyright: sluicesync
+    homepage: "https://sluicesync.com"
+    release_notes_url: "https://github.com/sluicesync/sluice/releases/tag/{{ .Tag }}"
+    tags:
+      - database
+      - migration
+      - cdc
+      - mysql
+      - postgres
+    commit_author:
+      name: sluicesync-bot
+      email: hello@sluicesync.com
+    repository:
+      owner: sluicesync
+      name: winget-pkgs
+      branch: "sluice-{{ .Version }}"
+      token: "{{ .Env.TAP_GITHUB_TOKEN }}"
+      pull_request:
+        enabled: true
+        draft: false
+        base:
+          owner: microsoft
+          name: winget-pkgs
+          branch: master
