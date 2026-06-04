@@ -6,6 +6,12 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.99.3] - 2026-06-04
+
+### Fixed
+
+- **CRITICAL: unbounded memory on PlanetScale (VStream) cold-start.** The VStream snapshot reader buffered the *entire* COPY phase in RAM before writing a single row to the target, so a large source table could exhaust memory and be OOM-killed mid-cold-start — a ~13 GB / ~19M-row table drove RSS to ~41 GB on a 32 GB host, into swap, until the process was killed (with zero target writes during the whole cold-start). The COPY phase now **streams**: a byte-capped, backpressured pump (`--max-buffer-bytes`) feeds rows to the target as they arrive, so large-table cold-start runs at **constant memory** and target writes begin immediately instead of after the full snapshot buffers. Multi-table snapshots that would exceed the cap refuse loudly instead of OOM-ing (disk-spill for that case is deferred). Extends ADR-0028's bounded-memory audit to this path; see [ADR-0071](docs/adr/adr-0071-vstream-snapshot-bounded-memory.md). Multi-shard fan-in, COPY-phase dedup, and the snapshot→CDC position handoff are preserved and validated under `-race`. The `ir.SnapshotStream` contract is unchanged.
+
 ## [0.99.2] - 2026-06-03
 
 A distribution release — sluice is now installable via Homebrew, Scoop, WinGet,
