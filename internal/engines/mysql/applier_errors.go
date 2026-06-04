@@ -59,6 +59,16 @@ func (e *retriableMySQLError) Unwrap() error            { return e.err }
 func (e *retriableMySQLError) Retriable() bool          { return true }
 func (e *retriableMySQLError) RetryHint() time.Duration { return e.hint }
 
+// isMySQLDeadlock reports whether err is (or wraps) an InnoDB deadlock —
+// MySQL error 1213 / SQLSTATE 40001. The deadlock victim's transaction is
+// rolled back and should be retried; classifyApplierError already treats
+// it as retriable on the apply path, and the shard-lease acquire uses this
+// to retry its acquire transaction under concurrent-shard contention.
+func isMySQLDeadlock(err error) bool {
+	var mysqlErr *gomysql.MySQLError
+	return errors.As(err, &mysqlErr) && mysqlErr.Number == 1213
+}
+
 // classifyApplierError inspects err and returns a value satisfying
 // [ir.RetriableError] when err matches one of the documented MySQL /
 // Vitess transient shapes. Returns err unchanged for non-retriable

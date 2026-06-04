@@ -112,8 +112,35 @@ type shardConsolidationLeaseRow struct {
 	AnchorEngine   sql.NullString
 }
 
-// tryAcquireShardLease conditionally INSERTs / UPDATEs a lease row.
-// The acquire wins iff one of:
+// tryAcquireShardLease retries tryAcquireShardLeaseOnce on an InnoDB
+// deadlock (1213). Concurrent shards racing to INSERT the same ABSENT
+// lease row deadlock on the gap lock taken by SELECT ... FOR UPDATE; the
+// victim transaction is rolled back, so a retry re-runs the acquire — on
+// the next pass the row exists and we take the held/takeover path instead
+// of the racing INSERT. Without this a contended shard fails spuriously
+// (reproduced by TestPhase2e_MySQL_3ShardContention_*; classifyApplierError
+// already treats 1213 as retriable on the apply path).
+func tryAcquireShardLease(ctx context.Context, db *sql.DB, tableName, streamID string, expires time.Time) (acquired bool, current shardConsolidationLeaseRow, err error) {
+	const maxAttempts = 8
+	backoff := 5 * time.Millisecond
+	for attempt := 1; ; attempt++ {
+		acquired, current, err = tryAcquireShardLeaseOnce(ctx, db, tableName, streamID, expires)
+		if err == nil || attempt >= maxAttempts || !isMySQLDeadlock(err) {
+			return acquired, current, err
+		}
+		select {
+		case <-ctx.Done():
+			return false, current, ctx.Err()
+		case <-time.After(backoff):
+		}
+		if backoff < 200*time.Millisecond {
+			backoff *= 2
+		}
+	}
+}
+
+// tryAcquireShardLeaseOnce is a single acquire attempt. The acquire wins
+// iff one of:
 //
 //   - The row is ABSENT (the INSERT lands cleanly), or
 //   - The row's lease_expires_at <= now() AND applied_at IS NULL
@@ -124,7 +151,7 @@ type shardConsolidationLeaseRow struct {
 // acquires, then INSERT / UPDATE / no-op based on the loaded row's
 // state. The row-level lock on the lease row scopes contention to
 // the consolidated target table, so other tables proceed in parallel.
-func tryAcquireShardLease(ctx context.Context, db *sql.DB, tableName, streamID string, expires time.Time) (acquired bool, current shardConsolidationLeaseRow, err error) {
+func tryAcquireShardLeaseOnce(ctx context.Context, db *sql.DB, tableName, streamID string, expires time.Time) (acquired bool, current shardConsolidationLeaseRow, err error) {
 	tx, beginErr := db.BeginTx(ctx, nil)
 	if beginErr != nil {
 		return false, shardConsolidationLeaseRow{}, fmt.Errorf("mysql: lease acquire: begin tx: %w", beginErr)

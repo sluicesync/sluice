@@ -16,6 +16,28 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 )
 
+// TestIsMySQLDeadlock pins the predicate the shard-lease acquire uses to
+// retry on InnoDB deadlock (1213) — including the wrapped form it sees
+// from tryAcquireShardLeaseOnce's "lease acquire: insert: %w".
+func TestIsMySQLDeadlock(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"deadlock 1213", &gomysql.MySQLError{Number: 1213, Message: "Deadlock found when trying to get lock"}, true},
+		{"wrapped 1213", fmt.Errorf("mysql: lease acquire: insert: %w", &gomysql.MySQLError{Number: 1213}), true},
+		{"dup key 1062", &gomysql.MySQLError{Number: 1062}, false},
+		{"plain error", errors.New("nope"), false},
+		{"nil", nil, false},
+	}
+	for _, tc := range cases {
+		if got := isMySQLDeadlock(tc.err); got != tc.want {
+			t.Errorf("%s: isMySQLDeadlock = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
 // TestClassifyApplierError_NilInNilOut is the boring boundary case
 // the pipeline relies on: classifier must pass nil through unchanged
 // so wrapping every applier return site doesn't accidentally turn a
