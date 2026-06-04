@@ -64,6 +64,14 @@ updates:
         update-types:
           - "minor"
           - "patch"
+    ignore:
+      # vitess.io/vitess keeps its Go module at v0.x ON PURPOSE (its real
+      # releases are v19/v24/etc.; the module stays v0 to avoid the /vN
+      # path). Dependabot misreads a stray v2.x tag as a major bump (e.g.
+      # 2.1.1+incompatible) that does not build. The vitess group above
+      # tracks legit v0.x minor/patch; this ignores the bogus major bumps.
+      - dependency-name: "vitess.io/vitess"
+        update-types: ["version-update:semver-major"]
 
   # GitHub Actions updates. Keeps the actions/checkout@v4-style references
   # current so we benefit from upstream fixes and security patches.
