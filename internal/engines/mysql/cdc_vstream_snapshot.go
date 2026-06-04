@@ -27,28 +27,36 @@ import (
 // by COPY_COMPLETED events.
 //
 // The function captures a no-gap, no-overlap snapshot in a single
-// physical stream:
+// physical stream WITHOUT draining it to completion first (ADR-0071):
 //
 //  1. Open the gRPC VStream with the from-beginning sentinel
 //     ([fromBeginningVStreamPos]).
-//  2. Synchronously drain COPY-phase events into a per-table row
-//     buffer, updating the field cache and tracking the latest VGTID
-//     as it arrives. The single global COPY_COMPLETED event (one
-//     with empty Keyspace+Shard, fired after every per-shard/per-
-//     table COPY_COMPLETED has arrived) marks the boundary.
-//  3. Encode the captured VGTID into an [ir.Position] — this is the
-//     position from which CDC will resume.
-//  4. Build a [SnapshotStream] whose [Rows] returns the buffered rows
-//     for any requested table, and whose [Changes] resumes reading
-//     the same gRPC stream and routes events as [ir.Change] values.
+//  2. Build a [SnapshotStream] and spawn a background COPY-pump
+//     goroutine ([copyPump]) that Recv's the gRPC stream, appends
+//     rows to per-table queues UNDER the byte cap, updates the field
+//     cache, and tracks the latest VGTID as it arrives. The single
+//     global COPY_COMPLETED event (one with empty Keyspace+Shard,
+//     fired after every per-shard/per-table COPY_COMPLETED has
+//     arrived) marks the boundary; at that point the pump records
+//     the final [ir.Position] onto the [SnapshotStream] and signals
+//     copy-completion to every queue.
+//  3. [Rows.ReadRows] streams a table's rows from its queue AS THEY
+//     ARRIVE, blocking until a row is available or copy completes.
+//     A slow target backpressures the queue, which backpressures the
+//     pump's append, which backpressures Recv, which backpressures
+//     Vitess — so a single large table copies in constant memory.
+//  4. [Changes] resumes reading the same gRPC stream after the COPY
+//     phase and routes events as [ir.Change] values.
 //
-// Buffering all COPY rows in memory (option (a) from the design
-// brief) is what lets [Rows.ReadRows] be called table-by-table in any
-// order — VStream emits FIELD-then-ROW-then-COPY_COMPLETED per
-// (shard, table), but we don't know the orchestrator's table-iteration
-// order at stream-open time. Sluice's v1 simple-mode workloads fit
-// well in memory; sharded / very large tables are out of scope and
-// would need a streaming variant.
+// Bounded memory is the point (ADR-0071, extending ADR-0028): the
+// pre-streaming reader buffered the ENTIRE COPY phase before a single
+// row reached the target — a 13 GB table drove RSS to ~41 GB and got
+// OOM-killed with zero target writes. The byte cap ([maxBufferBytes],
+// default 64 MiB) bounds the per-table queue; the streaming handoff
+// means target writes begin immediately. The multi-table interleaving
+// edge — rows for a not-yet-consumed table accumulating past the cap
+// while another table is being drained — is a loud refusal (Phase 1
+// floor), not an OOM; disk-spill for that tail is deferred (Phase 3).
 func (e Engine) openVStreamSnapshotStream(ctx context.Context, dsn string) (*ir.SnapshotStream, error) {
 	cfg, err := parseDSN(dsn)
 	if err != nil {
@@ -119,33 +127,35 @@ func (e Engine) openVStreamSnapshotStream(ctx context.Context, dsn string) (*ir.
 		rowBuffer:           make(map[string][]ir.Row),
 		copyCompletedShards: make(map[string]bool),
 		dedup:               newCopyDedupTracker(),
+		maxBufferBytes:      defaultSnapshotMaxBufferBytes,
 		conn:                conn,
 		grpcStream:          grpcStream,
 		grpcCancel:          streamCancel,
 	}
-
-	// Drain the COPY phase synchronously. The caller's ctx bounds how
-	// long we'll wait for COPY_COMPLETED — it isn't tied to streamCtx
-	// because streamCtx must outlive this function.
-	if err := snap.drainCopyPhase(ctx); err != nil {
-		streamCancel()
-		_ = conn.Close()
-		return nil, err
-	}
-
-	position, err := encodeVStreamPos(snap.currentVgtid)
-	if err != nil {
-		streamCancel()
-		_ = conn.Close()
-		return nil, fmt.Errorf("mysql/vstream: snapshot: encode position: %w", err)
-	}
+	snap.cond = sync.NewCond(&snap.mu)
 
 	stream := &ir.SnapshotStream{
-		Position: position,
-		Rows:     &vstreamSnapshotRows{snap: snap},
-		Changes:  &vstreamSnapshotChanges{snap: snap},
+		// Position is finalised by the COPY pump at the global
+		// COPY_COMPLETED event and read by the orchestrator only AFTER
+		// bulk-copy (ADR-0071). The happens-before edge is the per-table
+		// row-channel close: the pump records the final position BEFORE
+		// signalling copy-completion, and the orchestrator's post-bulk-
+		// copy read is ordered after every ReadRows channel has closed.
+		// It is the zero Position at open time; the cold-start log line
+		// that reads it immediately after open simply shows an empty
+		// token (cosmetic — the load-bearing read is the post-copy one).
+		Rows:    &vstreamSnapshotRows{snap: snap},
+		Changes: &vstreamSnapshotChanges{snap: snap},
 	}
 	stream.CloseFn = snap.close
+
+	// Pump the COPY phase concurrently rather than draining it to
+	// completion here. streamCtx (owned by CloseFn) bounds the pump's
+	// lifetime; the caller's ctx does NOT, because the SnapshotStream —
+	// and the gRPC stream it rides — must outlive this function.
+	snap.copyDone = make(chan struct{})
+	go snap.copyPump(streamCtx, stream)
+
 	return stream, nil
 }
 
@@ -154,51 +164,111 @@ func (e Engine) openVStreamSnapshotStream(ctx context.Context, dsn string) (*ir.
 // Lives for the life of the [ir.SnapshotStream] returned by
 // [Engine.openVStreamSnapshotStream]; closed via [close].
 //
-// The struct exists in three logical states:
+// The struct exists in three logical states (ADR-0071 reshaped the
+// COPY phase from a synchronous pre-drain into a concurrent streaming
+// pump):
 //
-//  1. COPY phase, draining synchronously in
-//     [openVStreamSnapshotStream]. fields and rowBuffer fill;
-//     currentVgtid updates as VGTID events arrive. Terminates on
-//     the global COPY_COMPLETED event.
-//  2. Idle, between OpenSnapshotStream returning and [Changes.
-//     StreamChanges] being called. The gRPC stream is held but no
-//     events are being consumed — vtgate buffers them server-side
-//     until the orchestrator finishes the bulk-copy phase.
-//  3. CDC phase, after [Changes.StreamChanges] is called. A pump
-//     goroutine consumes the stream and emits ir.Change values
+//  1. COPY phase, pumped CONCURRENTLY by [copyPump] (a background
+//     goroutine spawned at [openVStreamSnapshotStream] return). The
+//     pump Recv's the gRPC stream and appends rows to the per-table
+//     queues in rowBuffer UNDER the byte cap (maxBufferBytes), updates
+//     the field cache, and tracks the latest VGTID. Meanwhile
+//     [vstreamSnapshotRows.ReadRows] streams each table's rows from
+//     its queue AS THEY ARRIVE: a consumer blocks on cond until a row
+//     is available or copy completes, and the pump blocks on cond when
+//     the active table's queue is over the cap (backpressure → Recv →
+//     Vitess). A not-yet-consumed table accumulating past the cap is a
+//     loud refusal, not an OOM (Phase 1 floor; Phase 3 disk-spill
+//     deferred). The global COPY_COMPLETED event (empty Keyspace+Shard)
+//     records the final [ir.Position] onto the SnapshotStream, sets
+//     copyComplete, and broadcasts; the copyDone channel is closed.
+//  2. Idle, between the pump finishing COPY and [Changes.StreamChanges]
+//     being called. The gRPC stream is held but no events are being
+//     consumed — vtgate buffers them server-side until the orchestrator
+//     finishes the bulk-copy phase.
+//  3. CDC phase, after [Changes.StreamChanges] is called. The same
+//     gRPC stream is resumed by [pump], which emits ir.Change values
 //     onto the changes channel.
+//
+// Concurrency: mu (with cond) guards fields, currentVgtid, rowBuffer,
+// bufferedBytes, activeTable, copyComplete, maxBufferBytes, and err.
+// The COPY pump is the sole writer of rowBuffer/bufferedBytes during
+// state 1; ReadRows consumers remove from it under the same lock. The
+// final Position is written onto the SnapshotStream by the pump BEFORE
+// it sets copyComplete + closes copyDone, so the orchestrator's
+// post-bulk-copy Position read is ordered after that write via the
+// ReadRows channel-close happens-before edge.
 type vstreamSnapshotStream struct {
 	keyspace string
 
 	// fields caches column metadata keyed by [fieldCacheKey]. Shared
 	// between COPY-phase row decoding and post-COPY change decoding —
 	// FIELD events arrive in both phases, and a row cannot be decoded
-	// without its field list.
+	// without its field list. Guarded by mu (the COPY pump and the CDC
+	// pump both write it; ReadRows never touches it).
 	fields map[string][]*query.Field
 
-	// currentVgtid is the latest VGTID observed on the stream. After
-	// [drainCopyPhase] returns, this is the snapshot-consistent
-	// position; during the CDC phase it advances with each
-	// transaction's VGTID event.
+	// currentVgtid is the latest VGTID observed on the stream. When the
+	// COPY pump reaches the global COPY_COMPLETED, this is the snapshot-
+	// consistent position; during the CDC phase it advances with each
+	// transaction's VGTID event. Guarded by mu.
 	currentVgtid []shardGtid
 
-	// rowBuffer accumulates COPY-phase rows keyed by unqualified
-	// table name. Populated during drainCopyPhase, drained by
-	// [vstreamSnapshotRows.ReadRows]. Once drained, the per-table
-	// slice is cleared so a second ReadRows on the same table
-	// returns an empty slice (matches the contract in row_reader.go
-	// where ReadRows is single-shot per table).
+	// rowBuffer holds the not-yet-consumed COPY-phase rows keyed by
+	// unqualified table name — a per-table FIFO queue the pump appends
+	// to and [vstreamSnapshotRows.ReadRows] drains AS rows arrive
+	// (ADR-0071: streaming, not buffer-then-serve). A table's queue is
+	// deleted once drained AND copy is complete, so a second ReadRows
+	// on the same table returns an empty channel (matches the single-
+	// shot-per-table contract in row_reader.go). Guarded by mu/cond.
 	//
 	// Multi-shard sharded keyspaces fan rows for the *same logical
 	// table* in from multiple shards. Keying by unqualified table
-	// name (rather than per-shard) merges them into one slice so
+	// name (rather than per-shard) merges them into one queue so
 	// the orchestrator's single-table ReadRows call surfaces every
 	// row regardless of shard origin.
 	rowBuffer map[string][]ir.Row
 
+	// bufferedBytes is the running [ir.ApproximateRowBytes] sum of every
+	// row currently sitting in rowBuffer (appended on enqueue, debited
+	// on ReadRows handoff). The byte cap (maxBufferBytes) is enforced
+	// against it. Guarded by mu.
+	bufferedBytes int64
+
+	// maxBufferBytes is the soft byte cap (ADR-0028 / ADR-0071) on
+	// rowBuffer. The pump backpressures (or, for a not-yet-consumed
+	// table, refuses loudly) when an append would push bufferedBytes
+	// over it. Default [defaultSnapshotMaxBufferBytes]; overridable via
+	// [vstreamSnapshotRows.SetMaxBufferBytes]. Guarded by mu.
+	maxBufferBytes int64
+
+	// activeTable is the unqualified name of the table whose ReadRows
+	// channel is currently being drained (empty when none). The pump
+	// backpressures only on the active table's over-cap growth (a
+	// consumer is draining it, so the stall resolves); growth of a
+	// DIFFERENT, not-yet-consumed table past the cap is the loud-refuse
+	// case. Guarded by mu.
+	activeTable string
+
+	// copyComplete is set true when the COPY pump reaches the global
+	// COPY_COMPLETED. ReadRows uses it to close a table's channel once
+	// its queue is empty (before it, an empty queue means "more may
+	// arrive — block"). Guarded by mu.
+	copyComplete bool
+
+	// copyDone is closed by the COPY pump exactly once, when COPY ends
+	// (either at COPY_COMPLETED or on a terminal pump error). Lets
+	// [startPump] join the COPY phase before resuming the stream in CDC
+	// mode so the two pumps never Recv concurrently.
+	copyDone chan struct{}
+
+	// cond signals queue/byte-cap state changes between the COPY pump
+	// and ReadRows consumers. Built over mu in the constructor.
+	cond *sync.Cond
+
 	// copyCompletedShards tracks per-scope COPY_COMPLETED events
 	// (those carrying a non-empty Keyspace/Shard) seen during the
-	// COPY phase. drainCopyPhase terminates on vtgate's *global*
+	// COPY phase. The COPY pump terminates on vtgate's *global*
 	// COPY_COMPLETED event (Keyspace and Shard both empty), which
 	// fires once every per-scope copy has finished. The per-scope
 	// set is recorded for visibility — multi-shard snapshots emit
@@ -225,46 +295,140 @@ type vstreamSnapshotStream struct {
 	// pumpStarted prevents StreamChanges from being called twice on
 	// the same SnapshotStream (the underlying gRPC stream has linear
 	// state — two concurrent pumps would race on r.fields and the
-	// stream's Recv).
+	// stream's Recv). Guarded by mu.
 	pumpStarted bool
 
 	mu  sync.Mutex
 	err error
 }
 
-// drainCopyPhase reads VEvents off the gRPC stream synchronously
-// until the global COPY_COMPLETED event arrives, populating
-// rowBuffer and updating currentVgtid as it goes. The caller's ctx
-// bounds how long we'll wait for the COPY phase to finish; if ctx
-// cancels before COPY_COMPLETED, the gRPC call returns ctx.Err.
-func (s *vstreamSnapshotStream) drainCopyPhase(ctx context.Context) error {
+// broadcast wakes every goroutine parked on cond. Guarded against a
+// nil cond so the dispatch/enqueue helpers stay callable from unit
+// tests that construct a bare vstreamSnapshotStream literal (no
+// constructor, no cond) and exercise the dispatcher single-threaded —
+// those tests use sub-cap rows, so the backpressure cond.Wait path is
+// never reached; only the post-enqueue signal needs the guard.
+func (s *vstreamSnapshotStream) broadcast() {
+	if s.cond != nil {
+		s.cond.Broadcast()
+	}
+}
+
+// defaultSnapshotMaxBufferBytes is the byte cap the COPY pump enforces
+// on rowBuffer when the orchestrator never calls SetMaxBufferBytes. It
+// matches ADR-0028's `--max-buffer-bytes` default (64 MiB) so the
+// snapshot path bounds memory out of the box; the constructor seeds it
+// and [vstreamSnapshotRows.SetMaxBufferBytes] overrides it.
+const defaultSnapshotMaxBufferBytes int64 = 64 << 20
+
+// copyPump is the background COPY-phase goroutine (ADR-0071). It Recv's
+// the gRPC stream and dispatches each VEvent until the global
+// COPY_COMPLETED arrives (or ctx cancels / Recv errors), then closes
+// copyDone exactly once so the CDC pump can resume the same stream.
+//
+// On the COPY_COMPLETED boundary the dispatcher has already recorded
+// the snapshot-consistent VGTID and written the final [ir.Position]
+// onto stream; copyPump only has to broadcast the terminal state so any
+// ReadRows consumer still blocked on an empty queue wakes and closes
+// its channel.
+func (s *vstreamSnapshotStream) copyPump(ctx context.Context, stream *ir.SnapshotStream) {
+	defer close(s.copyDone)
+
 	for {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			s.failCopy(ctx.Err())
+			return
 		default:
 		}
 		resp, err := s.grpcStream.Recv()
 		if err != nil {
-			return fmt.Errorf("mysql/vstream: snapshot: copy recv: %w", err)
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				s.failCopy(err)
+				return
+			}
+			s.failCopy(classifyReaderError(fmt.Errorf("mysql/vstream: snapshot: copy recv: %w", err)))
+			return
 		}
 		for _, ev := range resp.GetEvents() {
 			done, err := s.dispatchCopyEvent(ev)
 			if err != nil {
-				return err
+				s.failCopy(err)
+				return
 			}
 			if done {
-				return nil
+				s.finishCopy(stream)
+				return
 			}
 		}
 	}
 }
 
+// finishCopy records the final snapshot position onto the stream and
+// flips copyComplete, then broadcasts so blocked ReadRows consumers
+// drain-and-close. The Position write happens-before every ReadRows
+// channel close (a consumer can only observe copyComplete under the
+// same mu the pump holds here), which in turn happens-before the
+// orchestrator's post-bulk-copy stream.Position read — so the plain
+// stream.Position field write is race-clean despite the orchestrator
+// reading the field without a lock. encodeVStreamPos can fail only
+// when no VGTID was ever observed (empty snapshot with no GTID); that
+// surfaces as a terminal pump error rather than a silent empty
+// position.
+func (s *vstreamSnapshotStream) finishCopy(stream *ir.SnapshotStream) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.err == nil {
+		pos, err := encodeVStreamPos(s.currentVgtid)
+		if err != nil {
+			s.err = fmt.Errorf("mysql/vstream: snapshot: encode position: %w", err)
+		} else {
+			stream.Position = pos
+		}
+	}
+	s.copyComplete = true
+	s.broadcast()
+}
+
+// failCopy records a terminal COPY-phase error (first one wins) and
+// flips copyComplete so blocked ReadRows consumers wake, observe the
+// error via Err, and close their channels rather than hang forever.
+func (s *vstreamSnapshotStream) failCopy(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.err == nil {
+		s.err = err
+	}
+	s.copyComplete = true
+	s.broadcast()
+}
+
+// drainCopyPhase reads VEvents off the gRPC stream synchronously
+// until the global COPY_COMPLETED event arrives, populating
+// rowBuffer and updating currentVgtid as it goes. The caller's ctx
+// bounds how long we'll wait for the COPY phase to finish; if ctx
 // dispatchCopyEvent routes a single COPY-phase VEvent. Returns
 // done=true when the global COPY_COMPLETED arrives (the boundary
 // between snapshot and CDC). All non-row, non-FIELD, non-VGTID
 // events during COPY are bookkeeping and silently dropped.
+//
+// Acquires s.mu for the whole dispatch: the COPY pump is the sole
+// caller in production and runs concurrently with ReadRows consumers,
+// so every mutation of fields / currentVgtid / rowBuffer / dedup /
+// copyCompletedShards must be guarded. bufferCopyRow may release and
+// reacquire the lock via cond.Wait while backpressuring; that is the
+// only point at which a consumer can interleave, and it does so safely
+// (the queue and byte counters are consistent at every Wait boundary).
 func (s *vstreamSnapshotStream) dispatchCopyEvent(ev *binlogdata.VEvent) (done bool, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.dispatchCopyEventLocked(ev)
+}
+
+// dispatchCopyEventLocked is the body of [dispatchCopyEvent]; the
+// caller holds s.mu.
+func (s *vstreamSnapshotStream) dispatchCopyEventLocked(ev *binlogdata.VEvent) (done bool, err error) {
 	switch ev.GetType() {
 	case binlogdata.VEventType_FIELD:
 		fe := ev.GetFieldEvent()
@@ -352,6 +516,11 @@ func (s *vstreamSnapshotStream) dispatchCopyEvent(ev *binlogdata.VEvent) (done b
 // every RowChange has only an After image (the rows are being
 // copied, not modified); we treat anything that decodes as a row as
 // a snapshot row.
+//
+// Caller holds s.mu. Each kept row is enqueued via [enqueueRowLocked],
+// which enforces the byte cap (ADR-0071): backpressure for the table a
+// consumer is actively draining, loud refusal for a not-yet-consumed
+// table accumulating past the cap.
 func (s *vstreamSnapshotStream) bufferCopyRow(ev *binlogdata.VEvent) error {
 	rev := ev.GetRowEvent()
 	if rev == nil {
@@ -382,8 +551,69 @@ func (s *vstreamSnapshotStream) bufferCopyRow(ev *binlogdata.VEvent) error {
 		if !s.dedup.shouldKeep(key, row) {
 			continue
 		}
-		s.rowBuffer[tableName] = append(s.rowBuffer[tableName], row)
+		if err := s.enqueueRowLocked(tableName, row); err != nil {
+			return err
+		}
 	}
+	return nil
+}
+
+// enqueueRowLocked appends one kept COPY row to tableName's queue under
+// the byte cap (ADR-0071). The caller holds s.mu.
+//
+//   - Backpressure: when the append would push bufferedBytes over the
+//     cap AND tableName is the table a consumer is actively draining
+//     (or no consumer is active yet — the orchestrator drains every
+//     table in turn, so one is coming), cond.Wait blocks until the
+//     consumer drains enough to fit. The consumer's ReadRows debit +
+//     cond.Broadcast wakes us. This is the dominant single-large-table
+//     path — the queue never grows past the cap because the target
+//     drains it, so memory stays constant and Recv backpressures
+//     Vitess. cond.Wait may be woken by close() cancelling the stream;
+//     we re-check the terminal state each iteration to avoid a wedge
+//     on shutdown.
+//   - Loud refusal: when the over-cap table is NOT the one being
+//     drained while a DIFFERENT table IS being drained (a not-yet-
+//     consumed table accumulating while another table is read — the
+//     multi-table interleaving edge), blocking would deadlock: the
+//     active consumer's table gets no more rows because the pump is
+//     blocked, so neither side progresses. We refuse loudly rather
+//     than OOM-or-deadlock (Phase 1 floor; disk-spill is the deferred
+//     Phase 3).
+//
+// A single row larger than the cap on an otherwise-empty queue still
+// goes through (bufferedBytes==0, so the guard's bufferedBytes>0 term
+// is false); this matches ADR-0028's soft-target semantics and avoids
+// wedging a table whose individual rows exceed the cap.
+func (s *vstreamSnapshotStream) enqueueRowLocked(tableName string, row ir.Row) error {
+	rowBytes := ir.ApproximateRowBytes(row)
+
+	for s.bufferedBytes > 0 && s.bufferedBytes+rowBytes > s.maxBufferBytes {
+		// Over cap with at least one row already queued. A consumer
+		// actively draining a DIFFERENT table can never relieve the
+		// pressure on this one — refuse rather than deadlock.
+		if s.activeTable != "" && s.activeTable != tableName {
+			return fmt.Errorf(
+				"mysql/vstream: snapshot: table %q would buffer %d bytes, exceeding the --max-buffer-bytes cap of %d "+
+					"while table %q is being copied; this multi-table interleaving case is not yet disk-spilled "+
+					"(ADR-0071 Phase 3). Raise --max-buffer-bytes, or migrate the large tables in separate runs",
+				tableName, s.bufferedBytes+rowBytes, s.maxBufferBytes, s.activeTable,
+			)
+		}
+		// Wait for a consumer to drain this table. close() flips err +
+		// copyComplete and broadcasts, so a shutdown mid-wait unwedges.
+		if s.err != nil || s.copyComplete {
+			if s.err != nil {
+				return s.err
+			}
+			return errors.New("mysql/vstream: snapshot: copy ended before backpressured row could be buffered")
+		}
+		s.cond.Wait()
+	}
+
+	s.rowBuffer[tableName] = append(s.rowBuffer[tableName], row)
+	s.bufferedBytes += rowBytes
+	s.broadcast()
 	return nil
 }
 
@@ -391,6 +621,16 @@ func (s *vstreamSnapshotStream) bufferCopyRow(ev *binlogdata.VEvent) error {
 // changes channel the pump owns and closes on shutdown. Idempotent
 // guard via pumpStarted: a second StreamChanges call returns an
 // error rather than racing on the gRPC stream.
+//
+// Joins the COPY pump first (copyDone): the CDC pump reuses the same
+// gRPC stream, and the two must never Recv concurrently. The
+// orchestrator only calls StreamChanges after bulk-copy (every
+// ReadRows drained → COPY_COMPLETED reached → copyDone closed), so this
+// is effectively non-blocking in production; the explicit join makes
+// the no-concurrent-Recv invariant a structural guarantee rather than
+// a sequencing assumption. A terminal COPY-phase error short-circuits
+// here so the streamer's cold-start surfaces it instead of starting a
+// CDC pump against a dead stream.
 func (s *vstreamSnapshotStream) startPump(ctx context.Context) (<-chan ir.Change, error) {
 	s.mu.Lock()
 	if s.pumpStarted {
@@ -399,6 +639,17 @@ func (s *vstreamSnapshotStream) startPump(ctx context.Context) (<-chan ir.Change
 	}
 	s.pumpStarted = true
 	s.mu.Unlock()
+
+	if s.copyDone != nil {
+		select {
+		case <-s.copyDone:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	if err := s.Err(); err != nil {
+		return nil, err
+	}
 
 	out := make(chan ir.Change, vstreamChannelBuffer)
 	go s.pump(ctx, out)
@@ -607,10 +858,22 @@ func (s *vstreamSnapshotStream) Err() error {
 
 // close cancels the gRPC stream and closes the connection. Wired
 // into [ir.SnapshotStream.CloseFn]. Safe to call multiple times.
+//
+// Cancelling the gRPC context unblocks a COPY pump parked in Recv; it
+// then records the cancellation as a terminal error (failCopy), which
+// flips copyComplete and broadcasts cond — so a COPY pump parked in
+// enqueue backpressure or a ReadRows consumer parked waiting for more
+// rows both unwedge. We also broadcast here directly to cover the
+// window before the pump observes the cancellation.
 func (s *vstreamSnapshotStream) close() error {
 	if s.grpcCancel != nil {
 		s.grpcCancel()
 		s.grpcCancel = nil
+	}
+	if s.cond != nil {
+		s.mu.Lock()
+		s.cond.Broadcast()
+		s.mu.Unlock()
 	}
 	if s.conn != nil {
 		err := s.conn.Close()
@@ -621,37 +884,63 @@ func (s *vstreamSnapshotStream) close() error {
 }
 
 // vstreamSnapshotRows is the [ir.RowReader] half of the snapshot
-// stream. It serves rows from the in-memory buffer that
-// [drainCopyPhase] populated; no I/O happens after Open.
+// stream. It STREAMS rows from the per-table queue the COPY pump fills
+// as they arrive (ADR-0071) rather than serving a fully-buffered slice
+// — so a single large table copies in constant memory and target
+// writes begin before the COPY phase finishes.
 //
 // The reader is stateless: ReadRows can be called for any subset of
-// the source's tables in any order. Each call drains the buffer for
-// the requested table and returns nil for unknown tables (callers
-// don't always read every table — translation may filter some out).
+// the source's tables in any order. Each call drains a table's queue
+// and returns an empty channel for unknown tables (callers don't
+// always read every table — translation may filter some out).
 type vstreamSnapshotRows struct {
 	snap *vstreamSnapshotStream
 }
 
-// Err implements [ir.RowReader]. The rows are served from an
-// in-memory buffer that the COPY-phase pump populated, so there is
-// no per-row decode that can fail after the channel opens; the only
-// failure surface is the pump goroutine itself, whose terminal
-// status lives on the backing snapshot stream. Delegating keeps the
-// loud-failure contract (Bug 68) honest for the vstream snapshot
-// path: a pump that died mid-COPY surfaces here rather than looking
-// like an empty buffer.
+// SetMaxBufferBytes implements [ir.MaxBufferBytesSetter] (ADR-0028 /
+// ADR-0071). It overrides the byte cap the COPY pump enforces on the
+// per-table queue. Zero or negative means "no cap" — the pump never
+// backpressures and never refuses (the pre-bounded behaviour, useful
+// only when the operator has explicitly opted out of the memory
+// bound). Guarded by mu so a late call from the orchestrator races
+// cleanly with the already-running pump; the constructor seeds the
+// 64 MiB default so the bound holds even when this is never called.
+func (r *vstreamSnapshotRows) SetMaxBufferBytes(bytes int64) {
+	s := r.snap
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if bytes <= 0 {
+		// "No cap": a value larger than any plausible accumulation.
+		s.maxBufferBytes = 1 << 62
+	} else {
+		s.maxBufferBytes = bytes
+	}
+	if s.cond != nil {
+		s.cond.Broadcast()
+	}
+}
+
+// Err implements [ir.RowReader]. Rows stream off the per-table queue
+// the COPY pump fills; a pump that died mid-COPY records its terminal
+// error on the backing snapshot stream. Delegating keeps the loud-
+// failure contract (Bug 68) honest for the vstream snapshot path: a
+// pump that died mid-COPY surfaces here rather than looking like an
+// empty buffer (the streaming ReadRows below closes the channel on a
+// terminal pump error so the orchestrator reaches this check).
 func (r *vstreamSnapshotRows) Err() error {
 	return r.snap.Err()
 }
 
-// ReadRows returns a channel that yields every row the COPY phase
-// captured for table.Name, then closes. Synchronous emission inside
-// a goroutine keeps the contract identical to the SQL-backed
-// [RowReader] (caller drains the channel).
+// ReadRows returns a channel that streams the rows the COPY pump
+// captures for table.Name AS THEY ARRIVE, then closes once the table's
+// queue is empty and the COPY phase has completed (or the pump hit a
+// terminal error, or ctx cancelled). Blocking on an empty-but-not-yet-
+// complete queue is the backpressure seam: a slow consumer here stalls
+// the pump's enqueue, which stalls Recv, which stalls Vitess.
 //
-// Returning a nil-table-name table is rejected at the same
-// signature point [RowReader.ReadRows] does, so the orchestrator's
-// validation looks the same for both flavors.
+// Returning a nil-table-name table is rejected at the same signature
+// point [RowReader.ReadRows] does, so the orchestrator's validation
+// looks the same for both flavors.
 func (r *vstreamSnapshotRows) ReadRows(ctx context.Context, table *ir.Table) (<-chan ir.Row, error) {
 	if table == nil {
 		return nil, errors.New("mysql/vstream: snapshot: ReadRows: table is nil")
@@ -660,15 +949,58 @@ func (r *vstreamSnapshotRows) ReadRows(ctx context.Context, table *ir.Table) (<-
 		return nil, errors.New("mysql/vstream: snapshot: ReadRows: table.Name is empty")
 	}
 
-	r.snap.mu.Lock()
-	rows := r.snap.rowBuffer[table.Name]
-	delete(r.snap.rowBuffer, table.Name)
-	r.snap.mu.Unlock()
+	s := r.snap
+	tableName := table.Name
+
+	// Mark this table active so the pump backpressures (rather than
+	// refuses) on its over-cap growth while we drain it.
+	s.mu.Lock()
+	s.activeTable = tableName
+	s.cond.Broadcast()
+	s.mu.Unlock()
 
 	out := make(chan ir.Row)
 	go func() {
 		defer close(out)
-		for _, row := range rows {
+		defer func() {
+			s.mu.Lock()
+			if s.activeTable == tableName {
+				s.activeTable = ""
+			}
+			s.cond.Broadcast()
+			s.mu.Unlock()
+		}()
+
+		for {
+			s.mu.Lock()
+			// Wait for a row, completion, a terminal error, or
+			// cancellation. ctx is polled here (we can't select on a
+			// cond) and again on the send below.
+			for len(s.rowBuffer[tableName]) == 0 && !s.copyComplete && s.err == nil && ctx.Err() == nil {
+				s.cond.Wait()
+			}
+			queue := s.rowBuffer[tableName]
+			if len(queue) == 0 {
+				// Empty queue + (complete | error | cancelled): the
+				// table is fully delivered. Drop its now-empty entry so
+				// a second ReadRows returns immediately.
+				delete(s.rowBuffer, tableName)
+				s.mu.Unlock()
+				return
+			}
+			// Pop the head row, debit its bytes, wake the pump (which
+			// may be backpressured on this table), and release the lock
+			// before the (potentially blocking) send. Nil the popped
+			// slot so the drained row is GC-eligible immediately rather
+			// than pinned by the backing array's head (the queue keeps
+			// growing as the pump appends).
+			row := queue[0]
+			queue[0] = nil
+			s.rowBuffer[tableName] = queue[1:]
+			s.bufferedBytes -= ir.ApproximateRowBytes(row)
+			s.cond.Broadcast()
+			s.mu.Unlock()
+
 			select {
 			case out <- row:
 			case <-ctx.Done():
@@ -682,8 +1014,9 @@ func (r *vstreamSnapshotRows) ReadRows(ctx context.Context, table *ir.Table) (<-
 // vstreamSnapshotChanges is the [ir.CDCReader] half of the snapshot
 // stream. StreamChanges starts the pump goroutine that resumes the
 // gRPC stream in CDC mode; the from parameter is informational only
-// — the position is whatever the COPY phase captured, set on the
-// SnapshotStream at OpenSnapshotStream return time.
+// — the position is whatever the COPY phase captured at the global
+// COPY_COMPLETED (recorded onto the SnapshotStream by [finishCopy],
+// before the orchestrator reads it post-bulk-copy).
 type vstreamSnapshotChanges struct {
 	snap *vstreamSnapshotStream
 }
@@ -696,16 +1029,25 @@ type vstreamSnapshotChanges struct {
 // here for symmetry with the standalone CDC path; mismatches are
 // surfaced as a validation error so misconfigured callers fail
 // loudly.
+//
+// The captured-VGTID read is taken under mu — by the time the
+// orchestrator calls this (after bulk-copy → COPY_COMPLETED → copyDone)
+// the COPY pump has stopped writing currentVgtid, but reading it under
+// the same lock the pump used keeps the comparison race-clean by
+// construction rather than by sequencing assumption.
 func (c *vstreamSnapshotChanges) StreamChanges(ctx context.Context, from ir.Position) (<-chan ir.Change, error) {
 	if from.Engine != "" || from.Token != "" {
 		shards, ok, err := decodeVStreamPos(from)
 		if err != nil {
 			return nil, fmt.Errorf("mysql/vstream: snapshot: StreamChanges: decode from position: %w", err)
 		}
-		if ok && !sameVgtid(shards, c.snap.currentVgtid) {
+		c.snap.mu.Lock()
+		captured := c.snap.currentVgtid
+		c.snap.mu.Unlock()
+		if ok && !sameVgtid(shards, captured) {
 			return nil, fmt.Errorf(
 				"mysql/vstream: snapshot: StreamChanges: from position %v does not match captured snapshot position %v",
-				shards, c.snap.currentVgtid,
+				shards, captured,
 			)
 		}
 	}

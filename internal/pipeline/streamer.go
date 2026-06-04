@@ -2429,10 +2429,24 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 	// returned stop closure (set on the success path below) closes it
 	// so the engine-side streaming goroutine is joined deterministically
 	// when Streamer.Run unwinds.
-	slog.InfoContext(
-		ctx, "cold start; snapshot captured",
-		slog.String("position_token", stream.Position.Token),
-	)
+	//
+	// stream.Position is intentionally NOT read here. The VStream
+	// snapshot reader (ADR-0071) finalises Position asynchronously at
+	// COPY_COMPLETED (after bulk-copy), so reading the field at open
+	// time would both be meaningless (zero token) and — because the
+	// COPY pump may write it concurrently — a data race. The captured
+	// position IS logged once it's load-bearing, after bulk-copy (the
+	// "cold-start CDC anchor persisted" line below). Engines that
+	// populate Position synchronously at open are unaffected by the
+	// missing token on this one line.
+	slog.InfoContext(ctx, "cold start; snapshot captured")
+	// Bound the snapshot row reader's in-flight buffer (ADR-0071). The
+	// VStream COPY-phase reader streams rows under a byte cap; engines
+	// without a buffered snapshot reader (PG, vanilla MySQL) no-op the
+	// setter. Applied before bulk-copy drains the stream so the pump's
+	// backpressure uses the operator's cap rather than the 64 MiB
+	// default the engine seeds at open.
+	applyMaxBufferBytes(stream.Rows, s.MaxBufferBytes)
 
 	sw, err := s.Target.OpenSchemaWriter(ctx, s.TargetDSN)
 	if err != nil {

@@ -6,6 +6,7 @@ package mysql
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -14,6 +15,24 @@ import (
 
 	"sluicesync.dev/sluice/internal/ir"
 )
+
+// newTestSnapshotStream builds a vstreamSnapshotStream wired the way
+// the constructor does (cond over mu, dedup tracker, default byte cap)
+// so the dispatcher/enqueue/ReadRows helpers behave as in production
+// when a test drives them directly. Tests that need copy-completion or
+// a smaller cap mutate the returned struct's fields before use.
+func newTestSnapshotStream() *vstreamSnapshotStream {
+	s := &vstreamSnapshotStream{
+		keyspace:            "main",
+		fields:              make(map[string][]*query.Field),
+		rowBuffer:           make(map[string][]ir.Row),
+		copyCompletedShards: make(map[string]bool),
+		dedup:               newCopyDedupTracker(),
+		maxBufferBytes:      defaultSnapshotMaxBufferBytes,
+	}
+	s.cond = sync.NewCond(&s.mu)
+	return s
+}
 
 // TestVStreamSnapshot_CopyPhaseBuffering walks the dispatcher
 // through the canonical COPY-phase event stream (FIELD → ROW × N →
@@ -25,11 +44,7 @@ import (
 //   - the global COPY_COMPLETED returns done=true,
 //   - per-shard COPY_COMPLETED events do NOT terminate the drain.
 func TestVStreamSnapshot_CopyPhaseBuffering(t *testing.T) {
-	s := &vstreamSnapshotStream{
-		keyspace:  "main",
-		fields:    make(map[string][]*query.Field),
-		rowBuffer: make(map[string][]ir.Row),
-	}
+	s := newTestSnapshotStream()
 
 	// FIELD event for users(id, email).
 	fieldsEv := &binlogdata.VEvent{
@@ -125,11 +140,7 @@ func TestVStreamSnapshot_CopyPhaseBuffering(t *testing.T) {
 // CDC reader — a missing FIELD means we can't decode the row, and
 // silently dropping would mask an upstream protocol violation.
 func TestVStreamSnapshot_CopyRowWithoutField(t *testing.T) {
-	s := &vstreamSnapshotStream{
-		keyspace:  "main",
-		fields:    make(map[string][]*query.Field),
-		rowBuffer: make(map[string][]ir.Row),
-	}
+	s := newTestSnapshotStream()
 	rowEv := &binlogdata.VEvent{
 		Type: binlogdata.VEventType_ROW,
 		RowEvent: &binlogdata.RowEvent{
@@ -231,7 +242,13 @@ func TestVStreamSnapshot_RowsReadDrainsBuffer(t *testing.T) {
 				{"id": int64(2), "email": "bob@example.com"},
 			},
 		},
+		// Streaming ReadRows (ADR-0071) blocks until a row is available
+		// or the COPY phase has completed; this test pre-stages the
+		// queue and marks copy complete so ReadRows drains-and-closes.
+		copyComplete:   true,
+		maxBufferBytes: defaultSnapshotMaxBufferBytes,
 	}
+	s.cond = sync.NewCond(&s.mu)
 	rr := &vstreamSnapshotRows{snap: s}
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -319,12 +336,7 @@ func TestVStreamSnapshot_ChangesPositionMismatchRejected(t *testing.T) {
 //     view per logical table),
 //   - only the global event flips done=true.
 func TestVStreamSnapshot_MultiShardCopyCompletedRouting(t *testing.T) {
-	s := &vstreamSnapshotStream{
-		keyspace:            "main",
-		fields:              make(map[string][]*query.Field),
-		rowBuffer:           make(map[string][]ir.Row),
-		copyCompletedShards: make(map[string]bool),
-	}
+	s := newTestSnapshotStream()
 
 	for _, shard := range []string{"-80", "80-"} {
 		fieldsEv := &binlogdata.VEvent{
@@ -410,12 +422,7 @@ func TestVStreamSnapshot_MultiShardCopyCompletedRouting(t *testing.T) {
 // of multi-shard snapshot punts on in-place reshard recovery — the
 // caller drops the stream and reopens against the new layout.
 func TestVStreamSnapshot_JournalDuringCopyReturnsShardLayoutErr(t *testing.T) {
-	s := &vstreamSnapshotStream{
-		keyspace:            "main",
-		fields:              make(map[string][]*query.Field),
-		rowBuffer:           make(map[string][]ir.Row),
-		copyCompletedShards: make(map[string]bool),
-	}
+	s := newTestSnapshotStream()
 
 	journalEv := &binlogdata.VEvent{
 		Type: binlogdata.VEventType_JOURNAL,
@@ -457,12 +464,7 @@ func TestVStreamSnapshot_JournalDuringCopyReturnsShardLayoutErr(t *testing.T) {
 // applies rows by (table, value); shard origin is irrelevant on the
 // target side.
 func TestVStreamSnapshot_MultiShardRowBufferMerge(t *testing.T) {
-	s := &vstreamSnapshotStream{
-		keyspace:            "main",
-		fields:              make(map[string][]*query.Field),
-		rowBuffer:           make(map[string][]ir.Row),
-		copyCompletedShards: make(map[string]bool),
-	}
+	s := newTestSnapshotStream()
 
 	// Two FIELD events (one per shard) — same table, same column
 	// shape but distinct field-cache entries (per-shard FIELD events
@@ -516,6 +518,12 @@ func TestVStreamSnapshot_MultiShardRowBufferMerge(t *testing.T) {
 	if len(rows) != 4 {
 		t.Fatalf("rowBuffer[users] = %d rows; want 4 (rows from both shards merged)", len(rows))
 	}
+
+	// Streaming ReadRows blocks until copy completes; mark it so the
+	// merged queue drains-and-closes for the consumer assertions below.
+	s.mu.Lock()
+	s.copyComplete = true
+	s.mu.Unlock()
 
 	rr := &vstreamSnapshotRows{snap: s}
 	tbl := &ir.Table{Name: "users", Columns: []*ir.Column{
