@@ -15,6 +15,9 @@
 # Usage: ci-ghcr-pull.sh <image-ref> [<image-ref> ...]
 # Auth comes from the environment so the token never lands on the
 # command line: GHCR_USER (e.g. github.actor) + GHCR_TOKEN (GITHUB_TOKEN).
+# When GHCR_TOKEN is empty — fork PRs run with a read-only GITHUB_TOKEN and
+# no access to repo secrets — the login is skipped and the (public) pre-baked
+# images are pulled anonymously, so external-contributor PRs pass CI too.
 set -euo pipefail
 
 readonly MAX_ATTEMPTS=5
@@ -41,7 +44,7 @@ retry() {
 }
 
 ghcr_login() {
-	echo "${GHCR_TOKEN}" | docker login ghcr.io -u "${GHCR_USER}" --password-stdin
+	echo "${GHCR_TOKEN:-}" | docker login ghcr.io -u "${GHCR_USER:-}" --password-stdin
 }
 
 if [ "$#" -eq 0 ]; then
@@ -49,7 +52,16 @@ if [ "$#" -eq 0 ]; then
 	exit 2
 fi
 
-retry "ghcr.io login" ghcr_login
+# Fork PRs run with an empty GITHUB_TOKEN and no access to repo secrets, so
+# GHCR_TOKEN is empty there. The pre-baked images are public, so an anonymous
+# pull works — skip the login (an empty-password `docker login` would only
+# fail) and pull straight through. Same-repo pushes/PRs still authenticate
+# (private-image-safe, and authed pulls dodge GHCR's stricter anon rate limit).
+if [ -n "${GHCR_TOKEN:-}" ]; then
+	retry "ghcr.io login" ghcr_login
+else
+	echo "::notice::no GHCR_TOKEN (fork PR / anonymous run) — skipping login, pulling public images anonymously" >&2
+fi
 for img in "$@"; do
 	retry "docker pull ${img}" docker pull "${img}"
 done
