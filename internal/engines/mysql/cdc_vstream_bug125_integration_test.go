@@ -71,9 +71,13 @@ func TestVStream_Bug125_DivergentScanOrder_ZeroLoss(t *testing.T) {
 	cases := []bug125Case{
 		{
 			name: "a_explicit_pk_control",
+			// tiny is SMALLINT (not TINYINT): seedBug125Rows writes
+			// tiny = id for rows 1..rowCount, and rowCount (200) exceeds
+			// TINYINT's signed max of 127 — a seed-data overflow, not a
+			// fix concern. SMALLINT holds the full range.
 			seedDDL: `CREATE TABLE t (
 				id   BIGINT      NOT NULL,
-				tiny TINYINT     NOT NULL,
+				tiny SMALLINT    NOT NULL,
 				val  VARCHAR(64) NOT NULL,
 				PRIMARY KEY (id)
 			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
@@ -81,7 +85,7 @@ func TestVStream_Bug125_DivergentScanOrder_ZeroLoss(t *testing.T) {
 				Name: "t",
 				Columns: []*ir.Column{
 					{Name: "id", Type: ir.Integer{Width: 64}, Nullable: false},
-					{Name: "tiny", Type: ir.Integer{Width: 8}, Nullable: false},
+					{Name: "tiny", Type: ir.Integer{Width: 16}, Nullable: false},
 					{Name: "val", Type: ir.Varchar{Length: 64}, Nullable: false},
 				},
 				PrimaryKey: &ir.Index{Name: "PRIMARY", Unique: true, Columns: []ir.IndexColumn{{Column: "id"}}},
@@ -197,12 +201,21 @@ func runBug125Case(t *testing.T, tc bug125Case) {
 	}
 	defer func() { _ = stream.Close() }()
 
-	// Case (d): write more rows on a separate connection AFTER the
-	// snapshot opened so Vitess re-emits them during COPY catchup.
+	// Case (d): UPDATE already-seeded rows on a separate connection AFTER
+	// the snapshot opened. Rows the COPY scan has already passed get
+	// re-emitted during Vitess's COPY catchup (PK <= lastpk); the fix
+	// must UPSERT those re-emissions, not 1062 and not drop them. We
+	// update existing rows rather than INSERT new high-id ones on
+	// purpose: new post-snapshot INSERTs arrive via post-COPY CDC (which
+	// this COPY-only test doesn't consume), whereas UPDATEs to scanned
+	// rows exercise the catchup-absorption path AND keep the row count
+	// deterministic at rowCount — so the zero-loss assertion can't
+	// false-fail on snapshot/CDC timing. If the update lands outside the
+	// copy window the test still holds (count unchanged, no 1062).
 	if tc.concurrentDuringCopy {
-		for i := tc.rowCount; i < tc.rowCount+50; i++ {
+		for i := 1; i <= 50; i++ {
 			applyVTTestSQL(t, mysqlDSN, fmt.Sprintf(
-				"INSERT INTO t (id, tiny, val) VALUES (%d, %d, 'c%d')", i+1, i+1, i,
+				"UPDATE t SET val = 'u%d' WHERE id = %d", i, i,
 			))
 		}
 	}
