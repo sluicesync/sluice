@@ -326,6 +326,33 @@ type IdempotentRowWriter interface {
 	WriteRowsIdempotent(ctx context.Context, table *Table, rows <-chan Row) error
 }
 
+// IdempotentCopyReader is the OPTIONAL surface a snapshot
+// [RowReader] implements to declare that its COPY-phase row stream may
+// re-deliver the same row, or deliver legitimate rows out of primary-
+// key order, so the cold-start bulk-copy writer MUST be idempotent
+// (upsert) rather than plain INSERT (Bug 125).
+//
+// The MySQL VStream snapshot reader implements it and returns true:
+// Vitess's COPY mode re-emits rows already past the scan during binlog
+// catchup, and can order the scan by a cheaper unique key than the
+// table's PK — so a plain INSERT would collide on a unique key. The
+// orchestrator type-asserts on this surface during cold-start and, when
+// it reports true, routes the row stream through
+// [IdempotentRowWriter.WriteRowsIdempotent] (and refuses a keyless
+// table loudly, since the upsert needs a unique key to collide on).
+//
+// Readers that don't implement it (Postgres snapshot, MySQL binlog
+// snapshot) keep the faster plain-INSERT / COPY cold-start path — their
+// snapshot reads are gap-free and overlap-free by construction, so no
+// idempotency is required.
+type IdempotentCopyReader interface {
+	RowReader
+
+	// CopyNeedsIdempotentWriter reports whether the cold-start bulk
+	// copy of this reader's rows must go through the idempotent writer.
+	CopyNeedsIdempotentWriter() bool
+}
+
 // TableTruncator is the optional surface a [RowWriter] (or
 // [SchemaWriter]) can implement to expose TRUNCATE TABLE for
 // resume's truncate-and-redo path. The pipeline.Migrator type-asserts

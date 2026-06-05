@@ -193,3 +193,61 @@ func (drainingWriter) WriteRows(_ context.Context, _ *ir.Table, rows <-chan ir.R
 	}
 	return nil
 }
+
+// idempotentCountingWriter records which write path the orchestrator
+// chose. It implements ir.IdempotentRowWriter so copyTableColdStart-
+// Idempotent can route to it; plainCalls / idemCalls distinguish the
+// two paths for the Bug 125 routing pin.
+type idempotentCountingWriter struct {
+	plainCalls int
+	idemCalls  int
+}
+
+func (w *idempotentCountingWriter) WriteRows(_ context.Context, _ *ir.Table, rows <-chan ir.Row) error {
+	w.plainCalls++
+	for range rows {
+	}
+	return nil
+}
+
+func (w *idempotentCountingWriter) WriteRowsIdempotent(_ context.Context, _ *ir.Table, rows <-chan ir.Row) error {
+	w.idemCalls++
+	for range rows {
+	}
+	return nil
+}
+
+// TestCopyTableColdStartIdempotent_RoutesThroughUpsert pins Bug 125's
+// orchestration half: copyTableColdStartIdempotent must use the
+// writer's idempotent (upsert) path, NOT plain WriteRows.
+func TestCopyTableColdStartIdempotent_RoutesThroughUpsert(t *testing.T) {
+	rr := newPumpReader(50)
+	rw := &idempotentCountingWriter{}
+	table := &ir.Table{Name: "connections", Columns: []*ir.Column{{Name: "id"}}}
+
+	if err := copyTableColdStartIdempotent(context.Background(), rr, rw, table, nil, ShardColumnSpec{}); err != nil {
+		t.Fatalf("copyTableColdStartIdempotent: %v", err)
+	}
+	if rw.idemCalls != 1 || rw.plainCalls != 0 {
+		t.Errorf("idemCalls=%d plainCalls=%d; want idem=1 plain=0 (Bug 125 must upsert)", rw.idemCalls, rw.plainCalls)
+	}
+}
+
+// TestCopyTableColdStartIdempotent_RefusesNonIdempotentWriter pins the
+// loud refusal: when the reader declares its rows need idempotent
+// writes (VStream COPY re-emits, Bug 125) but the target writer can't
+// upsert, the orchestrator must refuse rather than silently fall back
+// to plain INSERT (which would re-introduce the duplicate-key collision).
+func TestCopyTableColdStartIdempotent_RefusesNonIdempotentWriter(t *testing.T) {
+	rr := newPumpReader(10)
+	rw := drainingWriter{} // implements only WriteRows
+	table := &ir.Table{Name: "connections", Columns: []*ir.Column{{Name: "id"}}}
+
+	err := copyTableColdStartIdempotent(context.Background(), rr, rw, table, nil, ShardColumnSpec{})
+	if err == nil {
+		t.Fatal("expected refusal when target writer is not idempotent; got nil")
+	}
+	if !strings.Contains(err.Error(), "connections") || !strings.Contains(err.Error(), "Bug 125") {
+		t.Errorf("error %q; want it to name the table and Bug 125", err.Error())
+	}
+}

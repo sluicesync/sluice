@@ -279,21 +279,19 @@ func (w *SchemaWriter) CreateIndexes(ctx context.Context, s *ir.Schema) error {
 		return fmt.Errorf("mysql: CreateIndexes: schema is nil")
 	}
 	for _, table := range orderedTables(s) {
-		// GitHub #25: skip the index that emitTableDef already emitted
-		// inline (the supporting key for a non-PK AUTO_INCREMENT
-		// column). Re-creating it here would fail with "duplicate
-		// index" on the second pass. Tables without the inline pattern
-		// see the entire index list as before.
-		skipName := ""
-		if inline := inlineAutoIncrementIndex(table); inline != nil {
-			skipName = inline.Name
-		}
+		// GitHub #25 + Bug 125: skip the indexes emitTableDef already
+		// emitted inline (the AUTO_INCREMENT supporting key and, for a
+		// PK-less table, the promoted non-null UNIQUE COPY key).
+		// Re-creating either here would fail with "duplicate index" on
+		// the second pass. Tables without an inline pattern see the
+		// entire index list as before.
+		skip := inlineSkipIndexNames(table)
 		indexes := append([]*ir.Index(nil), table.Indexes...)
 		sort.Slice(indexes, func(i, j int) bool {
 			return indexes[i].Name < indexes[j].Name
 		})
 		for _, idx := range indexes {
-			if idx.Name == skipName {
+			if _, skipped := skip[idx.Name]; skipped {
 				continue
 			}
 			stmt, err := emitCreateIndex(table.Name, idx)
@@ -306,6 +304,22 @@ func (w *SchemaWriter) CreateIndexes(ctx context.Context, s *ir.Schema) error {
 		}
 	}
 	return nil
+}
+
+// inlineSkipIndexNames returns the set of index names emitTableDef
+// emits inline at CREATE TABLE time — the AUTO_INCREMENT supporting
+// key (GitHub #25) and the PK-less COPY unique key (Bug 125). The
+// index-emit phases skip these so they aren't re-created (which would
+// raise a duplicate-index error). Empty for the common table.
+func inlineSkipIndexNames(table *ir.Table) map[string]struct{} {
+	skip := make(map[string]struct{}, 2)
+	if inline := inlineAutoIncrementIndex(table); inline != nil {
+		skip[inline.Name] = struct{}{}
+	}
+	if inline := inlineUniqueKeyForCopy(table); inline != nil {
+		skip[inline.Name] = struct{}{}
+	}
+	return skip
 }
 
 // CreateConstraints adds every foreign-key constraint across the
@@ -430,20 +444,17 @@ func (w *SchemaWriter) PreviewDDL(_ context.Context, s *ir.Schema) ([]ir.DDLStat
 		})
 	}
 
-	// Phase 2: secondary indexes. Skip the inline-emitted
-	// AUTO_INCREMENT-supporting index (GitHub #25, same logic as
-	// CreateIndexes above).
+	// Phase 2: secondary indexes. Skip the inline-emitted indexes
+	// (GitHub #25 AUTO_INCREMENT key + Bug 125 PK-less COPY unique key,
+	// same logic as CreateIndexes above).
 	for _, table := range orderedTables(s) {
-		skipName := ""
-		if inline := inlineAutoIncrementIndex(table); inline != nil {
-			skipName = inline.Name
-		}
+		skip := inlineSkipIndexNames(table)
 		indexes := append([]*ir.Index(nil), table.Indexes...)
 		sort.Slice(indexes, func(i, j int) bool {
 			return indexes[i].Name < indexes[j].Name
 		})
 		for _, idx := range indexes {
-			if idx.Name == skipName {
+			if _, skipped := skip[idx.Name]; skipped {
 				continue
 			}
 			stmt, err := emitCreateIndex(table.Name, idx)

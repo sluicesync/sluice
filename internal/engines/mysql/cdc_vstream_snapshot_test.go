@@ -17,17 +17,16 @@ import (
 )
 
 // newTestSnapshotStream builds a vstreamSnapshotStream wired the way
-// the constructor does (cond over mu, dedup tracker, default byte cap)
-// so the dispatcher/enqueue/ReadRows helpers behave as in production
-// when a test drives them directly. Tests that need copy-completion or
-// a smaller cap mutate the returned struct's fields before use.
+// the constructor does (cond over mu, default byte cap) so the
+// dispatcher/enqueue/ReadRows helpers behave as in production when a
+// test drives them directly. Tests that need copy-completion or a
+// smaller cap mutate the returned struct's fields before use.
 func newTestSnapshotStream() *vstreamSnapshotStream {
 	s := &vstreamSnapshotStream{
 		keyspace:            "main",
 		fields:              make(map[string][]*query.Field),
 		rowBuffer:           make(map[string][]ir.Row),
 		copyCompletedShards: make(map[string]bool),
-		dedup:               newCopyDedupTracker(),
 		maxBufferBytes:      defaultSnapshotMaxBufferBytes,
 	}
 	s.cond = sync.NewCond(&s.mu)

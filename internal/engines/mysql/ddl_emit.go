@@ -810,6 +810,40 @@ func inlineAutoIncrementIndex(table *ir.Table) *ir.Index {
 	return nil
 }
 
+// inlineUniqueKeyForCopy returns the non-null UNIQUE index that
+// [emitTableDef] promotes inline at CREATE TABLE time for a PK-LESS
+// table so the cold-start VStream COPY's idempotent writer has a
+// unique key present on the target while rows land (Bug 125). Returns
+// nil when:
+//
+//   - the table has a PRIMARY KEY (the PK is already inline and serves
+//     as the upsert conflict key — no promotion needed), or
+//   - no non-null UNIQUE index qualifies (a truly-keyless table; the
+//     idempotent writer refuses it loudly at copy time), or
+//   - the qualifying index is ALREADY the one [inlineAutoIncrementIndex]
+//     emits inline (avoid a double-create on the same index).
+//
+// The index it picks is exactly the one [effectiveUpsertKeyColumns]
+// keys the upsert on (both call [pickNonNullUniqueIndex]), so the
+// promoted-inline key and the writer's conflict key are the same by
+// construction. [CreateIndexes] skips whatever this returns so Phase 2
+// doesn't re-create it.
+func inlineUniqueKeyForCopy(table *ir.Table) *ir.Index {
+	if table == nil || table.PrimaryKey != nil {
+		return nil
+	}
+	idx := pickNonNullUniqueIndex(table)
+	if idx == nil {
+		return nil
+	}
+	if auto := inlineAutoIncrementIndex(table); auto != nil && auto.Name == idx.Name {
+		// Already emitted inline by the auto-increment path; promoting
+		// it again here would double-create.
+		return nil
+	}
+	return idx
+}
+
 // emitTableDef returns a CREATE TABLE statement with columns and
 // the primary key inline (plus, when [inlineAutoIncrementIndex]
 // matches, the supporting unique index required to satisfy MySQL's
@@ -877,8 +911,15 @@ func emitTableDefWithDomainChecks(table *ir.Table, inlineCheckSupported bool) (s
 	hasPK := table.PrimaryKey != nil
 	inlineIdx := inlineAutoIncrementIndex(table)
 	hasInlineIdx := inlineIdx != nil
+	// Bug 125: for a PK-less table, promote a non-null UNIQUE index
+	// inline so the cold-start VStream COPY's idempotent upsert has a
+	// key to collide on while rows land (other UNIQUE indexes are
+	// deferred to Phase 2). nil when a PK exists, when none qualifies,
+	// or when the auto-increment path already inlines the same index.
+	copyUniqueIdx := inlineUniqueKeyForCopy(table)
+	hasCopyUniqueIdx := copyUniqueIdx != nil
 	tailHas := func() bool {
-		return hasPK || hasInlineIdx || len(table.CheckConstraints) > 0 || len(domainCheckClauses) > 0
+		return hasPK || hasInlineIdx || hasCopyUniqueIdx || len(table.CheckConstraints) > 0 || len(domainCheckClauses) > 0
 	}
 	hasUserChecks := len(table.CheckConstraints) > 0
 	hasDomainChecks := len(domainCheckClauses) > 0
@@ -918,6 +959,21 @@ func emitTableDefWithDomainChecks(table *ir.Table, inlineCheckSupported bool) (s
 		sb.WriteString(quoteIdent(inlineIdx.Name))
 		sb.WriteByte(' ')
 		sb.WriteString(emitIndexColumnList(inlineIdx.Columns))
+		if hasCopyUniqueIdx || hasUserChecks || hasDomainChecks {
+			sb.WriteByte(',')
+		}
+		sb.WriteByte('\n')
+	}
+
+	// Bug 125: emit the promoted non-null UNIQUE index inline for a
+	// PK-less table so the cold-start VStream COPY's idempotent upsert
+	// has a key present on the target while rows land. Phase 2
+	// (CreateIndexes) skips this same index via [inlineUniqueKeyForCopy].
+	if hasCopyUniqueIdx {
+		sb.WriteString("  UNIQUE KEY ")
+		sb.WriteString(quoteIdent(copyUniqueIdx.Name))
+		sb.WriteByte(' ')
+		sb.WriteString(emitIndexColumnList(copyUniqueIdx.Columns))
 		if hasUserChecks || hasDomainChecks {
 			sb.WriteByte(',')
 		}

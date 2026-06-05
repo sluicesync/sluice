@@ -281,20 +281,27 @@ func TestVStreamSnapshot_StreamingMultiShardFanIn(t *testing.T) {
 	}
 }
 
-// TestVStreamSnapshot_StreamingDedup confirms the behind-the-scan
-// re-emission drop still fires on the streaming path: the dedup
-// tracker runs inline in the COPY pump, so a re-emitted (lower-or-equal
-// PK) row never reaches the queue or the consumer.
-func TestVStreamSnapshot_StreamingDedup(t *testing.T) {
+// TestVStreamSnapshot_StreamingKeepsEveryRow is the Bug 125 pin: the
+// COPY pump no longer drops behind-the-scan re-emissions. The deleted
+// copyDedupTracker assumed Vitess's COPY scan emits in PK-ascending
+// order of the PRI_KEY_FLAG column and dropped any row with PK <=
+// max-seen — but that assumption is false when Vitess orders the scan
+// by a cheaper unique key, so legitimate forward rows were silently
+// dropped (the 13.5M-of-19M incident). Every decoded ROW now reaches
+// the consumer verbatim; the idempotent COPY writer absorbs the
+// re-emissions downstream without any ordering assumption.
+func TestVStreamSnapshot_StreamingKeepsEveryRow(t *testing.T) {
 	resp := []*vtgate.VStreamResponse{
 		oneEvent(snapFieldEvent("-", snapPKField("id"))),
 		oneEvent(snapRowEvent("-", "1")),
 		oneEvent(snapRowEvent("-", "2")),
 		oneEvent(snapRowEvent("-", "3")),
-		// Behind-the-scan re-emissions (PK <= max seen) — must drop.
+		// Behind-the-scan re-emissions (PK <= max seen). Pre-Bug-125
+		// these were dropped; now they flow through and the idempotent
+		// writer upserts them harmlessly.
 		oneEvent(snapRowEvent("-", "2")),
 		oneEvent(snapRowEvent("-", "1")),
-		// Forward again — kept.
+		// Forward again.
 		oneEvent(snapRowEvent("-", "4")),
 		oneEvent(snapVgtidEvent("MySQL56/abc:1-100")),
 		oneEvent(globalCopyCompleted()),
@@ -317,14 +324,29 @@ func TestVStreamSnapshot_StreamingDedup(t *testing.T) {
 	if err := (&vstreamSnapshotRows{snap: s}).Err(); err != nil {
 		t.Fatalf("Err: %v", err)
 	}
-	want := []int64{1, 2, 3, 4}
+	// Every emitted ROW is delivered in arrival order — zero drops.
+	want := []int64{1, 2, 3, 2, 1, 4}
 	if len(ids) != len(want) {
-		t.Fatalf("got ids %v; want %v (behind-the-scan re-emissions dropped)", ids, want)
+		t.Fatalf("got ids %v; want %v (zero drops — Bug 125)", ids, want)
 	}
 	for i := range want {
 		if ids[i] != want[i] {
 			t.Errorf("ids[%d] = %d; want %d", i, ids[i], want[i])
 		}
+	}
+}
+
+// TestVStreamSnapshot_CopyNeedsIdempotentWriter pins the marker the
+// orchestrator reads to route the cold-start bulk copy through the
+// upsert writer (Bug 125). The VStream snapshot reader must declare it.
+func TestVStreamSnapshot_CopyNeedsIdempotentWriter(t *testing.T) {
+	var rr ir.RowReader = &vstreamSnapshotRows{snap: newTestSnapshotStream()}
+	icr, ok := rr.(ir.IdempotentCopyReader)
+	if !ok {
+		t.Fatal("vstreamSnapshotRows must implement ir.IdempotentCopyReader")
+	}
+	if !icr.CopyNeedsIdempotentWriter() {
+		t.Error("CopyNeedsIdempotentWriter() = false; want true (VStream COPY re-emits rows)")
 	}
 }
 

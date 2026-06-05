@@ -865,6 +865,91 @@ func TestEmitTableDef_AutoIncrementNonPK_GitHub25(t *testing.T) {
 	}
 }
 
+// TestEmitTableDef_PKLessNonNullUnique_Bug125 pins the Bug 125 inline
+// promotion: a PK-less table with non-null UNIQUE indexes gets ONE
+// deterministic unique key (fewest cols, then smallest name) emitted
+// inline in CREATE TABLE so the cold-start VStream COPY upsert has a
+// key to collide on while rows land. The other unique index is deferred
+// to Phase 2 (CreateIndexes).
+func TestEmitTableDef_PKLessNonNullUnique_Bug125(t *testing.T) {
+	table := &ir.Table{
+		Name: "connections",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}, Nullable: false},
+			{Name: "tiny", Type: ir.Integer{Width: 8}, Nullable: false},
+			{Name: "payload", Type: ir.Text{}, Nullable: true},
+		},
+		Indexes: []*ir.Index{
+			{Name: "uq_id", Unique: true, Columns: []ir.IndexColumn{{Column: "id"}}},
+			{Name: "uk_tiny", Unique: true, Columns: []ir.IndexColumn{{Column: "tiny"}}},
+		},
+	}
+	got, err := emitTableDef(table)
+	if err != nil {
+		t.Fatalf("emitTableDef: %v", err)
+	}
+	// Deterministic pick: both are single-column non-null UNIQUE, so
+	// the lexicographically smaller name (uk_tiny) is promoted inline.
+	if !strings.Contains(got, "UNIQUE KEY `uk_tiny` (`tiny`)") {
+		t.Errorf("output missing inline UNIQUE KEY uk_tiny; got:\n%s", got)
+	}
+	// The other unique index is NOT inline (deferred to Phase 2).
+	if strings.Contains(got, "`uq_id`") {
+		t.Errorf("uq_id should be deferred to Phase 2, not inline; got:\n%s", got)
+	}
+}
+
+// TestInlineUniqueKeyForCopy_DetectionTable covers the Bug 125 inline
+// detector directly across the decision branches.
+func TestInlineUniqueKeyForCopy_DetectionTable(t *testing.T) {
+	// PK present → nil (PK is the conflict key; no promotion).
+	withPK := &ir.Table{
+		Columns:    []*ir.Column{{Name: "id", Nullable: false}},
+		PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "id"}}},
+		Indexes:    []*ir.Index{{Name: "uq_x", Unique: true, Columns: []ir.IndexColumn{{Column: "id"}}}},
+	}
+	if got := inlineUniqueKeyForCopy(withPK); got != nil {
+		t.Errorf("table with PK should return nil; got %+v", got)
+	}
+
+	// PK-less + non-null unique → that index.
+	pkLess := &ir.Table{
+		Columns: []*ir.Column{{Name: "id", Nullable: false}},
+		Indexes: []*ir.Index{{Name: "uq_id", Unique: true, Columns: []ir.IndexColumn{{Column: "id"}}}},
+	}
+	if got := inlineUniqueKeyForCopy(pkLess); got == nil || got.Name != "uq_id" {
+		t.Errorf("PK-less non-null unique should return uq_id; got %+v", got)
+	}
+
+	// PK-less + nullable unique → nil (nullable UNIQUE allows multiple
+	// NULL rows; not a reliable conflict key).
+	pkLessNullable := &ir.Table{
+		Columns: []*ir.Column{{Name: "id", Nullable: true}},
+		Indexes: []*ir.Index{{Name: "uq_id", Unique: true, Columns: []ir.IndexColumn{{Column: "id"}}}},
+	}
+	if got := inlineUniqueKeyForCopy(pkLessNullable); got != nil {
+		t.Errorf("PK-less nullable unique should return nil; got %+v", got)
+	}
+
+	// PK-less + auto-increment unique already inlined by the
+	// auto-increment path → nil here (avoid double-create). The auto
+	// column with its own supporting unique IS the picked key, so the
+	// auto-increment path owns it.
+	pkLessAuto := &ir.Table{
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64, AutoIncrement: true}, Nullable: false},
+		},
+		Indexes: []*ir.Index{
+			{Name: "uq_id", Unique: true, Columns: []ir.IndexColumn{{Column: "id"}}},
+		},
+	}
+	if auto := inlineAutoIncrementIndex(pkLessAuto); auto != nil && auto.Name == "uq_id" {
+		if got := inlineUniqueKeyForCopy(pkLessAuto); got != nil {
+			t.Errorf("auto-increment path already inlines uq_id; copy detector should return nil; got %+v", got)
+		}
+	}
+}
+
 // TestInlineAutoIncrementIndex_DetectionTable covers the detector
 // directly: PK auto column → no inline (existing common case),
 // non-PK auto column with supporting unique → inline that index,

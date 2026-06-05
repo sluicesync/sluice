@@ -933,8 +933,24 @@ func runBulkCopyWithOpts(
 			return wrapWithHint(PhaseSchemaApply, fmt.Errorf("pipeline: create tables: %w", err))
 		}
 	}
+	// Bug 125: the MySQL VStream snapshot reader re-emits COPY-phase
+	// rows (binlog catchup) and can deliver legitimate rows out of PK
+	// order (Vitess orders the scan by a cheaper unique key than the
+	// flagged PK). When the reader declares this via
+	// [ir.IdempotentCopyReader], route the bulk copy through the
+	// engine's upsert path so the re-emissions absorb instead of
+	// colliding on a unique key. Readers that don't declare it (PG
+	// snapshot, MySQL binlog snapshot) keep the faster plain path.
+	needsIdempotent := false
+	if icr, ok := rows.(ir.IdempotentCopyReader); ok {
+		needsIdempotent = icr.CopyNeedsIdempotentWriter()
+	}
 	for _, table := range schema.Tables {
-		if err := copyTable(ctx, rows, rw, table, opts.Redactor, opts.Shard); err != nil {
+		copyFn := copyTable
+		if needsIdempotent {
+			copyFn = copyTableColdStartIdempotent
+		}
+		if err := copyFn(ctx, rows, rw, table, opts.Redactor, opts.Shard); err != nil {
 			return wrapWithHint(PhaseBulkCopy, fmt.Errorf("pipeline: copy table %q: %w", table.Name, err))
 		}
 	}
@@ -1397,6 +1413,56 @@ func copyTable(ctx context.Context, rr ir.RowReader, rw ir.RowWriter, table *ir.
 	// The writer returned without error, but it may have observed a
 	// truncated stream because the reader aborted mid-table on a
 	// scan/decode failure. Surface that loudly (Bug 68).
+	return readerStreamErr(rr, table)
+}
+
+// copyTableColdStartIdempotent is the upsert-form of [copyTable] used
+// when the snapshot reader declares [ir.IdempotentCopyReader] (Bug 125
+// — the MySQL VStream COPY phase re-emits rows and can deliver them out
+// of PK order). Routes the row stream through
+// [ir.IdempotentRowWriter.WriteRowsIdempotent] so the re-emissions
+// absorb via ON DUPLICATE KEY UPDATE / ON CONFLICT instead of colliding
+// on a unique key.
+//
+// Goroutine-lifecycle, redaction, shard-stamping, and the Bug-68
+// loud-failure gate are identical to [copyTable] — only the write call
+// differs. A target writer that doesn't implement [ir.IdempotentRowWriter]
+// is a loud refusal rather than a silent fallback: the reader has
+// declared its rows NEED idempotent writes, so falling back to plain
+// INSERT would re-introduce the duplicate-key collision the dedup
+// removal was meant to fix. (Both shipping target engines implement
+// the surface; this guards a future engine that forgets it.)
+func copyTableColdStartIdempotent(ctx context.Context, rr ir.RowReader, rw ir.RowWriter, table *ir.Table, redactor *redact.Registry, shard ShardColumnSpec) (retErr error) {
+	idem, ok := rw.(ir.IdempotentRowWriter)
+	if !ok {
+		return fmt.Errorf(
+			"pipeline: table %q: snapshot reader requires an idempotent bulk-copy writer "+
+				"(VStream COPY re-emits rows, Bug 125) but the target row writer does not "+
+				"implement IdempotentRowWriter",
+			table.Name,
+		)
+	}
+
+	copyCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	rows, err := rr.ReadRows(copyCtx, table)
+	if err != nil {
+		return fmt.Errorf("read rows: %w", err)
+	}
+	pt := newProgressTicker(copyCtx, progressInterval, table.Name)
+	kickOffRowCount(copyCtx, rr, table, pt)
+	defer func() { pt.Stop(ctx, retErr) }()
+
+	teed := teeRows(copyCtx, rows, pt.observeRow)
+	redacted, redactErrFn := redactRows(copyCtx, teed, redactor, table.Schema, table.Name, table.Columns, tablePKColumns(table), "")
+	stamped, _ := shardStampRows(copyCtx, redacted, shard.Name, shard.Value)
+	if err := idem.WriteRowsIdempotent(copyCtx, table, stamped); err != nil {
+		return fmt.Errorf("write rows (idempotent): %w", err)
+	}
+	if err := redactErrFn(); err != nil {
+		return fmt.Errorf("redact rows: %w", err)
+	}
 	return readerStreamErr(rr, table)
 }
 
