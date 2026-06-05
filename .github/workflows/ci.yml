@@ -419,6 +419,62 @@ jobs:
             ghcr.io/sluicesync/sluice-postgis:16-3.4-prebaked
       - run: go test -tags="integration postgis" -race -count=1 -timeout=15m -run TestMigrate_PostGIS_ ./internal/pipeline/...
 
+  # ----- Integration (vstream) -----
+  # The PlanetScale/Vitess VStream path is exercised end-to-end against a
+  # real `vitess/vttestserver:mysql80` local cluster (booted by
+  # testcontainers, ~10-45s/test). Historically these `integration &&
+  # vstream`-tagged tests ran only locally — no CI job passed the
+  # `vstream` tag — which is exactly how Bug 125 (a CRITICAL silent-loss
+  # class: the COPY dedup dropped ~70% of rows when Vitess's scan order
+  # diverged from the flagged PK column) reached a release: no unit test
+  # or standard `integration` test reproduces it; only the vstream matrix
+  # does. This job closes that gap and runs the matrix under -race on
+  # every push.
+  #
+  # Dedicated job (not folded into the main integration shards) because
+  # vttestserver boots a full Vitess cluster — heavier and slower than a
+  # plain mysql:8.0 — and we want its cost + any startup flakiness
+  # isolated from the core shards while its CI reliability is observed.
+  # It is intentionally NOT in `main`'s required-checks list yet (watch a
+  # cycle, then promote to a hard gate via branch protection).
+  #
+  # Build-tag additivity (same as the PostGIS job): `-tags="integration
+  # vstream"` compiles BOTH the integration- and vstream-tagged files, so
+  # `-run 'TestVStream_'` scopes execution to the vstream suite in the
+  # mysql engine package (Bug 125 matrix + VTTestServer CDC/snapshot +
+  # schema-evolution). The two pipeline-package vstream tests
+  # (sharded-source, ShapeA consolidation) are a planned follow-up once
+  # this job's reliability is established.
+  #
+  # Images: vitess/vttestserver:mysql80 (Docker Hub, public — the source
+  # cluster) + the pre-baked sluice-mysql target. 35m outer / 30m inner
+  # timeout (inner < outer so Go's diagnostic timeout-panic fires before
+  # a hard job kill), with headroom for the per-test cluster boots.
+  integration-vstream:
+    name: Integration (vstream)
+    runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 35
+    # See the integration job's permissions block for the rationale.
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: "go.mod"
+      - run: go mod download
+      - name: Log in to ghcr.io + pre-pull the pre-baked MySQL target (bounded retry)
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          bash scripts/ci-ghcr-pull.sh \
+            ghcr.io/sluicesync/sluice-mysql:8.0-prebaked
+      - name: Pre-pull vttestserver (Docker Hub, public — avoids a cold-pull timeout mid-test)
+        run: docker pull vitess/vttestserver:mysql80
+      - run: go test -tags="integration vstream" -race -count=1 -timeout=30m -run 'TestVStream_' ./internal/engines/mysql/...
+
   # ----- Lint -----
   # golangci-lint runs many static analyzers in a single pass. We use the
   # official action which handles caching and version selection. Linting
