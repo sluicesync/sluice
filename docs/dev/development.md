@@ -95,6 +95,7 @@ Integration tests are layered by build tag so the normal pass doesn't pull heavy
 | `integration` | `mysql:8.0`, `postgres:16`, plus extension images | minutes; runs in CI on every PR | the default cross-engine + same-engine suite |
 | `integration vstream` | `vitess/vttestserver:mysql80` (~2 GB) | +1–2 min container boot; runs in the vstream pass | VStream CDC reader basics, snapshot→CDC handoff, multi-shard snapshot/CDC, **static-sharded Vitess → sluice Migrate → src==dst** (`internal/pipeline`, `TestMigrate_VStreamShardedSource`) |
 | `integration vitessreshard` | `vitess/lite:latest` (~2 GB) + `quay.io/coreos/etcd:v3.5.17` (~70 MB) | cluster bring-up ~40–60 s; each test 80–170 s wall; **heavy, NOT in the normal CI gate** | the Track-1a reshard core: a scripted multi-process Vitess cluster (etcd + vtctld + per-shard primary+replica vttablets + vtgate) that can run `vtctldclient Reshard create` + `SwitchTraffic`. `TestVitessReshard_ProofOfReshardability` (topology feasibility gate) and `TestVitessReshard_ChaosExactlyOnce` (the headline no-gap/no-dup-across-the-journal-cut oracle, `internal/engines/mysql`) |
+| `integration vitesscluster` | `vitess/lite:v20.0.6` (~2.6 GB) + `quay.io/coreos/etcd:v3.5.21` (~70 MB) | cluster bring-up ~28–40 s; each test ~90–110 s wall; **heavy, NOT in the normal CI gate** | ADR-0073 (c) FULL online-DDL cutover-survival: a minimal real Vitess cluster (etcd + vtctld + a primary + a replica vttablet + vtgate) that runs the **real online-DDL scheduler** vtcombo stubs out. `TestVitessCluster_OnlineDDL_CutoverSurvivesWithZeroLoss` (snapshot→CDC across a real `ddl_strategy='vitess'` cutover, zero loss, post-cutover schema flows) and `TestVitessCluster_OnlineDDL_ComplexShapesSurviveCutover` (mid-table column drop + ENUM add + ENUM extend each survive a real cutover), `internal/engines/mysql` |
 
 Why `vitessreshard` is a separate tag rather than reusing `vstream`: the `vstream` tag's `vttestserver` image is single-process `vtcombo` — it serves a *statically* sharded keyspace and ships **no `vtctldclient`/`vtctld`/standalone `vttablet`**, so it physically cannot run a shard-count reshard. The reshard correctness core therefore needs the full multi-process cluster (the `examples/local` topology, containerised), which is heavier and slower and must not burden the normal integration pass. Run it explicitly:
 
@@ -105,6 +106,18 @@ go test -tags='integration vitessreshard' -v -count=1 -timeout=35m \
 ```
 
 The cheap CI-smoke half of the Track-1a Vitess validation (VStream basics + static-sharded `src==dst`) stays under `vstream` and runs in the normal vstream pass; only the heavy reshard-chaos core is behind `vitessreshard`.
+
+Why `vitesscluster` is a separate tag (ADR-0073 (c), track item (b2)): vttestserver's `vtcombo` online-DDL scheduler is **stubbed** (`SHOW VITESS_MIGRATIONS` reports `not implemented in vtcombo`), so the `vstream`-tagged online-DDL tests can only prove internal-`_vt_*`-table exclusion + that shadow-table DDL events don't wedge the logical stream — they **cannot** run the genuine VReplication copy + atomic rename cutover. The `vitesscluster` harness boots a real multi-process Vitess cluster (driven via `docker compose`, not testcontainers — the compose file lives at `internal/engines/mysql/testdata/vitesscluster/docker-compose.yml`) whose scheduler reaches `migration_status=complete`, so it validates the full cutover-survival of ADR-0073 (c) end-to-end through sluice's VStream. Run it explicitly:
+
+```bash
+# Windows/Rancher: add docker.exe to PATH first (the harness also probes
+# the Rancher install path automatically). Ryuk is irrelevant here — the
+# harness drives `docker compose` directly, not the testcontainers API.
+go test -tags='integration vitesscluster' -v -count=1 -timeout=20m \
+  -run 'TestVitessCluster' ./internal/engines/mysql/...
+```
+
+Resource needs: ~2 GB free RAM for the 5-container stack (the running footprint is modest, ~500 MB RSS; the cost is the ~2.6 GB `vitess/lite` image on disk). The harness publishes vtgate on fixed host ports (MySQL 15306, gRPC 15991), so it is **not** safe to run two `vitesscluster` stacks at once on one host; the compose file accepts `VTGATE_MYSQL_PORT` / `VTGATE_GRPC_PORT` overrides if you need to relocate them. One subtlety the harness encapsulates: after the replica joins and the primary is reparented, vtgate needs a few seconds before it advertises a healthy `PRIMARY` — seeding before that races the healthcheck and fails with `no healthy tablet available ... tablet_type:PRIMARY`. `startVitessCluster` polls a trivial write through vtgate until it succeeds before returning, so tests never see that race.
 
 ### Rancher Desktop on Windows
 

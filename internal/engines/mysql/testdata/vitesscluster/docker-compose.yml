@@ -1,0 +1,165 @@
+# Minimal full Vitess cluster for ADR-0073 (c) cutover-survival tests.
+#
+# Unlike vttestserver (single vtcombo container, scheduler stubbed), this
+# is a REAL cluster — etcd + vtctld + a primary + a replica vttablet
+# (each with its own MySQL) + vtgate — so the online-DDL scheduler runs
+# the genuine VReplication copy + atomic rename cutover that vtcombo
+# can't. See startVitessCluster in cdc_vstream_cluster_integration_test.go.
+#
+# Flag conventions are pinned to vitess/lite:v20.0.6 (matches the
+# vendored vitess.io/vitess v0.24.1 client): the server binaries take
+# underscore flags (--service_map, --topo_implementation), vtctldclient
+# takes hyphenated topo flags (--topo-implementation), and the binaries
+# live in /vt/bin which is NOT on the image's default PATH — hence the
+# `export PATH=/vt/bin:$PATH` prelude in every entrypoint. ($$ escapes the
+# compose variable-substitution so $PATH reaches the shell literally.)
+#
+# Host ports are env-substitutable so a second stack (or CI) can avoid
+# clashes; they default to the values the Go harness expects.
+
+name: ${COMPOSE_PROJECT:-sluice-vitesscluster}
+
+services:
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.21
+    command:
+      - etcd
+      - --data-dir=/etcd-data
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://etcd:2379
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+
+  vtctld:
+    image: vitess/lite:v20.0.6
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        set -e
+        export PATH=/vt/bin:$$PATH
+        vtctldclient --server internal --topo-implementation etcd2 --topo-global-server-address etcd:2379 --topo-global-root /vitess/global AddCellInfo --root /vitess/zone1 --server-address etcd:2379 zone1 || true
+        exec vtctld \
+          --topo_implementation etcd2 --topo_global_server_address etcd:2379 --topo_global_root /vitess/global \
+          --cell zone1 \
+          --service_map 'grpc-vtctl,grpc-vtctld' \
+          --port 15000 --grpc_port 15999 \
+          --config-file-not-found-handling=ignore
+    depends_on:
+      etcd:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "sh", "-c", "/vt/bin/vtctldclient --server localhost:15999 GetKeyspaces || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+
+  vttablet:
+    image: vitess/lite:v20.0.6
+    hostname: vttablet
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        set -e
+        export PATH=/vt/bin:$$PATH
+        mkdir -p /vt/vtdataroot
+        mysqlctl --tablet_uid 100 --mysql_port 17000 init || mysqlctl --tablet_uid 100 --mysql_port 17000 start
+        exec vttablet \
+          --topo_implementation etcd2 --topo_global_server_address etcd:2379 --topo_global_root /vitess/global \
+          --tablet-path zone1-0000000100 \
+          --tablet_hostname vttablet \
+          --init_keyspace test \
+          --init_shard 0 \
+          --init_tablet_type replica \
+          --mysql_server_version '8.0.40-Vitess' \
+          --health_check_interval 5s \
+          --port 15100 --grpc_port 16100 \
+          --service_map 'grpc-queryservice,grpc-tabletmanager,grpc-updatestream' \
+          --heartbeat_on_demand_duration=5s \
+          --config-file-not-found-handling=ignore
+    depends_on:
+      vtctld:
+        condition: service_healthy
+
+  vttablet-replica:
+    image: vitess/lite:v20.0.6
+    hostname: vttablet-replica
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        set -e
+        export PATH=/vt/bin:$$PATH
+        mkdir -p /vt/vtdataroot
+        mysqlctl --tablet_uid 101 --mysql_port 17000 init || mysqlctl --tablet_uid 101 --mysql_port 17000 start
+        exec vttablet \
+          --topo_implementation etcd2 --topo_global_server_address etcd:2379 --topo_global_root /vitess/global \
+          --tablet-path zone1-0000000101 \
+          --tablet_hostname vttablet-replica \
+          --init_keyspace test \
+          --init_shard 0 \
+          --init_tablet_type replica \
+          --mysql_server_version '8.0.40-Vitess' \
+          --health_check_interval 5s \
+          --port 15100 --grpc_port 16100 \
+          --service_map 'grpc-queryservice,grpc-tabletmanager,grpc-updatestream' \
+          --heartbeat_on_demand_duration=5s \
+          --config-file-not-found-handling=ignore
+    depends_on:
+      vtctld:
+        condition: service_healthy
+
+  init:
+    image: vitess/lite:v20.0.6
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        export PATH=/vt/bin:$$PATH
+        VTCTLD="vtctldclient --server vtctld:15999"
+        echo "waiting for both tablets to register..."
+        for i in $$(seq 1 90); do
+          n=$$($$VTCTLD GetTablets --keyspace test 2>/dev/null | grep -c zone1-)
+          if [ "$$n" -ge 2 ]; then break; fi
+          sleep 2
+        done
+        echo "promoting primary (uid 100)..."
+        $$VTCTLD InitShardPrimary --force test/0 zone1-0000000100
+        echo "waiting for a serving primary and replica..."
+        for i in $$(seq 1 90); do
+          out=$$($$VTCTLD GetTablets --keyspace test 2>/dev/null)
+          if echo "$$out" | grep -q "primary" && echo "$$out" | grep -q "replica"; then break; fi
+          sleep 2
+        done
+        echo "init done."
+        $$VTCTLD GetTablets --keyspace test
+    depends_on:
+      vttablet:
+        condition: service_started
+      vttablet-replica:
+        condition: service_started
+      vtctld:
+        condition: service_healthy
+
+  vtgate:
+    image: vitess/lite:v20.0.6
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        set -e
+        export PATH=/vt/bin:$$PATH
+        exec vtgate \
+          --topo_implementation etcd2 --topo_global_server_address etcd:2379 --topo_global_root /vitess/global \
+          --port 15001 --grpc_port 15991 --mysql_server_port 15306 \
+          --cell zone1 --cells_to_watch zone1 \
+          --tablet_types_to_wait PRIMARY \
+          --service_map 'grpc-vtgateservice' \
+          --mysql_auth_server_impl none \
+          --mysql_server_version '8.0.40-Vitess' \
+          --config-file-not-found-handling=ignore
+    ports:
+      - "${VTGATE_MYSQL_PORT:-15306}:15306"
+      - "${VTGATE_GRPC_PORT:-15991}:15991"
+    depends_on:
+      vtctld:
+        condition: service_healthy
