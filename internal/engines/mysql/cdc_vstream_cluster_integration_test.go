@@ -26,7 +26,7 @@
 //	  -run 'TestVitessCluster' ./internal/engines/mysql/...
 //
 // Resource needs: Docker with ~2 GB free RAM for the stack and the
-// vitess/lite:v20.0.6 + quay.io/coreos/etcd images pulled (~2.7 GB
+// vitess/lite:v24.0.1 + quay.io/coreos/etcd images pulled (~2.7 GB
 // disk). On Windows/Rancher Desktop, docker.exe must be reachable (the
 // harness probes the Rancher install path) and TESTCONTAINERS_RYUK is
 // irrelevant here because the harness drives `docker compose` directly
