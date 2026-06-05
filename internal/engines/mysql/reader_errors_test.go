@@ -6,10 +6,13 @@ package mysql
 import (
 	"database/sql/driver"
 	"errors"
+	"fmt"
 	"io"
 	"testing"
 
 	gomysql "github.com/go-sql-driver/mysql"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"sluicesync.dev/sluice/internal/ir"
 )
@@ -59,6 +62,58 @@ func TestClassifyReaderError_DelegatesToApplierClassifier(t *testing.T) {
 			if retriableR != retriableA {
 				t.Errorf("reader/applier classifier disagree on retriable shape for %q: reader=%v applier=%v",
 					c.name, retriableR, retriableA)
+			}
+		})
+	}
+}
+
+// TestClassifyReaderError_GRPCStatusCodes pins the gRPC-status branch
+// the reader classifier adds on top of the SQL-path delegation — the
+// reader-only shape a VStream stream Recv produces on a connection
+// drop (operator report: `Unavailable: connector reset by peer` failing
+// a cold-start, which the text/1105 matchers missed).
+//
+// Pin-the-class, not the representative: every code in the retriable
+// set AND a spread of terminal codes are asserted, each wrapped EXACTLY
+// as the pump wraps it (`fmt.Errorf("mysql/vstream: recv: %w", …)`) so
+// the test also guards that status.FromError still unwraps the `%w`
+// chain on a grpc dependency bump. A widening of [isRetriableGRPCCode]
+// (or a regression in unwrapping) fails here rather than silently.
+func TestClassifyReaderError_GRPCStatusCodes(t *testing.T) {
+	cases := []struct {
+		name      string
+		code      codes.Code
+		retriable bool
+	}{
+		{"Unavailable (transport reset/draining)", codes.Unavailable, true},
+		{"Aborted (tx-killer/failover)", codes.Aborted, true},
+		{"Unknown (vttablet internal transient)", codes.Unknown, true},
+		{"ResourceExhausted (throttler)", codes.ResourceExhausted, true},
+		{"InvalidArgument (terminal)", codes.InvalidArgument, false},
+		{"NotFound (terminal)", codes.NotFound, false},
+		{"FailedPrecondition (terminal)", codes.FailedPrecondition, false},
+		{"PermissionDenied (terminal)", codes.PermissionDenied, false},
+		{"Internal (terminal)", codes.Internal, false},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			// Wrap as the VStream pump does (cdc_vstream.go pump:
+			// classifyReaderError(fmt.Errorf("mysql/vstream: recv: %w", err))).
+			raw := status.Error(c.code, "connector reset by peer")
+			wrapped := fmt.Errorf("mysql/vstream: recv: %w", raw)
+
+			got := classifyReaderError(wrapped)
+			var re ir.RetriableError
+			gotRetriable := errors.As(got, &re)
+			if gotRetriable != c.retriable {
+				t.Errorf("classifyReaderError(grpc %s) retriable=%v, want %v", c.code, gotRetriable, c.retriable)
+			}
+			// The original status error must remain reachable via the
+			// chain so downstream errors.Is/As against the gRPC status
+			// still works from the consumer side.
+			if st, ok := status.FromError(got); !ok || st.Code() != c.code {
+				t.Errorf("classifyReaderError(grpc %s) lost the underlying status (ok=%v code=%v)", c.code, ok, st.Code())
 			}
 		})
 	}

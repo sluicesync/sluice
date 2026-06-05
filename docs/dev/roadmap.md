@@ -24,7 +24,18 @@ The v0.10.x cycle closed reactive-bug loops on the v0.9.x translator gaps and sh
 
 The v0.22.x–v0.64.0 block then shipped, end-to-end: **logical-backups Phase 6** (passphrase + AWS/GCP/Azure KMS encryption, Phase 6.1–6.4 including the ADR-0037 key-management + operator-encryption-guide deliverables), the **PG → PG extension-passthrough v1 shortlist** (pgvector, pg_trgm, hstore, citext, PostGIS — ADR-0032), **GEOMETRY/SPATIAL** (ADR-0035 + the v0.33.x geography/Z-M closure), **mid-stream strict zero-loss correctness** (ADR-0036), multi-source aggregation Shape B, the translator catalog (28 of 30 rules), backup-chain retention chunks **14a/14c + 14b Phase 1**, the full **PII redaction track Phase 1 → Phase 4** (ADR-0039/0040/0041), and the **ADR-0042/0043 bulk-copy throughput arc** (v0.62.0 default tune, v0.63.1 PG cold-start N1 fix, v0.64.0 native fast-loader on the cold parallel-copy path).
 
-What remains are the **harder-frontier, demand-gated items** that have always been here as design-first work — multi-source Shape A, MySQL multi-source native parity, ADR-0032 Tier 3 (uuid-ossp + pgcrypto function-defaults), the remaining 5 deferred translator rules, View Phase 3, and the analytics-export / Arrow research items pending operator demand.
+What remains are the **harder-frontier, demand-gated items** that have always been here as design-first work — multi-source Shape A, MySQL multi-source native parity, ADR-0032 Tier 3 (uuid-ossp + pgcrypto function-defaults), the remaining 5 deferred translator rules, View Phase 3, and the analytics-export / Arrow research items pending operator demand — plus the **active operator-reported cold-start-hardening arc** below.
+
+### 1. Resilient, resumable VStream cold-start COPY ([ADR-0072](../adr/adr-0072-resumable-coldstart-copy.md)) — *operator-reported, active*
+
+**Why.** A large-table PlanetScale cold-start that hits a transient network fault mid-COPY (`Unavailable: connector reset by peer`) currently has to restart the **entire** copy from row 0 — and for a multi-GB table over a flaky link, the re-copy may fault again before finishing, never converging. Steady-state CDC tailing already resumes from the last GTID and PG→PG copy-pool has AIMD backoff; the VStream cold-start COPY phase is the one long-running path with no resume.
+
+**What.** Three interlocking gaps (full trace in ADR-0072):
+- **Gap 1 — gRPC transient classification (SHIPPED).** `classifyReaderError` now honors native gRPC status codes (`Unavailable`/`Aborted`/`Unknown`/`ResourceExhausted` → retriable) instead of only MySQL-`1105`/raw-text shapes, so a VStream `Recv` reset triggers `runWithRetry` instead of failing terminally. `reader_errors.go` + `TestClassifyReaderError_GRPCStatusCodes`.
+- **Gap 1.5 — idempotency prerequisite.** `runWithRetry` clears `ResetTargetData` after the first attempt (`streamer.go:884`), so a retry re-copies into a target holding the partial rows → non-retriable `1062` unless the COPY writer is idempotent. **Ties to the Bug 125 idempotent-COPY-writer fix; the two must ship together** or cold-start retry is inert.
+- **Gap 2 — resumable COPY cursor (the design).** `shardGtid` drops Vitess's per-table `TablePKs` (the COPY-resume cursor); the position is persisted only at `COPY_COMPLETED`. Carry `TablePKs` in the position (Phase A), checkpoint it on a bounded cadence during COPY (Phase B), and reconnect-and-resume in the snapshot pump (Phase C).
+
+**Gotchas.** Position format gains an additive field — pin that old tokens still decode to "COPY from beginning". Checkpoint cadence trades fault-loss-window vs. control-table write amplification (bounded N-rows/T-seconds, not per-row). Concurrency-adjacent (pump goroutine + in-place reconnect) → **`-race`-before-tag**. Validate jointly with the Bug 125 idempotency fix and ground-truth the resume row-count on a real Vitess target.
 
 ### 2. Apache Arrow integration (deferred — research-doc updated)
 
