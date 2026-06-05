@@ -2,7 +2,9 @@
 
 ## Status
 
-Proposed. Surfaces a reproduced gap from the Bug-125 investigation and an operator-flagged robustness requirement. Builds on the VStream snapshot/CDC path ([ADR-0071](adr-0071-vstream-snapshot-bounded-memory.md), [ADR-0072](adr-0072-resumable-coldstart-copy.md)) and the existing `_vt_*` exclusion (GitHub issue #22 / "Bug 22"), whose coverage this ADR completes for the VStream COPY filter.
+Accepted (part (c) implemented). Surfaces a reproduced gap from the Bug-125 investigation and an operator-flagged robustness requirement. Builds on the VStream snapshot/CDC path ([ADR-0071](adr-0071-vstream-snapshot-bounded-memory.md), [ADR-0072](adr-0072-resumable-coldstart-copy.md)) and the existing `_vt_*` exclusion (GitHub issue #22 / "Bug 22"), whose coverage this ADR completes for the VStream COPY filter.
+
+The implementation — Phase-A ground truth, the exclusion choke points, the cutover-survival handling, and the vendored-Vitess verdict — is recorded in [Implementation notes (part c)](#implementation-notes-part-c) below.
 
 ## Context
 
@@ -36,3 +38,49 @@ This functionality must be **rock-solid**: every PlanetScale user will run schem
 
 - **Rely on vtgate's own internal-table exclusion.** Insufficient — the reproduced `_vt_vrp_*` leak shows the blanket `/.*/` request still surfaces them to sluice; sluice must filter.
 - **A static `_vt_` prefix list.** Fragile against the lifecycle-hint names and future Vitess conventions; prefer the Vitess helper as the single source of truth.
+
+## Implementation notes (part c)
+
+Implemented following the three-phase debugging protocol against `vitess/vttestserver:mysql80` (booted with `ENABLE_ONLINE_DDL=true`; the integration harness's `startVTTestServerWithShards` now sets it explicitly).
+
+### Vendored-Vitess verdict (Step 0)
+
+sluice vendors `vitess.io/vitess v0.24.1`. Its `schema.IsInternalOperationTableName()` is importable and **covers every format real PlanetScale / vttestserver (v20+) emit — no Vitess bump needed.** Recognized set (pinned in `vstream_internal_table_test.go`):
+
+- **Unified v20+ format** `_vt_<op>_<uuid32hex>_<ts14>_` (`InternalTableNameExpression = ^_vt_([a-zA-Z0-9]{3})_([0-f]{32})_([0-9]{14})_$`), so all op codes match: `hld`/`prg`/`evc`/`drp` (GC states), **`vrp`** (vreplication / online-DDL — the Bug-125 shadow), `gho`/`ghc`/`del` (gh-ost). `_vt_vrp_*` is covered.
+- **Legacy gh-ost / vreplication** `_<uuid>_<ts>_(gho|ghc|del|new|vrepl)` via `IsOnlineDDLTableName`.
+- **pt-online-schema-change** `_..._old`.
+
+One caveat worth recording: v0.24.1 does **not** match the pre-v19 *uppercase* `_vt_HOLD/PURGE/EVAC/DROP_<uuid>` legacy GC names (only the lowercase unified `_vt_hld_…`). That uppercase form predates the Vitess releases PlanetScale and `vttestserver:mysql80` run, so it isn't a real exposure today; if a very old self-hosted Vitess ever surfaces it, the matcher would need a Vitess bump or a supplement, and the unit pin would flag the gap.
+
+### Phase-A ground truth (observe before fixing)
+
+A temporary instrumented test (deleted in Phase C) tapped the raw VEvent stream during a real `ddl_strategy='vitess'` ALTER, and a second probe created an internal-named (`_vt_vrp_*`) table directly. Findings:
+
+1. **Do `_vt_*` internal tables reach sluice?** **Yes.** A directly-created `_vt_vrp_*` table surfaced **2 rows via `ReadRows` on the COPY path** pre-fix — i.e. its FIELD + ROW events flow through `bufferCopyRow` and get buffered under the `/.*/` filter. This is the exact Bug-125 leak (a buffered shadow that can trip the ADR-0071 scope-mismatch refusal).
+2. **What does the cutover emit?** During the online ALTER, vtgate streamed the shadow-table **DDL events** — `CREATE TABLE _vt_vrp_…`, `ALTER TABLE _vt_vrp_… ADD COLUMN …`, `ALTER TABLE _vt_vrp_… AUTO_INCREMENT=…` — as `VEventType_DDL`, with the internal name in the **statement text** and an **empty event `table` field**.
+3. **vttestserver limit (the Step-2 knob hunt).** The full online-DDL **scheduler is "not implemented in vtcombo"** (`SHOW VITESS_MIGRATIONS` reports `migration_status=failed message="not implemented in vtcombo"`). vtcombo's internal tablet-manager client stubs out the tmclient RPCs the cutover needs (`LockTables`/`UnlockTables`, …; `go/vt/vtcombo/tablet_map.go`). So vttestserver builds the shadow-table **DDL** but **cannot complete the VReplication copy or the atomic cutover** — there is no knob to make it. The end-to-end *cutover-with-rows + post-cutover-schema* assertion therefore lives in the real-PlanetScale `psverify` suite; vttestserver validates (a) the internal-table COPY/CDC ROW+FIELD exclusion (via a directly-created internal table, which produces the identical wire events) and (b) that the shadow-table DDL events don't wedge the logical stream.
+
+### The exclusion (Phase B)
+
+Single source of truth: `isVitessInternalTable()` in `internal/engines/mysql/vstream_internal_table.go`, delegating to `schema.IsInternalOperationTableName()` (callers strip the `keyspace.` prefix first). The `Match:"/.*/"` filters are unchanged (Vitess RE2 filters can't negative-lookahead-exclude). Internal-table events are dropped at every dispatch/buffer choke point, on **both** the COPY and the CDC paths:
+
+| Path | Site | Action |
+| --- | --- | --- |
+| COPY ROW | `vstreamSnapshotStream.bufferCopyRow` | skip before buffering (so the ADR-0071 scope-mismatch can't fire on `_vt_*`) |
+| COPY FIELD | `dispatchCopyEventLocked` FIELD branch | don't cache fields for internal tables |
+| CDC ROW | `vstreamCDCReader.dispatchRow` **and** `vstreamSnapshotStream.dispatchCDCRow` | skip before the FIELD lookup |
+| CDC FIELD | `vstreamCDCReader.dispatch` **and** `dispatchCDCEvent` FIELD branches | don't register/schema-snapshot internal tables |
+
+The ROW skips precede the field-cache lookup so the existing "row event without preceding FIELD event" loud floor stays reserved for genuine logical-table bugs (the matching FIELD was already dropped).
+
+### Cutover survival (decision #2)
+
+The VStream DDL handlers (`dispatchDDL` / `dispatchCDCDDL`) invalidate the **whole** field cache on every DDL ("a DDL might have changed the column shape"). A shadow-table DDL (Phase-A item 2) does **not** change any logical table's schema — clearing the logical cache on it would force a spurious "row without FIELD" wedge on the next logical ROW. So a small detector, `isVitessInternalDDL()` (extracts the target table from `CREATE/ALTER/DROP/RENAME TABLE …` and tests it with `isVitessInternalTable`), makes both DDL handlers **skip** internal-table DDLs entirely (no emit, no invalidation). The detector is fail-safe: anything it can't confidently parse falls through to the normal cache-clear (the pre-ADR behaviour). The atomic cutover's rename swaps the shadow onto the logical name, which surfaces as a FIELD re-emit on the **logical** table — not an internal-table DDL — so it still flows through the normal ADR-0049 schema-history path.
+
+### Pins
+
+- **Unit** (`vstream_internal_table_test.go`) — `isVitessInternalTable` over the full recognized set (every unified op code + each legacy family) **and** a battery of non-internal lookalikes that must NOT be excluded (`_vtok`, `vt_foo`, `_vt_foo`, `_vt_users_backup`, …; a false positive there is silent loss — a user table dropped from the migration). Plus `isVitessInternalDDL` over shadow vs logical DDL shapes. Pin-the-class so a Vitess wording change fails a test.
+- **Integration** (`integration && vstream`, `cdc_vstream_onlineddl_integration_test.go`):
+  - `TestVStream_OnlineDDL_InternalTablesExcluded_ColdStart` — a logical table copies byte-clean (5/5) alongside a 20-row internal `_vt_vrp_*` table; the internal table surfaces **0** rows and **no** scope-mismatch refusal fires (`stream.Rows.Err() == nil`).
+  - `TestVStream_OnlineDDL_LogicalStreamSurvivesCutover` — a real `ddl_strategy='vitess'` ALTER mid-CDC-stream; the logical stream is **not wedged** (3/3 post-ALTER inserts delivered, `Err() == nil`, no internal table surfaces as a change).

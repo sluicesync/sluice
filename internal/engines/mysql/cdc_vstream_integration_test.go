@@ -87,6 +87,19 @@ func startVTTestServerWithShards(t *testing.T, numShards int) (mysqlDSN, grpcEnd
 			// the host-side port mapping useless. 0.0.0.0 binds on
 			// all interfaces so the published port reaches us.
 			"MYSQL_BIND_HOST": "0.0.0.0",
+			// ENABLE_ONLINE_DDL makes vttestserver accept online
+			// schema-change strategies (ddl_strategy='vitess'),
+			// which build a shadow table, VReplication-copy into it,
+			// then atomically cut over — emitting the Vitess-internal
+			// `_vt_vrp_*` artifacts ADR-0073 (c) must exclude. It
+			// defaults to true in vttestserver's run.sh, but we set
+			// it explicitly so the online-DDL test surface doesn't
+			// depend on an image default that could change. The
+			// sibling knobs (FOREIGN_KEY_MODE, KEYSPACES, NUM_SHARDS)
+			// are already covered above / left at their image
+			// defaults; noted here so a future FK-cutover test knows
+			// where to set FOREIGN_KEY_MODE.
+			"ENABLE_ONLINE_DDL": "true",
 		},
 		// vttestserver logs "Local cluster started." once vtcombo
 		// has finished bringing up the embedded MySQL + vtgate +

@@ -629,6 +629,16 @@ func (r *vstreamCDCReader) dispatch(ctx context.Context, ev *binlogdata.VEvent, 
 		if fe == nil {
 			return nil
 		}
+		// ADR-0073 (c): drop FIELD events for Vitess-internal tables
+		// (online-DDL shadows, GC-renamed tables, …). vtgate streams
+		// them under the `/.*/` filter, but they are never logical user
+		// tables — caching their field metadata or writing a
+		// schema-history version for them is exactly the leak this ADR
+		// closes. Strip the keyspace prefix before matching; the
+		// internal-table naming is on the table component.
+		if isVitessInternalTable(stripKeyspaceFromTable(fe.GetTableName(), fe.GetKeyspace())) {
+			return nil
+		}
 		key := fieldCacheKey(fe.GetShard(), fe.GetTableName())
 		r.fields[key] = fe.GetFields()
 		return r.maybeSnapshotSchema(ctx, fe, out)
@@ -695,6 +705,19 @@ func (r *vstreamCDCReader) dispatchDDL(ctx context.Context, ev *binlogdata.VEven
 	stmt := ev.GetStatement()
 	if stmt == "" {
 		clear(r.fields)
+		return nil
+	}
+
+	// ADR-0073 (c) cutover survival: a DDL on a Vitess-internal shadow
+	// table (e.g. `CREATE/ALTER TABLE _vt_vrp_*`, which Phase A observed
+	// streaming during an online ALTER) does NOT change any logical
+	// user table's schema — so it must NOT clear the logical field
+	// cache. Clearing it would force a "row event without preceding
+	// FIELD event" wedge on the next logical ROW. The atomic cutover's
+	// rename surfaces as a FIELD re-emit on the LOGICAL table, which
+	// flows through the normal path below. Skip internal-table DDLs
+	// entirely (don't emit, don't invalidate).
+	if isVitessInternalDDL(stmt) {
 		return nil
 	}
 
@@ -836,6 +859,16 @@ func (r *vstreamCDCReader) maybeSnapshotSchema(ctx context.Context, fe *binlogda
 func (r *vstreamCDCReader) dispatchRow(ctx context.Context, ev *binlogdata.VEvent, out chan<- ir.Change) error {
 	rev := ev.GetRowEvent()
 	if rev == nil {
+		return nil
+	}
+	// ADR-0073 (c): drop ROW events for Vitess-internal tables before
+	// the FIELD-cache lookup. Their FIELD events were already dropped
+	// (dispatch's FIELD branch), so an internal ROW would otherwise trip
+	// the "row event without preceding FIELD event" loud floor below —
+	// and even with a FIELD it must never be applied to the target. Must
+	// precede the field lookup so the floor is reserved for genuine
+	// missing-FIELD bugs on logical tables.
+	if isVitessInternalTable(stripKeyspaceFromTable(rev.GetTableName(), rev.GetKeyspace())) {
 		return nil
 	}
 	key := fieldCacheKey(rev.GetShard(), rev.GetTableName())

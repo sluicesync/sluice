@@ -683,6 +683,15 @@ func (s *vstreamSnapshotStream) dispatchCopyEventLocked(ev *binlogdata.VEvent) (
 		if fe == nil {
 			return false, nil
 		}
+		// ADR-0073 (c): drop FIELD events for Vitess-internal tables
+		// (online-DDL shadows like `_vt_vrp_*`, GC-renamed tables, …)
+		// during the COPY phase. vtgate streams them under the `/.*/`
+		// filter, but they are never logical user tables — caching their
+		// field metadata is the precursor to bufferCopyRow buffering
+		// their rows (the Bug-125 leak). Strip the keyspace prefix first.
+		if isVitessInternalTable(stripKeyspaceFromTable(fe.GetTableName(), fe.GetKeyspace())) {
+			return false, nil
+		}
 		key := fieldCacheKey(fe.GetShard(), fe.GetTableName())
 		s.fields[key] = fe.GetFields()
 		return false, nil
@@ -765,6 +774,22 @@ func (s *vstreamSnapshotStream) dispatchCopyEventLocked(ev *binlogdata.VEvent) (
 func (s *vstreamSnapshotStream) bufferCopyRow(ev *binlogdata.VEvent) error {
 	rev := ev.GetRowEvent()
 	if rev == nil {
+		return nil
+	}
+	// ADR-0073 (c): drop COPY rows for Vitess-internal tables BEFORE
+	// buffering. This is the exact Bug-125 choke point — the probe
+	// reproduced an in-flight online DDL's `_vt_vrp_*` shadow being
+	// buffered here, which then tripped the ADR-0071 scope-name-mismatch
+	// loud refusal (enqueueRowLocked's activeTable guard) and aborted the
+	// cold-start with zero rows. Skipping before buffering means the
+	// shadow never enters rowBuffer, never sets activeTable, and can
+	// never fire that refusal. Their FIELD events were already dropped
+	// (dispatchCopyEventLocked's FIELD branch), so an internal ROW would
+	// otherwise trip the "row event without preceding FIELD event" floor
+	// below; this skip precedes the field lookup so that floor stays
+	// reserved for genuine logical-table bugs. Strip the keyspace prefix
+	// first — the internal-table naming is on the table component.
+	if isVitessInternalTable(stripKeyspaceFromTable(rev.GetTableName(), rev.GetKeyspace())) {
 		return nil
 	}
 	key := fieldCacheKey(rev.GetShard(), rev.GetTableName())
@@ -948,6 +973,13 @@ func (s *vstreamSnapshotStream) dispatchCDCEvent(ctx context.Context, ev *binlog
 		if fe == nil {
 			return nil
 		}
+		// ADR-0073 (c): drop FIELD events for Vitess-internal tables in
+		// the post-COPY CDC phase too — a steady-state online DDL emits
+		// the shadow's FIELD/ROW events here, not just during COPY.
+		// Symmetric with vstreamCDCReader.dispatch's FIELD branch.
+		if isVitessInternalTable(stripKeyspaceFromTable(fe.GetTableName(), fe.GetKeyspace())) {
+			return nil
+		}
 		key := fieldCacheKey(fe.GetShard(), fe.GetTableName())
 		s.fields[key] = fe.GetFields()
 		return nil
@@ -992,6 +1024,12 @@ func (s *vstreamSnapshotStream) dispatchCDCEvent(ctx context.Context, ev *binlog
 func (s *vstreamSnapshotStream) dispatchCDCRow(ctx context.Context, ev *binlogdata.VEvent, out chan<- ir.Change) error {
 	rev := ev.GetRowEvent()
 	if rev == nil {
+		return nil
+	}
+	// ADR-0073 (c): drop ROW events for Vitess-internal tables before the
+	// FIELD lookup (their FIELD was already dropped above, so this also
+	// keeps the missing-FIELD floor reserved for logical-table bugs).
+	if isVitessInternalTable(stripKeyspaceFromTable(rev.GetTableName(), rev.GetKeyspace())) {
 		return nil
 	}
 	key := fieldCacheKey(rev.GetShard(), rev.GetTableName())
@@ -1050,6 +1088,13 @@ func (s *vstreamSnapshotStream) dispatchCDCDDL(ctx context.Context, ev *binlogda
 	stmt := ev.GetStatement()
 	if stmt == "" {
 		clear(s.fields)
+		return nil
+	}
+
+	// ADR-0073 (c) cutover survival: skip internal shadow-table DDLs so
+	// they don't invalidate the logical field cache. Symmetric with
+	// vstreamCDCReader.dispatchDDL; see isVitessInternalDDL.
+	if isVitessInternalDDL(stmt) {
 		return nil
 	}
 
