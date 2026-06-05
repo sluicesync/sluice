@@ -6,6 +6,22 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.99.4] - 2026-06-04
+
+A cold-start-hardening release: a CRITICAL silent-loss fix on the PlanetScale
+(VStream) cold-start path, plus auto-retry on transient mid-copy connection
+drops. Drop-in upgrade from v0.99.3 — no API or CLI changes.
+
+### Fixed
+
+- **CRITICAL: silent row loss on PlanetScale (VStream) cold-start of a table with no explicit PRIMARY KEY.** The COPY-phase dedup dropped any row whose key was at or below the running maximum, assuming Vitess emits the COPY scan in ascending order of the column it flags as the primary key. That assumption is false when Vitess orders the scan by a *cheaper* unique key than the flagged one (its column-type-cost heuristic prefers e.g. a `TINYINT`/`SMALLINT` unique over a `BIGINT` one): legitimate rows then arrive "out of order" and were silently discarded. A real migration of a ~19M-row table with a `UNIQUE` id but no declared `PRIMARY KEY` lost ~70% of its rows (13.5M of 19M) this way. The fragile order-dependent dedup is **removed**; the cold-start COPY writer is now **idempotent** (`INSERT … ON DUPLICATE KEY UPDATE` on a unique key present during copy), so Vitess's catch-up re-emissions are absorbed instead of dropped — independent of scan order. A truly keyless table (no `PRIMARY KEY` and no non-null `UNIQUE` index) is now **refused loudly** at cold-start rather than silently duplicating re-emitted rows. Pinned end-to-end against `vttestserver` across the key-shape family (explicit-PK / single-unique / cheaper-unique / catch-up-overlap / keyless), now gated in CI under `-race` (the new `Integration (vstream)` job). See [ADR-0072](docs/adr/adr-0072-resumable-coldstart-copy.md).
+
+- **PlanetScale (VStream) cold-start now auto-retries a transient connection drop instead of failing.** A mid-stream `Unavailable: connector reset by peer` — and other native gRPC transients (`Aborted` / `Unknown` / `ResourceExhausted`) — surfaces from the VStream stream as a gRPC *status* error, not a MySQL `1105` wrapper, so the retry classifier didn't recognize it and a large-table cold-start failed terminally on a network blip. The source-reader classifier now honors gRPC status codes directly, so the pipeline's retry policy reconnects and resumes. (A transient still re-copies the table from the start; *resumable* mid-copy continuation is designed in [ADR-0072](docs/adr/adr-0072-resumable-coldstart-copy.md) and tracked for a later release.)
+
+### Changed
+
+- **Cross-engine safety guard for no-PK VStream→Postgres copies.** With the source-side dedup removed, a table with no `PRIMARY KEY` copied from a VStream source to a **Postgres** target would have duplicated Vitess's catch-up re-emissions (Postgres's idempotent path plain-INSERTs no-PK tables). Such a migration is now **refused loudly** until the Postgres target gains the symmetric unique-key-upsert treatment. PK tables and MySQL targets are unaffected.
+
 ## [0.99.3] - 2026-06-04
 
 ### Fixed
