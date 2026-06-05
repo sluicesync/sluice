@@ -1613,6 +1613,35 @@ func applyMaxBufferBytes(target any, bytes int64) {
 	}
 }
 
+// applyCopyCheckpoint wires the resumable COPY-cursor checkpoint sink
+// (ADR-0072 Phase B) onto a snapshot row reader that opts into it via
+// [ir.CopyCheckpointer]. The sink upserts the in-progress snapshot
+// position to the control table — the same row the cold-start CDC
+// anchor and the apply path write, with the same idempotency contract —
+// so a fault mid-COPY resumes from the checkpoint rather than re-copying
+// the table from row 0.
+//
+// No-op unless BOTH sides are present: the reader implements
+// CopyCheckpointer (only the VStream cold-start reader does today) and
+// the applier implements [ir.PositionWriter] (every shipping engine
+// does). When either is absent the snapshot path keeps its pre-ADR-0072
+// behaviour (position persisted only at COPY_COMPLETED). The ctx passed
+// to the sink at call time is the COPY pump's own context, supplied per
+// checkpoint by the engine — there's no pipeline-side ctx to capture.
+func applyCopyCheckpoint(rows ir.RowReader, applier ir.ChangeApplier, streamID string) {
+	cp, ok := rows.(ir.CopyCheckpointer)
+	if !ok {
+		return
+	}
+	pw, ok := applier.(ir.PositionWriter)
+	if !ok {
+		return
+	}
+	cp.SetCopyCheckpoint(func(checkpointCtx context.Context, pos ir.Position) error {
+		return pw.WritePosition(checkpointCtx, streamID, pos)
+	})
+}
+
 // applyExecTimeout plumbs the streamer-side --apply-exec-timeout
 // value to an engine-side [ir.ChangeApplier] that opts into the
 // per-exec deadline via [ir.ApplyExecTimeoutSetter]. Engines that

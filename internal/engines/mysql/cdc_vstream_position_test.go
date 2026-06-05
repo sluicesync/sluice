@@ -4,12 +4,132 @@
 package mysql
 
 import (
+	"bytes"
 	"reflect"
 	"strings"
 	"testing"
 
+	"vitess.io/vitess/go/sqltypes"
+	"vitess.io/vitess/go/vt/proto/binlogdata"
+	querypb "vitess.io/vitess/go/vt/proto/query"
+
 	"sluicesync.dev/sluice/internal/ir"
 )
+
+// makeTableLastPK builds a binlogdata.TableLastPK whose Lastpk is a
+// query.QueryResult with one PK column (an INT64) at the given value —
+// the shape Vitess's rowstreamer emits as the COPY-resume cursor.
+func makeTableLastPK(t *testing.T, table, pkCol string, pkVal int64) *binlogdata.TableLastPK {
+	t.Helper()
+	row := []sqltypes.Value{sqltypes.NewInt64(pkVal)}
+	qr := sqltypes.ResultToProto3(&sqltypes.Result{
+		Fields: []*querypb.Field{{Name: pkCol, Type: querypb.Type_INT64}},
+		Rows:   [][]sqltypes.Value{row},
+	})
+	return &binlogdata.TableLastPK{TableName: table, Lastpk: qr}
+}
+
+// TestVStreamPos_TablePKsRoundTrip pins ADR-0072 Phase A: a position
+// carrying Vitess's per-shard TablePKs cursor encodes and decodes back
+// to the same proto bytes, so a resume request asks vtgate to continue
+// the COPY scan from the last-copied PK rather than restart from row 0.
+func TestVStreamPos_TablePKsRoundTrip(t *testing.T) {
+	src := &binlogdata.VGtid{ShardGtids: []*binlogdata.ShardGtid{
+		{
+			Keyspace: "main",
+			Shard:    "-",
+			Gtid:     "MySQL56/abcd:1-100",
+			TablePKs: []*binlogdata.TableLastPK{
+				makeTableLastPK(t, "users", "id", 4242),
+				makeTableLastPK(t, "orders", "order_id", 99),
+			},
+		},
+	}}
+
+	// Encode the proto VGtid → domain → ir.Position → domain → proto and
+	// assert the reconstructed proto TablePKs are byte-identical.
+	domain, err := vgtidToShardGtidSlice(src)
+	if err != nil {
+		t.Fatalf("vgtidToShardGtidSlice: %v", err)
+	}
+	pos, err := encodeVStreamPos(domain)
+	if err != nil {
+		t.Fatalf("encodeVStreamPos: %v", err)
+	}
+	decoded, ok, err := decodeVStreamPos(pos)
+	if err != nil || !ok {
+		t.Fatalf("decodeVStreamPos: ok=%v err=%v", ok, err)
+	}
+	roundTripped, err := toProtoShardGtids(decoded)
+	if err != nil {
+		t.Fatalf("toProtoShardGtids: %v", err)
+	}
+	if len(roundTripped) != 1 {
+		t.Fatalf("got %d shards; want 1", len(roundTripped))
+	}
+	got := roundTripped[0]
+	if got.Keyspace != "main" || got.Shard != "-" || got.Gtid != "MySQL56/abcd:1-100" {
+		t.Errorf("shard scalar fields lost: %+v", got)
+	}
+	if len(got.TablePKs) != 2 {
+		t.Fatalf("got %d TablePKs; want 2", len(got.TablePKs))
+	}
+	for i, want := range src.ShardGtids[0].TablePKs {
+		wb, _ := want.MarshalVT()
+		gb, _ := got.TablePKs[i].MarshalVT()
+		if !bytes.Equal(wb, gb) {
+			t.Errorf("TablePKs[%d] (%s) not byte-identical after round-trip", i, want.GetTableName())
+		}
+	}
+}
+
+// TestVStreamPos_OldTokenDecodesWithoutTablePKs is the backward-compat
+// pin (ADR-0072 Phase A): a token written before this field existed has
+// no `table_p_ks` key, so it must decode cleanly to a nil TablePKs —
+// "no mid-COPY cursor", i.e. start the COPY from the beginning (today's
+// behaviour). toProtoShardGtids on that position must emit a nil
+// TablePKs (vtgate then starts COPY at row 0).
+func TestVStreamPos_OldTokenDecodesWithoutTablePKs(t *testing.T) {
+	// A pre-ADR-0072 token: exactly the shape the old encoder produced,
+	// no table_p_ks key.
+	old := ir.Position{
+		Engine: engineNameVStream,
+		Token:  `[{"keyspace":"main","shard":"-","gtid":"MySQL56/abcd:1-100"}]`,
+	}
+	decoded, ok, err := decodeVStreamPos(old)
+	if err != nil || !ok {
+		t.Fatalf("decodeVStreamPos(old token): ok=%v err=%v", ok, err)
+	}
+	if len(decoded) != 1 {
+		t.Fatalf("got %d shards; want 1", len(decoded))
+	}
+	if decoded[0].TablePKs != nil {
+		t.Errorf("old token decoded to non-nil TablePKs: %+v", decoded[0].TablePKs)
+	}
+	proto, err := toProtoShardGtids(decoded)
+	if err != nil {
+		t.Fatalf("toProtoShardGtids: %v", err)
+	}
+	if proto[0].TablePKs != nil {
+		t.Errorf("old token produced non-nil proto TablePKs (would resume a COPY that should start fresh): %+v", proto[0].TablePKs)
+	}
+}
+
+// TestVStreamPos_NoTablePKsOmitsKey confirms a position with no
+// in-flight COPY serialises WITHOUT the table_p_ks key — the encoded
+// token stays byte-identical to a pre-ADR-0072 token, so the format
+// change is invisible on the CDC-tailing path (only mid-COPY positions
+// gain the field).
+func TestVStreamPos_NoTablePKsOmitsKey(t *testing.T) {
+	in := []shardGtid{{Keyspace: "main", Shard: "-", Gtid: "MySQL56/abcd:1-100"}}
+	pos, err := encodeVStreamPos(in)
+	if err != nil {
+		t.Fatalf("encodeVStreamPos: %v", err)
+	}
+	if strings.Contains(pos.Token, "table_p_ks") {
+		t.Errorf("token unexpectedly carries table_p_ks for a no-cursor position: %s", pos.Token)
+	}
+}
 
 func TestEncodeDecodeVStreamPos(t *testing.T) {
 	cases := []struct {

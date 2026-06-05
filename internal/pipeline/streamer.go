@@ -2448,6 +2448,18 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 	// default the engine seeds at open.
 	applyMaxBufferBytes(stream.Rows, s.MaxBufferBytes)
 
+	// Wire the resumable COPY-cursor checkpoint sink (ADR-0072 Phase B).
+	// Engines whose snapshot reader carries a mid-COPY resume cursor (the
+	// VStream cold-start reader, whose position round-trips Vitess's
+	// per-shard TablePKs) persist that cursor to the control table on a
+	// bounded cadence, so a fault mid-COPY resumes from the checkpoint
+	// instead of re-copying the table from row 0. Engines without the
+	// cursor (PG, vanilla MySQL) don't implement CopyCheckpointer and the
+	// sink is simply not wired. Requires a PositionWriter applier (every
+	// shipping engine implements it); without one we skip the wiring (the
+	// checkpoint would have nowhere durable to land).
+	applyCopyCheckpoint(stream.Rows, applier, streamID)
+
 	sw, err := s.Target.OpenSchemaWriter(ctx, s.TargetDSN)
 	if err != nil {
 		_ = stream.Close()

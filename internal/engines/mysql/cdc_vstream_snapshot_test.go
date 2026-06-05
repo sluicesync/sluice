@@ -579,3 +579,105 @@ func TestSameVgtid(t *testing.T) {
 		t.Error("nil slices reported not equal")
 	}
 }
+
+// TestSameVgtid_IgnoresTablePKs confirms the equality helper compares
+// only (keyspace, shard, gtid) and not the transient TablePKs cursor —
+// two positions with the same GTID but different in-flight COPY cursors
+// are "the same" for the snapshot-anchor mismatch guard (and shardGtid
+// is no longer comparable with == now that it carries a slice).
+func TestSameVgtid_IgnoresTablePKs(t *testing.T) {
+	a := []shardGtid{{Keyspace: "main", Shard: "-", Gtid: "g1", TablePKs: []encodedTablePK{{TableName: "users", Lastpk: "AAAA"}}}}
+	b := []shardGtid{{Keyspace: "main", Shard: "-", Gtid: "g1"}}
+	if !sameVgtid(a, b) {
+		t.Error("positions with same GTID but differing TablePKs reported not equal; TablePKs must not affect identity")
+	}
+}
+
+// TestVStreamSnapshot_CheckpointCadence pins ADR-0072 Phase B: the COPY
+// pump persists the resume cursor on the bounded N-rows cadence, the
+// persisted position carries the per-shard TablePKs, and the row counter
+// resets after each checkpoint.
+func TestVStreamSnapshot_CheckpointCadence(t *testing.T) {
+	s := newTestSnapshotStream()
+	s.checkpointRows = 3
+	s.checkpointInterval = time.Hour // disable the time half for determinism
+
+	var got []ir.Position
+	s.checkpointFn = func(_ context.Context, pos ir.Position) error {
+		got = append(got, pos)
+		return nil
+	}
+
+	// Seed a cursor (the VGTID the pump would have captured), including a
+	// TablePKs entry so we can prove the checkpoint carries it.
+	s.currentVgtid = []shardGtid{{
+		Keyspace: "main", Shard: "-", Gtid: "MySQL56/abc:1-50",
+		TablePKs: []encodedTablePK{{TableName: "users", Lastpk: "QkFTRTY0"}},
+	}}
+
+	last := time.Now()
+
+	// Below the row threshold: no checkpoint.
+	s.rowsSinceCheckpoint = 2
+	last = s.maybeCheckpoint(context.Background(), last)
+	if len(got) != 0 {
+		t.Fatalf("checkpoint fired below threshold: %d writes", len(got))
+	}
+	if s.rowsSinceCheckpoint != 2 {
+		t.Errorf("rowsSinceCheckpoint mutated below threshold: %d", s.rowsSinceCheckpoint)
+	}
+
+	// At the threshold: one checkpoint, counter resets, position carries
+	// the TablePKs cursor.
+	s.rowsSinceCheckpoint = 3
+	_ = s.maybeCheckpoint(context.Background(), last)
+	if len(got) != 1 {
+		t.Fatalf("expected exactly one checkpoint at threshold; got %d", len(got))
+	}
+	if s.rowsSinceCheckpoint != 0 {
+		t.Errorf("rowsSinceCheckpoint not reset after checkpoint: %d", s.rowsSinceCheckpoint)
+	}
+	decoded, ok, err := decodeVStreamPos(got[0])
+	if err != nil || !ok {
+		t.Fatalf("checkpointed position did not decode: ok=%v err=%v", ok, err)
+	}
+	if len(decoded) != 1 || len(decoded[0].TablePKs) != 1 || decoded[0].TablePKs[0].TableName != "users" {
+		t.Errorf("checkpointed position lost the TablePKs cursor: %+v", decoded)
+	}
+}
+
+// TestVStreamSnapshot_CheckpointNilFnNoOp confirms a stream with no
+// wired checkpoint sink (the non-cold-start / pre-ADR-0072 path) never
+// checkpoints — position is then persisted only at COPY_COMPLETED.
+func TestVStreamSnapshot_CheckpointNilFnNoOp(t *testing.T) {
+	s := newTestSnapshotStream()
+	s.checkpointRows = 1
+	s.currentVgtid = []shardGtid{{Keyspace: "main", Shard: "-", Gtid: "g"}}
+	s.rowsSinceCheckpoint = 100
+	// checkpointFn is nil.
+	if got := s.maybeCheckpoint(context.Background(), time.Now()); got.IsZero() {
+		t.Error("maybeCheckpoint returned a zero time for a nil-fn no-op; expected the lastCheckpoint passthrough")
+	}
+	if s.rowsSinceCheckpoint != 100 {
+		t.Errorf("nil-fn checkpoint mutated the row counter: %d", s.rowsSinceCheckpoint)
+	}
+}
+
+// TestVStreamSnapshot_CheckpointWriteFailureNonFatal confirms a failing
+// checkpoint sink does NOT abort the copy — the cursor is re-attempted
+// next cadence tick and COPY_COMPLETED persists the final position
+// regardless. maybeCheckpoint swallows the write error (logs + continues)
+// and never calls failCopy for it.
+func TestVStreamSnapshot_CheckpointWriteFailureNonFatal(t *testing.T) {
+	s := newTestSnapshotStream()
+	s.checkpointRows = 1
+	s.checkpointFn = func(_ context.Context, _ ir.Position) error {
+		return errors.New("control table write failed")
+	}
+	s.currentVgtid = []shardGtid{{Keyspace: "main", Shard: "-", Gtid: "g"}}
+	s.rowsSinceCheckpoint = 1
+	_ = s.maybeCheckpoint(context.Background(), time.Now())
+	if err := s.Err(); err != nil {
+		t.Errorf("a failed checkpoint write set a terminal copy error (should be non-fatal): %v", err)
+	}
+}

@@ -213,6 +213,37 @@ type MaxBufferBytesSetter interface {
 	SetMaxBufferBytes(bytes int64)
 }
 
+// CopyCheckpointFunc persists a snapshot-COPY resume position to the
+// durable control table. The pipeline supplies an implementation that
+// upserts the position row for the current stream (the same row the
+// cold-start CDC anchor and the apply path write), so a fault mid-COPY
+// resumes from the checkpoint rather than restarting the whole table.
+// It is called from the engine's COPY-pump goroutine, so the
+// implementation must be safe to call concurrently with the apply path
+// (in practice the apply path isn't running yet during cold-start
+// bulk-copy, but the position-row write must still be self-contained).
+type CopyCheckpointFunc func(ctx context.Context, pos Position) error
+
+// CopyCheckpointer is the optional surface a snapshot [RowReader] can
+// implement to accept a periodic COPY-cursor checkpoint sink
+// (ADR-0072 Phase B). The pipeline threads a [CopyCheckpointFunc] that
+// persists the in-progress snapshot position to the control table on a
+// bounded cadence (every N rows or T seconds, whichever first). Engines
+// whose snapshot reader carries a resumable COPY cursor — today only the
+// VStream cold-start reader, whose position round-trips Vitess's
+// per-shard TablePKs — implement this; engines without a mid-COPY resume
+// cursor (vanilla MySQL, Postgres) don't, and the checkpoint is simply
+// not wired (their cold-start re-copies from the snapshot anchor on
+// retry, unchanged).
+//
+// The sink must be set BEFORE bulk-copy drains the snapshot; the
+// pipeline calls it on the cold-start path right after opening the
+// stream. A nil func disables checkpointing (the pre-ADR-0072 behaviour:
+// position persisted only at COPY_COMPLETED).
+type CopyCheckpointer interface {
+	SetCopyCheckpoint(fn CopyCheckpointFunc)
+}
+
 // ApplyExecTimeoutSetter is the optional surface a [ChangeApplier]
 // can implement to accept a per-statement deadline for every
 // tx.ExecContext on the apply path. The pipeline orchestrator

@@ -7,7 +7,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
+	"time"
 
 	"google.golang.org/grpc"
 	"vitess.io/vitess/go/vt/proto/binlogdata"
@@ -100,10 +102,19 @@ func (e Engine) openVStreamSnapshotStream(ctx context.Context, dsn string) (*ir.
 	// CDC reader streams from REPLICA to keep load off the primary,
 	// but the snapshot is a one-shot operation where catalog
 	// freshness matters more than read isolation.
+	// fromBeginningVStreamPos carries no TablePKs (empty-Gtid sentinel,
+	// no mid-COPY cursor), so toProtoShardGtids can't fail here — but it
+	// returns an error in the general case (Phase A), so we handle it.
+	protoShardGtids, err := toProtoShardGtids(fromBeginningVStreamPos(keyspace, shards))
+	if err != nil {
+		streamCancel()
+		_ = conn.Close()
+		return nil, fmt.Errorf("mysql/vstream: snapshot: build start position: %w", err)
+	}
 	req := &vtgate.VStreamRequest{
 		TabletType: topodata.TabletType_PRIMARY,
 		Vgtid: &binlogdata.VGtid{
-			ShardGtids: toProtoShardGtids(fromBeginningVStreamPos(keyspace, shards)),
+			ShardGtids: protoShardGtids,
 		},
 		Filter: &binlogdata.Filter{Rules: []*binlogdata.Rule{{Match: "/.*/"}}},
 		Flags: &vtgate.VStreamFlags{
@@ -121,14 +132,21 @@ func (e Engine) openVStreamSnapshotStream(ctx context.Context, dsn string) (*ir.
 	}
 
 	snap := &vstreamSnapshotStream{
-		keyspace:            keyspace,
-		fields:              make(map[string][]*query.Field),
-		rowBuffer:           make(map[string][]ir.Row),
-		copyCompletedShards: make(map[string]bool),
-		maxBufferBytes:      defaultSnapshotMaxBufferBytes,
-		conn:                conn,
-		grpcStream:          grpcStream,
-		grpcCancel:          streamCancel,
+		keyspace:             keyspace,
+		client:               client,
+		shards:               shards,
+		reconnectMax:         defaultCopyReconnectMax,
+		reconnectBackoffBase: defaultCopyReconnectBackoffBase,
+		reconnectBackoffCap:  defaultCopyReconnectBackoffCap,
+		fields:               make(map[string][]*query.Field),
+		rowBuffer:            make(map[string][]ir.Row),
+		copyCompletedShards:  make(map[string]bool),
+		maxBufferBytes:       defaultSnapshotMaxBufferBytes,
+		checkpointRows:       defaultCopyCheckpointRows,
+		checkpointInterval:   defaultCopyCheckpointInterval,
+		conn:                 conn,
+		grpcStream:           grpcStream,
+		grpcCancel:           streamCancel,
 	}
 	snap.cond = sync.NewCond(&snap.mu)
 
@@ -198,6 +216,27 @@ func (e Engine) openVStreamSnapshotStream(ctx context.Context, dsn string) (*ir.
 // ReadRows channel-close happens-before edge.
 type vstreamSnapshotStream struct {
 	keyspace string
+
+	// client is the typed Vitess gRPC client. Held so the COPY pump can
+	// re-open the VStream IN PLACE on a retriable Recv error (ADR-0072
+	// Phase C) — reusing the same underlying conn but replacing the
+	// stream — without unwinding the whole cold-start to runWithRetry.
+	client vtgateservice.VitessClient
+
+	// shards is the shard layout the snapshot streams. Captured at open
+	// so an in-place reconnect (Phase C) can rebuild the request; the
+	// resume request's per-shard Gtid + TablePKs come from currentVgtid,
+	// but the shard list itself is the constructor's resolved layout.
+	shards []string
+
+	// reconnectMax is the in-place COPY-reconnect budget (Phase C):
+	// consecutive retriable Recv failures the pump absorbs before giving
+	// up and failing the COPY (the outer runWithRetry then becomes the
+	// backstop). reconnectBackoffBase/Cap bound the exponential backoff
+	// between attempts. Seeded with safe defaults by the constructor.
+	reconnectMax         int
+	reconnectBackoffBase time.Duration
+	reconnectBackoffCap  time.Duration
 
 	// fields caches column metadata keyed by [fieldCacheKey]. Shared
 	// between COPY-phase row decoding and post-COPY change decoding —
@@ -285,6 +324,32 @@ type vstreamSnapshotStream struct {
 	// stream's Recv). Guarded by mu.
 	pumpStarted bool
 
+	// checkpointFn is the durable COPY-cursor sink (ADR-0072 Phase B).
+	// nil until the pipeline wires it via [vstreamSnapshotRows.
+	// SetCopyCheckpoint] (before bulk-copy drains the stream). When set,
+	// the COPY pump persists currentVgtid (including its TablePKs resume
+	// cursor) to the control table on a bounded cadence so a post-fault
+	// resume reads the checkpoint instead of restarting from row 0.
+	// Read by the pump goroutine under mu; the actual DB write happens
+	// OUTSIDE mu (the pump is the sole writer of currentVgtid during
+	// COPY, so it snapshots the position under mu then writes unlocked).
+	checkpointFn ir.CopyCheckpointFunc
+
+	// checkpointRows / checkpointInterval are the bounded cadence: the
+	// pump checkpoints after either checkpointRows COPY rows have been
+	// buffered since the last checkpoint OR checkpointInterval has
+	// elapsed, whichever comes first. Seeded with safe defaults by the
+	// constructor.
+	checkpointRows     int
+	checkpointInterval time.Duration
+
+	// rowsSinceCheckpoint counts COPY rows buffered since the last
+	// successful checkpoint (the N-rows half of the cadence). Mutated by
+	// the pump under mu. lastCheckpoint is the wall-clock time of the
+	// last checkpoint (the T-seconds half); the pump owns it (no lock
+	// needed — single goroutine), seeded at copyPump start.
+	rowsSinceCheckpoint int
+
 	mu  sync.Mutex
 	err error
 }
@@ -308,6 +373,33 @@ func (s *vstreamSnapshotStream) broadcast() {
 // and [vstreamSnapshotRows.SetMaxBufferBytes] overrides it.
 const defaultSnapshotMaxBufferBytes int64 = 64 << 20
 
+// defaultCopyCheckpointRows / defaultCopyCheckpointInterval are the
+// bounded cadence (ADR-0072 Phase B) at which the COPY pump persists the
+// resume cursor: whichever of "this many rows buffered" or "this much
+// wall-clock elapsed" comes first. The row count bounds write
+// amplification (one control-table upsert per 50k rows rather than per
+// row — the rejected "persist every row" alternative); the interval
+// bounds data-loss-on-fault for slow/idle copies to one interval. Both
+// are conservative defaults; the cursor itself is correct at any
+// cadence, these only trade resume-granularity against write traffic.
+const (
+	defaultCopyCheckpointRows     = 50_000
+	defaultCopyCheckpointInterval = 10 * time.Second
+)
+
+// defaultCopyReconnect* tune the in-place COPY-reconnect (ADR-0072
+// Phase C): on a retriable Recv error the COPY pump re-opens the VStream
+// from the last-observed cursor up to defaultCopyReconnectMax times,
+// with exponential backoff bounded by base/cap, before surfacing the
+// error to the outer runWithRetry backstop. The budget is generous
+// because each in-place reconnect is cheap (no pipeline teardown) and
+// the reported failure mode is sustained link flakiness on a large copy.
+const (
+	defaultCopyReconnectMax         = 10
+	defaultCopyReconnectBackoffBase = 200 * time.Millisecond
+	defaultCopyReconnectBackoffCap  = 10 * time.Second
+)
+
 // copyPump is the background COPY-phase goroutine (ADR-0071). It Recv's
 // the gRPC stream and dispatches each VEvent until the global
 // COPY_COMPLETED arrives (or ctx cancels / Recv errors), then closes
@@ -320,6 +412,18 @@ const defaultSnapshotMaxBufferBytes int64 = 64 << 20
 // its channel.
 func (s *vstreamSnapshotStream) copyPump(ctx context.Context, stream *ir.SnapshotStream) {
 	defer close(s.copyDone)
+
+	// lastCheckpoint is the wall-clock anchor for the T-seconds half of
+	// the cadence. Owned by this goroutine (the sole checkpoint caller),
+	// so it needs no lock.
+	lastCheckpoint := time.Now()
+
+	// reconnectAttempts counts consecutive in-place reconnects (Phase C)
+	// since the last successful Recv. Reset to 0 on any successful Recv so
+	// a copy that survives one blip gets the full budget again for the
+	// next; exhausting it surfaces the error to the outer runWithRetry
+	// backstop. Owned by this goroutine.
+	reconnectAttempts := 0
 
 	for {
 		select {
@@ -334,9 +438,27 @@ func (s *vstreamSnapshotStream) copyPump(ctx context.Context, stream *ir.Snapsho
 				s.failCopy(err)
 				return
 			}
-			s.failCopy(classifyReaderError(fmt.Errorf("mysql/vstream: snapshot: copy recv: %w", err)))
+			classified := classifyReaderError(fmt.Errorf("mysql/vstream: snapshot: copy recv: %w", err))
+			// Phase C: a retriable mid-COPY Recv error reconnects the
+			// VStream IN PLACE from the last-observed cursor (currentVgtid,
+			// carrying TablePKs) rather than failing the whole cold-start.
+			// In-place reconnect keeps the bulk-copy goroutines warm and
+			// skips schema-apply / pre-flight; runWithRetry stays the outer
+			// backstop for budget exhaustion or non-retriable shapes.
+			var re ir.RetriableError
+			if errors.As(classified, &re) && reconnectAttempts < s.reconnectMax {
+				reconnectAttempts++
+				if rerr := s.reconnectCopy(ctx, reconnectAttempts); rerr != nil {
+					s.failCopy(rerr)
+					return
+				}
+				// Fresh stream installed; loop and Recv from it.
+				continue
+			}
+			s.failCopy(classified)
 			return
 		}
+		reconnectAttempts = 0
 		for _, ev := range resp.GetEvents() {
 			done, err := s.dispatchCopyEvent(ev)
 			if err != nil {
@@ -348,7 +470,146 @@ func (s *vstreamSnapshotStream) copyPump(ctx context.Context, stream *ir.Snapsho
 				return
 			}
 		}
+		// Bounded-cadence COPY checkpoint (ADR-0072 Phase B), between
+		// Recv batches so the DB write never holds the dispatch lock. A
+		// checkpoint failure is non-fatal: the COPY itself is fine, and
+		// the final position is still persisted at COPY_COMPLETED — we
+		// just lose this intermediate resume point. Log-and-continue
+		// rather than failCopy so a flaky control-table write can't abort
+		// an otherwise-healthy snapshot.
+		lastCheckpoint = s.maybeCheckpoint(ctx, lastCheckpoint)
 	}
+}
+
+// reconnectCopy re-opens the VStream IN PLACE after a retriable mid-COPY
+// Recv error (ADR-0072 Phase C), resuming from the last-observed cursor
+// (currentVgtid, carrying TablePKs) so vtgate continues the COPY scan
+// from the last-copied PK rather than restarting from row 0. The
+// underlying gRPC conn is reused; only the stream is replaced.
+//
+// The resume request carries each shard's Gtid AND TablePKs as observed
+// so far. When no VGTID has been seen yet (a fault before the first
+// LASTPK), currentVgtid is empty and we fall back to the from-beginning
+// sentinel — i.e. restart the COPY, which is the only correct option
+// when there's no cursor to resume from.
+//
+// Backoff is exponential, bounded by reconnectBackoffBase/Cap, and
+// interruptible by ctx (CloseFn cancels the stream ctx; a parked
+// reconnect must unwedge). attempt is 1-based for the backoff scaling
+// and the log line.
+//
+// The new stream is installed on s.grpcStream under mu — the field is
+// read by this same pump goroutine (the only Recv caller during COPY),
+// but ReadRows/close may observe it, so the write is guarded.
+func (s *vstreamSnapshotStream) reconnectCopy(ctx context.Context, attempt int) error {
+	// Backoff before re-dialing. Exponential on the attempt count,
+	// capped. Interruptible so close() during a flaky window doesn't hang.
+	backoff := s.reconnectBackoffBase << (attempt - 1)
+	if backoff <= 0 || backoff > s.reconnectBackoffCap {
+		backoff = s.reconnectBackoffCap
+	}
+	select {
+	case <-time.After(backoff):
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
+	// Snapshot the resume cursor under mu (the pump is the sole writer of
+	// currentVgtid, but reading it under the same lock keeps the contract
+	// uniform).
+	s.mu.Lock()
+	resume := make([]shardGtid, len(s.currentVgtid))
+	copy(resume, s.currentVgtid)
+	s.mu.Unlock()
+
+	if len(resume) == 0 {
+		// No cursor observed yet — the only correct resume is a full
+		// restart from the beginning of the configured shard layout.
+		resume = fromBeginningVStreamPos(s.keyspace, s.shards)
+	}
+
+	protoShardGtids, err := toProtoShardGtids(resume)
+	if err != nil {
+		return fmt.Errorf("mysql/vstream: snapshot: copy reconnect: build resume position: %w", err)
+	}
+	req := &vtgate.VStreamRequest{
+		TabletType: topodata.TabletType_PRIMARY,
+		Vgtid:      &binlogdata.VGtid{ShardGtids: protoShardGtids},
+		Filter:     &binlogdata.Filter{Rules: []*binlogdata.Rule{{Match: "/.*/"}}},
+		Flags: &vtgate.VStreamFlags{
+			MinimizeSkew:      true,
+			StopOnReshard:     true,
+			HeartbeatInterval: 5,
+		},
+	}
+
+	slog.WarnContext(ctx, "mysql/vstream: snapshot: COPY stream dropped; reconnecting in place from cursor",
+		slog.Int("attempt", attempt),
+		slog.Int("max_attempts", s.reconnectMax),
+		slog.Duration("backoff", backoff))
+
+	grpcStream, err := s.client.VStream(ctx, req)
+	if err != nil {
+		return fmt.Errorf("mysql/vstream: snapshot: copy reconnect: open stream: %w", err)
+	}
+	s.mu.Lock()
+	s.grpcStream = grpcStream
+	s.mu.Unlock()
+	return nil
+}
+
+// maybeCheckpoint persists the current COPY cursor to the durable
+// control table when the bounded cadence (N rows OR T seconds) is due.
+// Returns the (possibly updated) lastCheckpoint anchor. The pump is the
+// sole caller and the sole writer of currentVgtid during COPY, so it
+// snapshots the position under mu, then releases the lock BEFORE the DB
+// write — the write must not block ReadRows consumers or the cond-wait
+// backpressure path. A nil checkpointFn (pipeline never wired a sink, or
+// a non-cold-start path) is a no-op.
+func (s *vstreamSnapshotStream) maybeCheckpoint(ctx context.Context, lastCheckpoint time.Time) time.Time {
+	s.mu.Lock()
+	fn := s.checkpointFn
+	if fn == nil {
+		s.mu.Unlock()
+		return lastCheckpoint
+	}
+	rowsDue := s.checkpointRows > 0 && s.rowsSinceCheckpoint >= s.checkpointRows
+	timeDue := s.checkpointInterval > 0 && time.Since(lastCheckpoint) >= s.checkpointInterval &&
+		s.rowsSinceCheckpoint > 0
+	if !rowsDue && !timeDue {
+		s.mu.Unlock()
+		return lastCheckpoint
+	}
+	// Snapshot the position under the lock; encode while holding it is
+	// cheap and keeps the read consistent with the pump's own writes.
+	if len(s.currentVgtid) == 0 {
+		// No VGTID observed yet (no cursor to persist); reset the row
+		// counter so we don't spin re-evaluating the same empty state.
+		s.rowsSinceCheckpoint = 0
+		s.mu.Unlock()
+		return time.Now()
+	}
+	pos, err := encodeVStreamPos(s.currentVgtid)
+	if err != nil {
+		// A position that won't encode is the same terminal condition
+		// finishCopy guards against; surface it loudly rather than
+		// silently skipping every checkpoint.
+		s.rowsSinceCheckpoint = 0
+		s.mu.Unlock()
+		s.failCopy(fmt.Errorf("mysql/vstream: snapshot: checkpoint: encode position: %w", err))
+		return time.Now()
+	}
+	s.rowsSinceCheckpoint = 0
+	s.mu.Unlock()
+
+	if err := fn(ctx, pos); err != nil {
+		// Non-fatal: log and keep copying. The cursor is re-attempted on
+		// the next cadence tick, and COPY_COMPLETED persists the final
+		// position regardless.
+		slog.WarnContext(ctx, "mysql/vstream: snapshot: COPY checkpoint write failed; continuing",
+			slog.String("error", err.Error()))
+	}
+	return time.Now()
 }
 
 // finishCopy records the final snapshot position onto the stream and
@@ -434,7 +695,15 @@ func (s *vstreamSnapshotStream) dispatchCopyEventLocked(ev *binlogdata.VEvent) (
 		if vg == nil {
 			return false, nil
 		}
-		s.currentVgtid = vgtidToShardGtidSlice(vg)
+		// During COPY, each VGTID after a LASTPK event carries the
+		// per-shard TablePKs cursor (ADR-0072 Phase A) — capturing it
+		// here is what lets a post-fault resume continue the COPY scan
+		// from the last-copied PK rather than restarting from row 0.
+		next, err := vgtidToShardGtidSlice(vg)
+		if err != nil {
+			return false, err
+		}
+		s.currentVgtid = next
 		return false, nil
 
 	case binlogdata.VEventType_COPY_COMPLETED:
@@ -585,6 +854,10 @@ func (s *vstreamSnapshotStream) enqueueRowLocked(tableName string, row ir.Row) e
 
 	s.rowBuffer[tableName] = append(s.rowBuffer[tableName], row)
 	s.bufferedBytes += rowBytes
+	// Count this row toward the N-rows half of the checkpoint cadence
+	// (ADR-0072 Phase B). The pump reads + resets this under mu in
+	// maybeCheckpoint between Recv iterations.
+	s.rowsSinceCheckpoint++
 	s.broadcast()
 	return nil
 }
@@ -687,7 +960,11 @@ func (s *vstreamSnapshotStream) dispatchCDCEvent(ctx context.Context, ev *binlog
 		if vg == nil {
 			return nil
 		}
-		s.currentVgtid = vgtidToShardGtidSlice(vg)
+		next, err := vgtidToShardGtidSlice(vg)
+		if err != nil {
+			return err
+		}
+		s.currentVgtid = next
 		return nil
 
 	case binlogdata.VEventType_DDL:
@@ -892,6 +1169,21 @@ func (r *vstreamSnapshotRows) SetMaxBufferBytes(bytes int64) {
 	}
 }
 
+// SetCopyCheckpoint implements [ir.CopyCheckpointer] (ADR-0072 Phase B).
+// The pipeline wires the durable position sink here on the cold-start
+// path, BEFORE bulk-copy drains the stream, so the COPY pump persists
+// the resume cursor (currentVgtid, including its TablePKs) to the
+// control table on the bounded cadence. A nil fn disables checkpointing
+// (the pre-ADR-0072 behaviour: position persisted only at
+// COPY_COMPLETED). Guarded by mu so the late wire races cleanly with the
+// already-running pump.
+func (r *vstreamSnapshotRows) SetCopyCheckpoint(fn ir.CopyCheckpointFunc) {
+	s := r.snap
+	s.mu.Lock()
+	s.checkpointFn = fn
+	s.mu.Unlock()
+}
+
 // Err implements [ir.RowReader]. Rows stream off the per-table queue
 // the COPY pump fills; a pump that died mid-COPY records its terminal
 // error on the backing snapshot stream. Delegating keeps the loud-
@@ -1057,15 +1349,22 @@ func shardScopeKey(keyspace, shard string) string {
 }
 
 // sameVgtid is a strict equality check: same shards in the same
-// order with the same Gtids. Used only to catch the case where the
-// orchestrator passes a position that doesn't correspond to the
-// captured snapshot.
+// order with the same (keyspace, shard, gtid). Used only to catch the
+// case where the orchestrator passes a position that doesn't correspond
+// to the captured snapshot.
+//
+// The per-shard TablePKs cursor (ADR-0072 Phase A) is intentionally NOT
+// compared: it is the transient COPY-resume cursor, empty once COPY
+// completes, and the captured snapshot position this guard checks is the
+// COPY_COMPLETED anchor (TablePKs already drained). Comparing it would
+// also require deep-equality — shardGtid now holds a slice and is no
+// longer comparable with ==. The GTID is the load-bearing identity here.
 func sameVgtid(a, b []shardGtid) bool {
 	if len(a) != len(b) {
 		return false
 	}
 	for i := range a {
-		if a[i] != b[i] {
+		if a[i].Keyspace != b[i].Keyspace || a[i].Shard != b[i].Shard || a[i].Gtid != b[i].Gtid {
 			return false
 		}
 	}
@@ -1075,14 +1374,27 @@ func sameVgtid(a, b []shardGtid) bool {
 // toProtoShardGtids converts our domain type to the proto type.
 // Inverse of [vgtidToShardGtidSlice]; lives here so only one file
 // imports binlogdata for request-construction.
-func toProtoShardGtids(in []shardGtid) []*binlogdata.ShardGtid {
+//
+// TablePKs (the COPY-resume cursor, ADR-0072 Phase A) are decoded back
+// into the proto so a resume request asks vtgate to continue the COPY
+// scan from the last-copied PK rather than restarting from row 0. The
+// decode can fail only on a corrupt persisted token (bad base64 or a
+// TableLastPK that won't unmarshal), surfaced as an error so a wedged
+// position fails loudly at stream-open rather than silently restarting
+// the whole table copy.
+func toProtoShardGtids(in []shardGtid) ([]*binlogdata.ShardGtid, error) {
 	out := make([]*binlogdata.ShardGtid, len(in))
 	for i, s := range in {
+		pks, err := decodeTablePKs(s.TablePKs)
+		if err != nil {
+			return nil, err
+		}
 		out[i] = &binlogdata.ShardGtid{
 			Keyspace: s.Keyspace,
 			Shard:    s.Shard,
 			Gtid:     s.Gtid,
+			TablePKs: pks,
 		}
 	}
-	return out
+	return out, nil
 }

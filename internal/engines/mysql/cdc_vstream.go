@@ -501,7 +501,10 @@ func (r *vstreamCDCReader) StreamChanges(ctx context.Context, from ir.Position) 
 	}
 	r.currentVgtid = startPos
 
-	req := r.buildVStreamRequest(startPos)
+	req, err := r.buildVStreamRequest(startPos)
+	if err != nil {
+		return nil, err
+	}
 	loopCtx, cancel := context.WithCancel(ctx)
 	r.streamerCancel = cancel
 
@@ -537,14 +540,10 @@ func (r *vstreamCDCReader) resolveStartPosition(from ir.Position) ([]shardGtid, 
 // StopOnReshard so the reader sees a clean termination instead of
 // a silently-rewritten shard layout, and a 5s heartbeat for
 // liveness.
-func (r *vstreamCDCReader) buildVStreamRequest(start []shardGtid) *vtgate.VStreamRequest {
-	shardGtids := make([]*binlogdata.ShardGtid, len(start))
-	for i, s := range start {
-		shardGtids[i] = &binlogdata.ShardGtid{
-			Keyspace: s.Keyspace,
-			Shard:    s.Shard,
-			Gtid:     s.Gtid,
-		}
+func (r *vstreamCDCReader) buildVStreamRequest(start []shardGtid) (*vtgate.VStreamRequest, error) {
+	shardGtids, err := toProtoShardGtids(start)
+	if err != nil {
+		return nil, err
 	}
 	return &vtgate.VStreamRequest{
 		TabletType: topodata.TabletType_REPLICA,
@@ -560,7 +559,7 @@ func (r *vstreamCDCReader) buildVStreamRequest(start []shardGtid) *vtgate.VStrea
 			StopOnReshard:     true,
 			HeartbeatInterval: 5,
 		},
-	}
+	}, nil
 }
 
 // pump owns out and closes it before returning. Errors from the
@@ -611,7 +610,11 @@ func (r *vstreamCDCReader) dispatch(ctx context.Context, ev *binlogdata.VEvent, 
 		if vg == nil {
 			return nil
 		}
-		r.currentVgtid = vgtidToShardGtidSlice(vg)
+		next, err := vgtidToShardGtidSlice(vg)
+		if err != nil {
+			return err
+		}
+		r.currentVgtid = next
 		return nil
 
 	case binlogdata.VEventType_DDL:
@@ -895,16 +898,27 @@ func (r *vstreamCDCReader) positionFor() (ir.Position, error) {
 // type. The conversion is field-by-field; keeping the two types
 // separate prevents the proto from leaking into the position
 // encoding format that's persisted to the control table.
-func vgtidToShardGtidSlice(vg *binlogdata.VGtid) []shardGtid {
+//
+// TablePKs (the per-shard COPY-resume cursor, ADR-0072 Phase A) are
+// carried through in their encoded form. Encoding can fail only if the
+// TableLastPK proto fails to marshal — a genuinely corrupt event — so
+// the conversion now returns an error the dispatcher propagates loudly
+// rather than silently dropping the resume cursor.
+func vgtidToShardGtidSlice(vg *binlogdata.VGtid) ([]shardGtid, error) {
 	out := make([]shardGtid, 0, len(vg.GetShardGtids()))
 	for _, sg := range vg.GetShardGtids() {
+		pks, err := encodeTablePKs(sg.GetTablePKs())
+		if err != nil {
+			return nil, err
+		}
 		out = append(out, shardGtid{
 			Keyspace: sg.GetKeyspace(),
 			Shard:    sg.GetShard(),
 			Gtid:     sg.GetGtid(),
+			TablePKs: pks,
 		})
 	}
-	return out
+	return out, nil
 }
 
 // decodeVStreamRow turns a query.Row + cached []*query.Field into
@@ -1258,7 +1272,10 @@ func (r *vstreamCDCReader) Reopen(ctx context.Context, resh *ShardLayoutChangedE
 		return nil, err
 	}
 
-	req := r.buildVStreamRequest(r.currentVgtid)
+	req, err := r.buildVStreamRequest(r.currentVgtid)
+	if err != nil {
+		return nil, err
+	}
 	loopCtx, cancel := context.WithCancel(ctx)
 	r.streamerCancel = cancel
 

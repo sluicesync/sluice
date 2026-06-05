@@ -4,10 +4,13 @@
 package mysql
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
+
+	"vitess.io/vitess/go/vt/proto/binlogdata"
 
 	"sluicesync.dev/sluice/internal/ir"
 )
@@ -45,6 +48,94 @@ type shardGtid struct {
 	Keyspace string `json:"keyspace"`
 	Shard    string `json:"shard"`
 	Gtid     string `json:"gtid"`
+
+	// TablePKs is the per-table COPY-resume cursor Vitess carries on
+	// each shard's position (binlogdata.ShardGtid.TablePKs). During a
+	// cold-start COPY, vtgate emits a VGTID after every LASTPK event
+	// whose ShardGtids[i].TablePKs hold the last-copied primary key
+	// for each still-copying table; replaying that cursor back into
+	// the resume request's VGtid asks vtgate to resume the COPY scan
+	// from `WHERE pk > lastpk` rather than restarting from row 0
+	// (ADR-0072 Phase A). It is empty once COPY completes for a table
+	// (vtgate removes the entry on a Completed LASTPK) and empty for a
+	// pure CDC-tailing position.
+	//
+	// The field is ADDITIVE and JSON-omitempty: a pre-ADR-0072 token
+	// has no `table_p_ks` key, so it decodes to a nil slice — "no
+	// mid-COPY cursor", i.e. start the COPY from the beginning (the
+	// behaviour before this field existed). See encodedTablePK for the
+	// per-entry encoding.
+	TablePKs []encodedTablePK `json:"table_p_ks,omitempty"`
+}
+
+// encodedTablePK is the JSON-serialisable form of one
+// binlogdata.TableLastPK (a table name + a query.QueryResult-shaped
+// lastpk row). The lastpk payload is a protobuf message whose exact
+// bytes vtgate's rowstreamer needs to build the `WHERE pk > lastpk`
+// resume clause, so it is round-tripped via deterministic proto
+// marshalling base64-encoded into a JSON string rather than re-modelled
+// field-by-field — re-modelling would risk dropping a type/charset
+// nuance the tablet's PK comparison depends on. The table name is
+// carried in the clear so an operator inspecting a position token can
+// see which tables still have an in-flight COPY.
+type encodedTablePK struct {
+	TableName string `json:"table_name"`
+	// Lastpk is base64(proto-marshalled binlogdata.TableLastPK). The
+	// whole TableLastPK (not just its Lastpk QueryResult) is marshalled
+	// so the decode side reconstructs the exact proto vtgate produced.
+	Lastpk string `json:"lastpk"`
+}
+
+// encodeTablePKs converts the proto per-shard TablePKs into the
+// JSON-serialisable form. A nil/empty input yields a nil slice so the
+// `table_p_ks` key is omitted entirely (Debezium-adjacent: a position
+// with no in-flight COPY looks exactly like a pre-ADR-0072 token).
+func encodeTablePKs(pks []*binlogdata.TableLastPK) ([]encodedTablePK, error) {
+	if len(pks) == 0 {
+		return nil, nil
+	}
+	out := make([]encodedTablePK, 0, len(pks))
+	for _, pk := range pks {
+		if pk == nil {
+			continue
+		}
+		b, err := pk.MarshalVT()
+		if err != nil {
+			return nil, fmt.Errorf("mysql: vstream position: marshal TableLastPK for %q: %w", pk.GetTableName(), err)
+		}
+		out = append(out, encodedTablePK{
+			TableName: pk.GetTableName(),
+			Lastpk:    base64.StdEncoding.EncodeToString(b),
+		})
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return out, nil
+}
+
+// decodeTablePKs is the inverse of encodeTablePKs: it reconstructs the
+// proto TablePKs slice the resume request carries back to vtgate. A
+// nil/empty input (the pre-ADR-0072 / no-mid-COPY case) returns nil so
+// the resume request omits TablePKs and vtgate starts the COPY from the
+// beginning.
+func decodeTablePKs(pks []encodedTablePK) ([]*binlogdata.TableLastPK, error) {
+	if len(pks) == 0 {
+		return nil, nil
+	}
+	out := make([]*binlogdata.TableLastPK, 0, len(pks))
+	for _, pk := range pks {
+		raw, err := base64.StdEncoding.DecodeString(pk.Lastpk)
+		if err != nil {
+			return nil, fmt.Errorf("mysql: vstream position: decode TableLastPK base64 for %q: %w", pk.TableName, err)
+		}
+		var tpk binlogdata.TableLastPK
+		if err := tpk.UnmarshalVT(raw); err != nil {
+			return nil, fmt.Errorf("mysql: vstream position: unmarshal TableLastPK for %q: %w", pk.TableName, err)
+		}
+		out = append(out, &tpk)
+	}
+	return out, nil
 }
 
 // encodeVStreamPos serialises a slice of shardGtid into the
