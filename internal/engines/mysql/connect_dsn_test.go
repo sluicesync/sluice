@@ -131,6 +131,65 @@ func TestParseDSN_SetSessionSQLModeEmptyDisablesInjection(t *testing.T) {
 	}
 }
 
+// TestStripVStreamParams_RemovesAllVStreamKeys pins the Bug 126
+// choke-point helper that openDB runs before handing the config to
+// go-sql-driver/mysql. Every vstream_* param is a sluice-internal DSN
+// extension consumed only by the VStream CDC reader; if any survives
+// into a MySQL connection the driver emits a `SET vstream_* = …` that
+// self-hosted Vitess / vttestserver rejects (Error 1105 / VT05006),
+// killing a planetscale-flavored cold-start at the schema-reader open.
+// The integration counterpart (cdc_vstream_bug126_integration_test.go)
+// proves the end-to-end behaviour against real Vitess; this is the
+// fast unit pin so the strip can't regress silently under the default
+// suite.
+func TestStripVStreamParams_RemovesAllVStreamKeys(t *testing.T) {
+	cfg, err := parseDSN("user:pw@tcp(host:3306)/mydb")
+	if err != nil {
+		t.Fatalf("parseDSN: %v", err)
+	}
+	// The full known set of sluice's vstream_* extensions, as a real
+	// --source-driver=planetscale DSN would carry them.
+	vstreamKeys := []string{
+		"vstream_endpoint",
+		"vstream_transport",
+		"vstream_auth",
+		"vstream_shards",
+		"vstream_auto_discover_shards",
+		"vstream_insecure_tls",
+	}
+	for _, k := range vstreamKeys {
+		cfg.Params[k] = "x"
+	}
+	// A non-vstream param that MUST survive the strip (sql_mode is
+	// injected by parseDSN; time_zone too) — the helper must be a
+	// prefix filter, not a blanket clear.
+	cfg.Params["custom_param"] = "keepme"
+
+	stripped := stripVStreamParams(cfg)
+
+	for _, k := range vstreamKeys {
+		if _, ok := stripped.Params[k]; ok {
+			t.Errorf("stripped.Params still contains %q; openDB would emit SET %s and vtgate would reject it (Bug 126)", k, k)
+		}
+	}
+	if v := stripped.Params["custom_param"]; v != "keepme" {
+		t.Errorf("stripped.Params[custom_param] = %q; non-vstream params must survive the strip", v)
+	}
+	if v := stripped.Params["sql_mode"]; v == "" {
+		t.Error("stripped.Params[sql_mode] empty; the strict-mode injection must survive the strip")
+	}
+
+	// No-mutation guarantee: the helper Clone()s, so the caller's
+	// original cfg.Params is left intact — the VStream reader reads
+	// vstream_* out of its own cfg before openDB ever runs, and a
+	// future caller that inspects cfg after openDB must see no change.
+	for _, k := range vstreamKeys {
+		if _, ok := cfg.Params[k]; !ok {
+			t.Errorf("stripVStreamParams mutated the caller's cfg (lost %q); it must Clone()", k)
+		}
+	}
+}
+
 // TestDSNShapeHint_PlainPathNoHint confirms a well-formed DSN with
 // just `db` in the path produces no hint (we don't want false
 // positives noising every DSN parse error).

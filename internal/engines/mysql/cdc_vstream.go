@@ -300,22 +300,16 @@ func discoverShards(ctx context.Context, cfg *gomysql.Config, keyspace string) (
 	if keyspace == "" {
 		return nil, errors.New("mysql/vstream: discoverShards: empty keyspace")
 	}
-	// Clone the Config and drop sluice's vstream_* DSN flags before
-	// opening the connection: the go-sql-driver's session-init
-	// emits the DSN's Params map as `SET <key>=<value>, ...`, and
-	// vtgate's MySQL parser rejects unknown variable names with a
-	// syntax error. (The flags are sluice-internal — they belong
-	// in cfg.Params for the parser's eyes only, not in a SET
-	// statement on the wire.)
-	conn := cfg.Clone()
-	if conn.Params != nil {
-		for k := range conn.Params {
-			if strings.HasPrefix(k, "vstream_") {
-				delete(conn.Params, k)
-			}
-		}
-	}
-	db, err := openDB(ctx, conn)
+	// openDB strips sluice's vstream_* DSN flags before opening the
+	// connection (Bug 126, see [stripVStreamParams]): the
+	// go-sql-driver's session-init emits the DSN's Params map as
+	// `SET <key>=<value>, ...`, and vtgate's MySQL parser rejects
+	// unknown variable names with a syntax error. (The flags are
+	// sluice-internal — they belong in cfg.Params for the VStream
+	// reader's eyes only, not in a SET statement on the wire.) We
+	// pass cfg through directly; openDB Clone()s, so the caller's
+	// cfg.Params is left intact.
+	db, err := openDB(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("open mysql for shard discovery: %w", err)
 	}

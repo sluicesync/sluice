@@ -233,10 +233,60 @@ func parseDSN(dsn string) (*mysql.Config, error) {
 	return cfg, nil
 }
 
+// vstreamParamPrefix is the DSN-parameter namespace sluice reserves
+// for its Vitess VStream extensions (vstream_endpoint, vstream_transport,
+// vstream_auth, vstream_shards, vstream_auto_discover_shards,
+// vstream_insecure_tls, …). These are sluice-internal DSN flags; they
+// are never valid MySQL session variables.
+const vstreamParamPrefix = "vstream_"
+
+// stripVStreamParams returns a clone of cfg with every cfg.Params entry
+// whose key carries the vstream_ prefix removed. It never mutates the
+// caller's cfg (it Clone()s first), so a caller may continue to read the
+// original cfg.Params after the call.
+//
+// Bug 126. sluice's vstream_* DSN extensions are consumed only by the
+// VStream CDC reader (cdc_vstream.go), which reads them out of cfg.Params
+// at openVStreamReader time and then dials vtgate over gRPC — it never
+// hands these params to a MySQL connection. Every *other* path
+// (schema-reader, row-reader, schema-writer, row-writer, change-applier,
+// migration-state-store, and the CDC reader's own shard-discovery
+// connection) opens a database/sql handle through [openDB]; the
+// go-sql-driver's session init emits each cfg.Params entry as a
+// `SET <key> = <value>` after the handshake. Self-hosted Vitess /
+// vttestserver rejects the unknown vstream_* vars (Error 1105 for the
+// IP-bearing vstream_endpoint, VT05006 unknown system variable for the
+// rest), killing a planetscale-flavored cold-start at "open source
+// schema reader" before any data moves. Stripping at the openDB choke
+// point makes the leak impossible for any present or future Open* path,
+// while leaving the CDC reader's earlier cfg.Params reads intact (it has
+// already extracted them before the gRPC dial; it never reaches openDB
+// except via discoverShards, which is a MySQL connection and correctly
+// wants them stripped).
+func stripVStreamParams(cfg *mysql.Config) *mysql.Config {
+	if cfg == nil {
+		return nil
+	}
+	clone := cfg.Clone()
+	for k := range clone.Params {
+		if strings.HasPrefix(k, vstreamParamPrefix) {
+			delete(clone.Params, k)
+		}
+	}
+	return clone
+}
+
 // openDB connects to MySQL and verifies the connection is usable.
 // It returns a *sql.DB ready for queries; callers are responsible for
 // calling Close() when finished.
+//
+// sluice's vstream_* DSN extensions are stripped here (see
+// [stripVStreamParams]) so they never reach a MySQL session as a
+// `SET vstream_* = …` statement — Bug 126. This is the single choke
+// point every MySQL connection passes through, so the strip is
+// leak-proof against future Open* paths.
 func openDB(ctx context.Context, cfg *mysql.Config) (*sql.DB, error) {
+	cfg = stripVStreamParams(cfg)
 	connector, err := mysql.NewConnector(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("mysql: build connector: %w", err)
