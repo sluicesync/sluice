@@ -23,6 +23,7 @@ import (
 	"net/http"
 	_ "net/http/pprof" // GitHub #23 Phase A: pprof debug endpoints registered on the default mux
 	"os"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -70,6 +71,7 @@ func main() {
 		},
 	)
 	configureLogging(cli.LogLevel)
+	applyMaxMemory(cli.MaxMemory)
 	startPprofIfRequested(cli.PprofListen)
 	// v0.92.1 escape hatch: thread the operator's --mysql-sql-mode
 	// override into the mysql engine package before any engine opens
@@ -80,6 +82,31 @@ func main() {
 	mysql.SetSessionSQLMode(cli.MySQLSQLMode)
 	err := ctx.Run(&cli.Globals)
 	ctx.FatalIfErrorf(err)
+}
+
+// applyMaxMemory installs the operator's --max-memory ceiling via
+// runtime/debug.SetMemoryLimit. An empty/"off" flag is a no-op so Go
+// keeps honoring the GOMEMLIMIT env var natively; any non-empty value
+// is parsed strictly and a bad size is fatal (the operator explicitly
+// asked for a ceiling — a silent fallthrough would defeat the purpose,
+// the same discipline as --pprof-listen bind failure). See the
+// Globals.MaxMemory doc for why a heap ceiling complements
+// --max-buffer-bytes.
+func applyMaxMemory(raw string) {
+	limit, err := parseMaxMemory(raw)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "sluice: %v\n", err)
+		os.Exit(1)
+	}
+	if limit <= 0 {
+		return
+	}
+	debug.SetMemoryLimit(limit)
+	slog.InfoContext(
+		context.Background(), "max-memory ceiling applied",
+		slog.Int64("bytes", limit),
+		slog.String("hint", "GC defends this soft heap limit; pair with headroom over the live set"),
+	)
 }
 
 // startPprofIfRequested starts net/http/pprof on addr in a background

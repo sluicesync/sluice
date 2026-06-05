@@ -65,6 +65,22 @@ type Globals struct {
 	// contradicts the help text. v0.92.1 shipped with this defect;
 	// v0.92.2 pins the public name explicitly.
 	MySQLSQLMode string `name:"mysql-sql-mode" help:"Override sluice's default strict sql_mode on every MySQL connection. Pass --mysql-sql-mode='' (explicit empty) to fall through to the server's default sql_mode — required for migrating legacy MySQL data with zero-dates / silently-truncated values. Pass a specific comma-separated mode list to force exactly those modes. See docs/operator/migrating-legacy-mysql.md." default:"STRICT_TRANS_TABLES,NO_ZERO_DATE,NO_ZERO_IN_DATE,ERROR_FOR_DIVISION_BY_ZERO" placeholder:"MODES"`
+
+	// MaxMemory is a hard soft-ceiling on the Go heap, applied via
+	// runtime/debug.SetMemoryLimit at startup. --max-buffer-bytes only
+	// caps *raw value bytes* of buffered ir.Row maps; the real Go-heap
+	// footprint of those maps is ~4–5× the raw bytes, and with the
+	// default GOGC the heap grows to ~2× the live set, so a large
+	// --max-buffer-bytes (or many tables in flight) can drive RSS to
+	// ~9× the cap (a 2 GiB raw cap → ~18 GB RSS observed). Setting
+	// --max-memory makes the GC defend a real RSS target instead.
+	// Default OFF (empty → SetMemoryLimit is not called, so Go honors
+	// the GOMEMLIMIT env var natively if set). Sets a soft limit: the
+	// GC works harder as the heap approaches it but does not hard-fail
+	// — pair it with headroom over the live set. Not auto-derived from
+	// system RAM (that would change behavior for everyone); a future
+	// --max-memory=auto could do so.
+	MaxMemory string `name:"max-memory" help:"Soft ceiling on the Go heap (e.g. '2GiB', '512MiB'), applied via runtime/debug.SetMemoryLimit at startup to bound RSS. Unlike --max-buffer-bytes (which caps only raw buffered value bytes), this bounds the whole heap, so the GC defends a real RSS target. Off by default; the GOMEMLIMIT env var is honored natively when this is unset." placeholder:"SIZE"`
 }
 
 // CLI is the root of the sluice command tree. Kong populates this from
@@ -687,6 +703,29 @@ func parseIndexBuildMem(raw string) (int64, error) {
 	}
 	if n < 0 {
 		return 0, fmt.Errorf("--index-build-mem: expected a non-negative size; got %q", raw)
+	}
+	return n, nil
+}
+
+// parseMaxMemory turns the --max-memory flag value into a byte count
+// for runtime/debug.SetMemoryLimit. Empty / "off" → 0 (the OFF
+// sentinel: SetMemoryLimit is not called, so Go honors the GOMEMLIMIT
+// env var natively). Otherwise a human size ("2GiB", "512MiB", "2GB")
+// or raw byte count is parsed via units.RAMInBytes (power-of-two
+// units, case-insensitive, optional 'b'). A zero, negative, or
+// unparseable size is a loud error rather than a silent no-op — the
+// operator asked for a ceiling and a typo shouldn't drop it.
+func parseMaxMemory(raw string) (int64, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" || strings.EqualFold(trimmed, "off") {
+		return 0, nil
+	}
+	n, err := units.RAMInBytes(trimmed)
+	if err != nil {
+		return 0, fmt.Errorf("--max-memory: expected a size ('2GiB', '512MiB', '2GB') or 'off'; got %q", raw)
+	}
+	if n <= 0 {
+		return 0, fmt.Errorf("--max-memory: expected a positive size; got %q", raw)
 	}
 	return n, nil
 }

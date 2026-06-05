@@ -61,12 +61,27 @@ func TestBuildInsertSQL(t *testing.T) {
 			wantArgs: []any{true, "alice@example.com", int64(7)},
 		},
 		{
-			name:     "plain insert when PK is empty (no-PK table)",
+			// No-PK table: ADR-0072 Gap-2 requires the applier to be
+			// idempotent on the unique-key collision so a resumed
+			// cold-start COPY's re-sent rows upsert instead of 1062.
+			// MySQL fires ON DUPLICATE KEY UPDATE on ANY unique index,
+			// so we emit a full-row SET-list even with no PK.
+			name:     "no-PK table still upserts on a unique key (full-row SET-list)",
+			schema:   "src",
+			table:    "connections",
+			row:      ir.Row{"id": int64(42), "name": "conn-a"},
+			pk:       nil,
+			wantSQL:  "INSERT INTO `src`.`connections` (`id`, `name`) VALUES (?, ?) AS new ON DUPLICATE KEY UPDATE `id` = new.`id`, `name` = new.`name`",
+			wantArgs: []any{int64(42), "conn-a"},
+		},
+		{
+			// Single-column no-PK case keeps the full-row SET-list.
+			name:     "no-PK single-column table emits ON DUPLICATE KEY UPDATE",
 			schema:   "src",
 			table:    "events",
 			row:      ir.Row{"payload": "hello"},
 			pk:       nil,
-			wantSQL:  "INSERT INTO `src`.`events` (`payload`) VALUES (?)",
+			wantSQL:  "INSERT INTO `src`.`events` (`payload`) VALUES (?) AS new ON DUPLICATE KEY UPDATE `payload` = new.`payload`",
 			wantArgs: []any{"hello"},
 		},
 		{

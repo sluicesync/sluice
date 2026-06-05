@@ -144,10 +144,12 @@ func TestChangeApplier_ApplyAndIdempotency(t *testing.T) {
 	}
 }
 
-// TestChangeApplier_NoPKInsert verifies the documented fallback for
-// tables without a PRIMARY KEY: plain INSERT. Replaying inserts on
-// such a table produces duplicates — that's the documented best-
-// effort behavior. Operators are warned in the package comment.
+// TestChangeApplier_NoPKInsert verifies the TRULY-keyless fallback:
+// a table with no PRIMARY KEY AND no unique index has nothing for ON
+// DUPLICATE KEY UPDATE to collide on, so replaying an Insert produces
+// a duplicate row — the documented best-effort behavior. (The no-PK
+// table WITH a unique key now upserts idempotently — see
+// TestChangeApplier_NoPKWithUniqueKey_Idempotent.)
 func TestChangeApplier_NoPKInsert(t *testing.T) {
 	dsn, cleanup := startMySQLForApplier(t)
 	defer cleanup()
@@ -181,14 +183,97 @@ func TestChangeApplier_NoPKInsert(t *testing.T) {
 		t.Errorf("after first apply: rows = %d; want 2", got)
 	}
 
-	// Replay: plain INSERT path produces duplicates. This is the
-	// documented behavior for no-PK tables; the package comment
-	// names it as best-effort.
+	// Replay on a truly-keyless table produces a duplicate: the emitted
+	// ON DUPLICATE KEY UPDATE clause is inert (no unique index to
+	// collide on). This is the documented best-effort behavior; the
+	// package comment names it.
 	pumpChanges(t, ctx, applier, []ir.Change{
 		ir.Insert{Schema: "target_db", Table: "events", Row: ir.Row{"payload": "first"}},
 	})
 	if got := countAllRows(t, dsn, "target_db", "events"); got != 3 {
-		t.Errorf("after replay on no-PK table: rows = %d; want 3 (best-effort behavior — replays duplicate)", got)
+		t.Errorf("after replay on truly-keyless table: rows = %d; want 3 (best-effort behavior — replays duplicate)", got)
+	}
+}
+
+// TestChangeApplier_NoPKWithUniqueKey_Idempotent is the ADR-0072
+// Gap-2 applier-correctness pin: a table with NO PRIMARY KEY but WITH
+// a UNIQUE key (the Bug-125 shape, e.g. `connections`) must absorb a
+// re-applied Insert as an upsert — ZERO MySQL 1062, ZERO duplicate
+// rows — because the resumable cold-start COPY routes the post-
+// checkpoint catch-up rows through this applier and the checkpoint
+// lags the COPY writer's flushes, so vtgate re-sends rows the target
+// already holds. Before Fix 1 (Gap-2), buildInsertSQL emitted a plain
+// INSERT for no-PK tables and this replay would 1062 → terminal
+// resume failure.
+func TestChangeApplier_NoPKWithUniqueKey_Idempotent(t *testing.T) {
+	dsn, cleanup := startMySQLForApplier(t)
+	defer cleanup()
+
+	// No PRIMARY KEY; a BIGINT UNIQUE id plus a cheaper non-null
+	// UNIQUE key (mirrors the Bug-125 divergent-scan shape).
+	applyMySQLApplier(t, dsn, `
+		CREATE TABLE connections (
+			id   BIGINT       NOT NULL,
+			tiny SMALLINT     NOT NULL,
+			name VARCHAR(64)  NOT NULL,
+			UNIQUE KEY uq_id   (id),
+			UNIQUE KEY uk_tiny (tiny)
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+	`)
+
+	eng := Engine{Flavor: FlavorVanilla}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	applier, err := eng.OpenChangeApplier(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenChangeApplier: %v", err)
+	}
+	defer func() {
+		if c, ok := applier.(interface{ Close() error }); ok {
+			_ = c.Close()
+		}
+	}()
+
+	// First apply: three distinct rows.
+	pumpChanges(t, ctx, applier, []ir.Change{
+		ir.Insert{Schema: "target_db", Table: "connections", Row: ir.Row{"id": int64(1), "tiny": int64(1), "name": "c1"}},
+		ir.Insert{Schema: "target_db", Table: "connections", Row: ir.Row{"id": int64(2), "tiny": int64(2), "name": "c2"}},
+		ir.Insert{Schema: "target_db", Table: "connections", Row: ir.Row{"id": int64(3), "tiny": int64(3), "name": "c3"}},
+	})
+	if got := countAllRows(t, dsn, "target_db", "connections"); got != 3 {
+		t.Fatalf("after first apply: rows = %d; want 3", got)
+	}
+
+	// Simulate the checkpoint-lag re-send: rows already present in the
+	// target are re-emitted as COPY Inserts on resume. With Fix 1 these
+	// upsert on the unique key (id and/or tiny) instead of 1062. A
+	// pumpChanges that errors would t.Fatal inside the helper, so a
+	// 1062 here fails the test loudly.
+	pumpChanges(t, ctx, applier, []ir.Change{
+		ir.Insert{Schema: "target_db", Table: "connections", Row: ir.Row{"id": int64(1), "tiny": int64(1), "name": "c1"}},
+		ir.Insert{Schema: "target_db", Table: "connections", Row: ir.Row{"id": int64(2), "tiny": int64(2), "name": "c2"}},
+		// A genuinely-new row past the checkpoint also lands.
+		ir.Insert{Schema: "target_db", Table: "connections", Row: ir.Row{"id": int64(4), "tiny": int64(4), "name": "c4"}},
+	})
+
+	// Zero duplicate rows: the two re-sends upserted onto their unique
+	// keys; only the new id=4 row was added. Count == 4.
+	if got := countAllRows(t, dsn, "target_db", "connections"); got != 4 {
+		t.Fatalf("after checkpoint-lag re-send on no-PK+UNIQUE table: rows = %d; want 4 (re-sends must upsert, not duplicate)", got)
+	}
+
+	// The upsert overwrote with the re-sent image (full-row SET-list):
+	// re-send a row with a CHANGED name on the same unique id and
+	// confirm the row was updated in place (still one row for id=1).
+	pumpChanges(t, ctx, applier, []ir.Change{
+		ir.Insert{Schema: "target_db", Table: "connections", Row: ir.Row{"id": int64(1), "tiny": int64(1), "name": "c1-updated"}},
+	})
+	if got := countAllRows(t, dsn, "target_db", "connections"); got != 4 {
+		t.Fatalf("after upsert-overwrite re-send: rows = %d; want 4 (overwrite in place, no new row)", got)
+	}
+	if name := scalarString(t, dsn, "SELECT name FROM connections WHERE id = 1"); name != "c1-updated" {
+		t.Fatalf("upsert did not overwrite the full row: name = %q; want %q", name, "c1-updated")
 	}
 }
 
@@ -593,6 +678,26 @@ func countAllRows(t *testing.T, dsn, schema, table string) int {
 		t.Fatalf("count: %v", err)
 	}
 	return n
+}
+
+// scalarString runs a query expected to return a single string column
+// in a single row and returns it.
+func scalarString(t *testing.T, dsn, query string) string {
+	t.Helper()
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	var s string
+	if err := db.QueryRowContext(ctx, query).Scan(&s); err != nil {
+		t.Fatalf("scalarString %q: %v", query, err)
+	}
+	return s
 }
 
 func equalUsers(a, b []userRow) bool {

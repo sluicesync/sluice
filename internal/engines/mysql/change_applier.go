@@ -77,21 +77,29 @@ import (
 // apply safe (a re-applied Insert turns into a no-op UPDATE rather
 // than a duplicate-key error). Two situations to be aware of:
 //
-//   - **Tables without any PK fall back to plain INSERT.** Both PG's
-//     ON CONFLICT and MySQL's ON DUPLICATE KEY UPDATE require a key
-//     to collide with; without one, the syntax is unusable. Plain
-//     INSERT means a re-applied Insert produces a duplicate row.
-//     Resume idempotency on no-PK tables is therefore best-effort,
-//     and continuous-sync on such tables is not recommended. Add a
-//     PRIMARY KEY to the source table before running sluice in
-//     continuous-sync mode.
+//   - **Tables with a UNIQUE KEY but no PRIMARY KEY upsert
+//     idempotently.** MySQL's ON DUPLICATE KEY UPDATE fires on a
+//     conflict against ANY unique index, not just the PRIMARY KEY.
+//     So even with no PK, the applier emits ON DUPLICATE KEY UPDATE
+//     with a full-row SET-list (every column ← its new value); a
+//     re-applied Insert that collides on the unique index becomes a
+//     full-row upsert (a no-op for an identical row, a newer-image
+//     overwrite otherwise) rather than a duplicate-key error. This
+//     is what makes the ADR-0072 resumable cold-start COPY safe on
+//     the Bug-125 table class (no PK + UNIQUE key, e.g. a
+//     `connections` table): on resume, vtgate re-sends already-
+//     copied rows past the last checkpoint and they absorb harmlessly
+//     instead of 1062-ing the whole resume terminally.
 //
-//   - **Tables with a UNIQUE KEY but no PRIMARY KEY** are a known
-//     trouble spot in MySQL replication generally — sluice doesn't
-//     special-case the unique-key as a conflict target either. The
-//     applier behaves as if there's no PK (plain INSERT path). If
-//     you need upsert semantics here, declare the unique column as
-//     the PRIMARY KEY on the source table.
+//   - **Truly keyless tables (no PK AND no unique index) fall back to
+//     effective plain INSERT.** The ON DUPLICATE KEY UPDATE clause is
+//     still emitted but is inert (nothing to collide with), so a
+//     re-applied Insert produces a duplicate row. Resume idempotency
+//     on such tables is therefore best-effort, and continuous-sync on
+//     them is not recommended — add a PRIMARY KEY (or at least a
+//     UNIQUE key) to the source table first. The Bug-125 keyless
+//     cold-start guard refuses these tables outright, so they don't
+//     reach the resumable-COPY path in practice.
 //
 // # Lifecycle
 //
@@ -1124,15 +1132,21 @@ func loadPrimaryKey(ctx context.Context, tx *sql.Tx, schema, table string) ([]st
 	return pk, rows.Err()
 }
 
-// buildInsertSQL builds an INSERT statement. With a non-empty PK,
-// uses the row-alias UPSERT form (8.0.20+):
+// buildInsertSQL builds an INSERT statement using the row-alias
+// UPSERT form (8.0.20+). With a non-empty PK the SET-list reassigns
+// every non-PK column to the new row's value:
 //
 //	INSERT INTO `s`.`t` (`a`, `b`) VALUES (?, ?) AS new
 //	ON DUPLICATE KEY UPDATE `a` = new.`a`, `b` = new.`b`
 //
-// With an empty PK list (tables without a PRIMARY KEY), falls back
-// to a plain INSERT — see the ChangeApplier package doc for the
-// resume-idempotency caveat.
+// With an empty PK list (tables without a PRIMARY KEY) it STILL emits
+// ON DUPLICATE KEY UPDATE — with a full-row SET-list (every column ←
+// its new value) — because MySQL fires that clause on a conflict
+// against any unique index, not just the PK. This makes a no-PK table
+// with a UNIQUE key idempotent on re-apply (the ADR-0072 Gap-2
+// interlock); a truly keyless table never collides, so the clause is
+// inert and behavior is effectively plain INSERT. See the
+// ChangeApplier package doc for the full resume-idempotency contract.
 //
 // colTypes maps column names to their full IR descriptors and is the
 // input to prepareValue. A missing entry (empty map, or column not
@@ -1196,6 +1210,38 @@ func buildInsertSQL(schema, table string, row ir.Row, pk []string, colTypes map[
 			sb.WriteString(" = new.")
 			sb.WriteString(quoteIdent(pk[0]))
 		}
+	} else {
+		// No PRIMARY KEY. We still emit ON DUPLICATE KEY UPDATE so a
+		// collision on ANY unique index is absorbed idempotently
+		// rather than erroring with MySQL 1062 (duplicate-key). This
+		// is the ADR-0072 Gap-2 interlock: the resumable cold-start
+		// COPY routes the post-checkpoint catch-up rows through this
+		// applier, and the checkpoint cadence (every 50k rows / 10s)
+		// lags the COPY writer's flushes — so on resume vtgate
+		// re-sends rows the target already holds (id > lastpk that
+		// were flushed past the last checkpoint). On a no-PK table
+		// with a UNIQUE key (the Bug-125 shape, e.g. `connections`)
+		// those re-sends would otherwise collide on the unique index
+		// and 1062 → terminal resume failure.
+		//
+		// ON DUPLICATE KEY UPDATE fires on a conflict against any
+		// unique index, so the SET-list is what matters: set every
+		// column to its new value (full-row upsert). That is correct
+		// for both a re-emitted COPY row (overwrites with identical
+		// data — a no-op) and a catch-up UPDATE that arrived as an
+		// Insert (overwrites with the newer image).
+		//
+		// A TRULY keyless table (no PK AND no unique index) never
+		// collides, so the ON DUPLICATE KEY UPDATE clause is inert
+		// and behavior stays effectively plain-INSERT (the unchanged
+		// best-effort path). Such tables are refused at cold-start by
+		// the Bug-125 keyless guard, so they never reach resume.
+		sb.WriteString(" AS new ON DUPLICATE KEY UPDATE ")
+		parts := make([]string, len(cols))
+		for i, c := range cols {
+			parts[i] = fmt.Sprintf("%s = new.%s", quoteIdent(c), quoteIdent(c))
+		}
+		sb.WriteString(strings.Join(parts, ", "))
 	}
 	return sb.String(), args
 }
