@@ -6,6 +6,14 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.99.6] - 2026-06-05
+
+A self-hosted-Vitess compatibility fix. A no-op for PlanetScale users.
+
+### Fixed
+
+- **`--source-driver=planetscale` no longer leaks `vstream_*` DSN parameters into the MySQL session.** sluice's `vstream_*` DSN extensions (`vstream_endpoint`, `vstream_transport`, `vstream_auth`, `vstream_shards`, …) are consumed only by the gRPC CDC reader, but the schema-reader / row-reader / schema-writer / change-applier paths passed them straight through to the underlying MySQL connection, which emitted them as `SET vstream_endpoint = …` session variables on connect. A self-hosted Vitess / vttestserver rejects those (`Error 1105` for the IP-bearing endpoint, `VT05006 unknown system variable` for the rest), so a VStream-source cold-start failed at "open source schema reader" before any data moved. The parameters are now stripped centrally before every MySQL connection (one `openDB` choke point, leak-proof against future paths). Real PlanetScale was unaffected (its vtgate tolerates the unknown vars), so this is a no-op there and a fix for self-hosted Vitess / vttestserver. Pinned by a new `vttestserver`-backed integration test — the first to exercise the PlanetScale `Open*` (non-CDC) path against a real Vitess, which opens the door to CLI-driven Vitess test coverage.
+
 ## [0.99.5] - 2026-06-05
 
 Resumable PlanetScale cold-start, a memory hard-cap, and a no-PK CDC-resume
