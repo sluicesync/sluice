@@ -6,6 +6,20 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.99.5] - 2026-06-05
+
+Resumable PlanetScale cold-start, a memory hard-cap, and a no-PK CDC-resume
+correctness fix. Drop-in upgrade from v0.99.4 — no breaking API or CLI changes.
+
+### Added
+
+- **Resumable VStream cold-start COPY.** A transient connection drop — or a full process crash — *mid-COPY* now **resumes the snapshot from the last-copied primary key** instead of re-copying the table from row 0. sluice checkpoints Vitess's per-table `TablePKs` cursor to the control table on a bounded cadence (50k rows / 10s) during the COPY; on an in-place reconnect or a warm-resume after restart it replays the cursor so vtgate continues the scan from where it stopped, and the catch-up rows upsert idempotently (zero loss, no `1062`). For a large table over a flaky link, a fault now costs the in-flight chunk, not the whole table. Completes the cold-start-hardening arc begun in v0.99.4 (Gap 1 auto-retry + this resumable COPY). See [ADR-0072](docs/adr/adr-0072-resumable-coldstart-copy.md).
+- **`--max-memory` flag.** Sets a hard Go runtime memory soft-limit (`GOMEMLIMIT`) to bound RSS — e.g. `--max-memory=4GiB`. `--max-buffer-bytes` accounts only raw value bytes, but the real Go-heap footprint of buffered rows is several times larger, so a large `--max-buffer-bytes` (or many tables) can drive RSS to roughly 9× the configured cap; `--max-memory` gives the garbage collector a real ceiling to defend. Default off (the `GOMEMLIMIT` environment variable is also honored natively).
+
+### Fixed
+
+- **No-`PRIMARY KEY` CDC apply is now idempotent on a unique key.** The MySQL change applier emitted a plain `INSERT` for a table with no `PRIMARY KEY`, so a CDC warm-resume (the applier re-applies a few changes around the persisted position) of a no-PK-but-`UNIQUE` table — e.g. the v0.99.4 `connections` shape — hit `1062` and the resume failed. The applier now emits `INSERT … ON DUPLICATE KEY UPDATE` with a full-row SET even when the PK list is empty; MySQL fires it on *any* unique index, so the re-applied rows upsert idempotently. A truly keyless table (no PK and no unique index) is unchanged best-effort. This also underpins the no-PK case of the resumable COPY above.
+
 ## [0.99.4] - 2026-06-04
 
 A cold-start-hardening release: a CRITICAL silent-loss fix on the PlanetScale
