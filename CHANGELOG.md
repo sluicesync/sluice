@@ -6,6 +6,20 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.99.7] - 2026-06-05
+
+A Vitess robustness release: online-DDL cutovers no longer leak shadow-table
+rows into the target, and a primary-only Vitess cluster now works (or fails
+loudly) instead of wedging silently. Drop-in upgrade from v0.99.6 — no breaking
+API or CLI changes; a no-op for migrations that don't run online DDL on a
+PlanetScale/Vitess source.
+
+### Fixed
+
+- **Vitess internal / online-DDL shadow tables (`_vt_*`) are now excluded from VStream — a silent-loss hazard during online-DDL cutovers.** While an online DDL (`gh-ost`/`vreplication`-backed `ALTER`) is in flight, Vitess materializes transient shadow tables (`_vt_vrp_*`, `_vt_hld/prg/evc/drp/…` — the unified `_vt_<op>_<uuid>_<timestamp>_` form, vitessio/vitess#14582) and emits their rows + DDL on the stream. sluice previously forwarded those to the target, which at cutover could write rows under an internal table name or apply churn that never belonged in the user's schema. sluice now anchors exclusion to Vitess's own `schema.IsInternalOperationTableName()` helper (not a static name list, so it tracks Vitess's evolving naming) and drops both the row events and the shadow-table DDL across every dispatch path (COPY buffer, CDC tail, snapshot post-COPY, DDL). The user's real tables — including the freshly-cut table an online DDL swaps in — flow through untouched. See [ADR-0073](docs/adr/adr-0073-vitess-internal-and-online-ddl-tables.md). Validated end-to-end against a **full Vitess 24 cluster** (real online-DDL scheduler) through a completed cutover with zero row loss, including complex shapes (column drop, enum add/extend).
+
+- **A primary-only Vitess cluster no longer wedges silently — it works (or fails loudly).** sluice's pure CDC tail requests a `REPLICA` tablet by default (to keep load off the primary). Against a cluster with **no replica** — a PlanetScale **development** branch, or a minimal self-hosted Vitess — vtgate has no `REPLICA` tablet to serve the stream, yet keeps sending heartbeats while emitting no data, so the reader hung forever with `Err() == nil`: a silent stall. Two fixes: (1) a **first-event liveness watchdog** converts that wedge into a **loud, actionable error** (`vstream_liveness_timeout`, default 30s; keyed on the absence of any *non-heartbeat* event, so a legitimately idle-but-healthy source never false-trips); (2) a new **`vstream_tablet_type={primary|replica|rdonly}` DSN parameter** (default `replica`, unchanged for PlanetScale production) lets a primary-only cluster stream from the primary via `vstream_tablet_type=primary`. A COPY-resume (mid-snapshot cursor) still targets `PRIMARY` regardless, per [ADR-0072](docs/adr/adr-0072-resumable-coldstart-copy.md). Pinned on a primary-only Vitess-cluster harness: the default tail fails loudly, the `primary` tail delivers with zero loss. See [ADR-0073](docs/adr/adr-0073-vitess-internal-and-online-ddl-tables.md).
+
 ## [0.99.6] - 2026-06-05
 
 A self-hosted-Vitess compatibility fix. A no-op for PlanetScale users.
