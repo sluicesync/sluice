@@ -217,6 +217,33 @@ func (w *idempotentCountingWriter) WriteRowsIdempotent(_ context.Context, _ *ir.
 	return nil
 }
 
+// HandlesNoPKIdempotentCopy makes idempotentCountingWriter a full
+// ir.IdempotentCopyWriter (simulates the MySQL target, which upserts
+// no-PK tables on a unique key). Without this the Bug 125 cross-engine
+// guard would refuse no-PK tables.
+func (w *idempotentCountingWriter) HandlesNoPKIdempotentCopy() bool { return true }
+
+// pkOnlyIdempotentWriter implements ir.IdempotentRowWriter but NOT
+// ir.IdempotentCopyWriter — it simulates the Postgres target, whose
+// WriteRowsIdempotent plain-INSERTs no-PK tables. The Bug 125 guard
+// must refuse a no-PK table on this writer (a plain INSERT would
+// duplicate VStream catchup re-emissions) while allowing PK tables
+// (ON CONFLICT (pk) absorbs them).
+type pkOnlyIdempotentWriter struct{ idemCalls int }
+
+func (w *pkOnlyIdempotentWriter) WriteRows(_ context.Context, _ *ir.Table, rows <-chan ir.Row) error {
+	for range rows {
+	}
+	return nil
+}
+
+func (w *pkOnlyIdempotentWriter) WriteRowsIdempotent(_ context.Context, _ *ir.Table, rows <-chan ir.Row) error {
+	w.idemCalls++
+	for range rows {
+	}
+	return nil
+}
+
 // TestCopyTableColdStartIdempotent_RoutesThroughUpsert pins Bug 125's
 // orchestration half: copyTableColdStartIdempotent must use the
 // writer's idempotent (upsert) path, NOT plain WriteRows.
@@ -249,5 +276,49 @@ func TestCopyTableColdStartIdempotent_RefusesNonIdempotentWriter(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "connections") || !strings.Contains(err.Error(), "Bug 125") {
 		t.Errorf("error %q; want it to name the table and Bug 125", err.Error())
+	}
+}
+
+// TestCopyTableColdStartIdempotent_RefusesNoPKWithoutCopyCapability pins
+// the Bug 125 CROSS-ENGINE guard: a no-PRIMARY-KEY table on a writer
+// that implements IdempotentRowWriter but plain-INSERTs no-PK tables
+// (the Postgres target — no ir.IdempotentCopyWriter) must be refused
+// loudly. Removing the source-side dedup means catchup re-emissions
+// reach the writer; a plain INSERT would duplicate them.
+func TestCopyTableColdStartIdempotent_RefusesNoPKWithoutCopyCapability(t *testing.T) {
+	rr := newPumpReader(10)
+	rw := &pkOnlyIdempotentWriter{}                                              // idempotent on PK, but no no-PK capability
+	table := &ir.Table{Name: "connections", Columns: []*ir.Column{{Name: "id"}}} // no PrimaryKey
+
+	err := copyTableColdStartIdempotent(context.Background(), rr, rw, table, nil, ShardColumnSpec{})
+	if err == nil {
+		t.Fatal("expected refusal for a no-PK table on a writer without no-PK upsert capability; got nil")
+	}
+	if !strings.Contains(err.Error(), "connections") || !strings.Contains(err.Error(), "no PRIMARY KEY") {
+		t.Errorf("error %q; want it to name the table and 'no PRIMARY KEY'", err.Error())
+	}
+	if rw.idemCalls != 0 {
+		t.Errorf("idemCalls=%d; want 0 (guard must fire before any write)", rw.idemCalls)
+	}
+}
+
+// TestCopyTableColdStartIdempotent_AllowsPKWithPlainIdempotentWriter
+// confirms the guard is scoped to PK-less tables: a table WITH a
+// PRIMARY KEY proceeds on the same PG-like writer, because ON CONFLICT
+// (pk) absorbs the catchup re-emissions regardless of engine.
+func TestCopyTableColdStartIdempotent_AllowsPKWithPlainIdempotentWriter(t *testing.T) {
+	rr := newPumpReader(10)
+	rw := &pkOnlyIdempotentWriter{}
+	table := &ir.Table{
+		Name:       "users",
+		Columns:    []*ir.Column{{Name: "id"}},
+		PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "id"}}},
+	}
+
+	if err := copyTableColdStartIdempotent(context.Background(), rr, rw, table, nil, ShardColumnSpec{}); err != nil {
+		t.Fatalf("PK table must proceed on a plain idempotent writer; got %v", err)
+	}
+	if rw.idemCalls != 1 {
+		t.Errorf("idemCalls=%d; want 1 (PK table routes through the upsert path)", rw.idemCalls)
 	}
 }

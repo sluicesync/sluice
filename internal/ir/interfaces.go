@@ -353,6 +353,30 @@ type IdempotentCopyReader interface {
 	CopyNeedsIdempotentWriter() bool
 }
 
+// IdempotentCopyWriter is the writer-side capability the cold-start
+// Bug-125 path requires before it will route a NO-PRIMARY-KEY table
+// through [IdempotentRowWriter.WriteRowsIdempotent]. A writer implements
+// it only when its idempotent path keys the upsert on a non-null UNIQUE
+// index for PK-less tables (or refuses a truly keyless table loudly) —
+// NEVER silently falling back to plain INSERT, which would duplicate
+// Vitess's COPY catchup re-emissions now that the source-side dedup is
+// gone.
+//
+// The MySQL target implements it. The Postgres target does not yet: its
+// WriteRowsIdempotent plain-INSERTs no-PK tables, so a VStream→PG copy
+// of a PK-less table is refused loudly (see the orchestrator's cold-
+// start idempotent path) until PG gains the symmetric unique-key-upsert
+// treatment. PK tables are unaffected on either engine — ON CONFLICT
+// (pk) / ON DUPLICATE KEY UPDATE absorbs their re-emissions regardless.
+type IdempotentCopyWriter interface {
+	IdempotentRowWriter
+
+	// HandlesNoPKIdempotentCopy reports whether WriteRowsIdempotent
+	// upserts a no-PRIMARY-KEY table on a unique key (or refuses it
+	// loudly) rather than plain-INSERTing it.
+	HandlesNoPKIdempotentCopy() bool
+}
+
 // TableTruncator is the optional surface a [RowWriter] (or
 // [SchemaWriter]) can implement to expose TRUNCATE TABLE for
 // resume's truncate-and-redo path. The pipeline.Migrator type-asserts

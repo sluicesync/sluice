@@ -1443,6 +1443,27 @@ func copyTableColdStartIdempotent(ctx context.Context, rr ir.RowReader, rw ir.Ro
 		)
 	}
 
+	// Bug 125 cross-engine guard. A NO-PRIMARY-KEY table relies on the
+	// writer upserting on a unique key to absorb VStream's COPY catchup
+	// re-emissions. A writer whose idempotent path plain-INSERTs no-PK
+	// tables (the Postgres target today) would DUPLICATE those rows now
+	// that the source-side dedup is gone — refuse loudly rather than
+	// silently corrupt. PK tables are safe on any idempotent writer
+	// (ON CONFLICT / ON DUPLICATE KEY on the PK absorbs re-emissions),
+	// so the guard only fires for PK-less tables.
+	if len(tablePKColumns(table)) == 0 {
+		icw, capable := idem.(ir.IdempotentCopyWriter)
+		if !capable || !icw.HandlesNoPKIdempotentCopy() {
+			return fmt.Errorf(
+				"pipeline: table %q has no PRIMARY KEY and the target's idempotent bulk-copy "+
+					"writer does not support no-PK upsert (VStream COPY re-emits rows out of order, "+
+					"Bug 125; a plain INSERT would duplicate them). Add a PRIMARY KEY to the source "+
+					"table, or migrate it with `migrate` instead of `sync start`",
+				table.Name,
+			)
+		}
+	}
+
 	copyCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 

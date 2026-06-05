@@ -49,6 +49,15 @@ func (w *RowWriter) WriteRowsIdempotent(ctx context.Context, table *ir.Table, ro
 	return w.writeBatchedIdempotent(ctx, table, rows)
 }
 
+// HandlesNoPKIdempotentCopy implements [ir.IdempotentCopyWriter]: the
+// MySQL idempotent copy path keys the upsert on a non-null UNIQUE index
+// when the table has no PRIMARY KEY ([effectiveUpsertKeyColumns]) and
+// refuses a truly keyless table loudly ([errKeylessIdempotent]), so it
+// never plain-INSERTs a no-PK table — which would duplicate VStream COPY
+// catchup re-emissions (Bug 125). The orchestrator gates the cold-start
+// no-PK path on this capability.
+func (w *RowWriter) HandlesNoPKIdempotentCopy() bool { return true }
+
 // writeBatchedIdempotent is the upsert-form of [writeBatched]. The
 // per-batch flush mechanics are identical (flush on whichever of
 // row-count cap and byte-size cap fires first; ADR-0028); only the

@@ -102,9 +102,29 @@ func globalCopyCompleted() *binlogdata.VEvent {
 // onto, and a cancel that tears the pump down.
 func newStreamingHarness(t *testing.T, resp []*vtgate.VStreamResponse) (*vstreamSnapshotStream, *ir.SnapshotStream, context.CancelFunc) {
 	t.Helper()
+	return newStreamingHarnessCapped(t, resp, 0)
+}
+
+// newStreamingHarnessCapped is [newStreamingHarness] with the byte cap
+// applied BEFORE the copy pump goroutine starts. A test that needs a
+// small cap must NOT set s.maxBufferBytes after the harness returns:
+// the pump is already running and buffers at the 64 MiB default
+// ([defaultSnapshotMaxBufferBytes]) until the lower cap lands, so the
+// high-water mark overshoots by however many rows the pump enqueued in
+// that window. Under -race that window is wide enough to blow a tight
+// bound — the v0.99.x CI flake in TestVStreamSnapshot_StreamingBounded-
+// Memory (peak 53064 vs cap 8192). Applying the cap before the pump
+// starts makes the bound exact and the assertion non-flaky.
+//
+// capBytes <= 0 keeps the constructor default.
+func newStreamingHarnessCapped(t *testing.T, resp []*vtgate.VStreamResponse, capBytes int64) (*vstreamSnapshotStream, *ir.SnapshotStream, context.CancelFunc) {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 
 	s := newTestSnapshotStream()
+	if capBytes > 0 {
+		s.maxBufferBytes = capBytes
+	}
 	s.copyDone = make(chan struct{})
 	s.grpcStream = &fakeVStreamClient{ctx: ctx, resp: resp}
 
@@ -156,11 +176,12 @@ func TestVStreamSnapshot_StreamingBoundedMemory(t *testing.T) {
 		oneEvent(globalCopyCompleted()),
 	)
 
-	s, _, cancel := newStreamingHarness(t, resp)
+	// Apply the cap BEFORE the pump starts (newStreamingHarnessCapped),
+	// not after — otherwise the pump buffers at the 64 MiB default until
+	// the cap lands and the high-water mark overshoots (the v0.99.x
+	// -race flake). With the cap set up front the bound is exact.
+	s, _, cancel := newStreamingHarnessCapped(t, resp, capBytes)
 	defer cancel()
-	s.mu.Lock()
-	s.maxBufferBytes = capBytes
-	s.mu.Unlock()
 
 	// Sample the buffered-bytes high-water mark from a watchdog while
 	// the consumer drains, so we observe the pump's steady state rather
@@ -448,11 +469,11 @@ func TestVStreamSnapshot_StreamingMultiTableInterleaveRefuse(t *testing.T) {
 	}
 	resp = append(resp, oneEvent(globalCopyCompleted()))
 
-	s, _, cancel := newStreamingHarness(t, resp)
+	// Cap applied before the pump starts (see newStreamingHarnessCapped)
+	// so the interleaving refusal fires deterministically rather than
+	// racing the default-cap buffering window.
+	s, _, cancel := newStreamingHarnessCapped(t, resp, capBytes)
 	defer cancel()
-	s.mu.Lock()
-	s.maxBufferBytes = capBytes
-	s.mu.Unlock()
 
 	ctx, ccancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer ccancel()
