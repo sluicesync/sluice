@@ -533,20 +533,57 @@ func (r *vstreamCDCReader) resolveStartPosition(from ir.Position) ([]shardGtid, 
 	return fromNowVStreamPos(r.keyspace, r.shards), nil
 }
 
+// anyTablePKsPresent reports whether any shard in the resolved start
+// position still carries a per-table COPY-resume cursor (a non-empty
+// TablePKs). A non-empty cursor means this stream is resuming a
+// mid-COPY snapshot, not pure CDC tailing.
+func anyTablePKsPresent(start []shardGtid) bool {
+	for _, sg := range start {
+		if len(sg.TablePKs) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // buildVStreamRequest assembles the gRPC request from the resolved
 // position, the fixed flags v1 uses, and a wildcard table filter.
-// The flags are conservative: REPLICA tablet (off the primary's
-// hot path), MinimizeSkew for cleaner per-shard ordering,
-// StopOnReshard so the reader sees a clean termination instead of
-// a silently-rewritten shard layout, and a 5s heartbeat for
-// liveness.
+// The flags are conservative: MinimizeSkew for cleaner per-shard
+// ordering, StopOnReshard so the reader sees a clean termination
+// instead of a silently-rewritten shard layout, and a 5s heartbeat
+// for liveness.
+//
+// Tablet selection is cursor-dependent (ADR-0072):
+//
+//   - Pure CDC tailing (no TablePKs cursor) targets REPLICA to keep
+//     load off the primary's hot path. The binlog tail needs no
+//     schema-engine catalog lookup, so a cold replica is fine.
+//
+//   - A COPY-resume (non-empty TablePKs cursor) targets PRIMARY. This
+//     is the Phase-A root cause: on resume, vtgate's
+//     uvstreamer.buildTablePlan enumerates the COPY tables via the
+//     resolved tablet's schema engine. A REPLICA's schema engine may
+//     be COLD, so buildTablePlan finds no copy plan, the COPY-resume
+//     branch is skipped, and the stream SILENTLY degrades to plain
+//     CDC tailing — the TablePKs cursor is ignored and the un-copied
+//     rows are NEVER replayed (silent loss). PROVEN: flipping the
+//     resume TabletType REPLICA→PRIMARY made vtgate resume from the
+//     cursor (rows from id=cursor+1, ascending, no restart). The
+//     PRIMARY also took the snapshot (cdc_vstream_snapshot.go:115),
+//     so resuming there keeps the COPY read consistent with the
+//     snapshot's GTID anchor. This mirrors the snapshot cold-start
+//     and reconnectCopy paths, which already target PRIMARY.
 func (r *vstreamCDCReader) buildVStreamRequest(start []shardGtid) (*vtgate.VStreamRequest, error) {
 	shardGtids, err := toProtoShardGtids(start)
 	if err != nil {
 		return nil, err
 	}
+	tabletType := topodata.TabletType_REPLICA
+	if anyTablePKsPresent(start) {
+		tabletType = topodata.TabletType_PRIMARY
+	}
 	return &vtgate.VStreamRequest{
-		TabletType: topodata.TabletType_REPLICA,
+		TabletType: tabletType,
 		Vgtid:      &binlogdata.VGtid{ShardGtids: shardGtids},
 		Filter: &binlogdata.Filter{Rules: []*binlogdata.Rule{
 			// "/.*/" matches every table in the keyspace. Refining

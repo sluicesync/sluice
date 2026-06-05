@@ -49,11 +49,17 @@ func TestVStream_CopyResume_MidCopyCheckpointResumesFromCursor(t *testing.T) {
 	mysqlDSN, grpcEndpoint, _, cleanup := startVTTestServer(t)
 	defer cleanup()
 
-	const totalRows = 3000
+	// 20k rows with a wide padded name (matching the no-PK test) so the
+	// COPY reliably spans many VStream packets and the bounded checkpoint
+	// cadence captures a genuine MID-COPY cursor. The original 3k table
+	// drained inside a single COPY batch on vttestserver, leaving only a
+	// terminal (post-completion) cursor — too small to exercise resume.
+	const totalRows = 20000
+	const pad = "0123456789012345678901234567890123456789" // 40 bytes
 	const seedDDL = `
 		CREATE TABLE widgets (
-			id   BIGINT       NOT NULL AUTO_INCREMENT,
-			name VARCHAR(64)  NOT NULL,
+			id   BIGINT        NOT NULL AUTO_INCREMENT,
+			name VARCHAR(255)  NOT NULL,
 			PRIMARY KEY (id)
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
 	`
@@ -67,7 +73,7 @@ func TestVStream_CopyResume_MidCopyCheckpointResumesFromCursor(t *testing.T) {
 		} else {
 			b.WriteString(",")
 		}
-		fmt.Fprintf(&b, "('w%d')", i)
+		fmt.Fprintf(&b, "('w%d-%s')", i, pad)
 		if i%500 == 0 {
 			applyVTTestSQL(t, mysqlDSN+"&multiStatements=true", b.String())
 			b.Reset()
@@ -118,7 +124,7 @@ func TestVStream_CopyResume_MidCopyCheckpointResumesFromCursor(t *testing.T) {
 		Name: "widgets",
 		Columns: []*ir.Column{
 			{Name: "id", Type: ir.Integer{Width: 64, AutoIncrement: true}},
-			{Name: "name", Type: ir.Varchar{Length: 64}},
+			{Name: "name", Type: ir.Varchar{Length: 255}},
 		},
 	}
 	rowsCh, err := stream.Rows.ReadRows(ctx, widgetsTable)
@@ -322,7 +328,7 @@ func TestVStream_CopyResume_NoPKTable_CheckpointLagReSendUpserts(t *testing.T) {
 	}
 
 	eng := Engine{Flavor: FlavorPlanetScale}
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
 	stream, err := eng.OpenSnapshotStream(ctx, sluiceDSN)
@@ -380,18 +386,18 @@ func TestVStream_CopyResume_NoPKTable_CheckpointLagReSendUpserts(t *testing.T) {
 			break
 		}
 	}
-	// Whether a *mid-COPY* cursor surfaces depends on the vttestserver
-	// build's COPY packetization: a build that drains the whole table in
-	// one packet only ever emits a COPY-completed (terminal) cursor, with
-	// no rows left to resume. That is an environment property, not a
-	// product defect — and the deterministic Fix-1 proof lives in
-	// TestChangeApplier_NoPKWithUniqueKey_Idempotent (the applier upsert
-	// path this resume depends on). So when no strictly-mid-COPY cursor is
-	// captured, skip rather than false-fail; on a build that DOES surface
-	// one (observed: lastpk id=5045 of 20000), the assertions below run.
+	// With the ADR-0072 resume-targets-PRIMARY fix, a 20k wide-row no-PK
+	// table reliably surfaces a strictly mid-COPY cursor on vttestserver
+	// (the COPY spans many packets; the bounded checkpoint cadence catches
+	// an intermediate LASTPK). A missing mid-COPY cursor now means the
+	// table sizing / cadence regressed, NOT an environment quirk — so it
+	// is a hard failure, not a skip. (If a future vttestserver build
+	// changes packetization, enlarge totalRows / tighten the cadence until
+	// a mid-COPY cursor is captured — the point is a genuine resume
+	// assertion.)
 	if !haveCursor || cursorLast <= 0 || cursorLast >= totalRows {
 		_ = stream.Close()
-		t.Skipf("vttestserver did not surface a strictly mid-COPY no-PK cursor (haveCursor=%v lastpk=%d of %d); the applier-upsert correctness is pinned deterministically by TestChangeApplier_NoPKWithUniqueKey_Idempotent",
+		t.Fatalf("did not capture a strictly mid-COPY no-PK cursor (haveCursor=%v lastpk=%d of %d) — enlarge the table / tighten the checkpoint cadence until vtgate emits an intermediate LASTPK",
 			haveCursor, cursorLast, totalRows)
 	}
 	t.Logf("no-PK resume: mid-COPY checkpoint connections lastpk id=%d (of %d rows)", cursorLast, totalRows)
@@ -460,9 +466,14 @@ func TestVStream_CopyResume_NoPKTable_CheckpointLagReSendUpserts(t *testing.T) {
 	}
 	defer closeIfErr(rdr)
 
-	resumeCtx, resumeCancel := context.WithTimeout(ctx, 4*time.Minute)
-	defer resumeCancel()
-	changes, err := rdr.StreamChanges(resumeCtx, checkpoint)
+	// The resume reader and the applier get SEPARATE contexts. The reader's
+	// resume read is bounded (we stop once we have the bounded sample); the
+	// applier drains on the outer ctx so its final WritePosition isn't cut
+	// off by the read deadline — a deadline there would masquerade as an
+	// apply failure even though the resume itself succeeded.
+	readCtx, readCancel := context.WithTimeout(ctx, 8*time.Minute)
+	defer readCancel()
+	changes, err := rdr.StreamChanges(readCtx, checkpoint)
 	if err != nil {
 		t.Fatalf("StreamChanges (resume from checkpoint): %v", err)
 	}
@@ -473,29 +484,55 @@ func TestVStream_CopyResume_NoPKTable_CheckpointLagReSendUpserts(t *testing.T) {
 	// upsert MUST absorb every one (zero 1062). The "/.*/" resume also
 	// re-copies other keyspace tables; we ignore their events.
 	//
-	// Whether vtgate actually re-emits the resumed COPY rows is, again,
-	// a vttestserver-build property: some builds replay the COPY from
-	// the cursor (the rows arrive as Inserts here), others complete the
-	// COPY at the cursor without replay. firstResumeGrace bounds the
-	// wait for the FIRST resumed `connections` Insert; if none arrives,
-	// we skip (the environment didn't replay COPY on resume) rather than
-	// false-fail, since the applier-upsert correctness is already pinned
-	// deterministically elsewhere. Once rows DO start arriving, we assert
+	// With the ADR-0072 resume-targets-PRIMARY fix, vtgate continues the
+	// COPY scan from the cursor and replays rows id > cursorLast as COPY
+	// Inserts. firstResumeGrace bounds the wait for the FIRST resumed
+	// `connections` Insert; if none arrives within the window the resume
+	// silently degraded to plain CDC tailing (the pre-fix REPLICA-cold-
+	// schema bug) and we FAIL — not skip. Once rows arrive, we assert
 	// zero 1062 + zero loss on them.
-	wantResume := totalRows - int(cursorLast)
-	applierCh := make(chan ir.Change, 256)
+	remaining := totalRows - int(cursorLast)
+	// We route a BOUNDED sample of the resumed COPY rows through the real
+	// applier — enough to prove the load-bearing properties (resume starts
+	// at id > cursor, the re-sends upsert with zero 1062, and the replayed
+	// prefix is gap-free) — rather than all ~15k. Routing the full
+	// remainder through the control-table-writing applier is ~12 min of
+	// wall-clock (the applier's per-batch commit under the 100ms idle-flush
+	// is the rate limiter); a bounded sample keeps the CI vstream job fast
+	// while still exercising the exact warm-resume seam. The full-source
+	// zero-loss is independently ground-truthed by the final DB COUNT
+	// below.
+	sampleN := remaining
+	if sampleN > 2000 {
+		sampleN = 2000
+	}
+	// applierCh is buffered to hold the whole sample so the forward loop
+	// NEVER blocks on the send. Decoupling the channel-drain from the
+	// applier's commit latency is load-bearing for throughput: if the
+	// forward loop blocked on a slow applier mid-commit, it would stop
+	// draining `changes`, vtgate's server-side buffer would fill, and the
+	// COPY replay would throttle to the applier's commit rate.
+	applierCh := make(chan ir.Change, sampleN+64)
 	applyErrCh := make(chan error, 1)
+	// Drain through the BATCHED apply path (ApplyBatch, batch 500) rather
+	// than per-change Apply: it routes through the identical no-PK
+	// idempotent upsert (buildInsertSQL → ON DUPLICATE KEY UPDATE), so the
+	// zero-1062 property is preserved, but it commits + writes position
+	// once per batch instead of once per row. The warm-resume production
+	// path uses ApplyBatch too (the orchestrator batches), so this is also
+	// the realistic shape.
 	go func() {
-		applyErrCh <- applier.Apply(resumeCtx, "nopk-resume-stream", applierCh)
+		applyErrCh <- applier.(*ChangeApplier).ApplyBatch(ctx, "nopk-resume-stream", applierCh, 500)
 	}()
 
-	resumedIDs := make(map[int64]bool, wantResume)
+	resumedIDs := make(map[int64]bool, sampleN)
 	minResumed := int64(1<<62 - 1)
-	firstResumeGrace := time.After(60 * time.Second)
-	overallDeadline := time.After(220 * time.Second)
+	maxResumed := int64(-1)
+	firstResumeGrace := time.After(90 * time.Second)
+	overallDeadline := time.After(5 * time.Minute)
 	sawAny := false
 forward:
-	for len(resumedIDs) < wantResume {
+	for len(resumedIDs) < sampleN {
 		select {
 		case ev, ok := <-changes:
 			if !ok {
@@ -513,24 +550,25 @@ forward:
 			if id < minResumed {
 				minResumed = id
 			}
+			if id > maxResumed {
+				maxResumed = id
+			}
 			if !resumedIDs[id] {
 				resumedIDs[id] = true
-				// Send to the applier, but don't deadlock if the applier
-				// goroutine already returned an error (stopped draining):
-				// surface it (a 1062 would land here).
+				// The buffer is sized to the whole sample, so this send
+				// never blocks; still guard against the applier having
+				// returned early on an error (a 1062 would surface here).
 				select {
 				case applierCh <- ins:
 				case err := <-applyErrCh:
 					t.Fatalf("applier returned mid-stream — a 1062 here means the no-PK re-sends collided instead of upserting: %v", err)
-				case <-overallDeadline:
-					break forward
 				}
 			}
 		case <-firstResumeGrace:
 			if !sawAny {
 				close(applierCh)
 				<-applyErrCh
-				t.Skipf("vttestserver did not replay any resumed COPY rows for the no-PK table within the grace window; applier-upsert correctness is pinned deterministically by TestChangeApplier_NoPKWithUniqueKey_Idempotent")
+				t.Fatalf("no resumed COPY rows for the no-PK table arrived within the grace window — the resume degraded to plain CDC tailing instead of continuing the COPY from the cursor (the pre-ADR-0072 REPLICA-cold-schema silent-loss bug)")
 			}
 		case <-overallDeadline:
 			break forward
@@ -541,15 +579,26 @@ forward:
 		t.Fatalf("applier returned error on checkpoint-lag re-send — a 1062 here means the no-PK re-sends collided instead of upserting: %v", err)
 	}
 
+	// Resume started past the cursor (no row-0 restart).
 	if minResumed <= cursorLast {
 		t.Errorf("resume re-emitted id=%d <= cursor lastpk %d — vtgate restarted COPY from row 0", minResumed, cursorLast)
 	}
-	if len(resumedIDs) < wantResume {
-		t.Errorf("resume yielded %d distinct rows; want %d (rows with id > %d) — possible loss", len(resumedIDs), wantResume, cursorLast)
+	// We collected the full sample.
+	if len(resumedIDs) < sampleN {
+		t.Errorf("resume yielded %d distinct sample rows; want %d (rows with id > %d) — possible loss", len(resumedIDs), sampleN, cursorLast)
+	}
+	// The replayed prefix is GAP-FREE: every id in [minResumed, maxResumed]
+	// is present. A silent mid-replay skip (loss within the resumed range)
+	// would leave a hole here even though the sample count matched.
+	for id := minResumed; id <= maxResumed; id++ {
+		if !resumedIDs[id] {
+			t.Fatalf("resumed COPY has a gap at id=%d within [%d,%d] — silent loss inside the replayed range", id, minResumed, maxResumed)
+		}
 	}
 
-	// Zero loss: the target still holds exactly the full source set (the
-	// re-sends upserted in place, no duplicates, no drops).
+	// Full-source zero loss: the target still holds exactly the full source
+	// set (the sample's re-sends upserted in place — no duplicates, no
+	// drops — and the pre-populated rows beyond the sample are untouched).
 	srcCount := scalarCount(t, mysqlDSN, "SELECT COUNT(*) FROM connections")
 	dstCount := scalarCount(t, targetDSN, "SELECT COUNT(*) FROM connections")
 	if dstCount != srcCount {

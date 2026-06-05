@@ -12,6 +12,7 @@ import (
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/proto/binlogdata"
 	querypb "vitess.io/vitess/go/vt/proto/query"
+	"vitess.io/vitess/go/vt/proto/topodata"
 
 	"sluicesync.dev/sluice/internal/ir"
 )
@@ -80,6 +81,55 @@ func TestVStreamPos_TablePKsRoundTrip(t *testing.T) {
 		if !bytes.Equal(wb, gb) {
 			t.Errorf("TablePKs[%d] (%s) not byte-identical after round-trip", i, want.GetTableName())
 		}
+	}
+}
+
+// TestBuildVStreamRequest_TabletTypeDependsOnCopyResumeCursor pins the
+// ADR-0072 resume-targets-PRIMARY fix: buildVStreamRequest must target
+// PRIMARY when the resolved start position carries a non-empty TablePKs
+// cursor (a mid-COPY resume) and REPLICA when it does not (pure CDC
+// tailing). The root cause this guards against: on resume, vtgate's
+// uvstreamer.buildTablePlan enumerates the COPY tables via the resolved
+// tablet's schema engine; a REPLICA's schema engine may be COLD, so the
+// COPY-resume branch is silently skipped and the un-copied rows are
+// never replayed (silent loss). PROVEN against real vttestserver
+// (REPLICA→PRIMARY makes vtgate resume from the cursor).
+func TestBuildVStreamRequest_TabletTypeDependsOnCopyResumeCursor(t *testing.T) {
+	r := &vstreamCDCReader{}
+
+	// (1) Pure CDC tailing: no TablePKs cursor → REPLICA (off the
+	// primary's hot path).
+	cdcTail := []shardGtid{{Keyspace: "main", Shard: "-", Gtid: "MySQL56/abcd:1-100"}}
+	req, err := r.buildVStreamRequest(cdcTail)
+	if err != nil {
+		t.Fatalf("buildVStreamRequest(cdc tail): %v", err)
+	}
+	if req.TabletType != topodata.TabletType_REPLICA {
+		t.Errorf("pure CDC tailing targeted %v; want REPLICA", req.TabletType)
+	}
+
+	// (2) Mid-COPY resume: a non-empty TablePKs cursor → PRIMARY (warm
+	// schema engine, consistent with the PRIMARY-taken snapshot).
+	withCursor, err := vgtidToShardGtidSlice(&binlogdata.VGtid{ShardGtids: []*binlogdata.ShardGtid{
+		{
+			Keyspace: "main",
+			Shard:    "-",
+			Gtid:     "MySQL56/abcd:1-100",
+			TablePKs: []*binlogdata.TableLastPK{makeTableLastPK(t, "users", "id", 4242)},
+		},
+	}})
+	if err != nil {
+		t.Fatalf("vgtidToShardGtidSlice: %v", err)
+	}
+	if !anyTablePKsPresent(withCursor) {
+		t.Fatal("test setup: expected a non-empty TablePKs cursor")
+	}
+	req, err = r.buildVStreamRequest(withCursor)
+	if err != nil {
+		t.Fatalf("buildVStreamRequest(copy resume): %v", err)
+	}
+	if req.TabletType != topodata.TabletType_PRIMARY {
+		t.Errorf("mid-COPY resume targeted %v; want PRIMARY (REPLICA's cold schema engine would silently skip the COPY-resume → silent loss)", req.TabletType)
 	}
 }
 
