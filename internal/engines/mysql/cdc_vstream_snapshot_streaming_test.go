@@ -132,7 +132,7 @@ func newStreamingHarnessCapped(t *testing.T, resp []*vtgate.VStreamResponse, cap
 		Rows:    &vstreamSnapshotRows{snap: s},
 		Changes: &vstreamSnapshotChanges{snap: s},
 	}
-	go s.copyPump(ctx, stream)
+	go s.copyPump(ctx, cancel, stream)
 	return s, stream, cancel
 }
 

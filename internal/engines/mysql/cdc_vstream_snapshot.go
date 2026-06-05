@@ -86,6 +86,11 @@ func (e Engine) openVStreamSnapshotStream(ctx context.Context, dsn string) (*ir.
 		_ = conn.Close()
 		return nil, err
 	}
+	livenessWindow, err := vstreamLivenessWindowFromDSN(cfg)
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
 	client := vtgateservice.NewVitessClient(conn)
 
 	// The gRPC stream lives for the lifetime of the SnapshotStream:
@@ -144,6 +149,7 @@ func (e Engine) openVStreamSnapshotStream(ctx context.Context, dsn string) (*ir.
 		maxBufferBytes:       defaultSnapshotMaxBufferBytes,
 		checkpointRows:       defaultCopyCheckpointRows,
 		checkpointInterval:   defaultCopyCheckpointInterval,
+		livenessWindow:       livenessWindow,
 		conn:                 conn,
 		grpcStream:           grpcStream,
 		grpcCancel:           streamCancel,
@@ -170,7 +176,7 @@ func (e Engine) openVStreamSnapshotStream(ctx context.Context, dsn string) (*ir.
 	// lifetime; the caller's ctx does NOT, because the SnapshotStream —
 	// and the gRPC stream it rides — must outlive this function.
 	snap.copyDone = make(chan struct{})
-	go snap.copyPump(streamCtx, stream)
+	go snap.copyPump(streamCtx, streamCancel, stream)
 
 	return stream, nil
 }
@@ -237,6 +243,13 @@ type vstreamSnapshotStream struct {
 	reconnectMax         int
 	reconnectBackoffBase time.Duration
 	reconnectBackoffCap  time.Duration
+
+	// livenessWindow bounds how long each pump (COPY and post-COPY CDC)
+	// waits for the FIRST event of any kind (incl. heartbeat) after the
+	// stream opens before failing LOUDLY rather than hanging silently
+	// (the dead-stream / no-tablet wedge; ADR-0073 (b2)). From the
+	// vstream_liveness_timeout DSN param; 0 disables it.
+	livenessWindow time.Duration
 
 	// fields caches column metadata keyed by [fieldCacheKey]. Shared
 	// between COPY-phase row decoding and post-COPY change decoding —
@@ -410,8 +423,22 @@ const (
 // onto stream; copyPump only has to broadcast the terminal state so any
 // ReadRows consumer still blocked on an empty queue wakes and closes
 // its channel.
-func (s *vstreamSnapshotStream) copyPump(ctx context.Context, stream *ir.SnapshotStream) {
+func (s *vstreamSnapshotStream) copyPump(ctx context.Context, cancel context.CancelFunc, stream *ir.SnapshotStream) {
 	defer close(s.copyDone)
+
+	// First-event liveness watchdog (ADR-0073 (b2)): if NO event of any
+	// kind (incl. heartbeat) arrives within the window of opening the
+	// stream — the dead-stream / no-tablet signature — fail LOUDLY and
+	// cancel the stream so the parked Recv unblocks, rather than hanging
+	// the cold-start forever. The snapshot COPY targets PRIMARY (so the
+	// no-REPLICA wedge can't fire here), but a dead PRIMARY stream is the
+	// same silent-hang hazard, and keeping the guard symmetric with the
+	// CDC tail is cheap. Disarmed on the first successful Recv.
+	live := startVStreamLiveness(ctx, s.livenessWindow, func() {
+		s.failCopy(vstreamLivenessTimeoutError(s.livenessWindow, topodata.TabletType_PRIMARY, s.keyspace, s.shards))
+		cancel()
+	})
+	defer live.stop()
 
 	// lastCheckpoint is the wall-clock anchor for the T-seconds half of
 	// the cadence. Owned by this goroutine (the sole checkpoint caller),
@@ -459,6 +486,11 @@ func (s *vstreamSnapshotStream) copyPump(ctx context.Context, stream *ir.Snapsho
 			return
 		}
 		reconnectAttempts = 0
+		// A non-heartbeat event proves a tablet is serving — disarm the
+		// no-tablet watchdog. Heartbeats alone don't (ADR-0073 (b2)).
+		if eventsProveLiveness(resp.GetEvents()) {
+			live.observe()
+		}
 		for _, ev := range resp.GetEvents() {
 			done, err := s.dispatchCopyEvent(ev)
 			if err != nil {
@@ -930,8 +962,22 @@ func (s *vstreamSnapshotStream) startPump(ctx context.Context) (<-chan ir.Change
 // reuses the same gRPC stream the COPY phase drained; events still
 // flow against the cached field map (which may grow if new tables
 // surface or FIELD events refresh on DDL).
+//
+// First-event liveness watchdog (ADR-0073 (b2)): symmetric with the COPY
+// pump and the standalone CDC tail. The no-REPLICA wedge cannot fire here
+// (this CDC phase reuses the PRIMARY stream the COPY phase already proved
+// live), but a totally-silent stream is the same hang hazard, so the
+// guard stays. Disarmed on the first successful Recv; on timeout it
+// records a loud error and cancels the gRPC stream so the parked Recv
+// unblocks.
 func (s *vstreamSnapshotStream) pump(ctx context.Context, out chan<- ir.Change) {
 	defer close(out)
+
+	live := startVStreamLiveness(ctx, s.livenessWindow, func() {
+		s.setErr(vstreamLivenessTimeoutError(s.livenessWindow, topodata.TabletType_PRIMARY, s.keyspace, s.shards))
+		s.cancelGRPCStream()
+	})
+	defer live.stop()
 
 	for {
 		// Honour caller cancellation independently of the stream's
@@ -950,6 +996,11 @@ func (s *vstreamSnapshotStream) pump(ctx context.Context, out chan<- ir.Change) 
 			}
 			s.setErr(classifyReaderError(fmt.Errorf("mysql/vstream: snapshot: cdc recv: %w", err)))
 			return
+		}
+		// A non-heartbeat event proves a tablet is serving — disarm the
+		// watchdog. Heartbeats alone don't (ADR-0073 (b2)).
+		if eventsProveLiveness(resp.GetEvents()) {
+			live.observe()
 		}
 		for _, ev := range resp.GetEvents() {
 			if err := s.dispatchCDCEvent(ctx, ev, out); err != nil {
@@ -1150,6 +1201,21 @@ func (s *vstreamSnapshotStream) Err() error {
 	return s.err
 }
 
+// cancelGRPCStream cancels the gRPC stream context so a parked Recv
+// unblocks, WITHOUT closing the connection. Used by the liveness watchdog
+// to tear down a dead/silent stream after recording its loud error.
+// Reads s.grpcCancel under mu (close also writes it) and invokes it
+// without niling — context.CancelFunc is idempotent, so a concurrent
+// close() calling it again is harmless.
+func (s *vstreamSnapshotStream) cancelGRPCStream() {
+	s.mu.Lock()
+	cancel := s.grpcCancel
+	s.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
 // close cancels the gRPC stream and closes the connection. Wired
 // into [ir.SnapshotStream.CloseFn]. Safe to call multiple times.
 //
@@ -1160,9 +1226,15 @@ func (s *vstreamSnapshotStream) Err() error {
 // rows both unwedge. We also broadcast here directly to cover the
 // window before the pump observes the cancellation.
 func (s *vstreamSnapshotStream) close() error {
-	if s.grpcCancel != nil {
-		s.grpcCancel()
-		s.grpcCancel = nil
+	// Read+clear grpcCancel under mu — the liveness watchdog
+	// (cancelGRPCStream) reads it under the same lock, so an unguarded
+	// access here would race it.
+	s.mu.Lock()
+	cancel := s.grpcCancel
+	s.grpcCancel = nil
+	s.mu.Unlock()
+	if cancel != nil {
+		cancel()
 	}
 	if s.cond != nil {
 		s.mu.Lock()

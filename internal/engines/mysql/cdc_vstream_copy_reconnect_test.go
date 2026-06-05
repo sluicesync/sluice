@@ -131,7 +131,7 @@ func TestVStreamSnapshot_CopyReconnectResumesFromCursor(t *testing.T) {
 		Rows:    &vstreamSnapshotRows{snap: s},
 		Changes: &vstreamSnapshotChanges{snap: s},
 	}
-	go s.copyPump(ctx, streamObj)
+	go s.copyPump(ctx, cancel, streamObj)
 
 	// Drain table "t" — should see all three rows (2 before the drop, 1
 	// after the in-place reconnect): zero loss.
@@ -203,7 +203,7 @@ func TestVStreamSnapshot_CopyReconnectBudgetExhausted(t *testing.T) {
 	s.grpcStream = &scriptedStream{ctx: ctx, steps: dropStream}
 
 	streamObj := &ir.SnapshotStream{Rows: &vstreamSnapshotRows{snap: s}, Changes: &vstreamSnapshotChanges{snap: s}}
-	go s.copyPump(ctx, streamObj)
+	go s.copyPump(ctx, cancel, streamObj)
 
 	// Wait for the pump to give up (copyDone closes).
 	select {

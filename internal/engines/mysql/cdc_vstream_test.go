@@ -14,6 +14,7 @@ import (
 	gomysql "github.com/go-sql-driver/mysql"
 	"vitess.io/vitess/go/vt/proto/binlogdata"
 	"vitess.io/vitess/go/vt/proto/query"
+	"vitess.io/vitess/go/vt/proto/topodata"
 
 	"sluicesync.dev/sluice/internal/ir"
 )
@@ -897,6 +898,247 @@ func TestShardLayoutChangedError_Is(t *testing.T) {
 	// Unrelated errors must not match.
 	if errors.Is(errors.New("other"), ErrShardLayoutChanged) {
 		t.Errorf("errors.Is unrelated = true; want false")
+	}
+}
+
+// TestVStreamTabletTypeFromDSN pins the vstream_tablet_type DSN parse
+// (ADR-0073 (b2) usability): the three valid values, the default, and a
+// loud error for anything else.
+func TestVStreamTabletTypeFromDSN(t *testing.T) {
+	cases := []struct {
+		name    string
+		val     string // empty ⇒ param absent
+		want    topodata.TabletType
+		wantErr bool
+	}{
+		{name: "default (absent) ⇒ replica", val: "", want: topodata.TabletType_REPLICA},
+		{name: "explicit replica", val: "replica", want: topodata.TabletType_REPLICA},
+		{name: "primary", val: "primary", want: topodata.TabletType_PRIMARY},
+		{name: "rdonly", val: "rdonly", want: topodata.TabletType_RDONLY},
+		{name: "unknown ⇒ loud error", val: "secondary", wantErr: true},
+		{name: "case-sensitive ⇒ loud error", val: "PRIMARY", wantErr: true},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			params := map[string]string{}
+			if c.val != "" {
+				params["vstream_tablet_type"] = c.val
+			}
+			cfg, _ := minimalConfig("host:3306", params)
+			got, err := vstreamTabletTypeFromDSN(cfg)
+			if c.wantErr {
+				if err == nil {
+					t.Fatalf("want loud error for %q; got nil (type %v)", c.val, got)
+				}
+				if !strings.Contains(err.Error(), "vstream_tablet_type") {
+					t.Errorf("error does not name the param: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != c.want {
+				t.Errorf("got %v; want %v", got, c.want)
+			}
+		})
+	}
+}
+
+// TestVStreamLivenessWindowFromDSN pins the vstream_liveness_timeout DSN
+// parse: default when absent, a parsed duration, 0-disables, and a loud
+// error on a malformed value.
+func TestVStreamLivenessWindowFromDSN(t *testing.T) {
+	cases := []struct {
+		name    string
+		val     string
+		want    time.Duration
+		wantErr bool
+	}{
+		{name: "default (absent)", val: "", want: defaultVStreamLivenessWindow},
+		{name: "explicit 45s", val: "45s", want: 45 * time.Second},
+		{name: "zero disables", val: "0s", want: 0},
+		{name: "malformed ⇒ loud error", val: "soon", wantErr: true},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			params := map[string]string{}
+			if c.val != "" {
+				params["vstream_liveness_timeout"] = c.val
+			}
+			cfg, _ := minimalConfig("host:3306", params)
+			got, err := vstreamLivenessWindowFromDSN(cfg)
+			if c.wantErr {
+				if err == nil {
+					t.Fatalf("want loud error for %q; got nil (%v)", c.val, got)
+				}
+				if !strings.Contains(err.Error(), "vstream_liveness_timeout") {
+					t.Errorf("error does not name the param: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != c.want {
+				t.Errorf("got %v; want %v", got, c.want)
+			}
+		})
+	}
+}
+
+// TestBuildVStreamRequest_TabletTypeSelection pins the cursor-dependent
+// tablet selection (ADR-0072 + ADR-0073 (b2)):
+//
+//   - No TablePKs cursor ⇒ the reader's CONFIGURED tablet type (the
+//     vstream_tablet_type default/override) is used for the pure CDC tail.
+//   - A TablePKs cursor present ⇒ PRIMARY regardless of the configured
+//     type (the COPY-resume override always wins).
+func TestBuildVStreamRequest_TabletTypeSelection(t *testing.T) {
+	// A valid encoded cursor so toProtoShardGtids decodes cleanly.
+	cursor, err := encodeTablePKs([]*binlogdata.TableLastPK{{
+		TableName: "widgets",
+		Lastpk:    &query.QueryResult{},
+	}})
+	if err != nil {
+		t.Fatalf("encodeTablePKs: %v", err)
+	}
+
+	noCursor := []shardGtid{{Keyspace: "main", Shard: "0", Gtid: "current"}}
+	withCursor := []shardGtid{{Keyspace: "main", Shard: "0", Gtid: "MySQL56/abcd:1-5", TablePKs: cursor}}
+
+	cases := []struct {
+		name       string
+		configured topodata.TabletType
+		start      []shardGtid
+		want       topodata.TabletType
+	}{
+		{name: "no cursor + default replica ⇒ replica", configured: topodata.TabletType_REPLICA, start: noCursor, want: topodata.TabletType_REPLICA},
+		{name: "no cursor + primary override ⇒ primary", configured: topodata.TabletType_PRIMARY, start: noCursor, want: topodata.TabletType_PRIMARY},
+		{name: "no cursor + rdonly override ⇒ rdonly", configured: topodata.TabletType_RDONLY, start: noCursor, want: topodata.TabletType_RDONLY},
+		{name: "zero-value tablet type ⇒ replica default", configured: topodata.TabletType_UNKNOWN, start: noCursor, want: topodata.TabletType_REPLICA},
+		{name: "cursor present + replica configured ⇒ PRIMARY wins", configured: topodata.TabletType_REPLICA, start: withCursor, want: topodata.TabletType_PRIMARY},
+		{name: "cursor present + rdonly configured ⇒ PRIMARY wins", configured: topodata.TabletType_RDONLY, start: withCursor, want: topodata.TabletType_PRIMARY},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			r := &vstreamCDCReader{keyspace: "main", shards: []string{"0"}, tabletType: c.configured}
+			req, err := r.buildVStreamRequest(c.start)
+			if err != nil {
+				t.Fatalf("buildVStreamRequest: %v", err)
+			}
+			if req.GetTabletType() != c.want {
+				t.Errorf("TabletType = %v; want %v", req.GetTabletType(), c.want)
+			}
+		})
+	}
+}
+
+// TestEventsProveLiveness pins the heartbeat-vs-serving discriminator
+// (ADR-0073 (b2) Phase-A ground truth): a HEARTBEAT-only batch does NOT
+// prove a serving tablet (vtgate heartbeats even on the no-tablet wedge),
+// but any non-heartbeat event does. This is the load-bearing distinction
+// that lets the watchdog fire on the dead stream without false-firing on
+// a healthy idle one.
+func TestEventsProveLiveness(t *testing.T) {
+	hb := func() *binlogdata.VEvent { return &binlogdata.VEvent{Type: binlogdata.VEventType_HEARTBEAT} }
+	cases := []struct {
+		name string
+		evs  []*binlogdata.VEvent
+		want bool
+	}{
+		{name: "empty batch ⇒ no proof", evs: nil, want: false},
+		{name: "single heartbeat ⇒ no proof", evs: []*binlogdata.VEvent{hb()}, want: false},
+		{name: "multiple heartbeats ⇒ no proof", evs: []*binlogdata.VEvent{hb(), hb()}, want: false},
+		{
+			name: "VGTID present ⇒ proof (the healthy first event)",
+			evs:  []*binlogdata.VEvent{{Type: binlogdata.VEventType_VGTID}},
+			want: true,
+		},
+		{
+			name: "heartbeat + VGTID ⇒ proof",
+			evs:  []*binlogdata.VEvent{hb(), {Type: binlogdata.VEventType_VGTID}},
+			want: true,
+		},
+		{
+			name: "ROW present ⇒ proof",
+			evs:  []*binlogdata.VEvent{{Type: binlogdata.VEventType_ROW}},
+			want: true,
+		},
+		{
+			name: "FIELD present ⇒ proof",
+			evs:  []*binlogdata.VEvent{{Type: binlogdata.VEventType_FIELD}},
+			want: true,
+		},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			if got := eventsProveLiveness(c.evs); got != c.want {
+				t.Errorf("eventsProveLiveness = %v; want %v", got, c.want)
+			}
+		})
+	}
+}
+
+// TestVStreamLiveness_FiresOnNoEvent pins the watchdog's core contract:
+// with no observe() within the window, onTimeout fires exactly once.
+func TestVStreamLiveness_FiresOnNoEvent(t *testing.T) {
+	fired := make(chan struct{}, 1)
+	live := startVStreamLiveness(context.Background(), 30*time.Millisecond, func() { fired <- struct{}{} })
+	defer live.stop()
+	select {
+	case <-fired:
+		// good
+	case <-time.After(2 * time.Second):
+		t.Fatal("watchdog did not fire within the window — the silent-hang guard is broken")
+	}
+}
+
+// TestVStreamLiveness_ObserveDisarms pins that a single observe() before
+// the window elapses disarms the watchdog permanently — a healthy stream
+// (whose first event is a heartbeat) never false-times-out.
+func TestVStreamLiveness_ObserveDisarms(t *testing.T) {
+	fired := make(chan struct{}, 1)
+	live := startVStreamLiveness(context.Background(), 50*time.Millisecond, func() { fired <- struct{}{} })
+	defer live.stop()
+	live.observe() // first event arrived (e.g. a heartbeat)
+	select {
+	case <-fired:
+		t.Fatal("watchdog fired despite an event being observed — would false-time-out a healthy idle stream")
+	case <-time.After(200 * time.Millisecond):
+		// good — never fired
+	}
+}
+
+// TestVStreamLiveness_DisabledWindow pins that a 0/negative window
+// disables the watchdog entirely (the explicit opt-out): no goroutine,
+// onTimeout never fires, observe/stop are safe no-ops.
+func TestVStreamLiveness_DisabledWindow(t *testing.T) {
+	fired := make(chan struct{}, 1)
+	live := startVStreamLiveness(context.Background(), 0, func() { fired <- struct{}{} })
+	live.observe()
+	live.stop()
+	select {
+	case <-fired:
+		t.Fatal("disabled watchdog fired; want never")
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+// TestVStreamLivenessTimeoutError_Actionable pins that the loud error
+// names the tablet type, the keyspace, and the vstream_tablet_type
+// remediation — the operator-facing contract for the primary-only wedge.
+func TestVStreamLivenessTimeoutError_Actionable(t *testing.T) {
+	err := vstreamLivenessTimeoutError(30*time.Second, topodata.TabletType_REPLICA, "main", []string{"0"})
+	msg := err.Error()
+	for _, want := range []string{"no events within", "REPLICA", `"main"`, "vstream_tablet_type=primary"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error missing %q: %v", want, msg)
+		}
 	}
 }
 

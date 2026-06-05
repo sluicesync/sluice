@@ -78,6 +78,20 @@ type vstreamCDCReader struct {
 	// querying the keyspace metadata in resolveStartPosition.
 	shards []string
 
+	// tabletType is the vtgate tablet type the PURE-CDC-TAIL VStream
+	// request targets (the vstream_tablet_type DSN param; default
+	// REPLICA). A COPY-resume (TablePKs cursor present) overrides this
+	// to PRIMARY in buildVStreamRequest regardless — see ADR-0072. A
+	// primary-only cluster (no REPLICA tablet) needs
+	// vstream_tablet_type=primary or the stream wedges (ADR-0073 (b2)).
+	tabletType topodata.TabletType
+
+	// livenessWindow bounds how long the pump waits for the FIRST event
+	// of any kind (incl. heartbeat) before failing LOUDLY rather than
+	// hanging silently (the no-REPLICA-tablet wedge; ADR-0073 (b2)).
+	// From the vstream_liveness_timeout DSN param; 0 disables it.
+	livenessWindow time.Duration
+
 	// conn is the underlying gRPC client connection. Held for the
 	// reader's lifetime so multiple StreamChanges calls (currently
 	// disallowed; reserved for a future API change) would share it.
@@ -164,6 +178,25 @@ const vstreamChannelBuffer = 256
 //     Mutually exclusive with `vstream_shards`. Default false to
 //     keep existing single-shard deployments working without
 //     changes.
+//   - vstream_tablet_type={primary|replica|rdonly} — default
+//     replica. The tablet type the PURE CDC TAIL streams from.
+//     PlanetScale production reads from replicas, so replica is the
+//     default. A PRIMARY-ONLY cluster (PlanetScale *development*
+//     branches, minimal self-hosted Vitess — no REPLICA tablet)
+//     MUST set vstream_tablet_type=primary; otherwise vtgate finds
+//     no REPLICA to serve the stream and the reader fails loudly via
+//     the liveness timeout below (ADR-0073 (b2)). A COPY-resume
+//     (mid-snapshot TablePKs cursor) always targets PRIMARY
+//     regardless of this flag (ADR-0072), so this only governs the
+//     no-cursor CDC tail.
+//   - vstream_liveness_timeout=<duration> — default 30s. The window
+//     the reader waits for the FIRST VEvent OF ANY KIND (incl. the
+//     ~5s heartbeat) after opening the stream before surfacing a
+//     LOUD reader error instead of hanging silently. Keyed on the
+//     absence of ALL events (heartbeats included), so a legitimately
+//     idle-but-healthy source — whose heartbeats keep flowing —
+//     never false-times-out; only a dead stream (e.g. the no-REPLICA
+//     wedge) trips it. 0 or negative disables the watchdog.
 //
 // Multi-shard sharded keyspaces are supported: enable
 // auto-discovery (or list shards explicitly) and the receive path
@@ -195,20 +228,32 @@ func openVStreamReader(ctx context.Context, dsn string) (ir.CDCReader, error) {
 		return nil, err
 	}
 
+	tabletType, err := vstreamTabletTypeFromDSN(cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	livenessWindow, err := vstreamLivenessWindowFromDSN(cfg)
+	if err != nil {
+		return nil, err
+	}
+
 	conn, err := grpc.NewClient(endpoint, dialOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("mysql/vstream: dial %s: %w", endpoint, err)
 	}
 
 	return &vstreamCDCReader{
-		endpoint:    endpoint,
-		authHeader:  authHeader,
-		keyspace:    cfg.DBName,
-		shards:      shards,
-		conn:        conn,
-		client:      vtgateservice.NewVitessClient(conn),
-		fields:      make(map[string][]*query.Field),
-		snapshotSig: make(map[string]ir.SchemaSignature),
+		endpoint:       endpoint,
+		authHeader:     authHeader,
+		keyspace:       cfg.DBName,
+		shards:         shards,
+		tabletType:     tabletType,
+		livenessWindow: livenessWindow,
+		conn:           conn,
+		client:         vtgateservice.NewVitessClient(conn),
+		fields:         make(map[string][]*query.Field),
+		snapshotSig:    make(map[string]ir.SchemaSignature),
 	}, nil
 }
 
@@ -509,7 +554,7 @@ func (r *vstreamCDCReader) StreamChanges(ctx context.Context, from ir.Position) 
 	}
 
 	out := make(chan ir.Change, vstreamChannelBuffer)
-	go r.pump(loopCtx, stream, out)
+	go r.pump(loopCtx, cancel, req.GetTabletType(), stream, out)
 	return out, nil
 }
 
@@ -549,11 +594,18 @@ func anyTablePKsPresent(start []shardGtid) bool {
 //
 // Tablet selection is cursor-dependent (ADR-0072):
 //
-//   - Pure CDC tailing (no TablePKs cursor) targets REPLICA to keep
-//     load off the primary's hot path. The binlog tail needs no
-//     schema-engine catalog lookup, so a cold replica is fine.
+//   - Pure CDC tailing (no TablePKs cursor) targets the reader's
+//     configured tablet type (r.tabletType, from vstream_tablet_type;
+//     default REPLICA) to keep load off the primary's hot path. The
+//     binlog tail needs no schema-engine catalog lookup, so a cold
+//     replica is fine. A PRIMARY-ONLY cluster has no REPLICA tablet,
+//     so it must set vstream_tablet_type=primary — otherwise vtgate
+//     finds no tablet and the stream wedges silently (the liveness
+//     timeout in pump converts that wedge to a loud error; ADR-0073
+//     (b2)).
 //
-//   - A COPY-resume (non-empty TablePKs cursor) targets PRIMARY. This
+//   - A COPY-resume (non-empty TablePKs cursor) targets PRIMARY,
+//     overriding r.tabletType regardless of the DSN flag. This
 //     is the Phase-A root cause: on resume, vtgate's
 //     uvstreamer.buildTablePlan enumerates the COPY tables via the
 //     resolved tablet's schema engine. A REPLICA's schema engine may
@@ -572,7 +624,14 @@ func (r *vstreamCDCReader) buildVStreamRequest(start []shardGtid) (*vtgate.VStre
 	if err != nil {
 		return nil, err
 	}
-	tabletType := topodata.TabletType_REPLICA
+	tabletType := r.tabletType
+	if tabletType == topodata.TabletType_UNKNOWN {
+		// Defensive: a reader constructed without going through
+		// openVStreamReader (e.g. a bare struct literal in a unit test)
+		// has the zero-value tablet type. Treat that as the documented
+		// default so the request is always well-formed.
+		tabletType = topodata.TabletType_REPLICA
+	}
 	if anyTablePKsPresent(start) {
 		tabletType = topodata.TabletType_PRIMARY
 	}
@@ -596,8 +655,30 @@ func (r *vstreamCDCReader) buildVStreamRequest(start []shardGtid) (*vtgate.VStre
 // pump owns out and closes it before returning. Errors from the
 // gRPC stream get stored via setErr; clean ctx-cancellation just
 // closes the channel with no error.
-func (r *vstreamCDCReader) pump(ctx context.Context, stream vtgateservice.Vitess_VStreamClient, out chan<- ir.Change) {
+//
+// A first-event liveness watchdog (ADR-0073 (b2)) guards against the
+// primary-only-cluster wedge: if NO VEvent of any kind (incl. the ~5s
+// heartbeat) arrives within r.livenessWindow of opening the stream — the
+// signature of vtgate having no tablet of the requested type to serve the
+// stream — the watchdog records a LOUD error and cancels the stream ctx so
+// the parked Recv unblocks and the channel closes. cancel is the loop
+// context's cancel (also stored as r.streamerCancel); calling it here is
+// safe alongside Close. tabletType is the type the request actually used,
+// surfaced verbatim in the loud error.
+func (r *vstreamCDCReader) pump(
+	ctx context.Context,
+	cancel context.CancelFunc,
+	tabletType topodata.TabletType,
+	stream vtgateservice.Vitess_VStreamClient,
+	out chan<- ir.Change,
+) {
 	defer close(out)
+
+	live := startVStreamLiveness(ctx, r.livenessWindow, func() {
+		r.setErr(vstreamLivenessTimeoutError(r.livenessWindow, tabletType, r.keyspace, r.shards))
+		cancel()
+	})
+	defer live.stop()
 
 	for {
 		resp, err := stream.Recv()
@@ -607,6 +688,13 @@ func (r *vstreamCDCReader) pump(ctx context.Context, stream vtgateservice.Vitess
 			}
 			r.setErr(classifyReaderError(fmt.Errorf("mysql/vstream: recv: %w", err)))
 			return
+		}
+		// A non-heartbeat event proves a tablet is serving the stream —
+		// disarm the no-tablet watchdog. Heartbeats alone do NOT disarm it:
+		// vtgate keeps heart-beating even with no serving tablet, which is
+		// exactly the primary-only wedge this guards (ADR-0073 (b2)).
+		if eventsProveLiveness(resp.GetEvents()) {
+			live.observe()
 		}
 		for _, ev := range resp.GetEvents() {
 			if err := r.dispatch(ctx, ev, out); err != nil {
@@ -1350,7 +1438,7 @@ func (r *vstreamCDCReader) Reopen(ctx context.Context, resh *ShardLayoutChangedE
 	}
 
 	out := make(chan ir.Change, vstreamChannelBuffer)
-	go r.pump(loopCtx, stream, out)
+	go r.pump(loopCtx, cancel, req.GetTabletType(), stream, out)
 	return out, nil
 }
 

@@ -1,0 +1,131 @@
+# PRIMARY-ONLY Vitess cluster variant for the ADR-0073 (b2) primary-only
+# CDC-tail bug pins. Identical to docker-compose.yml EXCEPT it boots only
+# the PRIMARY vttablet — there is NO replica vttablet — so vtgate genuinely
+# has no REPLICA tablet to serve a VStream. This is the topology of a
+# PlanetScale *development* branch and of a minimal self-hosted Vitess.
+#
+# It is the ready-made vehicle the (b2) note calls for: against it, the
+# default REPLICA CDC tail must fail LOUDLY (the liveness timeout), and
+# vstream_tablet_type=primary must make the tail work. See
+# startVitessClusterPrimaryOnly in cdc_vstream_cluster_primaryonly_integration_test.go.
+#
+# Image pinned to vitess/lite:v24.0.1 (Vitess 24) in lockstep with the
+# vendored vitess.io/vitess v0.24.1 client — same rationale as the
+# full-cluster compose. Flag conventions are the hyphenated v24 forms.
+
+name: ${COMPOSE_PROJECT:-sluice-vitesscluster-primaryonly}
+
+services:
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.21
+    command:
+      - etcd
+      - --data-dir=/etcd-data
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://etcd:2379
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+
+  vtctld:
+    image: vitess/lite:v24.0.1
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        set -e
+        vtctldclient --server internal --topo-implementation etcd2 --topo-global-server-address etcd:2379 --topo-global-root /vitess/global AddCellInfo --root /vitess/zone1 --server-address etcd:2379 zone1 || true
+        exec vtctld \
+          --topo-implementation etcd2 --topo-global-server-address etcd:2379 --topo-global-root /vitess/global \
+          --cell zone1 \
+          --service-map 'grpc-vtctl,grpc-vtctld' \
+          --port 15000 --grpc-port 15999 \
+          --config-file-not-found-handling=ignore
+    depends_on:
+      etcd:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "sh", "-c", "/vt/bin/vtctldclient --server localhost:15999 GetKeyspaces || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+
+  # The SOLE tablet — initialised as replica type then reparented to
+  # PRIMARY by the init one-shot. No second (replica) tablet is booted, so
+  # the shard has exactly one serving tablet and it is the PRIMARY.
+  vttablet:
+    image: vitess/lite:v24.0.1
+    hostname: vttablet
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        set -e
+        mkdir -p /vt/vtdataroot
+        mysqlctl --tablet-uid 100 --mysql-port 17000 init || mysqlctl --tablet-uid 100 --mysql-port 17000 start
+        exec vttablet \
+          --topo-implementation etcd2 --topo-global-server-address etcd:2379 --topo-global-root /vitess/global \
+          --tablet-path zone1-0000000100 \
+          --tablet-hostname vttablet \
+          --init-keyspace test \
+          --init-shard 0 \
+          --init-tablet-type replica \
+          --mysql-server-version '8.0.40-Vitess' \
+          --health-check-interval 5s \
+          --port 15100 --grpc-port 16100 \
+          --service-map 'grpc-queryservice,grpc-tabletmanager,grpc-updatestream' \
+          --heartbeat-on-demand-duration=5s \
+          --config-file-not-found-handling=ignore
+    depends_on:
+      vtctld:
+        condition: service_healthy
+
+  init:
+    image: vitess/lite:v24.0.1
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        VTCTLD="vtctldclient --server vtctld:15999"
+        echo "waiting for the sole tablet to register..."
+        for i in $$(seq 1 90); do
+          n=$$($$VTCTLD GetTablets --keyspace test 2>/dev/null | grep -c zone1-)
+          if [ "$$n" -ge 1 ]; then break; fi
+          sleep 2
+        done
+        echo "promoting primary (uid 100) via PlannedReparentShard..."
+        $$VTCTLD PlannedReparentShard test/0 --new-primary zone1-0000000100
+        echo "waiting for a serving primary..."
+        for i in $$(seq 1 90); do
+          out=$$($$VTCTLD GetTablets --keyspace test 2>/dev/null)
+          if echo "$$out" | grep -q "primary"; then break; fi
+          sleep 2
+        done
+        echo "init done (primary-only — NO replica tablet)."
+        $$VTCTLD GetTablets --keyspace test
+    depends_on:
+      vttablet:
+        condition: service_started
+      vtctld:
+        condition: service_healthy
+
+  vtgate:
+    image: vitess/lite:v24.0.1
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        set -e
+        exec vtgate \
+          --topo-implementation etcd2 --topo-global-server-address etcd:2379 --topo-global-root /vitess/global \
+          --port 15001 --grpc-port 15991 --mysql-server-port 15306 \
+          --cell zone1 --cells-to-watch zone1 \
+          --tablet-types-to-wait PRIMARY \
+          --service-map 'grpc-vtgateservice' \
+          --mysql-auth-server-impl none \
+          --mysql-server-version '8.0.40-Vitess' \
+          --config-file-not-found-handling=ignore
+    ports:
+      - "${VTGATE_MYSQL_PORT:-15306}:15306"
+      - "${VTGATE_GRPC_PORT:-15991}:15991"
+    depends_on:
+      vtctld:
+        condition: service_healthy
