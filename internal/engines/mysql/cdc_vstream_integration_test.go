@@ -428,17 +428,17 @@ func TestVStream_VTTestServer_SnapshotStream(t *testing.T) {
 	}
 	defer func() { _ = stream.Close() }()
 
-	if stream.Position.Engine != engineNameVStream {
-		t.Errorf("Position.Engine = %q; want %q", stream.Position.Engine, engineNameVStream)
-	}
-	if stream.Position.Token == "" {
-		t.Error("Position.Token is empty after COPY_COMPLETED")
-	}
+	// ADR-0071 streaming contract: OpenSnapshotStream returns immediately
+	// with a ZERO Position; the COPY drains in a background pump and the
+	// Position is finalised at the global COPY_COMPLETED. So the snapshot
+	// rows AND the captured Position are only valid AFTER ReadRows is
+	// fully drained — checking them right after open is a race (the pump
+	// wins on a fast box but loses under -race on CI). Drain first, then
+	// assert; insert the post-snapshot row only after the drain so it is
+	// deterministically a CDC event, not a COPY-vs-insert race.
 
-	// Step 3 — concurrent insert AFTER snapshot capture.
-	applyVTTestSQL(t, mysqlDSN, "INSERT INTO users (email) VALUES ('r6@example.com')")
-
-	// Step 4 — drain bulk rows.
+	// Step 3 — drain bulk rows (the snapshot is complete when the channel
+	// closes).
 	usersTable := &ir.Table{
 		Name: "users",
 		Columns: []*ir.Column{
@@ -461,7 +461,19 @@ func TestVStream_VTTestServer_SnapshotStream(t *testing.T) {
 		t.Fatalf("bulk rows = %v; want exactly %v (overlap or missing rows)", bulkEmails, want)
 	}
 
-	// Step 5 — start CDC from the captured position. The R6 insert
+	// Step 4 — the Position is finalised now that the COPY has drained.
+	if stream.Position.Engine != engineNameVStream {
+		t.Errorf("Position.Engine = %q; want %q", stream.Position.Engine, engineNameVStream)
+	}
+	if stream.Position.Token == "" {
+		t.Error("Position.Token is empty after COPY_COMPLETED")
+	}
+
+	// Step 5 — insert R6 AFTER the snapshot completed so it surfaces via
+	// CDC, not the COPY.
+	applyVTTestSQL(t, mysqlDSN, "INSERT INTO users (email) VALUES ('r6@example.com')")
+
+	// Step 6 — start CDC from the captured position. The R6 insert
 	// committed after COPY_COMPLETED so it must surface here.
 	changes, err := stream.Changes.StreamChanges(ctx, stream.Position)
 	if err != nil {
@@ -552,26 +564,12 @@ func TestVStream_VTTestServer_MultiShardSnapshot(t *testing.T) {
 	}
 	defer func() { _ = stream.Close() }()
 
-	// The captured position must carry TWO shardGtid entries (one
-	// per shard) — the multi-shard snapshot path's defining
-	// difference from the single-shard path.
-	shards, ok, err := decodeVStreamPos(stream.Position)
-	if err != nil || !ok {
-		t.Fatalf("decodeVStreamPos(stream.Position) ok=%v err=%v", ok, err)
-	}
-	if len(shards) != 2 {
-		t.Fatalf("captured position has %d shardGtid entries (%v); want 2", len(shards), shards)
-	}
-	for i, s := range shards {
-		if s.Gtid == "" || s.Gtid == "current" {
-			t.Errorf("position shards[%d].Gtid = %q; want concrete GTID after COPY_COMPLETED", i, s.Gtid)
-		}
-	}
-
-	// Post-COPY insert on a separate connection — must surface via
-	// CDC, not via the snapshot rows.
-	applyVTTestSQL(t, mysqlDSN, "INSERT INTO users (id, email) VALUES (1001, 'after-copy-1@example.com')")
-	applyVTTestSQL(t, mysqlDSN, "INSERT INTO users (id, email) VALUES (1002, 'after-copy-2@example.com')")
+	// ADR-0071 streaming contract: OpenSnapshotStream returns with a ZERO
+	// Position and the COPY drains in a background pump, so the captured
+	// Position (and the snapshot-complete guarantee) are valid only AFTER
+	// ReadRows is fully drained. Drain first; assert the position and do
+	// the post-COPY inserts afterwards so they are deterministically CDC
+	// events, not COPY-vs-insert races.
 
 	// Drain bulk rows. Multi-shard COPY merges rows from both
 	// shards into the same unqualified-table slice; ReadRows
@@ -600,6 +598,27 @@ func TestVStream_VTTestServer_MultiShardSnapshot(t *testing.T) {
 	if !equalSorted(bulkEmails, want) {
 		t.Fatalf("bulk rows = %v; want exactly %v (overlap or missing rows across shards)", bulkEmails, want)
 	}
+
+	// The captured position is finalised now that the COPY drained; it
+	// must carry TWO shardGtid entries (one per shard) — the multi-shard
+	// snapshot path's defining difference from the single-shard path.
+	shards, ok, err := decodeVStreamPos(stream.Position)
+	if err != nil || !ok {
+		t.Fatalf("decodeVStreamPos(stream.Position) ok=%v err=%v", ok, err)
+	}
+	if len(shards) != 2 {
+		t.Fatalf("captured position has %d shardGtid entries (%v); want 2", len(shards), shards)
+	}
+	for i, s := range shards {
+		if s.Gtid == "" || s.Gtid == "current" {
+			t.Errorf("position shards[%d].Gtid = %q; want concrete GTID after COPY_COMPLETED", i, s.Gtid)
+		}
+	}
+
+	// Post-COPY inserts on a separate connection — they commit after
+	// COPY_COMPLETED so they must surface via CDC, not the snapshot rows.
+	applyVTTestSQL(t, mysqlDSN, "INSERT INTO users (id, email) VALUES (1001, 'after-copy-1@example.com')")
+	applyVTTestSQL(t, mysqlDSN, "INSERT INTO users (id, email) VALUES (1002, 'after-copy-2@example.com')")
 
 	// Start CDC from the captured position. The two after-copy
 	// inserts committed after COPY_COMPLETED so they must surface
