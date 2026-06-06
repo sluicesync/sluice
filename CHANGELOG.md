@@ -6,6 +6,20 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.99.11] - 2026-06-06
+
+A small CLI safety fix: `sync start` now validates mutually-exclusive flags
+*before* prompting for the `--reset-target-data` destructive confirmation.
+Drop-in from v0.99.10; no behaviour change for valid invocations.
+
+### Fixed
+
+- **`sync start --restart-from-scratch --reset-target-data` no longer prompts to DROP the target tables before reporting that the flags are mutually exclusive.** The `--reset-target-data` typed confirmation ("Type 'reset' to confirm") ran ahead of the flag-combination validation, so an operator combining the two flags was asked to authorize dropping every target table and only *after* typing `reset` learned the combination is rejected (the command then aborted without dropping). No data was ever lost — the mutex was always enforced, and `--yes` failed cleanly up front — but a *validation* error must fire before a *destructive-action* confirmation. The three sync-start flag-combination checks (`--restart-from-scratch`×`--reset-target-data`, `--restart-from-scratch`×`--position-from-manifest`, `--position-from-manifest`×`--reset-target-data`) now run up front, ahead of the prompt. Pinned by a unit test.
+
+### Compatibility
+
+- No breaking API or CLI changes. Drop-in from v0.99.10. Valid invocations are unaffected; only the error *ordering* for the rejected `--restart-from-scratch` + `--reset-target-data` combination changed (now loud up front, with no destructive prompt).
+
 ## [0.99.10] - 2026-06-06
 
 A Vitess/PlanetScale stream-resilience release: a stalled stream now fails loud
