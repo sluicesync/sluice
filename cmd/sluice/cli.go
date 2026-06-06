@@ -752,6 +752,24 @@ func validateRetryFlags(attempts int, base, capDur time.Duration) error {
 	return nil
 }
 
+// validateFlagCombos rejects mutually-exclusive sync-start flag combinations.
+// It is intentionally pure (no I/O) and called from Run BEFORE the destructive
+// --reset-target-data confirmation prompt, so an invalid combination fails loud
+// up front rather than after asking the operator to authorize a target-table
+// DROP the command would then refuse to perform.
+func (s *SyncStartCmd) validateFlagCombos() error {
+	if s.RestartFromScratch && s.ResetTargetData {
+		return errors.New("--restart-from-scratch and --reset-target-data are mutually exclusive (--reset-target-data already forces a fresh cold-start, and additionally drops the target)")
+	}
+	if s.RestartFromScratch && s.PositionFromManifest != "" {
+		return errors.New("--restart-from-scratch and --position-from-manifest are mutually exclusive (one discards the position, the other supplies one)")
+	}
+	if s.PositionFromManifest != "" && s.ResetTargetData {
+		return errors.New("--position-from-manifest and --reset-target-data are mutually exclusive")
+	}
+	return nil
+}
+
 func (s *SyncStartCmd) Run(g *Globals) error {
 	cfg, err := config.Load(g.Config)
 	if err != nil {
@@ -802,6 +820,14 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 		return err
 	}
 
+	// Validate mutually-exclusive flag combinations BEFORE the destructive
+	// confirmation prompt below — an invalid combination must fail loud up
+	// front, not after asking the operator to authorize a target-table DROP
+	// the command will then refuse to perform.
+	if err := s.validateFlagCombos(); err != nil {
+		return err
+	}
+
 	if s.ResetTargetData && !s.Yes {
 		ok, err := confirmTypedDestructive(os.Stdin, os.Stdout,
 			"This will DROP tables on the target. Type 'reset' to confirm: ", "reset")
@@ -821,16 +847,7 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 	// shapes; both override the persisted position).
 	var manifestStore ir.BackupStore
 	var manifestStoreCloser func() error
-	if s.RestartFromScratch && s.ResetTargetData {
-		return errors.New("--restart-from-scratch and --reset-target-data are mutually exclusive (--reset-target-data already forces a fresh cold-start, and additionally drops the target)")
-	}
-	if s.RestartFromScratch && s.PositionFromManifest != "" {
-		return errors.New("--restart-from-scratch and --position-from-manifest are mutually exclusive (one discards the position, the other supplies one)")
-	}
 	if s.PositionFromManifest != "" {
-		if s.ResetTargetData {
-			return errors.New("--position-from-manifest and --reset-target-data are mutually exclusive")
-		}
 		ctx := kongContext()
 		store, _, closer, err := openBackupStore(ctx, "", s.PositionFromManifest, pipeline.BlobStoreOptions{
 			Endpoint:  s.BackupEndpoint,
