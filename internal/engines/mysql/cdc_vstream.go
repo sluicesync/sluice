@@ -86,11 +86,19 @@ type vstreamCDCReader struct {
 	// vstream_tablet_type=primary or the stream wedges (ADR-0073 (b2)).
 	tabletType topodata.TabletType
 
-	// livenessWindow bounds how long the pump waits for the FIRST event
-	// of any kind (incl. heartbeat) before failing LOUDLY rather than
-	// hanging silently (the no-REPLICA-tablet wedge; ADR-0073 (b2)).
-	// From the vstream_liveness_timeout DSN param; 0 disables it.
+	// livenessWindow is the Phase-1 watchdog window: how long the pump
+	// waits for the FIRST NON-HEARTBEAT (serving-proof) event before
+	// failing LOUDLY rather than hanging silently (the no-REPLICA-tablet
+	// wedge; ADR-0073 (b2)). From the vstream_liveness_timeout DSN param;
+	// 0 disables the whole watchdog.
 	livenessWindow time.Duration
+
+	// progressWindow is the Phase-2 (mid-stream progress) watchdog window:
+	// once a serving tablet is proven, how long the pump tolerates TOTAL
+	// silence (no event of any kind, not even a heartbeat) before failing
+	// LOUDLY — the post-failover dead-Recv wedge (ADR-0073 (F3)). From the
+	// vstream_progress_timeout DSN param; 0 disables Phase 2 only.
+	progressWindow time.Duration
 
 	// conn is the underlying gRPC client connection. Held for the
 	// reader's lifetime so multiple StreamChanges calls (currently
@@ -189,14 +197,27 @@ const vstreamChannelBuffer = 256
 //     (mid-snapshot TablePKs cursor) always targets PRIMARY
 //     regardless of this flag (ADR-0072), so this only governs the
 //     no-cursor CDC tail.
-//   - vstream_liveness_timeout=<duration> — default 30s. The window
-//     the reader waits for the FIRST VEvent OF ANY KIND (incl. the
-//     ~5s heartbeat) after opening the stream before surfacing a
-//     LOUD reader error instead of hanging silently. Keyed on the
-//     absence of ALL events (heartbeats included), so a legitimately
-//     idle-but-healthy source — whose heartbeats keep flowing —
-//     never false-times-out; only a dead stream (e.g. the no-REPLICA
-//     wedge) trips it. 0 or negative disables the watchdog.
+//   - vstream_liveness_timeout=<duration> — default 30s. The PHASE-1
+//     window: how long the reader waits for the FIRST NON-HEARTBEAT
+//     (serving-proof) VEvent after opening the stream before surfacing
+//     a LOUD reader error. Heartbeats alone do NOT clear it (vtgate
+//     heartbeats even with no serving tablet — the no-REPLICA wedge),
+//     so a healthy stream's initial VGTID disarms it and only the
+//     no-tablet wedge trips it. 0 or negative disables the WHOLE
+//     watchdog (both phases).
+//   - vstream_progress_timeout=<duration> — default 45s. The PHASE-2
+//     (mid-stream) window for the CDC tail: once a serving tablet has
+//     been proven, how long TOTAL silence (no event of any kind, not
+//     even a heartbeat) is tolerated before failing LOUDLY — the
+//     post-failover/reparent dead-Recv wedge (ADR-0073 (F3)). A
+//     healthy idle stream's ~5s heartbeats re-arm it, so only genuine
+//     silence trips it. 0 or negative disables PHASE 2 only (Phase 1
+//     still guards the first event).
+//   - vstream_copy_progress_timeout=<duration> — default 10m. The
+//     PHASE-2 window for the snapshot COPY pump, deliberately generous
+//     to tolerate the multi-minute vreplication/schema-engine warmup
+//     before the first COPY row. Only relevant on the snapshot path;
+//     0 or negative disables Phase 2 for the COPY pump.
 //
 // Multi-shard sharded keyspaces are supported: enable
 // auto-discovery (or list shards explicitly) and the receive path
@@ -238,6 +259,11 @@ func openVStreamReader(ctx context.Context, dsn string) (ir.CDCReader, error) {
 		return nil, err
 	}
 
+	progressWindow, err := vstreamProgressWindowFromDSN(cfg)
+	if err != nil {
+		return nil, err
+	}
+
 	conn, err := grpc.NewClient(endpoint, dialOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("mysql/vstream: dial %s: %w", endpoint, err)
@@ -250,6 +276,7 @@ func openVStreamReader(ctx context.Context, dsn string) (ir.CDCReader, error) {
 		shards:         shards,
 		tabletType:     tabletType,
 		livenessWindow: livenessWindow,
+		progressWindow: progressWindow,
 		conn:           conn,
 		client:         vtgateservice.NewVitessClient(conn),
 		fields:         make(map[string][]*query.Field),
@@ -656,15 +683,23 @@ func (r *vstreamCDCReader) buildVStreamRequest(start []shardGtid) (*vtgate.VStre
 // gRPC stream get stored via setErr; clean ctx-cancellation just
 // closes the channel with no error.
 //
-// A first-event liveness watchdog (ADR-0073 (b2)) guards against the
-// primary-only-cluster wedge: if NO VEvent of any kind (incl. the ~5s
-// heartbeat) arrives within r.livenessWindow of opening the stream — the
-// signature of vtgate having no tablet of the requested type to serve the
-// stream — the watchdog records a LOUD error and cancels the stream ctx so
-// the parked Recv unblocks and the channel closes. cancel is the loop
-// context's cancel (also stored as r.streamerCancel); calling it here is
-// safe alongside Close. tabletType is the type the request actually used,
-// surfaced verbatim in the loud error.
+// A CONTINUOUS two-phase liveness watchdog (ADR-0073 (b2)+(F3)) guards
+// the pump for its whole life:
+//
+//   - PHASE 1 (r.livenessWindow): if no NON-HEARTBEAT event arrives within
+//     the window of opening the stream — the primary-only / no-serving-
+//     tablet signature (vtgate heartbeats but never serves data) — records
+//     the LOUD vstreamLivenessTimeoutError and cancels the stream.
+//   - PHASE 2 (r.progressWindow): once a serving tablet is proven, if the
+//     stream then goes TOTALLY silent (no event of any kind, not even a
+//     heartbeat) for the window — the post-failover dead-Recv wedge —
+//     records the LOUD vstreamProgressTimeoutError and cancels. A healthy
+//     idle stream's ~5s heartbeats re-arm Phase 2, so only true silence
+//     trips it.
+//
+// cancel is the loop context's cancel (also stored as r.streamerCancel);
+// calling it here is safe alongside Close. tabletType is the type the
+// request actually used, surfaced verbatim in the loud errors.
 func (r *vstreamCDCReader) pump(
 	ctx context.Context,
 	cancel context.CancelFunc,
@@ -674,10 +709,15 @@ func (r *vstreamCDCReader) pump(
 ) {
 	defer close(out)
 
-	live := startVStreamLiveness(ctx, r.livenessWindow, func() {
-		r.setErr(vstreamLivenessTimeoutError(r.livenessWindow, tabletType, r.keyspace, r.shards))
-		cancel()
-	})
+	live := startVStreamLiveness(ctx, r.livenessWindow, r.progressWindow,
+		func() {
+			r.setErr(vstreamLivenessTimeoutError(r.livenessWindow, tabletType, r.keyspace, r.shards))
+			cancel()
+		},
+		func() {
+			r.setErr(vstreamProgressTimeoutError(r.progressWindow, tabletType, r.keyspace, r.shards))
+			cancel()
+		})
 	defer live.stop()
 
 	for {
@@ -689,12 +729,14 @@ func (r *vstreamCDCReader) pump(
 			r.setErr(classifyReaderError(fmt.Errorf("mysql/vstream: recv: %w", err)))
 			return
 		}
-		// A non-heartbeat event proves a tablet is serving the stream —
-		// disarm the no-tablet watchdog. Heartbeats alone do NOT disarm it:
-		// vtgate keeps heart-beating even with no serving tablet, which is
-		// exactly the primary-only wedge this guards (ADR-0073 (b2)).
-		if eventsProveLiveness(resp.GetEvents()) {
-			live.observe()
+		// Feed the watchdog every batch that carried ≥1 event. A
+		// non-heartbeat event proves a serving tablet (clears Phase 1);
+		// any event (incl. a heartbeat) re-arms the Phase-2 progress
+		// deadline. A heartbeat alone does NOT clear Phase 1 — vtgate
+		// heartbeats even with no serving tablet (the primary-only wedge,
+		// ADR-0073 (b2)).
+		if evs := resp.GetEvents(); len(evs) > 0 {
+			live.observe(eventsProveLiveness(evs))
 		}
 		for _, ev := range resp.GetEvents() {
 			if err := r.dispatch(ctx, ev, out); err != nil {

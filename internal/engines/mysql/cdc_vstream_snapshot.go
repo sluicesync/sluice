@@ -120,6 +120,16 @@ func (e Engine) openVStreamSnapshotStreamFrom(ctx context.Context, dsn string, s
 		_ = conn.Close()
 		return nil, err
 	}
+	progressWindow, err := vstreamProgressWindowFromDSN(cfg)
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	copyProgressWindow, err := vstreamCopyProgressWindowFromDSN(cfg)
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
 	client := vtgateservice.NewVitessClient(conn)
 
 	// The gRPC stream lives for the lifetime of the SnapshotStream:
@@ -190,6 +200,8 @@ func (e Engine) openVStreamSnapshotStreamFrom(ctx context.Context, dsn string, s
 		checkpointRows:       defaultCopyCheckpointRows,
 		checkpointInterval:   defaultCopyCheckpointInterval,
 		livenessWindow:       livenessWindow,
+		progressWindow:       progressWindow,
+		copyProgressWindow:   copyProgressWindow,
 		conn:                 conn,
 		grpcStream:           grpcStream,
 		grpcCancel:           streamCancel,
@@ -284,12 +296,28 @@ type vstreamSnapshotStream struct {
 	reconnectBackoffBase time.Duration
 	reconnectBackoffCap  time.Duration
 
-	// livenessWindow bounds how long each pump (COPY and post-COPY CDC)
-	// waits for the FIRST event of any kind (incl. heartbeat) after the
-	// stream opens before failing LOUDLY rather than hanging silently
-	// (the dead-stream / no-tablet wedge; ADR-0073 (b2)). From the
-	// vstream_liveness_timeout DSN param; 0 disables it.
+	// livenessWindow is the Phase-1 watchdog window for both pumps (COPY
+	// and post-COPY CDC): how long to wait for the FIRST NON-HEARTBEAT
+	// (serving-proof) event after the stream opens before failing LOUDLY
+	// rather than hanging silently (the dead-stream / no-tablet wedge;
+	// ADR-0073 (b2)). From vstream_liveness_timeout; 0 disables the whole
+	// watchdog.
 	livenessWindow time.Duration
+
+	// progressWindow is the Phase-2 (mid-stream progress) window for the
+	// post-COPY CDC pump: once a serving tablet is proven, how long it
+	// tolerates TOTAL silence before failing LOUDLY (the post-failover
+	// dead-Recv wedge; ADR-0073 (F3)). From vstream_progress_timeout; 0
+	// disables Phase 2 on the CDC pump.
+	progressWindow time.Duration
+
+	// copyProgressWindow is the Phase-2 window for the COPY pump —
+	// deliberately far more generous than progressWindow because the COPY
+	// phase can take MINUTES of legitimate vreplication/schema-engine
+	// warmup before its first row (the only event meanwhile may be the
+	// attach VGTID, which proves serving and arms Phase 2). From
+	// vstream_copy_progress_timeout; 0 disables Phase 2 on the COPY pump.
+	copyProgressWindow time.Duration
 
 	// fields caches column metadata keyed by [fieldCacheKey]. Shared
 	// between COPY-phase row decoding and post-COPY change decoding —
@@ -503,18 +531,31 @@ const (
 func (s *vstreamSnapshotStream) copyPump(ctx context.Context, cancel context.CancelFunc, stream *ir.SnapshotStream) {
 	defer close(s.copyDone)
 
-	// First-event liveness watchdog (ADR-0073 (b2)): if NO event of any
-	// kind (incl. heartbeat) arrives within the window of opening the
-	// stream — the dead-stream / no-tablet signature — fail LOUDLY and
-	// cancel the stream so the parked Recv unblocks, rather than hanging
-	// the cold-start forever. The snapshot COPY targets PRIMARY (so the
-	// no-REPLICA wedge can't fire here), but a dead PRIMARY stream is the
-	// same silent-hang hazard, and keeping the guard symmetric with the
-	// CDC tail is cheap. Disarmed on the first successful Recv.
-	live := startVStreamLiveness(ctx, s.livenessWindow, func() {
-		s.failCopy(vstreamLivenessTimeoutError(s.livenessWindow, topodata.TabletType_PRIMARY, s.keyspace, s.shards))
-		cancel()
-	})
+	// Continuous two-phase liveness watchdog (ADR-0073 (b2)+(F3)):
+	//
+	//   - PHASE 1 (s.livenessWindow): no serving-proof event within the
+	//     window of opening the stream — the dead-stream / no-tablet
+	//     signature — fails LOUDLY. The snapshot COPY targets PRIMARY (so
+	//     the no-REPLICA wedge can't fire here), but a dead PRIMARY stream
+	//     is the same silent-hang hazard, and keeping the guard symmetric
+	//     with the CDC tail is cheap.
+	//   - PHASE 2 (s.copyProgressWindow): once serving is proven, total
+	//     silence past the window fails LOUDLY (the post-failover wedge).
+	//     The COPY Phase-2 window is DELIBERATELY generous (~10 min default)
+	//     to tolerate the legitimate multi-minute vreplication/schema-engine
+	//     warmup during which the only event may be the attach VGTID.
+	//
+	// Either fire cancels the stream so the parked Recv unblocks rather
+	// than hanging the cold-start forever.
+	live := startVStreamLiveness(ctx, s.livenessWindow, s.copyProgressWindow,
+		func() {
+			s.failCopy(vstreamLivenessTimeoutError(s.livenessWindow, topodata.TabletType_PRIMARY, s.keyspace, s.shards))
+			cancel()
+		},
+		func() {
+			s.failCopy(vstreamProgressTimeoutError(s.copyProgressWindow, topodata.TabletType_PRIMARY, s.keyspace, s.shards))
+			cancel()
+		})
 	defer live.stop()
 
 	// lastCheckpoint is the wall-clock anchor for the T-seconds half of
@@ -563,10 +604,11 @@ func (s *vstreamSnapshotStream) copyPump(ctx context.Context, cancel context.Can
 			return
 		}
 		reconnectAttempts = 0
-		// A non-heartbeat event proves a tablet is serving — disarm the
-		// no-tablet watchdog. Heartbeats alone don't (ADR-0073 (b2)).
-		if eventsProveLiveness(resp.GetEvents()) {
-			live.observe()
+		// Feed the watchdog: a non-heartbeat event clears Phase 1 (serving
+		// proven); any event re-arms the Phase-2 progress deadline. A
+		// heartbeat alone does NOT clear Phase 1 (ADR-0073 (b2)).
+		if evs := resp.GetEvents(); len(evs) > 0 {
+			live.observe(eventsProveLiveness(evs))
 		}
 		for _, ev := range resp.GetEvents() {
 			done, err := s.dispatchCopyEvent(ev)
@@ -1107,20 +1149,27 @@ func (s *vstreamSnapshotStream) startPump(ctx context.Context) (<-chan ir.Change
 // flow against the cached field map (which may grow if new tables
 // surface or FIELD events refresh on DDL).
 //
-// First-event liveness watchdog (ADR-0073 (b2)): symmetric with the COPY
-// pump and the standalone CDC tail. The no-REPLICA wedge cannot fire here
+// Continuous two-phase liveness watchdog (ADR-0073 (b2)+(F3)): symmetric
+// with the COPY pump and the standalone CDC tail. Phase 1 (s.livenessWindow)
+// guards the first serving-proof event; Phase 2 (s.progressWindow — the
+// CDC-tail window, NOT the generous COPY one) fires on total mid-stream
+// silence once serving is proven. The no-REPLICA wedge cannot fire here
 // (this CDC phase reuses the PRIMARY stream the COPY phase already proved
-// live), but a totally-silent stream is the same hang hazard, so the
-// guard stays. Disarmed on the first successful Recv; on timeout it
-// records a loud error and cancels the gRPC stream so the parked Recv
-// unblocks.
+// live), but a post-failover dead-Recv is the same silent-hang hazard, so
+// the guard stays. On timeout it records a loud error and cancels the gRPC
+// stream so the parked Recv unblocks.
 func (s *vstreamSnapshotStream) pump(ctx context.Context, out chan<- ir.Change) {
 	defer close(out)
 
-	live := startVStreamLiveness(ctx, s.livenessWindow, func() {
-		s.setErr(vstreamLivenessTimeoutError(s.livenessWindow, topodata.TabletType_PRIMARY, s.keyspace, s.shards))
-		s.cancelGRPCStream()
-	})
+	live := startVStreamLiveness(ctx, s.livenessWindow, s.progressWindow,
+		func() {
+			s.setErr(vstreamLivenessTimeoutError(s.livenessWindow, topodata.TabletType_PRIMARY, s.keyspace, s.shards))
+			s.cancelGRPCStream()
+		},
+		func() {
+			s.setErr(vstreamProgressTimeoutError(s.progressWindow, topodata.TabletType_PRIMARY, s.keyspace, s.shards))
+			s.cancelGRPCStream()
+		})
 	defer live.stop()
 
 	for {
@@ -1141,10 +1190,10 @@ func (s *vstreamSnapshotStream) pump(ctx context.Context, out chan<- ir.Change) 
 			s.setErr(classifyReaderError(fmt.Errorf("mysql/vstream: snapshot: cdc recv: %w", err)))
 			return
 		}
-		// A non-heartbeat event proves a tablet is serving — disarm the
-		// watchdog. Heartbeats alone don't (ADR-0073 (b2)).
-		if eventsProveLiveness(resp.GetEvents()) {
-			live.observe()
+		// Feed the watchdog: a non-heartbeat event clears Phase 1; any
+		// event re-arms the Phase-2 progress deadline (ADR-0073 (b2)+(F3)).
+		if evs := resp.GetEvents(); len(evs) > 0 {
+			live.observe(eventsProveLiveness(evs))
 		}
 		for _, ev := range resp.GetEvents() {
 			if err := s.dispatchCDCEvent(ctx, ev, out); err != nil {

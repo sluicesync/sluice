@@ -989,6 +989,104 @@ func TestVStreamLivenessWindowFromDSN(t *testing.T) {
 	}
 }
 
+// TestVStreamProgressWindowFromDSN pins the vstream_progress_timeout
+// (Phase-2 CDC-tail) DSN parse: default when absent, parsed duration,
+// 0-disables, malformed ⇒ loud error naming the param.
+func TestVStreamProgressWindowFromDSN(t *testing.T) {
+	cases := []struct {
+		name    string
+		val     string
+		want    time.Duration
+		wantErr bool
+	}{
+		{name: "default (absent)", val: "", want: defaultVStreamProgressWindow},
+		{name: "explicit 90s", val: "90s", want: 90 * time.Second},
+		{name: "zero disables phase 2", val: "0s", want: 0},
+		{name: "malformed ⇒ loud error", val: "later", wantErr: true},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			params := map[string]string{}
+			if c.val != "" {
+				params["vstream_progress_timeout"] = c.val
+			}
+			cfg, _ := minimalConfig("host:3306", params)
+			got, err := vstreamProgressWindowFromDSN(cfg)
+			if c.wantErr {
+				if err == nil {
+					t.Fatalf("want loud error for %q; got nil (%v)", c.val, got)
+				}
+				if !strings.Contains(err.Error(), "vstream_progress_timeout") {
+					t.Errorf("error does not name the param: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != c.want {
+				t.Errorf("got %v; want %v", got, c.want)
+			}
+		})
+	}
+}
+
+// TestVStreamCopyProgressWindowFromDSN pins the
+// vstream_copy_progress_timeout (Phase-2 COPY pump) DSN parse, including
+// that the default is the generous COPY window (slow-start tolerance).
+func TestVStreamCopyProgressWindowFromDSN(t *testing.T) {
+	cases := []struct {
+		name    string
+		val     string
+		want    time.Duration
+		wantErr bool
+	}{
+		{name: "default (absent) is generous", val: "", want: defaultVStreamCopyProgressWindow},
+		{name: "explicit 15m", val: "15m", want: 15 * time.Minute},
+		{name: "zero disables phase 2", val: "0s", want: 0},
+		{name: "malformed ⇒ loud error", val: "soon-ish", wantErr: true},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			params := map[string]string{}
+			if c.val != "" {
+				params["vstream_copy_progress_timeout"] = c.val
+			}
+			cfg, _ := minimalConfig("host:3306", params)
+			got, err := vstreamCopyProgressWindowFromDSN(cfg)
+			if c.wantErr {
+				if err == nil {
+					t.Fatalf("want loud error for %q; got nil (%v)", c.val, got)
+				}
+				if !strings.Contains(err.Error(), "vstream_copy_progress_timeout") {
+					t.Errorf("error does not name the param: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != c.want {
+				t.Errorf("got %v; want %v", got, c.want)
+			}
+		})
+	}
+}
+
+// TestVStreamCopyProgressWindow_GenerousByDefault sanity-pins that the
+// COPY Phase-2 default is materially larger than the CDC-tail Phase-2
+// default — the slow-start-tolerance invariant from the F3 design (the
+// COPY warmup can take minutes; the CDC tail's seconds-scale window must
+// never be applied to it).
+func TestVStreamCopyProgressWindow_GenerousByDefault(t *testing.T) {
+	if defaultVStreamCopyProgressWindow <= defaultVStreamProgressWindow {
+		t.Fatalf("COPY progress window (%v) must be far more generous than the CDC-tail one (%v)",
+			defaultVStreamCopyProgressWindow, defaultVStreamProgressWindow)
+	}
+}
+
 // TestBuildVStreamRequest_TabletTypeSelection pins the cursor-dependent
 // tablet selection (ADR-0072 + ADR-0073 (b2)):
 //
@@ -1084,58 +1182,189 @@ func TestEventsProveLiveness(t *testing.T) {
 	}
 }
 
-// TestVStreamLiveness_FiresOnNoEvent pins the watchdog's core contract:
-// with no observe() within the window, onTimeout fires exactly once.
-func TestVStreamLiveness_FiresOnNoEvent(t *testing.T) {
-	fired := make(chan struct{}, 1)
-	live := startVStreamLiveness(context.Background(), 30*time.Millisecond, func() { fired <- struct{}{} })
+// noopTimeout is a never-expected timeout callback for the phase the test
+// is NOT exercising; a fire on it is a test failure.
+func failingTimeout(t *testing.T, phase string) func() {
+	t.Helper()
+	return func() { t.Errorf("unexpected %s timeout fired", phase) }
+}
+
+// TestVStreamLiveness_Phase1_FiresOnHeartbeatsOnly pins the v0.99.7
+// primary-only guard (Phase 1): with only heartbeat-only observations —
+// the no-serving-tablet wedge — the Phase-1 callback fires. Heartbeats do
+// NOT clear Phase 1, and they do NOT re-arm it, so the absolute deadline
+// from stream-open elapses and fires. THIS MUST NOT REGRESS.
+func TestVStreamLiveness_Phase1_FiresOnHeartbeatsOnly(t *testing.T) {
+	p1 := make(chan struct{}, 1)
+	live := startVStreamLiveness(context.Background(), 60*time.Millisecond, 500*time.Millisecond,
+		func() { p1 <- struct{}{} },
+		failingTimeout(t, "phase-2"))
 	defer live.stop()
+
+	// Drip heartbeat-only observations faster than the Phase-1 window from
+	// a goroutine bounded by stop. A regression where heartbeats re-armed
+	// Phase 1 would keep it alive forever (the primary-only wedge would
+	// never surface) — this pins that they do not. The drip goroutine
+	// stops itself on stopDrip so it can't outlive the test.
+	stopDrip := make(chan struct{})
+	defer close(stopDrip)
+	go func() {
+		tick := time.NewTicker(10 * time.Millisecond)
+		defer tick.Stop()
+		for {
+			select {
+			case <-tick.C:
+				live.observe(false) // heartbeat-only
+			case <-stopDrip:
+				return
+			}
+		}
+	}()
+
 	select {
-	case <-fired:
-		// good
+	case <-p1:
+		// good — heartbeats did not keep Phase 1 alive
 	case <-time.After(2 * time.Second):
-		t.Fatal("watchdog did not fire within the window — the silent-hang guard is broken")
+		t.Fatal("Phase-1 watchdog did not fire on heartbeats-only — the primary-only guard regressed")
 	}
 }
 
-// TestVStreamLiveness_ObserveDisarms pins that a single observe() before
-// the window elapses disarms the watchdog permanently — a healthy stream
-// (whose first event is a heartbeat) never false-times-out.
-func TestVStreamLiveness_ObserveDisarms(t *testing.T) {
-	fired := make(chan struct{}, 1)
-	live := startVStreamLiveness(context.Background(), 50*time.Millisecond, func() { fired <- struct{}{} })
+// TestVStreamLiveness_Phase1_FiresOnNoEvent pins that with NO observations
+// at all the Phase-1 callback still fires (the dead-from-open stream).
+func TestVStreamLiveness_Phase1_FiresOnNoEvent(t *testing.T) {
+	p1 := make(chan struct{}, 1)
+	live := startVStreamLiveness(context.Background(), 30*time.Millisecond, time.Second,
+		func() { p1 <- struct{}{} },
+		failingTimeout(t, "phase-2"))
 	defer live.stop()
-	live.observe() // first event arrived (e.g. a heartbeat)
 	select {
-	case <-fired:
-		t.Fatal("watchdog fired despite an event being observed — would false-time-out a healthy idle stream")
-	case <-time.After(200 * time.Millisecond):
-		// good — never fired
+	case <-p1:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Phase-1 watchdog did not fire — the silent-hang guard is broken")
 	}
 }
 
-// TestVStreamLiveness_DisabledWindow pins that a 0/negative window
-// disables the watchdog entirely (the explicit opt-out): no goroutine,
-// onTimeout never fires, observe/stop are safe no-ops.
+// TestVStreamLiveness_ServingProofTransitionsToPhase2 pins that a single
+// serving-proof observation clears Phase 1: Phase 1 never fires afterward.
+func TestVStreamLiveness_ServingProofTransitionsToPhase2(t *testing.T) {
+	live := startVStreamLiveness(context.Background(), 40*time.Millisecond, time.Second,
+		failingTimeout(t, "phase-1"),
+		func() {}) // phase-2 may fire later; we only assert phase-1 stays quiet
+	defer live.stop()
+	live.observe(true) // serving proof
+	// Wait well past the Phase-1 window; Phase 1 must not fire.
+	time.Sleep(150 * time.Millisecond)
+}
+
+// TestVStreamLiveness_Phase2_FiresOnTotalSilence pins the NEW mid-stream
+// guard: after data has flowed (a serving-proof observation), TOTAL
+// silence past the Phase-2 window fires the Phase-2 callback — the
+// post-failover dead-Recv wedge becomes a LOUD failure.
+func TestVStreamLiveness_Phase2_FiresOnTotalSilence(t *testing.T) {
+	p2 := make(chan struct{}, 1)
+	live := startVStreamLiveness(context.Background(), time.Second, 40*time.Millisecond,
+		failingTimeout(t, "phase-1"),
+		func() { p2 <- struct{}{} })
+	defer live.stop()
+	live.observe(true) // serving proven; now go silent
+	select {
+	case <-p2:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Phase-2 watchdog did not fire on total silence — the mid-stream wedge guard is broken")
+	}
+}
+
+// TestVStreamLiveness_Phase2_HeartbeatsKeepAlive pins that once in Phase 2
+// a healthy idle stream — whose ~5s heartbeats keep arriving — never
+// false-times-out: each heartbeat-only observation re-arms the Phase-2
+// progress deadline.
+func TestVStreamLiveness_Phase2_HeartbeatsKeepAlive(t *testing.T) {
+	live := startVStreamLiveness(context.Background(), time.Second, 60*time.Millisecond,
+		failingTimeout(t, "phase-1"),
+		func() {
+			t.Error("Phase-2 fired despite heartbeats re-arming it — would false-time-out a healthy idle stream")
+		})
+	defer live.stop()
+
+	live.observe(true) // enter Phase 2
+	// Drip heartbeat-only observations faster than the Phase-2 window for
+	// several windows' worth; none should trip the timeout.
+	for i := 0; i < 15; i++ {
+		time.Sleep(20 * time.Millisecond)
+		live.observe(false) // heartbeat-only — must re-arm Phase 2
+	}
+}
+
+// TestVStreamLiveness_Phase2_ReArmsAcrossManyEvents pins the re-arm path
+// across a mix of data and heartbeat observations: as long as SOMETHING
+// keeps arriving, Phase 2 never fires.
+func TestVStreamLiveness_Phase2_ReArmsAcrossManyEvents(t *testing.T) {
+	live := startVStreamLiveness(context.Background(), time.Second, 50*time.Millisecond,
+		failingTimeout(t, "phase-1"),
+		func() { t.Error("Phase-2 fired despite continuous events re-arming it") })
+	defer live.stop()
+
+	live.observe(true)
+	for i := 0; i < 20; i++ {
+		time.Sleep(15 * time.Millisecond)
+		live.observe(i%2 == 0) // alternate data / heartbeat
+	}
+}
+
+// TestVStreamLiveness_Phase2Disabled pins that progressWindow<=0 keeps
+// Phase 1 but disables Phase 2: a proven-then-silent stream never fires.
+func TestVStreamLiveness_Phase2Disabled(t *testing.T) {
+	live := startVStreamLiveness(context.Background(), 40*time.Millisecond, 0,
+		failingTimeout(t, "phase-1"),
+		func() { t.Error("Phase-2 fired despite being disabled (progressWindow=0)") })
+	defer live.stop()
+	live.observe(true) // clears Phase 1; Phase 2 disabled ⇒ quiescent
+	time.Sleep(200 * time.Millisecond)
+}
+
+// TestVStreamLiveness_DisabledWindow pins that a 0/negative Phase-1 window
+// disables the whole watchdog: no goroutine, no callback ever fires,
+// observe/stop are safe no-ops.
 func TestVStreamLiveness_DisabledWindow(t *testing.T) {
-	fired := make(chan struct{}, 1)
-	live := startVStreamLiveness(context.Background(), 0, func() { fired <- struct{}{} })
-	live.observe()
+	live := startVStreamLiveness(context.Background(), 0, time.Second,
+		failingTimeout(t, "phase-1"),
+		failingTimeout(t, "phase-2"))
+	live.observe(true)
+	live.observe(false)
 	live.stop()
-	select {
-	case <-fired:
-		t.Fatal("disabled watchdog fired; want never")
-	case <-time.After(100 * time.Millisecond):
-	}
+	time.Sleep(100 * time.Millisecond)
 }
 
-// TestVStreamLivenessTimeoutError_Actionable pins that the loud error
-// names the tablet type, the keyspace, and the vstream_tablet_type
+// TestVStreamLiveness_StopBeforeFire pins that stop() tears the watchdog
+// down so neither callback fires after teardown.
+func TestVStreamLiveness_StopBeforeFire(t *testing.T) {
+	live := startVStreamLiveness(context.Background(), 40*time.Millisecond, 40*time.Millisecond,
+		failingTimeout(t, "phase-1"),
+		failingTimeout(t, "phase-2"))
+	live.stop()
+	time.Sleep(150 * time.Millisecond)
+}
+
+// TestVStreamLivenessTimeoutError_Actionable pins that the Phase-1 loud
+// error names the tablet type, the keyspace, and the vstream_tablet_type
 // remediation — the operator-facing contract for the primary-only wedge.
 func TestVStreamLivenessTimeoutError_Actionable(t *testing.T) {
 	err := vstreamLivenessTimeoutError(30*time.Second, topodata.TabletType_REPLICA, "main", []string{"0"})
 	msg := err.Error()
 	for _, want := range []string{"no events within", "REPLICA", `"main"`, "vstream_tablet_type=primary"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error missing %q: %v", want, msg)
+		}
+	}
+}
+
+// TestVStreamProgressTimeoutError_Actionable pins that the Phase-2 loud
+// error names the mid-stream/failover cause so an operator (or a log
+// scraper) can tell it apart from the primary-only Phase-1 error.
+func TestVStreamProgressTimeoutError_Actionable(t *testing.T) {
+	err := vstreamProgressTimeoutError(45*time.Second, topodata.TabletType_PRIMARY, "main", []string{"0"})
+	msg := err.Error()
+	for _, want := range []string{"no events for", "PRIMARY", `"main"`, "failover", "reparent"} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("error missing %q: %v", want, msg)
 		}
