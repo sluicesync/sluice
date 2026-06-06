@@ -244,6 +244,27 @@ For the field-cache failure (cause #4), watch sluice's logs for
 `row event for "X" without preceding FIELD event` and correlate
 with PS deploy timestamps.
 
+## Targeting a PlanetScale branch (control-table DDL needs an `admin`-role password)
+
+When a **PlanetScale branch is the sluice _target_** (`--target-driver=planetscale`),
+the password's role must allow DDL: on a cold-start sluice creates the destination
+tables and its control tables (`sluice_cdc_state`, `sluice_cdc_schema_history`,
+`sluice_shard_consolidation_lease`). A `reader`/`writer`/`readwriter`-role password
+is **denied DDL** on a production branch and the cold-start fails immediately at the
+control-table step:
+
+```
+pipeline: ensure control table: mysql: ... Error 1105 (HY000): ...
+DDL command denied to user '<user>', in groups [planetscale-writer], for table 'sluice_cdc_state' (ACL check error)
+```
+
+Mint the **target** password with `--role admin` (`pscale password create <db> <branch> --role admin`).
+This applies to the target only — a VStream **source** password needs just read
+access. (PlanetScale **production** branches are the case that enforces this; the
+ACL group `planetscale-writer` excludes DDL.) If your target branch has **Safe
+Migrations** enabled, schema changes go through deploy requests instead — pre-create
+the tables and use `--schema-already-applied` (see GitHub #17).
+
 ## What's new in Vitess 24 (and when does PlanetScale get it?)
 
 The [Vitess 24 announcement
