@@ -70,7 +70,20 @@ import (
 // mysql engine package and the spike drives the pipeline package).
 // ---------------------------------------------------------------------
 
-func startShardedVTTestServer(t *testing.T, keyspace string, numShards int) (mysqlDSN, grpcEndpoint string, cleanup func()) {
+// startShardedVTTestServer boots a sharded vttestserver and returns its
+// vtgate MySQL DSN, its VStream gRPC endpoint, a restartSource closure,
+// and a cleanup func.
+//
+// restartSource stops then re-starts the SAME container in place and
+// re-waits for the original readiness signal before returning, so a
+// chaos test can disrupt an in-flight source connection mid-copy and be
+// guaranteed the source is serving again by the time the closure
+// returns. The container's mapped ports are stable across a Docker
+// stop/start (the port bindings survive), so the previously-returned
+// mysqlDSN / grpcEndpoint stay valid after a restart — callers do not
+// need to re-read them. (testcontainers' Stop/Start preserve the
+// container; only Terminate removes it.)
+func startShardedVTTestServer(t *testing.T, keyspace string, numShards int) (mysqlDSN, grpcEndpoint string, restartSource func(t *testing.T), cleanup func()) {
 	t.Helper()
 	testcontainers.SkipIfProviderIsNotHealthy(t)
 
@@ -83,6 +96,14 @@ func startShardedVTTestServer(t *testing.T, keyspace string, numShards int) (mys
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
 	defer cancel()
 
+	// readiness is the same gate the initial bring-up uses; reused by
+	// restartSource so a restarted source is serving before we assert.
+	readiness := wait.ForAll(
+		wait.ForLog("Local cluster started."),
+		wait.ForListeningPort(grpcPortBase),
+		wait.ForListeningPort(mysqlPortBase),
+	).WithStartupTimeoutDefault(5 * time.Minute)
+
 	req := testcontainers.ContainerRequest{
 		Image:        "vitess/vttestserver:mysql80",
 		ExposedPorts: []string{mysqlPortBase, grpcPortBase},
@@ -92,11 +113,7 @@ func startShardedVTTestServer(t *testing.T, keyspace string, numShards int) (mys
 			"NUM_SHARDS":      fmt.Sprintf("%d", numShards),
 			"MYSQL_BIND_HOST": "0.0.0.0",
 		},
-		WaitingFor: wait.ForAll(
-			wait.ForLog("Local cluster started."),
-			wait.ForListeningPort(grpcPortBase),
-			wait.ForListeningPort(mysqlPortBase),
-		).WithStartupTimeoutDefault(5 * time.Minute),
+		WaitingFor: readiness,
 	}
 	container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
 		ContainerRequest: req,
@@ -132,7 +149,31 @@ func startShardedVTTestServer(t *testing.T, keyspace string, numShards int) (mys
 		host, mysqlPort.Num(), keyspace,
 	)
 	grpcEndpoint = fmt.Sprintf("%s:%d", host, grpcPort.Num())
-	return mysqlDSN, grpcEndpoint, terminate
+
+	// restartSource: stop + start the SAME container, then re-wait for
+	// the same readiness signal the bring-up used. Generous timeout
+	// (3 min) covers the vttestserver re-boot. This is the mid-copy
+	// disruption used by the cross-engine chaos test; for the
+	// non-chaos callers it is simply ignored (`_`).
+	restartSource = func(t *testing.T) {
+		t.Helper()
+		rctx, rcancel := context.WithTimeout(context.Background(), 3*time.Minute)
+		defer rcancel()
+		stopTimeout := 30 * time.Second
+		if err := container.Stop(rctx, &stopTimeout); err != nil {
+			t.Fatalf("restartSource: stop vttestserver: %v", err)
+		}
+		if err := container.Start(rctx); err != nil {
+			t.Fatalf("restartSource: start vttestserver: %v", err)
+		}
+		// Re-wait for readiness so the source is serving again before
+		// the test asserts the post-fault invariant.
+		if err := readiness.WaitUntilReady(rctx, container); err != nil {
+			t.Fatalf("restartSource: vttestserver not ready after restart: %v", err)
+		}
+	}
+
+	return mysqlDSN, grpcEndpoint, restartSource, terminate
 }
 
 func applySQL(t *testing.T, dsn, sqlText string) {
@@ -310,7 +351,9 @@ func TestSpikeShapeA_ShardedToConsolidated(t *testing.T) {
 	for _, tc := range cases {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
-			mysqlDSN, grpcEndpoint, vtCleanup := startShardedVTTestServer(t, keyspace, 2)
+			// restartSource is unused here (Shape-A consolidation spike,
+			// no source-disruption); ignore it.
+			mysqlDSN, grpcEndpoint, _, vtCleanup := startShardedVTTestServer(t, keyspace, 2)
 			defer vtCleanup()
 
 			// Sharded table: customer keyed by customer_id, hash vindex

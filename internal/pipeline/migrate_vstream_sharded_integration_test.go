@@ -87,7 +87,9 @@ func TestMigrate_VStreamShardedSource_SrcEqualsDst(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			// grpcEndpoint (VStream) is not needed: a static-sharded
 			// cold migrate is pure SQL over vtgate's MySQL frontend.
-			mysqlDSN, _, vtCleanup := startShardedVTTestServer(t, keyspace, 2)
+			// restartSource is unused here (static-sharded cold migrate,
+			// no source-disruption); ignore it.
+			mysqlDSN, _, _, vtCleanup := startShardedVTTestServer(t, keyspace, 2)
 			defer vtCleanup()
 
 			// Two related tables. customer is hash-vindexed so vtgate
