@@ -188,3 +188,27 @@ type PositionMonotonicChecker interface {
 type BackupSnapshotOpener interface {
 	OpenBackupSnapshot(ctx context.Context, dsn, slotName string) (*BackupSnapshot, error)
 }
+
+// TableScopedBackupSnapshotOpener is the OPTIONAL engine surface for
+// opening a backup-scoped consistent snapshot whose snapshot COPY is
+// restricted to a table allowlist. It is to [BackupSnapshotOpener] what
+// [TableScopedSnapshotOpener] is to [Engine.OpenSnapshotStream]: the same
+// snapshot contract, but with the COPY scoped to the included tables.
+//
+// An empty/nil tables slice means "all tables" — identical behaviour to
+// [BackupSnapshotOpener.OpenBackupSnapshot]. A non-empty slice scopes the
+// backup snapshot's VStream COPY filter to those UNQUALIFIED table names,
+// so a large unrelated table in the same keyspace is never streamed or
+// buffered (the ADR-0071 multi-table-interleaving buffer overflow). The
+// semantics match [TableScopedSnapshotOpener.OpenSnapshotStreamForTables]
+// exactly.
+//
+// Only engines that over-stream by default need to implement it (today:
+// the MySQL PlanetScale/VStream flavor). The full-backup orchestrator
+// type-asserts on this surface and prefers it when a table scope is in
+// effect; engines that don't implement it fall back to the base
+// [BackupSnapshotOpener.OpenBackupSnapshot] (Postgres and vanilla MySQL
+// read per-table and never over-stream, so the scope is a no-op there).
+type TableScopedBackupSnapshotOpener interface {
+	OpenBackupSnapshotForTables(ctx context.Context, dsn, slotName string, tables []string) (*BackupSnapshot, error)
+}

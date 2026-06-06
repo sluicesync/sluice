@@ -202,6 +202,190 @@ func (e *snapshotOpeningEngine) OpenBackupSnapshot(_ context.Context, _, slotNam
 	}, nil
 }
 
+// scopedSnapshotOpeningEngine implements BOTH [ir.BackupSnapshotOpener]
+// and [ir.TableScopedBackupSnapshotOpener] — the shape a PlanetScale
+// source presents (#2b). It records which surface the orchestrator chose
+// and the table allowlist it threaded in, so the test can pin that a
+// table-scoped backup prefers OpenBackupSnapshotForTables and never calls
+// the whole-keyspace OpenBackupSnapshot.
+type scopedSnapshotOpeningEngine struct {
+	*capturingBackupEngine
+	snapshotPos     ir.Position
+	scopedCalls     int
+	baseCalls       int
+	gotScopedTables []string
+	gotScopedSlot   string
+	closes          int
+}
+
+func (e *scopedSnapshotOpeningEngine) makeSnapshot() *ir.BackupSnapshot {
+	return &ir.BackupSnapshot{
+		Position: e.snapshotPos,
+		Rows:     &fakeRowReader{rows: e.rows},
+		CloseFn: func() error {
+			e.closes++
+			return nil
+		},
+	}
+}
+
+// OpenBackupSnapshot implements [ir.BackupSnapshotOpener] (the base,
+// whole-keyspace surface). The scoped test asserts this is NOT called.
+func (e *scopedSnapshotOpeningEngine) OpenBackupSnapshot(_ context.Context, _, _ string) (*ir.BackupSnapshot, error) {
+	e.baseCalls++
+	return e.makeSnapshot(), nil
+}
+
+// OpenBackupSnapshotForTables implements [ir.TableScopedBackupSnapshotOpener].
+func (e *scopedSnapshotOpeningEngine) OpenBackupSnapshotForTables(_ context.Context, _, slotName string, tables []string) (*ir.BackupSnapshot, error) {
+	e.scopedCalls++
+	e.gotScopedSlot = slotName
+	e.gotScopedTables = tables
+	return e.makeSnapshot(), nil
+}
+
+// TestBackup_TableScopedSnapshotPrefersScopedOpener pins the #2b
+// backup-path symmetry: when the source implements
+// [ir.TableScopedBackupSnapshotOpener] AND the filtered schema has tables,
+// the orchestrator opens the snapshot via OpenBackupSnapshotForTables
+// (threading the filtered table names) and NEVER calls the whole-keyspace
+// OpenBackupSnapshot. This is what stops a scoped PlanetScale backup from
+// over-streaming the entire keyspace (ADR-0071 buffer overflow).
+func TestBackup_TableScopedSnapshotPrefersScopedOpener(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewLocalStore(dir)
+	if err != nil {
+		t.Fatalf("NewLocalStore: %v", err)
+	}
+
+	schema := &ir.Schema{
+		Tables: []*ir.Table{
+			{Name: "small_t", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}},
+			{Name: "other_t", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}},
+		},
+	}
+	snapshotPos := ir.Position{Engine: "mysql", Token: `[{"keyspace":"ks","shard":"-","gtid":"x"}]`}
+	reader := &capturingSchemaReader{schema: schema}
+	src := &scopedSnapshotOpeningEngine{
+		capturingBackupEngine: &capturingBackupEngine{
+			backupRecorderEngine: newBackupRecorderEngine("mysql", schema, map[string][]ir.Row{
+				"small_t": {{"id": int64(1)}},
+				"other_t": {{"id": int64(2)}},
+			}),
+			cdc:    ir.CDCBinlog,
+			reader: reader,
+		},
+		snapshotPos: snapshotPos,
+	}
+
+	now := time.Date(2026, 6, 6, 12, 0, 0, 0, time.UTC)
+	b := &Backup{
+		Source:        src,
+		SourceDSN:     "src",
+		Store:         store,
+		SluiceVersion: "v0.99.13-test",
+		SlotName:      "ignored_on_vstream",
+		Now:           func() time.Time { return now },
+	}
+	if err := b.Run(context.Background()); err != nil {
+		t.Fatalf("Backup.Run: %v", err)
+	}
+
+	if src.scopedCalls != 1 {
+		t.Errorf("OpenBackupSnapshotForTables calls = %d; want 1", src.scopedCalls)
+	}
+	if src.baseCalls != 0 {
+		t.Errorf("OpenBackupSnapshot (base) calls = %d; want 0 (scoped opener must win)", src.baseCalls)
+	}
+	wantTables := []string{"small_t", "other_t"}
+	if len(src.gotScopedTables) != len(wantTables) {
+		t.Fatalf("scoped tables = %v; want %v", src.gotScopedTables, wantTables)
+	}
+	for i := range wantTables {
+		if src.gotScopedTables[i] != wantTables[i] {
+			t.Errorf("scoped tables = %v; want %v", src.gotScopedTables, wantTables)
+			break
+		}
+	}
+	if src.gotScopedSlot != "ignored_on_vstream" {
+		t.Errorf("scoped slotName = %q; want %q", src.gotScopedSlot, "ignored_on_vstream")
+	}
+
+	got, err := readManifest(context.Background(), store)
+	if err != nil {
+		t.Fatalf("readManifest: %v", err)
+	}
+	if got.EndPosition != snapshotPos {
+		t.Errorf("EndPosition = %+v; want scoped snapshot-anchored %+v", got.EndPosition, snapshotPos)
+	}
+	// The post-sweep capturer must NOT fire on the snapshot path.
+	if reader.captureCalls != 0 {
+		t.Errorf("CaptureBackupPosition calls = %d; want 0 (snapshot path bypasses it)", reader.captureCalls)
+	}
+}
+
+// TestBackup_BaseOnlySnapshotOpenerStillRoutesToBase pins the no-regression
+// case: a source that implements ONLY the base [ir.BackupSnapshotOpener]
+// (NOT the table-scoped surface — PG, vanilla-via-base) still routes to
+// OpenBackupSnapshot even when the filtered schema has tables. The #2b
+// dispatch must be byte-identical for non-implementers of the new
+// interface.
+func TestBackup_BaseOnlySnapshotOpenerStillRoutesToBase(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewLocalStore(dir)
+	if err != nil {
+		t.Fatalf("NewLocalStore: %v", err)
+	}
+
+	schema := &ir.Schema{
+		Tables: []*ir.Table{
+			{Name: "users", Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}}},
+		},
+	}
+	snapshotPos := ir.Position{Engine: "postgres", Token: `{"slot":"s","lsn":"0/BASE00"}`}
+	reader := &capturingSchemaReader{schema: schema}
+	// snapshotOpeningEngine implements ONLY ir.BackupSnapshotOpener.
+	src := &snapshotOpeningEngine{
+		capturingBackupEngine: &capturingBackupEngine{
+			backupRecorderEngine: newBackupRecorderEngine("postgres", schema, map[string][]ir.Row{
+				"users": {{"id": int64(1)}},
+			}),
+			cdc:    ir.CDCLogicalReplication,
+			reader: reader,
+		},
+		snapshotPos: snapshotPos,
+	}
+	// Compile-time guard: this stub must NOT satisfy the table-scoped
+	// surface, or the test would be vacuous.
+	if _, ok := interface{}(src).(ir.TableScopedBackupSnapshotOpener); ok {
+		t.Fatal("snapshotOpeningEngine must NOT implement TableScopedBackupSnapshotOpener for this test")
+	}
+
+	b := &Backup{
+		Source:    src,
+		SourceDSN: "src",
+		Store:     store,
+		SlotName:  "sluice_chain_slot",
+	}
+	if err := b.Run(context.Background()); err != nil {
+		t.Fatalf("Backup.Run: %v", err)
+	}
+
+	if src.snapshotCalls != 1 {
+		t.Errorf("OpenBackupSnapshot calls = %d; want 1 (base path)", src.snapshotCalls)
+	}
+	if src.gotSnapshotSlot != "sluice_chain_slot" {
+		t.Errorf("OpenBackupSnapshot slotName = %q; want %q", src.gotSnapshotSlot, "sluice_chain_slot")
+	}
+	got, err := readManifest(context.Background(), store)
+	if err != nil {
+		t.Fatalf("readManifest: %v", err)
+	}
+	if got.EndPosition != snapshotPos {
+		t.Errorf("EndPosition = %+v; want base snapshot-anchored %+v", got.EndPosition, snapshotPos)
+	}
+}
+
 // TestBackup_RecordsSnapshotAnchoredEndPosition pins the v0.18.0
 // snapshot-anchored EndPosition path: when the source engine
 // implements [ir.BackupSnapshotOpener], the orchestrator opens a

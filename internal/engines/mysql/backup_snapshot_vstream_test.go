@@ -7,7 +7,16 @@ import (
 	"context"
 	"strings"
 	"testing"
+
+	"sluicesync.dev/sluice/internal/ir"
 )
+
+// Compile-time assertion: the PlanetScale flavor satisfies the optional
+// [ir.TableScopedBackupSnapshotOpener] surface, so the backup orchestrator
+// can scope a PlanetScale backup's VStream COPY to --include-table (the
+// backup-path counterpart to ir.TableScopedSnapshotOpener on the cold-
+// start path). Engine implements it value-receiver, so a value satisfies it.
+var _ ir.TableScopedBackupSnapshotOpener = Engine{Flavor: FlavorPlanetScale}
 
 // TestEngine_OpenBackupSnapshot_FlavorBranchRoutes verifies the
 // v0.44.0 (GitHub issue #16) routing decision: FlavorPlanetScale
@@ -77,5 +86,40 @@ func TestEngine_OpenBackupSnapshot_VanillaDoesNotUseVStream(t *testing.T) {
 	}
 	if strings.Contains(strings.ToLower(err.Error()), "vstream") {
 		t.Errorf("vanilla flavor wrongly routed to VStream path; err = %q", err.Error())
+	}
+}
+
+// TestEngine_OpenBackupSnapshotForTables_VanillaDoesNotUseVStream is the
+// table-scoped counterpart of the routing assertion: even WITH a non-empty
+// table allowlist, vanilla MySQL must NOT touch the VStream gRPC machinery
+// (its per-table pinned-conn snapshot reader never over-streams, so the
+// scope is a no-op and it delegates to the base OpenBackupSnapshot). A
+// "vstream" marker in the error would mean the PlanetScale path misfired.
+func TestEngine_OpenBackupSnapshotForTables_VanillaDoesNotUseVStream(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	eng := Engine{Flavor: FlavorVanilla}
+	_, err := eng.OpenBackupSnapshotForTables(ctx, "user:pw@tcp(127.0.0.1:1)/db", "", []string{"small_t", "other"})
+	if err == nil {
+		t.Fatalf("expected error from unreachable DSN; got nil")
+	}
+	if strings.Contains(strings.ToLower(err.Error()), "vstream") {
+		t.Errorf("vanilla flavor wrongly routed to VStream path; err = %q", err.Error())
+	}
+}
+
+// TestEngine_OpenBackupSnapshotForTables_PlanetScaleRoutesToVStream is the
+// positive counterpart: a scoped PlanetScale backup must go through the
+// VStream COPY path (so the COPY filter can be narrowed to the allowlist).
+func TestEngine_OpenBackupSnapshotForTables_PlanetScaleRoutesToVStream(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	eng := Engine{Flavor: FlavorPlanetScale}
+	_, err := eng.OpenBackupSnapshotForTables(ctx, "user:pw@tcp(127.0.0.1:1)/db", "", []string{"small_t"})
+	if err == nil {
+		t.Fatalf("expected error from unreachable DSN; got nil")
+	}
+	if !strings.Contains(strings.ToLower(err.Error()), "vstream") {
+		t.Errorf("planetscale scoped backup did not route to VStream path; err = %q", err.Error())
 	}
 }

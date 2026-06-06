@@ -6,6 +6,7 @@ package mysql
 import (
 	"context"
 	"fmt"
+	"log/slog"
 
 	"sluicesync.dev/sluice/internal/ir"
 )
@@ -71,15 +72,15 @@ import (
 // vitessio/vitess#6277 documents).
 
 // openBackupSnapshotVStream is the PlanetScale-flavor implementation
-// of [Engine.OpenBackupSnapshot]. Opens a VStream COPY-mode snapshot
-// stream (the same mechanism the live-sync coldStart path uses),
-// drains the COPY phase synchronously, and wraps the result in an
-// [ir.BackupSnapshot] for the backup orchestrator.
+// of [Engine.OpenBackupSnapshot] / [Engine.OpenBackupSnapshotForTables].
+// Opens a VStream COPY-mode snapshot stream (the same mechanism the
+// live-sync coldStart path uses), drains the COPY phase synchronously,
+// and wraps the result in an [ir.BackupSnapshot] for the backup
+// orchestrator.
 //
-// slotName is accepted for [ir.BackupSnapshotOpener] interface
-// uniformity and ignored — VStream doesn't expose a slot concept
-// to clients (the underlying binlog position is in the captured
-// vgtid).
+// There is no slotName parameter — VStream doesn't expose a slot concept
+// to clients (the underlying binlog position is in the captured vgtid),
+// so the callers' slotName is dropped before reaching here.
 //
 // The returned BackupSnapshot.Position is encoded as a VStream
 // [shardGtid] slice (`[{"keyspace":"...","shard":"-","gtid":"..."}]`),
@@ -91,8 +92,24 @@ import (
 // so no goroutine or connection leaks. Caller closes the returned
 // snapshot to commit lifecycle (closes the gRPC stream + cancels
 // the stream context).
-func (e Engine) openBackupSnapshotVStream(ctx context.Context, dsn string) (*ir.BackupSnapshot, error) {
-	snap, err := e.openVStreamSnapshotStream(ctx, dsn)
+//
+// tables scopes the VStream COPY filter (vstreamCopyFilterRules):
+// empty/nil copies every table in the keyspace; a non-empty allowlist
+// restricts vtgate's COPY to those unqualified table names so a large
+// unrelated table in the same keyspace is never streamed/buffered (the
+// ADR-0071 multi-table-interleaving overflow). This is the backup-path
+// counterpart to the cold-start [Engine.OpenSnapshotStreamForTables]
+// scope — both seed a fresh scoped snapshot via
+// [openVStreamSnapshotStreamFrom] with a nil start cursor.
+func (e Engine) openBackupSnapshotVStream(ctx context.Context, dsn string, tables []string) (*ir.BackupSnapshot, error) {
+	if len(tables) > 0 {
+		slog.InfoContext(ctx, "mysql/vstream: backup snapshot: scoping COPY to included tables",
+			slog.Int("table_count", len(tables)))
+	}
+	// A nil start cursor produces a fresh from-beginning snapshot; the
+	// tables arg scopes the COPY filter exactly as the cold-start
+	// OpenSnapshotStreamForTables path does.
+	snap, err := e.openVStreamSnapshotStreamFrom(ctx, dsn, nil, tables)
 	if err != nil {
 		return nil, fmt.Errorf("mysql: backup snapshot (vstream): %w", err)
 	}

@@ -340,7 +340,7 @@ func (b *Backup) Run(ctx context.Context) error {
 	// carry the during-backup write-window gap. One-shot full backups
 	// without CDC are still legitimate; chain correctness is the only
 	// thing that needs the snapshot path.
-	rr, snapshotPos, snapshotCloser, err := b.openSnapshotOrFallback(ctx)
+	rr, snapshotPos, snapshotCloser, err := b.openSnapshotOrFallback(ctx, schema)
 	if err != nil {
 		return err
 	}
@@ -575,9 +575,45 @@ func (b *Backup) Run(ctx context.Context) error {
 // call. err is reserved for outright open failures of the fallback
 // row reader itself — a snapshot open error is NOT propagated as
 // err; it triggers the fallback instead.
-func (b *Backup) openSnapshotOrFallback(ctx context.Context) (ir.RowReader, *ir.Position, func(), error) {
+// openBackupSnapshotScoped opens a backup-scoped consistent snapshot,
+// preferring the table-scoped surface when a table scope is in effect.
+// It is the backup-path sibling of [openSnapshotStreamScoped] (the
+// cold-start dispatcher) — same selection logic, [ir.BackupSnapshot]
+// shape.
+//
+//   - source implements [ir.TableScopedBackupSnapshotOpener] AND there
+//     are filtered tables (len(tables) > 0) → OpenBackupSnapshotForTables,
+//     so a PlanetScale backup scopes its VStream COPY to the included
+//     tables (avoids the ADR-0071 over-stream/buffer-overflow on a large
+//     unrelated keyspace table).
+//   - else source implements [ir.BackupSnapshotOpener] → OpenBackupSnapshot
+//     (unchanged whole-snapshot path — PG, vanilla MySQL via base).
+//   - else → not implemented (ok=false); the caller takes the v0.17.x
+//     non-snapshot fallback.
+//
+// The schema passed here is already filtered to the included tables by
+// [applyTableFilter] (called earlier in Run), so its table names are the
+// backup's effective scope. implemented reports whether ANY snapshot
+// opener was found; err carries an open failure (the caller falls back to
+// the v0.17.x path on a non-nil err exactly as the base OpenBackupSnapshot
+// error path does — a scoped-open error is NOT a different failure mode).
+func (b *Backup) openBackupSnapshotScoped(ctx context.Context, schema *ir.Schema) (snap *ir.BackupSnapshot, implemented bool, err error) {
+	tables := tableNamesForPublication(schema)
+	if len(tables) > 0 {
+		if scoped, ok := b.Source.(ir.TableScopedBackupSnapshotOpener); ok {
+			snap, err = scoped.OpenBackupSnapshotForTables(ctx, b.SourceDSN, b.SlotName, tables)
+			return snap, true, err
+		}
+	}
 	if opener, ok := b.Source.(ir.BackupSnapshotOpener); ok {
-		snap, err := opener.OpenBackupSnapshot(ctx, b.SourceDSN, b.SlotName)
+		snap, err = opener.OpenBackupSnapshot(ctx, b.SourceDSN, b.SlotName)
+		return snap, true, err
+	}
+	return nil, false, nil
+}
+
+func (b *Backup) openSnapshotOrFallback(ctx context.Context, schema *ir.Schema) (ir.RowReader, *ir.Position, func(), error) {
+	if snap, ok, err := b.openBackupSnapshotScoped(ctx, schema); ok {
 		if err == nil {
 			slog.InfoContext(
 				ctx, "backup: opened snapshot-anchored consistent view",

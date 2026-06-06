@@ -52,7 +52,9 @@ func (e Engine) OpenBackupSnapshot(ctx context.Context, dsn, slotName string) (*
 		return nil, fmt.Errorf("%s: backup snapshot not supported by this flavor: %w", e.Name(), ErrNotImplemented)
 	}
 	if e.Flavor == FlavorPlanetScale {
-		return e.openBackupSnapshotVStream(ctx, dsn)
+		// Whole-keyspace COPY (nil tables). The table-scoped variant lives
+		// on OpenBackupSnapshotForTables (ir.TableScopedBackupSnapshotOpener).
+		return e.openBackupSnapshotVStream(ctx, dsn, nil)
 	}
 	_ = slotName // accepted for interface uniformity; ignored on the binlog-snapshot path
 	cfg, err := parseDSN(dsn)
@@ -131,6 +133,36 @@ func (e Engine) OpenBackupSnapshot(ctx context.Context, dsn, slotName string) (*
 		Rows:     rowReader,
 		CloseFn:  closeFn,
 	}, nil
+}
+
+// OpenBackupSnapshotForTables implements
+// [ir.TableScopedBackupSnapshotOpener]: it opens a backup snapshot whose
+// COPY is scoped to the unqualified table names in tables (an empty slice
+// means "all tables", identical to [Engine.OpenBackupSnapshot]).
+//
+// It branches on flavor EXACTLY like [Engine.OpenSnapshotStreamForTables]:
+//
+//   - FlavorPlanetScale → [openBackupSnapshotVStream] with the table
+//     allowlist, so vtgate's COPY scans only those tables and a large
+//     unrelated table in the same keyspace is never streamed/buffered
+//     (the ADR-0071 multi-table-interleaving buffer overflow). This is
+//     the over-stream the base whole-keyspace path hits on a scoped
+//     PlanetScale backup.
+//   - vanilla/binlog → delegate to the base [Engine.OpenBackupSnapshot].
+//     Its per-table pinned-conn reader reads one table at a time and
+//     never over-streams, so the table scope is a no-op there (mirrors
+//     the OpenSnapshotStreamForTables comment).
+func (e Engine) OpenBackupSnapshotForTables(ctx context.Context, dsn, slotName string, tables []string) (*ir.BackupSnapshot, error) {
+	if e.Capabilities().CDC == ir.CDCNone {
+		return nil, fmt.Errorf("%s: backup snapshot not supported by this flavor: %w", e.Name(), ErrNotImplemented)
+	}
+	if e.Flavor == FlavorPlanetScale {
+		return e.openBackupSnapshotVStream(ctx, dsn, tables)
+	}
+	// Vanilla/binlog flavor: its snapshot RowReader already reads per-table,
+	// so it never over-streams; the table scope is a no-op there. Delegate
+	// to the base whole-snapshot path (slotName is ignored there too).
+	return e.OpenBackupSnapshot(ctx, dsn, slotName)
 }
 
 // captureBackupPositionInTx queries the source-side cursor against the
