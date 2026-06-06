@@ -1673,6 +1673,16 @@ func (c *vstreamSnapshotChanges) StreamChanges(ctx context.Context, from ir.Posi
 // happens via [SnapshotStream.Close]; this is a no-op.
 func (c *vstreamSnapshotChanges) Close() error { return nil }
 
+// Err exposes the underlying snapshot stream's terminal pump error so the
+// pipeline's optional-Err probe (`cdc.(interface{ Err() error })`) and tests
+// can SEE a loud CDC-pump failure on the cold-start path — e.g. the F3
+// mid-stream progress-timeout (vstreamProgressTimeoutError) after a
+// failover-induced stream wedge. Without this delegation the wrapper has no
+// Err(), the probe finds nothing, and a loud pump failure is silently
+// swallowed — the sync appears to stall with no surfaced error. Mirrors the
+// standalone vstreamCDCReader.Err() contract.
+func (c *vstreamSnapshotChanges) Err() error { return c.snap.Err() }
+
 // shardScopeKey is the key shape used in
 // [vstreamSnapshotStream.copyCompletedShards]. Combines keyspace and
 // shard so two shards with the same name in different keyspaces
