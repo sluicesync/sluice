@@ -6,12 +6,17 @@
 # the genuine VReplication copy + atomic rename cutover that vtcombo
 # can't. See startVitessCluster in cdc_vstream_cluster_integration_test.go.
 #
-# Image is pinned to vitess/lite:v24.0.1 — Vitess 24 — to match the
+# Image defaults to vitess/lite:v24.0.1 — Vitess 24 — to match the
 # vendored vitess.io/vitess v0.24.1 client (the Go module v0.X maps to the
 # Vitess MAJOR release: v0.24.x == Vitess 24.0.x). Keep this image MAJOR
 # in lockstep with the vendored client: a multi-major skew exercises a
 # different online-DDL / `_vt_*` lifecycle than the code under test and is
 # not the real baseline (real PlanetScale runs current-major Vitess too).
+#
+# The image is env-overridable via ${VITESS_LITE_IMAGE} (default unchanged)
+# so the rolling-upgrade chaos scenario can boot the cluster on an OLDER
+# same-major minor (v24.0.0) and then roll each component forward to the
+# vendored-client-matching target (v24.0.1) via the chaos-upgrade override.
 #
 # Flag conventions are pinned to Vitess 24: the server binaries and
 # vtctldclient all take HYPHENATED flags (--service-map,
@@ -43,7 +48,7 @@ services:
       retries: 40
 
   vtctld:
-    image: vitess/lite:v24.0.1
+    image: ${VITESS_LITE_IMAGE:-vitess/lite:v24.0.1}
     entrypoint: ["sh", "-c"]
     command:
       - |
@@ -65,8 +70,14 @@ services:
       retries: 40
 
   vttablet:
-    image: vitess/lite:v24.0.1
+    image: ${VITESS_LITE_IMAGE:-vitess/lite:v24.0.1}
     hostname: vttablet
+    # Named volume for the tablet's MySQL datadir so a `--force-recreate`
+    # onto a new image (the rolling-upgrade chaos scenario) preserves the
+    # data + tablet identity — mysqlctl `init || start` resumes the existing
+    # datadir instead of re-initialising an empty one. `down -v` reclaims it.
+    volumes:
+      - vttablet-data:/vt/vtdataroot
     entrypoint: ["sh", "-c"]
     command:
       - |
@@ -91,8 +102,11 @@ services:
         condition: service_healthy
 
   vttablet-replica:
-    image: vitess/lite:v24.0.1
+    image: ${VITESS_LITE_IMAGE:-vitess/lite:v24.0.1}
     hostname: vttablet-replica
+    # Named volume — see vttablet above (rolling-upgrade recreate safety).
+    volumes:
+      - vttablet-replica-data:/vt/vtdataroot
     entrypoint: ["sh", "-c"]
     command:
       - |
@@ -117,7 +131,7 @@ services:
         condition: service_healthy
 
   init:
-    image: vitess/lite:v24.0.1
+    image: ${VITESS_LITE_IMAGE:-vitess/lite:v24.0.1}
     entrypoint: ["sh", "-c"]
     command:
       - |
@@ -147,7 +161,7 @@ services:
         condition: service_healthy
 
   vtgate:
-    image: vitess/lite:v24.0.1
+    image: ${VITESS_LITE_IMAGE:-vitess/lite:v24.0.1}
     entrypoint: ["sh", "-c"]
     command:
       - |
@@ -167,3 +181,9 @@ services:
     depends_on:
       vtctld:
         condition: service_healthy
+
+# Per-tablet MySQL datadirs (see the vttablet services). Project-scoped and
+# reclaimed by `docker compose down -v`, which every harness cleanup runs.
+volumes:
+  vttablet-data:
+  vttablet-replica-data:

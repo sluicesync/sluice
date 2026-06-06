@@ -195,32 +195,37 @@ func TestVitessChaos_PrimaryFailover_PRS_and_ERS(t *testing.T) {
 // ----------------------------------------------------------------------
 // Scenario 2 — TABLET KILL DURING COLD-START COPY
 //
-// Kills the primary vttablet (variant: its mysqld) DURING the COPY phase,
-// the real-crash analog of the SIGKILL simulation. Asserts v0.99.9's
-// durable-watermark resume + the Gap-1 gRPC-transient auto-retry recover
-// with zero loss, or fail loud.
+// Kills the primary vttablet (variant: its mysqld) DURING the COPY phase —
+// the real-crash analog of the SIGKILL simulation — then EmergencyReparents
+// onto the surviving replica (the VTOrc/operator action a real deployment
+// takes; this minimal harness runs no VTOrc). Asserts the COPY either
+// resumes across the reparent with zero loss (v0.99.5 in-place reconnect +
+// v0.99.8/9 durable-watermark resume carrying the cursor onto the new
+// primary) or fails LOUD — never a silent partial.
 // ----------------------------------------------------------------------
 
 func TestVitessChaos_TabletKill_MidColdStart(t *testing.T) {
-	// Killing the COPY-source tablet mid-cold-start must resume-or-fail-loud.
-	// INVESTIGATION OUTCOME: this originally CHURNED — the in-place reconnect
-	// budget reset on ANY event (cdc_vstream_snapshot.go), so an unproductive
-	// reconnect loop after the tablet death (reconnect → non-progress events →
-	// error → repeat) never exhausted reconnectMax and never failed loud. FIXED
-	// by gating the budget reset on actual COPY progress (a ROW buffered), so an
-	// unproductive loop now burns its budget and surfaces a LOUD failCopy
-	// (~reconnectMax × backoff ≈ 60s), which the invariant accepts and the
-	// pipeline's retry can act on.
+	// RECONNECT-BUDGET BACKGROUND: the COPY pump's in-place reconnect budget
+	// originally reset on ANY event (cdc_vstream_snapshot.go), so an
+	// unproductive reconnect loop after a tablet death (reconnect →
+	// non-progress events → error → repeat) never exhausted reconnectMax and
+	// never failed loud — it churned. FIXED by gating the budget reset on
+	// actual COPY progress (a ROW buffered) so an unproductive loop burns its
+	// budget and surfaces a LOUD failCopy (~reconnectMax × backoff), which the
+	// invariant accepts. This scenario exercises the recovery path: if the
+	// reparent restores a serving primary before the budget exhausts the COPY
+	// resumes (zero-loss); if not, it fails loud. Both are acceptable; a
+	// silent partial is not (commit 68c7486).
 	//
-	// SKIPPED (revalidation pending a clean environment): the fix is code-sound
-	// and the churn root-cause is confirmed, but this session's marathon of
-	// chaos-cluster boots degraded the local Docker host enough that a FRESH
-	// cluster's seed (chaosInsertBatch) itself times out before the scenario
-	// runs — an environmental limit, not a sluice/logic signal. Un-skip and
-	// re-run on a clean Docker host to confirm both variants flip to loud.
-	t.Skip("revalidation pending clean Docker host; reconnect-budget churn FIXED (progress-gated reset) — see comment")
 	// Two variants: kill the whole tablet container, and kill only mysqld
-	// underneath a live vttablet. Both must resume-or-fail-loud.
+	// underneath a live vttablet. Both recover via the same ERS.
+	// Each variant KILLS the COPY-source primary (uid 100) a different way;
+	// recovery is then driven uniformly by an EmergencyReparentShard onto the
+	// surviving replica (see the inject block). We deliberately do NOT restart
+	// the killed tablet before the ERS — mirroring the proven failover
+	// scenario, leaving the old primary dead makes the ERS deterministic
+	// (no flapping-primary race), and the reparent (not the dead tablet) is
+	// what restores a writable primary.
 	variants := []struct {
 		name    string
 		killOne func(t *testing.T, cc *chaosCluster)
@@ -229,16 +234,14 @@ func TestVitessChaos_TabletKill_MidColdStart(t *testing.T) {
 			name: "tablet-container",
 			killOne: func(t *testing.T, cc *chaosCluster) {
 				cc.killContainer(t, svcTabletPrimary, "SIGKILL")
-				cc.startService(t, svcTabletPrimary)
 			},
 		},
 		{
 			name: "tablet-mysqld",
 			killOne: func(t *testing.T, cc *chaosCluster) {
+				// Kill only mysqld; vttablet stays up but its backing MySQL is
+				// gone — the "storage crashed under a live tablet" fault.
 				cc.killTabletMySQL(t, svcTabletPrimary)
-				// vttablet stays up; mysqlctl is restarted by recovering the
-				// container's mysqld. Bounce the tablet to re-init MySQL.
-				cc.restartContainer(t, svcTabletPrimary)
 			},
 		},
 	}
@@ -290,7 +293,21 @@ func TestVitessChaos_TabletKill_MidColdStart(t *testing.T) {
 					injected = true
 					t.Logf("injecting tablet kill at ~%d/%d COPY rows", snap, seedRows)
 					v.killOne(t, cc)
-					cc.waitForWritablePrimaryHandle(t, 4*time.Minute)
+					// Recover the shard the way a real deployment (VTOrc / an
+					// operator) would: EmergencyReparentShard the dead primary's
+					// duties onto the surviving replica (uid 101, fully replicated
+					// before the kill). This both (a) gives the COPY pump a primary
+					// to resume its in-place reconnect against — the v0.99.5
+					// reconnect + v0.99.8/9 durable-watermark resume must carry the
+					// cursor across the reparent — and (b) restores a writable
+					// primary for the final source-count read. The invariant then
+					// holds either way: the COPY resumes to zero-loss across the
+					// reparent, or the reconnect budget exhausts first and it fails
+					// LOUD (the churn the progress-gated reset, commit 68c7486,
+					// converts into failCopy). It must never silently partial.
+					cc.emergencyReparent(t, tabletAliasReplica)
+					cc.waitForPrimaryAlias(t, tabletAliasReplica, 4*time.Minute)
+					cc.waitForWritablePrimaryHandle(t, 3*time.Minute)
 				}
 			}
 			rowsErr := stream.Rows.Err()
@@ -373,9 +390,8 @@ func TestVitessChaos_VtgateRestart_MidSync(t *testing.T) {
 	// Let CDC flow, then take vtgate (sluice's gRPC endpoint) fully DOWN for
 	// a window before bringing it back — a stronger fault than a single
 	// `restart` because there is a real interval where the endpoint is gone
-	// and the reader's dial fails. (restartContainer is the lighter bounce;
-	// the stop+gap+start here forces the reconnect path through a true
-	// outage.)
+	// and the reader's dial fails. The stop+gap+start forces the reconnect
+	// path through a true outage rather than a momentary bounce.
 	time.Sleep(4 * time.Second)
 	cc.stopContainer(t, svcVtgate)
 	time.Sleep(6 * time.Second) // endpoint-gone window: reader must dial-fail then retry
@@ -400,34 +416,53 @@ func TestVitessChaos_VtgateRestart_MidSync(t *testing.T) {
 // ----------------------------------------------------------------------
 // Scenario 4 — ROLLING UPGRADE MID-SYNC
 //
-// Swaps a component image tag (vitess/lite:v24.0.1 -> a newer documented
-// minor) and rolling-restarts mid-sync, asserting sluice survives the
-// version bump.
+// Boots the cluster on the PRIOR same-major minor (chaosUpgradeFromImage)
+// and rolls every component forward to the vendored-client-matching target
+// (chaosUpgradeToImage) one service at a time, mid-sync, asserting the
+// invariant survives a real version bump.
 //
-// FEASIBILITY CAVEAT (flagged for the local session): a true in-test
-// rolling upgrade needs (a) a second pinned image tag that is image-pull-
-// available and protocol-compatible with the vendored vitess.io/vitess
-// v0.24.x client, and (b) a compose override that re-creates one service
-// at a time with the new tag while the rest of the cluster keeps serving.
-// Within a single docker-compose project, `compose up -d --no-deps
-// <service>` with an override file that pins the new tag re-creates ONLY
-// that service. The skeleton below drives that, but is gated behind a
-// t.Skip documenting the manual steps because the exact compatible newer
-// tag (e.g. vitess/lite:v24.0.2 if released, or a v25 client+image bump)
-// must be chosen and pull-verified locally first. Promote it by removing
-// the Skip once the local session confirms the tag + override.
+// TAG CHOICE: within MAJOR 24 (the vendored vitess.io/vitess v0.24.1
+// client) the only pull-available minors are v24.0.0 and v24.0.1, so the
+// baseline upgrade is v24.0.0 -> v24.0.1 (target == the vendored client).
+// A cross-major skew exercises a different online-DDL / `_vt_*` lifecycle
+// than the code under test and is NOT the real upgrade baseline.
+//
+// ORDERING is the production zero-downtime pattern, NOT a naive
+// recreate-the-primary-in-place (which would drop the only serving primary
+// while its container rebuilds): upgrade the stateless vtgate first, then
+// the replica, then PlannedReparentShard onto the now-upgraded replica so
+// the OLD primary can be upgraded as a replica with no primary-write
+// outage. The two tablets carry NAMED VOLUMES (see docker-compose.yml) so
+// a `--force-recreate` onto the new image preserves each tablet's MySQL
+// data + identity (mysqlctl `init || start` resumes the existing datadir).
+//
+// EXPECTED OUTCOME: as with the other cold-start chaos scenarios, any
+// stream disruption mid-cold-start surfaces LOUD (the F3 watchdog +
+// snapshot-reader Err() delegation) rather than silently — so this test
+// most often passes via the loud branch of assertZeroLossOrLoud. That is
+// the point: a version bump must never silently corrupt; loud-or-zero-loss
+// is the contract.
 // ----------------------------------------------------------------------
 
-func TestVitessChaos_RollingUpgrade_MidSync(t *testing.T) {
-	t.Skip("rolling-upgrade chaos: DRAFT SKELETON — choose + pull-verify a compatible newer vitess/lite tag " +
-		"and the docker-compose.chaos-upgrade.yml override locally, then remove this Skip. " +
-		"Manual steps: (1) pick a newer minor of vitess/lite within the same MAJOR as the vendored " +
-		"vitess.io/vitess client (cross-major skew exercises a different _vt_* lifecycle and is NOT the baseline); " +
-		"(2) set CHAOS_UPGRADE_IMAGE to that tag; (3) `compose -f docker-compose.yml -f docker-compose.chaos-upgrade.yml " +
-		"up -d --no-deps <service>` per component (vtgate, then each vttablet), waiting for waitForWritablePrimary " +
-		"between each; (4) assert the invariant. See the skeleton below for the in-test driver.")
+// chaosUpgradeFromImage / chaosUpgradeToImage pin the rolling-upgrade
+// endpoints. Both are same-major (Vitess 24) minors so the bump exercises
+// the real upgrade path the vendored v0.24.1 client supports; the target
+// matches the vendored client exactly. Override CHAOS_UPGRADE_IMAGE /
+// VITESS_LITE_IMAGE to retarget when a newer compatible minor ships.
+const (
+	chaosUpgradeFromImage = "vitess/lite:v24.0.0"
+	chaosUpgradeToImage   = "vitess/lite:v24.0.1"
+)
 
-	cc := startChaosCluster(t)
+func TestVitessChaos_RollingUpgrade_MidSync(t *testing.T) {
+	// Boot on the prior minor; the override + recreate rolls forward to the
+	// target. baseEnv carries both so the bring-up and the per-service
+	// recreate pick up the right tags.
+	cc := startChaosCluster(
+		t,
+		"VITESS_LITE_IMAGE="+chaosUpgradeFromImage,
+		"CHAOS_UPGRADE_IMAGE="+chaosUpgradeToImage,
+	)
 	defer cc.cleanup()
 
 	const table = "upgrade_t"
@@ -475,16 +510,39 @@ func TestVitessChaos_RollingUpgrade_MidSync(t *testing.T) {
 	}()
 	time.Sleep(4 * time.Second)
 
-	// Rolling-restart each component onto the new tag, one at a time,
-	// waiting for the cluster to re-stabilise between each. The override
-	// file (docker-compose.chaos-upgrade.yml) pins CHAOS_UPGRADE_IMAGE; the
-	// per-service `--no-deps` recreate leaves the rest of the stack serving.
+	// Zero-downtime rolling upgrade. The override file pins
+	// CHAOS_UPGRADE_IMAGE; the per-service `--no-deps --force-recreate`
+	// recreates ONLY that component onto the new tag while the rest keep
+	// serving. If the reader errors loudly at any point the channel closes —
+	// we keep driving the cluster steps (they are idempotent) and let
+	// assertZeroLossOrLoud accept the loud outcome at the end.
 	overrideFile := chaosUpgradeOverridePath(t)
-	for _, svc := range []string{svcVtgate, svcTabletReplica, svcTabletPrimary} {
-		cc.recreateServiceWithOverride(t, overrideFile, svc)
-		cc.waitForWritablePrimaryHandle(t, 4*time.Minute)
-		_ = drainUntil(changes, drain, drain.count()+5, 60*time.Second)
-	}
+
+	// 1. vtgate — the stateless gRPC endpoint sluice's VStream dials.
+	cc.recreateServiceWithOverride(t, overrideFile, svcVtgate)
+	cc.waitForWritablePrimaryHandle(t, 4*time.Minute)
+	_ = drainUntil(changes, drain, drain.count()+5, 60*time.Second)
+
+	// 2. the replica tablet — its named volume preserves data across the
+	// image swap so it rejoins as a caught-up replica.
+	cc.recreateServiceWithOverride(t, overrideFile, svcTabletReplica)
+	cc.waitForWritablePrimaryHandle(t, 4*time.Minute)
+	// The recreated replica's vttablet needs to finish booting before we can
+	// reparent onto it — `compose up` returns at container-start, not at
+	// tablet-serving, and a PRS issued too early fails "tablet is shutdown".
+	cc.waitForTabletPing(t, tabletAliasReplica, 3*time.Minute)
+	_ = drainUntil(changes, drain, drain.count()+5, 60*time.Second)
+
+	// 3. promote the upgraded replica so the old primary can be upgraded
+	// without a primary-write outage (the production pattern).
+	cc.plannedReparent(t, tabletAliasReplica)
+	cc.waitForPrimaryAlias(t, tabletAliasReplica, 3*time.Minute)
+	cc.waitForWritablePrimaryHandle(t, 2*time.Minute)
+	_ = drainUntil(changes, drain, drain.count()+5, 60*time.Second)
+
+	// 4. the old primary (now a replica) — last component onto the new tag.
+	cc.recreateServiceWithOverride(t, overrideFile, svcTabletPrimary)
+	cc.waitForWritablePrimaryHandle(t, 4*time.Minute)
 
 	committed := stop()
 	writerStopped = true

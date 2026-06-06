@@ -98,7 +98,12 @@ type chaosCluster struct {
 // value is local to startVitessCluster. Keeping a parallel bring-up here is
 // the smaller wart than widening startVitessCluster's return signature for
 // a chaos-only need; the bring-up logic is intentionally identical.
-func startChaosCluster(t *testing.T) *chaosCluster {
+// extraEnv (optional) is appended to the compose env for every command this
+// cluster runs — used by the rolling-upgrade scenario to pin the bring-up
+// image (VITESS_LITE_IMAGE) and the upgrade-target image (CHAOS_UPGRADE_IMAGE)
+// so a per-service override recreate lands the newer tag. Other scenarios pass
+// nothing and inherit the compose defaults.
+func startChaosCluster(t *testing.T, extraEnv ...string) *chaosCluster {
 	t.Helper()
 
 	dockerBin := findDocker(t)
@@ -111,6 +116,7 @@ func startChaosCluster(t *testing.T) *chaosCluster {
 		fmt.Sprintf("VTGATE_MYSQL_PORT=%d", chaosMySQLPort),
 		fmt.Sprintf("VTGATE_GRPC_PORT=%d", chaosGRPCPort),
 	)
+	baseEnv = append(baseEnv, extraEnv...)
 
 	cc := &chaosCluster{
 		dockerBin:   dockerBin,
@@ -255,20 +261,6 @@ func (cc *chaosCluster) recreateServiceWithOverride(t *testing.T, overrideFile, 
 	t.Logf("CHAOS: recreated %s onto the upgrade image", service)
 }
 
-// restartContainer issues a single `docker compose restart` — the
-// stop+start of an already-running service in one step (vtgate-restart
-// fault). Unlike kill+start it preserves the container (same identity),
-// modelling a process bounce / rolling restart rather than a crash.
-func (cc *chaosCluster) restartContainer(t *testing.T, service string) {
-	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
-	defer cancel()
-	if out, err := cc.runCompose(ctx, "restart", service); err != nil {
-		t.Fatalf("restart %s: %v\n%s", service, err, out)
-	}
-	t.Logf("CHAOS: restarted service %s", service)
-}
-
 // killTabletMySQL kills ONLY the mysqld inside a tablet container, leaving
 // the vttablet process running — the "storage layer crashed under a live
 // tablet" fault, distinct from killing the whole tablet container. It
@@ -379,6 +371,33 @@ func (cc *chaosCluster) waitForPrimaryAlias(t *testing.T, wantPrimaryAlias strin
 		wantPrimaryAlias, timeout, lastOut)
 }
 
+// waitForTabletPing polls `vtctldclient PingTablet <alias>` until the
+// vttablet answers (or it times out). Unlike waitForPrimaryAlias (which
+// reads the TOPO record — stale after a kill/recreate, since a downed
+// tablet's record lingers), PingTablet RPCs the vttablet process itself, so
+// it is the reliable "the tablet is actually back up" gate. Needed before
+// reparenting onto a freshly `--force-recreate`d tablet: `compose up`
+// returns when the container starts, but vttablet takes seconds more to
+// register + serve, and a PlannedReparentShard issued too early fails with
+// "tablet is shutdown".
+func (cc *chaosCluster) waitForTabletPing(t *testing.T, alias string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		_, err := cc.vtctldclient(ctx, "PingTablet", alias)
+		cancel()
+		if err == nil {
+			t.Logf("CHAOS: tablet %s responds to PingTablet", alias)
+			return
+		}
+		lastErr = err
+		time.Sleep(2 * time.Second)
+	}
+	t.Fatalf("tablet %s never answered PingTablet within %v: %v", alias, timeout, lastErr)
+}
+
 // waitForWritablePrimaryHandle re-uses waitForWritablePrimary against this
 // cluster's DSN — the post-recovery "vtgate routes to a healthy writable
 // primary again" gate. Thin alias for readability in the scenarios.
@@ -409,12 +428,32 @@ func chaosSeedTable(t *testing.T, dsn, table string) {
 }
 
 // chaosInsertBatch inserts rows [start, start+n) into table as
-// payload='chaos-<i>' in one multi-statement exec.
+// payload='chaos-<i>' using chunked MULTI-ROW INSERTs (one statement per
+// chunk), not n single-row statements.
+//
+// Through vtgate every statement is its own distributed commit, so n
+// separate INSERTs is n sequential round-trips — at the larger seed sizes
+// (the tablet-kill scenario seeds 5000) that blew applyClusterSQL's 60s
+// deadline even on a freshly-booted cluster, which is what kept the
+// tablet-kill scenario un-runnable (it was mis-attributed to host
+// degradation). Multi-row chunks cut the seed to ceil(n/chunk) round-trips.
 func chaosInsertBatch(t *testing.T, dsn, table string, start, n int) {
 	t.Helper()
+	const chunk = 500 // rows per multi-row INSERT — one vtgate round-trip each
 	var b strings.Builder
-	for i := start; i < start+n; i++ {
-		fmt.Fprintf(&b, "INSERT INTO %s (payload) VALUES ('chaos-%d');", table, i)
+	for i := start; i < start+n; i += chunk {
+		end := i + chunk
+		if end > start+n {
+			end = start + n
+		}
+		fmt.Fprintf(&b, "INSERT INTO %s (payload) VALUES ", table)
+		for j := i; j < end; j++ {
+			if j > i {
+				b.WriteByte(',')
+			}
+			fmt.Fprintf(&b, "('chaos-%d')", j)
+		}
+		b.WriteByte(';')
 	}
 	applyClusterSQL(t, dsn+"&multiStatements=true", b.String())
 }
