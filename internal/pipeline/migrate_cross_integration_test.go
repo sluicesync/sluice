@@ -692,3 +692,182 @@ func findColumn(t *ir.Table, name string) *ir.Column {
 	}
 	return nil
 }
+
+// TestMigrate_MySQLToPostgres_NoPKUniqueKey_IdempotentCopy is the Bug 125
+// cross-engine pin (MySQL source -> PG target): a MySQL no-PK table with
+// a NOT-NULL UNIQUE key migrates to PG with the chosen unique key
+// inline-promoted as a UNIQUE CONSTRAINT (so PG's ON CONFLICT can infer
+// against it), the row count matches, and a second idempotent copy pass
+// (simulating a VStream COPY catch-up re-emission) neither duplicates nor
+// errors. A truly-keyless MySQL table is refused loudly on the idempotent
+// path.
+func TestMigrate_MySQLToPostgres_NoPKUniqueKey_IdempotentCopy(t *testing.T) {
+	mysqlSource, _, mysqlCleanup := startMySQL(t)
+	defer mysqlCleanup()
+
+	_, pgTarget, pgCleanup := startPostgres(t)
+	defer pgCleanup()
+
+	// connections: NO PRIMARY KEY, a NOT-NULL UNIQUE key on id (the
+	// real-world metrics.connections shape). keyless: no PK, no unique.
+	const seedDDL = `
+		CREATE TABLE connections (
+			id      BIGINT       NOT NULL,
+			payload VARCHAR(255) NULL,
+			UNIQUE KEY connections_uq_id (id)
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+		INSERT INTO connections (id, payload) VALUES
+			(1, 'a'), (2, 'b'), (3, 'c');
+	`
+	applyMySQLDDL(t, mysqlSource, seedDDL)
+
+	mysqlEng, _ := engines.Get("mysql")
+	pgEng, _ := engines.Get("postgres")
+
+	mig := &Migrator{
+		Source:    mysqlEng,
+		Target:    pgEng,
+		SourceDSN: mysqlSource,
+		TargetDSN: pgTarget,
+	}
+	ctx := ctx2min(t)
+	if err := mig.Run(ctx); err != nil {
+		t.Fatalf("Migrator.Run (no-PK unique-key table must migrate): %v", err)
+	}
+
+	pgdb, err := sql.Open("pgx", pgTarget)
+	if err != nil {
+		t.Fatalf("open pg: %v", err)
+	}
+	defer func() { _ = pgdb.Close() }()
+
+	// (1) The non-null UNIQUE key must physically exist on the target as
+	// a UNIQUE constraint/index — that's the precondition for ON CONFLICT
+	// to infer against it during the idempotent copy.
+	var uniqueCount int
+	if err := pgdb.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM pg_constraint c
+		WHERE c.conrelid = 'public.connections'::regclass
+		  AND c.contype = 'u'`).Scan(&uniqueCount); err != nil {
+		t.Fatalf("probe unique constraint: %v", err)
+	}
+	if uniqueCount == 0 {
+		t.Fatal("no UNIQUE constraint on connections; the cold-start COPY's ON CONFLICT would have nothing to infer against (Bug 125 inline-promotion missing)")
+	}
+
+	// (2) Row count matches the source.
+	var n int
+	if err := pgdb.QueryRowContext(ctx, "SELECT COUNT(*) FROM connections").Scan(&n); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if n != 3 {
+		t.Fatalf("connections rows = %d; want 3", n)
+	}
+
+	// (3) A second idempotent copy pass against the SAME rows (the
+	// VStream COPY catch-up re-emission shape) must upsert, not duplicate
+	// or error on the unique key. Read the source schema for the table
+	// shape, then drive WriteRowsIdempotent directly with re-emitted rows.
+	sr, err := pgEng.OpenSchemaReader(ctx, pgTarget)
+	if err != nil {
+		t.Fatalf("OpenSchemaReader: %v", err)
+	}
+	defer closeIf(sr)
+	schema, err := sr.ReadSchema(ctx)
+	if err != nil {
+		t.Fatalf("ReadSchema: %v", err)
+	}
+	tbl := findTable(schema, "connections")
+	if tbl == nil {
+		t.Fatal("connections table missing on target")
+	}
+	if tbl.PrimaryKey != nil {
+		t.Fatalf("connections has a PrimaryKey on target = %#v; want none (no-PK shape)", tbl.PrimaryKey)
+	}
+
+	rw, err := pgEng.OpenRowWriter(ctx, pgTarget)
+	if err != nil {
+		t.Fatalf("OpenRowWriter: %v", err)
+	}
+	defer closeIf(rw)
+	iw, ok := rw.(ir.IdempotentRowWriter)
+	if !ok {
+		t.Fatal("pg RowWriter does not implement IdempotentRowWriter")
+	}
+
+	rows := make(chan ir.Row, 3)
+	rows <- ir.Row{"id": int64(1), "payload": "a-replayed"}
+	rows <- ir.Row{"id": int64(2), "payload": "b"}
+	rows <- ir.Row{"id": int64(3), "payload": "c"}
+	close(rows)
+	if err := iw.WriteRowsIdempotent(ctx, tbl, rows); err != nil {
+		t.Fatalf("WriteRowsIdempotent replay on no-PK unique-key table: %v (must upsert, not collide)", err)
+	}
+	if err := pgdb.QueryRowContext(ctx, "SELECT COUNT(*) FROM connections").Scan(&n); err != nil {
+		t.Fatalf("count after replay: %v", err)
+	}
+	if n != 3 {
+		t.Errorf("connections rows after idempotent replay = %d; want 3 (no duplication)", n)
+	}
+	// The replayed row's non-key column must have been refreshed (DO
+	// UPDATE SET), proving the upsert is a real upsert.
+	var payload string
+	if err := pgdb.QueryRowContext(ctx, "SELECT payload FROM connections WHERE id = 1").Scan(&payload); err != nil {
+		t.Fatalf("read back payload: %v", err)
+	}
+	if payload != "a-replayed" {
+		t.Errorf("connections.id=1 payload = %q; want %q (idempotent replay must refresh non-key column)", payload, "a-replayed")
+	}
+}
+
+// TestMigrate_MySQLToPostgres_KeylessRefusedOnIdempotentCopy pins the
+// loud refusal: a truly-keyless table (no PK, no non-null UNIQUE) reaching
+// PG's idempotent copy writer is rejected with a Bug-125 error rather than
+// silently plain-INSERTed (which would duplicate catch-up re-emissions).
+func TestMigrate_MySQLToPostgres_KeylessRefusedOnIdempotentCopy(t *testing.T) {
+	_, pgTarget, pgCleanup := startPostgres(t)
+	defer pgCleanup()
+
+	applyPGDDL(t, pgTarget, `
+		CREATE TABLE log_lines (
+			ts   TIMESTAMP NOT NULL,
+			msg  TEXT NULL
+		);
+	`)
+
+	pgEng, _ := engines.Get("postgres")
+	ctx := ctx2min(t)
+
+	sr, err := pgEng.OpenSchemaReader(ctx, pgTarget)
+	if err != nil {
+		t.Fatalf("OpenSchemaReader: %v", err)
+	}
+	defer closeIf(sr)
+	schema, err := sr.ReadSchema(ctx)
+	if err != nil {
+		t.Fatalf("ReadSchema: %v", err)
+	}
+	tbl := findTable(schema, "log_lines")
+	if tbl == nil {
+		t.Fatal("log_lines table missing")
+	}
+
+	rw, err := pgEng.OpenRowWriter(ctx, pgTarget)
+	if err != nil {
+		t.Fatalf("OpenRowWriter: %v", err)
+	}
+	defer closeIf(rw)
+	iw := rw.(ir.IdempotentRowWriter)
+
+	rows := make(chan ir.Row)
+	close(rows)
+	err = iw.WriteRowsIdempotent(ctx, tbl, rows)
+	if err == nil {
+		t.Fatal("WriteRowsIdempotent on keyless table: err=nil; want loud Bug-125 refusal")
+	}
+	if !strings.Contains(err.Error(), "log_lines") || !strings.Contains(err.Error(), "Bug 125") {
+		t.Errorf("error %q; want it to name the table and Bug 125", err.Error())
+	}
+}

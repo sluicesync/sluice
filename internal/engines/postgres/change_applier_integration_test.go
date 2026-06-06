@@ -180,6 +180,87 @@ func TestChangeApplier_NoPKInsert(t *testing.T) {
 	}
 }
 
+// TestChangeApplier_NoPKUniqueKeyInsert_IdempotentReplay is the Bug 125
+// cross-engine pin: a table with NO PRIMARY KEY but a NOT-NULL UNIQUE
+// index upserts on that unique key (ON CONFLICT) so replaying an Insert
+// does NOT duplicate and does NOT error with a unique violation. This is
+// what makes continuous sync (and the resumable cold-start COPY's catch-
+// up re-emissions) safe on the connections-table class. It also exercises
+// the composite-key shape via a second table.
+func TestChangeApplier_NoPKUniqueKeyInsert_IdempotentReplay(t *testing.T) {
+	dsn, cleanup := startPostgresForApplier(t)
+	defer cleanup()
+
+	applyPGApplier(t, dsn, `
+		CREATE TABLE connections (
+			id      BIGINT       NOT NULL,
+			payload VARCHAR(255) NULL,
+			CONSTRAINT connections_uq_id UNIQUE (id)
+		);
+		CREATE TABLE edges (
+			src    BIGINT NOT NULL,
+			dst    BIGINT NOT NULL,
+			weight INTEGER NULL,
+			CONSTRAINT edges_uq_src_dst UNIQUE (src, dst)
+		);
+	`)
+
+	eng := Engine{}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	applier, err := eng.OpenChangeApplier(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenChangeApplier: %v", err)
+	}
+	defer func() {
+		if c, ok := applier.(interface{ Close() error }); ok {
+			_ = c.Close()
+		}
+	}()
+
+	events := []ir.Change{
+		ir.Insert{Schema: "public", Table: "connections", Row: ir.Row{"id": int64(1), "payload": "a"}},
+		ir.Insert{Schema: "public", Table: "connections", Row: ir.Row{"id": int64(2), "payload": "b"}},
+		ir.Insert{Schema: "public", Table: "edges", Row: ir.Row{"src": int64(1), "dst": int64(2), "weight": int64(10)}},
+	}
+	pumpChanges(t, ctx, applier, events)
+
+	if got := countAllRows(t, dsn, "connections"); got != 2 {
+		t.Fatalf("after first apply: connections rows = %d; want 2", got)
+	}
+	if got := countAllRows(t, dsn, "edges"); got != 1 {
+		t.Fatalf("after first apply: edges rows = %d; want 1", got)
+	}
+
+	// Replay the SAME inserts. With ON CONFLICT on the non-null unique
+	// key, the re-applied inserts upsert (DO UPDATE on connections'
+	// payload, DO NOTHING on edges where every column... actually weight
+	// is non-key so DO UPDATE) instead of duplicating or erroring.
+	pumpChanges(t, ctx, applier, events)
+
+	if got := countAllRows(t, dsn, "connections"); got != 2 {
+		t.Errorf("after replay: connections rows = %d; want 2 (no-PK-unique replay must NOT duplicate)", got)
+	}
+	if got := countAllRows(t, dsn, "edges"); got != 1 {
+		t.Errorf("after replay: edges rows = %d; want 1 (composite no-PK-unique replay must NOT duplicate)", got)
+	}
+
+	// A re-applied Insert carrying a NEWER image for the same unique key
+	// must overwrite the non-key column (DO UPDATE SET payload), proving
+	// the upsert refreshes rather than no-ops blindly.
+	pumpChanges(t, ctx, applier, []ir.Change{
+		ir.Insert{Schema: "public", Table: "connections", Row: ir.Row{"id": int64(1), "payload": "a-updated"}},
+	})
+	if got := countAllRows(t, dsn, "connections"); got != 2 {
+		t.Errorf("after newer-image upsert: connections rows = %d; want 2", got)
+	}
+	payload := queryScalarString(t, dsn, `SELECT payload FROM connections WHERE id = 1`)
+	if payload != "a-updated" {
+		t.Errorf("connections.id=1 payload = %q; want %q (upsert must refresh the non-key column)", payload, "a-updated")
+	}
+}
+
 // TestChangeApplier_NullInWhere verifies the IS-NULL predicate path:
 // a Delete whose Before image carries a NULL column must produce a
 // WHERE clause that actually matches that row.
@@ -536,6 +617,24 @@ func countAllRows(t *testing.T, dsn, table string) int {
 		t.Fatalf("count: %v", err)
 	}
 	return n
+}
+
+func queryScalarString(t *testing.T, dsn, query string) string {
+	t.Helper()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	var s string
+	if err := db.QueryRowContext(ctx, query).Scan(&s); err != nil {
+		t.Fatalf("query %q: %v", query, err)
+	}
+	return s
 }
 
 func equalUsers(a, b []userRow) bool {

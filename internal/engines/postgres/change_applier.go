@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -50,25 +51,41 @@ import (
 // # Identity-key behaviour (read this before pointing it at a real
 // # table)
 //
-// The applier upserts rows on Insert using the table's PRIMARY KEY
-// as the conflict target — that's what makes resume after a partial
+// The applier upserts rows on Insert using the table's conflict key
+// as the ON CONFLICT target — that's what makes resume after a partial
 // apply safe (a re-applied Insert turns into a no-op UPDATE rather
-// than a duplicate-key error). Two situations to be aware of:
+// than a duplicate-key error). The conflict key is resolved by
+// [conflictKeyFor] (Bug 125 cross-engine symmetry):
 //
-//   - **Tables without any PK fall back to plain INSERT.** Postgres'
-//     ON CONFLICT requires a unique-index target; without one, the
-//     syntax is unusable. Plain INSERT means a re-applied Insert
-//     produces a duplicate row. Resume idempotency on no-PK tables
-//     is therefore best-effort, and continuous-sync on such tables
-//     is not recommended. Add a PRIMARY KEY to the source table
-//     before running sluice in continuous-sync mode.
+//   - **Tables with a PRIMARY KEY** key the upsert on the PK — the
+//     common case, byte-identical to the pre-Bug-125 behaviour.
 //
-//   - **Tables with a UNIQUE INDEX/CONSTRAINT but no PRIMARY KEY**
-//     would be a candidate conflict target on PG (unlike MySQL),
-//     but sluice doesn't special-case it. The applier behaves as
-//     if there's no PK (plain INSERT path). If you need upsert
-//     semantics here, declare the unique column as the PRIMARY KEY
-//     on the source table.
+//   - **Tables with a NOT-NULL UNIQUE index but no PRIMARY KEY** key
+//     the upsert on a deterministic non-null UNIQUE index (every
+//     column NOT NULL, fewest columns, lex-smallest name — the same
+//     key the cold-start COPY writer + emitTableDef inline-promote).
+//     A re-applied Insert that collides on that unique index becomes
+//     a DO UPDATE (or DO NOTHING when every column is a key column)
+//     rather than a unique-violation error. This is what makes
+//     continuous sync — and the resumable cold-start COPY's catch-up
+//     re-emissions — safe on the Bug-125 table class (no PK + UNIQUE
+//     key, e.g. a `connections` table). PG (unlike MySQL's
+//     ON DUPLICATE KEY UPDATE) requires the inferred unique index to
+//     physically exist, which emitTableDef guarantees.
+//
+//   - **Truly keyless tables (no PK AND no non-null UNIQUE index)
+//     fall back to plain INSERT.** PG's ON CONFLICT has no arbiter to
+//     name, so a re-applied Insert produces a duplicate row. Resume
+//     idempotency on such tables is best-effort and continuous-sync
+//     on them is not recommended — add a PRIMARY KEY (or a NOT NULL
+//     UNIQUE index) to the source table first. The Bug-125 keyless
+//     cold-start guard refuses these tables outright, so they don't
+//     reach the resumable-COPY path in practice.
+//
+// Update and Delete are NOT keyed on the conflict key: they identify
+// the target row via the full Before-image WHERE predicate
+// ([buildWhereClause]), so the Insert conflict-key resolution above
+// does not affect them.
 //
 // # Lifecycle
 //
@@ -142,9 +159,21 @@ type ChangeApplier struct {
 	// pkCache maps "schema.table" → ordered list of PK column names.
 	// Populated lazily via a single information_schema query the
 	// first time a change for the table arrives. An empty slice
-	// (length 0) means "table exists but has no PK" — in that case
-	// Insert falls back to plain INSERT (see the package comment).
+	// (length 0) means "table exists but has no PK" — consulted by the
+	// redactor for replay-stable seeding (the true PK, never a
+	// unique-key fallback).
 	pkCache map[string][]string
+
+	// conflictKeyCache maps "schema.table" to the ordered column list the
+	// Insert path uses as its `ON CONFLICT (cols)` inference target: the
+	// PRIMARY KEY when present, else a deterministic non-null UNIQUE
+	// index (Bug 125 cross-engine symmetry — the same key the cold-start
+	// COPY writer + emitTableDef inline-promote). An empty slice means
+	// "no PK and no non-null UNIQUE index" so Insert falls back to plain
+	// INSERT (best-effort resume idempotency; such tables are refused at
+	// cold-start). Cached separately from pkCache so the redactor keeps
+	// reading the true PK.
+	conflictKeyCache map[string][]string
 
 	// colTypeCache maps "schema.table" → column-name → IR type. It
 	// is the input to prepareValue for every value the applier
@@ -1053,9 +1082,17 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 		// renderVerdictM5Attribution for the cross-reference.
 		diagApplierInsertReceived(ctx, a.schema, v)
 		schema := applierSchema(a.schema, v.Schema)
-		pk, err := a.pkFor(ctx, tx, schema, v.Table)
+		// Bug 125: the Insert ON CONFLICT target is the table's PK when
+		// present, else a deterministic non-null UNIQUE index — so a
+		// re-applied Insert on a no-PK-but-unique table (e.g. an
+		// at-least-once CDC replay, or a cold-start COPY catch-up
+		// re-emission against the inline-promoted UNIQUE constraint)
+		// upserts idempotently instead of erroring with a unique
+		// violation. Update/Delete are unaffected: they key on the full
+		// Before-image WHERE, not on this conflict key.
+		key, err := a.conflictKeyFor(ctx, tx, schema, v.Table)
 		if err != nil {
-			return fmt.Errorf("postgres: applier: pk lookup for %s.%s: %w", schema, v.Table, err)
+			return fmt.Errorf("postgres: applier: conflict-key lookup for %s.%s: %w", schema, v.Table, err)
 		}
 		colTypes, err := a.colTypesFor(ctx, schema, v.Table)
 		if errors.Is(err, errUnknownTable) {
@@ -1066,7 +1103,7 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 			return fmt.Errorf("postgres: applier: column types for %s.%s: %w", schema, v.Table, err)
 		}
 		generated := a.generatedColsFor(schema, v.Table)
-		stmt, args, err := buildInsertSQL(schema, v.Table, v.Row, pk, colTypes, generated)
+		stmt, args, err := buildInsertSQL(schema, v.Table, v.Row, key, colTypes, generated)
 		if err != nil {
 			return fmt.Errorf("postgres: applier: build insert for %s.%s: %w", schema, v.Table, err)
 		}
@@ -1267,20 +1304,23 @@ func logZeroRowsAffected(ctx context.Context, op, schema, table string, res sql.
 	}
 }
 
-// pkFor returns the cached PK column list for the named table,
-// loading it on the first sight of the table. An empty slice means
-// "no PK" — Insert falls back to plain INSERT in that case.
-func (a *ChangeApplier) pkFor(ctx context.Context, tx *sql.Tx, schema, table string) ([]string, error) {
+// conflictKeyFor returns the cached ON CONFLICT inference target for
+// the named table's Insert path (Bug 125): the PRIMARY KEY when
+// present, else a deterministic non-null UNIQUE index, else an empty
+// slice (plain INSERT). Loaded on the first sight of the table and
+// cached separately from pkFor so the redactor keeps reading the true
+// PK rather than a unique-key fallback.
+func (a *ChangeApplier) conflictKeyFor(ctx context.Context, tx *sql.Tx, schema, table string) ([]string, error) {
 	qn := schema + "." + table
-	if cached, ok := a.pkCache[qn]; ok {
+	if cached, ok := a.conflictKeyCache[qn]; ok {
 		return cached, nil
 	}
-	pk, err := loadPrimaryKey(ctx, tx, schema, table)
+	key, err := loadConflictKey(ctx, tx, schema, table)
 	if err != nil {
 		return nil, err
 	}
-	a.pkCache[qn] = pk
-	return pk, nil
+	a.conflictKeyCache[qn] = key
+	return key, nil
 }
 
 // generatedColsFor returns the set of generated-column names for
@@ -1555,22 +1595,130 @@ func loadPrimaryKey(ctx context.Context, tx *sql.Tx, schema, table string) ([]st
 	return pk, rows.Err()
 }
 
-// buildInsertSQL builds an INSERT statement. With a non-empty PK,
-// uses ON CONFLICT (pk) DO UPDATE:
+// loadConflictKey returns the column list the Insert path keys its
+// ON CONFLICT on (Bug 125 cross-engine symmetry): the PRIMARY KEY when
+// present, else a deterministic non-null UNIQUE index, else an empty
+// slice (plain INSERT — the table is truly keyless on the target).
+//
+// The non-null-unique selection mirrors [pickNonNullUniqueIndex] (the
+// schema-side helper the cold-start COPY writer + emitTableDef use):
+// every indexed column NOT NULL, then fewest columns, then
+// lexicographically smallest index name. Resolved here from the live
+// catalog (pg_index) rather than the IR because the applier sees the
+// target by name, not by *ir.Table — but the rule is identical, so the
+// applier's conflict key matches the inline-promoted UNIQUE constraint
+// emitTableDef created. Partial / expression indexes (indpred or
+// indexprs set) are excluded — they can't be a stable ON CONFLICT
+// arbiter without a matching index_predicate clause sluice doesn't
+// emit.
+func loadConflictKey(ctx context.Context, tx *sql.Tx, schema, table string) ([]string, error) {
+	pk, err := loadPrimaryKey(ctx, tx, schema, table)
+	if err != nil {
+		return nil, err
+	}
+	if len(pk) > 0 {
+		return pk, nil
+	}
+
+	// No PK — find the deterministic non-null UNIQUE index. The query
+	// returns one row per (index, column) in indkey order WITH each
+	// column's nullability; we group in Go, reject any index with a
+	// nullable member, then apply the same tie-break the IR-side picker
+	// uses. Filtering nullability in Go (not SQL) is load-bearing: a SQL
+	// `attnotnull` predicate would silently DROP the nullable column's
+	// row, making a composite UNIQUE(a,b) with nullable b look like a
+	// single-column key (a) — then `ON CONFLICT (a)` wouldn't match the
+	// real index and would error. We must see the full column set per
+	// index to judge it.
+	const q = `
+		SELECT cl.relname AS index_name, a.attname, a.attnotnull, u.ord
+		FROM   pg_index ix
+		JOIN   pg_class      tcl ON tcl.oid = ix.indrelid
+		JOIN   pg_class      cl  ON cl.oid  = ix.indexrelid
+		JOIN   pg_namespace  n   ON n.oid   = tcl.relnamespace
+		JOIN   LATERAL unnest(ix.indkey) WITH ORDINALITY AS u(attnum, ord) ON TRUE
+		JOIN   pg_attribute  a   ON a.attrelid = ix.indrelid AND a.attnum = u.attnum
+		WHERE  n.nspname = $1
+		  AND  tcl.relname = $2
+		  AND  ix.indisunique
+		  AND  NOT ix.indisprimary
+		  AND  ix.indpred  IS NULL
+		  AND  ix.indexprs IS NULL
+		ORDER  BY cl.relname, u.ord`
+
+	rows, err := tx.QueryContext(ctx, q, schema, table)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	// Group columns per index, preserving indkey order, tracking whether
+	// every member column is NOT NULL.
+	type idxCols struct {
+		cols       []string
+		allNotNull bool
+	}
+	byIndex := map[string]*idxCols{}
+	var order []string
+	for rows.Next() {
+		var name, col string
+		var notNull bool
+		var ord int
+		if err := rows.Scan(&name, &col, &notNull, &ord); err != nil {
+			return nil, err
+		}
+		ic, ok := byIndex[name]
+		if !ok {
+			ic = &idxCols{allNotNull: true}
+			byIndex[name] = ic
+			order = append(order, name)
+		}
+		ic.cols = append(ic.cols, col)
+		if !notNull {
+			ic.allNotNull = false
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	// Tie-break (matches pickNonNullUniqueIndex): every column NOT NULL,
+	// then fewest columns, then lexicographically smallest index name.
+	sort.Strings(order)
+	var bestCols []string
+	for _, name := range order {
+		ic := byIndex[name]
+		if !ic.allNotNull {
+			continue
+		}
+		if bestCols == nil || len(ic.cols) < len(bestCols) {
+			bestCols = ic.cols
+		}
+	}
+	if bestCols == nil {
+		return []string{}, nil
+	}
+	return bestCols, nil
+}
+
+// buildInsertSQL builds an INSERT statement. With a non-empty conflict
+// key, uses ON CONFLICT (key) DO UPDATE:
 //
 //	INSERT INTO "s"."t" ("a", "b", "id") VALUES ($1, $2, $3)
 //	ON CONFLICT ("id") DO UPDATE SET "a" = EXCLUDED."a", "b" = EXCLUDED."b"
 //
-// With an empty PK list (tables without a PRIMARY KEY), falls back
-// to a plain INSERT — see the ChangeApplier package doc for the
-// resume-idempotency caveat.
+// key is the table's PRIMARY KEY when present, else a deterministic
+// non-null UNIQUE index (Bug 125; resolved by [conflictKeyFor]). With
+// an empty key list (truly-keyless tables — no PK and no non-null
+// UNIQUE index), falls back to a plain INSERT — see the ChangeApplier
+// package doc for the resume-idempotency caveat.
 //
 // colTypes maps column names to their IR types and is the input to
 // prepareValue. A missing entry (nil map, or column not present) is
 // tolerated and the raw value is bound — preserving the pre-Bug-6
 // shape so unit tests without a populated cache still produce valid
 // SQL.
-func buildInsertSQL(schema, table string, row ir.Row, pk []string, colTypes map[string]ir.Type, generated map[string]bool) (sqlStmt string, args []any, err error) {
+func buildInsertSQL(schema, table string, row ir.Row, key []string, colTypes map[string]ir.Type, generated map[string]bool) (sqlStmt string, args []any, err error) {
 	cols := nonGeneratedRowKeys(row, generated)
 	args = make([]any, 0, len(cols))
 	colSQL := make([]string, len(cols))
@@ -1598,36 +1746,36 @@ func buildInsertSQL(schema, table string, row ir.Row, pk []string, colTypes map[
 	sb.WriteString(strings.Join(placeholders, ", "))
 	sb.WriteByte(')')
 
-	if len(pk) > 0 {
-		// ON CONFLICT (pk) DO UPDATE SET non-pk-cols = EXCLUDED.non-pk-cols
-		pkSet := make(map[string]struct{}, len(pk))
-		for _, p := range pk {
-			pkSet[p] = struct{}{}
+	if len(key) > 0 {
+		// ON CONFLICT (key) DO UPDATE SET non-key-cols = EXCLUDED.non-key-cols
+		keySet := make(map[string]struct{}, len(key))
+		for _, p := range key {
+			keySet[p] = struct{}{}
 		}
-		nonPK := make([]string, 0, len(cols))
+		nonKey := make([]string, 0, len(cols))
 		for _, c := range cols {
-			if _, isPK := pkSet[c]; !isPK {
-				nonPK = append(nonPK, c)
+			if _, isKey := keySet[c]; !isKey {
+				nonKey = append(nonKey, c)
 			}
 		}
 
-		conflictTarget := make([]string, len(pk))
-		for i, p := range pk {
+		conflictTarget := make([]string, len(key))
+		for i, p := range key {
 			conflictTarget[i] = quoteIdent(p)
 		}
 		sb.WriteString(" ON CONFLICT (")
 		sb.WriteString(strings.Join(conflictTarget, ", "))
 		sb.WriteByte(')')
 
-		if len(nonPK) > 0 {
+		if len(nonKey) > 0 {
 			sb.WriteString(" DO UPDATE SET ")
-			parts := make([]string, len(nonPK))
-			for i, c := range nonPK {
+			parts := make([]string, len(nonKey))
+			for i, c := range nonKey {
 				parts[i] = fmt.Sprintf("%s = EXCLUDED.%s", quoteIdent(c), quoteIdent(c))
 			}
 			sb.WriteString(strings.Join(parts, ", "))
 		} else {
-			// All columns are PK — nothing to update on conflict.
+			// All columns are key columns — nothing to update on conflict.
 			// DO NOTHING absorbs the conflict silently.
 			sb.WriteString(" DO NOTHING")
 		}

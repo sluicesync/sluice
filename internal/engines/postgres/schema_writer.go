@@ -391,15 +391,41 @@ func (w *SchemaWriter) CreateIndexes(ctx context.Context, s *ir.Schema) error {
 func (w *SchemaWriter) indexBuildJobs(s *ir.Schema) []indexBuildJob {
 	var jobs []indexBuildJob
 	for _, table := range orderedTables(s) {
+		// Bug 125: skip the unique index emitTableDef already promoted
+		// inline as a CONSTRAINT for a PK-less table — re-creating it here
+		// would fail with "relation already exists". Empty for the common
+		// table (PK present or no qualifying unique key).
+		skip := inlineSkipIndexNames(table)
 		indexes := append([]*ir.Index(nil), table.Indexes...)
 		sort.Slice(indexes, func(i, j int) bool {
 			return indexes[i].Name < indexes[j].Name
 		})
 		for _, idx := range indexes {
+			if _, skipped := skip[idx.Name]; skipped {
+				continue
+			}
 			jobs = append(jobs, indexBuildJob{tableName: table.Name, idx: idx})
 		}
 	}
 	return jobs
+}
+
+// inlineSkipIndexNames returns the set of index names emitTableDef
+// emits inline at CREATE TABLE time — today, the PK-less COPY unique
+// key promoted as a CONSTRAINT (Bug 125 cross-engine symmetry). The
+// index-build phases (live [CreateIndexes] and dry-run [PreviewDDL])
+// skip these so they aren't re-created (which would raise a
+// "relation already exists" error). Empty for the common table.
+//
+// Mirrors the MySQL engine's helper of the same name. PG has no
+// AUTO_INCREMENT-supporting-index case (that entry is MySQL-only), so
+// today only the COPY unique key can populate this set.
+func inlineSkipIndexNames(table *ir.Table) map[string]struct{} {
+	skip := make(map[string]struct{}, 1)
+	if inline := inlineUniqueKeyForCopy(table); inline != nil {
+		skip[inline.Name] = struct{}{}
+	}
+	return skip
 }
 
 // indexBuildPlan carries the resolved Phase B concurrency decision: the
@@ -950,11 +976,19 @@ func (w *SchemaWriter) PreviewDDL(_ context.Context, s *ir.Schema) ([]ir.DDLStat
 
 	// Phase 2: indexes.
 	for _, table := range orderedTables(s) {
+		// Bug 125: skip the unique key emitTableDef promoted inline as a
+		// CONSTRAINT for a PK-less table (mirrors the live CreateIndexes
+		// skip) — listing it here would show a duplicate CREATE the apply
+		// path never runs.
+		skip := inlineSkipIndexNames(table)
 		indexes := append([]*ir.Index(nil), table.Indexes...)
 		sort.Slice(indexes, func(i, j int) bool {
 			return indexes[i].Name < indexes[j].Name
 		})
 		for _, idx := range indexes {
+			if _, skipped := skip[idx.Name]; skipped {
+				continue
+			}
 			stmt, err := emitCreateIndex(w.schema, table.Name, idx, w.emitOpts())
 			if err != nil {
 				return nil, err

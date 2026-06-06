@@ -910,6 +910,34 @@ func emitCommentStatements(schema string, table *ir.Table) []string {
 	return out
 }
 
+// inlineUniqueKeyForCopy returns the non-null UNIQUE index that
+// [emitTableDef] promotes inline as a `CONSTRAINT <name> UNIQUE (cols)`
+// at CREATE TABLE time for a PK-LESS table, so the cold-start VStream
+// COPY's idempotent writer has a unique index for `ON CONFLICT (cols)`
+// to infer against while rows land (Bug 125 cross-engine symmetry).
+// Returns nil when:
+//
+//   - the table has a PRIMARY KEY (the PK already serves as the upsert
+//     conflict key — no promotion needed), or
+//   - no non-null UNIQUE index qualifies (a truly-keyless table; the
+//     idempotent writer refuses it loudly at copy time).
+//
+// The index it picks is exactly the one [effectiveUpsertKeyColumns]
+// keys the upsert on (both call [pickNonNullUniqueIndex]), so the
+// promoted-inline key and the writer's conflict key are the same by
+// construction. The index-build phases skip whatever this returns (via
+// [inlineSkipIndexNames]) so they don't re-create it as a duplicate.
+//
+// Unlike MySQL, PG has no auto-increment-supporting-index special case
+// (PG identity columns don't require a backing unique index at CREATE
+// time), so there is no double-create guard here.
+func inlineUniqueKeyForCopy(table *ir.Table) *ir.Index {
+	if table == nil || table.PrimaryKey != nil {
+		return nil
+	}
+	return pickNonNullUniqueIndex(table)
+}
+
 // emitTableDef produces a CREATE TABLE statement with columns,
 // table-level CHECK constraints (for SET columns), and the primary
 // key inline. The table is schema-qualified.
@@ -993,6 +1021,23 @@ func emitTableDef(schema string, table *ir.Table, opts emitOpts) (string, error)
 
 	if table.PrimaryKey != nil {
 		parts = append(parts, "PRIMARY KEY "+emitIndexColumnList(table.PrimaryKey.Columns, opts))
+	}
+
+	// Bug 125 cross-engine symmetry: for a PK-less table, promote a
+	// non-null UNIQUE key inline as a CONSTRAINT so the cold-start
+	// VStream COPY's idempotent `ON CONFLICT (cols)` has a real matching
+	// unique index to infer against while rows land. PG (unlike MySQL's
+	// ON DUPLICATE KEY UPDATE) cannot infer a conflict target without a
+	// physically-present unique index over exactly these columns. The
+	// index-build phases skip this same index ([inlineSkipIndexNames]) so
+	// it isn't re-created as a duplicate. nil when a PK exists or no
+	// non-null UNIQUE qualifies.
+	if idx := inlineUniqueKeyForCopy(table); idx != nil {
+		parts = append(parts, fmt.Sprintf(
+			"CONSTRAINT %s UNIQUE %s",
+			quoteIdent(pgIndexName(table.Name, idx.Name)),
+			emitIndexColumnList(idx.Columns, opts),
+		))
 	}
 
 	var sb strings.Builder

@@ -1432,3 +1432,163 @@ func TestQuoteSQLString(t *testing.T) {
 		}
 	}
 }
+
+// TestEmitTableDef_NoPKInlineUniqueKey is the Bug 125 PG pin: a PK-less
+// table with a NOT-NULL UNIQUE key emits the chosen unique key inline as
+// a CONSTRAINT ... UNIQUE (...) so PG's ON CONFLICT (cols) has a real
+// matching unique index to infer against while the cold-start COPY lands
+// rows. The deterministic pick (fewest cols, then lex-smallest name) is
+// the same key effectiveUpsertKeyColumns / the applier resolve.
+func TestEmitTableDef_NoPKInlineUniqueKey(t *testing.T) {
+	tbl := &ir.Table{
+		Name: "connections",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}, Nullable: false},
+			{Name: "payload", Type: ir.Text{}, Nullable: true},
+		},
+		Indexes: []*ir.Index{
+			{Name: "uq_id", Unique: true, Columns: []ir.IndexColumn{{Column: "id"}}},
+		},
+	}
+	got, err := emitTableDef("public", tbl, emitOpts{})
+	if err != nil {
+		t.Fatalf("emitTableDef: %v", err)
+	}
+	want := `CONSTRAINT "connections_uq_id" UNIQUE ("id")`
+	if !strings.Contains(got, want) {
+		t.Errorf("CREATE TABLE missing inline unique constraint %q\n--- got ---\n%s", want, got)
+	}
+	// No PRIMARY KEY clause — this table has none.
+	if strings.Contains(got, "PRIMARY KEY") {
+		t.Errorf("PK-less table emitted a PRIMARY KEY clause:\n%s", got)
+	}
+}
+
+// TestEmitTableDef_NoPKCompositeInlineUniqueKey pins the composite-key
+// shape: a PK-less table whose only qualifying key is a 2-column
+// NOT-NULL UNIQUE index emits both columns in the inline CONSTRAINT.
+func TestEmitTableDef_NoPKCompositeInlineUniqueKey(t *testing.T) {
+	tbl := &ir.Table{
+		Name: "edges",
+		Columns: []*ir.Column{
+			{Name: "src", Type: ir.Integer{Width: 64}, Nullable: false},
+			{Name: "dst", Type: ir.Integer{Width: 64}, Nullable: false},
+			{Name: "weight", Type: ir.Integer{Width: 32}, Nullable: true},
+		},
+		Indexes: []*ir.Index{
+			{Name: "uq_src_dst", Unique: true, Columns: []ir.IndexColumn{{Column: "src"}, {Column: "dst"}}},
+		},
+	}
+	got, err := emitTableDef("public", tbl, emitOpts{})
+	if err != nil {
+		t.Fatalf("emitTableDef: %v", err)
+	}
+	want := `CONSTRAINT "edges_uq_src_dst" UNIQUE ("src", "dst")`
+	if !strings.Contains(got, want) {
+		t.Errorf("CREATE TABLE missing composite inline unique constraint %q\n--- got ---\n%s", want, got)
+	}
+}
+
+// TestEmitTableDef_PKTableNoInlineUniquePromotion confirms a PK table is
+// unchanged by the Bug-125 path: the PK serves as the conflict key, so
+// no extra inline UNIQUE constraint is promoted (the secondary unique
+// index defers to Phase 2 as before).
+func TestEmitTableDef_PKTableNoInlineUniquePromotion(t *testing.T) {
+	tbl := &ir.Table{
+		Name: "users",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}, Nullable: false},
+			{Name: "email", Type: ir.Varchar{Length: 255}, Nullable: false},
+		},
+		PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "id"}}},
+		Indexes: []*ir.Index{
+			{Name: "uq_email", Unique: true, Columns: []ir.IndexColumn{{Column: "email"}}},
+		},
+	}
+	got, err := emitTableDef("public", tbl, emitOpts{})
+	if err != nil {
+		t.Fatalf("emitTableDef: %v", err)
+	}
+	if !strings.Contains(got, `PRIMARY KEY ("id")`) {
+		t.Errorf("PK table missing PRIMARY KEY clause:\n%s", got)
+	}
+	// The secondary unique index is NOT promoted inline — it defers to
+	// Phase 2's CREATE UNIQUE INDEX. (inlineUniqueKeyForCopy returns nil
+	// when a PK is present.)
+	if strings.Contains(got, `CONSTRAINT "users_uq_email" UNIQUE`) {
+		t.Errorf("PK table wrongly promoted a secondary unique index inline:\n%s", got)
+	}
+}
+
+// TestEmitTableDef_KeylessNoInlinePromotion confirms a truly-keyless
+// PK-less table (no qualifying non-null unique index) emits no inline
+// UNIQUE constraint. (The cold-start writer refuses such tables loudly
+// at copy time; the DDL stays a plain column list.)
+func TestEmitTableDef_KeylessNoInlinePromotion(t *testing.T) {
+	tbl := &ir.Table{
+		Name: "log_lines",
+		Columns: []*ir.Column{
+			{Name: "ts", Type: ir.Timestamp{}, Nullable: false},
+			{Name: "msg", Type: ir.Text{}, Nullable: true},
+		},
+	}
+	got, err := emitTableDef("public", tbl, emitOpts{})
+	if err != nil {
+		t.Fatalf("emitTableDef: %v", err)
+	}
+	if strings.Contains(got, "UNIQUE") || strings.Contains(got, "PRIMARY KEY") {
+		t.Errorf("keyless table emitted an unexpected key constraint:\n%s", got)
+	}
+}
+
+// TestInlineUniqueKeyForCopy_NullableUniqueExcluded pins that a PK-less
+// table whose only unique index is over a NULLABLE column does NOT get
+// inline-promoted (PG NULLS DISTINCT makes it an unreliable conflict
+// key — same hazard as no key).
+func TestInlineUniqueKeyForCopy_NullableUniqueExcluded(t *testing.T) {
+	tbl := &ir.Table{
+		Name: "t",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}, Nullable: true},
+		},
+		Indexes: []*ir.Index{
+			{Name: "uq_id", Unique: true, Columns: []ir.IndexColumn{{Column: "id"}}},
+		},
+	}
+	if idx := inlineUniqueKeyForCopy(tbl); idx != nil {
+		t.Errorf("inlineUniqueKeyForCopy promoted a nullable-unique key %q; want nil", idx.Name)
+	}
+}
+
+// TestInlineSkipIndexNames pins the index-build skip: the inline-promoted
+// unique key is in the skip set, an unrelated secondary index is not.
+func TestInlineSkipIndexNames(t *testing.T) {
+	tbl := &ir.Table{
+		Name: "connections",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}, Nullable: false},
+			{Name: "host", Type: ir.Varchar{Length: 255}, Nullable: false},
+		},
+		Indexes: []*ir.Index{
+			{Name: "uq_id", Unique: true, Columns: []ir.IndexColumn{{Column: "id"}}},
+			{Name: "idx_host", Unique: false, Columns: []ir.IndexColumn{{Column: "host"}}},
+		},
+	}
+	skip := inlineSkipIndexNames(tbl)
+	if _, ok := skip["uq_id"]; !ok {
+		t.Errorf("inlineSkipIndexNames omitted the promoted unique key uq_id: %v", skip)
+	}
+	if _, ok := skip["idx_host"]; ok {
+		t.Errorf("inlineSkipIndexNames wrongly skipped the secondary index idx_host: %v", skip)
+	}
+	// PK table: nothing inline-promoted, so nothing skipped.
+	pkTbl := &ir.Table{
+		Name:       "u",
+		Columns:    []*ir.Column{{Name: "id", Nullable: false}},
+		PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "id"}}},
+		Indexes:    []*ir.Index{{Name: "uq_id", Unique: true, Columns: []ir.IndexColumn{{Column: "id"}}}},
+	}
+	if len(inlineSkipIndexNames(pkTbl)) != 0 {
+		t.Errorf("inlineSkipIndexNames on a PK table = %v; want empty", inlineSkipIndexNames(pkTbl))
+	}
+}
