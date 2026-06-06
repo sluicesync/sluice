@@ -603,14 +603,27 @@ func (s *vstreamSnapshotStream) copyPump(ctx context.Context, cancel context.Can
 			s.failCopy(classified)
 			return
 		}
-		reconnectAttempts = 0
 		// Feed the watchdog: a non-heartbeat event clears Phase 1 (serving
 		// proven); any event re-arms the Phase-2 progress deadline. A
 		// heartbeat alone does NOT clear Phase 1 (ADR-0073 (b2)).
 		if evs := resp.GetEvents(); len(evs) > 0 {
 			live.observe(eventsProveLiveness(evs))
 		}
+		// Reset the in-place reconnect budget only on actual COPY PROGRESS (a
+		// ROW buffered), NOT on any received event. Otherwise a reconnect that
+		// re-establishes the stream but then yields only non-progress events —
+		// heartbeats, or a stale VGTID when the cursor is unresumable after a
+		// tablet death + reparent — resets reconnectAttempts every cycle, so
+		// the reconnect loop churns forever: it never exhausts reconnectMax and
+		// never fails loud (the mid-COPY tablet-kill finding). Gating the reset
+		// on a copied row means an unproductive reconnect loop burns its budget
+		// and surfaces a LOUD failCopy (~reconnectMax × backoff), which the
+		// pipeline's retry can then act on.
+		copiedRow := false
 		for _, ev := range resp.GetEvents() {
+			if ev.GetType() == binlogdata.VEventType_ROW {
+				copiedRow = true
+			}
 			done, err := s.dispatchCopyEvent(ev)
 			if err != nil {
 				s.failCopy(err)
@@ -620,6 +633,9 @@ func (s *vstreamSnapshotStream) copyPump(ctx context.Context, cancel context.Can
 				s.finishCopy(stream)
 				return
 			}
+		}
+		if copiedRow {
+			reconnectAttempts = 0
 		}
 		// Bounded-cadence COPY checkpoint (ADR-0072 Phase B), between
 		// Recv batches so the DB write never holds the dispatch lock. A
