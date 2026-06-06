@@ -2534,7 +2534,11 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 			slog.String("stream_id", streamID),
 			slog.String("position_token", truncateDryRunToken(resumeFrom.Token, 60)),
 		)
-		stream, err = resumer.OpenSnapshotStreamFromPosition(ctx, s.SourceDSN, resumeFrom)
+		// Pass the filtered table allowlist (snapshotTables, computed above)
+		// so the resumed COPY is scoped to --include-table exactly as a fresh
+		// cold-start is — Vitess's TablePKs cursor is per-table, so the scope
+		// composes with the cursor without any manual reconciliation.
+		stream, err = resumer.OpenSnapshotStreamFromPosition(ctx, s.SourceDSN, resumeFrom, snapshotTables)
 	} else {
 		stream, err = openSnapshotStreamScoped(ctx, s.Source, s.SourceDSN, s.SlotName, snapshotTables)
 	}

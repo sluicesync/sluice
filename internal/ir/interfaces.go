@@ -1756,7 +1756,16 @@ type SnapshotStreamResumer interface {
 	// cursor (no full re-copy) and transitions to CDC on completion. Must
 	// refuse loudly if from carries no cursor (seeding a bulk snapshot
 	// from a cursor-less position would silently re-copy from row 0).
-	OpenSnapshotStreamFromPosition(ctx context.Context, dsn string, from Position) (*SnapshotStream, error)
+	//
+	// tables scopes the resumed COPY filter, with the same semantics as
+	// [TableScopedSnapshotOpener.OpenSnapshotStreamForTables]: empty/nil
+	// means "all tables" (unchanged whole-keyspace behavior); a non-empty
+	// allowlist restricts the resumed COPY to those unqualified table names.
+	// Vitess's resume cursor is PER-TABLE, so passing the current allowlist
+	// is correct in every case — tables with a cursor entry resume from it,
+	// allowlisted tables with no cursor entry start fresh, and a table
+	// dropped from the allowlist simply stops being copied.
+	OpenSnapshotStreamFromPosition(ctx context.Context, dsn string, from Position, tables []string) (*SnapshotStream, error)
 }
 
 // TableScopedSnapshotOpener is the optional engine surface for engines

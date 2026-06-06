@@ -109,14 +109,14 @@ func TestOpenSnapshotStreamFromPosition_RefusesCursorlessPosition(t *testing.T) 
 	ctx := context.Background()
 
 	t.Run("cursor-less position is refused, not re-copied", func(t *testing.T) {
-		_, err := ps.OpenSnapshotStreamFromPosition(ctx, "dsn", posWithoutCursor(t))
+		_, err := ps.OpenSnapshotStreamFromPosition(ctx, "dsn", posWithoutCursor(t), nil)
 		if err == nil {
 			t.Fatal("OpenSnapshotStreamFromPosition accepted a cursor-less position; want a loud refusal (re-copying from row 0 is silent loss)")
 		}
 	})
 
 	t.Run("empty sentinel is refused", func(t *testing.T) {
-		_, err := ps.OpenSnapshotStreamFromPosition(ctx, "dsn", ir.Position{})
+		_, err := ps.OpenSnapshotStreamFromPosition(ctx, "dsn", ir.Position{}, nil)
 		if err == nil {
 			t.Fatal("OpenSnapshotStreamFromPosition accepted the empty sentinel; want a loud refusal")
 		}
@@ -124,7 +124,7 @@ func TestOpenSnapshotStreamFromPosition_RefusesCursorlessPosition(t *testing.T) 
 
 	t.Run("non-PlanetScale flavor is refused as not-implemented", func(t *testing.T) {
 		vanilla := Engine{Flavor: FlavorVanilla}
-		_, err := vanilla.OpenSnapshotStreamFromPosition(ctx, "dsn", posWithCursor(t, "widgets", 5000))
+		_, err := vanilla.OpenSnapshotStreamFromPosition(ctx, "dsn", posWithCursor(t, "widgets", 5000), nil)
 		if !errors.Is(err, ErrNotImplemented) {
 			t.Fatalf("vanilla resume err = %v; want ErrNotImplemented (binlog snapshot has no mid-COPY cursor)", err)
 		}

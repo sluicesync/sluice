@@ -816,7 +816,7 @@ func TestVStream_CopyResume_ProcessRestart_ResumesViaBulkPath(t *testing.T) {
 	resumeCtx, resumeCancel := context.WithTimeout(ctx, 6*time.Minute)
 	defer resumeCancel()
 
-	resumed, err := eng.OpenSnapshotStreamFromPosition(resumeCtx, sluiceDSN, checkpoint)
+	resumed, err := eng.OpenSnapshotStreamFromPosition(resumeCtx, sluiceDSN, checkpoint, nil)
 	if err != nil {
 		t.Fatalf("OpenSnapshotStreamFromPosition (process-restart resume): %v", err)
 	}
@@ -1067,7 +1067,7 @@ func TestVStream_HardCrash_CheckpointNeverAheadOfDurable_ZeroLoss(t *testing.T) 
 	// completion. {durable prefix} ∪ {resumed tail} must cover the FULL source.
 	resumeCtx, resumeCancel := context.WithTimeout(ctx, 6*time.Minute)
 	defer resumeCancel()
-	resumed, err := eng.OpenSnapshotStreamFromPosition(resumeCtx, sluiceDSN, resumeFrom)
+	resumed, err := eng.OpenSnapshotStreamFromPosition(resumeCtx, sluiceDSN, resumeFrom, nil)
 	if err != nil {
 		t.Fatalf("OpenSnapshotStreamFromPosition (hard-crash resume): %v", err)
 	}

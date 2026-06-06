@@ -82,6 +82,13 @@ func TestStreamer_InterruptedColdStart_RoutesToBulkResume(t *testing.T) {
 	if gotPos := source.resumeOpenPos.Load(); gotPos == nil || gotPos.Token != token {
 		t.Errorf("OpenSnapshotStreamFromPosition got position %v; want token %q", gotPos, token)
 	}
+	// The resumed COPY must be scoped to the SAME filtered table allowlist a
+	// fresh cold-start uses (v0.99.12 table-scope follow-up for the resume
+	// path). The one-table schema yields exactly ["widgets"].
+	if gotTables := source.resumeOpenTables.Load(); gotTables == nil ||
+		len(*gotTables) != 1 || (*gotTables)[0] != "widgets" {
+		t.Errorf("OpenSnapshotStreamFromPosition got tables %v; want [\"widgets\"] (resume must carry the filtered allowlist)", gotTables)
+	}
 	if err == nil {
 		t.Error("Run returned nil; want the routed-snapshot error to surface (loud, not silent)")
 	}
@@ -211,9 +218,10 @@ type copyResumeEngine struct {
 	// snapshot open (where the routing decision is observable).
 	schemaOneTable bool
 
-	resumeOpenCalls atomic.Int32
-	cdcOpenCalls    atomic.Int32
-	resumeOpenPos   atomic.Pointer[ir.Position]
+	resumeOpenCalls  atomic.Int32
+	cdcOpenCalls     atomic.Int32
+	resumeOpenPos    atomic.Pointer[ir.Position]
+	resumeOpenTables atomic.Pointer[[]string]
 }
 
 func (e *copyResumeEngine) Name() string                  { return e.name }
@@ -258,11 +266,13 @@ func (e *copyResumeEngine) PositionCarriesCopyCursor(ir.Position) bool {
 }
 
 func (e *copyResumeEngine) OpenSnapshotStreamFromPosition(
-	_ context.Context, _ string, from ir.Position,
+	_ context.Context, _ string, from ir.Position, tables []string,
 ) (*ir.SnapshotStream, error) {
 	e.resumeOpenCalls.Add(1)
 	p := from
 	e.resumeOpenPos.Store(&p)
+	tbls := tables
+	e.resumeOpenTables.Store(&tbls)
 	if e.resumeOpenErr != nil {
 		return nil, e.resumeOpenErr
 	}

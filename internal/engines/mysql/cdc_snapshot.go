@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 
 	"sluicesync.dev/sluice/internal/ir"
 )
@@ -91,7 +92,11 @@ func (e Engine) OpenSnapshotStreamForTables(ctx context.Context, dsn string, tab
 // would make vtgate restart the whole COPY from row 0 (silent full
 // re-copy of a partially-populated target), which is exactly the
 // silent-loss class the loud-failure tenet forbids.
-func (e Engine) OpenSnapshotStreamFromPosition(ctx context.Context, dsn string, from ir.Position) (*ir.SnapshotStream, error) {
+// tables scopes the resumed COPY filter exactly as
+// [Engine.OpenSnapshotStreamForTables] scopes a fresh one: empty/nil keeps
+// the whole-keyspace COPY; a non-empty allowlist restricts vtgate's COPY to
+// those unqualified table names.
+func (e Engine) OpenSnapshotStreamFromPosition(ctx context.Context, dsn string, from ir.Position, tables []string) (*ir.SnapshotStream, error) {
 	if e.Capabilities().CDC == ir.CDCNone {
 		return nil, fmt.Errorf("%s: snapshot+CDC not supported by this flavor: %w", e.Name(), ErrNotImplemented)
 	}
@@ -119,12 +124,18 @@ func (e Engine) OpenSnapshotStreamFromPosition(ctx context.Context, dsn string, 
 				"(the cursor-less warm-resume belongs on the plain CDC path)",
 		)
 	}
-	// NOTE: the resume path keeps the whole-keyspace COPY scope (nil
-	// tables). Scoping a resumed COPY to the included-table allowlist is a
-	// future enhancement — the persisted cursor predates the scope, and a
-	// resume that narrowed the filter would need to reconcile the cursor's
-	// per-table TablePKs against the new allowlist; deferred for now.
-	return e.openVStreamSnapshotStreamFrom(ctx, dsn, start, nil)
+	// Scope the resumed COPY to the same table allowlist a fresh cold-start
+	// would use. There is nothing to reconcile by hand: Vitess's resume
+	// cursor (TablePKs) is PER-TABLE, so passing the current allowlist into
+	// the resumed COPY is correct in every case — a table that has a cursor
+	// entry resumes from it, an allowlisted table with no cursor entry
+	// starts fresh, and a table dropped from the allowlist simply stops
+	// being copied. Empty/nil tables keeps the whole-keyspace COPY.
+	if len(tables) > 0 {
+		slog.InfoContext(ctx, "mysql/vstream: snapshot resume: scoping resumed COPY to included tables",
+			slog.Int("table_count", len(tables)))
+	}
+	return e.openVStreamSnapshotStreamFrom(ctx, dsn, start, tables)
 }
 
 // PositionCarriesCopyCursor reports whether a persisted position carries a
