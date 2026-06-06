@@ -137,6 +137,57 @@ func TestStreamer_CompletedColdStart_StaysOnPlainCDC(t *testing.T) {
 	}
 }
 
+// TestStreamer_RestartFromScratch_ForcesColdStart pins F2: a cursor-less
+// persisted position would normally warm-resume via the plain CDC reader
+// (see TestStreamer_CompletedColdStart_StaysOnPlainCDC), but with
+// RestartFromScratch the streamer must IGNORE the persisted position and force
+// a fresh cold-start — never touching the warm-resume plain-CDC path. The
+// cold-start path opens a snapshot (not OpenCDCReader) and here unwinds at the
+// test target's schema writer; the load-bearing assertion is the PATH.
+func TestStreamer_RestartFromScratch_ForcesColdStart(t *testing.T) {
+	const token = `[{"keyspace":"main","shard":"-","gtid":"MySQL56/abcd:1-200"}]`
+	cdc := &capturingCDCReader{captured: make(chan struct{})}
+	source := &copyResumeEngine{
+		name:           "planetscale",
+		caps:           ir.Capabilities{CDC: ir.CDCBinlog},
+		cdcReader:      cdc,
+		carriesCursor:  false, // cursor-less: would warm-resume WITHOUT the flag
+		schemaOneTable: true,  // proceed past the empty-schema short-circuit
+	}
+	target := &copyResumeEngine{name: "postgres"}
+	applier := &resumeDispatchApplier{
+		stored: ir.Position{Engine: "postgres", Token: token},
+		found:  true,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	s := &Streamer{
+		Source:             source,
+		Target:             target,
+		SourceDSN:          "src",
+		TargetDSN:          "tgt",
+		StreamID:           "test-stream",
+		Applier:            applier,
+		RestartFromScratch: true,
+	}
+	err := s.Run(ctx)
+
+	if cdc.once {
+		t.Error("plain CDC StreamChanges was called — --restart-from-scratch wrongly warm-resumed instead of forcing a fresh cold-start")
+	}
+	if source.cdcOpenCalls.Load() != 0 {
+		t.Errorf("OpenCDCReader called %d times; want 0 (restart-from-scratch must not take the warm-resume plain-CDC path)", source.cdcOpenCalls.Load())
+	}
+	if source.resumeOpenCalls.Load() != 0 {
+		t.Errorf("OpenSnapshotStreamFromPosition called %d times; want 0 (a cursor-less restart is a fresh cold-start, not a resume)", source.resumeOpenCalls.Load())
+	}
+	if err == nil {
+		t.Error("Run returned nil; want the forced cold-start path to be taken (and unwind at the unconfigured test target)")
+	}
+}
+
 // copyResumeEngine is a recording ir.Engine that optionally implements
 // ir.SnapshotStreamResumer. It records which open path the streamer takes
 // so the routing tests can assert bulk-resume vs plain-CDC dispatch.

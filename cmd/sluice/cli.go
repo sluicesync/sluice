@@ -565,6 +565,8 @@ type SyncStartCmd struct {
 
 	ResetTargetData bool `help:"Destructive recovery: DELETE the cdc-state row, DROP every source-schema table on the target, then run a fresh cold-start stream. Use after slot-missing fall-through or a similar wedged-state recovery. Requires confirmation (type 'reset') unless --yes is set. See ADR-0023."`
 
+	RestartFromScratch bool `help:"Force a fresh cold-start that re-copies from the beginning, IGNORING any persisted resume position (incl. a mid-COPY cursor) — WITHOUT dropping the target (the idempotent copy absorbs the overlap). Use when a checkpoint is bad or to force a clean re-copy. Unlike --force-cold-start (which only skips the pre-flight and still warm-resumes from a persisted position), this discards the position; unlike --reset-target-data, it does NOT drop tables. Mutually exclusive with --reset-target-data and --position-from-manifest."`
+
 	SchemaAlreadyApplied bool `help:"Skip every DDL phase during cold-start (CREATE TABLE / CREATE INDEX / ADD FOREIGN KEY / CREATE VIEW / SyncIdentitySequences / EnsureControlTable). Operator promises the target's catalog matches the source's AND the sluice_cdc_state control table is pre-created. Use this on PlanetScale branches with Safe Migrations enabled (GitHub #17), or on Atlas/Liquibase-managed schemas where DDL goes through a separate pipeline. The cold-start preflight refusal is also skipped — bulk-copy runs into operator-prepared empty tables; sluice does NOT validate the schema match."`
 
 	Yes bool `help:"Skip the destructive-action confirmation prompt for --reset-target-data." short:"y"`
@@ -819,6 +821,12 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 	// shapes; both override the persisted position).
 	var manifestStore ir.BackupStore
 	var manifestStoreCloser func() error
+	if s.RestartFromScratch && s.ResetTargetData {
+		return errors.New("--restart-from-scratch and --reset-target-data are mutually exclusive (--reset-target-data already forces a fresh cold-start, and additionally drops the target)")
+	}
+	if s.RestartFromScratch && s.PositionFromManifest != "" {
+		return errors.New("--restart-from-scratch and --position-from-manifest are mutually exclusive (one discards the position, the other supplies one)")
+	}
 	if s.PositionFromManifest != "" {
 		if s.ResetTargetData {
 			return errors.New("--position-from-manifest and --reset-target-data are mutually exclusive")
@@ -892,6 +900,7 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 		SkipViews:              s.SkipViews,
 		ForceColdStart:         s.ForceColdStart,
 		ResetTargetData:        s.ResetTargetData,
+		RestartFromScratch:     s.RestartFromScratch,
 		SchemaAlreadyApplied:   s.SchemaAlreadyApplied,
 		ApplyBatchSize:         applyBatchSize,
 		AutoTune:               !s.NoAutoTune,

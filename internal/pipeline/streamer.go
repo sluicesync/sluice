@@ -258,6 +258,20 @@ type Streamer struct {
 	// surfaces cause the flag to error clearly before any work runs.
 	ResetTargetData bool
 
+	// RestartFromScratch, when true, forces a fresh cold-start that
+	// re-copies from row 0 — IGNORING any persisted resume position
+	// (incl. a mid-COPY TablePKs cursor) — WITHOUT dropping the target
+	// (the idempotent COPY writer absorbs the re-copied overlap). It is
+	// the explicit "force-fresh-COPY" knob: --force-cold-start only
+	// skips the pre-flight (it still warm-resumes when a position
+	// exists), and --reset-target-data is the heavier destructive path
+	// (it DROPs the dest tables). This sits between them. Like
+	// ResetTargetData it forces the cold-start branch and skips the
+	// populated-target pre-flight (you are deliberately re-copying onto
+	// existing rows). Cleared after the first iteration so a retry does
+	// not perpetually re-cold-start.
+	RestartFromScratch bool
+
 	// SchemaAlreadyApplied, when true, declares that the target's
 	// schema (and the `sluice_cdc_state` control table) have been
 	// pre-created out-of-band. Sluice skips every DDL phase during
@@ -882,6 +896,10 @@ func (s *Streamer) runWithRetry(ctx context.Context, attempts int) error {
 		// another destructive reset of dest tables. The reset
 		// happens at most once per Run.
 		s.ResetTargetData = false
+		// Same one-shot semantics for the force-fresh-COPY knob: a retry
+		// after the first cold-start should warm-resume from the position the
+		// fresh copy just established, not re-cold-start from row 0 again.
+		s.RestartFromScratch = false
 
 		afterPos, afterFound, _ := posReader.ReadPosition(ctx, streamID)
 		progressed := beforeFound && afterFound && afterPos.Token != beforePos.Token
@@ -1404,13 +1422,25 @@ func (s *Streamer) runOnce(ctx context.Context) error {
 	// degrade this fixes). A cursor-less persisted position (completed
 	// cold-start) leaves this zero and stays on the fast warmResume path.
 	var resumeCopyFrom ir.Position
-	if found && !s.ResetTargetData {
+	if found && !s.ResetTargetData && !s.RestartFromScratch {
 		if resumer, ok := s.Source.(ir.SnapshotStreamResumer); ok && resumer.PositionCarriesCopyCursor(persisted) {
 			resumeCopyFrom = persisted
 		}
 	}
 	switch {
 	case s.ResetTargetData:
+		changes, stop, err = s.coldStart(streamCtx, lsnTracker, applier, streamID, ir.Position{})
+	case s.RestartFromScratch:
+		// Force a fresh cold-start from row 0, ignoring any persisted
+		// position (incl. a mid-COPY cursor). Unlike --reset-target-data this
+		// does NOT drop the target — the idempotent COPY writer absorbs the
+		// re-copied overlap. warmResumed stays false (a fresh cold-start
+		// resets effective schema-history state), so the cache prime gets the
+		// brand-new-stream sentinel below.
+		slog.InfoContext(
+			ctx, "restart-from-scratch: forcing a fresh cold-start, ignoring the persisted position",
+			slog.String("stream_id", streamID),
+		)
 		changes, stop, err = s.coldStart(streamCtx, lsnTracker, applier, streamID, ir.Position{})
 	case resumeCopyFrom.Token != "" || resumeCopyFrom.Engine != "":
 		// Interrupted cold-start: resume the bulk COPY from the persisted
@@ -2666,7 +2696,9 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 		// check above is the operator-opted-in replacement; the
 		// classic cold-start preflight is suppressed in that case.
 		if !s.InjectShardColumn.Engaged() {
-			if err := preflightColdStart(ctx, schema, rw, s.ForceColdStart, preflightModeSync); err != nil {
+			// --restart-from-scratch implies the pre-flight skip: the operator
+			// is deliberately re-copying onto existing rows (idempotently).
+			if err := preflightColdStart(ctx, schema, rw, s.ForceColdStart || s.RestartFromScratch, preflightModeSync); err != nil {
 				closeIf(rw)
 				closeIf(sw)
 				_ = stream.Close()
