@@ -1,0 +1,43 @@
+# OOM chaos OVERRIDE — layered on top of docker-compose.yml to cap a
+# tablet's memory so it (or its mysqld) can be driven to a real
+# kernel OOM-kill under load, rather than a clean SIGKILL.
+#
+# Usage (layer it the same way as the upgrade override):
+#
+#   docker compose -f docker-compose.yml -f docker-compose.chaos-oom.yml \
+#     -p <project> up -d
+#
+# THEN drive the capped tablet to OOM by generating memory pressure inside
+# it (e.g. a large in-tablet sort / a fat COPY) until the kernel reaps the
+# offending process.
+#
+# TRADEOFF (documented per the task): a deterministic, fast, portable OOM
+# is HARD to provoke in-test — it depends on the host cgroup/kernel
+# (`oom_kill_disable` must be false, which it is by default for a memory
+# cgroup), on Rancher Desktop's VM honoring `mem_limit`, and on actually
+# generating enough pressure to cross the cap without the test itself
+# flaking. For that reason the chaos suite's DEFAULT crash mechanism is
+# `killContainer(..., "SIGKILL")` (via docker kill --signal=KILL): it is
+# the abrupt-termination analog of an OOM (process vanishes with no
+# graceful shutdown, the case sluice's durable-watermark resume must
+# survive) and is deterministic + portable. This override exists so the
+# local session CAN exercise a genuine kernel OOM if it wants the stronger
+# fidelity, but the scenarios do not depend on it.
+#
+# mem_limit values are conservative starting points; the local session
+# should tune them to the host so the cap is reachable under the test's
+# COPY load but not so low the tablet OOMs at idle on boot.
+
+name: ${COMPOSE_PROJECT:-sluice-vitesscluster}
+
+services:
+  vttablet:
+    # Cap the primary tablet (vttablet + its mysqld share this container's
+    # cgroup). oom_kill_disable:false is the default for a memory-limited
+    # cgroup; set explicitly to document intent.
+    mem_limit: ${CHAOS_TABLET_MEM_LIMIT:-768m}
+    oom_kill_disable: false
+
+  vttablet-replica:
+    mem_limit: ${CHAOS_TABLET_MEM_LIMIT:-768m}
+    oom_kill_disable: false

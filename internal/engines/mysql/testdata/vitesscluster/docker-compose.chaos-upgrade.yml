@@ -1,0 +1,35 @@
+# Rolling-upgrade chaos OVERRIDE — layered on top of docker-compose.yml by
+# the TestVitessChaos_RollingUpgrade_MidSync scenario (scenario 4). It
+# re-pins each Vitess component image to ${CHAOS_UPGRADE_IMAGE} so a
+# per-service `compose up -d --no-deps --force-recreate <service>` recreates
+# THAT component onto the newer tag while the rest of the cluster keeps
+# serving the stream — the rolling-version-bump fault.
+#
+# Usage (the chaos test drives this via recreateServiceWithOverride):
+#
+#   CHAOS_UPGRADE_IMAGE=vitess/lite:vXX.Y.Z \
+#   docker compose -f docker-compose.yml -f docker-compose.chaos-upgrade.yml \
+#     -p <project> up -d --no-deps --force-recreate vtgate
+#
+# CHOOSE THE TAG CAREFULLY (flagged for the local session): keep the new
+# image within the SAME Vitess MAJOR as the vendored vitess.io/vitess
+# v0.24.x client (v0.X maps to Vitess MAJOR X). A cross-major skew exercises
+# a different online-DDL / `_vt_*` lifecycle than the code under test and is
+# NOT the real upgrade baseline. If no newer compatible minor is pull-
+# available, this scenario stays t.Skip'd (the default).
+#
+# The override ONLY changes the image tag; every other service knob
+# (command, ports, healthcheck, depends_on) is inherited unchanged from the
+# base compose file so the upgraded component boots identically.
+
+name: ${COMPOSE_PROJECT:-sluice-vitesscluster}
+
+services:
+  vtctld:
+    image: ${CHAOS_UPGRADE_IMAGE:-vitess/lite:v24.0.1}
+  vttablet:
+    image: ${CHAOS_UPGRADE_IMAGE:-vitess/lite:v24.0.1}
+  vttablet-replica:
+    image: ${CHAOS_UPGRADE_IMAGE:-vitess/lite:v24.0.1}
+  vtgate:
+    image: ${CHAOS_UPGRADE_IMAGE:-vitess/lite:v24.0.1}
