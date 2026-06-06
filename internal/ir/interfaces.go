@@ -1659,6 +1659,44 @@ type SnapshotStreamWithSlotOpener interface {
 	OpenSnapshotStreamWithSlot(ctx context.Context, dsn, slotName string) (*SnapshotStream, error)
 }
 
+// SnapshotStreamResumer is the optional engine surface for resuming an
+// INTERRUPTED cold-start COPY after a process restart (v0.99.8). Today
+// only the PlanetScale (VStream) flavor implements it: its snapshot COPY
+// checkpoints a mid-COPY resume cursor (Vitess per-shard TablePKs;
+// ADR-0072) to the control table, so a process restart can continue the
+// bulk COPY from the last-copied PK rather than restarting from row 0.
+//
+// The pipeline routes a process-restart resume here — instead of the
+// plain CDC warm-resume path — when [PositionCarriesCopyCursor] reports
+// that the persisted position carries such a cursor. Seeding the bulk
+// snapshot stream from the cursor makes vtgate's re-emitted COPY-tail
+// rows flow through the batched bulk-COPY writer (~4000 rows/sec) rather
+// than the plain CDC reader's per-row apply path (~10 rows/sec), which is
+// the silent-degrade this surface fixes: without it, the un-copied tail
+// of a large table trickles indefinitely with no error.
+//
+// Engines without a mid-COPY cursor (Postgres, vanilla MySQL — their
+// snapshots are single all-or-nothing transactions) do not implement
+// this surface; the orchestrator keeps every cursor-less resume on the
+// plain CDC warm-resume path.
+type SnapshotStreamResumer interface {
+	// PositionCarriesCopyCursor reports whether the persisted position
+	// was written mid-COPY (carries a resume cursor) and therefore needs
+	// the bulk resume path. A cursor-less position (completed cold-start,
+	// or a position the engine can't decode) returns false and stays on
+	// the plain CDC warm-resume path. This is a routing hint, not a
+	// validation gate — it never returns an error.
+	PositionCarriesCopyCursor(from Position) bool
+
+	// OpenSnapshotStreamFromPosition resumes the bulk COPY from the
+	// cursor carried by from, returning the same paired RowReader/CDCReader
+	// shape as [Engine.OpenSnapshotStream]. The COPY continues from the
+	// cursor (no full re-copy) and transitions to CDC on completion. Must
+	// refuse loudly if from carries no cursor (seeding a bulk snapshot
+	// from a cursor-less position would silently re-copy from row 0).
+	OpenSnapshotStreamFromPosition(ctx context.Context, dsn string, from Position) (*SnapshotStream, error)
+}
+
 // DefaultTableExcluder is the optional engine surface for "tables
 // the operator almost never wants to migrate against this engine".
 // Implementing engines return a list of [path.Match]-style patterns

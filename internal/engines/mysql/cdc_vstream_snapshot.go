@@ -59,6 +59,35 @@ import (
 // while another table is being drained — is a loud refusal (Phase 1
 // floor), not an OOM; disk-spill for that tail is deferred (Phase 3).
 func (e Engine) openVStreamSnapshotStream(ctx context.Context, dsn string) (*ir.SnapshotStream, error) {
+	// The default public path starts the COPY from the beginning of the
+	// binlog (empty-Gtid sentinel, no mid-COPY cursor). The shard layout
+	// is resolved inside openVStreamSnapshotStreamFrom — passing nil tells
+	// it to seed from-beginning against the resolved layout.
+	return e.openVStreamSnapshotStreamFrom(ctx, dsn, nil)
+}
+
+// openVStreamSnapshotStreamFrom is the seedable core of
+// [openVStreamSnapshotStream]. When start is nil it seeds the COPY from
+// the beginning of the binlog (the fresh cold-start path); when start is
+// a non-nil []shardGtid carrying Vitess's per-shard TablePKs cursor it
+// seeds the COPY to RESUME from that cursor (the process-restart
+// interrupted-cold-start path, v0.99.8). Seeding from a cursor makes
+// vtgate continue the COPY scan from the last-copied PK — the SAME
+// machinery the in-place [reconnectCopy] uses — so the resumed COPY rows
+// flow through the bulk [copyPump]/ReadRows path (batched bulk-COPY
+// writer) rather than the per-row CDC apply path the plain CDC reader
+// would use. On COPY completion it transitions to CDC exactly as a fresh
+// cold-start does.
+//
+// A non-nil start is REQUIRED to carry a TablePKs cursor on at least one
+// shard (the caller is resuming an interrupted COPY); seeding a bulk
+// snapshot stream from a pure-CDC position would silently start a full
+// re-copy from row 0 (vtgate ignores an empty-TablePKs Gtid for COPY),
+// so the resumer guards against that before it reaches here. The shard
+// list in start MUST match the resolved layout — a reshard since the
+// checkpoint surfaces as a loud JOURNAL error from the pump rather than
+// a silent mis-resume.
+func (e Engine) openVStreamSnapshotStreamFrom(ctx context.Context, dsn string, start []shardGtid) (*ir.SnapshotStream, error) {
 	cfg, err := parseDSN(dsn)
 	if err != nil {
 		return nil, err
@@ -106,11 +135,22 @@ func (e Engine) openVStreamSnapshotStream(ctx context.Context, dsn string) (*ir.
 	// schema-tracker by minutes on a quiet binlog). The standalone
 	// CDC reader streams from REPLICA to keep load off the primary,
 	// but the snapshot is a one-shot operation where catalog
-	// freshness matters more than read isolation.
-	// fromBeginningVStreamPos carries no TablePKs (empty-Gtid sentinel,
-	// no mid-COPY cursor), so toProtoShardGtids can't fail here — but it
-	// returns an error in the general case (Phase A), so we handle it.
-	protoShardGtids, err := toProtoShardGtids(fromBeginningVStreamPos(keyspace, shards))
+	// freshness matters more than read isolation. A COPY-resume from a
+	// TablePKs cursor MUST target PRIMARY for the same reason
+	// buildVStreamRequest does (a REPLICA's schema engine may be cold →
+	// buildTablePlan finds no copy plan → silent degrade to plain CDC).
+	//
+	// startPos seeds the request: nil → from-beginning sentinel (fresh
+	// cold-start); non-nil → the resume cursor (carrying TablePKs).
+	// fromBeginningVStreamPos carries no TablePKs, so toProtoShardGtids
+	// can't fail for it — but the resume cursor's base64 TableLastPK can
+	// (corrupt persisted token), and the general decode returns an error,
+	// so we handle it.
+	startPos := start
+	if startPos == nil {
+		startPos = fromBeginningVStreamPos(keyspace, shards)
+	}
+	protoShardGtids, err := toProtoShardGtids(startPos)
 	if err != nil {
 		streamCancel()
 		_ = conn.Close()

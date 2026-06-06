@@ -41,6 +41,85 @@ func (e Engine) OpenSnapshotStream(ctx context.Context, dsn string) (*ir.Snapsho
 	return e.openBinlogSnapshotStream(ctx, dsn)
 }
 
+// OpenSnapshotStreamFromPosition resumes an INTERRUPTED cold-start COPY
+// (v0.99.8) by seeding the bulk snapshot stream from a persisted position
+// that carries Vitess's per-shard TablePKs cursor. This is the optional
+// [ir.SnapshotStreamResumer] surface: the pipeline routes a process-
+// restart resume here (instead of the plain CDC reader) when the
+// persisted position carries a mid-COPY cursor, so vtgate's re-emitted
+// COPY-tail rows flow through the batched bulk-COPY writer rather than the
+// per-row CDC apply path (~4000 rows/sec vs ~10 rows/sec — the
+// silent-degrade this fixes). The COPY continues from the cursor (no full
+// re-copy) and transitions to CDC on completion exactly as a fresh
+// cold-start does.
+//
+// Only the PlanetScale (VStream) flavor implements a meaningful resume:
+// the binlog-snapshot flavor has no mid-COPY cursor (its snapshot is a
+// single REPEATABLE-READ transaction, all-or-nothing), so a position
+// reaching here for that flavor is a pure-CDC position the plain CDC
+// warm-resume path already handles — we refuse loudly rather than silently
+// re-copy from row 0.
+//
+// from MUST carry a TablePKs cursor (PositionCarriesCopyCursor true); the
+// pipeline gates on that before calling. A cursor-less position is
+// rejected loudly: seeding a bulk snapshot from an empty-TablePKs Gtid
+// would make vtgate restart the whole COPY from row 0 (silent full
+// re-copy of a partially-populated target), which is exactly the
+// silent-loss class the loud-failure tenet forbids.
+func (e Engine) OpenSnapshotStreamFromPosition(ctx context.Context, dsn string, from ir.Position) (*ir.SnapshotStream, error) {
+	if e.Capabilities().CDC == ir.CDCNone {
+		return nil, fmt.Errorf("%s: snapshot+CDC not supported by this flavor: %w", e.Name(), ErrNotImplemented)
+	}
+	if e.Flavor != FlavorPlanetScale {
+		return nil, fmt.Errorf(
+			"%s: resumable cold-start COPY is only implemented for the planetscale (VStream) flavor: %w",
+			e.Name(), ErrNotImplemented,
+		)
+	}
+	start, ok, err := decodeVStreamPos(from)
+	if err != nil {
+		return nil, fmt.Errorf("mysql/vstream: snapshot resume: decode position: %w", err)
+	}
+	if !ok {
+		return nil, errors.New("mysql/vstream: snapshot resume: empty position has no COPY cursor to resume from")
+	}
+	if !anyTablePKsPresent(start) {
+		// A cursor-less position must NOT seed a bulk snapshot: vtgate
+		// would restart the COPY from row 0 against the partially-copied
+		// target. The pipeline only routes here for cursor-carrying
+		// positions, so reaching this branch is a contract violation —
+		// fail loudly rather than silently full-re-copy.
+		return nil, errors.New(
+			"mysql/vstream: snapshot resume: position carries no TablePKs cursor; refusing to re-copy from row 0 " +
+				"(the cursor-less warm-resume belongs on the plain CDC path)",
+		)
+	}
+	return e.openVStreamSnapshotStreamFrom(ctx, dsn, start)
+}
+
+// PositionCarriesCopyCursor reports whether a persisted position carries a
+// mid-COPY resume cursor (Vitess per-shard TablePKs) — i.e. it was written
+// while an INTERRUPTED cold-start COPY was still in flight (v0.99.8). The
+// pipeline uses this engine-agnostic discriminator to decide whether a
+// process-restart resume must route through the bulk snapshot resume path
+// ([OpenSnapshotStreamFromPosition]) rather than the plain CDC warm-resume
+// path. A pure-CDC position (completed cold-start, or a non-VStream
+// engine's position) returns false and stays on the fast plain-CDC path.
+//
+// A position that fails to decode returns false (the plain CDC path's own
+// decoder will surface the decode error loudly) — this discriminator is a
+// routing hint, not a validation gate.
+func (e Engine) PositionCarriesCopyCursor(from ir.Position) bool {
+	if e.Flavor != FlavorPlanetScale {
+		return false
+	}
+	start, ok, err := decodeVStreamPos(from)
+	if err != nil || !ok {
+		return false
+	}
+	return anyTablePKsPresent(start)
+}
+
 // openBinlogSnapshotStream is the FlavorVanilla path of
 // [Engine.OpenSnapshotStream]. Lifted out of OpenSnapshotStream so
 // the flavor dispatch stays readable.

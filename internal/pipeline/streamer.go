@@ -1394,9 +1394,39 @@ func (s *Streamer) runOnce(ctx context.Context) error {
 	// recovery, or warm-resume → ErrPositionInvalid fall-through) is
 	// brand-new-stream-equivalent and skips the prime.
 	var warmResumed bool
+	// resumeCopyFrom is the interrupted-cold-start resume cursor (v0.99.8).
+	// It is non-zero only when ALL of: a position is persisted (found), the
+	// source engine implements the resumer surface, and the persisted
+	// position carries a mid-COPY TablePKs cursor. In that case the resume
+	// must route through coldStart's bulk-COPY path seeded from the cursor
+	// — NOT through warmResume's plain CDC reader, which would apply the
+	// un-copied COPY tail one row at a time (~10 rows/sec, the silent
+	// degrade this fixes). A cursor-less persisted position (completed
+	// cold-start) leaves this zero and stays on the fast warmResume path.
+	var resumeCopyFrom ir.Position
+	if found && !s.ResetTargetData {
+		if resumer, ok := s.Source.(ir.SnapshotStreamResumer); ok && resumer.PositionCarriesCopyCursor(persisted) {
+			resumeCopyFrom = persisted
+		}
+	}
 	switch {
 	case s.ResetTargetData:
-		changes, stop, err = s.coldStart(streamCtx, lsnTracker, applier, streamID)
+		changes, stop, err = s.coldStart(streamCtx, lsnTracker, applier, streamID, ir.Position{})
+	case resumeCopyFrom.Token != "" || resumeCopyFrom.Engine != "":
+		// Interrupted cold-start: resume the bulk COPY from the persisted
+		// cursor (seeded snapshot stream → batched bulk-COPY writer), then
+		// transition to CDC exactly as a fresh cold-start does. The target
+		// keeps its partial copy; the idempotent COPY writer absorbs the
+		// overlap. warmResumed stays false: coldStart's bulk-copy resets
+		// the applier's effective schema-history state, same as a fresh
+		// cold-start, so the schema-history cache prime gets the
+		// brand-new-stream sentinel below.
+		slog.InfoContext(
+			ctx, "persisted position carries a mid-COPY cursor; resuming interrupted cold-start via the bulk path",
+			slog.String("stream_id", streamID),
+			slog.String("position_token", truncateDryRunToken(persisted.Token, 60)),
+		)
+		changes, stop, err = s.coldStart(streamCtx, lsnTracker, applier, streamID, resumeCopyFrom)
 	case found:
 		changes, stop, err = s.warmResume(streamCtx, persisted, lsnTracker)
 		warmResumed = err == nil
@@ -1417,14 +1447,14 @@ func (s *Streamer) runOnce(ctx context.Context) error {
 			// warmResume failed; its stop is the no-op (it cleaned up
 			// its reader inline). coldStart's stop supersedes it.
 			stop()
-			changes, stop, err = s.coldStart(streamCtx, lsnTracker, applier, streamID)
+			changes, stop, err = s.coldStart(streamCtx, lsnTracker, applier, streamID, ir.Position{})
 			// coldStart supersedes the warm resume — schema-history
 			// stays brand-new from the applier's perspective (the
 			// snapshot bulk-copy reset effective state).
 			warmResumed = false
 		}
 	default:
-		changes, stop, err = s.coldStart(streamCtx, lsnTracker, applier, streamID)
+		changes, stop, err = s.coldStart(streamCtx, lsnTracker, applier, streamID, ir.Position{})
 	}
 	if err != nil {
 		return err
@@ -2267,7 +2297,27 @@ func (s *Streamer) warmResume(ctx context.Context, persisted ir.Position, lsnTra
 // replication goroutine deterministically. See warmResume's doc for
 // why ctx cancellation alone leaks that goroutine into the next test
 // (cross-test slog.Default() DATA RACE under `-race`).
-func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.ChangeApplier, streamID string) (changes <-chan ir.Change, stop func(), err error) {
+//
+// resumeFrom is the INTERRUPTED-cold-start resume cursor (v0.99.8). The
+// zero Position (empty Engine+Token) is the normal fresh cold-start: the
+// snapshot opens from the beginning and the populated-target preflight
+// gates as usual. A non-zero resumeFrom means a process restart caught an
+// in-flight cold-start COPY whose persisted position carries a mid-COPY
+// cursor ([ir.SnapshotStreamResumer.PositionCarriesCopyCursor]); coldStart
+// then (a) opens the snapshot via [ir.SnapshotStreamResumer.
+// OpenSnapshotStreamFromPosition] so the bulk COPY continues from the
+// cursor (NOT from row 0) through the batched bulk-COPY writer, and (b)
+// SKIPS the populated-target cold-start preflight — the partial copy on
+// the target is the expected state, and the idempotent COPY writer
+// absorbs the overlap. Everything else (schema read, publication scope,
+// the bulk-copy machinery, the CDC handoff) is shared verbatim with the
+// fresh path. The completed-cold-start warm-resume (cursor-less position)
+// never reaches here — it stays on the fast plain-CDC warmResume path.
+func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.ChangeApplier, streamID string, resumeFrom ir.Position) (changes <-chan ir.Change, stop func(), err error) {
+	// resumingCopy is the interrupted-cold-start discriminator: a non-zero
+	// resume position. It gates the seeded snapshot open and the preflight
+	// skip below. Read once here so the two call sites can't drift.
+	resumingCopy := resumeFrom.Engine != "" || resumeFrom.Token != ""
 	stop = func() {}
 	sr, err := s.Source.OpenSchemaReader(ctx, s.SourceDSN)
 	if err != nil {
@@ -2421,7 +2471,34 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 		return nil, stop, wrapWithHint(PhaseConnect, err)
 	}
 
-	stream, err := openSnapshotStreamWithOptionalSlot(ctx, s.Source, s.SourceDSN, s.SlotName)
+	// Interrupted-cold-start resume (v0.99.8): seed the bulk snapshot
+	// stream from the persisted mid-COPY cursor so vtgate continues the
+	// COPY from the last-copied PK through the batched bulk-COPY writer,
+	// instead of the plain CDC reader's per-row apply path (~10 rows/sec —
+	// the silent-degrade this fixes). Fresh cold-starts open from the
+	// beginning as before. The resumer surface is gated by the caller
+	// (runOnce only sets resumeFrom when the source implements
+	// SnapshotStreamResumer AND the position carries a cursor), but we
+	// re-assert the type here so a misrouted call fails loudly rather than
+	// silently re-copying from row 0.
+	var stream *ir.SnapshotStream
+	if resumingCopy {
+		resumer, ok := s.Source.(ir.SnapshotStreamResumer)
+		if !ok {
+			return nil, stop, wrapWithHint(PhaseSnapshot, fmt.Errorf(
+				"pipeline: source engine %q does not support resumable cold-start COPY but a resume cursor was supplied",
+				s.Source.Name(),
+			))
+		}
+		slog.InfoContext(
+			ctx, "resuming interrupted cold-start COPY from persisted cursor (bulk path)",
+			slog.String("stream_id", streamID),
+			slog.String("position_token", truncateDryRunToken(resumeFrom.Token, 60)),
+		)
+		stream, err = resumer.OpenSnapshotStreamFromPosition(ctx, s.SourceDSN, resumeFrom)
+	} else {
+		stream, err = openSnapshotStreamWithOptionalSlot(ctx, s.Source, s.SourceDSN, s.SlotName)
+	}
 	if err != nil {
 		return nil, stop, wrapWithHint(PhaseSnapshot, fmt.Errorf("pipeline: open snapshot stream: %w", err))
 	}
@@ -2548,6 +2625,25 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 		// operator-prepared empty tables.
 		slog.InfoContext(
 			ctx, "schema-already-applied: skipping cold-start preflight + DDL phases (GitHub #17)",
+			slog.String("stream_id", streamID),
+		)
+	case resumingCopy:
+		// Interrupted-cold-start resume (v0.99.8): the target already
+		// holds the PARTIAL copy from the run that was interrupted — that
+		// is precisely the expected state, so the populated-target
+		// cold-start preflight (Bug 9) MUST NOT fire here. The resumed
+		// COPY continues from the persisted cursor and the idempotent COPY
+		// writer (CreateTablesWithoutConstraints uses IF NOT EXISTS;
+		// copyTableColdStartIdempotent upserts) absorbs the overlap with
+		// rows already on the target. We do NOT drop or truncate the
+		// target tables — re-copying from row 0 destructively would defeat
+		// the whole resume. This branch is reached only when the persisted
+		// position carried a mid-COPY cursor (gated in runOnce), so it
+		// cannot mask a genuine "operator pointed at a populated target by
+		// mistake" — that path has no cursor and stays on the default
+		// preflight below.
+		slog.InfoContext(
+			ctx, "cold-start COPY resume: skipping populated-target preflight (partial copy is the expected state)",
 			slog.String("stream_id", streamID),
 		)
 	default:

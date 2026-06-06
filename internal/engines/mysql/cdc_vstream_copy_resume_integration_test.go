@@ -606,6 +606,217 @@ forward:
 	}
 }
 
+// TestVStream_CopyResume_ProcessRestart_ResumesViaBulkPath is the
+// v0.99.8 SILENT-DEGRADE pin (the gap the original ADR-0072 coverage
+// missed). It is DISTINCT from both the in-place reconnect test
+// (transient drop DURING an active stream, via reconnectCopy) and the
+// CDC-reader checkpoint-resume test above (which resumes via the plain
+// OpenCDCReader → per-row apply path): here the stream is fully TORN
+// DOWN and a process restart resumes the bulk COPY through the NEW
+// OpenSnapshotStreamFromPosition path, draining via the snapshot's
+// ReadRows (the bulk copyPump) — NOT the per-row CDC apply path.
+//
+// The bug: the pipeline's warmResume routed a process-restart resume
+// (persisted position carrying a TablePKs cursor) through the plain CDC
+// reader, which applied the un-copied COPY tail one INSERT round-trip at
+// a time (~10 rows/sec) instead of the batched bulk-COPY writer
+// (~4000 rows/sec) — the target stuck at ~5% of a 19M-row table, only
+// heartbeats, no error (silent-loss class).
+//
+// The fix routes a cursor-carrying resume through the seedable snapshot
+// stream so vtgate's re-emitted COPY-tail rows arrive on the bulk
+// copyPump. This test asserts EXACTLY that path is taken and yields zero
+// loss:
+//
+//   - the resumed snapshot's ReadRows (copyPump) yields the COPY tail —
+//     proving the bulk path is engaged, not the per-row CDC reader, and
+//   - every yielded id is strictly greater than the cursor lastpk
+//     (vtgate continued the COPY from the cursor — NO restart from row 0),
+//     and
+//   - the union (rows at/below the cursor on the first drain) + (rows from
+//     the resumed drain) covers the full source set: zero loss.
+//
+// NOTE on vttestserver vs real PlanetScale (Phase C caveat): vttestserver
+// runs a single local tablet, so its COPY throughput does NOT reproduce
+// real-PS's per-row-vs-bulk latency gap (the ~10 rows/sec crawl is a
+// remote-round-trip artifact). This test therefore CANNOT distinguish
+// bulk-vs-crawl by wall-clock; it instead asserts the STRUCTURAL property
+// that the resume flows through the snapshot's ReadRows/copyPump (the bulk
+// path) with zero loss. The wall-clock win is the operator's to confirm
+// on real PlanetScale.
+func TestVStream_CopyResume_ProcessRestart_ResumesViaBulkPath(t *testing.T) {
+	mysqlDSN, grpcEndpoint, _, cleanup := startVTTestServer(t)
+	defer cleanup()
+
+	const totalRows = 20000
+	const pad = "0123456789012345678901234567890123456789" // 40 bytes
+	const seedDDL = `
+		CREATE TABLE widgets (
+			id   BIGINT        NOT NULL AUTO_INCREMENT,
+			name VARCHAR(255)  NOT NULL,
+			PRIMARY KEY (id)
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+	`
+	applyVTTestSQL(t, mysqlDSN, seedDDL)
+
+	var b strings.Builder
+	for i := 1; i <= totalRows; i++ {
+		if b.Len() == 0 {
+			b.WriteString("INSERT INTO widgets (name) VALUES ")
+		} else {
+			b.WriteString(",")
+		}
+		fmt.Fprintf(&b, "('w%d-%s')", i, pad)
+		if i%500 == 0 {
+			applyVTTestSQL(t, mysqlDSN+"&multiStatements=true", b.String())
+			b.Reset()
+		}
+	}
+	if b.Len() > 0 {
+		applyVTTestSQL(t, mysqlDSN+"&multiStatements=true", b.String())
+	}
+	time.Sleep(3 * time.Second)
+
+	sluiceDSN := fmt.Sprintf(
+		"%s&vstream_endpoint=%s&vstream_transport=plaintext&vstream_auth=none&vstream_shards=0",
+		mysqlDSN, grpcEndpoint,
+	)
+
+	eng := Engine{Flavor: FlavorPlanetScale}
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
+	defer cancel()
+
+	widgetsTable := &ir.Table{
+		Name: "widgets",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64, AutoIncrement: true}},
+			{Name: "name", Type: ir.Varchar{Length: 255}},
+		},
+	}
+
+	// ---- Phase 1: fresh cold-start, drained partway, captures a mid-COPY
+	// checkpoint, then INTERRUPTED (stream fully closed = process death).
+	stream, err := eng.OpenSnapshotStream(ctx, sluiceDSN)
+	if err != nil {
+		t.Fatalf("OpenSnapshotStream: %v", err)
+	}
+	rows := stream.Rows.(*vstreamSnapshotRows)
+	rows.snap.checkpointRows = 200
+	rows.snap.checkpointInterval = 50 * time.Millisecond
+
+	capturedCh := make(chan ir.Position, 256)
+	rows.SetCopyCheckpoint(func(_ context.Context, pos ir.Position) error {
+		select {
+		case capturedCh <- pos:
+		default:
+		}
+		return nil
+	})
+
+	rowsCh, err := stream.Rows.ReadRows(ctx, widgetsTable)
+	if err != nil {
+		t.Fatalf("ReadRows: %v", err)
+	}
+	// Drain the full COPY (static source) so the checkpoint cadence captures
+	// genuine mid-COPY cursors; the interrupt is simulated by RESUMING from
+	// an early checkpoint, which is equivalent to the target having only
+	// reached that point before the process died.
+	firstSeen := 0
+	for range rowsCh {
+		firstSeen++
+	}
+	close(capturedCh)
+	var captured []ir.Position
+	for pos := range capturedCh {
+		captured = append(captured, pos)
+	}
+	if firstSeen != totalRows {
+		t.Fatalf("phase-1 drained %d COPY rows; want %d", firstSeen, totalRows)
+	}
+
+	var (
+		checkpoint ir.Position
+		cursorLast int64 = -1
+		haveCursor bool
+	)
+	for _, pos := range captured {
+		decoded, ok, derr := decodeVStreamPos(pos)
+		if derr != nil || !ok {
+			t.Fatalf("checkpoint position failed to decode: ok=%v err=%v", ok, derr)
+		}
+		if last, found := widgetsLastPK(t, decoded); found {
+			checkpoint = pos
+			cursorLast = last
+			haveCursor = true
+			break
+		}
+	}
+	if !haveCursor || cursorLast <= 0 || cursorLast >= totalRows {
+		_ = stream.Close()
+		t.Fatalf("did not capture a strictly mid-COPY cursor (haveCursor=%v lastpk=%d of %d) — enlarge the table / tighten the cadence",
+			haveCursor, cursorLast, totalRows)
+	}
+	t.Logf("process-restart resume: interrupting at mid-COPY checkpoint widgets lastpk id=%d (of %d)", cursorLast, totalRows)
+
+	// FULL TEARDOWN — the process-restart boundary. Nothing of the phase-1
+	// stream survives; only the persisted checkpoint position does.
+	_ = stream.Close()
+
+	// Guard: confirm the routing discriminator AGREES this position needs
+	// the bulk resume path (so the test exercises the real pipeline gate).
+	if !eng.PositionCarriesCopyCursor(checkpoint) {
+		t.Fatal("PositionCarriesCopyCursor=false for a mid-COPY checkpoint — the pipeline would mis-route this to the plain CDC path")
+	}
+
+	// ---- Phase 2: RESUME via the NEW bulk path (OpenSnapshotStreamFromPosition).
+	// This is what the pipeline's coldStart-resume now calls. We drain via
+	// ReadRows (the copyPump) and assert the COPY continues from the cursor.
+	resumeCtx, resumeCancel := context.WithTimeout(ctx, 6*time.Minute)
+	defer resumeCancel()
+
+	resumed, err := eng.OpenSnapshotStreamFromPosition(resumeCtx, sluiceDSN, checkpoint)
+	if err != nil {
+		t.Fatalf("OpenSnapshotStreamFromPosition (process-restart resume): %v", err)
+	}
+	defer func() { _ = resumed.Close() }()
+
+	resumedRowsCh, err := resumed.Rows.ReadRows(resumeCtx, widgetsTable)
+	if err != nil {
+		t.Fatalf("resumed ReadRows: %v", err)
+	}
+
+	resumedIDs := make(map[int64]bool, totalRows-int(cursorLast))
+	minResumed := int64(1<<62 - 1)
+	for row := range resumedRowsCh {
+		id, _ := row["id"].(int64)
+		if id < minResumed {
+			minResumed = id
+		}
+		resumedIDs[id] = true
+	}
+	if err := resumed.Rows.Err(); err != nil {
+		t.Fatalf("resumed bulk COPY ended with an error (loud-failure path, not a silent crawl): %v", err)
+	}
+
+	// The resumed COPY (bulk copyPump) must NOT restart from row 0.
+	if minResumed <= cursorLast {
+		t.Errorf("resumed bulk COPY yielded id=%d <= cursor lastpk %d — vtgate restarted the COPY from row 0 instead of resuming from the cursor",
+			minResumed, cursorLast)
+	}
+	// Zero loss: every id in (cursorLast, totalRows] must arrive on the bulk
+	// path. A missing id is silent loss across the process-restart seam.
+	wantResume := totalRows - int(cursorLast)
+	if len(resumedIDs) < wantResume {
+		t.Errorf("resumed bulk COPY yielded %d distinct rows; want %d (rows with id > %d) — possible loss",
+			len(resumedIDs), wantResume, cursorLast)
+	}
+	for id := cursorLast + 1; id <= int64(totalRows); id++ {
+		if !resumedIDs[id] {
+			t.Fatalf("row id=%d missing from the resumed BULK COPY — silent loss across the process-restart seam", id)
+		}
+	}
+}
+
 // widgetsLastPK extracts the integer lastpk for the "widgets" table from
 // a decoded position's per-shard TablePKs cursor, if present. Returns
 // (value, true) when the cursor exists; (_, false) when no widgets
