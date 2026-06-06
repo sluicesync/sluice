@@ -21,8 +21,10 @@ type slotAwareEngine struct {
 	stubEngine
 	lastCDCSlotName      string
 	lastSnapshotSlotName string
+	lastSnapshotTables   []string
 	cdcCallCount         int
 	snapshotCallCount    int
+	tableScopeCallCount  int
 	defaultCDCCalls      int
 	defaultSnapshotCalls int
 }
@@ -46,6 +48,12 @@ func (e *slotAwareEngine) OpenCDCReaderWithSlot(_ context.Context, _, slotName s
 func (e *slotAwareEngine) OpenSnapshotStreamWithSlot(_ context.Context, _, slotName string) (*ir.SnapshotStream, error) {
 	e.snapshotCallCount++
 	e.lastSnapshotSlotName = slotName
+	return nil, nil //nolint:nilnil // stub
+}
+
+func (e *slotAwareEngine) OpenSnapshotStreamForTables(_ context.Context, _ string, tables []string) (*ir.SnapshotStream, error) {
+	e.tableScopeCallCount++
+	e.lastSnapshotTables = tables
 	return nil, nil //nolint:nilnil // stub
 }
 
@@ -126,7 +134,8 @@ func TestOpenCDCReaderWithOptionalSlot(t *testing.T) {
 // to verify the fallback path silently degrades.
 type nonSlotAwareEngine struct {
 	stubEngine
-	defaultCDCCalls int
+	defaultCDCCalls      int
+	defaultSnapshotCalls int
 }
 
 func (e *nonSlotAwareEngine) OpenCDCReader(context.Context, string) (ir.CDCReader, error) {
@@ -134,15 +143,76 @@ func (e *nonSlotAwareEngine) OpenCDCReader(context.Context, string) (ir.CDCReade
 	return nil, nil //nolint:nilnil // stub
 }
 
-// TestOpenSnapshotStreamWithOptionalSlot mirrors the CDC version's
-// shape; one positive test for the slot-aware path is enough.
-func TestOpenSnapshotStreamWithOptionalSlot(t *testing.T) {
-	e := &slotAwareEngine{}
-	_, _ = openSnapshotStreamWithOptionalSlot(context.Background(), e, "dsn", "snap_custom_slot")
-	if e.snapshotCallCount != 1 {
-		t.Errorf("OpenSnapshotStreamWithSlot call count = %d; want 1", e.snapshotCallCount)
-	}
-	if e.lastSnapshotSlotName != "snap_custom_slot" {
-		t.Errorf("slotName forwarded = %q; want snap_custom_slot", e.lastSnapshotSlotName)
-	}
+func (e *nonSlotAwareEngine) OpenSnapshotStream(context.Context, string) (*ir.SnapshotStream, error) {
+	e.defaultSnapshotCalls++
+	return nil, nil //nolint:nilnil // stub
+}
+
+// TestOpenSnapshotStreamScoped covers the dispatch matrix for the
+// combined slot-aware / table-scoped snapshot open: slot wins when set,
+// table-scope is preferred over the default open when a non-empty
+// allowlist is supplied to a TableScopedSnapshotOpener, and everything
+// falls back to the plain default open otherwise.
+func TestOpenSnapshotStreamScoped(t *testing.T) {
+	t.Run("non-empty slotName routes to slot-aware method", func(t *testing.T) {
+		e := &slotAwareEngine{}
+		_, _ = openSnapshotStreamScoped(context.Background(), e, "dsn", "snap_custom_slot", nil)
+		if e.snapshotCallCount != 1 {
+			t.Errorf("OpenSnapshotStreamWithSlot call count = %d; want 1", e.snapshotCallCount)
+		}
+		if e.lastSnapshotSlotName != "snap_custom_slot" {
+			t.Errorf("slotName forwarded = %q; want snap_custom_slot", e.lastSnapshotSlotName)
+		}
+		if e.defaultSnapshotCalls != 0 {
+			t.Errorf("default OpenSnapshotStream was called; should have been skipped")
+		}
+	})
+
+	t.Run("slot wins over table-scope when both set", func(t *testing.T) {
+		// slotAwareEngine implements both surfaces; with a slot AND tables
+		// the slot path must win (the more specific lifecycle requirement).
+		e := &slotAwareEngine{}
+		_, _ = openSnapshotStreamScoped(context.Background(), e, "dsn", "snap_custom_slot", []string{"t1"})
+		if e.snapshotCallCount != 1 {
+			t.Errorf("slot path call count = %d; want 1 (slot must win over table-scope)", e.snapshotCallCount)
+		}
+		if e.tableScopeCallCount != 0 {
+			t.Errorf("table-scope path was called %d times; want 0 (slot wins)", e.tableScopeCallCount)
+		}
+	})
+
+	t.Run("non-empty tables routes to table-scoped method", func(t *testing.T) {
+		e := &slotAwareEngine{}
+		_, _ = openSnapshotStreamScoped(context.Background(), e, "dsn", "", []string{"small_t", "other"})
+		if e.tableScopeCallCount != 1 {
+			t.Errorf("OpenSnapshotStreamForTables call count = %d; want 1", e.tableScopeCallCount)
+		}
+		if len(e.lastSnapshotTables) != 2 || e.lastSnapshotTables[0] != "small_t" || e.lastSnapshotTables[1] != "other" {
+			t.Errorf("tables forwarded = %v; want [small_t other]", e.lastSnapshotTables)
+		}
+		if e.defaultSnapshotCalls != 0 {
+			t.Errorf("default OpenSnapshotStream was called; should have been skipped")
+		}
+	})
+
+	t.Run("empty slot + empty tables uses default open", func(t *testing.T) {
+		e := &slotAwareEngine{}
+		_, _ = openSnapshotStreamScoped(context.Background(), e, "dsn", "", nil)
+		if e.defaultSnapshotCalls != 1 {
+			t.Errorf("default OpenSnapshotStream call count = %d; want 1", e.defaultSnapshotCalls)
+		}
+		if e.snapshotCallCount != 0 || e.tableScopeCallCount != 0 {
+			t.Errorf("a scoped path was called for the empty-slot/empty-tables case")
+		}
+	})
+
+	t.Run("non-implementing engine falls back to default for tables", func(t *testing.T) {
+		// nonSlotAwareEngine implements neither optional surface; a
+		// table-scope request must silently fall back to the default open.
+		e := &nonSlotAwareEngine{}
+		_, _ = openSnapshotStreamScoped(context.Background(), e, "dsn", "", []string{"t1"})
+		if e.defaultSnapshotCalls != 1 {
+			t.Errorf("expected fallback to OpenSnapshotStream; got %d calls", e.defaultSnapshotCalls)
+		}
+	})
 }

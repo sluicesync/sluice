@@ -62,8 +62,26 @@ func (e Engine) openVStreamSnapshotStream(ctx context.Context, dsn string) (*ir.
 	// The default public path starts the COPY from the beginning of the
 	// binlog (empty-Gtid sentinel, no mid-COPY cursor). The shard layout
 	// is resolved inside openVStreamSnapshotStreamFrom — passing nil tells
-	// it to seed from-beginning against the resolved layout.
-	return e.openVStreamSnapshotStreamFrom(ctx, dsn, nil)
+	// it to seed from-beginning against the resolved layout. The nil
+	// tables arg keeps the keyspace-wide COPY (every table).
+	return e.openVStreamSnapshotStreamFrom(ctx, dsn, nil, nil)
+}
+
+// vstreamCopyFilterRules builds the VStream COPY filter rules. With no
+// tables it returns the keyspace-wide catch-all (every table). With a
+// table allowlist it returns one rule per table (exact Match + a
+// `select * from <t>` Filter) so vtgate's COPY scans only those tables —
+// a large unrelated table in the same keyspace is never streamed/buffered
+// (avoids the ADR-0071 multi-table interleaving buffer overflow).
+func vstreamCopyFilterRules(tables []string) []*binlogdata.Rule {
+	if len(tables) == 0 {
+		return []*binlogdata.Rule{{Match: "/.*/"}}
+	}
+	rules := make([]*binlogdata.Rule, 0, len(tables))
+	for _, t := range tables {
+		rules = append(rules, &binlogdata.Rule{Match: t, Filter: "select * from " + t})
+	}
+	return rules
 }
 
 // openVStreamSnapshotStreamFrom is the seedable core of
@@ -87,7 +105,14 @@ func (e Engine) openVStreamSnapshotStream(ctx context.Context, dsn string) (*ir.
 // list in start MUST match the resolved layout — a reshard since the
 // checkpoint surfaces as a loud JOURNAL error from the pump rather than
 // a silent mis-resume.
-func (e Engine) openVStreamSnapshotStreamFrom(ctx context.Context, dsn string, start []shardGtid) (*ir.SnapshotStream, error) {
+//
+// tables scopes the COPY filter (vstreamCopyFilterRules): empty/nil copies
+// every table in the keyspace; a non-empty allowlist makes vtgate's COPY
+// scan only those tables so a large unrelated table in the same keyspace
+// is never streamed/buffered (the ADR-0071 multi-table-interleaving
+// overflow). The scope is captured on the stream (copyTables) so an
+// in-place [reconnectCopy] re-applies it.
+func (e Engine) openVStreamSnapshotStreamFrom(ctx context.Context, dsn string, start []shardGtid, tables []string) (*ir.SnapshotStream, error) {
 	cfg, err := parseDSN(dsn)
 	if err != nil {
 		return nil, err
@@ -171,7 +196,7 @@ func (e Engine) openVStreamSnapshotStreamFrom(ctx context.Context, dsn string, s
 		Vgtid: &binlogdata.VGtid{
 			ShardGtids: protoShardGtids,
 		},
-		Filter: &binlogdata.Filter{Rules: []*binlogdata.Rule{{Match: "/.*/"}}},
+		Filter: &binlogdata.Filter{Rules: vstreamCopyFilterRules(tables)},
 		Flags: &vtgate.VStreamFlags{
 			MinimizeSkew:      true,
 			StopOnReshard:     true,
@@ -190,6 +215,7 @@ func (e Engine) openVStreamSnapshotStreamFrom(ctx context.Context, dsn string, s
 		keyspace:             keyspace,
 		client:               client,
 		shards:               shards,
+		copyTables:           tables,
 		reconnectMax:         defaultCopyReconnectMax,
 		reconnectBackoffBase: defaultCopyReconnectBackoffBase,
 		reconnectBackoffCap:  defaultCopyReconnectBackoffCap,
@@ -286,6 +312,15 @@ type vstreamSnapshotStream struct {
 	// resume request's per-shard Gtid + TablePKs come from currentVgtid,
 	// but the shard list itself is the constructor's resolved layout.
 	shards []string
+
+	// copyTables is the COPY filter scope captured at open: empty means
+	// keyspace-wide (every table), non-empty restricts the COPY to those
+	// unqualified table names (vstreamCopyFilterRules). Held so an
+	// in-place [reconnectCopy] re-applies the SAME scope — otherwise a
+	// reconnect would silently widen the COPY back to the whole keyspace
+	// and start streaming the large unrelated table the original scope
+	// excluded (the ADR-0071 overflow this feature avoids).
+	copyTables []string
 
 	// reconnectMax is the in-place COPY-reconnect budget (Phase C):
 	// consecutive retriable Recv failures the pump absorbs before giving
@@ -702,7 +737,7 @@ func (s *vstreamSnapshotStream) reconnectCopy(ctx context.Context, attempt int) 
 	req := &vtgate.VStreamRequest{
 		TabletType: topodata.TabletType_PRIMARY,
 		Vgtid:      &binlogdata.VGtid{ShardGtids: protoShardGtids},
-		Filter:     &binlogdata.Filter{Rules: []*binlogdata.Rule{{Match: "/.*/"}}},
+		Filter:     &binlogdata.Filter{Rules: vstreamCopyFilterRules(s.copyTables)},
 		Flags: &vtgate.VStreamFlags{
 			MinimizeSkew:      true,
 			StopOnReshard:     true,

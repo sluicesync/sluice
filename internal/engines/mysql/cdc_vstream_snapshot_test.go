@@ -777,3 +777,48 @@ func TestVStreamSnapshot_CheckpointWriteFailureNonFatal(t *testing.T) {
 		t.Errorf("a failed checkpoint write set a terminal copy error (should be non-fatal): %v", err)
 	}
 }
+
+// TestVStreamCopyFilterRules pins the COPY-filter scoping (the
+// included-table allowlist feature): an empty/nil scope is the keyspace-
+// wide catch-all (every table); a non-empty scope is one exact-match rule
+// per table with a `select * from <t>` Filter, order preserved.
+func TestVStreamCopyFilterRules(t *testing.T) {
+	t.Run("nil scope is keyspace-wide catch-all", func(t *testing.T) {
+		got := vstreamCopyFilterRules(nil)
+		if len(got) != 1 {
+			t.Fatalf("nil scope: got %d rules; want exactly 1 catch-all", len(got))
+		}
+		if got[0].GetMatch() != "/.*/" {
+			t.Errorf("nil scope: Match = %q; want /.*/", got[0].GetMatch())
+		}
+		if got[0].GetFilter() != "" {
+			t.Errorf("nil scope: Filter = %q; want empty", got[0].GetFilter())
+		}
+	})
+
+	t.Run("empty scope is keyspace-wide catch-all", func(t *testing.T) {
+		got := vstreamCopyFilterRules([]string{})
+		if len(got) != 1 || got[0].GetMatch() != "/.*/" {
+			t.Fatalf("empty scope: got %+v; want a single /.*/ catch-all", got)
+		}
+	})
+
+	t.Run("two-table scope is one rule per table, order preserved", func(t *testing.T) {
+		got := vstreamCopyFilterRules([]string{"small_t", "orders"})
+		want := []*binlogdata.Rule{
+			{Match: "small_t", Filter: "select * from small_t"},
+			{Match: "orders", Filter: "select * from orders"},
+		}
+		if len(got) != len(want) {
+			t.Fatalf("got %d rules; want %d", len(got), len(want))
+		}
+		for i := range want {
+			if got[i].GetMatch() != want[i].GetMatch() {
+				t.Errorf("rule %d Match = %q; want %q", i, got[i].GetMatch(), want[i].GetMatch())
+			}
+			if got[i].GetFilter() != want[i].GetFilter() {
+				t.Errorf("rule %d Filter = %q; want %q", i, got[i].GetFilter(), want[i].GetFilter())
+			}
+		}
+	})
+}

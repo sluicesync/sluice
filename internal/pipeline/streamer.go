@@ -2382,6 +2382,15 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 	}
 	applyViewFilter(ctx, schema, s.ViewFilter, s.SkipViews)
 
+	// Collect the surviving (filtered) table names so a source that
+	// implements ir.TableScopedSnapshotOpener (PlanetScale VStream) can
+	// scope its COPY to exactly these tables. Without this the VStream
+	// snapshot copies EVERY table in the keyspace regardless of
+	// --include-table, so a large unrelated table in the same keyspace
+	// gets streamed/buffered and overflows --max-buffer-bytes (ADR-0071).
+	// Unqualified names — matches the VStream filter rule's Match scope.
+	snapshotTables := tableNamesForPublication(schema)
+
 	// Source-side RLS preflight (task #52 sub-deliverable 1). Refuses
 	// loudly when any in-scope source table has RLS enabled AND the
 	// connecting role lacks BYPASSRLS — the silent-snapshot-filter
@@ -2527,7 +2536,7 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 		)
 		stream, err = resumer.OpenSnapshotStreamFromPosition(ctx, s.SourceDSN, resumeFrom)
 	} else {
-		stream, err = openSnapshotStreamWithOptionalSlot(ctx, s.Source, s.SourceDSN, s.SlotName)
+		stream, err = openSnapshotStreamScoped(ctx, s.Source, s.SourceDSN, s.SlotName, snapshotTables)
 	}
 	if err != nil {
 		return nil, stop, wrapWithHint(PhaseSnapshot, fmt.Errorf("pipeline: open snapshot stream: %w", err))
@@ -2971,19 +2980,39 @@ func openCDCReaderWithOptionalSlot(ctx context.Context, source ir.Engine, dsn, s
 	return source.OpenCDCReader(ctx, dsn)
 }
 
-// openSnapshotStreamWithOptionalSlot is the snapshot-stream sibling
-// of openCDCReaderWithOptionalSlot. Same dispatch shape.
-func openSnapshotStreamWithOptionalSlot(ctx context.Context, source ir.Engine, dsn, slotName string) (*ir.SnapshotStream, error) {
-	if slotName == "" {
+// openSnapshotStreamScoped opens the snapshot stream, preferring (in
+// order) the slot-aware surface, then the table-scoped surface, then the
+// plain default open. It is the snapshot-stream sibling of
+// openCDCReaderWithOptionalSlot, extended with the table-scope dispatch.
+//
+//   - slotName != "" → [ir.SnapshotStreamWithSlotOpener] when the engine
+//     implements it (Postgres), else a debug note + default open. The
+//     slot is created at open time, so the name must flow in here.
+//   - len(tables) > 0 → [ir.TableScopedSnapshotOpener] when the engine
+//     implements it (PlanetScale VStream), scoping the COPY to the
+//     filtered tables so a large unrelated keyspace table is never
+//     streamed/buffered (ADR-0071).
+//   - otherwise → the plain [ir.Engine.OpenSnapshotStream].
+//
+// Slot and table-scope never coexist on one engine (Postgres has the
+// slot; PlanetScale has the tables), but if both are somehow set the slot
+// wins — it's the more specific lifecycle requirement.
+func openSnapshotStreamScoped(ctx context.Context, source ir.Engine, dsn, slotName string, tables []string) (*ir.SnapshotStream, error) {
+	if slotName != "" {
+		if opener, ok := source.(ir.SnapshotStreamWithSlotOpener); ok {
+			return opener.OpenSnapshotStreamWithSlot(ctx, dsn, slotName)
+		}
+		slog.DebugContext(
+			ctx, "engine does not implement SnapshotStreamWithSlotOpener; --slot-name silently ignored",
+			slog.String("engine", source.Name()),
+		)
 		return source.OpenSnapshotStream(ctx, dsn)
 	}
-	if opener, ok := source.(ir.SnapshotStreamWithSlotOpener); ok {
-		return opener.OpenSnapshotStreamWithSlot(ctx, dsn, slotName)
+	if len(tables) > 0 {
+		if opener, ok := source.(ir.TableScopedSnapshotOpener); ok {
+			return opener.OpenSnapshotStreamForTables(ctx, dsn, tables)
+		}
 	}
-	slog.DebugContext(
-		ctx, "engine does not implement SnapshotStreamWithSlotOpener; --slot-name silently ignored",
-		slog.String("engine", source.Name()),
-	)
 	return source.OpenSnapshotStream(ctx, dsn)
 }
 

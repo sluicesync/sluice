@@ -1759,6 +1759,30 @@ type SnapshotStreamResumer interface {
 	OpenSnapshotStreamFromPosition(ctx context.Context, dsn string, from Position) (*SnapshotStream, error)
 }
 
+// TableScopedSnapshotOpener is the optional engine surface for engines
+// whose snapshot streams the WHOLE source keyspace/database by default
+// and can be told to scope the COPY to a specific table allowlist.
+type TableScopedSnapshotOpener interface {
+	// OpenSnapshotStreamForTables opens a snapshot stream whose COPY is
+	// scoped to exactly `tables` (unqualified names within the source
+	// keyspace/database), returning the same paired RowReader/CDCReader
+	// shape as [Engine.OpenSnapshotStream].
+	//
+	// Engines whose snapshot streams the whole keyspace by default
+	// (PlanetScale VStream: vtgate copies every table matched by the
+	// filter rules) implement this so a large unrelated table in the
+	// same keyspace is never streamed/buffered — avoiding the ADR-0071
+	// multi-table-interleaving buffer overflow when only a subset of a
+	// busy keyspace is in scope. An empty `tables` means "all tables"
+	// (identical to [Engine.OpenSnapshotStream]).
+	//
+	// Engines whose snapshot is already per-table (Postgres per-table
+	// COPY, vanilla MySQL per-table dump) gain nothing from scoping —
+	// they never over-stream — so they need not implement this surface;
+	// when they do, they may simply delegate to the default open.
+	OpenSnapshotStreamForTables(ctx context.Context, dsn string, tables []string) (*SnapshotStream, error)
+}
+
 // DefaultTableExcluder is the optional engine surface for "tables
 // the operator almost never wants to migrate against this engine".
 // Implementing engines return a list of [path.Match]-style patterns

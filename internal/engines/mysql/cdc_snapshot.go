@@ -41,6 +41,31 @@ func (e Engine) OpenSnapshotStream(ctx context.Context, dsn string) (*ir.Snapsho
 	return e.openBinlogSnapshotStream(ctx, dsn)
 }
 
+// OpenSnapshotStreamForTables is the optional [ir.TableScopedSnapshotOpener]
+// surface: it opens a snapshot whose COPY is scoped to the unqualified
+// table names in tables (an empty slice means "all tables", identical to
+// [Engine.OpenSnapshotStream]).
+//
+// Only the PlanetScale (VStream) flavor over-streams by default — vtgate's
+// COPY copies every table the filter rules match, so a large unrelated
+// table in the same keyspace gets streamed and buffered even when only a
+// small table is in scope (the ADR-0071 multi-table-interleaving buffer
+// overflow). Scoping the VStream COPY filter to the allowlist makes vtgate
+// scan only those tables. The vanilla/binlog flavor's snapshot RowReader
+// already reads per-table, so it never over-streams; there the scope is a
+// no-op and we delegate to the plain binlog snapshot open.
+func (e Engine) OpenSnapshotStreamForTables(ctx context.Context, dsn string, tables []string) (*ir.SnapshotStream, error) {
+	if e.Capabilities().CDC == ir.CDCNone {
+		return nil, fmt.Errorf("%s: snapshot+CDC not supported by this flavor: %w", e.Name(), ErrNotImplemented)
+	}
+	if e.Flavor == FlavorPlanetScale {
+		return e.openVStreamSnapshotStreamFrom(ctx, dsn, nil, tables)
+	}
+	// Vanilla/binlog flavor: its snapshot RowReader already reads per-table,
+	// so it never over-streams; the table scope is a no-op there.
+	return e.openBinlogSnapshotStream(ctx, dsn)
+}
+
 // OpenSnapshotStreamFromPosition resumes an INTERRUPTED cold-start COPY
 // (v0.99.8) by seeding the bulk snapshot stream from a persisted position
 // that carries Vitess's per-shard TablePKs cursor. This is the optional
@@ -94,7 +119,12 @@ func (e Engine) OpenSnapshotStreamFromPosition(ctx context.Context, dsn string, 
 				"(the cursor-less warm-resume belongs on the plain CDC path)",
 		)
 	}
-	return e.openVStreamSnapshotStreamFrom(ctx, dsn, start)
+	// NOTE: the resume path keeps the whole-keyspace COPY scope (nil
+	// tables). Scoping a resumed COPY to the included-table allowlist is a
+	// future enhancement — the persisted cursor predates the scope, and a
+	// resume that narrowed the filter would need to reconcile the cursor's
+	// per-table TablePKs against the new allowlist; deferred for now.
+	return e.openVStreamSnapshotStreamFrom(ctx, dsn, start, nil)
 }
 
 // PositionCarriesCopyCursor reports whether a persisted position carries a
