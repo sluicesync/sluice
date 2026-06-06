@@ -347,6 +347,115 @@ func TestPrimeSchemaHistoryCache_CrossEngine_UsesSourceOrderer(t *testing.T) {
 	}
 }
 
+// TestPrimeSchemaHistoryCache_VStream_WarmResume is the end-to-end pin
+// for the v0.99.7 PlanetScale warm-resume crash. The original
+// vttestserver resume pins never RETAINED a schema-history version, so
+// the ResolveSchemaVersion → orderer.PositionAtOrAfter ordering path was
+// never exercised on a VStream-shape position (the "pin the class" gap,
+// per the Bug-74 lesson). When PlanetScale warm-resumes, the persisted
+// position is a JSON ARRAY of per-shard shardGtid — not the single
+// binlogPos object the binlog path uses — and PrimeSchemaHistoryCache
+// crashed in the ordering with "cannot unmarshal array into Go value of
+// type mysql.binlogPos".
+//
+// This pin seeds MySQL's schema-history with a VStream-shape anchor
+// (source_engine "planetscale") and warm-resumes with a VStream-shape
+// currentPos at-or-after that anchor. It exercises the EXACT crash path
+// end-to-end against a real MySQL store and the real
+// engines.Get("planetscale") orderer:
+//
+//   - the WITHOUT-table_p_ks shape (an ordinary PlanetScale sync RESTART
+//     — Phase A proved this ALSO crashed, not just resumed cold-starts),
+//     and
+//   - the WITH-table_p_ks shape (a mid-COPY warm-resume — the COPY
+//     cursor must be ignored for ordering).
+//
+// PASS = prime returns nil and ActiveSchema resolves the seeded IR for
+// both shapes. FAIL = the v0.99.7 array-unmarshal crash recurs.
+func TestPrimeSchemaHistoryCache_VStream_WarmResume(t *testing.T) {
+	dsn, cleanup := startMySQLForApplier(t)
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if err := ensureSchemaHistoryTable(ctx, db); err != nil {
+		t.Fatalf("ensureSchemaHistoryTable: %v", err)
+	}
+
+	const (
+		uA = "11111111-1111-1111-1111-111111111111"
+		uB = "22222222-2222-2222-2222-222222222222"
+	)
+	// A VStream-shape schema-history anchor: single-shard "-", a
+	// MySQL56/-prefixed GTID set. Engine "planetscale" so the prime
+	// dispatches the FlavorPlanetScale orderer.
+	anchorTok := `[{"keyspace":"main","shard":"-","gtid":"MySQL56/` + uA + `:1-50"}]`
+	anchor := ir.Position{Engine: engineNameVStream, Token: anchorTok}
+	tbl := &ir.Table{Name: "connections", Columns: []*ir.Column{
+		{Name: "id", Type: ir.Integer{Width: 64}},
+		{Name: "name", Type: ir.Varchar{Length: 255}, Nullable: true},
+	}}
+	if err := writeSchemaVersion(ctx, db, "ps_resume", "main", "connections", anchor, tbl); err != nil {
+		t.Fatalf("seed vstream row: %v", err)
+	}
+
+	eng := Engine{Flavor: FlavorPlanetScale}
+	applier, err := eng.OpenChangeApplier(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenChangeApplier: %v", err)
+	}
+	defer func() {
+		if c, ok := applier.(interface{ Close() error }); ok {
+			_ = c.Close()
+		}
+	}()
+	a := applier.(*ChangeApplier)
+
+	// Two warm-resume shapes; ordering must succeed identically for both.
+	cases := []struct {
+		name  string
+		token string
+	}{
+		{
+			// Ordinary CDC-phase restart (no COPY cursor) — the shape Phase
+			// A proved ALSO crashed.
+			name:  "no table_p_ks (CDC restart)",
+			token: `[{"keyspace":"main","shard":"-","gtid":"MySQL56/` + uA + `:1-100,` + uB + `:1-7"}]`,
+		},
+		{
+			// Mid-COPY warm-resume — carries a connections COPY cursor that
+			// MUST be ignored for ordering.
+			name: "with table_p_ks (mid-COPY resume)",
+			token: `[{"keyspace":"main","shard":"-",` +
+				`"gtid":"MySQL56/` + uA + `:1-100,` + uB + `:1-7",` +
+				`"table_p_ks":[{"table_name":"connections","lastpk":"AAEC"}]}]`,
+		},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			resumePos := ir.Position{Engine: engineNameVStream, Token: c.token}
+			if err := a.PrimeSchemaHistoryCache(ctx, "ps_resume", resumePos); err != nil {
+				t.Fatalf("v0.99.7 regression: vstream warm-resume prime crashed: %v", err)
+			}
+			got, ok := a.ActiveSchema("main", "connections")
+			if !ok {
+				t.Fatal("ActiveSchema(main, connections) miss after vstream prime (want hit)")
+			}
+			if got == nil || len(got.Columns) != 2 || got.Columns[1].Name != "name" {
+				t.Errorf("vstream prime IR: got %+v (want 2 cols, col[1]=name)", got)
+			}
+		})
+	}
+}
+
 // TestPrimeSchemaHistoryCache_UnregisteredSourceEngine_IsLoud pins
 // the loud-fail behaviour for an unknown source engine name (mirror
 // of the PG-side test). A currentPos.Engine that doesn't match any
