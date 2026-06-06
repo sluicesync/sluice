@@ -57,6 +57,19 @@ import (
 // committed. Post-fix, no gap.
 func TestStreamer_PostgresToPostgres_StopRestartNoLoss(t *testing.T) {
 	setPollIntervalForTest(t, 200*time.Millisecond)
+	// Bound the graceful-drain watchdog (production default 30s) WELL below
+	// this test's 30s RequestStop wait. Root cause of a -race CI flake
+	// ("Streamer.Run did not return after RequestStop"): the stop path is
+	// poll-detect (~200ms here) + a graceful drain that, if it wedges on a
+	// resource-pressured host (the PG replication pump can be slow to release
+	// the change channel under load), is rescued by the hard-cancel watchdog
+	// at observation+30s ≈ RequestStop+30.2s — JUST after the test's 30s
+	// window gave up. Tuning the watchdog to 15s makes the hard-cancel return
+	// Run at ~15s, comfortably inside the 30s wait, mirroring the already-
+	// tuned poll cadence. Hard-cancel is still zero-loss (positions commit
+	// atomically per change; ADR-0007/0025), so this doesn't weaken the
+	// no-loss assertion.
+	setDrainTimeoutForTest(t, 15*time.Second)
 
 	sourceDSN, targetDSN, cleanup := startPostgresLogical(t)
 	defer cleanup()
