@@ -166,11 +166,16 @@ func TestVitessChaos_PrimaryFailover_PRS_and_ERS(t *testing.T) {
 	// Drain a while longer so post-ERS inserts flow (or the reader errors).
 	_ = drainUntil(changes, drain, seedRows+30, 2*time.Minute)
 
-	// Stop the writer and let CDC catch up to the final source state.
+	// Stop the writer and let CDC catch up to the final source state. Generous
+	// window: after ERS, vtgate must detect the dead primary, finish the
+	// promotion, and re-route the VStream to the new primary before the reader
+	// resumes — that can take tens of seconds. If the reader is going to
+	// recover at all, it does so well within this window; if it stays stuck
+	// here, that's a genuine silent-wedge-on-failover bug, not impatience.
 	committed := stop()
 	writerStopped = true
 	t.Logf("writer committed ~%d live rows across both reparents", committed)
-	_ = drainUntil(changes, drain, 1<<30, 45*time.Second) // drain to deadline
+	_ = drainUntil(changes, drain, 1<<30, 4*time.Minute) // drain to deadline
 
 	srcCount, srcDistinct := sourceRowStats(t, cc.mysqlDSN, table)
 	assertZeroLossOrLoud(t, "PrimaryFailover/PRS+ERS", drain, readerErr(stream.Changes), srcCount, srcDistinct)
