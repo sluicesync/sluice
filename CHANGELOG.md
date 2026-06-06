@@ -6,6 +6,20 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.99.12] - 2026-06-06
+
+`--include-table` now scopes the PlanetScale (VStream) cold-start snapshot COPY,
+not just the write path — so copying a subset of tables out of a large keyspace
+no longer streams (and buffers) the excluded tables. Drop-in from v0.99.11.
+
+### Fixed
+
+- **`--include-table` / `--exclude-table` now scope the PlanetScale (VStream) cold-start snapshot, not just what gets written.** The VStream snapshot COPY used a catch-all filter (`/.*/`) that copied **every** table in the keyspace; `--include-table` only restricted what sluice *wrote*. So copying one small table from a keyspace that also held a large table streamed and buffered the large table too, overflowing `--max-buffer-bytes` (`table "X" would buffer … exceeding the cap … this multi-table interleaving case is not yet disk-spilled`, ADR-0071) — the subset copy could fail outright. sluice now passes the filtered table set into the VStream snapshot's **per-table filter rules**, so vtgate's COPY scans only the in-scope tables and a large excluded table in the same keyspace is never streamed. The CDC tail is unchanged (it still streams all tables and filters on dispatch, to keep live add-table working); resume and backup snapshots keep whole-keyspace scope (documented follow-up). New optional engine surface `ir.TableScopedSnapshotOpener`; vanilla MySQL and Postgres snapshots are already per-table and are unaffected. Validated on real PlanetScale (a 1M-row subset copied cleanly with a coexisting 19M-row table) plus a vttestserver integration test.
+
+### Compatibility
+
+- No breaking API or CLI changes. Drop-in from v0.99.11. Whole-keyspace syncs (no `--include-table`) are unaffected — the snapshot is scoped to all discovered tables, equivalent to the prior catch-all. Only the PlanetScale/VStream snapshot path changed; vanilla MySQL and Postgres are unchanged.
+
 ## [0.99.11] - 2026-06-06
 
 A small CLI safety fix: `sync start` now validates mutually-exclusive flags
