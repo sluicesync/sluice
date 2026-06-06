@@ -69,6 +69,24 @@ type RowWriter struct {
 	// (rows go through an io.Pipe to the driver) and is unaffected.
 	// See ADR-0028.
 	maxBufferBytes int64
+
+	// copyDurableProgress is the durable-write reporter the cold-start
+	// COPY path wires (v0.99.9). When set, the idempotent batch writer
+	// calls it after each successful flush with the per-flush row delta
+	// so the snapshot reader's checkpoint stays at-or-behind the
+	// durably-written frontier. Implements [ir.CopyDurableProgressReporter]
+	// via [SetCopyDurableProgress]. nil on every non-cold-start path.
+	copyDurableProgress ir.CopyDurableProgressFunc
+}
+
+// SetCopyDurableProgress implements [ir.CopyDurableProgressReporter]
+// (v0.99.9). The pipeline wires the snapshot reader's durable-progress
+// sink here on the cold-start COPY path, before WriteRowsIdempotent runs,
+// so each successful flush reports its row delta to the checkpoint
+// watermark. A nil func disables reporting (the default on every path
+// that isn't a resumable VStream cold-start).
+func (w *RowWriter) SetCopyDurableProgress(report ir.CopyDurableProgressFunc) {
+	w.copyDurableProgress = report
 }
 
 // SetMaxBufferBytes implements [ir.MaxBufferBytesSetter]. The

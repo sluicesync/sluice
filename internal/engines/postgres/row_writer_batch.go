@@ -92,6 +92,13 @@ func (w *RowWriter) writeViaBatchIdempotent(ctx context.Context, table *ir.Table
 		if _, err := w.db.ExecContext(ctx, query, args...); err != nil {
 			return fmt.Errorf("postgres: idempotent insert into %q (%d rows): %w", table.Name, len(batch), err)
 		}
+		// Report the durable-write delta (v0.99.9): this batch is now
+		// committed, so a resumable source reader's (VStream→PG) checkpoint
+		// may advance to cover these rows. Reported AFTER the Exec
+		// succeeds so the watermark stays at-or-behind the durable frontier.
+		if w.copyDurableProgress != nil {
+			w.copyDurableProgress(int64(len(batch)))
+		}
 		batch = batch[:0]
 		batchBytes = 0
 		return nil

@@ -27,6 +27,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -814,6 +815,247 @@ func TestVStream_CopyResume_ProcessRestart_ResumesViaBulkPath(t *testing.T) {
 		if !resumedIDs[id] {
 			t.Fatalf("row id=%d missing from the resumed BULK COPY — silent loss across the process-restart seam", id)
 		}
+	}
+}
+
+// TestVStream_HardCrash_CheckpointNeverAheadOfDurable_ZeroLoss is the
+// v0.99.9 SILENT-LOSS pin (the class the prior coverage missed). The
+// resumable cold-start COPY checkpoint previously persisted the pump's
+// RECEIVED-from-vtgate frontier (currentVgtid) gated on rows BUFFERED,
+// not rows DURABLY WRITTEN. The consumer lags the pump by up to
+// --max-buffer-bytes, so the persisted cursor ran AHEAD of the durable
+// frontier. A hard crash (SIGKILL/OOM/power-loss) drops the buffered-but-
+// unwritten rows while the cursor stays advanced → resume restarts past
+// un-written rows → SILENT LOSS. (Real-PS repro: persisted cursor sat
+// 5.1M ids ahead of the durable MAX; a resume finished "bulk copy
+// complete" with 5.26M rows silently missing.)
+//
+// This pin reproduces the lead exactly and asserts the fix's invariant:
+//
+//  1. Cold-start a table big enough that the pump fills the in-flight
+//     buffer ahead of the consumer.
+//  2. Drain only a PREFIX via ReadRows, acking durability for each
+//     consumed row (AdvanceDurableRows) — exactly what the bulk-copy
+//     writer's per-flush reporter does in the pipeline. The pump races
+//     ahead, advancing currentVgtid + the breadcrumbs far past the
+//     durable frontier.
+//  3. STRUCTURAL ASSERTION: every persisted checkpoint's lastpk is
+//     <= the max DURABLY-acked id (the checkpoint is never ahead of the
+//     durable frontier) — the exact condition the real-PS repro caught.
+//  4. Simulate SIGKILL: stop draining (drop the in-flight buffer) and
+//     tear the stream down. Only the persisted checkpoint survives.
+//  5. Resume from the last persisted checkpoint and run to completion;
+//     assert the union of {durably-written prefix} + {resumed tail}
+//     covers the FULL source set — zero silently-skipped gap.
+func TestVStream_HardCrash_CheckpointNeverAheadOfDurable_ZeroLoss(t *testing.T) {
+	mysqlDSN, grpcEndpoint, _, cleanup := startVTTestServer(t)
+	defer cleanup()
+
+	const totalRows = 20000
+	const pad = "0123456789012345678901234567890123456789" // 40 bytes
+	const seedDDL = `
+		CREATE TABLE widgets (
+			id   BIGINT        NOT NULL AUTO_INCREMENT,
+			name VARCHAR(255)  NOT NULL,
+			PRIMARY KEY (id)
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+	`
+	applyVTTestSQL(t, mysqlDSN, seedDDL)
+
+	var b strings.Builder
+	for i := 1; i <= totalRows; i++ {
+		if b.Len() == 0 {
+			b.WriteString("INSERT INTO widgets (name) VALUES ")
+		} else {
+			b.WriteString(",")
+		}
+		fmt.Fprintf(&b, "('w%d-%s')", i, pad)
+		if i%500 == 0 {
+			applyVTTestSQL(t, mysqlDSN+"&multiStatements=true", b.String())
+			b.Reset()
+		}
+	}
+	if b.Len() > 0 {
+		applyVTTestSQL(t, mysqlDSN+"&multiStatements=true", b.String())
+	}
+	time.Sleep(3 * time.Second)
+
+	sluiceDSN := fmt.Sprintf(
+		"%s&vstream_endpoint=%s&vstream_transport=plaintext&vstream_auth=none&vstream_shards=0",
+		mysqlDSN, grpcEndpoint,
+	)
+
+	eng := Engine{Flavor: FlavorPlanetScale}
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
+	defer cancel()
+
+	widgetsTable := &ir.Table{
+		Name: "widgets",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64, AutoIncrement: true}},
+			{Name: "name", Type: ir.Varchar{Length: 255}},
+		},
+	}
+
+	// ---- Phase 1: cold-start, drain a PREFIX, let the pump race ahead.
+	stream, err := eng.OpenSnapshotStream(ctx, sluiceDSN)
+	if err != nil {
+		t.Fatalf("OpenSnapshotStream: %v", err)
+	}
+	rows := stream.Rows.(*vstreamSnapshotRows)
+	rows.snap.checkpointRows = 200
+	rows.snap.checkpointInterval = 50 * time.Millisecond
+
+	// Capture every persisted checkpoint with the durable frontier observed
+	// AT THE INSTANT it was persisted, so we can assert the invariant
+	// per-checkpoint rather than only at the end. maxDurable is advanced by
+	// the consumer below; the checkpointFn reads it under the snap lock that
+	// AdvanceDurableRows also takes, so the read is race-clean.
+	type capturedCP struct {
+		pos            ir.Position
+		durableAtWrite int64
+	}
+	var (
+		capMu    sync.Mutex
+		captured []capturedCP
+	)
+	rows.SetCopyCheckpoint(func(_ context.Context, pos ir.Position) error {
+		rows.snap.mu.Lock()
+		durable := rows.snap.durableRows
+		rows.snap.mu.Unlock()
+		capMu.Lock()
+		captured = append(captured, capturedCP{pos: pos, durableAtWrite: durable})
+		capMu.Unlock()
+		return nil
+	})
+
+	rowsCh, err := stream.Rows.ReadRows(ctx, widgetsTable)
+	if err != nil {
+		t.Fatalf("ReadRows: %v", err)
+	}
+
+	// Drain a PREFIX only. For each consumed row, ack durability exactly as
+	// the bulk-copy writer's per-flush reporter does (here: one row per ack
+	// for maximum granularity). Stop after prefixN rows: the rest stays
+	// buffered/unreceived and is DROPPED on teardown (the SIGKILL sim). The
+	// max durable id is the high-water mark the checkpoint must never exceed.
+	const prefixN = 4000
+	durablyWritten := make(map[int64]bool, prefixN)
+	var maxDurableID int64
+	consumed := 0
+	for row := range rowsCh {
+		id, _ := row["id"].(int64)
+		// Durably "write" this row, then ack it.
+		durablyWritten[id] = true
+		if id > maxDurableID {
+			maxDurableID = id
+		}
+		rows.AdvanceDurableRows(1)
+		consumed++
+		if consumed >= prefixN {
+			break
+		}
+	}
+	if consumed < prefixN {
+		_ = stream.Close()
+		t.Fatalf("phase-1 drained only %d rows before the channel closed; want >= %d (table too small to build a pump lead)", consumed, prefixN)
+	}
+
+	// Give the pump a moment to race ahead (fill the buffer / advance the
+	// cursor + checkpoints well past the durable frontier) so the test
+	// genuinely exercises the lead the bug depended on.
+	time.Sleep(500 * time.Millisecond)
+
+	// STRUCTURAL INVARIANT (the v0.99.9 fix): no persisted checkpoint may
+	// carry a lastpk ahead of the durable frontier observed when it was
+	// written. With the pre-fix code the checkpoint persisted currentVgtid
+	// (the received frontier), so cursorLastpk would exceed durableAtWrite
+	// here. The fix persists the durable breadcrumb, so it never does.
+	capMu.Lock()
+	checkpointsChecked := 0
+	var lastDurableCheckpoint ir.Position
+	var lastCheckpointLastpk int64 = -1
+	for _, cp := range captured {
+		decoded, ok, derr := decodeVStreamPos(cp.pos)
+		if derr != nil || !ok {
+			capMu.Unlock()
+			t.Fatalf("checkpoint position failed to decode: ok=%v err=%v", ok, derr)
+		}
+		last, found := widgetsLastPK(t, decoded)
+		if !found {
+			continue // post-completion / cursorless checkpoint
+		}
+		checkpointsChecked++
+		// The breadcrumb's lastpk must be <= an id we have durably written.
+		// Because vtgate's COPY scan is PK-ordered for this PK table, lastpk
+		// <= maxDurableID is equivalent to "all rows this position covers are
+		// durable". The persisted cursor must never exceed the durable max.
+		if last > maxDurableID {
+			capMu.Unlock()
+			t.Fatalf("INVARIANT VIOLATION (silent-loss bug): persisted checkpoint lastpk id=%d exceeds the max durably-written id=%d (durableRows-at-write=%d) — the checkpoint is AHEAD of the durable frontier; a hard crash here would resume past un-written rows",
+				last, maxDurableID, cp.durableAtWrite)
+		}
+		lastDurableCheckpoint = cp.pos
+		lastCheckpointLastpk = last
+	}
+	capMu.Unlock()
+
+	if checkpointsChecked == 0 {
+		_ = stream.Close()
+		t.Fatalf("captured no mid-COPY checkpoint carrying a cursor across the prefix drain — tighten the cadence / enlarge prefixN until the pump emits an intermediate LASTPK")
+	}
+	if lastCheckpointLastpk < 0 {
+		_ = stream.Close()
+		t.Fatalf("no durable-cursor checkpoint to resume from")
+	}
+	t.Logf("hard-crash sim: durable max id=%d; last persisted checkpoint lastpk id=%d (<= durable max — invariant holds across %d checkpoints)",
+		maxDurableID, lastCheckpointLastpk, checkpointsChecked)
+
+	// ---- SIGKILL: drop the in-flight buffer + tear the stream down. Only
+	// the last persisted checkpoint survives.
+	_ = stream.Close()
+
+	// ---- Phase 2: resume from the last persisted (durable-safe) checkpoint
+	// and run to completion. The union of {durably-written prefix} +
+	// {resumed tail} must cover the FULL source — zero silently-skipped gap.
+	resumeCtx, resumeCancel := context.WithTimeout(ctx, 6*time.Minute)
+	defer resumeCancel()
+
+	resumed, err := eng.OpenSnapshotStreamFromPosition(resumeCtx, sluiceDSN, lastDurableCheckpoint)
+	if err != nil {
+		t.Fatalf("OpenSnapshotStreamFromPosition (hard-crash resume): %v", err)
+	}
+	defer func() { _ = resumed.Close() }()
+
+	resumedRowsCh, err := resumed.Rows.ReadRows(resumeCtx, widgetsTable)
+	if err != nil {
+		t.Fatalf("resumed ReadRows: %v", err)
+	}
+	for row := range resumedRowsCh {
+		id, _ := row["id"].(int64)
+		durablyWritten[id] = true // union with the durable prefix
+	}
+	if err := resumed.Rows.Err(); err != nil {
+		t.Fatalf("resumed bulk COPY ended with an error: %v", err)
+	}
+
+	// Zero loss: every source id must be present in the union. Before the
+	// fix, the gap (durable max, checkpoint lastpk] would be missing from
+	// BOTH the durable prefix (never written) AND the resumed tail (resume
+	// starts past the checkpoint) — silent loss.
+	missing := 0
+	var firstMissing int64
+	for id := int64(1); id <= int64(totalRows); id++ {
+		if !durablyWritten[id] {
+			if missing == 0 {
+				firstMissing = id
+			}
+			missing++
+		}
+	}
+	if missing > 0 {
+		t.Fatalf("SILENT LOSS: %d source rows missing from {durable prefix} ∪ {resumed tail} (first missing id=%d) — the resume skipped a gap the checkpoint had advanced past",
+			missing, firstMissing)
 	}
 }
 

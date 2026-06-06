@@ -244,6 +244,68 @@ type CopyCheckpointer interface {
 	SetCopyCheckpoint(fn CopyCheckpointFunc)
 }
 
+// CopyDurableProgressFunc reports that the cold-start bulk-copy writer
+// has just DURABLY committed flushedRows more rows to the target
+// (v0.99.9). It is a per-flush DELTA, not a running total: the sink sums
+// the deltas into the global durable frontier, which sidesteps any
+// per-table reset (the writer is invoked once per table and its internal
+// counters restart each call, but the deltas accumulate cleanly across
+// tables).
+//
+// The reader-side checkpointer uses the summed frontier to keep the
+// persisted COPY checkpoint at-or-behind the durable-write frontier: a
+// snapshot reader whose checkpoint position advances as rows are RECEIVED
+// from the source (the VStream pump's TablePKs cursor) would, on a hard
+// crash, leave the cursor AHEAD of the rows actually written to the
+// target — and resume would silently skip the un-written gap.
+//
+// The reporter is the bulk-copy writer (the only component that knows
+// when a batch is durable: after each successful flush). The sink is the
+// snapshot reader, which gates its checkpoint on the running sum.
+// flushedRows is always > 0 (an empty flush reports nothing).
+type CopyDurableProgressFunc func(flushedRows int64)
+
+// CopyDurableProgressReporter is the OPTIONAL surface a bulk-copy
+// [RowWriter] implements to report its durable-write frontier to the
+// snapshot reader's checkpoint (v0.99.9). After each successful flush the
+// writer invokes the supplied [CopyDurableProgressFunc] with the
+// cumulative count of rows it has durably committed for the table being
+// copied.
+//
+// The pipeline wires the reporter to the reader's
+// [CopyDurableProgressSink] on the cold-start COPY path so the persisted
+// checkpoint never runs ahead of the durable rows (the invariant that
+// makes a hard-crash resume gapless). A nil func disables reporting.
+// Writers whose target has no resumable mid-COPY reader on the source
+// (every non-VStream path) can implement it harmlessly — the sink is
+// simply not wired when the reader doesn't carry a cursor.
+type CopyDurableProgressReporter interface {
+	SetCopyDurableProgress(report CopyDurableProgressFunc)
+}
+
+// CopyDurableProgressSink is the OPTIONAL surface a snapshot [RowReader]
+// implements to RECEIVE the bulk-copy writer's durable-write frontier
+// (v0.99.9). The reader EXPOSES [AdvanceDurableRows]; the pipeline hands
+// that method to a [CopyDurableProgressReporter] writer so the reader's
+// [CopyCheckpointer] persists a position no further ahead than the last
+// durably-written row.
+//
+// Only a reader whose checkpoint position can outrun the durable frontier
+// needs it — today the VStream cold-start reader, whose TablePKs cursor
+// advances as rows are received into a bounded in-flight buffer ahead of
+// the consumer. Readers without that lead (PG, vanilla MySQL) don't
+// implement it.
+//
+// AdvanceDurableRows is the [CopyDurableProgressFunc] the writer calls;
+// the data flows writer → reader, so the reader is the callback target,
+// not a setter. flushedRows is the per-flush delta the sink adds to its
+// running durable frontier.
+type CopyDurableProgressSink interface {
+	RowReader
+
+	AdvanceDurableRows(flushedRows int64)
+}
+
 // ApplyExecTimeoutSetter is the optional surface a [ChangeApplier]
 // can implement to accept a per-statement deadline for every
 // tx.ExecContext on the apply path. The pipeline orchestrator

@@ -96,6 +96,14 @@ func (w *RowWriter) writeBatchedIdempotent(ctx context.Context, table *ir.Table,
 		if _, err := w.db.ExecContext(ctx, query, args...); err != nil {
 			return fmt.Errorf("mysql: idempotent insert into %q (%d rows): %w", table.Name, len(batch), err)
 		}
+		// Report the durable-write delta (v0.99.9): this batch is now
+		// committed (autocommit Exec), so the snapshot reader's checkpoint
+		// may advance to cover these rows. Reported AFTER the Exec
+		// succeeds — never before — so the watermark stays at-or-behind
+		// the durable frontier.
+		if w.copyDurableProgress != nil {
+			w.copyDurableProgress(int64(len(batch)))
+		}
 		batch = batch[:0]
 		batchBytes = 0
 		return nil

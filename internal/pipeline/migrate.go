@@ -945,6 +945,24 @@ func runBulkCopyWithOpts(
 	if icr, ok := rows.(ir.IdempotentCopyReader); ok {
 		needsIdempotent = icr.CopyNeedsIdempotentWriter()
 	}
+	// Durable-write watermark (v0.99.9): when the snapshot reader carries
+	// a resumable mid-COPY cursor (CopyDurableProgressSink) AND the writer
+	// can report durable flushes (CopyDurableProgressReporter), connect
+	// them so the reader's COPY checkpoint never advances past the rows
+	// the writer has durably committed. Without this, the VStream pump's
+	// TablePKs cursor — which advances as rows are RECEIVED into the
+	// bounded in-flight buffer, ahead of the consumer — could persist a
+	// checkpoint ahead of the durable frontier; a hard crash would then
+	// resume past un-written rows (silent loss). The writer reports
+	// per-flush deltas; the sink sums them. Wired only on the idempotent
+	// cold-start path (the only one with a resumable VStream source).
+	if needsIdempotent {
+		if sink, ok := rows.(ir.CopyDurableProgressSink); ok {
+			if reporter, ok := rw.(ir.CopyDurableProgressReporter); ok {
+				reporter.SetCopyDurableProgress(sink.AdvanceDurableRows)
+			}
+		}
+	}
 	for _, table := range schema.Tables {
 		copyFn := copyTable
 		if needsIdempotent {

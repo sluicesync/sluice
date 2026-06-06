@@ -244,6 +244,92 @@ func (w *pkOnlyIdempotentWriter) WriteRowsIdempotent(_ context.Context, _ *ir.Ta
 	return nil
 }
 
+// durableSinkReader is a fake snapshot reader implementing the v0.99.9
+// CopyDurableProgressSink (plus IdempotentCopyReader so the cold-start
+// routes idempotent). It records the durable deltas the writer reports
+// through the pipeline wiring.
+type durableSinkReader struct {
+	*pumpReader
+	mu        sync.Mutex
+	deltas    []int64
+	totalRows int64
+}
+
+func (r *durableSinkReader) CopyNeedsIdempotentWriter() bool { return true }
+
+func (r *durableSinkReader) AdvanceDurableRows(flushedRows int64) {
+	r.mu.Lock()
+	r.deltas = append(r.deltas, flushedRows)
+	r.totalRows += flushedRows
+	r.mu.Unlock()
+}
+
+// durableReporterWriter is a fake idempotent writer implementing the
+// v0.99.9 CopyDurableProgressReporter. It calls the wired report func
+// after "flushing" the rows it consumed, exactly as the real batch
+// writers do after a successful Exec.
+type durableReporterWriter struct {
+	report ir.CopyDurableProgressFunc
+}
+
+func (w *durableReporterWriter) WriteRows(_ context.Context, _ *ir.Table, rows <-chan ir.Row) error {
+	for range rows {
+	}
+	return nil
+}
+
+func (w *durableReporterWriter) WriteRowsIdempotent(_ context.Context, _ *ir.Table, rows <-chan ir.Row) error {
+	n := int64(0)
+	for range rows {
+		n++
+	}
+	if w.report != nil && n > 0 {
+		w.report(n) // single "flush" ack for the whole table
+	}
+	return nil
+}
+
+func (w *durableReporterWriter) HandlesNoPKIdempotentCopy() bool { return true }
+
+func (w *durableReporterWriter) SetCopyDurableProgress(report ir.CopyDurableProgressFunc) {
+	w.report = report
+}
+
+// TestRunBulkCopy_WiresDurableProgressSinkToReporter pins the v0.99.9
+// pipeline wiring: when the snapshot reader carries a resumable cursor
+// (CopyDurableProgressSink) and the writer can report durable flushes
+// (CopyDurableProgressReporter), runBulkCopyWithOpts connects them so the
+// writer's per-flush deltas reach the reader's durable watermark. Without
+// this connection the checkpoint would have no durable frontier to gate
+// on and would fall back to persisting the received frontier (the
+// silent-loss bug).
+func TestRunBulkCopy_WiresDurableProgressSinkToReporter(t *testing.T) {
+	const nRows = 17
+	reader := &durableSinkReader{pumpReader: newPumpReader(nRows)}
+	writer := &durableReporterWriter{}
+	schema := &ir.Schema{Tables: []*ir.Table{{
+		Name:       "users",
+		Columns:    []*ir.Column{{Name: "id"}},
+		PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "id"}}},
+	}}}
+
+	// SkipSchemaApply short-circuits every schema-writer phase, so a nil
+	// SchemaWriter is never dereferenced — the test exercises only the
+	// row-copy + durable-progress wiring.
+	if err := runBulkCopyWithOpts(context.Background(), schema, reader, nil, writer, bulkCopyOpts{SkipSchemaApply: true}); err != nil {
+		t.Fatalf("runBulkCopyWithOpts: %v", err)
+	}
+
+	reader.mu.Lock()
+	total := reader.totalRows
+	deltas := append([]int64(nil), reader.deltas...)
+	reader.mu.Unlock()
+
+	if total != nRows {
+		t.Fatalf("durable sink received %d rows via deltas %v; want %d — writer reporter not wired to reader sink", total, deltas, nRows)
+	}
+}
+
 // TestCopyTableColdStartIdempotent_RoutesThroughUpsert pins Bug 125's
 // orchestration half: copyTableColdStartIdempotent must use the
 // writer's idempotent (upsert) path, NOT plain WriteRows.

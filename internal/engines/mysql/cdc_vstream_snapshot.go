@@ -403,8 +403,45 @@ type vstreamSnapshotStream struct {
 	// needed — single goroutine), seeded at copyPump start.
 	rowsSinceCheckpoint int
 
+	// --- durable-write watermark (v0.99.9 silent-loss fix) ---
+	//
+	// The Phase-B checkpoint must persist a position no further ahead than
+	// the rows the consumer has DURABLY written to the target. The pump's
+	// currentVgtid (the TablePKs cursor) advances as rows are RECEIVED into
+	// the bounded in-flight buffer, which runs AHEAD of the consumer by up
+	// to maxBufferBytes. Persisting that received frontier meant a hard
+	// crash (buffer lost, cursor advanced) left resume restarting past
+	// un-written rows — silent loss. We now key the checkpoint on the
+	// durable frontier instead.
+	//
+	// enqueuedRows is the monotonic count of rows appended to rowBuffer
+	// over the whole COPY (pump-owned, mutated under mu in
+	// enqueueRowLocked). durableRows is the cumulative count the bulk-copy
+	// writer reports DURABLY committed via AdvanceDurableRows (consumer-
+	// driven, mutated under mu). Vitess emits a VGTID *after* the rows it
+	// covers, so when a VGTID arrives every row enqueued so far is covered
+	// by it: we record a breadcrumb {enqueuedRows, encodedPosition}. A
+	// breadcrumb is safe to checkpoint once durableRows >= its rowsCovered
+	// (all the rows it covers are on the target). maybeCheckpoint persists
+	// the highest such breadcrumb instead of currentVgtid. Guarded by mu.
+	enqueuedRows   int64
+	durableRows    int64
+	posBreadcrumbs []posBreadcrumb
+
 	mu  sync.Mutex
 	err error
+}
+
+// posBreadcrumb pairs an encoded COPY-resume position with the
+// monotonic enqueued-row count it covers (v0.99.9). Vitess emits the
+// VGTID carrying a position AFTER the rows that position resumes past,
+// so rowsCovered = the pump's enqueuedRows at the moment the VGTID
+// arrived: every one of those rows is at-or-before pos in the COPY scan.
+// The position is checkpoint-safe once the consumer has durably written
+// rowsCovered rows.
+type posBreadcrumb struct {
+	rowsCovered int64
+	pos         ir.Position
 }
 
 // broadcast wakes every goroutine parked on cond. Guarded against a
@@ -652,36 +689,82 @@ func (s *vstreamSnapshotStream) maybeCheckpoint(ctx context.Context, lastCheckpo
 		s.mu.Unlock()
 		return lastCheckpoint
 	}
-	// Snapshot the position under the lock; encode while holding it is
-	// cheap and keeps the read consistent with the pump's own writes.
-	if len(s.currentVgtid) == 0 {
-		// No VGTID observed yet (no cursor to persist); reset the row
-		// counter so we don't spin re-evaluating the same empty state.
-		s.rowsSinceCheckpoint = 0
+	// The persisted position is the DURABLE-WRITE watermark (v0.99.9), NOT
+	// the pump's received frontier (currentVgtid). durableCheckpointLocked
+	// returns the highest breadcrumb position the consumer has fully
+	// written to the target, or ok=false when no breadcrumb is durable yet
+	// (the consumer is still catching up to the first VGTID boundary). In
+	// the not-yet-durable case we leave the cadence counter alone so the
+	// next tick re-evaluates as soon as the consumer advances — persisting
+	// nothing is strictly safe (an absent/older checkpoint only ever
+	// resumes EARLIER, which the idempotent COPY writer absorbs).
+	pos, ok := s.durableCheckpointLocked()
+	if !ok {
 		s.mu.Unlock()
-		return time.Now()
-	}
-	pos, err := encodeVStreamPos(s.currentVgtid)
-	if err != nil {
-		// A position that won't encode is the same terminal condition
-		// finishCopy guards against; surface it loudly rather than
-		// silently skipping every checkpoint.
-		s.rowsSinceCheckpoint = 0
-		s.mu.Unlock()
-		s.failCopy(fmt.Errorf("mysql/vstream: snapshot: checkpoint: encode position: %w", err))
+		// Reset the wall-clock anchor but NOT rowsSinceCheckpoint: the
+		// rows are buffered, just not yet durable, so the N-rows trigger
+		// should stay armed until a durable breadcrumb exists.
 		return time.Now()
 	}
 	s.rowsSinceCheckpoint = 0
 	s.mu.Unlock()
 
 	if err := fn(ctx, pos); err != nil {
-		// Non-fatal: log and keep copying. The cursor is re-attempted on
-		// the next cadence tick, and COPY_COMPLETED persists the final
-		// position regardless.
+		// Non-fatal: log and keep copying. The watermark is re-attempted
+		// on the next cadence tick, and the final fully-durable position
+		// is persisted at COPY_COMPLETED regardless.
 		slog.WarnContext(ctx, "mysql/vstream: snapshot: COPY checkpoint write failed; continuing",
 			slog.String("error", err.Error()))
 	}
 	return time.Now()
+}
+
+// recordBreadcrumbLocked appends a durable-watermark breadcrumb pairing
+// the just-arrived position with the rows it covers (the pump's current
+// enqueuedRows). Caller holds s.mu. Consecutive VGTIDs that arrive with
+// NO intervening rows (enqueuedRows unchanged) collapse onto the same
+// rowsCovered: keep the latest (further-along) position for that count
+// by overwriting the tail rather than appending a redundant entry.
+func (s *vstreamSnapshotStream) recordBreadcrumbLocked(pos ir.Position) {
+	n := len(s.posBreadcrumbs)
+	if n > 0 && s.posBreadcrumbs[n-1].rowsCovered == s.enqueuedRows {
+		s.posBreadcrumbs[n-1].pos = pos
+		return
+	}
+	s.posBreadcrumbs = append(s.posBreadcrumbs, posBreadcrumb{
+		rowsCovered: s.enqueuedRows,
+		pos:         pos,
+	})
+}
+
+// durableCheckpointLocked returns the highest breadcrumb position whose
+// covered rows are all durably written (rowsCovered <= durableRows),
+// pruning every breadcrumb at-or-below it (a later checkpoint only ever
+// moves forward). ok is false when no breadcrumb is durable yet. Caller
+// holds s.mu.
+//
+// This is the load-bearing invariant of the v0.99.9 fix: the returned
+// position is <= the position of the last row the consumer durably
+// committed, so a crash + resume restarts at-or-before the last durable
+// row and the idempotent COPY writer absorbs the re-copied overlap.
+func (s *vstreamSnapshotStream) durableCheckpointLocked() (ir.Position, bool) {
+	idx := -1
+	for i := range s.posBreadcrumbs {
+		if s.posBreadcrumbs[i].rowsCovered <= s.durableRows {
+			idx = i
+			continue
+		}
+		break
+	}
+	if idx < 0 {
+		return ir.Position{}, false
+	}
+	pos := s.posBreadcrumbs[idx].pos
+	// Prune the consumed prefix (keep everything past idx). Copy the tail
+	// down so the backing array's head entries are GC-eligible.
+	rest := s.posBreadcrumbs[idx+1:]
+	s.posBreadcrumbs = append(s.posBreadcrumbs[:0], rest...)
+	return pos, true
 }
 
 // finishCopy records the final snapshot position onto the stream and
@@ -785,6 +868,23 @@ func (s *vstreamSnapshotStream) dispatchCopyEventLocked(ev *binlogdata.VEvent) (
 			return false, err
 		}
 		s.currentVgtid = next
+		// Record a durable-watermark breadcrumb (v0.99.9): Vitess emits
+		// this VGTID AFTER every row it resumes past, so all
+		// s.enqueuedRows rows buffered so far are covered by this
+		// position. The checkpoint may persist it once the consumer has
+		// durably written that many rows. encodeVStreamPos can fail only
+		// on a position that won't marshal — the same terminal condition
+		// finishCopy guards; surface it loudly rather than silently
+		// dropping the breadcrumb (which would let the checkpoint fall
+		// back to an older, but still durable, position — safe, yet a
+		// won't-encode position is a real fault worth surfacing).
+		if len(s.currentVgtid) > 0 {
+			pos, err := encodeVStreamPos(s.currentVgtid)
+			if err != nil {
+				return false, fmt.Errorf("mysql/vstream: snapshot: encode checkpoint breadcrumb: %w", err)
+			}
+			s.recordBreadcrumbLocked(pos)
+		}
 		return false, nil
 
 	case binlogdata.VEventType_COPY_COMPLETED:
@@ -955,6 +1055,10 @@ func (s *vstreamSnapshotStream) enqueueRowLocked(tableName string, row ir.Row) e
 	// (ADR-0072 Phase B). The pump reads + resets this under mu in
 	// maybeCheckpoint between Recv iterations.
 	s.rowsSinceCheckpoint++
+	// Advance the monotonic enqueued-row counter (v0.99.9): the next
+	// VGTID breadcrumb records this value as the rows it covers, and the
+	// durable watermark gates the checkpoint on it.
+	s.enqueuedRows++
 	s.broadcast()
 	return nil
 }
@@ -1338,6 +1442,30 @@ func (r *vstreamSnapshotRows) SetCopyCheckpoint(fn ir.CopyCheckpointFunc) {
 	s := r.snap
 	s.mu.Lock()
 	s.checkpointFn = fn
+	s.mu.Unlock()
+}
+
+// AdvanceDurableRows implements [ir.CopyDurableProgressSink] (v0.99.9).
+// The pipeline hands this method to the bulk-copy writer as its
+// [ir.CopyDurableProgressFunc]; the writer calls it after each successful
+// flush with the per-flush DELTA of rows it has DURABLY committed. The
+// sink sums the deltas into the global durable frontier (durableRows).
+// The checkpoint (maybeCheckpoint) persists only breadcrumbs whose
+// covered rows are at-or-below that frontier, so the resume cursor can
+// never run ahead of the durably-written rows.
+//
+// Per-flush deltas sum cleanly across tables — the writer is invoked once
+// per table and its internal counters restart each call, but the running
+// sum here is global, matching the pump's global enqueuedRows
+// breadcrumbs. A non-positive delta is ignored (the writer never reports
+// an empty flush, but the guard keeps the frontier monotonic regardless).
+func (r *vstreamSnapshotRows) AdvanceDurableRows(flushedRows int64) {
+	if flushedRows <= 0 {
+		return
+	}
+	s := r.snap
+	s.mu.Lock()
+	s.durableRows += flushedRows
 	s.mu.Unlock()
 }
 

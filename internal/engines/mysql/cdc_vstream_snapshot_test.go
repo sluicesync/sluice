@@ -593,10 +593,48 @@ func TestSameVgtid_IgnoresTablePKs(t *testing.T) {
 	}
 }
 
-// TestVStreamSnapshot_CheckpointCadence pins ADR-0072 Phase B: the COPY
-// pump persists the resume cursor on the bounded N-rows cadence, the
-// persisted position carries the per-shard TablePKs, and the row counter
-// resets after each checkpoint.
+// seedBreadcrumb is a white-box helper mirroring what the pump does when
+// a VGTID arrives: it records a durable-watermark breadcrumb pairing the
+// encoded position (carrying a TablePKs cursor) with the rows enqueued so
+// far. enqueuedRows is the monotonic count the breadcrumb covers.
+func seedBreadcrumb(t *testing.T, s *vstreamSnapshotStream, gtid string, enqueuedRows int64) {
+	t.Helper()
+	cur := []shardGtid{{
+		Keyspace: "main", Shard: "-", Gtid: gtid,
+		TablePKs: []encodedTablePK{{TableName: "users", Lastpk: "QkFTRTY0"}},
+	}}
+	pos, err := encodeVStreamPos(cur)
+	if err != nil {
+		t.Fatalf("encodeVStreamPos(%s): %v", gtid, err)
+	}
+	s.currentVgtid = cur
+	s.enqueuedRows = enqueuedRows
+	s.recordBreadcrumbLocked(pos)
+}
+
+// gtidOf decodes a checkpointed position back to its single shard GTID.
+func gtidOf(t *testing.T, pos ir.Position) string {
+	t.Helper()
+	decoded, ok, err := decodeVStreamPos(pos)
+	if err != nil || !ok {
+		t.Fatalf("position did not decode: ok=%v err=%v", ok, err)
+	}
+	if len(decoded) != 1 {
+		t.Fatalf("position has %d shards; want 1", len(decoded))
+	}
+	if len(decoded[0].TablePKs) != 1 || decoded[0].TablePKs[0].TableName != "users" {
+		t.Fatalf("checkpointed position lost the TablePKs cursor: %+v", decoded)
+	}
+	return decoded[0].Gtid
+}
+
+// TestVStreamSnapshot_CheckpointCadence pins ADR-0072 Phase B + the
+// v0.99.9 durable-write watermark: the COPY pump persists the resume
+// cursor on the bounded N-rows cadence, the persisted position carries
+// the per-shard TablePKs, the row counter resets after each checkpoint,
+// and — the load-bearing v0.99.9 invariant — the persisted position never
+// runs ahead of the durably-written frontier (it persists the DURABLE
+// breadcrumb, not the latest RECEIVED VGTID).
 func TestVStreamSnapshot_CheckpointCadence(t *testing.T) {
 	s := newTestSnapshotStream()
 	s.checkpointRows = 3
@@ -608,41 +646,99 @@ func TestVStreamSnapshot_CheckpointCadence(t *testing.T) {
 		return nil
 	}
 
-	// Seed a cursor (the VGTID the pump would have captured), including a
-	// TablePKs entry so we can prove the checkpoint carries it.
-	s.currentVgtid = []shardGtid{{
-		Keyspace: "main", Shard: "-", Gtid: "MySQL56/abc:1-50",
-		TablePKs: []encodedTablePK{{TableName: "users", Lastpk: "QkFTRTY0"}},
-	}}
+	// The pump has RECEIVED two VGTID boundaries: position g50 covers the
+	// first 3 rows, g100 covers the first 6. But the consumer has durably
+	// written NOTHING yet.
+	seedBreadcrumb(t, s, "MySQL56/abc:1-50", 3)
+	seedBreadcrumb(t, s, "MySQL56/abc:1-100", 6)
 
 	last := time.Now()
 
-	// Below the row threshold: no checkpoint.
-	s.rowsSinceCheckpoint = 2
+	// Cadence is due (rowsSinceCheckpoint >= 3) but NO row is durable yet:
+	// the checkpoint must persist NOTHING rather than the received cursor.
+	s.rowsSinceCheckpoint = 3
 	last = s.maybeCheckpoint(context.Background(), last)
 	if len(got) != 0 {
-		t.Fatalf("checkpoint fired below threshold: %d writes", len(got))
-	}
-	if s.rowsSinceCheckpoint != 2 {
-		t.Errorf("rowsSinceCheckpoint mutated below threshold: %d", s.rowsSinceCheckpoint)
+		t.Fatalf("checkpoint persisted a position ahead of the durable frontier (durableRows=0): %d writes", len(got))
 	}
 
-	// At the threshold: one checkpoint, counter resets, position carries
-	// the TablePKs cursor.
-	s.rowsSinceCheckpoint = 3
-	_ = s.maybeCheckpoint(context.Background(), last)
+	// Consumer durably writes the first 3 rows. Now g50 (covers 3) is safe
+	// but g100 (covers 6) is NOT. The checkpoint must persist g50, never
+	// g100.
+	(&vstreamSnapshotRows{snap: s}).AdvanceDurableRows(3)
+	last = s.maybeCheckpoint(context.Background(), last)
 	if len(got) != 1 {
-		t.Fatalf("expected exactly one checkpoint at threshold; got %d", len(got))
+		t.Fatalf("expected exactly one checkpoint once 3 rows are durable; got %d", len(got))
+	}
+	if g := gtidOf(t, got[0]); g != "MySQL56/abc:1-50" {
+		t.Fatalf("checkpoint persisted %q; want the DURABLE breadcrumb MySQL56/abc:1-50 (not the received frontier MySQL56/abc:1-100)", g)
 	}
 	if s.rowsSinceCheckpoint != 0 {
-		t.Errorf("rowsSinceCheckpoint not reset after checkpoint: %d", s.rowsSinceCheckpoint)
+		t.Errorf("rowsSinceCheckpoint not reset after a durable checkpoint: %d", s.rowsSinceCheckpoint)
 	}
-	decoded, ok, err := decodeVStreamPos(got[0])
-	if err != nil || !ok {
-		t.Fatalf("checkpointed position did not decode: ok=%v err=%v", ok, err)
+
+	// Consumer durably writes the remaining 3 (6 total). Now g100 is safe.
+	(&vstreamSnapshotRows{snap: s}).AdvanceDurableRows(3)
+	s.rowsSinceCheckpoint = 3
+	_ = s.maybeCheckpoint(context.Background(), last)
+	if len(got) != 2 {
+		t.Fatalf("expected a second checkpoint once all 6 rows are durable; got %d", len(got))
 	}
-	if len(decoded) != 1 || len(decoded[0].TablePKs) != 1 || decoded[0].TablePKs[0].TableName != "users" {
-		t.Errorf("checkpointed position lost the TablePKs cursor: %+v", decoded)
+	if g := gtidOf(t, got[1]); g != "MySQL56/abc:1-100" {
+		t.Errorf("second checkpoint persisted %q; want MySQL56/abc:1-100 (the now-durable frontier)", g)
+	}
+}
+
+// TestVStreamSnapshot_CheckpointNeverAheadOfDurable is the structural
+// v0.99.9 pin: across an interleaving of received-VGTID boundaries and
+// durable-write acks, EVERY persisted checkpoint position is one whose
+// covered rows are all durably written — the checkpoint is never ahead of
+// the durable frontier. This is the exact condition the real-PlanetScale
+// repro caught (persisted cursor 5.1M ids ahead of the durable MAX).
+func TestVStreamSnapshot_CheckpointNeverAheadOfDurable(t *testing.T) {
+	s := newTestSnapshotStream()
+	s.checkpointRows = 1 // checkpoint at every opportunity
+	s.checkpointInterval = time.Hour
+
+	// breadcrumbCoverage maps a GTID to the durable-row count required for
+	// it to be safe (its rowsCovered). Any persisted GTID must have
+	// coverage <= the durable frontier at persist time.
+	coverage := map[string]int64{
+		"MySQL56/abc:1-10": 10,
+		"MySQL56/abc:1-20": 20,
+		"MySQL56/abc:1-30": 30,
+		"MySQL56/abc:1-40": 40,
+	}
+
+	durable := int64(0)
+	s.checkpointFn = func(_ context.Context, pos ir.Position) error {
+		g := gtidOf(t, pos)
+		cov, known := coverage[g]
+		if !known {
+			t.Fatalf("checkpoint persisted an unknown position %q", g)
+		}
+		if cov > durable {
+			t.Fatalf("INVARIANT VIOLATION: persisted %q (covers %d rows) but only %d rows are durable — checkpoint ahead of durable frontier", g, cov, durable)
+		}
+		return nil
+	}
+
+	// Pump receives all four VGTID boundaries up front (rows buffered, not
+	// yet durable) — the worst case where the received frontier is far
+	// ahead of the consumer.
+	seedBreadcrumb(t, s, "MySQL56/abc:1-10", 10)
+	seedBreadcrumb(t, s, "MySQL56/abc:1-20", 20)
+	seedBreadcrumb(t, s, "MySQL56/abc:1-30", 30)
+	seedBreadcrumb(t, s, "MySQL56/abc:1-40", 40)
+
+	last := time.Now()
+	// Advance the durable frontier in irregular steps, checkpointing after
+	// each. The checkpointFn assertion enforces the invariant every time.
+	for _, step := range []int64{5, 10, 8, 7, 10} { // cumulative: 5,15,23,30,40
+		(&vstreamSnapshotRows{snap: s}).AdvanceDurableRows(step)
+		durable += step
+		s.rowsSinceCheckpoint = 1
+		last = s.maybeCheckpoint(context.Background(), last)
 	}
 }
 
