@@ -106,10 +106,28 @@ func (Engine) OpenSchemaWriter(ctx context.Context, dsn string) (ir.SchemaWriter
 // OpenRowReader returns a [RowReader] bound to the database identified
 // by dsn. The caller is responsible for closing the returned RowReader
 // (via its Close method) to release the underlying connection pool.
-func (Engine) OpenRowReader(ctx context.Context, dsn string) (ir.RowReader, error) {
+func (e Engine) OpenRowReader(ctx context.Context, dsn string) (ir.RowReader, error) {
 	cfg, err := parseDSN(dsn)
 	if err != nil {
 		return nil, err
+	}
+	// Vitess/PlanetScale (CDCVStream flavors): the bulk-read is a single
+	// streaming SELECT (buildSelect → one QueryContext, no transaction), and
+	// vtgate's default OLTP workload caps a result set at ~100k rows. A no-PK
+	// source table can't be PK-chunked, so its full-scan copy is one big
+	// SELECT — which the cap would silently truncate at 100k. `workload=olap`
+	// lifts the cap and streams, exactly the pscale-dumper convention (see
+	// flavor.go). Applied ONLY to the reader's session — never the
+	// writer/applier, which DO use transactions that OLAP mode forbids. Not a
+	// valid var on vanilla MySQL, so it is gated on the VStream flavor. A
+	// DSN-supplied `workload` wins (operator override).
+	if e.Capabilities().CDC == ir.CDCVStream {
+		if cfg.Params == nil {
+			cfg.Params = map[string]string{}
+		}
+		if _, ok := cfg.Params["workload"]; !ok {
+			cfg.Params["workload"] = "'olap'"
+		}
 	}
 	db, err := openDB(ctx, cfg)
 	if err != nil {
