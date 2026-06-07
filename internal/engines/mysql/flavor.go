@@ -33,6 +33,16 @@ type Flavor uint8
 const (
 	FlavorVanilla Flavor = iota
 	FlavorPlanetScale
+	// FlavorVitess is self-hosted Vitess (etcd + vtctld + vtgate +
+	// vttablets you run yourself), as opposed to PlanetScale's hosted
+	// Vitess. It shares PlanetScale's VStream engine code and
+	// Capabilities verbatim (ADR-0073(a): start identical, diverge only
+	// on evidence); the only differences are the registered name and the
+	// self-hosted connection defaults applied at OpenCDCReader
+	// (vstream_transport=plaintext, vstream_auth=none) so
+	// `--source-driver=vitess` works against a typical self-hosted vtgate
+	// without hand-set vstream_* params.
+	FlavorVitess
 )
 
 // String returns the engine-registry name used to look this flavor
@@ -43,13 +53,34 @@ func (f Flavor) String() string {
 		return "mysql"
 	case FlavorPlanetScale:
 		return "planetscale"
+	case FlavorVitess:
+		return "vitess"
 	default:
 		return fmt.Sprintf("flavor(%d)", uint8(f))
 	}
 }
 
+// usesVStream reports whether this flavor's snapshot + CDC path is Vitess
+// VStream (vtgate gRPC) rather than the MySQL binlog. Both the hosted
+// PlanetScale flavor and the self-hosted vitess flavor are VStream-backed.
+// Every VStream-vs-binlog branch gates on this rather than
+// `== FlavorPlanetScale` so a new VStream flavor is correct everywhere by
+// construction (the per-path dispatch, the resumable-COPY cursor, the
+// `_vt_*` exclusion, the backup-snapshot path).
+func (f Flavor) usesVStream() bool {
+	return f == FlavorPlanetScale || f == FlavorVitess
+}
+
 // capabilities returns the capability declaration for this flavor.
 func (f Flavor) capabilities() ir.Capabilities {
+	// The self-hosted vitess flavor shares PlanetScale's capabilities
+	// verbatim (ADR-0073(a): start identical, diverge only on evidence).
+	// Keeping it out of the map and aliasing here guarantees zero drift;
+	// when a real capability difference surfaces, give vitess its own map
+	// entry and drop this alias.
+	if f == FlavorVitess {
+		f = FlavorPlanetScale
+	}
 	if c, ok := flavorCapabilities[f]; ok {
 		return c
 	}

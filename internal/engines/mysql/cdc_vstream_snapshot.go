@@ -120,6 +120,13 @@ func (e Engine) openVStreamSnapshotStreamFrom(ctx context.Context, dsn string, s
 	if cfg.DBName == "" {
 		return nil, errors.New("mysql/vstream: snapshot: DSN has no database name (vitess keyspace expected)")
 	}
+	// Self-hosted vitess flavor: default transport=plaintext / auth=none so
+	// the cold-start snapshot (and the backup snapshot, which funnels through
+	// here) dials a self-hosted vtgate without hand-set vstream_* params —
+	// the same defaults openVStreamReader applies to the CDC path. Covers
+	// every VStream dial entry point; the hosted planetscale flavor is left
+	// on its secure defaults.
+	applyVStreamFlavorDefaults(cfg, e.Flavor)
 
 	endpoint, err := vstreamEndpointFromDSN(cfg)
 	if err != nil {

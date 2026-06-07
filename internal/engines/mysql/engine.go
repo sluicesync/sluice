@@ -183,8 +183,8 @@ func (e Engine) OpenCDCReader(ctx context.Context, dsn string) (ir.CDCReader, er
 	if e.Capabilities().CDC == ir.CDCNone {
 		return nil, fmt.Errorf("%s: CDC not supported by this flavor: %w", e.Name(), ErrNotImplemented)
 	}
-	if e.Flavor == FlavorPlanetScale {
-		return openVStreamReader(ctx, dsn)
+	if e.Flavor.usesVStream() {
+		return openVStreamReader(ctx, dsn, e.Flavor)
 	}
 	// FlavorVanilla and any future binlog-based flavor land here.
 	return openBinlogCDCReader(ctx, dsn)
@@ -315,7 +315,7 @@ func (Engine) OpenChangeApplier(ctx context.Context, dsn string) (ir.ChangeAppli
 // usually a debugging exercise) override by passing
 // `--include-table` explicitly, which short-circuits the default.
 func (e Engine) DefaultExcludePatterns(dsn string) []string {
-	if e.Flavor == FlavorPlanetScale {
+	if e.Flavor.usesVStream() {
 		return []string{"_vt_*"}
 	}
 	if isPlanetScaleMySQLHost(dsn) {
@@ -367,4 +367,5 @@ func isPlanetScaleMySQLHost(dsn string) bool {
 func init() {
 	engines.Register(Engine{Flavor: FlavorVanilla})
 	engines.Register(Engine{Flavor: FlavorPlanetScale})
+	engines.Register(Engine{Flavor: FlavorVitess})
 }

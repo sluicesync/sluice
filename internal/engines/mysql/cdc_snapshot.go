@@ -35,7 +35,7 @@ func (e Engine) OpenSnapshotStream(ctx context.Context, dsn string) (*ir.Snapsho
 	if e.Capabilities().CDC == ir.CDCNone {
 		return nil, fmt.Errorf("%s: snapshot+CDC not supported by this flavor: %w", e.Name(), ErrNotImplemented)
 	}
-	if e.Flavor == FlavorPlanetScale {
+	if e.Flavor.usesVStream() {
 		return e.openVStreamSnapshotStream(ctx, dsn)
 	}
 	// FlavorVanilla and any future binlog-based flavor land here.
@@ -59,7 +59,7 @@ func (e Engine) OpenSnapshotStreamForTables(ctx context.Context, dsn string, tab
 	if e.Capabilities().CDC == ir.CDCNone {
 		return nil, fmt.Errorf("%s: snapshot+CDC not supported by this flavor: %w", e.Name(), ErrNotImplemented)
 	}
-	if e.Flavor == FlavorPlanetScale {
+	if e.Flavor.usesVStream() {
 		return e.openVStreamSnapshotStreamFrom(ctx, dsn, nil, tables)
 	}
 	// Vanilla/binlog flavor: its snapshot RowReader already reads per-table,
@@ -100,9 +100,9 @@ func (e Engine) OpenSnapshotStreamFromPosition(ctx context.Context, dsn string, 
 	if e.Capabilities().CDC == ir.CDCNone {
 		return nil, fmt.Errorf("%s: snapshot+CDC not supported by this flavor: %w", e.Name(), ErrNotImplemented)
 	}
-	if e.Flavor != FlavorPlanetScale {
+	if !e.Flavor.usesVStream() {
 		return nil, fmt.Errorf(
-			"%s: resumable cold-start COPY is only implemented for the planetscale (VStream) flavor: %w",
+			"%s: resumable cold-start COPY is only implemented for the VStream flavors (planetscale / vitess): %w",
 			e.Name(), ErrNotImplemented,
 		)
 	}
@@ -151,7 +151,7 @@ func (e Engine) OpenSnapshotStreamFromPosition(ctx context.Context, dsn string, 
 // decoder will surface the decode error loudly) — this discriminator is a
 // routing hint, not a validation gate.
 func (e Engine) PositionCarriesCopyCursor(from ir.Position) bool {
-	if e.Flavor != FlavorPlanetScale {
+	if !e.Flavor.usesVStream() {
 		return false
 	}
 	start, ok, err := decodeVStreamPos(from)

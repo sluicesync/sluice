@@ -225,7 +225,32 @@ const vstreamChannelBuffer = 256
 // position. Reshard handling is detected via the typed
 // [ErrShardLayoutChanged] error — see [vstreamCDCReader.dispatch]
 // for the contract.
-func openVStreamReader(ctx context.Context, dsn string) (ir.CDCReader, error) {
+// applyVStreamFlavorDefaults injects the self-hosted connection defaults
+// for the vitess flavor. A typical self-hosted vtgate speaks plaintext
+// gRPC with no auth, whereas PlanetScale's hosted vtgate is tls + basic;
+// so `--source-driver=vitess` defaults vstream_transport=plaintext and
+// vstream_auth=none, letting it connect without hand-set vstream_* params.
+// The hosted planetscale flavor (and any other) is left untouched and keeps
+// its secure defaults. A DSN-supplied value always wins (the guards only
+// fill an absent key). vstream_endpoint is deliberately NOT defaulted —
+// there is no universal self-hosted vtgate gRPC port, so the operator
+// supplies it.
+func applyVStreamFlavorDefaults(cfg *gomysql.Config, flavor Flavor) {
+	if flavor != FlavorVitess {
+		return
+	}
+	if cfg.Params == nil {
+		cfg.Params = map[string]string{}
+	}
+	if _, ok := cfg.Params["vstream_transport"]; !ok {
+		cfg.Params["vstream_transport"] = "plaintext"
+	}
+	if _, ok := cfg.Params["vstream_auth"]; !ok {
+		cfg.Params["vstream_auth"] = "none"
+	}
+}
+
+func openVStreamReader(ctx context.Context, dsn string, flavor Flavor) (ir.CDCReader, error) {
 	cfg, err := parseDSN(dsn)
 	if err != nil {
 		return nil, err
@@ -233,6 +258,7 @@ func openVStreamReader(ctx context.Context, dsn string) (ir.CDCReader, error) {
 	if cfg.DBName == "" {
 		return nil, errors.New("mysql/vstream: DSN has no database name (vitess keyspace expected)")
 	}
+	applyVStreamFlavorDefaults(cfg, flavor)
 
 	endpoint, err := vstreamEndpointFromDSN(cfg)
 	if err != nil {

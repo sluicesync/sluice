@@ -16,6 +16,7 @@ func TestFlavorString(t *testing.T) {
 	}{
 		{FlavorVanilla, "mysql"},
 		{FlavorPlanetScale, "planetscale"},
+		{FlavorVitess, "vitess"},
 	}
 	for _, c := range cases {
 		if got := c.f.String(); got != c.want {
@@ -38,7 +39,7 @@ func TestEngineZeroValueIsVanilla(t *testing.T) {
 }
 
 func TestEachFlavorHasCapabilities(t *testing.T) {
-	flavors := []Flavor{FlavorVanilla, FlavorPlanetScale}
+	flavors := []Flavor{FlavorVanilla, FlavorPlanetScale, FlavorVitess}
 	for _, f := range flavors {
 		caps := f.capabilities()
 		// A flavor with no SchemaScope and BulkLoadNone is almost
@@ -91,6 +92,31 @@ func TestPlanetScaleCapabilities(t *testing.T) {
 	}
 	if caps.SupportedTypes.Has(ir.ExtGeometry) {
 		t.Error("planetscale should not declare Geometry support (excluded for conservatism)")
+	}
+}
+
+// TestVitessCapabilities pins that the self-hosted vitess flavor shares
+// PlanetScale's capabilities verbatim (ADR-0073(a): start identical,
+// diverge only on evidence) and that it is VStream-backed. When a real
+// capability difference is introduced, this test is the place that should
+// change deliberately rather than by accident.
+func TestVitessCapabilities(t *testing.T) {
+	v := FlavorVitess.capabilities()
+	p := FlavorPlanetScale.capabilities()
+	if v != p {
+		t.Errorf("vitess capabilities != planetscale capabilities; vitess must mirror planetscale until evidence diverges\n vitess=%+v\n  pscale=%+v", v, p)
+	}
+	if v.CDC != ir.CDCVStream {
+		t.Errorf("vitess CDC = %v; want VStream", v.CDC)
+	}
+	if !FlavorVitess.usesVStream() {
+		t.Error("FlavorVitess.usesVStream() = false; want true (vitess is a VStream flavor)")
+	}
+	if !FlavorPlanetScale.usesVStream() {
+		t.Error("FlavorPlanetScale.usesVStream() = false; want true")
+	}
+	if FlavorVanilla.usesVStream() {
+		t.Error("FlavorVanilla.usesVStream() = true; want false (binlog flavor)")
 	}
 }
 

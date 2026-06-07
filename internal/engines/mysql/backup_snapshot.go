@@ -51,7 +51,7 @@ func (e Engine) OpenBackupSnapshot(ctx context.Context, dsn, slotName string) (*
 	if e.Capabilities().CDC == ir.CDCNone {
 		return nil, fmt.Errorf("%s: backup snapshot not supported by this flavor: %w", e.Name(), ErrNotImplemented)
 	}
-	if e.Flavor == FlavorPlanetScale {
+	if e.Flavor.usesVStream() {
 		// Whole-keyspace COPY (nil tables). The table-scoped variant lives
 		// on OpenBackupSnapshotForTables (ir.TableScopedBackupSnapshotOpener).
 		return e.openBackupSnapshotVStream(ctx, dsn, nil)
@@ -156,7 +156,7 @@ func (e Engine) OpenBackupSnapshotForTables(ctx context.Context, dsn, slotName s
 	if e.Capabilities().CDC == ir.CDCNone {
 		return nil, fmt.Errorf("%s: backup snapshot not supported by this flavor: %w", e.Name(), ErrNotImplemented)
 	}
-	if e.Flavor == FlavorPlanetScale {
+	if e.Flavor.usesVStream() {
 		return e.openBackupSnapshotVStream(ctx, dsn, tables)
 	}
 	// Vanilla/binlog flavor: its snapshot RowReader already reads per-table,
