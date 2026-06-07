@@ -203,7 +203,7 @@ func TestADR0046_ZeroLossMultiSegmentRotation_PG(t *testing.T) {
 // >COMMIT recovery resolution, and a correct restore afterward
 // (ADR-0036-style permanent proof-of-falsification).
 func TestADR0046_CrashInjectionMatrix_PG(t *testing.T) {
-	edges := []struct {
+	baseEdges := []struct {
 		name       string
 		postCommit bool // true => >COMMIT (new segment authoritative)
 	}{
@@ -212,6 +212,17 @@ func TestADR0046_CrashInjectionMatrix_PG(t *testing.T) {
 		{"post-bulkcopy", false},
 		{"pre-commit-write", false},
 		{"post-commit-write", true},
+	}
+	// TEMP PHASE-A (REMOVE): repeat every edge 4x so a single CI run gets
+	// ~20 independent crash attempts — the mis-stitch is ~1/3 per attempt
+	// and never repros locally, so we stress it to capture forensics in
+	// one run instead of churning single-job reruns.
+	var edges []struct {
+		name       string
+		postCommit bool
+	}
+	for rep := 0; rep < 4; rep++ {
+		edges = append(edges, baseEdges...)
 	}
 	for _, edge := range edges {
 		edge := edge
