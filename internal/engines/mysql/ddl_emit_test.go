@@ -1121,7 +1121,7 @@ func TestEmitAddForeignKey(t *testing.T) {
 		OnDelete:          ir.FKActionCascade,
 		OnUpdate:          ir.FKActionRestrict,
 	}
-	got, err := emitAddForeignKey("posts", fk)
+	got, err := emitAddForeignKey("", "posts", fk)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1132,26 +1132,43 @@ func TestEmitAddForeignKey(t *testing.T) {
 }
 
 // TestEmitAddForeignKey_QualifiedReferencedSchema pins the ADR-0074
-// multi-database fan-out behaviour: a FK carrying a ReferencedSchema
-// (the referenced table's database) qualifies the REFERENCES clause as
-// `db`.`table`, so a cross-database FK resolves against the same-named
-// target database rather than the current one. The empty-schema case is
-// the byte-identical single-database form pinned by TestEmitAddForeignKey.
+// multi-database fan-out REFERENCES-qualification CLASS: the reference is
+// qualified `db`.`table` ONLY for a genuine cross-namespace FK (referenced
+// schema differs from the child's own schema); a same-namespace or
+// single-database FK stays bare. The same-namespace case is load-bearing:
+// a cross-engine PG→MySQL migrate sets ReferencedSchema to the PG source
+// schema on every table, and the flat MySQL target has no such database —
+// qualifying it was the Phase-1a Error-1824 regression.
 func TestEmitAddForeignKey_QualifiedReferencedSchema(t *testing.T) {
-	fk := &ir.ForeignKey{
-		Name:              "orders_region_fk",
-		Columns:           []string{"region_id"},
-		ReferencedSchema:  "shared_db",
-		ReferencedTable:   "regions",
-		ReferencedColumns: []string{"id"},
+	cases := []struct {
+		name        string
+		childSchema string
+		refSchema   string
+		wantRef     string
+	}{
+		{"cross-namespace qualifies (MySQL multi-db)", "app_db", "shared_db", "`shared_db`.`regions`"},
+		{"same-namespace stays bare (PG->MySQL flatten)", "public", "public", "`regions`"},
+		{"single-database stays bare", "", "", "`regions`"},
 	}
-	got, err := emitAddForeignKey("orders", fk)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	want := "ALTER TABLE `orders` ADD CONSTRAINT `orders_region_fk` FOREIGN KEY (`region_id`) REFERENCES `shared_db`.`regions` (`id`);"
-	if got != want {
-		t.Errorf("\n got  %q\n want %q", got, want)
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			fk := &ir.ForeignKey{
+				Name:              "orders_region_fk",
+				Columns:           []string{"region_id"},
+				ReferencedSchema:  c.refSchema,
+				ReferencedTable:   "regions",
+				ReferencedColumns: []string{"id"},
+			}
+			got, err := emitAddForeignKey(c.childSchema, "orders", fk)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			want := "ALTER TABLE `orders` ADD CONSTRAINT `orders_region_fk` FOREIGN KEY (`region_id`) REFERENCES " + c.wantRef + " (`id`);"
+			if got != want {
+				t.Errorf("\n got  %q\n want %q", got, want)
+			}
+		})
 	}
 }
 
@@ -1166,7 +1183,7 @@ func TestEmitAddForeignKey_NoActions(t *testing.T) {
 		OnDelete:          ir.FKActionNoAction,
 		OnUpdate:          ir.FKActionNoAction,
 	}
-	got, err := emitAddForeignKey("child", fk)
+	got, err := emitAddForeignKey("", "child", fk)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1186,7 +1203,7 @@ func TestEmitAddForeignKey_SelfReferential(t *testing.T) {
 		ReferencedColumns: []string{"id"},
 		OnDelete:          ir.FKActionSetNull,
 	}
-	got, err := emitAddForeignKey("employees", fk)
+	got, err := emitAddForeignKey("", "employees", fk)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1207,7 +1224,7 @@ func TestEmitAddForeignKey_CompositePK(t *testing.T) {
 		OnDelete:          ir.FKActionCascade,
 		OnUpdate:          ir.FKActionCascade,
 	}
-	got, err := emitAddForeignKey("orders", fk)
+	got, err := emitAddForeignKey("", "orders", fk)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1241,7 +1258,7 @@ func TestEmitAddForeignKey_AllOnDeleteActions(t *testing.T) {
 				ReferencedColumns: []string{"id"},
 				OnDelete:          c.action,
 			}
-			got, err := emitAddForeignKey("child", fk)
+			got, err := emitAddForeignKey("", "child", fk)
 			if err != nil {
 				t.Fatalf("emitAddForeignKey: %v", err)
 			}

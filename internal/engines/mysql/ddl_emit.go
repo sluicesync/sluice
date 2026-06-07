@@ -1101,7 +1101,7 @@ func emitCreateIndex(tableName string, idx *ir.Index) (string, error) {
 
 // emitAddForeignKey renders an ALTER TABLE ... ADD CONSTRAINT
 // statement for a foreign key on the given child table.
-func emitAddForeignKey(childTable string, fk *ir.ForeignKey) (string, error) {
+func emitAddForeignKey(childSchema, childTable string, fk *ir.ForeignKey) (string, error) {
 	if fk == nil {
 		return "", fmt.Errorf("mysql: emitAddForeignKey: fk is nil")
 	}
@@ -1124,15 +1124,21 @@ func emitAddForeignKey(childTable string, fk *ir.ForeignKey) (string, error) {
 	sb.WriteString(" FOREIGN KEY ")
 	sb.WriteString(emitColumnList(fk.Columns))
 	sb.WriteString(" REFERENCES ")
-	// Multi-database fan-out (ADR-0074): a cross-database FK carries the
-	// referenced table's database in ReferencedSchema, so qualify the
-	// reference as `db`.`table`. In single-database mode ReferencedSchema
-	// is always empty (the flat-scope carve-out) and the reference stays
-	// bare — byte-identical to the pre-ADR-0074 output. MySQL resolves a
-	// bare reference against the current database, which is correct only
-	// when the referent lives in the same database; the qualifier is what
-	// lets a same-named target database in another namespace resolve.
-	if fk.ReferencedSchema != "" {
+	// Multi-database fan-out (ADR-0074): qualify the reference as
+	// `db`.`table` ONLY for a genuine CROSS-namespace FK — one whose
+	// referenced schema differs from the child table's own schema. That is
+	// exactly the MySQL→MySQL multi-database cross-database case (child in
+	// `app_db`, referent in `shared_db`), where the qualifier lets the
+	// sibling target database resolve. A same-namespace FK stays bare
+	// (MySQL resolves it against the current database), which covers BOTH:
+	//   - single-database MySQL (both schemas empty), and
+	//   - cross-engine PG→MySQL, where the PG source sets ReferencedSchema
+	//     to its source schema and every table shares it — the flat MySQL
+	//     target has no such database, so the reference MUST stay bare.
+	//     (Qualifying on ReferencedSchema alone was a Phase-1a regression:
+	//     it emitted `REFERENCES `public`.`t`` against a flat MySQL target,
+	//     MySQL Error 1824.)
+	if fk.ReferencedSchema != "" && fk.ReferencedSchema != childSchema {
 		sb.WriteString(quoteIdent(fk.ReferencedSchema))
 		sb.WriteByte('.')
 	}

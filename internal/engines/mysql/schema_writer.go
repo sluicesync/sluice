@@ -364,7 +364,7 @@ func (w *SchemaWriter) CreateConstraints(ctx context.Context, s *ir.Schema) erro
 			if exists {
 				continue
 			}
-			stmt, err := emitAddForeignKey(table.Name, fk)
+			stmt, err := emitAddForeignKey(table.Schema, table.Name, fk)
 			if err != nil {
 				return err
 			}
@@ -503,7 +503,7 @@ func (w *SchemaWriter) PreviewDDL(_ context.Context, s *ir.Schema) ([]ir.DDLStat
 			return fks[i].Name < fks[j].Name
 		})
 		for _, fk := range fks {
-			stmt, err := emitAddForeignKey(table.Name, fk)
+			stmt, err := emitAddForeignKey(table.Schema, table.Name, fk)
 			if err != nil {
 				return nil, err
 			}
