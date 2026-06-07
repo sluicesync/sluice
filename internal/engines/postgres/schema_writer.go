@@ -551,6 +551,13 @@ func (w *SchemaWriter) buildOneIndex(ctx context.Context, conn *sql.Conn, job in
 	if err != nil {
 		return err
 	}
+	// Idempotent resume (Bug 131): a resume re-entering phase=indexes over a
+	// table indexed in a prior run — or a partially-completed index phase —
+	// would otherwise fail with "relation already exists". Promote to the
+	// IF NOT EXISTS form (PG 9.5+), the same wrap CreateShapeIndex uses; the
+	// first " INDEX " token is the keyword to follow. sluice owns these
+	// tables, so a same-named index is the one it built.
+	stmt = strings.Replace(stmt, "INDEX ", "INDEX IF NOT EXISTS ", 1)
 	if _, err := conn.ExecContext(ctx, stmt); err != nil {
 		return fmt.Errorf("postgres: create index %q on %q: %w", job.idx.Name, job.tableName, err)
 	}

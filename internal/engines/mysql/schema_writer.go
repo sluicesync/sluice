@@ -294,6 +294,20 @@ func (w *SchemaWriter) CreateIndexes(ctx context.Context, s *ir.Schema) error {
 			if _, skipped := skip[idx.Name]; skipped {
 				continue
 			}
+			// Idempotent resume (Bug 131): a prior run that already created
+			// this index — a resume re-entering phase=indexes after a
+			// table-scope change, or a partially-completed index phase —
+			// would otherwise fail with MySQL 1061 "Duplicate key name".
+			// MySQL has no CREATE INDEX IF NOT EXISTS, so detect-then-skip
+			// (the same pattern the ADR-0054 shape applier uses). sluice
+			// owns these tables, so a same-named index is the one it built.
+			exists, err := indexExists(ctx, w.db, w.schema, table.Name, idx.Name)
+			if err != nil {
+				return fmt.Errorf("mysql: probe index %q on %q: %w", idx.Name, table.Name, err)
+			}
+			if exists {
+				continue
+			}
 			stmt, err := emitCreateIndex(table.Name, idx)
 			if err != nil {
 				return err
