@@ -194,7 +194,26 @@ func (e Engine) OpenCDCReader(ctx context.Context, dsn string) (ir.CDCReader, er
 // Lifted out of OpenCDCReader so the flavor dispatch above stays
 // readable.
 func openBinlogCDCReader(ctx context.Context, dsn string) (ir.CDCReader, error) {
-	cfg, err := parseDSN(dsn)
+	return openBinlogCDCReaderShared(ctx, dsn, false)
+}
+
+// openBinlogServerCDCReader opens a binlog CDC reader against a *server*
+// DSN whose database component may be empty (ADR-0074 Phase 1b.2
+// multi-database fan-out). The binlog is server-wide, so the reader's
+// bound `schema` stays empty and the selected-database set is supplied
+// separately via [CDCReader.SetCDCDatabaseScope]. The single-database
+// path keeps the strict [parseDSN] (database required); this sibling
+// relaxes only that precondition.
+func openBinlogServerCDCReader(ctx context.Context, dsn string) (ir.CDCReader, error) {
+	return openBinlogCDCReaderShared(ctx, dsn, true)
+}
+
+func openBinlogCDCReaderShared(ctx context.Context, dsn string, serverScope bool) (ir.CDCReader, error) {
+	parse := parseDSN
+	if serverScope {
+		parse = parseServerDSN
+	}
+	cfg, err := parse(dsn)
 	if err != nil {
 		return nil, err
 	}

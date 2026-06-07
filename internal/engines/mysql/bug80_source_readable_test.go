@@ -47,7 +47,7 @@ func TestBuildSelect_OmitsSluiceInjected(t *testing.T) {
 			{Name: "source_shard_id", Type: ir.Varchar{Length: 64}, SluiceInjected: true},
 		},
 	}
-	got := buildSelect(table)
+	got := buildSelect(table, false)
 	if !strings.Contains(got, "`id`") || !strings.Contains(got, "`name`") {
 		t.Errorf("buildSelect did not include real source columns: %s", got)
 	}

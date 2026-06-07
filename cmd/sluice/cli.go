@@ -565,6 +565,10 @@ type SyncStartCmd struct {
 	IncludeTable []string `help:"Only stream these tables (comma-separated, repeatable). Glob patterns allowed (e.g. 'audit_*'). Mutually exclusive with --exclude-table." sep:"," placeholder:"TABLE"`
 	ExcludeTable []string `help:"Stream every table except these (comma-separated, repeatable). Glob patterns allowed. Mutually exclusive with --include-table." sep:"," placeholder:"TABLE"`
 
+	IncludeDatabase []string `help:"Multi-database fan-out (ADR-0074, MySQL source): cold-start + CDC-sync ONLY these source databases (comma-separated, repeatable). Glob patterns allowed (e.g. 'app_*'). Each source database routes to a same-named target namespace (PG schema / MySQL database). The selected databases are cold-started under ONE spanning consistent snapshot, then the single server-wide binlog CDC stream is routed per-change to each namespace. Mutually exclusive with --exclude-database. When any database-scope flag is set, the source DSN's database is optional (it's a server connection). System databases (information_schema, performance_schema, mysql, sys) are always excluded. Warm-resume across N databases is not yet supported (ADR-0074 Phase 1b.3)." sep:"," placeholder:"DATABASE"`
+	ExcludeDatabase []string `help:"Multi-database fan-out (ADR-0074, MySQL source): cold-start + CDC-sync every non-system source database EXCEPT these (comma-separated, repeatable). Glob patterns allowed. Mutually exclusive with --include-database." sep:"," placeholder:"DATABASE"`
+	AllDatabases    bool     `help:"Multi-database fan-out (ADR-0074, MySQL source): cold-start + CDC-sync every non-system database on the source server, each to a same-named target namespace. Mutually exclusive with --include-database / --exclude-database."`
+
 	IncludeView []string `help:"Only create these views on the target during cold-start (comma-separated, repeatable). Glob patterns allowed. Mutually exclusive with --exclude-view. Views are not replicated by CDC; this filter only affects the cold-start schema-apply phase." sep:"," placeholder:"VIEW"`
 	ExcludeView []string `help:"Skip these views during cold-start schema-apply (comma-separated, repeatable). Glob patterns allowed. Mutually exclusive with --include-view." sep:"," placeholder:"VIEW"`
 	SkipViews   bool     `help:"Skip view creation entirely on cold-start. Views are not replicated by CDC, so this only affects the initial schema-apply step."`
@@ -807,6 +811,17 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 	if len(s.IncludeView) > 0 && len(s.ExcludeView) > 0 {
 		return errors.New("--include-view and --exclude-view are mutually exclusive")
 	}
+	// Multi-database fan-out (ADR-0074 Phase 1b.2).
+	if len(s.IncludeDatabase) > 0 && len(s.ExcludeDatabase) > 0 {
+		return errors.New("--include-database and --exclude-database are mutually exclusive")
+	}
+	if s.AllDatabases && (len(s.IncludeDatabase) > 0 || len(s.ExcludeDatabase) > 0) {
+		return errors.New("--all-databases is mutually exclusive with --include-database / --exclude-database")
+	}
+	databaseFilter, err := pipeline.NewDatabaseFilter(s.IncludeDatabase, s.ExcludeDatabase)
+	if err != nil {
+		return err
+	}
 
 	// ADR-0038 pin-down 3: the three retry dials carry hard ranges.
 	// Out-of-range values are rejected at startup (loud, before any
@@ -931,6 +946,8 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 		Filter:                 filter,
 		ViewFilter:             viewFilter,
 		SkipViews:              s.SkipViews,
+		DatabaseFilter:         databaseFilter,
+		AllDatabases:           s.AllDatabases,
 		ForceColdStart:         s.ForceColdStart,
 		ResetTargetData:        s.ResetTargetData,
 		RestartFromScratch:     s.RestartFromScratch,

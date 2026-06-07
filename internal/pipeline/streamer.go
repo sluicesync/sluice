@@ -513,6 +513,23 @@ type Streamer struct {
 	// loud-failure behaviour for extension-owned types.
 	EnabledPGExtensions []string
 
+	// DatabaseFilter selects which source databases participate in a
+	// multi-database fan-out `sync start` (ADR-0074 Phase 1b.2). A
+	// non-empty Include/Exclude — or AllDatabases — switches the Streamer
+	// into multi-database mode: it cold-starts the selected databases
+	// under ONE spanning consistent snapshot, copies each to a same-named
+	// target namespace, then routes the single server-wide binlog CDC
+	// stream per-change to the right namespace. Empty (the zero value)
+	// with AllDatabases=false is the default — byte-identical
+	// single-database behaviour. Mirrors [Migrator.DatabaseFilter].
+	DatabaseFilter DatabaseFilter
+
+	// AllDatabases is the `--all-databases` convenience: stream every
+	// non-system database on the source server. Mutually exclusive with a
+	// non-empty DatabaseFilter; switches the Streamer into multi-database
+	// mode (see DatabaseFilter). Mirrors [Migrator.AllDatabases].
+	AllDatabases bool
+
 	// InjectShardColumn is the ADR-0048 Shape A discriminator-column
 	// spec the per-shard streamer opts into via
 	// `--inject-shard-column NAME=VALUE`. When [ShardColumnSpec.Engaged]
@@ -1042,6 +1059,15 @@ func (s *Streamer) runOnce(ctx context.Context) error {
 	if err := s.validate(); err != nil {
 		return err
 	}
+	// ADR-0074 Phase 1b.2: surface multi-database flag-combo errors
+	// before any I/O (mutually-exclusive scope flags, unsupported
+	// combinations). The per-database snapshot + routing wiring lives in
+	// coldStartMultiDatabase, reached via the dispatch switch below.
+	if s.multiDatabaseMode() {
+		if err := s.validateMultiDatabaseStream(); err != nil {
+			return err
+		}
+	}
 
 	// Reset the per-attempt source-error handle (GitHub #19). Each
 	// iteration opens a fresh CDC reader; carrying a stale handle
@@ -1190,6 +1216,19 @@ func (s *Streamer) runOnce(ctx context.Context) error {
 	// returning ok=false (same as "no row").
 	if !s.DryRun && !s.SchemaAlreadyApplied {
 		if err := applier.EnsureControlTable(ctx); err != nil {
+			if s.multiDatabaseMode() {
+				// ADR-0074 Phase 1b.2: in multi-database mode the target
+				// DSN must name a "home" database for the per-target
+				// sluice_cdc_state control table (user data routes to
+				// per-source-database namespaces under it). A server-only
+				// target DSN with no database has nowhere to put the
+				// control table — name one and the per-source databases
+				// still route correctly.
+				return wrapWithHint(PhaseSchemaApply, fmt.Errorf(
+					"pipeline: ensure control table (multi-database mode): the target DSN must name a database "+
+						"to host sluice_cdc_state (user data still routes to per-source-database namespaces): %w", err,
+				))
+			}
 			return wrapWithHint(PhaseSchemaApply, fmt.Errorf("pipeline: ensure control table: %w", err))
 		}
 	}
@@ -1428,6 +1467,25 @@ func (s *Streamer) runOnce(ctx context.Context) error {
 		}
 	}
 	switch {
+	case s.multiDatabaseMode():
+		// ADR-0074 Phase 1b.2: multi-database fan-out cold-start. ONE
+		// spanning consistent snapshot across the selected databases →
+		// per-namespace bulk-copy → single server-wide binlog CDC routed
+		// per-change. Warm-resume (a persisted position) is Phase 1b.3 —
+		// refuse loudly here so an operator restart doesn't silently
+		// re-cold-start (and re-copy) across N databases. --reset-target-
+		// data / --restart-from-scratch are the explicit re-cold-start
+		// overrides; they bypass the refusal (handled inside
+		// coldStartMultiDatabase, which ignores the persisted position).
+		if found && !s.ResetTargetData && !s.RestartFromScratch {
+			return fmt.Errorf(
+				"pipeline: multi-database sync resume (a persisted position for stream %q exists) is not "+
+					"supported yet (ADR-0074 Phase 1b.3); re-run with --restart-from-scratch to force a fresh "+
+					"multi-database cold-start, or --reset-target-data to drop and re-copy",
+				streamID,
+			)
+		}
+		changes, stop, err = s.coldStartMultiDatabase(streamCtx, lsnTracker, applier, streamID)
 	case s.ResetTargetData:
 		changes, stop, err = s.coldStart(streamCtx, lsnTracker, applier, streamID, ir.Position{})
 	case s.RestartFromScratch:

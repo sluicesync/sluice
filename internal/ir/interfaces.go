@@ -1352,6 +1352,48 @@ type MultiDatabaseRouter interface {
 	SetMultiDatabaseRouting(enabled bool)
 }
 
+// MultiDatabaseSnapshotOpener is the OPTIONAL engine surface for opening
+// the SINGLE consistent snapshot spanning N databases that a
+// multi-database `sync start` cold-start needs (ADR-0074 Phase 1b.2).
+//
+// The crux of multi-database CDC is consistency: the server-wide binlog
+// position handed to the CDC reader MUST be captured at ONE consistent
+// cut across ALL selected databases, or the snapshot → CDC handoff loses
+// or double-applies rows. Phase 1a's `migrate` re-opened a single-database
+// snapshot per database (N independent positions); that is acceptable for
+// a one-time copy but WRONG for the CDC handoff. This surface fixes it:
+// the engine opens ONE snapshot transaction (`START TRANSACTION WITH
+// CONSISTENT SNAPSHOT` on MySQL) and captures ONE binlog position inside
+// it, then returns a [SnapshotStream] whose:
+//
+//   - Rows reads every selected database's tables FROM THAT ONE snapshot
+//     transaction. The reader qualifies each SELECT by the table's
+//     [Table.Schema] (the source database), so a single pinned connection
+//     reads across all N databases at the same REPEATABLE-READ view. The
+//     orchestrator stamps [Table.Schema] via [MultiDatabaseScoper] before
+//     bulk-copy, so the reader knows which database each table lives in.
+//   - Changes is the SERVER-WIDE CDC reader (the binlog is server-wide),
+//     ready to be scoped to the selected database set via
+//     [CDCDatabaseScoper.SetCDCDatabaseScope] and streamed from Position.
+//   - Position is the single binlog coordinate captured inside the
+//     spanning snapshot transaction — the gapless, idempotent handoff
+//     point for every selected database's CDC.
+//
+// databases is the concrete, already-resolved selected database set (the
+// orchestrator has applied the include/exclude globs and excluded the
+// system databases). It must be non-empty. The dsn is a *server*
+// connection — its database component may be empty (the operator drove a
+// multi-database run without naming one).
+//
+// Only engines whose CDC stream is server-wide (MySQL binlog) implement
+// it. The PlanetScale/Vitess VStream flavor is keyspace-scoped, so a
+// spanning multi-keyspace snapshot is a distinct N-stream design
+// (ADR-0074 §6 / Phase 1c) and is NOT implemented here — the engine
+// returns [ErrNotImplemented]-shaped errors for the VStream flavors.
+type MultiDatabaseSnapshotOpener interface {
+	OpenMultiDatabaseSnapshotStream(ctx context.Context, dsn string, databases []string) (*SnapshotStream, error)
+}
+
 // ExtensionAware is the optional engine-side surface for engines that
 // can pass through column types defined by extensions (ADR-0032). PG
 // implements; MySQL does not (no extension concept in the same shape).

@@ -47,9 +47,37 @@ func TestBuildSelect(t *testing.T) {
 			{Name: "weird`name", Type: ir.Boolean{}},
 		},
 	}
-	got := buildSelect(table)
+	got := buildSelect(table, false)
 	want := "SELECT `id`, `email`, `weird``name` FROM `users`"
 	if got != want {
 		t.Errorf("buildSelect:\n got  %q\n want %q", got, want)
+	}
+}
+
+// TestBuildSelect_QualifyBySchema pins the ADR-0074 Phase 1b.2 spanning-
+// snapshot variant: when qualifyBySchema is true and Table.Schema is set,
+// the FROM clause is `db`.`table`; with Schema empty it stays unqualified
+// (so a server-DSN reader with no per-table database doesn't emit a bare
+// dot-qualified ref).
+func TestBuildSelect_QualifyBySchema(t *testing.T) {
+	table := &ir.Table{
+		Name:   "users",
+		Schema: "app_db",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}},
+		},
+	}
+	got := buildSelect(table, true)
+	want := "SELECT `id` FROM `app_db`.`users`"
+	if got != want {
+		t.Errorf("buildSelect qualify:\n got  %q\n want %q", got, want)
+	}
+
+	// Empty Schema + qualifyBySchema true → unqualified (defensive).
+	table.Schema = ""
+	got = buildSelect(table, true)
+	want = "SELECT `id` FROM `users`"
+	if got != want {
+		t.Errorf("buildSelect qualify empty-schema:\n got  %q\n want %q", got, want)
 	}
 }

@@ -161,11 +161,84 @@ func (e Engine) PositionCarriesCopyCursor(from ir.Position) bool {
 	return anyTablePKsPresent(start)
 }
 
+// OpenMultiDatabaseSnapshotStream implements
+// [ir.MultiDatabaseSnapshotOpener] (ADR-0074 Phase 1b.2): it opens the
+// SINGLE consistent snapshot spanning all selected databases that a
+// multi-database `sync start` cold-start needs.
+//
+// The implementation is the binlog-snapshot path with ONE difference
+// from [openBinlogSnapshotStream]: the connection is a *server* DSN (no
+// default database — the operator drove a multi-database run) and the
+// returned RowReader has [RowReader.qualifyBySchema] set, so its single
+// pinned connection reads `db`.`table` across every selected database at
+// the one REPEATABLE-READ view. The single binlog position captured
+// inside the spanning transaction is the gapless handoff point for every
+// selected database's CDC — that is the consistency crux the ADR §5
+// "single spanning consistent snapshot" mandates, and the divergence
+// Phase 1a flagged for 1b to fix.
+//
+// databases must be non-empty (the orchestrator resolves + validates the
+// set before calling). It is accepted for symmetry with the IR surface
+// and to log the spanned set; the snapshot transaction itself spans the
+// whole server (REPEATABLE READ is server-wide), and the orchestrator
+// scopes the per-table reads via [ir.Table.Schema].
+//
+// The VStream flavors (PlanetScale / Vitess) are keyspace-scoped, so a
+// spanning multi-keyspace snapshot is the distinct N-stream Phase 1c
+// design — this method refuses them loudly rather than silently
+// capturing a single-keyspace position that would gap the others.
+func (e Engine) OpenMultiDatabaseSnapshotStream(ctx context.Context, dsn string, databases []string) (*ir.SnapshotStream, error) {
+	if e.Capabilities().CDC == ir.CDCNone {
+		return nil, fmt.Errorf("%s: snapshot+CDC not supported by this flavor: %w", e.Name(), ErrNotImplemented)
+	}
+	if e.Flavor.usesVStream() {
+		return nil, fmt.Errorf(
+			"%s: multi-database spanning snapshot is not supported on the VStream flavors (planetscale / vitess); "+
+				"VStream is keyspace-scoped and multi-keyspace CDC is a distinct N-stream design (ADR-0074 Phase 1c): %w",
+			e.Name(), ErrNotImplemented,
+		)
+	}
+	if len(databases) == 0 {
+		return nil, errors.New("mysql: multi-database snapshot: no databases selected")
+	}
+	slog.InfoContext(ctx, "mysql: opening single spanning consistent snapshot across selected databases",
+		slog.Int("database_count", len(databases)),
+		slog.Any("databases", databases))
+	return e.openBinlogSnapshotStreamShared(ctx, dsn, true)
+}
+
 // openBinlogSnapshotStream is the FlavorVanilla path of
 // [Engine.OpenSnapshotStream]. Lifted out of OpenSnapshotStream so
 // the flavor dispatch stays readable.
 func (e Engine) openBinlogSnapshotStream(ctx context.Context, dsn string) (*ir.SnapshotStream, error) {
-	cfg, err := parseDSN(dsn)
+	return e.openBinlogSnapshotStreamShared(ctx, dsn, false)
+}
+
+// openBinlogSnapshotStreamShared is the shared body of the
+// single-database and multi-database binlog snapshot openers. The two
+// differ in exactly two parameters, both ADR-0074 Phase 1b.2:
+//
+//   - the DSN is parsed via [parseServerDSN] (database-optional) when
+//     multiDatabase is true, so a server connection with no default
+//     database is accepted; single-database keeps the strict [parseDSN]
+//     that requires a database (byte-identical back-compat).
+//   - the returned RowReader sets [RowReader.qualifyBySchema] = multiDatabase
+//     so the spanning snapshot's reads are `db`.`table`-qualified.
+//
+// Everything else — the ONE pinned connection, the ONE
+// `START TRANSACTION WITH CONSISTENT SNAPSHOT`, the ONE binlog position
+// captured inside it, the server-wide CDC reader, and the release/close
+// lifecycle — is identical. That identity is the point: the
+// multi-database snapshot is the SAME single-transaction / single-position
+// capture, just spanning N databases.
+func (e Engine) openBinlogSnapshotStreamShared(ctx context.Context, dsn string, multiDatabase bool) (*ir.SnapshotStream, error) {
+	parse := parseDSN
+	if multiDatabase {
+		// Multi-database mode: the source DSN is a server connection
+		// whose database component may legitimately be empty (ADR-0074).
+		parse = parseServerDSN
+	}
+	cfg, err := parse(dsn)
 	if err != nil {
 		return nil, err
 	}
@@ -224,8 +297,11 @@ func (e Engine) openBinlogSnapshotStream(ctx context.Context, dsn string) (*ir.S
 
 	// The CDC reader uses an entirely separate connection and protocol
 	// (binlog dump). Construct it with the same DSN so it parses the
-	// host/port/credentials itself.
-	cdcReader, err := e.OpenCDCReader(ctx, dsn)
+	// host/port/credentials itself. In multi-database mode the DSN is a
+	// server connection (no default database); the server-scope CDC
+	// opener accepts the empty DBName and the reader's bound `schema`
+	// stays empty so SetCDCDatabaseScope's predicate governs the scope.
+	cdcReader, err := e.openCDCReaderForSnapshot(ctx, dsn, multiDatabase)
 	if err != nil {
 		_, _ = conn.ExecContext(ctx, "ROLLBACK")
 		_ = conn.Close()
@@ -250,6 +326,12 @@ func (e Engine) openBinlogSnapshotStream(ctx context.Context, dsn string) (*ir.S
 	rowReader := &RowReader{
 		q:      conn,
 		schema: cfg.DBName,
+		// Multi-database spanning snapshot (ADR-0074 Phase 1b.2): qualify
+		// each SELECT by the table's own Schema (source database) so this
+		// single pinned connection reads across N databases. In the
+		// single-database path this is false and the SELECT is unqualified
+		// — byte-identical back-compat.
+		qualifyBySchema: multiDatabase,
 		// Snapshot mode: SnapshotStream.Close handles cleanup.
 		closer: nil,
 	}
@@ -316,6 +398,19 @@ func (e Engine) openBinlogSnapshotStream(ctx context.Context, dsn string) (*ir.S
 		return firstErr
 	}
 	return stream, nil
+}
+
+// openCDCReaderForSnapshot opens the CDC reader paired with a binlog
+// snapshot. In single-database mode it delegates to the public
+// [Engine.OpenCDCReader] (strict DSN, database required). In
+// multi-database mode (ADR-0074 Phase 1b.2) it opens a server-scope
+// reader whose bound database is empty, so the orchestrator's
+// SetCDCDatabaseScope predicate is the sole event-scope authority.
+func (e Engine) openCDCReaderForSnapshot(ctx context.Context, dsn string, multiDatabase bool) (ir.CDCReader, error) {
+	if multiDatabase {
+		return openBinlogServerCDCReader(ctx, dsn)
+	}
+	return e.OpenCDCReader(ctx, dsn)
 }
 
 // closer is the local view of io.Closer for the CDC reader cleanup

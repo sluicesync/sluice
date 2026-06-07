@@ -32,6 +32,19 @@ type RowReader struct {
 	q      querier
 	schema string
 
+	// qualifyBySchema makes ReadRows / CountRows qualify the table
+	// reference by the table's own [ir.Table.Schema] (the source
+	// database) rather than relying on the connection's default database
+	// (ADR-0074 Phase 1b.2 multi-database spanning snapshot). It is set
+	// ONLY on the multi-database snapshot RowReader, whose single pinned
+	// connection reads across N databases at one consistent view — so a
+	// `db`-qualified SELECT is mandatory (the connection may have no
+	// default database at all). In every single-database path this stays
+	// false and the emitted SQL is BYTE-IDENTICAL to the pre-ADR-0074
+	// shape: an unqualified `table` reference resolved against the DSN's
+	// own database.
+	qualifyBySchema bool
+
 	// closer owns the underlying connection resources for this reader.
 	// In simple mode it's the *sql.DB; in snapshot mode it's nil and
 	// the SnapshotStream owns the lifecycle. Close is a no-op when nil.
@@ -79,7 +92,7 @@ func (r *RowReader) ReadRows(ctx context.Context, table *ir.Table) (<-chan ir.Ro
 	r.err = nil
 	r.mu.Unlock()
 
-	query := buildSelect(table)
+	query := buildSelect(table, r.qualifyBySchema)
 	// rowserrcheck and sqlclosecheck can't follow rows into the
 	// goroutine; both rows.Err() and rows.Close() are handled inside
 	// stream() (Close via defer, Err checked once iteration ends).
@@ -155,16 +168,26 @@ func (r *RowReader) setErr(err error) {
 // rather than freezing it. MySQL identifiers are quoted with
 // backticks; any backticks within identifiers (rare) are escaped by
 // doubling.
-func buildSelect(table *ir.Table) string {
+// When qualifyBySchema is true AND table.Schema is non-empty, the FROM
+// clause is `db`.`table` rather than the bare `table` — required by the
+// ADR-0074 Phase 1b.2 multi-database spanning snapshot, whose single
+// pinned connection reads across N databases and may have no default
+// database. qualifyBySchema is false on every single-database path, so
+// the emitted SQL stays byte-identical there.
+func buildSelect(table *ir.Table, qualifyBySchema bool) string {
 	src := sourceReadableColumns(table.Columns)
 	cols := make([]string, len(src))
 	for i, c := range src {
 		cols[i] = quoteIdent(c.Name)
 	}
+	tableRef := quoteIdent(table.Name)
+	if qualifyBySchema && table.Schema != "" {
+		tableRef = quoteIdent(table.Schema) + "." + tableRef
+	}
 	return fmt.Sprintf(
 		"SELECT %s FROM %s",
 		strings.Join(cols, ", "),
-		quoteIdent(table.Name),
+		tableRef,
 	)
 }
 
