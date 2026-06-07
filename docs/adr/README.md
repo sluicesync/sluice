@@ -128,7 +128,8 @@ ADRs are numbered in the order they were proposed. A few notable conventions:
 | [0071](adr-0071-vstream-snapshot-bounded-memory.md) | Bounded-memory VStream cold-start COPY (byte-capped backpressured pump, `--max-buffer-bytes`) |
 | [0072](adr-0072-resumable-coldstart-copy.md) | Resumable VStream cold-start COPY (carry Vitess `TablePKs` cursor, checkpoint during COPY, in-place reconnect) |
 | [0073](adr-0073-vitess-internal-and-online-ddl-tables.md) | Exclude Vitess internal / online-DDL `_vt_*` tables from COPY+CDC; survive an online-DDL cutover zero-loss |
-| [0074](adr-0074-multi-database-mysql-migration-and-sync.md) | **Proposed** — multi-database MySQL migrate + sync (one server → N databases → N target namespaces; server-wide binlog CDC with per-event apply-routing) |
+| [0074](adr-0074-multi-database-mysql-migration-and-sync.md) | Accepted (shipped v0.99.16) — multi-database MySQL migrate + sync (one server → N databases → N target namespaces; server-wide binlog CDC with per-event apply-routing) |
+| [0075](adr-0075-postgres-source-multi-schema-migration-and-sync.md) | Accepted — Postgres-source multi-schema migrate + sync (one PG database → N schemas → N target namespaces; one database-wide logical slot, per-event apply-routing — the symmetric reverse of ADR-0074) |
 
 ## Notes / dialogue prep / readiness briefs
 
