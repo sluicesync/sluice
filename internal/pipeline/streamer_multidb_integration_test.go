@@ -316,13 +316,23 @@ func TestStreamer_MultiDatabase_ConcurrentWritesDuringColdStart(t *testing.T) {
 	writerWG.Wait()
 	writerCancel()
 
-	if !waitForRowCountMySQLDB(t, serverDSN(t, tgtServer), "source_db", "events", wantA, 120*time.Second) {
+	// Catch-up ceiling. This is an async wait for the CDC tail to apply the
+	// 600 concurrent rows; the EXACT-count assertion below is the real
+	// zero-loss gate (a genuinely lost row never reaches the target and this
+	// times out). The ceiling only needs to be generous enough to never
+	// false-fail on slow apply — and under the CI `-race` build (~10x slower)
+	// 120s was marginal (a single trailing row could still be in flight),
+	// causing a `got 2299/2300` flake on an otherwise-green run. 300s gives
+	// ample margin under `-race` while still bounding a real loss. Verified:
+	// 5x local (non-race) runs reach the exact count with seconds to spare.
+	const catchUpCeiling = 300 * time.Second
+	if !waitForRowCountMySQLDB(t, serverDSN(t, tgtServer), "source_db", "events", wantA, catchUpCeiling) {
 		streamCancel()
 		<-runErr
 		t.Fatalf("source_db never reached %d rows (got %d)", wantA,
 			mysqlDBRowCount(t, serverDSN(t, tgtServer), "source_db", "events"))
 	}
-	if !waitForRowCountMySQLDB(t, serverDSN(t, tgtServer), "shop_db", "events", wantB, 120*time.Second) {
+	if !waitForRowCountMySQLDB(t, serverDSN(t, tgtServer), "shop_db", "events", wantB, catchUpCeiling) {
 		streamCancel()
 		<-runErr
 		t.Fatalf("shop_db never reached %d rows (got %d)", wantB,
