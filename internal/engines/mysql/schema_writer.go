@@ -351,6 +351,19 @@ func (w *SchemaWriter) CreateConstraints(ctx context.Context, s *ir.Schema) erro
 			return fks[i].Name < fks[j].Name
 		})
 		for _, fk := range fks {
+			// Idempotent resume (Bug 131 same-class): a prior run that
+			// already added this FK — a resume re-entering phase=constraints —
+			// would otherwise fail with MySQL 1826 "Duplicate foreign key
+			// constraint name". MySQL has no ADD CONSTRAINT IF NOT EXISTS, so
+			// detect-then-skip (mirrors the index/CHECK idempotency). sluice
+			// owns these tables, so a same-named FK is the one it built.
+			exists, err := foreignKeyExists(ctx, w.db, w.schema, table.Name, fk.Name)
+			if err != nil {
+				return fmt.Errorf("mysql: probe foreign key %q on %q: %w", fk.Name, table.Name, err)
+			}
+			if exists {
+				continue
+			}
 			stmt, err := emitAddForeignKey(table.Name, fk)
 			if err != nil {
 				return err
@@ -607,6 +620,22 @@ func indexExists(ctx context.Context, db *sql.DB, schema, table, indexName strin
 		WHERE table_schema = ? AND table_name = ? AND index_name = ?)`
 	var exists bool
 	if err := db.QueryRowContext(ctx, q, schema, table, indexName).Scan(&exists); err != nil {
+		return false, err
+	}
+	return exists, nil
+}
+
+// foreignKeyExists reports whether a FOREIGN KEY constraint named
+// constraintName is present on schema.table. Used by CreateConstraints
+// for idempotent resume (Bug 131 same-class) — MySQL has no
+// ADD CONSTRAINT IF NOT EXISTS, so detect-then-skip is the portable
+// pattern (mirrors indexExists / mysqlCheckConstraintExists).
+func foreignKeyExists(ctx context.Context, db *sql.DB, schema, table, constraintName string) (bool, error) {
+	const q = `SELECT EXISTS(SELECT 1 FROM information_schema.TABLE_CONSTRAINTS
+		WHERE CONSTRAINT_SCHEMA = ? AND TABLE_NAME = ?
+		  AND CONSTRAINT_TYPE = 'FOREIGN KEY' AND CONSTRAINT_NAME = ?)`
+	var exists bool
+	if err := db.QueryRowContext(ctx, q, schema, table, constraintName).Scan(&exists); err != nil {
 		return false, err
 	}
 	return exists, nil

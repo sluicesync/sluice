@@ -87,3 +87,71 @@ func TestCreateIndexes_IdempotentOnResume_Bug131(t *testing.T) {
 		}
 	}
 }
+
+// TestCreateConstraints_IdempotentOnResume_Bug131 pins the same-class FK
+// follow-up: a second CreateConstraints pass over an already-added foreign
+// key must be a no-op, not MySQL 1826 "Duplicate foreign key constraint
+// name" — the constraints phase must be idempotent on resume for the same
+// reasons the index phase must (Bug 131).
+func TestCreateConstraints_IdempotentOnResume_Bug131(t *testing.T) {
+	dsn, cleanup := newSharedDB(t, "bug131_fk_resume")
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	schema := &ir.Schema{Tables: []*ir.Table{
+		{
+			Name:       "parent",
+			Columns:    []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64, AutoIncrement: true}}},
+			PrimaryKey: &ir.Index{Name: "PRIMARY", Unique: true, Columns: []ir.IndexColumn{{Column: "id"}}},
+		},
+		{
+			Name: "child",
+			Columns: []*ir.Column{
+				{Name: "id", Type: ir.Integer{Width: 64, AutoIncrement: true}},
+				{Name: "parent_id", Type: ir.Integer{Width: 64}},
+			},
+			PrimaryKey: &ir.Index{Name: "PRIMARY", Unique: true, Columns: []ir.IndexColumn{{Column: "id"}}},
+			ForeignKeys: []*ir.ForeignKey{{
+				Name:              "fk_child_parent",
+				Columns:           []string{"parent_id"},
+				ReferencedTable:   "parent",
+				ReferencedColumns: []string{"id"},
+			}},
+		},
+	}}
+
+	swHandle, err := Engine{}.OpenSchemaWriter(ctx, dsn)
+	if err != nil {
+		t.Fatalf("OpenSchemaWriter: %v", err)
+	}
+	defer closeIf(swHandle)
+
+	if err := swHandle.CreateTablesWithoutConstraints(ctx, schema); err != nil {
+		t.Fatalf("CreateTablesWithoutConstraints: %v", err)
+	}
+	if err := swHandle.CreateConstraints(ctx, schema); err != nil {
+		t.Fatalf("CreateConstraints (first pass): %v", err)
+	}
+	// The same-class reproducer: a second pass over the already-added FK
+	// used to fail with Error 1826. It must now be a no-op.
+	if err := swHandle.CreateConstraints(ctx, schema); err != nil {
+		t.Fatalf("CreateConstraints (second pass, resume) must be idempotent, got: %v", err)
+	}
+
+	sw := swHandle.(*SchemaWriter)
+	var count int
+	if err := sw.db.QueryRowContext(
+		ctx,
+		`SELECT COUNT(*) FROM information_schema.TABLE_CONSTRAINTS
+			WHERE CONSTRAINT_SCHEMA = ? AND TABLE_NAME = 'child'
+			  AND CONSTRAINT_TYPE = 'FOREIGN KEY' AND CONSTRAINT_NAME = 'fk_child_parent'`,
+		sw.schema,
+	).Scan(&count); err != nil {
+		t.Fatalf("query information_schema.TABLE_CONSTRAINTS: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("FK fk_child_parent: got count %d, want 1", count)
+	}
+}

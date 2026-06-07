@@ -623,6 +623,20 @@ func (w *SchemaWriter) CreateConstraints(ctx context.Context, s *ir.Schema) erro
 			return fks[i].Name < fks[j].Name
 		})
 		for _, fk := range fks {
+			// Idempotent resume (Bug 131 same-class): a resume re-entering
+			// phase=constraints over an already-added FK would otherwise fail
+			// ("constraint ... already exists"). PG has no ADD CONSTRAINT IF
+			// NOT EXISTS for FKs, so detect-then-skip via the catalog (mirrors
+			// the CREATE INDEX IF NOT EXISTS idempotency). sluice owns these
+			// tables, so a same-named FK is the one it built — including one a
+			// prior degraded run attached NOT VALID.
+			present, err := pgForeignKeyExists(ctx, w.db, w.schema, table.Name, fk.Name)
+			if err != nil {
+				return fmt.Errorf("postgres: probe foreign key %q on %q: %w", fk.Name, table.Name, err)
+			}
+			if present {
+				continue
+			}
 			stmt, err := emitAddForeignKey(w.schema, table.Name, fk)
 			if err != nil {
 				return err
@@ -663,6 +677,25 @@ func (w *SchemaWriter) CreateConstraints(ctx context.Context, s *ir.Schema) erro
 		}
 	}
 	return nil
+}
+
+// pgForeignKeyExists reports whether a FOREIGN KEY constraint named
+// constraintName is present on schema.table. Used by CreateConstraints
+// for idempotent resume (Bug 131 same-class) — PG has no ADD CONSTRAINT
+// IF NOT EXISTS for FKs, so detect-then-skip is the portable pattern.
+// Catalog-scoped to (constraint name, table, schema); contype 'f' is the
+// FK type, so a same-named CHECK/UNIQUE on the table won't false-match.
+func pgForeignKeyExists(ctx context.Context, db *sql.DB, schema, table, constraintName string) (bool, error) {
+	const q = `SELECT EXISTS(
+		SELECT 1 FROM pg_constraint c
+		JOIN pg_class t      ON t.oid = c.conrelid
+		JOIN pg_namespace n  ON n.oid = t.relnamespace
+		WHERE c.contype = 'f' AND c.conname = $1 AND t.relname = $2 AND n.nspname = $3)`
+	var exists bool
+	if err := db.QueryRowContext(ctx, q, constraintName, table, schema).Scan(&exists); err != nil {
+		return false, fmt.Errorf("pg_constraint probe: %w", err)
+	}
+	return exists, nil
 }
 
 // EnableDegradedFKs implements [ir.DegradedFKAllower]. Called by the
