@@ -225,6 +225,16 @@ When the IR is emitted as MySQL DDL, the inverse mapping applies, with the follo
 - `JSON{Binary: false}` is emitted as `jsonb` by default, since `jsonb` is almost always the right choice on Postgres. Override available.
 - `Geometry{}` requires the PostGIS extension; if PostGIS is not in the allowlist, the run errors with an explicit message.
 
+### Extension-passthrough types (`--enable-pg-extension`)
+
+Postgres extension types — `hstore`, `citext`, `pgvector` (`vector`), `pg_trgm` (operator classes), PostGIS (`geometry`/`geography`) — are opt-in via `--enable-pg-extension EXT` (repeatable), per [ADR-0032](adr/adr-0032-pg-extension-passthrough.md). The flag is required because the target must actually have `CREATE EXTENSION <ext>` run; a pre-flight refuses cleanly if it doesn't.
+
+- **`hstore`** (ADR-0032 Tier 1). With `--enable-pg-extension hstore`:
+  - **PG → PG:** passes through verbatim — the column stays `hstore` and values round-trip in their text form (`"a"=>"1", "b"=>"2"`).
+  - **PG → MySQL:** degraded to MySQL `JSON` — the `"k"=>"v"` text is rewritten to `{"k":"v"}` at value-write time (key/value pairs preserved; hstore has no ordering to lose).
+  - **Without the flag:** an `hstore` column refuses **loudly at schema-read**, naming the column and the remedy (`pass --enable-pg-extension hstore to enable passthrough`) — it is *not* silently dropped, and it is *not* the older misleading "not a recognised enum" message (that wording is now reserved for a genuinely-unknown, non-extension user-defined type).
+- `citext` follows the same Tier-1 shape; `pgvector`/`pg_trgm`/PostGIS add index-method awareness (Tier 2). See ADR-0032 for the per-extension catalog and the cross-engine policy.
+
 ## Edge cases that need explicit policies
 
 These are the cases that historically turn type-mapping code into a regex zoo. Each one is named, has a default policy, and is overridable via config.
