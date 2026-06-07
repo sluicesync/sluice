@@ -6,6 +6,31 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.99.17] - 2026-06-07
+
+### Fixed
+
+- **Crash during a backup rotation could leave the backup un-restorable
+  ("branching/mis-stitched lineage").** When a streaming backup rotated to a
+  new segment and the process crashed (or was cancelled) at just the wrong
+  moment, the segment's first incremental could be written durably to object
+  storage but lost from `lineage.json`'s incremental list (its catalog append
+  is best-effort, so it never fails the stream). On resume the stream
+  correctly re-stitched off the on-disk tail — so **no data was lost** — but
+  the catalog kept the gap: its first recorded incremental then parented off
+  the orphaned one instead of the segment's full, and a later `restore`
+  **refused the whole segment** with `branching/mis-stitched lineage` even
+  though the on-disk chain was complete. sluice now **reconciles the open
+  segment's catalog against the on-disk chain on resume**, re-cataloguing any
+  orphaned incremental in chain order before streaming continues, so restore
+  succeeds. The repair is conservative and idempotent — it refuses to guess
+  when the on-disk manifests aren't a single clean linear chain (a branch,
+  a parentless incremental, or an unreachable manifest), leaving those for
+  restore's strict validation to surface rather than masking real corruption.
+  This was a loud, recoverable failure (a refused restore, never silent data
+  loss), surfaced by the ADR-0046 crash-injection matrix under the race
+  detector.
+
 ## [0.99.16] - 2026-06-07
 
 **Multi-database MySQL migration and continuous sync (ADR-0074).** A single

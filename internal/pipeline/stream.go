@@ -380,6 +380,21 @@ func (b *BackupStream) Run(ctx context.Context) error {
 	b.segStore = segStore
 	b.segCodec = segCodec
 
+	// 1.6. Heal an open-segment catalog that a crash/cancel left out of
+	//    sync with disk (an incremental durable on disk but missing from
+	//    lineage.json's Incrementals list, because its best-effort catalog
+	//    append never landed). Must run BEFORE resolveParent: otherwise the
+	//    resumed stream re-stitches off the on-disk tail while the catalog
+	//    keeps the head gap, and restore later refuses the segment as
+	//    mis-stitched. Best-effort + idempotent (retries next resume).
+	if rerr := reconcileOpenSegmentCatalog(ctx, b.Store, b.segStore); rerr != nil {
+		slog.WarnContext(
+			ctx, "stream: open-segment catalog reconcile failed; continuing "+
+				"(a crash-orphaned incremental may keep restore refusing this segment until repaired)",
+			slog.String("err", rerr.Error()),
+		)
+	}
+
 	// 2. Resolve parent manifest (within the open segment).
 	parent, parentPath, err := b.resolveParent(ctx)
 	if err != nil {

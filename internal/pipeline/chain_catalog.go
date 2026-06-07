@@ -45,6 +45,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"slices"
 	"sort"
 	"time"
 
@@ -610,4 +611,113 @@ func RebuildLineageCatalogAt(ctx context.Context, store ir.BackupStore) (segment
 		return 0, 0, err
 	}
 	return 1, len(recs), nil
+}
+
+// reconcileOpenSegmentCatalog heals the OPEN (last) segment's recorded
+// Incrementals list against the on-disk manifest chain, called on stream
+// resume before the parent is resolved.
+//
+// Why this exists: an incremental's manifest is written durably FIRST,
+// then its lineage.json entry is appended best-effort (so a transient
+// catalog-write failure never fails the stream). A crash — or a ctx
+// cancel — between those two steps leaves the incremental ON DISK but
+// ABSENT from the catalog's Incrementals list. On resume the stream
+// re-stitches off the on-disk tail correctly (the data chain stays
+// intact and the next incremental's ParentBackupID points at the
+// orphan), but the catalog keeps the gap: its first recorded
+// incremental now parents off the orphan instead of the segment full.
+// Restore's strict per-link chain walk then refuses the segment as
+// "branching/mis-stitched lineage" — a loud, un-restorable backup from
+// what is actually a complete on-disk chain. (Reproduced as the
+// ADR-0046 crash-injection matrix's post-drain/post-snapshot flake: the
+// rotation-opened segment's first (P_N, S] overlap incremental was the
+// orphan.)
+//
+// The heal rebuilds the open segment's Incrementals from the on-disk
+// chain ORDER (parent links — not the filename sort, which can tie on
+// same-millisecond rollovers), re-deriving IncrementalCoverageStart and
+// EndPosition from the true first/last links. It is conservative and
+// idempotent: a no-op when the catalog already matches disk, and it
+// REFUSES TO GUESS when the on-disk set isn't a single clean linear
+// chain off the full (a parentless incremental, a branch, or an
+// unreachable manifest) — those are left for restore's strict check to
+// surface rather than masked by a heuristic repair.
+func reconcileOpenSegmentCatalog(ctx context.Context, rootStore, segStore ir.BackupStore) error {
+	cat, ok, err := loadLineageCatalog(ctx, rootStore)
+	if err != nil || !ok || len(cat.Segments) == 0 {
+		return err // nothing catalogued yet — fresh start, nothing to heal
+	}
+	seg := &cat.Segments[len(cat.Segments)-1]
+
+	recs, err := listAllManifestsViaWalk(ctx, segStore)
+	if err != nil {
+		return err
+	}
+
+	// Index incrementals by parent BackupID and locate the full.
+	childByParent := make(map[string]manifestRecord, len(recs))
+	var fullID string
+	for _, r := range recs {
+		switch canonicalKind(r.manifest.Kind) {
+		case ir.BackupKindFull:
+			fullID = manifestBackupID(r.manifest)
+		case ir.BackupKindIncremental:
+			pid := r.manifest.ParentBackupID
+			if pid == "" {
+				return nil // can't chain deterministically — stay strict
+			}
+			if _, dup := childByParent[pid]; dup {
+				return nil // branch: two children share a parent — don't guess
+			}
+			childByParent[pid] = r
+		}
+	}
+	if fullID == "" {
+		return nil // no full walked (unexpected) — don't touch the catalog
+	}
+
+	// Walk the linear chain from the full, consuming each link.
+	ordered := make([]manifestRecord, 0, len(childByParent))
+	for cur := fullID; ; {
+		child, found := childByParent[cur]
+		if !found {
+			break
+		}
+		ordered = append(ordered, child)
+		delete(childByParent, cur)
+		cur = manifestBackupID(child.manifest)
+	}
+	if len(childByParent) != 0 {
+		return nil // an incremental wasn't reachable from the full — stay strict
+	}
+
+	paths := make([]string, len(ordered))
+	for i, r := range ordered {
+		paths[i] = r.path
+	}
+	if slices.Equal(seg.Incrementals, paths) {
+		return nil // catalog already matches disk — idempotent no-op
+	}
+
+	seg.Incrementals = paths
+	if len(ordered) > 0 {
+		first := ordered[0].manifest
+		// ADR-0067: a rotation-opened segment's first incremental starts
+		// at the (P_N, S] overlap, which precedes the full's anchor; record
+		// that coverage start. A never-rotated segment's first incremental
+		// starts at the full's end (== seg.StartPosition) — no overlap.
+		if first.StartPosition != seg.StartPosition {
+			seg.IncrementalCoverageStart = first.StartPosition
+		}
+		seg.EndPosition = ordered[len(ordered)-1].manifest.EndPosition
+	}
+	cat.UpdatedAt = time.Now().UTC()
+	slog.WarnContext(
+		ctx, "lineage: healed open-segment catalog from the on-disk chain "+
+			"(an incremental was orphaned from lineage.json by a crash/cancel "+
+			"during its best-effort catalog update; re-catalogued in chain order)",
+		slog.String("seg_dir", seg.Dir),
+		slog.Int("on_disk_incrementals", len(paths)),
+	)
+	return writeLineageCatalog(ctx, rootStore, cat)
 }
