@@ -12,6 +12,58 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 )
 
+// TestCDCReader_DatabaseInScope pins the ADR-0074 Phase 1b reader-scope
+// class (part A): the single drop-decision point the dispatch paths
+// consult. In single-database mode (no scope set) it must reduce
+// EXACTLY to `database == r.schema` — byte-identical back-compat. In
+// multi-database mode it must delegate to the selected-set predicate
+// (wider allow-set, same drop mechanism).
+func TestCDCReader_DatabaseInScope(t *testing.T) {
+	t.Run("single-database mode is byte-identical to database==schema", func(t *testing.T) {
+		r := &CDCReader{schema: "app"}
+		if !r.databaseInScope("app") {
+			t.Error("bound database must be in scope")
+		}
+		for _, other := range []string{"other", "", "App", "mysql"} {
+			if r.databaseInScope(other) {
+				t.Errorf("database %q must be dropped in single-database mode (only %q in scope)", other, "app")
+			}
+		}
+	})
+
+	t.Run("multi-database mode delegates to the selected-set predicate", func(t *testing.T) {
+		selected := map[string]struct{}{"app_db": {}, "shared_db": {}}
+		r := &CDCReader{schema: "app_db"}
+		r.SetCDCDatabaseScope(func(db string) bool {
+			_, ok := selected[db]
+			return ok
+		})
+		for _, in := range []string{"app_db", "shared_db"} {
+			if !r.databaseInScope(in) {
+				t.Errorf("selected database %q must be in scope", in)
+			}
+		}
+		// A database OUTSIDE the selected set is dropped — even though the
+		// server-wide binlog carries its events.
+		for _, out := range []string{"other_db", "mysql", ""} {
+			if r.databaseInScope(out) {
+				t.Errorf("out-of-scope database %q must be dropped", out)
+			}
+		}
+	})
+
+	t.Run("nil predicate is a no-op (single-database mode preserved)", func(t *testing.T) {
+		r := &CDCReader{schema: "app"}
+		r.SetCDCDatabaseScope(nil)
+		if r.cdcDBInScope != nil {
+			t.Fatal("nil predicate must not engage multi-database mode")
+		}
+		if r.databaseInScope("other") {
+			t.Error("after a nil SetCDCDatabaseScope the reader must stay single-database")
+		}
+	})
+}
+
 func TestEncodeDecodeBinlogPos(t *testing.T) {
 	cases := []struct {
 		name string

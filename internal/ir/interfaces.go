@@ -1286,6 +1286,72 @@ type MultiDatabaseScoper interface {
 	SetMultiDatabaseScope(database string, inScope func(database string) bool)
 }
 
+// CDCDatabaseScoper is the OPTIONAL surface a [CDCReader] implements to
+// be told it is streaming a multi-database fan-out run (ADR-0074 Phase
+// 1b). The MySQL binlog is server-wide — a single replication
+// connection already carries every database's changes, each event
+// tagged with its source database — so multi-database CDC is ONE
+// stream with a wider event-allow set, not N streams.
+//
+// `inScope` reports whether an event's source database is part of the
+// selected set. When set (non-nil):
+//
+//   - the reader emits row/truncate events from EVERY database the
+//     predicate admits (not just the DSN's one database), and drops
+//     events from databases outside the set — the SAME per-event drop
+//     the single-database path uses, just with a wider allow set;
+//   - each emitted [Change.Schema] carries the event's SOURCE database,
+//     read from the binlog event's own metadata (the TABLE_MAP_EVENT /
+//     QUERY-event schema field), so the [ChangeApplier]'s multi-database
+//     routing can land it in the correct target namespace.
+//
+// A nil predicate (the single-database default) keeps today's behaviour
+// EXACTLY: only the reader's DSN-bound database is emitted, everything
+// else dropped — byte-identical back-compat. Set before
+// [CDCReader.StreamChanges]; the predicate is consulted on the reader's
+// single pump goroutine.
+//
+// PG does not implement it (this phase is MySQL-source fan-out); engines
+// without the surface keep the single-database stream.
+type CDCDatabaseScoper interface {
+	SetCDCDatabaseScope(inScope func(database string) bool)
+}
+
+// MultiDatabaseRouter is the OPTIONAL surface a [ChangeApplier]
+// implements to enable per-change target-namespace routing for a
+// multi-database fan-out CDC run (ADR-0074 Phase 1b). The applier stays
+// ONE instance with ONE position write per batch (the binlog position
+// is server-wide per stream-id); routing is purely a per-change choice
+// of which namespace a row write targets.
+//
+// When routing is ENABLED, the applier qualifies an
+// Insert/Update/Delete/Truncate table reference with the change's
+// [Change.Schema] (MySQL target → `db`.`table`; PG target →
+// `schema.table`) ONLY when that source namespace is non-empty AND
+// differs from the applier's own bound/default namespace — exactly the
+// cross-namespace case, mirroring the Phase-1a foreign-key qualifier
+// (qualify across DIFFERING namespaces only). A change whose Schema is
+// empty OR equals the applier's bound namespace emits the SAME
+// unqualified/bound SQL the single-database path emits.
+//
+// When routing is DISABLED (the default — every single-database run,
+// for ALL engine pairs), the applier ignores [Change.Schema] for table
+// qualification and always writes into its bound namespace, BYTE-
+// IDENTICAL to the pre-ADR-0074 behaviour. This is the load-bearing
+// back-compat guard: cross-engine single-database CDC (e.g. a PG source
+// whose reader already populates Change.Schema with the source schema,
+// streamed into a MySQL target with a differing bound database) must
+// NOT start qualifying — the differing-namespace condition alone is
+// insufficient, so routing is an explicit opt-in the multi-database
+// streamer sets, never inferred from Change.Schema.
+//
+// The applier does NOT create the target namespace — the cold-start /
+// snapshot phase owns namespace creation (ADR-0074 Phase 1b.2); the
+// applier assumes the routed namespace already exists.
+type MultiDatabaseRouter interface {
+	SetMultiDatabaseRouting(enabled bool)
+}
+
 // ExtensionAware is the optional engine-side surface for engines that
 // can pass through column types defined by extensions (ADR-0032). PG
 // implements; MySQL does not (no extension concept in the same shape).

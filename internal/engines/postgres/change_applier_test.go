@@ -39,6 +39,46 @@ func captureSlog(t *testing.T) *bytes.Buffer {
 	return &buf
 }
 
+// TestApplier_RoutedSchema_BackCompatClass pins the ADR-0074 Phase 1b
+// namespace-routing class on the Postgres applier (part B). Mirror of
+// the MySQL pin — the reviewer re-derives the same back-compat matrix
+// on BOTH engines. Routing OFF must be byte-identical (bound schema
+// always); routing ON qualifies ONLY across DIFFERING non-empty
+// namespaces.
+//
+// The cross-engine single-database trap is the third OFF row: a
+// namespaced source (e.g. another PG, or a MySQL source whose binlog
+// reader stamps the source db) whose Change.Schema differs from the
+// bound target schema must stay bound when routing is OFF.
+func TestApplier_RoutedSchema_BackCompatClass(t *testing.T) {
+	cases := []struct {
+		name         string
+		bound        string
+		routing      bool
+		changeSchema string
+		want         string
+	}{
+		{"off: empty change schema -> bound", "public", false, "", "public"},
+		{"off: change schema == bound -> bound", "public", false, "public", "public"},
+		{"off: differing schema -> bound (NO over-qualify)", "public", false, "app_db", "public"},
+		{"on: empty change schema -> bound (bare)", "public", true, "", "public"},
+		{"on: change schema == bound -> bound (bare)", "public", true, "public", "public"},
+		{"on: differing non-empty schema -> qualified", "public", true, "app_db", "app_db"},
+		{"off: unbound applier -> change schema fallback", "", false, "src", "src"},
+		{"on: unbound applier -> change schema fallback", "", true, "src", "src"},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			a := &ChangeApplier{schema: c.bound, multiDBRouting: c.routing}
+			if got := a.routedSchema(c.changeSchema); got != c.want {
+				t.Errorf("routedSchema(%q) with bound=%q routing=%v = %q; want %q",
+					c.changeSchema, c.bound, c.routing, got, c.want)
+			}
+		})
+	}
+}
+
 // TestBuildInsertSQL covers both the upsert path (PK present) and
 // the plain-INSERT fallback (PK empty), plus the all-PK DO NOTHING
 // edge case. Column order is sorted so the SQL is deterministic.

@@ -74,10 +74,23 @@ type CDCReader struct {
 	// different protocol and needs the REPLICATION SLAVE privilege.
 	db *sql.DB
 
-	// schema is the database name the reader is bound to. Events from
-	// other databases are dropped during dispatch — this engine
-	// presents a single-schema view, same as RowReader and SchemaReader.
+	// schema is the database name the reader is bound to. In the
+	// default single-database mode, events from other databases are
+	// dropped during dispatch — this engine presents a single-schema
+	// view, same as RowReader and SchemaReader.
 	schema string
+
+	// cdcDBInScope is the ADR-0074 Phase 1b multi-database event-allow
+	// predicate, set by [SetCDCDatabaseScope]. When non-nil the reader
+	// streams the server-wide binlog scoped to the SELECTED database set
+	// instead of the single bound `schema`: an event is emitted iff its
+	// source database satisfies this predicate, and each emitted
+	// [ir.Change.Schema] carries that source database (read from the
+	// event's own TABLE_MAP_EVENT / QUERY-event metadata) so the applier
+	// can route it to the matching target namespace. A nil predicate
+	// (the default) keeps the single-database drop EXACTLY as before:
+	// only `schema` is in scope. Consulted only on the pump goroutine.
+	cdcDBInScope func(database string) bool
 
 	// host and port are extracted from the DSN at construction time
 	// and used to configure the binlog syncer's connection. Stored
@@ -200,6 +213,34 @@ type tableSchema struct {
 	Name       string
 	Columns    []*ir.Column
 	PrimaryKey []string
+}
+
+// SetCDCDatabaseScope implements [ir.CDCDatabaseScoper]. It switches
+// the reader from its default single-database view to a multi-database
+// fan-out (ADR-0074 Phase 1b): the server-wide binlog is streamed
+// scoped to the database set `inScope` admits, and each emitted change
+// carries its source database in [ir.Change.Schema]. A nil predicate is
+// a no-op (single-database mode preserved). Must be called before
+// [StreamChanges]; the predicate is read on the pump goroutine.
+func (r *CDCReader) SetCDCDatabaseScope(inScope func(database string) bool) {
+	if inScope == nil {
+		return
+	}
+	r.cdcDBInScope = inScope
+}
+
+// databaseInScope reports whether events from the given source database
+// should be emitted. In multi-database mode (cdcDBInScope non-nil) it
+// delegates to the selected-set predicate; otherwise it preserves the
+// single-database rule — only the bound `schema` is in scope. This is
+// the single decision point the dispatch paths consult, so the
+// single-database behaviour stays byte-identical: a nil predicate makes
+// this exactly `database == r.schema`.
+func (r *CDCReader) databaseInScope(database string) bool {
+	if r.cdcDBInScope != nil {
+		return r.cdcDBInScope(database)
+	}
+	return database == r.schema
 }
 
 // Close releases the schema-DB pool and stops the binlog syncer if one
@@ -519,8 +560,13 @@ func (r *CDCReader) dispatch(ctx context.Context, ev *replication.BinlogEvent, o
 		return nil
 
 	case *replication.TableMapEvent:
+		// The TABLE_MAP_EVENT's own schema field is the authoritative
+		// per-event source database (the binlog is server-wide). In
+		// single-database mode databaseInScope reduces to
+		// `schema == r.schema`; in multi-database mode it admits every
+		// selected database — the SAME drop mechanism, a wider allow set.
 		schema := string(e.Schema)
-		if schema != r.schema {
+		if !r.databaseInScope(schema) {
 			// Mark the table_id as out-of-scope so subsequent row
 			// events for it are dropped without a cache lookup.
 			r.tableMap[e.TableID] = ""
@@ -577,7 +623,7 @@ func (r *CDCReader) dispatch(ctx context.Context, ev *replication.BinlogEvent, o
 			if truncSchema == "" {
 				truncSchema = string(e.Schema)
 			}
-			if truncSchema == r.schema {
+			if r.databaseInScope(truncSchema) {
 				pos, err := r.positionFor(ev.Header)
 				if err != nil {
 					return err
@@ -598,7 +644,7 @@ func (r *CDCReader) dispatch(ctx context.Context, ev *replication.BinlogEvent, o
 		// We'd rather over-invalidate than risk the row decoder
 		// using a stale column list.
 		stmtSchema := string(e.Schema)
-		if stmtSchema == r.schema || stmtSchema == "" {
+		if stmtSchema == "" || r.databaseInScope(stmtSchema) {
 			clear(r.schemaCache)
 			// ADR-0049 Chunk B1, locked decision #4c: capture THIS
 			// QUERY (DDL) event's own position now. The schemaCache

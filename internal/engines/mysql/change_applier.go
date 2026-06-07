@@ -110,6 +110,21 @@ type ChangeApplier struct {
 	db     *sql.DB
 	schema string
 
+	// multiDBRouting is the ADR-0074 Phase 1b per-change namespace
+	// routing switch, set by [SetMultiDatabaseRouting]. When false (the
+	// default — every single-database run, ALL engine pairs) the applier
+	// writes into its bound `schema` and IGNORES each change's source
+	// Schema for table qualification: BYTE-IDENTICAL to the pre-ADR-0074
+	// behaviour. When true (a multi-database fan-out stream) it qualifies
+	// the table ref with the change's source database ONLY when that
+	// database is non-empty AND differs from `schema` — exactly the
+	// cross-database case, mirroring the Phase-1a FK qualifier. See
+	// [routedSchema] and the [ir.MultiDatabaseRouter] doc for why this is
+	// an explicit opt-in rather than inferred from Change.Schema (the
+	// back-compat guard against the cross-engine single-database case
+	// where a PG source already populates Change.Schema).
+	multiDBRouting bool
+
 	// slotName is the active stream's resolved replication-slot name,
 	// set by [SetSlotName] at Streamer startup. Threaded into every
 	// [writePositionTx] call so the per-target sluice_cdc_state row's
@@ -430,6 +445,18 @@ func (a *ChangeApplier) stampShardChange(c ir.Change) {
 	}
 }
 
+// SetMultiDatabaseRouting implements [ir.MultiDatabaseRouter] (ADR-0074
+// Phase 1b). Enables per-change target-database routing for a
+// multi-database fan-out CDC stream: when enabled, the applier qualifies
+// an Insert/Update/Delete/Truncate with the change's source database
+// (`db`.`table`) for the cross-database case (see [routedSchema]). When
+// disabled (the default), the applier writes into its bound database and
+// emits byte-identical single-database SQL. Idempotent; the streamer may
+// call this on every Run.
+func (a *ChangeApplier) SetMultiDatabaseRouting(enabled bool) {
+	a.multiDBRouting = enabled
+}
+
 // SetBatchSizeProvider implements [ir.BatchSizeProviderSetter]
 // (ADR-0052). Threads the AIMD controller onto the applier so each
 // batch's row-cap reflects the controller's current decision. A nil
@@ -498,7 +525,14 @@ func (a *ChangeApplier) redactChange(ctx context.Context, c ir.Change) error {
 // pkFor that opens a fresh tx — redactChange runs before the
 // dispatch's tx is established, but schema metadata is stable
 // across tx boundaries so this is safe.
-func (a *ChangeApplier) pkForRedact(ctx context.Context, schema, table string) ([]string, error) {
+//
+// changeSchema is the change's SOURCE schema; the PK lookup must hit the
+// TARGET namespace, so it is routed through [routedSchema] exactly like
+// the dispatch path — this keeps the redact-side and dispatch-side
+// pkCache entries keyed identically (single-database: both under the
+// bound database; cross-database: both under the routed source database).
+func (a *ChangeApplier) pkForRedact(ctx context.Context, changeSchema, table string) ([]string, error) {
+	schema := a.routedSchema(changeSchema)
 	qn := qualifiedName(schema, table)
 	if cached, ok := a.pkCache[qn]; ok {
 		return cached, nil
@@ -508,7 +542,7 @@ func (a *ChangeApplier) pkForRedact(ctx context.Context, schema, table string) (
 		return nil, fmt.Errorf("mysql: applier: pkForRedact: begin tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	pk, err := loadPrimaryKey(ctx, tx, applierSchema(a.schema, schema), table)
+	pk, err := loadPrimaryKey(ctx, tx, schema, table)
 	if err != nil {
 		return nil, fmt.Errorf("mysql: applier: pkForRedact: %w", err)
 	}
@@ -900,27 +934,34 @@ func (a *ChangeApplier) applyOne(ctx context.Context, streamID string, c ir.Chan
 func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID string, c ir.Change) error {
 	switch v := c.(type) {
 	case ir.Insert:
-		schema := applierSchema(a.schema, v.Schema)
-		pk, err := a.pkFor(ctx, tx, v.Schema, v.Table)
+		// ADR-0074 Phase 1b: routedSchema is the bound database in
+		// single-database mode (byte-identical) and the change's source
+		// database in a cross-database multi-database write. It is the
+		// authoritative namespace for BOTH the information_schema lookup
+		// (pkFor / colTypesFor) and the emitted table reference, so the
+		// metadata cache and the write target stay consistent.
+		schema := a.routedSchema(v.Schema)
+		pk, err := a.pkFor(ctx, tx, schema, v.Table)
 		if err != nil {
-			return fmt.Errorf("mysql: applier: pk lookup for %s.%s: %w", v.Schema, v.Table, err)
+			return fmt.Errorf("mysql: applier: pk lookup for %s.%s: %w", schema, v.Table, err)
 		}
-		colTypes, err := a.colTypesFor(ctx, tx, v.Schema, v.Table)
+		colTypes, err := a.colTypesFor(ctx, tx, schema, v.Table)
 		if err != nil {
-			return fmt.Errorf("mysql: applier: column types for %s.%s: %w", v.Schema, v.Table, err)
+			return fmt.Errorf("mysql: applier: column types for %s.%s: %w", schema, v.Table, err)
 		}
 		stmt, args := buildInsertSQL(schema, v.Table, v.Row, pk, colTypes)
 		if _, err := a.txExec(ctx, tx, stmt, args...); err != nil {
-			return fmt.Errorf("mysql: applier: insert into %s.%s: %w", v.Schema, v.Table, err)
+			return fmt.Errorf("mysql: applier: insert into %s.%s: %w", schema, v.Table, err)
 		}
 		return nil
 
 	case ir.Update:
-		colTypes, err := a.colTypesFor(ctx, tx, v.Schema, v.Table)
+		schema := a.routedSchema(v.Schema)
+		colTypes, err := a.colTypesFor(ctx, tx, schema, v.Table)
 		if err != nil {
-			return fmt.Errorf("mysql: applier: column types for %s.%s: %w", v.Schema, v.Table, err)
+			return fmt.Errorf("mysql: applier: column types for %s.%s: %w", schema, v.Table, err)
 		}
-		stmt, args := buildUpdateSQL(applierSchema(a.schema, v.Schema), v.Table, v.Before, v.After, colTypes)
+		stmt, args := buildUpdateSQL(schema, v.Table, v.Before, v.After, colTypes)
 		// Update misses are tolerated (zero rows affected). On resume
 		// we may replay an Update whose target row was already
 		// updated — that's expected, not an error. Silent zero-rows-
@@ -929,23 +970,24 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 		// the divergence has at least one observable footprint.
 		res, err := a.txExec(ctx, tx, stmt, args...)
 		if err != nil {
-			return fmt.Errorf("mysql: applier: update %s.%s: %w", v.Schema, v.Table, err)
+			return fmt.Errorf("mysql: applier: update %s.%s: %w", schema, v.Table, err)
 		}
-		logZeroRowsAffected(ctx, "update", v.Schema, v.Table, res)
+		logZeroRowsAffected(ctx, "update", schema, v.Table, res)
 		return nil
 
 	case ir.Delete:
-		colTypes, err := a.colTypesFor(ctx, tx, v.Schema, v.Table)
+		schema := a.routedSchema(v.Schema)
+		colTypes, err := a.colTypesFor(ctx, tx, schema, v.Table)
 		if err != nil {
-			return fmt.Errorf("mysql: applier: column types for %s.%s: %w", v.Schema, v.Table, err)
+			return fmt.Errorf("mysql: applier: column types for %s.%s: %w", schema, v.Table, err)
 		}
-		stmt, args := buildDeleteSQL(applierSchema(a.schema, v.Schema), v.Table, v.Before, colTypes)
+		stmt, args := buildDeleteSQL(schema, v.Table, v.Before, colTypes)
 		// Delete misses are tolerated for the same reason as Update.
 		res, err := a.txExec(ctx, tx, stmt, args...)
 		if err != nil {
-			return fmt.Errorf("mysql: applier: delete from %s.%s: %w", v.Schema, v.Table, err)
+			return fmt.Errorf("mysql: applier: delete from %s.%s: %w", schema, v.Table, err)
 		}
-		logZeroRowsAffected(ctx, "delete", v.Schema, v.Table, res)
+		logZeroRowsAffected(ctx, "delete", schema, v.Table, res)
 		return nil
 
 	case ir.Truncate:
@@ -968,9 +1010,9 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 				slog.Bool("source_restart_identity", v.RestartIdentity),
 			)
 		}
-		stmt := buildTruncateSQL(applierSchema(a.schema, v.Schema), v.Table)
+		stmt := buildTruncateSQL(a.routedSchema(v.Schema), v.Table)
 		if _, err := a.txExec(ctx, tx, stmt); err != nil {
-			return fmt.Errorf("mysql: applier: truncate %s.%s: %w", v.Schema, v.Table, err)
+			return fmt.Errorf("mysql: applier: truncate %s.%s: %w", a.routedSchema(v.Schema), v.Table, err)
 		}
 		return nil
 
@@ -1038,12 +1080,19 @@ func logZeroRowsAffected(ctx context.Context, op, schema, table string, res sql.
 // pkFor returns the cached PK column list for the named table,
 // loading it on the first sight of the table. An empty slice means
 // "no PK" — Insert falls back to plain INSERT in that case.
+// schema is the ALREADY-RESOLVED target database (the dispatch caller
+// passes [routedSchema]'s result: the bound database in single-database
+// mode, the change's source database in a cross-database multi-database
+// write). It is used verbatim for both the cache key and the
+// information_schema lookup — the routing decision lives entirely in the
+// caller, so this helper must not re-apply applierSchema (that would
+// override a cross-database lookup back to the bound database).
 func (a *ChangeApplier) pkFor(ctx context.Context, tx *sql.Tx, schema, table string) ([]string, error) {
 	qn := qualifiedName(schema, table)
 	if cached, ok := a.pkCache[qn]; ok {
 		return cached, nil
 	}
-	pk, err := loadPrimaryKey(ctx, tx, applierSchema(a.schema, schema), table)
+	pk, err := loadPrimaryKey(ctx, tx, schema, table)
 	if err != nil {
 		return nil, err
 	}
@@ -1074,7 +1123,9 @@ func (a *ChangeApplier) colTypesFor(ctx context.Context, _ *sql.Tx, schema, tabl
 	// The pkFor helper uses the tx for symmetry with the data write,
 	// but column-type metadata changes only on DDL, which sluice does
 	// not interleave with row events on the applier side.
-	tbl, err := loadTableSchema(ctx, a.db, applierSchema(a.schema, schema), table)
+	// schema is the already-resolved target database (see pkFor) — used
+	// verbatim for the lookup; the routing decision lives in the caller.
+	tbl, err := loadTableSchema(ctx, a.db, schema, table)
 	if err != nil {
 		return nil, err
 	}
@@ -1101,6 +1152,37 @@ func applierSchema(defaultSchema, changeSchema string) string {
 		return defaultSchema
 	}
 	return changeSchema
+}
+
+// routedSchema is the ADR-0074 Phase 1b namespace selector the dispatch
+// path uses to qualify each change's table reference. It generalises
+// [applierSchema] to the multi-database fan-out case while preserving
+// byte-identical single-database behaviour:
+//
+//   - Routing DISABLED (multiDBRouting == false; the default for every
+//     single-database run, ALL engine pairs): returns
+//     applierSchema(a.schema, changeSchema) UNCHANGED — the bound
+//     database when set, the change's schema only as a fallback. This is
+//     the load-bearing back-compat guard. Note the cross-engine
+//     single-database case (a PG source already populates Change.Schema,
+//     differing from a MySQL target's bound database) lands here and
+//     stays bound — qualifying on the differing namespace alone would
+//     re-introduce the Phase-1a over-qualification regression.
+//
+//   - Routing ENABLED (multiDBRouting == true; a multi-database CDC
+//     stream): qualifies with the change's source database ONLY when it
+//     is non-empty AND differs from the bound `schema` — exactly the
+//     cross-database case (`app_db` row applied while bound to a
+//     control/different database). A change whose schema is empty or
+//     equals the bound database returns the bound database, so an
+//     in-bound-namespace change still emits the SAME bound SQL. This
+//     mirrors emitAddForeignKey's "qualify across DIFFERING namespaces
+//     only" rule.
+func (a *ChangeApplier) routedSchema(changeSchema string) string {
+	if a.multiDBRouting && changeSchema != "" && changeSchema != a.schema {
+		return changeSchema
+	}
+	return applierSchema(a.schema, changeSchema)
 }
 
 // loadPrimaryKey reads the PK columns for the named table from

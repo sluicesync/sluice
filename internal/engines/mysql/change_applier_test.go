@@ -496,6 +496,53 @@ func TestRunWithDeadline(t *testing.T) {
 	})
 }
 
+// TestApplier_RoutedSchema_BackCompatClass pins the ADR-0074 Phase 1b
+// namespace-routing class on the MySQL applier (part B). The matrix is
+// the back-compat class the reviewer re-derives: routing OFF must be
+// byte-identical (the bound database, ALWAYS) regardless of the
+// change's Schema; routing ON qualifies ONLY when the change Schema is
+// non-empty AND differs from the bound database.
+//
+// The cross-engine single-database trap (a PG source whose CDC reader
+// already populates Change.Schema, streamed into a MySQL target with a
+// differing bound database) is the third OFF row: it must stay bound,
+// NOT qualify — that is the Phase-1a over-qualification regression this
+// guard exists to prevent.
+func TestApplier_RoutedSchema_BackCompatClass(t *testing.T) {
+	cases := []struct {
+		name         string
+		bound        string
+		routing      bool
+		changeSchema string
+		want         string
+	}{
+		// Routing OFF — byte-identical single-database behaviour. The
+		// bound database wins in every row, ignoring Change.Schema.
+		{"off: empty change schema -> bound", "app", false, "", "app"},
+		{"off: change schema == bound -> bound", "app", false, "app", "app"},
+		{"off: cross-engine differing schema -> bound (NO over-qualify)", "app", false, "public", "app"},
+		// Routing ON — multi-database fan-out. Qualify only across
+		// DIFFERING non-empty namespaces; otherwise stay bound.
+		{"on: empty change schema -> bound (bare)", "app", true, "", "app"},
+		{"on: change schema == bound -> bound (bare)", "app", true, "app", "app"},
+		{"on: differing non-empty schema -> qualified", "app", true, "other_db", "other_db"},
+		// Defensive: an unbound applier falls back to the change schema
+		// in both modes (applierSchema totality), unchanged from today.
+		{"off: unbound applier -> change schema fallback", "", false, "src", "src"},
+		{"on: unbound applier -> change schema fallback", "", true, "src", "src"},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			a := &ChangeApplier{schema: c.bound, multiDBRouting: c.routing}
+			if got := a.routedSchema(c.changeSchema); got != c.want {
+				t.Errorf("routedSchema(%q) with bound=%q routing=%v = %q; want %q",
+					c.changeSchema, c.bound, c.routing, got, c.want)
+			}
+		})
+	}
+}
+
 // TestApplier_SchemaSnapshot_NilIRIsLoud pins ADR-0049 locked
 // decision #4b at the dispatch boundary: a SchemaSnapshot with a nil
 // IR table is a loud error (never silently skipped). The nil check
