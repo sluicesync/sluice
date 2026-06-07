@@ -222,3 +222,31 @@ All three were resolved with the proposed defaults:
 3. **A MySQL → MySQL target auto-creates each database** (`CREATE DATABASE IF NOT
    EXISTS` per source database) rather than requiring the operator to pre-create
    them. sluice owns this small additional DDL surface for the convenience.
+
+## Implementation notes — Phase 1a (shipped 2026-06-07)
+
+Phase 1a (multi-database `migrate`/snapshot) landed in one commit. Two
+deliberate divergences from the design above, both within the ADR's latitude
+and flagged here so Phase 1b builds on them correctly:
+
+- **Per-database snapshot, not the single spanning consistent snapshot.** 1a
+  re-opens a single-database reader per selected database (reusing the whole
+  single-database migrate body) — so each database gets its OWN snapshot rather
+  than one `START TRANSACTION WITH CONSISTENT SNAPSHOT` spanning all of them.
+  For a one-time `migrate` (no CDC handoff) this is acceptable: the common case
+  is a quiesced source, and a cross-database FK whose referent moved between
+  per-database snapshots fails LOUDLY at the deferred FK pass, never silently.
+  **The single spanning snapshot is genuinely required for Phase 1b** (the
+  server-wide binlog position must be captured at one consistent cut across all
+  databases for the snapshot→CDC handoff) and must land there.
+- **Resume is per-database.** Each database carries its own
+  `migration_id`-suffixed state row, so a `--resume` continues each database
+  independently. This was not exercised end-to-end in 1a's integration tests
+  (a follow-up test is tracked).
+
+Also resolved within latitude: cross-database FKs are deferred to a final
+cross-database pass (the ADR specifies the carve-out, not the create-ordering);
+`--target-schema` and `--inject-shard-column` are refused in multi-database mode
+(each source database already routes to a same-named namespace); and `--dry-run`
+skips the orchestrator-level target writes (`CREATE DATABASE` + the deferred FK
+pass) — caught in review.
