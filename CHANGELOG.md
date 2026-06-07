@@ -43,6 +43,26 @@ existing single-database run is byte-identical.
   from the one persisted server-wide position without re-copying. Works
   MySQL→MySQL and MySQL→Postgres.
 
+### Fixed
+
+- **Silent-loss boundary gap in the binlog snapshot→CDC handoff.** The binlog
+  snapshot opener captured the row view (`START TRANSACTION WITH CONSISTENT
+  SNAPSHOT`) and the CDC start position (`SHOW BINARY LOG STATUS`) as two
+  separate statements. A transaction committing in the window between them
+  landed in **neither** the snapshot (it committed after the read view froze)
+  **nor** the CDC tail (its binlog offset is below the captured position) — a
+  silently lost row. The capture is now wrapped in `FLUSH TABLES WITH READ
+  LOCK` … `UNLOCK TABLES` (the mydumper/Debezium consistent-snapshot pattern),
+  so the snapshot view and the binlog position name the exact same logical
+  cut; the lock is released immediately after the position read and writes
+  resume captured by CDC from the frozen position. `FLUSH TABLES WITH READ
+  LOCK` needs the `RELOAD` privilege — absent it, sluice warns and falls back
+  to the prior lock-free capture rather than failing the run. The fix lands in
+  the shared snapshot opener, so it closes the gap for both the new
+  multi-database cold start **and** the pre-existing single-database binlog
+  snapshot path. Caught by the multi-database concurrent-writes regression
+  test under `-race`.
+
 ### Compatibility
 
 - No breaking API or CLI changes. Drop-in from v0.99.15. Multi-database mode
