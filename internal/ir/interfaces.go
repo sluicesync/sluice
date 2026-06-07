@@ -1394,6 +1394,30 @@ type MultiDatabaseSnapshotOpener interface {
 	OpenMultiDatabaseSnapshotStream(ctx context.Context, dsn string, databases []string) (*SnapshotStream, error)
 }
 
+// ServerCDCReaderOpener is the OPTIONAL engine surface for opening a
+// SERVER-WIDE CDC reader against a database-optional DSN — the
+// snapshot-less counterpart of [MultiDatabaseSnapshotOpener] that a
+// multi-database `sync start` WARM-RESUME needs (ADR-0074 Phase 1b.3).
+//
+// A multi-database cold-start opens its CDC reader as the [SnapshotStream]'s
+// Changes (server-wide, paired with the spanning snapshot). A WARM-RESUME
+// has a persisted server-wide binlog position and must NOT re-cold-start:
+// it opens a bare server-wide CDC reader, scopes it to the selected
+// database set via [CDCDatabaseScoper.SetCDCDatabaseScope], and resumes
+// [CDCReader.StreamChanges] from the one persisted position — exactly the
+// CDC wiring the cold-start does at handoff, minus the snapshot.
+//
+// The returned reader's bound database is empty (the binlog is
+// server-wide); the selected-database set is supplied separately via
+// [CDCDatabaseScoper]. dsn is a *server* connection — its database
+// component may be empty (the operator drove a multi-database run without
+// naming one). Only engines whose CDC stream is server-wide (MySQL binlog)
+// implement it; the VStream flavors return an [ErrNotImplemented]-shaped
+// error (keyspace-scoped CDC is the Phase 1c N-stream design).
+type ServerCDCReaderOpener interface {
+	OpenServerCDCReader(ctx context.Context, dsn string) (CDCReader, error)
+}
+
 // ExtensionAware is the optional engine-side surface for engines that
 // can pass through column types defined by extensions (ADR-0032). PG
 // implements; MySQL does not (no extension concept in the same shape).

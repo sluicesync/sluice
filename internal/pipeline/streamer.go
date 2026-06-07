@@ -1468,24 +1468,49 @@ func (s *Streamer) runOnce(ctx context.Context) error {
 	}
 	switch {
 	case s.multiDatabaseMode():
-		// ADR-0074 Phase 1b.2: multi-database fan-out cold-start. ONE
-		// spanning consistent snapshot across the selected databases →
-		// per-namespace bulk-copy → single server-wide binlog CDC routed
-		// per-change. Warm-resume (a persisted position) is Phase 1b.3 —
-		// refuse loudly here so an operator restart doesn't silently
-		// re-cold-start (and re-copy) across N databases. --reset-target-
-		// data / --restart-from-scratch are the explicit re-cold-start
-		// overrides; they bypass the refusal (handled inside
-		// coldStartMultiDatabase, which ignores the persisted position).
-		if found && !s.ResetTargetData && !s.RestartFromScratch {
-			return fmt.Errorf(
-				"pipeline: multi-database sync resume (a persisted position for stream %q exists) is not "+
-					"supported yet (ADR-0074 Phase 1b.3); re-run with --restart-from-scratch to force a fresh "+
-					"multi-database cold-start, or --reset-target-data to drop and re-copy",
-				streamID,
-			)
+		// ADR-0074 Phase 1b: multi-database fan-out. The cold-start path
+		// (1b.2) captures ONE spanning consistent snapshot across the
+		// selected databases → per-namespace bulk-copy → single server-wide
+		// binlog CDC routed per-change. The warm-resume path (1b.3) skips
+		// the snapshot+copy entirely: it re-resolves the selected database
+		// set, opens a bare server-wide CDC reader, re-scopes it to the set,
+		// enables routing, and resumes the single server-wide binlog from
+		// the one persisted position.
+		//
+		// --reset-target-data / --restart-from-scratch are the explicit
+		// re-cold-start overrides; they bypass warm-resume (handled inside
+		// coldStartMultiDatabase, which ignores the persisted position) so a
+		// fresh multi-database cold-start runs even when a position exists.
+		// Ordering mirrors the single-database dispatch above: the
+		// destructive/force-fresh flags win over a persisted position.
+		switch {
+		case s.ResetTargetData, s.RestartFromScratch:
+			changes, stop, err = s.coldStartMultiDatabase(streamCtx, lsnTracker, applier, streamID)
+		case found:
+			changes, stop, err = s.warmResumeMultiDatabase(streamCtx, persisted, lsnTracker, applier, streamID)
+			warmResumed = err == nil
+			// Slot-missing fall-through (ADR-0022), multi-database analogue:
+			// if the persisted server-wide position references binlog the
+			// source has since purged, the reader returns an error wrapping
+			// [ir.ErrPositionInvalid]. The only path forward is a fresh
+			// multi-database cold-start (re-snapshot across the selected set).
+			// Mirrors the single-database branch above; Bug 9's preflight
+			// still gates destructive dest-table operations.
+			if err != nil && errors.Is(err, ir.ErrPositionInvalid) {
+				slog.WarnContext(
+					ctx, "multi-database warm resume: persisted position is no longer valid; falling through to cold start",
+					slog.String("stream_id", streamID),
+					slog.String("position_token", persisted.Token),
+					slog.String("source_engine", persisted.Engine),
+					slog.String("err", err.Error()),
+				)
+				stop()
+				changes, stop, err = s.coldStartMultiDatabase(streamCtx, lsnTracker, applier, streamID)
+				warmResumed = false
+			}
+		default:
+			changes, stop, err = s.coldStartMultiDatabase(streamCtx, lsnTracker, applier, streamID)
 		}
-		changes, stop, err = s.coldStartMultiDatabase(streamCtx, lsnTracker, applier, streamID)
 	case s.ResetTargetData:
 		changes, stop, err = s.coldStart(streamCtx, lsnTracker, applier, streamID, ir.Position{})
 	case s.RestartFromScratch:

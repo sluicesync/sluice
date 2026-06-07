@@ -305,6 +305,145 @@ func (s *Streamer) coldStartMultiDatabase(
 	return changes, stop, nil
 }
 
+// warmResumeMultiDatabase is the ADR-0074 Phase 1b.3 multi-database
+// WARM-RESUME (stop → restart). A multi-database stream that has a
+// persisted server-wide binlog position must RESUME the single stream —
+// re-scoped to the selected database set, routing on — NOT re-cold-start
+// (which would re-snapshot + re-copy every database). Shape:
+//
+//  1. Re-resolve the selected database set + inScope predicate via the
+//     SAME resolveStreamDatabases the cold-start uses (the operator
+//     passes the same --include-database / --all-databases flags on
+//     restart; the live server is the source of truth, identical to
+//     cold-start). A newly-appeared in-scope database is admitted by the
+//     predicate; see the loud-failure note below.
+//  2. Open a BARE server-wide CDC reader (database-optional DSN) via
+//     [ir.ServerCDCReaderOpener] — no snapshot, no bulk-copy.
+//  3. Wire the CDC phase exactly as the cold-start does at handoff:
+//     SetCDCDatabaseScope(inScope) on the reader (scope the server-wide
+//     binlog to the selected set) and SetMultiDatabaseRouting(true) on
+//     the applier (per-change namespace routing). Refuse loudly if either
+//     surface is absent — without scoping the reader would emit only its
+//     (empty) bound database's events, and without routing the applier
+//     would write every database into one namespace (cross-database bleed
+//     / silent loss).
+//  4. Resume StreamChanges(ctx, persisted) from the ONE persisted
+//     server-wide position. Resume advances the one position regardless
+//     of which database an event came from (the binlog coordinate is
+//     server-wide).
+//
+// Loud-failure note (newly-appeared in-scope database): the selected set
+// is re-resolved from the LIVE server on restart, so a database created
+// since cold-start that matches the include globs IS admitted by inScope
+// and its CDC events flow. Its target namespace was never cold-started,
+// so the applier writes into an assumed-existing namespace; if it does
+// not exist the apply fails LOUDLY (no silent drop). Live add-database
+// (the cold-start analogue) is a future phase — 1b.3 only guarantees the
+// failure is loud, never silent.
+//
+// The returned changes channel + stop closure follow the same contract
+// as [Streamer.warmResume] / [Streamer.coldStartMultiDatabase].
+func (s *Streamer) warmResumeMultiDatabase(
+	ctx context.Context,
+	persisted ir.Position,
+	lsnTracker any,
+	applier ir.ChangeApplier,
+	streamID string,
+) (changes <-chan ir.Change, stop func(), err error) {
+	stop = func() {}
+
+	if err := s.validateMultiDatabaseStream(); err != nil {
+		return nil, stop, err
+	}
+
+	opener, ok := s.Source.(ir.ServerCDCReaderOpener)
+	if !ok {
+		return nil, stop, fmt.Errorf(
+			"pipeline: source engine %q does not support a server-wide CDC reader (ADR-0074 Phase 1b.3); "+
+				"multi-database `sync start` warm-resume requires a server-wide-binlog source (MySQL)",
+			s.Source.Name(),
+		)
+	}
+
+	// Re-resolve the selected database set from the live server — same
+	// source of truth as cold-start. The operator passed the same scope
+	// flags on restart; re-enumerate + re-filter rather than trusting any
+	// stale snapshot-time set (there is none persisted; the position model
+	// is one server-wide coordinate, not a per-database set).
+	selected, inScope, err := s.resolveStreamDatabases(ctx)
+	if err != nil {
+		return nil, stop, err
+	}
+	slog.InfoContext(
+		ctx, "multi-database sync: warm-resume; re-resolved database set",
+		slog.String("stream_id", streamID),
+		slog.Int("count", len(selected)),
+		slog.Any("databases", selected),
+		slog.String("position_token", persisted.Token),
+	)
+
+	// Open the bare server-wide CDC reader (no snapshot, no copy).
+	cdc, err := opener.OpenServerCDCReader(ctx, s.SourceDSN)
+	if err != nil {
+		return nil, stop, wrapWithHint(PhaseCDC, fmt.Errorf("pipeline: open server-wide cdc reader: %w", err))
+	}
+	// Once the reader is open every error path must close it.
+	closeReader := func() { closeIf(cdc) }
+
+	// Scope the server-wide binlog to the selected database set. The reader
+	// emits row/truncate events from EVERY selected database (each tagged
+	// with its source database in Change.Schema) and drops events outside
+	// the set. Refuse loudly when absent — an unscoped reader would emit
+	// only its (empty) bound database's events, silently losing every
+	// selected database's changes.
+	if scoper, ok := cdc.(ir.CDCDatabaseScoper); ok {
+		scoper.SetCDCDatabaseScope(inScope)
+	} else {
+		closeReader()
+		return nil, stop, fmt.Errorf(
+			"pipeline: source CDC reader for %q does not implement ir.CDCDatabaseScoper; "+
+				"cannot scope the server-wide binlog to the selected database set (ADR-0074 Phase 1b.3)",
+			s.Source.Name(),
+		)
+	}
+
+	// Enable per-change namespace routing on the applier. Refuse loudly if
+	// absent — it would silently write every database into one namespace
+	// (cross-database bleed / silent loss).
+	if router, ok := applier.(ir.MultiDatabaseRouter); ok {
+		router.SetMultiDatabaseRouting(true)
+	} else {
+		closeReader()
+		return nil, stop, fmt.Errorf(
+			"pipeline: target applier for %q does not implement ir.MultiDatabaseRouter; "+
+				"cannot route CDC changes per source database to same-named target namespaces (ADR-0074 Phase 1b.3)",
+			s.Target.Name(),
+		)
+	}
+
+	if lsnTracker != nil {
+		if attacher, ok := cdc.(lsnTrackerAttacher); ok {
+			attacher.AttachLSNTracker(lsnTracker)
+		}
+	}
+	if s.PollInterval > 0 {
+		if setter, ok := cdc.(pollIntervalSetter); ok {
+			setter.SetPollInterval(s.PollInterval)
+		}
+	}
+
+	changes, err = cdc.StreamChanges(ctx, persisted)
+	if err != nil {
+		closeReader()
+		return nil, stop, wrapWithHint(PhaseCDC, fmt.Errorf("pipeline: resume multi-database cdc: %w", err))
+	}
+	stop = func() { closeIf(cdc) }
+	if errer, ok := cdc.(interface{ Err() error }); ok {
+		s.sourceErrFn = errer.Err
+	}
+	return changes, stop, nil
+}
+
 // coldStartCopyOneDatabase reads one selected database's schema (scoped so
 // Table.Schema is stamped + the FK carve-out lifted) and bulk-copies its
 // tables — read from the SHARED spanning snapshot RowReader — into its

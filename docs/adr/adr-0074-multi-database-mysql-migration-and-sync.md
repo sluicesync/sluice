@@ -250,3 +250,46 @@ cross-database pass (the ADR specifies the carve-out, not the create-ordering);
 (each source database already routes to a same-named namespace); and `--dry-run`
 skips the orchestrator-level target writes (`CREATE DATABASE` + the deferred FK
 pass) — caught in review.
+
+## Implementation notes — Phase 1b.3 (multi-database `sync start` warm-resume)
+
+Phase 1b.3 makes multi-database sync feature-complete: a stop → restart (with a
+persisted position) now RESUMES the single server-wide binlog from the one
+persisted position — re-scoped to the selected database set, routing on — rather
+than re-cold-starting (which re-snapshots + re-copies every database).
+
+- **Dispatch.** `Streamer.runOnce` already branches cold-start vs warm-resume on
+  the persisted position. The multi-database case (`streamer.go`) now mirrors the
+  single-database ordering: `--reset-target-data` / `--restart-from-scratch` force
+  a fresh `coldStartMultiDatabase` (they bypass warm-resume and ignore the
+  persisted position); a present position with neither flag routes to the new
+  `warmResumeMultiDatabase`; absent → cold-start. The ADR-0022 slot-missing
+  fall-through has a multi-database analogue: a resume whose persisted server-wide
+  position references purged binlog (`ir.ErrPositionInvalid`) falls through to a
+  fresh multi-database cold-start, mirroring the single-database branch.
+- **`warmResumeMultiDatabase`** (`streamer_multidb.go`) re-resolves the selected
+  database set via the SAME `resolveStreamDatabases` the cold-start uses (the live
+  server is the source of truth — the operator passes the same scope flags on
+  restart; the position model persists ONE server-wide coordinate, not a
+  per-database set), opens a BARE server-wide CDC reader via the new
+  `ir.ServerCDCReaderOpener` engine surface (no snapshot, no copy), wires
+  `SetCDCDatabaseScope(inScope)` + `SetMultiDatabaseRouting(true)` exactly as the
+  cold-start does at handoff, and resumes `StreamChanges` from the persisted
+  position. It refuses loudly when the source lacks `ir.ServerCDCReaderOpener` /
+  `ir.CDCDatabaseScoper` or the applier lacks `ir.MultiDatabaseRouter`.
+- **`ir.ServerCDCReaderOpener`** is the snapshot-less sibling of
+  `MultiDatabaseSnapshotOpener` — `OpenServerCDCReader(ctx, dsn)` opens a CDC
+  reader against a database-optional server DSN. MySQL implements it by exposing
+  the already-existing `openBinlogServerCDCReader` (used internally by the spanning
+  snapshot's `Changes` since 1b.2); the VStream flavors refuse loudly
+  (keyspace-scoped, the Phase 1c N-stream design).
+- **Single-database warm-resume is untouched** — the new path is gated entirely on
+  `multiDatabaseMode()`; the single-database `warmResume` branch and its CDC reader
+  open are byte-identical.
+- **Loud-failure on a newly-appeared in-scope database.** The selected set is
+  re-resolved from the live server on restart, so a database created since
+  cold-start that matches the include globs IS admitted and its CDC events flow.
+  Its target namespace was never cold-started, so the applier writes into an
+  assumed-existing namespace; if it does not exist the apply fails LOUDLY (no
+  silent drop). Live add-database (the cold-start analogue of live add-table) is a
+  future phase; 1b.3 only guarantees the failure is loud.

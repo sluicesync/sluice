@@ -208,6 +208,33 @@ func openBinlogServerCDCReader(ctx context.Context, dsn string) (ir.CDCReader, e
 	return openBinlogCDCReaderShared(ctx, dsn, true)
 }
 
+// OpenServerCDCReader opens a server-wide binlog CDC reader against a
+// database-optional DSN (ADR-0074 Phase 1b.3, [ir.ServerCDCReaderOpener]).
+// It is the snapshot-less sibling of [Engine.OpenMultiDatabaseSnapshotStream]'s
+// Changes reader: a multi-database `sync start` WARM-RESUME has a persisted
+// server-wide binlog position and must resume the single server-wide stream
+// (re-scoped to the selected database set) WITHOUT a fresh cold-start
+// snapshot. The orchestrator scopes the returned reader via
+// [ir.CDCDatabaseScoper.SetCDCDatabaseScope] and resumes StreamChanges from
+// the persisted position.
+//
+// VStream flavors (planetscale / vitess) are keyspace-scoped, so a
+// server-wide CDC reader is not their model; they refuse loudly (multi-
+// keyspace CDC is the Phase 1c N-stream design).
+func (e Engine) OpenServerCDCReader(ctx context.Context, dsn string) (ir.CDCReader, error) {
+	if e.Capabilities().CDC == ir.CDCNone {
+		return nil, fmt.Errorf("%s: CDC not supported by this flavor: %w", e.Name(), ErrNotImplemented)
+	}
+	if e.Flavor.usesVStream() {
+		return nil, fmt.Errorf(
+			"%s: server-wide CDC resume is not supported on the VStream flavors (planetscale / vitess); "+
+				"VStream is keyspace-scoped and multi-keyspace CDC is a distinct N-stream design (ADR-0074 Phase 1c): %w",
+			e.Name(), ErrNotImplemented,
+		)
+	}
+	return openBinlogServerCDCReader(ctx, dsn)
+}
+
 func openBinlogCDCReaderShared(ctx context.Context, dsn string, serverScope bool) (ir.CDCReader, error) {
 	parse := parseDSN
 	if serverScope {

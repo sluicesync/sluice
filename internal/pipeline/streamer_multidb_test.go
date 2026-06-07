@@ -4,8 +4,11 @@
 package pipeline
 
 import (
+	"context"
 	"strings"
 	"testing"
+
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // TestStreamer_MultiDatabaseMode pins the back-compat discriminator: the
@@ -79,5 +82,55 @@ func TestStreamer_ValidateMultiDatabaseStream(t *testing.T) {
 				t.Fatalf("validateMultiDatabaseStream() = %v; want error containing %q", err, c.wantErr)
 			}
 		})
+	}
+}
+
+// TestStreamer_WarmResumeMultiDatabase_RefusesNonServerSource pins the
+// ADR-0074 Phase 1b.3 loud-failure floor: a multi-database warm-resume
+// against a source engine that can't open a server-wide CDC reader
+// (no [ir.ServerCDCReaderOpener]) refuses loudly BEFORE any I/O, rather
+// than silently degrading to a single-database resume. stubEngine panics
+// on every Open* call, so reaching the refusal (not a panic) proves the
+// type-assert gate fires first.
+func TestStreamer_WarmResumeMultiDatabase_RefusesNonServerSource(t *testing.T) {
+	s := &Streamer{
+		Source:         stubEngine{},
+		Target:         stubEngine{},
+		DatabaseFilter: DatabaseFilter{Include: []string{"app_db"}},
+	}
+	_, stop, err := s.warmResumeMultiDatabase(
+		context.Background(), ir.Position{Engine: "stub", Token: "tok"}, nil, nil, "sid",
+	)
+	if stop != nil {
+		stop() // no-op closure on the error path; call to satisfy the contract
+	}
+	if err == nil {
+		t.Fatal("warmResumeMultiDatabase did not refuse a non-server-CDC source")
+	}
+	if !strings.Contains(err.Error(), "ir.ServerCDCReaderOpener") &&
+		!strings.Contains(err.Error(), "server-wide CDC reader") {
+		t.Errorf("refusal %q does not name the server-wide-CDC requirement", err.Error())
+	}
+}
+
+// TestStreamer_WarmResumeMultiDatabase_PropagatesValidation pins that the
+// warm-resume path enforces the same multi-database flag-combo refusals as
+// the cold-start path (it calls validateMultiDatabaseStream first), so an
+// incompatible restart fails loudly before opening anything.
+func TestStreamer_WarmResumeMultiDatabase_PropagatesValidation(t *testing.T) {
+	s := &Streamer{
+		Source:       stubEngine{},
+		Target:       stubEngine{},
+		AllDatabases: true,
+		TargetSchema: "analytics", // incompatible with multi-database mode
+	}
+	_, stop, err := s.warmResumeMultiDatabase(
+		context.Background(), ir.Position{Engine: "stub", Token: "tok"}, nil, nil, "sid",
+	)
+	if stop != nil {
+		stop()
+	}
+	if err == nil || !strings.Contains(err.Error(), "--target-schema is incompatible") {
+		t.Fatalf("warmResumeMultiDatabase() = %v; want --target-schema incompatibility", err)
 	}
 }
