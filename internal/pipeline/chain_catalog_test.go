@@ -288,6 +288,173 @@ func mustWriteManifest(t *testing.T, store ir.BackupStore, path string, m *ir.Ma
 	}
 }
 
+// pgIncr builds a complete incremental manifest chained off parent.
+func pgIncr(parent, startLSN, endLSN string) *ir.Manifest {
+	m := &ir.Manifest{
+		FormatVersion:  ir.BackupFormatVersion,
+		CreatedAt:      time.Now().UTC(),
+		SourceEngine:   "postgres",
+		Kind:           ir.BackupKindIncremental,
+		ParentBackupID: parent,
+		StartPosition:  ir.Position{Engine: "postgres", Token: startLSN},
+		EndPosition:    ir.Position{Engine: "postgres", Token: endLSN},
+		PartialState:   ir.BackupStateComplete,
+	}
+	m.BackupID = ir.ComputeBackupID(m)
+	return m
+}
+
+// TestReconcileOpenSegmentCatalog_HealsHeadOrphan pins the fix for the
+// ADR-0046 crash-injection mis-stitch: a rotation-opened segment's first
+// (P_N, S] overlap incremental is durable on disk but was orphaned from
+// lineage.json (its best-effort catalog append was lost to a crash/cancel).
+// On resume the catalog's first recorded incremental then parents off the
+// orphan instead of the segment full, and restore refuses the segment as
+// "branching/mis-stitched lineage" though the on-disk chain is complete.
+// The heal must re-catalogue the orphan AT THE HEAD in chain order and fix
+// the derived coverage start / end.
+func TestReconcileOpenSegmentCatalog_HealsHeadOrphan(t *testing.T) {
+	ctx := context.Background()
+	root := newMemStore()
+
+	// seg0: capped root segment (Dir == "").
+	full0 := bug66Manifest(ir.BackupKindFull, "0/100")
+	mustWriteManifest(t, root, ManifestFileName, full0)
+
+	// seg1: rotation-opened sub-dir segment. Anchor S = 0/900; the first
+	// incremental A starts at the prior segment's end P_N = 0/250 (the
+	// kept overlap), so A.start != seg1.StartPosition.
+	seg1 := newPrefixedStore(root, "seg-1")
+	full1 := bug66Manifest(ir.BackupKindFull, "0/900")
+	mustWriteManifest(t, seg1, ManifestFileName, full1)
+	a := pgIncr(full1.BackupID, "0/250", "0/300")
+	b := pgIncr(a.BackupID, "0/300", "0/400")
+	c := pgIncr(b.BackupID, "0/400", "0/500")
+	pathA := "manifests/incr-1000000000001-aaaaaaaa.json"
+	pathB := "manifests/incr-1000000000002-bbbbbbbb.json"
+	pathC := "manifests/incr-1000000000003-cccccccc.json"
+	mustWriteManifest(t, seg1, pathA, a) // orphan: ON DISK, missing from catalog
+	mustWriteManifest(t, seg1, pathB, b)
+	mustWriteManifest(t, seg1, pathC, c)
+
+	capped := time.Now().UTC()
+	cat := &LineageCatalog{
+		FormatVersion: lineageCatalogFormatVersion,
+		SourceEngine:  "postgres",
+		SluiceVersion: "test",
+		Segments: []LineageSegment{
+			{Dir: "", SegmentID: full0.BackupID, FullManifestPath: ManifestFileName, StartPosition: full0.EndPosition, EndPosition: full0.EndPosition, Codec: CodecZstd, CappedAt: &capped},
+			// The bug shape: A is missing from Incrementals, so the list
+			// HEAD (B) parents off the orphan A, and the recorded coverage
+			// start is B.start (wrong) instead of A.start.
+			{Dir: "seg-1", SegmentID: full1.BackupID, FullManifestPath: ManifestFileName, StartPosition: full1.EndPosition, Incrementals: []string{pathB, pathC}, IncrementalCoverageStart: b.StartPosition, EndPosition: c.EndPosition, Codec: CodecZstd},
+		},
+	}
+	if err := writeLineageCatalog(ctx, root, cat); err != nil {
+		t.Fatalf("seed catalog: %v", err)
+	}
+
+	if err := reconcileOpenSegmentCatalog(ctx, root, seg1); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	healed, ok, err := loadLineageCatalog(ctx, root)
+	if err != nil || !ok {
+		t.Fatalf("reload catalog: ok=%v err=%v", ok, err)
+	}
+	got := healed.Segments[1]
+	if want := []string{pathA, pathB, pathC}; !slicesEqualStr(got.Incrementals, want) {
+		t.Fatalf("healed Incrementals = %v; want %v (orphan re-catalogued at head, chain order)", got.Incrementals, want)
+	}
+	if got.IncrementalCoverageStart.Token != "0/250" {
+		t.Errorf("healed IncrementalCoverageStart = %q; want 0/250 (the true first link A's start)", got.IncrementalCoverageStart.Token)
+	}
+	if got.EndPosition.Token != "0/500" {
+		t.Errorf("healed EndPosition = %q; want 0/500 (last link C's end)", got.EndPosition.Token)
+	}
+	// seg0 must be untouched.
+	if len(healed.Segments[0].Incrementals) != 0 || healed.Segments[0].CappedAt == nil {
+		t.Errorf("seg0 mutated by heal: %+v", healed.Segments[0])
+	}
+
+	// Idempotent: a second reconcile is a no-op.
+	if err := reconcileOpenSegmentCatalog(ctx, root, seg1); err != nil {
+		t.Fatalf("reconcile (2nd): %v", err)
+	}
+	again, _, _ := loadLineageCatalog(ctx, root)
+	if !slicesEqualStr(again.Segments[1].Incrementals, []string{pathA, pathB, pathC}) {
+		t.Errorf("second reconcile changed the catalog: %v", again.Segments[1].Incrementals)
+	}
+}
+
+// TestReconcileOpenSegmentCatalog_NoOpWhenConsistent: a catalog that
+// already matches disk is left byte-identical (no spurious rewrite).
+func TestReconcileOpenSegmentCatalog_NoOpWhenConsistent(t *testing.T) {
+	ctx := context.Background()
+	root := newMemStore()
+	full := bug66Manifest(ir.BackupKindFull, "0/100")
+	mustWriteManifest(t, root, ManifestFileName, full)
+	a := pgIncr(full.BackupID, "0/100", "0/200")
+	pathA := "manifests/incr-1000000000001-aaaaaaaa.json"
+	mustWriteManifest(t, root, pathA, a)
+	cat := &LineageCatalog{
+		FormatVersion: lineageCatalogFormatVersion, SourceEngine: "postgres", SluiceVersion: "test",
+		Segments: []LineageSegment{{Dir: "", SegmentID: full.BackupID, FullManifestPath: ManifestFileName, StartPosition: full.EndPosition, Incrementals: []string{pathA}, EndPosition: a.EndPosition, Codec: CodecZstd}},
+	}
+	if err := writeLineageCatalog(ctx, root, cat); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if err := reconcileOpenSegmentCatalog(ctx, root, root); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	got, _, _ := loadLineageCatalog(ctx, root)
+	if !slicesEqualStr(got.Segments[0].Incrementals, []string{pathA}) {
+		t.Errorf("consistent catalog mutated: %v", got.Segments[0].Incrementals)
+	}
+}
+
+// TestReconcileOpenSegmentCatalog_RefusesToGuessOnBranch: when the
+// on-disk set is NOT a single clean linear chain off the full (here two
+// incrementals share a parent — a real branch), the heal refuses to
+// guess and leaves the catalog untouched for restore's strict check.
+func TestReconcileOpenSegmentCatalog_RefusesToGuessOnBranch(t *testing.T) {
+	ctx := context.Background()
+	root := newMemStore()
+	full := bug66Manifest(ir.BackupKindFull, "0/100")
+	mustWriteManifest(t, root, ManifestFileName, full)
+	// Two children both parent off the full -> branch.
+	b1 := pgIncr(full.BackupID, "0/100", "0/200")
+	b2 := pgIncr(full.BackupID, "0/100", "0/250")
+	mustWriteManifest(t, root, "manifests/incr-1000000000001-aaaaaaaa.json", b1)
+	mustWriteManifest(t, root, "manifests/incr-1000000000002-bbbbbbbb.json", b2)
+	cat := &LineageCatalog{
+		FormatVersion: lineageCatalogFormatVersion, SourceEngine: "postgres", SluiceVersion: "test",
+		Segments: []LineageSegment{{Dir: "", SegmentID: full.BackupID, FullManifestPath: ManifestFileName, StartPosition: full.EndPosition, Codec: CodecZstd}},
+	}
+	if err := writeLineageCatalog(ctx, root, cat); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if err := reconcileOpenSegmentCatalog(ctx, root, root); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	got, _, _ := loadLineageCatalog(ctx, root)
+	if len(got.Segments[0].Incrementals) != 0 {
+		t.Errorf("branch was healed (%v); want untouched (strict restore surfaces it)", got.Segments[0].Incrementals)
+	}
+}
+
+func slicesEqualStr(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // memStore is a minimal in-memory BackupStore for catalog/lineage
 // tests. The real LocalStore + BlobStore have integration coverage;
 // the lineage behaviour is store-agnostic.

@@ -213,10 +213,8 @@ func TestADR0046_CrashInjectionMatrix_PG(t *testing.T) {
 		{"pre-commit-write", false},
 		{"post-commit-write", true},
 	}
-	// TEMP PHASE-A (REMOVE): repeat every edge 4x so a single CI run gets
-	// ~20 independent crash attempts — the mis-stitch is ~1/3 per attempt
-	// and never repros locally, so we stress it to capture forensics in
-	// one run instead of churning single-job reruns.
+	// TEMP VERIFY (REMOVE): 4x stress to prove the reconcile fix closes the
+	// mis-stitch across ~20 crash attempts under CI -race load.
 	var edges []struct {
 		name       string
 		postCommit bool
@@ -353,7 +351,6 @@ func TestADR0046_CrashInjectionMatrix_PG(t *testing.T) {
 			// correct, no loss".
 			if err := (&Restore{Target: eng, TargetDSN: targetDSN, Store: store}).
 				Run(context.Background()); err != nil {
-				dumpLineageForensics(t, store, edge.name) // TEMP PHASE-A (REMOVE)
 				t.Fatalf("restore after %s recovery: %v", edge.name, err)
 			}
 			got := map[string]bool{}
@@ -369,65 +366,6 @@ func TestADR0046_CrashInjectionMatrix_PG(t *testing.T) {
 				edge.name, len(lin.Segments), edge.postCommit)
 		})
 	}
-}
-
-// dumpLineageForensics is TEMP PHASE-A instrumentation: on a restore
-// failure it dumps the full lineage-catalog structure AND every manifest
-// in the store (path/kind/BackupID/ParentBackupID/positions, including
-// orphans not catalogued in any segment) so the mis-stitch ground truth
-// is captured in one failing -race run. REMOVE after the fix lands.
-func dumpLineageForensics(t *testing.T, store ir.BackupStore, edgeName string) {
-	t.Helper()
-	ctx := context.Background()
-	t.Logf("=== PHASE-A FORENSICS (edge=%s) ===", edgeName)
-
-	cat, ok, err := loadLineageCatalog(ctx, store)
-	if err != nil || !ok {
-		t.Logf("lineage catalog: ok=%v err=%v", ok, err)
-	} else {
-		t.Logf("lineage: %d segment(s), restorableFrom=%d", len(cat.Segments), cat.RestorableFromSegment)
-		for i := range cat.Segments {
-			s := &cat.Segments[i]
-			capped := "OPEN"
-			if s.CappedAt != nil {
-				capped = "capped"
-			}
-			t.Logf("  seg[%d] dir=%q id=%s %s incrCoverageStart=%q start=%q end=%q incrementals=%d",
-				i, s.Dir, s.SegmentID, capped, s.IncrementalCoverageStart.Token, s.StartPosition.Token, s.EndPosition.Token, len(s.Incrementals))
-			ss := newPrefixedStore(store, s.Dir)
-			if fm, ferr := readManifestAt(ctx, ss, s.FullManifestPath); ferr == nil {
-				t.Logf("      FULL  path=%s id=%s parent=%s end=%q", s.FullManifestPath, manifestBackupID(fm), fm.ParentBackupID, fm.EndPosition.Token)
-			} else {
-				t.Logf("      FULL  path=%s READ-ERR=%v", s.FullManifestPath, ferr)
-			}
-			for ii, ip := range s.Incrementals {
-				if im, ierr := readManifestAt(ctx, ss, ip); ierr == nil {
-					t.Logf("      inc[%d] path=%s id=%s parent=%s start=%q end=%q", ii, ip, manifestBackupID(im), im.ParentBackupID, im.StartPosition.Token, im.EndPosition.Token)
-				} else {
-					t.Logf("      inc[%d] path=%s READ-ERR=%v", ii, ip, ierr)
-				}
-			}
-		}
-	}
-
-	// Walk every object in the store and try to read it as a manifest —
-	// this surfaces ORPHANS (manifests on disk not referenced by any
-	// segment), e.g. a discarded provisional full whose BackupID a
-	// mis-stitched incremental still names.
-	paths, lerr := store.List(ctx, "")
-	if lerr != nil {
-		t.Logf("store.List err=%v", lerr)
-		return
-	}
-	t.Logf("--- all objects (%d) ---", len(paths))
-	for _, p := range paths {
-		if m, merr := readManifestAt(ctx, store, p); merr == nil && m != nil && m.Kind != "" {
-			t.Logf("  obj %s kind=%s id=%s parent=%s start=%q end=%q", p, canonicalKind(m.Kind), manifestBackupID(m), m.ParentBackupID, m.StartPosition.Token, m.EndPosition.Token)
-		} else {
-			t.Logf("  obj %s (non-manifest or unreadable)", p)
-		}
-	}
-	t.Logf("=== END PHASE-A FORENSICS ===")
 }
 
 // TestADR0046_NeverRotatedByteIdentical_PG proves the
