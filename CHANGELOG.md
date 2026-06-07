@@ -6,6 +6,26 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.99.14] - 2026-06-07
+
+Resume-idempotency hardening plus a PlanetScale no-PK migrate fix. A
+`migrate --resume` whose schema-apply phases re-run over already-built
+objects no longer aborts on a duplicate, and migrating a large no-PK table
+from PlanetScale no longer silently truncates at vtgate's row cap. Drop-in
+from v0.99.13 — no breaking API or CLI changes.
+
+### Fixed
+
+- **`migrate --resume` is now idempotent across the index and constraint phases (no more `Duplicate key name` / `constraint already exists`).** When a resume re-entered `phase=indexes` or `phase=constraints` over a table whose objects a prior run had already created — e.g. after the resume changed `--include-table`/`--exclude-table` scope, or after a phase that had partially completed — sluice re-issued a plain `CREATE INDEX` / `ADD FOREIGN KEY` and the engine rejected the duplicate: MySQL `Error 1061 (Duplicate key name)` / `Error 1826 (Duplicate foreign key constraint name)`, Postgres `relation … already exists` / `constraint … already exists`. No data was lost (it failed loud and left the target intact), but the run wedged on a confusing error. Both phases are now idempotent in both engines — sluice owns these tables, so a same-named index/FK is the one it built and is skipped: MySQL probes `information_schema` and skips already-present objects (it has no `IF NOT EXISTS` for indexes/FKs); Postgres promotes index creation to `CREATE INDEX IF NOT EXISTS` and catalog-checks foreign keys before adding. Pinned per engine by a re-run-must-be-a-no-op integration matrix.
+
+### Added
+
+- **PlanetScale source migrations of a no-PK table no longer truncate at vtgate's ~100k-row cap.** vtgate's default OLTP workload caps a single result set at ~100,000 rows. The `migrate` bulk read is one streaming `SELECT`, and a no-PK source table can't be primary-key-chunked — so its full-scan copy is a single large `SELECT` that vtgate silently truncated at 100k rows. sluice now sets `workload=olap` (the battle-tested pscale-dumper convention) on the migrate reader's session, which lifts the cap and streams. It is applied **only** to the read session, and **only** for PlanetScale / VStream (vtgate) flavors — never to the writer, applier, or any path that uses transactions (OLAP mode forbids them), and never to vanilla MySQL (which has no such variable). A `workload` set in the DSN still wins. Validated against `vttestserver` (the session var is accepted and `@@workload` reports `OLAP`).
+
+### Compatibility
+
+- No breaking API or CLI changes. Drop-in from v0.99.13. The resume-idempotency change only affects re-run behaviour (a fresh first run emits byte-identical DDL); the `workload=olap` change only affects the PlanetScale/VStream `migrate` read session — vanilla MySQL and all write/CDC paths are unchanged.
+
 ## [0.99.13] - 2026-06-06
 
 Cross-engine parity + table-scope completion. A no-PK table that carries a
