@@ -6,6 +6,24 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.99.15] - 2026-06-07
+
+A self-hosted Vitess engine flavor and a clearer error for an unsupported
+Postgres user-defined type. Drop-in from v0.99.14 — additive, no breaking
+API or CLI changes.
+
+### Added
+
+- **`--source-driver=vitess` — a self-hosted Vitess engine flavor.** A sibling to the `planetscale` flavor for operators running their own Vitess (etcd + vtctld + vtgate + vttablets), rather than PlanetScale's hosted service. It shares PlanetScale's VStream engine code and capabilities verbatim; the difference is the **self-hosted connection defaults**: a typical self-hosted vtgate speaks plaintext gRPC with no auth, so the `vitess` flavor defaults `vstream_transport=plaintext` and `vstream_auth=none` — `--source-driver=vitess` connects without hand-set `vstream_*` params. The hosted `planetscale` flavor keeps its secure `tls` + `basic` defaults; a value set in the DSN always wins. (`vstream_endpoint` and `vstream_shards` have no universal self-hosted default, so the operator still supplies those.) Internally, the VStream-vs-binlog branch points (CDC reader, cold-start + resumable snapshot, backup snapshot, `_vt_*` internal-table exclusion) now gate on a `usesVStream()` capability predicate, so the new flavor is correct at every path. Validated against `vttestserver` (a `vitess`-flavor cold-start COPY connects and streams with no transport/auth params).
+
+### Fixed
+
+- **Clearer error for an unsupported Postgres user-defined type.** A `USER-DEFINED` column that is not a recognised enum, a catalogued/enabled extension type, geometry, or a same-engine verbatim-passthrough type (i.e. a composite or domain type, which the IR does not model) previously refused with `user-defined type "X" is not a recognised enum` — misleading, since the type was never going to be an enum. The message now states the type is unsupported and why, and points at the reliable `--exclude-table` escape.
+
+### Compatibility
+
+- No breaking API or CLI changes. Drop-in from v0.99.14. The `vitess` flavor is purely additive (a new registered engine name); existing `mysql` / `planetscale` behaviour is byte-identical. The user-defined-type change is error-message-only.
+
 ## [0.99.14] - 2026-06-07
 
 Resume-idempotency hardening plus a PlanetScale no-PK migrate fix. A
