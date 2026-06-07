@@ -6,6 +6,56 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.99.16] - 2026-06-07
+
+**Multi-database MySQL migration and continuous sync (ADR-0074).** A single
+`sluice` run can now connect to a MySQL server and migrate — and continuously
+sync — many databases at once, each landing in its own same-named target
+namespace, analogous to how a Postgres source carries multiple schemas.
+Drop-in from v0.99.15 — purely additive; without the new flags, every
+existing single-database run is byte-identical.
+
+### Added
+
+- **`migrate` across multiple MySQL databases in one run.** New flags
+  `--include-database <glob>` / `--exclude-database <glob>` (mutually
+  exclusive, repeatable) and `--all-databases`. When any is set, the source
+  DSN is a *server* connection (its database component is optional), sluice
+  enumerates the server's databases, and each selected database is migrated
+  to a **same-named target namespace**: a Postgres **schema** (MySQL→Postgres)
+  or an auto-created target **database** (MySQL→MySQL, via `CREATE DATABASE IF
+  NOT EXISTS`). System databases (`information_schema`, `performance_schema`,
+  `mysql`, `sys`) are always excluded. Cross-database foreign keys are
+  preserved when both databases are in scope and applied in a final pass after
+  every database's tables exist; a foreign key pointing at a database *outside*
+  the selected set is **refused loudly** (sluice can't guarantee the referent
+  exists on the target) rather than silently flattened.
+
+- **`sync start` across multiple MySQL databases — cold-start, CDC, and
+  resume.** The same `--include-database` / `--exclude-database` /
+  `--all-databases` flags on `sync start` give continuous multi-database
+  replication. The cold start captures **one consistent snapshot spanning all
+  selected databases** (a single `START TRANSACTION WITH CONSISTENT SNAPSHOT`
+  on one pinned connection, one binlog position) so the snapshot→CDC handoff is
+  a single gapless cut across every database. Steady-state CDC then rides the
+  **server-wide MySQL binlog as one stream**, routing each change to its source
+  database's target namespace — not N streams. A stopped stream **warm-resumes**
+  from the one persisted server-wide position without re-copying. Works
+  MySQL→MySQL and MySQL→Postgres.
+
+### Compatibility
+
+- No breaking API or CLI changes. Drop-in from v0.99.15. Multi-database mode
+  engages only when a `--*-database` / `--all-databases` flag is set; without
+  them, single-database `migrate` and `sync start` are byte-identical (same
+  snapshot, same position, same apply path). The feature is MySQL-source
+  fan-out; PlanetScale/VStream multi-keyspace and the reverse
+  Postgres-source→MySQL-multi-database direction are tracked follow-ons. New
+  engine surfaces are additive optional interfaces. A MySQL→MySQL
+  multi-database target DSN must name a "home" database for the sync control
+  table (it errors clearly if absent); per-source user data still routes to its
+  own database.
+
 ## [0.99.15] - 2026-06-07
 
 A self-hosted Vitess engine flavor and a clearer error for an unsupported
