@@ -121,6 +121,15 @@ ADRs are numbered in the order they were proposed. A few notable conventions:
 | [0069](adr-0069-service-mode-readyz.md) | Service-mode `/readyz` endpoint for k8s/load-balancer probes |
 | [0070](adr-0070-stage-2-verbatim-carry-promote.md) | Promote Stage 2 core-PG verbatim carry (xml/money/pg_lsn/txid_snapshot/pg_snapshot) per ADR-0051a evidence |
 
+## VStream resilience + multi-database (0071–0074)
+
+| ADR | Decision |
+|---|---|
+| [0071](adr-0071-vstream-snapshot-bounded-memory.md) | Bounded-memory VStream cold-start COPY (byte-capped backpressured pump, `--max-buffer-bytes`) |
+| [0072](adr-0072-resumable-coldstart-copy.md) | Resumable VStream cold-start COPY (carry Vitess `TablePKs` cursor, checkpoint during COPY, in-place reconnect) |
+| [0073](adr-0073-vitess-internal-and-online-ddl-tables.md) | Exclude Vitess internal / online-DDL `_vt_*` tables from COPY+CDC; survive an online-DDL cutover zero-loss |
+| [0074](adr-0074-multi-database-mysql-migration-and-sync.md) | **Proposed** — multi-database MySQL migrate + sync (one server → N databases → N target namespaces; server-wide binlog CDC with per-event apply-routing) |
+
 ## Notes / dialogue prep / readiness briefs
 
 Some ADRs were drafted from dialogue artifacts in `docs/dev/notes/`. Notable companions:
