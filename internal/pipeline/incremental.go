@@ -514,14 +514,31 @@ func chainTailManifest(ctx context.Context, rootStore ir.BackupStore, recs []man
 			tailPath := seg.Incrementals[n-1]
 			for i := range recs {
 				if recs[i].path == tailPath {
+					slog.InfoContext(ctx, "PHASEA chainTail: catalog-tail matched", // TEMP PHASE-A (REMOVE)
+						slog.String("seg_dir", seg.Dir), slog.Int("seg_incr_count", n),
+						slog.String("tail_path", tailPath),
+						slog.String("tail_id", manifestBackupID(recs[i].manifest)),
+						slog.String("tail_parent", recs[i].manifest.ParentBackupID))
 					return recs[i]
 				}
 			}
+			// DANGER: catalog names a tail the walk didn't surface -> the
+			// unreliable walk-order fallback below decides the parent.
+			slog.WarnContext(ctx, "PHASEA chainTail: catalog tailPath NOT in recs -> walk-last fallback", // TEMP PHASE-A (REMOVE)
+				slog.String("seg_dir", seg.Dir), slog.Int("seg_incr_count", n),
+				slog.String("tail_path", tailPath), slog.Int("recs", len(recs)))
+		} else {
+			slog.InfoContext(ctx, "PHASEA chainTail: open segment has 0 catalogued incrementals -> walk-last", // TEMP PHASE-A (REMOVE)
+				slog.String("seg_dir", seg.Dir), slog.Int("recs", len(recs)))
 		}
 	}
 	// No lineage / no incrementals recorded: the walk's last record is
 	// the tail (full when the segment has no incrementals).
-	return recs[len(recs)-1]
+	last := recs[len(recs)-1]
+	slog.InfoContext(ctx, "PHASEA chainTail: walk-last chosen", // TEMP PHASE-A (REMOVE)
+		slog.String("path", last.path), slog.String("id", manifestBackupID(last.manifest)),
+		slog.String("parent", last.manifest.ParentBackupID))
+	return last
 }
 
 // readSourceSchema opens a fresh schema reader and reads the source
