@@ -283,6 +283,61 @@ func applyViewFilter(ctx context.Context, schema *ir.Schema, filter ViewFilter, 
 	)
 }
 
+// DatabaseFilter selects which source databases participate in a
+// multi-database fan-out migration (ADR-0074). Same shape and semantics
+// as [TableFilter]: at most one of Include / Exclude is non-empty
+// ([path.Match] glob patterns), validated at construction. The zero
+// value is the "everything passes" filter.
+//
+// System databases (information_schema, performance_schema, mysql, sys)
+// are excluded by the engine's [ir.DatabaseLister] before the filter
+// ever sees the list, so an operator's `--include-database '*'` /
+// `--all-databases` never picks them up.
+type DatabaseFilter struct {
+	Include []string
+	Exclude []string
+}
+
+// NewDatabaseFilter mirrors [NewTableFilter]: validates mutual exclusion
+// of Include / Exclude and that each pattern is well-formed under
+// [path.Match].
+func NewDatabaseFilter(include, exclude []string) (DatabaseFilter, error) {
+	if len(include) > 0 && len(exclude) > 0 {
+		return DatabaseFilter{}, fmt.Errorf(
+			"pipeline: --include-database and --exclude-database are mutually exclusive (got include=%v exclude=%v)",
+			include, exclude,
+		)
+	}
+	for _, p := range include {
+		if _, err := path.Match(p, ""); err != nil {
+			return DatabaseFilter{}, fmt.Errorf("pipeline: invalid include-database pattern %q: %w", p, err)
+		}
+	}
+	for _, p := range exclude {
+		if _, err := path.Match(p, ""); err != nil {
+			return DatabaseFilter{}, fmt.Errorf("pipeline: invalid exclude-database pattern %q: %w", p, err)
+		}
+	}
+	return DatabaseFilter{Include: include, Exclude: exclude}, nil
+}
+
+// IsEmpty reports whether the filter has no rules.
+func (f DatabaseFilter) IsEmpty() bool {
+	return len(f.Include) == 0 && len(f.Exclude) == 0
+}
+
+// Allows reports whether database participates. Same [path.Match]
+// semantics as [TableFilter.Allows].
+func (f DatabaseFilter) Allows(database string) bool {
+	if len(f.Include) > 0 {
+		return matchesAny(f.Include, database)
+	}
+	if len(f.Exclude) > 0 {
+		return !matchesAny(f.Exclude, database)
+	}
+	return true
+}
+
 // filterChanges wraps in with a goroutine that drops [ir.Change]
 // events whose table is excluded by filter. Used by the streamer's
 // dispatch loop so the [ir.ChangeApplier] never sees events for

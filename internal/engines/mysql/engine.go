@@ -265,6 +265,125 @@ func (Engine) OpenChangeApplier(ctx context.Context, dsn string) (ir.ChangeAppli
 	}, nil
 }
 
+// systemDatabases is the closed set of MySQL server-internal databases
+// that are NEVER user data and are always excluded from a
+// multi-database fan-out (ADR-0074), even under `--all-databases`. The
+// lookup is lowercase-keyed: MySQL database names are case-insensitive
+// on the default (Linux server / lower_case_table_names) configurations
+// sluice targets, and these four are spelled lowercase by convention.
+var systemDatabases = map[string]struct{}{
+	"information_schema": {},
+	"performance_schema": {},
+	"mysql":              {},
+	"sys":                {},
+}
+
+// ListDatabases implements [ir.DatabaseLister]: it enumerates every
+// non-system database visible to the connection in dsn. Used by the
+// multi-database migrate orchestrator to resolve `--all-databases` /
+// `--include-database` / `--exclude-database` globs into a concrete
+// database set (ADR-0074).
+//
+// The dsn is a *server* connection — its database component may be
+// empty (the operator drove a multi-database run without naming one),
+// so this opens via [parseServerDSN] rather than [parseDSN]. The system
+// databases (information_schema, performance_schema, mysql, sys) are
+// filtered out unconditionally per the ADR.
+func (Engine) ListDatabases(ctx context.Context, dsn string) ([]string, error) {
+	cfg, err := parseServerDSN(dsn)
+	if err != nil {
+		return nil, err
+	}
+	db, err := openDB(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = db.Close() }()
+
+	const q = `SELECT schema_name FROM information_schema.schemata ORDER BY schema_name`
+	rows, err := db.QueryContext(ctx, q)
+	if err != nil {
+		return nil, fmt.Errorf("mysql: list databases: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, fmt.Errorf("mysql: list databases: scan: %w", err)
+		}
+		if _, sys := systemDatabases[strings.ToLower(name)]; sys {
+			continue
+		}
+		out = append(out, name)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("mysql: list databases: %w", err)
+	}
+	return out, nil
+}
+
+// WithDatabase implements [ir.DatabaseDSNDeriver]: it returns a clone of
+// dsn whose database component is set to database, leaving every other
+// DSN element (credentials, host, params) untouched. Used by the
+// multi-database fan-out orchestrator (ADR-0074) to re-open a
+// single-database reader/writer per selected database. The clone is
+// produced via the driver's own ParseDSN/FormatDSN so the round-trip
+// is faithful for unix sockets, params, and TLS configs alike.
+func (Engine) WithDatabase(dsn, database string) (string, error) {
+	cfg, err := parseServerDSN(dsn)
+	if err != nil {
+		return "", err
+	}
+	// FormatDSN re-emits the keep-alive network name finishParseDSN
+	// swapped in; reset it to the wire-standard `tcp` so the re-parsed
+	// clone routes through parseDSN's own keep-alive swap rather than
+	// double-prefixing. The vstream_* params are stripped at openDB, so
+	// leaving them on the clone is harmless.
+	if cfg.Net == keepaliveNet {
+		cfg.Net = "tcp"
+	}
+	clone := cfg.Clone()
+	clone.DBName = database
+	return clone.FormatDSN(), nil
+}
+
+// EnsureDatabase implements [ir.DatabaseDSNDeriver]: it issues
+// `CREATE DATABASE IF NOT EXISTS` for database against the server dsn
+// points at (ADR-0074, MySQL → MySQL auto-create-target-database). It
+// connects at the server level (database component optional) so a
+// freshly-provisioned target server with no per-source databases yet
+// still works. Idempotent.
+//
+// The database identifier is backtick-quoted via quoteIdent so a
+// database name with reserved-word or special-character shape is safe;
+// embedded backticks are doubled by quoteIdent.
+func (Engine) EnsureDatabase(ctx context.Context, dsn, database string) error {
+	if database == "" {
+		return errors.New("mysql: EnsureDatabase: database name is empty")
+	}
+	cfg, err := parseServerDSN(dsn)
+	if err != nil {
+		return err
+	}
+	// Connect at the server level — the target database may not exist
+	// yet, so a database-scoped DSN would fail to connect.
+	cfg = cfg.Clone()
+	cfg.DBName = ""
+	db, err := openDB(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = db.Close() }()
+
+	stmt := "CREATE DATABASE IF NOT EXISTS " + quoteIdent(database)
+	if _, err := db.ExecContext(ctx, stmt); err != nil {
+		return fmt.Errorf("mysql: create database %q: %w", database, wrapDDLError(err))
+	}
+	return nil
+}
+
 // DefaultExcludePatterns returns flavor-specific or DSN-derived
 // table patterns the orchestrator should merge into the operator's
 // exclude list (only when the operator hasn't supplied

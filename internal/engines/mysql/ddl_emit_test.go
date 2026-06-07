@@ -1131,6 +1131,30 @@ func TestEmitAddForeignKey(t *testing.T) {
 	}
 }
 
+// TestEmitAddForeignKey_QualifiedReferencedSchema pins the ADR-0074
+// multi-database fan-out behaviour: a FK carrying a ReferencedSchema
+// (the referenced table's database) qualifies the REFERENCES clause as
+// `db`.`table`, so a cross-database FK resolves against the same-named
+// target database rather than the current one. The empty-schema case is
+// the byte-identical single-database form pinned by TestEmitAddForeignKey.
+func TestEmitAddForeignKey_QualifiedReferencedSchema(t *testing.T) {
+	fk := &ir.ForeignKey{
+		Name:              "orders_region_fk",
+		Columns:           []string{"region_id"},
+		ReferencedSchema:  "shared_db",
+		ReferencedTable:   "regions",
+		ReferencedColumns: []string{"id"},
+	}
+	got, err := emitAddForeignKey("orders", fk)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := "ALTER TABLE `orders` ADD CONSTRAINT `orders_region_fk` FOREIGN KEY (`region_id`) REFERENCES `shared_db`.`regions` (`id`);"
+	if got != want {
+		t.Errorf("\n got  %q\n want %q", got, want)
+	}
+}
+
 func TestEmitAddForeignKey_NoActions(t *testing.T) {
 	// FKs with NoAction (the MySQL default) shouldn't emit ON DELETE
 	// / ON UPDATE clauses — they'd be redundant noise.

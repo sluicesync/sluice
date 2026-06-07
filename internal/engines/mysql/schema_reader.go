@@ -30,6 +30,48 @@ type SchemaReader struct {
 	// preserves the historical behaviour of every reader that
 	// pre-dates this field.
 	flavor Flavor
+
+	// multiDB is set by [SchemaReader.SetMultiDatabaseScope] when this
+	// reader is reading one database of a multi-database fan-out run
+	// (ADR-0074). It flips two behaviours, both NO-OP in the default
+	// single-database mode (back-compat):
+	//
+	//   - every emitted [ir.Table.Schema] / [ir.View.Schema] is stamped
+	//     with r.schema (the source database name), so the orchestrator
+	//     can route each database to its same-named target namespace.
+	//
+	//   - the flat-scope foreign-key carve-out is lifted:
+	//     [ir.ForeignKey.ReferencedSchema] is POPULATED with the
+	//     referenced table's database, and a FK referencing a database
+	//     OUTSIDE the selected set (per dbInScope) is REFUSED LOUDLY at
+	//     read time rather than silently flattened.
+	multiDB bool
+
+	// dbInScope reports whether a referenced database name is part of
+	// the multi-database run's selected set. Consulted only when
+	// multiDB is true; a nil predicate (the single-database default)
+	// disables the FK carve-out entirely.
+	dbInScope func(database string) bool
+}
+
+// SetMultiDatabaseScope implements [ir.MultiDatabaseScoper]. It marks
+// the reader as reading one database (`database`) of a multi-database
+// fan-out run (ADR-0074) and supplies the `inScope` predicate the
+// flat-scope FK carve-out uses to refuse out-of-scope cross-database
+// references. Called by the orchestrator before [ReadSchema]; a nil
+// inScope leaves the reader in single-database mode.
+func (r *SchemaReader) SetMultiDatabaseScope(database string, inScope func(database string) bool) {
+	if inScope == nil {
+		return
+	}
+	r.multiDB = true
+	r.dbInScope = inScope
+	// The reader already reads r.schema (set from the DSN's DBName at
+	// open); database is the same value, threaded for clarity and as a
+	// defensive cross-check against a mis-cloned DSN.
+	if database != "" {
+		r.schema = database
+	}
 }
 
 // Close releases the underlying connection pool.
@@ -121,6 +163,11 @@ func (r *SchemaReader) readViews(ctx context.Context) ([]*ir.View, error) {
 			return nil, err
 		}
 		out = append(out, &ir.View{
+			// Schema is empty in single-database mode (flat scope); in
+			// multi-database mode (ADR-0074) it carries the source
+			// database name so the orchestrator routes the view to its
+			// same-named target namespace.
+			Schema:            r.namespaceName(),
 			Name:              name,
 			Definition:        definition,
 			DefinitionDialect: dialectName,
@@ -161,9 +208,24 @@ func (r *SchemaReader) readTables(ctx context.Context) (map[string]*ir.Table, er
 		if err := rows.Scan(&name, &comment); err != nil {
 			return nil, err
 		}
-		out[name] = &ir.Table{Name: name, Comment: comment}
+		// Schema is empty in single-database mode (flat scope); in
+		// multi-database mode (ADR-0074) it carries the source database
+		// name so the orchestrator routes the table to its same-named
+		// target namespace.
+		out[name] = &ir.Table{Schema: r.namespaceName(), Name: name, Comment: comment}
 	}
 	return out, rows.Err()
+}
+
+// namespaceName returns the database name to stamp onto emitted
+// [ir.Table.Schema] / [ir.View.Schema]: the source database name in
+// multi-database mode (ADR-0074), or the empty string in the default
+// single-database mode (flat scope, byte-identical back-compat).
+func (r *SchemaReader) namespaceName() string {
+	if r.multiDB {
+		return r.schema
+	}
+	return ""
 }
 
 // populateColumns fills in Column lists for each table.
@@ -416,23 +478,53 @@ func (r *SchemaReader) populateForeignKeys(ctx context.Context, tables map[strin
 		k := key{table: tableName, name: name}
 		fk, ok := collected[k]
 		if !ok {
-			// MySQL has a flat scope: its `TABLE_SCHEMA` column is a
-			// database name, not a namespace. The IR contract on
+			// Flat-scope carve-out (ADR-0074). MySQL has a flat scope:
+			// its `TABLE_SCHEMA` column is a database name, not a
+			// namespace, and the IR contract on
 			// ir.ForeignKey.ReferencedSchema says it must be empty for
-			// flat-scope engines, so we deliberately drop refSchema
-			// here. Propagating it leaks the source database name
-			// into target dialects that *do* have namespaced schemas
-			// — e.g. emitting `REFERENCES "source_db"."users"(...)`
-			// against a Postgres target where no such schema exists.
-			// Cross-database FKs in MySQL are rare and not supported
-			// by InnoDB enforcement; if real-world cases appear we
-			// can revisit with a typed translation policy.
-			_ = refSchema
+			// flat-scope engines. So in SINGLE-database mode we
+			// deliberately DROP refSchema here — propagating it would
+			// leak the source database name into target dialects that
+			// *do* have namespaced schemas (e.g. emitting
+			// `REFERENCES "source_db"."users"(...)` against a Postgres
+			// target where no such schema exists).
+			//
+			// In MULTI-database mode the carve-out is LIFTED: the
+			// migrated set spans N databases, each routed to a
+			// same-named target namespace, so a cross-database FK CAN
+			// be honoured — but only if its referenced database is part
+			// of the selected set. A FK referencing a database OUTSIDE
+			// the set is REFUSED LOUDLY (the loud-failure tenet): sluice
+			// cannot guarantee the referent exists on the target, and
+			// silently dropping the reference to a flat one would create
+			// a broken / divergent constraint. See refusedSchema below.
+			refQualified := ""
+			if r.multiDB {
+				refDB := refSchema
+				if refDB == "" {
+					// A same-database FK reports its own database in
+					// referenced_table_schema; an empty value would be a
+					// MySQL anomaly. Default to the child's database so a
+					// same-DB FK is qualified consistently.
+					refDB = r.schema
+				}
+				if r.dbInScope != nil && !r.dbInScope(refDB) {
+					return fmt.Errorf(
+						"mysql: foreign key %q on table %q references table %q in database %q, "+
+							"which is OUTSIDE the selected multi-database set — sluice cannot guarantee "+
+							"the referenced database exists on the target (remedy: add %q via "+
+							"--include-database, or drop the table from scope via --exclude-table %q)",
+						name, tableName, refTable, refDB, refDB, tableName,
+					)
+				}
+				refQualified = refDB
+			}
 			fk = &ir.ForeignKey{
-				Name:            name,
-				ReferencedTable: refTable,
-				OnUpdate:        fkActionFrom(updateRule),
-				OnDelete:        fkActionFrom(deleteRule),
+				Name:             name,
+				ReferencedSchema: refQualified,
+				ReferencedTable:  refTable,
+				OnUpdate:         fkActionFrom(updateRule),
+				OnDelete:         fkActionFrom(deleteRule),
 			}
 			collected[k] = fk
 		}

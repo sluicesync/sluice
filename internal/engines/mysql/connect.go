@@ -161,7 +161,39 @@ func parseDSN(dsn string) (*mysql.Config, error) {
 	if cfg.DBName == "" {
 		return nil, errors.New("mysql: DSN must include a database name")
 	}
+	return finishParseDSN(cfg), nil
+}
 
+// parseServerDSN is the database-OPTIONAL sibling of [parseDSN], used
+// by the multi-database fan-out path (ADR-0074). The single-database
+// migrate / sync path requires a database in the DSN ([parseDSN]); when
+// the operator drives a multi-database run with `--all-databases` /
+// `--include-database` / `--exclude-database`, the source DSN is a
+// *server* connection whose database component may legitimately be
+// empty — the orchestrator enumerates databases via [DatabaseLister]
+// and re-opens a single-database reader per database. Every other DSN
+// adjustment ([finishParseDSN]: keep-alive dialer, parseTime, UTC loc,
+// time_zone, sql_mode, utf8mb4) applies identically; only the
+// non-empty-DBName precondition is relaxed.
+func parseServerDSN(dsn string) (*mysql.Config, error) {
+	cfg, err := mysql.ParseDSN(dsn)
+	if err != nil {
+		msg := err.Error()
+		const dupPrefix = "invalid DSN: "
+		if strings.HasPrefix(msg, dupPrefix) {
+			//nolint:errorlint // intentional: rewriting prefix for operator readability; matches parseDSN
+			return nil, fmt.Errorf("mysql: invalid DSN: %s%s", dsnShapeHint(dsn), msg[len(dupPrefix):])
+		}
+		return nil, fmt.Errorf("mysql: invalid DSN: %s%w", dsnShapeHint(dsn), err)
+	}
+	return finishParseDSN(cfg), nil
+}
+
+// finishParseDSN applies the sluice-required parameter adjustments to a
+// parsed [mysql.Config] — the shared tail of [parseDSN] and
+// [parseServerDSN]. Split out so the only difference between the two
+// entry points is whether an empty DBName is an error.
+func finishParseDSN(cfg *mysql.Config) *mysql.Config {
 	// Route plain-TCP query connections through the keep-alive dialer.
 	// Long-lived pools (the change applier, schema reader) would
 	// otherwise sit idle behind cloud NAT and stall on a dropped
@@ -230,7 +262,7 @@ func parseDSN(dsn string) (*mysql.Config, error) {
 		cfg.Collation = "utf8mb4_general_ci"
 	}
 
-	return cfg, nil
+	return cfg
 }
 
 // vstreamParamPrefix is the DSN-parameter namespace sluice reserves

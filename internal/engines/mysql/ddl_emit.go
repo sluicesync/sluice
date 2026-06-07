@@ -1124,6 +1124,18 @@ func emitAddForeignKey(childTable string, fk *ir.ForeignKey) (string, error) {
 	sb.WriteString(" FOREIGN KEY ")
 	sb.WriteString(emitColumnList(fk.Columns))
 	sb.WriteString(" REFERENCES ")
+	// Multi-database fan-out (ADR-0074): a cross-database FK carries the
+	// referenced table's database in ReferencedSchema, so qualify the
+	// reference as `db`.`table`. In single-database mode ReferencedSchema
+	// is always empty (the flat-scope carve-out) and the reference stays
+	// bare — byte-identical to the pre-ADR-0074 output. MySQL resolves a
+	// bare reference against the current database, which is correct only
+	// when the referent lives in the same database; the qualifier is what
+	// lets a same-named target database in another namespace resolve.
+	if fk.ReferencedSchema != "" {
+		sb.WriteString(quoteIdent(fk.ReferencedSchema))
+		sb.WriteByte('.')
+	}
 	sb.WriteString(quoteIdent(fk.ReferencedTable))
 	sb.WriteByte(' ')
 	sb.WriteString(emitColumnList(fk.ReferencedColumns))

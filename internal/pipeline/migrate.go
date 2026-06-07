@@ -326,6 +326,44 @@ type Migrator struct {
 	// is a no-op and this flag is inert.
 	ReapStaleBackends bool
 
+	// DatabaseFilter selects which source databases participate in a
+	// multi-database fan-out migration (ADR-0074). Non-empty
+	// Include/Exclude — or AllDatabases — switches the Migrator into
+	// multi-database mode: the source DSN becomes a *server* connection
+	// (its database component is optional), the orchestrator enumerates
+	// databases via the source engine's [ir.DatabaseLister], and runs a
+	// per-database snapshot loop that routes each source database to a
+	// same-named target namespace (PG schema / MySQL database).
+	//
+	// Empty (the zero value) with AllDatabases=false is the default,
+	// single-database mode — behaviour is byte-identical to a Migrator
+	// that never had this field, and the source DSN must name a database
+	// exactly as before.
+	//
+	// Mutually exclusive with TargetSchema: in multi-database mode the
+	// per-database target namespace is the source database name, so an
+	// operator-supplied single --target-schema is contradictory.
+	DatabaseFilter DatabaseFilter
+
+	// AllDatabases is the `--all-databases` convenience: migrate every
+	// non-system database the source server exposes. Switches the
+	// Migrator into multi-database mode (see DatabaseFilter) with an
+	// empty include/exclude (every enumerated database passes). Mutually
+	// exclusive with a non-empty DatabaseFilter.
+	AllDatabases bool
+
+	// multiDBDeferFKs is set by the multi-database orchestrator on each
+	// per-database clone so the inner single-database run SKIPS the
+	// foreign-key constraint phase. Cross-database FKs reference tables
+	// in OTHER selected databases that may not exist on the target yet
+	// (databases are migrated one at a time); deferring every FK to a
+	// final pass after all databases' tables exist is the only correct
+	// ordering. Same-database FKs are deferred too — harmless, and it
+	// keeps the two-pass model uniform. Never set in single-database
+	// mode (the FK phase runs inline as always). Unexported: an
+	// orchestrator-internal mechanism, not an operator knob.
+	multiDBDeferFKs bool
+
 	// AllowDegradedFKs opts the operator into the pgcopydb-PR-#27-style
 	// "tolerate dirty FK source" behaviour: when [SchemaWriter.CreateConstraints]
 	// hits SQLSTATE 23503 on a validating `ADD CONSTRAINT`, retry as
@@ -383,6 +421,23 @@ func (m *Migrator) Run(ctx context.Context) error {
 		return err
 	}
 
+	// Multi-database fan-out (ADR-0074). When any database-scope flag is
+	// set, resolve the database set and run a per-database snapshot loop;
+	// each iteration re-opens a single-database reader/writer (a DSN
+	// clone with DBName set) and reuses 100% of the single-database path
+	// below. Single-database mode falls straight through, byte-identical.
+	if m.multiDatabaseMode() {
+		return m.runMultiDatabase(ctx)
+	}
+
+	return m.runSingleDatabase(ctx, nil)
+}
+
+// runSingleDatabase is the original single-database orchestrator body.
+// scope is nil for a genuine single-database run; in the multi-database
+// fan-out it carries the per-database namespace + in-scope predicate the
+// source reader needs (Table.Schema stamping + the FK carve-out).
+func (m *Migrator) runSingleDatabase(ctx context.Context, scope *multiDBScope) error {
 	// Engine-default exclusions (Bug 22 / v0.8.1): merge in any
 	// patterns the source engine surfaces via [ir.DefaultTableExcluder]
 	// — today PlanetScale's `_vt_*` Vitess shadow tables, triggered
@@ -430,6 +485,14 @@ func (m *Migrator) Run(ctx context.Context) error {
 	// authoritative post-read applyTableFilter prune below.
 	applyTableScope(sr, m.Filter)
 
+	// Multi-database fan-out (ADR-0074): tell the source reader it is
+	// reading one database of the selected set so it stamps
+	// Table.Schema / View.Schema with the database name and lifts the
+	// flat-scope FK carve-out (populating ReferencedSchema + refusing an
+	// out-of-scope cross-database FK loudly). No-op in single-database
+	// mode (scope is nil) and on engines without [ir.MultiDatabaseScoper].
+	applyMultiDatabaseScope(sr, scope)
+
 	schema, err := sr.ReadSchema(ctx)
 	if err != nil {
 		return wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: read source schema: %w", err))
@@ -447,6 +510,21 @@ func (m *Migrator) Run(ctx context.Context) error {
 		return err
 	}
 	applyViewFilter(ctx, schema, m.ViewFilter, m.SkipViews)
+
+	// Multi-database fan-out (ADR-0074): defer EVERY foreign key to a
+	// final cross-database pass. A cross-database FK references a table
+	// in another selected database which may not exist on the target yet
+	// (databases migrate one at a time, alphabetically), so creating it
+	// inline races the referent's creation (MySQL Error 1824). Stripping
+	// the FKs here makes Phase 5 a no-op for this database; the
+	// orchestrator re-applies them all once every database's tables
+	// exist (see applyDeferredMultiDBConstraints). Same-database FKs ride
+	// the same deferral — uniform and harmless. The carve-out's
+	// out-of-scope refusal already fired at ReadSchema, so the FKs
+	// reaching here are all in-scope and safe to re-apply later.
+	if m.multiDBDeferFKs {
+		stripForeignKeys(schema)
+	}
 
 	// ---- 1.45. Source-side RLS preflight (task #52 sub-deliverable 1) ----
 	// Refuses when any in-scope source table has RLS enabled AND the

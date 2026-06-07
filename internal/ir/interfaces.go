@@ -1196,6 +1196,96 @@ type TableScoper interface {
 	SetTableScope(allow func(tableName string) bool)
 }
 
+// DatabaseLister is the OPTIONAL engine surface for enumerating the
+// databases a server connection can see (ADR-0074, multi-database
+// MySQL migration). The orchestrator calls it to resolve
+// `--all-databases` / `--include-database` / `--exclude-database` into
+// a concrete database list before iterating the per-database snapshot.
+//
+// Only engines whose namespacing primitive is a *database* on a shared
+// server (MySQL: one binlog/server, N databases) implement it. MySQL
+// lists `information_schema.schemata` minus the always-excluded system
+// set (`information_schema`, `performance_schema`, `mysql`, `sys`).
+// Postgres does NOT implement it in this phase: a PG "database" is a
+// connection boundary, not a same-server namespace the orchestrator
+// fans out across — PG multi-schema fan-out is the symmetric follow-on
+// tracked in ADR-0074, not built here.
+//
+// The pipeline type-asserts on the source engine when any
+// database-scope flag is set; an engine that doesn't implement the
+// surface is refused loudly (the operator picked a multi-database run
+// against a source that can't enumerate databases). Implementations
+// open and close their own connection from the (database-optional)
+// server DSN — the orchestrator hands the same source DSN it migrates
+// from, whose database component may be empty in multi-database mode.
+type DatabaseLister interface {
+	// ListDatabases returns the non-system databases visible on the
+	// server the dsn points at, in unspecified order. The orchestrator
+	// applies the operator's include/exclude globs to this list. The
+	// always-excluded system databases must never appear in the result.
+	ListDatabases(ctx context.Context, dsn string) ([]string, error)
+}
+
+// DatabaseDSNDeriver is the OPTIONAL engine surface for deriving a
+// single-database DSN from a (possibly database-less) server DSN
+// (ADR-0074). The multi-database orchestrator uses it to re-open a
+// single-database reader/writer per selected database without the
+// pipeline having to know each engine's DSN syntax (the IR-first /
+// engine-neutral-orchestrator tenets).
+//
+// MySQL implements it: WithDatabase swaps the DSN's DBName component;
+// EnsureDatabase issues `CREATE DATABASE IF NOT EXISTS` against the
+// server (the MySQL → MySQL auto-create-target-database behaviour
+// resolved in ADR-0074). The PG engine does NOT implement it — PG
+// multi-database fan-out is the symmetric follow-on, and a PG *target*
+// in a MySQL-source fan-out routes via `--target-schema` (same DSN,
+// per-database schema), not a DSN rewrite.
+type DatabaseDSNDeriver interface {
+	// WithDatabase returns a clone of dsn whose database component is
+	// set to database. Used to re-open a single-database reader/writer
+	// for one database of a multi-database run. Returns an error for a
+	// malformed dsn.
+	WithDatabase(dsn, database string) (string, error)
+
+	// EnsureDatabase creates database on the server dsn points at if it
+	// does not already exist (`CREATE DATABASE IF NOT EXISTS` semantics
+	// — idempotent). Called for a MySQL → MySQL multi-database target
+	// before the per-database writer opens. dsn may be a server DSN
+	// (no database component) or name any database on the same server;
+	// the implementation connects at the server level to run the DDL.
+	EnsureDatabase(ctx context.Context, dsn, database string) error
+}
+
+// MultiDatabaseScoper is the OPTIONAL surface a [SchemaReader] implements
+// to be told it is reading ONE database of a multi-database fan-out run
+// (ADR-0074). It carries two pieces of state the reader needs that the
+// single-database path leaves at their zero value:
+//
+//  1. The source database name, which the reader stamps onto every
+//     [Table.Schema] / [View.Schema] it emits, so the orchestrator can
+//     route each database to its same-named target namespace (PG schema
+//     / MySQL database). In single-database mode these stay empty
+//     (byte-identical back-compat).
+//
+//  2. An `inScope` predicate over database names, used for the
+//     flat-scope foreign-key carve-out. MySQL's flat scope normally
+//     drops a FK's referenced database to keep [ForeignKey.ReferencedSchema]
+//     empty; in multi-database mode the reader instead POPULATES
+//     ReferencedSchema with the referenced database — and refuses
+//     LOUDLY at read time when a FK references a database OUTSIDE the
+//     selected set (sluice can't guarantee the referent exists on the
+//     target). `inScope` reports whether a referenced database name is
+//     part of the migrated set; a nil predicate means single-database
+//     mode (the carve-out stays disabled).
+//
+// Set before [SchemaReader.ReadSchema]; implementations must not buffer
+// schema state before that call. PG does not implement it (this phase is
+// MySQL-source fan-out); engines without the surface keep the flat,
+// single-database behaviour.
+type MultiDatabaseScoper interface {
+	SetMultiDatabaseScope(database string, inScope func(database string) bool)
+}
+
 // ExtensionAware is the optional engine-side surface for engines that
 // can pass through column types defined by extensions (ADR-0032). PG
 // implements; MySQL does not (no extension concept in the same shape).

@@ -144,6 +144,10 @@ type MigrateCmd struct {
 	IncludeTable []string `help:"Only migrate these tables (comma-separated, repeatable). Glob patterns allowed (e.g. 'audit_*'). Mutually exclusive with --exclude-table." sep:"," placeholder:"TABLE"`
 	ExcludeTable []string `help:"Migrate every table except these (comma-separated, repeatable). Glob patterns allowed. Mutually exclusive with --include-table." sep:"," placeholder:"TABLE"`
 
+	IncludeDatabase []string `help:"Multi-database fan-out (ADR-0074, MySQL source): migrate ONLY these source databases (comma-separated, repeatable). Glob patterns allowed (e.g. 'app_*'). Each source database routes to a same-named target namespace (PG schema / MySQL database). Mutually exclusive with --exclude-database. When any database-scope flag is set, the source DSN's database is optional (it's a server connection). System databases (information_schema, performance_schema, mysql, sys) are always excluded." sep:"," placeholder:"DATABASE"`
+	ExcludeDatabase []string `help:"Multi-database fan-out (ADR-0074, MySQL source): migrate every non-system source database EXCEPT these (comma-separated, repeatable). Glob patterns allowed. Mutually exclusive with --include-database." sep:"," placeholder:"DATABASE"`
+	AllDatabases    bool     `help:"Multi-database fan-out (ADR-0074, MySQL source): migrate every non-system database on the source server, each to a same-named target namespace. Mutually exclusive with --include-database / --exclude-database."`
+
 	IncludeView []string `help:"Only migrate these views (comma-separated, repeatable). Glob patterns allowed. Mutually exclusive with --exclude-view." sep:"," placeholder:"VIEW"`
 	ExcludeView []string `help:"Migrate every view except these (comma-separated, repeatable). Glob patterns allowed. Mutually exclusive with --include-view." sep:"," placeholder:"VIEW"`
 	SkipViews   bool     `help:"Skip view processing entirely; views in the source schema are not created on the target. Useful when views are managed out-of-band (Atlas / sqitch / liquibase)."`
@@ -216,8 +220,18 @@ func (m *MigrateCmd) Run(g *Globals) error {
 	if len(m.IncludeTable) > 0 && len(m.ExcludeTable) > 0 {
 		return errors.New("--include-table and --exclude-table are mutually exclusive")
 	}
+	if len(m.IncludeDatabase) > 0 && len(m.ExcludeDatabase) > 0 {
+		return errors.New("--include-database and --exclude-database are mutually exclusive")
+	}
+	if m.AllDatabases && (len(m.IncludeDatabase) > 0 || len(m.ExcludeDatabase) > 0) {
+		return errors.New("--all-databases is mutually exclusive with --include-database / --exclude-database")
+	}
 	if len(m.IncludeView) > 0 && len(m.ExcludeView) > 0 {
 		return errors.New("--include-view and --exclude-view are mutually exclusive")
+	}
+	databaseFilter, err := pipeline.NewDatabaseFilter(m.IncludeDatabase, m.ExcludeDatabase)
+	if err != nil {
+		return err
 	}
 	if m.Resume && m.ResetTargetData {
 		return errors.New("--resume and --reset-target-data are mutually exclusive")
@@ -278,6 +292,8 @@ func (m *MigrateCmd) Run(g *Globals) error {
 		Mappings:              mappings,
 		ExpressionMappings:    exprMappings,
 		Filter:                filter,
+		DatabaseFilter:        databaseFilter,
+		AllDatabases:          m.AllDatabases,
 		ViewFilter:            viewFilter,
 		SkipViews:             m.SkipViews,
 		Resume:                m.Resume,
