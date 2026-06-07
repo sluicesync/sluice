@@ -2,13 +2,15 @@
 
 ## Status
 
-**Proposed (2026-06-07) — DRAFT for review.** Operator-requested: connect to a
+**Accepted (2026-06-07).** Operator-requested: connect to a
 MySQL server (e.g. as `root`, with access to many databases) and migrate **and
 sync** all — or a selected subset — of its databases to a target in one run,
 analogous to how a Postgres source can carry multiple schemas. Supersedes the
 "Multi-source aggregation — MySQL native parity" roadmap item's `--rename-table`
 framing for the *fan-out* (one server → N databases) case; the *fan-in* (N
 sources → one namespace) case stays as described in [ADR-0031](adr-0031-multi-source-aggregation-target-schema.md).
+
+The three open questions raised at draft (see [Resolved decisions](#resolved-decisions-operator-review-2026-06-07)) were reviewed and **resolved with the proposed defaults**: `--map-database` is a 1.x follow-on (first cut routes same-name), an out-of-scope cross-database FK is **refused loudly**, and a MySQL→MySQL target **auto-creates each database** (`CREATE DATABASE IF NOT EXISTS`). The operator also confirmed **Phase 1 includes CDC** (Phase 1a snapshot → 1b server-wide binlog CDC).
 
 ## Context
 
@@ -206,12 +208,17 @@ the binlog handoff).
   snapshot — re-opening a single-database reader per database reuses all existing
   logic with no interface churn.
 
-## Open questions for review
+## Resolved decisions (operator review, 2026-06-07)
 
-1. **`--map-database` in the first cut, or a 1.x follow-on?** (Default is
-   same-name; renaming is the only thing it adds.)
-2. **Out-of-scope cross-database FK:** refuse loudly (this ADR's choice) vs. drop
-   to a flat reference with a WARN. The loud-refuse is the tenet-aligned default.
-3. **MySQL → MySQL target:** auto-`CREATE DATABASE IF NOT EXISTS` per source
-   database (this ADR's choice) vs. require the operator to pre-create them. Auto
-   is more convenient but is sluice owning a bit more DDL surface.
+All three were resolved with the proposed defaults:
+
+1. **`--map-database` is a 1.x follow-on, not in the first cut.** The first cut
+   routes each source database to a **same-named** target namespace; the optional
+   rename map is added later if demand surfaces.
+2. **An out-of-scope cross-database FK is refused loudly** (the loud-failure
+   tenet) — a FK referencing a database outside the selected set fails at
+   pre-flight, naming the site and the `--include-database` / `--exclude-table`
+   remedy. It is never dropped to a flat reference with only a WARN.
+3. **A MySQL → MySQL target auto-creates each database** (`CREATE DATABASE IF NOT
+   EXISTS` per source database) rather than requiring the operator to pre-create
+   them. sluice owns this small additional DDL surface for the convenience.
