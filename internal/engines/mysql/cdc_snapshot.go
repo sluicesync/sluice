@@ -264,7 +264,39 @@ func (e Engine) openBinlogSnapshotStreamShared(ctx context.Context, dsn string, 
 		_ = db.Close()
 		return nil, fmt.Errorf("mysql: snapshot: set isolation: %w", err)
 	}
+	// Freeze writes across the snapshot+position capture. Without this,
+	// there is a window between START TRANSACTION WITH CONSISTENT SNAPSHOT
+	// (which fixes the row view) and SHOW BINARY LOG STATUS (which fixes
+	// the CDC start position): a transaction that commits inside that
+	// window lands in NEITHER the snapshot (it committed after the read
+	// view froze) NOR the CDC tail (its binlog offset is below the
+	// position we capture) — a silent-loss boundary gap. FLUSH TABLES
+	// WITH READ LOCK blocks commits for the duration, so the snapshot
+	// view and the binlog position name the exact same logical cut. This
+	// is the mydumper/Debezium consistent-snapshot pattern. The lock is
+	// released immediately after the position read; the open transaction
+	// keeps the snapshot view alive, and writes that resume afterward are
+	// captured by CDC from the frozen position.
+	//
+	// FTWRL needs the RELOAD privilege. If it's absent we warn and fall
+	// back to the lock-free capture (the prior behaviour) rather than
+	// failing the run — keyless/least-privilege single-DB users who never
+	// hit the window keep working; the warning tells multi-DB/root users
+	// to grant RELOAD to close the gap.
+	locked := false
+	if _, err := conn.ExecContext(ctx, "FLUSH TABLES WITH READ LOCK"); err != nil {
+		slog.Warn("mysql: snapshot: FLUSH TABLES WITH READ LOCK failed; "+
+			"capturing snapshot position without a write freeze (a concurrent "+
+			"commit during capture could be lost). Grant RELOAD to close this gap.",
+			"error", err)
+	} else {
+		locked = true
+	}
+
 	if _, err := conn.ExecContext(ctx, "START TRANSACTION WITH CONSISTENT SNAPSHOT"); err != nil {
+		if locked {
+			_, _ = conn.ExecContext(ctx, "UNLOCK TABLES")
+		}
 		_ = conn.Close()
 		_ = db.Close()
 		return nil, fmt.Errorf("mysql: snapshot: start tx: %w", err)
@@ -276,10 +308,25 @@ func (e Engine) openBinlogSnapshotStreamShared(ctx context.Context, dsn string, 
 	// pre-8.4 fallback. Same shape as the standalone CDC reader.
 	file, pos, err := snapshotMasterStatus(ctx, conn)
 	if err != nil {
+		if locked {
+			_, _ = conn.ExecContext(ctx, "UNLOCK TABLES")
+		}
 		_, _ = conn.ExecContext(ctx, "ROLLBACK")
 		_ = conn.Close()
 		_ = db.Close()
 		return nil, fmt.Errorf("mysql: snapshot: capture position: %w", err)
+	}
+
+	// Release the write freeze now that both the snapshot view and the
+	// binlog position are captured. The open transaction keeps the
+	// snapshot alive for the per-database COPY reads that follow.
+	if locked {
+		if _, err := conn.ExecContext(ctx, "UNLOCK TABLES"); err != nil {
+			_, _ = conn.ExecContext(ctx, "ROLLBACK")
+			_ = conn.Close()
+			_ = db.Close()
+			return nil, fmt.Errorf("mysql: snapshot: unlock tables: %w", err)
+		}
 	}
 
 	// Bind the handoff position to the source instance (Track 1c

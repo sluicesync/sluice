@@ -320,12 +320,16 @@ func TestStreamer_MultiDatabase_ConcurrentWritesDuringColdStart(t *testing.T) {
 	// 600 concurrent rows; the EXACT-count assertion below is the real
 	// zero-loss gate (a genuinely lost row never reaches the target and this
 	// times out). The ceiling only needs to be generous enough to never
-	// false-fail on slow apply — and under the CI `-race` build (~10x slower)
-	// 120s was marginal (a single trailing row could still be in flight),
-	// causing a `got 2299/2300` flake on an otherwise-green run. 300s gives
-	// ample margin under `-race` while still bounding a real loss. Verified:
-	// 5x local (non-race) runs reach the exact count with seconds to spare.
-	const catchUpCeiling = 300 * time.Second
+	// false-fail on slow apply under the CI `-race` build (~10x slower).
+	//
+	// History (do not relax this assertion): a `got 2299/2300` here was first
+	// mistaken for a slow-apply flake and "fixed" by bumping the ceiling — but
+	// the row never arrived no matter the ceiling. It was a real silent-loss
+	// boundary gap in the snapshot capture: a commit landing between START
+	// TRANSACTION WITH CONSISTENT SNAPSHOT and the binlog-position read fell
+	// into neither the snapshot nor the CDC tail. The fix is FTWRL around the
+	// capture (see openBinlogSnapshotStreamShared); this test is its pin.
+	const catchUpCeiling = 180 * time.Second
 	if !waitForRowCountMySQLDB(t, serverDSN(t, tgtServer), "source_db", "events", wantA, catchUpCeiling) {
 		streamCancel()
 		<-runErr
