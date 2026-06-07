@@ -70,7 +70,7 @@ func (r *RowReader) ReadRowsBatch(ctx context.Context, table *ir.Table, after []
 	}
 
 	out := make(chan ir.Row)
-	go r.stream(ctx, rows, table, out)
+	go r.stream(ctx, rows, table, out, nil)
 	return out, nil
 }
 

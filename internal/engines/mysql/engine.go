@@ -111,29 +111,31 @@ func (e Engine) OpenRowReader(ctx context.Context, dsn string) (ir.RowReader, er
 	if err != nil {
 		return nil, err
 	}
-	// Vitess/PlanetScale (CDCVStream flavors): the bulk-read is a single
-	// streaming SELECT (buildSelect → one QueryContext, no transaction), and
-	// vtgate's default OLTP workload caps a result set at ~100k rows. A no-PK
-	// source table can't be PK-chunked, so its full-scan copy is one big
-	// SELECT — which the cap would silently truncate at 100k. `workload=olap`
-	// lifts the cap and streams, exactly the pscale-dumper convention (see
-	// flavor.go). Applied ONLY to the reader's session — never the
-	// writer/applier, which DO use transactions that OLAP mode forbids. Not a
-	// valid var on vanilla MySQL, so it is gated on the VStream flavor. A
-	// DSN-supplied `workload` wins (operator override).
-	if e.Capabilities().CDC == ir.CDCVStream {
-		if cfg.Params == nil {
-			cfg.Params = map[string]string{}
-		}
-		if _, ok := cfg.Params["workload"]; !ok {
-			cfg.Params["workload"] = "'olap'"
-		}
-	}
 	db, err := openDB(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
-	return &RowReader{q: db, schema: cfg.DBName, closer: db}, nil
+	// Vitess/PlanetScale (CDCVStream flavors): a no-PK source table can't be
+	// PK-chunked, so it is read as ONE unbounded streaming SELECT
+	// ([RowReader.ReadRows]) — which vtgate's default OLTP workload silently
+	// TRUNCATES at ~100k rows. That full scan needs `workload=olap` to lift
+	// the cap (the pscale-dumper convention, see flavor.go).
+	//
+	// But olap must be scoped to JUST that full scan. Setting it session-wide
+	// (a `workload` DSN param, as v0.99.14 did) makes it ALSO cover the
+	// PK-bounded, LIMIT-paged [RowReader.ReadRowsBatch] the parallel chunked
+	// bulk-copy uses — where vtgate's olap streaming truncates each
+	// concurrently-read chunk's page, silently copying a tiny fraction of a
+	// large PK table at default parallelism (Bug 132, the v0.99.14
+	// regression). LIMIT-paged reads never approach the 100k cap, so they
+	// never needed olap. The fix carries the intent to the reader and applies
+	// `SET workload='olap'` on a DEDICATED connection inside ReadRows only;
+	// ReadRowsBatch (PK-only by construction) stays olap-free, exactly as it
+	// was before v0.99.14. An operator-supplied `workload` DSN param is their
+	// explicit session choice and is left untouched (olapFullScan off).
+	_, operatorSetWorkload := cfg.Params["workload"]
+	olapFullScan := e.Capabilities().CDC == ir.CDCVStream && !operatorSetWorkload
+	return &RowReader{q: db, schema: cfg.DBName, closer: db, olapFullScan: olapFullScan}, nil
 }
 
 // OpenRowWriter returns a [RowWriter] bound to the database identified

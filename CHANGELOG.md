@@ -6,6 +6,40 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.99.18] - 2026-06-07
+
+### Fixed
+
+- **CRITICAL: a `migrate` from a PlanetScale/Vitess source (`--source-driver=
+  planetscale` or `vitess`) silently copied only a tiny fraction of a large
+  PK table and still reported success.** v0.99.14 set vtgate's `workload=olap`
+  as a **session-wide** setting on the source reader (to lift vtgate's ~100k
+  OLTP result cap on a *no-PK* full-table scan). But that session setting also
+  covered the `LIMIT`-paged reads used by the **parallel chunked bulk-copy**
+  (the default for tables at or above `--bulk-parallel-min-rows`, 100k), and
+  under olap *streaming* mode each concurrently-read chunk's page was
+  truncated — so a large PK table was copied only in part (e.g. ~7.5k of
+  1.5M rows) while `sluice migrate` still exited 0 with `migration complete`.
+  Single-stream copies (`--bulk-parallelism=1`) and vanilla MySQL sources were
+  unaffected, and the bug only appeared above the chunk threshold — which is
+  why the existing VStream tests (sub-threshold tables) did not catch it.
+
+  **Affected releases: v0.99.14, v0.99.15, v0.99.16, v0.99.17.** Anyone who
+  ran a PlanetScale/Vitess `migrate` of a table with ≥100k rows at the default
+  parallelism on those versions should **re-verify row counts** (and re-run on
+  v0.99.18). No fix-up is needed for the *source* — the data was never touched;
+  the target simply received a partial copy. `sync start` cold-start and CDC
+  were not affected by this path.
+
+  **Fix:** `workload=olap` is now scoped to **just** the unbounded no-PK full
+  scan (`ReadRows`), applied on a dedicated connection — never session-wide.
+  The `LIMIT`-paged `ReadRowsBatch` the chunked copy uses is olap-free again,
+  exactly as it was before v0.99.14, so the parallel copy reads every row,
+  while the no-PK 100k-cap lift the olap change was added for is preserved.
+  Pinned by a new VStream regression test that migrates an above-threshold PK
+  table at parallelism > 1 and asserts exact row-count parity (the
+  chunk-threshold dimension the prior pins missed).
+
 ## [0.99.17] - 2026-06-07
 
 ### Fixed

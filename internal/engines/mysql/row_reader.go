@@ -50,6 +50,15 @@ type RowReader struct {
 	// the SnapshotStream owns the lifecycle. Close is a no-op when nil.
 	closer io.Closer
 
+	// olapFullScan scopes vtgate's `workload=olap` to the unbounded
+	// [ReadRows] full scan (the no-PK path that would otherwise be
+	// silently truncated at vtgate's 100k OLTP cap). It is applied on a
+	// DEDICATED connection per ReadRows call — never session-wide — so the
+	// LIMIT-paged [ReadRowsBatch] used by the parallel chunked copy stays
+	// olap-free (olap streaming truncates concurrent chunk pages — Bug
+	// 132). Set by [Engine.OpenRowReader] for VStream flavors only.
+	olapFullScan bool
+
 	mu  sync.Mutex
 	err error // sticky error from the most recent ReadRows call
 }
@@ -96,14 +105,48 @@ func (r *RowReader) ReadRows(ctx context.Context, table *ir.Table) (<-chan ir.Ro
 	// rowserrcheck and sqlclosecheck can't follow rows into the
 	// goroutine; both rows.Err() and rows.Close() are handled inside
 	// stream() (Close via defer, Err checked once iteration ends).
-	rows, err := r.q.QueryContext(ctx, query) //nolint:rowserrcheck,sqlclosecheck
+	rows, cleanup, err := r.queryFullScan(ctx, query) //nolint:rowserrcheck,sqlclosecheck // rows.Err()/Close() handled in stream()
 	if err != nil {
 		return nil, fmt.Errorf("mysql: ReadRows: query failed: %w", err)
 	}
 
 	out := make(chan ir.Row)
-	go r.stream(ctx, rows, table, out)
+	go r.stream(ctx, rows, table, out, cleanup)
 	return out, nil
+}
+
+// queryFullScan runs the unbounded bulk-copy SELECT. On a VStream
+// (vtgate) reader it scopes `SET workload='olap'` to a DEDICATED
+// connection so the no-PK full scan lifts vtgate's 100k OLTP result cap
+// WITHOUT making olap a session-wide setting — which would also cover the
+// LIMIT-paged [ReadRowsBatch] the parallel chunked copy uses, where olap
+// streaming silently truncates each concurrent chunk's page (Bug 132).
+// The returned cleanup closes the dedicated conn after streaming
+// finishes; it is nil on the plain (non-olap) path.
+func (r *RowReader) queryFullScan(ctx context.Context, query string) (*sql.Rows, func(), error) {
+	if r.olapFullScan {
+		if pool, ok := r.q.(*sql.DB); ok {
+			conn, err := pool.Conn(ctx)
+			if err != nil {
+				return nil, nil, err
+			}
+			if _, err := conn.ExecContext(ctx, "SET workload = 'olap'"); err != nil {
+				_ = conn.Close()
+				return nil, nil, fmt.Errorf("set workload=olap: %w", err)
+			}
+			rows, err := conn.QueryContext(ctx, query) //nolint:rowserrcheck,sqlclosecheck
+			if err != nil {
+				_ = conn.Close()
+				return nil, nil, err
+			}
+			return rows, func() { _ = conn.Close() }, nil
+		}
+	}
+	rows, err := r.q.QueryContext(ctx, query) //nolint:rowserrcheck,sqlclosecheck
+	if err != nil {
+		return nil, nil, err
+	}
+	return rows, nil, nil
 }
 
 // stream is the goroutine that scans rows from the database and pushes
@@ -114,8 +157,11 @@ func (r *RowReader) ReadRows(ctx context.Context, table *ir.Table) (<-chan ir.Ro
 // and therefore out of the iterated columns here too — the database
 // recomputes them on the target's INSERT, so the source value is
 // never carried.
-func (r *RowReader) stream(ctx context.Context, rows *sql.Rows, table *ir.Table, out chan<- ir.Row) {
+func (r *RowReader) stream(ctx context.Context, rows *sql.Rows, table *ir.Table, out chan<- ir.Row, cleanup func()) {
 	defer close(out)
+	if cleanup != nil {
+		defer cleanup() // close the dedicated olap full-scan conn (ReadRows)
+	}
 	defer rows.Close()
 
 	cols := sourceReadableColumns(table.Columns)
