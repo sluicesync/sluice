@@ -5,6 +5,7 @@ package postgres
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
@@ -13,6 +14,37 @@ import (
 // int64Val is a small helper so test cases can write &int64Val(255)
 // where an *int64 is needed for columnMeta numeric fields.
 func int64Val(v int64) *int64 { return &v }
+
+// TestTranslateType_UnrecognizedUDT_HonestRefusal pins that a genuinely-
+// unsupported user-defined type (not an enum, not a catalogued/owned
+// extension type, not geometry, not verbatim-eligible — e.g. a composite
+// or domain type) refuses with an honest message that names the type and
+// says it is unsupported, rather than the old misleading "is not a
+// recognised enum" wording (which implied the type should have been an
+// enum). The message points at the reliable --exclude-table escape.
+func TestTranslateType_UnrecognizedUDT_HonestRefusal(t *testing.T) {
+	_, err := translateType(columnMeta{
+		DataType: "USER-DEFINED",
+		UDTName:  "some_composite_type",
+		// no EnumValues, no ExtensionName, not VerbatimEligible, not geometry
+	})
+	if err == nil {
+		t.Fatal("expected a refusal for an unsupported user-defined type")
+	}
+	msg := err.Error()
+	// The old misleading message ENDED with "is not a recognised enum"
+	// (implying the type should have been one). The new message may mention
+	// "recognised enum" only inside the list of what the type is NOT, so
+	// guard against the bare old tail, not the phrase.
+	if strings.HasSuffix(msg, "is not a recognised enum") {
+		t.Errorf("error still uses the misleading bare-enum wording: %q", msg)
+	}
+	for _, want := range []string{"some_composite_type", "not supported", "--exclude-table"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error message %q missing %q", msg, want)
+		}
+	}
+}
 
 func TestTranslateType(t *testing.T) {
 	cases := []struct {

@@ -281,7 +281,14 @@ func translateType(c columnMeta) (ir.Type, error) {
 				c.UDTName, owningExt, owningExt,
 			)
 		}
-		return nil, fmt.Errorf("postgres: user-defined type %q is not a recognised enum", c.UDTName)
+		return nil, fmt.Errorf(
+			"postgres: user-defined type %q is not supported (it is not a "+
+				"recognised enum, a catalogued extension type, or a "+
+				"verbatim-passthrough type — composite and domain types are "+
+				"not modelled in the IR) — exclude the table with "+
+				"--exclude-table to proceed",
+			c.UDTName,
+		)
 	}
 
 	switch c.DataType {
