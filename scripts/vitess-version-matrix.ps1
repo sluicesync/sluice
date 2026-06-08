@@ -44,8 +44,8 @@
 param(
     [string[]]$Versions = @(
         'vitess/lite:v21.0.6',
-        'vitess/lite:v22.0.5',
-        'vitess/lite:v23.0.3',
+        'vitess/lite:v22.0.4',
+        'vitess/lite:v23.0.4',
         'vitess/lite:v24.0.1',
         'vitess/lite:latest'
     ),
