@@ -1,0 +1,22 @@
+# Single source of truth for the Vitess SERVER versions the multi-version
+# matrix sweeps and the prebake mirrors. One docker.io ref per line; blank
+# lines and lines starting with '#' are ignored.
+#
+# Consumers (keep them all reading THIS file — do not hardcode the list
+# elsewhere):
+#   - scripts/build-prebaked-images.sh  (ENGINES=vitess) mirrors each ref to
+#     ghcr.io/sluicesync/sluice-vitess:<tag> for fast/reliable CI pulls.
+#   - .github/workflows/vitess-version-matrix.yml builds its job matrix from
+#     this file (pulling the GHCR mirror, not docker.io).
+#   - scripts/vitess-version-matrix.{ps1,sh} default their sweep list from it.
+#
+# Policy: keep the pinned majors in [v21 .. v24] (the vendored
+# vitess.io/vitess client is v0.24.1; older servers are exercised via
+# newer-client->older-server skew). Bump the MINORS as upstream releases —
+# verify tags exist at https://hub.docker.com/r/vitess/lite/tags. `:latest`
+# is the forward-compat canary (allowed to fail in the matrix).
+vitess/lite:v21.0.6
+vitess/lite:v22.0.4
+vitess/lite:v23.0.4
+vitess/lite:v24.0.1
+vitess/lite:latest

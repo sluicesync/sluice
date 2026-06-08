@@ -20,13 +20,15 @@
 #   RUN=TestVitessCluster_Bug27 scripts/vitess-version-matrix.sh
 #   VERSIONS="vitess/lite:v23.0.3 vitess/lite:v24.0.1" scripts/vitess-version-matrix.sh
 #
-# KEEP THE PINNED MAJORS IN [v21..v24] and BUMP THE MINORS as upstream
-# releases (verify tags at https://hub.docker.com/r/vitess/lite/tags).
-# v24 must stay in lockstep with the vendored client major.
+# The version list is the single source of truth in scripts/vitess-versions.txt
+# (shared with the prebake mirror + the CI matrix workflow); bump it there.
 
 set -uo pipefail
 
-VERSIONS="${VERSIONS:-vitess/lite:v21.0.6 vitess/lite:v22.0.4 vitess/lite:v23.0.4 vitess/lite:v24.0.1 vitess/lite:latest}"
+# Default version list is the single source of truth (scripts/vitess-versions.txt);
+# override with VERSIONS="vitess/lite:vX.Y.Z ..." for an ad-hoc subset.
+_versions_file="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/vitess-versions.txt"
+VERSIONS="${VERSIONS:-$(grep -vE '^[[:space:]]*#|^[[:space:]]*$' "$_versions_file" | tr '\n' ' ')}"
 RUN="${RUN:-TestVitessCluster}"
 TIMEOUT="${TIMEOUT:-25m}"
 

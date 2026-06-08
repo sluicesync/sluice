@@ -1,0 +1,114 @@
+# Multi-version Vitess cluster matrix (roadmap item 1(e)).
+#
+# Boots the REAL multi-process Vitess cluster (the gated `vitesscluster`
+# build-tag harness) against a sweep of Vitess SERVER versions and runs the
+# Bug-27 VStream-POINT end-to-end test on each, proving the vendored
+# vitess.io/vitess v0.24.1 client streams correctly across newer-client ->
+# older-server skew (the direction Vitess supports for rolling upgrades).
+#
+# This is NOT part of the per-PR `ci.yml` gate — it is a heavy, scheduled /
+# on-demand job (each matrix leg boots a 5-container cluster). It is never a
+# required status check, so it never blocks a merge.
+#
+# Versions come from scripts/vitess-versions.txt (the single source of truth,
+# shared with the prebake mirror + the local scripts/vitess-version-matrix.*).
+# Each leg pulls the PRE-BAKED GHCR mirror (ghcr.io/sluicesync/sluice-vitess:
+# <tag>, published by build-prebaked-images.yml's `vitess` engine) rather than
+# docker.io — faster, and no docker.io rate-limit SPOF. The mirror must have
+# run at least once before this matrix's first run (the weekly cron orders
+# them: prebake at 06:00 Sun, this at 08:00 Sun).
+#
+# `:latest` is the forward-compat CANARY (continue-on-error) — its failure is
+# the signal that a newer Vitess major diverged from the vendored client (time
+# to bump the client), not a red build.
+
+name: Vitess version matrix
+
+on:
+  schedule:
+    # 08:00 UTC Sunday — 2h after build-prebaked-images.yml (06:00) so the
+    # week's GHCR mirrors are fresh before this sweeps them.
+    - cron: "0 8 * * 0"
+  workflow_dispatch:
+    inputs:
+      run:
+        description: "go test -run filter (default: the Bug-27 geometry test; widen to TestVitessCluster for the full cutover suite)"
+        required: false
+        default: "TestVitessCluster_Bug27"
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: vitess-version-matrix-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # Build the job matrix from scripts/vitess-versions.txt so the version list
+  # lives in exactly one place. Emits [{version, image, canary}, ...] where
+  # image is the GHCR mirror and canary is true only for the :latest tag.
+  setup:
+    name: Resolve version matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v6
+      - id: gen
+        run: |
+          entries=$(grep -vE '^[[:space:]]*#|^[[:space:]]*$' scripts/vitess-versions.txt | while read -r ref; do
+            tag="${ref##*:}"
+            ghcr="ghcr.io/sluicesync/sluice-vitess:${tag}"
+            canary=false
+            [ "$tag" = "latest" ] && canary=true
+            printf '{"version":"%s","image":"%s","canary":%s}\n' "$tag" "$ghcr" "$canary"
+          done | jq -s -c '.')
+          echo "resolved matrix: $entries"
+          echo "matrix=$entries" >> "$GITHUB_OUTPUT"
+
+  cluster:
+    name: Bug 27 on Vitess ${{ matrix.version }}
+    needs: setup
+    runs-on: ubuntu-latest
+    # The :latest leg is a forward-compat canary — let it fail without failing
+    # the workflow. Pinned v21..v24 legs are fatal on failure.
+    continue-on-error: ${{ matrix.canary }}
+    permissions:
+      packages: read
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.setup.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # Pre-pull the pre-baked GHCR mirror (bounded retry, same helper the
+      # ci.yml integration jobs use). The compose `up` then finds the image
+      # already local and only pulls the small etcd image from quay.io.
+      - name: Log in to ghcr.io + pull the pre-baked Vitess image
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash scripts/ci-ghcr-pull.sh "${{ matrix.image }}"
+
+      # Boot the cluster on this version and run the Bug-27 end-to-end test.
+      # VITESS_LITE_IMAGE points the compose file + harness at the GHCR mirror;
+      # the harness parses the major from the tag and layers the legacy-flag
+      # override for major <= 22 (v21/v22).
+      - name: Boot cluster + run ${{ github.event.inputs.run || 'TestVitessCluster_Bug27' }}
+        env:
+          VITESS_LITE_IMAGE: ${{ matrix.image }}
+        run: |
+          go test -tags='integration vitesscluster' -count=1 -timeout=20m \
+            -run '${{ github.event.inputs.run || 'TestVitessCluster_Bug27' }}' \
+            -v ./internal/engines/mysql/...

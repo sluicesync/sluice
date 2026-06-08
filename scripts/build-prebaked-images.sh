@@ -58,10 +58,14 @@
 #   that owns the token (defaults to `sluicesync`).
 #
 # Usage:
-#   ./scripts/build-prebaked-images.sh             # build + push all 4
+#   ./scripts/build-prebaked-images.sh             # build + push the 4 DB engines
 #   SKIP_PUSH=1 ./scripts/build-prebaked-images.sh # build only, no push
 #   ENGINES=mysql ./scripts/build-prebaked-images.sh
 #   ENGINES="postgres postgis pgvector" ./scripts/build-prebaked-images.sh
+#   ENGINES=vitess ./scripts/build-prebaked-images.sh   # MIRROR the vitess/lite
+#       # tags in scripts/vitess-versions.txt to ghcr.io/sluicesync/sluice-vitess.
+#       # NOT in the default set (it pulls ~5 x 2.7GB images) — opt in explicitly
+#       # or via the build-prebaked-images.yml `vitess` matrix entry.
 #
 # CI usage: invoked by .github/workflows/build-prebaked-images.yml on a
 # weekly cron + workflow_dispatch.
@@ -100,6 +104,23 @@ POSTGIS_TARGET_IMAGE="${GHCR_NAMESPACE}/sluice-postgis:16-3.4-prebaked"
 # test time, which is the upstream image's contract.
 PGVECTOR_BASE_IMAGE="pgvector/pgvector:0.7.4-pg16"
 PGVECTOR_TARGET_IMAGE="${GHCR_NAMESPACE}/sluice-pgvector:0.7.4-pg16-prebaked"
+
+# vitess (roadmap item 1(e)): unlike the DB engines above there is NO init to
+# bake — vitess/lite initializes its mysqld datadirs at RUNTIME via
+# `mysqlctl init` with per-tablet config, so there is no static first-boot
+# step to fold into the image. This engine is therefore a pure MIRROR of the
+# upstream docker.io tags listed in scripts/vitess-versions.txt to
+# ghcr.io/sluicesync/sluice-vitess:<tag>, for the same reason task #70 mirrored
+# pgvector: eliminate docker.io as a single-point-of-failure / rate-limited
+# pull source for the gated `vitesscluster` multi-version matrix
+# (.github/workflows/vitess-version-matrix.yml), and get the faster GHCR-to-
+# runner pull. The mirror is single-arch (the runner's arch, amd64 in CI) —
+# the matrix only ever runs on amd64. NOTE: a mirror must `docker pull` the
+# base to retag it, so (unlike the digest-skip the DB bakes get) the weekly
+# run always re-pulls; `docker push` still layer-dedups unchanged tags, and
+# each image is `docker rmi`'d after push to bound the runner's ~14GB disk.
+VITESS_VERSIONS_FILE="${VITESS_VERSIONS_FILE:-$(dirname "$0")/vitess-versions.txt}"
+VITESS_TARGET_REPO="${GHCR_NAMESPACE}/sluice-vitess"
 
 # --- Helpers ----------------------------------------------------------
 
@@ -434,6 +455,35 @@ DOCKERFILE
     fi
 }
 
+# read_vitess_versions emits the docker.io refs from VITESS_VERSIONS_FILE,
+# one per line, skipping comments and blank lines.
+read_vitess_versions() {
+    grep -vE '^[[:space:]]*#|^[[:space:]]*$' "$VITESS_VERSIONS_FILE"
+}
+
+# bake_vitess MIRRORS each upstream vitess/lite tag to GHCR. Pure retag (no
+# Dockerfile / init bake — see the VITESS_* config block for why). Each image
+# is removed after push so peak disk stays ~one image rather than the sum of
+# all versions (~13.5GB would blow the runner's 14GB).
+bake_vitess() {
+    local base tag target
+    while IFS= read -r base; do
+        [[ -z "$base" ]] && continue
+        tag="${base##*:}"
+        target="${VITESS_TARGET_REPO}:${tag}"
+        log "mirroring ${base} -> ${target}"
+        docker pull "$base"
+        docker tag "$base" "$target"
+        if [[ "${SKIP_PUSH:-0}" != "1" ]]; then
+            log "pushing ${target}"
+            docker push "$target"
+        fi
+        # Bound disk: drop both tags before the next (larger) pull. Layers
+        # already in GHCR are not re-uploaded on a later unchanged push.
+        docker rmi "$target" "$base" >/dev/null 2>&1 || true
+    done < <(read_vitess_versions)
+}
+
 # --- Main -------------------------------------------------------------
 
 main() {
@@ -447,8 +497,9 @@ main() {
             postgres) bake_postgres ;;
             postgis)  bake_postgis ;;
             pgvector) bake_pgvector ;;
+            vitess)   bake_vitess ;;
             *)
-                log "ERROR: unknown engine '${engine}' (want one of: mysql postgres postgis pgvector)"
+                log "ERROR: unknown engine '${engine}' (want one of: mysql postgres postgis pgvector vitess)"
                 exit 1
                 ;;
         esac

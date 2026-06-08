@@ -23,10 +23,9 @@
     5-container cluster). It is intentionally not wired into per-PR CI.
 
 .PARAMETER Versions
-    Vitess/lite image tags to sweep. KEEP THE PINNED MAJORS IN [v21..v24]
-    and BUMP THE MINORS as upstream releases (verify tags exist at
-    https://hub.docker.com/r/vitess/lite/tags). v24 must stay in lockstep
-    with the vendored client major.
+    Vitess/lite image tags to sweep. Defaults to the single source of truth in
+    scripts/vitess-versions.txt (shared with the prebake mirror + the CI matrix
+    workflow); bump the canonical list there. Pass this for an ad-hoc subset.
 
 .PARAMETER Run
     -run filter passed to go test. Default exercises the whole cluster suite;
@@ -42,18 +41,22 @@
 #>
 [CmdletBinding()]
 param(
-    [string[]]$Versions = @(
-        'vitess/lite:v21.0.6',
-        'vitess/lite:v22.0.4',
-        'vitess/lite:v23.0.4',
-        'vitess/lite:v24.0.1',
-        'vitess/lite:latest'
-    ),
+    [string[]]$Versions = @(),
     [string]$Run = 'TestVitessCluster',
     [string]$Timeout = '25m'
 )
 
 $ErrorActionPreference = 'Stop'
+
+# Default version list is the single source of truth (scripts/vitess-versions.txt),
+# shared with the prebake mirror + the CI matrix workflow. Pass -Versions for a
+# subset. Bump the canonical list in that file, not here.
+if (-not $Versions -or $Versions.Count -eq 0) {
+    $versionsFile = Join-Path $PSScriptRoot 'vitess-versions.txt'
+    $Versions = Get-Content $versionsFile |
+        Where-Object { $_ -notmatch '^\s*#' -and $_.Trim() -ne '' } |
+        ForEach-Object { $_.Trim() }
+}
 
 function Resolve-DockerBin {
     $cmd = Get-Command docker -ErrorAction SilentlyContinue

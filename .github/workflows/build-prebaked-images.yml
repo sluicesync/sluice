@@ -2,7 +2,10 @@
 #
 # Runs `scripts/build-prebaked-images.sh` to rebuild the
 # ghcr.io/sluicesync/sluice-{mysql,postgres,postgis,pgvector} images that
-# `ci.yml`'s integration jobs consume. The script is idempotent
+# `ci.yml`'s integration jobs consume, plus MIRROR the vitess/lite server
+# tags (scripts/vitess-versions.txt) to ghcr.io/sluicesync/sluice-vitess for
+# the gated multi-version cluster matrix (vitess-version-matrix.yml). The
+# script is idempotent
 # (skips when the upstream base digest hasn't moved) so the weekly
 # cron is a no-op on uneventful weeks and rebakes when MySQL 8.0 /
 # postgres:16 / postgis:16-3.4 / pgvector:0.7.4-pg16 publish a patch
@@ -89,8 +92,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        engine: [mysql, postgres, postgis, pgvector]
-    timeout-minutes: 20
+        engine: [mysql, postgres, postgis, pgvector, vitess]
+    # 30 (was 20): the `vitess` engine MIRRORS ~5 x 2.7GB vitess/lite tags
+    # (scripts/vitess-versions.txt) — a pull+push per version, heavier than the
+    # single-image DB bakes. The DB shards finish well inside 20m regardless.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
 
