@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 	"sync"
@@ -518,7 +519,13 @@ func vstreamEndpointFromDSN(cfg *gomysql.Config) (string, error) {
 // (system roots + ServerName from the endpoint host).
 func vstreamTLSConfigFromDSN(cfg *gomysql.Config) *tls.Config {
 	if cfg.Params["vstream_insecure_tls"] == "true" {
-		return &tls.Config{InsecureSkipVerify: true} //nolint:gosec // explicit opt-in for tests
+		// Loud-failure tenet: this disables certificate verification on the
+		// VStream gRPC dial (it exists for vttestserver-on-localhost). Warn
+		// every time it is honoured so a test DSN copied into production
+		// can't silently downgrade transport security.
+		slog.Warn("mysql/vstream: vstream_insecure_tls=true — TLS certificate verification is DISABLED " +
+			"on the VStream connection (intended for local vttestserver only; never use against a real endpoint)")
+		return &tls.Config{InsecureSkipVerify: true} //nolint:gosec // explicit, loudly-warned opt-in for local tests
 	}
 	return &tls.Config{MinVersion: tls.VersionTLS12}
 }
