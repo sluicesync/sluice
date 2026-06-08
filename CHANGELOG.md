@@ -6,6 +6,33 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.99.21] - 2026-06-07
+
+### Fixed
+
+- **MySQL `TINYINT(1)` columns that store real integers (not a 0/1 boolean) no
+  longer collapse silently.** sluice maps `TINYINT(1)` to boolean by the
+  documented MySQL convention, but `TINYINT(1)` is only a display width — the
+  column physically stores the full signed 8-bit range, so a schema using it as
+  a status code or small enum can hold `2`, `127`, `-1`, etc. The boolean decode
+  collapsed every non-zero value to `true`, losing the integer with no warning —
+  even MySQL→MySQL. The bulk-copy / snapshot read path now **WARNs loudly, once
+  per column** (naming the `table.column` and an example value) when it reads a
+  `TINYINT(1)` value outside `{0,1}`, instead of doing it silently.
+
+### Added
+
+- **`--type-override <table>.<col>=smallint` (and `=int` / `=integer`) to
+  preserve a `TINYINT(1)` integer column.** The override rewrites the IR type the
+  reader decodes with, so the cell is read as an integer (not collapsed to a
+  bool) and carried faithfully end-to-end — cross-engine and same-engine.
+  `smallint` is the recommended floor: a `TINYINT(1)` value always fits, and
+  unlike a `tinyint` override it can't re-emit a MySQL `TINYINT(1)` target column
+  that would re-trigger the boolean mapping on a round-trip. The new
+  out-of-range WARN points operators here. (The WARN currently fires on the
+  copy / `sync` cold-start path; the CDC tail is a tracked follow-up — the
+  override already preserves the value on every path.)
+
 ## [0.99.20] - 2026-06-07
 
 ### Fixed
