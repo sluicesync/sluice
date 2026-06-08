@@ -53,6 +53,16 @@ the target so it stores the legacy zero-date as-is. This is independent
 of `--zero-date`: `--mysql-sql-mode=''` alone no longer silently carries
 partial dates (the read side refuses them first).
 
+Under `--mysql-sql-mode=''` MySQL also silently *clamps or truncates* any
+other out-of-range / over-long value on write (a numeric overflow → MAX, an
+over-long string → cut). sluice no longer lets that pass quietly: the bulk
+writer reports each such coercion as a loud **WARN** (once per column),
+naming the offending values and the data-preserving remedy (map the column
+to a fitting type with `--type-override`, e.g. `=decimal(P,S)`,
+`=text`/`=varchar`, `=datetime`). It is a WARN, not a refusal — you opted
+into relaxed mode — but a silent clamp will never escape unannounced. Drop
+`--mysql-sql-mode=''` to have strict mode *refuse* such values instead.
+
 **Recovery.** Pick the read policy that matches your data semantics:
 
 ```bash

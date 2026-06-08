@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 
 	"sluicesync.dev/sluice/internal/ir"
 )
@@ -77,6 +78,12 @@ type RowWriter struct {
 	// durably-written frontier. Implements [ir.CopyDurableProgressReporter]
 	// via [SetCopyDurableProgress]. nil on every non-cold-start path.
 	copyDurableProgress ir.CopyDurableProgressFunc
+
+	// warnedClamp tracks tables already warned about a relaxed-sql_mode
+	// silent coercion (Vector B), so reportBulkWriteWarnings emits at
+	// most one WARN per table rather than one per flushed batch. Keyed
+	// by table name; values are struct{}. Zero value is ready to use.
+	warnedClamp sync.Map
 }
 
 // SetCopyDurableProgress implements [ir.CopyDurableProgressReporter]
@@ -397,6 +404,21 @@ func (w *RowWriter) writeBatched(ctx context.Context, table *ir.Table, rows <-ch
 		byteCap = defaultMaxBufferBytes
 	}
 
+	// Pin a single connection for the whole batched write so the
+	// post-flush warning check (Vector B) reads SHOW WARNINGS on the SAME
+	// session that ran the INSERT — @@warning_count / SHOW WARNINGS are
+	// session-scoped, and the pool could otherwise hand the probe a
+	// different conn. This is the bulk path used whenever LOAD DATA isn't
+	// (server local_infile=OFF, or a geometry column), so it's where a
+	// relaxed-sql_mode silent clamp would otherwise go unreported. The
+	// write was already sequential (one flush at a time), so pinning
+	// loses no parallelism.
+	conn, err := w.db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("mysql: batched insert into %q: pin connection: %w", table.Name, err)
+	}
+	defer func() { _ = conn.Close() }()
+
 	batch := make([]ir.Row, 0, limit)
 	var batchBytes int64
 
@@ -406,8 +428,16 @@ func (w *RowWriter) writeBatched(ctx context.Context, table *ir.Table, rows <-ch
 		}
 		query := buildBatchInsert(table, len(batch))
 		args := flattenArgs(batch, table)
-		if _, err := w.db.ExecContext(ctx, query, args...); err != nil {
+		if _, err := conn.ExecContext(ctx, query, args...); err != nil {
 			return fmt.Errorf("mysql: insert into %q (%d rows): %w", table.Name, len(batch), err)
+		}
+		// Strict sql_mode rejects an out-of-range value at the INSERT
+		// above (loud already); under --mysql-sql-mode='' MySQL silently
+		// clamps/truncates and only flags it via the warning list — so
+		// check after each successful flush (Vector B). Refuses (strict)
+		// or WARNs once per table (relaxed).
+		if err := w.reportBulkWriteWarnings(ctx, conn, table.Name); err != nil {
+			return err
 		}
 		batch = batch[:0]
 		batchBytes = 0

@@ -85,6 +85,19 @@ func (w *RowWriter) writeBatchedIdempotent(ctx context.Context, table *ir.Table,
 		return errKeylessIdempotent(table)
 	}
 
+	// Pin a single connection for the whole write so the per-flush Vector
+	// B warning check (reportBulkWriteWarnings) reads SHOW WARNINGS on the
+	// SAME session that ran the upsert — session-scoped, like writeBatched.
+	// This is the idempotent path the orchestrator takes on resume,
+	// parallel chunked copy (>100k threshold), add-table, and the VStream
+	// cold-start COPY; without the check a silent clamp under
+	// --mysql-sql-mode='' would go unreported on exactly those runs.
+	conn, err := w.db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("mysql: idempotent insert into %q: pin connection: %w", table.Name, err)
+	}
+	defer func() { _ = conn.Close() }()
+
 	batch := make([]ir.Row, 0, limit)
 	var batchBytes int64
 	flush := func() error {
@@ -93,14 +106,22 @@ func (w *RowWriter) writeBatchedIdempotent(ctx context.Context, table *ir.Table,
 		}
 		query := buildBatchUpsert(table, len(batch), keyCols)
 		args := flattenArgs(batch, table)
-		if _, err := w.db.ExecContext(ctx, query, args...); err != nil {
+		if _, err := conn.ExecContext(ctx, query, args...); err != nil {
 			return fmt.Errorf("mysql: idempotent insert into %q (%d rows): %w", table.Name, len(batch), err)
+		}
+		// Vector B: strict sql_mode errors at the upsert above; under
+		// --mysql-sql-mode='' MySQL silently clamps and only flags the
+		// warning list — check it before advancing any watermark so a
+		// strict-mode refusal (returned error) doesn't mark a bad batch
+		// durable, and a relaxed-mode clamp is WARNed once per table.
+		if err := w.reportBulkWriteWarnings(ctx, conn, table.Name); err != nil {
+			return err
 		}
 		// Report the durable-write delta (v0.99.9): this batch is now
 		// committed (autocommit Exec), so the snapshot reader's checkpoint
-		// may advance to cover these rows. Reported AFTER the Exec
-		// succeeds — never before — so the watermark stays at-or-behind
-		// the durable frontier.
+		// may advance to cover these rows. Reported AFTER the Exec +
+		// warning check succeed — never before — so the watermark stays
+		// at-or-behind the durable frontier.
 		if w.copyDurableProgress != nil {
 			w.copyDurableProgress(int64(len(batch)))
 		}

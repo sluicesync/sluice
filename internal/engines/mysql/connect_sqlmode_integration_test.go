@@ -24,6 +24,15 @@ func getenvOr(key, def string) string {
 	return def
 }
 
+func mustParseDSN(t *testing.T, dsn string) *mysqldriver.Config {
+	t.Helper()
+	cfg, err := parseDSN(dsn)
+	if err != nil {
+		t.Fatalf("parseDSN: %v", err)
+	}
+	return cfg
+}
+
 // TestConnectAppliesStrictSQLModeOnSession pins the v0.92.1
 // connection-side sql_mode forcing. The cycle subagent's general-log
 // probe found "ZERO SET sql_mode" — but that was a test-methodology
@@ -144,7 +153,7 @@ func TestLoadDataWarningCountRefusesSilentClamp(t *testing.T) {
 // passed --mysql-sql-mode=”), the writer trusts the server's
 // default behaviour and does NOT refuse on warnings — the operator
 // has explicitly accepted server-side semantics.
-func TestLoadDataWarningCountSkippedWhenSQLModeEmpty(t *testing.T) {
+func TestLoadDataWarning_RelaxedModeWarnsNotRefuses(t *testing.T) {
 	dsn := getenvOr("MYSQL_PROBE_DSN", "")
 	if dsn == "" {
 		host, port, user, password := ensureSharedMySQL(t)
@@ -192,27 +201,49 @@ func TestLoadDataWarningCountSkippedWhenSQLModeEmpty(t *testing.T) {
 	}
 	defer func() { _, _ = db.ExecContext(ctx, "DROP TABLE IF EXISTS sluice_loaddata_pin_legacy") }()
 
-	// Probe refuseOnLoadDataWarnings directly with a pinned conn.
-	// This isolates the v0.92.2 escape-hatch contract (sessionSQLMode
-	// == "" → skip warning check) from the LOAD DATA path itself,
-	// which depends on environment in ways the pin shouldn't.
+	// Probe reportBulkWriteWarnings directly with a pinned conn. Under
+	// sessionSQLMode=="" (escape hatch) the Vector B contract is: a
+	// silent coercion is no longer SKIPPED — it must WARN loudly but NOT
+	// refuse (the operator opted into relaxed mode). We must NOT run
+	// `SELECT @@warning_count` before the probe — that statement clears
+	// the diagnostic list (the very ordering bug that produced empty
+	// `Examples: []`), so the probe reads SHOW WARNINGS first.
 	conn, err := db.Conn(ctx)
 	if err != nil {
 		t.Fatalf("pin conn: %v", err)
 	}
 	defer func() { _ = conn.Close() }()
-	// Force a warning into the session deliberately so the test
-	// has something to ignore.
+	if _, err := conn.ExecContext(ctx, "SET SESSION sql_mode = ''"); err != nil {
+		t.Skipf("cannot relax session sql_mode for the probe: %v", err)
+	}
+	// Seed an out-of-range value: under relaxed sql_mode it silently
+	// clamps and flags the warning list (the Vector B silent-loss shape).
 	if _, err := conn.ExecContext(ctx, "INSERT INTO sluice_loaddata_pin_legacy (id, big) VALUES (1, 999999999999999999999.99999)"); err != nil {
 		t.Fatalf("seed warning row: %v", err)
 	}
-	var wc int
-	_ = conn.QueryRowContext(ctx, "SELECT @@warning_count").Scan(&wc)
-	if wc == 0 {
-		t.Skip("server's session sql_mode is too strict for the escape-hatch probe to seed a warning; the contract is still validated by the unit pin TestParseDSN_SetSessionSQLModeEmptyDisablesInjection")
+
+	buf := captureSlog(t)
+	w := &RowWriter{}
+	if err := w.reportBulkWriteWarnings(ctx, conn, "sluice_loaddata_pin_legacy"); err != nil {
+		t.Fatalf("relaxed sql_mode must WARN, not refuse; got error: %v", err)
 	}
-	if err := refuseOnLoadDataWarnings(ctx, conn, "sluice_loaddata_pin_legacy"); err != nil {
-		t.Fatalf("refuseOnLoadDataWarnings should return nil when sessionSQLMode==''; got: %v", err)
+	out := buf.String()
+	if !strings.Contains(out, "sluice_loaddata_pin_legacy") {
+		t.Skip("server did not surface a warning for the seeded overflow; relaxed-WARN behavior is also covered by the end-to-end Vector B integration test")
+	}
+	if !strings.Contains(out, "SILENTLY coerced") || !strings.Contains(out, "--type-override") {
+		t.Errorf("relaxed-mode WARN missing expected content:\n%s", out)
+	}
+	// Second call must NOT warn again (once per table).
+	buf.Reset()
+	if _, err := conn.ExecContext(ctx, "INSERT INTO sluice_loaddata_pin_legacy (id, big) VALUES (2, 999999999999999999999.99999)"); err != nil {
+		t.Fatalf("seed second warning row: %v", err)
+	}
+	if err := w.reportBulkWriteWarnings(ctx, conn, "sluice_loaddata_pin_legacy"); err != nil {
+		t.Fatalf("second probe should still not refuse; got: %v", err)
+	}
+	if strings.Contains(buf.String(), "sluice_loaddata_pin_legacy") {
+		t.Errorf("warned twice for the same table; want once-per-table:\n%s", buf.String())
 	}
 }
 
@@ -298,4 +329,159 @@ func TestDirectInsertHonoursStrictMode(t *testing.T) {
 	// driver import is consumed by the other tests at registration.
 	_ = mysqldriver.MySQLDriver{}
 	_ = io.EOF
+}
+
+// TestWriteBatched_RelaxedModeWarnsOnClamp pins the Vector B fix on the
+// batched-INSERT bulk path (the path used whenever LOAD DATA isn't —
+// server local_infile=OFF, or a geometry column). Under
+// --mysql-sql-mode=” an out-of-range value is silently clamped by the
+// server; writeBatched now reports it as a loud one-time-per-table WARN
+// (not a refusal) via its pinned connection, instead of the pre-Vector-B
+// silent pass.
+func TestWriteBatched_RelaxedModeWarnsOnClamp(t *testing.T) {
+	host, port, user, password := ensureSharedMySQL(t)
+	dsn := sharedDSN(host, port, user, password, "mysql")
+	ctx := context.Background()
+
+	// Relax the server's GLOBAL sql_mode so freshly-pooled connections
+	// (the ones writeBatched pins) coerce instead of erroring. Restore on
+	// cleanup so other tests on the shared container stay strict.
+	admin, err := openDB(ctx, mustParseDSN(t, dsn))
+	if err != nil {
+		t.Fatalf("admin openDB: %v", err)
+	}
+	defer admin.Close()
+	var origGlobal string
+	if err := admin.QueryRowContext(ctx, "SELECT @@GLOBAL.sql_mode").Scan(&origGlobal); err != nil {
+		t.Fatalf("read GLOBAL sql_mode: %v", err)
+	}
+	if _, err := admin.ExecContext(ctx, "SET GLOBAL sql_mode = ''"); err != nil {
+		t.Skipf("cannot relax GLOBAL sql_mode for the batched-path probe: %v", err)
+	}
+	defer func() { _, _ = admin.ExecContext(ctx, "SET GLOBAL sql_mode = ?", origGlobal) }()
+
+	orig := sessionSQLMode
+	defer func() { sessionSQLMode = orig }()
+	SetSessionSQLMode("") // don't re-force strict on sluice's pooled conns
+
+	db, err := openDB(ctx, mustParseDSN(t, dsn))
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	defer db.Close()
+
+	if _, err := db.ExecContext(ctx, "DROP TABLE IF EXISTS sluice_vectorb_batched"); err != nil {
+		t.Fatalf("DROP: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "CREATE TABLE sluice_vectorb_batched (id INT PRIMARY KEY, small TINYINT)"); err != nil {
+		t.Fatalf("CREATE: %v", err)
+	}
+	defer func() { _, _ = db.ExecContext(ctx, "DROP TABLE IF EXISTS sluice_vectorb_batched") }()
+
+	rowCh := make(chan ir.Row, 1)
+	rowCh <- ir.Row{"id": int64(1), "small": int64(300)} // 300 > TINYINT max 127 → clamps to 127
+	close(rowCh)
+
+	buf := captureSlog(t)
+	w := &RowWriter{db: db}
+	tbl := &ir.Table{Name: "sluice_vectorb_batched", Columns: []*ir.Column{
+		{Name: "id", Type: ir.Integer{Width: 32}},
+		{Name: "small", Type: ir.Integer{Width: 8}},
+	}}
+	if err := w.writeBatched(ctx, tbl, rowCh); err != nil {
+		t.Fatalf("writeBatched under relaxed mode must not refuse; got: %v", err)
+	}
+
+	// The value was silently clamped (documents the Vector B shape)...
+	var got int
+	if err := db.QueryRowContext(ctx, "SELECT small FROM sluice_vectorb_batched WHERE id=1").Scan(&got); err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if got != 127 {
+		t.Skipf("server did not clamp 300→127 (got %d); GLOBAL sql_mode relax may not have taken on the pooled conn", got)
+	}
+	// ...and the clamp was reported as a loud WARN naming the table + remedy.
+	out := buf.String()
+	if !strings.Contains(out, "sluice_vectorb_batched") || !strings.Contains(out, "SILENTLY coerced") {
+		t.Errorf("writeBatched relaxed-mode WARN missing/incorrect:\n%s", out)
+	}
+	if !strings.Contains(out, "--type-override") {
+		t.Errorf("writeBatched WARN should name the --type-override remedy:\n%s", out)
+	}
+}
+
+// TestWriteBatchedIdempotent_RelaxedModeWarnsOnClamp pins Vector B on the
+// IDEMPOTENT upsert bulk path (row_writer_batch.go) — the path the
+// orchestrator takes on resume, parallel chunked copy (>100k threshold),
+// add-table, and the VStream cold-start COPY. It was the third bulk-write
+// dispatch member; LOAD DATA and writeBatched were covered, this one was
+// not (the Bug-74 "pin the class, not the representative" gap). Under
+// --mysql-sql-mode=” an out-of-range value silently clamps; the upsert
+// path now reports it as a one-time-per-table WARN via its pinned conn.
+func TestWriteBatchedIdempotent_RelaxedModeWarnsOnClamp(t *testing.T) {
+	host, port, user, password := ensureSharedMySQL(t)
+	dsn := sharedDSN(host, port, user, password, "mysql")
+	ctx := context.Background()
+
+	admin, err := openDB(ctx, mustParseDSN(t, dsn))
+	if err != nil {
+		t.Fatalf("admin openDB: %v", err)
+	}
+	defer admin.Close()
+	var origGlobal string
+	if err := admin.QueryRowContext(ctx, "SELECT @@GLOBAL.sql_mode").Scan(&origGlobal); err != nil {
+		t.Fatalf("read GLOBAL sql_mode: %v", err)
+	}
+	if _, err := admin.ExecContext(ctx, "SET GLOBAL sql_mode = ''"); err != nil {
+		t.Skipf("cannot relax GLOBAL sql_mode for the idempotent-path probe: %v", err)
+	}
+	defer func() { _, _ = admin.ExecContext(ctx, "SET GLOBAL sql_mode = ?", origGlobal) }()
+
+	orig := sessionSQLMode
+	defer func() { sessionSQLMode = orig }()
+	SetSessionSQLMode("")
+
+	db, err := openDB(ctx, mustParseDSN(t, dsn))
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	defer db.Close()
+
+	if _, err := db.ExecContext(ctx, "DROP TABLE IF EXISTS sluice_vectorb_idem"); err != nil {
+		t.Fatalf("DROP: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "CREATE TABLE sluice_vectorb_idem (id INT PRIMARY KEY, small TINYINT)"); err != nil {
+		t.Fatalf("CREATE: %v", err)
+	}
+	defer func() { _, _ = db.ExecContext(ctx, "DROP TABLE IF EXISTS sluice_vectorb_idem") }()
+
+	rowCh := make(chan ir.Row, 1)
+	rowCh <- ir.Row{"id": int64(1), "small": int64(300)} // clamps to 127
+	close(rowCh)
+
+	buf := captureSlog(t)
+	w := &RowWriter{db: db}
+	tbl := &ir.Table{
+		Name: "sluice_vectorb_idem",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 32}},
+			{Name: "small", Type: ir.Integer{Width: 8}},
+		},
+		PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "id"}}},
+	}
+	if err := w.writeBatchedIdempotent(ctx, tbl, rowCh); err != nil {
+		t.Fatalf("writeBatchedIdempotent under relaxed mode must not refuse; got: %v", err)
+	}
+
+	var got int
+	if err := db.QueryRowContext(ctx, "SELECT small FROM sluice_vectorb_idem WHERE id=1").Scan(&got); err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if got != 127 {
+		t.Skipf("server did not clamp 300→127 (got %d); GLOBAL relax may not have taken", got)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "sluice_vectorb_idem") || !strings.Contains(out, "SILENTLY coerced") {
+		t.Errorf("idempotent-path relaxed-mode WARN missing/incorrect:\n%s", out)
+	}
 }

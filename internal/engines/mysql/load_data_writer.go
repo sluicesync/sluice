@@ -137,63 +137,98 @@ func (w *RowWriter) writeLoadData(ctx context.Context, table *ir.Table, rows <-c
 	//   - Explicit CAST(@var AS DECIMAL(65,30)) in SET still clamps
 	//
 	// The only reliable closure is the post-load warning probe.
-	// Surface any non-zero warning count as a loud refusal with the
-	// SHOW WARNINGS detail. Existing operators with intentionally
-	// lossy data should pass `--mysql-sql-mode=''` (the legacy-data
-	// escape hatch) — that path also disables sluice's strict
-	// session forcing, so warnings against a relaxed server fall
-	// outside this refusal.
-	return refuseOnLoadDataWarnings(ctx, conn, table.Name)
+	// Surface any warnings: a loud refusal under strict sql_mode, a loud
+	// one-time WARN under `--mysql-sql-mode=''` (Vector B — the relaxed
+	// path no longer skips silently; a silent clamp/truncation is still
+	// reported, just not refused, since the operator opted into coercion).
+	return w.reportBulkWriteWarnings(ctx, conn, table.Name)
 }
 
-// refuseOnLoadDataWarnings queries @@warning_count on the pinned LOAD
-// DATA connection and, if non-zero, surfaces the SHOW WARNINGS detail
-// as a loud refusal. See the rationale comment at the writeLoadData
-// call site for why this is necessary even under strict sql_mode.
+// reportBulkWriteWarnings inspects the diagnostic-area warnings produced
+// by the just-completed bulk write (LOAD DATA, or a batched INSERT) on the
+// pinned conn, and either refuses loudly (strict sql_mode) or WARNs loudly
+// once per table (relaxed sql_mode, --mysql-sql-mode=”) — closing the
+// Vector B silent-clamp gap. With zero warnings it's a no-op.
 //
-// Skipped (returns nil) when the operator opted out of sluice's
-// strict-default sql_mode injection via --mysql-sql-mode=” — in
-// that mode the operator has explicitly accepted server-side
-// behaviour, and surfaced warnings are not silent corruption per
-// sluice's tenet (the operator was warned at flag-set time via the
-// legacy-data docs).
-func refuseOnLoadDataWarnings(ctx context.Context, conn *sql.Conn, table string) error {
-	if sessionSQLMode == "" {
-		return nil
-	}
-	var count int
-	if err := conn.QueryRowContext(ctx, "SELECT @@warning_count").Scan(&count); err != nil {
-		return fmt.Errorf("mysql: LOAD DATA into %q: probe @@warning_count: %w", table, err)
-	}
-	if count == 0 {
-		return nil
-	}
+// SHOW WARNINGS is read FIRST (before any other statement on the conn):
+// reading `@@warning_count` first empties the diagnostic list, so the
+// prior code's subsequent SHOW WARNINGS returned nothing and the refusal
+// rendered an empty `Examples: []`. Reading SHOW WARNINGS directly gives
+// both the count (row count) AND the detail.
+//
+// Strict sql_mode: LOAD DATA / non-strict-INSERT downgrade per-row
+// type-conversion errors to warnings; a non-empty list is silent
+// corruption sluice must refuse (Bugs 102/103 / v0.92.2).
+//
+// Relaxed sql_mode (`--mysql-sql-mode=”`): the operator opted into
+// server-side coercion (e.g. to accept legacy zero-dates, now better
+// handled read-side by --zero-date). That opt-in does NOT make a silent
+// numeric clamp / string truncation acceptable — MySQL still flags it
+// (verified: under sql_mode=” an out-of-range value clamps AND bumps the
+// warning list). So instead of the pre-Vector-B silent skip, emit a loud
+// one-time-per-table WARN naming the coercions + the data-preserving
+// remedy. Not a refusal: the operator chose relaxed mode deliberately.
+// readShowWarnings reads SHOW WARNINGS on conn (must be read before any
+// other statement on the session, which would clear the diagnostic list),
+// returning up to 8 formatted detail lines and the total warning count.
+func readShowWarnings(ctx context.Context, conn *sql.Conn, table string) (details []string, count int, err error) {
 	rows, err := conn.QueryContext(ctx, "SHOW WARNINGS")
 	if err != nil {
-		return fmt.Errorf("mysql: LOAD DATA into %q: %d warnings reported; SHOW WARNINGS failed: %w",
-			table, count, err)
+		return nil, 0, fmt.Errorf("mysql: bulk write into %q: SHOW WARNINGS failed: %w", table, err)
 	}
-	defer rows.Close()
-	var details []string
+	defer func() { _ = rows.Close() }()
 	for rows.Next() {
 		var level, code, msg string
 		if err := rows.Scan(&level, &code, &msg); err != nil {
-			return fmt.Errorf("mysql: LOAD DATA into %q: scan warning: %w", table, err)
+			return nil, 0, fmt.Errorf("mysql: bulk write into %q: scan warning: %w", table, err)
 		}
-		// Cap at a few warnings — gigantic loads can emit thousands
-		// and we just need enough for the operator to diagnose.
+		count++
+		// Cap at a few warnings — gigantic loads can emit thousands and
+		// we just need enough for the operator to diagnose.
 		if len(details) < 8 {
 			details = append(details, fmt.Sprintf("%s %s: %s", level, code, msg))
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return fmt.Errorf("mysql: LOAD DATA into %q: iterate warnings: %w", table, err)
+		return nil, 0, fmt.Errorf("mysql: bulk write into %q: iterate warnings: %w", table, err)
+	}
+	return details, count, nil
+}
+
+func (w *RowWriter) reportBulkWriteWarnings(ctx context.Context, conn *sql.Conn, table string) error {
+	details, count, err := readShowWarnings(ctx, conn, table)
+	if err != nil {
+		return err
+	}
+	if count == 0 {
+		return nil
 	}
 	more := ""
 	if count > 8 {
 		more = fmt.Sprintf(" (… and %d more)", count-8)
 	}
-	return fmt.Errorf("mysql: LOAD DATA into %q produced %d warning(s) under strict sql_mode — "+
+
+	if sessionSQLMode == "" {
+		// Relaxed: WARN once per table, don't refuse.
+		if _, seen := w.warnedClamp.LoadOrStore(table, struct{}{}); !seen {
+			slog.WarnContext(
+				ctx,
+				"mysql: target SILENTLY coerced value(s) under --mysql-sql-mode='' — out-of-range/over-long "+
+					"values were clamped or truncated on write, not refused (Vector B). The migration proceeds "+
+					"with the coerced values per your relaxed sql_mode opt-in.",
+				slog.String("table", table),
+				slog.Int("warnings", count),
+				slog.String("examples", strings.Join(details, "; ")+more),
+				slog.String("hint", "to PRESERVE such values, map the column to a fitting type via "+
+					"--type-override (e.g. =decimal(P,S) for a numeric overflow, =text/=varchar for an over-long "+
+					"string, =datetime for an out-of-range timestamp) or fix the source; to REFUSE instead of "+
+					"coerce, drop --mysql-sql-mode='' so strict mode rejects the value loudly"),
+			)
+		}
+		return nil
+	}
+
+	return fmt.Errorf("mysql: bulk write into %q produced %d warning(s) under strict sql_mode — "+
 		"LOAD DATA's per-row type-conversion errors are silently downgraded to warnings (a MySQL "+
 		"behaviour quirk this refusal closes; Bugs 102/103 / v0.92.2). Examples: [%s]%s. "+
 		"Recovery (data-preserving): map the column to a target type that FITS the value via "+
