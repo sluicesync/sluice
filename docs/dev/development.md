@@ -131,7 +131,7 @@ Rancher Desktop works as a Docker Desktop replacement, with two snags worth know
   $env:TESTCONTAINERS_RYUK_DISABLED='true'   # PowerShell
   ```
 
-  Our tests already terminate their containers via `defer cleanup()` so dropping ryuk doesn't leak anything in practice. CI runs Docker on Linux where ryuk works fine, so this is a local-only override.
+  Our tests already terminate their containers via `defer cleanup()` so dropping ryuk doesn't leak anything in practice. CI also disables ryuk on its integration jobs (`TESTCONTAINERS_RYUK_DISABLED=true` in `.github/workflows/ci.yml`): the runners are ephemeral, so there are no orphans to reap, and keeping it on only added a docker.io pull of `testcontainers/ryuk` that intermittently timed out and red-failed a shard. Local Linux/macOS dev can leave ryuk **on** if you like — its orphan-reaping is genuinely useful after a Ctrl-C or panic that skips `defer cleanup()`; this override is only *required* on Windows/Rancher (where ryuk doesn't work) and is what CI does for reliability.
 
 ## Branch protection
 

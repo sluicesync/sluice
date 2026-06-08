@@ -185,6 +185,18 @@ jobs:
   integration:
     name: Integration (${{ matrix.shard.name }})
     runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
+    # Disable the testcontainers ryuk reaper in CI. CI runners are
+    # ephemeral (the VM is discarded after the job, so there are no orphan
+    # containers to reap) and the tests already self-clean via
+    # `defer cleanup()`, so ryuk is pure overhead here — and keeping it on
+    # added a docker.io pull of testcontainers/ryuk that intermittently
+    # timed out and red-failed a shard ("registry-1.docker.io ... context
+    # deadline exceeded"). Scoped to CI only: local Linux/macOS dev keeps
+    # ryuk (its orphan-reaping helps after a Ctrl-C/panic before defer
+    # runs); Windows/Rancher already disables it locally. See
+    # docs/dev/development.md.
+    env:
+      TESTCONTAINERS_RYUK_DISABLED: "true"
     # Need packages:read so the pre-baked images on ghcr.io
     # (ghcr.io/sluicesync/sluice-mysql:8.0-prebaked etc., task #68) can be
     # pulled by `docker pull` below. Default token permissions are
@@ -393,6 +405,9 @@ jobs:
   integration-postgis:
     name: Integration (PostGIS)
     runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
+    # Disable ryuk on CI — see the integration job's env block.
+    env:
+      TESTCONTAINERS_RYUK_DISABLED: "true"
     timeout-minutes: 20
     # See the integration job's permissions block for the rationale.
     permissions:
@@ -453,6 +468,9 @@ jobs:
   integration-vstream:
     name: Integration (vstream)
     runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
+    # Disable ryuk on CI — see the integration job's env block.
+    env:
+      TESTCONTAINERS_RYUK_DISABLED: "true"
     timeout-minutes: 35
     # See the integration job's permissions block for the rationale.
     permissions:
