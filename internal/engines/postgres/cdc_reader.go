@@ -68,6 +68,22 @@ type CDCReader struct {
 	// Events for other schemas are dropped during dispatch.
 	schema string
 
+	// cdcSchemaInScope is the ADR-0075 Phase 2b multi-schema event-allow
+	// predicate, set by [SetCDCDatabaseScope]. A PG logical replication
+	// slot is DATABASE-WIDE — a single slot decodes the WAL for every
+	// schema in the connected database through one stream, each change
+	// already tagged with its source schema (the pgoutput RelationMessage's
+	// Namespace, surfaced as rel.Schema). When non-nil the reader emits a
+	// change iff its source schema satisfies this predicate, instead of the
+	// single-schema `rel.Schema == r.schema` drop; [ir.Change.Schema] is
+	// ALREADY populated with rel.Schema (no new decode), so the applier's
+	// MultiDatabaseRouter can route each change to its same-named target
+	// schema. A nil predicate (the default) preserves the single-schema
+	// drop EXACTLY (only `schema` is in scope). Consulted only on the pump
+	// goroutine. This is the symmetric analog of MySQL's
+	// CDCReader.cdcDBInScope (server-wide binlog → database-wide slot).
+	cdcSchemaInScope func(schema string) bool
+
 	// dsn is the underlying connection string the schema-DB was
 	// opened with. Stashed so [StreamChanges] can re-open it in
 	// replication mode.
@@ -131,6 +147,42 @@ type CDCReader struct {
 // reader is racy with the pump goroutine and will be ignored.
 func (r *CDCReader) AttachLSNTracker(t *lsnTracker) {
 	r.appliedLSN = t
+}
+
+// SetCDCDatabaseScope implements [ir.CDCDatabaseScoper] (ADR-0075 Phase
+// 2b). It switches the reader from its default single-schema view to a
+// multi-schema fan-out: because a PG logical slot is DATABASE-WIDE, the
+// one stream already carries every schema's changes (each tagged with
+// rel.Schema), so this only widens the per-event allow set — it does NOT
+// add a second slot. An event is emitted iff its source schema satisfies
+// `inScope`, and each emitted [ir.Change.Schema] already carries that
+// source schema so the applier's [ir.MultiDatabaseRouter] can route it to
+// the matching target schema. A nil predicate is a no-op (single-schema
+// mode preserved). Must be called before [StreamChanges]; the predicate
+// is read on the pump goroutine.
+func (r *CDCReader) SetCDCDatabaseScope(inScope func(schema string) bool) {
+	if inScope == nil {
+		return
+	}
+	r.cdcSchemaInScope = inScope
+}
+
+// Compile-time assertion that the PG CDC reader satisfies the multi-schema
+// fan-out event-scope surface (ADR-0075 Phase 2b).
+var _ ir.CDCDatabaseScoper = (*CDCReader)(nil)
+
+// schemaInScope reports whether events from the given source schema
+// should be emitted. In multi-schema mode (cdcSchemaInScope non-nil) it
+// delegates to the selected-set predicate; otherwise it preserves the
+// single-schema rule — only the bound `schema` is in scope. This is the
+// single decision point the four dispatch drop-sites consult, so the
+// single-schema behaviour stays byte-identical: a nil predicate makes
+// this exactly `schema == r.schema`.
+func (r *CDCReader) schemaInScope(schema string) bool {
+	if r.cdcSchemaInScope != nil {
+		return r.cdcSchemaInScope(schema)
+	}
+	return schema == r.schema
 }
 
 // Close releases the schema-DB pool and stops the pump goroutine.
@@ -885,7 +937,7 @@ func (r *CDCReader) emitInsert(
 	if !ok {
 		return fmt.Errorf("postgres: cdc: insert for unknown relation OID %d", relID)
 	}
-	if rel.Schema != r.schema {
+	if !r.schemaInScope(rel.Schema) {
 		return nil // out-of-scope schema; drop
 	}
 	row, err := decodeTuple(tuple, rel.Columns)
@@ -916,8 +968,8 @@ func (r *CDCReader) emitUpdate(
 	if !ok {
 		return fmt.Errorf("postgres: cdc: update for unknown relation OID %d", relID)
 	}
-	if rel.Schema != r.schema {
-		return nil
+	if !r.schemaInScope(rel.Schema) {
+		return nil // out-of-scope schema; drop
 	}
 	after, err := decodeTuple(newTuple, rel.Columns)
 	if err != nil {
@@ -1032,8 +1084,8 @@ func (r *CDCReader) emitDelete(
 	if !ok {
 		return fmt.Errorf("postgres: cdc: delete for unknown relation OID %d", relID)
 	}
-	if rel.Schema != r.schema {
-		return nil
+	if !r.schemaInScope(rel.Schema) {
+		return nil // out-of-scope schema; drop
 	}
 	if oldTuple == nil {
 		// pgoutput emits no OldTuple at all only under REPLICA IDENTITY
@@ -1177,8 +1229,8 @@ func (r *CDCReader) emitTruncate(
 		if !ok {
 			return fmt.Errorf("postgres: cdc: truncate for unknown relation OID %d", id)
 		}
-		if rel.Schema != r.schema {
-			continue
+		if !r.schemaInScope(rel.Schema) {
+			continue // out-of-scope schema; drop
 		}
 		if err := send(ctx, out, ir.Truncate{
 			Position:        pos,
@@ -1633,6 +1685,50 @@ func ensurePublication(ctx context.Context, db *sql.DB, name, schema string, tab
 		quoteIdent(name), formatPublicationTableList(schema, tables))
 	if _, err := db.ExecContext(ctx, alterQuery); err != nil {
 		return fmt.Errorf("postgres: alter publication %q tables: %w", name, err)
+	}
+	return nil
+}
+
+// ensureAllTablesPublication guarantees the named publication exists as
+// FOR ALL TABLES (ADR-0075 Phase 2b multi-schema CDC). A PG logical slot
+// is DATABASE-WIDE, so a multi-schema fan-out streams every selected
+// schema through one slot + one publication; the reader-side inScope
+// filter ([CDCReader.SetCDCDatabaseScope]) is the selection boundary, not
+// the publication. FOR ALL TABLES works on every supported PG version
+// (the PG15+ FOR TABLES IN SCHEMA trim is a later WAL-volume optimisation,
+// not a correctness requirement).
+//
+// Three cases, mirroring [ensurePublication]'s create/recreate logic but
+// in the opposite direction (toward FOR ALL TABLES, not toward a scoped
+// list):
+//
+//   - missing → CREATE PUBLICATION … FOR ALL TABLES.
+//   - exists and already FOR ALL TABLES → no-op (idempotent).
+//   - exists but SCOPED (a leftover FOR TABLE publication from a prior
+//     single-schema run) → DROP + recreate FOR ALL TABLES. ALTER cannot
+//     promote a FOR TABLE publication to FOR ALL TABLES, so a drop is
+//     required; it is safe because the publication is metadata only —
+//     slots reference WAL by LSN, not by a publication-name binding, and
+//     this opener creates a fresh slot in the same call.
+func ensureAllTablesPublication(ctx context.Context, db *sql.DB, name string) error {
+	var exists, allTables bool
+	const checkQuery = "SELECT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = $1), " +
+		"COALESCE((SELECT puballtables FROM pg_publication WHERE pubname = $1), false)"
+	if err := db.QueryRowContext(ctx, checkQuery, name).Scan(&exists, &allTables); err != nil {
+		return fmt.Errorf("postgres: check publication: %w", err)
+	}
+	if exists && allTables {
+		return nil
+	}
+	if exists {
+		dropQuery := fmt.Sprintf(`DROP PUBLICATION %s`, quoteIdent(name))
+		if _, err := db.ExecContext(ctx, dropQuery); err != nil {
+			return fmt.Errorf("postgres: drop scoped publication %q for multi-schema FOR ALL TABLES: %w", name, err)
+		}
+	}
+	createQuery := fmt.Sprintf(`CREATE PUBLICATION %s FOR ALL TABLES`, quoteIdent(name))
+	if _, err := db.ExecContext(ctx, createQuery); err != nil {
+		return fmt.Errorf("postgres: create FOR ALL TABLES publication %q: %w", name, err)
 	}
 	return nil
 }

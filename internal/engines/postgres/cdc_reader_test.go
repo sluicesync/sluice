@@ -825,6 +825,229 @@ func TestSynthesizeKeyOnlyBeforeRejectsMissingKeyValue(t *testing.T) {
 	}
 }
 
+// TestCDCSchemaInScope pins the ADR-0075 Phase 2b multi-schema event-
+// scope predicate at its decision point. A nil predicate (single-schema
+// default) MUST reduce EXACTLY to `schema == r.schema` — byte-identical
+// back-compat. A non-nil predicate (multi-schema) MUST delegate to the
+// selected-set predicate and admit every in-scope schema while dropping
+// out-of-scope ones. This is the single gate the four emit drop-sites
+// consult, so pinning it here covers all four.
+func TestCDCSchemaInScope(t *testing.T) {
+	r := &CDCReader{schema: "sales"}
+
+	// Single-schema (nil predicate): only the bound schema is in scope.
+	if !r.schemaInScope("sales") {
+		t.Error("nil predicate: bound schema must be in scope")
+	}
+	if r.schemaInScope("inventory") {
+		t.Error("nil predicate: non-bound schema must be out of scope (byte-identical back-compat)")
+	}
+	if r.schemaInScope("") {
+		t.Error("nil predicate: empty schema must be out of scope")
+	}
+
+	// SetCDCDatabaseScope(nil) is a no-op (single-schema mode preserved).
+	r.SetCDCDatabaseScope(nil)
+	if r.cdcSchemaInScope != nil {
+		t.Error("SetCDCDatabaseScope(nil) must be a no-op")
+	}
+	if r.schemaInScope("inventory") {
+		t.Error("after SetCDCDatabaseScope(nil): still single-schema; non-bound out of scope")
+	}
+
+	// Multi-schema: a selected set of {sales, inventory}.
+	selected := map[string]struct{}{"sales": {}, "inventory": {}}
+	r.SetCDCDatabaseScope(func(s string) bool {
+		_, ok := selected[s]
+		return ok
+	})
+	if !r.schemaInScope("sales") {
+		t.Error("multi-schema: in-scope schema 'sales' must be admitted")
+	}
+	if !r.schemaInScope("inventory") {
+		t.Error("multi-schema: in-scope schema 'inventory' must be admitted (not just the bound one)")
+	}
+	if r.schemaInScope("audit") {
+		t.Error("multi-schema: out-of-scope schema 'audit' must be dropped")
+	}
+}
+
+// TestEmitDropSitesHonorScope drives the four emit paths (insert /
+// update / delete / truncate) through the scope predicate and asserts
+// each one DROPS an out-of-scope schema's change and EMITS an in-scope
+// one. This is the family pin: the four drop-sites all route through
+// schemaInScope, so an out-of-scope schema must never reach the channel
+// on any of them, and an in-scope non-bound schema must reach it on all.
+func TestEmitDropSitesHonorScope(t *testing.T) {
+	const (
+		inScopeRelID  = uint32(1)
+		outScopeRelID = uint32(2)
+	)
+	mkReader := func() *CDCReader {
+		// slotName must be non-empty: emit* → positionAt → encodePGPos
+		// rejects an empty slot.
+		r := &CDCReader{schema: "sales", slotName: "sluice_slot"}
+		// Multi-schema scope admits {sales, inventory} but not {audit}.
+		sel := map[string]struct{}{"sales": {}, "inventory": {}}
+		r.SetCDCDatabaseScope(func(s string) bool { _, ok := sel[s]; return ok })
+		return r
+	}
+	// inventory is in scope but NOT the bound schema (the case the
+	// pre-2b `rel.Schema != r.schema` drop would have wrongly dropped).
+	relations := map[uint32]*relationCacheEntry{
+		inScopeRelID: {
+			Schema: "inventory", Name: "widgets", ReplicaIdentity: 'd',
+			Columns:         []relationColumn{{Name: "id", OID: pgtype.Int8OID, Type: ir.Integer{Width: 64}, KeyColumn: true}},
+			IdentityKeyCols: []string{"id"},
+		},
+		outScopeRelID: {
+			Schema: "audit", Name: "log", ReplicaIdentity: 'd',
+			Columns:         []relationColumn{{Name: "id", OID: pgtype.Int8OID, Type: ir.Integer{Width: 64}, KeyColumn: true}},
+			IdentityKeyCols: []string{"id"},
+		},
+	}
+	keyTuple := &pglogrepl.TupleData{
+		ColumnNum: 1,
+		Columns:   []*pglogrepl.TupleDataColumn{{DataType: 't', Length: 1, Data: []byte("7")}},
+	}
+
+	// drainOne runs emit, closes the channel, and reports whether any
+	// change was emitted plus the schema it carried.
+	drainOne := func(t *testing.T, emit func(out chan<- ir.Change) error) (emitted bool, schema string) {
+		t.Helper()
+		// Buffered so the emit's `send` never blocks for this single-row
+		// path; we inspect after.
+		out := make(chan ir.Change, 4)
+		if err := emit(out); err != nil {
+			t.Fatalf("emit: %v", err)
+		}
+		close(out)
+		for c := range out {
+			switch ev := c.(type) {
+			case ir.Insert:
+				return true, ev.Schema
+			case ir.Update:
+				return true, ev.Schema
+			case ir.Delete:
+				return true, ev.Schema
+			case ir.Truncate:
+				return true, ev.Schema
+			}
+		}
+		return false, ""
+	}
+
+	const lsn = pglogrepl.LSN(0x16B7350)
+	cases := []struct {
+		name string
+		emit func(r *CDCReader, relID uint32, out chan<- ir.Change) error
+	}{
+		{"insert", func(r *CDCReader, relID uint32, out chan<- ir.Change) error {
+			return r.emitInsert(context.Background(), relations, relID, keyTuple, lsn, out)
+		}},
+		{"update", func(r *CDCReader, relID uint32, out chan<- ir.Change) error {
+			return r.emitUpdate(context.Background(), relations, relID, keyTuple, keyTuple, lsn, out)
+		}},
+		{"delete", func(r *CDCReader, relID uint32, out chan<- ir.Change) error {
+			return r.emitDelete(context.Background(), relations, relID, keyTuple, lsn, out)
+		}},
+		{"truncate", func(r *CDCReader, relID uint32, out chan<- ir.Change) error {
+			return r.emitTruncate(context.Background(), relations, []uint32{relID}, 0, lsn, out)
+		}},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			r := mkReader()
+			// In-scope (non-bound) schema: must be emitted, carrying its
+			// source schema so the applier can route it.
+			emitted, schema := drainOne(t, func(out chan<- ir.Change) error {
+				return c.emit(r, inScopeRelID, out)
+			})
+			if !emitted {
+				t.Errorf("%s: in-scope schema 'inventory' was dropped; multi-schema must emit it", c.name)
+			}
+			if schema != "inventory" {
+				t.Errorf("%s: emitted Change.Schema = %q; want 'inventory' (source schema for routing)", c.name, schema)
+			}
+			// Out-of-scope schema: must be dropped on every path.
+			emitted, _ = drainOne(t, func(out chan<- ir.Change) error {
+				return c.emit(r, outScopeRelID, out)
+			})
+			if emitted {
+				t.Errorf("%s: out-of-scope schema 'audit' reached the channel; it must be dropped", c.name)
+			}
+		})
+	}
+}
+
+// TestEmitDropSitesSingleSchemaBackCompat pins the unset-scope path: with
+// no predicate set, only the bound schema's changes are emitted and a
+// non-bound schema is dropped — byte-identical to the pre-ADR-0075
+// `rel.Schema != r.schema` drop.
+func TestEmitDropSitesSingleSchemaBackCompat(t *testing.T) {
+	r := &CDCReader{schema: "public", slotName: "sluice_slot"} // no SetCDCDatabaseScope → single-schema
+	relations := map[uint32]*relationCacheEntry{
+		1: {
+			Schema: "public", Name: "t", ReplicaIdentity: 'd',
+			Columns:         []relationColumn{{Name: "id", OID: pgtype.Int8OID, Type: ir.Integer{Width: 64}, KeyColumn: true}},
+			IdentityKeyCols: []string{"id"},
+		},
+		2: {
+			Schema: "other", Name: "t", ReplicaIdentity: 'd',
+			Columns:         []relationColumn{{Name: "id", OID: pgtype.Int8OID, Type: ir.Integer{Width: 64}, KeyColumn: true}},
+			IdentityKeyCols: []string{"id"},
+		},
+	}
+	tup := &pglogrepl.TupleData{ColumnNum: 1, Columns: []*pglogrepl.TupleDataColumn{{DataType: 't', Length: 1, Data: []byte("1")}}}
+
+	out := make(chan ir.Change, 4)
+	if err := r.emitInsert(context.Background(), relations, 1, tup, 0x10, out); err != nil {
+		t.Fatalf("emitInsert bound schema: %v", err)
+	}
+	if err := r.emitInsert(context.Background(), relations, 2, tup, 0x10, out); err != nil {
+		t.Fatalf("emitInsert other schema: %v", err)
+	}
+	close(out)
+	var schemas []string
+	for c := range out {
+		if ins, ok := c.(ir.Insert); ok {
+			schemas = append(schemas, ins.Schema)
+		}
+	}
+	if len(schemas) != 1 || schemas[0] != "public" {
+		t.Errorf("single-schema mode: emitted schemas = %v; want exactly [public] (non-bound 'other' dropped)", schemas)
+	}
+}
+
+// TestBuildSelectQualifyBySchema pins the ADR-0075 Phase 2b spanning-
+// snapshot read path: buildSelect schema-qualifies the FROM clause, and
+// the spanning reader feeds it the table's OWN Schema so one pinned
+// connection reads across N schemas. (The PG reader always schema-
+// qualifies — unlike MySQL's bare table — so the toggle only changes
+// WHICH schema qualifies the ref. ReadRows computes effSchema and passes
+// it here; this pins the underlying SQL shape.)
+func TestBuildSelectQualifyBySchema(t *testing.T) {
+	table := &ir.Table{
+		Schema:  "inventory",
+		Name:    "widgets",
+		Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}},
+	}
+	// Spanning mode feeds Table.Schema as the effective schema.
+	got := buildSelect(table.Schema, table)
+	want := `SELECT "id" FROM "inventory"."widgets"`
+	if got != want {
+		t.Errorf("spanning buildSelect:\n got  %q\n want %q", got, want)
+	}
+	// Single-schema mode feeds the reader's bound schema, ignoring
+	// Table.Schema — byte-identical back-compat.
+	got = buildSelect("public", table)
+	want = `SELECT "id" FROM "public"."widgets"`
+	if got != want {
+		t.Errorf("single-schema buildSelect:\n got  %q\n want %q", got, want)
+	}
+}
+
 func TestWithReplicationParam(t *testing.T) {
 	cases := []struct {
 		name string

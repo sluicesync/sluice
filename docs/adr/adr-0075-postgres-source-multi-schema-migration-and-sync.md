@@ -300,12 +300,58 @@ One divergence worth recording (mirrors ADR-0074's notes):
 
 ## Implementation notes — Phase 2b (CDC)
 
-Not yet built. PG does not yet implement `ir.CDCDatabaseScoper` /
-`ir.MultiDatabaseSnapshotOpener` / `ir.ServerCDCReaderOpener`, so a multi-schema
-`sync start` against a PG source refuses loudly at the streamer's capability
-check; the `--*-schema` flags are wired onto `sync start` for surface symmetry
-with a Phase-2b caveat in the help text. The CDC half is the easy one (a PG
-logical slot is database-wide — flip the three `rel.Schema != r.schema`
-drop-sites in `cdc_reader.go` to a `CDCDatabaseScoper` predicate and route via the
-already-implemented PG `MultiDatabaseRouter`; one slot, one LSN; the slot's
-exported snapshot is the consistent handoff). Tracked as the next chunk.
+Phase 2b (multi-schema `sync start`) landed reusing the ADR-0074 orchestrator
+(`streamer_multidb.go`) **entirely unchanged** — the engine-neutral cold-start /
+warm-resume / route-per-change machinery MySQL already drives now drives PG once
+PG implements the interfaces. New PG engine surface only:
+
+- **`ir.CDCDatabaseScoper`** on the PG `CDCReader`. The load-bearing insight held:
+  a PG logical slot is **database-wide**, so the one stream already carries every
+  schema's changes (each tagged `rel.Schema`). The drop-site flip was **four**
+  sites, not three — the ADR text said "three" but the truncate path is a fourth
+  emit-side drop: `emitInsert` / `emitUpdate` / `emitDelete` / `emitTruncate` all
+  had `rel.Schema != r.schema`, replaced by a single `schemaInScope(rel.Schema)`
+  predicate (the symmetric analog of MySQL's `databaseInScope`). A nil scope
+  reduces EXACTLY to `rel.Schema == r.schema` — byte-identical single-schema
+  back-compat. The **separate** ADR-0049 schema-history gate in
+  `maybeSnapshotSchema` (also `rel.Schema != r.schema`) was deliberately **left
+  untouched** — it gates which relations get schema-history version writes, not
+  which changes get applied, and is orthogonal to basic multi-schema CDC apply.
+- **`ir.MultiDatabaseSnapshotOpener`** — `OpenMultiDatabaseSnapshotStream`. The PG
+  slot makes this the easy case: `CREATE_REPLICATION_SLOT … EXPORT_SNAPSHOT`
+  returns one exported snapshot at one consistent LSN that already spans every
+  schema in the database (no MySQL-style `FLUSH TABLES WITH READ LOCK` dance — the
+  slot's snapshot already IS the boundary). Implemented as the existing slot-based
+  `OpenSnapshotStreamWithSlot` body refactored into a shared `openSnapshotStreamShared`
+  with two spanning-mode toggles: (1) the publication is forced **FOR ALL TABLES**
+  via a new `ensureAllTablesPublication` (the slot is DB-wide; the reader-side
+  `inScope` filter is the selection boundary), and (2) the returned `RowReader` sets
+  a new `qualifyBySchema` flag so its one pinned exported-snapshot connection reads
+  `schema."table"` across N schemas (the PG reader already schema-qualifies — the
+  flag only changes *which* schema qualifies; only `ReadRows`/`buildSelect` needed
+  it, since the snapshot reader's `CountRows` short-circuits on `closer==nil`).
+- **`ir.ServerCDCReaderOpener`** — `OpenServerCDCReader` is simply `OpenCDCReader`
+  (a PG slot is already database-wide, so the warm-resume bare reader is the
+  ordinary reader scoped via `SetCDCDatabaseScope` rather than its DSN-bound
+  schema). One slot, one persisted LSN, no per-schema position bookkeeping.
+
+The write-side `ir.MultiDatabaseRouter` (`change_applier.go`) was already
+implemented (ADR-0074 Phase 1b, same surface — PG→PG schemas / PG→MySQL databases).
+The `--include-schema` / `--exclude-schema` / `--all-schemas` flags' `sync start`
+help text dropped the Phase-2b "refused loudly" caveat now that it ships.
+
+Class-pinned: the four emit drop-sites (insert/update/delete/truncate each
+emit an in-scope **non-bound** schema and drop an out-of-scope one), the unset-scope
+single-schema back-compat drop, `buildSelect` qualify-by-schema, and end to end —
+PG→PG and PG→MySQL cold-start + steady-state (insert/update/delete in both schemas,
+no cross-schema bleed) + stop→restart warm-resume from the one persisted LSN
+(zero loss/dup, exact source==target parity), single-schema back-compat, and the
+scope pin (an out-of-scope schema's writes never reach the target — neither copied
+nor routed).
+
+No ADR divergence beyond the "three → four drop-sites" count correction above and
+the (additive) `ensureAllTablesPublication` / `RowReader.qualifyBySchema` /
+`openSnapshotStreamShared` helpers, all named + tested + commented per the
+warts-get-a-name tenet. **Concurrency chunk:** the CDC reader's per-event path +
+warm-resume FSM are touched, so the `-race` integration gate runs before any tag
+(CLAUDE.md).

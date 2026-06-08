@@ -33,6 +33,18 @@ type RowReader struct {
 	q      querier
 	schema string
 
+	// qualifyBySchema makes ReadRows qualify the table reference by the
+	// table's OWN [ir.Table.Schema] (the source schema) rather than the
+	// reader's bound r.schema (ADR-0075 Phase 2b multi-schema spanning
+	// snapshot). It is set ONLY on the spanning snapshot RowReader, whose
+	// single pinned connection reads across N schemas from the one
+	// exported-snapshot transaction. In every single-schema path this
+	// stays false and the emitted SQL is BYTE-IDENTICAL to the pre-ADR-0075
+	// shape — r.schema."table" qualified, exactly as today. (The PG reader
+	// already schema-qualifies its SELECT, unlike MySQL's bare table; here
+	// the only change is WHICH schema qualifies it.)
+	qualifyBySchema bool
+
 	// closer owns the underlying connection resources for this reader.
 	// In simple mode it's the *sql.DB; in snapshot mode it's nil and
 	// the SnapshotStream owns the lifecycle. Close is a no-op when nil.
@@ -118,7 +130,17 @@ func (r *RowReader) ReadRows(ctx context.Context, table *ir.Table) (<-chan ir.Ro
 	r.err = nil
 	r.mu.Unlock()
 
-	query := buildSelect(r.schema, table)
+	// In the multi-schema spanning snapshot (ADR-0075 Phase 2b) the one
+	// pinned connection reads across N schemas, so qualify by the table's
+	// own Schema rather than the reader's single bound schema. Defensive
+	// fall-back to r.schema when Table.Schema is empty (a single-schema
+	// table threaded through the spanning reader). Single-schema mode keeps
+	// qualifyBySchema false and reads byte-identically from r.schema.
+	effSchema := r.schema
+	if r.qualifyBySchema && table.Schema != "" {
+		effSchema = table.Schema
+	}
+	query := buildSelect(effSchema, table)
 	// rowserrcheck and sqlclosecheck can't follow rows into the
 	// goroutine; both rows.Err() and rows.Close() are handled inside
 	// stream() (Close via defer, Err checked once iteration ends).

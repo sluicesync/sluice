@@ -925,6 +925,11 @@ func (a *ChangeApplier) SetMultiDatabaseRouting(enabled bool) {
 	a.multiDBRouting = enabled
 }
 
+// Compile-time assertion that the PG applier satisfies the multi-namespace
+// per-change routing surface (ADR-0074 Phase 1b / ADR-0075 Phase 2b — same
+// write-side surface, PG → PG schemas and PG → MySQL databases).
+var _ ir.MultiDatabaseRouter = (*ChangeApplier)(nil)
+
 // SetSourceDSNFingerprint implements [ir.SourceFingerprintRecorder].
 // Records the source DSN fingerprint the streamer computed at startup
 // (ADR-0031) so subsequent position-writes populate the

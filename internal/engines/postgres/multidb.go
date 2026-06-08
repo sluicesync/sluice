@@ -186,9 +186,36 @@ func (Engine) EnsureDatabase(ctx context.Context, dsn, schema string) error {
 	return nil
 }
 
-// compile-time assertions that the engine satisfies the Phase-2a
-// fan-out interfaces (ADR-0075).
+// OpenServerCDCReader implements [ir.ServerCDCReaderOpener] (ADR-0075
+// Phase 2b): it opens a database-wide CDC reader for a multi-schema
+// `sync start` WARM-RESUME. A multi-schema cold-start opens its CDC reader
+// as the spanning snapshot's Changes (paired with the exported snapshot);
+// a warm-resume has a persisted database-wide LSN and must NOT re-cold-
+// start — it opens a bare reader, scopes it to the selected schema set via
+// [CDCReader.SetCDCDatabaseScope], and resumes [CDCReader.StreamChanges]
+// from the one persisted position.
+//
+// A PG logical slot is ALREADY database-wide, so this is simply
+// [Engine.OpenCDCReader] — the same reader the single-schema path uses —
+// with the schema selection supplied separately by the orchestrator's
+// SetCDCDatabaseScope call rather than the reader's bound schema. (The
+// reader keeps its DSN-bound r.schema for the unscoped/back-compat path
+// and for the untouched ADR-0049 schema-history gate; the wider event
+// allow-set comes entirely from the scope predicate.) dsn names the
+// containing database; "server" in the interface name is the engine-
+// neutral term — for PG the slot spans that one database's schemas.
+func (e Engine) OpenServerCDCReader(ctx context.Context, dsn string) (ir.CDCReader, error) {
+	return e.OpenCDCReaderWithSlot(ctx, dsn, defaultSlot)
+}
+
+// compile-time assertions that the engine satisfies the ADR-0075 fan-out
+// interfaces. Phase 2a: DatabaseLister + DatabaseDSNDeriver. Phase 2b:
+// MultiDatabaseSnapshotOpener + ServerCDCReaderOpener (the CDC reader's
+// CDCDatabaseScoper and the applier's MultiDatabaseRouter are asserted
+// near their own implementations).
 var (
-	_ ir.DatabaseLister     = Engine{}
-	_ ir.DatabaseDSNDeriver = Engine{}
+	_ ir.DatabaseLister              = Engine{}
+	_ ir.DatabaseDSNDeriver          = Engine{}
+	_ ir.MultiDatabaseSnapshotOpener = Engine{}
+	_ ir.ServerCDCReaderOpener       = Engine{}
 )
