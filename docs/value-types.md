@@ -80,7 +80,7 @@ The MySQL reader therefore reads `Date`/`DateTime`/`Timestamp` columns as their 
 
 - `error` (default) — refuse loudly, naming the column. The IR never carries a guessed value.
 - `null` — emit SQL `NULL` (refused loudly for a `NOT NULL` column).
-- `epoch` — emit `1970-01-01` (`1970-01-01 00:00:00 UTC`).
+- `epoch` — emit `1970-01-01` (`1970-01-01 00:00:01 UTC` for date+time types). The one-second offset past midnight is deliberate: MySQL's `TIMESTAMP` floor is `1970-01-01 00:00:01` UTC, so a midnight placeholder is unrepresentable on a MySQL `TIMESTAMP` target and a relaxed-`sql_mode` write would silently coerce it back to the `0000-00-00` zero sentinel. A single sentinel at the floor is representable by every temporal target (and the offset is meaningless on a synthetic placeholder for an invalid date), so the resolution stays target-agnostic in the source reader.
 
 A genuinely out-of-range but **non-zero** date (month 13, Feb 30) is not a zero date; it stays a hard decode error regardless of `--zero-date`, so the flag can never silently rescue malformed data. See [migrating-legacy-mysql.md](operator/migrating-legacy-mysql.md) for the operator-facing flow and its interaction with the write-side `--mysql-sql-mode`.
 

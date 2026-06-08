@@ -375,10 +375,23 @@ func SetZeroDateMode(s string) error {
 	return nil
 }
 
-// zeroDateEpochValue is the substitute for --zero-date=epoch: the Unix
-// epoch in UTC. Writers render it per the target column type (date-only
-// for DATE, with time for DATETIME/TIMESTAMP).
-var zeroDateEpochValue = time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)
+// zeroDateEpochValue is the synthetic substitute for --zero-date=epoch:
+// 1970-01-01 at 00:00:01 UTC. It is one second past the Unix epoch on
+// purpose — MySQL's TIMESTAMP range floor is '1970-01-01 00:00:01' UTC,
+// so a plain midnight epoch is one second BELOW it and unrepresentable:
+// a MySQL TIMESTAMP target under a relaxed sql_mode (which reading a
+// legacy zero-date source requires) would silently coerce midnight back
+// to the '0000-00-00' zero sentinel — the very value epoch is meant to
+// replace (Bug 133). 00:00:01 is representable by every temporal target
+// (MySQL TIMESTAMP floor, MySQL DATETIME, and PG's effectively-unbounded
+// timestamp/date), so a single sentinel is correct everywhere. The
+// resolution stays target-agnostic (this is the source reader; per the
+// IR-first separation it has no business knowing the target type), and
+// the one-second offset is meaningless on what is by definition a
+// placeholder for an invalid date, not real data. Writers render it per
+// the target column type (date-only for DATE; with time for
+// DATETIME/TIMESTAMP).
+var zeroDateEpochValue = time.Date(1970, 1, 1, 0, 0, 1, 0, time.UTC)
 
 // zeroDateValueError marks a MySQL zero/partial date surfaced by
 // decodeTime. Read paths catch it with errors.As and resolve it via

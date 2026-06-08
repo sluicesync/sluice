@@ -165,14 +165,15 @@ func TestZeroDate_ReadPath(t *testing.T) {
 		}
 	})
 
-	// (3b) epoch policy: zero/partial dates become 1970-01-01.
+	// (3b) epoch policy: zero/partial dates become 1970-01-01 00:00:01
+	// (one second past midnight — MySQL's TIMESTAMP floor; see Bug 133).
 	t.Run("epoch_policy_substitutes_epoch", func(t *testing.T) {
 		withZeroDatePolicy(t, zeroDateAsEpoch)
 		rows, err := readZeroDateRows(t, db)
 		if err != nil {
 			t.Fatalf("ReadRows Err = %v; want nil under epoch policy", err)
 		}
-		epoch := time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)
+		epoch := time.Date(1970, 1, 1, 0, 0, 1, 0, time.UTC)
 		// Row 2 is all-zero across all three temporal columns.
 		for _, col := range []string{"d", "dt", "ts"} {
 			got, ok := rows[2][col].(time.Time)
@@ -313,7 +314,7 @@ func TestZeroDate_BatchedReadPath(t *testing.T) {
 		if len(rows) != 4 {
 			t.Fatalf("read %d rows; want 4", len(rows))
 		}
-		epoch := time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)
+		epoch := time.Date(1970, 1, 1, 0, 0, 1, 0, time.UTC) // MySQL TIMESTAMP floor; see Bug 133
 		for _, col := range []string{"d", "dt", "ts"} {
 			got, ok := rows[2][col].(time.Time)
 			if !ok {
@@ -464,6 +465,91 @@ func TestZeroDate_TemporalPKPagination(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestZeroDate_EpochRepresentableOnMySQLTimestamp pins Bug 133: the
+// --zero-date=epoch sentinel must be storable in a MySQL TIMESTAMP target
+// column even under a relaxed sql_mode. Reading a legacy zero-date source
+// requires --mysql-sql-mode=” (to get past strict-mode read rejection),
+// and that also relaxes the applier connection — so an out-of-range
+// TIMESTAMP write is silently COERCED to the 0000-00-00 zero sentinel
+// instead of raising ERROR 1292. The Unix-epoch midnight (1970-01-01
+// 00:00:00 UTC) is exactly one second below MySQL's TIMESTAMP floor
+// (1970-01-01 00:00:01 UTC), so it coerces to zero — re-introducing the
+// very value epoch is meant to replace. zeroDateEpochValue is 00:00:01
+// precisely to sit at the floor and round-trip.
+func TestZeroDate_EpochRepresentableOnMySQLTimestamp(t *testing.T) {
+	const dbName = "sluice_zerodate_epoch_ts"
+	host, port, user, password := ensureSharedMySQL(t)
+	resetSharedDB(t, dbName)
+	// loc=UTC so the driver formats bound time.Time values as UTC wall-clock.
+	dsn := sharedDSN(host, port, user, password, dbName) + "&parseTime=true&loc=UTC"
+
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	ctx := context.Background()
+
+	if _, err := db.ExecContext(ctx, `
+		CREATE TABLE ts_target (
+			id INT PRIMARY KEY,
+			ts TIMESTAMP NULL
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+
+	// A dedicated connection mirroring the applier under --mysql-sql-mode='':
+	// relaxed sql_mode (so out-of-range coerces silently rather than erroring)
+	// + time_zone='+00:00' (sluice's convention, so a UTC instant stores as
+	// its UTC wall-clock and the TIMESTAMP floor check is in UTC).
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("conn: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	for _, stmt := range []string{"SET SESSION sql_mode=''", "SET SESSION time_zone='+00:00'"} {
+		if _, err := conn.ExecContext(ctx, stmt); err != nil {
+			t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+
+	// (1) GROUND TRUTH: midnight epoch is below the floor and silently
+	// coerces to the zero sentinel under relaxed sql_mode — the Bug 133
+	// mechanism, and why the sentinel can't be 00:00:00.
+	t.Run("midnight_epoch_coerces_to_zero_floor_evidence", func(t *testing.T) {
+		midnight := time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)
+		if _, err := conn.ExecContext(ctx, "INSERT INTO ts_target (id, ts) VALUES (1, ?)", midnight); err != nil {
+			t.Fatalf("insert midnight: %v", err)
+		}
+		var got string
+		if err := conn.QueryRowContext(ctx, "SELECT CAST(ts AS CHAR) FROM ts_target WHERE id = 1").Scan(&got); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		if got != "0000-00-00 00:00:00" {
+			t.Fatalf("midnight epoch stored as %q; expected the silent zero coercion "+
+				"(MySQL TIMESTAMP floor changed — revisit the Bug 133 fix)", got)
+		}
+	})
+
+	// (2) The actual epoch sentinel sits at the floor and round-trips as a
+	// real value, not the zero sentinel.
+	t.Run("sentinel_round_trips_nonzero", func(t *testing.T) {
+		if _, err := conn.ExecContext(ctx, "INSERT INTO ts_target (id, ts) VALUES (2, ?)", zeroDateEpochValue); err != nil {
+			t.Fatalf("insert sentinel: %v", err)
+		}
+		var got string
+		if err := conn.QueryRowContext(ctx, "SELECT CAST(ts AS CHAR) FROM ts_target WHERE id = 2").Scan(&got); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		if got == "0000-00-00 00:00:00" {
+			t.Fatalf("epoch sentinel coerced to the zero sentinel (Bug 133 regression): %q", got)
+		}
+		if got != "1970-01-01 00:00:01" {
+			t.Errorf("epoch sentinel stored as %q; want 1970-01-01 00:00:01", got)
+		}
+	})
 }
 
 // TestZeroDate_NullPolicyRefusesNotNull pins the precise loud refusal:

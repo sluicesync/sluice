@@ -39,7 +39,7 @@ avoid that, then applies your `--zero-date` policy:
 |---|---|
 | `error` (default) | Refuse loudly, naming the column and value. Nothing silently wrong leaves the source. |
 | `null` | Carry the value as SQL `NULL`. Refused loudly if the column is `NOT NULL` (use `epoch`, or repair the data). |
-| `epoch` | Substitute `1970-01-01` (`1970-01-01 00:00:00` for DATETIME/TIMESTAMP). |
+| `epoch` | Substitute `1970-01-01` (`1970-01-01 00:00:01` for DATETIME/TIMESTAMP). The placeholder is one second past midnight on purpose: MySQL's `TIMESTAMP` range starts at `1970-01-01 00:00:01` UTC, so a plain midnight value is unrepresentable there and a relaxed-`sql_mode` target would silently store it back as `0000-00-00`. One second is meaningless on a synthetic placeholder for an invalid date. |
 
 This applies to **every** direction the value is *read* in — including
 MySQL→MySQL and the CDC tail — so it also protects the same-engine case

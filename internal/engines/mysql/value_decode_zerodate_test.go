@@ -187,7 +187,7 @@ func TestApplyZeroDatePolicy(t *testing.T) {
 			t.Fatal("err = nil; want a NOT NULL refusal")
 		}
 	})
-	t.Run("epoch substitutes 1970-01-01", func(t *testing.T) {
+	t.Run("epoch substitutes 1970-01-01 00:00:01", func(t *testing.T) {
 		withZeroDatePolicy(t, zeroDateAsEpoch)
 		v, err := applyZeroDatePolicy(zd, notNull)
 		if err != nil {
@@ -197,8 +197,11 @@ func TestApplyZeroDatePolicy(t *testing.T) {
 		if !ok {
 			t.Fatalf("v = %T; want time.Time", v)
 		}
-		if !gt.Equal(time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)) {
-			t.Errorf("v = %v; want 1970-01-01 UTC", gt)
+		// 00:00:01, not midnight: MySQL's TIMESTAMP floor is
+		// 1970-01-01 00:00:01 UTC, so midnight is unrepresentable there
+		// and would coerce back to the zero sentinel (Bug 133).
+		if !gt.Equal(time.Date(1970, 1, 1, 0, 0, 1, 0, time.UTC)) {
+			t.Errorf("v = %v; want 1970-01-01 00:00:01 UTC", gt)
 		}
 	})
 }
