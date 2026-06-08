@@ -28,8 +28,8 @@ package translate
 // (advisory) by default, not a hard refusal — the universal ORM schema
 // must still migrate — but it must be loud and visible. Operators who
 // genuinely need the full 2^64 range override per-column with
-// `--type-override TABLE.COL=numeric` (a non-IDENTITY column maps to
-// numeric(20,0)).
+// `--type-override TABLE.COL=decimal:precision=20,scale=0` (PG
+// numeric(20,0) holds 2^64-1; or =text to carry it as text).
 
 import (
 	"errors"
@@ -161,8 +161,9 @@ func renderUnsignedBigintNotice(notices []UnsignedBigintNotice, contextID string
 		}
 	}
 	b.WriteString("\nIf a column genuinely stores values above 2^63-1, override " +
-		"it per-column with `--type-override TABLE.COL=numeric` " +
-		"(numeric(20,0) preserves the full unsigned 64-bit range; note a " +
-		"numeric column cannot also be an IDENTITY/AUTO_INCREMENT key).")
+		"it per-column with `--type-override TABLE.COL=decimal:precision=20,scale=0` " +
+		"— PG numeric(20,0) preserves the full unsigned 64-bit range (2^64-1 is 20 " +
+		"digits). (`--type-override TABLE.COL=text` carries it as text instead. Note a " +
+		"numeric/text column cannot also be an IDENTITY/AUTO_INCREMENT key.)")
 	return b.String()
 }

@@ -50,6 +50,11 @@ func TestDecodeValue(t *testing.T) {
 		// ---- Decimal ----
 		{"decimal as string", []byte("3.14159"), ir.Decimal{Precision: 6, Scale: 5}, "3.14159"},
 		{"decimal already string", "2.71828", ir.Decimal{Precision: 6, Scale: 5}, "2.71828"},
+		// BIGINT UNSIGNED overridden to a wide DECIMAL to keep the full
+		// unsigned-64 range: go-sql-driver hands back uint64/int64, which
+		// must render as exact decimal text (the uint64-no-path finding).
+		{"decimal from uint64 max", uint64(18446744073709551615), ir.Decimal{Precision: 20, Scale: 0}, "18446744073709551615"},
+		{"decimal from int64", int64(9223372036854775807), ir.Decimal{Precision: 20, Scale: 0}, "9223372036854775807"},
 
 		// ---- Float ----
 		{"double passthrough", float64(2.71828), ir.Float{Precision: ir.FloatDouble}, float64(2.71828)},
@@ -59,6 +64,10 @@ func TestDecodeValue(t *testing.T) {
 		{"varchar from bytes", []byte("hello"), ir.Varchar{Length: 32}, "hello"},
 		{"text from bytes", []byte("a long string"), ir.Text{Size: ir.TextRegular}, "a long string"},
 		{"char from string", "world", ir.Char{Length: 5}, "world"},
+		// BIGINT UNSIGNED carried as TEXT (--type-override COL=text): the
+		// driver's uint64/int64 must render as exact decimal text.
+		{"text from uint64 max", uint64(18446744073709551615), ir.Text{Size: ir.TextRegular}, "18446744073709551615"},
+		{"varchar from int64", int64(42), ir.Varchar{Length: 32}, "42"},
 
 		// ---- Bytes ----
 		{"blob from bytes", []byte{0xde, 0xad, 0xbe, 0xef}, ir.Blob{Size: ir.BlobRegular}, []byte{0xde, 0xad, 0xbe, 0xef}},

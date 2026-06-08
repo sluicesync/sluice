@@ -289,7 +289,7 @@ func emitColumnType(t ir.Type, opts emitOpts) (string, error) {
 // preview` and `migrate` preflight (see translate.UnsignedBigintNotices
 // / Refuses... ) so it is never silent. Operators needing the full
 // 2^64 range override per-column with `--type-override
-// TABLE.COL=numeric` (numeric(20,0) for a non-IDENTITY column).
+// TABLE.COL=decimal:precision=20,scale=0` (PG numeric(20,0), non-IDENTITY).
 func emitIntegerType(i ir.Integer) string {
 	width := effectiveWidth(i)
 	typeName := postgresIntName(width)

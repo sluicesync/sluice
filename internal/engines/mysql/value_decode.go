@@ -6,6 +6,7 @@ package mysql
 import (
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -154,12 +155,23 @@ func decodeInteger(raw any) (any, error) {
 // decodeDecimal preserves the textual precision of a DECIMAL column
 // by returning it as a string. Avoids the precision loss that float
 // conversion would introduce.
+//
+// The integer cases carry a `BIGINT UNSIGNED` column that an operator
+// overrode to a wide DECIMAL to preserve the full unsigned-64 range
+// (`--type-override TABLE.COL=decimal:precision=20,scale=0`): go-sql-driver
+// returns uint64 for values above 2^63-1 (and int64 otherwise), and the
+// default `bigint` mapping can't hold them. Rendering the integer as its
+// exact decimal text keeps the value lossless into PG `numeric(20,0)`.
 func decodeDecimal(raw any) (any, error) {
 	switch v := raw.(type) {
 	case []byte:
 		return string(v), nil
 	case string:
 		return v, nil
+	case uint64:
+		return strconv.FormatUint(v, 10), nil
+	case int64:
+		return strconv.FormatInt(v, 10), nil
 	}
 	return nil, fmt.Errorf("mysql: cannot decode %T as Decimal", raw)
 }
@@ -178,12 +190,21 @@ func decodeFloat(raw any) (any, error) {
 }
 
 // decodeString converts a string-like driver value into a Go string.
+//
+// The integer cases let a `BIGINT UNSIGNED` column be carried as TEXT when
+// an operator overrides it (`--type-override TABLE.COL=text`): go-sql-driver
+// returns uint64/int64 for an integer column, which the bare []byte/string
+// branches can't consume. Rendering the exact decimal text is lossless.
 func decodeString(raw any) (any, error) {
 	switch v := raw.(type) {
 	case []byte:
 		return string(v), nil
 	case string:
 		return v, nil
+	case uint64:
+		return strconv.FormatUint(v, 10), nil
+	case int64:
+		return strconv.FormatInt(v, 10), nil
 	}
 	return nil, fmt.Errorf("mysql: cannot decode %T as string", raw)
 }
