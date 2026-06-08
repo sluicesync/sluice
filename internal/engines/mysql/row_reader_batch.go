@@ -91,10 +91,22 @@ func buildBatchedSelect(table *ir.Table, limit int, hasCursor bool) string {
 		colsList[i] = selectColumnExpr(c)
 	}
 
+	// PK refs in WHERE/ORDER BY are TABLE-QUALIFIED on purpose. A
+	// temporal PK column is projected as `CAST(`c` AS CHAR) AS `c`` by
+	// selectColumnExpr (the Vector A zero-date fix), which introduces a
+	// SELECT-list alias with the same bare name. An unqualified
+	// `ORDER BY `c`` binds to that CHAR alias — a STRING sort — while
+	// the cursor predicate `(`c`) > (?)` (WHERE can't see aliases)
+	// compares the DATE-typed column against a time.Time cursor value.
+	// Lexical ISO order happens to match date order, so pagination was
+	// correct-but-fragile; the alias sort also defeated the PRIMARY
+	// index (forced filesort). Qualifying to `tbl`.`c`` binds both
+	// clauses to the real column: date-typed throughout, index-ordered.
+	tbl := quoteIdent(table.Name)
 	pkCols := table.PrimaryKey.Columns
 	pkList := make([]string, len(pkCols))
 	for i, c := range pkCols {
-		pkList[i] = quoteIdent(c.Column)
+		pkList[i] = tbl + "." + quoteIdent(c.Column)
 	}
 	pkTuple := strings.Join(pkList, ", ")
 

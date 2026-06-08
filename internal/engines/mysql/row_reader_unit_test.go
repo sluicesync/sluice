@@ -84,7 +84,7 @@ func TestBuildSelect_TemporalCAST(t *testing.T) {
 	}
 
 	gotBatch := buildBatchedSelect(table, 1000, false)
-	if want := "SELECT " + wantList + " FROM `events` ORDER BY `id` LIMIT 1000"; gotBatch != want {
+	if want := "SELECT " + wantList + " FROM `events` ORDER BY `events`.`id` LIMIT 1000"; gotBatch != want {
 		t.Errorf("buildBatchedSelect:\n got  %q\n want %q", gotBatch, want)
 	}
 }
