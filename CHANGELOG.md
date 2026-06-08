@@ -6,6 +6,21 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.99.22] - 2026-06-07
+
+### Fixed
+
+- **The `TINYINT(1)` out-of-range WARN now also fires on the CDC read paths.**
+  v0.99.21 made a `TINYINT(1)` value outside `{0,1}` loud on the bulk-copy /
+  snapshot path (it had been silently collapsed to `true`). This extends the
+  same one-time-per-column WARN to the steady-state CDC tail — both the binlog
+  reader and the PlanetScale/Vitess VStream reader (and its cold-start COPY) —
+  so a non-`{0,1}` value written live during continuous sync is flagged too,
+  not just during `migrate` / `sync` cold-start. Detection-only and
+  side-effect-free: the decoded value is unchanged; the `--type-override
+  <table>.<col>=smallint` (or `=int`) remedy already preserved the integer on
+  every path. Closes the Vector D detection gap.
+
 ## [0.99.21] - 2026-06-07
 
 ### Fixed
