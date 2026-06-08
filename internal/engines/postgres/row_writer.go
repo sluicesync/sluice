@@ -850,6 +850,23 @@ func prepareValue(v any, t ir.Type) (any, error) {
 		return prepareValue(v, dom.BaseType)
 	}
 
+	// PostgreSQL text types (text/varchar/char) cannot store a NUL byte
+	// (0x00) — PG rejects it with SQLSTATE 22021, and over the COPY
+	// protocol that surfaces as an opaque stream error far from the
+	// offending row. A MySQL CHAR/VARCHAR/TEXT can hold embedded NULs, so
+	// a cross-engine MySQL → PG copy can hit this. Refuse loudly and early,
+	// pointing at the data-preserving remedy, rather than letting the
+	// driver error cryptically mid-stream. The caller wraps the column
+	// name; no value is silently altered (the loud-failure tenet — and
+	// stripping the NUL would be silent corruption). (Vector C.)
+	switch t.(type) {
+	case ir.Char, ir.Varchar, ir.Text:
+		if s, ok := v.(string); ok && strings.IndexByte(s, 0) >= 0 {
+			return nil, errors.New("value contains a NUL byte (0x00), which PostgreSQL text types cannot store; " +
+				"clean the source data, or map this column to bytea with --type-override (bytea holds arbitrary bytes incl. NUL)")
+		}
+	}
+
 	return v, nil
 }
 

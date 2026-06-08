@@ -6,6 +6,23 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.99.25] - 2026-06-08
+
+### Fixed
+
+- **A string with an embedded NUL byte (`0x00`) bound for a Postgres
+  `text`/`varchar`/`char` column is now refused loudly and early (Vector C).**
+  PostgreSQL text types cannot store a NUL byte, and over the COPY protocol PG
+  rejects it with SQLSTATE 22021 as an opaque stream error far from the
+  offending row. A MySQL `CHAR`/`VARCHAR`/`TEXT` *can* hold embedded NULs, so a
+  cross-engine MySQL → Postgres copy can hit this. sluice now detects the NUL at
+  the value layer and refuses with an actionable message naming the column and
+  the data-preserving remedy (`--type-override <col>=bytea`, since `bytea` holds
+  arbitrary bytes including NUL) instead of letting the driver fail cryptically
+  mid-stream. No value is silently altered — stripping the NUL would be silent
+  corruption. Pinned by `TestPrepareValueNULByteRefused` (text/varchar/char +
+  DOMAIN-over-text recursion; `bytea` and NUL-free text unaffected).
+
 ## [0.99.24] - 2026-06-07
 
 ### Added

@@ -130,6 +130,45 @@ func TestPrepareValuePassthrough(t *testing.T) {
 	}
 }
 
+// TestPrepareValueNULByteRefused pins the Vector C loud refusal: a string
+// carrying an embedded NUL (0x00) bound for a PG text type (text/varchar/
+// char) is refused with an actionable message, instead of letting pgx fail
+// opaquely mid-COPY (PG can't store NUL in text). A NUL-free string passes
+// through; the same bytes bound for bytea are fine (bytea holds NUL).
+func TestPrepareValueNULByteRefused(t *testing.T) {
+	withNUL := "ab\x00cd"
+	for _, tt := range []struct {
+		name string
+		typ  ir.Type
+	}{
+		{"text", ir.Text{Size: ir.TextLong}},
+		{"varchar", ir.Varchar{Length: 32}},
+		{"char", ir.Char{Length: 8}},
+	} {
+		t.Run(tt.name+" with NUL refuses", func(t *testing.T) {
+			_, err := prepareValue(withNUL, tt.typ)
+			if err == nil {
+				t.Fatalf("prepareValue(%q, %T) err = nil; want a NUL-byte refusal", withNUL, tt.typ)
+			}
+			if !strings.Contains(err.Error(), "NUL byte") || !strings.Contains(err.Error(), "bytea") {
+				t.Errorf("err = %q; want it to name the NUL byte + the bytea remedy", err)
+			}
+		})
+	}
+	// NUL-free text passes through unchanged.
+	if got, err := prepareValue("abcd", ir.Text{Size: ir.TextLong}); err != nil || got != "abcd" {
+		t.Errorf("NUL-free text: got (%#v, %v); want (\"abcd\", nil)", got, err)
+	}
+	// The same NUL-bearing bytes are fine for bytea (Blob) — NUL is legal there.
+	if _, err := prepareValue([]byte(withNUL), ir.Blob{Size: ir.BlobLong}); err != nil {
+		t.Errorf("bytea with NUL: unexpected error %v", err)
+	}
+	// A DOMAIN over a text base recurses into the guard.
+	if _, err := prepareValue(withNUL, ir.Domain{Name: "d", BaseType: ir.Text{Size: ir.TextLong}}); err == nil {
+		t.Error("DOMAIN over text with NUL: err = nil; want refusal via base-type recursion")
+	}
+}
+
 func ptr[T any](v T) *T { return &v }
 
 func dim(n int) pgtype.ArrayDimension {
