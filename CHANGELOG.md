@@ -6,6 +6,25 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.99.23] - 2026-06-07
+
+### Fixed
+
+- **`--zero-date` now works on a PlanetScale/Vitess source.** The VStream CDC
+  decoder parsed temporal cells with a strict layout that rejected a zero or
+  partial date (`'0000-00-00'`, `'YYYY-00-DD'`, `'YYYY-MM-00'`), then fell back
+  to handing the raw bytes downstream — where a Postgres target failed with a
+  confusing `expected time.Time, got []byte` instead of applying the operator's
+  `--zero-date` policy. The vanilla MySQL binlog / bulk-copy paths have honored
+  `--zero-date` since the original Vector A fix; this brings the VStream path to
+  parity. A zero/partial date now resolves per `--zero-date`: `error` (default)
+  refuses the stream loudly naming the column, `null` carries SQL `NULL`
+  (refused on a `NOT NULL` column), `epoch` substitutes `1970-01-01 00:00:01`.
+  A genuinely malformed but non-zero date (month 13, Feb 30) still fails loudly
+  as before. Covers the live CDC reader and the cold-start COPY + catch-up
+  paths. Pinned by decoder unit tests across the temporal family × every zero
+  shape × each policy (including the `NOT NULL` refusal).
+
 ## [0.99.22] - 2026-06-07
 
 ### Fixed
