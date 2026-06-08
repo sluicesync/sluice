@@ -6,6 +6,8 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.99.19] - 2026-06-07
+
 ### Fixed
 
 - **CRITICAL: MySQL zero and partial dates were silently corrupted into a
@@ -39,6 +41,20 @@ project follows [Semantic Versioning](https://semver.org/).
   Pinned by unit tests across the full temporal family × every zero shape ×
   each policy, plus an integration test that ground-truths the live-driver
   normalization against real MySQL 8.0.
+
+- **Temporal primary keys now paginate by the real date column on the chunked
+  copy path.** The zero-date fix above projects `DATE`/`DATETIME`/`TIMESTAMP`
+  columns as `CAST(... AS CHAR)`, which aliases a temporal column to its own
+  name. On the >100k-row keyset-paginated bulk copy, an unqualified
+  `ORDER BY` then sorted by that text alias while the cursor predicate
+  compared the real date column — consistent only by ISO date strings sorting
+  in calendar order, and it defeated the primary-key index (forced a
+  filesort). The cursor and ordering clauses are now table-qualified so both
+  bind the real column: date-typed throughout and index-ordered. No
+  user-visible behavior change for valid data; caught by the value-fidelity
+  review of the zero-date fix. Pinned by a SQL-shape unit test plus
+  `DATE`/`DATETIME(6)` primary-key pagination integration tests across page
+  boundaries.
 
 ## [0.99.18] - 2026-06-07
 
