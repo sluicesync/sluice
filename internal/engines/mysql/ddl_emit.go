@@ -4,6 +4,7 @@
 package mysql
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -87,6 +88,13 @@ func emitColumnType(t ir.Type) (string, error) {
 		return "DATE", nil
 	case ir.Time:
 		return emitWithPrecision("TIME", v.Precision), nil
+	case ir.Interval:
+		// MySQL has no INTERVAL type. The `interval` override targets PG
+		// only; refuse loudly rather than silently degrade a duration to
+		// MySQL TIME (which would re-lose the >24h / negative range the
+		// override exists to preserve).
+		return "", errors.New("mysql: no INTERVAL type — the `interval` type-override targets a Postgres target only " +
+			"(a MySQL TIME can't hold the full duration range); map this column to a MySQL-representable type instead")
 	case ir.DateTime:
 		return emitWithPrecision("DATETIME", v.Precision), nil
 	case ir.Timestamp:

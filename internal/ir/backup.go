@@ -779,6 +779,11 @@ func MarshalType(t Type) ([]byte, error) {
 		env.BlobSize = uint8(v.Size)
 	case Date:
 		env.Kind = "Date"
+	case Interval:
+		// PG duration type (the MySQL TIME → PG interval override); no
+		// fields. Round-trips so a schema-history snapshot / backup of an
+		// interval-overridden column survives.
+		env.Kind = "Interval"
 	case Time:
 		env.Kind = "Time"
 		env.Precision = v.Precision
@@ -907,6 +912,8 @@ func UnmarshalType(b []byte) (Type, error) {
 		return Blob{Size: BlobSize(env.BlobSize)}, nil
 	case "Date":
 		return Date{}, nil
+	case "Interval":
+		return Interval{}, nil
 	case "Time":
 		return Time{Precision: env.Precision, WithTimeZone: env.WithTimeZone}, nil
 	case "DateTime":

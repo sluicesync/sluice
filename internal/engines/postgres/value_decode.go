@@ -57,7 +57,9 @@ func decodeValue(raw any, t ir.Type) (any, error) {
 		return decodeBitString(raw)
 	case ir.Date, ir.DateTime, ir.Timestamp:
 		return decodeTime(raw)
-	case ir.Time:
+	case ir.Time, ir.Interval:
+		// ir.Time (time-of-day) and ir.Interval (duration) both surface
+		// from pgx stdlib as their textual form; carry the string.
 		return decodeTimeAsString(raw)
 	case ir.JSON:
 		return decodeBytes(raw)

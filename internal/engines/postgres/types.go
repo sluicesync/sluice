@@ -354,6 +354,16 @@ func translateType(c columnMeta) (ir.Type, error) {
 	// ---- Temporal ----
 	case "date":
 		return ir.Date{}, nil
+	case "interval":
+		// PG-native duration type. Reads as ir.Interval (a span), distinct
+		// from ir.Time (a time-of-day). Carrying it here makes interval a
+		// first-class PG type: PG→PG round-trips it, the MySQL TIME →
+		// `--type-override col=interval` migrate path round-trips through
+		// it, and — load-bearing — the CDC applier's target-catalog read
+		// (loadColumnTypes → translateType) resolves an interval target
+		// column instead of stopping the stream. A non-PG target has no
+		// interval and is refused (emitColumnType / unsupportablePGtoMySQL).
+		return ir.Interval{}, nil
 	case "time without time zone", "time":
 		return ir.Time{Precision: int(int64Ptr(c.DTPrec))}, nil
 	case "time with time zone":

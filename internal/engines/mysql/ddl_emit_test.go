@@ -135,6 +135,20 @@ func TestEmitColumnType_ExtensionTypeRefuses(t *testing.T) {
 	}
 }
 
+// TestEmitColumnType_IntervalRefuses pins that ir.Interval (the PG-only
+// duration override) is refused loudly by the MySQL writer — MySQL has no
+// INTERVAL type, and silently degrading it to TIME would re-lose the
+// >24h/negative range the override exists to preserve (Vector C).
+func TestEmitColumnType_IntervalRefuses(t *testing.T) {
+	_, err := emitColumnType(ir.Interval{})
+	if err == nil {
+		t.Fatal("expected error on ir.Interval in MySQL writer; got nil")
+	}
+	if !strings.Contains(err.Error(), "INTERVAL") {
+		t.Errorf("err = %v; want mention of INTERVAL", err)
+	}
+}
+
 // TestEmitColumnType_HstoreCrossEngine emits MySQL JSON for an
 // ir.ExtensionType{Extension: "hstore"} column. The cross-engine
 // translator (ADR-0032 § "Cross-engine policy") is wired into the

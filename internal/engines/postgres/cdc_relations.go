@@ -288,6 +288,11 @@ func oidToType(oid uint32, typmod int32) (ir.Type, error) {
 	// ---- Temporal ----
 	case pgtype.DateOID:
 		return ir.Date{}, nil
+	case pgtype.IntervalOID:
+		// PG duration type; reads as ir.Interval (a span), distinct from
+		// ir.Time (a time-of-day). Keeps PG → PG CDC of an interval
+		// column working symmetrically with the schema-read path.
+		return ir.Interval{}, nil
 	case pgtype.TimeOID, pgtype.TimetzOID:
 		return ir.Time{Precision: temporalTypmod(typmod)}, nil
 	case pgtype.TimestampOID:

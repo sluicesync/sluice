@@ -226,6 +226,15 @@ var targetTypeRegistry = map[string]ir.Type{
 	"smallint": ir.Integer{Width: 16},
 	"integer":  ir.Integer{Width: 32},
 	"int":      ir.Integer{Width: 32},
+	// `interval` carries a MySQL `TIME` column that stores a real
+	// DURATION (range -838:59:59…838:59:59) rather than a time-of-day:
+	// such values exceed PG `time`'s 00:00–24:00 range, so the default
+	// MySQL TIME → PG `time` mapping can't hold them. Overriding to
+	// `interval` maps the column to PG `interval`, which holds the full
+	// range; the value is carried as its textual form, which PG parses.
+	// PG-target only — a MySQL/non-PG target has no native interval and
+	// refuses loudly.
+	"interval": ir.Interval{},
 }
 
 // postgisAliasSubtypes maps the postgis_<subtype> aliases to their

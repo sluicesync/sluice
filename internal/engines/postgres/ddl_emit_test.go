@@ -177,6 +177,8 @@ func TestEmitColumnType(t *testing.T) {
 		{"datetime precision 3", ir.DateTime{Precision: 3}, "TIMESTAMP(3)"},
 		{"timestamp", ir.Timestamp{Precision: 0, WithTimeZone: false}, "TIMESTAMP"},
 		{"timestamptz", ir.Timestamp{Precision: 6, WithTimeZone: true}, "TIMESTAMP(6) WITH TIME ZONE"},
+		// interval: MySQL TIME duration → PG INTERVAL override (Vector C).
+		{"interval", ir.Interval{}, "INTERVAL"},
 
 		// ---- Structured ----
 		{"json", ir.JSON{Binary: false}, "JSON"},

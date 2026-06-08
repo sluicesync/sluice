@@ -339,6 +339,8 @@ func renderTypeForNote(t ir.Type, engine string) string {
 		return "date"
 	case ir.Time:
 		return renderWithPrecision("time", v.Precision)
+	case ir.Interval:
+		return "interval"
 	case ir.DateTime:
 		if engine == "postgres" {
 			return renderWithPrecision("timestamp", v.Precision)

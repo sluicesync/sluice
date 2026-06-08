@@ -417,7 +417,7 @@ func (w *RowWriter) WriteRows(ctx context.Context, table *ir.Table, rows <-chan 
 	// specifies. This is contained: it fires ONLY for tables that
 	// actually carry a verbatim column (the catalogued / core path is
 	// untouched and keeps using COPY).
-	if w.useCopy && !tableHasVerbatimColumn(table) {
+	if w.useCopy && !tableHasVerbatimColumn(table) && !tableHasIntervalColumn(table) {
 		return w.writeViaCopy(ctx, table, rows)
 	}
 	return w.writeViaBatch(ctx, table, rows)
@@ -583,6 +583,28 @@ func tableHasVerbatimColumn(table *ir.Table) bool {
 			continue
 		}
 		if _, ok := col.Type.(ir.VerbatimType); ok {
+			return true
+		}
+	}
+	return false
+}
+
+// tableHasIntervalColumn reports whether table carries an ir.Interval
+// column (the MySQL TIME → PG INTERVAL override, Vector C). Such columns
+// take the batched-INSERT path rather than binary COPY: the value is
+// carried as MySQL's textual duration ("838:59:59", "-12:30:00"), and
+// pgx's binary COPY interval codec can't encode a bare string, whereas a
+// parameterised INSERT sends it as text and PG's interval input parser
+// accepts it — the same text-I/O round-trip the verbatim path relies on.
+func tableHasIntervalColumn(table *ir.Table) bool {
+	if table == nil {
+		return false
+	}
+	for _, col := range table.Columns {
+		if col == nil {
+			continue
+		}
+		if _, ok := col.Type.(ir.Interval); ok {
 			return true
 		}
 	}

@@ -143,6 +143,8 @@ func TestApplyMappings_RegistryAliases(t *testing.T) {
 		{"smallint", ir.Integer{Width: 16}},
 		{"integer", ir.Integer{Width: 32}},
 		{"int", ir.Integer{Width: 32}},
+		// interval: MySQL TIME duration → PG INTERVAL (Vector C).
+		{"interval", ir.Interval{}},
 	}
 	for _, c := range cases {
 		c := c

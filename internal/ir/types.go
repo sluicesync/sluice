@@ -337,6 +337,25 @@ func (t Time) String() string {
 	return fmt.Sprintf("Time(%d)", t.Precision)
 }
 
+// Interval is a span of time (a duration), distinct from Time (a
+// time-of-day). It is an EXTENSION type: PostgreSQL has a native
+// `interval`, but MySQL has no equivalent — a MySQL `TIME` column is a
+// duration in the range -838:59:59…838:59:59, which exceeds PG `time`'s
+// 00:00–24:00 time-of-day range, so carrying such a column to PG needs
+// `interval`, not `time`. There is no default reader mapping to Interval
+// (MySQL `TIME` still reads as [Time] by default); it is reached only via
+// an explicit `--type-override col=interval`, for the MySQL `TIME`
+// duration → PG `interval` case. Values are carried as their textual
+// form (e.g. "838:59:59", "-12:00:00"), which PG's interval input
+// parser accepts. A MySQL/non-PG target has no native interval and is
+// refused loudly (emitColumnType / cross-engine supportability check).
+type Interval struct{}
+
+func (Interval) isType()    {}
+func (Interval) Tier() Tier { return TierExtension }
+
+func (Interval) String() string { return "Interval" }
+
 // DateTime is a calendar date plus time-of-day, without a timezone.
 type DateTime struct {
 	Precision int

@@ -252,6 +252,13 @@ func unsupportablePGtoMySQL(t ir.Type) string {
 			"same-engine PG / PG-restore only; no cross-engine MySQL form)",
 			v.Definition)
 	}
+	if _, ok := t.(ir.Interval); ok {
+		// PG `interval` (e.g. via `--type-override col=interval`) has no
+		// MySQL equivalent — a MySQL TIME can't hold the full duration
+		// range. Refuse early rather than emit-time, mirroring the other
+		// PG-native-with-no-MySQL-form refusals above.
+		return "a PG INTERVAL type (no MySQL equivalent — a MySQL TIME can't hold the full duration range)"
+	}
 	return ""
 }
 

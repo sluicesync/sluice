@@ -141,6 +141,11 @@ func emitColumnType(t ir.Type, opts emitOpts) (string, error) {
 			return base + " WITH TIME ZONE", nil
 		}
 		return base, nil
+	case ir.Interval:
+		// PG-native duration type (the `--type-override col=interval`
+		// target for a MySQL TIME duration). PG parses the carried
+		// textual value ("838:59:59", "-12:00:00").
+		return "INTERVAL", nil
 	case ir.DateTime:
 		return emitWithPrecision("TIMESTAMP", v.Precision), nil
 	case ir.Timestamp:

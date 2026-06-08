@@ -51,7 +51,9 @@ func decodeValue(raw any, t ir.Type) (any, error) {
 		return decodeBit(raw, v.Length)
 	case ir.Date, ir.DateTime, ir.Timestamp:
 		return decodeTime(raw)
-	case ir.Time:
+	case ir.Time, ir.Interval:
+		// MySQL TIME reads as its textual form; the `interval` override
+		// (ir.Interval, PG target) carries the same text — PG parses it.
 		return decodeString(raw)
 	case ir.JSON:
 		return decodeBytes(raw)

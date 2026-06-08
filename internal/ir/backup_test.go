@@ -32,6 +32,7 @@ func TestMarshalType_RoundTrip(t *testing.T) {
 		{"Varbinary", Varbinary{Length: 64}},
 		{"Blob medium", Blob{Size: BlobMedium}},
 		{"Date", Date{}},
+		{"Interval", Interval{}},
 		{"Time precision 6", Time{Precision: 6}},
 		{"DateTime precision 3", DateTime{Precision: 3}},
 		{"Timestamp tz", Timestamp{Precision: 6, WithTimeZone: true}},
