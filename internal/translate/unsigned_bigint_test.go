@@ -96,18 +96,18 @@ func TestUnsignedBigintNoticeError_LoudAndActionable(t *testing.T) {
 	}
 	msg := err.Error()
 	for _, want := range []string{
-		"migrate",                      // contextID surfaced
-		"bigint unsigned",              // the source type named
-		"bigint",                       // the target type named
-		"2^63-1",                       // the ceiling stated
-		"9223372036854775807",          // the explicit numeric ceiling
-		"deliberate",                   // it's a documented policy, not a bug
-		"Migration proceeds",           // it's a NOTICE, not a refusal
-		"--type-override",              // the escape hatch
-		"decimal:precision=20,scale=0", // the WORKING remediation token (not the bogus `=numeric`)
-		"posts.user_id",                // names an affected FK child column
-		"users.id",                     // names an affected PK column
-		"AUTO_INCREMENT",               // flags the autoincrement key
+		"migrate",             // contextID surfaced
+		"bigint unsigned",     // the source type named
+		"bigint",              // the target type named
+		"2^63-1",              // the ceiling stated
+		"9223372036854775807", // the explicit numeric ceiling
+		"deliberate",          // it's a documented policy, not a bug
+		"Migration proceeds",  // it's a NOTICE, not a refusal
+		"--type-override",     // the escape hatch
+		"decimal(20,0)",       // the WORKING remediation token (CLI paren form; not the bogus `=numeric`)
+		"posts.user_id",       // names an affected FK child column
+		"users.id",            // names an affected PK column
+		"AUTO_INCREMENT",      // flags the autoincrement key
 	} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("notice message missing %q\nfull message:\n%s", want, msg)

@@ -25,9 +25,29 @@ func TestParseTypeOverride(t *testing.T) {
 			config.Mapping{Table: "products", Column: "attrs", TargetType: "longtext"},
 		},
 		{
-			"target_type with parentheses",
+			"varchar with length",
 			"users.bio=varchar(2048)",
-			config.Mapping{Table: "users", Column: "bio", TargetType: "varchar(2048)"},
+			config.Mapping{Table: "users", Column: "bio", TargetType: "varchar", TargetTypeOptions: map[string]any{"length": 2048}},
+		},
+		{
+			"decimal precision+scale",
+			"t.amount=decimal(20,0)",
+			config.Mapping{Table: "t", Column: "amount", TargetType: "decimal", TargetTypeOptions: map[string]any{"precision": 20, "scale": 0}},
+		},
+		{
+			"numeric alias precision+scale",
+			"t.amount=numeric(38,10)",
+			config.Mapping{Table: "t", Column: "amount", TargetType: "numeric", TargetTypeOptions: map[string]any{"precision": 38, "scale": 10}},
+		},
+		{
+			"decimal precision only",
+			"t.amount=decimal(12)",
+			config.Mapping{Table: "t", Column: "amount", TargetType: "decimal", TargetTypeOptions: map[string]any{"precision": 12}},
+		},
+		{
+			"paren args tolerate whitespace",
+			"t.amount=decimal( 20 , 4 )",
+			config.Mapping{Table: "t", Column: "amount", TargetType: "decimal", TargetTypeOptions: map[string]any{"precision": 20, "scale": 4}},
 		},
 	}
 	for _, c := range cases {
@@ -56,6 +76,12 @@ func TestParseTypeOverride_Errors(t *testing.T) {
 		{"empty table", ".attrs=text", "empty table"},
 		{"empty column", "products.=text", "empty column"},
 		{"empty target type", "products.attrs=", "empty target_type"},
+		{"unbalanced paren", "t.c=decimal(20,0", "unbalanced"},
+		{"empty parens", "t.c=decimal()", "empty parentheses"},
+		{"non-integer arg", "t.c=decimal(x)", "is not an integer"},
+		{"too many decimal args", "t.c=decimal(1,2,3)", "takes (precision)"},
+		{"varchar two args", "t.c=varchar(1,2)", "single (length)"},
+		{"parens on non-parametric type", "t.c=text(5)", "does not take parenthesised"},
 	}
 	for _, c := range cases {
 		c := c

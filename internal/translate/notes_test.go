@@ -162,8 +162,8 @@ func TestHintsFor_PG_UnboundedNumeric_to_MySQL(t *testing.T) {
 	if len(got) != 1 {
 		t.Fatalf("expected 1 hint; got %d (%#v)", len(got), got)
 	}
-	if !strings.Contains(got[0].SuggestedOverride, "decimal:precision=N,scale=M") {
-		t.Errorf("override = %q; want decimal:precision=N,scale=M template", got[0].SuggestedOverride)
+	if !strings.Contains(got[0].SuggestedOverride, "decimal(N,M)") {
+		t.Errorf("override = %q; want decimal(N,M) template", got[0].SuggestedOverride)
 	}
 }
 

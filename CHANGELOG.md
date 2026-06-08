@@ -6,6 +6,31 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.99.26] - 2026-06-08
+
+### Added
+
+- **`--type-override` accepts parenthesised precision/length from the CLI:
+  `decimal(20,0)`, `numeric(20,0)`, `decimal(20)`, `varchar(255)`.** Previously
+  the CLI flag passed the whole post-`=` string as a bare type name, so a
+  precision-bearing decimal could only be set via the YAML `mappings:` form
+  (`target_type_options`) — the documented remediation hint
+  `decimal:precision=20,scale=0` did not actually parse from the CLI. The
+  concise paren form now works, and `numeric` is accepted as an alias for
+  `decimal` (the Postgres spelling). Malformed specs (unbalanced/empty parens,
+  non-integer or wrong-arity arguments, parens on a non-parametric type) are
+  rejected with a clear error.
+
+### Fixed
+
+- **The unsigned-bigint / unconstrained-numeric range advisories now point at a
+  remediation that actually works from the CLI.** The notices, `schema preview`
+  output, and the LOAD-DATA recovery hint recommended
+  `--type-override COL=decimal:precision=N,scale=M`, which the CLI never parsed
+  (it silently became an unknown type name). They now recommend the working
+  `--type-override COL=decimal(N,M)` form (e.g. `decimal(20,0)` to carry a full
+  unsigned-64 value into PG `numeric(20,0)`).
+
 ## [0.99.25] - 2026-06-08
 
 ### Fixed

@@ -274,9 +274,10 @@ func resolveTargetType(name string, opts map[string]any) (ir.Type, error) {
 		}
 		return ir.Varchar{Length: length}, nil
 	}
-	if name == "decimal" {
-		// `decimal` is the override for "force a specific precision/
-		// scale on a DECIMAL column". The default cross-engine path
+	if name == "decimal" || name == "numeric" {
+		// `decimal` (alias `numeric`, the PG spelling) is the override
+		// for "force a specific precision/scale on a DECIMAL column".
+		// The default cross-engine path
 		// for PG unbounded `numeric` lands as MySQL DECIMAL(65,30)
 		// (the maximum); operators with bounded-precision values
 		// override via this alias to recover storage. See ADR-0024.

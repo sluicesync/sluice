@@ -272,8 +272,8 @@ var hintEntries = []hintEntry{
 			// numerics carry their declared precision/scale.
 			return ok && d.Unconstrained
 		},
-		message:        "PG unbounded numeric -> MySQL DECIMAL(65,30); for narrower storage, override to decimal:precision=N,scale=M",
-		suggestedAlias: "decimal:precision=N,scale=M",
+		message:        "PG unbounded numeric -> MySQL DECIMAL(65,30); for narrower storage, override to decimal(N,M)",
+		suggestedAlias: "decimal(N,M)",
 	},
 }
 

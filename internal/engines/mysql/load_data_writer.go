@@ -198,7 +198,7 @@ func refuseOnLoadDataWarnings(ctx context.Context, conn *sql.Conn, table string)
 		"behaviour quirk this refusal closes; Bugs 102/103 / v0.92.2). Examples: [%s]%s. "+
 		"Recovery (data-preserving): map the column to a target type that FITS the value via "+
 		"--type-override — e.g. `=datetime` for an out-of-range timestamp (MySQL DATETIME covers "+
-		"1000–9999 vs TIMESTAMP's 1970–2038), `=decimal:precision=P,scale=S` for a numeric overflow, "+
+		"1000–9999 vs TIMESTAMP's 1970–2038), `=decimal(P,S)` for a numeric overflow, "+
 		"or `=text`/`=varchar` to keep the raw value — or fix the source data. "+
 		"Do NOT pass --mysql-sql-mode='' to silence a range/overflow/truncation warning: under "+
 		"non-strict sql_mode MySQL SILENTLY clamps or truncates the offending values (out-of-range "+

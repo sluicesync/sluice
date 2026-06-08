@@ -23,7 +23,7 @@ import (
 // 2^63-1 (the uint64-no-migration-path finding, 2026-06-08). The default
 // `bigint` mapping can't represent them (loud refusal at COPY encode), and
 // the unsigned-bigint notice directs operators to
-// `--type-override TABLE.COL=decimal:precision=20,scale=0`. Before the fix
+// `--type-override TABLE.COL=decimal(20,0)`. Before the fix
 // that path was broken end to end: the notice named a non-existent
 // `=numeric` token, and even with `=decimal` the MySQL reader couldn't
 // decode a uint64 into a Decimal/text target. This asserts the documented
@@ -106,7 +106,7 @@ func TestMigrate_BigintUnsignedOverflow_DecimalOverride(t *testing.T) {
 	}
 	for id, w := range want {
 		if got[id] != w {
-			t.Errorf("ubig id=%d: target u = %q; want %q (exact unsigned-64 value via decimal:precision=20,scale=0 override)", id, got[id], w)
+			t.Errorf("ubig id=%d: target u = %q; want %q (exact unsigned-64 value via decimal(20,0) override)", id, got[id], w)
 		}
 	}
 }

@@ -189,6 +189,36 @@ func TestApplyMappings_VarcharOptions(t *testing.T) {
 	}
 }
 
+// TestApplyMappings_NumericAliasAndPrecision pins that `numeric` resolves
+// as an alias for `decimal` and that precision/scale options apply — the
+// resolution side of the CLI `decimal(p,s)`/`numeric(p,s)` paren shorthand.
+func TestApplyMappings_NumericAliasAndPrecision(t *testing.T) {
+	for _, name := range []string{"decimal", "numeric"} {
+		t.Run(name, func(t *testing.T) {
+			s := schemaWith(struct {
+				table string
+				cols  []string
+			}{"t", []string{"amount"}})
+			got, err := ApplyMappings(s, []config.Mapping{
+				{
+					Table: "t", Column: "amount", TargetType: name,
+					TargetTypeOptions: map[string]any{"precision": 20, "scale": 4},
+				},
+			})
+			if err != nil {
+				t.Fatalf("err: %v", err)
+			}
+			d, ok := got.Tables[0].Columns[0].Type.(ir.Decimal)
+			if !ok {
+				t.Fatalf("type = %T; want ir.Decimal", got.Tables[0].Columns[0].Type)
+			}
+			if d.Precision != 20 || d.Scale != 4 {
+				t.Errorf("got Decimal(%d,%d); want Decimal(20,4)", d.Precision, d.Scale)
+			}
+		})
+	}
+}
+
 func TestApplyMappings_VarcharDefaultsTo255(t *testing.T) {
 	s := schemaWith(struct {
 		table string

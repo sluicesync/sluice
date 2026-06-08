@@ -283,7 +283,7 @@ A PostgreSQL column declared as bare `numeric` / `decimal` with **no precision o
 
 **`numeric[]` (array of unconstrained numeric):** on a PG target the array round-trips as `NUMERIC[]` (each element bare `NUMERIC`, lossless, no advisory). On a MySQL target the whole array column lands as `JSON` (the [Postgres ARRAY → MySQL](#postgres-array--mysql) policy) — the values are stored as JSON text with no decimal-precision loss, so the widening advisory does **not** fire for the array case (there is nothing to narrow).
 
-**Override:** for a column that needs a specific precision/scale (to recover storage, or because values exceed 65/30), supply `--type-override TABLE.COL=decimal:precision=N,scale=M` (or the per-column `mappings:` hook).
+**Override:** for a column that needs a specific precision/scale (to recover storage, or because values exceed 65/30), supply `--type-override TABLE.COL=decimal(N,M)` (or the per-column `mappings:` hook).
 
 ### MySQL ENUM and SET → Postgres
 

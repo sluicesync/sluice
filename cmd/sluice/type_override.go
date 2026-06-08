@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"sluicesync.dev/sluice/internal/config"
@@ -82,9 +83,76 @@ func parseTypeOverride(raw string) (config.Mapping, error) {
 		return config.Mapping{}, fmt.Errorf("empty target_type in %q", raw)
 	}
 
+	name, opts, err := parseTargetTypeSpec(targetType)
+	if err != nil {
+		return config.Mapping{}, fmt.Errorf("%w (in %q)", err, raw)
+	}
+
 	return config.Mapping{
-		Table:      table,
-		Column:     column,
-		TargetType: targetType,
+		Table:             table,
+		Column:            column,
+		TargetType:        name,
+		TargetTypeOptions: opts,
 	}, nil
+}
+
+// parseTargetTypeSpec splits a CLI target-type spec into the bare type
+// name and its options. It supports the concise parenthesised forms for
+// the precision/length-bearing types — the common case operators need
+// from the CLI without resorting to the YAML `mappings:` form:
+//
+//	decimal(20,0) / numeric(20,0)  → decimal, {precision:20, scale:0}
+//	decimal(20)   / numeric(20)    → decimal, {precision:20}
+//	varchar(255)                   → varchar, {length:255}
+//	text, jsonb, smallint, …       → bare name, no options
+//
+// (`numeric` is normalised to `decimal` by resolveTargetType.) A bare
+// name with no parentheses passes through unchanged, so every existing
+// token keeps working. Anything malformed (unbalanced/empty parens,
+// non-integer or wrong-arity arguments, parens on a type that takes
+// none) is a clear error rather than a silently-ignored suffix.
+func parseTargetTypeSpec(spec string) (name string, opts map[string]any, err error) {
+	open := strings.IndexByte(spec, '(')
+	if open < 0 {
+		return spec, nil, nil
+	}
+	if !strings.HasSuffix(spec, ")") {
+		return "", nil, fmt.Errorf("type %q has an unbalanced '('", spec)
+	}
+	name = strings.TrimSpace(spec[:open])
+	inner := strings.TrimSpace(spec[open+1 : len(spec)-1])
+	if name == "" {
+		return "", nil, fmt.Errorf("missing type name before '(' in %q", spec)
+	}
+	if inner == "" {
+		return "", nil, fmt.Errorf("type %q has empty parentheses", spec)
+	}
+	parts := strings.Split(inner, ",")
+	args := make([]int, len(parts))
+	for i, p := range parts {
+		n, perr := strconv.Atoi(strings.TrimSpace(p))
+		if perr != nil {
+			return "", nil, fmt.Errorf("type %q: argument %q is not an integer", spec, strings.TrimSpace(p))
+		}
+		args[i] = n
+	}
+
+	switch name {
+	case "decimal", "numeric":
+		if len(args) < 1 || len(args) > 2 {
+			return "", nil, fmt.Errorf("type %q: %s takes (precision) or (precision,scale)", spec, name)
+		}
+		opts = map[string]any{"precision": args[0]}
+		if len(args) == 2 {
+			opts["scale"] = args[1]
+		}
+		return name, opts, nil
+	case "varchar":
+		if len(args) != 1 {
+			return "", nil, fmt.Errorf("type %q: varchar takes a single (length)", spec)
+		}
+		return name, map[string]any{"length": args[0]}, nil
+	default:
+		return "", nil, fmt.Errorf("type %q does not take parenthesised arguments", name)
+	}
 }

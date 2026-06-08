@@ -213,7 +213,7 @@ func decodeInteger(raw any) (any, error) {
 //
 // The integer cases carry a `BIGINT UNSIGNED` column that an operator
 // overrode to a wide DECIMAL to preserve the full unsigned-64 range
-// (`--type-override TABLE.COL=decimal:precision=20,scale=0`): go-sql-driver
+// (`--type-override TABLE.COL=decimal(20,0)`): go-sql-driver
 // returns uint64 for values above 2^63-1 (and int64 otherwise), and the
 // default `bigint` mapping can't hold them. Rendering the integer as its
 // exact decimal text keeps the value lossless into PG `numeric(20,0)`.

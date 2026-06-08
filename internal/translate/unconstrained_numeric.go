@@ -21,7 +21,7 @@ package translate
 // NOTICE, not a refusal: unconstrained `numeric` is ubiquitous in PG
 // schemas, so a hard refusal would over-block. Operators whose values
 // genuinely need a different precision override per-column with
-// `--type-override TABLE.COL=decimal:precision=N,scale=M`.
+// `--type-override TABLE.COL=decimal(N,M)`.
 //
 // PG → PG is unaffected: the unconstrained numeric round-trips as bare
 // `NUMERIC` (no narrowing), so the scan short-circuits non-MySQL
@@ -147,6 +147,6 @@ func renderUnconstrainedNumericNotice(notices []UnconstrainedNumericNotice, cont
 		fmt.Fprintf(&b, "%s.%s", n.Table, n.Column)
 	}
 	b.WriteString("\nIf a column needs a different precision/scale, override it " +
-		"per-column with `--type-override TABLE.COL=decimal:precision=N,scale=M`.")
+		"per-column with `--type-override TABLE.COL=decimal(N,M)`.")
 	return b.String()
 }

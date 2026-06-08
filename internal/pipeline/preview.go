@@ -350,7 +350,7 @@ func (p *Previewer) Run(ctx context.Context) error {
 	// ---- 3.6. Unsigned-bigint range-narrowing notice (Bug 11) ----
 	// Advisory — NOT a refusal (it must still migrate the universal
 	// ORM schema). Scanned on the post-override schema so an operator's
-	// `--type-override TABLE.COL=decimal:precision=20,scale=0` escape hatch
+	// `--type-override TABLE.COL=decimal(20,0)` escape hatch
 	// suppresses the notice for that column. Rendered in a dedicated preview section
 	// so it's loud and visible alongside the translator-gaps block,
 	// matching the wording `migrate` preflight logs.
@@ -736,7 +736,7 @@ func writeUnsignedBigintSection(sb *strings.Builder, notices []translate.Unsigne
 	sb.WriteString("-- values > 2^63-1 (9223372036854775807) are NOT representable\n")
 	sb.WriteString("-- on the target. This is advisory; the migration proceeds.\n")
 	sb.WriteString("-- Override a column that genuinely exceeds 2^63-1 with\n")
-	sb.WriteString("-- `--type-override TABLE.COL=decimal:precision=20,scale=0`\n")
+	sb.WriteString("-- `--type-override TABLE.COL=decimal(20,0)`\n")
 	sb.WriteString("-- (PG numeric(20,0) keeps the full unsigned 64-bit range; or\n")
 	sb.WriteString("-- =text to carry it as text; neither can also be an IDENTITY key).\n")
 	sb.WriteString("--\n")
@@ -769,7 +769,7 @@ func writeUnconstrainedNumericSection(sb *strings.Builder, notices []translate.U
 	sb.WriteString("-- representable on the target. This is advisory; the migration\n")
 	sb.WriteString("-- proceeds. Override a column that needs a different\n")
 	sb.WriteString("-- precision/scale with\n")
-	sb.WriteString("-- `--type-override TABLE.COL=decimal:precision=N,scale=M`.\n")
+	sb.WriteString("-- `--type-override TABLE.COL=decimal(N,M)`.\n")
 	sb.WriteString("--\n")
 	for _, n := range notices {
 		fmt.Fprintf(sb, "-- %s.%s: numeric (unconstrained) -> DECIMAL(65,30)\n", n.Table, n.Column)
