@@ -6,6 +6,7 @@ package mysql
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -181,6 +182,12 @@ func (r *RowReader) stream(ctx context.Context, rows *sql.Rows, table *ir.Table,
 		for i, col := range cols {
 			v, err := decodeValue(scanBuf[i], col.Type)
 			if err != nil {
+				var zd *zeroDateValueError
+				if errors.As(err, &zd) {
+					v, err = applyZeroDatePolicy(zd, col)
+				}
+			}
+			if err != nil {
 				r.setErr(fmt.Errorf("mysql: column %q: %w", col.Name, err))
 				return
 			}
@@ -224,7 +231,7 @@ func buildSelect(table *ir.Table, qualifyBySchema bool) string {
 	src := sourceReadableColumns(table.Columns)
 	cols := make([]string, len(src))
 	for i, c := range src {
-		cols[i] = quoteIdent(c.Name)
+		cols[i] = selectColumnExpr(c)
 	}
 	tableRef := quoteIdent(table.Name)
 	if qualifyBySchema && table.Schema != "" {
@@ -235,6 +242,30 @@ func buildSelect(table *ir.Table, qualifyBySchema bool) string {
 		strings.Join(cols, ", "),
 		tableRef,
 	)
+}
+
+// selectColumnExpr returns the SELECT-list expression for source column
+// c. Temporal columns (DATE/DATETIME/TIMESTAMP) are read through
+// CAST(... AS CHAR) so the value-decode layer receives MySQL's literal
+// text — including zero and partial dates (0000-00-00, YYYY-00-DD,
+// YYYY-MM-00). Read as native time values under the driver's
+// parseTime=true, those legacy dates are silently normalized to a wrong
+// calendar date by the driver before sluice ever sees them (Vector A
+// CRITICAL silent corruption); the CHAR detour hands decodeTime the raw
+// string so it can validate and apply the --zero-date policy. The result
+// is aliased back to the original column name so positional and
+// name-based consumers are unchanged. The CAST is in the SELECT list
+// only; ORDER BY / WHERE predicates (e.g. the keyset cursor) reference
+// the real column, so pagination is unaffected. All other columns read
+// directly.
+func selectColumnExpr(c *ir.Column) string {
+	switch c.Type.(type) {
+	case ir.Date, ir.DateTime, ir.Timestamp:
+		ident := quoteIdent(c.Name)
+		return "CAST(" + ident + " AS CHAR) AS " + ident
+	default:
+		return quoteIdent(c.Name)
+	}
 }
 
 // nonGeneratedColumns returns the columns of in that are NOT

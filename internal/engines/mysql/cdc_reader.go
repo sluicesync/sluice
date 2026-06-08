@@ -1420,6 +1420,12 @@ func decodeBinlogRow(raw []any, cols []*ir.Column) (ir.Row, error) {
 		}
 		v, err := decodeValue(raw[i], col.Type)
 		if err != nil {
+			var zd *zeroDateValueError
+			if errors.As(err, &zd) {
+				v, err = applyZeroDatePolicy(zd, col)
+			}
+		}
+		if err != nil {
 			return nil, fmt.Errorf("column %q: %w", col.Name, err)
 		}
 		row[col.Name] = v

@@ -88,7 +88,7 @@ func buildBatchedSelect(table *ir.Table, limit int, hasCursor bool) string {
 	src := sourceReadableColumns(table.Columns)
 	colsList := make([]string, len(src))
 	for i, c := range src {
-		colsList[i] = quoteIdent(c.Name)
+		colsList[i] = selectColumnExpr(c)
 	}
 
 	pkCols := table.PrimaryKey.Columns

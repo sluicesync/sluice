@@ -72,6 +72,18 @@ Concretely: the MySQL reader copies bytes off the driver's `[]byte` before retur
 
 Engine readers must not return `time.Time` values in a non-UTC location. Engine writers must accept any `time.Time` location (calling `.UTC()` is cheap and idempotent), but should write in the engine's expected form: a literal date for `Date`, a UTC datetime literal for `DateTime`, and an instant for `Timestamp`.
 
+### Zero and partial dates (MySQL legacy data)
+
+MySQL under a relaxed `sql_mode` can store dates with no valid calendar value: the all-zero `'0000-00-00'`, a zero month (`'2026-00-15'`), or a zero day (`'2026-06-00'`). These have **no faithful `time.Time` representation** — Go's `time.Date` would normalize a zero component into a neighbouring real date, silently corrupting the value (Vector A).
+
+The MySQL reader therefore reads `Date`/`DateTime`/`Timestamp` columns as their raw text (via `CAST(... AS CHAR)`) so the decode layer sees the literal, and resolves zero/partial dates per the operator's `--zero-date` policy **before** a `time.Time` is ever constructed:
+
+- `error` (default) — refuse loudly, naming the column. The IR never carries a guessed value.
+- `null` — emit SQL `NULL` (refused loudly for a `NOT NULL` column).
+- `epoch` — emit `1970-01-01` (`1970-01-01 00:00:00 UTC`).
+
+A genuinely out-of-range but **non-zero** date (month 13, Feb 30) is not a zero date; it stays a hard decode error regardless of `--zero-date`, so the flag can never silently rescue malformed data. See [migrating-legacy-mysql.md](operator/migrating-legacy-mysql.md) for the operator-facing flow and its interaction with the write-side `--mysql-sql-mode`.
+
 ## Per-engine reader normalisation requirements
 
 Drivers vary in what they return for the same SQL value. Engine readers are responsible for normalising to the contract above. The MySQL reader, for example, must:

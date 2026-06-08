@@ -80,6 +80,9 @@ func main() {
 	// zero-dates / silently-truncated values that pre-MySQL-5.7
 	// schemas commonly carry. See docs/operator/migrating-legacy-mysql.md.
 	mysql.SetSessionSQLMode(cli.MySQLSQLMode)
+	// Thread the operator's --zero-date policy (kong's enum tag already
+	// validated the value; the setter re-checks defensively).
+	ctx.FatalIfErrorf(mysql.SetZeroDateMode(cli.ZeroDate))
 	err := ctx.Run(&cli.Globals)
 	ctx.FatalIfErrorf(err)
 }

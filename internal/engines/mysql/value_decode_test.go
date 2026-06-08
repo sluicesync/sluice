@@ -183,16 +183,6 @@ func TestDecodeTimeFromString(t *testing.T) {
 			"2026-05-05",
 			time.Date(2026, 5, 5, 0, 0, 0, 0, time.UTC),
 		},
-		{
-			"all-zero datetime maps to zero time",
-			"0000-00-00 00:00:00",
-			time.Time{},
-		},
-		{
-			"empty string maps to zero time",
-			"",
-			time.Time{},
-		},
 	}
 	for _, c := range cases {
 		c := c

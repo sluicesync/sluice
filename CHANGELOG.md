@@ -6,6 +6,40 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **CRITICAL: MySQL zero and partial dates were silently corrupted into a
+  wrong calendar date on the `migrate` / snapshot bulk-copy path.** A source
+  column holding a legacy invalid date — the all-zero `'0000-00-00'`, a zero
+  month (`'2026-00-15'`), or a zero day (`'2026-06-00'`), all storable under a
+  relaxed source `sql_mode` — was read through the MySQL driver's
+  `parseTime=true`, which hands such values to Go's `time.Date(2026, 0, 0, …)`.
+  Go *normalizes* a zero component into a neighbouring real date
+  (`'2026-06-00'` → `2026-05-31`, `'2026-00-00'` → `2025-11-30`), so the
+  migration carried a **different, plausible-looking date** and exited 0. The
+  all-zero `'0000-00-00'` was the only case handled sanely (→ NULL); every
+  partial date was silently wrong. The CDC binlog tail already surfaced these
+  loudly; only the bulk-copy read path corrupted them.
+
+  **Fix:** sluice now reads `DATE`/`DATETIME`/`TIMESTAMP` columns as their raw
+  text (`CAST(... AS CHAR)`) so the decode layer sees MySQL's literal value
+  before any `time.Time` is constructed, and resolves zero/partial dates per a
+  new `--zero-date` policy:
+  - `--zero-date=error` (**default**) — refuse loudly, naming the column. The
+    safe default: nothing silently wrong leaves the source.
+  - `--zero-date=null` — carry the value as SQL `NULL` (refused loudly for a
+    `NOT NULL` column).
+  - `--zero-date=epoch` — substitute `1970-01-01`.
+
+  A genuinely out-of-range but non-zero date (month 13, Feb 30) stays a hard
+  error regardless of the flag. This is a **behavior change**: prior versions
+  silently mapped `'0000-00-00'` to NULL; that case now refuses by default —
+  pass `--zero-date=null` to restore it. See
+  [docs/operator/migrating-legacy-mysql.md](docs/operator/migrating-legacy-mysql.md).
+  Pinned by unit tests across the full temporal family × every zero shape ×
+  each policy, plus an integration test that ground-truths the live-driver
+  normalization against real MySQL 8.0.
+
 ## [0.99.18] - 2026-06-07
 
 ### Fixed

@@ -19,38 +19,65 @@ year-old WHMCS-shaped corpus is the canonical example.
 This doc shows the three things that legacy-MySQL operators need to
 know to migrate cleanly with v0.92.1+.
 
-## 1. Zero-dates: `'0000-00-00'`
+## 1. Zero-dates and partial dates: `'0000-00-00'`, `'YYYY-00-DD'`, `'YYYY-MM-00'`
 
-**Symptom.** With strict-by-default, sluice's INSERT into the target
-MySQL fails with one of:
+Legacy MySQL stores three flavors of invalid date under a relaxed
+`sql_mode`: the all-zero `'0000-00-00'`, a zero **month** (`'2026-00-15'`),
+and a zero **day** (`'2026-06-00'`). None has a valid calendar value.
+There are **two independent layers** to control, and getting only one of
+them is a trap:
 
-- `Error 1292`: `Incorrect date value: '0000-00-00' for column ...`
-- `Error 1525`: `Incorrect DATE value: '0000-00-00'`
-- `Error 1364` if the column is NOT NULL and the strict mode also
-  blocks the implicit zero-default
+**Read side — `--zero-date` (how sluice *carries* the value off the
+source).** When sluice reads a temporal column it gets MySQL's literal
+text. The go-sql-driver, left to parse these itself, would feed them to
+Go's `time.Date(2026, 0, 0, …)` which **silently normalizes** a partial
+date to the wrong calendar day (`'2026-00-00'` → `2025-11-30`) — a
+silent-corruption class. sluice reads temporal columns as raw text to
+avoid that, then applies your `--zero-date` policy:
 
-**Recovery.** Pick the option that matches your data semantics:
+| `--zero-date` | Behavior |
+|---|---|
+| `error` (default) | Refuse loudly, naming the column and value. Nothing silently wrong leaves the source. |
+| `null` | Carry the value as SQL `NULL`. Refused loudly if the column is `NOT NULL` (use `epoch`, or repair the data). |
+| `epoch` | Substitute `1970-01-01` (`1970-01-01 00:00:00` for DATETIME/TIMESTAMP). |
+
+This applies to **every** direction the value is *read* in — including
+MySQL→MySQL and the CDC tail — so it also protects the same-engine case
+the prior `--mysql-sql-mode=''` write-side workaround did not.
+
+**Write side — `--mysql-sql-mode` (whether the target MySQL *accepts*
+the value).** Only relevant when the **target** is MySQL. With
+strict-by-default, an INSERT carrying a zero-date fails with
+`Error 1292` / `1525` / `1364`. Passing `--mysql-sql-mode=''` relaxes
+the target so it stores the legacy zero-date as-is. This is independent
+of `--zero-date`: `--mysql-sql-mode=''` alone no longer silently carries
+partial dates (the read side refuses them first).
+
+**Recovery.** Pick the read policy that matches your data semantics:
 
 ```bash
-# Option A — preserve the zero-date convention (legacy-faithful):
-# Disable strict mode and let the target MySQL accept the same
-# zero-dates the source has been storing for 20 years.
-sluice migrate \
-    --mysql-sql-mode='' \
+# Modernize: convert zero/partial dates to NULL (requires the target
+# columns to be nullable; sluice refuses loudly on any NOT NULL one).
+sluice migrate --zero-date=null \
+    --source-driver=mysql --source=$LEGACY_DSN \
+    --target-driver=postgres --target=$NEW_PG_DSN
+
+# MySQL→MySQL with a non-null placeholder: substitute the epoch. The
+# target accepts 1970-01-01 under strict mode, so no --mysql-sql-mode
+# relaxation is needed.
+sluice migrate --zero-date=epoch \
     --source-driver=mysql --source=$LEGACY_DSN \
     --target-driver=mysql --target=$NEW_MYSQL_DSN
-
-# Option B — convert at translate-time (modernise):
-# Use a YAML config or repeated --type-override to convert each
-# zero-date column to nullable timestamp; sluice translates the
-# source's '0000-00-00' to NULL via a type-mapping rule.
-# (Not yet shipped as a one-flag flow — currently you'd use an
-# operator-side ETL stage to clean the data before sluice sees it.)
 ```
 
-If you can't tell up front, **start with option A**. Once you see what
-sluice ran clean, you can decide whether to fix the data on the new
-target.
+sluice never re-emits a literal `'0000-00-00'` — the read side resolves
+every zero/partial date to a refusal, `NULL`, or the epoch. If you must
+preserve the literal zero-date convention on a MySQL target, that's an
+operator-side ETL step before sluice sees the data.
+
+If you can't tell up front, run the default (`--zero-date=error`) once:
+it names every offending column so you can decide per-column whether
+`null` or `epoch` is right.
 
 ## 2. Silently-truncated VARCHARs
 

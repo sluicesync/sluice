@@ -262,22 +262,30 @@ func decodeMySQLGeometry(raw any) (any, error) {
 
 // decodeTime converts MySQL temporal values into time.Time.
 //
-// The schema-cache pool's DSN sets `parseTime=true` so SELECT results
-// arrive as time.Time directly — that's the cold-start bulk-copy
-// path. The binlog reader's RowsEvent decoder, however, hands back
-// the raw string form ("YYYY-MM-DD HH:MM:SS[.ffffff]" / "YYYY-MM-DD")
-// regardless of the SQL DSN setting, because the binlog protocol is
-// independent of the driver's row-scan flow. Bug 12 surfaced as a
-// silent CDC stall when this branch couldn't decode strings — pump
-// errored on the first INSERT carrying a TIMESTAMP/DATETIME column,
-// returned, defer close(out) closed the channel, and the applier
-// drained zero events.
+// The bulk-copy read path reads DATE/DATETIME/TIMESTAMP columns through
+// CAST(... AS CHAR) (see selectColumnExpr) so this decoder receives
+// MySQL's literal text rather than a value the go-sql-driver has
+// already parsed under parseTime=true. That detour is load-bearing for
+// correctness: the driver decodes a partial date like "2026-00-00" via
+// time.Date(2026, 0, 0, ...), which Go *silently normalizes* into the
+// prior month ("2025-11-30") before sluice ever sees it — a CRITICAL
+// silent-corruption class (Vector A). Reading the raw string lets this
+// decoder validate the value and surface zero/partial dates explicitly.
 //
-// The 0000-00-00 zero-value (not the same as NULL — MySQL emits it
-// when strict mode is off and a date is omitted) maps to the Go
-// time.Time zero value so it round-trips cleanly to PG's NULL
-// (TIMESTAMPTZ rejects '0000-00-00'). Operators with strict mode on
-// won't see this case.
+// The binlog reader's RowsEvent decoder independently hands back the
+// raw string form ("YYYY-MM-DD HH:MM:SS[.ffffff]" / "YYYY-MM-DD"),
+// because the binlog protocol is independent of the driver's row-scan
+// flow. Bug 12 surfaced as a silent CDC stall when this branch couldn't
+// decode strings — the pump errored on the first INSERT carrying a
+// TIMESTAMP/DATETIME column and drained zero events.
+//
+// MySQL zero and partial dates (0000-00-00, YYYY-00-DD, YYYY-MM-00) —
+// storable only under a relaxed source sql_mode and with no valid
+// calendar value — are returned as a *zeroDateValueError sentinel. The
+// read paths funnel that through applyZeroDatePolicy to honor the
+// operator's --zero-date choice (refuse / null / epoch). A genuinely
+// out-of-range but non-zero value (month 13, Feb 30) stays a hard
+// decode error.
 func decodeTime(raw any) (any, error) {
 	if v, ok := raw.(time.Time); ok {
 		return v, nil
@@ -291,8 +299,11 @@ func decodeTime(raw any) (any, error) {
 	default:
 		return nil, fmt.Errorf("mysql: cannot decode %T as time.Time", raw)
 	}
-	if s == "0000-00-00 00:00:00" || s == "0000-00-00" || s == "" {
-		return time.Time{}, nil
+	if s == "" {
+		// A non-NULL temporal column rendered as an empty string has no
+		// calendar value; let the --zero-date policy govern it rather
+		// than silently producing the Go zero time.
+		return nil, &zeroDateValueError{raw: s}
 	}
 	for _, layout := range []string{
 		"2006-01-02 15:04:05.999999",
@@ -303,7 +314,105 @@ func decodeTime(raw any) (any, error) {
 			return t, nil
 		}
 	}
+	if isMySQLZeroDate(s) {
+		return nil, &zeroDateValueError{raw: s}
+	}
 	return nil, fmt.Errorf("mysql: cannot parse %q as MySQL temporal value", s)
+}
+
+// isMySQLZeroDate reports whether s is a MySQL zero or partial date: the
+// all-zero 0000-00-00, or any value with a zero month or zero day
+// (YYYY-00-DD, YYYY-MM-00). time.Parse rejects all of these, so this is
+// only consulted after the valid-layout attempts fail — it distinguishes
+// the legacy zero-date family (governed by --zero-date) from a genuinely
+// malformed value (month 13, Feb 30), which stays a hard error. Year
+// "0000" with an otherwise-valid month/day is a representable historical
+// date and intentionally NOT treated as a zero date.
+func isMySQLZeroDate(s string) bool {
+	datePart := s
+	if i := strings.IndexByte(s, ' '); i >= 0 {
+		datePart = s[:i]
+	}
+	p := strings.Split(datePart, "-")
+	if len(p) != 3 {
+		return false
+	}
+	return p[1] == "00" || p[2] == "00"
+}
+
+// zeroDateMode is the process-wide policy for carrying MySQL zero and
+// partial dates discovered on the read path. It is set once at startup
+// from --zero-date via SetZeroDateMode (main.go), mirroring
+// sessionSQLMode. The default refuses loudly: silently normalizing
+// these values to a wrong calendar date was a CRITICAL silent-corruption
+// class (Vector A).
+type zeroDateMode int
+
+const (
+	zeroDateRefuse  zeroDateMode = iota // --zero-date=error (default)
+	zeroDateAsNull                      // --zero-date=null
+	zeroDateAsEpoch                     // --zero-date=epoch
+)
+
+// zeroDatePolicy is the active zero-date mode. Read on the row-decode
+// path; written once at startup before any engine connects.
+var zeroDatePolicy = zeroDateRefuse
+
+// SetZeroDateMode sets the process-wide zero-date policy from the
+// operator's --zero-date value. Called once from main.go before any
+// engine opens a connection. An empty string keeps the refuse default.
+func SetZeroDateMode(s string) error {
+	switch s {
+	case "", "error":
+		zeroDatePolicy = zeroDateRefuse
+	case "null":
+		zeroDatePolicy = zeroDateAsNull
+	case "epoch":
+		zeroDatePolicy = zeroDateAsEpoch
+	default:
+		return fmt.Errorf("mysql: invalid --zero-date %q (want one of: error, null, epoch)", s)
+	}
+	return nil
+}
+
+// zeroDateEpochValue is the substitute for --zero-date=epoch: the Unix
+// epoch in UTC. Writers render it per the target column type (date-only
+// for DATE, with time for DATETIME/TIMESTAMP).
+var zeroDateEpochValue = time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)
+
+// zeroDateValueError marks a MySQL zero/partial date surfaced by
+// decodeTime. Read paths catch it with errors.As and resolve it via
+// applyZeroDatePolicy; propagated unhandled it refuses loudly, which is
+// the correct fallback.
+type zeroDateValueError struct{ raw string }
+
+func (e *zeroDateValueError) Error() string {
+	return fmt.Sprintf("MySQL zero/partial date %q has no valid calendar value", e.raw)
+}
+
+// applyZeroDatePolicy resolves a zero/partial date per the configured
+// --zero-date mode for column col. It is the single chokepoint the
+// bulk-copy and CDC read paths funnel zeroDateValueError through. The
+// caller adds the "mysql: column %q" context, so the returned errors
+// carry only the reason.
+func applyZeroDatePolicy(zd *zeroDateValueError, col *ir.Column) (any, error) {
+	switch zeroDatePolicy {
+	case zeroDateAsNull:
+		if !col.Nullable {
+			return nil, fmt.Errorf(
+				"%s; --zero-date=null cannot apply to a NOT NULL column (use --zero-date=epoch, or repair the source value)",
+				zd.Error(),
+			)
+		}
+		return nil, nil
+	case zeroDateAsEpoch:
+		return zeroDateEpochValue, nil
+	default: // zeroDateRefuse
+		return nil, fmt.Errorf(
+			"%s; pass --zero-date=null or --zero-date=epoch to carry it (see docs/operator/migrating-legacy-mysql.md)",
+			zd.Error(),
+		)
+	}
 }
 
 // decodeSet converts a MySQL SET value's textual representation into

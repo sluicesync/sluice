@@ -54,6 +54,41 @@ func TestBuildSelect(t *testing.T) {
 	}
 }
 
+// TestBuildSelect_TemporalCAST pins the Vector A read-side fix: DATE,
+// DATETIME and TIMESTAMP columns are read through CAST(... AS CHAR) so
+// the value-decode layer receives MySQL's raw literal (zero/partial
+// dates included) instead of a value the driver has already normalized
+// under parseTime=true. Non-temporal columns (including TIME, which
+// decodes as a string) are read directly. buildBatchedSelect shares the
+// same selectColumnExpr helper, so the CAST must appear there too.
+func TestBuildSelect_TemporalCAST(t *testing.T) {
+	table := &ir.Table{
+		Name: "events",
+		Columns: []*ir.Column{
+			{Name: "id", Type: ir.Integer{Width: 64}},
+			{Name: "d", Type: ir.Date{}},
+			{Name: "dt", Type: ir.DateTime{}},
+			{Name: "ts", Type: ir.Timestamp{}},
+			{Name: "dur", Type: ir.Time{}},
+			{Name: "label", Type: ir.Varchar{Length: 64}},
+		},
+		PrimaryKey: &ir.Index{Columns: []ir.IndexColumn{{Column: "id"}}},
+	}
+
+	wantList := "`id`, CAST(`d` AS CHAR) AS `d`, CAST(`dt` AS CHAR) AS `dt`, " +
+		"CAST(`ts` AS CHAR) AS `ts`, `dur`, `label`"
+
+	got := buildSelect(table, false)
+	if want := "SELECT " + wantList + " FROM `events`"; got != want {
+		t.Errorf("buildSelect:\n got  %q\n want %q", got, want)
+	}
+
+	gotBatch := buildBatchedSelect(table, 1000, false)
+	if want := "SELECT " + wantList + " FROM `events` ORDER BY `id` LIMIT 1000"; gotBatch != want {
+		t.Errorf("buildBatchedSelect:\n got  %q\n want %q", gotBatch, want)
+	}
+}
+
 // TestBuildSelect_QualifyBySchema pins the ADR-0074 Phase 1b.2 spanning-
 // snapshot variant: when qualifyBySchema is true and Table.Schema is set,
 // the FROM clause is `db`.`table`; with Schema empty it stays unqualified
