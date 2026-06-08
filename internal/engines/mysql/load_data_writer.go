@@ -195,10 +195,16 @@ func refuseOnLoadDataWarnings(ctx context.Context, conn *sql.Conn, table string)
 	}
 	return fmt.Errorf("mysql: LOAD DATA into %q produced %d warning(s) under strict sql_mode — "+
 		"LOAD DATA's per-row type-conversion errors are silently downgraded to warnings (a MySQL "+
-		"behaviour quirk this refusal closes; Bugs 102/103 / v0.92.2). Examples: [%s]%s. Recovery: "+
-		"narrow the column type via --type-override, fix the source data, or pass "+
-		"--mysql-sql-mode='' to fall through to the server's default sql_mode (legacy-data escape "+
-		"hatch — see docs/operator/migrating-legacy-mysql.md)",
+		"behaviour quirk this refusal closes; Bugs 102/103 / v0.92.2). Examples: [%s]%s. "+
+		"Recovery (data-preserving): map the column to a target type that FITS the value via "+
+		"--type-override — e.g. `=datetime` for an out-of-range timestamp (MySQL DATETIME covers "+
+		"1000–9999 vs TIMESTAMP's 1970–2038), `=decimal:precision=P,scale=S` for a numeric overflow, "+
+		"or `=text`/`=varchar` to keep the raw value — or fix the source data. "+
+		"Do NOT pass --mysql-sql-mode='' to silence a range/overflow/truncation warning: under "+
+		"non-strict sql_mode MySQL SILENTLY clamps or truncates the offending values (out-of-range "+
+		"dates → 0000-00-00, over-long strings cut, numbers clamped) and the migration exits 0 with "+
+		"corrupted data. --mysql-sql-mode='' is appropriate ONLY for accepting genuinely legacy "+
+		"zero-date data as-is (see docs/operator/migrating-legacy-mysql.md)",
 		table, count, strings.Join(details, "; "), more)
 }
 

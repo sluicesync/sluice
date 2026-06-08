@@ -133,6 +133,11 @@ func TestApplyMappings_RegistryAliases(t *testing.T) {
 		{"jsonb", ir.JSON{Binary: true}},
 		{"json", ir.JSON{Binary: false}},
 		{"bytea", ir.Blob{Size: ir.BlobLong}},
+		{"timestamptz", ir.Timestamp{Precision: 6, WithTimeZone: true}},
+		// datetime: the out-of-range-timestamp escape hatch (→ MySQL
+		// DATETIME(6), range 1000–9999) for PG timestamptz outside MySQL
+		// TIMESTAMP's 1970–2038 window.
+		{"datetime", ir.DateTime{Precision: 6}},
 	}
 	for _, c := range cases {
 		c := c

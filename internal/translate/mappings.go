@@ -203,6 +203,15 @@ var targetTypeRegistry = map[string]ir.Type{
 	// intent operators sometimes encode in DATETIME values. See
 	// ADR-0024.
 	"timestamptz": ir.Timestamp{Precision: 6, WithTimeZone: true},
+	// `datetime` is the data-preserving escape hatch for a PG `timestamptz`
+	// (or any instant) whose value falls outside MySQL `TIMESTAMP`'s
+	// 1970–2038 window: it maps to MySQL `DATETIME(6)` (range 1000–9999),
+	// which holds historical / far-future timestamps the default zoned
+	// TIMESTAMP mapping cannot. sluice already UTC-normalises the value, so
+	// the stored instant is correct; the trade-off is DATETIME's naive
+	// (no session-TZ-conversion-on-read) semantics. The unsigned-bigint /
+	// timestamptz range-overflow notices point operators here.
+	"datetime": ir.DateTime{Precision: 6},
 }
 
 // postgisAliasSubtypes maps the postgis_<subtype> aliases to their
