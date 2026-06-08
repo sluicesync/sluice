@@ -1078,7 +1078,10 @@ func (s *vstreamSnapshotStream) bufferCopyRow(ev *binlogdata.VEvent) error {
 	}
 	tableName := stripKeyspaceFromTable(rev.GetTableName(), rev.GetKeyspace())
 	for _, rc := range rev.GetRowChanges() {
-		row, ok := decodeVStreamRow(rc.GetAfter(), fields, tableName, s.boolWarn)
+		row, ok, err := decodeVStreamRow(rc.GetAfter(), fields, tableName, s.boolWarn)
+		if err != nil {
+			return err
+		}
 		if !ok {
 			// COPY-phase rows always have After populated. A missing
 			// After is malformed; skip it so the rest of the table
@@ -1353,8 +1356,14 @@ func (s *vstreamSnapshotStream) dispatchCDCRow(ctx context.Context, ev *binlogda
 	tableName := stripKeyspaceFromTable(rev.GetTableName(), rev.GetKeyspace())
 
 	for _, rc := range rev.GetRowChanges() {
-		before, beforeOK := decodeVStreamRow(rc.GetBefore(), fields, tableName, s.boolWarn)
-		after, afterOK := decodeVStreamRow(rc.GetAfter(), fields, tableName, s.boolWarn)
+		before, beforeOK, err := decodeVStreamRow(rc.GetBefore(), fields, tableName, s.boolWarn)
+		if err != nil {
+			return err
+		}
+		after, afterOK, err := decodeVStreamRow(rc.GetAfter(), fields, tableName, s.boolWarn)
+		if err != nil {
+			return err
+		}
 		switch {
 		case afterOK && !beforeOK:
 			if err := send(ctx, out, ir.Insert{

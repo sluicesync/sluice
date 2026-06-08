@@ -1062,8 +1062,14 @@ func (r *vstreamCDCReader) dispatchRow(ctx context.Context, ev *binlogdata.VEven
 	}
 
 	for _, rc := range rev.GetRowChanges() {
-		before, beforeOK := decodeVStreamRow(rc.GetBefore(), fields, tableName, r.boolWarn)
-		after, afterOK := decodeVStreamRow(rc.GetAfter(), fields, tableName, r.boolWarn)
+		before, beforeOK, err := decodeVStreamRow(rc.GetBefore(), fields, tableName, r.boolWarn)
+		if err != nil {
+			return err
+		}
+		after, afterOK, err := decodeVStreamRow(rc.GetAfter(), fields, tableName, r.boolWarn)
+		if err != nil {
+			return err
+		}
 		switch {
 		case afterOK && !beforeOK:
 			if err := send(ctx, out, ir.Insert{
@@ -1169,9 +1175,9 @@ func vgtidToShardGtidSlice(vg *binlogdata.VGtid) ([]shardGtid, error) {
 // docs/value-types.md, so cross-engine MySQL→PG paths behave
 // identically whether changes flow through the binlog reader or
 // the VStream reader.
-func decodeVStreamRow(row *query.Row, fields []*query.Field, tableName string, warner *boolRangeWarner) (ir.Row, bool) {
+func decodeVStreamRow(row *query.Row, fields []*query.Field, tableName string, warner *boolRangeWarner) (ir.Row, bool, error) {
 	if row == nil {
-		return nil, false
+		return nil, false, nil
 	}
 	out := make(ir.Row, len(fields))
 	values := row.GetValues()
@@ -1180,7 +1186,7 @@ func decodeVStreamRow(row *query.Row, fields []*query.Field, tableName string, w
 		// Malformed event (length count != field count) — produce
 		// an empty row so the caller surfaces the issue rather
 		// than silently misaligning columns.
-		return out, true
+		return out, true, nil
 	}
 	offset := 0
 	for i, f := range fields {
@@ -1192,6 +1198,20 @@ func decodeVStreamRow(row *query.Row, fields []*query.Field, tableName string, w
 		raw := values[offset : offset+int(l)]
 		offset += int(l)
 		v := decodeVStreamCell(f, raw)
+		// Vector A parity: a zero/partial date arrives as the shared
+		// sentinel (decodeVStreamCell has no error channel). Resolve it
+		// per --zero-date here, where we have the field's name and
+		// nullability — refuse (default) errors the stream loudly, null
+		// carries SQL NULL (refused on a NOT NULL column), epoch
+		// substitutes the representable floor.
+		if zd, isZero := v.(*zeroDateValueError); isZero {
+			col := &ir.Column{Name: f.GetName(), Nullable: vstreamFieldNullable(f)}
+			rv, err := applyZeroDatePolicy(zd, col)
+			if err != nil {
+				return nil, false, fmt.Errorf("mysql/vstream: column %q: %w", f.GetName(), err)
+			}
+			v = rv
+		}
 		// Vector D: a TINYINT(1) value outside {0,1} is collapsed to a
 		// bool here too (same MySQL convention as the binlog / bulk-copy
 		// paths). VStream cells are text-encoded, so parse the literal
@@ -1205,7 +1225,21 @@ func decodeVStreamRow(row *query.Row, fields []*query.Field, tableName string, w
 		}
 		out[f.GetName()] = v
 	}
-	return out, true
+	return out, true, nil
+}
+
+// mysqlNotNullFlag is the MySQL protocol column flag bit for NOT NULL
+// (NOT_NULL_FLAG). Vitess populates [query.Field.Flags] from the source
+// column's flags.
+const mysqlNotNullFlag = 1
+
+// vstreamFieldNullable reports whether a VStream field is nullable. An
+// unset NOT_NULL bit (including an unpopulated Flags) is treated as
+// nullable, so --zero-date=null errs on the side of carrying the value;
+// a genuine NOT NULL target column then refuses the NULL at write time,
+// loudly — never silently.
+func vstreamFieldNullable(f *query.Field) bool {
+	return f.GetFlags()&mysqlNotNullFlag == 0
 }
 
 // decodeVStreamCell maps a single Vitess-wire cell to its IR-Row
@@ -1293,13 +1327,22 @@ func decodeVStreamCell(field *query.Field, raw []byte) any {
 		}
 		return strings.Split(s, ",")
 	case query.Type_DATE, query.Type_DATETIME, query.Type_TIMESTAMP:
-		t, err := parseVStreamDateTime(t, raw)
+		tv, err := parseVStreamDateTime(t, raw)
 		if err != nil {
-			// Malformed date — surface bytes so the consumer
+			var zd *zeroDateValueError
+			if errors.As(err, &zd) {
+				// Zero/partial date — hand the sentinel up so
+				// decodeVStreamRow resolves it per --zero-date
+				// (Vector A parity). Returned as the cell VALUE
+				// (decodeVStreamCell has no error channel); the
+				// row decoder type-asserts and applies the policy.
+				return zd
+			}
+			// Genuinely malformed — surface bytes so the consumer
 			// notices rather than silently misinterpreting.
 			return copyBytes(raw)
 		}
-		return t
+		return tv
 	case query.Type_TIME:
 		// HH:MM:SS[.fffff] textual. The binlog reader returns the
 		// same string shape; matching here keeps cross-engine
@@ -1361,6 +1404,22 @@ func isMySQLBoolColumnType(columnType string) bool {
 // doesn't — MySQL DATETIME/TIMESTAMP wire values are zone-agnostic).
 func parseVStreamDateTime(t query.Type, raw []byte) (time.Time, error) {
 	s := string(raw)
+	// Zero/partial dates ('0000-00-00', 'YYYY-00-DD', 'YYYY-MM-00') are
+	// not real calendar values; surface the shared sentinel so the caller
+	// resolves them per --zero-date, exactly as the bulk-copy / binlog
+	// decodeTime path does (Vector A parity). time.Parse would otherwise
+	// reject them with a generic "out of range" error, which the old code
+	// turned into a raw-bytes passthrough — a confusing downstream failure
+	// rather than the operator's chosen zero-date policy. A genuinely
+	// malformed but non-zero date (month 13, Feb 30) is NOT a zero date
+	// and still falls through to the time.Parse hard error below.
+	// (An empty cell isn't a concern here: VStream signals NULL via a
+	// negative length, decoded before this function, and serializes a zero
+	// DATE as the literal "0000-00-00" — never an empty string. So unlike
+	// decodeTime, there's no empty-string zero-date case to handle.)
+	if isMySQLZeroDate(s) {
+		return time.Time{}, &zeroDateValueError{raw: s}
+	}
 	if t == query.Type_DATE {
 		return time.Parse("2006-01-02", s)
 	}

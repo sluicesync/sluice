@@ -1423,7 +1423,10 @@ func TestDecodeVStreamRow_TinyInt1OutOfRangeWarns(t *testing.T) {
 	warner := newBoolRangeWarner()
 
 	// id=1, active=2 (out of range) -> active decodes true, warns once.
-	out, ok := decodeVStreamRow(&query.Row{Lengths: []int64{1, 1}, Values: []byte("12")}, fields, "users", warner)
+	out, ok, err := decodeVStreamRow(&query.Row{Lengths: []int64{1, 1}, Values: []byte("12")}, fields, "users", warner)
+	if err != nil {
+		t.Fatalf("decodeVStreamRow: %v", err)
+	}
 	if !ok {
 		t.Fatal("decodeVStreamRow ok=false")
 	}
@@ -1431,7 +1434,9 @@ func TestDecodeVStreamRow_TinyInt1OutOfRangeWarns(t *testing.T) {
 		t.Errorf("active = %#v; want true (non-zero -> true)", out["active"])
 	}
 	// id=3, active=127 -> still out of range, must NOT warn again.
-	decodeVStreamRow(&query.Row{Lengths: []int64{1, 3}, Values: []byte("3127")}, fields, "users", warner)
+	if _, _, err := decodeVStreamRow(&query.Row{Lengths: []int64{1, 3}, Values: []byte("3127")}, fields, "users", warner); err != nil {
+		t.Fatalf("decodeVStreamRow: %v", err)
+	}
 
 	o := buf.String()
 	if c := strings.Count(o, "column=users.active"); c != 1 {
@@ -1443,8 +1448,113 @@ func TestDecodeVStreamRow_TinyInt1OutOfRangeWarns(t *testing.T) {
 
 	// In-range bool (0/1) never warns.
 	buf.Reset()
-	decodeVStreamRow(&query.Row{Lengths: []int64{1, 1}, Values: []byte("10")}, fields, "users", newBoolRangeWarner())
+	if _, _, err := decodeVStreamRow(&query.Row{Lengths: []int64{1, 1}, Values: []byte("10")}, fields, "users", newBoolRangeWarner()); err != nil {
+		t.Fatalf("decodeVStreamRow: %v", err)
+	}
 	if strings.Contains(buf.String(), "users.active") {
 		t.Errorf("in-range value warned:\n%s", buf.String())
 	}
+}
+
+// TestDecodeVStreamCell_ZeroDateSentinel pins Vector A VStream parity at the
+// cell level: a zero/partial date decodes to the shared *zeroDateValueError
+// sentinel (resolved by decodeVStreamRow per --zero-date), a valid date to
+// time.Time, and a genuinely malformed non-zero date to raw bytes.
+func TestDecodeVStreamCell_ZeroDateSentinel(t *testing.T) {
+	mk := func(ct string, qt query.Type) *query.Field {
+		return &query.Field{Type: qt, ColumnType: ct}
+	}
+	for _, c := range []struct {
+		name string
+		f    *query.Field
+		raw  string
+	}{
+		{"date all-zero", mk("date", query.Type_DATE), "0000-00-00"},
+		{"date zero-month", mk("date", query.Type_DATE), "2026-00-15"},
+		{"date zero-day", mk("date", query.Type_DATE), "2026-06-00"},
+		{"datetime all-zero", mk("datetime", query.Type_DATETIME), "0000-00-00 00:00:00"},
+		{"timestamp zero-day", mk("timestamp", query.Type_TIMESTAMP), "2026-06-00 01:02:03"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			got := decodeVStreamCell(c.f, []byte(c.raw))
+			if _, ok := got.(*zeroDateValueError); !ok {
+				t.Fatalf("decodeVStreamCell(%q) = %T; want *zeroDateValueError", c.raw, got)
+			}
+		})
+	}
+	// Valid date still decodes to time.Time.
+	if got := decodeVStreamCell(mk("date", query.Type_DATE), []byte("2026-06-07")); func() bool { _, ok := got.(*zeroDateValueError); return ok }() {
+		t.Errorf("valid date returned the zero-date sentinel: %#v", got)
+	}
+	// Genuinely malformed non-zero date stays raw bytes (loud downstream).
+	if got := decodeVStreamCell(mk("date", query.Type_DATE), []byte("2026-13-40")); func() bool { _, ok := got.([]byte); return !ok }() {
+		t.Errorf("malformed date = %T; want []byte passthrough", got)
+	}
+}
+
+// TestDecodeVStreamRow_ZeroDatePolicy pins that decodeVStreamRow resolves the
+// zero-date sentinel per the configured --zero-date policy: error refuses
+// loudly (naming the column), null carries nil (refused on a NOT NULL field),
+// epoch substitutes the representable floor.
+func TestDecodeVStreamRow_ZeroDatePolicy(t *testing.T) {
+	// Nullable DATE field "d" (NOT_NULL flag unset) + a non-null id.
+	fields := []*query.Field{
+		{Name: "id", Type: query.Type_INT64, ColumnType: "bigint", Flags: mysqlNotNullFlag},
+		{Name: "d", Type: query.Type_DATE, ColumnType: "date"},
+	}
+	rowZero := func() *query.Row {
+		return &query.Row{Lengths: []int64{1, 10}, Values: []byte("10000-00-00")} // id=1, d=0000-00-00
+	}
+
+	t.Run("error refuses loudly", func(t *testing.T) {
+		withZeroDatePolicy(t, zeroDateRefuse)
+		_, _, err := decodeVStreamRow(rowZero(), fields, "events", newBoolRangeWarner())
+		if err == nil {
+			t.Fatal("err = nil; want a zero-date refusal")
+		}
+		if !strings.Contains(err.Error(), `"d"`) || !strings.Contains(err.Error(), "zero/partial date") {
+			t.Errorf("err = %q; want it to name column d + the zero/partial date", err)
+		}
+	})
+
+	t.Run("null carries nil", func(t *testing.T) {
+		withZeroDatePolicy(t, zeroDateAsNull)
+		out, _, err := decodeVStreamRow(rowZero(), fields, "events", newBoolRangeWarner())
+		if err != nil {
+			t.Fatalf("err = %v; want nil under null policy", err)
+		}
+		if out["d"] != nil {
+			t.Errorf("d = %#v; want nil (NULL)", out["d"])
+		}
+	})
+
+	t.Run("epoch substitutes floor", func(t *testing.T) {
+		withZeroDatePolicy(t, zeroDateAsEpoch)
+		out, _, err := decodeVStreamRow(rowZero(), fields, "events", newBoolRangeWarner())
+		if err != nil {
+			t.Fatalf("err = %v; want nil under epoch policy", err)
+		}
+		got, ok := out["d"].(time.Time)
+		if !ok {
+			t.Fatalf("d = %T; want time.Time", out["d"])
+		}
+		if !got.Equal(zeroDateEpochValue) {
+			t.Errorf("d = %v; want epoch sentinel %v", got, zeroDateEpochValue)
+		}
+	})
+
+	t.Run("null on NOT NULL field refuses", func(t *testing.T) {
+		withZeroDatePolicy(t, zeroDateAsNull)
+		nnFields := []*query.Field{
+			{Name: "d", Type: query.Type_DATE, ColumnType: "date", Flags: mysqlNotNullFlag},
+		}
+		nnRow := &query.Row{Lengths: []int64{10}, Values: []byte("0000-00-00")}
+		_, _, err := decodeVStreamRow(nnRow, nnFields, "events", newBoolRangeWarner())
+		if err == nil {
+			t.Fatal("err = nil; want a NOT NULL refusal under --zero-date=null")
+		}
+		if !strings.Contains(err.Error(), "NOT NULL") {
+			t.Errorf("err = %q; want it to name the NOT NULL conflict", err)
+		}
+	})
 }
