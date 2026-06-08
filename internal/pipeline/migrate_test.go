@@ -271,7 +271,7 @@ func (e *staleBackendOrderEngine) DetectStaleBackends(context.Context, string, [
 
 func (e *staleBackendOrderEngine) OpenRowWriter(context.Context, string) (ir.RowWriter, error) {
 	return &staleBackendOrderRowWriter{
-		recordingRowWriter: &recordingRowWriter{phaseLog: &e.phaseLog},
+		recordingRowWriter: &recordingRowWriter{phaseLog: &e.phaseLog, mu: &e.mu},
 		order:              e.order,
 	}, nil
 }
@@ -446,6 +446,10 @@ type recordingEngine struct {
 	openSchemaWriterCalls int
 	openRowWriterCalls    int
 	phaseLog              []string
+	// mu guards phaseLog appends from the recordingRowWriters this engine
+	// hands out: under the ADR-0076 cross-table pool, peer tables call
+	// WriteRows concurrently on sibling writers that share this slice.
+	mu sync.Mutex
 }
 
 func newRecordingEngine(name string) *recordingEngine {
@@ -470,7 +474,7 @@ func (e *recordingEngine) OpenRowReader(_ context.Context, _ string) (ir.RowRead
 
 func (e *recordingEngine) OpenRowWriter(_ context.Context, _ string) (ir.RowWriter, error) {
 	e.openRowWriterCalls++
-	return &recordingRowWriter{phaseLog: &e.phaseLog}, nil
+	return &recordingRowWriter{phaseLog: &e.phaseLog, mu: &e.mu}, nil
 }
 
 func (*recordingEngine) OpenCDCReader(context.Context, string) (ir.CDCReader, error) {
@@ -538,10 +542,16 @@ func (*recordingRowReader) Err() error { return nil }
 
 type recordingRowWriter struct {
 	phaseLog *[]string
+	mu       *sync.Mutex // shared with the owning recordingEngine; guards phaseLog
 }
 
 func (w *recordingRowWriter) WriteRows(_ context.Context, table *ir.Table, _ <-chan ir.Row) error {
+	// Guard the shared phaseLog append: the ADR-0076 cross-table pool calls
+	// WriteRows on sibling writers concurrently. (Schema-phase appends run
+	// strictly before/after the copy pool, so they need no lock.)
+	w.mu.Lock()
 	*w.phaseLog = append(*w.phaseLog, "WriteRows:"+table.Name)
+	w.mu.Unlock()
 	return nil
 }
 
