@@ -6,6 +6,29 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.99.28] - 2026-06-08
+
+### Fixed
+
+- **A silent value clamp/truncation under `--mysql-sql-mode=''` is now reported
+  loudly (Vector B).** Passing `--mysql-sql-mode=''` (the legacy-data escape
+  hatch) relaxes the MySQL target so it accepts legacy zero-dates — but it also
+  makes MySQL **silently** clamp or truncate any *other* out-of-range value on
+  write (a numeric overflow → MAX, an over-long string → cut). The post-write
+  warning guard previously skipped its check entirely under relaxed mode, so
+  those coercions passed unannounced. sluice now emits a loud **one-time-per-
+  column WARN** (not a refusal — you opted into relaxed mode) naming the
+  coercions and the data-preserving remedy (`--type-override`), on all three
+  bulk-copy write paths (`LOAD DATA`, batched INSERT, and the idempotent upsert
+  path used on resume / parallel chunked copy / cold-start). Under strict
+  sql_mode the value is still refused, as before. Drop `--mysql-sql-mode=''` to
+  refuse instead of coerce.
+- **Range/overflow refusal messages no longer render an empty `Examples: []`.**
+  The warning guard read `@@warning_count` before `SHOW WARNINGS`, and that
+  intervening read clears MySQL's diagnostic list — so the strict-mode refusal
+  (and the NaN/±Infinity refusal) listed no offending values. The guard now
+  reads `SHOW WARNINGS` first, so the refusal names the values.
+
 ## [0.99.27] - 2026-06-08
 
 ### Added
