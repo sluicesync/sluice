@@ -138,6 +138,11 @@ func TestApplyMappings_RegistryAliases(t *testing.T) {
 		// DATETIME(6), range 1000–9999) for PG timestamptz outside MySQL
 		// TIMESTAMP's 1970–2038 window.
 		{"datetime", ir.DateTime{Precision: 6}},
+		// smallint/integer/int: the Vector D escape hatch to preserve a
+		// MySQL TINYINT(1) column that holds real integers (not a 0/1 bool).
+		{"smallint", ir.Integer{Width: 16}},
+		{"integer", ir.Integer{Width: 32}},
+		{"int", ir.Integer{Width: 32}},
 	}
 	for _, c := range cases {
 		c := c

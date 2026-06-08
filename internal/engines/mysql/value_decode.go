@@ -6,6 +6,7 @@ package mysql
 import (
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -116,6 +117,60 @@ func decodeBoolean(raw any) (any, error) {
 		return v != "" && v != "0", nil
 	}
 	return nil, fmt.Errorf("mysql: cannot decode %T as Boolean", raw)
+}
+
+// tinyBoolOutOfRange reports the underlying integer when raw — a cell about
+// to be collapsed to a Go bool for a TINYINT(1)/ir.Boolean column — holds an
+// integer other than 0 or 1. MySQL's boolean convention maps every non-zero
+// value to true, so 2 / 127 / -1 / -128 lose their real value (Vector D);
+// the reader uses this to WARN loudly without changing the carried value.
+//
+// Only integer-family sources can be out of range. bool, BIT(1) bytes, and
+// string sources are inherently boolean (decodeBoolean already canonicalises
+// them) and are reported as in-range. A column reaches ir.Boolean only via a
+// SIGNED tinyint(1) (the schema reader maps unsigned/auto-increment
+// tinyint(1) to ir.Integer), so the value is always in the int8 range in
+// practice; the wider integer cases are handled defensively to mirror
+// decodeBoolean's accepted set.
+func tinyBoolOutOfRange(raw any) (n int64, oob bool) {
+	var i int64
+	switch v := raw.(type) {
+	case int64:
+		i = v
+	case int32:
+		i = int64(v)
+	case int16:
+		i = int64(v)
+	case int8:
+		i = int64(v)
+	case int:
+		i = int64(v)
+	case uint64:
+		if v > 1 {
+			// Far outside tinyint(1) in practice; clamp the reported
+			// example to int64 max rather than overflow.
+			if v > math.MaxInt64 {
+				return math.MaxInt64, true
+			}
+			return int64(v), true
+		}
+		i = int64(v)
+	case uint32:
+		i = int64(v)
+	case uint16:
+		i = int64(v)
+	case uint8:
+		i = int64(v)
+	case uint:
+		i = int64(v)
+	default:
+		// bool, []byte, string: inherently boolean, never out of range.
+		return 0, false
+	}
+	if i == 0 || i == 1 {
+		return 0, false
+	}
+	return i, true
 }
 
 // decodeInteger normalises the various integer widths a MySQL row

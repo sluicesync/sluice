@@ -212,6 +212,20 @@ var targetTypeRegistry = map[string]ir.Type{
 	// (no session-TZ-conversion-on-read) semantics. The unsigned-bigint /
 	// timestamptz range-overflow notices point operators here.
 	"datetime": ir.DateTime{Precision: 6},
+	// `smallint` / `integer` / `int` are the data-preserving escape hatch for
+	// a MySQL `TINYINT(1)` column that stores real integers (2, 127, -1, …)
+	// rather than a 0/1 boolean. sluice maps `TINYINT(1)` to boolean by the
+	// documented MySQL convention, which silently collapses every non-zero
+	// value to true (Vector D); overriding the column to one of these integer
+	// types preserves the value end-to-end (the override rewrites the IR type
+	// the reader decodes with, so the cell is read as an integer, not a bool).
+	// `smallint` is the safe floor — a `TINYINT(1)` (8-bit) value always fits a
+	// 16-bit SMALLINT, and unlike a `tinyint` override it can't re-emit a MySQL
+	// `TINYINT(1)` target column that would re-trigger the boolean mapping on a
+	// round-trip. The TINYINT(1)-out-of-range WARN points operators here.
+	"smallint": ir.Integer{Width: 16},
+	"integer":  ir.Integer{Width: 32},
+	"int":      ir.Integer{Width: 32},
 }
 
 // postgisAliasSubtypes maps the postgis_<subtype> aliases to their

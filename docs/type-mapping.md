@@ -136,7 +136,7 @@ Each leaf type implements `isType()` so the compiler enforces that only IR types
 
 | MySQL declaration             | IR type                                            | Notes |
 |-------------------------------|----------------------------------------------------|-------|
-| `TINYINT(1)`                  | `Boolean{}`                                        | Convention. Configurable; see overrides. |
+| `TINYINT(1)`                  | `Boolean{}`                                        | Convention. A value outside `{0,1}` is collapsed to `true` by the boolean mapping; the reader WARNs loudly per column. Override with `--type-override col=smallint`/`int` to preserve the integer. |
 | `TINYINT` (any other width)   | `Integer{Width: 8}`                                | |
 | `SMALLINT`                    | `Integer{Width: 16}`                               | |
 | `MEDIUMINT`                   | `Integer{Width: 24}`                               | Becomes `Integer{Width: 32}` when emitted to Postgres. |
@@ -260,6 +260,14 @@ PostgreSQL has no unsigned integer types.
 - **The narrowing is surfaced LOUDLY, never silently.** Both `sluice schema preview` and `sluice migrate` preflight emit a dedicated, operator-actionable **unsigned-bigint range-narrowing notice** that names every affected `table.column`, states the `2^63-1` ceiling, and gives the per-column override. It is an *advisory notice* (the migration proceeds — the universal ORM schema must still migrate), not a hard refusal, but it is visible at both surfaces (a section in `schema preview` output / JSON `unsigned_bigint_narrowings`, and a `WARN` log line at `migrate` preflight). The loud-failure tenet is satisfied by the loud notice, not by silently narrowing.
 
 **Override:** for a column that genuinely stores values above `2^63-1`, supply `--type-override TABLE.COL=numeric` (or the per-column `mappings:` hook) to keep the full unsigned 64-bit range as `numeric(20,0)`. Note such a column then *cannot* also be an `IDENTITY`/`AUTO_INCREMENT` key — that combination is impossible in PostgreSQL and is precisely why the default cannot be `numeric` for autoincrement keys.
+
+### MySQL `TINYINT(1)` used as an integer (not a boolean)
+
+`TINYINT(1)` is MySQL's conventional boolean, and sluice maps it to `Boolean{}` by default (the `(1)` is only a display width; the column physically stores the full signed 8-bit range, `-128…127`). Some schemas use `TINYINT(1)` as a genuine small integer — a status code, a small enum, a count — so it can hold values outside `{0,1}`.
+
+**Default policy:** keep the documented `TINYINT(1)`→`Boolean` mapping (changing it would break the overwhelming majority of schemas that *do* mean boolean), but **detect and WARN loudly** when a value outside `{0,1}` is read. The boolean decode collapses every non-zero value to `true`, so `2`/`127`/`-1` lose their real value; sluice now emits a one-time-per-column `WARN` (naming the `table.column` and an example value) on the bulk-copy / snapshot read path instead of doing it silently. The CDC tail is a tracked follow-up.
+
+**Override:** for a column that genuinely stores integers, supply `--type-override TABLE.COL=smallint` (or `=int`/`=integer`, or the per-column `mappings:` hook) to preserve the value end-to-end. The override rewrites the IR type the **reader** decodes with, so the cell is read as an integer (not collapsed to a bool) and carried faithfully to the target. `smallint` (16-bit) is the recommended floor: a `TINYINT(1)` value always fits, and — unlike a `tinyint` override — it cannot re-emit a MySQL `TINYINT(1)` target column that would re-trigger the boolean mapping on a round-trip.
 
 ### Unconstrained Postgres `numeric` (no precision/scale) — owner-surface design call (v0.69.x / Bug #69)
 
