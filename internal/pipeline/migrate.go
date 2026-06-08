@@ -187,6 +187,21 @@ type Migrator struct {
 	// See ADR-0019.
 	BulkParallelism int
 
+	// TableParallelism is the number of tables copied CONCURRENTLY in
+	// the bulk-copy phase — the cross-table axis (roadmap item 3(a),
+	// ADR-0076), composed with the within-table BulkParallelism axis.
+	// The two multiply: at most TableParallelism × (effective
+	// within-table parallelism) target connections are open at once, and
+	// that product is bounded by the target's connection budget at the
+	// single budget chokepoint (see [resolveCopyParallelismBudget]).
+	//
+	// Zero means use the default — a small constant (4, matching
+	// pgcopydb's --table-jobs default) bounded by the connection budget.
+	// 1 disables cross-table concurrency (the pre-ADR-0076 serial-table
+	// behaviour). Only the `migrate` path drives this; the sync
+	// cold-start path stays serial by design (ADR-0076).
+	TableParallelism int
+
 	// BulkParallelMinRows is the row-count threshold below which a
 	// table is copied with a single reader/writer pair regardless of
 	// BulkParallelism. The per-chunk overhead (extra connections,
@@ -844,7 +859,7 @@ func (m *Migrator) runSingleDatabase(ctx context.Context, scope *multiDBScope) e
 	// --bulk-parallelism can't exhaust a small target's slots mid-COPY.
 	// No-op on engines without a connection-slot model (MySQL); refuses
 	// loudly if the target has no free budget at all.
-	copyParallelism, err := resolveTargetCopyParallelism(
+	copyParallelism, budgetReport, err := resolveTargetCopyParallelism(
 		ctx, m.Target, m.TargetDSN,
 		resolveBulkParallelism(m.BulkParallelism, runtime.NumCPU()),
 		m.MaxTargetConnections,
@@ -853,12 +868,34 @@ func (m *Migrator) runSingleDatabase(ctx context.Context, scope *multiDBScope) e
 		return markFailed(ctx, rc, state, ir.MigrationPhasePending, err)
 	}
 
+	// Cross-table copy pool (ADR-0076, roadmap item 3(a)). Split the
+	// single connection budget across the table × within-table axes at
+	// the SINGLE chokepoint so their PRODUCT can't exhaust the target's
+	// slots (gotcha 2). The within factor (copyParallelism) is satisfied
+	// first; the table factor gets whatever whole multiples remain, also
+	// bounded by --max-target-connections. The within factor is then
+	// pinned to its split value so each table's gate opens exactly
+	// withinP connections — the product bound holds by construction.
+	tableParallelism, withinParallelism := resolveCopyParallelismBudget(
+		copyParallelism,
+		resolveTableParallelism(m.TableParallelism),
+		budgetReport.CopyBudget,
+		m.MaxTargetConnections,
+	)
+	slog.InfoContext(
+		ctx, "bulk-copy parallelism resolved",
+		slog.Int("table_parallelism", tableParallelism),
+		slog.Int("within_table_parallelism", withinParallelism),
+		slog.Int("max_concurrent_connections", tableParallelism*withinParallelism),
+		slog.Int("copy_budget", budgetReport.CopyBudget),
+	)
+
 	parallelDeps := &parallelBulkCopyDeps{
 		source:         m.Source,
 		target:         m.Target,
 		sourceDSN:      m.SourceDSN,
 		targetDSN:      m.TargetDSN,
-		parallelism:    copyParallelism,
+		parallelism:    withinParallelism,
 		minRows:        resolveBulkParallelMinRows(m.BulkParallelMinRows, len(schema.Tables)),
 		maxBufferBytes: m.MaxBufferBytes,
 		// ADR-0043 gate (3): --force-cold-start skipped the Bug 9
@@ -867,7 +904,7 @@ func (m *Migrator) runSingleDatabase(ctx context.Context, scope *multiDBScope) e
 		forceColdStart: m.ForceColdStart,
 	}
 
-	if err := runBulkCopyPhases(ctx, rc, &state, schema, rr, sw, rw, resuming, m.BulkBatchSize, parallelDeps, m.Redactor, m.InjectShardColumn); err != nil {
+	if err := runBulkCopyPhases(ctx, rc, &state, schema, rr, sw, rw, resuming, m.BulkBatchSize, parallelDeps, tableParallelism, m.Redactor, m.InjectShardColumn); err != nil {
 		return err
 	}
 
@@ -1041,6 +1078,14 @@ func runBulkCopyWithOpts(
 			}
 		}
 	}
+	// This (the sync cold-start path) stays SERIAL by design — it is NOT
+	// wired into the cross-table copy pool (ADR-0076). It has no
+	// parallelBulkCopyDeps, no connection budget, and no resume-state
+	// mutex, and the snapshot-pinning + idempotent-COPY interplay
+	// (CopyDurableProgressSink watermark, in-flight ordering) is delicate
+	// enough that parallelising it is a separate, deliberately deferred
+	// chunk. Only `sluice migrate` (runBulkCopyPhases) drives cross-table
+	// concurrency.
 	for _, table := range schema.Tables {
 		copyFn := copyTable
 		if needsIdempotent {
@@ -1216,6 +1261,7 @@ func runBulkCopyPhases(
 	resuming bool,
 	bulkBatchSize int,
 	parallel *parallelBulkCopyDeps,
+	tableParallelism int,
 	redactor *redact.Registry,
 	shard ShardColumnSpec,
 ) error {
@@ -1238,15 +1284,20 @@ func runBulkCopyPhases(
 	if state.TableProgress == nil {
 		state.TableProgress = map[string]ir.TableProgress{}
 	}
-	// stateMu serialises access to state.TableProgress across the
-	// per-chunk goroutines spawned by the parallel-copy path. The
-	// map itself is not safe for concurrent writes; each chunk takes
-	// the mutex when checkpointing its cursor.
+	// stateMu serialises access to state.TableProgress across BOTH
+	// concurrency axes: the per-chunk goroutines spawned by the
+	// within-table parallel-copy path AND the cross-table copy pool
+	// below (ADR-0076). The map itself is not safe for concurrent
+	// writes; every writer takes the mutex and clones the state under
+	// the lock before the JSON-encoding writeState call (peer tables
+	// write distinct keys of the same map — distinct keys under one
+	// mutex is exactly cloneStateForWrite's design).
 	var stateMu sync.Mutex
-	for _, table := range schema.Tables {
-		if err := bulkCopyOneTable(ctx, rc, state, &stateMu, rows, rw, table, resuming, bulkBatchSize, parallel, redactor, shard); err != nil {
-			return err
-		}
+	if err := runBulkCopyTablePool(
+		ctx, rc, state, &stateMu, schema, rows, rw,
+		resuming, bulkBatchSize, parallel, tableParallelism, redactor, shard,
+	); err != nil {
+		return err
 	}
 	slog.InfoContext(ctx, "migration: phase complete", slog.String("phase", string(ir.MigrationPhaseBulkCopy)))
 

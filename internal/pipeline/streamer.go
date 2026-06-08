@@ -2709,7 +2709,7 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 	// operator --max-target-connections ceiling is honoured. No-op on
 	// engines without a connection-slot model (MySQL). Discarded
 	// effective value (it can only be 1 here); we run it for the refusal.
-	if _, err := resolveTargetCopyParallelism(ctx, s.Target, s.TargetDSN, 1, s.MaxTargetConnections); err != nil {
+	if _, _, err := resolveTargetCopyParallelism(ctx, s.Target, s.TargetDSN, 1, s.MaxTargetConnections); err != nil {
 		closeIf(rw)
 		closeIf(sw)
 		_ = stream.Close()

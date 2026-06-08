@@ -85,6 +85,31 @@ const adaptiveBulkParallelMinRowsFloor int64 = 10_000
 // I/O, both of which max out well before 8 parallel writers.
 const defaultBulkParallelism = 8
 
+// defaultTableParallelism is the cross-table copy-pool width when
+// --table-parallelism is left at the 0 = auto sentinel (ADR-0076). It
+// matches pgcopydb's --table-jobs default of 4: enough to keep cores
+// busy across a many-medium-table schema without aggressively
+// oversubscribing the target's connection budget (the auto value is
+// further bounded by the budget split in [resolveCopyParallelismBudget],
+// so this constant is the upper end of the auto range, not a hard floor).
+const defaultTableParallelism = 4
+
+// resolveTableParallelism returns the effective cross-table parallelism,
+// applying the "0 = use defaultTableParallelism" rule. 1 disables
+// cross-table concurrency (the pre-ADR-0076 serial-table behaviour);
+// negative values clamp to 1 (defensive against bad CLI input). The
+// budget split downstream further bounds this so the table × within
+// product fits the target's connection budget.
+func resolveTableParallelism(configured int) int {
+	if configured < 0 {
+		return 1
+	}
+	if configured == 0 {
+		return defaultTableParallelism
+	}
+	return configured
+}
+
 // chunkBoundary describes one chunk's PK range. LowerPK is the
 // exclusive lower bound (rows with PK > LowerPK), UpperPK is the
 // inclusive upper bound (rows with PK <= UpperPK). nil bounds mean

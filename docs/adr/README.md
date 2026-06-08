@@ -6,7 +6,7 @@ ADRs are numbered in the order they were proposed. A few notable conventions:
 
 - **Status** lines at the top of each ADR record whether the decision is Accepted, Superseded, or Discovery (research-only).
 - Some ADRs were promoted from a design doc in `docs/dev/notes/` after extended dialogue; the dialogue artifacts stay in `notes/` for traceability.
-- **ADR-0051 collision:** two ADRs share the number — `adr-0051-core-pg-type-verbatim-carry.md` (the canonical one referenced by the roadmap and `ir.VerbatimType`) and `adr-0051-pg-cdc-source-identity-pinning.md` (a sibling concern). Renumbering hasn't been done because both are widely cross-referenced; future ADRs continue from 0076.
+- **ADR-0051 collision:** two ADRs share the number — `adr-0051-core-pg-type-verbatim-carry.md` (the canonical one referenced by the roadmap and `ir.VerbatimType`) and `adr-0051-pg-cdc-source-identity-pinning.md` (a sibling concern). Renumbering hasn't been done because both are widely cross-referenced; future ADRs continue from 0077.
 - **ADR-0066 collision:** `adr-0066-postgres-trigger-engine-variant.md` is the actual ADR; `adr-0066-task-62-planning-brief.md` is a planning brief for the same chunk and not a true ADR.
 
 ## Foundations (0001–0009)
@@ -130,6 +130,7 @@ ADRs are numbered in the order they were proposed. A few notable conventions:
 | [0073](adr-0073-vitess-internal-and-online-ddl-tables.md) | Exclude Vitess internal / online-DDL `_vt_*` tables from COPY+CDC; survive an online-DDL cutover zero-loss |
 | [0074](adr-0074-multi-database-mysql-migration-and-sync.md) | Accepted (shipped v0.99.16) — multi-database MySQL migrate + sync (one server → N databases → N target namespaces; server-wide binlog CDC with per-event apply-routing) |
 | [0075](adr-0075-postgres-source-multi-schema-migration-and-sync.md) | Accepted (shipped v0.99.24) — Postgres-source multi-schema migrate + sync (one PG database → N schemas → N target namespaces; one database-wide logical slot, per-event apply-routing — the symmetric reverse of ADR-0074) |
+| [0076](adr-0076-cross-table-copy-worker-pool.md) | Accepted (shipped) — cross-table copy worker pool for `sluice migrate` (`--table-parallelism`; bounded errgroup over tables composed with within-table `--bulk-parallelism`; combined budget split at the single chokepoint so the product can't exhaust the target's slots; resume-under-concurrency discipline; sync path stays serial). Roadmap item 3(a) |
 
 ## Notes / dialogue prep / readiness briefs
 

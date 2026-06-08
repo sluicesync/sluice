@@ -185,6 +185,8 @@ type MigrateCmd struct {
 
 	BulkParallelism int `help:"Number of parallel reader/writer pairs per table during bulk copy. Tables above --bulk-parallel-min-rows are split into this many PK ranges and copied concurrently. Tables without a single integer PK fall back to single-reader. 0 means use min(8, NumCPU); 1 disables parallelism. See ADR-0019." default:"0" placeholder:"N"`
 
+	TableParallelism int `help:"Number of tables copied CONCURRENTLY during bulk copy — the cross-table axis (pgcopydb --table-jobs), composed with the within-table --bulk-parallelism axis. Closes the many-medium-table gap where each table sat below the within-table-split threshold and the table loop ran them serially, leaving cores idle. The two axes MULTIPLY: at most --table-parallelism × (effective --bulk-parallelism) connections open against the target at once, and that PRODUCT is bounded by the target's connection budget (and --max-target-connections) at a single chokepoint — within-table parallelism is satisfied first, the table axis gets whatever remains. 0 (default) = auto: 4 (pgcopydb's --table-jobs default), bounded by the budget split. 1 disables cross-table concurrency (one table at a time). Only the migrate path uses this; the sync cold-start path stays serial by design. See ADR-0076." default:"0" placeholder:"N"`
+
 	MaxTargetConnections int `help:"Explicit ceiling on the number of connections the bulk-copy pool opens against the target (connection-resilience item 4). 0 (default) = auto: sluice probes the target's connection-slot budget (Postgres max_connections / role / database limits minus in-use and a small reserve) and caps --bulk-parallelism to fit, refusing loudly if no budget is free. When set, it's an explicit upper bound the auto-cap further bounds — it never raises --bulk-parallelism. Inert against engines without a connection-slot model (MySQL target)." default:"0" placeholder:"N"`
 
 	ReapStaleBackends bool `help:"Terminate sluice's OWN orphaned backends on the target during the cold-start preflight (connection-resilience Phase 2, item 2). Detection runs ALWAYS and reports loudly; this flag authorises pg_terminate_backend on each orphan. An orphan is a backend whose application_name carries the 'sluice/' prefix, owned by the connecting role, NOT the current session, and either idle-in-transaction or holding a lock on a relation sluice is about to write — typically a SIGKILL'd / OOM'd prior run whose server-side COPY backend still holds a target-table lock and a connection slot. Default off — detect-and-report is the safe baseline, because a legitimately-running concurrent sluice process on the same target is a real possibility (the report is shown first so you can tell them apart). Termination is always scoped to your own sluice backends; it never touches another role's or a non-sluice session, and needs no superuser grant. Inert against engines without a backend model (MySQL target)."`
@@ -323,6 +325,7 @@ func (m *MigrateCmd) Run(g *Globals) error {
 		ResetTargetData:       m.ResetTargetData,
 		BulkBatchSize:         m.BulkBatchSize,
 		BulkParallelism:       m.BulkParallelism,
+		TableParallelism:      m.TableParallelism,
 		BulkParallelMinRows:   m.BulkParallelMinRows,
 		MaxTargetConnections:  m.MaxTargetConnections,
 		ReapStaleBackends:     m.ReapStaleBackends,

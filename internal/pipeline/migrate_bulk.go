@@ -79,7 +79,14 @@ func bulkCopyOneTable(
 	redactor *redact.Registry,
 	shard ShardColumnSpec,
 ) error {
+	// Read the resume classification under the lock: peer tables in the
+	// cross-table pool (ADR-0076) write distinct keys of state.TableProgress
+	// concurrently, and the Go map is not safe for a concurrent read +
+	// write. classifyTableForResume only reads this table's own key, but it
+	// indexes the shared map, so it takes the same mutex every writer does.
+	stateMu.Lock()
 	action := classifyTableForResume(*state, table.Name, resuming)
+	stateMu.Unlock()
 	switch action {
 	case resumeActionSkip:
 		slog.InfoContext(ctx, "migration: skipping completed table",
@@ -90,12 +97,16 @@ func bulkCopyOneTable(
 			slog.String("table", table.Name))
 		if err := truncateForResume(ctx, rw, table); err != nil {
 			wrapped := fmt.Errorf("pipeline: truncate before resume: %w", err)
-			return wrapWithHint(PhaseBulkCopy, markFailed(ctx, rc, *state, ir.MigrationPhaseBulkCopy, wrapped))
+			return wrapWithHint(PhaseBulkCopy, markFailedLocked(ctx, rc, state, stateMu, ir.MigrationPhaseBulkCopy, wrapped))
 		}
 	case resumeActionResumeFromCursor:
 		// Cursor-bearing resume: the per-batch path picks up the
-		// previous attempt's progress entry below. No truncate.
+		// previous attempt's progress entry below. No truncate. Read the
+		// entry under the lock (shared map; peer tables write concurrently
+		// under the cross-table pool — ADR-0076).
+		stateMu.Lock()
 		entry := state.TableProgress[table.Name]
+		stateMu.Unlock()
 		slog.InfoContext(ctx, "migration: resuming table from cursor",
 			slog.String("table", table.Name),
 			slog.Int64("rows_already_copied", entry.RowsCopied),
@@ -103,7 +114,9 @@ func bulkCopyOneTable(
 	case resumeActionResumeChunked:
 		// Parallel-copy resume: per-chunk cursors live in entry.Chunks
 		// and the parallel path below picks them up. No truncate.
+		stateMu.Lock()
 		entry := state.TableProgress[table.Name]
+		stateMu.Unlock()
 		slog.InfoContext(ctx, "migration: resuming chunked table from per-chunk cursors",
 			slog.String("table", table.Name),
 			slog.Int("chunks", len(entry.Chunks)))
@@ -120,7 +133,7 @@ func bulkCopyOneTable(
 	// "fall through to the single-reader path".
 	if ran, err := tryParallelCopyTable(ctx, rc, state, stateMu, rows, rw, table, parallel, resuming, bulkBatchSize, redactor, shard); err != nil {
 		wrapped := fmt.Errorf("pipeline: copy table %q (parallel): %w", table.Name, err)
-		return wrapWithHint(PhaseBulkCopy, markFailed(ctx, rc, *state, ir.MigrationPhaseBulkCopy, wrapped))
+		return wrapWithHint(PhaseBulkCopy, markFailedLocked(ctx, rc, state, stateMu, ir.MigrationPhaseBulkCopy, wrapped))
 	} else if ran {
 		return nil
 	}
@@ -144,22 +157,15 @@ func bulkCopyOneTable(
 			slog.InfoContext(ctx, "migration: table has no primary key; falling back to truncate-and-redo on resume",
 				slog.String("table", table.Name))
 		}
-		state.TableProgress[table.Name] = entry
-		if err := writeState(ctx, rc, *state); err != nil {
-			slog.WarnContext(ctx, "migration: per-table state write failed; continuing",
-				slog.String("table", table.Name),
-				slog.String("err", err.Error()))
-		}
+		// In-progress breadcrumb + terminal complete both go through the
+		// locked clone-and-write helper (ADR-0076): peer tables in the
+		// cross-table pool write distinct keys of this map concurrently.
+		setTableProgressAndWrite(ctx, rc, state, stateMu, table.Name, entry)
 		if err := copyTable(ctx, rows, rw, table, redactor, shard); err != nil {
 			wrapped := fmt.Errorf("pipeline: copy table %q: %w", table.Name, err)
-			return wrapWithHint(PhaseBulkCopy, markFailed(ctx, rc, *state, ir.MigrationPhaseBulkCopy, wrapped))
+			return wrapWithHint(PhaseBulkCopy, markFailedLocked(ctx, rc, state, stateMu, ir.MigrationPhaseBulkCopy, wrapped))
 		}
-		state.TableProgress[table.Name] = ir.TableProgress{State: ir.TableProgressComplete}
-		if err := writeState(ctx, rc, *state); err != nil {
-			slog.WarnContext(ctx, "migration: per-table state write failed; continuing",
-				slog.String("table", table.Name),
-				slog.String("err", err.Error()))
-		}
+		setTableProgressAndWrite(ctx, rc, state, stateMu, table.Name, ir.TableProgress{State: ir.TableProgressComplete})
 		return nil
 	}
 
@@ -168,16 +174,11 @@ func bulkCopyOneTable(
 	if limit <= 0 {
 		limit = defaultBulkBatchSize
 	}
-	if err := copyTableWithCursor(ctx, rc, state, rw, rows, table, limit, redactor, shard); err != nil {
+	if err := copyTableWithCursor(ctx, rc, state, stateMu, rw, rows, table, limit, redactor, shard); err != nil {
 		wrapped := fmt.Errorf("pipeline: copy table %q: %w", table.Name, err)
-		return wrapWithHint(PhaseBulkCopy, markFailed(ctx, rc, *state, ir.MigrationPhaseBulkCopy, wrapped))
+		return wrapWithHint(PhaseBulkCopy, markFailedLocked(ctx, rc, state, stateMu, ir.MigrationPhaseBulkCopy, wrapped))
 	}
-	state.TableProgress[table.Name] = ir.TableProgress{State: ir.TableProgressComplete}
-	if err := writeState(ctx, rc, *state); err != nil {
-		slog.WarnContext(ctx, "migration: per-table state write failed; continuing",
-			slog.String("table", table.Name),
-			slog.String("err", err.Error()))
-	}
+	setTableProgressAndWrite(ctx, rc, state, stateMu, table.Name, ir.TableProgress{State: ir.TableProgressComplete})
 	return nil
 }
 
@@ -239,6 +240,7 @@ func copyTableWithCursor(
 	ctx context.Context,
 	rc resumeContext,
 	state *ir.MigrationState,
+	stateMu *sync.Mutex,
 	rw ir.RowWriter,
 	rr ir.RowReader,
 	table *ir.Table,
@@ -257,7 +259,11 @@ func copyTableWithCursor(
 
 	pkCols := primaryKeyColumnNames(table)
 
+	// Read the entry under the lock: peer tables in the cross-table pool
+	// (ADR-0076) write distinct keys of this shared map concurrently.
+	stateMu.Lock()
 	entry := state.TableProgress[table.Name]
+	stateMu.Unlock()
 	if entry.State != ir.TableProgressInProgress {
 		// Either fresh start (entry is the zero value) or a sticky
 		// state we shouldn't be on (caller routes complete/no-PK
@@ -271,12 +277,7 @@ func copyTableWithCursor(
 	// Persist the in-progress breadcrumb up front (mirrors the v0.3.0
 	// behaviour) so a crash before the first batch lands still leaves
 	// a meaningful state row for the next attempt.
-	state.TableProgress[table.Name] = entry
-	if err := writeState(ctx, rc, *state); err != nil {
-		slog.WarnContext(ctx, "migration: per-table state write failed; continuing",
-			slog.String("table", table.Name),
-			slog.String("err", err.Error()))
-	}
+	setTableProgressAndWrite(ctx, rc, state, stateMu, table.Name, entry)
 
 	// Progress ticker for the long-running per-batch loop. The same
 	// shape as copyTable; one ticker per table.
@@ -352,8 +353,13 @@ func copyTableWithCursor(
 
 		entry.LastPK = cursor
 		entry.RowsCopied = rowsCopied
+		// Clone-and-write under the lock (ADR-0076): peer tables in the
+		// cross-table pool write distinct keys of this map concurrently.
+		stateMu.Lock()
 		state.TableProgress[table.Name] = entry
-		if err := writeState(ctx, rc, *state); err != nil {
+		stateCopy := cloneStateForWrite(state)
+		stateMu.Unlock()
+		if err := writeState(ctx, rc, stateCopy); err != nil {
 			// Best-effort; log and continue. The replay window
 			// tolerated by the idempotent INSERT will catch any rows
 			// that re-deliver on the next attempt.
