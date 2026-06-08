@@ -2,7 +2,7 @@
 
 ## Status
 
-**Accepted (2026-06-07).** Operator-requested: connect to a
+**Accepted (2026-06-07); shipped v0.99.16.** Operator-requested: connect to a
 MySQL server (e.g. as `root`, with access to many databases) and migrate **and
 sync** all — or a selected subset — of its databases to a target in one run,
 analogous to how a Postgres source can carry multiple schemas. Supersedes the

@@ -2,7 +2,7 @@
 
 ## Status
 
-**Accepted (2026-06-07).** The symmetric reverse of
+**Accepted (2026-06-07); shipped v0.99.24 (Phase 2a migrate + Phase 2b continuous sync/CDC).** The symmetric reverse of
 [ADR-0074](adr-0074-multi-database-mysql-migration-and-sync.md): connect to a
 Postgres source that carries **many schemas** and migrate **and sync** all — or
 a selected subset — of them to a target in one run, each schema landing in its

@@ -59,6 +59,21 @@ const (
 	clusterKeyspace  = "test"
 )
 
+// defaultVitessLiteImage mirrors the compose file's default. The harness
+// boots on this unless VITESS_LITE_IMAGE overrides it (the multi-version
+// matrix in scripts/vitess-version-matrix.{ps1,sh} drives that override).
+// Keep this MAJOR in lockstep with the vendored vitess.io/vitess client.
+const defaultVitessLiteImage = "vitess/lite:v24.0.1"
+
+// vitessClusterImage reports which Vitess image the cluster will boot on,
+// honoring the VITESS_LITE_IMAGE override the compose file reads.
+func vitessClusterImage() string {
+	if img := os.Getenv("VITESS_LITE_IMAGE"); img != "" {
+		return img
+	}
+	return defaultVitessLiteImage
+}
+
 // startVitessCluster boots the full Vitess cluster defined in
 // testdata/vitesscluster/docker-compose.yml and returns the vtgate
 // MySQL DSN (for SQL setup), the vtgate gRPC endpoint (for VStream),
@@ -78,6 +93,12 @@ func startVitessCluster(t *testing.T) (mysqlDSN, grpcEndpoint, keyspace string, 
 	dockerBin := findDocker(t)
 	composeFile := composeFilePath(t)
 	project := fmt.Sprintf("sluice-vitesscluster-%d", os.Getpid())
+
+	// Log the Vitess image up front so a matrix run's per-version output is
+	// self-identifying (which server version this boot exercised). The
+	// vendored client stays v24.0.1; older servers are reached via
+	// newer-client->older-server skew (the rolling-upgrade direction).
+	t.Logf("vitesscluster: booting on %s (override via VITESS_LITE_IMAGE; vendored client = vitess.io/vitess v0.24.1)", vitessClusterImage())
 
 	// Inherit the env and pin the project name + ports so a stale stack
 	// from a crashed run doesn't collide and teardown is unambiguous.

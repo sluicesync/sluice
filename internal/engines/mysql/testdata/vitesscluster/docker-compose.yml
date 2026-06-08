@@ -18,6 +18,14 @@
 # same-major minor (v24.0.0) and then roll each component forward to the
 # vendored-client-matching target (v24.0.1) via the chaos-upgrade override.
 #
+# The SAME ${VITESS_LITE_IMAGE} override drives the deliberate multi-version
+# test matrix (roadmap item 1(e), scripts/vitess-version-matrix.{ps1,sh}):
+# there the WHOLE cluster boots on one older server (v21..v24) and the
+# vendored v24.0.1 client streams against it (newer-client -> older-server
+# skew). That is a separate axis from the lockstep caution below — the
+# matrix boots a single uniform version (no intra-cluster skew); the caution
+# is about the per-PR default + the chaos-upgrade intra-cluster bump.
+#
 # Flag conventions are pinned to Vitess 24: the server binaries and
 # vtctldclient all take HYPHENATED flags (--service-map,
 # --topo-implementation, --init-tablet-type, --tablet-uid, --mysql-port).
