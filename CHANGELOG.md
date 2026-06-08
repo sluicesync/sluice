@@ -6,6 +6,31 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.99.24] - 2026-06-07
+
+### Added
+
+- **Postgres-source multi-schema CONTINUOUS SYNC / CDC (ADR-0075 Phase 2b).**
+  `sluice sync start` against a Postgres source now supports the multi-schema
+  fan-out flags `--include-schema` / `--exclude-schema` / `--all-schemas` for
+  the full cold-start **and** continuous-CDC path — the steady-state counterpart
+  to Phase 2a's multi-schema `migrate`. Each selected source schema is replicated
+  to a same-named target namespace (a Postgres schema, or a database on a MySQL
+  target). Because a Postgres logical-replication slot is database-wide, the
+  selected schemas are cold-started under **one spanning exported snapshot**,
+  then the single database-wide CDC stream is routed per-change to the matching
+  target namespace; warm-resume continues all schemas from the one persisted
+  slot/LSN. This mirrors the ADR-0074 MySQL multi-database shape (the
+  orchestrator is shared and unchanged). Previously a multi-schema `sync start`
+  against a Postgres source was refused loudly ("Phase 2b, not in this
+  release"); that refusal is now real support. Same-named tables in different
+  schemas are isolated on the target (routing + per-namespace applier caches are
+  schema-keyed), out-of-scope schemas are dropped (never misapplied), and CDC
+  `TRUNCATE` routes to exactly one namespace. Pinned by per-drop-site scope unit
+  tests plus PG→PG and PG→MySQL multi-schema integration tests (cold-start +
+  steady-state insert/update/delete/truncate + cross-schema bleed guards +
+  warm-resume parity), run under the CI `-race` Integration gate.
+
 ## [0.99.23] - 2026-06-07
 
 ### Fixed
