@@ -1,0 +1,103 @@
+# Legacy-underscore-flag override for the Vitess cluster harness.
+#
+# WHY THIS EXISTS: the base docker-compose.yml uses the MODERN HYPHENATED
+# server flags that are canonical from Vitess v23 onward (--topo-implementation,
+# --service-map, --grpc-port, --init-tablet-type, ...). The v21/v22 SERVER
+# binaries (vtctld / vttablet / vtgate / mysqlctl) only accept the LEGACY
+# UNDERSCORE form of those flags — on v21, vtctld dies with
+# `unknown flag: --topo-implementation`. This override rewrites ONLY the
+# server-binary commands to the underscore form so the multi-version matrix
+# (scripts/vitess-version-matrix.{ps1,sh}) can boot v21/v22 clusters.
+#
+# WHEN IT IS LAYERED: only when the booted Vitess MAJOR is <= 22. The harness
+# (startVitessCluster in cdc_vstream_cluster_integration_test.go) parses the
+# major from VITESS_LITE_IMAGE and adds `-f docker-compose.legacy-flags.yml`
+# to EVERY `docker compose` invocation (up/down/logs) when major <= 22. On
+# v23+ this file is NOT layered, so the modern/per-PR path stays on the clean
+# hyphen form with no deprecated flags.
+#
+# WHAT IS (NOT) OVERRIDDEN: docker compose replaces `command` WHOLESALE (it
+# does NOT deep-merge the list), so each service below carries the COMPLETE
+# command block — byte-identical to the base EXCEPT the hyphen->underscore
+# conversions. The etcd / init / volumes sections are intentionally absent:
+# init drives vtctldclient, which ALREADY takes hyphen flags on v21 (verified
+# on vitess/lite:v21.0.6), and etcd is unrelated to the Vitess flag skew.
+#
+# KEEP IN SYNC: when the base compose's vtctld/vttablet/vtgate commands change,
+# mirror the change here. Each block is a 1:1 copy of the base with only the
+# documented flags converted. Flags that STAY HYPHEN even on v21 (verified):
+# --tablet-path, --config-file-not-found-handling, --port, --cell, and every
+# flag inside the vtctldclient prelude.
+
+name: ${COMPOSE_PROJECT:-sluice-vitesscluster}
+
+services:
+  vtctld:
+    # NOTE: the vtctldclient prelude (AddCellInfo) stays HYPHEN — vtctldclient
+    # accepts hyphen flags on v21. Only the `vtctld` server exec is converted.
+    command:
+      - |
+        set -e
+        vtctldclient --server internal --topo-implementation etcd2 --topo-global-server-address etcd:2379 --topo-global-root /vitess/global AddCellInfo --root /vitess/zone1 --server-address etcd:2379 zone1 || true
+        exec vtctld \
+          --topo_implementation etcd2 --topo_global_server_address etcd:2379 --topo_global_root /vitess/global \
+          --cell zone1 \
+          --service_map 'grpc-vtctl,grpc-vtctld' \
+          --port 15000 --grpc_port 15999 \
+          --config-file-not-found-handling=ignore
+
+  vttablet:
+    # NOTE: mysqlctl --tablet_uid/--mysql_port converted; vttablet --tablet-path
+    # stays HYPHEN (verified present/hyphen on v21).
+    command:
+      - |
+        set -e
+        mkdir -p /vt/vtdataroot
+        mysqlctl --tablet_uid 100 --mysql_port 17000 init || mysqlctl --tablet_uid 100 --mysql_port 17000 start
+        exec vttablet \
+          --topo_implementation etcd2 --topo_global_server_address etcd:2379 --topo_global_root /vitess/global \
+          --tablet-path zone1-0000000100 \
+          --tablet_hostname vttablet \
+          --init_keyspace test \
+          --init_shard 0 \
+          --init_tablet_type replica \
+          --mysql_server_version '8.0.40-Vitess' \
+          --health_check_interval 5s \
+          --port 15100 --grpc_port 16100 \
+          --service_map 'grpc-queryservice,grpc-tabletmanager,grpc-updatestream' \
+          --heartbeat_on_demand_duration=5s \
+          --config-file-not-found-handling=ignore
+
+  vttablet-replica:
+    command:
+      - |
+        set -e
+        mkdir -p /vt/vtdataroot
+        mysqlctl --tablet_uid 101 --mysql_port 17000 init || mysqlctl --tablet_uid 101 --mysql_port 17000 start
+        exec vttablet \
+          --topo_implementation etcd2 --topo_global_server_address etcd:2379 --topo_global_root /vitess/global \
+          --tablet-path zone1-0000000101 \
+          --tablet_hostname vttablet-replica \
+          --init_keyspace test \
+          --init_shard 0 \
+          --init_tablet_type replica \
+          --mysql_server_version '8.0.40-Vitess' \
+          --health_check_interval 5s \
+          --port 15100 --grpc_port 16100 \
+          --service_map 'grpc-queryservice,grpc-tabletmanager,grpc-updatestream' \
+          --heartbeat_on_demand_duration=5s \
+          --config-file-not-found-handling=ignore
+
+  vtgate:
+    command:
+      - |
+        set -e
+        exec vtgate \
+          --topo_implementation etcd2 --topo_global_server_address etcd:2379 --topo_global_root /vitess/global \
+          --port 15001 --grpc_port 15991 --mysql_server_port 15306 \
+          --cell zone1 --cells_to_watch zone1 \
+          --tablet_types_to_wait PRIMARY \
+          --service_map 'grpc-vtgateservice' \
+          --mysql_auth_server_impl none \
+          --mysql_server_version '8.0.40-Vitess' \
+          --config-file-not-found-handling=ignore

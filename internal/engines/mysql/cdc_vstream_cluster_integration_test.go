@@ -42,6 +42,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -74,6 +75,29 @@ func vitessClusterImage() string {
 	return defaultVitessLiteImage
 }
 
+// vitessClusterMajor extracts the Vitess MAJOR version from the booted
+// image's tag (e.g. "vitess/lite:v21.0.6" -> 21). It returns ok=false for
+// `latest`, untagged, or any tag that isn't the `vNN.x.y` shape — those are
+// treated as MODERN (no legacy-flag override layered). This gates the
+// legacy-underscore-flag compose override: v21/v22 server binaries only
+// accept underscore flags, so the override is layered when major <= 22.
+func vitessClusterMajor() (int, bool) {
+	img := vitessClusterImage()
+	tag := img[strings.LastIndex(img, ":")+1:]
+	if !strings.HasPrefix(tag, "v") {
+		return 0, false
+	}
+	rest := tag[1:]
+	if dot := strings.IndexByte(rest, '.'); dot >= 0 {
+		rest = rest[:dot]
+	}
+	major, err := strconv.Atoi(rest)
+	if err != nil {
+		return 0, false
+	}
+	return major, true
+}
+
 // startVitessCluster boots the full Vitess cluster defined in
 // testdata/vitesscluster/docker-compose.yml and returns the vtgate
 // MySQL DSN (for SQL setup), the vtgate gRPC endpoint (for VStream),
@@ -100,6 +124,19 @@ func startVitessCluster(t *testing.T) (mysqlDSN, grpcEndpoint, keyspace string, 
 	// newer-client->older-server skew (the rolling-upgrade direction).
 	t.Logf("vitesscluster: booting on %s (override via VITESS_LITE_IMAGE; vendored client = vitess.io/vitess v0.24.1)", vitessClusterImage())
 
+	// The base compose uses the modern HYPHENATED server flags (canonical
+	// from Vitess v23). v21/v22 server binaries only accept the LEGACY
+	// UNDERSCORE form, so for major <= 22 we layer the legacy-flags override
+	// onto the base. This MUST be in the `-f` set of EVERY runCompose call
+	// (up/down/logs) or docker compose computes a different project view for
+	// teardown/log than for up. v23+ / latest / unparseable tags skip it and
+	// stay on the clean hyphen form (no deprecated flags on the modern path).
+	composeFiles := []string{"-f", composeFile}
+	if major, ok := vitessClusterMajor(); ok && major <= 22 {
+		composeFiles = append(composeFiles, "-f", legacyFlagsOverridePath(t))
+		t.Logf("vitesscluster: layering legacy-underscore-flag override for Vitess major %d (<=22)", major)
+	}
+
 	// Inherit the env and pin the project name + ports so a stale stack
 	// from a crashed run doesn't collide and teardown is unambiguous.
 	baseEnv := append(
@@ -110,7 +147,8 @@ func startVitessCluster(t *testing.T) (mysqlDSN, grpcEndpoint, keyspace string, 
 	)
 
 	runCompose := func(ctx context.Context, args ...string) ([]byte, error) {
-		full := append([]string{"compose", "-f", composeFile, "-p", project}, args...)
+		full := append(append([]string{"compose"}, composeFiles...), "-p", project)
+		full = append(full, args...)
 		cmd := exec.CommandContext(ctx, dockerBin, full...)
 		cmd.Env = baseEnv
 		return cmd.CombinedOutput()
@@ -193,6 +231,17 @@ func composeFilePath(t *testing.T) string {
 		t.Fatal("runtime.Caller failed; cannot locate compose file")
 	}
 	return filepath.Join(filepath.Dir(thisFile), "testdata", "vitesscluster", "docker-compose.yml")
+}
+
+// legacyFlagsOverridePath returns the absolute path to the
+// docker-compose.legacy-flags.yml override (layered for Vitess major <= 22).
+func legacyFlagsOverridePath(t *testing.T) string {
+	t.Helper()
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed; cannot locate legacy-flags override")
+	}
+	return filepath.Join(filepath.Dir(thisFile), "testdata", "vitesscluster", "docker-compose.legacy-flags.yml")
 }
 
 // findDocker returns a usable `docker` binary path. It prefers a
