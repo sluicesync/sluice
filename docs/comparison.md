@@ -8,6 +8,8 @@ If a row in the README's matrix doesn't land for your scenario, the answer is in
 
 For the **canonical open-source PG → PG comparison point (Bucardo)**, see the standalone [`docs/comparison-bucardo.md`](comparison-bucardo.md). That page carries measured head-to-head numbers from a one-on-one benchmark and the honest "which one should you pick" framing.
 
+For **measured initial-copy throughput head-to-heads**, see [`docs/comparison-pgcopydb.md`](comparison-pgcopydb.md) (PG → PG bulk copy, the tool whose parallel-COPY tactics sluice borrowed) and [`docs/comparison-pgloader.md`](comparison-pgloader.md) (sluice vs. pgloader for MySQL → PG, plus the cross-engine + Vitess throughput matrix).
+
 ---
 
 ## Cross-engine MySQL ↔ Postgres in all four directions
