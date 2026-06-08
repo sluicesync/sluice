@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -71,6 +72,15 @@ type vstreamCDCReader struct {
 	// keyspace is the database name from the DSN. PlanetScale's
 	// keyspace concept maps onto sluice's per-engine schema.
 	keyspace string
+
+	// boolWarn carries the one-time-per-column TINYINT(1)-out-of-range
+	// WARN (Vector D) for the VStream decode path, mirroring the binlog
+	// reader and the bulk-copy reader. Lazily created on the
+	// single-goroutine dispatch path; nil until then. A non-{0,1} value
+	// in a TINYINT(1) column is still carried as a bool per MySQL
+	// convention, but the operator is told (and pointed at
+	// --type-override) rather than it being silent.
+	boolWarn *boolRangeWarner
 
 	// shards is the shard layout the stream subscribes to. Empty
 	// means "discover via SHOW VITESS_SHARDS at open time"; a
@@ -1047,9 +1057,13 @@ func (r *vstreamCDCReader) dispatchRow(ctx context.Context, ev *binlogdata.VEven
 
 	tableName := stripKeyspaceFromTable(rev.GetTableName(), rev.GetKeyspace())
 
+	if r.boolWarn == nil { // single-goroutine dispatch — no lock needed
+		r.boolWarn = newBoolRangeWarner()
+	}
+
 	for _, rc := range rev.GetRowChanges() {
-		before, beforeOK := decodeVStreamRow(rc.GetBefore(), fields)
-		after, afterOK := decodeVStreamRow(rc.GetAfter(), fields)
+		before, beforeOK := decodeVStreamRow(rc.GetBefore(), fields, tableName, r.boolWarn)
+		after, afterOK := decodeVStreamRow(rc.GetAfter(), fields, tableName, r.boolWarn)
 		switch {
 		case afterOK && !beforeOK:
 			if err := send(ctx, out, ir.Insert{
@@ -1155,7 +1169,7 @@ func vgtidToShardGtidSlice(vg *binlogdata.VGtid) ([]shardGtid, error) {
 // docs/value-types.md, so cross-engine MySQL→PG paths behave
 // identically whether changes flow through the binlog reader or
 // the VStream reader.
-func decodeVStreamRow(row *query.Row, fields []*query.Field) (ir.Row, bool) {
+func decodeVStreamRow(row *query.Row, fields []*query.Field, tableName string, warner *boolRangeWarner) (ir.Row, bool) {
 	if row == nil {
 		return nil, false
 	}
@@ -1177,7 +1191,19 @@ func decodeVStreamRow(row *query.Row, fields []*query.Field) (ir.Row, bool) {
 		}
 		raw := values[offset : offset+int(l)]
 		offset += int(l)
-		out[f.GetName()] = decodeVStreamCell(f, raw)
+		v := decodeVStreamCell(f, raw)
+		// Vector D: a TINYINT(1) value outside {0,1} is collapsed to a
+		// bool here too (same MySQL convention as the binlog / bulk-copy
+		// paths). VStream cells are text-encoded, so parse the literal
+		// to recover the real integer and WARN once per column. Gated on
+		// the decoded value actually being a bool so only true
+		// TINYINT(1)/BIT(1)-shaped columns are probed.
+		if _, isBool := v.(bool); isBool {
+			if n, err := strconv.ParseInt(string(raw), 10, 64); err == nil {
+				warner.observeNamed(tableName, f.GetName(), n)
+			}
+		}
+		out[f.GetName()] = v
 	}
 	return out, true
 }

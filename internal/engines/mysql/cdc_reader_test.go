@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
@@ -334,7 +335,7 @@ func TestDecodeBinlogRow(t *testing.T) {
 	}
 	raw := []any{int64(7), []byte("alice@example.com"), int64(1)}
 
-	row, err := decodeBinlogRow(raw, cols)
+	row, err := decodeBinlogRow(raw, cols, "users", nil)
 	if err != nil {
 		t.Fatalf("decodeBinlogRow: %v", err)
 	}
@@ -349,11 +350,51 @@ func TestDecodeBinlogRow(t *testing.T) {
 	}
 }
 
+// TestDecodeBinlogRow_TinyInt1OutOfRangeWarns pins the Vector D CDC-tail
+// wiring: a TINYINT(1)/ir.Boolean column carrying a value outside {0,1} on
+// the binlog path is still decoded to a bool (per convention) but emits the
+// one-time-per-column WARN naming the column + the --type-override remedy.
+func TestDecodeBinlogRow_TinyInt1OutOfRangeWarns(t *testing.T) {
+	buf := captureSlog(t)
+	cols := []*ir.Column{
+		{Name: "id", Type: ir.Integer{Width: 64}},
+		{Name: "active", Type: ir.Boolean{}},
+	}
+	warner := newBoolRangeWarner()
+	// active=2 (out of range) -> still decodes to true, but warns.
+	row, err := decodeBinlogRow([]any{int64(1), int64(2)}, cols, "users", warner)
+	if err != nil {
+		t.Fatalf("decodeBinlogRow: %v", err)
+	}
+	if row["active"] != true {
+		t.Errorf("active = %#v; want true (convention: non-zero -> true)", row["active"])
+	}
+	// A second out-of-range row must NOT warn again (once per column).
+	if _, err := decodeBinlogRow([]any{int64(2), int64(127)}, cols, "users", warner); err != nil {
+		t.Fatalf("decodeBinlogRow (2nd): %v", err)
+	}
+	out := buf.String()
+	if got := strings.Count(out, "column=users.active"); got != 1 {
+		t.Errorf("users.active warned %d times; want exactly 1\n%s", got, out)
+	}
+	if !strings.Contains(out, "--type-override users.active=smallint") {
+		t.Errorf("WARN missing the --type-override hint:\n%s", out)
+	}
+	// An in-range bool column never warns.
+	buf.Reset()
+	if _, err := decodeBinlogRow([]any{int64(3), int64(1)}, cols, "users", newBoolRangeWarner()); err != nil {
+		t.Fatalf("decodeBinlogRow (in-range): %v", err)
+	}
+	if strings.Contains(buf.String(), "users.active") {
+		t.Errorf("in-range value warned:\n%s", buf.String())
+	}
+}
+
 func TestDecodeBinlogRowColumnCountMismatch(t *testing.T) {
 	cols := []*ir.Column{
 		{Name: "id", Type: ir.Integer{Width: 64}},
 	}
-	if _, err := decodeBinlogRow([]any{int64(1), int64(2)}, cols); err == nil {
+	if _, err := decodeBinlogRow([]any{int64(1), int64(2)}, cols, "t", nil); err == nil {
 		t.Error("expected error for column count mismatch")
 	}
 }

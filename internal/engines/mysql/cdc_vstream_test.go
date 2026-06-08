@@ -1408,3 +1408,43 @@ func minimalConfig(addr string, params map[string]string) (*gomysql.Config, erro
 	}
 	return cfg, nil
 }
+
+// TestDecodeVStreamRow_TinyInt1OutOfRangeWarns pins the Vector D CDC-tail
+// wiring on the VStream path: a TINYINT(1) cell outside {0,1} is decoded to
+// a bool (per convention) but emits the one-time-per-column WARN naming the
+// column + the --type-override remedy. VStream cells are text-encoded, so the
+// detection re-parses the literal to recover the real integer.
+func TestDecodeVStreamRow_TinyInt1OutOfRangeWarns(t *testing.T) {
+	buf := captureSlog(t)
+	fields := []*query.Field{
+		{Name: "id", Type: query.Type_INT64, ColumnType: "bigint"},
+		{Name: "active", Type: query.Type_INT8, ColumnType: "tinyint(1)"},
+	}
+	warner := newBoolRangeWarner()
+
+	// id=1, active=2 (out of range) -> active decodes true, warns once.
+	out, ok := decodeVStreamRow(&query.Row{Lengths: []int64{1, 1}, Values: []byte("12")}, fields, "users", warner)
+	if !ok {
+		t.Fatal("decodeVStreamRow ok=false")
+	}
+	if out["active"] != true {
+		t.Errorf("active = %#v; want true (non-zero -> true)", out["active"])
+	}
+	// id=3, active=127 -> still out of range, must NOT warn again.
+	decodeVStreamRow(&query.Row{Lengths: []int64{1, 3}, Values: []byte("3127")}, fields, "users", warner)
+
+	o := buf.String()
+	if c := strings.Count(o, "column=users.active"); c != 1 {
+		t.Errorf("users.active warned %d times; want exactly 1\n%s", c, o)
+	}
+	if !strings.Contains(o, "--type-override users.active=smallint") {
+		t.Errorf("WARN missing the --type-override hint:\n%s", o)
+	}
+
+	// In-range bool (0/1) never warns.
+	buf.Reset()
+	decodeVStreamRow(&query.Row{Lengths: []int64{1, 1}, Values: []byte("10")}, fields, "users", newBoolRangeWarner())
+	if strings.Contains(buf.String(), "users.active") {
+		t.Errorf("in-range value warned:\n%s", buf.String())
+	}
+}

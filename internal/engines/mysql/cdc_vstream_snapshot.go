@@ -228,6 +228,7 @@ func (e Engine) openVStreamSnapshotStreamFrom(ctx context.Context, dsn string, s
 		reconnectBackoffCap:  defaultCopyReconnectBackoffCap,
 		fields:               make(map[string][]*query.Field),
 		rowBuffer:            make(map[string][]ir.Row),
+		boolWarn:             newBoolRangeWarner(),
 		copyCompletedShards:  make(map[string]bool),
 		maxBufferBytes:       defaultSnapshotMaxBufferBytes,
 		checkpointRows:       defaultCopyCheckpointRows,
@@ -307,6 +308,12 @@ func (e Engine) openVStreamSnapshotStreamFrom(ctx context.Context, dsn string, s
 // ReadRows channel-close happens-before edge.
 type vstreamSnapshotStream struct {
 	keyspace string
+
+	// boolWarn carries the one-time-per-column TINYINT(1)-out-of-range
+	// WARN (Vector D) for the VStream cold-start COPY + its CDC catch-up.
+	// Set in the constructor; nil-safe (test literals leave it nil and
+	// observeNamed no-ops).
+	boolWarn *boolRangeWarner
 
 	// client is the typed Vitess gRPC client. Held so the COPY pump can
 	// re-open the VStream IN PLACE on a retriable Recv error (ADR-0072
@@ -1071,7 +1078,7 @@ func (s *vstreamSnapshotStream) bufferCopyRow(ev *binlogdata.VEvent) error {
 	}
 	tableName := stripKeyspaceFromTable(rev.GetTableName(), rev.GetKeyspace())
 	for _, rc := range rev.GetRowChanges() {
-		row, ok := decodeVStreamRow(rc.GetAfter(), fields)
+		row, ok := decodeVStreamRow(rc.GetAfter(), fields, tableName, s.boolWarn)
 		if !ok {
 			// COPY-phase rows always have After populated. A missing
 			// After is malformed; skip it so the rest of the table
@@ -1346,8 +1353,8 @@ func (s *vstreamSnapshotStream) dispatchCDCRow(ctx context.Context, ev *binlogda
 	tableName := stripKeyspaceFromTable(rev.GetTableName(), rev.GetKeyspace())
 
 	for _, rc := range rev.GetRowChanges() {
-		before, beforeOK := decodeVStreamRow(rc.GetBefore(), fields)
-		after, afterOK := decodeVStreamRow(rc.GetAfter(), fields)
+		before, beforeOK := decodeVStreamRow(rc.GetBefore(), fields, tableName, s.boolWarn)
+		after, afterOK := decodeVStreamRow(rc.GetAfter(), fields, tableName, s.boolWarn)
 		switch {
 		case afterOK && !beforeOK:
 			if err := send(ctx, out, ir.Insert{

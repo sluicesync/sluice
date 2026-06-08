@@ -38,11 +38,23 @@ func newBoolRangeWarner() *boolRangeWarner {
 // gate the call on the column actually being ir.Boolean, but observe also
 // no-ops for in-range / non-integer raws so an unconditional call is safe.
 func (w *boolRangeWarner) observe(table string, col *ir.Column, raw any) {
+	w.observeNamed(table, col.Name, raw)
+}
+
+// observeNamed is observe for callers that have a column name but not an
+// [ir.Column] — the VStream CDC path, which decodes off Vitess
+// [query.Field] metadata rather than the IR schema. raw must be an
+// integer-family value (the VStream caller parses the textual cell first);
+// non-integer raws are treated as in-range, same as observe.
+func (w *boolRangeWarner) observeNamed(table, colName string, raw any) {
+	if w == nil {
+		return
+	}
 	n, oob := tinyBoolOutOfRange(raw)
 	if !oob {
 		return
 	}
-	key := table + "." + col.Name
+	key := table + "." + colName
 
 	w.mu.Lock()
 	_, seen := w.warned[key]
