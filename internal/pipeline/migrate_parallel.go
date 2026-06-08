@@ -236,7 +236,12 @@ func tryParallelCopyTable(
 		return false, nil
 	}
 
+	// Read under stateMu (ADR-0076): peer tables in the cross-table pool
+	// write distinct keys of this shared map concurrently, and a Go map
+	// read racing a write is undefined behaviour even on a different key.
+	stateMu.Lock()
 	entry := state.TableProgress[table.Name]
+	stateMu.Unlock()
 	hasRecordedChunks := resuming && len(entry.Chunks) > 1
 
 	if !hasRecordedChunks {
@@ -274,15 +279,13 @@ func tryParallelCopyTable(
 
 	// All chunks complete: record terminal state. The bare-string
 	// "complete" wins on the next read; the verbose chunked entry is
-	// no longer load-bearing.
-	stateMu.Lock()
-	state.TableProgress[table.Name] = ir.TableProgress{State: ir.TableProgressComplete}
-	stateMu.Unlock()
-	if err := writeState(ctx, rc, *state); err != nil {
-		slog.WarnContext(ctx, "migration: terminal table-state write failed; continuing",
-			slog.String("table", table.Name),
-			slog.String("err", err.Error()))
-	}
+	// no longer load-bearing. Persist via setTableProgressAndWrite so the
+	// state is cloned UNDER stateMu before writeState JSON-encodes it —
+	// peer tables in the cross-table pool mutate the shared map
+	// concurrently (ADR-0076); a raw writeState(*state) here would race
+	// their writes during encoding.
+	setTableProgressAndWrite(ctx, rc, state, stateMu, table.Name,
+		ir.TableProgress{State: ir.TableProgressComplete})
 	return true, nil
 }
 
@@ -337,18 +340,15 @@ func resolveChunks(
 			State:      ir.TableProgressInProgress,
 		}
 	}
-	stateMu.Lock()
 	entry.State = ir.TableProgressInProgress
 	entry.LastPK = nil
 	entry.RowsCopied = 0
 	entry.Chunks = chunks
-	state.TableProgress[table.Name] = entry
-	stateMu.Unlock()
-	if err := writeState(ctx, rc, *state); err != nil {
-		slog.WarnContext(ctx, "migration: chunk-boundary state write failed; continuing",
-			slog.String("table", table.Name),
-			slog.String("err", err.Error()))
-	}
+	// Clone-under-lock persist (ADR-0076): writeState JSON-encodes the
+	// TableProgress map that peer tables mutate concurrently, so the set +
+	// deep-clone must happen under stateMu (setTableProgressAndWrite does
+	// exactly that, then writes the clone).
+	setTableProgressAndWrite(ctx, rc, state, stateMu, table.Name, entry)
 	return chunks, nil
 }
 
