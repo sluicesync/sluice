@@ -30,6 +30,7 @@ package pipeline
 import (
 	"context"
 	"database/sql"
+	"strings"
 	"testing"
 	"time"
 
@@ -546,4 +547,112 @@ func TestStreamer_MultiSchema_BoundSchemaAndTruncateRouting(t *testing.T) {
 	if got := pgScalarCount(pgTarget, `SELECT COUNT(*) FROM public.widgets`); got != 3 {
 		t.Errorf("TRUNCATE bled across schemas: public.widgets = %d; want 3 (intact)", got)
 	}
+}
+
+// TestStreamer_MultiSchema_SlotLossRefusesLoudly closes ADR-0075 Phase 2b
+// review nit #2 — the multi-schema ErrPositionInvalid fall-through is now
+// pinned. A PG failover/switchover (or pg_drop_replication_slot) loses the
+// logical slot; on restart the multi-schema sync must (a) detect the
+// invalid position and fall through to cold-start, and (b) hit the Bug-9
+// cold-start preflight, which REFUSES LOUDLY because the target already
+// holds data — exit non-zero, no silent partial re-copy, target untouched.
+// (Rig-confirmed contract on v0.99.28: loud refusal, not silent loss and
+// not auto-re-converge. The data-preserving recovery is --reset-target-data
+// or a deliberate --force-cold-start.)
+func TestStreamer_MultiSchema_SlotLossRefusesLoudly(t *testing.T) {
+	pgSource, pgTarget, cleanup := startPostgresLogicalMultiSchema(t)
+	defer cleanup()
+
+	applyPGDDL(t, pgSource, `
+		CREATE SCHEMA sales;
+		CREATE SCHEMA billing;
+		CREATE TABLE sales.widgets   (id BIGINT PRIMARY KEY, name TEXT NOT NULL);
+		CREATE TABLE billing.widgets (id BIGINT PRIMARY KEY, name TEXT NOT NULL);
+		INSERT INTO sales.widgets   (id, name) VALUES (1, 'a-one');
+		INSERT INTO billing.widgets (id, name) VALUES (1, 'b-one');
+	`)
+
+	pgEng, _ := engines.Get("postgres")
+	newStreamer := func() *Streamer {
+		return &Streamer{
+			Source: pgEng, Target: pgEng,
+			SourceDSN: pgSource, TargetDSN: pgTarget,
+			StreamID:       "multischema-slotloss-refuse",
+			DatabaseFilter: DatabaseFilter{Include: []string{"sales", "billing"}},
+		}
+	}
+
+	streamCtx, streamCancel := context.WithCancel(context.Background())
+	runErr := make(chan error, 1)
+	go func() { runErr <- newStreamer().Run(streamCtx) }()
+	if !waitForPGSchemaCount(t, pgTarget, "sales", "widgets", 1, 60*time.Second) ||
+		!waitForPGSchemaCount(t, pgTarget, "billing", "widgets", 1, 60*time.Second) {
+		streamCancel()
+		<-runErr
+		t.Fatal("initial cold-start never delivered both schemas")
+	}
+	streamCancel()
+	select {
+	case <-runErr:
+	case <-time.After(20 * time.Second):
+		t.Fatal("first stream did not return after ctx cancel")
+	}
+
+	if dropSluiceSlots(t, pgSource) == 0 {
+		t.Skip("no sluice replication slot found to drop; cannot exercise the slot-loss path")
+	}
+
+	// Restart: warm-resume sees the missing slot → ErrPositionInvalid →
+	// coldStartMultiDatabase → Bug-9 preflight refuses (target has data).
+	resumeCtx, resumeCancel := context.WithCancel(context.Background())
+	defer resumeCancel()
+	resumeErr := make(chan error, 1)
+	go func() { resumeErr <- newStreamer().Run(resumeCtx) }()
+
+	select {
+	case err := <-resumeErr:
+		if err == nil {
+			t.Fatal("slot-loss restart returned nil; want a loud cold-start refusal (target already has data)")
+		}
+		if !strings.Contains(err.Error(), "already contains data") && !strings.Contains(err.Error(), "cold-start refused") {
+			t.Errorf("slot-loss restart error = %v; want a Bug-9 cold-start refusal naming the populated target", err)
+		}
+	case <-time.After(60 * time.Second):
+		resumeCancel()
+		t.Fatal("slot-loss restart neither refused nor returned within 60s")
+	}
+}
+
+// dropSluiceSlots drops every replication slot named like 'sluice%' on the
+// source and returns how many it dropped. The slot must be inactive (the
+// stream stopped) for the drop to succeed.
+func dropSluiceSlots(t *testing.T, dsn string) int {
+	t.Helper()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open source for slot drop: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	rows, err := db.QueryContext(ctx, "SELECT slot_name FROM pg_replication_slots WHERE slot_name LIKE 'sluice%'")
+	if err != nil {
+		t.Fatalf("list replication slots: %v", err)
+	}
+	var names []string
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			_ = rows.Close()
+			t.Fatalf("scan slot name: %v", err)
+		}
+		names = append(names, n)
+	}
+	_ = rows.Close()
+	for _, n := range names {
+		if _, err := db.ExecContext(ctx, "SELECT pg_drop_replication_slot($1)", n); err != nil {
+			t.Fatalf("drop slot %q: %v", n, err)
+		}
+	}
+	return len(names)
 }
