@@ -169,8 +169,8 @@ func TestRunMultiDatabaseRefusesNonLister(t *testing.T) {
 		AllDatabases: true,
 	}
 	err := m.runMultiDatabase(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "enumerate databases") {
-		t.Fatalf("err = %v; want a 'cannot enumerate databases' refusal", err)
+	if err == nil || !strings.Contains(err.Error(), "enumerate namespaces") {
+		t.Fatalf("err = %v; want a 'cannot enumerate namespaces' refusal", err)
 	}
 	if !strings.Contains(err.Error(), "noLister") {
 		t.Errorf("err %q should name the offending engine", err)

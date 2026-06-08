@@ -1418,6 +1418,33 @@ type ServerCDCReaderOpener interface {
 	OpenServerCDCReader(ctx context.Context, dsn string) (CDCReader, error)
 }
 
+// NamespaceFolder is the OPTIONAL surface a TARGET engine implements to
+// report how it would FOLD a source namespace name into its own
+// namespace identifier (ADR-0075 resolved decision #1). It exists for
+// exactly one safety check: a PG → MySQL multi-schema fan-out routes each
+// source schema to a same-NAMED MySQL database, but MySQL database names
+// fold per the server's `lower_case_table_names` setting, whereas PG
+// schema names are case-sensitive. Two distinct source schemas (e.g.
+// `Sales` and `sales`) would therefore collide into ONE MySQL database —
+// a silent merge of two namespaces' data. The orchestrator's
+// multi-namespace pre-flight calls FoldNamespace on every selected source
+// namespace and refuses LOUDLY when two distinct source names fold to the
+// same target identifier (or a name is otherwise unsafe), naming both
+// schemas (never a silent merge — the loud-failure tenet).
+//
+// FoldNamespace returns the target-side identifier `name` would land
+// under. MySQL queries `@@lower_case_table_names` once and lowercases the
+// name when the server folds (the common Linux default lct=0 is
+// case-sensitive — identity — so on such servers the collision check is a
+// no-op). Engines whose namespace identifiers are case-sensitive and
+// never fold (Postgres) DON'T implement this surface; the orchestrator
+// treats a missing surface as identity (no fold, no collision possible
+// from folding). The dsn names the target server so the implementation
+// can probe the live setting.
+type NamespaceFolder interface {
+	FoldNamespace(ctx context.Context, dsn, name string) (string, error)
+}
+
 // ExtensionAware is the optional engine-side surface for engines that
 // can pass through column types defined by extensions (ADR-0032). PG
 // implements; MySQL does not (no extension concept in the same shape).

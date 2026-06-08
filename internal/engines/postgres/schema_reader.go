@@ -63,6 +63,46 @@ type SchemaReader struct {
 	// table in the schema is read, the historical behaviour. Set via
 	// [SetTableScope] before ReadSchema.
 	tableScope func(tableName string) bool
+
+	// schemaInScope is set by [SchemaReader.SetMultiDatabaseScope] when
+	// this reader is reading one schema of a multi-schema fan-out run
+	// (ADR-0075). It reports whether a REFERENCED schema name is part of
+	// the migrated set. Consulted only by the foreign-key cross-schema
+	// carve-out: a FK whose referenced table lives in a schema OUTSIDE
+	// the selected set is REFUSED LOUDLY at read time (the loud-failure
+	// tenet) rather than landing a broken constraint on the target.
+	//
+	// Unlike MySQL (flat scope, where Table.Schema is empty in single-
+	// schema mode), the PG reader ALWAYS stamps Table.Schema with
+	// r.schema and ALWAYS populates ForeignKey.ReferencedSchema — PG is
+	// SchemaScopeNamespaced. So the scoper adds ONLY the cross-schema
+	// refusal predicate; there is no Table.Schema-stamping carve-out to
+	// lift. A nil predicate (the single-schema default) disables the
+	// refusal entirely, preserving byte-identical back-compat.
+	schemaInScope func(schema string) bool
+}
+
+// SetMultiDatabaseScope implements [ir.MultiDatabaseScoper]. It marks
+// the reader as reading one schema (`schema`) of a multi-schema fan-out
+// run (ADR-0075) and supplies the `inScope` predicate the cross-schema
+// foreign-key carve-out uses to refuse out-of-scope references. Called
+// by the orchestrator before [ReadSchema]; a nil inScope leaves the
+// reader in single-schema mode.
+//
+// "Database" in the interface name is the engine-neutral term for
+// "namespace to fan out"; for Postgres that is a SCHEMA. The PG reader
+// already binds r.schema from the DSN (the orchestrator's per-schema
+// WithDatabase clone sets the `schema` parameter), so `schema` here is
+// the same value — threaded for clarity and as a defensive cross-check
+// against a mis-cloned DSN.
+func (r *SchemaReader) SetMultiDatabaseScope(schema string, inScope func(schema string) bool) {
+	if inScope == nil {
+		return
+	}
+	r.schemaInScope = inScope
+	if schema != "" {
+		r.schema = schema
+	}
 }
 
 // SetTableScope implements [ir.TableScoper]. The pipeline calls this
@@ -1384,11 +1424,21 @@ func (r *SchemaReader) populateIndexes(ctx context.Context, tables map[string]*i
 // directly so we get conkey/confkey pairs without needing the
 // ordinal-position bookkeeping that information_schema would require.
 func (r *SchemaReader) populateForeignKeys(ctx context.Context, tables map[string]*ir.Table) error {
+	// pn.nspname is the REFERENCED table's namespace. Pre-ADR-0075 the
+	// reader hard-coded ReferencedSchema = r.schema (the bound schema),
+	// which is correct only for same-schema FKs. The referenced
+	// namespace is read here so a multi-schema fan-out (ADR-0075) can
+	// (a) populate ReferencedSchema with the ACTUAL referenced schema for
+	// cross-schema FKs and (b) refuse loudly when that schema is outside
+	// the selected set. In single-schema mode the value equals r.schema
+	// for every in-namespace FK, so the emitted IR is byte-identical to
+	// the pre-ADR-0075 shape.
 	const q = `
 		SELECT
 			con.conname,
 			cl.relname  AS table_name,
 			pcl.relname AS referenced_table,
+			pn.nspname  AS referenced_schema,
 			con.confupdtype,
 			con.confdeltype,
 			fk_col.attname,
@@ -1397,7 +1447,8 @@ func (r *SchemaReader) populateForeignKeys(ctx context.Context, tables map[strin
 		FROM   pg_constraint con
 		JOIN   pg_class cl   ON cl.oid  = con.conrelid
 		JOIN   pg_class pcl  ON pcl.oid = con.confrelid
-		JOIN   pg_namespace n ON n.oid = cl.relnamespace
+		JOIN   pg_namespace n  ON n.oid  = cl.relnamespace
+		JOIN   pg_namespace pn ON pn.oid = pcl.relnamespace
 		JOIN   LATERAL unnest(con.conkey, con.confkey) WITH ORDINALITY AS u(k_attnum, f_attnum, ord) ON TRUE
 		LEFT JOIN pg_attribute fk_col  ON fk_col.attrelid  = con.conrelid  AND fk_col.attnum  = u.k_attnum
 		LEFT JOIN pg_attribute ref_col ON ref_col.attrelid = con.confrelid AND ref_col.attnum = u.f_attnum
@@ -1416,13 +1467,13 @@ func (r *SchemaReader) populateForeignKeys(ctx context.Context, tables map[strin
 
 	for rows.Next() {
 		var (
-			name, tableName, refTable string
-			updType, delType          string
-			fkCol, refCol             sql.NullString
-			ord                       int
+			name, tableName, refTable, refSchema string
+			updType, delType                     string
+			fkCol, refCol                        sql.NullString
+			ord                                  int
 		)
 		if err := rows.Scan(
-			&name, &tableName, &refTable,
+			&name, &tableName, &refTable, &refSchema,
 			&updType, &delType,
 			&fkCol, &refCol, &ord,
 		); err != nil {
@@ -1435,9 +1486,27 @@ func (r *SchemaReader) populateForeignKeys(ctx context.Context, tables map[strin
 		k := key{table: tableName, name: name}
 		fk, ok := collected[k]
 		if !ok {
+			// Cross-schema carve-out (ADR-0075). PG always namespaces, so
+			// ReferencedSchema is always populated with the ACTUAL
+			// referenced namespace. In a multi-schema fan-out run a FK
+			// referencing a schema OUTSIDE the selected set is REFUSED
+			// LOUDLY (the loud-failure tenet): sluice cannot guarantee the
+			// referenced schema exists on the target, and silently landing
+			// the constraint would create a broken / divergent reference.
+			// In single-schema mode (schemaInScope nil) the refusal is
+			// disabled — every FK passes through, byte-identical.
+			if r.schemaInScope != nil && refSchema != "" && !r.schemaInScope(refSchema) {
+				return fmt.Errorf(
+					"postgres: foreign key %q on table %q references table %q in schema %q, "+
+						"which is OUTSIDE the selected multi-schema set — sluice cannot guarantee "+
+						"the referenced schema exists on the target (remedy: add %q via "+
+						"--include-schema, or drop the table from scope via --exclude-table %q)",
+					name, tableName, refTable, refSchema, refSchema, tableName,
+				)
+			}
 			fk = &ir.ForeignKey{
 				Name:             name,
-				ReferencedSchema: r.schema,
+				ReferencedSchema: refSchema,
 				ReferencedTable:  refTable,
 				OnUpdate:         fkActionFromCode(updType),
 				OnDelete:         fkActionFromCode(delType),

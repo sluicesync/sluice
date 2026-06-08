@@ -67,22 +67,24 @@ func (m *Migrator) runMultiDatabase(ctx context.Context) error {
 	lister, ok := m.Source.(ir.DatabaseLister)
 	if !ok {
 		return fmt.Errorf(
-			"pipeline: --all-databases / --include-database / --exclude-database require a source engine "+
-				"that can enumerate databases, but %q does not (this is a MySQL-source feature; ADR-0074)",
+			"pipeline: the multi-namespace fan-out flags (--all-databases / --include-database / "+
+				"--exclude-database, or their --*-schema synonyms) require a source engine that can "+
+				"enumerate namespaces, but %q does not (MySQL source = ADR-0074 databases; "+
+				"Postgres source = ADR-0075 schemas)",
 			m.Source.Name(),
 		)
 	}
 	deriver, ok := m.Source.(ir.DatabaseDSNDeriver)
 	if !ok {
 		return fmt.Errorf(
-			"pipeline: source engine %q cannot derive a per-database DSN for multi-database migrate (ADR-0074)",
+			"pipeline: source engine %q cannot derive a per-namespace DSN for multi-namespace migrate (ADR-0074 / ADR-0075)",
 			m.Source.Name(),
 		)
 	}
 
 	all, err := lister.ListDatabases(ctx, m.SourceDSN)
 	if err != nil {
-		return wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: list source databases: %w", err))
+		return wrapWithHint(PhaseConnect, fmt.Errorf("pipeline: list source namespaces: %w", err))
 	}
 
 	selected := make([]string, 0, len(all))
@@ -94,8 +96,9 @@ func (m *Migrator) runMultiDatabase(ctx context.Context) error {
 	sort.Strings(selected)
 	if len(selected) == 0 {
 		return errors.New(
-			"pipeline: no source databases matched the database scope; nothing to migrate " +
-				"(check --include-database / --exclude-database, or that the source server has non-system databases)",
+			"pipeline: no source namespaces matched the scope; nothing to migrate " +
+				"(check --include-database / --exclude-database / --include-schema / --exclude-schema, " +
+				"or that the source has non-system databases / schemas)",
 		)
 	}
 
@@ -114,11 +117,27 @@ func (m *Migrator) runMultiDatabase(ctx context.Context) error {
 		slog.Any("databases", selected),
 	)
 
-	// MySQL → MySQL target: auto-create each same-named database before
-	// its writer opens. PG targets route via --target-schema (the PG
-	// writer auto-creates the schema), so no target-database creation is
-	// needed there. The ensure step is keyed on the TARGET engine
-	// exposing [ir.DatabaseDSNDeriver]; PG does not, so PG targets skip it.
+	// ---- Pre-flight: unsafe target-namespace fold (ADR-0075 resolved
+	// decision #1). When the target engine folds namespace names (MySQL
+	// under lower_case_table_names != 0) two distinct source namespaces
+	// can collapse to the same target database — a silent merge of two
+	// namespaces' data. Refuse LOUDLY, naming both, before any data
+	// moves. No-op on a target engine that doesn't fold (Postgres:
+	// case-sensitive schemas) — the type-assertion falls through. ----
+	if err := preflightNamespaceFoldCollisions(ctx, m.Target, m.TargetDSN, selected); err != nil {
+		return err
+	}
+
+	// Per-namespace target routing is keyed on the TARGET engine exposing
+	// [ir.DatabaseDSNDeriver]: auto-create each same-named target namespace
+	// and re-point the target DSN at it. Both shipped targets implement it —
+	// MySQL's EnsureDatabase is `CREATE DATABASE IF NOT EXISTS` (ADR-0074),
+	// PG's is `CREATE SCHEMA IF NOT EXISTS` (ADR-0075) — so MySQL→MySQL and
+	// {MySQL,PG}→PG all take the deriver branch below. The non-deriver `else`
+	// is the fallback for a hypothetical namespaced target without the
+	// surface (it routes via --target-schema and leans on the writer's own
+	// auto-create); it is unreachable with today's engines but kept so the
+	// orchestrator stays engine-neutral.
 	targetDeriver, targetCanDeriveDB := m.Target.(ir.DatabaseDSNDeriver)
 
 	// ---- Pre-flight: read every selected database's schema up front so
@@ -156,9 +175,10 @@ func (m *Migrator) runMultiDatabase(ctx context.Context) error {
 		perDB.AllDatabases = false
 
 		if targetCanDeriveDB {
-			// MySQL → MySQL: each source database → a same-named target
-			// database, auto-created, with the target DSN re-pointed.
-			// Skip the CREATE DATABASE under --dry-run: a dry run must not
+			// Each source namespace → a same-named target namespace,
+			// auto-created (CREATE DATABASE for MySQL / CREATE SCHEMA for PG),
+			// with the target DSN re-pointed at it via WithDatabase.
+			// Skip the auto-create under --dry-run: a dry run must not
 			// mutate the target (the per-database runSingleDatabase below
 			// prints the plan and writes nothing). WithDatabase is pure, so
 			// the routing is still derived for an accurate plan.
@@ -175,9 +195,9 @@ func (m *Migrator) runMultiDatabase(ctx context.Context) error {
 			perDB.TargetDSN = targetDSN
 			perDB.TargetSchema = ""
 		} else {
-			// MySQL → PG (or any namespaced target): route to a target
-			// schema of the same name. The PG writer auto-creates the
-			// schema and emits Schema-qualified DDL.
+			// Fallback for a namespaced target without [ir.DatabaseDSNDeriver]
+			// (none today): route to a target namespace of the same name via
+			// --target-schema and lean on the writer's own auto-create.
 			perDB.TargetSchema = database
 		}
 
@@ -227,6 +247,47 @@ func (m *Migrator) runMultiDatabase(ctx context.Context) error {
 		ctx, "multi-database migrate complete",
 		slog.Int("databases", len(selected)),
 	)
+	return nil
+}
+
+// preflightNamespaceFoldCollisions refuses LOUDLY when two distinct
+// selected source namespaces would FOLD to the same target-namespace
+// identifier (ADR-0075 resolved decision #1) — the silent-merge hazard a
+// PG → MySQL multi-schema fan-out carries because MySQL database names
+// fold per `lower_case_table_names` while PG schema names are
+// case-sensitive.
+//
+// No-op when the target engine doesn't implement [ir.NamespaceFolder]
+// (Postgres target: case-sensitive, never folds), or when the fold is
+// identity (MySQL with lct=0). Selected is the already-resolved,
+// already-sorted source namespace set. The check runs before any data
+// moves; a collision names BOTH source namespaces and the folded target
+// identifier so the operator can rename or re-scope.
+func preflightNamespaceFoldCollisions(ctx context.Context, target ir.Engine, targetDSN string, selected []string) error {
+	folder, ok := target.(ir.NamespaceFolder)
+	if !ok {
+		return nil
+	}
+	// folded -> first source namespace that mapped to it.
+	seen := make(map[string]string, len(selected))
+	for _, src := range selected {
+		folded, err := folder.FoldNamespace(ctx, targetDSN, src)
+		if err != nil {
+			return wrapWithHint(PhaseConnect,
+				fmt.Errorf("pipeline: probe target namespace fold for %q: %w", src, err))
+		}
+		if prev, dup := seen[folded]; dup {
+			return fmt.Errorf(
+				"pipeline: source namespaces %q and %q both fold to the target namespace %q "+
+					"(the target engine %q folds names case-insensitively, e.g. MySQL under "+
+					"lower_case_table_names != 0) — sluice refuses to silently merge two source "+
+					"namespaces into one target database; rename one source schema or drop one "+
+					"from scope via --exclude-schema / --include-schema",
+				prev, src, folded, target.Name(),
+			)
+		}
+		seen[folded] = src
+	}
 	return nil
 }
 

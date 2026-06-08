@@ -432,6 +432,50 @@ func (Engine) EnsureDatabase(ctx context.Context, dsn, database string) error {
 	return nil
 }
 
+// FoldNamespace implements [ir.NamespaceFolder]: it reports the MySQL
+// database identifier a source namespace `name` would land under on the
+// server dsn points at, accounting for the server's
+// `lower_case_table_names` (lct) setting (ADR-0075 resolved decision #1).
+//
+// MySQL folds database (and table) names per lct:
+//
+//   - lct=0 (the common Linux default): names are stored and compared
+//     case-SENSITIVELY — no fold, identity.
+//   - lct=1 (the Windows / macOS default, and some managed services):
+//     names are stored lowercased and compared case-insensitively — the
+//     fold is strings.ToLower.
+//   - lct=2 (macOS default): stored as given but compared
+//     case-insensitively — for COLLISION purposes this behaves like a
+//     lowercase fold (two names equal under case-insensitive compare).
+//
+// So lct != 0 ⇒ lowercase fold. The orchestrator uses the returned value
+// only to detect two distinct source namespaces folding to the same
+// target database (a silent-merge hazard it refuses loudly). Identity
+// (lct=0) means no folding-induced collision is possible.
+//
+// Used on a MySQL TARGET of a PG-source (or MySQL-source) multi-namespace
+// fan-out. dsn may be a server DSN (database component optional).
+func (Engine) FoldNamespace(ctx context.Context, dsn, name string) (string, error) {
+	cfg, err := parseServerDSN(dsn)
+	if err != nil {
+		return "", err
+	}
+	db, err := openDB(ctx, cfg)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = db.Close() }()
+
+	var lct int
+	if err := db.QueryRowContext(ctx, "SELECT @@global.lower_case_table_names").Scan(&lct); err != nil {
+		return "", fmt.Errorf("mysql: read lower_case_table_names: %w", err)
+	}
+	if lct != 0 {
+		return strings.ToLower(name), nil
+	}
+	return name, nil
+}
+
 // DefaultExcludePatterns returns flavor-specific or DSN-derived
 // table patterns the orchestrator should merge into the operator's
 // exclude list (only when the operator hasn't supplied

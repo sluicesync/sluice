@@ -148,6 +148,10 @@ type MigrateCmd struct {
 	ExcludeDatabase []string `help:"Multi-database fan-out (ADR-0074, MySQL source): migrate every non-system source database EXCEPT these (comma-separated, repeatable). Glob patterns allowed. Mutually exclusive with --include-database." sep:"," placeholder:"DATABASE"`
 	AllDatabases    bool     `help:"Multi-database fan-out (ADR-0074, MySQL source): migrate every non-system database on the source server, each to a same-named target namespace. Mutually exclusive with --include-database / --exclude-database."`
 
+	IncludeSchema []string `help:"Multi-schema fan-out (ADR-0075, Postgres source): migrate ONLY these source schemas (comma-separated, repeatable). Glob patterns allowed (e.g. 'app_*'). Each source schema routes to a same-named target namespace (PG schema / MySQL database). Mutually exclusive with --exclude-schema. The PG-source synonym of --include-database; supplying BOTH the --*-schema and --*-database spelling in one invocation is an error. System schemas (pg_catalog, information_schema, pg_toast, pg_temp*) are always excluded." sep:"," placeholder:"SCHEMA"`
+	ExcludeSchema []string `help:"Multi-schema fan-out (ADR-0075, Postgres source): migrate every non-system source schema EXCEPT these (comma-separated, repeatable). Glob patterns allowed. Mutually exclusive with --include-schema. The PG-source synonym of --exclude-database." sep:"," placeholder:"SCHEMA"`
+	AllSchemas    bool     `help:"Multi-schema fan-out (ADR-0075, Postgres source): migrate every non-system schema in the source database, each to a same-named target namespace. The PG-source synonym of --all-databases. Mutually exclusive with --include-schema / --exclude-schema."`
+
 	IncludeView []string `help:"Only migrate these views (comma-separated, repeatable). Glob patterns allowed. Mutually exclusive with --exclude-view." sep:"," placeholder:"VIEW"`
 	ExcludeView []string `help:"Migrate every view except these (comma-separated, repeatable). Glob patterns allowed. Mutually exclusive with --include-view." sep:"," placeholder:"VIEW"`
 	SkipViews   bool     `help:"Skip view processing entirely; views in the source schema are not created on the target. Useful when views are managed out-of-band (Atlas / sqitch / liquibase)."`
@@ -220,16 +224,23 @@ func (m *MigrateCmd) Run(g *Globals) error {
 	if len(m.IncludeTable) > 0 && len(m.ExcludeTable) > 0 {
 		return errors.New("--include-table and --exclude-table are mutually exclusive")
 	}
-	if len(m.IncludeDatabase) > 0 && len(m.ExcludeDatabase) > 0 {
-		return errors.New("--include-database and --exclude-database are mutually exclusive")
+	includeNS, excludeNS, allNS, err := resolveNamespaceScopeArgs(
+		m.IncludeDatabase, m.ExcludeDatabase, m.AllDatabases,
+		m.IncludeSchema, m.ExcludeSchema, m.AllSchemas,
+	)
+	if err != nil {
+		return err
 	}
-	if m.AllDatabases && (len(m.IncludeDatabase) > 0 || len(m.ExcludeDatabase) > 0) {
-		return errors.New("--all-databases is mutually exclusive with --include-database / --exclude-database")
+	if len(includeNS) > 0 && len(excludeNS) > 0 {
+		return errors.New("--include-database/--include-schema and --exclude-database/--exclude-schema are mutually exclusive")
+	}
+	if allNS && (len(includeNS) > 0 || len(excludeNS) > 0) {
+		return errors.New("--all-databases/--all-schemas is mutually exclusive with --include-* / --exclude-* namespace scope")
 	}
 	if len(m.IncludeView) > 0 && len(m.ExcludeView) > 0 {
 		return errors.New("--include-view and --exclude-view are mutually exclusive")
 	}
-	databaseFilter, err := pipeline.NewDatabaseFilter(m.IncludeDatabase, m.ExcludeDatabase)
+	databaseFilter, err := pipeline.NewDatabaseFilter(includeNS, excludeNS)
 	if err != nil {
 		return err
 	}
@@ -293,7 +304,7 @@ func (m *MigrateCmd) Run(g *Globals) error {
 		ExpressionMappings:    exprMappings,
 		Filter:                filter,
 		DatabaseFilter:        databaseFilter,
-		AllDatabases:          m.AllDatabases,
+		AllDatabases:          allNS,
 		ViewFilter:            viewFilter,
 		SkipViews:             m.SkipViews,
 		Resume:                m.Resume,
@@ -362,6 +373,38 @@ func resolveTableFilterArgs(cliInclude, cliExclude []string, cfg *config.Config)
 		return nil, cliExclude
 	}
 	return cfg.IncludeTables, cfg.ExcludeTables
+}
+
+// resolveNamespaceScopeArgs merges the two spellings of the
+// multi-namespace fan-out flags into the single internal
+// ([DatabaseFilter] + all-flag) shape the orchestrator consumes. The
+// `--*-database` form (ADR-0074) is canonical on a MySQL source; the
+// `--*-schema` form (ADR-0075) is canonical on a Postgres source. They
+// populate the SAME internal filter — "a MySQL database ≈ a PG schema"
+// (ADR-0031) — so there is no duplicated filter logic downstream.
+//
+// Supplying BOTH a `--*-schema` and a `--*-database` form in one
+// invocation is a loud error: the operator must pick one vocabulary
+// (the two are synonyms, and mixing them is almost certainly a mistake).
+// The per-form mutual-exclusion (include vs exclude, all vs include/
+// exclude) is enforced by the caller separately on the merged result.
+func resolveNamespaceScopeArgs(
+	includeDatabase, excludeDatabase []string, allDatabases bool,
+	includeSchema, excludeSchema []string, allSchemas bool,
+) (include, exclude []string, all bool, err error) {
+	schemaUsed := len(includeSchema) > 0 || len(excludeSchema) > 0 || allSchemas
+	databaseUsed := len(includeDatabase) > 0 || len(excludeDatabase) > 0 || allDatabases
+	if schemaUsed && databaseUsed {
+		return nil, nil, false, errors.New(
+			"--include-schema / --exclude-schema / --all-schemas and " +
+				"--include-database / --exclude-database / --all-databases are synonyms; " +
+				"supply only one vocabulary (use --*-schema on a Postgres source, --*-database on a MySQL source)",
+		)
+	}
+	if schemaUsed {
+		return includeSchema, excludeSchema, allSchemas, nil
+	}
+	return includeDatabase, excludeDatabase, allDatabases, nil
 }
 
 // resolveEngine looks up an engine by registered name and returns a
@@ -568,6 +611,10 @@ type SyncStartCmd struct {
 	IncludeDatabase []string `help:"Multi-database fan-out (ADR-0074, MySQL source): cold-start + CDC-sync ONLY these source databases (comma-separated, repeatable). Glob patterns allowed (e.g. 'app_*'). Each source database routes to a same-named target namespace (PG schema / MySQL database). The selected databases are cold-started under ONE spanning consistent snapshot, then the single server-wide binlog CDC stream is routed per-change to each namespace. Mutually exclusive with --exclude-database. When any database-scope flag is set, the source DSN's database is optional (it's a server connection). System databases (information_schema, performance_schema, mysql, sys) are always excluded. Warm-resume across N databases is not yet supported (ADR-0074 Phase 1b.3)." sep:"," placeholder:"DATABASE"`
 	ExcludeDatabase []string `help:"Multi-database fan-out (ADR-0074, MySQL source): cold-start + CDC-sync every non-system source database EXCEPT these (comma-separated, repeatable). Glob patterns allowed. Mutually exclusive with --include-database." sep:"," placeholder:"DATABASE"`
 	AllDatabases    bool     `help:"Multi-database fan-out (ADR-0074, MySQL source): cold-start + CDC-sync every non-system database on the source server, each to a same-named target namespace. Mutually exclusive with --include-database / --exclude-database."`
+
+	IncludeSchema []string `help:"Multi-schema fan-out (ADR-0075, Postgres source): the PG-source synonym of --include-database. NOTE: multi-schema CDC (sync) is ADR-0075 Phase 2b and not in this release — a multi-schema 'sync start' against a Postgres source is refused loudly. Use 'sluice migrate --include-schema' for the Phase-2a snapshot. Supplying BOTH the --*-schema and --*-database spelling in one invocation is an error." sep:"," placeholder:"SCHEMA"`
+	ExcludeSchema []string `help:"Multi-schema fan-out (ADR-0075, Postgres source): the PG-source synonym of --exclude-database. See --include-schema for the Phase-2b caveat." sep:"," placeholder:"SCHEMA"`
+	AllSchemas    bool     `help:"Multi-schema fan-out (ADR-0075, Postgres source): the PG-source synonym of --all-databases. See --include-schema for the Phase-2b caveat."`
 
 	IncludeView []string `help:"Only create these views on the target during cold-start (comma-separated, repeatable). Glob patterns allowed. Mutually exclusive with --exclude-view. Views are not replicated by CDC; this filter only affects the cold-start schema-apply phase." sep:"," placeholder:"VIEW"`
 	ExcludeView []string `help:"Skip these views during cold-start schema-apply (comma-separated, repeatable). Glob patterns allowed. Mutually exclusive with --include-view." sep:"," placeholder:"VIEW"`
@@ -811,14 +858,23 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 	if len(s.IncludeView) > 0 && len(s.ExcludeView) > 0 {
 		return errors.New("--include-view and --exclude-view are mutually exclusive")
 	}
-	// Multi-database fan-out (ADR-0074 Phase 1b.2).
-	if len(s.IncludeDatabase) > 0 && len(s.ExcludeDatabase) > 0 {
-		return errors.New("--include-database and --exclude-database are mutually exclusive")
+	// Multi-database fan-out (ADR-0074 Phase 1b.2) / multi-schema fan-out
+	// (ADR-0075). The --*-schema and --*-database forms are synonyms; mixing
+	// them is a loud error.
+	includeNS, excludeNS, allNS, err := resolveNamespaceScopeArgs(
+		s.IncludeDatabase, s.ExcludeDatabase, s.AllDatabases,
+		s.IncludeSchema, s.ExcludeSchema, s.AllSchemas,
+	)
+	if err != nil {
+		return err
 	}
-	if s.AllDatabases && (len(s.IncludeDatabase) > 0 || len(s.ExcludeDatabase) > 0) {
-		return errors.New("--all-databases is mutually exclusive with --include-database / --exclude-database")
+	if len(includeNS) > 0 && len(excludeNS) > 0 {
+		return errors.New("--include-database/--include-schema and --exclude-database/--exclude-schema are mutually exclusive")
 	}
-	databaseFilter, err := pipeline.NewDatabaseFilter(s.IncludeDatabase, s.ExcludeDatabase)
+	if allNS && (len(includeNS) > 0 || len(excludeNS) > 0) {
+		return errors.New("--all-databases/--all-schemas is mutually exclusive with --include-* / --exclude-* namespace scope")
+	}
+	databaseFilter, err := pipeline.NewDatabaseFilter(includeNS, excludeNS)
 	if err != nil {
 		return err
 	}
@@ -947,7 +1003,7 @@ func (s *SyncStartCmd) Run(g *Globals) error {
 		ViewFilter:             viewFilter,
 		SkipViews:              s.SkipViews,
 		DatabaseFilter:         databaseFilter,
-		AllDatabases:           s.AllDatabases,
+		AllDatabases:           allNS,
 		ForceColdStart:         s.ForceColdStart,
 		ResetTargetData:        s.ResetTargetData,
 		RestartFromScratch:     s.RestartFromScratch,

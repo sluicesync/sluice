@@ -265,3 +265,47 @@ All three were resolved with the proposed defaults:
    target) / `CREATE DATABASE IF NOT EXISTS` (MySQL target) per selected schema.
    sluice owns the small DDL surface (identical to ADR-0074's auto-create
    decision).
+
+## Implementation notes — Phase 2a (migrate; shipped 2026-06-08)
+
+Phase 2a (multi-schema `migrate`/snapshot) landed reusing the ADR-0074
+orchestrator unchanged. New surface: PG `ir.DatabaseLister` (schema enumeration
++ system-schema exclusion with the non-lookalike battery), `ir.DatabaseDSNDeriver`
+(`WithDatabase` = bind the `schema` DSN param, `EnsureDatabase` = `CREATE SCHEMA
+IF NOT EXISTS`), `ir.MultiDatabaseScoper` on the PG schema reader (stamp + the FK
+carve-out predicate); MySQL `FoldNamespace` + the new optional `ir.NamespaceFolder`
+target surface for the unsafe-fold refusal; `preflightNamespaceFoldCollisions` in
+the orchestrator; and the `--include-schema` / `--exclude-schema` / `--all-schemas`
+CLI synonyms (same internal `DatabaseFilter`, both-forms-error). Class-pinned:
+schema enumeration + non-lookalike battery, FK same/cross-in/cross-out-refusal,
+fold-collision, `--dry-run` no-writes, single-schema back-compat, PG→PG and
+PG→MySQL end to end.
+
+One divergence worth recording (mirrors ADR-0074's notes):
+
+- **PG now implements `ir.DatabaseDSNDeriver`, which unifies the multi-namespace
+  target routing.** Before Phase 2a, `migrate_multidb.go` keyed target routing on
+  `targetCanDeriveDB` and only MySQL satisfied it; a **PG target** took the `else`
+  branch and routed via `--target-schema`. Now PG satisfies it too, so **every
+  shipped target** (MySQL→MySQL, MySQL→PG, PG→PG, PG→MySQL) takes the deriver
+  branch — auto-create the same-named namespace (`CREATE DATABASE` / `CREATE
+  SCHEMA`) + `WithDatabase` re-point — and the `--target-schema` `else` branch is
+  now an unreachable fallback for a hypothetical namespaced target without the
+  surface, kept for engine-neutrality. This changed the **pre-existing MySQL→PG
+  multi-database path** (ADR-0074) from `--target-schema` routing to
+  `WithDatabase`(`schema=` param)+`EnsureDatabase`(`CREATE SCHEMA`); the two are
+  equivalent (the PG writer auto-creates + emits schema-qualified DDL either way)
+  and the existing MySQL→PG multi-database integration test confirms no behavior
+  change.
+
+## Implementation notes — Phase 2b (CDC)
+
+Not yet built. PG does not yet implement `ir.CDCDatabaseScoper` /
+`ir.MultiDatabaseSnapshotOpener` / `ir.ServerCDCReaderOpener`, so a multi-schema
+`sync start` against a PG source refuses loudly at the streamer's capability
+check; the `--*-schema` flags are wired onto `sync start` for surface symmetry
+with a Phase-2b caveat in the help text. The CDC half is the easy one (a PG
+logical slot is database-wide — flip the three `rel.Schema != r.schema`
+drop-sites in `cdc_reader.go` to a `CDCDatabaseScoper` predicate and route via the
+already-implemented PG `MultiDatabaseRouter`; one slot, one LSN; the slot's
+exported snapshot is the consistent handoff). Tracked as the next chunk.
