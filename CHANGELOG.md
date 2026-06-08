@@ -6,6 +6,25 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.99.27] - 2026-06-08
+
+### Added
+
+- **`--type-override COL=interval` carries a MySQL `TIME` *duration* to a
+  Postgres `INTERVAL` (Vector C).** A MySQL `TIME` column is a duration in the
+  range `-838:59:59…838:59:59`, which exceeds Postgres `time`'s `00:00–24:00`
+  time-of-day range — so a column used to store a real duration (a >24h span, a
+  negative offset) could not be carried by the default `TIME → time` mapping.
+  Overriding the column to `interval` maps it to PG `INTERVAL`, which holds the
+  full range; the value is carried as its textual form and PG's interval parser
+  accepts it. Works on both `migrate` and continuous `sync` (CDC), in all the
+  duration shapes (max-positive, negative, fractional-second, zero, NULL).
+  `interval` is now a first-class Postgres type in the IR (a new `ir.Interval`,
+  distinct from `ir.Time`): PG→PG round-trips a native `interval` column, and a
+  non-Postgres target — which has no interval type — is refused loudly rather
+  than silently degraded back to `TIME` (which would re-lose the range the
+  override exists to preserve).
+
 ## [0.99.26] - 2026-06-08
 
 ### Added
