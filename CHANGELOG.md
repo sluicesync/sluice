@@ -6,6 +6,25 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.99.20] - 2026-06-07
+
+### Fixed
+
+- **`--zero-date=epoch` now lands a real date on a MySQL `TIMESTAMP` target
+  instead of silently storing the `0000-00-00` zero sentinel.** The epoch
+  substitute was `1970-01-01 00:00:00` — exactly one second below MySQL's
+  `TIMESTAMP` range floor (`1970-01-01 00:00:01` UTC). Because reading a legacy
+  zero-date source requires `--mysql-sql-mode=''`, which also relaxes the target
+  connection, a midnight-epoch write into a MySQL `TIMESTAMP` column was silently
+  coerced back to `0000-00-00` — re-introducing the very value epoch is meant to
+  replace — at exit 0 with no warning. (`DATE`/`DATETIME` targets and all
+  Postgres targets were unaffected; the decoder was always correct.) The epoch
+  sentinel is now `1970-01-01 00:00:01`, which sits at the `TIMESTAMP` floor and
+  is representable by every temporal target. The one-second offset is meaningless
+  on a synthetic placeholder for an invalid date. Pinned by a real-MySQL
+  integration test that ground-truths the midnight coercion and proves the new
+  sentinel round-trips as a non-zero value.
+
 ## [0.99.19] - 2026-06-07
 
 ### Fixed
