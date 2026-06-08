@@ -1,0 +1,38 @@
+# sluice v0.92.0
+
+# sluice v0.92.0 — Four bugs from the v0.91.0 deep bug-finding sweep
+
+**Headline:** A focused bug-finding sweep against v0.91.0 surfaced four real bugs across the postgres-trigger CDC path, the cross-engine TRUNCATE handler, PG declarative partitioning, and the orphan-trigger blast radius. All four ship together as v0.92.0. **Bug 99 (CRITICAL silent-PII-loss)** was hotfixed separately in v0.91.1; **four additional latent silent-loss bugs surfaced by a follow-up deep sweep** ship in a forthcoming v0.92.1 patch.
+
+## Fixed
+
+- **`fix(postgres): plumb Stage 1+2 verbatim-carry OIDs through the CDC reader (Bug 97 — silent migrate-vs-sync contract gap)`** — same-engine PG → PG `sluice sync` of columns whose `pg_catalog` type is one of the 19 verbatim-carry types (Stage 1 `tsvector`/`tsquery`/range/multirange, Stage 2 `xml`/`money`/`pg_lsn`/`txid_snapshot`/`pg_snapshot` per [ADR-0070](https://github.com/orware/sluice/blob/v0.92.0/docs/adr/adr-0070-stage-2-verbatim-carry-promote.md)) crashed the sync stream on the first DML. The schema reader's text-keyed `coreVerbatimEligibleTypes` allowlist and the CDC reader's OID-based `oidToType()` switch had drifted: every type was eligible at schema-read but unknown at decode-time, so the streamer exited with `postgres: cdc: unsupported column type OID <N>`. The v0.91.0 release notes asserted "preserve path" — that was true for `migrate`; the sync path was quietly broken for these types all the way back to Stage 1 (v0.71.0, May 2026). The fix adds a `coreVerbatimCDCOIDs` map in `internal/engines/postgres/cdc_relations.go` mirroring the text allowlist OID-for-typname. 19 unit pins added covering every entry. Cross-engine PG → MySQL stays loud-refused via `ir.VerbatimType`.
+- **`fix(postgres, mysql): preserve TRUNCATE CASCADE / RESTART IDENTITY through CDC (Bug 98 — stream-crash on common operator action)`** — pgoutput's `TruncateMessage.Option` flag (bit 0 = CASCADE, bit 1 = RESTART IDENTITY) was discarded in `emitTruncate`; `ir.Truncate` carried no flag; the PG applier emitted a naked `TRUNCATE TABLE` which fails on FK-referenced targets with `cannot truncate a table referenced in a foreign key constraint` (SQLSTATE 0A000), crashing the stream. The fix plumbs the option byte through: `ir.Truncate` grows `Cascade` and `RestartIdentity` boolean fields; the PG applier emits `RESTART IDENTITY` then `CASCADE` per PG's grammar when set. MySQL applier logs a WARN on cross-engine PG → MySQL when option flags are present (MySQL `TRUNCATE` has no CASCADE concept) and emits the plain `TRUNCATE`. 4 unit pins added (all four flag combinations).
+- **`fix(pipeline): refuse loudly when source contains PG declaratively-partitioned tables (Bug 100 — silent constraint loss)`** — `sluice migrate` / `sluice sync start` against a source schema containing `PARTITION BY RANGE | LIST | HASH (...)` tables silently flattened the partitioned parent to a plain heap on the target: the partition key declaration was dropped, the partition children disappeared from the parent narrative, AND the parent's composite PRIMARY KEY (which in a partitioned table must include every partition-key column) was silently dropped along with the partitioning. The child tables are individual heap tables in `information_schema.tables` and were also copied, leading to either lost children (filtered) or duplicated data (parent + N children both copied). Sluice does not yet support partition-aware migration; v0.92.0 turns the silent-flatten into a loud refusal at preflight. New `partitionPreflightProber` engine surface (PG implements via `SchemaReader.PartitionedTables`), new `preflightPartitionedTables` orchestrator-side check wired into both `migrate.go` and `streamer.go`. Filter-aware — `--exclude-table=<parent>` is the recovery path. Refusal lists every offending parent and surfaces three operator-actionable recoveries. 7 unit pins.
+- **`fix(pgtrigger): orphaned DDL event trigger names the recovery command (Bug 101 — operator-friction with catastrophic blast radius)`** — `sluice_capture_ddl_trg` is an event trigger that INSERTs a marker row into `sluice_change_log` for every DDL command. If the operator manually drops `sluice_change_log` without running `sluice trigger teardown`, the trigger fires on the next DDL, the INSERT fails with `relation does not exist`, and PG returns the full PL/pgSQL function body as the error message — blocking ALL subsequent DDL on the source with no operator-visible recovery hint. The fix wraps the INSERT in an `EXCEPTION WHEN undefined_table` handler that raises with a clear message naming the diagnostic ("partially uninstalled") and the operator-actionable recovery commands (`sluice trigger teardown --yes` to fully remove, or `sluice trigger setup` to restore CDC). ERRCODE = `object_not_in_prerequisite_state` (55000) for monitoring keyability. Unit pin verifies handler shape + recovery message content.
+
+## Compatibility
+
+- **Minor version bump (v0.92.0)** — additive + bug-fix release. Drop-in from v0.91.1 except for the two documented behavior changes below.
+- **Two new loud refusals** that previously failed silently or crashed mid-stream:
+  - PG declaratively-partitioned tables in source schema → preflight refusal (Bug 100). Operators with partitioned schemas must explicitly `--exclude-table` the parents or scope via `--include-table` to opt into the silent-flatten if that's what they actually want (the workaround was always wrong, but it was the silent default).
+  - Cross-engine PG → MySQL `TRUNCATE … CASCADE`: a one-shot WARN log per source TRUNCATE event documenting which option flags were dropped at the cross-engine boundary (the apply still happens, plain TRUNCATE).
+- **Two formerly-stream-crashing scenarios that now apply cleanly** (Bugs 97 + 98).
+
+## Who needs this
+
+- **Anyone using `sluice sync start --source-driver=postgres`** on schemas with `tsvector`, `tsquery`, range, multirange, `xml`, `money`, `pg_lsn`, `txid_snapshot`, or `pg_snapshot` columns — v0.91.0's release notes promised preserve-path for these; this release actually delivers it for sync (migrate was always fine). Bug 97.
+- **Anyone whose source workload uses `TRUNCATE … CASCADE`** — pre-v0.92.0 this crashed the sync stream on FK-referenced targets. Bug 98.
+- **Anyone with PG declaratively-partitioned tables** in their source schema — you were getting silent data duplication or silent constraint loss. Now you get a loud refusal with three recovery paths. Bug 100.
+- **Anyone running `postgres-trigger` engine** — papercut closed. Bug 101.
+
+## Coming next (v0.92.1)
+
+A follow-up deep sweep against the un-touched ground from sweep #1 surfaced **three more CRITICAL silent-loss bugs sharing one root cause** and a fourth charset-class bug, all latent for many releases:
+
+- **Bug 102** — PG NUMERIC overflow silently clamped to MySQL DECIMAL(65,30) MAX on cross-engine
+- **Bug 103** — PG TIMESTAMPTZ outside MySQL TIMESTAMP range silently zero-dated on cross-engine
+- **Bug 105** — `--redact ... randomize:int:LO,HI` silently clamps to target column MAX on cross-engine (defeats PII randomization)
+- **Bug 106** — MySQL ENUM labels containing 4-byte UTF-8 (emoji etc.) silently corrupted to `?` during MySQL → PG enum-type creation
+
+Bugs 102/103/105 share one root cause — sluice inherits the MySQL server's `sql_mode` instead of forcing strict mode, so when the server permits silent-clamp-on-overflow / silent-zero-date, sluice does too. v0.92.1 forces `STRICT_TRANS_TABLES,NO_ZERO_DATE,NO_ZERO_IN_DATE,ERROR_FOR_DIVISION_BY_ZERO` on every MySQL connection regardless of server default, closing the silent class. **If your destination is MySQL, wait for v0.92.1 before running anything sensitive.**

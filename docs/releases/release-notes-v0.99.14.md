@@ -1,3 +1,5 @@
+# sluice v0.99.14
+
 **Resume-idempotency hardening + a PlanetScale no-PK migrate fix.** A `migrate --resume` whose schema-apply phases re-run over already-built objects no longer aborts on a duplicate, and migrating a large no-PK table from PlanetScale no longer silently truncates at vtgate's row cap. Drop-in upgrade from v0.99.13 — no breaking API or CLI changes.
 
 ## Fixed

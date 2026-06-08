@@ -72,3 +72,10 @@ internal/pipeline/testdata/real-world-corpus/*
 
 # Logs
 *.log
+
+# Release-gate scratch / ephemeral working dirs. Release-notes drafts and
+# CI-watch logs land here during a release; the curated GitHub-release
+# block is archived to docs/releases/ (see CLAUDE.md release step 5), so
+# nothing under here is tracked.
+workspace/
+tmp/

@@ -1,0 +1,48 @@
+# sluice v0.92.2
+
+> **Update 2026-05-31:** Bug 97's partial — the `money` / `pg_lsn` wire-encoding gap that was open at v0.92.2 publish time — is now closed in [v0.92.3](https://github.com/orware/sluice/releases/tag/v0.92.3). Operators with `money` / `pg_lsn` columns in PG → PG sync should upgrade directly to v0.92.3.
+
+---
+
+# sluice v0.92.2 — root-cause closures for v0.92.1's missed silent-loss bugs
+
+**Headline:** v0.92.1's marquee silent-loss closures (Bugs 102/103/106) did not actually deliver in practice — a verification cycle against the published binary found 5 of 8 focuses still failing. v0.92.2 ships the real fixes after a Phase-A diagnostic identified the actual root cause: **`LOAD DATA LOCAL INFILE` silently bypasses strict `sql_mode` for type-conversion errors**, regardless of session sql_mode being correctly set. Plus the applier-side gap for Bug 97, the `--mysql-sql-mode` kong-tag typo, the Bug 109 generated-column redact silent PII leak, and a clarifying treatment of Bug 106 as a MySQL server-side limitation (mysqldump reproduces). **If your destination is MySQL, upgrade — v0.92.1's closures are real now.**
+
+## Fixed
+
+- **`fix(mysql): refuse loudly on LOAD DATA conversion warnings (Bugs 102 + 103 root-cause closure)`** — v0.92.1's `sql_mode='STRICT_TRANS_TABLES,...'` injection IS correct end-to-end (`@@SESSION.sql_mode` on a sluice-opened connection contains every strict mode; direct `INSERT` of out-of-range NUMERIC errors `1264`, direct INSERT of zero-date errors `1292`) — but the bulk-copy path uses `LOAD DATA LOCAL INFILE` with `(@var) SET col=@var` indirection, and **MySQL silently bypasses strict mode for type-conversion errors in that path**. Empirically verified: 80-digit NUMERIC into DECIMAL(65,30) silently clamps to MAX; zero-date TIMESTAMP silently lands as `'0000-00-00 00:00:00'`; explicit `CAST(@var AS type)` in the SET clause does NOT change the behavior. `@@warning_count` IS non-zero though, so v0.92.2 pins the LOAD DATA connection (`sql.DB.Conn`), queries `@@warning_count` after the exec, and refuses loudly with the first up-to-8 `SHOW WARNINGS` rows. Skipped on the `--mysql-sql-mode=''` legacy-data path (operator opted out). Closes the silent-loss class v0.92.1 announced but did not actually deliver. Pinned by `TestLoadDataWarningCountRefusesSilentClamp` (loud-refuse) + `TestLoadDataWarningCountSkippedWhenSQLModeEmpty` (escape hatch) + `TestDirectInsertHonoursStrictMode` (control: confirms the session-level sql_mode does work for direct INSERT).
+
+- **`fix(postgres): plumb verbatim-carry types through the applier's type translator (Bug 97 applier-side gap — wire-encoding finalised in v0.92.3)`** — v0.92.0's CDC reader OID-switch fix landed correctly, but the **applier-side** type translator (`loadColumnTypes` in `internal/engines/postgres/change_applier.go`) carried the same family-dispatch gap. The applier's `information_schema` query didn't fetch `pg_catalog.format_type` and didn't set `VerbatimEligible`, so `translateType` hit the generic loud refusal on the first DML touching `money` / `xml` / `tsvector` / `pg_lsn` / `txid_snapshot` / `pg_snapshot` / range / multirange. Stream died at `pipeline: apply changes: postgres: applier: translate <col>: postgres: unsupported data_type "<type>"`. v0.92.2 adds the `pg_class` + `pg_attribute` join (mirroring the schema reader) and sets `VerbatimEligible=true` in the applier context (target is PG; cross-engine sources can't produce these types in the first place, so the flag has no effect on cross-engine streams). 11-family integration pin covers each verbatim-eligible family per the Bug 74 family-dispatch lesson. **v0.92.3** closes the wire-encoding follow-up (explicit `$N::TYPE` casts for `money` / `pg_lsn`).
+
+- **`fix(cli): kong tag pin for --mysql-sql-mode (v0.92.1 flag-name typo)`** — kong's auto-kebab-case reads `MySQLSQLMode` as `My` + `SQLSQL` (one acronym block, no lowercase break) + `Mode`, emitting the flag as `--my-sqlsql-mode` — a typo that contradicts the help text. Operators who copy-pasted the documented `--mysql-sql-mode` got an `unknown flag` error. v0.92.2 adds explicit `name:"mysql-sql-mode"` kong tag so the public name matches the docs. Two unit pins: positive (`--mysql-sql-mode=...` parses) and negative (`--my-sqlsql-mode` is rejected so v0.92.1-typo paste-copies surface clearly).
+
+- **`fix(pipeline): refuse loudly when a redaction rule targets a GENERATED column (Bug 109 — CRITICAL silent PII leak)`** — `--redact='<generated_column>=<strategy>'` (or YAML equivalent) silently no-op'd at apply time: the target's `GENERATED ALWAYS AS (...) STORED` / virtual column re-derives from the source columns the expression depends on, so the operator's intent to block PII propagation was silently nullified — exit 0, dst still shows the PII via the re-derivation. Same family as Bug 99 (selector unresolved silent no-op). The fix adds a third case to `preflightRedactTypes` (`internal/pipeline/redact_preflight.go`): every rule whose selector resolves to a column with non-empty `GeneratedExpr` is refused with the new `errRedactOnGeneratedColumn` sentinel naming the column, the generated expression, the dialect, and the recovery hint ("redact the source columns the expression depends on"). Found by the v0.92.0 deep bug-finding sweep #3.
+
+## Added
+
+- **`feat(mysql): WARN at schema-read on ENUM/SET labels containing '?' (Bug 106 — clarified as MySQL server-side limitation)`** — investigation determined Bug 106 is a **MySQL server-side data-dictionary limitation, not a sluice connection-charset problem**: MySQL silently substitutes `?` for supplementary-plane (4-byte UTF-8) characters in ENUM/SET labels at `CREATE TABLE` time regardless of column charset; `mysqldump` reproduces the same loss. The label is already gone from the source's catalog by the time sluice reads it — no recovery possible from sluice's side. v0.92.2 surfaces this at schema-read via a WARN line so operators discover the loss before the runtime row-INSERT loud-fails (PG: `invalid input value for enum ...`). Heuristic kept narrow (warn only on `?` chars in column_type) to keep false positives low. `docs/operator/migrating-legacy-mysql.md` gets a new section explaining the MySQL behavior, the runtime symptom, and recovery via `--type-override=TABLE.COL=text`.
+
+## Surprise-closed (incidental, found by v0.92.2 verification cycle)
+
+- **Bug 111 — `backup incremental` segment-level `end_position` propagation** — pre-v0.92.2 the incremental's `changes=0` because the parent's `end_position` wasn't persisted at the segment level, falling through to "start from CDC's current position" and silently omitting writes between the full and the incremental. The v0.92.2 cycle found this no longer reproduces. Not an advertised v0.92.2 fix — the closure likely came in incidentally via one of the other changes. Operators on a chained-backup workflow should re-verify against their own setup before relying on this.
+
+## Compatibility
+
+- **Patch bump (v0.92.2).** Drop-in from v0.92.1 except for the behavior changes below.
+- **Behavior changes** (all designed to surface previously-silent loss):
+  - MySQL `writeLoadData` now refuses loudly on any post-load warning when the session uses sluice's default strict `sql_mode`. Pre-v0.92.2 the bulk-copy path silently corrupted values that MySQL's strict mode would normally reject. The `--mysql-sql-mode=''` escape hatch (legacy data) bypasses the refusal.
+  - The PG change applier now translates `money` / `xml` / `tsvector` / `pg_lsn` / `txid_snapshot` / `pg_snapshot` / range / multirange types correctly on the apply path; pre-v0.92.2 the stream died on the first DML. Wire-encoding for `money` / `pg_lsn` is finalised in v0.92.3.
+  - `--mysql-sql-mode` is the canonical flag name (v0.92.1's `--my-sqlsql-mode` is no longer accepted; you'll get an explicit `unknown flag` error so the rename is discoverable).
+  - Redaction rules targeting a GENERATED column now refuse loudly at preflight. Pre-v0.92.2 they silently no-op'd, leaving PII on the target.
+
+## Who needs this
+
+- **Anyone with MySQL as a sluice target** — Bug 102 (NUMERIC overflow), Bug 103 (TIMESTAMPTZ out-of-range), and any other LOAD DATA type-conversion edge are now the loud MySQL error path instead of silent client-side corruption. **Upgrade.**
+- **Anyone running PG → PG sync with `xml` / `tsvector` / `int4range` / range / multirange columns** — Bug 97 silent-stream-death is now closed at the applier. **Upgrade if your source has any of those types.** (For `money` / `pg_lsn` columns, upgrade directly to v0.92.3.)
+- **Anyone using `--redact` on columns** — verify your redaction rules don't target GENERATED columns; v0.92.2 surfaces the silent PII leak at preflight (Bug 109).
+- **Anyone scripted against `--mysql-sql-mode`** — v0.92.1 accepted `--my-sqlsql-mode` (typo). v0.92.2 makes `--mysql-sql-mode` (the documented name) canonical. Update scripts accordingly.
+- **Anyone migrating MySQL ENUM/SET schemas with emoji / supplementary-plane labels** — read the new `docs/operator/migrating-legacy-mysql.md` section. The corruption is MySQL-side (not sluice's), but the sluice WARN now surfaces it at schema-read.
+
+## Coming next
+
+v0.92.3 closes the wire-encoding follow-up for Bug 97 (`money` / `pg_lsn`) and Bug 121 (`--slot-name` normalization across backup commands). v0.93.0 will ship the CDC schema-race family closures (Bugs 112 + 119 + 120 — shared root: applier's relation cache doesn't react to relation-OID changes mid-stream → silent drops on RENAME / DROP COLUMN / DROP+CREATE-same-name). v0.93.0 is concurrency-adjacent and needs the `-race` integration gate before tag cut.

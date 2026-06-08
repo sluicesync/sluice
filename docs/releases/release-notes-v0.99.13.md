@@ -1,3 +1,5 @@
+# sluice v0.99.13
+
 **Cross-engine parity + table-scope completion.** A no-PK table that carries a NOT-NULL UNIQUE key now migrates and syncs **MySQL→Postgres** without a manual schema change (it already worked MySQL→MySQL), and the v0.99.12 `--include-table` snapshot scope now also covers the PlanetScale cold-start **resume** and **backup** paths. Drop-in upgrade from v0.99.12 — no breaking API or CLI changes.
 
 ## Fixed

@@ -1,8 +1,0 @@
-{"strict": true, "checks": [
-  {"context": "Test (ubuntu-latest)"},
-  {"context": "Integration"},
-  {"context": "Integration (PostGIS)"},
-  {"context": "Integration (vstream)"},
-  {"context": "Lint"},
-  {"context": "Build (ubuntu-latest)"}
-]}

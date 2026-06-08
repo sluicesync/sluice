@@ -1,3 +1,5 @@
+# sluice v0.99.15
+
 **A self-hosted Vitess engine flavor and a clearer error for an unsupported Postgres user-defined type.** Drop-in upgrade from v0.99.14 — additive, no breaking API or CLI changes.
 
 ## Added
