@@ -117,7 +117,7 @@ jobs:
       - uses: actions/checkout@v6
 
       # Install Go and enable the module cache so subsequent runs reuse
-      # downloaded dependencies. setup-go@v5 enables caching by default.
+      # downloaded dependencies. setup-go@v6 enables caching by default.
       # `go-version-file` reads the version from go.mod so CI tracks the
       # declared toolchain automatically — bumping go.mod is the only
       # place a Go upgrade has to land.
