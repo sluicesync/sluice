@@ -66,6 +66,13 @@ import (
 // Nothing in the design depends on the specific value.
 const defaultBulkParallelMinRows int64 = 80_000
 
+// adaptiveBulkParallelMinRowsFloor is the lowest the auto threshold is
+// dialled to on a many-table schema (roadmap item 3, phase (b)). Below
+// this, per-chunk overhead (extra connections, MIN/MAX query, per-chunk
+// state writes) outweighs the parallelism gain even when many tables are
+// waiting, so genuinely small tables still take the single-reader path.
+const adaptiveBulkParallelMinRowsFloor int64 = 10_000
+
 // defaultBulkParallelism is the per-table reader/writer pair count
 // when --bulk-parallelism is left at zero. The orchestrator caps it at
 // min(8, NumCPU) to avoid saturating per-target connection pools on
@@ -108,14 +115,35 @@ func resolveBulkParallelism(configured, numCPU int) int {
 	return configured
 }
 
-// resolveBulkParallelMinRows applies the "0 = use default" rule. The
-// CLI default is 80k (v0.62.0+); in-process callers passing zero
-// pick up the same value.
-func resolveBulkParallelMinRows(configured int64) int64 {
-	if configured <= 0 {
+// resolveBulkParallelMinRows resolves the within-table-split threshold.
+//
+// An explicit operator value (configured > 0) is honoured verbatim — we
+// never override a knob the operator set.
+//
+// configured <= 0 is the "auto" sentinel (the CLI default). Here we ADAPT
+// the threshold to the table count (roadmap item 3, phase (b)): a
+// single/few-table schema keeps the full default (preserving the
+// single-large-table auto-split win), but as the table count rises the
+// threshold is dialled DOWN — toward adaptiveBulkParallelMinRowsFloor — so a
+// many-medium-table schema engages within-table parallelism instead of
+// copying each medium table serially AND single-streamed (the pgcopydb
+// many-table gap: 30 medium tables sat below the fixed 80k threshold, so
+// every one was single-streamed and the table loop ran them serially,
+// leaving cores idle). The curve is default/tableCount clamped to
+// [floor, default]: monotonic, tableCount==1 is unchanged, and small tables
+// still skip chunking via the floor.
+func resolveBulkParallelMinRows(configured int64, tableCount int) int64 {
+	if configured > 0 {
+		return configured
+	}
+	if tableCount <= 1 {
 		return defaultBulkParallelMinRows
 	}
-	return configured
+	adapted := defaultBulkParallelMinRows / int64(tableCount)
+	if adapted < adaptiveBulkParallelMinRowsFloor {
+		return adaptiveBulkParallelMinRowsFloor
+	}
+	return adapted
 }
 
 // canParallelChunkTable reports whether table is eligible for the

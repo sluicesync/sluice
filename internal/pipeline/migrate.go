@@ -859,7 +859,7 @@ func (m *Migrator) runSingleDatabase(ctx context.Context, scope *multiDBScope) e
 		sourceDSN:      m.SourceDSN,
 		targetDSN:      m.TargetDSN,
 		parallelism:    copyParallelism,
-		minRows:        resolveBulkParallelMinRows(m.BulkParallelMinRows),
+		minRows:        resolveBulkParallelMinRows(m.BulkParallelMinRows, len(schema.Tables)),
 		maxBufferBytes: m.MaxBufferBytes,
 		// ADR-0043 gate (3): --force-cold-start skipped the Bug 9
 		// preflight, so the target may hold rows; the fast non-upsert

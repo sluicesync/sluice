@@ -256,6 +256,52 @@ func TestResolveBulkParallelism(t *testing.T) {
 	}
 }
 
+// TestResolveBulkParallelMinRows pins the roadmap item 3 phase (b) adaptive
+// threshold: explicit values are honoured verbatim (never auto-lowered),
+// while the 0=auto sentinel scales the threshold down as the table count
+// rises — preserving the single-table default and flooring at 10k.
+func TestResolveBulkParallelMinRows(t *testing.T) {
+	cases := []struct {
+		name       string
+		configured int64
+		tableCount int
+		want       int64
+	}{
+		{"explicit honoured verbatim, ignores tableCount", 100_000, 30, 100_000},
+		{"explicit honoured for single table", 100_000, 1, 100_000},
+		{"explicit small honoured (not auto-lowered)", 5_000, 50, 5_000},
+		{"explicit 1 honoured", 1, 100, 1},
+		{"auto single table = full default", 0, 1, 80_000},
+		{"auto zero tables (defensive) = full default", 0, 0, 80_000},
+		{"auto 2 tables = default/2", 0, 2, 40_000},
+		{"auto 4 tables = default/4", 0, 4, 20_000},
+		{"auto 5 tables = default/5", 0, 5, 16_000},
+		{"auto 8 tables = floor (default/8 == floor)", 0, 8, 10_000},
+		{"auto 30 tables = floored at 10k", 0, 30, 10_000},
+		{"auto 1000 tables = floored at 10k", 0, 1000, 10_000},
+		{"negative treated as auto", -1, 1, 80_000},
+	}
+	prev := int64(1<<62 - 1)
+	for _, c := range cases {
+		got := resolveBulkParallelMinRows(c.configured, c.tableCount)
+		if got != c.want {
+			t.Errorf("%s: resolveBulkParallelMinRows(%d, %d) = %d; want %d",
+				c.name, c.configured, c.tableCount, got, c.want)
+		}
+		if got < adaptiveBulkParallelMinRowsFloor && c.configured <= 0 {
+			t.Errorf("%s: auto result %d below floor %d", c.name, got, adaptiveBulkParallelMinRowsFloor)
+		}
+	}
+	// Monotonic non-increasing as the table count rises (auto path).
+	for tc := 1; tc <= 64; tc++ {
+		got := resolveBulkParallelMinRows(0, tc)
+		if got > prev {
+			t.Errorf("auto threshold not monotonic: tableCount=%d gave %d > previous %d", tc, got, prev)
+		}
+		prev = got
+	}
+}
+
 // TestCoerceInt64 covers the realistic driver-return shapes plus the
 // rejected ones.
 func TestCoerceInt64(t *testing.T) {
