@@ -8,11 +8,14 @@ consistency — directly inspired sluice's bulk-copy implementation (`CLAUDE.md`
 evaluator asks is: *"for the PG → PG initial copy, how close did sluice actually
 get to the thing it was modeled on?"*
 
-**Short answer.** Close, and out-of-the-box sluice is actually a touch faster on a
-single large table — but pgcopydb still has a meaningfully faster *per-stream* COPY,
-and it remains the right tool when you're PG → PG forever and want nothing but the
-copy. sluice's pitch over pgcopydb is **coverage** (cross-engine + CDC), not raw
-single-table COPY throughput.
+**Short answer.** On a single large table sluice's default auto-parallel COPY edges
+pgcopydb's default — but on a realistic **large mixed corpus (110 GB, 43 tables)
+pgcopydb is ~1.75× faster end-to-end** (895 s vs 1564 s), from two structural
+advantages: it overlaps index builds with the copy (sluice runs them as a separate
+phase), and its raw byte-pipe COPY is ~23% faster per stream than sluice's
+decode-through-the-IR path. Both are zero-loss; both are disk-bound at this scale.
+sluice's pitch over pgcopydb stays **coverage** (cross-engine + CDC), and the two
+gaps are now tracked optimizations (index-overlap; a PG→PG identity passthrough).
 
 ---
 
@@ -92,42 +95,102 @@ would show through.
 
 ---
 
-## Multi-table: where pgcopydb's default pulls ahead (and how sluice catches up)
+## Multi-table: the cross-table gap (found here, now closed)
 
 The single-table table above is the *least* favorable shape for pgcopydb's default.
 The opposite shape — **many tables** — is where pgcopydb's cross-table parallelism
-shines and sluice's serial-per-table copy shows its limit. Same 1.5M total rows, now
-spread across **30 tables × 50k rows** (each below sluice's 80k within-table-split
-threshold, so this isolates the *cross-table* axis). Median of 3, sluice 0.99.17:
+shines. The original measurement that surfaced the gap: 1.5M total rows across
+**30 tables × 50k rows** (each below sluice's 80k within-table-split threshold, so it
+isolates the *cross-table* axis). Median of 3, sluice 0.99.17:
 
 | Configuration | Median | Read-out |
 |---|---|---|
 | **pgcopydb — default (4 table-jobs)** | **6.13 s** | copies 4 tables concurrently |
 | pgcopydb — table-jobs 8 | 6.47 s | flattens past 4 (slight contention) |
-| **sluice — default** | **16.12 s** | **copies tables serially** (within-table parallel only) |
-| sluice — `--bulk-parallel-min-rows 10000` | 6.97 s | forces 8-way within-table split per table |
+| **sluice 0.99.17 — default** | **16.12 s** | copied tables *serially* (within-table parallel only) |
+| sluice 0.99.17 — `--bulk-parallel-min-rows 10000` | 6.97 s | forced 8-way within-table split per table |
 
-Two honest read-outs:
+At the time, sluice's `migrate` had **no cross-table concurrency** — the per-table loop
+was serial and `--bulk-parallelism` only split *within* a table, so 30 medium tables
+were single-streamed *and* serial (~2.6× behind pgcopydb out of the box; tunable to
+within ~14% by hand-lowering the split threshold).
 
-1. **Out-of-the-box on many tables, pgcopydb is ~2.6× faster** (6.13 vs 16.12). This
-   *reverses* the single-table default result. The cause is architectural:
-   **sluice's `migrate` has no cross-table concurrency** — the per-table loop is
-   serial (`internal/pipeline/migrate.go`), and `--bulk-parallelism` only splits
-   *within* a table. pgcopydb's `--table-jobs` (default 4) copies multiple tables at
-   once. On a many-table schema, sluice leaves cores idle between tables.
+**That gap is now closed (roadmap item 3, both phases):**
 
-2. **The gap is mostly *tunable*, not fundamental.** Lowering
-   `--bulk-parallel-min-rows` so each 50k table gets split into 8 PK-range chunks
-   brings sluice to **6.97 s — within ~14% of pgcopydb.** 8-way *within*-table ≈ 4-way
-   *across*-table for total throughput; the default only loses because 50k < the 80k
-   threshold leaves each table single-streamed *and* serial. The residual ~14% is the
-   serial-table scheduling overhead pgcopydb doesn't pay.
+- **(a) cross-table copy worker pool** ([ADR-0076](adr/adr-0076-cross-table-copy-worker-pool.md), `--table-parallelism`, default 4 — pgcopydb's `--table-jobs` model) copies N tables concurrently, composed with the within-table axis under one combined connection budget.
+- **(b) adaptive `--bulk-parallel-min-rows`** (`0 = auto`, scales the threshold down as the table count rises) so a many-medium-table schema auto-engages within-table parallelism — no hand-tuning.
 
-**Roadmap implication (worth a real issue):** sluice would benefit from either
-cross-table copy concurrency, or an adaptive `--bulk-parallel-min-rows` that drops as
-the table count rises (so many-medium-table schemas auto-engage within-table
-parallelism instead of single-streaming serially). Today the operator has to know to
-lower the threshold by hand.
+The at-scale run below confirms the pool carries a full 43-table corpus zero-loss; the
+remaining gap vs pgcopydb is **no longer cross-table scheduling** — it's per-stream
+copy rate and a sequential index phase (both characterized next).
+
+---
+
+## At scale: 110 GB mixed corpus (the honest end-to-end picture)
+
+A larger, fairer corpus than the 1.5M-row micro-benchmarks: **107 GB heap / 133 GB
+with indexes, 422M rows across 43 tables** — 3 huge tables (~30 GB each, exercising
+within-table PK-range splitting) + 40 medium tables (exercising the cross-table pool)
++ realistic mixed columns (bigint PK, varchar, jsonb, numeric, timestamptz, boolean)
++ 3 secondary indexes per table. Both tools containerized on one Docker network
+against two tuned `postgres:16` containers (`shared_buffers=2GB`, `max_wal_size=16GB`,
+`maintenance_work_mem=1GB`, `max_connections=300`, `/dev/shm=8g`). Single Windows +
+Rancher-Desktop host, shared NVMe. Reproduce via `bench-pgcopydb/` (seed.sql +
+gen_fn.sql + bench.sh). All runs zero-loss (aggregate-checksum verified).
+
+| Configuration | Total wall | Notes |
+|---|---|---|
+| **pgcopydb — default (4 table/index jobs)** | **895 s (~15 min)** | overlaps COPY + CREATE INDEX + VACUUM (12-way) |
+| pgcopydb — tuned (`--split-tables-larger-than 2GB --table-jobs 8 --index-jobs 4`) | 985 s | *slower* — over-splitting contends on a saturated disk |
+| **sluice — default (`--table-parallelism 4 --bulk-parallelism 8`)** | **1564 s (~26 min)** | bulk-copy 1103 s (99.5 MB/s) **then** a separate 457 s index phase |
+| sluice — tuned (`--table-parallelism 8 --bulk-parallelism 8`) | 1598 s | identical to default — more parallelism does nothing |
+
+Three honest read-outs:
+
+### 1. It's disk-bound — parallelism is maxed, structure is the lever
+
+sluice tuned (64-way) ties sluice default (32-way); pgcopydb tuned (split) is *slower*
+than pgcopydb default. The shared NVMe saturates at ~100–122 MB/s and extra workers /
+table-splitting only add contention. So the wins are **not** more parallelism — they
+are the two structural differences below. (Absolute MB/s is host-specific and far
+below pgcopydb's published cloud figures of 1.5–2 TB/hr / 400–500 MB/s, which assume
+provisioned-IOPS disks + a fat NIC; *those* need an in-region cloud rig. Here the
+portable takeaway is the **ratio**, not the absolute.)
+
+### 2. pgcopydb is ~1.75× faster end-to-end — two separable causes
+
+pgcopydb 895 s vs sluice 1564 s. From its own step summary (COPY cumulative 38.9 min +
+CREATE INDEX cumulative 33.6 min, overlapped into ~14 min wall, 12-way concurrency):
+
+- **Overlapped index builds.** pgcopydb builds each table's indexes *as soon as its
+  data lands*, concurrently with the still-copying tables. sluice runs a full
+  bulk-copy phase **then** a separate index phase — a sequential ~457 s tail (29% of
+  sluice's total) that pgcopydb hides.
+- **~23% higher copy rate** (122.6 vs 99.5 MB/s). pgcopydb byte-pipes the raw COPY
+  stream (`COPY … TO STDOUT` → `COPY … FROM STDIN`) with zero per-value work; sluice
+  decodes every row into its typed IR and re-encodes it via `pgx.CopyFrom` (binary
+  COPY — already the fast pgx path, `row_writer.go`). That decode→IR→re-encode is the
+  price of IR-first generality (cross-engine, redaction, type-overrides,
+  value-fidelity); even at disk saturation the extra per-byte CPU keeps the disk
+  slightly less full.
+
+### 3. Both are correct
+
+Every run landed all 422M rows with matching aggregate checksums (count + sum(id) +
+sum(amount) + sum(length(event_type)) + true-count per table) and all indexes. The
+comparison is speed + coverage, not correctness.
+
+**Two optimizations this surfaces (tracked on the roadmap):**
+
+1. **Overlap index builds with the copy** (broadest win — every engine pair, not just
+   PG→PG): build a table's indexes as soon as its copy completes, concurrently with
+   ongoing copies, under the same combined connection budget; constraints/FKs stay a
+   final phase. Closes most of the ~457 s sequential tail.
+2. **PG→PG identity passthrough** (closes the per-stream rate gap): for a same-engine,
+   no-transform copy (no redaction / type-override / shard-injection / cross-engine),
+   bypass the IR and byte-pipe `COPY … TO STDOUT` → `COPY … FROM STDIN` via pgx's raw
+   `pgconn` — pgcopydb's exact tactic — falling back to the IR path the moment any
+   transform is present.
 
 ## Where pgcopydb is strictly better
 

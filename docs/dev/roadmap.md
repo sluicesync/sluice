@@ -83,6 +83,20 @@ What remains are the **harder-frontier, demand-gated items** that have always be
 
 ---
 
+### 3b. PG→PG copy throughput: index-build overlap + identity passthrough — *NEXT (surfaced by the at-scale pgcopydb benchmark, 2026-06-08)*
+
+**Why.** The 110 GB / 43-table at-scale comparison (`docs/comparison-pgcopydb.md`, "At scale" section) showed pgcopydb **~1.75× faster end-to-end** (895 s vs 1564 s) on a realistic mixed corpus — *after* item 3 closed the cross-table gap. The remaining difference is two **structural** things (NOT parallelism — the run is disk-bound at ~100–122 MB/s; tuning workers/splitting did nothing or hurt). Both are concrete, independently-shippable optimizations.
+
+**What.** Two separate chunks (each likely an ADR + a `-race`/value-fidelity pass):
+
+- **(a) Overlap index builds with the copy — the broad win (every engine pair).** Today `migrate` runs a full bulk-copy phase, *then* a separate deferred index phase (a sequential ~457 s tail at 110 GB — 29% of total — that pgcopydb hides by building each table's indexes as its data lands). Build a table's secondary indexes as soon as its copy completes, concurrently with the still-copying tables (extends the item-3 cross-table pool). **Gotchas:** (1) the combined connection budget (`resolveCopyParallelismBudget`) must now span copy *and* index-build connections held SIMULTANEOUSLY, not the current sequential assumption; (2) constraints/FKs stay a FINAL phase (FK validation needs all data + indexes present); (3) resumability — per-table index state interleaved with copy state; (4) `-race`-before-tag (concurrency chunk extending ADR-0076's pool). PG-first (the index-build-parallelism machinery is PG-only) but the phase-overlap concept generalizes.
+
+- **(b) PG→PG identity passthrough — closes the per-stream rate gap (PG→PG only).** sluice's copy is ~23% slower per-stream (99.5 vs 122.6 MB/s) because it decodes every row into the typed IR and re-encodes via `pgx.CopyFrom` (already the fast binary-COPY pgx path — `row_writer.go`) — the price of IR-first generality. pgcopydb byte-pipes the raw COPY stream (`COPY … TO STDOUT` → `COPY … FROM STDIN`) with zero per-value work. Add a same-engine fast lane that does the same via pgx's raw `pgconn` `CopyTo`/`CopyFrom`, composing with the chunk machinery (`COPY (SELECT … WHERE pk BETWEEN …) TO STDOUT` per chunk → still a byte-pipe). **Gotcha — the GATE is correctness-critical (value-fidelity-reviewer lens):** engage ONLY when source==target==postgres AND no `--redact` AND no `--expr/type-override` on any copied table AND no shard-injection AND identical column projection — any transform present → fall back to the IR path, or you silently bypass a transformation (silent-loss class). Also: **text vs binary COPY format** for the pipe — binary is fastest but version/codec-sensitive across PG majors; default to text (cross-version-safe, pgcopydb's default), binary opt-in on matched versions.
+
+**Operator demand check.** Competitive-gated (the pgcopydb-comparison story), operator-chosen 2026-06-08 to do next. (a) is the higher-value/broader; (b) is the headline per-stream-gap closer for the PG→PG audience. Reproduce the benchmark via `bench-pgcopydb/`.
+
+---
+
 ### 5. Translator catalog continuation
 
 **Status (v0.38.0).** Twenty-eight of 30 catalog rules shipped after a second re-assessment pass. v0.35.0 landed 6 rules; v0.37.0 added 3 more (TIMESTAMPDIFF, JSON_OBJECT/ARRAY, LAST_DAY); v0.38.0 added 3 more from rule #10's hash family (MD5 unconditional via PG core; SHA1 + SHA2 gated on `--enable-pg-extension pgcrypto`). pgcrypto joins the extension catalog as a presence-gate (no types) — sluice's preflight confirms it's installed on the target before the SHA rewrites fire. The remaining 5 rules stay deferred per the catalog's load-bearing per-rule analysis:

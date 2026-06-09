@@ -1,0 +1,4 @@
+# Build context for the sluice-from-main bench image (contains the compiled
+# binary) and per-run logs — reproducible from the committed scripts, not tracked.
+img/
+results/
