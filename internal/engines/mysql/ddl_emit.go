@@ -1039,6 +1039,17 @@ func emitTableDefWithDomainChecks(table *ir.Table, inlineCheckSupported bool) (s
 // expression text is preserved as-is, so non-portable constructs fail
 // loudly on the target rather than be silently rewritten.
 func emitIndexColumnList(cols []ir.IndexColumn) string {
+	return emitIndexColumnListWithPrefix(cols, true)
+}
+
+// emitIndexColumnListWithPrefix renders the parenthesised column list,
+// optionally suppressing the per-column prefix length. SPATIAL and FULLTEXT
+// indexes MUST NOT carry a column prefix — MySQL rejects `pt(32)` on such an
+// index with Error 1089 ("Incorrect prefix key; the used key part isn't a
+// string …"). The source reader can legitimately surface a SUB_PART on a
+// spatial index's geometry column, so the prefix is dropped at emit time for
+// those kinds (allowPrefix=false) rather than relying on the reader.
+func emitIndexColumnListWithPrefix(cols []ir.IndexColumn, allowPrefix bool) string {
 	parts := make([]string, len(cols))
 	for i, c := range cols {
 		var entry string
@@ -1046,7 +1057,7 @@ func emitIndexColumnList(cols []ir.IndexColumn) string {
 			entry = "(" + translateIndexExpr(c) + ")"
 		} else {
 			entry = quoteIdent(c.Column)
-			if c.Length > 0 {
+			if allowPrefix && c.Length > 0 {
 				entry += fmt.Sprintf("(%d)", c.Length)
 			}
 		}
@@ -1092,7 +1103,10 @@ func emitCreateIndex(tableName string, idx *ir.Index) (string, error) {
 		sb.WriteString(quoteIdent(idx.Name))
 		sb.WriteByte(' ')
 	}
-	sb.WriteString(emitIndexColumnList(idx.Columns))
+	// SPATIAL / FULLTEXT indexes reject a column prefix (Error 1089); every
+	// other kind keeps the source's prefix length.
+	allowPrefix := idx.Kind != ir.IndexKindSpatial && idx.Kind != ir.IndexKindFullText
+	sb.WriteString(emitIndexColumnListWithPrefix(idx.Columns, allowPrefix))
 
 	// Storage type: MySQL accepts USING BTREE / USING HASH for
 	// regular indexes. FULLTEXT and SPATIAL ignore it.

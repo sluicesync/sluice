@@ -1101,6 +1101,29 @@ func TestEmitCreateIndex(t *testing.T) {
 			},
 			want: "ALTER TABLE `users` ADD INDEX `users_mixed` (`tenant_id`, (lower(email))) USING BTREE;",
 		},
+		{
+			// ADR-0080 regression: a SPATIAL index must NOT carry a column
+			// prefix even when the source surfaced a SUB_PART (Length) on the
+			// geometry column — MySQL rejects `pt(32)` on a SPATIAL index with
+			// Error 1089. The prefix is dropped at emit time.
+			name: "spatial drops prefix",
+			idx: &ir.Index{
+				Name:    "places_pt_spidx",
+				Kind:    ir.IndexKindSpatial,
+				Columns: []ir.IndexColumn{{Column: "pt", Length: 32}},
+			},
+			want: "ALTER TABLE `users` ADD SPATIAL INDEX `places_pt_spidx` (`pt`);",
+		},
+		{
+			// Same rule for FULLTEXT: no column prefix even if Length is set.
+			name: "fulltext drops prefix",
+			idx: &ir.Index{
+				Name:    "posts_body_ft_pref",
+				Kind:    ir.IndexKindFullText,
+				Columns: []ir.IndexColumn{{Column: "body", Length: 64}},
+			},
+			want: "ALTER TABLE `users` ADD FULLTEXT INDEX `posts_body_ft_pref` (`body`);",
+		},
 	}
 	for _, c := range cases {
 		c := c
