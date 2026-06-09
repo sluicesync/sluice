@@ -91,17 +91,33 @@ t_cold=$(date +%s)
 wait "$writer_pid" 2>/dev/null; echo "$(cat "$LOGDIR/writer.log" | tail -1)"
 t_writer_done=$(date +%s)
 
-# Drain: poll until src checksum == dst checksum, stable for 2 reads.
+# Drain: poll the dst row-count climbing toward src each tick (progress
+# visibility — distinguishes "slow drain" from "stuck/lost"), and only run the
+# expensive full checksum once the counts converge. Stable for 2 checksum reads.
+rowtotal() { docker exec "$1" psql -U postgres -d benchdb -tAc \
+  "SELECT coalesce(sum(c),0) FROM (SELECT (xpath('/row/c/text()', query_to_xml(format('SELECT count(*) AS c FROM %I.%I', schemaname, tablename), false, true, '')))[1]::text::bigint AS c FROM pg_tables WHERE schemaname='public' AND tablename LIKE 'cdc\_%') s" 2>/dev/null | tr -d '[:space:]'; }
 echo "draining CDC (timeout ${DRAIN_TIMEOUT}s) ..."
-matches=0; zl="TIMEOUT"; drain_start=$(date +%s)
+matches=0; zl="TIMEOUT"; drain_start=$(date +%s); last_dst=-1; stalls=0
 while [ $(( $(date +%s) - drain_start )) -lt "$DRAIN_TIMEOUT" ]; do
-  cs_src="$(cksum bench-cdc-src)"; cs_dst="$(cksum bench-cdc-dst)"
-  if [ -n "$cs_src" ] && [ "$cs_src" = "$cs_dst" ]; then
-    matches=$((matches+1)); [ "$matches" -ge 2 ] && { zl="ZERO-LOSS-OK"; break; }
+  rt_src="$(rowtotal bench-cdc-src)"; rt_dst="$(rowtotal bench-cdc-dst)"
+  printf '  drain t=%ss: dst=%s / src=%s (lag=%s)\n' \
+    "$(( $(date +%s) - drain_start ))" "${rt_dst:-?}" "${rt_src:-?}" "$(( ${rt_src:-0} - ${rt_dst:-0} ))"
+  if [ -n "$rt_src" ] && [ "$rt_src" = "$rt_dst" ]; then
+    # Counts converged — confirm with the value-sensitive checksum.
+    cs_src="$(cksum bench-cdc-src)"; cs_dst="$(cksum bench-cdc-dst)"
+    if [ -n "$cs_src" ] && [ "$cs_src" = "$cs_dst" ]; then
+      matches=$((matches+1)); [ "$matches" -ge 2 ] && { zl="ZERO-LOSS-OK"; break; }
+    else
+      matches=0
+    fi
   else
     matches=0
+    # Stall detection: dst not advancing AND still behind ⇒ candidate real loss.
+    if [ "$rt_dst" = "$last_dst" ]; then stalls=$((stalls+1)); else stalls=0; fi
+    last_dst="$rt_dst"
+    [ "$stalls" -ge 6 ] && { zl="STALLED (dst stuck behind src — candidate loss)"; break; }
   fi
-  sleep 5
+  sleep 8
 done
 t_drained=$(date +%s)
 
