@@ -101,11 +101,15 @@ func (s *SnapshotImporter) ImportSnapshot(ctx context.Context, snapshotName stri
 		}
 		// Wrap the pinned conn into a RowReader. The closer is a small
 		// adapter that ROLLBACKs the snapshot tx then returns the conn
-		// to the pool.
+		// to the pool. snapshotPinned MUST be set: unlike the stream's
+		// externally-owned reader (closer==nil), this reader has a non-nil
+		// closer, so without the explicit flag the CountRows deadlock-guard
+		// would miss it and self-deadlock on the pinned conn (ADR-0079).
 		rdr := &RowReader{
-			q:      conn,
-			schema: s.schema,
-			closer: snapshotConnCloser{conn: conn},
+			q:              conn,
+			schema:         s.schema,
+			closer:         snapshotConnCloser{conn: conn},
+			snapshotPinned: true,
 		}
 		readers = append(readers, rdr)
 	}

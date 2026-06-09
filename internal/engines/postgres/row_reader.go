@@ -50,6 +50,22 @@ type RowReader struct {
 	// the SnapshotStream owns the lifecycle. Close is a no-op when nil.
 	closer io.Closer
 
+	// snapshotPinned marks a reader whose queries all run on ONE pinned
+	// *sql.Conn inside a single consistent-read transaction (the
+	// slot/export snapshot stream's reader, and the parallel
+	// SnapshotImporter readers). Such a reader CANNOT run two overlapping
+	// queries on its connection — database/sql serialises a *sql.Conn
+	// through closemu, so e.g. CountRows's exact-COUNT fallback firing a
+	// second QueryContext while its first Rows is still open self-deadlocks
+	// (and during a copy, a probe racing the in-flight row-stream would
+	// too). Methods that would issue such an overlapping/concurrent query
+	// (CountRows) short-circuit when this is set. It is the EXPLICIT signal
+	// for "single pinned conn"; the older `closer == nil` test caught only
+	// the externally-owned snapshot reader and MISSED the self-closing
+	// importer readers — which have a non-nil closer yet are equally
+	// pinned (the bug that wedged the ADR-0079 sync fast path).
+	snapshotPinned bool
+
 	mu  sync.Mutex
 	err error // sticky error from the most recent ReadRows call
 }

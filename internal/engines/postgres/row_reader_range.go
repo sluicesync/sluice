@@ -110,8 +110,14 @@ func (r *RowReader) CountRows(ctx context.Context, table *ir.Table) (int64, erro
 	if table == nil {
 		return 0, errors.New("postgres: CountRows: table is nil")
 	}
-	if r.closer == nil {
-		// Snapshot-pinned reader; concurrent queries would deadlock.
+	if r.closer == nil || r.snapshotPinned {
+		// Snapshot-pinned reader (externally-owned stream reader OR a
+		// self-closing SnapshotImporter reader): all queries run on one
+		// pinned *sql.Conn, so the exact-COUNT fallback's second query —
+		// fired while this method's reltuples Rows is still open — would
+		// self-deadlock on the conn's closemu (and a probe racing an
+		// in-flight copy stream would too). Return "no estimate"; the
+		// caller routes a pinned reader to the single-stream path.
 		return 0, nil
 	}
 	q := `SELECT COALESCE((SELECT reltuples::bigint
