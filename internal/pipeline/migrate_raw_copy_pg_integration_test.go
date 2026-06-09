@@ -73,6 +73,22 @@ func (r *rawCopyRecorder) any() bool {
 	return len(r.tables) > 0
 }
 
+// count returns how many times the raw-copy lane fired for one table. The
+// observer fires once per raw-copied UNIT — a whole-table single stream fires
+// once; a within-table-chunked table fires once per chunk — so count(t) > 1
+// proves within-table PK-range chunking actually engaged for t (ADR-0079 v1.1).
+func (r *rawCopyRecorder) count(table string) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n := 0
+	for _, tn := range r.tables {
+		if tn == table {
+			n++
+		}
+	}
+	return n
+}
+
 // pgScalar runs a single-value query and returns the int64 result.
 func pgScalar(t *testing.T, dsn, query string) int64 {
 	t.Helper()

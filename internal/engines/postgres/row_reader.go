@@ -51,19 +51,18 @@ type RowReader struct {
 	closer io.Closer
 
 	// snapshotPinned marks a reader whose queries all run on ONE pinned
-	// *sql.Conn inside a single consistent-read transaction (the
-	// slot/export snapshot stream's reader, and the parallel
-	// SnapshotImporter readers). Such a reader CANNOT run two overlapping
-	// queries on its connection — database/sql serialises a *sql.Conn
-	// through closemu, so e.g. CountRows's exact-COUNT fallback firing a
-	// second QueryContext while its first Rows is still open self-deadlocks
-	// (and during a copy, a probe racing the in-flight row-stream would
-	// too). Methods that would issue such an overlapping/concurrent query
-	// (CountRows) short-circuit when this is set. It is the EXPLICIT signal
-	// for "single pinned conn"; the older `closer == nil` test caught only
-	// the externally-owned snapshot reader and MISSED the self-closing
-	// importer readers — which have a non-nil closer yet are equally
-	// pinned (the bug that wedged the ADR-0079 sync fast path).
+	// *sql.Conn inside a single consistent-read transaction (a parallel
+	// SnapshotImporter reader; the externally-owned stream reader is the
+	// other pinned kind, identified by closer == nil). Such a reader cannot
+	// run two OVERLAPPING queries on its connection — database/sql serialises
+	// a *sql.Conn through closemu. The range/count methods respect this by
+	// issuing strictly-sequential, fully-closed queries (see
+	// [RowReader.reltuplesEstimate]) and, on a pinned reader, declining the
+	// exact-COUNT(*) seq-scan fallback (cost, not safety — ADR-0079 v1.1).
+	// It is the EXPLICIT signal for "single pinned conn"; the older
+	// `closer == nil` test alone caught only the externally-owned stream
+	// reader and MISSED the self-closing importer readers — which have a
+	// non-nil closer yet are equally pinned (the a8d065d deadlock).
 	snapshotPinned bool
 
 	mu  sync.Mutex
