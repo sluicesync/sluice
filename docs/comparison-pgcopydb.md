@@ -9,13 +9,18 @@ evaluator asks is: *"for the PG → PG initial copy, how close did sluice actual
 get to the thing it was modeled on?"*
 
 **Short answer.** On a single large table sluice's default auto-parallel COPY edges
-pgcopydb's default — but on a realistic **large mixed corpus (110 GB, 43 tables)
-pgcopydb is ~1.75× faster end-to-end** (895 s vs 1564 s), from two structural
-advantages: it overlaps index builds with the copy (sluice runs them as a separate
+pgcopydb's default. On a realistic **large mixed corpus (110 GB, 43 tables)** pgcopydb
+was originally ~1.75× faster end-to-end (895 s vs 1564 s), from two structural
+advantages: it overlaps index builds with the copy (sluice ran them as a separate
 phase), and its raw byte-pipe COPY is ~23% faster per stream than sluice's
-decode-through-the-IR path. Both are zero-loss; both are disk-bound at this scale.
-sluice's pitch over pgcopydb stays **coverage** (cross-engine + CDC), and the two
-gaps are now tracked optimizations (index-overlap; a PG→PG identity passthrough).
+decode-through-the-IR path. **Both gaps are now shipped optimizations** — index-build
+overlap (ADR-0077) and a same-engine PG→PG identity passthrough (ADR-0078) — which
+**close sluice's gap from 1.75× to 1.42×** (1269 s vs pgcopydb's 895 s) on the *same*
+corpus, all zero-loss. The run is disk-bound at this scale, so the bigger lever turned
+out to be the passthrough (−235 s, removing the per-value IR CPU) over the overlap
+(−60 s, since overlapped index builds still contend for the saturated disk). sluice's
+pitch over pgcopydb stays **coverage** (cross-engine + CDC); the PG→PG speed gap is now
+mostly architectural headroom, not a missing tactic.
 
 ---
 
@@ -142,8 +147,17 @@ gen_fn.sql + bench.sh). All runs zero-loss (aggregate-checksum verified).
 |---|---|---|
 | **pgcopydb — default (4 table/index jobs)** | **895 s (~15 min)** | overlaps COPY + CREATE INDEX + VACUUM (12-way) |
 | pgcopydb — tuned (`--split-tables-larger-than 2GB --table-jobs 8 --index-jobs 4`) | 985 s | *slower* — over-splitting contends on a saturated disk |
-| **sluice — default (`--table-parallelism 4 --bulk-parallelism 8`)** | **1564 s (~26 min)** | bulk-copy 1103 s (99.5 MB/s) **then** a separate 457 s index phase |
-| sluice — tuned (`--table-parallelism 8 --bulk-parallelism 8`) | 1598 s | identical to default — more parallelism does nothing |
+| sluice — original (no index-overlap, IR copy) | 1564 s (~26 min) | bulk-copy 1103 s (99.5 MB/s) **then** a separate 457 s index phase — 1.75× pgcopydb |
+| sluice — + index-overlap only (ADR-0077) | 1504 s | index tail collapses into the copy; **−60 s** (disk-bound, so little of the 457 s tail hides) — 1.68× |
+| **sluice — + index-overlap + PG→PG passthrough (ADR-0077 + ADR-0078, default today)** | **1269 s (~21 min)** | raw `COPY→COPY` byte-pipe removes the IR per-value CPU; **−235 s** on top — **1.42× pgcopydb** |
+| sluice — tuned (`--table-parallelism 8 --bulk-parallelism 8`) | ≈ default | identical to default — more parallelism does nothing (disk-bound) |
+
+Each sluice row was measured on the **same** still-seeded source volume, target reset
+between runs, by swapping only the binary (commits `e6ce956` → `22e96fb` → `2a9eace`);
+all three landed identical aggregate checksums. The passthrough lane engaged
+automatically (logged `raw-copy passthrough lane eligible (ADR-0078)`); index-overlap
+is confirmed by the `indexes` phase completing within ~2 ms of `bulk_copy` instead of a
+separate ~457 s tail.
 
 Three honest read-outs:
 
@@ -157,10 +171,12 @@ below pgcopydb's published cloud figures of 1.5–2 TB/hr / 400–500 MB/s, whic
 provisioned-IOPS disks + a fat NIC; *those* need an in-region cloud rig. Here the
 portable takeaway is the **ratio**, not the absolute.)
 
-### 2. pgcopydb is ~1.75× faster end-to-end — two separable causes
+### 2. The original 1.75× gap had two separable causes — both now closed to 1.42×
 
-pgcopydb 895 s vs sluice 1564 s. From its own step summary (COPY cumulative 38.9 min +
-CREATE INDEX cumulative 33.6 min, overlapped into ~14 min wall, 12-way concurrency):
+pgcopydb 895 s vs sluice's *original* 1564 s. From pgcopydb's own step summary (COPY
+cumulative 38.9 min + CREATE INDEX cumulative 33.6 min, overlapped into ~14 min wall,
+12-way concurrency), the two causes — and what each is worth now that both are shipped
+(measured above: index-overlap −60 s, passthrough −235 s):
 
 - **Overlapped index builds.** pgcopydb builds each table's indexes *as soon as its
   data lands*, concurrently with the still-copying tables. sluice runs a full
@@ -180,17 +196,23 @@ Every run landed all 422M rows with matching aggregate checksums (count + sum(id
 sum(amount) + sum(length(event_type)) + true-count per table) and all indexes. The
 comparison is speed + coverage, not correctness.
 
-**Two optimizations this surfaces (tracked on the roadmap):**
+**Two optimizations this surfaced — both now shipped and measured (above):**
 
-1. **Overlap index builds with the copy** (broadest win — every engine pair, not just
-   PG→PG): build a table's indexes as soon as its copy completes, concurrently with
-   ongoing copies, under the same combined connection budget; constraints/FKs stay a
-   final phase. Closes most of the ~457 s sequential tail.
-2. **PG→PG identity passthrough** (closes the per-stream rate gap): for a same-engine,
-   no-transform copy (no redaction / type-override / shard-injection / cross-engine),
-   bypass the IR and byte-pipe `COPY … TO STDOUT` → `COPY … FROM STDIN` via pgx's raw
-   `pgconn` — pgcopydb's exact tactic — falling back to the IR path the moment any
-   transform is present.
+1. **Overlap index builds with the copy** (ADR-0077, broadest win — every engine pair,
+   not just PG→PG): build a table's indexes as soon as its copy completes, concurrently
+   with ongoing copies, under the same combined connection budget; constraints/FKs stay
+   a final phase. The ~457 s sequential tail collapses — but at 110 GB on a saturated
+   disk the overlapped builds contend for the same I/O, so the net was a modest **−60 s**.
+   The win is larger when the disk is *not* the bottleneck (smaller corpora, faster
+   storage, in-region provisioned IOPS).
+2. **PG→PG identity passthrough** (ADR-0078, closes the per-stream rate gap): for a
+   same-engine, no-transform copy (no redaction / type-override / shard-injection /
+   cross-engine), bypass the IR and byte-pipe `COPY … TO STDOUT` → `COPY … FROM STDIN`
+   via pgx's raw `pgconn` — pgcopydb's exact tactic — falling back to the IR path the
+   moment any transform is present. This removes the per-value decode/re-encode CPU and
+   was the **bigger lever at scale: −235 s** (1504 → 1269 s), lifting sluice's per-stream
+   rate toward pgcopydb's. A single auditable value-fidelity gate guarantees the lane is
+   taken only when there is provably no transform to skip.
 
 ## Where pgcopydb is strictly better
 

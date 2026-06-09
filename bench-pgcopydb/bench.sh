@@ -66,7 +66,7 @@ docker rm -f "$cname" >/dev/null 2>&1 || true
 start=$(date +%s)
 case "$tool" in
   sluice)
-    retry "launch" docker run -d --name "$cname" --network "$NET" sluice-bench:main migrate \
+    retry "launch" docker run -d --name "$cname" --network "$NET" "${SLUICE_IMG:-sluice-bench:main}" migrate \
       --source-driver=postgres --source="$SRC_URI" \
       --target-driver=postgres --target="$DST_URI" "${extra[@]}" >/dev/null ;;
   pgcopydb)
