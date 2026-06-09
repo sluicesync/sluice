@@ -26,10 +26,12 @@ docker volume create benchcdcsrc >/dev/null                    # no-op if it alr
 docker volume rm benchcdcdst 2>/dev/null || true               # target always fresh
 docker volume create benchcdcdst >/dev/null
 
-docker run -d --name bench-cdc-src --network benchnet -p 5443:5432 --shm-size=2g \
+# Host ports 5453/5454 (debugging only — the bench containers talk over the
+# benchnet Docker network). Chosen to avoid the local rig's 5442/5443.
+docker run -d --name bench-cdc-src --network benchnet -p 5453:5432 --shm-size=2g \
   -e POSTGRES_PASSWORD=bench -e POSTGRES_DB=benchdb \
   -v benchcdcsrc:/var/lib/postgresql/data postgres:16 $SRC_TUNE >/dev/null
-docker run -d --name bench-cdc-dst --network benchnet -p 5444:5432 --shm-size=2g \
+docker run -d --name bench-cdc-dst --network benchnet -p 5454:5432 --shm-size=2g \
   -e POSTGRES_PASSWORD=bench -e POSTGRES_DB=benchdb \
   -v benchcdcdst:/var/lib/postgresql/data postgres:16 $TUNE >/dev/null
 
@@ -61,6 +63,6 @@ else
   echo "reusing existing seed (${have} cdc_ tables in benchcdcsrc volume)"
 fi
 
-echo "up: bench-cdc-src (wal_level=logical, seeded, port 5443) + bench-cdc-dst (empty, port 5444)"
+echo "up: bench-cdc-src (wal_level=logical, seeded, port 5453) + bench-cdc-dst (empty, port 5454)"
 docker exec bench-cdc-src psql -U postgres -d benchdb -tAc \
   "SELECT 'source corpus: '||pg_size_pretty(sum(pg_total_relation_size(c.oid)))||' total, '||count(*)||' cdc tables' FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.relkind='r' AND n.nspname='public' AND c.relname LIKE 'cdc\\_%'"

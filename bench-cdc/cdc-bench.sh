@@ -45,6 +45,17 @@ retry "target-reset" docker exec bench-cdc-dst psql -U postgres -d benchdb -q -c
   "DROP SCHEMA public CASCADE; CREATE SCHEMA public; GRANT ALL ON SCHEMA public TO postgres;" >/dev/null \
   || { echo "FATAL: target reset"; exit 1; }
 
+# Source slot hygiene: a prior run's cold-start left `sluice_slot` on the
+# SOURCE (slots are server-side — removing the sync container does NOT drop
+# them), and sluice correctly REFUSES to start over an existing slot
+# (ADR-0022). Terminate any walsender still holding it, then drop it, so each
+# run cold-starts fresh. (Resetting only the target schema is not enough.)
+retry "slot-cleanup" docker exec bench-cdc-src psql -U postgres -d benchdb -q -c \
+  "SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots WHERE slot_name='sluice_slot' AND active_pid IS NOT NULL;" >/dev/null 2>&1 || true
+sleep 1
+retry "slot-drop" docker exec bench-cdc-src psql -U postgres -d benchdb -q -c \
+  "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name='sluice_slot';" >/dev/null 2>&1 || true
+
 cname="cdcrun-${STREAM}"
 docker rm -f "$cname" >/dev/null 2>&1 || true
 t_start=$(date +%s)
@@ -60,11 +71,17 @@ writer_pid=$!
 echo "writer started (pid $writer_pid) — mutating source during cold-copy + CDC"
 
 # Wait for cold-start to finish (the streamer logs this once per stream).
+# Exit-detection is hardened against the Rancher Hyper-V-socket blip: only a
+# SUCCESSFUL `docker inspect` reporting exited/dead is treated as a real exit;
+# a failed/empty inspect (control-plane blip) just retries next iteration. A
+# bare `docker ps | grep` here false-positived "exited" on a healthy,
+# still-copying container.
 cold_done=""
 for _ in $(seq 1 600); do
   if docker logs "$cname" 2>&1 | grep -q "entering CDC mode"; then cold_done=1; break; fi
-  if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -q "$cname"; then
-    echo "FATAL: sync container exited during cold-start"; docker logs "$cname" 2>&1 | tail -30; exit 1
+  st="$(docker inspect -f '{{.State.Status}}' "$cname" 2>/dev/null)"
+  if [ "$st" = "exited" ] || [ "$st" = "dead" ]; then
+    echo "FATAL: sync container exited during cold-start (status=$st)"; docker logs "$cname" 2>&1 | tail -30; exit 1
   fi
   sleep 2
 done
