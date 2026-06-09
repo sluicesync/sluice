@@ -6,6 +6,51 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.99.30] - 2026-06-09
+
+### Added
+- **Index-build overlap extended to MySQL targets (ADR-0080).** `sluice migrate`
+  to a MySQL target (MySQL→MySQL and PG→MySQL) now builds each table's secondary
+  indexes as that table's copy lands, concurrently with the still-copying tables
+  — collapsing the separate post-copy whole-schema index phase, the same
+  structural win Postgres targets got in v0.99.29 (ADR-0077). The MySQL
+  `SchemaWriter` now implements `ir.IncrementalIndexBuilder` + `ir.TableIndexedNotifier`,
+  draining the completed-tables channel into a bounded worker pool (each table's
+  indexes built on its own connection, detect-then-skip for idempotent resume).
+  MySQL has no connection-slot prober, so the pool sizes itself from a fixed
+  worker count (default 4) rather than a measured budget; PlanetScale/Vitess
+  targets decline the overlap and defer to their own online-DDL (the channel is
+  drained into a no-op that still fires the per-table callback so resume
+  accounting stays correct, then the post-copy `CreateIndexes` runs as before).
+  No throughput number is claimed yet — it needs an at-scale MySQL measurement.
+- **Within-table chunking on the PG-source `sync start` fast cold-start
+  (ADR-0079 v1.1).** v0.99.29 gave the fast sync cold-start cross-table
+  parallelism + index-overlap + raw passthrough; v0.99.30 adds within-table
+  PK-range chunking so a large single table on the sync path is copied in
+  parallel chunks instead of single-streamed. Engages when the source table has
+  planner stats (`pg_class.reltuples`); a never-ANALYZEd table stays
+  single-stream (slower, never lossy). PG-source only. Implemented via a new
+  optional `ir.RowCountEstimator` surface (sibling to `RowCounter`) that carries
+  the chunk-decision-only estimate; the PG implementation reads `reltuples` off a
+  separate connection so it never races the live snapshot stream. Only the
+  chunk-decision estimate changes — a wrong estimate degrades to single-stream,
+  never corrupts the copy.
+
+### Fixed
+- **MySQL `SPATIAL` / `FULLTEXT` index creation no longer fails with
+  `Error 1089`.** sluice emitted a per-column prefix length (e.g. `pt(32)`) on
+  `SPATIAL` and `FULLTEXT` indexes, which MySQL rejects with `Error 1089`
+  ("Incorrect prefix key; the used key part isn't a string…"), so the index was
+  never created and the migration errored. The source reader can legitimately
+  surface a `SUB_PART` (length) on a geometry/full-text index column; the prefix
+  is now dropped at emit time for those two index kinds (every other kind keeps
+  the source's prefix length). Affected any migration carrying a
+  `SPATIAL`/`FULLTEXT` secondary index to a MySQL target, on both the serial
+  post-copy `CreateIndexes` path and the new overlapped path. Pre-existing bug —
+  present in every prior published version on that path — first surfaced by the
+  ADR-0080 work. Loud failure (the migration errors; the index is not created),
+  not silent data loss, so no data re-verification is needed.
+
 ## [0.99.29] - 2026-06-09
 
 ### Added
