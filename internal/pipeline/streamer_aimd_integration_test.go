@@ -115,17 +115,14 @@ func TestStreamer_AIMDController_PostgresToPostgres_Engages(t *testing.T) {
 		t.Fatalf("source commit: %v", err)
 	}
 
-	// Wait for all rows to land.
-	deadline := time.Now().Add(60 * time.Second)
-	for {
-		got := countRows(t, targetDSN, "aimd_users")
-		if got >= totalRows {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("dest only saw %d/%d rows after timeout", got, totalRows)
-		}
-		time.Sleep(200 * time.Millisecond)
+	// Wait for all rows to land. Use the tolerant waitForRowCount /
+	// pollRowCount: the cold-start creates aimd_users on the TARGET
+	// asynchronously, so an early countRows() races the schema-apply and
+	// hits "relation \"aimd_users\" does not exist" (42P01) — which countRows
+	// turns into a t.Fatal (the recurring AIMD CI flake). pollRowCount treats
+	// the not-yet-created table as 0 rows and keeps polling.
+	if !waitForRowCount(t, targetDSN, "aimd_users", totalRows, 60*time.Second) {
+		t.Fatalf("dest only saw %d/%d rows after timeout", pollRowCount(targetDSN, "aimd_users"), totalRows)
 	}
 
 	// Scrape the metrics endpoint and confirm the AIMD gauges fired.

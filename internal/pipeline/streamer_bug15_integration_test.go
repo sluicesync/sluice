@@ -228,7 +228,14 @@ func TestStreamer_PostgresToPostgres_StopRestartNoLoss(t *testing.T) {
 	if threshold < 50 {
 		threshold = 50
 	}
-	if !waitForRowCount(t, targetDSN, "bug15", threshold, 60*time.Second) {
+	// 120s (not 60s): after the warm resume reconnects, the tail events drain
+	// at the per-change/batched CDC apply rate, which under the -race scheduler
+	// + self-hosted disk-I/O contention is occasionally slow enough that 60s
+	// was a flaky deadline (the recurring "bug15 catch-up" rerun). The
+	// load-bearing assertion (no gaps, MAX(id)==COUNT(*)) is unchanged; this
+	// only widens the catch-up window so a slow-but-correct drain isn't a
+	// false failure.
+	if !waitForRowCount(t, targetDSN, "bug15", threshold, 120*time.Second) {
 		resumeCancel()
 		<-resumeErr
 		t.Fatalf("after resume, dst rows did not catch up to threshold (src=%d, dst=%d, threshold=%d)",
