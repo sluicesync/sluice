@@ -109,6 +109,11 @@ func (r *RowReader) ExportRawCopy(ctx context.Context, table *ir.Table, chunk *i
 		if perr != nil {
 			return perr
 		}
+		// Pin the wire encoding to UTF8 so the byte-pipe is self-consistent
+		// regardless of either DSN's client_encoding (see rawCopyForceUTF8).
+		if eerr := rawCopyForceUTF8(ctx, conn); eerr != nil {
+			return fmt.Errorf("postgres: ExportRawCopy %q: %w", table.Name, eerr)
+		}
 		if _, cerr := conn.CopyTo(ctx, w, sqlStmt); cerr != nil {
 			return fmt.Errorf("postgres: ExportRawCopy %q: COPY TO STDOUT: %w", table.Name, cerr)
 		}
@@ -148,6 +153,12 @@ func (w *RowWriter) ImportRawCopy(ctx context.Context, table *ir.Table, format i
 		if perr != nil {
 			return perr
 		}
+		// Match the exporter's pinned UTF8 wire encoding so the byte stream
+		// the importer receives is decoded under the same encoding it was
+		// emitted (see rawCopyForceUTF8).
+		if eerr := rawCopyForceUTF8(ctx, conn); eerr != nil {
+			return fmt.Errorf("postgres: ImportRawCopy %q: %w", table.Name, eerr)
+		}
 		tag, cerr := conn.CopyFrom(ctx, r, sqlStmt)
 		if cerr != nil {
 			return fmt.Errorf("postgres: ImportRawCopy %q: COPY FROM STDIN: %w", table.Name, cerr)
@@ -182,6 +193,24 @@ func (r *RowReader) rawConn(ctx context.Context, exec func(driverConn any) error
 	default:
 		return fmt.Errorf("postgres: ExportRawCopy: query source %T does not support raw COPY", r.q)
 	}
+}
+
+// rawCopyForceUTF8 pins the session's client_encoding to UTF8 on the raw
+// connection before a COPY. The raw lane byte-pipes the source's
+// COPY-TO-STDOUT stream straight into the target's COPY-FROM-STDIN: the
+// bytes are encoded under the SOURCE session's client_encoding and decoded
+// under the TARGET session's. If an operator sets client_encoding=LATIN1
+// in one DSN and not the other, that asymmetry would silently corrupt
+// non-ASCII text — the byte-pipe sees no Row, so the typed IR path's
+// per-value re-encode (which would normalize this) never runs. Forcing
+// both sessions to UTF8 makes the stream self-consistent by construction,
+// regardless of either DSN — matching what the IR/pgx COPY path already
+// gets from pgx's default UTF8 session. (ADR-0078 known-limitation note.)
+func rawCopyForceUTF8(ctx context.Context, conn *pgconn.PgConn) error {
+	if _, err := conn.Exec(ctx, "SET client_encoding TO 'UTF8'").ReadAll(); err != nil {
+		return fmt.Errorf("pin client_encoding=UTF8: %w", err)
+	}
+	return nil
 }
 
 // pgConnFromDriver unwraps a database/sql driver connection to the

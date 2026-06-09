@@ -59,6 +59,7 @@ Binary COPY is faster on the wire but version/codec-sensitive across PG majors. 
 - New optional IR surfaces (`RawCopyExporter` / `RawCopyImporter` / `RawCopyVersionProber` / `RawCopyChunk` / `RawCopyFormat`) — additive, type-asserted, no change to the base `RowReader` / `RowWriter` or to engines that don't implement them (MySQL).
 - The lane is cold-start + `migrate`-only by construction (slotted in the fast-loader branch); resume and sync cold-start stay on the IR path.
 - v1 is conservative on type families (extension/verbatim/bit/geometry excluded) and on chunk PKs (single integer only). Both widen on evidence.
+- **Wire encoding is pinned to UTF8 on both raw sessions** (`rawCopyForceUTF8`). The byte-pipe encodes under the source session's `client_encoding` and decodes under the target's; an asymmetric DSN (`client_encoding=LATIN1` on one side only) would otherwise silently corrupt non-ASCII text, since the byte-pipe skips the IR per-value re-encode that would normalize it. Forcing UTF8 on both makes the stream self-consistent by construction — matching the pgx IR path's default UTF8 session. This is the one place the raw lane actively asserts session state rather than passing bytes through untouched, and it exists precisely to keep "nothing is supposed to change" honest at the encoding layer.
 
 ## Alternatives considered
 
