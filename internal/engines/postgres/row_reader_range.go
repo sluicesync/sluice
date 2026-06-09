@@ -36,15 +36,18 @@ import (
 // (nil, nil, nil) so the orchestrator routes to single-reader without
 // a special error code.
 //
-// Safe on a snapshot-pinned reader (ADR-0079 v1.1): MIN/MAX is a single
-// statement that fully closes its rows (deferred Close below) before the
-// caller proceeds, and the chunk-boundary decision always runs BEFORE the
-// per-chunk copy streams open (single-goroutine, [tryParallelCopyTable] →
-// [resolveChunks] precedes [runChunks]) — so it never overlaps a stream on
-// the shared pinned *sql.Conn. This is what lets the sync fast cold-start
-// chunk a large table within-table; the pre-v1.1 closer==nil refusal here
-// was the conservative guard that blocked it.
+// On a snapshot-pinned reader (the one returned by
+// [Engine.OpenSnapshotStream]) this would conflict with a concurrent
+// row-stream because both share the same pinned *sql.Conn — the
+// query interface allows only one in-flight statement at a time. The
+// snapshot path doesn't currently invoke parallel-copy, so this is
+// not exercised in practice; the defensive check exists so a future
+// caller doesn't deadlock silently.
 func (r *RowReader) RangeBounds(ctx context.Context, table *ir.Table, pkColumn string) (minVal, maxVal any, err error) {
+	if r.closer == nil {
+		// Snapshot-pinned reader; concurrent queries would deadlock.
+		return nil, nil, errors.New("postgres: RangeBounds: not supported on snapshot-pinned reader")
+	}
 	if table == nil {
 		return nil, nil, errors.New("postgres: RangeBounds: table is nil")
 	}
@@ -99,58 +102,24 @@ func (r *RowReader) RangeBounds(ctx context.Context, table *ir.Table, pkColumn s
 // a test, and this comment per the codebase's clean-code tenet.
 //
 // Returns (0, nil) when the table doesn't appear in pg_class (e.g. a
-// non-default schema). The throughput-metric layer treats zero as "no
-// estimate" and the orchestrator routes a zero count to the single-reader
-// path.
-//
-// Pinned-reader discipline (the ADR-0079 v1.1 contract). A snapshot-pinned
-// reader — the externally-owned stream reader (closer == nil) OR a
-// self-closing SnapshotImporter reader (snapshotPinned) — runs all its
-// queries on ONE pinned *sql.Conn, which database/sql serialises through
-// closemu: two OVERLAPPING queries on it self-deadlock. CountRows never
-// overlaps now (the reltuples probe fully closes its rows in
-// [reltuplesEstimate] before any second query — the root cause of the
-// a8d065d deadlock was the old code firing exactCount while the reltuples
-// rows were still open). The remaining rule is purely cost: on a pinned
-// reader we DECLINE the exact-COUNT(*) fallback, because that full seq scan
-// would run on the live snapshot connection (potentially minutes on a huge
-// table). So a pinned reader gets the reltuples estimate when stats exist
-// (enabling within-table chunking on the sync fast path, ADR-0079 v1.1) and
-// "no estimate" (0 → single-stream) when they don't — never-analyzed tables
-// stay single-stream, exactly as before. The non-pinned migrate reader keeps
-// the exact fallback (ADR-0042 N1). The decision-phase probe always precedes
-// the copy stream (single-goroutine), so no probe ever races a stream.
+// non-default schema), or when the reader is snapshot-pinned
+// (closer == nil) — in the latter case a concurrent CountRows would
+// deadlock against the in-flight row-stream on the same connection.
+// The throughput-metric layer treats zero as "no estimate".
 func (r *RowReader) CountRows(ctx context.Context, table *ir.Table) (int64, error) {
 	if table == nil {
 		return 0, errors.New("postgres: CountRows: table is nil")
 	}
-	count, err := r.reltuplesEstimate(ctx, table)
-	if err != nil {
-		return 0, err
-	}
-	if count > 0 {
-		return count, nil
-	}
-	// reltuples non-positive => never-analyzed (sentinel -1 / 0) or
-	// genuinely empty.
 	if r.closer == nil || r.snapshotPinned {
-		// Pinned reader: skip the exact COUNT(*) seq scan (cost, not
-		// safety — the reltuples rows are already closed). 0 ⇒ single-stream.
+		// Snapshot-pinned reader (externally-owned stream reader OR a
+		// self-closing SnapshotImporter reader): all queries run on one
+		// pinned *sql.Conn, so the exact-COUNT fallback's second query —
+		// fired while this method's reltuples Rows is still open — would
+		// self-deadlock on the conn's closemu (and a probe racing an
+		// in-flight copy stream would too). Return "no estimate"; the
+		// caller routes a pinned reader to the single-stream path.
 		return 0, nil
 	}
-	// Non-pinned migrate reader: resolve exactly so parallel-copy eligibility
-	// is correct on a freshly-loaded source (ADR-0042 N1). Safe here too — the
-	// reltuples rows closed in reltuplesEstimate before this second query.
-	return r.exactCount(ctx, table)
-}
-
-// reltuplesEstimate runs the pg_class.reltuples catalog lookup and returns
-// the estimate (0 when the table isn't in pg_class). It fully consumes and
-// CLOSES its result rows before returning, so a caller may safely issue a
-// second query on the same pinned *sql.Conn afterward — this sequencing is
-// what makes [CountRows]'s exactCount fallback deadlock-free on a single
-// pinned connection (the a8d065d fix lives here).
-func (r *RowReader) reltuplesEstimate(ctx context.Context, table *ir.Table) (int64, error) {
 	q := `SELECT COALESCE((SELECT reltuples::bigint
 	                       FROM pg_class c
 	                       JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -173,6 +142,14 @@ func (r *RowReader) reltuplesEstimate(ctx context.Context, table *ir.Table) (int
 	}
 	if rerr := rows.Err(); rerr != nil {
 		return 0, fmt.Errorf("postgres: CountRows rows: %w", rerr)
+	}
+	// reltuples non-positive => never-analyzed (sentinel -1 / 0) or
+	// genuinely empty. Resolve it exactly so parallel-copy
+	// eligibility is correct on a freshly-loaded source (ADR-0042
+	// N1). Snapshot-pinned readers already returned above, so the
+	// exact COUNT(*) cannot deadlock the in-flight stream.
+	if count <= 0 {
+		return r.exactCount(ctx, table)
 	}
 	return count, nil
 }
