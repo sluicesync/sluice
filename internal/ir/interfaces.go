@@ -1166,6 +1166,88 @@ type IndexBuildTuner interface {
 	SetIndexBuildParallelism(n int)
 }
 
+// IncrementalIndexBuilder is the OPTIONAL surface a [SchemaWriter] can
+// implement to build each table's secondary indexes AS SOON AS its bulk
+// copy finishes, concurrently with the still-copying tables, instead of
+// in one whole-schema sweep after every table's copy completes (ADR-0077,
+// roadmap item 3b(a)). pgcopydb hides its deferred-index phase this way;
+// at scale (a 110 GB / 43-table corpus) sluice's separate post-copy index
+// phase was a sequential ~457 s tail — 29% of the total wall.
+//
+// The orchestrator runs the copy pool and a consumer of this surface
+// under ONE errgroup: the copy pool invokes a per-table callback as each
+// table's copy returns nil, the orchestrator forwards the completed
+// *Table onto completedTables, and BuildTableIndexesFromChannel drains
+// that channel with the writer's OWN bounded, budget-aware build pool. A
+// copy error cancels the build pool via the shared ctx and vice versa.
+//
+// Contract:
+//
+//   - The orchestrator closes completedTables exactly once, after the
+//     copy pool finishes (and only on copy success — an error path cancels
+//     the ctx instead). The implementation returns nil once the channel
+//     is closed AND every queued build has finished, or the first build
+//     error (which must cancel its peers).
+//   - Each *Table arrives at most once. The implementation builds only
+//     that table's secondary indexes (the same set the whole-schema
+//     [SchemaWriter.CreateIndexes] would build for it), with
+//     `CREATE INDEX IF NOT EXISTS` so a resume that re-feeds an
+//     already-indexed table is a no-op.
+//   - The build pool's connection budget is the value passed via
+//     [IndexBuildBudgetSetter.SetIndexBuildBudget] (the slice the
+//     combined copy+index split reserved for the index axis), NOT a fresh
+//     self-probe — copy connections are open SIMULTANEOUSLY now, so a
+//     self-probe would double-count the budget. When no budget was set
+//     (0), the implementation may fall back to its self-probe (the
+//     non-overlapped path).
+//
+// PG implements it (its index-build worker pool predates this). MySQL
+// does NOT: the orchestrator detects the missing surface, drains
+// completedTables into a no-op, and calls the whole-schema
+// [SchemaWriter.CreateIndexes] AFTER the copy completes — exactly the
+// pre-ADR-0077 behaviour.
+type IncrementalIndexBuilder interface {
+	BuildTableIndexesFromChannel(ctx context.Context, s *Schema, completedTables <-chan *Table) error
+}
+
+// TableIndexedNotifier is the OPTIONAL companion to
+// [IncrementalIndexBuilder] (ADR-0077): the builder calls the registered
+// callback ONCE per table, after that table's LAST secondary index has
+// built (or immediately for a table with no secondary indexes). The
+// pipeline orchestrator uses it to flip [TableProgress.IndexesBuilt] so a
+// resume can fully skip an already-indexed table. The callback may run
+// from any build worker goroutine, so the pipeline's implementation
+// serialises its state write on the shared stateMu.
+//
+// Set BEFORE [IncrementalIndexBuilder.BuildTableIndexesFromChannel]; nil
+// (the default) is a no-op (indexes still build, IndexesBuilt just isn't
+// recorded — a crash then re-feeds every table on resume, harmless under
+// IF NOT EXISTS). PG implements it.
+type TableIndexedNotifier interface {
+	SetTableIndexedCallback(fn func(table *Table))
+}
+
+// IndexBuildBudgetSetter is the OPTIONAL setter the orchestrator uses to
+// hand an [IncrementalIndexBuilder] the connection budget reserved for
+// the index axis when copy and index builds run SIMULTANEOUSLY (ADR-0077).
+//
+// The combined copy+index budget is split once at the single chokepoint
+// (see pipeline.splitCopyAndIndexBudget): the index axis gets a small
+// slice, the copy axis the rest, and their sum never exceeds the measured
+// budget. The reserved slice is passed here so
+// [IncrementalIndexBuilder.BuildTableIndexesFromChannel] sizes its pool
+// from it instead of self-probing (which would double-count connections
+// the copy pool already holds open).
+//
+// Zero is the sentinel for "no reserved budget" — the overlap path was
+// not engaged (no measured ceiling / MySQL / degraded probe), so the
+// implementation keeps its self-probe. Negative is treated as zero.
+//
+// PG implements it; MySQL does not (it has no [IncrementalIndexBuilder]).
+type IndexBuildBudgetSetter interface {
+	SetIndexBuildBudget(connBudget int)
+}
+
 // TableScoper is the optional surface a [SchemaReader] can implement
 // to accept the operator's table filter *before* the schema scan, so
 // per-column type validation is scoped to the tables that will
@@ -1770,6 +1852,30 @@ type TableProgress struct {
 	// each chunk maintains its own cursor and row count, and the
 	// orchestrator classifies each chunk independently on resume.
 	Chunks []TableChunkProgress
+
+	// IndexesBuilt records whether this table's secondary indexes have
+	// finished building (ADR-0077, index-build overlap). It is set true
+	// only after ALL of the table's secondary indexes have been built —
+	// the index-overlap consumer flips it once the table's
+	// [IncrementalIndexBuilder] queue drains. On resume the orchestrator
+	// reads it alongside State:
+	//
+	//   - State=complete && !IndexesBuilt → copy is skipped (the data
+	//     landed) but the table is re-fed to the index pool so its
+	//     indexes finish; CREATE INDEX IF NOT EXISTS guards a crash that
+	//     happened mid-index-build.
+	//   - State=complete && IndexesBuilt   → the table is fully skipped.
+	//
+	// Additive on the JSON wire: it is omitempty, so an old state row
+	// (which never wrote the key) decodes to false — read as "copy done,
+	// indexes not yet built", which re-feeds the table to the index pool.
+	// That is the safe interpretation: re-building an already-built index
+	// is a no-op under IF NOT EXISTS, whereas the inverse (treating an
+	// absent flag as "built") would silently skip a never-built index.
+	// Engines without an [IncrementalIndexBuilder] (MySQL) never set this;
+	// their indexes build in the post-copy whole-schema CreateIndexes
+	// fallback, so the flag stays its zero value and is harmless.
+	IndexesBuilt bool
 }
 
 // TableChunkProgress is the per-chunk entry within

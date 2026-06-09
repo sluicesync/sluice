@@ -74,6 +74,15 @@ func warnStateWriteFailed(ctx context.Context, tableName string, err error) {
 //
 // The errgroup's derived ctx cancels on the first table's error so peers
 // unwind promptly; g.Wait returns the first error.
+//
+// onTableCopied, when non-nil, is invoked with the table AFTER its copy
+// returns nil — the per-table success point the index-build overlap
+// (ADR-0077) feeds off. It fires ONLY on success; an error short-circuits
+// via the errgroup ctx exactly as before, so a table whose copy failed is
+// never handed to the index pool. The callback runs on the table's own
+// copy goroutine and must return promptly (it forwards the table to a
+// separate index consumer); index builds are NOT enqueued on the copy
+// goroutines — that would starve copy slots.
 func runBulkCopyTablePool(
 	ctx context.Context,
 	rc resumeContext,
@@ -88,6 +97,7 @@ func runBulkCopyTablePool(
 	tableParallelism int,
 	redactor *redact.Registry,
 	shard ShardColumnSpec,
+	onTableCopied func(table *ir.Table),
 ) error {
 	limit := tableParallelism
 	if limit < 1 {
@@ -112,10 +122,19 @@ func runBulkCopyTablePool(
 				return err
 			}
 			defer release()
-			return bulkCopyOneTable(
+			if err := bulkCopyOneTable(
 				tctx, rc, state, stateMu, pair.rows, pair.rw, table,
 				resuming, bulkBatchSize, parallel, redactor, shard,
-			)
+			); err != nil {
+				return err
+			}
+			// Per-table success point (ADR-0077): hand the just-copied
+			// table to the index-overlap consumer. Only reached on a clean
+			// copy — an error returned above and never gets here.
+			if onTableCopied != nil {
+				onTableCopied(table)
+			}
+			return nil
 		})
 	}
 	return tg.Wait()

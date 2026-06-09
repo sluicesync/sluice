@@ -98,6 +98,25 @@ type SchemaWriter struct {
 	// the operator cap into the pure [computeIndexBuildConcurrency]
 	// computation.
 	indexBuildParallelism int
+
+	// indexBuildBudget is the connection slice the combined copy+index
+	// split reserved for the overlapped index-build pool (ADR-0077),
+	// threaded via [SetIndexBuildBudget] before
+	// [BuildTableIndexesFromChannel] runs. When >0 it REPLACES the index
+	// pool's connection self-probe: copy connections are open
+	// simultaneously now, so a fresh self-probe would double-count the
+	// budget the copy pool already holds. 0 is the sentinel for "not
+	// overlapping" — the whole-schema [CreateIndexes] path (no concurrent
+	// copy) keeps its self-probe. Only consulted by
+	// BuildTableIndexesFromChannel.
+	indexBuildBudget int
+
+	// tableIndexedCallback fires once per table after its last secondary
+	// index finishes building on the overlap path (ADR-0077), set via
+	// [SetTableIndexedCallback]. The pipeline uses it to flip IndexesBuilt.
+	// nil (the default, and on the whole-schema CreateIndexes path) is a
+	// no-op. May be invoked from any build worker goroutine.
+	tableIndexedCallback func(table *ir.Table)
 }
 
 // SetIndexBuildMem implements [ir.IndexBuildTuner]. Called by the
@@ -124,6 +143,20 @@ func (w *SchemaWriter) SetIndexBuildParallelism(n int) {
 		n = 0
 	}
 	w.indexBuildParallelism = n
+}
+
+// SetIndexBuildBudget implements [ir.IndexBuildBudgetSetter] (ADR-0077).
+// Called by the pipeline orchestrator with the connection slice the
+// combined copy+index split reserved for the overlapped index-build pool.
+// Must be called BEFORE [BuildTableIndexesFromChannel]. Negative or zero
+// is the "not overlapping" sentinel — BuildTableIndexesFromChannel then
+// keeps the self-probe (and the whole-schema [CreateIndexes] path is
+// unaffected either way; it always self-probes).
+func (w *SchemaWriter) SetIndexBuildBudget(connBudget int) {
+	if connBudget < 0 {
+		connBudget = 0
+	}
+	w.indexBuildBudget = connBudget
 }
 
 // SetSchema implements [ir.SchemaSetter]. Called by the pipeline
@@ -383,14 +416,26 @@ func (w *SchemaWriter) CreateIndexes(ctx context.Context, s *ir.Schema) error {
 	return g.Wait()
 }
 
-// indexBuildJobs flattens the schema into a deterministically-ordered
-// (table, index) work-list: tables alphabetical, indexes alphabetical
-// within each table. The ordering is the same one the prior serial loop
-// used, so a single-worker run reproduces the prior CREATE INDEX
-// sequence exactly.
+// indexBuildJobs flattens the whole schema into a deterministically-
+// ordered (table, index) work-list: tables alphabetical, indexes
+// alphabetical within each table. The ordering is the same one the prior
+// serial loop used, so a single-worker run reproduces the prior CREATE
+// INDEX sequence exactly. Used by the whole-schema [CreateIndexes].
 func (w *SchemaWriter) indexBuildJobs(s *ir.Schema) []indexBuildJob {
+	return w.indexBuildJobsForTables(orderedTables(s))
+}
+
+// indexBuildJobsForTables flattens a SUBSET of tables into the same
+// (table, index) work-list shape indexBuildJobs produces for the whole
+// schema. Factored out (ADR-0077) so [BuildTableIndexesFromChannel] can
+// queue exactly one completed table's secondary indexes as its copy lands,
+// reusing the identical inline-skip + alphabetical-index ordering the
+// whole-schema phase uses. Indexes are sorted within each table; the
+// caller controls the table order (the channel-driven overlap path queues
+// each table as it completes — order is data-arrival, not alphabetical).
+func (w *SchemaWriter) indexBuildJobsForTables(tables []*ir.Table) []indexBuildJob {
 	var jobs []indexBuildJob
-	for _, table := range orderedTables(s) {
+	for _, table := range tables {
 		// Bug 125: skip the unique index emitTableDef already promoted
 		// inline as a CONSTRAINT for a PK-less table — re-creating it here
 		// would fail with "relation already exists". Empty for the common
@@ -464,15 +509,26 @@ func (w *SchemaWriter) resolveIndexBuildConcurrency(ctx context.Context, numJobs
 	memBudget := indexBuildMemBudget(probe)
 	floor := indexBuildMemFloorFor(probe)
 
-	// Connection budget bounds N alongside memory. A probe failure
-	// degrades to serial (connBudget 0 → workers floored at 1) but keeps
-	// the mem tuning.
-	connBudget, cbErr := probeIndexBuildConnBudget(ctx, w.db)
-	if cbErr != nil {
-		slog.WarnContext(ctx,
-			"postgres: index-build connection-budget probe failed; building indexes serially",
-			slog.String("error", cbErr.Error()))
-		connBudget = 0
+	// Connection budget bounds N alongside memory.
+	//
+	// ADR-0077: when SetIndexBuildBudget pre-reserved a slice (the overlap
+	// path — copy connections are open simultaneously), use that RESERVED
+	// value verbatim instead of self-probing. A fresh self-probe here would
+	// count the slots the still-running copy pool already holds open as
+	// "spare" and double-allocate the budget, blowing past the target's
+	// ceiling. Zero means "not overlapping" — the whole-schema CreateIndexes
+	// path self-probes as before. A probe failure degrades to serial
+	// (connBudget 0 → workers floored at 1) but keeps the mem tuning.
+	connBudget := w.indexBuildBudget
+	if connBudget < 1 {
+		var cbErr error
+		connBudget, cbErr = probeIndexBuildConnBudget(ctx, w.db)
+		if cbErr != nil {
+			slog.WarnContext(ctx,
+				"postgres: index-build connection-budget probe failed; building indexes serially",
+				slog.String("error", cbErr.Error()))
+			connBudget = 0
+		}
 	}
 
 	conc := computeIndexBuildConcurrency(

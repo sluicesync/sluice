@@ -184,6 +184,99 @@ func resolveCopyParallelismBudget(resolvedWithin, requestedTable, copyBudget, ce
 	return tableP, withinP
 }
 
+// indexBudgetFraction is the share of the combined copy+index connection
+// budget reserved for the overlapped index-build pool (ADR-0077). 0.25
+// mirrors pgcopydb's default 4 table-jobs / 4 index-jobs balance from the
+// at-scale comparison; the index pool's auto concurrency self-caps at
+// indexBuildConcurrencyHardCap (8) anyway, so reserving more than that is
+// wasted — hence the [1, indexBudgetCeiling] clamp.
+const (
+	indexBudgetFraction = 0.25
+	indexBudgetCeiling  = 8 // == postgres.indexBuildConcurrencyHardCap
+)
+
+// splitCopyAndIndexBudget carves the single measured connection budget
+// into a slice for the overlapped index-build pool and the remainder for
+// the copy pool, when index builds OVERLAP the bulk copy (ADR-0077,
+// roadmap item 3b(a)). Both pools now hold connections open SIMULTANEOUSLY,
+// so the combined ceiling has to be enforced at this ONE chokepoint — the
+// same single-chokepoint discipline ADR-0076 uses for the copy axes — with
+// no runtime semaphore.
+//
+// Inputs:
+//   - copyBudget is report.CopyBudget — the target's measured total
+//     connection ceiling for sluice's copy/index work. <1 means "no
+//     measured ceiling" (a non-prober target like MySQL, or a degraded
+//     probe).
+//   - withinParallelism is the within-table copy factor AFTER the budget
+//     cap (the value resolveTargetCopyParallelism returned). It is the
+//     minimum the copy axis needs to copy a single table, so the copy
+//     slice is never trimmed below it.
+//
+// Returns (indexBudget, copyBudget'):
+//
+//   - copyBudget < 1 → (0, 0). There is no measured ceiling to divide, so
+//     the overlap split does not engage: the caller keeps the existing
+//     unclamped behaviour (MySQL — which overlaps via the post-copy
+//     whole-schema fallback anyway — and the degraded-probe path).
+//
+//   - else: indexBudget = clamp(round(indexBudgetFraction × copyBudget),
+//     1, indexBudgetCeiling); copyBudget' = max(copyBudget − indexBudget,
+//     withinParallelism), then indexBudget is trimmed to
+//     copyBudget − copyBudget' so the INVARIANT holds:
+//
+//     indexBudget + copyBudget' <= copyBudget
+//
+//     i.e. the sum of simultaneously-open copy + index connections never
+//     exceeds the measured budget. If trimming would drop indexBudget
+//     below 1 (the copy axis alone needs the whole budget to copy one
+//     table), the split returns (0, copyBudget) — no slot can be spared
+//     for the index pool, so it falls back to the post-copy phase rather
+//     than starving copy.
+//
+// The returned copyBudget' is fed back into resolveCopyParallelismBudget
+// so the copy axes only ever see their slice; indexBudget is handed to
+// the SchemaWriter via SetIndexBuildBudget.
+func splitCopyAndIndexBudget(copyBudget, withinParallelism int) (indexBudget, copyBudgetRemaining int) {
+	if copyBudget < 1 {
+		// No measured ceiling: don't engage the split. Both axes stay
+		// unclamped (the pre-ADR-0077 behaviour); MySQL overlaps via the
+		// post-copy whole-schema CreateIndexes fallback regardless.
+		return 0, 0
+	}
+	if withinParallelism < 1 {
+		withinParallelism = 1
+	}
+
+	indexBudget = int(indexBudgetFraction*float64(copyBudget) + 0.5)
+	if indexBudget < 1 {
+		indexBudget = 1
+	}
+	if indexBudget > indexBudgetCeiling {
+		indexBudget = indexBudgetCeiling
+	}
+
+	copyBudgetRemaining = copyBudget - indexBudget
+	if copyBudgetRemaining < withinParallelism {
+		copyBudgetRemaining = withinParallelism
+	}
+
+	// Enforce the invariant: copy is satisfied first (it floored at
+	// withinParallelism above), so trim the index slice to whatever budget
+	// is left. This can only shrink indexBudget, never grow it.
+	if indexBudget+copyBudgetRemaining > copyBudget {
+		indexBudget = copyBudget - copyBudgetRemaining
+	}
+	if indexBudget < 1 {
+		// No slot can be spared for the index pool without starving copy
+		// below one table's worth of connections. Don't overlap; the copy
+		// pool keeps the full budget and indexes build in the post-copy
+		// phase.
+		return 0, copyBudget
+	}
+	return indexBudget, copyBudgetRemaining
+}
+
 // minNonZeroBudget returns the smaller of a and b treating 0 (or
 // negative) as "no limit". Returns 0 when both are unlimited.
 func minNonZeroBudget(a, b int) int {

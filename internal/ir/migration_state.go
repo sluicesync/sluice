@@ -48,11 +48,21 @@ import (
 // whatever the chunked-LastPK state was, which is wrong but not
 // catastrophic. The v0.5.0 release notes call out the same caveat as
 // v0.4.0 → v0.3.0: state-row forward-compat is one-way.
+//
+// The IndexesBuilt field is the ADR-0077 addition (index-build overlap).
+// It is omitempty, so an old state row that never wrote it decodes to
+// false — read as "copy done, indexes not yet built", which re-feeds the
+// table to the index pool on resume (a no-op under CREATE INDEX IF NOT
+// EXISTS). A `complete` table with IndexesBuilt=true forces the object
+// form (the bare-string `complete` can't carry the flag); a `complete`
+// table with IndexesBuilt=false stays the compact bare string (false is
+// the wire default anyway).
 type tableProgressObject struct {
-	State      TableProgressState   `json:"state"`
-	LastPK     []any                `json:"last_pk,omitempty"`
-	RowsCopied int64                `json:"rows_copied,omitempty"`
-	Chunks     []TableChunkProgress `json:"chunks,omitempty"`
+	State        TableProgressState   `json:"state"`
+	LastPK       []any                `json:"last_pk,omitempty"`
+	RowsCopied   int64                `json:"rows_copied,omitempty"`
+	Chunks       []TableChunkProgress `json:"chunks,omitempty"`
+	IndexesBuilt bool                 `json:"indexes_built,omitempty"`
 }
 
 // tableChunkProgressObject is the on-wire representation for one entry
@@ -94,8 +104,19 @@ func (c *TableChunkProgress) UnmarshalJSON(b []byte) error {
 // zero-value TableProgress round-trips unchanged.
 func (p TableProgress) MarshalJSON() ([]byte, error) {
 	switch p.State {
-	case TableProgressComplete, TableProgressNoPKTruncateAndRedo:
-		// Terminal-style states: nothing useful to carry beyond the
+	case TableProgressComplete:
+		// Terminal copy state. Emit the compact bare string UNLESS the
+		// table also carries IndexesBuilt=true (ADR-0077) — the bare
+		// string can't carry that flag, so promote to the object form so
+		// a resume reads "copy done AND indexes done" and skips the table
+		// entirely. IndexesBuilt=false stays the compact bare string
+		// (false is the wire default, decoded back the same way).
+		if p.IndexesBuilt {
+			return json.Marshal(tableProgressObject(p))
+		}
+		return json.Marshal(string(p.State))
+	case TableProgressNoPKTruncateAndRedo:
+		// Terminal-style state: nothing useful to carry beyond the
 		// label. Emit the bare string for compact wire output.
 		return json.Marshal(string(p.State))
 	case TableProgressInProgress:

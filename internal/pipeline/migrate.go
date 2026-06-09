@@ -868,6 +868,32 @@ func (m *Migrator) runSingleDatabase(ctx context.Context, scope *multiDBScope) e
 		return markFailed(ctx, rc, state, ir.MigrationPhasePending, err)
 	}
 
+	// Index-build overlap budget split (ADR-0077, roadmap item 3b(a)).
+	// When index builds OVERLAP the copy (the target engine implements
+	// [ir.IncrementalIndexBuilder] — PG), copy and index connections are
+	// open SIMULTANEOUSLY, so the single measured budget has to cover BOTH.
+	// splitCopyAndIndexBudget reserves a small slice for the index pool and
+	// hands the copy axes only the remainder, with the invariant
+	// indexBudget + copyBudget' <= CopyBudget enforced here at the single
+	// chokepoint (no runtime semaphore). The index slice is threaded to the
+	// SchemaWriter so its build pool sizes from it instead of self-probing
+	// (which would double-count the copy pool's open connections).
+	//
+	// indexBudget == 0 means "don't overlap-split" — no measured ceiling
+	// (MySQL / degraded probe), or the engine has no IncrementalIndexBuilder
+	// (MySQL again, which overlaps via the post-copy whole-schema fallback).
+	// In that case the copy axes see the full CopyBudget unchanged.
+	copyBudgetForAxes := budgetReport.CopyBudget
+	indexBudget := 0
+	if _, overlaps := sw.(ir.IncrementalIndexBuilder); overlaps {
+		ib, copyRemaining := splitCopyAndIndexBudget(budgetReport.CopyBudget, copyParallelism)
+		if ib > 0 {
+			indexBudget = ib
+			copyBudgetForAxes = copyRemaining
+		}
+	}
+	applyIndexBuildBudget(sw, indexBudget)
+
 	// Cross-table copy pool (ADR-0076, roadmap item 3(a)). Split the
 	// single connection budget across the table × within-table axes at
 	// the SINGLE chokepoint so their PRODUCT can't exhaust the target's
@@ -876,10 +902,13 @@ func (m *Migrator) runSingleDatabase(ctx context.Context, scope *multiDBScope) e
 	// bounded by --max-target-connections. The within factor is then
 	// pinned to its split value so each table's gate opens exactly
 	// withinP connections — the product bound holds by construction.
+	//
+	// copyBudgetForAxes is the copy axes' slice after the ADR-0077 index
+	// reservation (== CopyBudget when overlap isn't engaged).
 	tableParallelism, withinParallelism := resolveCopyParallelismBudget(
 		copyParallelism,
 		resolveTableParallelism(m.TableParallelism),
-		budgetReport.CopyBudget,
+		copyBudgetForAxes,
 		m.MaxTargetConnections,
 	)
 	slog.InfoContext(
@@ -888,6 +917,8 @@ func (m *Migrator) runSingleDatabase(ctx context.Context, scope *multiDBScope) e
 		slog.Int("within_table_parallelism", withinParallelism),
 		slog.Int("max_concurrent_connections", tableParallelism*withinParallelism),
 		slog.Int("copy_budget", budgetReport.CopyBudget),
+		slog.Int("copy_budget_after_index_reserve", copyBudgetForAxes),
+		slog.Int("index_build_budget", indexBudget),
 	)
 
 	parallelDeps := &parallelBulkCopyDeps{
@@ -1293,33 +1324,67 @@ func runBulkCopyPhases(
 	// write distinct keys of the same map — distinct keys under one
 	// mutex is exactly cloneStateForWrite's design).
 	var stateMu sync.Mutex
-	if err := runBulkCopyTablePool(
-		ctx, rc, state, &stateMu, schema, rows, rw,
-		resuming, bulkBatchSize, parallel, tableParallelism, redactor, shard,
-	); err != nil {
-		return err
-	}
-	slog.InfoContext(ctx, "migration: phase complete", slog.String("phase", string(ir.MigrationPhaseBulkCopy)))
 
-	// Phase 3.5: identity sync.
-	if err := markPhase(ctx, rc, state, ir.MigrationPhaseIdentitySync); err != nil {
-		_ = err
-	}
-	if err := sw.SyncIdentitySequences(ctx, schema); err != nil {
-		err = fmt.Errorf("pipeline: sync identity sequences: %w", err)
-		return wrapWithHint(PhaseSchemaApply, markFailed(ctx, rc, *state, ir.MigrationPhaseIdentitySync, err))
-	}
-	slog.InfoContext(ctx, "migration: phase complete", slog.String("phase", string(ir.MigrationPhaseIdentitySync)))
+	// Phases 2 + 4: bulk-copy and secondary-index builds. ADR-0077: when
+	// the target engine implements [ir.IncrementalIndexBuilder] (PG), the
+	// two run OVERLAPPED — each table's indexes build as soon as its copy
+	// lands, concurrently with the still-copying tables, closing the
+	// sequential post-copy index tail. Engines without the surface (MySQL)
+	// run the copy pool, then identity-sync, then the whole-schema
+	// CreateIndexes — exactly the pre-ADR-0077 sequential order.
+	if ib, ok := sw.(ir.IncrementalIndexBuilder); ok {
+		if err := runOverlappedCopyAndIndexPhase(
+			ctx, rc, state, &stateMu, schema, rows, sw, rw, ib,
+			resuming, bulkBatchSize, parallel, tableParallelism, redactor, shard,
+		); err != nil {
+			return err
+		}
+		slog.InfoContext(ctx, "migration: phase complete", slog.String("phase", string(ir.MigrationPhaseBulkCopy)))
+		slog.InfoContext(ctx, "migration: phase complete", slog.String("phase", string(ir.MigrationPhaseIndexes)))
 
-	// Phase 4: indexes.
-	if err := markPhase(ctx, rc, state, ir.MigrationPhaseIndexes); err != nil {
-		_ = err
+		// Phase 3.5: identity sync. Runs after the combined copy+index
+		// phase; it depends on the copied rows (sequence high-water mark),
+		// not on the indexes, so its position relative to index builds is
+		// immaterial.
+		if err := markPhase(ctx, rc, state, ir.MigrationPhaseIdentitySync); err != nil {
+			_ = err
+		}
+		if err := sw.SyncIdentitySequences(ctx, schema); err != nil {
+			err = fmt.Errorf("pipeline: sync identity sequences: %w", err)
+			return wrapWithHint(PhaseSchemaApply, markFailed(ctx, rc, *state, ir.MigrationPhaseIdentitySync, err))
+		}
+		slog.InfoContext(ctx, "migration: phase complete", slog.String("phase", string(ir.MigrationPhaseIdentitySync)))
+	} else {
+		// Fallback (MySQL): serial copy → identity-sync → whole-schema
+		// indexes, the pre-ADR-0077 ordering.
+		if err := runBulkCopyTablePool(
+			ctx, rc, state, &stateMu, schema, rows, rw,
+			resuming, bulkBatchSize, parallel, tableParallelism, redactor, shard, nil,
+		); err != nil {
+			return err
+		}
+		slog.InfoContext(ctx, "migration: phase complete", slog.String("phase", string(ir.MigrationPhaseBulkCopy)))
+
+		// Phase 3.5: identity sync.
+		if err := markPhase(ctx, rc, state, ir.MigrationPhaseIdentitySync); err != nil {
+			_ = err
+		}
+		if err := sw.SyncIdentitySequences(ctx, schema); err != nil {
+			err = fmt.Errorf("pipeline: sync identity sequences: %w", err)
+			return wrapWithHint(PhaseSchemaApply, markFailed(ctx, rc, *state, ir.MigrationPhaseIdentitySync, err))
+		}
+		slog.InfoContext(ctx, "migration: phase complete", slog.String("phase", string(ir.MigrationPhaseIdentitySync)))
+
+		// Phase 4: indexes.
+		if err := markPhase(ctx, rc, state, ir.MigrationPhaseIndexes); err != nil {
+			_ = err
+		}
+		if err := sw.CreateIndexes(ctx, schema); err != nil {
+			err = fmt.Errorf("pipeline: create indexes: %w", err)
+			return wrapWithHint(PhaseIndexes, markFailed(ctx, rc, *state, ir.MigrationPhaseIndexes, err))
+		}
+		slog.InfoContext(ctx, "migration: phase complete", slog.String("phase", string(ir.MigrationPhaseIndexes)))
 	}
-	if err := sw.CreateIndexes(ctx, schema); err != nil {
-		err = fmt.Errorf("pipeline: create indexes: %w", err)
-		return wrapWithHint(PhaseIndexes, markFailed(ctx, rc, *state, ir.MigrationPhaseIndexes, err))
-	}
-	slog.InfoContext(ctx, "migration: phase complete", slog.String("phase", string(ir.MigrationPhaseIndexes)))
 
 	// Phase 5: constraints.
 	if err := markPhase(ctx, rc, state, ir.MigrationPhaseConstraints); err != nil {

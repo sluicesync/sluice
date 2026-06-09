@@ -102,6 +102,19 @@ func applyIndexBuildParallelism(target any, n int) {
 	}
 }
 
+// applyIndexBuildBudget threads the connection slice the combined
+// copy+index split reserved for the overlapped index-build pool (ADR-0077)
+// to the target [ir.SchemaWriter] via the optional
+// [ir.IndexBuildBudgetSetter] surface, before
+// [ir.IncrementalIndexBuilder.BuildTableIndexesFromChannel] runs. Engines
+// without the setter (today: MySQL) skip cleanly. connBudget == 0 is the
+// "not overlapping" sentinel — the writer keeps its self-probe.
+func applyIndexBuildBudget(target any, connBudget int) {
+	if setter, ok := target.(ir.IndexBuildBudgetSetter); ok {
+		setter.SetIndexBuildBudget(connBudget)
+	}
+}
+
 // applyEnabledPGExtensions threads the operator's
 // `--enable-pg-extension` allowlist (ADR-0032) through to a freshly-
 // opened engine reader / writer / applier via the optional

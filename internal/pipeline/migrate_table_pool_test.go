@@ -184,7 +184,7 @@ func runTablePoolForTest(t *testing.T, n, rowsPerTable, tableParallelism int, dw
 	if err := runBulkCopyTablePool(
 		context.Background(), rc, state, &stateMu, schema,
 		primaryReader, primaryWriter,
-		false, 0, deps, tableParallelism, nil, ShardColumnSpec{},
+		false, 0, deps, tableParallelism, nil, ShardColumnSpec{}, nil,
 	); err != nil {
 		t.Fatalf("runBulkCopyTablePool: %v", err)
 	}
@@ -254,7 +254,7 @@ func TestRunBulkCopyTablePool_PeakBoundedByParallelism(t *testing.T) {
 			if err := runBulkCopyTablePool(
 				context.Background(), rc, state, &stateMu, schema,
 				primaryReader, primaryWriter,
-				false, 0, deps, tableP, nil, ShardColumnSpec{},
+				false, 0, deps, tableP, nil, ShardColumnSpec{}, nil,
 			); err != nil {
 				t.Fatalf("runBulkCopyTablePool: %v", err)
 			}

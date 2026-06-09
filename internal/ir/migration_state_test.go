@@ -37,6 +37,51 @@ func TestTableProgressMarshalCompactStrings(t *testing.T) {
 	}
 }
 
+// TestTableProgressIndexesBuiltWire pins the ADR-0077 IndexesBuilt wire
+// contract: a `complete` table with the flag UNSET stays the compact bare
+// string (false is the wire default), a `complete` table with the flag SET
+// promotes to the object form carrying indexes_built:true, an old
+// bare-string `"complete"` row decodes to IndexesBuilt=false (the safe
+// "re-feed to the index pool" interpretation), and the object form
+// round-trips.
+func TestTableProgressIndexesBuiltWire(t *testing.T) {
+	// (a) complete + not-yet-indexed → compact bare string.
+	b, err := json.Marshal(TableProgress{State: TableProgressComplete, IndexesBuilt: false})
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if string(b) != `"complete"` {
+		t.Errorf("complete+!built: got %s; want \"complete\"", b)
+	}
+
+	// (b) complete + indexed → object form with the flag.
+	b, err = json.Marshal(TableProgress{State: TableProgressComplete, IndexesBuilt: true})
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if string(b) != `{"state":"complete","indexes_built":true}` {
+		t.Errorf("complete+built: got %s; want object form with indexes_built:true", b)
+	}
+
+	// (c) old bare-string complete row → IndexesBuilt false (re-feed).
+	var old TableProgress
+	if err := json.Unmarshal([]byte(`"complete"`), &old); err != nil {
+		t.Fatalf("Unmarshal legacy: %v", err)
+	}
+	if old.State != TableProgressComplete || old.IndexesBuilt {
+		t.Errorf("legacy decode: got state=%q built=%v; want complete,false", old.State, old.IndexesBuilt)
+	}
+
+	// (d) object form round-trips the flag.
+	var rt TableProgress
+	if err := json.Unmarshal([]byte(`{"state":"complete","indexes_built":true}`), &rt); err != nil {
+		t.Fatalf("Unmarshal object: %v", err)
+	}
+	if rt.State != TableProgressComplete || !rt.IndexesBuilt {
+		t.Errorf("object decode: got state=%q built=%v; want complete,true", rt.State, rt.IndexesBuilt)
+	}
+}
+
 // TestTableProgressMarshalInProgressObject confirms the in-progress
 // state emits the object form with cursor and row count. Round-trips
 // through Unmarshal preserve all fields.
