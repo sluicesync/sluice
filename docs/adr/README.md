@@ -6,7 +6,7 @@ ADRs are numbered in the order they were proposed. A few notable conventions:
 
 - **Status** lines at the top of each ADR record whether the decision is Accepted, Superseded, or Discovery (research-only).
 - Some ADRs were promoted from a design doc in `docs/dev/notes/` after extended dialogue; the dialogue artifacts stay in `notes/` for traceability.
-- **ADR-0051 collision:** two ADRs share the number — `adr-0051-core-pg-type-verbatim-carry.md` (the canonical one referenced by the roadmap and `ir.VerbatimType`) and `adr-0051-pg-cdc-source-identity-pinning.md` (a sibling concern). Renumbering hasn't been done because both are widely cross-referenced; future ADRs continue from 0079.
+- **ADR-0051 collision:** two ADRs share the number — `adr-0051-core-pg-type-verbatim-carry.md` (the canonical one referenced by the roadmap and `ir.VerbatimType`) and `adr-0051-pg-cdc-source-identity-pinning.md` (a sibling concern). Renumbering hasn't been done because both are widely cross-referenced; future ADRs continue from 0080.
 - **ADR-0066 collision:** `adr-0066-postgres-trigger-engine-variant.md` is the actual ADR; `adr-0066-task-62-planning-brief.md` is a planning brief for the same chunk and not a true ADR.
 
 ## Foundations (0001–0009)
@@ -143,6 +143,12 @@ ADRs are numbered in the order they were proposed. A few notable conventions:
 | ADR | Decision |
 |---|---|
 | [0078](adr-0078-pg-pg-identity-passthrough-raw-copy.md) | Accepted — PG→PG identity passthrough: byte-pipe the raw COPY stream (`COPY (SELECT …) TO STDOUT` → `COPY tbl (…) FROM STDIN` via pgx `pgconn`) to close the per-stream copy-rate gap vs pgcopydb, bypassing the typed IR. Engine-neutral optional surfaces (`ir.RawCopyExporter`/`RawCopyImporter`/`RawCopyVersionProber`/`RawCopyChunk`/`RawCopyFormat`); engages ONLY behind a single auditable value-fidelity gate (`rawCopyGate`: same-engine + no redaction/type-override/expr-override/shard-injection + per-table identity projection excluding extension/verbatim/bit/geometry) — any transform present falls back to the IR path. Slotted in the ADR-0043 cold-start fast-loader branch (`migrate`-only; resume + sync stay on the IR path); text COPY default, binary opt-in on matched server majors. Roadmap item 3b(b) |
+
+## Fast cold-start for the sync path (0079)
+
+| ADR | Decision |
+|---|---|
+| [0079](adr-0079-fast-cold-start-for-sync-path.md) | Accepted (design) — bring the migrate cold-start speedups (cross-table pool ADR-0076 + index-overlap ADR-0077 + raw passthrough ADR-0078) to `sluice sync start`'s cold-start, so copy+follow gets the fast copy (the one-command pgcopydb-`--follow`-at-full-speed equivalent). Shape (A), PG-source-first, behind a source-capability gate: qualifies only when the `ir.SnapshotStream` carries a shareable exported-snapshot name AND the source implements `ir.SnapshotImporterOpener` (wires the latent, never-called `SnapshotImporter` `SET TRANSACTION SNAPSHOT` surface to pin all N parallel readers to ONE consistent snapshot). MySQL + VStream/PlanetScale stay serial (loud INFO), deferred — the durable-watermark + idempotent-COPY coupling lives only on the VStream path, which never coexists with the raw byte-pipe. `rawCopyGate` refactored off `*Migrator` onto a shared transform-config struct so the value-fidelity guarantee is identical on both paths. CDC connection slot reserved in the budget; resume stays serial. Roadmap item 3d. |
 
 ## Notes / dialogue prep / readiness briefs
 
