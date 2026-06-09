@@ -414,10 +414,16 @@ func TestMigrate_PG_ParallelCopy_BelowThreshold(t *testing.T) {
 	if !progress.Valid {
 		t.Fatalf("table_progress is NULL; expected non-empty progress map")
 	}
-	// We expect the bare-string "complete" form, not an object with
-	// chunks. Check by string-matching the JSON.
-	if !strings.Contains(progress.String, `"small_table":"complete"`) {
-		t.Errorf("small_table progress did not use bare-string complete form: %s", progress.String)
+	// small_table declined the parallel-chunk path, so its progress must NOT
+	// carry a chunks array (the load-bearing assertion). It is recorded
+	// complete; post-ADR-0077 a completed table also records indexes_built,
+	// so it serialises as the object form {"state":"complete",
+	// "indexes_built":true} rather than the bare-string "complete" — accept
+	// either complete form, but never the chunk-verbose form.
+	completeBare := strings.Contains(progress.String, `"small_table":"complete"`)
+	completeObj := strings.Contains(progress.String, `"small_table":{"state":"complete"`)
+	if !completeBare && !completeObj {
+		t.Errorf("small_table progress not in a complete form: %s", progress.String)
 	}
 	if strings.Contains(progress.String, `"chunks"`) {
 		t.Errorf("small_table progress unexpectedly contains chunks: %s", progress.String)
