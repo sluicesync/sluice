@@ -56,6 +56,48 @@ dispatch assertion. `-race` is CI-only (this is a concurrency chunk — the
 new pool + snapshot-importer readers across goroutines + the CDC-slot
 reservation); the `-race` Integration gate must pass before any tag.
 
+### v1.1 addendum — within-table chunking re-enabled (roadmap 3d v1.1)
+
+**Why.** The v1 fast cold-start got cross-table parallelism + index-overlap +
+raw passthrough but NOT within-table PK-range chunking (ADR-0019), because the
+deadlock fix that landed during the v0.99.29 release (`a8d065d`) made the
+chunk-size probe (`CountRows`) return `0` for snapshot-pinned readers — so every
+sync-fast-path table single-streams, and a huge table copies on one connection.
+
+**Root cause of the original deadlock (the thing v1.1 must not reintroduce).**
+`CountRows`'s exact-`COUNT(*)` fallback fired a SECOND `QueryContext` on the
+table's single pinned `*sql.Conn` **while its first reltuples `Rows` was still
+open** (the deferred `Close` hadn't run) — database/sql serialises a `*sql.Conn`
+through `closemu`, so the second query blocked forever (goroutine-dump
+confirmed). Migrate's `*sql.DB`-backed readers never hit it (each query draws a
+fresh pooled conn). The v1 fix returned `0` for pinned readers to dodge it.
+
+**Verified sequencing (the load-bearing finding).** The chunk DECISION phase
+(`shouldParallelChunk` → `CountRows`, then `resolveChunks` → MIN/MAX) runs
+STRICTLY BEFORE `runChunks` opens any copy stream, single-goroutine and
+single-conn — each table's primary reader is owned exclusively by that table's
+goroutine. So the decision probes never race an in-flight stream; the *only*
+hazard was the intra-`CountRows` self-overlap above.
+
+**Fix (conservative, two independent guarantees against the deadlock).**
+(a) Make `CountRows` sequential — explicitly close the reltuples `Rows` before
+the `exactCount` fallback, so two queries never overlap on a pinned conn
+(a correctness fix valuable on its own). (b) Let pinned readers run the
+decision-phase probes (reltuples + MIN/MAX, single sequential statements) but
+**skip the exact-`COUNT(*)` seq scan** — return `reltuples`, or `0` when stats
+are absent. A `0` estimate just means single-stream (= current behavior), so the
+within-table win is realized only when `reltuples` is populated (the common
+case). **Named limitation:** a freshly-loaded, never-`ANALYZE`d huge table on the
+sync path stays single-stream until analyzed — acceptable, it equals today's
+behavior and degrades to slower, never lossy. The only production change is the
+two Postgres `RowReader` methods (`CountRows`, `RangeBounds`) + unifying the
+"is-pinned" signal (`snapshotPinned`) across the stream reader and the importer
+readers; the orchestrator, budget (`tableP × withinP` already provisioned), and
+snapshot-consistency (chunk readers still minted via `SnapshotImporter`) are
+unchanged. No-silent-loss: the change touches only count/range *estimation*; a
+wrong estimate degrades to single-stream, never corrupts the copy. `-race`
+concurrency chunk; gate before any tag.
+
 ## Context
 
 The three cold-start copy speedups — the cross-table worker pool (ADR-0076), index-build overlap (ADR-0077), and the PG→PG raw-copy identity passthrough (ADR-0078) — are **`migrate`-only**. `sluice sync start`'s initial cold-start calls the serial `runBulkCopyWithOpts` (`internal/pipeline/migrate.go:1116`), so the **copy-then-continuously-follow** workflow — the one-command equivalent of pgcopydb's `--follow` — does its initial copy on the slow path. A user who wants *both* a fast initial copy *and* continuous CDC currently cannot get the fast copy: `migrate` is fast but one-shot; `sync start` follows but copies serially. pgcopydb gives fast-copy + follow together; sluice should too.

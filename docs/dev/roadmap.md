@@ -97,7 +97,7 @@ What remains are the **harder-frontier, demand-gated items** that have always be
 
 ---
 
-### 3c. Extend index-build overlap to MySQL targets — *next (operator-flagged 2026-06-09)*
+### 3c. Extend index-build overlap to MySQL targets — *design done + [ADR-0080](../adr/adr-0080-mysql-index-build-overlap.md); implementation in progress (operator-flagged 2026-06-09)*
 
 **Why.** Index-build overlap (ADR-0077, item 3b(a)) is engine-NEUTRAL in concept but PG-only in implementation: it engages only when the target writer implements `ir.IncrementalIndexBuilder`, which today only the PG writer does. MySQL-target migrates therefore still run the pre-ADR-0077 order — full bulk-copy phase, *then* a separate whole-schema `CreateIndexes` tail. A MySQL target would get the same tail-collapse the PG target got, for free on every MySQL-*target* migrate (MySQL→MySQL and PG→MySQL).
 
@@ -105,7 +105,7 @@ What remains are the **harder-frontier, demand-gated items** that have always be
 
 **Gotchas.** (1) MySQL/InnoDB online-DDL `ADD INDEX` has different cost/locking characteristics than PG's `CREATE INDEX` (inplace vs copy algorithm, metadata locks, the row-log) — measure at scale before claiming a win; the PG number doesn't transfer. (2) PlanetScale/Vitess targets route DDL through their own online-DDL/Safe-Migrations machinery, so the overlap may be a no-op or need to defer to the platform — gate on flavor. (3) Concurrent `ALTER`s against the same instance compete for `innodb_buffer_pool` + I/O exactly like the PG disk-contention finding — the at-scale win may again be modest on a saturated disk and larger on fast storage. (4) `-race` chunk (extends the cross-table pool). Its own at-scale `bench-pgcopydb/`-style MySQL measurement before the doc claims a number.
 
-### 3d. Fast cold-start for the `sync` path — the pgcopydb `--follow` equivalent at full speed — *surfaced 2026-06-09*
+### 3d. Fast cold-start for the `sync` path — the pgcopydb `--follow` equivalent at full speed — *v1 SHIPPED v0.99.29 ([ADR-0079](../adr/adr-0079-fast-cold-start-for-sync-path.md)); v1.1 (within-table chunking) design done + ADR-0079 addendum, implementation in progress*
 
 **Why.** This is the migrate-vs-sync gap a user hit: today the three cold-start speedups — cross-table pool (`--table-parallelism`, ADR-0076), index-build overlap (ADR-0077), and PG→PG raw passthrough (ADR-0078) — are **`migrate`-only**. `sync start`'s own initial cold-start calls the serial `runBulkCopyWithOpts` (`streamer.go:2811`, `streamer_multidb.go:587`) "serial by design," so the **copy-then-continuously-follow** workflow (pgcopydb's `--follow`; sluice's `sync start` is the one-command equivalent) does the initial copy on the SLOW path. There is also no clean `migrate` (fast) → `sync start` (CDC, no re-copy) handoff: `sync start` re-runs its own cold-start. So a user who wants *both* a fast initial copy *and* continuous CDC currently can't get the fast copy. pgcopydb gives fast-copy + follow together; sluice should too.
 
