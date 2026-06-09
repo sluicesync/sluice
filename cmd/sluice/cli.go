@@ -177,6 +177,8 @@ type MigrateCmd struct {
 
 	ForceColdStart bool `help:"Skip the cold-start pre-flight check that refuses to bulk-copy into a populated target. Use with caution — INSERT into a non-empty table will collide on PRIMARY KEY. Ignored when --resume is set."`
 
+	RawCopyFormat string `help:"Wire format for the same-engine raw-copy passthrough fast lane (ADR-0078, PG→PG). 'text' (default) is cross-major safe (pgcopydb's default); 'binary' is faster but only used when source and target server majors match (sluice probes both and downgrades to text loudly on a mismatch); 'auto' requests binary, letting the version probe decide. The lane itself engages ONLY for a same-engine, no-transform copy (no --redact / --type-override / --expr-override / --inject-shard-column); any transform present falls back to the IR copy path. The win is eliminating the per-value decode/re-encode, not text-vs-binary." default:"text" enum:"text,binary,auto" placeholder:"text|binary|auto"`
+
 	ResetTargetData bool `help:"Destructive recovery: DELETE the migrate-state row, DROP every source-schema table on the target, then run a fresh cold-start. Use after a wedged-state recovery (e.g. slot-missing fall-through). Requires confirmation (type 'reset') unless --yes is set. Mutually exclusive with --resume. See ADR-0023."`
 
 	Yes bool `help:"Skip the destructive-action confirmation prompt for --reset-target-data." short:"y"`
@@ -322,6 +324,7 @@ func (m *MigrateCmd) Run(g *Globals) error {
 		Resume:                m.Resume,
 		MigrationID:           m.MigrationID,
 		ForceColdStart:        m.ForceColdStart,
+		RawCopyFormat:         parseRawCopyFormat(m.RawCopyFormat),
 		ResetTargetData:       m.ResetTargetData,
 		BulkBatchSize:         m.BulkBatchSize,
 		BulkParallelism:       m.BulkParallelism,
@@ -787,6 +790,21 @@ func parseIndexBuildMem(raw string) (int64, error) {
 		return 0, fmt.Errorf("--index-build-mem: expected a non-negative size; got %q", raw)
 	}
 	return n, nil
+}
+
+// parseRawCopyFormat maps the --raw-copy-format flag to the IR request
+// constant (ADR-0078). kong's enum tag has already constrained raw to
+// {text,binary,auto}, so this is a total map; "auto" requests binary as
+// the intent and lets the orchestrator's version probe decide the actual
+// wire format. Any unexpected value falls back to text — the always-safe
+// default.
+func parseRawCopyFormat(raw string) ir.RawCopyFormat {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "binary", "auto":
+		return ir.RawCopyBinary
+	default:
+		return ir.RawCopyText
+	}
 }
 
 // parseMaxMemory turns the --max-memory flag value into a byte count

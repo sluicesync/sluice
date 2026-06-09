@@ -138,6 +138,34 @@ func bulkCopyOneTable(
 		return nil
 	}
 
+	// ADR-0078 raw-copy passthrough — whole-table single-stream path.
+	// Mirrors the chunked dispatch in copyChunk but for tables that
+	// didn't take the parallel path (below the split threshold). Engaged
+	// only on a cold-start (non-resume, non-force-cold-start) run where
+	// the target is proven empty (Bug 9), so the non-upsert byte-pipe
+	// COPY FROM can't collide; a crash leaves the in-progress breadcrumb
+	// below absent, so resume replays through the IR path. Requires the
+	// run-level gate, this table's identity projection, and both
+	// endpoints implementing the raw surfaces. No PK needed — the
+	// whole-table export has no WHERE bound.
+	if parallel != nil && parallel.rawCopyOK && !resuming && !parallel.forceColdStart && identityProjection(table) {
+		if exp, imp, ok := asRawCopyEndpoints(rows, rw); ok {
+			// Breadcrumb so a mid-pipe crash leaves a clean truncate-and-redo
+			// entry for the next attempt (same disposition as copyTable's).
+			setTableProgressAndWrite(ctx, rc, state, stateMu, table.Name, ir.TableProgress{State: ir.TableProgressInProgress})
+			rowsN, rawErr := runRawCopyChunk(ctx, exp, imp, table, nil, parallel.rawCopyFormat)
+			if rawErr != nil {
+				wrapped := fmt.Errorf("pipeline: copy table %q (raw copy): %w", table.Name, rawErr)
+				return wrapWithHint(PhaseBulkCopy, markFailedLocked(ctx, rc, state, stateMu, ir.MigrationPhaseBulkCopy, wrapped))
+			}
+			slog.InfoContext(ctx, "migration: table copied via raw-copy passthrough",
+				slog.String("table", table.Name),
+				slog.Int64("rows", rowsN))
+			setTableProgressAndWrite(ctx, rc, state, stateMu, table.Name, ir.TableProgress{State: ir.TableProgressComplete})
+			return nil
+		}
+	}
+
 	// Decide whether per-batch checkpointing is available for this
 	// table and classify accordingly. The decision is sticky: once
 	// classified as no-PK truncate-and-redo, the entry stays that way

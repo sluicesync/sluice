@@ -145,9 +145,20 @@ func TestMigrate_PostgresToPostgres_SpecialValues(t *testing.T) {
 	}
 
 	// Per-row, per-family value preservation. Each WHERE uses PG-native
-	// equality (or `isnan()` for NaN — `NaN <> NaN` per IEEE-754 so equals
-	// won't catch it). A silently-coerced value (zero-Time / 0.0 / NULL)
-	// surfaces as "rows = 0" here.
+	// equality for infinity and a text-rendering compare for NaN (PG
+	// treats NaN = NaN as TRUE, so an `!= ` predicate never catches it).
+	// A silently-coerced value (zero-Time / 0.0 / NULL) surfaces as
+	// "rows = 0" here.
+	//
+	// NOTE (ADR-0078): on a same-engine PG → PG cold migrate these values
+	// now round-trip faithfully through the raw-copy passthrough byte-pipe
+	// (the COPY text stream carries 'infinity' / 'NaN' literally), so the
+	// per-row assertions below execute and pass. Before ADR-0078 the IR
+	// row-reader loud-failed on infinity-as-time.Time (the documented
+	// LOUD-FAILURE PATH above), which short-circuited these assertions. The
+	// raw lane is strictly MORE faithful here; the loud-failure path is
+	// still the IR-path outcome (and the only outcome for any transform /
+	// cross-engine run, which falls back to the IR path).
 	for _, c := range []struct {
 		name  string
 		where string
@@ -160,11 +171,15 @@ func TestMigrate_PostgresToPostgres_SpecialValues(t *testing.T) {
 		{"date -infinity (id=6)", `id = 6 AND d = '-infinity'`},
 		{"float4 +infinity (id=7)", `id = 7 AND f4 = 'infinity'::real`},
 		{"float4 -infinity (id=8)", `id = 8 AND f4 = '-infinity'::real`},
-		{"float4 NaN (id=9)", `id = 9 AND f4 != f4`}, // NaN != NaN per IEEE-754
+		// NaN: PG defines NaN = NaN as TRUE (it does NOT follow IEEE-754's
+		// NaN != NaN), so an `f4 != f4` predicate is always false even for a
+		// genuine PG NaN. Compare the text rendering instead — unambiguous
+		// and quirk-free.
+		{"float4 NaN (id=9)", `id = 9 AND f4::text = 'NaN'`},
 		{"float8 +infinity (id=10)", `id = 10 AND f8 = 'infinity'::double precision`},
 		{"float8 -infinity (id=11)", `id = 11 AND f8 = '-infinity'::double precision`},
-		{"float8 NaN (id=12)", `id = 12 AND f8 != f8`},
-		{"numeric NaN (id=13)", `id = 13 AND n != n`},
+		{"float8 NaN (id=12)", `id = 12 AND f8::text = 'NaN'`},
+		{"numeric NaN (id=13)", `id = 13 AND n::text = 'NaN'`},
 		{"sanity row (id=14, ordinary values)", `id = 14 AND ts = '2026-01-02 03:04:05'::timestamp AND f8 = 1.5 AND n = 1.5`},
 	} {
 		t.Run(c.name, func(t *testing.T) {

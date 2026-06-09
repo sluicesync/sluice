@@ -148,6 +148,18 @@ type Migrator struct {
 	// regardless of this flag.
 	ForceColdStart bool
 
+	// RawCopyFormat is the operator's --raw-copy-format intent for the
+	// ADR-0078 same-engine raw-copy passthrough lane (item 3b(b)).
+	// [ir.RawCopyText] (the default) is cross-major safe; [ir.RawCopyBinary]
+	// is requested only on a matched-major same-engine pair (the
+	// orchestrator probes both endpoints and downgrades to text loudly on
+	// a mismatch). The "auto" CLI token maps to RawCopyBinary as the
+	// *request* — negotiation, not the flag, decides the actual format —
+	// while "text"/"binary" map to the respective constants. The lane
+	// itself only engages when [rawCopyGate] proves there is no value
+	// transform to skip; this field never affects the IR copy path.
+	RawCopyFormat ir.RawCopyFormat
+
 	// ResetTargetData, when true, clears the migrate-state row and
 	// drops every source-schema table on the target before starting
 	// a fresh cold-start migration. The destructive recovery path for
@@ -595,6 +607,24 @@ func (m *Migrator) runSingleDatabase(ctx context.Context, scope *multiDBScope) e
 		}
 	}
 
+	// ---- 1.52. Raw-copy passthrough gate (ADR-0078, item 3b(b)) ----
+	// The SINGLE auditable value-fidelity predicate, evaluated ONCE here —
+	// after every IR-mutation step (ApplyMappings / ApplyExpressionOverrides
+	// / InjectShardColumn) so the gate sees the final transform set, and
+	// before any data moves. Result is threaded as a bool into
+	// parallelBulkCopyDeps; a per-table identity re-check (identityProjection)
+	// + a reader/writer raw-surface assertion happen at per-table dispatch so
+	// one odd table falls back without disabling the lane. The byte-pipe
+	// bypasses the typed IR (= every value transform), so this gate is the
+	// silent-loss backstop: any transform present ⇒ ok=false ⇒ IR copy path.
+	rawCopyOK, rawCopyReason := rawCopyGate(m, schema)
+	if rawCopyOK {
+		slog.InfoContext(ctx, "raw-copy passthrough lane eligible (ADR-0078)")
+	} else {
+		slog.DebugContext(ctx, "raw-copy passthrough lane not eligible; using IR copy path",
+			slog.String("reason", rawCopyReason))
+	}
+
 	// ---- 1.55. Redaction-type pre-flight refusal (Bug 60, v0.58.1) ----
 	// Catches mask:uuid on UUID-typed columns BEFORE schema apply so
 	// the operator sees an actionable error at run-start instead of
@@ -921,6 +951,18 @@ func (m *Migrator) runSingleDatabase(ctx context.Context, scope *multiDBScope) e
 		slog.Int("index_build_budget", indexBudget),
 	)
 
+	// Raw-copy format negotiation (ADR-0078). Only meaningful when the
+	// gate held AND both the primary reader/writer implement the raw
+	// surfaces; negotiation probes both endpoints' server majors and
+	// downgrades a binary request to text loudly on a mismatch. When the
+	// gate didn't hold the format is irrelevant (the lane never engages).
+	rawCopyFormat := ir.RawCopyText
+	if rawCopyOK {
+		if exp, imp, ok := asRawCopyEndpoints(rr, rw); ok {
+			rawCopyFormat = negotiateRawCopyFormat(ctx, m.RawCopyFormat, exp, imp)
+		}
+	}
+
 	parallelDeps := &parallelBulkCopyDeps{
 		source:         m.Source,
 		target:         m.Target,
@@ -933,6 +975,11 @@ func (m *Migrator) runSingleDatabase(ctx context.Context, scope *multiDBScope) e
 		// preflight, so the target may hold rows; the fast non-upsert
 		// loader must not run on a chunk in that case.
 		forceColdStart: m.ForceColdStart,
+		// ADR-0078 raw-copy passthrough — run-level gate result + the
+		// negotiated wire format. Per-table identity + raw-surface checks
+		// happen at dispatch.
+		rawCopyOK:     rawCopyOK,
+		rawCopyFormat: rawCopyFormat,
 	}
 
 	if err := runBulkCopyPhases(ctx, rc, &state, schema, rr, sw, rw, resuming, m.BulkBatchSize, parallelDeps, tableParallelism, m.Redactor, m.InjectShardColumn); err != nil {

@@ -111,6 +111,21 @@ type parallelBulkCopyDeps struct {
 	// key — so the chunk must take the idempotent branch even on a
 	// fresh, zero-progress run. See [useFastLoader].
 	forceColdStart bool
+
+	// rawCopyOK is the run-level result of [rawCopyGate], computed once
+	// at migrate setup. When true the same-engine raw-copy passthrough
+	// lane (ADR-0078) is eligible — a chunk/table additionally requires
+	// [identityProjection] to hold AND its reader/writer to implement the
+	// raw surfaces before it byte-pipes. False forces the IR copy path
+	// for every table (the gate found a transform that the byte-pipe
+	// would silently skip).
+	rawCopyOK bool
+
+	// rawCopyFormat is the negotiated wire format for the raw-copy lane
+	// ([negotiateRawCopyFormat]). Threaded verbatim into every
+	// ExportRawCopy / ImportRawCopy so the exporter and importer never
+	// disagree. Meaningful only when rawCopyOK is true.
+	rawCopyFormat ir.RawCopyFormat
 }
 
 // useFastLoader is the ADR-0043 gate: it decides whether a parallel
@@ -426,14 +441,14 @@ func runChunks(
 				// Chunk 0 reuses the orchestrator's primary connections;
 				// they are already open, so there is no acquire/retry and
 				// no gate token to manage.
-				return copyChunk(gctx, rc, state, stateMu, primaryRows, primaryRW, table, pkCols, k, limit, redactor, shard, resuming, deps.forceColdStart)
+				return copyChunk(gctx, rc, state, stateMu, primaryRows, primaryRW, table, pkCols, k, limit, redactor, shard, resuming, deps.forceColdStart, deps.rawCopyOK, deps.rawCopyFormat)
 			}
 			chunkRows, chunkRW, releaseConn, err := acquireChunkConn(gctx, deps, gate, classifySlotExhaustion, k)
 			if err != nil {
 				return err
 			}
 			defer releaseConn()
-			return copyChunk(gctx, rc, state, stateMu, chunkRows, chunkRW, table, pkCols, k, limit, redactor, shard, resuming, deps.forceColdStart)
+			return copyChunk(gctx, rc, state, stateMu, chunkRows, chunkRW, table, pkCols, k, limit, redactor, shard, resuming, deps.forceColdStart, deps.rawCopyOK, deps.rawCopyFormat)
 		})
 	}
 	return g.Wait()
@@ -563,6 +578,8 @@ func copyChunk(
 	shard ShardColumnSpec,
 	resuming bool,
 	forceColdStart bool,
+	rawCopyOK bool,
+	rawCopyFormat ir.RawCopyFormat,
 ) (retErr error) {
 	br, ok := rr.(ir.BatchedRowReader)
 	if !ok {
@@ -593,6 +610,20 @@ func copyChunk(
 	// loader; otherwise it falls through to the idempotent branch,
 	// which additionally requires the IdempotentRowWriter surface.
 	if useFastLoader(resuming, forceColdStart, chunk) {
+		// ADR-0078 raw-copy passthrough: slotted INSIDE the fast-loader
+		// branch so it inherits the same cold-start safety (a fresh,
+		// zero-progress, proven-empty chunk — a byte-pipe COPY FROM is
+		// non-upsert and can only run where a PK collision is impossible,
+		// and a crash mid-pipe leaves zero recorded progress so resume
+		// replays via the IR path). Engaged only when the run-level gate
+		// holds AND this table's projection is identity-safe AND both
+		// endpoints implement the raw surfaces; otherwise the regular IR
+		// fast-loader runs.
+		if rawCopyOK && identityProjection(table) {
+			if exp, imp, ok := asRawCopyEndpoints(rr, rw); ok {
+				return copyChunkRaw(ctx, rc, state, stateMu, exp, imp, table, pkCols, chunkIndex, chunk, rawCopyFormat)
+			}
+		}
 		return copyChunkFast(ctx, rc, state, stateMu, br, rw, table, pkCols, chunkIndex, chunk, limit, redactor, shard)
 	}
 
@@ -1003,6 +1034,100 @@ func copyChunkFast(
 		slog.Float64("rows_per_sec", rowsPerSec))
 
 	return nil
+}
+
+// copyChunkRaw is the ADR-0078 raw-copy passthrough branch for a fresh,
+// zero-progress chunk that passed the run-level [rawCopyGate], this
+// table's [identityProjection], and whose endpoints implement the raw
+// surfaces. It byte-pipes the chunk's PK range straight from source COPY
+// TO STDOUT into target COPY FROM STDIN via [runRawCopyChunk] — no row
+// is ever decoded.
+//
+// Checkpoint shape mirrors [copyChunkFast] exactly: NO per-batch
+// checkpoint (a byte-pipe is one atomic logical operation), one terminal
+// per-chunk checkpoint (RowsCopied + State=Complete) on success. A crash
+// before that terminal write leaves the chunk with zero recorded
+// progress, so the resume run fails [useFastLoader] gate (1) and replays
+// the whole chunk through the IR path — the same load-bearing correctness
+// property the fast loader relies on (raw lane never taken on resume).
+//
+// v1 supports a SINGLE integer PK column (the orchestrator's chunk
+// machinery already restricts itself to that shape via
+// canParallelChunkTable); the chunk's [ir.TableChunkProgress] PK tuples
+// are 1-wide, so we project the lone bound. A defensively-empty pkCols
+// or a missing first chunk-PK element is a programming error (chunking
+// would not have produced this chunk), surfaced loudly rather than
+// silently copying the whole table.
+func copyChunkRaw(
+	ctx context.Context,
+	rc resumeContext,
+	state *ir.MigrationState,
+	stateMu *sync.Mutex,
+	exp ir.RawCopyExporter,
+	imp ir.RawCopyImporter,
+	table *ir.Table,
+	pkCols []string,
+	chunkIndex int,
+	chunk ir.TableChunkProgress,
+	format ir.RawCopyFormat,
+) error {
+	if len(pkCols) != 1 {
+		return fmt.Errorf("pipeline: copyChunkRaw: expected exactly one PK column, got %d", len(pkCols))
+	}
+	rcChunk := &ir.RawCopyChunk{
+		PKColumn: pkCols[0],
+		LowerPK:  firstPKBound(chunk.LowerPK),
+		UpperPK:  firstPKBound(chunk.UpperPK),
+	}
+
+	chunkStart := time.Now()
+	slog.DebugContext(ctx, "adr0078: raw chunk start",
+		slog.String("table", table.Name),
+		slog.Int("chunk", chunkIndex),
+		slog.Bool("raw_copy", true),
+		slog.String("format", format.String()),
+		slog.Time("t_start", chunkStart))
+
+	rows, err := runRawCopyChunk(ctx, exp, imp, table, rcChunk, format)
+	if err != nil {
+		return err
+	}
+
+	// Single terminal per-chunk checkpoint (mirrors copyChunkFast).
+	stateMu.Lock()
+	tp := state.TableProgress[table.Name]
+	if chunkIndex < len(tp.Chunks) {
+		tp.Chunks[chunkIndex].RowsCopied = rows
+		tp.Chunks[chunkIndex].State = ir.TableProgressComplete
+		state.TableProgress[table.Name] = tp
+	}
+	stateCopy := cloneStateForWrite(state)
+	stateMu.Unlock()
+	if err := writeState(ctx, rc, stateCopy); err != nil {
+		slog.WarnContext(ctx, "migration: raw-copy chunk completion state write failed; continuing",
+			slog.String("table", table.Name),
+			slog.Int("chunk", chunkIndex),
+			slog.String("err", err.Error()))
+	}
+
+	chunkEnd := time.Now()
+	slog.DebugContext(ctx, "adr0078: raw chunk done",
+		slog.String("table", table.Name),
+		slog.Int("chunk", chunkIndex),
+		slog.Bool("raw_copy", true),
+		slog.Int64("rows", rows),
+		slog.Duration("chunk_wall", chunkEnd.Sub(chunkStart)))
+	return nil
+}
+
+// firstPKBound projects the single-column PK bound out of a chunk's PK
+// tuple. Returns nil for an empty/nil tuple (an open bound — chunk 0 has
+// no lower, the last chunk has no upper).
+func firstPKBound(pk []any) any {
+	if len(pk) == 0 {
+		return nil
+	}
+	return pk[0]
 }
 
 // cloneStateForWrite returns a deep enough copy of state to be safe
