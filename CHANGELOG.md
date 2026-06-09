@@ -6,6 +6,68 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.99.29] - 2026-06-09
+
+### Added
+
+- **Cross-table copy worker pool for `sluice migrate` (`--table-parallelism`,
+  ADR-0076) + adaptive `--bulk-parallel-min-rows`.** `migrate` now copies
+  multiple tables concurrently (the cross-table axis, pgcopydb's `--table-jobs`),
+  composed with the existing within-table `--bulk-parallelism` PK-range
+  splitting — closing the many-medium-table gap where each table sat below the
+  within-table-split threshold and the serial table loop left cores idle. The
+  two axes multiply, and the product is bounded by the target's connection
+  budget (and `--max-target-connections`) at a single chokepoint. `0` (default)
+  = auto 4; `1` disables. `--bulk-parallel-min-rows` became a `0=auto` sentinel
+  that dials the within-table-split threshold down on many-table schemas
+  (`base/table-count`, floored at 10000); explicit values are honoured verbatim,
+  single/few-table behaviour unchanged. ~2.76× on the 30×50k shape, zero-loss.
+- **Index-build overlap for `migrate` (ADR-0077, Postgres target).** Each
+  table's secondary indexes are now built as that table's copy lands,
+  concurrently with the still-copying tables, instead of a separate post-copy
+  whole-schema index phase (which had been a sequential ~457 s tail — 29% of
+  total — on the 110 GB benchmark). Copy and index connections are open
+  simultaneously, so the budget reserves a clamped ~25% slice (capped at 8) for
+  the index pool at the same chokepoint. Constraints/FKs stay after the combined
+  phase. Resume is additive (`TableProgress.IndexesBuilt`, omitempty; old tokens
+  re-feed, a no-op under `CREATE INDEX IF NOT EXISTS`). PG-only; a MySQL target
+  falls back to the post-copy `CreateIndexes`.
+- **PG→PG identity passthrough (ADR-0078).** For a same-engine, no-transform
+  PG→PG copy, `migrate` byte-pipes the raw COPY stream (`COPY (SELECT …) TO
+  STDOUT` → `io.Pipe` → `COPY … FROM STDIN`) past the typed IR, removing the
+  per-value decode/re-encode and closing the per-stream rate gap vs pgcopydb.
+  Auto-engaged behind a value-fidelity gate: same-engine + no transform (no
+  `--redact` / `--type-override` / `--expr-override` / `--inject-shard-column`)
+  + a per-table projection that excludes OID/wire-format-sensitive types
+  (extension / verbatim / bit / geometry / array — the Bug-74 element-family
+  classes) in v1; any transform falls back to the IR path. New
+  `--raw-copy-format=text|binary|auto` (text default — cross-major safe; binary
+  only when source/target server majors match, downgrading to text loudly
+  otherwise). Both sessions are forced to `client_encoding=UTF8` so the
+  byte-pipe is self-consistent regardless of either DSN (an asymmetric
+  `client_encoding` would otherwise silently corrupt non-ASCII text).
+- **Fast parallel cold-start for the `sync` path (ADR-0079, Postgres source).**
+  `sluice sync start`'s PG-source cold-start now reuses the fast machinery —
+  cross-table pool + index-build overlap + raw passthrough — so the
+  copy-then-continuously-follow workflow (pgcopydb's `--follow` equivalent) gets
+  the fast initial copy instead of the old serial one. All parallel readers are
+  pinned to the one exported snapshot via `SET TRANSACTION SNAPSHOT`, so the
+  reads are snapshot-consistent (gap-free). Capability-gated on a shareable
+  exported-snapshot surface (IR-first, never an engine-name check): MySQL and
+  VStream/PlanetScale sources stay on the serial cold-start with a loud INFO
+  log. Resume, `--schema-already-applied`, and multi-database / multi-schema
+  cold-start stay serial in v1. New `sync start` flags mirror migrate's:
+  `--table-parallelism`, `--bulk-parallelism`, `--bulk-parallel-min-rows`,
+  `--bulk-batch-size`, `--raw-copy-format` (inert on MySQL/VStream sources).
+
+### Changed
+
+- Vitess cluster integration-test floor extended to v21, with a scheduled
+  multi-version matrix (v21→latest) backed by prebaked GHCR server images
+  (test/CI infrastructure only — no binary behaviour change). Testcontainers
+  ryuk disabled on the integration jobs to kill the docker.io ryuk-pull flake;
+  `actions/setup-go` bumped v5→v6.
+
 ## [0.99.28] - 2026-06-08
 
 ### Fixed
