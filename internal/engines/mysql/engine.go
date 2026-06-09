@@ -81,7 +81,7 @@ func (e Engine) OpenSchemaReader(ctx context.Context, dsn string) (ir.SchemaRead
 // identified by dsn. The caller is responsible for closing the
 // returned SchemaWriter (via its Close method) to release the
 // underlying connection pool.
-func (e Engine) OpenSchemaWriter(ctx context.Context, dsn string) (ir.SchemaWriter, error) {
+func (Engine) OpenSchemaWriter(ctx context.Context, dsn string) (ir.SchemaWriter, error) {
 	cfg, err := parseDSN(dsn)
 	if err != nil {
 		return nil, err
@@ -90,10 +90,7 @@ func (e Engine) OpenSchemaWriter(ctx context.Context, dsn string) (ir.SchemaWrit
 	if err != nil {
 		return nil, err
 	}
-	// Thread the flavor so the overlapped index-build path (ADR-0080) can
-	// decline the overlap on PlanetScale/Vitess targets and fall back to
-	// the post-copy whole-schema CreateIndexes.
-	w := &SchemaWriter{db: db, schema: cfg.DBName, flavor: e.Flavor}
+	w := &SchemaWriter{db: db, schema: cfg.DBName}
 	// Probe SELECT VERSION() once at open so the v0.97.0 inline-CHECK
 	// path knows whether the target is MySQL 8.0.16+. A probe failure
 	// is non-fatal: zero-value inlineCheckSupported (false) preserves
