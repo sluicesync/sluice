@@ -207,6 +207,20 @@ func (s *Streamer) runColdStartParallel(
 	// concurrently by peer chunk/table goroutines; ImportSnapshot opens its
 	// own *sql.Conn per call, so concurrent calls are safe. The returned
 	// reader's lifecycle is owned by the caller's closeIf release path.
+	//
+	// INVARIANT (load-bearing): these importer-minted readers are
+	// SINGLE-SCHEMA (qualifyBySchema=false). The fast lane therefore must
+	// NEVER be reached by a spanning / multi-schema snapshot stream (ADR-0075
+	// Phase 2b): such a stream qualifies table names by schema, and a
+	// single-schema parallel reader would silently read only the default
+	// schema while CDC delivered all of them — a silent divergence. This
+	// holds by construction today: the spanning opener
+	// (OpenMultiDatabaseSnapshotStream) is reached ONLY via
+	// coldStartMultiDatabase, which copies serially through
+	// runBulkCopyWithOpts and never calls runColdStartParallel; coldStart's
+	// fast dispatch only ever sees the non-spanning (qualifyBySchema=false)
+	// OpenSnapshotStream. If a future change routes a spanning stream into
+	// coldStart's fast path, this becomes a live bug — re-gate here first.
 	snapshotName := stream.SnapshotName
 	maxBuffer := s.MaxBufferBytes
 	readerFactory := func(rctx context.Context) (ir.RowReader, error) {
