@@ -393,6 +393,32 @@ type RowCounter interface {
 	CountRows(ctx context.Context, table *Table) (int64, error)
 }
 
+// RowCountEstimator is the optional surface a [RowReader] can implement
+// to supply a row-count estimate used ONLY for the pre-stream within-
+// table chunk DECISION ([shouldParallelChunk] in the parallel-bulk-copy
+// orchestrator). It is deliberately SEPARATE from [RowCounter]:
+//
+//   - [RowCounter.CountRows] is also consumed by the throughput/ETA probe
+//     ([kickOffRowCount]), which fires CONCURRENTLY with the in-flight
+//     copy stream on the SAME reader. On a snapshot-pinned reader (a PG
+//     stream/import reader whose every query runs on one pinned conn) a
+//     count query racing the live row-stream would conflict on the
+//     connection — so CountRows returns (0, nil) for pinned readers.
+//   - EstimateRowCount is invoked ONLY pre-stream (single-goroutine,
+//     before any copy stream opens), so an implementation MAY query the
+//     catalog even when pinned — provided it does so on a connection that
+//     CANNOT race an in-flight stream (e.g. a fresh off-snapshot conn for
+//     snapshot-insensitive catalog metadata like pg_class.reltuples). It
+//     must NEVER be wired into the ETA path.
+//
+// Returning (0, nil) means "no estimate → route to the single-stream
+// path"; errors are non-fatal (the orchestrator falls back to single-
+// reader). The orchestrator prefers this surface over [RowCounter] for
+// the chunk decision when a reader implements it.
+type RowCountEstimator interface {
+	EstimateRowCount(ctx context.Context, table *Table) (int64, error)
+}
+
 // IdempotentRowWriter is an optional extension of [RowWriter] for the
 // resume path. Indicates the writer's bulk INSERT path uses
 // upsert-on-PK semantics (ON CONFLICT / ON DUPLICATE KEY UPDATE)

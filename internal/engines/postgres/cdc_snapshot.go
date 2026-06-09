@@ -250,6 +250,14 @@ func (e Engine) openSnapshotStreamShared(ctx context.Context, dsn, slotName stri
 		// cfg.schema exactly as before — byte-identical back-compat.
 		qualifyBySchema: spanning,
 		closer:          nil, // SnapshotStream owns the lifecycle
+		// estimatorDSN lets EstimateRowCount open a fresh off-snapshot conn
+		// for the pre-stream within-table chunk decision (ADR-0079 v1.1).
+		// This reader IS the chunk-0 decision reader on the sync fast path
+		// (primaryRows = stream.Rows), and it is pinned (closer == nil), so
+		// without the DSN it would report "no estimate" and single-stream.
+		// cfg.dsn is the driver-ready DSN (schema stripped) — reltuples is
+		// snapshot-insensitive, so the off-conn read is correct.
+		estimatorDSN: cfg.dsn,
 	}
 
 	stream := &ir.SnapshotStream{

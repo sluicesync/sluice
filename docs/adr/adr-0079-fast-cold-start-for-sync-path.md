@@ -98,6 +98,68 @@ unchanged. No-silent-loss: the change touches only count/range *estimation*; a
 wrong estimate degrades to single-stream, never corrupts the copy. `-race`
 concurrency chunk; gate before any tag.
 
+### v1.1 addendum CORRECTION — the first attempt regressed; the as-built design
+
+The v1.1 approach described above (relax `CountRows` for pinned readers, make it
+sequential) **was implemented and REVERTED** (revert of `0ddd04e`) because it
+regressed a broad set of cold-start integration tests. The above text is retained
+as the *rejected* design; the paragraphs below are what actually landed.
+
+**Why the first attempt regressed.** Relaxing `CountRows` so pinned readers run
+the reltuples probe overlooked a SECOND caller of `CountRows` that runs DURING the
+copy: the throughput/ETA probe (`kickOffRowCount`, `internal/pipeline/progress.go`)
+fires `CountRows` on the SAME pinned `*sql.Conn` **concurrently with the in-flight
+copy stream**. database/sql serialises a `*sql.Conn` through `closemu`, so the ETA
+probe's query racing the live stream produced `driver: bad connection`, poisoned
+the pinned conn, and the cold-start delivered 0 rows. The "decision phase runs
+strictly pre-stream" reasoning was correct for the chunk-decision caller — but
+`CountRows` has *two* callers and only one of them is pre-stream.
+
+**As-built corrected design (the load-bearing change).** Keep `CountRows`
+returning `0` for pinned readers EXACTLY as on `main` (the a8d065d fix) — that
+keeps the ETA probe safe *by construction*, since it can never extract a non-zero
+count from a pinned reader and so never queries it. Add a SEPARATE, optional IR
+surface for the chunk DECISION only:
+
+```
+type RowCountEstimator interface {
+    EstimateRowCount(ctx context.Context, table *Table) (int64, error)
+}
+```
+
+- The orchestrator's `approximateRowCount` (the chunk-decision path, caller A)
+  type-asserts `RowCountEstimator` FIRST and prefers it; it falls back to
+  `RowCounter.CountRows` only when the reader doesn't implement the estimator.
+  `kickOffRowCount` (caller B, the ETA path) is UNTOUCHED — it still uses
+  `CountRows`, which still returns 0 for pinned readers. The two callers are now
+  cleanly separated.
+- PG's `EstimateRowCount`: on a **pinned** reader (the snapshot stream reader,
+  `closer == nil`, OR a `SnapshotImporter` reader, `snapshotPinned`) it runs the
+  `pg_class.reltuples` lookup on a **FRESH off-snapshot connection** opened from a
+  new `estimatorDSN` field (open, query, defer-close). reltuples is
+  snapshot-insensitive catalog metadata, so the off-conn read is correct, and a
+  fresh conn cannot race the pinned reader's in-flight stream — closing the
+  connection-conflict hole the first attempt opened. The exact-`COUNT(*)` fallback
+  is DECLINED on a pinned reader (cost: that seq scan would run on the live
+  snapshot conn). On a **non-pinned** migrate reader it queries `r.q` and KEEPS the
+  exact-`COUNT(*)` fallback, so migrate's chunk decision is byte-identical
+  (ADR-0042 N1 preserved).
+- `RangeBounds` drops the `closer == nil` refusal (verified pre-stream-only:
+  `resolveChunks` → `computeChunkBoundaries` precedes `runChunks`) and is a single
+  fully-closed statement. `estimatorDSN` is threaded onto the stream reader
+  (`cdc_snapshot.go`) and the importer readers (`snapshot_importer.go`); both
+  qualify by a shared `effectiveSchema(table)` helper (a correctness fix for the
+  multi-schema spanning reader, no-op for single-schema).
+
+**Named limitation (unchanged):** a never-`ANALYZE`d huge table on the sync path
+reports the reltuples sentinel and stays single-stream — equals today's behavior,
+degrades to slower, never lossy. **No-silent-loss:** the change touches only the
+chunk-decision *estimate*; a wrong estimate degrades to single-stream, never
+corrupts the copy. **Cost note:** the pinned-reader estimate opens one short-lived
+connection per table at decision time (off the snapshot, pre-stream) — acceptable
+for the chunk decision; it is never on the per-row or ETA path. `-race` concurrency
+chunk; the `-race` Integration gate must pass before any tag.
+
 ## Context
 
 The three cold-start copy speedups — the cross-table worker pool (ADR-0076), index-build overlap (ADR-0077), and the PG→PG raw-copy identity passthrough (ADR-0078) — are **`migrate`-only**. `sluice sync start`'s initial cold-start calls the serial `runBulkCopyWithOpts` (`internal/pipeline/migrate.go:1116`), so the **copy-then-continuously-follow** workflow — the one-command equivalent of pgcopydb's `--follow` — does its initial copy on the slow path. A user who wants *both* a fast initial copy *and* continuous CDC currently cannot get the fast copy: `migrate` is fast but one-shot; `sync start` follows but copies serially. pgcopydb gives fast-copy + follow together; sluice should too.

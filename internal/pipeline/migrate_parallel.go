@@ -232,16 +232,23 @@ func shouldParallelChunk(ctx context.Context, deps *parallelBulkCopyDeps, rows i
 }
 
 // approximateRowCount queries the row reader for an estimate of the
-// table's row count via the optional [ir.RowCounter] surface.
-// Returns (0, nil) when the reader doesn't implement RowCounter — the
-// caller treats "0 rows" as "below any reasonable threshold" so we
-// fall back to the single-reader path.
+// table's row count used to decide within-table parallel chunking. This
+// is the chunk-DECISION path (caller A) and runs STRICTLY pre-stream, so
+// it prefers the [ir.RowCountEstimator] surface — which a snapshot-pinned
+// PG reader implements by reading reltuples off a FRESH conn, enabling
+// within-table chunking on the sync fast cold-start without ever probing
+// the pinned conn that the ETA path ([kickOffRowCount]) must keep clear
+// (ADR-0079 v1.1). When the reader implements only [ir.RowCounter] (or
+// neither), it falls back to CountRows / (0, nil); the caller treats "0
+// rows" as below any threshold and routes to the single-reader path.
 func approximateRowCount(ctx context.Context, rows ir.RowReader, table *ir.Table) (int64, error) {
-	rc, ok := rows.(ir.RowCounter)
-	if !ok {
-		return 0, nil
+	if est, ok := rows.(ir.RowCountEstimator); ok {
+		return est.EstimateRowCount(ctx, table)
 	}
-	return rc.CountRows(ctx, table)
+	if rc, ok := rows.(ir.RowCounter); ok {
+		return rc.CountRows(ctx, table)
+	}
+	return 0, nil
 }
 
 // tryParallelCopyTable is the dispatcher entry point. Returns

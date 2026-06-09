@@ -4,6 +4,7 @@
 package postgres
 
 import (
+	"context"
 	"testing"
 
 	"sluicesync.dev/sluice/internal/ir"
@@ -63,5 +64,65 @@ func TestBuildSelectNonDefaultSchema(t *testing.T) {
 	want := `SELECT "id" FROM "app"."users"`
 	if got != want {
 		t.Errorf("\n got  %q\n want %q", got, want)
+	}
+}
+
+// TestCountRows_PinnedReaderReturnsZeroWithoutQuerying guards the
+// load-bearing invariant the ADR-0079 v1.1 design rests on: CountRows
+// (which the throughput/ETA probe [kickOffRowCount] fires CONCURRENTLY
+// with the in-flight copy stream on the SAME pinned reader) must NEVER
+// query the pinned conn — it short-circuits to (0, nil) for both pinned
+// shapes. The first v1.1 attempt regressed precisely by relaxing this and
+// letting the ETA probe hit the pinned conn mid-copy. A nil querier proves
+// no query is issued: if the short-circuit broke, the nil deref would
+// panic.
+func TestCountRows_PinnedReaderReturnsZeroWithoutQuerying(t *testing.T) {
+	table := &ir.Table{
+		Name:    "big",
+		Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}},
+	}
+	cases := []struct {
+		name string
+		r    *RowReader
+	}{
+		{
+			name: "externally-owned stream reader (closer==nil)",
+			r:    &RowReader{q: nil, schema: "public", closer: nil},
+		},
+		{
+			name: "self-closing SnapshotImporter reader (snapshotPinned)",
+			r:    &RowReader{q: nil, schema: "public", closer: snapshotConnCloser{}, snapshotPinned: true},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			n, err := c.r.CountRows(context.Background(), table)
+			if err != nil {
+				t.Fatalf("CountRows: unexpected error: %v", err)
+			}
+			if n != 0 {
+				t.Fatalf("CountRows on a pinned reader = %d; want 0 (must not query the pinned conn — that would race the ETA probe)", n)
+			}
+		})
+	}
+}
+
+// TestEstimateRowCount_PinnedReaderNoDSNReturnsZero pins the
+// EstimateRowCount degrade-path: a pinned reader with no estimatorDSN
+// (e.g. a NewSnapshotRowReader minted by a delegating engine that didn't
+// thread one in) yields (0, nil) → single-stream, rather than touching the
+// pinned conn. A nil querier proves no on-conn query is issued.
+func TestEstimateRowCount_PinnedReaderNoDSNReturnsZero(t *testing.T) {
+	table := &ir.Table{
+		Name:    "big",
+		Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}},
+	}
+	r := &RowReader{q: nil, schema: "public", snapshotPinned: true, estimatorDSN: ""}
+	n, err := r.EstimateRowCount(context.Background(), table)
+	if err != nil {
+		t.Fatalf("EstimateRowCount: unexpected error: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("EstimateRowCount on a pinned reader with no DSN = %d; want 0 (single-stream, no on-conn query)", n)
 	}
 }

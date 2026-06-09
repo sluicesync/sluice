@@ -328,6 +328,108 @@ func TestCoerceInt64(t *testing.T) {
 	}
 }
 
+// countProbeReader is a stub [ir.RowReader] that records which row-count
+// surface the orchestrator probed. It can selectively implement
+// [ir.RowCounter] and/or [ir.RowCountEstimator] so the dispatch preference
+// is observable.
+type countProbeReader struct {
+	estimateVal  int64
+	estimateUsed *bool
+	countVal     int64
+	countUsed    *bool
+}
+
+func (r *countProbeReader) ReadRows(context.Context, *ir.Table) (<-chan ir.Row, error) {
+	return nil, nil
+}
+func (r *countProbeReader) Err() error { return nil }
+
+// countOnlyReader implements only [ir.RowCounter].
+type countOnlyReader struct{ countProbeReader }
+
+func (r *countOnlyReader) CountRows(context.Context, *ir.Table) (int64, error) {
+	if r.countUsed != nil {
+		*r.countUsed = true
+	}
+	return r.countVal, nil
+}
+
+// estimatorReader implements BOTH surfaces — the orchestrator must prefer
+// the estimator for the chunk decision.
+type estimatorReader struct{ countProbeReader }
+
+func (r *estimatorReader) CountRows(context.Context, *ir.Table) (int64, error) {
+	if r.countUsed != nil {
+		*r.countUsed = true
+	}
+	return r.countVal, nil
+}
+
+func (r *estimatorReader) EstimateRowCount(context.Context, *ir.Table) (int64, error) {
+	if r.estimateUsed != nil {
+		*r.estimateUsed = true
+	}
+	return r.estimateVal, nil
+}
+
+// plainReader implements neither surface.
+type plainReader struct{ countProbeReader }
+
+// TestApproximateRowCount_PrefersEstimator pins the ADR-0079 v1.1
+// orchestrator change: the chunk-DECISION probe prefers
+// [ir.RowCountEstimator] over [ir.RowCounter] (the latter is also the ETA
+// probe and returns 0 on pinned readers by design), falls back to
+// CountRows when only that exists, and returns 0 when neither does.
+func TestApproximateRowCount_PrefersEstimator(t *testing.T) {
+	table := integerPKTable()
+
+	t.Run("prefers estimator when both implemented", func(t *testing.T) {
+		var estUsed, cntUsed bool
+		r := &estimatorReader{countProbeReader{
+			estimateVal: 5000, estimateUsed: &estUsed,
+			countVal: 0, countUsed: &cntUsed,
+		}}
+		got, err := approximateRowCount(context.Background(), r, table)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !estUsed {
+			t.Error("expected EstimateRowCount to be used")
+		}
+		if cntUsed {
+			t.Error("CountRows must NOT be used when EstimateRowCount is present (it is the ETA path; on a pinned reader it returns 0 → would wrongly single-stream)")
+		}
+		if got != 5000 {
+			t.Errorf("got %d; want 5000 (the estimate)", got)
+		}
+	})
+
+	t.Run("falls back to CountRows when only RowCounter", func(t *testing.T) {
+		var cntUsed bool
+		r := &countOnlyReader{countProbeReader{countVal: 1234, countUsed: &cntUsed}}
+		got, err := approximateRowCount(context.Background(), r, table)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !cntUsed {
+			t.Error("expected CountRows to be used")
+		}
+		if got != 1234 {
+			t.Errorf("got %d; want 1234", got)
+		}
+	})
+
+	t.Run("returns 0 when neither implemented", func(t *testing.T) {
+		got, err := approximateRowCount(context.Background(), &plainReader{}, table)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got != 0 {
+			t.Errorf("got %d; want 0", got)
+		}
+	})
+}
+
 // contains is the std library's strings.Contains hand-rolled to keep
 // the test file's import list minimal.
 func contains(haystack, needle string) bool {

@@ -469,3 +469,68 @@ func TestStreamer_ColdStartParallel_PG_SnapshotConsistency(t *testing.T) {
 		t.Fatal("Streamer.Run did not return after ctx cancel")
 	}
 }
+
+// TestStreamer_ColdStartParallel_PG_WithinTableChunkingEngaged is the
+// ADR-0079 v1.1 pin: a large, ANALYZEd single table on the PG-source fast
+// sync cold-start must engage WITHIN-table PK-range chunking — not just the
+// cross-table pool's single-stream-per-table. It proves the chunk-DECISION
+// estimator (the new [ir.RowCountEstimator] reading reltuples off a FRESH
+// conn for the pinned snapshot reader) actually re-enabled chunking AND did
+// not reintroduce the connection conflict that wedged the first attempt (a
+// CountRows probe on the pinned conn racing the in-flight stream → bad
+// connection → 0 rows / hang). The raw-copy observer fires once per copied
+// UNIT, so >1 fire for the single table == multiple chunks ran.
+//
+// ANALYZE is load-bearing: a pinned reader takes the reltuples estimate and
+// declines the exact-COUNT(*) seq scan, so without populated stats the table
+// stays single-stream (the documented v1.1 limitation) and this would not
+// chunk.
+func TestStreamer_ColdStartParallel_PG_WithinTableChunkingEngaged(t *testing.T) {
+	pgEng, ok := engines.Get("postgres")
+	if !ok {
+		t.Fatal("postgres engine not registered")
+	}
+	src, tgt, cleanup := startPostgresLogical(t)
+	defer cleanup()
+
+	const rows = 60_000
+	applyDDL(t, src, fmt.Sprintf(`
+		CREATE TABLE big (id BIGINT PRIMARY KEY, payload TEXT NOT NULL);
+		INSERT INTO big (id, payload)
+			SELECT g, 'p' || g FROM generate_series(1, %d) AS g;
+		ANALYZE big;
+	`, rows))
+
+	rec := installRawCopyRecorder(t)
+
+	streamer := &Streamer{
+		Source:    pgEng,
+		Target:    pgEng,
+		SourceDSN: src,
+		TargetDSN: tgt,
+		StreamID:  "coldstart-within-table-chunk",
+		// 60k rows >> the 1000-row threshold → within-table chunking eligible;
+		// up to 4 PK-range chunks, each a raw-copied unit.
+		BulkParallelism:     4,
+		BulkParallelMinRows: 1000,
+	}
+	streamCtx, streamCancel := context.WithCancel(context.Background())
+	defer streamCancel()
+	runErr := make(chan error, 1)
+	go func() { runErr <- streamer.Run(streamCtx) }()
+
+	if !waitForExactRowCount(tgt, "big", rows, 2*time.Minute) {
+		t.Fatalf("cold-start copy never delivered %d rows (got %d) — a hang here would indicate the pinned-reader estimator regressed to a connection conflict",
+			rows, pollRowCount(tgt, "big"))
+	}
+	streamCancel()
+	select {
+	case <-runErr:
+	case <-time.After(20 * time.Second):
+		t.Fatal("Streamer.Run did not return after ctx cancel")
+	}
+
+	if n := rec.count("big"); n < 2 {
+		t.Errorf("within-table chunking did NOT engage on the sync fast cold-start: raw-copy fired %d time(s) for \"big\" (want >=2 chunks). The ADR-0079 v1.1 pinned-reader EstimateRowCount/RangeBounds fix may have regressed to single-stream.", n)
+	}
+}

@@ -66,6 +66,19 @@ type RowReader struct {
 	// pinned (the bug that wedged the ADR-0079 sync fast path).
 	snapshotPinned bool
 
+	// estimatorDSN is the driver-ready DSN (schema already stripped) used
+	// by [RowReader.EstimateRowCount] to open a FRESH off-snapshot
+	// connection for the pre-stream within-table chunk DECISION on a
+	// pinned reader. pg_class.reltuples is snapshot-insensitive catalog
+	// metadata, so reading it off a separate conn is correct AND cannot
+	// race the pinned reader's in-flight stream (the connection conflict
+	// that the chunk-DECISION-only EstimateRowCount surface exists to
+	// avoid — see [ir.RowCountEstimator]). Empty on the non-pinned migrate
+	// reader, which estimates on its own *sql.DB pool instead. Threaded in
+	// at the snapshot stream / importer mint sites (cdc_snapshot.go,
+	// snapshot_importer.go).
+	estimatorDSN string
+
 	mu  sync.Mutex
 	err error // sticky error from the most recent ReadRows call
 }
@@ -118,6 +131,22 @@ func (r *RowReader) SetSchema(name string) {
 	r.schema = name
 }
 
+// effectiveSchema returns the schema a query should qualify table by. In
+// the multi-schema spanning snapshot (ADR-0075 Phase 2b) the one pinned
+// connection reads across N schemas, so qualify by the table's own Schema
+// rather than the reader's single bound schema; the defensive fall-back to
+// r.schema covers a single-schema table threaded through the spanning
+// reader (empty Table.Schema). In every single-schema path qualifyBySchema
+// stays false and this returns r.schema — byte-identical to the pre-ADR-0075
+// shape. Shared by ReadRows, CountRows, RangeBounds, and EstimateRowCount so
+// they all qualify identically.
+func (r *RowReader) effectiveSchema(table *ir.Table) string {
+	if r.qualifyBySchema && table.Schema != "" {
+		return table.Schema
+	}
+	return r.schema
+}
+
 // Err returns the error, if any, that terminated the most recently
 // returned channel. It is only valid to call after the channel has
 // been fully drained.
@@ -146,17 +175,7 @@ func (r *RowReader) ReadRows(ctx context.Context, table *ir.Table) (<-chan ir.Ro
 	r.err = nil
 	r.mu.Unlock()
 
-	// In the multi-schema spanning snapshot (ADR-0075 Phase 2b) the one
-	// pinned connection reads across N schemas, so qualify by the table's
-	// own Schema rather than the reader's single bound schema. Defensive
-	// fall-back to r.schema when Table.Schema is empty (a single-schema
-	// table threaded through the spanning reader). Single-schema mode keeps
-	// qualifyBySchema false and reads byte-identically from r.schema.
-	effSchema := r.schema
-	if r.qualifyBySchema && table.Schema != "" {
-		effSchema = table.Schema
-	}
-	query := buildSelect(effSchema, table)
+	query := buildSelect(r.effectiveSchema(table), table)
 	// rowserrcheck and sqlclosecheck can't follow rows into the
 	// goroutine; both rows.Err() and rows.Close() are handled inside
 	// stream() (Close via defer, Err checked once iteration ends).

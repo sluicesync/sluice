@@ -37,6 +37,12 @@ import (
 type SnapshotImporter struct {
 	db     *sql.DB
 	schema string
+
+	// estimatorDSN is the driver-ready DSN this importer was opened from.
+	// Threaded onto every minted RowReader so its [RowReader.EstimateRowCount]
+	// can open a FRESH off-snapshot conn for the pre-stream chunk decision —
+	// the pinned import conn must never run that probe (ADR-0079 v1.1).
+	estimatorDSN string
 }
 
 // Close releases the underlying connection pool. Callers should close
@@ -110,6 +116,7 @@ func (s *SnapshotImporter) ImportSnapshot(ctx context.Context, snapshotName stri
 			schema:         s.schema,
 			closer:         snapshotConnCloser{conn: conn},
 			snapshotPinned: true,
+			estimatorDSN:   s.estimatorDSN,
 		}
 		readers = append(readers, rdr)
 	}
@@ -143,5 +150,5 @@ func (Engine) OpenSnapshotImporter(ctx context.Context, dsn string) (ir.Snapshot
 	if err != nil {
 		return nil, err
 	}
-	return &SnapshotImporter{db: db, schema: cfg.schema}, nil
+	return &SnapshotImporter{db: db, schema: cfg.schema, estimatorDSN: cfg.dsn}, nil
 }
