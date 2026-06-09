@@ -254,8 +254,17 @@ func (e Engine) openSnapshotStreamShared(ctx context.Context, dsn, slotName stri
 
 	stream := &ir.SnapshotStream{
 		Position: position,
-		Rows:     rowReader,
-		Changes:  cdcReader,
+		// The exported snapshot name is SHAREABLE: any other connection
+		// can `SET TRANSACTION SNAPSHOT '<name>'` to observe this exact
+		// consistent_point view. Surfacing it (ADR-0079) lets the sync
+		// cold-start mint N parallel readers all pinned to this one
+		// snapshot via [Engine.OpenSnapshotImporter], so the fast
+		// cross-table/within-table copy machinery runs gap-free. The
+		// snapshotName is valid only while the slot-creation tx
+		// (replConn) stays open — which it does until ReleaseRows.
+		SnapshotName: snapshotName,
+		Rows:         rowReader,
+		Changes:      cdcReader,
 	}
 
 	// rowsReleased is the idempotency guard for ReleaseRowsFn /

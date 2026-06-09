@@ -126,6 +126,27 @@ type parallelBulkCopyDeps struct {
 	// ExportRawCopy / ImportRawCopy so the exporter and importer never
 	// disagree. Meaningful only when rawCopyOK is true.
 	rawCopyFormat ir.RawCopyFormat
+
+	// chunkReaderFactory mints the SOURCE-side reader for each parallel
+	// chunk/table connection (ADR-0079). It is the ONE provenance seam
+	// distinguishing migrate from the sync cold-start:
+	//
+	//   - migrate (nil): [openOneChunkConn] opens an INDEPENDENT reader
+	//     via source.OpenRowReader, each observing its own per-connection
+	//     snapshot (the documented ADR-0019 v1 window). Byte-identical to
+	//     the pre-ADR-0079 behaviour.
+	//   - sync cold-start (non-nil): each reader is minted via the source
+	//     engine's [ir.SnapshotImporter] pinned to the ONE exported
+	//     snapshot ([ir.SnapshotStream.SnapshotName]), so all N readers
+	//     observe the SAME consistent_point view (gap-free, strictly
+	//     better than migrate's per-connection window). The factory owns
+	//     each reader's connection lifecycle; the caller closes it via the
+	//     same closeIf release path a normal chunk reader uses.
+	//
+	// The factory returns ONE reader per call (lazy, matching the existing
+	// per-chunk acquisition shape); it must be safe for concurrent calls
+	// from peer chunk/table goroutines.
+	chunkReaderFactory func(ctx context.Context) (ir.RowReader, error)
 }
 
 // useFastLoader is the ADR-0043 gate: it decides whether a parallel
@@ -524,13 +545,27 @@ func acquireChunkConn(
 	}
 }
 
+// openChunkReader mints the source-side reader for one parallel chunk/table
+// connection. It routes through [parallelBulkCopyDeps.chunkReaderFactory]
+// when set (sync cold-start: a snapshot-pinned reader, ADR-0079) and falls
+// back to an independent source.OpenRowReader otherwise (migrate, the
+// pre-ADR-0079 behaviour). Centralising the choice here keeps every reader
+// open-site — per-chunk and per-table (openTablePair delegates here too) —
+// consistent by construction.
+func openChunkReader(ctx context.Context, deps *parallelBulkCopyDeps) (ir.RowReader, error) {
+	if deps.chunkReaderFactory != nil {
+		return deps.chunkReaderFactory(ctx)
+	}
+	return deps.source.OpenRowReader(ctx, deps.sourceDSN)
+}
+
 // openOneChunkConn opens a single source reader + target writer pair for
 // a parallel-copy chunk. On a writer-open failure the just-opened reader
 // is closed so no connection leaks. Returns the pair, or the first open
 // error verbatim (so [acquireChunkConn]'s classifier sees the engine's
 // real error, including any SQLSTATE).
 func openOneChunkConn(ctx context.Context, deps *parallelBulkCopyDeps) (ir.RowReader, ir.RowWriter, error) {
-	rdr, err := deps.source.OpenRowReader(ctx, deps.sourceDSN)
+	rdr, err := openChunkReader(ctx, deps)
 	if err != nil {
 		return nil, nil, err
 	}

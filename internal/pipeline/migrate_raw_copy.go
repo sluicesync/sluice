@@ -30,7 +30,9 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
+	"sluicesync.dev/sluice/internal/config"
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/redact"
 )
 
 // rawCopyTakenObserver is a test-only seam. When non-nil it is invoked
@@ -40,6 +42,78 @@ import (
 // fallback). Mirrors ADR-0077's onTableCopiedObserver disposition.
 var rawCopyTakenObserver func(table string)
 
+// rawCopyConfig is the SHAREABLE transform-config the raw-copy gate
+// reasons over, decoupled from any one orchestrator (ADR-0079). Both
+// [Migrator] (migrate) and [Streamer] (sync cold-start) populate it from
+// their own fields so the SINGLE auditable value-fidelity predicate
+// ([rawCopyGate]) governs BOTH paths identically — the raw lane can never
+// silently skip a transform on either. The fields are exactly the
+// value-affecting transform knobs; a new transform that the byte-pipe
+// would bypass MUST be added here (and gated below) or it is a silent-loss
+// hole.
+type rawCopyConfig struct {
+	// sourceEngine / targetEngine are the engine names. Equal names are
+	// the same-engine precondition (G1); the gate never spells an engine
+	// out (IR-first tenet).
+	sourceEngine string
+	targetEngine string
+
+	// redactor is the configured PII redaction policy (nil or Empty() ==
+	// no redaction). The raw lane never sees a Row, so any active rule is
+	// a transform it would skip (G2).
+	redactor *redact.Registry
+
+	// mappings / exprMappings are the --type-override / --expr-override
+	// IR rewrites (G3); shard is the --inject-shard-column discriminator
+	// stamp (G4). Any present forces the IR path.
+	mappings     []config.Mapping
+	exprMappings []config.ExpressionMapping
+	shard        ShardColumnSpec
+}
+
+// rawCopyConfigForMigrator projects a [Migrator]'s transform configuration
+// onto the shared [rawCopyConfig]. Keeping the projection in one place
+// makes the migrate-vs-sync parity auditable: the two callers differ only
+// in which struct they read from, never in what the gate checks.
+func rawCopyConfigForMigrator(m *Migrator) rawCopyConfig {
+	cfg := rawCopyConfig{
+		redactor:     m.Redactor,
+		mappings:     m.Mappings,
+		exprMappings: m.ExpressionMappings,
+		shard:        m.InjectShardColumn,
+	}
+	if m.Source != nil {
+		cfg.sourceEngine = m.Source.Name()
+	}
+	if m.Target != nil {
+		cfg.targetEngine = m.Target.Name()
+	}
+	return cfg
+}
+
+// rawCopyConfigForStreamer is the sync cold-start twin of
+// [rawCopyConfigForMigrator] (ADR-0079): it projects a [Streamer]'s
+// transform configuration onto the SAME [rawCopyConfig] the migrate path
+// uses, so the raw-copy lane on the sync path is governed by the identical
+// gate. The Streamer holds every transform field under a slightly different
+// name; reading them here (not in the gate) keeps the predicate
+// engine-/orchestrator-neutral and the parity auditable in one spot.
+func rawCopyConfigForStreamer(s *Streamer) rawCopyConfig {
+	cfg := rawCopyConfig{
+		redactor:     s.Redactor,
+		mappings:     s.Mappings,
+		exprMappings: s.ExpressionMappings,
+		shard:        s.InjectShardColumn,
+	}
+	if s.Source != nil {
+		cfg.sourceEngine = s.Source.Name()
+	}
+	if s.Target != nil {
+		cfg.targetEngine = s.Target.Name()
+	}
+	return cfg
+}
+
 // rawCopyGate is the SINGLE auditable value-fidelity predicate for the
 // raw-copy passthrough lane. It is the load-bearing correctness surface:
 // the raw lane bypasses the typed IR, so it bypasses EVERY value
@@ -47,42 +121,43 @@ var rawCopyTakenObserver func(table string)
 // / shard-stamp, a silent-loss class. So the gate is conservative by
 // construction: it returns ok=true only when there is provably no
 // transform to skip, and any single transform present returns
-// (false, reason). It is checked ONCE per run at migrate setup (after the
+// (false, reason). It is checked ONCE per run at setup (after the
 // IR-mutation steps ApplyMappings / ApplyExpressionOverrides /
 // InjectShardColumn) and the result is threaded as a bool into the copy
 // path; per-table identity is re-checked separately by
 // [identityProjection] so one odd table falls back without disabling the
 // lane.
 //
-// Pure: no I/O, no state mutation — directly unit-testable. The schema
-// argument is reserved for future per-schema gating; v1 gates on the
-// Migrator's transform configuration alone (per-table shape is
-// [identityProjection]'s job).
-func rawCopyGate(m *Migrator, _ *ir.Schema) (ok bool, reason string) {
+// Pure: no I/O, no state mutation — directly unit-testable. It reasons
+// over the engine-neutral [rawCopyConfig] so both migrate and sync route
+// through the identical predicate (ADR-0079).
+func rawCopyGate(cfg rawCopyConfig) (ok bool, reason string) {
 	// G1 — same engine. Cross-engine copies MUST go through the IR (the
 	// whole point of sluice over pgcopydb); a byte-pipe between different
-	// engines would ship one engine's wire format to another.
-	if m.Source == nil || m.Target == nil || m.Source.Name() != m.Target.Name() {
+	// engines would ship one engine's wire format to another. An empty
+	// engine name (nil Source/Target) can never match a real one, so this
+	// also refuses a misconfigured caller.
+	if cfg.sourceEngine == "" || cfg.targetEngine == "" || cfg.sourceEngine != cfg.targetEngine {
 		return false, "cross-engine (raw copy is same-engine only)"
 	}
 	// G2 — no redaction. The raw lane never sees a Row, so a redaction
 	// rule would be silently skipped.
-	if m.Redactor != nil && !m.Redactor.Empty() {
+	if cfg.redactor != nil && !cfg.redactor.Empty() {
 		return false, "redaction configured"
 	}
 	// G3 — no type/expr override. ApplyMappings / ApplyExpressionOverrides
 	// rewrite the IR type/expression; byte-piping the source bytes would
 	// ignore the override.
-	if len(m.Mappings) > 0 {
+	if len(cfg.mappings) > 0 {
 		return false, "type override (--type-override) configured"
 	}
-	if len(m.ExpressionMappings) > 0 {
+	if len(cfg.exprMappings) > 0 {
 		return false, "expression override (--expr-override) configured"
 	}
 	// G4 — no shard-column injection. Shape A stamps a discriminator value
 	// onto every row between read and write; the byte-pipe has no stamp
 	// point.
-	if m.InjectShardColumn.Engaged() {
+	if cfg.shard.Engaged() {
 		return false, "shard-column injection (--inject-shard-column) configured"
 	}
 	return true, ""

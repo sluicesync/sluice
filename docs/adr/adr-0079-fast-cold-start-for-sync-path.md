@@ -6,7 +6,55 @@ Accepted — design. Roadmap item 3d. Implementation notes filled in as the chun
 
 ### Implementation notes (what landed)
 
-_(to be completed when the chunk merges)_
+PG-source-first, single-database. The fast path engages on a PG→PG (any
+same-engine that surfaces a shareable snapshot) `sync start` cold-start;
+MySQL/VStream stay serial. As-built:
+
+- **Step 1 — `ir.SnapshotStream.SnapshotName`** (additive field, `internal/ir/snapshot.go`).
+  Populated for PG in `openSnapshotStreamShared` (`cdc_snapshot.go`) from the
+  already-captured `snapshotName`; the multi-DB opener inherits it via the
+  shared body. MySQL/VStream leave it empty (their `OpenSnapshotStream` never
+  sets it). No new interface.
+- **Step 2 — shareable gate.** `rawCopyGate` now takes an engine-neutral
+  `rawCopyConfig` (`migrate_raw_copy.go`); `rawCopyConfigForMigrator` /
+  `rawCopyConfigForStreamer` project each orchestrator's transform fields onto
+  it. Migrate behaviour is byte-identical (the existing negative matrix passes
+  via the new projection); the Streamer parity matrix is pinned in
+  `TestRawCopyGate_StreamerParity`.
+- **Step 3 — `runColdStartParallel`** (`streamer_coldstart_parallel.go`)
+  reuses `runBulkCopyPhases` directly, with two deltas confined to the
+  `parallelBulkCopyDeps`: (a) a new `chunkReaderFactory` field that mints every
+  parallel reader via the source's `ir.SnapshotImporter` pinned to the one
+  exported snapshot (default nil ⇒ migrate's independent `OpenRowReader`, so
+  the migrate path is unchanged); (b) a disabled `resumeContext` (the fast path
+  is fresh-cold-start-only). The gate (`coldStartFastEligible`) is
+  field/interface-presence-driven, never an engine-name check.
+- **Step 4 — budget.** `resolveColdStartCopyBudget` mirrors migrate's
+  chokepoint and RESERVES one slot for the CDC connection BEFORE the
+  copy/index split, so `tableP × withinP + indexBudget + 1 ≤ CopyBudget`.
+- **Step 5 — snapshot lifetime.** Unchanged: `stream.ReleaseRows()` still runs
+  AFTER bulk-copy; the snapshot tx stays live for every parallel reader's
+  `SET TRANSACTION SNAPSHOT`. The snapshot-importer pool is closed when
+  `runColdStartParallel` returns.
+- **Step 6 — multidb/multi-schema stays serial** (deferred). `coldStartCopyOneDatabase`
+  is untouched; only single-database `coldStart` gained the fast gate.
+
+CLI: `sync start` gained `--bulk-parallelism`, `--table-parallelism`,
+`--bulk-parallel-min-rows`, `--bulk-batch-size`, `--raw-copy-format`
+(`--max-target-connections` already existed; its help now notes the fast
+path). All inert on non-qualifying sources.
+
+Tests: unit — `coldStartFastEligible` matrix, `resolveColdStartCopyBudget`
+CDC-reservation invariant, `openChunkReader` factory-selection, the
+`rawCopyGate` Streamer parity matrix. Integration (PG, real container,
+all green locally on Docker) — many-table zero-loss + index-overlap-proves-
+fast-path + CDC-continues; raw-lane-taken; per-transform negative fallback
+(redaction / type-override / expr-override / shard); the load-bearing
+snapshot-consistency pin (post-snapshot writes fired from the dispatch seam
+arrive exactly-once via CDC, gap-free checksum); MySQL serial-fallback
+dispatch assertion. `-race` is CI-only (this is a concurrency chunk — the
+new pool + snapshot-importer readers across goroutines + the CDC-slot
+reservation); the `-race` Integration gate must pass before any tag.
 
 ## Context
 

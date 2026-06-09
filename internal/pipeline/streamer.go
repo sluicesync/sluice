@@ -386,7 +386,29 @@ type Streamer struct {
 	// Zero (the default) means "auto" — probe-and-refuse-on-exhaustion
 	// with no operator-imposed ceiling. Target-engine-specific: a no-op
 	// on engines without a connection-slot model (today: MySQL).
+	//
+	// On the ADR-0079 FAST cold-start (PG source with a shareable exported
+	// snapshot) it ALSO bounds the cross-table × within-table copy +
+	// index-build connection product, exactly as it does for migrate — the
+	// serial fallback keeps the single-reader loud-refusal role above.
 	MaxTargetConnections int
+
+	// BulkParallelism, TableParallelism, BulkParallelMinRows, BulkBatchSize,
+	// and RawCopyFormat configure the ADR-0079 FAST cold-start copy — the
+	// migrate-speed cross-table pool (ADR-0076) + index-build overlap
+	// (ADR-0077) + same-engine raw passthrough (ADR-0078) the sync
+	// cold-start engages when the source surfaces a shareable exported
+	// snapshot ([ir.SnapshotStream.SnapshotName]) and implements
+	// [ir.SnapshotImporterOpener] (Postgres). On every other source
+	// (MySQL, VStream) the cold-start stays serial and these are inert.
+	// Semantics mirror the identically-named [Migrator] fields verbatim;
+	// see [resolveBulkParallelism] / [resolveTableParallelism] /
+	// [resolveBulkParallelMinRows] for the 0=auto rules.
+	BulkParallelism     int
+	TableParallelism    int
+	BulkParallelMinRows int64
+	BulkBatchSize       int
+	RawCopyFormat       ir.RawCopyFormat
 
 	// ReapStaleBackends opts the operator into terminating sluice's own
 	// orphaned backends on the target during the cold-start preflight
@@ -2803,16 +2825,37 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 		}
 	}
 
-	bulkOpts := bulkCopyOpts{
-		SkipSchemaApply: s.SchemaAlreadyApplied,
-		Redactor:        s.Redactor,
-		Shard:           s.InjectShardColumn,
+	// ADR-0079: take the FAST parallel cold-start (migrate's cross-table
+	// pool + index-build overlap + same-engine raw passthrough) when the
+	// source surfaced a SHAREABLE exported snapshot AND implements the
+	// snapshot importer — so the one-command copy+follow workflow gets the
+	// fast copy, with all N parallel readers pinned to the ONE snapshot.
+	// Otherwise (MySQL, VStream, resume, --schema-already-applied) the
+	// existing serial path runs, with a loud INFO naming the reason — the
+	// resumable durable-watermark + idempotent-COPY coupling lives ONLY on
+	// the serial path and is left untouched.
+	fast, fastReason := coldStartFastEligible(resumingCopy, s.SchemaAlreadyApplied, stream.SnapshotName, s.Source)
+	if coldStartDispatchObserver != nil {
+		coldStartDispatchObserver(fast)
 	}
-	if err := runBulkCopyWithOpts(ctx, schema, stream.Rows, sw, rw, bulkOpts); err != nil {
+	var copyErr error
+	if fast {
+		copyErr = s.runColdStartParallel(ctx, stream, sw, rw, schema)
+	} else {
+		slog.InfoContext(ctx, "sync cold-start: "+fastReason+"; using serial cold-start",
+			slog.String("stream_id", streamID))
+		bulkOpts := bulkCopyOpts{
+			SkipSchemaApply: s.SchemaAlreadyApplied,
+			Redactor:        s.Redactor,
+			Shard:           s.InjectShardColumn,
+		}
+		copyErr = runBulkCopyWithOpts(ctx, schema, stream.Rows, sw, rw, bulkOpts)
+	}
+	if copyErr != nil {
 		closeIf(rw)
 		closeIf(sw)
 		_ = stream.Close()
-		return nil, stop, err
+		return nil, stop, copyErr
 	}
 	closeIf(rw)
 	closeIf(sw)

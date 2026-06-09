@@ -34,6 +34,21 @@ type SnapshotStream struct {
 	// until persistent position storage lands (roadmap §5).
 	Position Position
 
+	// SnapshotName is the engine's SHAREABLE exported-snapshot name —
+	// the handle other connections pass to the engine's
+	// [SnapshotImporter] to observe the EXACT same consistent view as
+	// Rows. Postgres populates it from CREATE_REPLICATION_SLOT …
+	// EXPORT_SNAPSHOT (the `snapshot_name`); MySQL and the Vitess
+	// VStream leave it empty because their snapshots are per-session /
+	// single-stream and not shareable across connections.
+	//
+	// It is the capability gate for the fast parallel cold-start
+	// (ADR-0079): an empty value means "not shareable → the cold-start
+	// copy stays serial". Treated like Position — an additive, optional
+	// field the engine fills in; readers that don't recognise it ignore
+	// it.
+	SnapshotName string
+
 	// Rows reads the source as it appeared at Position. The
 	// implementation pins the read view via engine-specific means
 	// (REPEATABLE-READ tx + WITH CONSISTENT SNAPSHOT for MySQL,

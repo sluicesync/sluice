@@ -617,7 +617,7 @@ func (m *Migrator) runSingleDatabase(ctx context.Context, scope *multiDBScope) e
 	// one odd table falls back without disabling the lane. The byte-pipe
 	// bypasses the typed IR (= every value transform), so this gate is the
 	// silent-loss backstop: any transform present ⇒ ok=false ⇒ IR copy path.
-	rawCopyOK, rawCopyReason := rawCopyGate(m, schema)
+	rawCopyOK, rawCopyReason := rawCopyGate(rawCopyConfigForMigrator(m))
 	if rawCopyOK {
 		slog.InfoContext(ctx, "raw-copy passthrough lane eligible (ADR-0078)")
 	} else {

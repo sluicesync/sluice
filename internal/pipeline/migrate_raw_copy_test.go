@@ -176,7 +176,7 @@ func TestRawCopyGate(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			ok, reason := rawCopyGate(tc.migr, &ir.Schema{})
+			ok, reason := rawCopyGate(rawCopyConfigForMigrator(tc.migr))
 			if ok != tc.wantOK {
 				t.Fatalf("rawCopyGate ok = %v (reason %q); want %v", ok, reason, tc.wantOK)
 			}
@@ -187,6 +187,92 @@ func TestRawCopyGate(t *testing.T) {
 				if tc.wantSub != "" && !strings.Contains(reason, tc.wantSub) {
 					t.Errorf("reason %q does not contain %q", reason, tc.wantSub)
 				}
+			}
+		})
+	}
+}
+
+// TestRawCopyGate_StreamerParity asserts the SAME gate governs the sync
+// cold-start path (ADR-0079): a Streamer-populated config routes through
+// the identical predicate. The matrix above already pins every transform
+// negative on the migrate projection; here we confirm (a) the all-clear
+// same-engine Streamer config is eligible and (b) each transform the
+// Streamer can carry forces the IR fallback through the shared gate, so
+// the raw lane can never silently skip a transform on the sync path.
+func TestRawCopyGate_StreamerParity(t *testing.T) {
+	allClear := func() *Streamer {
+		return &Streamer{Source: newRecordingEngine("postgres"), Target: newRecordingEngine("postgres")}
+	}
+
+	tests := []struct {
+		name    string
+		stream  *Streamer
+		wantOK  bool
+		wantSub string
+	}{
+		{
+			name:   "all clear positive",
+			stream: allClear(),
+			wantOK: true,
+		},
+		{
+			name:    "cross engine",
+			stream:  &Streamer{Source: newRecordingEngine("postgres"), Target: newRecordingEngine("mysql")},
+			wantOK:  false,
+			wantSub: "cross-engine",
+		},
+		{
+			name: "redaction configured",
+			stream: func() *Streamer {
+				s := allClear()
+				r := redact.New()
+				r.Set("public", "users", "email", redact.Hash{Algo: "sha256"})
+				s.Redactor = r
+				return s
+			}(),
+			wantOK:  false,
+			wantSub: "redaction",
+		},
+		{
+			name: "type override configured",
+			stream: func() *Streamer {
+				s := allClear()
+				s.Mappings = []config.Mapping{{Table: "t", Column: "c", TargetType: "text"}}
+				return s
+			}(),
+			wantOK:  false,
+			wantSub: "type override",
+		},
+		{
+			name: "expression override configured",
+			stream: func() *Streamer {
+				s := allClear()
+				s.ExpressionMappings = []config.ExpressionMapping{{Table: "t", Column: "c", Expression: "1"}}
+				return s
+			}(),
+			wantOK:  false,
+			wantSub: "expression override",
+		},
+		{
+			name: "shard injection engaged",
+			stream: func() *Streamer {
+				s := allClear()
+				s.InjectShardColumn = ShardColumnSpec{Name: "shard_id", Value: "us-east-1"}
+				return s
+			}(),
+			wantOK:  false,
+			wantSub: "shard-column injection",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ok, reason := rawCopyGate(rawCopyConfigForStreamer(tc.stream))
+			if ok != tc.wantOK {
+				t.Fatalf("rawCopyGate ok = %v (reason %q); want %v", ok, reason, tc.wantOK)
+			}
+			if !tc.wantOK && tc.wantSub != "" && !strings.Contains(reason, tc.wantSub) {
+				t.Errorf("reason %q does not contain %q", reason, tc.wantSub)
 			}
 		})
 	}
