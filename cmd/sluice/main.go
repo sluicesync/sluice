@@ -46,9 +46,9 @@ var (
 )
 
 // logLevels maps the values accepted by the kong enum on
-// Globals.LogLevel to slog levels. Kept tight on purpose: format,
-// destination, and structured-vs-text choices are all hard-coded
-// today; if we ever need them configurable, they become flags.
+// Globals.LogLevel to slog levels. Kept tight on purpose: the
+// destination (stderr) is hard-coded today; if we ever need it
+// configurable, it becomes a flag (level and format already are).
 var logLevels = map[string]slog.Level{
 	"debug": slog.LevelDebug,
 	"info":  slog.LevelInfo,
@@ -70,7 +70,7 @@ func main() {
 			"version": fmt.Sprintf("sluice %s (commit %s, built %s)", version, commit, date),
 		},
 	)
-	configureLogging(cli.LogLevel)
+	configureLogging(cli.LogLevel, cli.LogFormat)
 	applyMaxMemory(cli.MaxMemory)
 	startPprofIfRequested(cli.PprofListen)
 	// v0.92.1 escape hatch: thread the operator's --mysql-sql-mode
@@ -157,15 +157,28 @@ func startPprofIfRequested(addr string) {
 	}()
 }
 
-// configureLogging installs a stderr-bound text slog handler at the
-// requested level on slog.Default. Unknown levels fall back to info
-// without erroring — kong's enum tag already rejects bad values, so
-// this only fires if the enum and map drift apart.
-func configureLogging(level string) {
+// configureLogging installs a stderr-bound slog handler at the
+// requested level and format on slog.Default. Unknown levels/formats
+// fall back to info/text without erroring — kong's enum tags already
+// reject bad values, so the fallbacks only fire if an enum and this
+// function drift apart.
+//
+// "json" emits one JSON object per line, the shape log aggregators
+// (Loki, Datadog, CloudWatch) ingest natively — the long-running
+// `sync` mode ships /metrics + /healthz and a k8s-probed container
+// image, and a structured log stream is the missing third leg of that
+// operational story.
+func configureLogging(level, format string) {
 	lvl, ok := logLevels[strings.ToLower(level)]
 	if !ok {
 		lvl = slog.LevelInfo
 	}
-	h := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: lvl})
+	opts := &slog.HandlerOptions{Level: lvl}
+	var h slog.Handler
+	if strings.EqualFold(format, "json") {
+		h = slog.NewJSONHandler(os.Stderr, opts)
+	} else {
+		h = slog.NewTextHandler(os.Stderr, opts)
+	}
 	slog.SetDefault(slog.New(h))
 }

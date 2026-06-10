@@ -28,8 +28,9 @@ import (
 // subcommand the user runs; binding the value in main() makes it
 // available to Run methods that declare a *Globals parameter.
 type Globals struct {
-	Config   string `help:"Path to a YAML config file." short:"c" type:"existingfile" placeholder:"PATH"`
-	LogLevel string `help:"Log verbosity." short:"l" default:"info" enum:"debug,info,warn,error" placeholder:"LEVEL"`
+	Config    string `help:"Path to a YAML config file." short:"c" type:"existingfile" placeholder:"PATH"`
+	LogLevel  string `help:"Log verbosity." short:"l" default:"info" enum:"debug,info,warn,error" placeholder:"LEVEL"`
+	LogFormat string `help:"Log output format: human-readable text or one-JSON-object-per-line (for Loki/Datadog/CloudWatch ingestion of long-running sync)." default:"text" enum:"text,json" placeholder:"FORMAT"`
 
 	// PprofListen is the GitHub #23 Phase A operator-diagnostic hook.
 	// When non-empty, starts net/http/pprof's debug endpoints at the
