@@ -2,11 +2,24 @@
 
 ## Status
 
-Accepted — design. Roadmap item 3c. Extends [ADR-0077](adr-0077-overlap-index-builds-with-bulk-copy.md) (which shipped the overlap for Postgres targets). Implementation notes filled in when the chunk lands.
+Accepted — **shipped v0.99.30** (roadmap item 3c). Extends [ADR-0077](adr-0077-overlap-index-builds-with-bulk-copy.md) (which shipped the overlap for Postgres targets). The deferred **combined-`ALTER`** alternative (below) shipped as a measured follow-up on `main` (`591da65`) after the at-scale bench confirmed the within-table MDL serialization it dodges; see the amendment.
 
 ### Implementation notes (what landed)
 
-_(to be completed when the chunk merges)_
+- `internal/engines/mysql/schema_writer_index_overlap.go` implements `ir.IncrementalIndexBuilder` + `ir.TableIndexedNotifier` + `ir.IndexBuildBudgetSetter` on the MySQL `SchemaWriter`, mirroring the PG path. The orchestrator engages it with zero change the moment the writer satisfies `IncrementalIndexBuilder`.
+- Worker sizing is the fixed-N policy (`resolveIndexBuildWorkers`): `min(4, jobCount)` clamped `[1, 8]`. The reserved budget is always 0 on MySQL (no slot prober), so it is stored for surface symmetry but not used to size the pool.
+- Flavor gate: `flavor.usesVStream()` (PlanetScale/Vitess) drains the channel firing the per-table callback and defers to the post-copy `CreateIndexes` — required threading `Engine.Flavor` onto the `SchemaWriter`.
+- v0.99.30 also fixed a pre-existing serial-path bug surfaced by the overlap work: SPATIAL/FULLTEXT indexes must not carry a column prefix (Error 1089) — `emitCreateIndex` now drops it for those kinds.
+
+### Measured result (at-scale bench, `bench-mysql/`)
+
+MySQL→MySQL, 30 tables × 1.5 M rows, **4 secondary indexes/table**, 10.7 GiB (7.55 GiB data + 3.13 GiB index ≈ 29 %), disk-bound local Docker (both DBs on one host — the realistic worst case for overlap, same regime as ADR-0077's PG bench). Comparing v0.99.30 (overlap) vs v0.99.29 (serial), all runs zero-loss + all-indexes-present:
+
+- **−13 % median total wall (−21 % best-case run1-vs-run1).** The stable, directly-comparable signal is the serial post-copy `ALTER … ADD INDEX` tail — **~1432–1500 s and rock-steady across runs, larger than the copy itself** — which the overlap folds essentially entirely into the copy window.
+- **A clear, repeatable win** — *unlike* ADR-0077's PG overlap (−60 s regression), because here the index tail is huge and steady rather than a small fraction of a copy-dominated profile. Live `SHOW PROCESSLIST` confirmed `ALTER … ADD INDEX` running concurrently with `LOAD DATA LOCAL INFILE` on other tables.
+- The win is surfaced by **many indexes/table** (4) and **enough tables to keep the N=4 pool busy** (30); it shrinks toward neutral with 1 index/table or a copy-dominated corpus, and grows with more/wider indexes.
+
+Publish the **−13 % median** as the conservative number. (The earlier "~1.27×" placeholder in the roadmap parity tracker was a pre-measurement estimate; this is the measured figure.)
 
 ## Context
 
@@ -31,11 +44,27 @@ Implement `ir.IncrementalIndexBuilder` + `ir.TableIndexedNotifier` on the MySQL 
 
 - MySQL-target migrate's separate index phase collapses into the copy phase (the same structural win ADR-0077 gave PG). PlanetScale/Vitess targets are byte-identical to today (serial post-copy `CreateIndexes`).
 - `-race` concurrency chunk (the worker pool + tracker, identical surface to PG) → the `-race` Integration gate must pass before any tag.
-- **No throughput number is published until an at-scale `bench-pgcopydb`-style MySQL-target run measures it.** ADR-0077's PG overlap was **−60 s (a regression)** on disk-bound storage — overlapped builds contended for the saturated disk. InnoDB's online-DDL row-log + buffer-pool contention may be better or worse; the honest framing ("tail-collapse on fast storage, possibly neutral/negative when disk-bound") gets the *measured* number, not an assumed win.
+- The at-scale bench (above) measured **−13 % median total wall (−21 % best case)** on a disk-bound MySQL→MySQL corpus with a heavy index tail — a clear, repeatable win, unlike ADR-0077's PG −60 s regression. The honest framing held: the number is measured, not assumed, and it would shrink toward neutral on a copy-dominated / few-index corpus.
 
 ## Alternatives considered
 
 - **Size the MySQL index pool from `splitCopyAndIndexBudget` like PG.** Rejected — MySQL's budget is always 0 (no slot prober), which floors to serial. A self-bounded fixed N is the only workable sizing without inventing a MySQL connection-slot model.
 - **Run the overlap on PlanetScale/Vitess targets.** Rejected — concurrent `ALTER … ADD INDEX` fights the platform's online-DDL/Safe-Migrations queue; defer to it via the post-copy fallback.
-- **Combined `ALTER TABLE … ADD INDEX a, ADD INDEX b` per table.** Deferred — trades parallelism for InnoDB scan-sharing; a measured follow-up, not a v1 guess.
+- **Combined `ALTER TABLE … ADD INDEX a, ADD INDEX b` per table.** Originally deferred as a measured follow-up; **shipped** (`591da65`) — see the amendment below. The at-scale bench confirmed the within-table MDL serialization that motivated it.
 - **Add `ADD INDEX IF NOT EXISTS` for resume.** Not portable on the MySQL versions sluice supports; the existing `indexExists` catalog probe is the idempotency mechanism (strictly an explicit check vs a server-side guard).
+
+## Amendment — combined-`ALTER` per table (shipped `591da65`)
+
+The v1 "one index per job" design left a measured question open: per-index jobs parallelize **across tables** but not **within** a table, because InnoDB takes a table **metadata lock** per `ALTER` — the at-scale bench observed `Waiting for table metadata lock` with one "altering table" + siblings blocked, so a table's N indexes serialize regardless of the pool width. The deferred combined-`ALTER` both dodges that MDL ping-pong and shares the single InnoDB table scan across all of a table's indexes. With the bench having confirmed the serialization empirically (and the win already large without it), the follow-up shipped.
+
+**Grouping rule (the load-bearing constraint).** MySQL allows a comma-separated list of `ADD` clauses in one `ALTER`, but not every index kind may share the statement:
+
+- **G1 — combine:** regular + UNIQUE BTREE/HASH secondary indexes → **one** `ALTER TABLE t ADD INDEX a (…), ADD UNIQUE INDEX b (…), …`. INPLACE-eligible, they share one scan.
+- **G2 — each its own statement:** every FULLTEXT index. InnoDB permits only **one** `ADD FULLTEXT` per `ALTER` (Error 1795); the first FULLTEXT also forces an `ALGORITHM=COPY` rebuild for the hidden `FTS_DOC_ID`.
+- **G3 — each its own statement:** every SPATIAL index. SPATIAL does not support `LOCK=NONE`, so folding one into G1 would downgrade the whole statement's algorithm.
+
+Mixing G2/G3 into G1 would error (1795) or silently downgrade the combined group off its online INPLACE scan — so they stay separate. On the common all-BTREE table this collapses K statements to one.
+
+**No explicit `ALGORITHM=`/`LOCK=` is pinned.** The target tables are sluice-created and bulk-loaded with no concurrent traffic, so `LOCK=NONE`'s only benefit (not blocking live readers/writers) doesn't apply, and pinning `ALGORITHM=INPLACE` would convert a legitimate server COPY-fallback into a hard error for zero benefit. Letting MySQL choose keeps the emit byte-compatible with the prior per-index output. The grouping rule is what secures the scan-sharing; the algorithm clause is not needed for it.
+
+**Model change.** The job unit became one-per-**table** (`indexBuildJob{tableName, idxs []*ir.Index}`); both the serial whole-schema `CreateIndexes` and the overlapped per-table workers route through the shared `buildTableIndexes`, which filters each index through the `indexExists` probe (so a partial-resume's combined `ALTER` carries only the surviving missing indexes — no 1061 on the present ones) then emits via `emitCreateIndexesCombined`. The overlap tracker's per-table count is now 1; cross-table parallelism (the only parallelism the per-index model actually bought, given the MDL) is preserved. Flavor gate unchanged. Pinned by a unit grouped-emit matrix (all-combinable collapse, mixed-kind split, two-FULLTEXT-never-combine, single==standalone) and integration tests (all-kinds-land family guard per the Bug 74 discipline + partial-resume). The combined-`ALTER`'s own incremental number over the overlap baseline is a future bench re-measure; its mechanism (one scan + one MDL per table vs N) is the established InnoDB behavior.
