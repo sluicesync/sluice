@@ -304,9 +304,7 @@ func (r *CDCReader) StreamChanges(ctx context.Context, from ir.Position) (<-chan
 		fmt.Sprintf("proto_version '%d'", r.protoVersion),
 		fmt.Sprintf("publication_names '%s'", r.publication),
 	}
-	if err := pglogrepl.StartReplication(ctx, conn, r.slotName, startLSN, pglogrepl.StartReplicationOptions{
-		PluginArgs: pluginArgs,
-	}); err != nil {
+	if err := r.startReplicationWithSlotActiveRetry(ctx, conn, startLSN, pluginArgs); err != nil {
 		if !slotJustCreated {
 			_ = conn.Close(ctx)
 			r.replConn = nil
@@ -320,6 +318,70 @@ func (r *CDCReader) StreamChanges(ctx context.Context, from ir.Position) (<-chan
 	streamStarted = true // suppress the deferred slot-drop
 	go r.pump(loopCtx, conn, startLSN, out)
 	return out, nil
+}
+
+// startReplicationWithSlotActiveRetry runs START_REPLICATION, retrying
+// with bounded backoff when the slot reports "active for PID N"
+// (SQLSTATE 55006). That error has two distinct causes that need
+// opposite handling:
+//
+//   - A PRIOR OWNER NOT YET REAPED: a just-crashed/stopped streamer's
+//     walsender lingers for a moment after its client connection dies
+//     (kernel socket teardown, in-process teardown ordering, or — under
+//     a contended CI scheduler — whole seconds). A warm resume or
+//     crash-recovery restart racing that window is transient and
+//     self-heals; failing it loudly forces an operator retry for a
+//     condition that resolves itself. This race is real and recurring:
+//     the bug15 stop/restart test papered over it with a 5s sleep, and
+//     the ADR-0046 post-bulkcopy crash-recovery leg hit it on CI the
+//     moment faster checkpoints (ADR-0082) narrowed the gap between
+//     recovery start and PG's reap.
+//
+//   - A GENUINELY CONCURRENT SECOND WRITER: the error is the load-
+//     bearing guard against two live streamers sharing a slot, and it
+//     must keep failing loudly.
+//
+// A bounded retry separates them: a dead owner's walsender is reaped
+// well within the budget (worst case wal_sender_timeout, default 60s,
+// but socket-death detection is near-immediate in practice); a live
+// owner keeps holding the slot past it, and the final attempt's error
+// — the original loud refusal — propagates unchanged. Each wait is
+// logged at INFO so a recovering stream is visibly waiting, not hung.
+// A failed START_REPLICATION leaves the replication conn in
+// ReadyForQuery, so retries reuse the same conn.
+func (r *CDCReader) startReplicationWithSlotActiveRetry(ctx context.Context, conn *pgconn.PgConn, startLSN pglogrepl.LSN, pluginArgs []string) error {
+	const (
+		attempts    = 8
+		baseBackoff = 500 * time.Millisecond
+		maxBackoff  = 8 * time.Second
+	)
+	var err error
+	for attempt := 1; ; attempt++ {
+		err = pglogrepl.StartReplication(ctx, conn, r.slotName, startLSN, pglogrepl.StartReplicationOptions{
+			PluginArgs: pluginArgs,
+		})
+		var pgErr *pgconn.PgError
+		if err == nil || !errors.As(err, &pgErr) || pgErr.Code != "55006" || attempt >= attempts {
+			return err
+		}
+		backoff := baseBackoff << (attempt - 1)
+		if backoff > maxBackoff {
+			backoff = maxBackoff
+		}
+		slog.InfoContext(
+			ctx, "postgres: cdc: slot is active (prior owner likely not yet reaped); waiting to retry START_REPLICATION",
+			slog.String("slot", r.slotName),
+			slog.String("detail", pgErr.Message),
+			slog.Int("attempt", attempt),
+			slog.Int("max_attempts", attempts),
+			slog.Duration("backoff", backoff),
+		)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(backoff):
+		}
+	}
 }
 
 // resolveStartPosition turns the caller's [ir.Position] into a

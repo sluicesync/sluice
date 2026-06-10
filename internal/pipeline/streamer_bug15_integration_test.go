@@ -192,13 +192,13 @@ func TestStreamer_PostgresToPostgres_StopRestartNoLoss(t *testing.T) {
 	// resume's StartReplication races with the previous connection's
 	// release and the slot reports "active for PID N".
 	streamCancel()
-	// Give the pump goroutine a moment to release the replication
-	// connection so the warm resume's slot ownership check passes.
-	// 5 seconds is generous: under healthy host conditions the pump
-	// exits within milliseconds of streamCancel; the larger window
-	// covers the test running concurrently with other PG containers
-	// where the host's docker daemon is under resource pressure.
-	time.Sleep(5 * time.Second)
+	// No release-grace sleep: the warm resume's START_REPLICATION now
+	// absorbs the prior pump's slot-release window itself via the
+	// bounded slot-active retry in the PG CDC reader (SQLSTATE 55006,
+	// see startReplicationWithSlotActiveRetry). Racing the resume
+	// directly against the release is deliberate — this test now
+	// EXERCISES that retry path instead of papering over the race
+	// with a 5s sleep that still lost under CI contention.
 
 	// Streamer is now stopped. The writer continues producing rows
 	// on the source — those events will accumulate in WAL until the
