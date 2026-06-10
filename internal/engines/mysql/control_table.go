@@ -12,18 +12,38 @@ import (
 	"strings"
 	"time"
 
+	"sluicesync.dev/sluice/internal/appliershared"
 	"sluicesync.dev/sluice/internal/ir"
 )
 
 // controlTableName is the per-target table that holds CDC stream
 // positions. ADR-0007 picks the name; v1 honors it verbatim. A
-// configurable prefix lands as part of roadmap §10.
-const controlTableName = "sluice_cdc_state"
+// configurable prefix lands as part of roadmap §10. Aliased from
+// appliershared so both engines share one source of truth.
+const controlTableName = appliershared.ControlTableName
 
 // shardConsolidationLeaseTableName is the ADR-0054 per-target control
 // table that holds the cross-shard DDL-coordination lease (one row per
 // consolidated target table). See ensureShardConsolidationLeaseTable.
-const shardConsolidationLeaseTableName = "sluice_shard_consolidation_lease"
+const shardConsolidationLeaseTableName = appliershared.ShardConsolidationLeaseTableName
+
+// controlCfg is the ADR-0081 tier-c dialect seam for the shared
+// control-table CRUD in internal/appliershared: the engine-constant
+// leaves (error prefix, the Error-1146 missing-table classifier, the
+// stream-not-found sentinel, the changed-rows RowsAffected wart) the
+// shared skeletons need. SQL text is built at each call site —
+// quoting and placeholder style stay in this package.
+var controlCfg = &appliershared.ControlTableConfig{
+	EngineName:        "mysql",
+	IsMissingTable:    isMySQLMissingTableErr,
+	ErrStreamNotFound: errStreamNotFound,
+
+	// go-sql-driver defaults to changed-rows RowsAffected semantics —
+	// an UPDATE that rewrites a row with the same value reports 0 —
+	// so RequestStop's missing-row detection uses the shared
+	// SELECT-then-UPDATE shape rather than a rows-affected check.
+	RowsAffectedIsChangedRows: true,
+}
 
 // ensureControlTable creates the per-target sluice_cdc_state table
 // if it doesn't exist. Idempotent — second-and-later calls are no-
@@ -90,27 +110,11 @@ func ensureControlTable(ctx context.Context, db *sql.DB) error {
 	return ensureCrossEngineParityColumn(ctx, db, "target_schema", "VARCHAR(255) NULL")
 }
 
-// shardConsolidationLeaseRow is the engine-internal mirror of
-// ir.ShardConsolidationLeaseRow. Defined here so the engine's lease
-// primitives keep their database/sql NullTime types local; the
+// shardConsolidationLeaseRow aliases the shared lease-row mirror of
+// ir.ShardConsolidationLeaseRow (ADR-0081 tier c); the
 // shard_consolidation_lease.go file converts to the pipeline-facing
 // shape.
-type shardConsolidationLeaseRow struct {
-	TargetTableFullName  string
-	LeaseHolderStreamID  string
-	LeaseExpiresAt       sql.NullTime
-	DDLText              string
-	DDLChecksum          string
-	AppliedSchemaVersion int64
-	AppliedAt            sql.NullTime
-
-	// AnchorPosition + AnchorEngine: source-side CDC position + engine
-	// the recorded boundary's DDL was observed at. v0.76.0+ task #21
-	// (lease GC sweep) reads these. Legacy v0.75.0 rows have NULL on
-	// both columns; the GC sweep defensively retains NULL-anchor rows.
-	AnchorPosition sql.NullString
-	AnchorEngine   sql.NullString
-}
+type shardConsolidationLeaseRow = appliershared.ShardLeaseRow
 
 // tryAcquireShardLease retries tryAcquireShardLeaseOnce on an InnoDB
 // deadlock (1213). Concurrent shards racing to INSERT the same ABSENT
@@ -169,17 +173,7 @@ func tryAcquireShardLeaseOnce(ctx context.Context, db *sql.DB, tableName, stream
 		"FROM `" + shardConsolidationLeaseTableName + "` " +
 		"WHERE target_table_full_name = ? FOR UPDATE"
 	var row shardConsolidationLeaseRow
-	scanErr := tx.QueryRowContext(ctx, selectQ, tableName).Scan(
-		&row.TargetTableFullName,
-		&row.LeaseHolderStreamID,
-		&row.LeaseExpiresAt,
-		&row.DDLText,
-		&row.DDLChecksum,
-		&row.AppliedSchemaVersion,
-		&row.AppliedAt,
-		&row.AnchorPosition,
-		&row.AnchorEngine,
-	)
+	scanErr := appliershared.ScanShardLeaseRow(tx.QueryRowContext(ctx, selectQ, tableName), &row)
 	switch {
 	case errors.Is(scanErr, sql.ErrNoRows):
 		// ABSENT: insert fresh row.
@@ -258,15 +252,7 @@ func heartbeatShardLease(ctx context.Context, db *sql.DB, tableName, streamID st
 		"WHERE target_table_full_name = ? " +
 		"AND lease_holder_stream_id = ? " +
 		"AND applied_at IS NULL"
-	res, err := db.ExecContext(ctx, q, expires, tableName, streamID)
-	if err != nil {
-		return false, fmt.Errorf("mysql: lease heartbeat: %w", err)
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return false, fmt.Errorf("mysql: lease heartbeat: rows affected: %w", err)
-	}
-	return n > 0, nil
+	return appliershared.GuardedExec(ctx, db, controlCfg, "lease heartbeat", q, expires, tableName, streamID)
 }
 
 // recordShardLeaseDDLText UPDATEs ddl_text for the held lease.
@@ -275,26 +261,16 @@ func recordShardLeaseDDLText(ctx context.Context, db *sql.DB, tableName, streamI
 		"WHERE target_table_full_name = ? " +
 		"AND lease_holder_stream_id = ? " +
 		"AND applied_at IS NULL"
-	res, err := db.ExecContext(ctx, q, ddlText, tableName, streamID)
-	if err != nil {
-		return false, fmt.Errorf("mysql: lease record ddl: %w", err)
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return false, fmt.Errorf("mysql: lease record ddl: rows affected: %w", err)
-	}
-	return n > 0, nil
+	return appliershared.GuardedExec(ctx, db, controlCfg, "lease record ddl", q, ddlText, tableName, streamID)
 }
 
 // finalizeShardLeaseApply records applied_at + ddl_text + ddl_checksum
 // + applied_schema_version + anchor_position + source_engine atomically,
 // gated on continued ownership.
 //
-// MySQL's RowsAffected uses changed-rows semantics by default — a UPDATE
-// that touches the same row with the same new value reports 0 rows
-// affected rather than 1. The lease primitive's UPDATEs always change
-// applied_at (NULL → CURRENT_TIMESTAMP), so the "0 rows means contention"
-// detection is reliable here.
+// MySQL's changed-rows RowsAffected semantics don't undermine the
+// "0 rows means contention" detection here: the UPDATE always changes
+// applied_at (NULL → CURRENT_TIMESTAMP).
 //
 // anchorPos / anchorEngine carry the source-side CDC position the
 // boundary was observed at (v0.76.0+). Empty strings store NULL via the
@@ -307,15 +283,8 @@ func finalizeShardLeaseApply(ctx context.Context, db *sql.DB, tableName, streamI
 		"WHERE target_table_full_name = ? " +
 		"AND lease_holder_stream_id = ? " +
 		"AND applied_at IS NULL"
-	res, err := db.ExecContext(ctx, q, ddlText, ddlChecksum, version, anchorPos, anchorEngine, tableName, streamID)
-	if err != nil {
-		return false, fmt.Errorf("mysql: lease finalize: %w", err)
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return false, fmt.Errorf("mysql: lease finalize: rows affected: %w", err)
-	}
-	return n > 0, nil
+	return appliershared.GuardedExec(ctx, db, controlCfg, "lease finalize", q,
+		ddlText, ddlChecksum, version, anchorPos, anchorEngine, tableName, streamID)
 }
 
 // listShardLeases returns every row in the per-target lease table.
@@ -327,34 +296,7 @@ func listShardLeases(ctx context.Context, db *sql.DB) ([]shardConsolidationLease
 		"lease_expires_at, COALESCE(ddl_text, ''), COALESCE(ddl_checksum, ''), " +
 		"applied_schema_version, applied_at, anchor_position, source_engine " +
 		"FROM `" + shardConsolidationLeaseTableName + "`"
-	rows, err := db.QueryContext(ctx, q)
-	if err != nil {
-		if isMySQLMissingTableErr(err) {
-			return []shardConsolidationLeaseRow{}, nil
-		}
-		return nil, fmt.Errorf("mysql: list leases: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-
-	out := []shardConsolidationLeaseRow{}
-	for rows.Next() {
-		var row shardConsolidationLeaseRow
-		if err := rows.Scan(
-			&row.TargetTableFullName,
-			&row.LeaseHolderStreamID,
-			&row.LeaseExpiresAt,
-			&row.DDLText,
-			&row.DDLChecksum,
-			&row.AppliedSchemaVersion,
-			&row.AppliedAt,
-			&row.AnchorPosition,
-			&row.AnchorEngine,
-		); err != nil {
-			return nil, fmt.Errorf("mysql: scan lease: %w", err)
-		}
-		out = append(out, row)
-	}
-	return out, rows.Err()
+	return appliershared.ListShardLeases(ctx, db, controlCfg, q)
 }
 
 // deleteShardLease removes the row keyed by tableName. Tolerant of the
@@ -363,13 +305,7 @@ func listShardLeases(ctx context.Context, db *sql.DB) ([]shardConsolidationLease
 // target is a no-op). v0.76.0 lease GC sweep (task #21).
 func deleteShardLease(ctx context.Context, db *sql.DB, tableName string) error {
 	const q = "DELETE FROM `" + shardConsolidationLeaseTableName + "` WHERE target_table_full_name = ?"
-	if _, err := db.ExecContext(ctx, q, tableName); err != nil {
-		if isMySQLMissingTableErr(err) {
-			return nil
-		}
-		return fmt.Errorf("mysql: lease delete: %w", err)
-	}
-	return nil
+	return appliershared.TolerantExec(ctx, db, controlCfg, "lease delete", q, tableName)
 }
 
 // selectShardLease loads the row for tableName. Returns ok=false when
@@ -381,27 +317,7 @@ func selectShardLease(ctx context.Context, db *sql.DB, tableName string) (row sh
 		"applied_schema_version, applied_at, anchor_position, source_engine " +
 		"FROM `" + shardConsolidationLeaseTableName + "` " +
 		"WHERE target_table_full_name = ?"
-	r := db.QueryRowContext(ctx, q, tableName)
-	scanErr := r.Scan(
-		&row.TargetTableFullName,
-		&row.LeaseHolderStreamID,
-		&row.LeaseExpiresAt,
-		&row.DDLText,
-		&row.DDLChecksum,
-		&row.AppliedSchemaVersion,
-		&row.AppliedAt,
-		&row.AnchorPosition,
-		&row.AnchorEngine,
-	)
-	switch {
-	case errors.Is(scanErr, sql.ErrNoRows):
-		return shardConsolidationLeaseRow{}, false, nil
-	case isMySQLMissingTableErr(scanErr):
-		return shardConsolidationLeaseRow{}, false, nil
-	case scanErr != nil:
-		return shardConsolidationLeaseRow{}, false, fmt.Errorf("mysql: lease select: %w", scanErr)
-	}
-	return row, true, nil
+	return appliershared.SelectShardLease(ctx, db, controlCfg, q, tableName)
 }
 
 // ensureShardConsolidationLeaseTable creates the per-target
@@ -572,46 +488,23 @@ func ensureStopRequestedColumn(ctx context.Context, db *sql.DB) error {
 // or ok=false when no row exists. The Engine field of the returned
 // position is set to "mysql" by the caller — only the Token survives
 // across runs (the engine reading is implicitly the engine that
-// wrote).
-//
-// Tolerant of the control table being absent: a missing-table error
-// is reported as ok=false (same as "no row") so dry-run flows that
-// skip EnsureControlTable still work. The same string-match helper
-// powers ListStreams's missing-table fallback.
+// wrote). Missing-table tolerance and error shape live in the shared
+// skeleton; the same string-match classifier powers ListStreams's
+// missing-table fallback.
 func readPosition(ctx context.Context, db *sql.DB, streamID string) (token string, ok bool, err error) {
 	const q = "SELECT source_position FROM `" + controlTableName + "` WHERE stream_id = ?"
-	row := db.QueryRowContext(ctx, q, streamID)
-	switch err := row.Scan(&token); {
-	case errors.Is(err, sql.ErrNoRows):
-		return "", false, nil
-	case isMySQLMissingTableErr(err):
-		return "", false, nil
-	case err != nil:
-		return "", false, fmt.Errorf("mysql: read position: %w", err)
-	}
-	return token, true, nil
+	return appliershared.ReadPosition(ctx, db, controlCfg, q, streamID)
 }
 
-// listStreams returns every row in the per-target control table.
-// Tolerant of the table being absent (treated as "no streams") so
-// `sluice sync status` works against a target that hasn't been a
-// CDC destination yet.
+// listStreams returns every row in the per-target control table via
+// the shared skeleton (missing table → "no streams"; COALESCE on
+// slot_name / source_dsn_fingerprint / target_schema so legacy rows
+// that pre-date those columns — v0.32.2 introduced them on the MySQL
+// side; OBS-1 — surface as empty strings).
 //
-// The Position values returned set Engine to the supplied
-// engineName for symmetry with ReadPosition's contract.
-//
-// COALESCE on slot_name / source_dsn_fingerprint / target_schema so
-// legacy rows that pre-date those columns (v0.32.2 introduced them on
-// the MySQL side; OBS-1) surface as empty strings in the StreamStatus
-// — callers branch on empty-string rather than handling
-// sql.NullString. The columns are also COALESCE'd in case the
-// control table itself was created pre-v0.32.2 and an ALTER landed
-// the columns: existing rows would be NULL until a subsequent
-// position-write upserts a non-empty value.
-//
-// The query falls back to the legacy column set (no slot_name etc.)
-// when MySQL reports "Unknown column" — the path is reachable only
-// during an in-progress upgrade where another connection has run
+// The fallback hook retries with the legacy column set (no slot_name
+// etc.) when MySQL reports "Unknown column" — the path is reachable
+// only during an in-progress upgrade where another connection has run
 // EnsureControlTable's ALTER concurrently but this connection's
 // query was already planned against the old schema. Defence in
 // depth; the fallback returns empty strings for the missing fields.
@@ -621,49 +514,15 @@ func listStreams(ctx context.Context, db *sql.DB, engineName string) ([]ir.Strea
 		"COALESCE(source_dsn_fingerprint, ''), " +
 		"COALESCE(target_schema, '') " +
 		"FROM `" + controlTableName + "`"
-	rows, err := db.QueryContext(ctx, q)
-	if err != nil {
-		// MySQL surfaces missing-table as error 1146; the friendly
-		// fallback treats that as "no streams". String-match keeps
-		// the helper driver-version-tolerant.
-		if isMySQLMissingTableErr(err) {
-			return []ir.StreamStatus{}, nil
+	cfg := *controlCfg
+	cfg.ListStreamsFallback = func(ctx context.Context, queryErr error) ([]ir.StreamStatus, bool, error) {
+		if !isMySQLUnknownColumnErr(queryErr) {
+			return nil, false, nil
 		}
-		// Unknown-column fallback: pre-v0.32.2 control tables that
-		// haven't had EnsureControlTable's ALTER applied yet. The
-		// streamer's startup runs EnsureControlTable so this is rare
-		// in practice; the fallback keeps `sluice sync status` working
-		// against a target mid-upgrade.
-		if isMySQLUnknownColumnErr(err) {
-			return listStreamsLegacy(ctx, db, engineName)
-		}
-		return nil, fmt.Errorf("mysql: list streams: %w", err)
+		out, err := listStreamsLegacy(ctx, db, engineName)
+		return out, true, err
 	}
-	defer func() { _ = rows.Close() }()
-
-	out := []ir.StreamStatus{}
-	for rows.Next() {
-		var (
-			streamID     string
-			token        string
-			updated      time.Time
-			slotName     string
-			fingerprint  string
-			targetSchema string
-		)
-		if err := rows.Scan(&streamID, &token, &updated, &slotName, &fingerprint, &targetSchema); err != nil {
-			return nil, fmt.Errorf("mysql: scan streams: %w", err)
-		}
-		out = append(out, ir.StreamStatus{
-			StreamID:             streamID,
-			Position:             ir.Position{Engine: engineName, Token: token},
-			UpdatedAt:            updated,
-			SlotName:             slotName,
-			SourceDSNFingerprint: fingerprint,
-			TargetSchema:         targetSchema,
-		})
-	}
-	return out, rows.Err()
+	return appliershared.ListStreams(ctx, db, &cfg, q, engineName)
 }
 
 // listStreamsLegacy is the pre-v0.32.2 SELECT shape, used as a
@@ -719,6 +578,11 @@ func isMySQLMissingTableErr(err error) bool {
 // Called from the applier's per-change tx after the data write —
 // atomicity guarantees that progress and data move together.
 //
+// Deliberately NOT routed through the appliershared tier-c skeletons:
+// the upsert SQL is the ADR-0007/ADR-0010 resume contract and wholly
+// dialect (row-alias ON DUPLICATE KEY here vs ON CONFLICT on PG), so
+// each engine byte-owns it.
+//
 // Uses the row-alias UPSERT form (MySQL 8.0.20+) for consistency
 // with the data-write Insert path. stop_requested_at is left
 // untouched: a position write is the streamer making forward
@@ -757,66 +621,33 @@ func writePositionTx(ctx context.Context, tx *sql.Tx, streamID, token, slotName,
 }
 
 // readStopRequested returns true when the named stream's row has a
-// non-NULL stop_requested_at column. Tolerant of the table being
-// absent (returns false, nil) so polling-loop startup races don't
-// surface as errors.
-//
-// Returns (false, nil) when the row doesn't exist — a stop signal
-// that hasn't been recorded is, by definition, not present. The
-// Streamer's poll loop calls this every few seconds via the
-// receiver method on ChangeApplier; the lint pass can't see that
-// cross-package usage, hence the nolint.
+// non-NULL stop_requested_at column, via the shared skeleton (missing
+// table / missing row → false, nil — a stop signal that hasn't been
+// recorded is, by definition, not present). The Streamer's poll loop
+// calls this every few seconds via the receiver method on
+// ChangeApplier; the lint pass can't see that cross-package usage,
+// hence the nolint.
 //
 //nolint:unused // called by pipeline poll loop via ChangeApplier receiver
 func readStopRequested(ctx context.Context, db *sql.DB, streamID string) (bool, error) {
 	const q = "SELECT stop_requested_at IS NOT NULL FROM `" + controlTableName + "` WHERE stream_id = ?"
-	var stopRequested bool
-	err := db.QueryRowContext(ctx, q, streamID).Scan(&stopRequested)
-	switch {
-	case errors.Is(err, sql.ErrNoRows):
-		return false, nil
-	case isMySQLMissingTableErr(err):
-		return false, nil
-	case err != nil:
-		return false, fmt.Errorf("mysql: read stop flag: %w", err)
-	}
-	return stopRequested, nil
+	return appliershared.ReadStopRequested(ctx, db, controlCfg, q, streamID)
 }
 
 // requestStop flips the stop flag on the named stream's row. Returns
 // errStreamNotFound when no row exists (the operator likely typoed
-// the stream ID; the CLI surfaces a friendly message).
+// the stream ID; the CLI surfaces a friendly message). Idempotent;
+// updated_at is left alone so the "age" column in `sync status`
+// continues to reflect real apply activity rather than stop-request
+// bookkeeping.
 //
-// Idempotent: repeated calls land the same flag (the timestamp
-// updates, but the streamer treats any non-NULL value as "stop
-// requested" so the repeat is harmless). updated_at is left alone
-// so the "age" column in `sync status` continues to reflect real
-// apply activity rather than stop-request bookkeeping.
-//
-// Implementation note: MySQL's go-sql-driver reports RowsAffected
-// using `changed-rows` semantics by default — a UPDATE that touches
-// the same row with the same new value reports 0 rows affected
-// rather than 1. That makes "rows affected = 0 means missing row"
-// unreliable for our idempotency contract. We use a SELECT-then-
-// UPDATE pair instead. The two queries don't need to be in a
-// transaction: the UPDATE is itself atomic, and a stream row can
-// only be inserted by the streamer's writePositionTx, which races
-// don't matter for here (a transient missing row → operator retry
-// → success).
+// The existence probe + unconditional UPDATE pair (rather than a
+// rows-affected check) is the shared skeleton's changed-rows branch —
+// see ControlTableConfig.RowsAffectedIsChangedRows on controlCfg.
 func requestStop(ctx context.Context, db *sql.DB, streamID string) error {
 	const existsQ = "SELECT 1 FROM `" + controlTableName + "` WHERE stream_id = ?"
-	var dummy int
-	switch err := db.QueryRowContext(ctx, existsQ, streamID).Scan(&dummy); {
-	case errors.Is(err, sql.ErrNoRows):
-		return fmt.Errorf("%w: %q", errStreamNotFound, streamID)
-	case err != nil:
-		return fmt.Errorf("mysql: request stop: existence check: %w", err)
-	}
 	const updateQ = "UPDATE `" + controlTableName + "` SET stop_requested_at = CURRENT_TIMESTAMP WHERE stream_id = ?"
-	if _, err := db.ExecContext(ctx, updateQ, streamID); err != nil {
-		return fmt.Errorf("mysql: request stop: %w", err)
-	}
-	return nil
+	return appliershared.RequestStop(ctx, db, controlCfg, existsQ, updateQ, streamID)
 }
 
 // errStreamNotFound is returned by [requestStop] (and thus
@@ -830,19 +661,12 @@ var errStreamNotFound = errors.New("mysql: stream not found")
 // previous `sluice sync stop` doesn't leave a sticky stop signal
 // that immediately exits the next `sluice sync start`. Idempotent
 // and tolerant of a missing row or table (returns nil) — the next
-// position-write commit will populate the row.
+// position-write commit will populate the row. (EnsureControlTable
+// runs first, but a brand-new target may have an in-flight
+// schema-apply.)
 func clearStopRequested(ctx context.Context, db *sql.DB, streamID string) error {
 	const q = "UPDATE `" + controlTableName + "` SET stop_requested_at = NULL WHERE stream_id = ?"
-	if _, err := db.ExecContext(ctx, q, streamID); err != nil {
-		// Tolerant of the table being absent — same shape as
-		// readPosition. EnsureControlTable runs first, but a
-		// brand-new target may have an in-flight schema-apply.
-		if isMySQLMissingTableErr(err) {
-			return nil
-		}
-		return fmt.Errorf("mysql: clear stop signal: %w", err)
-	}
-	return nil
+	return appliershared.TolerantExec(ctx, db, controlCfg, "clear stop signal", q, streamID)
 }
 
 // clearStream deletes the named stream's row from the per-target
@@ -851,13 +675,7 @@ func clearStopRequested(ctx context.Context, db *sql.DB, streamID string) error 
 // cleanly. See [ChangeApplier.ClearStream] for the recovery flow.
 func clearStream(ctx context.Context, db *sql.DB, streamID string) error {
 	const q = "DELETE FROM `" + controlTableName + "` WHERE stream_id = ?"
-	if _, err := db.ExecContext(ctx, q, streamID); err != nil {
-		if isMySQLMissingTableErr(err) {
-			return nil
-		}
-		return fmt.Errorf("mysql: clear stream: %w", err)
-	}
-	return nil
+	return appliershared.TolerantExec(ctx, db, controlCfg, "clear stream", q, streamID)
 }
 
 // readLiveAddedTables returns the comma-separated list parsed into a
