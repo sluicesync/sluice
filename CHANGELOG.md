@@ -6,6 +6,8 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.99.34] - 2026-06-10
+
 ### Fixed
 - **Warm resumes and crash recoveries no longer fail on a not-yet-released
   replication slot.** Restarting a PG stream moments after the prior owner
