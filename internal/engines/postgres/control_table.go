@@ -10,19 +10,51 @@ import (
 	"fmt"
 	"time"
 
+	"sluicesync.dev/sluice/internal/appliershared"
 	"sluicesync.dev/sluice/internal/ir"
 )
 
 // controlTableName is the per-target table that holds CDC stream
-// positions. ADR-0007 picks the name; v1 honors it verbatim.
-const controlTableName = "sluice_cdc_state"
+// positions. ADR-0007 picks the name; v1 honors it verbatim. Aliased
+// from appliershared so both engines share one source of truth.
+const controlTableName = appliershared.ControlTableName
 
 // shardConsolidationLeaseTableName is the ADR-0054 per-target control
 // table that holds the cross-shard DDL-coordination lease (one row per
 // consolidated target table). Lives in the same controlSchema as
 // sluice_cdc_state; additive, never touches existing data. See
 // ensureShardConsolidationLeaseTable.
-const shardConsolidationLeaseTableName = "sluice_shard_consolidation_lease"
+const shardConsolidationLeaseTableName = appliershared.ShardConsolidationLeaseTableName
+
+// controlCfg is the ADR-0081 tier-c dialect seam for the shared
+// control-table CRUD in internal/appliershared: the engine-constant
+// leaves (error prefix, the 42P01 missing-relation classifier, the
+// stream-not-found sentinel) the shared skeletons need. SQL text is
+// built at each call site — quoting, placeholder style, and the
+// controlSchema qualification stay in this package.
+// RowsAffectedIsChangedRows stays false: Postgres RowsAffected
+// reports matched rows, so RequestStop's zero-rows check detects a
+// missing stream row directly.
+var controlCfg = &appliershared.ControlTableConfig{
+	EngineName:        "postgres",
+	IsMissingTable:    isUndefinedRelationErr,
+	ErrStreamNotFound: errStreamNotFound,
+}
+
+// controlTableRef returns the schema-qualified, quoted reference to
+// the sluice_cdc_state table. Postgres has namespaced schemas (unlike
+// MySQL's flat per-connection database), so every control-table
+// statement qualifies the name with the schema threaded from the
+// DSN's `schema` query parameter (default "public").
+func controlTableRef(schema string) string {
+	return quoteIdent(schema) + "." + quoteIdent(controlTableName)
+}
+
+// shardLeaseTableRef is controlTableRef's counterpart for the
+// ADR-0054 lease table.
+func shardLeaseTableRef(schema string) string {
+	return quoteIdent(schema) + "." + quoteIdent(shardConsolidationLeaseTableName)
+}
 
 // ensureControlTable creates the per-target sluice_cdc_state table
 // in the named schema if it doesn't exist. Idempotent — second-and-
@@ -38,7 +70,7 @@ const shardConsolidationLeaseTableName = "sluice_shard_consolidation_lease"
 // transparently on the next call. Existing rows keep their data;
 // the new column starts NULL (i.e. "no stop requested").
 func ensureControlTable(ctx context.Context, db *sql.DB, schema string) error {
-	tableRef := quoteIdent(schema) + "." + quoteIdent(controlTableName)
+	tableRef := controlTableRef(schema)
 	ddl := `
 		CREATE TABLE IF NOT EXISTS ` + tableRef + ` (
 			stream_id         VARCHAR(255) NOT NULL,
@@ -90,31 +122,11 @@ func ensureControlTable(ctx context.Context, db *sql.DB, schema string) error {
 	return nil
 }
 
-// shardConsolidationLeaseRow is the engine-internal mirror of
-// pipeline.ShardConsolidationLeaseRow. Defined here so the engine's
-// lease primitives don't import the pipeline package (which would
-// create a cycle); the ChangeApplier's interface methods (in
-// shard_consolidation_lease.go) translate between this and the
-// pipeline shape.
-type shardConsolidationLeaseRow struct {
-	TargetTableFullName  string
-	LeaseHolderStreamID  string
-	LeaseExpiresAt       sql.NullTime
-	DDLText              string
-	DDLChecksum          string
-	AppliedSchemaVersion int64
-	AppliedAt            sql.NullTime
-
-	// AnchorPosition + AnchorEngine: the source-side CDC position +
-	// engine identity at which the recorded boundary's DDL was
-	// observed. Populated by [finalizeShardLeaseApply] in v0.76.0+; NULL
-	// on legacy rows that pre-date the additive migration (the lease
-	// GC sweep defensively retains NULL-anchor rows). Mirrors the
-	// `anchor_position` / `source_engine` columns the
-	// sluice_cdc_schema_history table carries (ADR-0049 / Bug 78).
-	AnchorPosition sql.NullString
-	AnchorEngine   sql.NullString
-}
+// shardConsolidationLeaseRow aliases the shared lease-row mirror of
+// ir.ShardConsolidationLeaseRow (ADR-0081 tier c); the ChangeApplier's
+// interface methods (in shard_consolidation_lease.go) translate
+// between this and the pipeline shape.
+type shardConsolidationLeaseRow = appliershared.ShardLeaseRow
 
 // tryAcquireShardLease conditionally INSERTs / UPDATEs a lease row
 // under the row-level lock of the conflict-on-PK ON CONFLICT path.
@@ -134,7 +146,7 @@ type shardConsolidationLeaseRow struct {
 // SELECT (under PG's snapshot semantics inside the same tx) gives the
 // caller a consistent view.
 func tryAcquireShardLease(ctx context.Context, db *sql.DB, schema, tableName, streamID string, expires time.Time) (acquired bool, current shardConsolidationLeaseRow, err error) {
-	tableRef := quoteIdent(schema) + "." + quoteIdent(shardConsolidationLeaseTableName)
+	tableRef := shardLeaseTableRef(schema)
 	// Single-statement upsert; RETURNING gives back whether the
 	// statement actually wrote (acquired) or hit the WHERE-guard
 	// (contended). When acquired, the returned row reflects the
@@ -173,19 +185,8 @@ func tryAcquireShardLease(ctx context.Context, db *sql.DB, schema, tableName, st
 			applied_at,
 			anchor_position,
 			source_engine`
-	row := db.QueryRowContext(ctx, q, tableName, streamID, expires)
 	var got shardConsolidationLeaseRow
-	scanErr := row.Scan(
-		&got.TargetTableFullName,
-		&got.LeaseHolderStreamID,
-		&got.LeaseExpiresAt,
-		&got.DDLText,
-		&got.DDLChecksum,
-		&got.AppliedSchemaVersion,
-		&got.AppliedAt,
-		&got.AnchorPosition,
-		&got.AnchorEngine,
-	)
+	scanErr := appliershared.ScanShardLeaseRow(db.QueryRowContext(ctx, q, tableName, streamID, expires), &got)
 	switch {
 	case errors.Is(scanErr, sql.ErrNoRows):
 		// Conditional upsert WHERE-guard rejected the conflict path:
@@ -211,45 +212,28 @@ func tryAcquireShardLease(ctx context.Context, db *sql.DB, schema, tableName, st
 // heartbeatShardLease extends lease_expires_at to expires iff the row
 // is still held by streamID. Returns extended=false when a peer has
 // taken over (the holder's apply path must exit).
+//
+// The WHERE guard makes the UPDATE conditional on continued
+// ownership: holder must match AND applied_at must still be
+// NULL. A holder that has already finalized would no-op here, but
+// the heartbeat loop doesn't fire after Apply closes stopCh, so
+// this case shouldn't arise in practice.
 func heartbeatShardLease(ctx context.Context, db *sql.DB, schema, tableName, streamID string, expires time.Time) (extended bool, err error) {
-	tableRef := quoteIdent(schema) + "." + quoteIdent(shardConsolidationLeaseTableName)
-	// The WHERE guard makes the UPDATE conditional on continued
-	// ownership: holder must match AND applied_at must still be
-	// NULL. A holder that has already finalized would no-op here, but
-	// the heartbeat loop doesn't fire after Apply closes stopCh, so
-	// this case shouldn't arise in practice.
-	q := "UPDATE " + tableRef + " SET lease_expires_at = $1 " +
+	q := "UPDATE " + shardLeaseTableRef(schema) + " SET lease_expires_at = $1 " +
 		"WHERE target_table_full_name = $2 " +
 		"AND lease_holder_stream_id = $3 " +
 		"AND applied_at IS NULL"
-	res, err := db.ExecContext(ctx, q, expires, tableName, streamID)
-	if err != nil {
-		return false, fmt.Errorf("postgres: lease heartbeat: %w", err)
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return false, fmt.Errorf("postgres: lease heartbeat: rows affected: %w", err)
-	}
-	return n > 0, nil
+	return appliershared.GuardedExec(ctx, db, controlCfg, "lease heartbeat", q, expires, tableName, streamID)
 }
 
 // recordShardLeaseDDLText UPDATEs ddl_text for the held lease. Same
 // holder-guard as heartbeatShardLease.
 func recordShardLeaseDDLText(ctx context.Context, db *sql.DB, schema, tableName, streamID, ddlText string) (recorded bool, err error) {
-	tableRef := quoteIdent(schema) + "." + quoteIdent(shardConsolidationLeaseTableName)
-	q := "UPDATE " + tableRef + " SET ddl_text = $1 " +
+	q := "UPDATE " + shardLeaseTableRef(schema) + " SET ddl_text = $1 " +
 		"WHERE target_table_full_name = $2 " +
 		"AND lease_holder_stream_id = $3 " +
 		"AND applied_at IS NULL"
-	res, err := db.ExecContext(ctx, q, ddlText, tableName, streamID)
-	if err != nil {
-		return false, fmt.Errorf("postgres: lease record ddl: %w", err)
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return false, fmt.Errorf("postgres: lease record ddl: rows affected: %w", err)
-	}
-	return n > 0, nil
+	return appliershared.GuardedExec(ctx, db, controlCfg, "lease record ddl", q, ddlText, tableName, streamID)
 }
 
 // finalizeShardLeaseApply records applied_at + ddl_text + ddl_checksum
@@ -261,61 +245,25 @@ func recordShardLeaseDDLText(ctx context.Context, db *sql.DB, schema, tableName,
 // legacy callers (and the unit-test fakes that don't supply an anchor)
 // preserve the pre-anchor shape.
 func finalizeShardLeaseApply(ctx context.Context, db *sql.DB, schema, tableName, streamID, ddlText, ddlChecksum string, version int64, anchorPos, anchorEngine string) (finalized bool, err error) {
-	tableRef := quoteIdent(schema) + "." + quoteIdent(shardConsolidationLeaseTableName)
-	q := "UPDATE " + tableRef + " SET " +
+	q := "UPDATE " + shardLeaseTableRef(schema) + " SET " +
 		"ddl_text = $1, ddl_checksum = $2, " +
 		"applied_schema_version = $3, applied_at = CURRENT_TIMESTAMP, " +
 		"anchor_position = NULLIF($4, ''), source_engine = NULLIF($5, '') " +
 		"WHERE target_table_full_name = $6 " +
 		"AND lease_holder_stream_id = $7 " +
 		"AND applied_at IS NULL"
-	res, err := db.ExecContext(ctx, q, ddlText, ddlChecksum, version, anchorPos, anchorEngine, tableName, streamID)
-	if err != nil {
-		return false, fmt.Errorf("postgres: lease finalize: %w", err)
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return false, fmt.Errorf("postgres: lease finalize: rows affected: %w", err)
-	}
-	return n > 0, nil
+	return appliershared.GuardedExec(ctx, db, controlCfg, "lease finalize", q,
+		ddlText, ddlChecksum, version, anchorPos, anchorEngine, tableName, streamID)
 }
 
 // listShardLeases returns every row in the per-target lease table.
 // Tolerant of the table being absent. ADR-0054 §6 operator-visibility
 // surface, plus the v0.76.0 lease GC sweep's enumeration source.
 func listShardLeases(ctx context.Context, db *sql.DB, schema string) ([]shardConsolidationLeaseRow, error) {
-	tableRef := quoteIdent(schema) + "." + quoteIdent(shardConsolidationLeaseTableName)
 	q := "SELECT target_table_full_name, COALESCE(lease_holder_stream_id, ''), " +
 		"lease_expires_at, COALESCE(ddl_text, ''), COALESCE(ddl_checksum, ''), " +
-		"applied_schema_version, applied_at, anchor_position, source_engine FROM " + tableRef
-	rows, err := db.QueryContext(ctx, q)
-	if err != nil {
-		if isUndefinedRelationErr(err) {
-			return []shardConsolidationLeaseRow{}, nil
-		}
-		return nil, fmt.Errorf("postgres: list leases: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-
-	out := []shardConsolidationLeaseRow{}
-	for rows.Next() {
-		var row shardConsolidationLeaseRow
-		if err := rows.Scan(
-			&row.TargetTableFullName,
-			&row.LeaseHolderStreamID,
-			&row.LeaseExpiresAt,
-			&row.DDLText,
-			&row.DDLChecksum,
-			&row.AppliedSchemaVersion,
-			&row.AppliedAt,
-			&row.AnchorPosition,
-			&row.AnchorEngine,
-		); err != nil {
-			return nil, fmt.Errorf("postgres: scan lease: %w", err)
-		}
-		out = append(out, row)
-	}
-	return out, rows.Err()
+		"applied_schema_version, applied_at, anchor_position, source_engine FROM " + shardLeaseTableRef(schema)
+	return appliershared.ListShardLeases(ctx, db, controlCfg, q)
 }
 
 // deleteShardLease removes the row keyed by tableName. Tolerant of the
@@ -323,47 +271,19 @@ func listShardLeases(ctx context.Context, db *sql.DB, schema string) ([]shardCon
 // itself being absent (returns nil so a GC sweep against a pre-Ensure
 // target is a no-op). v0.76.0 lease GC sweep (task #21).
 func deleteShardLease(ctx context.Context, db *sql.DB, schema, tableName string) error {
-	tableRef := quoteIdent(schema) + "." + quoteIdent(shardConsolidationLeaseTableName)
-	q := "DELETE FROM " + tableRef + " WHERE target_table_full_name = $1"
-	if _, err := db.ExecContext(ctx, q, tableName); err != nil {
-		if isUndefinedRelationErr(err) {
-			return nil
-		}
-		return fmt.Errorf("postgres: lease delete: %w", err)
-	}
-	return nil
+	q := "DELETE FROM " + shardLeaseTableRef(schema) + " WHERE target_table_full_name = $1"
+	return appliershared.TolerantExec(ctx, db, controlCfg, "lease delete", q, tableName)
 }
 
 // selectShardLease loads the row for tableName. Returns ok=false when
 // no row exists (ABSENT) or when the table doesn't exist (dry-run
 // path before EnsureControlTable).
 func selectShardLease(ctx context.Context, db *sql.DB, schema, tableName string) (row shardConsolidationLeaseRow, ok bool, err error) {
-	tableRef := quoteIdent(schema) + "." + quoteIdent(shardConsolidationLeaseTableName)
 	q := "SELECT target_table_full_name, COALESCE(lease_holder_stream_id, ''), " +
 		"lease_expires_at, COALESCE(ddl_text, ''), COALESCE(ddl_checksum, ''), " +
 		"applied_schema_version, applied_at, anchor_position, source_engine " +
-		"FROM " + tableRef + " WHERE target_table_full_name = $1"
-	r := db.QueryRowContext(ctx, q, tableName)
-	scanErr := r.Scan(
-		&row.TargetTableFullName,
-		&row.LeaseHolderStreamID,
-		&row.LeaseExpiresAt,
-		&row.DDLText,
-		&row.DDLChecksum,
-		&row.AppliedSchemaVersion,
-		&row.AppliedAt,
-		&row.AnchorPosition,
-		&row.AnchorEngine,
-	)
-	switch {
-	case errors.Is(scanErr, sql.ErrNoRows):
-		return shardConsolidationLeaseRow{}, false, nil
-	case isUndefinedRelationErr(scanErr):
-		return shardConsolidationLeaseRow{}, false, nil
-	case scanErr != nil:
-		return shardConsolidationLeaseRow{}, false, fmt.Errorf("postgres: lease select: %w", scanErr)
-	}
-	return row, true, nil
+		"FROM " + shardLeaseTableRef(schema) + " WHERE target_table_full_name = $1"
+	return appliershared.SelectShardLease(ctx, db, controlCfg, q, tableName)
 }
 
 // ensureShardConsolidationLeaseTable creates the per-target
@@ -380,7 +300,7 @@ func selectShardLease(ctx context.Context, db *sql.DB, schema, tableName string)
 // the holder's RetryPeriod cadence. See ADR-0054 §1 for the state
 // machine and §2 for the timing defaults.
 func ensureShardConsolidationLeaseTable(ctx context.Context, db *sql.DB, schema string) error {
-	tableRef := quoteIdent(schema) + "." + quoteIdent(shardConsolidationLeaseTableName)
+	tableRef := shardLeaseTableRef(schema)
 	ddl := `
 		CREATE TABLE IF NOT EXISTS ` + tableRef + ` (
 			target_table_full_name        VARCHAR(512) NOT NULL,
@@ -419,94 +339,41 @@ func ensureShardConsolidationLeaseTable(ctx context.Context, db *sql.DB, schema 
 // readPosition returns the persisted source_position for streamID,
 // or ok=false when no row exists. Engine on the returned Position
 // is set by the caller — only the Token survives across runs.
-//
-// Tolerant of the control table being absent: a missing-relation
-// error is reported as ok=false (same as "no row") so dry-run
-// flows that skip EnsureControlTable still work. Missing-relation
-// detection uses the same string-match helper as the schema reader's
-// PostGIS lookup.
+// Missing-relation tolerance and error shape live in the shared
+// skeleton; the classifier is the same string-match helper the
+// schema reader's PostGIS lookup uses.
 func readPosition(ctx context.Context, db *sql.DB, schema, streamID string) (token string, ok bool, err error) {
-	tableRef := quoteIdent(schema) + "." + quoteIdent(controlTableName)
-	q := "SELECT source_position FROM " + tableRef + " WHERE stream_id = $1"
-	row := db.QueryRowContext(ctx, q, streamID)
-	switch err := row.Scan(&token); {
-	case errors.Is(err, sql.ErrNoRows):
-		return "", false, nil
-	case isUndefinedRelationErr(err):
-		return "", false, nil
-	case err != nil:
-		return "", false, fmt.Errorf("postgres: read position: %w", err)
-	}
-	return token, true, nil
+	q := "SELECT source_position FROM " + controlTableRef(schema) + " WHERE stream_id = $1"
+	return appliershared.ReadPosition(ctx, db, controlCfg, q, streamID)
 }
 
-// listStreams returns every row in the per-target control table.
-// Tolerant of the table being absent (treated as "no streams") so
-// `sluice sync status` works against a target that hasn't been a
-// CDC destination yet.
-//
-// The Position values returned set Engine to the
-// engine-specific identifier the binlog or pgoutput readers use,
-// since the token alone is opaque without that context. The CLI
-// is the consumer; it doesn't strictly need Engine populated, but
-// keeping the shape consistent with ReadPosition's return matters
-// for any future caller that might.
+// listStreams returns every row in the per-target control table via
+// the shared skeleton (missing relation → "no streams", so
+// `sluice sync status` works against a target that hasn't been a CDC
+// destination yet; COALESCE on slot_name / source_dsn_fingerprint /
+// target_schema so legacy NULL rows surface as empty strings — the
+// fingerprint check (ADR-0031) treats empty as "unknown — allow" and
+// the target_schema check (Bug 46) as "operator did not pass
+// --target-schema"). The Position values set Engine to the
+// engine-specific identifier for symmetry with ReadPosition's
+// contract.
 func listStreams(ctx context.Context, db *sql.DB, schema, engineName string) ([]ir.StreamStatus, error) {
-	tableRef := quoteIdent(schema) + "." + quoteIdent(controlTableName)
-	// COALESCE on slot_name + source_dsn_fingerprint + target_schema
-	// so legacy rows that pre-date those columns (NULL values)
-	// surface as empty strings in the StreamStatus — callers branch
-	// on empty-string rather than handling sql.NullString. The
-	// fingerprint check (ADR-0031) treats empty as "unknown —
-	// allow," so legacy rows don't trip false-positive stream-id
-	// collisions; the target_schema check (Bug 46) treats empty as
-	// "operator did not pass --target-schema; use the DSN default
-	// schema."
 	q := "SELECT stream_id, source_position, updated_at, " +
 		"COALESCE(slot_name, ''), " +
 		"COALESCE(source_dsn_fingerprint, ''), " +
 		"COALESCE(target_schema, '') " +
-		"FROM " + tableRef
-	rows, err := db.QueryContext(ctx, q)
-	if err != nil {
-		// Best-effort tolerance: missing-relation = no streams.
-		// The schema reader uses the same string-match approach for
-		// PostGIS detection (see schema_reader.go).
-		if isUndefinedRelationErr(err) {
-			return []ir.StreamStatus{}, nil
-		}
-		return nil, fmt.Errorf("postgres: list streams: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-
-	out := []ir.StreamStatus{}
-	for rows.Next() {
-		var (
-			streamID     string
-			token        string
-			updated      time.Time
-			slotName     string
-			fingerprint  string
-			targetSchema string
-		)
-		if err := rows.Scan(&streamID, &token, &updated, &slotName, &fingerprint, &targetSchema); err != nil {
-			return nil, fmt.Errorf("postgres: scan streams: %w", err)
-		}
-		out = append(out, ir.StreamStatus{
-			StreamID:             streamID,
-			Position:             ir.Position{Engine: engineName, Token: token},
-			UpdatedAt:            updated,
-			SlotName:             slotName,
-			SourceDSNFingerprint: fingerprint,
-			TargetSchema:         targetSchema,
-		})
-	}
-	return out, rows.Err()
+		"FROM " + controlTableRef(schema)
+	return appliershared.ListStreams(ctx, db, controlCfg, q, engineName)
 }
 
 // writePositionTx upserts the (streamID, token, slotName) row inside
 // an open transaction. Called from the applier's per-change tx after
 // the data write; same atomicity guarantee as the MySQL counterpart.
+//
+// Deliberately NOT routed through the appliershared tier-c skeletons:
+// the upsert SQL is the ADR-0007/ADR-0010 resume contract and wholly
+// dialect (ON CONFLICT here vs row-alias ON DUPLICATE KEY on MySQL),
+// so each engine byte-owns it.
 //
 // The updated_at column is refreshed on every upsert via
 // CURRENT_TIMESTAMP — diagnostic info for operators inspecting the
@@ -536,7 +403,7 @@ func listStreams(ctx context.Context, db *sql.DB, schema, engineName string) ([]
 // without --target-schema / chain-handoff WritePosition without
 // streamer context).
 func writePositionTx(ctx context.Context, tx *sql.Tx, schema, streamID, token, slotName, sourceFingerprint, targetSchema string) error {
-	tableRef := quoteIdent(schema) + "." + quoteIdent(controlTableName)
+	tableRef := controlTableRef(schema)
 	// COALESCE on the conflict path lets a non-empty slotName /
 	// sourceFingerprint / targetSchema overwrite, while an empty value
 	// falls back to whichever value the existing row already carries —
@@ -557,55 +424,30 @@ func writePositionTx(ctx context.Context, tx *sql.Tx, schema, streamID, token, s
 }
 
 // readStopRequested returns true when the named stream's row has a
-// non-NULL stop_requested_at column. Tolerant of the table being
-// absent (returns false, nil) so dry-run / unconfigured-target paths
-// don't error.
-//
-// Returns (false, nil) when the row doesn't exist — a stop signal
-// that hasn't been recorded is, by definition, not present. The
-// Streamer's poll loop calls this every few seconds via the
-// receiver method on ChangeApplier; the lint pass can't see that
-// cross-package usage, hence the nolint.
+// non-NULL stop_requested_at column, via the shared skeleton (missing
+// relation / missing row → false, nil — a stop signal that hasn't
+// been recorded is, by definition, not present; dry-run /
+// unconfigured-target paths don't error). The Streamer's poll loop
+// calls this every few seconds via the receiver method on
+// ChangeApplier; the lint pass can't see that cross-package usage,
+// hence the nolint.
 //
 //nolint:unused // called by pipeline poll loop via ChangeApplier receiver
 func readStopRequested(ctx context.Context, db *sql.DB, schema, streamID string) (bool, error) {
-	tableRef := quoteIdent(schema) + "." + quoteIdent(controlTableName)
-	q := "SELECT stop_requested_at IS NOT NULL FROM " + tableRef + " WHERE stream_id = $1"
-	var stopRequested bool
-	err := db.QueryRowContext(ctx, q, streamID).Scan(&stopRequested)
-	switch {
-	case errors.Is(err, sql.ErrNoRows):
-		return false, nil
-	case isUndefinedRelationErr(err):
-		return false, nil
-	case err != nil:
-		return false, fmt.Errorf("postgres: read stop flag: %w", err)
-	}
-	return stopRequested, nil
+	q := "SELECT stop_requested_at IS NOT NULL FROM " + controlTableRef(schema) + " WHERE stream_id = $1"
+	return appliershared.ReadStopRequested(ctx, db, controlCfg, q, streamID)
 }
 
 // requestStop flips the stop flag on the named stream's row. Returns
 // errStreamNotFound when no row exists (the operator likely typoed
-// the stream ID; the CLI surfaces a friendly message).
-//
-// Idempotent: repeated calls land the same flag. updated_at is left
-// alone so the "age" column in `sync status` continues to reflect
-// real apply activity rather than stop-request bookkeeping.
+// the stream ID; the CLI surfaces a friendly message). Idempotent;
+// updated_at is left alone so the "age" column in `sync status`
+// continues to reflect real apply activity rather than stop-request
+// bookkeeping. The shared skeleton's matched-rows branch (a single
+// UPDATE with a zero-rows check) applies — see controlCfg.
 func requestStop(ctx context.Context, db *sql.DB, schema, streamID string) error {
-	tableRef := quoteIdent(schema) + "." + quoteIdent(controlTableName)
-	q := "UPDATE " + tableRef + " SET stop_requested_at = CURRENT_TIMESTAMP WHERE stream_id = $1"
-	res, err := db.ExecContext(ctx, q, streamID)
-	if err != nil {
-		return fmt.Errorf("postgres: request stop: %w", err)
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("postgres: request stop: rows affected: %w", err)
-	}
-	if n == 0 {
-		return fmt.Errorf("%w: %q", errStreamNotFound, streamID)
-	}
-	return nil
+	q := "UPDATE " + controlTableRef(schema) + " SET stop_requested_at = CURRENT_TIMESTAMP WHERE stream_id = $1"
+	return appliershared.RequestStop(ctx, db, controlCfg, "", q, streamID)
 }
 
 // errStreamNotFound is returned by [requestStop] (and thus
@@ -618,8 +460,10 @@ var errStreamNotFound = errors.New("postgres: stream not found")
 // the named stream. Called by [pipeline.Streamer] at startup so a
 // previous `sluice sync stop` doesn't leave a sticky stop signal
 // that immediately exits the next `sluice sync start`. Idempotent
-// and tolerant of a missing row (returns nil) — the next position-
-// write commit will populate the row.
+// and tolerant of a missing row or table (returns nil) — the next
+// position-write commit will populate the row. (EnsureControlTable
+// runs first and creates the table, but a brand-new target may have
+// an in-flight schema-apply at this point.)
 //
 // Why not clear on consumption? The polling goroutine doesn't own
 // a transaction with the applier's data writes, so a clear-on-read
@@ -627,19 +471,8 @@ var errStreamNotFound = errors.New("postgres: stream not found")
 // the flag. Clearing at startup is structurally simpler: the
 // streamer's lifecycle owns the flag's lifecycle.
 func clearStopRequested(ctx context.Context, db *sql.DB, schema, streamID string) error {
-	tableRef := quoteIdent(schema) + "." + quoteIdent(controlTableName)
-	q := "UPDATE " + tableRef + " SET stop_requested_at = NULL WHERE stream_id = $1"
-	if _, err := db.ExecContext(ctx, q, streamID); err != nil {
-		// Tolerant of the table being absent — same shape as
-		// readPosition. EnsureControlTable runs first and creates
-		// the table, but a brand-new target may have an in-flight
-		// schema-apply at this point.
-		if isUndefinedRelationErr(err) {
-			return nil
-		}
-		return fmt.Errorf("postgres: clear stop signal: %w", err)
-	}
-	return nil
+	q := "UPDATE " + controlTableRef(schema) + " SET stop_requested_at = NULL WHERE stream_id = $1"
+	return appliershared.TolerantExec(ctx, db, controlCfg, "clear stop signal", q, streamID)
 }
 
 // clearStream deletes the named stream's row from the per-target
@@ -647,13 +480,6 @@ func clearStopRequested(ctx context.Context, db *sql.DB, schema, streamID string
 // re-running `--reset-target-data` after a partial failure proceeds
 // cleanly. See [ChangeApplier.ClearStream] for the recovery flow.
 func clearStream(ctx context.Context, db *sql.DB, schema, streamID string) error {
-	tableRef := quoteIdent(schema) + "." + quoteIdent(controlTableName)
-	q := "DELETE FROM " + tableRef + " WHERE stream_id = $1"
-	if _, err := db.ExecContext(ctx, q, streamID); err != nil {
-		if isUndefinedRelationErr(err) {
-			return nil
-		}
-		return fmt.Errorf("postgres: clear stream: %w", err)
-	}
-	return nil
+	q := "DELETE FROM " + controlTableRef(schema) + " WHERE stream_id = $1"
+	return appliershared.TolerantExec(ctx, db, controlCfg, "clear stream", q, streamID)
 }
