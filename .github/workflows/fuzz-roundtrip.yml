@@ -1,0 +1,91 @@
+# Scheduled generative-fuzz run for the migrate round-trip harness.
+#
+# The in-tree fuzz harness (internal/pipeline/
+# migrate_fuzz_roundtrip_integration_test.go) runs inside the normal
+# integration suite at a tiny deterministic smoke budget (fixed seed,
+# 4 cases per direction) so every PR exercises the *harness*. That
+# fixed seed means PR CI replays the same ~16 cases forever — the
+# generator's whole point (catching the Bug-74-style next-family-over
+# defect the hand-written matrix missed) needs case DIVERSITY, which
+# is what this job adds: a weekly run at a couple hundred cases per
+# direction with a fresh seed every time (the run id), plus a
+# workflow_dispatch for pre-release deep runs.
+#
+# On failure the harness dumps each failing case as a deterministically
+# replayable fixture (seed + case index + direction reproduce the DDL
+# byte-for-byte); this job uploads those as an artifact, and the seed
+# is in the job log — so a red run here is fully reproducible locally:
+#   SLUICE_FUZZ_SEED=<seed> SLUICE_FUZZ_ITERS=<iters> \
+#     go test -tags=integration -run '^TestMigrate_FuzzRoundtrip$' ./internal/pipeline/
+#
+# Saturday 07:00 UTC: clear of the Sunday 06:00 prebake and the Sunday
+# 08:00 Vitess version matrix, so the scheduled jobs never contend for
+# runners.
+
+name: Fuzz roundtrip
+
+on:
+  schedule:
+    - cron: "0 7 * * 6"
+  workflow_dispatch:
+    inputs:
+      iters:
+        description: "Cases per direction (SLUICE_FUZZ_ITERS)"
+        required: false
+        default: "200"
+      seed:
+        description: "Master seed (SLUICE_FUZZ_SEED); empty = this run's id"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  fuzz:
+    name: Fuzz roundtrip
+    runs-on: ubuntu-latest
+    # 200 cases × 4 directions on real containers under -race needs a
+    # generous envelope; the inner go-test timeout stays below it so
+    # Go's diagnostic timeout-panic fires before a hard job kill.
+    timeout-minutes: 170
+    env:
+      TESTCONTAINERS_RYUK_DISABLED: "true"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: "go.mod"
+      - run: go mod download
+
+      # Same pre-baked images + bounded-retry pull as the main
+      # integration shards (see ci.yml for the rationale).
+      - name: Log in to ghcr.io + pre-pull pre-baked images (bounded retry)
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          bash scripts/ci-ghcr-pull.sh \
+            ghcr.io/sluicesync/sluice-mysql:8.0-prebaked \
+            ghcr.io/sluicesync/sluice-postgres:16-prebaked
+
+      - name: Run the fuzz harness (fresh seed, deep budget)
+        env:
+          # A fresh seed per scheduled run is the whole point — the
+          # run id is unique, monotonic, and recorded with the run.
+          SLUICE_FUZZ_SEED: ${{ github.event.inputs.seed || github.run_id }}
+          SLUICE_FUZZ_ITERS: ${{ github.event.inputs.iters || '200' }}
+        run: |
+          echo "fuzz: seed=$SLUICE_FUZZ_SEED iters/dir=$SLUICE_FUZZ_ITERS"
+          go test -tags=integration -race -count=1 -timeout=160m \
+            -run '^TestMigrate_FuzzRoundtrip$' ./internal/pipeline/
+
+      # Each failing case is dumped as a replayable fixture; keep them.
+      - name: Upload failure fixtures
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-failures-seed-${{ github.event.inputs.seed || github.run_id }}
+          path: internal/pipeline/testdata/fuzz-failures/
+          if-no-files-found: ignore
