@@ -286,7 +286,7 @@ func (Engine) OpenMigrationStateStore(ctx context.Context, dsn string) (ir.Migra
 	if err != nil {
 		return nil, err
 	}
-	return &MigrationStateStore{db: db}, nil
+	return newMigrationStateStore(db), nil
 }
 
 // OpenChangeApplier returns a [ChangeApplier] bound to the database

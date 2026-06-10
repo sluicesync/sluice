@@ -8,13 +8,20 @@
 // — but holds different state for a different concept.
 // `sluice_cdc_state` tracks long-running continuous-sync streams (one
 // row per stream); `sluice_migrate_state` tracks one-shot simple-mode
-// migrations (one row per --migration-id). They are deliberately kept
-// separate: streams and migrations have different lifetimes and
-// different recovery semantics, and conflating them would make ad-hoc
-// inspection of either harder.
+// migrations (one header row per --migration-id, plus one
+// `sluice_migrate_table_progress` row per table — ADR-0082). They are
+// deliberately kept separate: streams and migrations have different
+// lifetimes and different recovery semantics, and conflating them
+// would make ad-hoc inspection of either harder.
 //
 // MySQL has a flat namespace (no schema-qualification needed beyond
-// the connection's default database), so the table lives unqualified.
+// the connection's default database), so the tables live unqualified.
+//
+// The CRUD control flow lives ONCE in internal/migratestate (the
+// ADR-0081 tier-c precedent): this file owns only the dialect leaves
+// — the ensure DDL + detect-then-ALTER column migration, backtick
+// quoting, ? placeholders, and the row-alias ON DUPLICATE KEY upsert
+// syntax — and hands the finished statements to the shared skeleton.
 //
 // The store is wired into the MySQL engine via
 // [Engine.OpenMigrationStateStore], which the pipeline.Migrator
@@ -26,23 +33,74 @@ package mysql
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
-	"errors"
 	"fmt"
-	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/migratestate"
 )
 
-// migrateStateTableName is the per-target table that holds simple-
-// mode migration state. Parallel to controlTableName; the two
-// deliberately don't share a row model.
-const migrateStateTableName = "sluice_migrate_state"
+// migrateStateTableName is the per-target header table; one row per
+// --migration-id. Parallel to controlTableName; the two deliberately
+// don't share a row model.
+const migrateStateTableName = migratestate.HeaderTableName
+
+// migrateProgressTableName is the per-target per-table progress
+// table; one row per (migration_id, table_name) — ADR-0082. Excluded
+// from user-schema reads in schema_reader.go alongside the other
+// sluice_* bookkeeping tables.
+const migrateProgressTableName = migratestate.ProgressTableName
 
 // MigrationStateStore is the MySQL implementation of
 // [ir.MigrationStateStore]. One value per target connection pool.
 type MigrationStateStore struct {
-	db *sql.DB
+	db     *sql.DB
+	shared *migratestate.Store
+}
+
+// newMigrationStateStore builds the store plus its dialect SQL. The
+// statement set and the argument-order contract per statement are
+// documented on [migratestate.SQL]. Upserts use the row-alias form
+// (8.0.20+) — same form the data-write path uses for cross-applier
+// consistency.
+func newMigrationStateStore(db *sql.DB) *MigrationStateStore {
+	const hdr = "`" + migrateStateTableName + "`"
+	const prog = "`" + migrateProgressTableName + "`"
+	return &MigrationStateStore{
+		db: db,
+		shared: &migratestate.Store{
+			DB: db,
+			Config: migratestate.Config{
+				EngineName:     "mysql",
+				IsMissingTable: isMySQLMissingTableErr,
+			},
+			SQL: migratestate.SQL{
+				ReadHeader: "SELECT phase, table_progress, state_format, started_at, updated_at, last_error FROM " +
+					hdr + " WHERE migration_id = ?",
+				ReadProgressRows: "SELECT table_name, progress, updated_at FROM " +
+					prog + " WHERE migration_id = ?",
+				// started_at is deliberately excluded from the SET list
+				// so its DEFAULT CURRENT_TIMESTAMP on the original
+				// INSERT survives subsequent upserts; updated_at
+				// refreshes via the column's ON UPDATE clause.
+				UpsertHeader: "INSERT INTO " + hdr + " " +
+					"(migration_id, phase, table_progress, state_format, last_error) " +
+					"VALUES (?, ?, ?, ?, ?) AS new " +
+					"ON DUPLICATE KEY UPDATE " +
+					"phase = new.phase, " +
+					"table_progress = new.table_progress, " +
+					"state_format = new.state_format, " +
+					"last_error = new.last_error",
+				UpsertProgressRow: "INSERT INTO " + prog + " " +
+					"(migration_id, table_name, progress) " +
+					"VALUES (?, ?, ?) AS new " +
+					"ON DUPLICATE KEY UPDATE progress = new.progress",
+				MarkUpgraded: "UPDATE " + hdr +
+					" SET table_progress = ?, state_format = ? WHERE migration_id = ?",
+				DeleteHeader:       "DELETE FROM " + hdr + " WHERE migration_id = ?",
+				DeleteProgressRows: "DELETE FROM " + prog + " WHERE migration_id = ?",
+			},
+		},
+	}
 }
 
 // Close releases the underlying connection pool.
@@ -53,176 +111,110 @@ func (s *MigrationStateStore) Close() error {
 	return s.db.Close()
 }
 
-// EnsureControlTable creates the per-target sluice_migrate_state
-// table if it doesn't exist. Idempotent — safe to call on every
-// start.
+// EnsureControlTable creates the per-target migrate-state tables if
+// they don't exist, and adds the ADR-0082 state_format column to a
+// header table created by a ≤v0.99.x binary. Idempotent — safe to
+// call on every start.
 //
 // MySQL doesn't allow CREATE TABLE inside a multi-statement tx; the
 // caller runs this from the *sql.DB pool at Migrator startup, not
 // inside a per-write tx (the single-row write paths use the same
 // pool).
 //
-// No detect-then-ALTER is needed today because the table is shipped
-// in its final v1 shape; the pattern is established in control_table
-// .go for future column additions.
+// The column migration uses detect-then-ALTER (same shape as
+// ensureCrossEngineParityColumn) rather than ADD COLUMN IF NOT
+// EXISTS, which would impose an 8.0.29 floor. state_format DEFAULT 1:
+// an existing row that pre-dates the column reads back as
+// FormatLegacyBlob, which is exactly what it is — the first Read
+// upgrades it to per-table progress rows.
 func (s *MigrationStateStore) EnsureControlTable(ctx context.Context) error {
-	const ddl = `
+	const hdrDDL = `
 		CREATE TABLE IF NOT EXISTS ` + "`" + migrateStateTableName + "`" + ` (
 			migration_id    VARCHAR(255) NOT NULL,
 			phase           VARCHAR(32)  NOT NULL,
 			table_progress  TEXT         NULL,
+			state_format    INT          NOT NULL DEFAULT 1,
 			started_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			updated_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP
 				ON UPDATE CURRENT_TIMESTAMP,
 			last_error      TEXT         NULL,
 			PRIMARY KEY (migration_id)
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
-	if _, err := s.db.ExecContext(ctx, ddl); err != nil {
+	if _, err := s.db.ExecContext(ctx, hdrDDL); err != nil {
 		return fmt.Errorf("mysql: ensure migrate-state table: %w", err)
 	}
+	if err := s.ensureStateFormatColumn(ctx); err != nil {
+		return err
+	}
+	const progDDL = `
+		CREATE TABLE IF NOT EXISTS ` + "`" + migrateProgressTableName + "`" + ` (
+			migration_id    VARCHAR(255) NOT NULL,
+			table_name      VARCHAR(255) NOT NULL,
+			progress        TEXT         NOT NULL,
+			updated_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP
+				ON UPDATE CURRENT_TIMESTAMP,
+			PRIMARY KEY (migration_id, table_name)
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
+	if _, err := s.db.ExecContext(ctx, progDDL); err != nil {
+		return fmt.Errorf("mysql: ensure migrate-state progress table: %w", err)
+	}
 	return nil
 }
 
-// Read returns the row for migrationID, or ok=false when no row
-// exists. Tolerant of the table being absent (treated as "no row")
-// so dry-run / pre-EnsureControlTable inspection paths don't error.
+// ensureStateFormatColumn adds the ADR-0082 state_format column to a
+// header table created by a ≤v0.99.x binary. Detect-then-ALTER keeps
+// the migration portable to MySQL 8.0.x versions older than 8.0.29
+// (no ADD COLUMN IF NOT EXISTS), mirroring control_table.go's column
+// migrations.
+func (s *MigrationStateStore) ensureStateFormatColumn(ctx context.Context) error {
+	const checkQ = `
+		SELECT COUNT(*)
+		FROM   information_schema.COLUMNS
+		WHERE  TABLE_SCHEMA = DATABASE()
+		  AND  TABLE_NAME   = ?
+		  AND  COLUMN_NAME  = 'state_format'`
+	var n int
+	if err := s.db.QueryRowContext(ctx, checkQ, migrateStateTableName).Scan(&n); err != nil {
+		return fmt.Errorf("mysql: ensure migrate-state table: detect state_format: %w", err)
+	}
+	if n > 0 {
+		return nil
+	}
+	const alter = "ALTER TABLE `" + migrateStateTableName + "` ADD COLUMN state_format INT NOT NULL DEFAULT 1"
+	if _, err := s.db.ExecContext(ctx, alter); err != nil {
+		return fmt.Errorf("mysql: ensure migrate-state table: add state_format: %w", err)
+	}
+	return nil
+}
+
+// Read returns the merged header + per-table state for migrationID,
+// or ok=false when no row exists. Tolerant of the header table being
+// absent (treated as "no row") so dry-run / pre-EnsureControlTable
+// inspection paths don't error. A legacy single-blob row is upgraded
+// to per-table progress rows on first Read (one transaction; see
+// internal/migratestate).
 func (s *MigrationStateStore) Read(ctx context.Context, migrationID string) (ir.MigrationState, bool, error) {
-	if migrationID == "" {
-		return ir.MigrationState{}, false, errors.New("mysql: migrate-state Read: migrationID is empty")
-	}
-	const q = "SELECT migration_id, phase, table_progress, started_at, updated_at, last_error " +
-		"FROM `" + migrateStateTableName + "` WHERE migration_id = ?"
-	row := s.db.QueryRowContext(ctx, q, migrationID)
-
-	var (
-		id, phase                string
-		tableProgress, lastError sql.NullString
-		startedAt, updatedAt     time.Time
-	)
-	switch err := row.Scan(&id, &phase, &tableProgress, &startedAt, &updatedAt, &lastError); {
-	case errors.Is(err, sql.ErrNoRows):
-		return ir.MigrationState{}, false, nil
-	case isMySQLMissingTableErr(err):
-		return ir.MigrationState{}, false, nil
-	case err != nil:
-		return ir.MigrationState{}, false, fmt.Errorf("mysql: read migrate-state: %w", err)
-	}
-
-	progress, err := decodeMigrateTableProgress(tableProgress.String)
-	if err != nil {
-		return ir.MigrationState{}, false, fmt.Errorf("mysql: decode table_progress: %w", err)
-	}
-	return ir.MigrationState{
-		MigrationID:   id,
-		Phase:         ir.MigrationPhase(phase),
-		TableProgress: progress,
-		StartedAt:     startedAt,
-		UpdatedAt:     updatedAt,
-		LastError:     lastError.String,
-	}, true, nil
+	return s.shared.Read(ctx, migrationID)
 }
 
-// Write upserts the migration-state row. updated_at is refreshed to
-// CURRENT_TIMESTAMP via the ON UPDATE clause; started_at is set on
-// first insert and preserved on subsequent upserts because we don't
-// list it in the ON DUPLICATE KEY UPDATE clause.
+// Write upserts the header row plus any per-table entries present in
+// state.TableProgress (never deleting absent ones). The hot
+// per-checkpoint path is [MigrationStateStore.WriteTableProgress].
 func (s *MigrationStateStore) Write(ctx context.Context, state ir.MigrationState) error {
-	if state.MigrationID == "" {
-		return errors.New("mysql: migrate-state Write: MigrationID is empty")
-	}
-	if state.Phase == "" {
-		return errors.New("mysql: migrate-state Write: Phase is empty")
-	}
-	progressJSON, err := encodeMigrateTableProgress(state.TableProgress)
-	if err != nil {
-		return fmt.Errorf("mysql: encode table_progress: %w", err)
-	}
-
-	// Row-alias UPSERT (8.0.20+) — same form the data-write path
-	// uses for cross-applier consistency. started_at is deliberately
-	// excluded from the SET list so its DEFAULT CURRENT_TIMESTAMP on
-	// the original INSERT survives subsequent upserts.
-	const q = "INSERT INTO `" + migrateStateTableName + "` " +
-		"(migration_id, phase, table_progress, last_error) " +
-		"VALUES (?, ?, ?, ?) AS new " +
-		"ON DUPLICATE KEY UPDATE " +
-		"phase = new.phase, " +
-		"table_progress = new.table_progress, " +
-		"last_error = new.last_error"
-	args := []any{
-		state.MigrationID,
-		string(state.Phase),
-		nullableMigrateString(progressJSON),
-		nullableMigrateString(state.LastError),
-	}
-	if _, err := s.db.ExecContext(ctx, q, args...); err != nil {
-		return fmt.Errorf("mysql: write migrate-state: %w", err)
-	}
-	return nil
+	return s.shared.Write(ctx, state)
 }
 
-// ClearMigration deletes the row for migrationID. Used by the
-// `--reset-target-data` recovery path (ADR-0023). Idempotent and
-// tolerant of a missing row or a missing table — the next run with
-// `--reset-target-data` proceeds cleanly either way.
+// WriteTableProgress upserts one table's progress row — the O(1)
+// per-checkpoint write (ADR-0082).
+func (s *MigrationStateStore) WriteTableProgress(ctx context.Context, migrationID, tableName string, progress ir.TableProgress) error {
+	return s.shared.WriteTableProgress(ctx, migrationID, tableName, progress)
+}
+
+// ClearMigration deletes the progress rows and header row for
+// migrationID. Used by the `--reset-target-data` recovery path
+// (ADR-0023). Idempotent and tolerant of missing rows or missing
+// tables — the next run with `--reset-target-data` proceeds cleanly
+// either way.
 func (s *MigrationStateStore) ClearMigration(ctx context.Context, migrationID string) error {
-	if migrationID == "" {
-		return errors.New("mysql: migrate-state ClearMigration: migrationID is empty")
-	}
-	const q = "DELETE FROM `" + migrateStateTableName + "` WHERE migration_id = ?"
-	if _, err := s.db.ExecContext(ctx, q, migrationID); err != nil {
-		if isMySQLMissingTableErr(err) {
-			return nil
-		}
-		return fmt.Errorf("mysql: clear migrate-state: %w", err)
-	}
-	return nil
-}
-
-// nullableMigrateString returns a sql.NullString that's invalid when
-// s is empty. Empty values land as SQL NULL on disk so a fresh row
-// with no per-table progress reads back as nil rather than `{}`.
-//
-// Suffix is `Migrate` rather than the bare name to avoid colliding
-// with any future helper of the same shape elsewhere in the engine
-// package.
-func nullableMigrateString(s string) sql.NullString {
-	if s == "" {
-		return sql.NullString{}
-	}
-	return sql.NullString{String: s, Valid: true}
-}
-
-// encodeMigrateTableProgress serialises the per-table state map to
-// JSON. An empty or nil map returns "" — store as SQL NULL — so a
-// freshly-inserted state row before any table starts isn't littered
-// with `{}` literals. Per-entry encoding is delegated to
-// [ir.TableProgress.MarshalJSON]; see internal/ir/migration_state.go
-// for the bare-string-vs-object choice.
-func encodeMigrateTableProgress(m map[string]ir.TableProgress) (string, error) {
-	if len(m) == 0 {
-		return "", nil
-	}
-	b, err := json.Marshal(m)
-	if err != nil {
-		return "", err
-	}
-	return string(b), nil
-}
-
-// decodeMigrateTableProgress is the inverse of
-// encodeMigrateTableProgress. An empty input returns nil so callers
-// can use the zero map shape without a special case. Per-entry
-// decoding is delegated to [ir.TableProgress.UnmarshalJSON] which
-// accepts both the v0.3.0 bare-string form and the v0.4.0 cursor-
-// bearing object form.
-func decodeMigrateTableProgress(s string) (map[string]ir.TableProgress, error) {
-	if s == "" {
-		return nil, nil
-	}
-	out := map[string]ir.TableProgress{}
-	if err := json.Unmarshal([]byte(s), &out); err != nil {
-		return nil, err
-	}
-	return out, nil
+	return s.shared.ClearMigration(ctx, migrationID)
 }

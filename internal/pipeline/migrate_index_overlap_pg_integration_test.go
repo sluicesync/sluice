@@ -324,13 +324,14 @@ func waitForSomeIndexedThenCancel(t *testing.T, dsn, migrationID string, cancel 
 	deadline := time.Now().Add(25 * time.Second)
 	for time.Now().Before(deadline) {
 		var n int
-		// The table_progress JSON carries "indexes_built":true for a fully
-		// indexed table; count state rows whose JSON contains it. The
-		// control table may not exist yet on the very first polls — ignore
-		// the error and retry.
+		// A fully indexed table's progress JSON carries
+		// "indexes_built":true; count its per-table rows (ADR-0082:
+		// progress lives in sluice_migrate_table_progress, one row per
+		// table). The control table may not exist yet on the very first
+		// polls — ignore the error and retry.
 		err := db.QueryRow(
-			`SELECT COUNT(*) FROM sluice_migrate_state
-			   WHERE migration_id = $1 AND table_progress::text LIKE '%"indexes_built":true%'`,
+			`SELECT COUNT(*) FROM sluice_migrate_table_progress
+			   WHERE migration_id = $1 AND progress LIKE '%"indexes_built":true%'`,
 			migrationID,
 		).Scan(&n)
 		if err == nil && n >= 1 {

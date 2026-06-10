@@ -14,18 +14,25 @@ import (
 )
 
 // fakeStateStore is an in-memory ir.MigrationStateStore for unit
-// testing the resume orchestration. It records every Read / Write
-// call and lets tests pre-seed a state row to simulate prior runs.
+// testing the resume orchestration. It records every Read / Write /
+// WriteTableProgress call and lets tests pre-seed a state row to
+// simulate prior runs.
 //
 // The errors-on-write hook lets tests exercise the "state-write
-// failure joined with primary error" branch.
+// failure joined with primary error" branch (it gates both write
+// surfaces).
 type fakeStateStore struct {
-	mu       sync.Mutex
-	rows     map[string]ir.MigrationState
-	reads    int
-	writes   int
-	writeErr error
-	closed   bool
+	mu          sync.Mutex
+	rows        map[string]ir.MigrationState
+	reads       int
+	writes      int
+	tableWrites int
+	// progressInWrites counts Write calls that carried a non-empty
+	// TableProgress map — the ADR-0082 pins assert phase-transition
+	// writes are header-only (this stays 0).
+	progressInWrites int
+	writeErr         error
+	closed           bool
 }
 
 func newFakeStateStore() *fakeStateStore {
@@ -49,16 +56,59 @@ func (f *fakeStateStore) Write(_ context.Context, s ir.MigrationState) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.writes++
+	if len(s.TableProgress) > 0 {
+		f.progressInWrites++
+	}
 	if f.writeErr != nil {
 		return f.writeErr
 	}
-	// Preserve started_at across upserts the way the real
-	// implementations do — first write captures it, later writes
-	// keep the original.
-	if existing, ok := f.rows[s.MigrationID]; ok && !existing.StartedAt.IsZero() {
-		s.StartedAt = existing.StartedAt
+	if existing, ok := f.rows[s.MigrationID]; ok {
+		// Preserve started_at across upserts the way the real
+		// implementations do — first write captures it, later writes
+		// keep the original.
+		if !existing.StartedAt.IsZero() {
+			s.StartedAt = existing.StartedAt
+		}
+		// Merge per-table entries the way the real implementations do
+		// (ADR-0082): Write upserts the entries it carries and never
+		// deletes absent ones, so a header-only Write keeps the
+		// progress rows landed via WriteTableProgress.
+		if len(existing.TableProgress) > 0 {
+			merged := make(map[string]ir.TableProgress, len(existing.TableProgress)+len(s.TableProgress))
+			for k, v := range existing.TableProgress {
+				merged[k] = v
+			}
+			for k, v := range s.TableProgress {
+				merged[k] = v
+			}
+			s.TableProgress = merged
+		}
 	}
 	f.rows[s.MigrationID] = s
+	return nil
+}
+
+func (f *fakeStateStore) WriteTableProgress(_ context.Context, id, tableName string, p ir.TableProgress) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.tableWrites++
+	if f.writeErr != nil {
+		return f.writeErr
+	}
+	row := f.rows[id]
+	if row.MigrationID == "" {
+		row.MigrationID = id
+	}
+	// Clone the map before mutating: Read hands callers the stored
+	// map by reference, so an in-place set here could alias a map a
+	// test (or the orchestrator) is concurrently reading.
+	merged := make(map[string]ir.TableProgress, len(row.TableProgress)+1)
+	for k, v := range row.TableProgress {
+		merged[k] = v
+	}
+	merged[tableName] = p
+	row.TableProgress = merged
+	f.rows[id] = row
 	return nil
 }
 
@@ -119,6 +169,78 @@ func TestMigrationStateRoundTrip(t *testing.T) {
 	}
 	if got.TableProgress["orders"].RowsCopied != 42 {
 		t.Errorf("TableProgress[orders].RowsCopied = %d; want 42", got.TableProgress["orders"].RowsCopied)
+	}
+}
+
+// TestSetTableProgressAndWrite_UsesPerTableWrite pins the ADR-0082
+// hot-path shape: a per-table breadcrumb goes through the store's
+// O(1) WriteTableProgress (one progress-row upsert), never through
+// the whole-state Write.
+func TestSetTableProgressAndWrite_UsesPerTableWrite(t *testing.T) {
+	store := newFakeStateStore()
+	rc := resumeContext{store: store, migrationID: "m1", enabled: true}
+	state := &ir.MigrationState{
+		MigrationID:   "m1",
+		Phase:         ir.MigrationPhaseBulkCopy,
+		TableProgress: map[string]ir.TableProgress{},
+	}
+	var stateMu sync.Mutex
+
+	entry := ir.TableProgress{State: ir.TableProgressInProgress, LastPK: []any{int64(99)}, RowsCopied: 99}
+	setTableProgressAndWrite(context.Background(), rc, state, &stateMu, "orders", entry)
+
+	if store.tableWrites != 1 {
+		t.Errorf("tableWrites = %d; want 1", store.tableWrites)
+	}
+	if store.writes != 0 {
+		t.Errorf("writes = %d; want 0 (breadcrumbs must not re-write the whole state)", store.writes)
+	}
+	if got, _ := store.get("m1"); got.TableProgress["orders"].RowsCopied != 99 {
+		t.Errorf("persisted entry = %+v; want rows_copied 99", got.TableProgress["orders"])
+	}
+	if state.TableProgress["orders"].RowsCopied != 99 {
+		t.Errorf("in-memory entry = %+v; want rows_copied 99", state.TableProgress["orders"])
+	}
+}
+
+// TestPhaseMarksAreHeaderOnly pins the other half of ADR-0082: phase
+// transitions and failure marks write the header WITHOUT shipping the
+// TableProgress map (which Write would re-upsert row by row — O(N)
+// per transition at the 10k-table scale) — and the store's
+// never-delete-absent-entries contract keeps previously persisted
+// progress intact across them.
+func TestPhaseMarksAreHeaderOnly(t *testing.T) {
+	store := newFakeStateStore()
+	rc := resumeContext{store: store, migrationID: "m1", enabled: true}
+	state := &ir.MigrationState{
+		MigrationID: "m1",
+		Phase:       ir.MigrationPhaseBulkCopy,
+		TableProgress: map[string]ir.TableProgress{
+			"users": {State: ir.TableProgressComplete},
+		},
+	}
+	// Seed the persisted progress the way the hot path does.
+	if err := writeTableProgress(context.Background(), rc, "users", state.TableProgress["users"]); err != nil {
+		t.Fatalf("writeTableProgress: %v", err)
+	}
+
+	if err := markPhase(context.Background(), rc, state, ir.MigrationPhaseIndexes); err != nil {
+		t.Fatalf("markPhase: %v", err)
+	}
+	markComplete(context.Background(), rc, *state)
+	var stateMu sync.Mutex
+	_ = markFailedLocked(context.Background(), rc, state, &stateMu, ir.MigrationPhaseIndexes, errors.New("boom"))
+
+	if store.progressInWrites != 0 {
+		t.Errorf("progressInWrites = %d; want 0 (phase marks must be header-only)", store.progressInWrites)
+	}
+	got, _ := store.get("m1")
+	if got.TableProgress["users"].State != ir.TableProgressComplete {
+		t.Errorf("persisted progress lost across header writes: %+v", got.TableProgress)
+	}
+	// The in-memory map must survive the header-only stripping.
+	if state.TableProgress["users"].State != ir.TableProgressComplete {
+		t.Errorf("in-memory progress mutated: %+v", state.TableProgress)
 	}
 }
 

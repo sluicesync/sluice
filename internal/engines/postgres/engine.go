@@ -427,7 +427,7 @@ func (Engine) OpenMigrationStateStore(ctx context.Context, dsn string) (ir.Migra
 	if err != nil {
 		return nil, err
 	}
-	return &MigrationStateStore{db: db, schema: cfg.schema}, nil
+	return newMigrationStateStore(db, cfg.schema), nil
 }
 
 // OpenChangeApplier returns a [ChangeApplier] bound to the database

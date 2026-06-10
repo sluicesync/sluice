@@ -162,6 +162,12 @@ ADRs are numbered in the order they were proposed. A few notable conventions:
 |---|---|
 | [0081](adr-0081-applier-control-plane-extraction.md) | Accepted — repo-audit M2.2: extract the engines' mirrored applier control plane into `internal/appliershared` behind a flat config-of-closures dialect seam (`BatchConfig`, exprident.Config precedent). The audit measured the two `change_applier_batch.go` files ≥85 % identical with 16/19 commits forced to touch both (the item-18 latency fix landed twice). Tier (b) — the batched-apply loop (accumulation, AIMD consult/observe, idle-grace timer, byte cap, ADR-0007/0010 position-write-then-commit ordering) — now lives ONCE in `RunBatchLoop`/`RunOneBatch`; engines fill the divergent leaves (engine name, `TransactionalDDL` flag for MySQL's implicit-commit DDL vs PG's in-tx schema events, F7 BeginTx, slot-ack AfterCommit, cache-after-commit hook). SQL builders, value codecs, classifiers stay engine-side. All item-18 timing pins + idempotency pins passed unchanged. Tiers: (a) helpers PR #170 + (b) batch loop DONE; (c) control-table CRUD + (d) lease/keyset/heartbeat OPEN. |
 
+## Per-table migration-state rows (0082)
+
+| ADR | Decision |
+|---|---|
+| [0082](adr-0082-per-table-migration-state-rows.md) | Accepted — repo-audit M2.3: make migrate-state checkpoint writes O(1) in table count. The ≤v0.99.x store re-encoded the WHOLE `map[table]TableProgress` blob into the one hot `sluice_migrate_state` row on every breadcrumb/per-5000-row cursor/chunk checkpoint — O(N²) over a 10k-table migration (~856 KB × ≥20k writes ≈ 17 GB through one row's MVCC/TOAST). Now: a header row (phase, `state_format`, timestamps) + one `sluice_migrate_table_progress` row per table; hot paths use the new `ir.MigrationStateStore.WriteTableProgress` (one upsert; measured 84× faster wall, ~12,770× less payload per checkpoint on real PG). Store logic lands ONCE in `internal/migratestate` (ADR-0081 tier-c dialect-seam precedent); engines are thin SQL shims. Legacy blobs upgrade once, transactionally, on first Read (crash-safe: commit-whole or re-run; orphan-clearing delete-first); the old blob is overwritten with a deliberately-invalid-JSON sentinel so a downgraded binary fails LOUDLY instead of silently re-copying (one-way state compat, as at v0.4.0). Cross-version pin ×2 engines against a byte-captured v0.99.x blob covering every TableProgress family × shape. |
+
 ## Notes / dialogue prep / readiness briefs
 
 Some ADRs were drafted from dialogue artifacts in `docs/dev/notes/`. Notable companions:

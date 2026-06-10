@@ -6,6 +6,11 @@ Accepted. Implemented in v0.3.0 (`internal/pipeline/resume.go`,
 `internal/engines/postgres/migration_state.go`,
 `internal/engines/mysql/migration_state.go`).
 
+Storage shape evolved by ADR-0082: the single-row `table_progress`
+JSON blob became a header row + one `sluice_migrate_table_progress`
+row per table (O(1) checkpoint writes; legacy rows upgrade on first
+Read). The resume semantics this ADR defines are unchanged.
+
 ## Context
 
 Before this work, a `sluice migrate` run that failed partway through —

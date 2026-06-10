@@ -1962,22 +1962,37 @@ type TableChunkProgress struct {
 	State TableProgressState
 }
 
-// MigrationState is one row in the per-target sluice_migrate_state
-// table. Returned by [MigrationStateStore.Read] and accepted by
+// MigrationState is the in-memory view of one migration's persisted
+// state. Returned by [MigrationStateStore.Read] and accepted by
 // [MigrationStateStore.Write].
 //
-// Wire shape on disk (engine-neutral):
+// Wire shape on disk (engine-neutral, ADR-0082): a HEADER row in
+// sluice_migrate_state plus one PROGRESS row per table in
+// sluice_migrate_table_progress:
 //
+//	-- sluice_migrate_state (header; one row per migration)
 //	migration_id    TEXT PRIMARY KEY
 //	phase           TEXT NOT NULL
-//	table_progress  TEXT          -- JSON map[string]TableProgress
+//	table_progress  TEXT          -- ≤v0.99.x: JSON map blob (state_format 1);
+//	                              -- now: a deliberately-invalid-JSON sentinel
+//	state_format    INT NOT NULL DEFAULT 1
 //	started_at      TIMESTAMP NOT NULL
 //	updated_at      TIMESTAMP NOT NULL
 //	last_error      TEXT          -- truncated to 1KB on write
 //
-// In-memory we de/serialize the JSON map into a Go map for convenient
-// per-table updates. nil TableProgress is fine — first-run writes
-// before any table starts use an empty map.
+//	-- sluice_migrate_table_progress (one row per table)
+//	migration_id    TEXT NOT NULL
+//	table_name      TEXT NOT NULL
+//	progress        TEXT NOT NULL -- one TableProgress JSON value
+//	updated_at      TIMESTAMP NOT NULL
+//	PRIMARY KEY (migration_id, table_name)
+//
+// Read merges the two back into the Go map; UpdatedAt carries the
+// most recent of the header's and the progress rows' timestamps. A
+// legacy single-blob row (state_format 1) is upgraded to per-table
+// rows once, on first Read — see internal/migratestate. nil
+// TableProgress is fine — first-run writes before any table starts
+// use an empty map.
 type MigrationState struct {
 	MigrationID   string
 	Phase         MigrationPhase
@@ -1996,10 +2011,14 @@ type MigrationState struct {
 // Lifecycle:
 //
 //   - Migrator.Run calls EnsureControlTable once at startup.
-//   - Read decides whether to start fresh, resume, or refuse.
-//   - Write is called at every phase transition (one-row UPDATE) and
-//     after each per-table bulk-copy boundary (table_progress JSON
-//     refresh).
+//   - Read decides whether to start fresh, resume, or refuse — and
+//     performs the one-time legacy-blob → per-table-rows upgrade
+//     (ADR-0082) when it finds a ≤v0.99.x row.
+//   - Write is called at every phase transition (a header-only
+//     upsert).
+//   - WriteTableProgress is called at every per-table bulk-copy
+//     boundary and per-batch resume checkpoint (one progress-row
+//     upsert — O(1) in table count).
 //
 // Engines that don't support resumable migrations (none today) can
 // simply not implement [MigrationStateStoreOpener]; the orchestrator
@@ -2016,12 +2035,24 @@ type MigrationStateStore interface {
 	// found, decide resume vs refuse based on Phase".
 	Read(ctx context.Context, migrationID string) (MigrationState, bool, error)
 
-	// Write upserts the row. The store implementation is responsible
-	// for setting updated_at to the current wall-clock time and for
-	// preserving started_at across updates (only the first Write for
-	// a given migration_id sets it). LastError is stored verbatim;
+	// Write upserts the header row plus any per-table entries present
+	// in state.TableProgress. It never deletes progress rows absent
+	// from the map — entries only accrue over a migration's life, so
+	// a header-only Write (nil map; the phase-transition shape)
+	// leaves previously-persisted per-table progress untouched. The
+	// store sets updated_at to the current wall-clock time and
+	// preserves started_at across updates (only the first Write for a
+	// given migration_id sets it). LastError is stored verbatim;
 	// callers should truncate before passing.
 	Write(ctx context.Context, state MigrationState) error
+
+	// WriteTableProgress upserts ONE table's progress row without
+	// touching the header or any peer table's row — the O(1)
+	// per-checkpoint write (ADR-0082). Callers must have called Read
+	// or Write for migrationID first (the pipeline's loadOrInitState
+	// guarantees it): Read performs the legacy-row upgrade that makes
+	// per-table rows the authoritative progress source.
+	WriteTableProgress(ctx context.Context, migrationID, tableName string, progress TableProgress) error
 
 	// ClearMigration deletes the row for migrationID. Used by the
 	// `--reset-target-data` recovery path (ADR-0023) before the dest

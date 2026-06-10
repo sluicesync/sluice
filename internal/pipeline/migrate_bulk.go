@@ -381,13 +381,14 @@ func copyTableWithCursor(
 
 		entry.LastPK = cursor
 		entry.RowsCopied = rowsCopied
-		// Clone-and-write under the lock (ADR-0076): peer tables in the
-		// cross-table pool write distinct keys of this map concurrently.
+		// Set under the lock (ADR-0076): peer tables in the cross-table
+		// pool write distinct keys of this map concurrently. The
+		// persisted write is this table's progress row only (ADR-0082).
 		stateMu.Lock()
 		state.TableProgress[table.Name] = entry
-		stateCopy := cloneStateForWrite(state)
+		entryCopy := cloneTableProgressForWrite(entry)
 		stateMu.Unlock()
-		if err := writeState(ctx, rc, stateCopy); err != nil {
+		if err := writeTableProgress(ctx, rc, table.Name, entryCopy); err != nil {
 			// Best-effort; log and continue. The replay window
 			// tolerated by the idempotent INSERT will catch any rows
 			// that re-deliver on the next attempt.
