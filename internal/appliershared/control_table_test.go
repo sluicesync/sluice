@@ -536,3 +536,98 @@ func TestListShardLeases_ScanAndTolerance(t *testing.T) {
 		}
 	})
 }
+
+// TestShardLeaseRow_ToIR pins the Null-shape → HasX-bool conversion
+// (ADR-0081 tier d; previously byte-identical in both engines'
+// lease wrapper files). The load-bearing rule is the anchor
+// conjunction: BOTH AnchorPosition and AnchorEngine must be non-NULL
+// for HasAnchor — a half-populated row is treated as anchor-absent so
+// the v0.76.0 lease GC sweep defensively retains it. The matrix
+// covers each nullable field × {valid, NULL} and all four anchor
+// presence combinations.
+func TestShardLeaseRow_ToIR(t *testing.T) {
+	expires := time.Date(2026, 6, 10, 12, 0, 0, 0, time.UTC)
+	applied := time.Date(2026, 6, 10, 12, 5, 0, 0, time.UTC)
+
+	base := ShardLeaseRow{
+		TargetTableFullName:  "db.t1",
+		LeaseHolderStreamID:  "stream-a",
+		DDLText:              "ALTER …",
+		DDLChecksum:          "abc123",
+		AppliedSchemaVersion: 7,
+	}
+	wantBase := ir.ShardConsolidationLeaseRow{
+		TargetTableFullName:  "db.t1",
+		LeaseHolderStreamID:  "stream-a",
+		DDLText:              "ALTER …",
+		DDLChecksum:          "abc123",
+		AppliedSchemaVersion: 7,
+	}
+
+	cases := []struct {
+		name   string
+		mutate func(r *ShardLeaseRow)
+		want   func(w *ir.ShardConsolidationLeaseRow)
+	}{
+		{
+			name:   "all nullables NULL",
+			mutate: func(*ShardLeaseRow) {},
+			want:   func(*ir.ShardConsolidationLeaseRow) {},
+		},
+		{
+			name: "lease_expires_at set",
+			mutate: func(r *ShardLeaseRow) {
+				r.LeaseExpiresAt = sql.NullTime{Time: expires, Valid: true}
+			},
+			want: func(w *ir.ShardConsolidationLeaseRow) {
+				w.LeaseExpiresAt = expires
+				w.HasLeaseExpiresAt = true
+			},
+		},
+		{
+			name: "applied_at set",
+			mutate: func(r *ShardLeaseRow) {
+				r.AppliedAt = sql.NullTime{Time: applied, Valid: true}
+			},
+			want: func(w *ir.ShardConsolidationLeaseRow) {
+				w.AppliedAt = applied
+				w.HasAppliedAt = true
+			},
+		},
+		{
+			name: "anchor fully populated",
+			mutate: func(r *ShardLeaseRow) {
+				r.AnchorPosition = sql.NullString{String: "pos-1", Valid: true}
+				r.AnchorEngine = sql.NullString{String: "mysql", Valid: true}
+			},
+			want: func(w *ir.ShardConsolidationLeaseRow) {
+				w.AnchorPosition = ir.Position{Engine: "mysql", Token: "pos-1"}
+				w.HasAnchor = true
+			},
+		},
+		{
+			name: "anchor position without engine is absent",
+			mutate: func(r *ShardLeaseRow) {
+				r.AnchorPosition = sql.NullString{String: "pos-1", Valid: true}
+			},
+			want: func(*ir.ShardConsolidationLeaseRow) {},
+		},
+		{
+			name: "anchor engine without position is absent",
+			mutate: func(r *ShardLeaseRow) {
+				r.AnchorEngine = sql.NullString{String: "postgres", Valid: true}
+			},
+			want: func(*ir.ShardConsolidationLeaseRow) {},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			row, want := base, wantBase
+			tc.mutate(&row)
+			tc.want(&want)
+			if got := row.ToIR(); got != want {
+				t.Fatalf("ToIR() = %+v; want %+v", got, want)
+			}
+		})
+	}
+}
