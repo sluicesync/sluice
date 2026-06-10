@@ -214,6 +214,47 @@ comparison is speed + coverage, not correctness.
    rate toward pgcopydb's. A single auditable value-fidelity gate guarantees the lane is
    taken only when there is provably no transform to skip.
 
+## RAM-resident: the software-limited gap (disk ceiling removed)
+
+The 110 GB runs above are **disk-bound** (~100–122 MB/s), so they measure the
+storage more than the software past a point. To see where the *software* gap
+actually sits post-ADR-0077/0078, we re-ran the same harness on a RAM-resident
+corpus (2026-06-10, sluice main @ v0.99.33-tag commit): both `postgres:16`
+containers with `PGDATA` on tmpfs (13 GB caps, 31 GB Docker VM), an 8.9 GB
+total / 7.0 GB heap mixed corpus (3×4M-row huge + 40×375k medium, same
+generators), median of 5 defaults runs + targeted variants, every run zero-loss
+checksummed.
+
+| Configuration | wall (s) | aggregate heap MB/s |
+|---|---|---|
+| **pgcopydb defaults** (`--table-jobs 4`) | **40–41** | **~175** |
+| pgcopydb `--table-jobs 8` | 44 | ~160 (4 already saturates) |
+| sluice defaults (4 tables × 8 chunks = 32 streams) | 62–65 | ~110 |
+| sluice `--table-parallelism=8 --bulk-parallelism=1` (8 single streams, **best**) | 53–56 | ~130 |
+| sluice 8 × 2 | 56 | ~127 |
+| sluice `--bulk-parallelism=1` (4 single streams) | 80 | ~88 |
+| sluice `--raw-copy-format=binary` (4×8) | 62 | text ≈ binary |
+
+What the matrix says:
+
+1. **Defaults-vs-defaults the RAM gap is 1.63×; best-vs-best it is 1.33×** —
+   the disk was hiding roughly a third of the measured 1.42× at 110 GB and
+   compressing the rest.
+2. **Stream *shape* is a real lever in RAM, and sluice's default is disk-tuned.**
+   Eight single-table streams beat thirty-two chunk-streams (53 s vs 62 s): the
+   per-chunk session setup + budget contention that pays for itself against
+   disk latency is overhead at RAM speed. The knobs already exist; the default
+   stays disk-tuned because real targets have disks.
+3. **The remaining frontier is per-stream rate, not format and not structure.**
+   Binary COPY moved nothing (server-side parse isn't the cost), and pgcopydb
+   saturates with *four* streams where sluice needs eight to reach a lower
+   aggregate — i.e. pgcopydb's per-stream pipe is still roughly 2× leaner even
+   against sluice's raw passthrough lane (confirmed engaged via debug logs,
+   `raw_copy=true` on every chunk). The suspects are the Go-side plumbing of
+   the byte pipe (`io.Pipe` copy + goroutine handoff between `CopyTo` and
+   `CopyFrom`, per-chunk connection setup) vs pgcopydb's direct libpq splice —
+   profiling that path on a RAM run is the next parity item.
+
 ## Where pgcopydb is strictly better
 
 - **Per-stream COPY throughput** (~2.5×, above). The binary-protocol path is lean.
