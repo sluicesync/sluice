@@ -92,6 +92,16 @@ func TestStreamer_PostgresToPostgres_StopRestartNoLoss(t *testing.T) {
 
 	const streamID = "bug15-stop-restart"
 
+	// Phase-A instrumentation for the recurring resume-stall flake
+	// (CI run 27266012795: after warm resume, dst sat at EXACTLY the
+	// pre-stop count for the full 120s window — zero CDC applied —
+	// then a rerun passed). Under the shard's non-verbose `go test`,
+	// the streamer's slog output is unrecoverable post-mortem (the
+	// failed run's log contained ZERO lines for this stream id), so
+	// capture it at DEBUG and dump it only on failure. The discarded
+	// resume-Run error below gets the same treatment.
+	logs := captureSlog(t)
+
 	// ---- Phase 1: cold-start with batched apply ----
 	streamer := &Streamer{
 		Source:         pgEng,
@@ -198,6 +208,8 @@ func TestStreamer_PostgresToPostgres_StopRestartNoLoss(t *testing.T) {
 	// the applier never reported those LSNs as applied.
 
 	// ---- Phase 4: warm resume ----
+	t.Logf("phase 4: resuming; src=%d dst=%d at resume start",
+		readSrcRowCount(t, sourceDSN, "bug15"), pollRowCount(targetDSN, "bug15"))
 	resumeStreamer := &Streamer{
 		Source:         pgEng,
 		Target:         pgEng,
@@ -235,11 +247,39 @@ func TestStreamer_PostgresToPostgres_StopRestartNoLoss(t *testing.T) {
 	// load-bearing assertion (no gaps, MAX(id)==COUNT(*)) is unchanged; this
 	// only widens the catch-up window so a slow-but-correct drain isn't a
 	// false failure.
-	if !waitForRowCount(t, targetDSN, "bug15", threshold, 120*time.Second) {
+	// The wait watches resumeErr concurrently: if the resume Run
+	// returns EARLY (slot still active, retries exhausted, …) the old
+	// shape sat blind in the row-count poll for the full window and
+	// then DISCARDED the error (`<-resumeErr` without capturing) — the
+	// stall's diagnosis was thrown away on every occurrence. Now an
+	// early return fails immediately with the actual error, and the
+	// timeout path dumps the error + the captured streamer log.
+	catchupDeadline := time.Now().Add(120 * time.Second)
+	caughtUp := false
+	for time.Now().Before(catchupDeadline) {
+		if pollRowCount(targetDSN, "bug15") >= threshold {
+			caughtUp = true
+			break
+		}
+		select {
+		case err := <-resumeErr:
+			t.Logf("captured streamer log:\n%s", logs.String())
+			t.Fatalf("resume Streamer.Run returned EARLY during catch-up (src=%d, dst=%d, threshold=%d): %v",
+				srcCount, pollRowCount(targetDSN, "bug15"), threshold, err)
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+	if !caughtUp {
 		resumeCancel()
-		<-resumeErr
-		t.Fatalf("after resume, dst rows did not catch up to threshold (src=%d, dst=%d, threshold=%d)",
-			srcCount, pollRowCount(targetDSN, "bug15"), threshold)
+		var runResult error
+		select {
+		case runResult = <-resumeErr:
+		case <-time.After(15 * time.Second):
+			runResult = fmt.Errorf("(resume Run did not return within 15s of cancel)")
+		}
+		t.Logf("captured streamer log:\n%s", logs.String())
+		t.Fatalf("after resume, dst rows did not catch up to threshold (src=%d, dst=%d, threshold=%d); resume Run returned: %v",
+			srcCount, pollRowCount(targetDSN, "bug15"), threshold, runResult)
 	}
 
 	// ---- Phase 5: assert no gaps ----
