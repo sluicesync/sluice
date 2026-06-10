@@ -15,6 +15,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -915,4 +916,65 @@ func drainChanges(
 		}
 	}
 	return got
+}
+
+// TestCDCReader_SlotActiveRetry_LiveOwnerStillRefuses pins both
+// branches of startReplicationWithSlotActiveRetry: against a slot held
+// by a LIVE owner, the second reader (a) visibly retries (the
+// transient prior-owner-not-reaped branch fires — the bug15 /
+// ADR-0046-recovery race class) and (b) ultimately surfaces the
+// original loud SQLSTATE 55006 refusal — the two-concurrent-writers
+// guard must survive the retry budget. The self-heal branch (owner
+// releases mid-retry) is exercised end-to-end by the bug15
+// stop/restart test, which now races the resume directly against the
+// release with no grace sleep.
+func TestCDCReader_SlotActiveRetry_LiveOwnerStillRefuses(t *testing.T) {
+	dsn, cleanup := startPostgresForCDC(t)
+	defer cleanup()
+
+	applyPGSQL(t, dsn, `CREATE TABLE retrypin (id BIGSERIAL PRIMARY KEY, v TEXT);`)
+
+	eng := Engine{}
+
+	// Owner A: open and START a stream — it holds the slot live.
+	ctxA, cancelA := context.WithCancel(context.Background())
+	defer cancelA()
+	rdrA, err := eng.OpenCDCReader(ctxA, dsn)
+	if err != nil {
+		t.Fatalf("OpenCDCReader A: %v", err)
+	}
+	defer func() {
+		if c, ok := rdrA.(interface{ Close() error }); ok {
+			_ = c.Close()
+		}
+	}()
+	if _, err := rdrA.StreamChanges(ctxA, ir.Position{}); err != nil {
+		t.Fatalf("StreamChanges A: %v", err)
+	}
+
+	// Contender B against the same slot, with a ctx window long enough
+	// for >=2 retry attempts (0.5s+1s backoffs) but far short of the
+	// full budget — B must be RETRYING (not failing fast) and then
+	// stop with either ctx.Err or the loud 55006, never a success.
+	logs := captureSlog(t)
+	ctxB, cancelB := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancelB()
+	rdrB, err := eng.OpenCDCReader(ctxB, dsn)
+	if err != nil {
+		t.Fatalf("OpenCDCReader B: %v", err)
+	}
+	defer func() {
+		if c, ok := rdrB.(interface{ Close() error }); ok {
+			_ = c.Close()
+		}
+	}()
+	if _, err = rdrB.StreamChanges(ctxB, ir.Position{}); err == nil {
+		t.Fatal("second stream on a live-held slot succeeded; the two-writers guard is gone")
+	}
+	if !strings.Contains(logs.String(), "slot is active") {
+		t.Errorf("expected the slot-active retry branch to fire (log line missing); err=%v\nlogs:\n%s", err, logs.String())
+	}
+	if !strings.Contains(err.Error(), "55006") && !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("want the original 55006 refusal or ctx deadline from the bounded wait; got: %v", err)
+	}
 }
