@@ -6,6 +6,8 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.99.33] - 2026-06-10
+
 ### Fixed
 - **Single-manifest (full-only) cross-engine restores now run the same
   unsupportability gate as chain restores (Bug 134).** v0.99.32 fixed the
@@ -22,6 +24,25 @@ project follows [Semantic Versioning](https://semver.org/).
   even one incremental made the same restore refuse loudly, so chains were
   covered). Pinned across all three MySQL-family targets plus the PG→PG and
   clean-schema controls, with a revert-test proving the pin catches the bug.
+
+### Internal
+- **The applier batch loop now lives once (ADR-0081, extraction tier b).**
+  Both engines' ~500-line mirrored AIMD/flush/idle-grace state machines
+  collapsed into one shared loop in `internal/appliershared` behind a
+  closure seam; the measured 69 divergent lines reduce to five named
+  config fields. Behavior-identical — the item-18 timing pins and the
+  ADR-0010 idempotency pin passed unchanged on both engines. The next
+  batch-loop fix lands in one file instead of two.
+
+### CI
+- Weekly Postgres version matrix (`pg-version-matrix.yml`): the postgres
+  engine integration suite now runs against stock `postgres:17`, `:18`,
+  and a `:latest` canary (PG19-beta drift signal) on a Saturday schedule +
+  dispatch — PR CI stays on the prebaked PG16. Enabled by a
+  `SLUICE_TEST_PG_IMAGE` override on the shared test container.
+- `funlen`/`gocyclo` hold-the-line lint ceilings (210 lines / complexity
+  60, ratchet-down note in the config) so the orchestrator mega-function
+  class can't regrow silently.
 
 ## [0.99.32] - 2026-06-10
 
