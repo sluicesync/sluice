@@ -58,7 +58,36 @@ linters:
     - gocritic      # opinionated but useful idiomatic suggestions
     - prealloc      # suggest slice preallocation when length is known
 
+    # ---- Hold-the-line (2026-06-10, repo-audit M2.6 follow-up) ----
+    # The orchestrator mega-functions (runOnce at 718 lines, coldStart
+    # at 509, runSingleDatabase at 527) grew by accretion because
+    # nothing stopped them; after carving them into named phase
+    # methods, these two make regrowth a CI failure instead of a
+    # review judgment call. Thresholds are deliberately GENEROUS —
+    # far above anything the refactored code hits — so a trip means
+    # "carve a phase out", not "fight the linter". Test files are
+    # excluded (table-driven tests are legitimately long).
+    - funlen        # function length ceiling
+    - gocyclo       # cyclomatic-complexity ceiling
+
   settings:
+    # Ceilings sit just above TODAY's high-water marks (funlen: 202 =
+    # postgres populateColumns; gocyclo: 58 = BackupStream.Run in the
+    # still-unsplit stream.go) so they land with zero nolint debt while
+    # still failing the next 700-line/complexity-95 accretion (what
+    # runOnce was before the M2.6 carve). RATCHET DOWN as the remaining
+    # large functions get split — target 150/30 once stream.go has had
+    # its pass; never raise these to admit new code.
+    funlen:
+      lines: 210
+      # Count lines only; a statement ceiling double-charges dense
+      # table literals without adding signal on top of `lines`.
+      statements: -1
+      ignore-comments: true
+
+    gocyclo:
+      min-complexity: 60
+
     errcheck:
       # Don't require checking errors from these functions. Adjust as
       # needed when patterns emerge.
@@ -110,6 +139,14 @@ linters:
         - rangeValCopy     # noisy on small structs
 
   exclusions:
+    rules:
+      # Length/complexity ceilings don't apply to tests: table-driven
+      # test functions and integration scenarios are legitimately long,
+      # and carving them up would hurt readability, not help it.
+      - path: _test\.go
+        linters:
+          - funlen
+          - gocyclo
     # Don't lint generated or fixture code.
     paths:
       - test/golden
