@@ -24,15 +24,16 @@
 // mid-table re-enters each chunk at its last cursor without
 // re-copying completed chunks.
 //
-// Concurrency safety: the per-table state-row write happens from
+// Concurrency safety: the per-table progress write happens from
 // inside each chunk's goroutine via a small mutex guarding the
 // table_progress map. The orchestrator's per-table loop is
-// sequential, so no two parallel-copy phases write to the same
-// state row at the same time. Within a phase, peer chunk goroutines
-// take the mutex to mutate their own slot on Chunks, then deep-copy
-// the state via [cloneStateForWrite] before releasing the lock so
-// the JSON-encoding [writeState] call no longer shares the map and
-// slice backing storage with concurrent mutators.
+// sequential, so no two parallel-copy phases write the same table's
+// progress at the same time. Within a phase, peer chunk goroutines
+// take the mutex to mutate their own slot on Chunks, then copy the
+// table's entry via [cloneTableProgressForWrite] before releasing
+// the lock so the JSON-encoding [writeTableProgress] call (one
+// progress-row upsert — ADR-0082) no longer shares the Chunks
+// backing storage with concurrent mutators.
 //
 // Snapshot consistency: the cold-start (`sluice migrate`) path does
 // not currently capture a source-side snapshot — each parallel reader
@@ -322,11 +323,11 @@ func tryParallelCopyTable(
 
 	// All chunks complete: record terminal state. The bare-string
 	// "complete" wins on the next read; the verbose chunked entry is
-	// no longer load-bearing. Persist via setTableProgressAndWrite so the
-	// state is cloned UNDER stateMu before writeState JSON-encodes it —
-	// peer tables in the cross-table pool mutate the shared map
-	// concurrently (ADR-0076); a raw writeState(*state) here would race
-	// their writes during encoding.
+	// no longer load-bearing. Persist via setTableProgressAndWrite so
+	// the in-memory map mutation happens UNDER stateMu — peer tables
+	// in the cross-table pool mutate the shared map concurrently
+	// (ADR-0076) — and only this table's progress row is upserted
+	// (ADR-0082).
 	setTableProgressAndWrite(ctx, rc, state, stateMu, table.Name,
 		ir.TableProgress{State: ir.TableProgressComplete})
 	return true, nil
@@ -387,10 +388,10 @@ func resolveChunks(
 	entry.LastPK = nil
 	entry.RowsCopied = 0
 	entry.Chunks = chunks
-	// Clone-under-lock persist (ADR-0076): writeState JSON-encodes the
-	// TableProgress map that peer tables mutate concurrently, so the set +
-	// deep-clone must happen under stateMu (setTableProgressAndWrite does
-	// exactly that, then writes the clone).
+	// Set-under-lock persist (ADR-0076): peer tables mutate the shared
+	// TableProgress map concurrently, so the set + entry clone must
+	// happen under stateMu (setTableProgressAndWrite does exactly that,
+	// then upserts this table's progress row — ADR-0082).
 	setTableProgressAndWrite(ctx, rc, state, stateMu, table.Name, entry)
 	return chunks, nil
 }
@@ -783,7 +784,12 @@ func copyChunk(
 		cursor = newCursor
 		rowsCopied += batchCount
 
-		// Chunk-level checkpoint write.
+		// Chunk-level checkpoint write — one progress-row upsert for
+		// THIS table (ADR-0082). Clone the entry under the lock:
+		// writeTableProgress's JSON encoding walks the entry's Chunks
+		// slice, whose backing array peer chunk goroutines mutate
+		// under the lock — a shallow entry copy would race the
+		// encoder reading outside it.
 		stateMu.Lock()
 		tp = state.TableProgress[table.Name]
 		if chunkIndex < len(tp.Chunks) {
@@ -791,16 +797,9 @@ func copyChunk(
 			tp.Chunks[chunkIndex].RowsCopied = rowsCopied
 			state.TableProgress[table.Name] = tp
 		}
-		// Deep-clone the state under the lock: writeState's JSON
-		// encoding iterates TableProgress (a map shared with peer
-		// chunk goroutines) and walks each entry's Chunks slice. A
-		// shallow copy of *state would leave both pointing at the
-		// same map and slice backing arrays, so peer goroutines
-		// taking the lock to mutate their own chunk slot would race
-		// the JSON encoder reading outside the lock.
-		stateCopy := cloneStateForWrite(state)
+		entryCopy := cloneTableProgressForWrite(tp)
 		stateMu.Unlock()
-		if err := writeState(ctx, rc, stateCopy); err != nil {
+		if err := writeTableProgress(ctx, rc, table.Name, entryCopy); err != nil {
 			slog.WarnContext(ctx, "migration: chunk cursor checkpoint write failed; continuing",
 				slog.String("table", table.Name),
 				slog.Int("chunk", chunkIndex),
@@ -821,9 +820,9 @@ func copyChunk(
 		tp.Chunks[chunkIndex].State = ir.TableProgressComplete
 		state.TableProgress[table.Name] = tp
 	}
-	stateCopy := cloneStateForWrite(state)
+	entryCopy := cloneTableProgressForWrite(tp)
 	stateMu.Unlock()
-	if err := writeState(ctx, rc, stateCopy); err != nil {
+	if err := writeTableProgress(ctx, rc, table.Name, entryCopy); err != nil {
 		slog.WarnContext(ctx, "migration: chunk completion state write failed; continuing",
 			slog.String("table", table.Name),
 			slog.Int("chunk", chunkIndex),
@@ -1037,9 +1036,9 @@ func copyChunkFast(
 	finalRows := atomic.LoadInt64(&rowCount)
 
 	// Single terminal per-chunk checkpoint (ADR-0043 design point b):
-	// RowsCopied + State=Complete in one writeState. No LastPK is
-	// recorded — the chunk is atomically "done" or (on crash) "never
-	// started", never mid-cursor.
+	// RowsCopied + State=Complete in one writeTableProgress. No LastPK
+	// is recorded — the chunk is atomically "done" or (on crash)
+	// "never started", never mid-cursor.
 	stateMu.Lock()
 	tp := state.TableProgress[table.Name]
 	if chunkIndex < len(tp.Chunks) {
@@ -1047,9 +1046,9 @@ func copyChunkFast(
 		tp.Chunks[chunkIndex].State = ir.TableProgressComplete
 		state.TableProgress[table.Name] = tp
 	}
-	stateCopy := cloneStateForWrite(state)
+	entryCopy := cloneTableProgressForWrite(tp)
 	stateMu.Unlock()
-	if err := writeState(ctx, rc, stateCopy); err != nil {
+	if err := writeTableProgress(ctx, rc, table.Name, entryCopy); err != nil {
 		slog.WarnContext(ctx, "migration: fast-loader chunk completion state write failed; continuing",
 			slog.String("table", table.Name),
 			slog.Int("chunk", chunkIndex),
@@ -1144,9 +1143,9 @@ func copyChunkRaw(
 		tp.Chunks[chunkIndex].State = ir.TableProgressComplete
 		state.TableProgress[table.Name] = tp
 	}
-	stateCopy := cloneStateForWrite(state)
+	entryCopy := cloneTableProgressForWrite(tp)
 	stateMu.Unlock()
-	if err := writeState(ctx, rc, stateCopy); err != nil {
+	if err := writeTableProgress(ctx, rc, table.Name, entryCopy); err != nil {
 		slog.WarnContext(ctx, "migration: raw-copy chunk completion state write failed; continuing",
 			slog.String("table", table.Name),
 			slog.Int("chunk", chunkIndex),
@@ -1173,35 +1172,31 @@ func firstPKBound(pk []any) any {
 	return pk[0]
 }
 
-// cloneStateForWrite returns a deep enough copy of state to be safe
-// to read concurrently with peer chunk goroutines mutating the
-// original under stateMu. Specifically: the TableProgress map is
-// re-allocated, and each entry's Chunks slice is re-allocated so the
+// cloneTableProgressForWrite returns a deep enough copy of one
+// table's progress entry to be safe to JSON-encode concurrently with
+// peer chunk goroutines mutating the original under stateMu.
+// Specifically: the entry's Chunks slice is re-allocated so the
 // encoder no longer shares slice backing storage with the chunk
-// goroutines that write into [TableChunkProgress] slots under the
-// lock.
+// goroutines that write into [ir.TableChunkProgress] slots under the
+// lock. This is the per-entry successor of the pre-ADR-0082
+// cloneStateForWrite (which had to re-allocate the WHOLE map because
+// the store re-encoded the whole map per checkpoint — O(N) clone +
+// encode at the 10k-table scale; the per-table store made the entry
+// the unit of persistence).
 //
-// Other reference-typed fields on the entry (LastPK on the table-
-// level entry, LowerPK/UpperPK/LastPK on each chunk) are not cloned:
-// boundaries are written once during resolveChunks and per-chunk
-// LastPK is replaced wholesale (not mutated in place) on every
-// checkpoint, so swapping the slice header under the lock is enough
-// to keep the encoder's view stable.
-func cloneStateForWrite(state *ir.MigrationState) ir.MigrationState {
-	cp := *state
-	if state.TableProgress != nil {
-		clone := make(map[string]ir.TableProgress, len(state.TableProgress))
-		for k, v := range state.TableProgress {
-			if len(v.Chunks) > 0 {
-				chunks := make([]ir.TableChunkProgress, len(v.Chunks))
-				copy(chunks, v.Chunks)
-				v.Chunks = chunks
-			}
-			clone[k] = v
-		}
-		cp.TableProgress = clone
+// Other reference-typed fields (the table-level LastPK,
+// LowerPK/UpperPK/LastPK on each chunk) are not cloned: boundaries
+// are written once during resolveChunks and per-chunk LastPK is
+// replaced wholesale (not mutated in place) on every checkpoint, so
+// swapping the slice header under the lock is enough to keep the
+// encoder's view stable.
+func cloneTableProgressForWrite(p ir.TableProgress) ir.TableProgress {
+	if len(p.Chunks) > 0 {
+		chunks := make([]ir.TableChunkProgress, len(p.Chunks))
+		copy(chunks, p.Chunks)
+		p.Chunks = chunks
 	}
-	return cp
+	return p
 }
 
 // filterByUpperBound wraps a row channel with a goroutine that drops

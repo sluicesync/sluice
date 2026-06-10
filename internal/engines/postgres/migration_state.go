@@ -8,10 +8,17 @@
 // deployments — but holds different state for a different concept.
 // `sluice_cdc_state` tracks long-running continuous-sync streams (one
 // row per stream); `sluice_migrate_state` tracks one-shot simple-mode
-// migrations (one row per --migration-id). They are deliberately kept
-// separate: streams and migrations have different lifetimes and
-// different recovery semantics, and conflating them would make ad-hoc
-// inspection of either harder.
+// migrations (one header row per --migration-id, plus one
+// `sluice_migrate_table_progress` row per table — ADR-0082). They are
+// deliberately kept separate: streams and migrations have different
+// lifetimes and different recovery semantics, and conflating them
+// would make ad-hoc inspection of either harder.
+//
+// The CRUD control flow lives ONCE in internal/migratestate (the
+// ADR-0081 tier-c precedent): this file owns only the dialect leaves
+// — the ensure DDL + column migration, the schema-qualified
+// identifier quoting, $n placeholders, and ON CONFLICT upsert syntax
+// — and hands the finished statements to the shared skeleton.
 //
 // The store is wired into the Postgres engine via
 // [Engine.OpenMigrationStateStore], which the pipeline.Migrator
@@ -23,25 +30,80 @@ package postgres
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
-	"errors"
 	"fmt"
-	"time"
 
 	"sluicesync.dev/sluice/internal/ir"
+	"sluicesync.dev/sluice/internal/migratestate"
 )
 
-// migrateStateTableName is the per-target table that holds simple-
-// mode migration state. Parallel to controlTableName; the two
-// deliberately don't share a row model.
-const migrateStateTableName = "sluice_migrate_state"
+// migrateStateTableName is the per-target header table; one row per
+// --migration-id. Parallel to controlTableName; the two deliberately
+// don't share a row model.
+const migrateStateTableName = migratestate.HeaderTableName
+
+// migrateProgressTableName is the per-target per-table progress
+// table; one row per (migration_id, table_name) — ADR-0082. Excluded
+// from user-schema reads in schema_reader.go alongside the other
+// sluice_* bookkeeping tables.
+const migrateProgressTableName = migratestate.ProgressTableName
 
 // MigrationStateStore is the Postgres implementation of
 // [ir.MigrationStateStore]. One value per target connection pool;
-// safe to call concurrently from a single Migrator.Run.
+// safe to call concurrently from a single Migrator.Run (the
+// cross-table pool's per-table checkpoint writers hit distinct
+// progress rows).
 type MigrationStateStore struct {
 	db     *sql.DB
 	schema string
+	shared *migratestate.Store
+}
+
+// newMigrationStateStore builds the store plus its dialect SQL. The
+// statement set and the argument-order contract per statement are
+// documented on [migratestate.SQL].
+func newMigrationStateStore(db *sql.DB, schema string) *MigrationStateStore {
+	hdr := quoteIdent(schema) + "." + quoteIdent(migrateStateTableName)
+	prog := quoteIdent(schema) + "." + quoteIdent(migrateProgressTableName)
+	return &MigrationStateStore{
+		db:     db,
+		schema: schema,
+		shared: &migratestate.Store{
+			DB: db,
+			Config: migratestate.Config{
+				EngineName:     "postgres",
+				IsMissingTable: isUndefinedRelationErr,
+			},
+			SQL: migratestate.SQL{
+				ReadHeader: "SELECT phase, table_progress, state_format, started_at, updated_at, last_error FROM " +
+					hdr + " WHERE migration_id = $1",
+				ReadProgressRows: "SELECT table_name, progress, updated_at FROM " +
+					prog + " WHERE migration_id = $1",
+				// started_at: set from the column default on first
+				// insert, preserved on conflict by simply not being in
+				// the SET list — the "set once" semantics resume runs
+				// rely on.
+				UpsertHeader: "INSERT INTO " + hdr + " " +
+					"(migration_id, phase, table_progress, state_format, started_at, updated_at, last_error) " +
+					"VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, $5) " +
+					"ON CONFLICT (migration_id) DO UPDATE SET " +
+					"phase = EXCLUDED.phase, " +
+					"table_progress = EXCLUDED.table_progress, " +
+					"state_format = EXCLUDED.state_format, " +
+					"updated_at = CURRENT_TIMESTAMP, " +
+					"last_error = EXCLUDED.last_error",
+				UpsertProgressRow: "INSERT INTO " + prog + " " +
+					"(migration_id, table_name, progress, updated_at) " +
+					"VALUES ($1, $2, $3, CURRENT_TIMESTAMP) " +
+					"ON CONFLICT (migration_id, table_name) DO UPDATE SET " +
+					"progress = EXCLUDED.progress, " +
+					"updated_at = CURRENT_TIMESTAMP",
+				MarkUpgraded: "UPDATE " + hdr +
+					" SET table_progress = $1, state_format = $2 WHERE migration_id = $3",
+				DeleteHeader:       "DELETE FROM " + hdr + " WHERE migration_id = $1",
+				DeleteProgressRows: "DELETE FROM " + prog + " WHERE migration_id = $1",
+			},
+		},
+	}
 }
 
 // Close releases the underlying connection pool.
@@ -52,175 +114,78 @@ func (s *MigrationStateStore) Close() error {
 	return s.db.Close()
 }
 
-// EnsureControlTable creates the per-target sluice_migrate_state
-// table in the configured schema if it doesn't exist. Idempotent —
-// safe to call on every start.
+// EnsureControlTable creates the per-target migrate-state tables in
+// the configured schema if they don't exist, and adds the ADR-0082
+// state_format column to a header table created by a ≤v0.99.x
+// binary. Idempotent — safe to call on every start.
 //
-// The ADD COLUMN IF NOT EXISTS calls beneath the CREATE TABLE provide
-// a forward-compatibility hook for any future column we add: a v0.3
-// deployment with an older table shape picks up the new columns on
-// the next Migrator.Run. v1 has no such columns yet, but the pattern
-// is established here for parity with control_table.go's
-// stop_requested_at migration.
+// state_format DEFAULT 1: an existing row that pre-dates the column
+// reads back as FormatLegacyBlob, which is exactly what it is — the
+// first Read upgrades it to per-table progress rows.
 func (s *MigrationStateStore) EnsureControlTable(ctx context.Context) error {
-	tableRef := quoteIdent(s.schema) + "." + quoteIdent(migrateStateTableName)
-	ddl := `
-		CREATE TABLE IF NOT EXISTS ` + tableRef + ` (
+	hdr := quoteIdent(s.schema) + "." + quoteIdent(migrateStateTableName)
+	prog := quoteIdent(s.schema) + "." + quoteIdent(migrateProgressTableName)
+	hdrDDL := `
+		CREATE TABLE IF NOT EXISTS ` + hdr + ` (
 			migration_id    VARCHAR(255) NOT NULL,
 			phase           VARCHAR(32)  NOT NULL,
 			table_progress  TEXT         NULL,
+			state_format    INT          NOT NULL DEFAULT 1,
 			started_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			updated_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			last_error      TEXT         NULL,
 			PRIMARY KEY (migration_id)
 		)`
-	if _, err := s.db.ExecContext(ctx, ddl); err != nil {
+	if _, err := s.db.ExecContext(ctx, hdrDDL); err != nil {
 		return fmt.Errorf("postgres: ensure migrate-state table: %w", err)
 	}
+	addFormat := "ALTER TABLE " + hdr +
+		" ADD COLUMN IF NOT EXISTS state_format INT NOT NULL DEFAULT 1"
+	if _, err := s.db.ExecContext(ctx, addFormat); err != nil {
+		return fmt.Errorf("postgres: ensure migrate-state table: add state_format: %w", err)
+	}
+	progDDL := `
+		CREATE TABLE IF NOT EXISTS ` + prog + ` (
+			migration_id    VARCHAR(255) NOT NULL,
+			table_name      VARCHAR(255) NOT NULL,
+			progress        TEXT         NOT NULL,
+			updated_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			PRIMARY KEY (migration_id, table_name)
+		)`
+	if _, err := s.db.ExecContext(ctx, progDDL); err != nil {
+		return fmt.Errorf("postgres: ensure migrate-state progress table: %w", err)
+	}
 	return nil
 }
 
-// Read returns the row for migrationID, or ok=false when no row
-// exists. Tolerant of the table being absent (treated as "no row")
-// so dry-run / pre-EnsureControlTable inspection paths don't error.
+// Read returns the merged header + per-table state for migrationID,
+// or ok=false when no row exists. Tolerant of the header table being
+// absent (treated as "no row") so dry-run / pre-EnsureControlTable
+// inspection paths don't error. A legacy single-blob row is upgraded
+// to per-table progress rows on first Read (one transaction; see
+// internal/migratestate).
 func (s *MigrationStateStore) Read(ctx context.Context, migrationID string) (ir.MigrationState, bool, error) {
-	if migrationID == "" {
-		return ir.MigrationState{}, false, errors.New("postgres: migrate-state Read: migrationID is empty")
-	}
-	tableRef := quoteIdent(s.schema) + "." + quoteIdent(migrateStateTableName)
-	q := "SELECT migration_id, phase, table_progress, started_at, updated_at, last_error FROM " +
-		tableRef + " WHERE migration_id = $1"
-	row := s.db.QueryRowContext(ctx, q, migrationID)
-
-	var (
-		id, phase                string
-		tableProgress, lastError sql.NullString
-		startedAt, updatedAt     time.Time
-	)
-	switch err := row.Scan(&id, &phase, &tableProgress, &startedAt, &updatedAt, &lastError); {
-	case errors.Is(err, sql.ErrNoRows):
-		return ir.MigrationState{}, false, nil
-	case isUndefinedRelationErr(err):
-		return ir.MigrationState{}, false, nil
-	case err != nil:
-		return ir.MigrationState{}, false, fmt.Errorf("postgres: read migrate-state: %w", err)
-	}
-
-	progress, err := decodeTableProgress(tableProgress.String)
-	if err != nil {
-		return ir.MigrationState{}, false, fmt.Errorf("postgres: decode table_progress: %w", err)
-	}
-	return ir.MigrationState{
-		MigrationID:   id,
-		Phase:         ir.MigrationPhase(phase),
-		TableProgress: progress,
-		StartedAt:     startedAt,
-		UpdatedAt:     updatedAt,
-		LastError:     lastError.String,
-	}, true, nil
+	return s.shared.Read(ctx, migrationID)
 }
 
-// Write upserts the migration-state row. updated_at is refreshed to
-// CURRENT_TIMESTAMP on every call; started_at is set on first insert
-// and preserved on subsequent upserts via the COALESCE-on-conflict
-// trick so resume runs don't overwrite the original start time.
+// Write upserts the header row plus any per-table entries present in
+// state.TableProgress (never deleting absent ones). The hot
+// per-checkpoint path is [MigrationStateStore.WriteTableProgress].
 func (s *MigrationStateStore) Write(ctx context.Context, state ir.MigrationState) error {
-	if state.MigrationID == "" {
-		return errors.New("postgres: migrate-state Write: MigrationID is empty")
-	}
-	if state.Phase == "" {
-		return errors.New("postgres: migrate-state Write: Phase is empty")
-	}
-	progressJSON, err := encodeTableProgress(state.TableProgress)
-	if err != nil {
-		return fmt.Errorf("postgres: encode table_progress: %w", err)
-	}
-
-	tableRef := quoteIdent(s.schema) + "." + quoteIdent(migrateStateTableName)
-	// COALESCE on started_at: keep the existing value when the row
-	// already exists; populate from EXCLUDED on first insert. The
-	// EXCLUDED-side default is CURRENT_TIMESTAMP via the column
-	// default, which fires on insert but not on update — exactly the
-	// "set once" semantics we want.
-	q := "INSERT INTO " + tableRef + " " +
-		"(migration_id, phase, table_progress, started_at, updated_at, last_error) " +
-		"VALUES ($1, $2, $3, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, $4) " +
-		"ON CONFLICT (migration_id) DO UPDATE SET " +
-		"phase = EXCLUDED.phase, " +
-		"table_progress = EXCLUDED.table_progress, " +
-		"updated_at = CURRENT_TIMESTAMP, " +
-		"last_error = EXCLUDED.last_error"
-	args := []any{
-		state.MigrationID,
-		string(state.Phase),
-		nullableString(progressJSON),
-		nullableString(state.LastError),
-	}
-	if _, err := s.db.ExecContext(ctx, q, args...); err != nil {
-		return fmt.Errorf("postgres: write migrate-state: %w", err)
-	}
-	return nil
+	return s.shared.Write(ctx, state)
 }
 
-// ClearMigration deletes the row for migrationID. Used by the
-// `--reset-target-data` recovery path (ADR-0023). Idempotent and
-// tolerant of a missing row or a missing table — the next run with
-// `--reset-target-data` proceeds cleanly either way.
+// WriteTableProgress upserts one table's progress row — the O(1)
+// per-checkpoint write (ADR-0082).
+func (s *MigrationStateStore) WriteTableProgress(ctx context.Context, migrationID, tableName string, progress ir.TableProgress) error {
+	return s.shared.WriteTableProgress(ctx, migrationID, tableName, progress)
+}
+
+// ClearMigration deletes the progress rows and header row for
+// migrationID. Used by the `--reset-target-data` recovery path
+// (ADR-0023). Idempotent and tolerant of missing rows or missing
+// tables — the next run with `--reset-target-data` proceeds cleanly
+// either way.
 func (s *MigrationStateStore) ClearMigration(ctx context.Context, migrationID string) error {
-	if migrationID == "" {
-		return errors.New("postgres: migrate-state ClearMigration: migrationID is empty")
-	}
-	tableRef := quoteIdent(s.schema) + "." + quoteIdent(migrateStateTableName)
-	q := "DELETE FROM " + tableRef + " WHERE migration_id = $1"
-	if _, err := s.db.ExecContext(ctx, q, migrationID); err != nil {
-		if isUndefinedRelationErr(err) {
-			return nil
-		}
-		return fmt.Errorf("postgres: clear migrate-state: %w", err)
-	}
-	return nil
-}
-
-// nullableString returns a sql.NullString that's invalid when s is
-// empty. Centralises the "empty string maps to SQL NULL" convention
-// so encodeTableProgress's empty-map = nil JSON stays distinct from
-// "no entries yet" on disk.
-func nullableString(s string) sql.NullString {
-	if s == "" {
-		return sql.NullString{}
-	}
-	return sql.NullString{String: s, Valid: true}
-}
-
-// encodeTableProgress serialises the per-table state map to JSON.
-// An empty or nil map returns "" — store as SQL NULL — so a freshly-
-// inserted state row before any table starts isn't littered with
-// `{}` literals. The per-entry encoding is delegated to
-// [ir.TableProgress.MarshalJSON]; see internal/ir/migration_state.go
-// for the bare-string-vs-object choice.
-func encodeTableProgress(m map[string]ir.TableProgress) (string, error) {
-	if len(m) == 0 {
-		return "", nil
-	}
-	b, err := json.Marshal(m)
-	if err != nil {
-		return "", err
-	}
-	return string(b), nil
-}
-
-// decodeTableProgress is the inverse of encodeTableProgress. An empty
-// input returns nil so callers can use the zero map shape without a
-// special case. Per-entry decoding is delegated to
-// [ir.TableProgress.UnmarshalJSON] which accepts both the v0.3.0 bare-
-// string form and the v0.4.0 cursor-bearing object form.
-func decodeTableProgress(s string) (map[string]ir.TableProgress, error) {
-	if s == "" {
-		return nil, nil
-	}
-	out := map[string]ir.TableProgress{}
-	if err := json.Unmarshal([]byte(s), &out); err != nil {
-		return nil, err
-	}
-	return out, nil
+	return s.shared.ClearMigration(ctx, migrationID)
 }

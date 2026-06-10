@@ -160,12 +160,14 @@ func runOverlappedCopyAndIndexPhase(
 }
 
 // markTableIndexesBuilt flips one table's IndexesBuilt flag to true and
-// persists the state, taking stateMu and cloning under the lock before the
+// persists THAT table's progress row, taking stateMu for the in-memory
+// map mutation and cloning the entry under the lock before the
 // JSON-encoding write (ADR-0076 / ADR-0077 resume-under-concurrency
-// discipline). It preserves the table's existing State (complete) and
-// other fields; only IndexesBuilt changes. A write error is logged at WARN
-// and swallowed — the index build itself is the load-bearing work, the
-// breadcrumb is best-effort, mirroring setTableProgressAndWrite.
+// discipline; per-table persistence per ADR-0082). It preserves the
+// table's existing State (complete) and other fields; only IndexesBuilt
+// changes. A write error is logged at WARN and swallowed — the index
+// build itself is the load-bearing work, the breadcrumb is best-effort,
+// mirroring setTableProgressAndWrite.
 func markTableIndexesBuilt(
 	ctx context.Context,
 	rc resumeContext,
@@ -177,9 +179,9 @@ func markTableIndexesBuilt(
 	entry := state.TableProgress[tableName]
 	entry.IndexesBuilt = true
 	state.TableProgress[tableName] = entry
-	stateCopy := cloneStateForWrite(state)
+	entryCopy := cloneTableProgressForWrite(entry)
 	stateMu.Unlock()
-	if err := writeState(ctx, rc, stateCopy); err != nil {
+	if err := writeTableProgress(ctx, rc, tableName, entryCopy); err != nil {
 		warnStateWriteFailed(ctx, tableName, err)
 	}
 	slog.DebugContext(ctx, "migration: table indexes built",

@@ -9,12 +9,14 @@
 // the failure left off, skips what's already done, and only redoes
 // what's actually needed.
 //
-// State is persisted in a per-target `sluice_migrate_state` table —
-// parallel to (but deliberately separate from) the streamer's
-// `sluice_cdc_state` — keyed by --migration-id. The pipeline writes
-// the state row at every phase transition and at every per-table
-// bulk-copy boundary; on restart with --resume it reads the row and
-// branches:
+// State is persisted per target — parallel to (but deliberately
+// separate from) the streamer's `sluice_cdc_state` — keyed by
+// --migration-id: a header row in `sluice_migrate_state` (phase,
+// timestamps, last error) plus one `sluice_migrate_table_progress`
+// row per table (ADR-0082). The pipeline writes the header at every
+// phase transition and the touched table's progress row at every
+// per-table bulk-copy boundary; on restart with --resume it reads
+// the merged state and branches:
 //
 //   - phase `tables` → re-run CreateTablesWithoutConstraints
 //     (idempotent via CREATE TABLE IF NOT EXISTS).
@@ -282,6 +284,35 @@ func writeState(ctx context.Context, rc resumeContext, state ir.MigrationState) 
 	return nil
 }
 
+// writeTableProgress persists ONE table's progress entry via the
+// store's per-row upsert (ADR-0082) — the O(1) hot-path counterpart
+// of writeState. Per-table breadcrumbs, per-batch resume cursors, and
+// per-chunk checkpoints all land through here so a 10k-table schema
+// never re-encodes the whole progress map per checkpoint. Same nil-
+// store no-op contract as writeState.
+func writeTableProgress(ctx context.Context, rc resumeContext, tableName string, entry ir.TableProgress) error {
+	if !rc.enabled {
+		return nil
+	}
+	if err := rc.store.WriteTableProgress(ctx, rc.migrationID, tableName, entry); err != nil {
+		return fmt.Errorf("pipeline: write table progress: %w", err)
+	}
+	return nil
+}
+
+// headerOnly strips the TableProgress map off a state value before a
+// phase-transition / failure-mark Write. Per-table progress is
+// already persisted incrementally by writeTableProgress, and
+// [ir.MigrationStateStore.Write] never deletes absent entries — so
+// shipping the map again would re-upsert every row (O(N) per phase
+// transition at the ADR-0076 10k-table scale) for no information
+// gain. The caller keeps its in-memory map; only the written copy is
+// stripped.
+func headerOnly(state ir.MigrationState) ir.MigrationState {
+	state.TableProgress = nil
+	return state
+}
+
 // markPhase updates the persisted state to the given phase, clears
 // last_error (we only get here on phase entry/success), and emits a
 // log line. Errors from the state write are returned but logged so
@@ -290,7 +321,7 @@ func writeState(ctx context.Context, rc resumeContext, state ir.MigrationState) 
 func markPhase(ctx context.Context, rc resumeContext, state *ir.MigrationState, phase ir.MigrationPhase) error {
 	state.Phase = phase
 	state.LastError = ""
-	if err := writeState(ctx, rc, *state); err != nil {
+	if err := writeState(ctx, rc, headerOnly(*state)); err != nil {
 		// Non-fatal in production: the migration's data work is the
 		// load-bearing thing. Surface as warn rather than swallowing
 		// silently — operators inspecting the state table see the
@@ -322,7 +353,7 @@ func markFailed(ctx context.Context, rc resumeContext, state ir.MigrationState, 
 	}
 	state.Phase = phase
 	state.LastError = truncateLastError(err.Error())
-	if writeErr := rc.store.Write(ctx, state); writeErr != nil {
+	if writeErr := rc.store.Write(ctx, headerOnly(state)); writeErr != nil {
 		slog.WarnContext(
 			ctx, "migration: state write on failure also failed; joining",
 			slog.String("phase", string(phase)),
@@ -345,7 +376,7 @@ func markComplete(ctx context.Context, rc resumeContext, state ir.MigrationState
 	}
 	state.Phase = ir.MigrationPhaseComplete
 	state.LastError = ""
-	if err := rc.store.Write(ctx, state); err != nil {
+	if err := rc.store.Write(ctx, headerOnly(state)); err != nil {
 		slog.WarnContext(
 			ctx, "migration: failed to mark complete; data is safe but state row is stale",
 			slog.String("migration_id", state.MigrationID),

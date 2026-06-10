@@ -9,6 +9,11 @@ Accepted. Implemented in `internal/pipeline/migrate_bulk.go`,
 `cmd/sluice/cli.go` (`--bulk-batch-size`); programmatic surface on
 `pipeline.Migrator.BulkBatchSize`.
 
+Storage shape evolved by ADR-0082: each per-batch cursor checkpoint
+now upserts ONE `sluice_migrate_table_progress` row instead of
+re-encoding the whole `table_progress` blob (O(1) in table count).
+The checkpoint/replay semantics this ADR defines are unchanged.
+
 ## Context
 
 [ADR-0015](adr-0015-migration-resume.md) made `sluice migrate

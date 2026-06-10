@@ -403,16 +403,17 @@ func TestMigrate_PG_ParallelCopy_BelowThreshold(t *testing.T) {
 		t.Errorf("target rows = %d; want %d", got, rowCount)
 	}
 
-	// State row carries no Chunks for the small_table because the
-	// parallel path declined to act. Read the table_progress JSON
-	// and assert the bare-string "complete" form.
+	// The persisted progress carries no Chunks for the small_table
+	// because the parallel path declined to act. Read its per-table
+	// progress row (ADR-0082: one sluice_migrate_table_progress row
+	// per table) and assert the complete form.
 	var progress sql.NullString
-	q := `SELECT table_progress FROM sluice_migrate_state WHERE migration_id = $1`
-	if err := tgtDB.QueryRowContext(ctx, q, "test-parallel-below-threshold").Scan(&progress); err != nil {
-		t.Fatalf("read state row: %v", err)
+	q := `SELECT progress FROM sluice_migrate_table_progress WHERE migration_id = $1 AND table_name = $2`
+	if err := tgtDB.QueryRowContext(ctx, q, "test-parallel-below-threshold", "small_table").Scan(&progress); err != nil {
+		t.Fatalf("read progress row: %v", err)
 	}
 	if !progress.Valid {
-		t.Fatalf("table_progress is NULL; expected non-empty progress map")
+		t.Fatalf("progress is NULL; expected a progress value")
 	}
 	// small_table declined the parallel-chunk path, so its progress must NOT
 	// carry a chunks array (the load-bearing assertion). It is recorded
@@ -420,8 +421,8 @@ func TestMigrate_PG_ParallelCopy_BelowThreshold(t *testing.T) {
 	// so it serialises as the object form {"state":"complete",
 	// "indexes_built":true} rather than the bare-string "complete" — accept
 	// either complete form, but never the chunk-verbose form.
-	completeBare := strings.Contains(progress.String, `"small_table":"complete"`)
-	completeObj := strings.Contains(progress.String, `"small_table":{"state":"complete"`)
+	completeBare := progress.String == `"complete"`
+	completeObj := strings.Contains(progress.String, `{"state":"complete"`)
 	if !completeBare && !completeObj {
 		t.Errorf("small_table progress not in a complete form: %s", progress.String)
 	}

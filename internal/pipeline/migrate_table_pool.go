@@ -31,10 +31,13 @@
 // Resume under concurrency: every table-level state write now races peer
 // tables writing distinct keys of the same Go map. That map is not safe
 // for concurrent writes, so the discipline the chunk axis already proves
-// (mutate under stateMu, cloneStateForWrite under the lock, writeState
+// (mutate under stateMu, clone the touched entry under the lock, persist
 // outside it) is extended to every table-level write in bulkCopyOneTable
-// and copyTableWithCursor. Resume stays order-independent: each table's
-// progress entry is self-contained.
+// and copyTableWithCursor. Persistence is per-table rows (ADR-0082):
+// each checkpoint upserts only the touched table's
+// sluice_migrate_table_progress row, so pool workers hit distinct rows
+// instead of contending on one hot blob. Resume stays order-independent:
+// each table's progress entry is self-contained.
 //
 // The sync cold-start path (runBulkCopyWithOpts) stays SERIAL by design;
 // see ADR-0076 and the comment there.
@@ -192,14 +195,16 @@ func openTablePair(ctx context.Context, deps *parallelBulkCopyDeps) (ir.RowReade
 	return openOneChunkConn(ctx, deps)
 }
 
-// setTableProgressAndWrite sets one table's progress entry and persists
-// the state, taking stateMu and deep-cloning the state UNDER the lock
-// before the JSON-encoding writeState call (ADR-0076 resume-under-
-// concurrency discipline). Peer tables in the cross-table pool write
-// distinct keys of the same Go map concurrently; without the lock the
-// encoder would race their writes. A write error is logged at WARN and
-// swallowed — the data work is load-bearing, the breadcrumb is best-
-// effort — mirroring the pre-pool per-table behaviour.
+// setTableProgressAndWrite sets one table's progress entry in the
+// in-memory map and persists THAT ENTRY ONLY via the store's per-row
+// upsert (ADR-0082) — the map mutation still happens under stateMu
+// (peer tables in the cross-table pool write distinct keys of the
+// same Go map concurrently — ADR-0076), and the entry is cloned UNDER
+// the lock before the JSON encoding outside it (its Chunks slice can
+// share backing storage with chunk goroutines mutating their slots
+// under the same lock). A write error is logged at WARN and swallowed
+// — the data work is load-bearing, the breadcrumb is best-effort —
+// mirroring the pre-pool per-table behaviour.
 func setTableProgressAndWrite(
 	ctx context.Context,
 	rc resumeContext,
@@ -210,20 +215,23 @@ func setTableProgressAndWrite(
 ) {
 	stateMu.Lock()
 	state.TableProgress[tableName] = entry
-	stateCopy := cloneStateForWrite(state)
+	entryCopy := cloneTableProgressForWrite(entry)
 	stateMu.Unlock()
-	if err := writeState(ctx, rc, stateCopy); err != nil {
+	if err := writeTableProgress(ctx, rc, tableName, entryCopy); err != nil {
 		// Logged via the shared warn shape so the message matches the
 		// pre-ADR-0076 per-table state-write warnings operators grep for.
 		warnStateWriteFailed(ctx, tableName, err)
 	}
 }
 
-// markFailedLocked is the cross-table-safe wrapper around markFailed. It
-// deep-clones the state UNDER stateMu so the failure write's JSON encoding
-// doesn't race a peer table mutating the shared TableProgress map. The
-// returned error is markFailed's (the original err, possibly joined with a
-// state-write error), so callers wrap it exactly as before.
+// markFailedLocked is the cross-table-safe wrapper around markFailed.
+// It snapshots the header fields UNDER stateMu and hands markFailed a
+// header-only copy: the failure write carries phase + last_error, and
+// the per-table progress is already persisted incrementally
+// (ADR-0082), so no map clone — and no map read racing peer tables —
+// is needed. The returned error is markFailed's (the original err,
+// possibly joined with a state-write error), so callers wrap it
+// exactly as before.
 func markFailedLocked(
 	ctx context.Context,
 	rc resumeContext,
@@ -233,7 +241,7 @@ func markFailedLocked(
 	err error,
 ) error {
 	stateMu.Lock()
-	stateCopy := cloneStateForWrite(state)
+	headerCopy := headerOnly(*state)
 	stateMu.Unlock()
-	return markFailed(ctx, rc, stateCopy, phase, err)
+	return markFailed(ctx, rc, headerCopy, phase, err)
 }

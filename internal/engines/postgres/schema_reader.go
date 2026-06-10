@@ -455,7 +455,9 @@ func (r *SchemaReader) readViews(ctx context.Context) ([]*ir.View, error) {
 // in cross-engine re-migrations:
 //
 //   - sluice_cdc_state — continuous-sync position store (target side).
-//   - sluice_migrate_state — resumable-migration progress (target side).
+//   - sluice_migrate_state / sluice_migrate_table_progress —
+//     resumable-migration header + per-table progress rows (target
+//     side, ADR-0082).
 //   - sluice_change_log / sluice_change_log_meta — the postgres-trigger
 //     engine's source-side capture log + meta row (ADR-0066 §2/§3). The
 //     trigger engine reads schema via this reader by delegation
@@ -482,6 +484,7 @@ func (r *SchemaReader) readTables(ctx context.Context) (map[string]*ir.Table, er
 		  AND  table_type   = 'BASE TABLE'
 		  AND  table_name NOT IN (
 		           'sluice_cdc_state', 'sluice_migrate_state',
+		           'sluice_migrate_table_progress',
 		           'sluice_change_log', 'sluice_change_log_meta'
 		       )
 		ORDER  BY table_name`

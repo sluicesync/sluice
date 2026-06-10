@@ -916,10 +916,11 @@ func runBulkCopyPhases(
 	// concurrency axes: the per-chunk goroutines spawned by the
 	// within-table parallel-copy path AND the cross-table copy pool
 	// below (ADR-0076). The map itself is not safe for concurrent
-	// writes; every writer takes the mutex and clones the state under
-	// the lock before the JSON-encoding writeState call (peer tables
-	// write distinct keys of the same map — distinct keys under one
-	// mutex is exactly cloneStateForWrite's design).
+	// writes; every writer takes the mutex to mutate its table's
+	// entry and clones that entry under the lock before the
+	// JSON-encoding writeTableProgress call outside it — one
+	// progress-row upsert per checkpoint (ADR-0082), so peer tables
+	// contend only on this mutex, never on a shared hot state row.
 	var stateMu sync.Mutex
 
 	// Phases 2 + 4: bulk-copy and secondary-index builds. ADR-0077: when
