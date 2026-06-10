@@ -6,6 +6,8 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.99.32] - 2026-06-10
+
 ### Fixed
 - **PG → `vitess`-flavor chain restores no longer silently skip the PG-native
   refusal checks.** The `vitess` self-hosted flavor (shipped v0.99.15) was
@@ -48,6 +50,10 @@ project follows [Semantic Versioning](https://semver.org/).
 - Orchestrator engine dispatch re-anchored to `ir.Capabilities` (five new
   declared fields); per-engine compile-time optional-interface declarations
   (a method-set break now fails compile instead of silently downgrading).
+- The three orchestrator mega-functions (`runOnce`, `coldStart`,
+  `runSingleDatabase`) carved into named phase methods and `streamer.go`
+  split by its own seams (3,205 → 1,235 lines) — purely mechanical, zero
+  test edits, teardown ordering byte-identical.
 
 ## [0.99.31] - 2026-06-10
 
