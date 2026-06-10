@@ -58,10 +58,12 @@ func startPostgresForCDCWithSmallDecodeMem(t *testing.T) (dsn string, cleanup fu
 	t.Helper()
 
 	container := runPGWithRetry(
-		// sharedPGImage is the task-#68 pre-baked postgres:16 image;
-		// safe to share with the shared-TestMain container because the
-		// per-test boot here uses a *separate* container instance (its
-		// own logical_decoding_work_mem GUC). Image identity, not
+		// sharedPGImage is the task-#68 pre-baked postgres:16 image
+		// (or the SLUICE_TEST_PG_IMAGE matrix override — spill
+		// semantics aren't version-pinned here); safe to share with
+		// the shared-TestMain container because the per-test boot here
+		// uses a *separate* container instance (its own
+		// logical_decoding_work_mem GUC). Image identity, not
 		// container identity, is what we want pre-baked.
 		t, sharedPGImage,
 		pgtc.WithDatabase("source_db"),

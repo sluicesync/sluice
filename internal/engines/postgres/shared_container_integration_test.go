@@ -189,8 +189,8 @@ const (
 	sharedPGPass   = "test"
 	sharedPGSeedDB = "sluice_shared_seed"
 
-	// sharedPGImage is the testcontainers image reference used by the
-	// shared TestMain boot.
+	// sharedPGDefaultImage is the image the suite boots when no
+	// override is set.
 	//
 	// Task #68: this is the pre-baked image
 	// (ghcr.io/sluicesync/sluice-postgres:16-prebaked) — built nightly from
@@ -210,10 +210,35 @@ const (
 	//
 	// See docs/dev/ci-images.md for how the pre-baked images are
 	// built and when to bump the base version (e.g. PG 16 → 17).
-	sharedPGImage = "ghcr.io/sluicesync/sluice-postgres:16-prebaked"
+	sharedPGDefaultImage = "ghcr.io/sluicesync/sluice-postgres:16-prebaked"
+
+	// sharedPGImageEnv overrides sharedPGDefaultImage with an arbitrary
+	// postgres image reference (e.g. "postgres:18"). Set by the weekly
+	// .github/workflows/pg-version-matrix.yml sweep — and usable locally
+	// to point the whole engines/postgres suite at a different PG
+	// version. Mirrors the mysql package's VITESS_LITE_IMAGE override
+	// shape (vitessClusterImage). Tests that pin a version on purpose
+	// (the PG 17 FAILOVER tests' explicit "postgres:17") do NOT read
+	// this — see startPostgres17ForCDC.
+	sharedPGImageEnv = "SLUICE_TEST_PG_IMAGE"
 
 	sharedPGAdminDB = "postgres"
 )
+
+// sharedPGImage is the image reference the shared TestMain boot AND the
+// sharedPGImage-based per-test escape hatches (runPGWithRetry call sites
+// that don't pin a version) actually use. Resolved once at process init:
+// SLUICE_TEST_PG_IMAGE when set (the multi-version matrix / a local
+// override, typically a STOCK postgres image), sharedPGDefaultImage
+// (pre-baked PG 16) otherwise.
+var sharedPGImage = resolveSharedPGImage()
+
+func resolveSharedPGImage() string {
+	if img := os.Getenv(sharedPGImageEnv); img != "" {
+		return img
+	}
+	return sharedPGDefaultImage
+}
 
 // bootSharedPostgresOnce runs a single boot attempt against a fresh
 // container. On any error it terminates the half-state container
@@ -240,6 +265,18 @@ func bootSharedPostgresOnce(ctx context.Context) (host, port string, container *
 		// on a pre-baked datadir). Use an explicit 1-occurrence wait
 		// matched with the listen-port check that BasicWaitStrategies
 		// also includes.
+		//
+		// This same strategy is ALSO correct when SLUICE_TEST_PG_IMAGE
+		// points sharedPGImage at a STOCK postgres image (the
+		// multi-version matrix): a 1-occurrence log wait alone would
+		// fire during a stock image's initdb phase (the temporary
+		// init server logs "ready" once before the restart), but
+		// initdb's temp server binds ONLY the unix socket — never TCP
+		// 5432 — so the ANDed ForListeningPort can't pass until the
+		// real post-init server is up. This is exactly the combination
+		// runPGWithRetry appends for every per-test boot, which has
+		// been booting stock postgres:17 (the FAILOVER tests) in CI
+		// since task #68 landed. One strategy, both image shapes.
 		testcontainers.WithWaitStrategyAndDeadline(
 			sharedPostgresBootTimeout,
 			wait.ForAll(
@@ -830,6 +867,9 @@ func TestMain(m *testing.M) {
 //       Different container image (postgres:17) so semantically a
 //       different server — sharing would defeat the purpose of the
 //       PG 17–specific tests. Lives in cdc_reader_integration_test.go.
+//       The "postgres:17" pin there is DELIBERATE and exempt from the
+//       SLUICE_TEST_PG_IMAGE override — those tests assert
+//       version-specific behaviour.
 //
 //   - TestCDCReader_RejectsWrongWALLevel (inlined boot in the test)
 //       Asserts the reader's wal_level precondition fires when the
