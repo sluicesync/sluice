@@ -308,8 +308,8 @@ func GuardedExec(ctx context.Context, db *sql.DB, cfg *ControlTableConfig, op, q
 // ir.ShardConsolidationLeaseRow, shared by both engines' lease
 // primitives (each aliases it as its package-local
 // shardConsolidationLeaseRow). Defined with database/sql Null types
-// so the engines' scan paths stay direct; each engine's
-// shard_consolidation_lease.go converts to the pipeline-facing shape.
+// so the engines' scan paths stay direct; [ShardLeaseRow.ToIR]
+// converts to the pipeline-facing shape.
 type ShardLeaseRow struct {
 	TargetTableFullName  string
 	LeaseHolderStreamID  string
@@ -328,6 +328,42 @@ type ShardLeaseRow struct {
 	// sluice_cdc_schema_history table carries (ADR-0049 / Bug 78).
 	AnchorPosition sql.NullString
 	AnchorEngine   sql.NullString
+}
+
+// ToIR converts the engine's sql.NullTime-bearing row shape to the
+// cross-package HasX-bool shape. ADR-0081 tier (d): the conversion was
+// byte-identical in both engines' lease wrapper files; together with
+// ShardLeaseRow + [ScanShardLeaseRow] it gives the whole lease-row
+// projection contract a single owner.
+func (r ShardLeaseRow) ToIR() ir.ShardConsolidationLeaseRow {
+	out := ir.ShardConsolidationLeaseRow{
+		TargetTableFullName:  r.TargetTableFullName,
+		LeaseHolderStreamID:  r.LeaseHolderStreamID,
+		DDLText:              r.DDLText,
+		DDLChecksum:          r.DDLChecksum,
+		AppliedSchemaVersion: r.AppliedSchemaVersion,
+	}
+	if r.LeaseExpiresAt.Valid {
+		out.LeaseExpiresAt = r.LeaseExpiresAt.Time
+		out.HasLeaseExpiresAt = true
+	}
+	if r.AppliedAt.Valid {
+		out.AppliedAt = r.AppliedAt.Time
+		out.HasAppliedAt = true
+	}
+	// Reconstruct the source-side anchor Position. Both Token + Engine
+	// must be present for an anchor to count as "set" — a half-populated
+	// row (legacy v0.75.0 + a manually-poked anchor_position with
+	// source_engine still NULL) is treated as absent so the GC sweep
+	// defensively retains it.
+	if r.AnchorPosition.Valid && r.AnchorEngine.Valid {
+		out.AnchorPosition = ir.Position{
+			Engine: r.AnchorEngine.String,
+			Token:  r.AnchorPosition.String,
+		}
+		out.HasAnchor = true
+	}
+	return out
 }
 
 // RowScanner is the scan surface shared by *sql.Row and *sql.Rows.

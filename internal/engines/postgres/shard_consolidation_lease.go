@@ -13,10 +13,9 @@ package postgres
 // have to import pipeline (which would create a cycle).
 //
 // The translation between the pipeline-facing
-// [ir.ShardConsolidationLeaseRow] and this engine's
-// [shardConsolidationLeaseRow] is bespoke (sql.NullTime vs HasX bool
-// flags) to keep the engine package's SQL implementation pure
-// database/sql.
+// [ir.ShardConsolidationLeaseRow] and the engine-internal
+// sql.NullTime-bearing row shape is the shared
+// [appliershared.ShardLeaseRow.ToIR] (ADR-0081 tier d).
 
 import (
 	"context"
@@ -35,7 +34,7 @@ func (a *ChangeApplier) TryAcquireLease(
 	if err != nil {
 		return false, ir.ShardConsolidationLeaseRow{}, err
 	}
-	return acquired, toIRLeaseRow(row), nil
+	return acquired, row.ToIR(), nil
 }
 
 // HeartbeatLease implements [ir.ShardConsolidationLeaseStore].
@@ -95,7 +94,7 @@ func (a *ChangeApplier) ObserveLease(
 	if !ok {
 		return ir.ShardConsolidationLeaseRow{}, false, nil
 	}
-	return toIRLeaseRow(row), true, nil
+	return row.ToIR(), true, nil
 }
 
 // ListLeases implements [ir.ShardConsolidationLeaseLister] — returns
@@ -108,40 +107,7 @@ func (a *ChangeApplier) ListLeases(ctx context.Context) ([]ir.ShardConsolidation
 	}
 	out := make([]ir.ShardConsolidationLeaseRow, 0, len(rows))
 	for _, row := range rows {
-		out = append(out, toIRLeaseRow(row))
+		out = append(out, row.ToIR())
 	}
 	return out, nil
-}
-
-// toIRLeaseRow converts the engine's sql.NullTime-bearing row shape
-// to the cross-package HasX-bool shape.
-func toIRLeaseRow(row shardConsolidationLeaseRow) ir.ShardConsolidationLeaseRow {
-	out := ir.ShardConsolidationLeaseRow{
-		TargetTableFullName:  row.TargetTableFullName,
-		LeaseHolderStreamID:  row.LeaseHolderStreamID,
-		DDLText:              row.DDLText,
-		DDLChecksum:          row.DDLChecksum,
-		AppliedSchemaVersion: row.AppliedSchemaVersion,
-	}
-	if row.LeaseExpiresAt.Valid {
-		out.LeaseExpiresAt = row.LeaseExpiresAt.Time
-		out.HasLeaseExpiresAt = true
-	}
-	if row.AppliedAt.Valid {
-		out.AppliedAt = row.AppliedAt.Time
-		out.HasAppliedAt = true
-	}
-	// Reconstruct the source-side anchor Position. Both Token + Engine
-	// must be present for an anchor to count as "set" — a half-populated
-	// row (legacy v0.75.0 + a manually-poked anchor_position with
-	// source_engine still NULL) is treated as absent so the GC sweep
-	// defensively retains it.
-	if row.AnchorPosition.Valid && row.AnchorEngine.Valid {
-		out.AnchorPosition = ir.Position{
-			Engine: row.AnchorEngine.String,
-			Token:  row.AnchorPosition.String,
-		}
-		out.HasAnchor = true
-	}
-	return out
 }
