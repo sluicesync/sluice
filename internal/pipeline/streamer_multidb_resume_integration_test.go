@@ -182,8 +182,26 @@ func TestStreamer_MultiDatabase_StopRestart_MySQLToMySQL(t *testing.T) {
 		<-runErr2
 		t.Fatalf("phase 4: resumed CDC never settled shop_db post-restart")
 	}
-	// Let the UPDATE/DELETE settle before the bleed/value assertions.
-	time.Sleep(2 * time.Second)
+	// The UPDATE and the INSERT+DELETE pair are invisible to the
+	// row-count waits above (the shop_db count transits 4→5→4, so its
+	// wait can return before either lands), and the drain-stop below
+	// only commits what the stream has already read — so poll for their
+	// effects directly instead of a blind settle sleep (see
+	// [waitForStringMySQL]). The b-two poll also guarantees the
+	// earlier-committed b-five INSERT applied (binlog order is apply
+	// order), which the phase-6 zero-loss counts rely on.
+	if !waitForStringMySQL(t, tgtServerDSN, "source_db",
+		"SELECT COUNT(*) FROM widgets WHERE name='a-one-upd'", "1", 30*time.Second) {
+		cancel2()
+		<-runErr2
+		t.Fatalf("phase 4: resumed CDC never delivered the source_db UPDATE (a-one-upd)")
+	}
+	if !waitForStringMySQL(t, tgtServerDSN, "shop_db",
+		"SELECT COUNT(*) FROM widgets WHERE name='b-two'", "0", 30*time.Second) {
+		cancel2()
+		<-runErr2
+		t.Fatalf("phase 4: resumed CDC never delivered the shop_db DELETE (b-two)")
+	}
 
 	// ---- Phase 5: drain-stop again ----
 	drainStopStreamer(t, cancel2, runErr2, "phase 5")
@@ -321,6 +339,11 @@ func TestStreamer_MultiDatabase_StopRestart_MySQLToPostgres(t *testing.T) {
 		<-runErr2
 		t.Fatalf("phase 4: resumed CDC never delivered shop_db post-restart insert to PG")
 	}
+	// Benign settle window: BOTH phase-4 writes are inserts, already
+	// count-confirmed by the waits above (no capture hazard either — the
+	// binlog position was pinned at cold-start). This only widens the
+	// window in which a hypothetical misrouted event would land before
+	// the phase-6 bleed guard reads.
 	time.Sleep(2 * time.Second)
 
 	// ---- Phase 5: drain-stop ----

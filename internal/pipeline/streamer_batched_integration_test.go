@@ -94,9 +94,14 @@ func TestStreamer_PostgresToPostgres_BatchedApply(t *testing.T) {
 	runErr := make(chan error, 1)
 	go func() { runErr <- streamer.Run(streamCtx) }()
 
-	// Give the streamer a moment to capture the snapshot and start
-	// CDC. With an empty seed the bulk-copy is near-instant.
-	time.Sleep(2 * time.Second)
+	// Wait for the replication slot to exist before committing the
+	// finite source burst below — a commit that lands BEFORE the slot is
+	// created is captured by neither the snapshot nor CDC (the AIMD
+	// "0/250" flake class; see [waitForSourceSlot]). The slot is created
+	// before the bulk-copy phase, so the empty-seed copy's handful of
+	// dest commits may now land inside the measurement window — well
+	// within the tolerance band below.
+	waitForSourceSlot(t, sourceDSN, 60*time.Second)
 
 	// Snapshot the dest commit counter, drive a single source-side
 	// transaction with N inserts, then snapshot again.

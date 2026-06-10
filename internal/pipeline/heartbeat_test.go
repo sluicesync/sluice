@@ -56,8 +56,16 @@ func TestStartHeartbeat_EmitsOnTick(t *testing.T) {
 	defer cancel()
 	startHeartbeat(ctx, "test-stream", 50*time.Millisecond)
 
-	// Wait long enough for ~3 ticks to land.
-	time.Sleep(200 * time.Millisecond)
+	// Poll until >= 2 ticks land instead of sleeping a fixed window: the
+	// cadence is real-clock, so a starved CI runner (the Windows
+	// unit-leg class) can deliver fewer ticks in a fixed window than the
+	// cadence promises. >= 2 still pins the goroutine-dies-after-first-
+	// tick regression; the deadline is generous because it only bounds
+	// the FAILURE path.
+	if !pollLogCount(&buf, "stream: heartbeat", 2, 10*time.Second) {
+		t.Fatalf("heartbeat fired only %d times within 10s at 50ms cadence; want >= 2",
+			strings.Count(buf.String(), "stream: heartbeat"))
+	}
 	cancel()
 
 	got := buf.String()
@@ -67,13 +75,20 @@ func TestStartHeartbeat_EmitsOnTick(t *testing.T) {
 	if !strings.Contains(got, "test-stream") {
 		t.Errorf("heartbeat log missing stream_id; got = %q", got)
 	}
-	// Expect at least 2 ticks in 200ms at 50ms cadence (allowing
-	// scheduling slop). A flaky count >= 1 would mask the goroutine-
-	// dies-after-first-tick regression we care about.
-	count := strings.Count(got, "stream: heartbeat")
-	if count < 2 {
-		t.Errorf("heartbeat fired only %d times in 200ms at 50ms cadence; want >= 2", count)
+}
+
+// pollLogCount polls buf until substr appears at least n times, or the
+// deadline passes. The poll-until shape replaces the fixed sleep-then-
+// count windows that under-counted ticks on starved runners.
+func pollLogCount(buf *syncBuffer, substr string, n int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if strings.Count(buf.String(), substr) >= n {
+			return true
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
+	return false
 }
 
 // TestStartHeartbeat_ZeroIntervalDisables covers the off path:
@@ -90,6 +105,8 @@ func TestStartHeartbeat_ZeroIntervalDisables(t *testing.T) {
 	defer cancel()
 	startHeartbeat(ctx, "test-stream", 0)
 
+	// Benign real-clock sleep: interval=0 starts NO goroutine at all, so
+	// this can only false-pass (never false-fail) — not a flake vector.
 	time.Sleep(100 * time.Millisecond)
 	cancel()
 
@@ -99,13 +116,14 @@ func TestStartHeartbeat_ZeroIntervalDisables(t *testing.T) {
 }
 
 // TestStartHeartbeat_ExitsOnCtxCancel pins the goroutine-leak guard:
-// when ctx cancels, the goroutine MUST exit. Tested indirectly: take
-// a count snapshot some time AFTER cancel (allowing a grace window
-// in case ticker.C and ctx.Done both fire in the same select — Go
-// picks one randomly, so a single extra tick is in-spec), then
-// confirm the count stays stable across a second window. A leaked
-// goroutine would keep accumulating ticks across the second window;
-// a healthy exit produces a flat line.
+// when ctx cancels, the goroutine MUST exit. Tested indirectly: after
+// cancel, poll until the tick count holds still for 10x the cadence. A
+// leaked goroutine keeps producing a tick every 20ms and can never show
+// a 200ms-quiet window; a healthy exit flat-lines right after the at-
+// most-one raced tick (ticker.C and ctx.Done ready in the same select —
+// Go picks randomly — is in-spec). The poll-until-stable shape replaces
+// the old fixed grace + fixed second window, whose real-clock bounds
+// false-failed when a starved runner delivered the raced tick late.
 func TestStartHeartbeat_ExitsOnCtxCancel(t *testing.T) {
 	var buf syncBuffer
 	h := slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})
@@ -115,21 +133,24 @@ func TestStartHeartbeat_ExitsOnCtxCancel(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	startHeartbeat(ctx, "test-stream", 20*time.Millisecond)
-	time.Sleep(60 * time.Millisecond)
+	// Prove the goroutine is actually ticking before the cancel, so the
+	// leak check below is exercising a live goroutine.
+	if !pollLogCount(&buf, "stream: heartbeat", 1, 10*time.Second) {
+		t.Fatal("heartbeat never ticked before cancel")
+	}
 	cancel()
 
-	// Grace window: allow any in-flight tick that raced with cancel
-	// to land before we snapshot the count.
-	time.Sleep(40 * time.Millisecond)
-	postCancelCount := strings.Count(buf.String(), "stream: heartbeat")
-
-	// Second window: a healthy-exit goroutine produces no further
-	// ticks here. A leak would add ~10+ ticks at 20ms cadence.
-	time.Sleep(200 * time.Millisecond)
-	finalCount := strings.Count(buf.String(), "stream: heartbeat")
-
-	if finalCount != postCancelCount {
-		t.Errorf("heartbeat goroutine leaked: post-cancel-grace=%d final=%d (cancel didn't exit the goroutine)",
-			postCancelCount, finalCount)
+	const stableFor = 200 * time.Millisecond // 10x the 20ms cadence
+	deadline := time.Now().Add(10 * time.Second)
+	last := strings.Count(buf.String(), "stream: heartbeat")
+	lastChange := time.Now()
+	for time.Now().Before(deadline) {
+		if n := strings.Count(buf.String(), "stream: heartbeat"); n != last {
+			last, lastChange = n, time.Now()
+		} else if time.Since(lastChange) >= stableFor {
+			return // flat line — the goroutine exited
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
+	t.Fatalf("heartbeat count still rising %s after cancel (count=%d) — goroutine leaked", stableFor, last)
 }
