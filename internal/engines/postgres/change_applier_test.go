@@ -132,7 +132,7 @@ func TestBuildInsertSQL(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			gotSQL, gotArgs, err := buildInsertSQL(c.schema, c.table, c.row, c.pk, nil, nil)
+			gotSQL, gotArgs, err := buildInsertSQL(c.schema, c.table, c.row, c.pk, nil)
 			if err != nil {
 				t.Fatalf("buildInsertSQL: %v", err)
 			}
@@ -158,18 +158,18 @@ func TestBuildInsertSQL(t *testing.T) {
 // / txid_snapshot / multirange (likely-affected families not
 // exercised in the cycle but structurally identical).
 func TestBuildSQL_VerbatimTypeCasts(t *testing.T) {
-	colTypes := map[string]ir.Type{
-		"id":    ir.Integer{Width: 64},
-		"price": ir.VerbatimType{Definition: "money"},
-		"lsn":   ir.VerbatimType{Definition: "pg_lsn"},
-		"doc":   ir.VerbatimType{Definition: "xml"},
-		"r":     ir.VerbatimType{Definition: "int4range"},
-		"v":     ir.VerbatimType{Definition: "tsvector"},
+	colTypes := map[string]*ir.Column{
+		"id":    {Name: "id", Type: ir.Integer{Width: 64}},
+		"price": {Name: "price", Type: ir.VerbatimType{Definition: "money"}},
+		"lsn":   {Name: "lsn", Type: ir.VerbatimType{Definition: "pg_lsn"}},
+		"doc":   {Name: "doc", Type: ir.VerbatimType{Definition: "xml"}},
+		"r":     {Name: "r", Type: ir.VerbatimType{Definition: "int4range"}},
+		"v":     {Name: "v", Type: ir.VerbatimType{Definition: "tsvector"}},
 	}
 
 	t.Run("INSERT VALUES placeholders carry the cast", func(t *testing.T) {
 		row := ir.Row{"id": int64(1), "price": "$99.99", "lsn": "0/16B3748", "doc": "<a/>", "r": "[1,10)", "v": "'foo':1"}
-		gotSQL, _, err := buildInsertSQL("public", "t", row, []string{"id"}, colTypes, nil)
+		gotSQL, _, err := buildInsertSQL("public", "t", row, []string{"id"}, colTypes)
 		if err != nil {
 			t.Fatalf("buildInsertSQL: %v", err)
 		}
@@ -191,7 +191,7 @@ func TestBuildSQL_VerbatimTypeCasts(t *testing.T) {
 	t.Run("UPDATE SET clause carries the cast", func(t *testing.T) {
 		before := ir.Row{"id": int64(1)}
 		after := ir.Row{"id": int64(1), "price": "$50.00", "lsn": "0/100"}
-		gotSQL, _, err := buildUpdateSQL("public", "t", before, after, colTypes, nil)
+		gotSQL, _, err := buildUpdateSQL("public", "t", before, after, colTypes)
 		if err != nil {
 			t.Fatalf("buildUpdateSQL: %v", err)
 		}
@@ -207,7 +207,7 @@ func TestBuildSQL_VerbatimTypeCasts(t *testing.T) {
 
 	t.Run("WHERE equality predicate casts both sides", func(t *testing.T) {
 		before := ir.Row{"id": int64(1), "price": "$50.00"}
-		gotSQL, _, err := buildDeleteSQL("public", "t", before, colTypes, nil)
+		gotSQL, _, err := buildDeleteSQL("public", "t", before, colTypes)
 		if err != nil {
 			t.Fatalf("buildDeleteSQL: %v", err)
 		}
@@ -219,8 +219,8 @@ func TestBuildSQL_VerbatimTypeCasts(t *testing.T) {
 
 	t.Run("non-verbatim columns keep bare $N", func(t *testing.T) {
 		row := ir.Row{"plain": "x"}
-		colTypesBare := map[string]ir.Type{"plain": ir.Text{Size: ir.TextLong}}
-		gotSQL, _, err := buildInsertSQL("public", "t", row, nil, colTypesBare, nil)
+		colTypesBare := map[string]*ir.Column{"plain": {Name: "plain", Type: ir.Text{Size: ir.TextLong}}}
+		gotSQL, _, err := buildInsertSQL("public", "t", row, nil, colTypesBare)
 		if err != nil {
 			t.Fatalf("buildInsertSQL: %v", err)
 		}
@@ -239,11 +239,11 @@ func TestBuildSQL_VerbatimTypeCasts(t *testing.T) {
 // must convert `[]byte` to `string` for ir.VerbatimType columns so pgx
 // binds as text and PG's `text::TYPE` parse sees the canonical form.
 func TestPrepareApplierValue_VerbatimTypeBytesBecomeString(t *testing.T) {
-	colTypes := map[string]ir.Type{
-		"price": ir.VerbatimType{Definition: "money"},
-		"lsn":   ir.VerbatimType{Definition: "pg_lsn"},
-		"doc":   ir.VerbatimType{Definition: "xml"},
-		"plain": ir.Text{Size: ir.TextLong},
+	colTypes := map[string]*ir.Column{
+		"price": {Name: "price", Type: ir.VerbatimType{Definition: "money"}},
+		"lsn":   {Name: "lsn", Type: ir.VerbatimType{Definition: "pg_lsn"}},
+		"doc":   {Name: "doc", Type: ir.VerbatimType{Definition: "xml"}},
+		"plain": {Name: "plain", Type: ir.Text{Size: ir.TextLong}},
 	}
 
 	cases := []struct {
@@ -301,7 +301,7 @@ func TestBuildUpdateSQL(t *testing.T) {
 	before := ir.Row{"id": int64(7), "email": "old@example.com"}
 	after := ir.Row{"id": int64(7), "email": "new@example.com", "active": false}
 
-	gotSQL, gotArgs, err := buildUpdateSQL("public", "users", before, after, nil, nil)
+	gotSQL, gotArgs, err := buildUpdateSQL("public", "users", before, after, nil)
 	if err != nil {
 		t.Fatalf("buildUpdateSQL: %v", err)
 	}
@@ -318,7 +318,7 @@ func TestBuildUpdateSQL(t *testing.T) {
 
 func TestBuildDeleteSQL(t *testing.T) {
 	before := ir.Row{"id": int64(7), "email": "alice@example.com"}
-	gotSQL, gotArgs, err := buildDeleteSQL("public", "users", before, nil, nil)
+	gotSQL, gotArgs, err := buildDeleteSQL("public", "users", before, nil)
 	if err != nil {
 		t.Fatalf("buildDeleteSQL: %v", err)
 	}
@@ -367,7 +367,7 @@ func TestBuildWhereClause_NullHandling(t *testing.T) {
 		"email": nil, // NULL — must produce IS NULL, not = $N
 		"name":  "alice",
 	}
-	gotSQL, gotArgs, err := buildWhereClause(row, 1, nil, nil)
+	gotSQL, gotArgs, err := buildWhereClause(row, 1, nil)
 	if err != nil {
 		t.Fatalf("buildWhereClause: %v", err)
 	}
@@ -387,7 +387,7 @@ func TestBuildWhereClause_NullHandling(t *testing.T) {
 // honoured — UPDATE SET + WHERE share a numbering sequence.
 func TestBuildWhereClause_StartIdx(t *testing.T) {
 	row := ir.Row{"id": int64(1)}
-	gotSQL, _, err := buildWhereClause(row, 5, nil, nil)
+	gotSQL, _, err := buildWhereClause(row, 5, nil)
 	if err != nil {
 		t.Fatalf("buildWhereClause: %v", err)
 	}
@@ -399,7 +399,7 @@ func TestBuildWhereClause_StartIdx(t *testing.T) {
 
 func TestBuildSetClause(t *testing.T) {
 	row := ir.Row{"a": int64(1), "b": "x"}
-	gotSQL, gotArgs, err := buildSetClause(row, 1, nil, nil)
+	gotSQL, gotArgs, err := buildSetClause(row, 1, nil)
 	if err != nil {
 		t.Fatalf("buildSetClause: %v", err)
 	}
@@ -425,12 +425,12 @@ func TestBuildInsertSQL_RoutesThroughPrepareValue(t *testing.T) {
 		"id":   int64(1),
 		"tags": []any{"a", "b"},
 	}
-	colTypes := map[string]ir.Type{
-		"id":   ir.Integer{Width: 64},
-		"tags": ir.Array{Element: ir.Text{Size: ir.TextLong}},
+	colTypes := map[string]*ir.Column{
+		"id":   {Name: "id", Type: ir.Integer{Width: 64}},
+		"tags": {Name: "tags", Type: ir.Array{Element: ir.Text{Size: ir.TextLong}}},
 	}
 
-	_, gotArgs, err := buildInsertSQL("public", "docs", row, []string{"id"}, colTypes, nil)
+	_, gotArgs, err := buildInsertSQL("public", "docs", row, []string{"id"}, colTypes)
 	if err != nil {
 		t.Fatalf("buildInsertSQL: %v", err)
 	}
@@ -456,12 +456,12 @@ func TestBuildWhereClause_RoutesThroughPrepareValue(t *testing.T) {
 		"id":   int64(1),
 		"tags": []any{"a", "b"},
 	}
-	colTypes := map[string]ir.Type{
-		"id":   ir.Integer{Width: 64},
-		"tags": ir.Array{Element: ir.Text{Size: ir.TextLong}},
+	colTypes := map[string]*ir.Column{
+		"id":   {Name: "id", Type: ir.Integer{Width: 64}},
+		"tags": {Name: "tags", Type: ir.Array{Element: ir.Text{Size: ir.TextLong}}},
 	}
 
-	_, gotArgs, err := buildWhereClause(before, 1, colTypes, nil)
+	_, gotArgs, err := buildWhereClause(before, 1, colTypes)
 	if err != nil {
 		t.Fatalf("buildWhereClause: %v", err)
 	}
@@ -490,14 +490,14 @@ func TestBuildWhereClause_JSONCastUnderReplicaIdentityFull(t *testing.T) {
 		"doc_bin":  `{"b":2}`, // PG jsonb — uses native `=`
 		"label":    "hello",   // plain text — uses native `=`
 	}
-	colTypes := map[string]ir.Type{
-		"id":       ir.Integer{Width: 64},
-		"doc_text": ir.JSON{Binary: false},
-		"doc_bin":  ir.JSON{Binary: true},
-		"label":    ir.Text{Size: ir.TextLong},
+	colTypes := map[string]*ir.Column{
+		"id":       {Name: "id", Type: ir.Integer{Width: 64}},
+		"doc_text": {Name: "doc_text", Type: ir.JSON{Binary: false}},
+		"doc_bin":  {Name: "doc_bin", Type: ir.JSON{Binary: true}},
+		"label":    {Name: "label", Type: ir.Text{Size: ir.TextLong}},
 	}
 
-	gotSQL, _, err := buildWhereClause(before, 1, colTypes, nil)
+	gotSQL, _, err := buildWhereClause(before, 1, colTypes)
 	if err != nil {
 		t.Fatalf("buildWhereClause: %v", err)
 	}
@@ -531,7 +531,7 @@ func TestPrepareApplierValue_FallsBackOnMissingType(t *testing.T) {
 	if !reflect.DeepEqual(got, raw) {
 		t.Errorf("nil colTypes: got %#v; want raw value passthrough", got)
 	}
-	got, err = prepareApplierValue(raw, map[string]ir.Type{}, "data")
+	got, err = prepareApplierValue(raw, map[string]*ir.Column{}, "data")
 	if err != nil {
 		t.Fatalf("missing colName: unexpected err: %v", err)
 	}
@@ -590,17 +590,16 @@ func TestApplierSchema(t *testing.T) {
 // non-DEFAULT value into column"); a CDC INSERT that includes the
 // generated column's value would fail the whole batch.
 func TestBuildSQL_FiltersGeneratedColumns(t *testing.T) {
-	colTypes := map[string]ir.Type{
-		"id":     ir.Integer{Width: 64},
-		"price":  ir.Decimal{Precision: 12, Scale: 2},
-		"cost":   ir.Decimal{Precision: 12, Scale: 2},
-		"margin": ir.Decimal{Precision: 12, Scale: 2},
+	colTypes := map[string]*ir.Column{
+		"id":     {Name: "id", Type: ir.Integer{Width: 64}},
+		"price":  {Name: "price", Type: ir.Decimal{Precision: 12, Scale: 2}},
+		"cost":   {Name: "cost", Type: ir.Decimal{Precision: 12, Scale: 2}},
+		"margin": {Name: "margin", Type: ir.Decimal{Precision: 12, Scale: 2}, GeneratedExpr: "price - COALESCE(cost, 0)", GeneratedStored: true},
 	}
-	generated := map[string]bool{"margin": true}
 
 	t.Run("INSERT excludes generated column from column list and ON CONFLICT DO UPDATE SET", func(t *testing.T) {
 		row := ir.Row{"id": int64(1), "price": "9.99", "cost": "4.50", "margin": "5.49"}
-		gotSQL, _, err := buildInsertSQL("public", "products", row, []string{"id"}, colTypes, generated)
+		gotSQL, _, err := buildInsertSQL("public", "products", row, []string{"id"}, colTypes)
 		if err != nil {
 			t.Fatalf("buildInsertSQL: %v", err)
 		}
@@ -614,7 +613,7 @@ func TestBuildSQL_FiltersGeneratedColumns(t *testing.T) {
 	t.Run("UPDATE SET and WHERE both exclude generated column", func(t *testing.T) {
 		before := ir.Row{"id": int64(1), "price": "9.99", "cost": "4.50", "margin": "5.49"}
 		after := ir.Row{"id": int64(1), "price": "12.99", "cost": "4.50", "margin": "8.49"}
-		gotSQL, _, err := buildUpdateSQL("public", "products", before, after, colTypes, generated)
+		gotSQL, _, err := buildUpdateSQL("public", "products", before, after, colTypes)
 		if err != nil {
 			t.Fatalf("buildUpdateSQL: %v", err)
 		}
@@ -626,7 +625,7 @@ func TestBuildSQL_FiltersGeneratedColumns(t *testing.T) {
 
 	t.Run("DELETE WHERE excludes generated column", func(t *testing.T) {
 		before := ir.Row{"id": int64(1), "price": "9.99", "cost": "4.50", "margin": "5.49"}
-		gotSQL, _, err := buildDeleteSQL("public", "products", before, colTypes, generated)
+		gotSQL, _, err := buildDeleteSQL("public", "products", before, colTypes)
 		if err != nil {
 			t.Fatalf("buildDeleteSQL: %v", err)
 		}
@@ -636,14 +635,14 @@ func TestBuildSQL_FiltersGeneratedColumns(t *testing.T) {
 		}
 	})
 
-	t.Run("nil generated map: every column passes through (pre-fix shape)", func(t *testing.T) {
+	t.Run("nil colTypes: every column passes through (pre-fix shape)", func(t *testing.T) {
 		row := ir.Row{"id": int64(1), "margin": "5.49"}
-		gotSQL, _, err := buildInsertSQL("public", "products", row, []string{"id"}, colTypes, nil)
+		gotSQL, _, err := buildInsertSQL("public", "products", row, []string{"id"}, nil)
 		if err != nil {
 			t.Fatalf("buildInsertSQL: %v", err)
 		}
 		if !strings.Contains(gotSQL, `"margin"`) {
-			t.Errorf("with nil generated map the filter should not engage; got %q", gotSQL)
+			t.Errorf("with nil colTypes the generated-column filter should not engage; got %q", gotSQL)
 		}
 	})
 }

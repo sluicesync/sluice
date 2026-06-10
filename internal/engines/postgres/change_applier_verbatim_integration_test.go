@@ -74,20 +74,20 @@ func TestLoadColumnTypes_Bug97VerbatimEligibleTypes(t *testing.T) {
 	}
 	defer func() { _, _ = db.ExecContext(ctx, "DROP TABLE IF EXISTS bug97_verbatim_pin") }()
 
-	types, _, err := loadColumnTypes(ctx, db, "public", "bug97_verbatim_pin")
+	cols, err := loadColumnTypes(ctx, db, "public", "bug97_verbatim_pin")
 	if err != nil {
 		t.Fatalf("loadColumnTypes: %v — pre-v0.92.2 this is the applier-side Bug 97 failure path", err)
 	}
 
 	for _, col := range wantCols {
-		typ, ok := types[col]
+		c, ok := cols[col]
 		if !ok {
 			t.Errorf("loadColumnTypes did not return type for column %q", col)
 			continue
 		}
-		v, isVerbatim := typ.(ir.VerbatimType)
+		v, isVerbatim := c.Type.(ir.VerbatimType)
 		if !isVerbatim {
-			t.Errorf("col %q: type %T; expected ir.VerbatimType (the verbatim-carry path)", col, typ)
+			t.Errorf("col %q: type %T; expected ir.VerbatimType (the verbatim-carry path)", col, c.Type)
 			continue
 		}
 		if v.Definition == "" {

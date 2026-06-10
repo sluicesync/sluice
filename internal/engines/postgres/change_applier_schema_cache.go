@@ -43,9 +43,9 @@ import (
 //     the same-goroutine mutation in one place so the apply paths
 //     stay readable.
 //
-// Scope fence: this file does NOT touch the pkCache / colTypeCache /
-// generatedColCache (those are target-side caches for the writer
-// path, orthogonal to the source-IR active-version concern); does
+// Scope fence: this file does NOT touch the pkCache / colTypeCache
+// (those are target-side caches for the writer path, orthogonal to
+// the source-IR active-version concern); does
 // NOT add a per-row resolve (storage hits are prime-time only —
 // per-row is cache-only via ActiveSchema); does NOT wire backup-
 // envelope (Chunk D); does NOT touch broker / filter / incremental

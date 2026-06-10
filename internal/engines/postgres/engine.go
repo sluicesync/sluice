@@ -447,14 +447,13 @@ func (Engine) OpenChangeApplier(ctx context.Context, dsn string) (ir.ChangeAppli
 		return nil, err
 	}
 	return &ChangeApplier{
-		db:                db,
-		schema:            cfg.schema,
-		controlSchema:     cfg.schema,
-		pkCache:           make(map[string][]string),
-		conflictKeyCache:  make(map[string][]string),
-		colTypeCache:      make(map[string]map[string]ir.Type),
-		generatedColCache: make(map[string]map[string]bool),
-		activeSchema:      make(map[string]activeSchemaVersion),
+		db:               db,
+		schema:           cfg.schema,
+		controlSchema:    cfg.schema,
+		pkCache:          make(map[string][]string),
+		conflictKeyCache: make(map[string][]string),
+		colTypeCache:     make(map[string]map[string]*ir.Column),
+		activeSchema:     make(map[string]activeSchemaVersion),
 	}, nil
 }
 
