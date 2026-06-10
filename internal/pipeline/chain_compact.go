@@ -272,6 +272,8 @@ type plannedGroup struct {
 // lineage in store. See package doc + ADR-0046 §14d. Returns the
 // summary on success; any pre-flight refusal (encryption-keyset
 // boundary, codec mismatch, gap-between-segments) is a wrapped error.
+//
+//nolint:funlen // ratchet: pre-existing 234-line accretion; split when next touched (hold-the-line note in .golangci.yml)
 func CompactChain(ctx context.Context, store ir.BackupStore, opts CompactOpts) (*CompactResult, error) {
 	if opts.MergeWindow <= 0 {
 		return nil, errors.New("backup compact: --merge-window is required (positive duration)")

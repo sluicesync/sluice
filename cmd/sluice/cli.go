@@ -879,6 +879,7 @@ func (s *SyncStartCmd) validateFlagCombos() error {
 	return nil
 }
 
+//nolint:funlen // ratchet: pre-existing 212-line accretion; split when next touched (hold-the-line note in .golangci.yml)
 func (s *SyncStartCmd) Run(g *Globals) error {
 	cfg, err := config.Load(g.Config)
 	if err != nil {

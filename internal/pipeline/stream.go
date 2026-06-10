@@ -314,6 +314,8 @@ type BackupStream struct {
 // under `manifests/incr-<unix-millis>-<seq>.json` and one or more
 // change-chunk files under `chunks/_changes/<run-namespace>/`.
 // `stream_state.json` is updated with the rollover's commit timestamp.
+//
+//nolint:funlen // ratchet: pre-existing 355-line accretion — stream.go is the flagged M2.6-leftover split target; carve it then drop this
 func (b *BackupStream) Run(ctx context.Context) error {
 	if err := b.validate(); err != nil {
 		return err

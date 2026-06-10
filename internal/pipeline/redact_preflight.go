@@ -127,6 +127,8 @@ var errRedactRandomizeRangeOverflow = errors.New("pipeline: randomize:int rule h
 // listing every offending rule when one or more fail; operators
 // see the full set in a single run instead of fix-rerun-fix-rerun
 // cycles.
+//
+//nolint:gocyclo // ratchet: pre-existing complexity-65 type-family switch; table-ify when next touched (hold-the-line note in .golangci.yml)
 func preflightRedactTypes(reg *redact.Registry, schema *ir.Schema) error {
 	if reg == nil || reg.Empty() || schema == nil {
 		return nil
