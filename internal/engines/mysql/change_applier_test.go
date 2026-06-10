@@ -106,7 +106,10 @@ func TestBuildInsertSQL(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			gotSQL, gotArgs := buildInsertSQL(c.schema, c.table, c.row, c.pk, nil)
+			gotSQL, gotArgs, err := buildInsertSQL(c.schema, c.table, c.row, c.pk, nil)
+			if err != nil {
+				t.Fatalf("buildInsertSQL: %v", err)
+			}
 			if gotSQL != c.wantSQL {
 				t.Errorf("\n got SQL: %q\nwant SQL: %q", gotSQL, c.wantSQL)
 			}
@@ -121,7 +124,10 @@ func TestBuildUpdateSQL(t *testing.T) {
 	before := ir.Row{"id": int64(7), "email": "old@example.com"}
 	after := ir.Row{"id": int64(7), "email": "new@example.com", "active": false}
 
-	gotSQL, gotArgs := buildUpdateSQL("src", "users", before, after, nil)
+	gotSQL, gotArgs, err := buildUpdateSQL("src", "users", before, after, nil)
+	if err != nil {
+		t.Fatalf("buildUpdateSQL: %v", err)
+	}
 	wantSQL := "UPDATE `src`.`users` SET `active` = ?, `email` = ?, `id` = ? WHERE `email` = ? AND `id` = ?"
 	if gotSQL != wantSQL {
 		t.Errorf("\n got: %q\nwant: %q", gotSQL, wantSQL)
@@ -135,7 +141,10 @@ func TestBuildUpdateSQL(t *testing.T) {
 
 func TestBuildDeleteSQL(t *testing.T) {
 	before := ir.Row{"id": int64(7), "email": "alice@example.com"}
-	gotSQL, gotArgs := buildDeleteSQL("src", "users", before, nil)
+	gotSQL, gotArgs, err := buildDeleteSQL("src", "users", before, nil)
+	if err != nil {
+		t.Fatalf("buildDeleteSQL: %v", err)
+	}
 	wantSQL := "DELETE FROM `src`.`users` WHERE `email` = ? AND `id` = ?"
 	if gotSQL != wantSQL {
 		t.Errorf("\n got: %q\nwant: %q", gotSQL, wantSQL)
@@ -164,7 +173,10 @@ func TestBuildWhereClause_NullHandling(t *testing.T) {
 		"email": nil, // NULL — must produce IS NULL, not = NULL
 		"name":  "alice",
 	}
-	gotSQL, gotArgs := buildWhereClause(row, nil)
+	gotSQL, gotArgs, err := buildWhereClause(row, nil)
+	if err != nil {
+		t.Fatalf("buildWhereClause: %v", err)
+	}
 	wantSQL := "`email` IS NULL AND `id` = ? AND `name` = ?"
 	if gotSQL != wantSQL {
 		t.Errorf("\n got: %q\nwant: %q", gotSQL, wantSQL)
@@ -178,7 +190,10 @@ func TestBuildWhereClause_NullHandling(t *testing.T) {
 
 func TestBuildSetClause(t *testing.T) {
 	row := ir.Row{"a": int64(1), "b": "x"}
-	gotSQL, gotArgs := buildSetClause(row, nil)
+	gotSQL, gotArgs, err := buildSetClause(row, nil)
+	if err != nil {
+		t.Fatalf("buildSetClause: %v", err)
+	}
 	wantSQL := "`a` = ?, `b` = ?"
 	if gotSQL != wantSQL {
 		t.Errorf("\n got: %q\nwant: %q", gotSQL, wantSQL)
@@ -207,7 +222,10 @@ func TestBuildInsertSQL_JSONColumnRoutesThroughPrepareValue(t *testing.T) {
 		"data": {Name: "data", Type: ir.JSON{Binary: true}},
 	}
 
-	_, gotArgs := buildInsertSQL("src", "docs", row, []string{"id"}, colTypes)
+	_, gotArgs, err := buildInsertSQL("src", "docs", row, []string{"id"}, colTypes)
+	if err != nil {
+		t.Fatalf("buildInsertSQL: %v", err)
+	}
 	// Sorted column order: data, id. data must be a string (not []byte).
 	if len(gotArgs) != 2 {
 		t.Fatalf("args length = %d; want 2", len(gotArgs))
@@ -233,7 +251,10 @@ func TestBuildSetClause_JSONColumnRoutesThroughPrepareValue(t *testing.T) {
 		"data": {Name: "data", Type: ir.JSON{Binary: true}},
 	}
 
-	_, gotArgs := buildSetClause(after, colTypes)
+	_, gotArgs, err := buildSetClause(after, colTypes)
+	if err != nil {
+		t.Fatalf("buildSetClause: %v", err)
+	}
 	if len(gotArgs) != 2 {
 		t.Fatalf("args length = %d; want 2", len(gotArgs))
 	}
@@ -263,7 +284,10 @@ func TestBuildWhereClause_JSONColumnRoutesThroughPrepareValue(t *testing.T) {
 		"data": {Name: "data", Type: ir.JSON{Binary: true}},
 	}
 
-	gotSQL, gotArgs := buildWhereClause(before, colTypes)
+	gotSQL, gotArgs, err := buildWhereClause(before, colTypes)
+	if err != nil {
+		t.Fatalf("buildWhereClause: %v", err)
+	}
 	wantSQL := "`data` = CAST(? AS JSON) AND `id` = ?"
 	if gotSQL != wantSQL {
 		t.Errorf("\n got SQL: %q\nwant SQL: %q (Bug 6: WHERE without CAST AS JSON silently matches zero rows)", gotSQL, wantSQL)
@@ -285,10 +309,18 @@ func TestBuildWhereClause_JSONColumnRoutesThroughPrepareValue(t *testing.T) {
 // passed through unchanged. Same shape as the pre-Bug-6 behavior.
 func TestPrepareApplierValue_FallsBackOnMissingType(t *testing.T) {
 	raw := []byte(`{"k":"v"}`)
-	if got := prepareApplierValue(raw, nil, "data"); !reflect.DeepEqual(got, raw) {
+	got, err := prepareApplierValue(raw, nil, "data")
+	if err != nil {
+		t.Fatalf("nil colTypes: unexpected err: %v", err)
+	}
+	if !reflect.DeepEqual(got, raw) {
 		t.Errorf("nil colTypes: got %#v; want raw value passthrough", got)
 	}
-	if got := prepareApplierValue(raw, map[string]*ir.Column{}, "data"); !reflect.DeepEqual(got, raw) {
+	got, err = prepareApplierValue(raw, map[string]*ir.Column{}, "data")
+	if err != nil {
+		t.Fatalf("missing colName: unexpected err: %v", err)
+	}
+	if !reflect.DeepEqual(got, raw) {
 		t.Errorf("missing colName: got %#v; want raw value passthrough", got)
 	}
 }
@@ -364,7 +396,10 @@ func TestBuildSQL_FiltersGeneratedColumns(t *testing.T) {
 
 	t.Run("INSERT excludes generated column from column list and ON DUPLICATE KEY UPDATE SET", func(t *testing.T) {
 		row := ir.Row{"id": int64(1), "price": "9.99", "cost": "4.50", "margin": "5.49"}
-		gotSQL, gotArgs := buildInsertSQL("src", "products", row, []string{"id"}, colTypes)
+		gotSQL, gotArgs, err := buildInsertSQL("src", "products", row, []string{"id"}, colTypes)
+		if err != nil {
+			t.Fatalf("buildInsertSQL: %v", err)
+		}
 		wantSQL := "INSERT INTO `src`.`products` (`cost`, `id`, `price`) VALUES (?, ?, ?) AS new ON DUPLICATE KEY UPDATE `cost` = new.`cost`, `price` = new.`price`"
 		if gotSQL != wantSQL {
 			t.Errorf("\n got SQL: %q\nwant SQL: %q", gotSQL, wantSQL)
@@ -379,7 +414,10 @@ func TestBuildSQL_FiltersGeneratedColumns(t *testing.T) {
 	t.Run("UPDATE SET excludes generated column", func(t *testing.T) {
 		before := ir.Row{"id": int64(1), "price": "9.99", "cost": "4.50", "margin": "5.49"}
 		after := ir.Row{"id": int64(1), "price": "12.99", "cost": "4.50", "margin": "8.49"}
-		gotSQL, _ := buildUpdateSQL("src", "products", before, after, colTypes)
+		gotSQL, _, err := buildUpdateSQL("src", "products", before, after, colTypes)
+		if err != nil {
+			t.Fatalf("buildUpdateSQL: %v", err)
+		}
 		// SET excludes margin; WHERE also excludes margin.
 		wantSQL := "UPDATE `src`.`products` SET `cost` = ?, `id` = ?, `price` = ? WHERE `cost` = ? AND `id` = ? AND `price` = ?"
 		if gotSQL != wantSQL {
@@ -389,7 +427,10 @@ func TestBuildSQL_FiltersGeneratedColumns(t *testing.T) {
 
 	t.Run("DELETE WHERE excludes generated column", func(t *testing.T) {
 		before := ir.Row{"id": int64(1), "price": "9.99", "cost": "4.50", "margin": "5.49"}
-		gotSQL, _ := buildDeleteSQL("src", "products", before, colTypes)
+		gotSQL, _, err := buildDeleteSQL("src", "products", before, colTypes)
+		if err != nil {
+			t.Fatalf("buildDeleteSQL: %v", err)
+		}
 		wantSQL := "DELETE FROM `src`.`products` WHERE `cost` = ? AND `id` = ? AND `price` = ?"
 		if gotSQL != wantSQL {
 			t.Errorf("\n got SQL: %q\nwant SQL: %q", gotSQL, wantSQL)
@@ -398,7 +439,10 @@ func TestBuildSQL_FiltersGeneratedColumns(t *testing.T) {
 
 	t.Run("nil colTypes: every column passes through (pre-fix shape)", func(t *testing.T) {
 		row := ir.Row{"id": int64(1), "margin": "5.49"}
-		gotSQL, _ := buildInsertSQL("src", "products", row, []string{"id"}, nil)
+		gotSQL, _, err := buildInsertSQL("src", "products", row, []string{"id"}, nil)
+		if err != nil {
+			t.Fatalf("buildInsertSQL: %v", err)
+		}
 		if !strings.Contains(gotSQL, "`margin`") {
 			t.Errorf("with nil colTypes the generated-column filter should not engage; got %q", gotSQL)
 		}

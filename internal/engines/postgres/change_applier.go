@@ -191,24 +191,21 @@ type ChangeApplier struct {
 	// reading the true PK.
 	conflictKeyCache map[string][]string
 
-	// colTypeCache maps "schema.table" → column-name → IR type. It
+	// colTypeCache maps "schema.table" → column-name → *ir.Column. It
 	// is the input to prepareValue for every value the applier
 	// binds; see the file-header comment for the JSON-column bug
-	// the parallel MySQL fix exists to address. Populated lazily on
-	// the first sight of a table — same shape as pkCache.
-	colTypeCache map[string]map[string]ir.Type
-
-	// generatedColCache maps "schema.table" → set of column names
-	// that are GENERATED ALWAYS AS (...) STORED on the target. The
-	// applier's SQL builders filter these out of every INSERT column
-	// list, UPDATE SET, and UPDATE/DELETE WHERE predicate — PG
-	// rejects non-DEFAULT values on generated columns (SQLSTATE 428C9
-	// "cannot insert a non-DEFAULT value into column"). Mirrors the
-	// bulk-load writer's existing filter; closes GitHub issue #12.
-	// Populated alongside colTypeCache in colTypesFor; the parallel
-	// map keeps the existing cache contract local-friendly while
-	// adding the generated-column awareness the apply path needs.
-	generatedColCache map[string]map[string]bool
+	// the parallel MySQL fix exists to address. The map carries the
+	// full Column descriptor (not just the IR type) so the builders
+	// read the generated-column flag ([ir.Column.IsGenerated]) off
+	// the same entry — the applier's SQL builders filter generated
+	// columns out of every INSERT column list, UPDATE SET, and
+	// UPDATE/DELETE WHERE predicate, because PG rejects non-DEFAULT
+	// values on generated columns (SQLSTATE 428C9 "cannot insert a
+	// non-DEFAULT value into column"; mirrors the bulk-load writer's
+	// filter, GitHub issue #12). Same descriptor shape as the MySQL
+	// applier's colTypeCache (repo-audit M2.1 convergence). Populated
+	// lazily on the first sight of a table — same shape as pkCache.
+	colTypeCache map[string]map[string]*ir.Column
 
 	// lsnFeedback is the slot-ack-after-apply tracker (Bug 15,
 	// ADR-0020). The applier reports the LSN of each successfully-
@@ -1135,8 +1132,7 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 		if err != nil {
 			return fmt.Errorf("postgres: applier: column types for %s.%s: %w", schema, v.Table, err)
 		}
-		generated := a.generatedColsFor(schema, v.Table)
-		stmt, args, err := buildInsertSQL(schema, v.Table, v.Row, key, colTypes, generated)
+		stmt, args, err := buildInsertSQL(schema, v.Table, v.Row, key, colTypes)
 		if err != nil {
 			return fmt.Errorf("postgres: applier: build insert for %s.%s: %w", schema, v.Table, err)
 		}
@@ -1155,8 +1151,7 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 		if err != nil {
 			return fmt.Errorf("postgres: applier: column types for %s.%s: %w", schema, v.Table, err)
 		}
-		generated := a.generatedColsFor(schema, v.Table)
-		stmt, args, err := buildUpdateSQL(schema, v.Table, v.Before, v.After, colTypes, generated)
+		stmt, args, err := buildUpdateSQL(schema, v.Table, v.Before, v.After, colTypes)
 		if err != nil {
 			return fmt.Errorf("postgres: applier: build update for %s.%s: %w", schema, v.Table, err)
 		}
@@ -1181,8 +1176,7 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 		if err != nil {
 			return fmt.Errorf("postgres: applier: column types for %s.%s: %w", schema, v.Table, err)
 		}
-		generated := a.generatedColsFor(schema, v.Table)
-		stmt, args, err := buildDeleteSQL(schema, v.Table, v.Before, colTypes, generated)
+		stmt, args, err := buildDeleteSQL(schema, v.Table, v.Before, colTypes)
 		if err != nil {
 			return fmt.Errorf("postgres: applier: build delete for %s.%s: %w", schema, v.Table, err)
 		}
@@ -1355,54 +1349,40 @@ func (a *ChangeApplier) conflictKeyFor(ctx context.Context, tx *sql.Tx, schema, 
 	return key, nil
 }
 
-// generatedColsFor returns the set of generated-column names for
-// the named table, populated alongside colTypesFor. Builders use it
-// to filter generated columns out of INSERT column lists, UPDATE
-// SET clauses, and UPDATE/DELETE WHERE predicates — PG rejects
-// non-DEFAULT values on generated columns (SQLSTATE 428C9). Empty
-// map for tables with no generated columns; nil-tolerant for unit
-// tests using a hand-built fixture (returns false for any column).
-//
-// Cache is populated as a side effect of colTypesFor, so the same
-// information_schema round-trip covers both the type map and the
-// generated-column set.
-func (a *ChangeApplier) generatedColsFor(schema, table string) map[string]bool {
-	if a.generatedColCache == nil {
-		return nil
-	}
-	return a.generatedColCache[schema+"."+table]
-}
-
-// colTypesFor returns the cached column-name → IR type map for the
+// colTypesFor returns the cached column-name → *ir.Column map for the
 // named table, loading it on the first sight of the table. The map
 // is consulted for every value the applier binds so prepareValue can
-// shape Array / Geometry / future special-cased values for pgx.
+// shape Array / Geometry / future special-cased values for pgx, and
+// carries the generated-column flag the builders filter on
+// ([ir.Column.IsGenerated] — SQLSTATE 428C9, GitHub issue #12).
 //
 // The lookup uses information_schema directly (the same source the
 // schema reader's populateColumns uses) and runs the existing
 // translateType to produce IR types — keeping the applier's view of
 // "what does this column hold" in lockstep with the rest of the
 // engine.
-func (a *ChangeApplier) colTypesFor(ctx context.Context, schema, table string) (map[string]ir.Type, error) {
+func (a *ChangeApplier) colTypesFor(ctx context.Context, schema, table string) (map[string]*ir.Column, error) {
 	qn := schema + "." + table
 	if cached, ok := a.colTypeCache[qn]; ok {
 		return cached, nil
 	}
-	out, generated, err := loadColumnTypes(ctx, a.db, schema, table)
+	out, err := loadColumnTypes(ctx, a.db, schema, table)
 	if err != nil {
 		return nil, err
 	}
 	a.colTypeCache[qn] = out
-	if a.generatedColCache != nil {
-		a.generatedColCache[qn] = generated
-	}
 	return out, nil
 }
 
 // loadColumnTypes queries information_schema for the column list of
-// schema.table and produces a column-name → IR type map. Mirrors
+// schema.table and produces a column-name → *ir.Column map. Mirrors
 // SchemaReader.populateColumns minus the index/FK/PK plumbing the
-// applier doesn't need.
+// applier doesn't need. Each Column carries only the fields the
+// apply path consults — Type plus the Generated* triple (which makes
+// [ir.Column.IsGenerated] truthful for the builders' filter);
+// nullability/default/comment metadata stays unpopulated because no
+// applier code reads it. The descriptor shape matches the MySQL
+// applier's colTypeCache (repo-audit M2.1 convergence).
 //
 // Enum-valued columns are resolved through readEnumValuesForSchema,
 // which loads the enum type values in the same call. Arrays of
@@ -1415,10 +1395,10 @@ func (a *ChangeApplier) colTypesFor(ctx context.Context, schema, table string) (
 // so for replicated UPDATE/DELETE rows). When the cross-engine
 // PostGIS replication path lands we'll need to extend this to read
 // the geometry_columns view too.
-func loadColumnTypes(ctx context.Context, db *sql.DB, schema, table string) (types map[string]ir.Type, generated map[string]bool, err error) {
+func loadColumnTypes(ctx context.Context, db *sql.DB, schema, table string) (map[string]*ir.Column, error) {
 	enumValues, err := readEnumValuesForSchema(ctx, db, schema)
 	if err != nil {
-		return nil, nil, fmt.Errorf("postgres: applier: read enum values: %w", err)
+		return nil, fmt.Errorf("postgres: applier: read enum values: %w", err)
 	}
 
 	// is_generated has been in information_schema.columns since PG 12
@@ -1447,6 +1427,7 @@ func loadColumnTypes(ctx context.Context, db *sql.DB, schema, table string) (typ
 			c.is_identity,
 			c.column_default,
 			c.is_generated,
+			COALESCE(c.generation_expression, ''),
 			COALESCE(pg_catalog.format_type(a.atttypid, a.atttypmod), '')
 		FROM   information_schema.columns c
 		LEFT JOIN pg_class      cl   ON cl.relname    = c.table_name
@@ -1462,12 +1443,11 @@ func loadColumnTypes(ctx context.Context, db *sql.DB, schema, table string) (typ
 
 	rows, err := db.QueryContext(ctx, q, schema, table)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	defer func() { _ = rows.Close() }()
 
-	types = map[string]ir.Type{}
-	generated = map[string]bool{}
+	cols := map[string]*ir.Column{}
 	for rows.Next() {
 		var (
 			colName, dataType, udtName string
@@ -1476,18 +1456,16 @@ func loadColumnTypes(ctx context.Context, db *sql.DB, schema, table string) (typ
 			isIdentity                 string
 			columnDefault              sql.NullString
 			isGenerated                string
+			genExpr                    string
 			formatType                 string
 		)
 		if err := rows.Scan(
 			&colName, &dataType, &udtName,
 			&charMaxLen, &numPrec, &numScale, &dtPrec,
-			&isIdentity, &columnDefault, &isGenerated,
+			&isIdentity, &columnDefault, &isGenerated, &genExpr,
 			&formatType,
 		); err != nil {
-			return nil, nil, err
-		}
-		if strings.EqualFold(isGenerated, "ALWAYS") {
-			generated[colName] = true
+			return nil, err
 		}
 
 		meta := columnMeta{
@@ -1520,7 +1498,7 @@ func loadColumnTypes(ctx context.Context, db *sql.DB, schema, table string) (typ
 				// the schema reader surfaces them: an applier that
 				// can't shape the value will fail on the wire and the
 				// operator deserves a precise message.
-				return nil, nil, fmt.Errorf("postgres: applier: array column %s.%s has unsupported element type %q", table, colName, udtName)
+				return nil, fmt.Errorf("postgres: applier: array column %s.%s has unsupported element type %q", table, colName, udtName)
 			}
 			meta.ArrayElement = &columnMeta{
 				DataType: elemDataType,
@@ -1530,21 +1508,32 @@ func loadColumnTypes(ctx context.Context, db *sql.DB, schema, table string) (typ
 
 		typ, err := translateType(meta)
 		if err != nil {
-			return nil, nil, fmt.Errorf("postgres: applier: translate %s.%s: %w", table, colName, err)
+			return nil, fmt.Errorf("postgres: applier: translate %s.%s: %w", table, colName, err)
 		}
-		types[colName] = typ
+		col := &ir.Column{Name: colName, Type: typ}
+		// Postgres only supports STORED generated columns today;
+		// is_generated = 'ALWAYS' implies STORED (same reading as
+		// SchemaReader.populateColumns). Carrying the expression on
+		// the Column makes [ir.Column.IsGenerated] truthful, which is
+		// what the builders' generated-column filter keys on.
+		if strings.EqualFold(isGenerated, "ALWAYS") && genExpr != "" {
+			col.GeneratedExpr = genExpr
+			col.GeneratedStored = true
+			col.GeneratedExprDialect = dialectName
+		}
+		cols[colName] = col
 	}
 	if err := rows.Err(); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	if len(types) == 0 {
+	if len(cols) == 0 {
 		// Empty information_schema result: the table doesn't exist
 		// on the destination. Wrap [errUnknownTable] so callers can
 		// branch on errors.Is and skip the event with a warning
 		// (Bug 13 defence-in-depth). See [ChangeApplier.dispatch].
-		return nil, nil, fmt.Errorf("%w: %s.%s", errUnknownTable, schema, table)
+		return nil, fmt.Errorf("%w: %s.%s", errUnknownTable, schema, table)
 	}
-	return types, generated, nil
+	return cols, nil
 }
 
 // readEnumValuesForSchema is the standalone variant of
@@ -1774,13 +1763,13 @@ func loadConflictKey(ctx context.Context, tx *sql.Tx, schema, table string) ([]s
 // UNIQUE index), falls back to a plain INSERT — see the ChangeApplier
 // package doc for the resume-idempotency caveat.
 //
-// colTypes maps column names to their IR types and is the input to
-// prepareValue. A missing entry (nil map, or column not present) is
-// tolerated and the raw value is bound — preserving the pre-Bug-6
-// shape so unit tests without a populated cache still produce valid
-// SQL.
-func buildInsertSQL(schema, table string, row ir.Row, key []string, colTypes map[string]ir.Type, generated map[string]bool) (sqlStmt string, args []any, err error) {
-	cols := nonGeneratedRowKeys(row, generated)
+// colTypes maps column names to their full IR descriptors and is the
+// input to prepareValue and the generated-column filter. A missing
+// entry (nil map, or column not present) is tolerated and the raw
+// value is bound — preserving the pre-Bug-6 shape so unit tests
+// without a populated cache still produce valid SQL.
+func buildInsertSQL(schema, table string, row ir.Row, key []string, colTypes map[string]*ir.Column) (sqlStmt string, args []any, err error) {
+	cols := nonGeneratedRowKeys(row, colTypes)
 	args = make([]any, 0, len(cols))
 	colSQL := make([]string, len(cols))
 	for i, c := range cols {
@@ -1848,13 +1837,13 @@ func buildInsertSQL(schema, table string, row ir.Row, key []string, colTypes map
 // in After (unchanged-column detection is a v1.5 optimization).
 // WHERE uses every column in Before with NULL-aware predicate
 // building.
-func buildUpdateSQL(schema, table string, before, after ir.Row, colTypes map[string]ir.Type, generated map[string]bool) (sqlStmt string, args []any, err error) {
+func buildUpdateSQL(schema, table string, before, after ir.Row, colTypes map[string]*ir.Column) (sqlStmt string, args []any, err error) {
 	tableRef := quoteIdent(schema) + "." + quoteIdent(table)
-	setSQL, setArgs, err := buildSetClause(after, 1, colTypes, generated)
+	setSQL, setArgs, err := buildSetClause(after, 1, colTypes)
 	if err != nil {
 		return "", nil, err
 	}
-	whereSQL, whereArgs, err := buildWhereClause(before, len(setArgs)+1, colTypes, generated)
+	whereSQL, whereArgs, err := buildWhereClause(before, len(setArgs)+1, colTypes)
 	if err != nil {
 		return "", nil, err
 	}
@@ -1867,9 +1856,9 @@ func buildUpdateSQL(schema, table string, before, after ir.Row, colTypes map[str
 
 // buildDeleteSQL builds a DELETE statement using the Before image
 // as the WHERE predicate.
-func buildDeleteSQL(schema, table string, before ir.Row, colTypes map[string]ir.Type, generated map[string]bool) (sqlStmt string, args []any, err error) {
+func buildDeleteSQL(schema, table string, before ir.Row, colTypes map[string]*ir.Column) (sqlStmt string, args []any, err error) {
 	tableRef := quoteIdent(schema) + "." + quoteIdent(table)
-	whereSQL, whereArgs, err := buildWhereClause(before, 1, colTypes, generated)
+	whereSQL, whereArgs, err := buildWhereClause(before, 1, colTypes)
 	if err != nil {
 		return "", nil, err
 	}
@@ -1895,8 +1884,8 @@ func buildTruncateSQL(schema, table string, cascade, restartIdentity bool) strin
 // startIdx is the next available placeholder number — Postgres uses
 // numbered placeholders (unlike MySQL's `?`), so a SET + WHERE
 // combination needs to share a sequence.
-func buildSetClause(row ir.Row, startIdx int, colTypes map[string]ir.Type, generated map[string]bool) (clause string, args []any, err error) {
-	cols := nonGeneratedRowKeys(row, generated)
+func buildSetClause(row ir.Row, startIdx int, colTypes map[string]*ir.Column) (clause string, args []any, err error) {
+	cols := nonGeneratedRowKeys(row, colTypes)
 	parts := make([]string, len(cols))
 	args = make([]any, 0, len(cols))
 	for i, c := range cols {
@@ -1921,8 +1910,8 @@ func buildSetClause(row ir.Row, startIdx int, colTypes map[string]ir.Type, gener
 // value (floating-point precision / NULL-coalescing differences are
 // realistic). The PK + remaining-column equality is sufficient to
 // identify the row.
-func buildWhereClause(row ir.Row, startIdx int, colTypes map[string]ir.Type, generated map[string]bool) (clause string, args []any, err error) {
-	cols := nonGeneratedRowKeys(row, generated)
+func buildWhereClause(row ir.Row, startIdx int, colTypes map[string]*ir.Column) (clause string, args []any, err error) {
+	cols := nonGeneratedRowKeys(row, colTypes)
 	parts := make([]string, 0, len(cols))
 	args = make([]any, 0, len(cols))
 	idx := startIdx
@@ -1967,12 +1956,12 @@ func buildWhereClause(row ir.Row, startIdx int, colTypes map[string]ir.Type, gen
 // PG text-IO accepts the bytea-hex form as a syntactic accident;
 // the cast makes the apply unambiguous for every verbatim family.
 // v0.92.3 closure.
-func equalityPredicate(col string, paramIdx int, colTypes map[string]ir.Type) string {
-	if t, ok := colTypes[col]; ok {
-		if j, isJSON := t.(ir.JSON); isJSON && !j.Binary {
+func equalityPredicate(col string, paramIdx int, colTypes map[string]*ir.Column) string {
+	if c, ok := colTypes[col]; ok && c != nil {
+		if j, isJSON := c.Type.(ir.JSON); isJSON && !j.Binary {
 			return fmt.Sprintf("%s::text = $%d::text", quoteIdent(col), paramIdx)
 		}
-		if v, isVerbatim := t.(ir.VerbatimType); isVerbatim {
+		if v, isVerbatim := c.Type.(ir.VerbatimType); isVerbatim {
 			return fmt.Sprintf("%s::text = %s::text", quoteIdent(col), verbatimPlaceholder(paramIdx, v))
 		}
 	}
@@ -1997,39 +1986,41 @@ func verbatimPlaceholder(paramIdx int, t ir.VerbatimType) string {
 // the explicit cast — same v0.92.3 Bug-97 wire-encoding closure as
 // equalityPredicate. The WHERE/equality predicate has its own
 // renderer because it also needs to cast the LEFT side.
-func applyPlaceholder(col string, paramIdx int, colTypes map[string]ir.Type) string {
-	if t, ok := colTypes[col]; ok {
-		if v, isVerbatim := t.(ir.VerbatimType); isVerbatim {
+func applyPlaceholder(col string, paramIdx int, colTypes map[string]*ir.Column) string {
+	if c, ok := colTypes[col]; ok && c != nil {
+		if v, isVerbatim := c.Type.(ir.VerbatimType); isVerbatim {
 			return verbatimPlaceholder(paramIdx, v)
 		}
 	}
 	return fmt.Sprintf("$%d", paramIdx)
 }
 
-// nonGeneratedRowKeys returns the row's keys in sorted order with
-// any column flagged in `generated` filtered out. PG rejects
-// non-DEFAULT values on generated columns (SQLSTATE 428C9 "cannot
-// insert a non-DEFAULT value into column"), so INSERT column lists
-// and UPDATE SET clauses must exclude them; including them in
-// UPDATE/DELETE WHERE risks silent zero-rows-affected (see the
-// buildWhereClause docstring).
+// nonGeneratedRowKeys returns the row's keys in sorted order, filtering
+// out any column the colTypes map identifies as a generated column
+// (Column.GeneratedExpr non-empty). PG rejects non-DEFAULT values on
+// generated columns (SQLSTATE 428C9 "cannot insert a non-DEFAULT value
+// into column"), so INSERT column lists and UPDATE SET clauses must
+// exclude them; including them in UPDATE/DELETE WHERE risks silent
+// zero-rows-affected (see the buildWhereClause docstring).
 //
 // Mirrors the bulk-load writer's existing column-list filter
 // (ADR-0026:100, row_reader.go). The CDC apply path was historically
 // missing this filter — see GitHub issue #12 / v0.40.0.
 //
-// A nil `generated` map is tolerant: with no generated-column
-// info, every row key passes through. This preserves the pre-fix
-// behaviour for unit tests using hand-built fixtures and for the
-// small race window before the applier's lazy cache populates.
-func nonGeneratedRowKeys(row ir.Row, generated map[string]bool) []string {
+// A nil or partial colTypes map (cache cold, column unknown) is
+// tolerant: columns not in the map are treated as non-generated and
+// included. This preserves the pre-fix behaviour for unit tests using
+// hand-built fixtures and for the small race window before the
+// applier's lazy cache populates.
+func nonGeneratedRowKeys(row ir.Row, colTypes map[string]*ir.Column) []string {
 	all := sortedKeys(row)
-	if len(generated) == 0 {
+	if len(colTypes) == 0 {
 		return all
 	}
 	out := make([]string, 0, len(all))
 	for _, c := range all {
-		if generated[c] {
+		col, ok := colTypes[c]
+		if ok && col != nil && col.IsGenerated() {
 			continue
 		}
 		out = append(out, c)
@@ -2061,19 +2052,19 @@ func nonGeneratedRowKeys(row ir.Row, generated map[string]bool) []string {
 // tsvector / int4range syntactically tolerated the bytea-hex form
 // pre-v0.92.4 and round-tripped, but the conversion is uniform —
 // every verbatim family lands as text on the wire.
-func prepareApplierValue(v any, colTypes map[string]ir.Type, colName string) (any, error) {
+func prepareApplierValue(v any, colTypes map[string]*ir.Column, colName string) (any, error) {
 	if colTypes == nil {
 		return v, nil
 	}
-	t, ok := colTypes[colName]
-	if !ok {
+	col, ok := colTypes[colName]
+	if !ok || col == nil {
 		return v, nil
 	}
-	out, err := prepareValue(v, t)
+	out, err := prepareValue(v, col.Type)
 	if err != nil {
 		return nil, err
 	}
-	if _, isVerbatim := t.(ir.VerbatimType); isVerbatim {
+	if _, isVerbatim := col.Type.(ir.VerbatimType); isVerbatim {
 		if b, isBytes := out.([]byte); isBytes {
 			return string(b), nil
 		}

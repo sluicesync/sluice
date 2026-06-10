@@ -949,7 +949,10 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 		if err != nil {
 			return fmt.Errorf("mysql: applier: column types for %s.%s: %w", schema, v.Table, err)
 		}
-		stmt, args := buildInsertSQL(schema, v.Table, v.Row, pk, colTypes)
+		stmt, args, err := buildInsertSQL(schema, v.Table, v.Row, pk, colTypes)
+		if err != nil {
+			return fmt.Errorf("mysql: applier: build insert for %s.%s: %w", schema, v.Table, err)
+		}
 		if _, err := a.txExec(ctx, tx, stmt, args...); err != nil {
 			return fmt.Errorf("mysql: applier: insert into %s.%s: %w", schema, v.Table, err)
 		}
@@ -961,7 +964,10 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 		if err != nil {
 			return fmt.Errorf("mysql: applier: column types for %s.%s: %w", schema, v.Table, err)
 		}
-		stmt, args := buildUpdateSQL(schema, v.Table, v.Before, v.After, colTypes)
+		stmt, args, err := buildUpdateSQL(schema, v.Table, v.Before, v.After, colTypes)
+		if err != nil {
+			return fmt.Errorf("mysql: applier: build update for %s.%s: %w", schema, v.Table, err)
+		}
 		// Update misses are tolerated (zero rows affected). On resume
 		// we may replay an Update whose target row was already
 		// updated — that's expected, not an error. Silent zero-rows-
@@ -981,7 +987,10 @@ func (a *ChangeApplier) dispatch(ctx context.Context, tx *sql.Tx, streamID strin
 		if err != nil {
 			return fmt.Errorf("mysql: applier: column types for %s.%s: %w", schema, v.Table, err)
 		}
-		stmt, args := buildDeleteSQL(schema, v.Table, v.Before, colTypes)
+		stmt, args, err := buildDeleteSQL(schema, v.Table, v.Before, colTypes)
+		if err != nil {
+			return fmt.Errorf("mysql: applier: build delete for %s.%s: %w", schema, v.Table, err)
+		}
 		// Delete misses are tolerated for the same reason as Update.
 		res, err := a.txExec(ctx, tx, stmt, args...)
 		if err != nil {
@@ -1236,13 +1245,23 @@ func loadPrimaryKey(ctx context.Context, tx *sql.Tx, schema, table string) ([]st
 // pre-Bug-6 shape — so that callers without a populated cache
 // (currently only unit tests pre-dating this fix) still produce
 // valid SQL.
-func buildInsertSQL(schema, table string, row ir.Row, pk []string, colTypes map[string]*ir.Column) (sqlStmt string, args []any) {
+//
+// The error return is the PG-applier signature convergence (repo-audit
+// M2.1): today no MySQL value rule refuses, so it is always nil — it
+// exists so a future error-producing value rule surfaces loudly on
+// this path without another signature change. Same on the
+// buildUpdateSQL / buildDeleteSQL / clause-builder siblings.
+func buildInsertSQL(schema, table string, row ir.Row, pk []string, colTypes map[string]*ir.Column) (sqlStmt string, args []any, err error) {
 	cols := nonGeneratedRowKeys(row, colTypes)
 	args = make([]any, 0, len(cols))
 	colSQL := make([]string, len(cols))
 	for i, c := range cols {
 		colSQL[i] = quoteIdent(c)
-		args = append(args, prepareApplierValue(row[c], colTypes, c))
+		v, perr := prepareApplierValue(row[c], colTypes, c)
+		if perr != nil {
+			return "", nil, fmt.Errorf("column %q: %w", c, perr)
+		}
+		args = append(args, v)
 	}
 
 	tableRef := quoteIdent(schema) + "." + quoteIdent(table)
@@ -1325,30 +1344,39 @@ func buildInsertSQL(schema, table string, row ir.Row, pk []string, colTypes map[
 		}
 		sb.WriteString(strings.Join(parts, ", "))
 	}
-	return sb.String(), args
+	return sb.String(), args, nil
 }
 
 // buildUpdateSQL builds an UPDATE statement. SET uses every column
 // in After (including ones whose value didn't change — unchanged-
 // column detection is a v1.5 optimization). WHERE uses every column
 // in Before with NULL-aware predicate building.
-func buildUpdateSQL(schema, table string, before, after ir.Row, colTypes map[string]*ir.Column) (sqlStmt string, args []any) {
+func buildUpdateSQL(schema, table string, before, after ir.Row, colTypes map[string]*ir.Column) (sqlStmt string, args []any, err error) {
 	tableRef := quoteIdent(schema) + "." + quoteIdent(table)
-	setSQL, setArgs := buildSetClause(after, colTypes)
-	whereSQL, whereArgs := buildWhereClause(before, colTypes)
+	setSQL, setArgs, err := buildSetClause(after, colTypes)
+	if err != nil {
+		return "", nil, err
+	}
+	whereSQL, whereArgs, err := buildWhereClause(before, colTypes)
+	if err != nil {
+		return "", nil, err
+	}
 
 	args = make([]any, 0, len(setArgs)+len(whereArgs))
 	args = append(args, setArgs...)
 	args = append(args, whereArgs...)
-	return "UPDATE " + tableRef + " SET " + setSQL + " WHERE " + whereSQL, args
+	return "UPDATE " + tableRef + " SET " + setSQL + " WHERE " + whereSQL, args, nil
 }
 
 // buildDeleteSQL builds a DELETE statement using the Before image
 // as the WHERE predicate.
-func buildDeleteSQL(schema, table string, before ir.Row, colTypes map[string]*ir.Column) (sqlStmt string, args []any) {
+func buildDeleteSQL(schema, table string, before ir.Row, colTypes map[string]*ir.Column) (sqlStmt string, args []any, err error) {
 	tableRef := quoteIdent(schema) + "." + quoteIdent(table)
-	whereSQL, whereArgs := buildWhereClause(before, colTypes)
-	return "DELETE FROM " + tableRef + " WHERE " + whereSQL, whereArgs
+	whereSQL, whereArgs, err := buildWhereClause(before, colTypes)
+	if err != nil {
+		return "", nil, err
+	}
+	return "DELETE FROM " + tableRef + " WHERE " + whereSQL, whereArgs, nil
 }
 
 // buildTruncateSQL builds a TRUNCATE TABLE statement.
@@ -1359,15 +1387,19 @@ func buildTruncateSQL(schema, table string) string {
 // buildSetClause renders "col1 = ?, col2 = ?" for an UPDATE SET.
 // NULL values bind through database/sql normally; no special form
 // is needed in SET (unlike WHERE).
-func buildSetClause(row ir.Row, colTypes map[string]*ir.Column) (clause string, args []any) {
+func buildSetClause(row ir.Row, colTypes map[string]*ir.Column) (clause string, args []any, err error) {
 	cols := nonGeneratedRowKeys(row, colTypes)
 	parts := make([]string, len(cols))
 	args = make([]any, 0, len(cols))
 	for i, c := range cols {
 		parts[i] = quoteIdent(c) + " = ?"
-		args = append(args, prepareApplierValue(row[c], colTypes, c))
+		v, perr := prepareApplierValue(row[c], colTypes, c)
+		if perr != nil {
+			return "", nil, fmt.Errorf("column %q: %w", c, perr)
+		}
+		args = append(args, v)
 	}
-	return strings.Join(parts, ", "), args
+	return strings.Join(parts, ", "), args, nil
 }
 
 // buildWhereClause renders an AND-joined predicate with NULL-aware
@@ -1384,7 +1416,7 @@ func buildSetClause(row ir.Row, colTypes map[string]*ir.Column) (clause string, 
 // (whitespace, key order) the way operators expect. This is the
 // SQL-side half of the Bug 6 silent-failure fix; the value-shaping
 // half (prepareValue routing) is the other.
-func buildWhereClause(row ir.Row, colTypes map[string]*ir.Column) (clause string, args []any) {
+func buildWhereClause(row ir.Row, colTypes map[string]*ir.Column) (clause string, args []any, err error) {
 	cols := nonGeneratedRowKeys(row, colTypes)
 	parts := make([]string, 0, len(cols))
 	args = make([]any, 0, len(cols))
@@ -1395,9 +1427,13 @@ func buildWhereClause(row ir.Row, colTypes map[string]*ir.Column) (clause string
 			continue
 		}
 		parts = append(parts, quoteIdent(c)+" = "+placeholderFor(colTypes, c))
-		args = append(args, prepareApplierValue(v, colTypes, c))
+		prepared, perr := prepareApplierValue(v, colTypes, c)
+		if perr != nil {
+			return "", nil, fmt.Errorf("column %q: %w", c, perr)
+		}
+		args = append(args, prepared)
 	}
-	return strings.Join(parts, " AND "), args
+	return strings.Join(parts, " AND "), args, nil
 }
 
 // nonGeneratedRowKeys returns the row's keys in sorted order, filtering
@@ -1464,15 +1500,20 @@ func placeholderFor(colTypes map[string]*ir.Column, colName string) string {
 // JSON []byte → string conversion here means new shaping rules added
 // to prepareValue (for future IR types) are automatically picked up
 // by the applier without touching this file.
-func prepareApplierValue(v any, colTypes map[string]*ir.Column, colName string) any {
+//
+// The error return is always nil today (MySQL's prepareValue is
+// infallible) — it is the PG-applier signature convergence (repo-audit
+// M2.1), reserved so a future refusing value rule propagates loudly
+// through the builders without a signature change.
+func prepareApplierValue(v any, colTypes map[string]*ir.Column, colName string) (any, error) {
 	if colTypes == nil {
-		return v
+		return v, nil
 	}
 	col, ok := colTypes[colName]
 	if !ok || col == nil {
-		return v
+		return v, nil
 	}
-	return prepareValue(v, col)
+	return prepareValue(v, col), nil
 }
 
 // (sortedKeys is shared with the schema reader — see schema_reader.go
