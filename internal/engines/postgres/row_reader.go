@@ -184,10 +184,18 @@ func (r *RowReader) ReadRows(ctx context.Context, table *ir.Table) (<-chan ir.Ro
 		return nil, fmt.Errorf("postgres: ReadRows: query failed: %w", err)
 	}
 
-	out := make(chan ir.Row)
+	out := make(chan ir.Row, rowChanBuffer)
 	go r.stream(ctx, rows, table, out)
 	return out, nil
 }
+
+// rowChanBuffer is the bounded buffer on the reader's output channel:
+// it lets row decode overlap the downstream write instead of
+// rendezvous-alternating with it, while staying small enough that
+// back-pressure (and worst-case buffered bytes on wide rows) is
+// preserved. Mirrors the same-named constant in internal/pipeline
+// (see its doc comment for the checkpoint-correctness argument).
+const rowChanBuffer = 64
 
 // stream is the goroutine that scans rows from the database and pushes
 // them onto out as IR Rows. It owns rows and is responsible for

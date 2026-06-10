@@ -470,16 +470,20 @@ func (t *pkTracker) lastPK() ([]any, bool) {
 
 // teePKAndCount wraps the row channel with a tee that observes each
 // row's PK columns into the tracker, increments count, and invokes
-// onRow for the [progressTicker]. The downstream channel is unbuffered
-// so back-pressure flows naturally through the writer; closing
-// happens on src close or ctx cancellation.
+// onRow for the [progressTicker]. The downstream channel carries the
+// standard bounded buffer ([rowChanBuffer]) — back-pressure still
+// flows through the writer once the buffer fills; closing happens on
+// src close or ctx cancellation. The tracker may run ahead of the
+// writer by up to the buffered rows, which is safe because the resume
+// cursor is only persisted after the whole batch's WriteRows returns
+// (see the checkpoint note on [rowChanBuffer]).
 //
 // Mirrors [teeRows]'s shape but pulls the per-row hooks together since
 // the per-batch loop wants all three. onRow gets the row itself so
 // observers like [progressTicker.observeRow] can sum its byte cost
 // alongside the count.
 func teePKAndCount(ctx context.Context, src <-chan ir.Row, tracker *pkTracker, count *int64, onRow func(ir.Row)) <-chan ir.Row {
-	out := make(chan ir.Row)
+	out := make(chan ir.Row, rowChanBuffer)
 	go func() {
 		defer close(out)
 		for {

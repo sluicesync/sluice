@@ -26,17 +26,25 @@ import (
 type chanCopySource struct {
 	ctx     context.Context
 	rows    <-chan ir.Row
-	table   *ir.Table
-	current []any // values for the row Next just dequeued
-	err     error // sticky; once non-nil, Next returns false on every call
+	cols    []*ir.Column // non-generated columns, computed once — invariant per table
+	current []any        // values for the row Next just dequeued; reused across calls
+	err     error        // sticky; once non-nil, Next returns false on every call
 }
 
 // newChanCopySource builds a source bound to the given context,
 // table schema, and row channel. The source does not retain
 // ownership of any of these — the caller is still responsible for
 // the channel's lifecycle.
+//
+// The non-generated column filter is hoisted here: it is invariant
+// per table, and computing it inside Next cost one slice allocation
+// + filter walk per row (billions of transient allocs on a large
+// cross-engine copy). The values slice is likewise allocated once
+// and reused — pgx's CopyFrom copies what it needs before the next
+// Next call (see the Values doc comment).
 func newChanCopySource(ctx context.Context, table *ir.Table, rows <-chan ir.Row) *chanCopySource {
-	return &chanCopySource{ctx: ctx, table: table, rows: rows}
+	cols := nonGeneratedColumns(table.Columns)
+	return &chanCopySource{ctx: ctx, rows: rows, cols: cols, current: make([]any, len(cols))}
 }
 
 // Next blocks until a row arrives on the channel, the channel
@@ -56,17 +64,14 @@ func (s *chanCopySource) Next() bool {
 		if !ok {
 			return false
 		}
-		cols := nonGeneratedColumns(s.table.Columns)
-		values := make([]any, len(cols))
-		for i, col := range cols {
+		for i, col := range s.cols {
 			v, err := prepareValue(row[col.Name], col.Type)
 			if err != nil {
 				s.err = fmt.Errorf("column %q: %w", col.Name, err)
 				return false
 			}
-			values[i] = v
+			s.current[i] = v
 		}
-		s.current = values
 		return true
 	case <-s.ctx.Done():
 		s.err = s.ctx.Err()

@@ -111,10 +111,18 @@ func (r *RowReader) ReadRows(ctx context.Context, table *ir.Table) (<-chan ir.Ro
 		return nil, fmt.Errorf("mysql: ReadRows: query failed: %w", err)
 	}
 
-	out := make(chan ir.Row)
+	out := make(chan ir.Row, rowChanBuffer)
 	go r.stream(ctx, rows, table, out, cleanup)
 	return out, nil
 }
+
+// rowChanBuffer is the bounded buffer on the reader's output channel:
+// it lets row decode overlap the downstream write instead of
+// rendezvous-alternating with it, while staying small enough that
+// back-pressure (and worst-case buffered bytes on wide rows) is
+// preserved. Mirrors the same-named constant in internal/pipeline
+// (see its doc comment for the checkpoint-correctness argument).
+const rowChanBuffer = 64
 
 // queryFullScan runs the unbounded bulk-copy SELECT. On a VStream
 // (vtgate) reader it scopes `SET workload='olap'` to a DEDICATED

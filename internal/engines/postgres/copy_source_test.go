@@ -65,6 +65,29 @@ func TestChanCopySource_CleanDrain(t *testing.T) {
 	}
 }
 
+// BenchmarkChanCopySource_Next pins the per-row cost of the COPY
+// bridge. The column filter + values-slice allocation used to happen
+// inside Next (one slice alloc + filter walk per row — billions of
+// transient allocs on a large cross-engine copy); both are hoisted
+// into the constructor now, so Next should be alloc-free for plain
+// scalar values. Guards the hoist against regression: a meaningful
+// allocs/op increase here means someone moved per-table work back
+// into the per-row path.
+func BenchmarkChanCopySource_Next(b *testing.B) {
+	table := usersTableForCopySource()
+	ch := make(chan ir.Row, 1)
+	src := newChanCopySource(context.Background(), table, ch)
+	row := ir.Row{"id": int64(1), "email": "a@x"}
+
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		ch <- row
+		if !src.Next() {
+			b.Fatalf("Next returned false at iteration %d: %v", i, src.Err())
+		}
+	}
+}
+
 // TestChanCopySource_EmptyChannel covers the case where the channel
 // closes before any row arrives. Source should report end-of-stream
 // immediately with no error.
