@@ -49,6 +49,7 @@ import (
 	"log/slog"
 	"time"
 
+	"sluicesync.dev/sluice/internal/appliershared"
 	"sluicesync.dev/sluice/internal/ir"
 )
 
@@ -135,7 +136,7 @@ func (a *ChangeApplier) ApplyBatch(ctx context.Context, streamID string, changes
 				ctx, "mysql: applier: batch committed",
 				slog.String("stream_id", streamID),
 				slog.Int("rows", batchN),
-				slog.String("position_token", truncateBatchToken(lastPos.Token, 80)),
+				slog.String("position_token", appliershared.TruncateToken(lastPos.Token, 80)),
 			)
 		}
 		if channelClosed {
@@ -359,7 +360,7 @@ func (a *ChangeApplier) applyOneBatch(ctx context.Context, streamID string, chan
 					ctx, "mysql: applier: batch committed",
 					slog.String("stream_id", streamID),
 					slog.Int("rows", n),
-					slog.String("position_token", truncateBatchToken(lastPos.Token, 80)),
+					slog.String("position_token", appliershared.TruncateToken(lastPos.Token, 80)),
 				)
 				// Apply the truncate alone via the per-change path.
 				if err := a.applyOne(ctx, streamID, c); err != nil {
@@ -385,7 +386,7 @@ func (a *ChangeApplier) applyOneBatch(ctx context.Context, streamID string, chan
 					ctx, "mysql: applier: batch committed",
 					slog.String("stream_id", streamID),
 					slog.Int("rows", n),
-					slog.String("position_token", truncateBatchToken(lastPos.Token, 80)),
+					slog.String("position_token", appliershared.TruncateToken(lastPos.Token, 80)),
 				)
 				if err := a.applyOne(ctx, streamID, c); err != nil {
 					return 0, ir.Position{}, false, err
@@ -492,16 +493,4 @@ func (a *ChangeApplier) commitBatch(ctx context.Context, tx *sql.Tx, streamID, t
 		return classifyApplierError(fmt.Errorf("mysql: applier: commit: %w", err))
 	}
 	return nil
-}
-
-// truncateBatchToken trims a position token to maxLen characters
-// with an ellipsis when longer. Mirrors the streamer's
-// truncateDryRunToken helper; kept local so the applier doesn't
-// import the pipeline package. Position tokens are JSON blobs that
-// can run hundreds of bytes; the debug log line stays scannable.
-func truncateBatchToken(token string, maxLen int) string {
-	if len(token) <= maxLen {
-		return token
-	}
-	return token[:maxLen-1] + "…"
 }

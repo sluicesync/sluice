@@ -6,7 +6,6 @@ package mysql
 import (
 	"bytes"
 	"context"
-	"errors"
 	"log/slog"
 	"reflect"
 	"strings"
@@ -361,21 +360,6 @@ func TestLogZeroRowsAffected(t *testing.T) {
 	})
 }
 
-// TestApplierSchema covers the small fallback rule. The applier's
-// configured schema wins; the change's source-side schema is only
-// used when the applier wasn't given a default.
-func TestApplierSchema(t *testing.T) {
-	if got := applierSchema("default_db", "source_db"); got != "default_db" {
-		t.Errorf("default wins: got %q; want default_db", got)
-	}
-	if got := applierSchema("default_db", ""); got != "default_db" {
-		t.Errorf("empty change schema: got %q; want default_db", got)
-	}
-	if got := applierSchema("", "source_db"); got != "source_db" {
-		t.Errorf("empty default falls back to change schema: got %q; want source_db", got)
-	}
-}
-
 // TestBuildSQL_FiltersGeneratedColumns covers the GitHub issue #12 fix:
 // the CDC apply path must exclude STORED generated columns from
 // INSERT column lists, UPDATE SET clauses, and UPDATE/DELETE WHERE
@@ -486,56 +470,6 @@ func TestExecTimeoutCtx(t *testing.T) {
 		}
 		if dl.Before(start) || dl.After(start.Add(60*time.Millisecond)) {
 			t.Errorf("deadline %v outside expected window [%v, %v]", dl, start, start.Add(60*time.Millisecond))
-		}
-	})
-}
-
-// TestRunWithDeadline exercises the package-level watchdog that
-// [commitWithTimeout] delegates to (Bug 56, v0.52.1). The watchdog
-// race semantics need direct coverage because the production failure
-// mode (tx.Commit blocked inside crypto/tls.(*Conn).Read on a
-// half-closed PlanetScale destination) can't be reproduced in a unit
-// test — but the race + cancel + passthrough logic is testable with
-// synthetic closures.
-func TestRunWithDeadline(t *testing.T) {
-	t.Run("zero timeout: passthrough preserves return verbatim", func(t *testing.T) {
-		sentinel := errors.New("synthetic commit failure")
-		got := runWithDeadline(0, func() error { return sentinel })
-		if !errors.Is(got, sentinel) {
-			t.Errorf("zero-timeout passthrough lost the original error; got %v; want %v", got, sentinel)
-		}
-	})
-
-	t.Run("negative timeout: same passthrough", func(t *testing.T) {
-		got := runWithDeadline(-1*time.Second, func() error { return nil })
-		if got != nil {
-			t.Errorf("negative-timeout passthrough produced unexpected error: %v", got)
-		}
-	})
-
-	t.Run("positive timeout: fast f returns its own value", func(t *testing.T) {
-		sentinel := errors.New("fast f")
-		got := runWithDeadline(500*time.Millisecond, func() error { return sentinel })
-		if !errors.Is(got, sentinel) {
-			t.Errorf("fast-f race lost the original error; got %v; want %v", got, sentinel)
-		}
-	})
-
-	t.Run("positive timeout: slow f trips watchdog with DeadlineExceeded", func(t *testing.T) {
-		// f sleeps longer than the timeout; the watchdog must fire.
-		start := time.Now()
-		got := runWithDeadline(20*time.Millisecond, func() error {
-			time.Sleep(500 * time.Millisecond)
-			return nil
-		})
-		if !errors.Is(got, context.DeadlineExceeded) {
-			t.Errorf("slow-f watchdog did not return DeadlineExceeded; got %v", got)
-		}
-		// The wall-clock cost should match the timeout, not f's sleep.
-		// Allow generous slack for scheduler jitter, especially on CI.
-		elapsed := time.Since(start)
-		if elapsed > 100*time.Millisecond {
-			t.Errorf("watchdog took %v; expected ~20ms (cap 100ms)", elapsed)
 		}
 	})
 }

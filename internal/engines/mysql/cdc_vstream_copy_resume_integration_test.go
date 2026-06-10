@@ -486,7 +486,7 @@ func TestVStream_CopyResume_NoPKTable_CheckpointLagReSendUpserts(t *testing.T) {
 		t.Fatalf("EnsureControlTable: %v", err)
 	}
 	// The applier's configured schema (from targetDSN) is authoritative
-	// for write routing — see applierSchema — so the resumed Insert's
+	// for write routing — see appliershared.Schema — so the resumed Insert's
 	// source-side v.Schema doesn't need retargeting.
 
 	rdr, err := eng.OpenCDCReader(ctx, sluiceDSN)
