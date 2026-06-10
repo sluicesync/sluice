@@ -88,12 +88,17 @@ func TestIndexBuildJobsForTables_Parity(t *testing.T) {
 	w := &SchemaWriter{}
 	jobs := w.indexBuildJobsForTables([]*ir.Table{table})
 
-	gotNames := make([]string, 0, len(jobs))
-	for _, j := range jobs {
-		if j.tableName != "t" {
-			t.Errorf("job for unexpected table %q", j.tableName)
-		}
-		gotNames = append(gotNames, j.idx.Name)
+	// One job per table now (combined-ALTER model): the single job carries
+	// the table's full, sorted, skip-filtered index set.
+	if len(jobs) != 1 {
+		t.Fatalf("indexBuildJobsForTables = %d jobs; want 1 (one per table)", len(jobs))
+	}
+	if jobs[0].tableName != "t" {
+		t.Errorf("job for unexpected table %q", jobs[0].tableName)
+	}
+	gotNames := make([]string, 0, len(jobs[0].idxs))
+	for _, idx := range jobs[0].idxs {
+		gotNames = append(gotNames, idx.Name)
 	}
 	want := []string{"a_idx", "z_idx"} // sorted, seq_idx dropped
 	if !reflect.DeepEqual(gotNames, want) {

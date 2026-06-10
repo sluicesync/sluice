@@ -1073,20 +1073,33 @@ func emitIndexColumnListWithPrefix(cols []ir.IndexColumn, allowPrefix bool) stri
 // statement for a non-primary index. PRIMARY indexes are inline in
 // the CREATE TABLE statement and must not be passed here.
 func emitCreateIndex(tableName string, idx *ir.Index) (string, error) {
+	clause, err := emitAddIndexClause(idx)
+	if err != nil {
+		return "", err
+	}
+	return "ALTER TABLE " + quoteIdent(tableName) + " " + clause + ";", nil
+}
+
+// emitAddIndexClause renders a single `ADD [UNIQUE|FULLTEXT|SPATIAL] INDEX
+// name (cols) [USING …]` fragment — the body of one ADD clause without the
+// surrounding `ALTER TABLE t …;`. emitCreateIndex wraps one of these into a
+// standalone statement; emitCreateIndexesCombined (ADR-0080 follow-up) joins
+// several with commas into one ALTER so they share a single InnoDB scan.
+// Factored out so both paths render byte-identical clause text, preserving the
+// v0.99.30 SPATIAL/FULLTEXT prefix suppression and the USING storage hint.
+func emitAddIndexClause(idx *ir.Index) (string, error) {
 	if idx == nil {
-		return "", fmt.Errorf("mysql: emitCreateIndex: index is nil")
+		return "", fmt.Errorf("mysql: emitAddIndexClause: index is nil")
 	}
 	if strings.EqualFold(idx.Name, "PRIMARY") {
-		return "", fmt.Errorf("mysql: emitCreateIndex: PRIMARY index is inline in CREATE TABLE")
+		return "", fmt.Errorf("mysql: emitAddIndexClause: PRIMARY index is inline in CREATE TABLE")
 	}
 	if len(idx.Columns) == 0 {
-		return "", fmt.Errorf("mysql: emitCreateIndex: index %q has no columns", idx.Name)
+		return "", fmt.Errorf("mysql: emitAddIndexClause: index %q has no columns", idx.Name)
 	}
 
 	var sb strings.Builder
-	sb.WriteString("ALTER TABLE ")
-	sb.WriteString(quoteIdent(tableName))
-	sb.WriteString(" ADD ")
+	sb.WriteString("ADD ")
 
 	switch {
 	case idx.Kind == ir.IndexKindFullText:
@@ -1117,8 +1130,55 @@ func emitCreateIndex(tableName string, idx *ir.Index) (string, error) {
 		sb.WriteString(" USING HASH")
 	}
 
-	sb.WriteByte(';')
 	return sb.String(), nil
+}
+
+// indexCombinable reports whether idx may share a single ALTER TABLE with
+// other indexes (ADR-0080 follow-up). Regular and UNIQUE BTREE/HASH secondary
+// indexes are INPLACE-eligible and combine freely. FULLTEXT and SPATIAL must
+// each get their OWN statement:
+//
+//   - InnoDB permits only ONE ADD FULLTEXT INDEX per ALTER (Error 1795,
+//     "InnoDB presently supports one FULLTEXT index creation at a time"); the
+//     first FULLTEXT on a table also forces an ALGORITHM=COPY rebuild to add
+//     the hidden FTS_DOC_ID column.
+//   - SPATIAL indexes do not support LOCK=NONE, so folding one into the
+//     combined group would downgrade the whole statement's algorithm.
+//
+// Keeping them separate preserves the combined group's online INPLACE scan.
+func indexCombinable(idx *ir.Index) bool {
+	return idx.Kind != ir.IndexKindFullText && idx.Kind != ir.IndexKindSpatial
+}
+
+// emitCreateIndexesCombined renders the minimum set of ALTER TABLE statements
+// that builds every index in idxs (ADR-0080 follow-up). All combinable indexes
+// (see [indexCombinable]) collapse into ONE `ALTER TABLE t ADD INDEX …, ADD
+// UNIQUE INDEX …, …` so InnoDB scans the table once instead of once per index;
+// each FULLTEXT and each SPATIAL index gets its own standalone statement. The
+// combined statement preserves the incoming order of its clauses; the separate
+// statements follow, in incoming order. idxs must already be filtered (skip
+// set applied, no PRIMARY, no already-existing index) by the caller.
+func emitCreateIndexesCombined(tableName string, idxs []*ir.Index) ([]string, error) {
+	var combinedClauses []string
+	var separate []string
+	for _, idx := range idxs {
+		clause, err := emitAddIndexClause(idx)
+		if err != nil {
+			return nil, err
+		}
+		if indexCombinable(idx) {
+			combinedClauses = append(combinedClauses, clause)
+			continue
+		}
+		separate = append(separate, "ALTER TABLE "+quoteIdent(tableName)+" "+clause+";")
+	}
+
+	stmts := make([]string, 0, len(separate)+1)
+	if len(combinedClauses) > 0 {
+		stmts = append(stmts, "ALTER TABLE "+quoteIdent(tableName)+" "+strings.Join(combinedClauses, ", ")+";")
+	}
+	stmts = append(stmts, separate...)
+	return stmts, nil
 }
 
 // emitAddForeignKey renders an ALTER TABLE ... ADD CONSTRAINT

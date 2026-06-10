@@ -19,8 +19,10 @@
 // decrements under the mutex, onDone fires OUTSIDE the lock) drains the
 // orchestrator's completed-tables channel into a bounded worker pool, each
 // worker building one table's secondary indexes on its OWN connection via
-// the shared [SchemaWriter.buildOneIndex] (`ALTER TABLE … ADD INDEX`,
-// detect-then-skip for idempotent resume).
+// the shared [SchemaWriter.buildTableIndexes] (combined `ALTER TABLE … ADD
+// INDEX …, ADD INDEX …` for the table's BTREE/UNIQUE indexes in one InnoDB
+// scan, FULLTEXT/SPATIAL each separate, detect-then-skip for idempotent
+// resume).
 //
 // Two MySQL-specific deviations from the PG path (ADR-0080):
 //
@@ -127,9 +129,11 @@ func (w *SchemaWriter) BuildTableIndexesFromChannel(ctx context.Context, s *ir.S
 		return w.drainTablesFiringCallback(ctx, completedTables)
 	}
 
-	// Size the worker pool once up front from the WHOLE schema's index
-	// count — the upper bound on useful workers — even though tables arrive
-	// incrementally.
+	// Size the worker pool once up front from the count of tables WITH
+	// secondary indexes (one job per table now — ADR-0080 follow-up's
+	// combined-ALTER model) — the upper bound on useful workers, since each
+	// table's indexes build together in one worker — even though tables
+	// arrive incrementally.
 	totalJobs := len(w.indexBuildJobsForTables(orderedTables(s)))
 	if totalJobs == 0 {
 		// No secondary indexes anywhere. Still drain (firing the per-table
@@ -176,6 +180,9 @@ func (w *SchemaWriter) BuildTableIndexesFromChannel(ctx context.Context, s *ir.S
 					w.fireTableIndexed(table)
 					continue
 				}
+				// One job per table now (combined-ALTER model): the table's
+				// whole index set builds in a single worker, so register a
+				// count of 1 (== len(jobs)).
 				tracker.register(table, len(jobs))
 				for _, job := range jobs {
 					select {
@@ -193,7 +200,9 @@ func (w *SchemaWriter) BuildTableIndexesFromChannel(ctx context.Context, s *ir.S
 // resolveIndexBuildWorkers picks the overlapped index pool's worker count
 // (ADR-0080). MySQL has no connection-slot prober, so the size is a fixed
 // policy rather than a budget split: min(default-N, jobCount), clamped to
-// [floor, ceil]. The --max-target-connections cap the ADR mentions is NOT
+// [floor, ceil]. jobCount is the number of tables WITH secondary indexes
+// (the combined-ALTER model builds each table's whole index set in one
+// worker), the upper bound on useful concurrency. The --max-target-connections cap the ADR mentions is NOT
 // applied here — that value is not threaded to the SchemaWriter today (it
 // lives in the pipeline MigratorConfig and is consumed by the copy-axis
 // budget resolver, which is a no-op on MySQL). Wiring it would require an
@@ -237,7 +246,7 @@ func (w *SchemaWriter) indexBuildWorkerTracked(ctx context.Context, jobCh <-chan
 			if hook := onIndexBuildStartObserver; hook != nil {
 				hook(job.tableName)
 			}
-			if err := w.buildOneIndex(ctx, conn, job); err != nil {
+			if err := w.buildTableIndexes(ctx, conn, job); err != nil {
 				return err
 			}
 			tracker.complete(job.tableName)

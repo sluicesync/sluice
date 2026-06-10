@@ -4,6 +4,7 @@
 package mysql
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 
@@ -1147,6 +1148,92 @@ func TestEmitCreateIndexRejectsPrimary(t *testing.T) {
 	if _, err := emitCreateIndex("t", idx); err == nil {
 		t.Error("expected error for PRIMARY index; got nil")
 	}
+}
+
+// TestEmitCreateIndexesCombined pins the ADR-0080 follow-up grouping rule:
+// combinable (regular + UNIQUE BTREE/HASH) indexes collapse into ONE ALTER
+// (a single InnoDB scan); each FULLTEXT and each SPATIAL index gets its own
+// statement (Error 1795 one-FULLTEXT-per-ALTER + SPATIAL's no-LOCK=NONE
+// downgrade). Family-matrix discipline (CLAUDE.md Bug 74): assert every kind,
+// not one representative.
+func TestEmitCreateIndexesCombined(t *testing.T) {
+	t.Run("all combinable collapse into one ALTER", func(t *testing.T) {
+		idxs := []*ir.Index{
+			{Name: "a_idx", Kind: ir.IndexKindBTree, Columns: []ir.IndexColumn{{Column: "a"}}},
+			{Name: "b_uniq", Unique: true, Kind: ir.IndexKindBTree, Columns: []ir.IndexColumn{{Column: "b"}}},
+			{Name: "c_idx", Kind: ir.IndexKindBTree, Columns: []ir.IndexColumn{{Column: "c"}}},
+		}
+		stmts, err := emitCreateIndexesCombined("t", idxs)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		want := []string{
+			"ALTER TABLE `t` ADD INDEX `a_idx` (`a`) USING BTREE, ADD UNIQUE INDEX `b_uniq` (`b`) USING BTREE, ADD INDEX `c_idx` (`c`) USING BTREE;",
+		}
+		if !reflect.DeepEqual(stmts, want) {
+			t.Errorf("\n got  %#v\n want %#v", stmts, want)
+		}
+	})
+
+	t.Run("mixed kinds split combined + separate", func(t *testing.T) {
+		idxs := []*ir.Index{
+			{Name: "a_idx", Kind: ir.IndexKindBTree, Columns: []ir.IndexColumn{{Column: "a"}}},
+			{Name: "b_uniq", Unique: true, Kind: ir.IndexKindBTree, Columns: []ir.IndexColumn{{Column: "b"}}},
+			{Name: "body_ft", Kind: ir.IndexKindFullText, Columns: []ir.IndexColumn{{Column: "body"}}},
+			{Name: "pt_sp", Kind: ir.IndexKindSpatial, Columns: []ir.IndexColumn{{Column: "pt", Length: 32}}},
+		}
+		stmts, err := emitCreateIndexesCombined("t", idxs)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		want := []string{
+			// Combined first (incoming order of combinable clauses), then
+			// each FULLTEXT/SPATIAL as its own statement — prefix dropped on
+			// the SPATIAL column (Error 1089).
+			"ALTER TABLE `t` ADD INDEX `a_idx` (`a`) USING BTREE, ADD UNIQUE INDEX `b_uniq` (`b`) USING BTREE;",
+			"ALTER TABLE `t` ADD FULLTEXT INDEX `body_ft` (`body`);",
+			"ALTER TABLE `t` ADD SPATIAL INDEX `pt_sp` (`pt`);",
+		}
+		if !reflect.DeepEqual(stmts, want) {
+			t.Errorf("\n got  %#v\n want %#v", stmts, want)
+		}
+	})
+
+	t.Run("two FULLTEXT never combine (Error 1795)", func(t *testing.T) {
+		idxs := []*ir.Index{
+			{Name: "ft1", Kind: ir.IndexKindFullText, Columns: []ir.IndexColumn{{Column: "title"}}},
+			{Name: "ft2", Kind: ir.IndexKindFullText, Columns: []ir.IndexColumn{{Column: "body"}}},
+		}
+		stmts, err := emitCreateIndexesCombined("t", idxs)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		want := []string{
+			"ALTER TABLE `t` ADD FULLTEXT INDEX `ft1` (`title`);",
+			"ALTER TABLE `t` ADD FULLTEXT INDEX `ft2` (`body`);",
+		}
+		if !reflect.DeepEqual(stmts, want) {
+			t.Errorf("\n got  %#v\n want %#v", stmts, want)
+		}
+	})
+
+	t.Run("single combinable index is one ALTER", func(t *testing.T) {
+		idxs := []*ir.Index{
+			{Name: "solo", Kind: ir.IndexKindBTree, Columns: []ir.IndexColumn{{Column: "x"}}},
+		}
+		stmts, err := emitCreateIndexesCombined("t", idxs)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		// Byte-identical to the standalone emitCreateIndex output.
+		single, err := emitCreateIndex("t", idxs[0])
+		if err != nil {
+			t.Fatalf("emitCreateIndex: %v", err)
+		}
+		if len(stmts) != 1 || stmts[0] != single {
+			t.Errorf("combined single = %#v; want [%q]", stmts, single)
+		}
+	})
 }
 
 func TestEmitAddForeignKey(t *testing.T) {

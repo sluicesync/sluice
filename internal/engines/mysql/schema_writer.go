@@ -306,37 +306,41 @@ func (w *SchemaWriter) CreateIndexes(ctx context.Context, s *ir.Schema) error {
 	if s == nil {
 		return fmt.Errorf("mysql: CreateIndexes: schema is nil")
 	}
-	// Flatten the whole schema into the same (table, index) work-list the
-	// overlapped builder (ADR-0080) queues per table, then build each job
+	// Flatten the whole schema into the same per-table work-list the
+	// overlapped builder (ADR-0080) queues, then build each table's indexes
 	// serially on the shared pool. Factoring the per-table loop body into
 	// indexBuildJobsForTables keeps the emitted SQL — inline-skip set,
-	// alphabetical index order — byte-identical on both paths.
+	// alphabetical index order, combined-ALTER grouping — byte-identical on
+	// both paths.
 	for _, job := range w.indexBuildJobsForTables(orderedTables(s)) {
-		if err := w.buildOneIndex(ctx, w.db, job); err != nil {
+		if err := w.buildTableIndexes(ctx, w.db, job); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// indexBuildJob is one (table, index) unit of work the index-build paths
-// consume. The table name is carried alongside the index because
-// emitCreateIndex needs it and the error messages name it.
+// indexBuildJob is one TABLE's secondary-index work the index-build paths
+// consume (ADR-0080 follow-up). All of the table's eligible indexes travel
+// together so [buildTableIndexes] can collapse the combinable ones into a
+// single ALTER (one InnoDB scan); idxs is already inline-skip-filtered,
+// PRIMARY-free, and alphabetically sorted by indexBuildJobsForTables.
 type indexBuildJob struct {
 	tableName string
-	idx       *ir.Index
+	idxs      []*ir.Index
 }
 
-// indexBuildJobsForTables flattens a subset of tables into the (table,
-// index) work-list both [CreateIndexes] (whole-schema) and the overlapped
-// [BuildTableIndexesFromChannel] (per-table, as copies land) consume.
-// Factored out (ADR-0080) so the two paths emit identical SQL: the same
-// inlineSkipIndexNames carve-out (GitHub #25 AUTO_INCREMENT supporting key
-// + Bug 125 PK-less COPY unique key — re-creating either would raise a
-// duplicate-index error) and the same alphabetical index ordering within
-// each table. The caller controls table order: CreateIndexes passes
-// orderedTables(s) (alphabetical, the prior serial order); the overlap path
-// passes one just-copied table at a time (data-arrival order).
+// indexBuildJobsForTables flattens a subset of tables into the per-table
+// work-list both [CreateIndexes] (whole-schema) and the overlapped
+// [BuildTableIndexesFromChannel] (per-table, as copies land) consume — ONE
+// job per table that has at least one buildable secondary index. Factored out
+// (ADR-0080) so the two paths emit identical SQL: the same inlineSkipIndexNames
+// carve-out (GitHub #25 AUTO_INCREMENT supporting key + Bug 125 PK-less COPY
+// unique key — re-creating either would raise a duplicate-index error) and the
+// same alphabetical index ordering within each table. The caller controls
+// table order: CreateIndexes passes orderedTables(s) (alphabetical, the prior
+// serial order); the overlap path passes one just-copied table at a time
+// (data-arrival order).
 func (w *SchemaWriter) indexBuildJobsForTables(tables []*ir.Table) []indexBuildJob {
 	var jobs []indexBuildJob
 	for _, table := range tables {
@@ -345,17 +349,25 @@ func (w *SchemaWriter) indexBuildJobsForTables(tables []*ir.Table) []indexBuildJ
 		sort.Slice(indexes, func(i, j int) bool {
 			return indexes[i].Name < indexes[j].Name
 		})
+		eligible := indexes[:0]
 		for _, idx := range indexes {
 			if _, skipped := skip[idx.Name]; skipped {
 				continue
 			}
-			jobs = append(jobs, indexBuildJob{tableName: table.Name, idx: idx})
+			eligible = append(eligible, idx)
 		}
+		if len(eligible) == 0 {
+			continue
+		}
+		jobs = append(jobs, indexBuildJob{
+			tableName: table.Name,
+			idxs:      append([]*ir.Index(nil), eligible...),
+		})
 	}
 	return jobs
 }
 
-// dbExecer is the subset of *sql.DB / *sql.Conn buildOneIndex needs. The
+// dbExecer is the subset of *sql.DB / *sql.Conn buildTableIndexes needs. The
 // whole-schema [CreateIndexes] builds on the pooled *sql.DB; the overlapped
 // builder's workers each build on their OWN dedicated *sql.Conn so the
 // concurrent ALTERs don't share one pooled connection.
@@ -363,31 +375,44 @@ type dbExecer interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
 }
 
-// buildOneIndex probes for the index, then emits and executes its
-// `ALTER TABLE … ADD INDEX` on execer. Shared verbatim by the serial
-// whole-schema path and the overlapped per-table workers (ADR-0080).
+// buildTableIndexes builds all of one table's eligible secondary indexes
+// (ADR-0080 follow-up). It probes each index, drops the ones that already
+// exist, then emits the minimum set of ALTER statements via
+// [emitCreateIndexesCombined] — combinable BTREE/UNIQUE indexes share one
+// ALTER (a single InnoDB scan), FULLTEXT and SPATIAL each get their own — and
+// executes them on execer. Shared verbatim by the serial whole-schema path and
+// the overlapped per-table workers.
 //
-// Idempotent resume (Bug 131): a prior run that already created this index
-// — a resume re-entering phase=indexes after a table-scope change, a
+// Idempotent resume (Bug 131): a prior run that already created some of these
+// indexes — a resume re-entering phase=indexes after a table-scope change, a
 // partially-completed index phase, or (on the overlap path) a re-fed
 // copied-not-fully-indexed table — would otherwise fail with MySQL 1061
 // "Duplicate key name". MySQL has no `CREATE INDEX IF NOT EXISTS`, so
-// detect-then-skip (the pattern the ADR-0054 shape applier uses). sluice
-// owns these tables, so a same-named index is the one it built.
-func (w *SchemaWriter) buildOneIndex(ctx context.Context, execer dbExecer, job indexBuildJob) error {
-	exists, err := indexExists(ctx, w.db, w.schema, job.tableName, job.idx.Name)
-	if err != nil {
-		return fmt.Errorf("mysql: probe index %q on %q: %w", job.idx.Name, job.tableName, err)
+// detect-then-skip per index (the pattern the ADR-0054 shape applier uses).
+// sluice owns these tables, so a same-named index is the one it built. When
+// every index already exists the table is skipped entirely (no ALTER emitted).
+func (w *SchemaWriter) buildTableIndexes(ctx context.Context, execer dbExecer, job indexBuildJob) error {
+	pending := make([]*ir.Index, 0, len(job.idxs))
+	for _, idx := range job.idxs {
+		exists, err := indexExists(ctx, w.db, w.schema, job.tableName, idx.Name)
+		if err != nil {
+			return fmt.Errorf("mysql: probe index %q on %q: %w", idx.Name, job.tableName, err)
+		}
+		if !exists {
+			pending = append(pending, idx)
+		}
 	}
-	if exists {
+	if len(pending) == 0 {
 		return nil
 	}
-	stmt, err := emitCreateIndex(job.tableName, job.idx)
+	stmts, err := emitCreateIndexesCombined(job.tableName, pending)
 	if err != nil {
 		return err
 	}
-	if _, err := execer.ExecContext(ctx, stmt); err != nil {
-		return fmt.Errorf("mysql: create index %q on %q: %w", job.idx.Name, job.tableName, wrapDDLError(err))
+	for _, stmt := range stmts {
+		if _, err := execer.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("mysql: create indexes on %q: %w", job.tableName, wrapDDLError(err))
+		}
 	}
 	return nil
 }
