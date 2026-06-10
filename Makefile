@@ -1,4 +1,4 @@
-.PHONY: all build test test-it test-all bench lint vet fmt fmt-check pre-commit tidy clean help
+.PHONY: all build test test-it test-all bench lint vet vet-tags fmt fmt-check pre-commit tidy clean help
 
 GO         ?= go
 PKG        := sluicesync.dev/sluice
@@ -42,6 +42,9 @@ lint: vet ## Run go vet plus golangci-lint
 vet: ## Run go vet
 	$(GO) vet ./...
 
+vet-tags: ## Type-check every build-tag combination in use (incl. tagged test files)
+	sh scripts/vet-tags.sh
+
 fmt: ## Apply gofumpt (preferred) or gofmt to all .go files
 	@if command -v gofumpt >/dev/null 2>&1; then \
 		echo "gofumpt -l -w ."; \
@@ -66,7 +69,7 @@ fmt-check: ## Verify formatting without writing changes (exits non-zero if any f
 		exit 1; \
 	fi
 
-pre-commit: fmt-check vet test ## Run the pre-commit suite locally (formatting, vet, fast tests)
+pre-commit: fmt-check vet vet-tags test ## Run the pre-commit suite locally (formatting, vet, fast tests)
 	@echo "OK — ready to commit."
 
 tidy: ## go mod tidy

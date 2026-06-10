@@ -98,6 +98,9 @@ jobs:
   # (so we see the full picture of which platforms broke).
   test:
     name: Test (${{ matrix.os }})
+    # Explicit cap so a wedged step can't run to GitHub's 6-hour
+    # default. The unit suite + vet take ~5-8m; generous headroom.
+    timeout-minutes: 20
     # Self-hosted-runner selector. vars.CI_LINUX_RUNNER /
     # CI_WINDOWS_RUNNER unset => ubuntu-latest / windows-latest
     # (identical to pre-selector behaviour). Set a repo variable to
@@ -248,10 +251,16 @@ jobs:
     # Zero overlap; zero gap. Go 1.20+ required for `-skip`; go.mod
     # pins >= 1.26.
     #
-    # `engines-postgres-and-rest` defensively bundles the small
-    # non-pipeline / non-mysql-engine packages (ir, translate,
-    # redact, crypto, config) so any future integration-tagged file
-    # outside pipeline/engines/mysql is still gated.
+    # `engines-postgres-and-rest` also bundles the pgtrigger engine
+    # and the small non-pipeline / non-mysql-engine packages (ir,
+    # translate, redact, crypto, config). The package list below is
+    # HAND-MAINTAINED — it does NOT automatically pick up new
+    # packages (the pgtrigger engine landed 2026-05-27 and sat
+    # outside every shard until 2026-06-10, untested in CI). The
+    # `check integration shard coverage` step in the Lint job
+    # (scripts/check-shard-coverage.sh) fails CI when a package with
+    # integration-tagged tests is missing from this list, so the
+    # list can no longer rot silently.
     #
     # The rollup job below (`integration-summary`, name: Integration)
     # preserves the existing required-status-check name so branch
@@ -287,7 +296,7 @@ jobs:
             packages: "./internal/engines/mysql/..."
             goflags: ""
           - name: engines-postgres-and-rest
-            packages: "./internal/engines/postgres/... ./internal/ir/... ./internal/translate/... ./internal/redact/... ./internal/crypto/... ./internal/config/..."
+            packages: "./internal/engines/postgres/... ./internal/engines/pgtrigger/... ./internal/ir/... ./internal/translate/... ./internal/redact/... ./internal/crypto/... ./internal/config/..."
             goflags: ""
     steps:
       - uses: actions/checkout@v6
@@ -384,6 +393,8 @@ jobs:
     needs: integration
     if: always()
     runs-on: ubuntu-latest
+    # One echo + one conditional — minutes, not GitHub's 6-h default.
+    timeout-minutes: 5
     steps:
       - name: assert all integration shards succeeded
         run: |
@@ -462,8 +473,10 @@ jobs:
   # vttestserver boots a full Vitess cluster — heavier and slower than a
   # plain mysql:8.0 — and we want its cost + any startup flakiness
   # isolated from the core shards while its CI reliability is observed.
-  # It is intentionally NOT in `main`'s required-checks list yet (watch a
-  # cycle, then promote to a hard gate via branch protection).
+  # It IS in `main`'s required-checks list (promoted after its first
+  # clean cycles) — do not disable it to save CI cost without also
+  # updating branch protection, or merges will wedge on a check that
+  # never reports.
   #
   # Build-tag additivity (same as the PostGIS job): `-tags="integration
   # vstream"` compiles BOTH the integration- and vstream-tagged files, so
@@ -512,11 +525,35 @@ jobs:
   lint:
     name: Lint
     runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
+    # A wedged step otherwise runs to GitHub's 6-hour default. The
+    # budget covers golangci-lint (~3-5m) + the per-combo vet matrix
+    # (~3m cold) with generous headroom.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-go@v6
         with:
           go-version-file: "go.mod"
+      - run: go mod download
+
+      # Type-check every build-tag combination in use — including
+      # tagged *test* files, which `go build -tags=...` skips (the
+      # v0.58.1 retag class: a symbol rename an integration-tagged
+      # test still references compiles clean everywhere and only
+      # fails when that suite finally runs). Tag combos are
+      # discovered from the tree, so a new tagged suite is gated
+      # here automatically — no hand-maintained list to rot.
+      - name: vet build-tag combinations
+        run: bash scripts/vet-tags.sh
+
+      # The integration shard matrix above is a hand-maintained
+      # package list; this guard fails CI when a package containing
+      # integration-tagged tests is missing from it (the mechanism
+      # that let the pgtrigger engine sit outside every shard for
+      # two weeks).
+      - name: check integration shard coverage
+        run: bash scripts/check-shard-coverage.sh
+
       - uses: golangci/golangci-lint-action@v9
         with:
           # @v8+ of the action natively requires golangci-lint v2 (the
@@ -549,6 +586,9 @@ jobs:
   # cost-shape note.
   build:
     name: Build (${{ matrix.os }})
+    # Explicit cap so a wedged step can't run to GitHub's 6-hour
+    # default; a full build takes ~2-3m.
+    timeout-minutes: 15
     # Same self-hosted selector as the test job — see that comment.
     runs-on: ${{ (matrix.os == 'windows-latest' && (vars.CI_WINDOWS_RUNNER || 'windows-latest')) || (vars.CI_LINUX_RUNNER || 'ubuntu-latest') }}
     strategy:

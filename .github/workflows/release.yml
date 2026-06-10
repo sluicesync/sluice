@@ -29,6 +29,12 @@ permissions:
 jobs:
   goreleaser:
     runs-on: ubuntu-latest
+    # Explicit cap so a wedged step can't run to GitHub's 6-hour
+    # default — that failure mode silently stalls the autonomous
+    # release flow, which watches this workflow for completion.
+    # A full release build (cross-platform binaries + multi-arch
+    # image) takes ~10-15m.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
         with:

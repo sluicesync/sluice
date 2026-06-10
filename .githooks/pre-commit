@@ -63,6 +63,18 @@ if ! go vet ./...; then
 	exit 1
 fi
 
+# ---- go vet, per build-tag combination ----
+# Bare `go vet ./...` skips every build-tagged file, and `go build
+# -tags=...` skips _test.go files — so a symbol rename that a tagged
+# test still references passes both and only fails when that suite
+# finally runs (the v0.58.1 retag class). vet-tags.sh discovers every
+# tag combo in the tree and type-checks each one; results are cached
+# by the Go build cache, so repeat runs cost seconds.
+if ! sh scripts/vet-tags.sh; then
+	red "pre-commit: vet-tags failed (a build-tagged file no longer type-checks)."
+	exit 1
+fi
+
 # ---- go test (fast, no DB) ----
 # -race is preferred but requires cgo. On Windows / minimal-toolchain
 # setups CGO_ENABLED=0 by default, in which case we skip -race locally

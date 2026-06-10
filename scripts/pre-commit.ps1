@@ -59,6 +59,19 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 
+# ---- go vet, per build-tag combination ----
+# Bare `go vet ./...` skips every build-tagged file, and `go build
+# -tags=...` skips _test.go files -- so a symbol rename that a tagged
+# test still references passes both and only fails when that suite
+# finally runs (the v0.58.1 retag class). vet-tags.ps1 discovers every
+# tag combo in the tree and type-checks each one; results are cached
+# by the Go build cache, so repeat runs cost seconds.
+& (Join-Path $PSScriptRoot 'vet-tags.ps1')
+if ($LASTEXITCODE -ne 0) {
+    Red "vet-tags failed (a build-tagged file no longer type-checks)."
+    exit 1
+}
+
 # ---- go test (fast, no DB) ----
 # -race is preferred but requires cgo. On Windows without a C compiler
 # (the default for most Go installs) CGO_ENABLED=0, so -race won't
