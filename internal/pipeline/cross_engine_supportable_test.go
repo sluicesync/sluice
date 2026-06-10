@@ -700,6 +700,58 @@ func TestCheckCrossEngineDeltaSupportable_PGTriggerAddTableExtensionRefuses(t *t
 	}
 }
 
+// TestIsMySQLFamilyEngine pins the MySQL-family target set, including
+// the self-hosted `vitess` flavor (M2.5): before vitess joined the
+// set, a PG → vitess chain restore silently SKIPPED every PG-native
+// refusal (EXCLUDE constraints, extension opclasses) — exactly the
+// new-engine-misses-a-name-branch bug class. These helpers stay
+// name-based on purpose (lineage-recorded identity strings; see the
+// helper doc comments), so this pin is the drift guard.
+func TestIsMySQLFamilyEngine(t *testing.T) {
+	cases := []struct {
+		name string
+		want bool
+	}{
+		{"mysql", true},
+		{"planetscale", true},
+		{"vitess", true},
+		{"postgres", false},
+		{"postgres-trigger", false},
+		{"", false},
+		{"future", false},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			if got := isMySQLFamilyEngine(c.name); got != c.want {
+				t.Errorf("isMySQLFamilyEngine(%q) = %v; want %v", c.name, got, c.want)
+			}
+		})
+	}
+}
+
+// TestCheckCrossEngineSupportable_PGToVitess_ExcludeRefuses pins the
+// M2.5 gap fix end-to-end: a PG-source EXCLUDE constraint restored to
+// the `vitess` flavor must refuse loudly (it previously fell through
+// the "mysql"/"planetscale"-only target check and silently dropped
+// the constraint on the target).
+func TestCheckCrossEngineSupportable_PGToVitess_ExcludeRefuses(t *testing.T) {
+	s := &ir.Schema{Tables: []*ir.Table{{
+		Name: "reservations",
+		ExcludeConstraints: []*ir.ExcludeConstraint{{
+			Name:       "no_overlap",
+			Definition: "EXCLUDE USING gist (room WITH =, during WITH &&)",
+		}},
+	}}}
+	err := checkCrossEngineSupportable(s, "postgres", "vitess", "test")
+	if err == nil {
+		t.Fatal("postgres → vitess with EXCLUDE: expected loud refusal, got nil (silent constraint drop)")
+	}
+	if !strings.Contains(err.Error(), "no_overlap") {
+		t.Errorf("err = %v; want the offending constraint named", err)
+	}
+}
+
 // TestIsPGSourceEngine pins the small helper that drives the gate fix.
 func TestIsPGSourceEngine(t *testing.T) {
 	cases := []struct {

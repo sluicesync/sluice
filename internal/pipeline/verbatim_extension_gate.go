@@ -72,11 +72,13 @@ func verbatimExtensionColumnsIn(s *ir.Schema) []string {
 // recorded marker), so it gates directly on the manifest's schema —
 // the SAME schema the marker is derived from, so the two checks are
 // consistent by construction. Loud, before any data moves, naming the
-// columns. Returns nil for a PG target and for a schema with no
-// verbatim columns (the legacy / common case — unaffected).
-func refuseVerbatimManifestRestoreToNonPG(schema *ir.Schema, targetEngine string) error {
-	if targetEngine == "postgres" {
-		return nil
+// columns. Returns nil for a target declaring
+// [ir.Capabilities.VerbatimExtensionTypes] (the verbatim columns
+// re-create exactly) and for a schema with no verbatim columns (the
+// legacy / common case — unaffected).
+func refuseVerbatimManifestRestoreToNonPG(schema *ir.Schema, target ir.Engine) error {
+	if target == nil || target.Capabilities().VerbatimExtensionTypes {
+		return nil // nil target is caught by the caller's validate()
 	}
 	refs := verbatimExtensionColumnsIn(schema)
 	if len(refs) == 0 {
@@ -93,27 +95,28 @@ func refuseVerbatimManifestRestoreToNonPG(schema *ir.Schema, targetEngine string
 			"(with the owning extension installed), or take a fresh "+
 			"backup against a schema that excludes these columns "+
 			"(--exclude-table) if a cross-engine copy is required",
-		targetEngine, strings.Join(refs, ", "),
+		target.Name(), strings.Join(refs, ", "),
 	)
 }
 
 // refuseVerbatimRestoreToNonPG is the ADR-0047 loud restore-time
 // engine gate. It scans every segment of the lineage for the recorded
 // PG-restore-only marker; if ANY segment carries it AND the restore
-// target engine is not postgres, it returns a loud, operator-
-// actionable refusal naming the verbatim columns and the PG-restore-
-// only constraint. Returns nil for a PG target (the verbatim columns
-// re-create exactly), and nil when no segment carries the marker
-// (every pre-ADR-0047 / non-verbatim backup — legacy backups
-// unaffected).
+// target engine doesn't declare
+// [ir.Capabilities.VerbatimExtensionTypes], it returns a loud,
+// operator-actionable refusal naming the verbatim columns and the
+// PG-restore-only constraint. Returns nil for a verbatim-capable
+// target (the verbatim columns re-create exactly), and nil when no
+// segment carries the marker (every pre-ADR-0047 / non-verbatim
+// backup — legacy backups unaffected).
 //
 // The check is recorded-marker-driven, NOT schema-sniffing: the
 // marker is the authoritative structural record (ADR-0046 / Bug 66
 // idiom). It fires before any data moves so the operator never gets a
 // partial cross-engine restore of a PG-only backup.
-func refuseVerbatimRestoreToNonPG(cat *LineageCatalog, targetEngine string) error {
-	if cat == nil || targetEngine == "postgres" {
-		return nil
+func refuseVerbatimRestoreToNonPG(cat *LineageCatalog, target ir.Engine) error {
+	if cat == nil || target == nil || target.Capabilities().VerbatimExtensionTypes {
+		return nil // nil target is caught by the caller's validate()
 	}
 	var marked []string
 	for i := range cat.Segments {
@@ -137,6 +140,6 @@ func refuseVerbatimRestoreToNonPG(cat *LineageCatalog, targetEngine string) erro
 			"(with the owning extension installed), or take a fresh "+
 			"backup against a schema that excludes these columns "+
 			"(--exclude-table) if a cross-engine copy is required",
-		targetEngine, strings.Join(marked, ", "),
+		target.Name(), strings.Join(marked, ", "),
 	)
 }

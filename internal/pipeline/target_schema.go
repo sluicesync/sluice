@@ -121,7 +121,7 @@ func applyIndexBuildBudget(target any, connBudget int) {
 // [ir.ExtensionAware] surface. Engines that don't implement the
 // interface (today: MySQL) skip cleanly — the validate gate
 // upstream already refused the flag for non-PG sides via the
-// engine-name check in [validateEnabledPGExtensions].
+// PGExtensionCatalog capability check in [validateEnabledPGExtensions].
 //
 // Returns the error from [ir.ExtensionAware.EnableExtensions] when
 // the engine refuses (unknown extension name, missing on the
@@ -145,17 +145,18 @@ func applyEnabledPGExtensions(ctx context.Context, target any, extensions []stri
 // implement it (today: MySQL) skip cleanly.
 //
 // The orchestrator is the determination authority and stays
-// engine-neutral: it passes a boolean computed purely from engine
-// *names* (never importing an engine package). enabled MUST be true
-// only when the run provably does not need semantic type
-// understanding for uncatalogued extension types:
+// engine-neutral: it passes a boolean computed purely from the
+// engines' declared [ir.Capabilities.VerbatimExtensionTypes] (never
+// importing an engine package). enabled MUST be true only when the
+// run provably does not need semantic type understanding for
+// uncatalogued extension types:
 //
-//   - live PG → PG: source engine name == target engine name ==
-//     "postgres" (see [verbatimLiveSameEnginePG]); or
-//   - a PG backup: the source is PG and the restore-target engine is
-//     unknown at backup time, so verbatim columns are recorded on the
-//     lineage segment and a loud restore-time engine gate enforces
-//     PG-restore-only.
+//   - live PG → PG: both engines declare VerbatimExtensionTypes
+//     (see [verbatimLiveSameEnginePG]); or
+//   - a PG backup: the source declares VerbatimExtensionTypes and the
+//     restore-target engine is unknown at backup time, so verbatim
+//     columns are recorded on the lineage segment and a loud
+//     restore-time engine gate enforces PG-restore-only.
 //
 // Cross-engine and non-PG runs pass enabled=false (or never call
 // this), preserving ADR-0047 tier (c): the existing loud refusal for
@@ -197,26 +198,32 @@ func applyTableScope(reader any, filter TableFilter) {
 
 // verbatimLiveSameEnginePG reports whether a LIVE run (migrate / sync)
 // qualifies for the ADR-0047 verbatim tier: both engines are present
-// and are the same PostgreSQL engine. This is the orchestrator's
-// engine-neutral, name-only determination for tier (b) on the live
-// path — no engine package import, no DSN sniffing.
+// and BOTH declare [ir.Capabilities.VerbatimExtensionTypes] — i.e.
+// both sides record/re-emit the raw uncatalogued type spelling
+// exactly (today: only the vanilla `postgres` engine declares it).
+// This is the orchestrator's engine-neutral, capability-only
+// determination for tier (b) on the live path — no engine package
+// import, no DSN sniffing.
 func verbatimLiveSameEnginePG(source, target ir.Engine) bool {
 	return source != nil && target != nil &&
-		source.Name() == "postgres" && target.Name() == "postgres"
+		source.Capabilities().VerbatimExtensionTypes &&
+		target.Capabilities().VerbatimExtensionTypes
 }
 
 // verbatimBackupSourcePG reports whether a BACKUP run qualifies for
-// the ADR-0047 verbatim tier: the source engine is PostgreSQL. The
-// restore-target engine is unknown at backup time, so qualifying here
-// only enables CAPTURE; the PG-restore-only constraint is enforced by
-// the recorded lineage marker + the loud restore-time engine gate
+// the ADR-0047 verbatim tier: the source engine declares
+// [ir.Capabilities.VerbatimExtensionTypes]. The restore-target engine
+// is unknown at backup time, so qualifying here only enables CAPTURE;
+// the PG-restore-only constraint is enforced by the recorded lineage
+// marker + the loud restore-time engine gate
 // ([refuseVerbatimRestoreToNonPG]).
 func verbatimBackupSourcePG(source ir.Engine) bool {
-	return source != nil && source.Name() == "postgres"
+	return source != nil && source.Capabilities().VerbatimExtensionTypes
 }
 
-// validateEnabledPGExtensions enforces the engine-name gate for
-// `--enable-pg-extension` (ADR-0032). For most extensions the flag
+// validateEnabledPGExtensions enforces the engine-capability gate
+// ([ir.Capabilities.PGExtensionCatalog]) for `--enable-pg-extension`
+// (ADR-0032). For most extensions the flag
 // is meaningful only on same-engine PG → PG paths — cross-engine
 // translation keeps loud-failure as the default when the target
 // isn't PG. The exception: extensions with a default cross-engine
@@ -230,10 +237,11 @@ func verbatimBackupSourcePG(source ir.Engine) bool {
 //
 // Refuses (with operator-actionable wording) when:
 //
-//   - The source engine isn't postgres — the flag has no meaning on
-//     a non-PG source.
-//   - The target engine isn't postgres AND none of the named
-//     extensions has a default cross-engine translator — the
+//   - The source engine doesn't host the PG extension catalog — the
+//     flag has no meaning on a non-PG source.
+//   - The target engine doesn't host the PG extension catalog AND
+//     none of the named extensions has a default cross-engine
+//     translator — the
 //     cross-engine refusal would fire later anyway; surface it
 //     earlier with a clearer pointer to the right escape hatch
 //     (--type-override).
@@ -241,7 +249,7 @@ func validateEnabledPGExtensions(source, target ir.Engine, extensions []string) 
 	if len(extensions) == 0 {
 		return nil
 	}
-	if source != nil && source.Name() != "postgres" {
+	if source != nil && !source.Capabilities().PGExtensionCatalog {
 		return fmt.Errorf(
 			"pipeline: --enable-pg-extension is only supported on PG sources "+
 				"(source engine is %q); the flag opts into PG → PG extension "+
@@ -249,7 +257,7 @@ func validateEnabledPGExtensions(source, target ir.Engine, extensions []string) 
 			source.Name(),
 		)
 	}
-	if target != nil && target.Name() != "postgres" {
+	if target != nil && !target.Capabilities().PGExtensionCatalog {
 		// Per-extension cross-engine gate: an extension with a
 		// default translator declared by the source engine may pass
 		// against a non-PG target; the translator rewrites the

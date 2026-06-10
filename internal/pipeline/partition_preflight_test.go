@@ -24,14 +24,14 @@ func (s stubPartitionProber) PartitionedTables(_ context.Context) ([]string, err
 	return s.tables, s.err
 }
 
-// TestPreflightPartitionedTables_NonPGSourceSkips pins the engine-name
-// gate: a MySQL source short-circuits even if its handle would
-// satisfy the prober interface (none does today; the pin guards a
+// TestPreflightPartitionedTables_NonPGSourceSkips pins the
+// PostgresBackend capability gate: a MySQL source short-circuits
+// even if its handle would satisfy the prober interface (none does today; the pin guards a
 // future engine that might).
 func TestPreflightPartitionedTables_NonPGSourceSkips(t *testing.T) {
 	p := stubPartitionProber{tables: []string{"events"}} // would refuse on PG
 	schema := &ir.Schema{Tables: []*ir.Table{{Name: "events"}}}
-	if err := preflightPartitionedTables(context.Background(), p, "mysql", schema); err != nil {
+	if err := preflightPartitionedTables(context.Background(), p, capsMySQL, schema); err != nil {
 		t.Errorf("got %v; want nil (non-PG source short-circuits)", err)
 	}
 }
@@ -42,7 +42,7 @@ func TestPreflightPartitionedTables_NonPGSourceSkips(t *testing.T) {
 func TestPreflightPartitionedTables_HandleWithoutProberSkips(t *testing.T) {
 	type bareSchemaReader struct{}
 	schema := &ir.Schema{Tables: []*ir.Table{{Name: "events"}}}
-	if err := preflightPartitionedTables(context.Background(), bareSchemaReader{}, "postgres", schema); err != nil {
+	if err := preflightPartitionedTables(context.Background(), bareSchemaReader{}, capsSlotPG, schema); err != nil {
 		t.Errorf("got %v; want nil (handle without prober skips silently)", err)
 	}
 }
@@ -53,7 +53,7 @@ func TestPreflightPartitionedTables_HandleWithoutProberSkips(t *testing.T) {
 func TestPreflightPartitionedTables_NoPartitionedTables(t *testing.T) {
 	p := stubPartitionProber{tables: nil}
 	schema := &ir.Schema{Tables: []*ir.Table{{Name: "users"}, {Name: "events"}}}
-	if err := preflightPartitionedTables(context.Background(), p, "postgres", schema); err != nil {
+	if err := preflightPartitionedTables(context.Background(), p, capsSlotPG, schema); err != nil {
 		t.Errorf("got %v; want nil (no partitioned tables)", err)
 	}
 }
@@ -65,7 +65,7 @@ func TestPreflightPartitionedTables_NoPartitionedTables(t *testing.T) {
 func TestPreflightPartitionedTables_OneInScopeRefuses(t *testing.T) {
 	p := stubPartitionProber{tables: []string{"events"}}
 	schema := &ir.Schema{Tables: []*ir.Table{{Name: "events"}, {Name: "users"}}}
-	err := preflightPartitionedTables(context.Background(), p, "postgres", schema)
+	err := preflightPartitionedTables(context.Background(), p, capsSlotPG, schema)
 	if err == nil {
 		t.Fatal("got nil; want loud refusal — partitioned-parent silent-flatten would drop key + children + PK")
 	}
@@ -88,7 +88,7 @@ func TestPreflightPartitionedTables_OneInScopeRefuses(t *testing.T) {
 func TestPreflightPartitionedTables_ExcludedFromScopePasses(t *testing.T) {
 	p := stubPartitionProber{tables: []string{"events"}}
 	schema := &ir.Schema{Tables: []*ir.Table{{Name: "users"}}}
-	if err := preflightPartitionedTables(context.Background(), p, "postgres", schema); err != nil {
+	if err := preflightPartitionedTables(context.Background(), p, capsSlotPG, schema); err != nil {
 		t.Errorf("got %v; want nil (`events` already excluded — operator took recovery path (a))", err)
 	}
 }
@@ -104,7 +104,7 @@ func TestPreflightPartitionedTables_MultiplePartitionedRefuses(t *testing.T) {
 			{Name: "events"}, {Name: "metrics"}, {Name: "audit"}, {Name: "users"},
 		},
 	}
-	err := preflightPartitionedTables(context.Background(), p, "postgres", schema)
+	err := preflightPartitionedTables(context.Background(), p, capsSlotPG, schema)
 	if err == nil {
 		t.Fatal("got nil; want loud refusal")
 	}
@@ -123,7 +123,7 @@ func TestPreflightPartitionedTables_MultiplePartitionedRefuses(t *testing.T) {
 // connection, NOT a reason to silently skip partition detection.
 func TestPreflightPartitionedTables_ProberErrorPropagates(t *testing.T) {
 	p := stubPartitionProber{err: errors.New("source connection refused")}
-	err := preflightPartitionedTables(context.Background(), p, "postgres", nil)
+	err := preflightPartitionedTables(context.Background(), p, capsSlotPG, nil)
 	if err == nil {
 		t.Fatal("got nil; want prober error propagated")
 	}
@@ -133,15 +133,16 @@ func TestPreflightPartitionedTables_ProberErrorPropagates(t *testing.T) {
 }
 
 // TestPreflightPartitionedTables_PostgresTriggerAlsoGated pins the
-// engine-name gate's PG-flavoured set: `postgres-trigger` source
-// also exercises partition detection (its schema reader delegates to
-// the postgres engine's, so the prober is present).
+// capability gate's PG-server set: a `postgres-trigger` source (which
+// also declares PostgresBackend) exercises partition detection too
+// (its schema reader delegates to the postgres engine's, so the
+// prober is present).
 func TestPreflightPartitionedTables_PostgresTriggerAlsoGated(t *testing.T) {
 	p := stubPartitionProber{tables: []string{"events"}}
 	schema := &ir.Schema{Tables: []*ir.Table{{Name: "events"}}}
-	err := preflightPartitionedTables(context.Background(), p, "postgres-trigger", schema)
+	err := preflightPartitionedTables(context.Background(), p, capsTriggerPG, schema)
 	if err == nil {
-		t.Fatal("got nil; want refusal — postgres-trigger also PG-flavoured per isPGFlavoured()")
+		t.Fatal("got nil; want refusal — postgres-trigger also declares ir.Capabilities.PostgresBackend")
 	}
 	if !errors.Is(err, errPartitionedTableRefused) {
 		t.Errorf("want errPartitionedTableRefused sentinel; got: %v", err)

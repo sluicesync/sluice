@@ -117,6 +117,7 @@ var flavorCapabilities = map[Flavor]ir.Capabilities{
 		EnumSupport:              ir.EnumColumnLevel,
 		JSONSupport:              ir.JSONBinary,
 		UnsignedIntegers:         true,
+		DDLDialect:               ir.DDLDialectMySQL,
 	},
 
 	// ---------------------------------------------------------------
@@ -161,5 +162,13 @@ var flavorCapabilities = map[Flavor]ir.Capabilities{
 		EnumSupport:              ir.EnumColumnLevel,
 		JSONSupport:              ir.JSONBinary,
 		UnsignedIntegers:         true,
+		DDLDialect:               ir.DDLDialectMySQL,
+
+		// vtgate kills transactions at ~20s by default; the streamer's
+		// AIMD controller and apply-batch-size warning both gate on
+		// this (GitHub #18 / ADR-0052 DP-2). The self-hosted vitess
+		// flavor inherits it via the capabilities alias — same vtgate,
+		// same killer.
+		TransactionKiller: true,
 	},
 }

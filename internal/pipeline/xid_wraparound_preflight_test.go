@@ -8,11 +8,13 @@ import (
 	"errors"
 	"strings"
 	"testing"
+
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // stubXIDWraparoundProber is a fake [xidWraparoundProber] returning a
 // canned (age, datname) pair plus an optional error. callCount lets
-// tests assert the engine-name gate short-circuits BEFORE the prober is
+// tests assert the capability gate short-circuits BEFORE the prober is
 // consulted (the MySQL exclusion).
 type stubXIDWraparoundProber struct {
 	age       int64
@@ -34,7 +36,7 @@ func (s *stubXIDWraparoundProber) SourceXIDWraparoundHorizon(_ context.Context) 
 // is present.
 func TestPreflightSourceXIDWraparound_GateExcludesMySQL(t *testing.T) {
 	prober := &stubXIDWraparoundProber{age: xidWraparoundRefuseThreshold + 1, datname: "mysql_db"}
-	if err := preflightSourceXIDWraparound(context.Background(), prober, "mysql"); err != nil {
+	if err := preflightSourceXIDWraparound(context.Background(), prober, capsMySQL); err != nil {
 		t.Errorf("mysql source must not refuse on XID preflight; got %v", err)
 	}
 	if prober.callCount != 0 {
@@ -43,11 +45,11 @@ func TestPreflightSourceXIDWraparound_GateExcludesMySQL(t *testing.T) {
 }
 
 // TestPreflightSourceXIDWraparound_GateExcludesEmptyEngine: defensive —
-// an empty sourceEngine must not fire.
+// zero source Capabilities must not fire.
 func TestPreflightSourceXIDWraparound_GateExcludesEmptyEngine(t *testing.T) {
 	prober := &stubXIDWraparoundProber{age: xidWraparoundRefuseThreshold + 1, datname: "anywhere"}
-	if err := preflightSourceXIDWraparound(context.Background(), prober, ""); err != nil {
-		t.Errorf("empty sourceEngine must not refuse; got %v", err)
+	if err := preflightSourceXIDWraparound(context.Background(), prober, ir.Capabilities{}); err != nil {
+		t.Errorf("zero-capability source must not refuse; got %v", err)
 	}
 	if prober.callCount != 0 {
 		t.Errorf("expected empty engine to short-circuit at the gate; got %d prober calls", prober.callCount)
@@ -62,7 +64,7 @@ func TestPreflightSourceXIDWraparound_GateExcludesEmptyEngine(t *testing.T) {
 // query holds back autovacuum the same way a logical-slot xmin does).
 func TestPreflightSourceXIDWraparound_GateIncludesPostgresTrigger(t *testing.T) {
 	prober := &stubXIDWraparoundProber{age: xidWraparoundRefuseThreshold + 1, datname: "near_wrap_db"}
-	err := preflightSourceXIDWraparound(context.Background(), prober, "postgres-trigger")
+	err := preflightSourceXIDWraparound(context.Background(), prober, capsTriggerPG)
 	if err == nil {
 		t.Fatal("expected refusal for postgres-trigger near wraparound; got nil")
 	}
@@ -78,7 +80,7 @@ func TestPreflightSourceXIDWraparound_GateIncludesPostgresTrigger(t *testing.T) 
 // handle that doesn't implement the prober skips silently (matches the
 // REPLICATION preflight's opportunistic-skip posture).
 func TestPreflightSourceXIDWraparound_NonProberHandleSkips(t *testing.T) {
-	if err := preflightSourceXIDWraparound(context.Background(), stubWriterNoChecker{}, "postgres"); err != nil {
+	if err := preflightSourceXIDWraparound(context.Background(), stubWriterNoChecker{}, capsSlotPG); err != nil {
 		t.Errorf("expected nil when handle lacks xidWraparoundProber; got %v", err)
 	}
 }
@@ -89,7 +91,7 @@ func TestPreflightSourceXIDWraparound_NonProberHandleSkips(t *testing.T) {
 // thousands max).
 func TestPreflightSourceXIDWraparound_HealthyAgePasses(t *testing.T) {
 	prober := &stubXIDWraparoundProber{age: 1_000_000, datname: "healthy_db"}
-	if err := preflightSourceXIDWraparound(context.Background(), prober, "postgres"); err != nil {
+	if err := preflightSourceXIDWraparound(context.Background(), prober, capsSlotPG); err != nil {
 		t.Errorf("expected nil for healthy age; got %v", err)
 	}
 	if prober.callCount != 1 {
@@ -102,7 +104,7 @@ func TestPreflightSourceXIDWraparound_HealthyAgePasses(t *testing.T) {
 // refusal floor, not a "near" warning.
 func TestPreflightSourceXIDWraparound_BelowThresholdPasses(t *testing.T) {
 	prober := &stubXIDWraparoundProber{age: xidWraparoundRefuseThreshold - 1, datname: "just_under"}
-	if err := preflightSourceXIDWraparound(context.Background(), prober, "postgres"); err != nil {
+	if err := preflightSourceXIDWraparound(context.Background(), prober, capsSlotPG); err != nil {
 		t.Errorf("expected nil for age = threshold-1; got %v", err)
 	}
 }
@@ -113,7 +115,7 @@ func TestPreflightSourceXIDWraparound_BelowThresholdPasses(t *testing.T) {
 // age, and the canonical recovery action.
 func TestPreflightSourceXIDWraparound_AtOrAboveThresholdRefuses(t *testing.T) {
 	prober := &stubXIDWraparoundProber{age: xidWraparoundRefuseThreshold, datname: "danger_db"}
-	err := preflightSourceXIDWraparound(context.Background(), prober, "postgres")
+	err := preflightSourceXIDWraparound(context.Background(), prober, capsSlotPG)
 	if err == nil {
 		t.Fatal("expected refusal at threshold; got nil")
 	}
@@ -141,7 +143,7 @@ func TestPreflightSourceXIDWraparound_AtOrAboveThresholdRefuses(t *testing.T) {
 // replace.
 func TestPreflightSourceXIDWraparound_ProbeErrorPropagates(t *testing.T) {
 	prober := &stubXIDWraparoundProber{err: errors.New("connection reset probing pg_database")}
-	err := preflightSourceXIDWraparound(context.Background(), prober, "postgres")
+	err := preflightSourceXIDWraparound(context.Background(), prober, capsSlotPG)
 	if err == nil {
 		t.Fatal("expected error; got nil")
 	}

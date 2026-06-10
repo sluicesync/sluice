@@ -977,13 +977,13 @@ func (s *Streamer) runWithRetry(ctx context.Context, attempts int) error {
 // failed at batch=100 (every batch hit tx-timeout, retry loop fired
 // exhaustively), worked at 25-50.
 //
-// Triggers when target engine name is "planetscale" AND
-// ApplyBatchSize > 50. The check is conservative — we don't try to
-// detect cross-region from DSN host inspection (PS hostname formats
-// vary; false negatives are better than the maintenance burden of a
-// host-pattern table that grows stale). Operators on same-region
-// PS-MySQL hit a benign WARN — better than missing the cross-region
-// foot-gun entirely.
+// Triggers when the target declares [ir.Capabilities.TransactionKiller]
+// (Vitess-backed flavors: planetscale, vitess) AND ApplyBatchSize > 50.
+// The check is conservative — we don't try to detect cross-region from
+// DSN host inspection (PS hostname formats vary; false negatives are
+// better than the maintenance burden of a host-pattern table that
+// grows stale). Operators on same-region PS-MySQL hit a benign WARN —
+// better than missing the cross-region foot-gun entirely.
 //
 // Phase 3 (v0.46.0+) will replace this static rail with an AIMD
 // controller that auto-discovers the right size per (source,
@@ -992,15 +992,16 @@ func warnIfApplyBatchSizeRisky(ctx context.Context, s *Streamer) {
 	if s.Target == nil {
 		return
 	}
-	maybeWarnApplyBatchSizeRisky(ctx, s.Target.Name(), s.ApplyBatchSize)
+	maybeWarnApplyBatchSizeRisky(ctx, s.Target.Capabilities(), s.Target.Name(), s.ApplyBatchSize)
 }
 
 // maybeWarnApplyBatchSizeRisky is the testable core of
-// [warnIfApplyBatchSizeRisky] — takes the target engine name and
-// batch size directly so unit tests can exercise the policy without
-// constructing a full Engine stub.
-func maybeWarnApplyBatchSizeRisky(ctx context.Context, targetName string, batchSize int) {
-	if targetName != "planetscale" {
+// [warnIfApplyBatchSizeRisky] — takes the target capabilities, engine
+// name (for the WARN text only), and batch size directly so unit
+// tests can exercise the policy without constructing a full Engine
+// stub.
+func maybeWarnApplyBatchSizeRisky(ctx context.Context, targetCaps ir.Capabilities, targetName string, batchSize int) {
+	if !targetCaps.TransactionKiller {
 		return
 	}
 	const riskyThreshold = 50
@@ -1008,7 +1009,7 @@ func maybeWarnApplyBatchSizeRisky(ctx context.Context, targetName string, batchS
 		return
 	}
 	slog.WarnContext(
-		ctx, "apply-batch-size > 50 against a planetscale target may exceed Vitess's 20s transaction-killer timeout under sustained CDC load",
+		ctx, fmt.Sprintf("apply-batch-size > 50 against a %s target may exceed Vitess's 20s transaction-killer timeout under sustained CDC load", targetName),
 		slog.Int("apply_batch_size", batchSize),
 		slog.Int("safe_threshold", riskyThreshold),
 		slog.String("hint", "if you see frequent 'mysql: applier: batch rollback on error' with 'code = Aborted ... for tx killer rollback', reduce --apply-batch-size to 25-50. See GitHub #18 for the auto-tuning controller planned for a future release."),
@@ -1879,7 +1880,7 @@ func (s *Streamer) maybeAttachAIMDController(ctx context.Context, applier ir.Cha
 
 	target := s.ApplyTuneTargetLatency
 	if target <= 0 {
-		target = resolveAIMDTargetLatency(s.engineNameForAIMD())
+		target = resolveAIMDTargetLatency(s.targetCapsForAIMD())
 	}
 
 	cfg := appliercontrol.Config{
@@ -2061,10 +2062,9 @@ func (s *Streamer) attachSlotHealthProbe(ctx context.Context, streamID string) *
 // surfaced as a CLI default in `--slot-name` help text.
 const defaultPGSlotName = "sluice_slot"
 
-// engineNameForAIMD returns the canonical engine name used for the
-// AIMD controller's defaults lookup. Falls back to an empty string
-// when the target engine is unset (test fixtures); resolveAIMDTargetLatency
-// treats empty as "use the cross-engine default."
+// engineNameForAIMD returns the canonical engine name used to label
+// the AIMD controller's log lines. Falls back to an empty string
+// when the target engine is unset (test fixtures).
 func (s *Streamer) engineNameForAIMD() string {
 	if s.Target == nil {
 		return ""
@@ -2072,14 +2072,26 @@ func (s *Streamer) engineNameForAIMD() string {
 	return s.Target.Name()
 }
 
+// targetCapsForAIMD returns the target engine's declared capabilities
+// for the AIMD defaults lookup. Falls back to the zero Capabilities
+// when the target engine is unset (test fixtures);
+// resolveAIMDTargetLatency then picks the cross-engine default.
+func (s *Streamer) targetCapsForAIMD() ir.Capabilities {
+	if s.Target == nil {
+		return ir.Capabilities{}
+	}
+	return s.Target.Capabilities()
+}
+
 // resolveAIMDTargetLatency returns the engine-default p95 target
 // latency per ADR-0052 DP-2:
 //
-//   - planetscale: 5s (Vitess 20s tx-killer + 4x headroom)
-//   - mysql / postgres / any other named engine: 10s
-//   - empty (unknown target — typically a test stub): 10s
-func resolveAIMDTargetLatency(engineName string) time.Duration {
-	if engineName == "planetscale" {
+//   - targets declaring [ir.Capabilities.TransactionKiller]
+//     (planetscale, vitess): 5s (Vitess 20s tx-killer + 4x headroom)
+//   - mysql / postgres / any other target: 10s
+//   - zero capabilities (unknown target — typically a test stub): 10s
+func resolveAIMDTargetLatency(targetCaps ir.Capabilities) time.Duration {
+	if targetCaps.TransactionKiller {
 		return 5 * time.Second
 	}
 	return 10 * time.Second
@@ -2515,12 +2527,13 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 	// REPLICATION attribute. Refuses loudly UPFRONT — naming the role
 	// and pointing managed-PG operators at `--source-driver=postgres-
 	// trigger` — instead of failing mid-cold-start with a raw permission
-	// error. Gated on the source engine NAME: fires only for `postgres`,
+	// error. Gated on the declared CDC capability: fires only for
+	// slot-creating CDC (ir.CDCLogicalReplication — today `postgres`),
 	// never for the slot-less `postgres-trigger` (which delegates the
 	// same SchemaReader, so interface-presence alone wouldn't exclude
-	// it) nor for MySQL. Runs against the still-open source SchemaReader
-	// (sr) before it's closed below.
-	if err := preflightSourceReplication(ctx, sr, s.Source.Name()); err != nil {
+	// it; its CDCTriggers capability does) nor for MySQL. Runs against
+	// the still-open source SchemaReader (sr) before it's closed below.
+	if err := preflightSourceReplication(ctx, sr, s.Source.Capabilities()); err != nil {
 		closeIf(sr)
 		return nil, stop, err
 	}
@@ -2528,15 +2541,16 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 	// upfront when the source PG database is near the 32-bit wraparound
 	// horizon — long-running CDC against such a source either races
 	// PG's global write-block or holds back autovacuum and makes it
-	// worse. Gated on PG-flavoured sources (postgres + postgres-trigger).
-	if err := preflightSourceXIDWraparound(ctx, sr, s.Source.Name()); err != nil {
+	// worse. Gated on the PostgresBackend capability (postgres +
+	// postgres-trigger both declare it).
+	if err := preflightSourceXIDWraparound(ctx, sr, s.Source.Capabilities()); err != nil {
 		closeIf(sr)
 		return nil, stop, err
 	}
 	// Partition preflight (Bug 100 / v0.92.0). Same shape as the
 	// migrate preflight — refuses upfront when the source schema
 	// contains declaratively-partitioned tables.
-	if err := preflightPartitionedTables(ctx, sr, s.Source.Name(), schema); err != nil {
+	if err := preflightPartitionedTables(ctx, sr, s.Source.Capabilities(), schema); err != nil {
 		closeIf(sr)
 		return nil, stop, err
 	}

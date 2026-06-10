@@ -29,12 +29,13 @@ package pipeline
 //
 // # Gating
 //
-// Fires for any PG-flavoured source — the slot-based `postgres` and
-// the slot-less `postgres-trigger` engines. MySQL sources and every
-// non-PG path short-circuit. The handle's
-// [xidWraparoundProber] interface presence ALONE is insufficient —
-// the engine-name gate excludes non-PG sources whose handles happen
-// to satisfy the prober shape.
+// Fires for any source declaring [ir.Capabilities.PostgresBackend] —
+// the slot-based `postgres` and the slot-less `postgres-trigger`
+// engines both front a genuine PG server, whose 32-bit XID machinery
+// this preflight probes. MySQL sources and every non-PG path
+// short-circuit. The handle's [xidWraparoundProber] interface presence
+// ALONE is insufficient — the capability gate excludes non-PG sources
+// whose handles happen to satisfy the prober shape.
 //
 // # Threshold
 //
@@ -61,6 +62,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // errXIDWraparoundRefused is the sentinel cause for an XID-wraparound
@@ -72,12 +75,6 @@ var errXIDWraparoundRefused = errors.New("pipeline: XID-wraparound preflight ref
 // xidWraparoundRefuseThreshold is the `age(datfrozenxid)` value above
 // which the preflight refuses. See the file-header §Threshold rationale.
 const xidWraparoundRefuseThreshold = int64(1_500_000_000)
-
-// triggerPostgresEngineName is the registered engine name of the
-// slot-less Postgres CDC engine. Named alongside [slotBasedPostgresEngineName]
-// (defined in `replication_preflight.go`) so the XID preflight's
-// "fire for any PG-flavoured source" intent reads clearly.
-const triggerPostgresEngineName = "postgres-trigger"
 
 // xidWraparoundProber is the optional surface a Postgres source
 // SchemaReader implements to drive the XID-wraparound preflight.
@@ -98,8 +95,9 @@ type xidWraparoundProber interface {
 // preflightSourceXIDWraparound runs the XID-wraparound preflight
 // against the source handle. Returns nil when:
 //
-//   - sourceEngine is neither `postgres` nor `postgres-trigger` (the
-//     engine-name gate — excludes MySQL and every non-PG path).
+//   - The source doesn't declare [ir.Capabilities.PostgresBackend]
+//     (the capability gate — excludes MySQL and every non-PG path;
+//     both `postgres` and `postgres-trigger` declare it).
 //   - The handle doesn't implement [xidWraparoundProber] (a PG
 //     surface that doesn't expose the probe — opportunistic-skip
 //     posture, matches [preflightSourceReplication]).
@@ -110,8 +108,8 @@ type xidWraparoundProber interface {
 // observed age, the threshold, and the operator-actionable recovery
 // paths (VACUUM FREEZE, kill the stuck long-lived transaction, or
 // wait for autovacuum to advance the horizon).
-func preflightSourceXIDWraparound(ctx context.Context, handle any, sourceEngine string) error {
-	if sourceEngine != slotBasedPostgresEngineName && sourceEngine != triggerPostgresEngineName {
+func preflightSourceXIDWraparound(ctx context.Context, handle any, sourceCaps ir.Capabilities) error {
+	if !sourceCaps.PostgresBackend {
 		return nil
 	}
 	prober, ok := handle.(xidWraparoundProber)

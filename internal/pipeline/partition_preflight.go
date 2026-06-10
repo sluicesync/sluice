@@ -49,8 +49,10 @@ type partitionPreflightProber interface {
 // preflightPartitionedTables runs the partitioning preflight against
 // the source schema reader. Returns nil when:
 //
-//   - sourceEngine is NOT a PG-flavoured engine (MySQL silently
-//     skips, mirroring [preflightSourceReplication]'s engine gate).
+//   - The source doesn't declare [ir.Capabilities.PostgresBackend]
+//     (PG declarative partitioning is a PG-server concept; MySQL
+//     silently skips, mirroring [preflightSourceReplication]'s
+//     capability gate).
 //   - The handle doesn't implement [partitionPreflightProber] (the
 //     opportunistic-skip posture matches [preflightRLS]).
 //   - No table in the active schema is partitioned.
@@ -63,8 +65,8 @@ type partitionPreflightProber interface {
 // partitioned parent table is in-scope. The message names every
 // offending parent (sorted) and lists the three operator-actionable
 // recovery paths.
-func preflightPartitionedTables(ctx context.Context, handle any, sourceEngine string, schema *ir.Schema) error {
-	if !isPGFlavoured(sourceEngine) {
+func preflightPartitionedTables(ctx context.Context, handle any, sourceCaps ir.Capabilities, schema *ir.Schema) error {
+	if !sourceCaps.PostgresBackend {
 		return nil
 	}
 	prober, ok := handle.(partitionPreflightProber)
@@ -146,12 +148,4 @@ func formatPartitionedRefusal(parents []string) string {
 		"partition hierarchy first, then `sluice migrate --schema-already-applied` for the data. ")
 	b.WriteString("Native partition-aware support is roadmap-tracked but not yet shipped")
 	return b.String()
-}
-
-// isPGFlavoured reports whether the named engine is one of the PG
-// CDC paths. Includes `postgres` (slot-based) and `postgres-trigger`
-// (trigger-capture). Other engines silently skip the partition
-// preflight.
-func isPGFlavoured(name string) bool {
-	return name == "postgres" || name == "postgres-trigger"
 }

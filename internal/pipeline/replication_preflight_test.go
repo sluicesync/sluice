@@ -8,13 +8,15 @@ import (
 	"errors"
 	"strings"
 	"testing"
+
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // stubReplicationProber is a fake [replicationCapabilityProber]
 // returning a canned (canReplicate, role) pair plus an optional error.
 // Used by the unit tests to exercise the gate + refusal-formatting paths
 // without booting a real PG container. callCount lets tests assert the
-// engine-name gate short-circuits BEFORE the prober is consulted (the
+// capability gate short-circuits BEFORE the prober is consulted (the
 // postgres-trigger exclusion).
 type stubReplicationProber struct {
 	canReplicate bool
@@ -34,16 +36,16 @@ func (s *stubReplicationProber) SourceReplicationCapability(_ context.Context) (
 // TestPreflightSourceReplication_GateExcludesPostgresTrigger is the KEY
 // exclusion test: postgres-trigger is the slot-less RECOMMENDED FIX. Its
 // SchemaReader delegates to the composed postgres.Engine, so it DOES
-// satisfy replicationCapabilityProber — the engine-NAME gate is the only
-// thing that excludes it. A prober that WOULD refuse (cannot replicate)
+// satisfy replicationCapabilityProber — its declared CDCTriggers
+// capability is the only thing that excludes it. A prober that WOULD refuse (cannot replicate)
 // must never be consulted for postgres-trigger.
 func TestPreflightSourceReplication_GateExcludesPostgresTrigger(t *testing.T) {
 	prober := &stubReplicationProber{canReplicate: false, role: "heroku_like"}
-	if err := preflightSourceReplication(context.Background(), prober, "postgres-trigger"); err != nil {
+	if err := preflightSourceReplication(context.Background(), prober, capsTriggerPG); err != nil {
 		t.Errorf("postgres-trigger must never refuse on replication preflight; got %v", err)
 	}
 	if prober.callCount != 0 {
-		t.Errorf("expected the engine-name gate to short-circuit BEFORE the prober is consulted; got %d calls",
+		t.Errorf("expected the capability gate to short-circuit BEFORE the prober is consulted; got %d calls",
 			prober.callCount)
 	}
 }
@@ -53,7 +55,7 @@ func TestPreflightSourceReplication_GateExcludesPostgresTrigger(t *testing.T) {
 // prober is present.
 func TestPreflightSourceReplication_GateExcludesMySQL(t *testing.T) {
 	prober := &stubReplicationProber{canReplicate: false, role: "mysql_role"}
-	if err := preflightSourceReplication(context.Background(), prober, "mysql"); err != nil {
+	if err := preflightSourceReplication(context.Background(), prober, capsMySQL); err != nil {
 		t.Errorf("mysql source must not refuse on replication preflight; got %v", err)
 	}
 	if prober.callCount != 0 {
@@ -61,16 +63,16 @@ func TestPreflightSourceReplication_GateExcludesMySQL(t *testing.T) {
 	}
 }
 
-// TestPreflightSourceReplication_GateExcludesEmptyEngine: an empty
-// sourceEngine (defensive) must not fire — only the exact slot-based
-// `postgres` name does.
-func TestPreflightSourceReplication_GateExcludesEmptyEngine(t *testing.T) {
+// TestPreflightSourceReplication_GateExcludesEmptyCaps: zero
+// Capabilities (defensive — an unset test stub) must not fire — only
+// a declared CDCLogicalReplication capability does.
+func TestPreflightSourceReplication_GateExcludesEmptyCaps(t *testing.T) {
 	prober := &stubReplicationProber{canReplicate: false, role: "anyone"}
-	if err := preflightSourceReplication(context.Background(), prober, ""); err != nil {
-		t.Errorf("empty sourceEngine must not refuse; got %v", err)
+	if err := preflightSourceReplication(context.Background(), prober, ir.Capabilities{}); err != nil {
+		t.Errorf("zero-capability source must not refuse; got %v", err)
 	}
 	if prober.callCount != 0 {
-		t.Errorf("expected empty engine to short-circuit at the gate; got %d prober calls", prober.callCount)
+		t.Errorf("expected zero-capability source to short-circuit at the gate; got %d prober calls", prober.callCount)
 	}
 }
 
@@ -80,7 +82,7 @@ func TestPreflightSourceReplication_GateExcludesEmptyEngine(t *testing.T) {
 func TestPreflightSourceReplication_NonProberHandleSkips(t *testing.T) {
 	// stubWriterNoChecker (from preflight_test.go) doesn't implement
 	// replicationCapabilityProber.
-	if err := preflightSourceReplication(context.Background(), stubWriterNoChecker{}, "postgres"); err != nil {
+	if err := preflightSourceReplication(context.Background(), stubWriterNoChecker{}, capsSlotPG); err != nil {
 		t.Errorf("expected nil when handle lacks replicationCapabilityProber; got %v", err)
 	}
 }
@@ -90,7 +92,7 @@ func TestPreflightSourceReplication_NonProberHandleSkips(t *testing.T) {
 // control's unit-test counterpart).
 func TestPreflightSourceReplication_CapableRolePasses(t *testing.T) {
 	prober := &stubReplicationProber{canReplicate: true, role: "sluice_super"}
-	if err := preflightSourceReplication(context.Background(), prober, "postgres"); err != nil {
+	if err := preflightSourceReplication(context.Background(), prober, capsSlotPG); err != nil {
 		t.Errorf("expected nil for a replication-capable role; got %v", err)
 	}
 	if prober.callCount != 1 {
@@ -104,7 +106,7 @@ func TestPreflightSourceReplication_CapableRolePasses(t *testing.T) {
 // the postgres-trigger recovery hint.
 func TestPreflightSourceReplication_IncapableRoleRefuses(t *testing.T) {
 	prober := &stubReplicationProber{canReplicate: false, role: "heroku_like"}
-	err := preflightSourceReplication(context.Background(), prober, "postgres")
+	err := preflightSourceReplication(context.Background(), prober, capsSlotPG)
 	if err == nil {
 		t.Fatal("expected refusal; got nil")
 	}
@@ -132,7 +134,7 @@ func TestPreflightSourceReplication_IncapableRoleRefuses(t *testing.T) {
 // error this preflight exists to replace.
 func TestPreflightSourceReplication_ProbeErrorPropagates(t *testing.T) {
 	prober := &stubReplicationProber{err: errors.New("connection reset probing pg_roles")}
-	err := preflightSourceReplication(context.Background(), prober, "postgres")
+	err := preflightSourceReplication(context.Background(), prober, capsSlotPG)
 	if err == nil {
 		t.Fatal("expected error; got nil")
 	}

@@ -47,6 +47,18 @@ func TestEngine_Capabilities(t *testing.T) {
 	if !c.SupportsCheckConstraint {
 		t.Errorf("SupportsCheckConstraint = false; want true")
 	}
+	if !c.PostgresBackend {
+		t.Error("PostgresBackend = false; want true (genuine PG server — XID/partition preflights must fire)")
+	}
+	if c.PGExtensionCatalog {
+		t.Error("PGExtensionCatalog = true; want false (extension passthrough unvalidated through the trigger capture path)")
+	}
+	if c.VerbatimExtensionTypes {
+		t.Error("VerbatimExtensionTypes = true; want false (ADR-0047 verbatim tier unvalidated through the trigger capture path)")
+	}
+	if c.DDLDialect != ir.DDLDialectANSI {
+		t.Errorf("DDLDialect = %v; want DDLDialectANSI", c.DDLDialect)
+	}
 }
 
 // TestEngine_NoSlotManager asserts the engine does NOT expose

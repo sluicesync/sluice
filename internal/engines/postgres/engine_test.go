@@ -10,6 +10,36 @@ import (
 	"sluicesync.dev/sluice/internal/ir"
 )
 
+// TestEngine_Capabilities pins the capability declarations the
+// orchestrator's engine-neutral gates dispatch on (M2.5): the
+// PG-server preflights (PostgresBackend), the ADR-0032
+// `--enable-pg-extension` gate (PGExtensionCatalog), the ADR-0047
+// verbatim tier (VerbatimExtensionTypes), and the slot-creation
+// replication preflight (CDCLogicalReplication). Flipping any of
+// these silently re-routes pipeline behaviour — change them
+// deliberately, with the matching gate test.
+func TestEngine_Capabilities(t *testing.T) {
+	c := Engine{}.Capabilities()
+	if c.CDC != ir.CDCLogicalReplication {
+		t.Errorf("CDC = %v; want CDCLogicalReplication (slot-based — the replication preflight keys on this)", c.CDC)
+	}
+	if !c.PostgresBackend {
+		t.Error("PostgresBackend = false; want true (XID/partition preflights must fire)")
+	}
+	if !c.PGExtensionCatalog {
+		t.Error("PGExtensionCatalog = false; want true (--enable-pg-extension, ADR-0032)")
+	}
+	if !c.VerbatimExtensionTypes {
+		t.Error("VerbatimExtensionTypes = false; want true (ADR-0047 verbatim tier)")
+	}
+	if c.DDLDialect != ir.DDLDialectANSI {
+		t.Errorf("DDLDialect = %v; want DDLDialectANSI", c.DDLDialect)
+	}
+	if c.TransactionKiller {
+		t.Error("TransactionKiller = true; want false (no vtgate in front of PG)")
+	}
+}
+
 // TestEngine_CompareLSN exercises the live-mode invariant helper
 // (ADR-0030) on canonical PG LSN strings. The compare must be
 // numeric over the parsed pglogrepl.LSN value, not lexicographic

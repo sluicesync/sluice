@@ -569,8 +569,8 @@ func (m *Migrator) runSingleDatabase(ctx context.Context, scope *multiDBScope) e
 	// upfront when the source PG database is near the 32-bit wraparound
 	// horizon (age(datfrozenxid) ≥ ~1.5B) — migrating from such a source
 	// either races PG's global write-block or makes it worse. Gated on
-	// PG-flavoured sources only; non-PG paths short-circuit.
-	if err := preflightSourceXIDWraparound(ctx, sr, m.Source.Name()); err != nil {
+	// the PostgresBackend capability; non-PG paths short-circuit.
+	if err := preflightSourceXIDWraparound(ctx, sr, m.Source.Capabilities()); err != nil {
 		return err
 	}
 
@@ -578,9 +578,10 @@ func (m *Migrator) runSingleDatabase(ctx context.Context, scope *multiDBScope) e
 	// the source schema contains declaratively-partitioned tables,
 	// since sluice would otherwise silently flatten the parent to a
 	// plain heap (dropping the partition key + composite PK) AND
-	// re-copy the children as separate heaps. PG-only; the source-
-	// engine name gate inside the preflight excludes non-PG paths.
-	if err := preflightPartitionedTables(ctx, sr, m.Source.Name(), schema); err != nil {
+	// re-copy the children as separate heaps. PG-only; the
+	// PostgresBackend capability gate inside the preflight excludes
+	// non-PG paths.
+	if err := preflightPartitionedTables(ctx, sr, m.Source.Capabilities(), schema); err != nil {
 		return err
 	}
 

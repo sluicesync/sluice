@@ -74,6 +74,15 @@ func TestVanillaCapabilities(t *testing.T) {
 	if !caps.SupportedTypes.Has(ir.ExtGeometry) {
 		t.Error("vanilla should declare native Geometry support")
 	}
+	if caps.DDLDialect != ir.DDLDialectMySQL {
+		t.Errorf("vanilla DDLDialect = %v; want DDLDialectMySQL (backtick quoting, MODIFY COLUMN)", caps.DDLDialect)
+	}
+	if caps.TransactionKiller {
+		t.Error("vanilla TransactionKiller = true; want false (no vtgate tx-killer on upstream MySQL)")
+	}
+	if caps.PostgresBackend || caps.PGExtensionCatalog || caps.VerbatimExtensionTypes {
+		t.Error("vanilla must not declare any PG-family capability")
+	}
 }
 
 // TestPlanetScaleCapabilities asserts the differences from vanilla
@@ -92,6 +101,12 @@ func TestPlanetScaleCapabilities(t *testing.T) {
 	}
 	if caps.SupportedTypes.Has(ir.ExtGeometry) {
 		t.Error("planetscale should not declare Geometry support (excluded for conservatism)")
+	}
+	if !caps.TransactionKiller {
+		t.Error("planetscale TransactionKiller = false; want true (vtgate ~20s tx-killer drives the AIMD + batch-size rails)")
+	}
+	if caps.DDLDialect != ir.DDLDialectMySQL {
+		t.Errorf("planetscale DDLDialect = %v; want DDLDialectMySQL", caps.DDLDialect)
 	}
 }
 

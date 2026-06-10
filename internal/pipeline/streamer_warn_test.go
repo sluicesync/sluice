@@ -8,14 +8,21 @@ import (
 	"errors"
 	"strings"
 	"testing"
+
+	"sluicesync.dev/sluice/internal/ir"
 )
 
-// TestMaybeWarnApplyBatchSizeRisky_FiresForPlanetScaleAboveThreshold
-// covers the GitHub #18 Phase 2 safety-rail: WARN when target is
-// planetscale AND --apply-batch-size > 50.
-func TestMaybeWarnApplyBatchSizeRisky_FiresForPlanetScaleAboveThreshold(t *testing.T) {
+// capsTxKiller mirrors the Vitess-backed flavors (planetscale,
+// vitess): the vtgate ~20s transaction killer drives the conservative
+// apply-batch warning + AIMD defaults.
+var capsTxKiller = ir.Capabilities{TransactionKiller: true}
+
+// TestMaybeWarnApplyBatchSizeRisky_FiresForTxKillerAboveThreshold
+// covers the GitHub #18 Phase 2 safety-rail: WARN when the target
+// declares TransactionKiller AND --apply-batch-size > 50.
+func TestMaybeWarnApplyBatchSizeRisky_FiresForTxKillerAboveThreshold(t *testing.T) {
 	buf := captureSlog(t)
-	maybeWarnApplyBatchSizeRisky(context.Background(), "planetscale", 100)
+	maybeWarnApplyBatchSizeRisky(context.Background(), capsTxKiller, "planetscale", 100)
 	out := buf.String()
 	if out == "" {
 		t.Fatal("expected WARN log for planetscale + batch=100; got empty")
@@ -28,26 +35,34 @@ func TestMaybeWarnApplyBatchSizeRisky_FiresForPlanetScaleAboveThreshold(t *testi
 	}
 }
 
-// TestMaybeWarnApplyBatchSizeRisky_QuietForNonPlanetscale confirms
+// TestMaybeWarnApplyBatchSizeRisky_QuietWithoutTxKiller confirms
 // no warn fires for vanilla MySQL / PG targets — the safety rail
-// is scoped to Vitess's documented tx-killer behaviour.
-func TestMaybeWarnApplyBatchSizeRisky_QuietForNonPlanetscale(t *testing.T) {
+// is scoped to Vitess's documented tx-killer behaviour, which those
+// engines don't declare.
+func TestMaybeWarnApplyBatchSizeRisky_QuietWithoutTxKiller(t *testing.T) {
 	buf := captureSlog(t)
-	for _, name := range []string{"mysql", "postgres", "sqlite"} {
-		maybeWarnApplyBatchSizeRisky(context.Background(), name, 1000)
+	for _, tc := range []struct {
+		caps ir.Capabilities
+		name string
+	}{
+		{capsMySQL, "mysql"},
+		{capsSlotPG, "postgres"},
+		{ir.Capabilities{}, "sqlite"},
+	} {
+		maybeWarnApplyBatchSizeRisky(context.Background(), tc.caps, tc.name, 1000)
 	}
 	if buf.Len() != 0 {
-		t.Errorf("expected silent for non-planetscale targets even with batch=1000; got log %q", buf.String())
+		t.Errorf("expected silent for non-tx-killer targets even with batch=1000; got log %q", buf.String())
 	}
 }
 
-// TestMaybeWarnApplyBatchSizeRisky_QuietForPlanetscaleAtSafeBatch
+// TestMaybeWarnApplyBatchSizeRisky_QuietForTxKillerAtSafeBatch
 // confirms the warn doesn't fire when an operator is well within
-// the 50-row safe zone on planetscale.
-func TestMaybeWarnApplyBatchSizeRisky_QuietForPlanetscaleAtSafeBatch(t *testing.T) {
+// the 50-row safe zone on a tx-killer target.
+func TestMaybeWarnApplyBatchSizeRisky_QuietForTxKillerAtSafeBatch(t *testing.T) {
 	buf := captureSlog(t)
 	for _, n := range []int{0, 1, 10, 25, 50} {
-		maybeWarnApplyBatchSizeRisky(context.Background(), "planetscale", n)
+		maybeWarnApplyBatchSizeRisky(context.Background(), capsTxKiller, "planetscale", n)
 	}
 	if buf.Len() != 0 {
 		t.Errorf("expected silent for planetscale at safe batch sizes (≤50); got log %q", buf.String())
