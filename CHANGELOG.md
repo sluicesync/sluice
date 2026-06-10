@@ -6,6 +6,49 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **PG → `vitess`-flavor chain restores no longer silently skip the PG-native
+  refusal checks.** The `vitess` self-hosted flavor (shipped v0.99.15) was
+  missing from the MySQL-family target check in the cross-engine restore gate,
+  so restoring a PG-lineage backup chain to a `vitess` target silently skipped
+  every PG-native unsupportability refusal — a PG schema carrying `EXCLUDE`
+  constraints or extension opclasses would restore with those constraints
+  **silently dropped** instead of refusing loudly. Found while converting
+  engine-name dispatch to capability dispatch (the exact bug class that
+  conversion exists to kill); now pinned. Anyone who restored a PG-lineage
+  chain to a `vitess`-flavor target on v0.99.15–v0.99.31 should re-check that
+  schema's constraints. (`planetscale` and `mysql` targets were always
+  covered; PG→PG restores unaffected.)
+
+### Changed
+- **The `vitess` flavor now inherits the PlanetScale-tuned apply defaults it
+  was always meant to have** (same vtgate semantics): conservative AIMD p95
+  target latency (5s, was the generic 10s), the apply-batch-size>50
+  transaction-killer warning, and MySQL-dialect schema-diff rendering (was
+  PG-style).
+
+### Performance
+- **Idle `backup stream` broker ticks are now O(1) store reads instead of one
+  GET per manifest in the chain** (~2,000 GETs per 30s tick on a week-old
+  5-minute-rollover stream → exactly 2). The walked chain is cached on the
+  byte-identity of the lineage catalog + tail manifest; any structural change
+  (rotation, compaction, prune, append, tail checkpoint rewrite) invalidates.
+- **Bulk-copy decode and write now overlap** (bounded 64-row buffers on the
+  row-channel chain; backpressure preserved) and the PG COPY bridge no longer
+  allocates per row (0 allocs/op pinned).
+- **The per-flush `SHOW WARNINGS` probe on batched-INSERT targets is sampled**
+  (first 10 flushes exhaustive, then 1-in-16, final flush always) — up to ~30
+  min saved on large cross-region PlanetScale loads; the LOAD DATA path keeps
+  its every-statement check.
+
+### Internal
+- Applier column-metadata shapes converged across engines + byte-identical
+  helpers extracted to `internal/appliershared` (control-plane extraction
+  tiers a; groundwork for one-applier-fix-lands-once).
+- Orchestrator engine dispatch re-anchored to `ir.Capabilities` (five new
+  declared fields); per-engine compile-time optional-interface declarations
+  (a method-set break now fails compile instead of silently downgrading).
+
 ## [0.99.31] - 2026-06-10
 
 ### Added
