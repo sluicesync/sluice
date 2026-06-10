@@ -150,18 +150,23 @@ func TestStreamer_MaybeAttachAIMDController_SkipsEngineWithoutSetters(t *testing
 func TestStreamer_ResolveAIMDTargetLatency_EngineDefaults(t *testing.T) {
 	cases := []struct {
 		engine string
+		caps   ir.Capabilities
 		want   time.Duration
 	}{
-		{"planetscale", 5 * time.Second},
-		{"mysql", 10 * time.Second},
-		{"postgres", 10 * time.Second},
-		{"", 10 * time.Second}, // unknown/empty falls back to the cross-engine default
-		{"future-engine", 10 * time.Second},
+		// Both Vitess-backed flavors declare TransactionKiller (vtgate
+		// ~20s tx-killer) → conservative 5s target per ADR-0052 DP-2.
+		{"planetscale", ir.Capabilities{TransactionKiller: true}, 5 * time.Second},
+		{"vitess", ir.Capabilities{TransactionKiller: true}, 5 * time.Second},
+		{"mysql", capsMySQL, 10 * time.Second},
+		{"postgres", capsSlotPG, 10 * time.Second},
+		// Zero caps (unset target — a test stub) falls back to the
+		// cross-engine default.
+		{"zero-caps", ir.Capabilities{}, 10 * time.Second},
 	}
 	for _, tc := range cases {
 		t.Run(tc.engine, func(t *testing.T) {
-			if got := resolveAIMDTargetLatency(tc.engine); got != tc.want {
-				t.Fatalf("resolveAIMDTargetLatency(%q) = %v; want %v", tc.engine, got, tc.want)
+			if got := resolveAIMDTargetLatency(tc.caps); got != tc.want {
+				t.Fatalf("resolveAIMDTargetLatency(%s) = %v; want %v", tc.engine, got, tc.want)
 			}
 		})
 	}

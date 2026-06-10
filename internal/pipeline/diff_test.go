@@ -544,3 +544,28 @@ func (e *previewStubFailingTargetEngine) OpenSnapshotStream(_ context.Context, _
 type failingReader struct{ err error }
 
 func (r *failingReader) ReadSchema(_ context.Context) (*ir.Schema, error) { return nil, r.err }
+
+// TestRenderColumnMismatch_DialectDispatch pins the M2.5 capability
+// conversion of the diff renderer: the ALTER-suggestion shape and
+// identifier quoting follow the target's declared
+// [ir.Capabilities.DDLDialect], not its engine name. Both dialect
+// families are exercised (the family matrix is two-wide here, so this
+// IS the full pin): MySQL-style MODIFY COLUMN + backticks, ANSI/PG
+// ALTER COLUMN ... TYPE + double quotes. Note the vitess flavor
+// inherits DDLDialectMySQL via planetscale's capabilities — under the
+// old name-switch it silently fell into the PG-style default.
+func TestRenderColumnMismatch_DialectDispatch(t *testing.T) {
+	cd := ir.ColumnDiff{Name: "title", ExpectedType: "VARCHAR(64)", ActualType: "TEXT"}
+
+	var mysqlOut strings.Builder
+	renderColumnMismatch(&mysqlOut, "books", cd, identifierQuoter(ir.DDLDialectMySQL), ir.DDLDialectMySQL)
+	if want := "ALTER TABLE `books` MODIFY COLUMN `title` VARCHAR(64);"; !strings.Contains(mysqlOut.String(), want) {
+		t.Errorf("MySQL dialect rendering missing %q; got %q", want, mysqlOut.String())
+	}
+
+	var ansiOut strings.Builder
+	renderColumnMismatch(&ansiOut, "books", cd, identifierQuoter(ir.DDLDialectANSI), ir.DDLDialectANSI)
+	if want := `ALTER TABLE "books" ALTER COLUMN "title" TYPE VARCHAR(64);`; !strings.Contains(ansiOut.String(), want) {
+		t.Errorf("ANSI dialect rendering missing %q; got %q", want, ansiOut.String())
+	}
+}

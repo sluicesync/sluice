@@ -65,8 +65,7 @@ func checkCrossEngineSupportable(
 	// The literal (not pgtrigger.EngineName) keeps the orchestrator
 	// engine-neutral — the pipeline package never imports an engine
 	// package (see CLAUDE.md "IR-first" / "engine-neutral orchestrator").
-	pgToMySQL := isPGSourceEngine(sourceEngine) &&
-		(targetEngine == "mysql" || targetEngine == "planetscale")
+	pgToMySQL := isPGSourceEngine(sourceEngine) && isMySQLFamilyEngine(targetEngine)
 	if !pgToMySQL {
 		return nil
 	}
@@ -271,8 +270,31 @@ func unsupportablePGtoMySQL(t ir.Type) string {
 // indexes, EXCLUDE constraints). String literals (not pgtrigger.EngineName)
 // keep the orchestrator engine-neutral: the pipeline package never imports
 // a specific engine package.
+//
+// Deliberately a NAME check, not an [ir.Capabilities] read: the source
+// engine here is a lineage-recorded identity string from a backup
+// manifest — the source database is never connected (and its engine
+// need not even be registered in this binary) at restore time, so a
+// capability declaration isn't resolvable. The names ARE the durable
+// record. Keep this list and [isMySQLFamilyEngine] in lock-step with
+// the engine registrations.
 func isPGSourceEngine(engine string) bool {
 	return engine == "postgres" || engine == "postgres-trigger"
+}
+
+// isMySQLFamilyEngine reports whether engine is a MySQL-family target
+// for cross-engine supportability purposes — an engine with no
+// PG-native type surface, so every PG-only shape (PostGIS Geometry,
+// extension opclasses, EXCLUDE constraints) must refuse loudly before
+// any data moves. Covers all three registered MySQL flavors: `mysql`,
+// `planetscale`, and the self-hosted `vitess` flavor (which shares
+// PlanetScale's engine code and capabilities verbatim — ADR-0073(a)).
+//
+// A NAME check for the same reason as [isPGSourceEngine]: the engine
+// pair reaching [checkCrossEngineSupportable] is recorded-name-driven
+// (backup lineage), so capabilities aren't resolvable here.
+func isMySQLFamilyEngine(engine string) bool {
+	return engine == "mysql" || engine == "planetscale" || engine == "vitess"
 }
 
 // isCrossEngineTranslatablePGExtension reports whether an

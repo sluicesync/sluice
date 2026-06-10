@@ -63,7 +63,7 @@ func TestRefuseVerbatimRestoreToNonPG(t *testing.T) {
 	unmarked := &LineageCatalog{Segments: []LineageSegment{{SegmentID: "seg0"}}}
 
 	t.Run("marked → mysql refuses loudly", func(t *testing.T) {
-		err := refuseVerbatimRestoreToNonPG(marked, "mysql")
+		err := refuseVerbatimRestoreToNonPG(marked, capsEngine{name: "mysql", caps: capsMySQL})
 		if err == nil {
 			t.Fatal("expected loud refusal restoring verbatim-marked backup to mysql; got nil")
 		}
@@ -75,25 +75,25 @@ func TestRefuseVerbatimRestoreToNonPG(t *testing.T) {
 	})
 
 	t.Run("marked → planetscale refuses loudly", func(t *testing.T) {
-		if err := refuseVerbatimRestoreToNonPG(marked, "planetscale"); err == nil {
+		if err := refuseVerbatimRestoreToNonPG(marked, capsEngine{name: "planetscale", caps: capsTxKiller}); err == nil {
 			t.Fatal("expected refusal restoring verbatim-marked backup to planetscale; got nil")
 		}
 	})
 
 	t.Run("marked → postgres OK", func(t *testing.T) {
-		if err := refuseVerbatimRestoreToNonPG(marked, "postgres"); err != nil {
+		if err := refuseVerbatimRestoreToNonPG(marked, capsEngine{name: "postgres", caps: capsSlotPG}); err != nil {
 			t.Errorf("verbatim-marked backup → postgres should be OK; got %v", err)
 		}
 	})
 
 	t.Run("unmarked → mysql OK (legacy/non-verbatim unaffected)", func(t *testing.T) {
-		if err := refuseVerbatimRestoreToNonPG(unmarked, "mysql"); err != nil {
+		if err := refuseVerbatimRestoreToNonPG(unmarked, capsEngine{name: "mysql", caps: capsMySQL}); err != nil {
 			t.Errorf("unmarked lineage → mysql should be OK; got %v", err)
 		}
 	})
 
 	t.Run("nil catalog OK", func(t *testing.T) {
-		if err := refuseVerbatimRestoreToNonPG(nil, "mysql"); err != nil {
+		if err := refuseVerbatimRestoreToNonPG(nil, capsEngine{name: "mysql", caps: capsMySQL}); err != nil {
 			t.Errorf("nil catalog should be OK; got %v", err)
 		}
 	})
@@ -103,7 +103,7 @@ func TestRefuseVerbatimRestoreToNonPG(t *testing.T) {
 			{SegmentID: "seg0"},
 			{SegmentID: "seg1", VerbatimExtensionColumns: []string{"public.t.c"}},
 		}}
-		if err := refuseVerbatimRestoreToNonPG(multi, "mysql"); err == nil {
+		if err := refuseVerbatimRestoreToNonPG(multi, capsEngine{name: "mysql", caps: capsMySQL}); err == nil {
 			t.Fatal("a verbatim-marked LATER segment must still trip the gate; got nil")
 		}
 	})
@@ -112,13 +112,13 @@ func TestRefuseVerbatimRestoreToNonPG(t *testing.T) {
 // TestRefuseVerbatimManifestRestoreToNonPG covers the single-manifest
 // path counterpart (gates on the manifest schema directly).
 func TestRefuseVerbatimManifestRestoreToNonPG(t *testing.T) {
-	if err := refuseVerbatimManifestRestoreToNonPG(verbatimSchema(), "mysql"); err == nil {
+	if err := refuseVerbatimManifestRestoreToNonPG(verbatimSchema(), capsEngine{name: "mysql", caps: capsMySQL}); err == nil {
 		t.Fatal("single-manifest verbatim → mysql must refuse; got nil")
 	}
-	if err := refuseVerbatimManifestRestoreToNonPG(verbatimSchema(), "postgres"); err != nil {
+	if err := refuseVerbatimManifestRestoreToNonPG(verbatimSchema(), capsEngine{name: "postgres", caps: capsSlotPG}); err != nil {
 		t.Errorf("single-manifest verbatim → postgres OK; got %v", err)
 	}
-	if err := refuseVerbatimManifestRestoreToNonPG(nonVerbatimSchema(), "mysql"); err != nil {
+	if err := refuseVerbatimManifestRestoreToNonPG(nonVerbatimSchema(), capsEngine{name: "mysql", caps: capsMySQL}); err != nil {
 		t.Errorf("single-manifest non-verbatim → mysql OK (unaffected); got %v", err)
 	}
 }

@@ -145,7 +145,7 @@ func (r *ChainRestore) Run(ctx context.Context) error {
 	//      record — never sniffed from chunk bytes.
 	if cat, err := resolveLineage(ctx, r.Store); err != nil {
 		return wrapWithHint(PhaseConnect, fmt.Errorf("chain restore: %w", err))
-	} else if err := refuseVerbatimRestoreToNonPG(cat, r.Target.Name()); err != nil {
+	} else if err := refuseVerbatimRestoreToNonPG(cat, r.Target); err != nil {
 		return wrapWithHint(PhaseConnect, err)
 	}
 

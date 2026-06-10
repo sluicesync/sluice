@@ -24,16 +24,18 @@ package pipeline
 //
 // # Gating (correctness-critical)
 //
-// The preflight fires ONLY for the slot-based `postgres` source engine.
-// It MUST NOT fire for:
+// The preflight fires ONLY for a source whose declared CDC mechanism is
+// [ir.CDCLogicalReplication] — the capability that MEANS "cold start
+// creates a logical replication slot". It MUST NOT fire for:
 //
 //   - `postgres-trigger` — the slot-less engine is the RECOMMENDED FIX;
 //     refusing on it would be absurd. Its SchemaReader delegates to the
 //     composed [postgres.Engine], so it DOES expose
 //     SourceReplicationCapability — interface-presence ALONE is
-//     insufficient to exclude it. The engine-NAME gate is what excludes
-//     it.
-//   - MySQL sources — REPLICATION-attribute / slot creation is PG-only.
+//     insufficient to exclude it. Its declared CDC capability is
+//     [ir.CDCTriggers], which is what excludes it.
+//   - MySQL sources — REPLICATION-attribute / slot creation is PG-only
+//     (binlog / VStream CDC capabilities skip).
 //   - Any non-CDC path — a one-shot bulk `migrate` needs only SELECT and
 //     genuinely works on Heroku; refusing there would be wrong. This
 //     preflight is wired only into the CDC cold-start path, not the pure
@@ -50,6 +52,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	"sluicesync.dev/sluice/internal/ir"
 )
 
 // errReplicationRefused is the sentinel cause for a replication-
@@ -57,13 +61,6 @@ import (
 // connecting role and the recovery paths. Tests assert via errors.Is to
 // avoid coupling to the message text.
 var errReplicationRefused = errors.New("pipeline: replication-capability preflight refused")
-
-// slotBasedPostgresEngineName is the registered engine name of the
-// slot-based Postgres CDC engine — the ONLY engine this preflight fires
-// for. Kept as a named constant (rather than an inline literal) so the
-// gate's intent reads clearly and the postgres-trigger exclusion is
-// obvious: `postgres-trigger` is a DIFFERENT name and so is skipped.
-const slotBasedPostgresEngineName = "postgres"
 
 // replicationCapabilityProber is the optional surface a slot-based
 // Postgres source SchemaReader implements to drive the replication-
@@ -84,11 +81,13 @@ type replicationCapabilityProber interface {
 // preflightSourceReplication runs the replication-capability preflight
 // against the source handle. Returns nil when:
 //
-//   - sourceEngine is NOT the slot-based `postgres` engine (the engine-
-//     name gate — excludes postgres-trigger, MySQL, and every non-CDC
-//     path). This check runs FIRST so postgres-trigger short-circuits
-//     before the prober type-assert, since its delegated SchemaReader
-//     WOULD satisfy the prober interface.
+//   - The source's declared CDC capability is not
+//     [ir.CDCLogicalReplication] (the capability gate — excludes
+//     postgres-trigger ([ir.CDCTriggers]), MySQL ([ir.CDCBinlog] /
+//     [ir.CDCVStream]), and every non-CDC path). This check runs FIRST
+//     so postgres-trigger short-circuits before the prober type-assert,
+//     since its delegated SchemaReader WOULD satisfy the prober
+//     interface.
 //   - The handle doesn't implement [replicationCapabilityProber] (a PG
 //     surface that doesn't expose the probe — the opportunistic-skip
 //     posture matches [preflightRLS]).
@@ -99,13 +98,15 @@ type replicationCapabilityProber interface {
 // the REPLICATION attribute, and lists the three operator-actionable
 // recovery paths (grant REPLICATION, use a replication-enabled role, or
 // switch to `--source-driver=postgres-trigger`).
-func preflightSourceReplication(ctx context.Context, handle any, sourceEngine string) error {
-	// Engine-name gate FIRST (correctness-critical). postgres-trigger's
+func preflightSourceReplication(ctx context.Context, handle any, sourceCaps ir.Capabilities) error {
+	// Capability gate FIRST (correctness-critical). postgres-trigger's
 	// SchemaReader delegates to the composed postgres.Engine, so it DOES
-	// satisfy replicationCapabilityProber — the name gate is the only
-	// thing that excludes it. MySQL and every non-CDC / bulk-migrate
-	// path also short-circuit here.
-	if sourceEngine != slotBasedPostgresEngineName {
+	// satisfy replicationCapabilityProber — its declared CDCTriggers
+	// capability is the only thing that excludes it. MySQL and every
+	// non-CDC / bulk-migrate path also short-circuit here: only an
+	// engine whose CDC mechanism creates a logical replication slot
+	// needs the REPLICATION attribute.
+	if sourceCaps.CDC != ir.CDCLogicalReplication {
 		return nil
 	}
 	prober, ok := handle.(replicationCapabilityProber)

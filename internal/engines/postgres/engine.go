@@ -477,6 +477,10 @@ var capabilities = ir.Capabilities{
 	EnumSupport:              ir.EnumTypeLevel,
 	JSONSupport:              ir.JSONBoth, // json + jsonb
 	UnsignedIntegers:         false,       // Postgres has no unsigned integers
+	DDLDialect:               ir.DDLDialectANSI,
+	PostgresBackend:          true, // PG catalogs / XID wraparound / declarative partitioning
+	PGExtensionCatalog:       true, // --enable-pg-extension resolves extension-owned types (ADR-0032)
+	VerbatimExtensionTypes:   true, // uncatalogued-extension verbatim passthrough (ADR-0047)
 }
 
 // init registers this engine with the engines registry. The blank

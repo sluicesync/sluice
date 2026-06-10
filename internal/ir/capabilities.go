@@ -133,6 +133,32 @@ func (s JSONSupport) String() string {
 	}
 }
 
+// DDLDialect identifies the SQL dialect family used when sluice
+// renders DDL *suggestions* for an engine (schema-diff ALTER hints,
+// identifier quoting). It is a rendering concern only — actual schema
+// writes go through the engine's own [SchemaWriter].
+type DDLDialect uint8
+
+// Recognised DDLDialect values. The zero value is the ANSI/Postgres
+// idiom (double-quoted identifiers, `ALTER COLUMN ... TYPE`), so an
+// engine that doesn't declare a dialect renders portable-ish SQL
+// rather than silently inheriting MySQL's backtick syntax.
+const (
+	DDLDialectANSI  DDLDialect = iota // double-quoted identifiers, ALTER COLUMN ... TYPE
+	DDLDialectMySQL                   // backtick identifiers, MODIFY COLUMN
+)
+
+func (d DDLDialect) String() string {
+	switch d {
+	case DDLDialectANSI:
+		return "ansi"
+	case DDLDialectMySQL:
+		return "mysql"
+	default:
+		return "unknown"
+	}
+}
+
 // TypeSet is a small fixed-size set of [ExtensionKind] values used by
 // [Capabilities] to declare which extension types an engine supports.
 //
@@ -184,4 +210,52 @@ type Capabilities struct {
 	JSONSupport JSONSupport
 	// UnsignedIntegers reports whether the engine has native unsigned integer types.
 	UnsignedIntegers bool
+
+	// DDLDialect is the SQL dialect family used when sluice renders
+	// DDL suggestions for this engine (schema-diff ALTER hints,
+	// identifier quoting). Rendering-only; schema writes go through
+	// the engine's [SchemaWriter].
+	DDLDialect DDLDialect
+
+	// PostgresBackend reports whether the engine connects to a genuine
+	// PostgreSQL server, regardless of capture mechanism — PG
+	// system-catalog probes (pg_roles, datfrozenxid,
+	// pg_partitioned_table), 32-bit XID wraparound, and PG declarative
+	// partitioning semantics all apply. True for both the slot-based
+	// `postgres` engine and the trigger-based `postgres-trigger`
+	// engine; false for the MySQL family. Orchestrator preflights that
+	// probe PG internals gate on this rather than on engine names, so
+	// a future PG-family flavor inherits them by declaration.
+	PostgresBackend bool
+
+	// PGExtensionCatalog reports whether the engine natively hosts the
+	// PostgreSQL extension ecosystem (ADR-0032): `--enable-pg-extension`
+	// can resolve extension-owned column types (pgvector, hstore,
+	// citext, ...) into IR [ExtensionType] on this engine's side of a
+	// run. False for MySQL-family engines (they can only RECEIVE the
+	// per-extension cross-engine translations) and, conservatively,
+	// for `postgres-trigger` — extension passthrough through its
+	// JSONB-mediated trigger capture path is unvalidated, so the
+	// pre-capability refusal is preserved.
+	PGExtensionCatalog bool
+
+	// VerbatimExtensionTypes reports whether the engine can carry
+	// UNCATALOGUED PG extension types verbatim (ADR-0047): its schema
+	// surface records the raw type spelling and re-emits it exactly,
+	// so verbatim columns round-trip only when BOTH sides of a run
+	// declare this. True only for the vanilla `postgres` engine;
+	// false (conservatively) for `postgres-trigger`, preserving the
+	// pre-capability refusal until the trigger capture path is
+	// validated against verbatim-typed columns.
+	VerbatimExtensionTypes bool
+
+	// TransactionKiller reports whether the engine's server side
+	// enforces a wall-clock transaction killer (Vitess vtgate kills
+	// transactions at ~20s by default). Drives conservative apply-path
+	// defaults: the AIMD controller's p95 target latency (ADR-0052
+	// DP-2: 5s = 20s with 4x headroom) and the startup warning when
+	// `--apply-batch-size` exceeds the empirically-safe range
+	// (GitHub #18: cross-region PlanetScale failed at batch=100,
+	// worked at 25-50).
+	TransactionKiller bool
 }

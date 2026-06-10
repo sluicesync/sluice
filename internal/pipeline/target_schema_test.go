@@ -69,24 +69,35 @@ func TestValidateTargetSchema(t *testing.T) {
 	})
 }
 
-// stubPGEngine is a stubEngine that names itself "postgres" so the
-// ADR-0032 PG-only validate gate accepts it on either side.
+// stubPGEngine is a stubEngine that declares the PG extension catalog
+// (and the rest of the vanilla-PG capability surface) so the ADR-0032
+// validate gate accepts it on either side.
 type stubPGEngine struct{ stubEngine }
 
 func (stubPGEngine) Name() string { return "postgres" }
 
 func (stubPGEngine) Capabilities() ir.Capabilities {
-	return ir.Capabilities{SchemaScope: ir.SchemaScopeNamespaced, CDC: ir.CDCLogicalReplication}
+	return ir.Capabilities{
+		SchemaScope:            ir.SchemaScopeNamespaced,
+		CDC:                    ir.CDCLogicalReplication,
+		PostgresBackend:        true,
+		PGExtensionCatalog:     true,
+		VerbatimExtensionTypes: true,
+	}
 }
 
-// stubMySQLEngine is a stubEngine that names itself "mysql" so the
-// ADR-0032 PG-only validate gate refuses it.
+// stubMySQLEngine is a stubEngine without the PG extension catalog so
+// the ADR-0032 validate gate refuses it.
 type stubMySQLEngine struct{ stubEngine }
 
 func (stubMySQLEngine) Name() string { return "mysql" }
 
 func (stubMySQLEngine) Capabilities() ir.Capabilities {
-	return ir.Capabilities{SchemaScope: ir.SchemaScopeFlat, CDC: ir.CDCBinlog}
+	return ir.Capabilities{
+		SchemaScope: ir.SchemaScopeFlat,
+		CDC:         ir.CDCBinlog,
+		DDLDialect:  ir.DDLDialectMySQL,
+	}
 }
 
 func TestValidateEnabledPGExtensions(t *testing.T) {

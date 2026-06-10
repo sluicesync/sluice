@@ -221,7 +221,7 @@ func (r *Restore) Run(ctx context.Context) error {
 	//      drop/mangle). The single-manifest path gates on the
 	//      manifest schema directly — the same schema the lineage
 	//      marker is derived from, so the two restore paths agree.
-	if err := refuseVerbatimManifestRestoreToNonPG(manifest.Schema, r.Target.Name()); err != nil {
+	if err := refuseVerbatimManifestRestoreToNonPG(manifest.Schema, r.Target); err != nil {
 		return wrapWithHint(PhaseConnect, err)
 	}
 

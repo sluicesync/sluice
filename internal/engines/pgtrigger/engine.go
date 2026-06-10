@@ -140,6 +140,11 @@ func (e Engine) OpenChangeApplier(ctx context.Context, dsn string) (ir.ChangeApp
 //     own expression would silently overwrite the captured value.
 //   - SupportedTypes: same set as vanilla PG — the JSONB-mediated
 //     decode path reuses the same value-decoder catalog.
+//   - PGExtensionCatalog / VerbatimExtensionTypes: false. Extension
+//     passthrough (ADR-0032) and verbatim uncatalogued types
+//     (ADR-0047) are unvalidated through the trigger capture path;
+//     the orchestrator's capability gates refuse them, exactly as the
+//     pre-capability engine-name gates did.
 func (Engine) Capabilities() ir.Capabilities { return capabilities }
 
 // OpenCDCReader returns a polling reader against `sluice_change_log`
@@ -173,6 +178,20 @@ var capabilities = ir.Capabilities{
 	EnumSupport:              ir.EnumTypeLevel,
 	JSONSupport:              ir.JSONBoth,
 	UnsignedIntegers:         false,
+	DDLDialect:               ir.DDLDialectANSI,
+
+	// The engine fronts a genuine PG server — PG catalog probes, the
+	// XID-wraparound preflight, and the declarative-partitioning
+	// refusal all apply (the schema surface delegates to the vanilla
+	// postgres engine).
+	PostgresBackend: true,
+
+	// Conservatively NOT declared (preserving the pre-capability
+	// engine-name refusals): `--enable-pg-extension` resolution and
+	// ADR-0047 verbatim passthrough are unvalidated through the
+	// JSONB-mediated trigger capture path. Flip on evidence.
+	PGExtensionCatalog:     false,
+	VerbatimExtensionTypes: false,
 }
 
 // init registers the engine with the engines registry. The blank

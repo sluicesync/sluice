@@ -270,6 +270,7 @@ func (d *Differ) Run(ctx context.Context) (*ir.SchemaDiff, error) {
 		if err := renderDiffText(d.Out, diffBundle{
 			srcEngine:     d.Source.Name(),
 			tgtEngine:     d.Target.Name(),
+			tgtDialect:    d.Target.Capabilities().DDLDialect,
 			diff:          diff,
 			missingDDL:    missingDDL,
 			missingColDDL: missingColDDL,
@@ -310,6 +311,7 @@ func (d *Differ) validate() error {
 type diffBundle struct {
 	srcEngine  string
 	tgtEngine  string
+	tgtDialect ir.DDLDialect // target's declared DDL-suggestion dialect
 	diff       ir.SchemaDiff
 	missingDDL map[string][]ir.DDLStatement // table name -> CREATE TABLE / CREATE INDEX statements
 
@@ -521,7 +523,7 @@ func renderDiffText(w io.Writer, b diffBundle) error {
 		return err
 	}
 
-	quote := identifierQuoter(b.tgtEngine)
+	quote := identifierQuoter(b.tgtDialect)
 
 	// Tables missing on target — render the engine's CREATE TABLE
 	// (and CREATE INDEX, FK) when available, otherwise a placeholder.
@@ -620,7 +622,7 @@ func renderDiffText(w io.Writer, b diffBundle) error {
 			fmt.Fprintln(&sb, "-- ^ column not in source schema; sluice would not create it")
 		}
 		for _, cd := range td.ColumnsMismatched {
-			renderColumnMismatch(&sb, td.Name, cd, quote, b.tgtEngine)
+			renderColumnMismatch(&sb, td.Name, cd, quote, b.tgtDialect)
 		}
 		for _, idx := range td.IndexesMissing {
 			fmt.Fprintf(&sb, "-- index %s missing on target; CREATE INDEX %s ON %s (...);\n",
@@ -706,13 +708,13 @@ func lookupCheckExpr(s *ir.Schema, tableName, checkName string) string {
 
 // renderColumnMismatch emits one ALTER suggestion per column-level
 // drift. The exact MODIFY syntax varies between MySQL (MODIFY COLUMN)
-// and PG (ALTER COLUMN ... TYPE / SET NOT NULL); we write the MySQL
-// form when targeting MySQL, the PG form otherwise. Operators copy-
-// paste these as a starting point — they're not guaranteed verified
-// migration scripts.
-func renderColumnMismatch(sb *strings.Builder, table string, cd ir.ColumnDiff, quote func(string) string, engine string) {
-	switch engine {
-	case "mysql", "planetscale":
+// and PG (ALTER COLUMN ... TYPE / SET NOT NULL); we write the form
+// the target engine's declared [ir.Capabilities.DDLDialect] asks for.
+// Operators copy-paste these as a starting point — they're not
+// guaranteed verified migration scripts.
+func renderColumnMismatch(sb *strings.Builder, table string, cd ir.ColumnDiff, quote func(string) string, dialect ir.DDLDialect) {
+	switch dialect {
+	case ir.DDLDialectMySQL:
 		if cd.ExpectedType != "" {
 			fmt.Fprintf(sb, "ALTER TABLE %s MODIFY COLUMN %s %s; -- on target: %s\n",
 				quote(table), quote(cd.Name), cd.ExpectedType, cd.ActualType)
@@ -731,7 +733,7 @@ func renderColumnMismatch(sb *strings.Builder, table string, cd ir.ColumnDiff, q
 		if cd.ExpectedGeneratedExpr != cd.ActualGeneratedExpr {
 			renderGeneratedExprMismatch(sb, table, cd, quote)
 		}
-		renderCharsetCollationMismatch(sb, table, cd, quote, "mysql")
+		renderCharsetCollationMismatch(sb, table, cd, quote, ir.DDLDialectMySQL)
 	default:
 		if cd.ExpectedType != "" {
 			fmt.Fprintf(sb, "ALTER TABLE %s ALTER COLUMN %s TYPE %s; -- on target: %s\n",
@@ -751,7 +753,7 @@ func renderColumnMismatch(sb *strings.Builder, table string, cd ir.ColumnDiff, q
 		if cd.ExpectedGeneratedExpr != cd.ActualGeneratedExpr {
 			renderGeneratedExprMismatch(sb, table, cd, quote)
 		}
-		renderCharsetCollationMismatch(sb, table, cd, quote, "postgres")
+		renderCharsetCollationMismatch(sb, table, cd, quote, ir.DDLDialectANSI)
 	}
 }
 
@@ -764,13 +766,13 @@ func renderColumnMismatch(sb *strings.Builder, table string, cd ir.ColumnDiff, q
 // PG uses `ALTER COLUMN ... TYPE ... COLLATE "..."`. Suggestions are
 // hint comments — the precise type still needs filling in by the
 // operator.
-func renderCharsetCollationMismatch(sb *strings.Builder, table string, cd ir.ColumnDiff, quote func(string) string, engine string) {
+func renderCharsetCollationMismatch(sb *strings.Builder, table string, cd ir.ColumnDiff, quote func(string) string, dialect ir.DDLDialect) {
 	if cd.ExpectedCharset == "" && cd.ActualCharset == "" &&
 		cd.ExpectedCollation == "" && cd.ActualCollation == "" {
 		return
 	}
-	switch engine {
-	case "mysql", "planetscale":
+	switch dialect {
+	case ir.DDLDialectMySQL:
 		switch {
 		case cd.ExpectedCharset != cd.ActualCharset && cd.ExpectedCollation != cd.ActualCollation:
 			fmt.Fprintf(sb, "ALTER TABLE %s MODIFY COLUMN %s ... CHARACTER SET %s COLLATE %s; -- on target: charset=%s collation=%s\n",
@@ -901,13 +903,14 @@ func renderGeneratedExprMismatch(sb *strings.Builder, table string, cd ir.Column
 }
 
 // identifierQuoter returns a function that quotes a SQL identifier in
-// the target engine's idiom — backticks for MySQL/PlanetScale, double
-// quotes for everything else (PostgreSQL today, ANSI SQL idiom for
-// future engines). The renderer is the only thing that cares about
-// engine-specific identifier syntax in the diff path.
-func identifierQuoter(engine string) func(string) string {
-	switch engine {
-	case "mysql", "planetscale":
+// the target engine's declared [ir.Capabilities.DDLDialect] —
+// backticks for the MySQL family, double quotes for everything else
+// (PostgreSQL today, ANSI SQL idiom for future engines). The renderer
+// is the only thing that cares about dialect-specific identifier
+// syntax in the diff path.
+func identifierQuoter(dialect ir.DDLDialect) func(string) string {
+	switch dialect {
+	case ir.DDLDialectMySQL:
 		return func(s string) string { return "`" + s + "`" }
 	default:
 		return func(s string) string { return `"` + s + `"` }
