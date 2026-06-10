@@ -387,8 +387,16 @@ func runConvCheck(rt *rapid.T, t *testing.T, env *convLiveEnv, c *convCase) {
 	// Independent oracle on the harness itself: the live source's PK
 	// set must equal the model's. A mismatch means the generator or
 	// the script applier is wrong — a harness bug, not a sluice bug.
-	if want := final.livePKs(); !slices.Equal(srcPKs, want) {
-		t.Fatalf("HARNESS BUG: source PKs %v != model PKs %v\nscript:\n%s", srcPKs, want, c.renderScript(table))
+	// convDump returns PKs in the dump's own ordering (lexicographic —
+	// the rows are ordered by the text-rendered id, so e.g. 17 < 3),
+	// while the model sorts numerically; normalize before comparing.
+	// The dump-vs-dump convergence comparison below is unaffected:
+	// both sides render and order identically, so its ordering only
+	// needs to be consistent, not numeric.
+	srcPKsSorted := slices.Clone(srcPKs)
+	slices.Sort(srcPKsSorted)
+	if want := final.livePKs(); !slices.Equal(srcPKsSorted, want) {
+		t.Fatalf("HARNESS BUG: source PKs %v != model PKs %v\nscript:\n%s", srcPKsSorted, want, c.renderScript(table))
 	}
 
 	// Convergence: poll until the target's ordered canonical dump
