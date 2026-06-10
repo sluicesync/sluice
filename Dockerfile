@@ -8,7 +8,11 @@
 # `sluice sync start --metrics-listen ADDR` exposes (/healthz, /readyz,
 # /metrics), so the image needs no in-container curl — Kubernetes httpGet
 # probes hit them directly. See docs/operator/running-as-a-service.md.
-FROM gcr.io/distroless/static-debian12:nonroot
+# Digest-pinned (the multi-arch index digest, not a per-platform
+# manifest) so two builds of the same sluice tag can't differ because
+# the mutable `:nonroot` tag moved underneath them. Dependabot's
+# docker ecosystem bumps the digest when upstream publishes.
+FROM gcr.io/distroless/static-debian12:nonroot@sha256:d093aa3e30dbadd3efe1310db061a14da60299baff8450a17fe0ccc514a16639
 
 COPY sluice /usr/local/bin/sluice
 
