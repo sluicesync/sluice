@@ -6,6 +6,8 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.99.31] - 2026-06-10
+
 ### Added
 - **Combined-`ALTER` MySQL secondary-index builds (ADR-0080 follow-up).** When
   `sluice migrate` builds a table's secondary indexes on a MySQL target, all
