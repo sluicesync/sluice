@@ -4,7 +4,12 @@
 # ghcr.io/sluicesync/sluice-{mysql,postgres,postgis,pgvector} images that
 # `ci.yml`'s integration jobs consume, plus MIRROR the vitess/lite server
 # tags (scripts/vitess-versions.txt) to ghcr.io/sluicesync/sluice-vitess for
-# the gated multi-version cluster matrix (vitess-version-matrix.yml). The
+# the gated multi-version cluster matrix (vitess-version-matrix.yml), plus
+# MIRROR the stock docker.io images CI pre-pulls (postgres:16 + the
+# scripts/pg-versions.txt majors, mysql:8.0, vitess/vttestserver:mysql80)
+# to ghcr.io/sluicesync/sluice-mirror-<name>:<tag> as pure retags (task
+# #36 — removes docker.io from CI's critical path; consumers pull via
+# scripts/ci-mirror-pull.sh with a docker.io fallback). The
 # script is idempotent
 # (skips when the upstream base digest hasn't moved) so the weekly
 # cron is a no-op on uneventful weeks and rebakes when MySQL 8.0 /
@@ -46,6 +51,12 @@ on:
     branches: [main]
     paths:
       - "scripts/build-prebaked-images.sh"
+      # ci-mirror-pull.sh owns the mirror naming rule the bake consumes
+      # via --print-ref; pg-versions.txt drives the postgres mirror list.
+      # A change to either must republish the mirrors promptly (e.g. a
+      # new PG major) rather than waiting for the Sunday cron.
+      - "scripts/ci-mirror-pull.sh"
+      - "scripts/pg-versions.txt"
       - ".github/workflows/build-prebaked-images.yml"
   # Also run on PRs that touch the bake script or this workflow so
   # the bake logic is exercised end-to-end before merge. Without this
@@ -59,6 +70,8 @@ on:
   pull_request:
     paths:
       - "scripts/build-prebaked-images.sh"
+      - "scripts/ci-mirror-pull.sh"
+      - "scripts/pg-versions.txt"
       - ".github/workflows/build-prebaked-images.yml"
 
 # Need to write to GHCR (the registry under the repo's GH org).
@@ -92,10 +105,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        engine: [mysql, postgres, postgis, pgvector, vitess]
+        engine: [mysql, postgres, postgis, pgvector, vitess, mirrors]
     # 30 (was 20): the `vitess` engine MIRRORS ~5 x 2.7GB vitess/lite tags
     # (scripts/vitess-versions.txt) — a pull+push per version, heavier than the
     # single-image DB bakes. The DB shards finish well inside 20m regardless.
+    # The `mirrors` engine (task #36) is ~6 stock images totalling ~3GB —
+    # comfortably inside the same budget.
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
