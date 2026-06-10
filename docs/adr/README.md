@@ -6,7 +6,7 @@ ADRs are numbered in the order they were proposed. A few notable conventions:
 
 - **Status** lines at the top of each ADR record whether the decision is Accepted, Superseded, or Discovery (research-only).
 - Some ADRs were promoted from a design doc in `docs/dev/notes/` after extended dialogue; the dialogue artifacts stay in `notes/` for traceability.
-- **ADR-0051 collision:** two ADRs share the number — `adr-0051-core-pg-type-verbatim-carry.md` (the canonical one referenced by the roadmap and `ir.VerbatimType`) and `adr-0051-pg-cdc-source-identity-pinning.md` (a sibling concern). Renumbering hasn't been done because both are widely cross-referenced; future ADRs continue from 0081.
+- **ADR-0051 collision:** two ADRs share the number — `adr-0051-core-pg-type-verbatim-carry.md` (the canonical one referenced by the roadmap and `ir.VerbatimType`) and `adr-0051-pg-cdc-source-identity-pinning.md` (a sibling concern). Renumbering hasn't been done because both are widely cross-referenced; future ADRs continue from 0082.
 - **ADR-0066 collision:** `adr-0066-postgres-trigger-engine-variant.md` is the actual ADR; `adr-0066-task-62-planning-brief.md` is a planning brief for the same chunk and not a true ADR.
 
 ## Foundations (0001–0009)
@@ -155,6 +155,12 @@ ADRs are numbered in the order they were proposed. A few notable conventions:
 | ADR | Decision |
 |---|---|
 | [0080](adr-0080-mysql-index-build-overlap.md) | Accepted (design) — extend ADR-0077 index-build overlap to MySQL targets: the MySQL `SchemaWriter` implements `ir.IncrementalIndexBuilder`/`TableIndexedNotifier` (mirrors the PG file), so every MySQL-target migrate (MySQL→MySQL, PG→MySQL) collapses the separate post-copy index phase into the copy. Orchestrator unchanged (gated on the surface). MySQL has no connection-slot prober, so the index pool self-sizes (fixed N=4, clamped [1,8], bounded by job count + `--max-target-connections`) rather than from `splitCopyAndIndexBudget` (always 0 for MySQL). PlanetScale/Vitess targets decline the overlap (internal drain-and-defer to the platform's online-DDL via the post-copy `CreateIndexes`). One index per job (parallel), idempotency via the existing `indexExists` probe (no portable `ADD INDEX IF NOT EXISTS`). No published throughput number until an at-scale MySQL measurement (PG's overlap was −60 s on disk-bound storage). Roadmap item 3c. |
+
+## Applier control-plane extraction (0081)
+
+| ADR | Decision |
+|---|---|
+| [0081](adr-0081-applier-control-plane-extraction.md) | Accepted — repo-audit M2.2: extract the engines' mirrored applier control plane into `internal/appliershared` behind a flat config-of-closures dialect seam (`BatchConfig`, exprident.Config precedent). The audit measured the two `change_applier_batch.go` files ≥85 % identical with 16/19 commits forced to touch both (the item-18 latency fix landed twice). Tier (b) — the batched-apply loop (accumulation, AIMD consult/observe, idle-grace timer, byte cap, ADR-0007/0010 position-write-then-commit ordering) — now lives ONCE in `RunBatchLoop`/`RunOneBatch`; engines fill the divergent leaves (engine name, `TransactionalDDL` flag for MySQL's implicit-commit DDL vs PG's in-tx schema events, F7 BeginTx, slot-ack AfterCommit, cache-after-commit hook). SQL builders, value codecs, classifiers stay engine-side. All item-18 timing pins + idempotency pins passed unchanged. Tiers: (a) helpers PR #170 + (b) batch loop DONE; (c) control-table CRUD + (d) lease/keyset/heartbeat OPEN. |
 
 ## Notes / dialogue prep / readiness briefs
 
