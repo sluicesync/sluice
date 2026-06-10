@@ -242,15 +242,20 @@ func TestStreamer_PostgresToPostgres(t *testing.T) {
 	runErr := make(chan error, 1)
 	go func() { runErr <- streamer.Run(streamCtx) }()
 
-	// Give the streamer time to capture the snapshot, complete bulk
-	// copy, and start CDC. 10s is generous for two seed rows.
-	time.Sleep(2 * time.Second)
+	// The old blind 2s start-up sleep served two purposes; both are now
+	// waited for explicitly. First, the replication slot must exist
+	// before the finite CDC insert below commits — a commit that lands
+	// BEFORE the slot is created is captured by neither the snapshot nor
+	// CDC (the AIMD "0/250" flake class; see [waitForSourceSlot]).
+	waitForSourceSlot(t, sourceDSN, 60*time.Second)
 
-	// Verify bulk copy reached the target. (Streamer doesn't expose
-	// a "bulk-copy done" signal; for the test we just check the
-	// table after a short delay.)
-	targetRows := countRows(t, targetDSN, "users")
-	if targetRows != 2 {
+	// Second, verify bulk copy reached the target. (Streamer doesn't
+	// expose a "bulk-copy done" signal; poll for the seed rows, then
+	// pin the exact count — bulk-copy must not duplicate.)
+	if !waitForRowCount(t, targetDSN, "users", 2, 60*time.Second) {
+		t.Fatalf("target users rows = %d after bulk copy; want 2", pollRowCount(targetDSN, "users"))
+	}
+	if targetRows := countRows(t, targetDSN, "users"); targetRows != 2 {
 		t.Errorf("target users rows = %d after bulk copy; want 2", targetRows)
 	}
 

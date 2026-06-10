@@ -117,7 +117,12 @@ func TestStreamer_PostgresToPostgres_SlotMissingFallsThroughToColdStart(t *testi
 	// ---- Phase 2: cancel the streamer + give the pump a moment to
 	// release the replication connection. Same shape as the bug 15
 	// test — without the wait, the next slot-drop attempt races with
-	// the pump's release. ----
+	// the pump's release. (NOT the pre-slot finite-burst flake class:
+	// every burst in this test follows a count-confirmed delivery, so
+	// the slot already exists when each burst commits. And unlike the
+	// resume-side 55006 retry that production absorbed in PR #179,
+	// dropSlotDirect is a raw test-side pg_drop_replication_slot with
+	// no retry, so this sleep still carries the release window.) ----
 	streamCancel()
 	select {
 	case err := <-runErr:

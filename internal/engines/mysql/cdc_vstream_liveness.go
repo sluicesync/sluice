@@ -184,6 +184,30 @@ type vstreamLiveness struct {
 	done chan struct{}
 }
 
+// livenessTimer abstracts the watchdog goroutine's single timer so unit
+// tests can substitute a hand-fired fake: the "must NOT fire while
+// re-armed" assertions are pinned against a deterministic re-arm count
+// instead of racing a real clock — real-clock windows lost that race on
+// slow CI runners (the v0.99.31 windows-latest flake in
+// TestVStreamLiveness_Phase2_ReArmsAcrossManyEvents). Production always
+// gets the real time.Timer wrapper via [startVStreamLiveness].
+type livenessTimer interface {
+	C() <-chan time.Time
+	Stop() bool
+	Reset(d time.Duration)
+}
+
+// realLivenessTimer adapts *time.Timer to [livenessTimer].
+type realLivenessTimer struct{ t *time.Timer }
+
+func (r realLivenessTimer) C() <-chan time.Time   { return r.t.C }
+func (r realLivenessTimer) Stop() bool            { return r.t.Stop() }
+func (r realLivenessTimer) Reset(d time.Duration) { r.t.Reset(d) }
+
+func newRealLivenessTimer(d time.Duration) livenessTimer {
+	return realLivenessTimer{time.NewTimer(d)}
+}
+
 // startVStreamLiveness arms the continuous two-phase watchdog. The two
 // callbacks run in the watchdog goroutine when their phase's window
 // elapses without the required event; each should record a loud error and
@@ -201,6 +225,14 @@ type vstreamLiveness struct {
 //   - phase2Window <= 0 keeps Phase 1 but disables Phase 2 (a proven
 //     stream is never timed out mid-stream).
 func startVStreamLiveness(ctx context.Context, phase1Window, phase2Window time.Duration, onPhase1Timeout, onPhase2Timeout func()) *vstreamLiveness {
+	return startVStreamLivenessWithTimer(ctx, phase1Window, phase2Window, onPhase1Timeout, onPhase2Timeout, newRealLivenessTimer)
+}
+
+// startVStreamLivenessWithTimer is the test seam behind
+// [startVStreamLiveness]: identical semantics, with the timer factory
+// injectable. Only the unit tests ever pass anything other than
+// [newRealLivenessTimer].
+func startVStreamLivenessWithTimer(ctx context.Context, phase1Window, phase2Window time.Duration, onPhase1Timeout, onPhase2Timeout func(), newTimer func(time.Duration) livenessTimer) *vstreamLiveness {
 	l := &vstreamLiveness{}
 	if phase1Window <= 0 {
 		// Disabled: nil channels make observe/stop no-ops; no goroutine.
@@ -210,7 +242,7 @@ func startVStreamLiveness(ctx context.Context, phase1Window, phase2Window time.D
 	// number of them, and the watchdog drains one per loop iteration.
 	l.events = make(chan bool, 1)
 	l.done = make(chan struct{})
-	go l.run(ctx, phase1Window, phase2Window, onPhase1Timeout, onPhase2Timeout)
+	go l.run(ctx, phase1Window, phase2Window, onPhase1Timeout, onPhase2Timeout, newTimer)
 	return l
 }
 
@@ -221,8 +253,8 @@ func startVStreamLiveness(ctx context.Context, phase1Window, phase2Window time.D
 // if Phase 2 is disabled); thereafter every observation re-arms the
 // Phase-2 timer. A timer fire calls the active phase's callback once and
 // returns.
-func (l *vstreamLiveness) run(ctx context.Context, phase1Window, phase2Window time.Duration, onPhase1Timeout, onPhase2Timeout func()) {
-	timer := time.NewTimer(phase1Window)
+func (l *vstreamLiveness) run(ctx context.Context, phase1Window, phase2Window time.Duration, onPhase1Timeout, onPhase2Timeout func(), newTimer func(time.Duration) livenessTimer) {
+	timer := newTimer(phase1Window)
 	defer timer.Stop()
 
 	// phase2 tracks whether a serving tablet has been proven (Phase 1
@@ -241,7 +273,7 @@ func (l *vstreamLiveness) run(ctx context.Context, phase1Window, phase2Window ti
 			// clean. Non-blocking: the value may have already been
 			// consumed by the select below.
 			select {
-			case <-timer.C:
+			case <-timer.C():
 			default:
 			}
 		}
@@ -274,7 +306,7 @@ func (l *vstreamLiveness) run(ctx context.Context, phase1Window, phase2Window ti
 				// The Phase-1 window is an absolute deadline from
 				// stream-open for the first serving proof.
 			}
-		case <-timer.C:
+		case <-timer.C():
 			if !armed {
 				// Quiescent (Phase 2 disabled, Phase 1 cleared): a stale
 				// fire we chose not to act on. Keep looping so observe/stop

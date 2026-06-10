@@ -134,9 +134,19 @@ func TestStreamer_MultiDatabase_MySQLToMySQL(t *testing.T) {
 		t.Fatalf("CDC never settled shop_db")
 	}
 
-	// Give the UPDATE/DELETE a moment to land, then assert no cross-DB
-	// bleed and the routed values.
-	time.Sleep(2 * time.Second)
+	// The UPDATE and the INSERT+DELETE pair are invisible to the
+	// row-count waits above (counts are unchanged), so poll for their
+	// effects directly instead of a blind settle sleep (see
+	// [waitForStringMySQL]); then assert no cross-DB bleed and the
+	// routed values.
+	if !waitForStringMySQL(t, serverDSN(t, tgtServer), "source_db",
+		"SELECT COUNT(*) FROM widgets WHERE name='a-one-upd'", "1", 30*time.Second) {
+		t.Fatalf("CDC never delivered the source_db UPDATE (a-one-upd)")
+	}
+	if !waitForStringMySQL(t, serverDSN(t, tgtServer), "shop_db",
+		"SELECT COUNT(*) FROM widgets WHERE name='b-two'", "0", 30*time.Second) {
+		t.Fatalf("CDC never delivered the shop_db DELETE (b-two)")
+	}
 
 	if got := mysqlDBRowCount(t, serverDSN(t, tgtServer), "source_db", "widgets"); got != 3 {
 		t.Errorf("target source_db.widgets = %d; want 3", got)
@@ -496,6 +506,26 @@ func queryStringMySQL(t *testing.T, serverDSNStr, database, query string) string
 		t.Fatalf("query %q: %v", query, err)
 	}
 	return s
+}
+
+// waitForStringMySQL polls a single-value query against database on the
+// server until it returns want, or the timeout passes. Replaces the blind
+// "let the UPDATE/DELETE settle" sleeps: row-count waits can't observe
+// count-neutral changes (an UPDATE, or an INSERT+DELETE pair), so their
+// effects are polled for directly. There is no capture hazard on the
+// MySQL source — the binlog position is pinned at cold-start, so a
+// post-cold-start write is always delivered eventually; only the arrival
+// timing was flaky under a fixed sleep.
+func waitForStringMySQL(t *testing.T, serverDSNStr, database, query, want string, timeout time.Duration) bool {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if queryStringMySQL(t, serverDSNStr, database, query) == want {
+			return true
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	return false
 }
 
 // waitForPGSchemaCount polls schema.table on the PG target for >= n rows.

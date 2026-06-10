@@ -1189,6 +1189,67 @@ func failingTimeout(t *testing.T, phase string) func() {
 	return func() { t.Errorf("unexpected %s timeout fired", phase) }
 }
 
+// fakeLivenessTimer is a hand-fired [livenessTimer]: the test owns the
+// fire channel and observes every Stop/Reset the watchdog performs, so
+// the "must NOT fire while re-armed" property is pinned as a
+// DETERMINISTIC re-arm count instead of a real-clock race. The old
+// real-clock versions of these tests (sleep < window, observe, repeat)
+// flaked on slow runners — a 15ms sleep stretching past the 50ms window
+// fired the watchdog spuriously (the v0.99.31 windows-latest flake in
+// TestVStreamLiveness_Phase2_ReArmsAcrossManyEvents).
+type fakeLivenessTimer struct {
+	fire   chan time.Time
+	resets chan time.Duration
+	stops  chan struct{}
+}
+
+func newFakeLivenessTimer() *fakeLivenessTimer {
+	return &fakeLivenessTimer{
+		fire:   make(chan time.Time, 1),
+		resets: make(chan time.Duration, 64),
+		stops:  make(chan struct{}, 64),
+	}
+}
+
+func (f *fakeLivenessTimer) C() <-chan time.Time { return f.fire }
+
+// Stop records the call and reports true (timer "was armed") so the
+// watchdog's reset path skips its drain — the fake's channel only ever
+// holds test-injected fires.
+func (f *fakeLivenessTimer) Stop() bool { f.stops <- struct{}{}; return true }
+
+func (f *fakeLivenessTimer) Reset(d time.Duration) { f.resets <- d }
+
+// factory adapts the fake to the startVStreamLivenessWithTimer seam.
+func (f *fakeLivenessTimer) factory() func(time.Duration) livenessTimer {
+	return func(time.Duration) livenessTimer { return f }
+}
+
+// awaitReset blocks until the watchdog re-arms the fake timer, failing
+// the test if no re-arm lands (generous bound — it only gates failure)
+// or if the re-arm window differs from want.
+func (f *fakeLivenessTimer) awaitReset(t *testing.T, want time.Duration) {
+	t.Helper()
+	select {
+	case got := <-f.resets:
+		if got != want {
+			t.Fatalf("watchdog re-armed with %v; want %v", got, want)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("watchdog never re-armed the timer")
+	}
+}
+
+// awaitStop blocks until the watchdog calls Stop on the fake timer.
+func (f *fakeLivenessTimer) awaitStop(t *testing.T) {
+	t.Helper()
+	select {
+	case <-f.stops:
+	case <-time.After(10 * time.Second):
+		t.Fatal("watchdog never stopped the timer")
+	}
+}
+
 // TestVStreamLiveness_Phase1_FiresOnHeartbeatsOnly pins the v0.99.7
 // primary-only guard (Phase 1): with only heartbeat-only observations —
 // the no-serving-tablet wedge — the Phase-1 callback fires. Heartbeats do
@@ -1245,15 +1306,29 @@ func TestVStreamLiveness_Phase1_FiresOnNoEvent(t *testing.T) {
 }
 
 // TestVStreamLiveness_ServingProofTransitionsToPhase2 pins that a single
-// serving-proof observation clears Phase 1: Phase 1 never fires afterward.
+// serving-proof observation clears Phase 1: the watchdog re-arms with the
+// Phase-2 window, and a subsequent timer fire routes to the PHASE-2
+// callback, never Phase 1. Fake-timer test: the fire is hand-injected
+// after the re-arm is observed, so there is no real-clock race between
+// observe and the Phase-1 deadline.
 func TestVStreamLiveness_ServingProofTransitionsToPhase2(t *testing.T) {
-	live := startVStreamLiveness(context.Background(), 40*time.Millisecond, time.Second,
+	ft := newFakeLivenessTimer()
+	p2 := make(chan struct{}, 1)
+	live := startVStreamLivenessWithTimer(context.Background(), time.Minute, time.Second,
 		failingTimeout(t, "phase-1"),
-		func() {}) // phase-2 may fire later; we only assert phase-1 stays quiet
+		func() { p2 <- struct{}{} },
+		ft.factory())
 	defer live.stop()
-	live.observe(true) // serving proof
-	// Wait well past the Phase-1 window; Phase 1 must not fire.
-	time.Sleep(150 * time.Millisecond)
+
+	live.observe(true)            // serving proof
+	ft.awaitReset(t, time.Second) // Phase 1 cleared: re-armed with phase2Window
+
+	ft.fire <- time.Now() // a fire AFTER the transition must be Phase 2
+	select {
+	case <-p2:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timer fire after serving proof did not reach the Phase-2 callback")
+	}
 }
 
 // TestVStreamLiveness_Phase2_FiresOnTotalSilence pins the NEW mid-stream
@@ -1262,7 +1337,10 @@ func TestVStreamLiveness_ServingProofTransitionsToPhase2(t *testing.T) {
 // post-failover dead-Recv wedge becomes a LOUD failure.
 func TestVStreamLiveness_Phase2_FiresOnTotalSilence(t *testing.T) {
 	p2 := make(chan struct{}, 1)
-	live := startVStreamLiveness(context.Background(), time.Second, 40*time.Millisecond,
+	// Real-clock fire test (kept deliberately: it exercises the real
+	// time.Timer integration). The Phase-1 window is an hour so a starved
+	// runner can't fire Phase 1 before the observe(true) below lands.
+	live := startVStreamLiveness(context.Background(), time.Hour, 40*time.Millisecond,
 		failingTimeout(t, "phase-1"),
 		func() { p2 <- struct{}{} })
 	defer live.stop()
@@ -1277,49 +1355,78 @@ func TestVStreamLiveness_Phase2_FiresOnTotalSilence(t *testing.T) {
 // TestVStreamLiveness_Phase2_HeartbeatsKeepAlive pins that once in Phase 2
 // a healthy idle stream — whose ~5s heartbeats keep arriving — never
 // false-times-out: each heartbeat-only observation re-arms the Phase-2
-// progress deadline.
+// progress deadline. Fake-timer test: "never times out" is pinned as a
+// deterministic re-arm count (every heartbeat-only observation produces a
+// Reset(phase2Window)); the timer never fires because the test never
+// fires it, so the failing callbacks guard against any spurious path.
 func TestVStreamLiveness_Phase2_HeartbeatsKeepAlive(t *testing.T) {
-	live := startVStreamLiveness(context.Background(), time.Second, 60*time.Millisecond,
+	ft := newFakeLivenessTimer()
+	live := startVStreamLivenessWithTimer(context.Background(), time.Minute, time.Second,
 		failingTimeout(t, "phase-1"),
 		func() {
 			t.Error("Phase-2 fired despite heartbeats re-arming it — would false-time-out a healthy idle stream")
-		})
+		},
+		ft.factory())
 	defer live.stop()
 
-	live.observe(true) // enter Phase 2
-	// Drip heartbeat-only observations faster than the Phase-2 window for
-	// several windows' worth; none should trip the timeout.
+	live.observe(true)            // enter Phase 2
+	ft.awaitReset(t, time.Second) // armed with phase2Window
 	for i := 0; i < 15; i++ {
-		time.Sleep(20 * time.Millisecond)
-		live.observe(false) // heartbeat-only — must re-arm Phase 2
+		live.observe(false)           // heartbeat-only — must re-arm Phase 2
+		ft.awaitReset(t, time.Second) // …and here is the re-arm, counted
 	}
 }
 
 // TestVStreamLiveness_Phase2_ReArmsAcrossManyEvents pins the re-arm path
 // across a mix of data and heartbeat observations: as long as SOMETHING
-// keeps arriving, Phase 2 never fires.
+// keeps arriving, Phase 2 re-arms every time and never fires. Fake-timer
+// test (this was the v0.99.31 windows-latest flake: the real-clock
+// version's 15ms sleeps stretched past the 50ms window under a slow
+// runner and fired the watchdog spuriously); each observation's re-arm is
+// now awaited explicitly — a deterministic count of 20.
 func TestVStreamLiveness_Phase2_ReArmsAcrossManyEvents(t *testing.T) {
-	live := startVStreamLiveness(context.Background(), time.Second, 50*time.Millisecond,
+	ft := newFakeLivenessTimer()
+	live := startVStreamLivenessWithTimer(context.Background(), time.Minute, time.Second,
 		failingTimeout(t, "phase-1"),
-		func() { t.Error("Phase-2 fired despite continuous events re-arming it") })
+		func() { t.Error("Phase-2 fired despite continuous events re-arming it") },
+		ft.factory())
 	defer live.stop()
 
 	live.observe(true)
+	ft.awaitReset(t, time.Second)
 	for i := 0; i < 20; i++ {
-		time.Sleep(15 * time.Millisecond)
 		live.observe(i%2 == 0) // alternate data / heartbeat
+		ft.awaitReset(t, time.Second)
 	}
 }
 
 // TestVStreamLiveness_Phase2Disabled pins that progressWindow<=0 keeps
-// Phase 1 but disables Phase 2: a proven-then-silent stream never fires.
+// Phase 1 but disables Phase 2: clearing Phase 1 DISARMS the timer (a
+// bare Stop, no re-arm), and a stale fire while disarmed is ignored —
+// the watchdog stays quiescent but keeps servicing observations.
 func TestVStreamLiveness_Phase2Disabled(t *testing.T) {
-	live := startVStreamLiveness(context.Background(), 40*time.Millisecond, 0,
+	ft := newFakeLivenessTimer()
+	live := startVStreamLivenessWithTimer(context.Background(), time.Minute, 0,
 		failingTimeout(t, "phase-1"),
-		func() { t.Error("Phase-2 fired despite being disabled (progressWindow=0)") })
+		func() { t.Error("Phase-2 fired despite being disabled (progressWindow=0)") },
+		ft.factory())
 	defer live.stop()
-	live.observe(true) // clears Phase 1; Phase 2 disabled ⇒ quiescent
-	time.Sleep(200 * time.Millisecond)
+
+	live.observe(true) // clears Phase 1; Phase 2 disabled ⇒ disarm
+	ft.awaitStop(t)    // reset(0) stops the timer WITHOUT re-arming
+
+	ft.fire <- time.Now() // a stale fire while disarmed must be ignored
+	live.observe(false)   // quiescent watchdog still services observations…
+	ft.awaitStop(t)       // …(its reset(0) lands as another bare Stop)
+
+	// No re-arm may ever have happened with Phase 2 disabled. (The stale
+	// fire can never reach a callback: armed stays false for good, so the
+	// failing phase-2 callback above guards the whole window.)
+	select {
+	case d := <-ft.resets:
+		t.Fatalf("watchdog re-armed to %v with Phase 2 disabled; want no re-arm", d)
+	default:
+	}
 }
 
 // TestVStreamLiveness_DisabledWindow pins that a 0/negative Phase-1 window
@@ -1336,13 +1443,23 @@ func TestVStreamLiveness_DisabledWindow(t *testing.T) {
 }
 
 // TestVStreamLiveness_StopBeforeFire pins that stop() tears the watchdog
-// down so neither callback fires after teardown.
+// down so neither callback fires after teardown. Fake-timer test: the
+// watchdog goroutine's exit is observed via its deferred timer.Stop (the
+// only Stop in this sequence — no reset ever ran), after which a fire has
+// no listener and observe is a safe no-op. The old real-clock version
+// raced stop() against a 40ms deadline — on a starved runner both could
+// be ready in the same select and the random pick fired the callback.
 func TestVStreamLiveness_StopBeforeFire(t *testing.T) {
-	live := startVStreamLiveness(context.Background(), 40*time.Millisecond, 40*time.Millisecond,
+	ft := newFakeLivenessTimer()
+	live := startVStreamLivenessWithTimer(context.Background(), time.Minute, time.Minute,
 		failingTimeout(t, "phase-1"),
-		failingTimeout(t, "phase-2"))
+		failingTimeout(t, "phase-2"),
+		ft.factory())
 	live.stop()
-	time.Sleep(150 * time.Millisecond)
+	ft.awaitStop(t) // the deferred timer.Stop ⇒ the goroutine has exited
+
+	ft.fire <- time.Now() // no listener left; must not reach a callback
+	live.observe(true)    // observe after stop is a safe no-op
 }
 
 // TestVStreamLivenessTimeoutError_Actionable pins that the Phase-1 loud

@@ -79,6 +79,22 @@ func (s *stubHeartbeatWriter) setWriteErr(err error) {
 	s.writeErr = err
 }
 
+// waitForCalls polls an atomic call counter until it reaches want, or the
+// deadline passes. Replaces the fixed "sleep N x cadence then count"
+// windows: the tickers are real-clock, so a starved CI runner (the
+// Windows unit-leg class) could deliver fewer ticks in a fixed window
+// than the cadence promises. The deadline only bounds the FAILURE path.
+func waitForCalls(c *atomic.Int32, want int32, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if c.Load() >= want {
+			return true
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return false
+}
+
 // TestSourceHeartbeatLoop_TicksAndCancels pins the basic lifecycle: a
 // short-interval loop calls WriteHeartbeat on every tick and exits
 // cleanly when ctx cancels.
@@ -92,8 +108,11 @@ func TestSourceHeartbeatLoop_TicksAndCancels(t *testing.T) {
 		close(done)
 	}()
 
-	// Wait long enough for ~5 ticks.
-	time.Sleep(150 * time.Millisecond)
+	// Poll until >=3 ticks land (pins "keeps ticking", not just "ticked
+	// once"), then cancel.
+	if !waitForCalls(&w.writeCalls, 3, 10*time.Second) {
+		t.Fatalf("expected >=3 write calls within 10s at 20ms tick; got %d", w.writeCalls.Load())
+	}
 	cancel()
 
 	select {
@@ -102,9 +121,6 @@ func TestSourceHeartbeatLoop_TicksAndCancels(t *testing.T) {
 		t.Fatal("loop did not exit within 2s of ctx cancel")
 	}
 
-	if got := w.writeCalls.Load(); got < 3 {
-		t.Errorf("expected >=3 write calls in 150ms with 20ms tick; got %d", got)
-	}
 	if w.lastStreamID != "stream-a" {
 		t.Errorf("lastStreamID: got %q; want %q", w.lastStreamID, "stream-a")
 	}
@@ -126,13 +142,13 @@ func TestSourceHeartbeatLoop_TransientWriteErrorDoesNotKillLoop(t *testing.T) {
 		sourceHeartbeatLoop(ctx, w, "sluice_heartbeat", "stream-b", 20*time.Millisecond, 0)
 		close(done)
 	}()
-	time.Sleep(150 * time.Millisecond)
+	// >=3 calls proves the loop survived the erroring ticks, not just the
+	// first one.
+	if !waitForCalls(&w.writeCalls, 3, 10*time.Second) {
+		t.Fatalf("loop should continue past transient errors; got %d calls within 10s", w.writeCalls.Load())
+	}
 	cancel()
 	<-done
-
-	if got := w.writeCalls.Load(); got < 3 {
-		t.Errorf("loop should continue past transient errors; got %d calls", got)
-	}
 }
 
 // TestSourceHeartbeatLoop_PermissionErrorTerminatesLoop pins the
@@ -151,12 +167,14 @@ func TestSourceHeartbeatLoop_PermissionErrorTerminatesLoop(t *testing.T) {
 	}()
 
 	// The loop should exit on the first permission-revoked tick — not
-	// wait for ctx cancel. Allow generously for goroutine scheduling.
+	// wait for ctx cancel. The bound is generous (it only gates the
+	// FAILURE path; the healthy loop exits on its first ~20ms tick): the
+	// old 500ms bound false-failed on starved runners.
 	select {
 	case <-done:
 		// good — loop exited on its own
-	case <-time.After(500 * time.Millisecond):
-		t.Fatal("loop did not exit within 500ms of permission-revoked write error")
+	case <-time.After(10 * time.Second):
+		t.Fatal("loop did not exit within 10s of permission-revoked write error")
 	}
 
 	if got := w.writeCalls.Load(); got != 1 {
@@ -186,13 +204,12 @@ func TestSourceHeartbeatLoop_PrunePathFires(t *testing.T) {
 		)
 		close(done)
 	}()
-	time.Sleep(150 * time.Millisecond)
+	// >=2 prune calls pins the prune ticker keeps firing, not just once.
+	if !waitForCalls(&w.pruneCalls, 2, 10*time.Second) {
+		t.Fatalf("expected >=2 prune calls within 10s at 30ms cadence; got %d", w.pruneCalls.Load())
+	}
 	cancel()
 	<-done
-
-	if got := w.pruneCalls.Load(); got < 2 {
-		t.Errorf("expected >=2 prune calls with 30ms cadence in 150ms; got %d", got)
-	}
 }
 
 // TestSourceHeartbeatLoop_PruneDisabled pins the disabled-prune branch:
@@ -215,15 +232,17 @@ func TestSourceHeartbeatLoop_PruneDisabled(t *testing.T) {
 		)
 		close(done)
 	}()
-	time.Sleep(150 * time.Millisecond)
+	// Wait for the write path to tick a few times; the prune count must
+	// stay at zero throughout (the disabled branch skips Prune entirely,
+	// however many prune ticks elapse — duration-independent).
+	if !waitForCalls(&w.writeCalls, 3, 10*time.Second) {
+		t.Fatalf("write path should still tick when prune is disabled; got %d within 10s", w.writeCalls.Load())
+	}
 	cancel()
 	<-done
 
 	if got := w.pruneCalls.Load(); got != 0 {
 		t.Errorf("expected 0 prune calls with pruneWindow=0; got %d", got)
-	}
-	if got := w.writeCalls.Load(); got < 3 {
-		t.Errorf("write path should still tick when prune is disabled; got %d", got)
 	}
 }
 
@@ -251,17 +270,26 @@ func TestSourceHeartbeatLoop_PrunePermissionStopsPruneTicker(t *testing.T) {
 		)
 		close(done)
 	}()
-	time.Sleep(150 * time.Millisecond)
+	// Wait for the first prune (which trips the permission error and
+	// stops the prune ticker), then for the write path to keep ticking
+	// well past several would-be prune cadences — proving the loop
+	// survived the revocation AND stopped retrying prune.
+	if !waitForCalls(&w.pruneCalls, 1, 10*time.Second) {
+		t.Fatalf("prune never fired; got %d within 10s", w.pruneCalls.Load())
+	}
+	if !waitForCalls(&w.writeCalls, 10, 10*time.Second) {
+		t.Fatalf("write path should continue after prune-permission revocation; got %d within 10s", w.writeCalls.Load())
+	}
 	cancel()
 	<-done
 
-	// One prune call (which trips the permission error and stops the
-	// prune ticker), and many write calls (loop continues for INSERT).
-	if got := w.pruneCalls.Load(); got != 1 {
-		t.Errorf("expected exactly 1 prune call before prune ticker stops; got %d", got)
-	}
-	if got := w.writeCalls.Load(); got < 3 {
-		t.Errorf("write path should continue after prune-permission revocation; got %d writes", got)
+	// The stopped ticker must not keep retrying: 10 write ticks span
+	// ~6 prune cadences, so a non-stopped ticker would be well past 2.
+	// At most one extra call is in-spec — a tick already buffered when
+	// Stop() ran is still consumed (the same documented raced-tick
+	// allowance as the heartbeat cancel test).
+	if got := w.pruneCalls.Load(); got < 1 || got > 2 {
+		t.Errorf("expected 1 (at most 2, raced-tick allowance) prune calls before the prune ticker stops; got %d", got)
 	}
 }
 
