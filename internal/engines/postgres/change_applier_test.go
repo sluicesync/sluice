@@ -6,7 +6,6 @@ package postgres
 import (
 	"bytes"
 	"context"
-	"errors"
 	"log/slog"
 	"reflect"
 	"strings"
@@ -570,18 +569,6 @@ func TestLogZeroRowsAffected(t *testing.T) {
 	})
 }
 
-func TestApplierSchema(t *testing.T) {
-	if got := applierSchema("public", "myschema"); got != "public" {
-		t.Errorf("default wins: got %q; want public", got)
-	}
-	if got := applierSchema("public", ""); got != "public" {
-		t.Errorf("empty change schema: got %q; want public", got)
-	}
-	if got := applierSchema("", "myschema"); got != "myschema" {
-		t.Errorf("empty default falls back to change schema: got %q; want myschema", got)
-	}
-}
-
 // TestBuildSQL_FiltersGeneratedColumns covers the GitHub issue #12 fix
 // on the PG side: the CDC apply path must exclude GENERATED ALWAYS AS
 // (...) STORED columns from INSERT column lists, UPDATE SET clauses,
@@ -681,42 +668,6 @@ func TestExecTimeoutCtx(t *testing.T) {
 		}
 		if dl.Before(start) || dl.After(start.Add(60*time.Millisecond)) {
 			t.Errorf("deadline %v outside expected window [%v, %v]", dl, start, start.Add(60*time.Millisecond))
-		}
-	})
-}
-
-// TestRunWithDeadline mirrors the MySQL test. The PG engine has its
-// own copy of runWithDeadline so the watchdog stays local to the
-// package; the tests stay symmetric for the same reason.
-func TestRunWithDeadline(t *testing.T) {
-	t.Run("zero timeout: passthrough preserves return verbatim", func(t *testing.T) {
-		sentinel := errors.New("synthetic commit failure")
-		got := runWithDeadline(0, func() error { return sentinel })
-		if !errors.Is(got, sentinel) {
-			t.Errorf("zero-timeout passthrough lost the original error; got %v; want %v", got, sentinel)
-		}
-	})
-
-	t.Run("positive timeout: fast f returns its own value", func(t *testing.T) {
-		sentinel := errors.New("fast f")
-		got := runWithDeadline(500*time.Millisecond, func() error { return sentinel })
-		if !errors.Is(got, sentinel) {
-			t.Errorf("fast-f race lost the original error; got %v; want %v", got, sentinel)
-		}
-	})
-
-	t.Run("positive timeout: slow f trips watchdog with DeadlineExceeded", func(t *testing.T) {
-		start := time.Now()
-		got := runWithDeadline(20*time.Millisecond, func() error {
-			time.Sleep(500 * time.Millisecond)
-			return nil
-		})
-		if !errors.Is(got, context.DeadlineExceeded) {
-			t.Errorf("slow-f watchdog did not return DeadlineExceeded; got %v", got)
-		}
-		elapsed := time.Since(start)
-		if elapsed > 100*time.Millisecond {
-			t.Errorf("watchdog took %v; expected ~20ms (cap 100ms)", elapsed)
 		}
 	})
 }

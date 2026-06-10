@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"sluicesync.dev/sluice/internal/appliershared"
 	"sluicesync.dev/sluice/internal/ir"
 	"sluicesync.dev/sluice/internal/redact"
 )
@@ -583,49 +584,11 @@ func (a *ChangeApplier) execTimeoutCtx(ctx context.Context) (context.Context, co
 }
 
 // commitWithTimeout runs tx.Commit() under the per-exec watchdog
-// (see [runWithDeadline] for the semantics and Bug 56 / v0.52.1
-// rationale). Thin wrapper that exists so callers don't have to
-// thread the closure manually.
+// (see [appliershared.RunWithDeadline] for the semantics and Bug 56 /
+// v0.52.1 rationale). Thin wrapper that exists so callers don't have
+// to thread the closure manually.
 func (a *ChangeApplier) commitWithTimeout(tx *sql.Tx) error {
-	return runWithDeadline(a.execTimeout, tx.Commit)
-}
-
-// runWithDeadline runs f under a wall-clock deadline of `timeout`.
-// Zero or negative timeout is a passthrough (f runs to completion
-// inline). For positive timeouts, f runs in a goroutine and we race
-// its return against a time.After: whichever wins, wins.
-//
-// On timeout we return [context.DeadlineExceeded] (classified
-// retriable by [classifyApplierError]) so the runWithRetry loop
-// reopens the applier on a fresh connection. The orphaned f goroutine
-// cannot be cancelled — it will eventually return when the underlying
-// state (typically a TCP socket the caller closes via Close()) errors
-// out. One orphaned goroutine per timeout event is the bounded cost
-// of closing the silent-stall failure mode.
-//
-// Used by [commitWithTimeout] because [database/sql.Tx.Commit] takes
-// no context. Pulled out as a package-level function so it's testable
-// without constructing a real *sql.Tx; the watchdog race semantics
-// are non-trivial enough to deserve direct coverage.
-//
-// Bug 56 (v0.52.1): the apply path's third TLS-read surface (after
-// dispatch's tx.ExecContext + writePositionTx) is the implicit commit
-// flush. Pre-v0.52.1 it had no deadline; goroutine pprof on a v0.52.0
-// stall showed goroutine 1 blocked at tx.Commit() for >10 min.
-func runWithDeadline(timeout time.Duration, f func() error) error {
-	if timeout <= 0 {
-		return f()
-	}
-	done := make(chan error, 1)
-	go func() { done <- f() }()
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
-	select {
-	case err := <-done:
-		return err
-	case <-timer.C:
-		return context.DeadlineExceeded
-	}
+	return appliershared.RunWithDeadline(a.execTimeout, tx.Commit)
 }
 
 // Close releases the underlying connection pool.
@@ -1146,31 +1109,14 @@ func (a *ChangeApplier) colTypesFor(ctx context.Context, _ *sql.Tx, schema, tabl
 	return out, nil
 }
 
-// applierSchema picks the schema name to use in SQL. The applier's
-// configured schema (a.schema, derived from the target DSN) is
-// authoritative — it is the destination database the operator
-// pointed sluice at. The change's source-side schema is metadata
-// only; using it would route writes to a same-named schema on the
-// target, which is wrong whenever source and target schema names
-// differ (e.g. source_db → target_db on the same MySQL instance,
-// or any cross-engine pair). v.Schema is honoured only as a
-// fallback when the applier wasn't configured with one — which
-// shouldn't happen in practice but keeps the function total.
-func applierSchema(defaultSchema, changeSchema string) string {
-	if defaultSchema != "" {
-		return defaultSchema
-	}
-	return changeSchema
-}
-
 // routedSchema is the ADR-0074 Phase 1b namespace selector the dispatch
 // path uses to qualify each change's table reference. It generalises
-// [applierSchema] to the multi-database fan-out case while preserving
-// byte-identical single-database behaviour:
+// [appliershared.Schema] to the multi-database fan-out case while
+// preserving byte-identical single-database behaviour:
 //
 //   - Routing DISABLED (multiDBRouting == false; the default for every
 //     single-database run, ALL engine pairs): returns
-//     applierSchema(a.schema, changeSchema) UNCHANGED — the bound
+//     appliershared.Schema(a.schema, changeSchema) UNCHANGED — the bound
 //     database when set, the change's schema only as a fallback. This is
 //     the load-bearing back-compat guard. Note the cross-engine
 //     single-database case (a PG source already populates Change.Schema,
@@ -1191,7 +1137,7 @@ func (a *ChangeApplier) routedSchema(changeSchema string) string {
 	if a.multiDBRouting && changeSchema != "" && changeSchema != a.schema {
 		return changeSchema
 	}
-	return applierSchema(a.schema, changeSchema)
+	return appliershared.Schema(a.schema, changeSchema)
 }
 
 // loadPrimaryKey reads the PK columns for the named table from
@@ -1252,7 +1198,7 @@ func loadPrimaryKey(ctx context.Context, tx *sql.Tx, schema, table string) ([]st
 // this path without another signature change. Same on the
 // buildUpdateSQL / buildDeleteSQL / clause-builder siblings.
 func buildInsertSQL(schema, table string, row ir.Row, pk []string, colTypes map[string]*ir.Column) (sqlStmt string, args []any, err error) {
-	cols := nonGeneratedRowKeys(row, colTypes)
+	cols := appliershared.NonGeneratedRowKeys(row, colTypes)
 	args = make([]any, 0, len(cols))
 	colSQL := make([]string, len(cols))
 	for i, c := range cols {
@@ -1388,7 +1334,7 @@ func buildTruncateSQL(schema, table string) string {
 // NULL values bind through database/sql normally; no special form
 // is needed in SET (unlike WHERE).
 func buildSetClause(row ir.Row, colTypes map[string]*ir.Column) (clause string, args []any, err error) {
-	cols := nonGeneratedRowKeys(row, colTypes)
+	cols := appliershared.NonGeneratedRowKeys(row, colTypes)
 	parts := make([]string, len(cols))
 	args = make([]any, 0, len(cols))
 	for i, c := range cols {
@@ -1417,7 +1363,7 @@ func buildSetClause(row ir.Row, colTypes map[string]*ir.Column) (clause string, 
 // SQL-side half of the Bug 6 silent-failure fix; the value-shaping
 // half (prepareValue routing) is the other.
 func buildWhereClause(row ir.Row, colTypes map[string]*ir.Column) (clause string, args []any, err error) {
-	cols := nonGeneratedRowKeys(row, colTypes)
+	cols := appliershared.NonGeneratedRowKeys(row, colTypes)
 	parts := make([]string, 0, len(cols))
 	args = make([]any, 0, len(cols))
 	for _, c := range cols {
@@ -1434,40 +1380,6 @@ func buildWhereClause(row ir.Row, colTypes map[string]*ir.Column) (clause string
 		args = append(args, prepared)
 	}
 	return strings.Join(parts, " AND "), args, nil
-}
-
-// nonGeneratedRowKeys returns the row's keys in sorted order, filtering
-// out any column the colTypes map identifies as a generated column
-// (Column.GeneratedExpr non-empty). Generated columns cannot accept
-// non-DEFAULT values on either MySQL or PG — INSERT/UPDATE SET against
-// a generated column is a hard error on both engines, and including
-// one in a WHERE predicate risks silent zero-rows-affected when the
-// target's recomputation differs from the source's stored value
-// (precision / NULL-coalescing differences are realistic).
-//
-// Mirrors the bulk-load writer's [nonGeneratedColumns] (row_reader.go);
-// the GitHub issue #12 fix wires the CDC apply path to the same
-// filter the LOAD-DATA path already uses (ADR-0026:100).
-//
-// A nil or partial colTypes map (cache cold, column unknown) is
-// tolerant: columns not in the map are treated as non-generated and
-// included. This preserves the pre-fix shape for unit tests with
-// hand-built fixtures and for the small race window before the
-// applier's lazy cache populates.
-func nonGeneratedRowKeys(row ir.Row, colTypes map[string]*ir.Column) []string {
-	all := sortedKeys(row)
-	if len(colTypes) == 0 {
-		return all
-	}
-	out := make([]string, 0, len(all))
-	for _, c := range all {
-		col, ok := colTypes[c]
-		if ok && col != nil && col.IsGenerated() {
-			continue
-		}
-		out = append(out, c)
-	}
-	return out
 }
 
 // placeholderFor returns the right-hand-side placeholder fragment
