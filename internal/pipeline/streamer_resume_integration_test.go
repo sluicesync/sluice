@@ -184,6 +184,42 @@ func pollRowCount(dsn, table string) int {
 	return n
 }
 
+// waitForSourceSlot polls the PG source's pg_replication_slots until a
+// sluice slot exists, or fails the test at timeout. It replaces the
+// blind "give the streamer a moment" start-up sleep in streamer tests
+// that write a FINITE burst of source rows after starting the stream:
+// a write committed BEFORE the slot exists is captured by neither the
+// snapshot (taken at slot creation) nor CDC — under CI shard
+// contention the 2s sleep lost that race and the test sat at 0/N rows
+// until its deadline (the AIMD "dest only saw 0/250" flake,
+// root-caused 2026-06-10: local pass in 3.8s, CI 0 rows in 63s).
+// Slot existence is the capture guarantee, so polling for it makes
+// the test correct under arbitrary scheduler delay rather than just
+// more tolerant. Tests whose writer runs CONTINUOUSLY (bug15) don't
+// need this — later writes are captured regardless.
+func waitForSourceSlot(t *testing.T, sourceDSN string, timeout time.Duration) {
+	t.Helper()
+	db, err := sql.Open("pgx", sourceDSN)
+	if err != nil {
+		t.Fatalf("waitForSourceSlot: open source: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		var n int
+		err := db.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM pg_replication_slots WHERE slot_name LIKE 'sluice%'`).Scan(&n)
+		cancel()
+		if err == nil && n > 0 {
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	t.Fatalf("waitForSourceSlot: no sluice replication slot on the source after %s — cold-start never reached slot creation", timeout)
+}
+
 // readPersistedPosition reads the source_position column for streamID
 // from the target's sluice_cdc_state table. Returns "" if no row.
 func readPersistedPosition(t *testing.T, dsn, streamID string) string {

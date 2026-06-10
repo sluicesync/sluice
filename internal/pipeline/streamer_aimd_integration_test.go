@@ -88,9 +88,12 @@ func TestStreamer_AIMDController_PostgresToPostgres_Engages(t *testing.T) {
 	runErr := make(chan error, 1)
 	go func() { runErr <- streamer.Run(streamCtx) }()
 
-	// Give the streamer a moment to capture the snapshot, start CDC,
-	// and bind the metrics listener.
-	time.Sleep(2 * time.Second)
+	// Wait for the replication slot to exist before writing the source
+	// burst — a commit that lands BEFORE the slot is created is
+	// captured by neither the snapshot nor CDC, so under CI shard
+	// contention the old blind 2s sleep produced the permanent
+	// "dest only saw 0/250 rows" failure (see [waitForSourceSlot]).
+	waitForSourceSlot(t, sourceDSN, 60*time.Second)
 
 	srcDB, err := sql.Open("pgx", sourceDSN)
 	if err != nil {
