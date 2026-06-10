@@ -6,6 +6,37 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Warm resumes and crash recoveries no longer fail on a not-yet-released
+  replication slot.** Restarting a PG stream moments after the prior owner
+  stopped (or crashed) could hit `replication slot is active for PID N`
+  (SQLSTATE 55006) and fail loudly for a condition that self-heals as soon
+  as Postgres reaps the dead walsender. `START_REPLICATION` now retries
+  with bounded backoff (8 attempts, 0.5–8 s, each wait visible at INFO);
+  a *genuinely* concurrent second writer still holds the slot past the
+  budget and gets the original loud refusal — the two-writers guard is
+  unchanged and pinned.
+
+### Performance
+- **Migration-state checkpoints are O(1) in table count (ADR-0082).**
+  Per-table progress and resume cursors now live one-row-per-table instead
+  of re-serializing the entire progress map into a single hot row on every
+  checkpoint. Measured at 10k tables on real Postgres: **31.7 ms → 377 µs
+  per checkpoint (84×)**; a 10k-table migration's total state writes drop
+  from ~17 GB to ~1.3 MB. Existing migrations upgrade transparently on
+  first resume (crash-safe, one-time); a *downgraded* binary encountering
+  the upgraded layout fails loudly instead of silently re-copying.
+
+### Internal
+- Applier control-plane extraction arc complete (ADR-0081 tiers a–d): the
+  duplicated batch loop, control-table CRUD, and lease-row conversion now
+  live once in `internal/appliershared`; ADR-0081 records what stays
+  engine-specific and why.
+- Random-op sync-convergence property test (`pgregory.net/rapid`) joins
+  the suite: random transaction interleavings against live PG/MySQL syncs
+  must converge to exact content equality; smoke budget in PR CI,
+  env-knobbed deep runs.
+
 ## [0.99.33] - 2026-06-10
 
 ### Fixed
