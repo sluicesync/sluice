@@ -342,11 +342,16 @@ jobs:
           # docker.io dependency to a retried setup step; the test-time start
           # then hits the local cache (PullIfNotPresent). The ghcr login is
           # inert for the docker.io pulls (they resolve anonymously).
+          # postgres:17 joined the list 2026-06-10: the PG17 FAILOVER-flag
+          # tests (cdc_reader_integration_test.go) boot stock postgres:17,
+          # and its cold docker.io pull mid-test flaked TestServerVersionNum_
+          # PG17 on three tag runs (v0.99.29/31/32) before being pre-pulled.
           bash scripts/ci-ghcr-pull.sh \
             ghcr.io/sluicesync/sluice-mysql:8.0-prebaked \
             ghcr.io/sluicesync/sluice-postgres:16-prebaked \
             ghcr.io/sluicesync/sluice-pgvector:0.7.4-pg16-prebaked \
             postgres:16 \
+            postgres:17 \
             mysql:8.0
 
       # Run every package's integration tests. -count=1 disables the
