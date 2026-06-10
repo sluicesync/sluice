@@ -421,8 +421,11 @@ func (w *RowWriter) writeBatched(ctx context.Context, table *ir.Table, rows <-ch
 
 	batch := make([]ir.Row, 0, limit)
 	var batchBytes int64
+	flushes := 0
 
-	flush := func() error {
+	// final=true on the channel-close flush: the table's last flush is
+	// always checked regardless of the sampling schedule below.
+	flush := func(final bool) error {
 		if len(batch) == 0 {
 			return nil
 		}
@@ -431,13 +434,18 @@ func (w *RowWriter) writeBatched(ctx context.Context, table *ir.Table, rows <-ch
 		if _, err := conn.ExecContext(ctx, query, args...); err != nil {
 			return fmt.Errorf("mysql: insert into %q (%d rows): %w", table.Name, len(batch), err)
 		}
+		flushes++
 		// Strict sql_mode rejects an out-of-range value at the INSERT
 		// above (loud already); under --mysql-sql-mode='' MySQL silently
 		// clamps/truncates and only flags it via the warning list — so
-		// check after each successful flush (Vector B). Refuses (strict)
-		// or WARNs once per table (relaxed).
-		if err := w.reportBulkWriteWarnings(ctx, conn, table.Name); err != nil {
-			return err
+		// check after a successful flush (Vector B). Refuses (strict)
+		// or WARNs once per table (relaxed). Sampled rather than
+		// every-flush — see [warningsCheckDue] for the schedule and
+		// what the sampling does and doesn't weaken.
+		if final || warningsCheckDue(flushes) {
+			if err := w.reportBulkWriteWarnings(ctx, conn, table.Name); err != nil {
+				return err
+			}
 		}
 		batch = batch[:0]
 		batchBytes = 0
@@ -448,12 +456,12 @@ func (w *RowWriter) writeBatched(ctx context.Context, table *ir.Table, rows <-ch
 		select {
 		case row, ok := <-rows:
 			if !ok {
-				return flush()
+				return flush(true)
 			}
 			batch = append(batch, row)
 			batchBytes += ir.ApproximateRowBytes(row)
 			if len(batch) >= limit || batchBytes >= byteCap {
-				if err := flush(); err != nil {
+				if err := flush(false); err != nil {
 					return err
 				}
 			}
@@ -461,6 +469,41 @@ func (w *RowWriter) writeBatched(ctx context.Context, table *ir.Table, rows <-ch
 			return ctx.Err()
 		}
 	}
+}
+
+// Warning-check sampling schedule for the batched-INSERT bulk path
+// (repo-audit M3.5). SHOW WARNINGS is a full round-trip per flush; on
+// a cross-region PlanetScale target (~50 ms RTT) — the engine that can
+// ONLY use batched INSERT — checking every ≤500-row flush adds up to
+// ~2× per-flush latency (a 19M-row table is ~38k flushes ≈ ~30 min of
+// pure SHOW WARNINGS round-trips). The schedule: the first
+// [warningsExhaustiveFlushes] flushes are ALL checked (a systematic
+// coercion — wrong column type, bad mapping — clamps on every flush
+// and is caught immediately), then 1-in-[warningsSampleEvery], plus
+// the table's final flush unconditionally.
+//
+// What sampling does NOT weaken: under strict sql_mode (the default),
+// a conversion problem on this path errors the INSERT itself — the
+// per-flush warning probe is defense-in-depth there, not the primary
+// guard (the LOAD DATA path, where strict mode DOES downgrade errors
+// to warnings, keeps its every-statement check in the load-data
+// writer; so does the ≤10-flush-per-call idempotent resume path).
+// What it does weaken, deliberately: under the operator's explicit
+// --mysql-sql-mode=” relaxed opt-in, a SPARSE clamp confined to
+// unsampled mid-table flushes can miss the advisory once-per-table
+// WARN. That advisory exists to name coercions the operator already
+// opted into; trading completeness of the advisory for ~30 min on
+// large cross-region loads is the documented call.
+const (
+	warningsExhaustiveFlushes = 10
+	warningsSampleEvery       = 16
+)
+
+// warningsCheckDue reports whether the flushNum-th (1-based) flush is
+// on the sampling schedule. The caller additionally forces the final
+// flush.
+func warningsCheckDue(flushNum int) bool {
+	return flushNum <= warningsExhaustiveFlushes || flushNum%warningsSampleEvery == 0
 }
 
 // buildBatchInsert returns the parameterised INSERT statement for the

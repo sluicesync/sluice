@@ -247,3 +247,32 @@ func TestPrimaryKeyColumns(t *testing.T) {
 		t.Error("primaryKeyColumns: expected nil for table without PK")
 	}
 }
+
+// TestWarningsCheckDue pins the batched-INSERT warning-sampling
+// schedule (repo-audit M3.5): the first warningsExhaustiveFlushes
+// flushes are ALL checked — the property that a systematic clamp
+// (wrong type mapping, coercing column) is caught on the very first
+// flush of a table — then 1-in-warningsSampleEvery. The final flush
+// is forced by the caller and isn't part of this function.
+func TestWarningsCheckDue(t *testing.T) {
+	for n := 1; n <= warningsExhaustiveFlushes; n++ {
+		if !warningsCheckDue(n) {
+			t.Errorf("flush %d: want exhaustive-phase check, got skip", n)
+		}
+	}
+	checked := 0
+	for n := warningsExhaustiveFlushes + 1; n <= warningsExhaustiveFlushes+10*warningsSampleEvery; n++ {
+		if warningsCheckDue(n) {
+			checked++
+			if n%warningsSampleEvery != 0 {
+				t.Errorf("flush %d: checked off-schedule (every %d)", n, warningsSampleEvery)
+			}
+		}
+	}
+	// 10 sampling windows after the exhaustive phase => ~10 checks
+	// (±1 for phase alignment); the point is sparse, not zero and
+	// not every-flush.
+	if checked < 9 || checked > 11 {
+		t.Errorf("sampling phase: %d checks across 10 windows; want ~10", checked)
+	}
+}
