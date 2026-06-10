@@ -69,7 +69,7 @@ func (r *RowReader) ReadRowsBatch(ctx context.Context, table *ir.Table, after []
 		return nil, fmt.Errorf("mysql: ReadRowsBatch: query failed: %w", err)
 	}
 
-	out := make(chan ir.Row)
+	out := make(chan ir.Row, rowChanBuffer)
 	go r.stream(ctx, rows, table, out, nil)
 	return out, nil
 }

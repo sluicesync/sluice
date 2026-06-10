@@ -937,9 +937,10 @@ func copyChunkFast(
 	// LowerPK (nil => table start) and advances by the last PK seen;
 	// LastPK is guaranteed nil here (useFastLoader gate (2)) so there
 	// is no mid-chunk resume cursor to honour. The downstream channel
-	// is unbuffered, so the writer back-pressures the pump exactly as
-	// the single-reader copyTable path does.
-	out := make(chan ir.Row)
+	// carries the standard bounded buffer ([rowChanBuffer]) — the
+	// writer still back-pressures the pump once it fills, but decode
+	// and COPY overlap instead of rendezvous-alternating.
+	out := make(chan ir.Row, rowChanBuffer)
 	pumpErr := make(chan error, 1)
 	go func() {
 		defer close(out)
@@ -1235,7 +1236,9 @@ func filterByUpperBound(ctx context.Context, src <-chan ir.Row, pkCols []string,
 	}
 	pkCol := pkCols[0]
 
-	out := make(chan ir.Row)
+	// Bounded buffer for the same decode/write-overlap reason as the
+	// tees — see [rowChanBuffer].
+	out := make(chan ir.Row, rowChanBuffer)
 	go func() {
 		defer close(out)
 		for {
