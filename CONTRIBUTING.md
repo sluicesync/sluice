@@ -12,8 +12,10 @@ You'll need a recent Go toolchain (the version in `go.mod`'s `go` directive — 
 
 ```bash
 go install mvdan.cc/gofumpt@latest
-go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest
 ```
+
+(Note the `/v2/` in the lint path — the project's `.golangci.yml` is v2-schema, and the un-suffixed module path silently installs v1, which rejects the config. CI installs it the same way.)
 
 Then enable the pre-commit hook so the local gate matches CI:
 
@@ -47,7 +49,7 @@ The test suite is layered by infrastructure cost; each layer is opt-in via a bui
 - **Unit tests** (no tag) run on every push: `go test -race -count=1 ./internal/...`. Mock engines (`stubEngine`, `recordingEngine` in the pipeline package), no Docker.
 - **Integration tests** (`integration` tag): testcontainers-go boots `mysql:8.0` and `postgres:16` — `go test -tags=integration -race -count=1 ./internal/...`. Run on Linux in CI; same-engine tests live in each engine package, cross-engine tests in `internal/pipeline`.
 - **PostGIS tests** (`integration && postgis` tag): adds the `postgis/postgis:16-3.4` image (~600 MB). Single test (`TestMigrate_PostGIS_MySQLToPG`) gated behind a separate tag so the default integration suite doesn't pull the heavier image.
-- **VStream tests** (`integration && vstream` tag): adds the `vitess/vttestserver:mysql80` image (~700 MB). Five tests covering the FlavorPlanetScale CDC + snapshot paths against a vanilla Vitess cluster — same image cost concern as PostGIS, hence the separate tag.
+- **VStream tests** (`integration && vstream` tag): adds the `vitess/vttestserver:mysql80` image (~700 MB). The FlavorPlanetScale CDC + snapshot suite against a vanilla Vitess cluster — same image cost concern as PostGIS, hence the separate tag.
 - **PlanetScale verification tests** (`psverify` tag): hits a real PlanetScale account via env vars / a repo-root `PLANETSCALE_CREDENTIALS.env` file. Manual-trigger only via `.github/workflows/psverify.yml`; never runs on push. Use these to validate against actual product quirks the in-container tests can't reach.
 
 Same-engine tests are sanity. Cross-engine tests are validation. Add a cross-engine test before claiming a feature works end-to-end.
@@ -56,7 +58,16 @@ Local Windows note: the integration suites need `export TESTCONTAINERS_RYUK_DISA
 
 ## CI shape
 
-Four jobs run on every PR (see [`.github/workflows/ci.yml`](.github/workflows/ci.yml) and [docs/dev/branch-protection.md](docs/dev/branch-protection.md)): Test (3 OSes, unit only), Integration (Linux only, Docker-backed), Lint (golangci-lint), Build (3 OSes, `go build` smoke test). All four must pass to merge.
+See [`.github/workflows/ci.yml`](.github/workflows/ci.yml) (heavily commented) and [docs/dev/branch-protection.md](docs/dev/branch-protection.md). On every PR, all jobs run **Linux-only** (the Windows matrix entries join on tag pushes and manual dispatch — routine PRs do *not* get Windows coverage; a Windows-only breakage surfaces at release verification, not merge time):
+
+- **Test** — unit suite under `-race`, plus `go vet`.
+- **Integration** — the Docker-backed `-tags=integration -race` suite, split across five parallel shards (pipeline × 3 by test-name regex, mysql engine, postgres + pgtrigger + small packages) and rolled up into a single required check named `Integration`.
+- **Integration (PostGIS)** / **Integration (vstream)** — the heavier-image suites as their own jobs.
+- **Lint** — golangci-lint, plus a tags-vet matrix that type-checks every `//go:build` combination (including tagged test files), plus a shard-coverage guard that fails if a package with integration tests is outside the shard matrix.
+- **Build** — `go build ./...` smoke test.
+- **govulncheck** — reachability-based vulnerability scan (informational; not yet a required check).
+
+Branch protection requires six checks to merge: `Test (ubuntu-latest)`, `Integration`, `Integration (PostGIS)`, `Integration (vstream)`, `Lint`, `Build (ubuntu-latest)`. Linear history is enforced (no merge commits). Docs-only changes (`**.md`, `docs/`) skip CI on branch pushes; tag pushes always run everything.
 
 ## Releases
 

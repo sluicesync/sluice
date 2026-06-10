@@ -576,6 +576,31 @@ jobs:
           # this means you can't merge until lint is clean.
           args: --timeout=5m
 
+  # ----- govulncheck -----
+  # Reachability-based vulnerability scanning: unlike Dependabot alerts
+  # / CodeQL (which flag vulnerable *versions*), govulncheck reports
+  # only vulnerabilities whose affected symbols are actually reachable
+  # from this module's call graph — high signal, near-zero noise.
+  #
+  # Triage path for a red run: `go get <module>@<fixed-version> && go
+  # mod tidy` when a fixed version exists (Dependabot usually has the
+  # PR open already); otherwise read the finding's trace, decide
+  # whether the reachable path matters for sluice, and either pin a
+  # workaround or accept-with-comment here. Do NOT silence the job to
+  # get a merge through. Not in the required-checks list yet — watch
+  # its signal for a cycle, then promote via branch protection.
+  govulncheck:
+    name: govulncheck
+    runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: "go.mod"
+      - run: go install golang.org/x/vuln/cmd/govulncheck@latest
+      - run: govulncheck ./...
+
   # ----- Build -----
   # A separate build smoke-test confirms `./cmd/sluice` compiles on every
   # platform — useful because pure unit tests don't always exercise the

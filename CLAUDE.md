@@ -46,14 +46,15 @@ On Windows with Rancher Desktop, two things bite: `docker.exe` lives at `C:\Prog
 
 ## CI shape
 
-Four GitHub Actions jobs gate merges (see `.github/workflows/ci.yml` and `docs/dev/branch-protection.md`):
+Six required checks gate merges (see `.github/workflows/ci.yml` — heavily commented — and `docs/dev/branch-protection.md`). Routine PR/push runs are **Linux-only**; the Windows matrix entries join on tag pushes and workflow_dispatch. Docs-only diffs (`**.md`, `docs/`) skip CI on branch pushes; tag pushes always run everything.
 
-- **Test** on ubuntu/macos/windows — unit tests with `-race`, no integration tag
-- **Integration** on ubuntu only — `go test -tags=integration -race ./internal/...`, with `mysql:8.0` and `postgres:16` pre-pulled
-- **Lint** on ubuntu — golangci-lint
-- **Build** on ubuntu/macos/windows — `go build ./...` smoke test
+- **Test (ubuntu-latest)** — unit tests with `-race` + `go vet`
+- **Integration** — rollup of a 5-shard `-tags=integration -race` matrix on real DB containers (pipeline ×3 by test-name regex; mysql engine; postgres + pgtrigger + small packages). The shard package list is hand-maintained; a Lint-job guard (`scripts/check-shard-coverage.sh`) fails CI if a package with integration-tagged tests falls outside it.
+- **Integration (PostGIS)**, **Integration (vstream)** — heavier-image suites as separate required jobs
+- **Lint** — golangci-lint + the tags-vet matrix (`scripts/vet-tags.sh`: type-checks every `//go:build` combo incl. tagged test files) + the shard-coverage guard
+- **Build (ubuntu-latest)** — `go build ./...` smoke test
 
-Branch protection on `main` requires all four to pass. Linear history is enforced (no merge commits).
+Non-required but running: **govulncheck** (reachability-based vuln scan), scheduled fuzz (`fuzz-roundtrip.yml`, weekly fresh-seed deep run), the Vitess version matrix (weekly), prebaked-image builds. Branch protection requires the six named checks; linear history is enforced (no merge commits).
 
 ## Lint and format gotchas (these have bitten us)
 

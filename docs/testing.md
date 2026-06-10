@@ -94,6 +94,15 @@ func TestMigrate_MySQL_to_Postgres_BasicTypes(t *testing.T) {
 
 ## Layer 3: Semantic equivalence (sqllogictest)
 
+> **Status: not built (design target).** `test/sqllogic/` does not exist
+> yet and no sqllogictest runner is wired up; this layer describes the
+> intended design, kept here so the curation buckets below don't get
+> re-derived from scratch when it's picked up. The closest shipped
+> relative is the real-world DDL fixture corpus
+> (`internal/translate/ddl_fixture_test.go`, `ddlfixture` build tag),
+> which replays large real-application schemas through translation —
+> schema-level, not query-result-level.
+
 **What it covers:** the question that matters most to a real user: "if I run my application's queries against the migrated database, do I get the same answers?"
 
 **How:** a curated subset of the [SQLite sqllogictest](https://www.sqlite.org/sqllogictest/doc/trunk/about.wiki) corpus, plus DoltHub's MySQL-flavored adaptations. Each test case is a sequence of `statement` and `query` lines with expected results. Existing Go runners are available — the [CockroachDB runner](https://github.com/cockroachdb/cockroach/tree/master/pkg/sql/logictest) is the most mature.
@@ -116,6 +125,21 @@ The curation itself is a deliverable: it forces us to enumerate the real semanti
 **Speed budget:** runs nightly, not on every commit. Aiming for under thirty minutes for the portable bucket against all four migration directions.
 
 ## Layer 4: Property-based sync correctness
+
+> **Status: partially built, differently than described.** The
+> `pgregory.net/rapid` stateful property test sketched below is not
+> built (`rapid` is not a dependency). What *does* exist is the
+> generative **migrate round-trip fuzz harness**
+> (`internal/pipeline/migrate_fuzz_roundtrip_integration_test.go`):
+> random schema + data generation across all four directions, a smoke
+> budget in every PR's integration run, and a weekly deep run with a
+> fresh seed (`.github/workflows/fuzz-roundtrip.yml`) that uploads
+> replayable failure fixtures. That covers the *snapshot/migrate*
+> surface. The random-op **sync-convergence** property (CDC apply under
+> arbitrary interleavings — historically the buggiest surface) remains
+> unbuilt and is the single highest-value new test investment on this
+> page; whether to build it is an open decision tracked in the repo
+> audit (2026-06-09).
 
 **What it covers:** the continuous-sync engine's ability to converge under arbitrary sequences of operations. Hand-written tests miss the interactions; a fuzzer finds them.
 
@@ -148,6 +172,15 @@ func TestSync_ConvergesUnderRandomOps(t *testing.T) {
 
 ## Layer 5: Performance regressions
 
+> **Status: manual harnesses, no CI gate.** There is no automated
+> CI benchmark comparison. What exists: the `benchmarks/{pgcopydb,cdc,
+> mysql}/` harnesses, run manually per performance arc with results
+> recorded in the relevant ADR (house style — e.g. ADR-0076/0077/0078
+> carry measured numbers from the 110 GB pgcopydb comparison, ADR-0080
+> the MySQL index numbers), plus targeted `go test -bench` micro-
+> benchmarks (e.g. `BenchmarkColdStartCopyWriter`). The CI-gated
+> regression threshold below is a design target.
+
 **What it covers:** the tool getting slower over time without anyone noticing.
 
 **How:** a checked-in benchmark dataset (small enough to live in the repo or be generated deterministically; large enough to be meaningful) and a `make bench` target that records timings to a file. CI compares against a baseline and fails the build if a regression exceeds a threshold (e.g. 15%).
@@ -169,10 +202,10 @@ The dataset shape:
 ## Local developer workflow
 
 ```bash
-make test          # Layer 1 only, < 5 seconds
+make test          # Layer 1 only (note: -race needs CGO; see make pre-commit for the conditional path)
 make test-it       # Layers 1 + 2, ~5 minutes (containers)
-make test-all      # Layers 1-4, ~30 minutes (sqllogic + property)
-make bench         # Layer 5
+make test-all      # today: same as test-it — the sqllogic/property tags match no files yet (Layers 3-4 unbuilt)
+make bench         # Go micro-benchmarks; the at-scale harnesses live in benchmarks/ (manual)
 ```
 
 The default `go test ./...` runs only the unit layer. Container-based and slow tests live behind build tags (`//go:build integration`) so the fast loop stays fast.

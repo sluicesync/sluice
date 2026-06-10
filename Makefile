@@ -14,6 +14,12 @@ LDFLAGS := -s -w \
 	-X main.commit=$(COMMIT) \
 	-X main.date=$(DATE)
 
+# -race needs the CGO/TSan runtime; Windows toolchains commonly run
+# with CGO_ENABLED=0, where -race fails to build. Mirror the
+# pre-commit hook's conditional: race on when CGO is on, plain
+# otherwise (CI's Linux runners remain the authoritative -race gate).
+RACE := $(shell [ "$$($(GO) env CGO_ENABLED 2>/dev/null)" = "1" ] && echo -race)
+
 all: lint test build ## Run lint, tests, and build
 
 build: ## Build the sluice binary into ./bin
@@ -21,13 +27,13 @@ build: ## Build the sluice binary into ./bin
 	$(GO) build -ldflags '$(LDFLAGS)' -o $(BUILD_DIR)/$(BINARY) ./cmd/sluice
 
 test: ## Run unit tests (Layer 1) — fast, no databases
-	$(GO) test -race -count=1 ./...
+	$(GO) test $(RACE) -count=1 ./...
 
 test-it: ## Run unit + integration tests (Layers 1-2) — requires Docker for testcontainers
-	$(GO) test -race -count=1 -tags=integration ./...
+	$(GO) test $(RACE) -count=1 -tags=integration ./...
 
-test-all: ## Run unit + integration + sqllogic + property tests (Layers 1-4)
-	$(GO) test -race -count=1 -tags='integration sqllogic property' ./...
+test-all: ## Today: same as test-it (the sqllogic/property tags match no files yet — docs/testing.md Layers 3-4 are design targets)
+	$(GO) test $(RACE) -count=1 -tags='integration sqllogic property' ./...
 
 bench: ## Run Go benchmarks
 	$(GO) test -bench=. -run='^$$' -count=3 ./...
@@ -69,7 +75,7 @@ fmt-check: ## Verify formatting without writing changes (exits non-zero if any f
 		exit 1; \
 	fi
 
-pre-commit: fmt-check vet vet-tags test ## Run the pre-commit suite locally (formatting, vet, fast tests)
+pre-commit: fmt-check vet vet-tags lint test ## Run the full local gate (mirrors CI: format, vet, tags-vet, lint, fast tests)
 	@echo "OK — ready to commit."
 
 tidy: ## go mod tidy
