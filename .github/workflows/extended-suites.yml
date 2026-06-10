@@ -1,0 +1,151 @@
+# Scheduled run for the heavy, previously-orphaned test suites
+# (repo-audit M0.5): the Vitess chaos pair and the Vitess reshard
+# correctness test. Until 2026-06-10 these suites had NO CI entry
+# point at all — they only ran when someone remembered to run them
+# locally (their build tags are at least type-checked on every PR by
+# the Lint job's vet-tags matrix, but type-checking is not running).
+#
+# Cadence: weekly, Sunday 10:00 UTC — after the 06:00 prebake refresh
+# and the 08:00 Vitess version matrix, so the GHCR mirrors are fresh
+# and the runner pool isn't contended. Plus workflow_dispatch for
+# on-demand runs (pre-release validation of VStream-path changes).
+# Owner: the release operator; a red run here files a bug, it never
+# blocks a merge (NOT a required check — each leg boots real
+# multi-process Vitess clusters and runs fault injection, far too
+# heavy and too stateful for the per-PR gate).
+#
+# Deliberately NOT here: the `kmsverify` suite
+# (internal/pipeline/backup_kms_localstack_integration_test.go) is
+# scaffolding — every test body t.Skip()s pending localstack + AWS
+# config wiring. Scheduling it would run five skips and report green
+# while testing nothing (the vacuous-pass failure mode). Wire the
+# scaffolding first, then add a localstack job here.
+
+name: Extended suites
+
+on:
+  schedule:
+    - cron: "0 10 * * 0"
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: "Which suite to run"
+        required: false
+        default: "all"
+        type: choice
+        options: [all, chaos, reshard, vstream-pipeline]
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: extended-suites-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # The chaos suite: primary failover (PRS + ERS), tablet kill mid
+  # cold-start, vtgate restart mid-sync, rolling upgrade mid-sync —
+  # all against the real compose cluster
+  # (internal/engines/mysql/testdata/vitesscluster/docker-compose.yml).
+  chaos:
+    name: Vitess chaos suite
+    if: ${{ github.event_name == 'schedule' || github.event.inputs.suite == 'all' || github.event.inputs.suite == 'chaos' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      # The compose file defaults to vitess/lite:v24.0.1; point it at
+      # the pre-baked GHCR mirror instead (no docker.io rate-limit
+      # SPOF, same image bytes — build-prebaked-images.yml publishes a
+      # pure retag).
+      - name: Log in to ghcr.io + pull the pre-baked Vitess image
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash scripts/ci-ghcr-pull.sh ghcr.io/sluicesync/sluice-vitess:v24.0.1
+
+      - name: Run the chaos suite
+        env:
+          VITESS_LITE_IMAGE: ghcr.io/sluicesync/sluice-vitess:v24.0.1
+        run: |
+          go test -tags='integration vitesscluster chaos' -count=1 -timeout=80m \
+            -run '^TestVitessChaos_' -v ./internal/engines/mysql/...
+
+  # The reshard correctness test: proves the CDC reader follows a
+  # VReplication reshard (shard split) without loss or duplication.
+  # Its own in-test comments flag any failure as "a sluice CDC-reader
+  # correctness bug, NOT a flake" — treat a red leg here as a real
+  # bug to file, not a rerun candidate.
+  reshard:
+    name: Vitess reshard correctness
+    if: ${{ github.event_name == 'schedule' || github.event.inputs.suite == 'all' || github.event.inputs.suite == 'reshard' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      # The reshard harness hardcodes vitess/lite:latest (vrVitessImage
+      # in vitess_cluster_reshard_integration_test.go). Pull the GHCR
+      # :latest mirror and retag it locally so testcontainers'
+      # PullIfNotPresent finds it without touching docker.io.
+      - name: Pull the GHCR :latest mirror and retag as vitess/lite:latest
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          bash scripts/ci-ghcr-pull.sh ghcr.io/sluicesync/sluice-vitess:latest
+          docker tag ghcr.io/sluicesync/sluice-vitess:latest vitess/lite:latest
+
+      - name: Run the reshard suite
+        run: |
+          go test -tags='integration vitessreshard' -count=1 -timeout=65m \
+            -run '^TestVitessReshard_' -v ./internal/engines/mysql/...
+
+  # The four PIPELINE-package vstream tests (Bug-132 chunked parity,
+  # restart-mid-copy chaos, sharded-source, ShapeA consolidation).
+  # The required `Integration (vstream)` check in ci.yml runs only the
+  # mysql-engine package with -run 'TestVStream_', so these matched
+  # neither its package set nor its filter and ran nowhere. They live
+  # here (not in the required check) because the set includes a
+  # restart-chaos test — observe its reliability across a few weekly
+  # cycles before considering promotion into ci.yml's vstream job.
+  vstream-pipeline:
+    name: Pipeline vstream suite
+    if: ${{ github.event_name == 'schedule' || github.event.inputs.suite == 'all' || github.event.inputs.suite == 'vstream-pipeline' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      TESTCONTAINERS_RYUK_DISABLED: "true"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Log in to ghcr.io + pre-pull images (bounded retry)
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          bash scripts/ci-ghcr-pull.sh \
+            ghcr.io/sluicesync/sluice-mysql:8.0-prebaked \
+            ghcr.io/sluicesync/sluice-postgres:16-prebaked
+      - name: Pre-pull vttestserver (Docker Hub, public)
+        run: docker pull vitess/vttestserver:mysql80
+
+      - name: Run the pipeline vstream tests
+        run: |
+          go test -tags='integration vstream' -race -count=1 -timeout=40m \
+            -run '^(TestMigrate_VStream|TestSpikeShapeA_)' -v ./internal/pipeline/
