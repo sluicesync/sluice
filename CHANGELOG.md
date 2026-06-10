@@ -6,6 +6,46 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **Combined-`ALTER` MySQL secondary-index builds (ADR-0080 follow-up).** When
+  `sluice migrate` builds a table's secondary indexes on a MySQL target, all
+  combinable `BTREE`/`UNIQUE` indexes for that table are now created in **one**
+  `ALTER TABLE ... ADD INDEX ..., ADD INDEX ...` statement — one InnoDB scan and
+  one metadata lock per table instead of one per index. `FULLTEXT`/`SPATIAL`
+  stay separate statements (MySQL restricts combining them). Measured on the
+  `benchmarks/mysql/` harness: **−18.1 % median index-phase time** on top of the
+  v0.99.30 overlap win, zero-loss verified. Applies to both the overlapped and
+  serial post-copy index paths.
+- **`--log-format=json`.** Emits one JSON object per line on stderr (slog's
+  JSONHandler) instead of the human-readable text format — the shape Loki /
+  Datadog / CloudWatch agents ingest natively. Pairs with the existing
+  `/metrics` + `/healthz` + `/readyz` endpoints for running `sluice sync` under
+  Kubernetes. Default remains `text`.
+
+### Security
+- **Local backup stores and crash bundles are now written owner-only (0600
+  files / 0700 directories; previously 0644/0755).** Backup chunks contain full
+  row data and `--encrypt` is opt-in, so a world-readable backup directory
+  handed any local user the dataset. Existing stores keep their current
+  permissions (only newly created files/dirs are affected); restore is
+  unaffected. No effect on Windows.
+
+### Fixed
+- **Failed backup-compact orphan sweeps now leave a WARN breadcrumb.** The
+  post-commit delete pass that removes a merged segment's superseded files was
+  silently best-effort; a failure leaked backup-store disk with no log line at
+  any level. The chain remains correct either way — this is purely operator
+  visibility.
+
+### CI
+- **The `postgres-trigger` engine's integration tests now run in CI.** The
+  package landed after the integration-shard split and no shard listed it, so
+  its suite — including the capture-payload pin for a known silent-loss class —
+  had never executed in CI. A new Lint-job guard fails CI if a package with
+  integration-tagged tests is ever outside the shard matrix again, and a
+  tags-vet matrix type-checks every build-tag combination (including tagged
+  test files) on every PR.
+
 ## [0.99.30] - 2026-06-09
 
 ### Added

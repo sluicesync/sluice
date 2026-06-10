@@ -93,7 +93,7 @@ These are the operator-pain features Reddit's `/r/PostgreSQL`, `/r/mysql`, and `
 | **F17 — Source-side heartbeat writer** | [v0.82.0](https://github.com/sluicesync/sluice/releases/tag/v0.82.0) | Optionally writes a tiny periodic row to a sluice-owned table on the source. The `INSERT` generates WAL / binlog so the consumer's position advances even against a quiet source, preventing silent slot eviction / binlog rotation past the consumer on low-traffic sources. Default-off; opt in with `--source-heartbeat-interval=30s`. Pairs with F13: F13 detects the symptom, F17 prevents the cause. ([ADR-0061](docs/adr/adr-0061-source-side-heartbeat-writer.md)) |
 | **F10 — Cutover sequence priming** | [v0.83.0](https://github.com/sluicesync/sluice/releases/tag/v0.83.0) | `sluice cutover` reads source PG sequences (`pg_sequences.last_value`) / MySQL `AUTO_INCREMENT` values and bumps the target by `--cutover-sequence-margin=N` (default 1000). Closes the PK-collision-on-first-post-cutover-`INSERT` class. Idempotent; refuses loudly when target value is already above the safety margin (signal that traffic landed before cutover priming ran). Skips composite-PK / UUID / no-sequence tables gracefully. ([ADR-0062](docs/adr/adr-0062-cutover-sequence-priming.md)) |
 
-Since that arc, the **v0.84 → v0.98 releases** widened the surface well beyond those four: encrypted logical backups with incremental chains, point-in-time restore, and a continuous-backup broker; PII redaction (26 strategies); the slot-less `postgres-trigger` CDC engine; PG Row-Level Security capture/emit; PostGIS geometry round-trips; multi-source aggregation; and connection-resilience + index-build tuning for large migrations. See [Recent releases](#recent-releases) and the [CHANGELOG](CHANGELOG.md).
+Since that arc, the **v0.84 → v0.99 releases** widened the surface well beyond those four: encrypted logical backups with incremental chains, point-in-time restore, and a continuous-backup broker; PII redaction (26 strategies); the slot-less `postgres-trigger` CDC engine; PG Row-Level Security capture/emit; PostGIS geometry round-trips; multi-source aggregation; multi-database fan-out; connection-resilience tuning; and the bulk-copy throughput arc (cross-table worker pool, index-build overlap on both engines, PG→PG raw `COPY` passthrough, fast `sync` cold-start). See [Recent releases](#recent-releases) and the [CHANGELOG](CHANGELOG.md).
 
 ### Engines and directions
 
@@ -201,7 +201,7 @@ Calling out the gaps explicitly so operators don't waste a discovery cycle:
 
 ## Project state
 
-**Pre-1.0** (`v0.98.x` series at time of writing, 180+ tagged releases across the v0.x line). The v0.84 → v0.98 arc kept widening the capability surface — encrypted logical backups + restore + a continuous-backup broker, PII redaction, the slot-less `postgres-trigger` engine, PG Row-Level Security, PostGIS round-trips, multi-source aggregation, and connection-resilience tuning — each landing with the same class-pin test discipline rather than a happy-path-only ship. **No known production users today.**
+**Pre-1.0** (`v0.99.x` series at time of writing, 200+ tagged releases across the v0.x line). The v0.84 → v0.99 arc kept widening the capability surface — encrypted logical backups + restore + a continuous-backup broker, PII redaction, the slot-less `postgres-trigger` engine, PG Row-Level Security, PostGIS round-trips, multi-source aggregation, multi-database fan-out, connection-resilience tuning, and the bulk-copy throughput arc (cross-table pool + index overlap + raw PG→PG passthrough) — each landing with the same class-pin test discipline rather than a happy-path-only ship. **No known production users today.**
 
 This is a deliberate posture, not an accident:
 
@@ -275,7 +275,7 @@ A few terms recur in the codebase and docs:
 - [`docs/cookbook/`](docs/cookbook/) — task-shaped recipes: one-shot migrate, bidirectional cutover, Heroku-style slot-less migration, encrypted backup chains, PII redaction, PostGIS round-trip, GitLab-shape case study, and the `pg_dump` comparison
 - [`docs/translator-catalog.md`](docs/translator-catalog.md) — consolidated cross-engine expression translator reference: shipped translations + deferred rules + escape hatches
 - [`docs/backup-format-versioning.md`](docs/backup-format-versioning.md) — backup manifest `FormatVersion` contract: proportional version-stamp, refuse-before-touch on older binaries, how older sluice doesn't silently drop RLS / EXCLUDE metadata (Bug 116 closure reference)
-- [`docs/adr/README.md`](docs/adr/README.md) — index of all 70 ADRs (ADR-0001 – ADR-0070), one-line summary per decision
+- [`docs/adr/README.md`](docs/adr/README.md) — index of all ADRs (ADR-0001 – ADR-0080), one-line summary per decision
 - [`docs/managed-services.md`](docs/managed-services.md) — PlanetScale-specific notes, operator preconditions
 - [`docs/postgres-source-prep.md`](docs/postgres-source-prep.md) — required PG GUCs, slot lifecycle, failover-survival mechanisms
 - [`docs/vitess-vstream-troubleshooting.md`](docs/vitess-vstream-troubleshooting.md) — operator runbook for PlanetScale-MySQL VStream lag (throttler, replication lag, deploy requests)
@@ -285,14 +285,18 @@ A few terms recur in the codebase and docs:
 - [`docs/schema-change-runbook.md`](docs/schema-change-runbook.md) — `ADD COLUMN` / `DROP COLUMN` / `MODIFY` against a running stream
 - [`docs/type-mapping.md`](docs/type-mapping.md), [`docs/value-types.md`](docs/value-types.md) — type translation policies and runtime row contract
 - [`docs/testing.md`](docs/testing.md) — testing strategy, the Bug 74 class-pin lesson
-- [`docs/adr/`](docs/adr/) — Architecture Decision Records (ADR-0001 through ADR-0070)
+- [`docs/adr/`](docs/adr/) — Architecture Decision Records (ADR-0001 through ADR-0080)
 - [`docs/dev/`](docs/dev/) — local development setup, roadmap, design proto-ADRs
 - [`docs/examples/`](docs/examples/) — runnable quickstart, sample `sluice.yaml` config
 
 ## Recent releases
 
-Selected highlights from the **v0.94 → v0.98** arc:
+Selected highlights from the **v0.94 → v0.99** arc:
 
+- [v0.99.30](https://github.com/sluicesync/sluice/releases/tag/v0.99.30) — Index-build overlap extended to MySQL targets (ADR-0080) + within-table chunking on the PG fast `sync` cold-start + the `SPATIAL`/`FULLTEXT` `Error 1089` fix
+- [v0.99.29](https://github.com/sluicesync/sluice/releases/tag/v0.99.29) — The bulk-copy throughput arc: cross-table worker pool (`--table-parallelism`, ADR-0076), index-build overlap (ADR-0077), PG→PG raw `COPY` passthrough (ADR-0078), fast `sync` cold-start (ADR-0079)
+- [v0.99.16](https://github.com/sluicesync/sluice/releases/tag/v0.99.16) — Multi-database fan-out (`--all-databases` / `--include-database`, migrate + sync) + the FTWRL binlog-snapshot boundary-gap silent-loss fix
+- [v0.99.0](https://github.com/sluicesync/sluice/releases/tag/v0.99.0) — `sluicesync.dev/sluice` vanity module + first GHCR runtime image
 - [v0.98.0](https://github.com/sluicesync/sluice/releases/tag/v0.98.0) — Connection-resilience (target connection-budget cap, stale-backend reaping, AIMD copy-pool backoff) + Postgres deferred-index build tuning
 - [v0.97.0](https://github.com/sluicesync/sluice/releases/tag/v0.97.0) — Inline MySQL `CHECK` enforcement for translatable PG `DOMAIN` checks; multi-segment backup-broker following (v0.97.2)
 - [v0.96.0](https://github.com/sluicesync/sluice/releases/tag/v0.96.0) — Redaction config-precedence hardening; backup-chain passphrase-rotation probes (Bug 116 / 117)
