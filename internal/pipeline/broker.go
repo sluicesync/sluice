@@ -175,6 +175,12 @@ type SyncFromBackup struct {
 	// Argon2id (passphrase mode) runs once per broker process.
 	chainCEK []byte
 
+	// chainCache memoizes the lineage-chain walk across ticks so an
+	// idle tick costs O(1) store GETs instead of O(chain-length); see
+	// [brokerChainCache] for the identity-key invariants. Confined to
+	// Run's goroutine, like chainCEK.
+	chainCache brokerChainCache
+
 	// Now, when set, overrides the wall-clock-time source used for
 	// `broker_state.json` timestamps. Tests pin timestamps; in
 	// production callers leave it nil and the default uses time.Now.
@@ -521,13 +527,21 @@ func (b *SyncFromBackup) Run(ctx context.Context) error {
 	}
 }
 
+// brokerChain returns the lineage chain via the tick-spanning cache.
+// Every broker-side chain walk goes through here so a repeat walk
+// against an unchanged chain reuses the cached link list; the one-shot
+// restore paths keep calling [buildLineageChain] directly.
+func (b *SyncFromBackup) brokerChain(ctx context.Context) ([]segmentRecord, error) {
+	return b.chainCache.get(ctx, b.Store)
+}
+
 // detectChainSourceEngine returns the SourceEngine recorded in the
 // chain's full-backup manifest, or "" when the chain can't be read
 // (the broker's tick loop will surface its own error on the first
 // pass; this helper is best-effort metadata for the cross-engine
 // log line).
 func (b *SyncFromBackup) detectChainSourceEngine(ctx context.Context) string {
-	chain, err := buildBrokerChain(ctx, b.Store)
+	chain, err := b.brokerChain(ctx)
 	if err != nil || len(chain) == 0 {
 		return ""
 	}
@@ -602,7 +616,7 @@ func (b *SyncFromBackup) coldStart(ctx context.Context, applier ir.ChangeApplier
 // columns and the subsequent COPY would fail with "column does not
 // exist". Mirror `migrate --reset-target-data`'s drop-loop pattern.
 func (b *SyncFromBackup) coldStartReset(ctx context.Context, applier ir.ChangeApplier) (string, error) {
-	chain, err := buildBrokerChain(ctx, b.Store)
+	chain, err := b.brokerChain(ctx)
 	if err != nil {
 		return "", wrapWithHint(PhaseConnect, fmt.Errorf("broker: build chain: %w", err))
 	}
@@ -684,7 +698,7 @@ func (b *SyncFromBackup) dropExistingTargetTables(ctx context.Context, schema *i
 // Validates that the asserted ID exists in the chain (typo
 // protection) and writes the broker's position row.
 func (b *SyncFromBackup) coldStartAtChainID(ctx context.Context, applier ir.ChangeApplier) (string, error) {
-	chain, err := buildBrokerChain(ctx, b.Store)
+	chain, err := b.brokerChain(ctx)
 	if err != nil {
 		return "", wrapWithHint(PhaseConnect, fmt.Errorf("broker: build chain: %w", err))
 	}
@@ -763,7 +777,7 @@ func (b *SyncFromBackup) replayNewIncrementals(
 	applier ir.ChangeApplier,
 	lastAppliedID string,
 ) (newApplied string, totalBytes int64, err error) {
-	chain, err := buildBrokerChain(ctx, b.Store)
+	chain, err := b.brokerChain(ctx)
 	if err != nil {
 		return "", 0, fmt.Errorf("build chain: %w", err)
 	}
