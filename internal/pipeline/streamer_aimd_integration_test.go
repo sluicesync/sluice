@@ -93,7 +93,12 @@ func TestStreamer_AIMDController_PostgresToPostgres_Engages(t *testing.T) {
 	// captured by neither the snapshot nor CDC, so under CI shard
 	// contention the old blind 2s sleep produced the permanent
 	// "dest only saw 0/250 rows" failure (see [waitForSourceSlot]).
-	waitForSourceSlot(t, sourceDSN, 60*time.Second)
+	// 120s, not 60s: the first CI failure of THIS gate (run 27307141746)
+	// proved cold-start can take >60s to reach slot creation under
+	// worst-case shard contention — slow-but-correct, and the gate's
+	// loud message diagnosed it precisely. Matches the catch-up
+	// window's tolerance below.
+	waitForSourceSlot(t, sourceDSN, 120*time.Second)
 
 	srcDB, err := sql.Open("pgx", sourceDSN)
 	if err != nil {
