@@ -126,20 +126,33 @@ The curation itself is a deliverable: it forces us to enumerate the real semanti
 
 ## Layer 4: Property-based sync correctness
 
-> **Status: partially built, differently than described.** The
-> `pgregory.net/rapid` stateful property test sketched below is not
-> built (`rapid` is not a dependency). What *does* exist is the
-> generative **migrate round-trip fuzz harness**
+> **Status: built (2026-06-10), two harnesses.** (1) The generative
+> **migrate round-trip fuzz harness**
 > (`internal/pipeline/migrate_fuzz_roundtrip_integration_test.go`):
 > random schema + data generation across all four directions, a smoke
 > budget in every PR's integration run, and a weekly deep run with a
 > fresh seed (`.github/workflows/fuzz-roundtrip.yml`) that uploads
 > replayable failure fixtures. That covers the *snapshot/migrate*
-> surface. The random-op **sync-convergence** property (CDC apply under
-> arbitrary interleavings — historically the buggiest surface) remains
-> unbuilt and is the single highest-value new test investment on this
-> page; whether to build it is an open decision tracked in the repo
-> audit (2026-06-09).
+> surface. (2) The random-op **sync-convergence property test**
+> (repo-audit task M3.12): `pgregory.net/rapid`-driven, pure core in
+> `internal/pipeline/converge_gen.go` (op generator + in-memory
+> expected-state model, unit-tested without containers), live harness
+> in `sync_converge_integration_test.go` (`TestSyncConverges_PGToPG`
+> over slot CDC — the historical bug surface — and
+> `TestSyncConverges_MySQLToMySQL` over binlog). It generates random
+> transaction sequences including the nasty interleavings
+> (update-then-delete same row same tx, PK-changing UPDATEs, multi-row
+> and empty txs, TRUNCATE, PK reuse) against a live source mid-stream
+> and asserts the target converges to the source's exact ordered
+> content; failures shrink to a minimal replayable script. A smoke
+> budget (3 checks/direction, deterministic seed) rides every PR's
+> integration run; `SLUICE_CONVERGE_ITERS` / `SLUICE_CONVERGE_OPS` /
+> `SLUICE_CONVERGE_SEED` budget the deep runs. Still aspirational:
+> cross-engine directions (the harness is structured for them — a new
+> `convLiveEnv` constructor plus a cross-engine canonical-dump
+> equivalence — but only same-engine is wired), multi-table tx
+> interleaving, mid-stream DDL, and a scheduled deep-run workflow like
+> fuzz-roundtrip's.
 
 **What it covers:** the continuous-sync engine's ability to converge under arbitrary sequences of operations. Hand-written tests miss the interactions; a fuzzer finds them.
 
@@ -204,7 +217,7 @@ The dataset shape:
 ```bash
 make test          # Layer 1 only (note: -race needs CGO; see make pre-commit for the conditional path)
 make test-it       # Layers 1 + 2, ~5 minutes (containers)
-make test-all      # today: same as test-it — the sqllogic/property tags match no files yet (Layers 3-4 unbuilt)
+make test-all      # today: same as test-it — Layer 4 rides the integration tag (no separate property tag); Layer 3 unbuilt
 make bench         # Go micro-benchmarks; the at-scale harnesses live in benchmarks/ (manual)
 ```
 

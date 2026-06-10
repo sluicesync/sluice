@@ -38,6 +38,7 @@ require (
 	google.golang.org/api v0.283.0
 	google.golang.org/grpc v1.81.1
 	gopkg.in/yaml.v3 v3.0.1
+	pgregory.net/rapid v1.3.0
 	vitess.io/vitess v0.24.1
 )
 
