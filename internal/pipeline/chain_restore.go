@@ -1034,6 +1034,9 @@ func sameEngineComparator(ctx context.Context, store ir.BackupStore, eng ir.Engi
 // this commit closes it. Same comparator semantics as the single-
 // segment path — nil is fine because the rotation FSM's write-time
 // S>=P_N hard-assert is the authoritative monotonicity gate.
+// Broker call sites reach this through [brokerChainCache], which
+// memoizes the walk across ticks so an idle tick is O(1) store GETs
+// instead of O(chain-length).
 func buildBrokerChain(ctx context.Context, store ir.BackupStore) ([]segmentRecord, error) {
 	return buildLineageChain(ctx, store, nil)
 }
