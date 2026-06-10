@@ -473,14 +473,15 @@ func (s *Streamer) phaseLookupPosition(ctx context.Context, applier ir.ChangeApp
 // is used for the operator-facing fall-through log lines, matching
 // the pre-split inline behaviour.
 //
-// stop is always non-nil; the caller's unconditional deferred
-// `stop()` closes whichever reader/stream the winning branch opened.
-// warmResumed reports whether the apply loop is about to consume from
-// a CDC reader opened at the persisted position — the ADR-0049
-// Chunk C cache-prime discriminator (see the comment kept on the
-// declaration this named return replaced, now at the call site).
+// stop is always non-nil — every dispatch branch assigns it (the
+// branches' own error paths clean up inline and hand back a no-op) —
+// so the caller's unconditional deferred `stop()` closes whichever
+// reader/stream the winning branch opened. warmResumed reports
+// whether the apply loop is about to consume from a CDC reader opened
+// at the persisted position — the ADR-0049 Chunk C cache-prime
+// discriminator (see the comment kept on the declaration this named
+// return replaced, now at the call site).
 func (s *Streamer) phaseOpenChangeStream(ctx, streamCtx context.Context, lsnTracker any, applier ir.ChangeApplier, streamID string, persisted ir.Position, found bool) (changes <-chan ir.Change, stop func(), warmResumed bool, err error) {
-	stop = func() {}
 	// warmResumed tracks whether the apply loop is about to consume
 	// from a CDC reader opened at the persisted position (vs. a fresh
 	// post-snapshot reader). The ADR-0049 Chunk C cache prime keys on

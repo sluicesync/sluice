@@ -423,7 +423,7 @@ func (m *Migrator) phaseGateColdStart(ctx context.Context, rc resumeContext, sta
 // overlap reservation (threaded onto the SchemaWriter), and the
 // ADR-0076 table × within-table split whose product can never exceed
 // the budget. Returns (tableParallelism, withinParallelism).
-func (m *Migrator) phaseResolveCopyParallelism(ctx context.Context, rc resumeContext, state ir.MigrationState, sw ir.SchemaWriter) (int, int, error) {
+func (m *Migrator) phaseResolveCopyParallelism(ctx context.Context, rc resumeContext, state ir.MigrationState, sw ir.SchemaWriter) (tableParallelism, withinParallelism int, err error) {
 	// Connection-budget preflight (connection-resilience item 4). Probe
 	// the target's connection-slot budget BEFORE the per-table parallel-
 	// copy pool opens, and cap the resolved parallelism so a wide
@@ -476,7 +476,7 @@ func (m *Migrator) phaseResolveCopyParallelism(ctx context.Context, rc resumeCon
 	//
 	// copyBudgetForAxes is the copy axes' slice after the ADR-0077 index
 	// reservation (== CopyBudget when overlap isn't engaged).
-	tableParallelism, withinParallelism := resolveCopyParallelismBudget(
+	tableParallelism, withinParallelism = resolveCopyParallelismBudget(
 		copyParallelism,
 		resolveTableParallelism(m.TableParallelism),
 		copyBudgetForAxes,

@@ -89,7 +89,7 @@ func (s *Streamer) coldStart(ctx context.Context, lsnTracker any, applier ir.Cha
 	// capture, the ADR-0048 Shape-A discriminator injection, and the
 	// Bug 60 redaction-type preflight — in that order (the phase
 	// documents each ordering constraint).
-	schema, err = s.coldStartPrepareSchema(ctx, schema)
+	schema, err = s.coldStartPrepareSchema(schema)
 	if err != nil {
 		return nil, stop, err
 	}
@@ -239,7 +239,7 @@ func (s *Streamer) coldStartReadSourceSchema(ctx context.Context) (*ir.Schema, [
 // injection, and the Bug 60 redaction-type preflight. Warm resume
 // never runs this — by then the target schema is already shaped from
 // the cold-start run.
-func (s *Streamer) coldStartPrepareSchema(ctx context.Context, schema *ir.Schema) (*ir.Schema, error) {
+func (s *Streamer) coldStartPrepareSchema(schema *ir.Schema) (*ir.Schema, error) {
 	// Apply per-column type overrides before the schema-write phase
 	// sees the schema. Warm resume skips this step — by then the
 	// target schema is already shaped from the cold-start run.
