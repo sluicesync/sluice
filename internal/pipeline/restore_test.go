@@ -383,6 +383,90 @@ func TestRestore_CrossEngine_RetargetsTypes(t *testing.T) {
 	}
 }
 
+// TestRestore_CrossEngine_SingleManifest_RefusesUnsupportable pins
+// the Bug 134 fix: the SINGLE-MANIFEST restore branch (Restore.Run,
+// no incrementals) must run the same checkCrossEngineSupportable gate
+// the chain path has had since Phase 5. Pre-fix, a full-only PG
+// backup carrying an EXCLUDE constraint restored to a MySQL-family
+// target with exit 0 and the constraint silently downgraded to a
+// plain non-unique KEY — found by the v0.99.32 regression cycle, the
+// instance one branch over from the v0.99.32 chain-path fix.
+//
+// Matrix: {mysql, vitess, planetscale} targets refuse identically
+// (the family is "MySQL-family target", per the isMySQLFamilyEngine
+// set the vitess gap was about); PG→PG passes (same-engine); a clean
+// schema passes the gate cross-engine. The per-CONSTRUCT family
+// coverage (opclasses, GIN, PostGIS, …) lives on the gate's own
+// tests — this pins the CALL, which dispatches uniformly.
+func TestRestore_CrossEngine_SingleManifest_RefusesUnsupportable(t *testing.T) {
+	excludeSchema := &ir.Schema{
+		Tables: []*ir.Table{{
+			Name: "bookings",
+			Columns: []*ir.Column{
+				{Name: "id", Type: ir.Integer{Width: 64}},
+			},
+			ExcludeConstraints: []*ir.ExcludeConstraint{{
+				Name:       "bookings_id_excl",
+				Definition: "EXCLUDE USING btree (id WITH =)",
+			}},
+		}},
+	}
+	rows := map[string][]ir.Row{"bookings": {{"id": int64(1)}}}
+
+	for _, target := range []string{"mysql", "vitess", "planetscale"} {
+		t.Run("refuses_"+target, func(t *testing.T) {
+			dir := t.TempDir()
+			store, _ := NewLocalStore(dir)
+			src := newBackupRecorderEngine("postgres", excludeSchema, rows)
+			if err := (&Backup{Source: src, SourceDSN: "src", Store: store}).Run(context.Background()); err != nil {
+				t.Fatalf("Backup: %v", err)
+			}
+			tgt := newRestoreRecorderEngine(target)
+			err := (&Restore{Target: tgt, TargetDSN: "tgt", Store: store}).Run(context.Background())
+			if err == nil {
+				t.Fatalf("restore to %s with EXCLUDE constraint succeeded; want loud refusal (Bug 134)", target)
+			}
+			if !strings.Contains(err.Error(), "bookings_id_excl") {
+				t.Errorf("refusal should name the constraint; got: %v", err)
+			}
+			phases, _ := tgt.snapshot()
+			if len(phases) != 0 {
+				t.Errorf("gate must fire before any target write; schema-write phases ran: %v", phases)
+			}
+		})
+	}
+
+	t.Run("pg_to_pg_passes", func(t *testing.T) {
+		dir := t.TempDir()
+		store, _ := NewLocalStore(dir)
+		src := newBackupRecorderEngine("postgres", excludeSchema, rows)
+		if err := (&Backup{Source: src, SourceDSN: "src", Store: store}).Run(context.Background()); err != nil {
+			t.Fatalf("Backup: %v", err)
+		}
+		tgt := newRestoreRecorderEngine("postgres")
+		if err := (&Restore{Target: tgt, TargetDSN: "tgt", Store: store}).Run(context.Background()); err != nil {
+			t.Fatalf("same-engine restore must pass the gate: %v", err)
+		}
+	})
+
+	t.Run("clean_schema_passes_cross_engine", func(t *testing.T) {
+		dir := t.TempDir()
+		store, _ := NewLocalStore(dir)
+		clean := &ir.Schema{Tables: []*ir.Table{{
+			Name:    "users",
+			Columns: []*ir.Column{{Name: "id", Type: ir.Integer{Width: 64}}},
+		}}}
+		src := newBackupRecorderEngine("postgres", clean, map[string][]ir.Row{"users": {{"id": int64(1)}}})
+		if err := (&Backup{Source: src, SourceDSN: "src", Store: store}).Run(context.Background()); err != nil {
+			t.Fatalf("Backup: %v", err)
+		}
+		tgt := newRestoreRecorderEngine("mysql")
+		if err := (&Restore{Target: tgt, TargetDSN: "tgt", Store: store}).Run(context.Background()); err != nil {
+			t.Fatalf("clean cross-engine restore must pass the gate: %v", err)
+		}
+	})
+}
+
 // capturingTargetEngine wraps restoreRecorderEngine to capture the
 // schema sent through CreateTablesWithoutConstraints — needed to
 // assert the cross-engine type retarget reached the writer.

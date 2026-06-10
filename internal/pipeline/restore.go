@@ -225,6 +225,34 @@ func (r *Restore) Run(ctx context.Context) error {
 		return wrapWithHint(PhaseConnect, err)
 	}
 
+	// 1.45. Cross-engine supportability gate (Bug 134). The chain
+	//       restore path has gated PG-native constructs (EXCLUDE
+	//       constraints, extension opclasses, PostGIS metadata, …)
+	//       since Phase 5, but this single-manifest branch never
+	//       called the gate — so a full-only PG backup restored to a
+	//       MySQL-family target exited 0 with an EXCLUDE constraint
+	//       SILENTLY downgraded to a plain non-unique KEY (semantic-
+	//       invariant loss; every row still arrives, which is exactly
+	//       why nothing else caught it). Same recorded-SourceEngine vs
+	//       target-name dispatch as chain_restore.go step 2, gated
+	//       BEFORE the retarget so the refusal sees the source-true
+	//       schema, and BEFORE the table filter for path-consistency
+	//       with the chain (which also gates its root's full schema).
+	if manifest.SourceEngine != "" && manifest.SourceEngine != r.Target.Name() {
+		if err := checkCrossEngineSupportable(
+			manifest.Schema,
+			manifest.SourceEngine, r.Target.Name(),
+			fmt.Sprintf("restore: full %s", manifestBackupID(manifest)),
+		); err != nil {
+			return err
+		}
+		slog.InfoContext(
+			ctx, "restore: cross-engine mode",
+			slog.String("source_engine", manifest.SourceEngine),
+			slog.String("target_engine", r.Target.Name()),
+		)
+	}
+
 	// 1.5. Encryption pre-flight. If the chain root manifest carries
 	// [ir.ChainEncryption], the operator MUST have supplied an
 	// envelope that can unwrap the chain's CEK. A missing envelope

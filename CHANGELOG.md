@@ -6,6 +6,23 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Single-manifest (full-only) cross-engine restores now run the same
+  unsupportability gate as chain restores (Bug 134).** v0.99.32 fixed the
+  PG→`vitess` *chain*-restore refusal skip — but the single-manifest restore
+  branch (a `backup full` with no incrementals) never called the gate at all,
+  on **any** MySQL-family target: a full-only PG backup carrying an `EXCLUDE`
+  constraint restored to `mysql`, `planetscale`, or `vitess` with exit 0 and
+  the constraint silently downgraded to a plain non-unique `KEY` (the same
+  applies to the gate's other refusal families — extension opclasses, PostGIS
+  metadata). Pre-existing on every version with cross-engine restore; found
+  by the v0.99.32 regression cycle within hours of the chain-path fix —
+  the instance one branch over. Anyone who restored a **full-only** PG backup
+  to a MySQL-family target should re-check that schema's constraints (adding
+  even one incremental made the same restore refuse loudly, so chains were
+  covered). Pinned across all three MySQL-family targets plus the PG→PG and
+  clean-schema controls, with a revert-test proving the pin catches the bug.
+
 ## [0.99.32] - 2026-06-10
 
 ### Fixed
