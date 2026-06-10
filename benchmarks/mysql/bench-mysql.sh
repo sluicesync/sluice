@@ -108,10 +108,20 @@ bulk_s=""; idx_s=""
 [ -n "$t0" ] && [ -n "$t1" ] && bulk_s=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.1f", b-a}')
 [ -n "$t1" ] && [ -n "$t2" ] && idx_s=$(awk -v a="$t1" -v b="$t2" 'BEGIN{printf "%.1f", b-a}')
 
-# Zero-loss content checksum.
+# Zero-loss content checksum. An EMPTY checksum means the verify
+# harness itself failed (mysql exec error, dropped container, bad
+# VERIFY path) — report that distinctly so it is never misread as a
+# data-loss verdict in either direction (empty==empty must not pass,
+# and harness failure must not masquerade as MISMATCH).
 cs_src="$(checksum $SRC)"
 cs_dst="$(checksum $DST)"
-zl="MISMATCH"; [ "$cs_src" = "$cs_dst" ] && [ -n "$cs_src" ] && zl="ZERO-LOSS-OK"
+if [ -z "$cs_src" ] || [ -z "$cs_dst" ]; then
+  zl="CHECKSUM-EMPTY (verify harness failed: src='$cs_src' dst='$cs_dst' — rerun; NOT a data-loss verdict)"
+elif [ "$cs_src" = "$cs_dst" ]; then
+  zl="ZERO-LOSS-OK"
+else
+  zl="MISMATCH"
+fi
 
 # Index-presence: every bench table on the target must carry its 4 secondary
 # indexes (idx_user_id, idx_created_at, idx_event_type, idx_active_amt). Count
