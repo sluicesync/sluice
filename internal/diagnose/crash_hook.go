@@ -130,7 +130,10 @@ func (h *CrashHook) writeBundle(ctx context.Context, req Request) (string, error
 	stamp := strings.ReplaceAll(now.UTC().Format(time.RFC3339), ":", "-")
 	name := fmt.Sprintf("crash-bundle-%s-%s.zip", stamp, sanitizeFilename(req.StreamID))
 	path := filepath.Join(h.cfg.Dir, name)
-	f, err := os.Create(path) //nolint:gosec // path is composed of operator-supplied directory + structured filename
+	// 0600, not os.Create's 0644: even at the most redacted privacy
+	// level the bundle carries operator config and recent log context,
+	// so it stays owner-only on disk.
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600) //nolint:gosec // path is composed of operator-supplied directory + structured filename
 	if err != nil {
 		return "", err
 	}

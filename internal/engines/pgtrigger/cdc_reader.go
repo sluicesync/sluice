@@ -361,6 +361,11 @@ func (r *CDCReader) poll(ctx context.Context, lastSeen int64) (events []ir.Chang
 		default:
 			return nil, lastSeen, "", fmt.Errorf("unknown op %q at id=%d", op, id)
 		}
+		// txid and committed are scanned (the SELECT projects them for
+		// schema-shape stability with the trigger's audit table) but
+		// not yet consumed: ordering uses the bigserial id alone.
+		// They become load-bearing if/when transactional batching or
+		// commit-timestamp watermarks land.
 		_ = txid
 		_ = committed
 	}

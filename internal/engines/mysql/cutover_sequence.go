@@ -238,6 +238,9 @@ func (w *SchemaWriter) primeOneSequence(
 	}
 	defer func() { _ = conn.Close() }()
 	if _, err := conn.ExecContext(ctx, "SET SESSION information_schema_stats_expiry = 0"); err != nil {
+		// Pre-8.0 MySQL doesn't have this variable; ignore the
+		// failure. The catalog read still works, just with whatever
+		// caching the server has. (Same rationale as ReadSequenceState.)
 		_ = err
 	}
 

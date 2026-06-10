@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"testing"
@@ -43,6 +44,39 @@ func TestLocalStore_PutGet(t *testing.T) {
 	// Verify atomic write: there's no leftover .tmp.
 	if _, err := os.Stat(filepath.Join(dir, "manifest.json.tmp")); !os.IsNotExist(err) {
 		t.Errorf("leftover .tmp file: err=%v", err)
+	}
+}
+
+// TestLocalStore_OwnerOnlyPermissions pins the 0600/0700 contract:
+// backup chunks contain full row data and --encrypt is opt-in, so a
+// world-readable backup dir hands any local user the dataset. Skipped
+// on Windows, where Go approximates Unix permission bits.
+func TestLocalStore_OwnerOnlyPermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix permission bits are approximated on Windows")
+	}
+	dir := t.TempDir()
+	s, err := NewLocalStore(filepath.Join(dir, "store"))
+	if err != nil {
+		t.Fatalf("NewLocalStore: %v", err)
+	}
+	if err := s.Put(context.Background(), "chunks/users/users-0.jsonl.gz", bytes.NewReader([]byte("row data"))); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	wantPerms := map[string]os.FileMode{
+		filepath.Join(dir, "store"):                                        0o700,
+		filepath.Join(dir, "store", "chunks", "users"):                     0o700,
+		filepath.Join(dir, "store", "chunks", "users", "users-0.jsonl.gz"): 0o600,
+	}
+	for path, want := range wantPerms {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("Stat %s: %v", path, err)
+		}
+		if got := info.Mode().Perm(); got != want {
+			t.Errorf("%s: perm = %o; want %o", path, got, want)
+		}
 	}
 }
 

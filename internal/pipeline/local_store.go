@@ -50,11 +50,18 @@ type LocalStore struct {
 // is created if it doesn't exist (via `os.MkdirAll`); existing
 // content is preserved (Put overwrites individual files but doesn't
 // clean up siblings).
+//
+// Directories are 0700 and files 0600: backup chunks contain full row
+// data and `--encrypt` is opt-in, so a world-readable backup dir would
+// hand any local user the whole dataset. Owner-only is the safe
+// default; operators who need group/other access can widen it on the
+// directory themselves. (No effect on Windows, where os perm bits are
+// approximated.)
 func NewLocalStore(root string) (*LocalStore, error) {
 	if root == "" {
 		return nil, errors.New("local store: root directory is empty")
 	}
-	if err := os.MkdirAll(root, 0o755); err != nil {
+	if err := os.MkdirAll(root, 0o700); err != nil {
 		return nil, fmt.Errorf("local store: create root %q: %w", root, err)
 	}
 	abs, err := filepath.Abs(root)
@@ -84,11 +91,13 @@ func (s *LocalStore) Put(ctx context.Context, path string, r io.Reader) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(abs), 0o700); err != nil {
 		return fmt.Errorf("local store: mkdir for %q: %w", path, err)
 	}
 	tmp := abs + ".tmp"
-	f, err := os.Create(tmp)
+	// 0600, not os.Create's 0644 — chunk contents are row data; see
+	// the NewLocalStore doc comment.
+	f, err := os.OpenFile(tmp, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
 		return fmt.Errorf("local store: create %q: %w", tmp, err)
 	}

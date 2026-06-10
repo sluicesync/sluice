@@ -502,7 +502,11 @@ func CompactChain(ctx context.Context, store ir.BackupStore, opts CompactOpts) (
 	}
 
 	// Post-commit delete pass: the merged segment is now authoritative;
-	// every source's leftover files are orphans.
+	// every source's leftover files are orphans. Failures here are
+	// non-fatal by design (the catalog swap above already committed,
+	// so the chain is correct either way) — but a failed sweep leaks
+	// backup-store disk forever, so it must leave a breadcrumb for the
+	// operator rather than vanish.
 	for i := range planned {
 		pg := &planned[i]
 		if pg.plan.MergedSegmentID == "" {
@@ -510,11 +514,22 @@ func CompactChain(ctx context.Context, store ir.BackupStore, opts CompactOpts) (
 		}
 		for _, s := range pg.span {
 			seg := &eligible[s.idx]
+			target := seg.Dir
+			var sweepErr error
 			if seg.Dir == "" {
-				_ = sweepRootSegmentArtifacts(ctx, store, seg)
-				continue
+				target = "(root segment artifacts)"
+				sweepErr = sweepRootSegmentArtifacts(ctx, store, seg)
+			} else {
+				sweepErr = sweepSegmentSubdir(ctx, store, seg.Dir)
 			}
-			_ = sweepSegmentSubdir(ctx, store, seg.Dir)
+			if sweepErr != nil {
+				slog.WarnContext(
+					ctx, "backup compact: orphan sweep failed — superseded segment files remain in the backup store",
+					slog.String("segment_dir", target),
+					slog.String("merged_into", pg.plan.MergedSegmentID),
+					slog.String("error", sweepErr.Error()),
+				)
+			}
 		}
 	}
 
