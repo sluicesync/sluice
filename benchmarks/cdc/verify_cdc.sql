@@ -1,5 +1,5 @@
 -- CDC-bench zero-loss checksum. Same aggregate shape as
--- bench-pgcopydb/verify.sql, scoped to the cdc_% tables: md5 over per-table
+-- benchmarks/pgcopydb/verify.sql, scoped to the cdc_% tables: md5 over per-table
 -- count + sum(id) + sum(amount) + sum(length(event_type)) + true-count.
 --
 -- A matching value on source and target — taken AFTER the writer has stopped

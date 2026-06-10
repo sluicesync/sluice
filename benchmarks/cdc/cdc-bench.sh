@@ -13,7 +13,7 @@
 #   5. compare cdc_checksum() on source vs target — must converge to EQUAL
 #      (zero-loss: every write delivered exactly once). Report timings.
 #
-# Robustness mirrors bench-pgcopydb/bench.sh: every docker call retried (the
+# Robustness mirrors benchmarks/pgcopydb/bench.sh: every docker call retried (the
 # Rancher Hyper-V socket flaps), the sync runs detached so a control-plane blip
 # can't abort the data plane, and timing comes from container/log facts.
 #

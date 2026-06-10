@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # cdc-up.sh — bring up the CDC-bench cluster and seed the source.
 #
-# Differences from bench-pgcopydb/bench-up.sh (the migrate harness):
+# Differences from benchmarks/pgcopydb/bench-up.sh (the migrate harness):
 #   * SOURCE runs wal_level=logical + a generous max_replication_slots /
 #     max_wal_senders — required for sluice's PG CDC replication slot.
 #   * the corpus is the LOWER-SCALE cdc_NN tables (gen_cdc.sql), good-sized

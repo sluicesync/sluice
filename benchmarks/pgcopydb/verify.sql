@@ -1,4 +1,4 @@
--- bench-pgcopydb zero-loss checksum. Returns an md5 over per-table
+-- benchmarks/pgcopydb zero-loss checksum. Returns an md5 over per-table
 -- count + sum(id) + sum(amount) + sum(length(event_type)) + true-count, so a
 -- matching value on source and target proves no row loss / dup / value
 -- corruption across the whole corpus (not just row counts). Mirrors the

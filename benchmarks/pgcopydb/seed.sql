@@ -1,4 +1,4 @@
--- bench-pgcopydb seed generator (Tier A: local sluice-vs-pgcopydb throughput).
+-- benchmarks/pgcopydb seed generator (Tier A: local sluice-vs-pgcopydb throughput).
 --
 -- Produces a FAIR mixed PG corpus that exercises BOTH pgcopydb strengths the
 -- comparison must cover:

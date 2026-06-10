@@ -140,7 +140,7 @@ within-table PK-range splitting) + 40 medium tables (exercising the cross-table 
 + 3 secondary indexes per table. Both tools containerized on one Docker network
 against two tuned `postgres:16` containers (`shared_buffers=2GB`, `max_wal_size=16GB`,
 `maintenance_work_mem=1GB`, `max_connections=300`, `/dev/shm=8g`). Single Windows +
-Rancher-Desktop host, shared NVMe. Reproduce via `bench-pgcopydb/` (seed.sql +
+Rancher-Desktop host, shared NVMe. Reproduce via `benchmarks/pgcopydb/` (seed.sql +
 gen_fn.sql + bench.sh). All runs zero-loss (aggregate-checksum verified).
 
 | Configuration | Total wall | Notes |

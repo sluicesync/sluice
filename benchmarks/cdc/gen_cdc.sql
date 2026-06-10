@@ -1,6 +1,6 @@
 -- gen_cdc_table(name, rows): one CDC-bench table, server-side populated.
 --
--- Shape mirrors bench-pgcopydb/gen_fn.sql (mixed columns + 3 secondary
+-- Shape mirrors benchmarks/pgcopydb/gen_fn.sql (mixed columns + 3 secondary
 -- indexes) so the two harnesses are comparable, with two CDC-specific
 -- requirements:
 --   * a real PRIMARY KEY (id) — the CDC applier needs it to route

@@ -1,0 +1,4 @@
+# Build context for the sluice bench images (cross-compiled binaries) and
+# per-run logs — reproducible from the committed scripts + tags, not tracked.
+img/
+results/

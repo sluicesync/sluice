@@ -1,6 +1,6 @@
 # bench-cdc — continuous-sync (CDC) validation harness
 
-A lower-scale sibling of `bench-pgcopydb/`. Where that harness measures
+A lower-scale sibling of `benchmarks/pgcopydb/`. Where that harness measures
 one-shot `migrate` THROUGHPUT at 110 GB, this one validates the
 **continuous-sync path** (`sluice sync start`: fast cold-start → follow) is
 **zero-loss under concurrent writes** at a good-sized scale — the thing a
@@ -25,13 +25,13 @@ throughput-only benchmark can't tell you.
 ## Run
 
 ```bash
-bash bench-cdc/cdc-up.sh 12 2000000      # seed (persists in the benchcdcsrc volume; reuse is free)
+bash benchmarks/cdc/cdc-up.sh 12 2000000      # seed (persists in the benchcdcsrc volume; reuse is free)
 SLUICE_IMG=sluice-bench:main \
-  bash bench-cdc/cdc-bench.sh 45 900     # writer 45s, drain timeout 900s
+  bash benchmarks/cdc/cdc-bench.sh 45 900     # writer 45s, drain timeout 900s
 ```
 
 Build `sluice-bench:main` from the version under test first (see
-`bench-pgcopydb/img/`). Host ports 5453/5454 (debugging only; the containers
+`benchmarks/pgcopydb/img/`). Host ports 5453/5454 (debugging only; the containers
 talk over the `benchnet` Docker network). LOCAL only — the seed volume isn't
 portable; regenerate from `gen_cdc.sql` elsewhere.
 
