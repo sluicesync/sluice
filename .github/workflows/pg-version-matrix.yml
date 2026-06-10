@@ -17,12 +17,18 @@
 # never blocks a merge.
 #
 # Versions come from scripts/pg-versions.txt (the single source of truth).
-# These are STOCK docker.io images, not GHCR pre-baked mirrors — the sweep
-# wants upstream bytes, including each image's real first-boot initdb path
+# These are STOCK images, not the pre-baked ones — the sweep wants
+# upstream bytes, including each image's real first-boot initdb path
 # (the shared harness's wait strategy handles both boot shapes; see the
-# bootSharedPostgresOnce comment). scripts/ci-ghcr-pull.sh provides the
-# bounded-retry pull (naked docker.io pulls have flaked); its GHCR login
-# is inert for docker.io, so no token is passed and the pull is anonymous.
+# bootSharedPostgresOnce comment). Task #36: the pulls go through
+# scripts/ci-mirror-pull.sh, which fetches the byte-identical GHCR
+# mirror (ghcr.io/sluicesync/sluice-mirror-postgres:<tag> — a pure retag
+# published by build-prebaked-images.yml from the SAME pg-versions.txt,
+# so matrix and mirrors can't drift) and retags it locally back to the
+# stock name; docker.io stays as a ::warning fallback. Upstream-bytes
+# fidelity is preserved — a retag changes nothing, the :latest canary
+# included (it lags an upstream roll by at most one weekly prebake, and
+# the fallback covers a not-yet-mirrored tag).
 #
 # `postgres:latest` is the forward-compat CANARY (continue-on-error): when
 # upstream rolls :latest to the next major (e.g. PG 19), a failing canary
@@ -90,6 +96,11 @@ jobs:
     name: PG engine suite on postgres ${{ matrix.version }}
     needs: setup
     runs-on: ubuntu-latest
+    # packages: read lets the GITHUB_TOKEN pull the sluice-mirror-*
+    # images from GHCR (task #36). The workflow default is contents-only.
+    permissions:
+      contents: read
+      packages: read
     # The :latest leg is a forward-compat canary — let it fail without
     # failing the workflow. Pinned legs are fatal on failure.
     continue-on-error: ${{ matrix.canary }}
@@ -105,14 +116,17 @@ jobs:
         with:
           go-version-file: go.mod
 
-      # Pre-pull the matrix image with bounded retry (naked docker.io pulls
-      # have flaked CI before). postgres:17 is pulled on every leg because
-      # the deliberately-pinned FAILOVER tests boot it regardless of which
-      # version the matrix env points the shared harness at. No GHCR_TOKEN
-      # is passed: the script then skips its ghcr.io login (inert for
-      # docker.io anyway) and pulls anonymously.
-      - name: Pre-pull postgres images (bounded retry)
-        run: bash scripts/ci-ghcr-pull.sh "${{ matrix.image }}" postgres:17
+      # Pre-pull the matrix image via its GHCR mirror with docker.io
+      # fallback (task #36; see the workflow-header note). postgres:17 is
+      # pulled on every leg because the deliberately-pinned FAILOVER tests
+      # boot it regardless of which version the matrix env points the
+      # shared harness at. GHCR_TOKEN authenticates the mirror pull (the
+      # job has packages: read); the docker.io fallback is anonymous.
+      - name: Pre-pull postgres images via their GHCR mirrors (docker.io fallback)
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash scripts/ci-mirror-pull.sh "${{ matrix.image }}" postgres:17
 
       # SLUICE_TEST_PG_IMAGE routes the shared container + every
       # non-version-pinned per-test boot in engines/postgres onto this

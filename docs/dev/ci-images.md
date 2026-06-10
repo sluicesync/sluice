@@ -33,6 +33,26 @@ NOT pre-baked:
 - `postgres:17` — used only by the failover-flag tests in `internal/engines/postgres/cdc_reader_integration_test.go`; per-boot cost on a niche path is acceptable.
 - `vitess/vttestserver:mysql80`, `vitess/lite`, `quay.io/coreos/etcd` — Vitess test images; behind opt-in `vstream` / `vitessreshard` build tags, not in the default CI gate.
 
+## Stock-image mirrors (task #36)
+
+Several tests deliberately boot **stock** images under their upstream names (`postgres:16` for the pgtrigger/hstore/cutover paths, `postgres:17` for the PG17 FAILOVER tests, `mysql:8.0` for the translate fixtures, `vitess/vttestserver:mysql80` for the vstream suite, plus the `pg-versions.txt` majors in the weekly PG matrix). Those pulls used to hit docker.io directly, and three incidents in 24 hours (a vttestserver pull flake, `postgres:17` cold-pulls flaking three tag runs, and a full registry outage failing a PR shard on `postgres:16` through the entire 5-attempt retry budget) showed retry-with-backoff alone can't remove docker.io from the critical path.
+
+The fix is a second image class next to the pre-baked ones: **pure retags** of the stock images, published to GHCR by the `mirrors` engine in `scripts/build-prebaked-images.sh` (same weekly cron / dispatch as the bakes). Never modified content — byte-identical upstream images under a registry we control.
+
+Naming scheme (owned by `scripts/ci-mirror-pull.sh`, which the bake script queries via `--print-ref` so publisher and consumers can't drift):
+
+| stock ref | mirror |
+| --- | --- |
+| `postgres:16` (and each `scripts/pg-versions.txt` entry: 17, 18, latest) | `ghcr.io/sluicesync/sluice-mirror-postgres:<tag>` |
+| `mysql:8.0` | `ghcr.io/sluicesync/sluice-mirror-mysql:8.0` |
+| `vitess/vttestserver:mysql80` | `ghcr.io/sluicesync/sluice-mirror-vttestserver:mysql80` |
+
+(`ghcr.io/sluicesync/sluice-vitess:<tag>` — the `vitess/lite` mirror — predates this scheme; consumers pass it explicitly via `ci-mirror-pull.sh --mirror`.)
+
+CI workflows pre-pull stock images through `scripts/ci-mirror-pull.sh <stock-ref>...`, which pulls the mirror (bounded retry, 3 attempts), then `docker tag`s it back to the **stock** name — tests and testcontainers `PullIfNotPresent` keep working unchanged against the stock refs, now served from the local cache. If the mirror pull fails (GHCR outage, or the mirror was never published — the first-run bootstrap case), the helper emits a `::warning` and falls back to a direct docker.io pull with the full retry budget: a missing mirror degrades to the pre-mirror behavior, it never makes availability worse.
+
+Bootstrap / ordering: nothing has to exist before the workflows merge — every consumer carries the fallback. To stop the warnings, run the `Build pre-baked CI images` workflow once (the `mirrors` matrix leg publishes all mirror tags) and, on first publish, set the new `sluice-mirror-*` GHCR packages to public so fork PRs (which run with an empty `GHCR_TOKEN` and pull anonymously) hit the mirror instead of the fallback.
+
 Byte-equivalence is preserved: the pre-baked images are the same base image plus the result of the init step the tests would otherwise run on first boot. No extra layers, no extensions, no config files copied in. The runtime Cmd args (`-c wal_level=logical` etc.) in the TestMains' container customisers are still applied at boot the same way they would be against the upstream image; the pre-bake just removes init from the critical path.
 
 ## How to manually rebuild

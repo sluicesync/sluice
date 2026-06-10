@@ -99,14 +99,17 @@ jobs:
       # The reshard harness hardcodes vitess/lite:latest (vrVitessImage
       # in vitess_cluster_reshard_integration_test.go). Pull the GHCR
       # :latest mirror and retag it locally so testcontainers'
-      # PullIfNotPresent finds it without touching docker.io.
+      # PullIfNotPresent finds it without touching docker.io. The
+      # sluice-vitess mirror predates the sluice-mirror-* naming rule, so
+      # the helper gets the mirror ref explicitly via --mirror; it adds
+      # the docker.io ::warning fallback the bare pull+tag lacked.
       - name: Pull the GHCR :latest mirror and retag as vitess/lite:latest
         env:
           GHCR_USER: ${{ github.actor }}
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          bash scripts/ci-ghcr-pull.sh ghcr.io/sluicesync/sluice-vitess:latest
-          docker tag ghcr.io/sluicesync/sluice-vitess:latest vitess/lite:latest
+          bash scripts/ci-mirror-pull.sh \
+            --mirror ghcr.io/sluicesync/sluice-vitess:latest vitess/lite:latest
 
       - name: Run the reshard suite
         run: |
@@ -142,14 +145,15 @@ jobs:
           bash scripts/ci-ghcr-pull.sh \
             ghcr.io/sluicesync/sluice-mysql:8.0-prebaked \
             ghcr.io/sluicesync/sluice-postgres:16-prebaked
-      # Bounded retry — naked docker.io pulls have red-failed jobs on
-      # transient "context deadline exceeded" (see the ci.yml vstream
-      # job note).
-      - name: Pre-pull vttestserver (Docker Hub, public)
+      # Via the GHCR mirror with docker.io fallback (task #36) — even
+      # bounded-retry docker.io pulls have red-failed jobs on transient
+      # "context deadline exceeded" (see the ci.yml vstream job note).
+      # The helper retags the mirror back to the stock name locally.
+      - name: Pre-pull vttestserver via its GHCR mirror (docker.io fallback)
         env:
           GHCR_USER: ${{ github.actor }}
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: bash scripts/ci-ghcr-pull.sh vitess/vttestserver:mysql80
+        run: bash scripts/ci-mirror-pull.sh vitess/vttestserver:mysql80
 
       - name: Run the pipeline vstream tests
         run: |

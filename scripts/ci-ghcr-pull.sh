@@ -20,7 +20,15 @@
 # images are pulled anonymously, so external-contributor PRs pass CI too.
 set -euo pipefail
 
-readonly MAX_ATTEMPTS=5
+# Overridable so callers with their own fallback (ci-mirror-pull.sh) can
+# spend a smaller budget on the first-choice registry before falling back.
+readonly MAX_ATTEMPTS="${MAX_ATTEMPTS:-5}"
+
+# Annotation level for the exhausted-retry message. Callers with their
+# own fallback (ci-mirror-pull.sh) downgrade this to "warning" so a
+# mirror miss that the fallback recovers doesn't leave a spurious
+# ::error annotation on a green run. Direct callers stay loud.
+readonly FAIL_LEVEL="${FAIL_LEVEL:-error}"
 
 # retry <human-label> <cmd...> — runs cmd, retrying up to MAX_ATTEMPTS
 # with linear backoff (10s, 20s, ...). Returns cmd's success or fails
@@ -34,7 +42,7 @@ retry() {
 			return 0
 		fi
 		if [ "${attempt}" -eq "${MAX_ATTEMPTS}" ]; then
-			echo "::error::${label} failed after ${MAX_ATTEMPTS} attempts" >&2
+			echo "::${FAIL_LEVEL}::${label} failed after ${MAX_ATTEMPTS} attempts" >&2
 			return 1
 		fi
 		local backoff=$((attempt * 10))

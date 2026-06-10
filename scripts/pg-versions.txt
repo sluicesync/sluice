@@ -5,8 +5,14 @@
 # Consumers (keep them all reading THIS file — do not hardcode the list
 # elsewhere):
 #   - .github/workflows/pg-version-matrix.yml builds its job matrix from
-#     this file (stock docker.io images, pulled with bounded retry via
-#     scripts/ci-ghcr-pull.sh).
+#     this file (stock images, pulled via their GHCR mirrors with a
+#     docker.io fallback — scripts/ci-mirror-pull.sh).
+#   - scripts/build-prebaked-images.sh's `mirrors` engine derives the
+#     postgres mirror list from this file (plus the per-PR floor 16), so
+#     adding a major here both adds the matrix leg and publishes its
+#     ghcr.io/sluicesync/sluice-mirror-postgres:<tag> mirror on the next
+#     prebake run (the file is in build-prebaked-images.yml's trigger
+#     paths, so the mirror publishes on merge, not just on the cron).
 #
 # Policy: per-PR CI runs the engines/postgres suite on the pre-baked PG 16
 # image (ghcr.io/sluicesync/sluice-postgres:16-prebaked — see

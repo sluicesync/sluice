@@ -66,6 +66,12 @@
 #       # tags in scripts/vitess-versions.txt to ghcr.io/sluicesync/sluice-vitess.
 #       # NOT in the default set (it pulls ~5 x 2.7GB images) — opt in explicitly
 #       # or via the build-prebaked-images.yml `vitess` matrix entry.
+#   ENGINES=mirrors ./scripts/build-prebaked-images.sh  # MIRROR the stock
+#       # docker.io images CI pre-pulls (postgres:16 + the pg-versions.txt
+#       # majors, mysql:8.0, vitess/vttestserver:mysql80) to
+#       # ghcr.io/sluicesync/sluice-mirror-<name>:<tag> as pure retags
+#       # (task #36 — see the mirrors config block). Like vitess, opt-in
+#       # here / a dedicated matrix entry in the workflow.
 #
 # CI usage: invoked by .github/workflows/build-prebaked-images.yml on a
 # weekly cron + workflow_dispatch.
@@ -121,6 +127,29 @@ PGVECTOR_TARGET_IMAGE="${GHCR_NAMESPACE}/sluice-pgvector:0.7.4-pg16-prebaked"
 # each image is `docker rmi`'d after push to bound the runner's ~14GB disk.
 VITESS_VERSIONS_FILE="${VITESS_VERSIONS_FILE:-$(dirname "$0")/vitess-versions.txt}"
 VITESS_TARGET_REPO="${GHCR_NAMESPACE}/sluice-vitess"
+
+# mirrors (task #36): pure RETAGS of the STOCK docker.io images CI's
+# pre-pull steps depend on — postgres:{16,<pg-versions.txt majors>},
+# mysql:8.0, vitess/vttestserver:mysql80. Same rationale as the vitess
+# mirror above, but for the images tests deliberately boot UNDER THEIR
+# STOCK NAMES (the pgtrigger cdc-reader, hstore/pg_trgm, PG17 FAILOVER,
+# translate fixtures, the vstream suite, the PG version matrix): three
+# docker.io incidents in 24h — a vttestserver pull flake, postgres:17
+# cold-pulls flaking three tag runs, and a registry outage failing a PR
+# shard on postgres:16 through the whole 5-attempt retry budget — showed
+# retries alone can't remove docker.io from the critical path. CI pulls
+# these mirrors via scripts/ci-mirror-pull.sh, which retags them back to
+# the stock names locally (so testcontainers' PullIfNotPresent hits the
+# cache) and falls back to docker.io with a ::warning if a mirror is
+# missing (the first-run bootstrap) or GHCR is down. Target naming —
+# ghcr.io/sluicesync/sluice-mirror-<basename>:<tag> — is owned by
+# ci-mirror-pull.sh (--print-ref); this script only consumes it, so the
+# publisher and the consumers cannot drift. Like the vitess mirror, this
+# is single-arch (the runner's arch, amd64 in CI) and always re-pulls
+# (a retag needs the bytes locally); `docker push` layer-dedups
+# unchanged tags so the weekly cron is cheap on uneventful weeks.
+PG_VERSIONS_FILE="${PG_VERSIONS_FILE:-$(dirname "$0")/pg-versions.txt}"
+CI_MIRROR_PULL="$(dirname "$0")/ci-mirror-pull.sh"
 
 # --- Helpers ----------------------------------------------------------
 
@@ -484,6 +513,40 @@ bake_vitess() {
     done < <(read_vitess_versions)
 }
 
+# mirror_stock_refs emits the stock docker.io refs the `mirrors` engine
+# publishes, one per line. The Postgres list is DERIVED: 16 is the per-PR
+# floor (deliberately absent from scripts/pg-versions.txt — see that
+# file's policy note) and the rest come from pg-versions.txt so the
+# weekly PG version matrix and the mirror set cannot drift. That includes
+# the postgres:latest canary — a pure retag keeps upstream bytes, so the
+# canary still tests upstream, at most one prebake-cron behind the roll.
+mirror_stock_refs() {
+    echo "postgres:16"
+    grep -vE '^[[:space:]]*#|^[[:space:]]*$' "$PG_VERSIONS_FILE"
+    echo "mysql:8.0"
+    echo "vitess/vttestserver:mysql80"
+}
+
+# bake_mirrors MIRRORS each stock ref to GHCR. Pure retag, never a build —
+# the whole point is byte-identical upstream images under a registry we
+# control. Each image is rmi'd after push to bound runner disk, mirroring
+# bake_vitess (vttestserver alone is ~1.3GB).
+bake_mirrors() {
+    local stock target
+    while IFS= read -r stock; do
+        [[ -z "$stock" ]] && continue
+        target="$(bash "$CI_MIRROR_PULL" --print-ref "$stock")"
+        log "mirroring ${stock} -> ${target}"
+        docker pull "$stock"
+        docker tag "$stock" "$target"
+        if [[ "${SKIP_PUSH:-0}" != "1" ]]; then
+            log "pushing ${target}"
+            docker push "$target"
+        fi
+        docker rmi "$target" "$stock" >/dev/null 2>&1 || true
+    done < <(mirror_stock_refs)
+}
+
 # --- Main -------------------------------------------------------------
 
 main() {
@@ -498,8 +561,9 @@ main() {
             postgis)  bake_postgis ;;
             pgvector) bake_pgvector ;;
             vitess)   bake_vitess ;;
+            mirrors)  bake_mirrors ;;
             *)
-                log "ERROR: unknown engine '${engine}' (want one of: mysql postgres postgis pgvector vitess)"
+                log "ERROR: unknown engine '${engine}' (want one of: mysql postgres postgis pgvector vitess mirrors)"
                 exit 1
                 ;;
         esac
