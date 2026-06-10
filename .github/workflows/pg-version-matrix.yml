@@ -1,0 +1,128 @@
+# Multi-version Postgres engine matrix (task #32).
+#
+# Runs the full engines/postgres integration suite (with -race) against a
+# sweep of NEWER Postgres server versions by pointing the shared-container
+# harness's SLUICE_TEST_PG_IMAGE override (see
+# internal/engines/postgres/shared_container_integration_test.go) at each
+# stock postgres image in turn. Slot lifecycle, logical decoding, and
+# catalog-query behaviour are exactly the surfaces that drift between PG
+# majors — this matrix catches that drift on a schedule instead of letting
+# a user find it.
+#
+# Why weekly, not per-PR: per-PR CI runs this suite on the pre-baked PG 16
+# image (fast, cached, the supported-floor version) — adding three more
+# full -race integration legs to every PR would roughly quadruple the
+# postgres shard's CI cost for drift that moves on a release-cycle
+# timescale, not a per-commit one. This is NOT a required status check and
+# never blocks a merge.
+#
+# Versions come from scripts/pg-versions.txt (the single source of truth).
+# These are STOCK docker.io images, not GHCR pre-baked mirrors — the sweep
+# wants upstream bytes, including each image's real first-boot initdb path
+# (the shared harness's wait strategy handles both boot shapes; see the
+# bootSharedPostgresOnce comment). scripts/ci-ghcr-pull.sh provides the
+# bounded-retry pull (naked docker.io pulls have flaked); its GHCR login
+# is inert for docker.io, so no token is passed and the pull is anonymous.
+#
+# `postgres:latest` is the forward-compat CANARY (continue-on-error): when
+# upstream rolls :latest to the next major (e.g. PG 19), a failing canary
+# leg is the early drift signal — time to investigate and add the new
+# major as a pinned line in pg-versions.txt — not a red build. Pinned legs
+# (17, 18) failing ARE real regressions against released majors.
+#
+# Operator decision point: when a newer major has been green here for a
+# while and PG 16 ages toward EOL, bumping per-PR CI's default off 16 means
+# (1) adding the new major to build-prebaked-images.sh / ci-images.md,
+# (2) flipping sharedPGDefaultImage in shared_container_integration_test.go,
+# (3) moving the retired major INTO this matrix if it's still supported.
+# This matrix's green history is the evidence that makes that bump safe.
+#
+# Schedule: Saturday 09:00 UTC — after Saturday's 07:00 fuzz run, before
+# Sunday's 06:00 prebake + 08:00 Vitess matrix, so the weekend batch jobs
+# stay serialized rather than contending for runners.
+
+name: Postgres version matrix
+
+on:
+  schedule:
+    - cron: "0 9 * * 6"
+  workflow_dispatch:
+    inputs:
+      run:
+        description: "go test -run filter (default: the full engines/postgres suite)"
+        required: false
+        default: "."
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pg-version-matrix-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # Build the job matrix from scripts/pg-versions.txt so the version list
+  # lives in exactly one place. Emits [{version, image, canary}, ...] where
+  # image is the stock docker.io ref and canary is true only for :latest.
+  setup:
+    name: Resolve version matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v6
+      - id: gen
+        run: |
+          entries=$(grep -vE '^[[:space:]]*#|^[[:space:]]*$' scripts/pg-versions.txt | while read -r ref; do
+            tag="${ref##*:}"
+            canary=false
+            [ "$tag" = "latest" ] && canary=true
+            printf '{"version":"%s","image":"%s","canary":%s}\n' "$tag" "$ref" "$canary"
+          done | jq -s -c '.')
+          echo "resolved matrix: $entries"
+          echo "matrix=$entries" >> "$GITHUB_OUTPUT"
+
+  engine:
+    name: PG engine suite on postgres ${{ matrix.version }}
+    needs: setup
+    runs-on: ubuntu-latest
+    # The :latest leg is a forward-compat canary — let it fail without
+    # failing the workflow. Pinned legs are fatal on failure.
+    continue-on-error: ${{ matrix.canary }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.setup.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      # Pre-pull the matrix image with bounded retry (naked docker.io pulls
+      # have flaked CI before). postgres:17 is pulled on every leg because
+      # the deliberately-pinned FAILOVER tests boot it regardless of which
+      # version the matrix env points the shared harness at. No GHCR_TOKEN
+      # is passed: the script then skips its ghcr.io login (inert for
+      # docker.io anyway) and pulls anonymously.
+      - name: Pre-pull postgres images (bounded retry)
+        run: bash scripts/ci-ghcr-pull.sh "${{ matrix.image }}" postgres:17
+
+      # SLUICE_TEST_PG_IMAGE routes the shared container + every
+      # non-version-pinned per-test boot in engines/postgres onto this
+      # leg's image. RYUK stays disabled (CI Option B): the ephemeral
+      # runner self-cleans and the reaper pull is its own flake source.
+      - name: Run engines/postgres integration suite on ${{ matrix.image }}
+        env:
+          SLUICE_TEST_PG_IMAGE: ${{ matrix.image }}
+          TESTCONTAINERS_RYUK_DISABLED: "true"
+        run: |
+          go test -tags=integration -race -count=1 -timeout=35m \
+            -run '${{ github.event.inputs.run || '.' }}' \
+            ./internal/engines/postgres/...

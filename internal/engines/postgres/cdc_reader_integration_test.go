@@ -54,6 +54,12 @@ func startPostgresForCDC(t *testing.T) (dsn string, cleanup func()) {
 // per-boot cost on a niche path is acceptable, and adding a third
 // pre-baked artifact for one test isn't worth the maintenance.
 //
+// The "postgres:17" pin here is DELIBERATE: these tests assert PG
+// 17–specific behaviour (the FAILOVER slot flag, the 17.x
+// server_version_num band), so the SLUICE_TEST_PG_IMAGE override
+// the multi-version matrix sets does NOT apply to this helper —
+// only sharedPGImage-based boots follow the matrix env.
+//
 // Stays per-test (does NOT share the container) because the image is
 // different from the shared container's PG 16 — sharing would defeat
 // the purpose of the PG 17–specific assertion. See the comment block
@@ -645,12 +651,14 @@ func TestCDCReader_DeleteCompositePKUnderReplicaIdentityDefault(t *testing.T) {
 // the per-test 3-attempt cap (see runPGWithRetry).
 func TestCDCReader_RejectsWrongWALLevel(t *testing.T) {
 	container := runPGWithRetry(
-		// sharedPGImage is the task-#68 pre-baked PG image. Safe to
-		// reuse here even though the test asserts wal_level=replica
-		// refusal: wal_level is a runtime GUC set by container Cmd
-		// args, not baked into the image. With no wal_level override
-		// in Cmd the server starts at its default "replica" the same
-		// way it would against the upstream postgres:16 image.
+		// sharedPGImage is the task-#68 pre-baked PG image (or the
+		// SLUICE_TEST_PG_IMAGE matrix override — the refusal path is
+		// version-agnostic). Safe to reuse here even though the test
+		// asserts wal_level=replica refusal: wal_level is a runtime
+		// GUC set by container Cmd args, not baked into the image.
+		// With no wal_level override in Cmd the server starts at its
+		// default "replica" the same way it would against the
+		// upstream postgres:16 image.
 		t, sharedPGImage,
 		pgtc.WithDatabase("source_db"),
 		pgtc.WithUsername("test"),
@@ -772,6 +780,12 @@ func TestCDCReader_FailoverFlag_PG17(t *testing.T) {
 // exists. The pg_replication_slots view in PG 16 doesn't have a
 // failover column, so we don't assert on it — we just confirm the
 // helper takes the FAILOVER-less path without erroring.
+//
+// Under the SLUICE_TEST_PG_IMAGE matrix override the shared
+// container may be PG 17+; the assertions here (slot creation
+// succeeds, slot exists) stay valid on every version — the
+// FAILOVER-less-path coverage is only exercised when the shared
+// image really is PG 16, i.e. on the default per-PR CI path.
 func TestCDCReader_FailoverFlag_PG16(t *testing.T) {
 	dsn, cleanup := startPostgresForCDC(t)
 	defer cleanup()

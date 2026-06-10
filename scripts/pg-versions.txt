@@ -1,0 +1,20 @@
+# Single source of truth for the Postgres SERVER versions the multi-version
+# matrix sweeps. One docker.io ref per line; blank lines and lines starting
+# with '#' are ignored.
+#
+# Consumers (keep them all reading THIS file — do not hardcode the list
+# elsewhere):
+#   - .github/workflows/pg-version-matrix.yml builds its job matrix from
+#     this file (stock docker.io images, pulled with bounded retry via
+#     scripts/ci-ghcr-pull.sh).
+#
+# Policy: per-PR CI runs the engines/postgres suite on the pre-baked PG 16
+# image (ghcr.io/sluicesync/sluice-postgres:16-prebaked — see
+# sharedPGDefaultImage in shared_container_integration_test.go), so 16 is
+# deliberately NOT listed here. This matrix sweeps the NEWER majors weekly
+# to catch slot-CDC / logical-decoding / catalog drift before a user does.
+# `:latest` is the forward-compat canary (allowed to fail in the matrix) —
+# it turns into the next major's drift signal the day upstream rolls it.
+postgres:17
+postgres:18
+postgres:latest
